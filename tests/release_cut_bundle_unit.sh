@@ -128,13 +128,12 @@ echo "-- the tag must be proven SERVABLE, not merely pushed (dev, review of #313
 # unattended and install.sh fails closed, so an unservable tag kills installs after EVERY
 # release and is discovered at the NEXT one. Graded structurally because the property is a
 # live network fetch this harness must not perform.
-# The arm must follow the probe: it now fetches the BUNDLE, which is the object
-# install.sh:264 DIES on, not the .sha256 that install.sh:273 treats as optional
-# (fail-soft by design since DIVE-1271). Probing the optional object proved the
-# wrong thing — they are independent CDN objects with independent cache
-# generations, which is the whole of DIVE-1977.
+# The arm must follow the probe: it fetches the BUNDLE, not only the .sha256.
+# DIVE-2248 made both network objects mandatory, but proving the checksum is
+# servable still says nothing about the independent bundle object whose bytes it
+# describes — they have separate CDN cache generations (DIVE-1977).
 grep -q '"${_base}/5dive" -o "$_tmp"' "$WF" \
-  && ok_t 'the cut fetches the BUNDLE — the object install.sh dies on, not the optional checksum' \
+  && ok_t 'the cut fetches the BUNDLE — checksum servability alone cannot prove that independent object' \
   || bad_t 'the probe does not fetch the mandatory bundle' "$(grep -n '_base' "$WF" | head -3)"
 grep -q 'sha256sum "$_tmp"' "$WF" \
   && ok_t 'the FETCHED BYTES are hashed, so a servable-but-wrong bundle cannot pass' \

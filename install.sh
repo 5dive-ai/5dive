@@ -374,21 +374,24 @@ assert_version_monotonic() {
 # populated host.
 refresh_managed_files() {
   # DIVE-1261: fetch the bundle to a temp file, verify it against the published
-  # sha256, then atomically swap it in. A checksum MISMATCH is fatal (corrupt
-  # download or tampered mirror); an absent/unfetchable checksum only WARNS so a
-  # box can't be bricked if the .sha256 isn't published yet. (Integrity check v1:
-  # guards corruption + mirror tamper; not signing-strength — that needs an
-  # out-of-band key.) Temp lives in BIN_DIR so the final mv is a same-fs atomic swap.
+  # sha256, then atomically swap it in. A checksum MISMATCH or an absent network
+  # checksum is fatal. The one deliberate exception is an explicit file:// source:
+  # install-smoke owns those local bytes and intentionally carries no checksum.
+  # (Integrity check v1 guards corruption + mirror tamper; not signing-strength —
+  # that needs an out-of-band key.) Temp lives in BIN_DIR so the final mv is a
+  # same-fs atomic swap.
   local _bundle_tmp; _bundle_tmp="$(mktemp "${BIN_DIR}/.5dive.XXXXXX")"
   curl -fsSL "$REPO/5dive" -o "$_bundle_tmp" || { rm -f "$_bundle_tmp"; die "failed to download 5dive bundle from $REPO/5dive"; }
   local _want _got
   # `|| _want=""` is load-bearing: under `set -euo pipefail` (line 6) a plain
   # assignment whose command-substitution pipeline fails aborts the whole script
-  # BEFORE the else-branch below can treat an absent checksum as fail-soft. The
+  # BEFORE the policy below can classify an absent checksum. The
   # offline install-smoke bundle (REPO=file:///opt/5dive-bundle) ships no
   # 5dive.sha256, so curl exits 37 (CURLE_FILE_COULDNT_READ_FILE) and pipefail
   # propagates it — reddening docker-install at the "Installing CLI binaries"
-  # step (DIVE-1271). Swallowing it here keeps the absent-checksum-warns contract.
+  # step (DIVE-1271). Swallowing it here lets the policy distinguish that explicit
+  # local source from a network source whose integrity object disappeared.
+  # >>> DIVE-2248 checksum policy
   _want="$(curl -fsSL "$REPO/5dive.sha256" 2>/dev/null | tr -d '[:space:]')" || _want=""
   if [[ -n "$_want" ]]; then
     _got="$(sha256sum "$_bundle_tmp" | awk '{print $1}')"
@@ -404,9 +407,13 @@ refresh_managed_files() {
       fi
       die "5dive bundle checksum mismatch (want ${_want:0:16}…, got ${_got:0:16}…) — refusing to install. This box could not pin a commit sha, so the bundle and its checksum were fetched from the mutable ref $REPO and may be two different CDN cache generations (a stale mirror in the minutes after a release) rather than a corrupt download or a tampered mirror. Retry in a few minutes; if it persists, treat it as an integrity failure."
     fi
+  elif [[ "$REPO" == file://* ]]; then
+    echo "  ! local file:// source has no 5dive.sha256 — proceeding without a network integrity check" >&2
   else
-    echo "  ! no published 5dive.sha256 (or fetch failed) — skipping integrity check" >&2
+    rm -f "$_bundle_tmp"
+    die "failed to fetch required 5dive.sha256 from $REPO/5dive.sha256 — refusing to install an unverified bundle"
   fi
+  # <<< DIVE-2248 checksum policy
   # DIVE-2243: direction is a separate assertion from the action. Checked HERE —
   # after integrity, before the swap — so a refusal leaves the installed binary
   # untouched and the box keeps running the version it already has.
