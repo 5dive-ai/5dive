@@ -55,11 +55,99 @@ on:
   workflow_dispatch:
   # The tiering machinery itself must be graded on the PR that changes it, or the
   # first evidence that a budget is mis-set arrives a day late on main.
+  #
+  # DIVE-2789: AND SO MUST THE SOURCE TREE. DIVE-2667 (`push: main`) closed the
+  # POST-merge half — a break is attributed to one merge instead of a day's worth.
+  # It did nothing for the PRE-merge half: a change could still be reviewed and
+  # merged with no instrument in the check set that runs the harnesses outside the
+  # core tier. Two measured instances, both in the same week:
+  #   (A) 2f8dbaa (#486, DIVE-2371) -> src/lib/tasks_db.sh, src/cmd_selfcheck.sh,
+  #       src/cmd_task.sh. Broke tests/gate_nonce_unit.sh (`# TIER: nightly`).
+  #   (B) 4e87712 (#488, DIVE-2603) -> build.sh, install.sh, src/header.sh.
+  #       Broke tests/selfcheck_mutation_e2e.sh (`# TIER: nightly`).
+  #
+  # WHY THE LIST IS THIS BROAD, AND WHY THAT IS THE HONEST ANSWER RATHER THAN A LAZY
+  # ONE. DIVE-2785 proposed a "risk-triggered" narrow surface. The union of what the
+  # two instances ACTUALLY touched is build.sh, install.sh and src/** — a narrower
+  # list misses src/cmd_*.sh (A) or src/header.sh and install.sh (B). Measured over
+  # the seven days to 2026-08-05: 131 of 181 first-parent merges (72%) touch this
+  # surface. So "risk-triggered" and "every PR" are the same trigger at the same
+  # cost, and any list narrow enough to feel cheap is narrow enough to have missed
+  # one of the two instances we already have. Naming that plainly is the point.
+  #
+  # WHAT IT COSTS, MEASURED, NOT ASSERTED. Not dollars: the repo is public and every
+  # job here is `ubuntu-latest`, so standard runners are free. The cost is wall-clock
+  # and queue contention. Rate, measured from unit-tests.yml's own pull_request runs
+  # (it has no paths filter, so every one of them is a push to an open PR branch):
+  # 100 runs across 57 DISTINCT branches over 2026-08-04T07:09Z..08-05T17:55Z, a
+  # 34.8h window = ~69 pushes and ~39 branches/day. BRANCHES is the figure that
+  # matters, because the concurrency group below is keyed on the ref, so repeated
+  # pushes to one branch collapse into one sweep. At the 72% surface-touch rate that
+  # is ~28 sweeps/day. The window is what the API paginates to, NOT a calendar day —
+  # per-day counts off that page are floors on both ends and reading one as a full
+  # day understates the rate, which is the direction that flatters this change.
+  #
+  # WHY NOT A `--tier=nightly` BRANCH RUN, which was the recommended option going in.
+  # It was the right thing to COST before shipping, and the cost killed it. Summed
+  # from the per-harness timings of full-sweep run 31019560760 (main, 609210d,
+  # SUCCESS), classified through tests/lib/tier.sh:
+  #     pristine        324 harnesses 1481s | nightly subset 81 harnesses 1210s (81%)
+  #     installed-host  324 harnesses 1594s | nightly subset 81 harnesses 1306s (81%)
+  # The nightly subset IS the corpus: core is 270s/288s of it. A nightly-only branch
+  # run buys 18-19% of wall-clock and costs a third run selector with its own budget
+  # dial — a second place the PR path and the sweep path can drift apart, which is
+  # the defect tests/lib/tier.sh exists to prevent. 18% is not worth that, so this
+  # ships the tier that already exists.
   pull_request:
     paths:
       - 'tests/lib/tier.sh'
       - 'scripts/run-harnesses.sh'
       - '.github/workflows/full-sweep.yml'
+      # DIVE-2789: the measured union of the two known instances. Keep this list and
+      # tests/full_sweep_pr_trigger_unit.sh in step — that harness fails if either
+      # instance's file list stops being covered.
+      - 'build.sh'
+      - 'install.sh'
+      - 'src/**'
+
+# DIVE-2789: THIS SWEEP IS ADVISORY ON A PR. IT DOES NOT BLOCK A MERGE.
+#
+# Read from the API, not inferred from this file — `gh api
+# repos/5dive-ai/5dive/branches/main/protection`, 2026-08-05. The required contexts
+# are exactly: test, test-installed-host, shellcheck, docker-install, scan, check,
+# supply-chain-guard. No job in this workflow is among them, and `strict` is false.
+# BOTH mechanisms were checked, because classic protection is not the only one that
+# can make a context required and the other one is invisible to the endpoint above:
+# `repos/5dive-ai/5dive/rulesets` and `.../rules/branches/main` both return `[]`, so
+# classic protection is the whole answer today. If a ruleset ever appears, re-read
+# this — a required context added there would not show up in the list above.
+#
+# It stays advisory ON PURPOSE, not by omission. This trigger is paths-filtered, so
+# it is ABSENT from ~28% of PRs — and GitHub leaves a required check that never
+# reports PENDING FOREVER, so requiring it would wedge every PR that legitimately
+# does not touch the surface. Making it required needs a separate always-reporting
+# gate job, which is DIVE-2790's shape, not this row's.
+#
+# So: a red here is a signal a human has to read, not a control that stops a merge.
+# That is strictly more than the zero we had — the break in (A) and (B) above was on
+# NO surface anybody looked at before merging — and it is less than it sounds like.
+# Do not read "full-sweep runs on branches" as "a regression outside the core tier
+# can no longer land".
+#
+# AND TWO THINGS THIS DOES NOT COVER AT ALL, because the next author reads this
+# comment and would otherwise inherit a false premise:
+#   * THE RELEASE PATH. `release-cut.yml` runs on schedule and workflow_dispatch
+#     only — never on a PR. A change to the release flow still merges behind fully
+#     green checks and is first exercised when somebody needs a release. That is
+#     this same defect one rail over, and 4e87712 (DIVE-2603) is the live instance:
+#     full-sweep on 33c6c80 was GREEN in both environments and the cut still failed
+#     on `bundle-integrity`. Tracked as DIVE-2798.
+#   * THE SELFCHECK PROBE CLASS. What failed in that incident is a `5dive selfcheck`
+#     probe invoked by the release workflow (src/cmd_selfcheck.sh), which the harness
+#     corpus never reaches in either tier. This workflow runs THE CORPUS. A branch
+#     sweep would have gone green on 33c6c80 exactly as the real sweep did.
+# This row closes ONE axis — a regression in the harness corpus, outside the core
+# tier, on a branch — with ONE instrument class, the corpus.
 
 # DIVE-2667: what makes `push: main` affordable, and WHAT IT COSTS TO BUY THAT.
 #
@@ -220,6 +308,18 @@ jobs:
   harness-verdict-pristine:
     runs-on: ubuntu-latest
     needs: full-pristine
+    # DIVE-2789: NOT ON A PULL REQUEST. The PR trigger above puts the whole corpus
+    # on a branch; it does not put a SECOND whole pass on one. The verdict probe
+    # re-runs every harness once per injected mutation, so these four jobs roughly
+    # double the workflow's cost, and the argument for skipping them on a PR is the
+    # one already written above in this file rather than a new one: the PR-shaped
+    # case — a harness added or edited in a diff whose exit status is not wired to
+    # its own assertions — is caught at the moment of introduction by unit-tests.yml's
+    # `changed-harnesses`; and the union's invariant is a whole-corpus,
+    # cross-environment claim that NO SINGLE PR CAN MAKE OR BREAK. Both still run on
+    # every push to main, on the nightly, and on dispatch, which is where they were
+    # sound in the first place.
+    if: github.event_name != 'pull_request'
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -260,6 +360,18 @@ jobs:
   harness-verdict-installed:
     runs-on: ubuntu-latest
     needs: full-installed-host
+    # DIVE-2789: NOT ON A PULL REQUEST. The PR trigger above puts the whole corpus
+    # on a branch; it does not put a SECOND whole pass on one. The verdict probe
+    # re-runs every harness once per injected mutation, so these four jobs roughly
+    # double the workflow's cost, and the argument for skipping them on a PR is the
+    # one already written above in this file rather than a new one: the PR-shaped
+    # case — a harness added or edited in a diff whose exit status is not wired to
+    # its own assertions — is caught at the moment of introduction by unit-tests.yml's
+    # `changed-harnesses`; and the union's invariant is a whole-corpus,
+    # cross-environment claim that NO SINGLE PR CAN MAKE OR BREAK. Both still run on
+    # every push to main, on the nightly, and on dispatch, which is where they were
+    # sound in the first place.
+    if: github.event_name != 'pull_request'
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -347,6 +459,18 @@ jobs:
   harness-verdict-slow:
     runs-on: ubuntu-latest
     needs: full-pristine
+    # DIVE-2789: NOT ON A PULL REQUEST. The PR trigger above puts the whole corpus
+    # on a branch; it does not put a SECOND whole pass on one. The verdict probe
+    # re-runs every harness once per injected mutation, so these four jobs roughly
+    # double the workflow's cost, and the argument for skipping them on a PR is the
+    # one already written above in this file rather than a new one: the PR-shaped
+    # case — a harness added or edited in a diff whose exit status is not wired to
+    # its own assertions — is caught at the moment of introduction by unit-tests.yml's
+    # `changed-harnesses`; and the union's invariant is a whole-corpus,
+    # cross-environment claim that NO SINGLE PR CAN MAKE OR BREAK. Both still run on
+    # every push to main, on the nightly, and on dispatch, which is where they were
+    # sound in the first place.
+    if: github.event_name != 'pull_request'
     timeout-minutes: 60
     env:
       # One name per slow harness, comma-separated — the probe's own --only format.
@@ -392,6 +516,18 @@ jobs:
   harness-verdict-union:
     runs-on: ubuntu-latest
     needs: [harness-verdict-pristine, harness-verdict-installed, harness-verdict-slow]
+    # DIVE-2789: NOT ON A PULL REQUEST. The PR trigger above puts the whole corpus
+    # on a branch; it does not put a SECOND whole pass on one. The verdict probe
+    # re-runs every harness once per injected mutation, so these four jobs roughly
+    # double the workflow's cost, and the argument for skipping them on a PR is the
+    # one already written above in this file rather than a new one: the PR-shaped
+    # case — a harness added or edited in a diff whose exit status is not wired to
+    # its own assertions — is caught at the moment of introduction by unit-tests.yml's
+    # `changed-harnesses`; and the union's invariant is a whole-corpus,
+    # cross-environment claim that NO SINGLE PR CAN MAKE OR BREAK. Both still run on
+    # every push to main, on the nightly, and on dispatch, which is where they were
+    # sound in the first place.
+    if: github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
