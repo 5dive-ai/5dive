@@ -1456,6 +1456,16 @@ cmd_task_show() {
     deps=$(db "SELECT t.ident||'  ['||t.status||']  '||t.title FROM task_deps d JOIN tasks t ON t.id=d.blocked_by WHERE d.task_id=${id} ORDER BY t.id;")
     [[ -n "$deps" ]] && { echo; echo "blocked by:"; printf '%s\n' "$deps" | indent2; }
   fi
+  # DIVE-2751: the `blocked by` block above is a CONDITIONAL RENDER whose test is
+  # the last command in this function, so on a row with no dependency edge the
+  # false test became `task show`'s exit status and `set -euo pipefail` killed the
+  # script — after the row had already printed in full. That is the majority of the
+  # board, and `5dive task show <id>` is the canonical verification command a /goal
+  # stop-hook is pointed at, so a correctly-rendered row read as a failed command
+  # whose effect the trap then declared UNKNOWN. Terminate the function on its own
+  # status: a render that reached the end SUCCEEDED, whatever the last block chose
+  # not to print. Covers the --json branch too (jq's status is not a render verdict).
+  return 0
 }
 
 # DIVE-2133 — gate_history was an append-only WRITE path with no reader. Keep
@@ -7601,7 +7611,20 @@ cmd_task_need() {
         # Rule 3: a non-appealable class (money / real comms / irreversible infra)
         # is present. Name the surviving term so the refusal is actionable rather
         # than mysterious — the filer can see it is not the word they meant.
-        local _dd_term; _dd_term=$(_gate_tier2_floor_term "$_dd_residual")
+        # DIVE-2751 iteration 4 (main2): TWO defects on the one line this replaces.
+        # `$_dd_residual` occurred exactly ONCE in the whole repo — here — so it
+        # has never held a value: under `set -u` the substitution died "unbound
+        # variable" and the plain assignment inherited its rc, aborting `task need`
+        # with no message on the Rule 3 path. And the term must be read off the
+        # residual that ACTUALLY hit; concatenating the two would re-open the
+        # phantom seam match the DIVE-2224 comment above forbids, so this mirrors
+        # _gate_hit_either's own order (ask first, then title) and absorbs the rc.
+        local _dd_term=""
+        if _gate_tier2_floor_hit "$_dd_res_ask"; then
+          _dd_term=$(_gate_tier2_floor_term "$_dd_res_ask" 2>/dev/null) || _dd_term=""
+        else
+          _dd_term=$(_gate_tier2_floor_term "$_dd_res_title" 2>/dev/null) || _dd_term=""
+        fi
         warn "--discusses REFUSED: this gate names a non-appealable category (matched '${_dd_term}'). Money, outbound customer comms and irreversible infra/access stay hard-human however they are framed. Staying at tier 2."
       else
         local _dd_reviewer; _dd_reviewer=$(_gate_route_reviewer "$(task_actor "")")   # DIVE-2518: tier-flag only; see note above
@@ -8311,8 +8334,19 @@ cmd_task_need() {
         # TITLE, say so HERE. A stderr warn is not the durable surface -- the routed
         # reviewer reads this line, and "escalate if the ask really is asking for
         # that" is only actionable if they are told which term and from where.
-        local _fbt=""
-        [[ "$_floored_by_title" == "1" ]] && _fbt=" [floored_by=title: the T2 category floor matched '$(_gate_tier2_floor_term "$_ft_title")' in the TASK TITLE, not in the ask — escalate to the human if the ask really is asking for that]"
+        # DIVE-2751 iteration 4 — decided explicitly rather than left as "guarded in
+        # practice". An assignment's rc is its LAST command substitution's, so
+        # `[[ test ]] && v="...$(f)..."` hands f's status to the compound with the
+        # test TRUE. `_ft_title` is the text that just matched, so the helper does
+        # return 0 here — but "in practice" is exactly the reasoning the previous
+        # three iterations got wrong, and this false rc arrives from the RHS, where
+        # no detector that classifies the LEFT side of `&&` can ever see it. Split
+        # so the status is absorbed instead of argued about.
+        local _fbt="" _fbt_term=""
+        if [[ "$_floored_by_title" == "1" ]]; then
+          _fbt_term=$(_gate_tier2_floor_term "$_ft_title" 2>/dev/null) || _fbt_term=""
+          _fbt=" [floored_by=title: the T2 category floor matched '${_fbt_term}' in the TASK TITLE, not in the ask — escalate to the human if the ask really is asking for that]"
+        fi
         ok "$ident routed to $_reviewer for ${_rrole} ($type, tier $tier)${_rnote}${_fbt} — $ask" \
            '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), routed_to:$rv, delivery:$ds, notified:($ds=="delivered"), ask:$ak, recommend:(($rc|select(length>0)) // null)}' \
            --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg rv "$_reviewer" --arg ds "$_rstate" --arg ak "$ask" --arg rc "$recommend"
@@ -8510,7 +8544,12 @@ cmd_task_need() {
     floor_note=" [tier 2 — DECLARED --needs=${needs}, a human-held capability; routed to the paired human, not to a lead or verifier]"
     warn "this gate is hard-human because you DECLARED --needs=${needs}. It bypasses lead- and verifier-routing by constant, and only the paired human can answer it. If the ask does not actually consume that capability, withdraw and re-file without --needs — do not appeal it, the declaration is yours."
   elif (( tier_floored )); then
-    floor_term=$(_gate_tier2_floor_term "${ask} $(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")")
+    # DIVE-2751: `_gate_tier2_floor_term` is trailing-test-terminated — it returns 1
+    # when it finds no term — so this PLAIN assignment made "the floor fired but the
+    # helper could not name the word" kill `task need` under `set -e`. The helper's
+    # own rc contract is left alone (a value producer may report "no match"); the
+    # call site absorbs it, exactly as the two sites at _floor_term above already do.
+    floor_term=$(_gate_tier2_floor_term "${ask} $(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")") || floor_term=""
     floor_note=" [tier forced to 2 — T2 category floor${floor_term:+: matched '$floor_term'}]"
     local _fw="this gate was FORCED to tier 2 (hard human) by the T2 category floor"
     [[ -n "$floor_term" ]] && _fw="$_fw because the ask or the task title contains '${floor_term}'"

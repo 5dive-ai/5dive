@@ -887,6 +887,8 @@ paperclip_unseed_for_profile() {
       | .[0].value.authProfile // empty' <<<"$reg")
     [[ -n "$fallback_profile" ]] && paperclip_seed_for_type "$t" "$fallback_profile"
   done
+  return 0   # DIVE-2751: a for-loop returns its LAST iteration's status, so
+             # `claude` having no fallback profile made the whole unseed fail.
 }
 
 # paperclip_seed_all_from_registry — backfill the host-default credential
@@ -904,6 +906,9 @@ paperclip_seed_all_from_registry() {
       | .[0].value.authProfile // empty' <<<"$reg")
     [[ -n "$profile" ]] && paperclip_seed_for_type "$t" "$profile"
   done
+  return 0   # DIVE-2751: LIVE — main.sh:738 calls this bare under `paperclip-seed`
+             # (invoked from update.sh), and the loop's last iteration is `claude`,
+             # so a host with no claude auth profile exited 1 before the ok() line.
 }
 
 # profile_set_var <profile> <VAR> <VALUE> — idempotent KEY=VALUE upsert in
