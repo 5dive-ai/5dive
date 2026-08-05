@@ -47,6 +47,7 @@ fixture() {
 You are Don. Don's brief calls the slug don twice: don don.
 People don't buy rooted documents from surface-level vendors.
 People don’t accept naive replacements either.
+Don't corrupt sentence-leading contractions. Don’t corrupt curly ones.
 EOF
 }
 
@@ -65,6 +66,8 @@ for f in "$STAGE/CLAUDE.md" "$STAGE/card.md" "$STAGE/persona.yaml" "$STAGE/memor
     "$(basename "$f"): ASCII contraction and embedded substrings preserved"
   has "$f" "People don’t accept naive replacements either." \
     "$(basename "$f"): curly-apostrophe contraction preserved"
+  has "$f" "Don't corrupt sentence-leading contractions. Don’t corrupt curly ones." \
+    "$(basename "$f"): capitalized contractions preserved"
   hasnt "$f" "zed't" "$(basename "$f"): reported corruption absent"
 done
 
