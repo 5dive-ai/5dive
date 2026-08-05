@@ -171,6 +171,49 @@ out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
 [[ "$(row_count)" == "3" ]] && ok "paired: explicit TASKS_BACKUP_DIR still restores" \
   || bad "paired: rows=$(row_count) ($out)"
 
+# --- Case 9 (DIVE-2197): a fresh schema contains all six additive columns -----
+# These lived only in the migration list, while a genuinely fresh STATE_DIR
+# skipped migration. The result was a green init over a partial tasks table.
+fresh_tree
+out=$(tasks_db_init 2>&1); rc=$?
+required='delivered_at delivery_ref escalated_at escalated_by park_reason parked_at'
+actual=$(sqlite3 "$TASKS_DB" \
+  "SELECT name FROM pragma_table_info('tasks')
+    WHERE name IN ('delivery_ref','delivered_at','parked_at','park_reason','escalated_at','escalated_by')
+    ORDER BY name;" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
+[[ $rc -eq 0 && "$actual" == "$required" ]] \
+  && ok "fresh schema: all six additive columns are present" \
+  || bad "fresh schema: init returned a partial tasks table" "rc=$rc got=[$actual] want=[$required] out=$out"
+
+# --- Case 10 (DIVE-2197): one ALTER fails -> init fails loudly ----------------
+fresh_tree
+real_sqlite=$(command -v sqlite3)
+mkdir -p "$TMP/bin"
+cat > "$TMP/bin/sqlite3" <<'SQLITE_SHIM'
+#!/usr/bin/env bash
+if [[ "${DIVE2197_FAIL_COLUMN:-}" == "delivery_ref" \
+      && "$*" == *"ALTER TABLE tasks ADD COLUMN delivery_ref"* ]]; then
+  exit 1
+fi
+exec "$DIVE2197_REAL_SQLITE" "$@"
+SQLITE_SHIM
+chmod +x "$TMP/bin/sqlite3"
+out=$(DIVE2197_FAIL_COLUMN=delivery_ref DIVE2197_REAL_SQLITE="$real_sqlite" \
+      PATH="$TMP/bin:$PATH" tasks_db_init 2>&1); rc=$?
+actual=$("$real_sqlite" "$TASKS_DB" \
+  "SELECT name FROM pragma_table_info('tasks')
+    WHERE name IN ('delivery_ref','delivered_at','parked_at','park_reason','escalated_at','escalated_by')
+    ORDER BY name;" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
+[[ $rc -ne 0 ]] \
+  && ok "failed ALTER: tasks_db_init fails instead of accepting a partial schema" \
+  || bad "failed ALTER: init silently returned success" "rc=$rc out=$out"
+grep -q 'schema incomplete.*delivery_ref' <<<"$out" \
+  && ok "failed ALTER: refusal names the missing column" \
+  || bad "failed ALTER: refusal does not identify the hole" "out=$out"
+[[ "$actual" == 'delivered_at escalated_at escalated_by park_reason parked_at' ]] \
+  && ok "failed ALTER: mutation applied and only delivery_ref remains absent" \
+  || bad "failed ALTER: mutation precondition/result is not the intended one-column hole" "got=[$actual]"
+
 echo
 echo "tasks-db restore guard: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]
