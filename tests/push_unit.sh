@@ -168,6 +168,40 @@ out=$(run_push DIVE-907 --dry-run); rc=$?
 { [[ $rc -eq 0 ]] && grep -qi "dry-run: would push" <<<"$out"; } \
   && ok_t "happy dry-run -> ok" || bad_t "happy dry-run -> ok" "rc=$rc :: $out"
 
+# 7c) DIVE-2801: THE DRY-RUN MUST NOT GREEN-LIGHT WHAT THE REAL PUSH REFUSES.
+# Measured on DIVE-2798: `--dry-run` printed OK and the real push refused the same
+# row seconds later, nothing changed between them. Cause — the rehearsal runs
+# _push_gate_check at require_sig=0 and cmd_push_do at 1, so the rehearsal
+# evaluated a weaker predicate and reported its verdict as the whole gate.
+# The DIVE-2760 arm above pins the ANSWERER's warning; this pins the ACTOR's, and
+# they are different agents in different sessions, which is why both exist.
+# The arm is the SAME fixture as arm 7 with one column cleared (sign=0), so a
+# difference here is attributable to the signature and to nothing else.
+seed_task DIVE-930 "Branch: feature-ok" approval "2026-07-18 00:00:00" \
+  "yes ship it" "human:test" "" 0
+out=$(run_push DIVE-930 --dry-run); rc=$?
+{ [[ $rc -ne 0 ]] && ! grep -qi "would push" <<<"$out"; } \
+  && ok_t "unsigned closure: dry-run refuses, and reports no push (DIVE-2801)" \
+  || bad_t "unsigned closure: dry-run refuses, and reports no push (DIVE-2801)" "rc=$rc :: $out"
+grep -qi "carries NO closure signature" <<<"$out" \
+  && ok_t "…and it NAMES the state it saw, so the reader is not sent to audit the reviewer" \
+  || bad_t "…and it NAMES the state it saw" "$out"
+# And the positive control is arm 7 directly above — same command, same fixture,
+# signature present, rc=0. The pair is what proves the fix is not "always warn".
+# What arm 7 must now ALSO do: SAY what it did not check. A green that stays silent
+# about the executor's signature check is the same false go-ahead one release later.
+out=$(run_push DIVE-907 --dry-run); rc=$?
+{ [[ $rc -eq 0 ]] && grep -qi "NOT verified here" <<<"$out"; } \
+  && ok_t "signed closure: the dry-run passes AND states the check it did not run" \
+  || bad_t "signed closure: the dry-run passes AND states the check it did not run" "rc=$rc :: $out"
+# The machine surface must carry the state as a FIELD, not only inside prose: a
+# consumer that greps `ok:true` and ships is the automated version of the reader
+# this ticket is about.
+out=$( JSON_MODE=1 run_push DIVE-907 --dry-run )
+grep -q '"gateSignature":"unverified"' <<<"$out" \
+  && ok_t "…and --json carries gateSignature as a field, not only as prose" \
+  || bad_t "…and --json carries gateSignature as a field, not only as prose" "$out"
+
 # 7b) INST-5 FAIL-CLOSED ON A MISSING PREDICATE. Extracting push's gate check into
 # lib/broker.sh created a failure mode the inline code could not have: if the lib
 # is not loaded the call is merely "command not found" (rc 127) and, as a bare
