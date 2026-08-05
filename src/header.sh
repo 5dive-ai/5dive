@@ -457,7 +457,7 @@ declare -A SKILLS_AGENT_ID=(
 # Used for post-install verification, the cmd_skill_list dir-scan fallback,
 # and cmd_skill_rm. Probed empirically against npx skills v0.x — if upstream
 # changes a path, update here. Unknown types fall through to ".claude/skills"
-# in the lookup sites below.
+# in the resolver below.
 #
 # DIVE-2583 — THE CONTRACT, because prose elsewhere in this repo contradicted it:
 # every value here is $HOME-RELATIVE (it is joined to /home/agent-<name>/ at every
@@ -549,13 +549,13 @@ skill_default_source() {
 }
 
 # skills_install_dir <type> -> the $HOME-relative dir an installed skill body
-# lands in for that type. THE resolver: this is the expression cmd_pack.sh's
-# import path, cmd_skill add/list/rm and agent_setup.sh each spell by hand, and
-# DIVE-2583 exists because a rendered sentence stated a DIFFERENT answer than the
-# one the installer computed. Anything that TELLS a user where skills go must ask
-# this function, so the claim and the behaviour cannot drift apart. Total by
-# construction — never empty, for any input — which is exactly why "a harness with
-# no skills directory" describes nothing here.
+# lands in for that type. THE resolver: cmd_pack.sh's import path, cmd_skill
+# add/list/rm and agent_setup.sh all call this function. DIVE-2583 exists because
+# a rendered sentence stated a DIFFERENT answer than the installer computed.
+# Anything that tells or acts on where skills go must ask this function, so the
+# claim and behaviour cannot drift apart. Total by construction — never empty,
+# for any input — which is exactly why "a harness with no skills directory"
+# describes nothing here.
 skills_install_dir() {
   printf '%s\n' "${SKILLS_INSTALL_DIR[${1:-}]:-.claude/skills}"
 }
