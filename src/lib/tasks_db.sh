@@ -1050,15 +1050,18 @@ tasks_db_init() {
     # Only a genuinely fresh box (no sentinel, no snapshot) gets a new schema.
     if _tasks_board_existed; then
       _tasks_board_recover
-      _tasks_db_migrate            # bring the restored snapshot up to current schema
     else
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" < <(_tasks_schema) >/dev/null \
         || fail "$E_GENERIC" "failed to initialise tasks db at $TASKS_DB"
       chmod 0660 "$TASKS_DB" 2>/dev/null || true
     fi
-  else
-    _tasks_db_migrate
   fi
+  # DIVE-2197: fresh and restored stores need the same additive reconciliation
+  # as an existing store. The canonical CREATE TABLE historically omitted six
+  # additive columns, and skipping this call made an isolated STATE_DIR report a
+  # healthy-but-partial schema. _tasks_db_migrate now verifies the result, so a
+  # failed ALTER is loud instead of being hidden by its idempotency guard.
+  _tasks_db_migrate
   # DIVE-1479: stamp the durable "this board exists" sentinel (idempotent). On a
   # pre-existing board this is the one-time backfill so a later wipe is caught.
   _tasks_mark_initialized
@@ -1073,6 +1076,7 @@ _tasks_db_migrate() {
   cols=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
          "SELECT name FROM pragma_table_info('tasks');" 2>/dev/null)
   local c
+  local -a required_columns=()
   # Each entry: "<column> <type>". Add new additive columns here; existing
   # rows backfill to NULL. Pure expand (no contract), so old queries/rows are
   # untouched and a downgrade still reads/writes the table fine.
@@ -1105,6 +1109,7 @@ _tasks_db_migrate() {
            'human_evidence TEXT' \
            'derived_actor TEXT' \
            'floor_provenance TEXT'; do
+    required_columns+=("${c%% *}")
     # DIVE-2418: herestring, NOT a pipe. `printf | grep -q` lets grep exit on its
     # first match while printf is still writing, and printf then takes SIGPIPE and
     # emits "write error: Broken pipe" on stderr. This runs from tasks_db_init on
@@ -1129,6 +1134,21 @@ _tasks_db_migrate() {
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true
     fi
   done
+  # DIVE-2197: `|| true` above is necessary for duplicate-column races between
+  # concurrent initializers, but it must not turn every other ALTER failure into
+  # success. Re-read the schema after the attempts and assert the anchor: every
+  # additive column is present. This also grades a genuinely fresh store because
+  # tasks_db_init now sends that path through this reconciliation.
+  local final_cols
+  final_cols=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+               "SELECT name FROM pragma_table_info('tasks');" 2>/dev/null)
+  local -a missing_columns=()
+  for c in "${required_columns[@]}"; do
+    grep -qx "$c" <<<"$final_cols" || missing_columns+=("$c")
+  done
+  ((${#missing_columns[@]} == 0)) || fail "$E_GENERIC" \
+    "tasks db schema incomplete after migration — missing columns: ${missing_columns[*]} (DIVE-2197)"
+
   # OSS-11 precedent-lookup index (idempotent; harmless if the columns just
   # backfilled to NULL above — an all-NULL ask_shape simply never matches).
   sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
