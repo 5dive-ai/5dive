@@ -604,8 +604,46 @@ _sc_probe_bundle_integrity() {
   # bundle is a self-consistent lie — the pair agrees and neither is the code.
   local tmpb; tmpb=$(mktemp "${TMPDIR:-/tmp}/5dive-bundle.XXXXXX" 2>/dev/null)
   if [[ -n "$tmpb" ]] && (cd "$root" && BUILD_OUT="$tmpb" bash build.sh >/dev/null 2>&1); then
-    cmp -s "$tmpb" "$root/5dive" \
-      || bad+=("./5dive is not what src/ builds — the bundle and the commit it claims are different code")
+    # DIVE-2798: A BUNDLE CANNOT CARRY THE SHA OF THE COMMIT THAT CONTAINS IT.
+    # DIVE-2603 made build.sh stamp FIVE_BUILD_SHA=HEAD; the release flow builds
+    # the bundle, then commits it onto a NEW commit. A rebuild here therefore
+    # stamps THAT commit, while the tracked bundle names the commit it was built
+    # from — which is the release commit's first parent, exactly the identity
+    # install.sh's legacy_release_build_sha() already documents and reads. So a
+    # raw `cmp` made the stamp and this probe jointly unsatisfiable on every
+    # release commit, i.e. precisely where the probe matters most: it blocked the
+    # v0.19.3 cut with a true byte difference nobody could ever satisfy.
+    #
+    # The stamp is NOT waived. It moves from a byte comparison to an identity
+    # assertion: every other byte must still match src/ exactly, and the stamp
+    # itself must name a commit this checkout can corroborate. Waiving it would
+    # pass a forged stamp; this fails one. Comparing the tracked stamp against
+    # git — rather than against the REBUILT stamp — also drops a second, quieter
+    # trap: an untracked file on the runner makes the rebuild stamp `<sha>-dirty`
+    # and would fail a naive stamp-to-stamp check for a reason that is not the
+    # bundle's fault.
+    local stamp_rx='^readonly FIVE_BUILD_SHA="[^"]*"$'
+    local n_stamp; n_stamp=$(grep -cE "$stamp_rx" "$root/5dive" 2>/dev/null) || true
+    if [[ "$n_stamp" != "1" ]]; then
+      bad+=("the tracked bundle carries ${n_stamp:-0} FIVE_BUILD_SHA lines rather than exactly one, so its build identity cannot be read or compared")
+    elif ! cmp -s "$tmpb" "$root/5dive"; then
+      if diff -q <(grep -vE "$stamp_rx" "$tmpb") <(grep -vE "$stamp_rx" "$root/5dive") >/dev/null 2>&1; then
+        # Only the stamp line differs — legitimate on a release commit, a lie anywhere else.
+        local _tracked _head _parent
+        _tracked=$(grep -m1 -E "$stamp_rx" "$root/5dive" | sed -E 's/.*="([^"]*)".*/\1/')
+        _head=$(git -C "$root" rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || _head=""
+        _parent=$(git -C "$root" rev-parse --verify 'HEAD^1^{commit}' 2>/dev/null) || _parent=""
+        if [[ -z "$_head" ]]; then
+          bad+=("./5dive differs from src/ only in its build stamp, but git cannot resolve HEAD here, so the stamp names nothing this checkout can check")
+        elif [[ "$_tracked" == "$_head" || ( -n "$_parent" && "$_tracked" == "$_parent" ) ]]; then
+          : # the bundle names the commit it was built from; the release commit is its child
+        else
+          bad+=("./5dive claims FIVE_BUILD_SHA=${_tracked:-missing}, which is neither this commit (${_head:0:12}) nor its first parent (${_parent:0:12}) — the bundle names a build identity this checkout cannot corroborate")
+        fi
+      else
+        bad+=("./5dive is not what src/ builds — the bundle and the commit it claims are different code")
+      fi
+    fi
   else
     bad+=("build.sh could not be run, so the bundle could not be shown to match src/")
   fi
