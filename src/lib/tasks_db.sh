@@ -2144,11 +2144,48 @@ _gate_sudo_uid_nonagent() {
 # "Ship it" 2026-08-05 07:40 knowing the consequence — a tier-2 gate can no longer
 # be cleared from a shell on the box as user claude. Telegram taps are untouched:
 # they clear through the nonce arm, not this one.
-_gate_caller_cgroup() {
-  # cgroup v2 emits a single `0::<path>` line; take everything after the last ':'.
-  local line; line=$(head -1 /proc/self/cgroup 2>/dev/null) || return 1
+# Pick the SYSTEMD line out of a /proc/<pid>/cgroup stream and print its path.
+# Split out from _gate_caller_cgroup so the line-SELECTION rule is gradable without
+# an override for the path to read — the path stays hardcoded at the one call site
+# below, because a readable-path knob on a fail-closed predicate is the same class
+# of widening surface as an accept-list knob (D1).
+#
+# WHY NOT `head -1`. That read whichever line came first. On cgroup v2 the file IS
+# the single unified `0::<path>` entry and it happens to be right; on a v1 or hybrid
+# host the file is many `<hier>:<controllers>:<path>` lines in kernel order, so the
+# first is an ARBITRARY controller whose path can differ from the systemd one. A real
+# login session then read as an unrecognised cgroup and a HUMAN was locked out of
+# their own tier-2 clear. That direction is fail-closed, which is the right default
+# and is NOT a reason to keep a known-wrong reader on a human-auth path: the installed
+# fleet is unobservable by design (no exec token, SSH stripped), so "our boxes are v2"
+# is a statement about the boxes we can see, and a lockout there has no self-service
+# path.
+#
+# NO PERMISSIVE FALLBACK. If neither line is present we return 1 and the caller
+# refuses. "Take any line we did find" is exactly what would admit an unrecognised
+# hierarchy's path into a fail-closed accept list.
+_gate_cgroup_pick_line() {
+  local line sysd="" uni=""
+  while IFS= read -r line; do
+    case "$line" in
+      *:name=systemd:*) sysd="$line" ;;   # v1/hybrid: systemd's unit-tracking hierarchy
+      0::*)             uni="$line"  ;;   # v2: the unified hierarchy
+    esac
+  done
+  # v1/hybrid FIRST: where systemd tracks units in the name=systemd hierarchy the
+  # unified line may be bare `/`. A pure-v2 host has no name=systemd line at all, so
+  # this falls through to the unified one rather than needing to detect the version.
+  line="${sysd:-$uni}"
   [[ -n "$line" ]] || return 1
-  printf '%s' "${line##*:}"
+  # Strip the two leading `<field>:` columns rather than taking everything after the
+  # LAST colon — a unit path may legitimately contain one.
+  printf '%s' "${line#*:*:}"
+}
+
+_gate_caller_cgroup() {
+  # An unreadable /proc entry fails the redirect, so this returns nonzero and the
+  # caller refuses — the "unresolved principal is not a verified one" rule.
+  _gate_cgroup_pick_line </proc/self/cgroup 2>/dev/null
 }
 
 _gate_cgroup_human_capable() {

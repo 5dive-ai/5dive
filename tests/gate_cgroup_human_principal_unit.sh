@@ -46,10 +46,12 @@ bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
 # Pull ONLY the two functions under test out of the shipped file, so this grades
 # real bytes without executing the rest of the library.
-SRC=$(sed -n '/^_gate_caller_cgroup()/,/^}/p;/^_gate_cgroup_human_capable()/,/^}/p' "$LIB")
+SRC=$(sed -n '/^_gate_cgroup_pick_line()/,/^}/p;/^_gate_caller_cgroup()/,/^}/p;/^_gate_cgroup_human_capable()/,/^}/p' "$LIB")
 [[ -n "$SRC" ]] || { echo "FATAL: could not extract the predicate from $LIB" >&2; exit 2; }
 grep -q 'shelld.service' <<<"$SRC" \
   || { echo "FATAL: extraction lost the accept list — the arms below would be vacuous" >&2; exit 2; }
+grep -q 'name=systemd' <<<"$SRC" \
+  || { echo "FATAL: extraction lost the line picker — the E arms below would be vacuous" >&2; exit 2; }
 eval "$SRC"
 
 # The stub: replaces the ONE unforgeable reader. Everything after it is real.
@@ -123,6 +125,60 @@ if sed 's/#.*//' "$LIB" | grep -qE '\$\{?FIVE_GATE_CGROUP|\$\{?GATE_CGROUP_ACCEP
 else
   ok_t "D1 the accept list is HARDCODED — no env var can widen it"
 fi
+
+# --- E. WHICH LINE the reader picks (the `head -1` defect) -------------------
+# Graded through _gate_cgroup_pick_line, which takes the stream on stdin, so the
+# selection rule is testable while /proc/self/cgroup stays HARDCODED at the single
+# call site — no readable-path override is introduced to make a test possible.
+pick() { _gate_cgroup_pick_line <<<"$1"; }
+
+# E1 pure v2: one unified line.
+[[ "$(pick '0::/system.slice/shelld.service')" == "/system.slice/shelld.service" ]] \
+  && ok_t "E1 v2 unified line yields its path" \
+  || bad_t "E1 v2 unified" "got '$(pick '0::/system.slice/shelld.service')'"
+
+# E2 THE LOAD-BEARING ARM. v1/hybrid, systemd line NOT first and a DIFFERENT path on
+# the line that is. `head -1` returned the pids controller's '/', so a real login
+# session read as unrecognised and the human was refused. Order is the whole point.
+_V1=$'12:pids:/\n5:memory:/user.slice\n1:name=systemd:/user.slice/user-1000.slice/session-3.scope'
+[[ "$(pick "$_V1")" == "/user.slice/user-1000.slice/session-3.scope" ]] \
+  && ok_t "E2 v1/hybrid picks the name=systemd line, not the first line" \
+  || bad_t "E2 v1/hybrid systemd line" "got '$(pick "$_V1")' — head -1 behaviour is back"
+
+# E3 the E2 path must survive into the real ACCEPT decision, not just the reader.
+_CG="$(pick "$_V1")"
+if _gate_cgroup_human_capable; then
+  ok_t "E3 the v1/hybrid login session is ACCEPTED end-to-end (reader -> accept list)"
+else
+  bad_t "E3 v1/hybrid session accepted" "the picked path '$_CG' did not satisfy the accept list"
+fi
+
+# E4 hybrid where the unified line is bare '/': the systemd hierarchy still wins.
+_HY=$'0::/\n1:name=systemd:/system.slice/shelld.service'
+[[ "$(pick "$_HY")" == "/system.slice/shelld.service" ]] \
+  && ok_t "E4 hybrid with a bare '/' unified line still resolves the unit" \
+  || bad_t "E4 hybrid bare unified" "got '$(pick "$_HY")'"
+
+# E5 NO PERMISSIVE FALLBACK: a stream with neither line REFUSES rather than
+# returning some other hierarchy's path into a fail-closed accept list.
+if pick $'3:cpu:/some/other/path\n4:blkio:/whatever' >/dev/null 2>&1; then
+  bad_t "E5 unknown hierarchy refused" "the picker returned a path for a stream with no systemd line — that is the permissive fallback"
+else
+  ok_t "E5 a stream with no systemd line is REFUSED (no permissive fallback)"
+fi
+
+# E6 an empty/unreadable stream refuses.
+if pick '' >/dev/null 2>&1; then
+  bad_t "E6 empty stream refused" "the picker accepted an empty cgroup stream"
+else
+  ok_t "E6 an empty cgroup stream is REFUSED"
+fi
+
+# E7 a colon inside the unit path is not truncated — `${line##*:}` took only the
+# tail, this takes everything after the two leading columns.
+[[ "$(pick '0::/system.slice/weird:name.service')" == "/system.slice/weird:name.service" ]] \
+  && ok_t "E7 a colon in the unit path is preserved" \
+  || bad_t "E7 colon in path" "got '$(pick '0::/system.slice/weird:name.service')'"
 
 printf '\nDIVE-2371 cgroup human-principal guard: passed: %s  failed: %s\n' "$PASS" "$FAIL"
 [[ $PASS -gt 0 ]] || { printf 'FAIL - nothing was graded\n'; exit 1; }
