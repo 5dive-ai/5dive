@@ -270,9 +270,9 @@ else
   bad_t "dirty tree claimed a clean build identity" "rc=$rc head=$dirty_head stamp=${dirty_stamp:-missing} log=$dirty_log"
 fi
 
-out="$(run_guard 0.18.0 0.18.1 0 '' '' "${NEW_SHA}-dirty")"; rc=$?
-if (( rc == 0 )) && [[ "$out" == *"__DIRECTION=forward __INSTALLED_SHA= __CANDIDATE_SHA="* && "$out" != *"refusing to DOWNGRADE"* ]]; then
-  ok_t "install guard rejects a sha-dirty stamp and uses the safe fallback"
+out="$(run_guard 0.18.0 0.18.1 0 '' "$NEW_SHA" "${OLD_SHA}-dirty" behind)"; rc=$?
+if (( rc == 0 )) && [[ "$out" == *"__DIRECTION=forward __INSTALLED_SHA=$NEW_SHA __CANDIDATE_SHA="* && "$out" != *"${OLD_SHA}-dirty"* && "$out" != *"refusing"* ]]; then
+  ok_t "install guard rejects a sha-dirty candidate when both artifacts are stamped"
 else
   bad_t "install guard trusted a dirty build identity" "rc=$rc out: ${out//$'\n'/ | }"
 fi
