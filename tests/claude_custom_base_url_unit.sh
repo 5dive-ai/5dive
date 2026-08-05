@@ -151,6 +151,74 @@ else
   ok "custom id is a label, not a catalog vendor"
 fi
 
+# --- 5. THE ACCEPT PATH (DIVE-2757 iteration 2, olivia's reject) -------------
+# Every arm above this line is a REFUSAL. 11 refusals / 0 creates means the YES
+# path was unexercised, and the YES path is where this feature actually writes:
+# six assignments into a systemd EnvironmentFile that the agent reads at boot.
+# A malformed file there does not refuse — the agent comes up and fails later,
+# which is the exact failure this row pins haiku to prevent.
+#
+# Driven through the REAL profile_set_var (src/cmd_auth.sh), not a re-typed
+# copy, so the arm grades the writer that ships.
+. "$REPO_ROOT/src/cmd_auth.sh" 2>/dev/null || . ./src/cmd_auth.sh
+_ap_root=$(mktemp -d); export FIVE_STATE_DIR="$_ap_root"
+_ap_dir="$_ap_root/profiles/acceptarm"; mkdir -p "$_ap_dir"
+_ap_env="$_ap_dir/combined.env"; : > "$_ap_env"
+# minimal stand-in for the writer's contract: replace any prior VAR= line, append.
+# Drive the REAL profile_set_var from src/cmd_auth.sh — a re-typed copy would
+# grade the copy, and a copy of a writer is exactly what drifts away from the
+# guard it is supposed to be testing. Only the root-owned side effects are stubbed.
+ensure_profile_dir() { printf '%s' "$_ap_dir"; }
+chown() { :; }; chmod() { :; }
+_ap_set() { profile_set_var acceptarm "$1"; }
+
+_AP_URL="https://weights.example.com/v1"
+_AP_MODEL="qwen3.8-max"
+printf '%s' "$_AP_URL"   | _ap_set ANTHROPIC_BASE_URL
+printf '%s' "sk-test"    | _ap_set ANTHROPIC_AUTH_TOKEN
+printf '%s' "$_AP_MODEL" | _ap_set ANTHROPIC_DEFAULT_OPUS_MODEL
+printf '%s' "$_AP_MODEL" | _ap_set ANTHROPIC_DEFAULT_SONNET_MODEL
+printf '%s' "$_AP_MODEL" | _ap_set ANTHROPIC_DEFAULT_HAIKU_MODEL
+printf '%s' "3000000"    | _ap_set API_TIMEOUT_MS
+
+# 5a. ALL THREE TIERS PINNED. haiku is the one that fails silently — it is never
+# the tier an operator selects, it is what background turns reach for.
+_ap_missing=""
+for _t in OPUS SONNET HAIKU; do
+  grep -q "^ANTHROPIC_DEFAULT_${_t}_MODEL=${_AP_MODEL}$" "$_ap_env" || _ap_missing="$_ap_missing $_t"
+done
+if [[ -z "$_ap_missing" ]]; then ok "accept path pins all three model tiers"
+else bad "accept path left tier(s) unpinned:$_ap_missing"; fi
+
+# 5b. WELL-FORMED: every line is exactly one KEY=VALUE, no blanks, no strays.
+_ap_bad=$(grep -cvE '^[A-Z_][A-Z0-9_]*=' "$_ap_env" || true)
+if [[ "$_ap_bad" == "0" ]]; then ok "EnvironmentFile is well-formed (every line one KEY=VALUE)"
+else bad "EnvironmentFile has $_ap_bad malformed line(s)"; fi
+
+# 5c. NEWLINE FORGERY IS AN ACCEPT-PATH PROPERTY. The refusal arms shape-check
+# the URL; this checks what happens if one gets through — a value carrying a
+# newline must not become a SECOND assignment the agent would honour.
+_ap_before=$(cat "$_ap_env")
+if ( printf '%s' "https://evil.example.com/v1
+ANTHROPIC_AUTH_TOKEN=stolen" | _ap_set ANTHROPIC_BASE_URL ) >/dev/null 2>&1; then
+  bad "newline value was ACCEPTED by profile_set_var (it must refuse)"
+else
+  if [[ "$(cat "$_ap_env")" == "$_ap_before" ]]; then
+    ok "a newline value is REFUSED and the EnvironmentFile is left untouched"
+  else
+    bad "profile_set_var refused but still modified the file"
+  fi
+fi
+# positive control: the same writer still accepts an ordinary single-line value,
+# so the arm above grades the newline and not a writer that refuses everything.
+if printf '%s' "https://ok.example.com/v1" | _ap_set ANTHROPIC_BASE_URL 2>/dev/null \
+   && grep -q '^ANTHROPIC_BASE_URL=https://ok.example.com/v1$' "$_ap_env"; then
+  ok "positive control: an ordinary single-line value still writes"
+else
+  bad "positive control failed — the writer refuses valid values too"
+fi
+rm -rf "$_ap_root"
+
 echo
 if (( fails )); then echo "$fails failed"; exit 1; fi
 echo "all assertions passed"
