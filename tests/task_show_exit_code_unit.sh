@@ -45,7 +45,15 @@
 #   paperclip_seed_all_from_registry - LIVE: main.sh:738, bare, from update.sh
 #   paperclip_unseed_for_profile     - same shape; caller absorbs with `|| true`
 #   link_agent_profile               - latent at five bare call sites
-# Plus the one unguarded `_gate_tier2_floor_term` assignment.
+# Plus TWO unguarded `_gate_tier2_floor_term` call sites, not one — the count was
+# wrong a third time, and again because the instrument could not see the miss:
+#   cmd_task_need Rule 3 - `local v; v=$(...)`, invisible to a grep anchored to the
+#                          start of the line. Its ARGUMENT was also a phantom:
+#                          `$_dd_residual` occurs exactly once in the repo, so the
+#                          path died `unbound variable` under set -u regardless.
+#   the `_fbt` assembly   - `[[ t ]] && v="...$(...)..."`; an assignment inherits
+#                          its LAST command substitution, so the false rc arrives
+#                          from the RHS where no left-side classifier can see it.
 #
 # Sources src/ against a throwaway tasks.db (same posture as
 # project_show_graph_unit.sh) so it NEVER touches the shared queue.
@@ -63,7 +71,7 @@ TMP="$(mktemp -d /tmp/taskshow-rc-unit.XXXXXX)"
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh lib/actor.sh cmd_task.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_push.sh cmd_task.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
@@ -182,12 +190,59 @@ if declare -F _gate_tier2_floor_term >/dev/null; then
         printf '%s' "__REACHED__${v}" )
   [[ "$ft" == *"__REACHED__"* ]] && ok_t "_gate_tier2_floor_term: absorbed rc does not kill set -e" \
     || bad_t "guarded floor-term call still died" "$ft"
-  bare=$(grep -nE '^\s*[A-Za-z_]+=\$\(_gate_tier2_floor_term ' "$SRC/cmd_task.sh" \
-         | grep -v '|| *[A-Za-z_]*=""' )
-  [[ -z "$bare" ]] && ok_t "no unguarded \$(_gate_tier2_floor_term) assignment remains" \
-    || bad_t "unguarded floor-term assignment (dies under set -e when no term matches)" "$bare"
+  # The grep that used to live here is GONE, not tightened. It was anchored to
+  # `^\s*VAR=$(...`, and that anchor is exactly why iteration 3's "every call site
+  # absorbs it" was false: the Rule 3 site in `task need` is written
+  # `local _dd_term; _dd_term=$(...)`, so what PRECEDED the assignment on the
+  # physical line hid it — while a guarded site four lines away matched and the
+  # test passed on zero hits. A statement is not a line, in either direction.
+  # The claim is now checked by the same script that grants the exemption, in
+  # --call-sites mode, graded by its own control set — see the class guard below.
+  #
+  # THE OTHER HALF of that miss was not an rc at all: the argument was
+  # `$_dd_residual`, an identifier occurring EXACTLY ONCE in the repo, so it had
+  # never held a value and the substitution died `unbound variable` under set -u
+  # before absorption could matter. A read-once name in a `set -u` script is a
+  # typo by construction, so this grades the class over the two paths touched
+  # rather than the one name — and it is mutation-graded against the pre-fix file
+  # in the control section below.
+  # Whole-line comments are dropped first: a name in a comment cannot die under
+  # set -u, and this file's own fix note names the phantom it removed.
+  phantom=$(grep -vE '^[[:space:]]*#' "$SRC/cmd_task.sh" \
+            | grep -ohE '\$\{?(_dd_|_ft_|_fbt)[a-zA-Z0-9_]*' \
+            | sed -E 's/^\$\{?//' | sort -u \
+            | while read -r v; do
+                grep -qE "(^|[ \t;(&|])${v}=" "$SRC/cmd_task.sh" || printf '%s\n' "$v"
+              done)
+  [[ -z "$phantom" ]] && ok_t "no read-once phantom identifier on the gate-term paths" \
+    || bad_t "an identifier is READ but never assigned (dies 'unbound variable' under set -u)" "$phantom"
 else
   bad_t "_gate_tier2_floor_term missing" "helper was renamed or removed"
+fi
+
+# ---- and the same path EXECUTED, not merely scanned ----
+# main2 could only prove the Rule 3 defect statically: reaching it needs a floored
+# gate, and they were not going to file one on the shared prod store to prove a
+# point. This harness already owns a throwaway tasks.db, so it can just run it —
+# a gate whose ask names money is floored, and --discusses asks to appeal that.
+# On the pre-fix text this died `line 7385: _dd_residual: unbound variable` before
+# the sentinel; the assertion is the sentinel PLUS the refusal actually naming its
+# term, so a "fix" that silences the path without answering also fails here.
+if declare -F cmd_task_need >/dev/null && declare -F _push_branch_from_body >/dev/null; then
+  r3id=$(mk "probe row for the rule 3 appeal path")
+  r3=$(ident_of "$r3id")
+  r3out=$( set -euo pipefail
+           cmd_task_need "$r3" --type=decision \
+             --ask="approve a \$500 spend on the ads account" \
+             --discusses="this is a design discussion, not a spend" 2>&1
+           echo "__REACHED__" )
+  [[ "$r3out" == *"__REACHED__"* ]] && ok_t "task need --discusses on a floored gate survives Rule 3 (executed)" \
+    || bad_t "Rule 3 path still dies before the next statement" "$r3out"
+  [[ "$r3out" == *"--discusses REFUSED"* && "$r3out" == *"matched '"*"'"* ]] \
+    && ok_t "Rule 3 refusal renders and NAMES the surviving term" \
+    || bad_t "Rule 3 refusal did not name its term (a silent fix passes the rc arm alone)" "$r3out"
+else
+  bad_t "Rule 3 arm not runnable" "cmd_task_need or _push_branch_from_body did not source"
 fi
 
 # ================= fifth+sixth instance: cmd_project_show (found by main2) ==========
@@ -403,6 +458,88 @@ neg=$(scan "$TMP/ctl/negative.sh" 2>&1)
 unreadable=$(scan "$TMP/ctl/does-not-exist.sh" 2>/dev/null; echo "rc=$?")
 [[ "$unreadable" == *"rc=2"* ]] && ok_t "unscannable input exits 2, not 0 (silence is not a pass)" \
   || bad_t "scanner reported clean on input it could not read" "$unreadable"
+
+# ============ call-site guard: the ALLOWLIST's own justification ============
+# Iterations 1 and 2 leaked through a blind DETECTOR. Iteration 3's detector was
+# sound and the leak moved one level out, into the three allowlist entries' REASON
+# — "every call site absorbs it", checked by exactly the kind of prefix regex the
+# detector had been rewritten to stop using. An exemption is only as good as its
+# justification, so the justification is a guard now, not prose.
+unabsorbed=$(scan --call-sites 2>&1)
+[[ -z "$unabsorbed" ]] && ok_t "every allowlisted rc-bearing call absorbs its status (call-site guard)" \
+  || bad_t "an allowlisted contract's rc reaches a plain assignment (dies under set -e)" "$unabsorbed"
+
+# ---- control SET for the call-site guard ----
+# Same rule as above: the positives are the shapes the REPLACED grep could not
+# see, so "it is quiet" cannot be the evidence.
+cat > "$TMP/ctl/cs-positive.sh" <<'CTL'
+same_line_local() {         # the actual escapee: prefix-blind, not shape-blind
+  local _dd_term; _dd_term=$(_gate_tier2_floor_term "$1")
+  printf '%s\n' "$_dd_term"
+}
+rhs_substitution() {        # rc arrives from the RHS — invisible to any detector
+  local _fbt=""             # that classifies the LEFT side of &&
+  _fbt=" matched '$(_gate_tier2_floor_term "$1")' in the title"
+  printf '%s\n' "$_fbt"
+}
+conditional_assign() {      # test TRUE, assignment still hands over the call's rc
+  local _cav=""
+  [[ -n "$1" ]] && _cav=$(_gate_tier2_floor_term "$1")
+  printf '%s\n' "$_cav"
+}
+wrapped_assign() {          # the statement continues onto the next physical line
+  local _wav=""
+  _wav=$(_gate_tier2_floor_term \
+      "$1")
+  printf '%s\n' "$_wav"
+}
+CTL
+cat > "$TMP/ctl/cs-negative.sh" <<'CTL'
+absorbed() {                # the documented contract
+  local v; v=$(_gate_tier2_floor_term "$1") || v=""
+  printf '%s\n' "$v"
+}
+as_argument() {             # rc goes to printf, not to this statement
+  printf 'matched %s\n' "$(_gate_tier2_floor_term "$1")"
+}
+in_condition() {            # rc is the test's, not the call's
+  if [[ -n "$(_gate_tier2_floor_term "$1")" ]]; then printf 'hit\n'; fi
+}
+builtin_prefix() {          # `local` returns the BUILTIN's status, which is 0
+  local v=$(_gate_tier2_floor_term "$1")
+  printf '%s\n' "$v"
+}
+CTL
+cspos=$(scan --call-sites "$TMP/ctl/cs-positive.sh" 2>&1)
+for shape in same_line_local rhs_substitution conditional_assign wrapped_assign; do
+  case "$shape" in
+    same_line_local)    probe='_dd_term=$(' ;;
+    rhs_substitution)   probe='_fbt=" matched' ;;
+    conditional_assign) probe='_cav=$(' ;;
+    wrapped_assign)     probe='_wav=$(' ;;
+  esac
+  [[ "$cspos" == *"$probe"* ]] && ok_t "call-site guard FIRES on $shape (positive control)" \
+    || bad_t "call-site guard is BLIND to $shape" "$cspos"
+done
+csneg=$(scan --call-sites "$TMP/ctl/cs-negative.sh" 2>&1)
+[[ -z "$csneg" ]] && ok_t "call-site guard stays silent on all four absorbing shapes (negative control)" \
+  || bad_t "call-site guard fires on an absorbed call — it would be widened-then-muted" "$csneg"
+
+# ---- mutation control for the phantom-identifier arm ----
+# The arm above is a regex, and a regex that has only ever been run on a CLEAN
+# file has not been shown to fire. Hand it the pre-fix text.
+mkdir -p "$TMP/ctl/pre"
+{ printf 'phantom_arg() {\n  local _dd_res_ask=""\n'
+  printf '  local _dd_term; _dd_term=$(_gate_tier2_floor_term "$_dd_residual")\n'
+  printf '  printf %s "$_dd_term" "$_dd_res_ask"\n' "'%s%s\\n'"
+  printf '}\n'; } > "$TMP/ctl/pre/cmd_task.sh"
+premiss=$(grep -ohE '\$\{?(_dd_|_ft_|_fbt)[a-zA-Z0-9_]*' "$TMP/ctl/pre/cmd_task.sh" \
+          | sed -E 's/^\$\{?//' | sort -u \
+          | while read -r v; do
+              grep -qE "(^|[ \t;(&|])${v}=" "$TMP/ctl/pre/cmd_task.sh" || printf '%s\n' "$v"
+            done)
+[[ "$premiss" == *"_dd_residual"* ]] && ok_t "phantom-identifier arm FIRES on the pre-fix text (mutation control)" \
+  || bad_t "phantom-identifier arm cannot see the defect it was written for" "got='$premiss'"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

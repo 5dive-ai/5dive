@@ -32,22 +32,50 @@
 # Anything left over is a genuine judgement call and is named in ALLOWLIST below
 # with the reason, so the guard stays armed instead of being widened until quiet.
 #
-# Usage: scripts/scan-trailing-conditional.sh [file ...]   (default: src/*.sh src/lib/*.sh)
+# SECOND MODE — `--call-sites`. An allowlist entry is only as good as the reason
+# it rests on, and iteration 3 shipped a false one: "every call site absorbs it"
+# had been checked by a grep anchored to the start of the line, so an unguarded
+# assignment written `local v; v=$(f ...)` was invisible to it while a guarded one
+# four lines away matched. Same failure mode as the two blind detectors above,
+# moved one level out — into the justification. So the justification is checked by
+# this script too: `--call-sites` masks quotes and command-substitution bodies,
+# splits on TOP-LEVEL `;` (a statement is not a line, in either direction), and
+# asks of each statement whether the substitution's rc can become the statement's.
+#
+# Usage: scripts/scan-trailing-conditional.sh [--call-sites] [file ...]
+#        (default file set: src/*.sh src/lib/*.sh src/council/*.sh scripts/*.sh
+#         plus the customer-facing runners)
 # Exit 0 = nothing found, 1 = offenders printed to stdout, 2 = could not scan.
 set -uo pipefail
 
 # Deliberate survivors. Each is a contract that is intentionally rc-bearing and
-# whose call sites already absorb it — NOT an instance we could not fix.
+# whose call sites already absorb it — NOT an instance we could not fix. Re-audited
+# call site by call site in iteration 4; `--call-sites` is what keeps these honest.
 ALLOWLIST='_gate_tier2_floor_term|_compose_create_args|_gate_anon_ok'
-# _gate_tier2_floor_term - value producer; rc 1 means "named no term". Every call
-#   site absorbs it (`|| v=""`), asserted directly in task_show_exit_code_unit.sh.
-# _compose_create_args   - its only caller reads it through a process substitution
-#   (`mapfile -t args < <(...)`), where the rc never reaches errexit.
+# _gate_tier2_floor_term - value producer; rc 1 means "named no term". FIVE call
+#   sites in src/cmd_task.sh: 7208 and 7210 absorb with `|| _floor_term=""`, 8299
+#   the same; the Rule 3 site in cmd_task_need and the `_fbt` string assembly did
+#   NOT until iteration 4 and now do. The claim is asserted by `--call-sites`
+#   below, run from task_show_exit_code_unit.sh — not by a grep, and not by prose.
+# _compose_create_args   - one call site, cmd_compose.sh:421, read through a
+#   process substitution (`mapfile -t args < <(...)`) where the rc never reaches
+#   errexit. Re-checked: `_compose_create_args` appears nowhere else in the tree.
 # _gate_anon_ok          - a genuine predicate whose consequent happens to be a
 #   `command -v` probe rather than a bracket test, so elimination cannot see it
-#   is a test. Returning "is anonymous access possible" IS its contract.
+#   is a test. Returning "is anonymous access possible" IS its contract. Two call
+#   sites, both predicate-context: cmd_task.sh:1757 is the last statement of
+#   _gate_gh_reachable (itself a predicate, so the rc is the answer) and 1989 is
+#   `_gate_anon_ok || return 1`.
 
 cd "$(dirname "$0")/.." || { echo "scan: cannot reach repo root" >&2; exit 2; }
+MODE=trailing
+while [[ ${1:-} == --* ]]; do
+  case "$1" in
+    --call-sites) MODE=callsites; shift ;;
+    --trailing)   MODE=trailing;  shift ;;
+    *) echo "scan: unknown option $1" >&2; exit 2 ;;
+  esac
+done
 files=("$@")
 if (( ${#files[@]} == 0 )); then
   shopt -s nullglob
@@ -145,10 +173,116 @@ scan_one() {
   '
 }
 
+# ---- mode 2: are the ALLOWLIST contracts actually absorbed where they are CALLED? ----
+# The rc of `v=$(f)` IS f's rc — and so is the rc of `v="text $(f) more"`, because
+# an assignment inherits its LAST command substitution. Neither is visible to a
+# detector that classifies the left side of `&&`, and neither is findable by a
+# pattern anchored to the start of a line. Decided by elimination again:
+#   * mask quoted regions and command-substitution BODIES to same-length filler,
+#     so every `;` `&&` `||` found in the mask is top level by construction;
+#   * cut the record into statements at those `;` — this is the whole point: the
+#     escapee was the second statement of `local v; v=$(f ...)`;
+#   * strip leading `then/else/do/{/!` and split each statement into && / || operands;
+#   * an operand that is a bare ASSIGNMENT containing the call, with no top-level
+#     `||` after it, is where the rc leaks. Everything else falls out structurally:
+#     a test operand's rc is the test, a `local`/`export` prefix returns the
+#     BUILTIN's status, and a call passed as an ARGUMENT hands its rc to the outer
+#     command, not to the statement.
+scan_call_sites_one() {
+  local f="$1"
+  awk '
+    { if (cont) { line = line " " $0 } else { line = $0; ln = FNR }
+      if (line ~ /\\$/) { sub(/\\[ \t]*$/, "", line); cont = 1; next }
+      cont = 0
+      printf "%d\t%s\n", ln, line }
+    END { if (cont) printf "%d\t%s\n", ln, line }
+  ' "$f" |
+  awk -v FNAME="$f" -v ALLOW="$ALLOWLIST" '
+    BEGIN { SQ = sprintf("%c", 39) }
+    # same length as the input, with quotes and $( ) bodies blanked
+    function mask(l,   i,c,n,out,inq,ind,depth) {
+      n = length(l); out = ""; inq = 0; ind = 0; depth = 0
+      for (i = 1; i <= n; i++) {
+        c = substr(l, i, 1)
+        if (depth > 0) {
+          if (c == "(") depth++; else if (c == ")") depth--
+          out = out "."; continue
+        }
+        if (inq) { if (c == SQ) inq = 0; out = out "."; continue }
+        if (ind) { if (c == "\"") ind = 0; out = out "."; continue }
+        if (c == SQ)   { inq = 1; out = out "."; continue }
+        if (c == "\"") { ind = 1; out = out "."; continue }
+        if (c == "$" && substr(l, i+1, 1) == "(") { depth = 1; out = out ".."; i++; continue }
+        out = out c
+      }
+      return out
+    }
+    function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+    function dekeyword(s) {
+      while (s ~ /^[ \t]*(then|else|do|\{|!)([ \t]|$)/) sub(/^[ \t]*(then|else|do|\{|!)[ \t]*/, "", s)
+      return trim(s)
+    }
+    # rc of this operand comes from the call itself?
+    function leaks(op) {
+      op = dekeyword(op)
+      if (op ~ /^(if|elif|while|until|case|for)([ \t]|$)/) return 0   # condition context
+      if (op ~ /^(\[\[|\(\(|\[)([ \t]|$)/) return 0                  # rc is the test
+      if (op ~ /^(local|declare|typeset|export|readonly)[ \t]/) return 0  # builtin rc
+      if (op !~ /^[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=/) return 0   # argument to a command
+      return 1
+    }
+    { ln = $1; sub(/^[0-9]+\t/, "") }
+    {
+      raw = $0
+      if (raw ~ /^[ \t]*#/) next
+      if (raw !~ ("\\$\\((" ALLOW ")([ \t)]|$)")) next
+      m = mask(raw)
+      # cut into statements on top-level ;
+      nstmt = 0; start = 1
+      for (i = 1; i <= length(m); i++) {
+        if (substr(m, i, 1) == ";") {
+          nstmt++; stmt[nstmt] = substr(raw, start, i - start); smask[nstmt] = substr(m, start, i - start)
+          start = i + 1
+        }
+      }
+      nstmt++; stmt[nstmt] = substr(raw, start); smask[nstmt] = substr(m, start)
+      for (s = 1; s <= nstmt; s++) {
+        if (stmt[s] !~ ("\\$\\((" ALLOW ")([ \t)]|$)")) continue
+        # split the statement into && / || operands, remembering where the || are
+        nop = 0; ostart = 1; sawpipe = 0; hit = 0
+        sm = smask[s]
+        for (i = 1; i <= length(sm) - 1; i++) {
+          op2 = substr(sm, i, 2)
+          if (op2 == "&&" || op2 == "||") {
+            nop++; opnd[nop] = substr(stmt[s], ostart, i - ostart); okind[nop] = op2
+            ostart = i + 2; i++
+          }
+        }
+        nop++; opnd[nop] = substr(stmt[s], ostart); okind[nop] = ""
+        for (o = 1; o <= nop; o++) {
+          if (opnd[o] !~ ("\\$\\((" ALLOW ")([ \t)]|$)")) continue
+          if (!leaks(opnd[o])) continue
+          # a top-level || anywhere after this operand absorbs the status
+          sawpipe = 0
+          for (k = o; k <= nop; k++) if (okind[k] == "||") sawpipe = 1
+          if (sawpipe) continue
+          printf "%s:%d  rc of an allowlisted call is not absorbed\n    %s\n", FNAME, ln, substr(trim(opnd[o]), 1, 120)
+          hit = 1
+        }
+      }
+    }
+    END { exit 0 }
+  '
+}
+
 rc=0
 for f in "${files[@]}"; do
   [[ -r "$f" ]] || { echo "scan: cannot read $f" >&2; exit 2; }
-  out=$(scan_one "$f") || { echo "scan: awk failed on $f" >&2; exit 2; }
+  if [[ "$MODE" == callsites ]]; then
+    out=$(scan_call_sites_one "$f") || { echo "scan: awk failed on $f" >&2; exit 2; }
+  else
+    out=$(scan_one "$f") || { echo "scan: awk failed on $f" >&2; exit 2; }
+  fi
   if [[ -n "$out" ]]; then printf '%s\n' "$out"; rc=1; fi
 done
 exit "$rc"
