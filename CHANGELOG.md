@@ -65,18 +65,24 @@ branch does not exist on the remote. Fleet coverage on this host went **1 → 22
 23**; the remaining one is a worktree owned by a uid this session cannot assume, and
 its origin is a local path whose target is guarded.
 
-## v0.19.0 — fix(tasks-db): fresh and migrated schemas must converge (DIVE-2197)
+## v0.19.0 — fix(tasks-db): converge schemas without taxing every init (DIVE-2197, DIVE-2808)
 
-`tasks_db_init` now runs additive reconciliation for fresh stores as well as
-existing ones, then verifies the resulting `tasks` column set. This restores six
-columns that the canonical fresh schema omitted (`delivery_ref`, `delivered_at`,
-`parked_at`, `park_reason`, `escalated_at`, `escalated_by`) and turns a failed
-`ALTER TABLE` into a loud initialization failure instead of a healthy-looking
-partial schema.
+The canonical `tasks` CREATE now contains all 71 columns, including the eight that
+previously existed only in the additive migration list (`delivery_ref`,
+`delivered_at`, `delivery_ref_iteration`, `parked_at`, `park_reason`,
+`escalated_at`, `escalated_by`, and `human_evidence`). `tasks_db_init` checks the
+current column set once and skips the full migration when it is already complete.
+The gate uses pure Bash matching and derives its requirements from the exact array
+the migration loop consumes, so it cannot become a third drifting column list.
 
-The isolated restore harness asserts all six columns on a fresh `STATE_DIR` and
-injects a failure into the `delivery_ref` ALTER. Removing only the resulting-set
-assertion makes that arm red, proving the refusal is connected to the source path.
+DIVE-2197's loud resulting-set assertion remains on both the migrate and skip
+paths. The isolated restore harness proves all 71 columns exist on a fresh
+`STATE_DIR`, injects a failed `delivery_ref` ALTER, forces a lying skip-gate over
+the same one-column hole, and appends a test-only column to the migration array to
+show that the gate and ALTER path follow it. On this 4-core host, 20 isolated fresh
+initializations measured a 126 ms median, 22 ms over the 104 ms pre-DIVE-2197
+baseline and within the 30 ms acceptance envelope; the full migration had measured
+517 ms.
 
 ## v0.19.0 — fix(heartbeat): surface a recurring instance that was never started (DIVE-2693)
 

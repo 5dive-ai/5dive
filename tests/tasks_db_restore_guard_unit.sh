@@ -171,23 +171,26 @@ out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
 [[ "$(row_count)" == "3" ]] && ok "paired: explicit TASKS_BACKUP_DIR still restores" \
   || bad "paired: rows=$(row_count) ($out)"
 
-# --- Case 9 (DIVE-2197): a fresh schema contains all six additive columns -----
-# These lived only in the migration list, while a genuinely fresh STATE_DIR
-# skipped migration. The result was a green init over a partial tasks table.
+# --- Case 9 (DIVE-2808): canonical schema is complete at birth ----------------
+# Eight columns lived only in the migration list. The completed CREATE must have
+# the full 71-column tasks surface before the skip-gate is allowed to save work.
 fresh_tree
 out=$(tasks_db_init 2>&1); rc=$?
-required='delivered_at delivery_ref escalated_at escalated_by park_reason parked_at'
+required='delivered_at delivery_ref delivery_ref_iteration escalated_at escalated_by human_evidence park_reason parked_at'
 actual=$(sqlite3 "$TASKS_DB" \
   "SELECT name FROM pragma_table_info('tasks')
-    WHERE name IN ('delivery_ref','delivered_at','parked_at','park_reason','escalated_at','escalated_by')
+    WHERE name IN ('delivery_ref','delivered_at','delivery_ref_iteration','parked_at','park_reason','escalated_at','escalated_by','human_evidence')
     ORDER BY name;" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
-[[ $rc -eq 0 && "$actual" == "$required" ]] \
-  && ok "fresh schema: all six additive columns are present" \
-  || bad "fresh schema: init returned a partial tasks table" "rc=$rc got=[$actual] want=[$required] out=$out"
+column_count=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM pragma_table_info('tasks');" 2>/dev/null)
+[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "71" ]] \
+  && ok "fresh schema: all 71 columns, including the eight former holes, are present" \
+  || bad "fresh schema: init returned a partial tasks table" "rc=$rc count=$column_count got=[$actual] want=[$required] out=$out"
 
-# --- Case 10 (DIVE-2197): one ALTER fails -> init fails loudly ----------------
+# --- Case 10 (DIVE-2197): migrate arm still rejects a failed ALTER ------------
 fresh_tree
+tasks_db_init >/dev/null 2>&1
 real_sqlite=$(command -v sqlite3)
+"$real_sqlite" "$TASKS_DB" "ALTER TABLE tasks DROP COLUMN delivery_ref;"
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/sqlite3" <<'SQLITE_SHIM'
 #!/usr/bin/env bash
@@ -213,6 +216,48 @@ grep -q 'schema incomplete.*delivery_ref' <<<"$out" \
 [[ "$actual" == 'delivered_at escalated_at escalated_by park_reason parked_at' ]] \
   && ok "failed ALTER: mutation applied and only delivery_ref remains absent" \
   || bad "failed ALTER: mutation precondition/result is not the intended one-column hole" "got=[$actual]"
+
+# --- Case 11 (DIVE-2808): skip arm retains the resulting-set assertion --------
+# Force the gate to lie over a one-column hole. Removing the skip-arm assertion
+# makes this mutation green, so the test proves that path is connected too.
+fresh_tree
+tasks_db_init >/dev/null 2>&1
+sqlite3 "$TASKS_DB" "ALTER TABLE tasks DROP COLUMN delivery_ref;"
+out=$( ( _tasks_db_migration_needed() {
+           _TASKS_DB_GATE_COLUMNS=$(sqlite3 "$TASKS_DB" \
+             "SELECT name FROM pragma_table_info('tasks');" 2>/dev/null)
+           return 1
+         }
+         tasks_db_init ) 2>&1); rc=$?
+[[ $rc -ne 0 ]] \
+  && ok "skip assertion: a lying gate cannot accept a partial schema" \
+  || bad "skip assertion: partial schema was silently accepted" "rc=$rc out=$out"
+grep -q 'schema incomplete.*delivery_ref' <<<"$out" \
+  && ok "skip assertion: refusal names the missing column" \
+  || bad "skip assertion: refusal does not identify the hole" "out=$out"
+
+# --- Case 12 (DIVE-2808): gate derives its list from the migration array ------
+# Change the array alone. The gate must immediately follow that new requirement,
+# and the same array must drive the ALTER that satisfies it.
+fresh_tree
+tasks_db_init >/dev/null 2>&1
+if _tasks_db_migration_needed; then
+  bad "derived gate: complete canonical schema unexpectedly needs migration"
+else
+  ok "derived gate: complete canonical schema takes the skip path"
+fi
+_TASKS_ADDITIVE_COLUMNS+=('dive2808_probe TEXT')
+if _tasks_db_migration_needed; then
+  ok "derived gate: array-only column addition enters migration"
+else
+  bad "derived gate: array-only column addition was ignored"
+fi
+out=$(_tasks_db_migrate 2>&1); rc=$?
+probe=$(sqlite3 "$TASKS_DB" \
+  "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='dive2808_probe';" 2>/dev/null)
+[[ $rc -eq 0 && "$probe" == "1" ]] \
+  && ok "derived gate: migration follows the same array and adds its column" \
+  || bad "derived gate: migration did not follow the array" "rc=$rc probe=$probe out=$out"
 
 echo
 echo "tasks-db restore guard: $PASS passed, $FAIL failed"
