@@ -1,4 +1,21 @@
 #!/usr/bin/env bash
+# TIER: nightly — 2.0s measured on the control plane (two runs, 1.18s/2.03s; the
+# 2.0s figure is the one with the provenance arms). The core tier came in at
+# 322s against a 318s effective cap on the installed-host job of PR #503 —
+# OVER BUDGET by 4s, confirmed twice (323s then 322s) — and this harness is
+# essentially that overage. Demotion is the THIRD option and has to be argued,
+# so: MERGE-by-subject does not apply (tests/pii_scan_range_unit.sh grades the
+# scanner over a commit range; this grades installation and push refusal across
+# repos — no shared setup to reclaim, and folding them would drop neither file's
+# assertions but would hide two subjects behind one name). RETIRE does not apply
+# to a guard for a class that just fired. What is left is moving the cost, and
+# this is a good candidate for it: it drives real `git push` against local bare
+# remotes, so its cost is process spawns rather than logic, and it guards an
+# INSTALL path that changes rarely. Editing it always runs it regardless of tier
+# (the changed-harnesses job), so the demotion does not make a change to this
+# file unguarded — it only keeps a rarely-changing integration test out of every
+# unrelated PR.
+#
 # DIVE-2788 — the pre-push PII guard reaches repos that are NOT 5dive-ai/5dive.
 #
 # THE MEASURED DEFECT. scripts/install-pii-push-guard.sh called itself
