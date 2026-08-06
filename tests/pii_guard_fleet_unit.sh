@@ -270,6 +270,127 @@ frep2="$(PATH="$STUBBIN:$PATH" bash "$FLEET" --root "$FROOT" 2>&1)"
 case "$frep2" in *PUBLIC*) ok_t "arm8 positive control: a gh that ANSWERS is reported (UNKNOWN is not unconditional)" ;;
   *) fail_t "arm8 visibility is UNKNOWN even when gh answers — the column asserts nothing" ;; esac
 
+# ── arms 9-12: PROVISIONING (DIVE-2803) ───────────────────────────────────────
+#
+# Merged into this file rather than filed as a new harness: the subject is
+# identical (how far the PII guard actually reaches), the fixtures above are the
+# ones these arms need, and the core tier is at ~96% of its cap — CLAUDE.md's
+# first way out is "merge by subject", and this is that case exactly.
+#
+# THE DEFECT THESE GRADE. install.sh's PII block used to be a loop over
+# PRE-EXISTING checkouts of this repo. install.sh never clones (`git clone`
+# appears nowhere in it), so on a freshly provisioned box the loop iterated ZERO
+# times and /usr/local/share/5dive/pii-guard was never created. The guard was
+# "fleet-wide" on a census of boxes that already had a checkout, and absent on
+# every box provisioning made after it — DIVE-1997's error one layer up.
+#
+# Executed, not grepped: the staging block is EXTRACTED VERBATIM from install.sh
+# (the tests/install_monotonicity_unit.sh idiom) and run against a file:// $REPO,
+# so a rewrite of that block that stops populating the guard home fails here.
+# Hermetic — $LIB_DIR, $REPO and PII_GUARD_HOME are all inside $TMP, and the
+# denylist is the FIXTURE one (reserved fake 1234567890), never the real file.
+PGBLOCK="$(sed -n '/^  # >>> DIVE-2803 guard-home staging/,/^  # <<< DIVE-2803 guard-home staging/p' "$ROOT/install.sh")"
+if [[ -z "$PGBLOCK" ]]; then
+  fail_t "arm9 could not extract the DIVE-2803 staging block from install.sh (markers moved or removed)"
+else
+  ok_t "arm9 the DIVE-2803 staging block is extractable from install.sh"
+
+  # A file:// $REPO standing in for the pinned release tree. Same four paths
+  # install.sh fetches, same layout, so the extracted block is unmodified.
+  PGREPO="$TMP/pgrepo"
+  mkdir -p "$PGREPO/scripts/git-hooks-portable" "$PGREPO/.github"
+  cp "$INSTALLER" "$PGREPO/scripts/install-pii-push-guard.sh"
+  cp "$ROOT/scripts/git-hooks-portable/pre-push" "$PGREPO/scripts/git-hooks-portable/pre-push"
+  cp "$SCANNER" "$PGREPO/scripts/pii-scan.sh"
+  printf '%s\n' "$(printf '1234567890' | sha256sum | awk '{print $1}')" > "$PGREPO/.github/pii-denylist.txt"
+
+  # Not a real commit and never was — a fixture sha, per the reserved-fakes rule.
+  PGSHA=0123456789abcdef0123456789abcdef01234567
+
+  run_pg_block() { # <lib-dir> <repo-url> <pinned-sha> <guard-home>
+    LIB_DIR="$1" REPO="$2" GH_PINNED_SHA="$3" PII_GUARD_HOME="$4" \
+      bash -c 'set -uo pipefail
+export PII_GUARD_HOME
+ok() { echo "  ok $*"; }
+mkdir -p "$LIB_DIR"
+'"$PGBLOCK"'' 2>&1
+  }
+
+  PGLIB="$TMP/pglib"; PGHOME="$TMP/pghome"
+  out9="$(run_pg_block "$PGLIB" "file://$PGREPO" "$PGSHA" "$PGHOME")"
+
+  # arm 9: the guard home is POPULATED on a box with no checkout of this repo.
+  # All four files, because a hook whose payload never arrived reads exactly
+  # like an installed one (the same reason arm 2 exists).
+  miss=""
+  for f in pre-push pii-scan.sh pii-denylist.txt INSTALLED; do
+    [[ -s "$PGHOME/$f" ]] || miss="$miss $f"
+  done
+  if [[ -z "$miss" ]]; then
+    ok_t "arm9 fresh box (no checkout): guard home populated with hook, scanner, denylist and stamp"
+  else
+    fail_t "arm9 guard home missing:$miss — output: $out9"
+  fi
+  [[ -x "$PGHOME/pre-push" ]] \
+    && ok_t "arm9 the staged hook is executable (a non-exec hook is silently skipped by git)" \
+    || fail_t "arm9 staged pre-push is not executable"
+
+  # arm 10: the stamp NAMES THE COMMIT. The row's ACCEPTANCE says the INSTALLED
+  # stamp on a provisioned box names a real commit; a staged tree has no .git,
+  # so without PII_GUARD_SRC_SHA every provisioned box would stamp UNKNOWN.
+  got_sha="$(sed -n 's/^source_sha=//p' "$PGHOME/INSTALLED" 2>/dev/null)"
+  chk "arm10 INSTALLED names the pinned commit, not UNKNOWN" "${PGSHA:0:12}" "$got_sha"
+
+  # NEGATIVE CONTROL for arm 10, and it is the arm that makes the one above mean
+  # something: with no pinned sha the stamp must say UNKNOWN rather than invent a
+  # value. Without this, "names a commit" is equally satisfied by a stamp that
+  # always prints something.
+  PGHOME2="$TMP/pghome2"
+  run_pg_block "$TMP/pglib2" "file://$PGREPO" "" "$PGHOME2" >/dev/null 2>&1
+  chk "arm10 negative control: no pinned sha stamps UNKNOWN (no value is invented)" \
+      UNKNOWN "$(sed -n 's/^source_sha=//p' "$PGHOME2/INSTALLED" 2>/dev/null)"
+
+  # SECOND NEGATIVE CONTROL: PII_GUARD_SRC_SHA must not be able to launder a git
+  # tree's real state. Run the installer from THIS repo (a git tree) with the
+  # fixture sha exported; the stamp must report the tree, never the variable.
+  PGHOME3="$TMP/pghome3"
+  PII_GUARD_HOME="$PGHOME3" PII_GUARD_SRC_SHA="$PGSHA" bash "$INSTALLER" --sync >/dev/null 2>&1
+  case "$(sed -n 's/^source_sha=//p' "$PGHOME3/INSTALLED" 2>/dev/null)" in
+    "${PGSHA:0:12}") fail_t "arm10 PII_GUARD_SRC_SHA overrode a real git tree — a dirty checkout could stamp itself clean" ;;
+    "")              fail_t "arm10 no source_sha written when syncing from a git tree" ;;
+    *)               ok_t "arm10 PII_GUARD_SRC_SHA is ignored when \$SRC_REPO is a git tree" ;;
+  esac
+
+  # arm 11: THE GATE DECISION, asserted on the code rather than left in a body.
+  # DIVE-2803 was answered B: provisioning wires the guard home and the box's own
+  # CLI checkout, and pii-guard-fleet.sh --install is NOT on that path, because
+  # install.sh runs as ROOT where the tool's EPERM-by-owner bound cannot fire.
+  # A future edit that "completes" the wiring by adding it is the exact change
+  # that needs to come back to a human, so it fails here.
+  case "$PGBLOCK" in
+    *pii-guard-fleet*) fail_t "arm11 the provisioning path invokes pii-guard-fleet.sh — DIVE-2803 answered B: report-only, off this path" ;;
+    *)                 ok_t "arm11 provisioning does not invoke pii-guard-fleet.sh (DIVE-2803 gate answer B holds)" ;;
+  esac
+
+  # arm 12: an offline/mirror $REPO that does not serve the payload must WARN and
+  # leave the box alone — never fail the install, and never delete the staged
+  # tree it already has. REPO=file:///opt/5dive-bundle is the documented offline
+  # install path and it ships only the bundle, so this is a real shape.
+  before="$(cat "$PGLIB/pii-guard-src/scripts/pii-scan.sh" 2>/dev/null | wc -c)"
+  # Without this, "before == after" is satisfied by 0 == 0 — i.e. by a staging
+  # step that never wrote anything, which is the failure arm12 exists to catch.
+  [[ "$before" -gt 0 ]] \
+    && ok_t "arm12 precondition: arm9 left a staged payload under \$LIB_DIR to survive" \
+    || fail_t "arm12 precondition: no staged payload under \$LIB_DIR — the survival check would be vacuous"
+  out12="$(run_pg_block "$PGLIB" "file://$TMP/nonexistent-mirror" "$PGSHA" "$PGHOME")"
+  rc12=$?
+  after="$(cat "$PGLIB/pii-guard-src/scripts/pii-scan.sh" 2>/dev/null | wc -c)"
+  chk "arm12 a mirror that does not serve the payload does not fail the install" 0 "$rc12"
+  case "$out12" in *warn:*) ok_t "arm12 the miss is announced, not silent" ;;
+    *) fail_t "arm12 payload staging failed with no warning — a silent miss reads as installed" ;; esac
+  chk "arm12 the previously staged payload survives a failed refresh" "$before" "$after"
+fi
+
 echo
 echo "$PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]] || exit 1

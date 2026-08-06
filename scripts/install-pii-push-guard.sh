@@ -58,7 +58,10 @@
 #   scripts/install-pii-push-guard.sh --status [dir]    # report, change nothing
 #
 # Env:
-#   PII_GUARD_HOME  override the guard home (default below)
+#   PII_GUARD_HOME      override the guard home (default below)
+#   PII_GUARD_SRC_SHA   provenance for the INSTALLED stamp when this script runs
+#                       from a STAGED copy with no .git (install.sh's provisioning
+#                       path, DIVE-2803). Ignored whenever $SRC_REPO is a git tree.
 set -uo pipefail
 
 SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -77,7 +80,7 @@ for a in "$@"; do
   case "$a" in
     --sync)    MODE=sync ;;
     --status)  MODE=status ;;
-    -h|--help) sed -n '1,62p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '1,64p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *)         TARGET="$a" ;;
   esac
 done
@@ -128,11 +131,23 @@ sync_guard_home() {
   # a bare sha here would assert provenance the bytes do not have — this row's
   # own defect class, inside the artifact meant to make provenance readable.
   # Three states, never two: clean sha, sha+uncommitted, or UNKNOWN.
+  #
+  # DIVE-2803 adds a FOURTH source, not a fourth state. Provisioning stages this
+  # script and its three payload files out of the pinned release tree into
+  # $LIB_DIR (a fresh box has no checkout to run from), so $SRC_REPO there is a
+  # plain directory with no .git — every run would stamp UNKNOWN for a payload
+  # whose commit is precisely known. PII_GUARD_SRC_SHA supplies it, and is read
+  # ONLY when there is no git tree to contradict it: a dirty checkout must never
+  # be able to launder itself into a clean sha by exporting the variable. It is
+  # also shape-checked, because a stamp that names a non-sha is worse than one
+  # that admits UNKNOWN.
   local sha
   if sha="$(git -C "$SRC_REPO" rev-parse --short HEAD 2>/dev/null)" && [[ -n "$sha" ]]; then
     if ! git -C "$SRC_REPO" diff --quiet HEAD -- scripts .github/pii-denylist.txt 2>/dev/null; then
       sha="$sha+uncommitted"
     fi
+  elif [[ "${PII_GUARD_SRC_SHA:-}" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+    sha="${PII_GUARD_SRC_SHA:0:12}"
   else
     sha=UNKNOWN
   fi
