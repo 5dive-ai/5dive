@@ -393,6 +393,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- DIVE-2403 ate 07-31..08-04. Both recovered cleanly downstream, which is exactly
   -- what kept the fault quiet.
   recurring_stall_pinged_at TEXT,
+  -- DIVE-2853: recurring_stall_escalated_at throttles the SECOND rung — the one
+  -- that changes hands — to once per instance. The first rung's notice goes to the
+  -- row's assignee, i.e. to the party whose non-pickup IS the fault, so repeating it
+  -- cannot clear the state: measured on DIVE-2694, which was flagged exactly on time
+  -- and then sat unstarted another 28h because dev was mid-delivery under a
+  -- single-task goal and structurally could not take a second row. A fence outlives
+  -- every re-ping. So the second rung reassigns to a free agent, or cancels with a
+  -- written reason so the template re-fires, and this column is what stops a
+  -- reassignment from thrashing the row around the fleet tick after tick.
+  recurring_stall_escalated_at TEXT,
   -- DIVE-891: risk-tiered gates (adopted design DIVE-861). tier is set when the
   -- gate is filed: 0 = auto-clear (rec applies immediately, digest line only),
   -- 1 = agent-clearable + 48h TTL auto-applies the recommendation, 2 = hard
@@ -1133,7 +1143,7 @@ _TASKS_ADDITIVE_COLUMNS=(
   'acceptance_criteria TEXT' 'verify_command TEXT' 'max_iterations INTEGER' 'verifier TEXT'
   'iteration INTEGER' 'maker_agent TEXT' 'handoff_ack_at TEXT' 'task_budget TEXT'
   'handoff_delivered_at TEXT' 'handoff_stale_pinged_at TEXT' 'handoff_rejected_at TEXT'
-  'recurring_stall_pinged_at TEXT'
+  'recurring_stall_pinged_at TEXT' 'recurring_stall_escalated_at TEXT'
   'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT'
   'gate_filed_by TEXT'
   'secret_key TEXT' 'connector TEXT' 'secret_oob TEXT' 'human_nonce_hash TEXT'
@@ -1254,6 +1264,10 @@ _tasks_db_migrate() {
   local cols c name framed
   cols=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
          "SELECT name FROM pragma_table_info('tasks');" 2>/dev/null)
+  # DIVE-2808: the list moved to $_TASKS_ADDITIVE_COLUMNS so the skip-gate and this
+  # loop cannot drift, and the DIVE-2418 `grep -qx` herestring became pure-Bash
+  # membership — same prefix-rejecting semantics (need_ty vs need_type), and with no
+  # subprocess at all the SIGPIPE class that comment describes cannot exist here.
   framed=$'\n'"$cols"$'\n'
   for c in "${_TASKS_ADDITIVE_COLUMNS[@]}"; do
     name="${c%% *}"

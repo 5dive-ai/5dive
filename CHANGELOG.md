@@ -67,7 +67,7 @@ its origin is a local path whose target is guarded.
 
 ## v0.19.0 — fix(tasks-db): converge schemas without taxing every init (DIVE-2197, DIVE-2808)
 
-The canonical `tasks` CREATE now contains all 71 columns, including the eight that
+The canonical `tasks` CREATE now contains all 72 columns, including the eight that
 previously existed only in the additive migration list (`delivery_ref`,
 `delivered_at`, `delivery_ref_iteration`, `parked_at`, `park_reason`,
 `escalated_at`, `escalated_by`, and `human_evidence`). `tasks_db_init` checks the
@@ -104,7 +104,7 @@ legacy-shaped store. `tests/schema_sync_unit.sh` keeps the two copies of those
 per-table ALTERs and its own row.
 
 DIVE-2197's loud resulting-set assertion remains on both the migrate and skip
-paths. The isolated restore harness proves all 71 columns exist on a fresh
+paths. The isolated restore harness proves all 72 columns exist on a fresh
 `STATE_DIR`, injects a failed `delivery_ref` ALTER, forces a lying skip-gate over
 the same one-column hole, appends a test-only column to the migration array to show
 that the gate and ALTER path follow it, removes a non-`tasks` migration column from

@@ -173,7 +173,11 @@ out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
 
 # --- Case 9 (DIVE-2808): canonical schema is complete at birth ----------------
 # Eight columns lived only in the migration list. The completed CREATE must have
-# the full 71-column tasks surface before the skip-gate is allowed to save work.
+# the full 72-column tasks surface before the skip-gate is allowed to save work.
+# (71 at the time this case was written; DIVE-2853 added recurring_stall_escalated_at
+# on main. The count is asserted literally on purpose — this case exists to catch a
+# canonical CREATE that silently drops a column, so it must not derive its own
+# expectation from the thing under test.)
 fresh_tree
 out=$(tasks_db_init 2>&1); rc=$?
 required='delivered_at delivery_ref delivery_ref_iteration escalated_at escalated_by human_evidence park_reason parked_at'
@@ -182,8 +186,8 @@ actual=$(sqlite3 "$TASKS_DB" \
     WHERE name IN ('delivery_ref','delivered_at','delivery_ref_iteration','parked_at','park_reason','escalated_at','escalated_by','human_evidence')
     ORDER BY name;" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
 column_count=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM pragma_table_info('tasks');" 2>/dev/null)
-[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "71" ]] \
-  && ok "fresh schema: all 71 columns, including the eight former holes, are present" \
+[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "72" ]] \
+  && ok "fresh schema: all 72 columns, including the eight former holes, are present" \
   || bad "fresh schema: init returned a partial tasks table" "rc=$rc count=$column_count got=[$actual] want=[$required] out=$out"
 
 # --- Case 10 (DIVE-2197): migrate arm still rejects a failed ALTER ------------
@@ -261,7 +265,7 @@ probe=$(sqlite3 "$TASKS_DB" \
 unset '_TASKS_ADDITIVE_COLUMNS[${#_TASKS_ADDITIVE_COLUMNS[@]}-1]'
 
 # --- Case 13 (DIVE-2808): epoch covers non-tasks migration surfaces -----------
-# A tasks-only gate would skip this store because all 71 tasks columns remain.
+# A tasks-only gate would skip this store because all 72 tasks columns remain.
 # A pre-epoch store with a hole elsewhere must run the whole migration once and
 # earn the receipt only after the canonical surface is complete.
 fresh_tree
@@ -378,6 +382,42 @@ if _tasks_db_migration_needed; then
 else
   ok "ledger marker: a healed store settles back onto the skip path"
 fi
+
+# --- Case 17 (DIVE-2808): the canonical CREATE and the additive array PARTITION -
+# The row warned about a THIRD copy of the column list drifting. Merging main into
+# this branch produced a FOURTH axis nobody had named: DIVE-2853 added
+# recurring_stall_escalated_at to the canonical CREATE *and* to the old inline
+# migration list, and because this branch replaces that inline list with
+# $_TASKS_ADDITIVE_COLUMNS, the textual conflict resolved cleanly while the array
+# silently lost the column. Canonical had 72, the array drove 59, and a legacy store
+# would never have been given the 72nd. Nothing was watching, because both of the
+# guards that exist compare a store to the ARRAY -- so an array that is short of
+# canonical is invisible to them by construction.
+#
+# So: the canonical tasks surface must partition exactly into a pinned BASE set (the
+# columns of the original table, which no migration ever adds) and the additive
+# array. Both directions matter and fail differently:
+#   - a canonical column in neither  => a legacy store never receives it
+#   - an array entry not in canonical => a fresh store is born needing migration
+# The base set is written out literally. That is the point: growing the canonical
+# CREATE must force an explicit decision here rather than passing silently.
+fresh_tree
+tasks_db_init >/dev/null 2>&1
+base_want='assignee body created_at created_by done_at id ident parent_id priority started_at status title updated_at'
+sqlite3 "$TASKS_DB" "SELECT name FROM pragma_table_info('tasks');" | LC_ALL=C sort > "$TMP/canon.txt"
+printf '%s\n' "${_TASKS_ADDITIVE_COLUMNS[@]}" | awk '{print $1}' | LC_ALL=C sort > "$TMP/arr.txt"
+# LC_ALL=C on both sides: sqlite orders bytewise, and a locale-collated sort puts
+# `_` on the other side of the letters, which makes comm print bogus differences.
+base_got=$(LC_ALL=C comm -23 "$TMP/canon.txt" "$TMP/arr.txt" | tr '\n' ' ' | sed 's/ $//')
+orphans=$(LC_ALL=C comm -13 "$TMP/canon.txt" "$TMP/arr.txt" | tr '\n' ' ' | sed 's/ $//')
+[[ "$base_got" == "$base_want" ]] \
+  && ok "schema partition: canonical minus the additive array is exactly the base set" \
+  || bad "schema partition: a canonical column is in NO migration list (a legacy store never gets it)" \
+         "unexpected=[$base_got] want=[$base_want]"
+[[ -z "$orphans" ]] \
+  && ok "schema partition: every additive-array column exists in the canonical CREATE" \
+  || bad "schema partition: array names a column the canonical CREATE lacks (fresh store born needing migration)" \
+         "orphans=[$orphans]"
 
 echo
 echo "tasks-db restore guard: $PASS passed, $FAIL failed"

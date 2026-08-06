@@ -27,10 +27,11 @@
 #                              pass over the corpus) stay off the pull_request event.
 #                              Dropping that `if:` roughly doubles the trigger's cost
 #                              silently — nothing goes red, the queue just gets worse.
-#   the caveats survive        arms 6-8: the workflow comment must still say this
-#                              sweep is ADVISORY on a PR, and must still name the two
-#                              axes it does NOT cover (the release path, and the
-#                              selfcheck probe class). Those sentences are the whole
+#   the caveats survive        arms 6-9: the workflow comment must still say this
+#                              sweep is ADVISORY on a PR, and the caveat block must
+#                              still be locatable and still name the two axes it does
+#                              NOT cover (the release path, and the selfcheck probe
+#                              class). Those sentences are the whole
 #                              defence against the next author reading "full-sweep
 #                              runs on branches" as "a regression outside the core
 #                              tier can no longer land" — which is false, and was
@@ -155,8 +156,23 @@ PY
 if (( $? == 0 )); then ok "paths filter + verdict-job exclusion (see arms above)"; else no "paths filter + verdict-job exclusion (see arms above)"; fi
 
 # --------------------------------------------------------------------------------
-# Arms 6-8: the caveats. These are PROSE, and that is exactly why they need an arm —
+# Arms 6-9: the caveats. These are PROSE, and that is exactly why they need an arm —
 # a sentence nothing grades is a sentence the next cleanup deletes.
+#
+# ITERATION 2 — WHY ARMS 8-9 GRADE A BLOCK AND NOT THE FILE. They used to grep the
+# WHOLE FILE for `cmd_selfcheck.sh`. That string occurs TWICE: once in this caveat,
+# and once in the DIVE-2371 instance file list at the top of the trigger comment,
+# where it is for an unrelated reason. Measured: delete the entire caveat paragraph
+# and only ONE of the two arms went red — the selfcheck arm stayed GREEN with its own
+# subject deleted. An assertion that cannot observe its own removal is not an
+# assertion, and it is this harness's own thesis one rail over: A STRING THAT MATCHES
+# IS NOT A PROPERTY THAT HOLDS. So the two "does not cover" arms now extract the
+# caveat BLOCK by its heading and grade inside it. An occurrence anywhere else in the
+# file cannot satisfy them, and that holds without assuming any phrase is unique.
+#
+# Arm 6 stays FILE-scoped on purpose: its claim is that the words appear in the
+# workflow at all ("the workflow comment says so in those words"), not that a
+# particular paragraph contains them. Scope follows the claim.
 # --------------------------------------------------------------------------------
 if grep -qi 'ADVISORY ON A PR' "$WF"; then
   ok 'the workflow says IN THOSE WORDS that the PR sweep is advisory, not a merge gate'
@@ -164,16 +180,36 @@ else
   no 'the workflow no longer states that the PR sweep is ADVISORY — a sweep read as a control is the defect class this row exists to close'
 fi
 
-if grep -q 'release-cut.yml' "$WF"; then
-  ok 'the workflow names the RELEASE PATH as an axis it does not cover'
+# The caveat paragraph: from its heading to the end of that contiguous comment block.
+CAVEAT="$(awk '/AND TWO THINGS THIS DOES NOT COVER AT ALL/{f=1}
+               f{ if ($0 !~ /^[[:space:]]*#/) exit; print }' "$WF")"
+
+# Arm 7 grades the EXTRACTION, and grades it for COMPLETENESS, not just presence.
+# Narrowing arms 8-9 from the file to a block does not remove their failure mode, it
+# MOVES it: anything that makes the block short — a reworded heading, or a blank line
+# inserted mid-paragraph, which ends the contiguous comment run — reds them under
+# messages that name the wrong cause ("no longer names release-cut.yml"), sending the
+# next reader to re-add a sentence that is already there. So the block is required to
+# reach its own closing sentence. A legitimately deleted bullet leaves that sentence
+# in place, so this arm stays green and exactly the right content arm goes red.
+if [[ -z "$CAVEAT" ]]; then
+  no 'the caveat block is GONE or its heading was reworded — arms 8-9 below cannot grade what they cannot find'
+elif ! grep -q 'This row closes ONE axis' <<<"$CAVEAT"; then
+  no 'the caveat block is TRUNCATED — it does not reach its closing sentence, so any red below names the wrong cause (a blank line inside the paragraph ends the comment run)'
 else
-  no 'the workflow no longer names release-cut.yml as uncovered (DIVE-2798 is the live counterexample)'
+  ok 'the "TWO THINGS THIS DOES NOT COVER AT ALL" caveat block is present, locatable and complete'
 fi
 
-if grep -q 'cmd_selfcheck.sh' "$WF"; then
-  ok 'the workflow names the SELFCHECK PROBE class as an instrument the corpus never reaches'
+if grep -q 'release-cut.yml' <<<"$CAVEAT"; then
+  ok 'the caveat block names the RELEASE PATH as an axis it does not cover'
 else
-  no 'the workflow no longer names the selfcheck probe class as uncovered'
+  no 'the caveat block no longer names release-cut.yml as uncovered (DIVE-2798 is the live counterexample)'
+fi
+
+if grep -q 'SELFCHECK PROBE CLASS' <<<"$CAVEAT"; then
+  ok 'the caveat block names the SELFCHECK PROBE class as an instrument the corpus never reaches'
+else
+  no 'the caveat block no longer names the selfcheck probe class as uncovered'
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
