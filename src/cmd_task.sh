@@ -2876,6 +2876,112 @@ _gate_graded_sha() {
   printf '%s' "${sha,,}"
 }
 
+# DIVE-2835: _gate_version_claim <text> — the version a close STATES it verified on.
+#
+# Sibling of `_gate_graded_sha` above, and deliberately a LOOSER fence, for one
+# reason worth stating because it looks like an inconsistency: THE TIGHTNESS OF A
+# FENCE BELONGS TO THE CONSEQUENCE IT DRIVES. `graded-sha` drives a REFUSAL, so a
+# false positive blocks a close and the fence must be a labelled declaration only.
+# This one can never do more than WARN, so its false positive costs one line of
+# output while its false NEGATIVE costs what DIVE-2762 cost: a result reading
+# "VERIFIED ON v0.19.2" while this host ran 0.19.1, the board reading fixed for a
+# full day, and the live defect eating maker text twice with a verifier signature
+# on the row. A label-only fence (`verified-on:`) would be tidy and would have
+# matched NOTHING in the incident that motivates this, because the claim was
+# ordinary prose. A guard that cannot fire on its own founding case is decoration.
+#
+# So: a verification VERB and a full x.y.z version on the SAME line, verb first.
+# Requiring all three parts is what keeps it from matching the versions a result
+# routinely names without claiming to have verified against them — "fixed in
+# v0.19.2, rollout tracked in DIVE-2816", a version in a quoted log line, a
+# changelog citation. LAST occurrence wins, same as graded-sha: `--append-result`
+# prepends the earlier close's text, so the later statement is the current one.
+#
+# Prints the bare version (no leading v), or EMPTY when the result makes no such
+# claim. Empty is "nothing was claimed", never "it matched".
+_gate_version_claim() {
+  local txt="${1:-}" line ver=""
+  # One regex, and the ORDER inside it is the fence: the verb, then a gap, then the
+  # version. The gap class `[^0-9;,]*` is doing the real work and it is worth being
+  # precise about why, because the obvious `[^0-9]*` is NOT enough: "verified the
+  # retirement; separately, the box runs 0.19.1" has no digits between the verb and
+  # the version, so a digit-only gap matches it and attributes a claim to a sentence
+  # that never made one. Excluding `;` and `,` means the gap cannot cross into the
+  # next clause, which is where an unrelated version lives. Measured both ways.
+  # The pattern lives in a VARIABLE, not inline: an unquoted `;` inside `[[ =~ ]]`
+  # terminates the command and bash reports a syntax error at parse time, so the
+  # class that makes this fence work cannot be written inline at all.
+  local _re='(VERIFIED|Verified|verified|TESTED|Tested|tested|CONFIRMED|Confirmed|confirmed|VALIDATED|Validated|validated|SMOKED|Smoked|smoked|REPRODUCED|Reproduced|reproduced)[^0-9;,]*[vV]?([0-9]+\.[0-9]+\.[0-9]+)'
+  while IFS= read -r line; do
+    [[ "$line" =~ $_re ]] && ver="${BASH_REMATCH[2]}"
+  done <<<"$txt"
+  printf '%s' "$ver"
+}
+
+# DIVE-2835: _gate_installed_cli — the DEPLOYED artifact, as `<path>|<version>`.
+#
+# The point of the whole check is that a version STRING is not evidence (DIVE-2819),
+# so this resolves a FILE and asks that file what it reports, rather than trusting
+# `$FIVE_VERSION` of whatever bundle happens to be executing — which on a maker's
+# worktree is not what the control plane runs. `/usr/local/bin/5dive` first because
+# that is the path cron and every agent execute (the same path
+# `_gate_merged_not_deployed` names); `command -v` only as a fallback for a box that
+# installed elsewhere. Empty means the artifact could not be read, which the caller
+# must report as NOT CHECKED rather than as agreement.
+_gate_installed_cli() {
+  local p v
+  for p in /usr/local/bin/5dive "$(command -v 5dive 2>/dev/null)"; do
+    [[ -n "$p" && -f "$p" && -x "$p" ]] || continue
+    v=$("$p" --version 2>/dev/null | head -1 | awk '{print $2}')
+    [[ -n "$v" ]] || continue
+    printf '%s|%s' "$p" "$v"; return 0
+  done
+  return 1
+}
+
+# DIVE-2835: _gate_version_vs_installed <ident> <verb> <result-text>
+#
+# Converts a discipline into machinery. DIVE-2762 closed "verified on v0.19.2" onto a
+# host running 0.19.1; DIVE-2819's pass then turned on a human REMEMBERING to grep the
+# installed artifact. This runs that comparison at the only moment the closer can act
+# on it, and it always points at the FILE.
+#
+# WARN, never refuse, and that is not timidity: the guard cannot know WHICH artifact a
+# version names. "verified on v2.1.0" may be a plugin, the api, or a dependency, and a
+# refusal would be a confident claim about something this code did not identify. So it
+# reports the comparison and names its own scope, which is the honest shape for a check
+# whose subject is inferred rather than declared.
+#
+# Direction matters and is reported separately. Installed OLDER than claimed is the
+# DIVE-2762 shape — the artifact carrying the fix is not the artifact running here, and
+# the board is about to read fixed. Installed NEWER is ordinarily fine (it shipped, and
+# more shipped after), so it gets a note rather than the loud line.
+_gate_version_vs_installed() {
+  local ident="${1:-}" verb="${2:-}" txt="${3:-}"
+  local claimed; claimed=$(_gate_version_claim "$txt")
+  [[ -n "$claimed" ]] || return 0
+  local inst ipath iver
+  if ! inst=$(_gate_installed_cli); then
+    warn "$ident: this $verb states it verified on v$claimed, but the INSTALLED 5dive artifact could not be read (tried /usr/local/bin/5dive and \$PATH) — the deployed-vs-claimed comparison did NOT run (DIVE-2835). That is 'not checked', not 'agreed'."
+    return 0
+  fi
+  ipath="${inst%%|*}"; iver="${inst##*|}"
+  if [[ "$iver" == 0.0.0* || "$iver" == *-dev* ]]; then
+    warn "$ident: this $verb states it verified on v$claimed; $ipath reports '$iver', a dev build whose ordering against a release is meaningless, so no comparison was made (DIVE-2835). Grep the artifact for the change itself — the version string was never the evidence."
+    return 0
+  fi
+  if [[ "$iver" == "$claimed" ]]; then
+    step "$ident: verified-on v$claimed matches the installed artifact ($ipath reports $iver) — the claim describes what this host actually runs (DIVE-2835)."
+    return 0
+  fi
+  local older; older=$(printf '%s\n%s\n' "$claimed" "$iver" | sort -V | head -1)
+  if [[ "$older" == "$iver" ]]; then
+    warn "$ident: DEPLOYED-VS-CLAIMED MISMATCH — this $verb states it verified on v$claimed, but $ipath reports $iver, which is OLDER (DIVE-2835). The board is about to read this as fixed while the artifact every agent and cron actually executes does not carry it: that is exactly DIVE-2762, which stayed live for a day under a verifier's signature. Confirm against the FILE, not the version string — grep $ipath for the change — and if the rollout has not happened, this row is a rollout row, not a done one."
+  else
+    warn "$ident: this $verb states it verified on v$claimed; $ipath reports $iver, which is NEWER (DIVE-2835). Usually fine — it shipped and more shipped after — but the claim describes an artifact nobody is running now, so grep $ipath if the behaviour still matters."
+  fi
+}
+
 # DIVE-2656 PART 1: _gate_pr_shas <ref> <tok> — the two shas a merged PR can be
 # legitimately said to carry, as `<headRefOid>|<mergeCommit.oid>`.
 #
@@ -3493,6 +3599,12 @@ _task_status_cmd() {
     _task_guard_result_over_closed "$id" "$ident" "$verb" "$result" "$append_result" "$force_result"
     result="$_TASK_GUARDED_RESULT"
   fi
+  # DIVE-2835: a result that NAMES a version is making a claim about a DEPLOYED
+  # artifact — compare it to the one this host runs. Placed BEFORE the DIVE-477
+  # routing below on purpose: a maker's `task done` that delivers rather than
+  # closes carries exactly the same claim, and the moment to check it is the
+  # moment it is written, not the moment someone later re-reads it.
+  [[ "$verb" == "done" ]] && _gate_version_vs_installed "$ident" done "$result"
   # DIVE-477: maker→verifier routing. A `task done` on a task that carries a
   # `verifier` distinct from its current assignee is NOT a close — it's a handoff.
   # The maker is claiming the work is ready; the verifier must grade it before the
@@ -5746,6 +5858,13 @@ cmd_task_verify() {
   # append below, and running both would append twice. This is keyed on status at
   # the CALL SITE — which is fine and is not the defect this ticket is about — to
   # avoid two preservation mechanisms overlapping on one write.
+  # DIVE-2835: run the deployed-vs-claimed comparison on THIS close's own text,
+  # deliberately before the guard below prepends the prior result. After that
+  # prepend the cell also carries the MAKER's words, and warning "this verify
+  # states it verified on vX" about a sentence the verifier did not write would be
+  # a true finding attributed to the wrong author — the same misattribution
+  # DIVE-2725 spent two iterations removing from a probe verdict.
+  _gate_version_vs_installed "$ident" verify "$result_txt"
   local _v_guard_st
   _v_guard_st=$(db "SELECT COALESCE(status,'') FROM tasks WHERE id=${id};")
   if [[ "$_v_guard_st" != "done" && "$_v_guard_st" != "cancelled" ]]; then
