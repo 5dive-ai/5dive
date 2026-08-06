@@ -181,6 +181,59 @@ TIER_SQL="$(eval_by tier)"; CLASS_SQL="$(eval_by class)"
   && ok_t "class groups by project_key + priority, as the spec defines class" \
   || bad_t "class expr" "$CLASS_SQL"
 
+# --- Case 4d (DIVE-2745, iteration 2): the RESOLVED DEFAULT WINDOW ------------
+# olivia's reject: DIVE-2745 flipped this verb's default 7d -> 30d, and the
+# delivery cited "proof_scorecard_unit 27/0" as the evidence. Measured: setting
+# the default back to window="7d" left BOTH suites fully green. The 27 arms are
+# the pre-existing suite and they pass whether or not the flip happened, so a
+# green run was quoted as evidence for a change it structurally cannot see —
+# the succeeding-in-appearance class, on the row whose whole thesis is that the
+# window is several different quantities and moving one without the others is
+# how the badge once published 51/7 against a true ~343/53.
+#
+# It cannot be asserted through the renderer: `run()` above passes WINDOW="7d"
+# explicitly, so the extracted python never sees a default at all. Same shape as
+# the --by arms directly above — the defect lives in the shell, so assert THERE.
+# Extract the real arg-parse plus the span `case` from the shipped source and
+# evaluate window resolution end to end.
+WIN_BLOCK="$(awk '/^  local json="\$\{JSON_MODE:-0\}" window=/{f=1} f{print} f&&/^  esac$/{exit}' src/cmd_proof.sh)"
+[[ -n "$WIN_BLOCK" ]] && ok_t "the scorecard's window arg-parse + span block extracted for the shell-side arms" \
+  || bad_t "extract window block" "not found in src/cmd_proof.sh"
+fail() { printf 'fail(%s): %s\n' "${1:-}" "${2:-}" >&2; return 1; }   # only reachable on an ILLEGAL value; the arms below pass legal ones
+eval_window() {  # <args...> -> "<window>|<sql_window>|<usage_secs>"
+  local E_USAGE=64 window sql_window usage_secs
+  eval "$WIN_BLOCK" || return 1
+  printf '%s|%s|%s' "$window" "$sql_window" "$usage_secs"
+}
+DEF_WIN="$(eval_window)"; SEVEN_WIN="$(eval_window --7d)"; THIRTY_WIN="$(eval_window --30d)"
+# The PAIR, not just the default: an arm that only pins 30d passes if the parser
+# is inert and every input resolves to 30d. Both directions, so neither a pinned
+# constant nor a dead `--7d` can satisfy it.
+[[ "$DEF_WIN" == "30d|-30 days|2592000" ]] \
+  && ok_t "DIVE-2745: NO ARGS resolves 30d end to end (label, SQL span, usage seconds all agree)" \
+  || bad_t "scorecard default window" "got: $DEF_WIN (want 30d|-30 days|2592000)"
+[[ "$SEVEN_WIN" == "7d|-7 days|604800" ]] \
+  && ok_t "DIVE-2745: --7d is RETAINED and still resolves 7d end to end (a deliberate narrow read stays available)" \
+  || bad_t "scorecard --7d" "got: $SEVEN_WIN (want 7d|-7 days|604800)"
+[[ "$DEF_WIN" == "$THIRTY_WIN" ]] \
+  && ok_t "the bare default is byte-identical to an explicit --30d (the default IS the 30-day window, not a lookalike)" \
+  || bad_t "default vs --30d" "default=$DEF_WIN explicit=$THIRTY_WIN"
+[[ "$DEF_WIN" != "$SEVEN_WIN" ]] \
+  && ok_t "non-vacuity: the same block yields two DIFFERENT resolutions, so the parser is not inert" \
+  || bad_t "inert window parser" "both resolved to $DEF_WIN"
+# The catch-all, matching the badge half: past the one `case`, no span may be
+# hand-spelled anywhere in the verb — the fifth sense is exactly what slipped.
+SC_BODY="$(awk '/^_proof_scorecard\(\)/{f=1} f{print} f&&/^}/{exit}' src/cmd_proof.sh)"
+grep -q '"$self" digest --json "--\$window"' <<<"$SC_BODY" \
+  && ok_t "the scorecard's digest sub-call derives its flag from the resolved window (no literal --7d/--30d)" \
+  || bad_t "scorecard digest flag not derived" "$(grep -n 'digest --json' <<<"$SC_BODY")"
+if grep -nE -- '(-7 days|-30 days)' <<<"$(grep -v 'sql_window="' <<<"$SC_BODY")" >/dev/null; then
+  bad_t "a hand-spelled SQL span survives outside the scorecard's window case" \
+        "$(grep -nE -- '(-7 days|-30 days)' <<<"$(grep -v 'sql_window="' <<<"$SC_BODY")")"
+else
+  ok_t "every SQL span in the verb comes from sql_window (no hand-spelled day count elsewhere)"
+fi
+
 # --- Case 5: sample sizes ride ON the sourced numbers, not in a footnote.
 for m in "verifier first-pass rate" "median recovery time" "precedent acceptance rate"; do
   s="$(jq -r --arg m "$m" '.metrics[]|select(.name==$m)|.sample' <<<"$OUT")"
