@@ -330,6 +330,52 @@ PY2
 fi
 kill "$ONCE_PID" 2>/dev/null
 
+# --- 16. a client that never speaks cannot park --once -----------------------
+# This hazard is CREATED by the fix above. Serving in-thread is what makes the
+# response whole, and it also removes the only thing that was ending a connection
+# from a client that connects and sends no request line: the threaded server
+# exited on that client, but by ABANDONING it, which is the defect arm 15 grades.
+# Single-shot there is no other thread to notice, so the one thread would sit in
+# readline() forever.
+#
+# It is graded here for the reason the property was lost the first time — nobody
+# had encoded it, because it was never a decision, just a side effect of the bug.
+# A refactor back to a threading server passes every arm above and fails only
+# this one. `_5DIVE_UI_ONCE_READ_TIMEOUT` keeps that honest at 2s instead of 30.
+PORT3="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
+STALLTMP="$TMP/stall-tmpdir"; mkdir -p "$STALLTMP"
+_5DIVE_UI_ONCE_READ_TIMEOUT=2 TMPDIR="$STALLTMP" \
+    "$FIVE" ui --port="$PORT3" --once >"$TMP/stall.log" 2>&1 &
+STALL_PID=$!
+stall_up=0
+for _ in $(seq 1 40); do
+  grep -q 'listening on' "$TMP/stall.log" 2>/dev/null && { stall_up=1; break; }
+  sleep 0.25
+done
+chk "16 --once came up" "1" "$stall_up"
+if (( stall_up )); then
+  # Connect and say NOTHING. The fd is held open for the whole poll, so the
+  # server is never released by a hangup — only by its own read timeout.
+  if exec 9<>"/dev/tcp/127.0.0.1/$PORT3" 2>/dev/null; then
+    stall_gone=0
+    for _ in $(seq 1 60); do            # 15s: ample for a 2s timeout, and bounded
+      kill -0 "$STALL_PID" 2>/dev/null || { stall_gone=1; break; }
+      sleep 0.25
+    done
+    exec 9<&- 2>/dev/null; exec 9>&- 2>/dev/null
+    chk "16 a silent client does not park it" "1" "$stall_gone"
+    # Same reap discipline as arm 15: never `wait` on a server still running.
+    stall_rc="never-exited"; (( stall_gone )) && { wait "$STALL_PID"; stall_rc=$?; }
+    chk "16 a timed-out connection is not an error" "0" "$stall_rc"
+    chk "16 the temp dir is removed on that path too" "0" \
+        "$(find "$STALLTMP" -maxdepth 1 -name '5dive-ui.*' 2>/dev/null | wc -l)"
+    (( stall_gone )) || kill -9 "$STALL_PID" 2>/dev/null
+  else
+    chk "16 a silent client does not park it" "1" "connect-failed"
+    kill -9 "$STALL_PID" 2>/dev/null
+  fi
+fi
+
 # --- 13. wired into the CLI --------------------------------------------------
 chk "13 ui --help exits 0" "0" "$("$FIVE" ui --help >/dev/null 2>&1; echo $?)"
 chk "13 listed in top-level help" "1" \

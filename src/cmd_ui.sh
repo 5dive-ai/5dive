@@ -643,6 +643,7 @@ HTML
 _ui_server_py() {
   cat <<'PY'
 import json
+import os
 import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
@@ -665,7 +666,10 @@ class Handler(BaseHTTPRequestHandler):
     # for the worker, which is the defect this file just fixed, but it also hid
     # this. A read timeout ends the connection and handle_request() returns.
     # None (the stdlib default) everywhere else: serve_forever keeps its threads.
-    timeout = 30 if ONCE else None
+    # The override exists so a harness can grade this in seconds instead of
+    # waiting 30 out; the property was lost the first time precisely because no
+    # arm encoded it (DIVE-2813, arm 16 of tests/ui_views_e2e.sh).
+    timeout = float(os.environ.get("_5DIVE_UI_ONCE_READ_TIMEOUT") or 30) if ONCE else None
 
     def log_message(self, fmt, *args):          # one line per request, on stderr
         sys.stderr.write("%s %s\n" % (self.command, self.path.split("?", 1)[0]))
