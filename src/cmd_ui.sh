@@ -658,6 +658,14 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "5dive-ui"
     sys_version = ""
     protocol_version = "HTTP/1.1"
+    # A hazard CREATED by serving --once in-thread, so it is bounded here rather
+    # than left to be discovered. A bare TCP connect that sends no request line
+    # would park the single-shot server forever: nothing else is running to
+    # notice. The threaded version exited instead — the main thread never waited
+    # for the worker, which is the defect this file just fixed, but it also hid
+    # this. A read timeout ends the connection and handle_request() returns.
+    # None (the stdlib default) everywhere else: serve_forever keeps its threads.
+    timeout = 30 if ONCE else None
 
     def log_message(self, fmt, *args):          # one line per request, on stderr
         sys.stderr.write("%s %s\n" % (self.command, self.path.split("?", 1)[0]))
