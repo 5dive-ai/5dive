@@ -885,11 +885,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS lifecycle_events_idem_idx ON lifecycle_events(
 CREATE INDEX IF NOT EXISTS lifecycle_events_ident_idx ON lifecycle_events(ident, id);
 CREATE INDEX IF NOT EXISTS lifecycle_events_ts_idx ON lifecycle_events(ts, kind);
 SQL
-  # DIVE-2808: a fresh store is born at the current whole-schema epoch in the
-  # SAME sqlite invocation. Existing stores earn this receipt only after the
-  # complete migration and canonical-surface assertion below.
-  printf "INSERT INTO task_prefs(key,value) VALUES ('schema_epoch',%s);\n" \
-    "$(sqlq "$_TASKS_SCHEMA_EPOCH")"
 }
 
 # -------- DIVE-1479: silent-recreate trap guard --------
@@ -1068,8 +1063,30 @@ tasks_db_init() {
       _tasks_board_recover
     else
       local fresh_payload row
+      # DIVE-2808: a fresh store is born at the current whole-schema epoch in the
+      # SAME sqlite invocation. Existing stores earn this receipt only after the
+      # complete migration and canonical-surface assertion below.
+      #
+      # The stamp lives HERE and not in _tasks_schema() on purpose. Every statement
+      # that block emits is `CREATE ... IF NOT EXISTS`, so replaying it over an
+      # existing store is a no-op — a contract the migration driver and several
+      # harnesses rely on, and a bare INSERT is the one statement that breaks it
+      # (UNIQUE constraint failed: task_prefs.key). Making the INSERT itself
+      # idempotent would be worse than leaving it out: an upsert would stamp the
+      # CURRENT epoch onto a store that a replay does not actually complete, since
+      # `CREATE TABLE IF NOT EXISTS tasks` adds no column to an existing tasks
+      # table. That is the lying-gate class this row exists to close. Only this
+      # arm has just proved it created the whole schema from nothing.
       fresh_payload=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" < <(
         _tasks_schema
+        printf "INSERT INTO task_prefs(key,value) VALUES ('schema_epoch',%s);\n" \
+          "$(sqlq "$_TASKS_SCHEMA_EPOCH")"
+        # DIVE-2808: the ledger start marker was seeded inside _tasks_db_migrate,
+        # which a fresh store no longer enters. Without this a brand-new board has
+        # no marker at all, and `trace` reads a ledger with nothing to say about
+        # anything as one that predates everything — absence read as evidence,
+        # which is the exact failure the marker exists to prevent.
+        printf "INSERT OR IGNORE INTO task_prefs(key,value) VALUES ('ledger_started',datetime('now'));\n"
         printf "SELECT 'column:'||name FROM pragma_table_info('tasks');\n"
       )) || fail "$E_GENERIC" "failed to initialise tasks db at $TASKS_DB"
       _TASKS_DB_GATE_COLUMNS=''
@@ -1130,6 +1147,7 @@ _TASKS_ADDITIVE_COLUMNS=(
 )
 _TASKS_DB_GATE_COLUMNS=''
 _TASKS_DB_GATE_EPOCH=''
+_TASKS_DB_GATE_LEDGER=''
 
 # Exact newline membership without a subprocess. The newline frame prevents a
 # prefix (need_ty) from satisfying a full column name (need_type).
@@ -1145,61 +1163,64 @@ _tasks_columns_have_all_additive() { # <newline-delimited pragma names>
 
 _tasks_db_migration_needed() {
   local payload row
+  # The ledger marker rides along in the SAME read as the epoch and the columns,
+  # so keeping its self-heal costs no extra process. See the note below.
   payload=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
     "SELECT 'epoch:'||COALESCE((SELECT value FROM task_prefs WHERE key='schema_epoch'),'')
+       UNION ALL
+     SELECT 'ledger:'||COALESCE((SELECT '1' FROM task_prefs WHERE key='ledger_started'),'')
        UNION ALL
      SELECT 'column:'||name FROM pragma_table_info('tasks');" 2>/dev/null) || return 0
   _TASKS_DB_GATE_COLUMNS=''
   _TASKS_DB_GATE_EPOCH=''
+  _TASKS_DB_GATE_LEDGER=''
   while IFS= read -r row; do
     case "$row" in
       epoch:*)  _TASKS_DB_GATE_EPOCH="${row#epoch:}" ;;
+      ledger:*) _TASKS_DB_GATE_LEDGER="${row#ledger:}" ;;
       column:*) _TASKS_DB_GATE_COLUMNS+="${row#column:}"$'\n' ;;
     esac
   done <<<"$payload"
   _TASKS_DB_GATE_COLUMNS="${_TASKS_DB_GATE_COLUMNS%$'\n'}"
   [[ "$_TASKS_DB_GATE_EPOCH" == "$_TASKS_SCHEMA_EPOCH" ]] || return 0
+  # DIVE-2808: the migration also SEEDS things, it does not only alter shape, and a
+  # gate that only reasons about shape silently drops those seeds. `ledger_started`
+  # is re-inserted (INSERT OR IGNORE) on every pass through _tasks_db_migrate, so
+  # before this gate existed a deleted marker healed itself on the next invocation.
+  # Skipping the migration removed that, and the loss is invisible in a schema
+  # comparison: the store is shape-perfect and semantically wrong. Missing marker
+  # therefore sends the store back through the migration once, which re-seeds it.
+  [[ -n "$_TASKS_DB_GATE_LEDGER" ]] || return 0
   ! _tasks_columns_have_all_additive "$_TASKS_DB_GATE_COLUMNS"
 }
 
-_tasks_db_schema_manifest_sql() {
-  printf '%s\n' "SELECT item FROM (
-    SELECT 'table:'||name AS item FROM sqlite_schema
-      WHERE type='table' AND name NOT LIKE 'sqlite_%'
-    UNION ALL
-    SELECT 'column:'||m.name||'.'||p.name AS item
-      FROM sqlite_schema AS m, pragma_table_info(m.name) AS p
-      WHERE m.type='table' AND m.name NOT LIKE 'sqlite_%' AND m.name!='tasks'
-    UNION ALL
-    SELECT 'index:'||name AS item FROM sqlite_schema
-      WHERE type='index' AND name NOT LIKE 'sqlite_%'
-  ) ORDER BY item;"
-}
-
-# The epoch is a receipt for the WHOLE migration, not only tasks columns. Before
-# stamping it, prove every canonical table, non-tasks column and named index
-# exists; tasks columns are proved by the dedicated assertion above. Extras are
-# allowed for forward compatibility and local extensions.
-_tasks_db_assert_canonical_surface() {
-  local manifest_sql canonical observed item framed
-  manifest_sql=$(_tasks_db_schema_manifest_sql)
-  canonical=$(
-    {
-      printf '.output /dev/null\n'
-      _tasks_schema
-      printf '.output stdout\n%s\n' "$manifest_sql"
-    } | sqlite3 -cmd ".timeout 5000" :memory:
-  ) || fail "$E_GENERIC" "could not build canonical tasks-db schema manifest (DIVE-2808)"
-  observed=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" "$manifest_sql" 2>/dev/null) \
-    || fail "$E_GENERIC" "could not read migrated tasks-db schema manifest (DIVE-2808)"
-  framed=$'\n'"$observed"$'\n'
-  while IFS= read -r item; do
-    [[ -n "$item" ]] || continue
-    [[ "$framed" == *$'\n'"$item"$'\n'* ]] || fail "$E_GENERIC" \
-      "tasks db canonical surface incomplete after migration — missing $item (DIVE-2808)"
-  done <<<"$canonical"
-}
-
+# DIVE-2808: the epoch is a receipt that the curated migration GENERATION named by
+# $_TASKS_SCHEMA_EPOCH has run to completion on this store. It is deliberately NOT
+# a claim that the store matches the canonical schema item for item.
+#
+# The first cut asserted exactly that — every canonical table, index and non-tasks
+# column after migrating — and `fail`ed tasks_db_init when it did not hold, which
+# is every `5dive task` invocation rather than merely a slow one. It cannot hold:
+# the migration is a curated set of one-shot blocks that was never a convergence
+# engine, and `CREATE TABLE IF NOT EXISTS` cannot widen a table that already
+# exists, so neither the migration nor a replay of the canonical DDL can add a
+# missing column to an existing table or an index over a column that is absent.
+# Asserting a property no code path can repair converts a slow migration into an
+# outage; four unrelated harnesses (ledger, policy_refusals, rollback_rate,
+# whoami_for_chain) went red on precisely that, on a store shaped like a legacy box.
+#
+# What still covers the axis the first cut was reaching for:
+#   - The EPOCH itself, which is what Case 13 of tests/tasks_db_restore_guard_unit.sh
+#     exercises: a stale/absent epoch sends a tasks-current store back through the
+#     whole migration, so a hole OUTSIDE tasks (gate_history.floor_provenance) is
+#     still repaired. That win belongs to the epoch, not to the manifest assertion.
+#   - tests/schema_sync_unit.sh, which fails CI if the migration's copies of those
+#     CREATE TABLE statements drift from the canonical ones — so a table built by
+#     EITHER path carries the same columns.
+#   - DIVE-2197's resulting-column assertion, retained on BOTH arms below.
+# A store that is genuinely short of a canonical table or column is not made worse
+# by the gate: the pre-DIVE-2808 code re-ran the migration on every invocation and
+# never created those either. Converging one needs per-table ALTERs — its own row.
 _tasks_db_stamp_schema_epoch() {
   sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
     "INSERT INTO task_prefs(key,value,updated_at)
@@ -1719,7 +1740,6 @@ MIG
         "ALTER TABLE objectives ADD COLUMN run_mode TEXT NOT NULL DEFAULT 'live';" >/dev/null 2>&1 || true
     fi
   fi
-  _tasks_db_assert_canonical_surface
   _tasks_db_stamp_schema_epoch
 }
 

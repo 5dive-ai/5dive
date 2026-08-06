@@ -74,21 +74,47 @@ previously existed only in the additive migration list (`delivery_ref`,
 current column set once and skips the full migration when it is already complete.
 The gate uses pure Bash matching and derives its task-column requirements from the
 exact array the migration loop consumes, so it cannot become a third drifting
-column list. A whole-schema epoch separately covers migrations outside `tasks`:
-fresh canonical stores stamp it in their original schema invocation; older stores
-run the full migration once, prove every canonical table/column/index is present,
-then stamp it. A tasks-current store with a stale `gate_history` therefore cannot
-skip the repair.
+column list.
+
+A **whole-schema epoch** covers the migrations that live outside `tasks`, which a
+tasks-column gate cannot see. It is a receipt that the curated migration generation
+named by `_TASKS_SCHEMA_EPOCH` has run to completion on this store — deliberately
+**not** a claim that the store matches the canonical schema item for item. A fresh
+store is stamped on the init path that just built the whole schema from nothing;
+an older store earns the stamp after the full migration runs. A tasks-current store
+with a stale `gate_history` therefore cannot skip the repair.
+
+Two things the epoch had to learn, both of which reddened unrelated harnesses first:
+
+- **The stamp does not live inside the canonical DDL.** Every statement that block
+  emits is `CREATE … IF NOT EXISTS`, so replaying it over an existing store is a
+  no-op — a contract the migration driver and four other harnesses rely on, and a
+  bare `INSERT` is the one statement that breaks it.
+- **The gate requires the seeded `ledger_started` marker, not only the right shape.**
+  The migration *seeds* as well as reshapes; skipping it dropped a self-heal that no
+  schema comparison can miss, because the store is shape-perfect and semantically
+  wrong.
+
+The epoch does **not** assert the canonical surface item for item. The curated
+migration was never a convergence engine and `CREATE TABLE IF NOT EXISTS` cannot
+widen an existing table, so that property holds on no code path — asserting it turned
+a slow init into a hard `fail` on every `5dive task` invocation against a
+legacy-shaped store. `tests/schema_sync_unit.sh` keeps the two copies of those
+`CREATE TABLE` statements from drifting; converging a genuinely short store needs
+per-table ALTERs and its own row.
 
 DIVE-2197's loud resulting-set assertion remains on both the migrate and skip
 paths. The isolated restore harness proves all 71 columns exist on a fresh
 `STATE_DIR`, injects a failed `delivery_ref` ALTER, forces a lying skip-gate over
 the same one-column hole, appends a test-only column to the migration array to show
-that the gate and ALTER path follow it, and removes a non-`tasks` migration column
-from a pre-epoch fixture to prove the full migration repairs it. On this 4-core
-host, contemporaneous 20-run isolated medians were 133 ms for the pinned
-pre-DIVE-2197 base (`1bde9dc`) and 145 ms here: **+12 ms**, inside the 30 ms
-acceptance envelope. The full migration had measured 517 ms.
+that the gate and ALTER path follow it, removes a non-`tasks` migration column from
+a pre-epoch fixture to prove the full migration repairs it, replays the canonical
+schema twice to hold the no-op contract, drives a legacy-shaped store through init
+to prove it completes and then settles, and deletes the ledger marker to prove it
+self-heals. On this 4-core control-plane host, 20 **interleaved** isolated fresh-init
+medians were 125 ms for the pinned pre-DIVE-2197 base (`1bde9dc`) and 127 ms here:
+**+2 ms**, inside the 30 ms acceptance envelope. The full migration had measured
+517 ms.
 
 ## v0.19.0 — fix(heartbeat): surface a recurring instance that was never started (DIVE-2693)
 

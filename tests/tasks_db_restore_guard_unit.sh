@@ -281,6 +281,104 @@ epoch=$(sqlite3 "$TASKS_DB" "SELECT value FROM task_prefs WHERE key='schema_epoc
   && ok "schema epoch: full migration repairs the hole and stamps its receipt" \
   || bad "schema epoch: repair/receipt incomplete" "rc=$rc column=$gh_col epoch=$epoch out=$out"
 
+# --- Case 14 (DIVE-2808): _tasks_schema stays REPLAY-IDEMPOTENT ---------------
+# Every statement the canonical block emits is `CREATE ... IF NOT EXISTS`, so
+# applying it twice to one store must be a no-op. The migration driver and four
+# other harnesses (ledger, rollback_rate, whoami_for_chain, policy_refusals)
+# replay it, and they all failed CI at 6e48ee0 with a single bare INSERT in that
+# block: "UNIQUE constraint failed: task_prefs.key". Nothing in the tasks-db
+# suite was watching the contract, so the break surfaced as four unrelated reds.
+# This arm keeps the epoch stamp's call site honest: it belongs to the fresh-init
+# path, never to the replayable DDL.
+fresh_tree
+sqlite3 "$TASKS_DB" < <(_tasks_schema) >/dev/null 2>&1
+out=$(sqlite3 "$TASKS_DB" < <(_tasks_schema) 2>&1); rc=$?
+[[ $rc -eq 0 ]] \
+  && ok "schema replay: applying the canonical schema twice is a no-op" \
+  || bad "schema replay: canonical schema is not idempotent" "rc=$rc out=$out"
+# And the block must not carry the stamp, which is what made it non-idempotent.
+if _tasks_schema | grep -q "schema_epoch"; then
+  bad "schema replay: the epoch stamp is back inside the replayable DDL"
+else
+  ok "schema replay: the epoch stamp stays out of the replayable DDL"
+fi
+# Belt and braces: a fresh store must still be born stamped, so moving the
+# stamp out of the DDL cannot have quietly dropped it.
+fresh_tree
+tasks_db_init >/dev/null 2>&1
+epoch=$(sqlite3 "$TASKS_DB" "SELECT value FROM task_prefs WHERE key='schema_epoch';" 2>/dev/null)
+[[ "$epoch" == "$_TASKS_SCHEMA_EPOCH" ]] \
+  && ok "schema replay: a fresh store is still born at the current epoch" \
+  || bad "schema replay: fresh store lost its epoch stamp" "epoch=$epoch"
+
+# --- Case 15 (DIVE-2808): a legacy store must not be BRICKED by the receipt -----
+# The first cut of the epoch asserted every canonical table, index and non-tasks
+# column after migrating, and `fail`ed tasks_db_init when that did not hold. It
+# cannot hold — the curated migration was never a convergence engine, and
+# `CREATE TABLE IF NOT EXISTS` cannot widen an existing table nor index a column
+# that is absent — so the assertion took down every `5dive task` invocation on a
+# legacy-shaped store. Four unrelated harnesses (ledger, policy_refusals,
+# rollback_rate, whoami_for_chain) went red on exactly this fixture shape. This arm
+# is that store: init must COMPLETE, and the gate must not re-enter the migration
+# forever afterwards.
+fresh_tree
+sqlite3 "$TASKS_DB" "CREATE TABLE tasks (id INTEGER PRIMARY KEY, ident TEXT);
+                     CREATE TABLE supervisor_events (id INTEGER PRIMARY KEY, agent TEXT, classification TEXT);
+                     CREATE TABLE policy_refusals (id INTEGER PRIMARY KEY, policy TEXT);"
+: > "$STATE_DIR/tasks/.board-initialized"    # pre-existing board (DIVE-1479 guard)
+out=$(tasks_db_init 2>&1); rc=$?
+[[ $rc -eq 0 ]] \
+  && ok "legacy store: tasks_db_init completes rather than failing on an unrepairable surface" \
+  || bad "legacy store: init hard-failed on a legacy store" "rc=$rc out=$out"
+epoch=$(sqlite3 "$TASKS_DB" "SELECT value FROM task_prefs WHERE key='schema_epoch';" 2>/dev/null)
+[[ "$epoch" == "$_TASKS_SCHEMA_EPOCH" ]] \
+  && ok "legacy store: a completed migration earns the epoch receipt" \
+  || bad "legacy store: no receipt after a successful migration" "epoch=$epoch"
+# The receipt must also settle the store: a second init takes the skip path.
+if _tasks_db_migration_needed; then
+  bad "legacy store: gate still demands migration after a completed one"
+else
+  ok "legacy store: the receipt settles the gate on the next invocation"
+fi
+# And the migration must still have done its actual job on this store.
+ship=$(sqlite3 "$TASKS_DB" \
+  "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='ship_events';" 2>/dev/null)
+[[ "$ship" == "1" ]] \
+  && ok "legacy store: the curated migration still ran (ship_events created)" \
+  || bad "legacy store: migration did not run" "ship=$ship"
+
+# --- Case 16 (DIVE-2808): the migration SEEDS, it does not only reshape ---------
+# `ledger_started` is re-inserted on every pass through _tasks_db_migrate, so before
+# the gate existed a deleted marker healed itself on the next invocation, and a
+# fresh store got one on the way in. A gate that reasons only about SHAPE drops both:
+# the store is shape-perfect and semantically wrong, which no schema comparison can
+# see. tests/whoami_for_chain_unit.sh caught the self-heal half as
+# "H/REACHABILITY: marker did not self-heal"; nothing was watching the fresh half.
+fresh_tree
+tasks_db_init >/dev/null 2>&1
+marker=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM task_prefs WHERE key='ledger_started';" 2>/dev/null)
+[[ "$marker" == "1" ]] \
+  && ok "ledger marker: a FRESH store is born with the start marker" \
+  || bad "ledger marker: fresh store has no ledger_started (trace would read absence as predating)" "marker=$marker"
+# Self-heal: delete it on an otherwise-current store. The gate must not skip.
+sqlite3 "$TASKS_DB" "DELETE FROM task_prefs WHERE key='ledger_started';"
+if _tasks_db_migration_needed; then
+  ok "ledger marker: a missing marker on a shape-perfect store still enters migration"
+else
+  bad "ledger marker: shape-only gate skipped a store that lost a seeded row"
+fi
+out=$(tasks_db_init 2>&1); rc=$?
+marker=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM task_prefs WHERE key='ledger_started';" 2>/dev/null)
+[[ $rc -eq 0 && "$marker" == "1" ]] \
+  && ok "ledger marker: the marker self-heals through tasks_db_init" \
+  || bad "ledger marker: no self-heal" "rc=$rc marker=$marker out=$out"
+# And the healed store settles: the next invocation takes the skip path again.
+if _tasks_db_migration_needed; then
+  bad "ledger marker: store never settles — every invocation re-migrates"
+else
+  ok "ledger marker: a healed store settles back onto the skip path"
+fi
+
 echo
 echo "tasks-db restore guard: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]
