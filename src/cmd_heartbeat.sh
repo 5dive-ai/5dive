@@ -2360,8 +2360,88 @@ _hb_stall_sweep() {
                  AND t.parked_at IS NULL
                  AND t.created_at <= datetime('now','-${_HB_RECURRING_STALL_HOURS} hours');")
 
+  # (a3) DIVE-2207 — gap#2's SECOND predicate: a delivery whose blocking gate has
+  # since been ANSWERED.
+  #
+  # WHY (a) ABOVE CANNOT SEE THIS, which is the whole reason it needs its own
+  # predicate rather than a widened one. (a) carries `handoff_ack_at IS NULL`, and
+  # DIVE-2196 correctly excludes gate-blocked rows from it. But the ack has more
+  # than one writer: any verifier who ran `task start` and THEN hit the blocker has
+  # already stamped it. So the moment the human answers and the wait comes back to
+  # the verifier, (a) is permanently blind to that row — not throttled, structurally
+  # excluded. Measured on the live board 2026-07-28: the clean population (gate
+  # answered at or after handoff_delivered_at) is 20 rows; 17 were graded inside the
+  # hour, 2 took 1-6h, one took over 24h. It bites rarely and silently, which is the
+  # case for a rail and not against one.
+  #
+  # WHY NOT CLEAR/REFRESH handoff_ack_at INSTEAD (shape (a) of DIVE-2206, rejected):
+  # un-stamping erases a record of something that DID happen — the verifier reviewed
+  # and escalated. DIVE-2196 existed because the record lied by omission; clearing
+  # makes it lie in the other direction, and on a row whose ack was earned by a
+  # genuine `task start` it re-arms (a)'s "still unacknowledged" message against a
+  # verifier who demonstrably acknowledged. That false nudge IS the DIVE-2196 defect.
+  #
+  # THE MESSAGE IS DIFFERENT ON PURPOSE. (a) says "still unacknowledged", which is
+  # false here — the verifier acted. Per
+  # community/wiki/on-a-maker-verifier-task-the-ack-is-the-close.md a nudge that
+  # names a verb authors an instruction, so this one may only exist POST-answer:
+  # while the gate is open, "close it" is a disguised policy answer on a question
+  # the human has not decided. After the answer it is safe, and it is the point.
+  #
+  # THROTTLE: its own column. handoff_stale_pinged_at is already burned on 30 rows
+  # fleet-wide including the live specimen this was written for (DIVE-2146) —
+  # reusing it ships the fix dead on arrival for exactly its target population.
+  #
+  # `parked_at IS NULL` is one clause BEYOND the DIVE-2207 spec (olivia's constraint
+  # 2), added deliberately and mirroring the (a2) rail directly above: a parked row
+  # was set aside on purpose and nudging it is noise. Measured when added: 22 parked
+  # rows live fleet-wide, 0 of them inside this window.
+  #
+  # WHERE THE SAFETY COMES FROM, AND IT IS NOT IN THIS PREDICATE (olivia, DIVE-2207
+  # ruling). The clause is only ever a DEFERRAL rather than a permanent exclusion
+  # because `cmd_task_park` MANDATES --wake and refuses without it (E_USAGE,
+  # DIVE-1357: "a park with no revisit date is the block graveyard"), so every
+  # parked row carries its own clock back. That is a structural guarantee, not a
+  # property of today's board — the 22/0 measurement above says this moves no count
+  # TODAY, which is a different and much weaker claim.
+  # SAFE ONLY WHILE THAT MANDATE HOLDS. A new park path that does not require a
+  # wake, or a direct `parked_at` write via sqlite, bypasses it and silently
+  # converts this deferral into a permanent exclusion — and nothing in THIS file
+  # would say so. The bypass is not hypothetical: an unaudited direct UPDATE on the
+  # tasks table is how a title got corrected on 2026-08-04.
+  local grow gid gident gfier ganswered gmins
+  while IFS= read -r grow; do
+    [[ -n "$grow" ]] || continue
+    IFS=$'\x1f' read -r gid gident gfier ganswered <<<"$grow"
+    [[ -n "$gid" && -n "$gfier" ]] || continue
+    gmins=$(( ($(date -u +%s) - $(date -u -d "$ganswered" +%s 2>/dev/null || date -u +%s)) / 60 ))
+    ( cmd_send "$gfier" --from="task-engine" \
+        --message="✅ ${gident}: the human gate that was blocking it was ANSWERED ${gmins}m ago, so grading is genuinely yours again — nothing is waiting on a person. Pick it back up: \`5dive task start ${gident}\` then \`task done\`/\`task reject\` (DIVE-2207)." ) >/dev/null 2>&1 || true
+    ( cmd_send "main" --from="task-engine" \
+        --message="✅ Answered-gate delivery: ${gident} is back on verifier '${gfier}' — its gate was answered ${gmins}m ago and the row had left gap#2's view, so it is surfaced here rather than sitting invisible (DIVE-2207)." ) >/dev/null 2>&1 || true
+    db "UPDATE tasks SET gate_answered_nudged_at=datetime('now') WHERE id=${gid};"
+    _hb_log "[stall-sweep] ${gident} gate answered ${gmins}m ago, back on ${gfier} -> surfaced"
+  done < <(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id)||x'1f'||verifier||x'1f'||need_answered_at
+               FROM tasks
+               WHERE verifier IS NOT NULL AND maker_agent IS NOT NULL
+                 AND assignee=verifier AND status NOT IN ('done','cancelled')
+                 AND handoff_delivered_at IS NOT NULL
+                 -- `need_answered_at IS NOT NULL` is SUBSUMED by the comparison at
+                 -- the bottom and is kept only to state the intent (post-answer
+                 -- only) where a reader looks first. Proven, not assumed: in SQLite
+                 -- `NULL <= datetime(...)` is NULL, not true, so an open gate is
+                 -- already excluded by the window clause. Deleting this line reds
+                 -- NOTHING — it is the one clause here that no mutation can grade,
+                 -- so do not read arm A8 as evidence that it works. A8 grades the
+                 -- BEHAVIOUR (an open gate is never nudged); the window clause is
+                 -- what guards it.
+                 AND need_type IS NOT NULL AND need_answered_at IS NOT NULL
+                 AND gate_answered_nudged_at IS NULL
+                 AND parked_at IS NULL
+                 AND need_answered_at <= datetime('now','-${_HB_VERIFY_STALE_MIN} minutes');")
+
   # (b) GAP#3 core — fleet-idle-while-actionable-work-is-open, persisting.
-  local in_prog running_loops stranded_todo open_gates total_stranded
+  local in_prog running_loops stranded_todo open_gates parked_gates total_stranded
   in_prog=$(db "SELECT COUNT(*) FROM tasks WHERE status='in_progress' AND kind='standard';" 2>/dev/null || echo 0)
   running_loops=$(db "SELECT COUNT(*) FROM loop_runs WHERE status='running';" 2>/dev/null || echo 0)
   [[ "$in_prog" =~ ^[0-9]+$ ]] || in_prog=0
@@ -2374,6 +2454,24 @@ _hb_stall_sweep() {
     # gap#2 above already surfaces it on its own clock. Counting it here inflated the
     # stranded number with work that was moving (three such rows at the 2026-07-26
     # alert). Same predicate as the gap#2 query, so the two cannot disagree.
+    # DIVE-2207 — THE LABELS BELOW ARE LOAD-BEARING; both were renamed after a
+    # reader acted on the wrong one. A count whose NAME is broader than its
+    # PREDICATE cannot be read correctly by anyone who has not read the query, and
+    # it fails in the expensive direction: it under-reports, so it reads as "nothing
+    # is pending" exactly when something is. Two instances were live in one message:
+    #   * open_gates rendered as "open gate(s)" — a SUPERSET label (open ⊃
+    #     fleet-actionable), so it over-promised. main read "0 open gate(s)" against
+    #     12 genuinely open gates and reported the query as broken; the query was
+    #     right. Now "fleet-actionable gate(s)".
+    #   * stranded_todo rendered as "unclaimed todo" — worse, a DISJOINT label. The
+    #     predicate REQUIRES assignee IS NOT NULL, and todo/standard rows with no
+    #     assignee measured ZERO on the live board, so the word pointed at the empty
+    #     set and always would: no reader chasing genuinely unowned work could ever
+    #     find it here. Now "assigned-but-unstarted". (It also excludes 21 recurring
+    #     rows by kind and 2 awaiting-grade rows — both deliberate, DIVE-2693 and
+    #     DIVE-2122 own those shapes.)
+    # The rule, if you add an aggregate here: name it after its predicate, not after
+    # the concept the predicate approximates.
     stranded_todo=$(db "SELECT COUNT(*) FROM tasks
                         WHERE status='todo' AND kind='standard'
                           AND assignee IS NOT NULL AND assignee != ''
@@ -2394,8 +2492,20 @@ _hb_stall_sweep() {
                        AND status NOT IN ('done','cancelled')
                        AND (COALESCE(tier,2) <= 1
                             OR (need_asked_at IS NULL AND gate_pinged_at IS NULL));" 2>/dev/null || echo 0)
+    # DIVE-2207: the PARKED count — context, never alarm input. Deliberately NOT
+    # folded into total_stranded below: these are the rows open_gates excludes on
+    # purpose, and adding them back is the alert-fatigue regression the comment
+    # above exists to prevent. It is rendered so a reader can tell "the fleet has
+    # stopped" from "the fleet is waiting on a human", which is the distinction the
+    # alert could not previously express in either direction.
+    parked_gates=$(db "SELECT COUNT(*) FROM tasks
+                       WHERE need_type IS NOT NULL AND need_answered_at IS NULL
+                         AND status NOT IN ('done','cancelled')
+                         AND COALESCE(tier,2) >= 2
+                         AND (need_asked_at IS NOT NULL OR gate_pinged_at IS NOT NULL);" 2>/dev/null || echo 0)
     [[ "$stranded_todo" =~ ^[0-9]+$ ]] || stranded_todo=0
     [[ "$open_gates"    =~ ^[0-9]+$ ]] || open_gates=0
+    [[ "$parked_gates"  =~ ^[0-9]+$ ]] || parked_gates=0
     total_stranded=$(( stranded_todo + open_gates ))
   fi
 
@@ -2458,7 +2568,7 @@ _hb_stall_sweep() {
             _tail="The session probe could not measure every agent, so this is a QUESTION, not a finding — is the fleet actually stalled? Check \`5dive task ls\` / \`5dive task inbox\`"
           fi
           ( cmd_send "main" --from="task-engine" \
-              --message="${_hdr}: ${total_stranded} stranded actionable item(s) (${stranded_todo} unclaimed todo, ${open_gates} open gate(s)) idle $((since_secs / 60))m+ with 0 in_progress and 0 running loops — and ${_act_detail}. ${_tail} (DIVE-1416 gap#3, session probe DIVE-2122, claim/probe honesty DIVE-2244)." ) >/dev/null 2>&1 || true
+              --message="${_hdr}: ${total_stranded} stranded actionable item(s) (${stranded_todo} assigned-but-unstarted, ${open_gates} fleet-actionable gate(s)) idle $((since_secs / 60))m+ with 0 in_progress and 0 running loops, ${parked_gates} parked on the human (context, not counted) — and ${_act_detail}. ${_tail} (DIVE-1416 gap#3, session probe DIVE-2122, claim/probe honesty DIVE-2244, labels DIVE-2207)." ) >/dev/null 2>&1 || true
           db "INSERT INTO task_prefs (key,value) VALUES ('stall_alerted_at', datetime('now'))
               ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
           _hb_log "[stall-sweep] fleet-idle $((since_secs / 60))m with ${total_stranded} stranded item(s), ${_act_detail} -> sent '${_hdr}' to main"
