@@ -6,6 +6,7 @@
 # _apply_byo_claude write path against them. No root, network, credentials, users,
 # or runtime state are touched.
 set -uo pipefail
+trap 'rc=$?; rm -f "${capture:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
 # Three-state: if the helper is unreachable (a staged copy that did not carry
@@ -64,7 +65,6 @@ valid_byo_provider qwen \
 # 4. Behavioral: _apply_byo_claude writes the exact env shape the live smoke
 #    proved. Stub the writer (as byo_model_create_unit.sh does) and read back.
 capture=$(mktemp)
-trap 'rm -f "$capture"' EXIT
 step() { :; }
 profile_set_var() {
   local profile="$1" var="$2" value
