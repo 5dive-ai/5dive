@@ -938,7 +938,13 @@ valid_base_url() {
 # live the same day: qwen3.8-max answers on opus+sonnet tiers, qwen3.6-flash on the
 # haiku tier. No context-cap var is set deliberately: the harness has no per-provider
 # context knob, and a wrong one would silently TRUNCATE rather than error (the row's
-# open question, resolved as "don't guess").
+# open question, resolved as "don't guess"). Region availability re-checked 2026-08-07
+# (live probe + vendor confirmation): Token Plan is served ONLY from ap-southeast-1 —
+# token-plan.eu-central-1 answers 400 BadRequest.IllegalEndpoint ("Workspace endpoint
+# is invalid"), there is no eu-west-1 host, and us-east-1/cn-beijing reject the key
+# (separate key namespaces). There is NO EU Token Plan endpoint to switch to for
+# latency; EU-based boxes pay the ~170ms RTT to Singapore. Do not re-investigate
+# without a new signal (a region added upstream, or a workspace provisioned in it).
 declare -A CLAUDE_PROVIDER_BASEURL=(
   [deepseek]="https://api.deepseek.com/anthropic"
   [moonshot]="https://api.moonshot.ai/anthropic"
