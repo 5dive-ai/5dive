@@ -1,5 +1,1007 @@
 # Changelog
 
+## v0.19.6 — fix(objective): the planner could not see that its own task was dead (OSS-37)
+
+`task reject` at `max_iterations` does not close or reopen the row. It writes the
+feedback, files a `manual` gate on a human, and returns — so the task stays **open**
+at `status='blocked'`.
+
+The objective planner reads its open originated tasks as a status column, where that
+row renders `(blocked, high)` — byte-identical to a task blocked on a sibling
+dependency, which is a row you wait for. So the planner waited. A task whose whole
+maker→verifier budget is spent counted as in-flight progress, cycle after cycle, and
+the objective re-planned around work that was never coming: the "just parks" failure
+OSS-19 phase A2 names.
+
+Nothing was broken enough to report. The gate reached a human, the loop stopped
+bouncing, the audit row was written — every mechanism did its job, and the only
+casualty was the one reader that had no way to ask.
+
+The injected context now marks such a row `** STUCK: verifier rejected it N/Nx, the
+loop is spent **`, and names the unanswered human gate when one is parked on it. The
+contract tells the planner what that obliges: re-plan around it — cancel it (it is
+its own) and/or originate a smaller approach — and that the human gate is **not**
+its to clear, answer, or wait on.
+
+The predicate itself moved to `_task_stuck_loop_pred` (`lib/tasks_db.sh`), which
+`task loops --stuck` / `--escalate-stuck` and the planner now BOTH call. The first
+draft of this change re-typed it inline and the commit message claimed "one definition
+serves board and planner" — it did not. Two textual copies that agree today buy
+*does-not-currently-drift*; only a shared definition buys *cannot-drift*, and the two
+are indistinguishable on the day you write them. The copies were not even identical:
+the inline one dropped `AND status NOT IN ('done','cancelled')` because the local
+`WHERE` already covered it, which is exactly how a second copy starts. This repo had
+already written the lesson down 300 lines away (DIVE-1963, `_gate_bind_slug` in
+`cmd_push.sh`: "they agreed, but that is parallel derivation").
+
+The property is now graded rather than asserted: a test arm overrides
+`_task_stuck_loop_pred` with a never-true predicate and requires BOTH consumers to go
+dark. A consumer that re-typed it would be untouched by the override and stay marked.
+
+Read-only: this changes what the planner is **told**, not what it may **do**. Every
+anti-Goodhart guard is untouched — cancel/reprioritize stay restricted to the
+objective's own originated tasks, origination still rides the count checkpoint, and
+a T2 create still gates hard.
+
+
+## v0.19.6 — fix(heartbeat): the recurring-stall ladder's second rung changes hands instead of raising volume (DIVE-2853)
+
+The DIVE-2693 watchdog detects a never-started recurring instance correctly and says
+it exactly once — and then there was no second act. Its one notice is addressed to
+the row's assignee, i.e. to the party whose non-pickup *is* the observed fault.
+Measured on DIVE-2694: flagged on time (`recurring_stall_pinged_at 2026-08-05
+04:00:08`, once, right row), then unstarted a further 28h. The cause was not a lost
+message — dev had it and replied. dev was mid-delivery under a single-task goal and
+therefore **structurally barred** from starting a second row. A fence outlives every
+re-ping, so a louder notice to that same addressee is a guaranteed no-op.
+
+A second rung now fires on an instance still `todo` with `started_at IS NULL` a full
+window after its flag (`HEARTBEAT_RECURRING_ESCALATE_HOURS`, default 24). It **changes
+hands** rather than raising volume:
+
+- **reassign** to an agent the board can already see is free — heartbeat enabled in
+  the registry, no `in_progress` standard row — preferring the template's creator,
+  who owns the beat's inputs and unstuck it by hand both previous times;
+- **cancel with a written reason** when nobody is free, so the schedule re-fires. Not
+  a `blocked` park: skip-if-open counts every instance that is not `done`/`cancelled`,
+  so parking renames the outage instead of ending it. The old assignee and the
+  coordinator are told in the same breath, and the reason is written into the row.
+
+`recurring_stall_escalated_at` latches the rung to once per instance, so a
+reassignment cannot thrash a row around the fleet; if the new hands do not start it
+either, the next window's rung is the cancel that actually restores the beat.
+
+Fail-closed on an unreadable fleet: `registry_read()` collapses "no file",
+"unreadable" and "empty fleet" onto `{"agents":{}}`, and here an empty free list is
+the input that reaches the *cancel* rung — so the picker uses
+`registry_read_checked` and a tick that cannot read the registry escalates nothing.
+
+The first rung now also names whether its addressee could act at all — an assignee
+already holding an `in_progress` row is reported as occupied, rather than leaving
+"misaddressed" to be inferred from another day of silence.
+
+## v0.19.6 — feat(task): a close that NAMES a version is compared against the INSTALLED artifact (DIVE-2835)
+
+`task done` and `task verify` now read the version a result claims it verified on and compare it to
+the version the box's own `/usr/local/bin/5dive` reports. The durable half of DIVE-2819, which
+rolled out a fix but built no machinery.
+
+**What it is for.** DIVE-2762 closed *"verified on v0.19.2"* onto a control plane running 0.19.1.
+The board read fixed; the defect stayed live for a day and ate maker text twice, with a verifier's
+signature on the row. DIVE-2819's pass then turned on a human **remembering** to grep the installed
+artifact. This runs that comparison at the only moment the closer can act on it.
+
+- **It keys on the ARTIFACT, not the string.** `_gate_installed_cli` resolves `/usr/local/bin/5dive`
+  — the path cron and every agent execute — and asks that file what it reports, rather than trusting
+  `$FIVE_VERSION` of whatever bundle is executing, which on a maker's worktree is not what the
+  control plane runs. Every message points at the file, because the whole lesson of DIVE-2819 is
+  that a version string was never the evidence.
+- **Direction is graded, not just difference.** Installed OLDER than claimed is the DIVE-2762 shape
+  and gets the loud line; installed NEWER gets a note (it shipped, and more shipped after); equal
+  emits a `step` so the record shows the comparison RAN. A dev build (`0.0.0-dev`, which is what
+  `main` permanently reads since DIVE-2247) refuses to be ordered against a release instead of
+  false-REDing every worktree, and an unreadable artifact says **NOT CHECKED** out loud rather than
+  passing silently.
+- **It warns, it never refuses — deliberately.** The guard cannot know WHICH artifact a version
+  names: `v2.1.0` may be a plugin, the api, or a dependency. A refusal would be a confident claim
+  about something this code did not identify.
+- **A result that makes no claim is met with complete silence.** The enabling half must cost a
+  non-adopter nothing.
+
+**The fence is looser than `graded-sha`'s, and that is the design, not an inconsistency.**
+`_gate_graded_sha` matches only a labelled declaration because it drives a REFUSAL, where a false
+positive blocks a close. This one can only warn, so its false positive costs one line and its false
+NEGATIVE costs what DIVE-2762 cost. A tidy label-only fence (`verified-on:`) would have matched
+**nothing** in the incident that motivates it, because the claim was ordinary prose. So it matches a
+verification VERB and a full `x.y.z` on the same line, verb first — and the gap between them
+excludes `;` and `,` so it cannot cross into the next clause, which is where an unrelated version
+lives. Write-up: `community/wiki/a-fences-tightness-belongs-to-the-consequence-it-drives.md`.
+
+`tests/task_version_vs_installed_unit.sh`, 22 arms, extracting the three functions from the shipped
+`src/cmd_task.sh` rather than re-typing them — with anchor-uniqueness arms and an empty-extraction
+arm so the extraction cannot silently grade the wrong block or read as a vacuous green. Graded by
+four mutations of the shipped file: widening the gap class to the naive `[^0-9]*` reds the
+cross-clause arm, collapsing the direction split reds the NEWER arm, removing the path from the
+mismatch sentence reds the OLDER arm, and making the no-claim case speak reds the silence arm.
+
+## v0.19.6 — fix(agent): audit the inter-agent send rail with the derived caller (DIVE-2797)
+
+`5dive agent send`, `agent ask` and the scoped `agent _deliver` primitive now write a
+row to `agent-audit.log`. Before this they wrote nothing: `"cmd":"agent send"` was
+**0 rows** on a live box where `"cmd":"task inbox send"` had 83 in the same file, so no
+artifact anywhere recorded who sent an inter-agent message. `--from=` is caller-supplied
+and was the only provenance a recipient had — meaning a mislabeled or forged send could
+be re-verified for its *claim* and never for its *source*.
+
+Each row carries the assertion and the measurement as separate fields —
+`from_claimed=<--from value>`, `from_derived=<uid-derived caller>` and a
+`provenance=` verdict (`corroborated` / `divergent` / `unclaimed` /
+`unknown:<reason>`) — so a mislabeled send is greppable rather than a judgement call:
+
+```sh
+jq -r 'select(.args[]? | startswith("provenance=divergent"))' /var/log/5dive/agent-audit.log
+```
+
+A divergence is **recorded and surfaced, never blocked** — the same posture the task rail
+takes toward a divergent claim, so legitimate relay patterns (an agent sending on behalf
+of a chat user) keep working.
+
+The verdict comes from `envelope_provenance`, which composes over the existing
+`envelope_via` rather than re-deciding, so the audit row and the `[5dive-msg …]` header a
+recipient reads can never disagree. The message **body is not logged** — only its length.
+
+## v0.19.6 — fix(task): a FIRST close must carry a reason, on both verbs; a cancel no longer deletes a live human gate (DIVE-2773)
+
+Filed as an asymmetry — *"`task done --result=` refuses an empty value; `task cancel --result=`
+accepts one"* — and that mechanism was **wrong**, which changes the fix. `_task_guard_result_over_closed`
+returns early when the row carries no result yet (`-z "$_cl_prev"`): with nothing recorded there
+are no bytes at risk, which is correct for destroy-protection and means **a first close with a
+blank reason was accepted by BOTH verbs all along**. Shipping "give `cancel` the check `done`
+already has" would have delivered destroy-protection that misses every blank first close and
+leaves `done`, the commoner verb, exactly as open.
+
+The measurement that stands: **seven empty-result cancels on the board in three days, every one a
+daily recurring row**, arriving in bursts — three inside 186 seconds. DIVE-2472 was the same act by
+the same actor on the same template *with* a reason ("a stale dated instance, not work declined")
+and is still explicable six days on; DIVE-2683 and DIVE-2737 are not.
+
+- **A first close now requires a non-empty `--result=`, on `done` and `cancel` alike.** A new
+  predicate, not a ported one: *this row is being closed and nothing has ever been written about
+  why*. The refusal names the SHAPE of a good reason, because a caller under load writes "n/a"
+  unless told otherwise. **No flag bypasses it** — the population is exactly callers clearing a
+  board at speed, and a flag is what they reach for.
+- **Scoped so no false refusal is possible.** A maker→verifier *delivery* routes and returns before
+  the check, so a bare `task done` handoff is untouched; an already-closed row keeps its
+  long-standing idempotent bare re-close (rc=0 no-op); a row that already carries text is the other
+  guard's population.
+- **Both close verbs now refuse over a PENDING gate.** The empty cancel of DIVE-2758 also destroyed
+  a **live tier-2 human gate** — the buttons were retired ~8 minutes after the gate reached its
+  audience, on lodar's own surface decision, and the row still reads `answer: — pending`. A cancel
+  does not answer a gate; it deletes the question. This fires **with a good reason attached** and is
+  a stronger condition than the one above, not a case of it. `DIVE-555`'s refusal text, which named
+  `task cancel` as the sanctioned way out of a gated row, no longer does — it was publishing the
+  exact route DIVE-2758 took. Both refusals name `5dive task need <id> --withdraw`, a **recorded
+  withdrawal rather than an answer put in anyone's mouth**; refusing without naming it would leave a
+  gated row with no close verb at all and send the next agent to invent one.
+- **`task reject` now routes through the shared result guard** instead of a private copy of the
+  predicate DIVE-2483 replaced. Its own preservation fired only when the row was `done` — but a row
+  delivered to a verifier is `todo` **by design**, so on the *ordinary* bounce the branch never
+  fired and the bare UPDATE **replaced the maker's result** with the rejection text, silently. This
+  is DIVE-2762's finding one verb over: the guard keyed on closed-ness while the population is
+  carries-a-result. `reject` was never one of the shared guard's three call sites and so survived
+  the fix meant to kill the class, wearing a `DIVE-2067` marker that made it look handled. It asks
+  the guard to APPEND, which is what keeps DIVE-2112's legitimate reopen (the recorded verifier
+  withdrawing their own grade) working. **Observable change to the record:** on a closed row,
+  reject now writes the shared guard's `--- appended by a later close (DIVE-2464) ---` seam
+  instead of its private `--- superseded result (DIVE-2067, preserved) ---` one. The marker
+  changed and the guarantee did not — and it now also fires on the delivered-`todo` row, where
+  reject previously preserved nothing at all. `task verify`'s closed path still writes the
+  DIVE-2067 marker, so a grep for superseded records wants both strings.
+
+`tests/task_close_needs_a_reason_unit.sh`. Arms B and D are the ones a port-of-the-existing-check
+leaves red while looking like a fix; F/G are the non-vacuity half (a bare re-close still lands, a
+delivery is not a close); K builds the delivered-`todo` cell through the real rail, because that
+state is exactly what the old private predicate missed. Write-up:
+`community/wiki/a-guard-cited-by-name-covers-less-than-its-name-claims.md`.
+
+## v0.19.6 — feat(create): `--base-url` points a claude agent at any Anthropic-compatible endpoint (DIVE-2757)
+
+`5dive agent create --type=claude` could only reach the four vendors hardcoded in
+`CLAUDE_PROVIDER_BASEURL` (deepseek, moonshot, openrouter, zai). Open weights running
+on a server you own were unreachable at any price. `--base-url=<url>` removes that
+fixedness:
+
+```sh
+sudo 5dive agent create qwen-box --type=claude \
+  --base-url=https://llm.internal.example.com/anthropic \
+  --api-key=<key> --auth-profile=qwen-box --model=qwen3.8-max
+```
+
+- **`--model` is required** when the endpoint has no catalog row, because there are
+  no per-tier model ids to inherit. All three tiers are pinned to it — including
+  HAIKU, which is the one that would fail silently: it is background traffic, not a
+  tier anyone selects, so an unset value looks fine interactively and 404s later.
+- **`https://` is required**; the API key rides that URL on every request. `http://`
+  is accepted only for `localhost` / `127.0.0.1` / `[::1]`, where the traffic never
+  leaves the box. A private-LAN address is off-box and is refused.
+- **`--auth-profile` is required**, inherited from the existing claude BYO path, so
+  the endpoint and its key are scoped to that profile rather than to every claude
+  agent on the host.
+- Passing `--base-url` alongside a KNOWN provider redirects that vendor to another
+  host (a CN endpoint, a corporate gateway) and keeps its catalog model ids — the
+  models did not change, only where they are served.
+- claude only. hermes and openclaw resolve endpoints from their own catalogs and
+  speak different wire formats; one flag cannot serve all three.
+- `5dive compose` gains the `base_url` key. On that path `--model` is emitted at
+  create time rather than left to the post-create `agent config set model=`, because
+  create refuses before that would ever run.
+
+## v0.19.6 — fix(ci): re-derive the calibration baseline from CI, and probe the runner on BOTH sides of the corpus (DIVE-2736)
+
+DIVE-2728 shipped a relative core-tier budget whose baseline had been measured on
+the control plane. The first six CI readings say it was **inert on every run**.
+
+**The baseline is re-derived from CI**, `TIER_CAL_BASELINE_US` 173000 → **119000**,
+with its environment attached (GitHub-hosted `ubuntu-latest`, both PR jobs, six
+readings across three commits, each the min of 2 auto-sized samples):
+
+```
+116662  117714  120693  121231  121382     five, within 4%, both job types
+ 82218                                     one, one job, one run
+```
+
+119000 is the **median of all six** — within 0.5% of the mean of the tight five,
+and it does not require first winning the argument about excluding the sixth.
+
+**Why the old number did not merely misgrade.** 173000 came from a box that is ~45%
+slower per iteration than the runner it was grading, so every CI probe read as a
+*fast* runner — 47-70% of baseline — and because the scale clamp floors at 100% by
+policy, a fast reading can never widen the cap. All six runs clamped to the floor
+and were graded against exactly 300s. **A baseline attached to the wrong
+environment silently disables a relative budget rather than skewing it**, while
+every log line goes on claiming a ratio was applied. The re-baseline warning fired
+on all six runs from the first one onward; it was right and nothing read it.
+
+**A second probe now runs after the corpus, and grades nothing.** On
+core/installed-host run 30967674559 the probe read 30% *faster* than its own cluster
+while the corpus ran 90s *slower* with one fewer harness — the ratio's two halves
+moving in opposite directions, on the one run the mechanism existed to rescue. Two
+causes remain live: the probe is a ~20s point sample standing in for a ~6-minute
+integral (**temporal**), or its cost mix omits what the corpus pays (**structural**,
+trap 3). What ships is the **discriminator**, not either remedy: same iteration
+count, same min-of-N estimator, reported as `cal_post_us_per_iter` and a signed
+`cal_post_delta_pct`, never entering the scale, the verdict or the exit code.
+
+**The discriminator is one-sided and says so.** The corpus warms the page cache and
+the CLI it just spawned, biasing the second reading fast — so *post slower than pre*
+is the clean signal (it survives a confound pushing the other way), while *agreement*
+is consistent with structural blindness, with contention that ended, and with a real
+slowdown masked by cache warmth. The run prints the cap a max-bracket **would** have
+set, labelled as not applied.
+
+**`scripts/tier-cal-window.sh`** reads N reports and answers "does the probe track
+the corpus" across runs — no single run can see a window. Corpus wall-clock is
+normalised to **µs per harness** first, or deleting a harness reads as
+anti-correlation. Median-side agreement rather than a correlation coefficient, since
+at n=6 a Pearson r carries a false amount of authority. The discordant half that
+costs somebody a red gets its own name, **UNPROTECTED**: probe below median (so the
+floor pins the scale at 100%) while the corpus sat above it. Not wired to CI —
+a window needs reports to outlive the run that wrote them, and today they do not
+persist; `--strict` is off by default because n=1 on the anti-correlation is not a
+verdict to gate on.
+
+Local runs now print RE-BASELINE, correctly: the constant is attached to
+`ubuntu-latest`, and a warning on your laptop is it telling you truthfully that you
+are not standing in that environment. Re-deriving it from the box you happen to be
+on is how 173000 got there.
+
+## v0.19.6 — fix(ci): the core-tier budget is spent in a RELATIVE unit, so a slow runner stops reading as a fat corpus (DIVE-2728)
+
+PR #461 red-gated at **322s against the 300s cap with 234 of 234 harnesses passing
+and a diff worth +0.1s**. Per-harness against the identical corpus on main,
+unrelated files ran **10-36% slower** while the one file the diff touched moved
+**+0.3%**. Five recent runs of that same corpus: 253/256/260/261/273s — **27s of
+headroom on the worst normal run, 9%**, on a platform that draws 10-36% slow.
+
+So the gate had stopped failing when the corpus grows and started failing when the
+VM is slow, and those are different events wearing the same red.
+
+**The cap is not raised** — that buys time until the corpus catches up and
+re-installs the ratchet DIVE-2525 exists to remove. **DIVE-2592's confirmation is
+kept**, unchanged: it covers the *concentrated outlier*, this covers the *uniform
+slowdown*, and they are complementary. Instead the runner times a small calibration
+workload in the same job and spends the budget in units of it, so a uniformly slow
+VM scales both sides and cancels. An absolute second is not a stable unit on rented
+hardware.
+
+Three things this gets wrong if built carelessly, and what was done about each:
+
+- **A relative budget replaces one noisy number with a ratio of two.** A 3s probe
+  swinging 20% hands the effective cap that same swing. The probe is **auto-sized to
+  a ~10s wall-clock target** rather than to a fixed iteration count, reported in
+  **microseconds per iteration** so the sampling length is a precision knob that
+  cannot move the unit, and **min-of-2** on DIVE-2592's one-sided-noise argument.
+  Two independent readings on the control plane came in **0.16% apart** (173186 and
+  172907 us/iter), against the 9% headroom being protected.
+- **Unclamped, the scale factor IS the escape hatch** — a cap that grows with the
+  runner draw licenses an arbitrarily larger corpus. Clamped to **100-150%**, and
+  past the ceiling the run is **UNDETERMINED with its own exit 6**, never green. So
+  is a calibration that cannot be taken: fail closed, because "calibration
+  unavailable, falling back to the raw cap" is the free escape hatch wearing a new
+  name. Exit 6 sits **below 1** (a failing harness still dominates; a slow box must
+  never hide a broken test) and **above 4** ("over budget" and "could not measure
+  the budget" are the two events this row exists to separate).
+- **The probe must match the corpus's COST MIX, not merely its duration** — process
+  spawn, bash startup, the built CLI's own startup, small file I/O. A CPU spin is
+  the tempting probe and calibrates a dimension these harnesses barely pay for.
+
+**The report is the product.** Every run prints raw seconds, the baseline, the
+measured calibration, the scale, the effective cap, and the percentage against
+*both* caps on adjacent lines — raw high + effective low means the VM was slow, both
+high means the corpus grew. `wall_clock_s` / `budget_s` / `pct_of_budget` keep their
+names and meaning (every trend reader parses by name); the calibration fields are
+appended beside them. `TIER_CAL_BASELINE_US` is graded against itself every run and
+says **RE-BASELINE** past 25% drift.
+
+The lower clamp is **1.0**: a fast VM never tightens the cap. Symmetric scaling is
+the purer reading *of the measurement*, but 300s is the agreed number and scaling
+below it reds a PR that would pass on a normal runner, on a signal its author cannot
+reproduce — the same unactionable red, inverted.
+
+Five acceptance arms, each mutation-graded (six mutants, each killing exactly the
+arms it should): uniform slowdown does not move the verdict; growth past the clamp
+still reds; past the ceiling is exit 6 not green; a probe that cannot run fails
+closed; and DIVE-2592's confirmation still fires against the scaled cap. Every
+timing arm is driven through the `--corpus-dir` seam with durations the harness
+**wrote** and a calibration it **injected** — on a mechanism whose subject is runner
+variance, a test that measures its own inputs is a coin flip.
+
+## v0.19.6 — fix(task): verification depth is re-measured at delivery, from the paths the work touched (DIVE-2719)
+
+The defect was the TIMING, not the ruleset. `task add` decided how deeply a task would be graded
+from its PRIORITY and a KEYWORD REGEX over its TITLE — because at `task add` there is no branch, no
+diff and no PR, so the words in the title are the only axis that exists. The classifier was being
+asked at the one moment it could not be answered.
+
+Measured on DIVE-2712: the title described a real user-facing Telegram defect, correctly, so it
+earned the full verifier rail. The delivered change was ONE LINE in a test stub. Four verifier
+iterations graded it. No title classifier could have known — the fact had not happened yet.
+
+So the question is asked again at DELIVERY, where the answer is a measurement. `task done` reads the
+changed paths off the PR the row already binds (`delivery_ref`, or the DIVE-1462 `Branch:` line) and
+either confirms the add-time guess, DOWNGRADES it (every path is a test, a doc or a changelog
+fragment — CI is the gate there, and a grading round-trip adds latency and no signal) or UPGRADES it
+(a row filed as a chore whose diff reached the scheduler, the task store, credentials or deploy now
+routes to a grader instead of closing outright). Path globs only, both lists under ten entries; this
+is deliberately not a taxonomy.
+
+Unknown stays unknown. No binding, no `gh`, no credential, or no PR found all produce an empty path
+list, and an empty list classifies as neither — so a missing credential can never widen or narrow
+the rail, and an ordinary unbound close does not spend a single API call.
+
+This is not the done-time waiver DIVE-969 banned. That ruling refuses a waiver the MAKER ASSERTS at
+peak completion-incentive; this asserts nothing. To be classified shallow you must have genuinely
+changed only tests and docs, in which case there is nothing for a grader to grade. A downgraded
+close still has to satisfy the DIVE-1830 merge gate.
+
+One limit, stated rather than glossed. The add-time opt-out (`--no-verify`) is **not** persisted —
+it is an add-time shell variable with no column behind it — so at `task done` a `--no-verify` row is
+indistinguishable from a DIVE-969 auto-skipped one: both carry a NULL verifier. The UPGRADE arm
+tests exactly that shape, so an explicit opt-out whose diff reaches the blast radius is given a
+grader anyway. The misfire can only ADD a rail, never waive one, so the DIVE-969 posture is intact,
+and `verify_unavailable=1` self-handles (no distinct grader exists, so nothing is attached).
+DIVE-2730 persists the flag so the opt-out survives to delivery.
+
+**The same defect, one function over.** `_task_default_verifier` picked the GRADER by walking UP the
+org chart — project lead, coordinator, the maker's manager, the org root, the deputy. Every rung is a
+leader, so a leader was structurally guaranteed to win. lodar ruled on 2026-08-04: "you should never
+be verifier yourself" / "why our ceo acts as ci tool". The remedy applied that morning moved 58 rows
+off main and cleared 6 more, and did not touch the picker — so by that evening six MORE rows created
+the same day carried verifier=main again. Correcting the output of a rule leaves the rule producing
+it. A chart that names a QA agent has already answered who should grade, and nobody had asked it: the
+org's designated QA/testing/verification agent is now the FIRST rung, ahead of every leader.
+`FIVE_VERIFY_EXCLUDE=<names>` hard-excludes named agents from the default chain the way the maker is
+already excluded, so the next such ruling is data rather than a code change. It is empty by default —
+this ships inert on that half and changes no selection until an org sets it.
+
+## v0.19.6 — fix(heartbeat): a tier HOLD skips the held TASK, not the whole agent (DIVE-2716)
+
+The wake loop picked ONE todo per agent (`_hb_pick_task`, LIMIT 1) and, when DIVE-1065's
+tier guard refused to auto-drive it, ran `continue` on the AGENT. Task selection is
+deterministic, so the same row was re-picked and re-held every tick and everything queued
+behind it was unreachable forever. Measured on the live board 2026-08-04: five held rows
+head-of-line blocking 122 runnable ones, the fleet idle for 2h35m, `main`'s queue stuck
+since 2026-07-30.
+
+The guard itself was right and is unchanged — a standard-tier creator still cannot make an
+admin-tier agent execute work. What changed is the scope of the verdict: the wake loop now
+walks the candidate list in the same DIVE-979 priority/critical-path order and takes the
+first row the guard clears. A held row stays held, is never the wake target, and still names
+itself in the log; the tick additionally reports how many rows it stepped over, and the tick
+summary carries a `tierHeld` count. The scan is bounded (`_HB_PICK_SCAN=25`) and hitting that
+bound is logged as "rows past the cap were not examined" rather than passed off as an idle
+agent.
+
+The falsified premise is worth stating because it is not specific to this guard: the block's
+own comment argued "a hold skips ONE agent's wake this tick and never aborts the tick". Both
+halves are true per tick. Per-event isolation says nothing about an event that repeats with
+identical input, and this one repeated every five minutes.
+
+`tests/heartbeat_tier_head_of_line_unit.sh` drives the REAL `cmd_heartbeat_tick` on a scratch
+board and anchors against the pre-fix `cmd_heartbeat.sh` from a pinned commit: same fixture,
+pre-fix reaches ZERO of the five runnable rows queued behind a held head, post-fix reaches one
+— with the anchor graded for vacuity (the pre-fix run must still log the hold, or "no wake"
+would prove nothing).
+
+Two of the arms exist to keep the guard and the scheduler separable, because most of the
+obvious assertions cannot tell them apart: anything of the form "the tick wakes row X" reds
+both when the guard stops refusing and when the scheduler stops stepping over. So the guard
+half is pinned by "a fully-held queue wakes NOBODY" and the scheduler half by "a queue holding
+runnable work never leaves the agent idle" — the latter names no particular row and therefore
+survives a neutered guard while reding the moment a held head blocks the agent again.
+
+The `tierHeld` counter is graded rather than merely emitted. Stepping over a held head removes
+the blocking symptom that made this bug findable at all — DIVE-2459 sat held from 2026-07-30
+and went unnoticed for five days — so an unobservable skip would trade a loud permanent stall
+for a quiet permanent hold and make the next occurrence harder to find than this one was.
+
+## v0.19.6 — fix(council): a failed `verify` is a verdict, not a silent crash (DIVE-2711)
+
+`council verify` returned `E_GENERIC` on a legitimate failure — a drifted `constitution.yaml`,
+which it is *supposed* to fail closed on — without calling `mark_reported`. The EXIT backstop in
+`lib/output.sh` then treated that deliberate non-zero exit as an unreported one and appended its
+generic *"exited 1 without reporting a reason … this is a bug in the CLI"* text.
+
+On the stderr rail that is only noise. Under `--json` it is a **correctness bug**: the backstop
+emits a SECOND JSON object on stdout, so the command stops returning one document. Every reader
+breaks the same way — `jq -r '.data.constitutionOk'` returns `"false\nnull"` instead of `"false"`,
+so a caller checking `== "false"` sees a drifted constitution as *not flagged*. The verdict was
+right and unreadable, which is worse than either alone.
+
+Fixed by marking the failure reported: both rails already print the reason (the JSON envelope
+carries `constitutionOk` and `constitution`, the prose rail prints the `council verify: FAILED`
+block), so the backstop has nothing to add.
+
+**Why it only ever showed up on the installed-host CI matrix.** The environment did not change the
+bug; it changed how far the harness got. `council_amend_e2e.sh` drives real `convene` calls whose
+preflight needs a reachable agent registry, so on a pristine runner it stops before the drift arm
+and the defect is never reached. On a box with 5dive installed the preflight passes, the arm runs,
+and the second JSON object appears. `council_unit.sh` reds only because it aggregates that file.
+
+Also: the arm's failure message now prints the rc, stdout and stderr it rejected. It previously
+said only "verify json did not flag the drift", which is the one thing the payload already made
+obvious while hiding the second envelope that was the actual cause.
+
+## v0.19.6 — fix(merge-gate): a dead GitHub query no longer counts as a completed scan (DIVE-2705)
+
+`_gate_gh` ended `|| true; return 0` on **both** rails and discarded stderr on both, so a call
+that DIED and a call that succeeded and found nothing were indistinguishable on every channel at
+once: same empty stdout, same empty stderr, same exit 0.
+
+Most call sites were unharmed because the contract is carried by OUTPUT — DIVE-2318 reads
+`-z "$_state"` / `-z "$_attr"` and refuses as UNRESOLVED, which is why those paths were already
+honest. The autodetect scan is the exception: it counts a repo as scanned on the **exit status**
+(`_hit=$(_gate_gh …) && _sc_ok=$((_sc_ok+1))`), so an unlistable repo incremented `_sc_ok`,
+`_sc_ok == _sc_total` set `_scan_ran=1`, and the whole partial-repo-scan block — warn, audit row,
+`merge-gate: UNVERIFIED` stamp — never fired. Partial coverage was announced as a clean scan:
+the exact defect DIVE-1955 exists to delete, surviving one level down inside its own remedy.
+
+**Blast radius is refusals only, never acceptances.** `_GATE_ROLLUP_JQ` maps an empty rollup to
+`NONE` and never to `OK`, so no dead call could ever manufacture a green. No bad `done` was
+admitted by this bug.
+
+Three changes:
+
+1. **Both rails return the real status**, and stderr is captured into `_GATE_GH_LAST_ERR` rather
+   than discarded. An unusable bot rail now returns non-zero too — "there was nothing to run it
+   with" is not "the query ran and found nothing". Stderr is captured rather than passed through
+   deliberately: a repo a token cannot see is an ordinary condition on a multi-repo close, and
+   printing gh's error text on every gate would be the alarm fatigue DIVE-2711 names.
+2. **`_scan_why` stops using the token as a proxy for reachability.** `no-gh-token` is now only
+   reported when no rail answered at all (`_sc_total == 0`), and partial coverage is judged on how
+   many repos ANSWERED rather than on which rail asked. This was the same token-as-proxy that
+   DIVE-2605 replaced with `_gate_gh_reachable` one level up, left behind here — with the bot rail
+   reporting real failures it made a partial bot-rail scan announce itself as `no-gh-token`, which
+   is wrong and is the more reassuring of the two errors.
+3. **An arm that drives the bot rail.** The fixture exports `GH_STUB_AUTH_TOKEN`, so every
+   pre-existing arm in `task_merge_gate_multirepo_unit.sh` took the token rail and none could see
+   the bot rail's copy of the defect — a token-rail-only fix would have turned the corpus green
+   with the bot rail still laundering partial coverage, and the green is what would have stopped
+   anyone looking. The sudo stub gained a `BOT_RAIL_ON` mode serving the same fixtures over
+   stdin-delivered args; default behaviour is unchanged, so no existing arm moved.
+
+## v0.19.6 — fix(release): the changelog.d fold's deletions are part of the release commit (DIVE-2700)
+
+release-cut could not complete ANY cut while a `changelog.d` fragment existed. DIVE-2582
+added the fragment fold to the release commit — it merges `changelog.d/*.md` into
+`CHANGELOG.md` and deletes the fragments — but `grade-release-commit.sh`'s allowed-path set
+was never extended, so the inheritance premise reported the deletions as paths "OUTSIDE the
+release-commit set" and refused. The guard was correct; its premise had gone stale. v0.19.0
+was the first cut attempted afterwards and it died on 7 fragment deletions. Patch and minor
+cuts were equally affected, and the pipeline could not drain itself because the fold is what
+removes the fragments.
+
+The drift check that exists to catch exactly this (`grade_release_commit_unit.sh` section 11)
+missed it: its census matched the literal string `git add -f`, and the new writer is
+`git add -A -f changelog.d` behind an `if [ -d ]` guard, so it counted 4 of 5 writers and
+reported none unlisted. Both halves are fixed — the path set now admits `changelog.d/*`
+(entries are globs, split with `read -ra` so the pattern is not glob-expanded against the
+working directory before it can be used), and the census matches any `git add` regardless of
+flag order or guard shape.
+
+**This entry missed v0.19.0.** Its first version opened with `### Fixed` rather than the
+required `## Unreleased` heading, so the fold skipped it — correctly, and loudly enough to
+print, but non-fatally by design, because a cut must not die over a malformed fragment. The
+fix it describes did ship in v0.19.0; only the note is late.
+
+## v0.19.6 — ci(full-sweep): report the nightly total in the units of the policy dial (DIVE-2669)
+
+The full-sweep budget table printed an UN-SHARDED total next to a PER-JOB cap, so the nightly read as
+"1668s against 1320s (126%)" — a comparison between two different things, which is why it looked
+alarming and produced no decision. The dial is the shard COUNT, so the table now also prints the
+minimum number of shards the corpus needs: `N of M shards`. When N reaches M, adding a shard is the
+decision on the table, and it is exactly as visible a policy change as raising the ceiling would be.
+
+Hunk authored by dev on 2026-08-03 and stranded: it edits `.github/workflows/full-sweep.yml`, and
+`5dive push` uses a GitHub App token that GitHub withholds the `workflows` scope from by design
+(DIVE-2229/2262), so no agent push could carry it. Landed here via a token that holds the scope.
+
+**And the 126% turned out to be the artefact, not the corpus.** Measured on the 2026-08-05T04:33
+sweep, all three shards reporting in both environments:
+
+| environment | s1 | s2 | s3 | un-sharded total | worst shard vs 1320s cap | shards needed |
+|---|---:|---:|---:|---:|---:|---:|
+| pristine | 367s | 389s | 679s | **1435s** | 679s = 51% | **2 of 3** |
+| installed-host | 390s | 399s | 671s | **1460s** | 671s = 51% | **2 of 3** |
+
+So the nightly tier does **not** need another shard — it needs two of the three it already has, and
+no shard exceeds 51% of its cap. The row's second item ("still 126% un-sharded, nothing buys nightly
+headroom") was stated in precisely the units this change exists to correct.
+
+One thing the numbers show that the table does not: **shard 3 costs ~1.7x shards 1 and 2 in both
+environments.** Round-robin assignment spreads a long-tailed cost distribution better than
+contiguous blocks do, but it does not balance it — a single expensive harness still lands somewhere.
+Not actionable at 51% of cap; worth knowing when `shards needed` next moves.
+
+## v0.19.6 — fix(ci): full-sweep runs on every push to main, cost-bounded (DIVE-2667)
+
+`full-sweep.yml` has carried the comment **"A RED HERE IS NOT IGNORABLE"** since
+DIVE-2525. On 2026-08-03 it was ignored for about seventeen hours. "Not ignorable"
+was a property of the **consequence** — release-cut grades the same corpus, so a
+week-old red is a release that will not cut — and never of the **signal**.
+
+Two halves, each survivable alone:
+
+- **Cadence.** One `schedule:` at 03:17 UTC. Last green nightly `1cc1ce1e5`
+  (06:39Z), next observation `193e91291` (23:55Z) FAILURE, ~12 commits between
+  them — so the break was not attributable to a merge without bisecting.
+- **Surface.** full-sweep is **not in the per-PR check set**. PR #429 merged on
+  15/15 green with full-sweep not among the fifteen. Every PR that day could be
+  green *on its own checks* while the corpus rotted underneath. Nobody ignored a
+  red; the red was not on a surface anyone reads before merging.
+
+`push: branches: [main]` closes both: the latency to notice drops from up to a day
+to the length of one sweep, and the tier runs at the granularity that **attributes
+a break to one merge — between bursts** (the qualifier is real; see below). The
+`schedule:` stays — it is the arm that catches a break with **no commit behind it**
+(a runner image change, an expiring fixture, a rate limit).
+
+**Frequency and affordability are one change, not two.** The cost is **not money** —
+this repo is public and every job is `ubuntu-latest`, so standard runners are free.
+It is **wall-clock and queue contention**: six jobs at ~10 minutes, at ~20
+merges/day, against a pool every other workflow is also waiting on. So the push
+trigger ships with
+`concurrency: {group: full-sweep-${{ github.ref }}, cancel-in-progress: true}`: a
+burst of merges collapses into one sweep of the newest tip, and **nothing goes
+ungraded, because the cancelled run's tree is a strict ancestor of the survivor's**
+— it is graded later, at a tip that also contains it. Grouping on the ref keeps a
+PR-triggered sweep (the tiering-machinery `paths:` filter) from being cancelled by
+a merge to main.
+
+**What the bound spends is attribution, and that is the thing this row buys.** A
+collapsed burst grades N commits in one verdict, so a red *inside* a burst still
+needs a bisect over that burst. The window goes from a day's merges to a burst's;
+it does not go to one. The trade is taken knowingly and the qualifier sits next to
+the attribution claim in the workflow itself, not further down.
+
+No `paths:` filter on the push trigger, deliberately: the harnesses that went red
+here were broken by commits touching `src/`, not `tests/`, and any filter narrow
+enough to be cheap is narrow enough to miss that class again.
+
+`tests/corpus_tier_budget_unit.sh` pins both properties **in the same arm block**,
+by parsing the workflow rather than grepping it (a `grep 'push:'` matches the word
+inside this file's own comments and passes against the unchanged file). Red anchor,
+measured: against `origin/main`'s workflow the two new arms FAIL and the three
+control arms — parse liveness, absent-trigger discrimination, and the
+`unit-tests.yml` neighbour anchor — still pass.
+
+Full write-up, including the misplaced-`concurrency:` trap that `yaml.safe_load`
+accepts and only `actionlint` names:
+`community/wiki/a-tier-that-runs-nightly-cannot-attribute-a-break.md`.
+
+## v0.19.6 — feat(gate): the merge gate compares the merged sha against the sha the verifier says it graded (DIVE-2656)
+
+`task done` on a delivery-bound row already asks *did the PR merge*, *did it merge
+green*, *did the branch land*. Every one of those is a question about the **PR**.
+None of them is a question about the **verdict**.
+
+PR #425 (DIVE-2654) carried the commit its verifier had **REJECTED** while GitHub
+read CLEAN / MERGEABLE / 14 checks green — the graded fix existed only on a local
+branch and was never pushed. A merge was one command from landing rejected code,
+and it was caught by hand.
+
+Two halves, and the second is inert without the first:
+
+- **A verifier states the sha it graded.** Any `graded-sha: <7-40 hex>` line in the
+  `--result` text (also `graded sha`, `graded_sha`, `=` for `:`, any case; the last
+  one wins so `--append-result` behaves). A **labelled** declaration only — a bare
+  hex blob in prose is a different claim and never drives a refusal. A loop close
+  that states nothing gets a **nudge**, never a block: the enabling half costs
+  nothing, so it must not be able to stop a close.
+- **The gate compares it to what actually merged** — the PR's `headRefOid` **or**
+  its `mergeCommit.oid`, and refuses on mismatch (`--force-merge-gate` overrides,
+  audited). Both operands accepted on purpose: a verifier who graded the branch
+  names its head, one who graded the landed result names the merge commit.
+
+It is an **equality** test, deliberately not ancestry. We squash-merge, so a branch
+head is never an ancestor of `main` afterwards and an ancestry version would false-RED
+every squash-merged PR — worse than the false green it fixes
+(`community/wiki/a-stored-graded-sha-cannot-survive-a-squash-merge.md`). Equality is
+untouched by squash. A probe that cannot be reached prints **NOT CHECKED** and closes;
+a query that never ran is not a mismatch.
+
+The reason this is worth more than the rows it catches is that **a check that FORCES a
+path to run finds more than one that INSPECTS it**. On the night this was filed two
+fail-opens sat on one path and suppressed each other — a verifier whose gate proofs
+stored an empty signature and never failed, and a graded fix that was never pushed.
+Each defect's symptom was the other's absence. Comparing the stated sha to the merged
+one exercises the delivery step on **every** close, which is what makes a pair like
+that observable at all.
+
+## v0.19.6 — feat(ui): `5dive ui`, three read-only views served by the CLI itself (DIVE-2655)
+
+The org layer has always been the product and it has never been visible: to see who reports to
+whom, what is queued, and what is parked on a human, you had to run three commands and hold the
+join in your head. `5dive ui` serves that as a page, from the same single-file bundle, with no
+install, no build step, no account and no sign-in.
+
+Three views over ONE host. **Org chart** renders `agents_org` as a tree, each agent carrying what
+it is actually holding, and under it every live handoff on the board: who gave the work, who holds
+it, who grades it. The headline is a count off the data, not a claim in copy — how many of those
+handoffs run agent to agent with no human anywhere in the path. **Queue** is the open rows with
+assignee, verifier and maker-to-verifier handoff state. **Gates** is what is blocked on a person,
+at which tier, with the asking agent's own recommendation.
+
+It reads the local task store and the local org chart and nothing else. There is deliberately no
+endpoint that aggregates across boxes: multi-box, the marketplace and hosted council are a
+different product, and `tests/ui_views_e2e.sh` asserts the payload's key set WHOLE so a fleet key
+cannot arrive unnoticed.
+
+Read-only is a property of the server, not a promise about the client: GET and HEAD answer on
+exactly three paths, every write method returns 405, and anything that changes state already has a
+CLI verb. There is no sign-in, so the bind is loopback and `--host` refuses a routable address
+unless `FIVE_UI_ALLOW_REMOTE=1` says otherwise. The page is one self-contained file with no
+absolute URL in it, so it renders on a box with no egress. python3 (stdlib only) holds the socket
+because bash cannot, and the server script is generated at runtime into a private temp dir, so the
+shipped artifact is still exactly one file.
+
+A box whose task store has not been initialised yet still gets all three views: `task init` is
+root-only, so refusing there would mean a fresh install cannot open the UI at all. The empty board
+is NAMED (`store: "absent"`) and the page says which command fixes it, because three empty arrays
+on their own read as "nothing is queued" on a host that cannot queue anything.
+
+`5dive ui --data` prints the JSON both the page and any other consumer render. Every field in it
+comes from the predicates the CLI already uses (`handoff_state` and `gate_live` are the `task ls`
+expressions verbatim), so a view cannot tell a different story than the queue it is showing.
+
+## v0.19.6 — feat(task): every merge-gate accept now says merged is not deployed (DIVE-2641)
+
+The close gate prints `done=merged-to-main satisfied` — which is true — at the exact moment
+the reader assumes the stronger claim nobody checked: that the change is **running**. Four
+agents made that substitution independently on 2026-08-03 while the artifact their readers
+execute was an older bundle. The gate is the cheapest place to interrupt it, because the
+system is what tells the reader they are done.
+
+Every accepting arm now appends, in the same breath, what it did **not** establish, and
+rows whose deliverable is a deployed artifact get a second sentence naming the check that
+can actually answer for that artifact — `5dive doctor --category=host` for the bundled CLI
+at `/usr/local/bin/5dive`, `--category=plugins` for the marketplace clone each agent runs
+out of its own `$HOME`. The prompt is keyed off the repo the **accepting evidence** was
+found in, never off the task's own prose.
+
+The ticket named two accepting arms and a `grep -c` correction said three. There are
+**four**: the declared-`delivery_ref` path accepted while emitting no line at all, so no
+enumeration keyed on the accept string could return it — and it is the most-travelled close
+route in the product. It is now audible. Patching only the three that already spoke would
+have removed every visible symptom while leaving the defect intact for every row that binds
+a PR.
+
+Nothing about acceptance changes: text is appended to warns on paths that already passed,
+and no refusal is touched.
+
+## v0.19.6 — feat(doctor): per-host CLI freshness, so a verifier can tell INSTALLED from MERGED (DIVE-2640)
+
+Nothing on the board distinguished **merged** from **installed**. On 2026-08-03 four agents
+who did not know about each other closed rows against `origin/main` while the artifact their
+readers actually execute — `/usr/local/bin/5dive`, driven by cron every five minutes — was an
+older bundle.
+
+`5dive doctor --category=host` now answers *is what is RUNNING what we merged?* in three rows,
+because they are three different facts and collapsing them is how the strong claim gets read
+off the weak one:
+
+- **`cli-installed`** — what the binary *is*: path, the `FIVE_VERSION` it declares, mtime, sha256.
+- **`cli-freshness`** — is it *behind*: declared version vs the newest tag the installer would
+  actually resolve. `STALE` is an error, `AHEAD` a warn (a box above the newest release is
+  refused every upgrade by the monotonicity guard, so it never self-corrects).
+- **`cli-provenance`** — is that version *true*: sha256 of the installed bytes against the
+  bundle published at that tag.
+
+Provenance is its own row because a version string is a claim a bundle makes about itself —
+`0.18.0+dive2563` satisfied a "runtime reads 0.18.x" criterion while hand-built, carrying
+unmerged code, and missing two published releases. Only the bytes make the version a
+consequence of provenance instead of an assertion about it. On a hand-stamped bundle
+`cli-freshness` legitimately reads `ok` while `cli-provenance` reads `error`; one row would
+have to pick, and the cheap check is the one that answers.
+
+**Ancestry is a positive-only oracle and the row inherits that rather than fighting it.** Under
+squash merges a sha comparison answers FALSE for reasons unrelated to whether the work landed.
+So a non-match is rendered as **UNPROVEN**, with the reason, at `warn` — never as "not merged".
+A row printing the strong negative would manufacture alarms about healthy boxes, which is this
+row's own defect class pointed backwards. Bytes escalate to `error` in exactly one case: the
+declared version *equals* the newest published one, which is the hand stamp and nothing else.
+
+**No green the check did not earn.** An absent binary, an unreadable one, a bundle with no
+`FIVE_VERSION`, an unresolvable tag and an indeterminate probe each read `UNKNOWN` at `warn`.
+The reference is resolved from the remote through the installer's own `_published_cli_probe`
+rather than a second resolver that would drift from it; that probe now emits the published
+bundle's sha256 as a fourth line, empty unless the answer is `consistent`.
+
+Found a real one on its first live run: a control-plane box on `0.18.6`, bundle dated
+2026-08-03 14:21:10, against a published `0.19.0` — reproduced on a second box the next day.
+
+## v0.19.6 — fix(agent): report registry fetch failures without claiming a slug is absent (DIVE-2600)
+
+`agent import <slug>` and `agent inspect <slug>` now distinguish a successfully
+fetched index with no matching pack from an unreachable index, a malformed
+index, and a listed pack whose manifest could not be fetched. Transient HTTP or
+transport failures therefore report registry uncertainty instead of the false
+`no pack in the registry` diagnosis.
+
+## v0.19.6 — fix(pack): preserve contractions when renaming imported personas (DIVE-2599)
+
+Pack imports now rename only complete persona-name tokens, preventing short
+agent names such as `don` from corrupting contractions such as `don't` while
+still updating standalone names and display-name possessives.
+
+## v0.19.6 — fix(task): the loop bounce decision is read from the DECISION SEGMENT, not from a substring over the whole answer (DIVE-2572)
+
+`cmd_task_answer` chose bounce-vs-advance with five **bare substring** tests over the whole free-text
+answer — `*better*`, `*reject*`, `*deny*`, `*denied*`, `*declin*`. Any answer containing those letters
+anywhere was classified as a bounce to the previous loop step, whatever it actually decided.
+
+**Measured on the live board before choosing a fix, because the row asked for that rather than a hunch.**
+268 answered gates; 14 carry a trigger substring. Of the answers that are a human decision on a
+loop-shaped row, **five of five would have been misclassified — and every one of them approves**:
+
+| row | opens with | what tripped it |
+|---|---|---|
+| DIVE-2552 | `approve — …` | "uppercase is **rejected**" — describing what a regex does |
+| DIVE-2565 | `approve — …` | "two-phase **deny**-by-default flow" — a design pattern's *name* |
+| DIVE-2596 | `approve — …` | "See my **reject** feedback on this task" |
+| CNCL-9 | `Clear-now …` | "the rebase I filed in the **reject**" |
+| DIVE-1572 | `A — render inline…` | "B **rejected**:" — naming the option *not* chosen |
+
+The only true denials in the whole set are the bare word `denied`.
+
+**The failure is systematic, not random, and that is what settled the design.** Three of the five cite a
+previous bounce *in order to resolve it* — which is what closing a loop iteration looks like — so the
+reviewer doing the most careful job is the one most likely to be read as bouncing. It also refutes the
+cheap resolution the row offered as option (d): prose answers are not the exception, they are what
+substantive answers are (5 of 7 real decisions).
+
+So: match the stems inside the **decision segment** — the first non-blank line up to the first em-dash,
+colon, semicolon, comma or sentence stop — and **warn rather than silently choose** when the vocabulary
+appears later in the prose. Everything after that separator is the *reasoning*, and the reasoning is where
+every one of the five false positives lives.
+
+**The first cut of this fix was wrong and the existing suite caught it.** I anchored to the *leading token*
+(the row's option (a)) and `task_answer_cancelled_loop_bounce_unit` went 5/7, on the fixture `"Do better ↩"`
+— a real, ordinary bounce whose decision word is the *second* token. Leading-token anchoring is too strict
+for short imperatives, which is precisely the register a genuine bounce is written in. The segment rule
+(the row's option (b)) takes both: `Do better` bounces, `approve — … uppercase is rejected` does not.
+Its known limit is graded rather than glossed — a decision word placed *after* the separator
+(`needs work — reject`) advances **with** the advisory, which is the safe polarity here.
+
+Three properties are inherited deliberately from the same defect one file over (DIVE-2614), not
+rediscovered: a **word boundary** (`betterment`, `rejection sampling`, `denylist` must not trip);
+**inflections enumerated by hand** (with `\b`, `reject` stops matching `rejected` — now the third
+confirmed instance of that gap here, and collapsing to `(reject|deny|declin)(e|es|ed|ing)?\b` is not
+equivalent); and the **first non-blank line, not line 1**, because a leading blank line would otherwise
+read as an empty verdict — and empty means *advance* here, i.e. a false approve, the worse direction.
+Note the polarity differs from the push verdict: same parsing, opposite fail-safe.
+
+`better` is kept but only anchored. Unanchored it was the worst arm in the set.
+
+**Harness folded rather than added.** The new arms ship inside
+`tests/task_answer_cancelled_loop_bounce_unit.sh` (12 → 47 arms) instead of as their own file.
+The core tier was already AT its cap when this landed — the budgeted runner's own words on the
+preceding run were *"the next few guards will not be"* inside it — and past the cap its stated
+first remedy is to MERGE a new guard with an existing one rather than add a file. Same subject
+(the arms already there grade what a bounce *does*; these grade which answers *are* one), so the
+fold drops no assertion and reclaims a second file's whole library-sourcing cost: **6327 + 494ms
+as two files → 6139ms as one.**
+
+Worth stating plainly: that saving does not fix the tier being at its cap, and this PR is not the
+cause of it. Same 237 harnesses, same commit, two jobs — pristine 305s (over by 5s), installed-host
+282s (passes). A 23s spread on an identical corpus is the run-to-run variance DIVE-2728 documents,
+not a 494ms harness. The cap pressure is a standing corpus-size problem already flagged there.
+
+
+## v0.19.6 — fix(push): a mint failure says which of four things went wrong (DIVE-2566)
+
+A delegated push to any `lodar/*` repo used to die with a bare **rc=22** — curl's exit for HTTP>=400,
+leaking through `set -euo pipefail`. That is not a 5dive code at all (`error_codes.sh` tops out at
+`E_PERMISSION=10`), so the operator got a number from another namespace with no message, sitting under
+an error string that named four possible causes at once. It read as a missing sudo grant and cost a
+builder an hour; the real cause was a GitHub App with no installation on the target account.
+
+The `set -e` half shipped separately (the lookup guard, PR #395). This is the legibility half:
+
+- **The mint fails `E_AUTH_REQUIRED`, not the `E_GENERIC` catch-all**, and a 404 gets its own sentence:
+  *the GitHub App has no installation covering `<owner>/<repo>` … retrying will not help.* That is the
+  one cause an operator cannot fix by trying again, so it says so and points at DIVE-2033 (a human-only
+  account-level step). No new code was added to the ladder on purpose — `error_codes.sh` says to keep
+  `err_class_for()` in sync, so a new code has a reader outside this file, and this genuinely is an
+  authentication class rather than a class of its own.
+- **`_push_fetch_why`'s four-way string is split.** *Could not read Username* / *terminal prompts
+  disabled* means git wanted to prompt and nothing was ever presented; *Authentication failed* means a
+  credential **was** presented and rejected. Opposite diagnoses with different fixes, previously one
+  sentence. A cause list is not a cause.
+
+**Two arms that could not fail are now behavioural.** olivia mutation-graded the DIVE-2563 arms and found
+two survive a mutation restoring the exact defect they name: replacing `inst="$_inst_for_repo"` with `:`
+(the installation is looked up, announced, never adopted) and stripping `${_why}` from the mint's `fail()`
+(the body is parsed, then discarded). Both left the suite 94/0. They now **execute** the source's own
+lines — extracting the adoption block and the failure block and running them under a real shell with a
+real 404 body — rather than grepping that a string is present. Presence-of-string is not reachability,
+which is this row's own lesson: DIVE-2566 exists because a fallback that was *present* in the source was
+*unreachable* at runtime while the suite stayed green.
+
+**Caught by the row's own guard, and worth recording.** CI red on `unguarded_probe_substitution_unit`:
+the new arms' anchor lookups were themselves unguarded `$( )` probe substitutions — this row's exact
+defect class, committed inside its own fix. Now guarded (`|| _a_start=""` etc.), which also makes each
+arm's loud "could not locate its subject" path *reachable* instead of dying before it.
+
+The scan surfaced **six** sites, not three — and the reason is a coverage gap in the scanner, corrected
+here by olivia's measurement rather than by my first reading of it.
+
+`push_unit.sh` has **always** carried a real `bash -c 'set -euo pipefail` region (the DIVE-2566 `_probe`
+helper), so its probe substitutions were genuinely at risk the whole time. They were invisible, not
+exempt: eligibility is a **file-level, line-anchored `^set -e`** test, and that region writes its mode
+line on the same line as `bash -c '`, so nothing matched. ARM A happens to write `set -euo pipefail` at
+**column 0 inside a quoted string**, which the regex reads as a top-level mode line — so the file became
+*visible*, by accident, and three pre-existing unguarded probes (620, 823, 824) appeared alongside my
+three. Write ARM A the normal indented way and the whole file goes dark again.
+
+So the scanner was right about this file for a wrong reason. All six sites are fixed rather than worked
+around. The standing gap — eligibility decided per FILE while the property is per BLOCK, which makes
+guard membership turn on the indentation of a string literal — is filed as DIVE-2733, with olivia's
+measurement (22 of 312 `tests/*.sh` eligible, 290 skipped).
+
+## v0.19.6 — fix(task): the result guard keys on the COLUMN, not on whether the row is closed (DIVE-2483)
+
+The guard standing between a `--result=` write and an existing record only ran when the row was
+already `done` or `cancelled`. That is the rare cell. The cell the maker→verifier rail
+**manufactures on every loop** is the other one: a delivered row is OPEN and already carries the
+maker's record, so the routine case was unprotected.
+
+Three verbs reached it and each was found separately, months apart — `task done` (DIVE-2483, a
+killed heredoc expanded to nothing and replaced a 2.6KB note with a zero-length string, exit 0),
+`task verify --cmd=` (DIVE-2624, a maker's delivery record replaced by a verify verdict), and
+`task deliver` (DIVE-2476). So did the *remedy*: `--append-result` was parsed, accepted and
+**silently inert** on an open row, because it was implemented inside the refusal's branch
+(DIVE-2717/DIVE-2712). A flag that no-ops in the situation its help text describes is worse than an
+absent one — an operator reaches for it precisely when they perceive the risk, and a clean `OK` is
+affirmative evidence that the protection ran.
+
+Now: both reads happen unconditionally and the gate is *"bytes are about to be lost"*.
+
+- **Open row carrying someone's result → AUTO-APPEND.** Prior text verbatim on top, yours under a
+  marker. Preservation is the default rather than a flag, which removes the class instead of
+  patching it; `--append-result` still works and is simply a no-op here.
+- **Closed row → unchanged.** The DIVE-2464 refusal, `--append-result` and the audited
+  `--force-result` all behave exactly as before.
+- **An EMPTY `--result=` over a non-empty column → refused at every status and under every flag,
+  `--force-result` included.** There is no legitimate reason to blank a result, and the value
+  arrives from ordinary shell accidents rather than decisions. It is also the least visible loss
+  available: a zero-length result renders as a blank field, indistinguishable from one nobody ever
+  wrote, so unlike a replacement with real text it leaves nothing for a reader to notice.
+- **`task verify` is guarded on the not-done path**, where DIVE-2067's preservation never reached.
+
+**Why auto-append and not a uniform refusal**, which was the other candidate: `task reject` writes
+the *verifier's* feedback into `result`, so after any rejection the row is open and carries someone
+else's text — and the maker's next `task done --result=` at iteration 2 is exactly this cell. A
+uniform refusal would have turned the second iteration of every graded task on the fleet into a
+refusal, training people to reach for `--force-result`. `tests/task_result_loss_open_row_unit.sh`
+arm R is the regression arm for that rail and is not optional.
+
+## v0.19.6 — fix(task): the preservation is now ANNOUNCED, and the seam is dated (DIVE-2483)
+
+DIVE-2483's guard preserves the prior result correctly. It also shipped the silence: a bare open-row close
+printed exactly `ok - <ident> done` and nothing else — **byte-identical to the output that accompanied the
+DIVE-2712 wipe**. The bytes were rescued and the thing that made their loss undetectable was not, so an
+operator could not tell the fixed behaviour from the defect at the terminal.
+
+The gate answer named four conditions. The two expressible as **DB column state** shipped (bytes preserved,
+empty result refused); the two about **what the operator sees** were dropped — and the 24-arm harness had
+zero arms on either, because every arm ended in `SELECT result FROM tasks`. That is the transferable part
+and it is olivia's: *a state-asserting harness has no natural home for an output condition, so those are
+exactly the conditions a maker's own harness declines to grade.*
+
+- **The append is announced**, naming the prior **byte count** — the cheapest thing that makes the claim
+  falsifiable at a glance. A reader who expected 2.6KB and sees 40 knows to look; one who sees nothing
+  never does. On `task done` **and** `task verify`.
+- **The seam is dated.** There is no `result_by` column — that was this row's first blocker — so the seam
+  marker *is* the provenance, and an undated one says two texts were joined and nothing about when.
+- **Six new arms in a section with a different assertion shape**, reading the verb's OUTPUT rather than the
+  column, including a negative (no announcement when there was nothing to preserve) and the `verify` path.
+
+**Which stream the announcement uses, stated because it is a real limit and not a detail** (olivia, verifying):
+it goes to **stderr**, via the fleet's `warn()` (`echo "warn: $*" >&2`). That is the right convention for an
+advisory that must not corrupt a parsed stdout, and it is visible at any terminal. But the gate answer's
+condition 1 said *stdout*, and the O arms capture `2>&1` — so **a caller that keeps only stdout still sees a
+bare `ok - <ident> done`**, exactly the pre-fix shape. Scripted callers and log pipelines that drop fd 2 are
+therefore still blind to the preservation. Left as a convention-consistent limit rather than a code change,
+and recorded here so the next reader does not have to re-derive it from the harness's redirect.
+
+## Three harnesses on main were reddened by the original fix, and they were a shipping freeze
+
+`task_answer_closed_row_unit`, `task_reject_actor_and_closed_unit`, `task_verify_self_close_visibility_unit`
+— none of them about the result column. Their **fixture** built "a closed, graded task" by having the
+verifier's close destroy the maker's delivery, then asserted the destruction:
+
+```bash
+as dev  cmd_task_done "$id" --result="maker delivery v1"
+as main cmd_task_done "$id" --result="$ACK"      # <- destroyed v1, pre-fix
+...
+[[ "$(res_of "$a")" == "$ACK" ]]
+```
+
+The fixture performed the exact data loss this row exists to stop. Since `release-cut.yml` refuses to tag
+on a red tip, that froze shipping for everything merged after the fix.
+
+Each red was judged rather than reverted — appending is *correct* in all three scenarios — so the
+assertions moved to `contains` and each arm's real work (rc, status, audit rows, refusal text) is untouched.
+Written up in `community/wiki/a-fixture-can-encode-the-defect-another-row-was-filed-to-fix.md`.
+
+**How it got through:** before merging I ran five neighbouring harnesses chosen by subject. Enumerating
+readers by *content* — every harness calling `cmd_task_done`/`verify`/`reject`/`answer` — finds **54**. A
+fixture is a reader.
+
+## v0.19.6 — fix(agent): do not confirm an unconfirmed send (DIVE-2362)
+
+`agent send`, direct `agent ask`, and their scoped `_deliver` path now report
+`sent:false` or `delivered:false`, plus the stable reason `pane still shows an
+unsent paste buffer after retries (large-paste submit race, DIVE-147)`, when the
+payload was typed but the pane still appears unsubmitted after every retry. The
+final human-readable line also says the delivery is unconfirmed instead of
+overwriting the warning with a green success summary. Confirmed rc=0 receipts
+and credential-refusal rc=3 behavior are unchanged.
+
+## v0.19.6 — fix(task): make delivery bindings observable in task show and list (DIVE-2316)
+
+`task show` now always prints `delivery_ref`, rendering an empty binding as
+`absent` instead of omitting the enforcement input. `task ls --status=done` and
+`task ls --all` expose the same bound-or-absent column for board-wide audits,
+and JSON list rows now include the raw `delivery_ref` field.
+
+When the mandatory no-binding merge gate resolves an open PR from the task ident
+in its title or head branch, it now persists the full PR URL before refusing the
+premature close. A later close therefore follows the declared fail-closed path,
+and the compliant refuse-then-merge sequence retains the provenance the gate
+already discovered.
+
 ## v0.19.0 — feat(pii): the pre-push guard reaches the fleet, not one repo (DIVE-2788)
 
 `scripts/install-pii-push-guard.sh` said **"fleet-wide"** in its own docstring and
