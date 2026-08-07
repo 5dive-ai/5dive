@@ -1119,5 +1119,88 @@ else
   bad "scripts/tier-cal-harvest.sh is executable" "not found or not +x"
 fi
 
+# ------------- 74-82 DIVE-2829: THE OVER-BUDGET RED STOPS ASSERTING A CAUSE IT LACKS
+# THE MEASUREMENT THAT FORCED THIS is the pair the row was filed on — 828c1ea, run
+# 31051177868, the one that froze release-cut.yml for ~40 minutes:
+#
+#              corpus        pre probe        post probe   bracket
+#   attempt 1  416s (138%)   110990us = 93%   -10%         AGREES  -> exit 4, main red
+#   attempt 2  245s ( 81%)   106833us = 89%    +0%         AGREES  -> green
+#
+# Same sha, same corpus, same job name, 1.70x apart. And BOTH attempts printed AGREES,
+# from pre probes four points apart that both clamped to 100%. The calibration machinery
+# resolved a 70-point corpus swing as 4 points of probe.
+#
+# THAT KILLED THE REMEDY THIS ROW RECOMMENDED (promote the post probe to grading on the
+# red path). On the slow attempt the post probe read FASTER, so a promotion keyed on
+# "post slower" would not have fired on the run it was built for. Arm 65 above therefore
+# STANDS, and these arms exist because what CAN be fixed from inside one job is not the
+# verdict but the CLAIM: the red used to say "the CORPUS no longer fits its cap", which
+# on this pair was false, and false in the direction that costs real coverage.
+#
+# PAIRED THROUGHOUT, per the rule the 2592 and 2728 arms already follow: an arm asserting
+# that a STRING IS ABSENT passes trivially if the whole block stopped printing, so every
+# absence below is paired with a presence in the same output.
+rm -f "$TMP"/*.sh "$TMP"/*.seen
+
+# ---- 74-77 the red path: 1.4s of corpus, 1s cap, runner measured NORMAL. Still exit 4 —
+# this is the control whose expected value is NON-ZERO, without which every arm below is
+# satisfied by a verdict that simply stopped firing.
+printf '#!/usr/bin/env bash\nsleep 1.4\nexit 0\n' > "$TMP/w.sh"
+relrun --budget=1 --cal-us=100000 --confirm-top=0
+want "CONTROL: a genuinely over-cap corpus on a NORMAL runner still exits 4" "4" "$RC"
+if [[ "$OUT" != *"no longer fits its cap"* ]]; then
+  ok "the red no longer asserts 'the CORPUS no longer fits its cap' — a cause, asserted from a sum that cannot separate the two causes, and measured WRONG on 828c1ea"
+else bad "the red no longer asserts the corpus-growth cause" "$OUT"; fi
+if [[ "$OUT" == *"WHAT IS MEASURED"* && "$OUT" == *"WHAT IS NOT EXCLUDED"* && "$OUT" == *"NO TEST FAILED"* ]]; then
+  ok "it says what it measured and names the runner as the thing it did NOT exclude, keeping the budget-vs-test distinction it already had"
+else bad "the red says what it measured and what it did not exclude" "$OUT"; fi
+if [[ "$OUT" == *"RE-RUN THIS JOB ON THE SAME SHA"* && "$OUT" == *"DIFFERENT"* ]]; then
+  ok "the re-run on a DIFFERENT runner is named as the first action — the only discriminator with a measured track record, and it settled this twice"
+else bad "the re-run is named as the first action" "$OUT"; fi
+
+# ---- 78 THE PAIR. Same corpus inside the cap: none of the above prints. Without this,
+# arm 75 is also satisfied by a runner that prints nothing at all on the red path.
+printf '#!/usr/bin/env bash\nsleep 0.3\nexit 0\n' > "$TMP/w.sh"
+relrun --budget=1 --cal-us=100000 --confirm-top=0
+if (( RC == 0 )) && [[ "$OUT" != *"RE-RUN THIS JOB ON THE SAME SHA"* && "$OUT" != *"WHAT IS NOT EXCLUDED"* ]]; then
+  ok "PAIR: a run inside its cap prints none of the over-budget block — the arms above are about the RED path, not about the runner having gone quiet"
+else bad "PAIR: a run inside its cap prints none of the over-budget block" "rc=$RC $OUT"; fi
+
+# ---- 79 the DIVE-2592 confirmation line is SCOPED. "measured TWICE ... so it is not
+# variance" was the sentence that made a same-runner pair sound like a settled question.
+# Both samples share a runner, so it excludes the noise it can see and nothing else.
+printf '#!/usr/bin/env bash\nsleep 1.4\nexit 0\n' > "$TMP/w.sh"
+relrun --budget=1 --cal-us=100000
+if (( RC == 4 )) && [[ "$OUT" == *"measured TWICE"* && "$OUT" == *"does NOT rule out the runner"* \
+      && "$OUT" != *"so it is not variance"* ]]; then
+  ok "the two-sample confirmation now says WHICH variance it excluded — within this runner — and states that both samples share the runner it cannot exclude"
+else bad "the confirmation line scopes itself to within-runner noise" "rc=$RC $OUT"; fi
+
+# ---- 80 the scaled-cap line stops concluding the same thing one level up. Surviving the
+# allowance bounds what a SLOW PROBE could explain; the probe is the thing measured blind.
+printf '#!/usr/bin/env bash\nsleep 1.6\nexit 0\n' > "$TMP/w.sh"
+relrun --budget=1 --cal-us=140000 --confirm-top=0
+if (( RC == 4 )) && [[ "$OUT" == *"does not bound the runner"* \
+      && "$OUT" != *"makes this the corpus and not the VM"* ]]; then
+  ok "a red that survived the scaled cap no longer concludes 'the corpus and not the VM' — the allowance is only as good as the probe, and the probe is blind on the one pair we can grade it against"
+else bad "the scaled-cap red does not conclude corpus-not-VM" "rc=$RC $OUT"; fi
+
+# ---- 81 AGREES carries the falsification, in the output, on every calibrated run. This
+# is the arm that stops the recommended remedy being re-derived from priors: the next
+# reader of "AGREES" meets the pair where AGREES printed on BOTH sides of a 1.70x split.
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/w.sh"
+relrun --budget=1 --cal-us=100000 --cal-post-us=104000 --confirm-top=0
+if [[ "$OUT" == *"AGREEMENT IS NOT A CLEARANCE"* && "$OUT" == *"1.70x"* && "$OUT" == *"416s"* ]]; then
+  ok "the AGREES branch carries the measured pair — agreement means the probe saw nothing, not that there was nothing to see, and the number is there so the next reader does not have to take that on trust"
+else bad "the AGREES branch carries the measured pair" "$OUT"; fi
+
+# ---- 82 AND THE INVARIANT ARM 65 PROTECTS IS RESTATED WITH ITS NEW REASON. The post
+# probe still grades nothing, in BOTH directions, and it is no longer a "wait for data"
+# holding position — the data arrived and said the probe cannot see this factor.
+printf '#!/usr/bin/env bash\nsleep 1.4\nexit 0\n' > "$TMP/w.sh"
+relrun --budget=1 --cal-us=100000 --cal-post-us=40000 --confirm-top=0
+want "a post probe reading 2.5x FAST does not red-shift the verdict either — the discriminator is out of the exit code in both directions, now for a measured reason" "4" "$RC"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
