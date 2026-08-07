@@ -1576,8 +1576,22 @@ cmd_task_assign() {
   # OLD assignee. Without this, an inherited in_progress task keeps the prior
   # owner's started_at, and the heartbeat stale-reaper (_hb_reap_stale) can
   # cancel it on the new owner's very first tick before they touch it.
+  # DIVE-2853, and the SAME hazard the paragraph above fixes for the stale-reaper,
+  # one layer over: the recurring-stall ladder escalates on how long ago the row was
+  # FLAGGED, so a row flagged two days ago that someone deliberately reassigns by
+  # hand is eligible for rung 2 on the new owner's very first tick — the machine
+  # would yank a routing decision seconds after a person or agent made it, having
+  # measured nothing about the new hands. Clearing both stamps when the assignee
+  # actually CHANGES restarts the ladder at detection: the new owner gets a full
+  # rung-1 window, and is re-flagged on their own clock if they also sit on it.
+  # Only an explicit `task assign` resets it — the ladder writes assignee directly
+  # and keeps its own latch, so the machine's own move still cannot repeat.
   db "UPDATE tasks SET
         handoff_ack_at=CASE WHEN assignee IS NOT $(sqlq "$who") THEN NULL ELSE handoff_ack_at END,
+        recurring_stall_pinged_at=CASE WHEN assignee IS NOT $(sqlq "$who")
+                                       THEN NULL ELSE recurring_stall_pinged_at END,
+        recurring_stall_escalated_at=CASE WHEN assignee IS NOT $(sqlq "$who")
+                                          THEN NULL ELSE recurring_stall_escalated_at END,
         assignee=$(sqlq "$who"),
         started_at=CASE WHEN status='in_progress' AND assignee IS NOT $(sqlq "$who")
                         THEN datetime('now') ELSE started_at END
