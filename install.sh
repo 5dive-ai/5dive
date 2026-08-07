@@ -891,11 +891,72 @@ MANAGED
     chown -h claude:claude /home/claude/projects/AGENTS.md
   fi
 
-  # Fleet-wide pre-push PII guard (DIVE-1797). Point any local 5dive-ai/5dive
-  # checkout on this box at its in-repo pre-push scanner (core.hooksPath). One
-  # config per clone covers every linked worktree AND every future one, so new
-  # landing boxes get the guard on install and existing ones on the daily update
-  # cron. Best-effort + idempotent; a box with no checkout is a clean no-op.
+  # Pre-push PII guard (DIVE-1797 enforcement, DIVE-2788 portable mode,
+  # DIVE-2803 provisioning reach). TWO SEPARATE ARTIFACTS, in this order:
+  #
+  #   1. the GUARD HOME (/usr/local/share/5dive/pii-guard) — the ONE host copy
+  #      of the portable hook + scanner + denylist that every portable install
+  #      reads. It is staged below from $REPO.
+  #   2. the box's own 5dive-ai/5dive CHECKOUT, if it has one, pointed at its
+  #      IN-REPO hooks (a relative core.hooksPath) — the loop further down.
+  #
+  # WHY 1 IS STAGED FROM $REPO AND NOT FROM A CHECKOUT. Until DIVE-2803 the only
+  # writer of the guard home was `install-pii-push-guard.sh` running out of a
+  # checkout of this repo, and a freshly provisioned box HAS NO SUCH CHECKOUT:
+  # install.sh installs a released bundle and stages skills from tarballs, and
+  # `git clone` appears nowhere in this file. So the loop below iterated zero
+  # times and the guard home was never created — the whole PII block was a no-op
+  # on precisely the boxes provisioning creates, which is the "fleet-wide decays
+  # from the day it is written" defect this row exists to close.
+  #
+  # WHAT IS DELIBERATELY NOT DONE HERE: `scripts/pii-guard-fleet.sh --install`
+  # is NOT called from this path (DIVE-2803 gate, answered B on 2026-08-06).
+  # That tool's blast radius is bounded by an EPERM-by-owner branch that leaves
+  # a checkout it cannot write alone and REPORTS it. install.sh runs as ROOT,
+  # where that branch can never fire: root writes every uid's .git/config
+  # successfully, so nothing is left to report and nothing stops it. Wiring it
+  # here would reach every agent uid's checkout on every box and every update —
+  # strictly wider than the claude-owned radius it was reviewed against. It
+  # stays available, and stays report-only.
+  #
+  # Best-effort + idempotent throughout: safe to re-run, and it runs on the
+  # daily update too, because this whole function is the --upgrade path. That
+  # matters on its own — the guard home is the single update point for the
+  # denylist, so a box that installs once and never re-syncs grades against a
+  # frozen list, which is the drift the host-path design exists to avoid.
+  #
+  # >>> DIVE-2803 guard-home staging (extracted verbatim by tests/pii_guard_fleet_unit.sh)
+  # Mirror the repo's own layout under $LIB_DIR so install-pii-push-guard.sh
+  # resolves its three sources from $SELF_DIR/.. unchanged — no second copy of
+  # the "which files make a guard home" list, which would be a second thing to
+  # keep in step. PII_GUARD_SRC_SHA carries the provenance a staged tree cannot
+  # read from a .git it does not have; empty is honest and stamps UNKNOWN.
+  _pg_src="$LIB_DIR/pii-guard-src"
+  _pg_tmp="$(mktemp -d)"
+  if install -d -m 755 "$_pg_tmp/scripts/git-hooks-portable" "$_pg_tmp/.github" \
+     && curl -fsSL "$REPO/scripts/install-pii-push-guard.sh"   -o "$_pg_tmp/scripts/install-pii-push-guard.sh" \
+     && curl -fsSL "$REPO/scripts/git-hooks-portable/pre-push" -o "$_pg_tmp/scripts/git-hooks-portable/pre-push" \
+     && curl -fsSL "$REPO/scripts/pii-scan.sh"                 -o "$_pg_tmp/scripts/pii-scan.sh" \
+     && curl -fsSL "$REPO/.github/pii-denylist.txt"            -o "$_pg_tmp/.github/pii-denylist.txt"; then
+    rm -rf "$_pg_src"
+    install -d -m 755 "$_pg_src"
+    cp -a "$_pg_tmp/." "$_pg_src/"
+    chmod 755 "$_pg_src/scripts/install-pii-push-guard.sh" "$_pg_src/scripts/git-hooks-portable/pre-push"
+    chmod 644 "$_pg_src/scripts/pii-scan.sh" "$_pg_src/.github/pii-denylist.txt"
+    if _pg_out="$(PII_GUARD_SRC_SHA="${GH_PINNED_SHA:-}" "$_pg_src/scripts/install-pii-push-guard.sh" --sync 2>&1)"; then
+      ok "pii-guard home — ${_pg_out#pii-push-guard: }"
+    else
+      echo "warn: pii-guard home NOT synced (${_pg_out:-no output}) — a portable install on this box would point at a scanner that is not there" >&2
+    fi
+  else
+    echo "warn: failed to stage the pii-guard payload from $REPO — guard home not refreshed this run; existing portable installs keep reading the copy they have" >&2
+  fi
+  rm -rf "$_pg_tmp"
+  # <<< DIVE-2803 guard-home staging
+  #
+  # One config per clone covers every linked worktree AND every future one, so
+  # new landing boxes get the guard on install and existing ones on the daily
+  # update cron. A box with no checkout is a clean no-op.
   # WHY here and not branch protection: our landing account is the repo admin,
   # so a required check only gates external PRs, never our own agent commits.
   for _cli_co in /home/*/projects/*/5dive-cli /home/*/projects/5dive/5dive-cli /root/5dive-cli; do
