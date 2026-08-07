@@ -1157,7 +1157,7 @@ _TASKS_ADDITIVE_COLUMNS=(
 )
 _TASKS_DB_GATE_COLUMNS=''
 _TASKS_DB_GATE_EPOCH=''
-_TASKS_DB_GATE_LEDGER=''
+_TASKS_DB_GATE_SEEDS=''
 
 # Exact newline membership without a subprocess. The newline frame prevents a
 # prefix (need_ty) from satisfying a full column name (need_type).
@@ -1171,37 +1171,67 @@ _tasks_columns_have_all_additive() { # <newline-delimited pragma names>
   return 0
 }
 
+# DIVE-2808: the migration also SEEDS, it does not only alter shape, and a gate that
+# reasons only about SHAPE silently drops every seed. Each key below is written by
+# `_tasks_db_migrate` with an INSERT OR IGNORE that re-runs on every pass, so before
+# this gate existed a deleted row healed itself on the next invocation. Skipping the
+# migration removes that, and the loss is invisible to any schema comparison: the
+# store is shape-perfect and semantically wrong. A missing seed therefore sends the
+# store back through the migration once, which re-seeds it.
+#
+# ONE SOURCE OF TRUTH. This array is the gate's model of what the migration seeds,
+# and it is the same drift hazard as the column list: a copy that falls behind the
+# migration reports *current* on a store that is not. tests/tasks_db_restore_guard_unit.sh
+# Case 16 DERIVES the seeded keys from `_tasks_db_migrate`'s own source and reds if
+# the two disagree in either direction, so adding a seed to the migration without
+# adding it here cannot pass quietly.
+#
+# `ledger_started` (INST-4) was the first found: `trace` reads a missing marker as a
+# ledger that predates everything. `gate_history_coverage` (DIVE-2133) was the second
+# and was missed by the first cut — the coverage boundary the gate_history reader
+# needs to tell "no gates were displaced" from "the archive was not yet writing", so
+# losing it downgrades a truthful complete zero to `unknown`. Two of two seeds in the
+# migration were self-healing, which is why the list is enumerated rather than the
+# exception hand-carved.
+_TASKS_SELFHEAL_PREFS=(ledger_started gate_history_coverage)
+
 _tasks_db_migration_needed() {
-  local payload row
-  # The ledger marker rides along in the SAME read as the epoch and the columns,
-  # so keeping its self-heal costs no extra process. See the note below.
+  local payload row k in_list=''
+  # The seed markers ride along in the SAME read as the epoch and the columns, so
+  # keeping their self-heal costs no extra process. See the note above.
+  for k in "${_TASKS_SELFHEAL_PREFS[@]}"; do in_list+="${in_list:+,}'${k//\'/\'\'}'"; done
   payload=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
     "SELECT 'epoch:'||COALESCE((SELECT value FROM task_prefs WHERE key='schema_epoch'),'')
        UNION ALL
-     SELECT 'ledger:'||COALESCE((SELECT '1' FROM task_prefs WHERE key='ledger_started'),'')
+     SELECT 'seed:'||key FROM task_prefs WHERE key IN ($in_list)
        UNION ALL
      SELECT 'column:'||name FROM pragma_table_info('tasks');" 2>/dev/null) || return 0
   _TASKS_DB_GATE_COLUMNS=''
   _TASKS_DB_GATE_EPOCH=''
-  _TASKS_DB_GATE_LEDGER=''
+  _TASKS_DB_GATE_SEEDS=''
   while IFS= read -r row; do
     case "$row" in
       epoch:*)  _TASKS_DB_GATE_EPOCH="${row#epoch:}" ;;
-      ledger:*) _TASKS_DB_GATE_LEDGER="${row#ledger:}" ;;
+      seed:*)   _TASKS_DB_GATE_SEEDS+="${row#seed:}"$'\n' ;;
       column:*) _TASKS_DB_GATE_COLUMNS+="${row#column:}"$'\n' ;;
     esac
   done <<<"$payload"
   _TASKS_DB_GATE_COLUMNS="${_TASKS_DB_GATE_COLUMNS%$'\n'}"
+  _TASKS_DB_GATE_SEEDS="${_TASKS_DB_GATE_SEEDS%$'\n'}"
   [[ "$_TASKS_DB_GATE_EPOCH" == "$_TASKS_SCHEMA_EPOCH" ]] || return 0
-  # DIVE-2808: the migration also SEEDS things, it does not only alter shape, and a
-  # gate that only reasons about shape silently drops those seeds. `ledger_started`
-  # is re-inserted (INSERT OR IGNORE) on every pass through _tasks_db_migrate, so
-  # before this gate existed a deleted marker healed itself on the next invocation.
-  # Skipping the migration removed that, and the loss is invisible in a schema
-  # comparison: the store is shape-perfect and semantically wrong. Missing marker
-  # therefore sends the store back through the migration once, which re-seeds it.
-  [[ -n "$_TASKS_DB_GATE_LEDGER" ]] || return 0
+  _tasks_prefs_have_all_seeds "$_TASKS_DB_GATE_SEEDS" || return 0
   ! _tasks_columns_have_all_additive "$_TASKS_DB_GATE_COLUMNS"
+}
+
+# Same newline-framed membership as the column check, and for the same reason: no
+# subprocess per key, and no prefix satisfying a longer name.
+_tasks_prefs_have_all_seeds() { # <newline-delimited present pref keys>
+  local present="${1:-}" k framed
+  framed=$'\n'"$present"$'\n'
+  for k in "${_TASKS_SELFHEAL_PREFS[@]}"; do
+    [[ "$framed" == *$'\n'"$k"$'\n'* ]] || return 1
+  done
+  return 0
 }
 
 # DIVE-2808: the epoch is a receipt that the curated migration GENERATION named by

@@ -352,36 +352,87 @@ ship=$(sqlite3 "$TASKS_DB" \
   || bad "legacy store: migration did not run" "ship=$ship"
 
 # --- Case 16 (DIVE-2808): the migration SEEDS, it does not only reshape ---------
-# `ledger_started` is re-inserted on every pass through _tasks_db_migrate, so before
-# the gate existed a deleted marker healed itself on the next invocation, and a
-# fresh store got one on the way in. A gate that reasons only about SHAPE drops both:
-# the store is shape-perfect and semantically wrong, which no schema comparison can
-# see. tests/whoami_for_chain_unit.sh caught the self-heal half as
-# "H/REACHABILITY: marker did not self-heal"; nothing was watching the fresh half.
+# `_tasks_db_migrate` re-inserts several task_prefs rows (INSERT OR IGNORE) on every
+# pass, so before the gate existed a deleted row healed itself on the next
+# invocation, and a fresh store got one on the way in. A gate that reasons only about
+# SHAPE drops both: the store is shape-perfect and semantically wrong, which no
+# schema comparison can see. tests/whoami_for_chain_unit.sh caught the
+# `ledger_started` self-heal half as "H/REACHABILITY: marker did not self-heal";
+# nothing was watching the fresh half.
+#
+# The first cut of this case hand-listed `ledger_started` and stopped there, so the
+# SECOND seeded pref — `gate_history_coverage` (DIVE-2133) — went out unguarded and
+# reddened tests/gate_history_unit.sh in the nightly sweep only, two cases deep in a
+# harness this branch never touched. Enumerating one member of a class is not
+# covering the class. So the key set is now DERIVED FROM THE MIGRATION'S OWN SOURCE
+# and compared with $_TASKS_SELFHEAL_PREFS in BOTH directions, exactly as Case 12
+# derives the column list from the additive array: a seed added to the migration
+# without being added to the gate's model reds HERE, at the source of the drift,
+# instead of somewhere downstream that happens to read the row.
 fresh_tree
 tasks_db_init >/dev/null 2>&1
-marker=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM task_prefs WHERE key='ledger_started';" 2>/dev/null)
-[[ "$marker" == "1" ]] \
-  && ok "ledger marker: a FRESH store is born with the start marker" \
-  || bad "ledger marker: fresh store has no ledger_started (trace would read absence as predating)" "marker=$marker"
-# Self-heal: delete it on an otherwise-current store. The gate must not skip.
-sqlite3 "$TASKS_DB" "DELETE FROM task_prefs WHERE key='ledger_started';"
-if _tasks_db_migration_needed; then
-  ok "ledger marker: a missing marker on a shape-perfect store still enters migration"
-else
-  bad "ledger marker: shape-only gate skipped a store that lost a seeded row"
-fi
-out=$(tasks_db_init 2>&1); rc=$?
-marker=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM task_prefs WHERE key='ledger_started';" 2>/dev/null)
-[[ $rc -eq 0 && "$marker" == "1" ]] \
-  && ok "ledger marker: the marker self-heals through tasks_db_init" \
-  || bad "ledger marker: no self-heal" "rc=$rc marker=$marker out=$out"
-# And the healed store settles: the next invocation takes the skip path again.
-if _tasks_db_migration_needed; then
-  bad "ledger marker: store never settles — every invocation re-migrates"
-else
-  ok "ledger marker: a healed store settles back onto the skip path"
-fi
+# Parse the seeded keys out of _tasks_db_migrate's body. Two spellings exist in the
+# migration (a VALUES tuple and a SELECT projection), so take the first single-quoted
+# literal within three lines of the INSERT. Scoped to the function body on purpose:
+# `schema_epoch` is stamped elsewhere and is already the gate's first arm.
+mapfile -t SEEDED_KEYS < <(
+  awk '
+    /^_tasks_db_migrate\(\)/      { inf = 1; next }
+    inf && /^}/                   { inf = 0 }
+    inf && /INSERT OR IGNORE INTO task_prefs/ { grab = 3 }
+    grab > 0 {
+      if (match($0, /'"'"'[A-Za-z_][A-Za-z0-9_]*'"'"'/)) {
+        print substr($0, RSTART + 1, RLENGTH - 2); grab = 0; next
+      }
+      grab--
+    }
+  ' "$SRC/lib/tasks_db.sh" | LC_ALL=C sort -u
+)
+printf '%s\n' ${SEEDED_KEYS[@]+"${SEEDED_KEYS[@]}"} | LC_ALL=C sort -u > "$TMP/seeded.txt"
+printf '%s\n' "${_TASKS_SELFHEAL_PREFS[@]}"      | LC_ALL=C sort -u > "$TMP/modelled.txt"
+# Liveness: a parse that finds nothing would make both comparisons below vacuous, and
+# a silently-empty derivation is the same failure mode as a gate that never fires.
+(( ${#SEEDED_KEYS[@]} >= 2 )) \
+  && ok "seed drift: the derivation really read seeds out of the migration (${#SEEDED_KEYS[@]})" \
+  || bad "seed drift: derived NO seeds — the parse broke, so the two arms below prove nothing" \
+         "keys=[${SEEDED_KEYS[*]-}]"
+unmodelled=$(LC_ALL=C comm -23 "$TMP/seeded.txt" "$TMP/modelled.txt" | tr '\n' ' ' | sed 's/ $//')
+phantom=$(LC_ALL=C comm -13 "$TMP/seeded.txt" "$TMP/modelled.txt" | tr '\n' ' ' | sed 's/ $//')
+[[ -z "$unmodelled" ]] \
+  && ok "seed drift: every pref the migration seeds is in the gate's model" \
+  || bad "seed drift: the migration seeds a pref the gate does not know about (it will be skipped away)" \
+         "unmodelled=[$unmodelled]"
+[[ -z "$phantom" ]] \
+  && ok "seed drift: the gate models no pref the migration cannot re-seed" \
+  || bad "seed drift: gate demands a pref the migration never writes (every invocation would re-migrate)" \
+         "phantom=[$phantom]"
+
+# Behaviour, per modelled key: born on a fresh store, self-heals when deleted from an
+# otherwise-current store, and the healed store settles back onto the skip path.
+for seed_key in "${_TASKS_SELFHEAL_PREFS[@]}"; do
+  fresh_tree
+  tasks_db_init >/dev/null 2>&1
+  marker=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM task_prefs WHERE key='$seed_key';" 2>/dev/null)
+  [[ "$marker" == "1" ]] \
+    && ok "seed $seed_key: a FRESH store is born with it" \
+    || bad "seed $seed_key: fresh store lacks it (the reader sees absence, not a stamped boundary)" "marker=$marker"
+  sqlite3 "$TASKS_DB" "DELETE FROM task_prefs WHERE key='$seed_key';"
+  if _tasks_db_migration_needed; then
+    ok "seed $seed_key: a missing row on a shape-perfect store still enters migration"
+  else
+    bad "seed $seed_key: shape-only gate skipped a store that lost a seeded row"
+  fi
+  out=$(tasks_db_init 2>&1); rc=$?
+  marker=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM task_prefs WHERE key='$seed_key';" 2>/dev/null)
+  [[ $rc -eq 0 && "$marker" == "1" ]] \
+    && ok "seed $seed_key: it self-heals through tasks_db_init" \
+    || bad "seed $seed_key: no self-heal" "rc=$rc marker=$marker out=$out"
+  if _tasks_db_migration_needed; then
+    bad "seed $seed_key: store never settles — every invocation re-migrates"
+  else
+    ok "seed $seed_key: a healed store settles back onto the skip path"
+  fi
+done
 
 # --- Case 17 (DIVE-2808): the canonical CREATE and the additive array PARTITION -
 # The row warned about a THIRD copy of the column list drifting. Merging main into

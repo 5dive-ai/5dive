@@ -90,10 +90,16 @@ Two things the epoch had to learn, both of which reddened unrelated harnesses fi
   emits is `CREATE … IF NOT EXISTS`, so replaying it over an existing store is a
   no-op — a contract the migration driver and four other harnesses rely on, and a
   bare `INSERT` is the one statement that breaks it.
-- **The gate requires the seeded `ledger_started` marker, not only the right shape.**
-  The migration *seeds* as well as reshapes; skipping it dropped a self-heal that no
-  schema comparison can miss, because the store is shape-perfect and semantically
-  wrong.
+- **The gate requires the migration's seeded rows, not only the right shape.** The
+  migration *seeds* as well as reshapes; skipping it dropped self-heals that no schema
+  comparison can miss, because the store is shape-perfect and semantically wrong. Both
+  seeded prefs are covered — `ledger_started` (INST-4), which `trace` reads as a ledger
+  predating everything when absent, and `gate_history_coverage` (DIVE-2133), the
+  evidence boundary that lets a zero-row archive mean "no gates were displaced" rather
+  than "unknown". The first cut covered only the former and reddened
+  `tests/gate_history_unit.sh` in the nightly sweep. The gate's seed list is therefore
+  **derived from the migration's own source** and compared in both directions, the same
+  anti-drift rule the column list already follows.
 
 The epoch does **not** assert the canonical surface item for item. The curated
 migration was never a convergence engine and `CREATE TABLE IF NOT EXISTS` cannot
