@@ -26,3 +26,4 @@
 {"cliVersion": "0.19.1", "date": "2026-08-05", "day": {"humanAsks": 3, "shipped": 67}, "publishedBy": {"host": "poke-two", "user": "claude"}, "week": {"humanAsks": 27, "shipped": 340}}
 {"cliVersion": "0.19.3", "date": "2026-08-06", "day": {"humanAsks": 12, "shipped": 83}, "publishedBy": {"host": "poke-two", "user": "claude"}, "week": {"humanAsks": 34, "shipped": 354}}
 {"cliVersion": "0.19.5", "date": "2026-08-07", "day": {"humanAsks": 1, "shipped": 16}, "publishedBy": {"host": "poke-two", "user": "claude"}, "week": {"humanAsks": 26, "shipped": 310}}
+{"cliVersion": "0.19.6", "date": "2026-08-08", "day": {"humanAsks": 6, "shipped": 19}, "publishedBy": {"host": "poke-two", "user": "claude"}, "week": {"humanAsks": 32, "shipped": 315}}

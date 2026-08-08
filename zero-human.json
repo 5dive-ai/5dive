@@ -1,21 +1,21 @@
 {
-  "generatedAtUtc": "2026-08-07T02:00:12Z",
-  "date": "2026-08-07",
+  "generatedAtUtc": "2026-08-08T02:00:14Z",
+  "date": "2026-08-08",
   "week": {
-    "shipped": 310,
-    "humanAsks": 26
+    "shipped": 315,
+    "humanAsks": 32
   },
   "day": {
-    "shipped": 16,
-    "humanAsks": 1
+    "shipped": 19,
+    "humanAsks": 6
   },
   "cumulative": {
-    "daysPublished": 28,
-    "shipped": 1451,
-    "humanAsks": 181,
+    "daysPublished": 29,
+    "shipped": 1470,
+    "humanAsks": 187,
     "since": "2026-07-11"
   },
-  "cliVersion": "0.19.5",
+  "cliVersion": "0.19.6",
   "source": "5dive digest --json [--7d]",
   "methodology": "https://github.com/5dive-ai/5dive/blob/main/docs/zero-human.md",
   "corroborators": {
@@ -24,21 +24,21 @@
       "window": "7d",
       "firstPass": 113,
       "graded": 176,
-      "shippedStandardTasks": 304,
-      "coveragePct": 57.9,
+      "shippedStandardTasks": 309,
+      "coveragePct": 57.0,
       "basis": "live tasks.db query: status='done' AND kind='standard' AND done_at within the last 7 calendar days from datetime('now') \u2014 a DIFFERENT instrument from this datapoint's own week.shipped above (a frozen sum of the last 7 PUBLISHED daily datapoints, DIVE-1552, which can span more than 7 calendar days while publishing is paused). Do not read the two as the same number.",
       "iterationNullGraded": 1,
       "iterationNullBiasPctPtsMax": 0.6,
       "note": "rows with a NULL iteration count as first-pass, biasing this rate UP by at most iterationNullBiasPctPtsMax"
     },
     "policyBlockedAttempts": {
-      "value": 197,
+      "value": 203,
       "window": "7d",
       "instrumentedSites": 33,
       "firedSites": 20,
       "firedSitesLifetime": 23,
       "ledgerSince": "2026-07-25 12:04:55",
-      "ledgerAgeDays": 12.6,
+      "ledgerAgeDays": 13.6,
       "note": "a site that never fires is not evidence of compliance \u2014 10 of 33 instrumented sites have never fired lifetime; no baseline exists yet while the ledger is young (see ledgerAgeDays)"
     }
   },
