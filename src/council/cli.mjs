@@ -158,16 +158,47 @@ export function dispatchBallotVote(opts = {}) {
     // the deadline path — a seat that votes anyway needs no excuse for a lost nudge.
     let failure = priorFailure || null
     let delivered = false
+    // DIVE-2891 — THE ENGAGEMENT LEDGER. At 6/6 with requireQuorum, an abstention is a SILENT VETO,
+    // so "the seat withheld consent" and "the seat could not answer" have to stop rendering
+    // identically. Today they do not: a quota-locked seat and a seat that ignored its ballot both
+    // land on the same `no vote by deadline` string, and the receipt seals no field a later reader
+    // can separate them by. Proven live 2026-08-07 — codex's ballot went in_progress -> todo at
+    // ~10:40Z with 32 minutes left while `agent info codex` reported active/enabled, and the pane
+    // (the ONLY place the wall was legible) read "You've hit your usage limit".
+    //
+    // The signal was already in our hands and being thrown away: this loop polls `task show` every
+    // tick and reads a status it only ever tests for done/cancelled. The TRANSITIONS separate the
+    // cases at zero extra cost and with no pane-scraping:
+    //   · never left `todo`          -> the seat never claimed the ballot at all
+    //   · in_progress -> back to todo -> the seat ENGAGED AND THEN COULD NOT FINISH (the fingerprint
+    //                                    observed on the quota lock: claim, fail, release)
+    //   · still `in_progress` at the deadline -> the seat is working and ran out of window
+    //
+    // NAME THE OBSERVATION, NEVER THE CAUSE. A release is not proof of a throttle — it is what the
+    // throttle looked like once. This whole page of failures is instruments that were right about a
+    // fact and wrong about the cause, in the direction that reads as recoverable, so these kinds say
+    // what the ballot DID and leave the diagnosis to a reader who can see the pane.
+    let sawPickup = false        // the ballot reached in_progress at least once
+    let releases = 0             // in_progress -> todo transitions (claimed, then handed back)
+    let lastStatus = null
     while (now() < deadlineAt) {
       let row = null
       try {
         const env = JSON.parse(exec(['task', 'show', String(taskId), '--json']))
         row = env && env.data && env.data.task
       } catch { row = null }
+      if (row && row.status) {
+        if (row.status === 'in_progress') sawPickup = true
+        if (lastStatus === 'in_progress' && row.status === 'todo') releases += 1
+        lastStatus = row.status
+      }
       if (row && (row.status === 'done' || row.status === 'cancelled')) {
         const result = row.result || ''
         return E.parseVote(result) ||
-          { vote: 'abstain', rationale: `${seat.id} ${kind} ${taskId}: closed with no COUNCIL-VOTE line (deadline/no-vote)` }
+          // DIVE-2891: a ballot the seat CLOSED without a vote line is a fourth silence, and the
+          // most misleading one — the task went done, so every board and digest reads it as worked.
+          { vote: 'abstain', abstainKind: 'silent:closed-no-vote',
+            rationale: `${seat.id} ${kind} ${taskId}: closed with no COUNCIL-VOTE line (deadline/no-vote). OBSERVED: the seat CLOSED the ballot (${row.status}) without casting — the ballot was worked, the vote was not recorded.` }
       }
       if (nudgeInfo && !nudged && now() >= nudgeAt) {
         nudged = true
@@ -213,7 +244,19 @@ export function dispatchBallotVote(opts = {}) {
     // show about delivery. `nudged` says a wake reached the seat; `queued` says only that the ballot
     // task was minted into its queue and the mid-window nudge never fired.
     const told = nudgeInfo ? (delivered ? `; nudged ${nudgeInfo.agent} mid-window` : '; ballot queued, no mid-window nudge fired') : ''
-    return { vote: 'abstain', rationale: `${seat.id} ${kind} ${taskId}: no vote by deadline ${deadlineIso} (deadline/no-vote${told})` }
+    // DIVE-2891: this abstention is REAL for tally purposes and stays so — the vote, the counts and
+    // quorum are untouched, which is the whole point of remedy (a). What changes is that the record
+    // now says WHICH silence it was, from the transitions this loop already watched. `capture` is
+    // deliberately NOT set: we cannot show the seat was never asked, so calling it a capture failure
+    // would be a stronger claim than the evidence, and would move counts captureAudit feeds.
+    const silence = releases > 0 ? 'released' : (lastStatus === 'in_progress' ? 'held-open' : 'no-pickup')
+    const seen = releases > 0
+      ? `CLAIMED THEN RELEASED the ballot ${releases}x (last status ${lastStatus || 'unknown'}) — the seat engaged and did not finish`
+      : (lastStatus === 'in_progress'
+        ? 'held the ballot in_progress to the deadline — the seat engaged and ran out of window'
+        : `never moved the ballot off ${lastStatus || 'todo'} — the seat did not claim it`)
+    return { vote: 'abstain', abstainKind: `silent:${silence}`,
+             rationale: `${seat.id} ${kind} ${taskId}: no vote by deadline ${deadlineIso} (deadline/no-vote${told}). OBSERVED: ${seen}. This records what the ballot did, NOT why — a release is what the 2026-08-07 quota lock looked like, it is not proof of one; read the seat's pane before calling this dissent or a throttle.` }
   }
   return async (seat, ctx) => {
     const prompt = E.seatPrompt(seat, ctx)   // blind in round 1 (engine-guaranteed)
