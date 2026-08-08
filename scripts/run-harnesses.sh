@@ -302,6 +302,29 @@ eff_pct=0; (( EFF_MS > 0 )) && eff_pct=$(( total_ms * 100 / EFF_MS ))
 # corpus" becomes answerable from logs instead of arguable from priors
 # (scripts/tier-cal-window.sh does the across-runs read).
 #
+# DIVE-2829 ASKED THE QUESTION AND THE LOGS ANSWERED IT: NO. The proposal was to promote
+# this probe to grading on the red path — over the cap AND post probe reads slow => exit
+# 6 instead of 4. It is NOT implemented, and the reason is the measurement it asked for.
+# The one gradeable pair in the record is 828c1ea, unit-tests run 31051177868, the run
+# that froze the release cut for ~40 minutes:
+#
+#              corpus        pre probe          post probe   bracket
+#   attempt 1  416s (138%)   110990us =  93%    -10%         AGREES   -> exit 4, main red
+#   attempt 2  245s ( 81%)   106833us =  89%     +0%         AGREES   -> green
+#
+# Same sha, same corpus, same job name, 1.70x apart. The corpus moved 70 points; the pre
+# probe moved FOUR, and both clamped to 100%, so both runs were graded against an
+# identical 300s cap. The post probe on the SLOW run came in FASTER (-10%), which is the
+# dirty direction — a promotion keyed on "post slower" would not have fired on the very
+# run it was designed for, and one keyed on "post faster" is the cache-warmth confound
+# and would fire on healthy runs.
+#
+# So the promotion is not merely unproven, it is measured MISSING on n=2, on the pair
+# that motivated it. THE PROBE IS BLIND TO THE FACTOR THAT FIRES HERE. The only
+# discriminator with a track record is a SECOND SAMPLE FROM A DIFFERENT RUNNER, which no
+# amount of in-job arithmetic can synthesise; the over-budget block now says so and asks
+# for the re-run first. Do not wire this up on the next reading of the same idea.
+#
 # SAME ITERATION COUNT, SAME MIN-OF-N, on purpose. A cheaper post probe — one sample
 # instead of min-of-two — would read systematically SLOWER than the pre probe for a
 # reason that is arithmetic rather than weather, and would manufacture exactly the
@@ -527,6 +550,11 @@ if [[ "$CAL_POST_STATUS" == "measured" || "$CAL_POST_STATUS" == "injected" ]] &&
     printf '  Read that as weak evidence only: the corpus just warmed the page cache and the CLI it\n'
     printf '  spawned, which biases this second reading FAST, so agreement is also what a real\n'
     printf '  slowdown masked by cache warmth looks like.\n'
+    printf '  AGREEMENT IS NOT A CLEARANCE, and this is now MEASURED rather than argued (DIVE-2829).\n'
+    printf '  Same sha, same corpus, same job, two attempts: 416s (138%%) and 245s (81%%) — 1.70x — and\n'
+    printf '  BOTH attempts printed AGREES, with pre probes 4 points apart (93%% and 89%%) that both\n'
+    printf '  clamped to 100%%. The bracket resolved a 70-point corpus swing as 4 points of probe.\n'
+    printf '  So AGREES means the probe saw nothing; it does NOT mean there was nothing to see.\n'
   elif (( CAL_POST_DELTA > 0 )); then
     # The clean direction: the confound above pushes the post probe FASTER, so a post
     # probe that comes in SLOWER did so against it.
@@ -629,13 +657,37 @@ elif (( total_ms > EFF_MS )); then
   # person whose PR it stopped and as flake to the next reader, and it is neither.
   printf 'NO TEST FAILED — %d of %d harnesses passed. This is a BUDGET failure (exit 4), not a\n' \
     "$(( ${#CORPUS[@]} - ${#failed[@]} ))" "${#CORPUS[@]}"
-  printf 'test failure (exit 1): nothing in your diff is broken, the CORPUS no longer fits its cap.\n'
+  printf 'test failure (exit 1): nothing in your diff is broken.\n'
+  # DIVE-2829: WHAT THIS RED MEASURED, AND WHAT IT DID NOT EXCLUDE.
+  #
+  # This block used to end "the CORPUS no longer fits its cap" — a CAUSE, asserted from
+  # a wall-clock sum that cannot distinguish the two causes. On 2026-08-05 it was the
+  # wrong one, and it is the expensive direction to be wrong in: it sends the reader to
+  # merge, retire or demote real coverage in response to a slow box. So the run now says
+  # what it has, and names the one discriminator it does NOT have.
+  printf 'WHAT IS MEASURED: this corpus took %ds on THIS RUNNER, against a %ds cap.\n' \
+    "$total_s" "$EFF_BUDGET"
+  printf 'WHAT IS NOT EXCLUDED: that this runner was slow. Nothing in this job can separate\n'
+  printf '"the corpus grew" from "the box drew slow" — see the calibration note below.\n'
   if (( confirmed )); then
-    printf 'It was measured TWICE (%ds, then %ds) before this was printed, so it is not variance.\n' \
+    # DIVE-2829: this line used to read "...so it is not variance", full stop. Both
+    # samples come from the SAME RUNNER, so it excludes the noise it can see and is
+    # structurally blind to the factor that dominated on 2026-08-05.
+    printf 'It was measured TWICE (%ds, then %ds), which rules out a one-off spike WITHIN this\n' \
       "$first_total_s" "$total_s"
+    printf 'runner. Both samples are from this same runner, so it does NOT rule out the runner.\n'
   elif (( CONFIRM_TOP == 0 )); then
     printf 'Confirmation was disabled (--confirm-top=0), so this is ONE sample. Re-run to confirm.\n'
   fi
+  # DIVE-2829: the re-run is not one option among four. It is the only step here with a
+  # MEASURED track record of settling this question, it is one click, and it costs ~6
+  # minutes against the ~40 the release cut stayed frozen on 2026-08-05.
+  printf '\nDO THIS FIRST: RE-RUN THIS JOB ON THE SAME SHA. A second sample from a DIFFERENT\n'
+  printf 'runner is the only discriminator that has ever settled this, and it has settled it\n'
+  printf 'twice. Measured on the same sha, same corpus, same job name (DIVE-2828/2813):\n'
+  printf '    828c1ea attempt 1  416s (138%%)  RED        828c1ea attempt 2  245s (81%%)  green\n'
+  printf '    fd81f7b attempt 1  324s (108%%)  RED        fd81f7b attempt 2  291s (96%%)  green\n'
+  printf 'Only if the SECOND runner is also over is the finding below about your corpus.\n'
   # DIVE-2728: measured against the EFFECTIVE cap, so the covering set is the set that
   # actually gets this run inside the cap it was graded on. And the line above it says
   # so out loud, because "over by 22s" against an unstated cap is how a reader ends up
@@ -643,12 +695,18 @@ elif (( total_ms > EFF_MS )); then
   if (( SCALE > 100 )); then
     printf '\nThis runner was measured at %d%% of baseline, so the cap it is held to is %ds, not %ds.\n' \
       "$SCALE_RAW" "$EFF_BUDGET" "$BUDGET"
-    printf 'It is over EVEN WITH that allowance, which is what makes this the corpus and not the VM.\n'
+    # DIVE-2829: this line used to conclude "...which is what makes this the corpus and
+    # not the VM." It does not. The allowance is only as good as the probe, and the probe
+    # is measurably blind to the draw that fires here (see the calibration note below), so
+    # surviving it is not evidence about the corpus.
+    printf 'It is over EVEN WITH that allowance. That bounds how much of this a SLOW PROBE could\n'
+    printf 'explain; it does not bound the runner, because the probe does not track this corpus.\n'
   fi
   printf '\nThe overage is %ds, and these harness(es) cover it — the run is inside the cap without\n' "$(( (total_ms - EFF_MS + 999) / 1000 ))"
   printf 'them. This is the actionable set; the leaderboard below is context:\n'
   covering "$(( total_ms - EFF_MS ))"
-  printf '\nThe corpus is not free: every harness here runs on every future change, forever.\n'
+  printf '\nONCE A SECOND RUNNER HAS AGREED, and not before: the corpus is not free — every\n'
+  printf 'harness here runs on every future change, forever.\n'
   printf 'Past the cap a new guard REPLACES or MERGES an existing one. The %d slowest in this tier:\n' "$TOP"
   slowest "$TOP"
   printf '\nThree ways out, in order of preference:\n'
