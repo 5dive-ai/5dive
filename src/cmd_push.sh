@@ -366,8 +366,14 @@ cmd_push() {
     local body; body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
     branch=$(_push_branch_from_body "$body")
   fi
+  # DIVE-2801: name BOTH requirements. `--branch` satisfies this usage check but
+  # NOT the DIVE-1462 gate binding in _push_do, which reads the branch fresh from
+  # the task body — so offering `--branch` alone as an alternative sends the
+  # caller down a path whose only outcome is the next refusal. Same defect as the
+  # dry-run above: an early check answering on behalf of a later one it does not
+  # share a predicate with.
   [[ -n "$branch" ]] || fail "$E_USAGE" \
-    "no branch for ${ident}: pass --branch=<name> or add a 'Branch: <name>' line to the task body (push refuses to guess)."
+    "no branch for ${ident}: add a 'Branch: <name>' line to the task body (push refuses to guess). The task body is REQUIRED — the cleared gate binds to the branch the task itself declares (DIVE-1462), so --branch=<name> alone gets past this check and is then refused by that binding; pass it as well only to override which branch is read."
   case "$branch" in
     main|master|HEAD) fail "$E_VALIDATION" "refusing to push to protected branch '${branch}' — delegated push targets feature branches only." ;;
   esac
@@ -458,10 +464,27 @@ cmd_push() {
         pr_preview=" — but NOT open a PR: this account has no '_gh_do' grant, so --open-pr would warn and leave the branch for someone else to open"
       fi
     fi
-    ok "dry-run: would push ${branch}@${sha} to ${slug}${pr_preview} — target from ${repo_src} (gate cleared, author ${author_state})" \
+    # DIVE-2801: the rehearsal must not report a verdict it did not compute. This
+    # runs the preflight (require_sig=0); the real push runs the root executor
+    # (require_sig=1), so "gate cleared" alone answers for the signature check
+    # that never ran here — and that is the leg most likely to refuse. When the
+    # closure carries no signature the outcome is knowable NOW, so say so in the
+    # verb rather than previewing a push that cannot happen.
+    local sig_phrase gate_json lead
+    sig_phrase=$(broker_gate_sig_phrase push)
+    if [[ "${BROKER_GATE_SIG_STATE:-}" == "unsigned" ]]; then
+      lead="dry-run: would NOT push ${branch}@${sha} to ${slug} — REFUSED at push time"
+      gate_json="authority-ok-signature-absent"
+    else
+      lead="dry-run: would push ${branch}@${sha} to ${slug}${pr_preview}"
+      gate_json="authority-ok-signature-unverified"
+      [[ "${BROKER_GATE_SIG_STATE:-}" == "verified" ]] && gate_json="cleared"
+    fi
+    ok "${lead} — target from ${repo_src} (gate authority cleared; ${sig_phrase}; author ${author_state})" \
        "$(jq -n --arg t "$ident" --arg b "$branch" --arg s "$sha" --arg r "$slug" --arg a "$author_state" --arg rs "$repo_src" \
-             --argjson op "$open_pr" --arg pb "$pr_base_preview" \
-             '{task:$t,branch:$b,sha:$s,repo:$r,repoSource:$rs,dryRun:true,gate:"cleared",author:$a,openPr:($op==1),prBase:$pb}')"
+             --argjson op "$open_pr" --arg pb "$pr_base_preview" --arg g "$gate_json" \
+             --arg ss "${BROKER_GATE_SIG_STATE:-unknown}" \
+             '{task:$t,branch:$b,sha:$s,repo:$r,repoSource:$rs,dryRun:true,gate:$g,signature:$ss,author:$a,openPr:($op==1),prBase:$pb}')"
     return 0
   fi
 

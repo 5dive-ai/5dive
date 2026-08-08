@@ -195,6 +195,36 @@ broker_gate_check() {
       && ! _gate_closure_verify "$id" "$gtype" "$ganswer" "$gby" "$gansweredat" "$guid" "$gsig"; then
     fail "$E_VALIDATION" "gate on ${ident} has no valid signed closure — delegated ${noun} refused (the authoritative gate record may be unsigned or tampered)."
   fi
+
+  # DIVE-2801: say WHICH predicate this call actually ran, so a caller cannot
+  # report a verdict it did not compute. The agent-side preflight passes
+  # require_sig=0 and the root executor passes 1, so a preflight that prints a
+  # flat "gate cleared" is answering for a check it never ran — and the signature
+  # is the leg most likely to stop the real write (DIVE-2760). Absence is
+  # readable HERE, without the root key: an empty `need_answer_sig` cannot pass
+  # the executor, so the preflight can predict that refusal rather than merely
+  # disclaim it. A present-but-unverified signature is disclaimed, not warned
+  # about — otherwise the honest case and the doomed case read identically and
+  # the warning is noise (the failure mode that hid this for so long).
+  if [[ "$require_sig" == "1" ]]; then
+    BROKER_GATE_SIG_STATE="verified"
+  elif [[ -z "$gsig" ]]; then
+    BROKER_GATE_SIG_STATE="unsigned"
+  else
+    BROKER_GATE_SIG_STATE="unverified"
+  fi
+  export BROKER_GATE_SIG_STATE
+}
+
+# broker_gate_sig_phrase — render BROKER_GATE_SIG_STATE for a human line. Kept
+# beside the predicate that sets it so the two cannot drift apart.
+broker_gate_sig_phrase() {
+  case "${BROKER_GATE_SIG_STATE:-}" in
+    verified)   printf '%s' "signature verified" ;;
+    unsigned)   printf '%s' "closure carries NO signature — the root executor verifies it and WILL refuse this ${1:-push}" ;;
+    unverified) printf '%s' "signature present but NOT verified here — the root executor verifies it at ${1:-push} time" ;;
+    *)          printf '%s' "signature state unknown" ;;
+  esac
 }
 
 # broker_task_target <surface> <id> — the target a task AUTHORITATIVELY declares

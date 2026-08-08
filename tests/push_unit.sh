@@ -964,6 +964,66 @@ else
         "source shape gave '${_src_out:-<died before the fallback>}', unguarded control gave '${_unguarded_out:-<died, correct>}' — the source's own shape must reach the fallback AND the unguarded control must not"
 fi
 
+# ---------------------------------------------------------------------------
+# DIVE-2801: a step must not report a verdict it did not compute.
+#
+# --dry-run runs the agent-side preflight (require_sig=0); the real push runs the
+# root executor (require_sig=1). A flat "gate cleared" therefore answers for the
+# SIGNATURE check that never ran here — the leg most likely to refuse, because a
+# seat whose sudo grant does not reach `gate-proof sign` stores an unsigned
+# closure while the answer reports OK (DIVE-2760).
+#
+# The arms are deliberately PAIRED. Asserting only the warning would also pass
+# for a fix that always warns, which is worthless: a warning on every push is
+# noise, and noise is how this stayed invisible. So the positive control asserts
+# the honest case stays quiet and asserts the refusal wording is ABSENT.
+
+# 20) UNSIGNED closure -> predict the refusal rather than preview a push that
+#     cannot happen. Absence of a signature is readable at preflight without the
+#     root key, so this is a prediction, not a disclaimer.
+seed_task DIVE-990 "Branch: feature-ok" approval "2026-07-18 00:00:00" "yes" "lead:scoped" "" 0
+out=$(run_push DIVE-990 --dry-run); rc=$?
+{ [[ $rc -eq 0 ]] \
+    && grep -qi "would NOT push" <<<"$out" \
+    && grep -qi "WILL refuse" <<<"$out"; } \
+  && ok_t "unsigned closure -> dry run predicts the push-time refusal (DIVE-2801)" \
+  || bad_t "unsigned closure -> dry run predicts the push-time refusal (DIVE-2801)" "rc=$rc :: $out"
+
+# 20b) the machine-readable surface must carry it too — a script reading `gate`
+#      would otherwise still see "cleared" for a push that cannot happen.
+out=$( cd "$REPO"; JSON_MODE=1 cmd_push DIVE-990 --repo="file://$REPO" --dry-run 2>&1 ); rc=$?
+{ [[ $rc -eq 0 ]] \
+    && grep -q '"gate":"authority-ok-signature-absent"' <<<"$out" \
+    && grep -q '"signature":"unsigned"' <<<"$out"; } \
+  && ok_t "unsigned closure -> JSON gate/signature name the uncomputed check (DIVE-2801)" \
+  || bad_t "unsigned closure -> JSON gate/signature name the uncomputed check (DIVE-2801)" "rc=$rc :: $out"
+
+# 21) POSITIVE CONTROL — a SIGNED closure must still read as a clean rehearsal.
+#     This is the arm that stops the fix degrading into "always warn": a blanket
+#     warning fails HERE while arm 20 would still pass.
+seed_task DIVE-991 "Branch: feature-ok" approval "2026-07-18 00:00:00" "yes"
+out=$(run_push DIVE-991 --dry-run); rc=$?
+{ [[ $rc -eq 0 ]] \
+    && grep -qi "dry-run: would push" <<<"$out" \
+    && ! grep -qi "would NOT push" <<<"$out" \
+    && ! grep -qi "WILL refuse" <<<"$out" \
+    && grep -qi "NOT verified here" <<<"$out"; } \
+  && ok_t "signed closure -> clean rehearsal, disclaimed not warned (DIVE-2801 positive control)" \
+  || bad_t "signed closure -> clean rehearsal, disclaimed not warned (DIVE-2801 positive control)" "rc=$rc :: $out"
+
+# 22) The usage refusal must not recommend a remedy it cannot honour. `--branch`
+#     satisfies THIS check but not the DIVE-1462 gate binding in _push_do, which
+#     reads the branch from the task body — so offering it as the alternative
+#     sends the caller straight into the next refusal. Same defect, one step up.
+seed_task DIVE-992 "no branch line in this body" approval "2026-07-18 00:00:00" "yes"
+out=$(run_push DIVE-992 --dry-run 2>&1); rc=$?
+{ [[ $rc -ne 0 ]] \
+    && grep -q "Branch: <name>" <<<"$out" \
+    && grep -q "body is REQUIRED" <<<"$out" \
+    && ! grep -q "pass --branch=<name> or add" <<<"$out"; } \
+  && ok_t "branch refusal names the body requirement, not --branch alone (DIVE-2801)" \
+  || bad_t "branch refusal names the body requirement, not --branch alone (DIVE-2801)" "rc=$rc :: $out"
+
 echo "-----"
 printf 'push_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

@@ -180,9 +180,21 @@ out=$(cmd_task_answer DIVE-302 --value=approved 2>&1); rc=$?
 [[ -z "$(_nf)" ]] \
   && ok_t "E2 no escalation ping on a non-routed gate" \
   || bad_t "E2 no ping" "notified='$(_nf)'"
-[[ "$out" == *"only a human"* || "$out" == *"tier-2 human gate"* ]] \
-  && ok_t "E2 keeps the original tier-2 refusal message" \
+# DIVE-2801 CHANGED THE EXPECTED STRING, not this arm's claim. The claim here is
+# "refused, and by the plain refusal rather than the escalation path" — it was
+# keyed on "only a human", a sentence that row deleted for being false (the
+# lead-clear seat answers these with no human). Re-keyed onto what still
+# discriminates the two paths: the standing refusal names the caller's standing,
+# and escalation would have flagged itself (E1 asserts that flag's presence).
+[[ "$out" == *"lead-clear standing"* && "$out" != *"escalated_to_human"* ]] \
+  && ok_t "E2 gets the plain standing refusal, not the escalation path" \
   || bad_t "E2 refusal message" "out=$out"
+# And the remedy it offers must fit THIS gate: DIVE-302 is unrouted, so there is
+# no lead-clear seat to point at. Asserting the absence is the whole point — the
+# type-level sentence is exactly what would reappear here.
+[[ "$out" == *"no routed reviewer"* ]] \
+  && ok_t "E2 unrouted gate is not told a lead-clear seat can answer it (DIVE-2801)" \
+  || bad_t "E2 unrouted remedy names a seat that does not exist" "out=$out"
 
 # --- E3: a routed tier-2 manual gate cleared by a real HUMAN (--human) clears normally —
 #     escalation only fires for the NON-human refusal path (DIVE-525: taps never break). -
@@ -243,6 +255,32 @@ out=$(cmd_task_answer DIVE-304 --value=approved 2>&1); rc=$?
   && ok_t "E4 enforce OFF: the human was notified with a tap — escalation fires identically to enforce ON" \
   || bad_t "E4 escalation fires with enforce OFF" "notified='$(_nf)'"
 touch "$GATE_PROOF_ENFORCE"
+
+# --- E5: DIVE-2801's POSITIVE CONTROL. Every arm above grades a caller WITHOUT
+#     lead-clear standing, so all of them would still pass against a build that
+#     refuses every caller — and that build is precisely what the old wording
+#     ("only a human can clear it") described. The row's claim is that standing,
+#     not gate type, decides; a claim about a discriminator is not tested until
+#     both sides of it are run. Same caller identity as E2, tier-1 approval gate
+#     routed to that caller: it must clear, and see no refusal at all.
+#     (Ident DIVE-306, not 305: E3b already holds 305. Seeded onto a taken ident
+#     `seed_task` hits a UNIQUE constraint, the gate filing is refused as already
+#     filed, and the arm then grades the PREVIOUS arm's leftover row — which is
+#     how the first draft of this control passed while proving nothing.)
+seed_task DIVE-306
+cmd_task_need DIVE-306 --type=approval --tier=1 --ask="ship it" >/dev/null 2>&1
+[[ "$(tierof DIVE-306)" == "1" ]] \
+  && ok_t "E5 precond: a tier-1 approval gate is filed on a FRESH ident" \
+  || bad_t "E5 precond: fixture is not the gate this arm claims" "tier='$(tierof DIVE-306)' — a collided ident would grade a leftover row"
+route_to DIVE-306 marcus
+_nf_reset
+out5=$(cmd_task_answer DIVE-306 --value=approve 2>&1); rc5=$?
+[[ "$(answered DIVE-306)" == "closed" && $rc5 -eq 0 ]] \
+  && ok_t "E5 CONTROL: the caller WITH lead-clear standing clears its own gate, no human" \
+  || bad_t "E5 standing caller could not clear" "rc=$rc5 state=$(answered DIVE-306) out=$out5"
+[[ "$out5" != *"lead-clear standing"* && "$out5" != *"only a human"* ]] \
+  && ok_t "E5 CONTROL: standing caller sees no refusal text (standing decides, not type)" \
+  || bad_t "E5 standing caller was refused" "out=$out5"
 
 echo "-----"
 printf 'gate_t2_routed_escalate_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
