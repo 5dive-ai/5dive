@@ -3282,9 +3282,70 @@ function cmdDriftCheck() {
   process.exit(res.drifted ? 7 : 0)
 }
 
+// DIVE-2889 — THE BALLOT MUST CARRY THE CANDIDATE, NOT A 12-CHAR PREFIX OF ITS DIGEST.
+//
+// MEASURED (olivia as chair, from dev's finding on DIVE-2887, re-measured before filing): the
+// eng_approval_lead amendment was balloted TWICE on digest 6498adcb…, which RESOLVES TO NO FILE
+// ANYWHERE ON DISK. Both approving rationales claimed a direct read of the on-disk content — and
+// both statements were true about 8ee23dff… (the LIVE constitution), which is not what was
+// balloted. Two seats ran a verification that silently resolved to the live file and got a
+// CONFIRMATION instead of a finding. codex rejected both rounds on exactly this ground and was
+// right both times; the inquorate failure is the only thing that stopped an unreviewed policy
+// from sealing.
+//
+// THE SHARP DISTINCTION, and the reason no amount of seat diligence fixes this: "the candidate is
+// unavailable" and "the candidate is available and fine" are THE SAME SENTENCE ONE DIGEST APART.
+// A seat reading the ballot could not tell them apart, because the ballot named neither the path
+// nor the full digest — and the precedent block propagates a prior VERDICT and its prose but NOT
+// the digest that verdict was about, so case law cannot separate them either.
+//
+// TWO GUARDS, and the first is the one that matters:
+//
+//   1. THE DIGEST MUST BE THE DIGEST OF THE BYTES WE ARE BALLOTING. We already hold the candidate
+//      text here (we just parsed it), so re-derive its sha256 and REFUSE on mismatch. This is what
+//      makes 6498adcb… structurally unreachable: a digest that no longer corresponds to the bytes
+//      at the named path cannot reach a seat at all. Fail closed at mint, per the row — "a motion
+//      whose bytes cannot be located should not reach seats at all".
+//   2. THE BALLOT CARRIES path + FULL digest + diff-vs-live. Not so a stale objection stops
+//      recurring (that was the earlier, wrong framing, corrected on the wiki page) but so a seat's
+//      `verify` CANNOT silently resolve to the live file: with the full digest in the row,
+//      `sha256sum <path>` is a one-command binding rather than an eyeball comparison against a
+//      truncated prefix, and a seat with no sibling row to read still has a route to the bytes.
+//      Before this, both seats that went looking (DIVE-2882, DIVE-2886) had to locate the
+//      candidate independently, and that it worked is not the same as it being delivered.
+//
+// WHY THE DIFF IS CAPPED: this question becomes the ballot BODY for human seats too, delivered as
+// a Telegram message with a hard length limit — an uncapped diff would turn a governance change
+// into a capture failure, which is the same fail-open in a new coat. So the cap is deliberate and
+// the ballot always names the exact command for the full diff; the binding (path + full digest) is
+// never truncated, because that is the part a seat cannot reconstruct.
+// Sized against the transport, not against taste. The human-seat ballot body is
+// `${question}` + a ~250-char tap suffix, and a PRECEDENT block (one line per prior decision) can
+// precede the ask — all of it inside one Telegram message. Measured with a 400-line diff: 40
+// lines / 1600 chars puts the whole question near ~1.9k, leaving ~2k of headroom. The binding
+// itself is never counted against this cap; only the diff is clipped.
+const AMEND_DIFF_MAX_LINES = 40
+const AMEND_DIFF_MAX_CHARS = 1600
+
+// Cap the diff for the ballot body while making the truncation LOUD and self-repairing — a seat
+// that sees the marker knows it is reading a prefix and is told the command that yields the whole.
+function clipAmendDiff(diff, cmd) {
+  const raw = String(diff == null ? '' : diff).replace(/\s+$/, '')
+  if (!raw) return `(no textual diff — the candidate's bytes differ from live only in ways \`diff -u\` does not show, or live is absent; bind with the digest above, NOT with this block)`
+  const lines = raw.split('\n')
+  let clipped = lines.slice(0, AMEND_DIFF_MAX_LINES).join('\n')
+  if (clipped.length > AMEND_DIFF_MAX_CHARS) clipped = clipped.slice(0, AMEND_DIFF_MAX_CHARS)
+  if (clipped.length < raw.length) {
+    return `${clipped}\n… TRUNCATED (${lines.length} diff lines total; this ballot shows the first ${Math.min(lines.length, AMEND_DIFF_MAX_LINES)}). `
+      + `THIS IS A PREFIX, NOT THE DIFF — read the whole of it before voting: ${cmd}`
+  }
+  return clipped
+}
+
 // `amend-plan` — validate the PROPOSED constitution (must parse+normalize), then emit the
 // constitutional-class deliberation question over the full current roster (no recusal, full
-// quorum + 2/3 + founder veto follow from the constitutional class). Fails closed on a bad file.
+// quorum + 2/3 + founder veto follow from the constitutional class). Fails closed on a bad file,
+// and (DIVE-2889) on a candidate whose bytes it cannot bind to the digest it is about to ballot.
 function cmdAmendPlan() {
   const roster = readJsonFlag('seats-json')
   if (!Array.isArray(roster) || !roster.length) die('amend-plan needs the current roster --seats-json (fail-closed)', 3)
@@ -3294,11 +3355,54 @@ function cmdAmendPlan() {
   try { E.normalizeConstitution(E.parseConstitutionFrontmatter(text)) }
   catch (e) { die(`the proposed constitution.yaml is not a valid constitution — refusing to convene an amendment on it: ${String(e && e.message || e)}`, 4) }
   const digest = flag('constitution-digest') === true || flag('constitution-digest') == null ? '' : String(flag('constitution-digest'))
+  const candPath = flag('constitution-path') === true || flag('constitution-path') == null ? '' : String(flag('constitution-path'))
+
+  // DIVE-2889 guard 1 — fail closed unless the digest we are about to ballot IS the digest of the
+  // bytes we just read. A prefix is not a binding and an unbindable motion does not reach seats.
+  if (!/^[0-9a-f]{64}$/i.test(digest)) {
+    die(`amend-plan needs the FULL 64-hex --constitution-digest of the candidate (got ${digest ? `"${digest}"` : 'nothing'}) — `
+      + `a ballot that carries only a truncated digest cannot be bound to a file by any seat (fail-closed, DIVE-2889)`, 4)
+  }
+  const actual = E.digestConstitution(text)
+  if (actual.toLowerCase() !== digest.toLowerCase()) {
+    die(`REFUSING TO MINT THIS BALLOT (DIVE-2889): the digest to be balloted (${digest}) is NOT the digest of the candidate's bytes `
+      + `(${actual}). This is the exact shape that put 6498adcb… in front of two rounds of seats while every "I verified the on-disk `
+      + `content" rationale was in fact describing the LIVE constitution. Re-digest the candidate and convene again.`, 4)
+  }
+  if (!candPath) {
+    die(`amend-plan needs --constitution-path=<path the seats can resolve> (fail-closed, DIVE-2889) — the ballot must name where the `
+      + `candidate's bytes live, or a seat's verification silently resolves to the live constitution and returns a confirmation`, 4)
+  }
+
+  const diffCmd = `diff -u ${flag('live-path') && flag('live-path') !== true ? String(flag('live-path')) : '<live constitution.yaml>'} ${candPath}`
+  const livePath = flag('live-path') === true || flag('live-path') == null ? '' : String(flag('live-path'))
+  const liveDigest = flag('live-digest') === true || flag('live-digest') == null ? '' : String(flag('live-digest'))
+  const diffRaw = flag('diff') === true || flag('diff') == null ? '' : String(flag('diff'))
+  const diffText = diffRaw.startsWith('@') ? (() => { try { return fs.readFileSync(diffRaw.slice(1), 'utf-8') } catch { return '' } })() : diffRaw
+
+  // The binding block. Deliberately BEFORE the ask, and deliberately naming what each field is for
+  // — a seat that reads only this block still has everything it needs to bind, and a seat that
+  // skips it has no honest way to claim it verified anything.
+  const binding = `\nCANDIDATE BINDING — the bytes this motion is about (DIVE-2889; verify before you vote):
+  path        ${candPath}
+  sha256      ${digest}
+  live        ${livePath || '(unknown)'}${liveDigest ? ` sha256 ${liveDigest}` : ''}
+  bind it     sha256sum ${candPath}     <- must print the sha256 above, exactly
+DO NOT verify by reading the live constitution: it will agree with itself and return a confirmation
+instead of a finding. That is what happened in both dead rounds of the eng_approval_lead amendment.
+If \`sha256sum\` does not reproduce the digest above, the ballot and the file have diverged — REJECT
+and say so; do not vote on bytes you could not bind.
+
+DIFF vs the live constitution (${diffCmd}):
+${clipAmendDiff(diffText, diffCmd)}
+`
+
   const question = `Constitution amendment motion (constitutional): should the Council RATIFY the proposed constitution.yaml `
-    + `(digest ${digest ? digest.slice(0, 12) + '…' : '?'})? This is the hardest bar — a 2/3 supermajority of ALL `
+    + `(sha256 ${digest})?${binding}This is the hardest bar — a 2/3 supermajority of ALL `
     + `${roster.length} seat(s) with full quorum, founder-veto-able. On a pass the new constitution is sealed into the `
     + `hash-chain and becomes the enforced governance policy. Approve to ratify, reject to keep the current constitution, escalate only if it genuinely needs a human.`
-  out({ class: 'constitutional', recuse: [], subject: null, votingSeats: roster, votingSeatSpec: seatsToSpec(roster), question, constitutionDigest: digest })
+  out({ class: 'constitutional', recuse: [], subject: null, votingSeats: roster, votingSeatSpec: seatsToSpec(roster), question,
+        constitutionDigest: digest, candidatePath: candPath, livePath: livePath || null, liveDigest: liveDigest || null })
 }
 
 // `amend-apply` — on a PASS only: build the hash-chained constitutional motion record carrying the
@@ -4843,6 +4947,31 @@ _council_amend() {
   local new_digest; new_digest="$(sha256sum < "$file" 2>/dev/null | awk '{print $1}')"
   [[ -n "$new_digest" ]] || fail "$E_GENERIC" "could not digest the proposed constitution $file"
 
+  # DIVE-2889 — RESOLVE THE CANDIDATE TO A REAL, ABSOLUTE PATH BEFORE ANY SEAT SEES A BALLOT.
+  # The eng_approval_lead amendment was balloted twice on a digest that resolves to no file
+  # anywhere on disk, while both approving rationales described the LIVE constitution. A seat
+  # cannot bind bytes it cannot name, so the ballot has to carry the name — and a relative path
+  # is not a name once the ballot leaves this process and lands in another agent's task body.
+  local cand_abs; cand_abs="$(readlink -f -- "$file" 2>/dev/null || true)"
+  [[ -n "$cand_abs" && -r "$cand_abs" ]] \
+    || fail "$E_NOT_FOUND" "could not resolve the proposed constitution '$file' to a readable absolute path — a motion whose bytes cannot be located must not reach seats (fail-closed, DIVE-2889)"
+  # Re-digest through the RESOLVED path, not the argument. If the two disagree the file moved or
+  # changed under us between the two reads, and the ballot would name bytes that no longer exist.
+  local cand_recheck; cand_recheck="$(sha256sum < "$cand_abs" 2>/dev/null | awk '{print $1}')"
+  [[ "$cand_recheck" == "$new_digest" ]] \
+    || fail "$E_CONFLICT" "the proposed constitution changed between reads ($new_digest -> ${cand_recheck:-unreadable}) — refusing to ballot a digest that no longer names the file (fail-closed, DIVE-2889)"
+
+  # Live side of the binding: seats are told what the candidate is being compared AGAINST, so
+  # "verified the on-disk content" can no longer be true of the wrong file without the ballot
+  # contradicting it. An absent live file is a legitimate state (pre-genesis), not a failure.
+  local live_path live_digest cand_diff diff_tmp
+  live_path="$(_council_constitution_path)"
+  live_digest="$(sha256sum < "$live_path" 2>/dev/null | awk '{print $1}')" || live_digest=""
+  diff_tmp="$(mktemp)"
+  # `diff` exits 1 when the files differ, which is the ORDINARY case here — never let that kill
+  # the amend under `set -e`, and never let it read as an error.
+  diff -u "$live_path" "$cand_abs" > "$diff_tmp" 2>/dev/null || true
+
   # Current roster + hash-chain head from the SEALED lineage tail.
   local head head_seats prev_digest last_seq seq
   head="$(tail -n1 "$COUNCIL_LINEAGE" 2>/dev/null)"
@@ -4851,8 +4980,11 @@ _council_amend() {
   prev_digest="$(printf '%s' "$head" | jq -r '.digest // ""')"
   last_seq="$(printf '%s' "$head" | jq -r '.seq // -1')"; [[ "$last_seq" =~ ^[0-9]+$ ]] && seq=$((last_seq+1)) || seq=0
 
-  local plan question
-  plan="$(node "$dir/cli.mjs" amend-plan --seats-json="$head_seats" --constitution="@$file" --constitution-digest="$new_digest")" || return $?
+  local plan question _amend_rc
+  plan="$(node "$dir/cli.mjs" amend-plan --seats-json="$head_seats" --constitution="@$cand_abs" --constitution-digest="$new_digest" \
+    --constitution-path="$cand_abs" --live-path="$live_path" --live-digest="$live_digest" --diff="@$diff_tmp")" \
+    || { _amend_rc=$?; rm -f "$diff_tmp"; return $_amend_rc; }   # preserve amend-plan's exit code — its fail-closed refusals are distinguishable by code
+  rm -f "$diff_tmp"
   question="$(printf '%s' "$plan" | jq -r '.question')"
 
   if (( dry )); then
