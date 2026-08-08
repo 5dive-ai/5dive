@@ -993,6 +993,28 @@ export function canonicalTranscript(rec) {
   if (unreached.length) {
     L.push(`unreached: ${unreached.map(v => `${norm(v.seat)}:${norm(v.abstainKind || 'unknown')}`).slice().sort().join(',')}`)
   }
+  // DIVE-2891: SEAL WHICH SILENCE IT WAS. `unreached:` above covers the seats we can show were
+  // never asked (capture === false). It does NOT cover the case that actually killed the 2026-08-07
+  // round: a seat we DID reach, that simply never answered. Under `quorum: all` +
+  // `require_quorum: true` an abstention is a SILENT VETO, so "withheld consent" and "could not
+  // answer" are the two readings a receipt most needs to separate — and until now it sealed nothing
+  // that could. codex's ballot went in_progress -> todo with 32 minutes left while the registry
+  // reported active/enabled; at the deadline the receipt sealed a bare abstain and the quota lock
+  // existed only in a tmux pane nobody had captured.
+  //
+  // These kinds record the BALLOT'S OBSERVED BEHAVIOUR (claimed/released/held/closed-without-voting),
+  // never a diagnosis. That distinction is load-bearing: the whole failure thread on this council is
+  // instruments that were right about a fact and wrong about the cause, in the direction that reads
+  // as recoverable.
+  //
+  // CONDITIONAL, on the CNCL-19 / DIVE-1869 precedent: emitted only for an abstain that is NOT a
+  // capture failure AND carries a kind. No record written before this change can satisfy both — every
+  // pre-existing abstainKind site sets capture:false — so every historical receipt re-seals
+  // BYTE-IDENTICALLY and `council verify` on them is unaffected. Sorted for a stable seal.
+  const silent = (rec.votes || []).filter(v => v && v.vote === 'abstain' && v.capture !== false && v.abstainKind)
+  if (silent.length) {
+    L.push(`silent: ${silent.map(v => `${norm(v.seat)}:${norm(v.abstainKind)}`).slice().sort().join(',')}`)
+  }
   const vd = rec.verdict || {}
   const t = vd.tally || {}
   L.push(`verdict: ${norm(vd.recommendation != null ? vd.recommendation : vd.choice)} conf=${Number(vd.confidence)} tally=a${Number(t.approve) || 0}/r${Number(t.reject) || 0}/e${Number(t.escalate) || 0} escalated=${!!vd.escalated}`)
