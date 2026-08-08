@@ -1387,8 +1387,19 @@ cmd_create() {
   # precaution we refuse grok here. Every provisioning path (agent create, hire,
   # pack import, clone) funnels through cmd_create, so this blocks all of them.
   # Unfreeze condition (olivia): a VERIFIED xAI client-side patch + a pinnable
-  # version, NEVER the server-side toggle alone. The override below exists ONLY
-  # for that verified-unfreeze moment; do NOT set it to work around the freeze.
+  # version, NEVER the server-side toggle alone. That condition is still UNMET
+  # (re-checked 2026-08-08 for DIVE-2910: no client-side fix through Grok Build
+  # v0.2.121 / 1.0.0 — the upload path ships in every binary and in the
+  # open-source repo, the config.toml disable_codebase_upload key is an opt-in
+  # local override rather than a default-off fix, and xAI's only mitigation
+  # remains its revocable server-side flag of 2026-07-13).
+  # DIVE-2894/2910: the owner (lodar, 2026-08-07 18:07Z) answered the unfreeze
+  # gate "arm" anyway. That is a recorded owner RISK ACCEPTANCE, not a fix and
+  # not a withdrawal of the condition above — so an armed host is a host where
+  # the owner accepted a live, unpatched exfiltration risk. Set the override
+  # only on hosts named by that decision, never to route around the freeze on
+  # your own authority, and never read an armed host as evidence of a patch.
+  # The warn below fires on every armed create and is meant to stay noisy.
   if [[ "$type" == "grok" && "${FIVE_GROK_UNFREEZE_VERIFIED:-}" != "1" ]]; then
     fail "$E_VALIDATION" "grok provisioning is frozen (DIVE-1221): Grok Build has an unpatched codebase-exfiltration issue and xAI has shipped only a revocable server-side mitigation. Unfreeze needs a verified xAI client-side fix + pinnable version. See DIVE-1221."
   fi
