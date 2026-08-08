@@ -40,7 +40,12 @@ const ballotExec = ({ rowSeq = [], captured = null } = {}) => {
     return ''
   }
 }
-const seat = { id: 'codex', lens: 'engineering' }
+// DIVE-2914: a RESERVED-FAKE seat id, never a real fleet agent. This fixture used to say `codex`,
+// and `codex` is a live seat — combined with the un-injected `_nudge` below it addressed three real
+// `5dive agent send codex ...` notices per run at a seat that was quota-locked, asking it to close
+// DIVE-77 (a stub ident that exists on no board). Per CLAUDE.md: a fixture is precisely the place
+// where a real-looking value never needs to be real.
+const seat = { id: 'seat-under-test', lens: 'engineering' }
 // Deterministic clock: `_sleep` is the only thing that advances it, so the deadline is reached after
 // exactly `deadline / poll` poll iterations regardless of wall time.
 const drive = (rowSeq, deadline = 5) => {
@@ -48,6 +53,12 @@ const drive = (rowSeq, deadline = 5) => {
   return dispatchBallotVote({
     deadline, poll: 1, _now: () => t, _sleep: async (ms) => { t += ms },
     _exec: ballotExec({ rowSeq }),
+    // DIVE-2914: `_nudge` MUST be injected. It is a live rail (nudgeSeatAgent -> `5dive agent send`),
+    // not part of the collect loop, so stubbing `_exec` alone does NOT make this harness offline —
+    // that is exactly how this file emitted to a real seat. Sibling harnesses
+    // (council_dispatch_unit, council_liveness_unit) already inject all three seams; this one did not.
+    _nudge: () => ({ ok: true }),
+    _emitBallot: async () => ({ delivered: false, reason: 'offline unit' }),
   })(seat, { question: 'ratify?', round: 1 })
 }
 

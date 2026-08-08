@@ -2342,7 +2342,18 @@ export function dispatchBallotVote(opts = {}) {
   // on its queued ballot until the deadline abstains it out. Halfway through the window we send ONE
   // best-effort wake nudge into the seat agent's pane. Injectable + never-throws; a nudge that can't
   // land just means the seat isn't roused early — the deadline/abstain path is unchanged either way.
-  const nudge = opts._nudge || ((agent, msg) => nudgeSeatAgent(agent, msg))
+  // DIVE-2914: this seam FAILS CLOSED when the caller has already declared itself offline. `_nudge`
+  // defaults to a LIVE rail (nudgeSeatAgent -> `5dive agent send <seat> …`) that is NOT part of the
+  // collect loop, so a harness that stubs `_exec` and forgets this one does not become offline — it
+  // becomes a test that messages a real seat. Not hypothetical: council_abstain_engagement_unit.mjs
+  // injected `_exec` alone and addressed three `agent send codex …` notices PER RUN to a live,
+  // quota-locked seat, about a stub ident (DIVE-77) that exists on no board.
+  // A caller that stubbed `_exec` has declared the CLI rail unavailable; the only coherent default for
+  // the OTHER exec rail is then a no-op that RECORDS why, which is also the honest ledger entry —
+  // nothing was sent. Production (seatVoteFor) injects NO seams at all, so this branch cannot reach it.
+  const nudge = opts._nudge || (opts._exec
+    ? () => ({ ok: false, why: 'nudge suppressed: _exec stubbed without _nudge (offline test context, DIVE-2914)' })
+    : ((agent, msg) => nudgeSeatAgent(agent, msg)))
   const nudgeFrac = Number(opts.nudgeFrac) > 0 && Number(opts.nudgeFrac) < 1 ? Number(opts.nudgeFrac) : 0.5
   // (d) COLLECT (shared by the agent + human branches): poll task show until the ballot task closes
   // with a result, or the deadline elapses. The collection-loop deadline is AUTHORITATIVE regardless
@@ -2784,7 +2795,12 @@ export function preflightLiveness(seats, opts = {}) {
   if (health === null) {
     die('council liveness pre-flight FAILED: could not read seat health (`agent list --json`) — refusing to dispatch a full-quorum motion rather than gamble it into a structural inquorate.', 6)
   }
-  const nudge = opts._nudge || nudgeSeatAgent
+  // DIVE-2914: same fail-closed rule as dispatchBallotVote's seam. A caller that injected `_health`
+  // has declared itself offline (no real `agent list`); defaulting the WAKE rail to a live
+  // `agent send` there would message real seats from a test that believes it is isolated.
+  const nudge = opts._nudge || (opts._health
+    ? () => ({ ok: false, why: 'nudge suppressed: _health stubbed without _nudge (offline test context, DIVE-2914)' })
+    : nudgeSeatAgent)
   const unreachable = []
   for (const s of seats) {
     if (E.seatIsHuman(s)) continue
