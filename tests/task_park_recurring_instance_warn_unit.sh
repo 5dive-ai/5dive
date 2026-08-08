@@ -1,4 +1,20 @@
 #!/usr/bin/env bash
+# TIER: nightly — 2.9s measured (agent-main control plane, 2026-08-08, DIVE-2877): the core/
+# installed-host tier measured 313s against a 312s effective cap WITH this file present and
+# 256/256 harnesses passing, so the corpus is at its cap and a new guard has to pay for itself.
+# The argument is not that 2.9s is expensive — it is which 2.9s is safest to move. What this
+# file grades is a WARNING on a non-destructive path: park still succeeds either way, so its
+# failure mode is "the advice is missing or stale", never a data loss or a wrong mutation. That
+# is a slow-drift property, which is what a nightly sweep is for, and it is the only thing in
+# the diff that could move without either retiring another subject's guard or welding these
+# arms onto one that must stay in core.
+# MERGE BY SUBJECT WAS TRIED FIRST (the guard's own first preference) and MEASURED, not assumed:
+# folding these arms into tests/task_park_gate_guard_unit.sh — same subject, the guards on
+# cmd_task_park — ran 6771ms against 6545ms for the two files separately, i.e. it reclaims
+# NOTHING here; the per-file setup is already cheap and the arms dominate. It would also have
+# welded a warn-only guard to the DIVE-1453 park-over-gate guard, which protects a path that
+# SILENTLY DESTROYS an open human gate and therefore must not be demotable. Reverted.
+#
 # DIVE-2877 isolated unit harness for the RECURRING-INSTANCE warning in cmd_task_park.
 #
 # Bug: parking an instance materialized from a recurring template is not a delay of
