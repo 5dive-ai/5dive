@@ -1254,11 +1254,24 @@ export function canonicalTranscript(rec) {
   // instruments that were right about a fact and wrong about the cause, in the direction that reads
   // as recoverable.
   //
-  // CONDITIONAL, on the CNCL-19 / DIVE-1869 precedent: emitted only for an abstain that is NOT a
-  // capture failure AND carries a kind. No record written before this change can satisfy both — every
-  // pre-existing abstainKind site sets capture:false — so every historical receipt re-seals
-  // BYTE-IDENTICALLY and `council verify` on them is unaffected. Sorted for a stable seal.
-  const silent = (rec.votes || []).filter(v => v && v.vote === 'abstain' && v.capture !== false && v.abstainKind)
+  // CONDITIONAL, on the CNCL-19 / DIVE-1869 precedent: emitted only for the `silent:` kinds this
+  // change introduces, tested BY THEIR OWN NAME.
+  //
+  // Iteration 1 filtered on `capture !== false && abstainKind`, on the stated premise that every
+  // pre-existing abstainKind site also sets capture:false. THAT PREMISE IS FALSE and olivia measured
+  // it: cli.mjs's `unparsed` kind — a seat that DID reply, off-format — has carried capture:true
+  // since long before this row. Two things followed from the wrong predicate, and they are the same
+  // defect pointing in both directions in time. Backwards: any historical receipt with an unparsed
+  // abstain would re-seal under NEW bytes and fail `council verify`. Forwards: a seat that spoke
+  // would be sealed onto a line named `silent:` — this row's own failure class, a record asserting
+  // a silence for a seat that was heard.
+  //
+  // A prefix test on the kind is not a tighter filter for the same idea; it is the idea. The
+  // historical invariance is then true BY CONSTRUCTION rather than by a census of writers that
+  // nothing enforces: no pre-existing kind starts with `silent:` because the prefix is minted here.
+  // Same substitution this row already made to council_dispatch_unit's DIVE-2220 arm — stop using a
+  // neighbouring field as a proxy for the property you mean, and assert the property.
+  const silent = (rec.votes || []).filter(v => v && v.vote === 'abstain' && String(v.abstainKind || '').startsWith('silent:'))
   if (silent.length) {
     L.push(`silent: ${silent.map(v => `${norm(v.seat)}:${norm(v.abstainKind)}`).slice().sort().join(',')}`)
   }

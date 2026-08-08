@@ -99,14 +99,48 @@ const tWith = canonicalTranscript(recWith)
 ok(/^silent: codex:silent:released$/m.test(tWith), 'B1 the sealed transcript carries a `silent:` line naming the seat and its kind')
 
 // B2 — THE COMPATIBILITY GUARANTEE, and the reason the line is conditional. Every record written
-//      before this change has abstains with NO abstainKind (or with capture:false). Those must seal
-//      BYTE-IDENTICALLY or `council verify` goes red on historical receipts — a governance rail
+//      before this change has abstains whose kind (if any) does NOT start with `silent:`. Those must
+//      seal BYTE-IDENTICALLY or `council verify` goes red on historical receipts — a governance rail
 //      failing on its own past is a far worse outcome than the defect being fixed.
 const recLegacy = { ...recWith, votes: [{ seat: 'main', vote: 'approve', rationale: 'ok' }, { seat: 'codex', vote: 'abstain', rationale: 'no vote by deadline' }] }
 const tLegacy = canonicalTranscript(recLegacy)
 ok(!/^silent:/m.test(tLegacy), 'B2 a pre-DIVE-2891 record (abstain, no kind) seals with NO `silent:` line')
 ok(tLegacy === tWith.split('\n').filter(l => !l.startsWith('silent:')).join('\n'),
    'B2 …and is otherwise byte-identical to the new transcript minus that one line')
+
+// B2b — THE ARM THAT KILLED ITERATION 1, and the one this predicate exists for. `unparsed` is a
+//       PRE-EXISTING kind (src/council/cli.mjs — a seat that DID reply, off-format) and it carries
+//       capture:TRUE, so it satisfied iteration 1's `capture !== false && abstainKind` filter
+//       exactly. Note the fixture has NO capture field at all: normalizeSeatVote persists
+//       abstainKind always and capture only when it is false, so this is the shape an unparsed
+//       abstain actually takes on disk, not a hypothetical.
+//
+//       It has to be a fixture and not a census of the store: olivia measured that not one of the
+//       30 on-disk receipts carries any abstainKind field today, so a check against real receipts
+//       passes on zero and proves nothing. The break was LATENT — luck, not a guarantee — and the
+//       arm has to construct the case luck was hiding.
+//
+//       Two failures in one, in both directions in time. BACKWARDS: a historical receipt with an
+//       unparsed abstain re-seals under new bytes and `council verify` goes red on it. FORWARDS: a
+//       seat that SPOKE gets written onto a line named `silent:` — this row's own failure class,
+//       inside its own fix.
+const recUnparsed = { ...recWith, votes: [{ seat: 'main', vote: 'approve', rationale: 'ok' },
+  { seat: 'codex', vote: 'abstain', abstainKind: 'unparsed', rationale: 'codex replied but with no COUNCIL-VOTE line' }] }
+const tUnparsed = canonicalTranscript(recUnparsed)
+ok(!/^silent:/m.test(tUnparsed),
+   'B2b an `unparsed` abstain (pre-existing kind, capture:true, seat SPOKE) seals with NO `silent:` line')
+// Compared against the SAME fixture with the kind stripped — not against recLegacy, whose rationale
+// differs and which would make this pass or fail for a reason that is not the kind.
+const tUnparsedNoKind = canonicalTranscript({ ...recUnparsed,
+  votes: recUnparsed.votes.map(v => { const { abstainKind, ...rest } = v; return rest }) })
+ok(tUnparsed === tUnparsedNoKind,
+   'B2b …and seals BYTE-IDENTICALLY to the same record with the kind stripped — historical invariance by construction')
+// Positive control for B2b: the identical fixture with a `silent:` kind DOES seal the line, so the
+// arm above grades the prefix predicate and not a canonicalTranscript that emits nothing.
+const tUnparsedControl = canonicalTranscript({ ...recUnparsed,
+  votes: recUnparsed.votes.map(v => v.seat === 'codex' ? { ...v, abstainKind: 'silent:no-pickup' } : v) })
+ok(/^silent: codex:silent:no-pickup$/m.test(tUnparsedControl),
+   'B2b positive control: the same record with a silence kind DOES seal the line')
 
 // B3 — a capture failure keeps going to `unreached:` ONLY. The two lines answer different questions
 //      ("never asked" vs "asked, never answered") and a seat must not appear on both.
