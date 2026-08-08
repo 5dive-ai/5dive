@@ -6173,10 +6173,59 @@ cmd_task_park() {
   # DIVE-2410: park clears the gate columns, so whatever button that gate put in a
   # human's chat now points at a question the task no longer holds.
   _task_gate_retire_buttons "$tident" "parked" || true
+  # DIVE-2877: A PARK'S BLAST RADIUS EXCEEDS THE ROW IT IS APPLIED TO, and until
+  # now nothing said so at the moment of the park. On an instance materialized
+  # from a recurring template (from_template_id set) a park is not a delay of one
+  # row — it is a stop of the whole beat, with no catch-up:
+  #
+  #   - the materializer dedups on `status NOT IN ('done','cancelled')`
+  #     (_hb_materialize_recurring, src/cmd_heartbeat.sh) and a park sets
+  #     status='blocked', so the parked instance HOLDS the template's only open
+  #     slot. Every occurrence inside the park window is DROPPED, not deferred —
+  #     the materializer carries an explicit `V1 LIMITATION: no catch-up`.
+  #   - the DIVE-2693 stall ladder requires `status='todo' AND parked_at IS NULL`
+  #     at BOTH rungs (rung 2 added by DIVE-2853), so the row that stopped the
+  #     beat is the one state the watchdog cannot see.
+  #
+  # THE LADDER IS NOT THE DEFECT and this guard is deliberately not there. Rung 2's
+  # remedy is AUTO-CANCEL: widening its population to parked rows would convert an
+  # operator's "not now" into a destruction, on exactly the rows most likely to have
+  # been frozen for a real reason. Rung 1 is the same argument one notch softer — a
+  # parked row is pending BY DESIGN, and pinging it every beat is the false-positive
+  # class already fixed once (DIVE-639/711). Both clauses are correct FOR THE ACTION
+  # EACH RUNG TAKES, which is why the guard belongs here instead: the fact is
+  # knowable at park time from the row itself, so it needs no watchdog at all.
+  #
+  # WARN, NEVER REFUSE. This command cannot know whether the operator means to stop
+  # the beat (DIVE-2694 was parked by a legitimate fleet-wide token freeze), and a
+  # refusal would be a confident claim about intent. Naming the template and the two
+  # levers that actually mean "pause the job" is the whole job here.
+  #
+  # Cost of not having had it: DIVE-2694 (daily character drip) parked 2026-08-07,
+  # 9 days of dropped occurrences, downstream +3 days, and nothing red anywhere.
+  # CLASS: this is the SECOND entry into the DIVE-2237 trap (skip-if-open switches a
+  # template off silently) and strictly worse, because park also mutes the watchdog
+  # that surfaced the first. Fixing an entry path is not fixing the trap.
+  local _tmpl_ident=""
+  local _park_landed; _park_landed=$(db "SELECT CASE WHEN parked_at IS NOT NULL THEN 1 ELSE 0 END FROM tasks WHERE id=${tid};" 2>/dev/null || echo 0)
+  if [[ "$_park_landed" == "1" ]]; then
+    # ident has no spaces, so one row split on the first space keeps this to a
+    # single query. Empty when the row is not a materialized instance.
+    local _tmpl_row=""
+    _tmpl_row=$(db "SELECT p.ident || ' ' || COALESCE(p.schedule,'?')
+                    FROM tasks t JOIN tasks p ON p.id = t.from_template_id
+                    WHERE t.id=${tid};" 2>/dev/null || echo "")
+    if [[ -n "$_tmpl_row" ]]; then
+      _tmpl_ident="${_tmpl_row%% *}"
+      local _tmpl_sched="${_tmpl_row#* }"
+      warn "$tident is a recurring INSTANCE of ${_tmpl_ident} (schedule: ${_tmpl_sched}) — this park STOPS THAT BEAT, it does not delay one row (DIVE-2877). The materializer counts a parked instance as ${_tmpl_ident}'s open slot, so ${_tmpl_ident} will not fire again until this row is unparked or closed, and the occurrences inside the window are DROPPED with no catch-up. The recurring-stall watchdog skips parked rows, so nothing will report it. If you meant to pause the JOB: park the template instead — '5dive task park ${_tmpl_ident} --reason=<why> --wake=<when>' (a blocked template is skipped by the materializer, and unparking it resumes the schedule). If you meant to skip just THIS occurrence: '5dive task cancel $tident --result=\"<why>\"' — a cancel frees the slot, so the next tick fires normally."
+    fi
+  fi
   local wake_note=""; [[ "$wake_sql" != "NULL" ]] && wake_note=" — wakes $(db "SELECT wake_at FROM tasks WHERE id=${tid};") UTC"
   ok "$tident parked (no action needed)${reason:+ — $reason}${wake_note}" \
-     '{task:($t|tonumber), task_ident:$ti, parked:true, reason:$r, wake_at:(($w|select(length>0)) // null)}' \
-     --arg t "$tid" --arg ti "$tident" --arg r "$reason" --arg w "$([[ "$wake_sql" != "NULL" ]] && db "SELECT wake_at FROM tasks WHERE id=${tid};" || echo "")"
+     '{task:($t|tonumber), task_ident:$ti, parked:true, reason:$r, wake_at:(($w|select(length>0)) // null), stops_recurring_template:(($tm|select(length>0)) // null)}' \
+     --arg t "$tid" --arg ti "$tident" --arg r "$reason" --arg w "$([[ "$wake_sql" != "NULL" ]] && db "SELECT wake_at FROM tasks WHERE id=${tid};" || echo "")" \
+     --arg tm "$_tmpl_ident"
 }
 
 # Clear a park -> back to todo (unless real dependency edges still block it).
