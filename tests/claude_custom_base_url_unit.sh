@@ -219,6 +219,204 @@ else
 fi
 rm -rf "$_ap_root"
 
+
+# ============================================================================
+# DIVE-2809 — the same endpoint, one command later.
+#
+# Folded into this file rather than shipped as its own harness because it is the
+# same subject (a claude BYO endpoint that is NOT in the catalog) and the core
+# tier is at its cap: a separate file pays a second bash start and a second
+# source of six libraries to re-reach the state arm 5 already builds. Merging by
+# subject is the budget runner's own first remedy and it drops no assertion.
+#
+# `agent auth set claude --provider=<vendor> --auth-profile=<p>` re-derived
+# ANTHROPIC_BASE_URL from CLAUDE_PROVIDER_BASEURL and wrote the catalog's url
+# over the one --base-url pinned above. The agent did not break afterwards —
+# that is the defect. The value is a real vendor URL, so nothing downstream
+# looks wrong while a self-hosted agent resumes sending its traffic AND ITS KEY
+# to a vendor the operator deliberately moved off.
+#
+# Everything below drives the REAL writer against a REAL EnvironmentFile in a
+# mktemp dir and reads it off disk before and after; only root-owned side
+# effects are stubbed.
+# ============================================================================
+root=$(mktemp -d)
+AUTH_PROFILES_DIR="$root/auth-profiles"
+
+# Root-owned side effects only. profile_set_var itself is the shipped writer.
+step() { :; }
+warn() { :; }
+require_root() { :; }
+chown() { :; }
+chmod() { :; }
+ensure_profile_dir() { local d="$AUTH_PROFILES_DIR/$1"; mkdir -p "$d"; : >>"$d/combined.env"; printf '%s' "$d"; }
+# fail() EXITS in production; a stub that merely returns would let a refused
+# call run on and write the profile anyway. Keep the exit, run refusals in a
+# SUBSHELL.
+fail() { printf 'FAIL[%s] %s\n' "$1" "$2" >&2; exit "$1"; }
+
+CUSTOM_URL="https://weights.example.com/v1"
+ZAI_URL="${CLAUDE_PROVIDER_BASEURL[zai]}"
+
+# Stand up the profile the way `agent create --base-url=<custom> --model=<slug>`
+# leaves it: a custom endpoint plus all three pinned tiers.
+seed_custom_profile() {
+  local p="$1" url="${2:-$CUSTOM_URL}"
+  rm -rf "${AUTH_PROFILES_DIR:?}/$p"
+  ensure_profile_dir "$p" >/dev/null
+  printf '%s' "$url"           | profile_set_var "$p" ANTHROPIC_BASE_URL
+  printf '%s' "sk-selfhost-12" | profile_set_var "$p" ANTHROPIC_AUTH_TOKEN
+  printf '%s' "qwen3.8-max"    | profile_set_var "$p" ANTHROPIC_DEFAULT_OPUS_MODEL
+  printf '%s' "qwen3.8-max"    | profile_set_var "$p" ANTHROPIC_DEFAULT_SONNET_MODEL
+  printf '%s' "qwen3.8-max"    | profile_set_var "$p" ANTHROPIC_DEFAULT_HAIKU_MODEL
+}
+env_of() { printf '%s' "$AUTH_PROFILES_DIR/$1/combined.env"; }
+url_in()  { grep -E '^ANTHROPIC_BASE_URL=' "$(env_of "$1")" | tail -1 | cut -d= -f2-; }
+
+# --- 1. the silent revert is refused, and the file is untouched -------------
+echo "auth set on a custom-endpoint profile: refuse, do not revert"
+seed_custom_profile p1
+before=$(cat "$(env_of p1)")
+before_sum=$(sha256sum < "$(env_of p1)")
+rc=0
+( _apply_byo_claude zai sk-zai-rotate-12 p1 "" "" ) >/dev/null 2>&1 || rc=$?
+if (( rc == E_VALIDATION )); then ok "catalog re-derivation over a custom endpoint is refused (exit $rc)"
+else bad "expected exit $E_VALIDATION, got $rc — the custom endpoint was reverted"; fi
+after_sum=$(sha256sum < "$(env_of p1)")
+if [[ "$before_sum" == "$after_sum" ]]; then ok "EnvironmentFile is byte-identical after the refusal"
+else bad "EnvironmentFile CHANGED across a refusal:"$'\n'"--- before ---"$'\n'"$before"$'\n'"--- after ---"$'\n'"$(cat "$(env_of p1)")"; fi
+# The refusal has to NAME the endpoint it is protecting and the flag that
+# resolves it, or the operator is told "no" with nowhere to go.
+msg=$( ( _apply_byo_claude zai sk-zai-rotate-12 p1 "" "" ) 2>&1 || true )
+for want in "$CUSTOM_URL" "--base-url" "p1"; do
+  case "$msg" in *"$want"*) ok "refusal names: $want" ;;
+                 *) bad "refusal does not name '$want': $msg" ;; esac
+done
+
+# --- 1b. the same thing through the COMMAND an operator actually types ------
+# Arm 1 drives the applier. This drives `agent auth set` itself, because the
+# row's acceptance is about that command and because a guard reachable only
+# from an internal function is a guard the CLI does not have. Everything the
+# refusal path touches before it exits is stubbed above; it never reaches the
+# registry or systemctl.
+echo "cmd_auth_set claude --provider=<vendor> on a custom-endpoint profile"
+seed_custom_profile p6
+before_sum=$(sha256sum < "$(env_of p6)")
+rc=0
+( cmd_auth_set claude --api-key=sk-zai-rotate-12 --provider=zai --auth-profile=p6 ) >/dev/null 2>&1 || rc=$?
+if (( rc == E_VALIDATION )); then ok "the command refuses (exit $rc)"
+else bad "expected exit $E_VALIDATION from cmd_auth_set, got $rc"; fi
+if [[ "$before_sum" == "$(sha256sum < "$(env_of p6)")" ]]; then
+  ok "EnvironmentFile byte-identical after the command refused"
+else
+  bad "cmd_auth_set modified the EnvironmentFile despite refusing"
+fi
+# ...and the same command WITH the flag goes all the way through, so the arm
+# above is attributable to the pin and not to cmd_auth_set being unrunnable here.
+registry_read() { printf '{"agents":{}}'; }
+seed_custom_profile p7
+if ( cmd_auth_set claude --api-key=sk-zai-rotate-12 --provider=zai --auth-profile=p7 \
+       --base-url="$CUSTOM_URL" --model=qwen3.8-max ) >/dev/null 2>&1 \
+   && [[ "$(url_in p7)" == "$CUSTOM_URL" ]]; then
+  ok "positive control: the same command WITH --base-url completes and keeps the endpoint"
+else
+  bad "positive control: cmd_auth_set could not complete even with --base-url (url=$(url_in p7))"
+fi
+
+# --- 2. both doors the refusal offers actually open -------------------------
+echo "the two exits the refusal names"
+# 2a. KEEP: restate the same custom url.
+seed_custom_profile p2
+if ( _apply_byo_claude zai sk-zai-rotate-12 p2 "qwen3.8-max" "$CUSTOM_URL" ) >/dev/null 2>&1; then
+  [[ "$(url_in p2)" == "$CUSTOM_URL" ]] \
+    && ok "--base-url=<same> rotates the key and KEEPS the custom endpoint" \
+    || bad "--base-url=<same> accepted but the url is now $(url_in p2)"
+else
+  bad "--base-url=<same> was refused — the 'keep' exit does not open"
+fi
+# ...and the rotation actually landed, so 2a is not passing on a no-op.
+grep -q '^ANTHROPIC_AUTH_TOKEN=sk-zai-rotate-12$' "$(env_of p2)" \
+  && ok "positive control: the new key reached the profile" \
+  || bad "positive control: the key was NOT written — 2a proves nothing"
+# 2b. MOVE: name the catalog url explicitly.
+seed_custom_profile p3
+if ( _apply_byo_claude zai sk-zai-rotate-12 p3 "" "$ZAI_URL" ) >/dev/null 2>&1; then
+  [[ "$(url_in p3)" == "$ZAI_URL" ]] \
+    && ok "--base-url=<catalog url> MOVES the profile onto the vendor deliberately" \
+    || bad "--base-url=<catalog url> left the url at $(url_in p3)"
+else
+  bad "--base-url=<catalog url> was refused — there is no way back to a vendor"
+fi
+
+# --- 3. a catalog-pinned profile is NOT refused -----------------------------
+# The guard keys on catalog membership, not on difference. Re-pointing a profile
+# from one catalog vendor to another was named by --provider and is not silent,
+# so refusing it would break an ordinary vendor switch.
+echo "a profile already on a catalog url still switches vendors"
+seed_custom_profile p4 "$ZAI_URL"
+if ( _apply_byo_claude openrouter sk-or-rotate-12 p4 "" "" ) >/dev/null 2>&1; then
+  [[ "$(url_in p4)" == "${CLAUDE_PROVIDER_BASEURL[openrouter]}" ]] \
+    && ok "catalog->catalog vendor switch still applies" \
+    || bad "vendor switch left the url at $(url_in p4)"
+else
+  bad "catalog->catalog vendor switch was REFUSED (guard is over-broad)"
+fi
+
+# --- 4. cmd_auth_set parses and forwards the flags --------------------------
+echo "cmd_auth_set: --base-url / --model"
+disp=$(declare -f cmd_auth_set)
+grep -q -- '--base-url=\*)' <<<"$disp" \
+  && ok "cmd_auth_set parses --base-url" || bad "cmd_auth_set does not parse --base-url"
+grep -q -- '--model=\*)' <<<"$disp" \
+  && ok "cmd_auth_set parses --model" || bad "cmd_auth_set does not parse --model"
+grep -q 'apply_byo_provider "$type" "$byo_provider" "$api_key" "$profile" "$byo_model" "$base_url"' <<<"$disp" \
+  && ok "cmd_auth_set forwards both to apply_byo_provider" \
+  || bad "cmd_auth_set does not forward --model/--base-url (the parser would drop them)"
+rc=0; ( cmd_auth_set claude --api-key=sk-test-123456 --base-url="$CUSTOM_URL" ) >/dev/null 2>&1 || rc=$?
+(( rc == E_USAGE )) && ok "--base-url without --provider is refused (exit $rc)" \
+                    || bad "expected $E_USAGE for --base-url with no --provider, got $rc"
+rc=0; ( cmd_auth_set codex --api-key=sk-test-123456 --provider=zai --base-url="$CUSTOM_URL" ) >/dev/null 2>&1 || rc=$?
+(( rc == E_VALIDATION )) && ok "--base-url on a non-claude type is refused (exit $rc)" \
+                         || bad "expected $E_VALIDATION for --base-url on codex, got $rc"
+
+# --- 5. MUTATION: cut the guard, arm 1 must go red --------------------------
+# Cut from the LIVE file, so the mutant tracks the shipped source. Count the
+# anchors BEFORE cutting: a range that matches nothing yields a mutant identical
+# to the original, and this arm would then pass while grading nothing.
+echo "mutation: remove the guard and the refusal must disappear"
+src=src/cmd_agent_create.sh
+mutant="$root/mutant_cmd_agent_create.sh"
+n_begin=$(grep -c '^  # DIVE-2809 GUARD BEGIN' "$src" || true)
+n_end=$(grep -c '^  # DIVE-2809 GUARD END' "$src" || true)
+if [[ "$n_begin" == "1" && "$n_end" == "1" ]]; then
+  ok "mutation anchors are present exactly once each (BEGIN=$n_begin END=$n_end)"
+else
+  bad "mutation anchors are not 1/1 (BEGIN=$n_begin END=$n_end) — the cut below would be a no-op"
+fi
+sed '/^  # DIVE-2809 GUARD BEGIN/,/^  # DIVE-2809 GUARD END/d' "$src" >"$mutant"
+cut_lines=$(( $(wc -l <"$src") - $(wc -l <"$mutant") ))
+if (( cut_lines > 0 )); then ok "the cut removed $cut_lines lines"
+else bad "the cut removed NOTHING — the mutant is the original"; fi
+if grep -q 'is pinned to a custom endpoint' "$mutant"; then
+  bad "the guard's refusal survived the cut — the mutant still carries it"
+else
+  ok "the mutant no longer carries the guard's refusal"
+fi
+
+seed_custom_profile p5
+rc=0
+(
+  # shellcheck disable=SC1090
+  source "$mutant"
+  _apply_byo_claude zai sk-zai-rotate-12 p5 "" ""
+) >/dev/null 2>&1 || rc=$?
+if (( rc == 0 )) && [[ "$(url_in p5)" == "$ZAI_URL" ]]; then
+  ok "without the guard the custom endpoint IS silently reverted to $ZAI_URL — arm 1 is attributable"
+else
+  bad "the mutant did not reproduce the bug (rc=$rc url=$(url_in p5)) — arm 1 proves nothing"
+fi
+rm -rf "$root"
+
 echo
 if (( fails )); then echo "$fails failed"; exit 1; fi
 echo "all assertions passed"

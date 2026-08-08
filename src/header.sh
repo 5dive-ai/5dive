@@ -974,6 +974,38 @@ declare -A CLAUDE_PROVIDER_HAIKU_MODEL=(
   [zai]="glm-4.5-air"
 )
 
+# claude_baseurl_catalog_provider <url> — reverse the CLAUDE_PROVIDER_BASEURL
+# catalog: echo the canonical vendor id that serves <url>, or nothing when no
+# row does. Empty output is the load-bearing answer: it means the url came from
+# somewhere other than this table — i.e. an operator's --base-url (DIVE-2757) —
+# which is the one value a re-derivation from the catalog must not silently
+# overwrite (DIVE-2809). Exit status is not the signal; read stdout.
+claude_baseurl_catalog_provider() {
+  local url="$1" cand
+  [[ -n "$url" ]] || return 0
+  for cand in "${!CLAUDE_PROVIDER_BASEURL[@]}"; do
+    if [[ "${CLAUDE_PROVIDER_BASEURL[$cand]}" == "$url" ]]; then
+      echo "$cand"; return 0
+    fi
+  done
+  return 0
+}
+
+# profile_env_value <profile> <VAR> — read one KEY=VALUE out of an auth
+# profile's combined.env without creating anything (the writer's counterpart is
+# profile_set_var in cmd_auth.sh, which is root-only and DOES create). Empty
+# output for an absent file, an absent profile or an unset var — a caller that
+# needs to tell those apart must check the file itself. Lives in header.sh
+# rather than next to the writer because the create path reads it in contexts
+# that do not source cmd_auth.sh.
+profile_env_value() {
+  local profile="$1" var="$2" file="${AUTH_PROFILES_DIR}/${1}/combined.env" v
+  [[ -n "$profile" && -r "$file" ]] || return 0
+  v=$(grep -E "^${var}=" "$file" 2>/dev/null | tail -1 | cut -d= -f2-) || v=""
+  v="${v%\"}"; v="${v#\"}"
+  printf '%s' "$v"
+}
+
 # Resolve a canonical UI id to the agent CLI's native provider id. Empty
 # result means the type doesn't support that vendor and the caller should
 # fail with a clear error.
