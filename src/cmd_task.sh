@@ -798,15 +798,62 @@ _task_resolve_deputy() {
 # coordinator, manager, root, deputy), so a leader was structurally guaranteed to
 # win; a chart that names a QA agent has already answered who should grade, and
 # nobody had asked it.
+#
+# DIVE-2912: the UNIQUENESS rule above is defensible; its SILENCE was not, and
+# the silence is what shipped a live routing change. Seating main2 with
+# "verifier" in its TITLE made the count 2, so this function returned empty and
+# the chain fell through to the next rung — which did not make main2 a candidate
+# (main2 is nowhere in a dev-assigned row's chain), it made QUINN, the dedicated
+# QA agent, stop being one. An unrelated agent's job title silently removed the
+# QA rail from the picker for every row on the board, and nothing said so.
+# Three changes, each aimed at that:
+#   1. A DECLARED role outranks a descriptive title. Pass 1 scans `role` only;
+#      only if that names nobody do we widen to role||title (pass 2), which is
+#      what keeps an org whose QA agent is marked in the title alone working.
+#      A clone's self-description can no longer outvote `role='QA / testing'`.
+#   2. FIVE_VERIFY_EXCLUDE is honoured HERE too, not just in the chain below.
+#      Excluding a name there used to leave it still counting toward the
+#      ambiguity that suppressed the pick — the documented data lever could not
+#      resolve the one thing it is shaped to resolve. Now it can.
+#   3. A decline is LOUD. Genuine ambiguity warns and NAMES every match; the
+#      rung is skipped either way, but the caller can now see that the QA rail
+#      was skipped and why. Silence is kept for the one case that is not an
+#      event: no QA agent matches at all, the ordinary shape for an org that
+#      never named one, where warning would fire on every `task add`.
+# Prints the grader name, or nothing.
 _task_resolve_qa() {
-  local _skip="$1"
-  local _pred="( lower(' '||COALESCE(role,'')||' '||COALESCE(title,'')) LIKE '% qa%'
-                 OR lower(' '||COALESCE(role,'')||' '||COALESCE(title,'')) LIKE '% test%'
-                 OR lower(' '||COALESCE(role,'')||' '||COALESCE(title,'')) LIKE '% verif%'
-                 OR lower(' '||COALESCE(role,'')||' '||COALESCE(title,'')) LIKE '% quality%' )
-               AND name <> $(sqlq "$_skip")"
-  [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE ${_pred};")" == "1" ]] || return
-  db "SELECT name FROM agents_org WHERE ${_pred} LIMIT 1;"
+  local _skip="$1" _pass _label _pred _n
+  local -a _cands=()
+  for _pass in role any; do
+    if [[ "$_pass" == role ]]; then
+      _pred="$(_task_qa_kw_clause "COALESCE(role,'')")"; _label='declared role'
+    else
+      _pred="$(_task_qa_kw_clause "COALESCE(role,'')||' '||COALESCE(title,'')")"; _label='role or title'
+    fi
+    _cands=()
+    while IFS= read -r _n; do
+      [[ -n "$_n" ]] || continue
+      _task_verify_excluded "$_n" && continue
+      _cands+=("$_n")
+    done < <(db "SELECT name FROM agents_org WHERE ${_pred} AND name <> $(sqlq "$_skip") ORDER BY name;")
+    case "${#_cands[@]}" in
+      1) printf '%s' "${_cands[0]}"; return 0 ;;
+      0) continue ;;   # nobody at this precision — widen, or fall out silently
+      *) warn "verifier auto-pick: the QA rung was SKIPPED — ${#_cands[@]} agents match the QA scan by ${_label} (${_cands[*]}), so it cannot name one. The verifier falls through to the next rung (project lead, then up the chart). Disambiguate with FIVE_VERIFY_EXCLUDE=<name>, a narrower role/title, or set the verifier explicitly."
+         return 1 ;;
+    esac
+  done
+  return 1
+}
+
+# The QA keyword scan, over whichever SQL expression the caller passes, so the
+# role-only and role||title passes cannot drift apart. Leading-space-anchored
+# (so "QA" matches but "kanban" does not), same convention as
+# _task_resolve_deputy.
+_task_qa_kw_clause() {
+  local _e="lower(' '||$1)"
+  printf "( %s LIKE '%% qa%%' OR %s LIKE '%% test%%' OR %s LIKE '%% verif%%' OR %s LIKE '%% quality%%' )" \
+    "$_e" "$_e" "$_e" "$_e"
 }
 
 # DIVE-2719: a NAMED EXCLUSION LIST, so the next such ruling is data rather than
