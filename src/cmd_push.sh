@@ -366,8 +366,14 @@ cmd_push() {
     local body; body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
     branch=$(_push_branch_from_body "$body")
   fi
+  # DIVE-2801: name BOTH requirements. `--branch` satisfies this usage check but
+  # NOT the DIVE-1462 gate binding in _push_do, which reads the branch fresh from
+  # the task body — so offering `--branch` alone as an alternative sends the
+  # caller down a path whose only outcome is the next refusal. Same defect as the
+  # dry-run this row is named for: an early check answering on behalf of a later
+  # one it does not share a predicate with.
   [[ -n "$branch" ]] || fail "$E_USAGE" \
-    "no branch for ${ident}: pass --branch=<name> or add a 'Branch: <name>' line to the task body (push refuses to guess)."
+    "no branch for ${ident}: add a 'Branch: <name>' line to the task body (push refuses to guess). The task body is REQUIRED — the cleared gate binds to the branch the task itself declares (DIVE-1462), so --branch=<name> alone gets past this check and is then refused by that binding; pass it as well only to override which branch is read."
   case "$branch" in
     main|master|HEAD) fail "$E_VALIDATION" "refusing to push to protected branch '${branch}' — delegated push targets feature branches only." ;;
   esac

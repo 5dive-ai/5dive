@@ -11301,7 +11301,36 @@ cmd_task_answer() {
       # No audit_log here: the blocked caller is an agent user that can't write
       # the root-owned audit log anyway (it would only leak a perms error to
       # stderr). The fail + non-zero exit is the record.
-      fail "$E_AUTH_REQUIRED" "$ident is a '$nt' gate — only a human can clear it. Answer it from Telegram (tap the button) or the dashboard; an agent can't self-answer an approval/secret/manual gate."
+      # DIVE-2801: state the CALLER's standing, not a law about the gate type.
+      # "an agent can't self-answer an approval gate" is false — the gate's
+      # lead-clear seat reaches here with _lead_clear=1 and clears it with no
+      # human at all (see the branch above; DIVE-2599/2665/2654 are live
+      # instances). Human-only is the FALL-THROUGH for a caller without that
+      # standing, not the rule for the type. The old wording was read as a
+      # general rule by the agent it refused, who then rebuilt the gate around
+      # it — a refusal that describes the wrong subject sends the reader to fix
+      # the wrong thing, and unlike a wrong answer nobody audits a reason.
+      # ...and the same discipline applies to the REMEDY, one clause later. An
+      # unrouted gate has no lead-clear seat, so "its lead-clear seat can answer
+      # this with no human involved" is, on that gate, the identical defect in
+      # the opposite direction: a sentence true of the type and false of the row
+      # in front of the reader. Only the routed branch may claim a seat exists.
+      # ...and the same discipline again on TIER, which is the third way this
+      # sentence can be true of the type and false of the row. The tier-2 floor
+      # at `gtier == 2 && ! human` sits BELOW this refusal, so the routed
+      # reviewer never reaches it from here — but they hit it on their own
+      # answer, and it ESCALATES them to a human rather than letting them clear.
+      # Telling a tier-2 caller "your routed reviewer can answer this with no
+      # human involved" would therefore recommend a remedy this code refuses,
+      # which is the very defect this row exists to fix, committed inside its
+      # own fix. Only a sub-tier-2 routed gate may claim a seat that can finish.
+      local _who_can="a human — this gate has no routed reviewer, so no seat holds lead-clear standing on it"
+      if [[ -n "$_routed_rev" && "$gtier" == "2" ]]; then
+        _who_can="a human: this gate is routed to '${_routed_rev}', but it is TIER 2, and the tier-2 floor escalates even the routed reviewer's answer to a human tap rather than clearing it"
+      elif [[ -n "$_routed_rev" ]]; then
+        _who_can="'${_routed_rev}', this gate's routed reviewer, who holds lead-clear standing and can answer it with no human involved — or by a human"
+      fi
+      fail "$E_AUTH_REQUIRED" "$ident is a '$nt' gate and you ('${_caller}') do not hold lead-clear standing on it, so your answer is refused. This is about YOUR standing on THIS gate, not a law about '$nt' gates. It can be cleared by ${_who_can}. A human answers from Telegram (tap the button) or the dashboard."
     fi
     # DIVE-2054: routed_reviewer is task-store state for $ident — fenced.
     # DIVE-2099: `standing=` distinguishes the two clearances that reach here.
