@@ -85,7 +85,7 @@ _hb_agent_idle()      { return 0; }  # confident idle by default
 mk_delivered_unacked() {
   local id
   id=$(addt --assignee=dev --verifier=olivia -- "ship the widget")
-  ( cmd_task_done "$id" ) >/dev/null 2>&1
+  ( cmd_task_done "$id" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
   _hb_claim_task olivia "$id" >/dev/null 2>&1
   printf '%s' "$id"
 }

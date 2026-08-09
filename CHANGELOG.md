@@ -1,5 +1,127 @@
 # Changelog
 
+## v0.19.0 — feat(pii): the pre-push guard reaches the fleet, not one repo (DIVE-2788)
+
+`scripts/install-pii-push-guard.sh` said **"fleet-wide"** in its own docstring and
+refused every origin but `5dive-ai/5dive`. Not an oversight — the install mechanism
+could not express anything else. It set `core.hooksPath=scripts/git-hooks`, a
+**relative** path, which is exactly right in this repo (the hook is versioned with
+the branch it gates) and unimplementable anywhere else, because no other repo
+carries the hook, the scanner or the denylist.
+
+Measured on this host with the tool this change adds: **23 distinct remotes, 1
+guarded.** Four rows of PII program (DIVE-1774, DIVE-1797, DIVE-2267, DIVE-2268)
+were each scoped to that one repo, so *"the class is closed going forward"* — written
+into the DIVE-1997 decision of record — was true for `5dive-ai/5dive` and false for
+the fleet. The id reached current `main` of two PUBLIC repos and rendered as an
+`<input placeholder>` in the customer dashboard's Telegram modal.
+
+**A skip indistinguishable from a success is a silent scope.** The old `exit 0` was
+the right call for blind provisioning and the reason nothing noticed.
+
+New **portable mode**: for any non-`5dive-ai/5dive` origin the installer
+materialises a guard home (`/usr/local/share/5dive/pii-guard` by default) holding a
+PII-only hook plus verbatim copies of `scripts/pii-scan.sh` and
+`.github/pii-denylist.txt`, and points `core.hooksPath` at it absolutely. In-repo
+mode is unchanged for this repo, which keeps its version-bump, harness-tree and
+actionlint guards. The origin match is now anchored on the repo name — the old
+`*5dive-ai/5dive*` glob also matched `5dive-plugins` and `5dive-mcp` and would have
+pointed a relative hooksPath at a directory that does not exist there.
+
+**The denylist is read from a host path, not shipped into each repo, and the reason
+is drift, not secrecy.** It is sha256-only and already public. N in-repo copies are N
+things to update when an identifier is added, and a denylist current in one repo and
+stale in 21 is a guard that reports itself installed while grading against a
+population that no longer matches — the same failure again. Stated cost: an absolute
+hooksPath is not versioned with the branch and does not travel with a fresh clone.
+
+New `scripts/pii-guard-fleet.sh` enumerates, installs and optionally scans — and
+**prints a population, not a verdict**: roots walked, checkouts found (`find -name
+.git` at any depth; `ls -d */` had missed 12 nested and one hidden, including a live
+push remote under `marketing/.work`), how they fold into clones and remotes, and per
+row where the answer came from. An install that did not take says **why**
+(`none:EPERM(owner=…)`) and retries as the owning uid — failure and never-attempted
+otherwise print identically. Unreadable is `UNKNOWN`, never counted clean; unknown
+visibility is `UNKNOWN`, never "private".
+
+Three git facts this cost, each of which broke the fix before it worked, all in
+`tests/pii_guard_fleet_unit.sh` (27 arms, 1.2s):
+
+- **`git rev-parse --git-path hooks/pre-push` HONOURS `core.hooksPath`.** A portable
+  hook resolving "the repo's own hook, so I can chain to it" that way gets *itself*.
+  Unbounded recursion on every push; found by the harness on its first run, and
+  invisible to review because that expression is the obvious one and reads correctly.
+- **`core.hooksPath` REPLACES `$GIT_DIR/hooks`, it does not add to it.**
+  `lodar/5dive-frontend` has a `$GIT_DIR/hooks/pre-push` (the DIVE-2203 reminder), so
+  a naive install would have deleted a live control while reporting a guard installed.
+  The portable hook chains, and replays the ref-update list on the chained hook's
+  stdin — a chained hook handed an empty stdin scans nothing and exits 0.
+- **A pre-existing foreign `core.hooksPath` is refused, not clobbered.** It is
+  single-valued, so "install" would silently mean "delete theirs".
+
+Demonstrated end to end against the real remote: a throwaway commit carrying a
+denylisted value was **refused on push to `5dive-ai/5dive-plugins`** (PUBLIC) and the
+branch does not exist on the remote. Fleet coverage on this host went **1 → 22 of
+23**; the remaining one is a worktree owned by a uid this session cannot assume, and
+its origin is a local path whose target is guarded.
+
+## v0.19.0 — fix(tasks-db): converge schemas without taxing every init (DIVE-2197, DIVE-2808)
+
+The canonical `tasks` CREATE now contains all 72 columns, including the eight that
+previously existed only in the additive migration list (`delivery_ref`,
+`delivered_at`, `delivery_ref_iteration`, `parked_at`, `park_reason`,
+`escalated_at`, `escalated_by`, and `human_evidence`). `tasks_db_init` checks the
+current column set once and skips the full migration when it is already complete.
+The gate uses pure Bash matching and derives its task-column requirements from the
+exact array the migration loop consumes, so it cannot become a third drifting
+column list.
+
+A **whole-schema epoch** covers the migrations that live outside `tasks`, which a
+tasks-column gate cannot see. It is a receipt that the curated migration generation
+named by `_TASKS_SCHEMA_EPOCH` has run to completion on this store — deliberately
+**not** a claim that the store matches the canonical schema item for item. A fresh
+store is stamped on the init path that just built the whole schema from nothing;
+an older store earns the stamp after the full migration runs. A tasks-current store
+with a stale `gate_history` therefore cannot skip the repair.
+
+Two things the epoch had to learn, both of which reddened unrelated harnesses first:
+
+- **The stamp does not live inside the canonical DDL.** Every statement that block
+  emits is `CREATE … IF NOT EXISTS`, so replaying it over an existing store is a
+  no-op — a contract the migration driver and four other harnesses rely on, and a
+  bare `INSERT` is the one statement that breaks it.
+- **The gate requires the migration's seeded rows, not only the right shape.** The
+  migration *seeds* as well as reshapes; skipping it dropped self-heals that no schema
+  comparison can miss, because the store is shape-perfect and semantically wrong. Both
+  seeded prefs are covered — `ledger_started` (INST-4), which `trace` reads as a ledger
+  predating everything when absent, and `gate_history_coverage` (DIVE-2133), the
+  evidence boundary that lets a zero-row archive mean "no gates were displaced" rather
+  than "unknown". The first cut covered only the former and reddened
+  `tests/gate_history_unit.sh` in the nightly sweep. The gate's seed list is therefore
+  **derived from the migration's own source** and compared in both directions, the same
+  anti-drift rule the column list already follows.
+
+The epoch does **not** assert the canonical surface item for item. The curated
+migration was never a convergence engine and `CREATE TABLE IF NOT EXISTS` cannot
+widen an existing table, so that property holds on no code path — asserting it turned
+a slow init into a hard `fail` on every `5dive task` invocation against a
+legacy-shaped store. `tests/schema_sync_unit.sh` keeps the two copies of those
+`CREATE TABLE` statements from drifting; converging a genuinely short store needs
+per-table ALTERs and its own row.
+
+DIVE-2197's loud resulting-set assertion remains on both the migrate and skip
+paths. The isolated restore harness proves all 72 columns exist on a fresh
+`STATE_DIR`, injects a failed `delivery_ref` ALTER, forces a lying skip-gate over
+the same one-column hole, appends a test-only column to the migration array to show
+that the gate and ALTER path follow it, removes a non-`tasks` migration column from
+a pre-epoch fixture to prove the full migration repairs it, replays the canonical
+schema twice to hold the no-op contract, drives a legacy-shaped store through init
+to prove it completes and then settles, and deletes the ledger marker to prove it
+self-heals. On this 4-core control-plane host, 20 **interleaved** isolated fresh-init
+medians were 125 ms for the pinned pre-DIVE-2197 base (`1bde9dc`) and 127 ms here:
+**+2 ms**, inside the 30 ms acceptance envelope. The full migration had measured
+517 ms.
+
 ## v0.19.0 — fix(heartbeat): surface a recurring instance that was never started (DIVE-2693)
 
 The stall sweep keys on `handoff_delivered_at`. A materialized recurring instance

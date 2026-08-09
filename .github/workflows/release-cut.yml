@@ -447,7 +447,17 @@ jobs:
           # so stamp-changelog.sh sees the folded headings same as a manually-typed
           # one. Not fatal for the same reason the stamp isn't: a cut must not die
           # because a fragment drifted from the expected format.
-          if _folded=$(bash scripts/fold-changelog-fragments.sh 2>&1); then
+          #
+          # DIVE-2702: PASS THE ALREADY-CONSUMED BASELINE. The fold deletes fragments
+          # in this detached tree only — main keeps them (DIVE-2247: no push to a
+          # protected branch) — so without this the NEXT cut re-folds every fragment
+          # ever written and each release's notes repeat all previous releases'.
+          # "${incumbent}^" is main's tip as of the last cut, and it is the SAME
+          # incumbent this job already derived and asserted above, so this is not a
+          # third copy of the tag-resolution rule. Empty incumbent (first cut ever) is
+          # passed through as set-but-empty on purpose: it means "nothing has shipped
+          # yet, fold everything", which is different from the unset auto-detect case.
+          if _folded=$(FOLD_RELEASED_BASELINE="${incumbent:+${incumbent}^}" bash scripts/fold-changelog-fragments.sh 2>&1); then
             echo "changelog.d fragments folded for ${tag}: ${_folded} (DIVE-2582)"
           else
             echo "::warning::changelog.d fragments could not be folded for ${tag} (${_folded}) — publishing anyway"
@@ -469,6 +479,19 @@ jobs:
           else
             echo "::warning::CHANGELOG could not be stamped for ${tag} (${_stamped}) — publishing anyway; the release BODY is derived from the git range and is unaffected."
           fi
+          # DIVE-2603: build.sh stamps HEAD only when the tracked source tree is
+          # clean. Commit every tag-time source edit BEFORE building so the stamp
+          # names the exact bytes being concatenated. The bundle rides in a second
+          # release commit below; therefore its stamped source commit is the tagged
+          # commit's parent and ancestry remains directly checkable.
+          git add -f src/header.sh
+          if [ -f CHANGELOG.md ]; then git add -f CHANGELOG.md; fi
+          if [ -d changelog.d ]; then git add -A -f changelog.d; fi
+          git -c user.name=lodar -c user.email=markounik@gmail.com \
+              commit -q -m "release ${tag}: assign ${version} before bundle build (DIVE-2247, DIVE-2603)"
+          source_sha=$(git rev-parse HEAD)
+          [ -z "$(git status --porcelain --untracked-files=no)" ] \
+            || { echo "::error::tracked release source is dirty after commit ${source_sha} — refusing to stamp a false build identity"; exit 1; }
           ./build.sh || { echo "::error::build.sh failed — refusing to cut ${tag} with no bundle"; exit 1; }
           [ -s 5dive ] && [ -s 5dive.sha256 ] \
             || { echo "::error::build.sh produced no bundle/checksum — refusing to cut ${tag}"; exit 1; }
@@ -481,18 +504,12 @@ jobs:
           _bundle_ver=$(grep -m1 -oP "(?<=^readonly FIVE_VERSION=\")[^\"]+" 5dive)
           [ "v${_bundle_ver}" = "$tag" ] \
             || { echo "::error::built bundle says FIVE_VERSION=${_bundle_ver} but this cut is ${tag} — refusing to publish a bundle that disagrees with its own tag"; exit 1; }
-          git add -f 5dive 5dive.sha256 src/header.sh
-          # DIVE-2452: the stamped CHANGELOG rides in the release commit. Guarded
-          # rather than appended to the line above: `git add` fails the whole step on
-          # a pathspec that matches nothing, and the stamp is explicitly non-fatal —
-          # a cut must not die because a repo has no CHANGELOG.md.
-          if [ -f CHANGELOG.md ]; then git add -f CHANGELOG.md; fi
-          # DIVE-2582: the fold step above deletes any folded changelog.d/
-          # fragments from the working tree — stage that removal too, same guard
-          # shape (dir may legitimately not exist).
-          if [ -d changelog.d ]; then git add -A -f changelog.d; fi
+          _bundle_build_sha=$(grep -m1 -oP '(?<=^readonly FIVE_BUILD_SHA=")[^"]+' 5dive)
+          [ "$_bundle_build_sha" = "$source_sha" ] \
+            || { echo "::error::built bundle says FIVE_BUILD_SHA=${_bundle_build_sha:-missing} but its committed source is ${source_sha} — refusing to publish a false identity"; exit 1; }
+          git add -f 5dive 5dive.sha256
           git -c user.name=lodar -c user.email=markounik@gmail.com \
-              commit -q -m "release ${tag}: assign ${version} + built bundle (DIVE-2091 bundle-at-tag-time, DIVE-2247 version-at-tag-time)"
+              commit -q -m "release ${tag}: bundle built from ${source_sha} (DIVE-2091, DIVE-2603)"
           # DIVE-2433: `sha` is about to stop meaning "the commit whose check-runs we
           # read". Keep the graded one under its own name so the tag can say which
           # object each claim is about instead of silently attributing the parent's
@@ -505,7 +522,7 @@ jobs:
             || { echo "::error::release commit ${sha} does not carry the bundle — refusing to cut ${tag}"; exit 1; }
           [ "$(git show "${sha}:5dive" | sha256sum | cut -d" " -f1)" = "$_want" ] \
             || { echo "::error::bundle in the release commit differs from the one just built — refusing to cut ${tag}"; exit 1; }
-          echo "release commit ${sha} carries bundle ${_want} (FIVE_VERSION=${_bundle_ver})"
+          echo "release commit ${sha} carries bundle ${_want} (FIVE_VERSION=${_bundle_ver}, FIVE_BUILD_SHA=${_bundle_build_sha})"
           # <<< DIVE-2091 release-commit block
 
           # ── DIVE-2433: GRADE THE RELEASE COMMIT ──────────────────────────────
@@ -602,12 +619,19 @@ jobs:
           # The tag is NOT deleted on failure. A published tag that cannot be served is
           # a state a human must see; auto-removing it would hide the one occurrence
           # that proves the window is real.
-          # PROBE THE MANDATORY OBJECT, NOT THE OPTIONAL ONE (dev, review of #313).
-          # install.sh:264 `curl "$REPO/5dive" || die` is FATAL. install.sh:273
-          # `curl "$REPO/5dive.sha256" || _want=""` is fail-SOFT BY DESIGN — DIVE-1271
-          # made an absent checksum warn rather than brick a box. The first cut of this
-          # probe fetched the .sha256, so it proved the object install.sh treats as
-          # OPTIONAL was servable and said nothing about the one it dies on.
+          # PROBE EVERY OBJECT install.sh CAN DIE ON — and that set GREW (DIVE-2248).
+          # The first cut of this probe fetched only the .sha256 and said nothing about
+          # the bundle, so dev's review of #313 correctly reversed it to probe the
+          # bundle. That reasoning carried a premise which is no longer safe to leave
+          # standing: that `curl "$REPO/5dive.sha256" || _want=""` is fail-SOFT, so an
+          # unservable checksum could not brick a box. DIVE-2248 makes a missing NETWORK
+          # checksum FATAL in install.sh, which promotes the .sha256 from optional to
+          # mandatory and re-scopes this probe with it.
+          #
+          # So BOTH are probed with the same retry budget now. A probe whose coverage was
+          # derived from a policy does not update itself when the policy does, and the
+          # failure is silent in the safe-looking direction: the cut goes green and the
+          # box dies. Anyone tightening install.sh's fetch path must re-read THIS block.
           #
           # And they are two INDEPENDENT CDN objects with independent cache generations —
           # DIVE-1977 exists because they disagreed. Proving one servable is not evidence
@@ -639,12 +663,26 @@ jobs:
           # Also confirm the two objects AGREE at this one immutable sha — DIVE-1977's own
           # prescription. install.sh reads both, and a stale .sha256 against a fresh bundle
           # is the disagreement that row was filed for.
-          _servedsha="$(curl -fsSL --max-time 10 "${_base}/5dive.sha256" 2>/dev/null | tr -d '[:space:]')" || _servedsha=""
-          if [ -n "$_servedsha" ] && [ "$_servedsha" != "$_want" ]; then
+          # DIVE-2248: same 6-try budget as the bundle above, and an EMPTY result is now
+          # a failure rather than a skip. Previously a single 10s try with `|| _servedsha=""`
+          # meant an unservable checksum satisfied this step by being absent — the exact
+          # not-reached-reads-as-passed shape, guarding the object install.sh now dies on.
+          _servedsha=""
+          for _try in 1 2 3 4 5 6; do
+            _servedsha="$(curl -fsSL --max-time 60 "${_base}/5dive.sha256" 2>/dev/null | tr -d '[:space:]')" || _servedsha=""
+            [ -n "$_servedsha" ] && break
+            echo "  attempt ${_try}/6: ${tag} checksum not yet servable at ${sha:0:12} — waiting for propagation"
+            sleep 10
+          done
+          if [ -z "$_servedsha" ]; then
+            echo "::error::${tag} IS PUBLISHED BUT ITS 5dive.sha256 IS NOT SERVABLE. raw.githubusercontent returned nothing for ${_base}/5dive.sha256 after 6 tries. Since DIVE-2248 install.sh REFUSES a network bundle whose checksum it cannot fetch, so every new install and every unattended self-update fails until this resolves. The tag was deliberately NOT deleted — a human needs to see this."
+            exit 1
+          fi
+          if [ "$_servedsha" != "$_want" ]; then
             echo "::error::${tag}: the served 5dive.sha256 (${_servedsha}) disagrees with the bundle this cut verified (${_want}) at ${sha:0:12}. The two CDN objects are out of step (DIVE-1977)."
             exit 1
           fi
-          echo "${tag}: bundle verified SERVABLE and byte-correct at ${sha:0:12} (${_got:0:16}…) — install.sh's FATAL fetch path is proven, not assumed"
+          echo "${tag}: bundle AND checksum verified SERVABLE and byte-correct at ${sha:0:12} (${_got:0:16}…) — both of install.sh's fatal fetch paths are proven, not assumed"
 
           # >>> DIVE-2452 release-notes block
           #     (extracted verbatim by tests/release_notes_unit.sh — keep the fences.)

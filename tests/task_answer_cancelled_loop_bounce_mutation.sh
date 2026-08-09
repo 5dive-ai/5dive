@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TIER: core
+# TIER: nightly — 4.9s measured on ubuntu-latest by the core/installed-host runner itself (run 31292045115, 2026-08-09; the tier report's own top-10 line). Demoted under the mutation-harness rule (DIVE-2867): same class as gate_evidence_form_mutation.sh — a copied source tree per mutant, cost fixed by construction. Three of six *_mutation.sh files were already nightly before this change.
 # DIVE-2261 connectivity grade: delete the cancelled-status refusal from a
 # copied source tree and require the named C1 arm to turn red.
 # Run: bash tests/task_answer_cancelled_loop_bounce_mutation.sh

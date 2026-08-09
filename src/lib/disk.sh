@@ -43,6 +43,16 @@ disk_gb()       { awk -v kb="${1:-0}" 'BEGIN{printf "%.1f", kb/1048576}'; }
 wt_task_num() {
   local n="${1##*-}"
   [[ "$n" =~ ^[0-9]+$ ]] && printf '%s' "$n"
+  # DIVE-2751: same shape, latent rather than live. Both call sites are plain
+  # assignments (`local num; num=$(wt_task_num "$x")`), so a non-numeric ident
+  # killed the caller under `set -e` — and cmd_task.sh:199's `[[ -n "$num" ]] ||
+  # return 0` is proof the empty case was MEANT to be handled: that guard could
+  # never run. Report "no number" as empty output, not as failure.
+  # Checked before changing it, because the other call site feeds `wt_candidates`
+  # and this is a worktree-RECLAIM path with ~500 worktrees on the box:
+  # wt_candidates opens with `[[ "$num" =~ ^[0-9]+$ ]] || return 0`, so an empty
+  # value selects NOTHING. It fails closed, and the empty case stays safe.
+  return 0
 }
 
 # wt_candidates <num> — worktree dirs belonging to task <num>, one per line.

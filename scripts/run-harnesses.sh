@@ -54,6 +54,9 @@ CONFIRM_TOP=3
 # DIVE-2728 calibration. CALIBRATE=1 means MEASURE this runner before spending the
 # budget on it; the flags below are seams, not policy, and each carries its own note.
 CALIBRATE=1; CAL_US_IN=""; CAL_BASELINE_US=""; CAL_CLI="./5dive"
+# DIVE-2736. CAL_POST=1 means take a SECOND probe after the corpus. It is a
+# discriminator, not an input to the verdict — see the block after the run loop.
+CAL_POST=1; CAL_POST_US_IN=""
 for a in "$@"; do case "$a" in
   --tier=*)   TIER="${a#--tier=}" ;;
   # The seam that lets tests/corpus_tier_budget_unit.sh grade THIS script against a
@@ -108,19 +111,25 @@ for a in "$@"; do case "$a" in
   # that is what the corpus pays; pointing this at a path that does not exist is how
   # the harness grades the fail-closed arm.
   --cal-cli=*) CAL_CLI="${a#--cal-cli=}" ;;
+  # DIVE-2736 seams. The post-corpus probe costs another ~20s of job time and grades
+  # NOTHING, so --no-cal-post exists for anyone who wants the old cost; it cannot move a
+  # verdict in either direction, which is the whole point of it. --cal-post-us= injects
+  # the second reading for the same reason --cal-us= injects the first.
+  --no-cal-post) CAL_POST=0 ;;
+  --cal-post-us=*) CAL_POST_US_IN="${a#--cal-post-us=}" ;;
   --top=*)    TOP="${a#--top=}" ;;
   *) printf 'unknown arg: %s\n' "$a" >&2; exit 2 ;;
 esac; done
 
 case "$TIER" in
   core|full) ;;
-  *) printf 'usage: run-harnesses.sh --tier=core|full [--budget=<seconds>] [--label=<env>] [--report=<file>] [--corpus-dir=<dir>] [--confirm-top=<n>] [--no-calibrate] [--cal-us=<us/iter>] [--cal-baseline-us=<us/iter>] [--cal-cli=<path>]\n' >&2; exit 2 ;;
+  *) printf 'usage: run-harnesses.sh --tier=core|full [--budget=<seconds>] [--label=<env>] [--report=<file>] [--corpus-dir=<dir>] [--confirm-top=<n>] [--no-calibrate] [--cal-us=<us/iter>] [--cal-baseline-us=<us/iter>] [--cal-cli=<path>] [--no-cal-post] [--cal-post-us=<us/iter>]\n' >&2; exit 2 ;;
 esac
 [[ "$CONFIRM_TOP" =~ ^[0-9]+$ ]] || { printf 'run-harnesses: --confirm-top must be a non-negative integer, got %s\n' "$CONFIRM_TOP" >&2; exit 2; }
 [[ -n "$BUDGET" ]] || BUDGET="$(tier_budget "$TIER")" || exit 2
 [[ -n "$LABEL" ]] || LABEL="local"
 [[ -n "$CAL_BASELINE_US" ]] || CAL_BASELINE_US="$TIER_CAL_BASELINE_US"
-for _v in CAL_US_IN:"$CAL_US_IN" CAL_BASELINE_US:"$CAL_BASELINE_US"; do
+for _v in CAL_US_IN:"$CAL_US_IN" CAL_BASELINE_US:"$CAL_BASELINE_US" CAL_POST_US_IN:"$CAL_POST_US_IN"; do
   [[ -z "${_v#*:}" || "${_v#*:}" =~ ^[0-9]+$ ]] || {
     printf 'run-harnesses: --%s must be a non-negative integer of microseconds, got %s\n' \
       "$(tr 'A-Z_' 'a-z-' <<<"${_v%%:*}")" "${_v#*:}" >&2; exit 2; }
@@ -194,6 +203,7 @@ cal_probe() { # <iters> -> elapsed ms on stdout; non-zero if the probe could not
 }
 
 CAL_STATUS="skipped"; CAL_US=0; CAL_ITERS=0; CAL_WHY=""
+CAL_POST_STATUS="skipped"; CAL_POST_US=0; CAL_POST_DELTA=0
 SCALE_RAW=100; SCALE=100
 EFF_MS=$(( BUDGET * 1000 )); EFF_BUDGET="$BUDGET"
 undetermined=0
@@ -273,6 +283,52 @@ total_s=$(( (total_ms + 999) / 1000 ))
 # leaving the log; DIVE-2710 §2.4 calls that separation the actual product here.
 pct=0; (( BUDGET > 0 )) && pct=$(( total_s * 100 / BUDGET ))
 eff_pct=0; (( EFF_MS > 0 )) && eff_pct=$(( total_ms * 100 / EFF_MS ))
+
+# ---------------------------------------------------------------------------------
+# DIVE-2736: PROBE THE RUNNER AGAIN, ON THE OTHER SIDE OF THE CORPUS.
+#
+# The pre-corpus probe is a ~20s POINT SAMPLE standing in for a ~6-minute integral. On
+# run 30967674559 those two disagreed by 30% in the direction that guarantees no relief:
+# probe fast, corpus slow, scale clamped to the floor, exit 4 on a run the mechanism was
+# built to rescue. Nothing in the runner noticed, because nothing was looking — a ratio
+# whose halves can move in opposite directions is not a ratio, and there was no second
+# measurement to compare the first against.
+#
+# THIS IS A DISCRIMINATOR AND IT GRADES NOTHING. It does not enter SCALE, EFF_MS, the
+# verdict or the exit code, and the arm in tests/corpus_tier_budget_unit.sh that proves
+# so is the load-bearing one: shipping a remedy on n=1 evidence is how DIVE-2710's
+# premise got into the tree unmeasured in the first place. What it produces is the pair
+# of readings, on every run, in the report — so the question "does the probe track the
+# corpus" becomes answerable from logs instead of arguable from priors
+# (scripts/tier-cal-window.sh does the across-runs read).
+#
+# SAME ITERATION COUNT, SAME MIN-OF-N, on purpose. A cheaper post probe — one sample
+# instead of min-of-two — would read systematically SLOWER than the pre probe for a
+# reason that is arithmetic rather than weather, and would manufacture exactly the
+# divergence it was added to detect. Two estimators are only comparable when they are
+# the same estimator.
+#
+# AND IT ONLY RUNS WHEN THE PRE PROBE WAS MEASURED. Comparing a measured post against an
+# INJECTED pre would be comparing this runner against a number the harness typed.
+if [[ -n "$CAL_POST_US_IN" ]]; then
+  CAL_POST_US="$CAL_POST_US_IN"; CAL_POST_STATUS="injected"
+elif (( CAL_POST == 1 )) && [[ "$CAL_STATUS" == "measured" ]] && (( CAL_ITERS > 0 )); then
+  printf '\nharness-budget[%s/%s]: re-calibrating AFTER the corpus (~%ds, NOT counted toward the\n' \
+    "$TIER" "$LABEL" "$(( TIER_CAL_TARGET_MS * TIER_CAL_SAMPLES / 1000 ))"
+  printf '  corpus total, and NOT used to grade this run — it is the discriminator, DIVE-2736)\n'
+  _best=""
+  for (( _s = 0; _s < TIER_CAL_SAMPLES; _s++ )); do
+    if ! _ms="$(cal_probe "$CAL_ITERS")"; then
+      CAL_POST_STATUS="failed"; _best=""; break
+    fi
+    _us=$(( _ms * 1000 / CAL_ITERS )); (( _us > 0 )) || _us=1
+    if [[ -z "$_best" ]] || (( _us < _best )); then _best="$_us"; fi
+  done
+  if [[ -n "$_best" ]]; then CAL_POST_US="$_best"; CAL_POST_STATUS="measured"; fi
+fi
+if [[ "$CAL_POST_STATUS" == "measured" || "$CAL_POST_STATUS" == "injected" ]] && (( CAL_US > 0 )); then
+  CAL_POST_DELTA="$(tier_cal_diverge_pct "$CAL_US" "$CAL_POST_US")" || CAL_POST_DELTA=0
+fi
 
 # ---------------------------------------------------------------------------------
 # DIVE-2592: A BUDGET RED CONFIRMS ITSELF BEFORE IT CLAIMS ANYTHING.
@@ -412,6 +468,13 @@ if [[ -n "$REPORT" ]]; then
     printf '# cal_status=%s\n# cal_us_per_iter=%d\n# cal_baseline_us_per_iter=%d\n# cal_iters=%d\n# cal_scale_pct=%d\n# cal_scale_pct_applied=%d\n# effective_budget_s=%d\n# pct_of_effective_budget=%d\n# undetermined=%d\n' \
       "$CAL_STATUS" "$CAL_US" "$CAL_BASELINE_US" "$CAL_ITERS" "$SCALE_RAW" "$SCALE" \
       "$EFF_BUDGET" "$eff_pct" "$undetermined"
+    # DIVE-2736: appended for the same reason, and these three are the ones that make
+    # "did the probe track the corpus" answerable ACROSS runs rather than argued within
+    # one. cal_post_delta_pct is SIGNED — positive is the runner slower after the corpus
+    # than before it. scripts/tier-cal-window.sh reads exactly these fields plus
+    # wall_clock_s and harnesses.
+    printf '# cal_post_status=%s\n# cal_post_us_per_iter=%d\n# cal_post_delta_pct=%d\n' \
+      "$CAL_POST_STATUS" "$CAL_POST_US" "$CAL_POST_DELTA"
     for i in "${!NAME[@]}"; do printf '%s\t%s\t%s\n' "${MS[$i]}" "${RC[$i]}" "${NAME[$i]}"; done
   } > "$REPORT"
 fi
@@ -447,6 +510,45 @@ elif (( BUDGET > 0 && CALIBRATE == 0 )); then
   printf 'harness-budget[%s/%s]: CALIBRATION OFF (--no-calibrate) — graded against the RAW %ds cap.\n' \
     "$TIER" "$LABEL" "$BUDGET"
   printf '  The clamp floor is %d%%, so this is the STRICTEST this gate gets, never a relaxation.\n' "$TIER_CAL_SCALE_MIN_PCT"
+fi
+
+# DIVE-2736: the two probes, side by side, with the verdict this run supports and the
+# one it does not. Printed on every calibrated run, not only on a red — the anomaly this
+# exists to catch was found by comparing a PASSING run against a failing one 13 minutes
+# later, and a diagnostic that only prints on the red half of that pair cannot be used
+# that way.
+if [[ "$CAL_POST_STATUS" == "measured" || "$CAL_POST_STATUS" == "injected" ]] && (( CAL_US > 0 )); then
+  _absd=$CAL_POST_DELTA; (( _absd < 0 )) && _absd=$(( -_absd ))
+  printf 'harness-budget[%s/%s]: PROBE BRACKET (DIVE-2736) pre %dus/iter -> post %dus/iter (%+d%%),\n' \
+    "$TIER" "$LABEL" "$CAL_US" "$CAL_POST_US" "$CAL_POST_DELTA"
+  if (( _absd < TIER_CAL_POST_DIVERGE_PCT )); then
+    printf '  which AGREES (under %d%%). The runner drew the same at both ends of the corpus, so a\n' "$TIER_CAL_POST_DIVERGE_PCT"
+    printf '  slow corpus on this run would NOT be explained by the probe sampling the wrong moment.\n'
+    printf '  Read that as weak evidence only: the corpus just warmed the page cache and the CLI it\n'
+    printf '  spawned, which biases this second reading FAST, so agreement is also what a real\n'
+    printf '  slowdown masked by cache warmth looks like.\n'
+  elif (( CAL_POST_DELTA > 0 )); then
+    # The clean direction: the confound above pushes the post probe FASTER, so a post
+    # probe that comes in SLOWER did so against it.
+    _bus=$CAL_US; (( CAL_POST_US > _bus )) && _bus=$CAL_POST_US
+    _braw="$(tier_cal_scale_pct "$_bus" "$CAL_BASELINE_US")"
+    _bcap=$(( BUDGET * $(tier_cal_clamp_pct "$_braw") / 100 ))
+    printf '  which DIVERGES (>= %d%%) with the runner SLOWER after the corpus than before it. That\n' "$TIER_CAL_POST_DIVERGE_PCT"
+    printf '  is the pre-probe under-reading a draw that arrived later — a ~20s point sample standing\n'
+    printf '  in for a %ds integral — and it survives the cache-warmth confound, which pushes the\n' "$total_s"
+    printf '  other way. COUNTERFACTUAL, NOT APPLIED: bracketing on max(pre,post) reads %d%% of\n' "$_braw"
+    printf '  baseline and would have set the cap to %ds instead of %ds. This run was graded on the\n' "$_bcap" "$EFF_BUDGET"
+    printf '  PRE probe regardless; the number is here to be collected, not acted on.\n'
+  else
+    printf '  which DIVERGES (>= %d%%) with the runner FASTER after the corpus. Either contention\n' "$TIER_CAL_POST_DIVERGE_PCT"
+    printf '  ended during the run, or the corpus warmed what the probe pays for. Both are consistent\n'
+    printf '  with a pre-probe that over-read, which is the direction that costs nobody a red.\n'
+  fi
+elif [[ "$CAL_POST_STATUS" == "failed" ]]; then
+  # NOT undetermined and NOT a red: this probe grades nothing, so it cannot fail closed
+  # onto a verdict it does not participate in. Saying so is the whole handling.
+  printf 'harness-budget[%s/%s]: the post-corpus probe (DIVE-2736) could not run. The verdict above\n' "$TIER" "$LABEL"
+  printf '  is unaffected — it is graded on the pre-corpus probe and always was.\n'
 fi
 
 slowest() {
@@ -525,9 +627,24 @@ elif (( total_ms > EFF_MS )); then
   # DIVE-2592: SAY WHAT THIS RED IS, in the output that carries it. `exit 4` beside a
   # green assertion count cost the author of #395 an hour: it reads as systemic to the
   # person whose PR it stopped and as flake to the next reader, and it is neither.
-  printf 'NO TEST FAILED — %d of %d harnesses passed. This is a BUDGET failure (exit 4), not a\n' \
-    "$(( ${#CORPUS[@]} - ${#failed[@]} ))" "${#CORPUS[@]}"
-  printf 'test failure (exit 1): nothing in your diff is broken, the CORPUS no longer fits its cap.\n'
+  # DIVE-2801: the no-test-failed claim is only true when nothing failed, and this
+  # branch had been asserting it unconditionally — while computing "N of M" from
+  # the very `failed` array that contradicts it. On a run with 2 failures it
+  # printed "NO TEST FAILED — 241 of 243 harnesses passed", which is a verdict the
+  # printer did not compute, in the output whose whole job is to say what this red
+  # IS. Exactly the class this row exists to fix, occurring inside the measurement
+  # of it. Both facts are true at once here and the reader needs both, plus which
+  # exit code wins.
+  if (( ${#failed[@]} == 0 )); then
+    printf 'NO TEST FAILED — %d of %d harnesses passed. This is a BUDGET failure (exit 4), not a\n' \
+      "$(( ${#CORPUS[@]} - ${#failed[@]} ))" "${#CORPUS[@]}"
+    printf 'test failure (exit 1): nothing in your diff is broken, the CORPUS no longer fits its cap.\n'
+  else
+    printf '%d HARNESS(ES) ALSO FAILED — %d of %d passed. This run is BOTH over budget AND red.\n' \
+      "${#failed[@]}" "$(( ${#CORPUS[@]} - ${#failed[@]} ))" "${#CORPUS[@]}"
+    printf 'The FAILURE takes precedence and this run exits 1, not 4: fix the failing harness(es)\n'
+    printf 'first, then re-read the budget — a red run is not a trustworthy timing sample either.\n'
+  fi
   if (( confirmed )); then
     printf 'It was measured TWICE (%ds, then %ds) before this was printed, so it is not variance.\n' \
       "$first_total_s" "$total_s"

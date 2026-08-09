@@ -11,7 +11,19 @@ decision to add one is ever wrong on its own merits. See
 | tier | runs | budget |
 |---|---|---|
 | `core` (**the default**) | every PR, both CI environments | **300s** per job |
-| `nightly` | `full-sweep.yml` (03:17 UTC + dispatch) | **1320s** per job, corpus split across 3 shards |
+| `nightly` | `full-sweep.yml` — 03:17 UTC, dispatch, **every push to main** (DIVE-2667), and **every PR touching `build.sh`, `install.sh` or `src/**`** (DIVE-2789) | **1320s** per job, corpus split across 3 shards |
+
+- **The PR trigger is ADVISORY. It does not block a merge**, and it is deliberately not
+  a required context: it is paths-filtered, so it is absent from ~28% of PRs, and GitHub
+  leaves a required check that never reports pending forever. A red there is a signal to
+  read, not a gate. It also covers ONE axis — a regression in the harness corpus outside
+  the core tier — and **not** the release path (`release-cut.yml` never runs on a PR) or
+  the selfcheck probe class, which the corpus never reaches. Do not read "full-sweep runs
+  on branches" as "a tree-level regression can no longer land behind a green PR".
+- **The nightly tier is not a cheap subset**: 25% of the corpus by file count and **81%
+  of it by wall-clock** (1210s of 1481s, measured DIVE-2789), because membership is
+  selected on cost. Cost any plan that leans on the core/nightly split in seconds, not in
+  files — `community/wiki/a-demoted-tier-is-not-a-cheap-subset-it-holds-almost-all-the-cost.md`.
 
 - **A new harness is `core` unless you say otherwise.** Nothing to write.
 - **Over budget, CI FAILS** (`exit 4`, distinct from a test failure's `exit 1`) and
@@ -74,6 +86,21 @@ decision to add one is ever wrong on its own merits. See
   - Calibration time is **not** counted toward the total. `TIER_CAL_BASELINE_US` is
     graded against itself every run and says RE-BASELINE past 25% drift — a runner
     image change is exactly the event that moves it.
+  - **The baseline is a CI number and carries its environment** (DIVE-2736): 119000,
+    the median of six `ubuntu-latest` readings. The 173000 it replaced was measured on
+    the control plane, and the failure that produced was **silent** — every CI probe
+    read as a *fast* runner, the 100% floor clamped all six, and the relative budget
+    stopped existing while still printing a ratio. **A local run now prints
+    RE-BASELINE, and that is correct**; do not re-derive it from the box you are on.
+  - **Two probes, one verdict** (DIVE-2736). A second probe runs *after* the corpus
+    and **grades nothing** — it exists because on one run the probe read 30% fast
+    while the corpus ran 90s slow, and nothing noticed a ratio whose halves moved in
+    opposite directions. `cal_post_delta_pct` is signed; **post slower than pre** is
+    the clean signal, because the corpus warms what the probe pays for and biases the
+    second reading fast, so *agreement* is weak evidence rather than a clearance.
+    `--no-cal-post` skips it. Across runs: `scripts/tier-cal-window.sh <reports…>`
+    (normalises wall-clock to µs/harness first, or deleting a harness reads as
+    anti-correlation).
   - `--no-calibrate` grades against the raw cap (useful with no built bundle). The
     clamp floor is 1.0, so that is the **strictest** this gate gets, never a
     relaxation. `--cal-us=` / `--cal-baseline-us=` / `--cal-cli=` are harness seams;

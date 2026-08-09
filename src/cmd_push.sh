@@ -322,7 +322,7 @@ _push_touches_workflows() { # <repopath> <repourl> <branch>
 }
 
 cmd_push() {
-  require_loaded push broker_gate_check broker_bind_target broker_task_target
+  require_loaded push broker_gate_check broker_bind_target broker_task_target broker_gate_sig_note
   tasks_db_init
   local branch="" repo="" dry=0 yes=0
   # DIVE-2605: --open-pr and its two body sources. Parsed here, validated before the
@@ -366,8 +366,14 @@ cmd_push() {
     local body; body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
     branch=$(_push_branch_from_body "$body")
   fi
+  # DIVE-2801: name BOTH requirements. `--branch` satisfies this usage check but
+  # NOT the DIVE-1462 gate binding in _push_do, which reads the branch fresh from
+  # the task body — so offering `--branch` alone as an alternative sends the
+  # caller down a path whose only outcome is the next refusal. Same defect as the
+  # dry-run this row is named for: an early check answering on behalf of a later
+  # one it does not share a predicate with.
   [[ -n "$branch" ]] || fail "$E_USAGE" \
-    "no branch for ${ident}: pass --branch=<name> or add a 'Branch: <name>' line to the task body (push refuses to guess)."
+    "no branch for ${ident}: add a 'Branch: <name>' line to the task body (push refuses to guess). The task body is REQUIRED — the cleared gate binds to the branch the task itself declares (DIVE-1462), so --branch=<name> alone gets past this check and is then refused by that binding; pass it as well only to override which branch is read."
   case "$branch" in
     main|master|HEAD) fail "$E_VALIDATION" "refusing to push to protected branch '${branch}' — delegated push targets feature branches only." ;;
   esac
@@ -458,10 +464,16 @@ cmd_push() {
         pr_preview=" — but NOT open a PR: this account has no '_gh_do' grant, so --open-pr would warn and leave the branch for someone else to open"
       fi
     fi
-    ok "dry-run: would push ${branch}@${sha} to ${slug}${pr_preview} — target from ${repo_src} (gate cleared, author ${author_state})" \
+    # DIVE-2801: the rehearsal names the check it did NOT run. `gate cleared` alone
+    # asserted the whole gate predicate while having evaluated the weaker half of it
+    # — the preflight runs with require_sig=0, the real push with 1 — so a green here
+    # generalised, in the reader's head, to the check most likely to stop the write.
+    # Same shape as `author_state` above (DIVE-2161): name the bound the verdict rests on.
+    local sig_state; sig_state=$(broker_gate_sig_note push)
+    ok "dry-run: would push ${branch}@${sha} to ${slug}${pr_preview} — target from ${repo_src} (gate cleared, ${sig_state}, author ${author_state})" \
        "$(jq -n --arg t "$ident" --arg b "$branch" --arg s "$sha" --arg r "$slug" --arg a "$author_state" --arg rs "$repo_src" \
-             --argjson op "$open_pr" --arg pb "$pr_base_preview" \
-             '{task:$t,branch:$b,sha:$s,repo:$r,repoSource:$rs,dryRun:true,gate:"cleared",author:$a,openPr:($op==1),prBase:$pb}')"
+             --argjson op "$open_pr" --arg pb "$pr_base_preview" --arg gs "${BROKER_GATE_SIG_STATE:-unknown}" \
+             '{task:$t,branch:$b,sha:$s,repo:$r,repoSource:$rs,dryRun:true,gate:"cleared",gateSignature:$gs,author:$a,openPr:($op==1),prBase:$pb}')"
     return 0
   fi
 

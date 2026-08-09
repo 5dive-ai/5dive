@@ -793,6 +793,9 @@ link_agent_profile() {
   # this lib is also sourced in contexts without cmd_auth.sh.
   declare -F normalize_profile_seed_perms >/dev/null 2>&1 \
     && normalize_profile_seed_perms "$profile"
+  return 0   # DIVE-2751: the guard above is the point — in a context WITHOUT
+             # cmd_auth.sh the declare fails, and as the last statement that
+             # false test became this function's rc at five bare call sites.
 }
 
 # Write a BYO (bring-your-own) API-key credential for hermes/openclaw into
@@ -811,11 +814,25 @@ link_agent_profile() {
 # to the profile so the seed loop in 5dive-agent-start.sh picks up the
 # new files and bounces the hermes/openclaw gateway daemon.
 apply_byo_provider() {
-  local type="$1" canonical="$2" api_key="$3" profile="${4:-}" model="${5:-}"
-  valid_byo_provider "$canonical" \
-    || fail "$E_VALIDATION" "unknown provider '$canonical' (known: ${!BYO_PROVIDER_LABEL[*]})"
+  local type="$1" canonical="$2" api_key="$3" profile="${4:-}" model="${5:-}" base_url="${6:-}"
   valid_api_key "$api_key" \
     || fail "$E_VALIDATION" "api key looks wrong (>=10 printable non-space chars)"
+
+  # DIVE-2757: an operator-supplied --base-url is the ONE case where the vendor
+  # catalog is not consulted — the endpoint came from argv, so there is no
+  # catalog entry to look up and nothing for valid_byo_provider /
+  # resolve_native_provider to resolve. It is claude-only: hermes and openclaw
+  # keep their own URL tables (HERMES_PROVIDER_URL / OPENCLAW_PROVIDER_URL) and
+  # speak different wire formats, so one flag cannot serve all three.
+  if [[ -n "$base_url" ]]; then
+    [[ "$type" == "claude" ]] \
+      || fail "$E_VALIDATION" "--base-url is only supported for --type=claude (got: $type)"
+    _apply_byo_claude "$canonical" "$api_key" "$profile" "$model" "$base_url"
+    return 0
+  fi
+
+  valid_byo_provider "$canonical" \
+    || fail "$E_VALIDATION" "unknown provider '$canonical' (known: ${!BYO_PROVIDER_LABEL[*]})"
   local native
   native=$(resolve_native_provider "$type" "$canonical")
   [[ -n "$native" ]] \
@@ -837,12 +854,51 @@ apply_byo_provider() {
 # these override any default-account OAuth token that template otherwise leaks
 # in. profile_set_var takes the value on stdin (keeps secrets out of argv).
 _apply_byo_claude() {
-  local canonical="$1" api_key="$2" profile="${3:-}" override_model="${4:-}"
+  local canonical="$1" api_key="$2" profile="${3:-}" override_model="${4:-}" url_override="${5:-}"
   [[ -n "$profile" ]] \
     || fail "$E_USAGE" "claude BYO provider requires --auth-profile (custom-provider creds are profile-scoped)"
   local base_url="${CLAUDE_PROVIDER_BASEURL[$canonical]:-}"
+  # DIVE-2757: --base-url wins over the catalog. Two shapes reach here:
+  #   * a KNOWN vendor redirected to a different host of the same vendor (a CN
+  #     endpoint, a corporate gateway) — the catalog's per-tier model ids still
+  #     apply, because the models did not change, only where they are served;
+  #   * a CUSTOM endpoint with no catalog row at all (self-hosted open weights),
+  #     where there are no model ids to inherit — see the --model gate below.
+  if [[ -n "$url_override" ]]; then
+    valid_base_url "$url_override" \
+      || fail "$E_VALIDATION" "invalid --base-url '$url_override' (https:// required — http:// only for localhost/127.0.0.1/[::1]; no whitespace or quotes)"
+    base_url="$url_override"
+  fi
   [[ -n "$base_url" ]] \
-    || fail "$E_VALIDATION" "claude does not support provider '$canonical' (${BYO_PROVIDER_LABEL[$canonical]:-unknown}: no Anthropic-compatible endpoint)"
+    || fail "$E_VALIDATION" "claude does not support provider '$canonical' (${BYO_PROVIDER_LABEL[$canonical]:-unknown}: no Anthropic-compatible endpoint). Pass --base-url=<url> to point at one yourself."
+  # DIVE-2809 GUARD BEGIN — do not let a catalog re-derivation silently revert
+  # an operator's endpoint.
+  #
+  # Everything above this point resolves ANTHROPIC_BASE_URL from argv or the
+  # catalog and then WRITES it. That is correct on a first apply and wrong on a
+  # re-apply: `agent auth set claude --provider=<vendor> --auth-profile=<p>`
+  # (a routine key rotation) reaches here with url_override EMPTY, so the
+  # catalog's url wins and a profile created with --base-url loses its endpoint.
+  #
+  # The failure is not that the agent breaks — it is that it does not. The value
+  # written is a real vendor URL, so nothing downstream looks wrong, and a
+  # self-hosted agent quietly resumes sending its traffic AND ITS KEY to a vendor
+  # the operator deliberately moved off. Silence is the whole defect.
+  #
+  # Preserving silently is not the fix either: an operator who genuinely wants
+  # this profile back on a catalog vendor has to have a path that says so. So
+  # REFUSE, and name both exits with the same flag — keep, or move, but state
+  # which. The predicate is "the stored url is not in the catalog", not "the
+  # stored url differs": a profile already on vendor A that is re-pointed at
+  # vendor B was named on the command line by --provider and is not silent.
+  if [[ -z "$url_override" ]]; then
+    local stored_url
+    stored_url=$(profile_env_value "$profile" ANTHROPIC_BASE_URL)
+    if [[ -n "$stored_url" && -z "$(claude_baseurl_catalog_provider "$stored_url")" ]]; then
+      fail "$E_VALIDATION" "auth profile '$profile' is pinned to a custom endpoint (${stored_url}) that no provider catalog row serves; applying provider '$canonical' here would replace it with ${base_url}. Pass --base-url=${stored_url} to keep the custom endpoint, or --base-url=${base_url} to move this profile onto '$canonical' deliberately."
+    fi
+  fi
+  # DIVE-2809 GUARD END
   step "Configuring claude BYO provider '$canonical' → ${base_url} (profile=$profile)"
   printf '%s' "$base_url"  | profile_set_var "$profile" ANTHROPIC_BASE_URL
   printf '%s' "$api_key"   | profile_set_var "$profile" ANTHROPIC_AUTH_TOKEN
@@ -850,12 +906,23 @@ _apply_byo_claude() {
   # tiers with any slug the provider serves (OpenRouter translates every family;
   # the Chinese providers serve their own). The background/fast HAIKU slot stays
   # on the catalogue's caching-capable default so background turns stay cheap.
-  local opus_model="${CLAUDE_PROVIDER_OPUS_MODEL[$canonical]}"
-  local sonnet_model="${CLAUDE_PROVIDER_SONNET_MODEL[$canonical]}"
+  local opus_model="${CLAUDE_PROVIDER_OPUS_MODEL[$canonical]:-}"
+  local sonnet_model="${CLAUDE_PROVIDER_SONNET_MODEL[$canonical]:-}"
+  local haiku_model="${CLAUDE_PROVIDER_HAIKU_MODEL[$canonical]:-}"
   if [[ -n "$override_model" ]]; then opus_model="$override_model"; sonnet_model="$override_model"; fi
+  # DIVE-2757: a custom endpoint has no catalog row, so there is no per-tier
+  # default to inherit and --model has to supply all three. The HAIKU slot is
+  # the one that would fail silently: it is never the tier the operator selects,
+  # it is what the harness reaches for on background turns, and an empty value
+  # here leaves the variable unset — so the agent works interactively and 404s
+  # on its own background traffic. An unpinned haiku is not a smaller version of
+  # a working agent; it is a broken one that looks fine for the first minute.
+  [[ -n "$haiku_model" ]] || haiku_model="$override_model"
+  [[ -n "$opus_model" && -n "$sonnet_model" && -n "$haiku_model" ]] \
+    || fail "$E_USAGE" "--base-url with a custom provider requires --model=<slug> (no catalog entry for '$canonical', so there are no per-tier model ids to fall back to)"
   printf '%s' "$opus_model"   | profile_set_var "$profile" ANTHROPIC_DEFAULT_OPUS_MODEL
   printf '%s' "$sonnet_model" | profile_set_var "$profile" ANTHROPIC_DEFAULT_SONNET_MODEL
-  printf '%s' "${CLAUDE_PROVIDER_HAIKU_MODEL[$canonical]}"  | profile_set_var "$profile" ANTHROPIC_DEFAULT_HAIKU_MODEL
+  printf '%s' "$haiku_model"  | profile_set_var "$profile" ANTHROPIC_DEFAULT_HAIKU_MODEL
   # Custom endpoints (esp. z.ai during peak hours) can be slow; raise the
   # client-side request timeout so long tool turns don't get cut off.
   printf '%s' "3000000" | profile_set_var "$profile" API_TIMEOUT_MS
@@ -1272,7 +1339,7 @@ cmd_create() {
   local name="" type="" channels="none" channels_explicit=0 telegram_token="" discord_token="" workdir="" profile=""
   local telegram_home_channel="" telegram_allowed_users="" telegram_cos="" telegram_cos_avatar=""
   local cos_owner_id=""
-  local byo_provider="" byo_api_key="" byo_model=""
+  local byo_provider="" byo_api_key="" byo_model="" byo_base_url=""
   local skills_arg="" skills_set=0 no_skills=0 defer_auth=0
   local isolation="" isolation_explicit=0 no_team_bot=0
   local autonomy="standard"   # DIVE-499
@@ -1296,6 +1363,7 @@ cmd_create() {
       --provider=*)                byo_provider="${1#--provider=}" ;;
       --api-key=*)                 byo_api_key="${1#--api-key=}" ;;
       --model=*)                   byo_model="${1#--model=}" ;;
+      --base-url=*)                byo_base_url="${1#--base-url=}" ;;
       --with-skills=*)             skills_arg="${1#--with-skills=}"; skills_set=1 ;;
       --no-skills)                 no_skills=1 ;;
       --no-team-bot)               no_team_bot=1 ;;
@@ -1309,7 +1377,7 @@ cmd_create() {
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--model=<slug>] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--defer-auth] [--isolation=admin|standard|sandboxed] [--can-push] [--can-deploy] [--inherit-memory=wiki|all|team|<agent>[,...]]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--base-url=<url>] [--model=<slug>] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--defer-auth] [--isolation=admin|standard|sandboxed] [--can-push] [--can-deploy] [--inherit-memory=wiki|all|team|<agent>[,...]]"
   [[ -n "$type" ]] || fail "$E_USAGE" "--type is required"
   valid_name "$name" || fail "$E_VALIDATION" "invalid name (lowercase letters/digits/hyphens, start letter, <=16 chars)"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type (known: ${!TYPE_BIN[*]})"
@@ -1327,7 +1395,7 @@ cmd_create() {
   if [[ "$type" == "grok" ]]; then
     warn "FIVE_GROK_UNFREEZE_VERIFIED=1 set, bypassing the DIVE-1221 Grok exfiltration freeze. Only valid if a VERIFIED xAI client-side patch is pinned."
   fi
-  valid_channel "$channels" || fail "$E_VALIDATION" "invalid channels: $channels (none|telegram|discord|dashboard, comma-separable)"
+  valid_channel "$channels" || fail "$E_VALIDATION" "invalid channels: $channels (none|telegram|discord|dashboard|buzz, comma-separable)"
   # DIVE-856: claude agents are chat-capable in the web dashboard by default.
   # The dashboard channel needs no token (the plugin reads the box connectord
   # bearer itself), so fold it into every claude create: unset --channels
@@ -1456,6 +1524,20 @@ cmd_create() {
   # Mutually exclusive with --defer-auth: BYO is the alternative to "I'll sign in
   # later", not an add-on. The key sentinel "-" reads from stdin so the value
   # never appears in argv (and thus never in `ps`).
+  # DIVE-2757: --base-url points a claude-type agent at an Anthropic-compatible
+  # endpoint that is not in the catalog — a self-hosted server, or a vendor host
+  # we do not ship a row for. Normalised here, BEFORE the BYO block below, so a
+  # `--base-url` with no `--provider` still enters that block and inherits every
+  # guard it already applies (auth-profile required, --defer-auth exclusive,
+  # stdin-sentinel accounting, key-shape check). Without --provider the id is a
+  # label only; nothing downstream resolves a vendor from it.
+  if [[ -n "$byo_base_url" ]]; then
+    [[ "$type" == "claude" ]] \
+      || fail "$E_VALIDATION" "--base-url is only supported for --type=claude (got: $type). hermes/openclaw resolve endpoints from their own provider catalogs."
+    valid_base_url "$byo_base_url" \
+      || fail "$E_VALIDATION" "invalid --base-url '$byo_base_url' (https:// required — http:// only for localhost/127.0.0.1/[::1]; no whitespace or quotes)"
+    [[ -n "$byo_provider" ]] || byo_provider="$CLAUDE_CUSTOM_PROVIDER_ID"
+  fi
   if [[ -n "$byo_provider" || -n "$byo_api_key" ]]; then
     # pi and opencode are API-key multi-provider types: --provider names the
     # vendor and the key is injected as its native environment variable, so
@@ -1479,6 +1561,19 @@ cmd_create() {
     elif [[ "$type" == "opencode" ]]; then
       opencode_provider_var "$byo_provider" >/dev/null \
         || fail "$E_VALIDATION" "opencode provider '$byo_provider' not supported (known: ${!OPENCODE_PROVIDER_VAR[*]})"
+    elif [[ -n "$byo_base_url" ]]; then
+      # The endpoint came from argv, so there is no catalog row to validate the
+      # provider id against — it is a label. Still constrain its SHAPE: it names
+      # an auth-profile variable and appears in a `step` line, and a free-form
+      # string there is a needless injection surface.
+      valid_name "$byo_provider" \
+        || fail "$E_VALIDATION" "invalid --provider label '$byo_provider' with --base-url (lowercase letters/digits/hyphens, start letter, <=16 chars)"
+      # A custom endpoint has no per-tier model ids to inherit. Caught here as
+      # well as in _apply_byo_claude so the refusal lands at argument-parse time
+      # — before the agent user, home, and unit have been created and would have
+      # to be torn down.
+      [[ -n "$byo_model" || -n "${CLAUDE_PROVIDER_BASEURL[$byo_provider]:-}" ]] \
+        || fail "$E_USAGE" "--base-url with a custom provider requires --model=<slug> (no catalog entry for '$byo_provider', so there are no per-tier model ids to fall back to)"
     else
       valid_byo_provider "$byo_provider" \
         || fail "$E_VALIDATION" "unknown provider '$byo_provider' (known: ${!BYO_PROVIDER_LABEL[*]})"
@@ -1690,7 +1785,7 @@ cmd_create() {
       # create-time OpenRouter key reaches OPENROUTER_API_KEY, not OPENAI_API_KEY.
       opencode_apply_provider_key "$byo_provider" "$byo_api_key" "$profile"
     else
-      apply_byo_provider "$type" "$byo_provider" "$byo_api_key" "$profile" "$byo_model"
+      apply_byo_provider "$type" "$byo_provider" "$byo_api_key" "$profile" "$byo_model" "$byo_base_url"
     fi
   fi
 

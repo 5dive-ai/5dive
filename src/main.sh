@@ -43,7 +43,7 @@ Agents:
   5dive agent list
   5dive agent info <name>                            # type, CLI version, selected model, channel + state
   5dive agent types
-  5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard[,ch...]]
+  5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz[,ch...]]
                             [--telegram-token=<bot-token>] [--discord-token=<token>]
                             [--workdir=<path>] [--auth-profile=<name>]
                             [--provider=<id> --api-key=<key|->]
@@ -78,7 +78,7 @@ Agents:
   5dive agent rm <name> [--purge-home]               # aliases: 5dive agent fire <name>  /  5dive fire <name>
                                                      # home is quarantined to /home/.5dive-reaped/ (root 0700);
                                                      # --purge-home deletes it instead (irreversible)
-  5dive agent config <name> set channels=<none|telegram|discord|dashboard[,ch...]>
+  5dive agent config <name> set channels=<none|telegram|discord|dashboard|buzz[,ch...]>
                                                      # comma-separable; dashboard (claude-only, no token)
                                                      # enables web-dashboard chat — the one-tap Enable chat
                                                      # path. New claude creates include it by default.
@@ -194,8 +194,12 @@ Auth (lower-level; the dashboard uses these — prefer 'account' for human-drive
   5dive agent auth status [--probe] [--type=<type>]    # real --print probe reveals stale creds
   5dive agent auth login <type>                        # interactive TTY (hands off this process)
   5dive agent auth set <type> --api-key=<key|-> [--auth-profile=<name>] [--provider=<id>]
+                              [--base-url=<url>] [--model=<slug>]
                                                        # --provider=<id> required for hermes/openclaw;
                                                        # id is one of: ${!BYO_PROVIDER_LABEL[*]}
+                                                       # --base-url (claude only) restates a custom
+                                                       # endpoint; without it a profile pinned off the
+                                                       # catalog is refused, not reverted (DIVE-2809)
   5dive agent auth start <type> [--auth-profile=<name>]      # non-TTY device-code: returns session id
   5dive agent auth poll <session_id>                         # {state, url, error}
   5dive agent auth submit <session_id> --code=<callback>     # paste the claude callback code
@@ -489,12 +493,36 @@ main() {
         info)    cmd_info "$@" ;;
         types)   cmd_types "$@" ;;
         logs)    cmd_logs "$@" ;;
-        send)    cmd_send "$@" ;;
-        ask)     cmd_ask "$@" ;;
+        # DIVE-2797: the send rail is AUDITED. `task inbox send` had 78 rows in
+        # agent-audit.log and `agent send` had zero, so an inter-agent message —
+        # including an admin-tier one carrying a forgeable `--from=` — left no
+        # artifact naming who sent it. A recipient could re-verify the CLAIM and
+        # never the SOURCE, because no source record existed.
+        #
+        # AUDIT_ARGS is a PLACEHOLDER here, not the payload. The handler rewrites
+        # it once it has parsed its flags (see cmd_send / cmd_ask / cmd_deliver),
+        # because the dispatcher cannot tell a target from a `--message=` body and
+        # the message body must never land in a shared log. If the handler fails
+        # before that point the row still carries the verb, the exit code and the
+        # derived actor — attribution survives a usage error.
+        send)
+          AUDIT_CMD="agent send"; AUDIT_ARGS=("to=<unparsed>")
+          cmd_send "$@" ;;
+        ask)
+          AUDIT_CMD="agent ask"; AUDIT_ARGS=("to=<unparsed>")
+          cmd_ask "$@" ;;
         # DIVE-1065: hidden privileged delivery primitive. Only reachable via the
         # scoped-sudoers grant a standard agent gets (write_standard_sudoers);
         # `cmd_send` re-execs into it for non-root agent callers. Not advertised.
-        _deliver) cmd_deliver "$@" ;;
+        # DIVE-2797: audited for the same reason, and it is NOT redundant with the
+        # `send` row above. cmd_send reaches this primitive with `exec`, which
+        # replaces the process — the outer EXIT trap never fires, so a scoped
+        # (standard-tier) a2a send would have been audited by NOBODY if only
+        # `send` were wired. That is the DIVE-2788 shape this ticket names as its
+        # sibling: a guard covering a narrower population than its name.
+        _deliver)
+          AUDIT_CMD="agent _deliver"; AUDIT_ARGS=("to=<unparsed>")
+          cmd_deliver "$@" ;;
         # DIVE-1074: hidden privileged READ primitive (bounded reply-window read),
         # the sibling of _deliver. `cmd_ask` re-execs into it for a standard-tier
         # non-root caller to read back the reply. Scoped-sudoers only, not advertised.

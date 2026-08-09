@@ -39,6 +39,20 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+
+# DIVE-2770: the merge gate gained a CREDENTIAL-FREE rail (an unauthenticated read
+# of a public repo). Every no-token arm below was written when "no credential"
+# meant "no rail", and with the anon rail live they would reach the real network
+# and grade a LIVE PR instead of the fixture. Turn it off here: these harnesses
+# grade the pre-2770 rails, and tests/task_merge_gate_anon_rail_unit.sh grades the
+# new one. This is also what keeps `no root, no network` true of this file.
+#
+# IT MUST SIT AFTER lib/grading_tree.sh, AND THAT IS NOT A STYLE CHOICE: that file
+# sources lib/env_isolation.sh, which CLEARS inherited FIVE_* knobs so a harness
+# never grades the caller's environment. Set above it, this export is wiped and the
+# harness silently reaches the network instead — measured, and it read as three
+# unrelated assertion failures naming a live PR's real state.
+export FIVE_GATE_NO_ANON=1
 trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
@@ -216,10 +230,15 @@ if [[ "$res" == *"merge-gate: UNVERIFIED"* && "$res" == *"AMBIGUOUS"* \
 else
   bad_t 'ambiguous must be durable in the record' "result=[$res]"
 fi
-# The stamp must also appear when the maker passed NO --result at all: that row is the
-# emptiest-looking one there is, so it is the one most in need of the disclaimer.
+# The stamp must also appear on the emptiest close the rail allows, because that row is
+# the one most in need of the disclaimer.
+# DIVE-2773: that used to be a close with NO --result at all; a FIRST close with a blank
+# reason is now refused on both verbs, so the emptiest REACHABLE shape is a minimal one.
+# The arm is adapted rather than dropped: what it grades is that the stamp APPENDS to
+# whatever the maker wrote instead of depending on there being room, and a one-word
+# result exercises that as well as an absent one did.
 seed AMB-2 'delivery is PR #6'
-run_done AMB-2
+run_done AMB-2 --result="delivered"
 res2=$(db "SELECT COALESCE(result,'') FROM tasks WHERE ident='AMB-2';")
 [[ $RC -eq 0 && "$res2" == *"merge-gate: UNVERIFIED"* ]] \
   && ok_t 'the UNVERIFIED stamp lands even on a close with no --result of its own' \

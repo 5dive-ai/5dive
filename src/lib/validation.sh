@@ -87,7 +87,7 @@ valid_channel() {
   [[ -n "$1" ]] || return 1
   local IFS=',' c
   for c in $1; do
-    [[ "$c" =~ ^(none|telegram|discord|dashboard)$ ]] || return 1
+    [[ "$c" =~ ^(none|telegram|discord|dashboard|buzz)$ ]] || return 1
     if [[ "$c" == "none" && "$1" != "none" ]]; then return 1; fi
   done
   return 0

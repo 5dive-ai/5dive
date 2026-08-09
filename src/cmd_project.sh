@@ -193,7 +193,8 @@ cmd_project_show() {
   # --- DIVE-981 dependency graph + critical path ---
   if (( edges == 0 )); then
     (( n > 0 )) && printf '\nDependency graph: no task_deps recorded (%s independent task(s)).\n' "$n"
-    return
+    return 0   # DIVE-2751: a BARE `return` inherits $? from the line above, so a
+               # project with zero tasks rendered in full and then exited 1.
   fi
   printf '\nDependency graph  (%s task(s), %s layer(s), %s edge(s); \xe2\x97\x86 = critical path)\n\n' \
          "$n" "$layers" "$edges"
@@ -209,4 +210,6 @@ cmd_project_show() {
   done < <(printf '%s' "$graph" | jq -r '.[] | [.ident, .status, .title, (.layer|tostring), (.critical|tostring), .blockers] | @tsv')
   [[ -n "$chain" ]] && printf '\nCritical path:  %s  (%s step(s))\n' \
     "$chain" "$(( $(printf '%s' "$chain" | grep -o ' -> ' | wc -l) + 1 ))"
+  return 0   # DIVE-2751: a render that reached the end succeeded, whatever the
+             # last conditional chose not to print.
 }
