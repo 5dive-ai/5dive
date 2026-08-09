@@ -49,6 +49,7 @@ _task_usage() {
                                                      # the task to the new grader. No detach: opting out is add-time only.
   5dive task set-branch <id|DIVE-N> <branch>         # bind the task to a git branch for delegated push (DIVE-1462/1697);
                                                      # writes/updates a 'Branch: <name>' line in the body. Also: task add --branch=<name>
+  5dive task set-title <id|DIVE-N> <text...>        # DIVE-2848: fix a wrong/overstated title. The title is what the NEXT reader sees first (board, digest, gate alert); a body appendix does not retract it. Overwrite-only, audited with the prior title, refused on a closed task.
   5dive task set-body <id|DIVE-N> <text...>|--file=<path> [--append]
                                                      # --file reads the body VERBATIM from a file (DIVE-2627) and is the only
                                                      # form that preserves newlines: positional words are re-joined with spaces.
@@ -129,7 +130,8 @@ _task_usage() {
     --discusses="<why>" (DIVE-2089, --type=decision ONLY): appeal a T2 floor that fired on SUBJECT MATTER. A design question that merely NAMES secrets/publishing/deletion performs none of them; declare that and the gate goes to your lead at tier 1 instead of the human. The declaration is recorded on the gate, shown to the reviewer, and audited — unlike rewording the ask, which reaches the same audience with no record of how. Refused, loudly, for money / customer comms / irreversible infra, for a pinned --tier=2, and when no lead sits above you.
     --needs=<capability> (DIVE-2241): DECLARE what this ask consumes. human_tap (a person's call: brand, strategy, irreversible), spend_authority (billing, paid accounts), secret_provision (a new token/credential) resolve to the paired human as CONSTANTS — the gate skips lead- AND verifier-routing and cannot be agent-cleared. Fixes: a gate on a verifier-loop task otherwise routes to whoever is GRADING the ticket, whatever it asks. Declared, never guessed from your wording; any other value is undeclared-equivalent and changes nothing (it never refuses).
     --recommend: your advised choice (strongly encouraged for decision/approval). Leads the alert as '✅ Recommended: <X>' and ⭐-marks its button. For a decision it must match one of --options.
-    --tier (DIVE-891 risk tiers): 0 = auto-clear (rec applies NOW, no ping, digest line; requires --recommend)
+    --rubber-stamp-ok="<why>" (DIVE-2848, decision/approval ONLY): the AUDITED exception to the keystroke cap. A --tier=2 decision/approval gate that carries your own --recommend, hits no category floor and declares no --needs is REFUSED — you already decided, so asking a person to agree is reassurance, not a gate (measured: 96 of 107 such gates came back as the human tapping your own value). Declare why a person must answer anyway and it files, recorded on the row and countable. Refused in turn when >10 of your last 20 answered recommended gates were tapped back.
+    --tier (DIVE-891 risk tiers): 0 = auto-clear (rec applies NOW, no ping, digest line; requires --recommend)  <-- THE DEFAULT YOU WANT on a decision you have already made: "I decided X, here is the receipt" is a tier-0 gate. Used 0 times in 346 gates measured.
              1 = agent-clearable; unanswered 48h -> the heartbeat applies the rec   2 = hard human gate (default for approval/secret/manual)
              Money, public comms, secrets and destructive asks are FLOORED to tier 2 no matter what you pass; secret is always tier 2.
                                                      # -> blocked, awaiting a human (decision/secret/approval/manual)
@@ -298,6 +300,7 @@ cmd_task() {
     assign)          cmd_task_assign "$@" ;;
     set-branch)      cmd_task_set_branch "$@" ;;
     set-body)        cmd_task_set_body "$@" ;;
+    set-title)       cmd_task_set_title "$@" ;;
     start)           cmd_task_start "$@" ;;
     done|close)      cmd_task_done "$@" ;;
     deliver)         cmd_task_deliver "$@" ;;
@@ -470,6 +473,58 @@ cmd_task_set_body() {
     --arg id "$ident" --arg m "$mode" \
     --argjson pl "$prior_len" --argjson nl "$new_len" \
     --argjson pls "$prior_lines" --argjson nls "$new_lines"
+}
+
+# `5dive task set-title <id|DIVE-N> <text...>` — DIVE-2848. `set-body` has existed
+# since DIVE-1920 for exactly this reason and the title had no equivalent: after
+# `task add` it was immutable except by a direct sqlite UPDATE, which scoped-sudo
+# makers cannot do. That asymmetry is the wrong way round. A body correction lands
+# where a careful reader will find it; a WRONG TITLE is what the next reader sees
+# FIRST, on the board, in the digest, in every gate alert — and this ticket's own
+# sibling DIVE-2846 shipped with an overstated claim in its title that only a body
+# appendix retracts. Overwrite-only (there is no coherent "append" to a title), and
+# audited with the PRIOR title, because a retitle is exactly the edit that makes the
+# earlier discussion of a row unreadable if nobody can see what it used to say.
+# Refuses on a closed task, same guard as set-body: a closed row is frozen.
+cmd_task_set_title() {
+  tasks_db_init
+  local task=""
+  local -a words=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --)            shift; words+=("$@"); break ;;
+      -*)            fail "$E_USAGE" "unknown flag: $1" ;;
+      *)             if [[ -z "$task" ]]; then task="$1"; else words+=("$1"); fi ;;
+    esac
+    shift
+  done
+  local text="${words[*]:-}"
+  [[ -n "$task" && -n "$text" ]] \
+    || fail "$E_USAGE" "usage: 5dive task set-title <id|DIVE-N> <text...>"
+  # A title is a single line by construction — it renders on one row of the board
+  # and inside one Telegram alert. Collapse rather than refuse: the caller's shell
+  # may have handed us words that already lost their newlines anyway.
+  text="${text//$'\n'/ }"
+  [[ ${#text} -le 200 ]] \
+    || fail "$E_VALIDATION" "title is ${#text} chars; keep it under 200 so it survives the board, the digest and a gate alert without truncation. Put the detail in the body: 5dive task set-body $task --append \"...\""
+  resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  local st; st=$(db "SELECT status FROM tasks WHERE id=${id};")
+  [[ "$st" != "done" && "$st" != "cancelled" ]] \
+    || fail "$E_VALIDATION" "$ident is already $st — its title is frozen (closed tasks don't get retro-edited; bounce it back first with: 5dive task reject $ident --feedback=\"…\")"
+  local prior; prior=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
+  if [[ "$prior" == "$text" ]]; then
+    ok "$ident title unchanged (already \"$text\")" '{ident:$id, changed:false, title:$t}' \
+       --arg id "$ident" --arg t "$text"
+    return 0
+  fi
+  db "UPDATE tasks SET title=$(sqlq "$text") WHERE id=${id};"
+  # The PRIOR title is the payload here. Without it the audit row records that a
+  # retitle happened and destroys the only copy of what it replaced.
+  _task_store_audit_log "task set-title" "ok" 0 -- \
+    "task=$ident" "actor=$(task_actor)" "prior=$prior" "new=$text" || true
+  ok "$ident retitled: \"$prior\" -> \"$text\"" \
+     '{ident:$id, changed:true, prior_title:$p, title:$t}' \
+     --arg id "$ident" --arg p "$prior" --arg t "$text"
 }
 
 cmd_task_init() {
@@ -1507,6 +1562,10 @@ cmd_task_show() {
                       CASE WHEN tier IS NOT NULL THEN '  (tier '||tier||')' ELSE '' END||
                       CASE WHEN need_options IS NOT NULL THEN '  options: '||need_options ELSE '' END||
                       CASE WHEN recommend IS NOT NULL THEN x'0a'||'recommend: '||recommend ELSE '' END||
+                      -- DIVE-2848: the audited exception to the keystroke cap, shown
+                      -- next to the recommendation it overrode, because the pair is
+                      -- the whole claim (I advised X and still needed a person).
+                      CASE WHEN gate_rubber_stamp IS NOT NULL THEN x'0a'||'rubber-stamp-ok: '||gate_rubber_stamp ELSE '' END||
                       CASE WHEN precedent_ref IS NOT NULL
                            THEN x'0a'||'precedent: '||COALESCE((SELECT ident FROM tasks p WHERE p.id=tasks.precedent_ref),'#'||precedent_ref) ELSE '' END||
                       -- DIVE-2615: why this gate has this tier. Absent on rows filed
@@ -7447,9 +7506,86 @@ _gate_option_has_second_person() {
   LC_ALL=C grep -Eiq '(^|[^[:alnum:]_])(you|your|yours|yourself|yourselves)([^[:alnum:]_]|$)' <<<"${1:-}"
 }
 
+# DIVE-2848 — THE KEYSTROKE CAP ON RUBBER-STAMP GATES.
+#
+# lodar, 2026-08-06 04:11Z: "im fighting with unnecessary human gates for the past
+# three weeks", after "im tired of rubber tapping". The policy that should have
+# prevented it has been in CLAUDE.md since 2026-06-29, is unambiguous, and is
+# fleet-visible. Measured over 2026-07-16..2026-08-07 anyway: of 107 human-answered
+# JUDGMENT gates that carried a --recommend, 96 (90%) came back as the human tapping
+# that same value. Only 7 gates in the whole window were keyword-floored to tier 2 —
+# the rest of the tier-2 population is agents TYPING --tier=2 on decision, a type
+# that defaults to 1. `--tier=0` was used 0 times in 346 gates.
+#
+# So this is not an intent problem and not a floor-heuristic problem. A policy is
+# indexed by TOPIC (a bullet in a doc you read when thinking about gates); the act is
+# a KEYSTROKE (you are mid-task, you type the flag). The two never meet. Same defect
+# shape the filing cap already solved once: it does not ask agents to file fewer rows,
+# it REFUSES at `task add` and names the exits.
+#
+# The rule encoded below: A GATE WHOSE RECOMMENDATION YOU ARE CONFIDENT ENOUGH TO
+# WRITE IS A GATE YOU CAN TAKE. Writing --recommend is deciding; what remains is
+# asking a person to agree with a decision already made, which is reassurance.
+#
+# DELIBERATELY OUT OF SCOPE of the refusal — each of these is a real tier 2:
+#   * the T2 category floor (money / public comms / secrets / destructive). Those are
+#     tier 2 on SUBJECT MATTER, the filer cannot lower them, and --discusses is their
+#     own audited appeal. `tier_floored==1` excludes them here.
+#   * a DECLARED --needs=human_tap|spend_authority|secret_provision (DIVE-2241) — that
+#     names a capability the filer does not hold, which is the honest hard gate.
+#   * manual / secret / access, which are tier 2 by TYPE. Those defaults are the other
+#     half of this ticket and are NOT touched here: on --type=secret a tier-2 default
+#     is correct and must stay permanent.
+#
+# _gate_tapback_stats <filer> — this filer's recent rubber-stamp rate over their own
+# last _GATE_TAPBACK_WINDOW human-answered judgment gates that carried a
+# recommendation. Prints "<taps> <total>"; prints "0 0" on any error, i.e. FAIL-OPEN,
+# because the instance-level cap is the enforcing rail and a measurement that cannot
+# run must not become a block nobody can explain.
+#
+# The tap test is SEMANTIC, not string equality, and that is load-bearing. This
+# ticket's first measurement read 45% because it compared need_answer to recommend
+# with `=`: on an approval the human's tap normalises to 'approved' while the
+# recommendation is free text ("approve", "Push it", ...), so 45 of 47 genuine taps
+# scored as overrides. lodar caught it himself ("i tap on recs much more... more like
+# 98%"). The denominator is judgment gates WITH a recommendation only — manual /
+# secret / access carry nothing to tap back, and mixing them in dilutes precisely the
+# number being acted on.
+_GATE_TAPBACK_WINDOW=20      # M — the filer's own last M answered judgment gates
+_GATE_TAPBACK_MIN=8          # below this a share is noise, not a pattern
+_GATE_TAPBACK_MAX_TAPS=10    # N — refuse the escape above N taps within the window
+_gate_tapback_stats() {
+  local who="$1" out=""
+  [[ -n "$who" ]] || { printf '0 0'; return 0; }
+  out=$(db "SELECT COALESCE(SUM(tap),0)||' '||COUNT(*) FROM (
+        SELECT CASE
+          WHEN need_type='decision'
+               AND lower(trim(need_answer))=lower(trim(recommend)) THEN 1
+          WHEN need_type='approval'
+               AND lower(trim(need_answer)) LIKE 'approv%'
+               AND lower(trim(recommend)) NOT LIKE 'den%'
+               AND lower(trim(recommend)) NOT LIKE 'reject%'
+               AND lower(trim(recommend)) NOT LIKE 'no%' THEN 1
+          WHEN need_type='approval'
+               AND (lower(trim(need_answer)) LIKE 'den%' OR lower(trim(need_answer)) LIKE 'reject%')
+               AND (lower(trim(recommend)) LIKE 'den%' OR lower(trim(recommend)) LIKE 'reject%'
+                    OR lower(trim(recommend)) LIKE 'no%') THEN 1
+          ELSE 0 END AS tap
+        FROM tasks
+        WHERE gate_filed_by=$(sqlq "$who")
+          AND need_type IN ('decision','approval')
+          AND recommend IS NOT NULL AND trim(recommend) <> ''
+          AND need_answer IS NOT NULL
+          AND need_answered_by LIKE 'human:%'
+        ORDER BY COALESCE(need_asked_at, updated_at) DESC
+        LIMIT ${_GATE_TAPBACK_WINDOW});" 2>/dev/null) || out=""
+  [[ "$out" =~ ^[0-9]+\ [0-9]+$ ]] || out='0 0'
+  printf '%s' "$out"
+}
+
 cmd_task_need() {
   tasks_db_init
-  local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw="" discusses="" needs="" oob=""
+  local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw="" discusses="" needs="" oob="" rubber_stamp=""
   # DIVE-2627: which flag supplied each prose value (see _read_prose_file).
   local ask_src="" recommend_src=""
   local -a positional=()
@@ -7498,12 +7634,25 @@ cmd_task_need() {
       # inferred — inferring it from --type or from the ask text would be the
       # DIVE-2089 mistake one layer up (reading subject matter to guess intent).
       --needs=*)     needs="${1#*=}" ;;
+      # DIVE-2848: the AUDITED exception to the keystroke cap below. Declared,
+      # never inferred, and written to the gate row — an escape that leaves no
+      # record is `--tier=2` with extra steps, which is the thing being fixed.
+      --rubber-stamp-ok=*) rubber_stamp="${1#*=}" ;;
       --)          shift; positional+=("$@"); break ;;
       -*)          fail "$E_USAGE" "unknown flag: $1" ;;
       *)           positional+=("$1") ;;
     esac
     shift
   done
+  # DIVE-2848: the FILER'S OWN --recommend, captured before anything can write to
+  # `recommend`. The cap below refuses a hand-typed tier 2 on the premise "you wrote
+  # a recommendation, so you already decided" — and by the time the cap runs,
+  # `recommend` may have been PREFILLED from a precedent (OSS-11/OSS-20/OSS-21) that
+  # the filer never typed. Keying the cap on the post-prefill variable would refuse a
+  # gate for a decision the machine made on the filer's behalf, which inverts the
+  # rule. Caught by tests/gate_precedent_unit.sh A5, whose fixture passes no
+  # --recommend at all and was refused anyway.
+  local recommend_arg="$recommend"
   [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task need <id|DIVE-N> --type=decision|secret|approval|manual --ask=\"...\" [--options=A|B] [--recommend=\"A\"] [--needs=human_tap|spend_authority|secret_provision] [--discusses=\"why this decision only DISCUSSES a floored category\"]  (--type=secret also needs a delivery path: --secret-key=<ENV_NAME> --connector=<stem>, or --out-of-band=\"<where the value lands>\"; or --withdraw to cancel a moot pending gate)"
   resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
 
@@ -7648,6 +7797,16 @@ cmd_task_need() {
       || fail "$E_VALIDATION" "--discusses only applies to --type=decision — a $type gate requests an ACTION, so it cannot be 'only discussing' the category. If this really is a design question, file it as --type=decision."
     [[ ${#discusses} -ge 12 ]] \
       || fail "$E_VALIDATION" "--discusses must state WHY this gate discusses rather than performs (it is recorded on the gate and read by the reviewer who clears it)"
+  fi
+  # DIVE-2848: --rubber-stamp-ok is the audited exception to the keystroke cap
+  # further down. Same shape as --discusses on purpose: declared by the filer,
+  # required to have substance, recorded on the row, and REFUSED where it would be
+  # meaningless rather than silently ignored.
+  if [[ -n "$rubber_stamp" ]]; then
+    [[ "$type" == "decision" || "$type" == "approval" ]] \
+      || fail "$E_VALIDATION" "--rubber-stamp-ok only applies to --type=decision or --type=approval — those are the two types the keystroke cap governs. manual/secret/access default to tier 2 by TYPE and need no escape from it."
+    [[ ${#rubber_stamp} -ge 12 ]] \
+      || fail "$E_VALIDATION" "--rubber-stamp-ok must state WHY a person has to answer this despite your own --recommend (it is recorded on the gate and read by whoever counts these exceptions later)"
   fi
 
   # DIVE-1243: self-check for the manager-clearable `access` class. An access gate
@@ -8376,6 +8535,59 @@ cmd_task_need() {
   # delivery, not after: the delivery log is the input, so once task_need_notify
   # has run, the gate's own fresh button is in there too and would be stripped by
   # its own filing. Order is the correctness condition here, not a preference.
+  # DIVE-2848: THE KEYSTROKE CAP. See the block comment above cmd_task_need for the
+  # measurement and the rule. Placed HERE, after every floor / downgrade / declaration
+  # has had its turn, so the condition reads exactly as "this gate is tier 2 for no
+  # reason other than that the filer typed --tier=2": tier_floored==0 excludes the T2
+  # category floor AND the --needs re-assert, both of which set it.
+  #
+  # tier_floored==0 IS NOT "no category applies" ON THIS PATH, and assuming it was
+  # is the one way this cap could do damage. The T2 category floor only ever runs
+  # to RAISE a tier below 2 — there is nothing for it to raise when the filer typed
+  # --tier=2, so a money/secret/destructive gate filed AT tier 2 arrives here with
+  # tier_floored still 0, indistinguishable from a rubber stamp. Caught by the
+  # money control in tests/gate_recommend_cap_unit.sh (B3), which refused
+  # "approve the monthly spend on the paid Hetzner plan". Re-running the classifier
+  # here is the fix; reading the flag is not. (The refusal would not have AUTHORISED
+  # anything — a re-file at --tier=0 gets floored straight back to 2 — but it would
+  # have told an agent holding a genuine spend gate that they were rubber-stamping,
+  # which is worse than useless from a cap whose whole claim is that it knows the
+  # difference.)
+  local _rs_capped=0 _rs_taps=0 _rs_tot=0 _rs_title=""
+  _rs_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
+  if [[ ( "$type" == "decision" || "$type" == "approval" ) \
+        && "$tier" == "2" && "$tier_arg" == "2" && "$tier_floored" == "0" \
+        && "$_needs_human" != "1" && -n "$recommend_arg" ]] \
+     && ! _gate_hit_either _gate_tier2_floor_hit "$ask" "$_rs_title"; then
+    read -r _rs_taps _rs_tot <<<"$(_gate_tapback_stats "$actor")"
+    if [[ -z "$rubber_stamp" ]]; then
+      _task_store_audit_log "task need rubber-stamp-cap" "refused" 0 -- \
+        "task=$ident" "filer=$actor" "type=$type" "recommend=$recommend" \
+        "tapbacks=${_rs_taps}/${_rs_tot}" "reason=tier-2 with a recommendation and no declared capability" || true
+      fail "$E_VALIDATION" "$ident: refusing this --tier=2 ${type} gate. You wrote --recommend=\"${recommend}\", which means you have already decided — what is left is asking a person to agree, and that is reassurance, not a gate. (Measured 2026-07-16..08-07: 96 of 107 judgment gates carrying a recommendation came back as the human tapping that same value. Only 7 gates in 346 were floored by category; the rest of tier 2 was typed by hand.) A tier is a CAPABILITY, not a difficulty. Your exits:
+  --tier=0    apply \"${recommend}\" NOW. No ping, and still a permanent gate record plus a digest line. This is the exit you want on a decision you have already made — it was used 0 times in the 346 gates measured, which is a discoverability failure, not a missing feature.
+  --tier=1    route to your lead, or to this task's verifier if it carries a loop; the 48h TTL applies your recommendation if nobody answers. Use it when you want a second pair of eyes, not a person's authority.
+  --needs=human_tap|spend_authority|secret_provision    DECLARE the human-held capability this ask consumes (a person's call on brand/strategy, money, or a credential only a human can issue). Tier 2 by declaration, never refused here.
+  --rubber-stamp-ok=\"<why a person must answer this despite your recommendation>\"    the audited exception. Recorded on the gate row and readable afterwards.
+If you cannot name the capability, this is a decision you find uncomfortable, not a human gate."
+    fi
+    # The escape exists for an EXCEPTION. Rate-limit the CLASS, not just the
+    # instance (ticket item 3): past the cap, the exception IS the pattern, and the
+    # only honest exit left is naming a capability. Fail-open below the minimum
+    # sample — a new filer with no history must not inherit a refusal.
+    if (( _rs_tot >= _GATE_TAPBACK_MIN && _rs_taps > _GATE_TAPBACK_MAX_TAPS )); then
+      _task_store_audit_log "task need rubber-stamp-cap" "refused-rate" 0 -- \
+        "task=$ident" "filer=$actor" "type=$type" "tapbacks=${_rs_taps}/${_rs_tot}" \
+        "declared=$rubber_stamp" || true
+      fail "$E_VALIDATION" "$ident: refusing this --tier=2 ${type} gate AND its --rubber-stamp-ok escape. ${_rs_taps} of your last ${_rs_tot} human-answered gates that carried a recommendation came back as the human tapping that same value; the cap is ${_GATE_TAPBACK_MAX_TAPS} in ${_GATE_TAPBACK_WINDOW}. The escape is for an exception, and at this rate it is your pattern. Remaining exits: --tier=0 (apply \"${recommend}\" now, no ping, permanent record), --tier=1 (lead/verifier, TTL applies the rec), or --needs=<capability> if this genuinely consumes something you do not hold. The window is rolling — as those gates age out, the cap lifts on its own."
+    fi
+    _rs_capped=1
+    warn "tier-2 escape ACCEPTED and RECORDED: --rubber-stamp-ok=\"${rubber_stamp}\". You wrote a recommendation and are still sending this to a person; the reason is now on the gate row (task show) and in the audit log, so this exception is countable instead of invisible. Your recent rubber-stamp rate is ${_rs_taps}/${_rs_tot}."
+  fi
+  if [[ -n "$rubber_stamp" && "$_rs_capped" == "0" ]]; then
+    warn "--rubber-stamp-ok changed nothing on this gate — the keystroke cap did not fire (type=${type}, tier=${tier}$( ((tier_floored)) && printf ', floored by category or declaration')). The declaration is still written to the row, so it stays readable; it just did not need to buy anything."
+  fi
+
   _task_gate_retire_buttons "$ident" "superseded by a re-filed gate" || true
 
   db "BEGIN IMMEDIATE;
@@ -8444,6 +8656,11 @@ cmd_task_need() {
             -- provenance; whether it resolved is recomputable from the sealed
             -- list, and a mis-declaration you cannot see is one you cannot correct.
             needs_capability=$(sqlq_or_null "$needs"),
+            -- DIVE-2848: the declared reason a gate carrying its own recommendation
+            -- still went to a person. The cap's value is that the exception is
+            -- COUNTABLE afterwards — an escape that leaves no row is --tier=2 with
+            -- extra steps, which is the thing this ticket exists to end.
+            gate_rubber_stamp=$(sqlq_or_null "$rubber_stamp"),
             tier=${tier}, need_asked_at=datetime('now'), gate_pinged_at=NULL,
             gate_filed_by=$(sqlq "$actor")
       WHERE id=${id};
@@ -9064,8 +9281,8 @@ cmd_task_need() {
     unnotified_note=" [UNNOTIFIED — nobody was pinged; answer on the dashboard or: 5dive task answer ${ident}]"
   fi
   ok "$ident needs a human ($type, tier $tier)${floor_note}${prec_note}${unnotified_note} — $ask" \
-     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), floor_term:(($ft|select(length>0)) // null), needs_capability:(($nc|select(length>0)) // null), needs_human:($nh=="1"), notified:($nf=="1"), ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), precedent_ref:(($pr|select(length>0)|tonumber?) // null), assignee:$ac}' \
-     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg ft "$floor_term" --arg nc "$needs" --arg nh "$_needs_human" --arg nf "$notified" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg pr "$precedent_ref" --arg ac "$actor"
+     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), floor_term:(($ft|select(length>0)) // null), needs_capability:(($nc|select(length>0)) // null), needs_human:($nh=="1"), rubber_stamp_ok:(($rs|select(length>0)) // null), notified:($nf=="1"), ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), precedent_ref:(($pr|select(length>0)|tonumber?) // null), assignee:$ac}' \
+     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg ft "$floor_term" --arg nc "$needs" --arg nh "$_needs_human" --arg rs "$rubber_stamp" --arg nf "$notified" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg pr "$precedent_ref" --arg ac "$actor"
 }
 
 # _task_owner_channel — resolve the filing agent's bot token + the per-type

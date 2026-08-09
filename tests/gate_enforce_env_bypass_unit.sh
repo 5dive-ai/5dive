@@ -223,7 +223,7 @@ rm -f "$ALT_SENTINEL"
 : > "$DEFAULT_SENTINEL"   # the live posture: enforcement armed by the root-owned file
 
 file_gate DIVE-401 decision --ask="approve the spend for the volume resize" \
-  --options="A|B" --recommend="A" --tier=2
+  --options="A|B" --recommend="A" --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
 [[ "$(tierof DIVE-401)" == "2" ]] \
   && ok_t "E0 precondition: the gate really is tier 2" \
   || bad_t "E0 tier-2 precondition" "tier=$(tierof DIVE-401)"
@@ -253,7 +253,7 @@ grep -qi 'unproven\|tier-2' <<<"$out" \
 # Half 2 of the fix, isolated: even with NO sentinel anywhere — the state the override
 # used to fake — the tier-2 floor stands on its own.
 rm -f "$DEFAULT_SENTINEL"
-file_gate DIVE-402 decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2
+file_gate DIVE-402 decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
 out=$(answer DIVE-402 --value=A); rc=$?
 [[ $rc -ne 0 && "$(answered DIVE-402)" == "open" ]] \
   && ok_t "E5 with enforcement genuinely OFF the tier-2 floor STILL refuses a non-human answer" \
@@ -265,7 +265,7 @@ out=$(answer DIVE-402 --value=A); rc=$?
 # nonce-bearing tier-2 gate is the DIVE-2356 evidence block. Enforcement is still
 # genuinely off here, so this arm reds if that block's flag conjunct comes back and
 # stays green if only the floor's does. Without it, half the fix is untested.
-file_gate DIVE-406 decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2
+file_gate DIVE-406 decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
 [[ "$(hashof DIVE-406)" =~ ^[0-9a-f]{64}$ ]] || bad_t "E6 precondition: gate minted a nonce" "hash='$(hashof DIVE-406)'"
 out=$(answer DIVE-406 --value=A --human); rc=$?
 [[ $rc -ne 0 && "$(answered DIVE-406)" == "open" ]] \
@@ -275,7 +275,7 @@ out=$(answer DIVE-406 --value=A --human); rc=$?
 
 # ── L2: liveness. A harness whose every arm expects a refusal proves nothing. ─────
 as_human_on_box
-file_gate DIVE-403 decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2
+file_gate DIVE-403 decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
 out=$(answer DIVE-403 --value=A --human); rc=$?
 [[ $rc -eq 0 && "$(answered DIVE-403)" == "closed" ]] \
   && ok_t "L2 liveness: a REAL human path (non-agent SUDO_UID at EUID 0) still clears the same gate" \

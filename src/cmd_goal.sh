@@ -618,7 +618,14 @@ _goal_finish_with_plan() {
     # 48h-auto-applied, never quietly agent-cleared into a materialize). A
     # count-only checkpoint stays the default agent-clearable tier-1 decision.
     local -a tier_arg=()
-    if [[ "$GOAL_HAS_T2" == "1" ]]; then reason="carries a Tier-2 task"; tier_arg=(--tier=2); fi
+    # DIVE-2848: DECLARE the capability, do not just pin the tier. A plan carrying a
+    # Tier-2 task materializes money/publish/secret/destructive work, which is a
+    # person's call on an irreversible choice — that is human_tap by the DIVE-2241
+    # definition. Without the declaration the keystroke cap refuses this gate
+    # outright, because from its side "--tier=2 with a --recommend" is exactly the
+    # rubber-stamp shape; with it, the gate is hard-human by declaration and is also
+    # no longer misroutable to the anchor task's verifier.
+    if [[ "$GOAL_HAS_T2" == "1" ]]; then reason="carries a Tier-2 task"; tier_arg=(--tier=2 --needs=human_tap); fi
     # DIVE-1930: this used to capture the gate envelope into `gate_json` and never
     # read it. A capture that is never inspected reads at review time like a
     # checked result and is not one — which is why the empty-envelope bug could
