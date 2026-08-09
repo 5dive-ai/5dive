@@ -85,6 +85,12 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: core-pristine, path: core-pristine.txt, if-no-files-found: warn }
+      # DIVE-3017: the bun step above is a DECLARATION and a succeeding declaration
+      # was already shown not to imply a graded harness. This reads the outcome back
+      # out of the report just written: rc=0 AND seconds-scale, which together are
+      # satisfied only by the ACP stdio scenarios having actually run.
+      - name: The ACP server must have been GRADED (pristine)
+        run: bash tests/meta/harness-graded-union.sh --harness=acp_stdio_unit.sh --min-ms=1000 core-pristine.txt
 
   # DIVE-1919: the bare runner above is a PRISTINE box — no /var/lib/5dive, no
   # installed plugins. That is NOT the environment any agent actually runs the
@@ -296,6 +302,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: core-installed, path: core-installed.txt, if-no-files-found: warn }
+      # DIVE-3017: same outcome assertion as the pristine job — see the comment there.
+      - name: The ACP server must have been GRADED (installed host)
+        run: bash tests/meta/harness-graded-union.sh --harness=acp_stdio_unit.sh --min-ms=1000 core-installed.txt
       # DIVE-2039: TWICE, and that is the point. DIVE-1989 stayed invisible for as
       # long as the audit log was measured from one side — the same command wrote 0
       # rows as an agent and 1 row under sudo. `audit-root` is honestly NOT-REACHED
