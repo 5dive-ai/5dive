@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TIER: core
+# TIER: nightly — 4.1s measured on THIS CONTROL PLANE (poke-two, 2026-08-09, `time bash tests/task_add_parent_citation_warning_mutation.sh` -> rc 0), NOT on CI: this file did not appear in the runner's top-10 so no CI figure exists for it, and the control plane runs the two files above SLOWER than ubuntu-latest does (50s vs 20s on gate_evidence_form_mutation), so treat 4.1s as an upper bound rather than a like-for-like number. Demoted under the mutation-harness rule (DIVE-2867), same class as the two above.
 # DIVE-2449 connection proof. Disconnect the production advisory with a
 # syntax-valid source mutation, then prove only the warning arm goes red while
 # the prose/--parent/nonexistent-ident controls remain green.

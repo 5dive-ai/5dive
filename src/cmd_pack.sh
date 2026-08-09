@@ -1140,7 +1140,7 @@ _pack_usage() {
                                   # hooks (arbitrary shell), skills, plugins, whether it
                                   # re-renders the system prompt, seeds memory, or adopts a
                                   # signing key. Run this BEFORE importing a third-party pack.
-  5dive agent import <pack|slug> --as=<name> [--channels=none|telegram|discord|dashboard[,ch...]]
+  5dive agent import <pack|slug> --as=<name> [--channels=none|telegram|discord|dashboard|buzz[,ch...]]
                             [--telegram-token=<tok>] [--discord-token=<tok>]
                             [--auth-profile=<name>] [--workdir=<path>] [--report-import] [--allow-hooks]
                             [--type=<type>] [--provider=<id> --api-key=<key|->] [--model=<slug>]

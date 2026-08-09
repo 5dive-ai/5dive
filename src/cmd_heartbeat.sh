@@ -1302,17 +1302,40 @@ _hb_is_knowledge_task() {
 # live verifier loop — the MAKER variant before the handoff, the VERIFIER variant
 # after it — empty otherwise. Never fails the wake: any DB trouble yields "".
 #
-# WHY BOTH HALVES EXIST. The /goal condition accepts exactly three terminal states
-# (done, cancelled, human gate). A loop rail has TWO roles and each has a correct,
+# WHY EACH HALF EXISTS. The /goal condition accepts exactly three terminal states
+# (done, cancelled, human gate). A loop rail has THREE roles and each has a correct,
 # complete action that reaches NONE of them:
 #   - maker: `task done` DELIVERS (status stays todo, assignee moves to the
 #     verifier). Fixed by DIVE-2063.
-#   - verifier: `task reject` returns a FAIL verdict (status back to todo, assignee
-#     back to the maker). DIVE-2063 declined this half on the premise that "for the
-#     verifier, the terminal close really is theirs" — false: accept is only ONE of
-#     the verifier's two terminal actions, and the other one wedges the session the
-#     same way (measured on DIVE-2090). A terminal-state clause has to enumerate
-#     TERMINAL ACTIONS, not the happy-path close.
+#   - verifier AFTER the handoff: `task reject` returns a FAIL verdict (status back
+#     to todo, assignee back to the maker). DIVE-2063 declined this half on the
+#     premise that "for the verifier, the terminal close really is theirs" — false:
+#     accept is only ONE of the verifier's two terminal actions, and the other one
+#     wedges the session the same way (measured on DIVE-2090). A terminal-state
+#     clause has to enumerate TERMINAL ACTIONS, not the happy-path close.
+#   - verifier-of-record BEFORE any handoff (maker_agent EMPTY): the row was routed
+#     here for a DECISION, not to be built or graded. Its complete action is to make
+#     the call and ROUTE THE ROW ON — `task assign`. DIVE-2111's comment called this
+#     agent "just an ordinary owner" and gave it nothing, which is right about
+#     `reject` (genuinely refused with no maker) and wrong about the role: an
+#     ordinary owner is not a null role, it is the third one. Measured six times,
+#     last on DIVE-2745 where it wedged olivia's session across ~8 stop attempts.
+#     Fixed by DIVE-2834.
+#
+# WHY THE CLAUSE TELLS THE AGENT TO RE-READ (DIVE-2834, the sharper half). This
+# generator runs ONCE, at wake, and its output is frozen into the goal text — but
+# `maker_agent` is a LIVE COLUMN, and the tick cannot re-mint the clause mid-session
+# because its own busy-guard skips an agent whose task is already in_progress (see
+# the header of this file). So a role-derived instruction is cached against a role
+# that is not stable for the life of the instruction: on DIVE-2745 the row began
+# with no maker, was reassigned out, was built and delivered BACK, and at that point
+# the verifier variant's predicate was satisfied — about the same row and the same
+# agent, with no event in between other than the rail working as designed. The only
+# variant that can be overtaken this way is the third one (the other two are already
+# at the end of their role's life), so IT, and only it, also names the role it can
+# turn into and points at `task show` as the authority at the moment of acting.
+# Re-evaluation still happens — moved from generator-time to act-time, and done by
+# the reader against the source of truth rather than by a snapshot that cannot know.
 #
 # WHY IT IS NOT A FAIL-OPEN. The obvious wrong version of this ("a todo task with
 # something in its result field counts as done") would let a maker satisfy the goal
@@ -1332,20 +1355,48 @@ _hb_is_knowledge_task() {
 #      equals the woken agent by construction — a state the maker can genuinely
 #      reach.
 #   4. Verifier variant: gated on maker_agent being set, i.e. the SAME predicate
-#      `task show` uses to print the handoff line. Before delivery a verifier is
-#      just an ordinary owner and gets nothing; and the action it names (`task
-#      reject`) is itself refused by `cmd_task_reject` unless a maker exists, so
-#      the clause can never point at a verb the rail would reject.
+#      `task show` uses to print the handoff line — so it never names `task
+#      reject`, which `cmd_task_reject` refuses unless a maker exists.
+#   5. Routing variant: the mirror image — gated on maker_agent being EMPTY, so it
+#      and (4) are mutually exclusive by construction and neither can fire on the
+#      other's state. The state it names is `assignee = <someone else>`, which the
+#      agent cannot reach while still holding the row: satisfying it means actually
+#      DIVESTING the task, not writing a field. It is not a "punt anywhere" either
+#      — it names ONE default destination, `created_by`, the agent that filed the
+#      row and is asking for the answer, and it requires the decision to be
+#      recorded on the row BEFORE the routing (a routed row with no reason is the
+#      DIVE-2683 empty-cancel defect one verb over).
+#
+#      AND IT ASSERTS NO ROLE IT CANNOT DERIVE (olivia, iteration 1 reject). The
+#      first cut of this variant stated "this row was routed to you for a DECISION,
+#      not to build and not to grade" as flat fact. The predicate does not select
+#      that: `verifier == assignee && maker_agent EMPTY` is ALSO the shape of a row
+#      that is simply the owner's to do. Measured on the live board, 12 closed rows
+#      have ever been in this shape and 6 are in the guard's firing set; of those 6,
+#      DIVE-2456, DIVE-1956 and DIVE-1789 were owners doing or grading their own
+#      work, and in each the correct terminal was the `done` the first cut warned
+#      against and never offered. Those rows got silence before the change and would
+#      have got a confident wrong premise after it — the worse direction, and this
+#      row's own defect class one role over. So the clause now states only what the
+#      spec settles (nothing delivered, no handoff, `reject` would refuse), says
+#      outright that routed-vs-yours-to-do is indistinguishable here, and lists BOTH
+#      terminals: `task assign` for the routed case, `task done` for the do-it-
+#      yourself case. It stays silent when
+#      created_by is empty or is the woken agent itself, i.e. whenever there is no
+#      named party to route to — silence is the correct output there, and the base
+#      nudge's own gate path is the exit.
 _hb_loop_terminal_clause() {
   local name="$1" task_id="$2" task_ident="$3"
   [[ "$task_id" =~ ^[0-9]+$ ]] || return 0
-  local row vfier maker
-  # One read, two fields: the verifier selects the variant, maker_agent proves the
-  # handoff. '|' is safe as a separator — both are agent names (validated slugs).
-  row=$(db "SELECT COALESCE(verifier,'')||'|'||COALESCE(maker_agent,'') FROM tasks
+  local row vfier maker creator rest
+  # One read, three fields: the verifier selects the variant, maker_agent proves
+  # (or disproves) the handoff, created_by names the routing variant's destination.
+  # '|' is safe as a separator — all three are agent names (validated slugs).
+  row=$(db "SELECT COALESCE(verifier,'')||'|'||COALESCE(maker_agent,'')||'|'||COALESCE(created_by,'')
+              FROM tasks
                WHERE id=${task_id} AND assignee=$(sqlq "$name")
                  AND status NOT IN ('done','cancelled');" 2>/dev/null) || return 0
-  vfier="${row%%|*}"; maker="${row#*|}"
+  vfier="${row%%|*}"; rest="${row#*|}"; maker="${rest%%|*}"; creator="${rest#*|}"
   [[ -n "$vfier" ]] || return 0
 
   if [[ "$vfier" != "$name" ]]; then
@@ -1357,8 +1408,26 @@ _hb_loop_terminal_clause() {
     return 0
   fi
 
+  # ROUTING variant (DIVE-2834) — verifier-of-record, but nothing delivered yet.
+  # Mutually exclusive with the verifier variant below by the maker_agent test.
+  if [[ -z "$maker" ]]; then
+    [[ -n "$creator" && "$creator" != "$name" ]] || return 0
+    printf ' NOTE — on %s you are the verifier-of-record and NOTHING HAS BEEN HANDED TO YOU: %s is empty, so nothing has been delivered, there is no handoff to grade, and %s would refuse. That is the whole of what the loop spec settles. It does NOT settle whether this row was ROUTED to you for a decision or is simply YOURS TO DO — those two states are identical in the spec — so both terminals are listed below and you pick from the body, not from this note. IF IT WAS ROUTED TO YOU FOR A DECISION: make the call, write it and its reason onto the row (%s), then run %s and treat the goal as MET, and stop, once %s prints an %s line naming someone other than you; %s filed this row and is the default destination, pick a different agent only if the body says so. IF THE WORK IS YOURS TO DO: do it and close it with %s — that is the honest terminal for this state and nothing here is steering you off it. Not available either way: grading an empty handoff, recording a done for work nobody did, or cancelling a live row to clear your board. AND RE-READ %s AT THE MOMENT YOU ACT, because this note was written when the row had no maker and that is a live column: if the work is built and delivered BACK to you inside this same session, %s will then print %s under %s and a %s line, and your terminal action becomes the VERIFIER'"'"'s — accept with %s, or return a FAIL verdict with %s.' \
+      "$task_ident" "'maker_agent'" "'task reject'" \
+      "'5dive task set-body ${task_ident}' or a gate answer" \
+      "'5dive task assign ${task_ident} ${creator}'" \
+      "'5dive task show ${task_ident}'" "'assignee ='" "$creator" \
+      "'5dive task done ${task_ident}'" \
+      "'5dive task show ${task_ident}'" "'5dive task show ${task_ident}'" \
+      "'maker: ${creator}'" "'loop spec:'" \
+      "'handoff: delivered (awaiting verifier ACK)'" \
+      "'5dive task done ${task_ident}'" \
+      "'5dive task reject ${task_ident} --feedback=\"<what to fix>\"'"
+    return 0
+  fi
+
   # VERIFIER variant — only once the maker has actually handed off.
-  [[ -n "$maker" && "$maker" != "$name" ]] || return 0
+  [[ "$maker" != "$name" ]] || return 0
   printf ' NOTE — you are the VERIFIER on %s (maker: %s) and the handoff is already delivered, so you are here to GRADE the work, not to build or rescue it. A FAIL verdict is a complete, terminal outcome: if it does not pass, run %s and treat the goal as MET, and stop — the reject is a SECOND terminal state for THIS goal even though it leaves status todo, because it bounces the task back to %s (%s will show %s and a %s result line). Report that you rejected and why. Do NOT record a done you do not believe, cancel work that is verified-good, or file a human gate for something %s can fix in another pass — a correct reject IS the terminal action, and forcing a done/cancel past it writes a false record to the board.' \
     "$task_ident" "$maker" "'5dive task reject ${task_ident} --feedback=\"<what to fix>\"'" \
     "$maker" "'5dive task show ${task_ident}'" "'assignee = ${maker}'" \

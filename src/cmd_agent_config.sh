@@ -362,7 +362,7 @@ cmd_config() {
     local gate_ch gate_marketplace gate_dir gate_waited
     for gate_ch in ${channels_changed_to//,/ }; do
       case "$gate_ch" in
-        telegram|dashboard) gate_marketplace="5dive-plugins" ;;
+        telegram|dashboard|buzz) gate_marketplace="5dive-plugins" ;;
         discord)            gate_marketplace="claude-plugins-official" ;;
         *) continue ;;
       esac

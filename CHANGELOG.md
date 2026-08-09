@@ -118,6 +118,63 @@ branch does not exist on the remote. Fleet coverage on this host went **1 → 22
 23**; the remaining one is a worktree owned by a uid this session cannot assume, and
 its origin is a local path whose target is guarded.
 
+## v0.19.0 — fix(tasks-db): converge schemas without taxing every init (DIVE-2197, DIVE-2808)
+
+The canonical `tasks` CREATE now contains all 72 columns, including the eight that
+previously existed only in the additive migration list (`delivery_ref`,
+`delivered_at`, `delivery_ref_iteration`, `parked_at`, `park_reason`,
+`escalated_at`, `escalated_by`, and `human_evidence`). `tasks_db_init` checks the
+current column set once and skips the full migration when it is already complete.
+The gate uses pure Bash matching and derives its task-column requirements from the
+exact array the migration loop consumes, so it cannot become a third drifting
+column list.
+
+A **whole-schema epoch** covers the migrations that live outside `tasks`, which a
+tasks-column gate cannot see. It is a receipt that the curated migration generation
+named by `_TASKS_SCHEMA_EPOCH` has run to completion on this store — deliberately
+**not** a claim that the store matches the canonical schema item for item. A fresh
+store is stamped on the init path that just built the whole schema from nothing;
+an older store earns the stamp after the full migration runs. A tasks-current store
+with a stale `gate_history` therefore cannot skip the repair.
+
+Two things the epoch had to learn, both of which reddened unrelated harnesses first:
+
+- **The stamp does not live inside the canonical DDL.** Every statement that block
+  emits is `CREATE … IF NOT EXISTS`, so replaying it over an existing store is a
+  no-op — a contract the migration driver and four other harnesses rely on, and a
+  bare `INSERT` is the one statement that breaks it.
+- **The gate requires the migration's seeded rows, not only the right shape.** The
+  migration *seeds* as well as reshapes; skipping it dropped self-heals that no schema
+  comparison can miss, because the store is shape-perfect and semantically wrong. Both
+  seeded prefs are covered — `ledger_started` (INST-4), which `trace` reads as a ledger
+  predating everything when absent, and `gate_history_coverage` (DIVE-2133), the
+  evidence boundary that lets a zero-row archive mean "no gates were displaced" rather
+  than "unknown". The first cut covered only the former and reddened
+  `tests/gate_history_unit.sh` in the nightly sweep. The gate's seed list is therefore
+  **derived from the migration's own source** and compared in both directions, the same
+  anti-drift rule the column list already follows.
+
+The epoch does **not** assert the canonical surface item for item. The curated
+migration was never a convergence engine and `CREATE TABLE IF NOT EXISTS` cannot
+widen an existing table, so that property holds on no code path — asserting it turned
+a slow init into a hard `fail` on every `5dive task` invocation against a
+legacy-shaped store. `tests/schema_sync_unit.sh` keeps the two copies of those
+`CREATE TABLE` statements from drifting; converging a genuinely short store needs
+per-table ALTERs and its own row.
+
+DIVE-2197's loud resulting-set assertion remains on both the migrate and skip
+paths. The isolated restore harness proves all 72 columns exist on a fresh
+`STATE_DIR`, injects a failed `delivery_ref` ALTER, forces a lying skip-gate over
+the same one-column hole, appends a test-only column to the migration array to show
+that the gate and ALTER path follow it, removes a non-`tasks` migration column from
+a pre-epoch fixture to prove the full migration repairs it, replays the canonical
+schema twice to hold the no-op contract, drives a legacy-shaped store through init
+to prove it completes and then settles, and deletes the ledger marker to prove it
+self-heals. On this 4-core control-plane host, 20 **interleaved** isolated fresh-init
+medians were 125 ms for the pinned pre-DIVE-2197 base (`1bde9dc`) and 127 ms here:
+**+2 ms**, inside the 30 ms acceptance envelope. The full migration had measured
+517 ms.
+
 ## v0.19.0 — fix(heartbeat): surface a recurring instance that was never started (DIVE-2693)
 
 The stall sweep keys on `handoff_delivered_at`. A materialized recurring instance

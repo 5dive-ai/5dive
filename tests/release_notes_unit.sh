@@ -61,6 +61,8 @@ cat > "$R/CHANGELOG.md" <<'EOF'
 
 Writes go out as the bot; admin and reads stay on the caller.
 
+## v0.19.9 — fix(ui): a stamped heading carrying no prose
+
 ## Unreleased — fix(old): something that shipped in the last tag
 
 Body of the already-released section.
@@ -88,12 +90,33 @@ out=$(run_notes "$CUT_FROM" "$TO" "1.2.3"); rc=$?
   && ok_t "notes: EXCLUDES an older section that still reads 'Unreleased' at the tip" \
   || bad_t "notes: excludes an older 'Unreleased' section" "leaked a previously-released section: $out"
 
-[[ "$out" == *"### feat(gh): route agent writes"* ]] \
-  && ok_t "notes: '## Unreleased — X' is demoted to '### X' for the release page" \
-  || bad_t "notes: heading demoted for the release page" "$out"
+# A headline-only entry becomes a bullet under its type group. The fixture entry
+# is written in the STAMPED form (`## v0.19.9 — ...`), which is the form that
+# actually reaches this script: stamp-changelog.sh rewrites the headings before
+# release-notes runs, so the old Unreleased-only substitution matched nothing and
+# shipped 37 raw H2s on v0.19.9. Anchor the arm on the stamped form or the
+# regression is invisible again.
+[[ "$out" == *"### Fixes"* && "$out" == *"- fix(ui): a stamped heading carrying no prose"* ]] \
+  && ok_t "notes: a STAMPED headline-only entry becomes a bullet under its group" \
+  || bad_t "notes: stamped headline-only entry becomes a grouped bullet" "$out"
+# An entry WITH prose keeps a heading and its prose — grouping must not silently
+# drop bodies. v0.19.6..v0.19.7 added 384 lines against 37 headings, so a
+# bullets-only renderer would have thrown 347 written lines away.
+[[ "$out" == *"### Features"* && "$out" == *"#### feat(gh): route agent writes"* ]] \
+  && ok_t "notes: an entry WITH prose keeps a (demoted) heading in its group" \
+  || bad_t "notes: prose entry keeps a demoted heading" "$out"
+[[ "$out" == *"Writes go out as the bot"* ]] \
+  && ok_t "notes: the prose body survives grouping (no content dropped)" \
+  || bad_t "notes: prose body survived grouping" "$out"
 [[ "$out" != *"## Unreleased"* ]] \
   && ok_t "notes: the word 'Unreleased' never reaches the release body" \
   || bad_t "notes: 'Unreleased' reached the release body" "$out"
+# lodar, 2026-08-09, on the v0.19.9 page: "20 h2 tags are so messy". THE assert —
+# no H2 may reach a release body, whatever the heading said. Anchored per line,
+# because '## ' also appears mid-prose and only a line-start match is a heading.
+[[ -z "$(printf '%s\n' "$out" | grep -E '^## ' || true)" ]] \
+  && ok_t "notes: NO h2 heading survives into the release body" \
+  || bad_t "notes: an h2 reached the release body" "$(printf '%s\n' "$out" | grep -E '^## ')"
 [[ "$out" == *"Notes derived from"* && "$out" == *"CHANGELOG.md over"* ]] \
   && ok_t "notes: names its own source (CHANGELOG arm)" \
   || bad_t "notes: names its own source" "$out"

@@ -43,7 +43,7 @@ Agents:
   5dive agent list
   5dive agent info <name>                            # type, CLI version, selected model, channel + state
   5dive agent types
-  5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard[,ch...]]
+  5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz[,ch...]]
                             [--telegram-token=<bot-token>] [--discord-token=<token>]
                             [--workdir=<path>] [--auth-profile=<name>]
                             [--provider=<id> --api-key=<key|->]
@@ -78,7 +78,7 @@ Agents:
   5dive agent rm <name> [--purge-home]               # aliases: 5dive agent fire <name>  /  5dive fire <name>
                                                      # home is quarantined to /home/.5dive-reaped/ (root 0700);
                                                      # --purge-home deletes it instead (irreversible)
-  5dive agent config <name> set channels=<none|telegram|discord|dashboard[,ch...]>
+  5dive agent config <name> set channels=<none|telegram|discord|dashboard|buzz[,ch...]>
                                                      # comma-separable; dashboard (claude-only, no token)
                                                      # enables web-dashboard chat — the one-tap Enable chat
                                                      # path. New claude creates include it by default.
@@ -329,6 +329,14 @@ Health:
     re-prints the identical payload and then opens it (via \`5dive gh issue
     create\`, so it lands as 5dive-bot); a TTY also gets an interactive y/N.
     Agents take the same --file flag a human does — no separate unattended path.
+
+  5dive acp
+    Speak ACP (Agent Client Protocol) over stdin/stdout so an ACP client — Buzz
+    (block/buzz), Zed — can select 5dive as a coding-agent runtime. NOT
+    interactive: the client spawns it. A session ATTACHES to a named fleet agent
+    (its memory, tasks, org position and heartbeat intact) rather than opening a
+    blank one; the roster travels as ACP availableCommands, so /<name> or
+    /attach <name> picks the agent and /agents re-lists them. Runs on bun.
 
   5dive doctor [--fix] [--dry-run] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
@@ -998,6 +1006,12 @@ main() {
         AUDIT_CMD="self-update"; AUDIT_ARGS=("$@")
         cmd_self_update "$@"
       fi ;;
+    acp)
+      # DIVE-3017: ACP over stdio, spawned BY a client (Buzz's runtime picker), so
+      # this verb's stdout is the wire. AUDIT_CMD is deliberately NOT set: cmd_acp
+      # `exec`s into bun, which replaces the process before the dispatcher's EXIT
+      # trap can fire (DIVE-2797), so the row is written inside cmd_acp instead.
+      cmd_acp "$@" ;;
     -h|--help|help) usage ;;
     *) fail "$E_USAGE" "unknown command: $top" ;;
   esac

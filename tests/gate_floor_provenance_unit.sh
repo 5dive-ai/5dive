@@ -233,6 +233,10 @@ seed DIVE-9009 'ordinary title'
 OLD="$TMP/old"; mkdir -p "$OLD/tasks"
 ( STATE_DIR="$OLD"; TASKS_DIR="$OLD/tasks"; TASKS_DB="$OLD/tasks/tasks.db"; tasks_db_init >/dev/null 2>&1 )
 sqlite3 "$OLD/tasks/tasks.db" "DROP TABLE gate_history; CREATE TABLE gate_history (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL, retired_by TEXT NOT NULL);" 2>/dev/null
+# This fixture represents a pre-DIVE-2808 store, so it cannot carry the
+# whole-schema receipt introduced by DIVE-2808. Leaving a current receipt after
+# deliberately rewinding one table would instead model post-stamp corruption.
+sqlite3 "$OLD/tasks/tasks.db" "DELETE FROM task_prefs WHERE key='schema_epoch';" 2>/dev/null
 before=$(sqlite3 "$OLD/tasks/tasks.db" "SELECT COUNT(*) FROM pragma_table_info('gate_history') WHERE name='floor_provenance';")
 [[ "$(sqlite3 "$OLD/tasks/tasks.db" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tasks';")" == "1" ]] \
   && ok_t 'migration fixture: the store has a tasks table, so init takes the MIGRATE path (not fresh-create)' \

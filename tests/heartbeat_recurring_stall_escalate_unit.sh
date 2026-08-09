@@ -246,5 +246,49 @@ _hb_stall_sweep >/dev/null 2>&1
   && ok_t "MUTATION: re-flagging the reassigned row makes rung 2 apply again (the reset delays, it does not exempt)" \
   || bad_t "MUTATION: re-flagging the reassigned row makes rung 2 apply again" "assignee=[$(col 1 assignee)] status=[$(col 1 status)] — the reset is a permanent exemption, which would hide the next stall"
 
+# ---------------------------------------------------------------------------
+# 7. SAME HANDS (DIVE-2878). The guard in cmd_task_assign has TWO branches, and
+#    section 6 only ever exercises the taken one: it assigns row 1 (assignee dev)
+#    to anton, so `assignee IS NOT <who>` is TRUE in every arm above and the ELSE
+#    is dead code as far as this harness is concerned. Measured by olivia on
+#    a0190a2: delete the condition, collapse both lines to an unconditional
+#    `=NULL`, and the harness still reports 22/0. A surviving mutant is an
+#    uncovered branch whatever the pass count says.
+#
+#    The ELSE branch is the ANTI-DEFER property: a no-op reassign to the agent who
+#    already holds the row must NOT restart the ladder, or escalation is postponed
+#    indefinitely by re-assigning a row to its current owner — a move that costs
+#    nothing and looks like activity.
+#
+#    BOTH STAMPS ARE SET TO KNOWN NON-NULL VALUES FIRST, and that is load-bearing
+#    rather than tidiness: mk_fixture leaves recurring_stall_escalated_at NULL, so
+#    an arm that merely asserted "still NULL" would be satisfied by the very
+#    unconditional-NULL mutant it exists to kill. Asserting the EXACT prior values
+#    also catches a mutant that rewrites the stamps to now() instead of nulling
+#    them, which "IS NOT NULL" would wave through.
+# ---------------------------------------------------------------------------
+mk_fixture; busy dev
+db "UPDATE tasks SET recurring_stall_pinged_at='2026-01-01 00:00:00',
+                     recurring_stall_escalated_at='2026-01-02 00:00:00' WHERE id=1;"
+cmd_task_assign 1 dev >/dev/null 2>&1
+[[ "$(col 1 recurring_stall_pinged_at)" == "2026-01-01 00:00:00" \
+   && "$(col 1 recurring_stall_escalated_at)" == "2026-01-02 00:00:00" ]] \
+  && ok_t "SAME HANDS: reassigning to the CURRENT assignee PRESERVES both stall stamps" \
+  || bad_t "SAME HANDS: reassigning to the current assignee preserves both stall stamps" "pinged=[$(col 1 recurring_stall_pinged_at)] escalated=[$(col 1 recurring_stall_escalated_at)] — an in-place reassign restarts the ladder, so escalation can be deferred forever by re-assigning a row to whoever already holds it"
+
+# The state assert above pins the columns; this one pins what they are FOR. Under
+# the unconditional-NULL mutant the stamps are cleared here, the row reads as
+# freshly routed, rung 2 declines to touch it, and the deferral is achieved — so
+# this arm fails on the mutant for the reason the property exists, not just
+# because a value changed.
+db "UPDATE tasks SET recurring_stall_pinged_at=datetime('now','-25 hours'),
+                     recurring_stall_escalated_at=NULL WHERE id=1;"
+cmd_task_assign 1 dev >/dev/null 2>&1
+: >"$AGENT_SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+[[ "$(col 1 assignee)" != "dev" || "$(col 1 status)" == "cancelled" ]] \
+  && ok_t "SAME HANDS: a no-op reassign cannot DEFER rung 2 — the sweep still acts on the aged flag" \
+  || bad_t "SAME HANDS: a no-op reassign cannot defer rung 2" "assignee=[$(col 1 assignee)] status=[$(col 1 status)] pinged=[$(col 1 recurring_stall_pinged_at)] — re-assigning a row to its current owner bought it another full window"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

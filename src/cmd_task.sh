@@ -5911,11 +5911,15 @@ cmd_task_loop() {
 # --no-done (alias --check) runs the check and records it WITHOUT flipping.
 cmd_task_verify() {
   tasks_db_init
-  local task="" cmd="" no_done=0 timeout_s=""
+  local task="" cmd="" no_done=0 timeout_s="" prose="" have_prose=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --cmd=*)      cmd="${1#*=}" ;;
       --no-done|--check) no_done=1 ;;
+      # DIVE-2832: the verifier's own words. Every other writer of this column is
+      # either the MAKER's verb (deliver) or machine output, so a verifier who
+      # graded by READING had no way to put a prose PASS on an OPEN row at all.
+      --result=*)   prose="${1#*=}"; have_prose=1 ;;
       --timeout=*)  timeout_s="${1#*=}" ;;
       -*)           fail "$E_USAGE" "unknown flag: $1" ;;
       *)            [[ -z "$task" ]] && task="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
@@ -5923,22 +5927,44 @@ cmd_task_verify() {
     shift
   done
   [[ -n "$task" ]] \
-    || fail "$E_USAGE" "usage: 5dive task verify <id|DIVE-N> [--cmd=\"<command>\"] [--no-done] [--timeout=<seconds>]"
+    || fail "$E_USAGE" "usage: 5dive task verify <id|DIVE-N> [--cmd=\"<command>\"] [--result=\"<prose verdict>\"] [--no-done] [--timeout=<seconds>]"
   [[ -z "$timeout_s" || "$timeout_s" =~ ^[1-9][0-9]*$ ]] \
     || fail "$E_VALIDATION" "--timeout must be a positive integer (seconds)"
   resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  # DIVE-2832: --result is a RECORDING path, never a closing one. A prose verdict is
+  # an assertion about work; it is not evidence that anything reached main, and the
+  # DIVE-1830 merge gate this verb already bypasses (DIVE-2938) is exactly what would
+  # otherwise be riding on it. So --result requires --no-done and says so.
+  if (( have_prose )) && (( ! no_done )); then
+    fail "$E_USAGE" "--result records a verifier's prose verdict WITHOUT closing, so it requires --no-done (alias --check). A prose PASS asserts the work is good; it is not evidence the work MERGED, and \`task verify\`'s close does not run the DIVE-1830 merge gate (DIVE-2938). To record the grade: 5dive task verify $task --no-done --result=\"<verdict>\". To close on evidence, pass a --cmd whose EXIT STATUS proves what you are claiming."
+  fi
+  if (( have_prose )) && [[ -z "${prose//[[:space:]]/}" ]]; then
+    fail "$E_VALIDATION" "--result was given an EMPTY value. A zero-length verdict is indistinguishable from one that was never written (DIVE-2483), so it is refused rather than stored."
+  fi
   # DIVE-476: --cmd is now optional — when omitted, fall back to the task's stored
   # verify_command (the declarative loop spec). Persisted input, no re-passing.
+  #
+  # DIVE-2832: and with --result there may be NO command at all, which is the whole
+  # point. The row's receipts were graded by READING a diff, and this fail() was the
+  # reason the "record without flipping" flag could not reach them: it demanded a
+  # runnable acceptance test, so the only way in was to contrive one — manufacturing
+  # a green to satisfy a gate, which is the anti-pattern the row exists to name.
+  local ran_cmd=1
   if [[ -z "$cmd" ]]; then
     cmd=$(db "SELECT COALESCE(verify_command,'') FROM tasks WHERE id=${id};")
-    [[ -n "$cmd" ]] \
-      || fail "$E_USAGE" "no --cmd given and task has no stored verify_command (set one: 5dive task add … --verify=\"<cmd>\")"
+    if [[ -z "$cmd" ]]; then
+      (( have_prose )) \
+        || fail "$E_USAGE" "no --cmd given and task has no stored verify_command (set one: 5dive task add … --verify=\"<cmd>\"). If you graded by READING rather than by running something, record it as prose instead: 5dive task verify $task --no-done --result=\"<your verdict>\" (DIVE-2832)."
+      ran_cmd=0
+    fi
   fi
 
   # Run it. Combined stdout+stderr. The `if` wrapper captures the exit code
   # WITHOUT tripping `set -e` (a failing $() in a bare assignment would abort).
   local out rc
-  if [[ -n "$timeout_s" ]]; then
+  if (( ! ran_cmd )); then
+    out=""; rc=0
+  elif [[ -n "$timeout_s" ]]; then
     if out=$(timeout "${timeout_s}" bash -c "$cmd" 2>&1); then rc=0; else rc=$?; fi
     (( rc == 124 )) && out="${out}"$'\n'"[timed out after ${timeout_s}s]"
   else
@@ -5948,9 +5974,20 @@ cmd_task_verify() {
   local tail_out; tail_out=$(printf '%s\n' "$out" | tail -n 25)
 
   local verdict result_txt
-  if (( rc == 0 )); then
+  # DIVE-2832: with a prose verdict and no command, the record must not LOOK like a
+  # machine verdict. The whole value of the existing text is that "exit 0" is a fact
+  # a reader can re-derive; a grader's assertion is not, and rendering them the same
+  # way would buy the recording path at the cost of the one property that made the
+  # machine path trustworthy. So the prose is labelled as UNEXECUTED and attributed.
+  if (( have_prose )) && (( ! ran_cmd )); then
+    verdict="pass"
+    result_txt="✅ verify PASS (verifier's prose grade — NO command was run, DIVE-2832): recorded by $(task_actor "")"$'\n'"${prose}"
+  elif (( rc == 0 )); then
     verdict="pass"
     result_txt="✅ verify PASS (exit 0): ${cmd}"$'\n'"--- output tail ---"$'\n'"${tail_out}"
+    # Both given: the command's evidence AND the grader's words, prose first, because
+    # the prose is the part a human wrote and the tail is the part they were reading.
+    (( have_prose )) && result_txt="${prose}"$'\n'"--- evidence ---"$'\n'"${result_txt}"
   else
     verdict="fail"
     result_txt="❌ verify FAIL (exit ${rc}): ${cmd}"$'\n'"--- output tail ---"$'\n'"${tail_out}"
@@ -6083,6 +6120,52 @@ cmd_task_verify() {
     if [[ "$_v_st" == 'done' ]]; then
       _v_prev=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
       [[ -n "$_v_prev" ]] && result_txt="${result_txt}"$'\n'"--- superseded result (DIVE-2067, preserved) ---"$'\n'"${_v_prev}"
+    fi
+    # DIVE-2938: THIS CLOSE DOES NOT RUN THE MERGE GATE, AND UNTIL NOW IT DID NOT SAY SO.
+    #
+    # The DIVE-1830 merge gate lives in `_task_status_cmd` (the done/cancel verbs). This
+    # flip is a raw UPDATE in a different function, so a row can reach status=done with
+    # its delivery unmerged and nothing anywhere records that the question was never
+    # asked. Measured: DIVE-2743 closed on `verify --cmd` running a unit test inside a
+    # LOCAL WORKTREE and its test file is absent from main today; DIVE-2645 was graded
+    # "at worktree tip c2baa6b" with its PR still open.
+    #
+    # This is NOT the gate. Gating here would re-create the deadlock DIVE-2318 routes
+    # OUT of — its no-credential refusal names `task verify --cmd` as the authorised
+    # terminal move for a verifier who holds no gh, so refusing here without a working
+    # `--no-done` (still unreachable for a read-grader per DIVE-2832) would strand
+    # exactly the seat the exit was built for. That build waits on DIVE-2832.
+    #
+    # What ships instead is LEGIBILITY: when the row carries a binding the merge gate
+    # WOULD have checked, say on the record that it was not checked. Two properties
+    # earn it. (1) The reader of a done row currently cannot distinguish "merged and
+    # graded" from "graded on a branch" — both render as a green result. (2) It is the
+    # only way to FIND the class: `task merge-audit` scans for PR *numbers*, so a row
+    # binding a bare `Branch:` line — which is what both receipts did — is structurally
+    # invisible to it. A fixed token in the result field is greppable where the audit is
+    # blind.
+    #
+    # Deliberately scoped to rows that HAVE a binding. A row with nothing to merge has
+    # no question to leave unanswered, and stamping it would be noise that trains people
+    # to skip the line — the failure mode of every warning that fires too often.
+    local _mg_body _mg_dref _mg_bind=""
+    _mg_dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};")
+    _mg_body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
+    if [[ -n "$_mg_dref" ]]; then
+      _mg_bind="delivery_ref ${_mg_dref}"
+    elif _gate_text_names_a_ref "$_mg_body"; then
+      _mg_bind="a PR named in the body"
+    else
+      # DIVE-2577's own discovery rule, reused rather than re-spelt: a branch the row's
+      # prose names, anchored on the "<ident>-" prefix. Reusing it is the point — if the
+      # gate's idea of a binding changes, this stamp must change with it or it will go
+      # quiet on exactly the rows the gate started catching.
+      local _mg_branches
+      _mg_branches=$(_gate_branch_refs_from_text "$_mg_body" "$ident" 2>/dev/null | head -3 | paste -sd, -)
+      [[ -n "$_mg_branches" ]] && _mg_bind="branch(es) named in the body: ${_mg_branches}"
+    fi
+    if [[ -n "$_mg_bind" ]]; then
+      result_txt="⚠ merge-gate NOT EVALUATED (DIVE-2938) — closed via \`task verify\`, which does not run the DIVE-1830 gate. This row binds ${_mg_bind}; whether it reached main was NOT checked by this close. Confirm with a positive existence test on the canonical ref (e.g. \`git cat-file -e origin/main:<a file the change created>\`) before relying on it."$'\n'"${result_txt}"
     fi
     # DIVE-2477: the THIRD close writer. DIVE-2067 taught this lesson one column
     # over — when you guard one verb, ask which OTHERS write the field. A
@@ -8072,6 +8155,97 @@ cmd_task_need() {
     _task_store_audit_log "task need floor-appeal" \
       "$( ((_discusses_applied)) && echo applied || echo refused )" 0 -- \
       "task=$ident" "filer=$(task_actor "$from")" "declared=$discusses" || true
+  fi
+
+  # DIVE-2012: THE VERIFIER-SCOPING DEAD-END, made visible.
+  #
+  # The shape: the MAKER of a live maker→verifier loop files a `decision` gate
+  # asking the VERIFIER to scope that task's own acceptance criteria — a question
+  # whose only correct answerer is that verifier — and the ask NARRATES the work
+  # under test, so the T2 category floor fires on the narration. Measured on the
+  # ticket's own repro: tier goes to 2, the DIVE-1495 verifier-route below is
+  # guarded on `tier != 2` so it never runs, `routed_reviewer` stays NULL, and the
+  # DIVE-1117 provenance floor then refuses the verifier's answer. Net: the paired
+  # human is pinged for a call that was never theirs AND the designated answerer is
+  # locked out. dev's actual remedy on DIVE-1968 was to message olivia out of band.
+  #
+  # WHY THIS IS A WARNING AND NOT A SIXTH DOWNGRADE CLASS. The ticket asks for an
+  # exemption ("routed decision gates should skip the floor"). Building one means a
+  # sixth vocabulary guesser, and DIVE-2099's design note is explicit that adding
+  # one reproduces this bug with the polarity REVERSED — a false negative there
+  # routes a real money/secret ask to whichever agent happens to be grading the
+  # ticket, which is the exact defect DIVE-2241 had just closed. The appeal
+  # DIVE-2089 shipped is the supported answer and it already lands correctly:
+  # `--discusses` downgrades to tier 1, and because the verifier-route below runs
+  # AFTER every downgrade class, the gate then routes to the VERIFIER rather than
+  # the lead. Measured: tier=1, routed_reviewer=<verifier>, human not pinged.
+  #
+  # So the residual defect is not the tier — it is that the remedy is INVISIBLE at
+  # exactly the moment it is needed. `--discusses` landed after this ticket was
+  # filed, the floor's own warning never mentions it, and nothing tells the filer
+  # that the agent they are trying to reach is one flag away. An undiscoverable
+  # remedy is indistinguishable from no remedy, which is why this ticket exists.
+  #
+  # The trigger is STRUCTURAL, never vocabulary: a live loop (both ends present),
+  # the filer IS the maker, the verifier is someone else, and the type is the one
+  # type an appeal exists for. It changes NO tier and NO route — a floored gate
+  # still reaches the human, and the floor is untouched. It only ensures the filer
+  # is told, on the record, who they were trying to reach and how to reach them.
+  if [[ "$tier_floored" == "1" && "$type" == "decision" && "$_discusses_applied" == "0" \
+        && "$_curation" == "0" && "$_internal_ops" == "0" && "$_needs_human" == "0" \
+        && "$tier_arg" != "2" ]]; then
+    local _vs_filer; _vs_filer=$(task_actor "")
+    local _vs_vf _vs_mk
+    _vs_vf=$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${id};")
+    _vs_mk=$(db "SELECT COALESCE(maker_agent,'') FROM tasks WHERE id=${id};")
+    if [[ -n "$_vs_vf" && -n "$_vs_mk" && "$_vs_vf" != "$_vs_filer" && "$_vs_mk" == "$_vs_filer" ]]; then
+      # DIVE-2801 CLASS — do not recommend a remedy the code will refuse. This
+      # advice names `--discusses` as the way to reach the verifier, so it may
+      # only be printed when the appeal would actually be ACCEPTED. Both of
+      # DIVE-2089's refusal paths have to be evaluated here, not assumed:
+      #
+      #   Rule 3 — the residual still names a non-appealable category (money /
+      #   outbound comms / irreversible infra). Measured before this guard
+      #   existed: on a `spend` ask the appeal printed `--discusses REFUSED …
+      #   Staying at tier 2` and this warning then told the filer to re-file with
+      #   `--discusses` — the remedy they had just been refused, on the same
+      #   invocation. On that class there is also no dead-end to announce: the
+      #   floored gate is CORRECT and the human genuinely is the right answerer,
+      #   which is what the safety arm in the harness has always claimed.
+      #
+      #   Rule 4 — no lead sits above the filer, so the appeal has nobody to
+      #   route to and refuses. Promising a route we cannot mint is the same
+      #   defect with a different cause.
+      #
+      # Computed with the appeal's OWN helpers and its own per-field residual, so
+      # the two can never drift apart into a warning that predicts the wrong
+      # verdict. Silence here is the stock floor warning's job, not a gap.
+      local _vs_res_ask _vs_res_title
+      _vs_res_ask=$(_gate_floor_appeal_residual "$ask")
+      _vs_res_title=$(_gate_floor_appeal_residual "$_ft_title")
+      if _gate_hit_either _gate_tier2_floor_hit "$_vs_res_ask" "$_vs_res_title"; then
+        _vs_vf=""   # non-appealable: the human keeps this call, say nothing
+      elif [[ -z "$(_gate_route_reviewer "$_vs_filer")" ]]; then
+        _vs_vf=""   # no reviewer above the filer: the appeal would refuse
+      fi
+    fi
+    if [[ -n "$_vs_vf" && -n "$_vs_mk" && "$_vs_vf" != "$_vs_filer" && "$_vs_mk" == "$_vs_filer" ]]; then
+      # ABSORB the rc. `_gate_tier2_floor_term` is an allowlisted rc-bearing
+      # contract: it returns non-zero when it finds no term, so a plain
+      # assignment inherits that status and dies under `set -e`. Same shape
+      # main's DIVE-2751 fix uses two blocks up, and the call-site guard in
+      # tests/task_show_exit_code_unit.sh enforces it — that guard landed on
+      # main after this block was first written, and caught it on the rebase.
+      local _vs_term=""
+      _vs_term=$(_gate_tier2_floor_term "$ask" 2>/dev/null) || _vs_term=""
+      [[ -n "$_vs_term" ]] || { _vs_term=$(_gate_tier2_floor_term "$_ft_title" 2>/dev/null) || _vs_term=""; }
+      warn "this gate is floored to tier 2 (matched '${_vs_term}'), so it pings the paired human and ${_vs_vf} — the verifier on this task's loop, and the only agent who can answer a question about your own acceptance criteria — CANNOT clear it (tier-2 gates refuse a non-human answer, DIVE-1117). If the term is narration of the work under test rather than something you are asking to DO, re-file with --discusses=\"<why>\": the appeal downgrades the gate to tier 1 and routes it to ${_vs_vf}, not to the human. If you really are asking for that, leave it — the human is the right answerer."
+      # The dead-end this ticket was filed about was invisible in the record: the
+      # gate simply sat there while dev messaged olivia out of band. Audit the
+      # occurrence, not just the advice, so the NEXT instance is countable.
+      _task_store_audit_log "task need verifier-scoping floored" "warned" 0 -- \
+        "task=$ident" "filer=$_vs_filer" "verifier=$_vs_vf" "term=$_vs_term" || true
+    fi
   fi
 
   # DIVE-1359: eng-ship downgrade. A builder cannot file a hard-human (tier-2)
