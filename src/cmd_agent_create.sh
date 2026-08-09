@@ -1047,10 +1047,116 @@ KIMI_ENV
   fi
 }
 
+# DIVE-3113: normalise an openclaw model id against the provider that was
+# selected on the command line. Pure (no root, no runtime) so it is unit-gradable
+# — everything else on this path shells out to sudo + a real binary.
+#
+# An openclaw model id is `<openclaw-provider-id>/<model>`, and THE FIRST SEGMENT
+# SELECTS THE PROVIDER — and therefore which auth profile is consulted. So a
+# prefix that disagrees with --provider is not a cosmetic naming slip: the request
+# goes to a vendor we never wrote a credential for and comes back HTTP 401 on a
+# perfectly good key, with the error naming auth and hiding provider selection.
+# That is DIVE-3112.
+#
+# Graded against the runtime's own catalog (openclaw 2026.7.1-2,
+# `openclaw models list --provider <p> --plain`):
+#
+#     openai/gpt-5.4 · anthropic/claude-sonnet-5 · deepseek/deepseek-chat
+#     openrouter/auto · openrouter/moonshotai/kimi-k2.6
+#
+# Note the last one: OPENROUTER NESTS THE VENDOR ONE LEVEL DOWN. That single fact
+# decides the whole function, because it means a two-segment id is ambiguous —
+# `openai/gpt-5.6-luna` is a valid openclaw id (provider openai) AND a valid
+# OpenRouter catalog slug (vendor openai). Only --provider disambiguates it.
+#
+# Three shapes reach us and each has exactly one right answer:
+#   1. no slash (`gpt-5.6`)          -> prefix with the selected provider.
+#   2. first segment == the provider -> already correct, pass through untouched.
+#   3. a FOREIGN first segment       -> under openrouter it is an OpenRouter
+#      catalog slug whose openclaw id is that slug nested under `openrouter/`
+#      (the DIVE-3112 payload), so re-prefix. Under any other provider the two
+#      names genuinely disagree and there is nothing to infer, so REFUSE — a
+#      guess here writes a config that authenticates against the wrong vendor,
+#      which is the exact failure this function exists to stop.
+#
+# Echoes the normalised id. rc 1 == case 3 under a non-openrouter provider; the
+# caller owns the error text (it has --provider/--model spellings to quote back).
+openclaw_normalize_model() {
+  local native="$1" model="$2"
+  [[ -n "$model" ]] || return 0
+  # No provider segment at all: the operator named a model, we supply the
+  # provider they already selected.
+  [[ "$model" == */* ]] || { printf '%s/%s' "$native" "$model"; return 0; }
+  local first="${model%%/*}"
+  [[ "$first" == "$native" ]] && { printf '%s' "$model"; return 0; }
+  # openrouter is the one provider whose ids carry a second, vendor-scoped
+  # segment, so a foreign-looking prefix here is a catalog slug, not a provider.
+  [[ "$native" == "openrouter" ]] && { printf 'openrouter/%s' "$model"; return 0; }
+  return 1
+}
+
 _apply_byo_openclaw() {
   # override_model (DIVE-1318): --model wins over OPENCLAW_PROVIDER_MODEL default.
   local native="$1" canonical="$2" api_key="$3" profile="${4:-}" override_model="${5:-}"
   local base="/home/claude"
+
+  # ── DIVE-3113 PRECONDITIONS ────────────────────────────────────────────────
+  # EVERYTHING THAT CAN ABORT RUNS BEFORE THE KEY WRITE. This block used to sit
+  # below, between the credential write and the config writes, and the ordering
+  # was the bug: `agent create` wrote auth-profiles.json, then hit the runtime
+  # guard and aborted, leaving a profile that HOLDS A KEY AND NO MODEL PIN. That
+  # state does not read as broken — `agent list` prints AUTH ok (the sentinel is
+  # the file, and the file is there) and `agent info` prints `model: —` without
+  # calling it a fault. Worse, the documented retry
+  # (`agent create <name> --auth-profile=<existing>`) does not re-run this
+  # function at all, so the pin never lands and openclaw silently falls back to
+  # its BUILT-IN default — a different provider, hence no credential, hence 401.
+  # Measured on 65.109.170.211: key on disk 19:10:55, runtime 19:12. See
+  # community/wiki/an-unconfigured-model-authenticates-against-the-wrong-provider.md.
+  #
+  # So: resolve the model id and the runtime FIRST. A refusal now costs the
+  # operator a re-run with nothing written; a refusal after the credential write
+  # costs them a profile that lies about being healthy.
+  local openclaw_base_url="${OPENCLAW_PROVIDER_URL[$canonical]:-}"
+  local model="${override_model:-${OPENCLAW_PROVIDER_MODEL[$canonical]:-}}"
+  if [[ -n "$model" ]]; then
+    local normalized
+    if ! normalized=$(openclaw_normalize_model "$native" "$model"); then
+      fail "$E_VALIDATION" "openclaw model '$model' selects provider '${model%%/*}', but --provider=$canonical selects '$native' — in openclaw the first path segment picks the provider AND the credential, so this would authenticate against '${model%%/*}' with no key and return HTTP 401. Pass --model=${native}/${model#*/} (or drop the prefix: --model=${model#*/})."
+    fi
+    if [[ "$normalized" != "$model" ]]; then
+      step "openclaw model id normalised for provider '$native': $model → $normalized"
+    fi
+    model="$normalized"
+  fi
+
+  local openclaw_bin="${TYPE_BIN[openclaw]}"
+  local openclaw_node="/home/claude/.local/bin/node"
+  if [[ -n "$openclaw_base_url" || -n "$model" ]]; then
+    # The npm launcher uses `#!/usr/bin/env node`. Do not rely on sudo/systemd's
+    # PATH to resolve that shebang during fresh create: invoke the stable Node
+    # link installed alongside OpenClaw explicitly. Keep ~/.local/bin on PATH
+    # for any subprocess OpenClaw starts while writing the config.
+    #
+    # Install-on-demand rather than an immediate refusal, because the two
+    # preconditions are NOT the same check: `agent create`'s install gate tests
+    # ${TYPE_BIN[openclaw]}, while the write below also needs the node link the
+    # same recipe creates. A box where those two disagree (a dangling node link
+    # after an nvm prune, or `agent auth set` on an openclaw-less box — that path
+    # has no install gate at all) passes the gate and fails here.
+    if [[ ! -x "$openclaw_node" || ! -x "$openclaw_bin" ]] \
+       && declare -F cmd_install >/dev/null 2>&1; then
+      step "openclaw runtime incomplete — installing before writing any credential"
+      local _prev_json="${JSON_MODE:-0}"
+      JSON_MODE=0
+      cmd_install openclaw >&2 || true
+      JSON_MODE="$_prev_json"
+    fi
+    [[ -x "$openclaw_node" ]] \
+      || fail "$E_NOT_INSTALLED" "node runtime missing for openclaw (run: 5dive agent install openclaw --upgrade)"
+  fi
+  # ── end DIVE-3113 preconditions; writes start here ─────────────────────────
+
   if [[ -n "$profile" ]]; then
     base="$(profile_type_dir "$profile" openclaw)"
     install -d -m 2750 -o claude -g claude "$base"
@@ -1076,21 +1182,11 @@ _apply_byo_openclaw() {
   chmod 0600 "$tmp"
   mv "$tmp" "$auth_file"
 
-  local openclaw_base_url="${OPENCLAW_PROVIDER_URL[$canonical]:-}"
-  local model="${override_model:-${OPENCLAW_PROVIDER_MODEL[$canonical]:-}}"
-
   # Any openclaw.json write (provider base_url pin and/or default model) goes
-  # through the same stable-node invocation — resolve the runtime once.
+  # through the same stable-node invocation — resolved in the precondition block
+  # above, so by here the runtime is known present and the model id known to
+  # match the provider whose key we just wrote.
   if [[ -n "$openclaw_base_url" || -n "$model" ]]; then
-    local openclaw_bin="${TYPE_BIN[openclaw]}"
-    local openclaw_node="/home/claude/.local/bin/node"
-    # The npm launcher uses `#!/usr/bin/env node`. Do not rely on sudo/systemd's
-    # PATH to resolve that shebang during fresh create: invoke the stable Node
-    # link installed alongside OpenClaw explicitly. Keep ~/.local/bin on PATH
-    # for any subprocess OpenClaw starts while writing the config.
-    [[ -x "$openclaw_node" ]] \
-      || fail "$E_NOT_INSTALLED" "node runtime missing for openclaw (run: 5dive agent install openclaw --upgrade)"
-
     # DIVE-1826: pin the provider endpoint when we have a verified override.
     # openclaw's zai provider otherwise defaults to the GENERAL /paas/v4 surface
     # (its zai-api-key auto-detect probes general endpoints before the Coding Plan
@@ -1112,13 +1208,24 @@ _apply_byo_openclaw() {
     # Default model lands in openclaw.json's agents.defaults.model.primary;
     # 5dive-agent-start.sh syncs it from the shared/profile copy into the
     # per-agent openclaw.json on every launch.
+    #
+    # DIVE-3113: this is a `fail`, not a `warn`, and the asymmetry with the
+    # baseUrl write above is deliberate. A missing baseUrl override falls back to
+    # openclaw's own endpoint for the SAME provider — degraded, still that
+    # vendor, still our key. A missing MODEL falls back to openclaw's built-in
+    # default, which carries a DIFFERENT provider prefix and therefore consults a
+    # credential that does not exist. So the two failure modes are not the same
+    # size: one is a worse endpoint, the other is a profile that reports AUTH ok
+    # and cannot authenticate. The credential is already on disk by this point
+    # and cannot be un-written, so the only honest exit is to say so loudly and
+    # name the repair rather than let create return success over it.
     if [[ -n "$model" ]]; then
       sudo -u claude -H env \
         HOME="$base" \
         PATH="/home/claude/.local/bin:/usr/bin:/bin" \
         "$openclaw_node" "$openclaw_bin" \
         config set agents.defaults.model.primary "$model" >&2 \
-        || warn "openclaw config set agents.defaults.model.primary=$model failed"
+        || fail "$E_GENERIC" "openclaw model pin failed (agents.defaults.model.primary=$model). The key IS written to ${auth_file}, so this profile now holds a credential with no model — openclaw would fall back to its built-in default, whose provider is not '$native', and 401. Repair with: sudo -u claude -H env HOME=$base PATH=/home/claude/.local/bin:/usr/bin:/bin $openclaw_node $openclaw_bin config set agents.defaults.model.primary $model"
     fi
   fi
 
