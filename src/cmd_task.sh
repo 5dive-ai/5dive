@@ -1429,9 +1429,25 @@ cmd_task_ls() {
     # render the missing value explicitly instead of turning it into another
     # invisible blank.  The default open queue stays compact.
     if [[ "$status" == "done" || $all -eq 1 ]]; then
-      dbfmt -box "SELECT ident, status, priority, COALESCE(assignee,'-') AS assignee, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, title FROM tasks WHERE ${where} ${order};"
+      # DIVE-3098: the audit view renders graded-and-waiting the same way as the
+      # compact one. Two branches, one predicate — if only the default view knew,
+      # `--all` would still paint the row `todo` and the reader who went looking for
+      # detail would get the LESS accurate answer.
+      dbfmt -box "SELECT ident,
+             CASE WHEN ${_TASKS_TFV_SQL}
+                  THEN 'graded->merge:'||COALESCE(NULLIF(maker_agent,''), COALESCE(assignee,'?'))
+                  ELSE status END AS status,
+             priority, COALESCE(assignee,'-') AS assignee, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, title FROM tasks WHERE ${where} ${order};"
     else
-      dbfmt -box "SELECT ident, status, priority, COALESCE(assignee,'-') AS assignee, title FROM tasks WHERE ${where} ${order};"
+      # DIVE-3098: a graded-and-waiting row must not read as todo/blocked/in_progress
+      # to the eye, and the render must name who owes the MERGE - the maker or ship
+      # approver, never the verifier, who has already finished. Folded into the status
+      # cell rather than a new column so the compact board stays compact.
+      dbfmt -box "SELECT ident,
+             CASE WHEN ${_TASKS_TFV_SQL}
+                  THEN 'graded->merge:'||COALESCE(NULLIF(maker_agent,''), COALESCE(assignee,'?'))
+                  ELSE status END AS status,
+             priority, COALESCE(assignee,'-') AS assignee, title FROM tasks WHERE ${where} ${order};"
     fi
   fi
 }
@@ -4948,6 +4964,38 @@ _task_live_blocker() {
 # reuses the DIVE-477 in-review handoff — it does NOT invent a new status. When
 # there is no distinct verifier, the delivery is still recorded but the task
 # stays in_progress: a verifier must close it after the merge (done ≠ delivered).
+# _task_terminal_for_verifier <id> — DIVE-3098. TRUE (exit 0) when the row is
+# TERMINAL FOR THE VERIFIER and still NON-TERMINAL FOR THE ROW:
+#
+#   a verifier grade recorded by `task verify --no-done` (graded_at stamped,
+#   graded_by != maker_agent)  AND  delivery_ref bound.
+#
+# Such a row SATISFIES the goal Stop hook and is EXEMPT from the rot-nudger — the
+# verifier has discharged their role and the remaining work is a MERGE, owed by the
+# maker or the ship approver. `status` stays open; the row closes only on merge, so
+# `done` keeps meaning merged-to-main (DIVE-1835) and nobody gains a terminal-looking
+# verb short of it. That anti-goal is why this is a PREDICATE and not a status value.
+#
+# Both halves are load-bearing and the negative arms prove it: a grade with no
+# delivery_ref is a verdict nobody can check, and a delivery_ref with no grade is the
+# ungraded case the nudger exists for. Neither alone qualifies.
+_task_terminal_for_verifier() {
+  local id="$1"
+  [[ "$id" =~ ^[0-9]+$ ]] || return 1
+  local hit
+  hit=$(db "SELECT 1 FROM tasks WHERE id=${id} AND ${_TASKS_TFV_SQL};" 2>/dev/null) || return 1
+  [[ "$hit" == "1" ]]
+}
+
+# _task_merge_owner <id> — who owes the merge on a graded-and-waiting row. The maker
+# built it and the verifier has finished; naming the verifier here would point at the
+# one person with nothing left to do. Falls back to the assignee.
+_task_merge_owner() {
+  local id="$1" who
+  who=$(db "SELECT COALESCE(NULLIF(maker_agent,''), COALESCE(assignee,'?')) FROM tasks WHERE id=${id};" 2>/dev/null)
+  printf '%s' "${who:-?}"
+}
+
 cmd_task_deliver() {
   tasks_db_init
   local task="" pr="" result="" want_result=0 result_src=""
@@ -6243,7 +6291,19 @@ cmd_task_verify() {
     # overnight (OSS-27 closed via `task verify`, cascade never ran).
     _task_cascade_unblock "$id" || true
   else
-    db "UPDATE tasks SET result=$(sqlq "$result_txt") WHERE id=${id};"
+    # DIVE-3098: --no-done records a VERIFIER GRADE. Stamp it structurally as well
+    # as in prose, because the predicate that exempts this row from the goal hook
+    # and the rot-nudger must not be forgeable. `task deliver --result=` is the
+    # MAKER's verb and writes the same column; if the predicate keyed on result
+    # TEXT, a maker could satisfy it by typing the right words and walking away —
+    # exactly the fail-open _hb_loop_terminal_clause already warns about one layer
+    # up. graded_by is the ACTOR, so terminal_for_verifier can additionally require
+    # grader != maker and a self-verified close cannot buy the exemption.
+    # COALESCE: first grade wins, same rule as done_at (DIVE-2477).
+    db "UPDATE tasks SET result=$(sqlq "$result_txt"),
+           graded_at=COALESCE(graded_at, datetime('now')),
+           graded_by=COALESCE(graded_by, $(sqlq "$(task_actor "")"))
+        WHERE id=${id};"
   fi
 
   if (( JSON_MODE )); then

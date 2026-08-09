@@ -165,7 +165,7 @@ require_sqlite() {
 # NOTE: projects/loop_runs/supervisor_events are ALSO defined inside gated
 # one-shot migration blocks in _tasks_db_migrate() below — edit both copies
 # together; tests/schema_sync_unit.sh fails CI if they diverge.
-_TASKS_SCHEMA_EPOCH='2808-1'
+_TASKS_SCHEMA_EPOCH='3098-1'   # DIVE-3098: +graded_at, +graded_by
 _tasks_schema() {
   cat <<'SQL'
 PRAGMA journal_mode=WAL;
@@ -224,6 +224,15 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- array column is already present. Keeping the two definitions complete makes
   -- that fast path both safe and cheap; the convergence assertion is the backstop.
   derived_actor TEXT,
+  -- DIVE-3098: a verifier grade recorded by `task verify --no-done` (graded_at) and
+  -- the actor who recorded it (graded_by). Structural on purpose — the
+  -- terminal-for-verifier predicate must not key on result TEXT, which the MAKER's
+  -- `task deliver --result=` also writes, or a maker could buy the exemption by
+  -- typing the right words. Declared HERE as well as in _TASKS_ADDITIVE_COLUMNS,
+  -- per the rule directly above: a fresh store takes this CREATE and never runs the
+  -- ALTER loop, so array-only lands a store that fails the DIVE-2197 assertion.
+  graded_at TEXT,
+  graded_by TEXT,
   -- DIVE-2615: why this gate has this tier — axis=pinned|type-default|secret-type
   -- |ask|title|title-fallback|none, plus ;term=<t> where a term is what fired.
   -- Declared HERE as well as in _TASKS_ADDITIVE_COLUMNS: a fresh store takes this
@@ -1165,7 +1174,38 @@ _TASKS_ADDITIVE_COLUMNS=(
   'originated_by_objective INTEGER' 'originated_cycle INTEGER'
   'verify_unavailable INTEGER' 'last_skipped_at TEXT'
   'human_evidence TEXT' 'derived_actor TEXT' 'floor_provenance TEXT'
+  # DIVE-3098: a verifier grade recorded by `task verify --no-done`. Structural on
+  # purpose — the terminal-for-verifier predicate must not key on result TEXT,
+  # which the MAKER's `task deliver --result=` also writes.
+  'graded_at TEXT' 'graded_by TEXT'
 )
+
+# DIVE-3098 - TERMINAL FOR THE VERIFIER, as ONE SQL boolean expression.
+#
+# Three readers evaluate this: `task ls`'s render, `_task_terminal_for_verifier`
+# (the goal Stop hook's answer), and the heartbeat rot-nudger's exclusion. They MUST
+# agree - a row the nudger exempts but the render still paints `todo` is the original
+# bug wearing different clothes. So it is written once here and interpolated, never
+# retyped. (Same rule that produced broker_strip_md_quotes: a two-reader binding
+# diverges the moment someone fixes one side.)
+#
+# Every conjunct is load-bearing:
+#   graded_at                - stamped ONLY by `task verify --no-done`, never by the
+#                              maker's `task deliver --result=`, so it cannot be
+#                              forged in prose.
+#   graded_by <> maker_agent - a self-verified close does not buy the exemption.
+#   delivery_ref             - a verdict with nothing to merge is not awaiting a merge.
+# status stays OPEN: terminal for the VERIFIER, non-terminal for the ROW.
+# NOT `readonly`: several harnesses and code paths source this lib twice, and a
+# readonly re-assignment errors on the second source — measured, it broke 8 arms of
+# tests/gate_route_delivery_unit.sh with a stderr line and nothing else. Every other
+# constant in this file (incl. _TASKS_SCHEMA_EPOCH) is a plain assignment for the
+# same reason; match the file.
+_TASKS_TFV_SQL="graded_at IS NOT NULL
+       AND delivery_ref IS NOT NULL AND TRIM(delivery_ref) <> ''
+       AND (maker_agent IS NULL OR graded_by IS NULL OR graded_by <> maker_agent)
+       AND status NOT IN ('done','cancelled')"
+
 _TASKS_DB_GATE_COLUMNS=''
 _TASKS_DB_GATE_EPOCH=''
 _TASKS_DB_GATE_SEEDS=''

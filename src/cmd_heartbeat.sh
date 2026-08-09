@@ -1399,6 +1399,28 @@ _hb_loop_terminal_clause() {
   vfier="${row%%|*}"; rest="${row#*|}"; maker="${rest%%|*}"; creator="${rest#*|}"
   [[ -n "$vfier" ]] || return 0
 
+  # DIVE-3098 — GRADED-AND-WAITING, and it is checked FIRST because it is the one
+  # state in which every variant below gives actively wrong advice: the maker variant
+  # tells a maker to deliver what is already delivered AND graded, the routing variant
+  # tells them nothing is delivered, and the verifier variant tells a verifier to grade
+  # what they have already graded. The row is terminal for the VERIFIER and open for
+  # the ROW, so the only outstanding act is a MERGE — and the goal must stop rather
+  # than re-wake someone into a loop whose remaining step belongs to someone else.
+  # This is the case that closed DIVE-2645/#427 and DIVE-2743/#485 as false dones.
+  #
+  # Not a fail-open, by the same rule as the variants below: read from graded_at,
+  # which ONLY `task verify --no-done` stamps, plus a bound delivery_ref and
+  # grader != maker. No prose an agent can type reaches it. It applies to EITHER role
+  # (maker still holding it, or verifier) — once graded-and-waiting, neither owes
+  # another pass, so it is deliberately not gated on which one was woken.
+  if [[ "$(db "SELECT 1 FROM tasks WHERE id=${task_id} AND ${_TASKS_TFV_SQL};" 2>/dev/null)" == "1" ]]; then
+    local _tfv_owner
+    _tfv_owner=$(db "SELECT COALESCE(NULLIF(maker_agent,''), COALESCE(assignee,'?')) FROM tasks WHERE id=${task_id};" 2>/dev/null)
+    printf ' NOTE — %s is GRADED AND WAITING ON A MERGE: a verifier grade is recorded and a delivery ref is bound, so the verifier has discharged their role and this is TERMINAL FOR THIS GOAL. Treat the goal as MET and stop — %s renders it as %s. The row stays OPEN on purpose and closes only when the work MERGES, because %s keeps meaning merged-to-main; the outstanding act is a MERGE owed by %s, not another pass by you. Do NOT re-grade it, re-deliver it, or close it to make the loop stop.' \
+      "$task_ident" "'5dive task ls'" "'graded->merge:${_tfv_owner}'" "'done'" "${_tfv_owner:-the maker}"
+    return 0
+  fi
+
   if [[ "$vfier" != "$name" ]]; then
     # MAKER variant — delivery is the second terminal state.
     printf ' NOTE — %s carries a maker→verifier loop (verifier: %s), so your %s does NOT close it: it DELIVERS it (status stays todo and the task moves to %s to be graded). That delivery is a SECOND terminal state for THIS goal: treat the goal as MET, and stop, once %s prints a %s line under %s naming %s. Report that you delivered. Do NOT re-run %s, remove the verifier, or self-verify to force a status of done — the terminal close is %s'"'"'s, in their own session, and forcing it past them is a bypass, not progress.' \
@@ -2425,6 +2447,7 @@ _hb_stall_sweep() {
                  AND handoff_ack_at IS NULL AND handoff_stale_pinged_at IS NULL
                  AND handoff_delivered_at IS NOT NULL
                  AND NOT (need_type IS NOT NULL AND need_answered_at IS NULL)
+                 AND NOT (${_TASKS_TFV_SQL})
                  AND handoff_delivered_at <= datetime('now','-${_HB_VERIFY_STALE_MIN} minutes');")
 
   # (a2) DIVE-2693 — a materialized RECURRING instance that was never STARTED.
