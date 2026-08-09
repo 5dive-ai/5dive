@@ -6025,6 +6025,52 @@ cmd_task_verify() {
       _v_prev=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
       [[ -n "$_v_prev" ]] && result_txt="${result_txt}"$'\n'"--- superseded result (DIVE-2067, preserved) ---"$'\n'"${_v_prev}"
     fi
+    # DIVE-2938: THIS CLOSE DOES NOT RUN THE MERGE GATE, AND UNTIL NOW IT DID NOT SAY SO.
+    #
+    # The DIVE-1830 merge gate lives in `_task_status_cmd` (the done/cancel verbs). This
+    # flip is a raw UPDATE in a different function, so a row can reach status=done with
+    # its delivery unmerged and nothing anywhere records that the question was never
+    # asked. Measured: DIVE-2743 closed on `verify --cmd` running a unit test inside a
+    # LOCAL WORKTREE and its test file is absent from main today; DIVE-2645 was graded
+    # "at worktree tip c2baa6b" with its PR still open.
+    #
+    # This is NOT the gate. Gating here would re-create the deadlock DIVE-2318 routes
+    # OUT of — its no-credential refusal names `task verify --cmd` as the authorised
+    # terminal move for a verifier who holds no gh, so refusing here without a working
+    # `--no-done` (still unreachable for a read-grader per DIVE-2832) would strand
+    # exactly the seat the exit was built for. That build waits on DIVE-2832.
+    #
+    # What ships instead is LEGIBILITY: when the row carries a binding the merge gate
+    # WOULD have checked, say on the record that it was not checked. Two properties
+    # earn it. (1) The reader of a done row currently cannot distinguish "merged and
+    # graded" from "graded on a branch" — both render as a green result. (2) It is the
+    # only way to FIND the class: `task merge-audit` scans for PR *numbers*, so a row
+    # binding a bare `Branch:` line — which is what both receipts did — is structurally
+    # invisible to it. A fixed token in the result field is greppable where the audit is
+    # blind.
+    #
+    # Deliberately scoped to rows that HAVE a binding. A row with nothing to merge has
+    # no question to leave unanswered, and stamping it would be noise that trains people
+    # to skip the line — the failure mode of every warning that fires too often.
+    local _mg_body _mg_dref _mg_bind=""
+    _mg_dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};")
+    _mg_body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
+    if [[ -n "$_mg_dref" ]]; then
+      _mg_bind="delivery_ref ${_mg_dref}"
+    elif _gate_text_names_a_ref "$_mg_body"; then
+      _mg_bind="a PR named in the body"
+    else
+      # DIVE-2577's own discovery rule, reused rather than re-spelt: a branch the row's
+      # prose names, anchored on the "<ident>-" prefix. Reusing it is the point — if the
+      # gate's idea of a binding changes, this stamp must change with it or it will go
+      # quiet on exactly the rows the gate started catching.
+      local _mg_branches
+      _mg_branches=$(_gate_branch_refs_from_text "$_mg_body" "$ident" 2>/dev/null | head -3 | paste -sd, -)
+      [[ -n "$_mg_branches" ]] && _mg_bind="branch(es) named in the body: ${_mg_branches}"
+    fi
+    if [[ -n "$_mg_bind" ]]; then
+      result_txt="⚠ merge-gate NOT EVALUATED (DIVE-2938) — closed via \`task verify\`, which does not run the DIVE-1830 gate. This row binds ${_mg_bind}; whether it reached main was NOT checked by this close. Confirm with a positive existence test on the canonical ref (e.g. \`git cat-file -e origin/main:<a file the change created>\`) before relying on it."$'\n'"${result_txt}"
+    fi
     # DIVE-2477: the THIRD close writer. DIVE-2067 taught this lesson one column
     # over — when you guard one verb, ask which OTHERS write the field. A
     # verifier re-verifying their own already-done row (the case DIVE-2067's
