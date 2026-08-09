@@ -45,10 +45,18 @@ _push_expected_author() {
 
 # _push_branch_from_body <body> — pull a "Branch: <name>" line out of a task
 # body (case-insensitive, first match). Empty if absent.
+#
+# DIVE-3081: strips a markdown/quote wrapper via broker_strip_md_quotes, and MUST
+# keep doing so in lockstep with broker_task_target's use of the same helper — the
+# DIVE-1462 refusal compares this function's value against the broker's, so a
+# strip applied to only one side still refuses, just with a different pair of
+# look-alike names. Same reason the helper is shared rather than inlined.
 _push_branch_from_body() {
+  local raw
   # `|| true` so a no-match grep can't trip `set -euo pipefail` when this runs
   # inside a command substitution (branch=$(...)).
-  printf '%s\n' "$1" | grep -ioP '^\s*branch:\s*\K\S+' | head -1 || true
+  raw=$(printf '%s\n' "$1" | grep -ioP '^\s*branch:\s*\K\S+' | head -1 || true)
+  broker_strip_md_quotes "$raw"
 }
 
 # _push_repo_slug <url> — OWNER/REPO from an https/ssh github URL, no .git.
