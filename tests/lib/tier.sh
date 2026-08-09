@@ -238,6 +238,126 @@ tier_cal_diverge_pct() {
   printf '%s\n' "$(( (post - pre) * 100 / pre ))"
 }
 
+# DIVE-2867: WHO IS ALLOWED TO MOVE TIER_CAL_BASELINE_US, AND ON WHAT EVIDENCE.
+#
+# The constant above has now been re-derived twice by argument (173000 -> 119000, then a
+# proposed 116584), each time from a hand-copied handful of readings, because the
+# cross-run instrument that should settle it — scripts/tier-cal-window.sh — could not be
+# fed. It said so in its own header: reports do not outlive the run that wrote them.
+# scripts/tier-cal-harvest.sh removes that excuse (the runner prints every field the
+# window reads straight to the job log, and GitHub already keeps those), so the rule below
+# is now SATISFIABLE and is written as a countable check rather than a paragraph.
+#
+# THE RULE IS ONE-SIDED, mirroring the clamp it serves. RAISING the reference tightens
+# every future cap toward the 100% floor and is safe from any sample. LOWERING it widens
+# every future cap, permanently, for everyone — DIVE-2525's ratchet wearing the
+# calibration's clothes — so only that direction has to buy its evidence.
+#
+# WHY A COUNT AND NOT A PERCENTILE. "Use p10, not the minimum" was the first form of this
+# guard and it is the guard MIS-STATED: at n=8 the p10 was 116584 and the min was 116404,
+# 0.15% apart, so p10 WAS the extremum in all but name while sounding considered. There
+# are ~9 percentile conventions and they disagree most at small n. The real content was
+# never the statistic — it is a constraint on SAMPLE SIZE, and a count says it directly.
+#
+# WHY THE COUNT ALSO NEEDS A PROXIMITY BAND, and this is the part only the harvested
+# window could show. MEASURED 2026-08-08 over the last 20 `unit-tests` runs on main (n=40
+# job-samples, both lanes, via tier-cal-harvest.sh + tier-cal-window.sh): the 31
+# CONCORDANT probe readings are BIMODAL.
+#
+#     92852  96155  97360  99941  106833   <- a distinct FAST mode, n=5
+#     ---------------------------------------- a 10% gap with nothing in it
+#     117761 ... 121542 (median) ... 126454 <- the normal mode, n=26
+#
+# Excluding discordant runs first — the fix written for the previous hole — does NOT
+# separate these: three of the five fast-mode readings are honestly concordant (a fast box
+# ran a fast corpus). So a bare "K samples strictly below the candidate" is satisfied for
+# ANY candidate above 97360 by the fast mode ALONE, and the guard would have certified a
+# reference with K=5 while NO normal-population run had ever been observed below it. The
+# guard counts samples; the samples it counts came from a different population.
+#
+# Hence the band: a sample only supports a candidate if it sits WITHIN
+# TIER_CAL_REF_BAND_PCT below it. A reading 20% faster than the candidate is not evidence
+# about where the candidate sits in the normal distribution — it is evidence that a second
+# population exists. 10% is inside the normal mode's own observed spread (117761-126454 is
+# 7.4%) so it admits genuine neighbours, and outside the 12-25% gap to the fast mode so it
+# cannot be satisfied across it.
+#
+# APPLIED, which is why this ships as a refusal rather than as a new number: the proposed
+# fast-end 116584 has FIVE concordant samples below it and NONE within 10% of it (band
+# [104926, 116584) contains only 106833) -> K=1 -> REFUSED. The incumbent 119000 has band
+# [107100, 119000) containing 117761 and 118000 -> K=2 -> ADMITTED. The measurement does
+# not support the move the row proposed, and it does support leaving the constant alone.
+# AND THE BAND ALONE IS NOT ENOUGH — found by the arm written to prove it was, which is
+# the only reason it is here. A candidate placed INSIDE the fast mode (say 100000) has
+# four concordant neighbours within 10% below it, so it passes the support test at K=4
+# and would be certified — while handing a typical run (median concordant reading 121160)
+# a scale of 121% and a 363s cap against a 300s policy. The band proves LOCAL DENSITY;
+# it cannot tell a dense fast mode from the low tail of the working one.
+#
+# So the guard is a CONJUNCTION, and the two halves catch different things — neither is
+# redundant and neither alone is sufficient:
+#
+#   SUPPORT      K concordant samples within BAND% below the candidate.
+#                  116584 -> K=1  REFUSED   |   100000 -> K=4  passes
+#   BOUNDED COST the window's MEDIAN concordant reading may not scale past MAX_WIDEN.
+#                  116584 -> 103% passes    |   100000 -> 121% REFUSED
+#
+# The second is the bounded-cost test in its checkable form: a reference change is
+# legitimate because its cost is bounded, not because its intent was good. It needs no
+# mode-fitting — it asks the only question policy actually cares about, which is how much
+# extra cap the TYPICAL run is being handed.
+TIER_CAL_REF_MIN_BELOW=2
+TIER_CAL_REF_BAND_PCT=10
+TIER_CAL_REF_MAX_WIDEN_PCT=110
+
+# tier_cal_ref_admissible <candidate_us> <current_us> <concordant_sample_us>...
+#   -> "admit raise" | "admit K=<n> median-widen=<pct>%" | "refuse support ..." | "refuse cost ..."
+#      exit 0 admit / 1 refuse. The two refusals are spelled apart on purpose: they send
+#      the reader to different evidence, and a caller that cannot tell them apart will
+#      answer "get more samples" to a bounded-cost refusal that more samples cannot fix.
+#
+# Feed it CONCORDANT samples only (tier-cal-window.sh classifies them). Passing the whole
+# window is the caller's bug and this cannot detect it — which is why the harvest ->
+# window -> here order is the documented one and not a suggestion.
+tier_cal_ref_admissible() {
+  local cand="${1:?tier_cal_ref_admissible <candidate_us> <current_us> <sample>...}"
+  local cur="${2:?tier_cal_ref_admissible <candidate_us> <current_us> <sample>...}"
+  shift 2
+  if (( cand <= 0 || cur <= 0 )); then
+    printf 'tier_cal_ref_admissible: candidate and current must be > 0\n' >&2; return 2
+  fi
+  # Raising tightens toward the floor. No sample can make that dangerous, and demanding
+  # one would block the honest response to a runner image getting slower.
+  if (( cand >= cur )); then printf 'admit raise\n'; return 0; fi
+  local lo=$(( cand * (100 - TIER_CAL_REF_BAND_PCT) / 100 )) s k=0 n=0
+  local sorted=() med=0
+  for s in "$@"; do
+    [[ "$s" =~ ^[0-9]+$ ]] || continue
+    sorted+=("$s"); n=$((n+1))
+    (( s < cand && s >= lo )) && k=$((k+1))
+  done
+  if (( k < TIER_CAL_REF_MIN_BELOW )); then
+    printf 'refuse support K=%d need %d within %d%% below %d (band %d-%d)\n' \
+      "$k" "$TIER_CAL_REF_MIN_BELOW" "$TIER_CAL_REF_BAND_PCT" "$cand" "$lo" "$cand"
+    return 1
+  fi
+  # BOUNDED COST. Refuse rather than guess when there is nothing to take a median of —
+  # "no samples" and "the cost is fine" are different answers and only one is a pass.
+  if (( n == 0 )); then
+    printf 'refuse no samples to bound the cost against\n'; return 1
+  fi
+  mapfile -t sorted < <(printf '%s\n' "${sorted[@]}" | sort -n)
+  med="${sorted[$(( n / 2 ))]}"
+  local widen=$(( med * 100 / cand ))
+  if (( widen > TIER_CAL_REF_MAX_WIDEN_PCT )); then
+    printf 'refuse cost median %d scales to %d%% at candidate %d (max %d%%)\n' \
+      "$med" "$widen" "$cand" "$TIER_CAL_REF_MAX_WIDEN_PCT"
+    return 1
+  fi
+  printf 'admit K=%d median-widen=%d%%\n' "$k" "$widen"
+  return 0
+}
+
 # tier_cal_scale_pct <measured_us> [<baseline_us>] -> the RAW, UNCLAMPED scale, in
 # percent. Kept separate from the clamp so the runner can tell "slow" (clamped, still
 # graded) from "too slow to grade" (past the clamp, undetermined) — one number cannot
@@ -389,6 +509,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     scale)  tier_cal_scale_pct "${2:?scale <measured_us> [baseline_us]}" "${3:-$TIER_CAL_BASELINE_US}" ;;
     clamp)  tier_cal_clamp_pct "${2:?clamp <raw_pct>}" ;;
     diverge) tier_cal_diverge_pct "${2:?diverge <pre_us> <post_us>}" "${3:?diverge <pre_us> <post_us>}" ;;
-    *) printf 'usage: tier.sh {list core|nightly|full [dir] | of <file> | reason <file> | claim <file> | budget core|full | scale <us> [baseline] | clamp <pct> | diverge <pre_us> <post_us>}\n' >&2; exit 2 ;;
+    refadmit) shift; tier_cal_ref_admissible "${1:?refadmit <candidate_us> <current_us> <concordant_sample>...}" "${2:?refadmit <candidate_us> <current_us> <concordant_sample>...}" "${@:3}" ;;
+    *) printf 'usage: tier.sh {list core|nightly|full [dir] | of <file> | reason <file> | claim <file> | budget core|full | scale <us> [baseline] | clamp <pct> | diverge <pre_us> <post_us> | refadmit <candidate_us> <current_us> <concordant_sample>...}\n' >&2; exit 2 ;;
   esac
 fi

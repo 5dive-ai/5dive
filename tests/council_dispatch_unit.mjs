@@ -410,9 +410,20 @@ ok(ballotTap({ ref: 'DIVE-1600', vote: 'a', nonce: '', _exec: () => { throw new 
   const structured = await runBallot(() => ({ ok: false, why: 'exit 1 :: permission denied' }))
   ok(structured.abstainKind === 'nudge-failed' && /permission denied/.test(structured.rationale), 'DIVE-2220: {ok:false,why} nudge failure carries why into the rationale')
 
-  // (d) a DELIVERED nudge is untagged and the rationale records that the seat was told.
+  // (d) a DELIVERED nudge is not a capture failure, and the rationale records that the seat was told.
+  //
+  // DIVE-2891 UPDATED THE PREDICATE, NOT THE GUARANTEE. This arm's guarantee is "a seat we DID reach
+  // that stayed silent is a REAL abstention, not a capture failure", and that is unchanged and still
+  // asserted below via `capture !== false` — which is the field captureAudit, the verdict refusal and
+  // the sealed `unreached:` line all key on. The old `abstainKind == null` clause was a PROXY for it,
+  // sound only while abstainKind existed exclusively on capture failures. DIVE-2891 deliberately
+  // breaks that coupling: a reached-but-silent seat now carries a `silent:*` kind so a quota-locked
+  // seat stops rendering identically to one that withheld consent. So the clause is replaced by the
+  // thing it stood for, plus a positive check that the kind is a SILENCE kind and not a capture kind —
+  // which is strictly stronger than asserting absence.
   const delivered = await runBallot(() => ({ ok: true }))
-  ok(delivered.vote === 'abstain' && delivered.abstainKind == null && delivered.capture !== false, 'DIVE-2220: a delivered nudge + silent seat stays a REAL abstention (not a capture failure)')
+  ok(delivered.vote === 'abstain' && delivered.capture !== false, 'DIVE-2220: a delivered nudge + silent seat stays a REAL abstention (not a capture failure)')
+  ok(String(delivered.abstainKind || '').startsWith('silent:'), 'DIVE-2891: …and that real abstention is CLASSIFIED (a silent:* kind), never left indistinguishable from a withheld vote')
   ok(/no vote by deadline/.test(delivered.rationale) && /nudged dario mid-window/.test(delivered.rationale), 'DIVE-2220: a delivered nudge is NAMED in the deadline rationale (told vs merely queued)')
 
   // (e) a seat that VOTES after a failed nudge is not tagged — the ledger applies only at the deadline.
