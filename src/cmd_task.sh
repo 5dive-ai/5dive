@@ -4604,7 +4604,7 @@ $_body"
       fi
     fi
     if [[ -n "$_txt_open" && $force_merge_gate -eq 0 ]]; then
-      policy_refuse "$E_CONFLICT" done-with-open-pr-in-result DIVE-1935 "$ident" "$ident cannot close: PR #$_txt_open in $_txt_open_slug is open, not merged — merge it, then task done"
+      policy_refuse "$E_CONFLICT" done-with-open-pr-in-result DIVE-1935 "$ident" "$ident cannot close: PR #$_txt_open in $_txt_open_slug is OPEN, not merged — merge it, then task done"
     fi
     if [[ -n "$_txt_red" && $force_merge_gate -eq 0 ]]; then
       policy_refuse "$E_CONFLICT" done-after-named-red-merge DIVE-1935 "$ident" "$ident cannot close: PR ${_txt_red//,/, } is merged but its checks are RED — fix main, then task done"
