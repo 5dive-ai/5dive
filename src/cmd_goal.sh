@@ -405,7 +405,7 @@ _goal_approve_from_gate() {
   [[ -n "$nt" ]]  || fail "$E_CONFLICT" "$ident carries no gate to approve"
   [[ -n "$nat" ]] || fail "$E_CONFLICT" "$ident's plan gate is not answered yet — a human must approve it first, then re-run"
   [[ "$nby" == human:* ]] \
-    || fail "$E_AUTH_REQUIRED" "$ident's plan gate was cleared by '${nby:-?}', not a human — a plan materializes only on a HUMAN approval"
+    || fail "$E_AUTH_REQUIRED" "$ident's plan gate was not cleared by a human (answered by '${nby:-?}') — a plan materializes only on a HUMAN approval"
   [[ "$nans" == "approve" ]] \
     || fail "$E_CONFLICT" "$ident's plan gate was answered '${nans}', not 'approve' — nothing materialized (revise via re-planning, DIVE-982)"
 

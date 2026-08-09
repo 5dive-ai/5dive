@@ -4327,13 +4327,13 @@ _task_status_cmd() {
           # it here too, so the record does not read as "only the bound was inconclusive".
           _attr_unreach_note=""
           [[ -n "$_attr_unreach" ]] && _attr_unreach_note=" Additionally, $_attr_unreach never answered at all (unreachable, not merely bounded) — the scan is incomplete there too."
-          policy_refuse "$E_CONFLICT" done-ident-not-found-within-scan-bound DIVE-2120 "$ident" "$ident cannot close: the commit scan hit its bound in $_attr_bound — INCONCLUSIVE, not absence: the delivery may predate the scanned window, or the branch lives in a repo that was NEVER SCANNED. Raise FIVE_GATE_ANCESTRY_SCAN and retry, or add a 'Repo: <owner/repo>' line to the body."
+          policy_refuse "$E_CONFLICT" done-ident-not-found-within-scan-bound DIVE-2120 "$ident" "$ident cannot close: the commit scan hit its bound in $_attr_bound (repo:commits-walked) — INCONCLUSIVE, not absence.$_attr_unreach_note Three explanations survive: (a) the delivery predates the scanned window — raise FIVE_GATE_ANCESTRY_SCAN=<n> and retry; (b) no commit SUBJECT on main ever named $ident, which is what an EMPTY branch looks like — land one (\`5dive push $ident\`); (c) the branch lives in a repo that was NEVER SCANNED — add a 'Repo: <owner/repo>' line to the body, or bind it (\`task deliver $ident --pr=https://github.com/<owner>/<repo>/pull/N\`)."
         elif [[ -n "$_anc_novac" && -z "$_bmerged" ]]; then
           # The vacuous shape, named as itself: an ancestor tip carrying nothing
           # attributable is exactly what an EMPTY branch looks like, and a generic
           # "not merged" here would send the reader off to merge something that is
           # already in.
-          policy_refuse "$E_CONFLICT" done-on-vacuous-branch-ancestry DIVE-2101 "$ident" "$ident cannot close: branch '$_branch' is on main but no commit names $ident — land work naming it: 5dive push $ident"
+          policy_refuse "$E_CONFLICT" done-on-vacuous-branch-ancestry DIVE-2101 "$ident" "$ident cannot close: branch '$_branch' points at a commit on main but NO commit reachable from it names $ident — that is what an EMPTY branch looks like. Land work naming it (\`5dive push $ident\`), or bind the branch that carries it (\`task set-branch $ident <branch>\`)."
         elif [[ -n "$_attr_unreach" && -z "$_bmerged" ]]; then
           # DIVE-2318: at least one repo in the search set never ANSWERED, so the
           # negative below it is not exhaustive over the set it claims to cover. A
@@ -4362,7 +4362,7 @@ _task_status_cmd() {
           # a missing branch. It did exactly that to dev2 on DIVE-2286 and to dev3 on
           # DIVE-2301. So: state what was actually measured (no commit subject on main
           # names the ident, no merged PR for the branch) and give the remedy that works.
-          policy_refuse "$E_CONFLICT" done-before-branch-merged DIVE-1830 "$ident" "$ident cannot close: nothing on ${FIVE_GATE_MAIN_BRANCH:-main} in $_searched shows branch '$_branch' landed — no commit subject there names $ident (attribution) and no merged PR has that head. Ancestry cannot accept: a squash rewrites the sha. Land it (5dive push $ident), then task done."
+          policy_refuse "$E_CONFLICT" done-before-branch-merged DIVE-1830 "$ident" "$ident cannot close: nothing on ${FIVE_GATE_MAIN_BRANCH:-main} in $_searched shows branch '$_branch' landed — no commit SUBJECT there names $ident (attribution) and no MERGED PR has that head. Ancestry is NOT one of the ways in: a squash rewrites the sha, so a branch tip is never an ancestor of a squash-merged main. Land it (5dive push $ident), then task done."
         else
           # DIVE-2217: this is the OTHER accepting arm. Keep its repo in a variable
           # named for the evidence that assigned it, just as _attr_slug is owned by
@@ -6080,7 +6080,7 @@ cmd_task_verify() {
           && "$_svc_status" != "done" && "$_svc_status" != "cancelled" ]]; then
       if [[ -z "$_svc_auth_actor" ]]; then
         db "UPDATE tasks SET result=$(sqlq "$result_txt") WHERE id=${id};"
-        fail "$E_PERMISSION" "$ident verify passed and was recorded, but auto-close needs an authenticated caller identity"
+        fail "$E_PERMISSION" "$ident verify passed and was recorded, but auto-close was refused: the caller identity could not be authenticated"
       fi
       if [[ "$_svc_auth_actor" == "$self_verify_maker" ]]; then
         self_verified_close=1
@@ -7688,7 +7688,7 @@ cmd_task_need() {
     # and the reader needs to see that as a stated absence.
     w_who="the gate's filer (${w_filer:-unrecorded})"
     [[ -n "$w_holder" && "$w_holder" != "$w_filer" ]] && w_who+=" — held by ${w_holder}, who does NOT authorize a withdraw since they did not file it"
-    (( w_ok )) || policy_refuse "$E_AUTH_REQUIRED" gate-withdraw-not-authorized DIVE-1401 "$ident" "only ${w_who}, their lead (${w_lead:-none}), the coordinator (${w_coord:-none}) or a human can withdraw this gate"
+    (( w_ok )) || policy_refuse "$E_AUTH_REQUIRED" gate-withdraw-not-authorized DIVE-1401 "$ident" "only ${w_who}, their lead (${w_lead:-none}), the org coordinator (${w_coord:-none}) or a human can withdraw this gate"
     # Clear every gate field and unblock back to todo when no dependency edge
     # still holds it. The withdrawn gate is archived to gate_history first, in
     # the same transaction (DIVE-2119).
@@ -8481,7 +8481,7 @@ cmd_task_need() {
       "task=$ident" "type=$type" "tier=$tier" \
       "reason=could not mint a per-gate human nonce (openssl and /dev/urandom both unusable)" \
       2>/dev/null || true
-    fail "$E_GENERIC" "$ident: cannot mint the tier-2 human proof (openssl and /dev/urandom both unusable) — fix the box's RNG"
+    fail "$E_GENERIC" "$ident: refusing to file a tier-2 gate that cannot mint its own human proof — openssl and /dev/urandom are both unusable; fix the box's RNG, or file it at a lower --tier"
   fi
 
   # DIVE-2410: filing REPLACES any gate already on this task (that is what the
@@ -11463,7 +11463,7 @@ cmd_task_answer() {
   # value goes. Only "asks for a credential, names nowhere" is refused.
   if [[ "$nt" == "secret" ]]; then
     local _paths; _paths=$(db "SELECT COALESCE(secret_key,'')||COALESCE(connector,'')||COALESCE(secret_oob,'') FROM tasks WHERE id=${id};")
-    [[ -n "$_paths" ]] || fail "$E_CONFLICT" "$ident is a secret gate with no delivery path — re-file it with --secret-key/--connector or --out-of-band"
+    [[ -n "$_paths" ]] || fail "$E_CONFLICT" "$ident is a secret gate that names NO delivery path, so nothing can have landed — re-file it with one: --secret-key=<ENV> --connector=<stem>, or --out-of-band=\"<where>\""
   fi
 
   # DIVE-1117: resolve the gate's stored risk tier now — the human-only + evidence

@@ -117,7 +117,7 @@ broker_gate_check() {
   gsig=$(db "SELECT COALESCE(need_answer_sig,'')      FROM tasks WHERE id=${id};")
   reviewer=$(db "SELECT COALESCE(routed_reviewer,'')  FROM tasks WHERE id=${id};")
   if [[ -z "$gtype" ]]; then
-    fail "$E_VALIDATION" "no ${noun}-for-review gate on ${ident} — file one: 5dive task need ${ident} --type=approval --ask='${ask}'"
+    fail "$E_VALIDATION" "no gate on ${ident} — file a ${noun}-for-review gate first: 5dive task need ${ident} --type=approval --ask='${ask}' (files tier-1 to the org lead, who can clear it)"
   fi
   if [[ -z "$gansweredat" ]]; then
     fail "$E_VALIDATION" "gate on ${ident} is OPEN (unanswered ${gtype}) — ${noun} refused until it clears (5dive task answer ${ident} ...)."
