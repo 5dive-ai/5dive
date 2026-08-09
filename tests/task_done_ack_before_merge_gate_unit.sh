@@ -175,8 +175,11 @@ _hb_stall_sweep >/dev/null 2>&1
 
 # T4: the SAME task later merges for real -> `done` closes exactly as before —
 # proves the ack fix changed no acceptance, only the ack side-effect.
+# `--no-graded-sha` isolates this from DIVE-2940 (a loop close with no stated sha now
+# refuses). This case grades the ACK side-effect and the DIVE-1830 gate acceptance;
+# it must not go red — or green — for a third gate's reason.
 export GH_STUB_STATE="MERGED" GH_STUB_MERGED="2026-08-01T00:00:00Z"
-out=$(as_agent verifier cmd_task_done "$tid" --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1); rc=$?
+out=$(as_agent verifier cmd_task_done "$tid" --no-graded-sha --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1); rc=$?
 [[ $rc -eq 0 && "$(statusof "$tid")" == "done" ]] \
   && ok_t "T4 done still closes once the PR is merged (unchanged acceptance)" \
   || bad_t "T4 close" "rc=$rc status=$(statusof "$tid") out=$out"

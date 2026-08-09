@@ -21,7 +21,10 @@ _task_usage() {
   set-branch <id> <branch>                      bind the row to a git branch
 
   start <id>                                    -> in_progress
-  done <id> [--result=<text>|--result-file=<path>]   -> done, or hand to the verifier if one is set
+  done <id> [--result=<text>|--result-file=<path>] [--no-graded-sha]
+                                                -> done, or hand to the verifier if one is set
+                                                verifiers: put `graded-sha: <sha>` in the result;
+                                                --no-graded-sha is the audited escape
   deliver <id> --pr=<url> [--result=]           record the delivery PR, hand to the verifier
   verify <id> [--cmd=] [--no-done] [--timeout=] run the check; exit 0 = pass
   reject <id> [--feedback=<what to fix>]        verifier FAIL: bounce back to the maker
@@ -3350,7 +3353,7 @@ _task_guard_result_over_closed() {
 _task_status_cmd() {
   local newstatus="$1" extra="$2" verb="$3"; shift 3
   tasks_db_init
-  local result="" want_result=0 notify=0 no_preflight=0 force_merge_gate=0 keep_wt=0
+  local result="" want_result=0 notify=0 no_preflight=0 force_merge_gate=0 keep_wt=0 no_graded_sha=0
   local append_result=0 force_result=0   # DIVE-2464
   # DIVE-1955 (review, Marcus): every reason the merge-gate could NOT reach an answer,
   # accumulated so the close can be stamped UNVERIFIED in the DURABLE RECORD. A stderr
@@ -3378,6 +3381,13 @@ _task_status_cmd() {
       --notify)       notify=1 ;;
       --no-preflight) no_preflight=1 ;;
       --force-merge-gate) force_merge_gate=1 ;;  # DIVE-1835: audited escape from the mandatory auto-detect gate
+      # DIVE-2940: the declared escape from the graded-sha PRE-CLOSE refusal below.
+      # Deliberately NOT folded into --force-merge-gate: that flag escapes a gate
+      # that RAN and disagreed (a sha mismatch, a red merge), and this one escapes
+      # a gate that could not run at all for want of an operand. Same distinction
+      # DIVE-2318 draws between "answered no" and "never asked", and a shared flag
+      # would make the audit row unable to say which of the two a closer overrode.
+      --no-graded-sha) no_graded_sha=1 ;;
       # DIVE-1967: opt OUT of the node_modules reclaim a close performs (you are
       # about to reuse the worktree and do not want to pay for another npm ci).
       --keep-worktree) keep_wt=1 ;;
@@ -4114,11 +4124,45 @@ _task_status_cmd() {
             policy_refuse "$E_CONFLICT" done-graded-sha-not-the-merged-sha DIVE-2656 "$ident" "$ident cannot close: its result states it graded $_graded, but $_dref merged ${_headsha:+head $_headsha}${_headsha:+${_mcsha:+ / }}${_mcsha:+merge commit $_mcsha} — the sha that was GRADED is not the sha that LANDED (DIVE-2656; MEASURED, both operands read from GitHub). A merged PR is not evidence the verdict was cleared: on a maker->verifier loop the maker can push after the verdict, or fix in a NEW PR and leave this row bound to the old one, and every other check on this gate would still pass. Resolve it, do not route around it: if the graded work is in a different PR, re-point the binding (\`task deliver $ident --pr=<url>\`) and close against that; if this PR is right and the sha statement is stale, re-grade the head that actually merged and state THAT sha. \`task done $ident --force-merge-gate\` overrides (audited) — use it only when you have confirmed by hand that the merged content is the graded content."
           fi
         elif [[ "$(db "SELECT CASE WHEN maker_agent IS NOT NULL AND verifier IS NOT NULL AND verifier<>'' THEN 1 ELSE 0 END FROM tasks WHERE id=${id};")" == "1" ]]; then
-          # PART 2, the enabling half. A nudge and never a refusal: without the
-          # stated sha there is no second operand, so the guard above is inert on
-          # this row — say so at the moment it would have fired, which is the only
-          # moment the closer can act on it.
-          warn "$ident: closed on a maker->verifier loop with no \`graded-sha: <sha>\` in the result, so the DIVE-2656 head-vs-graded comparison did NOT run — $_dref merged unverified against any stated verdict. State the sha you graded in every done/reject result; it is what makes the guard possible."
+          # PART 2, the enabling half — a NUDGE until DIVE-2940, a REFUSAL after it.
+          #
+          # WHY IT CHANGED, measured by olivia over three closes by one seat:
+          # DIVE-2862 (08-07), DIVE-2891 (08-08), DIVE-2867 (08-09). The warn below
+          # is correct about the world and useless to the person reading it, because
+          # of WHEN it prints: the result row is already written by the time it
+          # appears. Its printed remedy ("state the sha you graded") is advice for
+          # the NEXT row, not an action available on this one — the
+          # community/wiki/a-gates-printed-remedy-must-be-reachable-from-the-state-
+          # it-fires-in shape. Prose remedy issued three times, missed three times,
+          # because the omission happens while DRAFTING and nothing checked at the
+          # keystroke.
+          #
+          # A pre-close refusal costs a retry and returns the one thing the warn
+          # cannot: the draft, still editable, before anything is committed.
+          #
+          # WHAT THE ORIGINAL OPT-IN-BY-CONSTRUCTION NOTE ABOVE GOT RIGHT, and why
+          # this does not contradict it: that note argues the ENABLING half must not
+          # block "a row whose verifier has not adopted the form yet". True while the
+          # form was new. The scope here is far narrower than "has a verifier" — it
+          # is the intersection of (maker AND verifier set) AND (a delivery PR bound)
+          # AND (that PR MEASURED as merged). Every predicate above this line has
+          # already passed. On that population the sha is not a convention, it is the
+          # missing operand of a guard the row is otherwise fully wired for.
+          #
+          # NOT a repair-vs-loss argument, and this is worth stating because the
+          # filing said the field was frozen and it is NOT: `task done <id>
+          # --append-result --result=...` writes a closed row and re-runs this gate
+          # (DIVE-2464/2476; measured by olivia on DIVE-2760, where an appended sha
+          # produced the confirmation the first close could not). So the warn was
+          # never unrepairable data loss. It was an ERRAND — undiscoverable from the
+          # warn's own text, which names no such path — and the refusal exists to
+          # convert an errand nobody runs into a retry nobody can skip.
+          if [[ $no_graded_sha -eq 1 ]]; then
+            _task_store_audit_log "task.no-graded-sha" ok 0 -- "$ident" "closed_without_graded_sha=$_dref"
+            warn "$ident: closed on a maker->verifier loop with no \`graded-sha: <sha>\` in the result (--no-graded-sha, audited), so the DIVE-2656 head-vs-graded comparison did NOT run — $_dref merged unverified against any stated verdict."
+          else
+            policy_refuse "$E_CONFLICT" done-without-graded-sha DIVE-2940 "$ident" "$ident cannot close: it is a maker->verifier loop row whose delivery PR $_dref is MEASURED as merged, but the result states no \`graded-sha: <7-40 hex>\`, so the DIVE-2656 head-vs-graded comparison has no second operand and CANNOT RUN (DIVE-2940). This is 'not checked', not 'matched' — nothing here has established that what merged is what was graded. NOTHING IS WRITTEN YET and your draft is still editable, which is the whole reason this fires before the close rather than after it: re-run with the sha you actually graded on the first line of the result (\`graded-sha: <sha>\`), and the gate will compare it to $_dref's head and merge commit and tell you which. Read the sha you graded from the PR itself, do NOT copy it from this message or from a handoff — \`gh pr view $_dref --json headRefOid,mergeCommit\`, or credential-free \`git ls-remote <repo-url> refs/pull/<N>/head\`. If you genuinely graded nothing sha-shaped (a docs row, a decision, work you did not grade yourself), that is a real case and it has a declared, audited escape: \`task done $ident --no-graded-sha\`. Use the escape rather than inventing a sha — a wrong sha here does not fail loudly, it MATCHES nothing and converts this refusal into the DIVE-2656 mismatch refusal one branch up."
+          fi
         fi
         # DIVE-1935: MERGED is not the same as GREEN.
         # Slug pairing: this DECLARED-binding site is `done-after-red-merge`; the
