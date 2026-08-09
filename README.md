@@ -135,6 +135,30 @@ sudo 5dive agent create cheap-coder --type=claude --provider=deepseek --api-key=
 sudo 5dive agent create glm-coder --type=claude --provider=openrouter --api-key=<key> --auth-profile=openrouter --model=z-ai/glm-5.2
 ```
 
+Not on that list? `--base-url` points the harness at **any** Anthropic-compatible
+endpoint — a model you host yourself, or a vendor host we don't ship a row for:
+
+```sh
+# Open weights on a server you own. --model is required here: there is no catalog
+# entry to inherit per-tier model ids from, and an unpinned background tier would
+# 404 on the agent's own housekeeping turns.
+sudo 5dive agent create qwen-box --type=claude \
+  --base-url=https://llm.internal.example.com/anthropic \
+  --api-key=<key> --auth-profile=qwen-box --model=qwen3.8-max
+
+# A local inference server (vLLM, llama.cpp, an Ollama Anthropic shim):
+sudo 5dive agent create local-box --type=claude \
+  --base-url=http://127.0.0.1:8000 \
+  --api-key=<key> --auth-profile=local-box --model=<slug>
+```
+
+`https://` is required — the API key rides that URL on every request. `http://` is
+accepted only for `localhost` / `127.0.0.1` / `[::1]`, where the traffic never leaves
+the box; a private-LAN address is still a real network and is refused. `--base-url`
+requires `--auth-profile`, like every claude BYO path, so the endpoint and its key
+are scoped to the agents you bind to that profile rather than to every claude agent
+on the host. In a `5dive compose` spec the key is `base_url`.
+
 Switch the model on a running agent (persists across restarts):
 
 ```sh
