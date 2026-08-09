@@ -191,7 +191,13 @@ run_done D-1 --result='landed'
 [[ "$(slugof D-1)" == "done-merge-gate-no-credential" ]] \
   && ok_t 'T1 refuses under its OWN slug (the cause is recorded, not just the block)' \
   || bad_t 'T1 slug' "slug=[$(slugof D-1)] out=$OUT"
-[[ "$OUT" == *"the merge was never checked"* && "$OUT" == *"no gh credential"* ]] \
+# DIVE-2645: this refusal is NOT cut. main landed _gate_refuse_no_rail (DIVE-2770) while
+# this branch waited, WITH tests/task_merge_gate_anon_rail_unit.sh pinning "COULD NOT CHECK",
+# "BY FAULT" and "BY DESIGN" in it. Its length is carrying a real second next-action (a
+# verifier seat must reach for 'task verify --cmd=', not GH_TOKEN), so by this row's own
+# boundary it is substance, not archaeology. Cutting it means deleting a guard main just
+# added — a decision for main, not a merge resolution.
+[[ "$OUT" == *"COULD NOT CHECK"* && "$OUT" == *"no gh credential"* ]] \
   && ok_t 'T1 the message names the missing credential, like merge-audit already does' \
   || bad_t 'T1 names the credential' "out=$OUT"
 # THE REGRESSION ITSELF: the old string asserted a merge verdict nobody measured.
