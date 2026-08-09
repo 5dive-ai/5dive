@@ -238,7 +238,7 @@ broker_gate_check() {
     BROKER_GATE_SIG_STATE="verified"
   elif [[ -z "$gsig" ]]; then
     BROKER_GATE_SIG_STATE="absent"
-    fail "$E_VALIDATION" "gate on ${ident} carries NO closure signature and the root executor will refuse it — re-answer the gate on a box that can sign: 5dive task answer ${ident} ..."
+    fail "$E_VALIDATION" "gate on ${ident} carries NO closure signature — the root-only executor verifies it before any delegated ${noun} and refuses an unsigned one. Re-answer the gate: 5dive task answer ${ident} ..."
   fi
 }
 
@@ -338,7 +338,7 @@ broker_bind_target() {
     a=$(printf '%s' "$value"      | tr -d '`'"'"'"<>[](),. \r\t')
     b=$(printf '%s' "$task_value" | tr -d '`'"'"'"<>[](),. \r\t')
     if [[ -n "$a" && "$a" == "$b" ]]; then
-      hint=" These differ only in punctuation, so the binding is NOT stale — the declared '${key}:' line is malformed."
+      hint=" NOTE: these differ only in punctuation/whitespace, so the binding is NOT stale and re-filing the gate will not change that — the declared '${key}:' line is malformed."
       fixcmd=$(broker_surface "$surface" fixcmd)
       [[ -n "$fixcmd" ]] && hint+=" Rewrite it: ${fixcmd} ${ident} ${a}"
     fi

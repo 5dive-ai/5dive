@@ -1862,7 +1862,7 @@ cmd_export() {
       kept="${counts%% *}"; excluded="${counts##* }"
       if (( kept == 0 )); then
         rm -rf "$draft"
-        fail "$E_GENERIC" "nothing shareable: 0 reference/project knowledge facts ($excluded private or opted-out) — only 'reference'/'project' facts export. Nothing written."
+        fail "$E_GENERIC" "nothing shareable: 0 reference/project knowledge facts ($excluded private or opted-out). Only metadata.type 'reference' or 'project' facts are eligible — 'user' and 'feedback' are never exported. Nothing written."
       fi
       if ! _pack_secret_tripwire "$draft"; then
         rm -rf "$draft"
