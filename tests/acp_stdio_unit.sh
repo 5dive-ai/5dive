@@ -78,12 +78,43 @@ want "$([[ $rc -eq 2 ]] && echo true)" "an argument is a usage error (2), got $r
 
 BUN=$(ACP_BUN_BIN="" _acp_resolve_bun)
 if [[ ! -x "$BUN" ]]; then
-  # Honest skip, and scoped: the two stdio scenarios below ARE the bun server, so
-  # a box without bun cannot grade them. The preflight checks above already ran.
-  printf 'SKIP - stdio scenarios: no bun on this box (%s); preflight checks ran\n' "$BUN"
-  printf 'PASS - %d checks, %d failed (stdio scenarios skipped)\n' "$CHECKS" "$FAILED"
-  [[ $FAILED -eq 0 ]] || exit 1
-  exit 0
+  # DIVE-3059: THIS DEFAULTS TO FAIL, and the reason is that the previous version
+  # of this block was honest in the log and invisible in the verdict. It printed
+  # `SKIP - stdio scenarios` and then `PASS - N checks` and exited 0, so a run
+  # that graded 2 of 21 checks was byte-identical, at the layer CI reads, to one
+  # that graded all 21. Confirmed to have actually happened: the core tier had no
+  # bun, and PR 537's green said nothing whatsoever about the ACP server.
+  #
+  # The skip itself was correct behaviour — these two scenarios ARE the bun
+  # server and a box without bun genuinely cannot grade them. What was wrong is
+  # who got to decide. So the decision moves to the CALLER: a human on a bun-less
+  # laptop passes ACP_ALLOW_SKIP=1 deliberately, and a CI runner that has lost its
+  # bun step goes red instead of silently grading two checks.
+  #
+  # Keep this even once bun is installed on the runner. Installing bun fixes
+  # today's coverage; this is what stops the silent-skip returning the day
+  # somebody drops the step.
+  # NO HARDCODED TOTAL HERE, deliberately. The first draft of this block said
+  # "19 stdio checks", a figure that had been repeated in three agents' messages
+  # and in the wiki write-up — and it was wrong: preflight is 3 and a full run is
+  # 21, so the stdio scenarios are 18. A literal total in a summary line is also
+  # wrong the moment somebody adds a check, and it is the kind of wrong that
+  # nothing catches, because the line still LOOKS precise. So report what is
+  # known for certain — how many ran, how many failed, and that the stdio
+  # scenarios were not among them.
+  if [[ -n "${ACP_ALLOW_SKIP:-}" ]]; then
+    printf 'SKIP - stdio scenarios: no bun on this box (%s); ACP_ALLOW_SKIP set\n' "$BUN"
+    # The count is in the summary line ON PURPOSE: a reader must be able to tell
+    # this run from a full one WITHOUT opening the log.
+    printf 'PARTIAL - %d preflight checks ran, %d failed; the stdio scenarios did NOT run\n' \
+      "$CHECKS" "$FAILED"
+    [[ $FAILED -eq 0 ]] || exit 1
+    exit 0
+  fi
+  printf 'FAIL - stdio scenarios cannot run: no bun on this box (%s)\n' "$BUN"
+  printf 'FAIL - only %d preflight checks ran; the ACP server itself was NOT graded.\n' "$CHECKS"
+  printf 'FAIL - install bun, or set ACP_ALLOW_SKIP=1 to accept an ungraded ACP server.\n'
+  exit 1
 fi
 
 # --- 2. handshake, roster, refuse-to-open-blank, attach, turn, fall-through -----

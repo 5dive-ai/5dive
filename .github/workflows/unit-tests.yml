@@ -62,6 +62,21 @@ jobs:
       # dependency true by construction instead of by alphabetical accident.
       - name: Build the bundle (harness precondition, not an accident of ordering)
         run: ./build.sh
+      # DIVE-3059: bun is a harness PRECONDITION, declared for the same reason
+      # ./build.sh is declared above — an unmet precondition here was not a red,
+      # it was a silent pass. tests/acp_stdio_unit.sh grades the ACP server by
+      # spawning it over stdio; ubuntu-latest does not ship bun, nothing here
+      # installed it, and the harness skipped its 19 stdio checks while still
+      # printing PASS and exiting 0. Measured on the core artifact: that harness
+      # finished in 37ms rc=0 (pristine) and 287ms rc=0 (installed-host) — nothing
+      # that spawns bun and drives 19 scenarios finishes in 37 milliseconds.
+      #
+      # The harness now FAILS rather than skipping (ACP_ALLOW_SKIP=1 is the
+      # deliberate local escape), so dropping this step is a red and not a lie.
+      # Both halves are needed: this one buys the coverage, that one keeps the
+      # absence of coverage loud.
+      - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
+        uses: oven-sh/setup-bun@v2
       # DIVE-2525: the budget is NOT passed here. It lives in tests/lib/tier.sh next
       # to the tier definition, because a budget spelled in the caller is raised by
       # a one-line YAML edit that nobody reviews as the policy change it is.
@@ -163,6 +178,14 @@ jobs:
       # dependency true by construction instead of by alphabetical accident.
       - name: Build the bundle (harness precondition, not an accident of ordering)
         run: ./build.sh
+      # DIVE-3059: this job runs whatever harnesses the PR TOUCHED, at any tier,
+      # and it also runs the verdict probe against them. A PR editing
+      # acp_stdio_unit.sh — this one, for a start — runs it here, so without bun
+      # this job reds on the very change that makes the harness honest. It is also
+      # the job where the probe asserts the harness CAN fail, which is only
+      # meaningful if the harness can also pass.
+      - name: Install bun (harness precondition — a touched harness may need it)
+        uses: oven-sh/setup-bun@v2
       - name: Run them (any tier)
         if: steps.changed.outputs.files != ''
         run: |
@@ -262,6 +285,12 @@ jobs:
       # dependency true by construction instead of by alphabetical accident.
       - name: Build the bundle (harness precondition, not an accident of ordering)
         run: ./build.sh
+      # DIVE-3059: same precondition as the pristine job. This job runs the SAME
+      # core tier, so it took the same silent skip (287ms rc=0 on the artifact).
+      # Needed in every job that runs the harness, not just the first one — the
+      # harness now FAILS without bun, so a job missing this step goes red.
+      - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
+        uses: oven-sh/setup-bun@v2
       - name: Run core harnesses (installed host, budgeted)
         run: bash scripts/run-harnesses.sh --tier=core --label=installed-host --report=core-installed.txt
       - uses: actions/upload-artifact@v4
