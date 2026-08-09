@@ -1,17 +1,17 @@
 {
-  "generatedAtUtc": "2026-08-08T02:00:14Z",
-  "date": "2026-08-08",
+  "generatedAtUtc": "2026-08-09T02:00:14Z",
+  "date": "2026-08-09",
   "week": {
-    "shipped": 315,
+    "shipped": 325,
     "humanAsks": 32
   },
   "day": {
-    "shipped": 19,
-    "humanAsks": 6
+    "shipped": 16,
+    "humanAsks": 0
   },
   "cumulative": {
-    "daysPublished": 29,
-    "shipped": 1470,
+    "daysPublished": 30,
+    "shipped": 1486,
     "humanAsks": 187,
     "since": "2026-07-11"
   },
@@ -20,25 +20,25 @@
   "methodology": "https://github.com/5dive-ai/5dive/blob/main/docs/zero-human.md",
   "corroborators": {
     "verifierFirstPassRate": {
-      "value": "64.2%",
+      "value": "64.0%",
       "window": "7d",
-      "firstPass": 113,
-      "graded": 176,
-      "shippedStandardTasks": 309,
-      "coveragePct": 57.0,
+      "firstPass": 114,
+      "graded": 178,
+      "shippedStandardTasks": 319,
+      "coveragePct": 55.8,
       "basis": "live tasks.db query: status='done' AND kind='standard' AND done_at within the last 7 calendar days from datetime('now') \u2014 a DIFFERENT instrument from this datapoint's own week.shipped above (a frozen sum of the last 7 PUBLISHED daily datapoints, DIVE-1552, which can span more than 7 calendar days while publishing is paused). Do not read the two as the same number.",
       "iterationNullGraded": 1,
       "iterationNullBiasPctPtsMax": 0.6,
       "note": "rows with a NULL iteration count as first-pass, biasing this rate UP by at most iterationNullBiasPctPtsMax"
     },
     "policyBlockedAttempts": {
-      "value": 203,
+      "value": 208,
       "window": "7d",
       "instrumentedSites": 33,
       "firedSites": 20,
       "firedSitesLifetime": 23,
       "ledgerSince": "2026-07-25 12:04:55",
-      "ledgerAgeDays": 13.6,
+      "ledgerAgeDays": 14.6,
       "note": "a site that never fires is not evidence of compliance \u2014 10 of 33 instrumented sites have never fired lifetime; no baseline exists yet while the ledger is young (see ledgerAgeDays)"
     }
   },
