@@ -1365,7 +1365,23 @@ _hb_is_knowledge_task() {
 #      — it names ONE default destination, `created_by`, the agent that filed the
 #      row and is asking for the answer, and it requires the decision to be
 #      recorded on the row BEFORE the routing (a routed row with no reason is the
-#      DIVE-2683 empty-cancel defect one verb over). It stays silent when
+#      DIVE-2683 empty-cancel defect one verb over).
+#
+#      AND IT ASSERTS NO ROLE IT CANNOT DERIVE (olivia, iteration 1 reject). The
+#      first cut of this variant stated "this row was routed to you for a DECISION,
+#      not to build and not to grade" as flat fact. The predicate does not select
+#      that: `verifier == assignee && maker_agent EMPTY` is ALSO the shape of a row
+#      that is simply the owner's to do. Measured on the live board, 12 closed rows
+#      have ever been in this shape and 6 are in the guard's firing set; of those 6,
+#      DIVE-2456, DIVE-1956 and DIVE-1789 were owners doing or grading their own
+#      work, and in each the correct terminal was the `done` the first cut warned
+#      against and never offered. Those rows got silence before the change and would
+#      have got a confident wrong premise after it — the worse direction, and this
+#      row's own defect class one role over. So the clause now states only what the
+#      spec settles (nothing delivered, no handoff, `reject` would refuse), says
+#      outright that routed-vs-yours-to-do is indistinguishable here, and lists BOTH
+#      terminals: `task assign` for the routed case, `task done` for the do-it-
+#      yourself case. It stays silent when
 #      created_by is empty or is the woken agent itself, i.e. whenever there is no
 #      named party to route to — silence is the correct output there, and the base
 #      nudge's own gate path is the exit.
@@ -1396,11 +1412,12 @@ _hb_loop_terminal_clause() {
   # Mutually exclusive with the verifier variant below by the maker_agent test.
   if [[ -z "$maker" ]]; then
     [[ -n "$creator" && "$creator" != "$name" ]] || return 0
-    printf ' NOTE — you are the verifier-of-record on %s but NOTHING HAS BEEN HANDED TO YOU: %s is empty, so there is no delivery to grade and %s would refuse. This row was routed to you for a DECISION, not to build and not to grade. Once you have made the call, the terminal action is to ROUTE THE ROW ON to the hands that do the work — write the decision and its reason onto the row first (%s), then run %s and treat the goal as MET, and stop, once %s prints an %s line naming someone other than you. %s filed this row and is the default destination; pick a different agent only if the body says so. Do NOT record a done for work you did not do, cancel a row you were only asked to decide, or grade an empty handoff. AND RE-READ %s AT THE MOMENT YOU ACT, because this note was written when the row had no maker and that is a live column: if the work is built and delivered BACK to you inside this same session, %s will then print %s under %s and a %s line, and your terminal action becomes the VERIFIER'"'"'s — accept with %s, or return a FAIL verdict with %s — not this one.' \
+    printf ' NOTE — on %s you are the verifier-of-record and NOTHING HAS BEEN HANDED TO YOU: %s is empty, so nothing has been delivered, there is no handoff to grade, and %s would refuse. That is the whole of what the loop spec settles. It does NOT settle whether this row was ROUTED to you for a decision or is simply YOURS TO DO — those two states are identical in the spec — so both terminals are listed below and you pick from the body, not from this note. IF IT WAS ROUTED TO YOU FOR A DECISION: make the call, write it and its reason onto the row (%s), then run %s and treat the goal as MET, and stop, once %s prints an %s line naming someone other than you; %s filed this row and is the default destination, pick a different agent only if the body says so. IF THE WORK IS YOURS TO DO: do it and close it with %s — that is the honest terminal for this state and nothing here is steering you off it. Not available either way: grading an empty handoff, recording a done for work nobody did, or cancelling a live row to clear your board. AND RE-READ %s AT THE MOMENT YOU ACT, because this note was written when the row had no maker and that is a live column: if the work is built and delivered BACK to you inside this same session, %s will then print %s under %s and a %s line, and your terminal action becomes the VERIFIER'"'"'s — accept with %s, or return a FAIL verdict with %s.' \
       "$task_ident" "'maker_agent'" "'task reject'" \
       "'5dive task set-body ${task_ident}' or a gate answer" \
       "'5dive task assign ${task_ident} ${creator}'" \
       "'5dive task show ${task_ident}'" "'assignee ='" "$creator" \
+      "'5dive task done ${task_ident}'" \
       "'5dive task show ${task_ident}'" "'5dive task show ${task_ident}'" \
       "'maker: ${creator}'" "'loop spec:'" \
       "'handoff: delivered (awaiting verifier ACK)'" \

@@ -131,9 +131,36 @@ r=$(_hb_loop_terminal_clause olivia "$grade" "DIVE-$grade")
 [[ "$r" == *"assignee ="* ]] \
   && ok_t "routing clause names the observable state (an 'assignee =' line)" \
   || bad_t "routing clause names the observable state" "got: $r"
-[[ "$r" == *"cancel a row you were only asked to decide"* ]] \
+[[ "$r" == *"cancelling a live row to clear your board"* ]] \
   && ok_t "routing clause forbids the empty-cancel exit (DIVE-2683)" \
   || bad_t "routing clause forbids the empty-cancel exit" "got: $r"
+
+# olivia's iteration-1 REJECT, and the arms that keep it fixed. The predicate
+# `verifier == assignee && maker_agent EMPTY` is ALSO the shape of a row that is
+# simply the owner's to do — measured on the live board, 3 of the 6 rows in the
+# guard's firing set (DIVE-2456, DIVE-1956, DIVE-1789) were owners doing or
+# grading their own work, and for each the correct terminal was the `done` the
+# first cut warned against and never offered. So the clause must assert only what
+# the loop spec settles, and must offer BOTH terminals.
+[[ "$r" != *"This row was routed to you for a DECISION, not to build"* ]] \
+  && ok_t "routing clause does NOT assert the routed-for-decision role as fact" \
+  || bad_t "routing clause asserts a role the predicate cannot select" "got: $r"
+[[ "$r" == *"IF IT WAS ROUTED TO YOU FOR A DECISION"* && "$r" == *"IF THE WORK IS YOURS TO DO"* ]] \
+  && ok_t "routing clause states BOTH branches conditionally, not one as premise" \
+  || bad_t "routing clause states both branches conditionally" "got: $r"
+# Split on the re-read pivot before asserting this one. A flat "contains task
+# done" PASSES ON THE BUG — the rejected version already named `task done` in the
+# forward-looking verifier-transition sentence AFTER the pivot, while offering it
+# nowhere as a terminal for this state. The before-half is the only place that
+# distinguishes a terminal on offer now from a role this may turn into.
+[[ "${r%%AND RE-READ*}" == *"5dive task done DIVE-$grade"* ]] \
+  && ok_t "routing clause offers 'task done' NOW, before the re-read pivot" \
+  || bad_t "routing clause offers 'task done' as a present terminal" "got: $r"
+# The generator genuinely cannot tell the two apart, and must say so rather than
+# guess — that admission is what stops the next reader treating it as a role read.
+[[ "$r" == *"does NOT settle"* || "$r" == *"identical in the spec"* ]] \
+  && ok_t "routing clause admits the spec cannot distinguish the two states" \
+  || bad_t "routing clause admits what it cannot derive" "got: $r"
 [[ "$r" != *$'\n'* && "${r:0:1}" == " " ]] \
   && ok_t "routing clause is a single space-prefixed line" \
   || bad_t "routing clause is a single space-prefixed line" "got: [$r]"
