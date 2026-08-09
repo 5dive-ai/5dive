@@ -94,7 +94,7 @@ ok "_attr_scope is declared local (no global leak under set -u)" \
 
 # ---- 4. THE REFUSALS KEPT THEIR SCOPE DISCLOSURE (no regression) ----
 ok "the DIVE-1830 refusal still names \$_searched" \
-  "grep -q 'nothing on \${FIVE_GATE_MAIN_BRANCH:-main} in \$_searched shows branch' \"\$SRC/cmd_task.sh\""
+  "grep -q 'in \$_searched shows branch' \"\$SRC/cmd_task.sh\""
 ok "the scan-bound refusal still offers the unsearched-repo explanation" \
   "grep -q 'the branch lives in a repo that was NEVER SCANNED' \"\$SRC/cmd_task.sh\""
 

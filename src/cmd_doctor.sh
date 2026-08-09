@@ -950,7 +950,7 @@ cmd_doctor() {
       if [[ -z "$_free" ]]; then
         doctor_add host "disk ${_mnt}" warn "could not read free space for ${_mnt} (df failed) — UNKNOWN, not fine"
       elif (( _free < DISK_ERROR_KB )); then
-        doctor_add host "disk ${_mnt}" error "only ${_gb}G free on ${_mnt} (${_pct}% used) — agents are about to fail with ENOSPC in ways that read as 'that tool is broken'; reclaim: 5dive task reclaim --all --dry-run"
+        doctor_add host "disk ${_mnt}" error "only ${_gb}G free on ${_mnt} (${_pct}% used) — reclaim: 5dive task reclaim --all --dry-run"
       elif (( _free < DISK_WARN_KB )); then
         doctor_add host "disk ${_mnt}" warn "${_gb}G free on ${_mnt} (${_pct}% used) — one npm install is ~1G; reclaim: 5dive task reclaim --all --dry-run"
       else

@@ -225,7 +225,7 @@ _push_author_scan() {
       # pre-policy commit in it as a violation. Say what is missing instead.
       local diag="the author check could not determine WHICH commits '${branch}' adds to $(_push_repo_slug "$repourl") — fetching that repo's main failed (${why}) and this work tree has no cached refs/remotes/origin/main to fall back on. Without a bound the only scannable range is the branch's ENTIRE history, which would report every pre-policy commit in it as an author violation; that is a fabricated result, so it is not produced."
       [[ "$mode" == preflight ]] && { warn "author check SKIPPED here — ${diag} It is re-run authoritatively inside the push as root, which fetches with the App credential. (DIVE-2161)"; return 0; }
-      fail "$E_GENERIC" "author check COULD NOT RUN — ${diag} Restore the bound and retry: give this tree a fetchable origin/main ('git remote add origin <url> && git fetch origin main'), or clear whatever blocked the fetch (see the reason above). (DIVE-2161)"
+      fail "$E_GENERIC" "author check COULD NOT RUN — ${diag} Give this tree a fetchable origin/main and retry"
     fi
   fi
   offenders=$("${G[@]}" log --format='%H %an <%ae>' "$rangespec" 2>/dev/null \

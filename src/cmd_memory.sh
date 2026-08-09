@@ -44,7 +44,7 @@ _memory_usage() {
       path other agents can search), stamps provenance (who/when), appends the
       store's index line, and refuses token/key-shaped content (tripwire;
       --force does NOT bypass it). Existing file needs --force to overwrite.
-      Lifecycle envelope (DIVE-1024, all optional): --valid-to = date the fact
+      Lifecycle envelope (, all optional): --valid-to = date the fact
       expires / needs recheck; --supersedes = slug of the memory this replaces
       (that one is then demoted in recall instead of silently lingering);
       --confidence = how sure; --provenance = where the fact came from. Recall

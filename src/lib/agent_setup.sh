@@ -1849,7 +1849,7 @@ PI_EXT
       sudo -u "$user" -H env PATH="$node_bin:/usr/bin:/bin" \
         pi remove "npm:${spec}" >/dev/null 2>&1 || true
       fail "$E_GENERIC" \
-        "pi default extension $spec failed to install or its npm integrity did not match the audited hash for $user (SECURITY: fail-closed). Check network to the npm registry, confirm $spec was not republished, or set FIVE_PI_DEFAULT_EXTENSIONS=0 to skip."
+        "pi extension $spec failed npm integrity for $user — check the registry, or set FIVE_PI_DEFAULT_EXTENSIONS=0"
     fi
   done
 }

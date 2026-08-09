@@ -30,7 +30,7 @@ SECRET_WRITE_LOCK="/run/5dive-secret-write.lock"
 
 _secret_usage() {
   cat >&2 <<'EOF'
-5dive secret — box-side secret store (secure credential drop, DIVE-919)
+5dive secret — box-side secret store (secure credential drop,)
 
   5dive secret write <KEY> --connector=<name> [--task=<DIVE-N>]   (value on STDIN)
       Write/replace KEY in /etc/5dive/connectors/<name>.env. Atomic,

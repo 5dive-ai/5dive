@@ -117,7 +117,7 @@ broker_gate_check() {
   gsig=$(db "SELECT COALESCE(need_answer_sig,'')      FROM tasks WHERE id=${id};")
   reviewer=$(db "SELECT COALESCE(routed_reviewer,'')  FROM tasks WHERE id=${id};")
   if [[ -z "$gtype" ]]; then
-    fail "$E_VALIDATION" "no gate on ${ident}: file a ${noun}-for-review gate first (5dive task need ${ident} --type=approval --ask='${ask}') — a ${noun}-for-review ask files as a lead-routed tier-1 gate the org lead can clear (not a human-only tier-2 in the human's DM), and ${noun} runs once a human OR that lead clears it."
+    fail "$E_VALIDATION" "no gate on ${ident} — file a ${noun}-for-review gate first: 5dive task need ${ident} --type=approval --ask='${ask}' (files tier-1 to the org lead, who can clear it)"
   fi
   if [[ -z "$gansweredat" ]]; then
     fail "$E_VALIDATION" "gate on ${ident} is OPEN (unanswered ${gtype}) — ${noun} refused until it clears (5dive task answer ${ident} ...)."
@@ -233,12 +233,12 @@ broker_gate_check() {
   BROKER_GATE_SIG_STATE="unverified"
   if [[ "$require_sig" == "1" ]]; then
     if ! _gate_closure_verify "$id" "$gtype" "$ganswer" "$gby" "$gansweredat" "$guid" "$gsig"; then
-      fail "$E_VALIDATION" "gate on ${ident} has no valid signed closure — delegated ${noun} refused (the authoritative gate record may be unsigned or tampered)."
+      fail "$E_VALIDATION" "gate on ${ident} has no valid signed closure — delegated ${noun} refused"
     fi
     BROKER_GATE_SIG_STATE="verified"
   elif [[ -z "$gsig" ]]; then
     BROKER_GATE_SIG_STATE="absent"
-    fail "$E_VALIDATION" "gate on ${ident} carries NO closure signature — the root-only executor verifies the root-HMAC closure before any delegated ${noun} and refuses an unsigned one, so this preflight refuses HERE rather than report a rehearsal success the real ${noun} will not honour (DIVE-2801). Re-answer the gate (5dive task answer ${ident} ...) on a box that can sign; 'task answer' warns when a closure mints unsigned (DIVE-2760)."
+    fail "$E_VALIDATION" "gate on ${ident} carries NO closure signature — the root-only executor verifies it before any delegated ${noun} and refuses an unsigned one. Re-answer the gate: 5dive task answer ${ident} ..."
   fi
 }
 
@@ -325,28 +325,24 @@ broker_bind_target() {
   local ticket; ticket=$(broker_surface "$surface" ticket)
   local task_value; task_value=$(broker_task_target "$surface" "$id")
   if [[ -z "$task_value" ]]; then
-    fail "$E_VALIDATION" "task ${ident} declares no ${target} — add a '${key}: <name>' line to its body so the cleared gate binds to a specific ${target} (delegated ${noun} refuses an unbound ${target})."
+    fail "$E_VALIDATION" "task ${ident} declares no ${target} — add a '${key}: <name>' line to its body, then retry"
   fi
   if [[ "$value" != "$task_value" ]]; then
-    # DIVE-3081: this refusal is DIVE-1462's anti-substitution guard, so its plain
-    # reading is "someone is acting on the wrong ${target}" and the natural repair
-    # is to re-file the gate — a second human tap. But when the two values differ
-    # only in characters that do not survive a glance (a leftover markdown wrapper,
-    # a stray quote, a trailing CR from a pasted body), the binding is not stale and
-    # re-filing changes nothing. Say so INSIDE the refusal: the reader is looking at
-    # two strings they have already decided are identical, and asking them to diff
-    # bytes only works if something tells them to. Cheap comparison, and it fires
-    # only on the look-alike case — a genuinely different ${target} gets the plain
-    # message, unchanged.
+    # DIVE-3081: when the two values differ only in characters that do not survive a
+    # glance (a leftover markdown wrapper, a stray quote, a trailing CR from a pasted
+    # body), the binding is NOT stale and re-filing the gate changes nothing. Say so
+    # inside the refusal — the reader is looking at two strings they have already
+    # decided are identical. Fires only on the look-alike case; a genuinely different
+    # ${target} gets the plain message, unchanged.
     local hint="" a b fixcmd
     a=$(printf '%s' "$value"      | tr -d '`'"'"'"<>[](),. \r\t')
     b=$(printf '%s' "$task_value" | tr -d '`'"'"'"<>[](),. \r\t')
     if [[ -n "$a" && "$a" == "$b" ]]; then
-      hint=" NOTE: these two differ only in punctuation/whitespace, so the binding is NOT stale and re-filing the gate will not change that — the declared '${key}:' line is malformed."
+      hint=" NOTE: these differ only in punctuation/whitespace, so the binding is NOT stale and re-filing the gate will not change that — the declared '${key}:' line is malformed."
       fixcmd=$(broker_surface "$surface" fixcmd)
-      [[ -n "$fixcmd" ]] && hint+=" Rewrite it with the verb that owns it: ${fixcmd} ${ident} ${a}"
+      [[ -n "$fixcmd" ]] && hint+=" Rewrite it: ${fixcmd} ${ident} ${a}"
     fi
-    fail "$E_VALIDATION" "${target} '${value}' is not the ${target} bound to ${ident}'s cleared gate ('${task_value}') — a cleared gate authorizes only its task's own declared ${target}. ${Noun} refused (${ticket}).${hint}"
+    fail "$E_VALIDATION" "'${value}' is not the ${target} bound to ${ident}'s cleared gate ('${task_value}') — ${noun} refused.${hint}"
   fi
 }
 

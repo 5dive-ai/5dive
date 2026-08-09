@@ -202,7 +202,7 @@ cmd_bug() {
   fi
 
   command -v gh >/dev/null 2>&1 \
-    || fail "$E_NOT_INSTALLED" "gh is not installed on this box — cannot file a GitHub issue. The payload above is everything this verb would have sent; file it by hand at https://github.com/$(gh_org)/5dive/issues/new?template=bug_report.md"
+    || fail "$E_NOT_INSTALLED" "gh is not installed — file the payload printed above by hand at https://github.com/$(gh_org)/5dive/issues/new"
 
   local body title tmpf rc=0 issue_url=""
   body=$(_bug_body_markdown "$payload")
@@ -221,6 +221,6 @@ cmd_bug() {
   if (( rc == 0 )); then
     ok "issue filed: $issue_url" '{filed:true, url:$u}' --arg u "$issue_url"
   else
-    fail "$E_GENERIC" "gh issue create failed (rc=$rc) — the payload printed above is everything this would have sent; file it by hand if needed"
+    fail "$E_GENERIC" "gh issue create failed (rc=$rc) — the payload printed above is everything this would have sent"
   fi
 }
