@@ -275,6 +275,24 @@ chk "14 the page names the fix"       "1"        "$(grep -c '5dive task init' "$
 #                            leak. TMPDIR is private to this run: the host has
 #                            hundreds of these already and other runs are racing.
 #
+# The body pair is ALSO the only arm that catches a refactor back to a threading
+# server, and it catches it PROBABILISTICALLY, because its subject is a race. Three
+# samples of the SAME one-line mutant (`srv = ThreadingHTTPServer` unconditionally),
+# all three taken on THIS host:
+#
+#   8/10  dev,   2026-08-06     4/6  dev,   2026-08-09
+#   3/6   main2, 2026-08-07     — every non-kill run reported PASS=72 FAIL=0
+#
+# The rate is not a property of the arm and not even a property of the box: it moves
+# with scheduler load between sittings on one machine. CI runs this file ONCE, so a
+# green run here is one sample from a detector with a false-negative rate somewhere
+# around 1-in-3 — never read it as proof the race is guarded. Quote a race arm's kill
+# rate with its host, its date and its run count, or do not quote it.
+#
+# Two distinct failure signatures, both graded: a TRUNCATED 200 (status passes, body
+# fails — the dominant one, 3 of 4 kills on 2026-08-09) and a dead connection (status
+# itself fails). The status/body split below is what keeps them tellable apart.
+#
 # Readiness comes from the server's own "listening on" line, never from opening a
 # connection — `--once` has exactly one request to give and a TCP probe spends it.
 PORT2="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
@@ -340,8 +358,16 @@ kill "$ONCE_PID" 2>/dev/null
 #
 # It is graded here for the reason the property was lost the first time — nobody
 # had encoded it, because it was never a decision, just a side effect of the bug.
-# A refactor back to a threading server passes every arm above and fails only
-# this one. `_5DIVE_UI_ONCE_READ_TIMEOUT` keeps that honest at 2s instead of 30.
+#
+# WHAT THIS ARM GUARDS: the read timeout, and only that. Deleting the timeout kills
+# exactly these three assertions. It does NOT guard the threading choice, and an
+# earlier version of this comment claimed it did. Measured against a mutant that is
+# this tree with only `HTTPServer` reverted to `ThreadingHTTPServer`: this arm passed
+# 5/5, and 6/6 on an earlier pass. It cannot fire — under threading the silent client
+# gets its own worker, the main thread returns from handle_request() on dispatch and
+# exits at once, so "did it park?" scores the re-threaded server GREEN. The
+# re-threading guard is arm 15's body pair, and it is probabilistic; see there.
+# `_5DIVE_UI_ONCE_READ_TIMEOUT` keeps this arm honest at 2s instead of 30.
 PORT3="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
 STALLTMP="$TMP/stall-tmpdir"; mkdir -p "$STALLTMP"
 _5DIVE_UI_ONCE_READ_TIMEOUT=2 TMPDIR="$STALLTMP" \
