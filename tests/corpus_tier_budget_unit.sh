@@ -541,6 +541,25 @@ if [[ "$C2" == *"cover it"* && "$C2" == *"always.sh"* ]]; then
   ok "the budget red names the smallest set of harnesses that COVERS the overage"
 else bad "the budget red names the smallest set of harnesses that COVERS the overage" "$C2"; fi
 
+# DIVE-2801: OVER BUDGET **AND** RED. The arm above is the no-failures case; this is
+# its pair. The banner used to assert "NO TEST FAILED" unconditionally inside the
+# over-budget branch while computing "N of M" from the very `failed` array that
+# contradicts it — a real run printed "NO TEST FAILED — 241 of 243 harnesses
+# passed". That is a verdict the printer did not compute, in the output whose only
+# job is to say what the red IS, and it is the same defect this row exists to fix.
+# Both facts are true here and the reader needs both plus which exit wins.
+rm -f "$TMP"/*.seen
+printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/broken.sh"
+C3="$(bash "$RUNNER" --no-calibrate --corpus-dir="$TMP" --tier=full --budget=1 --label=t 2>&1)"; RC3=$?
+want "over budget AND a failing harness exits 1 (the failure wins, not 4)" "1" "$RC3"
+if [[ "$C3" != *"NO TEST FAILED"* ]]; then
+  ok "an over-budget run WITH failures does not claim NO TEST FAILED (DIVE-2801)"
+else bad "an over-budget run WITH failures still claims NO TEST FAILED (DIVE-2801)" "$C3"; fi
+if [[ "$C3" == *"ALSO FAILED"* && "$C3" == *"BOTH over budget AND red"* && "$C3" == *"exits 1, not 4"* ]]; then
+  ok "the both-red banner states both facts and which exit code wins (DIVE-2801)"
+else bad "the both-red banner states both facts and which exit code wins (DIVE-2801)" "$C3"; fi
+rm -f "$TMP/broken.sh"
+
 # --confirm-top may only make this gate STRICTER. The rescued corpus, confirmation
 # off, must red — an override that can turn a red green is the hatch, not the control.
 cat > "$TMP/flaps.sh" <<'FLAPS'

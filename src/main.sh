@@ -194,8 +194,12 @@ Auth (lower-level; the dashboard uses these — prefer 'account' for human-drive
   5dive agent auth status [--probe] [--type=<type>]    # real --print probe reveals stale creds
   5dive agent auth login <type>                        # interactive TTY (hands off this process)
   5dive agent auth set <type> --api-key=<key|-> [--auth-profile=<name>] [--provider=<id>]
+                              [--base-url=<url>] [--model=<slug>]
                                                        # --provider=<id> required for hermes/openclaw;
                                                        # id is one of: ${!BYO_PROVIDER_LABEL[*]}
+                                                       # --base-url (claude only) restates a custom
+                                                       # endpoint; without it a profile pinned off the
+                                                       # catalog is refused, not reverted (DIVE-2809)
   5dive agent auth start <type> [--auth-profile=<name>]      # non-TTY device-code: returns session id
   5dive agent auth poll <session_id>                         # {state, url, error}
   5dive agent auth submit <session_id> --code=<callback>     # paste the claude callback code
