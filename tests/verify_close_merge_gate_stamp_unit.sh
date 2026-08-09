@@ -26,8 +26,29 @@ CLI="$ROOT/5dive"
 [[ -x "$CLI" ]] || { echo "SKIP - no built bundle at $CLI (run ./build.sh)"; exit 0; }
 
 TMP=$(mktemp -d)
-export FIVE_TASKS_DB="$TMP/tasks.db"
+# ISOLATION. The CLI reads TASKS_DB / TASKS_DIR / STATE_DIR (src/lib/tasks_db.sh);
+# it has never read FIVE_TASKS_DB, which is what this line said until DIVE-3059 and
+# is why the isolation was a no-op: on a host with real state the fixture rows landed
+# on the PRODUCTION board (18 of them), and on a fresh CI runner `task add` had no
+# initialised state to fall back to and failed 0/5. One wrong variable name, two
+# opposite symptoms, and the local one looked like a pass.
+export TASKS_DB="$TMP/tasks.db"
+export TASKS_DIR="$TMP"      # the .board-initialized marker lives HERE, not beside the db
+export STATE_DIR="$TMP/state"
 export HOME="$TMP"          # keep the fixture off the real board
+
+# The isolated store must exist before the bundle is driven, and `5dive task init`
+# is require_root by design (src/cmd_task.sh) because it writes /var/lib — so a
+# non-root CI runner can NEVER create one that way, and every `task add` refuses
+# with "tasks store not initialised". That is the whole CI failure. The root check
+# is on the COMMAND, not the library, so init IN-PROCESS the way every other
+# harness does, then hand the bundle the path and keep grading the CLI end-to-end
+# as a black box. DIVE-3059.
+( for _f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
+            lib/state.sh lib/tasks_db.sh; do . "${ROOT:-$PWD}/src/$_f"; done
+  set +e; mkdir -p "$(dirname "$TASKS_DB")"; tasks_db_init; _tasks_db_migrate ) >/dev/null 2>&1
+[[ -s "$TASKS_DB" ]] || { echo "FAIL - could not create the isolated tasks store at $TASKS_DB"; echo "0 passed, 1 failed"; exit 1; }
+
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
