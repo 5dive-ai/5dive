@@ -330,6 +330,14 @@ Health:
     create\`, so it lands as 5dive-bot); a TTY also gets an interactive y/N.
     Agents take the same --file flag a human does — no separate unattended path.
 
+  5dive acp
+    Speak ACP (Agent Client Protocol) over stdin/stdout so an ACP client — Buzz
+    (block/buzz), Zed — can select 5dive as a coding-agent runtime. NOT
+    interactive: the client spawns it. A session ATTACHES to a named fleet agent
+    (its memory, tasks, org position and heartbeat intact) rather than opening a
+    blank one; the roster travels as ACP availableCommands, so /<name> or
+    /attach <name> picks the agent and /agents re-lists them. Runs on bun.
+
   5dive doctor [--fix] [--dry-run] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
     probes, stale shadow-credential heal (creds), registry integrity, channel
@@ -998,6 +1006,12 @@ main() {
         AUDIT_CMD="self-update"; AUDIT_ARGS=("$@")
         cmd_self_update "$@"
       fi ;;
+    acp)
+      # DIVE-3017: ACP over stdio, spawned BY a client (Buzz's runtime picker), so
+      # this verb's stdout is the wire. AUDIT_CMD is deliberately NOT set: cmd_acp
+      # `exec`s into bun, which replaces the process before the dispatcher's EXIT
+      # trap can fire (DIVE-2797), so the row is written inside cmd_acp instead.
+      cmd_acp "$@" ;;
     -h|--help|help) usage ;;
     *) fail "$E_USAGE" "unknown command: $top" ;;
   esac

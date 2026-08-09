@@ -62,6 +62,21 @@ jobs:
       # dependency true by construction instead of by alphabetical accident.
       - name: Build the bundle (harness precondition, not an accident of ordering)
         run: ./build.sh
+      # DIVE-3059: bun is a harness PRECONDITION, declared for the same reason
+      # ./build.sh is declared above — an unmet precondition here was not a red,
+      # it was a silent pass. tests/acp_stdio_unit.sh grades the ACP server by
+      # spawning it over stdio; ubuntu-latest does not ship bun, nothing here
+      # installed it, and the harness skipped its 19 stdio checks while still
+      # printing PASS and exiting 0. Measured on the core artifact: that harness
+      # finished in 37ms rc=0 (pristine) and 287ms rc=0 (installed-host) — nothing
+      # that spawns bun and drives 19 scenarios finishes in 37 milliseconds.
+      #
+      # The harness now FAILS rather than skipping (ACP_ALLOW_SKIP=1 is the
+      # deliberate local escape), so dropping this step is a red and not a lie.
+      # Both halves are needed: this one buys the coverage, that one keeps the
+      # absence of coverage loud.
+      - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
+        uses: oven-sh/setup-bun@v2
       # DIVE-2525: the budget is NOT passed here. It lives in tests/lib/tier.sh next
       # to the tier definition, because a budget spelled in the caller is raised by
       # a one-line YAML edit that nobody reviews as the policy change it is.
@@ -70,6 +85,12 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: core-pristine, path: core-pristine.txt, if-no-files-found: warn }
+      # DIVE-3017: the bun step above is a DECLARATION and a succeeding declaration
+      # was already shown not to imply a graded harness. This reads the outcome back
+      # out of the report just written: rc=0 AND seconds-scale, which together are
+      # satisfied only by the ACP stdio scenarios having actually run.
+      - name: The ACP server must have been GRADED (pristine)
+        run: bash tests/meta/harness-graded-union.sh --harness=acp_stdio_unit.sh --min-ms=1000 core-pristine.txt
 
   # DIVE-1919: the bare runner above is a PRISTINE box — no /var/lib/5dive, no
   # installed plugins. That is NOT the environment any agent actually runs the
@@ -163,6 +184,14 @@ jobs:
       # dependency true by construction instead of by alphabetical accident.
       - name: Build the bundle (harness precondition, not an accident of ordering)
         run: ./build.sh
+      # DIVE-3059: this job runs whatever harnesses the PR TOUCHED, at any tier,
+      # and it also runs the verdict probe against them. A PR editing
+      # acp_stdio_unit.sh — this one, for a start — runs it here, so without bun
+      # this job reds on the very change that makes the harness honest. It is also
+      # the job where the probe asserts the harness CAN fail, which is only
+      # meaningful if the harness can also pass.
+      - name: Install bun (harness precondition — a touched harness may need it)
+        uses: oven-sh/setup-bun@v2
       - name: Run them (any tier)
         if: steps.changed.outputs.files != ''
         run: |
@@ -262,11 +291,20 @@ jobs:
       # dependency true by construction instead of by alphabetical accident.
       - name: Build the bundle (harness precondition, not an accident of ordering)
         run: ./build.sh
+      # DIVE-3059: same precondition as the pristine job. This job runs the SAME
+      # core tier, so it took the same silent skip (287ms rc=0 on the artifact).
+      # Needed in every job that runs the harness, not just the first one — the
+      # harness now FAILS without bun, so a job missing this step goes red.
+      - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
+        uses: oven-sh/setup-bun@v2
       - name: Run core harnesses (installed host, budgeted)
         run: bash scripts/run-harnesses.sh --tier=core --label=installed-host --report=core-installed.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: core-installed, path: core-installed.txt, if-no-files-found: warn }
+      # DIVE-3017: same outcome assertion as the pristine job — see the comment there.
+      - name: The ACP server must have been GRADED (installed host)
+        run: bash tests/meta/harness-graded-union.sh --harness=acp_stdio_unit.sh --min-ms=1000 core-installed.txt
       # DIVE-2039: TWICE, and that is the point. DIVE-1989 stayed invisible for as
       # long as the audit log was measured from one side — the same command wrote 0
       # rows as an agent and 1 row under sudo. `audit-root` is honestly NOT-REACHED
