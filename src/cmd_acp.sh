@@ -16,6 +16,17 @@
 # nothing guarding the two against drift, and one loader per filename is enough.
 ACP_RUN_DIR_DEFAULT="/opt/5dive"
 
+# TWO NEAR-IDENTICAL COPIES OF THIS PROBE LIST EXIST AND WERE DELIBERATELY LEFT UNFIXED:
+# _cos_resolve_bun (cmd_cos.sh) and _team_bot_resolve_bun (cmd_agent_teambot.sh). This one
+# is the canonical/fixed copy — you are reading the answer to "which of the three is the
+# bug". They still lack the PATH probe below, and neither has an env override at all, so
+# unlike this function they cannot be driven off their hardcoded paths by any test. Left
+# on purpose: both are VM-bound verbs (systemctl / useradd / /etc/5dive) that cannot
+# meaningfully run on a user's laptop, so /usr/local/bin/bun is always present for them and
+# the defect has zero user exposure — which is why it stays zero when the npm artifact
+# ships, rather than expiring then. No ident filed; a latent duplicate that has blocked
+# nothing does not earn a row. If a shared resolver is ever built, all three collapse into
+# it (there is no lib/ in this repo today, which is why that was not done here).
 _acp_resolve_bun() {
   local c
   # ACP_BUN_BIN: harness seam, and the escape hatch on a box with bun elsewhere.
