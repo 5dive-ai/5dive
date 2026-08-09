@@ -7988,8 +7988,15 @@ cmd_task_need() {
       fi
     fi
     if [[ -n "$_vs_vf" && -n "$_vs_mk" && "$_vs_vf" != "$_vs_filer" && "$_vs_mk" == "$_vs_filer" ]]; then
-      local _vs_term; _vs_term=$(_gate_tier2_floor_term "$ask")
-      [[ -n "$_vs_term" ]] || _vs_term=$(_gate_tier2_floor_term "$_ft_title")
+      # ABSORB the rc. `_gate_tier2_floor_term` is an allowlisted rc-bearing
+      # contract: it returns non-zero when it finds no term, so a plain
+      # assignment inherits that status and dies under `set -e`. Same shape
+      # main's DIVE-2751 fix uses two blocks up, and the call-site guard in
+      # tests/task_show_exit_code_unit.sh enforces it — that guard landed on
+      # main after this block was first written, and caught it on the rebase.
+      local _vs_term=""
+      _vs_term=$(_gate_tier2_floor_term "$ask" 2>/dev/null) || _vs_term=""
+      [[ -n "$_vs_term" ]] || { _vs_term=$(_gate_tier2_floor_term "$_ft_title" 2>/dev/null) || _vs_term=""; }
       warn "this gate is floored to tier 2 (matched '${_vs_term}'), so it pings the paired human and ${_vs_vf} — the verifier on this task's loop, and the only agent who can answer a question about your own acceptance criteria — CANNOT clear it (tier-2 gates refuse a non-human answer, DIVE-1117). If the term is narration of the work under test rather than something you are asking to DO, re-file with --discusses=\"<why>\": the appeal downgrades the gate to tier 1 and routes it to ${_vs_vf}, not to the human. If you really are asking for that, leave it — the human is the right answerer."
       # The dead-end this ticket was filed about was invisible in the record: the
       # gate simply sat there while dev messaged olivia out of band. Audit the
