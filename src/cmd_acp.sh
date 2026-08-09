@@ -23,6 +23,18 @@ _acp_resolve_bun() {
   for c in /usr/local/bin/bun /home/claude/.bun/bin/bun; do
     [[ -x "$c" ]] && { printf '%s' "$c"; return 0; }
   done
+  # THE CALLER'S OWN PATH — required for the verb to work anywhere but our VM, not a CI
+  # convenience. The two paths above are THIS box's layout, and the sudo probe below asks
+  # a user that only exists here. But the whole point of `5dive acp` is to be selected as
+  # a runtime on a machine that is not ours: a Buzz user on a Mac installs bun the
+  # documented way (bun.sh/install -> ~/.bun/bin/bun) and has no `claude` user, so every
+  # other probe misses and the literal fallback names a file that does not exist — exiting
+  # E_NOT_INSTALLED to tell them to install the bun they already have. That is a
+  # confidently actionable message that is wrong, which is worse than the dead pipe the
+  # preflight replaced. Ordered ahead of the sudo probe: correct in a strict superset of
+  # its cases and one fewer login shell.
+  c=$(command -v bun 2>/dev/null)
+  [[ -n "$c" && -x "$c" ]] && { printf '%s' "$c"; return 0; }
   c=$(sudo -u claude -i bash -lc 'command -v bun' 2>/dev/null | tail -1)
   [[ -x "$c" ]] && { printf '%s' "$c"; return 0; }
   printf '/usr/local/bin/bun'
