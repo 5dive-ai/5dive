@@ -615,7 +615,13 @@ jobs:
     runs-on: ubuntu-latest
     needs: [full-pristine, full-installed-host]
     steps:
+      # DIVE-2229: full history, like every other checkout in this file. This job
+      # runs no pinned-baseline harness itself, but the rule is deliberately blanket
+      # (tests/baseline_pin_unit.sh arm D sweeps every checkout in this workflow), and
+      # a per-job exemption is exactly the thing that goes stale when the job later
+      # grows a step that does need a baseline.
       - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
       - uses: actions/download-artifact@v4
         with: { pattern: "full-*", merge-multiple: true }
       # Reports named EXPLICITLY, not globbed, and once per environment: a lane that
