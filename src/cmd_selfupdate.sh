@@ -241,14 +241,22 @@ _cli_freeze_observe() {
 # version is not installable. Unresolvable tags => `unavailable`, which is honest
 # and is also what the installer does (it fails CLOSED on the same condition).
 #
-# Prints exactly three lines (never fails the caller):
+# Prints exactly four lines (never fails the caller):
 #   1  state    consistent | indeterminate | unavailable
 #   2  version  the published FIVE_VERSION — empty unless state is consistent
 #   3  detail   the ref the answer came from (consistent), else the reason.
 #               Never empty, so line 3 always exists.
+#   4  sha256   the sha256 of the published bundle — empty unless state is
+#               consistent. DIVE-2640: a version STRING is a claim the bundle
+#               makes about itself and nothing more — the hand-stamped
+#               `0.18.0+dive2563` bundle satisfied a `0.18.x` criterion while
+#               running neither the release nor main. The bytes are what turn
+#               that claim into provenance, so the one resolver that already
+#               fetched and checksum-verified the published bundle hands its
+#               digest out rather than making a second fetch drift from this one.
 _published_cli_probe() {
   local state version detail
-  _pcp_out() { printf '%s\n%s\n%s\n' "$1" "$2" "$3"; }
+  _pcp_out() { printf '%s\n%s\n%s\n%s\n' "$1" "$2" "$3" "${4:-}"; }
 
   command -v curl >/dev/null 2>&1 \
     || { _pcp_out unavailable "" "curl is not installed"; return 0; }
@@ -278,7 +286,7 @@ _published_cli_probe() {
   # vMAJOR.MINOR.PATCH release tag, so an rc or a `nightly` can never become the
   # thing we advertise — same filter install.sh applies before installing one.
   [[ -n "$tags" ]] && ref=$(printf '%s\n' "$tags" \
-    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1) || ref=""
   if [[ -z "$ref" ]]; then
     _pcp_out unavailable "" "no release tag resolves — the installer could not upgrade this box either"
     return 0
@@ -316,7 +324,7 @@ _published_cli_probe() {
     _pcp_out indeterminate "" "the published bundle carries no FIVE_VERSION"
     return 0
   fi
-  _pcp_out consistent "$version" "$ref"
+  _pcp_out consistent "$version" "$ref" "$served"
 }
 # <<< DIVE-2042 published-version probe
 
@@ -368,7 +376,7 @@ cmd_update_check() {
   local last_ok_json="null" last_at_json="null" last_epoch=""
   if [[ -r "$log" ]]; then
     local start_line
-    start_line=$(grep -n "soft updates start" "$log" | tail -1 | cut -d: -f1)
+    start_line=$(grep -n "soft updates start" "$log" | tail -1 | cut -d: -f1) || start_line=""
     if [[ -n "$start_line" ]]; then
       if tail -n "+${start_line}" "$log" | grep -q "CLI upgrade via install.5dive.com failed"; then
         last_ok_json="false"
@@ -378,7 +386,7 @@ cmd_update_check() {
     fi
     local last_at
     last_at=$(grep -oE "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:+-]+ soft updates done" "$log" \
-      | tail -1 | grep -oE "^[^ ]+")
+      | tail -1 | grep -oE "^[^ ]+") || last_at=""
     if [[ -n "$last_at" ]]; then
       last_at_json="\"$last_at\""
       last_epoch=$(date -d "$last_at" +%s 2>/dev/null || echo "")

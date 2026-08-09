@@ -37,13 +37,13 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 # DIVE-2518: `--from` is provenance; TIER/ROUTING read the uid derivation, so an arm
 # impersonating a filer must DERIVE as them. tests/lib/actor_seam.sh.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 SRC=src
 TMP="$(mktemp -d /tmp/gate-t2pin-unit.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
@@ -117,7 +117,7 @@ assert_downgraded() { # <ident> <label>
 
 # 1: keyword in the ASK — the original repro (`--tier=2` + "Ship it to prod").
 route_reset; seed DIVE-901 'DIVE-1690 council page'
-actor_seam_as dev; cmd_task_need DIVE-901 --type=decision --tier=2 --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-901 --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --from=dev \
   --ask="Ship it to prod: which council page copy goes live?" \
   --options="A|B" --recommend="A" >/dev/null 2>&1
 assert_pin_held DIVE-901 "eng-ship in ASK: explicit --tier=2 survives (stays hard-human)"
@@ -127,7 +127,7 @@ assert_pin_held DIVE-901 "eng-ship in ASK: explicit --tier=2 survives (stays har
 #    flags + ask, the only variable is the title, and the title alone downgraded
 #    the gate. A fix that only reads the ask cannot pass this case.
 route_reset; seed DIVE-902 'LAND the DIVE-1672 council-rules branch: rebase package.json + settle MERGE order vs dive-1690'
-actor_seam_as dev; cmd_task_need DIVE-902 --type=decision --tier=2 --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-902 --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --from=dev \
   --ask="Which of these two wordings should the public page use?" \
   --options="A|B" --recommend="A" >/dev/null 2>&1
 assert_pin_held DIVE-902 "eng-ship in TITLE: explicit --tier=2 survives (the axis the filer cannot reword)"
@@ -136,14 +136,14 @@ assert_pin_held DIVE-902 "eng-ship in TITLE: explicit --tier=2 survives (the axi
 #    explicit pin skips the floor evaluation entirely (tier_floored stays 0), so
 #    before the fix this was downgraded despite carrying a floor keyword.
 route_reset; seed DIVE-903 'Council page polish'
-actor_seam_as dev; cmd_task_need DIVE-903 --type=decision --tier=2 --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-903 --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --from=dev \
   --ask="BRAND call on the public 5dive.ai /council page before we ship it" \
   --options="A|B" --recommend="A" >/dev/null 2>&1
 assert_pin_held DIVE-903 "eng-ship + floor term ('brand'+'ship') with --tier=2 stays hard-human"
 
 # 4: approval flavour, keyword in TITLE only.
 route_reset; seed DIVE-904 'Merge the pricing-page redesign PR'
-actor_seam_as dev; cmd_task_need DIVE-904 --type=approval --tier=2 --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-904 --type=approval --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --from=dev \
   --ask="Sign off the final pricing numbers on the public page?" --recommend="yes" >/dev/null 2>&1
 assert_pin_held DIVE-904 "eng-ship TITLE + --type=approval --tier=2 survives"
 
@@ -169,13 +169,13 @@ actor_seam_as dev; cmd_task_need DIVE-906 --type=decision --tier=1 --from=dev \
 
 # 7: keyword in the ASK.
 route_reset; seed DIVE-910 'Character pack drip'
-actor_seam_as dev; cmd_task_need DIVE-910 --type=approval --tier=2 --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-910 --type=approval --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --from=dev \
   --ask="approve persona 'doc' as ready to publish to the character-pack drip queue?" --recommend="yes" >/dev/null 2>&1
 assert_pin_held DIVE-910 "curation in ASK: explicit --tier=2 survives"
 
 # 8: TITLE AXIS — curation vocabulary only in the title.
 route_reset; seed DIVE-911 'Approve the persona pack for the character-packs publish queue'
-actor_seam_as dev; cmd_task_need DIVE-911 --type=decision --tier=2 --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-911 --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --from=dev \
   --ask="Which of the two brand palettes should we commit to?" \
   --options="A|B" --recommend="A" >/dev/null 2>&1
 assert_pin_held DIVE-911 "curation in TITLE: explicit --tier=2 survives"
@@ -192,14 +192,14 @@ assert_downgraded DIVE-912 "curation with NO --tier: still downgraded + lead-rou
 
 # 10: keyword in the ASK (the STEER-1 board-wipe repro).
 route_reset; seed DIVE-920 'Board recovery'
-actor_seam_as dev; cmd_task_need DIVE-920 --type=decision --tier=2 --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-920 --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --from=dev \
   --ask="The task board was wiped/destroyed at 04:20 — keep or discard my uncommitted work and rebuild the board from the audit log?" \
   --options="keep|discard" --recommend="keep" >/dev/null 2>&1
 assert_pin_held DIVE-920 "internal-ops in ASK: explicit --tier=2 survives"
 
 # 11: TITLE AXIS.
 route_reset; seed DIVE-921 'Rebuild the wiped task board from the audit log'
-actor_seam_as dev; cmd_task_need DIVE-921 --type=decision --tier=2 --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-921 --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --from=dev \
   --ask="keep or discard the in-flight work?" --options="keep|discard" --recommend="keep" >/dev/null 2>&1
 assert_pin_held DIVE-921 "internal-ops in TITLE: explicit --tier=2 survives"
 
@@ -235,7 +235,7 @@ actor_seam_as dev; cmd_task_need DIVE-931 --type=access --from=dev \
 # 15: the JSON envelope must REPORT tier 2 — the bug was only visible by reading
 #     the recorded tier back, so assert the recorded value, not just the routing.
 route_reset; seed DIVE-940 'LAND the dive-1957 branch'
-OUT=$(cmd_task_need DIVE-940 --type=decision --tier=2 --from=dev \
+OUT=$(cmd_task_need DIVE-940 --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --from=dev \
   --ask="Which wording ships on the public page?" --options="A|B" --recommend="A" 2>/dev/null)
 [[ "$(printf '%s' "$OUT" | jq -r '.data.tier')" == "2" ]] \
   && ok_t "recorded JSON envelope reports tier 2 for a pinned eng-ship-TITLE gate" \
@@ -254,7 +254,7 @@ audit_reset() { : >"$AUDIT_FILE"; }
 
 # 16: a pinned eng-ship gate that escalates past the lead records the row.
 route_reset; audit_reset; seed DIVE-950 'LAND the dive-1957 branch: settle MERGE order'
-actor_seam_as dev; cmd_task_need DIVE-950 --type=decision --tier=2 --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-950 --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --from=dev \
   --ask="Which wording ships on the public page?" --options="A|B" --recommend="A" >/dev/null 2>&1
 grep -q '^task.gate-tier2-pin-escalated$' "$AUDIT_FILE" \
   && ok_t "pinned eng-ship escalation records an audit row (measurable, not just a warn)" \
@@ -277,7 +277,7 @@ grep -q '^task.gate-tier2-pin-escalated$' "$AUDIT_FILE" \
 route_reset; audit_reset; unset _TASK_STORE_AUDIT_FENCED
 seed DIVE-952 'LAND the dive-1957 branch: settle MERGE order'
 FIVEDIVE_PROD_TASKS_DB="$TMP/somewhere-else/tasks.db" cmd_task_need DIVE-952 \
-  --type=decision --tier=2 --from=dev \
+  --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --from=dev \
   --ask="Which wording ships on the public page?" --options="A|B" --recommend="A" \
   >/dev/null 2>"$TMP/offstore.err"
 [[ ! -s "$AUDIT_FILE" ]] \

@@ -17,6 +17,7 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.." || exit 1
 SRC="src/cmd_agent_create.sh"
 BIN="./5dive"
@@ -32,10 +33,41 @@ has "names the unfreeze bar"   "a verified xAI client-side fix"
 has "override warns"           "bypassing the DIVE-1221 Grok exfiltration freeze"
 has "guard sits after is_known_type" "DIVE-1221/1222: Grok provisioning is FROZEN"
 
+# DIVE-3090: the functional probe below is only meaningful in this ORDER. It
+# passes --channels=bogus so a guard that is bypassed, removed or reordered dies
+# at channel validation instead of provisioning — but if valid_channel ever moves
+# ABOVE the guard, the create stops before the guard is reached and the arm
+# proves nothing while still going green. And the barrier is only a barrier while
+# valid_channel stays below create_agent_user. Assert both, by line number.
+guard_ln=$(grep -nF -- 'DIVE-1221/1222: Grok provisioning is FROZEN' "$SRC" | head -1 | cut -d: -f1)
+chan_ln=$(grep -nF -- 'valid_channel "$channels"' "$SRC" | head -1 | cut -d: -f1)
+user_ln=$(grep -nF -- 'create_agent_user "$name"' "$SRC" | head -1 | cut -d: -f1)
+if [[ -n "$guard_ln" && -n "$chan_ln" && -n "$user_ln" \
+      && $guard_ln -lt $chan_ln && $chan_ln -lt $user_ln ]]; then
+  ok "guard < valid_channel < create_agent_user (${guard_ln} < ${chan_ln} < ${user_ln})"
+else
+  bad "probe order broken (guard=${guard_ln:-?} valid_channel=${chan_ln:-?} create_agent_user=${user_ln:-?}); --channels=bogus no longer separates refuse from bypass"
+fi
+
 echo "== functional (built binary) =="
 # cmd_create is root-gated; the freeze fires right after is_known_type, before
-# any user/FS side effect (verified: no agent-grokbot user is created), so a
-# sudo dry-hit is safe and hermetic.
+# any user/FS side effect, so a sudo dry-hit is cheap — but that safety used to
+# be BORROWED from the subject under test. This arm performs the real forbidden
+# act and asserts the guard refused, which is only safe while the guard holds.
+# DIVE-2910 armed FIVE_GROK_UNFREEZE_VERIFIED=1 on a host (lodar's recorded risk
+# acceptance); the override reaches every `sudo` call through /etc/environment +
+# pam_env, so this arm inherited it, the guard passed, and the harness itself
+# PROVISIONED and STARTED the agent it exists to prevent — a live
+# `grok --always-approve` over /home/claude/projects for 8h before anyone
+# noticed. The comment that used to sit here ("verified: no agent-grokbot user
+# is created") was measured on an UNARMED host and never said so.
+# DIVE-3090 — two changes so the arm owns its safety instead of borrowing it:
+#   1. `env -u FIVE_GROK_UNFREEZE_VERIFIED` pins the refusal, so this grades the
+#      GUARD and not the HOST. An armed box can no longer flatter or arm it.
+#   2. `--channels=bogus` is a second, independent barrier: the guard sits
+#      between is_known_type and valid_channel, so a refusing guard still yields
+#      the DIVE-1221 error, while a guard that is bypassed, removed or reordered
+#      dies at channel validation instead of provisioning a real agent.
 SUDO=""
 [[ $EUID -eq 0 ]] || { sudo -n true 2>/dev/null && SUDO="sudo -n"; }
 # ensure_state (state init) chgrps the state tree to the `claude` group, which
@@ -48,14 +80,28 @@ if [[ $EUID -eq 0 || -n "$SUDO" ]]; then
 fi
 have_claude_grp=0; getent group claude >/dev/null 2>&1 && have_claude_grp=1
 if [[ -x "$BIN" && ( $EUID -eq 0 || -n "$SUDO" ) && $have_claude_grp -eq 1 ]]; then
-  out="$($SUDO "$BIN" agent create grokbot --type=grok 2>&1)"; rc=$?
+  # DIVE-3070: agent-grokbot can PRE-EXIST this run — the DIVE-2910 incident left
+  # uid 1021 in place on purpose (forensics), and `id` cannot tell "leaked by this
+  # create" from "left by an earlier one". Absence is therefore the wrong
+  # assertion on any host that has ever leaked; snapshot first and grade the DELTA.
+  pre_user=0; id agent-grokbot &>/dev/null && pre_user=1
+  out="$($SUDO env -u FIVE_GROK_UNFREEZE_VERIFIED "$BIN" agent create grokbot --type=grok --channels=bogus 2>&1)"; rc=$?
+  # DIVE-2645: assert the VERDICT, not a ticket id. The refusal no longer carries
+  # "(DIVE-1221)" — an arm that requires one is what made the archaeology mandatory.
   if [[ $rc -ne 0 ]] && grep -qF "grok provisioning is frozen" <<<"$out"; then
     ok "grok create refused with the freeze error"
   else
     bad "grok create should refuse (rc=$rc, out: $out)"
   fi
-  id agent-grokbot &>/dev/null && bad "freeze leaked a user (agent-grokbot created)" \
-    || ok "no user created by refused grok create"
+  post_user=0; id agent-grokbot &>/dev/null && post_user=1
+  if [[ $post_user -gt $pre_user ]]; then
+    bad "freeze leaked a user (agent-grokbot created by THIS run)"
+  else
+    ok "no user created by refused grok create"
+  fi
+  if [[ $pre_user -eq 1 ]]; then
+    echo "  note: agent-grokbot PRE-EXISTED this run (DIVE-2910 residue) — the check above is a delta, not an absence"
+  fi
 else
   echo "  skip functional (need built ./5dive + root/sudo -n + claude group)"
 fi

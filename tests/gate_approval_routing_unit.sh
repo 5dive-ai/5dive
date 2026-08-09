@@ -26,10 +26,10 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-approval-routing-unit.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
@@ -117,7 +117,8 @@ cmd_task_need DIVE-207 --type=secret --ask="drop the deploy key" --secret-key=DE
 
 # --- A8: an explicit --tier=2 on an approval is honored (caller's hard-human contract).
 seed_task DIVE-208
-cmd_task_need DIVE-208 --type=approval --ask="approve the mechanical README sync?" --recommend="yes" --tier=2 >/dev/null 2>&1
+cmd_task_need DIVE-208 --type=approval --ask="approve the mechanical README sync?" --recommend="yes" --tier=2 \
+  --rubber-stamp-ok="fixture: this case grades that an explicit --tier=2 pin is honored, so it must BE one (DIVE-2848 cap)" >/dev/null 2>&1
 [[ "$(tierof DIVE-208)" == "2" ]] \
   && ok_t "A8 explicit --tier=2 on approval honored (hard-human contract preserved)" \
   || bad_t "A8 explicit tier 2 honored" "got tier '$(tierof DIVE-208)'"

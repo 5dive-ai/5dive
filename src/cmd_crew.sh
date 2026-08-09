@@ -145,7 +145,7 @@ _crew_detect_entry() {
   local repo="$1" f
   for f in crew.py main.py src/crew.py app.py; do
     if [[ -f "$repo/$f" ]]; then
-      local cls; cls="$(grep -oE 'class [A-Za-z_][A-Za-z0-9_]*' "$repo/$f" | head -1 | awk '{print $2}')"
+      local cls; cls="$(grep -oE 'class [A-Za-z_][A-Za-z0-9_]*' "$repo/$f" | head -1 | awk '{print $2}')" || cls=""
       local mod="${f%.py}"; mod="${mod//\//.}"
       [[ -n "$cls" ]] && { echo "${mod}:${cls}"; return; }
     fi
@@ -255,7 +255,9 @@ cmd_crew_show() {
   local dir; dir="$(_crew_dir "$name")"
   [[ -d "$dir" ]] || fail "$E_NOT_FOUND" "no crew '$name'"
   local keys="[]"
-  [[ -f "$dir/secret.env" ]] && keys="$(grep -oE '^[A-Z_][A-Z0-9_]*=' "$dir/secret.env" | sed 's/=$//' | jq -R . | jq -sc .)"
+  if [[ -f "$dir/secret.env" ]]; then
+    keys="$(grep -oE '^[A-Z_][A-Z0-9_]*=' "$dir/secret.env" | sed 's/=$//' | jq -R . | jq -sc .)" || keys="[]"
+  fi
   local meta; meta="$(cat "$dir/crew.json" 2>/dev/null || echo '{}')"
   if (( JSON_MODE )); then
     ok "" '($m + {name:$n, dir:$d, secretKeys:$k, hasStorage:$hs})' \

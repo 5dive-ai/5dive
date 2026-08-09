@@ -32,10 +32,10 @@ set -uo pipefail
 # DIVE-2229: pinned-commit baselines, fail-closed. Same no-2>/dev/null rule.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/pinned_baseline.sh" \
   || printf 'pinned baseline helper: UNRESOLVED (tests/lib/pinned_baseline.sh not reachable)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 
 TMP="$(mktemp -d /tmp/policy-refusals.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }

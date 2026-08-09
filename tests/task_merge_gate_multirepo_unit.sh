@@ -39,10 +39,24 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+
+# DIVE-2770: the merge gate gained a CREDENTIAL-FREE rail (an unauthenticated read
+# of a public repo). Every no-token arm below was written when "no credential"
+# meant "no rail", and with the anon rail live they would reach the real network
+# and grade a LIVE PR instead of the fixture. Turn it off here: these harnesses
+# grade the pre-2770 rails, and tests/task_merge_gate_anon_rail_unit.sh grades the
+# new one. This is also what keeps `no root, no network` true of this file.
+#
+# IT MUST SIT AFTER lib/grading_tree.sh, AND THAT IS NOT A STYLE CHOICE: that file
+# sources lib/env_isolation.sh, which CLEARS inherited FIVE_* knobs so a harness
+# never grades the caller's environment. Set above it, this export is wiped and the
+# harness silently reaches the network instead — measured, and it read as three
+# unrelated assertion failures naming a live PR's real state.
+export FIVE_GATE_NO_ANON=1
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-multirepo-unit.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 # --- stub gh. REPO-AWARE, which is the whole point: a PR number exists in a
 # specific repo, never in the abstract. `GH_STUB_PR_<REPO>_<n>` is the fixture for
@@ -88,9 +102,21 @@ chmod +x "$TMP/bin/gh"
 
 # sudo must be stubbed for the whole run or the token resolver reaches the HOST's
 # real gh login (real sudo resets PATH to secure_path, so the gh stub is bypassed).
+# DIVE-2705: the sudo stub now has TWO modes. Default is the historical one —
+# exit 1, so _gate_gh_bot_ok fails and every arm above this file's bot-rail
+# section keeps driving the TOKEN rail exactly as before. With BOT_RAIL_ON set it
+# emulates the bot rail instead: `-l` answers the capability probe, and the real
+# call reads its NUL-separated args off STDIN (never argv, which is the whole
+# posture of that rail) and serves them from the same gh stub, so both rails
+# answer from ONE fixture and an arm cannot pass on the wrong one by accident.
 cat >"$TMP/bin/sudo" <<SUDOSTUB
 #!/usr/bin/env bash
-exit 1
+[[ -n "\${BOT_RAIL_ON:-}" ]] || exit 1
+[[ "\$1" == "-n" ]] && shift
+[[ "\$1" == "-l" ]] && exit 0
+printf 'BOT_RAIL_CALL\n' >>"\$BOT_RAIL_LOG"
+mapfile -d '' -t _a < /dev/stdin
+exec "$TMP/bin/gh" "\${_a[@]}"
 SUDOSTUB
 chmod +x "$TMP/bin/sudo"
 export PATH="$TMP/bin:$PATH"
@@ -98,7 +124,7 @@ export GH_ARGS_LOG="$TMP/gh.args"; : >"$GH_ARGS_LOG"
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
-         lib/agent_setup.sh lib/state.sh lib/broker.sh lib/audit.sh \
+         lib/agent_setup.sh lib/disk.sh lib/state.sh lib/broker.sh lib/audit.sh \
          lib/registry.sh lib/tasks_db.sh lib/actor.sh cmd_push.sh \
          cmd_task.sh; do
   source "$SRC/$f"
@@ -204,10 +230,15 @@ if [[ "$res" == *"merge-gate: UNVERIFIED"* && "$res" == *"AMBIGUOUS"* \
 else
   bad_t 'ambiguous must be durable in the record' "result=[$res]"
 fi
-# The stamp must also appear when the maker passed NO --result at all: that row is the
-# emptiest-looking one there is, so it is the one most in need of the disclaimer.
+# The stamp must also appear on the emptiest close the rail allows, because that row is
+# the one most in need of the disclaimer.
+# DIVE-2773: that used to be a close with NO --result at all; a FIRST close with a blank
+# reason is now refused on both verbs, so the emptiest REACHABLE shape is a minimal one.
+# The arm is adapted rather than dropped: what it grades is that the stamp APPENDS to
+# whatever the maker wrote instead of depending on there being room, and a one-word
+# result exercises that as well as an absent one did.
 seed AMB-2 'delivery is PR #6'
-run_done AMB-2
+run_done AMB-2 --result="delivered"
 res2=$(db "SELECT COALESCE(result,'') FROM tasks WHERE ident='AMB-2';")
 [[ $RC -eq 0 && "$res2" == *"merge-gate: UNVERIFIED"* ]] \
   && ok_t 'the UNVERIFIED stamp lands even on a close with no --result of its own' \
@@ -430,6 +461,65 @@ out=$(cmd_task_cancel CAN-1 --result='abandoning, api PR #6 stays open' 2>&1); r
 [[ $rc -eq 0 && "$(statusof CAN-1)" == "cancelled" ]] \
   && ok_t 'task cancel is never merge-gated, multi-repo included' \
   || bad_t 'cancel must not be gated' "rc=$rc status=$(statusof CAN-1) out=$out"
+
+# --- 13. THE BOT RAIL carries the same honesty as the token rail (DIVE-2705) ---
+# WHY THIS ARM EXISTS. Every arm above drives the TOKEN rail, because line ~119
+# exports GH_STUB_AUTH_TOKEN and _gate_gh takes the token branch whenever one
+# resolves. _gate_gh has a SECOND rail, and it carried the identical defect: it
+# ended `|| true`, so a listing that DIED on the bot rail returned 0 and counted
+# as SCANNED. Nothing in this file could see that, which is the actual hazard —
+# a token-rail-only fix turns the whole corpus green while the bot rail keeps
+# laundering partial coverage into a clean scan, and the green is what would stop
+# anyone looking. Two fail-opens on one path hide each other; the second is only
+# findable while you are already holding the first.
+#
+# _gate_gh_bot_ok is overridden rather than satisfied for real: it tests
+# `[[ -x /usr/local/bin/5dive ]]`, and _GATE_GH_DO is readonly and absolute, so
+# satisfying it honestly would make this arm pass or vanish depending on whether
+# the box happens to have 5dive INSTALLED — a test that needs the host is not a
+# test. The predicate is not what is under test here; the status propagation
+# below it is.
+clear_fx
+unset GH_STUB_AUTH_TOKEN                   # no token => _gate_gh takes the bot rail
+export BOT_RAIL_ON=1                       # ...and the sudo stub answers as that rail
+export BOT_RAIL_LOG="$TMP/botrail.log"; : >"$BOT_RAIL_LOG"
+_gate_gh_bot_ok() { return 0; }            # see the note above
+export GH_STUB_LIST_FAIL_5dive_api=1       # one repo's listing dies ON THE BOT RAIL
+: >"$AUDIT_CALLS"
+seed BOT-1
+run_done BOT-1 --result='shipped as PR #99'
+# Liveness first: if the call never went over the bot rail, everything below would
+# be grading the token rail a second time and would pass for the wrong reason.
+if [[ -s "$BOT_RAIL_LOG" ]]; then
+  ok_t 'the bot rail actually carried the scan (arm is not silently re-testing the token rail)'
+else
+  bad_t 'bot rail never invoked — this arm proves nothing' "log=[$(cat "$BOT_RAIL_LOG" 2>/dev/null)] out=$OUT"
+fi
+# Two SEPARATE assertions, because two separate parts of the fix are load-bearing
+# here and one combined arm would let either part hide behind the other.
+#
+#   (i)  the bot rail must REPORT the failure at all — without it the listing is
+#        counted as scanned, _scan_ran flips to 1, and nothing is emitted;
+#   (ii) and the failure must be LABELLED as partial coverage rather than as a
+#        missing token, which is a different edit (_scan_why) further down.
+#
+# (ii) is only observable when (i) works — a rail that swallows its failure emits
+# no label to get wrong — so a mutation of (i) necessarily reds both. That is
+# causal ordering, not missing coverage: the reverse is NOT true, and mutating
+# _scan_why alone reds (ii) and leaves (i) green, which is what makes them two.
+if [[ $RC -eq 0 && "$OUT" == *UNVERIFIED* ]] \
+   && grep -q 'merge-gate-unverified' "$AUDIT_CALLS" \
+   && [[ "$(db "SELECT COALESCE(result,'') FROM tasks WHERE ident='BOT-1';")" == *"merge-gate: UNVERIFIED"* ]]; then
+  ok_t 'a listing that DIED on the bot rail is not counted as scanned — stamped, audited, fail-open'
+else
+  bad_t 'bot rail failure counted as a completed scan' "rc=$RC out=$OUT audit=$(cat "$AUDIT_CALLS")"
+fi
+if [[ "$OUT" == *partial-repo-scan* ]] && ! grep -q 'reason=no-gh-token' "$AUDIT_CALLS"; then
+  ok_t 'a partial BOT-RAIL scan is labelled partial coverage, not "no-gh-token"'
+else
+  bad_t 'bot rail partial scan mislabelled as a token problem' "out=$OUT audit=$(cat "$AUDIT_CALLS")"
+fi
+unset BOT_RAIL_ON GH_STUB_LIST_FAIL_5dive_api
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

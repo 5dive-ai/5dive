@@ -110,19 +110,58 @@ before this shipped can be re-provisioned, or you can add that one line to their
 
 ## 5. First push
 
-From inside the repo's work tree, on the branch you want to ship:
+**First add a `Branch:` line to the task body.** This is required, not an
+alternative to `--branch` — the cleared gate binds to the branch the *task*
+declares (DIVE-1462), so a push whose task body names no branch is refused even
+when `--branch` is passed:
 
-```sh
-# dry run — checks gate + author, mints nothing, pushes nothing:
-5dive push DIVE-123 --branch=my-feature --dry-run
-
-# real push (after the task's ship gate has been answered):
-5dive push DIVE-123 --branch=my-feature
+```
+Branch: my-feature
 ```
 
-The branch can also come from a `Branch: my-feature` line in the task body
-instead of `--branch`. Point at a different repo with `--repo=https://github.com/<org>/<repo>`
-(defaults to the repo configured for your deployment).
+Then, from inside the repo's work tree, on the branch you want to ship:
+
+```sh
+# dry run — checks gate authority + author, mints nothing, pushes nothing:
+5dive push DIVE-123 --dry-run
+
+# real push (after the task's ship gate has been answered):
+5dive push DIVE-123
+```
+
+`--branch=my-feature` overrides *which* branch is read; it does not remove the
+need for the body line. Point at a different repo with
+`--repo=https://github.com/<org>/<repo>` (defaults to the repo configured for
+your deployment).
+
+### What the dry run does NOT check
+
+The dry run is a **rehearsal, not the performance**. It runs the agent-side
+preflight, which checks gate *authority*; the real push re-verifies everything
+inside root and additionally verifies a **root-HMAC signed closure**. Signing
+needs a seat whose sudo grant reaches `5dive gate-proof sign` — a
+narrowly-scoped agent seat silently stores an unsigned closure when it answers a
+gate, and before DIVE-2801 that refusal only surfaced at push time (DIVE-2760).
+
+So the dry run now names its own limits rather than implying it checked them.
+Every dry run prints exactly one of these, and the same three states are carried
+in `--json` as `gateSignature`:
+
+- `closure signature ABSENT` — **the dry run refuses here** (exit 3) rather than
+  previewing a push that cannot happen. An empty signature cannot pass the
+  executor's check, so this outcome is knowable without the root key. Re-answer
+  the gate on a box that can sign; `5dive task answer` warns when a closure
+  mints unsigned (DIVE-2760).
+- `closure signature present but NOT verified here — the root executor verifies
+  it at push time` — the normal, honest dry-run result. The rehearsal is saying
+  which check it did not run, not warning you about a problem.
+- `closure signature VERIFIED against the root HMAC` — only the root executor
+  reaches this; it is the real verdict, not a rehearsal.
+- `closure signature NOT CHECKED — no gate check ran in this process` — no gate
+  check ran at all. A dry run that stayed silent because it never measured is
+  the same false green in a different costume.
+
+Confirm a closure with `sudo 5dive gate-proof verify <task>` (root only).
 
 ## Security model
 

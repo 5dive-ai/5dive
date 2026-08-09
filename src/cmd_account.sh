@@ -114,7 +114,7 @@ account_signin_detail() {
         [[ -n "$provider_line" ]] && provider=$(jq -cn --arg p "$provider_line" '$p')
         local default_line
         default_line=$(grep -E '^[[:space:]]*default:' "$cfg" 2>/dev/null | head -1 \
-          | sed -E 's/^[[:space:]]*default:[[:space:]]*//; s/^["'\'']//; s/["'\'']$//')
+          | sed -E 's/^[[:space:]]*default:[[:space:]]*//; s/^["'\'']//; s/["'\'']$//') || default_line=""
         [[ -n "$default_line" ]] && model=$(jq -cn --arg m "$default_line" '$m')
       fi
       # Fall back to the first credential-pool key only if config.yaml
@@ -150,7 +150,7 @@ account_signin_detail() {
       [[ -s "$env_file" ]] || { echo "{}"; return; }
       local base_url
       base_url=$(grep -E '^ANTHROPIC_BASE_URL=' "$env_file" 2>/dev/null \
-        | tail -1 | cut -d= -f2-)
+        | tail -1 | cut -d= -f2-) || base_url=""
       base_url="${base_url%\"}"; base_url="${base_url#\"}"
       if [[ -n "$base_url" ]]; then
         local cand
@@ -200,7 +200,7 @@ account_signin_detail() {
         local pv var val
         while IFS= read -r pv; do
           var="${PI_PROVIDER_VAR[$pv]}"
-          val=$(grep -E "^${var}=" "$sf" 2>/dev/null | tail -1 | cut -d= -f2-)
+          val=$(grep -E "^${var}=" "$sf" 2>/dev/null | tail -1 | cut -d= -f2-) || val=""
           val="${val%\"}"; val="${val#\"}"
           [[ -n "$val" ]] || continue
           if [[ -n "$pinned" && "$pv" == "$pinned" ]]; then found="$pv"; break; fi
@@ -420,7 +420,7 @@ cmd_account_show() {
   types=$(account_types_authed "$name")
   agents=$(account_agents_bound "$name")
   if [[ -s "$env_file" ]]; then
-    env_keys=$(grep -oE '^[A-Z_][A-Z0-9_]*' "$env_file" 2>/dev/null | sort -u | jq -R . | jq -cs '.')
+    env_keys=$(grep -oE '^[A-Z_][A-Z0-9_]*' "$env_file" 2>/dev/null | sort -u | jq -R . | jq -cs '.') || env_keys="[]"
   else
     env_keys="[]"
   fi
@@ -527,6 +527,7 @@ cmd_account_remove() {
           message:("account \($n) is in use by: " + ($a | join(", "))),
           details:{agents:$a}}}'
       echo "error: account '$name' is in use by: $list" >&2
+      mark_reported  # DIVE-2598: reason already printed above; not a silent exit
       exit "$E_CONFLICT"
     fi
     fail "$E_CONFLICT" "account '$name' is in use by: $list — rebind or remove those agents first"
@@ -956,7 +957,19 @@ cmd_account_set_active_provider() {
   # pin the gateway at the wrong endpoint.
   sudo -u claude -H env HERMES_HOME="$prof_hermes" \
     "$bin" config set model.base_url "" >&2 2>/dev/null || true
-  local model="${HERMES_PROVIDER_MODEL[$provider]:-}"
+  # HERMES_PROVIDER_MODEL is keyed CANONICAL but $provider here is the NATIVE
+  # hermes id (validated above against auth.json's credential_pool, which is
+  # native-keyed). Canonicalize before the lookup — indexing with $provider
+  # directly missed silently for every provider HERMES_PROVIDER_ID renames
+  # (google->gemini, moonshot->kimi, qwen->alibaba) and left model.default on
+  # whatever the PREVIOUS provider had (DIVE-2666).
+  local canonical_provider
+  canonical_provider="$(resolve_canonical_provider_hermes "$provider")"
+  if [[ -z "$canonical_provider" ]]; then
+    warn "no canonical id maps to hermes native provider '$provider' — check HERMES_PROVIDER_ID; leaving model.default unchanged"
+    canonical_provider="$provider"
+  fi
+  local model="${HERMES_PROVIDER_MODEL[$canonical_provider]:-}"
   if [[ -n "$model" ]]; then
     sudo -u claude -H env HERMES_HOME="$prof_hermes" \
       "$bin" config set model.default "$model" >&2 \

@@ -15,6 +15,7 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 START="$ROOT/5dive-agent-start"
 
@@ -39,7 +40,6 @@ declare -F newest_node24_bin >/dev/null || fail "could not extract newest_node24
 declare -F resolve_codex     >/dev/null || fail "could not extract resolve_codex"
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
 
 # Repoint the hardcoded absolute paths at a sandbox so the test never depends on
 # (or is rescued by) the hand-made v24 symlink on the control-plane host.

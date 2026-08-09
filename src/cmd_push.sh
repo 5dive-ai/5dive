@@ -118,8 +118,20 @@ _push_repo_from_worktree() {
 _push_fetch_why() {
   local err="$1"
   case "$err" in
-    *"could not read Username"*|*"Authentication failed"*|*"terminal prompts disabled"*)
-      printf 'no git credential is available to this user for that repo' ;;
+    # DIVE-2566: these three used to share ONE string — 'no git credential is
+    # available to this user for that repo'. They are different faults and the
+    # collapsed wording sent a builder after the wrong one: on DIVE-1560 it read
+    # as a missing sudo grant for an hour, when the real cause was a GitHub App
+    # with no installation on the target account. A cause list is not a cause.
+    #
+    # ASKED-AND-COULD-NOT-ASK: git wanted to PROMPT, and prompting is disabled.
+    # Nothing was presented, so nothing was rejected.
+    *"could not read Username"*|*"terminal prompts disabled"*)
+      printf 'this user has no git credential helper for that repo, so git fell back to prompting and prompts are disabled here' ;;
+    # PRESENTED-AND-REJECTED: a credential existed and the remote turned it down.
+    # The opposite diagnosis from the arm above, and the fix is different too.
+    *"Authentication failed"*)
+      printf 'a git credential WAS presented and the remote REJECTED it — this is a wrong/expired credential, not a missing one' ;;
     *FETCH_HEAD*|*"Permission denied"*|*"unable to create"*|*"Unable to create"*|*"cannot open"*)
       printf "this user cannot write .git/ in that work tree — a root-owned FETCH_HEAD left by an earlier root-run fetch is the known cause; 'sudo chgrp -R claude <repo>/.git && sudo chmod -R g+w <repo>/.git' clears it" ;;
     *"Could not resolve host"*|*"Connection timed out"*|*"unable to access"*)
@@ -310,9 +322,12 @@ _push_touches_workflows() { # <repopath> <repourl> <branch>
 }
 
 cmd_push() {
-  require_loaded push broker_gate_check broker_bind_target broker_task_target
+  require_loaded push broker_gate_check broker_bind_target broker_task_target broker_gate_sig_note
   tasks_db_init
   local branch="" repo="" dry=0 yes=0
+  # DIVE-2605: --open-pr and its two body sources. Parsed here, validated before the
+  # push so a bad --pr-body-file cannot cost you a push you then cannot follow up.
+  local open_pr=0 pr_base="" pr_title="" pr_body_file="" pr_draft=0
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -320,6 +335,11 @@ cmd_push() {
       --repo=*)   repo="${1#*=}" ;;
       --dry-run)  dry=1 ;;
       --yes|-y)   yes=1 ;;
+      --open-pr)      open_pr=1 ;;
+      --open-pr=*)    open_pr=1; pr_base="${1#*=}" ;;
+      --pr-title=*)   pr_title="${1#*=}" ;;
+      --pr-body-file=*) pr_body_file="${1#*=}" ;;
+      --pr-draft)     pr_draft=1 ;;
       --) shift; positional+=("$@"); break ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *)  positional+=("$1") ;;
@@ -327,7 +347,16 @@ cmd_push() {
     shift
   done
   [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" \
-    "usage: 5dive push <id|DIVE-N> [--branch=<b>] [--repo=<url>] [--dry-run]"
+    "usage: 5dive push <id|DIVE-N> [--branch=<b>] [--repo=<url>] [--dry-run] [--open-pr[=<base>]] [--pr-title=<t>] [--pr-body-file=<f>] [--pr-draft]"
+  # A PR flag without --open-pr is silently inert otherwise, and a silently inert
+  # flag on a verb you run once per branch is a body you think you attached.
+  if [[ $open_pr -eq 0 ]]; then
+    [[ -n "$pr_title" || -n "$pr_body_file" || $pr_draft -eq 1 ]] && fail "$E_USAGE" \
+      "--pr-title/--pr-body-file/--pr-draft do nothing without --open-pr; add --open-pr or drop them."
+  fi
+  if [[ -n "$pr_body_file" ]]; then
+    [[ -r "$pr_body_file" ]] || fail "$E_USAGE" "--pr-body-file: '${pr_body_file}' is not readable."
+  fi
 
   resolve_task_id "${positional[0]}"
   local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
@@ -337,8 +366,14 @@ cmd_push() {
     local body; body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
     branch=$(_push_branch_from_body "$body")
   fi
+  # DIVE-2801: name BOTH requirements. `--branch` satisfies this usage check but
+  # NOT the DIVE-1462 gate binding in _push_do, which reads the branch fresh from
+  # the task body — so offering `--branch` alone as an alternative sends the
+  # caller down a path whose only outcome is the next refusal. Same defect as the
+  # dry-run this row is named for: an early check answering on behalf of a later
+  # one it does not share a predicate with.
   [[ -n "$branch" ]] || fail "$E_USAGE" \
-    "no branch for ${ident}: pass --branch=<name> or add a 'Branch: <name>' line to the task body (push refuses to guess)."
+    "no branch for ${ident}: add a 'Branch: <name>' line to the task body (push refuses to guess). The task body is REQUIRED — the cleared gate binds to the branch the task itself declares (DIVE-1462), so --branch=<name> alone gets past this check and is then refused by that binding; pass it as well only to override which branch is read."
   case "$branch" in
     main|master|HEAD) fail "$E_VALIDATION" "refusing to push to protected branch '${branch}' — delegated push targets feature branches only." ;;
   esac
@@ -419,9 +454,26 @@ cmd_push() {
     # DIVE-1970: the dry-run names WHERE the target came from, not just what it
     # is — "5dive-ai/5dive" alone looks equally right whether it was resolved or
     # merely defaulted to, which is why --dry-run did not catch the wrong-repo bug.
-    ok "dry-run: would push ${branch}@${sha} to ${slug} — target from ${repo_src} (gate cleared, author ${author_state})" \
+    # DIVE-2605: --open-pr is part of what the dry run is previewing, and a dry run
+    # that stays silent about it reads as "this flag was ignored".
+    local pr_preview="" pr_base_preview="${pr_base:-${FIVE_GATE_MAIN_BRANCH:-main}}"
+    if [[ $open_pr -eq 1 ]]; then
+      if sudo -n -l /usr/local/bin/5dive _gh_do >/dev/null 2>&1; then
+        pr_preview=" then open a PR ${branch} -> ${pr_base_preview} as 5dive-bot"
+      else
+        pr_preview=" — but NOT open a PR: this account has no '_gh_do' grant, so --open-pr would warn and leave the branch for someone else to open"
+      fi
+    fi
+    # DIVE-2801: the rehearsal names the check it did NOT run. `gate cleared` alone
+    # asserted the whole gate predicate while having evaluated the weaker half of it
+    # — the preflight runs with require_sig=0, the real push with 1 — so a green here
+    # generalised, in the reader's head, to the check most likely to stop the write.
+    # Same shape as `author_state` above (DIVE-2161): name the bound the verdict rests on.
+    local sig_state; sig_state=$(broker_gate_sig_note push)
+    ok "dry-run: would push ${branch}@${sha} to ${slug}${pr_preview} — target from ${repo_src} (gate cleared, ${sig_state}, author ${author_state})" \
        "$(jq -n --arg t "$ident" --arg b "$branch" --arg s "$sha" --arg r "$slug" --arg a "$author_state" --arg rs "$repo_src" \
-             '{task:$t,branch:$b,sha:$s,repo:$r,repoSource:$rs,dryRun:true,gate:"cleared",author:$a}')"
+             --argjson op "$open_pr" --arg pb "$pr_base_preview" --arg gs "${BROKER_GATE_SIG_STATE:-unknown}" \
+             '{task:$t,branch:$b,sha:$s,repo:$r,repoSource:$rs,dryRun:true,gate:"cleared",gateSignature:$gs,author:$a,openPr:($op==1),prBase:$pb}')"
     return 0
   fi
 
@@ -436,6 +488,94 @@ cmd_push() {
     fail "$E_GENERIC" \
       "delegated push failed — the task gate is not cleared, the GitHub App credential is not provisioned (${_PUSH_APP_ENV_DEFAULT}), the NOPASSWD grant for '_push_do' is missing, or the push itself failed (see above). See DIVE-1376/1460."
   fi
+
+  # DIVE-2605: the branch is up; open the PR on the SAME rail rather than messaging
+  # an agent that holds a credential. Deliberately AFTER the push and never fatal to
+  # it — a failed PR open leaves a pushed branch anyone can open a PR from by hand,
+  # while making it fatal would turn a successful push into a red exit and invite a
+  # re-push. The push is the irreversible half; the PR is the recoverable one.
+  if [[ $open_pr -eq 1 ]]; then
+    _push_open_pr "$ident" "$slug" "$branch" "$pr_base" "$pr_title" "$pr_body_file" "$pr_draft" \
+      || warn "the branch pushed but the pull request was not opened (see above) — re-run just the PR with: 5dive gh pr create --repo ${slug} --head ${branch}"
+  fi
+}
+
+# _push_open_pr <ident> <slug> <branch> <base> <title> <body-file> <draft>
+# DIVE-2605, blockage #1. A builder holds no gh credential of any kind, so after
+# `5dive push` puts the branch up they have historically messaged main with a
+# prepared PR body for main to paste — two round-trips of agent-to-agent messaging
+# and one agent's attention, for a step that carries no judgement. Five such proxied
+# closes landed in one day (measured by main, 2026-08-03).
+#
+# The rail this uses is not new and no credential moves: `gh pr create` is class
+# `write` in DIVE-2448's routing map, so it already goes out as 5dive-bot through the
+# root-only `_gh_do`, which reads the PAT root-side and execs gh with it. Measured
+# 2026-08-04 from agent-dev2 (standard isolation, `ALL=(root) NOPASSWD:
+# /usr/local/bin/5dive *`): the rail answers, and the bot holds `push:true` on
+# 5dive-ai/5dive, which is the permission `pr create` needs. So this verb adds a
+# CALL, not a capability — the same posture as _push_do, one API call further on.
+#
+# The body travels over STDIN with the rest of the argv, NUL-separated, so a
+# multi-paragraph PR body never lands in the process table. That is strictly better
+# than the `gh pr create --body "$(cat f)"` a human would type.
+_push_open_pr() {
+  local ident="$1" slug="$2" branch="$3" base="$4" title="$5" body_file="$6" draft="$7"
+  local body="" url
+
+  [[ -n "$base" ]] || base="${FIVE_GATE_MAIN_BRANCH:-main}"
+  if [[ -z "$title" ]]; then
+    local t; t=$(db "SELECT COALESCE(title,'') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || true)
+    # The task title is the honest default, but it is prose written for a board and
+    # can run long; a PR title is a subject line. Truncate rather than refuse, and
+    # keep the ident so the merge gate's own ident-match evidence still binds.
+    [[ ${#t} -gt 80 ]] && t="${t:0:77}..."
+    title="${ident}: ${t:-delegated push}"
+  fi
+  if [[ -n "$body_file" ]]; then
+    body=$(cat "$body_file")
+  else
+    body="Delivers ${ident}."$'\n\n'"Opened by \`5dive push --open-pr\` (DIVE-2605): the branch and this pull request went out on the same root-side rail, as 5dive-bot. The authoring agent holds no GitHub credential."
+  fi
+
+  local -a args=(pr create --repo "$slug" --head "$branch" --base "$base"
+                 --title "$title" --body "$body")
+  [[ "$draft" == "1" ]] && args+=(--draft)
+
+  # Same handoff as the push: NUL-separated over stdin, exact command path, and
+  # `_gh_do` re-derives the routing class as root rather than trusting this caller.
+  # stderr is CAPTURED rather than passed through because one specific failure has
+  # to be read, not just relayed — see the already-exists arm below.
+  local rc=0 out
+  out=$(printf '%s\0' "${args[@]}" | sudo -n /usr/local/bin/5dive _gh_do 2>&1) || rc=$?
+  url="$out"
+
+  # ALREADY EXISTS IS THE DESIRED END STATE, not a failure. `--open-pr` means "make
+  # sure this branch has a pull request", and re-running a push (a second commit on
+  # the same branch, a retry after a red) hits this every time. Reporting it as a
+  # failure and then advising `5dive gh pr create` — the exact command that just
+  # refused — is advice that is wrong in the most likely failure mode there is.
+  # gh names the existing PR and its URL in that message; surface those.
+  if [[ $rc -ne 0 && "$out" == *"already exists"* ]]; then
+    local existing; existing=$(printf '%s' "$out" | grep -oE 'https://github\.com/[^ ]+/pull/[0-9]+' | head -1) || existing=""
+    ok "${ident} already has a pull request (${existing:-see above}) for ${branch} -> ${base} in ${slug} — branch pushed, nothing more to open" \
+       "$(jq -n --arg t "$ident" --arg u "${existing:-}" --arg b "$branch" --arg base "$base" --arg r "$slug" \
+             '{task:$t,pr:$u,branch:$b,base:$base,repo:$r,actor:"5dive-bot",created:false}')"
+    return 0
+  fi
+  if [[ $rc -ne 0 ]]; then
+    printf '%s\n' "$out" >&2
+    # Distinguish "you may not route" from "the routed call failed" — sudo exits 1
+    # for a missing grant and gh exits 1 for its own errors, so rc alone cannot tell
+    # them apart. Ask sudo directly, and only after a failure.
+    if ! sudo -n -l /usr/local/bin/5dive _gh_do >/dev/null 2>&1; then
+      warn "opening the PR needs the NOPASSWD grant for '/usr/local/bin/5dive _gh_do', which this account does not have — so nothing ran and this says NOTHING about the PR itself. A builder gets the grant with 'agent create --can-push'."
+    fi
+    return 1
+  fi
+  url="${url##*$'\n'}"
+  ok "opened ${url:-the pull request} for ${ident} (${branch} -> ${base} in ${slug}, as 5dive-bot)" \
+     "$(jq -n --arg t "$ident" --arg u "$url" --arg b "$branch" --arg base "$base" --arg r "$slug" \
+           '{task:$t,pr:$u,branch:$b,base:$base,repo:$r,actor:"5dive-bot"}')"
 }
 
 # cmd_push_do — ROOT-ONLY, the atomic gated push (DIVE-1460). Reads four lines on
@@ -656,7 +796,34 @@ cmd_push_do() {
   if [[ -z "$tok" ]]; then
     local _why; _why=$(printf '%s' "$_tokresp" | jq -r '.message // empty' 2>/dev/null)
     [[ -n "$_why" ]] || _why="$(printf '%s' "$_tokresp" | head -c 300)"
-    fail "$E_GENERIC" "installation token exchange failed for ${slug} against installation ${inst}: ${_why:-no response body} — if that names an inaccessible repository, the App is not installed on '$(printf '%s' "$slug" | cut -d/ -f1)'."
+    local _owner; _owner="${slug%%/*}"
+    # DIVE-2566: NOT $E_GENERIC, and not a number from someone else's namespace.
+    # The original symptom of this whole row was an operator seeing rc=22 — curl's
+    # exit for HTTP>=400 — which is not a 5dive code at all (error_codes.sh tops out
+    # at E_PERMISSION=10), so the number carried no meaning and the message named
+    # four possible causes at once. E_AUTH_REQUIRED is the honest class: the App
+    # cannot authenticate FOR THIS REPO. It is deliberately distinct from
+    # E_PERMISSION (which means "must run as root" here) and from the git-credential
+    # faults _push_fetch_why now separates.
+    #
+    # No NEW code was added to the ladder on purpose: error_codes.sh says "keep
+    # err_class_for() in sync if you add a code", so a new code has a reader outside
+    # this file, and this failure genuinely IS an authentication class rather than a
+    # class of its own. Widening a shared ladder for one call site is a bigger blast
+    # radius than the fix needs.
+    #
+    # The no-installation case gets its own SENTENCE because it is the one an
+    # operator cannot act on by retrying, and it is the case that actually happens:
+    # the App is installed on the 5dive-ai org, while lodar/5dive-api and
+    # lodar/5dive-frontend live on a personal account. Installing it there is
+    # DIVE-2033, a human-only step. Until then this refusal is CORRECT behaviour and
+    # only has to say why.
+    case "$_why" in
+      *"not installed"*|*"Not Found"*|*"not accessible"*|*"does not exist"*)
+        fail "$E_AUTH_REQUIRED" "the GitHub App has no installation covering ${slug} — it cannot mint a token for a repo it was never installed on, so this push CANNOT succeed and retrying will not help. GitHub said: ${_why}. Install the App on '${_owner}' (DIVE-2033, a human-only account-level step), or relay this push to someone holding credentials for ${slug}. This is NOT a missing sudo grant and NOT a git-credential problem." ;;
+      *)
+        fail "$E_AUTH_REQUIRED" "installation token exchange failed for ${slug} against installation ${inst}. GitHub said: ${_why:-no response body}. If that names an inaccessible repository, the App is not installed on '${_owner}'." ;;
+    esac
   fi
 
   # Push ONLY the named branch, token via extraheader so it never lands in argv

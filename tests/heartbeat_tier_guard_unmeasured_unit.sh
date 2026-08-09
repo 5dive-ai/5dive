@@ -67,6 +67,7 @@ set -uo pipefail
 # DIVE-2229: pinned-commit baselines, fail-closed. Same no-2>/dev/null rule.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/pinned_baseline.sh" \
   || printf 'pinned baseline helper: UNRESOLVED (tests/lib/pinned_baseline.sh not reachable)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 
 PASS=0; FAIL=0; SKIP=0
@@ -92,7 +93,7 @@ done
 eval "$(awk '/^_hb_tier_rank\(\) \{$/ { on=1 } on { print } on && $0 == "}" { exit }' src/cmd_heartbeat.sh)"
 declare -F _hb_tier_rank >/dev/null || { echo "FAIL: could not extract _hb_tier_rank"; exit 1; }
 
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+TMP="$(mktemp -d)"
 
 FIXTURE='{"agents":{
   "dev":{"isolation":"admin"},
@@ -161,8 +162,17 @@ done
 # Extract the block between its two banner comments from an arbitrary source
 # TEXT, so the same harness can run the current tree and origin/main's pre-fix
 # copy without either being retyped here.
+# DIVE-2716 moved the block INSIDE a candidate loop, so the lines that used to
+# follow it (`# --- Same-account spread`) are now preceded by the loop's own
+# `break`/`done`, which do not eval standalone. The range therefore ends at an
+# explicit sentinel — and still accepts the old terminator, so the PINNED pre-fix
+# copy below (which has no sentinel) extracts exactly as it always did. Ending on
+# EITHER marker is what keeps the anchor comparing like with like.
 _extract_guard() {  # stdin = a cmd_heartbeat.sh body
-  awk '/# --- DIVE-1065 tier guard/ { on=1 } /# --- Same-account spread/ { on=0 } on { print }'
+  awk '/# --- DIVE-1065 tier guard/ { on=1 }
+       /# --- end DIVE-1065 tier guard/ { on=0 }
+       /# --- Same-account spread/ { on=0 }
+       on { print }'
 }
 
 # Build a decider function from a guard block. `continue` inside the block ends

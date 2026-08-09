@@ -185,7 +185,7 @@ _sc_probe_lead_clear_seal() {
 
   local names; names="$(_gate_clear_leads 2>/dev/null || true)"
   if [[ -n "$names" ]]; then
-    local n; n=$(printf '%s\n' "$names" | grep -c .)
+    local n; n=$(printf '%s\n' "$names" | grep -c .) || n=0
     _sc_pass "routed lead-clear is ARMED: $n sealed lead(s) [$(printf '%s' "$names" | tr '\n' ' ')] may clear a gate routed to them; $standing"
     return
   fi
@@ -244,7 +244,8 @@ _sc_probe_t2_forge() {
     : > "$d/gate-proof.enforce"     # the live fleet posture since 2026-07-30
 
     seed() { db "INSERT INTO tasks (ident,title,status,created_by) VALUES ('$1','selfcheck','todo','main');" >/dev/null 2>&1
-             cmd_task_need "$1" --type=decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 >/dev/null 2>&1; }
+             cmd_task_need "$1" --type=decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 \
+               --needs=human_tap >/dev/null 2>&1; }   # DIVE-2848: this prover NEEDS a hard-human gate to forge against, so it declares one instead of hand-pinning a tier the cap now refuses
     by() { db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident='$1';"; }
 
     # (a) THE FORGE: an ordinary agent, unprivileged, no sudo — what every agent is.
@@ -272,6 +273,12 @@ _sc_probe_t2_forge() {
     _gate_passwd_stream() { _agentrow; printf '%s\n' "$(</etc/passwd)"; }
     _gate_caller_uid() { printf '%s' "$AUID"; }
     _gate_is_root() { return 1; }
+    # DIVE-2371: authorization is now the uid test AND a STRUCTURAL cgroup test, so
+    # pin the second half for the same reason the comment above pins the first —
+    # unpinned it is answered by whoever ran the probe (an agent unit on a box, a
+    # runner cgroup in CI), and a arm that refuses for an environmental reason is
+    # not grading the floor. An ordinary agent really does live in an agent unit.
+    _gate_caller_cgroup() { printf '%s' '/system.slice/system-5dive.slice/5dive-agent@fixture.service'; }
     unset SUDO_UID
     printf 'pinned=%s\n' "$(_gate_authenticated_actor)"
     seed DIVE-990001
@@ -288,6 +295,14 @@ _sc_probe_t2_forge() {
     _gate_caller_uid() { printf '%s' "0"; }
     _gate_passwd_stream() { printf '%s\n' "$(</etc/passwd)"; }
     _gate_is_root() { return 0; }
+    # DIVE-2371: the liveness arm has to model BOTH halves or it grades a refusal.
+    # Pinned to the DASHBOARD, which is what "a real human path" concretely IS on a
+    # box: the one non-Telegram surface a customer clears from, and the surface the
+    # accept list exists for. Left unpinned this arm reads the host's real cgroup and
+    # fails on every agent box and every CI runner — the probe would then report
+    # "the floor refuses everything" fleet-wide, which is a statement about where it
+    # ran, not about the floor.
+    _gate_caller_cgroup() { printf '%s' '/system.slice/shelld.service'; }
     export SUDO_UID=0
     ( cmd_task_answer DIVE-990002 --value=A --human ) >/dev/null 2>&1
     printf 'human=%s\n' "$(by DIVE-990002)"
@@ -499,8 +514,8 @@ _sc_probe_harness_verdicts() {
   rc=${PIPESTATUS[0]}
   out=$(cat "$logf"); rm -f "$logf"
   local corpus nwired
-  corpus=$(grep -oE '[0-9]+ wired' <<<"$out" | head -1)
-  nwired=$(grep -oE '[0-9]+ wired' <<<"$out" | head -1 | grep -oE '^[0-9]+')
+  corpus=$(grep -oE '[0-9]+ wired' <<<"$out" | head -1) || corpus=""
+  nwired=$(grep -oE '[0-9]+ wired' <<<"$out" | head -1 | grep -oE '^[0-9]+') || nwired=""
   local scoped; scoped=$( ((SELFCHECK_FULL)) && echo 'tests/*.sh' || echo "$SELFCHECK_HARNESS_SAMPLE")
 
   if (( rc != 0 )); then
@@ -590,8 +605,46 @@ _sc_probe_bundle_integrity() {
   # bundle is a self-consistent lie — the pair agrees and neither is the code.
   local tmpb; tmpb=$(mktemp "${TMPDIR:-/tmp}/5dive-bundle.XXXXXX" 2>/dev/null)
   if [[ -n "$tmpb" ]] && (cd "$root" && BUILD_OUT="$tmpb" bash build.sh >/dev/null 2>&1); then
-    cmp -s "$tmpb" "$root/5dive" \
-      || bad+=("./5dive is not what src/ builds — the bundle and the commit it claims are different code")
+    # DIVE-2798: A BUNDLE CANNOT CARRY THE SHA OF THE COMMIT THAT CONTAINS IT.
+    # DIVE-2603 made build.sh stamp FIVE_BUILD_SHA=HEAD; the release flow builds
+    # the bundle, then commits it onto a NEW commit. A rebuild here therefore
+    # stamps THAT commit, while the tracked bundle names the commit it was built
+    # from — which is the release commit's first parent, exactly the identity
+    # install.sh's legacy_release_build_sha() already documents and reads. So a
+    # raw `cmp` made the stamp and this probe jointly unsatisfiable on every
+    # release commit, i.e. precisely where the probe matters most: it blocked the
+    # v0.19.3 cut with a true byte difference nobody could ever satisfy.
+    #
+    # The stamp is NOT waived. It moves from a byte comparison to an identity
+    # assertion: every other byte must still match src/ exactly, and the stamp
+    # itself must name a commit this checkout can corroborate. Waiving it would
+    # pass a forged stamp; this fails one. Comparing the tracked stamp against
+    # git — rather than against the REBUILT stamp — also drops a second, quieter
+    # trap: an untracked file on the runner makes the rebuild stamp `<sha>-dirty`
+    # and would fail a naive stamp-to-stamp check for a reason that is not the
+    # bundle's fault.
+    local stamp_rx='^readonly FIVE_BUILD_SHA="[^"]*"$'
+    local n_stamp; n_stamp=$(grep -cE "$stamp_rx" "$root/5dive" 2>/dev/null) || n_stamp=0
+    if [[ "$n_stamp" != "1" ]]; then
+      bad+=("the tracked bundle carries ${n_stamp:-0} FIVE_BUILD_SHA lines rather than exactly one, so its build identity cannot be read or compared")
+    elif ! cmp -s "$tmpb" "$root/5dive"; then
+      if diff -q <(grep -vE "$stamp_rx" "$tmpb") <(grep -vE "$stamp_rx" "$root/5dive") >/dev/null 2>&1; then
+        # Only the stamp line differs — legitimate on a release commit, a lie anywhere else.
+        local _tracked _head _parent
+        _tracked=$(grep -m1 -E "$stamp_rx" "$root/5dive" | sed -E 's/.*="([^"]*)".*/\1/') || _tracked=""
+        _head=$(git -C "$root" rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || _head=""
+        _parent=$(git -C "$root" rev-parse --verify 'HEAD^1^{commit}' 2>/dev/null) || _parent=""
+        if [[ -z "$_head" ]]; then
+          bad+=("./5dive differs from src/ only in its build stamp, but git cannot resolve HEAD here, so the stamp names nothing this checkout can check")
+        elif [[ "$_tracked" == "$_head" || ( -n "$_parent" && "$_tracked" == "$_parent" ) ]]; then
+          : # the bundle names the commit it was built from; the release commit is its child
+        else
+          bad+=("./5dive claims FIVE_BUILD_SHA=${_tracked:-missing}, which is neither this commit (${_head:0:12}) nor its first parent (${_parent:0:12}) — the bundle names a build identity this checkout cannot corroborate")
+        fi
+      else
+        bad+=("./5dive is not what src/ builds — the bundle and the commit it claims are different code")
+      fi
+    fi
   else
     bad+=("build.sh could not be run, so the bundle could not be shown to match src/")
   fi

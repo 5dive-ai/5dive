@@ -32,10 +32,10 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-lead-standing-unit.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 # STATE_DIR must be set BEFORE cmd_council.sh is sourced: its COUNCIL_DIR/COUNCIL_LINEAGE
 # are source-time globals derived from it (they are re-pinned below anyway, belt-and-braces).
@@ -414,8 +414,17 @@ if [[ -f "$SRC/cmd_push.sh" ]]; then
   # shellcheck source=/dev/null
   source "$SRC/cmd_push.sh" 2>/dev/null
   if declare -F _push_gate_check >/dev/null; then
+    # DIVE-2801: `need_answer_sig` is set EXPLICITLY. This arm's subject is the
+    # `lead:standing:*` PROVENANCE rule, not the closure signature — but the preflight
+    # now refuses a gate carrying no signature at all, so leaving the column to
+    # whatever `cmd_task_answer` happened to store makes the fixture depend on
+    # WHETHER THE BOX CAN SIGN. That is not a hypothetical: this arm passed on the
+    # control plane (which signs) and failed on `pristine-s3` (which does not), so the
+    # local green was environment-luck and not evidence. Any non-empty value serves —
+    # the preflight checks presence, and only the root executor validates the HMAC.
     db "UPDATE tasks SET need_answer='approved', need_answered_at='2026-07-26 16:00:00',
-           need_answered_by='lead:standing:marcus', need_type='approval', routed_reviewer=NULL
+           need_answered_by='lead:standing:marcus', need_type='approval', routed_reviewer=NULL,
+           need_answer_sig='sig-fixture'
         WHERE ident='DIVE-401';"
     _i=$(db "SELECT id FROM tasks WHERE ident='DIVE-401';")
     out=$( _push_gate_check "$_i" DIVE-401 2>&1 ); rc=$?

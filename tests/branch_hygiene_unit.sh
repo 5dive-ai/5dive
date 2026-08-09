@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
 
 cat >"$TMP/gh" <<'MOCK'
 #!/usr/bin/env bash

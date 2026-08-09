@@ -28,10 +28,10 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-nonce-unit.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
@@ -190,6 +190,21 @@ out=$(SUDO_UID="$AGENT_UID" cmd_task_answer DIVE-400 --value=approved --human --
 [[ "$(answered DIVE-400)" == "open" && $rc -ne 0 ]] && ok_t "T4 DIVE-950: --proof no longer clears (form b dropped)" \
   || bad_t "T4 --proof dropped" "rc=$rc state=$(answered DIVE-400) out=$out"
 
+# DIVE-2371: authorization is now the uid test AND a structural cgroup test, and
+# this file's uid stubs cannot reach that read. Unpinned, T5 below (a human-on-box
+# clearing with no proof) is refused, its pre-existing `fail 6` exits this
+# UNSUBSHELLED harness, and the file truncates at 12 of 19 arms with rc=6 — no
+# summary, no HARNESS-RC, and nothing that greps for a FAIL line notices.
+#
+# Pinned to the DASHBOARD/drop surface these arms DESCRIBE, once, rather than
+# inherited from whatever ran the suite (the DIVE-2365 rule this file already
+# applies to the caller uid). The refusal arms below are unaffected: T6 is refused
+# on the agent SUDO_UID and T8 on the DIVE-394 caller guard, neither of which this
+# touches. Cgroup coverage itself belongs to gate_cgroup_human_principal_unit.sh —
+# this file grades the NONCE and SUDO_UID evidence forms, and it should grade them
+# without the structural half silently deciding every arm.
+_gate_caller_cgroup() { printf '%s' '/system.slice/shelld.service'; }
+
 # --- T5: (c) non-agent SUDO_UID clears with NO proof (drop / human-on-box) ----
 seed_task DIVE-500; cmd_task_need DIVE-500 --type=secret --ask="drop key" --secret-key=FIXTURE_TOKEN --connector=fixture >/dev/null 2>&1
 SUDO_UID=0 cmd_task_answer DIVE-500 --human --from=drop >/dev/null 2>&1
@@ -220,16 +235,29 @@ touch "$GATE_PROOF_ENFORCE"
 FAKE_CALLER="agent-evil"
 seed_task DIVE-800; cmd_task_need DIVE-800 --type=manual --ask="do it" >/dev/null 2>&1
 out=$(cmd_task_answer DIVE-800 --value=done --human 2>&1); rc=$?
-[[ "$(answered DIVE-800)" == "open" && $rc -ne 0 && "$out" == *"only a human"* ]] \
+# DIVE-2801: the refusal must name the CALLER's standing, not claim a property of
+# the gate type. "only a human can clear it" was false — the gate's lead-clear
+# seat clears these with no human at all — and the agent it refused read it as a
+# general rule and rebuilt the gate around it. Assert the mechanism (refused, gate
+# still open) AND that the wording describes the caller, since pinning the old
+# sentence is what made the wrong reason durable.
+[[ "$(answered DIVE-800)" == "open" && $rc -ne 0 && "$out" == *"lead-clear standing"* ]] \
   && ok_t "T8 agent-* immediate caller blocked on manual gate (defense-in-depth)" \
   || bad_t "T8 agent-* caller blocked on manual" "rc=$rc state=$(answered DIVE-800) out=$out"
+[[ "$out" != *"only a human can clear it"* ]] \
+  && ok_t "T8 refusal does not assert a gate-type law it cannot support (DIVE-2801)" \
+  || bad_t "T8 refusal still claims 'only a human can clear it'" "out=$out"
 
 # T8b: the CONTROL. Non-agent caller, everything else identical — must NOT hit
 # the agent refusal. Without this arm T8 grades a message, not a mechanism.
 FAKE_CALLER="root"
 seed_task DIVE-801; cmd_task_need DIVE-801 --type=manual --ask="do it" >/dev/null 2>&1
 out8b=$(cmd_task_answer DIVE-801 --value=done --human 2>&1); rc8b=$?
-[[ "$out8b" != *"only a human can clear it"* ]] \
+# DIVE-2801: keyed on the phrase the refusal ACTUALLY carries now. Left on the old
+# sentence this control would pass for any build — including one where the refusal
+# fires on every caller — because the string it looked for no longer exists
+# anywhere. A control that cannot fail has stopped being a control.
+[[ "$out8b" != *"lead-clear standing"* ]] \
   && ok_t "T8b CONTROL: non-agent caller does NOT hit the agent refusal (rc=$rc8b)" \
   || bad_t "T8b non-agent caller wrongly hit the agent refusal" "rc=$rc8b out=$out8b"
 

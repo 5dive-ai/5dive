@@ -82,7 +82,7 @@ _deploy_validate_target() {
 # needs no privilege and the errors are readable), then hand the actual gated
 # deploy to the root-only `_deploy_do`. The agent never receives a token.
 cmd_deploy() {
-  require_loaded deploy broker_gate_check broker_bind_target broker_task_target broker_connector_read
+  require_loaded deploy broker_gate_check broker_bind_target broker_task_target broker_connector_read broker_gate_sig_note
   tasks_db_init
   local target="" env="production" dry=0
   local -a positional=()
@@ -122,9 +122,13 @@ cmd_deploy() {
   broker_bind_target deploy "$id" "$ident" "$target"
 
   if (( dry )); then
-    ok "dry-run: would deploy ${proj}@${ref} to ${env} (gate cleared, target bound to ${ident})" \
-       "$(jq -n --arg t "$ident" --arg p "$proj" --arg r "$ref" --arg e "$env" \
-             '{task:$t,project:$p,ref:$r,env:$e,dryRun:true,gate:"cleared"}')"
+    # DIVE-2801: deploy's rehearsal runs the SAME require_sig=0 preflight push's does
+    # (B4 passes 1 inside root), so it inherits the same defect and the same fix —
+    # wired here in the one commit rather than left for the surface to rediscover.
+    local sig_state; sig_state=$(broker_gate_sig_note deploy)
+    ok "dry-run: would deploy ${proj}@${ref} to ${env} (gate cleared, ${sig_state}, target bound to ${ident})" \
+       "$(jq -n --arg t "$ident" --arg p "$proj" --arg r "$ref" --arg e "$env" --arg gs "${BROKER_GATE_SIG_STATE:-unknown}" \
+             '{task:$t,project:$p,ref:$r,env:$e,dryRun:true,gate:"cleared",gateSignature:$gs}')"
     return 0
   fi
 

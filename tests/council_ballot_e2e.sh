@@ -33,8 +33,15 @@ if ! BUILD_OUT="$FIVE" bash "$ROOT/build.sh" >/dev/null 2>&1 || [[ ! -x "$FIVE" 
 fi
 export STATE_DIR="$TMP"  # isolate — never touch a live state dir
 
-P=0; F=0
+P=0; F=0; S=0
 chk(){ if [ "$2" = "$3" ]; then P=$((P+1)); else F=$((F+1)); echo "FAIL: $1 (want=$2 got=$3)"; fi; }
+skip_chk(){ S=$((S+1)); echo "SKIP: $1 — $2"; }
+# DIVE-2703: --ask-rail delivers through the root-scoped `5dive agent _deliver`
+# grant (DIVE-1869's preflightDelivery). Mirrors src/council/cli.mjs's own
+# canDeliver(): root always delivers; otherwise ask sudo whether this caller may
+# run the grant, never prompts, fails closed. No grant here is not this e2e's
+# subject — do not touch the actual refusing-to-deliver behavior it guards.
+can_deliver(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] && return 0; sudo -n -l "$1" agent _deliver >/dev/null 2>&1; }
 
 # --- A) MOCK convene still works end-to-end through the bash route (offline, key-free) ---
 OUT="$(COUNCIL_MOCK=1 "$FIVE" council convene "Ship it?" --seats=a,b,c --mode=deliberate --json 2>/dev/null || true)"
@@ -75,11 +82,16 @@ if grep -q "^task add" "$FLOG"; then chk "default dispatch MINTS a ballot task (
 if grep -q "^agent ask" "$FLOG"; then chk "default dispatch does NOT use the agent-ask rail" "no" "yes"; else chk "default dispatch does NOT use the agent-ask rail" "no" "no"; fi
 
 # --- D) --ask-rail escape hatch uses the OLD agent-ask pane-scrape instead of a task ---
-: > "$FLOG"
-COUNCIL_5DIVE_BIN="$FAKE" "$FIVE" council convene "Ship it?" --seats=a,b,c --ask-rail --timeout=5 --json >/dev/null 2>&1 || true
-if grep -q "^agent ask" "$FLOG"; then chk "--ask-rail uses the agent-ask rail" "yes" "yes"; else chk "--ask-rail uses the agent-ask rail" "yes" "no"; fi
-if grep -q "^task add" "$FLOG"; then chk "--ask-rail does NOT mint a ballot task" "no" "yes"; else chk "--ask-rail does NOT mint a ballot task" "no" "no"; fi
+if can_deliver "$FAKE"; then
+  : > "$FLOG"
+  COUNCIL_5DIVE_BIN="$FAKE" "$FIVE" council convene "Ship it?" --seats=a,b,c --ask-rail --timeout=5 --json >/dev/null 2>&1 || true
+  if grep -q "^agent ask" "$FLOG"; then chk "--ask-rail uses the agent-ask rail" "yes" "yes"; else chk "--ask-rail uses the agent-ask rail" "yes" "no"; fi
+  if grep -q "^task add" "$FLOG"; then chk "--ask-rail does NOT mint a ballot task" "no" "yes"; else chk "--ask-rail does NOT mint a ballot task" "no" "no"; fi
+else
+  skip_chk "--ask-rail uses the agent-ask rail" "no _deliver grant reachable here (not root, no passwordless sudo for \`agent _deliver\`)"
+  skip_chk "--ask-rail does NOT mint a ballot task" "no _deliver grant reachable here (not root, no passwordless sudo for \`agent _deliver\`)"
+fi
 
-echo "CNCL-18 ballot E2E: $P passed, $F failed"
+echo "CNCL-18 ballot E2E: $P passed, $F failed, $S skipped"
 rc=0; [ "$F" -eq 0 ] || rc=1
 exit "$rc"

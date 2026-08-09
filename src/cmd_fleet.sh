@@ -60,7 +60,7 @@ fleet_write() {
 }
 
 cmd_fleet() {
-  [[ $# -gt 0 ]] || { _fleet_usage; exit "$E_USAGE"; }
+  [[ $# -gt 0 ]] || { _fleet_usage; mark_reported; exit "$E_USAGE"; }
   local sub="$1"; shift
   case "$sub" in
     add)            cmd_fleet_add "$@" ;;

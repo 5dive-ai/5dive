@@ -90,6 +90,173 @@ doctor_check_audit_drop_dir() {
     "$dir is a directory with mode 2770 and group $expected_group; lost audit rows can leave a drop marker"
 }
 
+# doctor_check_cli_freshness [installed-bin] [probe-output]
+#
+# DIVE-2640 (split of DIVE-2621 item a) — NOTHING ON THIS BOARD DISTINGUISHED
+# MERGED FROM INSTALLED. On 2026-08-03 four agents who did not know about each
+# other closed rows against `origin/main` while the artifact their readers
+# actually execute — `/usr/local/bin/5dive`, driven by cron every five minutes —
+# was a different, older bundle. See
+# community/wiki/merged-to-main-is-a-claim-about-the-authors-artifact-not-the-readers.md.
+# This is the per-host surface that answers, in one command, the question that
+# board had no way to ask: IS WHAT IS RUNNING WHAT WE MERGED?
+#
+# Three rows, because they are three different facts and collapsing them is how
+# the strong one gets read off the weak one:
+#
+#   cli-installed    what the binary IS   — path, the version it declares, mtime
+#   cli-freshness    is it BEHIND         — declared version vs the newest tag
+#                                           the installer would actually resolve
+#   cli-provenance   is that version TRUE — sha256 of the installed bytes vs the
+#                                           bundle published at that tag
+#
+# WHY PROVENANCE IS ITS OWN ROW AND NOT A DETAIL ON THE FRESHNESS ONE. A version
+# string is a claim a bundle makes about itself. `0.18.0+dive2563` satisfied a
+# "runtime reads 0.18.x" criterion while being hand-built, carrying unmerged
+# code, and missing two published releases — and `sort -V` ranks that suffix
+# ABOVE the plain tag, so it also disabled the self-update that would have
+# corrected it (see
+# community/wiki/a-hand-stamped-build-suffix-satisfies-a-version-criterion.md).
+# Byte identity against the bundle committed at the tag is what makes the version
+# a CONSEQUENCE of provenance instead of an assertion about it.
+#
+# TWO CONSTRAINTS FROM THE INCIDENT, both load-bearing:
+#
+#  1. NO SYMBOL GREPPING. It is tempting to answer "is the fix deployed" with
+#     `grep -c <function> /usr/local/bin/5dive`. A function present in a bundle
+#     is not a function that executed, and the identity check below is strictly
+#     stronger anyway: it grades ALL the bytes against a known published object
+#     rather than one string against an expectation. Where the evidence really is
+#     only presence, it gets labelled presence.
+#
+#  2. NO GREEN THE CHECK DID NOT EARN. Every way this can fail to run — no
+#     binary, an unreadable one, a bundle with no version line, no network, a
+#     tag that will not resolve — defaults to the empty, reassuring answer. Each
+#     one is filed as UNKNOWN at `warn`, never `ok`. A freshness check inherits
+#     its denominator from its own visibility
+#     (community/wiki/a-freshness-check-inherits-its-denominator-from-its-own-visibility.md),
+#     so the accepting evidence for this function is the STALE arm going red and
+#     each cannot-run arm reading UNKNOWN — a pass on a host that happens to be
+#     current is a non-vacuity control and never the result.
+#
+# Both parameters exist so the arms above can be MUTATED offline: $1 points the
+# check at a deliberately stale or unreadable bundle, $2 substitutes the probe's
+# four-line answer so no arm needs the network to be graded.
+doctor_check_cli_freshness() {
+  local bin="${1:-/usr/local/bin/5dive}"
+  local probe="${2-}"
+  local installed_ver="" mtime="" sha=""
+
+  # --- row 1: what IS installed -------------------------------------------
+  # `-e` then `-r`: absent and denied are different answers and only one of them
+  # is about this box being unprovisioned. Neither is "fine".
+  if [[ ! -e "$bin" ]]; then
+    doctor_add host cli-installed warn \
+      "UNKNOWN — no installed CLI at $bin; this host runs 5dive from somewhere else (or not at all), so nothing here can say what is running"
+    doctor_add host cli-freshness warn "UNKNOWN — no installed CLI at $bin to compare against the published release"
+    doctor_add host cli-provenance warn "UNKNOWN — no installed CLI at $bin to identify"
+    return 0
+  fi
+  if [[ ! -r "$bin" ]]; then
+    doctor_add host cli-installed warn \
+      "UNKNOWN — $bin exists but is not readable by $(id -un); an unreadable binary is a permission answer, not a freshness one"
+    doctor_add host cli-freshness warn "UNKNOWN — $bin is unreadable, so its version cannot be compared to the published release"
+    doctor_add host cli-provenance warn "UNKNOWN — $bin is unreadable, so its bytes cannot be identified"
+    return 0
+  fi
+
+  mtime=$(stat -c '%y' "$bin" 2>/dev/null | cut -d. -f1) || mtime=""
+  [[ -n "$mtime" ]] || mtime="unknown"
+  # The bundle's own declaration, read the same way _published_cli_probe reads
+  # the published one. This is a CLAIM until cli-provenance confirms it.
+  installed_ver=$(grep -m1 -oP '(?<=^readonly FIVE_VERSION=")[^"]+' "$bin" 2>/dev/null) || installed_ver=""
+  sha=$(sha256sum "$bin" 2>/dev/null | awk '{print $1}') || sha=""
+
+  if [[ -z "$installed_ver" ]]; then
+    doctor_add host cli-installed warn \
+      "UNKNOWN — $bin declares no FIVE_VERSION (mtime $mtime); a bundle that will not say what it is cannot be graded fresh"
+    doctor_add host cli-freshness warn "UNKNOWN — $bin declares no version to compare against the published release"
+    doctor_add host cli-provenance warn "UNKNOWN — $bin declares no version, so there is no claim to check its bytes against"
+    return 0
+  fi
+
+  doctor_add host cli-installed ok \
+    "$bin declares $installed_ver, mtime $mtime${sha:+, sha256 ${sha:0:12}} — this is the artifact cron and every agent on this host actually execute"
+
+  # --- the reference, resolved from the REMOTE ----------------------------
+  # Never from a local checkout: a reference that shares a failure mode with the
+  # population makes staleness self-cancelling, and the check is then most
+  # confidently green exactly when the box is most stale. _published_cli_probe
+  # mirrors install.sh's own tag resolution and fails CLOSED, which is why it is
+  # reused here instead of a second resolver that would drift from it.
+  [[ -n "$probe" ]] || probe=$(_published_cli_probe)
+  local -a p=()
+  mapfile -t p <<<"$probe"
+  local state="${p[0]:-unavailable}" latest="${p[1]:-}" detail="${p[2]:-no detail}" pubsha="${p[3]:-}"
+
+  if [[ "$state" != "consistent" || -z "$latest" ]]; then
+    doctor_add host cli-freshness warn \
+      "UNKNOWN — installed $installed_ver, but the newest published release could not be resolved ($state: $detail); this is not a statement that $installed_ver is current"
+    doctor_add host cli-provenance warn \
+      "UNKNOWN — no published bundle to identify $bin against ($state: $detail)"
+    return 0
+  fi
+
+  # --- row 2: is it BEHIND ------------------------------------------------
+  local age=""
+  [[ "$mtime" != "unknown" ]] && age=", installed bundle dated $mtime"
+  if version_lt "$installed_ver" "$latest"; then
+    doctor_add host cli-freshness error \
+      "STALE — this host runs $installed_ver but $latest is published$age; anything merged after $installed_ver is NOT running here, whatever the board says. Fix: sudo 5dive update"
+  elif version_lt "$latest" "$installed_ver"; then
+    # DIVE-2287: above the newest release is its own state, and it is the state
+    # DIVE-2243's monotonicity guard REFUSES every subsequent upgrade from — so
+    # this box will never self-correct back onto the release line.
+    doctor_add host cli-freshness warn \
+      "AHEAD — this host runs $installed_ver, above the newest published $latest$age; self-update refuses to move a box that is ahead, so it will not return to the release line on its own"
+  else
+    doctor_add host cli-freshness ok \
+      "installed $installed_ver matches the newest published release $latest (from $detail)$age"
+  fi
+
+  # --- row 3: is that version TRUE ----------------------------------------
+  #
+  # ANCESTRY IS A POSITIVE-ONLY ORACLE AND THIS ROW IS BUILT TO INHERIT THAT
+  # RATHER THAN FIGHT IT. Under squash merges a `git merge-base --is-ancestor`
+  # answers FALSE for reasons that have nothing to do with whether the work
+  # landed, because the squash rewrote the sha
+  # (community/wiki/ancestry-is-a-positive-only-oracle-under-squash-merges.md).
+  # Byte identity has the same asymmetry by construction: a MATCH proves the
+  # installed bundle is the published release, and a NON-MATCH proves nothing
+  # whatsoever. So the negative side is never rendered as "not merged" — it is
+  # rendered as UNPROVEN, with the reason. A doctor row that printed the strong
+  # negative would manufacture alarms about healthy boxes, which is the same
+  # class of false report this row exists to end, pointed the other way.
+  if [[ -z "$sha" || -z "$pubsha" ]]; then
+    doctor_add host cli-provenance warn \
+      "UNKNOWN — could not checksum both sides (installed ${sha:-unreadable}, published ${pubsha:-unavailable}), so $installed_ver stays an unverified claim"
+  elif [[ "$sha" == "$pubsha" ]]; then
+    # Two of the three legs of the identity, and the third is named rather than
+    # assumed. A release tag is cut from main, so byte-equality with the bundle
+    # committed at that tag is a positive answer to "does this correspond to a
+    # commit that is an ancestor of main" — for THIS tag only.
+    doctor_add host cli-provenance ok \
+      "$bin is byte-identical to the bundle published at $detail (sha256 ${sha:0:12}) — the release tag is cut from main, so what is running here IS what we merged as of $latest"
+  elif [[ "$installed_ver" == "$latest" ]]; then
+    # The hand-stamp shape, and the only case where differing bytes are a defect
+    # rather than an ordinary lag: the bundle CLAIMS the published version and is
+    # not the published object.
+    doctor_add host cli-provenance error \
+      "$bin declares $installed_ver — the newest published version — but its bytes differ from the bundle published at $detail (installed ${sha:0:12}, published ${pubsha:0:12}). This is a hand-built or locally-staged bundle wearing a release number; its version string corresponds to no published commit and reading it as 'we are on $latest' is exactly the substitution DIVE-2621 is about"
+  else
+    # Stale or ahead: differing bytes are EXPECTED, and the only published object
+    # we hold is the newest tag's. Say plainly that we cannot tell, rather than
+    # inferring ancestry from a version string.
+    doctor_add host cli-provenance warn \
+      "CANNOT TELL — $bin declares $installed_ver, which is not the newest published $latest, so its bytes have nothing to be compared against here. This identity is a POSITIVE-ONLY oracle: a match proves the installed build is what we merged, a non-match proves NOTHING, because a squash merge rewrites the sha and this check holds only the newest tag's bundle anyway. Read this as UNPROVEN, never as 'not merged' — a row that printed 'not merged' here would manufacture alarms about healthy boxes"
+  fi
+}
+
 # doctor_marketplace_reference_sha [remote-url] [branch]
 #
 # The PUBLISHED head of the plugin marketplace, read from the remote rather than
@@ -626,7 +793,7 @@ cmd_doctor() {
         # Look at the LAST occurrence of either event — agents may have
         # registered earlier then been told to skip, or vice versa.
         local last_event
-        last_event=$(sudo -u "$user" grep -E 'Channel notifications (registered|skipped|.*not on the approved channels allowlist)' "$latest" 2>/dev/null | tail -1)
+        last_event=$(sudo -u "$user" grep -E 'Channel notifications (registered|skipped|.*not on the approved channels allowlist)' "$latest" 2>/dev/null | tail -1) || last_event=""
         if [[ "$last_event" == *"not on the approved channels allowlist"* ]]; then
           doctor_add channels "agent:$name" error \
             "claude logged 'Channel notifications skipped' — likely on an Anthropic Teams org. Org admin must allowlist telegram@5dive-plugins via console. See: https://github.com/$(gh_org)/5dive-plugins#anthropic-teams-accounts" \
@@ -759,6 +926,11 @@ cmd_doctor() {
     # shape itself; testing a marker path for writability cannot distinguish a
     # missing parent (partial/hand-built provision) from an actual disk fault.
     doctor_check_audit_drop_dir
+
+    # DIVE-2640: is what is RUNNING on this host what we merged? Nothing else on
+    # the board distinguishes merged from installed, and a category that is
+    # dispatched nowhere is a check that never runs.
+    doctor_check_cli_freshness
 
     # --- disk headroom (DIVE-1966/1967) ---
     #

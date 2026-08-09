@@ -3,12 +3,26 @@
 # budget: the tier resolver (tests/lib/tier.sh) and the budgeted runner
 # (scripts/run-harnesses.sh).
 #
-# WHY THIS FILE IS ITSELF SMALL AND FAST, and says so. It is a harness added by the
-# row whose whole subject is that harnesses are added faster than they are retired.
-# The honest version of that is not to skip the coverage — it is to pay the budget
-# it enforces. Throwaway corpus of three one-line harnesses, no sleeps longer than
-# the assertion needs, and every arm below is one this mechanism can actually get
-# wrong.
+# TIER: nightly — 41.4s measured (GitHub Actions ubuntu-latest, core/pristine job,
+# run 30988600395, 2026-08-05). This is a META-harness: it grades the tier resolver
+# and the budgeted runner, so NO product path a customer reaches runs through it —
+# the standard nightly criterion. It costs 14% of the 300s core budget it is itself
+# grading, which makes it the strongest nightly candidate in the corpus on its own
+# merits. CLAUDE.md ranks merge and retire ahead of demotion and neither applies: it
+# has no sibling to fold into, and the mechanism it guards is live. A regression in
+# the runner is now caught within 24h instead of per-PR; that latency is acceptable
+# because the runner FAILS LOUD (exit 4 with numbers), so a break announces itself
+# rather than passing silently. If it ever starts failing OPEN, revisit this first.
+# Decision: main, 2026-08-05.
+#
+# THE "SMALL AND FAST" CLAIM THIS HEADER USED TO MAKE IS RETIRED, not quietly
+# dropped. It read: "WHY THIS FILE IS ITSELF SMALL AND FAST, and says so ... the
+# honest version is not to skip the coverage, it is to pay the budget it enforces."
+# That was true when written and is now false — at 41.4s this file is the SLOWEST in
+# core. Leaving it standing two lines above a nightly marker would be exactly the
+# stale unverified number this harness exists to catch (see the DIVE-2555 arms
+# below, which grade a demotion's claim against the clock). The coverage is still
+# paid for; it is paid nightly.
 #
 # THE ARMS, and the mutation each one would catch:
 #   1-3   default is core; an explicit `# TIER: core` is legal; a marker below the
@@ -25,6 +39,16 @@
 #         exits 1 even when also over budget (the failure is what you fix first);
 #         an empty selection is exit 1, never a green run over nothing; the report
 #         carries the wall-clock header the nightly summary reads.
+#  31-41 DIVE-2592: an over-budget run RE-TIMES its slowest files and keeps the
+#         smaller sample, so a red that flips on a re-run of the same commit cannot
+#         reach a PR author. Paired arms: the rescue, the corpus that is over on
+#         BOTH samples anyway, and --confirm-top=0 (an override may only make the
+#         control stricter). Plus: the red says NO TEST FAILED and names the set
+#         that COVERS the overage, min-of-two never RAISES a total, a re-run
+#         failure keeps its pass, and no workflow passes the new flag. The CONTROL
+#         olivia asked for: same flapping harness, one real harness added between
+#         two runs — the min rescues the first and reds the second, so it removes
+#         weather and not cost, measured rather than argued.
 #  13-14  the over-budget message actually names a remedy and the slowest file —
 #         a budget that reds without saying what to retire is a warning with a
 #         worse exit code (feedback: grade the REMEDY half, not only the predicate).
@@ -36,12 +60,12 @@ set -uo pipefail
 # `set -e` harness is not killed by a failed source.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 
 TIER_LIB="tests/lib/tier.sh"
 RUNNER="scripts/run-harnesses.sh"
 TMP="$(mktemp -d /tmp/corpus-tier-budget.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 pass=0; fail=0
 ok()  { pass=$((pass+1)); printf 'ok   %s\n' "$1"; }
@@ -126,7 +150,7 @@ mk slow_one.sh '#!/usr/bin/env bash
 sleep 1.2
 exit 0'
 
-run() { OUT="$(bash "$RUNNER" --corpus-dir="$TMP" "$@" 2>&1)"; RC=$?; }
+run() { OUT="$(bash "$RUNNER" --no-calibrate --corpus-dir="$TMP" "$@" 2>&1)"; RC=$?; }
 
 run --tier=core --budget=1 --label=t
 want "over budget exits 4 (not 1 — a slow suite is not a broken one)" "4" "$RC"
@@ -170,7 +194,7 @@ fi
 # loudly, having graded nothing (the grade-release-commit.sh lesson).
 mkdir -p "$TMP/empty"
 run --tier=core --budget=600 --corpus-dir="$TMP/empty" 2>/dev/null || true
-OUT="$(bash "$RUNNER" --tier=core --budget=600 --corpus-dir="$TMP/empty" 2>&1)"; RC=$?
+OUT="$(bash "$RUNNER" --no-calibrate --tier=core --budget=600 --corpus-dir="$TMP/empty" 2>&1)"; RC=$?
 if (( RC == 1 )) && [[ "$OUT" == *"not a green one"* ]]; then
   ok "an empty corpus FAILS rather than passing over nothing"
 else
@@ -232,7 +256,7 @@ done
 rm -f "$TMP"/*.sh
 for i in 1 2 3 4 5 6 7; do mk "s$i.sh" '#!/usr/bin/env bash
 exit 0'; done
-ran() { bash "$RUNNER" --corpus-dir="$TMP" --tier=full --budget=600 "$@" 2>&1 \
+ran() { bash "$RUNNER" --no-calibrate --corpus-dir="$TMP" --tier=full --budget=600 "$@" 2>&1 \
           | sed -n 's|^=== .*/||p' | sort; }
 u="$(for i in 1 2 3; do ran --shard=$i/3; done | sort)"
 flat() { tr '\n' ' ' | sed 's/ *$//'; }
@@ -246,13 +270,13 @@ want "no harness runs twice across the shards" \
 want "shard 1 of 3 takes every third harness, not the first third" \
   "s1.sh s4.sh s7.sh" "$(ran --shard=1/3 | tr '\n' ' ' | sed 's/ $//')"
 
-OUT="$(bash "$RUNNER" --corpus-dir="$TMP" --tier=full --shard=4/3 2>&1)"; RC=$?
+OUT="$(bash "$RUNNER" --no-calibrate --corpus-dir="$TMP" --tier=full --shard=4/3 2>&1)"; RC=$?
 if (( RC == 2 )) && [[ "$OUT" == *"out of range"* ]]; then
   ok "an out-of-range shard REFUSES"
 else bad "an out-of-range shard REFUSES" "rc=$RC out=$OUT"; fi
 
 # 9 shards over 7 files: shard 8 selects nothing. Green-over-nothing, per shard.
-OUT="$(bash "$RUNNER" --corpus-dir="$TMP" --tier=full --shard=8/9 2>&1)"; RC=$?
+OUT="$(bash "$RUNNER" --no-calibrate --corpus-dir="$TMP" --tier=full --shard=8/9 2>&1)"; RC=$?
 if (( RC == 1 )) && [[ "$OUT" == *"selected 0 harnesses"* ]]; then
   ok "a shard that selects nothing FAILS rather than reporting green over nothing"
 else bad "a shard that selects nothing FAILS rather than reporting green over nothing" "rc=$RC out=$OUT"; fi
@@ -467,6 +491,632 @@ STUBEOF
   else bad "the killed mutant is absent from the union's probed set, so coverage is not banked" "$(cat "$TMP/probe-kill.txt" 2>&1)"; fi
 else
   bad "probe mutant-kill arms" "NOT REACHED: could not symlink $PROBE into $FAKE — arms 27-30 graded nothing"
+fi
+
+# ------------------------------------- 31-41 DIVE-2592: A BUDGET RED CONFIRMS ITSELF
+# The measurement that forced this: PR #395 red at 356s and green at 289s on the SAME
+# commit, no rebase — a 67s swing, all of it inside one network-priced harness. A cap
+# compared against ONE noisy sample reds PRs on content they did not change, so an
+# over-budget run now re-times its slowest files and keeps the SMALLER sample per file.
+#
+# Every arm below is one this mechanism can get wrong, and they are deliberately
+# PAIRED: a rescue arm alone is satisfied by "confirmation always rescues", which is
+# the budget silently switched off. Sleeps are 1.2s against a 1s budget — the smallest
+# pair the runner's second-resolution clock can tell apart — because this file is
+# itself charged to the tier it enforces.
+rm -f "$TMP"/*.sh "$TMP"/*.seen
+# Slow once, then free: the shape of a harness whose cost was the runner, not itself.
+cat > "$TMP/flaps.sh" <<'FLAPS'
+#!/usr/bin/env bash
+[[ -e "$0.seen" ]] && exit 0
+touch "$0.seen"; sleep 1.2; exit 0
+FLAPS
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/tiny.sh"
+
+C1="$(bash "$RUNNER" --no-calibrate --corpus-dir="$TMP" --tier=full --budget=1 --label=t 2>&1)"; RC1=$?
+if (( RC1 == 0 )); then
+  ok "a run OVER on its first sample and INSIDE on its second exits 0"
+else bad "a run OVER on its first sample and INSIDE on its second exits 0" "rc=$RC1"; fi
+# A rescue that prints nothing is a budget that relaxed itself in silence. Both
+# numbers, or the trend this row exists to keep legible is gone on exactly the runs
+# where it moved.
+if [[ "$C1" == *"BUDGET CONFIRMATION"* && "$C1" == *"first sample"* && "$C1" == *"confirmed"* ]]; then
+  ok "the rescue SAYS SO, with both the first and the confirmed number"
+else bad "the rescue SAYS SO, with both the first and the confirmed number" "$C1"; fi
+if [[ "$C1" == *"flaps.sh"* && "$C1" == *"->"* ]]; then
+  ok "the rescue NAMES the harness whose timing swung"
+else bad "the rescue NAMES the harness whose timing swung" "$C1"; fi
+
+# NON-VACUITY. Same runner, same budget, a corpus that is over on BOTH samples: if
+# this passed too, the arm above would be measuring nothing but the retry existing.
+# Slow EVERY time: the shape of a corpus that genuinely does not fit its cap.
+rm -f "$TMP"/*.seen "$TMP/flaps.sh"
+printf '#!/usr/bin/env bash\nsleep 1.2\nexit 0\n' > "$TMP/always.sh"
+C2="$(bash "$RUNNER" --no-calibrate --corpus-dir="$TMP" --tier=full --budget=1 --label=t 2>&1)"; RC2=$?
+want "a corpus that is over on BOTH samples still exits 4" "4" "$RC2"
+if [[ "$C2" == *"NO TEST FAILED"* && "$C2" == *"BUDGET failure"* ]]; then
+  ok "the budget red says NO TEST FAILED — the sentence exit 4 alone does not carry"
+else bad "the budget red says NO TEST FAILED — the sentence exit 4 alone does not carry" "$C2"; fi
+if [[ "$C2" == *"cover it"* && "$C2" == *"always.sh"* ]]; then
+  ok "the budget red names the smallest set of harnesses that COVERS the overage"
+else bad "the budget red names the smallest set of harnesses that COVERS the overage" "$C2"; fi
+
+# DIVE-2801: OVER BUDGET **AND** RED. The arm above is the no-failures case; this is
+# its pair. The banner used to assert "NO TEST FAILED" unconditionally inside the
+# over-budget branch while computing "N of M" from the very `failed` array that
+# contradicts it — a real run printed "NO TEST FAILED — 241 of 243 harnesses
+# passed". That is a verdict the printer did not compute, in the output whose only
+# job is to say what the red IS, and it is the same defect this row exists to fix.
+# Both facts are true here and the reader needs both plus which exit wins.
+rm -f "$TMP"/*.seen
+printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/broken.sh"
+C3="$(bash "$RUNNER" --no-calibrate --corpus-dir="$TMP" --tier=full --budget=1 --label=t 2>&1)"; RC3=$?
+want "over budget AND a failing harness exits 1 (the failure wins, not 4)" "1" "$RC3"
+if [[ "$C3" != *"NO TEST FAILED"* ]]; then
+  ok "an over-budget run WITH failures does not claim NO TEST FAILED (DIVE-2801)"
+else bad "an over-budget run WITH failures still claims NO TEST FAILED (DIVE-2801)" "$C3"; fi
+if [[ "$C3" == *"ALSO FAILED"* && "$C3" == *"BOTH over budget AND red"* && "$C3" == *"exits 1, not 4"* ]]; then
+  ok "the both-red banner states both facts and which exit code wins (DIVE-2801)"
+else bad "the both-red banner states both facts and which exit code wins (DIVE-2801)" "$C3"; fi
+rm -f "$TMP/broken.sh"
+
+# --confirm-top may only make this gate STRICTER. The rescued corpus, confirmation
+# off, must red — an override that can turn a red green is the hatch, not the control.
+cat > "$TMP/flaps.sh" <<'FLAPS'
+#!/usr/bin/env bash
+[[ -e "$0.seen" ]] && exit 0
+touch "$0.seen"; sleep 1.2; exit 0
+FLAPS
+rm -f "$TMP/always.sh" "$TMP"/*.seen
+bash "$RUNNER" --no-calibrate --corpus-dir="$TMP" --tier=full --budget=1 --label=t --confirm-top=0 >/dev/null 2>&1
+want "--confirm-top=0 reds the SAME corpus the confirmation rescues (stricter, never looser)" "4" "$?"
+
+# MIN OF TWO NEVER RAISES A TIMING. A harness slower on its re-run keeps its first
+# sample: a confirmation that could INVENT a red is a second, worse coin flip.
+rm -f "$TMP"/*.sh "$TMP"/*.seen
+cat > "$TMP/rev.sh" <<'REV'
+#!/usr/bin/env bash
+[[ -e "$0.seen" ]] || { touch "$0.seen"; exit 0; }
+sleep 1.2; exit 0
+REV
+printf '#!/usr/bin/env bash\nsleep 1.2\nexit 0\n' > "$TMP/always.sh"
+C3="$(bash "$RUNNER" --no-calibrate --corpus-dir="$TMP" --tier=full --budget=1 --label=t 2>&1)"
+f3="$(sed -n 's/.*first sample \([0-9]*\)s.*/\1/p' <<<"$C3" | head -1)"
+c3="$(sed -n 's/.*confirmed \([0-9]*\)s.*/\1/p' <<<"$C3" | head -1)"
+if [[ -n "$f3" && -n "$c3" ]] && (( c3 <= f3 )); then
+  ok "a harness SLOWER on its re-run keeps its first sample (confirmation never raises a total)"
+else bad "a harness SLOWER on its re-run keeps its first sample (confirmation never raises a total)" "first=[$f3] confirmed=[$c3]"; fi
+
+# A harness that FAILS its re-run keeps its PASS. The graded run is the first one, and
+# flipping a pass to a fail on a second sample is this same one-sample error inverted —
+# but the non-determinism is reported, not swallowed.
+rm -f "$TMP"/*.sh "$TMP"/*.seen
+cat > "$TMP/flake.sh" <<'FLK'
+#!/usr/bin/env bash
+[[ -e "$0.seen" ]] && exit 1
+touch "$0.seen"; sleep 1.2; exit 0
+FLK
+C4="$(bash "$RUNNER" --no-calibrate --corpus-dir="$TMP" --tier=full --budget=1 --label=t 2>&1)"; RC4=$?
+if (( RC4 == 4 )) && [[ "$C4" == *"RE-RUN DISAGREED (observed)"* && "$C4" == *"flake.sh"* ]]; then
+  ok "a harness that fails its RE-RUN keeps its pass (exit 4, not 1) and the disagreement is reported"
+else bad "a harness that fails its RE-RUN keeps its pass (exit 4, not 1) and the disagreement is reported" "rc=$RC4 out=$C4"; fi
+# olivia, DIVE-2592: the observation and the CAUSE are different claims, and a guess
+# printed among measured sentences inherits their authority. The hedge lives in the
+# string, which is read forever, not only in the handoff, which is read once — so it
+# is graded here rather than trusted.
+if [[ "$C4" == *"CAUSE NOT MEASURED (inferred)"* ]]; then
+  ok "the re-run disagreement marks its CAUSE as inferred, in the output string itself"
+else bad "the re-run disagreement marks its CAUSE as inferred, in the output string itself" "$C4"; fi
+
+# CONTROL (olivia, grading DIVE-2592): DOES THE MIN STILL SEE GROWTH?
+# The whole defence of min-of-two is that it removes WEATHER and keeps GROWTH — and
+# that was an argument, not a measurement, which is exactly the kind of claim this
+# corpus is supposed to refuse. So measure it, differentially: the SAME flapping
+# harness in both runs, one harness of real cost ADDED between them, nothing else
+# changed. If the min hid growth, the grown corpus would be rescued too.
+rm -f "$TMP"/*.sh "$TMP"/*.seen
+cat > "$TMP/flaps.sh" <<'FLAPS'
+#!/usr/bin/env bash
+[[ -e "$0.seen" ]] && exit 0
+touch "$0.seen"; sleep 1.2; exit 0
+FLAPS
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/tiny.sh"
+G1="$(bash "$RUNNER" --no-calibrate --corpus-dir="$TMP" --tier=full --budget=1 --label=t 2>&1)"; GRC1=$?
+g1="$(sed -n 's/.*confirmed \([0-9]*\)s.*/\1/p' <<<"$G1" | head -1)"
+# GROW IT: one more harness that costs its time every single run.
+rm -f "$TMP"/*.seen
+printf '#!/usr/bin/env bash\nsleep 1.2\nexit 0\n' > "$TMP/grew.sh"
+G2="$(bash "$RUNNER" --no-calibrate --corpus-dir="$TMP" --tier=full --budget=1 --label=t 2>&1)"; GRC2=$?
+g2="$(sed -n 's/.*confirmed \([0-9]*\)s.*/\1/p' <<<"$G2" | head -1)"
+if (( GRC1 == 0 && GRC2 == 4 )); then
+  ok "GROWTH SURVIVES THE MIN: the confirmation that rescues the flapping corpus does NOT rescue it once one real harness is added"
+else bad "GROWTH SURVIVES THE MIN: the confirmation that rescues the flapping corpus does NOT rescue it once one real harness is added" "rc1=$GRC1 rc2=$GRC2"; fi
+# And the growth is VISIBLE IN THE CONFIRMED NUMBER, not only in the exit code — a
+# min that reported a flat total while reddening would be measuring something else.
+if [[ -n "$g1" && -n "$g2" ]] && (( g2 > g1 )); then
+  ok "the CONFIRMED total rises with the added harness (${g1}s -> ${g2}s): the min removes weather, not cost"
+else bad "the CONFIRMED total rises with the added harness: the min removes weather, not cost" "g1=[$g1] g2=[$g2]"; fi
+# Non-vacuity for the pair above: the second run must have actually RUN the
+# confirmation and reclaimed the flap, or "it went red" proves only that nothing
+# confirmed anything.
+if [[ "$G2" == *"BUDGET CONFIRMATION"* && "$G2" == *"flaps.sh"* ]]; then
+  ok "the grown corpus DID confirm and DID reclaim the flap, and reds anyway"
+else bad "the grown corpus DID confirm and DID reclaim the flap, and reds anyway" "$G2"; fi
+
+# The hatch arm the --budget flag never got (community/wiki/a-budget-with-a-free-
+# escape-hatch-is-a-second-budget-nobody-watches.md): enumerate the hatches from the
+# RUNNER'S FLAG SURFACE, not from the policy. --confirm-top is safe only while no job
+# passes it, and "no job does today" is not a control until something pins it.
+rm -f "$TMP"/*.sh "$TMP"/*.seen
+if grep -rn -- '--confirm-top' .github/workflows/ >/dev/null 2>&1; then
+  bad "no CI workflow passes --confirm-top" "$(grep -rn -- '--confirm-top' .github/workflows/)"
+else ok "no CI workflow passes --confirm-top"; fi
+
+# --- DIVE-2667: the tier must run often enough to ATTRIBUTE a break ------------
+# The nightly was red on main for ~17h across ~12 commits because full-sweep ran
+# once a day and is not in the per-PR check set. Two properties are pinned here,
+# and they only mean something together: `push: main` is what makes the sweep
+# frequent enough to name one merge, and `cancel-in-progress` is what makes that
+# frequency affordable. Ship one without the other and the next person deletes it.
+#
+# Graded by PARSING the workflow, not by grepping it. A `grep 'push:'` matches the
+# word inside any of this file's own comments, and would have passed against the
+# unchanged file. Note the YAML 1.1 gotcha the parse has to survive: the `on:` key
+# loads as the BOOLEAN True, not the string 'on'.
+_wf_on() {  # <file> -> the on: keys, one per line
+  python3 - "$1" <<'PY' 2>/dev/null
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+on = d.get(True, d.get('on', {})) or {}
+print('\n'.join(sorted(on)) if isinstance(on, dict) else '')
+PY
+}
+_wf_push_branches() {
+  python3 - "$1" <<'PY' 2>/dev/null
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+on = d.get(True, d.get('on', {})) or {}
+p = (on.get('push') or {}) if isinstance(on, dict) else {}
+print(' '.join(p.get('branches', []) or []))
+PY
+}
+SWEEP=.github/workflows/full-sweep.yml
+SWEEP_ON="$(_wf_on "$SWEEP")"
+# Liveness first: a parser that returns nothing makes every membership test below
+# vacuously... false, which is the safe direction, but says the wrong thing about WHY.
+if [[ -n "$SWEEP_ON" ]] && grep -qx 'schedule' <<<"$SWEEP_ON"; then
+  ok "full-sweep's on: block PARSES and still carries the nightly schedule"
+else bad "full-sweep's on: block PARSES and still carries the nightly schedule" "on=[$SWEEP_ON]"; fi
+if grep -qx 'push' <<<"$SWEEP_ON" && [[ " $(_wf_push_branches "$SWEEP") " == *" main "* ]]; then
+  ok "full-sweep runs on PUSH TO MAIN: a break is attributable to one merge, not to a day's window (DIVE-2667)"
+else bad "full-sweep runs on PUSH TO MAIN: a break is attributable to one merge, not to a day's window (DIVE-2667)" \
+       "on=[$(tr '\n' ',' <<<"$SWEEP_ON")] branches=[$(_wf_push_branches "$SWEEP")]"; fi
+# The parser is discriminating, not just permissive: a trigger this workflow does
+# NOT declare must come back absent from the same call that reported push present.
+if ! grep -qx 'release' <<<"$SWEEP_ON"; then
+  ok "the same parse reports an ABSENT trigger as absent (the membership test discriminates)"
+else bad "the same parse reports an ABSENT trigger as absent (the membership test discriminates)" "on=[$SWEEP_ON]"; fi
+# Cost bound. Without cancel-in-progress, push-on-main is 6 jobs per merge with no
+# collapse, and the first person to read the bill deletes the trigger this row added.
+if python3 - "$SWEEP" <<'PY' 2>/dev/null
+import sys, yaml
+c = (yaml.safe_load(open(sys.argv[1])) or {}).get('concurrency') or {}
+sys.exit(0 if isinstance(c, dict) and c.get('cancel-in-progress') is True and 'github.ref' in str(c.get('group','')) else 1)
+PY
+then
+  ok "the push trigger is cost-bounded: concurrency cancels in progress, grouped per REF so a PR sweep is not cancelled by a merge"
+else bad "the push trigger is cost-bounded: concurrency cancels in progress, grouped per REF so a PR sweep is not cancelled by a merge" \
+       "$(grep -A3 '^concurrency:' "$SWEEP" 2>&1)"; fi
+# Anchor: the neighbour workflow must NOT satisfy the same assertion, or "full-sweep
+# has push: main" is a claim about every workflow in the directory and grades nothing.
+if ! grep -qx 'schedule' <<<"$(_wf_on .github/workflows/unit-tests.yml)"; then
+  ok "ANCHOR: the neighbour (unit-tests.yml) parses to a DIFFERENT trigger set — the assertions above are about this file"
+else bad "ANCHOR: the neighbour (unit-tests.yml) parses to a DIFFERENT trigger set" "unit-tests on=[$(tr '\n' ',' <<<"$(_wf_on .github/workflows/unit-tests.yml)")]"; fi
+
+# ------------------------------ 42-58 DIVE-2728: THE BUDGET IS SPENT IN A RELATIVE UNIT
+# The measurement that forced this: PR #461 red at 322s/300s with 234 of 234 harnesses
+# passing and a diff worth +0.1s, while unrelated files ran 10-36% slower and the one
+# file the diff touched moved +0.3%. The cap had stopped measuring the corpus and
+# started measuring the runner. So the budget is now spent in units of a calibration
+# workload carried in the same job, and a uniformly slow VM scales both sides.
+#
+# EVERY TIMING ARM BELOW IS DRIVEN THROUGH --corpus-dir WITH DURATIONS THIS FILE WROTE
+# AND A CALIBRATION IT INJECTED (--cal-us). A test that MEASURES its own inputs grades
+# the runner it happens to be sitting on, which is the exact defect under repair
+# (DIVE-2555 §4) — and on a mechanism whose subject IS runner variance, that is not a
+# stylistic preference, it is the difference between an assertion and a coin flip.
+#
+# WHY THESE ARMS LIVE IN THIS FILE and not a new one: the runner's own over-budget
+# advice says MERGE BY SUBJECT before adding, and the subject here is identical. They
+# cost this file ~6s of sleeps, which it pays out of the tier it enforces. They cannot
+# be cheaper: the smallest budget the runner accepts is 1s, so an arm that must be OVER
+# a cap must burn more than a second of real clock (feedback: say what a cost buys, in
+# the file that pays it).
+#
+# THE PAIRING RULE FROM THE 2592 ARMS APPLIES DOUBLY HERE. Arms that assert a RED fail
+# quietly: a harness that reds for the WRONG REASON still reads green to the grader. So
+# every red arm below is paired with the run that must NOT red, differing in exactly one
+# input — and the pair is the assertion, not either half.
+rm -f "$TMP"/*.sh "$TMP"/*.seen
+
+# ---- 42-45 the arithmetic, graded on its own before any clock is involved
+want "scale is measured/baseline as a percent" "140" "$(tier_cal_scale_pct 140000 100000)"
+want "a faster runner reads BELOW 100%" "50" "$(tier_cal_scale_pct 50000 100000)"
+# The clamp is the escape-hatch guard (trap 2) and the never-tighten call (the open
+# question in DIVE-2710 §2.2, decided at 1.0 here). Both directions, or "clamp" is a
+# word in a comment.
+want "the clamp CEILING bounds how much a slow runner may buy" \
+  "$TIER_CAL_SCALE_MAX_PCT" "$(tier_cal_clamp_pct 400)"
+want "the clamp FLOOR means a fast runner never TIGHTENS the agreed cap" \
+  "$TIER_CAL_SCALE_MIN_PCT" "$(tier_cal_clamp_pct 50)"
+
+# ---- 46-48 ARM 1: A UNIFORMLY SLOW VM DOES NOT MOVE THE VERDICT
+# Three runs, one input changing at a time. 0.8s of corpus against a 1s cap passes.
+# The same corpus 1.4x slower, on a runner measured 1.4x slow, must STILL pass — that
+# is the whole claim. And the CONTROL: that same slow corpus on a runner measured
+# NORMAL must go RED, or the arm above is satisfied by a cap that simply got bigger.
+relrun() { OUT="$(bash "$RUNNER" --corpus-dir="$TMP" --tier=full --label=t \
+  --cal-baseline-us=100000 "$@" 2>&1)"; RC=$?; }
+
+printf '#!/usr/bin/env bash\nsleep 0.8\nexit 0\n' > "$TMP/w.sh"
+relrun --budget=1 --cal-us=100000
+want "a normal corpus on a normal runner passes" "0" "$RC"
+
+printf '#!/usr/bin/env bash\nsleep 1.12\nexit 0\n' > "$TMP/w.sh"
+relrun --budget=1 --cal-us=140000 --confirm-top=0
+want "ARM 1: the SAME corpus 1.4x slower, on a runner measured 1.4x slow, still passes" "0" "$RC"
+if [[ "$OUT" == *"140%"* && "$OUT" == *"effective cap"* ]]; then
+  ok "the run SHOWS its scale and its effective cap, so the reader can tell VM from corpus"
+else bad "the run SHOWS its scale and its effective cap" "$OUT"; fi
+
+relrun --budget=1 --cal-us=100000 --confirm-top=0
+want "CONTROL: that same slow corpus on a NORMAL runner reds — the pass above came from the calibration, not from slack" \
+  "4" "$RC"
+
+# ---- 49-50 ARM 2: THE RATCHET SURVIVES. Growth still reds, even with the allowance.
+# This is the arm that proves the fix did not become the hatch: a corpus that outgrows
+# its cap by MORE than the clamp forgives reds on a slow runner exactly as it would on
+# a fast one. Without it, "scale the cap" is indistinguishable from "raise the cap".
+printf '#!/usr/bin/env bash\nsleep 1.6\nexit 0\n' > "$TMP/w.sh"
+relrun --budget=1 --cal-us=140000 --confirm-top=0
+want "ARM 2: corpus growth beyond what the clamp forgives still exits 4 on a slow runner" "4" "$RC"
+if [[ "$OUT" == *"held to is"* && "$OUT" == *"EVEN WITH that allowance"* ]]; then
+  ok "the red states the cap it was ACTUALLY graded against — 'over by Ns' against an unstated cap is how a slow runner gets blamed on a diff"
+else bad "the red states the cap it was ACTUALLY graded against" "$OUT"; fi
+
+# ---- 51-53 ARM 3: PAST THE CLAMP THE RUN IS UNDETERMINED, NEVER GREEN
+# Trap 2, enforced. An unclamped scale factor licenses an arbitrarily larger corpus, so
+# past the ceiling the runner refuses to grade rather than generously passing. Exit 6,
+# and the pair below is what makes this an assertion: the SAME under-cap corpus one
+# notch inside the clamp exits 0, so the 6 is the clamp and not the corpus.
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/w.sh"
+relrun --budget=1 --cal-us=200000
+want "ARM 3: a runner past the clamp is UNDETERMINED (exit 6), not green" "6" "$RC"
+if [[ "$OUT" == *"UNDETERMINED"* && "$OUT" != *"OVER BUDGET"* ]]; then
+  ok "the undetermined run does NOT claim the corpus is over — those are different events and DIVE-2667 was them sharing a red"
+else bad "the undetermined run does NOT claim the corpus is over" "$OUT"; fi
+relrun --budget=1 --cal-us=140000
+want "PAIR: the same corpus one notch INSIDE the clamp exits 0 — the 6 above is the clamp, not the corpus" "0" "$RC"
+
+# ---- 54-56 ARM 4: A CALIBRATION THAT CANNOT BE TAKEN FAILS CLOSED
+# The lazy version of this line is "calibration unavailable, falling back to the raw
+# cap", which is the free escape hatch DIVE-2525 closed wearing a new name. A probe
+# that cannot run means the budget was not graded, and not-graded is not passed.
+OUT="$(bash "$RUNNER" --corpus-dir="$TMP" --tier=full --budget=1 --label=t \
+  --cal-cli=/nonexistent/5dive 2>&1)"; RC=$?
+want "ARM 4: a calibration that cannot run FAILS CLOSED (exit 6)" "6" "$RC"
+if [[ "$OUT" == *"UNDETERMINED"* && "$OUT" != *"BUDGET DISABLED"* ]]; then
+  ok "a missing probe is UNDETERMINED, never 'budget disabled' — the difference is whether the gate still exists"
+else bad "a missing probe is UNDETERMINED, never 'budget disabled'" "$OUT"; fi
+# ...but a genuinely BROKEN harness still dominates. An unmeasurable runner must never
+# hide a failing test, which is why the undetermined verdict is resolved at the exit
+# ladder rather than short-circuiting before the corpus ever ran.
+printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/broken.sh"
+bash "$RUNNER" --corpus-dir="$TMP" --tier=full --budget=1 --label=t \
+  --cal-cli=/nonexistent/5dive >/dev/null 2>&1; RC=$?
+want "a FAILING harness still exits 1 even when the runner could not be measured" "1" "$RC"
+rm -f "$TMP/broken.sh"
+
+# ---- 57 ARM 5: DIVE-2592's CONFIRMATION STILL FIRES, and now against the SCALED cap
+# The two mechanisms are complementary, not alternatives (olivia, DIVE-2710): the
+# confirmation covers the CONCENTRATED outlier, the relative budget covers the UNIFORM
+# slowdown. This arm is what stops the second quietly disabling the first.
+rm -f "$TMP"/*.sh "$TMP"/*.seen
+cat > "$TMP/flaps.sh" <<'FLAPS'
+#!/usr/bin/env bash
+[[ -e "$0.seen" ]] && exit 0
+touch "$0.seen"; sleep 1.5; exit 0
+FLAPS
+relrun --budget=1 --cal-us=140000
+if (( RC == 0 )) && [[ "$OUT" == *"BUDGET CONFIRMATION"* && "$OUT" == *"flaps.sh"* ]]; then
+  ok "ARM 5: a concentrated outlier is still re-timed and still rescued, against the EFFECTIVE cap"
+else bad "ARM 5: a concentrated outlier is still re-timed and still rescued" "rc=$RC $OUT"; fi
+
+# ---- 58-59 the report, and the flags no workflow may carry
+rm -f "$TMP"/*.sh "$TMP"/*.seen
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/w.sh"
+bash "$RUNNER" --corpus-dir="$TMP" --tier=full --budget=1 --label=t \
+  --cal-baseline-us=100000 --cal-us=120000 --report="$TMP/rep.txt" >/dev/null 2>&1
+_miss=""
+for f in cal_status cal_us_per_iter cal_baseline_us_per_iter cal_scale_pct \
+         cal_scale_pct_applied effective_budget_s pct_of_effective_budget undetermined \
+         wall_clock_s budget_s pct_of_budget; do
+  grep -q "^# $f=" "$TMP/rep.txt" || _miss="$_miss $f"
+done
+if [[ -z "$_miss" ]]; then
+  ok "the report carries the calibration fields AND still carries wall_clock_s/budget_s/pct_of_budget under their old names (every trend reader parses by name)"
+else bad "the report carries the calibration fields beside the originals" "missing:$_miss"; fi
+
+# Same rule as --budget and --confirm-top: the policy lives beside the tier definition,
+# not scattered across callers. A workflow that injected its own calibration would be
+# choosing its own cap in a YAML nobody reviews as a policy change.
+_wfcal="$(grep -rn -- '--cal-us=\|--cal-baseline-us=\|--cal-cli=' .github/workflows/ 2>/dev/null || true)"
+if [[ -z "$_wfcal" ]]; then
+  ok "NO workflow injects a calibration — the seam is for this harness and for a human measuring, never for a caller picking its own cap"
+else bad "NO workflow injects a calibration" "$_wfcal"; fi
+
+# ---- 60 the precondition this row MADE load-bearing
+# Before DIVE-2728 a job that forgot ./build.sh ran the corpus anyway (some earlier
+# harness builds the bundle as a side effect — the ordering accident unit-tests.yml
+# already documents at its own build step). Now the calibration probe SPAWNS that
+# bundle, and a missing one fails closed at exit 6. Fail-closed is correct and it also
+# means a mis-ordered workflow reds the whole sweep for a reason whose message is
+# about calibration, not about YAML. So the ordering gets an assertion.
+#
+# WHAT THIS CHECKS AND WHAT IT DOES NOT: step INDEX within the SAME JOB, parsed, not
+# grepped — a file-wide "both strings appear" test would pass a workflow where the two
+# live in different jobs, which is precisely the arrangement that breaks. It does not
+# follow composite actions or `uses:` steps that might build; if one is ever added,
+# this arm will complain and the fix is to teach it, not to delete it.
+_ord="$(python3 - <<'PY' 2>&1
+import glob, yaml
+bad = []
+for f in sorted(glob.glob('.github/workflows/*.yml')):
+    d = yaml.safe_load(open(f)) or {}
+    for jn, j in (d.get('jobs') or {}).items():
+        steps = j.get('steps') or []
+        run = [i for i, s in enumerate(steps) if 'run-harnesses.sh' in str((s or {}).get('run', ''))]
+        if not run:
+            continue
+        build = [i for i, s in enumerate(steps) if './build.sh' in str((s or {}).get('run', ''))]
+        if not build or min(build) > min(run):
+            bad.append(f'{f}:{jn}')
+print(' '.join(bad))
+PY
+)"
+if [[ -z "$_ord" ]]; then
+  ok "every job that runs the budgeted runner BUILDS THE BUNDLE FIRST, in that job — the calibration probe spawns it, and a missing bundle now fails closed"
+else bad "every job that runs the budgeted runner builds the bundle first, in that job" "offending job(s): $_ord"; fi
+
+# ------------------------ 61-73 DIVE-2736: THE PROBE IS GRADED AGAINST THE CORPUS
+# THE MEASUREMENT THAT FORCED THIS, on core/installed-host, same PR, 13 minutes apart:
+#
+#     01:47   237 harnesses   282s   calibration 117714us/iter (68% of a normal)
+#     02:00   236 harnesses   372s   calibration  82218us/iter (47% of a normal)
+#
+# ONE FEWER harness, 90s SLOWER corpus, and the probe reported the runner 31 points
+# FASTER. That is DIVE-2710's premise inverted — the ratio's two halves moved in
+# opposite directions — and because the clamp floors at 100%, a probe that under-reads
+# can NEVER widen the cap. The mechanism gave zero relief on the one run it existed for.
+#
+# TWO THINGS SHIP HERE AND NEITHER OF THEM IS A REMEDY. A post-corpus probe (the
+# discriminator between "the probe sampled the wrong moment" and "the probe measures the
+# wrong mix"), and a cross-run reader. The remedy waits for the data, which is why arm 65
+# below — the post probe changes NO verdict — is the load-bearing one in this section:
+# wiring the second reading into the scale is a one-line edit anybody might make while
+# "finishing the job", and it would ship a fix for a cause that is still n=1.
+rm -f "$TMP"/*.sh "$TMP"/*.seen
+
+# ---- 61-63 the arithmetic. SIGNED, because the two directions mean different things:
+# the corpus warms the cache and biases the post probe FAST, so only "post slower"
+# survives the confound. An absolute value would fold the clean signal into the dirty one.
+want "the post probe reading SLOWER than the pre probe is a POSITIVE divergence" \
+  "20" "$(tier_cal_diverge_pct 100000 120000)"
+want "the post probe reading FASTER is NEGATIVE (the direction a warm cache also produces)" \
+  "-30" "$(tier_cal_diverge_pct 100000 70000)"
+if tier_cal_diverge_pct 0 100000 >/dev/null 2>&1; then
+  bad "a zero pre-probe REFUSES rather than dividing by it" "returned 0"
+else ok "a zero pre-probe REFUSES rather than dividing by it"; fi
+
+# ---- 64 the report carries the pair, or the cross-run reader has nothing to read
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/w.sh"
+bash "$RUNNER" --corpus-dir="$TMP" --tier=full --budget=1 --label=t \
+  --cal-baseline-us=100000 --cal-us=120000 --cal-post-us=150000 --confirm-top=0 \
+  --report="$TMP/rep2.txt" >/dev/null 2>&1
+_miss=""
+for f in cal_post_status cal_post_us_per_iter cal_post_delta_pct; do
+  grep -q "^# $f=" "$TMP/rep2.txt" || _miss="$_miss $f"
+done
+want "the report's post-probe delta is computed, not just echoed" \
+  "# cal_post_delta_pct=25" "$(grep -m1 '^# cal_post_delta_pct=' "$TMP/rep2.txt")"
+if [[ -z "$_miss" ]]; then
+  ok "the report carries the post-probe fields beside the pre-probe ones — a window read needs BOTH readings from the same run or it is comparing runs to each other on one number"
+else bad "the report carries the post-probe fields" "missing:$_miss"; fi
+
+# ---- 65 THE LOAD-BEARING ARM: THE SECOND PROBE GRADES NOTHING.
+# 1.4s of corpus against a 1s cap on a runner measured NORMAL is exit 4. The post probe
+# says 300% — under any bracket-on-max remedy that is a 150% clamp, a 1.5s cap, and a
+# PASS. So this arm goes green if and only if the discriminator stayed out of the
+# verdict. Paired, as the 2592 arms are, with the run that must NOT red: same post
+# probe, corpus inside the cap.
+printf '#!/usr/bin/env bash\nsleep 1.4\nexit 0\n' > "$TMP/w.sh"
+relrun --budget=1 --cal-us=100000 --cal-post-us=300000 --confirm-top=0
+want "a post probe reading 3x slow does NOT rescue an over-budget run (it is a discriminator, not an input)" "4" "$RC"
+printf '#!/usr/bin/env bash\nsleep 0.3\nexit 0\n' > "$TMP/w.sh"
+relrun --budget=1 --cal-us=100000 --cal-post-us=300000 --confirm-top=0
+want "and the same post probe does not RED a run that was inside its cap either" "0" "$RC"
+
+# ---- 66-68 the three branches of the diagnosis. A branch that prints the wrong verdict
+# is invisible: every branch exits 0 and the run passes regardless, so the TEXT is the
+# only observable and each one has to be named separately.
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/w.sh"
+relrun --budget=1 --cal-us=100000 --cal-post-us=104000 --confirm-top=0
+if [[ "$OUT" == *"PROBE BRACKET"* && "$OUT" == *"AGREES"* && "$OUT" == *"cache"* ]]; then
+  ok "probes within the threshold say AGREES — and say in the same breath that the corpus warmed what the probe pays for, so agreement is weak evidence, not a clearance"
+else bad "probes within the threshold say AGREES, with the confound named" "$OUT"; fi
+relrun --budget=1 --cal-us=100000 --cal-post-us=140000 --confirm-top=0
+if [[ "$OUT" == *"DIVERGES"* && "$OUT" == *"SLOWER after the corpus"* && "$OUT" == *"COUNTERFACTUAL, NOT APPLIED"* ]]; then
+  ok "a post probe 40% slower says DIVERGES, names the direction that survives the confound, and prints the cap a max-bracket WOULD have set — labelled as not applied"
+else bad "a slower post probe prints the counterfactual, labelled as not applied" "$OUT"; fi
+relrun --budget=1 --cal-us=100000 --cal-post-us=60000 --confirm-top=0
+if [[ "$OUT" == *"DIVERGES"* && "$OUT" == *"FASTER after the corpus"* ]]; then
+  ok "a post probe 40% faster diverges in the direction that costs nobody a red, and is reported as such rather than as the same event"
+else bad "a faster post probe is reported as its own direction" "$OUT"; fi
+
+# ---- 69 the off switch, and that it is an off switch and not a lie
+relrun --budget=1 --cal-us=100000 --no-cal-post --confirm-top=0 --report="$TMP/rep3.txt"
+want "--no-cal-post records the probe as skipped rather than as a reading of zero" \
+  "# cal_post_status=skipped" "$(grep -m1 '^# cal_post_status=' "$TMP/rep3.txt")"
+
+# ---- 70 no workflow injects the new seams either, same rule as --cal-us
+_wfp="$(grep -rn -- '--cal-post-us=' .github/workflows/ 2>/dev/null || true)"
+if [[ -z "$_wfp" ]]; then
+  ok "NO workflow injects a post-probe reading — the discriminator must measure the runner it is standing on, or it discriminates nothing"
+else bad "NO workflow injects a post-probe reading" "$_wfp"; fi
+
+# ---- 71-73 the cross-run reader. TWO OF THESE ROWS ARE THE REAL MEASUREMENT (the
+# 01:47 and 02:00 installed-host runs above); the third is CONSTRUCTED to complete a
+# window, and is labelled so nobody later reads it as a fourth CI reading.
+WIN="scripts/tier-cal-window.sh"
+mkrep() { # mkrep <file> <label> <harnesses> <wall_s> <cal_us> <post_us> <delta>
+  printf '# run-harnesses report\n# tier=core\n# label=%s\n# harnesses=%d\n# wall_clock_s=%d\n# cal_status=measured\n# cal_us_per_iter=%d\n# cal_post_us_per_iter=%d\n# cal_post_delta_pct=%d\n' \
+    "$2" "$3" "$4" "$5" "$6" "$7" > "$TMP/$1"
+}
+mkrep r1.txt installed-host 237 282 117714 0 0      # MEASURED, gh run 30962...  01:47
+mkrep r2.txt installed-host 236 372  82218 0 0      # MEASURED, gh run 30967674559 02:00
+mkrep r3.txt installed-host 237 275 120693 0 0      # CONSTRUCTED to make a window of 3
+_w="$(bash "$WIN" "$TMP/r1.txt" "$TMP/r2.txt" "$TMP/r3.txt" --strict 2>&1)"; _wrc=$?
+if (( _wrc == 7 )) && [[ "$_w" == *"UNPROTECTED"* ]]; then
+  ok "the measured anti-correlated pair is read as UNPROTECTED and FAILS --strict (exit 7) — probe below the window median while the corpus sat above it is the case the clamp floor guarantees no relief for"
+else bad "the measured anti-correlated pair fails --strict as UNPROTECTED" "rc=$_wrc $_w"; fi
+
+# A window of two has no interior. Refusing is exit 2, and exit 2 is NOT a pass — the
+# same three-state the tier resolver and the runner both keep.
+bash "$WIN" "$TMP/r1.txt" "$TMP/r2.txt" >/dev/null 2>&1
+want "a window shorter than three REFUSES rather than reporting a verdict from an endpoint" "2" "$?"
+
+# THE CONTROL, and it is the arm that grades the normalisation rather than the counting:
+# a corpus that TRIPLES in size while the runner drifts mildly must read CONCORDANT. On
+# raw wall-clock it would not — run g3 has the largest wall-clock in the window and the
+# fastest probe, which is the anti-correlation signature — so this arm reds if anyone
+# ever compares wall_clock_s directly, which is the obvious way to write this tool.
+mkrep g1.txt pristine 100 100 100000 0 0
+mkrep g2.txt pristine 200 220 110000 0 0
+mkrep g3.txt pristine 300 270  90000 0 0
+_g="$(bash "$WIN" "$TMP/g1.txt" "$TMP/g2.txt" "$TMP/g3.txt" --strict 2>&1)"; _grc=$?
+if (( _grc == 0 )) && [[ "$_g" == *"concordant 2"* ]]; then
+  ok "CORPUS GROWTH is not anti-correlation: normalising wall-clock to us/harness keeps a window concordant that raw wall-clock would have called discordant"
+else bad "corpus growth is not read as anti-correlation" "rc=$_grc $_g"; fi
+
+# ---------------------------------------------------------------------------
+# DIVE-2867: THE REFERENCE-SETTING GUARD, and the harvester that makes it satisfiable.
+#
+# These arms live in THIS file rather than a new one on purpose. The core tier is at
+# 91-111% of its cap across the last 20 main runs; a new harness costs its own setup on
+# every future PR forever, and "merge by subject" is the remedy this budget's own failure
+# text ranks first. The subject is the tier budget and it is already here.
+#
+# THE FIXTURE IS THE MEASURED WINDOW, not an invented one — the whole finding is that the
+# concordant population is BIMODAL, and a hand-made fixture would not have been.
+# Harvested 2026-08-08 from the last 20 `unit-tests` runs on main, CONCORDANT rows only.
+# ---------------------------------------------------------------------------
+CONC=(92852 96155 97360 99941 106833 117761 118000 119341 119385 119409 119419 120087 \
+      120166 120409 120524 121160 121277 121807 122037 122703 122762 123341 123362 \
+      123884 123901 124500 125012 125493 125513 125628 126454)
+
+# THE ARM THE WHOLE ROW TURNS ON. 116584 was the proposed fast-end reference, and by the
+# guard's PREVIOUS form ("K concordant samples strictly below") it passes at K=5. Every
+# one of those five is from the fast mode. Kill the band and this arm goes green while
+# the constant moves on evidence from a different population.
+if _r="$(bash tests/lib/tier.sh refadmit 116584 119000 "${CONC[@]}" 2>&1)"; then
+  bad "the proposed fast-end reference 116584 is REFUSED on the measured window" "admitted: $_r"
+elif [[ "$_r" == *"refuse support"* && "$_r" == *"K=1"* ]]; then
+  ok "a candidate supported ONLY by a distinct fast mode is REFUSED (116584 has 5 concordant samples below it and 1 within 10% — the count alone would have certified it)"
+else bad "116584 is refused with K=1" "$_r"; fi
+
+# The incumbent, on the same window, admitted — so the guard is not simply a refusal
+# machine, and the arm above cannot pass by the check being broken in one direction.
+if _r="$(bash tests/lib/tier.sh refadmit 119000 119000 "${CONC[@]}" 2>&1)" && [[ "$_r" == "admit raise" ]]; then
+  ok "a candidate equal to the incumbent needs no evidence (not a lowering)"
+else bad "119000 vs 119000 admits as a non-lowering" "$_r"; fi
+if _r="$(bash tests/lib/tier.sh refadmit 119000 121000 "${CONC[@]}" 2>&1)" && [[ "$_r" == *"K=2"* ]]; then
+  ok "the incumbent 119000 IS admissible as a lowering from 121000 — K=2 from 117761 and 118000, both in the normal mode"
+else bad "119000 admits at K=2 with in-band support" "$_r"; fi
+
+# ONE-SIDED, and this is the arm that stops a future edit from making the guard
+# symmetric "for consistency": raising tightens toward the floor and must never need a
+# sample, or the honest response to a slower runner image is blocked by the guard.
+if _r="$(bash tests/lib/tier.sh refadmit 200000 119000 2>&1)" && [[ "$_r" == "admit raise" ]]; then
+  ok "RAISING the reference is admitted with ZERO samples — it tightens toward the clamp floor and cannot ratchet the cap open"
+else bad "raising needs no samples" "$_r"; fi
+# THE SECOND CONJUNCT, and this arm is why it exists. A candidate placed INSIDE the fast
+# mode PASSES the support test at K=4 off its own neighbours — the band proves local
+# density and cannot tell a dense fast mode from the low tail of the working one. Only
+# the bounded-cost half catches it. Delete either conjunct and one of these two arms goes
+# green on a reference that hands the typical run a 363s cap against a 300s policy.
+_r="$(bash tests/lib/tier.sh refadmit 100000 119000 "${CONC[@]}" 2>&1)"; _rc=$?
+if (( _rc != 0 )) && [[ "$_r" == *"refuse cost"* ]]; then
+  ok "a candidate down in the fast mode is refused on BOUNDED COST, not on support — it has K=4 neighbours and still scales the median run to 121% (363s cap). Support and cost catch different things and neither alone is sufficient"
+else bad "a fast-mode candidate is refused on cost" "rc=$_rc $_r"; fi
+
+# Fail closed with nothing to measure against: "no samples" and "the cost is fine" are
+# different answers and only one of them is a pass.
+_r="$(bash tests/lib/tier.sh refadmit 118000 119000 117900 117950 2>&1)"; _rc=$?
+if (( _rc == 0 )) && [[ "$_r" == *"median-widen"* ]]; then
+  ok "an admitted lowering REPORTS the widening it bought, so the cost is in the output rather than in the reviewer's head"
+else bad "an admitted lowering prints its median-widen" "rc=$_rc $_r"; fi
+
+# The harvester. Graded on a SAVED log rather than a live gh call: a test that needs
+# credentials and a network is a test that gets skipped, and a skip on the arm that
+# proves the window can be rebuilt is exactly the silence this row is about.
+HARV="scripts/tier-cal-harvest.sh"
+if [[ -x "$HARV" ]]; then
+  printf 'test\tUNKNOWN STEP\t2026-01-01T00:00:00Z harness-budget[core/pristine]: 254 harnesses, 283s wall-clock, budget 300s (94%% of budget)\n' > "$TMP/fake.log"
+  printf 'test\tUNKNOWN STEP\t2026-01-01T00:00:01Z harness-budget[core/pristine]: CALIBRATION (measured) 119385us/iter vs baseline 119000us/iter = 100%% of a normal\n' >> "$TMP/fake.log"
+  printf 'test\tUNKNOWN STEP\t2026-01-01T00:00:02Z   runner; applied 100%% (clamp 100-150%%) -> effective cap 300s. This run is 94%% of the RAW cap\n' >> "$TMP/fake.log"
+  printf 'test\tUNKNOWN STEP\t2026-01-01T00:00:03Z   and 94%% of the EFFECTIVE cap. Raw high + effective low = the VM was slow; both high =\n' >> "$TMP/fake.log"
+  printf 'test\tUNKNOWN STEP\t2026-01-01T00:00:04Z harness-budget[core/pristine]: PROBE BRACKET (DIVE-2736) pre 119385us/iter -> post 119349us/iter (+0%%),\n' >> "$TMP/fake.log"
+  # A SECOND JOB in the same stream, with a different probe. Two jobs interleave in a
+  # real `gh run view --log` and their budget blocks are byte-similar, so keying on the
+  # harness-budget label instead of the job column would merge two runners into one
+  # sample — which is the one parsing mistake that would silently corrupt the window.
+  printf 'test-installed-host\tUNKNOWN STEP\t2026-01-01T00:00:05Z harness-budget[core/installed-host]: 255 harnesses, 335s wall-clock, budget 300s (111%% of budget)\n' >> "$TMP/fake.log"
+  printf 'test-installed-host\tUNKNOWN STEP\t2026-01-01T00:00:06Z harness-budget[core/installed-host]: CALIBRATION (measured) 100111us/iter vs baseline 119000us/iter = 84%% of a normal\n' >> "$TMP/fake.log"
+  printf 'test-installed-host\tUNKNOWN STEP\t2026-01-01T00:00:07Z   runner; applied 100%% (clamp 100-150%%) -> effective cap 300s. This run is 111%% of the RAW cap\n' >> "$TMP/fake.log"
+
+  bash "$HARV" --from-log="$TMP/fake.log" --run=31192491258 --sha=deadbee --out="$TMP/harv" >/dev/null 2>&1
+  _p="$TMP/harv/31192491258-test.report"; _i="$TMP/harv/31192491258-test-installed-host.report"
+  if [[ -r "$_p" && -r "$_i" ]] \
+     && grep -q '^# cal_us_per_iter=119385$' "$_p" && grep -q '^# wall_clock_s=283$' "$_p" \
+     && grep -q '^# cal_us_per_iter=100111$' "$_i" && grep -q '^# wall_clock_s=335$' "$_i"; then
+    ok "the harvester rebuilds one report PER JOB from a single interleaved run log, and does not merge two runners into one sample"
+  else bad "harvest splits an interleaved log by job column" "$(ls -1 "$TMP/harv" 2>&1)"; fi
+
+  # ABSENCE IS ABSENT. The log does not carry a probe bracket for installed-host in the
+  # fixture above, and a zero-filled cal_post_us_per_iter would be read by
+  # tier-cal-window.sh as a measured -100% bracket — a fabricated finding, not a gap.
+  if grep -q '^# cal_post_us_per_iter=119349$' "$_p" && ! grep -q '^# cal_post_' "$_i"; then
+    ok "a field the log did not carry is OMITTED, never zero-filled — an absence encoded as a value is read as presence, and this one feeds arithmetic"
+  else bad "missing bracket fields are omitted rather than zero-filled" "$(grep -c cal_post "$_i" 2>&1)"; fi
+
+  # Provenance is not optional: a harvested number with no run id is 173000 again.
+  bash "$HARV" --from-log="$TMP/fake.log" --out="$TMP/harv2" >/dev/null 2>&1
+  want "harvesting WITHOUT a run id refuses (a sample that cannot name its runner is not evidence)" "2" "$?"
+
+  # An empty harvest must not read as a clean window.
+  : > "$TMP/empty.log"
+  bash "$HARV" --from-log="$TMP/empty.log" --run=1 --out="$TMP/harv3" >/dev/null 2>&1
+  want "a harvest that finds NOTHING exits 6 rather than 0 — an empty window is not a window" "6" "$?"
+
+  # The window tool must consume harvested reports UNCHANGED. If this ever needs a
+  # translation layer, the harvester has drifted from the report format it mimics.
+  bash "$HARV" --from-log="$TMP/fake.log" --run=2 --out="$TMP/harv" >/dev/null 2>&1
+  bash "$HARV" --from-log="$TMP/fake.log" --run=3 --out="$TMP/harv" >/dev/null 2>&1
+  if bash "$WIN" "$TMP"/harv/*.report >/dev/null 2>&1; then
+    ok "scripts/tier-cal-window.sh reads harvested reports with no changes — the window's stated blocker ('reports do not persist') was never true of the fields it reads"
+  else bad "window consumes harvested reports unchanged" "$(bash "$WIN" "$TMP"/harv/*.report 2>&1 | tail -3)"; fi
+else
+  bad "scripts/tier-cal-harvest.sh is executable" "not found or not +x"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

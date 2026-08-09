@@ -254,6 +254,45 @@ version_lt() {
   [[ "$1" != "$2" ]] && [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" == "$1" ]]
 }
 
+# Only plain release versions carry ordering meaning. In particular,
+# 0.0.0-dev is a tag-time sentinel, not a version below every release.
+release_version() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+
+bundle_build_sha() {
+  local _sha=""
+  _sha="$(grep -m1 'readonly FIVE_BUILD_SHA=' "$1" 2>/dev/null | sed -E 's/.*="([^"]+)".*/\1/')" || _sha=""
+  [[ "$_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  printf '%s\n' "$_sha"
+}
+
+# Legacy release bundles predate FIVE_BUILD_SHA. Their tag points at a detached
+# release commit whose first parent is the main commit the bundle was built
+# from, so recover that parent rather than comparing against the detached child.
+legacy_release_build_sha() {
+  local _version="$1" _json="" _line="" _sha=""
+  release_version "$_version" || return 1
+  _json="$(curl -fsSL --max-time 10 \
+    "https://api.github.com/repos/$GH_ORG/5dive/commits/v${_version}" 2>/dev/null)" || return 1
+  _line="$(printf '%s\n' "$_json" | awk '/"parents"[[:space:]]*:/ { parents=1; next } parents && /"sha"[[:space:]]*:/ { print; exit }')"
+  _sha="$(printf '%s\n' "$_line" | sed -n 's/.*"sha"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p')"
+  [[ "$_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  printf '%s\n' "$_sha"
+}
+
+# Prints ahead|behind|identical|diverged for installed...candidate.
+build_relation() {
+  local _installed="$1" _candidate="$2" _json="" _status=""
+  _json="$(curl -fsSL --max-time 10 \
+    "https://api.github.com/repos/$GH_ORG/5dive/compare/${_installed}...${_candidate}" 2>/dev/null)" || return 1
+  _status="$(printf '%s\n' "$_json" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+  case "$_status" in ahead|behind|identical|diverged) printf '%s\n' "$_status" ;; *) return 1 ;; esac
+}
+
+# Read by the --upgrade report after refresh_managed_files swaps the bundle.
+INSTALL_DIRECTION=""
+INSTALL_INSTALLED_SHA=""
+INSTALL_CANDIDATE_SHA=""
+
 # assert_version_monotonic <installed-bin> <candidate-bundle>
 # 0 = proceed, 1 = refuse (message already on stderr; caller cleans up + exits).
 # Deliberately does NOT call die(): the caller holds a temp bundle in $BIN_DIR
@@ -261,15 +300,57 @@ version_lt() {
 # directory it just refused to touch is its own small mess.
 assert_version_monotonic() {
   local _inst_bin="$1" _cand_file="$2" _inst="" _cand="" _src=""
+  local _inst_sha="" _cand_sha="" _relation="" _identity_note=""
+  INSTALL_DIRECTION="" INSTALL_INSTALLED_SHA="" INSTALL_CANDIDATE_SHA=""
   # Fresh install: nothing to move backwards from.
-  [[ -f "$_inst_bin" ]] || return 0
+  if [[ ! -f "$_inst_bin" ]]; then INSTALL_DIRECTION="fresh"; return 0; fi
   _inst="$(grep -m1 'readonly FIVE_VERSION=' "$_inst_bin" 2>/dev/null | sed -E 's/.*="([^"]+)".*/\1/')" || _inst=""
   _cand="$(grep -m1 'readonly FIVE_VERSION=' "$_cand_file" 2>/dev/null | sed -E 's/.*="([^"]+)".*/\1/')" || _cand=""
-  if [[ -z "$_inst" || -z "$_cand" ]]; then
-    echo "  ! version not comparable (installed='${_inst:-unreadable}', candidate='${_cand:-unreadable}') — direction unchecked, proceeding" >&2
+  _inst_sha="$(bundle_build_sha "$_inst_bin" || true)"
+  _cand_sha="$(bundle_build_sha "$_cand_file" || true)"
+  if [[ -z "$_inst_sha" && -n "$_cand_sha" && -n "$_inst" ]]; then
+    _inst_sha="$(legacy_release_build_sha "$_inst" || true)"
+    [[ -z "$_inst_sha" ]] || _identity_note=" (installed v${_inst} mapped to its release parent)"
+  fi
+  INSTALL_INSTALLED_SHA="$_inst_sha" INSTALL_CANDIDATE_SHA="$_cand_sha"
+
+  if [[ -n "$_inst_sha" && -n "$_cand_sha" ]]; then
+    _relation="$(build_relation "$_inst_sha" "$_cand_sha" || true)"
+    case "$_relation" in
+      ahead) INSTALL_DIRECTION="forward"; return 0 ;;
+      identical) INSTALL_DIRECTION="same"; return 0 ;;
+      behind)
+        INSTALL_DIRECTION="rollback"
+        if [[ "${FIVE_ALLOW_DOWNGRADE:-0}" == "1" ]]; then
+          echo "  ! ROLLBACK build ${_inst_sha} -> ${_cand_sha}${_identity_note} — allowed by FIVE_ALLOW_DOWNGRADE=1" >&2
+          return 0
+        fi
+        printf 'error: refusing to install older 5dive build: candidate %s is an ancestor of installed %s%s.\n' \
+          "$_cand_sha" "$_inst_sha" "$_identity_note" >&2
+        printf '       Nothing was changed. If this rollback is deliberate, re-run with FIVE_ALLOW_DOWNGRADE=1.\n' >&2
+        return 1
+        ;;
+      diverged)
+        echo "  ! build identity diverged (installed=${_inst_sha}, candidate=${_cand_sha}) — falling back to release-version ordering when available" >&2
+        ;;
+      *)
+        echo "  ! build ancestry unavailable (installed=${_inst_sha}, candidate=${_cand_sha}) — falling back to release-version ordering when available" >&2
+        ;;
+    esac
+  fi
+
+  # Version ordering is still authoritative when both artifacts carry real
+  # release versions. A sentinel or unreadable value is not rollback evidence.
+  if ! release_version "$_inst" || ! release_version "$_cand"; then
+    INSTALL_DIRECTION="unchecked"
+    echo "  ! release versions not comparable (installed='${_inst:-unreadable}', candidate='${_cand:-unreadable}') — direction unchecked, proceeding" >&2
     return 0
   fi
-  version_lt "$_cand" "$_inst" || return 0
+  if ! version_lt "$_cand" "$_inst"; then
+    if version_lt "$_inst" "$_cand"; then INSTALL_DIRECTION="forward"; else INSTALL_DIRECTION="same"; fi
+    return 0
+  fi
+  INSTALL_DIRECTION="rollback"
   # Name where the lower version came from — the whole point is that a backwards
   # move is traceable to the thing that resolved it.
   _src="${GH_PINNED_TAG:-}"
@@ -293,21 +374,24 @@ assert_version_monotonic() {
 # populated host.
 refresh_managed_files() {
   # DIVE-1261: fetch the bundle to a temp file, verify it against the published
-  # sha256, then atomically swap it in. A checksum MISMATCH is fatal (corrupt
-  # download or tampered mirror); an absent/unfetchable checksum only WARNS so a
-  # box can't be bricked if the .sha256 isn't published yet. (Integrity check v1:
-  # guards corruption + mirror tamper; not signing-strength — that needs an
-  # out-of-band key.) Temp lives in BIN_DIR so the final mv is a same-fs atomic swap.
+  # sha256, then atomically swap it in. A checksum MISMATCH or an absent network
+  # checksum is fatal. The one deliberate exception is an explicit file:// source:
+  # install-smoke owns those local bytes and intentionally carries no checksum.
+  # (Integrity check v1 guards corruption + mirror tamper; not signing-strength —
+  # that needs an out-of-band key.) Temp lives in BIN_DIR so the final mv is a
+  # same-fs atomic swap.
   local _bundle_tmp; _bundle_tmp="$(mktemp "${BIN_DIR}/.5dive.XXXXXX")"
   curl -fsSL "$REPO/5dive" -o "$_bundle_tmp" || { rm -f "$_bundle_tmp"; die "failed to download 5dive bundle from $REPO/5dive"; }
   local _want _got
   # `|| _want=""` is load-bearing: under `set -euo pipefail` (line 6) a plain
   # assignment whose command-substitution pipeline fails aborts the whole script
-  # BEFORE the else-branch below can treat an absent checksum as fail-soft. The
+  # BEFORE the policy below can classify an absent checksum. The
   # offline install-smoke bundle (REPO=file:///opt/5dive-bundle) ships no
   # 5dive.sha256, so curl exits 37 (CURLE_FILE_COULDNT_READ_FILE) and pipefail
   # propagates it — reddening docker-install at the "Installing CLI binaries"
-  # step (DIVE-1271). Swallowing it here keeps the absent-checksum-warns contract.
+  # step (DIVE-1271). Swallowing it here lets the policy distinguish that explicit
+  # local source from a network source whose integrity object disappeared.
+  # >>> DIVE-2248 checksum policy
   _want="$(curl -fsSL "$REPO/5dive.sha256" 2>/dev/null | tr -d '[:space:]')" || _want=""
   if [[ -n "$_want" ]]; then
     _got="$(sha256sum "$_bundle_tmp" | awk '{print $1}')"
@@ -323,9 +407,13 @@ refresh_managed_files() {
       fi
       die "5dive bundle checksum mismatch (want ${_want:0:16}…, got ${_got:0:16}…) — refusing to install. This box could not pin a commit sha, so the bundle and its checksum were fetched from the mutable ref $REPO and may be two different CDN cache generations (a stale mirror in the minutes after a release) rather than a corrupt download or a tampered mirror. Retry in a few minutes; if it persists, treat it as an integrity failure."
     fi
+  elif [[ "$REPO" == file://* ]]; then
+    echo "  ! local file:// source has no 5dive.sha256 — proceeding without a network integrity check" >&2
   else
-    echo "  ! no published 5dive.sha256 (or fetch failed) — skipping integrity check" >&2
+    rm -f "$_bundle_tmp"
+    die "failed to fetch required 5dive.sha256 from $REPO/5dive.sha256 — refusing to install an unverified bundle"
   fi
+  # <<< DIVE-2248 checksum policy
   # DIVE-2243: direction is a separate assertion from the action. Checked HERE —
   # after integrity, before the swap — so a refusal leaves the installed binary
   # untouched and the box keeps running the version it already has.
@@ -803,11 +891,72 @@ MANAGED
     chown -h claude:claude /home/claude/projects/AGENTS.md
   fi
 
-  # Fleet-wide pre-push PII guard (DIVE-1797). Point any local 5dive-ai/5dive
-  # checkout on this box at its in-repo pre-push scanner (core.hooksPath). One
-  # config per clone covers every linked worktree AND every future one, so new
-  # landing boxes get the guard on install and existing ones on the daily update
-  # cron. Best-effort + idempotent; a box with no checkout is a clean no-op.
+  # Pre-push PII guard (DIVE-1797 enforcement, DIVE-2788 portable mode,
+  # DIVE-2803 provisioning reach). TWO SEPARATE ARTIFACTS, in this order:
+  #
+  #   1. the GUARD HOME (/usr/local/share/5dive/pii-guard) — the ONE host copy
+  #      of the portable hook + scanner + denylist that every portable install
+  #      reads. It is staged below from $REPO.
+  #   2. the box's own 5dive-ai/5dive CHECKOUT, if it has one, pointed at its
+  #      IN-REPO hooks (a relative core.hooksPath) — the loop further down.
+  #
+  # WHY 1 IS STAGED FROM $REPO AND NOT FROM A CHECKOUT. Until DIVE-2803 the only
+  # writer of the guard home was `install-pii-push-guard.sh` running out of a
+  # checkout of this repo, and a freshly provisioned box HAS NO SUCH CHECKOUT:
+  # install.sh installs a released bundle and stages skills from tarballs, and
+  # `git clone` appears nowhere in this file. So the loop below iterated zero
+  # times and the guard home was never created — the whole PII block was a no-op
+  # on precisely the boxes provisioning creates, which is the "fleet-wide decays
+  # from the day it is written" defect this row exists to close.
+  #
+  # WHAT IS DELIBERATELY NOT DONE HERE: `scripts/pii-guard-fleet.sh --install`
+  # is NOT called from this path (DIVE-2803 gate, answered B on 2026-08-06).
+  # That tool's blast radius is bounded by an EPERM-by-owner branch that leaves
+  # a checkout it cannot write alone and REPORTS it. install.sh runs as ROOT,
+  # where that branch can never fire: root writes every uid's .git/config
+  # successfully, so nothing is left to report and nothing stops it. Wiring it
+  # here would reach every agent uid's checkout on every box and every update —
+  # strictly wider than the claude-owned radius it was reviewed against. It
+  # stays available, and stays report-only.
+  #
+  # Best-effort + idempotent throughout: safe to re-run, and it runs on the
+  # daily update too, because this whole function is the --upgrade path. That
+  # matters on its own — the guard home is the single update point for the
+  # denylist, so a box that installs once and never re-syncs grades against a
+  # frozen list, which is the drift the host-path design exists to avoid.
+  #
+  # >>> DIVE-2803 guard-home staging (extracted verbatim by tests/pii_guard_fleet_unit.sh)
+  # Mirror the repo's own layout under $LIB_DIR so install-pii-push-guard.sh
+  # resolves its three sources from $SELF_DIR/.. unchanged — no second copy of
+  # the "which files make a guard home" list, which would be a second thing to
+  # keep in step. PII_GUARD_SRC_SHA carries the provenance a staged tree cannot
+  # read from a .git it does not have; empty is honest and stamps UNKNOWN.
+  _pg_src="$LIB_DIR/pii-guard-src"
+  _pg_tmp="$(mktemp -d)"
+  if install -d -m 755 "$_pg_tmp/scripts/git-hooks-portable" "$_pg_tmp/.github" \
+     && curl -fsSL "$REPO/scripts/install-pii-push-guard.sh"   -o "$_pg_tmp/scripts/install-pii-push-guard.sh" \
+     && curl -fsSL "$REPO/scripts/git-hooks-portable/pre-push" -o "$_pg_tmp/scripts/git-hooks-portable/pre-push" \
+     && curl -fsSL "$REPO/scripts/pii-scan.sh"                 -o "$_pg_tmp/scripts/pii-scan.sh" \
+     && curl -fsSL "$REPO/.github/pii-denylist.txt"            -o "$_pg_tmp/.github/pii-denylist.txt"; then
+    rm -rf "$_pg_src"
+    install -d -m 755 "$_pg_src"
+    cp -a "$_pg_tmp/." "$_pg_src/"
+    chmod 755 "$_pg_src/scripts/install-pii-push-guard.sh" "$_pg_src/scripts/git-hooks-portable/pre-push"
+    chmod 644 "$_pg_src/scripts/pii-scan.sh" "$_pg_src/.github/pii-denylist.txt"
+    if _pg_out="$(PII_GUARD_SRC_SHA="${GH_PINNED_SHA:-}" "$_pg_src/scripts/install-pii-push-guard.sh" --sync 2>&1)"; then
+      ok "pii-guard home — ${_pg_out#pii-push-guard: }"
+    else
+      echo "warn: pii-guard home NOT synced (${_pg_out:-no output}) — a portable install on this box would point at a scanner that is not there" >&2
+    fi
+  else
+    echo "warn: failed to stage the pii-guard payload from $REPO — guard home not refreshed this run; existing portable installs keep reading the copy they have" >&2
+  fi
+  rm -rf "$_pg_tmp"
+  # <<< DIVE-2803 guard-home staging
+  #
+  # One config per clone covers every linked worktree AND every future one, so
+  # new landing boxes get the guard on install and existing ones on the daily
+  # update cron. A box with no checkout is a clean no-op.
   # WHY here and not branch protection: our landing account is the repo admin,
   # so a required check only gates external PRs, never our own agent commits.
   for _cli_co in /home/*/projects/*/5dive-cli /home/*/projects/5dive/5dive-cli /root/5dive-cli; do
@@ -954,17 +1103,17 @@ if [[ "${1:-}" == "--upgrade" ]]; then
   # DIVE-1260: report the version actually swapped in, read from the new bundle.
   _new_ver="$(grep -m1 'readonly FIVE_VERSION=' "$BIN_DIR/5dive" 2>/dev/null | sed -E 's/.*="([^"]+)".*/\1/')"
   # >>> DIVE-2243 upgrade report (extracted verbatim by tests/install_monotonicity_unit.sh)
-  # DIVE-2243: never call a backwards move an upgrade. Reachable only via
-  # FIVE_ALLOW_DOWNGRADE=1 now that the guard above refuses otherwise — but this
-  # line is what made the fleet-wide downgrade invisible, so it states the
-  # direction it actually measured rather than the one it assumed.
-  if [[ -n "${_old_ver:-}" && -n "${_new_ver:-}" ]] && version_lt "$_new_ver" "$_old_ver"; then
-    echo "5dive DOWNGRADED: ${_old_ver} -> ${_new_ver}"
-  elif [[ -n "${_old_ver:-}" && "${_old_ver}" != "${_new_ver:-}" ]]; then
-    echo "5dive upgraded: ${_old_ver} -> ${_new_ver:-unknown}"
-  else
-    echo "5dive upgraded (now ${_new_ver:-unknown})"
-  fi
+  # Report the direction the guard measured. A current-main bundle legitimately
+  # says 0.0.0-dev, so comparing that sentinel after the swap would recreate the
+  # false "DOWNGRADED" message DIVE-2603 removes.
+  _old_id="${_old_ver:-unknown}${INSTALL_INSTALLED_SHA:+ at ${INSTALL_INSTALLED_SHA}}"
+  _new_id="${_new_ver:-unknown}${INSTALL_CANDIDATE_SHA:+ at ${INSTALL_CANDIDATE_SHA}}"
+  case "${INSTALL_DIRECTION:-unchecked}" in
+    rollback) echo "5dive DOWNGRADED: ${_old_id} -> ${_new_id}" ;;
+    same) echo "5dive refreshed: ${_old_id} -> ${_new_id} (build identity unchanged)" ;;
+    forward) echo "5dive upgraded: ${_old_id} -> ${_new_id}" ;;
+    *) echo "5dive updated: ${_old_id} -> ${_new_id} (direction unchecked)" ;;
+  esac
   # <<< DIVE-2243 upgrade report
   exit 0
 fi

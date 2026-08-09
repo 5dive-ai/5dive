@@ -985,7 +985,11 @@ cmd_loop_map() {
     [[ "$(db "SELECT kill_requested FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")" == "1" ]] && { halt="killed"; break; }
     spent=$(_loop_ceiling_check "$loop_id" "$eff_ceiling") && crc=0 || crc=$?
     (( crc == 2 )) && { halt="spend-unreadable"; break; }   # DIVE-2304: unreadable spend halts, never continues
-    (( crc == 1 )) && { halt="escalated"; break; }
+    # DIVE-2126: keep the wire status folded to "escalated", but name the
+    # actual stop cause. A timeout lands on the same status, so "escalated"
+    # here erased the one fact a caller needs to decide whether to raise the
+    # ceiling or investigate a stalled map.
+    (( crc == 1 )) && { halt="ceiling"; break; }
     # dispatch up to the concurrency cap
     while (( live < eff_conc && next < n )); do
       local elem; elem=$(printf '%s' "$over" | jq -r ".[$next] | if type==\"string\" then . else (.|tojson) end")
@@ -1037,8 +1041,8 @@ cmd_loop_map() {
       >/dev/null 2>&1 || true
   fi
   ok "loop ${loop_id} map ${status_final}: ${ok_n} ok / ${failed_n} failed / ${n} total" \
-     '{loopId:$l, handle:$l, status:$s, topology:"map", total:($t|tonumber), ok:($ok|tonumber), failed:($f|tonumber), concurrency:($cc|tonumber), results:$res, ceiling:($c|tonumber), tokensSpent:($sp|tonumber)}' \
-     --arg l "$loop_id" --arg s "$status_final" --arg t "$n" --arg ok "$ok_n" --arg f "$failed_n" --arg cc "$eff_conc" \
+     '{loopId:$l, handle:$l, status:$s, haltReason:$hr, topology:"map", total:($t|tonumber), ok:($ok|tonumber), failed:($f|tonumber), concurrency:($cc|tonumber), results:$res, ceiling:($c|tonumber), tokensSpent:($sp|tonumber)}' \
+     --arg l "$loop_id" --arg s "$status_final" --arg hr "$halt" --arg t "$n" --arg ok "$ok_n" --arg f "$failed_n" --arg cc "$eff_conc" \
      --argjson res "$out_arr" --arg c "$eff_ceiling" --arg sp "${spent:-0}"
   return 0
 }

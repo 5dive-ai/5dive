@@ -43,7 +43,7 @@ Agents:
   5dive agent list
   5dive agent info <name>                            # type, CLI version, selected model, channel + state
   5dive agent types
-  5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard[,ch...]]
+  5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz[,ch...]]
                             [--telegram-token=<bot-token>] [--discord-token=<token>]
                             [--workdir=<path>] [--auth-profile=<name>]
                             [--provider=<id> --api-key=<key|->]
@@ -78,7 +78,7 @@ Agents:
   5dive agent rm <name> [--purge-home]               # aliases: 5dive agent fire <name>  /  5dive fire <name>
                                                      # home is quarantined to /home/.5dive-reaped/ (root 0700);
                                                      # --purge-home deletes it instead (irreversible)
-  5dive agent config <name> set channels=<none|telegram|discord|dashboard[,ch...]>
+  5dive agent config <name> set channels=<none|telegram|discord|dashboard|buzz[,ch...]>
                                                      # comma-separable; dashboard (claude-only, no token)
                                                      # enables web-dashboard chat — the one-tap Enable chat
                                                      # path. New claude creates include it by default.
@@ -135,8 +135,13 @@ Agents:
                                                      # handle instead of numeric id.
   5dive agent <name> tui                             # attach your terminal to the agent's tmux session
   5dive agent logs <name> [--follow] [--lines=N] [--tmux]
-  5dive agent send <name> <text...> [--from=<sender>] [--raw] [--wake]
+  5dive agent send <name> <text...>|--message=<text>|--message-file=<path>
+                                    [--from=<sender>] [--raw] [--wake]
                                     [--reply-to-chat=<id> [--reply-to-msg=<id>]]
+                                                     # --message-file reads the body VERBATIM from a file (DIVE-2627).
+                                                     # Use it for ANY message that quotes CLI verbs: inside a double-quoted
+                                                     # --message=, backtick-quoted verbs RUN as command substitution (as you),
+                                                     # the words are deleted, and the send still prints OK.
                                                      # inject a message (tmux send-keys + Enter).
                                                      # When called from another agent, auto-wraps as
                                                      # [5dive-msg from=<caller> id=<id>] so the
@@ -189,8 +194,12 @@ Auth (lower-level; the dashboard uses these — prefer 'account' for human-drive
   5dive agent auth status [--probe] [--type=<type>]    # real --print probe reveals stale creds
   5dive agent auth login <type>                        # interactive TTY (hands off this process)
   5dive agent auth set <type> --api-key=<key|-> [--auth-profile=<name>] [--provider=<id>]
+                              [--base-url=<url>] [--model=<slug>]
                                                        # --provider=<id> required for hermes/openclaw;
                                                        # id is one of: ${!BYO_PROVIDER_LABEL[*]}
+                                                       # --base-url (claude only) restates a custom
+                                                       # endpoint; without it a profile pinned off the
+                                                       # catalog is refused, not reverted (DIVE-2809)
   5dive agent auth start <type> [--auth-profile=<name>]      # non-TTY device-code: returns session id
   5dive agent auth poll <session_id>                         # {state, url, error}
   5dive agent auth submit <session_id> --code=<callback>     # paste the claude callback code
@@ -224,6 +233,11 @@ Org chart (who reports to whom):
   5dive org set <agent> --manager=<agent> [--role=<text>] [--title=<text>]
   5dive org tree | show <agent> | ls | rm <agent>
   # full surface: 5dive org --help
+
+Web UI for this host (org chart, queue, gates):
+  5dive ui [--port=8735] [--host=127.0.0.1]          # open the three views in a browser. Read-only, no sign-in.
+  5dive ui --data | --html                           # the JSON the views render / the page itself
+  # full surface: 5dive ui --help
 
 Heartbeat (wake an agent only when it has queued tasks, one per tick):
   5dive heartbeat on  <name> [--every=<dur>] [--fresh]      # enrol (default 30m, fresh off: no /clear between tasks)
@@ -262,6 +276,7 @@ Zero-human proof (publish your own badge —):
 
 Delegated push (bring your own GitHub App —):
   5dive push <id|DIVE-N> [--branch=<b>] [--dry-run]  # push ONLY the task's branch, ONLY after its gate clears; author enforced
+  5dive push <id|DIVE-N> --open-pr[=<base>]          # ...and open its pull request on the same root-side rail, as 5dive-bot (DIVE-2605)
   5dive deploy <id|DIVE-N> [--target=<project@ref>] [--env=production|preview] [--dry-run]
                                                      # deploy ONLY the project@ref the task declares, ONLY after its gate clears
   5dive push setup                                   # scaffold + check the GitHub App credential (bring-your-own; root)
@@ -277,7 +292,9 @@ Actor-routed gh:
   #. The PAT stays root-side in /etc/5dive/connectors/github-bot.env — the agent never holds it.
 
 Identity:
-  5dive whoami [--json]
+  5dive whoami [--json]                    # the CURRENT process: actor, authority, tier + the SOURCE of each; exit 6 if unmeasurable
+  5dive whoami --for=<id|DIVE-N> [--json]  # the RECORDED authority chain for one row; EXIT 1 when a link that HAPPENED is unmeasurable
+                                           # scope it: --for=task:DIVE-N | gate:DIVE-N | action:DIVE-N
     Who is acting, under whose authority, at what tier — and the SOURCE of each.
     Identity is uid-first: \$EUID (or sudo's \$SUDO_UID at real root) resolved
     against /etc/passwd in pure bash. Never argv/--from, \$USER, \$SUDO_USER or
@@ -312,6 +329,14 @@ Health:
     re-prints the identical payload and then opens it (via \`5dive gh issue
     create\`, so it lands as 5dive-bot); a TTY also gets an interactive y/N.
     Agents take the same --file flag a human does — no separate unattended path.
+
+  5dive acp
+    Speak ACP (Agent Client Protocol) over stdin/stdout so an ACP client — Buzz
+    (block/buzz), Zed — can select 5dive as a coding-agent runtime. NOT
+    interactive: the client spawns it. A session ATTACHES to a named fleet agent
+    (its memory, tasks, org position and heartbeat intact) rather than opening a
+    blank one; the roster travels as ACP availableCommands, so /<name> or
+    /attach <name> picks the agent and /agents re-lists them. Runs on bun.
 
   5dive doctor [--fix] [--dry-run] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
@@ -364,7 +389,7 @@ main() {
   done
   set -- "${rest[@]+"${rest[@]}"}"
 
-  [[ $# -gt 0 ]] || { usage; exit "$E_USAGE"; }
+  [[ $# -gt 0 ]] || { usage; mark_reported; exit "$E_USAGE"; }
   local top="$1"; shift
   # DIVE-2323: the one place that sees every dispatch, so fail()'s E_GENERIC
   # hint can name the verb that broke. Set unconditionally, even for a $top
@@ -472,7 +497,7 @@ main() {
         with_registry_lock cmd_hire "$@"
       fi ;;
     agent)
-      [[ $# -gt 0 ]] || { usage; exit "$E_USAGE"; }
+      [[ $# -gt 0 ]] || { usage; mark_reported; exit "$E_USAGE"; }
       local sub="$1"; shift
       case "$sub" in
         -h|--help|help) usage ;;
@@ -480,12 +505,36 @@ main() {
         info)    cmd_info "$@" ;;
         types)   cmd_types "$@" ;;
         logs)    cmd_logs "$@" ;;
-        send)    cmd_send "$@" ;;
-        ask)     cmd_ask "$@" ;;
+        # DIVE-2797: the send rail is AUDITED. `task inbox send` had 78 rows in
+        # agent-audit.log and `agent send` had zero, so an inter-agent message —
+        # including an admin-tier one carrying a forgeable `--from=` — left no
+        # artifact naming who sent it. A recipient could re-verify the CLAIM and
+        # never the SOURCE, because no source record existed.
+        #
+        # AUDIT_ARGS is a PLACEHOLDER here, not the payload. The handler rewrites
+        # it once it has parsed its flags (see cmd_send / cmd_ask / cmd_deliver),
+        # because the dispatcher cannot tell a target from a `--message=` body and
+        # the message body must never land in a shared log. If the handler fails
+        # before that point the row still carries the verb, the exit code and the
+        # derived actor — attribution survives a usage error.
+        send)
+          AUDIT_CMD="agent send"; AUDIT_ARGS=("to=<unparsed>")
+          cmd_send "$@" ;;
+        ask)
+          AUDIT_CMD="agent ask"; AUDIT_ARGS=("to=<unparsed>")
+          cmd_ask "$@" ;;
         # DIVE-1065: hidden privileged delivery primitive. Only reachable via the
         # scoped-sudoers grant a standard agent gets (write_standard_sudoers);
         # `cmd_send` re-execs into it for non-root agent callers. Not advertised.
-        _deliver) cmd_deliver "$@" ;;
+        # DIVE-2797: audited for the same reason, and it is NOT redundant with the
+        # `send` row above. cmd_send reaches this primitive with `exec`, which
+        # replaces the process — the outer EXIT trap never fires, so a scoped
+        # (standard-tier) a2a send would have been audited by NOBODY if only
+        # `send` were wired. That is the DIVE-2788 shape this ticket names as its
+        # sibling: a guard covering a narrower population than its name.
+        _deliver)
+          AUDIT_CMD="agent _deliver"; AUDIT_ARGS=("to=<unparsed>")
+          cmd_deliver "$@" ;;
         # DIVE-1074: hidden privileged READ primitive (bounded reply-window read),
         # the sibling of _deliver. `cmd_ask` re-execs into it for a standard-tier
         # non-root caller to read back the reply. Scoped-sudoers only, not advertised.
@@ -770,6 +819,11 @@ main() {
     org)
       # Agent org chart (sqlite, same store as tasks). Read/write, no audit/lock.
       cmd_org "$@" ;;
+    ui)
+      # DIVE-2655: the free single-host web UI (org chart / queue / gates).
+      # Reads the same group-writable store as tasks + org; GET/HEAD only, no
+      # root, no lock, no write path. Loopback bind unless the caller opts out.
+      cmd_ui "$@" ;;
     project|projects)
       # Project namespaces for the task queue (DIVE-484). Same group-writable
       # store as tasks; read/write, no root/lock.
@@ -956,6 +1010,12 @@ main() {
         AUDIT_CMD="self-update"; AUDIT_ARGS=("$@")
         cmd_self_update "$@"
       fi ;;
+    acp)
+      # DIVE-3017: ACP over stdio, spawned BY a client (Buzz's runtime picker), so
+      # this verb's stdout is the wire. AUDIT_CMD is deliberately NOT set: cmd_acp
+      # `exec`s into bun, which replaces the process before the dispatcher's EXIT
+      # trap can fire (DIVE-2797), so the row is written inside cmd_acp instead.
+      cmd_acp "$@" ;;
     -h|--help|help) usage ;;
     *) fail "$E_USAGE" "unknown command: $top" ;;
   esac

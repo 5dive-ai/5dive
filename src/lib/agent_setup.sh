@@ -451,6 +451,39 @@ _skill_needs_manual_install() {
   esac
 }
 
+# _skill_manifest_note <user> <home> <install_dir> <skill> <source>
+#
+# DIVE-2678 iteration 3 — THE HOLE THAT MADE THE MANIFEST FICTION. `.skills-manifest.json`
+# has been written by cmd_skill_add since DIVE-2282/PR #291, and yet MEASURED 2026-08-04
+# not one seat on this fleet has one. The reason is not that the writer is new or broken:
+# it is that `agent skill add` is not how skills get onto a seat. Every default arrives
+# through install_default_skill_for_agent below, which installed the body and recorded
+# nothing — so export had no provenance to read on any seat that exists.
+#
+# Best-effort by construction: a manifest write must never fail an install. Every failure
+# path swallows, exactly as the cmd_skill_add block does.
+_skill_manifest_note() {
+  local user="$1" home="$2" install_dir="$3" skill="$4" source="$5"
+  sudo -u "$user" -H env INSTALL_DIR="$install_dir" SKILL="$skill" SOURCE="$source" \
+    bash -s >/dev/null 2>&1 <<'MANIFEST_NOTE' || true
+set -uo pipefail
+[ -d "$HOME/$INSTALL_DIR/$SKILL" ] || exit 0
+MANIFEST="$HOME/$INSTALL_DIR/.skills-manifest.json"
+if ! /usr/bin/jq -e . "$MANIFEST" >/dev/null 2>&1; then echo '{}' > "$MANIFEST" 2>/dev/null || true; fi
+# Same hash recipe as cmd_skill_add: relative paths + sorted, so a tree installed by
+# either path hashes identically and `skill add --force` change-detection stays honest.
+CONTENT_SHA=$(cd "$HOME/$INSTALL_DIR/$SKILL" && find . -type f -print0 | sort -z | xargs -0 -r /usr/bin/sha256sum | /usr/bin/sha256sum | cut -d' ' -f1) || CONTENT_SHA=""
+if /usr/bin/jq --arg k "$SKILL" --arg s "$SOURCE" --arg c "$CONTENT_SHA" \
+     --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+     '.[$k] = {source:$s, resolved_sha:"", content_sha256:$c, installed_at:$t}' \
+     "$MANIFEST" > "$MANIFEST.tmp" 2>/dev/null; then
+  mv "$MANIFEST.tmp" "$MANIFEST"
+else
+  rm -f "$MANIFEST.tmp"
+fi
+MANIFEST_NOTE
+}
+
 # Install one skill into an agent user's per-type skills dir. Routes through
 # `npx skills add --agent <id>` for upstream-supported types, and falls back
 # to a direct git-clone + cp -r for types upstream rejects (see
@@ -473,6 +506,10 @@ install_default_skill_for_agent() {
   [[ -d "$home" ]] || return 1
   id -u "$user" &>/dev/null || return 1
   if sudo -u "$user" test -d "$home/$install_dir/$skill"; then
+    # Already installed — but on a seat created before the write above existed, that
+    # body has no manifest entry. Record it here too, so re-running preseed BACKFILLS
+    # provenance onto existing seats instead of only fixing seats created from now on.
+    _skill_manifest_note "$user" "$home" "$install_dir" "$skill" "$source"
     return 0
   fi
   if _skill_needs_manual_install "$type"; then
@@ -502,6 +539,7 @@ skill_target_within "$HOME/$INSTALL_DIR" "$SKILL" \
 cp -r "$SRC_DIR" "$HOME/$INSTALL_DIR/$SKILL"
 echo "manual-installed $SKILL → $HOME/$INSTALL_DIR/$SKILL"
 MANUAL_SKILL
+    _skill_manifest_note "$user" "$home" "$install_dir" "$skill" "$source"
     return 0
   fi
   sudo -u "$user" -H env SOURCE="$source" SKILL="$skill" AGENT_ID="$agent_id" bash -s >&2 <<'DEFAULT_SKILL' \
@@ -515,6 +553,7 @@ export PATH="/home/claude/.local/bin:$PATH"
 cd "$HOME"
 timeout 180 npx -y skills add "https://github.com/$SOURCE" --skill "$SKILL" --agent "$AGENT_ID" --yes 2>&1 | tail -15
 DEFAULT_SKILL
+  _skill_manifest_note "$user" "$home" "$install_dir" "$skill" "$source"
 }
 
 # Install a claude-plugins-official channel plugin into the agent user's
@@ -565,7 +604,7 @@ install_channel_plugin_for_agent() {
   # SSH key configured. Explicit https URL sidesteps the shorthand
   # resolver entirely.
   local mkt_repo="https://github.com/anthropics/claude-plugins-official.git"
-  if [[ "$plugin" == "telegram" || "$plugin" == "dashboard" ]]; then
+  if [[ "$plugin" == "telegram" || "$plugin" == "dashboard" || "$plugin" == "buzz" ]]; then
     marketplace="5dive-plugins"
     mkt_repo="https://github.com/$(gh_org)/5dive-plugins.git"
   fi
@@ -1826,6 +1865,12 @@ install_channel_for_agent() {
   if [[ "$plugin" == "dashboard" && "$type" != "claude" ]]; then
     fail "$E_VALIDATION" "channels=dashboard is claude-only (agent '$name' is type $type)"
   fi
+  # DIVE-2895: same for buzz — it is a claude channel plugin (MCP notification
+  # inbound), and the poll-fork runtimes have no Buzz variant. Refuse here so
+  # the failure names the reason, rather than at 5dive-agent-start's dispatch.
+  if [[ "$plugin" == "buzz" && "$type" != "claude" ]]; then
+    fail "$E_VALIDATION" "channels=buzz is claude-only (agent '$name' is type $type)"
+  fi
   case "$type" in
     claude)      install_channel_plugin_for_agent "$plugin" "$name" "$allowed_users" ;;
     codex)       install_channel_for_codex_agent "$plugin" "$name" "$token" "$allowed_users" ;;
@@ -1865,7 +1910,8 @@ reconcile_managed_settings() {
         .channelsEnabled = true
       | .allowedChannelPlugins = ((.allowedChannelPlugins // []) as $have
           | $have + ([{"plugin":"telegram","marketplace":"5dive-plugins"},
-                      {"plugin":"dashboard","marketplace":"5dive-plugins"}]
+                      {"plugin":"dashboard","marketplace":"5dive-plugins"},
+                      {"plugin":"buzz","marketplace":"5dive-plugins"}]
               | map(select(. as $need
                   | ($have | any(.plugin == $need.plugin and .marketplace == $need.marketplace)) | not))))
       ' "$msj" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then

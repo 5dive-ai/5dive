@@ -4,6 +4,72 @@ require_root() {
   [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "must run as root — try: sudo 5dive ${*:-${FIVE_ARGV[*]:-}}"
 }
 
+# -------- DIVE-2627: file input for the prose flags --------
+#
+# Every prose flag in this CLI is argv-only, so the CALLER'S SHELL assembles the
+# value BEFORE the CLI is invoked. A backtick inside a double-quoted value is
+# executed as command substitution and the text is silently replaced; the command
+# still exits 0 and prints OK. The corruption PRECEDES argv, so nothing downstream
+# — CLI, receipt, recipient — can detect it. Measured and written up in
+# community/wiki/the-payload-is-corrupted-before-the-cli-is-invoked.md (DIVE-2620).
+#
+# The audit inverted the original priority. `--message=` is the LEAST costly
+# member of the class: a mangled message is read once, by one agent. A mangled
+# `--result` / `--ask` / `--body` / `--accept` is the PERMANENT record — what a
+# verifier grades against, and for `--ask` what a human is paged to read — with
+# no reader present at the write to notice the missing words.
+#
+# The fix is to keep prose OUT of argv: pass a PATH, read the bytes here. This
+# COPIES council's `--context-file` precedent (src/council/cli.mjs:916, fed by
+# src/cmd_council.sh:4966, whose own wrapper writes prose to a temp file
+# specifically to keep it out of argv). It is not a new design.
+#
+# NOT stdin. stdin already carries the auth token (DIVE-880); a second reader on
+# that stream is a design problem, not a flag.
+#
+# The argv forms are NOT removed or deprecated. These are additive siblings.
+
+# Read <path> VERBATIM into the global _PROSE_FILE_VALUE.
+#
+# A global rather than a printed value ON PURPOSE: `$(cat f)` strips trailing
+# newlines, which is precisely the silent mutation this flag exists to stop.
+# `read -r -d ''` reads to the first NUL — i.e. to EOF for text — and returns
+# NON-ZERO at EOF with the full contents already assigned, so `|| true` here is
+# the SUCCESS path, not a swallowed error. -r keeps backslashes literal.
+#
+# Refuses empty rather than recording it: every caller of this treats empty as
+# "flag not given", so a silently-empty file would land the exact same
+# indistinguishable-from-correct write the argv form does.
+_read_prose_file() {
+  local flag="$1" path="$2"
+  _PROSE_FILE_VALUE=""
+  [[ -n "$path" ]] || fail "$E_USAGE" "$flag needs a path: ${flag}=<file>"
+  [[ -e "$path" ]] || fail "$E_USAGE" "$flag: no such file '$path'"
+  [[ -f "$path" || -p "$path" || -c "$path" ]] \
+    || fail "$E_USAGE" "$flag: '$path' is not a readable file (regular file, fifo or character device)"
+  [[ -r "$path" ]] || fail "$E_PERMISSION" "$flag: cannot read '$path'"
+  IFS= read -r -d '' _PROSE_FILE_VALUE < "$path" || true
+  [[ -n "$_PROSE_FILE_VALUE" ]] \
+    || fail "$E_VALIDATION" "$flag: '$path' is empty — refusing to record an empty value (an empty file is indistinguishable from the flag never being passed, which is the failure mode this flag exists to remove)"
+}
+
+# Refuse `--x` and `--x-file` together. They are two answers to the same
+# question; picking one silently is how a caller records the one they did not
+# mean — the same class of defect as the corruption above, one layer up.
+# $1 = the flag being applied now, $2 = the source that already set it (empty if none).
+#
+# The SAME flag repeated keeps its old last-wins behaviour and is deliberately NOT
+# refused. The ticket's rule is "add alongside, do not change the argv forms", and
+# `--result=a --result=b` has always taken b; turning that into a hard error would
+# be a silent behaviour change shipped inside an additive one, reaching callers
+# across the whole fleet that this ticket never looked at. Only the NEW ambiguity —
+# inline against file — is refused, and it has no callers yet.
+_prose_flag_dupe() {
+  [[ "$1" != "$2" ]] || return 0
+  [[ -z "$2" ]] \
+    || fail "$E_USAGE" "$1 conflicts with $2 — pass the prose exactly once, either inline or from a file."
+}
+
 is_known_type() {
   [[ -n "${TYPE_BIN[$1]+x}" ]]
 }
@@ -21,7 +87,7 @@ valid_channel() {
   [[ -n "$1" ]] || return 1
   local IFS=',' c
   for c in $1; do
-    [[ "$c" =~ ^(none|telegram|discord|dashboard)$ ]] || return 1
+    [[ "$c" =~ ^(none|telegram|discord|dashboard|buzz)$ ]] || return 1
     if [[ "$c" == "none" && "$1" != "none" ]]; then return 1; fi
   done
   return 0

@@ -37,6 +37,7 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 # DIVE-2518: impersonate through the SEALED seam. `USER=agent-x` no longer moves
 # the actor — that env path WAS the forgery this ticket closed, and these arms
@@ -45,7 +46,6 @@ cd "$(dirname "$0")/.."
 SRC=src
 
 TMP="$(mktemp -d /tmp/verifier-gate-ack.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
@@ -116,7 +116,7 @@ A=$(deliver "gate filed by the verifier")
   && ok_t "fixture is DELIVERED and unacked (todo, held by reviewer)" \
   || bad_t "fixture not delivered" "status=$(col "$A" status) assignee=$(col "$A" assignee) ack=$(col "$A" handoff_ack_at)"
 
-as reviewer cmd_task_need "$A" --type=decision --tier=2 --options="A|B" --recommend="A" \
+as reviewer cmd_task_need "$A" --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --options="A|B" --recommend="A" \
    --ask="Leave this open and parked, or close it as delivered?" >/dev/null
 [[ "$(col "$A" need_type)" == "decision" && -z "$(col "$A" need_answered_at)" \
    && "$(col "$A" status)" == "blocked" ]] \
@@ -145,7 +145,7 @@ as intruder cmd_task_need "$F" --type=manual --ask="unrelated question" >/dev/nu
 # left the suite green, because `handoff_ack_at IS NULL` was doing the skipping.
 # Two fixes for one symptom, one silently standing in for the other.
 G=$(deliver "delivered, live gate, no ACK on the row")
-as reviewer cmd_task_need "$G" --type=decision --tier=2 --options="A|B" --recommend="A" \
+as reviewer cmd_task_need "$G" --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --options="A|B" --recommend="A" \
    --ask="Leave this open and parked, or close it as delivered?" >/dev/null
 db "UPDATE tasks SET handoff_ack_at=NULL WHERE ident=$(sqlq "$G");"
 [[ "$(col "$G" assignee)" == "reviewer" && -z "$(col "$G" handoff_ack_at)" \
@@ -215,7 +215,7 @@ as reviewer cmd_task_reject "$D" --feedback="needs another pass" >/dev/null
 #     is the party the gate is waiting on, so their reject proceeds. Graded
 #     explicitly rather than inherited from whoever runs the suite.
 E=$(deliver "tier-2 gate, human rejects")
-as reviewer cmd_task_need "$E" --type=decision --tier=2 --options="A|B" --recommend="A" \
+as reviewer cmd_task_need "$E" --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --options="A|B" --recommend="A" \
    --ask="Leave open and parked, or close as delivered?" >/dev/null
 GATE_ACTOR="human"
 as reviewer cmd_task_reject "$E" --feedback="human call: bounce it" >/dev/null
@@ -240,7 +240,7 @@ as reviewer cmd_task_reject "$H" --feedback="needs another pass" >/dev/null
 #     themselves, the refusal points at withdraw-then-reject — so run it and prove
 #     it completes. The withdrawal is recorded; nothing is put in the human's mouth.
 I=$(deliver "verifier's own gate, withdraw then reject")
-as reviewer cmd_task_need "$I" --type=decision --tier=2 --options="A|B" --recommend="A" \
+as reviewer cmd_task_need "$I" --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --options="A|B" --recommend="A" \
    --ask="Leave open and parked, or close as delivered?" >/dev/null
 msg=$(as reviewer cmd_task_reject "$I" --feedback="it fails" 2>&1; cat "$TMP/err")
 [[ "$msg" == *"--withdraw"* && "$msg" == *"you can retire it yourself"* ]] \
@@ -257,7 +257,7 @@ as reviewer cmd_task_reject "$I" --feedback="it fails" >/dev/null
 #     refusal must name the exit that does not need them: record the verdict now,
 #     reject when the gate clears. Proven by running it, not by reading the string.
 J=$(deliver "third party's gate, verdict recorded meanwhile")
-as lead cmd_task_need "$J" --type=decision --tier=2 --options="A|B" --recommend="A" \
+as lead cmd_task_need "$J" --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --options="A|B" --recommend="A" \
    --ask="policy call only a human can make" >/dev/null
 db "UPDATE tasks SET assignee='reviewer' WHERE ident=$(sqlq "$J");"   # row still held by the verifier
 msg=$(as reviewer cmd_task_reject "$J" --feedback="it fails" 2>&1; cat "$TMP/err")
@@ -274,7 +274,7 @@ as reviewer cmd_task_set_body "$J" "VERDICT: FAIL — reasons here" --append >/d
 #     never saw DIVE-555. Unguarded, every rail above is advisory: one `task
 #     verify --cmd=true` closes the row and the human's question disappears.
 K=$(deliver "verify --cmd must not close over a gate")
-as reviewer cmd_task_need "$K" --type=decision --tier=2 --options="A|B" --recommend="A" \
+as reviewer cmd_task_need "$K" --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --options="A|B" --recommend="A" \
    --ask="Leave open and parked, or close as delivered?" >/dev/null
 out=$(as reviewer cmd_task_verify "$K" --cmd=true); rc=$?
 (( rc != 0 )) && ok_t "ARM3c verify auto-close over an open gate exits non-zero (rc=$rc)" \

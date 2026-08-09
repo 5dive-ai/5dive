@@ -22,10 +22,24 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+
+# DIVE-2770: the merge gate gained a CREDENTIAL-FREE rail (an unauthenticated read
+# of a public repo). Every no-token arm below was written when "no credential"
+# meant "no rail", and with the anon rail live they would reach the real network
+# and grade a LIVE PR instead of the fixture. Turn it off here: these harnesses
+# grade the pre-2770 rails, and tests/task_merge_gate_anon_rail_unit.sh grades the
+# new one. This is also what keeps `no root, no network` true of this file.
+#
+# IT MUST SIT AFTER lib/grading_tree.sh, AND THAT IS NOT A STYLE CHOICE: that file
+# sources lib/env_isolation.sh, which CLEARS inherited FIVE_* knobs so a harness
+# never grades the caller's environment. Set above it, this export is wiped and the
+# harness silently reaches the network instead — measured, and it read as three
+# unrelated assertion failures naming a live PR's real state.
+export FIVE_GATE_NO_ANON=1
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-gh-resolve-unit.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 # --- stub sudo (DIVE-1935): the resolver's last resort is
 # `sudo -n -u claude gh auth token`, and real sudo resets PATH to secure_path — so
@@ -112,7 +126,7 @@ cmd_task_set_branch DIVE-834 feat/dive-834-thing >/dev/null 2>&1
 : >"$GH_ARGS_LOG"
 export GH_STUB_STATE="" GH_STUB_MERGED="2026-07-23T12:00:00Z" GH_STUB_AUTH_TOKEN="tok"
 NONREPO="$TMP/nonrepo"; mkdir -p "$NONREPO"
-out=$( cd "$NONREPO" && cmd_task_done DIVE-834 2>&1 ); rc=$?
+out=$( cd "$NONREPO" && cmd_task_done DIVE-834 --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1 ); rc=$?
 [[ $rc -eq 0 && "$(statusof DIVE-834)" == "done" ]] \
   && ok_t "T3 Branch:-bound task closes from a non-repo CWD when its head is merged" \
   || bad_t "T3 close from non-repo CWD" "rc=$rc status=$(statusof DIVE-834) out=$out"
@@ -129,7 +143,7 @@ unset GH_TOKEN GITHUB_TOKEN
 export GH_STUB_STATE="MERGED" GH_STUB_MERGED="2026-07-23T13:00:00Z" GH_STUB_AUTH_TOKEN="deleg-tok-789"
 # delivery_ref path: bind a PR url directly.
 db "UPDATE tasks SET delivery_ref='https://github.com/5dive-ai/5dive/pull/835', delivered_at=datetime('now') WHERE ident='DIVE-835';"
-out=$(cmd_task_done DIVE-835 2>&1); rc=$?
+out=$(cmd_task_done DIVE-835 --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1); rc=$?
 [[ $rc -eq 0 && "$(statusof DIVE-835)" == "done" ]] \
   && ok_t "T4 delivery_ref task closes when merged (resolved token, no env GH_TOKEN)" \
   || bad_t "T4 close" "rc=$rc status=$(statusof DIVE-835) out=$out"
@@ -142,7 +156,7 @@ grep -q 'TOKEN=deleg-tok-789 ARGS=pr view' "$GH_ARGS_LOG" \
 seed_task DIVE-836 main main
 db "UPDATE tasks SET delivery_ref='https://github.com/5dive-ai/5dive/pull/836', delivered_at=datetime('now') WHERE ident='DIVE-836';"
 export GH_STUB_STATE="" GH_STUB_MERGED="" GH_STUB_AUTH_TOKEN=""
-out=$(cmd_task_done DIVE-836 2>&1); rc=$?
+out=$(cmd_task_done DIVE-836 --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1); rc=$?
 [[ $rc -eq $E_CONFLICT && "$(statusof DIVE-836)" != "done" ]] \
   && ok_t "T5 unknown/empty state still BLOCKS (fail-safe, never false-close)" \
   || bad_t "T5 fail-safe" "rc=$rc status=$(statusof DIVE-836) out=$out"

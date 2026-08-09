@@ -33,11 +33,11 @@ set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
 
 TMP="$(mktemp -d /tmp/hb-reclaim-verifier-handoff.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
@@ -85,7 +85,7 @@ _hb_agent_idle()      { return 0; }  # confident idle by default
 mk_delivered_unacked() {
   local id
   id=$(addt --assignee=dev --verifier=olivia -- "ship the widget")
-  ( cmd_task_done "$id" ) >/dev/null 2>&1
+  ( cmd_task_done "$id" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
   _hb_claim_task olivia "$id" >/dev/null 2>&1
   printf '%s' "$id"
 }

@@ -887,6 +887,8 @@ paperclip_unseed_for_profile() {
       | .[0].value.authProfile // empty' <<<"$reg")
     [[ -n "$fallback_profile" ]] && paperclip_seed_for_type "$t" "$fallback_profile"
   done
+  return 0   # DIVE-2751: a for-loop returns its LAST iteration's status, so
+             # `claude` having no fallback profile made the whole unseed fail.
 }
 
 # paperclip_seed_all_from_registry — backfill the host-default credential
@@ -904,6 +906,9 @@ paperclip_seed_all_from_registry() {
       | .[0].value.authProfile // empty' <<<"$reg")
     [[ -n "$profile" ]] && paperclip_seed_for_type "$t" "$profile"
   done
+  return 0   # DIVE-2751: LIVE — main.sh:738 calls this bare under `paperclip-seed`
+             # (invoked from update.sh), and the loop's last iteration is `claude`,
+             # so a host with no claude auth profile exited 1 before the ok() line.
 }
 
 # profile_set_var <profile> <VAR> <VALUE> — idempotent KEY=VALUE upsert in
@@ -920,6 +925,27 @@ profile_set_var() {
   file="${dir}/combined.env"
   local value
   value=$(cat)
+  # DIVE-2757 iteration 2: a NEWLINE in the value forges a SECOND assignment.
+  # `printf '%s=%s\n' VAR "a<LF>B=c"` writes two lines, and systemd honours the
+  # second — so a value carrying a newline can set ANY variable in this file,
+  # ANTHROPIC_AUTH_TOKEN included. Found by the accept-path arm olivia required
+  # on this row, on its first run; the refusal arms could not see it because
+  # they grade the INPUT and this is a property of the WRITER.
+  #
+  # Refuse rather than strip or escape. Stripping silently changes the operator's
+  # value, and an EnvironmentFile has no quoting that makes a literal newline
+  # safe — there is no correct multi-line assignment to preserve here. Every
+  # legitimate caller passes a URL, a token, a model slug or a number, none of
+  # which contain one.
+  #
+  # This is defence in DEPTH, not the only guard: `valid_base_url` already
+  # rejects whitespace on the --base-url input. But that guard is on ONE input
+  # of one caller, and this writer serves every profile variable there is —
+  # a control on one path is absent on the parallel one unless it sits at the
+  # write.
+  if [[ "$value" == *$'\n'* ]]; then
+    fail "$E_VALIDATION" "profile_set_var: refusing to write ${var} — the value contains a newline, which would forge a second assignment in ${file} (systemd honours it). Pass a single-line value."
+  fi
   local tmp
   tmp=$(mktemp "${file}.XXXXXX")
   grep -v "^${var}=" "$file" 2>/dev/null > "$tmp" || true
@@ -1060,7 +1086,7 @@ opencode_validate_model_or_fail() {
   [[ -n "$catalog" ]] || return 0
   grep -qxF "$model_id" <<<"$catalog" && return 0
   local sugg; sugg=$(grep -F "${model_id%/*}/" <<<"$catalog" | head -5 \
-    | awk 'NR>1{printf ", "}{printf "%s", $0}')
+    | awk 'NR>1{printf ", "}{printf "%s", $0}') || sugg=""
   fail "$E_VALIDATION" "opencode has no model '$model_id' for provider '$provider'.${sugg:+ Close matches: $sugg.} Run 'opencode models'"
 }
 
@@ -1140,7 +1166,7 @@ pi_validate_model_or_fail() {
   [[ -n "$catalog" ]] || return 0
   grep -qxF "$slug" <<<"$catalog" && return 0
   local sugg; sugg=$(grep -F "${slug%%/*}/" <<<"$catalog" | head -5 \
-    | awk 'NR>1{printf ", "}{printf "%s", $0}')
+    | awk 'NR>1{printf ", "}{printf "%s", $0}') || sugg=""
   fail "$E_VALIDATION" "pi has no model '$slug' for provider '$provider'.${sugg:+ Close matches: $sugg.} Run 'pi --list-models $provider'"
 }
 
@@ -1188,19 +1214,44 @@ pi_apply_model_default() {
 # The "-" sentinel reads the key from stdin — use that from the API layer
 # so the key never touches process argv (and thus never shows up in `ps`).
 cmd_auth_set() {
-  local type="" api_key="" profile="" byo_provider=""
+  local type="" api_key="" profile="" byo_provider="" base_url="" byo_model=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --api-key=*)       api_key="${1#--api-key=}" ;;
       --auth-profile=*)  profile="${1#--auth-profile=}" ;;
       --provider=*)      byo_provider="${1#--provider=}" ;;
+      # DIVE-2809: the create path's --base-url/--model reach auth set too, so a
+      # key rotation on a custom-endpoint profile has a way to RESTATE the
+      # endpoint instead of losing it to the catalog. Without these two flags the
+      # guard in _apply_byo_claude would be a wall with no door.
+      --base-url=*)      base_url="${1#--base-url=}" ;;
+      --model=*)         byo_model="${1#--model=}" ;;
       -*)                fail "$E_USAGE" "unknown flag: $1" ;;
       *)                 [[ -z "$type" ]] && type="$1" || fail "$E_USAGE" "extra arg: $1" ;;
     esac
     shift
   done
-  [[ -n "$type" ]] || fail "$E_USAGE" "usage: 5dive agent auth set <type> --api-key=<key> [--auth-profile=<name>] [--provider=<id>]"
+  [[ -n "$type" ]] || fail "$E_USAGE" "usage: 5dive agent auth set <type> --api-key=<key> [--auth-profile=<name>] [--provider=<id>] [--base-url=<url>] [--model=<slug>]"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type"
+  # DIVE-2809: both new flags only mean anything on the BYO branch below, which
+  # is entered by --provider. Refuse rather than accept-and-ignore: an operator
+  # who passes --base-url without --provider is asking for exactly the endpoint
+  # pin this row exists to protect, and silently dropping it is the same class
+  # of bug. `pi` and `opencode` also take --provider but return from their own
+  # branches ABOVE the BYO block, so a flag they do not read would be accepted
+  # and dropped there — hence the type check as well as the --provider one.
+  if [[ -n "$base_url" ]]; then
+    [[ -n "$byo_provider" ]] \
+      || fail "$E_USAGE" "--base-url requires --provider=<id> (it configures a claude BYO endpoint; see 'agent create --base-url')"
+    [[ "$type" == "claude" ]] \
+      || fail "$E_VALIDATION" "--base-url is only supported for claude (got: $type — hermes/openclaw carry their own provider URL tables)"
+  fi
+  if [[ -n "$byo_model" ]]; then
+    [[ -n "$byo_provider" ]] \
+      || fail "$E_USAGE" "--model requires --provider=<id> (per-tier model ids are BYO-provider state)"
+    [[ "$type" == "claude" || "$type" == "hermes" || "$type" == "openclaw" ]] \
+      || fail "$E_VALIDATION" "--model is only supported for claude/hermes/openclaw (got: $type)"
+  fi
   [[ -n "$api_key" ]] || fail "$E_USAGE" "--api-key=<key> required (use --api-key=- to read from stdin)"
 
   if [[ "$api_key" == "-" ]]; then
@@ -1272,7 +1323,7 @@ cmd_auth_set() {
       # override env vars directly in combined.env, so skip that step for it.
       [[ "$type" == "claude" ]] || profile_type_dir "$profile" "$type" >/dev/null
     fi
-    apply_byo_provider "$type" "$byo_provider" "$api_key" "$profile"
+    apply_byo_provider "$type" "$byo_provider" "$api_key" "$profile" "$byo_model" "$base_url"
 
     # Restart any running agents that consume this credential so the new
     # provider takes effect immediately. Without this, hermes/openclaw

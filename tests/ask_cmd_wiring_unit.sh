@@ -26,6 +26,7 @@ set -euo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${WORK:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 
 # shellcheck disable=SC1091
@@ -49,7 +50,7 @@ die() { echo "FAIL: $*" >&2; exit 1; }
 # forever and every run times out. (Found in about ten seconds by pointing the
 # new FIVE_ASK_DEBUG_DIR at this very test: the dumped transcript showed the
 # mid-write frame and nothing after it. The instrument works.)
-WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+WORK="$(mktemp -d)"
 FRAME_F="$WORK/frame_n"; echo 0 > "$FRAME_F"
 
 JSON_MODE=0
@@ -79,7 +80,7 @@ sudo() {
   case "$*" in
     *"tmux has-session"*)  return 0 ;;
     *"tmux capture-pane"*) _frame ;;
-    *"agent _deliver"*)    return 0 ;;
+    *"agent _deliver"*)        printf '%s\n' '{"ok":true,"data":{"delivered":true}}'; return 0 ;;
     *"agent _capture"*)    _frame ;;
     *)                     return 0 ;;
   esac
@@ -89,6 +90,9 @@ wait_agent_input_ready()    { return 0; }
 inject_and_submit()         { return 0; }
 mirror_interagent_outbound(){ :; }
 auto_sender_from_sudo()     { echo dev; }
+_envelope_caller()          { echo dev; }
+envelope_tier()             { echo standard; }
+envelope_via()              { :; }
 gen_msg_id()                { echo "$MID"; }
 step()                      { :; }
 

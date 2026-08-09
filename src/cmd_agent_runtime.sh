@@ -371,8 +371,9 @@ _mirror_send() {
   # synthetic ok so delivery receipts/stamping still exercise downstream logic.
   if [[ -n "${FIVEDIVE_NOTIFY_DRYRUN:-}" && "${FIVEDIVE_NOTIFY_DRYRUN}" != "0" ]]; then
     local dry_line
-    dry_line=$(printf 'notify-dryrun chat=%s thread=%s markup=%s text=%q' \
-      "$chat" "${thread:-none}" "$([[ -n "$reply_markup" ]] && echo yes || echo no)" "$text")
+    dry_line=$(printf 'notify-dryrun chat=%s thread=%s markup=%s silent=%s text=%q' \
+      "$chat" "${thread:-none}" "$([[ -n "$reply_markup" ]] && echo yes || echo no)" \
+      "$([[ -n "${FIVEDIVE_NOTIFY_SILENT:-}" && "${FIVEDIVE_NOTIFY_SILENT}" != "0" ]] && echo yes || echo no)" "$text")
     if [[ -n "${FIVEDIVE_NOTIFY_DRYRUN_LOG:-}" ]]; then
       printf '%s\n' "$dry_line" >>"$FIVEDIVE_NOTIFY_DRYRUN_LOG" 2>/dev/null || true
     fi
@@ -383,6 +384,15 @@ _mirror_send() {
   local args=(--data-urlencode "chat_id=${chat}" --data-urlencode "text=${text}")
   [[ -n "$thread" ]] && args+=(--data-urlencode "message_thread_id=${thread}")
   [[ -n "$reply_markup" ]] && args+=(--data-urlencode "reply_markup=${reply_markup}")
+  # DIVE-2712: opt-in SILENT delivery. Set by the /inbox digest for every message
+  # after the first, so N gates cost the human ONE buzz and N readable messages
+  # instead of N buzzes. Deliberately an env var rather than a 5th positional:
+  # this is the single POST every owner/gate/mirror notify funnels through, and
+  # widening four call signatures across the notify rail to carry a UX flag is a
+  # bigger change than the feature. Default-empty, so every existing caller is
+  # byte-identical on the wire.
+  [[ -n "${FIVEDIVE_NOTIFY_SILENT:-}" && "${FIVEDIVE_NOTIFY_SILENT}" != "0" ]] \
+    && args+=(--data-urlencode "disable_notification=true")
   # Bounded so a hung/slow Telegram API can't wedge the FOREGROUND callers
   # (task_need_notify runs this after the gate UPDATE has already committed;
   # mirror_interagent_outbound likewise). --connect-timeout caps the TCP/TLS
@@ -719,6 +729,24 @@ inject_and_submit() {
     tries=$((tries+1))
   done
   return 1
+}
+
+# rc=1 from inject_and_submit means the payload was typed, but the pane still
+# looked idle after every submit retry. Keep one machine-stable reason for both
+# public receipts: `send` and the scoped `_deliver` path must not disagree about
+# why their success boolean is false (DIVE-2362).
+_agent_submit_unconfirmed_reason() {
+  printf '%s\n' 'pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)'
+}
+
+# `ask` has no successful reply to return when its initial submit cannot be
+# confirmed. Use the same non-fatal receipt as `send`: the payload may actually
+# have landed, but neither a caller nor a person should mistake that for proof.
+_agent_ask_unconfirmed() {
+  local name="$1" sender="$2" msg_id="$3" reason="$4"
+  ok "question to agent '$name' is unconfirmed — ${reason}." \
+     '{name:$n, sent:false, from:$s, msg_id:$i, reason:$r}' \
+     --arg n "$name" --arg s "$sender" --arg i "$msg_id" --arg r "$reason"
 }
 
 # _ask_accumulate <transcript-file> — reassemble a scrolling stream from repeated
@@ -1151,22 +1179,53 @@ cmd_deliver() {
   header+="]"
   local payload="${header} ${message}"
 
+  # DIVE-2797: the row for the SCOPED delivery path. `s` here is already derived
+  # from the real sudo caller — _deliver accepts no --from — so from_claimed and
+  # from_derived agree by construction for an agent caller, and the verdict reads
+  # `corroborated`. The one case it does not: a non-agent caller renders the
+  # synthetic `from=human` with nothing measured behind it, which envelope_via
+  # already reports as unknown:no-caller and this row now preserves.
+  #
+  # The independent check on this path is the row's own top-level `derived` field:
+  # audit_log resolves it through actor_derive, which behind a REAL root check
+  # prefers SUDO_UID (DIVE-1413) — so it names the pre-elevation caller by uid, not
+  # `root`, and not anything this process was told.
+  AUDIT_ARGS=(
+    "to=${target}"
+    "from_claimed=${s}"
+    "from_derived=${_caller:-<unmeasured>}"
+    "provenance=$(envelope_provenance "$s" "$_caller")"
+    "bytes=${#message}"
+    "msg_id=${msgid:-<none>}"
+  )
+
   # Same boot-race guard as cmd_send, then deliver by REUSING the literal-inject
   # primitive. The message is passed to send-keys with `-l --` (literal) and is
   # never interpreted as a command.
   if ! wait_agent_input_ready "$target"; then
     step "agent '$target' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
   fi
-  local _rc=0
+  local _rc=0 _delivered=1 _reason="" _summary=""
   inject_and_submit "$target" "$payload" || _rc=$?
   if (( _rc == 3 )); then
     fail "$E_AUTH_REQUIRED" "$(_agent_credential_refusal_msg "$target")"
   elif (( _rc != 0 )); then
-    step "agent '$target': payload may not have submitted — pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)"
+    _delivered=0
+    _reason="$(_agent_submit_unconfirmed_reason)"
   fi
-  ok "delivered to agent '$target'." \
-     '{name:$n, delivered:true, from:$s, tier:($t|select(length>0))}' \
-     --arg n "$target" --arg s "$s" --arg t "$tier"
+  if (( _delivered )); then
+    # Byte-for-byte rc=0 compatibility: this is the pre-DIVE-2362 receipt.
+    ok "delivered to agent '$target'." \
+       '{name:$n, delivered:true, from:$s, tier:($t|select(length>0))}' \
+       --arg n "$target" --arg s "$s" --arg t "$tier"
+  else
+    _summary="delivery to agent '$target' is unconfirmed — ${_reason}."
+    ok "$_summary" \
+       '({name:$n, delivered:false, from:$s}
+         + (if ($t|length) > 0 then {tier:$t} else {} end)
+         + {reason:$r})' \
+       --arg n "$target" --arg s "$s" --arg t "$tier" --arg r "$_reason"
+  fi
 }
 
 # DIVE-1074: privileged inter-agent READ primitive — the read half of `ask` for a
@@ -1596,10 +1655,19 @@ agent_wake_gate_ready() {
 cmd_send() {
   local name="" message="" from="" from_set=0 raw=0 wake=0
   local reply_to_chat="" reply_to_msg=""
+  # DIVE-2627: which flag supplied the body, so --message and --message-file
+  # cannot silently race each other. See _read_prose_file in lib/validation.sh.
+  local msg_src=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --message=*)        message="${1#--message=}" ;;
+      --message=*)        _prose_flag_dupe --message "$msg_src"; message="${1#--message=}"; msg_src="--message" ;;
+      # DIVE-2627: the body read VERBATIM from a file, so the caller's shell never
+      # assembles it. `5dive agent send dev --message="… \`task need\` …"` executes
+      # those backticks AS YOU, deletes the words, and still prints "OK — sent".
+      --message-file=*)   _prose_flag_dupe --message-file "$msg_src"
+                          _read_prose_file --message-file "${1#--message-file=}"
+                          message="$_PROSE_FILE_VALUE"; msg_src="--message-file" ;;
       --from=*)           from="${1#--from=}"; from_set=1 ;;
       --raw)              raw=1 ;;
       --wake)             wake=1 ;;
@@ -1615,7 +1683,15 @@ cmd_send() {
     name="${positional[0]}"
     positional=("${positional[@]:1}")
   fi
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent send <name> <text...> | --message=<text> [--from=<sender>] [--raw] [--wake] [--reply-to-chat=<id> [--reply-to-msg=<id>]]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent send <name> <text...> | --message=<text> | --message-file=<path> [--from=<sender>] [--raw] [--wake] [--reply-to-chat=<id> [--reply-to-msg=<id>]]"
+  # DIVE-2627: positional text is the third way to supply the body. With
+  # --message-file set, the `-z "$message"` guard below would DROP trailing
+  # positional words without a word about it, so refuse instead. Deliberately
+  # scoped to the NEW flag: `--message=` + positional has always silently
+  # preferred the flag, and re-litigating that is a different change with live
+  # callers. --message-file has no callers yet, so this costs nothing today.
+  [[ "$msg_src" != "--message-file" || ${#positional[@]} -eq 0 ]] \
+    || fail "$E_USAGE" "--message-file conflicts with the positional text — pass the body exactly once, either inline or from a file."
   if [[ -z "$message" && ${#positional[@]} -gt 0 ]]; then
     message="${positional[*]}"
   fi
@@ -1746,6 +1822,35 @@ cmd_send() {
     fi
   fi
 
+  # DIVE-2797: the audit row for this send. Populated HERE, after parsing, because
+  # the dispatcher's placeholder cannot tell a target from a message body.
+  #
+  # `from_derived` is the measurement and `from_claimed` is the assertion, and they
+  # are separate keys on purpose: a row that carries only `--from=` has logged the
+  # unverified string it exists to check, which produces an audit trail that looks
+  # complete and establishes nothing. The derivation goes through `_envelope_caller`
+  # — the same resolver the rendered envelope uses — so the log and the header a
+  # recipient reads can never disagree about who called.
+  #
+  # Derived UNCONDITIONALLY, including under --raw. A raw send is anonymous to the
+  # RECIPIENT by design; that is not a reason for it to be anonymous to the log.
+  # Before this, --raw was the one send with no envelope and no row at all.
+  #
+  # The body is NOT logged — `bytes` is. agent-audit.log is world-appendable via
+  # the privileged fallback and read by anyone with the box; message bodies carry
+  # gate asks, prose and pasted output, and the attribution question this ticket is
+  # about is answered by WHO and TO WHOM, never by the text.
+  local _audit_caller; _audit_caller="$(_envelope_caller)"
+  AUDIT_ARGS=(
+    "to=${name}"
+    "from_claimed=${sender:-<none>}"
+    "from_derived=${_audit_caller:-<unmeasured>}"
+    "provenance=$(envelope_provenance "$sender" "$_audit_caller")"
+    "bytes=${#message}"
+    "msg_id=${msg_id:-<none>}"
+    "raw=${raw}"
+  )
+
   # Don't fire keystrokes into a still-booting TUI — they'd be dropped and the
   # message lost. Wait for the input prompt to render (fast no-op when already
   # up). On timeout we still send best-effort and warn, rather than hang.
@@ -1761,12 +1866,13 @@ cmd_send() {
     step "agent '$name' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
   fi
 
-  local _rc=0
+  local _rc=0 _sent=1 _reason="" _summary=""
   inject_and_submit "$name" "$payload" || _rc=$?
   if (( _rc == 3 )); then
     fail "$E_AUTH_REQUIRED" "$(_agent_credential_refusal_msg "$name")"
   elif (( _rc != 0 )); then
-    step "agent '$name': payload may not have submitted — pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)"
+    _sent=0
+    _reason="$(_agent_submit_unconfirmed_reason)"
   fi
 
   # Mirror the outbound into the sender's group chat (best-effort). Gated on a
@@ -1783,9 +1889,23 @@ cmd_send() {
   # key was typed. "unprovable" = this runtime has no prompt marker, so the delivery
   # is an assumption. A scheduler that treats those the same is making the exact
   # mistake this ticket is about.
-  ok "sent to agent '$name'." \
-     '{name:$n, sent:true, bytes:($p|length), woken:($w=="1"), ready:($rd|select(length>0)), from:($s|select(length>0)), msg_id:($i|select(length>0)), reply_to_chat:($rc|select(length>0)), reply_to_msg:($rm|select(length>0))}' \
-     --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY"
+  if (( _sent )); then
+    # Byte-for-byte rc=0 compatibility: this is the pre-DIVE-2362 receipt.
+    ok "sent to agent '$name'." \
+       '{name:$n, sent:true, bytes:($p|length), woken:($w=="1"), ready:($rd|select(length>0)), from:($s|select(length>0)), msg_id:($i|select(length>0)), reply_to_chat:($rc|select(length>0)), reply_to_msg:($rm|select(length>0))}' \
+       --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY"
+  else
+    _summary="send to agent '$name' is unconfirmed — ${_reason}."
+    ok "$_summary" \
+       '({name:$n, sent:false, bytes:($p|length), woken:($w=="1")}
+         + (if ($rd|length) > 0 then {ready:$rd} else {} end)
+         + (if ($s|length) > 0 then {from:$s} else {} end)
+         + (if ($i|length) > 0 then {msg_id:$i} else {} end)
+         + (if ($rc|length) > 0 then {reply_to_chat:$rc} else {} end)
+         + (if ($rm|length) > 0 then {reply_to_msg:$rm} else {} end)
+         + {reason:$reason})' \
+       --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY" --arg reason "$_reason"
+  fi
 }
 
 # Synchronous send + wait — the inter-agent counterpart to cmd_send. Drops the
@@ -1879,6 +1999,25 @@ cmd_ask() {
     || fail "$E_VALIDATION" "invalid --from label '$sender' (lowercase letter start, [a-z0-9-], <=32 chars)"
   msg_id="$(gen_msg_id)"
 
+  # DIVE-2797: same row shape as cmd_send — `ask` is a send that waits, and it
+  # accepts the same forgeable `--from=`. Auditing `send` alone would have left the
+  # identical spoof unrecorded one verb over.
+  #
+  # A SCOPED ask writes two rows, not one: this one, plus the `agent _deliver` row
+  # from the privileged subprocess that performs the injection. That is the honest
+  # record — two invocations happened — and anyone counting rows to prove the
+  # logging works must count per `cmd`, not in total.
+  local _audit_caller; _audit_caller="$(_envelope_caller)"
+  AUDIT_ARGS=(
+    "to=${name}"
+    "from_claimed=${sender}"
+    "from_derived=${_audit_caller:-<unmeasured>}"
+    "provenance=$(envelope_provenance "$sender" "$_audit_caller")"
+    "bytes=${#message}"
+    "msg_id=${msg_id}"
+    "scoped=${use_scoped}"
+  )
+
   # DIVE-1901: snapshot the pane BEFORE injecting. Two uses, both load-bearing:
   # the baseline is the chrome list (everything already on screen is furniture,
   # for whatever TUI this seat runs), and acc_file is where the scrolling
@@ -1917,12 +2056,28 @@ cmd_ask() {
     # a blanket "missing grant?" here would relabel a fail-closed secret guard as
     # a provisioning problem — the caller would go re-provision the agent and
     # resend, straight back into the prompt. Pass rc 6 and its message through.
-    local _derr _drc=0
-    _derr=$(sudo -n /usr/local/bin/5dive agent _deliver --id="$msg_id" "$name" "$ask_message" 2>&1 >/dev/null) || _drc=$?
+    local _derr _drc=0 _dout _derr_file="$ask_tmp/deliver.err"
+    # DIVE-2362: _deliver rc=1 is deliberately non-fatal and therefore exits 0
+    # with delivered:false. Capture its JSON receipt instead of discarding stdout;
+    # otherwise scoped ask would wait for a reply after hiding the exact doubt
+    # direct ask now reports. stderr stays separate so rc=3 retains its refusal.
+    # Keep `agent _deliver` immediately after the binary: standard agents are
+    # granted exactly `/usr/local/bin/5dive agent _deliver *` in sudoers, so a
+    # global flag before the subcommand is a positional policy denial.
+    _dout=$(sudo -n /usr/local/bin/5dive agent _deliver --json --id="$msg_id" "$name" "$ask_message" 2>"$_derr_file") || _drc=$?
+    _derr=$(<"$_derr_file")
     if (( _drc == E_AUTH_REQUIRED )); then
       fail "$E_AUTH_REQUIRED" "${_derr#*: }"
     elif (( _drc != 0 )); then
       fail "$E_GENERIC" "scoped delivery to '$name' failed (missing _deliver grant? re-provision the agent)${_derr:+ — $_derr}"
+    fi
+    jq -e '.ok == true and (.data.delivered == true or .data.delivered == false)' <<<"$_dout" >/dev/null 2>&1 \
+      || fail "$E_GENERIC" "scoped delivery to '$name' returned no usable receipt"
+    if [[ "$(jq -r '.data.delivered' <<<"$_dout")" == false ]]; then
+      local _reason; _reason=$(jq -r '.data.reason // empty' <<<"$_dout")
+      [[ -n "$_reason" ]] || _reason="$(_agent_submit_unconfirmed_reason)"
+      _agent_ask_unconfirmed "$name" "$sender" "$msg_id" "$_reason"
+      return 0
     fi
   else
     require_agent "$name"
@@ -1958,7 +2113,9 @@ cmd_ask() {
     if (( _rc == 3 )); then
       fail "$E_AUTH_REQUIRED" "$(_agent_credential_refusal_msg "$name")"
     elif (( _rc != 0 )); then
-      step "agent '$name': question may not have submitted — pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)"
+      local _reason; _reason="$(_agent_submit_unconfirmed_reason)"
+      _agent_ask_unconfirmed "$name" "$sender" "$msg_id" "$_reason"
+      return 0
     fi
   fi
 
@@ -2235,7 +2392,7 @@ cmd_stats() {
     pane=$(sudo -u "agent-${name}" tmux capture-pane -t "agent-${name}" -p -S -40 2>/dev/null | tail -c 4000 || true)
     if [[ -n "$pane" ]]; then
       if grep -qiE "session limit|usage limit|hit your (usage|session) limit|rate limit|/rate-limit-options" <<<"$pane"; then
-        local reset; reset=$(grep -oiE "resets?[^|]*" <<<"$pane" | head -1 | tr -s ' ' | sed 's/[[:space:]]*$//')
+        local reset; reset=$(grep -oiE "resets?[^|]*" <<<"$pane" | head -1 | tr -s ' ' | sed 's/[[:space:]]*$//') || reset=""
         health=$(jq -cn --arg d "${reset:-no reset time shown}" '{cause:"rate_limited", detail:$d}')
       elif grep -qiE "(sign ?in|log ?in|authenticate|re-?authenticate|enter your api key)" <<<"$pane"; then
         health=$(jq -cn '{cause:"auth", detail:"sitting at a login screen — re-auth needed"}')

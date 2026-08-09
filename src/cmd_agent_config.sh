@@ -270,7 +270,7 @@ cmd_config() {
       # the install helper still has something to register/seed. Falls
       # through to the connector-secret file written on the prior call.
       token_for_install=$(grep -E '^TELEGRAM_BOT_TOKEN=' "${CONNECTORS_DIR}/telegram-${name}.env" 2>/dev/null \
-        | head -1 | cut -d= -f2-)
+        | head -1 | cut -d= -f2-) || token_for_install=""
       [[ -n "$token_for_install" ]] \
         || fail "$E_NOT_FOUND" "no stored telegram token for agent '$name' — include telegram.token=<token>"
     fi
@@ -314,7 +314,7 @@ cmd_config() {
     local discord_token_for_install="$new_discord_token"
     if [[ -z "$discord_token_for_install" ]]; then
       discord_token_for_install=$(grep -E '^DISCORD_BOT_TOKEN=' "${CONNECTORS_DIR}/discord-${name}.env" 2>/dev/null \
-        | head -1 | cut -d= -f2-)
+        | head -1 | cut -d= -f2-) || discord_token_for_install=""
       [[ -n "$discord_token_for_install" ]] \
         || fail "$E_NOT_FOUND" "no stored discord token for agent '$name' — include discord.token=<token>"
     fi
@@ -362,7 +362,7 @@ cmd_config() {
     local gate_ch gate_marketplace gate_dir gate_waited
     for gate_ch in ${channels_changed_to//,/ }; do
       case "$gate_ch" in
-        telegram|dashboard) gate_marketplace="5dive-plugins" ;;
+        telegram|dashboard|buzz) gate_marketplace="5dive-plugins" ;;
         discord)            gate_marketplace="claude-plugins-official" ;;
         *) continue ;;
       esac

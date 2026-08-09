@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
-# TIER: core — 2.4s measured (DIVE-2525): fits the 300s PR core; stated, not defaulted.
+# TIER: core — 2.4s measured (DIVE-2525, CI): fits the 300s PR core; stated, not defaulted.
+# DIVE-2801 added section 10 (18 arms). Cost of the ADDITION, measured as a paired
+# delta rather than an absolute so the box cancels: same host, interleaved runs,
+# origin/main@828c1ea 2.98s vs this branch 3.23s -> +0.25s (control plane,
+# 2026-08-05, `date +%s%N` either side of `bash tests/broker_surface_unit.sh`).
+# The 2.4s above is a CI number and is deliberately NOT overwritten with a
+# control-plane one — the two environments are not interchangeable, and a delta
+# transfers between them where an absolute does not.
 # tests/broker_surface_unit.sh — INST-5.
 #
 # Two questions, and the first is the one that decides whether this refactor was
@@ -40,6 +47,7 @@ set -uo pipefail
   exit 1
 }
 
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PASS=0; FAIL=0
 want() { local n="$1"; shift; if eval "$@"; then echo "  ok   $n"; PASS=$((PASS+1)); else echo "  FAIL $n"; FAIL=$((FAIL+1)); fi; }
@@ -48,7 +56,7 @@ same() { # <name> <expected> <actual>
   else echo "  FAIL $1"; echo "    old: $2"; echo "    new: $3"; FAIL=$((FAIL+1)); fi
 }
 
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+TMP=$(mktemp -d)
 
 # RETIRED (DIVE-2645): section 1 was a pinned-baseline differential proving the
 # INST-5 wrapper refactor left push's refusals byte-identical. That refactor is
@@ -69,8 +77,20 @@ db() {
   local col; col=$(sed -nE 's/.*COALESCE\(([a-z_]+),.*/\1/p' <<<"$1")
   printf '%s' "${ROW[$col]:-}"
 }
-_gate_closure_verify() { return "${CLOSURE_RC:-0}"; }
+# DIVE-2801: the stub now models the real function's FIRST LINE — `[[ -n "$sig" ]]
+# || return 1`. It used to return CLOSURE_RC unconditionally, i.e. it reported a
+# valid closure for a row with no signature at all, which is the one input this
+# section is about. A stub that differs from its subject on the very case under
+# test scores the arm, not the code.
+_gate_closure_verify() { [[ -n "${7:-}" ]] || return 1; return "${CLOSURE_RC:-0}"; }
 _gate_agent_for_uid()  { printf '%s' "${UID_AGENT:-}"; }
+# DIVE-2614: broker_gate_check now audit_logs the rejected-gate refusal before
+# fail()ing. This harness doesn't source lib/audit.sh, so stub it. `run()`
+# below exercises broker_gate_check in a subshell (to contain fail()'s exit),
+# so a plain array wouldn't survive back to the parent shell — a file does.
+AUDIT_LOG_CALLS="$TMP/audit_log_calls"
+: > "$AUDIT_LOG_CALLS"
+audit_log() { printf '%s\n' "$*" >> "$AUDIT_LOG_CALLS"; }
 
 # shellcheck source=../src/lib/broker.sh
 . "$ROOT/src/lib/broker.sh"
@@ -82,8 +102,14 @@ eval "$(awk '/^_push_task_branch\(\) \{/,/^\}$/' "$ROOT/src/cmd_push.sh")"
 
 run() { ( "$@" ) 2>/dev/null; printf 'rc=%s' "$?"; }
 
+# DIVE-2801: the default fixture now carries a closure SIGNATURE. Every arm below
+# that is about something else — verdict parsing, authorization provenance, target
+# binding — used to leave this column empty incidentally, and an empty signature is
+# now a refusal in its own right at require_sig=0. Seeding it keeps those arms
+# measuring their own subject; the arms that are ABOUT the empty column clear it
+# explicitly (== 10 below), which is also what makes the seed non-vacuous.
 reset_row() { ROW=( [need_type]="" [need_answered_at]="" [need_answer]="" \
-                    [need_answered_by]="" [need_answered_uid]="" [need_answer_sig]="" \
+                    [need_answered_by]="" [need_answered_uid]="" [need_answer_sig]="sig-fixture" \
                     [routed_reviewer]="" [body]="" ); CLOSURE_RC=0; UID_AGENT=""; }
 
 echo "== 2. the parameterization is LIVE, not dead: deploy says deploy"
@@ -170,6 +196,215 @@ _seen=$(for _t in "$ROOT"/tests/*.sh; do
         done | grep -c x)
 want "non-vacuity: the harness sweep inspected at least 15 harnesses (saw $_seen)" \
      '[[ "$_seen" -ge 15 ]]'
+
+echo
+echo "== 8. DIVE-2614: verdict is read off the FIRST LINE ONLY, as a WHOLE WORD"
+# Each case is authorized (human:lodar) so a rc=0 unambiguously means the
+# reject-check let it through; these are direct broker_gate_check calls, not
+# the old/new differential above — the pinned baseline still carries the bug,
+# so diffing against it here would assert the fix never happened.
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]=$'approve — ship it.\nNote: this line used to trip the prefix list.'
+ROW[need_answered_by]="human:lodar"
+out=$(run broker_gate_check push 7 DIVE-7)
+want "a later line beginning 'Note:' no longer inverts a first-line approval" '[[ "$out" == "rc=0" ]]'
+
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]="Nothing blocks this"; ROW[need_answered_by]="human:lodar"
+out=$(run broker_gate_check push 7 DIVE-7)
+want "'Nothing' no longer prefix-matches 'no'" '[[ "$out" == "rc=0" ]]'
+
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]="Blocking issues: none"; ROW[need_answered_by]="human:lodar"
+out=$(run broker_gate_check push 7 DIVE-7)
+want "'Blocking' no longer prefix-matches 'block'" '[[ "$out" == "rc=0" ]]'
+
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]="non-agent, same sha: exit 0, 12 arms"; ROW[need_answered_by]="human:lodar"
+out=$(run broker_gate_check push 7 DIVE-7)
+want "'non-agent' no longer prefix-matches 'no'" '[[ "$out" == "rc=0" ]]'
+
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]="Reject as-is — rebase first"; ROW[need_answered_by]="human:lodar"
+out=$(run broker_gate_check push 7 DIVE-7)
+want "a genuine first-line reject ('Reject as-is') still refuses" \
+     '[[ "$out" == *"REJECTED"* && "$out" == *"rc=9" ]]'
+
+# "not" was never one of the five stems (no|reject|deny|denied|block) — it only
+# ever tripped via the OLD "no" prefix bug, the same bug that caught "Note"/
+# "Nothing"/"None". Required property #2 in DIVE-2614 names "Not" explicitly
+# among the words that must stop reading as a veto, so this is the intended
+# behavior change, not a miss — though it means a real reject that opens with
+# a bare "Not ..." (DIVE-2577's "NOT AS-IS — rebase first" is exactly this
+# shape) now needs "no"/"reject"/"deny"/"denied"/"block" as its actual first
+# word to be caught. Flagged, not silently resolved: see the DIVE-2614 result.
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]="Not a blocker"; ROW[need_answered_by]="human:lodar"
+out=$(run broker_gate_check push 7 DIVE-7)
+want "'Not' alone no longer prefix-matches 'no' (required property #2)" '[[ "$out" == "rc=0" ]]'
+
+# main (2026-08-04, reviewing this same fix): `head -n1` reads "line 1", not
+# "the first line" — the moment line 1 is blank/whitespace, a genuine
+# rejection on a LATER line cleared the gate. A false APPROVE is worse than
+# the false REJECT this row exists to fix, and it lands on cmd_deploy.sh too.
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]=$'\nNo — rejected'; ROW[need_answered_by]="human:lodar"
+out=$(run broker_gate_check push 7 DIVE-7)
+want "a leading blank line no longer hides a rejection on line 2" \
+     '[[ "$out" == *"REJECTED"* && "$out" == *"rc=9" ]]'
+
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]=$'  \nrejected, do not push'; ROW[need_answered_by]="human:lodar"
+out=$(run broker_gate_check push 7 DIVE-7)
+want "a whitespace-only line 1 no longer hides 'rejected' on line 2" \
+     '[[ "$out" == *"REJECTED"* && "$out" == *"rc=9" ]]'
+
+# "rejected" needs its own stem, same as deny/denied already had — with a
+# word boundary, "reject" (no trailing \b match into "...ed") no longer
+# prefix-matches "rejected", so the inflected form would silently stop
+# tripping without this entry.
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]="Rejected — needs another pass"; ROW[need_answered_by]="human:lodar"
+out=$(run broker_gate_check push 7 DIVE-7)
+want "'Rejected' (inflected) still refuses, not just bare 'Reject'" \
+     '[[ "$out" == *"REJECTED"* && "$out" == *"rc=9" ]]'
+
+# main (2026-08-04, second review pass): "block" was left bare while
+# reject/rejected and deny/denied were both split — with the word boundary,
+# "block" no longer prefix-matches "blocked" ('k' then 'e', both word chars,
+# no boundary), the exact same inflection gap as "rejected". "Blocked —
+# needs a rebase first" is how a reviewer actually refuses, not an exotic
+# phrasing, and it's on the cmd_deploy.sh path.
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]="Blocked — needs a rebase first"; ROW[need_answered_by]="human:lodar"
+out=$(run broker_gate_check push 7 DIVE-7)
+want "'Blocked' (inflected) still refuses, not just bare 'Block'" \
+     '[[ "$out" == *"REJECTED"* && "$out" == *"rc=9" ]]'
+# ...and it trips on nothing else it shouldn't: the false positives this row
+# exists to fix stay fixed with 'blocked' added to the alternation.
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]="Blocking issues: none"; ROW[need_answered_by]="human:lodar"
+out=$(run broker_gate_check push 7 DIVE-7)
+want "adding 'blocked' didn't re-admit 'Blocking issues: none'" '[[ "$out" == "rc=0" ]]'
+
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]="Denied for now"; ROW[need_answered_by]="human:lodar"
+out=$(run broker_gate_check push 7 DIVE-7)
+want "'Denied' still refuses (existing stem, non-regression check)" \
+     '[[ "$out" == *"REJECTED"* && "$out" == *"rc=9" ]]'
+
+# An answer that is nothing but blank lines must not crash broker_gate_check
+# under set -euo pipefail (the real caller's mode, per header.sh — `run()`
+# above does not set -e, so this needs its own subshell to actually exercise
+# it): gverdict's `grep -m1 -v` finds no non-blank line and exits 1, and
+# pipefail promotes that to the whole substitution unless it's guarded.
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]=$'   \n   '; ROW[need_answered_by]="human:lodar"
+out=$(( set -euo pipefail; broker_gate_check push 7 DIVE-7 ) 2>/dev/null; printf 'rc=%s' "$?")
+want "a wholly-blank answer doesn't crash the guarded gverdict assignment under set -e" \
+     '[[ "$out" == "rc=0" ]]'
+
+echo
+echo "== 9. DIVE-2614: the rejected-gate refusal is audit-logged"
+: > "$AUDIT_LOG_CALLS"
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t; ROW[need_answer]="no, not yet"
+run broker_gate_check push 7 DIVE-7 >/dev/null
+want "exactly one audit_log call fired on the reject path" \
+     '[[ "$(wc -l < "$AUDIT_LOG_CALLS")" -eq 1 ]]'
+want "the audit call names the surface and ident" \
+     '[[ "$(cat "$AUDIT_LOG_CALLS")" == *"push gate"* && "$(cat "$AUDIT_LOG_CALLS")" == *"ident=DIVE-7"* ]]'
+
+: > "$AUDIT_LOG_CALLS"
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]="Nothing blocks this"; ROW[need_answered_by]="human:lodar"
+run broker_gate_check push 7 DIVE-7 >/dev/null
+want "no audit_log call on a clean approval" '[[ "$(wc -l < "$AUDIT_LOG_CALLS")" -eq 0 ]]'
+
+echo
+echo "== 10. DIVE-2801: the PREFLIGHT can see an absent closure signature, and says so"
+# The defect: `push --dry-run` reported OK and the real push refused the same row
+# seconds later (DIVE-2798). Cause — the dry-run runs this predicate at
+# require_sig=0 and the real push at 1, so the rehearsal evaluated a weaker
+# predicate than the performance and reported its verdict as the whole gate.
+#
+# The fix rests on a fact about _gate_closure_verify, not on a new policy: it
+# returns 1 on an EMPTY sig before computing anything, so "no signature at all" is
+# a refusal the executor is CERTAIN to make, and an unprivileged caller can read
+# that column even though it can never verify the HMAC. Absent is therefore
+# decidable here; invalid-but-present is not, and stays the executor's to call.
+
+# POSITIVE CONTROL FIRST, so this section cannot pass by always refusing.
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t; ROW[need_answer]=yes
+ROW[need_answered_by]="human:lodar"
+want "a SIGNED closure still clears the preflight cleanly (rc=0, no warning)" \
+     '[[ "$(run broker_gate_check push 7 DIVE-7)" == "rc=0" ]]'
+want "…and publishes state 'unverified' — present, but this caller could not check it" \
+     '[[ "$( broker_gate_check push 7 DIVE-7 >/dev/null 2>&1; printf "%s" "$BROKER_GATE_SIG_STATE" )" == "unverified" ]]'
+
+# THE ARM. Same authorized row, signature column empty.
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t; ROW[need_answer]=yes
+ROW[need_answered_by]="human:lodar"; ROW[need_answer_sig]=""
+unsigned_pre=$(run broker_gate_check push 7 DIVE-7)
+want "an UNSIGNED closure is refused by the preflight, not reported as cleared" \
+     '[[ "$unsigned_pre" != "rc=0" ]]'
+want "…and the refusal names the state it observed (no signature), not a verdict it did not reach" \
+     '[[ "$unsigned_pre" == *"carries NO closure signature"* ]]'
+want "…and says the executor is what refuses it, so the reader knows where the real check lives" \
+     '[[ "$unsigned_pre" == *"root-only executor"* ]]'
+want "…and names the remedy (re-answer so the closure signs), not just the fault" \
+     '[[ "$unsigned_pre" == *"5dive task answer DIVE-7"* ]]'
+
+# The preflight must NOT preempt the executor's own refusal: that message covers
+# unsigned AND tampered, it is the string DIVE-2798 measured, and moving the
+# authoritative refusal into a less-privileged reader would be a different change.
+want "at require_sig=1 the AUTHORITATIVE message is unchanged — the preflight did not steal it" \
+     '[[ "$(run broker_gate_check push 7 DIVE-7 1)" == *"no valid signed closure"* ]]'
+want "…and the preflight's own wording does NOT appear on the executor path" \
+     '[[ "$(run broker_gate_check push 7 DIVE-7 1)" != *"carries NO closure signature"* ]]'
+
+# Parameterization is live here too — deploy inherits the same preflight.
+want "deploy's preflight refuses an unsigned closure in ITS OWN noun" \
+     '[[ "$(run broker_gate_check deploy 7 DIVE-7)" == *"delegated deploy and refuses an unsigned one"* ]]'
+
+# A state left over from a PREVIOUS call must not be rendered as this call's answer.
+# Every refusal above returns before the signature block, so without an explicit
+# clear at entry a stale "verified" would survive into the next gate's rendering.
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t; ROW[need_answer]=yes
+ROW[need_answered_by]="human:lodar"
+# An EXIT trap, because `fail` exits: the second call cannot return to a printf, so
+# the reading has to be taken on the way out. Both calls run in the SAME (sub)shell,
+# so the first call's assignment really is visible to the second — which is exactly
+# the leak being tested, and why a plain `run` wrapper could not detect it.
+# The trap writes to a FILE, not to stdout: `fail`'s `exit` happens while the
+# refused call's `>/dev/null` redirection is still in force, so a trap printing to
+# stdout is swallowed and the arm reads '' — indistinguishable from a real clear,
+# i.e. the instrument would have passed this arm for the wrong reason.
+STALE_OUT="$TMP/stale_state"
+(
+  trap 'printf "%s" "${BROKER_GATE_SIG_STATE:-<cleared>}" > "$STALE_OUT"' EXIT
+  broker_gate_check push 7 DIVE-7 >/dev/null 2>&1   # sets 'unverified'
+  ROW[need_type]=""                                  # …now the row has no gate at all
+  broker_gate_check push 7 DIVE-7 >/dev/null 2>&1   # refuses EARLY, before the sig block
+)
+stale=$(cat "$STALE_OUT")
+want "state from a prior call does not survive into a gate that refuses EARLY (got '${stale}')" \
+     '[[ "$stale" == "<cleared>" ]]'
+
+echo "-- the note a rehearsal renders: four states, four distinct sentences"
+note() { ( BROKER_GATE_SIG_STATE="$1"; broker_gate_sig_note "${2:-push}" ); }
+want "verified reads as VERIFIED"        '[[ "$(note verified)"   == *"VERIFIED against the root HMAC"* ]]'
+want "unverified says it was NOT checked here, and names who does check it" \
+     '[[ "$(note unverified)" == *"NOT verified here"* && "$(note unverified)" == *"root executor verifies it at push time"* ]]'
+want "unverified names the DEPLOY surface when asked for deploy" \
+     '[[ "$(note unverified deploy)" == *"at deploy time"* ]]'
+want "absent reads as ABSENT"            '[[ "$(note absent)"     == *"ABSENT"* ]]'
+# The silence case: a caller that renders the note without ever running a gate
+# check must get a statement, never an empty string — an empty parenthetical in a
+# dry-run line is exactly the confident-looking silence this ticket is about.
+want "an UNSET state renders 'NOT CHECKED', never empty" \
+     '[[ -n "$(note "")" && "$(note "")" == *"NOT CHECKED"* ]]'
+want "the four sentences are actually distinct (the case arms are not one string)" \
+     '[[ "$(printf "%s\n" "$(note verified)" "$(note unverified)" "$(note absent)" "$(note "")" | sort -u | wc -l)" -eq 4 ]]'
 
 echo
 echo "broker surface unit: ${PASS} passed, ${FAIL} failed"
