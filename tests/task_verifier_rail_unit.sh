@@ -259,7 +259,7 @@ done
 
 # T11b: UNDER the cap, an internal row is accepted — and books NO grading pass.
 # This is the half that moves tokens: the row used to cost a grading round-trip.
-int_json=$(run add --assignee=alice --priority=high -- "the release-cut harness is red")
+int_json=$(run add --assignee=alice --priority=medium -- "the release-cut harness is red")
 int_id=$(printf '%s' "$int_json" | jf '.data.id')
 [[ -n "$int_id" && "$int_id" != "null" \
    && "$(printf '%s' "$int_json" | jf '.data.verifySkipReason')" == "internal machinery" \
@@ -269,7 +269,7 @@ int_id=$(printf '%s' "$int_json" | jf '.data.id')
 
 # T11c: an explicit --verifier still forces grading ON. The skip is a default,
 # not a ceiling — same contract T3 asserts for the low-priority skip.
-fv_json=$(run add --assignee=alice --priority=high --verifier=boss -- "the CI job budget-report must be graded")
+fv_json=$(run add --assignee=alice --priority=medium --verifier=boss -- "the CI job budget-report must be graded")
 fv_id=$(printf '%s' "$fv_json" | jf '.data.id')
 [[ "$(db "SELECT verifier FROM tasks WHERE id=${fv_id};")" == "boss" ]] \
   && ok_t "T11c --verifier forces grading ON for an internal row" \
@@ -279,7 +279,7 @@ fv_id=$(printf '%s' "$fv_json" | jf '.data.id')
 for i in 1 2 3 4 5; do
   run add --assignee=alice --priority=medium -- "worktree cleanup sweep ${i}" >/dev/null
 done
-over_out=$(run add --assignee=alice --priority=high -- "another harness is flaky"); over_rc=$?
+over_out=$(run add --assignee=alice --priority=medium -- "another harness is flaky"); over_rc=$?
 (( over_rc != 0 )) && has "$(cat "$TMP"/err)$over_out" "filing cap" \
   && ok_t "T11d over the cap, an internal row is REFUSED" \
   || bad_t "T11d over the cap, an internal row is REFUSED" "rc=$over_rc $over_out $(cat "$TMP"/err)"
@@ -292,7 +292,7 @@ has "$(cat "$TMP"/err)$over_out" "--already-blocked" \
   || bad_t "T11e the refusal names both declared escapes" "$(cat "$TMP"/err)"
 
 # T11f: a CUSTOMER-facing row is never capped, however full the window is.
-cust_json=$(run add --assignee=alice --priority=high -- "dashboard billing page renders a stale plan")
+cust_json=$(run add --assignee=alice --priority=medium -- "dashboard billing page renders a stale plan")
 cust_id=$(printf '%s' "$cust_json" | jf '.data.id')
 [[ -n "$cust_id" && "$cust_id" != "null" ]] \
   && ok_t "T11f a customer-surface row is unaffected by a full window" \
@@ -301,7 +301,7 @@ cust_id=$(printf '%s' "$cust_json" | jf '.data.id')
 # T11g: --customer overrides a WRONG classification. The product row that named
 # this arm is real: "Free OSS web UI: three views (org chart, queue, gates)" is a
 # customer surface that matches the scan on two words.
-fp_json=$(run add --assignee=alice --priority=high --customer -- "free OSS web UI: org chart, queue and gates served by the CLI")
+fp_json=$(run add --assignee=alice --priority=medium --customer -- "free OSS web UI: org chart, queue and gates served by the CLI")
 fp_id=$(printf '%s' "$fp_json" | jf '.data.id')
 [[ -n "$fp_id" && "$fp_id" != "null" \
    && "$(db "SELECT verifier FROM tasks WHERE id=${fp_id};")" == "boss" ]] \
@@ -310,7 +310,7 @@ fp_id=$(printf '%s' "$fp_json" | jf '.data.id')
 
 # T11h: --already-blocked lands the row over the cap AND records why on it.
 # An exception that leaves no trace is an opt-out, not an exception.
-ab_json=$(run add --assignee=alice --priority=high --already-blocked="took task done down fleet-wide for 40m" -- "the merge gate harness is wrong")
+ab_json=$(run add --assignee=alice --priority=medium --already-blocked="took task done down fleet-wide for 40m" -- "the merge gate harness is wrong")
 ab_id=$(printf '%s' "$ab_json" | jf '.data.id')
 [[ -n "$ab_id" && "$ab_id" != "null" ]] \
   && has "$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${ab_id};")" "took task done down fleet-wide" \
@@ -318,11 +318,45 @@ ab_id=$(printf '%s' "$ab_json" | jf '.data.id')
   || bad_t "T11h --already-blocked lands over the cap and records the reason in the body" "$ab_json"
 
 # T11i: the fleet kill-switch, so an incident is never gated by a filing rule.
-kill_json=$(FIVE_FILING_CAP=0 run add --assignee=alice --priority=high -- "yet another harness is flaky")
+kill_json=$(FIVE_FILING_CAP=0 run add --assignee=alice --priority=medium -- "yet another harness is flaky")
 [[ "$(printf '%s' "$kill_json" | jf '.data.id')" != "null" \
    && -n "$(printf '%s' "$kill_json" | jf '.data.id')" ]] \
   && ok_t "T11i FIVE_FILING_CAP=0 disables the refusal fleet-wide" \
   || bad_t "T11i FIVE_FILING_CAP=0 disables the refusal fleet-wide" "$kill_json"
+
+# T11o: HIGH AND URGENT ARE NEVER CAPPED. The window is over the cap right now,
+# and T11d proved the identical shape is refused at medium — so these two arms
+# change exactly one thing. A quota whose failure mode is eating a serious
+# finding is worse than a quota that lets a few through, and the two directions
+# do not cost the same.
+_t11o_bad=""
+for _p in high urgent; do
+  _o=$(run add --assignee=alice --priority="$_p" -- "the merge gate harness is red and blocks the cut")
+  _oid=$(printf '%s' "$_o" | jf '.data.id')
+  [[ -z "$_oid" || "$_oid" == "null" ]] && _t11o_bad+="REFUSED AT ${_p}: ${_o} $(cat "$TMP"/err)"$'\n'
+done
+[[ -z "$_t11o_bad" ]] \
+  && ok_t "T11o high and urgent are never capped, on a title that IS refused at medium" \
+  || bad_t "T11o high and urgent are never capped, on a title that IS refused at medium" "$_t11o_bad"
+
+# T11p: A REFUSAL LEAVES THE FINDING SOMEWHERE. The cap used to `fail` and that
+# was the whole record — the refused TITLE existed nowhere afterwards, so a cap
+# that ate a real finding was indistinguishable from one that never fired. The
+# title must be recoverable from policy_refusals, not merely mentioned on a
+# terminal that has already scrolled.
+_t11p_title="the verifier rail drops a gate silently on every recurring row"
+run add --assignee=alice --priority=medium -- "$_t11p_title" >/dev/null 2>&1
+_t11p_rows=$(db "SELECT COUNT(*) FROM policy_refusals WHERE policy='filing-cap-internal-machinery';")
+_t11p_kept=$(db "SELECT COUNT(*) FROM policy_refusals WHERE policy='filing-cap-internal-machinery' AND detail LIKE '%${_t11p_title}%';")
+[[ "$_t11p_rows" -ge 1 && "$_t11p_kept" -ge 1 ]] \
+  && ok_t "T11p a refused filing is recorded in policy_refusals WITH its title" \
+  || bad_t "T11p a refused filing is recorded in policy_refusals WITH its title" "rows=$_t11p_rows kept=$_t11p_kept"
+
+# T11q: and the refusal still names the priority escape, so the filer learns the
+# way through at the moment they are stopped rather than from a doc.
+has "$(cat "$TMP"/err)" "--priority=high" \
+  && ok_t "T11q the refusal names the priority escape" \
+  || bad_t "T11q the refusal names the priority escape" "$(cat "$TMP"/err)"
 
 # T11j: THE ARITY REGRESSION (2026-08-09). The first cut keyed on multi-word
 # phrases — "verifier rail", "merge gate", "task add" — while the rows the fleet
@@ -387,7 +421,7 @@ done
 # policy refusing their setup, and it is why widening the classifier was safe.
 _t11m_saved="$FIVEDIVE_PROD_TASKS_DB"
 export FIVEDIVE_PROD_TASKS_DB="$TMP/not-the-real-board.db"
-nb_json=$(run add --assignee=alice --priority=high -- "w review gate harness seeds a row over the cap")
+nb_json=$(run add --assignee=alice --priority=medium -- "w review gate harness seeds a row over the cap")
 nb_id=$(printf '%s' "$nb_json" | jf '.data.id')
 [[ -n "$nb_id" && "$nb_id" != "null" ]] \
   && ok_t "T11m the cap does not govern a store that is not the production board" \
@@ -396,7 +430,7 @@ export FIVEDIVE_PROD_TASKS_DB="$_t11m_saved"
 
 # T11n: and putting the declaration back RESTORES the refusal on the same title.
 # Without this pair T11m is indistinguishable from a cap that stopped working.
-nb2_out=$(run add --assignee=alice --priority=high -- "w review gate harness seeds a row over the cap"); nb2_rc=$?
+nb2_out=$(run add --assignee=alice --priority=medium -- "w review gate harness seeds a row over the cap"); nb2_rc=$?
 (( nb2_rc != 0 )) && has "$(cat "$TMP"/err)$nb2_out" "filing cap" \
   && ok_t "T11n restoring the prod declaration restores the refusal (T11m was the store, not a broken cap)" \
   || bad_t "T11n restoring the prod declaration restores the refusal (T11m was the store, not a broken cap)" "rc=$nb2_rc $nb2_out $(cat "$TMP"/err)"
@@ -435,7 +469,7 @@ readback=$( set -euo pipefail
 # T12c: end-to-end — an internal-titled add under the shipping options either
 # creates a row or refuses, but ALWAYS says something. Silence is the bug.
 e2e_out=$( set -euo pipefail
-           JSON_MODE=0; cmd_task_add --assignee=alice --priority=high -- "the nightly sweep harness is flaky" 2>&1 ) ; e2e_rc=$?
+           JSON_MODE=0; cmd_task_add --assignee=alice --priority=medium -- "the nightly sweep harness is flaky" 2>&1 ) ; e2e_rc=$?
 [[ -n "$e2e_out" ]] \
   && ok_t "T12c an internal-titled add under set -e produces OUTPUT, never a silent exit" \
   || bad_t "T12c an internal-titled add under set -e produces OUTPUT, never a silent exit" "rc=$e2e_rc (empty output)"

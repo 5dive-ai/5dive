@@ -1245,7 +1245,17 @@ cmd_task_add() {
   # hid this by never matching those titles; it was always the wrong scope.
   # Store identity is the same primitive _task_human_send_allowed (DIVE-1506) uses
   # one control over, for the same "a fixture must not act on prod" reason.
-  if _task_filing_cap_store_is_prod && [[ -n "$internal_reason" && -z "$already_blocked" && "${FIVE_FILING_CAP:-1}" != "0" ]]; then
+  # HIGH AND URGENT ARE NEVER CAPPED (lodar, 2026-08-09: "maybe refuse only low
+  # and med priority tasks"). The cap exists to stop the fleet filing routine
+  # observations about itself, and a quota that can block a SERIOUS finding is a
+  # quota that will eventually eat one — the cost of the two failure directions
+  # is not symmetric. An agent that has judged something high or urgent has said
+  # more about it than any title scan can, so that judgement wins. This also
+  # narrows what the escapes are for: --already-blocked is now about the stated
+  # exception at medium, not a way to force a serious row through.
+  local _cap_exempt_priority=""
+  [[ "$priority" == "high" || "$priority" == "urgent" ]] && _cap_exempt_priority=1
+  if _task_filing_cap_store_is_prod && [[ -z "$_cap_exempt_priority" && -n "$internal_reason" && -z "$already_blocked" && "${FIVE_FILING_CAP:-1}" != "0" ]]; then
     # `|| true` on the read as well as the newline at the producer: two
     # independent guards, because a filing rule must never be able to take
     # `task add` down. If the read ever comes back empty the cap declines to
@@ -1257,8 +1267,25 @@ cmd_task_add() {
     # Only enforce once the window is big enough to mean anything — on a fresh
     # board a 1-in-4 rule computed over three rows is noise, not a signal.
     if (( _win >= 8 )) && (( (_hits + 1) * 4 > (_win + 1) )); then
-      fail "$E_VALIDATION" "filing cap: ${_hits} of the last ${_win} rows are already internal machinery — this one would make it $((_hits + 1))/$((_win + 1)), over the 1-in-4 cap.
+      # A REFUSAL MUST LEAVE THE FINDING SOMEWHERE (lodar, 2026-08-09: "if task
+      # is refused where will it be logged if something serious found?"). Until
+      # now: nowhere. `fail` printed to the caller's terminal and returned, so a
+      # refused row left no record of its own title — the cap could eat a real
+      # finding and neither the filer's next session nor anyone auditing the cap
+      # could recover what was lost. policy_refuse writes the TITLE into
+      # policy_refusals.detail and emits a policy.refused lifecycle event, so
+      # `5dive task refusals` and the ledger both hold it. It fails with the same
+      # code afterwards, so the refusal itself is unchanged.
+      #
+      # The ident slot takes the would-be title rather than an ident, because at
+      # this point in `task add` the row does not exist and never will — the
+      # whole event is "this title was not allowed to become a row". Recording a
+      # synthetic ident would be worse than none: it would look like a lookup key.
+      policy_refuse "$E_VALIDATION" filing-cap-internal-machinery DIVE-2681 "(unfiled) ${title}" \
+        "filing cap: ${_hits} of the last ${_win} rows are already internal machinery — this one would make it $((_hits + 1))/$((_win + 1)), over the 1-in-4 cap.
+REFUSED TITLE (recorded in policy_refusals, not lost): ${title}
 An internal-machinery finding gets its own ident ONLY if it has ALREADY blocked shipped work. Otherwise it belongs in the body of the row it was found on, or in the team wiki.
+  · it is serious                  →  --priority=high (high and urgent are never capped)
   · it already blocked something   →  --already-blocked='<what it blocked>'
   · the scan is wrong, this is a customer surface  →  --customer
   · fleet-wide override (emergencies)  →  FIVE_FILING_CAP=0"
