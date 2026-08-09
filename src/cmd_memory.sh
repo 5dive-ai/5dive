@@ -38,7 +38,7 @@ _memory_usage() {
                    [--type=user|feedback|project|reference] [--store=mine|wiki]
                    [--tags=a,b] [--valid-to=YYYY-MM-DD] [--supersedes=<slug>]
                    [--confidence=high|medium|low] [--provenance="<source>"]
-                   [--force]   (body on stdin)
+                   [--evidence=<kind>:<ref>]... [--no-dedup] [--force]  (body on stdin)
       Compile a durable memory: writes a frontmatter markdown file into your
       own store (default) or the shared team wiki (--store=wiki, the publish
       path other agents can search), stamps provenance (who/when), appends the
@@ -49,11 +49,21 @@ _memory_usage() {
       (that one is then demoted in recall instead of silently lingering);
       --confidence = how sure; --provenance = where the fact came from. Recall
       demotes + flags expired / superseded / low-confidence facts (never hides).
+      Evidence back-refs (DIVE-3106, idea-derived from TencentDB-Agent-Memory,
+      MIT): --evidence is repeatable and STRUCTURAL, so "re-verify this claim"
+      is a mechanical walk instead of re-reading prose. Kinds:
+        file:<path>[:line]  task:DIVE-1234  cmd:<command that proves it>
+        sha:<gitsha>  url:<https://...>  run:<id>
+      It sits BESIDE --provenance (free text), which is unchanged. A memory
+      with no evidence is not flagged, demoted, or degraded.
+      Write-time dedup: `add` WARNS (never refuses) when the body overlaps an
+      existing memory in the same store — silence it with --no-dedup.
 
   5dive memory doctor [--roots=a,b] [--agent=<name>] [--code-root=<dir>] [--json]
       Hygiene pass over the memory store(s): index drift (MEMORY.md vs files on
       disk), dangling [[wiki-links]], stale source refs (file:line no longer in
-      the codebase), and near-duplicate memories. Also runs inside the
+      the codebase), near-duplicate memories, and dangling structural
+      evidence back-refs (--evidence file: targets). Also runs inside the
       `memory` category of `5dive doctor` for the whole box.
 
 Searches the agent's own ~/.claude/projects/*/memory stores (+ the shared wiki
@@ -254,9 +264,82 @@ MEMJS
 # to --store=wiki is the PUBLISH path that makes a fact fleet-searchable —
 # cross-agent recall happens by publishing here, never by opening the 0600
 # per-agent stores (deny-by-default, same posture as the DIVE-481 gate).
+# _memory_emit_evidence <indent> [ref...] — emit the structural evidence list as
+# YAML. Values are double-quoted (a cmd: ref carries arbitrary shell text).
+_memory_emit_evidence() {
+  local indent="$1"; shift
+  [ $# -gt 0 ] || return 0
+  printf '%sevidence:\n' "$indent"
+  local r
+  for r in "$@"; do
+    printf '%s  - "%s"\n' "$indent" "$(printf '%s' "$r" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  done
+}
+
+# _memory_dedup_warn <target-file> <store-dir> — DIVE-3106 write-time dedup.
+# ADVISORY ONLY, by lodar's constraint (2026-08-09): `memory add` already carries
+# one load-bearing refusal (the secret tripwire) and a second refusal on the same
+# verb would make compiling feel adversarial — a duplicate memory is cheaper than
+# a false refusal on a write path. So: warn on stderr, exit 0, always.
+# Same Jaccard-over-body-words shape as the doctor's near-dup check, so the two
+# agree. Body arrives on stdin. python3 absent (customer boxes) = silently skip.
+# NOTE the body arrives as a FILE, not on stdin. The heredoc that carries this
+# program IS python3's stdin, so a piped body would be swallowed by `python3 -`
+# and sys.stdin.read() would return the tail of the program. (Caught by the
+# harness, not by review: the dedup silently never fired.)
+_memory_dedup_warn() {
+  local target="$1" dir="$2" bodyfile="$3"
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$target" "$dir" "$bodyfile" <<'DEDUPPY' >&2 || true
+import os, re, sys
+target, store, bodyfile = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    body = open(bodyfile, encoding="utf-8", errors="replace").read()
+except OSError:
+    sys.exit(0)
+WORD = re.compile(r"[a-z0-9_./-]{3,}")
+def words(t):
+    t = re.sub(r"\A---\n.*?\n---\n", "", t, flags=re.S)   # drop frontmatter
+    return set(WORD.findall(t.lower()))
+mine = words(body)
+if len(mine) < 12:
+    sys.exit(0)
+hits = []
+try:
+    entries = sorted(os.listdir(store))
+except OSError:
+    sys.exit(0)
+for f in entries:
+    if not f.endswith(".md") or f in ("MEMORY.md", "index.md"):
+        continue
+    path = os.path.join(store, f)
+    if os.path.abspath(path) == os.path.abspath(target):
+        continue                                  # --force update-in-place
+    try:
+        w = words(open(path, encoding="utf-8", errors="replace").read())
+    except OSError:
+        continue
+    if len(w) < 12:
+        continue
+    inter = len(mine & w)
+    if not inter:
+        continue
+    jac = inter / len(mine | w)
+    if jac >= 0.6:
+        hits.append((jac, f))
+for jac, f in sorted(hits, reverse=True)[:3]:
+    sys.stderr.write(
+        "\u26a0 near-duplicate: %d%% token overlap with %s \u2014 consider updating "
+        "it in place (--force) or --supersedes; writing anyway "
+        "(--no-dedup silences this)\n" % (int(jac * 100), f))
+DEDUPPY
+  return 0
+}
+
 _memory_add() {
-  local name="" type="" desc="" store="mine" tags="" force=0
+  local name="" type="" desc="" store="mine" tags="" force=0 no_dedup=0
   local valid_to="" supersedes="" confidence="" provenance=""
+  local evidence=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --name=*)        name="${1#*=}" ;;
@@ -268,6 +351,8 @@ _memory_add() {
       --supersedes=*)  supersedes="${1#*=}" ;;
       --confidence=*)  confidence="${1#*=}" ;;
       --provenance=*)  provenance="${1#*=}" ;;
+      --evidence=*)    evidence+=("${1#*=}") ;;
+      --no-dedup)      no_dedup=1 ;;
       --force)         force=1 ;;
       -h|--help)       _memory_usage; return 0 ;;
       *)               fail "$E_USAGE" "memory add: unknown arg: $1" ;;
@@ -289,6 +374,24 @@ _memory_add() {
   if [ -n "$confidence" ]; then case "$confidence" in high|medium|low) : ;; *) fail "$E_VALIDATION" "--confidence must be high|medium|low" ;; esac; fi
   if [ -n "$supersedes" ]; then printf '%s' "$supersedes" | grep -qE '^[a-z0-9][a-z0-9_-]{0,63}$' \
       || fail "$E_VALIDATION" "--supersedes must be the slug of the memory it replaces"; fi
+  # DIVE-3106 evidence back-refs: a STRUCTURAL path from the claim to the ground
+  # truth, so re-verification is a mechanical walk. The kind prefix is what makes
+  # it walkable — a free-text ref would just be a second --provenance.
+  local _ev
+  for _ev in ${evidence+"${evidence[@]}"}; do
+    case "$_ev" in
+      file:?*|task:?*|cmd:?*|sha:?*|url:?*|run:?*) : ;;
+      *) fail "$E_VALIDATION" "--evidence must be <kind>:<ref> (file|task|cmd|sha|url|run), got: $_ev" ;;
+    esac
+    case "$_ev" in
+      task:*) printf '%s' "${_ev#task:}" | grep -qE '^[A-Z]+-[0-9]+$' \
+          || fail "$E_VALIDATION" "--evidence task: wants a board ident like DIVE-1234, got: ${_ev#task:}" ;;
+      sha:*)  printf '%s' "${_ev#sha:}" | grep -qE '^[0-9a-f]{7,40}$' \
+          || fail "$E_VALIDATION" "--evidence sha: wants a git sha, got: ${_ev#sha:}" ;;
+      url:*)  printf '%s' "${_ev#url:}" | grep -qE '^https?://' \
+          || fail "$E_VALIDATION" "--evidence url: wants an http(s) URL, got: ${_ev#url:}" ;;
+    esac
+  done
   [ -t 0 ] && fail "$E_USAGE" "memory add reads the body on stdin — pipe or heredoc it"
   local body; body=$(cat)
   [ -n "$(printf '%s' "$body" | tr -d '[:space:]')" ] || fail "$E_USAGE" "empty body on stdin — nothing to remember"
@@ -334,6 +437,15 @@ _memory_add() {
     fail "$E_CONFLICT" "$(basename "$file") already exists — update it with --force, or pick a new --name"
   fi
   local existed=0; [ -f "$file" ] && existed=1
+  # Advisory dedup (never refuses) — before the write, so the warning is useful.
+  if [ "$no_dedup" -ne 1 ]; then
+    local _bf; _bf=$(mktemp "${TMPDIR:-/tmp}/5dive-mem-dedup.XXXXXX") || _bf=""
+    if [ -n "$_bf" ]; then
+      printf '%s' "$body" > "$_bf"
+      _memory_dedup_warn "$file" "$dir" "$_bf"
+      rm -f "$_bf"
+    fi
+  fi
 
   if [ "$store" = "wiki" ]; then
     { printf -- '---\ntitle: %s\n' "$name"
@@ -342,6 +454,7 @@ _memory_add() {
       [ -n "$valid_to" ]   && printf 'valid_to: %s\n' "$valid_to"
       [ -n "$supersedes" ] && printf 'supersedes: %s\n' "$supersedes"
       [ -n "$provenance" ] && printf 'provenance: "%s"\n' "$(printf '%s' "$provenance" | sed 's/"/\\"/g')"
+      _memory_emit_evidence "" ${evidence+"${evidence[@]}"}
       printf 'updated: %s\ncompiled_by: %s\n---\n\n%s\n' "$today" "$who" "$body"
     } > "$file"
   else
@@ -352,6 +465,7 @@ _memory_add() {
       [ -n "$valid_to" ]   && printf '  valid_to: %s\n' "$valid_to"
       [ -n "$supersedes" ] && printf '  supersedes: %s\n' "$supersedes"
       [ -n "$provenance" ] && printf '  provenance: "%s"\n' "$(printf '%s' "$provenance" | sed 's/"/\\"/g')"
+      _memory_emit_evidence "  " ${evidence+"${evidence[@]}"}
       printf -- '---\n\n%s\n' "$body"
     } > "$file"
   fi
@@ -492,6 +606,33 @@ def typo_suspect(target, slugs):
                 break
     return best if best_d <= thresh else None
 
+EVID_ITEM_RE = re.compile(r'^\s*-\s*"?([a-z]+:[^"\n]*?)"?\s*$')
+
+def evidence_of(text):
+    """Structural --evidence back-refs out of the frontmatter (DIVE-3106).
+    Both layouts: top-level `evidence:` (wiki) and nested under `metadata:`
+    (own store). Returns a list of '<kind>:<ref>' strings."""
+    if not text.startswith("---"):
+        return []
+    end = text.find("\n---", 3)
+    if end == -1:
+        return []
+    out, collecting = [], False
+    for ln in text[3:end].splitlines():
+        st = ln.strip()
+        if re.match(r'^evidence:\s*$', st):
+            collecting = True
+            continue
+        if collecting:
+            m = EVID_ITEM_RE.match(ln)
+            if m:
+                out.append(m.group(1).strip())
+                continue
+            if st and not st.startswith("-"):
+                collecting = False
+    return out
+
+
 def ref_exists(store_dir, token):
     if os.path.isabs(token):
         return os.path.exists(token)
@@ -533,6 +674,7 @@ for store in stores:
 
     all_slugs = set()
     docs = {}   # fname -> (name, mtype, body, wordset)
+    evid = {}   # fname -> ['<kind>:<ref>', ...]  (DIVE-3106 back-refs)
     for f in mem_files:
         try:
             with open(os.path.join(store, f), encoding="utf-8", errors="replace") as fh:
@@ -542,6 +684,7 @@ for store in stores:
         name, mtype, body = split_front(text)
         all_slugs |= slugs_of(f, name)
         docs[f] = (name, mtype, body, set(WORD_RE.findall(body.lower())))
+        evid[f] = evidence_of(text)
 
     # --- index drift ---
     if index_file:
@@ -582,6 +725,25 @@ for store in stores:
                 if ("/" in tok or f"{tok}:" in body) and not ref_exists(store, tok):
                     add(sname, f, "stale-ref", "warn",
                         f"cites '{tok}' which no longer exists in the codebase")
+
+    # --- evidence back-refs (DIVE-3106) ---
+    # ONLY file: targets are mechanically walkable offline; task:/cmd:/url:/run:/
+    # sha: need the board, a shell, or the network, so the doctor stays silent on
+    # them rather than crying wolf. A memory with NO evidence is never flagged —
+    # back-refs are additive and their absence is not a defect (lodar, 08-09).
+    for f, refs in evid.items():
+        for r in refs:
+            if not r.startswith("file:"):
+                continue
+            tok = r[5:].strip()
+            tok = re.sub(r':\d+$', '', tok)          # strip :line
+            if not tok:
+                add(sname, f, "evidence-ref", "warn",
+                    "evidence 'file:' back-ref is empty")
+            elif basenames and not ref_exists(store, tok):
+                add(sname, f, "evidence-ref", "warn",
+                    f"evidence back-ref '{tok}' no longer exists — the claim "
+                    f"can't be re-walked")
 
     # --- near-duplicate (Jaccard over body word-sets, same store) ---
     names = list(docs)
