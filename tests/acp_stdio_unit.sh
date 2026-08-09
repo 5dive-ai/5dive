@@ -156,12 +156,23 @@ want "$(jq -e 'select(.id==4)|.result.stopReason=="cancelled"' "$WORK/cancel.jso
   "session/cancel lands WHILE the prompt is open and the turn answers stopReason cancelled"
 
 # stdout is the wire: a stray diagnostic on it is a parse error in the client.
+#
+# COUNTED FIRST, on purpose (olivia, grading e577edd): "no unparseable lines" is
+# structurally pass-on-zero — an EMPTY stdout satisfies it — so on its own it would
+# have read green in exactly the run where the server never spoke. The floor is
+# asserted here rather than left to the sibling arms, so trimming them cannot
+# quietly turn this into a tautology.
+frames=$(grep -c . "$WORK/out.jsonl" 2>/dev/null || true)
+frames=${frames:-0}
+want "$([[ $frames -ge 8 ]] && echo true)" \
+  "stdout carried frames at all ($frames lines; 7 responses + notifications) — the purity arm is pass-on-zero without this"
 badlines=0
 while IFS= read -r line; do
   [[ -z "$line" ]] && continue
   jq -e . >/dev/null 2>&1 <<<"$line" || badlines=$((badlines+1))
 done < "$WORK/out.jsonl"
-want "$([[ $badlines -eq 0 ]] && echo true)" "every stdout line is one parseable JSON frame ($badlines bad)"
+want "$([[ $badlines -eq 0 && $frames -ge 8 ]] && echo true)" \
+  "every stdout line is one parseable JSON frame ($badlines bad of $frames)"
 
 printf '%s\n' "--- server stderr (diagnostics belong here):"
 head -5 "$WORK/err.log" || true
