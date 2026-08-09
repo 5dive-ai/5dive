@@ -1231,6 +1231,22 @@ cmd_task_add() {
     [[ -z "$assignee" ]] && assignee=$(_task_resolve_coordinator)
     [[ -n "$assignee" ]] && auto_coordinated=1
   fi
+  # DIVE-3097: an explicit --verifier naming this row's own (now-fully-resolved)
+  # assignee reaches the IDENTICAL end state `task verifier` already refuses —
+  # "'X' is <ident>'s own assignee — a maker can't grade itself" — but `task add`
+  # had zero guard on this attach point, so the same state was one flag combo
+  # away with no refusal at all (DIVE-2899: assignee=dev3, verifier=dev3,
+  # delivered_at NULL — a maker booked as its own grader, never handed off).
+  # Checked AFTER both --assignee resolution steps above (the org-chart token
+  # lookup and the DIVE-333 auto-coordinate default), so a --verifier that only
+  # collides with an IMPLIED assignee (nothing passed on the command line) is
+  # caught too, not just a literal --assignee=X --verifier=X pair. Never fires on
+  # the verify-BY-DEFAULT picker below — that path only runs when $verifier is
+  # still empty here, and _task_default_verifier already excludes the assignee by
+  # construction (see the "distinct from the maker" chain above).
+  if [[ -n "$verifier" && -n "$assignee" && "$verifier" == "$assignee" ]]; then
+    fail "$E_VALIDATION" "'$verifier' is this task's own assignee ('$assignee') — a maker can't grade itself (pick a different --verifier, or drop --assignee and let it default so the two can't collide)"
+  fi
   # DIVE-2681: the filing cap, enforced at the keystroke. Classify FIRST, because
   # the classification feeds two separate controls below (the refusal here, and
   # the verifier-rail skip further down). --customer declares the classifier
@@ -1755,6 +1771,26 @@ cmd_task_assign() {
   [[ $# -ge 2 ]] || fail "$E_USAGE" "usage: 5dive task assign <id|DIVE-N> <agent>"
   resolve_task_id "$1"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   local who="$2"
+  # DIVE-3097: refuse landing the ASSIGNEE onto this row's own VERIFIER — the
+  # identical end state `task verifier` already refuses from the other
+  # direction (DIVE-474: "'X' is <ident>'s own assignee — a maker can't grade
+  # itself"), reachable here because that guard only checks at ATTACH time and
+  # the assignee can move afterward. `task assign` is a raw reassignment with no
+  # such check, and the automatic maker→verifier handoff never calls this verb
+  # (it writes assignee=verifier itself, via _task_route_to_verifier, as PART of
+  # delivering) — so the only way `who` legitimately equals the current verifier
+  # here is a row ALREADY in that delivered shape (assignee is already the
+  # verifier), which this leaves alone as a no-op rather than refuse. What it
+  # refuses is manufacturing the shape FRESH: a not-yet-delivered row
+  # (assignee != verifier today) reassigned straight onto its own verifier,
+  # which would make that agent both the worker and the grader with no handoff
+  # ever recorded (DIVE-2899: assignee=verifier, delivered_at NULL).
+  local _asg_cur_vfier _asg_cur_assignee
+  _asg_cur_vfier=$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${id};")
+  _asg_cur_assignee=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
+  if [[ -n "$_asg_cur_vfier" && "$who" == "$_asg_cur_vfier" && "$_asg_cur_assignee" != "$_asg_cur_vfier" ]]; then
+    fail "$E_VALIDATION" "'$who' is $ident's own verifier — a maker can't grade itself (pick a different assignee, or re-point the verifier first with '5dive task verifier $ident <agent>')"
+  fi
   # Handing a task to a NEW owner resets its in_progress clock: SQLite evaluates
   # SET column refs against the pre-update row, so `assignee IS NOT <who>` is the
   # OLD assignee. Without this, an inherited in_progress task keeps the prior
@@ -8698,12 +8734,32 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
         -- handed sqlite an incomplete statement, wrote NO GATE, and still printed a
         -- successful filing -- which is what the post-write assertion below now
         -- refuses to let happen again.
+        -- DIVE-3097: a SECOND, narrower preserve-don't-steal arm, added beside the
+        -- DIVE-2624 one above rather than folded into it, because it guards a
+        -- different shape. DIVE-2624 protects a LIVE, DELIVERED handoff
+        -- (maker_agent set, already routed) from being un-delivered by a
+        -- third-party filing. This arm protects a row that was NEVER delivered
+        -- at all: if the actor filing this gate happens to be the row's own
+        -- verifier, the unconditional ELSE below would set assignee=actor=verifier
+        -- while maker_agent is still NULL -- manufacturing FRESH the exact
+        -- assignee==verifier, no-handoff-ever-recorded shape DIVE-2899 named
+        -- (assignee=dev3, verifier=dev3, delivered_at NULL), via a THIRD writer
+        -- neither of this ticket's other two fixes (task add, task assign) can
+        -- see, because filing a gate has no ownership check and this column write
+        -- is a side effect of it, not its stated purpose. Scoped to assignee<>
+        -- verifier so it is a no-op on every row the DIVE-2624 arm or the
+        -- DIVE-2196 review-escalation case (assignee=verifier=actor already)
+        -- already cover -- this only stops a NEW collision, never touches an
+        -- existing one (no retro-grading, same as the rest of DIVE-3097).
         SET status='blocked',
             assignee=CASE
               WHEN maker_agent IS NOT NULL AND verifier IS NOT NULL
                    AND assignee=verifier AND handoff_delivered_at IS NOT NULL
                    AND verifier IS NOT $(sqlq "$actor")
-              THEN assignee ELSE $(sqlq "$actor") END,
+              THEN assignee
+              WHEN verifier IS NOT NULL AND verifier=$(sqlq "$actor") AND assignee IS NOT verifier
+              THEN assignee
+              ELSE $(sqlq "$actor") END,
             handoff_ack_at=CASE
               WHEN maker_agent IS NOT NULL AND verifier IS NOT NULL
                    AND assignee=verifier AND verifier=$(sqlq "$_ack_actor")

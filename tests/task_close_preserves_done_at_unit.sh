@@ -130,7 +130,25 @@ c_at=$(doneat_of "$C")
 # against a clobber the question is "which other verbs write this column".
 # Reachable as the recorded verifier re-verifying their own already-done row
 # (DIVE-2067's refusal fires only for a DIFFERENT actor).
-E=$(add "E verify re-close preserves done_at" --assignee=main --verifier=main)
+#
+# DIVE-3097: `add "..." --assignee=main --verifier=main` is now refused BY
+# DESIGN — this is the exact create-time state that fix exists to close. But
+# the state must stay reachable to CLOSE (the 149 existing rows in this shape
+# are explicitly not retro-graded), so this arm reseeds it with a raw db
+# write instead, the same escape `task verifier` itself relies on to test its
+# own refusal (a guarded verb cannot be the thing that builds the fixture for
+# its own guard). Without this, `add` silently returns empty, `cmd_task_verify
+# ""` exits rc=2 as a USAGE error, and the arm reads as a `task verify`
+# regression instead of what it actually is: a fixture built on a door this
+# same change closed. The assertion right below is what stops that from
+# happening again quietly — it fails LOUDLY if the seed ever stops landing in
+# the guarded state, instead of the arm going vacuous.
+E=$(db "INSERT INTO tasks (title, assignee, verifier, created_by, project_key)
+        VALUES ($(sqlq "E verify re-close preserves done_at"), $(sqlq main), $(sqlq main), $(sqlq main), 'dive');
+        SELECT ident FROM tasks WHERE id=last_insert_rowid();")
+[[ -n "$E" && "$(db "SELECT assignee||'='||COALESCE(verifier,'') FROM tasks WHERE ident=$(sqlq "$E");")" == "main=main" ]] \
+  && ok_t "E/SEED: raw-seeded row reaches assignee==verifier ('main'=='main') — the state DIVE-3097 blocks at CREATE, still reachable to grade" \
+  || bad_t "E/SEED: raw seed did not reach the guarded state" "E='$E' row='$(db "SELECT assignee,verifier FROM tasks WHERE ident=$(sqlq "$E");")'"
 as main cmd_task_done "$E" --result="closed by the verifier" >/dev/null
 backdate "$E"
 as main cmd_task_verify "$E" --cmd=true >/dev/null; e_rc=$?
