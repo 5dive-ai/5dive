@@ -414,8 +414,17 @@ if [[ -f "$SRC/cmd_push.sh" ]]; then
   # shellcheck source=/dev/null
   source "$SRC/cmd_push.sh" 2>/dev/null
   if declare -F _push_gate_check >/dev/null; then
+    # DIVE-2801: `need_answer_sig` is set EXPLICITLY. This arm's subject is the
+    # `lead:standing:*` PROVENANCE rule, not the closure signature — but the preflight
+    # now refuses a gate carrying no signature at all, so leaving the column to
+    # whatever `cmd_task_answer` happened to store makes the fixture depend on
+    # WHETHER THE BOX CAN SIGN. That is not a hypothetical: this arm passed on the
+    # control plane (which signs) and failed on `pristine-s3` (which does not), so the
+    # local green was environment-luck and not evidence. Any non-empty value serves —
+    # the preflight checks presence, and only the root executor validates the HMAC.
     db "UPDATE tasks SET need_answer='approved', need_answered_at='2026-07-26 16:00:00',
-           need_answered_by='lead:standing:marcus', need_type='approval', routed_reviewer=NULL
+           need_answered_by='lead:standing:marcus', need_type='approval', routed_reviewer=NULL,
+           need_answer_sig='sig-fixture'
         WHERE ident='DIVE-401';"
     _i=$(db "SELECT id FROM tasks WHERE ident='DIVE-401';")
     out=$( _push_gate_check "$_i" DIVE-401 2>&1 ); rc=$?
