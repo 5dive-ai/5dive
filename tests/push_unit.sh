@@ -998,6 +998,21 @@ else
         "source shape gave '${_src_out:-<died before the fallback>}', unguarded control gave '${_unguarded_out:-<died, correct>}' — the source's own shape must reach the fallback AND the unguarded control must not"
 fi
 
+# ---------------------------------------------------------------------------
+# DIVE-2801 clause 2: the usage refusal must not recommend a remedy it cannot
+# honour. `--branch` satisfies THIS check but not the DIVE-1462 gate binding in
+# _push_do, which reads the branch from the task body — so offering it as the
+# alternative sends the caller straight into the next refusal. Same defect as
+# the dry-run clause (landed separately on #519), one step up the command.
+seed_task DIVE-992 "no branch line in this body" approval "2026-07-18 00:00:00" "yes"
+out=$(run_push DIVE-992 --dry-run 2>&1); rc=$?
+{ [[ $rc -ne 0 ]] \
+    && grep -q "Branch: <name>" <<<"$out" \
+    && grep -q "body is REQUIRED" <<<"$out" \
+    && ! grep -q "pass --branch=<name> or add" <<<"$out"; } \
+  && ok_t "branch refusal names the body requirement, not --branch alone (DIVE-2801)" \
+  || bad_t "branch refusal names the body requirement, not --branch alone (DIVE-2801)" "rc=$rc :: $out"
+
 echo "-----"
 printf 'push_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
