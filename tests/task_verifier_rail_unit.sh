@@ -238,6 +238,13 @@ run_as carol done "$low_id" --result="graded PASS" >/dev/null
 # their own ratio explicitly instead of inheriting whatever T1-T10 happened to
 # leave behind — an assertion that depends on the arms above it is not an
 # assertion, it is an ordering.
+#
+# THE CAP ONLY ENGAGES ON THE PRODUCTION BOARD (2026-08-09), so these arms must
+# DECLARE this fixture store to be the board they are testing. Without this line
+# every refusal arm below goes vacuously green: the cap would decline to enforce
+# against a temp dir and T11d/T11e/T11h would pass because nothing ran, which is
+# the "wrong and pleasant ⇒ no check ran" shape. T11m asserts the other side.
+export FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"
 db "DELETE FROM tasks;"
 for i in 1 2 3 4 5 6 7 8 9 10; do
   run add --assignee=alice --priority=medium -- "ship customer feature number ${i}" >/dev/null
@@ -316,6 +323,83 @@ kill_json=$(FIVE_FILING_CAP=0 run add --assignee=alice --priority=high -- "yet a
    && -n "$(printf '%s' "$kill_json" | jf '.data.id')" ]] \
   && ok_t "T11i FIVE_FILING_CAP=0 disables the refusal fleet-wide" \
   || bad_t "T11i FIVE_FILING_CAP=0 disables the refusal fleet-wide" "$kill_json"
+
+# T11j: THE ARITY REGRESSION (2026-08-09). The first cut keyed on multi-word
+# phrases — "verifier rail", "merge gate", "task add" — while the rows the fleet
+# actually files say the same thing in ONE word. Measured over 946 hand-filed
+# rows: 15% flagged against a ~67% human read, so the window sat at 3/20 under a
+# 5/20 threshold and the cap never fired once in the five days after it went
+# live. Each title below was a real MISS. They are the arm, not an example.
+_t11j_missed=(
+  "the gate is unsatisfiable once a branch tip moves"
+  "the verifier never picks the row back up"
+  "PII guard scans no content on a direct push to main"
+  "council verify --json double-reports on a RED verdict"
+  "the delegated push rail refuses for agent-dev"
+  "crontab snapshot wipe misses a PARTIAL loss"
+  "unit tests are RED on main since this morning"
+  "the nightly digest is dark again"
+  "recurring row fires but nobody triages the instance"
+  "smoke cannot grade a src/ change"
+)
+_t11j_bad=""
+for _t in "${_t11j_missed[@]}"; do
+  [[ -z "$(_task_internal_subject_reason "$_t")" ]] && _t11j_bad+="MISS: ${_t}"$'\n'
+done
+[[ -z "$_t11j_bad" ]] \
+  && ok_t "T11j the widened scan catches the single-word machinery titles the narrow one missed" \
+  || bad_t "T11j the widened scan catches the single-word machinery titles the narrow one missed" "$_t11j_bad"
+
+# T11k: THE TWO WORDS THAT STAY OUT, and why they are a test and not a comment.
+# "agent" appeared 97 times and "queue" throughout the missed set — and 5dive's
+# PRODUCT is agent hosting, so neither token can tell our machinery from the
+# thing we sell. Widening until the numbers look good would have swept both in
+# and taxed every real product row. A deliberate exclusion needs an assertion or
+# the next person tuning this file will "fix" it.
+_t11k_bad=""
+for _t in "the agent card renders the wrong plan on signup" \
+          "customer queue page shows a stale position" \
+          "agents list is empty for a fresh account"; do
+  [[ -n "$(_task_internal_subject_reason "$_t")" ]] && _t11k_bad+="FALSE POSITIVE: ${_t}"$'\n'
+done
+[[ -z "$_t11k_bad" ]] \
+  && ok_t "T11k 'agent' and 'queue' stay OUT — the product is agent hosting" \
+  || bad_t "T11k 'agent' and 'queue' stay OUT — the product is agent hosting" "$_t11k_bad"
+
+# T11l: the word boundaries are load-bearing, not incidental. `board` must not
+# eat "dashboard", `hook` must not eat "webhook", `test` must not eat "latest" —
+# every one of those is a customer surface, and a scan that swallowed them would
+# refuse product work with an internal-machinery reason.
+_t11l_bad=""
+for _t in "dashboard billing page renders a stale plan" \
+          "webhook retries drop the second event" \
+          "install the latest release on a fresh box for a customer"; do
+  [[ -n "$(_task_internal_subject_reason "$_t")" ]] && _t11l_bad+="BOUNDARY LEAK: ${_t}"$'\n'
+done
+[[ -z "$_t11l_bad" ]] \
+  && ok_t "T11l word boundaries hold: dashboard/webhook/latest are not machinery" \
+  || bad_t "T11l word boundaries hold: dashboard/webhook/latest are not machinery" "$_t11l_bad"
+
+# T11m: A FIXTURE STORE IS NOT THE BOARD. The window is over the cap right now
+# (T11d proved it refuses), so this arm changes exactly one thing — it stops
+# declaring this store to be prod — and the SAME add must land. This is the arm
+# that lets 24 other harnesses seed rows called "review gate" without a filing
+# policy refusing their setup, and it is why widening the classifier was safe.
+_t11m_saved="$FIVEDIVE_PROD_TASKS_DB"
+export FIVEDIVE_PROD_TASKS_DB="$TMP/not-the-real-board.db"
+nb_json=$(run add --assignee=alice --priority=high -- "w review gate harness seeds a row over the cap")
+nb_id=$(printf '%s' "$nb_json" | jf '.data.id')
+[[ -n "$nb_id" && "$nb_id" != "null" ]] \
+  && ok_t "T11m the cap does not govern a store that is not the production board" \
+  || bad_t "T11m the cap does not govern a store that is not the production board" "$nb_json $(cat "$TMP"/err)"
+export FIVEDIVE_PROD_TASKS_DB="$_t11m_saved"
+
+# T11n: and putting the declaration back RESTORES the refusal on the same title.
+# Without this pair T11m is indistinguishable from a cap that stopped working.
+nb2_out=$(run add --assignee=alice --priority=high -- "w review gate harness seeds a row over the cap"); nb2_rc=$?
+(( nb2_rc != 0 )) && has "$(cat "$TMP"/err)$nb2_out" "filing cap" \
+  && ok_t "T11n restoring the prod declaration restores the refusal (T11m was the store, not a broken cap)" \
+  || bad_t "T11n restoring the prod declaration restores the refusal (T11m was the store, not a broken cap)" "rc=$nb2_rc $nb2_out $(cat "$TMP"/err)"
 
 # --- T12: THE CAP PATH SURVIVES `set -e`, which is how it ships -------------
 # This harness runs under `set +e` (line ~52) so that arms can assert non-zero

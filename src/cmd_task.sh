@@ -705,13 +705,49 @@ _task_unparented_followup_advisory() {
 #   --customer          this touches a customer surface; classifier was wrong
 #   --already-blocked=  it IS internal, and it is the stated exception
 # A false positive costs one flag. It never costs the row.
+# A MISS IS NOT CHEAP — MEASURED 2026-08-09. The first cut of this scan was
+# deliberately narrow on the reasoning that "a miss here is cheap and a false hit
+# taxes someone's real work". Only the second half of that held. Over the 946
+# hand-filed rows of the preceding 14 days the narrow set flagged **15%** where a
+# read of the same titles says ~67% are our own machinery, so the gating window
+# sat at 3/20 against a 5/20 threshold and the cap **never fired once**. The
+# fleet filed 55 rows a day, two of every three about itself, for five days after
+# the guard shipped and went live in 0.19.6.
+#
+# The narrow set failed for one structural reason: it keyed on MULTI-WORD phrases
+# ("verifier rail", "merge gate", "task add") while the rows that actually get
+# filed say the same things in one word — "gate" (102 occurrences in the missed
+# set), "agent" (97), "task" (80), then verifier, guard, rail, council, probe,
+# board. The vocabulary was right and the arity was wrong.
+#
+# So the set below is single-token where our machinery owns the token outright.
+# Two words stay OUT on purpose because the product IS agent hosting and they
+# cannot discriminate: **agent** and **queue**. Word boundaries do real work
+# here — "dashboard" does not match `board`, "webhook" does not match `hook`,
+# "latest" does not match `test`. Measured detection after widening: 45%, still
+# under the ~67% human read, which is the safe direction for a refusal.
+# Is the ACTIVE task store the production board? The filing cap is a rule about
+# how many rows the fleet puts on the shared board, so a run against a fixture
+# store has nothing for it to govern. Deliberately its own function rather than a
+# call to _task_human_send_allowed: that one also refuses on FIVEDIVE_TEST and
+# friends because SENDING to a human from a fixture is the risk it guards, and
+# borrowing it here would couple a quota to a notification policy. Same store
+# comparison (DIVE-1506), different question.
+_task_filing_cap_store_is_prod() {
+  local active prod ra rp
+  active="${TASKS_DB:-${STATE_DIR:-/var/lib/5dive}/tasks/tasks.db}"
+  prod="$(_task_prod_tasks_db)"
+  ra="$(readlink -f "$active" 2>/dev/null || printf '%s' "$active")"
+  rp="$(readlink -f "$prod" 2>/dev/null || printf '%s' "$prod")"
+  [[ -n "$ra" && "$ra" == "$rp" ]]
+}
+
 _task_internal_subject_reason() {
   local t="${1,,}"
   # Our own machinery: the task engine, gates, verifier rails, CI, the release
-  # cut, harnesses, the board, agent plumbing. Deliberately narrow — anything
-  # ambiguous is left OUT, because a miss here is cheap and a false hit taxes
-  # someone's real work.
-  [[ "$t" =~ (^|[^a-z])(harness|harnesses|smoke[-_ ]gate|full[-_ ]sweep|pipefail|shellcheck|actionlint|verifier[[:space:]]rail|merge[[:space:]]gate|gate[-_ ]history|task[[:space:]](add|done|need|ls)|taskboard|worktree|worktrees|heartbeat|release[-_ ]cut|version[-_ ]bump|changelog|pre[-_ ]push[[:space:]]hook|ci[[:space:]](check|job|run)|nightly[[:space:]]sweep|budget[-_ ]report)([^a-z]|$) ]] \
+  # cut, harnesses, the board, agent plumbing. Still a candidate set, never an
+  # action set — see the two declared escapes above.
+  [[ "$t" =~ (^|[^a-z])(harness|harnesses|smoke|full[-_ ]sweep|pipefail|shellcheck|actionlint|lint|verifier|verifiers|rail|rails|gate|gates|gating|task[[:space:]](add|done|need|ls)|taskboard|worktree|worktrees|heartbeat|release[-_ ]cut|version[-_ ]bump|changelog|pre[-_ ]push|hook|hooks|guard|guards|council|probe|probes|ci|nightly|budget[-_ ]report|backlog|board|cron|crontab|digest|recurring|maker|regression|flaky|unit|test|tests)([^a-z]|$) ]] \
     && { printf 'internal machinery'; return 0; }
   return 0
 }
@@ -1146,7 +1182,15 @@ cmd_task_add() {
   if [[ "$kind" == "standard" && -z "$customer_facing" ]]; then
     internal_reason=$(_task_internal_subject_reason "$title")
   fi
-  if [[ -n "$internal_reason" && -z "$already_blocked" && "${FIVE_FILING_CAP:-1}" != "0" ]]; then
+  # THE CAP GOVERNS THE SHARED BOARD, SO IT ONLY APPLIES TO THE SHARED BOARD.
+  # Found 2026-08-09 by widening the classifier above: 24 harnesses seed rows with
+  # titles like "w review gate" and "smoke previous work", and once enough of them
+  # land in one fixture store the cap starts refusing a TEST's setup — which is
+  # not a filing decision at all, it is a rig building a fixture. The narrow scan
+  # hid this by never matching those titles; it was always the wrong scope.
+  # Store identity is the same primitive _task_human_send_allowed (DIVE-1506) uses
+  # one control over, for the same "a fixture must not act on prod" reason.
+  if _task_filing_cap_store_is_prod && [[ -n "$internal_reason" && -z "$already_blocked" && "${FIVE_FILING_CAP:-1}" != "0" ]]; then
     # `|| true` on the read as well as the newline at the producer: two
     # independent guards, because a filing rule must never be able to take
     # `task add` down. If the read ever comes back empty the cap declines to
