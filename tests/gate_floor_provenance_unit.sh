@@ -116,7 +116,7 @@ done
 
 # --- 1. axis=pinned — the filer chose it ---------------------------------------
 seed DIVE-9001 'ordinary title'
-( cmd_task_need DIVE-9001 --type=decision --ask="pick a lane" --options="A|B" --recommend=A --tier=2 >/dev/null 2>&1 )
+( cmd_task_need DIVE-9001 --type=decision --ask="pick a lane" --options="A|B" --recommend=A --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1 )
 [[ "$(prov DIVE-9001)" == "axis=pinned" && "$(tier_of DIVE-9001)" == "2" ]] \
   && ok_t 'an explicit --tier=2 records axis=pinned (the filer chose the human, not the floor)' \
   || bad_t 'explicit --tier=2 must record axis=pinned' "got [$(prov DIVE-9001)] tier=$(tier_of DIVE-9001)"

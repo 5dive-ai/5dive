@@ -848,7 +848,8 @@ _objective_file_gate() {
   # T2 create -> HARD tier-2 gate (never --yes-waived, never auto-cleared). Else a
   # count-only checkpoint stays the default agent-clearable tier-1 decision.
   local reason="create ${OBJ_N_CREATE}, reprioritize ${OBJ_N_REPRI}, cancel ${OBJ_N_CANCEL}"; local -a tier_arg=()
-  if [[ "$GOAL_HAS_T2" == "1" ]]; then reason="carries a Tier-2 task — ${reason}"; tier_arg=(--tier=2); fi
+  # DIVE-2848: declare human_tap alongside the pin — see the twin in cmd_goal.sh.
+  if [[ "$GOAL_HAS_T2" == "1" ]]; then reason="carries a Tier-2 task — ${reason}"; tier_arg=(--tier=2 --needs=human_tap); fi
   JSON_MODE=1 cmd_task_need "$anchor_id" --type=decision --options="approve|revise" --recommend="approve" "${tier_arg[@]}" ${from:+--from="$from"} \
     --ask="Approve objective '${oname}' re-plan cycle ${cycle_no}? (${reason}) Full diff in the task body." >/dev/null \
     || fail "$E_GENERIC" "objective replan: could not file the plan gate"

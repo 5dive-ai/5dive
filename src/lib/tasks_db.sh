@@ -467,6 +467,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- inferred from --type or the ask text. The sealed list lives in the shipped source
   -- (_GATE_HUMAN_CAPABILITIES), NOT here and not in any writable table — see DIVE-2099.
   needs_capability    TEXT,
+  -- DIVE-2848 gate_rubber_stamp: the filer's DECLARED reason for routing a
+  -- decision/approval gate to the paired human at tier 2 *despite* having written
+  -- their own --recommend. That shape is refused by default at the keystroke (see
+  -- the cap in cmd_task_need): measured 2026-07-16..08-07, 96 of 107 judgment gates
+  -- carrying a recommendation came back as the human tapping that same value. The
+  -- escape exists so a real exception can still be filed, and this column is what
+  -- makes it AUDITABLE instead of invisible — the failure mode the cap replaces is
+  -- an agent typing --tier=2 with no record of why. NULL on every gate that did not
+  -- use the escape. Recorded verbatim, never inferred from the ask.
+  gate_rubber_stamp   TEXT,
   -- DIVE-1140 gate-shipped sweep. Stamped (once) when the heartbeat finds a
   -- commit referencing this OPEN gate's ident on a configured repo's origin/main
   -- — the gate is FLAGGED "likely shipped, verify+close" to its owner. Flag-only
@@ -1149,6 +1159,7 @@ _TASKS_ADDITIVE_COLUMNS=(
   'secret_key TEXT' 'connector TEXT' 'secret_oob TEXT' 'human_nonce_hash TEXT'
   'ask_shape TEXT' 'precedent_ref INTEGER' 'precedent_kind TEXT'
   'needs_capability TEXT'
+  'gate_rubber_stamp TEXT'
   'shipped_flag_at TEXT' 'routed_reviewer TEXT'
   'delivery_ref TEXT' 'delivered_at TEXT' 'delivery_ref_iteration INTEGER'
   'originated_by_objective INTEGER' 'originated_cycle INTEGER'

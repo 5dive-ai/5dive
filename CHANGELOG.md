@@ -1,5 +1,58 @@
 # Changelog
 
+## v0.19.0 — feat(task): cap the rubber-stamp gate at the keystroke, not in a doc (DIVE-2848)
+
+`5dive/CLAUDE.md` line 61 has said "human gates only for money / irreversible / secrets /
+brand" since **2026-06-29**. Five weeks later lodar: *"im fighting with unnecessary human
+gates for the past three weeks"*, *"im tired of rubber tapping"*.
+
+Measured 2026-07-16 → 08-07: **346 gates asked**, and of the **107 judgment gates carrying a
+`--recommend`, 96 (90%) came back as him tapping that same value.** Only **7** in the window
+were keyword-floored to tier 2 — the rest of tier 2 was `--tier=2` typed by hand on a type
+that defaults to 1. **`--tier=0` was used 0 times in 346 gates.**
+
+The rule was not disbelieved. **A policy is indexed by TOPIC; the act is a KEYSTROKE.** So it
+moves to the keystroke, the way the filing cap already moved the equivalent rule for
+`task add`.
+
+`5dive task need` now **refuses** a `--tier=2` `decision`/`approval` gate that carries the
+filer's own `--recommend`, hits no category floor and declares no capability — and names the
+exits: `--tier=0` (apply the rec now, no ping, permanent record + digest line), `--tier=1`
+(lead/verifier, 48h TTL applies it), `--needs=<capability>`, or the audited
+`--rubber-stamp-ok="<why>"`, which is **recorded on the gate row** (`gate_rubber_stamp`,
+shown in `task show`) rather than being an invisible exception. The escape is itself
+rate-limited on the filer's own tap-back share (>10 of their last 20), measured with the
+**semantic** method — exact match on decisions, affirmative-vs-non-denial on approvals, over
+judgment gates carrying a recommendation only. Exact string equality is what produced this
+row's original 45%: an approval tap normalises to `approved` while the recommendation is free
+text, so 45 of 47 real taps scored as overrides.
+
+Untouched on purpose: the T2 category floor, a declared `--needs=`, and the tier-2-by-type
+defaults on `manual`/`secret`.
+
+Also `5dive task set-title` — `set-body` has existed since DIVE-1920 and the title had no
+equivalent, so a wrong or overstated title was immutable after `task add` except by direct
+sqlite. The title is what the next reader sees first. Overwrite-only, audited with the prior
+title, refused on a closed row.
+
+Three findings worth more than the feature, compiled to
+`community/wiki/a-policy-indexed-by-topic-cannot-govern-an-act-indexed-by-a-keystroke.md`:
+**(1)** `tier_floored==0` is **not** "no category applies" — a *raising* rule never runs when
+the caller pre-empted the raise, so a real spend gate reaches the cap indistinguishable from a
+rubber stamp; re-run the classifier, never read its flag. **(2)** the `recommend` a late guard
+reads may have been **precedent-prefilled**, not typed — a rule whose premise is "the caller
+asserted X" must capture the caller's argument before any writer touches the field.
+**(3)** `cmd_task_need` mints its row **before** the routing blocks run, so a guard placed
+"where the tier finally settles" landed after the write and still exited non-zero; assert the
+**absence of the write**, not the exit code.
+
+Blast radius, stated because it is the honest cost of a cap that is real: 10 harnesses and 3
+internal callers construct `--tier=2 --recommend` purely to obtain a hard-human gate for
+grading something else. `cmd_goal.sh` / `cmd_objective.sh` now **declare** `--needs=human_tap`
+on a plan gate carrying a Tier-2 task (better than the pin — it also stops the gate being
+misrouted to the anchor task's verifier); `cmd_selfcheck.sh`'s forge prover does the same;
+fixtures carry the audited escape with a fixture reason.
+
 ## v0.19.0 — feat(pii): the pre-push guard reaches the fleet, not one repo (DIVE-2788)
 
 `scripts/install-pii-push-guard.sh` said **"fleet-wide"** in its own docstring and
