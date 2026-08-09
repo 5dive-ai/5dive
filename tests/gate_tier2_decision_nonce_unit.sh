@@ -174,7 +174,7 @@ touch "$GATE_PROOF_ENFORCE"   # match the live envelope: enforce is ON fleet-wid
 #     This is the headline regression. RED on the unfixed tree.
 seed_task DIVE-201
 NOTIFY_NONCE=""
-cmd_task_need DIVE-201 --type=decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 >/dev/null 2>&1
+cmd_task_need DIVE-201 --type=decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 [[ "$(tierof DIVE-201)" == "2" && "$(typeof_ DIVE-201)" == "decision" ]] \
   && ok_t "T1 precondition: gate stored as a tier-2 decision" \
   || bad_t "T1 precondition tier-2 decision" "tier='$(tierof DIVE-201)' type='$(typeof_ DIVE-201)'"
@@ -205,7 +205,7 @@ fi
 #     remedy a no-op precisely because the digest mint was type-gated the same
 #     way; this asserts it no longer is. RED on the unfixed tree.
 seed_task DIVE-203
-cmd_task_need DIVE-203 --type=decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 >/dev/null 2>&1
+cmd_task_need DIVE-203 --type=decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 db "UPDATE tasks SET human_nonce_hash=NULL WHERE ident='DIVE-203';"   # simulate a pre-fix row
 [[ -z "$(hashof DIVE-203)" ]] \
   && ok_t "T3 precondition: legacy row starts with human_nonce_hash NULL" \
@@ -274,7 +274,7 @@ cmd_task_need DIVE-205 --type=decision --ask="pick a lane" --options="A|B" --rec
 #     a real tap is never rejected — and the decision tap carries NO nonce in its
 #     callback_data today, so an evidence requirement here would reject it).
 seed_task DIVE-206
-cmd_task_need DIVE-206 --type=decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 >/dev/null 2>&1
+cmd_task_need DIVE-206 --type=decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 [[ "$(hashof DIVE-206)" =~ ^[0-9a-f]{64}$ ]] || bad_t "T6 precondition: gate minted a nonce" "got '$(hashof DIVE-206)'"
 cmd_task_answer DIVE-206 --value=A --human >/dev/null 2>&1
 [[ "$(answered DIVE-206)" == "closed" ]] \
@@ -287,7 +287,7 @@ cmd_task_answer DIVE-206 --value=A --human >/dev/null 2>&1
 #     Together the pair says minting changed nothing about WHO can answer while the
 #     structural half decides who that is. Subshelled: the refusal is a `fail 6` by design.
 seed_task DIVE-216
-cmd_task_need DIVE-216 --type=decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 >/dev/null 2>&1
+cmd_task_need DIVE-216 --type=decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 _t6b_out=$( _CGROUP_PIN='/system.slice/system-5dive.slice/5dive-agent@dev.service'
             cmd_task_answer DIVE-216 --value=A --human 2>&1 ); _t6b_rc=$?
 [[ "$(answered DIVE-216)" == "open" && $_t6b_rc -ne 0 ]] \
@@ -298,7 +298,7 @@ _t6b_out=$( _CGROUP_PIN='/system.slice/system-5dive.slice/5dive-agent@dev.servic
 #     the same shape is still refused. Pairs with T6: together they pin the answer
 #     path to exactly where it was before this change, in both directions.
 seed_task DIVE-207
-cmd_task_need DIVE-207 --type=decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 >/dev/null 2>&1
+cmd_task_need DIVE-207 --type=decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 out=$(cmd_task_answer DIVE-207 --value=A 2>&1); rc=$?
 [[ "$(answered DIVE-207)" == "open" && $rc -ne 0 ]] \
   && ok_t "T7 bare-agent answer on tier-2 decision still REFUSED (DIVE-1117 floor intact)" \

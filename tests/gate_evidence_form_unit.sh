@@ -117,7 +117,7 @@ argval() { sed -n "s/.*[[:space:]]${2}=\([^[:space:]]*\).*/\1/p" <<<"$1" | head 
 reset
 t1=$(addt --assignee=dev -- "fixture t2 nonce gate")
 cmd_task_need "$t1" --type=decision --options="A|B" --recommend="A" \
-  --ask="pick one" --tier=2 >/dev/null 2>&1
+  --ask="pick one" --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 cmd_task_answer "$t1" --value="A" --human --human-proof="$KNOWN_NONCE" \
   >"$TMP/ev1.out" 2>"$TMP/ev1.err"
 WROW=$(grep 'task answer gate' "$AUDIT_CALLS" | grep 'answered_by=' | head -1)

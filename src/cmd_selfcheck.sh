@@ -244,7 +244,8 @@ _sc_probe_t2_forge() {
     : > "$d/gate-proof.enforce"     # the live fleet posture since 2026-07-30
 
     seed() { db "INSERT INTO tasks (ident,title,status,created_by) VALUES ('$1','selfcheck','todo','main');" >/dev/null 2>&1
-             cmd_task_need "$1" --type=decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 >/dev/null 2>&1; }
+             cmd_task_need "$1" --type=decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 \
+               --needs=human_tap >/dev/null 2>&1; }   # DIVE-2848: this prover NEEDS a hard-human gate to forge against, so it declares one instead of hand-pinning a tier the cap now refuses
     by() { db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident='$1';"; }
 
     # (a) THE FORGE: an ordinary agent, unprivileged, no sudo — what every agent is.
