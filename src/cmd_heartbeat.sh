@@ -2514,11 +2514,11 @@ _hb_stall_sweep() {
   # ONCE PER INSTANCE (recurring_stall_escalated_at), so a reassignment cannot
   # thrash a row around a fleet — and if the NEW hands do not start it either, the
   # next window's rung is the cancel, which is what actually restores the beat.
-  local erow eid eident easg etmpl etcreator ehours ecand etarget
+  local erow eid eident easg etmpl etcreator ehours ever ecand etarget
   local efree="" efree_read=0 efree_ok=0 ecancel_reason emsg
   while IFS= read -r erow; do
     [[ -n "$erow" ]] || continue
-    IFS=$'\x1f' read -r eid eident easg etmpl etcreator ehours <<<"$erow"
+    IFS=$'\x1f' read -r eid eident easg etmpl etcreator ehours ever <<<"$erow"
     [[ -n "$eid" ]] || continue
     if (( efree_read == 0 )); then
       efree_read=1
@@ -2536,6 +2536,15 @@ _hb_stall_sweep() {
       # The current assignee is not a target: handing the row back to the addressee
       # that already had a full window with it is the no-op this rung exists to stop.
       [[ -n "$easg" && "$ecand" == "$easg" ]] && continue
+      # DIVE-3097: nor is this row's own verifier. This ladder is a raw
+      # reassignment with no maker/grader check of its own — the row is still
+      # todo/never-started (no maker_agent, no delivery), so landing the
+      # verifier here as the new assignee would manufacture the exact
+      # assignee==verifier, no-handoff-ever-recorded shape DIVE-2899 named,
+      # except this time self-inflicted by the heartbeat rather than a human
+      # flag combo. Same "don't create it fresh" scope as the rest of DIVE-3097
+      # — a row where this already happened before the fix is not touched here.
+      [[ -n "$ever" && "$ecand" == "$ever" ]] && continue
       if [[ -n "$etcreator" && "$ecand" == "$etcreator" ]]; then etarget="$ecand"; break; fi
       [[ -z "$etarget" ]] && etarget="$ecand"
     done <<<"$efree"
@@ -2571,7 +2580,7 @@ _hb_stall_sweep() {
         detail="auto-cancelled after ${ehours}h never-started, no free agent (template ${etmpl})" || true
       _hb_log "[recurring-escalate] ${eident} ${ehours}h unstarted, no free agent -> auto-cancelled so template ${etmpl} re-fires"
     fi
-  done < <(db "SELECT t.id||x'1f'||COALESCE(t.ident,'DIVE-'||t.id)||x'1f'||COALESCE(t.assignee,'')||x'1f'||COALESCE(p.ident,'DIVE-'||t.from_template_id)||x'1f'||COALESCE(p.created_by,'')||x'1f'||CAST((julianday('now')-julianday(t.created_at))*24 AS INTEGER)
+  done < <(db "SELECT t.id||x'1f'||COALESCE(t.ident,'DIVE-'||t.id)||x'1f'||COALESCE(t.assignee,'')||x'1f'||COALESCE(p.ident,'DIVE-'||t.from_template_id)||x'1f'||COALESCE(p.created_by,'')||x'1f'||CAST((julianday('now')-julianday(t.created_at))*24 AS INTEGER)||x'1f'||COALESCE(t.verifier,'')
                FROM tasks t LEFT JOIN tasks p ON p.id=t.from_template_id
                WHERE t.kind='standard' AND t.from_template_id IS NOT NULL
                  AND t.status='todo' AND t.started_at IS NULL

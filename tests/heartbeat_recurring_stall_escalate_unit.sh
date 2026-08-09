@@ -290,5 +290,41 @@ _hb_stall_sweep >/dev/null 2>&1
   && ok_t "SAME HANDS: a no-op reassign cannot DEFER rung 2 — the sweep still acts on the aged flag" \
   || bad_t "SAME HANDS: a no-op reassign cannot defer rung 2" "assignee=[$(col 1 assignee)] status=[$(col 1 status)] pinged=[$(col 1 recurring_stall_pinged_at)] — re-assigning a row to its current owner bought it another full window"
 
+# ---------------------------------------------------------------------------
+# 8. DIVE-3097: the ladder must not hand the assignee to the row's OWN VERIFIER.
+#    This row is still todo/never-started (no maker_agent, no delivery) — exactly
+#    the shape a raw reassignment can corrupt — so landing the verifier here as
+#    the new assignee would manufacture the assignee==verifier, no-handoff-ever
+#    shape DIVE-2899 named, except self-inflicted by the heartbeat rather than a
+#    human flag combo. The template's creator (creative) is normally the
+#    FIRST-preference free target (see arm 1); this row's verifier IS creative,
+#    so the fixed ladder must skip it and fall to the next free agent instead.
+# ---------------------------------------------------------------------------
+mk_fixture
+db "INSERT INTO tasks (id,ident,title,status,kind,assignee,verifier,created_by,created_at,from_template_id,recurring_stall_pinged_at)
+    VALUES (8,'DIVE-2901','drip slot','todo','standard','dev','creative','task-engine',datetime('now','-3 days'),100,datetime('now','-25 hours'));"
+busy dev
+: >"$AGENT_SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+got_asg8=$(col 8 assignee); got_vf8=$(col 8 verifier)
+[[ "$got_asg8" != "$got_vf8" ]] \
+  && ok_t "never lands the assignee on the row's own verifier (self-grade guard)" \
+  || bad_t "never lands the assignee on the row's own verifier" "assignee=[$got_asg8] verifier=[$got_vf8] — this is the exact DIVE-2899 shape, produced fresh"
+[[ "$got_asg8" == "anton" ]] \
+  && ok_t "skips the verifier (creative, the preferred template-creator target) and falls to the next free agent (anton)" \
+  || bad_t "falls to the next free agent past the excluded verifier" "assignee=[$got_asg8] want anton (free agents were anton, creative, main; creative is this row's verifier)"
+
+# ANCHOR / MUTATION: without a verifier on the row, the SAME fixture (same free
+# agents, same template creator) picks creative — proving arm 8 above is the
+# exclusion firing, not incidental candidate ordering that happened to avoid it.
+mk_fixture
+db "INSERT INTO tasks (id,ident,title,status,kind,assignee,created_by,created_at,from_template_id,recurring_stall_pinged_at)
+    VALUES (9,'DIVE-2902','drip slot','todo','standard','dev','task-engine',datetime('now','-3 days'),100,datetime('now','-25 hours'));"
+busy dev
+_hb_stall_sweep >/dev/null 2>&1
+[[ "$(col 9 assignee)" == "creative" ]] \
+  && ok_t "ANCHOR: with no verifier on the row, the same fixture picks creative — arm 8's skip is the verifier exclusion, not luck" \
+  || bad_t "ANCHOR: with no verifier the ladder still prefers the template creator" "assignee=[$(col 9 assignee)] want creative"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
