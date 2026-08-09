@@ -6936,6 +6936,62 @@ _gate_eng_ship_hit() {
   [[ "$text" =~ $_GATE_ENG_SHIP_RX ]]
 }
 
+# --- DIVE-2093: say WHO the gate routed to and WHY, at FILE TIME --------------
+#
+# The routed `ok` line has always named the reviewer and the ROLE ("routed to
+# main2 for verifier review"). What it never named is the PROPERTY that picked
+# that reviewer, and that omission is the whole defect: three agents in 36 hours
+# (dev3 on DIVE-2084, main on DIVE-2146, olivia right behind them; then main2 on
+# DIVE-2798 and DIVE-2808) filed a gate asking for an ACTION and had it land on
+# the loop's verifier, who could judge the work and could not perform the act.
+# Every one of those cost a round trip, and none of them was visible on the
+# board — a gate pending on the wrong principal renders exactly like a gate
+# pending on the right one.
+#
+# The filer is the only party who knows what the ask actually needs, and the
+# moment of filing is the only moment at which re-filing is free. So the fix is
+# to hand them the routing basis right there instead of leaving them to infer it
+# from an answer that never comes.
+#
+# `basis` is the property that chose the target, NOT the trigger that made the
+# gate routable at all — those are different questions and the filer needs both.
+# _gate_route_why <verifier|lead> <reviewer> <filer> <trigger>
+_gate_route_why() {
+  local basis="$1" reviewer="$2" filer="$3" trigger="$4"
+  case "$basis" in
+    verifier)
+      printf 'why: routed by LOOP MEMBERSHIP — %s is this task'"'"'s verifier of record (tasks.verifier). That property carries NO information about which capabilities %s holds, so if this ask needs an ACTION performed (open a PR, push, spend, provision a secret) rather than a judgement made, it is on the wrong desk: re-file with --tier=2, or --needs=<capability>, or hand it to a holder. trigger=%s' \
+        "$reviewer" "$reviewer" "$trigger" ;;
+    *)
+      printf 'why: routed by the ORG CHART — %s is the lead %s reports to (agents_org.reports_to). trigger=%s' \
+        "$reviewer" "${filer:-the filer}" "$trigger" ;;
+  esac
+}
+
+# Can this seat mint a DIVE-756 closure signature? Echoes `<yes|no|unknown>|<class>`.
+#
+# The classes come from the same measurement `agent info` renders
+# (classify_sudo_grant), and the yes/no split is the one DIVE-2760's own answer-
+# time warning already states in prose: root-all and cli-root seats hold sudo for
+# `5dive gate-proof sign`; cli-scoped seats do not.
+#
+# `custom` and `unknown` return UNKNOWN and never `no`. DIVE-2318: an unmeasured
+# grant is the absence of a measurement, not evidence of absence, and the cost of
+# the two errors is asymmetric here — a false `no` sends the filer to re-route a
+# gate that would have cleared fine, on a box where the peer read simply did not
+# work (DIVE-2135 makes that read possible, not guaranteed).
+_gate_seat_can_sign() {
+  local name="$1" grant cls
+  [[ -n "$name" ]] || { printf 'unknown|unknown\n'; return 0; }
+  grant=$(agent_sudo_grant "agent-${name}" 2>/dev/null) || grant=""
+  cls="${grant%%|*}"; [[ -n "$cls" ]] || cls="unknown"
+  case "$cls" in
+    root-all|cli-root) printf 'yes|%s\n' "$cls" ;;
+    cli-scoped|none)   printf 'no|%s\n' "$cls" ;;
+    *)                 printf 'unknown|%s\n' "$cls" ;;
+  esac
+}
+
 # DIVE-2099: the org lead's STANDING authority to clear an ENGINEERING approval
 # gate. lodar granted it 2026-07-26 ("agreed") in response to main asking for it
 # directly; main filed the ticket rather than implementing it because the
@@ -9036,6 +9092,64 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
         # it is provenance only (decision is already agent-clearable by type).
         db "UPDATE tasks SET routed_reviewer=$(sqlq "$_reviewer") WHERE id=${id};"
         local _rrole="lead review"; [[ "$_verifier_route" == "1" ]] && _rrole="verifier review"
+        # DIVE-2093: the routable cascade above is a DISJUNCTION, so "which clause
+        # fired" is a short-circuit artefact and not a fact about the gate. Name the
+        # most SPECIFIC kind that applies instead — that is the one the filer can act
+        # on. The pref is reported only when no kind applies, because then it really
+        # is the only reason this gate routed at all.
+        local _rtrigger
+        if   [[ "$_verifier_route"   == "1" ]]; then _rtrigger="verifier-route"
+        elif [[ "$type"              == "access" ]]; then _rtrigger="access-type"
+        elif [[ "$_eng_ship"         == "1" ]]; then _rtrigger="eng-ship"
+        elif [[ "$_curation"         == "1" ]]; then _rtrigger="curation"
+        elif [[ "$_internal_ops"     == "1" ]]; then _rtrigger="internal-ops"
+        elif [[ "$_discusses_applied" == "1" ]]; then _rtrigger="declared-discussion"
+        elif [[ "$_floored_by_title" == "1" ]]; then _rtrigger="floored-by-title"
+        else _rtrigger="gate_builder_routing=on"
+        fi
+        local _rwhy _rbasis="lead"
+        [[ "$_verifier_route" == "1" ]] && _rbasis="verifier"
+        _rwhy=$(_gate_route_why "$_rbasis" "$_reviewer" "$(task_actor "")" "$_rtrigger")
+        # DIVE-2093 (2026-08-07 recurrence, DIVE-2808): the sharper variant. Routing
+        # reached a principal who could ANSWER and could not SIGN, which is worse than
+        # the original "could not act", because it fails SILENTLY at answer time and
+        # surfaces on somebody ELSE's command — the board shows an APPROVED gate whose
+        # authorization no privileged path will honour, and a closed-unsigned gate looks
+        # DONE where a pending-on-the-wrong-person one at least looks unfinished.
+        #
+        # DIVE-2760 already warns the ANSWERER when the mint comes back empty, and that
+        # notice fires correctly. It shortens the loop, it does not close it: by then a
+        # diff has been read and an answer given. Filing is the only point at which
+        # nobody has yet acted, so this is where the check belongs.
+        #
+        # Deliberately narrow (DIVE-1955 wallpaper): require_sig is 1 only on the push
+        # and deploy root executors, so this fires only when the ask is push/deploy
+        # shaped. It is a warn and never a `fail` — the same reasoning as DIVE-2760's
+        # write: a gate no broker will ever check is unharmed by an unsigned closure,
+        # and refusing the filing would cost more than the misroute does.
+        local _rsig="" _cs="" _csv="" _csc=""
+        if _gate_eng_ship_hit "$ask" || [[ "$_eng_ship" == "1" ]]; then
+          _cs=$(_gate_seat_can_sign "$_reviewer"); _csv="${_cs%%|*}"; _csc="${_cs#*|}"
+          case "$_csv" in
+            yes) _rsig=" [require_sig: ${_reviewer} can sign this closure (grant=${_csc})]" ;;
+            no)
+              _rsig=" [require_sig: ⚠ ${_reviewer} CANNOT sign this closure (grant=${_csc}) — see the warning above]"
+              warn "$ident routed to $_reviewer, who CANNOT MINT A CLOSURE SIGNATURE (sudo grant: ${_csc})."
+              warn "  This ask is push/deploy shaped, and the root-only executor verifies the"
+              warn "  DIVE-756 signed closure before any delegated push or deploy."
+              warn "  what happens if you leave it: $_reviewer can ANSWER the gate and the board"
+              warn "    will show it APPROVED — but need_answer_sig lands EMPTY, and the push is"
+              warn "    REFUSED later, on the MAKER's command, reading as tampering rather than"
+              warn "    as this (DIVE-2760/2808). 'task answer' is not a re-sign verb, so the"
+              warn "    only repair at that point is to re-file the gate from scratch."
+              warn "  fix: get it answered from a seat that signs — root (\`sudo 5dive task answer"
+              warn "    $ident ...\`) or an agent whose grant is root-all/cli-root; --tier=2 if it"
+              warn "    is genuinely the human's. Do NOT grant \`gate-proof sign\` to a cli-scoped"
+              warn "    seat: it signs arbitrary stdin, so the grant forges ANY closure, human:* included."
+              ;;
+            *) _rsig=" [require_sig: whether ${_reviewer} can sign is NOT MEASURABLE from this seat (grant=${_csc}) — unknown, not a no; check it first if a delegated push is refused later]" ;;
+          esac
+        fi
         # DIVE-2011: the handoff goes through the SAME delivery assertion as the
         # human ping (task_need_notify dispatches on TASK_GATE_ROUTE_TO), so a
         # routed gate can no longer exit without a delivery verdict or leave the
@@ -9085,9 +9199,10 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
           _fbt_term=$(_gate_tier2_floor_term "$_ft_title" 2>/dev/null) || _fbt_term=""
           _fbt=" [floored_by=title: the T2 category floor matched '${_fbt_term}' in the TASK TITLE, not in the ask — escalate to the human if the ask really is asking for that]"
         fi
-        ok "$ident routed to $_reviewer for ${_rrole} ($type, tier $tier)${_rnote}${_fbt} — $ask" \
-           '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), routed_to:$rv, delivery:$ds, notified:($ds=="delivered"), ask:$ak, recommend:(($rc|select(length>0)) // null)}' \
-           --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg rv "$_reviewer" --arg ds "$_rstate" --arg ak "$ask" --arg rc "$recommend"
+        ok "$ident routed to $_reviewer for ${_rrole} ($type, tier $tier)${_rnote}${_fbt}${_rsig} [${_rwhy}] — $ask" \
+           '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), routed_to:$rv, route_basis:$rb, route_trigger:$rt, require_sig_seat:(($cs|select(length>0)) // null), delivery:$ds, notified:($ds=="delivered"), ask:$ak, recommend:(($rc|select(length>0)) // null)}' \
+           --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg rv "$_reviewer" --arg ds "$_rstate" --arg ak "$ask" --arg rc "$recommend" \
+           --arg rb "$_rbasis" --arg rt "$_rtrigger" --arg cs "$_csv"
         # No separate undelivered row: the lead-route row above already carries
         # delivery=<state>, and a second row for the same event is how one send
         # becomes two data points (the re-inflation DIVE-1968 spent a round undoing).

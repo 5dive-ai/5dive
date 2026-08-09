@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.19.0 — fix(task): a routed gate says WHO it went to and WHY, at file time (DIVE-2093)
+
+`task need` has always printed the reviewer and the ROLE — *"routed to main2 for verifier
+review"*. It never printed the **property that chose that reviewer**, and that omission cost
+five round trips across four agents in two weeks: dev3 on DIVE-2084 ("open the PR" landed on
+someone holding no `gh`), main on DIVE-2146, olivia immediately after, main2 on DIVE-2798 and
+again on DIVE-2808. Every one of them was **invisible on the board** — a gate pending on the
+wrong principal renders exactly like a gate pending on the right one, so the only way anyone
+learned was the answer that never came.
+
+The routed line now carries the basis:
+
+```
+OK — DIVE-2798 routed to main2 for verifier review (approval, tier 1) [why: routed by LOOP
+MEMBERSHIP — main2 is this task's verifier of record (tasks.verifier). That property carries
+NO information about which capabilities main2 holds, so if this ask needs an ACTION performed
+(open a PR, push, spend, provision a secret) rather than a judgement made, it is on the wrong
+desk: re-file with --tier=2, or --needs=<capability>, or hand it to a holder.
+trigger=verifier-route]
+```
+
+The lead rail names its own edge instead (`agents_org.reports_to`, both ends), so the two
+bases are never confusable. `--json` carries `route_basis` and `route_trigger` for readers
+that should not be parsing prose. The reported trigger is the **most specific** routable kind
+that applies, not whichever clause of the disjunction short-circuited first.
+
+**And the sharper variant, from DIVE-2808.** When the ask is push/deploy shaped, the filing
+now measures whether the routed seat can mint a DIVE-756 closure signature at all, and says so
+in the same breath. A `cli-scoped` seat can ANSWER an approval and cannot SIGN it — so the
+board shows an approved gate, `need_answer_sig` lands empty, and the delegated push is refused
+later, on the MAKER's command, reading as tampering. DIVE-2760 already warns the answerer;
+that shortens the loop and does not close it, because by then a diff has been read and an
+answer given. **Filing is the only moment at which nobody has yet acted.**
+
+Deliberately a warn and never a refusal, and deliberately narrow: it fires only on a
+push/deploy-shaped ask, so an ordinary decision to a non-signing seat prints nothing. An
+**unmeasurable** grant reports as *unknown, not a no* — a false negative here would send a
+filer to re-route a gate that would have cleared fine.
+
+Not in scope, and still open: routing on `(gate type, requested capability)` rather than on
+loop membership. That half sequences with DIVE-2089 and is main's.
+
 ## v0.19.0 — feat(task): cap the rubber-stamp gate at the keystroke, not in a doc (DIVE-2848)
 
 `5dive/CLAUDE.md` line 61 has said "human gates only for money / irreversible / secrets /
