@@ -33,6 +33,22 @@ has "points to DIVE-1221"      "See DIVE-1221."
 has "override warns"           "bypassing the DIVE-1221 Grok exfiltration freeze"
 has "guard sits after is_known_type" "DIVE-1221/1222: Grok provisioning is FROZEN"
 
+# DIVE-3090: the functional probe below is only meaningful in this ORDER. It
+# passes --channels=bogus so a guard that is bypassed, removed or reordered dies
+# at channel validation instead of provisioning — but if valid_channel ever moves
+# ABOVE the guard, the create stops before the guard is reached and the arm
+# proves nothing while still going green. And the barrier is only a barrier while
+# valid_channel stays below create_agent_user. Assert both, by line number.
+guard_ln=$(grep -nF -- 'DIVE-1221/1222: Grok provisioning is FROZEN' "$SRC" | head -1 | cut -d: -f1)
+chan_ln=$(grep -nF -- 'valid_channel "$channels"' "$SRC" | head -1 | cut -d: -f1)
+user_ln=$(grep -nF -- 'create_agent_user "$name"' "$SRC" | head -1 | cut -d: -f1)
+if [[ -n "$guard_ln" && -n "$chan_ln" && -n "$user_ln" \
+      && $guard_ln -lt $chan_ln && $chan_ln -lt $user_ln ]]; then
+  ok "guard < valid_channel < create_agent_user (${guard_ln} < ${chan_ln} < ${user_ln})"
+else
+  bad "probe order broken (guard=${guard_ln:-?} valid_channel=${chan_ln:-?} create_agent_user=${user_ln:-?}); --channels=bogus no longer separates refuse from bypass"
+fi
+
 echo "== functional (built binary) =="
 # cmd_create is root-gated; the freeze fires right after is_known_type, before
 # any user/FS side effect, so a sudo dry-hit is cheap — but that safety used to
