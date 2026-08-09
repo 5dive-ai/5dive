@@ -66,6 +66,27 @@ _human_nonce_mint() { printf '%s' "$KNOWN_NONCE"; }
 # whether the immediate (pre-sudo) caller is an agent (the forge) or not (human/box).
 FAKE_NONAGENT=1   # 1 = non-agent (human), 0 = agent (forge)
 _gate_sudo_uid_nonagent() { [[ "$FAKE_NONAGENT" == "1" ]]; }
+# DIVE-2371: the AUTHORIZATION sites no longer ask the uid alone. They call
+# `_gate_human_principal`, which requires the uid test AND a structural cgroup
+# test, so the single switch above has to drive BOTH halves — otherwise every arm
+# below reads the HOST's real cgroup (an agent unit here, a runner cgroup on CI),
+# the tier-2 guard refuses correctly, and its pre-existing `fail 6` exits this
+# unsubshelled harness at rc=6 instead of grading. Stub the READER only, exactly
+# as tests/gate_cgroup_human_principal_unit.sh does; the accept/deny logic stays
+# the shipped bytes. Deliberately NOT an env var the product reads — a widening
+# knob on a fail-closed accept list is the forge class this row closes.
+_gate_caller_cgroup() {
+  if [[ "$FAKE_NONAGENT" == "1" ]]; then printf '%s' '/system.slice/shelld.service'
+  else printf '%s' '/system.slice/system-5dive.slice/5dive-agent@dev.service'; fi
+}
+# LIVENESS, BOTH DIRECTIONS. A stub that stops being called fails CLOSED here (the
+# real /proc read refuses and truncates, loudly), but a stub wired to the wrong
+# SENSE fails open — so assert the negative too, before any arm leans on it.
+FAKE_NONAGENT=1; _gate_human_principal \
+  || { printf 'NOT OK - human-principal pin inert: FAKE_NONAGENT=1 did not read as a human principal\n'; exit 1; }
+FAKE_NONAGENT=0; _gate_human_principal \
+  && { printf 'NOT OK - human-principal pin inert: FAKE_NONAGENT=0 read as a human principal\n'; exit 1; }
+FAKE_NONAGENT=1
 # Keep the CALLER a non-agent so the DIVE-394 caller-uid block never masks the
 # result. DIVE-2601: this was an `id -un` stub, which the derivation has not read
 # since DIVE-2330 — measured at ZERO calls here, so the caller's agent-ness was
@@ -145,8 +166,26 @@ cmd_task_need DIVE-203 --type=decision --ask="ship it?" --options="A|B" --recomm
 FAKE_NONAGENT=1
 cmd_task_answer DIVE-203 --value=A --human >/dev/null 2>&1
 [[ "$(answered DIVE-203)" == "closed" ]] \
-  && ok_t "T5 non-agent SUDO_UID (dashboard) clears tier-2 decision" \
-  || bad_t "T5 non-agent SUDO_UID clears" "still $(answered DIVE-203)"
+  && ok_t "T5 dashboard principal (non-agent uid + shelld cgroup) clears tier-2 decision" \
+  || bad_t "T5 dashboard principal clears" "still $(answered DIVE-203)"
+
+# --- T5b: DIVE-2371, THE FORGE THIS ROW CLOSES, on the AUTHORIZATION path. Same
+#     non-agent uid as T5 — only the cgroup differs — so the gate must REFUSE.
+#     Without this arm T5's green is satisfied by the uid half ALONE and the
+#     structural half is unpinned here: gate_cgroup_human_principal_unit.sh grades
+#     the predicate in isolation, nothing graded it through cmd_task_answer. This
+#     is the arm that reds if someone reverts _gate_human_principal to the uid test.
+#     Subshelled via $( ) because the refusal is a `fail 6` exit BY DESIGN.
+seed DIVE-290
+cmd_task_need DIVE-290 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 >/dev/null 2>&1
+FAKE_NONAGENT=1
+_cg_saved=$(declare -f _gate_caller_cgroup)
+_gate_caller_cgroup() { printf '%s' '/system.slice/system-5dive.slice/5dive-agent@dev.service'; }
+out=$(cmd_task_answer DIVE-290 --value=A --human 2>&1); rc=$?
+[[ "$(answered DIVE-290)" == "open" && $rc -ne 0 ]] \
+  && ok_t "T5b agent CGROUP with a non-agent uid is REFUSED (the bare --human tier-2 forge)" \
+  || bad_t "T5b agent cgroup refused" "rc=$rc state=$(answered DIVE-290) out=$out — structural half not reached on the answer path"
+eval "$_cg_saved"
 
 # --- T6: BACKWARD-COMPAT — a LEGACY tier-2 decision with NO stored nonce falls back
 #     to the DIVE-1117 provenance floor: a real human --human tap still clears even

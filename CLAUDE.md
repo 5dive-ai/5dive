@@ -11,7 +11,19 @@ decision to add one is ever wrong on its own merits. See
 | tier | runs | budget |
 |---|---|---|
 | `core` (**the default**) | every PR, both CI environments | **300s** per job |
-| `nightly` | `full-sweep.yml` (03:17 UTC + dispatch) | **1320s** per job, corpus split across 3 shards |
+| `nightly` | `full-sweep.yml` — 03:17 UTC, dispatch, **every push to main** (DIVE-2667), and **every PR touching `build.sh`, `install.sh` or `src/**`** (DIVE-2789) | **1320s** per job, corpus split across 3 shards |
+
+- **The PR trigger is ADVISORY. It does not block a merge**, and it is deliberately not
+  a required context: it is paths-filtered, so it is absent from ~28% of PRs, and GitHub
+  leaves a required check that never reports pending forever. A red there is a signal to
+  read, not a gate. It also covers ONE axis — a regression in the harness corpus outside
+  the core tier — and **not** the release path (`release-cut.yml` never runs on a PR) or
+  the selfcheck probe class, which the corpus never reaches. Do not read "full-sweep runs
+  on branches" as "a tree-level regression can no longer land behind a green PR".
+- **The nightly tier is not a cheap subset**: 25% of the corpus by file count and **81%
+  of it by wall-clock** (1210s of 1481s, measured DIVE-2789), because membership is
+  selected on cost. Cost any plan that leans on the core/nightly split in seconds, not in
+  files — `community/wiki/a-demoted-tier-is-not-a-cheap-subset-it-holds-almost-all-the-cost.md`.
 
 - **A new harness is `core` unless you say otherwise.** Nothing to write.
 - **Over budget, CI FAILS** (`exit 4`, distinct from a test failure's `exit 1`) and
@@ -53,8 +65,49 @@ decision to add one is ever wrong on its own merits. See
 - **Editing a harness always runs it**, whatever its tier: the `changed-harnesses`
   job runs and verdict-probes every harness your diff touches. Tier membership is
   a default, and a default loses to an explicit signal.
+- **The budget is spent in a RELATIVE unit** (DIVE-2728). PR #461 red-gated at 322s
+  with 234 of 234 harnesses passing and a diff worth +0.1s, while unrelated files ran
+  10-36% slower and the file the diff touched moved +0.3%. With 9% headroom against a
+  10-36% platform draw, the cap had stopped measuring the corpus. So the runner now
+  **times a small calibration workload in the same job** — process spawn, bash
+  startup, the CLI's own startup, small file I/O, auto-sized to ~10s, min of 2 — and
+  spends the cap in units of it. A uniformly slow VM scales both sides and cancels.
+  - **Clamped to 100-150%.** The floor means a fast VM never *tightens* the agreed
+    cap; the ceiling is the escape-hatch guard, because a cap that grows without
+    limit with the runner draw licenses an arbitrarily larger corpus.
+  - **Past the ceiling, or with a probe that cannot run, the verdict is
+    UNDETERMINED — `exit 6`, never green and never `exit 4`.** "The corpus is over
+    its cap" and "this box could not measure that cap" are different events with
+    different remedies (re-run, not retire a guard). A *failing harness still exits
+    1*: a slow box must never hide a broken test.
+  - **Read the two percentages together.** Every run prints the run against the raw
+    cap and against the effective one: **raw high + effective low = the VM was slow;
+    both high = the corpus grew.** That separation is the deliverable.
+  - Calibration time is **not** counted toward the total. `TIER_CAL_BASELINE_US` is
+    graded against itself every run and says RE-BASELINE past 25% drift — a runner
+    image change is exactly the event that moves it.
+  - **The baseline is a CI number and carries its environment** (DIVE-2736): 119000,
+    the median of six `ubuntu-latest` readings. The 173000 it replaced was measured on
+    the control plane, and the failure that produced was **silent** — every CI probe
+    read as a *fast* runner, the 100% floor clamped all six, and the relative budget
+    stopped existing while still printing a ratio. **A local run now prints
+    RE-BASELINE, and that is correct**; do not re-derive it from the box you are on.
+  - **Two probes, one verdict** (DIVE-2736). A second probe runs *after* the corpus
+    and **grades nothing** — it exists because on one run the probe read 30% fast
+    while the corpus ran 90s slow, and nothing noticed a ratio whose halves moved in
+    opposite directions. `cal_post_delta_pct` is signed; **post slower than pre** is
+    the clean signal, because the corpus warms what the probe pays for and biases the
+    second reading fast, so *agreement* is weak evidence rather than a clearance.
+    `--no-cal-post` skips it. Across runs: `scripts/tier-cal-window.sh <reports…>`
+    (normalises wall-clock to µs/harness first, or deleting a harness reads as
+    anti-correlation).
+  - `--no-calibrate` grades against the raw cap (useful with no built bundle). The
+    clamp floor is 1.0, so that is the **strictest** this gate gets, never a
+    relaxation. `--cal-us=` / `--cal-baseline-us=` / `--cal-cli=` are harness seams;
+    no workflow passes them, for the same reason no workflow passes `--budget`.
 - Locally: `bash scripts/run-harnesses.sh --tier=core` (or `--tier=full`). Both
-  budgets and the tier marker live in `tests/lib/tier.sh`, one place.
+  budgets, the calibration constants and the tier marker live in `tests/lib/tier.sh`,
+  one place.
 - **The nightly is sharded, not given a bigger number.** The cap is per job, so
   splitting the sweep cuts each job's wall-clock without relaxing it. Aggregate
   capacity is 3 x 1320s and the shard count is fixed in the matrix, so adding a

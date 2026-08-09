@@ -342,5 +342,44 @@ else
         "got '$(last_skipped_of "$t_err")'"
 fi
 
+# ---------------------------------------------------------------------------
+# DIVE-2271: a FAILED skip stamp must be visible without aborting the tick.
+#
+# last_skipped_at is telemetry, so its write remains best-effort. The old
+# `2>/dev/null || true` got the non-fatal half right but discarded sqlite's
+# only explanation for a NULL stamp. Force this exact UPDATE to fail, then
+# prove both halves of the contract: the pass completes and the error reaches
+# _hb_log. The recovery pass is the differential proving the stub hit the
+# intended write rather than making the template ineligible.
+t_stamp=$(mk_template "failed-stamp template" todo)
+_hb_materialize_recurring "$((t0 + 720))"
+db "UPDATE tasks SET last_fired_at='${SENTINEL}' WHERE id=${t_stamp};" >/dev/null
+: >"$LOG"
+
+DB_FAIL_MATCH="UPDATE tasks SET last_skipped_at=datetime('now') WHERE id=${t_stamp}"
+DB_FAIL_MODE='error'
+_hb_materialize_recurring "$((t0 + 840))"
+DB_FAIL_MATCH=''
+
+if grep -q 'last_skipped_at stamp FAILED: Error: database disk image is malformed' "$LOG"; then
+  ok_t "2271 stamp-error: failed last_skipped_at write is visible in _hb_log"
+else
+  bad_t "2271 stamp-error: failed last_skipped_at write is visible in _hb_log" "$(cat "$LOG")"
+fi
+if grep -q 'pass done' "$LOG" && [[ "$(instances_of "$t_stamp")" == "1" ]] \
+   && [[ -z "$(last_skipped_of "$t_stamp")" ]]; then
+  ok_t "2271 stamp-error: failure is non-fatal and does not forge a stamp"
+else
+  bad_t "2271 stamp-error: failure is non-fatal and does not forge a stamp" \
+        "log=$(cat "$LOG") instances=$(instances_of "$t_stamp") last_skipped='$(last_skipped_of "$t_stamp")'"
+fi
+
+_hb_materialize_recurring "$((t0 + 960))"
+if [[ -n "$(last_skipped_of "$t_stamp")" ]]; then
+  ok_t "2271 differential: the same skip stamps after the write recovers"
+else
+  bad_t "2271 differential: the same skip stamps after the write recovers"
+fi
+
 echo "-- ${PASS} passed, ${FAIL} failed --"
 [[ $FAIL -eq 0 ]]

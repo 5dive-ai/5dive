@@ -386,6 +386,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- DIVE-2403 ate 07-31..08-04. Both recovered cleanly downstream, which is exactly
   -- what kept the fault quiet.
   recurring_stall_pinged_at TEXT,
+  -- DIVE-2853: recurring_stall_escalated_at throttles the SECOND rung — the one
+  -- that changes hands — to once per instance. The first rung's notice goes to the
+  -- row's assignee, i.e. to the party whose non-pickup IS the fault, so repeating it
+  -- cannot clear the state: measured on DIVE-2694, which was flagged exactly on time
+  -- and then sat unstarted another 28h because dev was mid-delivery under a
+  -- single-task goal and structurally could not take a second row. A fence outlives
+  -- every re-ping. So the second rung reassigns to a free agent, or cancels with a
+  -- written reason so the template re-fires, and this column is what stops a
+  -- reassignment from thrashing the row around the fleet tick after tick.
+  recurring_stall_escalated_at TEXT,
   -- DIVE-891: risk-tiered gates (adopted design DIVE-861). tier is set when the
   -- gate is filed: 0 = auto-clear (rec applies immediately, digest line only),
   -- 1 = agent-clearable + 48h TTL auto-applies the recommendation, 2 = hard
@@ -1092,7 +1102,7 @@ _tasks_db_migrate() {
            'iteration INTEGER' 'maker_agent TEXT' 'handoff_ack_at TEXT' 'task_budget TEXT' \
            'handoff_delivered_at TEXT' 'handoff_stale_pinged_at TEXT' \
            'handoff_rejected_at TEXT' \
-           'recurring_stall_pinged_at TEXT' \
+           'recurring_stall_pinged_at TEXT' 'recurring_stall_escalated_at TEXT' \
            'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT' \
            'gate_filed_by TEXT' \
            'secret_key TEXT' 'connector TEXT' 'secret_oob TEXT' 'human_nonce_hash TEXT' \
@@ -2125,6 +2135,110 @@ _gate_sudo_uid_nonagent() {
   [[ "$uname" != agent-* ]]
 }
 
+# ── DIVE-2371: the STRUCTURAL half of the human-evidence test ────────────────
+# The uid test above asks "is this name absent from a list I maintain", so every
+# principal NOT enumerated is promoted to human: `claude` (an agent runtime, not
+# a person — the pre-`agent-*` session present on every box), `hello`, `dmarc`,
+# CI's `runner`, and any future service account. A human-evidence test whose
+# DEFAULT is *human* has its fail direction backwards, and on the one account
+# present everywhere it gave the wrong answer: a bare `--human` from any process
+# running as claude cleared a tier-2 gate.
+#
+# WHY A CGROUP AND NOT A BETTER NAME LIST: /proc/self/cgroup is written by systemd
+# at fork and an unprivileged process cannot rewrite its own. Crucially `sudo` does
+# NOT move cgroups, so it survives the EUID-0 hop $SUDO_UID exists for — the same
+# hop that makes that env var forgeable off-root (DIVE-1413).
+#
+# THE LIST IS ON THE ACCEPT SIDE, which is what makes it fail closed: a principal
+# nobody enumerated is REFUSED, where the uid test admitted it. lodar answered
+# "Ship it" 2026-08-05 07:40 knowing the consequence — a tier-2 gate can no longer
+# be cleared from a shell on the box as user claude. Telegram taps are untouched:
+# they clear through the nonce arm, not this one.
+# Pick the SYSTEMD line out of a /proc/<pid>/cgroup stream and print its path.
+# Split out from _gate_caller_cgroup so the line-SELECTION rule is gradable without
+# an override for the path to read — the path stays hardcoded at the one call site
+# below, because a readable-path knob on a fail-closed predicate is the same class
+# of widening surface as an accept-list knob (D1).
+#
+# WHY NOT `head -1`. That read whichever line came first. On cgroup v2 the file IS
+# the single unified `0::<path>` entry and it happens to be right; on a v1 or hybrid
+# host the file is many `<hier>:<controllers>:<path>` lines in kernel order, so the
+# first is an ARBITRARY controller whose path can differ from the systemd one. A real
+# login session then read as an unrecognised cgroup and a HUMAN was locked out of
+# their own tier-2 clear. That direction is fail-closed, which is the right default
+# and is NOT a reason to keep a known-wrong reader on a human-auth path: the installed
+# fleet is unobservable by design (no exec token, SSH stripped), so "our boxes are v2"
+# is a statement about the boxes we can see, and a lockout there has no self-service
+# path.
+#
+# NO PERMISSIVE FALLBACK. If neither line is present we return 1 and the caller
+# refuses. "Take any line we did find" is exactly what would admit an unrecognised
+# hierarchy's path into a fail-closed accept list.
+_gate_cgroup_pick_line() {
+  local line sysd="" uni=""
+  while IFS= read -r line; do
+    case "$line" in
+      *:name=systemd:*) sysd="$line" ;;   # v1/hybrid: systemd's unit-tracking hierarchy
+      0::*)             uni="$line"  ;;   # v2: the unified hierarchy
+    esac
+  done
+  # v1/hybrid FIRST: where systemd tracks units in the name=systemd hierarchy the
+  # unified line may be bare `/`. A pure-v2 host has no name=systemd line at all, so
+  # this falls through to the unified one rather than needing to detect the version.
+  line="${sysd:-$uni}"
+  [[ -n "$line" ]] || return 1
+  # Strip the two leading `<field>:` columns rather than taking everything after the
+  # LAST colon — a unit path may legitimately contain one.
+  printf '%s' "${line#*:*:}"
+}
+
+_gate_caller_cgroup() {
+  # An unreadable /proc entry fails the redirect, so this returns nonzero and the
+  # caller refuses — the "unresolved principal is not a verified one" rule.
+  _gate_cgroup_pick_line </proc/self/cgroup 2>/dev/null
+}
+
+_gate_cgroup_human_capable() {
+  local cg; cg=$(_gate_caller_cgroup) || return 1
+  [[ -n "$cg" ]] || return 1
+
+  # ACCEPT 1 — THE DASHBOARD. It is the only non-Telegram surface a customer
+  # clears a gate from, and it has neither a nonce (the nonce is minted into
+  # Telegram callback_data, never to a browser) nor a login session. shelld is a
+  # plain system service, User=claude, no Slice=, so /system.slice/shelld.service.
+  # MEASURED on a freshly provisioned box 2026-08-05, not derived from the unit
+  # file: ControlGroup and the running process's own /proc/<pid>/cgroup agree, and
+  # shelld spawns the CLI as a PLAIN sudo child, so the answerer inherits this.
+  #
+  # HARDCODED ON PURPOSE — no env override. My first draft read this list from
+  # $FIVE_GATE_CGROUP_ACCEPT, a plain env var any non-root process sets freely: an
+  # agent could name its OWN cgroup and pass. That is the exact env-forge class
+  # DIVE-1413 hardened $SUDO_UID against, reintroduced into the predicate written
+  # to close it. A widening knob on a fail-closed accept list IS the failure mode.
+  [[ "$cg" == "/system.slice/shelld.service" ]] && return 0
+
+  # ACCEPT 2 — A REAL LOGIN SESSION, structural rather than named: a person who
+  # logs in and sudo's lands in /user.slice/user-<uid>.slice/session-<n>.scope.
+  # No unit name to forget, and no system service can manufacture one.
+  [[ "$cg" == /user.slice/*/session-*.scope ]] && return 0
+
+  # Everything else refused: agent units, the primary claude runtime, an
+  # unreadable cgroup, a non-systemd host. An unresolved principal is not a
+  # verified one — the same rule the served/expected commit checks use.
+  return 1
+}
+
+# The AUTHORIZATION predicate. Requires BOTH halves on purpose, so it can only
+# tighten: nothing the uid test refused becomes permitted, and the structural test
+# removes the principals it wrongly admitted. ATTRIBUTION does not use this —
+# `_gate_withdraw_actor` keeps the uid test, because authorization must fail closed
+# while attribution must stay TRUTHFUL, and degrading a real person's withdrawal to
+# 'none' would make the record worse rather than safer.
+_gate_human_principal() {
+  _gate_sudo_uid_nonagent || return 1
+  _gate_cgroup_human_capable
+}
+
 # ── DIVE-756: persisted closure signature (tamper-evidence) ──────────────────
 # Unlike the short-lived answer-time --proof (bound to id:type, TTL 120s, then
 # discarded), this HMAC is STORED on the row and binds the durable closure facts,
@@ -2308,6 +2422,27 @@ ship_ledger_record() {
 # never prevent the refusal: if the write fails the action is still refused,
 # because a policy that stops working when its telemetry breaks is a worse
 # failure than a missing row.
+# OSS-37: the ONE definition of a spent maker→verifier loop, as a SQL predicate over
+# `tasks`. A loop is "stuck" once it has a cap, has reached it, and still isn't closed.
+#
+# It lives here, not in cmd_task.sh, because it has two callers in different command
+# files — `loop board --stuck` / `--escalate-stuck` and the objective planner's injected
+# context — and a predicate held as a local shell var in one of them can only be REUSED
+# by re-typing it. Re-typing buys does-not-currently-drift; a shared definition is what
+# buys cannot-drift, and the difference is invisible on the day you write it. This
+# codebase already paid for that lesson once (DIVE-1963, `_gate_bind_slug` in
+# cmd_push.sh: "they agreed, but that is parallel derivation").
+#
+# Callers must NOT re-type it or "simplify" it at the call site — the second copy that
+# omits a clause because the local WHERE already covers it is exactly the copy that
+# stops matching when this one changes. `tests/objective_replan_unit.sh` fails if either
+# call site inlines the predicate instead of calling this.
+_task_stuck_loop_pred() {
+  printf '%s' "(verifier IS NOT NULL AND max_iterations IS NOT NULL
+                AND COALESCE(iteration,0) >= max_iterations
+                AND status NOT IN ('done','cancelled'))"
+}
+
 policy_refuse() {
   local code="$1" policy="$2" ticket="$3" ident="$4"; shift 4
   local msg="$*" actor

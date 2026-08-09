@@ -887,6 +887,8 @@ paperclip_unseed_for_profile() {
       | .[0].value.authProfile // empty' <<<"$reg")
     [[ -n "$fallback_profile" ]] && paperclip_seed_for_type "$t" "$fallback_profile"
   done
+  return 0   # DIVE-2751: a for-loop returns its LAST iteration's status, so
+             # `claude` having no fallback profile made the whole unseed fail.
 }
 
 # paperclip_seed_all_from_registry — backfill the host-default credential
@@ -904,6 +906,9 @@ paperclip_seed_all_from_registry() {
       | .[0].value.authProfile // empty' <<<"$reg")
     [[ -n "$profile" ]] && paperclip_seed_for_type "$t" "$profile"
   done
+  return 0   # DIVE-2751: LIVE — main.sh:738 calls this bare under `paperclip-seed`
+             # (invoked from update.sh), and the loop's last iteration is `claude`,
+             # so a host with no claude auth profile exited 1 before the ok() line.
 }
 
 # profile_set_var <profile> <VAR> <VALUE> — idempotent KEY=VALUE upsert in
@@ -920,6 +925,27 @@ profile_set_var() {
   file="${dir}/combined.env"
   local value
   value=$(cat)
+  # DIVE-2757 iteration 2: a NEWLINE in the value forges a SECOND assignment.
+  # `printf '%s=%s\n' VAR "a<LF>B=c"` writes two lines, and systemd honours the
+  # second — so a value carrying a newline can set ANY variable in this file,
+  # ANTHROPIC_AUTH_TOKEN included. Found by the accept-path arm olivia required
+  # on this row, on its first run; the refusal arms could not see it because
+  # they grade the INPUT and this is a property of the WRITER.
+  #
+  # Refuse rather than strip or escape. Stripping silently changes the operator's
+  # value, and an EnvironmentFile has no quoting that makes a literal newline
+  # safe — there is no correct multi-line assignment to preserve here. Every
+  # legitimate caller passes a URL, a token, a model slug or a number, none of
+  # which contain one.
+  #
+  # This is defence in DEPTH, not the only guard: `valid_base_url` already
+  # rejects whitespace on the --base-url input. But that guard is on ONE input
+  # of one caller, and this writer serves every profile variable there is —
+  # a control on one path is absent on the parallel one unless it sits at the
+  # write.
+  if [[ "$value" == *$'\n'* ]]; then
+    fail "$E_VALIDATION" "profile_set_var: refusing to write ${var} — the value contains a newline, which would forge a second assignment in ${file} (systemd honours it). Pass a single-line value."
+  fi
   local tmp
   tmp=$(mktemp "${file}.XXXXXX")
   grep -v "^${var}=" "$file" 2>/dev/null > "$tmp" || true

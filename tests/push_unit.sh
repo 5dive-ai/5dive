@@ -168,6 +168,40 @@ out=$(run_push DIVE-907 --dry-run); rc=$?
 { [[ $rc -eq 0 ]] && grep -qi "dry-run: would push" <<<"$out"; } \
   && ok_t "happy dry-run -> ok" || bad_t "happy dry-run -> ok" "rc=$rc :: $out"
 
+# 7c) DIVE-2801: THE DRY-RUN MUST NOT GREEN-LIGHT WHAT THE REAL PUSH REFUSES.
+# Measured on DIVE-2798: `--dry-run` printed OK and the real push refused the same
+# row seconds later, nothing changed between them. Cause — the rehearsal runs
+# _push_gate_check at require_sig=0 and cmd_push_do at 1, so the rehearsal
+# evaluated a weaker predicate and reported its verdict as the whole gate.
+# The DIVE-2760 arm above pins the ANSWERER's warning; this pins the ACTOR's, and
+# they are different agents in different sessions, which is why both exist.
+# The arm is the SAME fixture as arm 7 with one column cleared (sign=0), so a
+# difference here is attributable to the signature and to nothing else.
+seed_task DIVE-930 "Branch: feature-ok" approval "2026-07-18 00:00:00" \
+  "yes ship it" "human:test" "" 0
+out=$(run_push DIVE-930 --dry-run); rc=$?
+{ [[ $rc -ne 0 ]] && ! grep -qi "would push" <<<"$out"; } \
+  && ok_t "unsigned closure: dry-run refuses, and reports no push (DIVE-2801)" \
+  || bad_t "unsigned closure: dry-run refuses, and reports no push (DIVE-2801)" "rc=$rc :: $out"
+grep -qi "carries NO closure signature" <<<"$out" \
+  && ok_t "…and it NAMES the state it saw, so the reader is not sent to audit the reviewer" \
+  || bad_t "…and it NAMES the state it saw" "$out"
+# And the positive control is arm 7 directly above — same command, same fixture,
+# signature present, rc=0. The pair is what proves the fix is not "always warn".
+# What arm 7 must now ALSO do: SAY what it did not check. A green that stays silent
+# about the executor's signature check is the same false go-ahead one release later.
+out=$(run_push DIVE-907 --dry-run); rc=$?
+{ [[ $rc -eq 0 ]] && grep -qi "NOT verified here" <<<"$out"; } \
+  && ok_t "signed closure: the dry-run passes AND states the check it did not run" \
+  || bad_t "signed closure: the dry-run passes AND states the check it did not run" "rc=$rc :: $out"
+# The machine surface must carry the state as a FIELD, not only inside prose: a
+# consumer that greps `ok:true` and ships is the automated version of the reader
+# this ticket is about.
+out=$( JSON_MODE=1 run_push DIVE-907 --dry-run )
+grep -q '"gateSignature":"unverified"' <<<"$out" \
+  && ok_t "…and --json carries gateSignature as a field, not only as prose" \
+  || bad_t "…and --json carries gateSignature as a field, not only as prose" "$out"
+
 # 7b) INST-5 FAIL-CLOSED ON A MISSING PREDICATE. Extracting push's gate check into
 # lib/broker.sh created a failure mode the inline code could not have: if the lib
 # is not loaded the call is merely "command not found" (rc 127) and, as a bare
@@ -617,7 +651,7 @@ grep -Eq "cached refs/remotes/origin/main|could not fetch" <<<"$out" \
 # ...and a cached bound still CATCHES a genuinely mis-authored commit — exactly
 # one, the branch's own, not the pre-policy history behind it.
 out=$(scan3 feature-dirty "$UNFETCHABLE" authoritative); rc=$?
-n=$(grep -cE "^  [0-9a-f]{40} " <<<"$out")
+n=$(grep -cE "^  [0-9a-f]{40} " <<<"$out") || n=0
 { [[ $rc -ne 0 ]] && grep -q "author check FAILED" <<<"$out" && [[ "$n" -eq 1 ]] \
     && grep -q "MAY BE STALE" <<<"$out"; } \
   && ok_t "2161: cached bound catches a real bad author — exactly 1 offender, flagged stale" \
@@ -820,8 +854,8 @@ grep -q 'repos/\${slug}/installation' "$SRC/cmd_push.sh" \
 # of this fix referenced \$slug 40 lines above its assignment, which expands to
 # empty and silently queries /repos//installation — a lookup that cannot fail
 # loudly. Pin the ordering, not just the presence.
-_slug_ln=$(grep -n '^  slug=\$(_push_repo_slug "\$repourl")' "$SRC/cmd_push.sh" | head -1 | cut -d: -f1)
-_inst_ln=$(grep -n 'repos/\${slug}/installation' "$SRC/cmd_push.sh" | head -1 | cut -d: -f1)
+_slug_ln=$(grep -n '^  slug=\$(_push_repo_slug "\$repourl")' "$SRC/cmd_push.sh" | head -1 | cut -d: -f1) || _slug_ln=""
+_inst_ln=$(grep -n 'repos/\${slug}/installation' "$SRC/cmd_push.sh" | head -1 | cut -d: -f1) || _inst_ln=""
 [[ -n "$_slug_ln" && -n "$_inst_ln" && "$_slug_ln" -lt "$_inst_ln" ]] \
   && ok_t "installation: slug is assigned BEFORE the installation lookup reads it" \
   || bad_t "installation: slug assigned before use" "slug at line ${_slug_ln:-none}, lookup at ${_inst_ln:-none}"
@@ -833,6 +867,95 @@ _inst_ln=$(grep -n 'repos/\${slug}/installation' "$SRC/cmd_push.sh" | head -1 | 
 grep -q "message // empty" "$SRC/cmd_push.sh" \
   && ok_t "installation: a failed mint surfaces GitHub's own message" \
   || bad_t "installation: mint failure names the cause" "the API error body is discarded"
+
+# === DIVE-2566: BEHAVIOURAL REPLACEMENTS FOR THE TWO PRESENCE GREPS ABOVE =====
+#
+# olivia mutation-graded the three DIVE-2563 arms at c728b00 and found two of them
+# survive a mutation that RESTORES the exact defect they name:
+#   MUT A  replace `inst="$_inst_for_repo"` with `:` — the installation is looked up,
+#          announced on stderr, and never ADOPTED, so the mint still POSTs to the
+#          pinned id and every lodar/* repo 422s exactly as before DIVE-2563.
+#          push_unit stayed 94/0, because the arm only greps that the LOOKUP EXISTS.
+#   MUT B  strip `${_why}` from the mint's fail(), leaving the `message // empty`
+#          extraction intact but discarding it before the operator sees it.
+#          push_unit stayed 94/0, because the arm greps that the body is PARSED.
+#
+# Both are this row's own lesson one layer up: DIVE-2566 exists because a fallback
+# that was PRESENT in the source was UNREACHABLE at runtime while the suite stayed
+# green. Presence-of-string is not reachability, and that fix was applied only to the
+# guard. These two arms EXECUTE the source's own lines instead of reading them.
+
+# --- ARM A: the mint URL must carry the RESOLVED id, not the pinned one -------
+# ASSERT THE ANCHORS FIRST. If the extraction misses, the arm must FAIL LOUDLY
+# rather than silently grade an empty string — an arm that cannot find its subject
+# is exactly the vacuous pass this whole ticket is about.
+_a_start=$(grep -n 'if \[\[ -n "\$_inst_for_repo" && "\$_inst_for_repo" != "\$inst" \]\]' "$SRC/cmd_push.sh" | head -1 | cut -d: -f1) || _a_start=""
+_a_end=$(awk -v s="${_a_start:-0}" 'NR>s && /^  fi$/ {print NR; exit}' "$SRC/cmd_push.sh")
+_a_url=$(grep -c 'app/installations/\${inst}/access_tokens' "$SRC/cmd_push.sh") || _a_url=0
+if [[ -z "$_a_start" || -z "$_a_end" || "$_a_url" -eq 0 ]]; then
+  bad_t "installation: ARM A could not locate its subject (DIVE-2566)" \
+        "adoption block ${_a_start:-none}..${_a_end:-none}, mint-URL hits ${_a_url} — the arm graded nothing"
+else
+  # Run the SOURCE's own adoption block with a resolved id that differs from the
+  # pinned one, then build the mint URL the way the source builds it.
+  _a_out=$(bash -c '
+set -euo pipefail
+inst=147419836; _inst_for_repo=999000111; slug=lodar/5dive-api
+'"$(sed -n "${_a_start},${_a_end}p" "$SRC/cmd_push.sh")"'
+printf "%s\n" "https://api.github.com/app/installations/${inst}/access_tokens"
+' 2>/dev/null)
+  if [[ "$_a_out" == *"/app/installations/999000111/access_tokens"* ]]; then
+    ok_t "installation: the mint URL carries the RESOLVED installation, not the pinned id (DIVE-2566, kills MUT A)"
+  else
+    bad_t "installation: resolved id reaches the mint (DIVE-2566)" \
+          "mint URL came out as '${_a_out:-<block died>}' — the lookup's answer is announced but never adopted, so every repo outside the pinned installation still 4xxs"
+  fi
+fi
+
+# --- ARM B: a 404 body's own message must REACH the operator ------------------
+# Extracts the mint's failure block and runs it with a real GitHub 404 body, with
+# `fail` stubbed to capture what the operator would actually see. Greping that the
+# body is PARSED cannot tell that apart from a fail() that drops it on the floor.
+_b_start=$(grep -n 'if \[\[ -z "\$tok" \]\]; then' "$SRC/cmd_push.sh" | head -1 | cut -d: -f1) || _b_start=""
+_b_end=$(awk -v s="${_b_start:-0}" 'NR>s && /^  fi$/ {print NR; exit}' "$SRC/cmd_push.sh")
+if [[ -z "$_b_start" || -z "$_b_end" ]]; then
+  bad_t "installation: ARM B could not locate its subject (DIVE-2566)" \
+        "failure block ${_b_start:-none}..${_b_end:-none} — the arm graded nothing"
+else
+  _b_msg='Not Found'
+  _b_out=$(bash -c '
+set -uo pipefail
+E_AUTH_REQUIRED=6; E_GENERIC=1
+fail() { printf "FAILCODE:%s\nFAILMSG:%s\n" "$1" "$2"; exit 0; }
+tok=""; slug=lodar/5dive-api; inst=147419836
+_tokresp='"'"'{"message":"Not Found","documentation_url":"https://docs.github.com/rest"}'"'"'
+'"$(sed -n "${_b_start},${_b_end}p" "$SRC/cmd_push.sh")"'
+' 2>/dev/null)
+  if [[ "$_b_out" == *"FAILMSG:"* && "$_b_out" == *"$_b_msg"* ]]; then
+    ok_t "installation: GitHub's own 404 message REACHES the operator's failure text (DIVE-2566, kills MUT B)"
+  else
+    bad_t "installation: mint failure carries the remote's message (DIVE-2566)" \
+          "operator would have seen '${_b_out:-<block died>}' — the body is parsed but discarded before it is shown, which is the state that cost a builder an hour on DIVE-1560"
+  fi
+  # ...and the code must be OURS, not curl's rc=22 and not the E_GENERIC catch-all.
+  # This is the row's originating symptom: a number from another namespace.
+  if [[ "$_b_out" == *"no installation covering"* ]]; then
+    ok_t "installation: a 404 mint names the NO-INSTALLATION cause specifically, not a generic failure (DIVE-2566)"
+  else
+    bad_t "installation: 404 names the no-installation cause (DIVE-2566)" \
+          "got '${_b_out:-<block died>}' — the one cause an operator cannot fix by retrying must say so"
+  fi
+  # THE ROW'S ORIGINATING SYMPTOM was an exit code from someone else's namespace:
+  # curl's rc=22 leaking through set -euo pipefail, which is not a 5dive code at all.
+  # E_GENERIC would technically be "ours" and still tells the operator nothing, so
+  # the arm pins the CLASS and not merely the fact that we called fail().
+  if [[ "$_b_out" == *"FAILCODE:${E_AUTH_REQUIRED}"* ]]; then
+    ok_t "installation: the mint failure exits E_AUTH_REQUIRED, not the E_GENERIC catch-all (DIVE-2566)"
+  else
+    bad_t "installation: mint failure carries a meaningful E_ code (DIVE-2566)" \
+          "got '${_b_out:-<block died>}' — expected FAILCODE:${E_AUTH_REQUIRED}; rc=22 from curl and a generic 1 are equally unactionable"
+  fi
+fi
 
 
 # DIVE-2566: the installation lookup is a probe that is ALLOWED to fail — a repo

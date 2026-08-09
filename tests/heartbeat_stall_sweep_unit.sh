@@ -100,7 +100,7 @@ reset_all() {
 #     clears any stale-ping flag, and is untouched by the sweep (too fresh)
 reset_all
 a=$(addt --assignee=dev --verifier=olivia -- "ship the widget")
-( cmd_task_done "$a" ) >/dev/null 2>&1
+( cmd_task_done "$a" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
 delivered=$(db "SELECT COALESCE(handoff_delivered_at,'NULL') FROM tasks WHERE id=${a};")
 [[ "$delivered" != "NULL" ]] \
   && ok_t "task done to a verifier stamps handoff_delivered_at" \
@@ -132,7 +132,7 @@ _hb_stall_sweep >/dev/null 2>&1
 # --- A4: acknowledged deliveries (handoff_ack_at set) are never surfaced
 reset_all
 b=$(addt --assignee=dev --verifier=olivia -- "ship the gadget")
-( cmd_task_done "$b" ) >/dev/null 2>&1
+( cmd_task_done "$b" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
 db "UPDATE tasks SET handoff_delivered_at=datetime('now','-999 minutes'),
        handoff_ack_at=datetime('now') WHERE id=${b};"
 : >"$SEND_LOG"
@@ -357,7 +357,7 @@ _hb_stall_sweep >/dev/null 2>&1
 FLEET=$(mkfleet dev); IDLE_MAP=""
 reset_all
 d=$(addt --assignee=dev --verifier=olivia -- "delivered, awaiting the grade")
-( cmd_task_done "$d" ) >/dev/null 2>&1
+( cmd_task_done "$d" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
 db "INSERT INTO task_prefs (key,value) VALUES ('stall_first_seen_at', datetime('now','-60 minutes'));"
 : >"$SEND_LOG"; : >"$PROBE_LOG"
 _hb_stall_sweep >/dev/null 2>&1

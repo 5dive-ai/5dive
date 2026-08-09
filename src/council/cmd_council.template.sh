@@ -1313,6 +1313,16 @@ _council_verify() {
       [[ -n "$target" && "$rcpt_ok" != "1" ]] && echo "  receipt: $target not found or does not re-seal" >&2
     fi
   fi
+  # DIVE-2711: a FAILED verify has already printed its reason on both rails above
+  # (the JSON envelope with constitutionOk/constitution, or the "council verify:
+  # FAILED" block on stderr), so mark it reported. Without this, the EXIT backstop
+  # in lib/output.sh treats the non-zero return as a SILENT exit and appends its
+  # generic "exited N without reporting a reason … this is a bug in the CLI" text.
+  # On the stderr rail that is merely noise; under --json it emits a SECOND JSON
+  # object on STDOUT, so the output stops being one document and every reader
+  # breaks — `jq -r .data.constitutionOk` returns "false\nnull" rather than
+  # "false". A drift verdict is a correct, deliberate non-zero exit, not a crash.
+  (( all_ok )) || mark_reported
   (( all_ok )) && return 0 || return "$E_GENERIC"
 }
 
@@ -1437,6 +1447,31 @@ _council_amend() {
   local new_digest; new_digest="$(sha256sum < "$file" 2>/dev/null | awk '{print $1}')"
   [[ -n "$new_digest" ]] || fail "$E_GENERIC" "could not digest the proposed constitution $file"
 
+  # DIVE-2889 — RESOLVE THE CANDIDATE TO A REAL, ABSOLUTE PATH BEFORE ANY SEAT SEES A BALLOT.
+  # The eng_approval_lead amendment was balloted twice on a digest that resolves to no file
+  # anywhere on disk, while both approving rationales described the LIVE constitution. A seat
+  # cannot bind bytes it cannot name, so the ballot has to carry the name — and a relative path
+  # is not a name once the ballot leaves this process and lands in another agent's task body.
+  local cand_abs; cand_abs="$(readlink -f -- "$file" 2>/dev/null || true)"
+  [[ -n "$cand_abs" && -r "$cand_abs" ]] \
+    || fail "$E_NOT_FOUND" "could not resolve the proposed constitution '$file' to a readable absolute path — a motion whose bytes cannot be located must not reach seats (fail-closed, DIVE-2889)"
+  # Re-digest through the RESOLVED path, not the argument. If the two disagree the file moved or
+  # changed under us between the two reads, and the ballot would name bytes that no longer exist.
+  local cand_recheck; cand_recheck="$(sha256sum < "$cand_abs" 2>/dev/null | awk '{print $1}')"
+  [[ "$cand_recheck" == "$new_digest" ]] \
+    || fail "$E_CONFLICT" "the proposed constitution changed between reads ($new_digest -> ${cand_recheck:-unreadable}) — refusing to ballot a digest that no longer names the file (fail-closed, DIVE-2889)"
+
+  # Live side of the binding: seats are told what the candidate is being compared AGAINST, so
+  # "verified the on-disk content" can no longer be true of the wrong file without the ballot
+  # contradicting it. An absent live file is a legitimate state (pre-genesis), not a failure.
+  local live_path live_digest cand_diff diff_tmp
+  live_path="$(_council_constitution_path)"
+  live_digest="$(sha256sum < "$live_path" 2>/dev/null | awk '{print $1}')" || live_digest=""
+  diff_tmp="$(mktemp)"
+  # `diff` exits 1 when the files differ, which is the ORDINARY case here — never let that kill
+  # the amend under `set -e`, and never let it read as an error.
+  diff -u "$live_path" "$cand_abs" > "$diff_tmp" 2>/dev/null || true
+
   # Current roster + hash-chain head from the SEALED lineage tail.
   local head head_seats prev_digest last_seq seq
   head="$(tail -n1 "$COUNCIL_LINEAGE" 2>/dev/null)"
@@ -1445,8 +1480,11 @@ _council_amend() {
   prev_digest="$(printf '%s' "$head" | jq -r '.digest // ""')"
   last_seq="$(printf '%s' "$head" | jq -r '.seq // -1')"; [[ "$last_seq" =~ ^[0-9]+$ ]] && seq=$((last_seq+1)) || seq=0
 
-  local plan question
-  plan="$(node "$dir/cli.mjs" amend-plan --seats-json="$head_seats" --constitution="@$file" --constitution-digest="$new_digest")" || return $?
+  local plan question _amend_rc
+  plan="$(node "$dir/cli.mjs" amend-plan --seats-json="$head_seats" --constitution="@$cand_abs" --constitution-digest="$new_digest" \
+    --constitution-path="$cand_abs" --live-path="$live_path" --live-digest="$live_digest" --diff="@$diff_tmp")" \
+    || { _amend_rc=$?; rm -f "$diff_tmp"; return $_amend_rc; }   # preserve amend-plan's exit code — its fail-closed refusals are distinguishable by code
+  rm -f "$diff_tmp"
   question="$(printf '%s' "$plan" | jq -r '.question')"
 
   if (( dry )); then
