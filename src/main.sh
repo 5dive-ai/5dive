@@ -43,7 +43,7 @@ Agents:
   5dive agent list
   5dive agent info <name>                            # type, CLI version, selected model, channel + state
   5dive agent types
-  5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard[,ch...]]
+  5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz[,ch...]]
                             [--telegram-token=<bot-token>] [--discord-token=<token>]
                             [--workdir=<path>] [--auth-profile=<name>]
                             [--provider=<id> --api-key=<key|->]
@@ -78,7 +78,7 @@ Agents:
   5dive agent rm <name> [--purge-home]               # aliases: 5dive agent fire <name>  /  5dive fire <name>
                                                      # home is quarantined to /home/.5dive-reaped/ (root 0700);
                                                      # --purge-home deletes it instead (irreversible)
-  5dive agent config <name> set channels=<none|telegram|discord|dashboard[,ch...]>
+  5dive agent config <name> set channels=<none|telegram|discord|dashboard|buzz[,ch...]>
                                                      # comma-separable; dashboard (claude-only, no token)
                                                      # enables web-dashboard chat — the one-tap Enable chat
                                                      # path. New claude creates include it by default.
