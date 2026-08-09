@@ -202,6 +202,43 @@ warned_on "discusses REFUSED" "matched 'spend'" \
   && ok_t "safety: money ask on a loop stays tier 2, unrouted (human keeps the call)" \
   || bad_t "safety money tier 2" "tier=$(tierof DIVE-925) routed='$(routedof DIVE-925)'"
 
+# --- 11b: THE CLAIM ARM 11 ONLY MADE IN PROSE. Its comment has always promised
+#          "gets NO dead-end advice", but it asserted tier and route only, so the
+#          advice was free to fire and did. DIVE-925 above passed --discusses and
+#          was REFUSED (Rule 3, 'spend' survives the residual); the dead-end
+#          warning then told the same filer, on the same invocation, to re-file
+#          with --discusses. That is the DIVE-2801 defect — a message recommending
+#          the remedy the code refused one line above. Grade the stderr, not the
+#          columns: two arms can agree on tier=2 and disagree about what was said.
+! warned "CANNOT clear it" \
+  && ok_t "safety: a REFUSED appeal gets no advice to re-try the flag that just refused" \
+  || bad_t "safety refused-appeal silent" "stderr: $(tr '\n' ' ' <"$ERR" | tail -c 400)"
+
+# --- 11c: the same class reached WITHOUT --discusses. 11b proves the advice is
+#          wrong once the appeal has spoken; this proves we do not offer it in the
+#          first place, which is the shape a filer actually hits. Separate arm
+#          because the two reach the guard by different routes (refused appeal vs
+#          never attempted) and a single fixture cannot fail for both reasons.
+reset; seedloop DIVE-931
+actor_seam_as dev; cmd_task_need DIVE-931 --type=decision --from=dev \
+  --ask="Should we spend \$500 on the ads test before grading criterion 3?" \
+  --options="yes|no" --recommend="no" 2>"$ERR" >/dev/null
+[[ "$(tierof DIVE-931)" == "2" ]] && ! warned "CANNOT clear it" \
+  && ok_t "safety: an unappealed money ask is floored silently, with no dead-end advice" \
+  || bad_t "safety plain money silent" "tier=$(tierof DIVE-931) stderr: $(tr '\n' ' ' <"$ERR" | tail -c 400)"
+
+# --- 11d: RULE 4 — the appeal also refuses when no lead sits above the filer, so
+#          advice promising a route we cannot mint is the same defect by another
+#          cause. `main` is the org root in the fixture above (reports_to NULL),
+#          so reviewer(main) is empty. The loop is otherwise valid and floored,
+#          which is what makes this a guard on the REMEDY and not on the trigger.
+reset; seedloop DIVE-932 main
+actor_seam_as main; cmd_task_need DIVE-932 --type=decision --from=main \
+  --ask="$SCOPE_ASK" --options="split|keep" --recommend="split" 2>"$ERR" >/dev/null
+[[ "$(tierof DIVE-932)" == "2" ]] && ! warned "CANNOT clear it" \
+  && ok_t "safety: no lead above the filer — no advice promising a route the appeal would refuse" \
+  || bad_t "safety no-lead silent" "tier=$(tierof DIVE-932) stderr: $(tr '\n' ' ' <"$ERR" | tail -c 400)"
+
 # --- 12: SAFETY — an EXPLICIT --tier=2 is the caller's hard-human contract
 #         (DIVE-1957). No advice, because there is nothing to appeal.
 reset; seedloop DIVE-926

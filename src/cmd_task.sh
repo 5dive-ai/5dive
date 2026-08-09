@@ -7957,6 +7957,37 @@ cmd_task_need() {
     _vs_vf=$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${id};")
     _vs_mk=$(db "SELECT COALESCE(maker_agent,'') FROM tasks WHERE id=${id};")
     if [[ -n "$_vs_vf" && -n "$_vs_mk" && "$_vs_vf" != "$_vs_filer" && "$_vs_mk" == "$_vs_filer" ]]; then
+      # DIVE-2801 CLASS — do not recommend a remedy the code will refuse. This
+      # advice names `--discusses` as the way to reach the verifier, so it may
+      # only be printed when the appeal would actually be ACCEPTED. Both of
+      # DIVE-2089's refusal paths have to be evaluated here, not assumed:
+      #
+      #   Rule 3 — the residual still names a non-appealable category (money /
+      #   outbound comms / irreversible infra). Measured before this guard
+      #   existed: on a `spend` ask the appeal printed `--discusses REFUSED …
+      #   Staying at tier 2` and this warning then told the filer to re-file with
+      #   `--discusses` — the remedy they had just been refused, on the same
+      #   invocation. On that class there is also no dead-end to announce: the
+      #   floored gate is CORRECT and the human genuinely is the right answerer,
+      #   which is what the safety arm in the harness has always claimed.
+      #
+      #   Rule 4 — no lead sits above the filer, so the appeal has nobody to
+      #   route to and refuses. Promising a route we cannot mint is the same
+      #   defect with a different cause.
+      #
+      # Computed with the appeal's OWN helpers and its own per-field residual, so
+      # the two can never drift apart into a warning that predicts the wrong
+      # verdict. Silence here is the stock floor warning's job, not a gap.
+      local _vs_res_ask _vs_res_title
+      _vs_res_ask=$(_gate_floor_appeal_residual "$ask")
+      _vs_res_title=$(_gate_floor_appeal_residual "$_ft_title")
+      if _gate_hit_either _gate_tier2_floor_hit "$_vs_res_ask" "$_vs_res_title"; then
+        _vs_vf=""   # non-appealable: the human keeps this call, say nothing
+      elif [[ -z "$(_gate_route_reviewer "$_vs_filer")" ]]; then
+        _vs_vf=""   # no reviewer above the filer: the appeal would refuse
+      fi
+    fi
+    if [[ -n "$_vs_vf" && -n "$_vs_mk" && "$_vs_vf" != "$_vs_filer" && "$_vs_mk" == "$_vs_filer" ]]; then
       local _vs_term; _vs_term=$(_gate_tier2_floor_term "$ask")
       [[ -n "$_vs_term" ]] || _vs_term=$(_gate_tier2_floor_term "$_ft_title")
       warn "this gate is floored to tier 2 (matched '${_vs_term}'), so it pings the paired human and ${_vs_vf} — the verifier on this task's loop, and the only agent who can answer a question about your own acceptance criteria — CANNOT clear it (tier-2 gates refuse a non-human answer, DIVE-1117). If the term is narration of the work under test rather than something you are asking to DO, re-file with --discusses=\"<why>\": the appeal downgrades the gate to tier 1 and routes it to ${_vs_vf}, not to the human. If you really are asking for that, leave it — the human is the right answerer."
