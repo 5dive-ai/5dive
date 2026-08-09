@@ -5852,11 +5852,15 @@ cmd_task_loop() {
 # --no-done (alias --check) runs the check and records it WITHOUT flipping.
 cmd_task_verify() {
   tasks_db_init
-  local task="" cmd="" no_done=0 timeout_s=""
+  local task="" cmd="" no_done=0 timeout_s="" prose="" have_prose=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --cmd=*)      cmd="${1#*=}" ;;
       --no-done|--check) no_done=1 ;;
+      # DIVE-2832: the verifier's own words. Every other writer of this column is
+      # either the MAKER's verb (deliver) or machine output, so a verifier who
+      # graded by READING had no way to put a prose PASS on an OPEN row at all.
+      --result=*)   prose="${1#*=}"; have_prose=1 ;;
       --timeout=*)  timeout_s="${1#*=}" ;;
       -*)           fail "$E_USAGE" "unknown flag: $1" ;;
       *)            [[ -z "$task" ]] && task="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
@@ -5864,22 +5868,44 @@ cmd_task_verify() {
     shift
   done
   [[ -n "$task" ]] \
-    || fail "$E_USAGE" "usage: 5dive task verify <id|DIVE-N> [--cmd=\"<command>\"] [--no-done] [--timeout=<seconds>]"
+    || fail "$E_USAGE" "usage: 5dive task verify <id|DIVE-N> [--cmd=\"<command>\"] [--result=\"<prose verdict>\"] [--no-done] [--timeout=<seconds>]"
   [[ -z "$timeout_s" || "$timeout_s" =~ ^[1-9][0-9]*$ ]] \
     || fail "$E_VALIDATION" "--timeout must be a positive integer (seconds)"
   resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  # DIVE-2832: --result is a RECORDING path, never a closing one. A prose verdict is
+  # an assertion about work; it is not evidence that anything reached main, and the
+  # DIVE-1830 merge gate this verb already bypasses (DIVE-2938) is exactly what would
+  # otherwise be riding on it. So --result requires --no-done and says so.
+  if (( have_prose )) && (( ! no_done )); then
+    fail "$E_USAGE" "--result records a verifier's prose verdict WITHOUT closing, so it requires --no-done (alias --check). A prose PASS asserts the work is good; it is not evidence the work MERGED, and \`task verify\`'s close does not run the DIVE-1830 merge gate (DIVE-2938). To record the grade: 5dive task verify $task --no-done --result=\"<verdict>\". To close on evidence, pass a --cmd whose EXIT STATUS proves what you are claiming."
+  fi
+  if (( have_prose )) && [[ -z "${prose//[[:space:]]/}" ]]; then
+    fail "$E_VALIDATION" "--result was given an EMPTY value. A zero-length verdict is indistinguishable from one that was never written (DIVE-2483), so it is refused rather than stored."
+  fi
   # DIVE-476: --cmd is now optional — when omitted, fall back to the task's stored
   # verify_command (the declarative loop spec). Persisted input, no re-passing.
+  #
+  # DIVE-2832: and with --result there may be NO command at all, which is the whole
+  # point. The row's receipts were graded by READING a diff, and this fail() was the
+  # reason the "record without flipping" flag could not reach them: it demanded a
+  # runnable acceptance test, so the only way in was to contrive one — manufacturing
+  # a green to satisfy a gate, which is the anti-pattern the row exists to name.
+  local ran_cmd=1
   if [[ -z "$cmd" ]]; then
     cmd=$(db "SELECT COALESCE(verify_command,'') FROM tasks WHERE id=${id};")
-    [[ -n "$cmd" ]] \
-      || fail "$E_USAGE" "no --cmd given and task has no stored verify_command (set one: 5dive task add … --verify=\"<cmd>\")"
+    if [[ -z "$cmd" ]]; then
+      (( have_prose )) \
+        || fail "$E_USAGE" "no --cmd given and task has no stored verify_command (set one: 5dive task add … --verify=\"<cmd>\"). If you graded by READING rather than by running something, record it as prose instead: 5dive task verify $task --no-done --result=\"<your verdict>\" (DIVE-2832)."
+      ran_cmd=0
+    fi
   fi
 
   # Run it. Combined stdout+stderr. The `if` wrapper captures the exit code
   # WITHOUT tripping `set -e` (a failing $() in a bare assignment would abort).
   local out rc
-  if [[ -n "$timeout_s" ]]; then
+  if (( ! ran_cmd )); then
+    out=""; rc=0
+  elif [[ -n "$timeout_s" ]]; then
     if out=$(timeout "${timeout_s}" bash -c "$cmd" 2>&1); then rc=0; else rc=$?; fi
     (( rc == 124 )) && out="${out}"$'\n'"[timed out after ${timeout_s}s]"
   else
@@ -5889,9 +5915,20 @@ cmd_task_verify() {
   local tail_out; tail_out=$(printf '%s\n' "$out" | tail -n 25)
 
   local verdict result_txt
-  if (( rc == 0 )); then
+  # DIVE-2832: with a prose verdict and no command, the record must not LOOK like a
+  # machine verdict. The whole value of the existing text is that "exit 0" is a fact
+  # a reader can re-derive; a grader's assertion is not, and rendering them the same
+  # way would buy the recording path at the cost of the one property that made the
+  # machine path trustworthy. So the prose is labelled as UNEXECUTED and attributed.
+  if (( have_prose )) && (( ! ran_cmd )); then
+    verdict="pass"
+    result_txt="✅ verify PASS (verifier's prose grade — NO command was run, DIVE-2832): recorded by $(task_actor "")"$'\n'"${prose}"
+  elif (( rc == 0 )); then
     verdict="pass"
     result_txt="✅ verify PASS (exit 0): ${cmd}"$'\n'"--- output tail ---"$'\n'"${tail_out}"
+    # Both given: the command's evidence AND the grader's words, prose first, because
+    # the prose is the part a human wrote and the tail is the part they were reading.
+    (( have_prose )) && result_txt="${prose}"$'\n'"--- evidence ---"$'\n'"${result_txt}"
   else
     verdict="fail"
     result_txt="❌ verify FAIL (exit ${rc}): ${cmd}"$'\n'"--- output tail ---"$'\n'"${tail_out}"
