@@ -100,6 +100,13 @@ _HB_VERIFY_STALE_MIN="${HEARTBEAT_VERIFY_STALE_MIN:-60}"
 # outlived its own cadence and started suppressing the NEXT slot.
 _HB_RECURRING_STALL_HOURS="${HEARTBEAT_RECURRING_STALL_HOURS:-24}"
 [[ "$_HB_RECURRING_STALL_HOURS" =~ ^[0-9]+$ ]] || _HB_RECURRING_STALL_HOURS=24
+# DIVE-2853: how long AFTER that one-shot notice an instance may still sit
+# todo-and-never-started before the ladder CHANGES HANDS. Same default window as
+# the first rung, so a daily beat gets one full extra cadence with its original
+# assignee before the row moves. Detection bounds how long an outage is invisible;
+# only this rung bounds the outage.
+_HB_RECURRING_ESCALATE_HOURS="${HEARTBEAT_RECURRING_ESCALATE_HOURS:-24}"
+[[ "$_HB_RECURRING_ESCALATE_HOURS" =~ ^[0-9]+$ ]] || _HB_RECURRING_ESCALATE_HOURS=24
 _HB_STALL_MIN_MINUTES="${HEARTBEAT_STALL_MIN_MINUTES:-30}"
 [[ "$_HB_STALL_MIN_MINUTES" =~ ^[0-9]+$ ]] || _HB_STALL_MIN_MINUTES=30
 # Orphan reclaim. An in_progress task whose claiming claude session is GONE — the
@@ -2278,6 +2285,41 @@ _hb_fleet_activity_probe() {
   return 0
 }
 
+# _hb_free_agents — the agents the BOARD can already see are free, one per line.
+#
+# "Free" is two facts we hold, not an inference from silence: the registry says the
+# agent has heartbeat config and it is ENABLED, and the task store says it holds no
+# in_progress standard row. Deterministically ordered (LC_ALL=C sort) so the
+# reassignment target a stalled row gets is reproducible and gradeable rather than
+# whatever jq happened to emit first.
+#
+# FAIL-CLOSED ON AN UNREADABLE REGISTRY, and that is the whole reason this is a
+# function with an exit code instead of an inline jq. registry_read() collapses "no
+# registry file", "unreadable (perms/IO)" and "genuinely empty fleet" onto
+# {"agents":{}} — indistinguishable. An empty list is NOT a harmless no-op for the
+# only caller: it is precisely the input that sends the escalation ladder to its
+# CANCEL rung. So this uses registry_read_checked and propagates its non-zero, and
+# the caller skips the tick entirely rather than closing a live row on evidence it
+# never actually had.
+_hb_free_agents() {
+  local reg name busy
+  reg=$(registry_read_checked 2>/dev/null) || return $?
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    busy=$(db "SELECT COUNT(*) FROM tasks
+               WHERE kind='standard' AND status='in_progress'
+                 AND assignee=$(sqlq "$name");" 2>/dev/null || echo 1)
+    # A failed/garbled count reads as BUSY, never as free — the cost of wrongly
+    # calling an agent busy is that this row waits one more tick; the cost of
+    # wrongly calling one free is handing it work it cannot take.
+    [[ "$busy" =~ ^[0-9]+$ ]] || busy=1
+    (( busy == 0 )) && printf '%s\n' "$name"
+  done < <(jq -r '.agents | to_entries[]
+                  | select(.value.heartbeat != null and ((.value.heartbeat.enabled // false) == true))
+                  | .key' <<<"$reg" 2>/dev/null | LC_ALL=C sort)
+  return 0
+}
+
 _hb_stall_sweep() {
   # (a) GAP#2 — surface stale maker->verifier deliveries.
   #
@@ -2347,8 +2389,20 @@ _hb_stall_sweep() {
       ( cmd_send "$rasg" --from="task-engine" \
           --message="⏳ ${rident} is a RECURRING instance you have never started — ${rhours}h old. While it sits open the schedule's next slot is SUPPRESSED (skip-if-open), so the beat is not late, it is not happening. Work it or close it: \`5dive task start ${rident}\`, or \`5dive task cancel ${rident} --result=...\` to let the schedule re-fire." ) >/dev/null 2>&1 || true
     fi
+    # DIVE-2853: NAME whether the addressee could even act, instead of leaving it to
+    # be inferred from another day of silence. An assignee already holding an
+    # in_progress row is the shape that produced the 28h non-response on DIVE-2694:
+    # under a single-task goal, taking this row would break an explicit instruction,
+    # so the notice is misaddressed at SEND time and no re-ping can fix it. Reported
+    # here (not acted on) because the remedy is the ladder's second rung below —
+    # holding a row's original assignee for one window is deliberate, and 'busy now'
+    # is not yet evidence of a stall that needs hands changed.
+    local rbusy
+    rbusy=$(db "SELECT COALESCE(ident,'DIVE-'||id) FROM tasks
+                WHERE kind='standard' AND status='in_progress'
+                  AND assignee=$(sqlq "${rasg:-}") ORDER BY id LIMIT 1;" 2>/dev/null || echo "")
     ( cmd_send "main" --from="task-engine" \
-        --message="⏳ Recurring beat stalled: ${rident} (from template ${rtmpl}) has sat todo and never-started for ${rhours}h, assignee '${rasg:-unassigned}' — every slot since is suppressed by skip-if-open (DIVE-2693)." ) >/dev/null 2>&1 || true
+        --message="⏳ Recurring beat stalled: ${rident} (from template ${rtmpl}) has sat todo and never-started for ${rhours}h, assignee '${rasg:-unassigned}'${rbusy:+ — who is OCCUPIED on ${rbusy}, so this notice may be undeliverable-in-effect (a goal-fenced assignee cannot take a second row)} — every slot since is suppressed by skip-if-open (DIVE-2693). If it is still unstarted in ${_HB_RECURRING_ESCALATE_HOURS}h the ladder reassigns or cancels it (DIVE-2853)." ) >/dev/null 2>&1 || true
     db "UPDATE tasks SET recurring_stall_pinged_at=datetime('now') WHERE id=${rid};"
     _hb_log "[recurring-stall] ${rident} never-started ${rhours}h (template ${rtmpl}) -> surfaced"
   done < <(db "SELECT t.id||x'1f'||COALESCE(t.ident,'DIVE-'||t.id)||x'1f'||COALESCE(t.assignee,'')||x'1f'||t.created_at||x'1f'||COALESCE(p.ident,'DIVE-'||t.from_template_id)
@@ -2359,6 +2413,104 @@ _hb_stall_sweep() {
                  AND NOT (t.need_type IS NOT NULL AND t.need_answered_at IS NULL)
                  AND t.parked_at IS NULL
                  AND t.created_at <= datetime('now','-${_HB_RECURRING_STALL_HOURS} hours');")
+
+  # (a3) DIVE-2853 — the SECOND RUNG, on a row (a2) already surfaced and that is
+  # still todo-and-never-started a full window later.
+  #
+  # WHY A LOUDER OR REPEATED NOTICE CANNOT BE THIS RUNG. (a2)'s single notice is
+  # addressed to the row's assignee — i.e. to the one party whose not picking the
+  # row up IS the observed fault. Measured on DIVE-2694: flagged on time
+  # (recurring_stall_pinged_at 2026-08-05 04:00:08, exactly once, correctly), then
+  # sat unstarted another 28h. The cause was NOT a missed message. dev had the
+  # message, replied to it, and was mid-delivery on DIVE-2801 under a single-task
+  # goal — STRUCTURALLY BARRED from starting a second row. A fence outlives every
+  # re-ping, so volume at that same addressee is a guaranteed no-op and the row
+  # stays dark for as long as the other goal runs.
+  #
+  # SO THIS RUNG CHANGES HANDS INSTEAD OF RAISING VOLUME:
+  #   1. reassign to an agent the board can see is FREE (_hb_free_agents), the
+  #      template's creator first when they are free — that is who owns the beat's
+  #      inputs and who unstuck it by hand both previous times;
+  #   2. if nobody is free, CANCEL with a written reason so the template re-fires.
+  #
+  # WHY CANCEL IS THE FALLBACK AND NOT A 'blocked' PARK, which is the posture used
+  # for a reaped in_progress row a few hundred lines up: skip-if-open counts EVERY
+  # instance with status NOT IN ('done','cancelled'), so 'blocked' would keep
+  # suppressing later slots — it renames the outage instead of ending it. Cancel is
+  # also the documented manual unstick (main did exactly this on the DIVE-2237 sweep
+  # and on DIVE-2403), and it never runs with an empty result: the reason is written
+  # into the row, and the old assignee is told in the same breath, so a cancel here
+  # is never indistinguishable from the beat having never fired.
+  #
+  # ONCE PER INSTANCE (recurring_stall_escalated_at), so a reassignment cannot
+  # thrash a row around a fleet — and if the NEW hands do not start it either, the
+  # next window's rung is the cancel, which is what actually restores the beat.
+  local erow eid eident easg etmpl etcreator ehours ecand etarget
+  local efree="" efree_read=0 efree_ok=0 ecancel_reason emsg
+  while IFS= read -r erow; do
+    [[ -n "$erow" ]] || continue
+    IFS=$'\x1f' read -r eid eident easg etmpl etcreator ehours <<<"$erow"
+    [[ -n "$eid" ]] || continue
+    if (( efree_read == 0 )); then
+      efree_read=1
+      if efree=$(_hb_free_agents); then
+        efree_ok=1
+      else
+        _hb_log "[recurring-escalate] registry unreadable — escalation SKIPPED this tick; no row was reassigned or cancelled on an unread fleet"
+      fi
+    fi
+    (( efree_ok )) || break
+
+    etarget=""
+    while IFS= read -r ecand; do
+      [[ -n "$ecand" ]] || continue
+      # The current assignee is not a target: handing the row back to the addressee
+      # that already had a full window with it is the no-op this rung exists to stop.
+      [[ -n "$easg" && "$ecand" == "$easg" ]] && continue
+      if [[ -n "$etcreator" && "$ecand" == "$etcreator" ]]; then etarget="$ecand"; break; fi
+      [[ -z "$etarget" ]] && etarget="$ecand"
+    done <<<"$efree"
+
+    if [[ -n "$etarget" ]]; then
+      db "UPDATE tasks SET assignee=$(sqlq "$etarget"), recurring_stall_escalated_at=datetime('now'),
+                           updated_at=datetime('now')
+          WHERE id=${eid} AND status='todo' AND started_at IS NULL;" 2>/dev/null || true
+      ( cmd_send "$etarget" --from="task-engine" \
+          --message="🔁 ${eident} (recurring beat from template ${etmpl}) has been REASSIGNED to you: it sat never-started for ${ehours}h with '${easg:-unassigned}', who was surfaced once and could not take it. While it sits open the schedule's next slot is SUPPRESSED (skip-if-open), so nothing is late — the beat is not happening. \`5dive task start ${eident}\`, or \`5dive task cancel ${eident} --result=...\` if it is genuinely not workable, which lets the schedule re-fire." ) >/dev/null 2>&1 || true
+      if [[ -n "$easg" ]]; then
+        ( cmd_send "$easg" --from="task-engine" \
+            --message="🔁 ${eident} has been moved OFF you to '${etarget}' — it was never started ${ehours}h after being flagged, and the beat's later slots are suppressed while it sits. Nothing for you to do; if you were about to start it, say so to ${etarget} rather than both starting it." ) >/dev/null 2>&1 || true
+      fi
+      ( cmd_send "main" --from="task-engine" \
+          --message="🔁 Recurring-stall ESCALATED: ${eident} (template ${etmpl}) reassigned '${easg:-unassigned}' -> '${etarget}' after ${ehours}h unstarted past its flag — a re-ping to the original assignee cannot clear a goal-fenced one, so the ladder changes hands (DIVE-2853)." ) >/dev/null 2>&1 || true
+      ledger_emit "task.recurring_stall_escalated" ident="$eident" task_id="$eid" \
+        actor="task-engine" authority="heartbeat" \
+        detail="reassigned ${easg:-unassigned}->${etarget} after ${ehours}h never-started (template ${etmpl})" || true
+      _hb_log "[recurring-escalate] ${eident} ${ehours}h unstarted -> reassigned ${easg:-unassigned} -> ${etarget}"
+    else
+      ecancel_reason="auto-cancelled by the recurring-stall ladder (DIVE-2853): materialized from template ${etmpl}, never started, surfaced once to '${easg:-unassigned}' and still unstarted ${ehours}h later, and no free agent was available to take it. Cancelled rather than left open BECAUSE skip-if-open counts every non-closed instance, so this row was suppressing every later slot of the beat — the schedule re-fires on its next slot. Not a judgement that the work is unwanted."
+      db "UPDATE tasks SET status='cancelled', done_at=datetime('now'), updated_at=datetime('now'),
+                           result=$(sqlq "$ecancel_reason"), recurring_stall_escalated_at=datetime('now')
+          WHERE id=${eid} AND status='todo' AND started_at IS NULL;" 2>/dev/null || true
+      emsg="🗑 ${eident} (recurring beat from template ${etmpl}) was AUTO-CANCELLED after sitting never-started ${ehours}h past its stall flag, with no free agent to hand it to. The reason is written into the row's result; the template re-fires on its next slot, which is the only way the beat restarts (skip-if-open counts an open instance)."
+      if [[ -n "$easg" ]]; then
+        ( cmd_send "$easg" --from="task-engine" --message="$emsg If you still want this instance, the next materialization is yours to start on time — or reply to say the row should not be assigned to you." ) >/dev/null 2>&1 || true
+      fi
+      ( cmd_send "main" --from="task-engine" --message="$emsg No free agent existed at escalation time, so reassignment had nowhere to go (DIVE-2853)." ) >/dev/null 2>&1 || true
+      ledger_emit "task.recurring_stall_escalated" ident="$eident" task_id="$eid" \
+        actor="task-engine" authority="heartbeat" \
+        detail="auto-cancelled after ${ehours}h never-started, no free agent (template ${etmpl})" || true
+      _hb_log "[recurring-escalate] ${eident} ${ehours}h unstarted, no free agent -> auto-cancelled so template ${etmpl} re-fires"
+    fi
+  done < <(db "SELECT t.id||x'1f'||COALESCE(t.ident,'DIVE-'||t.id)||x'1f'||COALESCE(t.assignee,'')||x'1f'||COALESCE(p.ident,'DIVE-'||t.from_template_id)||x'1f'||COALESCE(p.created_by,'')||x'1f'||CAST((julianday('now')-julianday(t.created_at))*24 AS INTEGER)
+               FROM tasks t LEFT JOIN tasks p ON p.id=t.from_template_id
+               WHERE t.kind='standard' AND t.from_template_id IS NOT NULL
+                 AND t.status='todo' AND t.started_at IS NULL
+                 AND t.recurring_stall_pinged_at IS NOT NULL
+                 AND t.recurring_stall_escalated_at IS NULL
+                 AND NOT (t.need_type IS NOT NULL AND t.need_answered_at IS NULL)
+                 AND t.parked_at IS NULL
+                 AND t.recurring_stall_pinged_at <= datetime('now','-${_HB_RECURRING_ESCALATE_HOURS} hours');")
 
   # (b) GAP#3 core — fleet-idle-while-actionable-work-is-open, persisting.
   local in_prog running_loops stranded_todo open_gates total_stranded

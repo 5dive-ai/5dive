@@ -829,6 +829,51 @@ valid_byo_provider() {
   [[ -n "${BYO_PROVIDER_LABEL[$1]:-}" ]]
 }
 
+# The canonical id a claude BYO agent carries when its endpoint came from
+# --base-url rather than from the CLAUDE_PROVIDER_BASEURL catalog. It is a
+# LABEL, not a vendor: nothing keys a model default or a native provider id off
+# it, and it is deliberately absent from BYO_PROVIDER_LABEL so the pickers that
+# enumerate that table (init step 6, the dashboard tiles) do not offer a vendor
+# with no endpoint behind it (DIVE-2757).
+CLAUDE_CUSTOM_PROVIDER_ID="custom"
+
+# Validate an operator-supplied Anthropic-compatible endpoint for claude BYO.
+#
+# This value is written into an auth profile's combined.env and loaded by
+# systemd as an EnvironmentFile, so the syntactic rules are not cosmetic: a
+# newline forges a second variable in that file, and whitespace or a quote
+# changes how systemd parses the line. Reject anything but a bare URL.
+#
+# SCHEME. https:// is required, because the agent's API key rides this URL on
+# every request and a plaintext http:// endpoint puts it on the wire. The one
+# exception is a loopback host — a local inference server (vLLM, llama.cpp,
+# Ollama's anthropic shim) is reached over http://127.0.0.1 and never leaves the
+# box, so requiring TLS there would refuse the most common self-hosted shape for
+# no gain. A private-LAN address is NOT exempt: it is off-box, it is a real
+# network, and "the LAN is trusted" is exactly the assumption that is wrong.
+valid_base_url() {
+  local url="$1" host=""
+  [[ -n "$url" ]] || return 1
+  (( ${#url} <= 512 )) || return 1
+  # No whitespace (incl. newline/tab), quotes, backslash, or shell metacharacters.
+  # Single-quoted so nothing in the class is expanded; `-` is last, `]` absent.
+  # `]` must be first in the class and `-` last for both to be literal.
+  local _re='^[]A-Za-z0-9._~:/?#@!$&*+,;=%[-]+$'
+  [[ "$url" =~ $_re ]] || return 1
+  case "$url" in
+    https://*) return 0 ;;
+    http://*)
+      # Strip scheme, then any /path or ?query — what remains is host[:port].
+      host="${url#http://}"; host="${host%%/*}"; host="${host%%\?*}"
+      # A bracketed IPv6 literal is full of colons, so the port strip has to
+      # respect the brackets or `[::1]:8080` truncates to `[:`.
+      if [[ "$host" == \[*\]* ]]; then host="${host%%\]*}]"; else host="${host%:*}"; fi
+      [[ "$host" == "127.0.0.1" || "$host" == "localhost" || "$host" == "[::1]" ]]
+      return $? ;;
+    *) return 1 ;;
+  esac
+}
+
 # --- Claude (Claude Code) harness BYO custom-provider catalog -----------------
 # The claude harness can be pointed at any third-party provider that ships an
 # Anthropic Messages-API-compatible endpoint by overriding ANTHROPIC_BASE_URL +
@@ -873,28 +918,59 @@ valid_byo_provider() {
 # there is no claude-haiku-5 on OpenRouter, 4.5 is the current haiku. NOTE the opus
 # slot was the only stale entry — its sibling sonnet was already at 5, so one tier had
 # been bumped and the other had not.
+# Qwen / Alibaba Model Studio (DIVE-2756): verified LIVE with a real Token Plan key
+# 2026-08-07 — not doc-and-probe-only like the pre-ship research. A full /v1/messages
+# POST to token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic returned 200 with
+# a real completion, and a claude-type agent ran qwen3.8-max through this exact env
+# shape for hours the same day. BEWARE THE KEY-SPACE SPLIT: Alibaba serves TWO
+# credential families that do NOT interchange. Token Plan (subscription) keys auth
+# ONLY on token-plan.<region>.maas.aliyuncs.com; pay-as-you-go Model Studio keys auth
+# on dashscope[-intl|-us].aliyuncs.com. Measured 2026-08-07 with the same key across
+# all three hosts: 200 on token-plan, `403 {"message":"invalid api-key"}` on both
+# dashscope hosts — a discriminating auth layer rejecting a FOREIGN key, which is what
+# makes the split real rather than a route difference. The tile ships the endpoint it
+# was SMOKED on (token-plan); a pay-as-you-go key points at its own host through the
+# generic `agent create --base-url` (DIVE-2757) instead of an unsmoked catalog default
+# — a tile that 403s for every customer is worse than no tile. Region is part of the
+# host (ap-southeast-1); operators on another region override via --base-url the same
+# way. Auth rides ANTHROPIC_AUTH_TOKEN (Bearer) with ANTHROPIC_API_KEY empty — both
+# already handled by _apply_byo_claude, same shape as openrouter. Model ids verified
+# live the same day: qwen3.8-max answers on opus+sonnet tiers, qwen3.6-flash on the
+# haiku tier. No context-cap var is set deliberately: the harness has no per-provider
+# context knob, and a wrong one would silently TRUNCATE rather than error (the row's
+# open question, resolved as "don't guess"). Region availability re-checked 2026-08-07
+# (live probe + vendor confirmation): Token Plan is served ONLY from ap-southeast-1 —
+# token-plan.eu-central-1 answers 400 BadRequest.IllegalEndpoint ("Workspace endpoint
+# is invalid"), there is no eu-west-1 host, and us-east-1/cn-beijing reject the key
+# (separate key namespaces). There is NO EU Token Plan endpoint to switch to for
+# latency; EU-based boxes pay the ~170ms RTT to Singapore. Do not re-investigate
+# without a new signal (a region added upstream, or a workspace provisioned in it).
 declare -A CLAUDE_PROVIDER_BASEURL=(
   [deepseek]="https://api.deepseek.com/anthropic"
   [moonshot]="https://api.moonshot.ai/anthropic"
   [openrouter]="https://openrouter.ai/api"
+  [qwen]="https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic"
   [zai]="https://api.z.ai/api/anthropic"
 )
 declare -A CLAUDE_PROVIDER_OPUS_MODEL=(
   [deepseek]="deepseek-v4-pro"
   [moonshot]="kimi-k2.5"
   [openrouter]="anthropic/claude-opus-5"
+  [qwen]="qwen3.8-max"
   [zai]="glm-5.2"
 )
 declare -A CLAUDE_PROVIDER_SONNET_MODEL=(
   [deepseek]="deepseek-v4-pro"
   [moonshot]="kimi-k2.5"
   [openrouter]="anthropic/claude-sonnet-5"
+  [qwen]="qwen3.8-max"
   [zai]="glm-5-turbo"
 )
 declare -A CLAUDE_PROVIDER_HAIKU_MODEL=(
   [deepseek]="deepseek-v4-flash"
   [moonshot]="kimi-k2.5"
   [openrouter]="anthropic/claude-haiku-4.5"
+  [qwen]="qwen3.6-flash"
   [zai]="glm-4.5-air"
 )
 

@@ -20,7 +20,7 @@
 #       defer_auth:     true               # create without auth gate
 #       isolation:      admin|standard|sandboxed
 #       auth_profile:   <named-account>
-#       provider:       <byo-id>           # hermes/openclaw (any), claude (anthropic-skin: deepseek moonshot openrouter zai)
+#       provider:       <byo-id>           # hermes/openclaw (any), claude (anthropic-skin: deepseek moonshot openrouter qwen zai)
 #       api_key:        "<key>"            # paired with provider; claude also needs auth_profile
 #       pack:           <slug>             # import a character pack instead of a
 #                                          # bare create — supplies persona+skills
@@ -68,7 +68,7 @@ if not isinstance(defaults, dict):
 # Known per-agent keys (v1 + v2). Unknown → warn, not fail (forward-compat).
 KNOWN = {
     "type","channels","telegram_token","discord_token","workdir","skills",
-    "no_skills","defer_auth","isolation","auth_profile","provider","api_key",
+    "no_skills","defer_auth","isolation","auth_profile","provider","api_key","base_url",
     "role","instructions","instructions_file","model","effort","reports_to","goals",
     "pack",  # DIVE-536: import a character pack (5dive agent import <slug>) instead
              # of a bare create — the pack supplies persona+skills+model/effort.
@@ -152,7 +152,7 @@ _compose_resolve_path() {
 _compose_create_args() {
   local spec="$1" name="$2" spec_dir="$3"
   printf '%s\n' "$name"
-  local type channels tg_token dc_token workdir profile isolation provider api_key
+  local type channels tg_token dc_token workdir profile isolation provider api_key base_url
   type=$(jq      -r '.type             // empty' <<<"$spec")
   channels=$(jq  -r '.channels         // empty' <<<"$spec")
   tg_token=$(jq  -r '.telegram_token   // empty' <<<"$spec")
@@ -162,6 +162,7 @@ _compose_create_args() {
   isolation=$(jq -r '.isolation        // empty' <<<"$spec")
   provider=$(jq  -r '.provider         // empty' <<<"$spec")
   api_key=$(jq   -r '.api_key          // empty' <<<"$spec")
+  base_url=$(jq  -r '.base_url         // empty' <<<"$spec")
   local no_skills defer_auth
   no_skills=$(jq  -r '.no_skills  // false' <<<"$spec")
   defer_auth=$(jq -r '.defer_auth // false' <<<"$spec")
@@ -179,6 +180,17 @@ _compose_create_args() {
   [[ -n "$isolation" ]] && printf '%s\n' "--isolation=${isolation}"
   [[ -n "$provider"  ]] && printf '%s\n' "--provider=${provider}"
   [[ -n "$api_key"   ]] && printf '%s\n' "--api-key=${api_key}"
+  # DIVE-2757: a self-hosted endpoint has no catalog row, so `agent create`
+  # requires --model in the SAME call — it cannot be left to the post-create
+  # `agent config set model=` that _compose_wire_role does for every other
+  # agent, because create refuses before that ever runs. Emitted only on the
+  # base_url path so no existing spec changes behaviour.
+  if [[ -n "$base_url" ]]; then
+    printf '%s\n' "--base-url=${base_url}"
+    local _cmodel
+    _cmodel=$(jq -r '.model // empty' <<<"$spec")
+    [[ -n "$_cmodel" ]] && printf '%s\n' "--model=${_cmodel}"
+  fi
 
   # Skills: comma-join the array. --no-skills wins (cmd_create's parser
   # treats them as mutually exclusive at the call site).

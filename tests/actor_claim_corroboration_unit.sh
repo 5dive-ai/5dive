@@ -310,10 +310,16 @@ else
   # on the actor derived from the caller's uid, and under sudo that derivation
   # correctly answers `root`, which would grade nothing about this change.
   # `sudo -n` — never prompt. No sudo means SKIP, and a skip is not a pass.
+  # DIVE-2898: ANNOUNCE the gating. Without sudo the scratch store is never
+  # initialised, so this seat grades a DIFFERENT arm set (T19-T21 skip on the
+  # isolation fence, T25/T26 go red on "tasks store not initialised") — and it
+  # did so silently, which reads as "the same suite, and it happened to skip".
   if sudo -n true 2>/dev/null; then
     sudo -n env STATE_DIR="$SBOX" TASKS_DIR="$SBOX/tasks" TASKS_DB="$SBOX/tasks/tasks.db" \
       "$BIN" task init >/dev/null 2>&1 || true
     sudo -n chown -R "$(id -u):$(id -g)" "$SBOX" 2>/dev/null || true
+  else
+    skip "e2e passwordless sudo unavailable: the scratch store was NOT initialised, so T19-T21 will skip and T25/T26 grade a store-less path — this seat runs a different arm set from CI's"
   fi
 
   # PROVE THE ISOLATION BEFORE WRITING ANYTHING, and SKIP rather than write if it
@@ -382,11 +388,24 @@ else
     # exactly as specified. Ground truth is the registry FILE, read directly, not
     # `actor_registry_agent` — that is the function under test.
     tid2=$(e2e task add "DIVE-2518 claimed row" --project=dive --from="$FORGE_BOARD" 2>&1 | grep -oE 'DIVE-[0-9]+' | head -1)
-    cb=$(e2e task show "$tid2" | awk -F' = ' '/^created_by /{print $2; exit}')
+    # DIVE-2898: read the STORE, exactly as T19b/T19c do — not `task show`'s text.
+    # This arm parsed that text with `/^created_by /`, but `task show` RIGHT-ALIGNS
+    # its field names ("  created_by = x"), so the ^anchor never matched and cb was
+    # '' on EVERY seat that got this far, reporting a relay loss that did not exist.
+    # CI never saw it: the isolation fence skips T19-T21 on a pristine runner whose
+    # default board lists 0 rows, so only a lived-in seat with sudo reached the arm.
+    # The display is a rendering of the column; the column is the claim.
+    cb=$(sqlite3 "$SBOX/tasks/tasks.db" \
+      "SELECT COALESCE(created_by,'<null>') FROM tasks WHERE ident='$tid2';" 2>/dev/null)
     # created_by keeps the CLAIM — for a uid-less relay principal that is the only
     # true answer — and `derived_actor` carries the uid that ran it. T19b is the half
     # that makes the claim falsifiable; neither arm means anything without the other.
-    if [[ "$cb" == "$FORGE_BOARD" ]]; then
+    if [[ -z "$cb" ]]; then
+      # COALESCE means a NULL column still returns '<null>', so EMPTY here can only
+      # be the instrument (no sqlite3 / unreadable store / no such row) — never a
+      # verdict about the claim. Grading it red would be the same false-red again.
+      skip "T19 sqlite3 unavailable, store unreadable, or row '$tid2' absent; created_by not graded"
+    elif [[ "$cb" == "$FORGE_BOARD" ]]; then
       ok "T19 e2e: --from=$FORGE_BOARD stamped created_by=$FORGE_BOARD (relay attribution preserved)"
     else
       no "T19 e2e: created_by='$cb', expected the claim '$FORGE_BOARD' (relay would be lost)"
