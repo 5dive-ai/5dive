@@ -23,7 +23,7 @@ _task_usage() {
   start <id>                                    -> in_progress
   done <id> [--result=<text>|--result-file=<path>] [--no-graded-sha]
                                                 -> done, or hand to the verifier if one is set
-                                                verifiers: put `graded-sha: <sha>` in the result;
+                                                verifiers: put \`graded-sha: <sha>\` in the result;
                                                 --no-graded-sha is the audited escape
   deliver <id> --pr=<url> [--result=]           record the delivery PR, hand to the verifier
   verify <id> [--cmd=] [--no-done] [--timeout=] run the check; exit 0 = pass
