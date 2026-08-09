@@ -56,6 +56,14 @@ _HB_STALE_MIN_MINUTES=45
 # the claim is stamped AFTER _hb_mark_run — see the call site.
 _HB_STARVE_AFTER=3
 
+# DIVE-2716 — how many of an agent's runnable todos the wake loop will step
+# through looking for one the tier guard clears. Bounded on purpose: each
+# candidate costs two small queries plus a registry read, and a queue where the
+# first 25 rows are ALL held is a tier misconfiguration, not a scheduling
+# problem. Hitting the cap is logged loudly (it means runnable rows past it were
+# never examined) rather than passed off as "nothing to do".
+_HB_PICK_SCAN=25
+
 # A reaped task (in_progress past the budget) is requeued to todo, never
 # cancelled — silently losing real mid-flight work is worse than a re-run
 # (DIVE-482/200). But a task that keeps overrunning even after a clean requeue
@@ -92,6 +100,13 @@ _HB_VERIFY_STALE_MIN="${HEARTBEAT_VERIFY_STALE_MIN:-60}"
 # outlived its own cadence and started suppressing the NEXT slot.
 _HB_RECURRING_STALL_HOURS="${HEARTBEAT_RECURRING_STALL_HOURS:-24}"
 [[ "$_HB_RECURRING_STALL_HOURS" =~ ^[0-9]+$ ]] || _HB_RECURRING_STALL_HOURS=24
+# DIVE-2853: how long AFTER that one-shot notice an instance may still sit
+# todo-and-never-started before the ladder CHANGES HANDS. Same default window as
+# the first rung, so a daily beat gets one full extra cadence with its original
+# assignee before the row moves. Detection bounds how long an outage is invisible;
+# only this rung bounds the outage.
+_HB_RECURRING_ESCALATE_HOURS="${HEARTBEAT_RECURRING_ESCALATE_HOURS:-24}"
+[[ "$_HB_RECURRING_ESCALATE_HOURS" =~ ^[0-9]+$ ]] || _HB_RECURRING_ESCALATE_HOURS=24
 _HB_STALL_MIN_MINUTES="${HEARTBEAT_STALL_MIN_MINUTES:-30}"
 [[ "$_HB_STALL_MIN_MINUTES" =~ ^[0-9]+$ ]] || _HB_STALL_MIN_MINUTES=30
 # Orphan reclaim. An in_progress task whose claiming claude session is GONE — the
@@ -791,8 +806,20 @@ _hb_press_continue() {
 # dependents) and is depth-capped at 64 so a pathological/cyclic graph can't spin.
 # Priority stays the primary key (an urgent task never waits behind a medium
 # critical-path task); critical-path depth is the tiebreaker, then id for stability.
-_hb_pick_task() {
-  local name="$1"
+#
+# DIVE-2716 — this is now the LIST form. It used to be `_hb_pick_task`, hard
+# LIMIT 1, and that single row was the agent's entire chance to be woken this
+# tick: when the tier guard below held it, the tick gave up on the AGENT, and
+# because selection is deterministic the same row was re-picked and re-held every
+# five minutes forever. Five held rows head-of-line blocked 122 runnable ones.
+# Handing the caller an ORDERED list is what lets a held head be stepped over
+# without weakening the guard — the order is unchanged, so the first runnable
+# candidate is exactly the row the old picker would have returned once the held
+# ones ahead of it are gone. `_hb_pick_task` is kept as the LIMIT-1 wrapper.
+_hb_pick_tasks() {
+  local name="$1" lim="${2:-1}"
+  # A non-numeric/zero limit must not become an unbounded scan.
+  [[ "$lim" =~ ^[1-9][0-9]*$ ]] || lim=1
   db "WITH RECURSIVE
         cp(root, node, depth) AS (
           SELECT id, id, 0 FROM tasks
@@ -812,8 +839,13 @@ _hb_pick_task() {
         ORDER BY CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1
                                  WHEN 'medium' THEN 2 ELSE 3 END,
                  COALESCE(c.cp,0) DESC, t.id
-        LIMIT 1;" 2>/dev/null || echo ""
+        LIMIT ${lim};" 2>/dev/null || echo ""
 }
+
+# The historical single-row picker: same rows, same order, first one only. Kept
+# because the direct-claim path and tests/heartbeat_pick_unit.sh want exactly
+# one id, and because it keeps DIVE-979's ordering rules stated in ONE query.
+_hb_pick_task() { _hb_pick_tasks "$1" 1; }
 
 # DIVE-1065: privilege ordering for the auto-wake tier guard. admin > standard >
 # sandboxed; 0 for unknown/human — an unknown creator never blocks a wake.
@@ -1450,7 +1482,7 @@ _hb_wake() {
 # coarse (daily/hourly) recurring jobs; minute granularity finer than the tick
 # interval can also be missed. Both documented in the CHANGELOG.
 _hb_materialize_recurring() {
-  local now="$1" minute_start tid sched last_fired open open_read open_rc n_made=0
+  local now="$1" minute_start tid sched last_fired open open_read open_rc stamp_err n_made=0
   minute_start=$(date -u -d "@${now}" +'%Y-%m-%d %H:%M:00')
   while IFS=$'\t' read -r tid sched last_fired; do
     [[ -n "$tid" ]] || continue
@@ -1502,7 +1534,9 @@ _hb_materialize_recurring() {
       # one the scheduler never reached, and a monitor implemented as a
       # recurring task can switch itself off in silence. Best-effort: a failed
       # stamp must never change whether the pass fires anything.
-      db "UPDATE tasks SET last_skipped_at=datetime('now') WHERE id=${tid};" >/dev/null 2>&1 || true
+      stamp_err=$(db "UPDATE tasks SET last_skipped_at=datetime('now') WHERE id=${tid};" 2>&1) \
+        || _hb_log "[materializer] $(_hb_ident "$tid") last_skipped_at stamp FAILED: ${stamp_err//$'\n'/ }" \
+        || true
       _hb_log "[materializer] $(_hb_ident "$tid") due but an open instance exists — skip"
       continue
     fi
@@ -2251,6 +2285,41 @@ _hb_fleet_activity_probe() {
   return 0
 }
 
+# _hb_free_agents — the agents the BOARD can already see are free, one per line.
+#
+# "Free" is two facts we hold, not an inference from silence: the registry says the
+# agent has heartbeat config and it is ENABLED, and the task store says it holds no
+# in_progress standard row. Deterministically ordered (LC_ALL=C sort) so the
+# reassignment target a stalled row gets is reproducible and gradeable rather than
+# whatever jq happened to emit first.
+#
+# FAIL-CLOSED ON AN UNREADABLE REGISTRY, and that is the whole reason this is a
+# function with an exit code instead of an inline jq. registry_read() collapses "no
+# registry file", "unreadable (perms/IO)" and "genuinely empty fleet" onto
+# {"agents":{}} — indistinguishable. An empty list is NOT a harmless no-op for the
+# only caller: it is precisely the input that sends the escalation ladder to its
+# CANCEL rung. So this uses registry_read_checked and propagates its non-zero, and
+# the caller skips the tick entirely rather than closing a live row on evidence it
+# never actually had.
+_hb_free_agents() {
+  local reg name busy
+  reg=$(registry_read_checked 2>/dev/null) || return $?
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    busy=$(db "SELECT COUNT(*) FROM tasks
+               WHERE kind='standard' AND status='in_progress'
+                 AND assignee=$(sqlq "$name");" 2>/dev/null || echo 1)
+    # A failed/garbled count reads as BUSY, never as free — the cost of wrongly
+    # calling an agent busy is that this row waits one more tick; the cost of
+    # wrongly calling one free is handing it work it cannot take.
+    [[ "$busy" =~ ^[0-9]+$ ]] || busy=1
+    (( busy == 0 )) && printf '%s\n' "$name"
+  done < <(jq -r '.agents | to_entries[]
+                  | select(.value.heartbeat != null and ((.value.heartbeat.enabled // false) == true))
+                  | .key' <<<"$reg" 2>/dev/null | LC_ALL=C sort)
+  return 0
+}
+
 _hb_stall_sweep() {
   # (a) GAP#2 — surface stale maker->verifier deliveries.
   #
@@ -2320,8 +2389,20 @@ _hb_stall_sweep() {
       ( cmd_send "$rasg" --from="task-engine" \
           --message="⏳ ${rident} is a RECURRING instance you have never started — ${rhours}h old. While it sits open the schedule's next slot is SUPPRESSED (skip-if-open), so the beat is not late, it is not happening. Work it or close it: \`5dive task start ${rident}\`, or \`5dive task cancel ${rident} --result=...\` to let the schedule re-fire." ) >/dev/null 2>&1 || true
     fi
+    # DIVE-2853: NAME whether the addressee could even act, instead of leaving it to
+    # be inferred from another day of silence. An assignee already holding an
+    # in_progress row is the shape that produced the 28h non-response on DIVE-2694:
+    # under a single-task goal, taking this row would break an explicit instruction,
+    # so the notice is misaddressed at SEND time and no re-ping can fix it. Reported
+    # here (not acted on) because the remedy is the ladder's second rung below —
+    # holding a row's original assignee for one window is deliberate, and 'busy now'
+    # is not yet evidence of a stall that needs hands changed.
+    local rbusy
+    rbusy=$(db "SELECT COALESCE(ident,'DIVE-'||id) FROM tasks
+                WHERE kind='standard' AND status='in_progress'
+                  AND assignee=$(sqlq "${rasg:-}") ORDER BY id LIMIT 1;" 2>/dev/null || echo "")
     ( cmd_send "main" --from="task-engine" \
-        --message="⏳ Recurring beat stalled: ${rident} (from template ${rtmpl}) has sat todo and never-started for ${rhours}h, assignee '${rasg:-unassigned}' — every slot since is suppressed by skip-if-open (DIVE-2693)." ) >/dev/null 2>&1 || true
+        --message="⏳ Recurring beat stalled: ${rident} (from template ${rtmpl}) has sat todo and never-started for ${rhours}h, assignee '${rasg:-unassigned}'${rbusy:+ — who is OCCUPIED on ${rbusy}, so this notice may be undeliverable-in-effect (a goal-fenced assignee cannot take a second row)} — every slot since is suppressed by skip-if-open (DIVE-2693). If it is still unstarted in ${_HB_RECURRING_ESCALATE_HOURS}h the ladder reassigns or cancels it (DIVE-2853)." ) >/dev/null 2>&1 || true
     db "UPDATE tasks SET recurring_stall_pinged_at=datetime('now') WHERE id=${rid};"
     _hb_log "[recurring-stall] ${rident} never-started ${rhours}h (template ${rtmpl}) -> surfaced"
   done < <(db "SELECT t.id||x'1f'||COALESCE(t.ident,'DIVE-'||t.id)||x'1f'||COALESCE(t.assignee,'')||x'1f'||t.created_at||x'1f'||COALESCE(p.ident,'DIVE-'||t.from_template_id)
@@ -2332,6 +2413,104 @@ _hb_stall_sweep() {
                  AND NOT (t.need_type IS NOT NULL AND t.need_answered_at IS NULL)
                  AND t.parked_at IS NULL
                  AND t.created_at <= datetime('now','-${_HB_RECURRING_STALL_HOURS} hours');")
+
+  # (a3) DIVE-2853 — the SECOND RUNG, on a row (a2) already surfaced and that is
+  # still todo-and-never-started a full window later.
+  #
+  # WHY A LOUDER OR REPEATED NOTICE CANNOT BE THIS RUNG. (a2)'s single notice is
+  # addressed to the row's assignee — i.e. to the one party whose not picking the
+  # row up IS the observed fault. Measured on DIVE-2694: flagged on time
+  # (recurring_stall_pinged_at 2026-08-05 04:00:08, exactly once, correctly), then
+  # sat unstarted another 28h. The cause was NOT a missed message. dev had the
+  # message, replied to it, and was mid-delivery on DIVE-2801 under a single-task
+  # goal — STRUCTURALLY BARRED from starting a second row. A fence outlives every
+  # re-ping, so volume at that same addressee is a guaranteed no-op and the row
+  # stays dark for as long as the other goal runs.
+  #
+  # SO THIS RUNG CHANGES HANDS INSTEAD OF RAISING VOLUME:
+  #   1. reassign to an agent the board can see is FREE (_hb_free_agents), the
+  #      template's creator first when they are free — that is who owns the beat's
+  #      inputs and who unstuck it by hand both previous times;
+  #   2. if nobody is free, CANCEL with a written reason so the template re-fires.
+  #
+  # WHY CANCEL IS THE FALLBACK AND NOT A 'blocked' PARK, which is the posture used
+  # for a reaped in_progress row a few hundred lines up: skip-if-open counts EVERY
+  # instance with status NOT IN ('done','cancelled'), so 'blocked' would keep
+  # suppressing later slots — it renames the outage instead of ending it. Cancel is
+  # also the documented manual unstick (main did exactly this on the DIVE-2237 sweep
+  # and on DIVE-2403), and it never runs with an empty result: the reason is written
+  # into the row, and the old assignee is told in the same breath, so a cancel here
+  # is never indistinguishable from the beat having never fired.
+  #
+  # ONCE PER INSTANCE (recurring_stall_escalated_at), so a reassignment cannot
+  # thrash a row around a fleet — and if the NEW hands do not start it either, the
+  # next window's rung is the cancel, which is what actually restores the beat.
+  local erow eid eident easg etmpl etcreator ehours ecand etarget
+  local efree="" efree_read=0 efree_ok=0 ecancel_reason emsg
+  while IFS= read -r erow; do
+    [[ -n "$erow" ]] || continue
+    IFS=$'\x1f' read -r eid eident easg etmpl etcreator ehours <<<"$erow"
+    [[ -n "$eid" ]] || continue
+    if (( efree_read == 0 )); then
+      efree_read=1
+      if efree=$(_hb_free_agents); then
+        efree_ok=1
+      else
+        _hb_log "[recurring-escalate] registry unreadable — escalation SKIPPED this tick; no row was reassigned or cancelled on an unread fleet"
+      fi
+    fi
+    (( efree_ok )) || break
+
+    etarget=""
+    while IFS= read -r ecand; do
+      [[ -n "$ecand" ]] || continue
+      # The current assignee is not a target: handing the row back to the addressee
+      # that already had a full window with it is the no-op this rung exists to stop.
+      [[ -n "$easg" && "$ecand" == "$easg" ]] && continue
+      if [[ -n "$etcreator" && "$ecand" == "$etcreator" ]]; then etarget="$ecand"; break; fi
+      [[ -z "$etarget" ]] && etarget="$ecand"
+    done <<<"$efree"
+
+    if [[ -n "$etarget" ]]; then
+      db "UPDATE tasks SET assignee=$(sqlq "$etarget"), recurring_stall_escalated_at=datetime('now'),
+                           updated_at=datetime('now')
+          WHERE id=${eid} AND status='todo' AND started_at IS NULL;" 2>/dev/null || true
+      ( cmd_send "$etarget" --from="task-engine" \
+          --message="🔁 ${eident} (recurring beat from template ${etmpl}) has been REASSIGNED to you: it sat never-started for ${ehours}h with '${easg:-unassigned}', who was surfaced once and could not take it. While it sits open the schedule's next slot is SUPPRESSED (skip-if-open), so nothing is late — the beat is not happening. \`5dive task start ${eident}\`, or \`5dive task cancel ${eident} --result=...\` if it is genuinely not workable, which lets the schedule re-fire." ) >/dev/null 2>&1 || true
+      if [[ -n "$easg" ]]; then
+        ( cmd_send "$easg" --from="task-engine" \
+            --message="🔁 ${eident} has been moved OFF you to '${etarget}' — it was never started ${ehours}h after being flagged, and the beat's later slots are suppressed while it sits. Nothing for you to do; if you were about to start it, say so to ${etarget} rather than both starting it." ) >/dev/null 2>&1 || true
+      fi
+      ( cmd_send "main" --from="task-engine" \
+          --message="🔁 Recurring-stall ESCALATED: ${eident} (template ${etmpl}) reassigned '${easg:-unassigned}' -> '${etarget}' after ${ehours}h unstarted past its flag — a re-ping to the original assignee cannot clear a goal-fenced one, so the ladder changes hands (DIVE-2853)." ) >/dev/null 2>&1 || true
+      ledger_emit "task.recurring_stall_escalated" ident="$eident" task_id="$eid" \
+        actor="task-engine" authority="heartbeat" \
+        detail="reassigned ${easg:-unassigned}->${etarget} after ${ehours}h never-started (template ${etmpl})" || true
+      _hb_log "[recurring-escalate] ${eident} ${ehours}h unstarted -> reassigned ${easg:-unassigned} -> ${etarget}"
+    else
+      ecancel_reason="auto-cancelled by the recurring-stall ladder (DIVE-2853): materialized from template ${etmpl}, never started, surfaced once to '${easg:-unassigned}' and still unstarted ${ehours}h later, and no free agent was available to take it. Cancelled rather than left open BECAUSE skip-if-open counts every non-closed instance, so this row was suppressing every later slot of the beat — the schedule re-fires on its next slot. Not a judgement that the work is unwanted."
+      db "UPDATE tasks SET status='cancelled', done_at=datetime('now'), updated_at=datetime('now'),
+                           result=$(sqlq "$ecancel_reason"), recurring_stall_escalated_at=datetime('now')
+          WHERE id=${eid} AND status='todo' AND started_at IS NULL;" 2>/dev/null || true
+      emsg="🗑 ${eident} (recurring beat from template ${etmpl}) was AUTO-CANCELLED after sitting never-started ${ehours}h past its stall flag, with no free agent to hand it to. The reason is written into the row's result; the template re-fires on its next slot, which is the only way the beat restarts (skip-if-open counts an open instance)."
+      if [[ -n "$easg" ]]; then
+        ( cmd_send "$easg" --from="task-engine" --message="$emsg If you still want this instance, the next materialization is yours to start on time — or reply to say the row should not be assigned to you." ) >/dev/null 2>&1 || true
+      fi
+      ( cmd_send "main" --from="task-engine" --message="$emsg No free agent existed at escalation time, so reassignment had nowhere to go (DIVE-2853)." ) >/dev/null 2>&1 || true
+      ledger_emit "task.recurring_stall_escalated" ident="$eident" task_id="$eid" \
+        actor="task-engine" authority="heartbeat" \
+        detail="auto-cancelled after ${ehours}h never-started, no free agent (template ${etmpl})" || true
+      _hb_log "[recurring-escalate] ${eident} ${ehours}h unstarted, no free agent -> auto-cancelled so template ${etmpl} re-fires"
+    fi
+  done < <(db "SELECT t.id||x'1f'||COALESCE(t.ident,'DIVE-'||t.id)||x'1f'||COALESCE(t.assignee,'')||x'1f'||COALESCE(p.ident,'DIVE-'||t.from_template_id)||x'1f'||COALESCE(p.created_by,'')||x'1f'||CAST((julianday('now')-julianday(t.created_at))*24 AS INTEGER)
+               FROM tasks t LEFT JOIN tasks p ON p.id=t.from_template_id
+               WHERE t.kind='standard' AND t.from_template_id IS NOT NULL
+                 AND t.status='todo' AND t.started_at IS NULL
+                 AND t.recurring_stall_pinged_at IS NOT NULL
+                 AND t.recurring_stall_escalated_at IS NULL
+                 AND NOT (t.need_type IS NOT NULL AND t.need_answered_at IS NULL)
+                 AND t.parked_at IS NULL
+                 AND t.recurring_stall_pinged_at <= datetime('now','-${_HB_RECURRING_ESCALATE_HOURS} hours');")
 
   # (b) GAP#3 core — fleet-idle-while-actionable-work-is-open, persisting.
   local in_prog running_loops stranded_todo open_gates total_stranded
@@ -2774,7 +2953,7 @@ cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
   local reg now; reg=$(registry_read); now=$(date +%s)
-  local checked=0 woke=0 reaped=0 reclaimed=0 starved=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0 sk_spread=0 sk_active=0 sk_budget=0
+  local checked=0 woke=0 reaped=0 reclaimed=0 starved=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0 sk_spread=0 sk_active=0 sk_budget=0 sk_held=0
   local today; today=$(date +%F)   # DIVE-1858 wake-budget day key (YYYY-MM-DD)
   # DIVE-138: materialize due recurring templates FIRST so a freshly-cloned todo
   # is eligible for the wake loop below this same tick. Isolated — a failure here
@@ -2888,16 +3067,29 @@ cmd_heartbeat_tick() {
     if [[ "${inprog:-0}" != "0" ]]; then
       sk_busy=$((sk_busy + 1)); _hb_log "[$name] busy — $inprog in_progress, skip"; continue
     fi
-    # Pick the single highest-priority todo and wake the agent against that exact
-    # id — the /goal condition needs a concrete DIVE-N to evaluate reliably.
-    local task_id
-    task_id=$(_hb_pick_task "$name")
-    if [[ -z "$task_id" ]]; then
-      sk_nowork=$((sk_nowork + 1)); _hb_log "[$name] no todo — stay idle"; continue
-    fi
-    # The /goal + every log below must name the task by its DISPLAY ident, not the
-    # raw row id — they diverge once a non-default project exists (DIVE-484).
-    local task_ident; task_ident=$(_hb_ident "$task_id")
+    # Wake the agent against ONE concrete todo — the /goal condition needs a
+    # concrete DIVE-N to evaluate reliably — but consider the queue IN ORDER
+    # until one is actually runnable.
+    #
+    # DIVE-2716: the tier guard below is a per-TASK verdict, and it used to be
+    # spent as a per-AGENT one. With a single pick, a held head meant `continue`
+    # on the whole agent; selection is deterministic, so the identical row was
+    # re-picked and re-held every tick and the runnable rows behind it were
+    # unreachable FOREVER (measured 2026-08-04: 5 held rows head-of-line blocking
+    # 122, fleet idle 2h35m, main's queue stuck 5 days). The guard's own comment
+    # bounded the wrong axis — "a hold skips ONE agent's wake this tick" is true
+    # per tick and says nothing about a tick that repeats with identical input.
+    # Stepping past the held row keeps the guard's whole safety property (a held
+    # task is still never auto-run, and still names itself in the log) and lets
+    # everything behind it flow.
+    local task_id="" task_ident="" _cand _cand_n=0 _picked=0
+    while IFS= read -r _cand; do
+      [[ -n "$_cand" ]] || continue
+      _cand_n=$((_cand_n + 1))
+      task_id="$_cand"
+      # The /goal + every log below must name the task by its DISPLAY ident, not
+      # the raw row id — they diverge once a non-default project exists (DIVE-484).
+      task_ident=$(_hb_ident "$task_id")
 
     # --- DIVE-1065 tier guard --------------------------------------------------
     # Refuse to AUTO-DRIVE a higher-tier agent from a lower-tier creator's task.
@@ -2935,15 +3127,20 @@ cmd_heartbeat_tick() {
     # are NOT envelope_tier(), which folds both populations into
     # `unknown:unregistered` because a wire format has no decision to make.
     #
-    # Still isolated: a hold skips ONE agent's wake this tick and never aborts
-    # the tick. A self-assigned task and an equal/higher-tier creator are
-    # unaffected.
+    # Isolation, restated correctly (DIVE-2716). This block used to claim "a hold
+    # skips ONE agent's wake this tick and never aborts the tick". Both halves
+    # are true PER TICK and the conclusion still did not hold: the tick repeats
+    # with identical input, so a per-tick skip of a deterministically re-picked
+    # row is a PERMANENT skip of that agent. The hold is now what it always said
+    # it was — scoped to the TASK: the held row is not auto-run, the next
+    # candidate in the same priority order is considered, and a self-assigned
+    # task or an equal/higher-tier creator is unaffected.
     local _cby _ctier _atier
     _cby=$(db "SELECT COALESCE(created_by,'') FROM tasks WHERE id=${task_id};" 2>/dev/null || echo "")
     if [[ -n "$_cby" && "$_cby" != "$name" ]]; then
       _ctier=$(agent_tier "$_cby"); _atier=$(agent_tier "$name")
       if tier_unmeasured "$_ctier" || tier_unmeasured "$_atier"; then
-        _hb_log "[$name] task ${task_ident} tier NOT MEASURED (creator ${_cby}=${_ctier}, assignee ${name}=${_atier}) — holding, not auto-running (DIVE-2213)"
+        _hb_log "[$name] task ${task_ident} tier NOT MEASURED (creator ${_cby}=${_ctier}, assignee ${name}=${_atier}) — holding, not auto-running (DIVE-2213); considering the next candidate"
         continue
       fi
       # Only measured values reach the ranking. `unknown:unregistered` ranks 0
@@ -2951,9 +3148,36 @@ cmd_heartbeat_tick() {
       local _cr _ar
       _cr=$(_hb_tier_rank "$_ctier"); _ar=$(_hb_tier_rank "$_atier")
       if (( _cr > 0 && _ar > 0 && _cr < _ar )); then
-        _hb_log "[$name] task ${task_ident} created by lower-tier ${_cby}(${_ctier}) < assignee(${_atier}) — holding, not auto-running"
+        _hb_log "[$name] task ${task_ident} created by lower-tier ${_cby}(${_ctier}) < assignee(${_atier}) — holding, not auto-running; considering the next candidate"
         continue
       fi
+    fi
+    # --- end DIVE-1065 tier guard ----------------------------------------------
+    # (Sentinel for tests/heartbeat_tier_guard_unmeasured_unit.sh, which extracts
+    # the block above VERBATIM and evals it: everything below closes the candidate
+    # loop and must stay outside that extraction.)
+
+      _picked=1; break
+    done < <(_hb_pick_tasks "$name" "$_HB_PICK_SCAN")
+    if (( _picked == 0 )); then
+      task_id=""; task_ident=""
+      if (( _cand_n == 0 )); then
+        sk_nowork=$((sk_nowork + 1)); _hb_log "[$name] no todo — stay idle"; continue
+      fi
+      # Every candidate we looked at was held. Not silent, and it names the cap:
+      # if _cand_n hit _HB_PICK_SCAN there may be runnable rows we never reached,
+      # which is a different (and much louder) situation than "the queue is held".
+      sk_held=$((sk_held + _cand_n))
+      if (( _cand_n >= _HB_PICK_SCAN )); then
+        _hb_log "[$name] tier guard held all ${_cand_n} candidate(s) SCANNED — scan cap _HB_PICK_SCAN=${_HB_PICK_SCAN} reached, runnable rows past it were NOT examined; authorize a held task (5dive task authorize) or fix the creator/assignee tiers"
+      else
+        _hb_log "[$name] tier guard held all ${_cand_n} runnable todo(s) — stay idle"
+      fi
+      continue
+    fi
+    if (( _cand_n > 1 )); then
+      sk_held=$((sk_held + _cand_n - 1))
+      _hb_log "[$name] tier guard held $((_cand_n - 1)) higher-priority todo(s); waking on ${task_ident} instead (DIVE-2716)"
     fi
 
     # --- Same-account spread ---------------------------------------------------
@@ -3158,8 +3382,8 @@ cmd_heartbeat_tick() {
                   | sort_by(.value.heartbeat.lastRunAt // 0)
                   | .[].key' <<<"$reg")
 
-  ok "heartbeat tick: woke ${woke} / slept ${_HB_SLEPT} / reclaimed ${reclaimed} / reaped ${reaped} / starved ${starved} / spread-deferred ${sk_spread} / active-deferred ${sk_active} / budget-skipped ${sk_budget} / checked ${checked}" \
+  ok "heartbeat tick: woke ${woke} / slept ${_HB_SLEPT} / reclaimed ${reclaimed} / reaped ${reaped} / starved ${starved} / tier-held ${sk_held} / spread-deferred ${sk_spread} / active-deferred ${sk_active} / budget-skipped ${sk_budget} / checked ${checked}" \
      '{checked:($c|tonumber), woke:($w|tonumber), slept:($sl|tonumber), sleepArmed:($sa|tonumber), reclaimed:($rc|tonumber), reaped:($r|tonumber), starved:($st|tonumber),
-       skipped:{notDue:($nd|tonumber), busy:($b|tonumber), noWork:($nw|tonumber), spread:($sp|tonumber), active:($ac|tonumber), budget:($bu|tonumber), failed:($sf|tonumber)}}' \
-     --arg c "$checked" --arg w "$woke" --arg sl "$_HB_SLEPT" --arg sa "$_HB_SLEEP_ARMED" --arg rc "$reclaimed" --arg r "$reaped" --arg st "$starved" --arg nd "$sk_notdue" --arg b "$sk_busy" --arg nw "$sk_nowork" --arg sp "$sk_spread" --arg ac "$sk_active" --arg bu "$sk_budget" --arg sf "$sk_fail"
+       skipped:{notDue:($nd|tonumber), busy:($b|tonumber), noWork:($nw|tonumber), spread:($sp|tonumber), active:($ac|tonumber), budget:($bu|tonumber), failed:($sf|tonumber), tierHeld:($th|tonumber)}}' \
+     --arg c "$checked" --arg w "$woke" --arg sl "$_HB_SLEPT" --arg sa "$_HB_SLEEP_ARMED" --arg rc "$reclaimed" --arg r "$reaped" --arg st "$starved" --arg nd "$sk_notdue" --arg b "$sk_busy" --arg nw "$sk_nowork" --arg sp "$sk_spread" --arg ac "$sk_active" --arg bu "$sk_budget" --arg sf "$sk_fail" --arg th "$sk_held"
 }

@@ -42,6 +42,7 @@ set -u
 # shellcheck source=/dev/null
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 
 PASS=0; FAIL=0
@@ -226,7 +227,6 @@ FIX='tests/gate_enforce_env_bypass_unit.sh:127-154 is the in-tree pattern to cop
 # ── A1 positive control: a violating fixture MUST be flagged ──────────────────
 # Without this the whole file could be a no-op that reports a clean corpus.
 TMP="$(mktemp -d /tmp/identity-stub-guard.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 cat > "$TMP/violator_unit.sh" <<'EOF'
 FAKE_CALLER="root"
 id() { if [[ "${1:-}" == -un ]]; then echo "$FAKE_CALLER"; else command id "$@"; fi; }

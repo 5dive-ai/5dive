@@ -18,8 +18,9 @@
 #
 # T6 deliberately does NOT assert survival of delivered_at/delivery_ref/
 # handoff_ack_at. Those are NULL on a `task done` delivery by construction —
-# delivered_at/delivery_ref have exactly one writer (cmd_task_deliver, the
-# `task deliver --pr=` flow) and handoff_ack_at is nulled by
+# explicit `task deliver --pr=` and DIVE-2316's merge-gate discovery write are
+# both unreachable after the maker→verifier early return, so delivered_at and
+# delivery_ref are NULL on this path; handoff_ack_at is nulled by
 # _task_route_to_verifier as part of delivering. T6d pins that directly. An arm
 # asserting a NULL column "survived" a write would pass no matter what the code
 # did, and stating it in prose invites a reader to hunt a data-loss bug that the
@@ -52,6 +53,7 @@ set -uo pipefail
 # which IS the payload.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 # DIVE-2518: impersonate through the SEALED seam. `USER=agent-x` no longer moves
 # the actor — that env path WAS the forgery this ticket closed, and these arms
@@ -59,7 +61,6 @@ cd "$(dirname "$0")/.."
 . "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 SRC=src
 TMP="$(mktemp -d /tmp/task-start-delivered-unit.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
@@ -213,7 +214,7 @@ else
     # a data-loss bug from a schema fact.
     nulls=$(db "SELECT COALESCE(delivered_at,'N')||COALESCE(delivery_ref,'N')||COALESCE(handoff_ack_at,'N') FROM tasks WHERE id=${t6};")
     [[ "$nulls" == "NNN" ]] \
-      && ok_t "T6d delivered_at/delivery_ref/handoff_ack_at are NULL by construction on a 'task done' delivery (they belong to 'task deliver --pr='), so their NULLness is never evidence of a clearing write" \
+      && ok_t "T6d delivered_at/delivery_ref/handoff_ack_at are NULL by construction on a 'task done' delivery (explicit/auto binding writers are unreachable after handoff), so their NULLness is never evidence of a clearing write" \
       || bad_t "T6d delivered_at/delivery_ref/handoff_ack_at are NULL by construction on a 'task done' delivery" "got=$nulls want=NNN"
   fi
 fi

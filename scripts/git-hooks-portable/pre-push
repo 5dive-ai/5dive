@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# PORTABLE pre-push PII guard (DIVE-2788).
+#
+# WHAT THIS IS FOR. scripts/git-hooks/pre-push is the 5dive-ai/5dive hook: it
+# lives IN the repo, is installed by core.hooksPath=scripts/git-hooks (a
+# RELATIVE path), and so is versioned with the branch being pushed. That is the
+# right design for this repo and it is the reason the guard cannot be installed
+# anywhere else — a relative hooksPath resolves inside the target repo, and no
+# other repo on the fleet carries scripts/git-hooks, scripts/pii-scan.sh or
+# .github/pii-denylist.txt. The DIVE-2788 measurement is the consequence: four
+# rows of PII program, twenty-two remotes, one repo covered.
+#
+# So this file is the OTHER half — a hook that carries its own scanner and its
+# own denylist and is installed by ABSOLUTE hooksPath into a guard home outside
+# every repo. It is PII-only on purpose: the version-bump, harness-tree and
+# actionlint guards in the in-repo hook are statements about 5dive-ai/5dive's
+# release rail and test corpus and mean nothing in a plugins or frontend repo.
+#
+# WHERE THE SCANNER AND DENYLIST COME FROM. Both sit NEXT TO this file, in the
+# guard home the installer materialises. This file resolves them from its own
+# path, so the guard home is self-locating and no host path is baked into any
+# copy of it. See scripts/install-pii-push-guard.sh for the distribution
+# rationale (one host copy, not twenty-two in-repo copies).
+#
+# CHAINING IS NOT OPTIONAL. core.hooksPath REPLACES $GIT_DIR/hooks — it does not
+# add to it. lodar/5dive-frontend already has a $GIT_DIR/hooks/pre-push (the
+# DIVE-2203 direct-push-to-main reminder), and installing this guard naively
+# would have silently deleted that control while reporting a guard installed.
+# That is this row's own defect wearing a different hat, so the chain below runs
+# the pre-existing hook after ours, with the ref-update list replayed onto its
+# stdin.
+#
+# FAILS OPEN, LOUDLY, if its own scanner or denylist is missing — a guard whose
+# payload has gone missing must say so rather than block every push on the
+# fleet. It does NOT fail open on a denylist HIT; that is the whole point.
+set -uo pipefail
+
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SCAN="$HERE/pii-scan.sh"
+DENYLIST="$HERE/pii-denylist.txt"
+EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
+Z40=0000000000000000000000000000000000000000
+
+# The ref-update list arrives on stdin and is consumed exactly once. Capture it
+# so it can be replayed onto the chained hook — a chained hook that gets an
+# empty stdin scans nothing and reports success, which is the silent-pass shape
+# this whole row is about.
+REFS="$(cat)"
+
+chain() {
+  # Run the repo's own pre-push, if it has one, with our argv and the same
+  # stdin.
+  #
+  # DO NOT reach for `git rev-parse --git-path hooks/pre-push` here. It looks
+  # like the right expression and it is not: git_path() special-cases `hooks/*`
+  # to HONOUR core.hooksPath, so under our own install it resolves to THIS FILE
+  # and the hook chains to itself — a fork bomb on every push, found by
+  # tests/pii_guard_fleet_unit.sh arm 6 and not by reading the code. The repo's
+  # own hooks live in the git COMMON dir (shared by every linked worktree), so
+  # that is what gets resolved, and the self-check below is kept anyway: a
+  # single guard against unbounded recursion is worth more than the one line it
+  # costs, and it also covers the case where someone points hooksPath at the
+  # real hooks dir.
+  local gd own
+  gd="$(git rev-parse --git-common-dir 2>/dev/null)" || return 0
+  [[ -n "$gd" ]] || return 0
+  case "$gd" in /*) ;; *) gd="$(cd -- "$gd" 2>/dev/null && pwd)" || return 0 ;; esac
+  own="$gd/hooks/pre-push"
+  [[ -x "$own" ]] || return 0
+  [[ "$own" -ef "${BASH_SOURCE[0]}" ]] && return 0     # never chain to ourselves
+  [[ -n "${_PII_GUARD_CHAINED:-}" ]] && return 0       # belt and braces
+  printf '%s\n' "$REFS" | _PII_GUARD_CHAINED=1 "$own" "$@"
+}
+
+rc=0
+
+if [[ ! -f "$SCAN" || ! -f "$DENYLIST" ]]; then
+  echo "pii-push-guard(portable): payload missing under $HERE (scanner and/or denylist)." >&2
+  echo "                          NOT scanning this push. Re-run scripts/install-pii-push-guard.sh." >&2
+  chain "$@" || rc=$?
+  exit $rc
+fi
+
+while read -r local_ref local_oid remote_ref remote_oid; do
+  [[ -z "${local_oid:-}" ]] && continue
+  [[ "$local_oid" == "$Z40" ]] && continue   # branch deletion: nothing to scan
+
+  if [[ "$remote_oid" == "$Z40" ]]; then
+    commits="$(git rev-list "$local_oid" --not --remotes 2>/dev/null)"
+    oldest="$(printf '%s\n' "$commits" | awk 'NF{last=$0} END{print last}')"
+    if [[ -n "$oldest" ]]; then
+      base="$(git rev-parse "${oldest}^" 2>/dev/null)" || base="$EMPTY_TREE"
+    else
+      base="$EMPTY_TREE"
+    fi
+  else
+    commits="$(git rev-list "${remote_oid}..${local_oid}" 2>/dev/null)"
+    base="$remote_oid"
+  fi
+
+  [[ -z "${commits// }" ]] && continue
+
+  # DIVE-1935, carried across deliberately: COLLECT first, scan second, so the
+  # SCANNER's verdict is the only thing that can set rc. `grep '^+'` exits 1 on
+  # no match, and a pipeline that lets that reach rc reports "a denylisted
+  # identifier is in your push" for a pure-deletion commit. `|| true` is on the
+  # COLLECTORS only, never on the scanner.
+  msgs="$(git log --no-color --format='%B' "$base..$local_oid" 2>/dev/null || true)"
+  printf '%s\n' "$msgs" | PII_DENYLIST="$DENYLIST" bash "$SCAN" >/dev/null || rc=1
+
+  added="$(git diff --no-color "$base" "$local_oid" 2>/dev/null \
+             | grep '^+' | grep -v '^+++' | sed 's/^+//' || true)"
+  printf '%s\n' "$added" | PII_DENYLIST="$DENYLIST" bash "$SCAN" >/dev/null || rc=1
+done <<<"$REFS"
+
+if [[ $rc -ne 0 ]]; then
+  echo "" >&2
+  echo "pre-push: BLOCKED by pii-push-guard(portable)." >&2
+  echo "  A denylisted identifier is in the commits you are pushing." >&2
+  echo "  Scrub the real id/email/phone (use placeholders like <user-id>, 1234567890) and re-commit." >&2
+  echo "  Guard home: $HERE" >&2
+  echo "  Emergency override (discouraged, and there is NO CI net in this repo): git push --no-verify" >&2
+  exit 1
+fi
+
+# Only chain when we did not block: a blocked push has already refused.
+chain "$@" || rc=$?
+exit $rc

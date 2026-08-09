@@ -135,6 +135,30 @@ sudo 5dive agent create cheap-coder --type=claude --provider=deepseek --api-key=
 sudo 5dive agent create glm-coder --type=claude --provider=openrouter --api-key=<key> --auth-profile=openrouter --model=z-ai/glm-5.2
 ```
 
+Not on that list? `--base-url` points the harness at **any** Anthropic-compatible
+endpoint — a model you host yourself, or a vendor host we don't ship a row for:
+
+```sh
+# Open weights on a server you own. --model is required here: there is no catalog
+# entry to inherit per-tier model ids from, and an unpinned background tier would
+# 404 on the agent's own housekeeping turns.
+sudo 5dive agent create qwen-box --type=claude \
+  --base-url=https://llm.internal.example.com/anthropic \
+  --api-key=<key> --auth-profile=qwen-box --model=qwen3.8-max
+
+# A local inference server (vLLM, llama.cpp, an Ollama Anthropic shim):
+sudo 5dive agent create local-box --type=claude \
+  --base-url=http://127.0.0.1:8000 \
+  --api-key=<key> --auth-profile=local-box --model=<slug>
+```
+
+`https://` is required — the API key rides that URL on every request. `http://` is
+accepted only for `localhost` / `127.0.0.1` / `[::1]`, where the traffic never leaves
+the box; a private-LAN address is still a real network and is refused. `--base-url`
+requires `--auth-profile`, like every claude BYO path, so the endpoint and its key
+are scoped to the agents you bind to that profile rather than to every claude agent
+on the host. In a `5dive compose` spec the key is `base_url`.
+
 Switch the model on a running agent (persists across restarts):
 
 ```sh
@@ -250,6 +274,22 @@ sudo 5dive agent import olivia --as=ceo    # spin up a named agent from a pack
 
 `--as` is the agent's name on your box; the pack supplies the persona, model, and skills. Add `--channels=telegram` to wire a bot at import time. Packs live in the [`5dive-ai/character-packs`](https://github.com/5dive-ai/character-packs) registry, and a `5dive.yaml` can reference one with `pack: <slug>`.
 
+### See the org layer: `5dive ui`
+
+The CLI serves its own web UI. No install, no build step, no account:
+
+```sh
+5dive ui                 # http://127.0.0.1:8735
+```
+
+Three views over the box you are on:
+
+- **Org chart** who reports to whom, what each agent is holding, and every live handoff on the board: who gave the work, who holds it, who grades it. The headline counts how many of those handoffs ran agent to agent with no human in the path.
+- **Queue** every open row with its assignee, its verifier, and where a maker-to-verifier handoff has got to.
+- **Gates** what is parked on a person, at which tier, with the asking agent's recommended answer.
+
+It is read-only and binds to loopback (there is no sign-in, so `--host` refuses a routable address unless you set `FIVE_UI_ALLOW_REMOTE=1`). Anything that changes state has a CLI verb. `5dive ui --data` prints the same JSON the views render, so you can pipe it somewhere else.
+
 ### Commands at a glance
 
 ```
@@ -263,6 +303,7 @@ sudo 5dive agent import olivia --as=ceo    # spin up a named agent from a pack
 5dive task      add / ls / assign / start / done / need / inbox / answer
 5dive heartbeat on / off / ls / tick     # wake agents that have queued work
 5dive org       set / tree               # who reports to whom
+5dive ui                                 # the three views in a browser (below)
 
 5dive account   add / login / list / show / usage / rename / remove
 5dive auth      set / login / status     # lower-level; account is the human path

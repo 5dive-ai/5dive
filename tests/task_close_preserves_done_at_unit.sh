@@ -33,6 +33,7 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 # DIVE-2518: impersonate through the SEALED seam. `USER=agent-x` no longer moves
 # the actor — that env path WAS the forgery this ticket closed, and these arms
@@ -41,7 +42,6 @@ cd "$(dirname "$0")/.."
 
 SRC=src
 TMP="$(mktemp -d /tmp/task-doneat-preserve-unit.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/broker.sh lib/audit.sh lib/registry.sh \
@@ -94,10 +94,14 @@ d_at=$(doneat_of "$D")
   || bad_t "D: first cancel did not stamp done_at" "status=$(status_of "$D") done_at='$d_at'"
 
 # ── B: a BARE repeat `task done` PRESERVES the first close timestamp ──────────
-# Bare (no --result) on purpose: that is the shape DIVE-2464's result guard does
-# not refuse, so the write actually lands and this arm is not vacuous.
+# The REPEAT is bare on purpose: that is the shape neither result guard refuses,
+# so the write actually lands and this arm is not vacuous.
+# DIVE-2773: the FIRST close now needs a reason (a first close with a blank one
+# is refused on both verbs), so it carries a --result here. Only the first close
+# moved — a bare re-close is explicitly exempt, which is what this arm grades and
+# why the change did not cost this harness an assertion.
 B=$(add "B bare re-done preserves done_at" --assignee=dev)
-as dev cmd_task_done "$B" >/dev/null
+as dev cmd_task_done "$B" --result="first close" >/dev/null
 backdate "$B"
 as dev cmd_task_done "$B" >/dev/null; b_rc=$?
 b_at=$(doneat_of "$B")
@@ -110,7 +114,7 @@ b_at=$(doneat_of "$B")
 
 # ── C: `task cancel` after a done PRESERVES the first close timestamp ─────────
 C=$(add "C cancel-after-done preserves done_at" --assignee=dev)
-as dev cmd_task_done "$C" >/dev/null
+as dev cmd_task_done "$C" --result="first close" >/dev/null   # DIVE-2773: first close needs a reason
 backdate "$C"
 as dev cmd_task_cancel "$C" >/dev/null; c_rc=$?
 c_at=$(doneat_of "$C")

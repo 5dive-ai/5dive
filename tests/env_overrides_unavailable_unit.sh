@@ -60,6 +60,7 @@ set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
 # shellcheck source=/dev/null
@@ -71,7 +72,7 @@ done
 # printing oks, no FAIL and NO SUMMARY. (Cost me a run on DIVE-2328.)
 set +e
 
-TMP="$(mktemp -d /tmp/env-ov-unavail.XXXXXX)"; trap 'rm -rf "$TMP"' EXIT
+TMP="$(mktemp -d /tmp/env-ov-unavail.XXXXXX)"
 PASS=0; FAIL=0; SKIP=0
 ok_t()   { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t()  { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }

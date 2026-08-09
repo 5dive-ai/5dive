@@ -240,16 +240,159 @@ cmd_list() {
   fi
 }
 
+# --- Unprivileged-first reads, with a circuit breaker (DIVE-2791) -----------
+#
+# These resolvers are cosmetic survey columns, and they are called once PER AGENT
+# on a fleet-wide sweep (`agent list`, `compose`). Reaching for `sudo` by reflex
+# made a scoped agent emit one denial per agent per sweep: 224 `command not
+# allowed` lines in 24h on the control plane (164 agent-codex + 26 agent-dev3),
+# all of them `sudo jq`/`sudo sed` against other agents' settings.json. Each
+# denial is a syslog line and, where sudoers sets `mail_no_perms`, a mail to root
+# — a reporter's box ran that chain for 9 days and landed its IP on Spamhaus CSS
+# and XBL. No compromise; volume to a nonexistent recipient just reads as abuse.
+#
+# Two rules keep that from recurring:
+#   1. Ask root only when the direct read genuinely cannot answer. Readability is
+#      the test, NOT emptiness — an empty `model` is a legitimate value (the
+#      runtime falls back to its built-in pick), so escalating on "" would sudo
+#      for every unset agent forever.
+#   2. Latch off after PRIV_READ_MAX_DENIALS consecutive refusals. A grant is
+#      written against the COMMAND, so a refusal for agent-A's file predicts a
+#      refusal for agent-B's; we spend a few before latching only because a
+#      per-target sudoers rule is expressible.
+
+# Consecutive sudo refusals tolerated before we stop asking for the rest of the
+# window. Cache TTL bounds how long a latched breaker outlives a sudoers change.
+PRIV_READ_MAX_DENIALS="${PRIV_READ_MAX_DENIALS:-3}"
+PRIV_READ_TTL="${PRIV_READ_TTL:-900}"
+
+# Where the denial count lives. It MUST be a file rather than a shell variable:
+# every caller invokes these resolvers as `model=$(resolve_agent_model …)`, and a
+# subshell cannot write a variable back to its parent — a variable-held counter
+# would reset on every agent and the breaker would never latch at all. Keyed by
+# the caller's OWN cache dir, so the count also carries across the ~8 sweeps a
+# day that produced the flood, and never lets one uid touch another's state.
+_priv_state_file() {
+  local base="${XDG_CACHE_HOME:-${HOME:-}/.cache}"
+  [[ "$base" == /* ]] || return 1
+  [[ -d "$base/5dive" ]] || mkdir -p "$base/5dive" 2>/dev/null || return 1
+  printf '%s/5dive/privread-denials' "$base"
+}
+
+# Current consecutive-denial count, or 0 when unknown/expired.
+_priv_denials() {
+  local f n mt now
+  f=$(_priv_state_file) || { printf 0; return; }
+  [[ -r "$f" ]] || { printf 0; return; }
+  mt=$(stat -c %Y "$f" 2>/dev/null) || mt=0
+  now=$(date +%s 2>/dev/null) || now=0
+  # A stale latch must expire: a sudoers grant can be widened between sweeps and
+  # nothing here would otherwise notice. TTL resolved locally for the same reason
+  # the denial bound is (an unset global would make this `> 0` — expire always).
+  local ttl="${PRIV_READ_TTL:-900}"
+  [[ "$ttl" =~ ^[1-9][0-9]*$ ]] || ttl=900
+  if (( now > 0 && mt > 0 && now - mt > ttl )); then
+    rm -f "$f" 2>/dev/null || true
+    printf 0; return
+  fi
+  read -r n <"$f" 2>/dev/null || n=0
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  printf '%s' "$n"
+}
+
+# Record an escalation outcome. `ok` clears the latch (root works here), `denied`
+# advances it and emits exactly ONE warn line for the window — a silently
+# degraded read that mails root once a minute is the worst of both, so the
+# operator gets told once and never spammed. A command that ran and merely failed
+# (absent file, bad JSON) is NOT a denial and must not latch the breaker.
+_priv_note() {
+  local outcome="$1" f n
+  f=$(_priv_state_file) || return 0
+  case "$outcome" in
+    ok)     rm -f "$f" 2>/dev/null || true ;;
+    denied)
+      n=$(_priv_denials); n=$(( n + 1 ))
+      printf '%s\n' "$n" >"$f" 2>/dev/null || true
+      if (( n == 1 )); then
+        local max="${PRIV_READ_MAX_DENIALS:-3}"
+        [[ "$max" =~ ^[1-9][0-9]*$ ]] || max=3
+        printf '5dive: warn: reading another agent'"'"'s config needs root and this grant was refused as %s; model/effort will show "—" for agents whose files are not readable. Suppressing further attempts after %s (DIVE-2791).\n' \
+          "$(id -un 2>/dev/null || printf '?')" "$max" >&2
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# Run a read-only command, unprivileged FIRST, escalating to `sudo -n` only when
+# the direct read cannot answer AND the breaker is closed.
+#   $1   the path whose readability decides whether root is needed at all
+#   $2.. the command; its stdout is the value
+# ALWAYS exits 0 with the value on stdout ("" when unavailable), because every
+# caller assigns it under the bundle's `set -e` (see DIVE-230).
+priv_read() {
+  local guard="$1"; shift
+  # Already root, or readable as us — our own home, a world-readable config, or a
+  # root-invoked sweep. The direct read is authoritative: "" means unset.
+  if (( EUID == 0 )) || [[ -r "$guard" ]]; then
+    "$@" 2>/dev/null || true
+    return 0
+  fi
+  # Resolve the bound LOCALLY. `(( n >= PRIV_READ_MAX_DENIALS ))` with the constant
+  # unset is `0 >= 0` — TRUE — which reads as "breaker already latched" and disables
+  # escalation entirely, silently returning "" for every agent. That is a quiet loss
+  # of function with no warn line, and it depends only on bundle source order, so the
+  # function must not rely on a global having been assigned first.
+  local max="${PRIV_READ_MAX_DENIALS:-3}"
+  [[ "$max" =~ ^[1-9][0-9]*$ ]] || max=3
+  local n; n=$(_priv_denials)
+  (( n >= max )) && { printf ''; return 0; }
+  local out err rc=0
+  err=$(mktemp 2>/dev/null) || { printf ''; return 0; }
+  # `-n` matters independently of the routing: without it a box that would prompt
+  # hangs a survey column behind a password read it can never satisfy.
+  out=$(sudo -n "$@" 2>"$err") || rc=$?
+  if (( rc == 0 )); then
+    _priv_note ok
+  elif grep -qiE 'not allowed|password is required|not in the sudoers|may not run|no tty' "$err" 2>/dev/null; then
+    _priv_note denied
+  fi
+  rm -f "$err" 2>/dev/null || true
+  printf '%s' "$out"
+  return 0
+}
+
 # Resolve the coding-CLI version string for an agent type from its TYPE_BIN
 # binary. Best-effort: returns "" if the binary is missing or doesn't answer
 # --version in time. Runs as `claude` (owns the binaries + their caches) through
 # a login shell so node/nvm-based CLIs (codex) inherit their PATH, capped at 5s
-# so a wedged CLI can't hang `info`.
+# so a wedged CLI can't hang `info`. DIVE-2791: when the binary is already
+# executable as us there is nothing to escalate for — that path was emitting
+# `sudo bash` denials for a string we could read directly.
 resolve_cli_version() {
   local type="$1"
   local bin="${TYPE_BIN[$type]:-}"
   [[ -n "$bin" ]] || { printf ''; return; }
-  timeout 5 sudo -u claude bash -lc "$(printf '%q' "$bin") --version 2>/dev/null | head -1" 2>/dev/null || printf ''
+  local q; q=$(printf '%q' "$bin")
+  if (( EUID == 0 )) || [[ -x "$bin" ]]; then
+    timeout 5 bash -lc "$q --version 2>/dev/null | head -1" 2>/dev/null || printf ''
+    return 0
+  fi
+  local max="${PRIV_READ_MAX_DENIALS:-3}"
+  [[ "$max" =~ ^[1-9][0-9]*$ ]] || max=3
+  local n; n=$(_priv_denials)
+  (( n >= max )) && { printf ''; return 0; }
+  local err out rc=0
+  err=$(mktemp 2>/dev/null) || { printf ''; return 0; }
+  out=$(timeout 5 sudo -n -u claude bash -lc "$q --version 2>/dev/null | head -1" 2>"$err") || rc=$?
+  if (( rc == 0 )); then
+    _priv_note ok
+  elif grep -qiE 'not allowed|password is required|not in the sudoers|may not run|no tty' "$err" 2>/dev/null; then
+    _priv_note denied
+  fi
+  rm -f "$err" 2>/dev/null || true
+  printf '%s' "$out"
+  return 0
 }
 
 # Resolve the model an agent is configured to use, read from the per-type
@@ -268,18 +411,21 @@ resolve_agent_model() {
   # read it as "agent missing". The `|| true` on every file read keeps the
   # contract: absent value → "" → exit 0. (sed|head needs it too: under
   # `pipefail` a missing config.toml propagates sed's non-zero status.)
+  # DIVE-2791: every arm goes through priv_read, which reads directly when it can
+  # and asks root only when the file is genuinely unreadable as us. The guard path
+  # and the command's own path argument are the same file by construction.
+  local f
   case "$type" in
     claude)
-      sudo jq -r '.model // empty' "$home/.claude/settings.json" 2>/dev/null || true ;;
-    codex)
-      { sudo sed -nE 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"?([^"#]*[^"# ])"?.*/\1/p' \
-        "$home/.codex/config.toml" 2>/dev/null | head -1; } || true ;;
-    grok)
-      { sudo sed -nE 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"?([^"#]*[^"# ])"?.*/\1/p' \
-        "$home/.grok/config.toml" 2>/dev/null | head -1; } || true ;;
+      f="$home/.claude/settings.json"
+      priv_read "$f" jq -r '.model // empty' "$f" ;;
+    codex|grok)
+      f="$home/.${type}/config.toml"
+      { priv_read "$f" sed -nE 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"?([^"#]*[^"# ])"?.*/\1/p' \
+        "$f" | head -1; } || true ;;
     antigravity)
-      sudo jq -r '.model // .selectedModel // empty' \
-        "$home/.gemini/antigravity-cli/settings.json" 2>/dev/null || true ;;
+      f="$home/.gemini/antigravity-cli/settings.json"
+      priv_read "$f" jq -r '.model // .selectedModel // empty' "$f" ;;
     *) printf '' ;;
   esac
 }
@@ -290,9 +436,11 @@ resolve_agent_model() {
 # "—"/null rather than treat empty as an error.
 resolve_agent_effort() {
   local type="$1" name="$2"
+  local f
   case "$type" in
     claude)
-      sudo jq -r '.effortLevel // empty' "/home/agent-${name}/.claude/settings.json" 2>/dev/null || true ;;
+      f="/home/agent-${name}/.claude/settings.json"
+      priv_read "$f" jq -r '.effortLevel // empty' "$f" ;;
     *) printf '' ;;
   esac
 }

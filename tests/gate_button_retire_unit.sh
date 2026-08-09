@@ -22,10 +22,10 @@ set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
 TMP=$(mktemp -d /tmp/gate-button-retire.XXXXXX)
-trap 'rm -rf "$TMP"' EXIT
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
@@ -214,7 +214,14 @@ seed_gate() { # <title> -> ident on stdout; files a real gate through the real n
   printf '%s' "$ident"
 }
 
-for arm in answer withdraw done; do
+# DIVE-2773: the `done` arm was `cmd_task_cancel --result="moot"` over a LIVE gate,
+# and that close is now REFUSED on both verbs — a cancel does not answer a gate, it
+# deletes the question, and it was retiring the human's buttons on the way out
+# (measured on DIVE-2758). So the arm is inverted rather than deleted: over a still-open
+# gate the button must SURVIVE, because the question is still answerable. That is a
+# stronger assertion than the one it replaces, and the retire WIRING it used to cover is
+# still graded three ways below by the answer/withdraw/refile arms.
+for arm in answer withdraw; do
   ident=$(seed_gate "DIVE-2410 wiring arm: $arm")
   if [[ -z "$ident" ]]; then chk "wiring/$arm: seeded a gate" "yes" "no"; continue; fi
   chk "wiring/$arm: the real emitter logged a retirable delivery" "1" \
@@ -223,11 +230,28 @@ for arm in answer withdraw done; do
   case "$arm" in
     answer)   ( cmd_task_answer   "$ident" --value=A ) >/dev/null 2>&1 ;;
     withdraw) ( cmd_task_need     "$ident" --withdraw ) >/dev/null 2>&1 ;;
-    done)     ( cmd_task_cancel   "$ident" --result="moot" ) >/dev/null 2>&1 ;;
   esac
   chk "wiring/$arm: the close path retired the delivered button" \
       "tok-marketing|1234567890|15491" "$(edits)"
 done
+
+# DIVE-2773 (replaces the old `done` arm above): a cancel over a LIVE gate is refused,
+# and the button it used to strip must still be there afterwards. Both halves are
+# asserted — a refusal that left the button retired anyway would pass a bare
+# "did it refuse" check while shipping the exact harm.
+ident=$(seed_gate "DIVE-2773 wiring arm: cancel over a live gate")
+if [[ -z "$ident" ]]; then chk "wiring/cancel-refused: seeded a gate" "yes" "no"; else
+  chk "wiring/cancel-refused: the real emitter logged a retirable delivery" "1" \
+      "$(_task_gate_deliveries "$ident" | grep -c '15491')"
+  reset_edits
+  ( cmd_task_cancel "$ident" --result="moot" ) >/dev/null 2>&1; _c2773_rc=$?
+  chk "wiring/cancel-refused: the cancel is REFUSED over a live gate" "refused" \
+      "$( (( _c2773_rc != 0 )) && echo refused || echo "landed rc=$_c2773_rc" )"
+  chk "wiring/cancel-refused: the human's button SURVIVES (the question is still answerable)" \
+      "" "$(edits)"
+  chk "wiring/cancel-refused: ...and the gate is still pending" "decision/pending" \
+      "$(db "SELECT COALESCE(need_type,'-')||'/'||CASE WHEN need_answered_at IS NULL THEN 'pending' ELSE 'answered' END FROM tasks WHERE ident=$(sqlq "$ident");")"
+fi
 
 # The stub above is load-bearing containment, not decoration: if cmd_send stops
 # being the resume path, this reads 0 and the next reader learns the harness lost
@@ -397,6 +421,82 @@ else
   chk "an EXISTING but unreadable delivery log warns (the no-op is observable)" "1" \
       "$(grep -c 'cannot read the gate-delivery log' <<<"$out")"
 fi
+
+# --- DIVE-2712: /inbox sends ONE MESSAGE PER GATE, first pings, rest silent -----
+# The defect: every gate shared ONE message with one merged keyboard, so answering
+# any gate retired the keyboard for ALL of them (retire edits the message that
+# delivered the gate, and that message was everyone's). Graded on the SHAPE OF THE
+# SENDS, not by reading the code — the send stub records one line per call.
+# cmd_task_inbox's send path opens with require_root, so unprivileged this whole
+# block died at that line with E_AUTH_REQUIRED and every arm below asserted against
+# an EMPTY log — which reads as "the feature sent nothing", not as "the test never
+# ran". Same stub the sibling harnesses use (capture_accumulate_unit.sh:41,
+# gate_proof_verify_unit.sh, gate_tier2_decision_nonce_unit.sh). Defined HERE rather
+# than at file scope so the arms above keep the real predicate.
+require_root() { :; }
+SENDS="$TMP/sends.log"; : >"$SENDS"
+# olivia's DIVE-2712 iteration-2 defect, and the fix is WHERE we cut, not what we assert.
+# The previous stub REPLACED _mirror_send and re-implemented the silent predicate in its
+# own printf — so the arms graded "did cmd_task_inbox export the env var", not "does the
+# wire carry disable_notification". Deleting the real line at cmd_agent_runtime.sh:394
+# left the suite at 42/0. The dry-run line at :376 cannot catch it either: it is a
+# PARALLEL EVALUATION of the same condition inside the same function, a mirror rather
+# than a measurement.
+# So restore the REAL _mirror_send and stub the TRANSPORT instead. Everything above this
+# point keeps the cheap stub; re-sourcing here rebinds the genuine implementation, and
+# curl on PATH captures the argv it actually composes.
+#
+# ONE SEND MUST BE ONE RECORD (olivia, iteration 3). The gate TEXT contains
+# newlines, so a plain printf of "$*" wrote ~7 lines per call: line 1 was the argv
+# prefix and disable_notification landed at the END of the argv, i.e. on that send's
+# LAST line. Every arm below is indexed by LINE, so `head -1` could never see the
+# flag (structurally always "absent" — a vacuous arm that survives a build which
+# silences the human's only ping) and `tail -n +2` still contained most of MESSAGE
+# ONE (so the "after the first" count was over the wrong population, and redded for
+# the right verdict by the wrong mechanism). Collapsing the newlines makes head -1
+# message 1 entire and tail -n +2 messages 2..N entire, which is the unit the arms
+# claim to measure. Generalisation worth keeping: an assertion indexed by LINE over
+# a log whose records are MULTI-LINE is measuring a unit the feature does not have.
+source "$SRC/cmd_agent_runtime.sh"
+mkdir -p "$TMP/bin"
+cat >"$TMP/bin/curl" <<'CURLSTUB'
+#!/usr/bin/env bash
+printf '%s\n' "${*//$'\n'/ }" >>"$SENDS"
+printf '%s' '{"ok":true,"result":{"message_id":15491}}'
+CURLSTUB
+chmod +x "$TMP/bin/curl"
+export PATH="$TMP/bin:$PATH" SENDS
+seed_gate() { # <id> <ident> <type>
+  db "INSERT INTO tasks (id,ident,title,status,priority,assignee,need_type,tier,ask,recommend,need_options,created_at)
+      VALUES ($1,'$2','t','blocked','high','main','$3',2,'ask?','A','A|B',datetime('now'));" 2>/dev/null
+}
+db "DELETE FROM tasks;" 2>/dev/null
+seed_gate 9001 DIVE-9001 decision
+seed_gate 9002 DIVE-9002 approval
+seed_gate 9003 DIVE-9003 decision
+# Subshell: cmd_task_inbox ends in ok/fail, which exit — `|| true` cannot catch an
+# exit in the current shell, and the harness must survive either outcome.
+# REACHABILITY FIRST, and it is the arm this block cost a delivery for. olivia's
+# point: stubbing require_root fixes THIS instance, it does not fix the property
+# that an unreached path reports as an empty measurement rather than a red one.
+# So grade the INSTRUMENT before grading the feature — a non-zero expectation that
+# can only be met if the code actually ran. Without this, every arm below reads
+# "expected 3, got 0" whether the split is broken or the harness never reached it,
+# and those two need different fixes.
+( cmd_task_inbox --send ) >/dev/null 2>&1; inbox_rc=$?
+chk "REACHABILITY: cmd_task_inbox --send actually RAN (rc 0, not a root/precondition refusal)" "0" "$inbox_rc"
+sends_n=$(grep -c 'sendMessage' "$SENDS" 2>/dev/null || echo 0)
+chk "REACHABILITY: the send log is NON-EMPTY before anything asserts what is IN it" \
+    "yes" "$([[ "$sends_n" -gt 0 ]] && echo yes || echo "no (rc=$inbox_rc)")"
+sends_n=$(grep -c 'sendMessage' "$SENDS" 2>/dev/null || echo 0)
+chk "3 open gates produce 3 SEPARATE messages, not one digest" "3" "$sends_n"
+# BOTH DIRECTIONS, deliberately. "assert it is present on 2..N" alone degrades into
+# "always pass it" — the absent-on-first arm is what stops that.
+chk "the FIRST gate message PINGS (no disable_notification on the wire)" "absent" \
+    "$(head -1 "$SENDS" | grep -q 'disable_notification=true' && echo present || echo absent)"
+chk "every message after the first carries disable_notification=true ON THE WIRE" "2" \
+    "$(tail -n +2 "$SENDS" | grep -c 'disable_notification=true')"
+chk "each gate carries its OWN keyboard" "3" "$(grep -c 'reply_markup=' "$SENDS" 2>/dev/null || echo 0)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == "0" ]]

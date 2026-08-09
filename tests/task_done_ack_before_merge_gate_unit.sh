@@ -23,10 +23,24 @@ set -uo pipefail
 # harnesses for why silencing it would swallow the payload, not just the noise.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+
+# DIVE-2770: the merge gate gained a CREDENTIAL-FREE rail (an unauthenticated read
+# of a public repo). Every no-token arm below was written when "no credential"
+# meant "no rail", and with the anon rail live they would reach the real network
+# and grade a LIVE PR instead of the fixture. Turn it off here: these harnesses
+# grade the pre-2770 rails, and tests/task_merge_gate_anon_rail_unit.sh grades the
+# new one. This is also what keeps `no root, no network` true of this file.
+#
+# IT MUST SIT AFTER lib/grading_tree.sh, AND THAT IS NOT A STYLE CHOICE: that file
+# sources lib/env_isolation.sh, which CLEARS inherited FIVE_* knobs so a harness
+# never grades the caller's environment. Set above it, this export is wiped and the
+# harness silently reaches the network instead — measured, and it read as three
+# unrelated assertion failures naming a live PR's real state.
+export FIVE_GATE_NO_ANON=1
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/done-ack-before-gate-unit.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 # --- stub gh + sudo, same convention as tests/task_deliver_merge_gate_unit.sh ---
 # (fail-closed sudo so the token resolver never reaches a real host credential;
@@ -125,7 +139,7 @@ as_agent maker cmd_task_deliver "$tid" --pr="$PR1" >/dev/null 2>"$TMP/err"
   || bad_t "T1 precondition" "$(db "SELECT * FROM tasks WHERE id=$tid;")"
 
 export GH_STUB_STATE="OPEN" GH_STUB_MERGED=""
-out=$(as_agent verifier cmd_task_done "$tid" 2>&1); rc=$?
+out=$(as_agent verifier cmd_task_done "$tid" --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1); rc=$?
 [[ $rc -eq "$E_CONFLICT" && "$out" == *"DIVE-1830"* ]] \
   && ok_t "T2 done-before-start is refused by the merge gate exactly as before (E_CONFLICT, DIVE-1830)" \
   || bad_t "T2 refusal" "rc=$rc (want $E_CONFLICT) out=$out"
@@ -160,7 +174,7 @@ _hb_stall_sweep >/dev/null 2>&1
 # T4: the SAME task later merges for real -> `done` closes exactly as before —
 # proves the ack fix changed no acceptance, only the ack side-effect.
 export GH_STUB_STATE="MERGED" GH_STUB_MERGED="2026-08-01T00:00:00Z"
-out=$(as_agent verifier cmd_task_done "$tid" 2>&1); rc=$?
+out=$(as_agent verifier cmd_task_done "$tid" --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1); rc=$?
 [[ $rc -eq 0 && "$(statusof "$tid")" == "done" ]] \
   && ok_t "T4 done still closes once the PR is merged (unchanged acceptance)" \
   || bad_t "T4 close" "rc=$rc status=$(statusof "$tid") out=$out"
@@ -179,7 +193,7 @@ as_agent maker cmd_task_deliver "$tid2" --pr="$PR2" >/dev/null 2>"$TMP/err"
   && ok_t "T5 precondition: delivered, unacked" \
   || bad_t "T5 precondition" "ack=$(ackof "$tid2")"
 
-out5=$(as_agent intruder cmd_task_done "$tid2" 2>&1); rc5=$?
+out5=$(as_agent intruder cmd_task_done "$tid2" --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1); rc5=$?
 [[ $rc5 -ne 0 ]] \
   && ok_t "T5 a non-assigned-verifier's done attempt is refused (DIVE-2007)" \
   || bad_t "T5 not refused" "rc=$rc5 out=$out5"

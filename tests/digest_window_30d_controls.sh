@@ -39,15 +39,16 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 REPO="$PWD"
 
 TMP="$(mktemp -d /tmp/digest-30d-ctl.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
-PASS=0; FAIL=0; PRECOND=0
+PASS=0; FAIL=0; PRECOND=0; SKIP=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
+skip_t() { SKIP=$((SKIP+1)); printf 'SKIP - %s\n   %s\n' "$1" "${2:-}"; }
 # A PRECONDITION is not a guard. It establishes that the instrument can OBSERVE
 # the property the graded arms claim; it catches nothing about the code under
 # test. Counted separately so a reader can never total them into "N guards" —
@@ -173,11 +174,33 @@ mutate src/cmd_digest.sh 'window_label = _WINDOW_LABELS.get(window) or f"{max(1,
   || { echo "FAIL - C2 mutation did not apply"; exit 1; }
 expect_only "C2 restore the >= label ladder (RENDERER layer)" "30d window mislabelled"
 
-fresh
-mutate src/cmd_proof.sh "policy_refusals WHERE ts>=datetime('now',\$(sqlq \"\$sql_window\"))" \
-                        "policy_refusals WHERE ts>=datetime('now','-7 days')" \
-  || { echo "FAIL - C3 mutation did not apply"; exit 1; }
-expect_only "C3 leave ONE scorecard SQL site at 7 days (MIXED-WINDOW)" "a hard-coded span survives in the scorecard"
+# --- Precondition for C3/armS: mutate() does a blind s.replace(o, n, 1) — it
+# hits the FIRST textual occurrence of the anchor in src/cmd_proof.sh, and only
+# means anything for THIS control if that first hit falls inside
+# _proof_scorecard(), the function digest_window_30d_unit.sh actually inspects
+# (HARDCODED = grep -c '-7 days' over the extracted function body). If a later
+# change added an EARLIER occurrence of the identical SQL span elsewhere in
+# cmd_proof.sh, mutate() silently lands on the wrong function and this control
+# cannot observe what it claims to — NOT-REACHED is the honest verdict, not a
+# red the control never earned (DIVE-2039's third state, applied here rather
+# than to an environment gap).
+C3_ANCHOR='policy_refusals WHERE ts>=datetime('"'"'now'"'"',$(sqlq "$sql_window"))'
+_c3_first_hit_line="$(grep -n -F "$C3_ANCHOR" src/cmd_proof.sh | head -1 | cut -d: -f1)"
+_c3_sc_start="$(grep -n '^_proof_scorecard() {$' src/cmd_proof.sh | head -1 | cut -d: -f1)"
+_c3_sc_end="$(awk '/^_proof_scorecard\(\) \{$/{f=1} f{print NR} f&&/^\}$/{exit}' src/cmd_proof.sh | tail -1)"
+C3_REACHABLE=1
+if [[ -z "$_c3_first_hit_line" || -z "$_c3_sc_start" || -z "$_c3_sc_end" \
+      || "$_c3_first_hit_line" -lt "$_c3_sc_start" || "$_c3_first_hit_line" -gt "$_c3_sc_end" ]]; then
+  C3_REACHABLE=0
+  skip_t "C3 leave ONE scorecard SQL site at 7 days (MIXED-WINDOW)" \
+    "mutate()'s first-occurrence anchor lands at src/cmd_proof.sh:${_c3_first_hit_line:-none}, outside _proof_scorecard() (lines ${_c3_sc_start:-?}-${_c3_sc_end:-?}) — a same-text SQL span now exists earlier in the file, so the blind first-hit replace targets the wrong function and this control cannot pin the scorecard's own defect"
+else
+  fresh
+  mutate src/cmd_proof.sh "policy_refusals WHERE ts>=datetime('now',\$(sqlq \"\$sql_window\"))" \
+                          "policy_refusals WHERE ts>=datetime('now','-7 days')" \
+    || { echo "FAIL - C3 mutation did not apply"; exit 1; }
+  expect_only "C3 leave ONE scorecard SQL site at 7 days (MIXED-WINDOW)" "a hard-coded span survives in the scorecard"
+fi
 
 # --- Arm S: SELF-TEST of this runner's own count branch.
 #
@@ -211,22 +234,31 @@ if a not in s:
 open(p, "w").write(s.replace(a, os.environ["SELF_INJ"] + "\n" + a, 1))
 SELFPY
 }
-fresh
-if ! _armS_truncate; then
-  bad_t "armS: could not stage the self-test truncation" "the anchor in digest_window_30d_unit.sh moved — this arm no longer tests what it claims, and a silent skip would leave the count branch uncontrolled"
-elif ! mutate src/cmd_proof.sh "policy_refusals WHERE ts>=datetime('now',\$(sqlq \"\$sql_window\"))" \
-                               "policy_refusals WHERE ts>=datetime('now','-7 days')"; then
-  bad_t "armS: the C3 mutation did not apply" "cannot self-test the count branch without it"
+# armS self-tests the count branch USING C3's own mutation (see the anchor note
+# above it) — with the same anchor landing outside _proof_scorecard(), staging it
+# here would silently exercise the wrong function too, so it shares C3's
+# precondition rather than re-deriving it.
+if [[ "$C3_REACHABLE" == "0" ]]; then
+  skip_t "armS: the count branch REDS on a short matrix" \
+    "shares C3's precondition (mutate()'s anchor is no longer scorecard-scoped) — staging the self-test truncation on the wrong function would prove nothing about the count branch"
 else
-  # expect_only runs in a SUBSHELL so its bad_t cannot touch the real counters.
-  _out="$( expect_only "armS probe" "a hard-coded span survives in the scorecard" 2>&1 )"
-  if grep -q "correct red name, but the harness evaluated" <<<"$_out"; then
-    ok_t "armS: the count branch REDS on a short matrix even when the red NAME is correct ($(sed -n 's/.*evaluated \([0-9]* of [0-9]*\).*/\1/p' <<<"$_out"))"
+  fresh
+  if ! _armS_truncate; then
+    bad_t "armS: could not stage the self-test truncation" "the anchor in digest_window_30d_unit.sh moved — this arm no longer tests what it claims, and a silent skip would leave the count branch uncontrolled"
+  elif ! mutate src/cmd_proof.sh "policy_refusals WHERE ts>=datetime('now',\$(sqlq \"\$sql_window\"))" \
+                                 "policy_refusals WHERE ts>=datetime('now','-7 days')"; then
+    bad_t "armS: the C3 mutation did not apply" "cannot self-test the count branch without it"
   else
-    bad_t "armS: the count branch did NOT fire on a deliberately short matrix" "expect_only printed: $(tr '\n' '|' <<<"$_out")"
+    # expect_only runs in a SUBSHELL so its bad_t cannot touch the real counters.
+    _out="$( expect_only "armS probe" "a hard-coded span survives in the scorecard" 2>&1 )"
+    if grep -q "correct red name, but the harness evaluated" <<<"$_out"; then
+      ok_t "armS: the count branch REDS on a short matrix even when the red NAME is correct ($(sed -n 's/.*evaluated \([0-9]* of [0-9]*\).*/\1/p' <<<"$_out"))"
+    else
+      bad_t "armS: the count branch did NOT fire on a deliberately short matrix" "expect_only printed: $(tr '\n' '|' <<<"$_out")"
+    fi
   fi
 fi
 
-printf '\n%s assertions passed, %s failed  (+%s precondition, which grades the INSTRUMENT, not the code)\n' \
-  "$PASS" "$FAIL" "$PRECOND"
+printf '\n%s assertions passed, %s failed, %s skipped  (+%s precondition, which grades the INSTRUMENT, not the code)\n' \
+  "$PASS" "$FAIL" "$SKIP" "$PRECOND"
 [[ "$FAIL" -eq 0 ]]

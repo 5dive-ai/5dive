@@ -26,11 +26,11 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
 
 TMP="$(mktemp -d /tmp/hb-stall-sweep.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
@@ -100,7 +100,7 @@ reset_all() {
 #     clears any stale-ping flag, and is untouched by the sweep (too fresh)
 reset_all
 a=$(addt --assignee=dev --verifier=olivia -- "ship the widget")
-( cmd_task_done "$a" ) >/dev/null 2>&1
+( cmd_task_done "$a" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
 delivered=$(db "SELECT COALESCE(handoff_delivered_at,'NULL') FROM tasks WHERE id=${a};")
 [[ "$delivered" != "NULL" ]] \
   && ok_t "task done to a verifier stamps handoff_delivered_at" \
@@ -132,7 +132,7 @@ _hb_stall_sweep >/dev/null 2>&1
 # --- A4: acknowledged deliveries (handoff_ack_at set) are never surfaced
 reset_all
 b=$(addt --assignee=dev --verifier=olivia -- "ship the gadget")
-( cmd_task_done "$b" ) >/dev/null 2>&1
+( cmd_task_done "$b" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
 db "UPDATE tasks SET handoff_delivered_at=datetime('now','-999 minutes'),
        handoff_ack_at=datetime('now') WHERE id=${b};"
 : >"$SEND_LOG"
@@ -357,7 +357,7 @@ _hb_stall_sweep >/dev/null 2>&1
 FLEET=$(mkfleet dev); IDLE_MAP=""
 reset_all
 d=$(addt --assignee=dev --verifier=olivia -- "delivered, awaiting the grade")
-( cmd_task_done "$d" ) >/dev/null 2>&1
+( cmd_task_done "$d" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
 db "INSERT INTO task_prefs (key,value) VALUES ('stall_first_seen_at', datetime('now','-60 minutes'));"
 : >"$SEND_LOG"; : >"$PROBE_LOG"
 _hb_stall_sweep >/dev/null 2>&1

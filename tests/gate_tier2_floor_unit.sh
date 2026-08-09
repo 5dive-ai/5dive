@@ -24,10 +24,10 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-tier2-unit.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
@@ -104,6 +104,15 @@ tierof()  { db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='$1';"; }
 # own header claims, rather than weakening an assertion.
 export SUDO_UID=0
 _gate_is_root() { return 0; }
+# DIVE-2371: the human-evidence test grew a STRUCTURAL half — the authorization
+# sites now call `_gate_human_principal` = the uid test AND `_gate_cgroup_human_capable`.
+# Same reasoning as the root seam directly above, one predicate later: the caller
+# this harness DESCRIBES is the dashboard exec / post-sudo human-on-box, and that
+# surface is an ACCEPTED cgroup, so pin it rather than weaken an assertion. Left
+# unpinned, T2 reads the host's real cgroup (an agent unit, or a CI runner), the
+# tier-2 guard refuses correctly, and the arm grades the fixture instead of the
+# floor. Stub the READER only; accept/deny stays the shipped bytes.
+_gate_caller_cgroup() { printf '%s' '/system.slice/shelld.service'; }
 
 touch "$GATE_PROOF_ENFORCE"   # enforcement ON for the floor tests
 

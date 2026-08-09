@@ -22,11 +22,11 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
 
 TMP="$(mktemp -d /tmp/task-cascade-unit.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
@@ -70,7 +70,7 @@ edges() { db "SELECT COUNT(*) FROM task_deps WHERE task_id=$1;"; }
 a=$(addt --assignee=alice -- "blocker A"); b=$(addt --assignee=bob -- "dependent B")
 ( cmd_task_block "$b" --by="$a" ) >/dev/null 2>&1
 [[ "$(st "$b")" == "blocked" && "$(edges "$b")" == "1" ]] || bad_t "T1 setup" "B not blocked"
-( cmd_task_done "$a" ) >/dev/null 2>&1
+( cmd_task_done "$a" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
 [[ "$(st "$b")" == "todo" && "$(edges "$b")" == "0" ]] \
   && ok_t "done blocker -> dependent flips todo, edge dropped" \
   || bad_t "single cascade" "B status=$(st "$b") edges=$(edges "$b")"
@@ -83,9 +83,9 @@ grep -q $'^bob\t' "$SEND_LOG" \
 a1=$(addt -- "A1"); a2=$(addt -- "A2"); d=$(addt --assignee=dora -- "D two-blockers")
 ( cmd_task_block "$d" --by="$a1" ) >/dev/null 2>&1
 ( cmd_task_block "$d" --by="$a2" ) >/dev/null 2>&1
-( cmd_task_done "$a1" ) >/dev/null 2>&1
+( cmd_task_done "$a1" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
 half="$(st "$d")/$(edges "$d")"
-( cmd_task_done "$a2" ) >/dev/null 2>&1
+( cmd_task_done "$a2" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
 full="$(st "$d")/$(edges "$d")"
 [[ "$half" == "blocked/1" && "$full" == "todo/0" ]] \
   && ok_t "two blockers: stays blocked after 1, flips after both ($half -> $full)" \
@@ -94,7 +94,7 @@ full="$(st "$d")/$(edges "$d")"
 # --- T3: CANCELLING a blocker cascades just like done
 a=$(addt -- "A cancel"); b=$(addt --assignee=bob -- "B via cancel")
 ( cmd_task_block "$b" --by="$a" ) >/dev/null 2>&1
-( cmd_task_cancel "$a" ) >/dev/null 2>&1
+( cmd_task_cancel "$a" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
 [[ "$(st "$b")" == "todo" && "$(edges "$b")" == "0" ]] \
   && ok_t "cancelled blocker also cascades" || bad_t "cancel cascade" "B status=$(st "$b")"
 
@@ -102,7 +102,7 @@ a=$(addt -- "A cancel"); b=$(addt --assignee=bob -- "B via cancel")
 a=$(addt -- "A gate"); b=$(addt --assignee=bob -- "B gated")
 ( cmd_task_block "$b" --by="$a" ) >/dev/null 2>&1
 ( cmd_task_need "$b" --type=decision --options="X|Y" --ask="pick one" ) >/dev/null 2>&1
-( cmd_task_done "$a" ) >/dev/null 2>&1
+( cmd_task_done "$a" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
 [[ "$(st "$b")" == "blocked" && "$(edges "$b")" == "0" ]] \
   && ok_t "need-gated dependent stays blocked (edge dropped, not flipped)" \
   || bad_t "gate guardrail" "B status=$(st "$b") edges=$(edges "$b")"
@@ -111,7 +111,7 @@ a=$(addt -- "A gate"); b=$(addt --assignee=bob -- "B gated")
 a=$(addt -- "A park"); b=$(addt --assignee=bob -- "B parked")
 ( cmd_task_block "$b" --by="$a" ) >/dev/null 2>&1
 db "UPDATE tasks SET parked_at=datetime('now'), park_reason='holding' WHERE id=$b;"
-( cmd_task_done "$a" ) >/dev/null 2>&1
+( cmd_task_done "$a" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
 [[ "$(st "$b")" == "blocked" ]] \
   && ok_t "parked dependent stays blocked (park owns the hold)" \
   || bad_t "park guardrail" "B status=$(st "$b")"
@@ -241,8 +241,17 @@ _pin_got="$(_gate_uid_to_agent "$(_gate_caller_uid)")"
   || { printf 'NOT OK - identity pin is inert: uid %s resolved to agent %s, expected %s\n' \
        "$_PIN_UID" "'$_pin_got'" "'${_pin_want:-<non-agent>}'"; exit 1; }
 
+# DIVE-2371: the human-evidence test grew a STRUCTURAL half — authorization calls
+# `_gate_human_principal` = the uid test AND `_gate_cgroup_human_capable`, and the
+# `id` stub above cannot reach the cgroup read. Unpinned, this answer is REFUSED on
+# any agent box or CI runner, A never closes, and the arm reds as a cascade failure
+# when nothing about the cascade changed. The caller this case DESCRIBES is a person
+# at a login session, which is an accepted surface, so pin it for the same scope as
+# the `id` stub. Stub the READER only; the accept list stays the shipped bytes.
+_gate_caller_cgroup() { printf '%s' '/user.slice/user-1000.slice/session-1.scope'; }
 ( cmd_task_answer "$a" --value=done --human ) >/dev/null 2>&1
 unset -f id
+unset -f _gate_caller_cgroup
 [[ "$(st "$a")" == "done" && "$(st "$b")" == "todo" && "$(edges "$b")" == "0" ]] \
   && ok_t "manual-gate 'done' answer cascades dependent blocked->todo" \
   || bad_t "manual-gate cascade" "A=$(st "$a") B=$(st "$b") edges=$(edges "$b")"

@@ -17,10 +17,10 @@ set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/task-verify-self-close-unit.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
@@ -133,7 +133,14 @@ before=$(wc -l <"$AUDIT_CALLS")
 unknown_out=$(run_with_identity "" nobody verify "$U" --cmd=true); unknown_rc=$?
 after=$(wc -l <"$AUDIT_CALLS")
 [[ $unknown_rc -ne 0 && "$(col "$U" status)" == "todo" \
-   && "$(col "$U" result)" == "✅ verify PASS (exit 0): true"* \
+   # DIVE-2483 (iteration 2): was a PREFIX match on the verdict. That pinned the
+   # WIPE in a subtler form than an equality would — on a DELIVERED (open) row the
+   # maker's record now correctly sits ABOVE the verdict, so the verdict is no
+   # longer the prefix. Every other assertion in this arm is untouched and still
+   # does the real work: rc!=0, status stays todo, no self-verified-close marker,
+   # audit unchanged, and the refusal names the unauthenticated caller.
+   && "$(col "$U" result)" == *"✅ verify PASS (exit 0): true"* \
+   && "$(col "$U" result)" == *"maker delivery"* \
    && "$(col "$U" result)" != *"self-verified-close"* && "$before" == "$after" \
    && "$(cat "$TMP/err")" == *"caller identity could not be authenticated"* ]] \
   && ok_t "unidentified caller records PASS evidence but cannot close a delivered loop" \

@@ -15,6 +15,7 @@
 # keep passing while doing so. Same reasoning as tests that derive a table from its
 # call sites instead of pinning a literal.
 set -euo pipefail
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
 # Three-state: if the helper is unreachable (a staged copy that did not carry
@@ -35,20 +36,32 @@ bad_t() { printf 'FAIL - %s\n' "$1"; [ -n "${2:-}" ] && printf '   %s\n' "$2"; F
 
 command -v sqlite3 >/dev/null 2>&1 || { echo "SKIP: sqlite3 not present"; exit 0; }
 
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+TMP=$(mktemp -d)
 DB="$TMP/t.db"
 
 # ---------------------------------------------------------------------------
 # 1. EXTRACT the live predicate. If this fails the test fails loudly rather than
 #    falling back to a hand-copy — a fallback here would silently grade nothing.
 # ---------------------------------------------------------------------------
-QUERY=$(awk '/SELECT t\.id\|\|x.1f.\|\|COALESCE\(t\.ident/,/hours.\);"\)/' "$SRC" \
+# STOPS AT THE FIRST RANGE, and then proves which range it got. DIVE-2853 added a
+# SECOND sweep query in the same function whose first line is character-identical to
+# this one (same SELECT list prefix), and an awk /start/,/end/ range RE-TRIGGERS on
+# it — the extraction silently returned both queries concatenated, which is not
+# valid SQL and reds an unrelated arm. The `exit` bounds it to one block; the
+# identity assertions below name WHICH block, so a future reordering of the two
+# fails loudly here instead of grading rung 2 while claiming to grade rung 1.
+QUERY=$(awk '/SELECT t\.id\|\|x.1f.\|\|COALESCE\(t\.ident/{c=1} c{print} c && /hours.\);"\)/{exit}' "$SRC" \
         | sed -e 's/^ *//' -e '1s/^.*db "//' -e 's/;")$/;/')
 if [[ -z "$QUERY" || "$QUERY" != *"from_template_id"* ]]; then
   bad_t "extract the live predicate from $SRC" "awk matched nothing, or the match does not mention from_template_id — the sweep query moved or was renamed; this test is now blind and must be re-anchored, NOT deleted"
   printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"; exit 1
 fi
+if [[ "$QUERY" != *"recurring_stall_pinged_at IS NULL"* || "$QUERY" == *"recurring_stall_escalated_at"* ]]; then
+  bad_t "the extracted block is rung 1 (DIVE-2693), not rung 2 (DIVE-2853)" "extracted: $QUERY"
+  printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"; exit 1
+fi
 ok_t "the sweep's SELECT is extracted from cmd_heartbeat.sh, not retyped here"
+ok_t "the extracted block is IDENTIFIED as rung 1 (pinged_at IS NULL, no escalated_at conjunct)"
 
 # The threshold is interpolated by the shell in the real caller; bind the default.
 QUERY="${QUERY//\$\{_HB_RECURRING_STALL_HOURS\}/24}"

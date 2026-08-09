@@ -111,6 +111,35 @@ envelope_via() {
   printf '%s\n' "$measured"
 }
 
+# envelope_provenance <claimed> <measured> — the same question envelope_via
+# answers, reduced to the VERDICT vocabulary the audit log needs (DIVE-2797).
+#
+# It composes over envelope_via rather than re-deciding, and that is the whole
+# point of it existing. The envelope and the audit row must never be able to
+# disagree about whether a send was mislabeled: two resolvers that drift apart
+# give a reader a conflict with nothing in either artifact saying which one is
+# right — the same defect _actor_identity was made a single function to avoid.
+#
+#   corroborated       the claimed sender matches what the uid measures
+#   divergent          they disagree — the mislabeled/forged send
+#   unclaimed          --raw or --from= : nothing was asserted to compare against
+#   unknown:*          nothing could be MEASURED, so no verdict is possible;
+#                      envelope_via's own reason string is passed through intact
+#
+# `unclaimed` is separated from `divergent` deliberately. An unasserted sender is
+# not a false one, and folding them together would bury the rows that matter
+# under every ordinary --raw send.
+envelope_provenance() {
+  local claimed="${1:-}" measured="${2:-}" via
+  [[ -n "$claimed" ]] || { printf 'unclaimed\n'; return 0; }
+  via="$(envelope_via "$claimed" "$measured")"
+  case "$via" in
+    "")        printf 'corroborated\n' ;;
+    unknown:*) printf '%s\n' "$via" ;;
+    *)         printf 'divergent\n' ;;
+  esac
+}
+
 # ---------------------------------------------------------------------------
 # DIVE-2213: the SAME not-measured-vs-measured-absent collapse as DIVE-2210, but
 # at a DECISION site (the heartbeat's privilege-escalation-by-queue guard) rather
