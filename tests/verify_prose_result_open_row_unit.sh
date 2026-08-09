@@ -18,7 +18,21 @@ TMP=""
 trap 'rc=$?; [[ -n "${TMP:-}" ]] && rm -rf "$TMP"; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.."
 CLI="$PWD/5dive"
-[[ -x "$CLI" ]] || { echo "SKIP - no built bundle (run ./build.sh)"; exit 0; }
+# DIVE-3059 instance 1, and it is this file's own defect: the SKIP below used to
+# exit 0, so a tree that had not run ./build.sh reported this harness as GREEN. That
+# is what let main stay red for six commits while every local check said fine. A
+# precondition this harness NEEDS is a FAILURE, not a skip — the escape is explicit
+# and local-only, matching ACP_ALLOW_SKIP in tests/acp_stdio_unit.sh.
+if [[ ! -x "$CLI" ]]; then
+  if [[ "${BUNDLE_ALLOW_SKIP:-}" == "1" ]]; then
+    echo "SKIP - no built bundle at $CLI (BUNDLE_ALLOW_SKIP=1); NOTHING WAS GRADED"; exit 0
+  fi
+  echo "FAIL - no built bundle at $CLI — run ./build.sh. This harness grades the CLI"
+  echo "       end-to-end and cannot run without one; refusing to exit 0 and be read as"
+  echo "       coverage. Set BUNDLE_ALLOW_SKIP=1 to skip deliberately (local only)."
+  echo "0 passed, 1 failed"; exit 1
+fi
+
 # DIVE-3059: TASKS_DB, not FIVE_TASKS_DB — the CLI never read the latter, so this
 # harness wrote its fixtures to the real board on a stateful host and failed 0/N on
 # a fresh runner. See the sibling harness for the full note.
