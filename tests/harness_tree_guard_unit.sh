@@ -172,5 +172,94 @@ fi
 bash "$GUARD" "$c2" "$c0" >/dev/null 2>&1
 assert_exit "guard: sanity — a valid BASE right beside the bad one above still passes a compliant add" 0 "$?"
 
+# --- DIVE-3074: the printed remediation is DEPTH-DEPENDENT ---------------
+# The canonical `")/lib/grading_tree.sh"` is correct ONLY for a file directly in
+# tests/. From tests/meta/ it resolves to tests/meta/lib/grading_tree.sh, which
+# cannot exist -- yet it still SATISFIES the text regex. An author who pasted
+# exactly what this guard printed got guard GREEN and property ABSENT, with the
+# harness printing `grading tree: UNRESOLVED` on every run and nothing saying so.
+# Measured on tests/meta/harness-graded-union.sh (DIVE-3017), the first file added
+# under tests/meta/ since this guard shipped.
+
+git checkout -q "$c0"
+
+NESTED_GOOD='#!/usr/bin/env bash
+set -uo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/../lib/grading_tree.sh" \
+  || printf "grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n" >&2
+echo hi'
+
+# A spelling this guard cannot statically judge (no $(dirname ...)): it must be
+# ALLOWED, not blocked. Deliberate negative control on the resolution check --
+# without it, "blocks the nested case" is satisfied by a check that blocks
+# everything it does not recognise.
+VAR_PATH_HARNESS='#!/usr/bin/env bash
+set -uo pipefail
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$ROOT/tests/lib/grading_tree.sh" \
+  || printf "grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n" >&2
+echo hi'
+
+mkdir -p tests/meta
+m1="$(commit_add_harness "meta/nested_missing_unit.sh" "$BAD_HARNESS" "add a nested harness with no source line")"
+out="$(bash "$GUARD" "$m1" "$c0" 2>&1)"; rc=$?
+assert_exit "guard: blocks a new tests/meta/ harness missing the source line" 1 "$rc"
+if [[ "$out" == *'. "$(dirname "${BASH_SOURCE[0]}")/../lib/grading_tree.sh"'* ]]; then
+  ok_t "guard: prints a ../lib/ remediation for a file one level under tests/"
+else
+  bad_t "guard: prints a ../lib/ remediation for a file one level under tests/" "$out"
+fi
+if [[ "$out" != *'"${BASH_SOURCE[0]}")/lib/grading_tree.sh'* ]]; then
+  ok_t "guard: does NOT print the depth-0 spelling for a nested file"
+else
+  bad_t "guard: does NOT print the depth-0 spelling for a nested file" "$out"
+fi
+
+git checkout -q "$c0"
+mkdir -p tests/a/b
+m2="$(commit_add_harness "a/b/deep_missing_unit.sh" "$BAD_HARNESS" "add a two-level-deep harness with no source line")"
+out="$(bash "$GUARD" "$m2" "$c0" 2>&1)"
+if [[ "$out" == *'. "$(dirname "${BASH_SOURCE[0]}")/../../lib/grading_tree.sh"'* ]]; then
+  ok_t "guard: prints ../../lib/ for a file two levels under tests/"
+else
+  bad_t "guard: prints ../../lib/ for a file two levels under tests/" "$out"
+fi
+
+# THE CLASS-CLOSING CASE: the file carries the guard's OWN canonical line, so the
+# text regex is satisfied -- and the path reaches nothing. Before DIVE-3074 this
+# exited 0.
+git checkout -q "$c0"
+mkdir -p tests/meta
+m3="$(commit_add_harness "meta/nested_unresolvable_unit.sh" "$GOOD_HARNESS" "nested harness carrying the depth-0 line (matches, resolves nowhere)")"
+out="$(bash "$GUARD" "$m3" "$c0" 2>&1)"; rc=$?
+assert_exit "guard: BLOCKS a nested harness whose source line matches but CANNOT RESOLVE" 1 "$rc"
+if [[ "$out" == *"CANNOT RESOLVE"* ]]; then
+  ok_t "guard: names the unresolvable-path failure distinctly from a missing line"
+else
+  bad_t "guard: names the unresolvable-path failure distinctly from a missing line" "$out"
+fi
+
+# ...and the corrected spelling passes, so the block above is about resolution
+# and not simply about being under tests/meta/.
+git checkout -q "$c0"
+mkdir -p tests/meta
+m4="$(commit_add_harness "meta/nested_ok_unit.sh" "$NESTED_GOOD" "nested harness with the depth-correct line")"
+bash "$GUARD" "$m4" "$c0" >/dev/null 2>&1
+assert_exit "guard: allows a nested harness whose ../lib/ line actually resolves" 0 "$?"
+
+# Negative control for the resolution check: an unjudgeable spelling is deferred
+# to CI, not blocked.
+git checkout -q "$c0"
+mkdir -p tests/meta
+m5="$(commit_add_harness "meta/nested_varpath_unit.sh" "$VAR_PATH_HARNESS" "nested harness sourcing via a computed \$ROOT")"
+bash "$GUARD" "$m5" "$c0" >/dev/null 2>&1
+assert_exit "guard: does not block a spelling it cannot statically judge (defers to CI)" 0 "$?"
+
+# Regression: depth 0 is unchanged -- the canonical line still passes in tests/.
+git checkout -q "$c0"
+r0="$(commit_add_harness "still_fine_unit.sh" "$GOOD_HARNESS" "depth-0 harness, canonical line")"
+bash "$GUARD" "$r0" "$c0" >/dev/null 2>&1
+assert_exit "guard: regression — the canonical line still passes directly in tests/" 0 "$?"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
