@@ -11728,7 +11728,7 @@ cmd_task_answer() {
       # own fix. Only a sub-tier-2 routed gate may claim a seat that can finish.
       local _who_can="a human — this gate has no routed reviewer, so no seat holds lead-clear standing"
       if [[ -n "$_routed_rev" && "$gtier" == "2" ]]; then
-        _who_can="a human — it is routed to '${_routed_rev}', but tier 2 escalates even their answer to a human tap"
+        _who_can="a human — it is routed to '${_routed_rev}', but this gate is TIER 2 and the floor escalates even their answer to a human tap"
       elif [[ -n "$_routed_rev" ]]; then
         _who_can="'${_routed_rev}' (its routed reviewer), or a human"
       fi
