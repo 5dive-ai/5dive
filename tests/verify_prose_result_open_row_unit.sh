@@ -69,8 +69,24 @@ res "$A" | grep -q "NO command was run" \
   && ok_t "A: the record says NO COMMAND RAN — not mistakable for a machine verdict" \
   || bad_t "A: the record says NO COMMAND RAN" "an unexecuted grade renders like an exit-0 one"
 
+# DIVE-3018. This arm used to assert ONLY that the row stayed todo, and that graded
+# NOTHING: replace the guard it names with `if false; then` and the suite still went
+# 9/0, because the now-open prose+close path dies under `set -euo pipefail` with the
+# generic "exited 1 without reporting a reason" BEFORE it can flip the row. "Did it
+# fail?" and "is the state unchanged?" are the SAME predicate in a system where
+# failing early is how nothing happens — any abort satisfies both, including a crash,
+# a typo'd ident or an unrelated guard firing first. So the status check stays (it is
+# the property we care about) but it can no longer carry the arm alone: we assert the
+# refusal's OWN output, which only this guard can produce.
+# See community/wiki/a-negative-arm-that-greps-for-failure-passes-on-any-failure.md
 B=$(mk "prose B")
-"$CLI" task verify "$B" --result="should be refused" >/dev/null 2>&1
+b_out=$("$CLI" task verify "$B" --result="should be refused" 2>&1); b_rc=$?
+[[ "$b_rc" -eq 2 ]] \
+  && ok_t "B NEGATIVE: the refusal exits E_USAGE(2), not a generic abort" \
+  || bad_t "B NEGATIVE: the refusal exits E_USAGE(2)" "got rc=$b_rc — any nonzero would satisfy a state-only assertion"
+grep -q "requires --no-done" <<<"$b_out" \
+  && ok_t "B NEGATIVE: and says 'requires --no-done' — a token only THIS guard emits" \
+  || bad_t "B NEGATIVE: the refusal names itself" "got: $(head -c 120 <<<"$b_out")"
 [[ "$(st "$B")" == "status=todo" ]] \
   && ok_t "B NEGATIVE: --result without --no-done cannot close the row" \
   || bad_t "B NEGATIVE: --result without --no-done cannot close" "got $(st "$B")"
@@ -78,8 +94,16 @@ res "$B" | grep -q "should be refused" \
   && bad_t "B NEGATIVE: a refused call must record nothing" "wrote a result on a refusal" \
   || ok_t "B NEGATIVE: a refused call recorded nothing"
 
+# DIVE-3018: C carried the same defect as B in a different costume — an ABSENCE
+# assertion ("no verdict was stored") is satisfied by every abort too. Same cure.
 C=$(mk "prose C")
-"$CLI" task verify "$C" --no-done --result="   " >/dev/null 2>&1
+c_out=$("$CLI" task verify "$C" --no-done --result="   " 2>&1); c_rc=$?
+[[ "$c_rc" -eq 3 ]] \
+  && ok_t "C NEGATIVE: the empty-verdict refusal exits E_VALIDATION(3)" \
+  || bad_t "C NEGATIVE: the empty-verdict refusal exits E_VALIDATION(3)" "got rc=$c_rc"
+grep -q "EMPTY value" <<<"$c_out" \
+  && ok_t "C NEGATIVE: and names the empty value — not a generic abort" \
+  || bad_t "C NEGATIVE: the refusal names the empty value" "got: $(head -c 120 <<<"$c_out")"
 res "$C" | grep -qE "verify (PASS|FAIL)" \
   && bad_t "C NEGATIVE: an EMPTY --result must be refused" "stored a blank verdict" \
   || ok_t "C NEGATIVE: an empty --result is refused, not stored (DIVE-2483)"
@@ -92,6 +116,57 @@ grep -q "task has no stored verify_command" <<<"$out" \
 grep -qi "graded by READING" <<<"$out" \
   && ok_t "D: and that refusal now NAMES --result as the exit" \
   || bad_t "D: the refusal names --result as the exit" "a refusal that hides its own exit is what this row is about"
+
+# ── DIVE-3018 item 2: --result-file= on the verbs that already take --result= ──
+# `task done` got this in DIVE-2627; `task deliver` and `task verify` did not. The
+# argv form only fails once the text is long enough to hit a shell-quoting mistake,
+# so it fails invisibly in exactly the cases nobody tests with — and what lands is a
+# permanently wrong record, not an error. These arms assert the FILE form on both
+# verbs plus the two refusals that make it safe to reach for.
+F=$(mk "prose F")
+printf 'graded by reading the diff.\n\nSecond paragraph with a `backtick`, an apostrophe'"'"'s worth of trouble, and $NOT_A_VAR.\n' > "$TMP/verdict.txt"
+"$CLI" task verify "$F" --no-done --result-file="$TMP/verdict.txt" >/dev/null 2>&1
+f_rc=$?
+[[ "$f_rc" -eq 0 ]] \
+  && ok_t "F: task verify --result-file records a prose verdict on an OPEN row" \
+  || bad_t "F: task verify --result-file exits 0" "got rc=$f_rc"
+res "$F" | grep -q 'a `backtick`' \
+  && ok_t "F: backticks/apostrophes/\$vars survive the FILE path verbatim" \
+  || bad_t "F: the file text survives verbatim" "the quoting trap this flag exists to remove"
+[[ "$(st "$F")" == "status=todo" ]] \
+  && ok_t "F: --result-file is a RECORDING path too — the row stays open" \
+  || bad_t "F: --result-file must not close the row" "got $(st "$F")"
+
+# NEGATIVE, and asserted on the refusal's own words rather than on absence.
+G=$(mk "prose G")
+g_out=$("$CLI" task verify "$G" --no-done --result=inline --result-file="$TMP/verdict.txt" 2>&1); g_rc=$?
+[[ "$g_rc" -eq 2 ]] && grep -q "conflicts with" <<<"$g_out" \
+  && ok_t "G NEGATIVE: --result and --result-file together are REFUSED (E_USAGE + names the conflict)" \
+  || bad_t "G NEGATIVE: inline+file must be refused" "rc=$g_rc out=$(head -c 120 <<<"$g_out")"
+: > "$TMP/empty.txt"
+h_out=$("$CLI" task verify "$G" --no-done --result-file="$TMP/empty.txt" 2>&1); h_rc=$?
+[[ "$h_rc" -eq 3 ]] && grep -q "is empty" <<<"$h_out" \
+  && ok_t "G NEGATIVE: an EMPTY file is refused, not recorded as blank (E_VALIDATION)" \
+  || bad_t "G NEGATIVE: an empty file must be refused" "rc=$h_rc out=$(head -c 120 <<<"$h_out")"
+i_out=$("$CLI" task verify "$G" --no-done --result-file="$TMP/nope.txt" 2>&1); i_rc=$?
+[[ "$i_rc" -eq 2 ]] && grep -q "no such file" <<<"$i_out" \
+  && ok_t "G NEGATIVE: a missing file is refused by NAME (E_USAGE)" \
+  || bad_t "G NEGATIVE: a missing file must be refused" "rc=$i_rc out=$(head -c 120 <<<"$i_out")"
+
+# The other verb the ticket names. deliver needs a --pr= URL to run at all.
+J=$(mk "prose J")
+"$CLI" task deliver "$J" --pr=https://github.com/5dive-ai/5dive/pull/1 --result-file="$TMP/verdict.txt" >/dev/null 2>&1
+j_rc=$?
+[[ "$j_rc" -eq 0 ]] \
+  && ok_t "J: task deliver --result-file works too (the second verb the ticket names)" \
+  || bad_t "J: task deliver --result-file exits 0" "got rc=$j_rc"
+res "$J" | grep -q 'a `backtick`' \
+  && ok_t "J: and deliver's file text survives verbatim" \
+  || bad_t "J: deliver's file text survives verbatim"
+k_out=$("$CLI" task deliver "$J" --pr=https://github.com/5dive-ai/5dive/pull/1 --result=x --result-file="$TMP/verdict.txt" 2>&1); k_rc=$?
+[[ "$k_rc" -eq 2 ]] && grep -q "conflicts with" <<<"$k_out" \
+  && ok_t "J NEGATIVE: deliver refuses inline+file too — one answer per question" \
+  || bad_t "J NEGATIVE: deliver must refuse inline+file" "rc=$k_rc out=$(head -c 120 <<<"$k_out")"
 
 E=$(mk "prose E")
 "$CLI" task verify "$E" --no-done --cmd=true --result="both given" >/dev/null 2>&1

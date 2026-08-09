@@ -25,8 +25,9 @@ _task_usage() {
                                                 -> done, or hand to the verifier if one is set
                                                 verifiers: put \`graded-sha: <sha>\` in the result;
                                                 --no-graded-sha is the audited escape
-  deliver <id> --pr=<url> [--result=]           record the delivery PR, hand to the verifier
-  verify <id> [--cmd=] [--no-done] [--timeout=] run the check; exit 0 = pass
+  deliver <id> --pr=<url> [--result=|--result-file=<path>]   record the delivery PR, hand to the verifier
+  verify <id> [--cmd=] [--result=|--result-file=<path>] [--no-done] [--timeout=]
+                                                run the check; exit 0 = pass
   reject <id> [--feedback=<what to fix>]        verifier FAIL: bounce back to the maker
   cancel <id> [--result=<text>]                 -> cancelled
   done|cancel [--keep-worktree]                 keep node_modules in that row's worktrees
@@ -4949,14 +4950,22 @@ _task_live_blocker() {
 # stays in_progress: a verifier must close it after the merge (done ≠ delivered).
 cmd_task_deliver() {
   tasks_db_init
-  local task="" pr="" result="" want_result=0
+  local task="" pr="" result="" want_result=0 result_src=""
   local append_result=0 force_result=0   # DIVE-2476: the two sanctioned answers to the
                                          # already-closed-row refusal, spelled exactly
                                          # as `task done|cancel` spells them.
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --pr=*)          pr="${1#*=}" ;;
-      --result=*)      result="${1#*=}"; want_result=1 ;;
+      # DIVE-3018: --result-file mirrors `task done`'s (DIVE-2627). The argv form
+      # only fails once the text is long enough to hit a shell-quoting mistake —
+      # i.e. it fails invisibly in exactly the cases nobody tests with, and what
+      # lands is a permanently wrong record rather than an error.
+      --result=*)      _prose_flag_dupe --result "$result_src"
+                       result="${1#*=}"; want_result=1; result_src="--result" ;;
+      --result-file=*) _prose_flag_dupe --result-file "$result_src"
+                       _read_prose_file --result-file "${1#*=}"
+                       result="$_PROSE_FILE_VALUE"; want_result=1; result_src="--result-file" ;;
       --append-result) append_result=1 ;;
       --force-result)  force_result=1 ;;
       -*)              fail "$E_USAGE" "unknown flag: $1" ;;
@@ -4964,7 +4973,7 @@ cmd_task_deliver() {
     esac
     shift
   done
-  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task deliver <id|DIVE-N> --pr=<url> [--result=<text>] [--append-result|--force-result]"
+  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task deliver <id|DIVE-N> --pr=<url> [--result=<text>|--result-file=<path>] [--append-result|--force-result]"
   [[ -n "$pr" ]]   || fail "$E_USAGE" "task deliver requires --pr=<url> (the PR that delivers this task; done stays blocked until it is MERGED — DIVE-1830)"
   # Basic sanity: a delivery ref must look like a PR URL, not a bare word.
   if [[ "$pr" != http*://* && "$pr" != *github.com* ]]; then
@@ -5950,7 +5959,7 @@ cmd_task_loop() {
 # --no-done (alias --check) runs the check and records it WITHOUT flipping.
 cmd_task_verify() {
   tasks_db_init
-  local task="" cmd="" no_done=0 timeout_s="" prose="" have_prose=0
+  local task="" cmd="" no_done=0 timeout_s="" prose="" have_prose=0 prose_src=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --cmd=*)      cmd="${1#*=}" ;;
@@ -5958,7 +5967,14 @@ cmd_task_verify() {
       # DIVE-2832: the verifier's own words. Every other writer of this column is
       # either the MAKER's verb (deliver) or machine output, so a verifier who
       # graded by READING had no way to put a prose PASS on an OPEN row at all.
-      --result=*)   prose="${1#*=}"; have_prose=1 ;;
+      --result=*)   _prose_flag_dupe --result "$prose_src"
+                    prose="${1#*=}"; have_prose=1; prose_src="--result" ;;
+      # DIVE-3018: same file sibling as `task done` / `task deliver`. A verifier's
+      # verdict is the LONGEST prose any of these verbs takes, so this is the one
+      # most exposed to the quoting trap the argv form carries.
+      --result-file=*) _prose_flag_dupe --result-file "$prose_src"
+                    _read_prose_file --result-file "${1#*=}"
+                    prose="$_PROSE_FILE_VALUE"; have_prose=1; prose_src="--result-file" ;;
       --timeout=*)  timeout_s="${1#*=}" ;;
       -*)           fail "$E_USAGE" "unknown flag: $1" ;;
       *)            [[ -z "$task" ]] && task="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
@@ -5966,7 +5982,7 @@ cmd_task_verify() {
     shift
   done
   [[ -n "$task" ]] \
-    || fail "$E_USAGE" "usage: 5dive task verify <id|DIVE-N> [--cmd=\"<command>\"] [--result=\"<prose verdict>\"] [--no-done] [--timeout=<seconds>]"
+    || fail "$E_USAGE" "usage: 5dive task verify <id|DIVE-N> [--cmd=\"<command>\"] [--result=\"<prose verdict>\"|--result-file=<path>] [--no-done] [--timeout=<seconds>]"
   [[ -z "$timeout_s" || "$timeout_s" =~ ^[1-9][0-9]*$ ]] \
     || fail "$E_VALIDATION" "--timeout must be a positive integer (seconds)"
   resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
