@@ -760,13 +760,49 @@ _task_unparented_followup_advisory() {
 #   --customer          this touches a customer surface; classifier was wrong
 #   --already-blocked=  it IS internal, and it is the stated exception
 # A false positive costs one flag. It never costs the row.
+# A MISS IS NOT CHEAP — MEASURED 2026-08-09. The first cut of this scan was
+# deliberately narrow on the reasoning that "a miss here is cheap and a false hit
+# taxes someone's real work". Only the second half of that held. Over the 946
+# hand-filed rows of the preceding 14 days the narrow set flagged **15%** where a
+# read of the same titles says ~67% are our own machinery, so the gating window
+# sat at 3/20 against a 5/20 threshold and the cap **never fired once**. The
+# fleet filed 55 rows a day, two of every three about itself, for five days after
+# the guard shipped and went live in 0.19.6.
+#
+# The narrow set failed for one structural reason: it keyed on MULTI-WORD phrases
+# ("verifier rail", "merge gate", "task add") while the rows that actually get
+# filed say the same things in one word — "gate" (102 occurrences in the missed
+# set), "agent" (97), "task" (80), then verifier, guard, rail, council, probe,
+# board. The vocabulary was right and the arity was wrong.
+#
+# So the set below is single-token where our machinery owns the token outright.
+# Two words stay OUT on purpose because the product IS agent hosting and they
+# cannot discriminate: **agent** and **queue**. Word boundaries do real work
+# here — "dashboard" does not match `board`, "webhook" does not match `hook`,
+# "latest" does not match `test`. Measured detection after widening: 45%, still
+# under the ~67% human read, which is the safe direction for a refusal.
+# Is the ACTIVE task store the production board? The filing cap is a rule about
+# how many rows the fleet puts on the shared board, so a run against a fixture
+# store has nothing for it to govern. Deliberately its own function rather than a
+# call to _task_human_send_allowed: that one also refuses on FIVEDIVE_TEST and
+# friends because SENDING to a human from a fixture is the risk it guards, and
+# borrowing it here would couple a quota to a notification policy. Same store
+# comparison (DIVE-1506), different question.
+_task_filing_cap_store_is_prod() {
+  local active prod ra rp
+  active="${TASKS_DB:-${STATE_DIR:-/var/lib/5dive}/tasks/tasks.db}"
+  prod="$(_task_prod_tasks_db)"
+  ra="$(readlink -f "$active" 2>/dev/null || printf '%s' "$active")"
+  rp="$(readlink -f "$prod" 2>/dev/null || printf '%s' "$prod")"
+  [[ -n "$ra" && "$ra" == "$rp" ]]
+}
+
 _task_internal_subject_reason() {
   local t="${1,,}"
   # Our own machinery: the task engine, gates, verifier rails, CI, the release
-  # cut, harnesses, the board, agent plumbing. Deliberately narrow — anything
-  # ambiguous is left OUT, because a miss here is cheap and a false hit taxes
-  # someone's real work.
-  [[ "$t" =~ (^|[^a-z])(harness|harnesses|smoke[-_ ]gate|full[-_ ]sweep|pipefail|shellcheck|actionlint|verifier[[:space:]]rail|merge[[:space:]]gate|gate[-_ ]history|task[[:space:]](add|done|need|ls)|taskboard|worktree|worktrees|heartbeat|release[-_ ]cut|version[-_ ]bump|changelog|pre[-_ ]push[[:space:]]hook|ci[[:space:]](check|job|run)|nightly[[:space:]]sweep|budget[-_ ]report)([^a-z]|$) ]] \
+  # cut, harnesses, the board, agent plumbing. Still a candidate set, never an
+  # action set — see the two declared escapes above.
+  [[ "$t" =~ (^|[^a-z])(harness|harnesses|smoke|full[-_ ]sweep|pipefail|shellcheck|actionlint|lint|verifier|verifiers|rail|rails|gate|gates|gating|task[[:space:]](add|done|need|ls)|taskboard|worktree|worktrees|heartbeat|release[-_ ]cut|version[-_ ]bump|changelog|pre[-_ ]push|hook|hooks|guard|guards|council|probe|probes|ci|nightly|budget[-_ ]report|backlog|board|cron|crontab|digest|recurring|maker|regression|flaky|unit|test|tests)([^a-z]|$) ]] \
     && { printf 'internal machinery'; return 0; }
   return 0
 }
@@ -1041,6 +1077,10 @@ _org_resolve_assignee() {
 }
 
 cmd_task_add() {
+  # DIVE-3077: a run that has declared itself a test may not write to the PROD
+  # board. Refuse BEFORE tasks_db_init so a refused call touches nothing.
+  _task_board_write_allowed || fail "$E_PERMISSION" \
+    "refusing to write to the production task board from a test run (FIVEDIVE_HARNESS/FIVEDIVE_TEST/FIVEDIVE_E2E/COUNCIL_MOCK/FIVEDIVE_NO_HUMAN_SEND is set and TASKS_DB resolves to $(_task_real_prod_tasks_db)). Point TASKS_DB/STATE_DIR at a throwaway store."
   tasks_db_init
   local body="" priority="medium" assignee="" parent="" from="" recurring="" fresh="" project="dive"
   local accept="" verify_cmd="" max_iters="" verifier="" task_budget="" no_verify="" branch=""
@@ -1197,7 +1237,15 @@ cmd_task_add() {
   if [[ "$kind" == "standard" && -z "$customer_facing" ]]; then
     internal_reason=$(_task_internal_subject_reason "$title")
   fi
-  if [[ -n "$internal_reason" && -z "$already_blocked" && "${FIVE_FILING_CAP:-1}" != "0" ]]; then
+  # THE CAP GOVERNS THE SHARED BOARD, SO IT ONLY APPLIES TO THE SHARED BOARD.
+  # Found 2026-08-09 by widening the classifier above: 24 harnesses seed rows with
+  # titles like "w review gate" and "smoke previous work", and once enough of them
+  # land in one fixture store the cap starts refusing a TEST's setup — which is
+  # not a filing decision at all, it is a rig building a fixture. The narrow scan
+  # hid this by never matching those titles; it was always the wrong scope.
+  # Store identity is the same primitive _task_human_send_allowed (DIVE-1506) uses
+  # one control over, for the same "a fixture must not act on prod" reason.
+  if _task_filing_cap_store_is_prod && [[ -n "$internal_reason" && -z "$already_blocked" && "${FIVE_FILING_CAP:-1}" != "0" ]]; then
     # `|| true` on the read as well as the newline at the producer: two
     # independent guards, because a filing rule must never be able to take
     # `task add` down. If the read ever comes back empty the cap declines to
@@ -10052,6 +10100,58 @@ _task_human_send_allowed() {
   ra="$(readlink -f "$active" 2>/dev/null || printf '%s' "$active")"
   rp="$(readlink -f "$prod" 2>/dev/null || printf '%s' "$prod")"
   [[ -n "$ra" && "$ra" == "$rp" ]]
+}
+
+# DIVE-3077 — the same fail-closed store-identity idea, applied to the board WRITE
+# path. On 2026-08-09 the prod board read 128 open rows of which 98 were test
+# fixtures filed that same day by three agents (`prose A`-`prose E`, `stamp arm
+# C/D/E`), burying a 27-row real backlog. The cost was not the count, it was
+# occlusion: a backlog you cannot read is one you cannot triage.
+#
+# WHY THIS IS NOT `! _task_human_send_allowed`, which is the obvious edit and is
+# wrong. That predicate refuses on EITHER a marker OR a non-prod store, because a
+# human send from a fixture store is never wanted. A board WRITE from a fixture
+# store into that fixture's OWN throwaway DB is the normal, correct case — it is
+# what nearly every harness in the corpus does. Inverting the send predicate here
+# would refuse all of them. The write rail cares about exactly one combination:
+# a run that has DECLARED itself a test, writing to the REAL production store.
+#
+#   refuse  <=>  (a test/harness marker is set)  AND  (the active TASKS_DB is the
+#                                                      real prod board)
+#
+# WHY THE PROD PATH HERE IGNORES FIVEDIVE_PROD_TASKS_DB, which is the one real
+# asymmetry with the send predicate and is deliberate. That variable exists so a
+# harness can DECLARE its own fixture store to be "prod" and exercise the send
+# predicate's allowed arm — 29 harnesses in the corpus do exactly that. A fence
+# that lets the caller redefine the thing it is protecting is fail-open by
+# construction, and honouring it here would refuse those 29 harnesses' own writes
+# to their own throwaway stores. The defect this closes was 98 fixture rows landing
+# on ONE file, so this fence names that file.
+#
+# THE SEAM, and why it is a SECOND variable rather than reusing the one above.
+# tests/task_board_write_fence_unit.sh must drive `task add` end to end against
+# "the prod board" to grade that the fence is WIRED and not merely correct. With
+# no seam its only option is to point TASKS_DB at the real board — and the arm
+# that grades "the fence refuses" then WRITES A REAL FIXTURE ROW the moment the
+# fence regresses. That is not hypothetical: it happened during this ticket's own
+# mutation testing and put DIVE-3082/3083/3084 on the live board. A guard whose
+# test reproduces, on its failure path, the exact defect the guard exists to
+# prevent is worse than no test. FIVEDIVE_FENCE_PROD_DB is set by that harness and
+# by nothing else; unset, this resolves to the real board, which the harness
+# asserts before it uses the seam.
+# Returns 0=allow, 1=refuse.
+_task_real_prod_tasks_db() { printf '%s' "${FIVEDIVE_FENCE_PROD_DB:-/var/lib/5dive/tasks/tasks.db}"; }
+_task_board_write_allowed() {
+  [[ -n "${FIVEDIVE_HARNESS:-}" || -n "${FIVEDIVE_NO_HUMAN_SEND:-}" \
+     || -n "${COUNCIL_MOCK:-}" || -n "${FIVEDIVE_E2E:-}" \
+     || -n "${FIVEDIVE_TEST:-}" ]] || return 0
+  local active prod ra rp
+  active="${TASKS_DB:-${STATE_DIR:-/var/lib/5dive}/tasks/tasks.db}"
+  prod="$(_task_real_prod_tasks_db)"
+  ra="$(readlink -f "$active" 2>/dev/null || printf '%s' "$active")"
+  rp="$(readlink -f "$prod" 2>/dev/null || printf '%s' "$prod")"
+  [[ -n "$ra" && "$ra" == "$rp" ]] && return 1
+  return 0
 }
 
 # DIVE-2010: fence a task-store-driven audit_log call on STORE IDENTITY, reusing
