@@ -989,5 +989,116 @@ if (( _grc == 0 )) && [[ "$_g" == *"concordant 2"* ]]; then
   ok "CORPUS GROWTH is not anti-correlation: normalising wall-clock to us/harness keeps a window concordant that raw wall-clock would have called discordant"
 else bad "corpus growth is not read as anti-correlation" "rc=$_grc $_g"; fi
 
+# ---------------------------------------------------------------------------
+# DIVE-2867: THE REFERENCE-SETTING GUARD, and the harvester that makes it satisfiable.
+#
+# These arms live in THIS file rather than a new one on purpose. The core tier is at
+# 91-111% of its cap across the last 20 main runs; a new harness costs its own setup on
+# every future PR forever, and "merge by subject" is the remedy this budget's own failure
+# text ranks first. The subject is the tier budget and it is already here.
+#
+# THE FIXTURE IS THE MEASURED WINDOW, not an invented one — the whole finding is that the
+# concordant population is BIMODAL, and a hand-made fixture would not have been.
+# Harvested 2026-08-08 from the last 20 `unit-tests` runs on main, CONCORDANT rows only.
+# ---------------------------------------------------------------------------
+CONC=(92852 96155 97360 99941 106833 117761 118000 119341 119385 119409 119419 120087 \
+      120166 120409 120524 121160 121277 121807 122037 122703 122762 123341 123362 \
+      123884 123901 124500 125012 125493 125513 125628 126454)
+
+# THE ARM THE WHOLE ROW TURNS ON. 116584 was the proposed fast-end reference, and by the
+# guard's PREVIOUS form ("K concordant samples strictly below") it passes at K=5. Every
+# one of those five is from the fast mode. Kill the band and this arm goes green while
+# the constant moves on evidence from a different population.
+if _r="$(bash tests/lib/tier.sh refadmit 116584 119000 "${CONC[@]}" 2>&1)"; then
+  bad "the proposed fast-end reference 116584 is REFUSED on the measured window" "admitted: $_r"
+elif [[ "$_r" == *"refuse support"* && "$_r" == *"K=1"* ]]; then
+  ok "a candidate supported ONLY by a distinct fast mode is REFUSED (116584 has 5 concordant samples below it and 1 within 10% — the count alone would have certified it)"
+else bad "116584 is refused with K=1" "$_r"; fi
+
+# The incumbent, on the same window, admitted — so the guard is not simply a refusal
+# machine, and the arm above cannot pass by the check being broken in one direction.
+if _r="$(bash tests/lib/tier.sh refadmit 119000 119000 "${CONC[@]}" 2>&1)" && [[ "$_r" == "admit raise" ]]; then
+  ok "a candidate equal to the incumbent needs no evidence (not a lowering)"
+else bad "119000 vs 119000 admits as a non-lowering" "$_r"; fi
+if _r="$(bash tests/lib/tier.sh refadmit 119000 121000 "${CONC[@]}" 2>&1)" && [[ "$_r" == *"K=2"* ]]; then
+  ok "the incumbent 119000 IS admissible as a lowering from 121000 — K=2 from 117761 and 118000, both in the normal mode"
+else bad "119000 admits at K=2 with in-band support" "$_r"; fi
+
+# ONE-SIDED, and this is the arm that stops a future edit from making the guard
+# symmetric "for consistency": raising tightens toward the floor and must never need a
+# sample, or the honest response to a slower runner image is blocked by the guard.
+if _r="$(bash tests/lib/tier.sh refadmit 200000 119000 2>&1)" && [[ "$_r" == "admit raise" ]]; then
+  ok "RAISING the reference is admitted with ZERO samples — it tightens toward the clamp floor and cannot ratchet the cap open"
+else bad "raising needs no samples" "$_r"; fi
+# THE SECOND CONJUNCT, and this arm is why it exists. A candidate placed INSIDE the fast
+# mode PASSES the support test at K=4 off its own neighbours — the band proves local
+# density and cannot tell a dense fast mode from the low tail of the working one. Only
+# the bounded-cost half catches it. Delete either conjunct and one of these two arms goes
+# green on a reference that hands the typical run a 363s cap against a 300s policy.
+_r="$(bash tests/lib/tier.sh refadmit 100000 119000 "${CONC[@]}" 2>&1)"; _rc=$?
+if (( _rc != 0 )) && [[ "$_r" == *"refuse cost"* ]]; then
+  ok "a candidate down in the fast mode is refused on BOUNDED COST, not on support — it has K=4 neighbours and still scales the median run to 121% (363s cap). Support and cost catch different things and neither alone is sufficient"
+else bad "a fast-mode candidate is refused on cost" "rc=$_rc $_r"; fi
+
+# Fail closed with nothing to measure against: "no samples" and "the cost is fine" are
+# different answers and only one of them is a pass.
+_r="$(bash tests/lib/tier.sh refadmit 118000 119000 117900 117950 2>&1)"; _rc=$?
+if (( _rc == 0 )) && [[ "$_r" == *"median-widen"* ]]; then
+  ok "an admitted lowering REPORTS the widening it bought, so the cost is in the output rather than in the reviewer's head"
+else bad "an admitted lowering prints its median-widen" "rc=$_rc $_r"; fi
+
+# The harvester. Graded on a SAVED log rather than a live gh call: a test that needs
+# credentials and a network is a test that gets skipped, and a skip on the arm that
+# proves the window can be rebuilt is exactly the silence this row is about.
+HARV="scripts/tier-cal-harvest.sh"
+if [[ -x "$HARV" ]]; then
+  printf 'test\tUNKNOWN STEP\t2026-01-01T00:00:00Z harness-budget[core/pristine]: 254 harnesses, 283s wall-clock, budget 300s (94%% of budget)\n' > "$TMP/fake.log"
+  printf 'test\tUNKNOWN STEP\t2026-01-01T00:00:01Z harness-budget[core/pristine]: CALIBRATION (measured) 119385us/iter vs baseline 119000us/iter = 100%% of a normal\n' >> "$TMP/fake.log"
+  printf 'test\tUNKNOWN STEP\t2026-01-01T00:00:02Z   runner; applied 100%% (clamp 100-150%%) -> effective cap 300s. This run is 94%% of the RAW cap\n' >> "$TMP/fake.log"
+  printf 'test\tUNKNOWN STEP\t2026-01-01T00:00:03Z   and 94%% of the EFFECTIVE cap. Raw high + effective low = the VM was slow; both high =\n' >> "$TMP/fake.log"
+  printf 'test\tUNKNOWN STEP\t2026-01-01T00:00:04Z harness-budget[core/pristine]: PROBE BRACKET (DIVE-2736) pre 119385us/iter -> post 119349us/iter (+0%%),\n' >> "$TMP/fake.log"
+  # A SECOND JOB in the same stream, with a different probe. Two jobs interleave in a
+  # real `gh run view --log` and their budget blocks are byte-similar, so keying on the
+  # harness-budget label instead of the job column would merge two runners into one
+  # sample — which is the one parsing mistake that would silently corrupt the window.
+  printf 'test-installed-host\tUNKNOWN STEP\t2026-01-01T00:00:05Z harness-budget[core/installed-host]: 255 harnesses, 335s wall-clock, budget 300s (111%% of budget)\n' >> "$TMP/fake.log"
+  printf 'test-installed-host\tUNKNOWN STEP\t2026-01-01T00:00:06Z harness-budget[core/installed-host]: CALIBRATION (measured) 100111us/iter vs baseline 119000us/iter = 84%% of a normal\n' >> "$TMP/fake.log"
+  printf 'test-installed-host\tUNKNOWN STEP\t2026-01-01T00:00:07Z   runner; applied 100%% (clamp 100-150%%) -> effective cap 300s. This run is 111%% of the RAW cap\n' >> "$TMP/fake.log"
+
+  bash "$HARV" --from-log="$TMP/fake.log" --run=31192491258 --sha=deadbee --out="$TMP/harv" >/dev/null 2>&1
+  _p="$TMP/harv/31192491258-test.report"; _i="$TMP/harv/31192491258-test-installed-host.report"
+  if [[ -r "$_p" && -r "$_i" ]] \
+     && grep -q '^# cal_us_per_iter=119385$' "$_p" && grep -q '^# wall_clock_s=283$' "$_p" \
+     && grep -q '^# cal_us_per_iter=100111$' "$_i" && grep -q '^# wall_clock_s=335$' "$_i"; then
+    ok "the harvester rebuilds one report PER JOB from a single interleaved run log, and does not merge two runners into one sample"
+  else bad "harvest splits an interleaved log by job column" "$(ls -1 "$TMP/harv" 2>&1)"; fi
+
+  # ABSENCE IS ABSENT. The log does not carry a probe bracket for installed-host in the
+  # fixture above, and a zero-filled cal_post_us_per_iter would be read by
+  # tier-cal-window.sh as a measured -100% bracket — a fabricated finding, not a gap.
+  if grep -q '^# cal_post_us_per_iter=119349$' "$_p" && ! grep -q '^# cal_post_' "$_i"; then
+    ok "a field the log did not carry is OMITTED, never zero-filled — an absence encoded as a value is read as presence, and this one feeds arithmetic"
+  else bad "missing bracket fields are omitted rather than zero-filled" "$(grep -c cal_post "$_i" 2>&1)"; fi
+
+  # Provenance is not optional: a harvested number with no run id is 173000 again.
+  bash "$HARV" --from-log="$TMP/fake.log" --out="$TMP/harv2" >/dev/null 2>&1
+  want "harvesting WITHOUT a run id refuses (a sample that cannot name its runner is not evidence)" "2" "$?"
+
+  # An empty harvest must not read as a clean window.
+  : > "$TMP/empty.log"
+  bash "$HARV" --from-log="$TMP/empty.log" --run=1 --out="$TMP/harv3" >/dev/null 2>&1
+  want "a harvest that finds NOTHING exits 6 rather than 0 — an empty window is not a window" "6" "$?"
+
+  # The window tool must consume harvested reports UNCHANGED. If this ever needs a
+  # translation layer, the harvester has drifted from the report format it mimics.
+  bash "$HARV" --from-log="$TMP/fake.log" --run=2 --out="$TMP/harv" >/dev/null 2>&1
+  bash "$HARV" --from-log="$TMP/fake.log" --run=3 --out="$TMP/harv" >/dev/null 2>&1
+  if bash "$WIN" "$TMP"/harv/*.report >/dev/null 2>&1; then
+    ok "scripts/tier-cal-window.sh reads harvested reports with no changes — the window's stated blocker ('reports do not persist') was never true of the fields it reads"
+  else bad "window consumes harvested reports unchanged" "$(bash "$WIN" "$TMP"/harv/*.report 2>&1 | tail -3)"; fi
+else
+  bad "scripts/tier-cal-harvest.sh is executable" "not found or not +x"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

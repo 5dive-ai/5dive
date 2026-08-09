@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TIER: nightly — 27s measured on the dev VM 2026-08-04 (DIVE-2719; was 24.4s, DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
+# TIER: nightly — 34.5s measured on the dev VM 2026-08-08 (DIVE-2912). The DIVE-2912 arms add +0s: interleaved n=2 on one sitting read base 34/35s against branch 34/34s, so the gap from the 27s claimed here on 2026-08-04 (DIVE-2719; 24.4s, DIVE-2525) is drift in the box, not in the corpus, and is re-stated rather than re-attributed. Does not fit the 300s PR core; the nightly sweep runs it.
 # OSS-7 isolated unit harness for the task-core verbs — the most-used surface
 # that had no coverage (only the loop/gate slices were tested). Same isolation
 # contract as the loop harnesses: source src/ directly, point STATE_DIR at a
@@ -412,6 +412,96 @@ v=$(FIVE_VERIFY_EXCLUDE="vfquinn" _task_default_verifier vfmaker "")
 v=$(_task_default_verifier vfquinn "")
 [[ "$v" != "vfquinn" ]] \
   && ok_t "default verifier: the QA agent does not grade its own work" || bad_t "self-grade" "got '$v'"
+
+# --- T-2912: the QA rung's DECLINE is observable, and a descriptive title can no
+# longer evict the declared QA agent.
+#
+# The live defect: main2 was seated with "verifier" in its TITLE, the QA scan
+# matched two agents, the COUNT==1 rule returned empty, and the chain fell
+# through — which did not promote main2 (it is nowhere in a dev-assigned row's
+# chain) but silently DEMOTED quinn off every row on the board. So the arms below
+# grade two separate things: that the right agent is picked, and that a decline
+# says so out loud.
+#
+# The chart is wiped and reseeded in the PRODUCTION shape (olivia root -> main ->
+# builders, one role-declared QA agent, one exec clone whose title says
+# "verifier"). Every prior arm's fixture is a tidy convenience chart; this defect
+# only exists in the real one, and a resolver arm seeded from a tidy chart is
+# exactly how the last such bug passed its tests.
+qa_out() {   # <maker> -> prints the pick; stderr captured to $TMP/qaerr
+  _task_resolve_qa "$1" 2>"$TMP/qaerr"
+}
+db "DELETE FROM agents_org;"
+org_seed olivia --role="AI CEO — conducts the fleet (advisory)" --title="Olivia · CEO"
+org_seed main   --manager=olivia --role="engineering + infra + the 5dive CLI" --title="Marcus · CTO"
+org_seed dev    --manager=main   --role="Backend lane" --title="Lead Engineer"
+org_seed main2  --manager=main   --role="engineering" --title="Marcus-2 · Exec clone / verifier"
+
+# BASELINE, with no QA agent seated yet: the picker walks up to a leader. Without
+# this the arm below is satisfied by a fixture that could only ever say quinn.
+qa_base=$(_task_default_verifier dev "")
+[[ -n "$qa_base" && "$qa_base" != "dev" ]] \
+  && ok_t "T-2912 baseline: no QA agent seated -> picker walks up to '$qa_base'" \
+  || bad_t "T-2912 baseline" "got '$qa_base'"
+
+# Now seat the dedicated QA agent by ROLE, beside the clone whose TITLE says
+# "verifier". This is the exact live table, and it used to return NOTHING.
+org_seed quinn --manager=main --role="QA / testing"
+pick=$(qa_out dev)
+[[ "$pick" == "quinn" ]] \
+  && ok_t "T-2912: a declared role='QA' outranks another agent's descriptive title" \
+  || bad_t "T-2912 role beats title" "got '$pick' (this is the DIVE-2912 regression)"
+[[ ! -s "$TMP/qaerr" ]] \
+  && ok_t "T-2912: a pick it CAN make stays quiet (no warn noise per task add)" \
+  || bad_t "T-2912 quiet pick" "warned anyway: $(cat "$TMP/qaerr")"
+v=$(_task_default_verifier dev "" 2>/dev/null)
+[[ "$v" == "quinn" && "$v" != "$qa_base" ]] \
+  && ok_t "T-2912: the full picker routes to the QA agent, not up the chart" \
+  || bad_t "T-2912 picker" "got '$v' (baseline was '$qa_base')"
+
+# GENUINE ambiguity — two agents whose ROLE declares QA. The rung is still
+# skipped (we do not guess), but it now NAMES both, which is the whole defect:
+# the old code returned an empty string and said nothing.
+org_seed quinn2 --manager=main --role="QA / release testing"
+pick=$(qa_out dev)
+[[ -z "$pick" ]] \
+  && ok_t "T-2912: two role-declared QA agents -> still declines to guess" \
+  || bad_t "T-2912 ambiguity" "guessed '$pick'"
+if grep -q 'quinn' "$TMP/qaerr" && grep -q 'quinn2' "$TMP/qaerr" && grep -qi 'skip' "$TMP/qaerr"; then
+  ok_t "T-2912: the decline WARNS and names every match"
+else
+  bad_t "T-2912 loud decline" "stderr did not name both matches: $(cat "$TMP/qaerr")"
+fi
+
+# ...and FIVE_VERIFY_EXCLUDE now resolves that ambiguity, which is what the list
+# is shaped for. It used to be read only by the chain below this function, so an
+# excluded name still counted toward the count that suppressed the pick.
+pick=$(FIVE_VERIFY_EXCLUDE="quinn2" qa_out dev)
+[[ "$pick" == "quinn" ]] \
+  && ok_t "T-2912: FIVE_VERIFY_EXCLUDE disambiguates the QA scan itself" \
+  || bad_t "T-2912 exclusion in predicate" "got '$pick'"
+[[ ! -s "$TMP/qaerr" ]] \
+  && ok_t "T-2912: a disambiguated scan stops warning" \
+  || bad_t "T-2912 exclusion quiet" "$(cat "$TMP/qaerr")"
+
+# A QA agent marked in the TITLE ALONE still wins — the role-first pass is a
+# tie-break, not a narrowing, so an org that never filled in `role` is untouched.
+db "DELETE FROM agents_org;"
+org_seed tmaker --manager=tlead
+org_seed tlead  --title="Engineering Lead"
+org_seed tqa    --manager=tlead --title="QA / testing"
+pick=$(qa_out tmaker)
+[[ "$pick" == "tqa" ]] \
+  && ok_t "T-2912: a title-only QA agent is still resolved (widen pass)" \
+  || bad_t "T-2912 title-only" "got '$pick'"
+
+# NO QA agent anywhere is not an event: empty AND silent, or every `task add` on
+# an org that never named one would print a warning.
+db "DELETE FROM agents_org WHERE name='tqa';"
+pick=$(qa_out tmaker)
+[[ -z "$pick" && ! -s "$TMP/qaerr" ]] \
+  && ok_t "T-2912: no QA agent at all -> empty and SILENT (unchanged behaviour)" \
+  || bad_t "T-2912 no-QA silence" "pick='$pick' stderr='$(cat "$TMP/qaerr")'"
 
 echo "-----"
 echo "task_core_unit: $PASS passed, $FAIL failed"

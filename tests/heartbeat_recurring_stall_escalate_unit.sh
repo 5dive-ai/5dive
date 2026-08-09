@@ -220,5 +220,31 @@ _hb_stall_sweep >/dev/null 2>&1
   && ok_t "MUTATION: clearing recurring_stall_escalated_at makes the row eligible again (the latch is load-bearing, not incidental)" \
   || bad_t "MUTATION: clearing recurring_stall_escalated_at makes the row eligible again" "assignee=[$(col 1 assignee)] — the second tick's no-op in arm 2 was NOT caused by the latch, so its cause is unknown"
 
+# ---------------------------------------------------------------------------
+# 6. A HAND REASSIGN RESTARTS THE LADDER, it does not hand the new owner a row the
+#    machine yanks back on its first tick. The clock is time-since-FLAG, so without
+#    this a row flagged two days ago is eligible the instant a person reassigns it —
+#    the ladder would overrule a routing decision seconds after it was made, having
+#    measured nothing about the new hands. Same hazard cmd_task_assign already
+#    guards for the stale-reaper (started_at), one layer over. Live case: creative
+#    hand-moved DIVE-2694 hours before this code would first run.
+# ---------------------------------------------------------------------------
+mk_fixture; busy dev
+cmd_task_assign 1 anton >/dev/null 2>&1
+[[ "$(col 1 recurring_stall_pinged_at)" == "NULL" && "$(col 1 recurring_stall_escalated_at)" == "NULL" ]] \
+  && ok_t "an explicit reassign CLEARS both stall stamps (the ladder restarts at detection)" \
+  || bad_t "an explicit reassign clears both stall stamps" "pinged=[$(col 1 recurring_stall_pinged_at)] escalated=[$(col 1 recurring_stall_escalated_at)]"
+: >"$AGENT_SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+[[ "$(col 1 assignee)" == "anton" && "$(col 1 status)" == "todo" ]] \
+  && ok_t "the very next tick does NOT move or cancel the freshly reassigned row" \
+  || bad_t "the very next tick does NOT move or cancel the freshly reassigned row" "assignee=[$(col 1 assignee)] status=[$(col 1 status)] — the machine overruled a hand routing decision"
+# ...and it is not immune forever: re-flag it, age the flag, and rung 2 applies again.
+db "UPDATE tasks SET recurring_stall_pinged_at=datetime('now','-25 hours') WHERE id=1;"
+_hb_stall_sweep >/dev/null 2>&1
+[[ "$(col 1 assignee)" != "anton" || "$(col 1 status)" == "cancelled" ]] \
+  && ok_t "MUTATION: re-flagging the reassigned row makes rung 2 apply again (the reset delays, it does not exempt)" \
+  || bad_t "MUTATION: re-flagging the reassigned row makes rung 2 apply again" "assignee=[$(col 1 assignee)] status=[$(col 1 status)] — the reset is a permanent exemption, which would hide the next stall"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

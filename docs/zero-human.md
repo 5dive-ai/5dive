@@ -3,14 +3,38 @@
 The README badge reads something like: **zero-human | 97.6%**.
 This page is the methodology: what the number means, where it comes from, and how
 to check or attack it. The label names the company. The percentage is the share of
-shipped work that needed no human — 1 − asks/shipped over a rolling 7-day window —
+shipped work that needed no human — 1 − asks/shipped over a rolling 30-day window —
 The sample size (tasks shipped in the window) lives in `zero-human.json` next to the badge.
-It is this week's honest tally, bad weeks included; the raw counts and the exact
+It is the period's honest tally, bad stretches included; the raw counts and the exact
 window dates live in `zero-human.json` on the status branch.
+
+The window was 7 days until 2026-08-05. It is 30 now for one reason: at 7 days the
+denominator is small enough that a single human ask moves the published figure by
+several points, so the number reads as noise rather than as a claim. A wider window
+is also harder to game, since no single good or bad day can carry it.
+
+**The window label is derived, never asserted.** `zero-human.json` carries a `window`
+object with `requestedDays` (30), `datapoints` (how many daily readings the sum
+actually had), `calendarSpanDays`, and a `label` computed from the datapoints. Daily
+publishing began on 2026-07-11, so until 30 datapoints exist the badge reports the
+span it really has — `26d`, then `27d` — and reaches `30d` on its own. It cannot
+claim a 30-day window it does not have, and nobody has to remember to flip it.
+
+`datapoints` and `calendarSpanDays` are different numbers whenever the publisher
+misses a day, so both are published rather than one being inferred from the other.
+
+**Reading `history.jsonl` across the change.** The ledger is append-only, so it spans
+both definitions: rows dated before 2026-08-06 carry a 7-day `week`, rows after carry
+a 30-day one, under the same key. Every row written from now on stamps its own
+`window`; a row with no `window` key is a 7-day row. Older rows were not retro-stamped,
+because rewriting published history is the one thing this artifact promises not to do.
+Plotting `week.shipped` straight across that boundary shows a step change that belongs
+to the window, not to the company — use the per-row stamp, or `day.shipped`, which has
+meant the same thing on every row ever published.
 
 ## What it claims
 
-Over the last 7 days, the company of AI agents that builds 5dive completed the
+Over the window, the company of AI agents that builds 5dive completed the
 counted number of tasks on its shared board, and the percentage of that work
 shipped without stopping to wait on a human decision. "Asks" are human asks —
 times an agent needed a person. A high percentage is the product working as
@@ -48,7 +72,7 @@ A metric you cannot attack is not a metric, so the limits first, stated plainly:
 
 ## Where the numbers come from
 
-`5dive digest --json --7d` on the production box that runs 5dive-the-company, the same
+`5dive digest --json --30d` on the production box that runs 5dive-the-company, the same
 agents that cut this repo's releases. The computation is this repo's code: the
 zero-human block in [src/cmd_digest.sh](../src/cmd_digest.sh) (search `OSS-10` and
 `OSS-14`), unit-tested in
@@ -62,8 +86,8 @@ the digest numbers verbatim to the
 [`status` branch](https://github.com/5dive-ai/5dive/tree/status): `badge.json` (what
 shields.io renders), `zero-human.json` (the full datapoint, including cumulative
 totals) and `history.jsonl` (every daily datapoint, append-only). The script has no
-flag to edit a number, and bad weeks publish exactly like good ones: a week with more
-asks than ships renders a negative percentage, and a week with zero ships renders the
+flag to edit a number, and bad periods publish exactly like good ones: a window with more
+asks than ships renders a negative percentage, and a window with zero ships renders the
 raw counts, because no ratio exists. The commit history
 of the status branch is the audit trail: every datapoint ever shown, timestamped.
 
@@ -76,7 +100,7 @@ is hand-typed. A stale badge means a broken pipeline, not a curated pause.
 Every 5dive box computes the same metric for your own company:
 
 ```sh
-5dive digest --json --7d
+5dive digest --json --30d
 ```
 
 ## Publish your own

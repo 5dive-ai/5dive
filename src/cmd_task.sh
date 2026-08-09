@@ -798,15 +798,62 @@ _task_resolve_deputy() {
 # coordinator, manager, root, deputy), so a leader was structurally guaranteed to
 # win; a chart that names a QA agent has already answered who should grade, and
 # nobody had asked it.
+#
+# DIVE-2912: the UNIQUENESS rule above is defensible; its SILENCE was not, and
+# the silence is what shipped a live routing change. Seating main2 with
+# "verifier" in its TITLE made the count 2, so this function returned empty and
+# the chain fell through to the next rung — which did not make main2 a candidate
+# (main2 is nowhere in a dev-assigned row's chain), it made QUINN, the dedicated
+# QA agent, stop being one. An unrelated agent's job title silently removed the
+# QA rail from the picker for every row on the board, and nothing said so.
+# Three changes, each aimed at that:
+#   1. A DECLARED role outranks a descriptive title. Pass 1 scans `role` only;
+#      only if that names nobody do we widen to role||title (pass 2), which is
+#      what keeps an org whose QA agent is marked in the title alone working.
+#      A clone's self-description can no longer outvote `role='QA / testing'`.
+#   2. FIVE_VERIFY_EXCLUDE is honoured HERE too, not just in the chain below.
+#      Excluding a name there used to leave it still counting toward the
+#      ambiguity that suppressed the pick — the documented data lever could not
+#      resolve the one thing it is shaped to resolve. Now it can.
+#   3. A decline is LOUD. Genuine ambiguity warns and NAMES every match; the
+#      rung is skipped either way, but the caller can now see that the QA rail
+#      was skipped and why. Silence is kept for the one case that is not an
+#      event: no QA agent matches at all, the ordinary shape for an org that
+#      never named one, where warning would fire on every `task add`.
+# Prints the grader name, or nothing.
 _task_resolve_qa() {
-  local _skip="$1"
-  local _pred="( lower(' '||COALESCE(role,'')||' '||COALESCE(title,'')) LIKE '% qa%'
-                 OR lower(' '||COALESCE(role,'')||' '||COALESCE(title,'')) LIKE '% test%'
-                 OR lower(' '||COALESCE(role,'')||' '||COALESCE(title,'')) LIKE '% verif%'
-                 OR lower(' '||COALESCE(role,'')||' '||COALESCE(title,'')) LIKE '% quality%' )
-               AND name <> $(sqlq "$_skip")"
-  [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE ${_pred};")" == "1" ]] || return
-  db "SELECT name FROM agents_org WHERE ${_pred} LIMIT 1;"
+  local _skip="$1" _pass _label _pred _n
+  local -a _cands=()
+  for _pass in role any; do
+    if [[ "$_pass" == role ]]; then
+      _pred="$(_task_qa_kw_clause "COALESCE(role,'')")"; _label='declared role'
+    else
+      _pred="$(_task_qa_kw_clause "COALESCE(role,'')||' '||COALESCE(title,'')")"; _label='role or title'
+    fi
+    _cands=()
+    while IFS= read -r _n; do
+      [[ -n "$_n" ]] || continue
+      _task_verify_excluded "$_n" && continue
+      _cands+=("$_n")
+    done < <(db "SELECT name FROM agents_org WHERE ${_pred} AND name <> $(sqlq "$_skip") ORDER BY name;")
+    case "${#_cands[@]}" in
+      1) printf '%s' "${_cands[0]}"; return 0 ;;
+      0) continue ;;   # nobody at this precision — widen, or fall out silently
+      *) warn "verifier auto-pick: the QA rung was SKIPPED — ${#_cands[@]} agents match the QA scan by ${_label} (${_cands[*]}), so it cannot name one. The verifier falls through to the next rung (project lead, then up the chart). Disambiguate with FIVE_VERIFY_EXCLUDE=<name>, a narrower role/title, or set the verifier explicitly."
+         return 1 ;;
+    esac
+  done
+  return 1
+}
+
+# The QA keyword scan, over whichever SQL expression the caller passes, so the
+# role-only and role||title passes cannot drift apart. Leading-space-anchored
+# (so "QA" matches but "kanban" does not), same convention as
+# _task_resolve_deputy.
+_task_qa_kw_clause() {
+  local _e="lower(' '||$1)"
+  printf "( %s LIKE '%% qa%%' OR %s LIKE '%% test%%' OR %s LIKE '%% verif%%' OR %s LIKE '%% quality%%' )" \
+    "$_e" "$_e" "$_e" "$_e"
 }
 
 # DIVE-2719: a NAMED EXCLUSION LIST, so the next such ruling is data rather than
@@ -1576,8 +1623,22 @@ cmd_task_assign() {
   # OLD assignee. Without this, an inherited in_progress task keeps the prior
   # owner's started_at, and the heartbeat stale-reaper (_hb_reap_stale) can
   # cancel it on the new owner's very first tick before they touch it.
+  # DIVE-2853, and the SAME hazard the paragraph above fixes for the stale-reaper,
+  # one layer over: the recurring-stall ladder escalates on how long ago the row was
+  # FLAGGED, so a row flagged two days ago that someone deliberately reassigns by
+  # hand is eligible for rung 2 on the new owner's very first tick — the machine
+  # would yank a routing decision seconds after a person or agent made it, having
+  # measured nothing about the new hands. Clearing both stamps when the assignee
+  # actually CHANGES restarts the ladder at detection: the new owner gets a full
+  # rung-1 window, and is re-flagged on their own clock if they also sit on it.
+  # Only an explicit `task assign` resets it — the ladder writes assignee directly
+  # and keeps its own latch, so the machine's own move still cannot repeat.
   db "UPDATE tasks SET
         handoff_ack_at=CASE WHEN assignee IS NOT $(sqlq "$who") THEN NULL ELSE handoff_ack_at END,
+        recurring_stall_pinged_at=CASE WHEN assignee IS NOT $(sqlq "$who")
+                                       THEN NULL ELSE recurring_stall_pinged_at END,
+        recurring_stall_escalated_at=CASE WHEN assignee IS NOT $(sqlq "$who")
+                                          THEN NULL ELSE recurring_stall_escalated_at END,
         assignee=$(sqlq "$who"),
         started_at=CASE WHEN status='in_progress' AND assignee IS NOT $(sqlq "$who")
                         THEN datetime('now') ELSE started_at END
@@ -6159,10 +6220,59 @@ cmd_task_park() {
   # DIVE-2410: park clears the gate columns, so whatever button that gate put in a
   # human's chat now points at a question the task no longer holds.
   _task_gate_retire_buttons "$tident" "parked" || true
+  # DIVE-2877: A PARK'S BLAST RADIUS EXCEEDS THE ROW IT IS APPLIED TO, and until
+  # now nothing said so at the moment of the park. On an instance materialized
+  # from a recurring template (from_template_id set) a park is not a delay of one
+  # row — it is a stop of the whole beat, with no catch-up:
+  #
+  #   - the materializer dedups on `status NOT IN ('done','cancelled')`
+  #     (_hb_materialize_recurring, src/cmd_heartbeat.sh) and a park sets
+  #     status='blocked', so the parked instance HOLDS the template's only open
+  #     slot. Every occurrence inside the park window is DROPPED, not deferred —
+  #     the materializer carries an explicit `V1 LIMITATION: no catch-up`.
+  #   - the DIVE-2693 stall ladder requires `status='todo' AND parked_at IS NULL`
+  #     at BOTH rungs (rung 2 added by DIVE-2853), so the row that stopped the
+  #     beat is the one state the watchdog cannot see.
+  #
+  # THE LADDER IS NOT THE DEFECT and this guard is deliberately not there. Rung 2's
+  # remedy is AUTO-CANCEL: widening its population to parked rows would convert an
+  # operator's "not now" into a destruction, on exactly the rows most likely to have
+  # been frozen for a real reason. Rung 1 is the same argument one notch softer — a
+  # parked row is pending BY DESIGN, and pinging it every beat is the false-positive
+  # class already fixed once (DIVE-639/711). Both clauses are correct FOR THE ACTION
+  # EACH RUNG TAKES, which is why the guard belongs here instead: the fact is
+  # knowable at park time from the row itself, so it needs no watchdog at all.
+  #
+  # WARN, NEVER REFUSE. This command cannot know whether the operator means to stop
+  # the beat (DIVE-2694 was parked by a legitimate fleet-wide token freeze), and a
+  # refusal would be a confident claim about intent. Naming the template and the two
+  # levers that actually mean "pause the job" is the whole job here.
+  #
+  # Cost of not having had it: DIVE-2694 (daily character drip) parked 2026-08-07,
+  # 9 days of dropped occurrences, downstream +3 days, and nothing red anywhere.
+  # CLASS: this is the SECOND entry into the DIVE-2237 trap (skip-if-open switches a
+  # template off silently) and strictly worse, because park also mutes the watchdog
+  # that surfaced the first. Fixing an entry path is not fixing the trap.
+  local _tmpl_ident=""
+  local _park_landed; _park_landed=$(db "SELECT CASE WHEN parked_at IS NOT NULL THEN 1 ELSE 0 END FROM tasks WHERE id=${tid};" 2>/dev/null || echo 0)
+  if [[ "$_park_landed" == "1" ]]; then
+    # ident has no spaces, so one row split on the first space keeps this to a
+    # single query. Empty when the row is not a materialized instance.
+    local _tmpl_row=""
+    _tmpl_row=$(db "SELECT p.ident || ' ' || COALESCE(p.schedule,'?')
+                    FROM tasks t JOIN tasks p ON p.id = t.from_template_id
+                    WHERE t.id=${tid};" 2>/dev/null || echo "")
+    if [[ -n "$_tmpl_row" ]]; then
+      _tmpl_ident="${_tmpl_row%% *}"
+      local _tmpl_sched="${_tmpl_row#* }"
+      warn "$tident is a recurring INSTANCE of ${_tmpl_ident} (schedule: ${_tmpl_sched}) — this park STOPS THAT BEAT, it does not delay one row (DIVE-2877). The materializer counts a parked instance as ${_tmpl_ident}'s open slot, so ${_tmpl_ident} will not fire again until this row is unparked or closed, and the occurrences inside the window are DROPPED with no catch-up. The recurring-stall watchdog skips parked rows, so nothing will report it. If you meant to pause the JOB: park the template instead — '5dive task park ${_tmpl_ident} --reason=<why> --wake=<when>' (a blocked template is skipped by the materializer, and unparking it resumes the schedule). If you meant to skip just THIS occurrence: '5dive task cancel $tident --result=\"<why>\"' — a cancel frees the slot, so the next tick fires normally."
+    fi
+  fi
   local wake_note=""; [[ "$wake_sql" != "NULL" ]] && wake_note=" — wakes $(db "SELECT wake_at FROM tasks WHERE id=${tid};") UTC"
   ok "$tident parked (no action needed)${reason:+ — $reason}${wake_note}" \
-     '{task:($t|tonumber), task_ident:$ti, parked:true, reason:$r, wake_at:(($w|select(length>0)) // null)}' \
-     --arg t "$tid" --arg ti "$tident" --arg r "$reason" --arg w "$([[ "$wake_sql" != "NULL" ]] && db "SELECT wake_at FROM tasks WHERE id=${tid};" || echo "")"
+     '{task:($t|tonumber), task_ident:$ti, parked:true, reason:$r, wake_at:(($w|select(length>0)) // null), stops_recurring_template:(($tm|select(length>0)) // null)}' \
+     --arg t "$tid" --arg ti "$tident" --arg r "$reason" --arg w "$([[ "$wake_sql" != "NULL" ]] && db "SELECT wake_at FROM tasks WHERE id=${tid};" || echo "")" \
+     --arg tm "$_tmpl_ident"
 }
 
 # Clear a park -> back to todo (unless real dependency edges still block it).
