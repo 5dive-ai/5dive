@@ -986,6 +986,10 @@ _org_resolve_assignee() {
 }
 
 cmd_task_add() {
+  # DIVE-3077: a run that has declared itself a test may not write to the PROD
+  # board. Refuse BEFORE tasks_db_init so a refused call touches nothing.
+  _task_board_write_allowed || fail "$E_PERMISSION" \
+    "refusing to write to the production task board from a test run (FIVEDIVE_HARNESS/FIVEDIVE_TEST/FIVEDIVE_E2E/COUNCIL_MOCK/FIVEDIVE_NO_HUMAN_SEND is set and TASKS_DB resolves to $(_task_real_prod_tasks_db)). Point TASKS_DB/STATE_DIR at a throwaway store."
   tasks_db_init
   local body="" priority="medium" assignee="" parent="" from="" recurring="" fresh="" project="dive"
   local accept="" verify_cmd="" max_iters="" verifier="" task_budget="" no_verify="" branch=""
@@ -9835,6 +9839,58 @@ _task_human_send_allowed() {
   ra="$(readlink -f "$active" 2>/dev/null || printf '%s' "$active")"
   rp="$(readlink -f "$prod" 2>/dev/null || printf '%s' "$prod")"
   [[ -n "$ra" && "$ra" == "$rp" ]]
+}
+
+# DIVE-3077 — the same fail-closed store-identity idea, applied to the board WRITE
+# path. On 2026-08-09 the prod board read 128 open rows of which 98 were test
+# fixtures filed that same day by three agents (`prose A`-`prose E`, `stamp arm
+# C/D/E`), burying a 27-row real backlog. The cost was not the count, it was
+# occlusion: a backlog you cannot read is one you cannot triage.
+#
+# WHY THIS IS NOT `! _task_human_send_allowed`, which is the obvious edit and is
+# wrong. That predicate refuses on EITHER a marker OR a non-prod store, because a
+# human send from a fixture store is never wanted. A board WRITE from a fixture
+# store into that fixture's OWN throwaway DB is the normal, correct case — it is
+# what nearly every harness in the corpus does. Inverting the send predicate here
+# would refuse all of them. The write rail cares about exactly one combination:
+# a run that has DECLARED itself a test, writing to the REAL production store.
+#
+#   refuse  <=>  (a test/harness marker is set)  AND  (the active TASKS_DB is the
+#                                                      real prod board)
+#
+# WHY THE PROD PATH HERE IGNORES FIVEDIVE_PROD_TASKS_DB, which is the one real
+# asymmetry with the send predicate and is deliberate. That variable exists so a
+# harness can DECLARE its own fixture store to be "prod" and exercise the send
+# predicate's allowed arm — 29 harnesses in the corpus do exactly that. A fence
+# that lets the caller redefine the thing it is protecting is fail-open by
+# construction, and honouring it here would refuse those 29 harnesses' own writes
+# to their own throwaway stores. The defect this closes was 98 fixture rows landing
+# on ONE file, so this fence names that file.
+#
+# THE SEAM, and why it is a SECOND variable rather than reusing the one above.
+# tests/task_board_write_fence_unit.sh must drive `task add` end to end against
+# "the prod board" to grade that the fence is WIRED and not merely correct. With
+# no seam its only option is to point TASKS_DB at the real board — and the arm
+# that grades "the fence refuses" then WRITES A REAL FIXTURE ROW the moment the
+# fence regresses. That is not hypothetical: it happened during this ticket's own
+# mutation testing and put DIVE-3082/3083/3084 on the live board. A guard whose
+# test reproduces, on its failure path, the exact defect the guard exists to
+# prevent is worse than no test. FIVEDIVE_FENCE_PROD_DB is set by that harness and
+# by nothing else; unset, this resolves to the real board, which the harness
+# asserts before it uses the seam.
+# Returns 0=allow, 1=refuse.
+_task_real_prod_tasks_db() { printf '%s' "${FIVEDIVE_FENCE_PROD_DB:-/var/lib/5dive/tasks/tasks.db}"; }
+_task_board_write_allowed() {
+  [[ -n "${FIVEDIVE_HARNESS:-}" || -n "${FIVEDIVE_NO_HUMAN_SEND:-}" \
+     || -n "${COUNCIL_MOCK:-}" || -n "${FIVEDIVE_E2E:-}" \
+     || -n "${FIVEDIVE_TEST:-}" ]] || return 0
+  local active prod ra rp
+  active="${TASKS_DB:-${STATE_DIR:-/var/lib/5dive}/tasks/tasks.db}"
+  prod="$(_task_real_prod_tasks_db)"
+  ra="$(readlink -f "$active" 2>/dev/null || printf '%s' "$active")"
+  rp="$(readlink -f "$prod" 2>/dev/null || printf '%s' "$prod")"
+  [[ -n "$ra" && "$ra" == "$rp" ]] && return 1
+  return 0
 }
 
 # DIVE-2010: fence a task-store-driven audit_log call on STORE IDENTITY, reusing

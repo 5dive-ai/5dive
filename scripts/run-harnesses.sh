@@ -44,6 +44,36 @@
 # NOT part of total_s and the report says so.
 set -uo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." || exit 2
+
+# DIVE-3077 — RAISE A SIGNAL THE BOARD-WRITE FENCE READS. `_task_human_send_allowed`
+# (DIVE-1506) has refused on FIVEDIVE_TEST since it was written; measured across the
+# 344-harness corpus on 2026-08-09, FIVEDIVE_TEST was set by ZERO files and
+# FIVEDIVE_E2E by ZERO. A control that reads a flag nobody sets is not a weak
+# control, it is an absent one wearing a control's shape — which is why 98 fixture
+# rows reached the prod board in one day (DIVE-3075).
+#
+# THE FIX IS ONE PLACE, NOT 344. Asking harness authors to set a marker is opt-OUT
+# of production and needs every author to remember; two stores have now proved they
+# do not. Setting it in the runner covers every harness including ones not yet
+# written, and inverts the default to opt-IN to production: only an invocation that
+# bypasses this script can reach the prod board at all.
+#
+# WHY THIS IS NOT `export FIVEDIVE_TEST=1`, which is what DIVE-3077 was filed asking
+# for and was MEASURED not to work. FIVEDIVE_TEST is read by
+# `_task_human_send_allowed`, where it forces refuse REGARDLESS of store path. But 29
+# harnesses point FIVEDIVE_PROD_TASKS_DB at their own fixture store precisely so they
+# can exercise that predicate's ALLOWED arm — simulating prod is their job. Exporting
+# FIVEDIVE_TEST here flips all of them to refuse. Measured on this branch, 2026-08-09:
+# 0/29 fail without the marker, 25/29 fail with it. Re-using the send rail's sentinel
+# for the write rail overloads one flag with two incompatible meanings, so the write
+# rail gets its own.
+#
+# KNOWN LIMIT, recorded rather than smoothed: this assumes the runner is the only
+# path to a harness. `bash tests/foo.sh` by hand bypasses it. That gap is real and
+# smaller — one person at a keyboard, not a nightly fleet — so this marker is a
+# FLOOR, not a proof. The durable fix in that direction is a writer-set scope column
+# as provenance (DIVE-3075), not a name match on the title.
+export FIVEDIVE_HARNESS=1
 # shellcheck source=tests/lib/tier.sh
 . tests/lib/tier.sh
 
