@@ -871,6 +871,34 @@ _apply_byo_claude() {
   fi
   [[ -n "$base_url" ]] \
     || fail "$E_VALIDATION" "claude does not support provider '$canonical' (${BYO_PROVIDER_LABEL[$canonical]:-unknown}: no Anthropic-compatible endpoint). Pass --base-url=<url> to point at one yourself."
+  # DIVE-2809 GUARD BEGIN — do not let a catalog re-derivation silently revert
+  # an operator's endpoint.
+  #
+  # Everything above this point resolves ANTHROPIC_BASE_URL from argv or the
+  # catalog and then WRITES it. That is correct on a first apply and wrong on a
+  # re-apply: `agent auth set claude --provider=<vendor> --auth-profile=<p>`
+  # (a routine key rotation) reaches here with url_override EMPTY, so the
+  # catalog's url wins and a profile created with --base-url loses its endpoint.
+  #
+  # The failure is not that the agent breaks — it is that it does not. The value
+  # written is a real vendor URL, so nothing downstream looks wrong, and a
+  # self-hosted agent quietly resumes sending its traffic AND ITS KEY to a vendor
+  # the operator deliberately moved off. Silence is the whole defect.
+  #
+  # Preserving silently is not the fix either: an operator who genuinely wants
+  # this profile back on a catalog vendor has to have a path that says so. So
+  # REFUSE, and name both exits with the same flag — keep, or move, but state
+  # which. The predicate is "the stored url is not in the catalog", not "the
+  # stored url differs": a profile already on vendor A that is re-pointed at
+  # vendor B was named on the command line by --provider and is not silent.
+  if [[ -z "$url_override" ]]; then
+    local stored_url
+    stored_url=$(profile_env_value "$profile" ANTHROPIC_BASE_URL)
+    if [[ -n "$stored_url" && -z "$(claude_baseurl_catalog_provider "$stored_url")" ]]; then
+      fail "$E_VALIDATION" "auth profile '$profile' is pinned to a custom endpoint (${stored_url}) that no provider catalog row serves; applying provider '$canonical' here would replace it with ${base_url}. Pass --base-url=${stored_url} to keep the custom endpoint, or --base-url=${base_url} to move this profile onto '$canonical' deliberately."
+    fi
+  fi
+  # DIVE-2809 GUARD END
   step "Configuring claude BYO provider '$canonical' → ${base_url} (profile=$profile)"
   printf '%s' "$base_url"  | profile_set_var "$profile" ANTHROPIC_BASE_URL
   printf '%s' "$api_key"   | profile_set_var "$profile" ANTHROPIC_AUTH_TOKEN
@@ -1349,7 +1377,7 @@ cmd_create() {
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--base-url=<url>] [--model=<slug>] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--defer-auth] [--isolation=admin|standard|sandboxed] [--can-push] [--can-deploy] [--inherit-memory=wiki|all|team|<agent>[,...]]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--base-url=<url>] [--model=<slug>] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--defer-auth] [--isolation=admin|standard|sandboxed] [--can-push] [--can-deploy] [--inherit-memory=wiki|all|team|<agent>[,...]]"
   [[ -n "$type" ]] || fail "$E_USAGE" "--type is required"
   valid_name "$name" || fail "$E_VALIDATION" "invalid name (lowercase letters/digits/hyphens, start letter, <=16 chars)"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type (known: ${!TYPE_BIN[*]})"
@@ -1367,7 +1395,7 @@ cmd_create() {
   if [[ "$type" == "grok" ]]; then
     warn "FIVE_GROK_UNFREEZE_VERIFIED=1 set, bypassing the DIVE-1221 Grok exfiltration freeze. Only valid if a VERIFIED xAI client-side patch is pinned."
   fi
-  valid_channel "$channels" || fail "$E_VALIDATION" "invalid channels: $channels (none|telegram|discord|dashboard, comma-separable)"
+  valid_channel "$channels" || fail "$E_VALIDATION" "invalid channels: $channels (none|telegram|discord|dashboard|buzz, comma-separable)"
   # DIVE-856: claude agents are chat-capable in the web dashboard by default.
   # The dashboard channel needs no token (the plugin reads the box connectord
   # bearer itself), so fold it into every claude create: unset --channels

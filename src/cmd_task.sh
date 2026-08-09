@@ -7915,6 +7915,97 @@ cmd_task_need() {
       "task=$ident" "filer=$(task_actor "$from")" "declared=$discusses" || true
   fi
 
+  # DIVE-2012: THE VERIFIER-SCOPING DEAD-END, made visible.
+  #
+  # The shape: the MAKER of a live maker→verifier loop files a `decision` gate
+  # asking the VERIFIER to scope that task's own acceptance criteria — a question
+  # whose only correct answerer is that verifier — and the ask NARRATES the work
+  # under test, so the T2 category floor fires on the narration. Measured on the
+  # ticket's own repro: tier goes to 2, the DIVE-1495 verifier-route below is
+  # guarded on `tier != 2` so it never runs, `routed_reviewer` stays NULL, and the
+  # DIVE-1117 provenance floor then refuses the verifier's answer. Net: the paired
+  # human is pinged for a call that was never theirs AND the designated answerer is
+  # locked out. dev's actual remedy on DIVE-1968 was to message olivia out of band.
+  #
+  # WHY THIS IS A WARNING AND NOT A SIXTH DOWNGRADE CLASS. The ticket asks for an
+  # exemption ("routed decision gates should skip the floor"). Building one means a
+  # sixth vocabulary guesser, and DIVE-2099's design note is explicit that adding
+  # one reproduces this bug with the polarity REVERSED — a false negative there
+  # routes a real money/secret ask to whichever agent happens to be grading the
+  # ticket, which is the exact defect DIVE-2241 had just closed. The appeal
+  # DIVE-2089 shipped is the supported answer and it already lands correctly:
+  # `--discusses` downgrades to tier 1, and because the verifier-route below runs
+  # AFTER every downgrade class, the gate then routes to the VERIFIER rather than
+  # the lead. Measured: tier=1, routed_reviewer=<verifier>, human not pinged.
+  #
+  # So the residual defect is not the tier — it is that the remedy is INVISIBLE at
+  # exactly the moment it is needed. `--discusses` landed after this ticket was
+  # filed, the floor's own warning never mentions it, and nothing tells the filer
+  # that the agent they are trying to reach is one flag away. An undiscoverable
+  # remedy is indistinguishable from no remedy, which is why this ticket exists.
+  #
+  # The trigger is STRUCTURAL, never vocabulary: a live loop (both ends present),
+  # the filer IS the maker, the verifier is someone else, and the type is the one
+  # type an appeal exists for. It changes NO tier and NO route — a floored gate
+  # still reaches the human, and the floor is untouched. It only ensures the filer
+  # is told, on the record, who they were trying to reach and how to reach them.
+  if [[ "$tier_floored" == "1" && "$type" == "decision" && "$_discusses_applied" == "0" \
+        && "$_curation" == "0" && "$_internal_ops" == "0" && "$_needs_human" == "0" \
+        && "$tier_arg" != "2" ]]; then
+    local _vs_filer; _vs_filer=$(task_actor "")
+    local _vs_vf _vs_mk
+    _vs_vf=$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${id};")
+    _vs_mk=$(db "SELECT COALESCE(maker_agent,'') FROM tasks WHERE id=${id};")
+    if [[ -n "$_vs_vf" && -n "$_vs_mk" && "$_vs_vf" != "$_vs_filer" && "$_vs_mk" == "$_vs_filer" ]]; then
+      # DIVE-2801 CLASS — do not recommend a remedy the code will refuse. This
+      # advice names `--discusses` as the way to reach the verifier, so it may
+      # only be printed when the appeal would actually be ACCEPTED. Both of
+      # DIVE-2089's refusal paths have to be evaluated here, not assumed:
+      #
+      #   Rule 3 — the residual still names a non-appealable category (money /
+      #   outbound comms / irreversible infra). Measured before this guard
+      #   existed: on a `spend` ask the appeal printed `--discusses REFUSED …
+      #   Staying at tier 2` and this warning then told the filer to re-file with
+      #   `--discusses` — the remedy they had just been refused, on the same
+      #   invocation. On that class there is also no dead-end to announce: the
+      #   floored gate is CORRECT and the human genuinely is the right answerer,
+      #   which is what the safety arm in the harness has always claimed.
+      #
+      #   Rule 4 — no lead sits above the filer, so the appeal has nobody to
+      #   route to and refuses. Promising a route we cannot mint is the same
+      #   defect with a different cause.
+      #
+      # Computed with the appeal's OWN helpers and its own per-field residual, so
+      # the two can never drift apart into a warning that predicts the wrong
+      # verdict. Silence here is the stock floor warning's job, not a gap.
+      local _vs_res_ask _vs_res_title
+      _vs_res_ask=$(_gate_floor_appeal_residual "$ask")
+      _vs_res_title=$(_gate_floor_appeal_residual "$_ft_title")
+      if _gate_hit_either _gate_tier2_floor_hit "$_vs_res_ask" "$_vs_res_title"; then
+        _vs_vf=""   # non-appealable: the human keeps this call, say nothing
+      elif [[ -z "$(_gate_route_reviewer "$_vs_filer")" ]]; then
+        _vs_vf=""   # no reviewer above the filer: the appeal would refuse
+      fi
+    fi
+    if [[ -n "$_vs_vf" && -n "$_vs_mk" && "$_vs_vf" != "$_vs_filer" && "$_vs_mk" == "$_vs_filer" ]]; then
+      # ABSORB the rc. `_gate_tier2_floor_term` is an allowlisted rc-bearing
+      # contract: it returns non-zero when it finds no term, so a plain
+      # assignment inherits that status and dies under `set -e`. Same shape
+      # main's DIVE-2751 fix uses two blocks up, and the call-site guard in
+      # tests/task_show_exit_code_unit.sh enforces it — that guard landed on
+      # main after this block was first written, and caught it on the rebase.
+      local _vs_term=""
+      _vs_term=$(_gate_tier2_floor_term "$ask" 2>/dev/null) || _vs_term=""
+      [[ -n "$_vs_term" ]] || { _vs_term=$(_gate_tier2_floor_term "$_ft_title" 2>/dev/null) || _vs_term=""; }
+      warn "this gate is floored to tier 2 (matched '${_vs_term}'), so it pings the paired human and ${_vs_vf} — the verifier on this task's loop, and the only agent who can answer a question about your own acceptance criteria — CANNOT clear it (tier-2 gates refuse a non-human answer, DIVE-1117). If the term is narration of the work under test rather than something you are asking to DO, re-file with --discusses=\"<why>\": the appeal downgrades the gate to tier 1 and routes it to ${_vs_vf}, not to the human. If you really are asking for that, leave it — the human is the right answerer."
+      # The dead-end this ticket was filed about was invisible in the record: the
+      # gate simply sat there while dev messaged olivia out of band. Audit the
+      # occurrence, not just the advice, so the NEXT instance is countable.
+      _task_store_audit_log "task need verifier-scoping floored" "warned" 0 -- \
+        "task=$ident" "filer=$_vs_filer" "verifier=$_vs_vf" "term=$_vs_term" || true
+    fi
+  fi
+
   # DIVE-1359: eng-ship downgrade. A builder cannot file a hard-human (tier-2)
   # gate for an eng ship/merge/diff/deploy decision — that class is lead-clearable,
   # not a human call. When a NON-lead filer's decision/approval gate hits the
@@ -11301,7 +11392,36 @@ cmd_task_answer() {
       # No audit_log here: the blocked caller is an agent user that can't write
       # the root-owned audit log anyway (it would only leak a perms error to
       # stderr). The fail + non-zero exit is the record.
-      fail "$E_AUTH_REQUIRED" "$ident is a '$nt' gate — only a human can clear it. Answer it from Telegram (tap the button) or the dashboard; an agent can't self-answer an approval/secret/manual gate."
+      # DIVE-2801: state the CALLER's standing, not a law about the gate type.
+      # "an agent can't self-answer an approval gate" is false — the gate's
+      # lead-clear seat reaches here with _lead_clear=1 and clears it with no
+      # human at all (see the branch above; DIVE-2599/2665/2654 are live
+      # instances). Human-only is the FALL-THROUGH for a caller without that
+      # standing, not the rule for the type. The old wording was read as a
+      # general rule by the agent it refused, who then rebuilt the gate around
+      # it — a refusal that describes the wrong subject sends the reader to fix
+      # the wrong thing, and unlike a wrong answer nobody audits a reason.
+      # ...and the same discipline applies to the REMEDY, one clause later. An
+      # unrouted gate has no lead-clear seat, so "its lead-clear seat can answer
+      # this with no human involved" is, on that gate, the identical defect in
+      # the opposite direction: a sentence true of the type and false of the row
+      # in front of the reader. Only the routed branch may claim a seat exists.
+      # ...and the same discipline again on TIER, which is the third way this
+      # sentence can be true of the type and false of the row. The tier-2 floor
+      # at `gtier == 2 && ! human` sits BELOW this refusal, so the routed
+      # reviewer never reaches it from here — but they hit it on their own
+      # answer, and it ESCALATES them to a human rather than letting them clear.
+      # Telling a tier-2 caller "your routed reviewer can answer this with no
+      # human involved" would therefore recommend a remedy this code refuses,
+      # which is the very defect this row exists to fix, committed inside its
+      # own fix. Only a sub-tier-2 routed gate may claim a seat that can finish.
+      local _who_can="a human — this gate has no routed reviewer, so no seat holds lead-clear standing on it"
+      if [[ -n "$_routed_rev" && "$gtier" == "2" ]]; then
+        _who_can="a human: this gate is routed to '${_routed_rev}', but it is TIER 2, and the tier-2 floor escalates even the routed reviewer's answer to a human tap rather than clearing it"
+      elif [[ -n "$_routed_rev" ]]; then
+        _who_can="'${_routed_rev}', this gate's routed reviewer, who holds lead-clear standing and can answer it with no human involved — or by a human"
+      fi
+      fail "$E_AUTH_REQUIRED" "$ident is a '$nt' gate and you ('${_caller}') do not hold lead-clear standing on it, so your answer is refused. This is about YOUR standing on THIS gate, not a law about '$nt' gates. It can be cleared by ${_who_can}. A human answers from Telegram (tap the button) or the dashboard."
     fi
     # DIVE-2054: routed_reviewer is task-store state for $ident — fenced.
     # DIVE-2099: `standing=` distinguishes the two clearances that reach here.

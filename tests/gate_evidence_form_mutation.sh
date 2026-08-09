@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TIER: core — ~50s measured (dev3, control plane, 2026-08-05, `time bash tests/gate_evidence_form_mutation.sh` -> rc 0, 8 mutants killed). Quote the environment when you replace this number.
+# TIER: nightly — 20.0s measured on ubuntu-latest by the core/installed-host runner itself (run 31292045115, 2026-08-09; the tier report's own top-10 line). The earlier "~50s (dev3, control plane)" figure in this slot was not wrong, it was a different box — quote the environment when you replace this number. Demoted under the mutation-harness rule (DIVE-2867): a mutant-killing grader re-copies the source tree once per mutant, so its cost is arms x tree-copy by construction and does not shrink with tuning. Three of the six *_mutation.sh harnesses were already nightly; this makes the class uniform rather than picking files by size.
 # DIVE-2799 mutation grader for tests/gate_evidence_form_unit.sh.
 #
 # WHY THIS FILE EXISTS. Most of the unit suite asserts a field is PRESENT and

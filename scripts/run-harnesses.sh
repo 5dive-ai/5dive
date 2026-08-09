@@ -627,9 +627,24 @@ elif (( total_ms > EFF_MS )); then
   # DIVE-2592: SAY WHAT THIS RED IS, in the output that carries it. `exit 4` beside a
   # green assertion count cost the author of #395 an hour: it reads as systemic to the
   # person whose PR it stopped and as flake to the next reader, and it is neither.
-  printf 'NO TEST FAILED — %d of %d harnesses passed. This is a BUDGET failure (exit 4), not a\n' \
-    "$(( ${#CORPUS[@]} - ${#failed[@]} ))" "${#CORPUS[@]}"
-  printf 'test failure (exit 1): nothing in your diff is broken, the CORPUS no longer fits its cap.\n'
+  # DIVE-2801: the no-test-failed claim is only true when nothing failed, and this
+  # branch had been asserting it unconditionally — while computing "N of M" from
+  # the very `failed` array that contradicts it. On a run with 2 failures it
+  # printed "NO TEST FAILED — 241 of 243 harnesses passed", which is a verdict the
+  # printer did not compute, in the output whose whole job is to say what this red
+  # IS. Exactly the class this row exists to fix, occurring inside the measurement
+  # of it. Both facts are true at once here and the reader needs both, plus which
+  # exit code wins.
+  if (( ${#failed[@]} == 0 )); then
+    printf 'NO TEST FAILED — %d of %d harnesses passed. This is a BUDGET failure (exit 4), not a\n' \
+      "$(( ${#CORPUS[@]} - ${#failed[@]} ))" "${#CORPUS[@]}"
+    printf 'test failure (exit 1): nothing in your diff is broken, the CORPUS no longer fits its cap.\n'
+  else
+    printf '%d HARNESS(ES) ALSO FAILED — %d of %d passed. This run is BOTH over budget AND red.\n' \
+      "${#failed[@]}" "$(( ${#CORPUS[@]} - ${#failed[@]} ))" "${#CORPUS[@]}"
+    printf 'The FAILURE takes precedence and this run exits 1, not 4: fix the failing harness(es)\n'
+    printf 'first, then re-read the budget — a red run is not a trustworthy timing sample either.\n'
+  fi
   if (( confirmed )); then
     printf 'It was measured TWICE (%ds, then %ds) before this was printed, so it is not variance.\n' \
       "$first_total_s" "$total_s"

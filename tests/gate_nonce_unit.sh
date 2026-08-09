@@ -235,16 +235,29 @@ touch "$GATE_PROOF_ENFORCE"
 FAKE_CALLER="agent-evil"
 seed_task DIVE-800; cmd_task_need DIVE-800 --type=manual --ask="do it" >/dev/null 2>&1
 out=$(cmd_task_answer DIVE-800 --value=done --human 2>&1); rc=$?
-[[ "$(answered DIVE-800)" == "open" && $rc -ne 0 && "$out" == *"only a human"* ]] \
+# DIVE-2801: the refusal must name the CALLER's standing, not claim a property of
+# the gate type. "only a human can clear it" was false — the gate's lead-clear
+# seat clears these with no human at all — and the agent it refused read it as a
+# general rule and rebuilt the gate around it. Assert the mechanism (refused, gate
+# still open) AND that the wording describes the caller, since pinning the old
+# sentence is what made the wrong reason durable.
+[[ "$(answered DIVE-800)" == "open" && $rc -ne 0 && "$out" == *"lead-clear standing"* ]] \
   && ok_t "T8 agent-* immediate caller blocked on manual gate (defense-in-depth)" \
   || bad_t "T8 agent-* caller blocked on manual" "rc=$rc state=$(answered DIVE-800) out=$out"
+[[ "$out" != *"only a human can clear it"* ]] \
+  && ok_t "T8 refusal does not assert a gate-type law it cannot support (DIVE-2801)" \
+  || bad_t "T8 refusal still claims 'only a human can clear it'" "out=$out"
 
 # T8b: the CONTROL. Non-agent caller, everything else identical — must NOT hit
 # the agent refusal. Without this arm T8 grades a message, not a mechanism.
 FAKE_CALLER="root"
 seed_task DIVE-801; cmd_task_need DIVE-801 --type=manual --ask="do it" >/dev/null 2>&1
 out8b=$(cmd_task_answer DIVE-801 --value=done --human 2>&1); rc8b=$?
-[[ "$out8b" != *"only a human can clear it"* ]] \
+# DIVE-2801: keyed on the phrase the refusal ACTUALLY carries now. Left on the old
+# sentence this control would pass for any build — including one where the refusal
+# fires on every caller — because the string it looked for no longer exists
+# anywhere. A control that cannot fail has stopped being a control.
+[[ "$out8b" != *"lead-clear standing"* ]] \
   && ok_t "T8b CONTROL: non-agent caller does NOT hit the agent refusal (rc=$rc8b)" \
   || bad_t "T8b non-agent caller wrongly hit the agent refusal" "rc=$rc8b out=$out8b"
 

@@ -604,7 +604,7 @@ install_channel_plugin_for_agent() {
   # SSH key configured. Explicit https URL sidesteps the shorthand
   # resolver entirely.
   local mkt_repo="https://github.com/anthropics/claude-plugins-official.git"
-  if [[ "$plugin" == "telegram" || "$plugin" == "dashboard" ]]; then
+  if [[ "$plugin" == "telegram" || "$plugin" == "dashboard" || "$plugin" == "buzz" ]]; then
     marketplace="5dive-plugins"
     mkt_repo="https://github.com/$(gh_org)/5dive-plugins.git"
   fi
@@ -1865,6 +1865,12 @@ install_channel_for_agent() {
   if [[ "$plugin" == "dashboard" && "$type" != "claude" ]]; then
     fail "$E_VALIDATION" "channels=dashboard is claude-only (agent '$name' is type $type)"
   fi
+  # DIVE-2895: same for buzz — it is a claude channel plugin (MCP notification
+  # inbound), and the poll-fork runtimes have no Buzz variant. Refuse here so
+  # the failure names the reason, rather than at 5dive-agent-start's dispatch.
+  if [[ "$plugin" == "buzz" && "$type" != "claude" ]]; then
+    fail "$E_VALIDATION" "channels=buzz is claude-only (agent '$name' is type $type)"
+  fi
   case "$type" in
     claude)      install_channel_plugin_for_agent "$plugin" "$name" "$allowed_users" ;;
     codex)       install_channel_for_codex_agent "$plugin" "$name" "$token" "$allowed_users" ;;
@@ -1904,7 +1910,8 @@ reconcile_managed_settings() {
         .channelsEnabled = true
       | .allowedChannelPlugins = ((.allowedChannelPlugins // []) as $have
           | $have + ([{"plugin":"telegram","marketplace":"5dive-plugins"},
-                      {"plugin":"dashboard","marketplace":"5dive-plugins"}]
+                      {"plugin":"dashboard","marketplace":"5dive-plugins"},
+                      {"plugin":"buzz","marketplace":"5dive-plugins"}]
               | map(select(. as $need
                   | ($have | any(.plugin == $need.plugin and .marketplace == $need.marketplace)) | not))))
       ' "$msj" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
