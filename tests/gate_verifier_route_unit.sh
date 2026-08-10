@@ -179,6 +179,86 @@ fixture_actor fixture-runner
   && ok_t "refused reject wrote nothing (status and gate untouched)" \
   || bad_t "refused reject wrote nothing" "status=$(db "SELECT status FROM tasks WHERE ident='DIVE-506';") answered_by=$(db "SELECT need_answered_by FROM tasks WHERE ident='DIVE-506';")"
 
+# ---- 7. DIVE-3117: a PUSH-FOR-REVIEW ask never routes to the row's verifier ----
+# The gate asks for the branch to be pushed; the verifier cannot read the diff until
+# it IS pushed. Every arm below needs the lead and the verifier to be DIFFERENT
+# agents — the fixtures above reuse `main` as both, so an assertion written against
+# them would pass whichever seat the router picked. `grader` is a fixture name, not a
+# fleet seat, and dev's lead stays `main`.
+db "INSERT INTO agents_org(name,reports_to,role) VALUES('grader','main','builder');"
+seed_loop_g() {
+  db "INSERT INTO tasks(ident,title,status,created_by,assignee,verifier,maker_agent,iteration,max_iterations)
+      VALUES('$1','${2:-loop task}','todo','dev','dev','grader','dev',1,5);"
+}
+PUSH_ASK='approve delegated push for review of branch dive-3117-pfr-lead-route'
+
+route_reset; seed_loop_g DIVE-3117; fixture_actor dev
+cmd_task_need DIVE-3117 --type=approval --ask="$PUSH_ASK" --from=dev >/dev/null 2>&1
+rr=$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-3117';")
+[[ "$(route_last)" == "main" && "$rr" == "main" ]] \
+  && ok_t "push-for-review approval routes to the LEAD, not the verifier" \
+  || bad_t "push-for-review approval routes to the LEAD, not the verifier" "route_last=$(route_last) routed_reviewer=$rr human=$HUMAN_PINGED"
+# The invariant stated on the ticket, asserted directly and in BOTH directions: a
+# push-for-review ask must produce a routed_reviewer that is NEITHER empty (the
+# DIVE-2629 failure — no agent can clear it) NOR the verifier (this one — the single
+# agent who cannot answer it). The two have opposite causes, so an arm covering one
+# is not evidence about the other.
+[[ -n "$rr" && "$rr" != "grader" ]] \
+  && ok_t "routed_reviewer is neither empty nor the verifier" \
+  || bad_t "routed_reviewer is neither empty nor the verifier" "routed_reviewer='$rr' verifier=grader"
+
+# 7b. NEGATIVE ARM (the ticket names it): a push-for-review ask on a row with NO
+# verifier keeps its current routing. It must reach the lead by the SAME eng-ship
+# path, so the loop's existence is not an input to routing in either direction.
+route_reset; fixture_actor dev
+db "INSERT INTO tasks(ident,title,status,created_by,assignee) VALUES('DIVE-3118','plain task','todo','dev','dev');"
+cmd_task_need DIVE-3118 --type=approval --ask="$PUSH_ASK" --from=dev >/dev/null 2>&1
+rr_nl=$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-3118';")
+[[ "$(route_last)" == "main" && "$rr_nl" == "main" ]] \
+  && ok_t "no-verifier row keeps its lead routing (fix is not conditional on the loop)" \
+  || bad_t "no-verifier row keeps its lead routing" "route_last=$(route_last) routed_reviewer=$rr_nl human=$HUMAN_PINGED"
+
+# 7c. NEGATIVE CONTROL: verifier-routing is SUPPRESSED for one ask class, not
+# disabled. A non-push question on the same loop shape still reaches the verifier —
+# without this arm, deleting the DIVE-1495 route entirely would pass 7 and 7b.
+route_reset; seed_loop_g DIVE-3119; fixture_actor dev
+cmd_task_need DIVE-3119 --type=decision --options='A|B' --recommend='A' \
+  --ask='Which schema for the field?' --from=dev >/dev/null 2>&1
+[[ "$(route_last)" == "grader" ]] \
+  && ok_t "a non-push gate on the same loop still routes to the verifier" \
+  || bad_t "a non-push gate on the same loop still routes to the verifier" "route_last=$(route_last)"
+
+# 7d. NEGATIVE CONTROL (DIVE-2224): the classifier reads the ASK, never the TITLE.
+# This ticket's own title contains 'push-for-review'; a title-reading classifier
+# would strip the verifier off every genuine question filed on it.
+route_reset; fixture_actor dev
+seed_loop_g DIVE-3120 'push-for-review gate routes to the loop VERIFIER'
+cmd_task_need DIVE-3120 --type=decision --options='A|B' --recommend='A' \
+  --ask='Which schema for the field?' --from=dev >/dev/null 2>&1
+[[ "$(route_last)" == "grader" ]] \
+  && ok_t "a push-for-review TITLE does not lead-route a non-push ask" \
+  || bad_t "a push-for-review TITLE does not lead-route a non-push ask" "route_last=$(route_last)"
+
+# 7e. NEGATIVE CONTROL: NOT-INERT pushes are unchanged. `_gate_push_for_review_hit`
+# fails closed, so "push … then merge to main" is not an inert push-for-review and
+# keeps the DIVE-1495 route — the same narrowing DIVE-2629 made on the tier axis.
+route_reset; seed_loop_g DIVE-3121; fixture_actor dev
+cmd_task_need DIVE-3121 --type=approval \
+  --ask='push branch dive-3117-pfr-lead-route for review, then merge to main' --from=dev >/dev/null 2>&1
+[[ "$(route_last)" == "grader" ]] \
+  && ok_t "a not-inert push (merge to main named) keeps the verifier route" \
+  || bad_t "a not-inert push (merge to main named) keeps the verifier route" "route_last=$(route_last)"
+
+# 7f. The tier-2 human floor still wins over the whole class: a push ask that also
+# names a spend stays with the human and reaches NO agent, verifier or lead.
+route_reset; seed_loop_g DIVE-3122; fixture_actor dev
+cmd_task_need DIVE-3122 --type=approval \
+  --ask='approve delegated push for review of branch dive-3117-x and the $900 runner spend' --from=dev >/dev/null 2>&1
+[[ "$HUMAN_PINGED" == "1" && "$(route_sent)" == "0" ]] \
+  && ok_t "a push ask naming a spend stays human (T2 floor outranks the class)" \
+  || bad_t "a push ask naming a spend stays human" "human=$HUMAN_PINGED sent=$(route_sent) routed=$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-3122';")"
+fixture_actor fixture-runner
+
 echo "-----"
 echo "gate_verifier_route_unit: $PASS passed, $FAIL failed"
 SUMMARY_PRINTED=1

@@ -8633,7 +8633,7 @@ cmd_task_need() {
         "tapbacks=${_rs_taps}/${_rs_tot}" "reason=tier-2 with a recommendation and no declared capability" || true
       fail "$E_VALIDATION" "$ident: refusing this --tier=2 ${type} gate. You wrote --recommend=\"${recommend}\", which means you have already decided — what is left is asking a person to agree, and that is reassurance, not a gate. (Measured 2026-07-16..08-07: 96 of 107 judgment gates carrying a recommendation came back as the human tapping that same value. Only 7 gates in 346 were floored by category; the rest of tier 2 was typed by hand.) A tier is a CAPABILITY, not a difficulty. Your exits:
   --tier=0    apply \"${recommend}\" NOW. No ping, and still a permanent gate record plus a digest line. This is the exit you want on a decision you have already made — it was used 0 times in the 346 gates measured, which is a discoverability failure, not a missing feature.
-  --tier=1    route to your lead, or to this task's verifier if it carries a loop; the 48h TTL applies your recommendation if nobody answers. Use it when you want a second pair of eyes, not a person's authority.
+  --tier=1    route to your lead, or to this task's verifier if it carries a loop — except a push-for-review ask, which goes to the LEAD even on a loop, because the verifier cannot read the diff until it is pushed (DIVE-3117); the 48h TTL applies your recommendation if nobody answers. Use it when you want a second pair of eyes, not a person's authority.
   --needs=human_tap|spend_authority|secret_provision    DECLARE the human-held capability this ask consumes (a person's call on brand/strategy, money, or a credential only a human can issue). Tier 2 by declaration, never refused here.
   --rubber-stamp-ok=\"<why a person must answer this despite your recommendation>\"    the audited exception. Recorded on the gate row and readable afterwards.
 If you cannot name the capability, this is a decision you find uncomfortable, not a human gate."
@@ -8992,7 +8992,43 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
     tier=2; tier_floored=1
   fi
 
-  local _verifier_route=0 _route_target=""
+  # DIVE-3117: THE ONE GATE CLASS WHERE THE VERIFIER-ROUTE DEFAULT INVERTS ITSELF.
+  #
+  # A push-for-review ask asks for the branch to be pushed. On a maker→verifier row
+  # the DIVE-1495 route above hands that gate to the VERIFIER — i.e. it asks the
+  # grader to authorise the push that is the only way the grader can read the diff.
+  # quinn stated it exactly on DIVE-2183: cannot approve a push before reading the
+  # diff, cannot read the diff until it is pushed. Measured FOUR times on
+  # 2026-08-09/10 (DIVE-3113, DIVE-2130, DIVE-2183, DIVE-2192), every one blocking a
+  # real push, every one cleared by hand from the root seat.
+  #
+  # THE TEST AT THE KEYSTROKE: if this gate clears, does the answerer GAIN the thing
+  # they needed in order to answer it? If yes, it is a cycle. Route it to the lead —
+  # the one seat that can authorise the push and is not the party blocked by it. The
+  # verifier still grades the work afterwards; that is `task reject`/`accept`, a
+  # different surface, and it is untouched here.
+  #
+  # WHY THIS IS A FLOOR ON THE ROUTING AXIS AND NOT A ROUTER REWRITE (main's framing,
+  # and it is the sharper one). The TIER machinery is correct — DIVE-2629 already put
+  # a floor on the tier axis of this exact gate class (branch names stop forcing T2)
+  # and it produced tier 1 on all four instances. What was missing is the SIBLING
+  # floor, on routing: `floor_provenance=axis=none` on all four, i.e. nothing
+  # engaged. DIVE-2629 left routed_reviewer EMPTY (no agent can clear it); this left
+  # it equal to the GRADER (the one agent who cannot answer it). Same symptom, and a
+  # tier-axis fix cannot reach the second case — which is why 2629 shipping did not
+  # prevent four occurrences of 3117 in one day.
+  #
+  # THE ASK ONLY, never the title (DIVE-2224). A title is written at ticket-creation
+  # time to describe a DEFECT; only the ask can be a REQUEST. This very ticket is
+  # titled "push-for-review gate routes to the loop VERIFIER…", so a title-reading
+  # classifier would strip the verifier off every genuine question filed on it. The
+  # negative control is graded in tests/gate_verifier_route_unit.sh.
+  #
+  # `_gate_push_for_review_hit` fails closed and is the SAME predicate DIVE-2629's
+  # tier floor uses, so the two axes cannot disagree about what an inert push is: a
+  # push ask that also names a merge/deploy/land-to-main is NOT inert, keeps its
+  # existing routing, and keeps flooring on its subject matter.
+  local _verifier_route=0 _route_target="" _pfr_lead_route=0
   if [[ ( "$type" == "decision" || "$type" == "approval" ) && "$tier" != "2" ]]; then
     local _vf; _vf=$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${id};")
     if [[ -n "$_vf" && "$_vf" != "$actor" ]]; then
@@ -9003,7 +9039,13 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
             (SELECT COALESCE(maker_agent,'') FROM tasks WHERE id=${id}) <> ''
             OR EXISTS(SELECT 1 FROM agents_org WHERE name=$(sqlq "$_vf"))
           THEN 1 ELSE 0 END;")
-      [[ "$_vf_is_agent" == "1" ]] && { _verifier_route=1; _route_target="$_vf"; }
+      if [[ "$_vf_is_agent" == "1" ]]; then
+        if _gate_push_for_review_hit "$ask"; then
+          _pfr_lead_route=1
+        else
+          _verifier_route=1; _route_target="$_vf"
+        fi
+      fi
     fi
   fi
   local _routable=0
@@ -9042,6 +9084,16 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
   [[ "$_discusses_applied" == "1" ]] && _routable=1
   # DIVE-1495: a verifier-route gate is routable by kind (to the verifier agent).
   [[ "$_verifier_route" == "1" ]] && _routable=1
+  # DIVE-3117: there is deliberately NO `_pfr_lead_route && _routable=1` line here.
+  # Suppressing the verifier route is the WHOLE change: the gate then takes the
+  # SAME path a push-for-review gate on a row with no loop already takes (eng-ship
+  # by kind, or the pref), so the loop's existence stops being an input to routing
+  # rather than becoming a second input pointing the other way. That is what the
+  # ticket's negative arm asks for, and it is why a no-verifier row keeps its
+  # routing byte-for-byte. Adding a line here would give a looped row a route a
+  # non-looped one does not have — the eng-ship guards (a resolvable lead, no true-
+  # human floor) would be crossed only in the one case that happened to be measured.
+  # Graded both ways in tests/gate_verifier_route_unit.sh.
   # DIVE-1957: backstop — an EXPLICIT --tier=2 is the caller's hard-human contract
   # and no KIND-based override may cross it, so the DIVE-1145 promise ("we never
   # route a tier-2 gate, floored OR filed with an explicit --tier=2") holds by
@@ -9066,6 +9118,24 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
       "$( ((_needs_human)) && echo human-class || echo unrecognised )" 0 -- \
       "task=$ident" "type=$type" "declared=$needs" "filer=$actor" \
       "resolved=$( ((_needs_human)) && echo human || echo unchanged )" || true
+  fi
+  # DIVE-3117: record the suppression AT THE MOMENT IT HAPPENS, with the verifier it
+  # would have gone to. The four measured instances were only findable because each
+  # left a row naming its routed_reviewer; a fix that silently stops writing that
+  # name leaves the next regression with nothing to count. `routed=` says where it
+  # went INSTEAD — which is the pre-existing lead/human path, not a new one, so an
+  # empty value here is the honest "no lead resolved, this fell through to the
+  # human" and is exactly the state the DIVE-2004 warn below is about to explain.
+  # DIVE-2054: task-store state for $ident, no channel proof — fenced.
+  if [[ "$_pfr_lead_route" == "1" ]]; then
+    # Split rather than `[[ … ]] && x=$(f)`: an assignment's rc is its last command
+    # substitution's, and _gate_route_reviewer returns non-zero when it resolves
+    # nobody — the DIVE-2751 shape, absorbed here instead of argued about.
+    local _pfr_dest=""
+    if [[ "$_routable" == "1" ]]; then _pfr_dest=$(_gate_route_reviewer "$(task_actor "")") || _pfr_dest=""; fi
+    _task_store_audit_log "task need push-for-review verifier-route suppressed" ok 0 -- \
+      "task=$ident" "type=$type" "filer=$actor" "verifier=${_vf-}" \
+      "routed=${_pfr_dest:-human}" || true
   fi
   if [[ "$_routable" == "1" ]]; then
     # DIVE-1243: `access` routing is intrinsic to the TYPE, so it does NOT wait on
