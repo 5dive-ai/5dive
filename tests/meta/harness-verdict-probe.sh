@@ -242,8 +242,27 @@ if [[ " $ALLOW_UNPROBEABLE " == *" $b "* ]]; then ALLOWED+=("$b"); else UNPROBEA
   # real, and it was 18 harnesses: reported "probed in an environment where it
   # runs" while no environment ever could. Before it, `set -e` harnesses were
   # structurally unprobeable and the check was green about it.
-  # DIVE-3149: file first, stderr second — both BEFORE the mutation, both cheap.
-  awk -v n="$ln" -v inj="$inject" 'NR==n{print "printf 1 > \"$_PROBE_CANARY_FILE\""; print "printf \x27__PROBE_REACHED__\\n\x27 >&2"; print inj} {print}' "$t" > "$mutant"
+  # DIVE-3149 FOLLOW-UP: TWO CHANNELS IN SERIES ARE NOT REDUNDANT. The first cut of
+  # this shipped `printf 1 > "$_PROBE_CANARY_FILE"` FIRST and the stderr canary second,
+  # and regressed six harnesses (the constitution/council family) into not-reached,
+  # refusing the cut a second time. constitution_set_e2e.sh:41 re-execs itself through
+  # `exec sudo -n env PATH="$PATH" bash "$0"`; sudo's env_reset scrubs the environment,
+  # so _PROBE_CANARY_FILE arrived UNSET, and under that harness's `set -u` the injected
+  # line was a FATAL unbound variable that killed the shell ON THAT LINE — so the stderr
+  # canary, sitting one line below, never ran either. The family never had to touch
+  # stderr; the redundant channel was suppressed by its own partner.
+  #
+  # Three properties now, and each is load-bearing on its own:
+  #   1. THE PATH IS A BAKED-IN LITERAL, not an env reference. Nothing has to survive a
+  #      sudo hop, an `env -i`, an `unset`, or a re-exec — the value is fixed when the
+  #      mutant is WRITTEN, not read when it runs. This is what actually closes the class.
+  #   2. STDERR GOES FIRST, because it needs no environment and no filesystem.
+  #   3. NEITHER LINE MAY BE FATAL (`|| :`). A canary that can abort the harness is a
+  #      canary that can manufacture the very not-reached it exists to disprove, and
+  #      under `set -e` or `set -u` an unguarded one does exactly that.
+  # Both still precede the injected mutation, preserving DIVE-2018.
+  awk -v n="$ln" -v inj="$inject" -v cf="$_PROBE_CANARY_FILE" \
+    'NR==n{print "printf \x27__PROBE_REACHED__\\n\x27 >&2 || :"; print "printf 1 > \"" cf "\" 2>/dev/null || :"; print inj} {print}' "$t" > "$mutant"
   # Removed BETWEEN harnesses, so a stale file can never certify the next one.
   rm -f "$_PROBE_CANARY_FILE"
   # The stderr capture is unchanged and still discards the mutant's stdout: it keeps
