@@ -84,6 +84,21 @@ HUMAN_PINGED=0
 # notify path ran. The routed rail runs for real against the `5dive` stub.
 _task_need_notify_deliver() { HUMAN_PINGED=1; }
 audit_log() { :; }
+# DIVE-3117 (quinn, iteration 2): the suppression audit row is not merely unasserted,
+# it is structurally UNOBSERVABLE from the sink side. `_task_store_audit_log` is fenced
+# behind `_task_human_send_allowed` (DIVE-2010), so against an isolated fixture TASKS_DB
+# it writes NOTHING and warns once — "assert the row landed" cannot be made to work here,
+# and a harness that queried the store would grade the fence, not the caller. So grade the
+# CALL SITE with a spy. What a future refactor would silently drop is the call and its
+# arguments, and that is exactly what this records.
+SUPPRESS_LOG="$TMP/suppress.log"; : >"$SUPPRESS_LOG"
+_task_store_audit_log() { printf '%s\n' "$*" >>"$SUPPRESS_LOG"; return 0; }
+suppress_reset() { : >"$SUPPRESS_LOG"; }
+# `grep -c` PRINTS 0 and EXITS 1 on no match, so a `|| echo 0` fallback appends a
+# SECOND line and the count becomes "0\n0" — which compares equal to neither 0 nor 1.
+# Caught by the zero-match arm below; the one-match arm was green throughout.
+suppress_n()     { local n; n=$(grep -c 'verifier-route suppressed' "$SUPPRESS_LOG" 2>/dev/null); printf '%s' "${n:-0}"; }
+suppress_last()  { grep 'verifier-route suppressed' "$SUPPRESS_LOG" 2>/dev/null | tail -n1; }
 ROUTE_FILE="$TMP/route.log"
 5dive() { if [[ "${1:-}" == "agent" && "${2:-}" == "send" ]]; then printf '%s\n' "${3:-}" >>"$ROUTE_FILE"; fi; return 0; }
 export -f 5dive 2>/dev/null || true
@@ -192,7 +207,7 @@ seed_loop_g() {
 }
 PUSH_ASK='approve delegated push for review of branch dive-3117-pfr-lead-route'
 
-route_reset; seed_loop_g DIVE-3117; fixture_actor dev
+route_reset; suppress_reset; seed_loop_g DIVE-3117; fixture_actor dev
 cmd_task_need DIVE-3117 --type=approval --ask="$PUSH_ASK" --from=dev >/dev/null 2>&1
 rr=$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-3117';")
 [[ "$(route_last)" == "main" && "$rr" == "main" ]] \
@@ -206,6 +221,14 @@ rr=$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-3117';
 [[ -n "$rr" && "$rr" != "grader" ]] \
   && ok_t "routed_reviewer is neither empty nor the verifier" \
   || bad_t "routed_reviewer is neither empty nor the verifier" "routed_reviewer='$rr' verifier=grader"
+# The suppression is the ONLY trace a future regression could be counted from — the
+# four measured instances were findable only because each row named its
+# routed_reviewer, and after the fix no row does. Assert the call fires once and
+# carries the verifier it did NOT go to plus where it went INSTEAD.
+sup=$(suppress_last)
+[[ "$(suppress_n)" == "1" && "$sup" == *"verifier=grader"* && "$sup" == *"routed=main"* && "$sup" == *"task=DIVE-3117"* ]] \
+  && ok_t "suppression audit row fires once, naming the verifier it did NOT go to and where it went" \
+  || bad_t "suppression audit row missing or malformed" "n=$(suppress_n) last='$sup'"
 
 # 7b. NEGATIVE ARM (the ticket names it): a push-for-review ask on a row with NO
 # verifier keeps its current routing. It must reach the lead by the SAME eng-ship
@@ -221,9 +244,12 @@ rr_nl=$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-311
 # 7c. NEGATIVE CONTROL: verifier-routing is SUPPRESSED for one ask class, not
 # disabled. A non-push question on the same loop shape still reaches the verifier —
 # without this arm, deleting the DIVE-1495 route entirely would pass 7 and 7b.
-route_reset; seed_loop_g DIVE-3119; fixture_actor dev
+route_reset; suppress_reset; seed_loop_g DIVE-3119; fixture_actor dev
 cmd_task_need DIVE-3119 --type=decision --options='A|B' --recommend='A' \
   --ask='Which schema for the field?' --from=dev >/dev/null 2>&1
+[[ "$(suppress_n)" == "0" ]] \
+  && ok_t "NEGATIVE: no suppression row when the verifier route actually fires" \
+  || bad_t "suppression row emitted on a gate that WAS verifier-routed" "n=$(suppress_n) last=$(suppress_last)"
 [[ "$(route_last)" == "grader" ]] \
   && ok_t "a non-push gate on the same loop still routes to the verifier" \
   || bad_t "a non-push gate on the same loop still routes to the verifier" "route_last=$(route_last)"
