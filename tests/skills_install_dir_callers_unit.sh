@@ -35,8 +35,8 @@ bad_t() { fail=$((fail + 1)); printf '  FAIL %s%s\n' "$1" "${2:+ — $2}"; }
 # executable read. Comments that document the map are not reads, so match the
 # parameter expansion itself. Exactly one is allowed, in the resolver body.
 mapfile -t direct_reads < <(
-  rg -n '\$\{SKILLS_INSTALL_DIR\[' "$SRC" \
-    | rg -v '^[^:]+:[0-9]+:[[:space:]]*#'
+  grep -RInF -- '${SKILLS_INSTALL_DIR[' "$SRC" \
+    | awk -F: '$3 !~ /^[[:space:]]*#/'
 )
 if [[ ${#direct_reads[@]} -eq 1 && "${direct_reads[0]}" == src/header.sh:* ]]; then
   ok_t 'skills_install_dir owns the only executable SKILLS_INSTALL_DIR read in src/'
