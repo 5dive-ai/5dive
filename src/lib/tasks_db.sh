@@ -238,6 +238,17 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- Declared HERE as well as in _TASKS_ADDITIVE_COLUMNS: a fresh store takes this
   -- CREATE, and the migration gate must find this column before it may skip.
   floor_provenance TEXT,
+  -- DIVE-2354: WHICH of the two orders this gate is in, as data.
+  --   approve-to-send   the action has NOT happened; the tap authorises it (default).
+  --   confirm-after-send the action ALREADY happened; the tap RATIFIES it after the fact.
+  -- NULL is a real third state and not a synonym for either: it means the gate was
+  -- filed before this column existed, so the record does not say which order it was
+  -- (the same distinction as unreadable-vs-absent, DIVE-2327). Readers must render
+  -- the three apart -- a ratification that renders as a prior approval is the exact
+  -- false record this ticket exists to end. Declared HERE as well as in
+  -- _TASKS_ADDITIVE_COLUMNS: a fresh store takes this CREATE and never runs the
+  -- ALTER loop, per the rule above.
+  gate_mode TEXT,
   parent_id   INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   started_at  TEXT,
@@ -303,6 +314,18 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- DIVE-1518: independently records which authenticated evidence form cleared
   -- the current gate (tap nonce, sudo uid, channel session, or proof).
   human_evidence   TEXT,
+  -- DIVE-3128: the RELAY, kept OUT of need_answered_by rather than folded into
+  -- it. A Telegram button tap reaches this CLI through some agent's bot, and
+  -- until now the relaying agent's own identity was what got the `human:`
+  -- prefix — so `human:olivia` meant either "a person tapped, olivia's bot
+  -- carried it" or "the olivia agent cleared its own human gate", with nothing
+  -- in the row to tell them apart (DIVE-3045). Two columns, two facts:
+  --   need_answered_by     WHO decided
+  --   need_answered_relay  WHOSE BOT carried the decision
+  -- need_answered_tap_uid is the Telegram user id of the person who tapped, kept
+  -- as TEXT because Telegram ids are opaque identifiers, not arithmetic.
+  need_answered_relay   TEXT,
+  need_answered_tap_uid TEXT,
   -- Recurring task templates (DIVE step 1). kind='recurring' marks a row as a
   -- TEMPLATE, not work: it's excluded from the work board, the heartbeat TODO
   -- count + wake, and the human inbox, so it's never picked up directly.
@@ -743,7 +766,8 @@ CREATE TABLE IF NOT EXISTS gate_history (
   human_nonce_hash  TEXT,
   retired_by        TEXT NOT NULL,
   retired_at        TEXT NOT NULL DEFAULT (datetime('now')),
-  floor_provenance  TEXT
+  floor_provenance  TEXT,
+  gate_mode         TEXT
 );
 CREATE INDEX IF NOT EXISTS gate_history_task_idx ON gate_history(task_id, id);
 
@@ -1174,10 +1198,15 @@ _TASKS_ADDITIVE_COLUMNS=(
   'originated_by_objective INTEGER' 'originated_cycle INTEGER'
   'verify_unavailable INTEGER' 'last_skipped_at TEXT'
   'human_evidence TEXT' 'derived_actor TEXT' 'floor_provenance TEXT'
+  # DIVE-3128: the tapping human vs the relaying bot, separated. See the CREATE
+  # TABLE comment above for why folding them into one string was the defect.
+  'need_answered_relay TEXT' 'need_answered_tap_uid TEXT'
   # DIVE-3098: a verifier grade recorded by `task verify --no-done`. Structural on
   # purpose — the terminal-for-verifier predicate must not key on result TEXT,
   # which the MAKER's `task deliver --result=` also writes.
   'graded_at TEXT' 'graded_by TEXT'
+  # DIVE-2354: approve-to-send | confirm-after-send. See the CREATE TABLE comment.
+  'gate_mode TEXT'
 )
 
 # DIVE-3098 - TERMINAL FOR THE VERIFIER, as ONE SQL boolean expression.
@@ -1610,7 +1639,8 @@ CREATE TABLE IF NOT EXISTS gate_history (
   human_nonce_hash  TEXT,
   retired_by        TEXT NOT NULL,
   retired_at        TEXT NOT NULL DEFAULT (datetime('now')),
-  floor_provenance  TEXT
+  floor_provenance  TEXT,
+  gate_mode         TEXT
 );
 CREATE INDEX IF NOT EXISTS gate_history_task_idx ON gate_history(task_id, id);
 MIG
@@ -1625,6 +1655,17 @@ MIG
   # already carries `floor_provenance TEXT`, added out-of-band by something that
   # left no trace in this repo — the column existed with no writer, no migration
   # and no reference in src/ or tests/, which is why it read NULL on all 79 rows.
+  # DIVE-2354: additive gate_mode on an ALREADY-CREATED gate_history, for the same
+  # reason floor_provenance needs one directly below -- the create-if-absent block
+  # above reaches only stores that have never filed a gate.
+  local has_gh_gatemode
+  has_gh_gatemode=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM pragma_table_info('gate_history') WHERE name='gate_mode' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_gh_gatemode" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+      "ALTER TABLE gate_history ADD COLUMN gate_mode TEXT;" >/dev/null 2>&1 || true
+  fi
+
   local has_gh_floorprov
   has_gh_floorprov=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
     "SELECT 1 FROM pragma_table_info('gate_history') WHERE name='floor_provenance' LIMIT 1;" 2>/dev/null)
@@ -2175,11 +2216,11 @@ _gate_archive_and_clear_sql() {
     "INSERT INTO gate_history (task_id, ident, need_type, ask, need_options, recommend," \
     "                          tier, need_asked_at, need_answer, need_answered_at," \
     "                          need_answered_by, need_answered_uid, need_answer_sig," \
-    "                          human_nonce_hash, retired_by, floor_provenance)" \
+    "                          human_nonce_hash, retired_by, floor_provenance, gate_mode)" \
     "  SELECT id, ident, need_type, ask, need_options, recommend," \
     "         tier, need_asked_at, need_answer, need_answered_at," \
     "         need_answered_by, need_answered_uid, need_answer_sig," \
-    "         human_nonce_hash, $(sqlq "$verb"), floor_provenance" \
+    "         human_nonce_hash, $(sqlq "$verb"), floor_provenance, gate_mode" \
     "    FROM tasks" \
     "   WHERE (${pred})" \
     "     AND (need_type IS NOT NULL OR need_answer IS NOT NULL" \

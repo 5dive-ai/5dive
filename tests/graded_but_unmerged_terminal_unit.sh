@@ -57,7 +57,17 @@ bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 addt()  { ( cmd_task_add "$@" ) 2>/dev/null | jq -r '.data.id'; }
 
 ME=$(task_actor "")     # this harness's actor == the VERIFIER in every fixture
-MAKER="dev"             # deliberately NOT $ME, so graded_by <> maker_agent holds
+# MAKER must never equal $ME. It was hardcoded "dev", which is a REAL agent on this
+# fleet: run by agent-dev, ME=="dev"=="$MAKER", `task add` correctly refuses
+# assignee==verifier (a maker cannot grade itself), EVERY fixture failed to create,
+# and the harness reported a wall of red that reads as a product regression. It was
+# green for every other seat, so it looked tree-related and got blamed on main.
+# A reserved fake cannot collide with any actor, present or future, and is what
+# projects/5dive/CLAUDE.md already requires of fixtures. Asserted, not assumed:
+# a future rename that reintroduces the collision must fail loudly here, not silently
+# stop creating rows.
+MAKER="fixturemaker"
+[[ "$MAKER" != "$ME" ]] || { printf 'FATAL: fixture maker (%s) == this harness actor (%s); every row would be refused as assignee==verifier. Pick a MAKER no real agent can be named.\n' "$MAKER" "$ME" >&2; exit 1; }
 
 # mkrow <mode> — build one delivered maker->verifier row, aged past the nudge
 # window, then apply the mode. Modes are the four populations the predicate must

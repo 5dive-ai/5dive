@@ -363,6 +363,19 @@ Full docs: https://5dive.ai/docs/5dive-cli
 USAGE
 }
 
+# _five_is_passthrough_verb <verb> — 0 when the verb hands its remaining argv to
+# ANOTHER program verbatim, so 5dive's own global flags must stop being parsed at
+# it (DIVE-3135). Kept as a named list rather than a heuristic: adding a verb here
+# is a deliberate statement that its tail belongs to someone else, and getting it
+# wrong in the permissive direction would silently disable `--json` for a verb
+# that implements it.
+_five_is_passthrough_verb() {
+  case "${1:-}" in
+    gh) return 0 ;;
+    *)  return 1 ;;
+  esac
+}
+
 main() {
   # DIVE-2249: mark that this process entered through the real CLI entrypoint.
   # The tasks-store fence (src/lib/tasks_db.sh) allows writes to the PRODUCTION
@@ -378,12 +391,29 @@ main() {
 
   # Global --json: strip every occurrence before dispatch so each subcommand
   # gets the same arg shape regardless of where the flag was placed.
+  #
+  # EXCEPT after a PASSTHROUGH verb (DIVE-3135). `5dive gh` documents
+  # `<gh args...>` and hands them to another tool, so a flag after it is that
+  # tool's, not ours. Stripping `--json` out of `gh pr view 51 --json state` left
+  # `state` behind as a stray positional and gh's own parser answered "accepts at
+  # most 1 arg(s), received 2" — public issues #526 and #553, and the reason a
+  # credential-less seat could not read a PR at all. A passthrough verb therefore
+  # ENDS global flag parsing, the same way `--` does. `5dive --json gh ...` still
+  # works: the flag is before the verb, which is where a 5dive-level flag belongs.
   local -a rest=()
-  local a
+  local a passthrough=0 seen_verb=0
   for a in "$@"; do
+    if (( passthrough )); then rest+=("$a"); continue; fi
     if [[ "$a" == "--json" ]]; then
       JSON_MODE=1
       continue
+    fi
+    # The first token that is not a global flag IS the verb — test it once, so a
+    # later argument that merely spells `gh` (`5dive task add "fix gh routing"`)
+    # cannot turn global parsing off midway.
+    if (( ! seen_verb )); then
+      seen_verb=1
+      _five_is_passthrough_verb "$a" && passthrough=1
     fi
     rest+=("$a")
   done
