@@ -51,11 +51,28 @@ else
   echo; echo "$PASS passed, $FAIL failed"; exit 1
 fi
 
+# The predicate DERIVES its payload paths from the installer's own per-type maps, so
+# the harness must supply the real ones or it would grade a .claude-only fallback and
+# reproduce the blind spot it exists to catch. Extracted VERBATIM from src/header.sh
+# for the same reason the function block is: a map restated here could drift from the
+# map the installer actually writes through, and the drift would be invisible.
+maps="$(sed -n '/^declare -A SKILLS_INSTALL_DIR=(/,/^)$/p; /^declare -A TYPE_PERSONA_FILE=(/,/^)$/p' \
+  src/header.sh)"
+if grep -q 'SKILLS_INSTALL_DIR=(' <<<"$maps" && grep -q 'TYPE_PERSONA_FILE=(' <<<"$maps" \
+   && grep -q '\.agents/skills' <<<"$maps" && grep -q '\.codex/AGENTS\.md' <<<"$maps"; then
+  ok_t "per-type payload maps are extractable from src/header.sh (non-.claude paths present)"
+else
+  bad_t "per-type payload maps missing" \
+        "SKILLS_INSTALL_DIR / TYPE_PERSONA_FILE not extractable — the derived-path arms below would grade a .claude-only fallback and pass vacuously"
+  echo; echo "$PASS passed, $FAIL failed"; exit 1
+fi
+
 WORK="$(mktemp -d)"
 
 # fp <home> <lib> -> the fingerprint, running the SHIPPED bytes.
 fp() {
   bash -c "set -uo pipefail
+$maps
 $block
 _agent_payload_fingerprint \"\$1\" \"\$2\"" _ "$1" "$2"
 }
@@ -68,7 +85,15 @@ _agent_home \"\$1\"" _ "$1"
 # ---- a populated agent home + shared lib, the shape a real box has ----------
 H="$WORK/home/agent-fixture"
 L="$WORK/lib"
-mkdir -p "$H/.claude/plugins" "$H/.claude/skills/demo" "$L/skills/notify-user"
+# MIXED ON PURPOSE. creative and marketing are real, live examples of a type=claude
+# agent that carries BOTH .claude/skills and .agents/skills (measured 2026-08-10:
+# creative 15/7, marketing 3/8). A fix that merely swaps one literal for another
+# passes an .agents-only fixture and breaks exactly this case, so the primary home
+# is mixed and the .agents-only shape is graded separately below.
+mkdir -p "$H/.claude/plugins" "$H/.claude/skills/demo" "$H/.agents/skills/agentsdemo" \
+         "$H/.codex" "$L/skills/notify-user"
+printf 'agents-dir skill body\n'                  > "$H/.agents/skills/agentsdemo/SKILL.md"
+printf '# codex agent rules\n'                    > "$H/.codex/AGENTS.md"
 printf '{"plugins":{"telegram@5dive":"0.4.1"}}\n' > "$H/.claude/plugins/installed_plugins.json"
 printf 'model: opus\n'                            > "$H/.claude/settings.json"
 printf '# agent rules\n'                          > "$H/.claude/CLAUDE.md"
@@ -138,6 +163,61 @@ assert_moves "an edit to the agent's CLAUDE.md" \
   bash -c 'printf "# agent rules v2\n" > "$1"' _ "$H/.claude/CLAUDE.md"
 assert_moves "an edit to the agent's settings.json" \
   bash -c 'printf "model: sonnet\n" > "$1"' _ "$H/.claude/settings.json"
+
+# ---- DERIVED PATHS: the defect the .claude-only fixture could not see ------
+# The predicate used to hash ".claude/skills" and ".claude/CLAUDE.md" as literals.
+# Skills and the instructions doc are resolved PER TYPE (SKILLS_INSTALL_DIR /
+# TYPE_PERSONA_FILE), so for every non-claude type it watched the wrong directory
+# and those agents compared EQUAL forever — skipped every night, silently, which is
+# the FALSE SAME failure this file's header calls the worse of the two.
+# MEASURED on the fleet 2026-08-10: andy 2, codex 5, ocqa 2 skill dirs under
+# .agents/skills with ZERO under .claude/skills; 5 of 13 running agents affected.
+# These arms run against the MIXED home above — a .claude-shaped payload is present
+# and unchanged throughout, so a fix that swapped one literal for another fails here.
+assert_moves "a skill change under .agents/skills, in a home that ALSO has .claude/skills" \
+  bash -c 'printf "agents-dir skill v2\n" > "$1"' _ "$H/.agents/skills/agentsdemo/SKILL.md"
+assert_moves "a NEW skill appearing under .agents/skills (mixed home)" \
+  bash -c 'mkdir -p "$(dirname "$1")" && printf "new\n" > "$1"' _ "$H/.agents/skills/added/SKILL.md"
+assert_moves "a skill being REMOVED from .agents/skills (mixed home)" \
+  rm -rf "$H/.agents/skills/added"
+assert_moves "an edit to a codex agent's .codex/AGENTS.md (the CLAUDE.md analogue)" \
+  bash -c 'printf "# codex agent rules v2\n" > "$1"' _ "$H/.codex/AGENTS.md"
+
+# The 100%-invisible shape, graded on its own: a codex/opencode-type home with NO
+# .claude directory at all (andy, codex and ocqa are exactly this on the live fleet).
+# Under the old literals this home hashed nothing but the shared lib dir, so every
+# agent of that shape was permanently unrestartable.
+A="$WORK/home/agent-agentsonly"
+mkdir -p "$A/.agents/skills/only"
+printf 'only\n' > "$A/.agents/skills/only/SKILL.md"
+a_base="$(fp "$A" "$L")"
+if [[ -n "$a_base" && "$a_base" =~ ^[0-9a-f]{64}$ ]]; then
+  ok_t "an .agents-only home (no ~/.claude at all) fingerprints to a sha256 rather than reading as unreadable"
+else
+  bad_t "an .agents-only home did not fingerprint" "got '${a_base}' — a codex/opencode agent would be invisible to the predicate"
+fi
+printf 'only v2\n' > "$A/.agents/skills/only/SKILL.md"
+if [[ "$(fp "$A" "$L")" != "$a_base" ]]; then
+  ok_t "POSITIVE CONTROL — a skill change in an .agents-only home moves the fingerprint (agent is restarted)"
+else
+  bad_t "an .agents-only home's skill change did NOT move the fingerprint" \
+        "andy/codex/ocqa would be SKIPPED every night forever — a plugin fix ships dormant"
+fi
+
+# ---- DETERMINISM ACROSS THE DERIVED SET ------------------------------------
+# The path list is now built by iterating bash associative arrays, whose order is
+# not a contract. If it came out differently on the second snapshot the hash would
+# move on an UNCHANGED payload and restart the whole fleet — the FALSE CHANGE
+# failure, reintroduced by the fix for the other one. The predicate sorts for this
+# reason; this arm is what proves the sort is actually there.
+det="$(fp "$H" "$L")"; det_stable=1
+for _ in 1 2 3 4 5; do [[ "$(fp "$H" "$L")" == "$det" ]] || det_stable=0; done
+if (( det_stable )); then
+  ok_t "the derived path set hashes identically across repeated calls (map iteration order cannot leak in)"
+else
+  bad_t "the derived path set is not order-stable" \
+        "an unchanged payload would fingerprint differently between the before and after snapshot and restart every agent"
+fi
 
 # ---- UNREADABLE IS NOT UNCHANGED -------------------------------------------
 # An empty fingerprint is the caller's signal to fall back to restarting. If a

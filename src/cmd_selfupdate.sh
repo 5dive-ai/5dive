@@ -89,6 +89,45 @@ _agent_home() {
 # The 5dive CLI binary is deliberately absent: it is exec'd per command, so a
 # swap needs no restart (measured — see the header).
 #
+# THE PAYLOAD PATHS ARE DERIVED FROM THE INSTALLER'S OWN MAPS, NEVER RE-LITERALED.
+# Skills and the instructions doc do NOT live under ~/.claude for every agent: the
+# install dir is resolved PER TYPE from SKILLS_INSTALL_DIR / TYPE_PERSONA_FILE, and
+# `5dive-refresh-skills.sh` writes through that same resolution. A hardcoded
+# ".claude/skills" therefore watched the wrong directory for every non-claude type.
+#
+# MEASURED on this fleet 2026-08-10, all 13 running units (`5dive agent skill <a> list`):
+#   andy 2 / codex 5 / ocqa 2 skill dirs under .agents/skills and ZERO under
+#   .claude/skills — 100% invisible; creative 15/7 and marketing 3/8 — partially
+#   invisible. 5 of 13 agents, 27 skill dirs. Those agents compared EQUAL forever and
+#   were SKIPPED every night, silently: the quiet failure the caller's comment below
+#   explicitly refuses. Note creative and marketing are type=claude and STILL have
+#   .agents/skills dirs, so this is NOT a clean type split and must not be "fixed" by
+#   special-casing non-claude types.
+#
+# WHY DERIVED AND NOT ONE MORE LITERAL. A path the fingerprint does not know about is
+# INDISTINGUISHABLE from a payload that did not change, so adding ".agents/skills" as a
+# second literal would fix today's three types and fail identically and silently on the
+# next type someone maps. Iterating the maps means the predicate cannot fall behind the
+# installer by construction: adding a type to SKILLS_INSTALL_DIR extends this hash for
+# free. The ".claude/*" entries stay in the set unconditionally because
+# skills_install_dir() falls back to ".claude/skills" for an UNMAPPED type.
+#
+# SORTED, and that is load-bearing rather than tidy. Bash associative-array iteration
+# order is not a contract; if the path list came out in a different order on the second
+# snapshot the hash would move on an unchanged payload and restart the whole fleet —
+# precisely the regression this change exists to prevent.
+#
+# STILL LITERAL, DELIBERATELY, AND NOT AN OVERSIGHT: ~/.claude/settings.json and
+# ~/.claude/plugins/installed_plugins.json. The plugin manifest is Claude-only (no other
+# harness has a plugin system). Per-type CONFIG does have real parallels — ~/.codex/
+# config.toml, ~/.grok/config.toml, ~/.pi/agent/settings.json — but unlike skills and the
+# persona doc there is NO map to derive them from; they are written ad hoc by the boot
+# path. Enumerating them here would recreate exactly the literal-drift defect this
+# function just fixed, one layer down, so it is raised as a DECISION (expose a
+# TYPE_CONFIG_FILE map vs enumerate) rather than quietly taken. Until that lands, a
+# config-only change on a non-claude agent is NOT detected — named so nobody reads this
+# fix as wider than it is.
+#
 # CONTENT, NEVER mtime OR SIZE. `refresh_managed_files()` in install.sh swaps the
 # managed files in UNCONDITIONALLY (`mv -f "$_bundle_tmp" ...`) with no
 # already-current branch, so the nightly rewrites them every night whether or not
@@ -103,13 +142,23 @@ _agent_payload_fingerprint() {
   local home="${1:-}" lib="${2:-${LIB_DIR:-/usr/local/lib/5dive}}"
   [[ -n "$home" ]] || return 0
   command -v sha256sum >/dev/null 2>&1 || return 0
-  local p out
+  local p out rel
+  # Build the $HOME-relative payload set from the installer's maps. `[@]-` keeps
+  # this safe under `set -u` if a map is absent (the unit harness extracts this
+  # function on its own), and the .claude entries below mean an empty map still
+  # yields the documented fallback set rather than nothing.
+  local -a rels=()
+  for rel in "${SKILLS_INSTALL_DIR[@]-}" "${TYPE_PERSONA_FILE[@]-}"; do
+    [[ -n "$rel" ]] && rels+=("$rel")
+  done
+  rels+=(".claude/skills" ".claude/CLAUDE.md" \
+         ".claude/plugins/installed_plugins.json" ".claude/settings.json")
+  local -a paths=("$lib/skills")
+  while IFS= read -r rel; do
+    [[ -n "$rel" ]] && paths+=("$home/$rel")
+  done < <(printf '%s\n' "${rels[@]}" | LC_ALL=C sort -u)
   out=$({
-    for p in "$lib/skills" \
-             "$home/.claude/skills" \
-             "$home/.claude/plugins/installed_plugins.json" \
-             "$home/.claude/settings.json" \
-             "$home/.claude/CLAUDE.md"; do
+    for p in "${paths[@]}"; do
       [[ -e "$p" ]] || continue
       if [[ -d "$p" ]]; then
         # -print0/-z/-0 throughout: a path with a space or newline in it must
