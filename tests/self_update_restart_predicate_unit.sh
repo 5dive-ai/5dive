@@ -281,5 +281,100 @@ else
   bad_t "skips are not reported" "0-restarts is emitted by both a CLI-only night and a box with no agents"
 fi
 
+# ---- NON-DERIVABLE CONFIG TYPES MUST NOT BE SKIPPED -------------------------
+# The fingerprint hashes ~/.claude/settings.json as a literal and there is no map to
+# derive the others (~/.codex/config.toml, ~/.grok/config.toml, ~/.pi/agent/settings.json).
+# TODAY's unconditional restart picks a config-only change up on those types — loudly
+# and wastefully, but correctly. A conditional that cannot see the file would compare
+# them EQUAL and SKIP them, which is a NEW silent failure this change would introduce,
+# not a pre-existing gap. So an unmeasurable type is never claimed unchanged.
+#
+# WHICH OF THESE ARMS ACTUALLY DISCRIMINATE — MEASURED, because the obvious guess was
+# wrong. Two controls, and they are not the same control:
+#
+#   (a) against f914d0f's source, where the helper does not exist: 7 of 7 new arms fail.
+#       That is WEAK evidence. They fail on a 127 — the function is absent — which says
+#       nothing about whether the old decision differed. Absence-failure is not
+#       behaviour-failure and must not be counted as it.
+#   (b) against a TYPE-BLIND helper carrying the old semantics verbatim (skip whenever
+#       both fingerprints are non-empty and equal, no type consulted): 32 passed,
+#       8 FAILED. Those 8 are the behavioural discriminators — the six
+#       `_agent_config_hashable` arms plus `codex, identical fingerprints` and
+#       `unknown/empty type`. They are exactly the regression this commit removes.
+#
+# The other three (claude skips, changed payload restarts, unreadable restarts) pass
+# under both, correctly: they are unchanged behaviour, so they are regression cover
+# rather than proof of this change.
+rn() {
+  bash -c "set -uo pipefail
+$block
+_agent_restart_needed \"\$1\" \"\$2\" \"\$3\"" _ "$1" "$2" "$3"
+}
+ch() {
+  bash -c "set -uo pipefail
+$block
+_agent_config_hashable \"\$1\"" _ "$1"
+}
+
+if grep -q '_agent_restart_needed()' <<<"$block" && grep -q '_agent_config_hashable()' <<<"$block"; then
+  ok_t "the skip/restart decision is inside the extracted block (graded as shipped bytes, not restated)"
+else
+  bad_t "decision helpers missing from the block" \
+        "_agent_restart_needed / _agent_config_hashable not found between the fence markers"
+fi
+
+if ch claude; then ok_t "_agent_config_hashable: claude is measurable (~/.claude/settings.json is hashed)"
+else bad_t "claude reported unmeasurable" "the literal settings.json entry is in the payload set"; fi
+
+for t in codex grok pi opencode antigravity ""; do
+  if ch "$t"; then
+    bad_t "_agent_config_hashable: '${t:-<empty>}' claimed measurable" \
+          "no map derives that type's config file, so it must not be treated as hashable"
+  else
+    ok_t "_agent_config_hashable: '${t:-<empty>}' is not measurable"
+  fi
+done
+
+# The two discriminating arms: equal fingerprints DO skip, but only for a type whose
+# config we can actually hash.
+if rn "$base" "$base" claude; then
+  bad_t "claude with an unchanged payload was restarted" "the conditional buys nothing if it never skips"
+else
+  ok_t "SKIP: claude, identical fingerprints — the saving this change exists for"
+fi
+if rn "$base" "$base" codex; then
+  ok_t "RESTART: codex, identical fingerprints — non-derivable config, fails loud per type"
+else
+  bad_t "codex was SKIPPED on identical fingerprints" \
+        "a ~/.codex/config.toml change ships today and would stop shipping — a regression this change would introduce"
+fi
+
+# Regression cover (vacuous against the old tree, by the note above).
+if rn "$base" "$base" ""; then
+  ok_t "RESTART: unknown/empty type — a registry miss is unmeasurable, not unchanged"
+else
+  bad_t "an agent with no resolvable type was skipped" "an unreadable type must take the unmeasurable branch"
+fi
+if rn "$base" "${base%?}x" claude; then
+  ok_t "RESTART: claude, fingerprints differ — a real payload change still bounces"
+else
+  bad_t "a changed payload did not restart" "the FALSE SAME failure, on the type we can measure"
+fi
+if rn "" "$base" claude && rn "$base" "" claude; then
+  ok_t "RESTART: an empty reading on either side — unreadable is not unchanged"
+else
+  bad_t "an unreadable fingerprint was treated as unchanged" "this is the FALSE SAME failure the harness header names"
+fi
+
+# The caller must USE the helper rather than re-deciding inline, or the arms above
+# grade a function nothing calls.
+if grep -q '_agent_restart_needed "$before" "$after" "$atype"' src/cmd_selfupdate.sh \
+   && grep -q 'atype=$(agent_type "$name"' src/cmd_selfupdate.sh; then
+  ok_t "cmd_self_update calls the decision helper with the agent's resolved type"
+else
+  bad_t "the caller does not use _agent_restart_needed with a resolved type" \
+        "the decision arms above would grade dead code"
+fi
+
 echo; echo "$PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]

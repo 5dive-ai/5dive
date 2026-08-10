@@ -66,6 +66,56 @@ _agent_home() {
   printf '%s\n' "${h:-/home/agent-$n}"
 }
 
+# _agent_config_hashable <type> — is this agent type's CONFIG file inside the set
+# _agent_payload_fingerprint actually hashes?
+#
+# Only `claude` is, via the literal ~/.claude/settings.json below. Every other type
+# keeps its config somewhere we have NO map to derive (~/.codex/config.toml,
+# ~/.grok/config.toml, ~/.pi/agent/settings.json), written ad hoc by the boot path.
+#
+# This function exists because of what the conditional would otherwise DO to those
+# types. Today's unconditional restart picks a config-only change up — loudly and
+# wastefully, but correctly. Under a fingerprint that cannot see the file, the agent
+# compares EQUAL and is SKIPPED: a change that ships today would stop shipping. That
+# is a NEW silent failure introduced by this fix, not a pre-existing gap being
+# documented, and it is the same shape as the skills defect one layer down.
+#
+# So an unmeasurable type is never claimed unchanged. It restarts — the caller's own
+# rule ("an absent reading resolves to neither answer") applied per TYPE instead of
+# fleet-wide, which preserves today's exact behaviour for precisely the agents we
+# cannot measure and keeps the savings for the ones we can. An unknown or empty type
+# is unmeasurable too and takes the same branch.
+#
+# OWED, NOT HERE: a TYPE_CONFIG_FILE map is the real fix and would let these types
+# be compared like any other. It means touching every boot path that writes those
+# files ad hoc — different change, different risk — so it is on DIVE-3172's body as
+# owed rather than bundled into a fix that is otherwise ready.
+_agent_config_hashable() {
+  case "${1:-}" in
+    claude) return 0 ;;
+    *)      return 1 ;;
+  esac
+}
+
+# _agent_restart_needed <before> <after> <type> — 0 when the unit must be bounced.
+# The whole skip/restart decision lives here rather than inline in the loop so the
+# unit harness grades the SHIPPED bytes of it instead of a restatement that can drift.
+_agent_restart_needed() {
+  local before="${1:-}" after="${2:-}" type="${3:-}"
+  # UNREADABLE IS NOT UNCHANGED. If either side of the comparison is empty we could
+  # not observe the payload, so we fall back to the old unconditional behaviour and
+  # restart. Skipping on an unknown would convert a permission problem into a fleet
+  # that silently never picks up a plugin fix — a much quieter failure than the one
+  # this change is fixing. (DIVE-2230's rule: an absent reading resolves to neither
+  # answer.)
+  [[ -n "$before" && -n "$after" && "$before" == "$after" ]] || return 0
+  # NON-DERIVABLE CONFIG TYPES ALWAYS RESTART, DELIBERATELY. See above: equal
+  # fingerprints on such a type do not mean the payload held still, only that the
+  # part we can hash did.
+  _agent_config_hashable "$type" || return 0
+  return 1
+}
+
 # _agent_payload_fingerprint <agent-home> [lib-dir] — one hash over everything a
 # running agent loaded at startup and cannot pick up without a restart. Empty
 # output means "could not be read", which is NOT the same as "unchanged" — see
@@ -213,23 +263,28 @@ cmd_self_update() {
   # Restart only the agents whose payload actually moved. Best-effort per unit —
   # one failed restart shouldn't abort the rest.
   local -a restarted=() failed=() skipped=()
-  local i after before
+  local i after before atype why
   for i in "${!units[@]}"; do
     name="${names[$i]}"; before="${befores[$i]}"
     after="$(_agent_payload_fingerprint "$(_agent_home "$name")")"
-    # UNREADABLE IS NOT UNCHANGED. If either side of the comparison is empty we
-    # could not observe the payload, so we fall back to the old unconditional
-    # behaviour and restart. Skipping on an unknown would convert a permission
-    # problem into a fleet that silently never picks up a plugin fix — a much
-    # quieter failure than the one this change is fixing. (DIVE-2230's rule:
-    # an absent reading resolves to neither answer.)
-    if [[ -n "$before" && -n "$after" && "$before" == "$after" ]]; then
+    # An agent whose type we cannot read is unmeasurable, which restarts — same
+    # branch as a type with non-derivable config, so a registry miss is safe.
+    atype=$(agent_type "$name" 2>/dev/null) || atype=""
+    if ! _agent_restart_needed "$before" "$after" "$atype"; then
       step "skipped $name (payload unchanged)"
       skipped+=("$name")
       continue
     fi
+    # Say WHICH reason out loud. "restarted" alone is emitted both by a real
+    # payload change and by a type we simply cannot measure, and an operator
+    # reading the nightly log has to be able to tell those apart — the second one
+    # is the population a TYPE_CONFIG_FILE map would move into the first.
+    why="payload changed"
+    if [[ -n "$before" && -n "$after" && "$before" == "$after" ]]; then
+      why="type '${atype:-unknown}' config not derivable — always restarts"
+    fi
     if systemctl restart "${units[$i]}" 2>/dev/null; then
-      step "restarted $name"
+      step "restarted $name ($why)"
       restarted+=("$name")
     else
       warn "failed to restart agent '$name'"
