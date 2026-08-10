@@ -319,18 +319,48 @@ if [[ -n "$DRIFT_BLOCK" && "$DRIFT_BLOCK" != *"truthful.sh"* ]]; then
   ok "a header the clock AGREES with is not accused"
 else bad "a header the clock AGREES with is not accused" "$DRIFT_BLOCK"; fi
 
-# >= 50% AND >= 3s under is not variance: exit 5, its own code, because the remedy is
-# neither "fix a test" (1) nor "retire a guard" (4) but "correct a number in a header".
+# >= 50% AND >= 3s over its claim is graded WRONG. DIVE-3163 CHANGED WHAT THAT VERDICT
+# IS ALLOWED TO DO. These arms used to require exit 5 and the literal words "not runner
+# variance"; both were measured false on 2026-08-10 (same sha red then green with no code
+# change; three unrelated harnesses drifting together in one shard; and THIS FILE drawing
+# 62.1s against its own 41.4s claim on a branch that does not touch it). The finding is
+# still graded and still printed in full — what it may no longer do is red the run off ONE
+# box, because release-cut.yml refuses on any red without reading which red it is.
 mk wrong_claim.sh '#!/usr/bin/env bash
 # TIER: nightly — 0.5s measured (DIVE-2555): does not fit the 300s PR core; the nightly sweep runs it.
 sleep 4
 exit 0'
 rm -f "$TMP/stale_claim.sh"
-run --tier=full --budget=600 --label=t
-want "a header the clock flatly refutes exits 5 (not 1, not 4)" "5" "$RC"
-if [[ "$OUT" == *"WRONG"* && "$OUT" == *"not runner variance"* ]]; then
-  ok "the refuted header is called WRONG and the message says why it is not variance"
-else bad "the refuted header is called WRONG and the message says why it is not variance" "$OUT"; fi
+run --tier=full --budget=600 --label=t --report="$TMP/drift-report.txt"
+want "a WRONG header is a WARNING, not a red: exit 0 on one box (DIVE-3163)" "0" "$RC"
+if [[ "$OUT" == *"WRONG"* && "$OUT" == *"wrong_claim.sh"* ]]; then
+  ok "the refuted header is still called WRONG and still named"
+else bad "the refuted header is still called WRONG and still named" "$OUT"; fi
+# The half that actually cost the releases: the sentence must stop ASSERTING a cause it
+# has no instrument to separate. An arm on the absence, because the defect was a claim
+# that was PRESENT and false, and the next reader's cheapest revert is to re-add it.
+if [[ "$OUT" != *"not runner variance"* ]]; then
+  ok "the run no longer asserts 'that is not runner variance' — one box cannot exclude the runner"
+else bad "the run no longer asserts 'that is not runner variance' — one box cannot exclude the runner" "$OUT"; fi
+if [[ "$OUT" == *"WHAT IS NOT EXCLUDED"* && "$OUT" == *"probe"* ]]; then
+  ok "it names what it did not exclude, and that the calibration probe cannot substitute"
+else bad "it names what it did not exclude, and that the calibration probe cannot substitute" "$OUT"; fi
+# The signal is PRESERVED on a rail that is not the PR gate: a count in the report, which
+# is the only place a reader can compare the same file ACROSS runners. Losing the exit
+# code while also losing the number would be hiding the finding, not de-escalating it.
+if grep -qx '# header_drift_wrong=1' "$TMP/drift-report.txt" \
+   && grep -qx '# drift_fatal_policy=off' "$TMP/drift-report.txt"; then
+  ok "the report carries header_drift_wrong and the policy that governed it"
+else bad "the report carries header_drift_wrong and the policy that governed it" "$(cat "$TMP/drift-report.txt" 2>&1)"; fi
+# DISARMED, NOT DELETED. --drift-fatal=required restores exit 5 for a caller that has some
+# other reason to trust one box; without this arm the next reader cannot tell a demoted
+# control from a removed one.
+run --tier=full --budget=600 --label=t --drift-fatal=required
+want "--drift-fatal=required restores exit 5 (not 1, not 4)" "5" "$RC"
+# Fail closed on a typo, in BOTH directions — the DIVE-2736 inertness shape: a misspelt
+# policy flag that quietly picks a side is the control silently ceasing to exist.
+run --tier=full --budget=600 --label=t --drift-fatal=yes
+want "a misspelt --drift-fatal is usage (exit 2), never a silent default" "2" "$RC"
 
 # A harness that FAILED is not accused of drift: an aborted run's wall-clock is not a
 # measurement of what it costs, and the failure is the thing to fix first (exit 1).

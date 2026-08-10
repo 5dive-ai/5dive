@@ -28,6 +28,10 @@
 #   5  every harness passed and the run is inside budget, but a harness HEADER
 #      claims a measured time the clock just refuted by >= 50% (DIVE-2555). Same
 #      reason 4 is not 1: the remedy is different, so the code is different.
+#      DIVE-3163: NOT REACHABLE unless --drift-fatal=required. One box cannot tell a
+#      stale header from a slow runner — measured false three times on 2026-08-10 —
+#      so by default that finding PRINTS as a stale-claim warning and does not red
+#      the run. See the block beside the drift print at the end of this file.
 #   6  UNDETERMINED (DIVE-2728). The budget could not be GRADED: the calibration
 #      probe could not run, the runner drew so far outside its clamp that the
 #      scaled cap would license an arbitrarily larger corpus, or (DIVE-2829, under
@@ -95,6 +99,13 @@ CAL_POST=1; CAL_POST_US_IN=""
 # measured the same corpus over the same cap — until then it is exit 6, not exit 4.
 # See the block beside the over-budget verdict for the argument and the numbers.
 CROSS_RUNNER=off; RUNNER_ID=""; PRIOR_OVER_RUNNER=""
+# DIVE-3163. THE DECLARED-COST DRIFT ARM, DISARMED PENDING AN INSTRUMENT.
+# `off` (the default) still grades every header against the clock and still PRINTS
+# the WRONG severity in full — it just does not exit 5 on it. `required` restores the
+# pre-DIVE-3163 fatal exit for a caller that has some other reason to trust a single
+# box. The three measurements that forced this are beside the drift print below; the
+# short version is that this axis makes DIVE-2829's exact mistake one axis over.
+DRIFT_FATAL=off
 for a in "$@"; do case "$a" in
   --tier=*)   TIER="${a#--tier=}" ;;
   # The seam that lets tests/corpus_tier_budget_unit.sh grade THIS script against a
@@ -165,6 +176,9 @@ for a in "$@"; do case "$a" in
   # over on this same tree. They are equality-compared and never parsed, so any
   # string that is unique per VM works (the workflow uses job+run+attempt).
   --cross-runner=*) CROSS_RUNNER="${a#--cross-runner=}" ;;
+  # DIVE-3163: policy, like --cross-runner and for the same reason — "may one box red
+  # main over a header claim" is a property of the caller's topology, not of the tier.
+  --drift-fatal=*) DRIFT_FATAL="${a#--drift-fatal=}" ;;
   --runner-id=*) RUNNER_ID="${a#--runner-id=}" ;;
   --prior-over-runner=*) PRIOR_OVER_RUNNER="${a#--prior-over-runner=}" ;;
   --top=*)    TOP="${a#--top=}" ;;
@@ -173,7 +187,7 @@ esac; done
 
 case "$TIER" in
   core|full) ;;
-  *) printf 'usage: run-harnesses.sh --tier=core|full [--budget=<seconds>] [--label=<env>] [--report=<file>] [--corpus-dir=<dir>] [--confirm-top=<n>] [--no-calibrate] [--cal-us=<us/iter>] [--cal-baseline-us=<us/iter>] [--cal-cli=<path>] [--no-cal-post] [--cal-post-us=<us/iter>] [--cross-runner=off|required] [--runner-id=<id>] [--prior-over-runner=<id>]\n' >&2; exit 2 ;;
+  *) printf 'usage: run-harnesses.sh --tier=core|full [--budget=<seconds>] [--label=<env>] [--report=<file>] [--corpus-dir=<dir>] [--confirm-top=<n>] [--no-calibrate] [--cal-us=<us/iter>] [--cal-baseline-us=<us/iter>] [--cal-cli=<path>] [--no-cal-post] [--cal-post-us=<us/iter>] [--cross-runner=off|required] [--runner-id=<id>] [--prior-over-runner=<id>] [--drift-fatal=off|required]\n' >&2; exit 2 ;;
 esac
 [[ "$CONFIRM_TOP" =~ ^[0-9]+$ ]] || { printf 'run-harnesses: --confirm-top must be a non-negative integer, got %s\n' "$CONFIRM_TOP" >&2; exit 2; }
 # DIVE-2829: an unrecognised MODE is usage, never a silent fall back to `off`. A typo
@@ -182,6 +196,12 @@ esac
 case "$CROSS_RUNNER" in
   off|required) ;;
   *) printf 'run-harnesses: --cross-runner must be off or required, got %s\n' "$CROSS_RUNNER" >&2; exit 2 ;;
+esac
+# DIVE-3163: same fail-closed-on-a-typo rule as above. A misspelt --drift-fatal must
+# not silently pick a policy for the caller in EITHER direction.
+case "$DRIFT_FATAL" in
+  off|required) ;;
+  *) printf 'run-harnesses: --drift-fatal must be off or required, got %s\n' "$DRIFT_FATAL" >&2; exit 2 ;;
 esac
 [[ -n "$BUDGET" ]] || BUDGET="$(tier_budget "$TIER")" || exit 2
 [[ -n "$LABEL" ]] || LABEL="local"
@@ -535,7 +555,7 @@ fi
 # A harness that FAILED is skipped — an aborted run's wall-clock is not a measurement
 # of what the harness costs, and accusing its header of drift on that evidence is the
 # same error, inverted.
-drift=(); drift_fatal=0
+drift=(); drift_fatal=0; drift_wrong=0
 for i in "${!NAME[@]}"; do
   (( RC[i] == 0 )) || continue
   claim="$(tier_claim "${NAME[$i]}")"
@@ -546,7 +566,7 @@ for i in "${!NAME[@]}"; do
   (( gap_ms >= TIER_CLAIM_DRIFT_WARN_S * 1000 && over_pct >= TIER_CLAIM_DRIFT_WARN_PCT )) || continue
   sev="stale"
   if (( over_pct >= TIER_CLAIM_DRIFT_FAIL_PCT && gap_ms >= TIER_CLAIM_DRIFT_FAIL_S * 1000 )); then
-    sev="WRONG"; drift_fatal=1
+    sev="WRONG"; drift_fatal=1; drift_wrong=$(( drift_wrong + 1 ))
   fi
   drift+=("$(printf '%s\t%s\t%s\t%s' "$sev" "${NAME[$i]}" "$claim" "${MS[$i]}")")
 done
@@ -581,6 +601,15 @@ if [[ -n "$REPORT" ]]; then
     # reports from the same run provably two BOXES rather than two attempts.
     printf '# cross_runner=%s\n# cross_runner_state=%s\n# runner_id=%s\n# prior_over_runner=%s\n' \
       "$CROSS_RUNNER" "$CROSS_STATE" "${RUNNER_ID:--}" "${PRIOR_OVER_RUNNER:--}"
+    # DIVE-3163: header_drift_wrong is the count that USED to be an exit code, and it is
+    # a field now for the reason the exit could not be one: the question it raises — "did
+    # a DIFFERENT box see this same file drift?" — is answerable only by comparing reports
+    # ACROSS runners, and never from inside the single box that took the sample. It is
+    # deliberately separate from header_drift (which counts warn+wrong and keeps its
+    # meaning, per the append-never-substitute rule above). drift_fatal_policy records
+    # whether this run was even allowed to exit 5, so a later reader does not have to date
+    # the YAML to know what the number meant.
+    printf '# header_drift_wrong=%d\n# drift_fatal_policy=%s\n' "$drift_wrong" "$DRIFT_FATAL"
     for i in "${!NAME[@]}"; do printf '%s\t%s\t%s\n' "${MS[$i]}" "${RC[$i]}" "${NAME[$i]}"; done
   } > "$REPORT"
 fi
@@ -886,8 +915,47 @@ if (( ${#drift[@]} )); then
     printf '        # TIER: nightly — %.1fs measured (%s, <date>): <why this cannot be in the %ds PR core>\n' \
       "$(awk -v m="$ms" 'BEGIN{print m/1000}')" "$LABEL" "$TIER_BUDGET_CORE"
   done
-  (( drift_fatal )) && printf 'At least one is marked WRONG (>= %d%% and >= %ds under): that is not runner variance.\n' \
-    "$TIER_CLAIM_DRIFT_FAIL_PCT" "$TIER_CLAIM_DRIFT_FAIL_S"
+  if (( drift_fatal )); then
+    # DIVE-3163. THIS LINE USED TO END "...that is not runner variance." and :912 turned
+    # it into exit 5. It was a flat sentence, not a measurement, and it was MEASURED FALSE
+    # three times on 2026-08-10 — the same defect DIVE-2829 fixed one axis over, a one-box
+    # sample asserting a cause it has no instrument to separate:
+    #   * full-pristine (2), main tip 269e3e7: exit 5, then GREEN on a re-run with NO code
+    #     change. Same sha, same corpus, same claims; the only variable was the runner.
+    #     120 harnesses, 0 failing, 500s against a 1320s budget (37%).
+    #   * full-pristine (3), PR #565: THREE unrelated harnesses drifting together in one
+    #     shard (+47%, +73%, +66%) on a branch touching none of them, 0 failing, 44% of
+    #     budget. Three simultaneous regressions is a worse explanation than one slow box.
+    #   * full-pristine (3), PR #567 head 8d661a8: corpus_tier_budget_unit.sh claimed 41.4s
+    #     and drew 62.1s (+50%) on a branch whose 3-dot diff does not touch it and whose
+    #     header byte-matches origin/main. It sits ON the threshold, so it flips on runner
+    #     speed alone, for every branch that goes nowhere near it.
+    #
+    # AND THE CALIBRATION PROBE CANNOT STAND IN FOR THE CONFIRMATION THIS AXIS LACKS. On
+    # #565 the probe measured this box at 101729us/iter against a 119000 baseline — FASTER
+    # than baseline, clamped to 100% — while the workload read +47-73% SLOW. They can
+    # disagree because the probe is a CPU-iteration microbenchmark and the drifting
+    # harnesses are process-spawn and IO heavy: a probe that samples a different RESOURCE
+    # than the workload can neither clear it nor convict it. That is the named mechanism
+    # behind the "AGREES means the probe saw nothing" caveat above, and it is why the
+    # calibration arm is not the fix here and must not be reached for as one.
+    printf 'At least one is marked WRONG (>= %d%% and >= %ds over its claim).\n' \
+      "$TIER_CLAIM_DRIFT_FAIL_PCT" "$TIER_CLAIM_DRIFT_FAIL_S"
+    printf 'WHAT IS MEASURED: on THIS RUNNER, in ONE sample, the clock disagreed with the header.\n'
+    printf 'WHAT IS NOT EXCLUDED: that this runner drew slow. No second box has measured these\n'
+    printf 'files, and the calibration probe cannot substitute for one — it prices CPU iterations\n'
+    printf 'while these harnesses are priced by process spawn and IO, so it can neither clear nor\n'
+    printf 'convict them (DIVE-3163: probe FASTER than baseline while the workload read +47-73%%\n'
+    printf 'slow, 2026-08-10).\n'
+    if [[ "$DRIFT_FATAL" == "required" ]]; then
+      printf 'This run was invoked with --drift-fatal=required, so it exits 5 on that anyway.\n'
+    else
+      printf 'So this is a STALE-CLAIM WARNING AND NOT A RED (DIVE-3163). Re-measure the header and\n'
+      printf 'widen it, with its environment and date — the replacement line is printed above. The\n'
+      printf 'count is in the report as header_drift_wrong, for a reader that can compare ACROSS\n'
+      printf 'runners, which is the only place the slow-box explanation can actually be excluded.\n'
+    fi
+  fi
 fi
 
 if (( ${#failed[@]} )); then
@@ -909,5 +977,24 @@ fi
 # is still set, still printed, and still the thing a second box confirms.
 (( cross_unconfirmed == 0 )) || exit 6
 (( over == 0 )) || exit 4
-(( drift_fatal == 0 )) || exit 5
+# DIVE-3163: EXIT 5 IS NOW OPT-IN AND THE DEFAULT IS A WARNING. The gate this used to be
+# was a one-box assertion about a cause it cannot measure (the three samples are beside the
+# drift print above), and the cost was not theoretical: it froze the v0.19.14 release cut
+# for ~40 minutes, held PR #565 and PR #554, and cost three agents a differential each —
+# because release-cut.yml grades every check-run on main's tip and refuses on ANY red
+# without reading which red it is. So "a header claim is stale" and "the code is wrong"
+# reached that gate as the same colour, and a corpus at 37-44% of budget with 0 failing
+# harnesses could freeze a cut on a stopwatch disagreement. It must not be able to.
+#
+# NOT DONE HERE, DELIBERATELY: the thresholds are untouched (tests/lib/tier.sh). Raising
+# them would hide the signal instead of confirming it, and the drift IS worth surfacing —
+# it is still graded, still printed in full with its replacement line, and still counted.
+#
+# WHAT WOULD RE-ARM IT: a confirmation that separates a slow FILE from a slow RUNNER.
+# DIVE-2829's --cross-runner is NOT that instrument on this axis and is deliberately not
+# reused here — it confirms that a second box found the corpus TOTAL over its cap, which
+# says nothing about any one header. Reusing it would be widening a control to mean
+# something it never measured. This flag exists so the arm is DISARMED rather than deleted;
+# it is wired to no caller today, and that is the honest state rather than an oversight.
+if (( drift_fatal )) && [[ "$DRIFT_FATAL" == "required" ]]; then exit 5; fi
 exit 0
