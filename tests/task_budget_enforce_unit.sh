@@ -51,10 +51,10 @@ ts1=$(date -u -d "@$((start+10))" +%FT%TZ)
 printf '{"type":"assistant","timestamp":"%s","message":{"model":"claude-opus-4-8","usage":{"input_tokens":20000,"output_tokens":10000,"cache_creation_input_tokens":30000,"cache_read_input_tokens":999999}}}\n' "$ts1" \
   > "$FAKEHOME/.claude/projects/proj/session.jsonl"
 
-mkrow() { # <ident> <budget-literal-or-empty> <priority>
+mkrow() { # <ident> <budget-literal-or-empty> <priority> [title]
   local bud="NULL"; [[ -n "$2" ]] && bud="'$2'"
   db "INSERT INTO tasks (ident,title,status,assignee,kind,priority,task_budget,started_at,created_at,updated_at)
-      VALUES ('$1','row $1','in_progress','$AG','standard','${3:-medium}',$bud,
+      VALUES ('$1','${4:-row $1}','in_progress','$AG','standard','${3:-medium}',$bud,
               datetime($start,'unixepoch'),datetime($start,'unixepoch'),datetime($start,'unixepoch'));"
   db "SELECT id FROM tasks WHERE ident='$1';"
 }
@@ -89,16 +89,69 @@ reason=$(db "SELECT park_reason FROM tasks WHERE id=$id_def;")
 # ── 2. the gate carries the facts that DECIDE it (main's rubber-stamp guard) ──
 gate=$(grep -F "DIVE-9001" "$GATELOG" | head -1)
 [[ -n "$gate" ]] && ok_t "a breach files a gate" || bad_t "no gate filed" "$(cat "$GATELOG")"
-for fact in "60000" "low" "--tier=1" "--recommend=park"; do
+for fact in "60k" "50k" "low" "--tier=1" "--recommend=park"; do
   if [[ "$gate" == *"$fact"* ]]; then ok_t "gate ask carries [$fact]"
   else bad_t "gate ask missing [$fact]" "$gate"; fi
 done
+# The exact figures are not lost — they live on the row, where no classifier
+# reads them. This is what makes the scaled unit in the ask a free change.
+[[ "$(db "SELECT park_reason FROM tasks WHERE id=$id_def;")" == *"60000/50000"* ]] \
+  && ok_t "park_reason keeps the EXACT spend, so scaling the ask loses nothing" \
+  || bad_t "park_reason lost the exact figures" "$(db "SELECT park_reason FROM tasks WHERE id=$id_def;")"
+
+# ── 2b. THE ASK MUST NOT TRIP THE TIER-2 CATEGORY FLOOR ─────────────────────
+# Arm one's first live trip (DIVE-2057, 2026-08-10) parked and gated correctly
+# and then paged the paired human, because the ask said "tokens" and `token` is
+# on _GATE_T2_FLOOR_RX (there it means an API credential; here it is a unit).
+# Every budget trip was being classified as a secrets gate. A gate that pages a
+# person on every trip is switched off inside a week, so this asserts the
+# property on the ask the sweep ACTUALLY EMITS, using the REAL floor predicate —
+# not on a hand-written copy of the string, and not in a comment.
+ask_of() { printf '%s' "${1#*--ask=}"; }
+ask_def=$(ask_of "$gate")
+if _gate_tier2_floor_hit "$ask_def"; then
+  bad_t "the emitted ask must not floor to tier 2" \
+        "floored on term='$(_gate_tier2_floor_term "$ask_def")': $ask_def"
+else
+  ok_t "the emitted ask does not trip the T2 category floor (stays lead-clearable)"
+fi
+# NON-VACUITY: the pre-fix wording must still be detected as a hit by this same
+# predicate, or the arm above proves only that the floor stopped working.
+_old_shape="DIVE-9001 spent ~60000 tokens (budget 50000) on a low-priority row running ~1h: \"row DIVE-9001\". It is parked. Continue with a raised budget, or leave it parked?"
+_gate_tier2_floor_hit "$_old_shape" \
+  && ok_t "control: the pre-fix ask DOES floor (term='$(_gate_tier2_floor_term "$_old_shape")') — the arm above is not vacuous" \
+  || bad_t "control: the pre-fix ask no longer floors — arm 2b proves nothing" "$_old_shape"
+
 
 # ── 3. trip rate is recorded from day one, so tier-1-vs-0 is re-decided on a
 #       number rather than on irritation ─────────────────────────────────────
 [[ "$(db "SELECT value FROM task_prefs WHERE key='task_budget_trips';")" == "1" ]] \
   && ok_t "the trip counter increments on a breach" \
   || bad_t "trip counter" "$(db "SELECT value FROM task_prefs WHERE key='task_budget_trips';")"
+
+# ── 3b. THE ROW TITLE MUST NOT RIDE INSIDE THE ASK ──────────────────────────
+# DIVE-2224 answer A made the floor's SUBJECT the ask, precisely so a ticket's
+# DESCRIPTION could not be read as a REQUEST. Quoting "${title}" into the ask
+# silently undoes that for this one gate: fixing the unit alone still leaves
+# every budget trip on a row titled with a floor term paging the human.
+# (Ordered AFTER the trip-counter arm on purpose — it parks a second row.)
+id_hot=$(mkrow "DIVE-9110" "" "low" "delete the stale webhook rows")
+_hb_task_budget_sweep >/dev/null 2>&1
+gate_hot=$(grep -F "DIVE-9110" "$GATELOG" | head -1)
+[[ -n "$gate_hot" ]] && ok_t "a floor-word row still files its budget gate" \
+                     || bad_t "no gate filed for the hot-title row" "$(cat "$GATELOG")"
+ask_hot=$(ask_of "$gate_hot")
+if _gate_tier2_floor_hit "$ask_hot"; then
+  bad_t "a floor-word TITLE must not floor a routine budget trip" \
+        "floored on term='$(_gate_tier2_floor_term "$ask_hot")': $ask_hot"
+else
+  ok_t "a row titled 'delete ...' still files a lead-clearable budget gate"
+fi
+# NON-VACUITY for 3b: that title floors on its own, so the arm is testing the
+# separation and not a harmless fixture.
+_gate_tier2_floor_hit "delete the stale webhook rows" \
+  && ok_t "control: the fixture title DOES floor on its own — 3b is not vacuous" \
+  || bad_t "control: fixture title does not floor; pick a hotter one" "delete the stale webhook rows"
 
 # ── 4. THE CARVE-OUT: 'none' is never parked (paired with a live control) ────
 id_none=$(mkrow "DIVE-9002" "none" "urgent")

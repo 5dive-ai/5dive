@@ -2903,7 +2903,57 @@ _hb_loop_ceiling_sweep() {
 # settable mid-incident on an existing row with `task set-budget <id> none`,
 # which is the part that makes it usable at 3am rather than only at filing time.
 # The fleet-wide kill switch is `task_budget_enforce=off`.
+#
+# THE ASK IS ALSO READ BY A KEYWORD CLASSIFIER, AND THAT DECIDES ITS WORDING.
+# Found by arm one firing correctly: the FIRST live trip (DIVE-2057, 2026-08-10,
+# ~40 min after the tag) parked and gated exactly as designed, and then landed in
+# the paired human's DM at tier 2. The tier defaulted to 1 correctly; the T2
+# CATEGORY FLOOR overrode it, because the ask said "tokens" and `token` is on
+# `_GATE_T2_FLOOR_RX` — it almost always means an API credential, and here it is a
+# unit of measure. The classifier cannot tell those apart, so EVERY budget trip
+# was being classified as a secrets gate and routed to a person. That is precisely
+# the outcome this arm was designed against: a budget guard that pages a human on
+# every trip converts a burn problem into a gate-spam problem and is switched off
+# inside a week.
+#
+# Two things therefore ride on the ask's WORDING, and both are load-bearing:
+#
+#   1. THE UNIT. `_hb_tok_scale` emits "21.0M" / "60k" — identical information to
+#      a human, and nothing at all to the credential classifier. Do NOT "improve"
+#      this back to a bare token count with the word `tokens`; the exact figures
+#      are preserved in `park_reason`, which no classifier reads.
+#   2. THE TITLE IS NOT QUOTED IN. DIVE-2224 answer A made the floor's subject the
+#      ASK, precisely so a ticket's DESCRIPTION could not be read as a REQUEST.
+#      Quoting `"${title}"` into the ask silently undid that here: a routine budget
+#      trip on a row titled "delete the stale rows" floored on `delete`. Measured —
+#      with the unit fixed but the title still quoted, the floor still fires.
+#
+# NOT fixed by widening `_GATE_T2_FLOOR_RX`: `token` belongs on that list for every
+# other gate, and weakening a safety control to unblock the thing it flags is the
+# DIVE-3175 anti-pattern. Reworded at source instead, so the gate is never
+# mis-filed rather than corrected afterwards (`--discusses`, DIVE-2089, is the
+# sanctioned appeal but only fires once the floor already has — file at 2, appeal
+# down; never reaching the human at all is better).
+#
+# A COMMENT IS NOT THE GUARD. tests/task_budget_enforce_unit.sh runs the real
+# `_gate_tier2_floor_hit` over the ask this sweep actually emits, with a
+# floor-word row title as the non-vacuous arm, so restoring either mistake goes
+# red instead of silently restoring the page-the-human behaviour.
 _TASK_BUDGET_BUILTIN=5000000
+# Token count -> a short human scale that carries no floor term. Rounds to one
+# decimal at M, to the nearest k below that, and leaves counts under 1000 bare.
+_hb_tok_scale() {
+  local n="${1:-0}"
+  [[ "$n" =~ ^[0-9]+$ ]] || { printf '%s' "$n"; return 0; }
+  if (( n >= 1000000 )); then
+    local t=$(( (n + 50000) / 100000 ))
+    printf '%d.%dM' $(( t / 10 )) $(( t % 10 ))
+  elif (( n >= 1000 )); then
+    printf '%dk' $(( (n + 500) / 1000 ))
+  else
+    printf '%d' "$n"
+  fi
+}
 _hb_task_budget_sweep() {
   local enforce dflt tier
   enforce=$(db "SELECT value FROM task_prefs WHERE key='task_budget_enforce';" 2>/dev/null || echo "")
@@ -2961,12 +3011,14 @@ _hb_task_budget_sweep() {
     # the answer, but only a measured rate can say so.
     db "INSERT INTO task_prefs (key,value) VALUES ('task_budget_trips','1')
         ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INT)+1 AS TEXT), updated_at=datetime('now');" 2>/dev/null || true
-    _hb_log "[task-budget] ${tident} breached budget (~${spent}/${eff} tok, ${prio}, ~${age:-?}h) — parked + gated"
+    # The title rides in the operator LOG, which no classifier reads, rather than
+    # in the ask — see the wording note above.
+    _hb_log "[task-budget] ${tident} breached budget (~${spent}/${eff} tok, ${prio}, ~${age:-?}h) — parked + gated: ${title}"
     # The gate goes on the row AFTER the park, because the park clears the gate
     # columns and would otherwise wipe the gate it just filed.
     ( cmd_task_need "$tid" --type=decision --tier="$tier" \
         --options="park|continue" --recommend="park" \
-        --ask="${tident} spent ~${spent} tokens (budget ${eff}) on a ${prio}-priority row running ~${age:-?}h: \"${title}\". It is parked. Continue with a raised budget, or leave it parked?" ) >/dev/null 2>&1 || true
+        --ask="${tident} is at ~$(_hb_tok_scale "$spent") of a $(_hb_tok_scale "$eff") budget on a ${prio}-priority row running ~${age:-?}h. It is parked. Continue with a raised budget, or leave it parked?" ) >/dev/null 2>&1 || true
   done < <(db "SELECT id||x'1f'||COALESCE(ident,'')||x'1f'||COALESCE(REPLACE(title,x'1f',' '),'')||x'1f'||COALESCE(priority,'')||x'1f'||COALESCE(task_budget,'')||x'1f'||COALESCE(started_at,'')
                FROM tasks
                WHERE status IN ('todo','in_progress') AND kind='standard'
