@@ -58,8 +58,11 @@
 # new content and folds again, which is what a re-filed fragment needs.
 #
 # BASELINE: $FOLD_RELEASED_BASELINE, a git ref whose tree is main as of the last
-# cut. release-cut.yml passes "${incumbent}^" — the incumbent it already derived
-# and asserted, so this is not a third copy of the tag rule. SET-BUT-EMPTY means
+# cut. release-cut.yml passes the sha from scripts/release-cut-baseline.sh, which
+# holds the single copy of the rule. It used to pass "${incumbent}^" and DIVE-3170
+# measured that wrong: a cut makes two commits, so the tag's first parent is the
+# ASSIGN commit — a tree this very script has already emptied — and every fragment
+# therefore looked unshipped and re-folded on every cut. SET-BUT-EMPTY means
 # "no previous cut, fold everything" (the first cut ever). UNSET means auto-detect
 # with the same filter+sort release-cut.yml and install.sh use. Unresolvable is
 # NOT fatal — the cut must not die over a changelog — but it is reported, because
@@ -109,7 +112,15 @@ if [[ "$baseline" == "__auto__" ]]; then
   # resolve_gh_tag(). At fold time the tag for THIS cut does not exist yet, so the
   # newest tag is the previous release.
   _prev_tag="$(git tag -l 2>/dev/null | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
-  baseline="${_prev_tag:+${_prev_tag}^}"
+  # DIVE-3170: resolve tag -> main commit through the one helper, never "^" here.
+  baseline=""
+  if [[ -n "$_prev_tag" ]]; then
+    _here="$(dirname -- "${BASH_SOURCE[0]}")"
+    baseline="$(bash "${_here}/release-cut-baseline.sh" "$_prev_tag" 2>/dev/null || true)"
+    # Unresolvable stays unresolvable and keeps the loud warning below; it must not
+    # quietly degrade to a tag-relative guess that is wrong in the same direction.
+    [[ -n "$baseline" ]] || baseline="${_prev_tag}^{unresolvable-baseline}"
+  fi
 fi
 if [[ -n "$baseline" ]] && ! git rev-parse --verify -q "${baseline}^{commit}" >/dev/null 2>&1; then
   # Loud, and it names the consequence rather than the symptom: this is the exact
