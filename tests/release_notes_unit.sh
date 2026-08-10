@@ -32,7 +32,9 @@ bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
 R="$TMP/repo"
 mkdir -p "$R"
-git -C "$R" init -q
+# -b main: DIVE-3170's baseline helper answers "what was this tag cut from" against
+# MAIN by name, so a fixture on the local git default branch would resolve nothing.
+git -C "$R" init -q -b main
 git -C "$R" config user.name  'Ada Lovelace'
 git -C "$R" config user.email 'ada@example.test'
 
@@ -236,6 +238,7 @@ grep -q 'release-notes.sh' <<<"$BLOCK" \
 # actually have sent to GitHub.
 mkdir -p "$R/scripts"
 cp "$SCRIPTS/release-notes.sh" "$R/scripts/release-notes.sh"
+cp "$SCRIPTS/release-cut-baseline.sh" "$R/scripts/release-cut-baseline.sh"
 # shellcheck disable=SC2034  # incumbent/sha/version/tag/note are read by `eval "$BLOCK"`
 run_block() { # <incumbent> <sha> <version>
   rm -f "$TMP/ghargs" "$TMP/ghbody"
@@ -247,6 +250,13 @@ run_block() { # <incumbent> <sha> <version>
     # look plausible. The directive sits on the subshell so it covers every one
     # (a per-line disable only covers the first command on that line).
     incumbent="$1"; sha="$2"; version="$3"; tag="v$3"
+    # DIVE-3170: the block no longer respells the tag rule — it reads $cut_from,
+    # the single derivation the job makes once up top. Stand it up the same way the
+    # job does, through the one helper, or the arms below grade an empty range.
+    cut_from=""
+    if [[ -n "$incumbent" ]]; then
+      cut_from=$(bash scripts/release-cut-baseline.sh "refs/tags/${incumbent}" 2>/dev/null || true)
+    fi
     note="nightly auto-cut: main changed and CI is green"
     gh() {
       printf '%s\n' "$*" > "$TMP/ghargs"
@@ -261,7 +271,22 @@ run_block() { # <incumbent> <sha> <version>
 # block's own `refs/tags/<incumbent>^{commit}^` expression is exercised rather than
 # bypassed with an empty incumbent. That expression is the part most likely to be
 # wrong, and grep cannot see it at all.
-git -C "$R" tag -f v0.0.8 "$FEAT" >/dev/null 2>&1
+# DIVE-3170: tag the way a real cut tags — TWO detached commits on top of the cut
+# point (assign, then bundle), tag on the second. The old fixture tagged one commit
+# above the cut point, which is the shape that let "${incumbent}^" look correct here
+# and be a release tree in production.
+tag_like_a_cut(){ # <tag> <cut-point-sha>
+  git -C "$R" tag -d "$1" >/dev/null 2>&1 || true
+  local _prev; _prev=$(git -C "$R" rev-parse HEAD)
+  ( cd "$R" && git checkout -q --detach "$2" \
+    && git commit -q --allow-empty -m "release $1: assign before bundle build" \
+    && git commit -q --allow-empty -m "release $1: bundle built" \
+    && git tag -f "$1" HEAD ) >/dev/null 2>&1
+  # Back onto main at exactly where we left it — the cut never moves the branch.
+  ( cd "$R" && git checkout -q -B main "$_prev" ) >/dev/null 2>&1
+}
+
+tag_like_a_cut v0.0.8 "$FEAT"
 run_block "v0.0.8" "$TO" "1.3.0"; rc=$?
 [[ $rc -eq 0 ]] \
   && ok_t "block: runs to completion on a derivable range (rc=0)" \
@@ -269,9 +294,17 @@ run_block "v0.0.8" "$TO" "1.3.0"; rc=$?
 grep -q -- '--notes-file' "$TMP/ghargs" 2>/dev/null \
   && ok_t "block: calls gh release create with --notes-file" \
   || bad_t "block: calls gh with --notes-file" "argv=$(cat "$TMP/ghargs" 2>/dev/null)"
+# DIVE-3170: v0.0.8 was cut FROM $FEAT, so $FEAT's entry ("machine account") has
+# ALREADY SHIPPED and must not appear again — while the commit that landed after it
+# must. This pair is the notes-layer statement of the accumulation defect: the old
+# rule started the range one commit too early and re-advertised the last release's
+# entries in this one.
+grep -q 'empty release body' "$TMP/ghbody" 2>/dev/null \
+  && ok_t "block: the body GitHub would receive carries the entry that landed since the cut" \
+  || bad_t "block: body carries derived notes" "$(cat "$TMP/ghbody" 2>/dev/null)"
 grep -q 'machine account' "$TMP/ghbody" 2>/dev/null \
-  && ok_t "block: the body GitHub would receive carries the derived notes" \
-  || bad_t "block: body carries derived notes" "$(head -3 "$TMP/ghbody" 2>/dev/null)"
+  && bad_t "block: body REPEATS an entry that shipped in the incumbent (DIVE-3170)" "$(cat "$TMP/ghbody" 2>/dev/null)" \
+  || ok_t "block: the incumbent's own entry is NOT repeated in the next release's body"
 grep -q 'nightly auto-cut' "$TMP/ghbody" 2>/dev/null \
   && ok_t "block: the cut provenance is kept as a footer, not lost" \
   || bad_t "block: cut provenance kept" "$(tail -3 "$TMP/ghbody" 2>/dev/null)"
@@ -280,8 +313,7 @@ grep -q 'nightly auto-cut' "$TMP/ghbody" 2>/dev/null \
 # called. A release page created with an underivable body is the bug being closed.
 # An EMPTY range means from == to. Build it the way the block will see it: a tag
 # whose commit's parent IS the sha being cut, so `_notes_from` resolves to `sha`.
-git -C "$R" commit -q --allow-empty -m "chore: synthetic release commit"
-git -C "$R" tag -f v0.0.9 HEAD >/dev/null 2>&1
+tag_like_a_cut v0.0.9 "$EMPTY"
 run_block "v0.0.9" "$EMPTY" "1.3.1" >/dev/null 2>&1; rc=$?
 [[ $rc -ne 0 ]] \
   && ok_t "block: an underivable body ABORTS the cut (rc!=0)" \

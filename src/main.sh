@@ -320,15 +320,19 @@ Health:
     two environments (tests/meta/selfcheck-union.sh) to prove no probe is
     skipped everywhere.
 
-  5dive bug [--verb=<name>] [--exit=<code>] [--no-probes] [--file]
+  5dive bug --what=<text> [--verb=<name>] [--exit=<code>] [--argv=<line>]
+            [--no-probes] [--file]
     Preview (default) or file a diagnostic bug report against 5dive-ai/5dive.
     Payload is a fixed ALLOWLIST — version, OS, bash version, install method,
-    the verb that failed + its exit code, and selfcheck probe name+verdict
-    pairs — never the free-text reason/detail fields underneath them. Bare
-    \`5dive bug\` only builds and prints the payload; NEVER auto-files. --file
-    re-prints the identical payload and then opens it (via \`5dive gh issue
-    create\`, so it lands as 5dive-bot); a TTY also gets an interactive y/N.
-    Agents take the same --file flag a human does — no separate unattended path.
+    the verb that failed + its exit code, selfcheck probe name+verdict pairs
+    (never the free-text reason/detail fields underneath them), and the two
+    fields you supply: --what and --argv. --what is REQUIRED to --file: a TTY
+    is prompted for it, and with no TTY an empty report is REFUSED rather than
+    opened against a public repo (DIVE-3136). Bare \`5dive bug\` only builds and
+    prints the payload; NEVER auto-files. --file re-prints the identical
+    payload and then opens it (via \`5dive gh issue create\`, so it lands as
+    5dive-bot); a TTY also gets an interactive y/N. Agents take the same --file
+    flag a human does — no separate unattended path.
 
   5dive acp
     Speak ACP (Agent Client Protocol) over stdin/stdout so an ACP client — Buzz
@@ -442,6 +446,22 @@ main() {
   # can't race across concurrent dashboard clicks. Read-only commands (list,
   # logs, stats, types, auth status/poll) bypass the lock and the audit log.
   case "$top" in
+    _task_answer)
+      # DIVE-3160: hidden, privileged, delegated SIGNED gate clear. Reachable ONLY
+      # via NOPASSWD sudo (the scoped render_standard_sudoers line). Reads the
+      # `task answer` arguments NUL-separated on STDIN — never argv, so the grant
+      # stays an exact command path with no wildcard — re-derives the caller from
+      # SUDO_UID and its lead-clear standing FROM THE ROW as root, refuses every
+      # human-evidence form, and only then runs cmd_task_answer at EUID 0, where
+      # the DIVE-756 closure signs in-process instead of shelling out to a
+      # `gate-proof sign` grant a cli-scoped seat does not have.
+      #
+      # Not audited HERE, for the _gh_do reason: the parent `task answer` verb is
+      # audited and reaches this primitive through a PIPE, not `exec`, so the
+      # outer EXIT trap still fires and attribution survives (DIVE-2797 is about
+      # the exec case, which this deliberately is not). Never advertised.
+      cmd_task_answer_delegated
+      exit $? ;;
     _audit_append)
       # DIVE-1268: hidden, privileged, APPEND-ONLY audit primitive. Reachable
       # ONLY via NOPASSWD sudo — the admin whole-CLI grant, or the scoped

@@ -203,8 +203,18 @@ _gh_caller_credential() { gh auth token >/dev/null 2>&1; }
 # it is. A reader can tell them apart on the class alone.
 _gh_child_exit() {
   local rc="${1:-0}"
+  shift || true
   (( rc == 0 )) && return 0
   mark_reported
+  if (( rc == 8 )) && [[ "${1:-}" == "pr" && "${2:-}" == "checks" ]]; then
+    echo "[5dive gh] checks are still pending (gh exit 8). This is a CI state, not a 5dive failure; poll again or use gh's --watch mode." >&2
+    if (( ${JSON_MODE:-0} )); then
+      jq -cn \
+        --arg m "Checks are still pending (gh exit 8). This is a CI state, not a 5dive failure." \
+        '{ok:false, error:{code:8, class:"pending", message:$m}}' 2>/dev/null || true
+    fi
+    return "$rc"
+  fi
   echo "[5dive gh] gh exited ${rc} — that is gh's OWN exit status, not a 5dive failure. Its message is above; 5dive routed the call and ran it to completion." >&2
   if (( ${JSON_MODE:-0} )); then
     jq -cn --argjson c "$rc" \
@@ -267,7 +277,7 @@ cmd_gh() {
   local rc=0
   if [[ "$actor" == "caller" ]]; then
     gh "$@" || rc=$?
-    _gh_child_exit "$rc"
+    _gh_child_exit "$rc" "$@"
     return "$rc"
   fi
 
@@ -285,7 +295,7 @@ cmd_gh() {
   fi
   # Past the grant probe, a non-zero came from the routed gh (or from _gh_do's own
   # refusal, which printed its reason in that process) — either way it is reported.
-  _gh_child_exit "$rc"
+  _gh_child_exit "$rc" "$@"
   return "$rc"
 }
 
@@ -335,5 +345,13 @@ cmd_gh_do() {
   # GITHUB_TOKEN is cleared so a stale one in root's environment cannot win over
   # the token we just resolved — gh prefers GH_TOKEN, but a reader six months out
   # should not have to know that to believe this line.
-  GH_TOKEN="$tok" GITHUB_TOKEN="" gh "${args[@]}"
+  # Capture the wrapped child's status HERE, before this helper's own EXIT trap
+  # can misclassify it as an unexplained 5dive death. The user-facing parent
+  # preserves the status and explains pending vs failure; this marker only says
+  # the root helper did run gh and therefore must not emit the silent-exit bug
+  # report on top of gh's own output.
+  local rc=0
+  GH_TOKEN="$tok" GITHUB_TOKEN="" gh "${args[@]}" || rc=$?
+  (( rc != 0 )) && mark_reported
+  return "$rc"
 }

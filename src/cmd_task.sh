@@ -19,6 +19,10 @@ _task_usage() {
   set-body <id> <text...>|--file=<path> [--append]   replace the body, or append to it
   set-title <id> <text...>                      overwrite the title (audited; refused once closed)
   set-branch <id> <branch>                      bind the row to a git branch
+  wip-cap-install [--relane=<lane>]             snapshot each lane's actionable count as its
+                                                frozen WIP ceiling (deliberate, once)
+  set-budget <id> <tokens|\$cost|none>           raise/lower the token budget, or 'none' to exempt
+                                                the row from the enforced ${_TASK_BUDGET_BUILTIN:-5000000}-token default
 
   start <id>                                    -> in_progress
   done <id> [--result=<text>|--result-file=<path>] [--no-graded-sha]
@@ -193,6 +197,8 @@ cmd_task() {
     set-branch)      cmd_task_set_branch "$@" ;;
     set-body)        cmd_task_set_body "$@" ;;
     set-title)       cmd_task_set_title "$@" ;;
+    set-budget)      cmd_task_set_budget "$@" ;;
+    wip-cap-install) cmd_task_wip_cap_install "$@" ;;
     start)           cmd_task_start "$@" ;;
     done|close)      cmd_task_done "$@" ;;
     deliver)         cmd_task_deliver "$@" ;;
@@ -378,6 +384,86 @@ cmd_task_set_body() {
 # audited with the PRIOR title, because a retitle is exactly the edit that makes the
 # earlier discussion of a row unreadable if nobody can see what it used to say.
 # Refuses on a closed task, same guard as set-body: a closed row is frozen.
+# DIVE-2794 — set/raise/exempt a row's token budget AFTER it was filed.
+#
+# This verb is the difference between a usable carve-out and a theoretical one.
+# The enforced 5M default parks a row the heartbeat finds over budget, and the
+# incident case main flagged is a LIVE row at 3am that nobody filed with
+# `--task-budget=none` because nobody was thinking about budgets when the box
+# went down. Without a post-hoc setter the only escape is re-filing the row,
+# which loses its history mid-incident — so the exemption would exist only for
+# people who predicted they would need it. Unparking alone is NOT enough and is
+# the trap this closes: the sweep re-parks the row on the very next tick unless
+# the budget itself changed.
+# DIVE-2794 arm two — install the per-lane WIP caps. Deliberate, once, and the
+# ONLY thing that creates a cap: no cap is ever minted as a side effect of a
+# filing. Snapshots each lane's current actionable count as its frozen ceiling.
+#
+# Idempotent by default: a lane that already has a cap keeps it, because
+# re-snapshotting is exactly the "cap tracks the count" lock this arm exists to
+# avoid — running install twice must not ratchet anybody. --relane <lane> resets
+# one lane deliberately (a lead clear, the one sanctioned way a cap moves).
+cmd_task_wip_cap_install() {
+  tasks_db_init
+  local one=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --relane=*) one="${1#--relane=}" ;;
+      -*) fail "$E_USAGE" "unknown flag: $1 (usage: 5dive task wip-cap-install [--relane=<lane>])" ;;
+    esac
+    shift
+  done
+  local lane n installed=0 lines=""
+  while IFS= read -r lane; do
+    [[ -n "$lane" ]] || continue
+    [[ -z "$one" || "$lane" == "$one" ]] || continue
+    if [[ -z "$one" ]]; then
+      local have; have=$(db "SELECT value FROM task_prefs WHERE key=$(sqlq "wip_cap:$lane");" 2>/dev/null || echo "")
+      [[ "$have" =~ ^[0-9]+$ ]] && continue     # already installed: never re-snapshot
+    fi
+    n=$(_task_lane_actionable "$lane")
+    [[ "$n" =~ ^[0-9]+$ ]] || continue
+    # Floor of 1: a lane with no actionable rows would otherwise install cap 0,
+    # and `actionable >= cap` is then 0 >= 0 — a breach — so an EMPTY lane could
+    # never accept its first row and a brand-new agent would be frozen at birth.
+    (( n < 1 )) && n=1
+    db "INSERT INTO task_prefs (key,value) VALUES ($(sqlq "wip_cap:$lane"),$(sqlq "$n"))
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
+    installed=$((installed+1)); lines+="  ${lane}: ${n}"$'\n'
+  done < <(db "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL AND assignee!='' AND kind='standard';" 2>/dev/null)
+  ok "installed WIP caps for ${installed} lane(s)${lines:+
+$lines}" '{installed:$n}' --argjson n "${installed:-0}"
+}
+
+cmd_task_set_budget() {
+  tasks_db_init
+  local task="" val=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -*) fail "$E_USAGE" "unknown flag: $1" ;;
+      *)  if [[ -z "$task" ]]; then task="$1"; elif [[ -z "$val" ]]; then val="$1"; fi ;;
+    esac
+    shift
+  done
+  [[ -n "$task" && -n "$val" ]] \
+    || fail "$E_USAGE" "usage: 5dive task set-budget <id|DIVE-N> <tokens|\$cost|none>  (none = exempt this row from the enforced default)"
+  [[ "$val" =~ ^[1-9][0-9]*$ || "$val" =~ ^\$[0-9]+(\.[0-9]+)?$ || "$val" == "none" ]] \
+    || fail "$E_VALIDATION" "budget must be a token count (e.g. 50000), a dollar cost (e.g. \$1.50), or 'none'"
+  resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  local st; st=$(db "SELECT status FROM tasks WHERE id=${id};")
+  [[ "$st" != "done" && "$st" != "cancelled" ]] \
+    || fail "$E_VALIDATION" "$ident is already $st — a closed row spends nothing, so its budget is moot"
+  local prior; prior=$(db "SELECT COALESCE(task_budget,'(default)') FROM tasks WHERE id=${id};")
+  db "UPDATE tasks SET task_budget=$(sqlq "$val"), updated_at=datetime('now') WHERE id=${id};"
+  # Say the parked case out loud rather than leaving the caller to discover that
+  # raising a budget did not, by itself, restart anything.
+  local parked; parked=$(db "SELECT CASE WHEN parked_at IS NOT NULL THEN 1 ELSE 0 END FROM tasks WHERE id=${id};")
+  local hint=""
+  [[ "${parked:-0}" == "1" ]] && hint=" It is still PARKED — 5dive task unpark $ident to resume it."
+  ok "$ident budget ${prior} → ${val}.${hint}" '{ident:$i, budget:$b, parked:$p}' \
+     --arg i "$ident" --arg b "$val" --arg p "${parked:-0}"
+}
+
 cmd_task_set_title() {
   tasks_db_init
   local task=""
@@ -655,6 +741,93 @@ _task_unparented_followup_advisory() {
 }
 
 # ---------------------------------------------------------------------------
+# ── DIVE-2794 arm two: the per-LANE WIP cap ──────────────────────────────────
+#
+# Tokens cap what one row may SPEND; this caps how many rows a lane may HOLD.
+# Same verb, same refusal path, same carve-out — one mechanism over two
+# resources, because two independent refusals on `task add` would disagree,
+# print different remedies, and teach the fleet that a failed add is noise.
+#
+# WHAT IS COUNTED: todo + in_progress only. Not blocked, not parked, not
+# recurring templates. The fleet holds 55 blocked rows right now; a cap that
+# counted them would be over on day one for every lane, with no satisfiable path
+# back under — the unsatisfiable-gate shape we have shipped once and had to
+# unwind. A blocked row consumes no attention, and attention is the resource.
+#
+# THE CAP IS FROZEN, NOT TRACKING. Initialised to the lane's own actionable count
+# the first time the lane is seen, then it never moves except by a lead clear.
+# A close lowers the COUNT, which is what creates headroom; it does NOT lower the
+# cap. The first spec said every close lowers the cap, and that is a lock rather
+# than a ratchet: after each close actionable == cap again, so the next add
+# refuses forever and the lane drains to zero and stops working (caught in review
+# before it was built). Frozen keeps every property that was actually wanted —
+# close-one-to-file-one, no lane can grow, nobody defends a magic N.
+_task_lane_actionable() {
+  db "SELECT COUNT(*) FROM tasks
+      WHERE assignee=$(sqlq "$1") AND kind='standard'
+        AND status IN ('todo','in_progress') AND parked_at IS NULL;" 2>/dev/null || echo ""
+}
+
+# _task_wip_cap <lane> — READ ONLY. A lane with no INSTALLED cap is not capped,
+# and the caller must treat a non-zero return as "no cap", never as zero.
+#
+# THE CAP IS INSTALLED, NEVER MINTED LAZILY, and the difference is the whole
+# defect CI found. The spec says "initialise each lane's cap to its own
+# actionable count AT INSTALL"; the first cut substituted "mint it the first time
+# anyone looks", which is not the same thing and is strictly worse. Minting on
+# first sight means the baseline is whatever the store happened to contain at
+# that instant — so every harness that points FIVEDIVE_PROD_TASKS_DB at its own
+# fixture (they do it deliberately, to exercise DIVE-2681) minted a cap from a
+# half-built fixture and then refused the rest of its own setup. DIVE-2681's
+# header already warns about exactly this: "a rig building a fixture is not a
+# filing decision". A title-based cap survives it because fixture titles rarely
+# classify; a COUNT-based cap cannot. Install is an explicit act
+# (`5dive task wip-cap-install`), so a store nobody installed against is a store
+# with no caps, which is the correct answer for every fixture and every fresh
+# board.
+_task_wip_cap() {
+  local key="wip_cap:$1" cur
+  cur=$(db "SELECT value FROM task_prefs WHERE key=$(sqlq "$key");" 2>/dev/null || echo "")
+  [[ "$cur" =~ ^[0-9]+$ ]] || return 1
+  # FLOOR OF 1, and this is the whole zero-lock defect rather than a rounding
+  # nicety. A lane with no actionable rows mints cap 0, and `actionable >= cap`
+  # is then 0 >= 0 — a breach — so an EMPTY lane could never accept its first
+  # row. A brand-new agent would be frozen from birth, and any lane that
+  # legitimately drained to empty would freeze permanently. That is the exact
+  # drain-to-zero failure this arm's frozen cap was designed to avoid, let back
+  # in through the INITIALISATION path instead of the update rule. Caught by CI
+  # (gate_evidence_form_unit / audit_task_store_fence_unit both start from an
+  # empty fixture lane), not by the arms I wrote — every one of those seeds rows
+  # first, so none of them could see it.
+  (( cur < 1 )) && cur=1
+  printf '%s' "$cur"
+}
+
+# _task_lanes_with_headroom <exclude> — lanes strictly under their cap, for the
+# redirect. Naming them is the whole point: "this lane is full" is a dead end,
+# "this lane is full, dev2 and quinn have room" is a next action.
+_task_lanes_with_headroom() {
+  local skip="$1" lane cap act out=""
+  while IFS= read -r lane; do
+    [[ -n "$lane" && "$lane" != "$skip" ]] || continue
+    cap=$(_task_wip_cap "$lane") || continue
+    act=$(_task_lane_actionable "$lane")
+    [[ "$act" =~ ^[0-9]+$ ]] || continue
+    (( act < cap )) && out+="${out:+, }${lane} ($((cap - act)) free)"
+  done < <(db "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL AND assignee!='' AND kind='standard';" 2>/dev/null)
+  printf '%s' "$out"
+}
+
+# _task_lane_oldest <lane> <n> — the oldest actionable rows, so a refusal says
+# what is actually holding the lane rather than only that it is held.
+_task_lane_oldest() {
+  db "SELECT '  · '||COALESCE(ident,'?')||'  '||substr(COALESCE(title,''),1,60)
+      FROM tasks
+      WHERE assignee=$(sqlq "$1") AND kind='standard'
+        AND status IN ('todo','in_progress') AND parked_at IS NULL
+      ORDER BY COALESCE(created_at,'') ASC LIMIT ${2:-3};" 2>/dev/null || echo ""
+}
+
 # THE FILING CAP (DIVE-2681). Two controls over one classifier.
 #
 # The measured problem: across the 508 rows filed in the 8 days to 2026-08-02,
@@ -1028,7 +1201,7 @@ cmd_task_add() {
   tasks_db_init
   local body="" priority="medium" assignee="" parent="" from="" recurring="" fresh="" project="dive"
   local accept="" verify_cmd="" max_iters="" verifier="" task_budget="" no_verify="" branch=""
-  local customer_facing="" already_blocked=""
+  local customer_facing="" already_blocked="" materialized=""
   # DIVE-2627: which flag supplied each prose value (see _read_prose_file).
   local body_src="" accept_src=""
   local -a words=()
@@ -1072,6 +1245,10 @@ cmd_task_add() {
       # mandatory on the exception and is written into the body, because an
       # exception nobody can audit later is not an exception, it is an opt-out.
       --customer)          customer_facing="1" ;;
+      # DIVE-2794 arm two: set by the internal writers that turn one approved
+      # decision into N rows. Exempts the WIP cap only — never the DIVE-2681
+      # filing cap, which is about what a title IS, not how many there are.
+      --materialized)      materialized="1" ;;
       --already-blocked=*) already_blocked="${1#*=}" ;;
       # DIVE-824: per-run spend cap carried on the row (sibling to verify --timeout).
       # Value is either a bare token count or a "$cost" dollar figure.
@@ -1094,8 +1271,12 @@ cmd_task_add() {
   # DIVE-824: --task-budget is EITHER a bare token count ("50000") OR a dollar
   # cost ("$1.50" / "$2"). Reject anything else so a malformed cap can't silently
   # store as a no-op. Stored verbatim; the loop runner interprets the form.
-  [[ -z "$task_budget" || "$task_budget" =~ ^[1-9][0-9]*$ || "$task_budget" =~ ^\$[0-9]+(\.[0-9]+)?$ ]] \
-    || fail "$E_VALIDATION" "--task-budget must be a token count (e.g. 50000) or a dollar cost (e.g. \$1.50)"
+  # DIVE-2794 adds a fourth accepted value: the literal `none`, which is the
+  # ONLY exemption from the now-enforced 5M default. It is spelled rather than
+  # implied on purpose — see _hb_task_budget_sweep's header for why --customer
+  # and priority were both rejected as implicit carve-outs.
+  [[ -z "$task_budget" || "$task_budget" =~ ^[1-9][0-9]*$ || "$task_budget" =~ ^\$[0-9]+(\.[0-9]+)?$ || "$task_budget" == "none" ]] \
+    || fail "$E_VALIDATION" "--task-budget must be a token count (e.g. 50000), a dollar cost (e.g. \$1.50), or 'none' to exempt this row from the enforced default"
   # DIVE-1697: --branch seeds the delegated-push 'Branch: <name>' binding into the
   # body up front (same line set-branch writes/upserts later).
   if [[ -n "$branch" ]]; then
@@ -1249,6 +1430,73 @@ An internal-machinery finding gets its own ident ONLY if it has ALREADY blocked 
   · it already blocked something   →  --already-blocked='<what it blocked>'
   · the scan is wrong, this is a customer surface  →  --customer
   · fleet-wide override (emergencies)  →  FIVE_FILING_CAP=0"
+    fi
+  fi
+  # DIVE-2794 arm two: the WIP cap, checked here so it shares the DIVE-2681
+  # store-identity and refusal machinery rather than adding a second, disagreeing
+  # refusal to the same verb.
+  #
+  # EXEMPT: MATERIALIZATION, NOT FILING. Six internal writers reach this function
+  # (cmd_goal x2, cmd_loop, cmd_loop_pack, cmd_objective, cmd_proof). They turn
+  # ONE already-approved decision into N rows, so a cap firing halfway through
+  # leaves a HALF-MATERIALIZED plan — some children exist, some do not, and a
+  # loop driver is already waiting on a child list that is short. That is a
+  # silent, undesigned state, and strictly worse than an uncapped lane. They pass
+  # --materialized and are exempt; the rows they create still COUNT toward the
+  # lane, so the next HUMAN filing is the one that gets refused.
+  #
+  # PRIORITY. lodar ruled 2026-08-09 that only low and med get the hard refusal —
+  # "a quota that can block a SERIOUS finding will eventually eat one". That rule
+  # stands here verbatim. What it does not say, because nobody asked, is that a
+  # high/urgent row must be filed to the lane first named: so on a full lane those
+  # are REDIRECTED, never refused. The message names the lanes with headroom and
+  # `--assignee=<other>` succeeds immediately, so nothing is ever lost. And if
+  # EVERY lane is at cap the row lands anyway, uncapped, and trips the counter
+  # loudly — at that point the fleet is genuinely saturated and refusing a serious
+  # finding is the worse of the two failures. That branch existing is precisely
+  # what lets the rest of the rule be strict.
+  if [[ "$kind" == "standard" && -z "$materialized" && "$task_budget" != "none" \
+        && "${FIVE_WIP_CAP:-1}" != "0" && -n "$assignee" ]] && _task_filing_cap_store_is_prod; then
+    local _wcap _wact
+    _wcap=$(_task_wip_cap "$assignee") || _wcap=""
+    _wact=$(_task_lane_actionable "$assignee")
+    if [[ "$_wcap" =~ ^[0-9]+$ && "$_wact" =~ ^[0-9]+$ ]] && (( _wact >= _wcap )); then
+      # Counted on every trip, including the redirect and the saturated-fleet
+      # landing. If lanes hit the cap constantly that is a signal about INFLOW,
+      # and it is the number that says whether the frozen cap wants a scheduled
+      # decay after all — measured, rather than argued.
+      db "INSERT INTO task_prefs (key,value) VALUES ('wip_cap_trips','1')
+          ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INT)+1 AS TEXT), updated_at=datetime('now');" 2>/dev/null || true
+      local _oldest; _oldest=$(_task_lane_oldest "$assignee" 3)
+      if [[ "$priority" == "high" || "$priority" == "urgent" ]]; then
+        local _free; _free=$(_task_lanes_with_headroom "$assignee")
+        if [[ -n "$_free" ]]; then
+          # DISTINCT SLUG from the hard refusal below, and not a cosmetic choice:
+          # the slug is the key `task refusals` and the ledger group by, so one
+          # slug over both branches would make a REDIRECT (nothing lost, re-file
+          # elsewhere) indistinguishable from a REFUSAL (close something first)
+          # in exactly the data main needs to separate them in. Caught by
+          # tests/policy_refusals_unit.sh's duplicate-slug arm.
+          policy_refuse "$E_VALIDATION" wip-cap-lane-redirect DIVE-2794 "(unfiled) ${title}" \
+            "lane '${assignee}' is at its WIP cap (${_wact}/${_wcap} actionable). A ${priority} row is never refused — it is REDIRECTED, so re-file it to a lane with room:
+${_oldest}
+  lanes with headroom:  ${_free}
+  →  5dive task add \"${title}\" --priority=${priority} --assignee=<one of the above>
+Nothing is lost: this title is recorded in policy_refusals, and the re-file succeeds immediately."
+        else
+          # Saturated fleet: land it. Loudly.
+          warn "every lane is at its WIP cap — filing '${title}' to '${assignee}' anyway because a ${priority} row is never refused. The fleet is saturated (lane ${_wact}/${_wcap}); this is recorded in wip_cap_trips."
+        fi
+      else
+        policy_refuse "$E_VALIDATION" wip-cap-lane-full DIVE-2794 "(unfiled) ${title}" \
+          "lane '${assignee}' is at its WIP cap (${_wact}/${_wcap} actionable). Close something before adding to it — the cap is frozen, so closing a row is what makes room:
+${_oldest}
+  · file it elsewhere            →  --assignee=<other lane>
+  · it is serious                →  --priority=high (high/urgent are redirected, never refused)
+  · exempt this row deliberately →  --task-budget=none
+  · fleet-wide override          →  FIVE_WIP_CAP=0
+REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
+      fi
     fi
   fi
   # The exception is recorded ON THE ROW, not just consumed at the prompt. A cap
@@ -9241,6 +9489,83 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
       fi
     fi
   fi
+
+  # DIVE-3171 — EVERY GATE THE ORG ROOT FILES REACHES THE HUMAN BY CONSTRUCTION.
+  #
+  # `_gate_route_reviewer` walks UP the chart — reports_to, then the coordinator/root —
+  # skipping any candidate equal to the filer. For the ROOT of the chart BOTH candidates
+  # are the filer, so the walk falls off the end empty and the gate drops to the human
+  # ping. Not intermittently, and not about any one gate's subject: it is every gate the
+  # root ever files. DIVE-2612 already wrote the shape down from the FILER's side (its
+  # warn text: "for the root of the chart the coordinator fallback resolves to
+  # themselves"); this is the routing half of the same fact, which that ticket described
+  # and did not fix. lodar, 2026-08-10, in the third week of it: "why still this goes to
+  # me????? i was complaining for 3 weeks already".
+  #
+  # WHAT MAKES IT INVISIBLE: for every other seat the same code is correct, and the root
+  # is the one seat that files engineering gates while sitting ABOVE the engineering lead.
+  #
+  # THE SAME PREDICATE ON BOTH SIDES OF THE SAME DECISION. DIVE-2099 gave a NAMED agent
+  # STANDING authority over tier-1 engineering approvals, and `_gate_lead_standing_eligible`
+  # already decides whether a given gate is in scope. So `cmd_task_answer` ALREADY knows
+  # this gate is lead-clearable while the router does not — and a gate a lead is ALLOWED
+  # to clear must not be DELIVERED to a human. The predicate is REUSED verbatim rather
+  # than restated: two copies of "is this lead-clearable" are two things that can
+  # disagree, and the dangerous direction of disagreement is the router handing an agent
+  # a gate the answer path will then refuse.
+  #
+  # SEALED SOURCE, NEVER THE CHART. The fallback holder is `_gate_standing_lead` — the
+  # agent named in the constitution, trusted only while the live bytes still match the
+  # digest sealed into the council lineage. `agents_org` is agent-writable on a
+  # NOPASSWD:ALL host, which is exactly why DIVE-2099/2233 anchored authority to the seal;
+  # resolving THIS fallback from the chart would hand back the self-grant path they closed
+  # (re-parent yourself above the root, receive the root's gates). Note the direction the
+  # widening runs: the standing lead can ALREADY clear these gates unrouted (the DIVE-2099
+  # branch ignores `routed_reviewer` entirely), so this moves who is PINGED and shown the
+  # gate, never who may answer it.
+  #
+  # NARROW, AND FAIL CLOSED THREE WAYS — the ticket's negative arm is "do NOT widen this
+  # to route ALL unrouteable gates to the lead":
+  #   1. only when the chart resolves NOBODY. A filer who has a lead keeps that lead, and
+  #      a `decision` the root files (agent-clearable by type already) is untouched.
+  #   2. only when `_gate_lead_standing_eligible` says yes — `approval`, tier exactly 1, a
+  #      POSITIVE engineering classification, minus the tier-2 floor and the deny list. A
+  #      money/secret/brand/customer-box/tier-2 gate filed by the root still reaches the
+  #      human. That is the arm that stops this becoming a way to launder a hard gate past
+  #      a person, and it is why the eligibility predicate is the whole condition rather
+  #      than a piece of it.
+  #   3. only when the seal resolves a plain name that is NOT the filer. Drifted, unsealed,
+  #      no `authority.eng_approval_lead` key, an empty value, no council loader in scope,
+  #      or the root IS the named lead -> nothing -> the gate falls through to the human
+  #      exactly as it does today. Fail closed, same direction as everything it reuses.
+  #
+  # The verifier route wins where it fired: that gate already has an agent routee, so this
+  # is not the "nobody" case.
+  #
+  # `_sr_unrouteable` / `_sr_outcome` exist so the DECLINING branch is countable too.
+  # The three weeks this ticket is about were invisible in the store: an unrouted gate
+  # simply pinged the human and left no row saying a route had been ATTEMPTED and refused.
+  # A fix that only records its successes leaves the next regression with nothing to count
+  # (DIVE-3117's lesson, and its suppression row is the model).
+  local _standing_route=0 _standing_target="" _sr_filer="" _sr_unrouteable=0 _sr_outcome=""
+  if [[ "$_verifier_route" != "1" ]] && declare -F _gate_standing_lead >/dev/null 2>&1; then
+    _sr_filer=$(task_actor "")   # DIVE-2518: the DERIVATION, never the `--from` claim — same line the reviewer resolution below takes, for the same reason (this decides who may later clear).
+    if [[ -n "$_sr_filer" && -z "$(_gate_route_reviewer "$_sr_filer")" ]]; then
+      _sr_unrouteable=1; _sr_outcome=not-standing-eligible
+      local _sr_title; _sr_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
+      # DIVE-2224: ask and title as SEPARATE arguments — pre-joining them lets a
+      # bounded-distance pattern straddle the seam and GRANT on a phantom hit.
+      if _gate_lead_standing_eligible "$type" "$tier" "$ask" "$_sr_title"; then
+        _sr_outcome=no-standing-lead
+        local _sr_lead; _sr_lead=$(_gate_standing_lead 2>/dev/null || printf '')
+        if [[ -n "$_sr_lead" && "$_sr_lead" == "$_sr_filer" ]]; then _sr_outcome=standing-lead-is-filer; fi
+        if [[ -n "$_sr_lead" && "$_sr_lead" != "$_sr_filer" ]]; then
+          _standing_route=1; _standing_target="$_sr_lead"; _sr_outcome=routed
+        fi
+      fi
+    fi
+  fi
+
   local _routable=0
   case "$type" in
     decision) [[ "$tier" != "2" ]] && _routable=1 ;;
@@ -9277,6 +9602,13 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
   [[ "$_discusses_applied" == "1" ]] && _routable=1
   # DIVE-1495: a verifier-route gate is routable by kind (to the verifier agent).
   [[ "$_verifier_route" == "1" ]] && _routable=1
+  # DIVE-3171: the standing-lead fallback is routable BY KIND, for the same reason
+  # eng-ship is — `gate_builder_routing` defaults to OFF, so routable-but-pref-gated
+  # would move the ROUTING byte and still ping the human, which is the entire thing the
+  # ticket is about. And the root filer cannot reach the eng-ship kind to inherit its
+  # bypass: that downgrade only fires when `_es_reviewer` is non-empty, i.e. when a chart
+  # lead sits above the filer, which is precisely what the root does not have.
+  [[ "$_standing_route" == "1" ]] && _routable=1
   # DIVE-3117: there is deliberately NO `_pfr_lead_route && _routable=1` line here.
   # Suppressing the verifier route is the WHOLE change: the gate then takes the
   # SAME path a push-for-review gate on a row with no loop already takes (eng-ship
@@ -9330,6 +9662,23 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
       "task=$ident" "type=$type" "filer=$actor" "verifier=${_vf-}" \
       "routed=${_pfr_dest:-human}" || true
   fi
+  # DIVE-3171: one row per gate whose filer the ORG CHART could not route — recorded
+  # AFTER the `tier_arg=2` / `_needs_human` backstops, so `routed=` is what actually
+  # happened and not what this branch proposed. `outcome=` says which conjunct decided:
+  # `routed` (the seal named a lead and it took the gate), `not-standing-eligible` (the
+  # tier-2 floor / deny list / non-engineering / wrong type — acceptance arm 2, the human
+  # keeps it), `no-standing-lead` (drift, unsealed, absent key — arm 3, fail closed), or
+  # `standing-lead-is-filer` (the root IS the named holder; routing to them would be the
+  # self-clear path). Without this the declining branches are indistinguishable from a
+  # build that never had this code.
+  # DIVE-2054: task-store state for $ident, no channel proof — fenced.
+  if [[ "$_sr_unrouteable" == "1" ]]; then
+    local _sr_routed=human
+    [[ "$_standing_route" == "1" && "$_routable" == "1" ]] && _sr_routed="$_standing_target"
+    _task_store_audit_log "task need org-root standing-route" ok 0 -- \
+      "task=$ident" "type=$type" "tier=$tier" "filer=$_sr_filer" \
+      "outcome=$_sr_outcome" "standing_lead=${_standing_target:-<none>}" "routed=$_sr_routed" || true
+  fi
   if [[ "$_routable" == "1" ]]; then
     # DIVE-1243: `access` routing is intrinsic to the TYPE, so it does NOT wait on
     # the gate_builder_routing pref (which ship-gates the decision/approval/manual
@@ -9341,7 +9690,7 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
     # pref for the same reason eng-ship does. Routable-but-pref-gated would have left
     # answer A moving the TIER while the human still got the ping -- two layers, and
     # only the second one decides who is woken.
-    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_curation" == "1" || "$_internal_ops" == "1" || "$_discusses_applied" == "1" || "$_verifier_route" == "1" || "$_floored_by_title" == "1" ]]; then
+    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_curation" == "1" || "$_internal_ops" == "1" || "$_discusses_applied" == "1" || "$_verifier_route" == "1" || "$_floored_by_title" == "1" || "$_standing_route" == "1" ]]; then
       # DIVE-1495: a verifier-route targets the task's verifier directly; every
       # other kind resolves the filer's lead via the org chart.
       local _reviewer
@@ -9352,13 +9701,31 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
       # Recording the claim and obeying it are different things, and this is the line
       # where they part. Graded by T23, which seeds two DIFFERENT leads so a claim
       # that won would route somewhere visible.
-      if [[ "$_verifier_route" == "1" ]]; then _reviewer="$_route_target"; else _reviewer=$(_gate_route_reviewer "$(task_actor "")"); fi
+      # DIVE-3171: the standing-lead fallback resolves from the SEAL, and only in the
+      # case the chart already answered "nobody" — so it can never re-point a gate the
+      # chart did route.
+      if [[ "$_verifier_route" == "1" ]]; then _reviewer="$_route_target"
+      elif [[ "$_standing_route" == "1" ]]; then _reviewer="$_standing_target"
+      else _reviewer=$(_gate_route_reviewer "$(task_actor "")"); fi
       if [[ -n "$_reviewer" ]]; then
         # Persist the designated reviewer on the row. For approval/manual this is
         # what authorizes agent-<_reviewer> to clear the gate later; for decision
         # it is provenance only (decision is already agent-clearable by type).
-        db "UPDATE tasks SET routed_reviewer=$(sqlq "$_reviewer") WHERE id=${id};"
+        # DIVE-3171: record WHY this reviewer, in the same statement that records WHO.
+        # `cmd_task_answer` reads this to decide whether the clear is stamped `lead:`
+        # or `lead:standing:`, and the two facts must not be able to arrive separately
+        # — a row naming a reviewer with no source is the state this column exists to
+        # abolish. NULL therefore means "a build before this one wrote the name", never
+        # "the route had no source". Sibling to floor_provenance on the tier axis.
+        local _route_prov=chart
+        [[ "$_verifier_route" == "1" ]] && _route_prov=verifier-loop
+        [[ "$_standing_route" == "1" ]] && _route_prov=seal:standing-lead
+        db "UPDATE tasks SET routed_reviewer=$(sqlq "$_reviewer"), route_provenance=$(sqlq "$_route_prov") WHERE id=${id};"
         local _rrole="lead review"; [[ "$_verifier_route" == "1" ]] && _rrole="verifier review"
+        # DIVE-3171: name the SEALED fallback distinctly. "lead review" would read as the
+        # org chart having resolved somebody, and the whole point of this branch is that
+        # it did not — the reader needs to know which source picked this reviewer.
+        [[ "$_standing_route" == "1" ]] && _rrole="standing lead review (org root: no chart lead above the filer)"
         # DIVE-2011: the handoff goes through the SAME delivery assertion as the
         # human ping (task_need_notify dispatches on TASK_GATE_ROUTE_TO), so a
         # routed gate can no longer exit without a delivery verdict or leave the
@@ -11931,8 +12298,166 @@ _gate_tap_log() {
   return 0
 }
 
+# ── DIVE-3160: `_task_answer` — the delegated, SIGNED gate clear ─────────────
+#
+# THE DEFECT. A cli-scoped lead can CLEAR a gate it cannot SIGN. cmd_task_answer
+# signs the DIVE-756 closure in-process only at EUID 0; every other caller shells
+# out to `sudo -n 5dive gate-proof sign`, and a cli-scoped seat holds no grant for
+# it (its own `_sig_why` string says so, a few hundred lines below). Signing is
+# best-effort by design, so the answer LANDS UNSIGNED and `require_sig=1` on the
+# push/deploy root executors refuses it later — on the MAKER's next round-trip,
+# with a message about tampering. Standing to clear and capability to sign were
+# decided in two different places and nothing lined them up.
+#
+# WHY NOT THE OBVIOUS FIX — this is the load-bearing paragraph. "Grant a narrow
+# root verb that seals the STORED ROW" reads far safer than `gate-proof sign` over
+# stdin, and is not safer at all: /var/lib/5dive/tasks/tasks.db is `rw-rw----
+# root:claude` and EVERY agent seat is in group `claude` (measured 2026-08-10 on
+# both a cli-scoped seat and a root-all one), so a caller writes
+# `need_answered_by='human:lodar'` with plain sqlite3 FIRST and then asks for the
+# seal. tasks_db.sh's own note — "a raw-sqlite write that never ran
+# cmd_task_answer leaves an unsigned/invalid row that gate-proof verify flags" —
+# is the reason this HMAC exists at all. Narrowing the ARGUMENT (stdin -> ident)
+# changes the transport and never the trust: the payload is caller-authored
+# either way. The question is not what the verb accepts, it is who authored the
+# bytes it will attest to.
+#
+# So this primitive signs at ANSWER time, from facts it establishes ITSELF:
+#
+#   1. EUID 0 or refuse — reachable only through the exact-path NOPASSWD grant.
+#   2. WHO comes from SUDO_UID under sudo's env_reset, never argv, never --from.
+#      `_gate_uid_to_agent` fails closed on anything that is not an `agent-*` row.
+#   3. STANDING is re-derived AS ROOT FROM THE ROW (routed_reviewer, or the
+#      sealed constitution's standing lead) — never from anything the caller
+#      passed. Identity alone is not enough: a lead with standing on gate X must
+#      not clear gate Y. (_gh_do's posture, and main's condition 1.)
+#   4. It cannot stamp `human:*`. An agent-invoked path is by definition not a
+#      human tap, so the human-evidence flags are REFUSED here and `human` is
+#      additionally forced to 0 inside cmd_task_answer for this path (main's
+#      condition 2 — the DIVE-916/1115/2224 forged-human residual is a known open
+#      threat and a new root path must not become a fresh entrance to it).
+#   5. cmd_task_answer then runs its OWN authorization unchanged, at EUID 0, and
+#      signs in-process. Every check above is a SUBSET guard that refuses EARLIER;
+#      this primitive grants nothing and cannot widen who may clear what.
+#
+# SELF-CLEAR (main's open design question, settled here): a maker may not have its
+# own gate signed, and the maker is `maker_agent` — the loop spec's maker — NEVER
+# `assignee`. On DIVE-2159, the acceptance row for this ticket, `assignee` is the
+# VERIFIER (main2) and `maker_agent` is dev: a self-clear check keyed on assignee
+# would have refused the one legitimate clear this whole ticket exists to make
+# signable. When a row names no maker the check stays SILENT rather than guessing
+# from assignee — a guess in that column is exactly the error just described.
+# Every argument to `task answer` that can raise `human`, or that names an actor
+# the caller was not measured to be. A PREDICATE over ONE argument, so the harness
+# can grade the exact list the executor loops over rather than a copy of it — and
+# a source tripwire in that harness asserts the loop still calls this, because the
+# usual failure of an extracted check is a call site that quietly stops using it.
+_task_answer_forbidden_flag() {
+  case "${1:-}" in
+    --human|--human-proof=*|--channel-proof=*|--channel-msg=*|--tap-uid=*|--tap-username=*|--tap-msg=*|--relay-agent=*|--from=*) return 0 ;;
+  esac
+  return 1
+}
+
+cmd_task_answer_delegated() {
+  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "_task_answer is a privileged internal primitive (reachable only through the exact-path NOPASSWD grant)."
+
+  # Parameters over stdin, NUL-separated, never argv (main's condition 3): nothing
+  # gate-bearing lands in the process table, and the grant stays an exact command
+  # path with no wildcard, so it holds identically under classic sudo and sudo-rs.
+  # Same shape as _push_do and _gh_do.
+  local -a args=(); local a
+  while IFS= read -r -d '' a; do args+=("$a"); done
+  (( ${#args[@]} )) || fail "$E_VALIDATION" "_task_answer got no arguments on stdin."
+
+  # (2) WHO — the kernel's view of the DELEGATING caller. sudo's env_reset means
+  # SUDO_UID here was set by sudo itself; a caller-supplied one is stripped before
+  # this process starts. A root-all seat could of course forge it, but that seat
+  # can already reach `gate-proof sign` directly — this grant hands it nothing new.
+  local _ruid="${SUDO_UID:-}"
+  [[ "$_ruid" =~ ^[0-9]+$ ]] \
+    || fail "$E_AUTH_REQUIRED" "_task_answer: no SUDO_UID — reach this primitive through sudo from an agent seat, never as root directly (a root caller has no delegating agent to attribute the clear to)."
+  [[ "$_ruid" != "0" ]] \
+    || fail "$E_AUTH_REQUIRED" "_task_answer: SUDO_UID is root, which is not an agent seat."
+  local _actor; _actor=$(_gate_uid_to_agent "$_ruid")
+  [[ -n "$_actor" ]] \
+    || fail "$E_AUTH_REQUIRED" "_task_answer: uid ${_ruid} owns no agent-* passwd row, so this clear has no attributable agent."
+
+  # (4) NEVER human:*. Refused by NAME here so the refusal is greppable and lands
+  # before any write; `human=0` is forced again inside cmd_task_answer so a flag
+  # added later cannot reopen this.
+  for a in "${args[@]}"; do
+    _task_answer_forbidden_flag "$a" \
+      && fail "$E_VALIDATION" "_task_answer refuses ${a%%=*}: an agent-invoked clear is never a human tap, and provenance here is derived from SUDO_UID rather than passed in. Use '5dive task answer' for a human-sourced answer."
+  done
+
+  local _ident=""
+  for a in "${args[@]}"; do [[ "$a" == --* ]] && continue; _ident="$a"; break; done
+  [[ -n "$_ident" ]] || fail "$E_VALIDATION" "_task_answer got no task ident on stdin."
+
+  tasks_db_init
+  # (3) STANDING, re-derived as root from the ROW. All four columns are
+  # enum/agent-name/timestamp shaped, so the sqlite3 `|` separator is unambiguous.
+  local _row
+  _row=$(db "SELECT COALESCE(routed_reviewer,''),COALESCE(maker_agent,''),COALESCE(need_type,''),COALESCE(need_answered_at,'') FROM tasks WHERE ident=$(sqlq "$_ident") LIMIT 1;" 2>/dev/null || printf '')
+  [[ -n "$_row" ]] || fail "$E_VALIDATION" "_task_answer: no task ${_ident}."
+  local _rr _maker _ntype _answered _rest
+  _rr="${_row%%|*}";     _rest="${_row#*|}"
+  _maker="${_rest%%|*}"; _rest="${_rest#*|}"
+  _ntype="${_rest%%|*}"; _answered="${_rest#*|}"
+
+  [[ -n "$_ntype" ]]   || fail "$E_VALIDATION" "_task_answer: ${_ident} carries no gate."
+  [[ -z "$_answered" ]] || fail "$E_CONFLICT" "_task_answer: the gate on ${_ident} was already answered at ${_answered} — answer-once has no re-sign path (re-file a fresh gate)."
+
+  local _sl; _sl=$(_gate_standing_lead 2>/dev/null || printf '')
+  if [[ "$_actor" != "$_rr" ]] && [[ -z "$_sl" || "$_actor" != "$_sl" ]]; then
+    fail "$E_AUTH_REQUIRED" "_task_answer: ${_actor} holds no lead-clear standing on ${_ident} (routed reviewer: ${_rr:-<none>}). This primitive serves the lead-clear-that-cannot-sign case and nothing else."
+  fi
+
+  if [[ -n "$_maker" && "$_actor" == "$_maker" ]]; then
+    fail "$E_AUTH_REQUIRED" "_task_answer: ${_actor} is the MAKER of ${_ident} — signing your own gate is a self-clear, refused here even when the row routes the clear back to you."
+  fi
+
+  TASK_ANSWER_DELEGATED=1
+  cmd_task_answer "${args[@]}"
+}
+
+# The caller half: reach for the SIGNED path when, and only when, this seat is one
+# whose closures land unsigned today. A seat that can sign directly keeps today's
+# path byte for byte — routing a root-all seat through the executor would silently
+# apply the new refusals to flows that never had them, which is a policy change
+# this ticket was not asked to make. Failing closed is free here: on any refusal we
+# fall through to the existing path, which lands the answer exactly as it does
+# today (unsigned, with the DIVE-2760 notice naming the cause) — so this can make
+# a closure signed and can never make an answer fail.
+_task_answer_try_delegated() {
+  [[ $EUID -ne 0 ]]                        || return 1   # root already signs in-process
+  [[ -z "${TASK_ANSWER_DELEGATED:-}" ]]    || return 1   # no recursion from the executor
+  sudo -n -l /usr/local/bin/5dive gate-proof sign >/dev/null 2>&1 && return 1
+  sudo -n -l /usr/local/bin/5dive _task_answer    >/dev/null 2>&1 || return 1
+  local _out _rc=0
+  _out=$(printf '%s\0' "$@" | sudo -n /usr/local/bin/5dive _task_answer 2>&1) || _rc=$?
+  if (( _rc == 0 )); then printf '%s\n' "$_out"; return 0; fi
+  # It refused. Two different situations hide behind one exit code, so ASK THE ROW
+  # rather than parse the message: if the gate is answered, the write landed and
+  # re-running would trip answer-once or double-write; only an untouched gate may
+  # fall through.
+  local _ident="" a
+  for a in "$@"; do [[ "$a" == --* ]] && continue; _ident="$a"; break; done
+  if [[ -n "$_ident" ]]; then
+    local _now; _now=$(db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE ident=$(sqlq "$_ident") LIMIT 1;" 2>/dev/null || printf '')
+    if [[ -n "$_now" ]]; then printf '%s\n' "$_out"; return 0; fi
+  fi
+  warn "the signed clear (_task_answer) refused, so this answer will store UNSIGNED:"
+  printf '%s\n' "$_out" | sed 's/^/  /' >&2
+  return 1
+}
+
 cmd_task_answer() {
   tasks_db_init
+  # DIVE-3160: prefer the delegated SIGNED clear on a seat that cannot sign. Runs
+  # before any parsing so the executor sees the caller's arguments verbatim.
+  _task_answer_try_delegated "$@" && return 0
   local value="" value_set=0 from="" human=0 human_proof="" channel_proof="" channel_msg=""
   local tap_uid="" tap_username="" tap_msg="" relay_agent=""
   local -a positional=()
@@ -12263,8 +12788,35 @@ cmd_task_answer() {
   # stored assignee (the agent that hit the gate — `task need` stamps it) falling
   # back to created_by, the same COALESCE `owner` uses below, so the log still
   # answers "whose gate was this" without the answer feeding the decision.
+  # DIVE-3171 — THE ROUTED BRANCH MUST NOT SWALLOW THE STANDING PROVENANCE.
+  #
+  # This guard was `_lead_clear != 1`, i.e. "standing only gets a say when routing did
+  # not already grant clearance". Correct until DIVE-3171, because a gate whose reviewer
+  # came from the CHART is genuinely a routed clear. But DIVE-3171 routes the org root's
+  # eligible approvals to the SEALED standing lead — so routing now grants clearance to
+  # an agent whose authority came from the constitution, the routed branch fires first,
+  # and the row stamps `lead:<n>` for a clear the seal is the entire reason for. The
+  # authority chain stays intact and the RECORD stops carrying HOW, which is the exact
+  # class that cost three incidents on 2026-08-10 (two unattributed human taps read as
+  # agent self-clears; a census that reported "quinn cleared ZERO gates" and was wrong
+  # by four). `lead:standing:` is the only thing on the row separating "a lead cleared a
+  # gate routed to them" from "a lead cleared it under constitutional standing", and
+  # those are different authorities even when the same name appears in both.
+  #
+  # THE COUNTING ARGUMENT IS WHY IT IS FIXED NOW AND NOT LATER: anyone tallying
+  # `lead:standing:` for a root-filed gate would find it under `lead:` and conclude the
+  # standing path went unused — a silent shift in a number nobody re-derives.
+  #
+  # IT GRANTS NOTHING. The added disjunct only lets the block RUN; every conjunct inside
+  # is unchanged, so `_lead_standing=1` still requires the authenticated actor to BE the
+  # sealed lead and the gate to pass `_gate_lead_standing_eligible`. `_lead_clear` is
+  # already 1 on this path and cannot be raised by reaching here. The only reachable
+  # effect is the label — and it is scoped by `route_provenance` to rows THIS build
+  # wrote, so no historical stamp moves and the counts shift for exactly the population
+  # that was mislabelled.
   local _lead_standing=0
-  if [[ "$_lead_clear" != "1" && "$nt" == "approval" ]]; then
+  local _route_prov_row; _route_prov_row=$(db "SELECT COALESCE(route_provenance,'') FROM tasks WHERE id=${id};")
+  if [[ ( "$_lead_clear" != "1" || "$_route_prov_row" == "seal:standing-lead" ) && "$nt" == "approval" ]]; then
     local _ls_auth _ls_lead _ls_filer
     _ls_auth=$(_gate_authenticated_actor)
     _ls_filer=$(db "SELECT COALESCE(NULLIF(assignee,''), NULLIF(created_by,''), '') FROM tasks WHERE id=${id};")
@@ -12642,6 +13194,15 @@ cmd_task_answer() {
   # forever. `_lead_clear=1` also implies nt is approval|manual|access, the types
   # that always enter the evidence block, so _hp/_su are measured values here and
   # never their declaration defaults.
+  # DIVE-3160 (main's condition 2): the delegated executor must be STRUCTURALLY
+  # incapable of writing a `human:*` label, not merely conventionally unlikely to.
+  # `_task_answer` already refuses the human-evidence flags by name; this is the
+  # backstop, placed at the one point every raise-site (--human, _cp_ok, _cs_ok,
+  # and whatever the next one turns out to be) has already run and nothing has yet
+  # read `human` to decide provenance. An agent-invoked clear is `lead:*`, full
+  # stop — a new root path must not widen the DIVE-916/1115/2224 forged-human
+  # residual, which is open.
+  [[ -z "${TASK_ANSWER_DELEGATED:-}" ]] || human=0
   local _human_evid=$(( _hp || _su || _cp_ok ))
   local _human_claim="$human"
   if (( human && ! _human_evid )) && [[ "$_lead_clear" == "1" ]]; then

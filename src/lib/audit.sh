@@ -146,8 +146,18 @@ _actor_identity() {
 # Pure bash by construction: it goes through `actor_derive`, which reads `$EUID` and
 # walks /etc/passwd without `id`, `getent` or jq. audit_log is a best-effort writer on
 # every command path, so it must not gain a jq dependency or a registry read here.
+# DIVE-2130: every `return` below is `return 0`, spelled out. A BARE `return`
+# yields `$?`, and both of these run inside `audit_log`, which the EXIT trap calls
+# with the process's own exit status still pending. Measured on bash 5.2.21: in a
+# command substitution taken from an EXIT trap, a function that ends in a bare
+# `return` hands back the TRAP'S inherited status, not the 0 that `printf ''` just
+# set — so `claimed=$(_actor_identity_claim)` returned 3 for a refused `5dive push`,
+# tripped `set -e` INSIDE the trap, and killed the process before the row was ever
+# rendered. Every dispatcher-audited verb that exited non-zero silently wrote
+# nothing from 2026-08-02 (when DIVE-2518 added the claim) onward. A helper that
+# answers a question must never leak the caller's status.
 _actor_identity_derived() {
-  actor_derive >/dev/null 2>&1 || { printf ''; return; }
+  actor_derive >/dev/null 2>&1 || { printf ''; return 0; }
   printf '%s' "$ACTOR_UNIX"
 }
 
@@ -159,9 +169,9 @@ _actor_identity_derived() {
 _actor_identity_claim() {
   local claimed derived
   claimed=$(_actor_identity); derived=$(_actor_identity_derived)
-  [[ -n "$derived" ]] || { printf ''; return; }
-  [[ "$claimed" == "$derived" ]] && { printf ''; return; }
-  [[ "$claimed" == "${derived#agent-}" ]] && { printf ''; return; }
+  [[ -n "$derived" ]] || { printf ''; return 0; }
+  [[ "$claimed" == "$derived" ]] && { printf ''; return 0; }
+  [[ "$claimed" == "${derived#agent-}" ]] && { printf ''; return 0; }
   printf '%s' "$claimed"
 }
 
@@ -244,6 +254,15 @@ audit_log() {
   local ts
   ts=$(date -Iseconds)
   local line
+  # DIVE-2130: `--` before the positionals. `--args` does NOT stop jq's option
+  # parsing — jq 1.7 still reads a later `--branch=probe` as an option and dies
+  # with "Unknown option", stderr swallowed by the 2>/dev/null below. AUDIT_ARGS
+  # is `("$@")` for most verbs, so ANY invocation carrying a flag rendered no row
+  # at all, pass or fail. That is the half of this defect that predates DIVE-2518
+  # and it is why the DIVE-2129 probe (`push … --branch=probe-nonexistent`) saw
+  # nothing on 2026-07-26 while plain `push DIVE-N` refusals were still logging.
+  # And a render failure now leaves a drop marker instead of evaporating: a row
+  # the log cannot record is exactly what DIVE-1989 bought _audit_note_drop for.
   line=$(jq -cn \
     --arg ts "$ts" --arg u "$user" --arg c "$cmd" \
     --arg dv "$derived" --arg cl "$claimed" \
@@ -251,7 +270,9 @@ audit_log() {
     --args '{ts:$ts, user:$u, cmd:$c, result:$r, code:($code|tonumber? // 0), args:$ARGS.positional}
             + (if $dv == "" then {} else {derived:$dv} end)
             + (if $cl == "" then {} else {claimed:$cl} end)' \
-    "${sanitized[@]+"${sanitized[@]}"}" 2>/dev/null) || return 0
+    -- "${sanitized[@]+"${sanitized[@]}"}" 2>/dev/null) \
+    || { _audit_note_drop "$(jq -Rn --arg s "cmd=${cmd} result=${result} code=${code} args=${sanitized[*]:-}" '$s' 2>/dev/null)" \
+           "render-failed"; return 0; }
   _emit_audit_line "$line"
 }
 
@@ -278,7 +299,13 @@ on_exit_audit() {
   [[ -n "$AUDIT_CMD" ]] || return 0
   local result="ok"
   (( code != 0 )) && result="error"
-  audit_log "$AUDIT_CMD" "$result" "$code" -- "${AUDIT_ARGS[@]+"${AUDIT_ARGS[@]}"}"
+  # DIVE-2130: `|| true` is load-bearing, not decoration. `set -e` is suspended for
+  # the whole of a `||` list — INCLUDING inside the called function — so this is what
+  # makes "audit is best-effort" true of the writer rather than only of its comments.
+  # Without it, one non-zero status anywhere in audit_log truncates the EXIT trap and
+  # the process dies mid-teardown, which is how the entire error class of rows went
+  # missing here. Belt and braces: the bare-`return` root cause is fixed above.
+  audit_log "$AUDIT_CMD" "$result" "$code" -- "${AUDIT_ARGS[@]+"${AUDIT_ARGS[@]}"}" || true
 }
 
 # Serialize mutating calls against a single flock. Lock is released when the

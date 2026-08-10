@@ -620,9 +620,23 @@ declare -A TYPE_PERSONA_FILE=(
   [pi]=".pi/agent/AGENTS.md"
   # antigravity reuses Google's ~/.gemini parent (see the TYPE_BIN note).
   [antigravity]=".gemini/GEMINI.md"
-  # hermes and openclaw are DELIBERATELY UNMAPPED: neither has been probe-verified
-  # on a live seat, and a guessed path is exactly the silent no-op this ticket
-  # removes. Creating one with a role warns loudly and installs nothing.
+  # hermes: NOT ~/.hermes/AGENTS.md, which is the path everyone guesses (DIVE-2245
+  # said so itself). hermes' prompt_builder loads AGENTS.md / CLAUDE.md from the
+  # CWD ONLY — a home-level one is never read — while SOUL.md is the identity slot
+  # it reads from HERMES_HOME (~/.hermes) and always injects. Measured on a live
+  # seat: NOT TOLD -> "I am Quill, the Release Archivist". `hermes gateway install`
+  # PRESEEDS SOUL.md with the Nous default identity during create, so this is an
+  # occupied slot like codex's — persona_install_doc PREPENDS, and an overwrite
+  # would delete the harness's own default persona.
+  [hermes]=".hermes/SOUL.md"
+  # openclaw injects a fixed set of WORKSPACE files every session (AGENTS.md,
+  # SOUL.md, TOOLS.md, IDENTITY.md, USER.md); the workspace root is ~/.openclaw/
+  # workspace, NOT the agent's --workdir and NOT a pi-shaped path. AGENTS.md is
+  # the operating-instructions slot, which is where a role + reporting line
+  # belongs (SOUL.md is tone/boundaries). Measured on a live seat: NOT TOLD ->
+  # "my job title on this team is Ledger Steward". openclaw's first-run bootstrap
+  # writes all of these during create, so this is an occupied slot too.
+  [openclaw]=".openclaw/workspace/AGENTS.md"
 )
 
 # OpenCode reads provider API keys directly from standard environment variables.
@@ -718,6 +732,17 @@ declare -A OPENCLAW_PROVIDER_ID=(
   [moonshot]="moonshot"
   [openrouter]="openrouter"
   [nous]=""
+  # DIVE-3130: openclaw 2026.7.1-2's catalog enumerates NO zai models
+  # (`models list --provider zai --plain` → "No models found"; the GLM ids it
+  # carries sit under byteplus/, novita/, nvidia/, together/ and volcengine/).
+  # zai is KEPT rather than dropped, deliberately: an unenumerated namespace is a
+  # NO-ORACLE state, not a proof of unroutability (see
+  # community/wiki/a-byo-model-pin-can-only-be-graded-off-ci.md), and the
+  # DIVE-1826 coding-endpoint pin in OPENCLAW_PROVIDER_URL still applies. What
+  # changed is that a zai seat can no longer be created WITHOUT a model: with no
+  # OPENCLAW_PROVIDER_MODEL row, _apply_byo_openclaw now refuses unless the
+  # operator passes --model. Do not add a [zai] model row here until an id is
+  # graded against `models list --provider zai --plain` on the installed version.
   [zai]="zai"
   [minimax]="minimax"
   [qwen]="qwen"

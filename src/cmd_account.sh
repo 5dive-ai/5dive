@@ -22,12 +22,32 @@ account_agents_bound() {
 # account_types_authed <name> — JSON array of types whose credential
 # sentinel exists under the profile dir. Mirrors auth_creds_present but
 # scoped to a specific profile (no shared-config fallback).
+#
+# Accumulates into a bash array and serializes ONCE at the end. It used to
+# re-serialize the JSON accumulator through a fresh jq on every hit and run a
+# `jq -e` membership probe per dedup check — a per-account constant that
+# cmd_account_list pays once per profile, which is how `account list` reached
+# ~3.1s (past the telegram plugin's budget) on slow boxes. DIVE-3088.
+#
+# The array-producing half is split out as account_types_authed_arr so
+# cmd_account_list can consume the type list directly (it used to serialize to
+# JSON here and immediately re-parse it with another `jq -r '.[]'`).
 account_types_authed() {
-  local name="$1" type path out="[]"
+  account_types_authed_arr "$1"
+  jq -cn '$ARGS.positional' --args ${ACCOUNT_TYPES_AUTHED[@]+"${ACCOUNT_TYPES_AUTHED[@]}"}
+}
+
+# account_types_authed_arr <name> — same detection, result left in the global
+# array ACCOUNT_TYPES_AUTHED (reset on every call). Spawns nothing.
+ACCOUNT_TYPES_AUTHED=()
+account_types_authed_arr() {
+  local name="$1" type path
+  local -a out=()
+  local seen=" "   # " a b " — membership test without a subprocess
   for type in "${!TYPE_BIN[@]}"; do
     path=$(profile_type_auth_path "$name" "$type" 2>/dev/null) || continue
     [[ -n "$path" && -s "$path" ]] || continue
-    out=$(jq -c --arg t "$type" '. + [$t]' <<<"$out")
+    out+=("$type"); seen+="$type "
   done
   # Also surface env-var-only credentials (api keys written by `auth set`)
   # — combined.env carries them without a per-type credential file.
@@ -41,8 +61,8 @@ account_types_authed() {
       if grep -q "^${var}=" "$env_file" 2>/dev/null \
          || ([[ "$type" == "claude" ]] && grep -q "^CLAUDE_CODE_OAUTH_TOKEN=" "$env_file" 2>/dev/null); then
         # Dedup: skip if already added via per-type sentinel above.
-        if ! jq -e --arg t "$type" 'index($t) != null' <<<"$out" >/dev/null; then
-          out=$(jq -c --arg t "$type" '. + [$t]' <<<"$out")
+        if [[ "$seen" != *" $type "* ]]; then
+          out+=("$type"); seen+="$type "
         fi
       fi
     done
@@ -55,14 +75,14 @@ account_types_authed() {
     local pv
     for pv in "${PI_PROVIDER_VAR[@]}"; do
       if grep -qE "^${pv}=.+" "$env_file" 2>/dev/null; then
-        if ! jq -e '. as $a | "pi" | IN($a[])' <<<"$out" >/dev/null; then
-          out=$(jq -c '. + ["pi"]' <<<"$out")
+        if [[ "$seen" != *" pi "* ]]; then
+          out+=("pi"); seen+="pi "
         fi
         break
       fi
     done
   fi
-  echo "$out"
+  ACCOUNT_TYPES_AUTHED=(${out[@]+"${out[@]}"})
 }
 
 # account_signin_detail <name> <type> — per-(profile, type) sign-in detail
@@ -245,27 +265,61 @@ account_each() {
   done
 }
 
+# cmd_account_list is on the hot path for /account in the telegram plugin (a
+# 3s-budgeted `5dive account list --json`) and for the new-agent wizard's
+# profile tiles. It used to fork jq once per account for the row accumulator,
+# once per authed type for the signins accumulator, and re-read the whole
+# registry per account via account_agents_bound — a spawn count that GROWS with
+# the fleet, which is what pushed it past the plugin's budget on slow boxes.
+#
+# Now: each account contributes one tab-separated record
+#   <name> \t <types,csv> \t <type> \t <signin-json> \t <type> \t <signin-json>…
+# built with shell builtins only, and ONE jq pass assembles every row, joins
+# the bound-agent index from a SINGLE registry read, and emits the array.
+# Per-account spawns left: account_signin_detail's, and only for authed types.
+# DIVE-3088.
 cmd_account_list() {
   ensure_state_ro
   [[ $# -eq 0 ]] || fail "$E_USAGE" "usage: 5dive account list"
-  local rows="[]" name types agents signins t detail
+  local rows name t detail rec csv
+  local -a recs=() fields=() atypes=()
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
-    types=$(account_types_authed "$name")
-    agents=$(account_agents_bound "$name")
+    # Copy out of the global before iterating it: nothing in the loop body calls
+    # account_types_authed* today, but a callee that did would rewrite the list
+    # being walked.
+    account_types_authed_arr "$name"
+    atypes=(${ACCOUNT_TYPES_AUTHED[@]+"${ACCOUNT_TYPES_AUTHED[@]}"})
+    printf -v csv '%s,' ${atypes[@]+"${atypes[@]}"}
+    fields=("$name" "${csv%,}")
     # Build per-type signin details so the new-agent wizard's profile tiles
     # can show "Anthropic · claude-sonnet-4-5 · signed in May 12" instead of
     # all three orphan profiles reading identically as "Not used yet".
-    signins="{}"
-    while IFS= read -r t; do
-      [[ -n "$t" ]] || continue
+    for t in ${atypes[@]+"${atypes[@]}"}; do
       detail=$(account_signin_detail "$name" "$t")
       [[ "$detail" != "{}" ]] || continue
-      signins=$(jq -c --arg k "$t" --argjson v "$detail" '. + {($k):$v}' <<<"$signins")
-    done < <(jq -r '.[]' <<<"$types" 2>/dev/null)
-    rows=$(jq -c --arg n "$name" --argjson t "$types" --argjson a "$agents" --argjson s "$signins" \
-      '. + [{name:$n, types:$t, agents:$a, signins:$s}]' <<<"$rows")
+      fields+=("$t" "$detail")
+    done
+    printf -v rec '%s\t' "${fields[@]}"
+    recs+=("${rec%$'\t'}")
   done < <(account_each)
+  rows=$(printf '%s\n' ${recs[@]+"${recs[@]}"} | jq -Rsc --argjson reg "$(registry_read)" '
+    # bound-agent index: profile -> [agent], from ONE registry read. Mirrors
+    # account_agents_bound s select(.value.authProfile == $p), per profile.
+    ( ($reg.agents // {}) | to_entries
+      | reduce .[] as $e ({};
+          ($e.value.authProfile // null) as $p
+          | if ($p | type) != "string" then . else .[$p] = ((.[$p] // []) + [$e.key]) end)
+    ) as $bound
+    | split("\n") | map(select(length > 0))
+    | map(split("\t")
+          | .[0] as $n
+          | .[2:] as $sig
+          | { name:  $n,
+              types: (if .[1] == "" then [] else (.[1] | split(",")) end),
+              agents: ($bound[$n] // []),
+              signins: (reduce range(0; ($sig | length); 2) as $i
+                          ({}; .[$sig[$i]] = ($sig[$i + 1] | fromjson))) })')
   if (( JSON_MODE )); then
     echo "$rows" | jq -c '{ok:true, data: .}'
   else
