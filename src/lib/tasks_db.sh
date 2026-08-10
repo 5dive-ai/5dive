@@ -303,6 +303,18 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- DIVE-1518: independently records which authenticated evidence form cleared
   -- the current gate (tap nonce, sudo uid, channel session, or proof).
   human_evidence   TEXT,
+  -- DIVE-3128: the RELAY, kept OUT of need_answered_by rather than folded into
+  -- it. A Telegram button tap reaches this CLI through some agent's bot, and
+  -- until now the relaying agent's own identity was what got the `human:`
+  -- prefix — so `human:olivia` meant either "a person tapped, olivia's bot
+  -- carried it" or "the olivia agent cleared its own human gate", with nothing
+  -- in the row to tell them apart (DIVE-3045). Two columns, two facts:
+  --   need_answered_by     WHO decided
+  --   need_answered_relay  WHOSE BOT carried the decision
+  -- need_answered_tap_uid is the Telegram user id of the person who tapped, kept
+  -- as TEXT because Telegram ids are opaque identifiers, not arithmetic.
+  need_answered_relay   TEXT,
+  need_answered_tap_uid TEXT,
   -- Recurring task templates (DIVE step 1). kind='recurring' marks a row as a
   -- TEMPLATE, not work: it's excluded from the work board, the heartbeat TODO
   -- count + wake, and the human inbox, so it's never picked up directly.
@@ -1174,6 +1186,9 @@ _TASKS_ADDITIVE_COLUMNS=(
   'originated_by_objective INTEGER' 'originated_cycle INTEGER'
   'verify_unavailable INTEGER' 'last_skipped_at TEXT'
   'human_evidence TEXT' 'derived_actor TEXT' 'floor_provenance TEXT'
+  # DIVE-3128: the tapping human vs the relaying bot, separated. See the CREATE
+  # TABLE comment above for why folding them into one string was the defect.
+  'need_answered_relay TEXT' 'need_answered_tap_uid TEXT'
   # DIVE-3098: a verifier grade recorded by `task verify --no-done`. Structural on
   # purpose — the terminal-for-verifier predicate must not key on result TEXT,
   # which the MAKER's `task deliver --result=` also writes.

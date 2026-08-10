@@ -47,6 +47,8 @@ _task_usage() {
       [--secret-key=<ENV> --connector=<stem> | --out-of-band="<where>"]   (--type=secret needs one)
   need <id> --withdraw                          cancel a pending gate that is now moot
   answer <id> --value="..." [--proof=<token>] [--channel-proof=<chat> [--channel-msg=<id>]]
+      [--tap-uid=<tg user id> [--tap-username=<handle>] [--tap-msg=<message id>]]
+      [--relay-agent=<name>]     a button tap: WHO tapped, and whose bot carried it
   clear-recs --channel-proof=<chat_id> [--only=<id>]     apply pending recommendations
   inbox [--send [--channel-proof=<chat>]]       human-gated rows; --send DMs the owner
   coordinator [--json]                          the agent fronting the needs-you banner
@@ -1400,7 +1402,7 @@ cmd_task_ls() {
     # regression test asserts against (tests/task_reject_trace_unit.sh, arm C).
     # NB: no inline SQL `--` comments in this string —
     # dbfmt flattens newlines, so a `--` would comment out the rest of the query.
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, tier, kind, schedule, last_fired_at, last_skipped_at, parked_at, park_reason, wake_at, project_key, maker_agent, verifier,
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, need_answered_relay, need_answered_tap_uid, tier, kind, schedule, last_fired_at, last_skipped_at, parked_at, park_reason, wake_at, project_key, maker_agent, verifier,
              CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
                   THEN CASE WHEN handoff_ack_at IS NOT NULL THEN 'reviewing' ELSE 'delivered' END
                   ELSE NULL END AS handoff_state,
@@ -11519,9 +11521,96 @@ _loop_answer_is_bounce() {
   return 1
 }
 
+# ── DIVE-3128: a button tap, attributed and recorded ─────────────────────────
+#
+# WHO the tapping Telegram uid IS. Resolution order, widest evidence first:
+#
+#   1. ${STATE_DIR}/humans.json  — `{"humans": {"<tg-uid>": "<name>"}}`. An
+#      explicit operator-maintained map. It is the only source that can give a
+#      person the name the org actually calls them, so it wins.
+#   2. the Telegram @username carried on the SAME callback. Telegram owns this
+#      field; the relaying bot cannot set it for someone else. Shape-checked to
+#      Telegram's own handle grammar so nothing exotic reaches a provenance
+#      string.
+#   3. `tg:<uid>` — the honest non-answer.
+#
+# RUNG 3 IS THE POINT OF THE LADDER, not its fallback embarrassment. The defect
+# this closes is a row that named the WRONG principal, not a row that named
+# nobody: `human:tg:1234567890` says "a person we have not put a name to tapped
+# this", which a reader can act on, and it cannot collide with a roster name
+# because agent names are bare tokens and this one carries a colon. There is
+# deliberately no rung that falls back to the RELAYING AGENT'S name — that rung
+# is precisely DIVE-3045.
+#
+# The map file is read at CALL time, not resolved at source time, so a harness
+# that sets STATE_DIR after sourcing (every harness in tests/) points at its own
+# fixture rather than the box's.
+_gate_tap_human_name() {
+  local uid="${1:-}" uname="${2:-}" mapped=""
+  [[ "$uid" =~ ^-?[0-9]{1,20}$ ]] || { printf ''; return 1; }
+  local map="${HUMANS_MAP:-${STATE_DIR}/humans.json}"
+  if [[ -r "$map" ]]; then
+    mapped=$(jq -r --arg u "$uid" '(.humans[$u] // empty)' "$map" 2>/dev/null || true)
+    # A mapped value still has to be a plain token: this string is about to be
+    # concatenated into `human:<name>` and stored as provenance, and a mapping
+    # file carrying `lodar human:root` would forge a second field.
+    [[ "$mapped" =~ ^[A-Za-z][A-Za-z0-9_.-]{0,31}$ ]] && { printf '%s' "$mapped"; return 0; }
+  fi
+  uname="${uname#@}"
+  # Telegram's own handle rule: 5-32 chars, letters/digits/underscore, letter
+  # first. Same grammar cmd_telegram_resolve_handle validates against.
+  [[ "$uname" =~ ^[A-Za-z][A-Za-z0-9_]{4,31}$ ]] && { printf '%s' "$uname"; return 0; }
+  printf 'tg:%s' "$uid"
+}
+
+# THE TAP LEDGER. Before this, an inline-button tap was the LEAST logged path in
+# the system for the control that is supposed to be the most rigorously evidenced:
+# the callback arrived, a `task answer` ran, and the only trace was whatever the
+# answer itself stored. Reconstructing "did a human really press this, and which
+# human" meant reading someone else's shell history.
+#
+# Append-only JSONL next to the other append-only ledgers (the council's
+# veto-audit.jsonl), same permissions posture: 0600, root-owned when we are root.
+# Best-effort by construction — a box that cannot write this file must not lose a
+# human's answer over it — but "best effort" here means the WRITE may fail, never
+# that the call is skipped.
+#
+# THE RAW NONCE IS NEVER WRITTEN. `human_nonce_hash` is hash-only at rest for the
+# reason DIVE-916 gives, and a ledger that recorded the presented nonce would undo
+# that at a second address. We record only WHETHER one was presented.
+_gate_tap_log() {
+  local log="${GATE_TAP_LOG:-${STATE_DIR}/gate-taps.jsonl}"
+  local dir="${log%/*}"
+  [[ -d "$dir" ]] || mkdir -p "$dir" 2>/dev/null || return 0
+  local line
+  line=$(jq -cn \
+    --arg ts        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    --arg ident     "${1:-}" \
+    --arg tier      "${2:-}" \
+    --arg type      "${3:-}" \
+    --arg tap_uid   "${4:-}" \
+    --arg tap_user  "${5:-}" \
+    --arg tap_msg   "${6:-}" \
+    --arg relay     "${7:-}" \
+    --arg resolved  "${8:-}" \
+    --arg stamp     "${9:-}" \
+    --arg nonce     "${10:-}" \
+    --arg verdict   "${11:-}" \
+    --arg via       "${12:-}" \
+    '{ts:$ts, gate:$ident, tier:$tier, type:$type, tap_uid:$tap_uid,
+      tap_username:$tap_user, tap_message_id:$tap_msg, relay_agent:$relay,
+      resolved_human:$resolved, resolved_via:$via, stamped_as:$stamp,
+      human_proof:$nonce, verdict:$verdict}' 2>/dev/null) || return 0
+  printf '%s\n' "$line" >>"$log" 2>/dev/null || return 0
+  chmod 0600 "$log" 2>/dev/null || true
+  [[ $EUID -eq 0 ]] && chown root:root "$log" 2>/dev/null || true
+  return 0
+}
+
 cmd_task_answer() {
   tasks_db_init
   local value="" value_set=0 from="" human=0 human_proof="" channel_proof="" channel_msg=""
+  local tap_uid="" tap_username="" tap_msg="" relay_agent=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -11556,6 +11645,22 @@ cmd_task_answer() {
       # WHICH conversation, and only this says the human actually spoke in it —
       # and it is checked against Telegram, not against the caller's word.
       --channel-msg=*) channel_msg="${1#*=}" ;;
+      # DIVE-3128: WHO TAPPED, and WHOSE BOT CARRIED IT — two flags because they
+      # are two facts. The tap handler reads both straight off Telegram's
+      # `callback_query`: `.from.id` is the person who pressed the button and
+      # `.from.username` is their handle, neither of which the relaying agent
+      # chooses. Before this the relay's own identity was all that reached the
+      # row and it wore the `human:` prefix (DIVE-3045).
+      #
+      # These are PROVENANCE, not authority. Nothing below is authorized by them:
+      # a tap still clears a tier-2 gate on the DIVE-916 nonce or a non-agent
+      # SUDO_UID exactly as before, and passing --tap-uid without that evidence
+      # buys nothing. What they change is what the record SAYS about an answer
+      # that was already going to land.
+      --tap-uid=*)      tap_uid="${1#*=}" ;;
+      --tap-username=*) tap_username="${1#*=}" ;;
+      --tap-msg=*)      tap_msg="${1#*=}" ;;
+      --relay-agent=*)  relay_agent="${1#*=}" ;;
       --)        shift; positional+=("$@"); break ;;
       -*)        fail "$E_USAGE" "unknown flag: $1" ;;
       *)         positional+=("$1") ;;
@@ -12218,7 +12323,88 @@ cmd_task_answer() {
   if (( human && ! _human_evid )) && [[ "$_lead_clear" == "1" ]]; then
     human=0
   fi
-  (( human )) && answered_by="human:${answered_by}"
+  # ── DIVE-3128: NAME THE PERSON, NOT THE PIPE ──────────────────────────────
+  #
+  # `$answered_by` at this point is the ACTOR — the identity of the process that
+  # ran `task answer`. On the tap path that process is a BOT, so prefixing it with
+  # `human:` produced `human:olivia`: an assertion about a person, built out of a
+  # measurement of a relay. That is DIVE-3045, and it is not a forgery — it is the
+  # honest output of asking the wrong question.
+  #
+  # So when the caller carried a tap, the person who pressed the button is what
+  # gets stamped, and the relay is recorded in its OWN column further down. When
+  # no tap was carried, nothing here changes: `$answered_by` stays the actor and
+  # every existing path keeps its current stamp.
+  #
+  # `(( human ))` fences the whole thing. --tap-uid is provenance, never
+  # authority: an answer that did not already qualify as human-sourced does not
+  # become one by naming a Telegram id, so a tap presented without the DIVE-916
+  # nonce or a non-agent SUDO_UID is still refused upstream and never reaches here.
+  local _tap_name="" _tap_src="none"
+  if (( human )) && [[ -n "$tap_uid" ]]; then
+    _tap_name=$(_gate_tap_human_name "$tap_uid" "$tap_username") || _tap_name=""
+    if [[ -n "$_tap_name" ]]; then
+      case "$_tap_name" in tg:*) _tap_src="unnamed-uid" ;; *) _tap_src="resolved" ;; esac
+      answered_by="$_tap_name"
+    else
+      # A tap_uid that is not a Telegram id at all. Do NOT fall through to the
+      # actor — that silently restores the exact substitution this block removes.
+      _tap_src="bad-uid"
+      answered_by="tg:invalid"
+    fi
+  fi
+
+  # ── DIVE-3128: A `human:` STAMP MAY NOT NAME AN AGENT ─────────────────────
+  #
+  # The cheap invariant, and it is checked on EVERY human stamp rather than only
+  # on the tap path — because the tap path is where this was DISCOVERED, not the
+  # only place it can happen. Any relay that clears a gate while running as an
+  # agent reaches this line with an agent name in `$answered_by`, and the fix
+  # above only covers the callers that were taught to send `--tap-uid`.
+  #
+  # REFUSED, NOT REPAIRED. There is no honest repair available here: the code knows
+  # the name is wrong and has nothing better to put in its place, so it declines to
+  # make the claim. `unattributed:<name>` keeps every fact that WAS measured (a
+  # --human answer arrived, this process ran it) while withholding the one that was
+  # not, and it does not start with `human:` — so cmd_trace, cmd_digest, cmd_proof
+  # and the precedent engine, all of which key on `need_answered_by LIKE 'human:%'`,
+  # stop counting it as a human touch with no change on their side. That is the
+  # DIVE-2406 demotion pattern one screen up, applied to a different lie.
+  #
+  # It is a DEMOTION rather than a `fail`, deliberately. The answer itself is
+  # already authorized by evidence this block does not re-litigate, and refusing
+  # the WRITE would discard a decision a person may really have made and leave a
+  # tier-2 gate open with no way to close it. What is refused is the CLAIM.
+  #
+  # `human` is deliberately NOT cleared: the two `(( ! human ))` guards below add
+  # `lead:` / `lead:standing:` prefixes, and firing them here would relabel a
+  # refused human claim as an authorized lead clear — a second wrong answer.
+  local _attr_why="" _attr_unverified=0
+  if (( human )); then
+    if actor_human_name_ok "$answered_by"; then
+      [[ "${ACTOR_HUMAN_NAME_WHY:-}" == "roster-unmeasured" ]] && _attr_unverified=1
+      answered_by="human:${answered_by}"
+    else
+      local _attr_name="$answered_by"
+      _attr_why="${ACTOR_HUMAN_NAME_WHY:-refused}"
+      answered_by="unattributed:${_attr_name}"
+      warn "$ident: refusing to record this answer as human:${_attr_name} — '${_attr_name}' is a name on the AGENT roster, so the stamp would assert a human where the record can only show a relay (DIVE-3128). Stored as '${answered_by}'. A button tap should carry --tap-uid=<telegram user id> so the person who pressed it is named."
+      # STDERR IS NOT REDIRECTED HERE, and that is a correction rather than a
+      # style choice. `_task_store_audit_log`'s off-prod-store withholding is
+      # announced ONCE per invocation (DIVE-2010, `_TASK_STORE_AUDIT_FENCED`), so
+      # a `2>/dev/null` on the FIRST call through it eats the announcement for
+      # every later one — measured against tests/gate_answer_audit_unit.sh, whose
+      # "a silent fence is the same fail-open shape as no fence" arm went red the
+      # moment this row was added ahead of the write-site row with its stderr
+      # discarded. The sibling refusal sites can redirect because each of them
+      # `fail`s immediately after; this one returns and the write-site row still
+      # has to be able to speak.
+      _task_store_audit_log "task answer human-attribution" error 0 -- \
+        "task=$ident" "type=$nt" "tier=$gtier" "reason=$_attr_why" \
+        "refused_stamp=human:${_attr_name}" "stored=${answered_by}" \
+        "tap_uid=${tap_uid:-none}" "relay_agent=${relay_agent:-none}" || true
+    fi
+  fi
   # DIVE-1182: a routed builder gate cleared by its designated lead is recorded as
   # lead-sourced provenance (NOT human:*) — honest that an agent lead, not a human,
   # cleared it. Never overrides a genuine human:* answer.
@@ -12397,6 +12583,43 @@ cmd_task_answer() {
     "$(( ${_hp:-0} || ${_t2_hp:-0} ))" "$(( ${_su:-0} || ${_t2_su:-0} ))" \
     "${_cs_ok:-0}" "${_cp_ok:-0}" "${_lead_clear:-0}")
   db "UPDATE tasks SET human_evidence=$(sqlq "${_evform:-none}") WHERE id=${id};"
+
+  # DIVE-3128: the RELAY and the TAPPING UID, in their own columns.
+  #
+  # Written unconditionally (empty when there was no tap) so the columns mean
+  # "this is what the answer carried", not "somebody remembered to set them".
+  # A reader can now separate the two questions the old single string conflated:
+  # `need_answered_by` says who decided, `need_answered_relay` says whose bot
+  # carried it.
+  #
+  # NOT INSIDE THE DIVE-756 SIGNED CLOSURE, and say so rather than let a reader
+  # assume otherwise. The closure signs need_answer/at/by/uid — so the HUMAN NAME
+  # is tamper-evident, which is the field this ticket is about — while the relay
+  # is corroborating context that a raw DB edit could change without failing
+  # `gate-proof verify`. Widening the signed payload would invalidate every
+  # signature already stored on the board, so it is a separate decision.
+  db "UPDATE tasks SET need_answered_relay=$(sqlq "${relay_agent}"), need_answered_tap_uid=$(sqlq "${tap_uid}") WHERE id=${id};"
+
+  # DIVE-3128: THE TAP LEDGER. A button tap was the least-recorded path in the
+  # system for the most rigorously evidenced control. Written AFTER the row, and
+  # reading the persisted stamp back out rather than the variable, for the
+  # DIVE-2090 reason: a ledger built from intent greens identically whether or not
+  # the write landed.
+  if [[ -n "$tap_uid" || -n "$relay_agent" || -n "$tap_msg" ]]; then
+    local _tap_persisted; _tap_persisted=$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE id=${id};")
+    # THE VERDICT IS THREE-VALUED for the same reason the roster predicate is:
+    # `stored` must mean "checked the name against the roster and it was clean",
+    # never "could not look". A run with no readable registry says so in the
+    # ledger instead of producing a line indistinguishable from a verified one.
+    local _tap_verdict="stored"
+    if [[ -n "$_attr_why" ]]; then _tap_verdict="refused:${_attr_why}"
+    elif (( _attr_unverified )); then _tap_verdict="stored:roster-unmeasured"
+    fi
+    local _tap_nonce="absent"; [[ -n "$human_proof" ]] && _tap_nonce="presented"
+    _gate_tap_log "$ident" "${gtier:-}" "$nt" "$tap_uid" "$tap_username" "$tap_msg" \
+      "$relay_agent" "${_tap_name:-}" "$_tap_persisted" \
+      "$_tap_nonce" "$_tap_verdict" "$_tap_src" || true
+  fi
 
   # DIVE-2099: the authoritative record of a STANDING-authority clear. Emitted
   # AFTER the write and reading `need_answered_by` BACK OUT of the row, so it

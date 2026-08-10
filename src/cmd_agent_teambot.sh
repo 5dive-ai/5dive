@@ -839,6 +839,27 @@ async function handleCallback(cq: any): Promise<void> {
     extra.push('--human')
     if (humanProof) extra.push(`--human-proof=${humanProof}`)
   }
+  // DIVE-3128: FORWARD WHO PRESSED THE BUTTON. Telegram puts the tapping user on
+  // `callback_query.from` — an id and a handle this listener did not choose and
+  // the relaying agent cannot set for someone else — and until now none of it
+  // left this function. So the CLI had only its own process identity to stamp,
+  // and a tier-2 gate cleared by a person came back reading as an AGENT name
+  // wearing a `human:` prefix (DIVE-3045).
+  //
+  // Sanitised before they become argv: a Telegram id is digits (negative for
+  // channels) and a username is Telegram's own handle grammar. Anything else is
+  // dropped rather than passed through — the CLI re-validates, but a relay should
+  // not be the thing that ships a malformed identity to a provenance field.
+  const tapUid = String(cq.from?.id ?? '')
+  if (/^-?\d{1,20}$/.test(tapUid)) extra.push(`--tap-uid=${tapUid}`)
+  const tapUser = String(cq.from?.username ?? '')
+  if (/^[A-Za-z][A-Za-z0-9_]{4,31}$/.test(tapUser)) extra.push(`--tap-username=${tapUser}`)
+  const tapMsg = String(cq.message?.message_id ?? '')
+  if (/^\d{1,19}$/.test(tapMsg)) extra.push(`--tap-msg=${tapMsg}`)
+  // The relay is THIS listener. It is named explicitly rather than inferred, so
+  // the row records the carrier as a separate fact instead of the carrier's name
+  // being what the `human:` prefix lands on.
+  extra.push('--relay-agent=team-bot-listener')
   const ans = five(['task', 'answer', taskId, ...r.answerArgs, ...extra])
   if (ans?.ok) {
     await ackCallback(cbId, `Answered: ${r.ack}`)
