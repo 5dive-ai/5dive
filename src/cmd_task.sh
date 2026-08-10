@@ -43,6 +43,8 @@ _task_usage() {
   need <id> --type=decision|secret|approval|manual|access --ask="..."|--ask-file=<path>
       [--options=A|B] [--recommend=<A>|--recommend-file=<path>] [--tier=0|1|2]
       [--needs=<capability>] [--discusses=<why>] [--rubber-stamp-ok="<why>"]
+      [--mode=approve-to-send|confirm-after-send]   --type=approval: is the action
+                                                    already DONE? (default: not yet)
       [--probe='<cmd>']                           --type=access: self-check the block
       [--secret-key=<ENV> --connector=<stem> | --out-of-band="<where>"]   (--type=secret needs one)
   need <id> --withdraw                          cancel a pending gate that is now moot
@@ -1454,7 +1456,7 @@ cmd_task_ls() {
     # regression test asserts against (tests/task_reject_trace_unit.sh, arm C).
     # NB: no inline SQL `--` comments in this string —
     # dbfmt flattens newlines, so a `--` would comment out the rest of the query.
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, need_answered_relay, need_answered_tap_uid, tier, kind, schedule, last_fired_at, last_skipped_at, parked_at, park_reason, wake_at, project_key, maker_agent, verifier,
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, need_answered_relay, need_answered_tap_uid, tier, gate_mode, kind, schedule, last_fired_at, last_skipped_at, parked_at, park_reason, wake_at, project_key, maker_agent, verifier,
              CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
                   THEN CASE WHEN handoff_ack_at IS NOT NULL THEN 'reviewing' ELSE 'delivered' END
                   ELSE NULL END AS handoff_state,
@@ -1560,6 +1562,14 @@ cmd_task_show() {
     # blocks below so an ordinary task's `show` stays clean.
     local gate
     gate=$(db "SELECT 'type: '||need_type||
+                      -- DIVE-2354: the ORDER, on the type line, because it changes
+                      -- what the type MEANS. A gate whose mode is absent says so —
+                      -- NULL is 'filed before the column existed', not 'before the
+                      -- action', and printing a default here would invent the claim.
+                      CASE WHEN gate_mode='confirm-after-send'
+                           THEN '  mode: confirm-after-send (the action ALREADY HAPPENED — this asks for RATIFICATION, not prior approval)'
+                           WHEN gate_mode IS NOT NULL THEN '  mode: '||gate_mode
+                           ELSE '' END||
                       CASE WHEN tier IS NOT NULL THEN '  (tier '||tier||')' ELSE '' END||
                       CASE WHEN need_options IS NOT NULL THEN '  options: '||need_options ELSE '' END||
                       CASE WHEN recommend IS NOT NULL THEN x'0a'||'recommend: '||recommend ELSE '' END||
@@ -1576,8 +1586,17 @@ cmd_task_show() {
                            THEN x'0a'||'tier set by: '||floor_provenance ELSE '' END||x'0a'||
                       'ask:  '||COALESCE(ask,'')||
                       CASE WHEN need_answered_at IS NOT NULL
-                           THEN x'0a'||'answer: '||CASE WHEN need_type='secret' THEN '(provided — loaded out-of-band)' ELSE COALESCE(need_answer,'') END||'  ('||need_answered_at||')'
-                           ELSE x'0a'||'answer: — pending' END
+                           -- DIVE-2354: an answer on a confirm-after-send gate is a
+                           -- RATIFICATION and must not read as a prior approval. The
+                           -- stored value is unchanged (approved/denied); what the
+                           -- record gains is the order the tap came in.
+                           THEN x'0a'||'answer: '||CASE WHEN need_type='secret' THEN '(provided — loaded out-of-band)' ELSE COALESCE(need_answer,'') END||'  ('||need_answered_at||')'||
+                                CASE WHEN gate_mode='confirm-after-send'
+                                     THEN x'0a'||'        ↩︎ RATIFIED AFTER THE FACT — the action had already been taken when this was answered'
+                                     ELSE '' END
+                           ELSE x'0a'||'answer: — pending'||
+                                CASE WHEN gate_mode='confirm-after-send'
+                                     THEN ' (awaiting RATIFICATION of an action already taken)' ELSE '' END END
                FROM tasks WHERE id=${id} AND need_type IS NOT NULL;")
     [[ -n "$gate" ]] && { echo; echo "human gate:"; printf '%s\n' "$gate" | indent2; }
     # DIVE-476: loop spec (only when any field is set) — the declarative verify
@@ -1690,7 +1709,7 @@ cmd_task_gate_history() {
     # archive internally but are not reader payload. Secret answers are always
     # redacted on both output paths, matching the live gate in `task show`.
     rows=$(dbfmt -json "SELECT id, ident, need_type, ask, need_options, recommend, tier,
-          need_asked_at,
+          need_asked_at, gate_mode,
           CASE WHEN need_type='secret' AND need_answer IS NOT NULL
                THEN '(provided - redacted)' ELSE need_answer END AS need_answer,
           need_answered_at, need_answered_by, need_answered_uid,
@@ -1710,7 +1729,7 @@ cmd_task_gate_history() {
     *)        printf '%s previous gates: %s recorded — archive coverage is NOT measured\n' "$ident" "$count" ;;
   esac
   (( count > 0 )) || return 0
-  dbfmt -box "SELECT id AS seq, need_type AS type, COALESCE(tier,'-') AS tier,
+  dbfmt -box "SELECT id AS seq, need_type AS type, COALESCE(gate_mode,'-') AS mode, COALESCE(tier,'-') AS tier,
       COALESCE(need_asked_at,'-') AS asked_at, COALESCE(ask,'-') AS ask,
       COALESCE(need_options,'-') AS options, COALESCE(recommend,'-') AS recommend,
       CASE WHEN need_type='secret' AND need_answer IS NOT NULL
@@ -6525,7 +6544,10 @@ cmd_task_park() {
       UPDATE tasks
         SET status='blocked', parked_at=datetime('now'), park_reason=$(sqlq "$reason"),
             wake_at=${wake_sql},
-            need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL
+            need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL,
+            -- DIVE-2354: a parked row holds no gate, so it must not keep reporting
+            -- which ORDER that gate was in. The archive above copied it to history.
+            gate_mode=NULL
       WHERE id=${tid} AND status NOT IN ('done','cancelled');
       COMMIT;"
   # DIVE-2410: park clears the gate columns, so whatever button that gate put in a
@@ -7706,7 +7728,7 @@ _gate_tapback_stats() {
 
 cmd_task_need() {
   tasks_db_init
-  local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw="" discusses="" needs="" oob="" rubber_stamp=""
+  local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw="" discusses="" needs="" oob="" rubber_stamp="" gate_mode=""
   # DIVE-2627: which flag supplied each prose value (see _read_prose_file).
   local ask_src="" recommend_src=""
   local -a positional=()
@@ -7759,6 +7781,10 @@ cmd_task_need() {
       # never inferred, and written to the gate row — an escape that leaves no
       # record is `--tier=2` with extra steps, which is the thing being fixed.
       --rubber-stamp-ok=*) rubber_stamp="${1#*=}" ;;
+      # DIVE-2354: WHICH ORDER this gate is in. Declared, never inferred — the
+      # filer is the only party who knows whether the action has already happened,
+      # and inferring it from timestamps would be a guess presented as a record.
+      --mode=*)      gate_mode="${1#*=}" ;;
       --)          shift; positional+=("$@"); break ;;
       -*)          fail "$E_USAGE" "unknown flag: $1" ;;
       *)           positional+=("$1") ;;
@@ -7874,6 +7900,9 @@ cmd_task_need() {
         $(_gate_archive_and_clear_sql withdraw "id=${id}")
         UPDATE tasks
           SET need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL,
+              -- DIVE-2354: same reason as the park path — a withdrawn gate has no
+              -- order to report, and the archive row above already carries it.
+              gate_mode=NULL,
               secret_key=NULL, connector=NULL, secret_oob=NULL, ask_shape=NULL,
               precedent_ref=NULL, precedent_kind=NULL, routed_reviewer=NULL,
               needs_capability=NULL,
@@ -7928,6 +7957,51 @@ cmd_task_need() {
       || fail "$E_VALIDATION" "--rubber-stamp-ok only applies to --type=decision or --type=approval — those are the two types the keystroke cap governs. manual/secret/access default to tier 2 by TYPE and need no escape from it."
     [[ ${#rubber_stamp} -ge 12 ]] \
       || fail "$E_VALIDATION" "--rubber-stamp-ok must state WHY a person has to answer this despite your own --recommend (it is recorded on the gate and read by whoever counts these exceptions later)"
+  fi
+
+  # DIVE-2354 — THE TWO ORDERS A GATE CAN BE IN, as data on the row.
+  #
+  # THE DEFECT, measured on the first run of the DIVE-2348 customer-feedback loop:
+  # a gate worded "lodar approves the reply BEFORE it is sent" cannot be satisfied
+  # honestly once the send has already happened (emails 13:27/13:30, loop fired the
+  # drafting step 13:40). Answering it asserts a before-the-fact approval that did
+  # not occur; cancelling it erases the decision point AND, on that run, deleted
+  # marketing's escalation path for a genuinely unapproved second email; leaving it
+  # open reads as a bypassed human. Nobody bypassed anyone and the record said
+  # somebody had. It recurs by construction: these loops race a LIVE Telegram
+  # thread, so a loop materialised from the board is routinely behind the
+  # conversation. That is the normal case for anything customer-facing, not a
+  # timing accident.
+  #
+  # THE FIX IS A THIRD STATE, not a new verb. `confirm-after-send` records that the
+  # tap came AFTER the action — a RATIFICATION. It is not "approved" and must never
+  # render as it (same shape as unreadable-vs-absent, DIVE-2327, and NOT-REACHED-vs-
+  # pass, DIVE-2039). NULL is the third value: a gate filed before this shipped
+  # does not say which order it was, and inferring one for it would manufacture the
+  # very claim this ticket is about.
+  #
+  # WHAT THIS DOES NOT DO, deliberately: nothing here clears anything. The human tap
+  # stays mandatory in BOTH modes. `confirm-after-send` is `--type=approval` only —
+  # approval is human-class (root-gated in cmd_task_answer, excluded from precedent
+  # auto-clear by _gate_human_class), so restricting the mode to it makes
+  # "ratification requires a person" true BY CONSTRUCTION rather than by a rule
+  # someone has to keep. A `decision` that already happened re-files as an approval;
+  # that is the same direction [[standing-authorisation-is-per-thread-dive2353]]
+  # already prescribes for an answer that licenses something.
+  if [[ -n "$gate_mode" ]]; then
+    case "$gate_mode" in
+      approve-to-send|confirm-after-send) ;;
+      *) fail "$E_VALIDATION" "bad --mode '$gate_mode' (approve-to-send|confirm-after-send)" ;;
+    esac
+    [[ "$type" == "approval" ]] \
+      || fail "$E_VALIDATION" "--mode only applies to --type=approval — a $type gate has no before/after order to record. If the action already happened and you need it ratified, re-file it as --type=approval --mode=confirm-after-send (a ratification must be a human tap, and approval is the type that guarantees one)."
+    # A tier-0 gate APPLIES the filer's own --recommend with no ping. On a
+    # confirm-after-send that is auto-ratification of an action the filer already
+    # took — precisely the thing this ticket says it is NOT asking for. Refused
+    # here rather than relying on approval's tier-2 type default, so the guarantee
+    # does not depend on a default someone may later think is a formality.
+    [[ "$tier" == "0" && "$gate_mode" == "confirm-after-send" ]] \
+      && fail "$E_VALIDATION" "--tier=0 auto-applies your own recommendation, which on --mode=confirm-after-send would ratify an action you have already taken with no human involved. A ratification needs the tap; file it at the type default."
   fi
 
   # DIVE-1243: self-check for the manager-clearable `access` class. An access gate
@@ -8802,6 +8876,10 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
             -- COUNTABLE afterwards — an escape that leaves no row is --tier=2 with
             -- extra steps, which is the thing this ticket exists to end.
             gate_rubber_stamp=$(sqlq_or_null "$rubber_stamp"),
+            -- DIVE-2354: the declared order (approve-to-send | confirm-after-send).
+            -- Written on the SAME statement as need_type, so a row can never hold a
+            -- mode belonging to a gate it no longer carries.
+            gate_mode=$(sqlq_or_null "$gate_mode"),
             tier=${tier}, need_asked_at=datetime('now'), gate_pinged_at=NULL,
             gate_filed_by=$(sqlq "$actor")
       WHERE id=${id};
@@ -10709,12 +10787,19 @@ _task_gate_reply_markup() { # <row_id> <type> <options> <recommend> <nonce> <cha
         | if ($kb | length) > 0 then {inline_keyboard: $kb} else empty end' 2>/dev/null) || reply_markup=""
     elif [[ "$need_type" == "approval" ]]; then
       local rl; rl=$(printf '%s' "$recommend" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
-      local appr='{"text":"'"${label}"'✅ Approve","callback_data":"tna:'"${numid}"':approved'"${np}"'"}'
-      local deny='{"text":"'"${label}"'🚫 Deny","callback_data":"tna:'"${numid}"':denied'"${np}"'"}'
+      # DIVE-2354: on a confirm-after-send gate the button that says "Approve" is
+      # asking for a claim the human cannot truthfully make — the action is already
+      # out. Only the LABELS change; callback_data stays byte-identical
+      # (tna:<id>:approved|denied), so every shipped plugin handler is untouched.
+      local _bm; _bm=$(db "SELECT COALESCE(gate_mode,'') FROM tasks WHERE id=${numid};" 2>/dev/null || echo "")
+      local _yes="✅ Approve" _no="🚫 Deny"
+      if [[ "$_bm" == "confirm-after-send" ]]; then _yes="✅ Confirm (after the fact)"; _no="🚫 Not authorised"; fi
+      local appr='{"text":"'"${label}${_yes}"'","callback_data":"tna:'"${numid}"':approved'"${np}"'"}'
+      local deny='{"text":"'"${label}${_no}"'","callback_data":"tna:'"${numid}"':denied'"${np}"'"}'
       case "$rl" in
-        approve|approved) appr='{"text":"'"${label}"'⭐ ✅ Approve","callback_data":"tna:'"${numid}"':approved'"${np}"'"}'
+        approve|approved) appr='{"text":"'"${label}"'⭐ '"${_yes}"'","callback_data":"tna:'"${numid}"':approved'"${np}"'"}'
                           reply_markup='{"inline_keyboard":[['"$appr"','"$deny"']]}' ;;
-        deny|denied)      deny='{"text":"'"${label}"'⭐ 🚫 Deny","callback_data":"tna:'"${numid}"':denied'"${np}"'"}'
+        deny|denied)      deny='{"text":"'"${label}"'⭐ '"${_no}"'","callback_data":"tna:'"${numid}"':denied'"${np}"'"}'
                           reply_markup='{"inline_keyboard":[['"$deny"','"$appr"']]}' ;;
         *)                reply_markup='{"inline_keyboard":[['"$appr"','"$deny"']]}' ;;
       esac
@@ -11082,7 +11167,17 @@ _task_need_notify_deliver() {
   # DIVE-148: lead with the agent's recommendation (✅ Recommended: <X>) before
   # the ask, so the human sees the advised choice first instead of hunting for
   # it. Applies to decision + approval gates; NULL/empty recommend = no line.
+  # DIVE-2354: a ratification must not arrive looking like a prior approval — the
+  # chat message IS the record the human answers from. Read from the ROW, not from a
+  # parameter (DIVE-2090, same reason the secret branch below does): the batch
+  # re-send calls this with whatever it happens to be holding.
+  local _gmode
+  _gmode=$(db "SELECT COALESCE(gate_mode,'') FROM tasks WHERE id=${numid};" 2>/dev/null || echo "")
   local text="🙋 [${ident}] needs you"
+  if [[ "$_gmode" == "confirm-after-send" ]]; then
+    text="↩︎ [${ident}] needs you to CONFIRM AN ACTION ALREADY TAKEN"
+    text+=$'\n'"This is a RATIFICATION, not a prior approval — the action has already happened. Confirming records that you signed it off after the fact; denying records that you did not."
+  fi
   # DIVE-1927: when the ask was escalated off an unpaired filer, NAME the filer.
   # The recipient's bot is not the asker's bot, so without this the alert reads as
   # the manager's own gate and there is no way to tell whose ask it is.
