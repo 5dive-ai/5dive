@@ -224,11 +224,25 @@ jobs:
       # never be earned here by adding another job, which is the difference
       # between an allowlist and a skip. Every other probe must be REACHED by
       # this job or the installed-host one, and the union below asserts it.
+      #
+      # DIVE-2129: `ship-ledger-liveness` is allowlisted for the same STRUCTURAL
+      # reason and not a convenience one — its denominator is pushes that crossed
+      # the production push rail since the running bundle acquired the ledger
+      # writer, and an ephemeral runner has never pushed through that rail and
+      # never will. No number of extra jobs earns it here. It is therefore the one
+      # probe whose verdict paths are graded HERMETICALLY instead:
+      # tests/ship_ledger_liveness_unit.sh drives all of LIVE / BROKEN / the five
+      # not-reached reasons over fixture sinks, and carries the two negative
+      # controls that matter (a refused push must not manufacture a BROKEN; ledger
+      # rows must not certify their own denominator). That harness runs in the
+      # `test` job, so this allowlist entry costs coverage of the probe's WIRING on
+      # a real box, not of its logic — and a real box is exactly where a human runs
+      # `5dive selfcheck --only=ship-ledger-liveness`.
       - name: Do the rails ACT? (pristine)
         run: |
           # DIVE-2091: bundle is generated at tag time, not committed on main.
           ./build.sh
-          bash ./5dive selfcheck --allow=snapshot-rails \
+          bash ./5dive selfcheck --allow=snapshot-rails,ship-ledger-liveness \
             --label=pristine --report=selfcheck-pristine.txt
       - uses: actions/upload-artifact@v4
         if: always()
@@ -314,13 +328,13 @@ jobs:
         run: |
           # DIVE-2091: bundle is generated at tag time, not committed on main.
           ./build.sh
-          bash ./5dive selfcheck --allow=snapshot-rails \
+          bash ./5dive selfcheck --allow=snapshot-rails,ship-ledger-liveness \
             --label=installed-host --report=selfcheck-installed.txt
       - name: Do the rails ACT? (installed host, root)
         run: |
           # DIVE-2091: bundle is generated at tag time, not committed on main.
           ./build.sh
-          sudo bash ./5dive selfcheck --allow=snapshot-rails \
+          sudo bash ./5dive selfcheck --allow=snapshot-rails,ship-ledger-liveness \
             --label=installed-root --report=selfcheck-root.txt
           sudo chown "$USER" selfcheck-root.txt
       - uses: actions/upload-artifact@v4

@@ -239,7 +239,7 @@ fi
 #    it is the whole point of this script.
 #    --allow=snapshot-rails matches unit-tests.yml, so this is the same bar and not a
 #    softer one invented here.
-if _sc_out=$(bash "$BUNDLE" selfcheck --allow=snapshot-rails --label=release-commit 2>&1); then
+if _sc_out=$(bash "$BUNDLE" selfcheck --allow=snapshot-rails,ship-ledger-liveness --label=release-commit 2>&1); then
   echo "$_sc_out"
   echo "grade-release-commit: selfcheck PASS on the released bundle"
 else
