@@ -264,8 +264,8 @@ printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 # Everything above is an assertion about a REFUSAL and about absences of one.
 # Both shapes pass trivially against a build where the check does nothing, so the
 # arms are worth exactly what the mutants below say they are.
+MPASS=0; MFAIL=0
 if [[ -z "$MUTANT_CHILD" ]]; then
-  MPASS=0; MFAIL=0
   mutate() { # <name> <sed-expr> <must-red-arm-hint>
     local name="$1" expr="$2" hint="$3" md out rc
     md="$TMP/mut-$name"; mkdir -p "$md"; cp -r "$REPO_ROOT/src/." "$md/"
@@ -293,7 +293,13 @@ if [[ -z "$MUTANT_CHILD" ]]; then
     's#^      if \[\[ $no_pr -eq 1 \]\]; then$#      if false; then#' \
     'arm 6 — the --no-pr opt-out'
   printf '%d mutants killed, %d survived\n' "$MPASS" "$MFAIL"
-  [[ $FAIL -eq 0 && $MFAIL -eq 0 ]]
-else
-  [[ $FAIL -eq 0 ]]
 fi
+# THE VERDICT IS ONE STATEMENT ON THE LAST EXECUTABLE LINE, reachable in BOTH the
+# parent and the MUTANT_CHILD re-exec. Stranding it in an if/else put the probe's
+# injection point (the `else` arm) on a branch the parent never takes, while the
+# parent's exit came from the other arm — so tests/meta/harness-verdict-probe.sh
+# reported this file UNWIRED: an exit status that cannot fail CI. The child's own
+# canary file then defeated the not-reached classification, so the miss surfaced
+# as a flat accusation with a green 19/19 sitting next to it. MFAIL is initialised
+# to 0 above the branch, so the child (which never mutates) reads 0.
+[[ $FAIL -eq 0 && $MFAIL -eq 0 ]]
