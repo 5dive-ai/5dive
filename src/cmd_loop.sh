@@ -103,56 +103,24 @@ _loop_eff_ceiling() {
   printf '%s' "$_LOOP_CEILING_BUILTIN"
 }
 
-# --- live token accounting (DIVE-972: advisory ceiling -> enforceable) --------
-# The ceiling was a no-op because nothing ever wrote loop_runs.tokens_spent — it
-# defaulted to 0 forever, so every `spent >= ceiling` test read 0 and never
-# fired. These helpers implement design §4's "re-read tokens_spent (summed via
-# the existing usage plumbing for the child tasks' agents)": we recompute the
-# real spend from the child tasks' assignees' transcripts (same limit-moving
-# metric as `5dive usage` — input+output+cache-write, cache-read excluded) and
-# persist it, turning the token ceiling from advisory into a hard stop.
-
-# _loop_refresh_spend <loop_id> — recompute + persist tokens_spent from the real
-# transcript usage of this loop's child tasks; echoes the fresh integer. Heavy
-# (scans transcripts), so callers in the hot --wait poll go through _loop_spent,
-# which throttles; the heartbeat sweep calls this directly (once per tick).
+# _spend_scan_task_ids <task_ids_json> <since_epoch> — the transcript scan that
+# turns a set of task ids into a token total (input+output+cache-write,
+# cache-read excluded — the same limit-moving metric as `5dive usage`).
 #
-# DIVE-2304: a spend read that FAILED is a THIRD STATE — NOT-REACHED — and must
-# never be reported as 0. Three fail-open sites in this one producer all coerced
-# a failed read to 0, and 0 is also what a genuinely-idle loop reports, so the
-# two were indistinguishable to `spent >= ceiling`: an unreadable spend silently
-# DISABLED the token ceiling. Worse, the persist below was unconditional and ran
-# on the fail-open path too, so one transient failure CLOBBERED the accumulated
-# running total to 0 in durable state and the throttled fast path then read that
-# 0 back — not a momentary blind spot that self-heals, a destroyed figure.
-# The contract now:
-#   rc 0 -> echoes a real integer, and only then persists it
-#   rc 2 -> echoes NOTHING, persists NOTHING, and names the cause on stderr
-# The stderr is load-bearing: the `2>/dev/null` on the python call is why this
-# was invisible for the whole life of the ceiling. Do not put it back.
-_loop_spend_unreadable() {   # <loop_id> <reason...> — emit + signal NOT-REACHED
-  local lid="$1"; shift
-  _LOOP_SPEND_UNREADABLE="$*"
-  printf 'loop-spend: %s: NOT-REACHED (%s) — ceiling not verified, tokens_spent left intact\n' "$lid" "$*" >&2
-  return 2
-}
-_LOOP_SPEND_UNREADABLE=""
-_loop_refresh_spend() {
-  local loop_id="$1"
-  _LOOP_SPEND_UNREADABLE=""
-  local row; row=$(db "SELECT COALESCE(child_task_ids,'[]')||'|'||COALESCE(started_at,0) FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
-  [[ -n "$row" ]] || { _loop_spend_unreadable "$loop_id" "no loop_runs row (absent or unreadable db)"; return 2; }
-  local kids="${row%|*}" since="${row##*|}"
-  if [[ "$kids" == "[]" || -z "$kids" ]]; then
-    # No children yet: the persisted total IS the real answer — but only if we
-    # can read it. An empty read here is the same NOT-REACHED, not a zero.
-    local held; held=$(db "SELECT COALESCE(tokens_spent,0) FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
-    [[ "$held" =~ ^[0-9]+$ ]] || { _loop_spend_unreadable "$loop_id" "persisted tokens_spent unreadable ('${held:-}')"; return 2; }
-    printf '%s' "$held"; return 0
-  fi
-  local dbp="${TASKS_DB:-${STATE_DIR}/tasks/tasks.db}" spent prc=0
-  local errf="${TMPDIR:-/tmp}/loop-spend-$$-${RANDOM}.err"
-  spent=$(REGISTRY="$REGISTRY" TASK_DB="$dbp" LOOP_KIDS="$kids" LOOP_SINCE="${since:-0}" python3 - 2>"$errf" <<'PY'
+# DIVE-2794 extracted this from _loop_refresh_spend UNCHANGED so the per-TASK
+# budget sweep and the per-LOOP ceiling read spend through ONE implementation.
+# The alternative was a second copy, and a second copy of a spend reader is how
+# you get two guards that disagree about what a token is — the DIVE-2304
+# fail-open would have had to be found and fixed twice.
+#
+# Contract: echoes an integer on success. Says NOTHING on failure and returns
+# non-zero; stderr is deliberately NOT swallowed here (see _loop_refresh_spend:
+# a 2>/dev/null on this call is what hid the broken ceiling for its whole life).
+# The NOT-REACHED bookkeeping stays with each CALLER, because "unreadable" means
+# something different to a loop ceiling than to a task budget.
+_spend_scan_task_ids() {
+  REGISTRY="$REGISTRY" TASK_DB="${TASKS_DB:-${STATE_DIR}/tasks/tasks.db}" \
+    LOOP_KIDS="$1" LOOP_SINCE="${2:-0}" python3 - <<'PY'
 import os, json, glob, time, sqlite3, datetime as dt, pwd
 since = int(os.environ.get("LOOP_SINCE") or 0)
 now = int(time.time())
@@ -215,7 +183,59 @@ for name, ws in wins.items():
     total += sum(w["tok"] for w in ws)
 print(int(total))
 PY
-) || prc=$?
+}
+
+
+# --- live token accounting (DIVE-972: advisory ceiling -> enforceable) --------
+# The ceiling was a no-op because nothing ever wrote loop_runs.tokens_spent — it
+# defaulted to 0 forever, so every `spent >= ceiling` test read 0 and never
+# fired. These helpers implement design §4's "re-read tokens_spent (summed via
+# the existing usage plumbing for the child tasks' agents)": we recompute the
+# real spend from the child tasks' assignees' transcripts (same limit-moving
+# metric as `5dive usage` — input+output+cache-write, cache-read excluded) and
+# persist it, turning the token ceiling from advisory into a hard stop.
+
+# _loop_refresh_spend <loop_id> — recompute + persist tokens_spent from the real
+# transcript usage of this loop's child tasks; echoes the fresh integer. Heavy
+# (scans transcripts), so callers in the hot --wait poll go through _loop_spent,
+# which throttles; the heartbeat sweep calls this directly (once per tick).
+#
+# DIVE-2304: a spend read that FAILED is a THIRD STATE — NOT-REACHED — and must
+# never be reported as 0. Three fail-open sites in this one producer all coerced
+# a failed read to 0, and 0 is also what a genuinely-idle loop reports, so the
+# two were indistinguishable to `spent >= ceiling`: an unreadable spend silently
+# DISABLED the token ceiling. Worse, the persist below was unconditional and ran
+# on the fail-open path too, so one transient failure CLOBBERED the accumulated
+# running total to 0 in durable state and the throttled fast path then read that
+# 0 back — not a momentary blind spot that self-heals, a destroyed figure.
+# The contract now:
+#   rc 0 -> echoes a real integer, and only then persists it
+#   rc 2 -> echoes NOTHING, persists NOTHING, and names the cause on stderr
+# The stderr is load-bearing: the `2>/dev/null` on the python call is why this
+# was invisible for the whole life of the ceiling. Do not put it back.
+_loop_spend_unreadable() {   # <loop_id> <reason...> — emit + signal NOT-REACHED
+  local lid="$1"; shift
+  _LOOP_SPEND_UNREADABLE="$*"
+  printf 'loop-spend: %s: NOT-REACHED (%s) — ceiling not verified, tokens_spent left intact\n' "$lid" "$*" >&2
+  return 2
+}
+_LOOP_SPEND_UNREADABLE=""
+_loop_refresh_spend() {
+  local loop_id="$1"
+  _LOOP_SPEND_UNREADABLE=""
+  local row; row=$(db "SELECT COALESCE(child_task_ids,'[]')||'|'||COALESCE(started_at,0) FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
+  [[ -n "$row" ]] || { _loop_spend_unreadable "$loop_id" "no loop_runs row (absent or unreadable db)"; return 2; }
+  local kids="${row%|*}" since="${row##*|}"
+  if [[ "$kids" == "[]" || -z "$kids" ]]; then
+    # No children yet: the persisted total IS the real answer — but only if we
+    # can read it. An empty read here is the same NOT-REACHED, not a zero.
+    local held; held=$(db "SELECT COALESCE(tokens_spent,0) FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
+    [[ "$held" =~ ^[0-9]+$ ]] || { _loop_spend_unreadable "$loop_id" "persisted tokens_spent unreadable ('${held:-}')"; return 2; }
+    printf '%s' "$held"; return 0
+  fi
+  local dbp="${TASKS_DB:-${STATE_DIR}/tasks/tasks.db}" spent prc=0
+  local errf="${TMPDIR:-/tmp}/loop-spend-$$-${RANDOM}.err"
+  spent=$(_spend_scan_task_ids "$kids" "${since:-0}" 2>"$errf") || prc=$?
   if (( prc != 0 )) || [[ ! "$spent" =~ ^[0-9]+$ ]]; then
     local detail=""; [[ -s "$errf" ]] && detail=" — $(tr '\n' ' ' <"$errf" | tail -c 300)"
     rm -f "$errf"
@@ -356,7 +376,7 @@ cmd_loop_spawn() {
   local task_body="${prompt}${marker}"
 
   local add_json
-  add_json=$(JSON_MODE=1 cmd_task_add --assignee="$agent" --project="$project" ${from:+--from="$from"} \
+  add_json=$(JSON_MODE=1 cmd_task_add --materialized --assignee="$agent" --project="$project" ${from:+--from="$from"} \
                --body="$task_body" -- "$title") || return $?
   local task_id task_ident
   task_id=$(printf '%s' "$add_json"   | jq -r '.data.id')
