@@ -179,6 +179,41 @@ _gh_bot_available() {
   grep -q "^${_GH_BOT_KEY}=" "$_GH_BOT_ENV" 2>/dev/null
 }
 
+# _gh_caller_credential — 0 when THIS seat actually holds a gh credential.
+# OFFLINE: `gh auth token` resolves GH_TOKEN/GITHUB_TOKEN and the hosts config
+# and makes no network call, so asking before we name an identity costs nothing.
+# DIVE-3135: the banner used to assert `actor=your own gh credential` on a seat
+# that has none — the same defect class as DIVE-3128's `human:<relaying agent>`,
+# an identity named before it was resolved.
+_gh_caller_credential() { gh auth token >/dev/null 2>&1; }
+
+# _gh_child_exit <rc> — a non-zero from the WRAPPED gh is gh's failure, not ours.
+#
+# DIVE-3135: without this the silent-exit backstop (lib/output.sh) fires and
+# overwrites gh's own message with "5dive gh exited N without reporting a reason.
+# This is a bug in the CLI, not a refusal". For a routed passthrough that text is
+# false in both halves — gh DID report a reason, and the reason is often a refusal
+# (rc 4 = "please run gh auth login"). It is what made issues #526 (rc 1) and #553
+# (rc 4) read as unrelated: the sentence a reader needed was printed and then
+# talked over. So we claim the report and re-state the status as gh's.
+#
+# The DIVE-2792 distinction is PRESERVED and in fact sharpened: an internal CLI
+# failure still reaches the backstop as class="generic" with the bug text, while a
+# wrapped child's non-zero now carries class="passthrough" and says whose status
+# it is. A reader can tell them apart on the class alone.
+_gh_child_exit() {
+  local rc="${1:-0}"
+  (( rc == 0 )) && return 0
+  mark_reported
+  echo "[5dive gh] gh exited ${rc} — that is gh's OWN exit status, not a 5dive failure. Its message is above; 5dive routed the call and ran it to completion." >&2
+  if (( ${JSON_MODE:-0} )); then
+    jq -cn --argjson c "$rc" \
+      --arg m "gh exited ${rc}. This is the wrapped gh's own exit status, passed through verbatim — 5dive routed the call and did not itself fail. Read gh's stderr for the reason." \
+      '{ok:false, error:{code:$c, class:"passthrough", message:$m}}' 2>/dev/null || true
+  fi
+  return 0
+}
+
 # cmd_gh — the user-facing verb.
 cmd_gh() {
   local as="auto" explain=0
@@ -219,21 +254,27 @@ cmd_gh() {
 
   if [[ "$actor" == "bot" ]]; then
     echo "[5dive gh] actor=5dive-bot (class=${class}: ${reason})" >&2
-  else
+  elif _gh_caller_credential; then
     echo "[5dive gh] actor=your own gh credential (class=${class}: ${reason})" >&2
+  else
+    # Resolve FIRST, then name what was resolved. Saying "your own gh credential"
+    # on a seat that holds none sends the reader looking for a routing bug when
+    # the answer is that there is nothing to route to (DIVE-3135).
+    echo "[5dive gh] actor=your own gh credential — but NONE IS RESOLVED on this seat, so gh will refuse to authenticate (class=${class}: ${reason}). Provision one, or use --as=bot if this is a write." >&2
   fi
   [[ $explain -eq 1 ]] && return 0
 
+  local rc=0
   if [[ "$actor" == "caller" ]]; then
-    gh "$@"
-    return $?
+    gh "$@" || rc=$?
+    _gh_child_exit "$rc"
+    return "$rc"
   fi
 
   # Hand off to the root-only helper. Args travel NUL-separated over stdin, never
   # argv, so the NOPASSWD grant stays an exact command path (sudo-rs safe, no arg
   # wildcard) and no argument of a credential-bearing call lands in the process
   # table. The helper re-derives the class and reads the token itself.
-  local rc=0
   printf '%s\0' "$@" | sudo -n /usr/local/bin/5dive _gh_do || rc=$?
   # Distinguish "you may not route" from "the routed call failed". sudo exits 1
   # for a missing grant, which is indistinguishable from gh's own 1 by rc alone —
@@ -242,7 +283,10 @@ cmd_gh() {
   if [[ $rc -ne 0 ]] && ! sudo -n -l /usr/local/bin/5dive _gh_do >/dev/null 2>&1; then
     fail "$E_GENERIC" "routing to 5dive-bot needs a NOPASSWD grant this account lacks, so nothing ran — re-run with --as=caller"
   fi
-  return $rc
+  # Past the grant probe, a non-zero came from the routed gh (or from _gh_do's own
+  # refusal, which printed its reason in that process) — either way it is reported.
+  _gh_child_exit "$rc"
+  return "$rc"
 }
 
 # cmd_gh_whoami — resolve BOTH identities and print them. The point of the verb
