@@ -39,6 +39,42 @@ for a in "$@"; do case "$a" in
   *) printf 'unknown arg: %s\n' "$a" >&2; exit 2 ;;
 esac; done
 
+# DIVE-3149: THE CANARY NEEDS A CHANNEL THE HARNESS CANNOT TAKE AWAY.
+# The canary below used to ride the mutant's STDERR, read back out of the same
+# capture this loop uses for everything else. That made it only as reliable as the
+# harness's own stderr: any harness that redirects or closes fd 2 before its verdict
+# line — deliberately, or by accident as in DIVE-3148 — silences the canary, and the
+# probe then reports not-reached, "harness exits early in this environment". The
+# harness did not exit early; the probe could not hear it. That misread is SILENT per
+# environment (not-reached is tolerated in any single run) and only surfaces when it
+# happens EVERYWHERE at once — as NEVER PROBED, which reds harness-verdict-union and
+# refuses the release cut. Loudest possible symptom, quietest possible cause, and a
+# message that sends the reader hunting a skip guard that does not exist.
+#
+# Note the shape, because it is the one this whole file exists to find: the canary was
+# introduced to stop a mutation that never EXECUTED from being reported UNWIRED — a
+# false accusation. A canary that cannot be heard makes a different false statement
+# about the same unknown, so the mechanism inherited the failure mode it was built to
+# remove. So the canary now writes a FILE at a path the probe names and exports; a
+# harness would have to unset the probe's own variable to defeat it.
+#
+# TWO channels, not one, and reached = EITHER. The file is the one that survives a
+# stderr redirection; stderr is kept as the one that survives an unwritable canary dir.
+# Neither is free to fail silently on its own, which is the property the single-channel
+# version did not have.
+_PROBE_CANARY_DIR=$(mktemp -d 2>/dev/null) || _PROBE_CANARY_DIR=""
+export _PROBE_CANARY_FILE="${_PROBE_CANARY_DIR}/reached"
+# …and PROVE the channel works before trusting a negative from it. An unwritable dir
+# would make every harness read not-reached — exactly the failure being fixed, re-entered
+# through a different door — so it is a loud exit here, never a quiet verdict there.
+if [[ -z "$_PROBE_CANARY_DIR" ]] || ! printf 1 > "$_PROBE_CANARY_FILE" 2>/dev/null || [[ ! -s "$_PROBE_CANARY_FILE" ]]; then
+  printf 'probe: cannot write the canary file (%s) — refusing to run, because every harness would read not-reached\n' \
+    "${_PROBE_CANARY_FILE:-unset}" >&2
+  exit 2
+fi
+rm -f "$_PROBE_CANARY_FILE"
+trap 'rm -rf "$_PROBE_CANARY_DIR"' EXIT
+
 # Allowlisted UNPROBEABLE, BY NAME with a reason — the cmd_init.sh heredoc pattern:
 # still detected and still reported, just permitted. A NEW unprobeable harness is
 # not covered by this and reds the check, which is the property olivia asked for
@@ -206,7 +242,13 @@ if [[ " $ALLOW_UNPROBEABLE " == *" $b "* ]]; then ALLOWED+=("$b"); else UNPROBEA
   # real, and it was 18 harnesses: reported "probed in an environment where it
   # runs" while no environment ever could. Before it, `set -e` harnesses were
   # structurally unprobeable and the check was green about it.
-  awk -v n="$ln" -v inj="$inject" 'NR==n{print "printf \x27__PROBE_REACHED__\\n\x27 >&2"; print inj} {print}' "$t" > "$mutant"
+  # DIVE-3149: file first, stderr second — both BEFORE the mutation, both cheap.
+  awk -v n="$ln" -v inj="$inject" 'NR==n{print "printf 1 > \"$_PROBE_CANARY_FILE\""; print "printf \x27__PROBE_REACHED__\\n\x27 >&2"; print inj} {print}' "$t" > "$mutant"
+  # Removed BETWEEN harnesses, so a stale file can never certify the next one.
+  rm -f "$_PROBE_CANARY_FILE"
+  # The stderr capture is unchanged and still discards the mutant's stdout: it keeps
+  # the mutant's noise off the probe's own progress stream. It is now the SECOND
+  # canary channel rather than the only one.
   out=$(timeout "$TIMEOUT" bash "$mutant" 2>&1 >/dev/null); rc=$?
   rm -f "$mutant"
   # DIVE-2555: THE KILL MUST BE CLASSIFIED BEFORE THE VERDICT IS READ, because a
@@ -229,7 +271,7 @@ if [[ " $ALLOW_UNPROBEABLE " == *" $b "* ]]; then ALLOWED+=("$b"); else UNPROBEA
     TIMED_OUT+=("$b (mutant killed at ${TIMEOUT}s — no verdict was observed; raise PROBE_TIMEOUT for it or make it faster)")
     continue
   fi
-  if ! grep -q '__PROBE_REACHED__' <<<"$out"; then
+  if [[ ! -s "$_PROBE_CANARY_FILE" ]] && ! grep -q '__PROBE_REACHED__' <<<"$out"; then
     NOT_REACHED+=("$b (verdict line $ln never executed — harness exits early in this environment)")
     continue
   fi

@@ -116,7 +116,7 @@ out=$(cmd_task_park DIVE-201 --reason="hold" --wake=+7d 2>&1); rc=$?
 [[ "$(parkedof DIVE-201)" == "no" ]] \
   && ok_t "T1 task was NOT parked" \
   || bad_t "T1 not parked" "parked=$(parkedof DIVE-201)"
-[[ "$out" == *"DIVE-1453"* && "$out" == *"gate"* ]] \
+[[ "$out" == *"answer the gate"* && "$out" == *"gate"* ]] \
   && ok_t "T1 refusal carries an actionable, attributed message" \
   || bad_t "T1 actionable message" "out=$out"
 

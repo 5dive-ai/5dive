@@ -1516,6 +1516,31 @@ _envelope_caller() {
   printf '%s' "$who"
 }
 
+# DIVE-2183 — the refusal side of the `--from` story, at both acceptors.
+# envelope_peer_forgery() decides; this exists only to turn its one refusing
+# verdict into a fail() and to keep that decision out of two call sites.
+#
+# WHY IT IS FED `_envelope_caller` AND NOT `auto_sender_from_sudo`, which is what
+# DIVE-2182 specified. auto_sender_from_sudo reads $SUDO_USER alone, and the
+# population this guard defends against does not use sudo to send: an admin agent
+# holds NOPASSWD:ALL, so it runs `5dive agent send` as its own uid and the inner
+# `sudo -u agent-X tmux` elevates from there. $SUDO_USER is empty on that path, so a
+# SUDO_USER-only guard would measure no caller, take the unmeasured branch, and wave
+# through every forgery by the exact callers who can commit one — a guard that is
+# green because it never fires. `_envelope_caller` resolves EUID first (DIVE-2281),
+# which is also the resolver behind from=/tier=/via=, so the refusal and the
+# envelope can never disagree about who called.
+#
+# The signature line carries no trailing comment on purpose: tests/ extracts
+# function bodies with `^name() {$`, and a comment there makes this unreachable
+# from the harness that grades it.
+_agent_refuse_peer_forgery() {
+  local claimed="$1" measured="$2" verb="$3" v   # <claimed> <measured> <send|ask>
+  v="$(envelope_peer_forgery "$claimed" "$measured")"
+  [[ "$v" == refuse:* ]] || return 0
+  fail "$E_PERMISSION" "agent ${verb}: --from='${claimed}' is a REGISTERED AGENT and this process measures as '${v#refuse:}' — a peer's identity is not claimable. Send as yourself (--from=${v#refuse:} or drop the flag), or use a synthetic label that is not an agent name for a script/rail sender."
+}
+
 # DIVE-2385 — WAKE-THEN-SEND, so deferred work does not depend on the recipient
 # being awake at the instant the scheduler fires.
 #
@@ -1647,7 +1672,7 @@ agent_wake_gate_ready() {
     return 0
   fi
   if ! wait_agent_input_ready "$name" "$budget"; then
-    fail "$E_NOT_RUNNING" "woke agent '$name' but its input prompt never rendered within ${budget}s — refusing to type into a booting TUI and report a send that would be lost. --wake budgets ${AGENT_WAKE_BUDGET_SECS}s in total for the wake and this wait; size a scheduler's timeout against that."
+    fail "$E_NOT_RUNNING" "woke agent '$name' but its input prompt never rendered in ${budget}s — refusing to type into a booting TUI"
   fi
   AGENT_WAKE_READY="proven"
 }
@@ -1718,7 +1743,7 @@ cmd_send() {
   # message the flag exists to prevent, with an exit 0 printed over it. Checked
   # BEFORE the exec for that reason.
   if (( wake )) && a2a_needs_scoped "$name"; then
-    fail "$E_PERMISSION" "--wake starts the target's systemd unit and needs admin/root; this caller only holds the scoped a2a delivery grant. Re-run via sudo, or schedule the work as a task row instead."
+    fail "$E_PERMISSION" "--wake needs admin/root; this caller holds only the a2a delivery grant — re-run via sudo, or file a task row"
   fi
   if a2a_needs_scoped "$name"; then
     exec sudo -n /usr/local/bin/5dive agent _deliver "$name" "$message"
@@ -1806,6 +1831,10 @@ cmd_send() {
       # DIVE-2281: same resolver as the sender above, so from= and tier= cannot
       # disagree, and the tier stops reading unknown:no-caller on the direct path.
       _caller="$(_envelope_caller)"
+      # DIVE-2183: and REFUSE, before the header is built or a keystroke reaches
+      # the target's pane, when the claim is another registered agent's name. The
+      # first of the two --from acceptors.
+      _agent_refuse_peer_forgery "$sender" "$_caller" send
       _tier="$(envelope_tier "$_caller")"
       local header="[5dive-msg from=${sender} id=${msg_id}"
       header+=" tier=${_tier}"
@@ -1953,7 +1982,7 @@ cmd_ask() {
   # (abstainKind=capture-failed), which convene already records distinguishably
   # from a real abstention.
   if (( allow_unfenced )) && [[ "$from" == council* ]]; then
-    fail "$E_VALIDATION" "--allow-unfenced is refused on a council ask: a ballot may never fall back to pane scraping (it is the path that returns furniture as a vote). A seat that cannot fence must record as a CAPTURE FAILURE, not as an abstention."
+    fail "$E_VALIDATION" "--allow-unfenced is refused on a council ask — a seat that cannot fence records as a CAPTURE FAILURE, not an abstain"
   fi
   if [[ -z "$message" && ${#positional[@]} -gt 0 ]]; then
     message="${positional[*]}"
@@ -1997,6 +2026,16 @@ cmd_ask() {
   [[ -n "$sender" ]] || sender="ask"
   valid_sender_label "$sender" \
     || fail "$E_VALIDATION" "invalid --from label '$sender' (lowercase letter start, [a-z0-9-], <=32 chars)"
+  # DIVE-2183: the SECOND --from acceptor, and the weaker one before this — DIVE-2182
+  # scoped its finding to `send`, and `ask` was found later to accept the identical
+  # claim. Placed ABOVE the scoped/unscoped branch, so it covers both: the scoped
+  # branch's `_deliver` re-derives the envelope and cannot be forged, but a forged
+  # `--from` there still reaches this command's JSON summary and its audit row.
+  # `_gcaller` is the same resolver as `_audit_caller` and `_dcaller` below
+  # (DIVE-2281's one-resolver rule), so the refusal, the audit row and the rendered
+  # via= cannot disagree about who called.
+  local _gcaller; _gcaller="$(_envelope_caller)"
+  _agent_refuse_peer_forgery "$sender" "$_gcaller" ask
   msg_id="$(gen_msg_id)"
 
   # DIVE-2797: same row shape as cmd_send — `ask` is a send that waits, and it

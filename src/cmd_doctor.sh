@@ -718,6 +718,44 @@ cmd_doctor() {
   #      is on a Teams org whose admin hasn't allowlisted us via remote
   #      managed-settings (remote overrides local). Linked from README.
   if (( run_channels )); then
+    # DIVE-2041 (follow-up to the DIVE-2031 outage): the pinned "needs-you"
+    # banner is single-pinner by design — only the resolved org coordinator
+    # posts it (DIVE-1568), and every other agent unpins any banner it left
+    # behind. When `task coordinator` resolves to NOBODY, "every other agent"
+    # is ALL of them: the banner is unpinned in every paired DM and re-unpinned
+    # on a 60s timer forever, while every component reports success. That is
+    # how 12 pending human gates sat invisible for days.
+    #
+    # This check is the surface that names it. It computes the resolution HERE
+    # rather than asking the plugin, deliberately: the plugin can only report
+    # what it saw on its last tick, and a bot that is down reports nothing at
+    # all — the state we most need to see. Severity is keyed to CONSEQUENCE,
+    # not to the config: no coordinator with an empty gate queue is a latent
+    # warn; no coordinator while human gates are pending is a live outage of a
+    # human-safety surface, so it is an error and `summary.errors` carries it.
+    if [[ -f "${TASKS_DB:-}" ]]; then
+      local coord roots pending fixhint
+      coord=$(_task_resolve_coordinator 2>/dev/null || true)
+      if [[ -n "$coord" ]]; then
+        doctor_add channels needs-banner-coordinator ok \
+          "task coordinator resolves to '$coord' — the pinned needs-you banner has an owner"
+      else
+        roots=$(db "SELECT COUNT(*) FROM agents_org WHERE reports_to IS NULL OR reports_to NOT IN (SELECT name FROM agents_org);" 2>/dev/null || echo 0)
+        pending=$(db "SELECT COUNT(*) FROM tasks WHERE need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled');" 2>/dev/null || echo 0)
+        fixhint="fix: give the chart ONE root (5dive org set <agent> --manager=<mgr>), or put 'coordinator' in one agent's role (5dive org set <agent> --role='<their prose> coordinator')"
+        if [[ "${roots:-0}" == "0" ]]; then
+          doctor_add channels needs-banner-coordinator warn \
+            "no org chart — no coordinator, so the pinned needs-you banner is suppressed in every paired DM (5dive org set …)" false false
+        elif [[ "${pending:-0}" -gt 0 ]]; then
+          doctor_add channels needs-banner-coordinator error \
+            "NO coordinator resolves (${roots} org roots, none tagged) and ${pending} human gate(s) are pending — the pinned needs-you banner is suppressed in EVERY paired DM and nothing else reports it (DIVE-2031/2041); ${fixhint}" false false
+        else
+          doctor_add channels needs-banner-coordinator warn \
+            "no coordinator resolves (${roots} org roots, none tagged) — the pinned needs-you banner is suppressed in every paired DM; harmless while 0 gates are pending, invisible the moment one opens (DIVE-2031/2041); ${fixhint}" false false
+        fi
+      fi
+    fi
+
     local ms=/etc/claude-code/managed-settings.json
     # DIVE-1843: the DIVE-1816 fix reconciles this allowlist on install.sh rerun
     # only, so boxes provisioned before the dashboard channel shipped stayed
@@ -878,9 +916,23 @@ cmd_doctor() {
           # Oldest (longest-running) claude process for this user = the
           # persistent session, not a transient hook subprocess. Pick max
           # elapsed-time among matches.
+          #
+          # DIVE-2041: `|| true` — this is the UNGUARDED TWIN of the identical
+          # pipeline ~30 lines below, whose comment already spells out why it is
+          # needed: a bare `x=$(pipeline)` inherits the pipeline's status, and
+          # under `set -euo pipefail` pgrep's no-match exit 1 aborts the ENTIRE
+          # doctor run before the envelope prints. One registered agent with no
+          # live claude process is enough, so it fires on any box with an idle
+          # agent. Measured on the control plane 2026-08-09 against the INSTALLED
+          # release and an origin/main build alike: `5dive doctor
+          # --category=channels` exits 1 with no JSON and no summary, so the
+          # dashboard's periodic `doctor --json` gets nothing for the category.
+          # Fixed here rather than filed because this change's own surface lands
+          # in this category and would otherwise be unreachable — the same
+          # reasoning the DIVE-2327 --category=policy fix used in this function.
           cpid=$(pgrep -u "$user" -f 'claude' 2>/dev/null \
                  | while read -r p; do echo "$(ps -o etimes= -p "$p" 2>/dev/null | tr -d ' ') $p"; done \
-                 | sort -rn | awk 'NR==1{print $2}')
+                 | sort -rn | awk 'NR==1{print $2}' || true)
           if [[ -n "$cpid" && -n "$ondisk_ver" ]]; then
             local etimes start_epoch now_epoch
             etimes=$(ps -o etimes= -p "$cpid" 2>/dev/null | tr -d ' ')
@@ -950,7 +1002,7 @@ cmd_doctor() {
       if [[ -z "$_free" ]]; then
         doctor_add host "disk ${_mnt}" warn "could not read free space for ${_mnt} (df failed) — UNKNOWN, not fine"
       elif (( _free < DISK_ERROR_KB )); then
-        doctor_add host "disk ${_mnt}" error "only ${_gb}G free on ${_mnt} (${_pct}% used) — agents are about to fail with ENOSPC in ways that read as 'that tool is broken'; reclaim: 5dive task reclaim --all --dry-run"
+        doctor_add host "disk ${_mnt}" error "only ${_gb}G free on ${_mnt} (${_pct}% used) — reclaim: 5dive task reclaim --all --dry-run"
       elif (( _free < DISK_WARN_KB )); then
         doctor_add host "disk ${_mnt}" warn "${_gb}G free on ${_mnt} (${_pct}% used) — one npm install is ~1G; reclaim: 5dive task reclaim --all --dry-run"
       else

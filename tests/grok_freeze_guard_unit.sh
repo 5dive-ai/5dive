@@ -27,9 +27,9 @@ bad()  { printf '  FAIL %s\n' "$1"; fail=$((fail+1)); }
 has()  { grep -qF -- "$2" "$SRC" && ok "$1" || bad "$1 (missing: $2)"; }
 
 echo "== static wiring (DIVE-1222 grok freeze) =="
-has "guard present"            "grok provisioning is frozen (DIVE-1221)"
+has "guard present"            "grok provisioning is frozen"
 has "refuse condition"         'if [[ "$type" == "grok" && "${FIVE_GROK_UNFREEZE_VERIFIED:-}" != "1" ]]; then'
-has "points to DIVE-1221"      "See DIVE-1221."
+has "names the unfreeze bar"   "a verified xAI client-side fix"
 has "override warns"           "bypassing the DIVE-1221 Grok exfiltration freeze"
 has "guard sits after is_known_type" "DIVE-1221/1222: Grok provisioning is FROZEN"
 
@@ -86,8 +86,10 @@ if [[ -x "$BIN" && ( $EUID -eq 0 || -n "$SUDO" ) && $have_claude_grp -eq 1 ]]; t
   # assertion on any host that has ever leaked; snapshot first and grade the DELTA.
   pre_user=0; id agent-grokbot &>/dev/null && pre_user=1
   out="$($SUDO env -u FIVE_GROK_UNFREEZE_VERIFIED "$BIN" agent create grokbot --type=grok --channels=bogus 2>&1)"; rc=$?
-  if [[ $rc -ne 0 ]] && grep -qF "grok provisioning is frozen (DIVE-1221)" <<<"$out"; then
-    ok "grok create refused with DIVE-1221 error"
+  # DIVE-2645: assert the VERDICT, not a ticket id. The refusal no longer carries
+  # "(DIVE-1221)" — an arm that requires one is what made the archaeology mandatory.
+  if [[ $rc -ne 0 ]] && grep -qF "grok provisioning is frozen" <<<"$out"; then
+    ok "grok create refused with the freeze error"
   else
     bad "grok create should refuse (rc=$rc, out: $out)"
   fi

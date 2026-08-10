@@ -68,8 +68,21 @@ FIXTURE_MARK="dive2406-fixture"
 [[ -r "$REALLOG" ]] && REALLOG_OFFSET=$(wc -c <"$REALLOG" 2>/dev/null || echo 0)
 
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
+# DIVE-3128: PIN THE ROSTER. `header.sh` computes REGISTRY at SOURCE time from the
+# default STATE_DIR, so moving STATE_DIR afterwards leaves it pointing at
+# /var/lib/5dive/agents.json — the box's real fleet. The new roster guard on the
+# `human:` stamp reads it, so without this pin arms 2 and 4 below grade differently
+# depending on which agents happen to exist on the machine running the suite: on a
+# control-plane box `main` IS registered and arm 2 sees the refusal, on a bare CI
+# runner there is no registry at all and it does not. `main` and `dev` are on this
+# fixture roster and `lodar` is deliberately NOT, which is what makes arm 4 a real
+# non-vacuity check rather than an accident of the host.
+REGISTRY="$TMP/agents.json"
 JSON_MODE=1
 mkdir -p "$TASKS_DIR"
+cat >"$REGISTRY" <<'REG'
+{"schemaVersion": 1, "agents": {"main": {"isolation": "vm"}, "dev": {"isolation": "vm"}}}
+REG
 set +e   # AFTER sourcing: header.sh turns `set -e` back on.
 tasks_db_init
 export FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"   # DIVE-2010 fence: let the row through
@@ -143,18 +156,37 @@ else
   bad_t "a demotion the log cannot show is a demotion nobody can audit" "row='$ROW1'"
 fi
 
-# --- 2. lead-clear + CORROBORATED --human -> human:. ALREADY GREEN before the --
-#        fix; this is the arm that fails if the demotion is made unconditional.
+# --- 2. lead-clear + CORROBORATED --human -> NOT the lead: demotion. ----------
+#        THE PROPERTY THIS ARM GUARDS IS UNCHANGED — "a corroborated --human must
+#        not be relabelled as a lead clear" — but the string it lands on moved,
+#        and the reason is worth stating because the expected value looks like a
+#        regression and is not.
+#
+#        This arm used to expect `human:main`, and DIVE-3128 says that stamp was
+#        never a legitimate human attribution: `main` is a name on the AGENT
+#        roster, so `human:main` cannot distinguish "a person cleared this through
+#        main's session" from "the main agent cleared its own human gate" — which
+#        is the one thing the field exists to establish. It is the DIVE-3045 shape
+#        exactly, arriving through the lead path instead of a Telegram tap. So the
+#        claim is now refused and stored as `unattributed:main`.
+#
+#        THE ARM STILL GRADES WHAT IT WAS BUILT FOR. `unattributed:main` is not
+#        `lead:main`: make the DIVE-2400 demotion unconditional and this arm reds,
+#        exactly as before. What it no longer does is assert that an agent name may
+#        wear a `human:` prefix.
 reset
 SUDO_NONAGENT=0            # non-agent SUDO_UID: a real human-evidence form
 t2=$(mkgate "ship the persona batch" "fixture routed approval, real human $FIXTURE_MARK")
 ( actor_seam_as main; cmd_task_answer "$t2" --value="approved" --human --from=main >/dev/null 2>&1 )
 BY2=$(nby "$t2")
-if [[ "$BY2" == "human:main" ]]; then
-  ok_t "a CORROBORATED --human still stamps human:main (no genuine tap relabelled)"
-else
+if [[ "$BY2" == "unattributed:main" ]]; then
+  ok_t "a CORROBORATED --human is NOT demoted to lead: — and, DIVE-3128, is not stamped human:<roster agent> either"
+elif [[ "$BY2" == "lead:main" ]]; then
   bad_t "the fix must not demote an evidenced human answer" \
-        "need_answered_by='$BY2' (expected human:main)"
+        "need_answered_by='$BY2' — an evidenced human answer took the lead-clear demotion"
+else
+  bad_t "unexpected provenance on the corroborated lead-clear" \
+        "need_answered_by='$BY2' (expected unattributed:main)"
 fi
 
 # --- 3. DISTINCTNESS: the two cases must not be the same string ---------------

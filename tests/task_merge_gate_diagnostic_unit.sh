@@ -191,11 +191,17 @@ run_done D-1 --result='landed'
 [[ "$(slugof D-1)" == "done-merge-gate-no-credential" ]] \
   && ok_t 'T1 refuses under its OWN slug (the cause is recorded, not just the block)' \
   || bad_t 'T1 slug' "slug=[$(slugof D-1)] out=$OUT"
+# DIVE-2645: this refusal is NOT cut. main landed _gate_refuse_no_rail (DIVE-2770) while
+# this branch waited, WITH tests/task_merge_gate_anon_rail_unit.sh pinning "COULD NOT CHECK",
+# "BY FAULT" and "BY DESIGN" in it. Its length is carrying a real second next-action (a
+# verifier seat must reach for 'task verify --cmd=', not GH_TOKEN), so by this row's own
+# boundary it is substance, not archaeology. Cutting it means deleting a guard main just
+# added — a decision for main, not a merge resolution.
 [[ "$OUT" == *"COULD NOT CHECK"* && "$OUT" == *"no gh credential"* ]] \
   && ok_t 'T1 the message names the missing credential, like merge-audit already does' \
   || bad_t 'T1 names the credential' "out=$OUT"
 # THE REGRESSION ITSELF: the old string asserted a merge verdict nobody measured.
-[[ "$OUT" != *"is not merged to main yet"* && "$OUT" != *"state=unknown"* ]] \
+[[ "$OUT" != *"not merged to main"* && "$OUT" != *"state=unknown"* ]] \
   && ok_t 'T1 does NOT claim the PR is unmerged — an unknown is not a negative' \
   || bad_t 'T1 must not assert a merge verdict' "out=$OUT"
 
@@ -209,7 +215,7 @@ run_done D-2 --result='landed'
 [[ $RC -eq $E_CONFLICT && "$(slugof D-2)" == "done-pr-state-unresolved" ]] \
   && ok_t 'T2 an unanswerable PR query refuses as UNRESOLVED, not as not-merged' \
   || bad_t 'T2 unresolved slug' "rc=$RC slug=[$(slugof D-2)] out=$OUT"
-[[ "$OUT" == *"COULD NOT READ"* && "$OUT" != *"is not merged to main yet"* ]] \
+[[ "$OUT" == *"could not read"* && "$OUT" != *"not merged to main"* ]] \
   && ok_t 'T2 says the question was never answered' \
   || bad_t 'T2 wording' "out=$OUT"
 
@@ -269,7 +275,7 @@ run_done B-2 --result='landed'
 [[ $RC -eq $E_CONFLICT && "$(slugof B-2)" == "done-attribution-unresolved" ]] \
   && ok_t 'T5 an unreachable attribution scan refuses as UNRESOLVED, under its own slug' \
   || bad_t 'T5 unreachable slug' "rc=$RC slug=[$(slugof B-2)] out=$OUT"
-[[ "$OUT" == *"COULD NOT SCAN"* && "$OUT" != *"MEASURED"* ]] \
+[[ "$OUT" == *"could not be scanned"* && "$OUT" != *"landed"* ]] \
   && ok_t 'T5 describes the scan, and asserts nothing about the branch' \
   || bad_t 'T5 wording' "out=$OUT"
 
@@ -313,7 +319,7 @@ eval "$attr_impl"
 # exact assertion). Pin the phrase that immediately precedes $_attr_unreach in the
 # message instead, so the comma-joined list is graded in its own position.
 [[ $RC -eq $E_CONFLICT && "$(slugof B-6)" == "done-attribution-unresolved" \
-   && "$OUT" == *"COULD NOT SCAN main in lodar/5dive-api, lodar/5dive-frontend for a commit naming"* ]] \
+   && "$OUT" == *"main in lodar/5dive-api, lodar/5dive-frontend could not be scanned"* ]] \
   && ok_t 'T5c DIVE-2324: names EVERY unreachable repo, not just the last' \
   || bad_t 'T5c accumulate unreachable' "rc=$RC slug=[$(slugof B-6)] out=$OUT"
 

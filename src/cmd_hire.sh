@@ -174,7 +174,7 @@ cmd_hire_market() {
   if [[ -z "$yes" ]]; then
     if (( JSON_MODE )) || [[ ! -t 0 ]]; then
       (( JSON_MODE )) || cmd_inspect "$slug"   # text: show the disclosure we're gating on
-      fail "$E_USAGE" "refusing to hire '$slug' without confirmation in a non-interactive shell — re-run with --yes to proceed, or --dry-run to preview (nothing created)"
+      fail "$E_USAGE" "refusing to hire '$slug' unconfirmed in a non-interactive shell — re-run with --yes (or --dry-run to preview)"
     fi
     cmd_inspect "$slug"
     printf 'Hire %s as %s from pack %s (%s)? [y/N] ' "$name" "$pack_role" "$slug" "$rarity" >&2

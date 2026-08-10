@@ -1,7 +1,7 @@
 # -------- helpers --------
 
 require_root() {
-  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "must run as root (try: sudo 5dive $*)"
+  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "must run as root — try: sudo 5dive ${*:-${FIVE_ARGV[*]:-}}"
 }
 
 # -------- DIVE-2627: file input for the prose flags --------

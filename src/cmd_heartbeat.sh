@@ -333,18 +333,18 @@ _hb_usage() {
   5dive heartbeat ls                      # show enrolled agents + next-wake + queued count
   5dive heartbeat tick                    # cron driver: wake every due agent that has work
   5dive heartbeat wake-mode <name> [always_on|cold] [--cap=<n>] [--sleep-after=<min>]
-                                          # DIVE-1858: opt-in reactive wake mode + wake-budget + auto-sleep.
+                                          # opt-in reactive wake mode + wake-budget + auto-sleep.
                                           # no args after <name> => show current mode/budget/sleep/cost.
 
   <dur>: minutes (e.g. 30), or 45m / 2h / 1h30m.
-  wake-mode (DIVE-1858 Phase 1): 'cold' opts an agent into reactive
+  wake-mode ( Phase 1): 'cold' opts an agent into reactive
         wake-on-alert with a wakes/day budget cap (default ${_HB_WAKE_DEFAULT_CAP}) so a chatty
         trigger can't thrash it; cost-per-wake is surfaced (display only, zero
         billing). A cold agent that goes idle with no open work is auto-slept
         (systemctl stop) after --sleep-after minutes (default ${_HB_SLEEP_AFTER_MIN}m) and is
         woken again by the next trigger. 'always_on' (default) is unchanged;
         main + marketing are pinned always-on and refuse 'cold'.
-  fresh (default off, DIVE-1210): --fresh sends /clear before each task so
+  fresh (default off,): --fresh sends /clear before each task so
         context starts clean, at the cost of a full CLAUDE.md/project re-prime
         on every wake (up to ~48x/day on the default 30m cadence). Off keeps
         the running conversation across tasks — cheaper, and what main/
@@ -492,7 +492,7 @@ cmd_heartbeat_wake_mode() {
     *) fail "$E_VALIDATION" "bad mode '$mode' (use: always_on | cold)" ;;
   esac
   if [[ "$mode" == "cold" ]] && _hb_wake_protected "$name"; then
-    fail "$E_VALIDATION" "'$name' is a protected always-on agent (customer-facing/critical; e.g. main, marketing) — refusing wake_mode=cold (olivia condition 3)"
+    fail "$E_VALIDATION" "'$name' is a protected always-on agent — refusing wake_mode=cold"
   fi
   [[ -z "$cap" || "$cap" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "bad --cap '$cap' (whole number of wakes/day)"
   [[ -z "$sleep_after" || ( "$sleep_after" =~ ^[0-9]+$ && "$sleep_after" -gt 0 ) ]] || fail "$E_VALIDATION" "bad --sleep-after '$sleep_after' (whole number of idle minutes > 0)"
@@ -1398,6 +1398,28 @@ _hb_loop_terminal_clause() {
                  AND status NOT IN ('done','cancelled');" 2>/dev/null) || return 0
   vfier="${row%%|*}"; rest="${row#*|}"; maker="${rest%%|*}"; creator="${rest#*|}"
   [[ -n "$vfier" ]] || return 0
+
+  # DIVE-3098 — GRADED-AND-WAITING, and it is checked FIRST because it is the one
+  # state in which every variant below gives actively wrong advice: the maker variant
+  # tells a maker to deliver what is already delivered AND graded, the routing variant
+  # tells them nothing is delivered, and the verifier variant tells a verifier to grade
+  # what they have already graded. The row is terminal for the VERIFIER and open for
+  # the ROW, so the only outstanding act is a MERGE — and the goal must stop rather
+  # than re-wake someone into a loop whose remaining step belongs to someone else.
+  # This is the case that closed DIVE-2645/#427 and DIVE-2743/#485 as false dones.
+  #
+  # Not a fail-open, by the same rule as the variants below: read from graded_at,
+  # which ONLY `task verify --no-done` stamps, plus a bound delivery_ref and
+  # grader != maker. No prose an agent can type reaches it. It applies to EITHER role
+  # (maker still holding it, or verifier) — once graded-and-waiting, neither owes
+  # another pass, so it is deliberately not gated on which one was woken.
+  if [[ "$(db "SELECT 1 FROM tasks WHERE id=${task_id} AND ${_TASKS_TFV_SQL};" 2>/dev/null)" == "1" ]]; then
+    local _tfv_owner
+    _tfv_owner=$(db "SELECT COALESCE(NULLIF(maker_agent,''), COALESCE(assignee,'?')) FROM tasks WHERE id=${task_id};" 2>/dev/null)
+    printf ' NOTE — %s is GRADED AND WAITING ON A MERGE: a verifier grade is recorded and a delivery ref is bound, so the verifier has discharged their role and this is TERMINAL FOR THIS GOAL. Treat the goal as MET and stop — %s renders it as %s. The row stays OPEN on purpose and closes only when the work MERGES, because %s keeps meaning merged-to-main; the outstanding act is a MERGE owed by %s, not another pass by you. Do NOT re-grade it, re-deliver it, or close it to make the loop stop.' \
+      "$task_ident" "'5dive task ls'" "'graded->merge:${_tfv_owner}'" "'done'" "${_tfv_owner:-the maker}"
+    return 0
+  fi
 
   if [[ "$vfier" != "$name" ]]; then
     # MAKER variant — delivery is the second terminal state.
@@ -2425,6 +2447,7 @@ _hb_stall_sweep() {
                  AND handoff_ack_at IS NULL AND handoff_stale_pinged_at IS NULL
                  AND handoff_delivered_at IS NOT NULL
                  AND NOT (need_type IS NOT NULL AND need_answered_at IS NULL)
+                 AND NOT (${_TASKS_TFV_SQL})
                  AND handoff_delivered_at <= datetime('now','-${_HB_VERIFY_STALE_MIN} minutes');")
 
   # (a2) DIVE-2693 — a materialized RECURRING instance that was never STARTED.
@@ -2514,11 +2537,11 @@ _hb_stall_sweep() {
   # ONCE PER INSTANCE (recurring_stall_escalated_at), so a reassignment cannot
   # thrash a row around a fleet — and if the NEW hands do not start it either, the
   # next window's rung is the cancel, which is what actually restores the beat.
-  local erow eid eident easg etmpl etcreator ehours ecand etarget
+  local erow eid eident easg etmpl etcreator ehours ever ecand etarget
   local efree="" efree_read=0 efree_ok=0 ecancel_reason emsg
   while IFS= read -r erow; do
     [[ -n "$erow" ]] || continue
-    IFS=$'\x1f' read -r eid eident easg etmpl etcreator ehours <<<"$erow"
+    IFS=$'\x1f' read -r eid eident easg etmpl etcreator ehours ever <<<"$erow"
     [[ -n "$eid" ]] || continue
     if (( efree_read == 0 )); then
       efree_read=1
@@ -2536,6 +2559,15 @@ _hb_stall_sweep() {
       # The current assignee is not a target: handing the row back to the addressee
       # that already had a full window with it is the no-op this rung exists to stop.
       [[ -n "$easg" && "$ecand" == "$easg" ]] && continue
+      # DIVE-3097: nor is this row's own verifier. This ladder is a raw
+      # reassignment with no maker/grader check of its own — the row is still
+      # todo/never-started (no maker_agent, no delivery), so landing the
+      # verifier here as the new assignee would manufacture the exact
+      # assignee==verifier, no-handoff-ever-recorded shape DIVE-2899 named,
+      # except this time self-inflicted by the heartbeat rather than a human
+      # flag combo. Same "don't create it fresh" scope as the rest of DIVE-3097
+      # — a row where this already happened before the fix is not touched here.
+      [[ -n "$ever" && "$ecand" == "$ever" ]] && continue
       if [[ -n "$etcreator" && "$ecand" == "$etcreator" ]]; then etarget="$ecand"; break; fi
       [[ -z "$etarget" ]] && etarget="$ecand"
     done <<<"$efree"
@@ -2571,7 +2603,7 @@ _hb_stall_sweep() {
         detail="auto-cancelled after ${ehours}h never-started, no free agent (template ${etmpl})" || true
       _hb_log "[recurring-escalate] ${eident} ${ehours}h unstarted, no free agent -> auto-cancelled so template ${etmpl} re-fires"
     fi
-  done < <(db "SELECT t.id||x'1f'||COALESCE(t.ident,'DIVE-'||t.id)||x'1f'||COALESCE(t.assignee,'')||x'1f'||COALESCE(p.ident,'DIVE-'||t.from_template_id)||x'1f'||COALESCE(p.created_by,'')||x'1f'||CAST((julianday('now')-julianday(t.created_at))*24 AS INTEGER)
+  done < <(db "SELECT t.id||x'1f'||COALESCE(t.ident,'DIVE-'||t.id)||x'1f'||COALESCE(t.assignee,'')||x'1f'||COALESCE(p.ident,'DIVE-'||t.from_template_id)||x'1f'||COALESCE(p.created_by,'')||x'1f'||CAST((julianday('now')-julianday(t.created_at))*24 AS INTEGER)||x'1f'||COALESCE(t.verifier,'')
                FROM tasks t LEFT JOIN tasks p ON p.id=t.from_template_id
                WHERE t.kind='standard' AND t.from_template_id IS NOT NULL
                  AND t.status='todo' AND t.started_at IS NULL

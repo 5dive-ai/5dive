@@ -24,7 +24,7 @@ create_agent_user() {
   # The real fix (relocate the runtime out of /home/claude) is DIVE-1034.
   if [[ "$isolation" == "sandboxed" ]]; then
     if ! setfacl -m "u:${user}:--x" /home/claude 2>/dev/null; then
-      warn "setfacl failed granting ${user} traverse on /home/claude (is the 'acl' package installed?); the sandboxed agent will not reach the shared runtime — plugin install and startup will fail (DIVE-1033)"
+      warn "setfacl failed granting ${user} traverse on /home/claude — install the 'acl' package, then re-run"
     fi
   fi
   # Admin gets sudo SCOPED to fleet-management ops (not blanket root). standard
@@ -717,7 +717,7 @@ agent_home_conflict_check() {
   # Name the uid explicitly: the whole failure mode is uid recycling, and on the
   # reported box the owner did not resolve to a name at all (uid 1006, no such
   # user) — a report that only prints a name says nothing in exactly that case.
-  fail "$E_CONFLICT" "${home} already exists, owned by ${owner_n} (uid ${owner_u}) — not by the agent-${name} user this create would make. That is a leftover home from a previously removed agent, and uids get recycled, so continuing would hand the new agent someone else's home and any credentials left in it (DIVE-2138). Move it aside first: sudo mv ${home} ${REAPED_DIR}/${name}-\$(date +%Y%m%d%H%M%S)"
+  fail "$E_CONFLICT" "${home} is a leftover home owned by ${owner_n} (uid ${owner_u}) — move it aside before creating ${name}"
 }
 
 # DIVE-499: accepted autonomy modes. 'son-of-anton' is a yolo synonym (a Silicon
@@ -895,7 +895,7 @@ _apply_byo_claude() {
     local stored_url
     stored_url=$(profile_env_value "$profile" ANTHROPIC_BASE_URL)
     if [[ -n "$stored_url" && -z "$(claude_baseurl_catalog_provider "$stored_url")" ]]; then
-      fail "$E_VALIDATION" "auth profile '$profile' is pinned to a custom endpoint (${stored_url}) that no provider catalog row serves; applying provider '$canonical' here would replace it with ${base_url}. Pass --base-url=${stored_url} to keep the custom endpoint, or --base-url=${base_url} to move this profile onto '$canonical' deliberately."
+      fail "$E_VALIDATION" "auth profile '$profile' is pinned to custom endpoint ${stored_url}, which provider '$canonical' would replace with ${base_url} — pass --base-url=${stored_url} to keep it, or --base-url=${base_url} to move it"
     fi
   fi
   # DIVE-2809 GUARD END
@@ -1037,7 +1037,7 @@ KIMI_ENV
   # A standard prepaid/API-only z.ai key may 401 "Provider authentication failed"
   # there. Surface it so an auth failure reads as key-type, not a broken config.
   if [[ "$canonical" == "zai" ]]; then
-    step "z.ai note: use your GLM Coding-Plan key (z.ai → Coding Plan) for GLM coding models; a standard prepaid API key may fail auth on the anthropic endpoint."
+    step "z.ai note: GLM coding models need your GLM Coding-Plan key; a prepaid API key may fail auth here"
   fi
   local model="${override_model:-${HERMES_PROVIDER_MODEL[$canonical]:-}}"
   if [[ -n "$model" ]]; then
@@ -1047,10 +1047,116 @@ KIMI_ENV
   fi
 }
 
+# DIVE-3113: normalise an openclaw model id against the provider that was
+# selected on the command line. Pure (no root, no runtime) so it is unit-gradable
+# — everything else on this path shells out to sudo + a real binary.
+#
+# An openclaw model id is `<openclaw-provider-id>/<model>`, and THE FIRST SEGMENT
+# SELECTS THE PROVIDER — and therefore which auth profile is consulted. So a
+# prefix that disagrees with --provider is not a cosmetic naming slip: the request
+# goes to a vendor we never wrote a credential for and comes back HTTP 401 on a
+# perfectly good key, with the error naming auth and hiding provider selection.
+# That is DIVE-3112.
+#
+# Graded against the runtime's own catalog (openclaw 2026.7.1-2,
+# `openclaw models list --provider <p> --plain`):
+#
+#     openai/gpt-5.4 · anthropic/claude-sonnet-5 · deepseek/deepseek-chat
+#     openrouter/auto · openrouter/moonshotai/kimi-k2.6
+#
+# Note the last one: OPENROUTER NESTS THE VENDOR ONE LEVEL DOWN. That single fact
+# decides the whole function, because it means a two-segment id is ambiguous —
+# `openai/gpt-5.6-luna` is a valid openclaw id (provider openai) AND a valid
+# OpenRouter catalog slug (vendor openai). Only --provider disambiguates it.
+#
+# Three shapes reach us and each has exactly one right answer:
+#   1. no slash (`gpt-5.6`)          -> prefix with the selected provider.
+#   2. first segment == the provider -> already correct, pass through untouched.
+#   3. a FOREIGN first segment       -> under openrouter it is an OpenRouter
+#      catalog slug whose openclaw id is that slug nested under `openrouter/`
+#      (the DIVE-3112 payload), so re-prefix. Under any other provider the two
+#      names genuinely disagree and there is nothing to infer, so REFUSE — a
+#      guess here writes a config that authenticates against the wrong vendor,
+#      which is the exact failure this function exists to stop.
+#
+# Echoes the normalised id. rc 1 == case 3 under a non-openrouter provider; the
+# caller owns the error text (it has --provider/--model spellings to quote back).
+openclaw_normalize_model() {
+  local native="$1" model="$2"
+  [[ -n "$model" ]] || return 0
+  # No provider segment at all: the operator named a model, we supply the
+  # provider they already selected.
+  [[ "$model" == */* ]] || { printf '%s/%s' "$native" "$model"; return 0; }
+  local first="${model%%/*}"
+  [[ "$first" == "$native" ]] && { printf '%s' "$model"; return 0; }
+  # openrouter is the one provider whose ids carry a second, vendor-scoped
+  # segment, so a foreign-looking prefix here is a catalog slug, not a provider.
+  [[ "$native" == "openrouter" ]] && { printf 'openrouter/%s' "$model"; return 0; }
+  return 1
+}
+
 _apply_byo_openclaw() {
   # override_model (DIVE-1318): --model wins over OPENCLAW_PROVIDER_MODEL default.
   local native="$1" canonical="$2" api_key="$3" profile="${4:-}" override_model="${5:-}"
   local base="/home/claude"
+
+  # ── DIVE-3113 PRECONDITIONS ────────────────────────────────────────────────
+  # EVERYTHING THAT CAN ABORT RUNS BEFORE THE KEY WRITE. This block used to sit
+  # below, between the credential write and the config writes, and the ordering
+  # was the bug: `agent create` wrote auth-profiles.json, then hit the runtime
+  # guard and aborted, leaving a profile that HOLDS A KEY AND NO MODEL PIN. That
+  # state does not read as broken — `agent list` prints AUTH ok (the sentinel is
+  # the file, and the file is there) and `agent info` prints `model: —` without
+  # calling it a fault. Worse, the documented retry
+  # (`agent create <name> --auth-profile=<existing>`) does not re-run this
+  # function at all, so the pin never lands and openclaw silently falls back to
+  # its BUILT-IN default — a different provider, hence no credential, hence 401.
+  # Measured on 65.109.170.211: key on disk 19:10:55, runtime 19:12. See
+  # community/wiki/an-unconfigured-model-authenticates-against-the-wrong-provider.md.
+  #
+  # So: resolve the model id and the runtime FIRST. A refusal now costs the
+  # operator a re-run with nothing written; a refusal after the credential write
+  # costs them a profile that lies about being healthy.
+  local openclaw_base_url="${OPENCLAW_PROVIDER_URL[$canonical]:-}"
+  local model="${override_model:-${OPENCLAW_PROVIDER_MODEL[$canonical]:-}}"
+  if [[ -n "$model" ]]; then
+    local normalized
+    if ! normalized=$(openclaw_normalize_model "$native" "$model"); then
+      fail "$E_VALIDATION" "openclaw model '$model' selects provider '${model%%/*}', but --provider=$canonical selects '$native' — in openclaw the first path segment picks the provider AND the credential, so this would authenticate against '${model%%/*}' with no key and return HTTP 401. Pass --model=${native}/${model#*/} (or drop the prefix: --model=${model#*/})."
+    fi
+    if [[ "$normalized" != "$model" ]]; then
+      step "openclaw model id normalised for provider '$native': $model → $normalized"
+    fi
+    model="$normalized"
+  fi
+
+  local openclaw_bin="${TYPE_BIN[openclaw]}"
+  local openclaw_node="/home/claude/.local/bin/node"
+  if [[ -n "$openclaw_base_url" || -n "$model" ]]; then
+    # The npm launcher uses `#!/usr/bin/env node`. Do not rely on sudo/systemd's
+    # PATH to resolve that shebang during fresh create: invoke the stable Node
+    # link installed alongside OpenClaw explicitly. Keep ~/.local/bin on PATH
+    # for any subprocess OpenClaw starts while writing the config.
+    #
+    # Install-on-demand rather than an immediate refusal, because the two
+    # preconditions are NOT the same check: `agent create`'s install gate tests
+    # ${TYPE_BIN[openclaw]}, while the write below also needs the node link the
+    # same recipe creates. A box where those two disagree (a dangling node link
+    # after an nvm prune, or `agent auth set` on an openclaw-less box — that path
+    # has no install gate at all) passes the gate and fails here.
+    if [[ ! -x "$openclaw_node" || ! -x "$openclaw_bin" ]] \
+       && declare -F cmd_install >/dev/null 2>&1; then
+      step "openclaw runtime incomplete — installing before writing any credential"
+      local _prev_json="${JSON_MODE:-0}"
+      JSON_MODE=0
+      cmd_install openclaw >&2 || true
+      JSON_MODE="$_prev_json"
+    fi
+    [[ -x "$openclaw_node" ]] \
+      || fail "$E_NOT_INSTALLED" "node runtime missing for openclaw (run: 5dive agent install openclaw --upgrade)"
+  fi
+  # ── end DIVE-3113 preconditions; writes start here ─────────────────────────
+
   if [[ -n "$profile" ]]; then
     base="$(profile_type_dir "$profile" openclaw)"
     install -d -m 2750 -o claude -g claude "$base"
@@ -1076,21 +1182,11 @@ _apply_byo_openclaw() {
   chmod 0600 "$tmp"
   mv "$tmp" "$auth_file"
 
-  local openclaw_base_url="${OPENCLAW_PROVIDER_URL[$canonical]:-}"
-  local model="${override_model:-${OPENCLAW_PROVIDER_MODEL[$canonical]:-}}"
-
   # Any openclaw.json write (provider base_url pin and/or default model) goes
-  # through the same stable-node invocation — resolve the runtime once.
+  # through the same stable-node invocation — resolved in the precondition block
+  # above, so by here the runtime is known present and the model id known to
+  # match the provider whose key we just wrote.
   if [[ -n "$openclaw_base_url" || -n "$model" ]]; then
-    local openclaw_bin="${TYPE_BIN[openclaw]}"
-    local openclaw_node="/home/claude/.local/bin/node"
-    # The npm launcher uses `#!/usr/bin/env node`. Do not rely on sudo/systemd's
-    # PATH to resolve that shebang during fresh create: invoke the stable Node
-    # link installed alongside OpenClaw explicitly. Keep ~/.local/bin on PATH
-    # for any subprocess OpenClaw starts while writing the config.
-    [[ -x "$openclaw_node" ]] \
-      || fail "$E_NOT_INSTALLED" "node runtime missing for openclaw (run: 5dive agent install openclaw --upgrade)"
-
     # DIVE-1826: pin the provider endpoint when we have a verified override.
     # openclaw's zai provider otherwise defaults to the GENERAL /paas/v4 surface
     # (its zai-api-key auto-detect probes general endpoints before the Coding Plan
@@ -1112,13 +1208,24 @@ _apply_byo_openclaw() {
     # Default model lands in openclaw.json's agents.defaults.model.primary;
     # 5dive-agent-start.sh syncs it from the shared/profile copy into the
     # per-agent openclaw.json on every launch.
+    #
+    # DIVE-3113: this is a `fail`, not a `warn`, and the asymmetry with the
+    # baseUrl write above is deliberate. A missing baseUrl override falls back to
+    # openclaw's own endpoint for the SAME provider — degraded, still that
+    # vendor, still our key. A missing MODEL falls back to openclaw's built-in
+    # default, which carries a DIFFERENT provider prefix and therefore consults a
+    # credential that does not exist. So the two failure modes are not the same
+    # size: one is a worse endpoint, the other is a profile that reports AUTH ok
+    # and cannot authenticate. The credential is already on disk by this point
+    # and cannot be un-written, so the only honest exit is to say so loudly and
+    # name the repair rather than let create return success over it.
     if [[ -n "$model" ]]; then
       sudo -u claude -H env \
         HOME="$base" \
         PATH="/home/claude/.local/bin:/usr/bin:/bin" \
         "$openclaw_node" "$openclaw_bin" \
         config set agents.defaults.model.primary "$model" >&2 \
-        || warn "openclaw config set agents.defaults.model.primary=$model failed"
+        || fail "$E_GENERIC" "openclaw model pin failed (agents.defaults.model.primary=$model). The key IS written to ${auth_file}, so this profile now holds a credential with no model — openclaw would fall back to its built-in default, whose provider is not '$native', and 401. Repair with: sudo -u claude -H env HOME=$base PATH=/home/claude/.local/bin:/usr/bin:/bin $openclaw_node $openclaw_bin config set agents.defaults.model.primary $model"
     fi
   fi
 
@@ -1127,7 +1234,7 @@ _apply_byo_openclaw() {
   # standard prepaid / API-only z.ai key may 401 there, so surface it — an auth
   # failure then reads as key-type, not a broken config.
   if [[ "$canonical" == "zai" ]]; then
-    step "z.ai note: use your GLM Coding-Plan key (z.ai → Coding Plan) for GLM coding models; a standard prepaid API key may fail auth on the coding endpoint."
+    step "z.ai note: GLM coding models need your GLM Coding-Plan key; a prepaid API key may fail auth here"
   fi
 }
 
@@ -1401,7 +1508,7 @@ cmd_create() {
   # your own authority, and never read an armed host as evidence of a patch.
   # The warn below fires on every armed create and is meant to stay noisy.
   if [[ "$type" == "grok" && "${FIVE_GROK_UNFREEZE_VERIFIED:-}" != "1" ]]; then
-    fail "$E_VALIDATION" "grok provisioning is frozen (DIVE-1221): Grok Build has an unpatched codebase-exfiltration issue and xAI has shipped only a revocable server-side mitigation. Unfreeze needs a verified xAI client-side fix + pinnable version. See DIVE-1221."
+    fail "$E_VALIDATION" "grok provisioning is frozen — unfreeze needs a verified xAI client-side fix and a pinnable version"
   fi
   if [[ "$type" == "grok" ]]; then
     warn "FIVE_GROK_UNFREEZE_VERIFIED=1 set, bypassing the DIVE-1221 Grok exfiltration freeze. Only valid if a VERIFIED xAI client-side patch is pinned."
@@ -1444,14 +1551,14 @@ cmd_create() {
   # so the capability is impossible. Refuse only the sandboxed contradiction.
   if (( can_push )); then
     case "$isolation" in
-      sandboxed) fail "$E_VALIDATION" "--can-push is incompatible with --isolation=sandboxed (a sandboxed agent gets no sudoers, so it cannot be granted delegated push)." ;;
+      sandboxed) fail "$E_VALIDATION" "--can-push is incompatible with --isolation=sandboxed — a sandboxed agent gets no sudoers" ;;
       admin)     can_push=0; warn "--can-push is redundant for an admin agent (admin sudo already permits '5dive _push_do'); ignoring." ;;
     esac
   fi
   # INST-5: --can-deploy, identical posture to --can-push above.
   if (( can_deploy )); then
     case "$isolation" in
-      sandboxed) fail "$E_VALIDATION" "--can-deploy is incompatible with --isolation=sandboxed (a sandboxed agent gets no sudoers, so it cannot be granted delegated deploy)." ;;
+      sandboxed) fail "$E_VALIDATION" "--can-deploy is incompatible with --isolation=sandboxed — a sandboxed agent gets no sudoers" ;;
       admin)     can_deploy=0; warn "--can-deploy is redundant for an admin agent (admin sudo already permits '5dive _deploy_do'); ignoring." ;;
     esac
   fi
@@ -1529,7 +1636,7 @@ cmd_create() {
   [[ "$telegram_token" == "-" ]] && (( ++_stdin_sentinels ))
   [[ "$discord_token" == "-" ]]  && (( ++_stdin_sentinels ))
   (( _stdin_sentinels <= 1 )) \
-    || fail "$E_USAGE" "only one of --api-key=- / --telegram-token=- / --discord-token=- can read from stdin per create (the exec tunnel has a single stdin channel)"
+    || fail "$E_USAGE" "only one of --api-key=- / --telegram-token=- / --discord-token=- can read stdin per create"
 
   # BYO API-key path (--provider=<canonical> + --api-key=<key|->).
   # Mutually exclusive with --defer-auth: BYO is the alternative to "I'll sign in
@@ -1698,7 +1805,7 @@ cmd_create() {
           # tapped yet, OR the Chief-of-Staff account is at its managed-bot cap
           # (20 free / 40 with Telegram Premium). Name both so a whale is not
           # left guessing. (DIVE-323)
-          fail "$E_TIMEOUT" "no bot @$telegram_cos appeared within the claim window — either you have not tapped the Create link in Telegram yet, or your Chief of Staff has hit its managed-bot limit (20 free, 40 with Telegram Premium). Tap the link to create it, or free a slot / upgrade to Premium, then retry"
+          fail "$E_TIMEOUT" "no bot @$telegram_cos appeared in the claim window — tap the Create link in Telegram, or free a bot slot, then retry"
         elif [[ "$_cos_reason" == "cos_token_stale" || "$_cos_reason" == "child_token_stale" ]]; then
           # DIVE-482: the CoS (or the just-minted child) token is dead — the bot
           # was deleted+recreated, so Telegram issued a new token and deactivated
@@ -1706,7 +1813,7 @@ cmd_create() {
           # validation error (not a generic JSON blob) so the dashboard can route
           # the user to re-paste / rotate the token instead of a cryptic failure.
           local _cos_detail; _cos_detail=$(jq -r '.detail // empty' <<<"$_cos_json" 2>/dev/null)
-          fail "$E_VALIDATION" "${_cos_detail:-Your Chief-of-Staff bot token is no longer valid — rotate it in BotFather and re-run: 5dive agent cos set --token=<new token>}"
+          fail "$E_VALIDATION" "${_cos_detail:-Chief-of-Staff bot token invalid — rotate it in BotFather: 5dive agent cos set --token=<new>}"
         elif (( _cos_rc == E_NOT_FOUND )); then
           fail "$E_NOT_FOUND" "no Chief-of-Staff bot configured — run: 5dive agent cos set --token=<token>"
         fi
@@ -1725,7 +1832,7 @@ cmd_create() {
     fi
     if [[ -z "$telegram_token" ]]; then
       telegram_token=$(prompt_secret "Telegram bot token for agent '$name'") \
-        || fail "$E_USAGE" "--channels=telegram requires --telegram-token=<token> or --telegram-cos=<child-username> (or run interactively to be prompted)"
+        || fail "$E_USAGE" "--channels=telegram needs --telegram-token=<token> or --telegram-cos=<child-username>"
     fi
     valid_telegram_token "$telegram_token" \
       || fail "$E_VALIDATION" "telegram token format looks wrong (expected <digits>:<20+ chars>)"
@@ -1821,12 +1928,12 @@ cmd_create() {
       [[ -n "$_profile_auth_path" && -s "$_profile_auth_path" ]] && _profile_authed=1
     fi
     (( _profile_authed )) \
-      || fail "$E_AUTH_REQUIRED" "auth profile '$profile' is empty — run: sudo 5dive agent auth login $type --auth-profile=$profile (or: sudo 5dive agent auth set $type --api-key=... --auth-profile=$profile)"
+      || fail "$E_AUTH_REQUIRED" "auth profile '$profile' is empty — run: sudo 5dive agent auth login $type --auth-profile=$profile"
   else
     local auth
     auth=$(auth_status_one "$type" --no-probe)
     if [[ "$auth" != "ok" ]]; then
-      fail "$E_AUTH_REQUIRED" "$type is not authenticated ($auth) — run: sudo 5dive agent auth login $type (or: sudo 5dive agent auth set $type --api-key=<key>)"
+      fail "$E_AUTH_REQUIRED" "$type is not authenticated ($auth) — run: sudo 5dive agent auth login $type"
     fi
   fi
 

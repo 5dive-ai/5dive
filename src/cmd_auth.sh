@@ -1087,7 +1087,7 @@ opencode_validate_model_or_fail() {
   grep -qxF "$model_id" <<<"$catalog" && return 0
   local sugg; sugg=$(grep -F "${model_id%/*}/" <<<"$catalog" | head -5 \
     | awk 'NR>1{printf ", "}{printf "%s", $0}') || sugg=""
-  fail "$E_VALIDATION" "opencode has no model '$model_id' for provider '$provider'. A fresh agent would silently fall back to an unrelated default that may not support tool use.${sugg:+ Close matches: $sugg.} Run 'opencode models' for the full list."
+  fail "$E_VALIDATION" "opencode has no model '$model_id' for provider '$provider'.${sugg:+ Close matches: $sugg.} Run 'opencode models'"
 }
 
 # opencode_apply_model_default <agent-name> <provider> <model> [api-key] — pin
@@ -1167,7 +1167,7 @@ pi_validate_model_or_fail() {
   grep -qxF "$slug" <<<"$catalog" && return 0
   local sugg; sugg=$(grep -F "${slug%%/*}/" <<<"$catalog" | head -5 \
     | awk 'NR>1{printf ", "}{printf "%s", $0}') || sugg=""
-  fail "$E_VALIDATION" "pi has no model '$slug' for provider '$provider'. A fresh agent would boot without the pinned model (no runnable default).${sugg:+ Close matches: $sugg.} Run 'pi --list-models $provider' for the full list."
+  fail "$E_VALIDATION" "pi has no model '$slug' for provider '$provider'.${sugg:+ Close matches: $sugg.} Run 'pi --list-models $provider'"
 }
 
 # pi_apply_model_default <agent-name> <provider> <model> [api-key] — pin a pi
@@ -1867,7 +1867,7 @@ cmd_auth_start() {
     # via `auth set --api-key --provider`. (Grandfathered agents can still
     # re-auth over the TTY `auth login` handoff, which is left intact.)
     claude|codex|antigravity|grok) ;;
-    *) fail "$E_VALIDATION" "device-code flow supports claude/codex/antigravity/grok. hermes/openclaw are API-key only — use 'auth set --api-key --provider=<id>' for $type." ;;
+    *) fail "$E_VALIDATION" "device-code flow supports claude/codex/antigravity/grok — for $type use: auth set --api-key --provider=<id>" ;;
   esac
   local bin="${TYPE_BIN[$type]}"
   [[ -x "$bin" ]] || fail "$E_NOT_INSTALLED" "$type not installed at $bin"
