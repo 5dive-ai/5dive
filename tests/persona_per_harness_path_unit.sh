@@ -98,6 +98,11 @@ check_target codex       ".codex/AGENTS.md"
 check_target opencode    ".config/opencode/AGENTS.md"
 check_target pi          ".pi/agent/AGENTS.md"
 check_target antigravity ".gemini/GEMINI.md"
+# DIVE-2245. Both rows are the path the GUESS would have missed: hermes reads
+# AGENTS.md/CLAUDE.md from the CWD only, so its home-level slot is SOUL.md; and
+# openclaw's is a workspace root, not a dotdir.
+check_target hermes      ".hermes/SOUL.md"
+check_target openclaw    ".openclaw/workspace/AGENTS.md"
 
 # The write itself, on a pi seat — and the ABSENCE of the old claude write. A
 # persona that also lands in ~/.claude/CLAUDE.md would still pass a "did the new
@@ -118,9 +123,14 @@ fi
 
 # --- (2) refusal: an unmapped type is loud, and writes nothing ---------------
 #
-# hermes and openclaw are unmapped on purpose (never probe-verified); newtype is
-# the state a contributor lands in mid-registration. All three must refuse.
-for t in hermes openclaw newtype; do
+# devin is unmapped on purpose (never probe-verified, DIVE-3129); newtype is the
+# state a contributor lands in mid-registration. Both must refuse.
+#
+# hermes and openclaw used to sit in this list. DIVE-2245 probed them on live
+# seats and they are mapped above — so the refusal arm is now graded on the type
+# that is ACTUALLY still unmapped. Keeping a mapped type here would have made
+# this loop assert the opposite of the table twenty lines up.
+for t in devin newtype; do
   : >"$WARNLOG"
   mkdir -p "$PERSONA_HOME_ROOT/agent-un-$t"
   out=$(persona_target "un-$t" "$t") && rc=0 || rc=$?
@@ -132,7 +142,7 @@ for t in hermes openclaw newtype; do
     bad "refusal for '$t' does not name the claude path it is refusing to fall back to"
   elif ! grep -q "TYPE_PERSONA_FILE" "$WARNLOG"; then
     bad "refusal for '$t' does not tell the operator how to map the type"
-  elif [[ "$t" != newtype ]] && ! grep -q "DIVE-2245" "$WARNLOG"; then
+  elif [[ "$t" != newtype ]] && ! grep -q "DIVE-3129" "$WARNLOG"; then
     # A deferred residual is only as durable as the ticket that holds it: the
     # refusal for a KNOWN-unmapped type has to name the row tracking the probe,
     # or the gap gets re-derived from scratch every time someone hits it.
