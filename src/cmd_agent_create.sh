@@ -1119,6 +1119,27 @@ _apply_byo_openclaw() {
   # costs them a profile that lies about being healthy.
   local openclaw_base_url="${OPENCLAW_PROVIDER_URL[$canonical]:-}"
   local model="${override_model:-${OPENCLAW_PROVIDER_MODEL[$canonical]:-}}"
+  # DIVE-3130: KEY WRITTEN + NO MODEL PIN IS A REFUSAL FOR EVERY PROVIDER, not
+  # only for the ones the check below can reach. The DIVE-3113 block above fails
+  # closed on a model id that names the WRONG provider — but it is guarded by
+  # `[[ -n "$model" ]]`, so a canonical id with NO OPENCLAW_PROVIDER_MODEL row and
+  # no --model resolves to the empty string and walks straight through it. That
+  # produces the exact state DIVE-3113 exists to prevent: openclaw falls back to
+  # its BUILT-IN default (openai/gpt-5.5), whose first path segment picks the
+  # provider AND the credential, so the seat authenticates as openai with no
+  # openai key and every message dies on "auth or provider access failed for
+  # openai" — while `agent list` still prints AUTH ok, because the sentinel is
+  # the credential file and the credential file is there.
+  # Measured 2026-08-10 on this host (openclaw 2026.7.1-2) via --provider=zai;
+  # the same hole is open for minimax, qwen and huggingface, which also have an
+  # OPENCLAW_PROVIDER_ID row and no model row.
+  # The remedy is deliberately NOT "add a model row": an id must be graded
+  # against `openclaw models list --provider <native> --plain` first (see the
+  # OPENCLAW_PROVIDER_MODEL header), and for zai that list is empty on this
+  # version — so the honest outcome is an explicit --model from the operator,
+  # not a pin we guessed.
+  [[ -n "$model" ]] \
+    || fail "$E_VALIDATION" "openclaw has no default model for provider '$canonical' (native id: $native), and no --model was given. Writing the key with no model pin would create a seat that reports AUTH ok and returns 401 on every message: openclaw would fall back to its built-in default, whose provider prefix selects a credential you have not supplied. Pass --model=<id> that openclaw routes to '$native' — grade it with: openclaw models list --provider $native --plain"
   if [[ -n "$model" ]]; then
     local normalized
     if ! normalized=$(openclaw_normalize_model "$native" "$model"); then

@@ -718,6 +718,17 @@ declare -A OPENCLAW_PROVIDER_ID=(
   [moonshot]="moonshot"
   [openrouter]="openrouter"
   [nous]=""
+  # DIVE-3130: openclaw 2026.7.1-2's catalog enumerates NO zai models
+  # (`models list --provider zai --plain` → "No models found"; the GLM ids it
+  # carries sit under byteplus/, novita/, nvidia/, together/ and volcengine/).
+  # zai is KEPT rather than dropped, deliberately: an unenumerated namespace is a
+  # NO-ORACLE state, not a proof of unroutability (see
+  # community/wiki/a-byo-model-pin-can-only-be-graded-off-ci.md), and the
+  # DIVE-1826 coding-endpoint pin in OPENCLAW_PROVIDER_URL still applies. What
+  # changed is that a zai seat can no longer be created WITHOUT a model: with no
+  # OPENCLAW_PROVIDER_MODEL row, _apply_byo_openclaw now refuses unless the
+  # operator passes --model. Do not add a [zai] model row here until an id is
+  # graded against `models list --provider zai --plain` on the installed version.
   [zai]="zai"
   [minimax]="minimax"
   [qwen]="qwen"
