@@ -3728,6 +3728,7 @@ _task_status_cmd() {
   local newstatus="$1" extra="$2" verb="$3"; shift 3
   tasks_db_init
   local result="" want_result=0 notify=0 no_preflight=0 force_merge_gate=0 keep_wt=0 no_graded_sha=0
+  local no_pr=0                          # DIVE-2096: "this close REPORTS ON a PR, it delivers none"
   local append_result=0 force_result=0   # DIVE-2464
   # DIVE-1955 (review, Marcus): every reason the merge-gate could NOT reach an answer,
   # accumulated so the close can be stamped UNVERIFIED in the DURABLE RECORD. A stderr
@@ -3755,6 +3756,11 @@ _task_status_cmd() {
       --notify)       notify=1 ;;
       --no-preflight) no_preflight=1 ;;
       --force-merge-gate) force_merge_gate=1 ;;  # DIVE-1835: audited escape from the mandatory auto-detect gate
+      # DIVE-2096: the NAMED opt-out for DIVE-1965's reports-on category. Distinct
+      # from --force-merge-gate on purpose: that one overrides a gate that RAN and
+      # disagreed; this one ASSERTS a fact about the close ("no PR is mine to bind"),
+      # which is a claim the operator can be held to and the audit row records.
+      --no-pr)        no_pr=1 ;;
       # DIVE-2940: the declared escape from the graded-sha PRE-CLOSE refusal below.
       # Deliberately NOT folded into --force-merge-gate: that flag escapes a gate
       # that RAN and disagreed (a sha mismatch, a red merge), and this one escapes
@@ -4308,6 +4314,61 @@ _task_status_cmd() {
     _task_slug=$(_gate_task_repo_slug "$_dref" "$_body")
     if [[ -z "$_dref" ]]; then
       _branch=$(_push_branch_from_body "$_body")
+    fi
+    # -----------------------------------------------------------------------
+    # DIVE-2096 — THE ORDERING PRE-CHECK: cited-not-delivered, BEFORE the close.
+    #
+    # Two agents hit the identical wall from opposite sides inside ~2h on
+    # 2026-07-26 (olivia on DIVE-2064, main on DIVE-2080). That is a tool defect,
+    # not two operator slips. The DIVE-2414 disclosure below already MEASURES a
+    # cited PR's state and says so — but it says so in the same breath as the
+    # close, and `done` freezes the body. The diagnosis and the point of no
+    # return arrive together, so the only remedy the warning can name (bounce it
+    # back to the maker to fix the verifier's own metadata) is wildly
+    # disproportionate to the error. Nothing anywhere hints at the correct
+    # sequence — merge -> `task deliver --pr` -> `done` — until it is too late to
+    # act on it. This is that hint, moved to the moment it is still actionable.
+    #
+    # THE SHAPE IS ORDERING, NOT INFERENCE, and that boundary is load-bearing:
+    #   * DIVE-1965 (done) deliberately separates a PR the task DELIVERED from one
+    #     it merely REPORTS ON. Kept intact — this refuses, it does not reclassify.
+    #   * DIVE-1962 (CANCELLED) proposed INFERRING the binding from a PR number in
+    #     prose. It was cancelled because that OVERCLAIMS: an incidental number
+    #     stamps an unrelated close UNVERIFIED. So prose is the TRIGGER for the
+    #     prompt and NEVER the SOURCE of the binding. Nothing below reads the
+    #     number into `delivery_ref`; the operator does that, with `task deliver`,
+    #     and only they can say which of the named refs is theirs.
+    #
+    # FIRES ONLY WITH NO DECLARED BINDING AT ALL — neither `delivery_ref` nor a
+    # `Branch:` line. Both are structured, intentional declarations, and either
+    # one sends this close down the DIVE-1830 declared path where the delivery IS
+    # verified (PR state, or ancestry+attribution for a branch). Refusing there
+    # would add friction to the fleet's dominant delegated-push flow and buy no
+    # safety, so "the field is bound" leaves behaviour byte-identical.
+    #
+    # The trigger is `_gate_text_names_a_ref`, deliberately the BROAD predicate
+    # (bash-only, no grep, no subprocess): it answers "was a PR mentioned", not
+    # "which one". An over-match here costs one refusal that `--no-pr` answers in
+    # a keystroke; an under-match costs the whole ticket. The sharp extractor is
+    # used only to NAME numbers in the message, and it is allowed to come back
+    # empty — a refusal must never depend on a parser that may be unusable.
+    if [[ -z "$_dref" && -z "$_branch" ]] && _gate_text_names_a_ref "$result
+$_body"; then
+      local _cnd_refs=""
+      if _gate_pr_refs_engine_ok; then
+        _cnd_refs=$(_gate_pr_refs_qualified_from_text "$result
+$_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
+      fi
+      local _cnd_named="${_cnd_refs:+ (${_cnd_refs//,/, })}"
+      if [[ $no_pr -eq 1 ]]; then
+        # The assertion is recorded, not just honoured. `--no-pr` is a CLAIM about
+        # this close ("no pull request here is mine"), and an unrecorded claim is
+        # indistinguishable from a bypass when someone reads the row back.
+        warn "$ident: closing with --no-pr — the PR reference(s)${_cnd_named:- named in the result/body} are asserted to be REPORTED ON, not delivered by this task (DIVE-2096, audited)."
+        _task_store_audit_log "task.done-no-pr" ok 0 -- "$ident" "refs=${_cnd_refs:-unparsed}"
+      elif [[ $force_merge_gate -eq 0 ]]; then
+        policy_refuse "$E_CONFLICT" done-cited-not-delivered DIVE-2096 "$ident" "$ident cannot close YET: its result/body names a pull request${_cnd_named} but NOTHING BINDS one to this task — \`delivery_ref\` is empty and the body declares no \`Branch:\` line. A citation in prose is not a binding: only the field is (DIVE-1962 was CANCELLED for trying to infer one from prose). Closing now would leave the named PR's merge state UNCHECKED, and \`done\` freezes the body, so you would learn that only after it was unfixable (DIVE-2096). CORRECT ORDER: merge it, then \`5dive task deliver $ident --pr=<url>\`, then \`5dive task done $ident\`. If this close only REPORTS ON that PR and delivers no code of its own — a review, triage, audit or coordination close, DIVE-1965's category — say so and it proceeds: \`5dive task done $ident --no-pr\` (audited). \`--force-merge-gate\` also overrides."
+      fi
     fi
     # DIVE-2682 (implements the DIVE-2671 design call): a binding can OUTLIVE the
     # iteration it was made for. The gate below asks "did the bound PR land"; it
