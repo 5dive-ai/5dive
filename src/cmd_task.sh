@@ -428,13 +428,36 @@ cmd_task_init() {
 # resolved live from the org chart — never a hardcoded agent:
 #   1. an agent explicitly tagged `--role=coordinator` (reuses the existing org
 #      role field; the disambiguator a multi-root org sets), when exactly one holds it
-#   2. else the lone org root (the single-CEO case — zero config)
-#   3. else empty — ambiguous (multi-root, none tagged) or empty org chart; we
+#   2. else the lone agent carrying the coordinator MARKER inside their role prose
+#      (DIVE-2041, below), when exactly one does
+#   3. else the lone org root (the single-CEO case — zero config)
+#   4. else empty — ambiguous (multi-root, none tagged) or empty org chart; we
 #      leave the task unassigned exactly as before rather than guess wrong.
 # Prints the coordinator name (or nothing). Safe on an empty/missing org table.
+#
+# DIVE-2041 — WHY TIER 2 EXISTS. `agents_org.role` does double duty: it is the
+# human prose the org chart and council roster RENDER ("AI CEO — conducts the
+# fleet (advisory)", "QA / testing") AND, at tier 1, an exact-match machine
+# sentinel. So the only way to tag a coordinator was to DESTROY that agent's
+# display text — which is exactly why DIVE-2031 was fixed by re-parenting an org
+# root instead (option B, `org set olivia --role=coordinator`, was rejected for
+# this reason). Tier 2 lets the marker live INSIDE the prose ("AI CEO — fleet
+# coordinator"), so tagging costs nothing. Space-anchored so "coordinator"
+# matches and "uncoordinated" does not, and uniqueness-checked like every other
+# resolver here: >1 holder is ambiguous and yields nothing rather than a guess.
+# Tier 1 is kept ahead of it so an exact tag still wins when prose elsewhere also
+# mentions the word. Measured on the live chart 2026-08-09: zero of 13 roles
+# contain the marker, so this tier adds no candidate today and the resolution
+# stays on the lone-root fallback — it widens what an operator CAN express, it
+# does not re-route anything already resolved.
 _task_resolve_coordinator() {
   if [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE role='coordinator';")" == "1" ]]; then
     db "SELECT name FROM agents_org WHERE role='coordinator' LIMIT 1;"
+    return
+  fi
+  local _marker="lower(' '||COALESCE(role,'')) LIKE '% coordinator%'"
+  if [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE ${_marker};")" == "1" ]]; then
+    db "SELECT name FROM agents_org WHERE ${_marker} LIMIT 1;"
     return
   fi
   if [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE reports_to IS NULL OR reports_to NOT IN (SELECT name FROM agents_org);")" == "1" ]]; then
@@ -944,21 +967,50 @@ _gate_withdraw_actor() {
 # Deterministic + explainable: a role/charter routes ONLY on an unambiguous
 # single match; >1 holder or unknown -> empty (never guess which one).
 #   @name / bare name  -> taken as-is (explicit override; never re-routed)
-#   role:<r>           -> the lone agents_org holder whose role == <r> (ci)
+#   role:<r>           -> the lone holder whose role/title CONTAINS <r> (ci, DIVE-2041)
 #   charter:<kw>       -> the lone holder whose title (charter) contains <kw> (ci)
 # Safe on an empty/missing org table (COUNT != 1 -> empty).
+#
+# DIVE-2041 — `role:<r>` WAS DEAD FOR EVERY AGENT ON EVERY CHART. It matched
+# `lower(role) = lower(<r>)`, full-string equality, against a column whose every
+# real value is human prose: "QA / testing", "Backend lane — OSS CLI, API, core
+# council/constitution engine", "AI CEO — conducts the fleet (advisory)". So
+# `role:QA` could not match quinn, and in practice NO role: token could match ANY
+# agent. Same shape as the DIVE-2031 banner outage it was found next to: the
+# lookup resolved to empty, the task simply landed unassigned, and an unassigned
+# task is indistinguishable from ordinary behaviour — so nobody ever reported it.
+#
+# The predicate is the one already used by `_task_resolve_deputy` ~450 lines
+# above: space-anchored substring over role||title, uniqueness-checked. Not a new
+# mechanism — the sibling `charter:` token below has always done the substring
+# thing correctly, against `title`. Exact equality is TRIED FIRST so a chart that
+# does use terse role values keeps its existing, sharper resolution; the
+# substring pass only runs when exact found no unique holder, so this can only
+# turn empties into matches, never re-point an already-working token.
+#
+# `%` and `_` in the token are ESCAPED: they are LIKE wildcards, and an assignee
+# token is caller input, so `role:%` would otherwise "match" whatever single row
+# happened to exist and route work by accident.
+_org_like_escape() { local s="${1//\\/\\\\}"; s="${s//%/\\%}"; printf '%s' "${s//_/\\_}"; }
+
 _org_resolve_assignee() {
   local v="${1#@}"
   case "$v" in
     role:*)
       local r="${v#role:}"
-      [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE role IS NOT NULL AND lower(role)=lower($(sqlq "$r"));" 2>/dev/null)" == "1" ]] || { printf ''; return; }
-      db "SELECT name FROM agents_org WHERE role IS NOT NULL AND lower(role)=lower($(sqlq "$r")) LIMIT 1;"
+      if [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE role IS NOT NULL AND lower(role)=lower($(sqlq "$r"));" 2>/dev/null)" == "1" ]]; then
+        db "SELECT name FROM agents_org WHERE role IS NOT NULL AND lower(role)=lower($(sqlq "$r")) LIMIT 1;"
+        return
+      fi
+      local _rp="lower(' '||COALESCE(role,'')||' '||COALESCE(title,'')) LIKE '% '||lower($(sqlq "$(_org_like_escape "$r")"))||'%' ESCAPE '\'"
+      [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE ${_rp};" 2>/dev/null)" == "1" ]] || { printf ''; return; }
+      db "SELECT name FROM agents_org WHERE ${_rp} LIMIT 1;"
       ;;
     charter:*)
       local kw="${v#charter:}"
-      [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE title IS NOT NULL AND lower(title) LIKE '%'||lower($(sqlq "$kw"))||'%';" 2>/dev/null)" == "1" ]] || { printf ''; return; }
-      db "SELECT name FROM agents_org WHERE title IS NOT NULL AND lower(title) LIKE '%'||lower($(sqlq "$kw"))||'%' LIMIT 1;"
+      local _cp="title IS NOT NULL AND lower(title) LIKE '%'||lower($(sqlq "$(_org_like_escape "$kw")"))||'%' ESCAPE '\'"
+      [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE ${_cp};" 2>/dev/null)" == "1" ]] || { printf ''; return; }
+      db "SELECT name FROM agents_org WHERE ${_cp} LIMIT 1;"
       ;;
     *)
       printf '%s' "$v"
