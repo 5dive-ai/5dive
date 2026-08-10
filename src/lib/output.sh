@@ -163,7 +163,21 @@ fail() {
   # the bug-report verb there, with the actual verb/code filled in, rather than
   # leaving discovery to whoever happens to read .github/ISSUE_TEMPLATE.
   if [[ "$code" == "${E_GENERIC:-1}" ]]; then
-    echo "hint: run '5dive bug --verb=\"${CURRENT_VERB:-unknown}\" --exit=$code' to preview a diagnostic bug report (allowlisted fields only; nothing is filed until you add --file)" >&2
+    # DIVE-3136: the hint PREFILLS --what with the error text this function is
+    # already printing one line above. The two empty issues on the public repo
+    # (#526, #553) were filed by an agent following this very hint on a path
+    # with nobody at a prompt — so the fix is not "remind the caller to
+    # describe it", it is to hand them a command that already carries the one
+    # fact only this moment knows. #553 would then have read "accepts at most 1
+    # arg(s), received 2" instead of an unfilled template comment.
+    #
+    # Quotes and newlines are stripped, not escaped: the hint is wrapped in
+    # single quotes for copy-paste, so a quote inside it would end the string
+    # early and hand the reader a command that runs as something else.
+    local hint_what="${msg//$'\n'/ }"
+    hint_what="${hint_what//\'/}"; hint_what="${hint_what//\"/}"
+    hint_what="${hint_what:0:160}"
+    echo "hint: run '5dive bug --verb=\"${CURRENT_VERB:-unknown}\" --exit=$code --what=\"${hint_what}\"' to preview a diagnostic bug report (allowlisted fields plus the text you pass; nothing is filed until you add --file)" >&2
   fi
   # DIVE-2598: this exit carries a reason, so the EXIT-trap backstop stays quiet
   # for it. Set AFTER the message is emitted, never before — the flag asserts "the
