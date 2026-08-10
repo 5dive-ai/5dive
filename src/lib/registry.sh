@@ -212,6 +212,72 @@ tier_unmeasured() {
   esac
 }
 
+# envelope_peer_forgery <claimed> <measured> — DIVE-2183. The REFUSAL that
+# DIVE-2552 declined to make, narrowed to the one shape where refusing breaks
+# nothing that works today.
+#
+# 2552 stamped `via=` and wrote down why it stopped there: "reject --from=X unless
+# X is the caller" breaks the legitimate synthetic-label senders (`comment-watch`,
+# `blocker-push`, `community-heartbeat`, `host-updates`, `loop`, `task-engine`,
+# `council`, `verifier`, `ask`), none of which are agent names. That argument rules
+# out the BROAD guard and says nothing about the narrow one: a claim on a name the
+# REGISTRY knows is an agent has no legitimate caller but that agent itself.
+#
+# So the refusal turns on registration, and registration only. A label that is not
+# a registered agent stays as free as it is today.
+#
+# WHY THIS IS A REFUSAL WHERE `via=` IS A MARKER. via= hands the fact to a
+# receiver, and every receiver here is an LLM reading a pane — the field is advice
+# that a model may or may not act on. Impersonating a REGISTERED PEER is the one
+# case where there is nothing to weigh, so it is decided by the sender's own
+# process instead of being delegated to the recipient's judgment.
+#
+# VERDICTS. Never empty, and every non-refusal names WHY it is not one — the
+# DIVE-2210 property: "we could not check" must never be spelled like "we checked
+# and it was fine".
+#   ok:unclaimed            nothing was asserted (--raw, or --from=)
+#   ok:corroborated         the claim matches the measured caller
+#   ok:synthetic-label      MEASURED: the claim is not a registered agent name
+#   ok:unmeasured:<reason>  the caller or the registry could not be measured
+#   refuse:<measured>       a REGISTERED agent's name, claimed by someone else
+#
+# THE UNMEASURED BRANCH FAILS OPEN, DELIBERATELY, and that is defensible only
+# because of what it degrades TO. A guard that refused whenever the registry was
+# unreadable would take out every divergent-but-legitimate send on a box with one
+# bad file mode — and it would buy nothing, because reaching the unmeasured branch
+# already requires the powers this guard cannot defend against anyway. What is left
+# when the refusal declines to fire is DIVE-2552's `via=`, stamped by the same two
+# values: the send still carries the divergence to its receiver. Fail-open here is
+# a downgrade to the marker, not a hole.
+#
+# NOT tier_unmeasured(). That predicate partitions on whether a TIER was measured,
+# and this guard asks whether a NAME is registered. They disagree on exactly the
+# rows that matter: `unknown:no-tier` and `unknown:malformed-tier` are registry
+# HITS — the agent is registered, its isolation field is just missing or malformed
+# — so tier_unmeasured() would wave through a claim on a real peer's name because
+# that peer had no tier. Registration is answered by the presence of the key.
+envelope_peer_forgery() {
+  local claimed="${1:-}" measured="${2:-}"
+  [[ -n "$claimed" ]] || { printf 'ok:unclaimed\n'; return 0; }
+  # Compose over envelope_via rather than re-comparing, for the reason
+  # envelope_provenance does: the refusal and the `via=` a receiver reads must not
+  # be able to disagree about whether a send was mislabeled. It also inherits the
+  # header-safety check on the measured name for free.
+  local via; via="$(envelope_via "$claimed" "$measured")"
+  case "$via" in
+    "")        printf 'ok:corroborated\n';              return 0 ;;
+    unknown:*) printf 'ok:unmeasured:%s\n' "${via#unknown:}"; return 0 ;;
+  esac
+  # Diverged, and both names are in hand. One question left.
+  local t; t="$(agent_tier "$claimed")"
+  case "$t" in
+    unknown:unregistered)                    printf 'ok:synthetic-label\n' ;;
+    unknown:no-tier|unknown:malformed-tier)  printf 'refuse:%s\n' "$via" ;;
+    unknown:*)                               printf 'ok:unmeasured:%s\n' "${t#unknown:}" ;;
+    *)                                       printf 'refuse:%s\n' "$via" ;;
+  esac
+}
+
 registry_write() {
   # stdin -> registry, atomic
   local tmp
