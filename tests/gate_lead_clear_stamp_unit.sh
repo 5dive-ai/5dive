@@ -225,11 +225,26 @@ AUTH="main"
 #        why the fix carries ONE condition. `_gate_standing_lead` reads the sealed
 #        constitution (unavailable in a fixture) so it is the seam; ELIGIBILITY is
 #        the real predicate and runs unstubbed.
+#        DIVE-3171 MADE THE ISOLATION AN ACCIDENT, so it is now stated. This suite
+#        seeds NO `agents_org` rows, so every fixture filer is one the chart cannot
+#        route — and DIVE-3171 routes exactly that filer's eligible tier-1 eng
+#        approval to `_gate_standing_lead`, which this arm stubs to `main`. So
+#        `task need` began PERSISTING routed_reviewer=main here, the DIVE-1182
+#        ROUTED branch won, and the arm stamped `lead:main` and reported that it had
+#        graded nothing (which is the harness working: it refused to score a pass on
+#        a path that never ran). The arm's SUBJECT is unchanged and its isolation is
+#        now an INPUT it writes down, exactly as `mkgate` above writes down the
+#        opposite input for the routed arms — "routed_reviewer is the INPUT to the
+#        path under test, not part of what it decides". Clearing it after filing is
+#        therefore not an accommodation of DIVE-3171; it is the same discipline the
+#        routed arms already had, applied to the arm that needs the column EMPTY.
+#        The new interaction is not lost — arm 5b below grades it directly.
 reset
 SUDO_NONAGENT=1
 _gate_standing_lead() { printf 'main'; }
 t5=$(addt --assignee=dev -- "fixture standing approval $FIXTURE_MARK")
 cmd_task_need "$t5" --type=approval --ask="merge the CLI fix to main" --tier=1 >/dev/null 2>&1
+db "UPDATE tasks SET routed_reviewer=NULL WHERE id=${t5};" >/dev/null 2>&1
 ( actor_seam_as main; cmd_task_answer "$t5" --value="approved" --human --from=main >/dev/null 2>&1 )
 BY5=$(nby "$t5"); ROW5=$(row)
 if [[ "$BY5" == "lead:standing:main" ]]; then
@@ -242,6 +257,31 @@ else
   bad_t "standing clear did not engage — this arm graded nothing" \
         "need_answered_by='$BY5' row='$ROW5'"
 fi
+
+# --- 5b. DIVE-3171: the gate the standing ROUTE now mints clears through the -----
+#         ROUTED branch, and must still be a lead-clear rather than a human stamp.
+#         This is the same gate arm 5 files, with the column left exactly as
+#         `task need` wrote it. It matters because the two branches carry DIFFERENT
+#         provenance: `lead:standing:<n>` says the SEAL granted the authority,
+#         `lead:<n>` says the row named the reviewer. After DIVE-3171 the row's name
+#         was ITSELF resolved from the seal, so the authority chain is unbroken — but
+#         the stamp no longer says so, and anyone counting `lead:standing:` for a
+#         root-filed gate will now find it under `lead:`. Written down here so that
+#         shift is a recorded consequence and not a future mystery.
+reset
+SUDO_NONAGENT=1
+_gate_standing_lead() { printf 'main'; }
+t5b=$(addt --assignee=dev -- "fixture standing-routed approval $FIXTURE_MARK")
+cmd_task_need "$t5b" --type=approval --ask="merge the CLI fix to main" --tier=1 >/dev/null 2>&1
+RR5B=$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE id=${t5b};")
+[[ "$RR5B" == "main" ]] \
+  && ok_t "DIVE-3171 persists routed_reviewer for an unrouteable filer's eligible approval" \
+  || bad_t "DIVE-3171 persists routed_reviewer" "routed_reviewer='$RR5B' (empty means the standing route did not fire, so 5b grades nothing)"
+( actor_seam_as main; cmd_task_answer "$t5b" --value="approved" --human --from=main >/dev/null 2>&1 )
+BY5B=$(nby "$t5b")
+[[ "$BY5B" == "lead:main" ]] \
+  && ok_t "a standing-ROUTED clear is a lead-clear (lead:main), never a human: stamp" \
+  || bad_t "standing-routed clear stamps a lead" "need_answered_by='$BY5B' (expected lead:main)"
 
 # --- 7. suite guard: no fixture row reached the real fleet log ----------------
 # Graded by CONTENT, not by byte offset. The offset comparison other harnesses use
