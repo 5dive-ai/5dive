@@ -34,7 +34,7 @@ esac
 # sentinel is correct — but that version was CLAIMED, and possibly installed
 # somewhere, so it must not be re-issued. Check it is <= .release-floor and raise
 # the floor if it is not. Graded by tests/release_cut_assign_unit.sh.
-readonly FIVE_VERSION="0.0.0-dev"
+readonly FIVE_VERSION="0.19.14"
 
 # Build identity, not a release number. build.sh replaces this sentinel only in
 # the generated bundle with the 40-hex commit whose clean source it concatenated
