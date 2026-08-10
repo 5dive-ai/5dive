@@ -28,3 +28,4 @@
 {"cliVersion": "0.19.5", "date": "2026-08-07", "day": {"humanAsks": 1, "shipped": 16}, "publishedBy": {"host": "poke-two", "user": "claude"}, "week": {"humanAsks": 26, "shipped": 310}}
 {"cliVersion": "0.19.6", "date": "2026-08-08", "day": {"humanAsks": 6, "shipped": 19}, "publishedBy": {"host": "poke-two", "user": "claude"}, "week": {"humanAsks": 32, "shipped": 315}}
 {"cliVersion": "0.19.6", "date": "2026-08-09", "day": {"humanAsks": 0, "shipped": 16}, "publishedBy": {"host": "poke-two", "user": "claude"}, "week": {"humanAsks": 32, "shipped": 325}}
+{"cliVersion": "0.19.10", "date": "2026-08-10", "day": {"humanAsks": 10, "shipped": 95}, "publishedBy": {"host": "poke-two", "user": "claude"}, "week": {"humanAsks": 197, "shipped": 1567}, "window": {"calendarSpanDays": 30, "datapoints": 30, "label": "30d", "requestedDays": 30}}

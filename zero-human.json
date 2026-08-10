@@ -1,45 +1,52 @@
 {
-  "generatedAtUtc": "2026-08-09T02:00:14Z",
-  "date": "2026-08-09",
+  "generatedAtUtc": "2026-08-10T02:00:14Z",
+  "date": "2026-08-10",
   "week": {
-    "shipped": 325,
-    "humanAsks": 32
+    "shipped": 1567,
+    "humanAsks": 197
   },
   "day": {
-    "shipped": 16,
-    "humanAsks": 0
+    "shipped": 95,
+    "humanAsks": 10
   },
   "cumulative": {
-    "daysPublished": 30,
-    "shipped": 1486,
-    "humanAsks": 187,
+    "daysPublished": 31,
+    "shipped": 1581,
+    "humanAsks": 197,
     "since": "2026-07-11"
   },
-  "cliVersion": "0.19.6",
-  "source": "5dive digest --json [--7d]",
+  "cliVersion": "0.19.10",
+  "source": "5dive digest --json [--30d]",
   "methodology": "https://github.com/5dive-ai/5dive/blob/main/docs/zero-human.md",
+  "window": {
+    "label": "30d",
+    "requestedDays": 30,
+    "datapoints": 30,
+    "calendarSpanDays": 30,
+    "basis": "week above sums the last N PUBLISHED daily datapoints (DIVE-1552: non-overlapping 24h counts, immune to a board wipe). label counts DATAPOINTS, not calendar days \u2014 they diverge if the publisher misses a day, which is why calendarSpanDays is carried separately. The corroborators below use a live SQL span instead and carry their own window label; the two are different instruments and may disagree."
+  },
   "corroborators": {
     "verifierFirstPassRate": {
-      "value": "64.0%",
-      "window": "7d",
-      "firstPass": 114,
-      "graded": 178,
-      "shippedStandardTasks": 319,
-      "coveragePct": 55.8,
-      "basis": "live tasks.db query: status='done' AND kind='standard' AND done_at within the last 7 calendar days from datetime('now') \u2014 a DIFFERENT instrument from this datapoint's own week.shipped above (a frozen sum of the last 7 PUBLISHED daily datapoints, DIVE-1552, which can span more than 7 calendar days while publishing is paused). Do not read the two as the same number.",
-      "iterationNullGraded": 1,
-      "iterationNullBiasPctPtsMax": 0.6,
+      "value": "73.5%",
+      "window": "30d",
+      "firstPass": 514,
+      "graded": 699,
+      "shippedStandardTasks": 1222,
+      "coveragePct": 57.2,
+      "basis": "live tasks.db query: status='done' AND kind='standard' AND done_at within the last 30 calendar days from datetime('now') \u2014 a DIFFERENT instrument from this datapoint's own week.shipped above (a frozen sum of the last 30 PUBLISHED daily datapoints, DIVE-1552, which can span more than 30 calendar days while publishing is paused). Do not read the two as the same number.",
+      "iterationNullGraded": 33,
+      "iterationNullBiasPctPtsMax": 4.7,
       "note": "rows with a NULL iteration count as first-pass, biasing this rate UP by at most iterationNullBiasPctPtsMax"
     },
     "policyBlockedAttempts": {
-      "value": 208,
-      "window": "7d",
-      "instrumentedSites": 33,
-      "firedSites": 20,
-      "firedSitesLifetime": 23,
+      "value": 362,
+      "window": "30d",
+      "instrumentedSites": 34,
+      "firedSites": 27,
+      "firedSitesLifetime": 27,
       "ledgerSince": "2026-07-25 12:04:55",
-      "ledgerAgeDays": 14.6,
-      "note": "a site that never fires is not evidence of compliance \u2014 10 of 33 instrumented sites have never fired lifetime; no baseline exists yet while the ledger is young (see ledgerAgeDays)"
+      "ledgerAgeDays": 15.6,
+      "note": "a site that never fires is not evidence of compliance \u2014 7 of 34 instrumented sites have never fired lifetime; no baseline exists yet while the ledger is young (see ledgerAgeDays)"
     }
   },
   "publishedBy": {
