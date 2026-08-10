@@ -27,15 +27,43 @@
 # y/N. There is no separate unattended path: an agent takes the exact same
 # --file flag a human types, because an unreviewed report filed at 3am is
 # precisely the failure mode this refuses to build.
+#
+# DIVE-3136 — WHY --what IS MANDATORY TO FILE. The first two issues this verb
+# ever opened on the PUBLIC repo (#526 2026-08-07, #553 2026-08-10) shipped with
+# the "What happened" section still holding the template's own HTML comment. The
+# template asked a human to finish it, but this verb is invoked FROM AN ERROR
+# PATH, usually by an agent, non-interactively — the suggestion to run it is
+# printed by the failure itself. A template that needs a human to finish it is
+# guaranteed to ship unfinished on exactly the path it was built for. So the
+# placeholder is GONE (nothing in this file can emit it) and the description is
+# an argument: `--what="..."`, satisfiable non-interactively, prompted for on a
+# TTY, and a hard refusal when absent. A bug report with no description is worth
+# less than no bug report, because it consumes a reader.
+#
+# --what AND --argv ARE THE ONLY FREE TEXT, AND THEY ARE THE CALLER'S OWN BYTES.
+# That is not a hole in the allowlist above, it is the allowlist gaining two
+# named fields whose content the caller typed and then SAW re-printed verbatim
+# before anything left the box. What stays banned is unchanged: no field of this
+# payload is ever harvested from a richer object the caller never looked at.
+# Two guards ride along because the destination is a public issue —
+# _bug_redact_argv (same sensitive-flag rule as audit_log, src/lib/audit.sh) and
+# _bug_secret_scan, which REFUSES to file text carrying a token-shaped string.
 
 _bug_usage() {
   local _org; _org=$(gh_org)
   cat >&2 <<EOF
-5dive bug [--verb=<name>] [--exit=<code>] [--no-probes] [--file]
+5dive bug --what=<text> [--verb=<name>] [--exit=<code>] [--argv=<line>]
+          [--no-probes] [--file]
 
 Preview (default): builds the diagnostic payload and prints it. Files nothing.
+  --what=<text>   REQUIRED to --file: what you were doing, what you expected,
+                  what you saw. On a TTY you are prompted if you omit it; with
+                  no TTY the report is REFUSED rather than filed empty.
   --verb=<name>   the 5dive verb that failed (e.g. "doctor"); default: unknown
   --exit=<code>   its exit code; default: unknown
+  --argv=<line>   the failing invocation, e.g. --argv="gh pr view 51 --json st".
+                  Sensitive =<value> flags (--token=, --api-key=, ...) are
+                  redacted before it is shown or filed.
   --no-probes     skip the selfcheck probe summary entirely (probe name +
                   verdict only ever appear — never the free-text reason/detail
                   fields underneath them)
@@ -46,8 +74,9 @@ Preview (default): builds the diagnostic payload and prints it. Files nothing.
                   gets an interactive y/N; nothing is ever filed by default.
 
 The payload is a fixed allowlist: version, OS, bash version, install method,
-the verb that failed, its exit code, and selfcheck probe name+verdict pairs.
-No free text ever leaves this box in it.
+the verb that failed, its exit code, selfcheck probe name+verdict pairs, and
+the two fields you supply yourself — --what and --argv. Nothing else is
+collected, and every byte is printed before it is filed.
 EOF
 }
 
@@ -86,6 +115,42 @@ _bug_sanitize_verb() {
   printf '%s' "${v:0:80}"
 }
 
+# _bug_sanitize_text <text> <max> — bounds a caller-supplied free-text field.
+# Unlike _bug_sanitize_verb, newlines SURVIVE: --what is a paragraph and the
+# issue body is markdown, so folding it to one line would damage the one field
+# this whole ticket exists to make readable. Everything else in the C0 range is
+# stripped (a terminal escape in a public issue body is nobody's friend) and the
+# length is capped so a pasted logfile cannot ride in disguised as a summary.
+_bug_sanitize_text() {
+  local t="$1" max="${2:-2000}"
+  t=$(printf '%s' "$t" | tr -d '\000-\010\013\014\016-\037')
+  printf '%s' "${t:0:$max}"
+}
+
+# _bug_redact_argv <line> — the SAME sensitive-flag rule audit_log applies to
+# every row it writes (src/lib/audit.sh), deliberately duplicated rather than
+# shared: audit_log redacts an ARRAY of argv elements it was handed, this
+# redacts one flat string a caller typed, and the two cannot take each other's
+# input. Keep the flag list here in step with that one. --secret=/--password=
+# are additions, not drift: this string is bound for a public issue, so the
+# denylist is wider here than on a root-only logfile.
+#
+# A denylist is the wrong shape for harvested data and the right shape here:
+# the caller wrote this line and re-reads it before filing. It removes the
+# common accident, and _bug_secret_scan below is the backstop that REFUSES
+# rather than silently rewriting when something token-shaped survives.
+_bug_redact_argv() {
+  printf '%s' "$1" | sed -E 's/(--(api-key|api_key|token|telegram-token|discord-token|code|password|secret|passwd)=)[^[:space:]]*/\1<redacted>/g'
+}
+
+# _bug_secret_scan <text> — returns 0 when the text carries something
+# token-SHAPED. Not a completeness claim: it cannot know every secret format,
+# so it is a refusal trigger and never a licence to relax the rest of this
+# file. Patterns are the prefixes that are unambiguous on sight.
+_bug_secret_scan() {
+  grep -qE 'gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|sk-ant-[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|BEGIN [A-Z ]*PRIVATE KEY|[Bb]earer [A-Za-z0-9._-]{20,}' <<<"$1"
+}
+
 # _bug_collect_probes — the ONLY two fields ('probe', 'verdict') ever read out
 # of `selfcheck --json`'s probes[], named explicitly. .reason/.detail/.asserts
 # and the top-level .label (a host:uid string) are never asked for — the
@@ -104,13 +169,20 @@ _bug_collect_probes() {
 # field to the payload means editing this one line on purpose, never a
 # passthrough of some richer object.
 _bug_render_payload() {
-  local verb="$1" exit_code="$2" include_probes="$3"
+  local verb="$1" exit_code="$2" include_probes="$3" what="${4:-}" argv="${5:-}"
   local v_san; v_san=$(_bug_sanitize_verb "$verb")
   [[ -n "$v_san" ]] || v_san="unknown"
   local probes_json='[]'
   (( include_probes )) && probes_json=$(_bug_collect_probes)
   local exit_json='null'
   [[ "$exit_code" =~ ^[0-9]+$ ]] && exit_json="$exit_code"
+  # what/invocation render as JSON null when absent, never "" — the preview path
+  # legitimately has no description yet, and an empty string would read as "the
+  # caller described it as nothing" in exactly the artifact this ticket is
+  # about. Absent-vs-empty stays distinguishable, same rule .exit_code follows.
+  local what_json='null' argv_json='null'
+  [[ -n "$what" ]] && what_json=$(jq -Rn --arg s "$(_bug_sanitize_text "$what" 2000)" '$s')
+  [[ -n "$argv" ]] && argv_json=$(jq -Rn --arg s "$(_bug_sanitize_text "$(_bug_redact_argv "$argv")" 400)" '$s')
   jq -cn \
     --arg version "$FIVE_VERSION" \
     --arg os "$(_bug_os)" \
@@ -118,10 +190,12 @@ _bug_render_payload() {
     --arg install_method "$(_bug_install_method)" \
     --arg verb "$v_san" \
     --argjson exit_code "$exit_json" \
+    --argjson what "$what_json" \
+    --argjson invocation "$argv_json" \
     --argjson probes "$probes_json" \
     '{version:$version, os:$os, bash_version:$bash_version,
       install_method:$install_method, verb:$verb, exit_code:$exit_code,
-      probes:$probes}'
+      what:$what, invocation:$invocation, probes:$probes}'
 }
 
 # _bug_body_markdown <payload-json> — renders the issue body from the
@@ -129,22 +203,32 @@ _bug_render_payload() {
 # the Environment/Logs sections of .github/ISSUE_TEMPLATE/bug_report.md.
 _bug_body_markdown() {
   local payload="$1"
-  local version os bash_version install_method verb exit_code probes_table
+  local version os bash_version install_method verb exit_code probes_table what invocation
   version=$(jq -r '.version' <<<"$payload")
   os=$(jq -r '.os' <<<"$payload")
   bash_version=$(jq -r '.bash_version' <<<"$payload")
   install_method=$(jq -r '.install_method' <<<"$payload")
   verb=$(jq -r '.verb' <<<"$payload")
   exit_code=$(jq -r '.exit_code // "unknown"' <<<"$payload")
+  what=$(jq -r '.what // ""' <<<"$payload")
+  invocation=$(jq -r '.invocation // ""' <<<"$payload")
   probes_table=$(jq -r '.probes[]? | "- \(.probe): \(.verdict)"' <<<"$payload")
   [[ -n "$probes_table" ]] || probes_table="(skipped — re-run without --no-probes to include)"
+  # DIVE-3136: the description is the caller's --what, rendered here verbatim.
+  # There is deliberately NO template comment to fall back to — cmd_bug refuses
+  # to --file without a description, so the only way to reach this line empty is
+  # the local preview path, and it says so in words a reader can act on rather
+  # than in a comment that renders invisible on github.com.
+  [[ -n "$what" ]] || what="_(preview: no --what supplied — 5dive bug refuses to file without one)_"
+  local invocation_block=""
+  [[ -n "$invocation" ]] && invocation_block=$(printf '\n## Failing invocation\n\n```\n5dive %s\n```\n' "$invocation")
   cat <<EOF
 ## What happened
 
+${what}
+
 Filed via \`5dive bug\` after \`5dive ${verb}\` exited ${exit_code}.
-
-<!-- Add a one-paragraph summary here: what did you expect, what did you see. -->
-
+${invocation_block}
 ## Environment
 
 - \`5dive --version\`: ${version}
@@ -159,11 +243,13 @@ EOF
 }
 
 cmd_bug() {
-  local verb="" exit_code="" include_probes=1 do_file=0
+  local verb="" exit_code="" include_probes=1 do_file=0 what="" argv=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --verb=*)    verb="${1#--verb=}"; shift ;;
       --exit=*)    exit_code="${1#--exit=}"; shift ;;
+      --what=*)    what="${1#--what=}"; shift ;;
+      --argv=*)    argv="${1#--argv=}"; shift ;;
       --no-probes) include_probes=0; shift ;;
       --file)      do_file=1; shift ;;
       -h|--help)   _bug_usage; return 0 ;;
@@ -172,8 +258,37 @@ cmd_bug() {
   done
   [[ -n "$verb" ]] || verb="${CURRENT_VERB:-unknown}"
 
+  # DIVE-3136: settle the description BEFORE the payload is rendered, so the
+  # preview a caller reads is byte-identical to what --file then sends. The TTY
+  # prompt is the whole reason the refusal below is not a regression for humans:
+  # they are ASKED for the field instead of being told to re-run with a flag.
+  if (( do_file )) && [[ -z "$what" ]] && [[ -t 0 ]]; then
+    printf 'One or two lines — what were you doing, what did you expect, what did you see?\n> ' >&2
+    read -r what || what=""
+  fi
+  # And this is the arm that closes the ticket: no description, no public issue.
+  # Non-interactive is the path that filed #526 and #553, and it is the path
+  # that must be satisfiable without a human — hence --what, named in the error.
+  if (( do_file )) && [[ -z "${what//[[:space:]]/}" ]]; then
+    fail "$E_USAGE" "refusing to file a bug report with no description. Re-run with --what=\"what you were doing, what you expected, what you saw\" (an empty report costs a reader more than it is worth). Everything else is collected for you."
+  fi
+  # The public destination is what makes this a refusal and not a redaction: a
+  # token-shaped string in text the caller is about to publish is a mistake no
+  # rewrite can make safe, because they would not learn they had made it.
+  #
+  # Scanned AFTER redaction, deliberately. --argv is the field a caller pastes
+  # their real command line into, and `--token=ghp_...` is precisely what
+  # _bug_redact_argv exists to absorb; scanning the RAW string made the two
+  # guards fight and the refusal always won, which left the redaction unable to
+  # fire on the one shape it was written for and handed the caller a dead end
+  # where the design promised a fix. So redaction goes first and the scan grades
+  # what actually SURVIVED it — a bare token with no flag around it.
+  if (( do_file )) && _bug_secret_scan "$what$(_bug_redact_argv "$argv")"; then
+    fail "$E_USAGE" "refusing to file: --what/--argv carries a token-shaped string, and this opens a PUBLIC issue. Remove it and re-run."
+  fi
+
   local payload
-  payload=$(_bug_render_payload "$verb" "$exit_code" "$include_probes")
+  payload=$(_bug_render_payload "$verb" "$exit_code" "$include_probes" "$what" "$argv")
 
   if (( ! do_file )); then
     if (( JSON_MODE )); then
