@@ -293,5 +293,47 @@ else
   ok_t "quotes/newlines are stripped from the prefilled --what (the hint stays copy-pasteable)"
 fi
 
+# ── 12. the hint is INERT when pasted (DIVE-3136 review, quinn) ───────────────
+# Stripping only the quotes left a live command injection: --what sits inside
+# DOUBLE quotes, which do NOT suppress $(...) or `...`, and $msg is
+# caller-influenced via `fail "unknown flag: $1"`. The victim is whoever trusts
+# the tool enough to paste its own suggestion. Graded on the EXACT payload from
+# the review, and on the paste ACTUALLY being inert rather than on the strip
+# having been performed — an echoed expectation is not a tested one.
+# The marker path is STATIC on purpose. A $$ in it re-expands to the PASTED
+# shell's own pid, so the arm would look for a file the injection never wrote
+# and stay green while the payload fired — a false negative caught only by
+# reverting the fix and watching this arm fail to notice.
+#
+# The path is also SHORT, and both metacharacters sit right after the marker
+# word, because fail() truncates an "unknown flag" message 40 chars past it
+# (the DIVE-2323 payload guard above). A longer payload pushed the backtick off
+# the end, so that arm passed while asserting nothing — the truncation was
+# grading the test instead of the code.
+PWNED=/tmp/d3136p
+EVIL="unknown flag: \`whoami\`\$(touch $PWNED)"
+CURRENT_VERB="x"
+hint4=$(fail "$E_GENERIC" "$EVIL" 2>&1)
+hint4_line=$(grep '^hint:' <<<"$hint4")
+what_arg="${hint4_line#*--what=\"}"; what_arg="${what_arg%%\"*}"
+for ch in '$' '`' '\' "'"; do
+  if [[ "$what_arg" == *"$ch"* ]]; then
+    fail_t "shell metacharacter [$ch] survived into the pasteable --what: $hint4_line"
+  else
+    ok_t "metacharacter [$ch] is stripped from the prefilled --what"
+  fi
+done
+# The end-to-end arm: extract the suggested command and RUN it through a shell
+# that would betray any surviving substitution, then assert nothing happened.
+rm -f "$PWNED"
+suggested=$(sed -n "s/^hint: run '\(.*\)' to preview.*/\1/p" <<<"$hint4_line")
+bash -c "cmd_bug() { :; }; five_probe() { :; }; : $suggested" >/dev/null 2>&1 || true
+if [[ -e "$PWNED" ]]; then
+  fail_t "PASTING the hint executed a substitution — the strip did not hold: $hint4_line"
+else
+  ok_t "pasting the suggested command executes nothing (the hint is inert end to end)"
+fi
+rm -f "$PWNED"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
