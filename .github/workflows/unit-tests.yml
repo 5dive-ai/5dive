@@ -39,6 +39,9 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    outputs:
+      needs_confirm: ${{ steps.core.outputs.needs_confirm }}
+      runner_id: ${{ steps.core.outputs.runner_id }}
     steps:
       # DIVE-2229: fetch-depth is load-bearing, not hygiene. actions/checkout@v4
       # defaults to depth 1, and the harnesses below anchor "what this code did
@@ -80,8 +83,33 @@ jobs:
       # DIVE-2525: the budget is NOT passed here. It lives in tests/lib/tier.sh next
       # to the tier definition, because a budget spelled in the caller is raised by
       # a one-line YAML edit that nobody reviews as the policy change it is.
+      # DIVE-2829: --cross-runner=required. An over-budget verdict from ONE box is
+      # UNDETERMINED (exit 6), not a red — the confirm job below re-measures on a
+      # SECOND box and ITS verdict gates. Measured, same sha, same corpus, same job
+      # name: 828c1ea read 416s (138%, red, cut frozen ~40 min) then 245s (81%,
+      # green) — 1.70x apart. No in-job signal separates that from a grown corpus;
+      # a second box does, and on GitHub-hosted runners every job is its own
+      # ephemeral VM, so `needs:` + a fresh job IS a second box. One-sided: this can
+      # only turn a 4 into a 6, never a green into a red.
       - name: Run core harnesses (budgeted)
-        run: bash scripts/run-harnesses.sh --tier=core --label=pristine --report=core-pristine.txt
+        id: core
+        run: |
+          rid="${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "runner_id=$rid" >> "$GITHUB_OUTPUT"
+          set +e
+          bash scripts/run-harnesses.sh --tier=core --label=pristine \
+            --report=core-pristine.txt --cross-runner=required --runner-id="$rid"
+          rc=$?
+          set -e
+          # HAND OFF ONLY THE CROSS-RUNNER 6, never the calibration one. Exit 6 has two
+          # producers and they are not the same event: `undetermined=0` in the report
+          # with rc 6 is this row's gate, and anything else keeps the red it always had.
+          if [ "$rc" = 6 ] && grep -q '^# undetermined=0' core-pristine.txt \
+             && ! grep -q '^# cross_runner_state=confirmed' core-pristine.txt; then
+            echo "needs_confirm=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          exit "$rc"
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: core-pristine, path: core-pristine.txt, if-no-files-found: warn }
@@ -250,44 +278,21 @@ jobs:
 
   test-installed-host:
     runs-on: ubuntu-latest
+    outputs:
+      needs_confirm: ${{ steps.core.outputs.needs_confirm }}
+      runner_id: ${{ steps.core.outputs.runner_id }}
     steps:
       # DIVE-2229: full history — pinned baselines must resolve here too.
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+      # DIVE-2829: the seeding lives in .github/scripts/simulate-installed-host.sh
+      # because the confirm job below must reproduce THIS environment exactly. A
+      # cross-runner confirmation of a budget red is only evidence if the second box
+      # measures the same corpus in the same environment, and two copies of a setup
+      # block are two environments as soon as one of them is edited. Every comment
+      # that stood beside these lines moved with them; nothing was dropped.
       - name: Simulate a box with 5dive installed
-        run: |
-          # live state dir + gate-proof enforcement flipped ON (as on the
-          # control plane) — catches harnesses whose gate paths escape STATE_DIR
-          sudo mkdir -p /var/lib/5dive
-          sudo touch /var/lib/5dive/gate-proof.enforce
-          sudo chmod 0644 /var/lib/5dive/gate-proof.enforce
-          # a real telegram-pi/-opencode checkout on the canonical fallback paths
-          # — catches assertions that only hold when the product is NOT installed
-          for p in telegram-pi telegram-opencode; do
-            sudo mkdir -p "/usr/local/lib/5dive/$p"
-            echo '// stub for the installed-host CI matrix' \
-              | sudo tee "/usr/local/lib/5dive/$p/server.ts" >/dev/null
-          done
-          # DIVE-2018: a `claude` user and at least one `agent-*` user. The control
-          # plane has both; a CI runner has neither, so gate_nonce_unit.sh and
-          # gate_sudo_uid_forge_unit.sh `exit 0` at their own SKIP guard before ever
-          # reaching a verdict. After the canary fix they were the LAST two harnesses
-          # the probe could not reach in ANY environment — and they are the gate
-          # identity and SUDO_UID forge tests, i.e. exactly the coverage whose absence
-          # matters most. Two throwaway system users, no shell, no home.
-          # DIVE-2525: the GROUP, not just the users. `task init` chowns the store to
-          # root:claude, and `useradd -N` deliberately does NOT create a like-named
-          # group — so on a runner seeded with users alone the chown dies with
-          # "chown: invalid group: 'root:claude'", `task init` fails, and
-          # council_record_e2e.sh takes its own `|| exit 0` and skips. That skip is
-          # what the nightly union reported as NEVER PROBED in EITHER environment.
-          # It had been getting the group by accident from a corpus run earlier in
-          # the same job; splitting the probe into its own job removed the accident
-          # and the union said so immediately, which is the rail working.
-          sudo groupadd -f claude
-          sudo useradd -M -N -s /usr/sbin/nologin claude 2>/dev/null || true
-          sudo useradd -M -N -s /usr/sbin/nologin agent-dev 2>/dev/null || true
-          getent passwd claude agent-dev
+        run: bash .github/scripts/simulate-installed-host.sh
       # DIVE-2525: core tier, held to the SAME 300s budget as the pristine job. This
       # environment is slower per harness (real sudo, seeded host state), and that is
       # a cost of the corpus too — hiding it under a laxer cap here would just move
@@ -311,8 +316,24 @@ jobs:
       # harness now FAILS without bun, so a job missing this step goes red.
       - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
         uses: oven-sh/setup-bun@v2
+      # DIVE-2829: see the pristine job. This is the job the 2026-08-05 pair was
+      # measured on, and the one whose red froze release-cut.yml.
       - name: Run core harnesses (installed host, budgeted)
-        run: bash scripts/run-harnesses.sh --tier=core --label=installed-host --report=core-installed.txt
+        id: core
+        run: |
+          rid="${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "runner_id=$rid" >> "$GITHUB_OUTPUT"
+          set +e
+          bash scripts/run-harnesses.sh --tier=core --label=installed-host \
+            --report=core-installed.txt --cross-runner=required --runner-id="$rid"
+          rc=$?
+          set -e
+          if [ "$rc" = 6 ] && grep -q '^# undetermined=0' core-installed.txt \
+             && ! grep -q '^# cross_runner_state=confirmed' core-installed.txt; then
+            echo "needs_confirm=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          exit "$rc"
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: core-installed, path: core-installed.txt, if-no-files-found: warn }
@@ -365,3 +386,69 @@ jobs:
         run: |
           bash tests/meta/selfcheck-union.sh \
             selfcheck-pristine.txt selfcheck-installed.txt selfcheck-root.txt
+
+  # DIVE-2829: THE SECOND BOX. It runs ONLY when the first one was over its cap and
+  # nothing else has looked — so on a green PR it does not exist, and the cost of the
+  # confirmation is charged to the ~1-in-N of runs that were previously deciding a
+  # release freeze off a single sample. `runs-on: ubuntu-latest` in a separate job is
+  # what makes it a different BOX rather than a different ATTEMPT: GitHub-hosted jobs
+  # each get their own ephemeral VM (the mechanism that also killed "a concurrent job
+  # stole CPU" as an explanation — see the wiki note).
+  #
+  # ITS VERDICT IS THE GATE. Over on this box too, with the first box named via
+  # --prior-over-runner, and the run exits 4 with the corpus finding restored. Inside
+  # the cap here and the first sample was the runner, which is what happened on
+  # 828c1ea: 416s then 245s, and only the 416s was ever acted on.
+  test-confirm:
+    needs: test
+    if: needs.test.outputs.needs_confirm == '1'
+    runs-on: ubuntu-latest
+    steps:
+      # DIVE-2229: full history — pinned baselines must resolve here too.
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Build the bundle (harness precondition, not an accident of ordering)
+        run: ./build.sh
+      # DIVE-3059: same precondition as the pristine job — the harness FAILS
+      # without bun, so every job that runs the corpus needs this step.
+      - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
+        uses: oven-sh/setup-bun@v2
+      - name: Confirm the budget red on a SECOND runner (DIVE-2829)
+        run: |
+          bash scripts/run-harnesses.sh --tier=core --label=pristine-confirm \
+            --report=core-pristine-confirm.txt --cross-runner=required \
+            --runner-id="${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --prior-over-runner="${{ needs.test.outputs.runner_id }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: core-pristine-confirm, path: core-pristine-confirm.txt, if-no-files-found: warn }
+
+  # DIVE-2829: the same second box for the installed-host tier. It seeds the
+  # environment from the SAME script the first job used, which is the whole reason
+  # that script exists — a confirmation taken in a different environment confirms a
+  # different question.
+  test-installed-host-confirm:
+    needs: test-installed-host
+    if: needs.test-installed-host.outputs.needs_confirm == '1'
+    runs-on: ubuntu-latest
+    steps:
+      # DIVE-2229: full history — pinned baselines must resolve here too.
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Simulate a box with 5dive installed
+        run: bash .github/scripts/simulate-installed-host.sh
+      - name: Build the bundle (harness precondition, not an accident of ordering)
+        run: ./build.sh
+      # DIVE-3059: same precondition as the pristine job — the harness FAILS
+      # without bun, so every job that runs the corpus needs this step.
+      - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
+        uses: oven-sh/setup-bun@v2
+      - name: Confirm the budget red on a SECOND runner (DIVE-2829)
+        run: |
+          bash scripts/run-harnesses.sh --tier=core --label=installed-host-confirm \
+            --report=core-installed-confirm.txt --cross-runner=required \
+            --runner-id="${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --prior-over-runner="${{ needs.test-installed-host.outputs.runner_id }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: core-installed-confirm, path: core-installed-confirm.txt, if-no-files-found: warn }

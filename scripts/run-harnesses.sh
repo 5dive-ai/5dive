@@ -29,8 +29,10 @@
 #      claims a measured time the clock just refuted by >= 50% (DIVE-2555). Same
 #      reason 4 is not 1: the remedy is different, so the code is different.
 #   6  UNDETERMINED (DIVE-2728). The budget could not be GRADED: the calibration
-#      probe could not run, or the runner drew so far outside its clamp that the
-#      scaled cap would license an arbitrarily larger corpus. NOT 4, and the
+#      probe could not run, the runner drew so far outside its clamp that the
+#      scaled cap would license an arbitrarily larger corpus, or (DIVE-2829, under
+#      --cross-runner=required) the run is over its cap on ONE runner and no second
+#      runner has agreed yet. NOT 4, and the
 #      distinction is the whole point of the row: "the corpus is over its cap" and
 #      "this box cannot measure that cap" are different events, and folding the
 #      second into the first is what DIVE-2667 was. Not 0 either — a run that could
@@ -87,6 +89,12 @@ CALIBRATE=1; CAL_US_IN=""; CAL_BASELINE_US=""; CAL_CLI="./5dive"
 # DIVE-2736. CAL_POST=1 means take a SECOND probe after the corpus. It is a
 # discriminator, not an input to the verdict — see the block after the run loop.
 CAL_POST=1; CAL_POST_US_IN=""
+# DIVE-2829. THE ONE DISCRIMINATOR WITH A TRACK RECORD, MADE MECHANICAL.
+# `off` is today's behaviour: one runner's sample can exit 4 on its own. `required`
+# says an over-budget verdict is not FINAL until a SECOND, DIFFERENT runner has
+# measured the same corpus over the same cap — until then it is exit 6, not exit 4.
+# See the block beside the over-budget verdict for the argument and the numbers.
+CROSS_RUNNER=off; RUNNER_ID=""; PRIOR_OVER_RUNNER=""
 for a in "$@"; do case "$a" in
   --tier=*)   TIER="${a#--tier=}" ;;
   # The seam that lets tests/corpus_tier_budget_unit.sh grade THIS script against a
@@ -147,15 +155,34 @@ for a in "$@"; do case "$a" in
   # the second reading for the same reason --cal-us= injects the first.
   --no-cal-post) CAL_POST=0 ;;
   --cal-post-us=*) CAL_POST_US_IN="${a#--cal-post-us=}" ;;
+  # DIVE-2829 seams. Unlike --budget and --cal-us, --cross-runner IS policy and the
+  # workflow DOES pass it: "how many boxes must agree before main goes red" is a
+  # property of the CI topology (one ephemeral VM per job), not of the tier, so it
+  # belongs with the caller that owns the topology. It is one-sided in the same
+  # direction as --confirm-top and the clamp: `required` can only ever turn a 4 into
+  # a 6. It can never turn a red into a green, and never a green into anything.
+  # --runner-id names THIS box; --prior-over-runner names a box that already went
+  # over on this same tree. They are equality-compared and never parsed, so any
+  # string that is unique per VM works (the workflow uses job+run+attempt).
+  --cross-runner=*) CROSS_RUNNER="${a#--cross-runner=}" ;;
+  --runner-id=*) RUNNER_ID="${a#--runner-id=}" ;;
+  --prior-over-runner=*) PRIOR_OVER_RUNNER="${a#--prior-over-runner=}" ;;
   --top=*)    TOP="${a#--top=}" ;;
   *) printf 'unknown arg: %s\n' "$a" >&2; exit 2 ;;
 esac; done
 
 case "$TIER" in
   core|full) ;;
-  *) printf 'usage: run-harnesses.sh --tier=core|full [--budget=<seconds>] [--label=<env>] [--report=<file>] [--corpus-dir=<dir>] [--confirm-top=<n>] [--no-calibrate] [--cal-us=<us/iter>] [--cal-baseline-us=<us/iter>] [--cal-cli=<path>] [--no-cal-post] [--cal-post-us=<us/iter>]\n' >&2; exit 2 ;;
+  *) printf 'usage: run-harnesses.sh --tier=core|full [--budget=<seconds>] [--label=<env>] [--report=<file>] [--corpus-dir=<dir>] [--confirm-top=<n>] [--no-calibrate] [--cal-us=<us/iter>] [--cal-baseline-us=<us/iter>] [--cal-cli=<path>] [--no-cal-post] [--cal-post-us=<us/iter>] [--cross-runner=off|required] [--runner-id=<id>] [--prior-over-runner=<id>]\n' >&2; exit 2 ;;
 esac
 [[ "$CONFIRM_TOP" =~ ^[0-9]+$ ]] || { printf 'run-harnesses: --confirm-top must be a non-negative integer, got %s\n' "$CONFIRM_TOP" >&2; exit 2; }
+# DIVE-2829: an unrecognised MODE is usage, never a silent fall back to `off`. A typo
+# that quietly disarms a control is the DIVE-2736 inertness shape — the mechanism stops
+# existing while everything still prints.
+case "$CROSS_RUNNER" in
+  off|required) ;;
+  *) printf 'run-harnesses: --cross-runner must be off or required, got %s\n' "$CROSS_RUNNER" >&2; exit 2 ;;
+esac
 [[ -n "$BUDGET" ]] || BUDGET="$(tier_budget "$TIER")" || exit 2
 [[ -n "$LABEL" ]] || LABEL="local"
 [[ -n "$CAL_BASELINE_US" ]] || CAL_BASELINE_US="$TIER_CAL_BASELINE_US"
@@ -234,6 +261,26 @@ cal_probe() { # <iters> -> elapsed ms on stdout; non-zero if the probe could not
 
 CAL_STATUS="skipped"; CAL_US=0; CAL_ITERS=0; CAL_WHY=""
 CAL_POST_STATUS="skipped"; CAL_POST_US=0; CAL_POST_DELTA=0
+
+# DIVE-2829: resolve the CROSS-RUNNER state here, before a single harness has run, and
+# on EVERY run rather than only on the red path. It is a property of the arguments, not
+# of the total, so a reader of a GREEN report can still see whether the confirmation
+# rail was armed on this job — an unarmed control and a satisfied one print the same
+# verdict, and telling them apart after the fact is exactly what was impossible on
+# 2026-08-05. Its EFFECT is applied once, beside the over-budget verdict.
+#   off           - not armed. One runner can exit 4 on its own (pre-DIVE-2829).
+#   single        - armed, no prior over-budget sample. This is the first box.
+#   same          - armed, but the prior sample came from THIS box. Not a second runner.
+#   unidentified  - armed and this box cannot name itself, so it cannot prove it is a
+#                   different box from any other. Fails CLOSED to UNDETERMINED.
+#   confirmed     - armed, and a DIFFERENT box already measured this tree over its cap.
+CROSS_STATE="off"
+if [[ "$CROSS_RUNNER" == "required" ]]; then
+  if [[ -z "$RUNNER_ID" ]];                        then CROSS_STATE="unidentified"
+  elif [[ -z "$PRIOR_OVER_RUNNER" ]];              then CROSS_STATE="single"
+  elif [[ "$PRIOR_OVER_RUNNER" == "$RUNNER_ID" ]]; then CROSS_STATE="same"
+  else                                                  CROSS_STATE="confirmed"; fi
+fi
 SCALE_RAW=100; SCALE=100
 EFF_MS=$(( BUDGET * 1000 )); EFF_BUDGET="$BUDGET"
 undetermined=0
@@ -528,6 +575,12 @@ if [[ -n "$REPORT" ]]; then
     # wall_clock_s and harnesses.
     printf '# cal_post_status=%s\n# cal_post_us_per_iter=%d\n# cal_post_delta_pct=%d\n' \
       "$CAL_POST_STATUS" "$CAL_POST_US" "$CAL_POST_DELTA"
+    # DIVE-2829: appended for the same reason again. cross_runner_state is what lets a
+    # later reader answer "was this red allowed to fire off one box?" from the artifact
+    # instead of from the YAML at the time — and the runner ids are what make two
+    # reports from the same run provably two BOXES rather than two attempts.
+    printf '# cross_runner=%s\n# cross_runner_state=%s\n# runner_id=%s\n# prior_over_runner=%s\n' \
+      "$CROSS_RUNNER" "$CROSS_STATE" "${RUNNER_ID:--}" "${PRIOR_OVER_RUNNER:--}"
     for i in "${!NAME[@]}"; do printf '%s\t%s\t%s\n' "${MS[$i]}" "${RC[$i]}" "${NAME[$i]}"; done
   } > "$REPORT"
 fi
@@ -661,7 +714,7 @@ if (( confirmed )); then
   done
 fi
 
-over=0
+over=0; cross_unconfirmed=0
 if (( BUDGET <= 0 )); then
   printf 'harness-budget[%s]: BUDGET DISABLED (--budget=%s). This run enforces nothing.\n' "$TIER" "$BUDGET"
 elif (( undetermined )); then
@@ -727,12 +780,48 @@ elif (( total_ms > EFF_MS )); then
   # DIVE-2829: the re-run is not one option among four. It is the only step here with a
   # MEASURED track record of settling this question, it is one click, and it costs ~6
   # minutes against the ~40 the release cut stayed frozen on 2026-08-05.
-  printf '\nDO THIS FIRST: RE-RUN THIS JOB ON THE SAME SHA. A second sample from a DIFFERENT\n'
-  printf 'runner is the only discriminator that has ever settled this, and it has settled it\n'
-  printf 'twice. Measured on the same sha, same corpus, same job name (DIVE-2828/2813):\n'
-  printf '    828c1ea attempt 1  416s (138%%)  RED        828c1ea attempt 2  245s (81%%)  green\n'
-  printf '    fd81f7b attempt 1  324s (108%%)  RED        fd81f7b attempt 2  291s (96%%)  green\n'
-  printf 'Only if the SECOND runner is also over is the finding below about your corpus.\n'
+  #
+  # AND UNDER --cross-runner=required IT IS NOT AN INSTRUCTION AT ALL, it is the gate.
+  # An advisory that names the right next step still spends the reader's ~40 minutes and
+  # still leaves main red while they read it; the whole cost of 2026-08-05 was paid
+  # BEFORE anyone disagreed with the text. So when the caller owns a topology that can
+  # produce a second box (one ephemeral VM per job on GitHub-hosted runners — the
+  # mechanism the wiki note establishes), this run stops at UNDETERMINED and the second
+  # box decides. One-sided, in the settled slot: 4 -> 6 only, never 6 -> 4, never
+  # green -> anything. The failure mode it CANNOT have is licensing a bigger corpus,
+  # because agreement between two boxes is not a number anyone can raise.
+  if [[ "$CROSS_STATE" == "confirmed" ]]; then
+    printf '\nCONFIRMED ON A SECOND RUNNER (DIVE-2829): %s measured this corpus over the same cap\n' "$PRIOR_OVER_RUNNER"
+    printf 'before this box (%s) did. Two boxes, same tree, both over — that is the discriminator\n' "$RUNNER_ID"
+    printf 'a single sample does not have, and it is the one that has ever settled this. Exit 4\n'
+    printf 'stands and the finding below IS about your corpus.\n'
+  elif [[ "$CROSS_STATE" != "off" ]]; then
+    cross_unconfirmed=1
+    printf '\nNOT CONFIRMED ON A SECOND RUNNER — THIS IS EXIT 6 (UNDETERMINED), NOT EXIT 4.\n'
+    case "$CROSS_STATE" in
+      single) printf 'This is ONE sample from ONE box (%s) and no other box has measured this tree.\n' "$RUNNER_ID" ;;
+      same)   printf 'The prior over-budget sample came from THIS SAME box (%s).\n' "$RUNNER_ID"
+              printf 'That is a second ATTEMPT, not a second RUNNER — the distinction the DIVE-2592\n'
+              printf 'confirmation above cannot make either, for the same reason.\n' ;;
+      unidentified)
+              printf -- '--cross-runner=required was passed with no --runner-id, so this run cannot prove\n'
+              printf 'it is a different box from any other. That fails CLOSED to UNDETERMINED: a control\n'
+              printf 'that cannot identify its own sample must not be credited with one (DIVE-2728).\n' ;;
+    esac
+    printf 'Measured on the same sha, same corpus, same job name (DIVE-2828/2813):\n'
+    printf '    828c1ea attempt 1  416s (138%%)  RED        828c1ea attempt 2  245s (81%%)  green\n'
+    printf '    fd81f7b attempt 1  324s (108%%)  RED        fd81f7b attempt 2  291s (96%%)  green\n'
+    printf 'A second box is now running this tier and its verdict is the one that gates. The\n'
+    printf 'finding below is CONDITIONAL on that box agreeing; do not retire or demote anything\n'
+    printf 'on the strength of this run alone.\n'
+  else
+    printf '\nDO THIS FIRST: RE-RUN THIS JOB ON THE SAME SHA. A second sample from a DIFFERENT\n'
+    printf 'runner is the only discriminator that has ever settled this, and it has settled it\n'
+    printf 'twice. Measured on the same sha, same corpus, same job name (DIVE-2828/2813):\n'
+    printf '    828c1ea attempt 1  416s (138%%)  RED        828c1ea attempt 2  245s (81%%)  green\n'
+    printf '    fd81f7b attempt 1  324s (108%%)  RED        fd81f7b attempt 2  291s (96%%)  green\n'
+    printf 'Only if the SECOND runner is also over is the finding below about your corpus.\n'
+  fi
   # DIVE-2728: measured against the EFFECTIVE cap, so the covering set is the set that
   # actually gets this run inside the cap it was graded on. And the line above it says
   # so out loud, because "over by 22s" against an unstated cap is how a reader ends up
@@ -812,6 +901,13 @@ fi
 # corpus ever ran. Above 4 because when the cap could not be graded there is no
 # over-budget claim to make: `over` was not even computed on that path.
 (( undetermined == 0 )) || exit 6
+# DIVE-2829: an over-budget run that no SECOND runner has confirmed resolves in the same
+# slot, above 4 and below 1, and for the same reason DIVE-2728 put it there: "the corpus
+# is over its cap" and "one box says so" are different claims, and the second is not
+# evidence for the first on a platform measured 1.70x wide at the same sha. Note the
+# ORDER — this is checked before `over`, so it can only ever turn a 4 into a 6; `over`
+# is still set, still printed, and still the thing a second box confirms.
+(( cross_unconfirmed == 0 )) || exit 6
 (( over == 0 )) || exit 4
 (( drift_fatal == 0 )) || exit 5
 exit 0

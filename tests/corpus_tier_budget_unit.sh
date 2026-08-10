@@ -1202,5 +1202,103 @@ printf '#!/usr/bin/env bash\nsleep 1.4\nexit 0\n' > "$TMP/w.sh"
 relrun --budget=1 --cal-us=100000 --cal-post-us=40000 --confirm-top=0
 want "a post probe reading 2.5x FAST does not red-shift the verdict either — the discriminator is out of the exit code in both directions, now for a measured reason" "4" "$RC"
 
+# ------------- 83-91 DIVE-2829 iteration 2: A SINGLE RUNNER CANNOT RED main ALONE
+# The arms above fixed the CLAIM. These fix the VERDICT, and they are the two arms the
+# row's acceptance names — a slow-runner arm that must NOT red, and the control that
+# must still red — plus the one-sidedness and fail-closed cases that keep the first from
+# being an escape hatch.
+#
+# WHY THIS SHAPE AND NOT THE ROW'S OWN RECOMMENDED ONE: the post-corpus discriminator is
+# measured BLIND to this factor (arms 81/82 and the note at run-harnesses.sh). What is
+# left is the discriminator that has settled it twice in the record — a second sample
+# from a DIFFERENT box — and the only reason it was deprioritised (olivia, DIVE-2828) was
+# the cost of a second corpus run. That cost is now paid ONLY on the red path, which is
+# the ~1-in-N of runs where the alternative was ~40 minutes of frozen release cut.
+#
+# THE SEAM IS EQUALITY ON A STRING, deliberately. The harness injects the confirmation
+# state the same way it injects --cal-us, so every arm below grades the GATE and not the
+# runner it happens to be on — the DIVE-2555 §4 rule this whole file is built around.
+rm -f "$TMP"/*.sh "$TMP"/*.seen
+
+# ---- 83 THE ACCEPTANCE'S FIRST ARM. Over the cap, one box, nobody else has looked.
+# Exit 6, not 4. This is the 2026-08-05 run: on this branch before this change it exited
+# 4, main went red and the cut froze.
+printf '#!/usr/bin/env bash\nsleep 1.4\nexit 0\n' > "$TMP/w.sh"
+relrun --budget=1 --cal-us=100000 --confirm-top=0 --cross-runner=required --runner-id=box-a
+want "SLOW-RUNNER ARM: over the cap on ONE box, unconfirmed, is UNDETERMINED (6) and not OVER BUDGET (4)" "6" "$RC"
+if [[ "$OUT" == *"NOT CONFIRMED ON A SECOND RUNNER"* && "$OUT" == *"ONE sample from ONE box"* ]]; then
+  ok "and it says which sample it has and which it lacks, rather than reporting a cap it could not grade"
+else bad "the unconfirmed red names the missing second runner" "$OUT"; fi
+
+# ---- 84 THE ACCEPTANCE'S SECOND ARM, the control whose expected value is non-zero. The
+# SAME corpus, the SAME cap, once a DIFFERENT box has already gone over: still exit 4.
+# Without this, arm 83 is satisfied by a gate that simply never reds.
+relrun --budget=1 --cal-us=100000 --confirm-top=0 --cross-runner=required \
+  --runner-id=box-b --prior-over-runner=box-a
+want "CONTROL: the same over-cap corpus, confirmed by a DIFFERENT box, still exits 4" "4" "$RC"
+if [[ "$OUT" == *"CONFIRMED ON A SECOND RUNNER"* && "$OUT" == *"IS about your corpus"* ]]; then
+  ok "and only THEN does the output tell the reader the finding is about their corpus — the sentence arm 74 stopped it asserting on one sample"
+else bad "the confirmed red claims the corpus, and only when confirmed" "$OUT"; fi
+
+# ---- 85 a second ATTEMPT is not a second RUNNER. The DIVE-2592 confirmation re-times on
+# the same box and calls that "not variance"; this is the same mistake one level up, and
+# it is the one an operator makes by hand when they re-run and paste the same id.
+relrun --budget=1 --cal-us=100000 --confirm-top=0 --cross-runner=required \
+  --runner-id=box-a --prior-over-runner=box-a
+want "a prior over-budget sample from the SAME box id does not confirm anything — exit 6" "6" "$RC"
+if [[ "$OUT" == *"second ATTEMPT, not a second RUNNER"* ]]; then
+  ok "and it names the attempt-vs-runner distinction, which is exactly what the same-runner confirmation above it cannot see"
+else bad "the same-box case names attempt vs runner" "$OUT"; fi
+
+# ---- 86 FAIL CLOSED. Armed but unable to identify itself: it cannot prove it is a
+# different box, so it is not credited with a sample. The alternative — treat an unnamed
+# box as distinct — is an escape hatch reachable by omitting an argument.
+relrun --budget=1 --cal-us=100000 --confirm-top=0 --cross-runner=required \
+  --prior-over-runner=box-a
+want "armed with NO --runner-id fails CLOSED to UNDETERMINED rather than crediting an unnamed box" "6" "$RC"
+
+# ---- 87 ONE-SIDED, PROVEN ON THE GREEN PATH. The gate must be unable to turn a passing
+# run into anything at all. An arm asserting a string is ABSENT passes trivially if the
+# block stopped printing, so this also asserts the run's own verdict.
+printf '#!/usr/bin/env bash\nsleep 0.3\nexit 0\n' > "$TMP/w.sh"
+relrun --budget=1 --cal-us=100000 --confirm-top=0 --cross-runner=required --runner-id=box-a
+if (( RC == 0 )) && [[ "$OUT" != *"NOT CONFIRMED ON A SECOND RUNNER"* && "$OUT" != *"OVER BUDGET"* ]]; then
+  ok "ONE-SIDED: a run INSIDE its cap is untouched by --cross-runner=required — the gate can only ever move a 4 to a 6, never a green to a red and never a red to a green"
+else bad "cross-runner=required leaves a passing run alone" "rc=$RC $OUT"; fi
+
+# ---- 88 A FAILING HARNESS STILL DOMINATES. Exit 1 outranks 6 for the same reason it
+# outranks 4: an unmeasurable box must never hide a broken test.
+printf '#!/usr/bin/env bash\nsleep 1.4\nexit 1\n' > "$TMP/w.sh"
+relrun --budget=1 --cal-us=100000 --confirm-top=0 --cross-runner=required --runner-id=box-a
+want "a FAILED harness still exits 1 under an unconfirmed over-budget run — the ladder order is unchanged" "1" "$RC"
+
+# ---- 89 DEFAULT IS OFF, and the default path is byte-for-byte the one arms 74-82 grade.
+# This is what keeps the change from being a silent policy edit for every other caller.
+printf '#!/usr/bin/env bash\nsleep 1.4\nexit 0\n' > "$TMP/w.sh"
+relrun --budget=1 --cal-us=100000 --confirm-top=0
+if (( RC == 4 )) && [[ "$OUT" == *"DO THIS FIRST: RE-RUN THIS JOB ON THE SAME SHA"* \
+      && "$OUT" != *"NOT CONFIRMED ON A SECOND RUNNER"* ]]; then
+  ok "DEFAULT OFF: with no --cross-runner the verdict and the text are unchanged — a caller that has no second box still gets the advisory it had, not a gate it cannot satisfy"
+else bad "the default is off and unchanged" "rc=$RC $OUT"; fi
+
+# ---- 90 an unrecognised MODE is usage, not a silent disarm. DIVE-2736's inertness was
+# a control that stopped existing while everything still printed; a typo'd flag is the
+# one-character version of it.
+relrun --budget=1 --cal-us=100000 --confirm-top=0 --cross-runner=requried
+want "a misspelt --cross-runner mode is exit 2 usage, never a silent fall back to off" "2" "$RC"
+
+# ---- 91 THE WIRING IS PART OF THE REMEDY. A gate that no caller arms grades nothing —
+# which is the exact failure this row was filed about (a discriminator that ships, runs
+# and is wired to nothing). So the workflow that reds `main` is asserted here, by the
+# same file that grades the gate, rather than left to a reviewer noticing the YAML.
+_wf="$(dirname "${BASH_SOURCE[0]}")/../.github/workflows/unit-tests.yml"
+if [[ -f "$_wf" ]]; then
+  _armed=$(grep -c -- '--cross-runner=required' "$_wf")
+  _prior=$(grep -c -- '--prior-over-runner=' "$_wf")
+  if (( _armed >= 3 && _prior >= 2 )); then
+    ok "unit-tests.yml ARMS the gate on both core jobs and carries a confirm job for each ($_armed armed invocations, $_prior confirming) — the remedy is wired to the workflow that reds main, not merely available to it"
+  else bad "unit-tests.yml arms the cross-runner gate on both core jobs" "armed=$_armed prior=$_prior"; fi
+else bad "unit-tests.yml is readable from the harness" "no file at $_wf"; fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
