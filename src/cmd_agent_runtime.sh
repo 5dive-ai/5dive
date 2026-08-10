@@ -638,21 +638,110 @@ _agent_cred_seed_failure() {
   sudo -u "agent-${name}" cat "/home/agent-${name}/.5dive-cred-seed-failed" 2>/dev/null | head -1 || true
 }
 
+# DIVE-2159 (residual on DIVE-2137, found by main while merging PR #238) —
+# THE GUARD USED TO FAIL OPEN WHEN IT COULD NOT SEE THE PANE.
+#
+# The read below was `... 2>/dev/null || true`, which throws away capture-pane's
+# exit status. A FAILED capture therefore reached the predicate as an empty
+# string, and an empty string is not a credential prompt, so safe_to_type
+# returned 0: SEND ANYWAY. COULD-NOT-MEASURE rendered identically to
+# MEASURED-AND-SAFE — inside the guard built to stop exactly that class.
+#
+# The dangerous case is not "pane missing because the agent is gone" (the send
+# fails anyway). It is "capture failed transiently WHILE the agent is parked on a
+# login prompt" — precisely when the guard is load-bearing, and precisely the
+# state gh#214 described. A guard that abstains under stress is weakest exactly
+# when it is needed.
+#
+# The two states ARE distinguishable; the `|| true` was discarding the
+# discriminator. Measured on this box 2026-08-10, tmux 3.4:
+#   missing pane, or `sudo -u` to an unknown user -> rc 1, empty stdout
+#   live pane with nothing drawn yet              -> rc 0, empty stdout
+# So the signal is the RETURN CODE, never the emptiness.
+#
+# Split out as its own function so the retry-and-decide logic below can be graded
+# without tmux, sudo or a live agent (tests/agent_send_credential_guard_unit.sh
+# stubs this one call). The seam is deliberately this single line: every DECISION
+# stays inside the function the ship path actually runs.
+_agent_capture_pane_for_guard() {
+  local name="$1"
+  sudo -u "agent-${name}" tmux capture-pane -p -t "agent-${name}" 2>/dev/null
+}
+
+# Why the last refusal fired, read by _agent_credential_refusal_msg and by the
+# heartbeat's skip log: 'credential' (the pane IS a login surface) or 'unreadable'
+# (we never got to see the pane). Reset at the top of every call — the heartbeat
+# asks this per agent inside a loop, and a stale reason would report the previous
+# agent's cause for this one's refusal.
+_AGENT_PANE_REFUSAL_REASON=""
+
 # Capture the target pane and decide whether typing into it is safe.
-# 0 = safe to type, 1 = REFUSE (pane is a credential/login surface).
-# Escape hatch for an operator who genuinely means to type into a login screen:
-# FIVE_ALLOW_CREDENTIAL_PANE=1. Named in the refusal message so it is findable.
+# 0 = safe to type, 1 = REFUSE (pane is a credential/login surface),
+# 2 = REFUSE (pane could not be read — see DIVE-2159 note above).
+# Both nonzero codes are refusals and callers may treat them alike; they differ
+# only so the receipt can name the real cause instead of asserting a login prompt
+# nobody actually saw.
+#
+# POSTURE, chosen deliberately rather than defaulted (DIVE-2159 offered three):
+#   RETRY the capture a couple of times, then FAIL CLOSED, loudly.
+# Retry first because the motivating failure is transient (a busy tmux server, a
+# momentary permission fault) and a bare fail-closed would turn that flake into
+# blocked inter-agent traffic. Fail closed after, because the alternative is the
+# defect itself. Loud because a silent abstention is what kept gh#214's root
+# cause invisible for a day — so the refusal is a hard error on send/ask/_deliver
+# and a logged skip in the heartbeat, never a warning nobody reads.
+#
+# Escape hatch for an operator who genuinely means to type into a login screen,
+# or into a pane we cannot read: FIVE_ALLOW_CREDENTIAL_PANE=1. Checked BEFORE the
+# capture, so it also unblocks a box where capture is broken outright. Named in
+# both refusal messages so it is findable.
 _agent_pane_safe_to_type() {
-  local name="$1" pane
+  local name="$1" pane="" rc=0 try=0 got=0
+  local tries="${_AGENT_PANE_CAPTURE_TRIES:-3}"
+  _AGENT_PANE_REFUSAL_REASON=""
   [[ "${FIVE_ALLOW_CREDENTIAL_PANE:-0}" == "1" ]] && return 0
-  pane=$(sudo -u "agent-${name}" tmux capture-pane -p -t "agent-${name}" 2>/dev/null || true)
-  _agent_pane_credential_prompt "$pane" && return 1
+  while (( try < tries )); do
+    try=$((try+1))
+    rc=0
+    pane=$(_agent_capture_pane_for_guard "$name") || rc=$?
+    if (( rc == 0 )); then
+      got=1
+      break
+    fi
+    if (( try < tries )); then
+      sleep "${_AGENT_PANE_CAPTURE_RETRY_SLEEP:-0.25}"
+    fi
+  done
+  if (( got == 0 )); then
+    _AGENT_PANE_REFUSAL_REASON="unreadable"
+    return 2
+  fi
+  if _agent_pane_credential_prompt "$pane"; then
+    _AGENT_PANE_REFUSAL_REASON="credential"
+    return 1
+  fi
   return 0
 }
 
 # Shared refusal text for the three inject sites, so the message can't drift.
+#
+# DIVE-2159: branches on WHY the guard refused. An unreadable pane must not be
+# reported as "parked on a CREDENTIAL/LOGIN prompt" — nobody saw a login prompt,
+# and asserting one sends the operator off to re-seed a credential that may be
+# perfectly fine. Same failure shape as the defect itself, one level up: a
+# confident claim about a state that was never measured.
 _agent_credential_refusal_msg() {
   local name="$1" why
+  if [[ "${_AGENT_PANE_REFUSAL_REASON:-}" == "unreadable" ]]; then
+    local u="refused to send: could not READ agent '${name}'s pane after ${_AGENT_PANE_CAPTURE_TRIES:-3} attempts"
+    u+=" (tmux capture-pane failed), so the credential guard could not tell a chat input from a login prompt."
+    u+=" Refusing rather than typing blind — the message body would become the agent's stored API key if that pane is a"
+    u+=" login screen (DIVE-2159, residual on DIVE-2137/gh#214). NOTHING WAS TYPED."
+    u+=" Check the agent is up (5dive agent list; 5dive agent tail ${name}) and resend."
+    u+=" To type into an unreadable pane on purpose: FIVE_ALLOW_CREDENTIAL_PANE=1."
+    printf '%s\n' "$u"
+    return 0
+  fi
   why="$(_agent_cred_seed_failure "$name")"
   local m="refused to send: agent '${name}' is parked on a CREDENTIAL/LOGIN prompt, not a chat input"
   m+=" — typing there would store the message body as its API key (DIVE-2137, gh#214)."

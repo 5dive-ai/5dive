@@ -869,8 +869,17 @@ _hb_send_line() {
   # would write "continue" (or a whole task line) into the API-key field and
   # submit it. Worse than the reported path, because no human is watching a tick.
   # Same fail-closed predicate, one shared definition (cmd_agent_runtime.sh).
+  # DIVE-2159: name the REAL cause. The guard now also refuses when it could not
+  # read the pane at all, and logging that as "pane is a credential/login prompt"
+  # would assert a state nobody measured — the same could-not-measure-reads-as-
+  # measured shape the guard exists to stop. A tick is the one place with no human
+  # watching, so the log line is the whole record.
   _agent_pane_safe_to_type "$name" || {
-    _hb_log "skip send to ${name}: pane is a credential/login prompt, not a chat input (DIVE-2137)" 2>/dev/null || true
+    if [[ "${_AGENT_PANE_REFUSAL_REASON:-}" == "unreadable" ]]; then
+      _hb_log "skip send to ${name}: could not read the pane (tmux capture-pane failed after retries) — fail-closed, nothing typed (DIVE-2159)" 2>/dev/null || true
+    else
+      _hb_log "skip send to ${name}: pane is a credential/login prompt, not a chat input (DIVE-2137)" 2>/dev/null || true
+    fi
     return 1
   }
   sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" -l -- "$text" 2>/dev/null || return 1
