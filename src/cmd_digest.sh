@@ -228,8 +228,28 @@ cmd_digest() {
                FROM objectives o ORDER BY o.created_at;" >"$tmpd/obj.json" 2>/dev/null || echo '[]' >"$tmpd/obj.json"
   [ -s "$tmpd/obj.json" ] || echo '[]' >"$tmpd/obj.json"
 
+  # DIVE-2306: the fleet-freeze / ahead reading. DIVE-2287 built an alarm that
+  # survives the release process being down and delivered it to `5dive
+  # supervisor` and `update --check` — both of which a human has to go and LOOK
+  # at. The digest is the one surface that comes to them (`--send` delivers it
+  # to the paired chat), so this is where the signal stops needing an audience
+  # that already suspects something.
+  #
+  # NOT a fourth board-shaped source: it is one `update --check`, the same
+  # command the dashboard tile runs, so the digest and the tile cannot disagree.
+  # HARD-BOUNDED because it makes a network probe and this runs from cron —
+  # `_published_cli_probe` fails closed on a dead endpoint, but "fails closed"
+  # is about the ANSWER, not about how long the socket takes to say so. A hung
+  # CDN must cost the digest a few seconds, never the digest. Unreadable => `{}`
+  # => the block is omitted, which is the same degrade-not-erase rule DIVE-1937
+  # applied to the usage source.
+  if [ -n "$self" ]; then timeout 25 "$self" update --check --json >"$tmpd/update.json" 2>/dev/null || echo '{}' >"$tmpd/update.json"
+  else timeout 25 bash "$0" update --check --json >"$tmpd/update.json" 2>/dev/null || echo '{}' >"$tmpd/update.json"; fi
+  [ -s "$tmpd/update.json" ] || echo '{}' >"$tmpd/update.json"
+
   DIGEST_TASKS_F="$tmpd/tasks.json" DIGEST_USAGE_F="$tmpd/usage.json" DIGEST_HB_F="$tmpd/hb.txt" \
   DIGEST_LOOPS_F="$tmpd/loops.json" DIGEST_SUP_F="$tmpd/sup.json" DIGEST_OBJ_F="$tmpd/obj.json" \
+  DIGEST_UPDATE_F="$tmpd/update.json" \
   DIGEST_WINDOW="$window" DIGEST_JSON="$as_json" python3 - >"$tmpd/out.txt" <<'PY'
 import os, json, time, datetime as dt
 
@@ -501,6 +521,7 @@ point_in_time = {
     "usage":         "usage_collect's own rolling 5h/7d limits — never this window",
     "usageCoverage": "describes the usage read above, same rolling scope",
     "health":        "freshness and rate-limit pressure as of now",
+    "cli":           "version-delivery reading as of now, and for THIS box only — never a fleet aggregate",
     "loops":         "every loop the fleet has run (--all), not a window slice",
     "stuck.openStuck":       "agents wedged right now",
     "autonomy.uptimeDays":   "all-time streak since the last human-blocking gate",
@@ -579,6 +600,41 @@ for o in obj_rows:
         "public": bool(o.get("public")),
     })
 
+# DIVE-2306: the fleet's version-delivery reading, from `update --check`.
+#
+# Three of its fields are things NO other line in this digest can report, and
+# each is false-or-absent in the states the rest of the health block calls
+# healthy: `frozen` (this box's CLI has not moved in 7d+ — what a dead release
+# cutter looks like from here), `ahead` (this box is past the newest release and
+# the installer refuses to move it), and `frozenArmed:false` (this box cannot
+# record the observation, so its freeze reading can never leave `unknown`).
+#
+# Rendered only when one of them is live. A digest line that says "releases are
+# fine" every day is a line nobody reads on the day it matters, and `behind` is
+# already covered by the box's own update banner.
+upd = load("DIGEST_UPDATE_F", {})
+if not isinstance(upd, dict):
+    upd = {}
+cli_frozen = upd.get("frozen")
+cli_ahead = upd.get("ahead") is True
+# Strictly `is False`: a pre-DIVE-2306 CLI omits the field, and a missing field
+# is "not observed", never "armed".
+cli_unarmed = upd.get("frozenArmed") is False
+cli_alarm = bool(cli_frozen == "frozen" or cli_ahead or cli_unarmed)
+cli_block = {
+    "current": upd.get("current"), "latest": upd.get("latest"),
+    "behind": upd.get("behind"), "ahead": upd.get("ahead"),
+    "frozen": cli_frozen if cli_frozen is not None else "unknown",
+    "frozenAgeSec": upd.get("frozenAgeSec"),
+    "frozenDetail": upd.get("frozenDetail"),
+    "frozenArmed": upd.get("frozenArmed"),
+    # The reading is one box's. "The fleet has stopped" is still an inference a
+    # reader makes from several boxes agreeing — say the scope rather than let
+    # the word "fleet" in the rendered line imply an aggregate we never took.
+    "scope": "this box only — not a fleet aggregate",
+    "read": bool(upd),
+}
+
 if as_json:
     print(json.dumps({
         "window": {"since": since, "now": now, "label": window_label,
@@ -593,6 +649,7 @@ if as_json:
                              "acceptanceRate": prefill_rate,
                              "byKind": {"exact": prefill_exact, "fuzzy": prefill_fuzzy}},
         "usage": usage_l, "usageCoverage": usage_cov,
+        "cli": cli_block,
         "health": {"stale": stale, "hot": [h["name"] for h in hot],
                    # DIVE-1937: `hot` is only a claim about what was READ. A
                    # consumer must not read an empty list as "nobody is hot".
@@ -731,6 +788,24 @@ else:
             out.append(f"\U0001F512 Token burn PARTIAL — {span} agent transcript sets readable"
                        + (f" (missing: {named}{more})" if named else "")
                        + ". The burn figures are a floor, not the fleet.")
+    # DIVE-2306: the version-delivery alarms, in the same block as the other
+    # as-of-now health readings. Placed BEFORE the "Fleet healthy" line on
+    # purpose — that line is about heartbeats and rate limits and is free to say
+    # healthy while nothing has shipped to the box in a week, which is exactly
+    # the pair of statements that has to be readable together.
+    if cli_frozen == "frozen":
+        out.append("\U0001F9CA Fleet freeze — " + str(cli_block["frozenDetail"] or
+                   f"CLI {cli_block['current']} has not been observed to change")
+                   + ". No release has reached this box; check the release cutter"
+                     " (this box only, not a fleet aggregate).")
+    if cli_ahead:
+        out.append(f"⬆️ CLI {cli_block['current']} is AHEAD of the newest release "
+                   f"{cli_block['latest']} — the installer will refuse to move it "
+                   "(a release cut is owed).")
+    if cli_unarmed:
+        out.append("\U0001F6A8 Version-freeze alarm UNARMED on this box — " +
+                   str(cli_block["frozenDetail"] or "the observation cannot be recorded") +
+                   ". Until a caller that can write it runs, a frozen fleet reads here as silence.")
     if stale:
         out.append("\U0001F634 Heartbeat stale: " + ", ".join(stale))
     if not hot and not stale:
