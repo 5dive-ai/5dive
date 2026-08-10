@@ -65,6 +65,18 @@
 #         re-create the exact harm DIVE-3163 measured, through a scheduled door.
 set -uo pipefail
 
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
+  || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+
+# DIVE-2692: the corpus RC contract. Registered HERE, above the `cd ... || exit 2`
+# below, because that is an early exit and a trap set after it would not cover it.
+# The TMP cleanup is FOLDED IN rather than left as a second `trap ... EXIT` — bash
+# keeps only the LAST registration per signal, so a second one silently replaces the
+# first and the temp dir would leak with nothing to notice. `${TMP:-}` because TMP is
+# not created until further down and this trap is live before it exists.
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
+
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." || exit 2
 ROOT="$PWD"
 RUNNER="$ROOT/scripts/run-harnesses.sh"
@@ -72,7 +84,6 @@ HARVEST="$ROOT/scripts/tier-cal-harvest.sh"
 WINDOW="$ROOT/scripts/tier-cal-window.sh"
 
 TMP="$(mktemp -d /tmp/header-drift-window.XXXXXX)" || exit 2
-trap 'rm -rf "$TMP"' EXIT
 CORPUS="$TMP/corpus"; mkdir -p "$CORPUS" "$TMP/reports"
 
 pass=0; fail=0
