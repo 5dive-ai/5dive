@@ -698,6 +698,77 @@ _task_unparented_followup_advisory() {
 }
 
 # ---------------------------------------------------------------------------
+# ── DIVE-2794 arm two: the per-LANE WIP cap ──────────────────────────────────
+#
+# Tokens cap what one row may SPEND; this caps how many rows a lane may HOLD.
+# Same verb, same refusal path, same carve-out — one mechanism over two
+# resources, because two independent refusals on `task add` would disagree,
+# print different remedies, and teach the fleet that a failed add is noise.
+#
+# WHAT IS COUNTED: todo + in_progress only. Not blocked, not parked, not
+# recurring templates. The fleet holds 55 blocked rows right now; a cap that
+# counted them would be over on day one for every lane, with no satisfiable path
+# back under — the unsatisfiable-gate shape we have shipped once and had to
+# unwind. A blocked row consumes no attention, and attention is the resource.
+#
+# THE CAP IS FROZEN, NOT TRACKING. Initialised to the lane's own actionable count
+# the first time the lane is seen, then it never moves except by a lead clear.
+# A close lowers the COUNT, which is what creates headroom; it does NOT lower the
+# cap. The first spec said every close lowers the cap, and that is a lock rather
+# than a ratchet: after each close actionable == cap again, so the next add
+# refuses forever and the lane drains to zero and stops working (caught in review
+# before it was built). Frozen keeps every property that was actually wanted —
+# close-one-to-file-one, no lane can grow, nobody defends a magic N.
+_task_lane_actionable() {
+  db "SELECT COUNT(*) FROM tasks
+      WHERE assignee=$(sqlq "$1") AND kind='standard'
+        AND status IN ('todo','in_progress') AND parked_at IS NULL;" 2>/dev/null || echo ""
+}
+
+# _task_wip_cap <lane> — the frozen ceiling, minted on first sight and then read.
+# The re-read after the insert is not belt-and-braces: two adds racing on a fresh
+# lane would otherwise each return their OWN computed number, and the cap a lane
+# gets would depend on which one won. ON CONFLICT DO NOTHING + re-read means the
+# first writer's value is the cap for everybody.
+_task_wip_cap() {
+  local lane="$1" key="wip_cap:$1" cur n
+  cur=$(db "SELECT value FROM task_prefs WHERE key=$(sqlq "$key");" 2>/dev/null || echo "")
+  if [[ ! "$cur" =~ ^[0-9]+$ ]]; then
+    n=$(_task_lane_actionable "$lane")
+    [[ "$n" =~ ^[0-9]+$ ]] || return 1
+    db "INSERT INTO task_prefs (key,value) VALUES ($(sqlq "$key"),$(sqlq "$n"))
+        ON CONFLICT(key) DO NOTHING;" 2>/dev/null || true
+    cur=$(db "SELECT value FROM task_prefs WHERE key=$(sqlq "$key");" 2>/dev/null || echo "")
+  fi
+  [[ "$cur" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$cur"
+}
+
+# _task_lanes_with_headroom <exclude> — lanes strictly under their cap, for the
+# redirect. Naming them is the whole point: "this lane is full" is a dead end,
+# "this lane is full, dev2 and quinn have room" is a next action.
+_task_lanes_with_headroom() {
+  local skip="$1" lane cap act out=""
+  while IFS= read -r lane; do
+    [[ -n "$lane" && "$lane" != "$skip" ]] || continue
+    cap=$(_task_wip_cap "$lane") || continue
+    act=$(_task_lane_actionable "$lane")
+    [[ "$act" =~ ^[0-9]+$ ]] || continue
+    (( act < cap )) && out+="${out:+, }${lane} ($((cap - act)) free)"
+  done < <(db "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL AND assignee!='' AND kind='standard';" 2>/dev/null)
+  printf '%s' "$out"
+}
+
+# _task_lane_oldest <lane> <n> — the oldest actionable rows, so a refusal says
+# what is actually holding the lane rather than only that it is held.
+_task_lane_oldest() {
+  db "SELECT '  · '||COALESCE(ident,'?')||'  '||substr(COALESCE(title,''),1,60)
+      FROM tasks
+      WHERE assignee=$(sqlq "$1") AND kind='standard'
+        AND status IN ('todo','in_progress') AND parked_at IS NULL
+      ORDER BY COALESCE(created_at,'') ASC LIMIT ${2:-3};" 2>/dev/null || echo ""
+}
+
 # THE FILING CAP (DIVE-2681). Two controls over one classifier.
 #
 # The measured problem: across the 508 rows filed in the 8 days to 2026-08-02,
@@ -1071,7 +1142,7 @@ cmd_task_add() {
   tasks_db_init
   local body="" priority="medium" assignee="" parent="" from="" recurring="" fresh="" project="dive"
   local accept="" verify_cmd="" max_iters="" verifier="" task_budget="" no_verify="" branch=""
-  local customer_facing="" already_blocked=""
+  local customer_facing="" already_blocked="" materialized=""
   # DIVE-2627: which flag supplied each prose value (see _read_prose_file).
   local body_src="" accept_src=""
   local -a words=()
@@ -1115,6 +1186,10 @@ cmd_task_add() {
       # mandatory on the exception and is written into the body, because an
       # exception nobody can audit later is not an exception, it is an opt-out.
       --customer)          customer_facing="1" ;;
+      # DIVE-2794 arm two: set by the internal writers that turn one approved
+      # decision into N rows. Exempts the WIP cap only — never the DIVE-2681
+      # filing cap, which is about what a title IS, not how many there are.
+      --materialized)      materialized="1" ;;
       --already-blocked=*) already_blocked="${1#*=}" ;;
       # DIVE-824: per-run spend cap carried on the row (sibling to verify --timeout).
       # Value is either a bare token count or a "$cost" dollar figure.
@@ -1296,6 +1371,67 @@ An internal-machinery finding gets its own ident ONLY if it has ALREADY blocked 
   · it already blocked something   →  --already-blocked='<what it blocked>'
   · the scan is wrong, this is a customer surface  →  --customer
   · fleet-wide override (emergencies)  →  FIVE_FILING_CAP=0"
+    fi
+  fi
+  # DIVE-2794 arm two: the WIP cap, checked here so it shares the DIVE-2681
+  # store-identity and refusal machinery rather than adding a second, disagreeing
+  # refusal to the same verb.
+  #
+  # EXEMPT: MATERIALIZATION, NOT FILING. Six internal writers reach this function
+  # (cmd_goal x2, cmd_loop, cmd_loop_pack, cmd_objective, cmd_proof). They turn
+  # ONE already-approved decision into N rows, so a cap firing halfway through
+  # leaves a HALF-MATERIALIZED plan — some children exist, some do not, and a
+  # loop driver is already waiting on a child list that is short. That is a
+  # silent, undesigned state, and strictly worse than an uncapped lane. They pass
+  # --materialized and are exempt; the rows they create still COUNT toward the
+  # lane, so the next HUMAN filing is the one that gets refused.
+  #
+  # PRIORITY. lodar ruled 2026-08-09 that only low and med get the hard refusal —
+  # "a quota that can block a SERIOUS finding will eventually eat one". That rule
+  # stands here verbatim. What it does not say, because nobody asked, is that a
+  # high/urgent row must be filed to the lane first named: so on a full lane those
+  # are REDIRECTED, never refused. The message names the lanes with headroom and
+  # `--assignee=<other>` succeeds immediately, so nothing is ever lost. And if
+  # EVERY lane is at cap the row lands anyway, uncapped, and trips the counter
+  # loudly — at that point the fleet is genuinely saturated and refusing a serious
+  # finding is the worse of the two failures. That branch existing is precisely
+  # what lets the rest of the rule be strict.
+  if [[ "$kind" == "standard" && -z "$materialized" && "$task_budget" != "none" \
+        && "${FIVE_WIP_CAP:-1}" != "0" && -n "$assignee" ]] && _task_filing_cap_store_is_prod; then
+    local _wcap _wact
+    _wcap=$(_task_wip_cap "$assignee") || _wcap=""
+    _wact=$(_task_lane_actionable "$assignee")
+    if [[ "$_wcap" =~ ^[0-9]+$ && "$_wact" =~ ^[0-9]+$ ]] && (( _wact >= _wcap )); then
+      # Counted on every trip, including the redirect and the saturated-fleet
+      # landing. If lanes hit the cap constantly that is a signal about INFLOW,
+      # and it is the number that says whether the frozen cap wants a scheduled
+      # decay after all — measured, rather than argued.
+      db "INSERT INTO task_prefs (key,value) VALUES ('wip_cap_trips','1')
+          ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INT)+1 AS TEXT), updated_at=datetime('now');" 2>/dev/null || true
+      local _oldest; _oldest=$(_task_lane_oldest "$assignee" 3)
+      if [[ "$priority" == "high" || "$priority" == "urgent" ]]; then
+        local _free; _free=$(_task_lanes_with_headroom "$assignee")
+        if [[ -n "$_free" ]]; then
+          policy_refuse "$E_VALIDATION" wip-cap-lane-full DIVE-2794 "(unfiled) ${title}" \
+            "lane '${assignee}' is at its WIP cap (${_wact}/${_wcap} actionable). A ${priority} row is never refused — it is REDIRECTED, so re-file it to a lane with room:
+${_oldest}
+  lanes with headroom:  ${_free}
+  →  5dive task add \"${title}\" --priority=${priority} --assignee=<one of the above>
+Nothing is lost: this title is recorded in policy_refusals, and the re-file succeeds immediately."
+        else
+          # Saturated fleet: land it. Loudly.
+          warn "every lane is at its WIP cap — filing '${title}' to '${assignee}' anyway because a ${priority} row is never refused. The fleet is saturated (lane ${_wact}/${_wcap}); this is recorded in wip_cap_trips."
+        fi
+      else
+        policy_refuse "$E_VALIDATION" wip-cap-lane-full DIVE-2794 "(unfiled) ${title}" \
+          "lane '${assignee}' is at its WIP cap (${_wact}/${_wcap} actionable). Close something before adding to it — the cap is frozen, so closing a row is what makes room:
+${_oldest}
+  · file it elsewhere            →  --assignee=<other lane>
+  · it is serious                →  --priority=high (high/urgent are redirected, never refused)
+  · exempt this row deliberately →  --task-budget=none
+  · fleet-wide override          →  FIVE_WIP_CAP=0
+REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
+      fi
     fi
   fi
   # The exception is recorded ON THE ROW, not just consumed at the prompt. A cap
