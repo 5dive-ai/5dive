@@ -11,16 +11,31 @@
 #      `uninstall` shells out to, so there's a single source of truth for
 #      "what gets updated" rather than a second copy that drifts.
 #
-#   2. Restarts every running agent so the refreshed plugins/CLIs actually
-#      load. A live agent keeps its old plugin (and shared CLI binary) in
-#      memory until it restarts — that's the usual reason a plugin "still
-#      shows the old version" after an upgrade.
+#   2. Restarts the agents whose IN-MEMORY payload the upgrade actually
+#      changed. A live agent keeps its plugins, its skills and its CLAUDE.md in
+#      memory until it restarts — that's the usual reason a plugin "still shows
+#      the old version" after an upgrade — so those, and only those, are worth
+#      a bounce.
 #
 # The agent AI CLIs themselves (claude/codex/grok/antigravity) self-update via
-# their own vendor autoupdaters; the restart in step 2 is what loads the latest
-# shared binary into each agent. Managed boxes have their own scheduler so they
+# their own vendor autoupdaters. Managed boxes have their own scheduler so they
 # don't need this, but running it there is harmless — `--upgrade` and the
 # restart loop are both idempotent.
+#
+# DIVE-3172 — THE CLI VERSION IS NOT A REASON TO RESTART ANYONE. This loop used
+# to bounce EVERY running agent unconditionally, on a nightly schedule, and a
+# `systemctl restart` mid-turn drops the agent's session and its in-flight work
+# with no record: a killed turn is indistinguishable afterwards from an agent
+# that simply went quiet. lodar reported it as "our nightly updates kills some
+# active agents mid tasks" (2026-08-10).
+#
+# The unconditional restart was buying nothing on most nights. MEASURED on this
+# host 2026-08-10: /usr/local/bin/5dive was replaced 0.19.10 -> 0.19.14 with
+# ZERO restarts and every running agent reported the new version on its next
+# command (`sudo -u agent-olivia 5dive --version` -> 0.19.14 immediately). The
+# CLI is exec'd per invocation, not held open, so a binary swap propagates on
+# its own. Only what the agent PROCESS holds across its lifetime needs a bounce.
+# On a CLI-only update the correct number of restarts is zero.
 
 # json_array <items...> — emit a compact JSON string array, "[]" when empty.
 # Guards the empty-array case (printf with no args would otherwise emit a stray
@@ -32,6 +47,88 @@ json_array() {
     printf '%s\n' "$@" | jq -R . | jq -cs .
   fi
 }
+
+# >>> DIVE-3172 agent payload fingerprint
+#     (tests/self_update_restart_predicate_unit.sh extracts this block VERBATIM
+#      between these markers and runs the shipped bytes — keep them.)
+#
+# _agent_home <unit-name> — the home directory whose payload that unit loads.
+# Resolved from passwd rather than assembled as a string: the fleet's agents are
+# `agent-<name>`, but the root seat runs as `claude` out of /home/claude, and a
+# hardcoded /home/agent-claude would fingerprint a directory that does not exist
+# — which reads as "unreadable", which restarts it every night. Falls back to the
+# conventional path so a box with no passwd entry still gets the old behaviour.
+_agent_home() {
+  local n="${1:-}" h=""
+  [[ -n "$n" ]] || return 0
+  h=$(getent passwd "agent-$n" 2>/dev/null | cut -d: -f6) || h=""
+  [[ -n "$h" ]] || h=$(getent passwd "$n" 2>/dev/null | cut -d: -f6) || h=""
+  printf '%s\n' "${h:-/home/agent-$n}"
+}
+
+# _agent_payload_fingerprint <agent-home> [lib-dir] — one hash over everything a
+# running agent loaded at startup and cannot pick up without a restart. Empty
+# output means "could not be read", which is NOT the same as "unchanged" — see
+# the caller.
+#
+# WHAT IS ON THE LIST, AND WHY THE CLI IS NOT.
+#   - $LIB_DIR/skills        staged skills, read when the agent session starts
+#   - ~/.claude/skills       the agent's own skills, same
+#   - ~/.claude/plugins/installed_plugins.json
+#                            the plugin VERSION PINS. `5dive-refresh-plugins.sh`
+#                            downloads each new version into
+#                            ~/.claude/plugins/cache/<mp>/<plugin>/<version>/ and
+#                            REPOINTS this manifest, so the manifest moving is
+#                            exactly the event a plugin update is. We hash the
+#                            manifest and not the cache on purpose: each cached
+#                            version is ~29M with its own node_modules, the old
+#                            versions linger, and hashing them would cost more
+#                            than the restart it is trying to avoid.
+#   - ~/.claude/settings.json  hooks, model and provider pins — read at startup
+#   - ~/.claude/CLAUDE.md      loaded into context at session start
+# The 5dive CLI binary is deliberately absent: it is exec'd per command, so a
+# swap needs no restart (measured — see the header).
+#
+# CONTENT, NEVER mtime OR SIZE. `refresh_managed_files()` in install.sh swaps the
+# managed files in UNCONDITIONALLY (`mv -f "$_bundle_tmp" ...`) with no
+# already-current branch, so the nightly rewrites them every night whether or not
+# a byte moved. An mtime predicate would therefore report "changed" on every run
+# and restart the whole fleet — today's behaviour wearing a conditional, which is
+# worse than today's because it would look fixed. (This is the same trap
+# DIVE-2287's freeze observer documents two functions down, for the same file.)
+#
+# The path is hashed alongside the bytes, so a file APPEARING or being REMOVED
+# moves the fingerprint too — a deleted skill is a payload change.
+_agent_payload_fingerprint() {
+  local home="${1:-}" lib="${2:-${LIB_DIR:-/usr/local/lib/5dive}}"
+  [[ -n "$home" ]] || return 0
+  command -v sha256sum >/dev/null 2>&1 || return 0
+  local p out
+  out=$({
+    for p in "$lib/skills" \
+             "$home/.claude/skills" \
+             "$home/.claude/plugins/installed_plugins.json" \
+             "$home/.claude/settings.json" \
+             "$home/.claude/CLAUDE.md"; do
+      [[ -e "$p" ]] || continue
+      if [[ -d "$p" ]]; then
+        # -print0/-z/-0 throughout: a path with a space or newline in it must
+        # not split into two hashed entries.
+        find "$p" -type f -print0 2>/dev/null | LC_ALL=C sort -z \
+          | xargs -0 -r sha256sum 2>/dev/null
+      else
+        sha256sum "$p" 2>/dev/null
+      fi
+    done
+  } | sha256sum) || return 0
+  # An agent home we could read NOTHING from yields the hash of the empty
+  # string. Return empty instead: "nothing to hash" and "hashed nothing" must
+  # not be the same value, or an unreadable home would compare equal to itself
+  # across the upgrade and silently never restart.
+  [[ "${out%% *}" == "$(printf '' | sha256sum | awk '{print $1}')" ]] && return 0
+  printf '%s\n' "${out%% *}"
+}
+# <<< DIVE-3172 agent payload fingerprint
 
 cmd_self_update() {
   [[ $# -eq 0 ]] || fail "$E_USAGE" "self-update takes no arguments"
@@ -46,27 +143,50 @@ cmd_self_update() {
   curl -fsSL "https://raw.githubusercontent.com/$(gh_org)/5dive/main/install.sh" -o "$installer" \
     || fail "$E_GENERIC" "failed to fetch installer"
 
-  step "Upgrading 5dive CLI + plugins"
-  # Send installer chatter to stderr so JSON stdout stays parseable.
-  bash "$installer" --upgrade >&2 || fail "$E_GENERIC" "upgrade failed"
-
-  # Restart running agents so the refreshed plugins/CLIs load. Best-effort per
-  # unit — one failed restart shouldn't abort the rest.
-  local -a restarted=() failed=()
+  # DIVE-3172: snapshot each running agent's in-memory payload BEFORE the
+  # upgrade. It has to be taken here — after the upgrade there is nothing left
+  # to compare against, which is why the old code had no predicate to apply.
+  local -a units=() names=() befores=()
   local unit name
   if command -v systemctl >/dev/null 2>&1; then
     while read -r unit; do
       [[ -z "$unit" ]] && continue
       name="${unit#5dive-agent@}"; name="${name%.service}"
-      if systemctl restart "$unit" 2>/dev/null; then
-        step "restarted $name"
-        restarted+=("$name")
-      else
-        warn "failed to restart agent '$name'"
-        failed+=("$name")
-      fi
+      units+=("$unit"); names+=("$name")
+      befores+=("$(_agent_payload_fingerprint "$(_agent_home "$name")")")
     done < <(systemctl list-units '5dive-agent@*' --state=running --no-legend --plain 2>/dev/null | awk '{print $1}')
   fi
+
+  step "Upgrading 5dive CLI + plugins"
+  # Send installer chatter to stderr so JSON stdout stays parseable.
+  bash "$installer" --upgrade >&2 || fail "$E_GENERIC" "upgrade failed"
+
+  # Restart only the agents whose payload actually moved. Best-effort per unit —
+  # one failed restart shouldn't abort the rest.
+  local -a restarted=() failed=() skipped=()
+  local i after before
+  for i in "${!units[@]}"; do
+    name="${names[$i]}"; before="${befores[$i]}"
+    after="$(_agent_payload_fingerprint "$(_agent_home "$name")")"
+    # UNREADABLE IS NOT UNCHANGED. If either side of the comparison is empty we
+    # could not observe the payload, so we fall back to the old unconditional
+    # behaviour and restart. Skipping on an unknown would convert a permission
+    # problem into a fleet that silently never picks up a plugin fix — a much
+    # quieter failure than the one this change is fixing. (DIVE-2230's rule:
+    # an absent reading resolves to neither answer.)
+    if [[ -n "$before" && -n "$after" && "$before" == "$after" ]]; then
+      step "skipped $name (payload unchanged)"
+      skipped+=("$name")
+      continue
+    fi
+    if systemctl restart "${units[$i]}" 2>/dev/null; then
+      step "restarted $name"
+      restarted+=("$name")
+    else
+      warn "failed to restart agent '$name'"
+      failed+=("$name")
+    fi
+  done
 
   # DIVE-1095: refresh the materialized shared team-bot listener. It lives at
   # /opt/5dive/team-bot-listener.ts and is (re)written ONLY by `team-bot shared`,
@@ -85,15 +205,23 @@ cmd_self_update() {
     fi
   fi
 
-  local r f prose
+  local r f s prose
   r=$(json_array "${restarted[@]}")
   f=$(json_array "${failed[@]}")
+  s=$(json_array "${skipped[@]}")
   prose="self-update complete — ${#restarted[@]} agent(s) restarted"
+  # Say the skip count out loud. "0 agents restarted" alone is emitted both by a
+  # CLI-only night (the good case this change exists to produce) and by a box
+  # with no agents running at all, and an operator reading the nightly log has to
+  # be able to tell those apart.
+  (( ${#skipped[@]} )) && prose+=", ${#skipped[@]} skipped (payload unchanged)"
   (( ${#failed[@]} )) && prose+=", ${#failed[@]} failed to restart"
   [[ "$listener_refreshed" == "true" ]] && prose+=", team-bot listener refreshed"
+  # `skipped` is ADDITIVE — `restarted`/`failed` keep their exact prior meaning,
+  # so every existing consumer reads the field it always did.
   ok "$prose" \
-     '{restarted:$r, restarted_count:($r|length), failed:$f, listener_refreshed:$lr}' \
-     --argjson r "$r" --argjson f "$f" --argjson lr "$listener_refreshed"
+     '{restarted:$r, restarted_count:($r|length), skipped:$s, skipped_count:($s|length), failed:$f, listener_refreshed:$lr}' \
+     --argjson r "$r" --argjson f "$f" --argjson s "$s" --argjson lr "$listener_refreshed"
 }
 
 # version_lt A B — true when semver A is strictly older than B (sort -V).
