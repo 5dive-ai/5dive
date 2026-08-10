@@ -19,6 +19,8 @@ _task_usage() {
   set-body <id> <text...>|--file=<path> [--append]   replace the body, or append to it
   set-title <id> <text...>                      overwrite the title (audited; refused once closed)
   set-branch <id> <branch>                      bind the row to a git branch
+  set-budget <id> <tokens|\$cost|none>           raise/lower the token budget, or 'none' to exempt
+                                                the row from the enforced ${_TASK_BUDGET_BUILTIN:-5000000}-token default
 
   start <id>                                    -> in_progress
   done <id> [--result=<text>|--result-file=<path>] [--no-graded-sha]
@@ -193,6 +195,7 @@ cmd_task() {
     set-branch)      cmd_task_set_branch "$@" ;;
     set-body)        cmd_task_set_body "$@" ;;
     set-title)       cmd_task_set_title "$@" ;;
+    set-budget)      cmd_task_set_budget "$@" ;;
     start)           cmd_task_start "$@" ;;
     done|close)      cmd_task_done "$@" ;;
     deliver)         cmd_task_deliver "$@" ;;
@@ -378,6 +381,46 @@ cmd_task_set_body() {
 # audited with the PRIOR title, because a retitle is exactly the edit that makes the
 # earlier discussion of a row unreadable if nobody can see what it used to say.
 # Refuses on a closed task, same guard as set-body: a closed row is frozen.
+# DIVE-2794 — set/raise/exempt a row's token budget AFTER it was filed.
+#
+# This verb is the difference between a usable carve-out and a theoretical one.
+# The enforced 5M default parks a row the heartbeat finds over budget, and the
+# incident case main flagged is a LIVE row at 3am that nobody filed with
+# `--task-budget=none` because nobody was thinking about budgets when the box
+# went down. Without a post-hoc setter the only escape is re-filing the row,
+# which loses its history mid-incident — so the exemption would exist only for
+# people who predicted they would need it. Unparking alone is NOT enough and is
+# the trap this closes: the sweep re-parks the row on the very next tick unless
+# the budget itself changed.
+cmd_task_set_budget() {
+  tasks_db_init
+  local task="" val=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -*) fail "$E_USAGE" "unknown flag: $1" ;;
+      *)  if [[ -z "$task" ]]; then task="$1"; elif [[ -z "$val" ]]; then val="$1"; fi ;;
+    esac
+    shift
+  done
+  [[ -n "$task" && -n "$val" ]] \
+    || fail "$E_USAGE" "usage: 5dive task set-budget <id|DIVE-N> <tokens|\$cost|none>  (none = exempt this row from the enforced default)"
+  [[ "$val" =~ ^[1-9][0-9]*$ || "$val" =~ ^\$[0-9]+(\.[0-9]+)?$ || "$val" == "none" ]] \
+    || fail "$E_VALIDATION" "budget must be a token count (e.g. 50000), a dollar cost (e.g. \$1.50), or 'none'"
+  resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  local st; st=$(db "SELECT status FROM tasks WHERE id=${id};")
+  [[ "$st" != "done" && "$st" != "cancelled" ]] \
+    || fail "$E_VALIDATION" "$ident is already $st — a closed row spends nothing, so its budget is moot"
+  local prior; prior=$(db "SELECT COALESCE(task_budget,'(default)') FROM tasks WHERE id=${id};")
+  db "UPDATE tasks SET task_budget=$(sqlq "$val"), updated_at=datetime('now') WHERE id=${id};"
+  # Say the parked case out loud rather than leaving the caller to discover that
+  # raising a budget did not, by itself, restart anything.
+  local parked; parked=$(db "SELECT CASE WHEN parked_at IS NOT NULL THEN 1 ELSE 0 END FROM tasks WHERE id=${id};")
+  local hint=""
+  [[ "${parked:-0}" == "1" ]] && hint=" It is still PARKED — 5dive task unpark $ident to resume it."
+  ok "$ident budget ${prior} → ${val}.${hint}" '{ident:$i, budget:$b, parked:$p}' \
+     --arg i "$ident" --arg b "$val" --arg p "${parked:-0}"
+}
+
 cmd_task_set_title() {
   tasks_db_init
   local task=""
@@ -1094,8 +1137,12 @@ cmd_task_add() {
   # DIVE-824: --task-budget is EITHER a bare token count ("50000") OR a dollar
   # cost ("$1.50" / "$2"). Reject anything else so a malformed cap can't silently
   # store as a no-op. Stored verbatim; the loop runner interprets the form.
-  [[ -z "$task_budget" || "$task_budget" =~ ^[1-9][0-9]*$ || "$task_budget" =~ ^\$[0-9]+(\.[0-9]+)?$ ]] \
-    || fail "$E_VALIDATION" "--task-budget must be a token count (e.g. 50000) or a dollar cost (e.g. \$1.50)"
+  # DIVE-2794 adds a fourth accepted value: the literal `none`, which is the
+  # ONLY exemption from the now-enforced 5M default. It is spelled rather than
+  # implied on purpose — see _hb_task_budget_sweep's header for why --customer
+  # and priority were both rejected as implicit carve-outs.
+  [[ -z "$task_budget" || "$task_budget" =~ ^[1-9][0-9]*$ || "$task_budget" =~ ^\$[0-9]+(\.[0-9]+)?$ || "$task_budget" == "none" ]] \
+    || fail "$E_VALIDATION" "--task-budget must be a token count (e.g. 50000), a dollar cost (e.g. \$1.50), or 'none' to exempt this row from the enforced default"
   # DIVE-1697: --branch seeds the delegated-push 'Branch: <name>' binding into the
   # body up front (same line set-branch writes/upserts later).
   if [[ -n "$branch" ]]; then
