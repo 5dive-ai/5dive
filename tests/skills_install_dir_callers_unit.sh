@@ -27,7 +27,8 @@ source "$SRC/cmd_skill.sh"
 source "$SRC/lib/agent_setup.sh"
 set +e
 
-pass=0 fail=0
+pass=0
+fail=0
 ok_t()  { pass=$((pass + 1)); printf '  ok   %s\n' "$1"; }
 bad_t() { fail=$((fail + 1)); printf '  FAIL %s%s\n' "$1" "${2:+ — $2}"; }
 
