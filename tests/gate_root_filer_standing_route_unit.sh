@@ -90,6 +90,7 @@ route_reset() { : >"$ROUTE_FILE"; HUMAN_PINGED=0; spy_reset; }
 route_sent()  { local i n; for i in $(seq 1 10); do [[ -s "$ROUTE_FILE" ]] && break; sleep 0.05; done; n=$(grep -c . "$ROUTE_FILE" 2>/dev/null); echo "${n:-0}"; }
 route_last()  { local i; for i in $(seq 1 10); do [[ -s "$ROUTE_FILE" ]] && break; sleep 0.05; done; tail -n1 "$ROUTE_FILE" 2>/dev/null; }
 rr_of()       { db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='$1';"; }
+rp_of()       { db "SELECT COALESCE(route_provenance,'') FROM tasks WHERE ident='$1';"; }
 tier_of()     { db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='$1';"; }
 
 # ---- the org chart, in PRODUCTION SHAPE: olivia is the lone root (CEO), main is the
@@ -155,6 +156,13 @@ cmd_task_need DIVE-3901 --type=approval --ask="$ENG_ASK" --from=olivia >/dev/nul
 [[ "$(tier_of DIVE-3901)" == "1" ]] \
   && ok_t "A1 the gate is still tier 1 — routing moved, tiering did not" \
   || bad_t "A1 tier unchanged at 1" "tier=$(tier_of DIVE-3901)"
+# DIVE-3171: WHO routed and WHY land in the same write. cmd_task_answer reads this
+# column to keep the clear stamped `lead:standing:` instead of `lead:` — graded in
+# tests/gate_lead_clear_stamp_unit.sh arms 5b/5c/5d — so a route recorded without its
+# source is a stamp that silently loses the seal.
+[[ "$(rp_of DIVE-3901)" == "seal:standing-lead" ]] \
+  && ok_t "A1 the route's SOURCE is persisted beside the reviewer (route_provenance)" \
+  || bad_t "A1 route_provenance persisted" "route_provenance='$(rp_of DIVE-3901)'"
 [[ "$(spy_n)" == "1" && "$(spy_last)" == *"outcome=routed"* && "$(spy_last)" == *"standing_lead=main"* && "$(spy_last)" == *"routed=main"* ]] \
   && ok_t "A1 the decision is audited at the moment it is made (outcome=routed)" \
   || bad_t "A1 audit row" "n=$(spy_n) last=$(spy_last)"
@@ -223,6 +231,11 @@ cmd_task_need DIVE-3908 --type=approval --ask="$ENG_ASK" --from=dev >/dev/null 2
 [[ "$(spy_n)" == "0" ]] \
   && ok_t "A5 the fallback does not even evaluate a routeable filer's gate" \
   || bad_t "A5 fallback stays out of the routeable path" "spy=$(spy_last)"
+# The discriminator the answer path reads: a chart route must say `chart`, or a
+# chart-routed clear would acquire the standing label meant for the seal.
+[[ "$(rp_of DIVE-3908)" == "chart" ]] \
+  && ok_t "A5 a chart route records itself as 'chart', never as the seal" \
+  || bad_t "A5 chart route_provenance" "route_provenance='$(rp_of DIVE-3908)'"
 
 # ---- A6. TYPE NARROWING: `decision` is agent-clearable by TYPE already, so it is not in
 # the standing authority's scope and must not acquire a route here. This is the ticket's
@@ -248,6 +261,9 @@ cmd_task_need DIVE-3910 --type=approval --ask='OK to land the refactor of the ta
 [[ "$(spy_n)" == "0" ]] \
   && ok_t "A7 the fallback does not evaluate a verifier-routed gate" \
   || bad_t "A7 fallback stays out of the verifier path" "spy=$(spy_last)"
+[[ "$(rp_of DIVE-3910)" == "verifier-loop" ]] \
+  && ok_t "A7 a verifier route records itself as 'verifier-loop'" \
+  || bad_t "A7 verifier route_provenance" "route_provenance='$(rp_of DIVE-3910)'"
 
 fixture_actor fixture-runner
 echo "-----"

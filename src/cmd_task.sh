@@ -9650,7 +9650,16 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
         # Persist the designated reviewer on the row. For approval/manual this is
         # what authorizes agent-<_reviewer> to clear the gate later; for decision
         # it is provenance only (decision is already agent-clearable by type).
-        db "UPDATE tasks SET routed_reviewer=$(sqlq "$_reviewer") WHERE id=${id};"
+        # DIVE-3171: record WHY this reviewer, in the same statement that records WHO.
+        # `cmd_task_answer` reads this to decide whether the clear is stamped `lead:`
+        # or `lead:standing:`, and the two facts must not be able to arrive separately
+        # — a row naming a reviewer with no source is the state this column exists to
+        # abolish. NULL therefore means "a build before this one wrote the name", never
+        # "the route had no source". Sibling to floor_provenance on the tier axis.
+        local _route_prov=chart
+        [[ "$_verifier_route" == "1" ]] && _route_prov=verifier-loop
+        [[ "$_standing_route" == "1" ]] && _route_prov=seal:standing-lead
+        db "UPDATE tasks SET routed_reviewer=$(sqlq "$_reviewer"), route_provenance=$(sqlq "$_route_prov") WHERE id=${id};"
         local _rrole="lead review"; [[ "$_verifier_route" == "1" ]] && _rrole="verifier review"
         # DIVE-3171: name the SEALED fallback distinctly. "lead review" would read as the
         # org chart having resolved somebody, and the whole point of this branch is that
@@ -12718,8 +12727,35 @@ cmd_task_answer() {
   # stored assignee (the agent that hit the gate — `task need` stamps it) falling
   # back to created_by, the same COALESCE `owner` uses below, so the log still
   # answers "whose gate was this" without the answer feeding the decision.
+  # DIVE-3171 — THE ROUTED BRANCH MUST NOT SWALLOW THE STANDING PROVENANCE.
+  #
+  # This guard was `_lead_clear != 1`, i.e. "standing only gets a say when routing did
+  # not already grant clearance". Correct until DIVE-3171, because a gate whose reviewer
+  # came from the CHART is genuinely a routed clear. But DIVE-3171 routes the org root's
+  # eligible approvals to the SEALED standing lead — so routing now grants clearance to
+  # an agent whose authority came from the constitution, the routed branch fires first,
+  # and the row stamps `lead:<n>` for a clear the seal is the entire reason for. The
+  # authority chain stays intact and the RECORD stops carrying HOW, which is the exact
+  # class that cost three incidents on 2026-08-10 (two unattributed human taps read as
+  # agent self-clears; a census that reported "quinn cleared ZERO gates" and was wrong
+  # by four). `lead:standing:` is the only thing on the row separating "a lead cleared a
+  # gate routed to them" from "a lead cleared it under constitutional standing", and
+  # those are different authorities even when the same name appears in both.
+  #
+  # THE COUNTING ARGUMENT IS WHY IT IS FIXED NOW AND NOT LATER: anyone tallying
+  # `lead:standing:` for a root-filed gate would find it under `lead:` and conclude the
+  # standing path went unused — a silent shift in a number nobody re-derives.
+  #
+  # IT GRANTS NOTHING. The added disjunct only lets the block RUN; every conjunct inside
+  # is unchanged, so `_lead_standing=1` still requires the authenticated actor to BE the
+  # sealed lead and the gate to pass `_gate_lead_standing_eligible`. `_lead_clear` is
+  # already 1 on this path and cannot be raised by reaching here. The only reachable
+  # effect is the label — and it is scoped by `route_provenance` to rows THIS build
+  # wrote, so no historical stamp moves and the counts shift for exactly the population
+  # that was mislabelled.
   local _lead_standing=0
-  if [[ "$_lead_clear" != "1" && "$nt" == "approval" ]]; then
+  local _route_prov_row; _route_prov_row=$(db "SELECT COALESCE(route_provenance,'') FROM tasks WHERE id=${id};")
+  if [[ ( "$_lead_clear" != "1" || "$_route_prov_row" == "seal:standing-lead" ) && "$nt" == "approval" ]]; then
     local _ls_auth _ls_lead _ls_filer
     _ls_auth=$(_gate_authenticated_actor)
     _ls_filer=$(db "SELECT COALESCE(NULLIF(assignee,''), NULLIF(created_by,''), '') FROM tasks WHERE id=${id};")
