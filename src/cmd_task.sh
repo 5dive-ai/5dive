@@ -11161,25 +11161,71 @@ cmd_task_inbox() {
   # human-gated and blocked-by another task): need set, not yet answered. We
   # still exclude TERMINAL statuses (done/cancelled) — a closed task waits on
   # no one, so a lingering unanswered gate must not leak into the human inbox.
-  local where="need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled')"
+  local open_where="need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled')"
+  # DIVE-3117 part 2: this view is "what is waiting on a HUMAN", and until now it
+  # listed every open gate. A gate with `routed_reviewer` set is waiting on an
+  # AGENT seat — the org lead, or a designated reviewer — and `task answer`'s
+  # designated-reviewer exception is what clears it. Listing it here put a question
+  # already addressed to someone else on lodar's plate, and it is exactly why the
+  # ROUTING fix (part 1) took not one gate off that plate: routing decides which
+  # agent is NAMED on a gate, this clause decides who is SHOWN it. Two independent
+  # defects, one symptom.
+  #
+  # THREE ESCAPES, each a class a human genuinely still owns:
+  #   * routed_reviewer empty — nothing was routed. The human's gate by default,
+  #     and also where an UNROUTABLE gate lands (no lead resolves, `--needs` a
+  #     human capability, a tier-2 filing that never routes at all).
+  #   * tier >= 2 — a hard gate: money, irreversible, a secret, a human tap. Note
+  #     DIVE-1437 clears routed_reviewer when a lead cannot answer one, so a
+  #     stalled hard gate comes BACK to this list rather than vanishing from it;
+  #     that escalation is the return path this filter relies on existing.
+  #   * needs_capability set — a declared human capability (DIVE-2241). Today that
+  #     already implies BOTH tier 2 and _routable=0, so this disjunct is redundant
+  #     by consequence. It is stated anyway because the floor making it true lives
+  #     ~2400 lines away in cmd_task_need, and if that floor ever moved the failure
+  #     mode would be a human losing sight of a human-capability gate, silently.
+  # An UNKNOWN tier reads as 2 and stays VISIBLE — the fail-safe direction here,
+  # since showing a human one gate too many is recoverable and hiding one is the
+  # defect being fixed. `NULLIF(tier,'')` and not `clear-recs`'s bare COALESCE:
+  # `tier` is INTEGER-affinity but nullable, and SQLite stores an empty string as
+  # TEXT '' rather than converting it, so COALESCE alone passes '' straight to
+  # CAST, which yields 0. Measured — the arm for this went red before the NULLIF.
+  # (clear-recs has the same gap with the opposite sign: there '' reads as tier 0
+  # and becomes ELIGIBLE for a blanket clear. Out of scope here, noted on the row.)
+  local human_where="${open_where}
+    AND ( COALESCE(routed_reviewer,'') = ''
+          OR CAST(COALESCE(NULLIF(tier,''),'2') AS INTEGER) >= 2
+          OR COALESCE(needs_capability,'') != '' )"
+  local where="$human_where"
   local order="ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, created_at"
   if (( send )); then
     _task_inbox_send "$channel_proof" "$where" "$order"
     return
   fi
   [[ -z "$channel_proof" ]] || fail "$E_USAGE" "--channel-proof only applies with --send"
+  # What the filter WITHHELD, counted rather than merely not-shown. Without this a
+  # newly-quiet inbox is indistinguishable from a fleet with no open gates — the
+  # same "an unnotified gate reads exactly like a notified one" shape this rail has
+  # been burned by before. It is a count and a pointer, never the asks themselves.
+  local routed_n; routed_n=$(db "SELECT COUNT(*) FROM tasks WHERE ${open_where} AND NOT ( COALESCE(routed_reviewer,'') = '' OR CAST(COALESCE(NULLIF(tier,''),'2') AS INTEGER) >= 2 OR COALESCE(needs_capability,'') != '' );")
+  routed_n="${routed_n:-0}"
   if (( JSON_MODE )); then
     local rows
     rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, need_type, ask, need_options, recommend, precedent_ref, need_answer, need_answered_at FROM tasks WHERE ${where} ${order};")
     [[ -n "$rows" ]] || rows="[]"
     # stdin, not --argjson — same ARG_MAX guard as `task ls`. (DIVE-222)
-    printf '%s' "$rows" | jq -c '{ok:true, data:{inbox:.}}'
+    # `routed_elsewhere` is additive under data{}; every existing consumer reads
+    # data.inbox and is unaffected.
+    printf '%s' "$rows" | jq -c --argjson r "$routed_n" '{ok:true, data:{inbox:., routed_elsewhere:$r}}'
   else
     local cnt; cnt=$(db "SELECT COUNT(*) FROM tasks WHERE ${where};")
     if [[ "$cnt" == "0" ]]; then
       echo "inbox empty — nothing waiting on a human."
     else
       dbfmt -box "SELECT ident, priority, need_type, COALESCE(assignee,'-') AS owner, COALESCE(recommend,'-') AS recommend, COALESCE((SELECT ident FROM tasks p WHERE p.id=tasks.precedent_ref),'-') AS precedent, ask FROM tasks WHERE ${where} ${order};"
+    fi
+    if (( routed_n > 0 )); then
+      echo "(${routed_n} more open gate(s) routed to an agent seat — not yours to answer: 5dive task ls --status=blocked)"
     fi
   fi
 }
