@@ -66,7 +66,8 @@ seeded_ok() { # <lane> <expected-actionable>
     || bad_t "FIXTURE BROKEN for lane $1" "expected $2, got $(_task_lane_actionable "$1") — arms below would grade the fixture, not the cap"
 }
 act_of() { _task_lane_actionable "$1"; }
-cap_of() { _task_wip_cap "$1"; }
+cap_of()  { _task_wip_cap "$1"; }
+install_caps() { ( cmd_task_wip_cap_install "$@" >/dev/null 2>&1 ); }
 # add-in-a-subshell: policy_refuse ends in fail(), which exits.
 try_add() { ( cmd_task_add "$@" >/dev/null 2>&1 ); }
 add_err() { ( cmd_task_add "$@" 2>&1 >/dev/null ); }
@@ -74,8 +75,24 @@ add_err() { ( cmd_task_add "$@" 2>&1 >/dev/null ); }
 seed alpha 3 todo
 seed beta  1 todo
 
-# ── 1. the cap is minted from the lane's own count, then FROZEN ──────────────
-[[ "$(cap_of alpha)" == "3" ]] && ok_t "cap initialises to the lane's actionable count (3)" \
+# ── 0. NO CAP UNTIL INSTALL. A store nobody installed against is uncapped —
+#      this is what keeps the cap off every fixture that points
+#      FIVEDIVE_PROD_TASKS_DB at itself, and off a fresh board.
+if cap_of alpha >/dev/null 2>&1; then
+  bad_t "a lane had a cap before install — caps must never be minted by a read" "$(cap_of alpha)"
+else
+  ok_t "before install, no lane has a cap (a read never mints one)"
+fi
+if try_add "pre-install row" --assignee=alpha --priority=medium; then
+  ok_t "...and an uninstalled store does not enforce (fixtures and fresh boards are untouched)"
+else
+  bad_t "uninstalled store refused a filing" ""
+fi
+db "DELETE FROM tasks WHERE title='pre-install row';"
+
+# ── 1. install snapshots the lane's own count, then FREEZES it ───────────────
+install_caps
+[[ "$(cap_of alpha)" == "3" ]] && ok_t "install snapshots the lane's actionable count (3)" \
   || bad_t "cap init" "$(cap_of alpha)"
 seed alpha 2 todo                      # count moves to 5...
 seeded_ok alpha 5
@@ -94,7 +111,7 @@ db "INSERT INTO tasks (ident,title,status,assignee,kind,priority,created_at,upda
   || bad_t "non-actionable counted" "before=$before now=$(act_of beta)"
 
 # ── 3. a full lane refuses low/med, and the refusal is USABLE ────────────────
-cap_of alpha >/dev/null                # alpha: cap 3, actionable 5 -> full
+# alpha: cap 3, actionable 5 -> full
 if try_add "a routine alpha row" --assignee=alpha --priority=medium; then
   bad_t "a full lane accepted a medium row" ""
 else
@@ -121,9 +138,9 @@ else
 fi
 
 # ── 5. high/urgent on a full lane is REDIRECTED, never plainly refused ───────
-seed gamma 2 todo; cap_of gamma >/dev/null; seed gamma 2 todo   # gamma full (4/2)
+seed gamma 2 todo; install_caps; seed gamma 2 todo   # gamma installed at 2, now holds 4
 # beta has headroom by construction (cap 1, actionable 1 -> full); give delta room
-seed delta 3 todo; cap_of delta >/dev/null
+seed delta 3 todo; install_caps
 db "UPDATE tasks SET status='done'
     WHERE id IN (SELECT id FROM tasks WHERE assignee='delta' AND status='todo' LIMIT 1);"
 err=$(add_err "a serious gamma finding" --assignee=gamma --priority=high)
@@ -140,7 +157,7 @@ else
 fi
 
 # ── 6. every lane full -> an urgent row LANDS anyway, loudly ─────────────────
-db "UPDATE task_prefs SET value='0' WHERE key LIKE 'wip_cap:%';"   # every cap 0 => all lanes full
+db "UPDATE task_prefs SET value='1' WHERE key LIKE 'wip_cap:%';"   # every lane holds >=1 => all full
 if try_add "saturated fleet urgent row" --assignee=alpha --priority=urgent; then
   ok_t "with NO lane free, an urgent row lands anyway (refusing a serious finding is the worse failure)"
 else
@@ -161,7 +178,7 @@ trips=$(db "SELECT value FROM task_prefs WHERE key='wip_cap_trips';")
   || bad_t "trip counter" "$trips"
 
 # ── 8. the exemptions ───────────────────────────────────────────────────────
-db "UPDATE task_prefs SET value='0' WHERE key LIKE 'wip_cap:%';"
+db "UPDATE task_prefs SET value='1' WHERE key LIKE 'wip_cap:%';"
 if try_add "materialized child" --assignee=alpha --priority=medium --materialized; then
   ok_t "--materialized is exempt (a half-materialized plan is the worse failure)"
 else
@@ -181,6 +198,39 @@ if ( FIVE_WIP_CAP=0 cmd_task_add "override row" --assignee=alpha --priority=medi
 else
   bad_t "override ignored" ""
 fi
+
+# ── 9. THE ZERO-LOCK. An EMPTY lane mints cap 0, and 0 >= 0 is a breach, so it
+#       could never take its first row — a new agent frozen from birth, and any
+#       lane that drained to empty frozen permanently. Same drain-to-zero shape
+#       the frozen cap exists to prevent, let back in through INITIALISATION.
+#       Found by CI, not by the arms above: every one of them seeds rows first,
+#       so none of them could ever see an empty lane.
+[[ "$(act_of freshlane)" == "0" ]] && ok_t "fixture: 'freshlane' is genuinely empty" \
+  || bad_t "fixture not empty" "$(act_of freshlane)"
+db "INSERT INTO tasks (ident,title,status,assignee,kind,priority,created_at,updated_at)
+    VALUES ('SEED-fresh-marker','marker','done','freshlane','standard','medium',datetime('now'),datetime('now'));"
+install_caps
+[[ "$(cap_of freshlane)" == "1" ]] && ok_t "an EMPTY lane's cap floors at 1, never 0" \
+  || bad_t "empty lane cap" "$(cap_of freshlane)"
+if try_add "first row on a brand new lane" --assignee=freshlane --priority=medium; then
+  ok_t "...so a brand-new lane can accept its first row (no zero-lock)"
+else
+  bad_t "ZERO-LOCK: an empty lane refused its first row" "$(add_err "first row on a brand new lane" --assignee=freshlane --priority=medium)"
+fi
+# ...and it is a cap of 1, not an exemption: the SECOND row is refused.
+if try_add "second row on a brand new lane" --assignee=freshlane --priority=medium; then
+  bad_t "control: the floored lane accepted a second row — floor became an exemption" ""
+else
+  ok_t "control: the second row on that lane IS refused (floor is a cap of 1, not a bypass)"
+fi
+
+# ── 10. install is IDEMPOTENT. Re-snapshotting on every run would make the cap
+#        track the count again — the exact lock this arm was built to avoid.
+before_cap=$(cap_of alpha)
+install_caps
+[[ "$(cap_of alpha)" == "$before_cap" ]] \
+  && ok_t "re-running install does NOT re-snapshot an installed lane (no ratchet)" \
+  || bad_t "install re-snapshotted" "was $before_cap now $(cap_of alpha)"
 
 printf -- '-----\nPASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]

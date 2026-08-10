@@ -19,6 +19,8 @@ _task_usage() {
   set-body <id> <text...>|--file=<path> [--append]   replace the body, or append to it
   set-title <id> <text...>                      overwrite the title (audited; refused once closed)
   set-branch <id> <branch>                      bind the row to a git branch
+  wip-cap-install [--relane=<lane>]             snapshot each lane's actionable count as its
+                                                frozen WIP ceiling (deliberate, once)
   set-budget <id> <tokens|\$cost|none>           raise/lower the token budget, or 'none' to exempt
                                                 the row from the enforced ${_TASK_BUDGET_BUILTIN:-5000000}-token default
 
@@ -196,6 +198,7 @@ cmd_task() {
     set-body)        cmd_task_set_body "$@" ;;
     set-title)       cmd_task_set_title "$@" ;;
     set-budget)      cmd_task_set_budget "$@" ;;
+    wip-cap-install) cmd_task_wip_cap_install "$@" ;;
     start)           cmd_task_start "$@" ;;
     done|close)      cmd_task_done "$@" ;;
     deliver)         cmd_task_deliver "$@" ;;
@@ -392,6 +395,46 @@ cmd_task_set_body() {
 # people who predicted they would need it. Unparking alone is NOT enough and is
 # the trap this closes: the sweep re-parks the row on the very next tick unless
 # the budget itself changed.
+# DIVE-2794 arm two — install the per-lane WIP caps. Deliberate, once, and the
+# ONLY thing that creates a cap: no cap is ever minted as a side effect of a
+# filing. Snapshots each lane's current actionable count as its frozen ceiling.
+#
+# Idempotent by default: a lane that already has a cap keeps it, because
+# re-snapshotting is exactly the "cap tracks the count" lock this arm exists to
+# avoid — running install twice must not ratchet anybody. --relane <lane> resets
+# one lane deliberately (a lead clear, the one sanctioned way a cap moves).
+cmd_task_wip_cap_install() {
+  tasks_db_init
+  local one=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --relane=*) one="${1#--relane=}" ;;
+      -*) fail "$E_USAGE" "unknown flag: $1 (usage: 5dive task wip-cap-install [--relane=<lane>])" ;;
+    esac
+    shift
+  done
+  local lane n installed=0 lines=""
+  while IFS= read -r lane; do
+    [[ -n "$lane" ]] || continue
+    [[ -z "$one" || "$lane" == "$one" ]] || continue
+    if [[ -z "$one" ]]; then
+      local have; have=$(db "SELECT value FROM task_prefs WHERE key=$(sqlq "wip_cap:$lane");" 2>/dev/null || echo "")
+      [[ "$have" =~ ^[0-9]+$ ]] && continue     # already installed: never re-snapshot
+    fi
+    n=$(_task_lane_actionable "$lane")
+    [[ "$n" =~ ^[0-9]+$ ]] || continue
+    # Floor of 1: a lane with no actionable rows would otherwise install cap 0,
+    # and `actionable >= cap` is then 0 >= 0 — a breach — so an EMPTY lane could
+    # never accept its first row and a brand-new agent would be frozen at birth.
+    (( n < 1 )) && n=1
+    db "INSERT INTO task_prefs (key,value) VALUES ($(sqlq "wip_cap:$lane"),$(sqlq "$n"))
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
+    installed=$((installed+1)); lines+="  ${lane}: ${n}"$'\n'
+  done < <(db "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL AND assignee!='' AND kind='standard';" 2>/dev/null)
+  ok "installed WIP caps for ${installed} lane(s)${lines:+
+$lines}" '{installed:$n}' --argjson n "${installed:-0}"
+}
+
 cmd_task_set_budget() {
   tasks_db_init
   local task="" val=""
@@ -725,22 +768,38 @@ _task_lane_actionable() {
         AND status IN ('todo','in_progress') AND parked_at IS NULL;" 2>/dev/null || echo ""
 }
 
-# _task_wip_cap <lane> — the frozen ceiling, minted on first sight and then read.
-# The re-read after the insert is not belt-and-braces: two adds racing on a fresh
-# lane would otherwise each return their OWN computed number, and the cap a lane
-# gets would depend on which one won. ON CONFLICT DO NOTHING + re-read means the
-# first writer's value is the cap for everybody.
+# _task_wip_cap <lane> — READ ONLY. A lane with no INSTALLED cap is not capped,
+# and the caller must treat a non-zero return as "no cap", never as zero.
+#
+# THE CAP IS INSTALLED, NEVER MINTED LAZILY, and the difference is the whole
+# defect CI found. The spec says "initialise each lane's cap to its own
+# actionable count AT INSTALL"; the first cut substituted "mint it the first time
+# anyone looks", which is not the same thing and is strictly worse. Minting on
+# first sight means the baseline is whatever the store happened to contain at
+# that instant — so every harness that points FIVEDIVE_PROD_TASKS_DB at its own
+# fixture (they do it deliberately, to exercise DIVE-2681) minted a cap from a
+# half-built fixture and then refused the rest of its own setup. DIVE-2681's
+# header already warns about exactly this: "a rig building a fixture is not a
+# filing decision". A title-based cap survives it because fixture titles rarely
+# classify; a COUNT-based cap cannot. Install is an explicit act
+# (`5dive task wip-cap-install`), so a store nobody installed against is a store
+# with no caps, which is the correct answer for every fixture and every fresh
+# board.
 _task_wip_cap() {
-  local lane="$1" key="wip_cap:$1" cur n
+  local key="wip_cap:$1" cur
   cur=$(db "SELECT value FROM task_prefs WHERE key=$(sqlq "$key");" 2>/dev/null || echo "")
-  if [[ ! "$cur" =~ ^[0-9]+$ ]]; then
-    n=$(_task_lane_actionable "$lane")
-    [[ "$n" =~ ^[0-9]+$ ]] || return 1
-    db "INSERT INTO task_prefs (key,value) VALUES ($(sqlq "$key"),$(sqlq "$n"))
-        ON CONFLICT(key) DO NOTHING;" 2>/dev/null || true
-    cur=$(db "SELECT value FROM task_prefs WHERE key=$(sqlq "$key");" 2>/dev/null || echo "")
-  fi
   [[ "$cur" =~ ^[0-9]+$ ]] || return 1
+  # FLOOR OF 1, and this is the whole zero-lock defect rather than a rounding
+  # nicety. A lane with no actionable rows mints cap 0, and `actionable >= cap`
+  # is then 0 >= 0 — a breach — so an EMPTY lane could never accept its first
+  # row. A brand-new agent would be frozen from birth, and any lane that
+  # legitimately drained to empty would freeze permanently. That is the exact
+  # drain-to-zero failure this arm's frozen cap was designed to avoid, let back
+  # in through the INITIALISATION path instead of the update rule. Caught by CI
+  # (gate_evidence_form_unit / audit_task_store_fence_unit both start from an
+  # empty fixture lane), not by the arms I wrote — every one of those seeds rows
+  # first, so none of them could see it.
+  (( cur < 1 )) && cur=1
   printf '%s' "$cur"
 }
 
@@ -1412,7 +1471,13 @@ An internal-machinery finding gets its own ident ONLY if it has ALREADY blocked 
       if [[ "$priority" == "high" || "$priority" == "urgent" ]]; then
         local _free; _free=$(_task_lanes_with_headroom "$assignee")
         if [[ -n "$_free" ]]; then
-          policy_refuse "$E_VALIDATION" wip-cap-lane-full DIVE-2794 "(unfiled) ${title}" \
+          # DISTINCT SLUG from the hard refusal below, and not a cosmetic choice:
+          # the slug is the key `task refusals` and the ledger group by, so one
+          # slug over both branches would make a REDIRECT (nothing lost, re-file
+          # elsewhere) indistinguishable from a REFUSAL (close something first)
+          # in exactly the data main needs to separate them in. Caught by
+          # tests/policy_refusals_unit.sh's duplicate-slug arm.
+          policy_refuse "$E_VALIDATION" wip-cap-lane-redirect DIVE-2794 "(unfiled) ${title}" \
             "lane '${assignee}' is at its WIP cap (${_wact}/${_wcap} actionable). A ${priority} row is never refused — it is REDIRECTED, so re-file it to a lane with room:
 ${_oldest}
   lanes with headroom:  ${_free}
