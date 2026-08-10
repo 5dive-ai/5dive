@@ -153,6 +153,24 @@ parse_log() {
       post_delta="$(printf '%s' "$brk" | sed -E 's/.*\(([-+][0-9]+)%\)$/\1/')"
     fi
 
+    # DIVE-3188: "harness-budget[full/pristine]: HEADER DRIFT (DIVE-3188) files 3, wrong 1, policy off"
+    # and one "HEADER DRIFT FILE <sev> <name> claim <n>s measured <n>s over <n>%" per
+    # drifting file. These are the cross-job carrier for the stale-claim verdict; see the
+    # block beside the drift print in scripts/run-harnesses.sh for why the report FIELD
+    # could not be it.
+    # Declared local so a job that `continue`d above cannot leak its values into the next
+    # one — a harvested field belonging to a different job is worse than a missing field.
+    local hdsum hdfiles hd_all hd_wrong hd_policy
+    hdsum="$(printf '%s\n' "$blk" | grep -aoE 'HEADER DRIFT \(DIVE-3188\) files [0-9]+, wrong [0-9]+, policy [a-z]+' | tail -1)"
+    if [[ -n "$hdsum" ]]; then
+      hd_all="$(printf '%s' "$hdsum"    | sed -E 's/.*files ([0-9]+),.*/\1/')"
+      hd_wrong="$(printf '%s' "$hdsum"  | sed -E 's/.*wrong ([0-9]+),.*/\1/')"
+      hd_policy="$(printf '%s' "$hdsum" | sed -E 's/.*policy ([a-z]+)$/\1/')"
+      # Only meaningful when the summary line was there. A per-file row harvested without
+      # its summary would be a count with no denominator.
+      hdfiles="$(printf '%s\n' "$blk" | grep -aoE 'HEADER DRIFT FILE (WRONG|stale) [^ ]+ claim [0-9.]+s measured [0-9.]+s over [0-9]+%' | sort -u)"
+    fi
+
     local f="$OUT/${run}-${job}.report"
     {
       printf '# run-harnesses report (HARVESTED from CI log by scripts/tier-cal-harvest.sh)\n'
@@ -175,10 +193,27 @@ parse_log() {
         printf '# cal_post_status=measured\n# cal_post_us_per_iter=%s\n# cal_post_delta_pct=%s\n' \
           "$post_us" "${post_delta#+}"
       fi
+      # DIVE-3188, and the absence rule above is the whole point on THIS field. A log from
+      # before DIVE-3188 carries no HEADER DRIFT line, so these keys are simply not written
+      # — never `header_drift_wrong=0`. The window counts recurrences across history, so a
+      # zero-fill here would manufacture a majority of clean historical samples inside the
+      # instrument built to count them, and it would look like a healthy corpus.
+      if [[ -n "${hd_wrong:-}" ]]; then
+        printf '# header_drift=%s\n# header_drift_wrong=%s\n# drift_fatal_policy=%s\n' \
+          "${hd_all}" "$hd_wrong" "$hd_policy"
+        # One row per drifting file, tab-separated: sev, name, claim_s, measured_s, over_pct.
+        # A repeated key, which every existing reader tolerates — tier-cal-window.sh's
+        # field() is `grep -m1`, so the scalar fields above are unaffected.
+        if [[ -n "${hdfiles:-}" ]]; then
+          printf '%s\n' "$hdfiles" | sed -E \
+            's/^HEADER DRIFT FILE (WRONG|stale) (.*) claim (.*)s measured (.*)s over ([0-9]+)%$/# header_drift_file=\1\t\2\t\3\t\4\t\5/'
+        fi
+      fi
     } > "$f"
     printf '%s\n' "$f"
     n=$((n+1))
     unset cal_status cal_us cal_base scale_raw scale_app eff_cap eff_pct post_us post_delta
+    unset hd_all hd_wrong hd_policy hdsum hdfiles
   done <<< "$jobs"
   return "$(( n > 0 ? 0 : 1 ))"
 }
