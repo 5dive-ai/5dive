@@ -389,6 +389,15 @@ sudo_grant_batch_reset() { unset _SUDOERS_BATCH_STATE; declare -gA _SUDOERS_BATC
 #   sudo -l       `    (root) NOPASSWD: /usr/local/bin/5dive, ...`
 # `sudo -l`'s "Matching Defaults entries" preamble carries no parens, so it is
 # skipped by the same test.
+# NOTE FOR THE NEXT EDITOR (DIVE-3160): the recognized-verb list below is a
+# SECOND copy of the verbs render_standard_sudoers emits, and the two drift
+# silently in one direction only — a verb added there and not here lands as
+# `has_other`, which flags every correctly-provisioned agent as carrying an
+# unrecognized grant. That is how this comment came to be written: the
+# `_task_answer` line was added to the renderer, and agent_sudo_grant_unit.sh +
+# gh_actor_routing_unit.sh both went red on `extra=1` within the same run. The
+# duplication is deliberate (the classifier must also read drop-ins this CLI did
+# NOT write), so the guard is the harnesses, not a shared constant.
 classify_sudo_grant() {
   local line runas cmds cmd
   local has_all=0 has_cli=0 has_a2a=0 has_other=0 any=0 runas_any=0
@@ -415,7 +424,8 @@ classify_sudo_grant() {
         "/usr/local/bin/5dive agent _deliver"*|"/usr/local/bin/5dive agent _capture"*|\
         "/usr/local/bin/5dive agent _self_restart"*|"/usr/local/bin/5dive _audit_append"*|\
         "/usr/local/bin/5dive _push_do"*|\
-        "/usr/local/bin/5dive _gh_do"*)                  has_a2a=1 ;;
+        "/usr/local/bin/5dive _gh_do"*|\
+        "/usr/local/bin/5dive _task_answer"*)            has_a2a=1 ;;
         *)                                              has_other=1 ;;
       esac
     done
@@ -527,6 +537,18 @@ ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _audit_append
 # inside _self_restart, never from argv, so it can restart ONLY itself, never a
 # peer. Deferred internally; needs no raw systemd-run/systemctl grant.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _self_restart
+# DIVE-3160: let this agent's LEAD-CLEAR land SIGNED. A cli-scoped seat can clear
+# a gate it is routed and cannot sign it (signing needs the root-only key), so its
+# closure stores unsigned and a delegated push or deploy is refused later, on
+# someone else's round-trip, as tampering. EXACT path, NO args, NO wildcard: the
+# parameters travel over stdin, the caller is derived from SUDO_UID inside
+# _task_answer, and the lead-clear STANDING is re-derived there from the task row
+# as root. UNCONDITIONAL on purpose, unlike the push and deploy grants: this verb
+# confers no authority of its own - it refuses unless the row already routes the
+# clear to this agent - so gating it behind a flag would only recreate the split
+# between standing and capability that it exists to close. It cannot stamp a
+# human answer: every human-evidence form is refused inside the primitive.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _task_answer
 SUDOERS
   if [[ "$can_push" == "1" ]]; then
     cat <<SUDOERS

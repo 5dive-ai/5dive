@@ -11870,8 +11870,166 @@ _gate_tap_log() {
   return 0
 }
 
+# ── DIVE-3160: `_task_answer` — the delegated, SIGNED gate clear ─────────────
+#
+# THE DEFECT. A cli-scoped lead can CLEAR a gate it cannot SIGN. cmd_task_answer
+# signs the DIVE-756 closure in-process only at EUID 0; every other caller shells
+# out to `sudo -n 5dive gate-proof sign`, and a cli-scoped seat holds no grant for
+# it (its own `_sig_why` string says so, a few hundred lines below). Signing is
+# best-effort by design, so the answer LANDS UNSIGNED and `require_sig=1` on the
+# push/deploy root executors refuses it later — on the MAKER's next round-trip,
+# with a message about tampering. Standing to clear and capability to sign were
+# decided in two different places and nothing lined them up.
+#
+# WHY NOT THE OBVIOUS FIX — this is the load-bearing paragraph. "Grant a narrow
+# root verb that seals the STORED ROW" reads far safer than `gate-proof sign` over
+# stdin, and is not safer at all: /var/lib/5dive/tasks/tasks.db is `rw-rw----
+# root:claude` and EVERY agent seat is in group `claude` (measured 2026-08-10 on
+# both a cli-scoped seat and a root-all one), so a caller writes
+# `need_answered_by='human:lodar'` with plain sqlite3 FIRST and then asks for the
+# seal. tasks_db.sh's own note — "a raw-sqlite write that never ran
+# cmd_task_answer leaves an unsigned/invalid row that gate-proof verify flags" —
+# is the reason this HMAC exists at all. Narrowing the ARGUMENT (stdin -> ident)
+# changes the transport and never the trust: the payload is caller-authored
+# either way. The question is not what the verb accepts, it is who authored the
+# bytes it will attest to.
+#
+# So this primitive signs at ANSWER time, from facts it establishes ITSELF:
+#
+#   1. EUID 0 or refuse — reachable only through the exact-path NOPASSWD grant.
+#   2. WHO comes from SUDO_UID under sudo's env_reset, never argv, never --from.
+#      `_gate_uid_to_agent` fails closed on anything that is not an `agent-*` row.
+#   3. STANDING is re-derived AS ROOT FROM THE ROW (routed_reviewer, or the
+#      sealed constitution's standing lead) — never from anything the caller
+#      passed. Identity alone is not enough: a lead with standing on gate X must
+#      not clear gate Y. (_gh_do's posture, and main's condition 1.)
+#   4. It cannot stamp `human:*`. An agent-invoked path is by definition not a
+#      human tap, so the human-evidence flags are REFUSED here and `human` is
+#      additionally forced to 0 inside cmd_task_answer for this path (main's
+#      condition 2 — the DIVE-916/1115/2224 forged-human residual is a known open
+#      threat and a new root path must not become a fresh entrance to it).
+#   5. cmd_task_answer then runs its OWN authorization unchanged, at EUID 0, and
+#      signs in-process. Every check above is a SUBSET guard that refuses EARLIER;
+#      this primitive grants nothing and cannot widen who may clear what.
+#
+# SELF-CLEAR (main's open design question, settled here): a maker may not have its
+# own gate signed, and the maker is `maker_agent` — the loop spec's maker — NEVER
+# `assignee`. On DIVE-2159, the acceptance row for this ticket, `assignee` is the
+# VERIFIER (main2) and `maker_agent` is dev: a self-clear check keyed on assignee
+# would have refused the one legitimate clear this whole ticket exists to make
+# signable. When a row names no maker the check stays SILENT rather than guessing
+# from assignee — a guess in that column is exactly the error just described.
+# Every argument to `task answer` that can raise `human`, or that names an actor
+# the caller was not measured to be. A PREDICATE over ONE argument, so the harness
+# can grade the exact list the executor loops over rather than a copy of it — and
+# a source tripwire in that harness asserts the loop still calls this, because the
+# usual failure of an extracted check is a call site that quietly stops using it.
+_task_answer_forbidden_flag() {
+  case "${1:-}" in
+    --human|--human-proof=*|--channel-proof=*|--channel-msg=*|--tap-uid=*|--tap-username=*|--tap-msg=*|--relay-agent=*|--from=*) return 0 ;;
+  esac
+  return 1
+}
+
+cmd_task_answer_delegated() {
+  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "_task_answer is a privileged internal primitive (reachable only through the exact-path NOPASSWD grant)."
+
+  # Parameters over stdin, NUL-separated, never argv (main's condition 3): nothing
+  # gate-bearing lands in the process table, and the grant stays an exact command
+  # path with no wildcard, so it holds identically under classic sudo and sudo-rs.
+  # Same shape as _push_do and _gh_do.
+  local -a args=(); local a
+  while IFS= read -r -d '' a; do args+=("$a"); done
+  (( ${#args[@]} )) || fail "$E_VALIDATION" "_task_answer got no arguments on stdin."
+
+  # (2) WHO — the kernel's view of the DELEGATING caller. sudo's env_reset means
+  # SUDO_UID here was set by sudo itself; a caller-supplied one is stripped before
+  # this process starts. A root-all seat could of course forge it, but that seat
+  # can already reach `gate-proof sign` directly — this grant hands it nothing new.
+  local _ruid="${SUDO_UID:-}"
+  [[ "$_ruid" =~ ^[0-9]+$ ]] \
+    || fail "$E_AUTH_REQUIRED" "_task_answer: no SUDO_UID — reach this primitive through sudo from an agent seat, never as root directly (a root caller has no delegating agent to attribute the clear to)."
+  [[ "$_ruid" != "0" ]] \
+    || fail "$E_AUTH_REQUIRED" "_task_answer: SUDO_UID is root, which is not an agent seat."
+  local _actor; _actor=$(_gate_uid_to_agent "$_ruid")
+  [[ -n "$_actor" ]] \
+    || fail "$E_AUTH_REQUIRED" "_task_answer: uid ${_ruid} owns no agent-* passwd row, so this clear has no attributable agent."
+
+  # (4) NEVER human:*. Refused by NAME here so the refusal is greppable and lands
+  # before any write; `human=0` is forced again inside cmd_task_answer so a flag
+  # added later cannot reopen this.
+  for a in "${args[@]}"; do
+    _task_answer_forbidden_flag "$a" \
+      && fail "$E_VALIDATION" "_task_answer refuses ${a%%=*}: an agent-invoked clear is never a human tap, and provenance here is derived from SUDO_UID rather than passed in. Use '5dive task answer' for a human-sourced answer."
+  done
+
+  local _ident=""
+  for a in "${args[@]}"; do [[ "$a" == --* ]] && continue; _ident="$a"; break; done
+  [[ -n "$_ident" ]] || fail "$E_VALIDATION" "_task_answer got no task ident on stdin."
+
+  tasks_db_init
+  # (3) STANDING, re-derived as root from the ROW. All four columns are
+  # enum/agent-name/timestamp shaped, so the sqlite3 `|` separator is unambiguous.
+  local _row
+  _row=$(db "SELECT COALESCE(routed_reviewer,''),COALESCE(maker_agent,''),COALESCE(need_type,''),COALESCE(need_answered_at,'') FROM tasks WHERE ident=$(sqlq "$_ident") LIMIT 1;" 2>/dev/null || printf '')
+  [[ -n "$_row" ]] || fail "$E_VALIDATION" "_task_answer: no task ${_ident}."
+  local _rr _maker _ntype _answered _rest
+  _rr="${_row%%|*}";     _rest="${_row#*|}"
+  _maker="${_rest%%|*}"; _rest="${_rest#*|}"
+  _ntype="${_rest%%|*}"; _answered="${_rest#*|}"
+
+  [[ -n "$_ntype" ]]   || fail "$E_VALIDATION" "_task_answer: ${_ident} carries no gate."
+  [[ -z "$_answered" ]] || fail "$E_CONFLICT" "_task_answer: the gate on ${_ident} was already answered at ${_answered} — answer-once has no re-sign path (re-file a fresh gate)."
+
+  local _sl; _sl=$(_gate_standing_lead 2>/dev/null || printf '')
+  if [[ "$_actor" != "$_rr" ]] && [[ -z "$_sl" || "$_actor" != "$_sl" ]]; then
+    fail "$E_AUTH_REQUIRED" "_task_answer: ${_actor} holds no lead-clear standing on ${_ident} (routed reviewer: ${_rr:-<none>}). This primitive serves the lead-clear-that-cannot-sign case and nothing else."
+  fi
+
+  if [[ -n "$_maker" && "$_actor" == "$_maker" ]]; then
+    fail "$E_AUTH_REQUIRED" "_task_answer: ${_actor} is the MAKER of ${_ident} — signing your own gate is a self-clear, refused here even when the row routes the clear back to you."
+  fi
+
+  TASK_ANSWER_DELEGATED=1
+  cmd_task_answer "${args[@]}"
+}
+
+# The caller half: reach for the SIGNED path when, and only when, this seat is one
+# whose closures land unsigned today. A seat that can sign directly keeps today's
+# path byte for byte — routing a root-all seat through the executor would silently
+# apply the new refusals to flows that never had them, which is a policy change
+# this ticket was not asked to make. Failing closed is free here: on any refusal we
+# fall through to the existing path, which lands the answer exactly as it does
+# today (unsigned, with the DIVE-2760 notice naming the cause) — so this can make
+# a closure signed and can never make an answer fail.
+_task_answer_try_delegated() {
+  [[ $EUID -ne 0 ]]                        || return 1   # root already signs in-process
+  [[ -z "${TASK_ANSWER_DELEGATED:-}" ]]    || return 1   # no recursion from the executor
+  sudo -n -l /usr/local/bin/5dive gate-proof sign >/dev/null 2>&1 && return 1
+  sudo -n -l /usr/local/bin/5dive _task_answer    >/dev/null 2>&1 || return 1
+  local _out _rc=0
+  _out=$(printf '%s\0' "$@" | sudo -n /usr/local/bin/5dive _task_answer 2>&1) || _rc=$?
+  if (( _rc == 0 )); then printf '%s\n' "$_out"; return 0; fi
+  # It refused. Two different situations hide behind one exit code, so ASK THE ROW
+  # rather than parse the message: if the gate is answered, the write landed and
+  # re-running would trip answer-once or double-write; only an untouched gate may
+  # fall through.
+  local _ident="" a
+  for a in "$@"; do [[ "$a" == --* ]] && continue; _ident="$a"; break; done
+  if [[ -n "$_ident" ]]; then
+    local _now; _now=$(db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE ident=$(sqlq "$_ident") LIMIT 1;" 2>/dev/null || printf '')
+    if [[ -n "$_now" ]]; then printf '%s\n' "$_out"; return 0; fi
+  fi
+  warn "the signed clear (_task_answer) refused, so this answer will store UNSIGNED:"
+  printf '%s\n' "$_out" | sed 's/^/  /' >&2
+  return 1
+}
+
 cmd_task_answer() {
   tasks_db_init
+  # DIVE-3160: prefer the delegated SIGNED clear on a seat that cannot sign. Runs
+  # before any parsing so the executor sees the caller's arguments verbatim.
+  _task_answer_try_delegated "$@" && return 0
   local value="" value_set=0 from="" human=0 human_proof="" channel_proof="" channel_msg=""
   local tap_uid="" tap_username="" tap_msg="" relay_agent=""
   local -a positional=()
@@ -12581,6 +12739,15 @@ cmd_task_answer() {
   # forever. `_lead_clear=1` also implies nt is approval|manual|access, the types
   # that always enter the evidence block, so _hp/_su are measured values here and
   # never their declaration defaults.
+  # DIVE-3160 (main's condition 2): the delegated executor must be STRUCTURALLY
+  # incapable of writing a `human:*` label, not merely conventionally unlikely to.
+  # `_task_answer` already refuses the human-evidence flags by name; this is the
+  # backstop, placed at the one point every raise-site (--human, _cp_ok, _cs_ok,
+  # and whatever the next one turns out to be) has already run and nothing has yet
+  # read `human` to decide provenance. An agent-invoked clear is `lead:*`, full
+  # stop — a new root path must not widen the DIVE-916/1115/2224 forged-human
+  # residual, which is open.
+  [[ -z "${TASK_ANSWER_DELEGATED:-}" ]] || human=0
   local _human_evid=$(( _hp || _su || _cp_ok ))
   local _human_claim="$human"
   if (( human && ! _human_evid )) && [[ "$_lead_clear" == "1" ]]; then
