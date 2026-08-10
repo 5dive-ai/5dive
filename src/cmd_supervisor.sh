@@ -277,6 +277,10 @@ _SUP_CLI_BEHIND="unknown"
 _SUP_CLI_STALE="unknown"
 _SUP_CLI_FROZEN="unknown"
 _SUP_CLI_FROZEN_DETAIL=""
+# DIVE-2306: three-state strings, like BEHIND/STALE above and for the same
+# reason — "we did not measure it" is not "false".
+_SUP_CLI_AHEAD="unknown"
+_SUP_CLI_FROZEN_ARMED="unknown"
 _sup_cli_check() {
   (( _SUP_CLI_CHECKED )) && return 0
   _SUP_CLI_CHECKED=1
@@ -295,6 +299,10 @@ _sup_cli_check() {
   mapfile -t fz < <(_cli_freeze_observe "$FIVE_VERSION" "${STATE_DIR}/cli-version-seen.json")
   _SUP_CLI_FROZEN="${fz[0]:-unknown}"
   _SUP_CLI_FROZEN_DETAIL="${fz[2]:-}"
+  # DIVE-2306: an `unknown` freeze reading from a box that cannot record the
+  # observation is not a monitor waiting for data — it is a monitor that will
+  # never have any. The board has to be able to tell those apart.
+  case "${fz[3]:-}" in yes) _SUP_CLI_FROZEN_ARMED="true" ;; no) _SUP_CLI_FROZEN_ARMED="false" ;; esac
   # DIVE-2042: the published version is read through _published_cli_probe, which
   # pins both fetches to one immutable sha and verifies the bundle against its
   # own checksum. Anything short of a CONSISTENT read leaves staleness UNKNOWN
@@ -313,9 +321,15 @@ _sup_cli_check() {
   _SUP_CLI_LATEST="$latest"
   if ! version_lt "$FIVE_VERSION" "$latest"; then
     _SUP_CLI_BEHIND="false"; _SUP_CLI_STALE="false"
+    # DIVE-2306: `update --check` has reported `ahead` as its own state since
+    # DIVE-2287; the board folded it into this not-behind branch, so the one
+    # surface the dashboard reads could not show it. A box above the newest
+    # release is the state DIVE-2243's guard refuses every upgrade from — the
+    # installer will say so and the board should not disagree by silence.
+    if version_lt "$latest" "$FIVE_VERSION"; then _SUP_CLI_AHEAD="true"; else _SUP_CLI_AHEAD="false"; fi
     return 0
   fi
-  _SUP_CLI_BEHIND="true"
+  _SUP_CLI_BEHIND="true"; _SUP_CLI_AHEAD="false"
   # Same nightly-log heuristic as cmd_update_check: a healthy recent nightly
   # means the gap closes on its own (behind-but-fine); a failed/absent/old one
   # means the box is genuinely running old code.
@@ -587,7 +601,8 @@ _sup_render_board() {
 _sup_summary_line() {
   local snap="$1"
   jq -r --arg stale "$_SUP_CLI_STALE" --arg cur "$FIVE_VERSION" --arg lat "$_SUP_CLI_LATEST" \
-        --arg frozen "$_SUP_CLI_FROZEN" --arg frozendet "$_SUP_CLI_FROZEN_DETAIL" '
+        --arg frozen "$_SUP_CLI_FROZEN" --arg frozendet "$_SUP_CLI_FROZEN_DETAIL" \
+        --arg ahead "$_SUP_CLI_AHEAD" --arg armed "$_SUP_CLI_FROZEN_ARMED" '
     "\(length) agents — " +
     "\([.[] | select(.classification == "healthy")]        | length) healthy / " +
     "\([.[] | select(.classification == "slow")]           | length) slow / " +
@@ -600,10 +615,20 @@ _sup_summary_line() {
     (if $stale == "true" then " · CLI \($cur) STALE (latest \($lat))"
      elif $stale == "unknown" then " · CLI staleness unknown (probe unavailable)"
      else " · CLI \($cur) ok" end) +
+    # DIVE-2306: `ahead` was reachable only from `update --check`. It is the
+    # state the installer refuses to move, so a board that renders "CLI ok" for
+    # it contradicts the installer without either of them being wrong.
+    (if $ahead == "true" then " · ⚠ CLI \($cur) AHEAD of release \($lat) — the installer will refuse (a release cut is owed)"
+     else "" end) +
     # DIVE-2287: appended, never substituted. A frozen fleet reads "CLI ok" on
     # the staleness half — that IS the failure — so this line has to be able to
     # say "ok" and "FROZEN" in the same breath.
     (if $frozen == "frozen" then " · ⚠ FLEET FROZEN: \($frozendet) — no release has reached this box; check the release cutter"
+     else "" end) +
+    # DIVE-2306: and the same argument one level down — a board that cannot
+    # record the observation prints the freeze half as silence, which is what
+    # "not frozen" looks like.
+    (if $armed == "false" then " · ⚠ freeze alarm UNARMED on this box: \($frozendet)"
      else "" end)' <<<"$snap"
 }
 
@@ -732,8 +757,17 @@ _sup_act_exec() {  # <name> <verb> <cause>
 cmd_supervisor_tick() {
   require_root "supervisor --tick"
   if [[ ! -f "$_SUP_ENABLED_FLAG" ]]; then
-    ok "supervisor tick: disabled — observe pass skipped (enable: sudo touch ${_SUP_ENABLED_FLAG})" \
-       '{enabled:false, skipped:true}'
+    # DIVE-2306: name what the no-op costs, rather than only what it skips. This
+    # tick is the only caller guaranteed to run as root and therefore guaranteed
+    # able to WRITE the DIVE-2287 version record; `update --check` runs as an
+    # operator and degrades to `unknown` on a STATE_DIR it cannot write. So on a
+    # box where the tick is off, the freeze alarm may have no writer at all —
+    # and an alarm with no writer reports `unknown` forever, which reads exactly
+    # like a monitor that has simply not fired yet. Stated here, and again in
+    # `update --check` / the board / the digest as `frozenArmed:false`, because
+    # a notice on a disabled cron path is seen by nobody by construction.
+    ok "supervisor tick: disabled — observe pass skipped (enable: sudo touch ${_SUP_ENABLED_FLAG}) · the DIVE-2287 version-freeze record is not being refreshed by this tick; if no other caller can write it, the freeze alarm is unarmed on this box" \
+       '{enabled:false, skipped:true, freezeRecordRefreshed:false}'
     return 0
   fi
   tasks_db_init
@@ -905,10 +939,13 @@ cmd_supervisor() {
           --arg cur "$FIVE_VERSION" --arg lat "$_SUP_CLI_LATEST" \
           --arg beh "$_SUP_CLI_BEHIND" --arg stl "$_SUP_CLI_STALE" \
           --arg frz "$_SUP_CLI_FROZEN" --arg frzd "$_SUP_CLI_FROZEN_DETAIL" \
+          --arg ahd "$_SUP_CLI_AHEAD" --arg frzarm "$_SUP_CLI_FROZEN_ARMED" \
           --argjson tstuck "$_SUP_T_STUCK_MIN" --argjson tslow "$_SUP_T_SLOW_MIN" \
           '{ok:true, data:{agents:.,
              cli:{current:$cur, latest:(if $lat == "" then null else $lat end), behind:$beh, stale:$stl,
-                  frozen:$frz, frozenDetail:(if $frzd == "" then null else $frzd end)},
+                  ahead:$ahd,
+                  frozen:$frz, frozenDetail:(if $frzd == "" then null else $frzd end),
+                  frozenArmed:$frzarm},
              tStuckMin:$tstuck, tSlowMin:$tslow}}'
       else
         _sup_render_board "$snap"

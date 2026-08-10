@@ -137,18 +137,47 @@ readonly UPDATE_STALE_AFTER_SECS=$((36 * 3600))
 # resolves to neither: we seed it and answer `unknown`. Reporting a green from
 # an absent record would rebuild the fail-open one layer down.
 #
-# Prints exactly three lines (never fails the caller):
+# DIVE-2306 — AN UNKNOWN THAT WILL NEVER RESOLVE IS ITS OWN ANSWER. Everything
+# above is about the reading; this is about whether the reading can ever be
+# TAKEN on this box. The alarm needs a record it can both write and re-read: the
+# state is derived by comparing the running version against a stored one, so a
+# caller that cannot WRITE the record leaves it exactly where it was, and the
+# next caller is in the identical position. Two ways that happens, and both are
+# silent today:
+#
+#   1. `update --check` runs as an unprivileged operator against a STATE_DIR it
+#      cannot write. It answers `unknown` — honestly — and will answer `unknown`
+#      forever, because nothing it does moves the record.
+#   2. `supervisor --tick` is the caller guaranteed to run as root and therefore
+#      guaranteed able to write, and it NO-OPS unless the enable flag exists. On
+#      a box where the tick is off, (1) may be the only caller there is.
+#
+# In both, "we have not observed a freeze" is indistinguishable from "we cannot
+# observe one" — the alarm is UNARMED, and an unarmed alarm reporting `unknown`
+# reads as a monitor doing its job. So the observation now says which it is.
+# `armed=no` is not a state of the FLEET; it is a statement about this box's
+# ability to answer at all, which is why it is a fourth field and not a fourth
+# value of the state (a consumer reading only the state keeps its exact prior
+# meaning — the same additive rule DIVE-2287 applied one layer up).
+#
+# Prints exactly four lines (never fails the caller):
 #   1  state       moving | frozen | unknown
 #   2  age_secs    seconds since the running version was first observed ('' if unknown)
 #   3  detail      human phrase — always the OBSERVED claim ("not observed to
 #                  change"), never the stronger unobserved one ("did not change")
+#   4  armed       yes | no — whether this box can record the observation at all.
+#                  `no` means the state above cannot change no matter how long
+#                  the fleet stays frozen.
 _CLI_FREEZE_AFTER_SECS=$((7 * 86400))
 _cli_freeze_observe() {
   local cur="${1:-}" record="${2:-}" now="${3:-}"
-  _cfo_out() { printf '%s\n%s\n%s\n' "$1" "$2" "$3"; }
+  # 4th arg defaults to `yes`: every site that reaches a conclusion FROM a
+  # readable record is by construction armed, so only the unrecordable paths
+  # have to say so.
+  _cfo_out() { printf '%s\n%s\n%s\n%s\n' "$1" "$2" "$3" "${4:-yes}"; }
   [[ -n "$now" ]] || now=$(date +%s)
-  [[ -n "$cur" ]] || { _cfo_out unknown "" "the running version is unreadable"; return 0; }
-  [[ -n "$record" ]] || { _cfo_out unknown "" "no state dir to record version movement in"; return 0; }
+  [[ -n "$cur" ]] || { _cfo_out unknown "" "the running version is unreadable" no; return 0; }
+  [[ -n "$record" ]] || { _cfo_out unknown "" "no state dir to record version movement in" no; return 0; }
 
   local seen_ver="" seen_at=""
   if [[ -r "$record" ]]; then
@@ -163,16 +192,32 @@ _cli_freeze_observe() {
     # Best-effort write. A read-only STATE_DIR (`update --check` runs as a
     # non-root operator) must not fail the command — it degrades to `unknown`,
     # which is what an unrecordable observation honestly is.
+    #
+    # DIVE-2306: whether the write LANDED is the armed/unarmed answer, and it is
+    # only knowable here. `-w` on the directory is a permission, not an outcome
+    # (a full disk, a read-only mount remounted under us, an immutable file all
+    # pass it), so the flag is set from the redirect's own status.
+    local wrote=0
     if [[ -w "$(dirname "$record")" || -w "$record" ]]; then
-      printf '{"version":%s,"first_seen_epoch":%s,"first_seen_at":%s}\n' \
+      if printf '{"version":%s,"first_seen_epoch":%s,"first_seen_at":%s}\n' \
         "$(printf '%s' "$cur" | jq -R .)" "$now" \
         "$(date -u -d "@$now" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null | jq -R .)" \
-        > "$record" 2>/dev/null || true
+        > "$record" 2>/dev/null; then
+        wrote=1
+      fi
     fi
+    local armed=no; (( wrote )) && armed=yes
     if [[ -n "$seen_ver" && "$seen_ver" != "$cur" ]]; then
-      _cfo_out moving "0" "version changed ${seen_ver} -> ${cur}"
-    else
+      # An unwritable record here is the sharpest case: the version DID move,
+      # the record still names the old one, and every future call re-reports
+      # this same "changed" — a monitor stuck on a transition it can never
+      # leave. Loud in the state, honest in `armed`.
+      _cfo_out moving "0" "version changed ${seen_ver} -> ${cur}" "$armed"
+    elif (( wrote )); then
       _cfo_out unknown "" "no prior observation of this box's version — clock starts now"
+    else
+      _cfo_out unknown "" \
+        "the version observation cannot be recorded on this box (${record} is not writable by this caller) — the freeze alarm is UNARMED and will stay unknown" no
     fi
     return 0
   fi
@@ -411,6 +456,11 @@ cmd_update_check() {
   local -a fz=()
   mapfile -t fz < <(_cli_freeze_observe "$current" "${STATE_DIR}/cli-version-seen.json")
   local frozen_state="${fz[0]:-unknown}" frozen_age="${fz[1]:-}" frozen_detail="${fz[2]:-}"
+  # DIVE-2306. `update --check` is the caller most likely to be UNARMED — it is
+  # the unprivileged one — and it is also the caller a human runs by hand, so it
+  # is where "this box cannot answer that question" has to be said.
+  local frozen_armed="${fz[3]:-yes}" frozen_armed_json=true
+  [[ "$frozen_armed" == yes ]] || frozen_armed_json=false
 
   local prose
   if [[ "$behind" == true ]]; then
@@ -422,6 +472,9 @@ cmd_update_check() {
     prose="CLI $current is up to date"
   fi
   [[ "$frozen_state" == frozen ]] && prose+=" · ⚠ $frozen_detail"
+  # An unarmed alarm never says "frozen", so this line is the only thing that
+  # distinguishes a fleet that is moving from one nobody is watching.
+  [[ "$frozen_armed_json" == false ]] && prose+=" · ⚠ freeze alarm UNARMED: $frozen_detail"
 
   # `behind`/`stale` keep their existing meaning and are only ever emitted on
   # the consistent path — the indeterminate branch above exits before here, so
@@ -435,9 +488,10 @@ cmd_update_check() {
   # or unwritable record is "unknown", and a caller must not be able to read a
   # green out of an observation we never made.
   ok "$prose" \
-     '{current:$cur, latest:$lat, behind:$beh, ahead:$ahd, stale:$stl, frozen:$fz, frozenAgeSec:$fza, frozenDetail:$fzd, lastUpdateOk:$luo, lastUpdateAt:$lua, source:$src}' \
+     '{current:$cur, latest:$lat, behind:$beh, ahead:$ahd, stale:$stl, frozen:$fz, frozenAgeSec:$fza, frozenDetail:$fzd, frozenArmed:$fzarm, lastUpdateOk:$luo, lastUpdateAt:$lua, source:$src}' \
      --arg cur "$current" --arg lat "$latest" --arg src "$detail" \
      --arg fz "$frozen_state" --arg fzd "$frozen_detail" \
+     --argjson fzarm "$frozen_armed_json" \
      --argjson fza "${frozen_age:-null}" \
      --argjson beh "$behind" --argjson ahd "$ahead" --argjson stl "$stale" \
      --argjson luo "$last_ok_json" --argjson lua "$last_at_json"

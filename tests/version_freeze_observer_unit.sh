@@ -194,6 +194,109 @@ else
   bad_t "empty record path not handled" "state '$(line "$out" 1)'"
 fi
 
+# --------------------------------------------------------------------- 7b -
+# DIVE-2306: AN UNKNOWN THAT CAN NEVER RESOLVE IS ITS OWN ANSWER.
+#
+# The state alone cannot express the difference between "we have not observed a
+# freeze yet" and "this box cannot take the observation at all". Both print
+# `unknown`, and the second one prints it forever — the alarm is unarmed, and an
+# unarmed alarm reporting `unknown` reads as a monitor doing its job. Line 4
+# says which it is. These arms grade the DISTINCTION, so each pairs an armed
+# case against an unarmed one; a test that only checked the unwritable path
+# would pass against an observer that hard-coded `no`.
+armed_line() { line "$1" 4; }
+
+# Armed: the record is writable, so the clock genuinely started.
+rec="$WORK/armed.json"
+out="$(observe 0.17.1 "$rec" "$NOW")"
+if [[ "$(line "$out" 1)" == unknown && "$(armed_line "$out")" == yes ]]; then
+  ok_t "a first pass that COULD record => unknown but ARMED (the clock really started)"
+else
+  bad_t "first recordable pass did not report armed" "state '$(line "$out" 1)' armed '$(armed_line "$out")'"
+fi
+
+# Unarmed: same absent-record case, but nothing can be written. `update --check`
+# runs as an unprivileged operator and this is its normal condition on a box
+# whose supervisor tick is disabled — the case DIVE-2287 left silent.
+unwritable="$WORK/nowrite"
+mkdir -p "$unwritable"; chmod 555 "$unwritable"
+if [[ -w "$unwritable" ]]; then
+  printf 'skip - unarmed case (running as root: chmod is inert)\n'
+else
+  out="$(observe 0.17.1 "$unwritable/seen.json" "$NOW")"
+  if [[ "$(line "$out" 1)" == unknown && "$(armed_line "$out")" == no ]]; then
+    ok_t "an unrecordable observation => unknown AND UNARMED (never a silent forever-unknown)"
+  else
+    bad_t "unwritable record did not report unarmed" "state '$(line "$out" 1)' armed '$(armed_line "$out")'"
+  fi
+  if grep -qi 'unarmed' <<<"$(line "$out" 3)"; then
+    ok_t "the unarmed detail names the condition rather than only the symptom"
+  else
+    bad_t "unarmed detail does not say so" "detail '$(line "$out" 3)'"
+  fi
+fi
+chmod 755 "$unwritable"
+
+# A readable record that resolves the question is armed by construction — the
+# state came FROM the record, so the record is readable and the reading moves.
+rec="$WORK/armed-frozen.json"; seed 0.17.1 $((NOW - 9 * DAY)) "$rec"
+out="$(observe 0.17.1 "$rec" "$NOW")"
+if [[ "$(line "$out" 1)" == frozen && "$(armed_line "$out")" == yes ]]; then
+  ok_t "a conclusion drawn from a readable record is ARMED"
+else
+  bad_t "frozen reading did not report armed" "state '$(line "$out" 1)' armed '$(armed_line "$out")'"
+fi
+
+# The sharpest unarmed case: the version DID move, and the record cannot be
+# updated to say so. Every future call re-reports the same transition — a
+# monitor wedged on a state it can never leave. It must stay loud in the state
+# AND admit it is unarmed.
+stuckdir="$WORK/stuck"; mkdir -p "$stuckdir"
+seed 0.17.0 $((NOW - 2 * DAY)) "$stuckdir/seen.json"
+chmod 555 "$stuckdir"; chmod 444 "$stuckdir/seen.json"
+if [[ -w "$stuckdir" || -w "$stuckdir/seen.json" ]]; then
+  printf 'skip - wedged-transition case (running as root: chmod is inert)\n'
+else
+  out="$(observe 0.17.1 "$stuckdir/seen.json" "$NOW")"
+  if [[ "$(line "$out" 1)" == moving && "$(armed_line "$out")" == no ]]; then
+    ok_t "a version change that cannot be recorded => MOVING but UNARMED (it will re-report forever)"
+  else
+    bad_t "unrecordable version change did not report unarmed" "state '$(line "$out" 1)' armed '$(armed_line "$out")'"
+  fi
+fi
+chmod 755 "$stuckdir"; chmod 644 "$stuckdir/seen.json"
+
+# The three original lines must keep their exact meaning — the fourth is
+# ADDITIVE, the same rule DIVE-2287 applied to `ahead`/`frozen` one layer up.
+rec="$WORK/additive.json"; seed 0.17.1 $((NOW - 8 * DAY)) "$rec"
+out="$(observe 0.17.1 "$rec" "$NOW")"
+if [[ "$(line "$out" 1)" == frozen && "$(line "$out" 2)" == "$((8 * DAY))" ]] \
+   && grep -q 'has not been observed to change' <<<"$(line "$out" 3)"; then
+  ok_t "lines 1-3 are unchanged by the addition of line 4"
+else
+  bad_t "the additive field disturbed the existing three lines" "$out"
+fi
+
+# --------------------------------------------------------------------- 7c -
+# DIVE-2306 DELIVERY FENCE — structural, like §8 below, and for the same reason:
+# no unit of the observer can express "the reading reaches a human". These are
+# the three consumers the alarm was one hop short of on 2026-07-29.
+if grep -q 'frozenArmed' src/cmd_selfupdate.sh; then
+  ok_t "update --check --json carries frozenArmed"
+else
+  bad_t "update --check does not emit frozenArmed" "an unarmed box cannot be told from a moving one by any JSON consumer"
+fi
+if grep -q 'frozenArmed' src/cmd_supervisor.sh && grep -q 'ahead:\$ahd' src/cmd_supervisor.sh; then
+  ok_t "supervisor --json carries ahead + frozenArmed (the dashboard's only source)"
+else
+  bad_t "supervisor --json is missing ahead/frozenArmed" "the fleet-health panel has no field to render"
+fi
+if grep -q 'DIGEST_UPDATE_F' src/cmd_digest.sh; then
+  ok_t "the digest reads update --check (the signal reaches a human who never opens the board)"
+else
+  bad_t "the digest does not read the freeze signal" "delivery still stops at the board"
+fi
+
 # --------------------------------------------------------------------- 8 --
 # WIRING FENCE, and it is a STRUCTURAL assertion, not a behavioural one — say so
 # rather than let it read as coverage it is not. What it defends is an ordering
