@@ -32,6 +32,13 @@
 #      stale header from a slow runner — measured false three times on 2026-08-10 —
 #      so by default that finding PRINTS as a stale-claim warning and does not red
 #      the run. See the block beside the drift print at the end of this file.
+#      DIVE-3188 DECIDED THIS FLAG'S FUTURE rather than leaving it standing beside a
+#      new verdict: it is KEPT, as a local re-arm for a caller reproducing the old
+#      behaviour by hand, and it is now WATCHED — tests/header_drift_window_unit.sh
+#      refuses any workflow that passes it. "Wired to no caller" was the honest state
+#      but not a safe one, because nothing would have noticed a caller appearing. The
+#      cross-job verdict lives in scripts/tier-cal-window.sh and is the enforcement
+#      path; this exit is deliberately NOT a second one.
 #   6  UNDETERMINED (DIVE-2728). The budget could not be GRADED: the calibration
 #      probe could not run, the runner drew so far outside its clamp that the
 #      scaled cap would license an arbitrarily larger corpus, or (DIVE-2829, under
@@ -957,6 +964,45 @@ if (( ${#drift[@]} )); then
     fi
   fi
 fi
+
+# DIVE-3188. THE CROSS-JOB CARRIER, AND IT IS A LOG LINE RATHER THAN A REPORT FIELD.
+#
+# DIVE-3163 left the count in the report and named the reader it needed: something that
+# can compare the same file ACROSS runners. The report file cannot be that carrier, and
+# the reason is mechanical rather than stylistic — a `--report=` file lives only inside
+# the run that wrote it. scripts/tier-cal-harvest.sh exists BECAUSE of that: it rebuilds
+# reports for the cross-run window by parsing `harness-budget[...]` lines back out of the
+# CI log, which is the one store that already outlives the run. A field written only to
+# the report is a field the window never sees, so the cross-job question would stay
+# unanswerable with the number sitting right there.
+#
+# So the facts go on a line the harvester's contract already matches. The prose block
+# above is unchanged and stays the thing a human reads; this is the same facts in a shape
+# a parser can key on, which is the difference between "the data is in the log" (it
+# already was) and "something reads it" (it did not).
+#
+# PRINTED ON EVERY RUN, INCLUDING A CLEAN ONE, and that is the load-bearing detail. The
+# window counts RECURRENCES ACROSS HISTORY, so a missing field defaulted to zero would
+# manufacture a majority of clean historical samples inside the very instrument built to
+# count them — poisoning the exact statistic, in the direction of "nothing recurs", and
+# looking like a healthy corpus while it did it. An unconditional line makes
+# `header_drift_wrong=0` a GRADED zero and leaves every pre-DIVE-3188 log with no field
+# at all, which is what lets the window exclude those samples instead of scoring them
+# clean. Absent must stay absent; that is only possible if present is unconditional.
+printf '\nharness-budget[%s/%s]: HEADER DRIFT (DIVE-3188) files %d, wrong %d, policy %s\n' \
+  "$TIER" "$LABEL" "${#drift[@]}" "$drift_wrong" "$DRIFT_FATAL"
+for d in "${drift[@]}"; do
+  IFS=$'\t' read -r _dsev _dnm _dclaim _dms <<<"$d"
+  _dclaim_ms=$(awk -v c="$_dclaim" 'BEGIN{printf "%d", c*1000 + 0.5}')
+  # The per-FILE rows are what make the verdict per-file. A summary count cannot answer
+  # "did a DIFFERENT job see THIS SAME file drift" — two jobs each reporting one wrong
+  # file is indistinguishable from one file wrong twice, and only the second is a stale
+  # claim. The name is the key the window joins on.
+  printf 'harness-budget[%s/%s]: HEADER DRIFT FILE %s %s claim %ss measured %ss over %d%%\n' \
+    "$TIER" "$LABEL" "$_dsev" "$_dnm" "$_dclaim" \
+    "$(awk -v m="$_dms" 'BEGIN{printf "%.1f", m/1000}')" \
+    "$(( (_dms - _dclaim_ms) * 100 / _dclaim_ms ))"
+done
 
 if (( ${#failed[@]} )); then
   printf '\n%d harness(es) FAILED:\n' "${#failed[@]}"
