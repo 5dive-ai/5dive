@@ -9428,6 +9428,83 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
       fi
     fi
   fi
+
+  # DIVE-3171 — EVERY GATE THE ORG ROOT FILES REACHES THE HUMAN BY CONSTRUCTION.
+  #
+  # `_gate_route_reviewer` walks UP the chart — reports_to, then the coordinator/root —
+  # skipping any candidate equal to the filer. For the ROOT of the chart BOTH candidates
+  # are the filer, so the walk falls off the end empty and the gate drops to the human
+  # ping. Not intermittently, and not about any one gate's subject: it is every gate the
+  # root ever files. DIVE-2612 already wrote the shape down from the FILER's side (its
+  # warn text: "for the root of the chart the coordinator fallback resolves to
+  # themselves"); this is the routing half of the same fact, which that ticket described
+  # and did not fix. lodar, 2026-08-10, in the third week of it: "why still this goes to
+  # me????? i was complaining for 3 weeks already".
+  #
+  # WHAT MAKES IT INVISIBLE: for every other seat the same code is correct, and the root
+  # is the one seat that files engineering gates while sitting ABOVE the engineering lead.
+  #
+  # THE SAME PREDICATE ON BOTH SIDES OF THE SAME DECISION. DIVE-2099 gave a NAMED agent
+  # STANDING authority over tier-1 engineering approvals, and `_gate_lead_standing_eligible`
+  # already decides whether a given gate is in scope. So `cmd_task_answer` ALREADY knows
+  # this gate is lead-clearable while the router does not — and a gate a lead is ALLOWED
+  # to clear must not be DELIVERED to a human. The predicate is REUSED verbatim rather
+  # than restated: two copies of "is this lead-clearable" are two things that can
+  # disagree, and the dangerous direction of disagreement is the router handing an agent
+  # a gate the answer path will then refuse.
+  #
+  # SEALED SOURCE, NEVER THE CHART. The fallback holder is `_gate_standing_lead` — the
+  # agent named in the constitution, trusted only while the live bytes still match the
+  # digest sealed into the council lineage. `agents_org` is agent-writable on a
+  # NOPASSWD:ALL host, which is exactly why DIVE-2099/2233 anchored authority to the seal;
+  # resolving THIS fallback from the chart would hand back the self-grant path they closed
+  # (re-parent yourself above the root, receive the root's gates). Note the direction the
+  # widening runs: the standing lead can ALREADY clear these gates unrouted (the DIVE-2099
+  # branch ignores `routed_reviewer` entirely), so this moves who is PINGED and shown the
+  # gate, never who may answer it.
+  #
+  # NARROW, AND FAIL CLOSED THREE WAYS — the ticket's negative arm is "do NOT widen this
+  # to route ALL unrouteable gates to the lead":
+  #   1. only when the chart resolves NOBODY. A filer who has a lead keeps that lead, and
+  #      a `decision` the root files (agent-clearable by type already) is untouched.
+  #   2. only when `_gate_lead_standing_eligible` says yes — `approval`, tier exactly 1, a
+  #      POSITIVE engineering classification, minus the tier-2 floor and the deny list. A
+  #      money/secret/brand/customer-box/tier-2 gate filed by the root still reaches the
+  #      human. That is the arm that stops this becoming a way to launder a hard gate past
+  #      a person, and it is why the eligibility predicate is the whole condition rather
+  #      than a piece of it.
+  #   3. only when the seal resolves a plain name that is NOT the filer. Drifted, unsealed,
+  #      no `authority.eng_approval_lead` key, an empty value, no council loader in scope,
+  #      or the root IS the named lead -> nothing -> the gate falls through to the human
+  #      exactly as it does today. Fail closed, same direction as everything it reuses.
+  #
+  # The verifier route wins where it fired: that gate already has an agent routee, so this
+  # is not the "nobody" case.
+  #
+  # `_sr_unrouteable` / `_sr_outcome` exist so the DECLINING branch is countable too.
+  # The three weeks this ticket is about were invisible in the store: an unrouted gate
+  # simply pinged the human and left no row saying a route had been ATTEMPTED and refused.
+  # A fix that only records its successes leaves the next regression with nothing to count
+  # (DIVE-3117's lesson, and its suppression row is the model).
+  local _standing_route=0 _standing_target="" _sr_filer="" _sr_unrouteable=0 _sr_outcome=""
+  if [[ "$_verifier_route" != "1" ]] && declare -F _gate_standing_lead >/dev/null 2>&1; then
+    _sr_filer=$(task_actor "")   # DIVE-2518: the DERIVATION, never the `--from` claim — same line the reviewer resolution below takes, for the same reason (this decides who may later clear).
+    if [[ -n "$_sr_filer" && -z "$(_gate_route_reviewer "$_sr_filer")" ]]; then
+      _sr_unrouteable=1; _sr_outcome=not-standing-eligible
+      local _sr_title; _sr_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
+      # DIVE-2224: ask and title as SEPARATE arguments — pre-joining them lets a
+      # bounded-distance pattern straddle the seam and GRANT on a phantom hit.
+      if _gate_lead_standing_eligible "$type" "$tier" "$ask" "$_sr_title"; then
+        _sr_outcome=no-standing-lead
+        local _sr_lead; _sr_lead=$(_gate_standing_lead 2>/dev/null || printf '')
+        if [[ -n "$_sr_lead" && "$_sr_lead" == "$_sr_filer" ]]; then _sr_outcome=standing-lead-is-filer; fi
+        if [[ -n "$_sr_lead" && "$_sr_lead" != "$_sr_filer" ]]; then
+          _standing_route=1; _standing_target="$_sr_lead"; _sr_outcome=routed
+        fi
+      fi
+    fi
+  fi
+
   local _routable=0
   case "$type" in
     decision) [[ "$tier" != "2" ]] && _routable=1 ;;
@@ -9464,6 +9541,13 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
   [[ "$_discusses_applied" == "1" ]] && _routable=1
   # DIVE-1495: a verifier-route gate is routable by kind (to the verifier agent).
   [[ "$_verifier_route" == "1" ]] && _routable=1
+  # DIVE-3171: the standing-lead fallback is routable BY KIND, for the same reason
+  # eng-ship is — `gate_builder_routing` defaults to OFF, so routable-but-pref-gated
+  # would move the ROUTING byte and still ping the human, which is the entire thing the
+  # ticket is about. And the root filer cannot reach the eng-ship kind to inherit its
+  # bypass: that downgrade only fires when `_es_reviewer` is non-empty, i.e. when a chart
+  # lead sits above the filer, which is precisely what the root does not have.
+  [[ "$_standing_route" == "1" ]] && _routable=1
   # DIVE-3117: there is deliberately NO `_pfr_lead_route && _routable=1` line here.
   # Suppressing the verifier route is the WHOLE change: the gate then takes the
   # SAME path a push-for-review gate on a row with no loop already takes (eng-ship
@@ -9517,6 +9601,23 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
       "task=$ident" "type=$type" "filer=$actor" "verifier=${_vf-}" \
       "routed=${_pfr_dest:-human}" || true
   fi
+  # DIVE-3171: one row per gate whose filer the ORG CHART could not route — recorded
+  # AFTER the `tier_arg=2` / `_needs_human` backstops, so `routed=` is what actually
+  # happened and not what this branch proposed. `outcome=` says which conjunct decided:
+  # `routed` (the seal named a lead and it took the gate), `not-standing-eligible` (the
+  # tier-2 floor / deny list / non-engineering / wrong type — acceptance arm 2, the human
+  # keeps it), `no-standing-lead` (drift, unsealed, absent key — arm 3, fail closed), or
+  # `standing-lead-is-filer` (the root IS the named holder; routing to them would be the
+  # self-clear path). Without this the declining branches are indistinguishable from a
+  # build that never had this code.
+  # DIVE-2054: task-store state for $ident, no channel proof — fenced.
+  if [[ "$_sr_unrouteable" == "1" ]]; then
+    local _sr_routed=human
+    [[ "$_standing_route" == "1" && "$_routable" == "1" ]] && _sr_routed="$_standing_target"
+    _task_store_audit_log "task need org-root standing-route" ok 0 -- \
+      "task=$ident" "type=$type" "tier=$tier" "filer=$_sr_filer" \
+      "outcome=$_sr_outcome" "standing_lead=${_standing_target:-<none>}" "routed=$_sr_routed" || true
+  fi
   if [[ "$_routable" == "1" ]]; then
     # DIVE-1243: `access` routing is intrinsic to the TYPE, so it does NOT wait on
     # the gate_builder_routing pref (which ship-gates the decision/approval/manual
@@ -9528,7 +9629,7 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
     # pref for the same reason eng-ship does. Routable-but-pref-gated would have left
     # answer A moving the TIER while the human still got the ping -- two layers, and
     # only the second one decides who is woken.
-    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_curation" == "1" || "$_internal_ops" == "1" || "$_discusses_applied" == "1" || "$_verifier_route" == "1" || "$_floored_by_title" == "1" ]]; then
+    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_curation" == "1" || "$_internal_ops" == "1" || "$_discusses_applied" == "1" || "$_verifier_route" == "1" || "$_floored_by_title" == "1" || "$_standing_route" == "1" ]]; then
       # DIVE-1495: a verifier-route targets the task's verifier directly; every
       # other kind resolves the filer's lead via the org chart.
       local _reviewer
@@ -9539,13 +9640,31 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
       # Recording the claim and obeying it are different things, and this is the line
       # where they part. Graded by T23, which seeds two DIFFERENT leads so a claim
       # that won would route somewhere visible.
-      if [[ "$_verifier_route" == "1" ]]; then _reviewer="$_route_target"; else _reviewer=$(_gate_route_reviewer "$(task_actor "")"); fi
+      # DIVE-3171: the standing-lead fallback resolves from the SEAL, and only in the
+      # case the chart already answered "nobody" — so it can never re-point a gate the
+      # chart did route.
+      if [[ "$_verifier_route" == "1" ]]; then _reviewer="$_route_target"
+      elif [[ "$_standing_route" == "1" ]]; then _reviewer="$_standing_target"
+      else _reviewer=$(_gate_route_reviewer "$(task_actor "")"); fi
       if [[ -n "$_reviewer" ]]; then
         # Persist the designated reviewer on the row. For approval/manual this is
         # what authorizes agent-<_reviewer> to clear the gate later; for decision
         # it is provenance only (decision is already agent-clearable by type).
-        db "UPDATE tasks SET routed_reviewer=$(sqlq "$_reviewer") WHERE id=${id};"
+        # DIVE-3171: record WHY this reviewer, in the same statement that records WHO.
+        # `cmd_task_answer` reads this to decide whether the clear is stamped `lead:`
+        # or `lead:standing:`, and the two facts must not be able to arrive separately
+        # — a row naming a reviewer with no source is the state this column exists to
+        # abolish. NULL therefore means "a build before this one wrote the name", never
+        # "the route had no source". Sibling to floor_provenance on the tier axis.
+        local _route_prov=chart
+        [[ "$_verifier_route" == "1" ]] && _route_prov=verifier-loop
+        [[ "$_standing_route" == "1" ]] && _route_prov=seal:standing-lead
+        db "UPDATE tasks SET routed_reviewer=$(sqlq "$_reviewer"), route_provenance=$(sqlq "$_route_prov") WHERE id=${id};"
         local _rrole="lead review"; [[ "$_verifier_route" == "1" ]] && _rrole="verifier review"
+        # DIVE-3171: name the SEALED fallback distinctly. "lead review" would read as the
+        # org chart having resolved somebody, and the whole point of this branch is that
+        # it did not — the reader needs to know which source picked this reviewer.
+        [[ "$_standing_route" == "1" ]] && _rrole="standing lead review (org root: no chart lead above the filer)"
         # DIVE-2011: the handoff goes through the SAME delivery assertion as the
         # human ping (task_need_notify dispatches on TASK_GATE_ROUTE_TO), so a
         # routed gate can no longer exit without a delivery verdict or leave the
@@ -12608,8 +12727,35 @@ cmd_task_answer() {
   # stored assignee (the agent that hit the gate — `task need` stamps it) falling
   # back to created_by, the same COALESCE `owner` uses below, so the log still
   # answers "whose gate was this" without the answer feeding the decision.
+  # DIVE-3171 — THE ROUTED BRANCH MUST NOT SWALLOW THE STANDING PROVENANCE.
+  #
+  # This guard was `_lead_clear != 1`, i.e. "standing only gets a say when routing did
+  # not already grant clearance". Correct until DIVE-3171, because a gate whose reviewer
+  # came from the CHART is genuinely a routed clear. But DIVE-3171 routes the org root's
+  # eligible approvals to the SEALED standing lead — so routing now grants clearance to
+  # an agent whose authority came from the constitution, the routed branch fires first,
+  # and the row stamps `lead:<n>` for a clear the seal is the entire reason for. The
+  # authority chain stays intact and the RECORD stops carrying HOW, which is the exact
+  # class that cost three incidents on 2026-08-10 (two unattributed human taps read as
+  # agent self-clears; a census that reported "quinn cleared ZERO gates" and was wrong
+  # by four). `lead:standing:` is the only thing on the row separating "a lead cleared a
+  # gate routed to them" from "a lead cleared it under constitutional standing", and
+  # those are different authorities even when the same name appears in both.
+  #
+  # THE COUNTING ARGUMENT IS WHY IT IS FIXED NOW AND NOT LATER: anyone tallying
+  # `lead:standing:` for a root-filed gate would find it under `lead:` and conclude the
+  # standing path went unused — a silent shift in a number nobody re-derives.
+  #
+  # IT GRANTS NOTHING. The added disjunct only lets the block RUN; every conjunct inside
+  # is unchanged, so `_lead_standing=1` still requires the authenticated actor to BE the
+  # sealed lead and the gate to pass `_gate_lead_standing_eligible`. `_lead_clear` is
+  # already 1 on this path and cannot be raised by reaching here. The only reachable
+  # effect is the label — and it is scoped by `route_provenance` to rows THIS build
+  # wrote, so no historical stamp moves and the counts shift for exactly the population
+  # that was mislabelled.
   local _lead_standing=0
-  if [[ "$_lead_clear" != "1" && "$nt" == "approval" ]]; then
+  local _route_prov_row; _route_prov_row=$(db "SELECT COALESCE(route_provenance,'') FROM tasks WHERE id=${id};")
+  if [[ ( "$_lead_clear" != "1" || "$_route_prov_row" == "seal:standing-lead" ) && "$nt" == "approval" ]]; then
     local _ls_auth _ls_lead _ls_filer
     _ls_auth=$(_gate_authenticated_actor)
     _ls_filer=$(db "SELECT COALESCE(NULLIF(assignee,''), NULLIF(created_by,''), '') FROM tasks WHERE id=${id};")
