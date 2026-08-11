@@ -71,8 +71,14 @@ PYMUT
   fi
   # A mutant that breaks the PARSE reddens every arm for the wrong reason, which
   # would read as a kill while grading nothing.
-  if ! bash -n "$dir/src/cmd_task.sh" 2>/dev/null || ! bash -n "$dir"/src/task/*.sh 2>/dev/null; then
-    bad_t "$name — mutated source still parses" "the substitution produced a syntax error; every arm would red for the wrong reason"
+  # `bash -n a.sh b.sh` parses ONLY a.sh — the rest become positional params and
+  # exit 0 regardless, so this must be one invocation per file (DIVE-3278).
+  local _m _bad_parse=""
+  for _m in "$dir/src/cmd_task.sh" "$dir"/src/task/*.sh; do
+    bash -n "$_m" 2>/dev/null || { _bad_parse="$_m"; break; }
+  done
+  if [[ -n "$_bad_parse" ]]; then
+    bad_t "$name — mutated source still parses" "the substitution produced a syntax error in ${_bad_parse##*/}; every arm would red for the wrong reason"
     return
   fi
   local out rc
