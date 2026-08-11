@@ -43,6 +43,15 @@ has "guard sits after is_known_type" "DIVE-1221/1222: Grok provisioning is FROZE
 # arm whose reverse is undocumented is a one-way door. Both are the kind of
 # comment that gets "tidied" by someone who does not know why it is there.
 has "marker named a speed bump"  "SPEED BUMP, NOT A SECURITY BOUNDARY"
+# DIVE-3185 item 4: the comment must record an owner risk acceptance on a
+# PARTIALLY-satisfied condition, and say WHICH half. A future reader who finds
+# armed customer boxes has to be able to tell "the owner accepted a live risk"
+# from "the freeze's exit condition was met" — those are different facts and
+# only one of them is true. Asserting both halves by name is what stops the
+# distinction being flattened by a later tidy-up.
+has "condition is half met"      "THAT CONDITION IS HALF MET"
+has "names the unmet half"       "ZERO tags and ZERO"
+has "risk acceptance recorded"   "RISK ACCEPTANCE ON A PARTIALLY-SATISFIED CONDITION"
 has "un-arm path documented"     "UN-ARMING"
 has "create-not-run caveat"      'does not mean "recallable"'
 

@@ -1539,18 +1539,34 @@ cmd_create() {
   # precaution we refuse grok here. Every provisioning path (agent create, hire,
   # pack import, clone) funnels through cmd_create, so this blocks all of them.
   # Unfreeze condition (olivia): a VERIFIED xAI client-side patch + a pinnable
-  # version, NEVER the server-side toggle alone. That condition is still UNMET
-  # (re-checked 2026-08-08 for DIVE-2910: no client-side fix through Grok Build
-  # v0.2.121 / 1.0.0 — the upload path ships in every binary and in the
-  # open-source repo, the config.toml disable_codebase_upload key is an opt-in
-  # local override rather than a default-off fix, and xAI's only mitigation
-  # remains its revocable server-side flag of 2026-07-13).
-  # DIVE-2894/2910: the owner (lodar, 2026-08-07 18:07Z) answered the unfreeze
-  # gate "arm" anyway. That is a recorded owner RISK ACCEPTANCE, not a fix and
-  # not a withdrawal of the condition above — so an armed host is a host where
-  # the owner accepted a live, unpatched exfiltration risk. Set the override
-  # only on hosts named by that decision, never to route around the freeze on
-  # your own authority, and never read an armed host as evidence of a patch.
+  # version, NEVER the server-side toggle alone.
+  #
+  # THAT CONDITION IS HALF MET, AND WHICH HALF MATTERS. Read this before you
+  # conclude anything from an armed box (DIVE-2894 source read, 2026-08-10 —
+  # it corrected the 2026-08-08 reading that used to sit here):
+  #   - FIRST HALF, SATISFIED: `upload_session_state` and `upload_full_prompt_txt`
+  #     are genuine client-side STUBS in the current open-source Grok Build
+  #     source — and have been since the first public commit (2026-07-16). So
+  #     they are not a new fix and nothing about xAI's behaviour changed; the
+  #     earlier "no client-side fix through v0.2.121 / 1.0.0" note was wrong.
+  #   - SECOND HALF, NOT SATISFIED: `xai-org/grok-build` has ZERO tags and ZERO
+  #     releases, every commit titled "Synced from monorepo". Nothing ties the
+  #     source we verified to the binary a box actually installs. There is no
+  #     version to pin, and no amount of further code reading closes that gap.
+  #   - STILL UPLOADING on the paths that remain: prompt images, turn results,
+  #     session metadata, and a working-directory `memory.tar.gz`.
+  #
+  # DIVE-2894/2910/3185: the owner (lodar — 2026-08-07 18:07Z for the internal
+  # host, again 2026-08-10 19:17Z for managed customer boxes) answered "arm"
+  # anyway, with the residual above in front of him. That is a recorded owner
+  # RISK ACCEPTANCE ON A PARTIALLY-SATISFIED CONDITION. It is not a fix, not a
+  # pinnable version, and not a withdrawal of the condition — an armed box is a
+  # box where the owner accepted a live, unpatched exfiltration risk.
+  #
+  # So: never read an armed box as evidence of a patch, and never arm one on
+  # your own authority. A marker written by 5dive provisioning is the sanctioned
+  # case and is what that acceptance covers; a marker you placed by hand to get
+  # past this guard is not, and is the thing the sentence below has always meant.
   # The warn below fires on every armed create and is meant to stay noisy.
   #
   # DIVE-3185 — WHAT ARMS IT CHANGED, AND WHY IT IS A FILE AND NOT AN ENV VAR.
