@@ -12,7 +12,22 @@
 # the arms below deliberately include the three "nothing is wrong" shapes that
 # must NOT collapse into each other: transacting, correctly-idle, and
 # never-measured.
-# Run: bash tests/agent_info_supervisor_unit.sh (no root, no network, no db).
+# Run: bash tests/agent_info_supervisor_unit.sh (no root, no network; §12 makes
+# its own temp sqlite store, never the prod board).
+#
+# GRADED BY MUTATION, both sides of the argument list — the §12 arms exist
+# because a pure-renderer harness cannot see the query that feeds it, which is
+# the coverage hole quinn measured on THIS detector's own tests
+# (community/wiki/a-detectors-tests-can-grade-the-branch-and-not-the-read.md).
+# Reds, 2026-08-11, against 88 passing: newest-row ORDER BY reversed 5 ·
+# open-rows narrowed to in_progress 1 · cause json path wrong 2 · per-agent
+# scope dropped 6 · staleness bound removed 3 · tick tolerance removed 5 ·
+# unmeasured folded into unknown 3. One SURVIVOR, reported not papered over:
+# scoping the fleet-heartbeat read to agent='(fleet)' vs any event='heartbeat'
+# row — the writer emits that event for no other agent, so the two queries are
+# the same query today. An arm for it would grade the fixture, not the code.
+# The ORDER BY arm was ADDED after the first draft survived that mutation at
+# full green: one seeded row makes "newest" and "oldest" the same row.
 set -uo pipefail
 
 # shellcheck source=/dev/null
@@ -162,6 +177,122 @@ t "ago 12m"    "12m" "$(_sup_info_ago 720)"
 t "ago 3h"     "3h"  "$(_sup_info_ago 10800)"
 t "ago 4d"     "4d"  "$(_sup_info_ago 345600)"
 t "ago unknown" "?"  "$(_sup_info_ago -1)"
+
+# --- 10. THE NEGATIVE CASE, GRADED (main, at the DIVE-3274 push approval) -----
+#     "A status line that learns to append a warning to everything is the same
+#     defect wearing the other sign, and it is the more likely regression here."
+#     So the healthy readings are asserted for what they must NOT contain, not
+#     only for what they say.
+for arm in OK IDLE; do
+  v="${!arm}"
+  t   "negative case ($arm): verdict is null"       "null" "$(f '.verdict|tostring' "$v")"
+  tnc "negative case ($arm): no NOT TRANSACTING"    "NOT TRANSACTING" "$(f .stateNote "$v")"
+  tnc "negative case ($arm): no warning glyph"      "⚠"                "$(f .stateNote "$v")"
+  tnc "negative case ($arm): supervisor line names no class"  "quota"  "$(f .line "$v")"
+  tnc "negative case ($arm): supervisor line is not an alarm" "no-output" "$(f .line "$v")"
+done
+t   "negative case: a healthy seat's supervisor line is exactly the class + tick age" \
+    "healthy (tick 1m ago)" "$(f .line "$OK")"
+
+# --- 11. A STALE TICK MUST NOT SPEAK FOR THE PRESENT ------------------------
+#     Also main's #2: "If the newest event is older than the detector's own
+#     window, say so rather than printing nothing." The observer stopping is not
+#     the observed being healthy — the whole absence-reads-as-health shape.
+STALE_TICK=$(s true $((NOW-_SUP_INFO_TICK_STALE-1)) 0 $NOW "" "" "" 5 0)
+t   "stale tick, no rows: classification=unobserved, NOT healthy" \
+    "unobserved" "$(f .classification "$STALE_TICK")"
+tc  "stale tick: names the age of the last tick" "ago and nothing has refreshed this" \
+    "$(f .line "$STALE_TICK")"
+STALE_TICK_ROW=$(s true $((NOW-_SUP_INFO_TICK_STALE-1)) $((NOW-_SUP_INFO_TICK_STALE)) $NOW \
+                   quota-exhausted quota-exhausted "old pane text" 5 0)
+t   "stale tick + a recorded row: still unobserved, class not forwarded" \
+    "unobserved" "$(f .classification "$STALE_TICK_ROW")"
+tc  "stale tick: the stale row is still SHOWN, with its own age" "newest recorded row" \
+    "$(f .line "$STALE_TICK_ROW")"
+FRESH_TICK=$(s true $((NOW-_SUP_INFO_TICK_STALE+1)) 0 $NOW "" "" "" 5 0)
+t   "one second inside the staleness bound: healthy is still derivable" \
+    "healthy" "$(f .classification "$FRESH_TICK")"
+
+# --- 12. POSITIVE CONTROL ON THE JOIN (main's #3) ----------------------------
+#     "Asserting the query compiles is not asserting it matched." Everything
+#     above grades the pure renderer with literal arguments — which is exactly
+#     the blind spot quinn measured on this detector's own tests
+#     ([[a-detectors-tests-can-grade-the-branch-and-not-the-read]]): the read is
+#     invisible to a harness that hands the decision its numbers. So these arms
+#     drive sup_info_for_agent over a REAL sqlite store and assert the rendering
+#     CHANGES when a classification is seeded.
+TMPD=$(mktemp -d)
+trap 'rc=$?; rm -rf "$TMPD"; echo "HARNESS-RC=$rc"' EXIT
+export TASKS_DB="$TMPD/tasks.db"
+_SUP_ENABLED_FLAG="$TMPD/supervisor.enabled"; touch "$_SUP_ENABLED_FLAG"
+sqlite3 "$TASKS_DB" "
+CREATE TABLE tasks (id INTEGER PRIMARY KEY, assignee TEXT, status TEXT, kind TEXT,
+                    created_at TEXT, done_at TEXT);
+CREATE TABLE supervisor_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, agent TEXT,
+                    event TEXT, classification TEXT, cause TEXT, prev_classification TEXT,
+                    signals TEXT);
+INSERT INTO supervisor_events (ts,agent,event,classification,signals)
+  VALUES (datetime('now'),'(fleet)','heartbeat','healthy','{}');"
+
+BEFORE=$(sup_info_for_agent seatx)
+t   "join/before: a seat with no rows at all reads unknown, not dry" \
+    "unknown" "$(f .output "$BEFORE")"
+t   "join/before: no verdict" "null" "$(f '.verdict|tostring' "$BEFORE")"
+
+# seed the OUTPUT half: rows held, last close well past the threshold
+sqlite3 "$TASKS_DB" "
+INSERT INTO tasks (assignee,status,kind,created_at,done_at) VALUES
+ ('seatx','in_progress','standard',datetime('now'),NULL),
+ ('seatx','todo','standard',datetime('now'),NULL),
+ ('seatx','done','standard',datetime('now','-30 days'),datetime('now','-${_SUP_T_NO_OUTPUT_DAYS} days','-1 day'));"
+AFTER=$(sup_info_for_agent seatx)
+t   "join/after: the SQL actually matched — output flips to dry" "dry" "$(f .output "$AFTER")"
+t   "join/after: verdict=no-output with no event row at all" "no-output" "$(f .verdict "$AFTER")"
+t   "join/after: open rows counted through the real query" "2" "$(f '.openRows|tostring' "$AFTER")"
+t   "join: the rendering CHANGED (not just the query compiled)" "changed" \
+    "$( [[ "$(f .stateNote "$BEFORE")" != "$(f .stateNote "$AFTER")" ]] && echo changed || echo SAME )"
+
+# a cancel is output too — done_at stamps both terminal states
+sqlite3 "$TASKS_DB" "UPDATE tasks SET done_at=datetime('now') WHERE status='done';"
+t   "join: a recent close clears the dry reading" "ok" "$(f .output "$(sup_info_for_agent seatx)")"
+
+# seed the INHERITED half: an OLD row of a DIFFERENT class first, then the
+# current one. Order matters to the arms below — with a single row seeded,
+# "newest row" and "oldest row" are the same row and an ORDER BY mutation
+# survives at full green. Measured: it did, on the first draft of this harness.
+sqlite3 "$TASKS_DB" "
+INSERT INTO supervisor_events (ts,agent,event,classification,cause,signals) VALUES
+ (datetime('now','-2 days'),'seatx','observe','drift','goal-drift',
+  json_object('detail','STALE ROW — an ORDER BY mutation surfaces this one'));
+INSERT INTO supervisor_events (ts,agent,event,classification,cause,signals) VALUES
+ (datetime('now'),'seatx','observe','quota-exhausted','quota-exhausted',
+  json_object('detail','pane shows a model-capacity refusal: quota exhausted, resets 08-14 13:49 UTC'));
+INSERT INTO supervisor_events (ts,agent,event,classification,signals)
+  VALUES (datetime('now'),'(fleet)','heartbeat','degraded','{}');"
+QROW=$(sup_info_for_agent seatx)
+t   "join: a seeded classification reaches the surface" "quota-exhausted" "$(f .verdict "$QROW")"
+t   "join: read through the real event query, not a literal" "quota-exhausted" \
+    "$(f .classification "$QROW")"
+# main's design note: the classification and the CAUSE are different facts.
+tc  "join: the CAUSE string is carried, not just the class" "resets 08-14 13:49 UTC" \
+    "$(f .detail "$QROW")"
+tc  "join: and it reaches the line the reader sees" "resets 08-14 13:49 UTC" "$(f .line "$QROW")"
+t   "join: output stays honestly ok — the two halves do not contaminate" "ok" "$(f .output "$QROW")"
+tnc "join: the NEWEST row wins — the older class is not the one reported" \
+    "STALE ROW" "$(f .detail "$QROW")"
+t   "join: an older row of another class is not surfaced" "quota-exhausted" \
+    "$(f .classification "$QROW")"
+
+# an agent with no rows, on the same store, must NOT inherit seatx's alarm
+OTHER=$(sup_info_for_agent seaty)
+t   "join: per-agent scoping — a clean seat on the same store stays clean" \
+    "null" "$(f '.verdict|tostring' "$OTHER")"
+t   "join: clean seat reads healthy off the fleet heartbeat" "healthy" "$(f .classification "$OTHER")"
+
+# and an unreadable store is still the fourth state, through the real I/O path
+TASKS_DB="$TMPD/does-not-exist.db"
+t   "join: unreadable store degrades to unmeasured through the I/O half" \
+    "unmeasured" "$(f .output "$(sup_info_for_agent seatx)")"
 
 echo "-- $PASS passed, $FAIL failed --"
 (( FAIL == 0 ))

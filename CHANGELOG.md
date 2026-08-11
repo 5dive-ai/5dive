@@ -35,6 +35,10 @@ supervisor:  quota-exhausted / quota-exhausted — pane shows a model-capacity r
 - **The warning leads with the queue**, not the seat's symptom: the whole cost of the
   incident was the rows stacked behind a seat nobody knew was dark, and the seat itself
   cannot read its own `info` output.
+- **A stale TICK does not speak for the present either.** Past `_SUP_INFO_TICK_STALE`
+  (1h) the overlay reports `unobserved` and names the age instead of deriving `healthy`
+  from an observer that has stopped — the same absence-reads-as-health shape one level up
+  (main, at the DIVE-3274 push approval).
 - `agent list` is unchanged — it is the survey surface, and this is a per-agent drill-down
   (three sqlite reads), deliberately not an N-way fan-out.
 

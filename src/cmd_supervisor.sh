@@ -270,6 +270,17 @@ _sup_output_stats() {  # <name>
 # whose newest row predates the newest heartbeat was looked at and found
 # healthy. No row at all + no heartbeat at all is `unobserved`, which is a third
 # value on purpose — it must not read as either healthy or dry.
+_SUP_INFO_TICK_STALE=3600  # seconds. A tick that has not completed in an hour is
+                           # broken on any sane schedule, and "healthy" derived
+                           # from a dead observer is the absence-reads-as-health
+                           # shape this whole row exists to remove (main, at the
+                           # DIVE-3274 push approval). Past this the overlay
+                           # reports `unobserved` and names the age — the reading
+                           # is not refuted, it is simply no longer current, and
+                           # a surface that cannot tell the difference is the
+                           # defect. Deliberately NOT the tick interval: `info`
+                           # cannot see the cron that drives it, so the bound has
+                           # to be one no real schedule crosses.
 _SUP_INFO_TICK_TOL=120   # seconds. Per-agent rows are written BEFORE the fleet
                          # heartbeat that closes the tick, so a row from the SAME
                          # tick carries an EARLIER ts (measured: 1s). Without a
@@ -339,7 +350,15 @@ _sup_info_status() {
     # The flag gates the whole tick. Whatever sits in the trail is not being
     # refreshed, so it cannot be quoted as a current reading at any age.
     cls="unobserved"; cause=""; detail=""
+  elif (( tick > 0 && now > tick && now - tick > _SUP_INFO_TICK_STALE )); then
+    # The observer itself has stopped. Whatever the trail says — including
+    # nothing — is a reading from a dead instrument, so it cannot be forwarded as
+    # either a class or a clear.
+    cls="unobserved"; cause=""; detail=""; current=false
   elif [[ "$current" != "true" ]]; then
+    # The newest tick looked at this agent and wrote no row. The tick writes an
+    # `observe` row EVERY tick for EVERY non-healthy class, so that silence is a
+    # positive reading and not an absence.
     if (( tick > 0 )); then cls="healthy"; cause=""; detail=""
     else cls="unobserved"; cause=""; detail=""; fi
   fi
@@ -372,6 +391,9 @@ _sup_info_status() {
   elif [[ "$armed" != "true" ]]; then
     sup_line="unobserved — the tick is NOT ARMED on this box, so nothing refreshes this"
     sup_line="${sup_line} (enable: sudo touch ${_SUP_ENABLED_FLAG})"
+  elif (( tick > 0 && now > tick && now - tick > _SUP_INFO_TICK_STALE )); then
+    sup_line="unobserved — the last supervisor tick completed $(_sup_info_ago "$tick_age_s") ago and nothing has refreshed this since"
+    (( row > 0 )) && sup_line="${sup_line}; newest recorded row for this agent: ${rc:-none} ($(_sup_info_ago "$age_s") ago)"
   elif (( tick > 0 )); then
     sup_line="${cls}${cause:+ / ${cause}}${detail:+ — ${detail}}"
     sup_line="${sup_line} (tick $(_sup_info_ago "$tick_age_s") ago)"
