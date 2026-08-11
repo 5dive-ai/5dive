@@ -34,10 +34,15 @@
 # STATE_DIR, FIVEDIVE_GATE_NOTIFY_LOG at a temp file so no prod telemetry is
 # touched. Run: bash tests/gate_route_why_unit.sh (no root, no network).
 #
-# ENV NOTE (DIVE-2007): a resolver reading the ambient identity behaves
-# differently on a CI runner ($USER=runner) than on a dev box ($USER=agent-*).
-# Repro the runner shape before pushing:
+# ENV NOTE — and the correction that cost this harness a REJECT (main2, 2026-08-10).
+# This header used to cite DIVE-2007 and tell you to repro the CI shape with
 #   env -u SUDO_USER -u SUDO_UID USER=runner bash tests/gate_route_why_unit.sh
+# THAT IS NOT A CROSS-SEAT INSTRUMENT, AND HAS NOT BEEN SINCE DIVE-2518: the
+# derivation stopped reading USER and SUDO_* altogether (that env path WAS the
+# forgery it closed), so the command above re-shapes nothing the code consults and
+# still runs as the caller's real uid. It reported 40/40 while this file was green
+# if and only if the runner happened to be agent-dev. The seam below is the only
+# instrument that moves the derived actor.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 set -uo pipefail
@@ -66,6 +71,26 @@ export FIVEDIVE_GATE_NOTIFY_LOG="$NOTIFY_LOG"
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
+
+# --- THE SEAM, ARMED AND GRADED ----------------------------------------------
+# Every `need` below files `--from=dev`. `--from` is PROVENANCE ONLY: since
+# DIVE-2518 the routing AND the why-clause both read the UID DERIVATION
+# (`task_actor`; cmd_task.sh resolves the reviewer the same way), which ignores
+# `--from` by design — "a claim, never an override". So case 2's expected string
+# "main is the lead dev reports to" is one only the DERIVED actor can produce,
+# and before this pin the file was green exactly when the runner's uid happened
+# to be agent-dev. It carries no TIER marker, so it is CORE, and full-sweep runs
+# it on a GitHub runner whose uid is not agent-dev: a red on merge, not a local
+# quirk. Pinning here rather than per-arm keeps the derived actor and the `--from`
+# provenance one coherent caller across every case.
+#
+# The selftest is a GRADED ARM, not a precondition printf, because an
+# impersonation harness that silently stops impersonating turns every arm below
+# it green-and-vacuous — the one failure mode the seam exists to make loud.
+actor_seam_selftest dev \
+  && ok_t "SEAM: the sealed derivation resolves to 'dev' under the pin — the arms below grade the product, not the runner's uid" \
+  || bad_t "the actor seam is INERT" "task_actor did not resolve to 'dev' under actor_seam_as; every routing arm below this line is vacuous"
+actor_seam_as dev
 
 tasks_db_init
 
