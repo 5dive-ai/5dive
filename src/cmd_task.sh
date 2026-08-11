@@ -11924,6 +11924,83 @@ _task_inbox_send() {
   fi
 }
 
+# DIVE-3191: THE CURRENT GATE IS NOT THE WHOLE RECORD.
+#
+# `gate-proof verify` read `tasks` only, and `tasks` holds exactly ONE gate per row.
+# The standard unblock for an unsigned lead clear is to RE-FILE the gate and have a
+# signer clear it — which retires the unsigned closure into `gate_history`. So the
+# workaround that unblocks the push also ERASES it from the tool you would audit
+# with: the row reads an unqualified green forever, with nothing saying a prior
+# clear existed. Measured on DIVE-3170/3136/3113/2808 (DIVE-3176), which is how a
+# proposed sweep would have reported the store healthy.
+#
+# No new store is needed. `gate_history` (lib/tasks_db.sh) already carries
+# need_answered_at / need_answered_by / need_answered_uid / need_answer_sig, and
+# `_gate_closure_verify` is keyed on the task id plus the closure FACTS — so an
+# archived signature re-verifies against the archived facts. A displaced closure
+# that WAS signed therefore reports `valid`, not merely `present`.
+#
+# Two boundaries this must respect, or it reintroduces the defect one level down:
+#   1. A zero count is only CLEAN where the archive covers the row's whole life.
+#      `gate_history_coverage` (DIVE-2133) is an evidence boundary, not a count —
+#      out of coverage, zero means UNKNOWN and the green stays qualified.
+#   2. A gate retired with NO answer (withdrawn / parked / loop-ceiling) is not a
+#      closure. Counting those would over-accuse, which is the mirror of the
+#      under-count this fixes:
+#      community/wiki/a-current-gate-only-read-undercounts-the-census-and-over-accuses-the-ships.md
+#
+# Sets for the caller: _GPH_VERDICT _GPH_ARCHIVED _GPH_CLOSED _GPH_UNSIGNED
+# _GPH_INVALID _GPH_VALID _GPH_STATE _GPH_BASIS _GPH_COVERAGE _GPH_TEXT _GPH_TRAILER
+_gate_proof_history_scan() {
+  local vid="$1"
+  IFS='|' read -r _GPH_ARCHIVED _GPH_COVERAGE _GPH_STATE _GPH_BASIS < <(_gate_history_facts "$vid")
+  _GPH_CLOSED=0; _GPH_UNSIGNED=0; _GPH_INVALID=0; _GPH_VALID=0; _GPH_TEXT=""; _GPH_TRAILER=""
+  local _row _seq _t _a _by _at _uid _sig _ret _retat _vfs _stat _lines=""
+  while IFS= read -r _row; do
+    [[ -n "$_row" ]] || continue
+    IFS=$'\x1f' read -r _seq _t _a _by _at _uid _sig _ret _retat <<<"$_row"
+    # Boundary 2: no answer => it was displaced, never closed. Not a closure.
+    [[ -n "$_at" ]] || continue
+    _GPH_CLOSED=$(( _GPH_CLOSED + 1 ))
+    # Mirror the live path exactly: a secret's answer is NOT in the signed payload.
+    _vfs=""; [[ "$_t" != "secret" ]] && _vfs="$_a"
+    if [[ -z "$_sig" ]]; then
+      _GPH_UNSIGNED=$(( _GPH_UNSIGNED + 1 )); _stat=UNSIGNED
+    elif _gate_closure_verify "$vid" "$_t" "$_vfs" "$_by" "$_at" "$_uid" "$_sig"; then
+      _GPH_VALID=$(( _GPH_VALID + 1 )); _stat=valid
+    else
+      _GPH_INVALID=$(( _GPH_INVALID + 1 )); _stat=INVALID
+    fi
+    _lines+="  #${_seq} ${_t} ${_stat} — answered ${_at} by ${_by:-—}, retired ${_retat} (${_ret})"$'\n'
+  done < <(db "SELECT id||x'1f'||COALESCE(need_type,'')||x'1f'||COALESCE(need_answer,'')||x'1f'||
+      COALESCE(need_answered_by,'')||x'1f'||COALESCE(need_answered_at,'')||x'1f'||
+      COALESCE(CAST(need_answered_uid AS TEXT),'')||x'1f'||COALESCE(need_answer_sig,'')||x'1f'||
+      COALESCE(retired_by,'')||x'1f'||COALESCE(retired_at,'')
+    FROM gate_history WHERE task_id=${vid} ORDER BY id;")
+  if   (( _GPH_UNSIGNED > 0 )); then _GPH_VERDICT="SUPERSEDED-UNSIGNED"
+  elif (( _GPH_INVALID  > 0 )); then _GPH_VERDICT="SUPERSEDED-INVALID"
+  elif [[ "$_GPH_STATE" == complete ]]; then _GPH_VERDICT="clean"
+  else _GPH_VERDICT="UNKNOWN"
+  fi
+  local _cov
+  case "$_GPH_STATE" in
+    complete) _cov="archive covers this row's whole life" ;;
+    partial)  _cov="archive coverage begins ${_GPH_COVERAGE} (${_GPH_BASIS}), so a zero here cannot mean clean" ;;
+    *)        _cov="archive coverage is NOT measured, so a zero here cannot mean clean" ;;
+  esac
+  case "$_GPH_VERDICT" in
+    clean)
+      _GPH_TEXT="history: clean — 0 superseded closures of ${_GPH_ARCHIVED} archived gate(s); ${_cov}"$'\n' ;;
+    UNKNOWN)
+      _GPH_TEXT="history: UNKNOWN — ${_GPH_CLOSED} superseded closure(s) of ${_GPH_ARCHIVED} archived gate(s), all signed and valid; ${_cov}"$'\n'"$_lines" ;;
+    *)
+      _GPH_TEXT="history: ${_GPH_VERDICT} — ${_GPH_CLOSED} superseded closure(s) of ${_GPH_ARCHIVED} archived gate(s): ${_GPH_UNSIGNED} UNSIGNED, ${_GPH_INVALID} INVALID, ${_GPH_VALID} valid; ${_cov}"$'\n'"$_lines" ;;
+  esac
+  if (( _GPH_UNSIGNED > 0 || _GPH_INVALID > 0 )); then
+    _GPH_TRAILER=" — but its ARCHIVE holds ${_GPH_CLOSED} superseded closure(s), ${_GPH_UNSIGNED} unsigned and ${_GPH_INVALID} invalid; read them with '5dive task gate-history'"
+  fi
+}
+
 # DIVE-519: `5dive gate-proof <id|DIVE-N> <approval|secret>` — root-only. Mints a
 # human-origin proof token (RAW on stdout, never a --json envelope) that the
 # trusted answer paths attach as --proof to clear an approval/secret gate: the
@@ -11965,7 +12042,11 @@ cmd_gate_proof() {
       FROM tasks WHERE id=${vid};")
     local _nt _na _nb _nat _nuid _nsig
     IFS=$'\x1f' read -r _nt _na _nb _nat _nuid _nsig <<<"$_row"
-    [[ -n "$_nt" && -n "$_nat" ]] || fail "$E_CONFLICT" "$vident has no answered gate to verify"
+    # DIVE-3191: read the ARCHIVE before the early exit, because the row with no
+    # current answered gate is the same defect one level down — "nothing to verify"
+    # is not "nothing ever happened here".
+    _gate_proof_history_scan "$vid"
+    [[ -n "$_nt" && -n "$_nat" ]] || fail "$E_CONFLICT" "$vident has no answered gate to verify${_GPH_TRAILER}"
     local _vfs=""; [[ "$_nt" != "secret" ]] && _vfs="$_na"
     local _signed=absent _valid=false
     if [[ -n "$_nsig" ]]; then
@@ -11974,15 +12055,27 @@ cmd_gate_proof() {
     fi
     # DIVE-2054: the nonce/signature being verified is itself TASKS_DB state for
     # $vident (not an independent real-world channel/identity fact) — fenced.
-    _task_store_audit_log "gate-proof verify" "$([[ "$_valid" == true ]] && echo ok || echo error)" 0 -- \
-      "task=$vident" "type=$_nt" "signed=$_signed" "valid=$_valid" "uid=${_nuid:-}" "by=${_nb:-}"
+    # DIVE-3191: the audit row carries the history verdict too, or the audit trail
+    # inherits exactly the blind spot this change exists to close.
+    _task_store_audit_log "gate-proof verify" "$([[ "$_valid" == true && "$_GPH_VERDICT" == clean ]] && echo ok || echo error)" 0 -- \
+      "task=$vident" "type=$_nt" "signed=$_signed" "valid=$_valid" "uid=${_nuid:-}" "by=${_nb:-}" \
+      "history=$_GPH_VERDICT" "superseded=$_GPH_CLOSED" "superseded_unsigned=$_GPH_UNSIGNED" \
+      "superseded_invalid=$_GPH_INVALID" "coverage=$_GPH_STATE"
     if (( JSON_MODE )); then
-      ok "gate-proof verify $vident: signed=$_signed valid=$_valid" \
-        '{ident:$i, signed:$s, valid:($v=="true"), uid:$u, by:$b}' \
-        --arg i "$vident" --arg s "$_signed" --arg v "$_valid" --arg u "${_nuid:-}" --arg b "${_nb:-}"
+      ok "gate-proof verify $vident: signed=$_signed valid=$_valid history=$_GPH_VERDICT" \
+        '{ident:$i, signed:$s, valid:($v=="true"), uid:$u, by:$b,
+          history:{verdict:$hv, superseded_closures:($hc|tonumber), unsigned:($hu|tonumber),
+                   invalid:($hi|tonumber), valid:($hg|tonumber), coverage_state:$hst,
+                   coverage_basis:$hbs,
+                   coverage_started_at:(if $hcv=="" then null else $hcv end)}}' \
+        --arg i "$vident" --arg s "$_signed" --arg v "$_valid" --arg u "${_nuid:-}" --arg b "${_nb:-}" \
+        --arg hv "$_GPH_VERDICT" --arg hc "$_GPH_CLOSED" --arg hu "$_GPH_UNSIGNED" \
+        --arg hi "$_GPH_INVALID" --arg hg "$_GPH_VALID" --arg hst "$_GPH_STATE" \
+        --arg hbs "$_GPH_BASIS" --arg hcv "$_GPH_COVERAGE"
     else
       echo "ident:  $vident"; echo "signed: $_signed"; echo "valid:  $_valid"
       echo "uid:    ${_nuid:-—}"; echo "by:     ${_nb:-—}"
+      printf '%s' "$_GPH_TEXT"
     fi
     return
   fi
