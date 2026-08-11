@@ -21,6 +21,13 @@
 #   sudo /usr/local/bin/5dive-refresh-plugins.sh main             # one agent (sans agent- prefix)
 #   sudo /usr/local/bin/5dive-refresh-plugins.sh --restart        # all + restart changed agents
 #   sudo /usr/local/bin/5dive-refresh-plugins.sh --restart dev    # one + restart if it changed
+#   sudo /usr/local/bin/5dive-refresh-plugins.sh --status         # what each FORK plugin is running, vs upstream
+#
+# TWO LINEAGES, ONE SCRIPT (DIVE-3269). The claude-lineage plugin is delivered by
+# the marketplace machinery below; the five FORK plugins are STAGED to
+# /usr/local/lib/5dive/telegram-<rt>, which until DIVE-3269 nothing wrote — see
+# 5dive-stage-fork-plugins.sh for what that cost and the three decisions it settles. `--status` answers "which version is each fork actually running", the
+# question whose absence let two merged rows sit undelivered unnoticed.
 #
 # --restart: after refreshing, bounce any agent whose plugin set actually
 # changed so the new version LOADS (Claude reads plugins once at launch — a
@@ -78,10 +85,12 @@ migrate_marketplace_org() {
 }
 
 RESTART_CHANGED=0
+STATUS_ONLY=0
 agents=""
 for arg in "$@"; do
   case "$arg" in
     --restart) RESTART_CHANGED=1 ;;
+    --status)  STATUS_ONLY=1 ;;
     -*) echo "5dive-refresh-plugins: unknown flag: $arg" >&2; exit 2 ;;
     *) agents="${agents:+$agents }$arg" ;;
   esac
@@ -234,11 +243,52 @@ refresh_agent() {
   prune_plugin_cache "$home"
 }
 
+# DIVE-3269: the FORK lineage is staged by its own script (see its header for the
+# three decisions it settles). It is called here rather than from the cron directly
+# so that BOTH lineages are delivered by one entry point and one --restart pass — a
+# second cron entry is a second thing to forget, and forgetting is this row's defect.
+FORK_STAGE_SH="${FORK_STAGE_SH:-$(dirname "${BASH_SOURCE[0]}")/5dive-stage-fork-plugins.sh}"
+[[ -x "$FORK_STAGE_SH" ]] || FORK_STAGE_SH=/usr/local/bin/5dive-stage-fork-plugins.sh
+
+if (( STATUS_ONLY )); then
+  if [[ -x "$FORK_STAGE_SH" ]]; then "$FORK_STAGE_SH" --status; else
+    echo "5dive-refresh-plugins: --status needs 5dive-stage-fork-plugins.sh (not found)" >&2; exit 2; fi
+  exit 0
+fi
+
 echo "=== $(date -Iseconds) plugin refresh start ==="
 for ag in $agents; do
   echo "--- agent-$ag ---"
   refresh_agent "$ag"
 done
+
+# Which forks moved, and therefore which fork agents need a bounce. The staging
+# script prints `changed: <rt>`; anything else it prints is progress for the log.
+FORK_CHANGED=""
+if [[ -x "$FORK_STAGE_SH" ]]; then
+  while IFS= read -r line; do
+    case "$line" in
+      "changed: "*) FORK_CHANGED="${FORK_CHANGED:+$FORK_CHANGED }${line#changed: }" ;;
+      *) echo "$line" ;;
+    esac
+  done < <("$FORK_STAGE_SH" 2>&1)
+else
+  echo "--- fork plugins: SKIPPED — $FORK_STAGE_SH not present ---" >&2
+fi
+
+# `type` in the registry IS the runtime, and the fork dir is telegram-<type>; a
+# claude-lineage agent is served by the marketplace path above and never matches.
+if [[ -n "$FORK_CHANGED" && -r /var/lib/5dive/agents.json ]] && command -v jq >/dev/null 2>&1; then
+  _fork_restart=""
+  while IFS=$'\t' read -r _name _type; do
+    [[ -n "$_type" && "$_type" != claude && "$_type" != null ]] || continue
+    case " $FORK_CHANGED " in *" telegram-$_type "*) _fork_restart="${_fork_restart:+$_fork_restart }$_name" ;; esac
+  done < <(jq -r '.agents | to_entries[] | "\(.key)\t\(.value.type // "")"' /var/lib/5dive/agents.json 2>/dev/null)
+  if [[ -n "$_fork_restart" ]]; then
+    CHANGED_AGENTS="${CHANGED_AGENTS:+$CHANGED_AGENTS }$_fork_restart"
+    echo "--- fork agents needing a bounce: $_fork_restart ---"
+  fi
+fi
 
 # --restart: bounce only the agents whose plugin set changed, so the new code
 # actually loads. Deferred via systemd-run (--on-active=1 --collect) so the
