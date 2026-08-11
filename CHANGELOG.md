@@ -1,6 +1,138 @@
 # Changelog
 
-## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
+## v0.19.22 — fix(task): `inbox --json` exports `tier`, so /inbox stops showing the founder other people's gates (DIVE-3224)
+
+lodar, 2026-08-11, minutes apart: *"im frustrated some tech asks still go to human
+instead of agent main"* and *"what about 14 gates awaiting you … this still spams my
+inbox every time I press /inbox"*. The second is not the first one lingering. It is a
+separate defect on the display side, and it is one predicate.
+
+Measured that morning: `/inbox` listed **12 gates, 3 of them his** (DIVE-3172 a
+CODEOWNER click, DIVE-3150 an npm token, DIVE-3215 customer comms). The other 9 were
+routed to agent seats — dev, dev2, dev3, cli, main2, quinn — and **each carried a ✅
+apply-the-recommendation button**, so the surface was not merely noisy: it invited him
+to answer questions already addressed to somebody else. DIVE-2093's gate was routed to
+main2 and rendered in the founder's chat with a tap button on it.
+
+`cmd_task_inbox` has known the difference since DIVE-3117 part 2 (a gate with
+`routed_reviewer` set waits on an agent seat) and grew a fourth clause in DIVE-3228
+(a routed `access` gate its lead can now clear). **The telegram plugin never called
+it.** It shelled `task ls --json` and kept every row carrying a `need_type` — "has an
+unanswered gate", not "needs a human".
+
+The old comment says honestly why it drifted, and the reason is this command's fault:
+`inbox --json` withheld `tier`, which the ✅ button path needs to tell a soft gate from
+a hard one. So the plugin reached for a view that had `tier` and rebuilt the filter by
+hand, minus the routing half.
+
+**`tier` is now in the `inbox --json` SELECT** — one field, so the predicate above can
+stay the single copy. The fix deliberately does NOT export `routed_reviewer` /
+`needs_capability` for consumers to re-implement the rule with: that is what produced
+this bug, and DIVE-3228 is the proof it would have drifted again — a plugin-side copy
+written before it would have gone on showing the routed `access` gates it excludes.
+
+A NULL tier ships as an **absent key**, not `tier: null` (`dbfmt -json` omits nulls,
+and jq answers `null` for an absent path either way). Consumers must read both as 2 —
+visible, not auto-clearable — matching this view's own fail-safe direction: showing a
+human one gate too many is recoverable, hiding one is the defect.
+
+New harness `tests/task_inbox_json_tier_unit.sh` (14 arms). Two are armed controls,
+because the obvious versions of these arms pass against a broken build: **T2** asserts
+`tier` reads back per-row rather than as a constant (a uniform `tier: null` would
+satisfy a mere presence check and then hand the consumer's unknown-tier fail-safe the
+entire fleet), and **R0** reproduces the pre-fix `need_type`-only read and shows the
+routed gates DO come back — without it, R4/R5 would be green against a filter that
+never ran.
+
+Plugin side ships separately (5dive-plugins): `/inbox` now sources this view and its
+local filter is deleted. On a host whose CLI predates this change `tier` is simply
+absent, every gate reads as 2, and they route through the `inbox --send` nonce digest —
+fewer inline buttons, never an unreachable gate.
+
+## v0.19.22 — feat(host): `5dive host` — hardened host-remediation verbs under the CLI-root grant an admin agent already holds (DIVE-3221)
+
+A devops seat provisioned at the **highest** isolation tier (`admin`) has full **detection** of the
+box and zero **remediation**: `systemctl show` is unprivileged, so it can read every unit's
+`WorkingDirectory` and `Result`, while `daemon-reload`, writes under `/etc/systemd/system` and
+another user's crontab are all denied. That is the wrong half. lodar found dead `Type=oneshot`
+backup jobs by looking at a screen; the finding was never the hard part.
+
+DIVE-3213 proposed closing it with a fourth isolation tier scoped to `systemctl` + `daemon-reload` +
+`/etc/systemd/system` + `crontab` + `journalctl`. **Each of those four is an independent one-line
+root escape, and three were already on `write_admin_sudoers`'s deliberately-excluded list** (the
+DIVE-1088/2079 comment block): `journalctl` and `systemctl status` page through `less` → `!sh`;
+writing a unit file and reloading is `systemd-run` spelled slowly. The tier would have read
+`host-admin` in `agent info` and meant `root-all`. lodar answered **B**: no tier — build the verbs.
+
+An `admin` agent's grant is `/usr/local/bin/5dive, /usr/local/bin/5dive *`. The trailing `*` covers
+**subcommands that do not exist yet** — measured as the seat, not read off the drop-in:
+`sudo -u agent-ops sudo -n /usr/local/bin/5dive host unit list` returns the CLI's own
+`unknown command: host`, while `sudo -n systemctl daemon-reload` from the same seat returns
+`a password is required`. So these verbs ship remediation with **no sudoers change, no new tier, and
+nothing for the next `agent create` to silently revert** — which was the whole objection to
+hand-editing a drop-in.
+
+```
+5dive host unit list [--pattern=<unit-glob>]
+5dive host unit show --unit=<unit>
+5dive host unit repoint --unit=<u>.service --workdir=<abs-path> [--no-restart]
+5dive host unit revert  --unit=<u>.service [--no-restart]
+5dive host journal --unit=<unit> [--lines=N] [--since=<N>m|<N>h|<N>d]
+5dive host cron show|snapshot|diff --user=<user>
+```
+
+Every verb takes **structured, validated parameters only** — no unit-file content, no shell string,
+no editor, no caller-supplied file path. `repoint` writes one drop-in of fixed shape
+(`<unit>.d/50-5dive-workdir.conf`, one `[Service]` section, one `WorkingDirectory=` line);
+`revert` removes exactly that basename. `crontab` is read-only (`-l -u` only): `crontab -e` for
+another user is an `EDITOR=/bin/sh` escape, and if the target is `claude` that seat is
+`NOPASSWD: ALL`. `--since` is a structured `<N>m|h|d` pair mapped to one of three literal phrases,
+because `journalctl`'s own time grammar is caller text reaching a root process's argv.
+
+**`repoint` refuses a unit that runs as root, and that refusal is the design.** A unit's
+`WorkingDirectory` *is* a code pointer whenever its `ExecStart` carries a relative argument —
+`5dive-api.service` runs `node dist/index.js`, resolved against the cwd. Repointing a root unit at a
+caller-chosen directory is "exec agent-controlled input as root" with two extra steps, which is the
+one thing that turns `cli-root` into `root-all` for **every** admin agent on the box at once. An
+empty `User=` lands on the same branch as the literal `root`, since that is systemd's default. Every
+unit the devops charter named runs non-root (`5dive-api`/`5dive-frontend` as `claude`,
+`5dive-discord-welcome` as `agent-marketing`), so the refusal costs the driver case nothing.
+
+The pager escape that DIVE-1088 excluded those grants *for* is closed **in code**, not by
+convention: all `systemctl`/`journalctl` calls route through two wrappers that pass `--no-pager` and
+pin `SYSTEMD_PAGER`/`PAGER=cat` while dropping `LESSOPEN`, so an inherited environment cannot
+reintroduce it. `tests/host_verbs_unit.sh` pins both the value refusals and the *structural* ones —
+no `eval`, no `sh -c`, no editor, no `crontab` verb but `-l -u`, no raw `systemctl`/`journalctl`
+outside the wrappers — because a value assertion cannot see a new verb someone adds next year.
+
+## v0.19.22 — fix(task): rewriting a row's acceptance criteria is now recorded (DIVE-2812)
+
+`task verifier <id> <agent> --accept=<criteria>` is the only writer of `acceptance_criteria`
+on an existing row. It **replaced** the prior criterion and wrote nothing anywhere: measured
+**zero** `task verifier` rows in the fleet audit log, ever, against **1672** for its audited
+sibling `task set-body` (DIVE-1920, which carries actor/mode/prior_len for exactly this
+reason). So a maker could rewrite the bar they are graded against and leave no trace of who
+did it or what it used to say.
+
+That is also why the field read as **immutable** for months — DIVE-2812 was filed asking for a
+setter that already existed. A mutable value whose mutation leaves no trace is
+indistinguishable from an immutable one to everyone except the person who typed the command.
+
+The remedy is a **record of the edit, not a lock on the field** — a legitimate re-scope has to
+stay possible (an acceptance criterion naming a mechanism that was measured not to exist is its
+own defect), it just must not be silent:
+
+- an accept-write that MOVES the text emits `task verifier set-accept` with the actor, the
+  verifier, `prior_len`/`new_len`, a sha256 of the prior text and the **prior criterion itself**
+  (truncated past 2000 chars, with the hash of the untruncated original alongside), so the bar a
+  row was originally filed under stays recoverable by someone who was not there;
+- re-pointing a grader with no `--accept`, or passing back the identical criterion, writes
+  nothing — those are not edits to the bar, and a row for them would hide the real ones;
+- the command itself now says the criteria CHANGED and echoes the prior text
+  (`priorAcceptanceCriteria`, `acceptanceChanged` in JSON), for the one person who can still
+  catch a wrong overwrite while it is undoable.
+
+## v0.19.22 — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
 
 DIVE-1935's first iteration was rejected, and for the right reason. It added a
 `sudo -n -u claude gh auth token` arm to `_gate_gh_token` justified by *"agents hold
