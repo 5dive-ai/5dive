@@ -20,7 +20,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 START=5dive-agent-start
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/workdir-trust-seed-unit.XXXXXX")"
-trap 'rm -rf "$TMP"' EXIT
+trap 'rc=$?; rm -rf "$TMP"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-3247: the corpus contract requires HARNESS-RC on every exit path, and bash keeps only the LAST trap per signal -- so the tempdir cleanup is FOLDED IN here rather than left in a second EXIT trap that would clobber this one.
 
 fail=0
 check() { if [[ "$2" == "$3" ]]; then echo "ok: $1"; else echo "FAIL: $1 (want=$3 got=$2)"; fail=1; fi; }
