@@ -1156,7 +1156,26 @@ _council_seal_stdin() {
 # council roster — the current seats + live threshold (from the persisted council bench), the
 # founder-veto principal (from genesis), and the sealed lineage head (seq + digest).
 _council_roster() {
-  local dir="$1"
+  local dir="$1"; shift || true
+  # DIVE-2890: `--class=<name>` was SILENTLY ACCEPTED AND IGNORED here (roster took no args at all,
+  # so any flag fell through to the default print). Parse it, and reject anything else rather than
+  # answering a question that was not asked — `roster --help` used to just re-print the roster.
+  local want_class=""
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --class=*) want_class="${a#--class=}" ;;
+      -h|--help)
+        cat <<'ROSTERHELP'
+ 5dive council roster [--class=<ordinary|promote|demote|expel|constitutional>] [--json]
+      The current seats, the per-decision-CLASS pass threshold + quorum resolved against
+      those seats, the founder-veto principal, and the sealed lineage head. --class narrows
+      the table to one class (fails closed on an unknown class).
+ROSTERHELP
+        return 0 ;;
+      *) fail "$E_USAGE" "unknown roster flag: $a (try: 5dive council roster --help)" ;;
+    esac
+  done
   [[ -f "$COUNCIL_GENESIS" ]] || fail "$E_VALIDATION" "the Council has no genesis roster — seed it: sudo 5dive council init --seats=<a:chair,b,c> --threshold=<spec> --veto=<p>"
   # DIVE-1664: derive the roster VIEW from the ROOT-SEALED lineage — the SAME source `promote`/
   # `demote` mutate — so `roster` can never disagree with `log`/the lineage about membership. The
@@ -1174,7 +1193,14 @@ _council_roster() {
     [[ -n "$rthreshold" && "$rthreshold" != "null" ]] && roster_args+=(--threshold-json="$rthreshold")
     [[ -n "$rstamped" ]] && roster_args+=(--seeded-at="$rstamped")
   fi
-  local raw; raw="$(node "$dir/cli.mjs" roster "${roster_args[@]}")" || return $?
+  roster_args+=(--constitution-path="$(_council_constitution_path)")
+  [[ -n "$want_class" ]] && roster_args+=(--class="$want_class")
+  # DIVE-2890: cli.mjs exits 2 with its OWN message on an unknown --class. Mark it reported so the
+  # EXIT backstop in lib/output.sh does not append its generic "exited N without reporting a reason
+  # … this is a bug in the CLI" block over a deliberate, already-explained usage refusal.
+  local raw rrc=0
+  raw="$(node "$dir/cli.mjs" roster "${roster_args[@]}")" || rrc=$?
+  if (( rrc )); then mark_reported; return "$rrc"; fi
   local vprincipal vresolved head_seq head_digest hlen
   vprincipal="$(jq -r '.veto.principal // "none"' "$COUNCIL_GENESIS" 2>/dev/null)"
   vresolved="$(jq -r '.veto.resolved // ""' "$COUNCIL_GENESIS" 2>/dev/null)"
@@ -1187,7 +1213,14 @@ _council_roster() {
   else
     echo "council:   council ($(printf '%s' "$raw" | jq -r '.seatCount') seats)"
     printf '%s' "$raw" | jq -r '.seats[] | "  seat \(.id)\(if .chair then " (chair)" else "" end)"'
-    echo "threshold: $(printf '%s' "$raw" | jq -r '.threshold') to pass, quorum $(printf '%s' "$raw" | jq -r '.quorum') (spec: $(printf '%s' "$raw" | jq -c '.thresholdSpec'))"
+    # DIVE-2890: the per-CLASS table, not the default spec alone. The old single line printed the
+    # ordinary rule unlabelled, so on a constitutional motion it under-reported quorum (4, not 6).
+    echo "thresholds (per decision class, resolved over $(printf '%s' "$raw" | jq -r '.seatCount') seat(s)):"
+    printf '%s' "$raw" | jq -r '.classes[] | "  \(.class | . + (" " * (15 - length)))\(.threshold) to pass, quorum \(.quorum)\(if .requireQuorum then " (require_quorum: EVERY seat must cast)" else "" end) (spec: \(.spec | tojson))"'
+    echo "  ^ genesis-sealed default spec: $(printf '%s' "$raw" | jq -c '.thresholdSpec') (governs the ordinary class)"
+    if _council_constitution_drifted; then
+      echo "  ! WARNING: the live constitution.yaml no longer matches the sealed digest — these rows are the LIVE file, which a convene will REFUSE to enforce (5dive council verify)." >&2
+    fi
     echo "veto:      $(_council_principal_label "$vprincipal")"
     echo "lineage:   seq $head_seq, ${hlen} record(s), head ${head_digest:0:16}…"
   fi

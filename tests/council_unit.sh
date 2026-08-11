@@ -62,6 +62,13 @@ if ! bash "tests/council_cosign_e2e.sh"; then echo "FAILED: tests/council_cosign
 echo "=== tests/council_roster_lineage_e2e.sh"
 if ! bash "tests/council_roster_lineage_e2e.sh"; then echo "FAILED: tests/council_roster_lineage_e2e.sh"; rc=1; fi
 
+# DIVE-2890: roster must report the bar for the decision CLASS a seat is voting in, not the default
+# (ordinary) spec alone — the pre-fix single line under-reported the constitutional quorum as 4 of 6
+# seats when it is ALL 6, wrong in the reassuring direction on the one class that had already failed
+# INQUORATE twice. Also guards `--class=` (was silently accepted and ignored) and `--help`.
+echo "=== tests/council_roster_class_thresholds_e2e.sh"
+if ! bash "tests/council_roster_class_thresholds_e2e.sh"; then echo "FAILED: tests/council_roster_class_thresholds_e2e.sh"; rc=1; fi
+
 # CNCL-15: the constitution-AMENDMENTS WIRING e2e (real 5dive council {init,amend,convene,verify}
 # bundle over an isolated STATE_DIR): genesis seals the v0 digest, amend is a constitutional motion
 # that swaps + hash-chains, and drift fails closed (verify RED + convene escalate). Same self-SKIP.
