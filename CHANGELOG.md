@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
+
+DIVE-2483's gate answer said the preservation notice lands on **stdout**. It lands on **stderr**,
+via the fleet's `warn()`. Six arms were written for that condition and all six were green, because
+every one of them captured `2>&1` — the merge happens *before* the comparison, so the arm set was
+satisfied by either channel and could not fail in the direction of the routing condition it was
+written for. The limit was known and recorded as a sentence; a sentence does not go red.
+
+`tests/task_result_loss_open_row_unit.sh` grows three arms (30 → 33) that capture **one stream per
+arm**:
+
+- **O7** — stderr alone (`2>&1 >/dev/null`) carries the announcement *and* the byte count.
+- **O8** — stdout alone (`2>/dev/null`) does **not**. This is the arm no merged capture can
+  contain, and it is what makes stderr a decision with a guard on it rather than a convention.
+- **O9** — stdout alone is not empty (it still carries the close line), so O8 — a negative arm on a
+  capture — is graded against real output rather than against silence.
+
+**stderr stays the convention and that is deliberate**: an advisory must not corrupt a parsed
+stdout, and moving a fleet-wide `warn()` is not this row's call. What changes is that a future move
+to stdout now reds a named arm instead of silently breaking every caller that parses the close.
+
+Graded by mutation, and the two mutants point opposite ways:
+
+- **Same bytes, different channel** (`warn` → `echo`, so the identical string goes to fd 1) reds
+  **O7 and O8 and nothing else** — 31/2. Every content arm above stays green. That disjointness *is*
+  the finding: no content assertion in this file can see a routing change, which is exactly how the
+  original six passed.
+- **Announcement deleted** reds **O1/O2/O3/O6/O7** — 28/5 — while **O8 stays green**, because a
+  negative arm is satisfied by an absence. Neither arm is sufficient alone; the pair is the guard.
+
+Still open and scoped out on purpose: `task reject` remains an unguarded writer of the result
+column (`src/cmd_task.sh:4235`). That is a design question about accumulating verifier feedback, not
+this gap.
+
 ## Unreleased — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
 
 DIVE-3272 taught the supervisor BOARD to see a seat that is alive and closing nothing. The

@@ -208,6 +208,42 @@ grep -q "PRESERVED, not replaced" <<<"$out" \
   && ok "O6 'task verify' announces the preservation too (DIVE-2624's writer)" \
   || no "O6 verify announces" "${out:0:200}"
 
+# WHICH STREAM — DIVE-2748. Every arm above captures `2>&1`, which MERGES the two
+# channels before comparing, so O1-O3/O6 are satisfied whether the announcement
+# lands on stdout or on stderr: the set above cannot fail in the direction of the
+# routing half of the condition (the gate answer said "stdout"; the code uses the
+# fleet's warn(), which is stderr). That is not a cosmetic gap — a scripted caller,
+# a log pipeline or a CI step that keeps only stdout sees the PRE-FIX bytes, and
+# automated readers are exactly the population still blind.
+#
+# The convention is not the defect: an advisory must not corrupt a parsed stdout,
+# so fd 2 is right and moving a fleet-wide warn() is not this row's call. What was
+# missing is that the limit was a CHANGELOG COMMENT and comments do not go red.
+# These three arms make it a measured fact — capture ONE stream per arm, because
+# any assertion that merges two channels can grade the CONTENT and never the
+# CHANNEL. Keep the merged arms above; they still grade the content.
+id=$(seed in_progress "$THEIRS")
+err_only=$( cmd_task_done "$id" --result="$MINE" 2>&1 >/dev/null )
+grep -q "PRESERVED, not replaced" <<<"$err_only" && grep -qF "${#THEIRS} bytes kept" <<<"$err_only" \
+  && ok "O7 the announcement is carried by STDERR ALONE (2>&1 >/dev/null), byte count and all" \
+  || no "O7 announcement on stderr" "stderr alone: ${err_only:0:200}"
+# The other side of the same fact, and the one a merged arm can never state: the
+# operator sees it, a stdout-only reader does NOT. If someone moves the warn() to
+# stdout this reds, which is the point — the convention becomes a decision with a
+# guard on it rather than a sentence in a changelog.
+id=$(seed in_progress "$THEIRS")
+out_only=$( cmd_task_done "$id" --result="$MINE" 2>/dev/null )
+! grep -q "PRESERVED, not replaced" <<<"$out_only" \
+  && ok "O8 ...and STDOUT ALONE (2>/dev/null) does NOT carry it — stderr is the convention" \
+  || no "O8 announcement absent from stdout" "stdout alone: ${out_only:0:200}"
+# NON-VACUITY for O8, which is a NEGATIVE arm on a capture: an empty $out_only
+# would satisfy it for reasons that have nothing to do with routing (a die before
+# any print, a changed verb name, a broken fixture). Anchor it on what stdout DOES
+# carry, so O8 is graded against real output rather than against silence.
+grep -q 'done' <<<"$out_only" \
+  && ok "O9 stdout alone is NOT empty — it still carries the close line (O8 grades routing, not silence)" \
+  || no "O9 stdout carries the close line" "stdout alone: ${out_only:0:200}"
+
 echo
 echo "DIVE-2483 result-loss-on-open-row guard: passed: $P  failed: $F"
 [ "$F" -eq 0 ]
