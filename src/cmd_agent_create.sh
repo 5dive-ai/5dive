@@ -1539,24 +1539,89 @@ cmd_create() {
   # precaution we refuse grok here. Every provisioning path (agent create, hire,
   # pack import, clone) funnels through cmd_create, so this blocks all of them.
   # Unfreeze condition (olivia): a VERIFIED xAI client-side patch + a pinnable
-  # version, NEVER the server-side toggle alone. That condition is still UNMET
-  # (re-checked 2026-08-08 for DIVE-2910: no client-side fix through Grok Build
-  # v0.2.121 / 1.0.0 — the upload path ships in every binary and in the
-  # open-source repo, the config.toml disable_codebase_upload key is an opt-in
-  # local override rather than a default-off fix, and xAI's only mitigation
-  # remains its revocable server-side flag of 2026-07-13).
-  # DIVE-2894/2910: the owner (lodar, 2026-08-07 18:07Z) answered the unfreeze
-  # gate "arm" anyway. That is a recorded owner RISK ACCEPTANCE, not a fix and
-  # not a withdrawal of the condition above — so an armed host is a host where
-  # the owner accepted a live, unpatched exfiltration risk. Set the override
-  # only on hosts named by that decision, never to route around the freeze on
-  # your own authority, and never read an armed host as evidence of a patch.
+  # version, NEVER the server-side toggle alone.
+  #
+  # THAT CONDITION IS HALF MET, AND WHICH HALF MATTERS. Read this before you
+  # conclude anything from an armed box (DIVE-2894 source read, 2026-08-10 —
+  # it corrected the 2026-08-08 reading that used to sit here):
+  #   - FIRST HALF, SATISFIED: `upload_session_state` and `upload_full_prompt_txt`
+  #     are genuine client-side STUBS in the current open-source Grok Build
+  #     source — and have been since the first public commit (2026-07-16). So
+  #     they are not a new fix and nothing about xAI's behaviour changed; the
+  #     earlier "no client-side fix through v0.2.121 / 1.0.0" note was wrong.
+  #   - SECOND HALF, NOT SATISFIED: `xai-org/grok-build` has ZERO tags and ZERO
+  #     releases, every commit titled "Synced from monorepo". Nothing ties the
+  #     source we verified to the binary a box actually installs. There is no
+  #     version to pin, and no amount of further code reading closes that gap.
+  #   - STILL UPLOADING on the paths that remain: prompt images, turn results,
+  #     session metadata, and a working-directory `memory.tar.gz`.
+  #
+  # DIVE-2894/2910/3185: the owner (lodar — 2026-08-07 18:07Z for the internal
+  # host, again 2026-08-10 19:17Z for managed customer boxes) answered "arm"
+  # anyway, with the residual above in front of him. That is a recorded owner
+  # RISK ACCEPTANCE ON A PARTIALLY-SATISFIED CONDITION. It is not a fix, not a
+  # pinnable version, and not a withdrawal of the condition — an armed box is a
+  # box where the owner accepted a live, unpatched exfiltration risk.
+  #
+  # So: never read an armed box as evidence of a patch, and never arm one on
+  # your own authority. A marker written by 5dive provisioning is the sanctioned
+  # case and is what that acceptance covers; a marker you placed by hand to get
+  # past this guard is not, and is the thing the sentence below has always meant.
   # The warn below fires on every armed create and is meant to stay noisy.
-  if [[ "$type" == "grok" && "${FIVE_GROK_UNFREEZE_VERIFIED:-}" != "1" ]]; then
+  #
+  # DIVE-3185 — WHAT ARMS IT CHANGED, AND WHY IT IS A FILE AND NOT AN ENV VAR.
+  # lodar (2026-08-10 19:17Z) accepted the risk for CUSTOMER boxes too, not just
+  # the one internal host of DIVE-2910. The scope grew; the mechanism therefore
+  # had to change, twice, and both reversals are worth knowing:
+  #   1. NOT an env var swept over SSH to every box (DIVE-3092 forbade it and
+  #      DIVE-3185 briefly re-prescribed it). "Revocable" requires knowing WHICH
+  #      boxes carry it and reversing them reliably. A line in /etc/environment
+  #      on someone else's machine gives you no inventory, no diff, and no
+  #      rollback that is not a second sweep. A release gives you all three.
+  #   2. NOT a bare bundle-versioned relaxation either. 5dive-ai/5dive is public
+  #      and boxes install the newest TAG, so a guard that simply went permissive
+  #      would unfreeze grok for every OSS installer — implementing something
+  #      broader than the decision it claims to implement, and handing an
+  #      unpatched exfiltration path to people who never saw our risk acceptance.
+  # Hence: the guard stays in the bundle (reviewable in a diff, versioned,
+  # revocable by a release) and PERMITS only where a managed-fleet marker written
+  # by OUR provisioning is present. Auditability comes from the release; scope
+  # comes from the predicate. Default is still REFUSE, and the OSS path is the
+  # unmarked path, so nothing about a stranger's install changes.
+  #
+  # THE MARKER IS A SPEED BUMP, NOT A SECURITY BOUNDARY. Say it here because
+  # this is where someone would otherwise assume the opposite and build
+  # something load-bearing on it. `agent create` is root-gated, so anyone who
+  # can create the marker could already have deleted this guard from a public
+  # repo — the marker grants no capability that did not already exist. What it
+  # buys is DELIBERATENESS: a knowing opt-in by someone who read the source is a
+  # categorically different act from a permissive default that reaches everyone
+  # who ran an installer. It does not enforce scope against a determined user
+  # and must never be described as if it does.
+  #
+  # UN-ARMING (the reverse must exist or this is a one-way door — DIVE-3185
+  # acceptance 4): remove the marker; the guard keys on PRESENCE, so `=0` or an
+  # empty file does nothing. Revert the provisioning template BEFORE sweeping
+  # existing boxes, or boxes built in between come up armed. Verify per box with
+  # the zero-cost DIVE-2910 probe (`agent create <n> --type=grok --channels=bogus`
+  # must reach the channels error, not this refusal) through the control plane.
+  # And the load-bearing caveat: un-arming stops the NEXT create and nothing
+  # else. This gate is on CREATE, not on RUN — grok agents already provisioned
+  # keep running. "Revocable" does not mean "recallable".
+  # Full reverse:
+  # community/wiki/un-arming-the-grok-unfreeze-what-the-env-var-can-and-cannot-reverse.md
+  #
+  # FIVE_GROK_ARM_MARKER overrides the path. It is a test seam (it is what lets
+  # tests/grok_freeze_guard_unit.sh grade the GUARD instead of the HOST, in both
+  # directions, after DIVE-3090 caught that harness inheriting a host's arm and
+  # provisioning a live grok agent for 8h16m). It is not a control — see the
+  # speed-bump paragraph above.
+  local grok_arm_marker="${FIVE_GROK_ARM_MARKER:-/etc/5dive/arm/grok-unfreeze}"
+  if [[ "$type" == "grok" && ! -e "$grok_arm_marker" ]]; then
     fail "$E_VALIDATION" "grok provisioning is frozen — unfreeze needs a verified xAI client-side fix and a pinnable version"
   fi
   if [[ "$type" == "grok" ]]; then
-    warn "FIVE_GROK_UNFREEZE_VERIFIED=1 set, bypassing the DIVE-1221 Grok exfiltration freeze. Only valid if a VERIFIED xAI client-side patch is pinned."
+    warn "managed-fleet arm marker present ($grok_arm_marker), bypassing the DIVE-1221 Grok exfiltration freeze. Owner risk acceptance (lodar 2026-08-10), NOT a patch — the xAI upload path is still unfixed and unpinnable."
   fi
   valid_channel "$channels" || fail "$E_VALIDATION" "invalid channels: $channels (none|telegram|discord|dashboard|buzz, comma-separable)"
   # DIVE-856: claude agents are chat-capable in the web dashboard by default.
