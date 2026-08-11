@@ -1,6 +1,86 @@
 # Changelog
 
-## Unreleased — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
+## v0.19.24 — fix(tests): council_roster_class_thresholds_e2e reaches its verdict in CI (DIVE-3282)
+
+`tests/council_roster_class_thresholds_e2e.sh` (DIVE-2890) skipped in *every* probe environment —
+`harness-verdict-union` read it NEVER PROBED, which reds full-sweep on every sha carrying the file
+and froze the release cut.
+
+Cause: `council init` seals genesis on the root gate-proof rail, and the non-root rail resolves
+`5dive` **by name off PATH**. That rail works on the control-plane host (whose sudoers grants
+NOPASSWD to `/usr/local/bin/5dive` and nothing else) and on no GitHub runner, since neither probe
+environment installs the CLI. The harness therefore graded nothing, anywhere, while reporting green.
+
+It now takes whichever rail the environment has — re-exec under passwordless sudo and seal
+in-process (the idiom already carrying `council_veto_e2e.sh` and `constitution_set_e2e.sh`),
+falling back to the by-name rail — and skips only when there is no rail at all. A seal that fails
+while running as root is now a FAIL, not a skip: root has the in-process rail, so that outcome is a
+defect rather than an environment.
+
+No allowlist entry: the harness is wired, and it now runs.
+
+## v0.19.24 — fix(test): refuse sudo when PAM restores host `FIVE_*` policy (DIVE-3096)
+
+`tests/lib/env_isolation.sh` cleared inherited `FIVE_*` variables in the harness shell, but
+`sudo` opened a PAM session that read `/etc/environment` and restored them before privileged
+code ran. A harness could therefore announce that it was isolated while grading host policy.
+
+The shared isolation seam now detects the exact configuration pair — a host `FIVE_*` entry
+plus an active sudo `pam_env` rule that reads `/etc/environment` — and refuses the sudo call
+before privileged code executes. It does not edit host policy or sweep customer boxes
+(DIVE-3092), and it does not rewrite sudo argv, which would break exact-path sudoers grants.
+
+`env_isolation_sudo_unit.sh` carries both positive controls: a clean environment with active
+`pam_env` forwards the original argv byte-for-byte, and a host knob with PAM pointed at a
+different file also passes. Only the conjunction refuses. Disabling the real guard installation
+turns the two DIVE-3096 arms red while both controls stay green.
+
+## v0.19.24 — feat(doctor): `5dive doctor --caps` answers "can THIS seat read GitHub" without guessing (DIVE-3076)
+
+On DIVE-3017 a seat declined to grade two items because it had no authenticated remote
+path. Three true observations, one false conclusion: `sudo -u claude gh auth status` is
+logged in — on **four of nine seats**. Two seats spent a round trip each on a capability
+question, and a verifier nearly handed a grade back to the maker, which is precisely what
+the independence rule exists to prevent.
+
+A wiki page cannot close that, because the failure is *an agent forming a false belief
+about its own capability*: a page only reaches the agent who thinks to look, and the whole
+defect is believing there is nothing to look up. So the answer is derived, per seat, by a
+command the seat already runs.
+
+`5dive doctor --caps` (= `--category=caps`) prints two lines:
+
+```
+── capabilities (per-seat report, not checks) ──
+  seat          dev2 (sudo grant cli-root, runas root)
+  github:read   NO  this seat's sudo grant is cli-root: root only, not arbitrary uids —
+                    there is no `sudo -u claude` path from here, and no password will make
+                    one. Route the read to a seat with runas=any (…).
+  github:write  NO  push identity is per-seat and the claude-uid borrow is RETIRED for the
+                    push class (DIVE-3017) — this report is NOT permission to reopen it.
+```
+
+`github:read` needs **both** arms and says which one failed: the seat's measured
+`sudo.runas` (already carried by `agent_sudo_grant` — it predicted all nine live seats with
+zero misses, and no second measurement was built) **and** a live `sudo -u claude gh auth
+status`, because a permitted uid switch says nothing about whether that token is still
+valid or still scoped. Account and scopes are read off the live call, never off a cached
+string. Roughly half the seats on a box have no path at all, so a `NO` always names its
+reason — a bare NO sends the reader hunting for a password that does not exist.
+
+It rides in `data.capabilities` **alongside** the checks, never inside them (the DIVE-2328
+lesson): the dashboard renders `severity == "ok"` as a passed check in green, and
+`github:write NO` is a correct, permanent, by-design state on every seat. As a passing check
+it would assert a health nobody claimed; as a `warn` it would light up half the fleet
+forever for being configured the way it is meant to be. The one genuinely check-shaped
+state — the uid switch is permitted but the token is dead — does file a `warn`, because
+then the fleet's documented CI-read route is advertised and broken.
+
+Known limits, written down rather than smoothed: a `cli-scoped` seat cannot run `5dive
+doctor` at all, so it cannot reach its own answer here; and the probe reports the
+capability, not the wisdom of using it.
+
+## v0.19.24 — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
 
 A gate reaches the filer's lead only if `_GATE_ENG_SHIP_RX` matches the ask or the row
 title. `gate_builder_routing` is OFF by default, so for an ordinary builder ship gate that
@@ -64,7 +144,7 @@ prose for identifiers.
   `gate_access_lead_clear`, `gate_internal_ops_floor`, `task_needs_human_parity`,
   `task_inbox_json_tier`, `push_unit`, `broker_surface`, + 15 more).
 
-## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
+## v0.19.24 — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
 
 DIVE-1935's first iteration was rejected, and for the right reason. It added a
 `sudo -n -u claude gh auth token` arm to `_gate_gh_token` justified by *"agents hold
