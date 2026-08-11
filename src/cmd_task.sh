@@ -1896,6 +1896,15 @@ cmd_task_ls() {
   [[ -n "$project" ]] && where+=" AND project_key=$(sqlq "${project,,}")"
   if (( JSON_MODE )); then
     local rows
+    # DIVE-3267: `needs_human` is the CLI's own verdict — "this gate is waiting on a
+    # HUMAN" — exported as a computed boolean so a consumer partitions on the answer
+    # instead of rebuilding the rule. Both predicates come from the single-source
+    # helpers above `cmd_task_inbox`; see the contract there before touching either.
+    # NOT a second call to `task inbox --json`: two calls are two snapshots with a
+    # window between them, and a gate answered in that window lands a row in neither
+    # section or in both. One query, one evaluation, one truth.
+    local _gate_open _gate_human
+    _gate_open=$(_task_gate_open_pred); _gate_human=$(_task_human_gate_pred)
     # DIVE-583: emit project_key natively so the dashboard keys off a real field
     # (join name/prefix/lead from `project ls`) instead of deriving project from
     # the ident prefix client-side (fragile; couples to naming + the id≠ident bug).
@@ -1931,7 +1940,8 @@ cmd_task_ls() {
                   THEN CASE WHEN handoff_ack_at IS NOT NULL THEN 'reviewing' ELSE 'delivered' END
                   ELSE NULL END AS handoff_state,
              handoff_ack_at, handoff_delivered_at, handoff_rejected_at,
-             CASE WHEN need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled') THEN 1 ELSE 0 END AS gate_live,
+             CASE WHEN ${_gate_open} THEN 1 ELSE 0 END AS gate_live,
+             CASE WHEN ${_gate_open} AND ( ${_gate_human} ) THEN 1 ELSE 0 END AS needs_human,
              CASE WHEN verify_unavailable = 1 AND verifier IS NULL AND status NOT IN ('done','cancelled') THEN 1 ELSE 0 END AS verify_unavailable,
              CASE WHEN kind='recurring' THEN CASE WHEN COALESCE(on_overlap,'skip')='spawn' THEN (SELECT CASE WHEN COUNT(*) >= COALESCE(tasks.overlap_bound, ${TASKS_OVERLAP_BOUND_DEFAULT:-3}) THEN 'bound '||COUNT(*)||'/'||COALESCE(tasks.overlap_bound, ${TASKS_OVERLAP_BOUND_DEFAULT:-3}) ELSE NULL END FROM tasks i WHERE i.from_template_id=tasks.id AND i.status NOT IN ('done','cancelled')) ELSE (SELECT i.ident FROM tasks i WHERE i.from_template_id=tasks.id AND i.status NOT IN ('done','cancelled') ORDER BY i.id LIMIT 1) END ELSE NULL END AS blocked_by
            FROM tasks WHERE ${where} ${order};")
@@ -12550,6 +12560,47 @@ cmd_task_coordinator() {
   fi
 }
 
+# --- DIVE-3267: the human-gate predicate, in ONE place, for TWO call sites ------
+#
+# `cmd_task_inbox` owns the answer to "is this gate waiting on a HUMAN?". It is the
+# only place that predicate is evaluated, and these two functions exist so that
+# staying true stays cheap: `task ls --json` needs the SAME answer (to partition its
+# "Needs you" section) and must not restate the rule to get it.
+#
+# THIS IS THE FIX FOR THE BUG THAT KEEPS RECURRING, SO READ THE SHAPE BEFORE
+# EDITING. DIVE-3224: the telegram plugin's /inbox filtered on `need_type` alone —
+# "has an unanswered gate", not "needs a human" — and showed the founder 12 gates of
+# which 3 were his, each with a tap-to-apply button on a question routed to an agent
+# seat. DIVE-3267: the SAME wrong predicate was live one command over, in /task's
+# "Needs you" section, in all SIX plugin forks, with a comment above it asserting the
+# premise as justification. Both copies existed because this predicate was reachable
+# only by re-deriving it.
+#
+# So the contract is: **export the VERDICT, never the INPUTS.** `needs_human` on
+# `task ls --json` is the RESULT of the one evaluation below. Exporting
+# `routed_reviewer` / `needs_capability` so a consumer can rebuild the rule is the
+# forbidden move — that is the second copy, and it drifts: the access clause
+# (DIVE-3228) landed the morning after DIVE-3224 was written, so a plugin-side copy
+# authored the day before was already wrong by the time it shipped.
+#
+# And the way to get THIS wrong is to paste the string into the `ls` query instead of
+# calling this. Then there are two copies inside the fix for two copies. Both call
+# sites go through here; `tests/task_needs_human_parity_unit.sh` asserts the two views
+# return the identical ident set, and asserts at source level that the disjunction
+# appears exactly once in this file.
+_task_gate_open_pred() {
+  printf '%s' "need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled')"
+}
+_task_human_gate_pred() {
+  printf '%s' "( COALESCE(routed_reviewer,'') = ''
+          OR CAST(COALESCE(NULLIF(tier,''),'2') AS INTEGER) >= 2
+          OR COALESCE(needs_capability,'') != '' )
+    AND NOT ( COALESCE(need_type,'') = 'access'
+              AND COALESCE(routed_reviewer,'') != ''
+              AND COALESCE(floor_provenance,'') = 'axis=type-default'
+              AND COALESCE(needs_capability,'') = '' )"
+}
+
 cmd_task_inbox() {
   tasks_db_init
   local send=0 channel_proof=""
@@ -12566,7 +12617,7 @@ cmd_task_inbox() {
   # human-gated and blocked-by another task): need set, not yet answered. We
   # still exclude TERMINAL statuses (done/cancelled) — a closed task waits on
   # no one, so a lingering unanswered gate must not leak into the human inbox.
-  local open_where="need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled')"
+  local open_where; open_where=$(_task_gate_open_pred)
   # DIVE-3117 part 2: this view is "what is waiting on a HUMAN", and until now it
   # listed every open gate. A gate with `routed_reviewer` set is waiting on an
   # AGENT seat — the org lead, or a designated reviewer — and `task answer`'s
@@ -12619,13 +12670,7 @@ cmd_task_inbox() {
   # only its successes leaves the next regression with nothing to count, and a
   # hand-maintained inverse is the form that rots silently, since both halves still
   # run and neither errors.
-  local human_pred="( COALESCE(routed_reviewer,'') = ''
-          OR CAST(COALESCE(NULLIF(tier,''),'2') AS INTEGER) >= 2
-          OR COALESCE(needs_capability,'') != '' )
-    AND NOT ( COALESCE(need_type,'') = 'access'
-              AND COALESCE(routed_reviewer,'') != ''
-              AND COALESCE(floor_provenance,'') = 'axis=type-default'
-              AND COALESCE(needs_capability,'') = '' )"
+  local human_pred; human_pred=$(_task_human_gate_pred)
   local human_where="${open_where} AND ${human_pred}"
   local where="$human_where"
   local order="ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, created_at"
