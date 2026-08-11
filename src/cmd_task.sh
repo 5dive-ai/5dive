@@ -971,6 +971,59 @@ _task_internal_subject_reason() {
   return 0
 }
 
+# DIVE-3245 — THE PER-FILER VOLUME CAP: how many low/medium rows this filer has
+# created in the last ROLLING 24 HOURS.
+#
+# ROLLING, NOT CALENDAR, and that is the whole design (main, 2026-08-11). The
+# thing being bound is a BURST, not a mean: one filer put 65 low/medium rows on
+# the board in a day, and the fleet peaked at 163. A calendar-day cap lets a burst
+# straddle midnight and clear itself, which is the shape that produced the damage.
+#
+# WHAT IS EXCLUDED, each for its own reason:
+#   from_template_id  a recurring instance is MATERIALIZED by the scheduler, not
+#                     filed by a person. Counting it fires the cap on a cadence
+#                     nobody chose that day.
+#   kind != standard  templates and their machinery are not filings.
+#   priority          high/urgent never reach here (see the caller) — capping a
+#                     serious finding is the failure direction lodar ruled out.
+# NOT excluded: rows later cancelled or done. The cap is about INFLOW, and a row
+# that was filed and then cancelled cost exactly what this exists to stop.
+_task_filer_low_med_24h() { # <filer> -> count
+  local who="$1"
+  [[ -n "$who" ]] || { printf '0'; return 0; }
+  db "SELECT COUNT(*) FROM tasks
+       WHERE created_by=$(sqlq "$who")
+         AND kind='standard'
+         AND priority IN ('low','medium')
+         AND COALESCE(from_template_id,0)=0
+         AND created_at > datetime('now','-24 hours');" 2>/dev/null
+}
+
+# THE NUMBER, AND WHY IT IS THIS NUMBER. Derived from 30 days of the real board
+# (low/medium, template-materialized and cli/system excluded), by asking how many
+# rows each cap WOULD have refused:
+#
+#     cap   main  olivia  dev  dev3  everyone else
+#      10    327     151   78     3              0
+#      12    313     129   47     1              0
+#      15    282      97   18     0              0     <- chosen
+#      20    227      60    7     0              0
+#
+# 15 is the smallest cap at which NO filer outside the top three is ever touched.
+# Below it the cap starts catching dev3, who is not the problem; above it the
+# heavy filers keep more of the headroom that produced 245 cancelled rows out of
+# 1092. The median filer's worst rolling-24h in that window is 4.5 and ten of
+# fourteen filers never exceed 6, so this leaves the ordinary case untouched by
+# more than 2x while binding all three runaway filers — including dev, which is
+# the point: a cap its author is exempt from is a suggestion.
+#
+# NOT `${_TASK_FILING_DAILY_CAP:-15}`. An env-overridable cap IS the bypass flag
+# this row forbids, just spelled differently and invisible in the record — and the
+# population it exists to slow down is the population that would export it. It is
+# a constant, and the harness trips it by seeding real rows rather than by
+# lowering the bar, which also means the tests exercise the REAL threshold.
+_TASK_FILING_DAILY_CAP=15
+
 # How many of the last N standard rows read as internal machinery. Counted by
 # running the SAME classifier over recent titles rather than storing a column —
 # no schema change, and the count can never disagree with the rule that gates
@@ -1533,6 +1586,55 @@ An internal-machinery finding gets its own ident ONLY if it has ALREADY blocked 
   · fleet-wide override (emergencies)  →  FIVE_FILING_CAP=0"
     fi
   fi
+  # DIVE-3245 — THE PER-FILER VOLUME CAP, beside the ratio cap above rather than
+  # replacing it, because they bind different things and both are needed.
+  # DIVE-2681 caps the PROPORTION of internal-machinery titles fleet-wide; this
+  # caps the VOLUME one filer can add per rolling 24h whatever the titles say.
+  # Measured: main filed 404 low/medium rows in 30 days and almost none of them
+  # classify as machinery, so the ratio cap never saw them.
+  #
+  # THERE IS NO BYPASS FLAG, deliberately (DIVE-3245): "the population this exists
+  # to slow down is exactly the population that would reach for one." The escape is
+  # --priority=high|urgent, which is BETTER than a flag precisely because it is not
+  # a bypass — it is a claim about severity, recorded on the row, visible to
+  # everyone, and falsifiable later. An env kill-switch would be invisible in the
+  # record, which is the property that makes it worth refusing.
+  #
+  # IT STILL FAILS OPEN, which is not a bypass and is the same posture the ratio
+  # cap takes: if the count cannot be read the cap declines to enforce rather than
+  # taking `task add` down. A quota that can break filing is worse than a quota
+  # that occasionally misses.
+  if [[ "$kind" == "standard" && -z "$materialized" && -z "$_cap_exempt_priority" ]] \
+     && _task_filing_cap_store_is_prod; then
+    local _vfiler; _vfiler=$(task_actor "$from") || _vfiler=""
+    # `cli` is the unmeasurable-actor sentinel, not a person with a filing habit.
+    if [[ -n "$_vfiler" && "$_vfiler" != "cli" ]]; then
+      local _v24; _v24=$(_task_filer_low_med_24h "$_vfiler") || _v24=""
+      if [[ "$_v24" =~ ^[0-9]+$ ]] && (( _v24 >= _TASK_FILING_DAILY_CAP )); then
+        # Counted for the same reason the WIP cap counts its trips: whether this
+        # binds constantly is a fact about INFLOW, and it decides whether 15 was
+        # the right number — measured later, rather than re-argued.
+        db "INSERT INTO task_prefs (key,value) VALUES ('filing_volume_cap_trips','1')
+            ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INT)+1 AS TEXT), updated_at=datetime('now');" 2>/dev/null || true
+        # DISTINCT SLUG from the ratio cap's, so `task refusals` and the ledger can
+        # separate "you file too much" from "the board is too full of machinery" —
+        # they have different remedies and one slug would merge the two populations
+        # in exactly the data that decides whether either number is right.
+        # The message NAMES THE ALTERNATIVE rather than only the limit, and points
+        # at the row the finding came from — which is where DIVE-3245 phase 2 will
+        # put findings, so the instruction does not change under people later.
+        policy_refuse "$E_VALIDATION" filing-cap-daily-volume DIVE-3245 "(unfiled) ${title}" \
+          "filing cap: ${_vfiler} has filed ${_v24} low/medium rows in the last 24h (cap ${_TASK_FILING_DAILY_CAP}, rolling).
+REFUSED TITLE (recorded in policy_refusals, not lost): ${title}
+This is a budget on NEW ROWS, not on noticing things. Put it where it already has context:
+  · a finding on work you are doing  →  append it to the BODY of the row you found it on
+  · durable, reusable knowledge      →  community/wiki/ (see the compile-knowledge skill)
+  · someone must ACT and it is serious →  --priority=high (high and urgent are never capped)
+There is no bypass flag. If it is serious enough to need one, it is serious enough to be high."
+      fi
+    fi
+  fi
+
   # DIVE-2794 arm two: the WIP cap, checked here so it shares the DIVE-2681
   # store-identity and refusal machinery rather than adding a second, disagreeing
   # refusal to the same verb.
