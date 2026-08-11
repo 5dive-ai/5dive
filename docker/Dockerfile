@@ -49,7 +49,11 @@ RUN systemctl mask \
 # resolve to local files. Keeps install.sh as the single source of truth for
 # laying down binaries / units / hooks / skills — the Dockerfile doesn't
 # duplicate that logic.
-COPY 5dive 5dive-agent-start 5dive-refresh-plugins.sh 5dive-refresh-skills.sh install.sh projects-CLAUDE.md telegram-agent-CLAUDE.md model-tiering-CLAUDE.md operational-comms-CLAUDE.md /opt/5dive-bundle/
+# Every file install.sh curls must be listed here or the build fails with
+# `curl: (37) Couldn't open file` — this list and install.sh's fetches are two
+# copies of one set, and only the docker-install job notices when they disagree.
+# (DIVE-3269 added 5dive-stage-fork-plugins.sh and this line went red first.)
+COPY 5dive 5dive-agent-start 5dive-refresh-plugins.sh 5dive-stage-fork-plugins.sh 5dive-refresh-skills.sh install.sh projects-CLAUDE.md telegram-agent-CLAUDE.md model-tiering-CLAUDE.md operational-comms-CLAUDE.md /opt/5dive-bundle/
 COPY hooks /opt/5dive-bundle/hooks/
 COPY skills /opt/5dive-bundle/skills/
 COPY systemd /opt/5dive-bundle/systemd/
