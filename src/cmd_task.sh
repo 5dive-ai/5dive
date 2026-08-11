@@ -11078,10 +11078,15 @@ _task_gate_card_record() { # <idents-csv> <chat> <message_id> <via>
   [[ -n "$chat" && "$chat" != "none" && "$chat" != agent:* ]] || return 0
   [[ -n "$mid" && "$mid" != "none" && "$mid" != "0" ]] || return 0
   [[ -n "$via" && "$via" != "none" ]] || return 0
+  # `tasks=` is a COMMA LIST — the re-nag batches several gates into one message,
+  # and each of them gets its own card row for the same (chat, message_id).
+  # Split ONCE with IFS scoped to the `read`, rather than juggling a global IFS
+  # around the loop: `for` expands its list before the first iteration, so any
+  # IFS change inside the body is dead code that reads like it matters.
+  local -a _idents=()
+  IFS=',' read -r -a _idents <<<"$idents"
   local ident tid shape epoch
-  local _IFS="$IFS"; IFS=','
-  for ident in $idents; do
-    IFS="$_IFS"
+  for ident in "${_idents[@]}"; do
     [[ -n "$ident" && "$ident" != "unknown" ]] || continue
     tid=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null) || tid=""
     [[ -n "$tid" ]] || continue
@@ -11093,9 +11098,7 @@ _task_gate_card_record() { # <idents-csv> <chat> <message_id> <via>
     db "INSERT INTO gate_cards (task_id, ident, gate_epoch, ask_shape, chat_id, message_id, via, state)
         VALUES (${tid}, $(sqlq "$ident"), ${epoch}, $(sqlq "$shape"), $(sqlq "$chat"), $(sqlq "$mid"), $(sqlq "$via"), 'live');" \
       >/dev/null 2>&1 || true
-    IFS=','
   done
-  IFS="$_IFS"
   return 0
 }
 
