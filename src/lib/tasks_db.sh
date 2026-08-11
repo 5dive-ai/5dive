@@ -477,6 +477,24 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- written reason so the template re-fires, and this column is what stops a
   -- reassignment from thrashing the row around the fleet tick after tick.
   recurring_stall_escalated_at TEXT,
+  -- DIVE-3218: nudge_escalated_at / nudge_parked_at throttle the two rungs of the
+  -- nudge-threshold ladder (heartbeat). They are stamped ONCE PER ROW, not per
+  -- wake: the ladder's job is to force a state change after N fruitless nudges,
+  -- and a rung that could re-fire every tick would escalate a row to urgent N
+  -- times over. Deliberately NOT cleared when the row is re-queued — the count
+  -- of sessions already burned on this row is a property of the row, not of its
+  -- current status, and re-arming the ladder on every requeue is how a reassign
+  -- turns into a thrash around the fleet (the DIVE-2853 lesson).
+  nudge_escalated_at TEXT,
+  -- DIVE-3218: the nudge COUNT at which rung 1 fired. Rung 2 keys on
+  -- nudge_escalated_n + N, never on 2*N recomputed from the current priority,
+  -- because rung 1's own escalation RAISES the band and a higher band has a
+  -- SMALLER N — so a row escalated at the high threshold of 16 is instantly past
+  -- an urgent 2N of 16 and both rungs fire on the same wake. Storing the count
+  -- makes rung 2 "one more full threshold of fruitless wakes AFTER we escalated",
+  -- which is what the ladder means and is immune to the band moving underneath it.
+  nudge_escalated_n INTEGER,
+  nudge_parked_at TEXT,
   -- DIVE-891: risk-tiered gates (adopted design DIVE-861). tier is set when the
   -- gate is filed: 0 = auto-clear (rec applies immediately, digest line only),
   -- 1 = agent-clearable + 48h TTL auto-applies the recommendation, 2 = hard
@@ -1243,6 +1261,7 @@ _TASKS_ADDITIVE_COLUMNS=(
   'iteration INTEGER' 'maker_agent TEXT' 'handoff_ack_at TEXT' 'task_budget TEXT'
   'handoff_delivered_at TEXT' 'handoff_stale_pinged_at TEXT' 'handoff_rejected_at TEXT'
   'recurring_stall_pinged_at TEXT' 'recurring_stall_escalated_at TEXT'
+  'nudge_escalated_at TEXT' 'nudge_escalated_n INTEGER' 'nudge_parked_at TEXT'
   'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT'
   'gate_filed_by TEXT'
   'secret_key TEXT' 'connector TEXT' 'secret_oob TEXT' 'human_nonce_hash TEXT'

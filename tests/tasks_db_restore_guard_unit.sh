@@ -184,6 +184,15 @@ out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
 # (79 -> 81). Both nullable on purpose: NULL means 'skip' / 'the default bound',
 # so the migration is a no-op for every template predating the column AND an
 # unclassified template stays visibly unclassified.
+# DIVE-3218 added THREE more at once — nudge_escalated_at, nudge_escalated_n and
+# nudge_parked_at, the two rungs of the nudge-enforcement ladder plus the count
+# rung 1 fired at. 81 -> 84.
+#
+# THIS LITERAL WAS RESOLVED BY ARITHMETIC, NOT BY PICKING A SIDE (2026-08-11).
+# Both branches forked at 79 and each was internally right: DIVE-3218 read 82,
+# DIVE-2272 read 81. Taking either verbatim ships a merge that is wrong by the
+# other's column count — which is the failure the NOTE below predicts. 79+3+2=84,
+# then confirmed by running this case against the merged tree.
 # The count is asserted literally on purpose — this case exists to catch a canonical
 # CREATE that silently drops a column, so it must not derive its own expectation from
 # the thing under test.)
@@ -201,8 +210,8 @@ actual=$(sqlite3 "$TASKS_DB" \
     WHERE name IN ('delivery_ref','delivered_at','delivery_ref_iteration','parked_at','park_reason','escalated_at','escalated_by','human_evidence')
     ORDER BY name;" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
 column_count=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM pragma_table_info('tasks');" 2>/dev/null)
-[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "81" ]] \
-  && ok "fresh schema: all 81 columns, including the eight former holes, are present" \
+[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "84" ]] \
+  && ok "fresh schema: all 84 columns, including the eight former holes, are present" \
   || bad "fresh schema: init returned a partial tasks table" "rc=$rc count=$column_count got=[$actual] want=[$required] out=$out"
 
 # --- Case 10 (DIVE-2197): migrate arm still rejects a failed ALTER ------------
