@@ -43,7 +43,7 @@
 # asks of each statement whether the substitution's rc can become the statement's.
 #
 # Usage: scripts/scan-trailing-conditional.sh [--call-sites] [file ...]
-#        (default file set: src/*.sh src/lib/*.sh src/council/*.sh scripts/*.sh
+#        (default file set: src/*.sh src/lib/*.sh src/task/*.sh src/council/*.sh scripts/*.sh
 #         plus the customer-facing runners)
 # Exit 0 = nothing found, 1 = offenders printed to stdout, 2 = could not scan.
 set -uo pipefail
@@ -89,7 +89,7 @@ if (( ${#files[@]} == 0 )); then
   # ships from elsewhere. An ABSENT default is not the same event as an
   # UNREADABLE argument: the caller naming a file it cannot read is exit 2.
   files=()
-  for f in src/*.sh src/lib/*.sh src/council/*.sh scripts/*.sh install.sh update.sh build.sh; do
+  for f in src/*.sh src/lib/*.sh src/task/*.sh src/council/*.sh scripts/*.sh install.sh update.sh build.sh; do
     [[ -r "$f" ]] && files+=("$f")
   done
   shopt -u nullglob
