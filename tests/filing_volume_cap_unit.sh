@@ -70,18 +70,57 @@ _cap_under_env=$( SRC="$SRC" _TASK_FILING_DAILY_CAP=999 bash -c '
   printf "%s" "$_TASK_FILING_DAILY_CAP"' 2>/dev/null )
 chk "the cap is a CONSTANT: a hostile env value does NOT raise it" "15" "$_cap_under_env"
 
-seed() { # <filer> <n> <priority> [age-hours]
-  local who="$1" n="$2" pri="$3" age="${4:-1}" i
+# ---- BECOMING A FILER, BY UID AND NOT BY ARGV ------------------------------
+# DIVE-3245 it.2. The first cut of this harness drove every arm through `--from`,
+# which is THE SAME DOOR THE BYPASS USED — so a suite that was green end to end
+# could not see that one fresh `--from` token filed unlimited rows. A harness that
+# reaches the rule the way the exploit does cannot grade the exploit.
+#
+# So a fixture filer is now a UNIX PRINCIPAL: pin the two seams the resolver reads
+# (`_gate_caller_uid`, `_gate_passwd_stream`, the DIVE-2518/1413 pattern already
+# used by tests/gate_sudo_uid_forge_unit.sh) and let the real derivation ladder run.
+# The names are deliberately NOT registered agents, so the registry rung declines
+# and the `agent-*` passwd rung answers — deterministic on any host, and it means
+# these arms exercise the shipped ladder rather than a stub of it.
+AS_UN=""; AS_UID=""
+_gate_caller_uid() { printf '%s' "${AS_UID:-$EUID}"; }
+_gate_passwd_stream() {
+  [[ -n "$AS_UN" && -n "$AS_UID" ]] && printf '%s:x:%s:%s::/home/%s:/bin/bash\n' "$AS_UN" "$AS_UID" "$AS_UID" "$AS_UN"
+  printf '%s\n' "$(</etc/passwd)"
+}
+declare -A _FILER_UID=(); _NEXT_UID=90001
+as_filer() { # <board-name> — become the unix principal that DERIVES to this name
+  local who="$1"
+  [[ -n "${_FILER_UID[$who]:-}" ]] || { _FILER_UID[$who]=$_NEXT_UID; _NEXT_UID=$((_NEXT_UID+1)); }
+  AS_UN="agent-$who"; AS_UID="${_FILER_UID[$who]}"
+}
+# Liveness on the seam itself: if this ever stops deriving what it claims to, every
+# arm below is measuring nothing, and it would do so SILENTLY.
+chk "the fixture seam really derives the board name from the uid" "heavy" \
+    "$( as_filer heavy; task_actor "" )"
+
+seed() { # <derived-filer> <n> <priority> [age-hours] [created-by-claim]
+  # Seeds stamp BOTH columns the way `task add` does: `created_by` is the claim
+  # (defaulting to the filer when there is none) and `derived_actor` is the measured
+  # truth. A seed that wrote only `created_by` could not tell the two apart, which
+  # is the whole question this file now grades.
+  local who="$1" n="$2" pri="$3" age="${4:-1}" claim="${5:-$1}" i
   for (( i=0; i<n; i++ )); do
-    db "INSERT INTO tasks (title,body,priority,assignee,created_by,kind,status,created_at)
-        VALUES ('seeded row $who $i','','$pri','$who','$who','standard','todo',
+    db "INSERT INTO tasks (title,body,priority,assignee,created_by,derived_actor,kind,status,created_at)
+        VALUES ('seeded row $who $i','','$pri','$claim','$claim','$who','standard','todo',
                 datetime('now','-${age} hours'));" >/dev/null 2>&1
   done
 }
-add_as() { # <filer> <priority> <title> -> rc, output on stdout
-  ( JSON_MODE=0; cmd_task_add "$3" --priority="$2" --from="$1" ) 2>&1
+# add_as <derived-filer> <priority> <title> [claim]
+# With no <claim> the invocation carries no `--from` at all. With one, the claim and
+# the derivation DISAGREE on purpose — that disagreement is the exploit, and it is
+# now something the harness can express instead of something it was blind to.
+add_as() {
+  ( JSON_MODE=0; as_filer "$1"
+    if [[ -n "${4:-}" ]]; then cmd_task_add "$3" --priority="$2" --from="$4"
+    else cmd_task_add "$3" --priority="$2"; fi ) 2>&1
 }
-rc_of() { ( JSON_MODE=0; cmd_task_add "$3" --priority="$2" --from="$1" ) >/dev/null 2>&1; printf '%s' "$?"; }
+rc_of() { add_as "$@" >/dev/null 2>&1; printf '%s' "$?"; }
 
 # ---- a filer at a NORMAL day's volume is untouched --------------------------
 # The median filer's worst rolling-24h on the real board is 4.5, and ten of
@@ -138,6 +177,62 @@ chk "template-materialized rows do NOT count toward their creator's cap" "0" \
 # files freely, which proves those refusals came from the rule, not the fence.
 chk "off the shared board the cap declines to enforce" "0" \
     "$( FIVEDIVE_PROD_TASKS_DB="$TMP/not-the-board.db" rc_of heavy medium 'off-board filing' )"
+
+# ---- THE KEY, NOT THE RULE (DIVE-3245 it.2) ---------------------------------
+# Everything above this line perturbs the RULE — threshold, window, priority,
+# template. All of it was green at a9618e4 and the cap still had a bypass, because
+# the rule was never the weak part: the KEY was. `task_actor "$from"` returns the
+# CLAIM, so the count and the stamp agreed with each other and neither agreed with
+# reality. These arms grade the axis nobody thought to grade.
+#
+# `heavy` is at the cap from the arms above.
+chk "a FRESH --from does NOT start a fresh budget (the reproduced bypass)" "$E_VALIDATION" \
+    "$(rc_of heavy medium 'one argv token, unlimited rows' heavy-2)"
+chk "and the refusal names the DERIVED filer, not the claim" "1" \
+    "$(add_as heavy medium 'named by derivation' heavy-2 | grep -c 'heavy has filed')"
+chk "--from=cli does not buy the unmeasurable-actor exemption" "$E_VALIDATION" \
+    "$(rc_of heavy medium 'claiming the sentinel' cli)"
+chk "--from=<a real quiet agent> does not launder an over-budget filer" "$E_VALIDATION" \
+    "$(rc_of heavy medium 'borrowing a quiet name' quiet)"
+
+# The inverse, and it is a DIFFERENT claim: the cap must key on the derivation
+# rather than merely also-consult it. A filer who has personally filed nothing is
+# untouched even while CLAIMING the name of a filer who is at the cap.
+chk "the count follows the DERIVATION, not the claim: a fresh filer claiming 'heavy' files fine" "0" \
+    "$(rc_of newcomer medium 'my first row today' heavy)"
+
+# A uid-less relay principal (`council`, `telegram`) can only ever be NAMED, so its
+# rows carry created_by=<principal> and derived_actor=<the seat that ran it>. The
+# quota charges the seat — that is the entity it exists to bind, and it is the
+# COALESCE precedence in _task_filer_low_med_24h stated as a behaviour.
+seed relayer "$CAP" medium 2 council
+chk "rows filed as a relay principal are charged to the SEAT that ran them" "$E_VALIDATION" \
+    "$(rc_of relayer medium 'still my budget' council)"
+
+# Rows predating the derived_actor column have no derivation recorded. Dropping
+# them would hand every filer on the board an empty budget the day this ships, so
+# created_by is the fallback — the only evidence those rows have.
+seed legacy "$CAP" medium 2
+db "UPDATE tasks SET derived_actor=NULL WHERE created_by='legacy';" >/dev/null 2>&1
+chk "pre-column rows (derived_actor NULL) still count, via created_by" "$E_VALIDATION" \
+    "$(rc_of legacy medium 'a row on a legacy board')"
+
+# The sentinel exemption is KEPT and is now honest: `cli` means the uid genuinely
+# did not resolve to a board actor (root, a build bot, a uid absent from passwd) —
+# a state nothing can claim its way into. Derive as root and the exemption holds.
+seed cli "$CAP" medium 2
+chk "a genuinely unmeasurable actor is still exempt (derived cli, not claimed)" "0" \
+    "$( AS_UN=""; AS_UID="0"; ( JSON_MODE=0; cmd_task_add 'a root cron row' --priority=medium ) >/dev/null 2>&1; printf '%s' "$?" )"
+
+# ---- loop scaffolding does not spend its author's budget --------------------
+# `task loop` INSERTs a run parent plus one row per step directly, at medium and
+# kind=standard, so they never reach the `--materialized` exemption. Uncounted:
+# one decision produces N rows and a five-step loop would burn a third of the
+# author's day. The marker is the same one `task loop` itself queries by.
+seed looper "$CAP" medium 2
+db "UPDATE tasks SET body='[[5dive-loop:work]]' WHERE created_by='looper';" >/dev/null 2>&1
+chk "loop-materialized rows do NOT count toward their author's cap" "0" \
+    "$(rc_of looper medium 'a real filing on a loop lane')"
 
 printf -- '-----\nRESULT: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

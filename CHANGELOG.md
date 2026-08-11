@@ -1,5 +1,55 @@
 # Changelog
 
+## Unreleased — fix(task): the filing cap counted a CLAIM, so `--from` was the bypass flag it forbids (DIVE-3245)
+
+v0.19.0 shipped the per-filer filing cap with *"there is no bypass flag"* as its first
+design rule, and argued the point well enough to delete `${_TASK_FILING_DAILY_CAP:-15}`
+on the grounds that an env-overridable cap **is** the bypass spelled differently. Then it
+keyed the count on `task_actor "$from"` — and `task_actor` returns **the claim** whenever
+one is supplied (the DIVE-2518 epoch). Measured by quinn on a fixture declared prod, one
+filer seeded to exactly the cap:
+
+| invocation | rc | outcome |
+|---|---|---|
+| `--from=heavy` | 3 | refused — the arm the harness graded |
+| `--from=heavy-2` | 0 | **FILED** — one argv token, unlimited rows |
+| `--from=cli` | 0 | **FILED** — the unmeasurable-actor sentinel was claimable |
+
+`filing_volume_cap_trips`, which v0.19.0's own ship note called *"the evidence"*, read
+zero the entire time the cap was being walked around.
+
+- **The count keys on the DERIVED actor.** `task_actor ""` at the enforcement site, and
+  `COALESCE(NULLIF(derived_actor,''), created_by)` in the counting query — both halves,
+  because either one alone re-opens the hole from the other side. `created_by` is
+  untouched and still stamps the claim: only the count key moved, so a uid-less relay
+  principal (`council`, `telegram`) keeps its name on the row while the **seat that ran
+  the process** is the one charged. The `cli` exemption is kept and is now derived rather
+  than claimable, so it means what it says.
+- **The convention was already written down, beside the function.** `tasks_db.sh`: *"Sites
+  that DECIDE rather than record call `task_actor "" ` explicitly."* Recording sites want
+  the claim; deciding sites want the derivation. A quota decides. Recording sites
+  outnumber deciding ones roughly 40:1, which is why the wrong call is always the one
+  nearest to hand.
+- **Loop scaffolding stops spending its author's budget.** `task loop` INSERTs its run
+  parent and every step directly at medium/standard, so those rows never reached the
+  `--materialized` exemption: a five-step loop silently burned a third of a day. Excluded
+  by the same `_LOOP_MARK` predicate `task loop` itself queries by — defaulted, not read
+  bare, because an unset expansion would leave `NOT LIKE '%:%'` and turn the cap off
+  without failing. (Flagged by quinn as not blocking; it is the row's own named failure
+  condition, *"counting rows the filer did not create"*.)
+- **The mutation suite now perturbs the KEY, not only the rule.** M1-M4 (threshold,
+  window, priority, template) were all green at `a9618e4` while the bypass was live,
+  because every arm drove the cap through `--from` — the same door the bypass used. M5
+  restores the defect exactly and reds the new arm **while the control stays green**: an
+  over-budget filer with no `--from` is still refused, so the cap presents as perfectly
+  healthy. M6 reverts the query side, M7 the loop exclusion. Unit 25/0, mutation 29/0.
+
+**The second-order lesson, and it is the transferable one:** a green mutation suite proves
+the arms are wired to the logic they grade. It says nothing whatever about an axis no
+mutation moves — and a harness that reaches the rule the way the exploit does cannot grade
+the exploit. Fixture filers are now unix principals (pinned uid + passwd seam) rather than
+argv strings, so the derivation ladder under test is the shipped one.
+
 ## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
 
 DIVE-1935's first iteration was rejected, and for the right reason. It added a

@@ -1005,14 +1005,43 @@ _task_internal_subject_reason() {
 #                     serious finding is the failure direction lodar ruled out.
 # NOT excluded: rows later cancelled or done. The cap is about INFLOW, and a row
 # that was filed and then cancelled cost exactly what this exists to stop.
-_task_filer_low_med_24h() { # <filer> -> count
+# <derived-filer> -> count. KEYED ON THE DERIVATION, NOT ON `created_by` (DIVE-3245
+# it.2). `created_by` is the CLAIM when `--from` supplied one (the DIVE-2518 epoch),
+# so counting it made the count agree with the stamp and disagree with reality: one
+# fresh `--from` token started a fresh budget. `derived_actor` is measured from the
+# uid and no argv can move it, so it is the only column a quota can honestly count.
+#
+# COALESCE, not a bare compare, for TWO populations and they are not the same one:
+#   · rows filed before the `derived_actor` column existed — NULL, no derivation was
+#     ever recorded, and `created_by` is the best evidence there is. Dropping them
+#     would hand every filer an empty budget on the day this ships.
+#   · rows a uid-less relay principal filed (`council`, `telegram`) carry BOTH, and
+#     the derivation wins — those are charged to the seat that really ran the process,
+#     which is the entity a quota is trying to bind.
+# NULLIF because a written-but-empty string is not a recorded derivation.
+_task_filer_low_med_24h() { # <derived-filer> -> count
   local who="$1"
   [[ -n "$who" ]] || { printf '0'; return 0; }
+  # LOOP SCAFFOLDING IS MATERIALIZATION, NOT FILING (quinn, grading it.1 — flagged
+  # not blocking, fixed here because it is the row's own named failure: "counting
+  # rows the filer did not create"). `task loop` INSERTs its run parent and every
+  # step directly (:6979, :7003) at priority medium, kind standard — so they never
+  # reach the cap's own `--materialized` exemption and a five-step loop silently
+  # spent a third of its author's daily budget. One decision, N rows, same shape
+  # the WIP cap already exempts by name.
+  #
+  # `_LOOP_MARK` is the established discriminator for exactly these rows (:7043,
+  # :13735), and it is DEFAULTED rather than read bare: it is assigned further down
+  # this file, and an unset expansion here would leave `NOT LIKE '%:%'`, which
+  # excludes nearly every row on the board and turns the cap off without failing.
+  # A control must not have a silent off state, so the fallback is the literal.
+  local loopmark="${_LOOP_MARK:-[[5dive-loop}"
   db "SELECT COUNT(*) FROM tasks
-       WHERE created_by=$(sqlq "$who")
+       WHERE COALESCE(NULLIF(derived_actor,''), created_by)=$(sqlq "$who")
          AND kind='standard'
          AND priority IN ('low','medium')
          AND COALESCE(from_template_id,0)=0
+         AND body NOT LIKE '%' || $(sqlq "$loopmark") || ':%'
          AND created_at > datetime('now','-24 hours');" 2>/dev/null
 }
 
@@ -1623,8 +1652,26 @@ An internal-machinery finding gets its own ident ONLY if it has ALREADY blocked 
   # that occasionally misses.
   if [[ "$kind" == "standard" && -z "$materialized" && -z "$_cap_exempt_priority" ]] \
      && _task_filing_cap_store_is_prod; then
-    local _vfiler; _vfiler=$(task_actor "$from") || _vfiler=""
+    # KEY ON THE DERIVATION, NOT THE CLAIM (DIVE-3245 it.2, quinn's reject).
+    # `task_actor "$from"` returns the CLAIM whenever one is supplied, so this line
+    # WAS the bypass flag the row's first failure condition forbids — spelled as an
+    # argv token instead of a flag, which is worse, because nothing named it.
+    # Reproduced at a9618e4 on a fixture declared prod, filer seeded to exactly the
+    # cap: `--from=heavy` rc 3 refused, `--from=heavy-2` rc 0 FILED, and
+    # `filing_volume_cap_trips` — the counter the ship note called "the evidence" —
+    # stayed at zero while the cap was walked around.
+    #
+    # The convention was already written down and this was the site that needed it,
+    # in tasks_db.sh beside `task_actor` itself: "Sites that DECIDE rather than
+    # record call `task_actor \"\"` explicitly." Recording sites want the claim (a
+    # uid-less principal like `council` can only ever be NAMED). A quota decides.
+    # `created_by` is untouched at :1798 and still stamps the claim — only the count
+    # key moves, so provenance keeps its vocabulary and the quota stops taking argv.
+    local _vfiler; _vfiler=$(task_actor "") || _vfiler=""
     # `cli` is the unmeasurable-actor sentinel, not a person with a filing habit.
+    # It is now DERIVED (root, a build bot, a uid absent from passwd) rather than
+    # claimed, which closes the second half of the same hole: `--from=cli` used to
+    # reach this skip and file freely.
     if [[ -n "$_vfiler" && "$_vfiler" != "cli" ]]; then
       local _v24; _v24=$(_task_filer_low_med_24h "$_vfiler") || _v24=""
       if [[ "$_v24" =~ ^[0-9]+$ ]] && (( _v24 >= _TASK_FILING_DAILY_CAP )); then

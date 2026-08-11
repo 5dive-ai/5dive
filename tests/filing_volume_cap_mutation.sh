@@ -3,9 +3,15 @@
 #
 # DIVE-3245 CONNECTION PROOF. main's gate answer: "THE MUTATION ARM IS THE
 # DELIVERABLE, not the cap. A cap that never fires and a cap that fires on
-# everyone both present as no complaints." So this disconnects the cap four ways
+# everyone both present as no complaints." So this disconnects the cap seven ways
 # with syntax-valid source mutations and proves the unit harness NOTICES each one
 # — and, just as important, that the mutation reds only the arms it should.
+#
+# M1-M4 perturb the RULE; M5-M7 perturb the KEY AND THE COUNT. That split is not
+# cosmetic. The first four were all green at a9618e4 while the cap had a bypass,
+# because every one of them drove the cap through `--from` — the same door the
+# bypass used. A mutation suite proves the arms are wired to the logic they grade;
+# it says nothing whatever about an axis no mutation moves (DIVE-3245 it.2).
 #
 # WHY THE CONTROL HALF MATTERS. A mutation that reds almost every arm is usually a
 # BROKEN HARNESS, not a strong result: if the mutated source fails to load, every
@@ -29,7 +35,7 @@ set +e
 
 # ---- baseline: the harness is green against UNMUTATED source ----------------
 base_out=$(DIVE_TEST_SRC="$ROOT/src" bash "$UNIT" 2>&1)
-if [[ "$base_out" == *'RESULT: 15 passed, 0 failed'* ]]; then
+if [[ "$base_out" == *'RESULT: 25 passed, 0 failed'* ]]; then
   ok_t "baseline: unit harness is green before any mutation"
 else
   bad_t "baseline: unit harness is green before any mutation" "$(tail -4 <<<"$base_out")"
@@ -107,6 +113,43 @@ run_mutation m4-count-materialized \
   's/AND COALESCE(from_template_id,0)=0//' \
   'template-materialized rows do NOT count' \
   'a filer at 6\/24h'
+
+# ---- M5: the KEY goes back to the CLAIM -------------------------------------
+# THE MUTATION THIS SUITE DID NOT HAVE, and its absence is why a9618e4 shipped a
+# bypass under a green board. M1-M4 all perturb the RULE (threshold, window,
+# priority, template) and every one of them reds correctly — but each drives the
+# cap through `--from`, which is the same door the bypass uses, so no arrangement
+# of them could have noticed the key.
+#
+# This restores the shipped defect exactly: count on the claim instead of the
+# derivation. Read the CONTROL carefully, because it is the finding — an
+# over-budget filer with NO `--from` is still refused, so the cap looks completely
+# healthy while one argv token walks around it. A mutation is only evidence about
+# the axis it moves, and a green suite says nothing about the axes it never moved.
+run_mutation m5-key-on-the-claim \
+  's/_vfiler=$(task_actor "")/_vfiler=$(task_actor "$from")/' \
+  'a FRESH --from does NOT start a fresh budget' \
+  'at the cap, a medium row is REFUSED'
+
+# ---- M6: the COUNT goes back to created_by ----------------------------------
+# The other half of the same key, one layer down. `created_by` is the CLAIM on any
+# row that carried one, so counting it re-opens the hole from the query side even
+# with the caller keyed correctly. Control: a filer whose two columns AGREE is
+# still refused — which is every arm above, and precisely why this needs its own.
+run_mutation m6-count-on-created-by \
+  "s@COALESCE(NULLIF(derived_actor,''), created_by)@created_by@" \
+  'rows filed as a relay principal are charged to the SEAT' \
+  'at the cap, a medium row is REFUSED'
+
+# ---- M7: loop scaffolding starts counting again ------------------------------
+# Same class as M4 and a different writer: `task loop` bypasses the add path
+# entirely, so its rows carry no `--materialized` and only the marker separates
+# them. Control: the ordinary over-budget refusal is untouched, so this exclusion
+# cannot have been implemented by simply counting less.
+run_mutation m7-count-loop-scaffolding \
+  "s@AND body NOT LIKE '%' || \$(sqlq \"\$loopmark\") || ':%'@@" \
+  'loop-materialized rows do NOT count' \
+  'at the cap, a medium row is REFUSED'
 
 printf -- '-----\nRESULT: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
