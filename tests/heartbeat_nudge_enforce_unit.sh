@@ -660,6 +660,15 @@ race 27 DIVE-9027 64
 # skipping a band. Hardcoding the band here would have asserted that ladder and
 # gone red the day it changed. What must hold is that the race moved the row
 # exactly as far as one tick does — no further.
+#
+# BE HONEST ABOUT WHAT THIS ARM CAN SEE: it is a regression guard, NOT the race
+# detector. Mutation-checked — with rung 1's latch clause neutered it still
+# PASSES, because the two escalations are themselves a lost update
+# (cmd_task_escalate reads old_pri, both callers read `low`, both write `high`)
+# and because ledger_emit's idem_key drops the duplicate event. The arm that
+# actually dies on the unguarded code is the NOTE COUNT above — the body write
+# is the one lever with no dedupe of its own, which is exactly why the design
+# calls it the load-bearing half.
 _raced_pri=$(col 27 priority)
 mk_row 30 'DIVE-9030' low 64
 _hb_nudge_enforce dev 30 DIVE-9030 64 >/dev/null 2>&1
@@ -694,9 +703,13 @@ race 29 DIVE-9029 32
 [[ "$(notes 29)" == "1" && "$(ledn DIVE-9029)" == "1" ]] \
   && ok_t "rung 2 reassign under two overlapping ticks: ONE note, ONE ledger event — status alone could not have refused the second" \
   || bad_t "rung 2 reassign is race-safe" "notes=[$(notes 29)] ledger=[$(ledn DIVE-9029)] want 1/1"
+# Corroborating, not detecting — mutation-checked: this one PASSES on the
+# unguarded code too, because both callers scan the same free list and pick the
+# same lane-mate. It guards the fixture, not the race. The note/ledger counts
+# above are what die when the latch clause is removed.
 [[ "$(col 29 assignee)" == "dev2" ]] \
   && ok_t "…and the row lands on exactly one pair of hands" \
-  || bad_t "rung 2 reassign is race-safe: one target" "assignee=[$(col 29 assignee)]"
+  || bad_t "rung 2 reassign: one target" "assignee=[$(col 29 assignee)]"
 
 # 13d — WIRING, same posture as arms 11 and 12h. The arms above pass on a
 # lucky interleave too; assert the latch column is IN the WHERE clause that sets
