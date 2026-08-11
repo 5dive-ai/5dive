@@ -342,6 +342,32 @@ Health:
     blank one; the roster travels as ACP availableCommands, so /<name> or
     /attach <name> picks the agent and /agents re-lists them. Runs on bun.
 
+  5dive host unit list [--pattern=<unit-glob>]       # systemd units, --no-pager pinned in code
+  5dive host unit show --unit=<unit>                 # a FIXED property set (User, WorkingDirectory,
+                                                     # ExecStart, DropInPaths, Result, ...)
+  5dive host unit repoint --unit=<u>.service --workdir=<abs-path> [--no-restart]
+                                                     # write a fixed one-directive drop-in
+                                                     # (<unit>.d/50-5dive-workdir.conf), daemon-reload,
+                                                     # restart — one audited operation.
+                                                     # REFUSES a unit that runs as root: WorkingDirectory
+                                                     # is a code pointer whenever ExecStart carries a
+                                                     # relative argument, so repointing a root unit would
+                                                     # exec caller-chosen content as root.
+  5dive host unit revert --unit=<u>.service [--no-restart]
+                                                     # remove exactly that drop-in, reload, restart
+  5dive host journal --unit=<unit> [--lines=N] [--since=<N>m|<N>h|<N>d]
+                                                     # journalctl --no-pager; --since is structured,
+                                                     # free-form time strings are refused
+  5dive host cron show|snapshot|diff --user=<user>   # READ-ONLY. \`crontab -l -u\` only; there is no
+                                                     # write/edit path (crontab -e is an EDITOR escape).
+                                                     # diff compares against the CLI's own snapshot,
+                                                     # never a caller-supplied file.
+    Host remediation for a privileged seat, delivered as scoped subcommands
+    rather than raw systemctl/journalctl/crontab grants (DIVE-3221; DIVE-1088
+    excluded those grants because each is a one-line root escape via the pager
+    or an editor). Needs root for the mutating and journal/cron verbs — an admin
+    agent reaches them through its existing \`/usr/local/bin/5dive *\` grant.
+
   5dive doctor [--fix] [--dry-run] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
     probes, stale shadow-credential heal (creds), registry integrity, channel
@@ -808,6 +834,21 @@ main() {
       # src/lib/models.sh). Read-only. The telegram plugin reads
       # `5dive models --json` at boot so its /model picker can't drift again.
       cmd_models "$@" ;;
+    host)
+      # DIVE-3221: hardened host-remediation verbs, reached through the CLI-root
+      # grant an `admin` agent already holds (no new sudoers class, no new tier —
+      # lodar answered B on DIVE-3213). Every verb takes structured, validated
+      # parameters only: no unit-file content, no shell string, no editor, no
+      # caller-supplied path. See the header of src/cmd_host.sh for the finite
+      # set of commands each verb can exec as root, and why `repoint` refuses a
+      # root-running unit.
+      #
+      # Audited as a whole: `unit list`/`unit show`/`journal`/`cron show` are
+      # reads, but they are reads a privileged seat performs about ANOTHER user's
+      # box state, and the row that answers "who repointed this unit" is worth
+      # more than the noise it costs.
+      AUDIT_CMD="host"; AUDIT_ARGS=("$@")
+      cmd_host "$@" ;;
     doctor)
       # Only audit when a mutating run is requested (--fix/--repair); read-only
       # runs (and --dry-run previews) would spam the log.
