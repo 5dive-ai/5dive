@@ -60,15 +60,31 @@
 # A unit's WorkingDirectory IS a code pointer whenever its ExecStart carries a
 # relative argument. Measured on this host:
 #     5dive-api.service  ExecStart={ path=/usr/bin/node ; argv[]=/usr/bin/node dist/index.js }
-# `dist/index.js` resolves against WorkingDirectory. So repointing a unit that
-# runs AS ROOT at a directory of the caller's choosing is exactly "exec
-# agent-controlled input as root" with two extra steps — the invariant above,
-# violated by the verb that was supposed to respect it. Therefore: **repoint and
-# revert refuse any unit whose User= is empty or root.** A root unit's cwd stays
-# a human/root operation and should be filed as a gate, not unlocked by widening
-# this verb. Every unit the devops charter named runs non-root (5dive-api and
-# 5dive-frontend as `claude`, 5dive-discord-welcome as `agent-marketing`), so the
-# refusal costs the driver case nothing.
+# `dist/index.js` resolves against WorkingDirectory. So repointing such a unit at
+# a directory of the caller's choosing is exactly "exec agent-controlled input as
+# root" with two extra steps — the invariant above, violated by the verb that was
+# supposed to respect it.
+#
+# THE PREDICATE IS ROOT-EQUIVALENCE, NOT LITERAL ROOT. The first draft of this
+# file refused only `User=` empty/"root"/"0", and carried this sentence:
+#
+#   "Every unit the devops charter named runs non-root (5dive-api and
+#    5dive-frontend as `claude`, ...), so the refusal costs the driver case
+#    nothing."
+#
+# That is the correct fact with the opposite conclusion drawn from it, and the
+# code followed the comment faithfully. `claude` holds `ALL=(ALL) NOPASSWD: ALL`.
+# Running as `claude` is not what made 5dive-api cheap to repoint, it is what
+# made it the most dangerous unit on the box: the literal-root test returns
+# false, repoint proceeds, and systemd execs the caller's file as an account that
+# can sudo anything. Found by main reviewing this file; recorded here rather than
+# quietly deleted, because the next person to "simplify" _host_account_class back
+# into a `[[ $u == root ]]` one-liner needs to meet the reason it is not one.
+#
+# So repoint/revert refuse unless _host_account_class returns `restricted` — the
+# only POSITIVELY established class. `root`, `root-equivalent` and `undetermined`
+# all refuse; a cwd on any of them stays a human/root operation and is filed as a
+# gate rather than unlocked by widening this verb.
 #
 # CRONTAB IS READ-ONLY, BY THE ROW'S OWN SCOPE. `crontab -e` for another user is
 # an EDITOR=/bin/sh escape, and if the target is `claude` that seat is
@@ -217,13 +233,85 @@ _host_since_phrase() {
   esac
 }
 
-# _host_unit_runs_as_root <unit> — true when restarting it would exec as root.
-# An empty User= means root (systemd's default for a system unit), so absent and
-# "root" must land on the SAME branch; treating empty as "not root" is how this
-# guard would fail open on almost every unit on the box.
-_host_unit_runs_as_root() {
-  local u; u=$(_host_unit_property "$1" User)
-  [[ -z "$u" || "$u" == "root" || "$u" == "0" ]]
+# _host_sudo_list <user> — enumerate a user's sudo privileges, or fail.
+#
+# Asks SUDO what the account can do rather than parsing /etc/sudoers.d ourselves.
+# The drop-in is text; this is the enforced answer, and the gap between them is
+# where the wrong answer lives (DIVE-2079: `isolation` is a stored label with
+# nothing keeping it honest, and on this host it disagrees with the grant on more
+# than one seat). Group membership, /etc/sudoers proper and every drop-in are all
+# folded in for free. Separate function so the harness can drive it.
+_host_sudo_list() {
+  sudo -n -l -U "$1" 2>/dev/null
+}
+
+# _host_account_class <user> — root | root-equivalent | restricted | undetermined
+#
+# THE PREDICATE THAT MATTERS IS ROOT-EQUIVALENCE, NOT LITERAL ROOT, and getting
+# that wrong is a live escalation rather than a lint (found by main reviewing
+# DIVE-3221's first draft, which tested `User=` against "root"/""/"0" only):
+#
+#   5dive-api.service   User=claude
+#   /etc/sudoers.d/claude   claude ALL=(ALL) NOPASSWD:ALL
+#
+# `claude` is not root, so a literal-root test returns false and repoint
+# proceeds — pointing a unit whose ExecStart is `node dist/index.js` at a
+# directory the caller created, and systemd then execs the caller's file as an
+# account that can `sudo` anything. Caller-chosen content, exec'd as root, from
+# the verb whose own refusal message describes that hazard.
+#
+# So: classify the ACCOUNT (a property of the account, not of the filesystem — it
+# does not fall into DIVE-3258's "do not relocate a filesystem fact into a CLI
+# check" trap), and FAIL CLOSED. `undetermined` is a refusal, not a shrug: an
+# unknown user, an unreadable sudo policy, or a sudo that will not answer all
+# mean the same thing here — we cannot show the target is safe, and the cost of
+# being wrong is every admin agent on the box at once.
+#
+# `restricted` is the ONLY class that proceeds, and it is the positively
+# established one. Note what is deliberately NOT root-equivalent: the cli-root
+# grant (`(root) NOPASSWD: /usr/local/bin/5dive *`) an admin agent holds. If that
+# counted, the design would refuse itself — cli-root is a boundary precisely
+# because of the no-exec-caller-input invariant this function exists to keep.
+_host_account_class() {
+  local u="${1:-}"
+  # systemd's default User= for a system unit is root, so ABSENT and "root" must
+  # land on the same branch. Reading empty as "not root" disables the guard on
+  # nearly every unit on the box.
+  if [[ -z "$u" || "$u" == "root" || "$u" == "0" ]]; then
+    printf 'root'; return 0
+  fi
+  # $u arrives from systemd's own `User=`, not from the caller — but it is about
+  # to become an argv to a root `sudo`, so it is charset-checked anyway. A value
+  # that is not a POSIX login name (a leading '-' would be read as an option) is
+  # UNDETERMINED, i.e. refused, never passed through.
+  if [[ ! "$u" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+    printf 'undetermined'; return 0
+  fi
+  local uid
+  uid=$(id -u -- "$u" 2>/dev/null) || { printf 'undetermined'; return 0; }
+  [[ "$uid" == "0" ]] && { printf 'root'; return 0; }   # a second name for uid 0
+
+  local listing
+  listing=$(_host_sudo_list "$u") || { printf 'undetermined'; return 0; }
+  if [[ -z "$listing" ]]; then
+    printf 'undetermined'; return 0
+  fi
+  # sudo says so itself. This is the positive establishment `restricted` needs.
+  if grep -qiE 'is not allowed to run sudo' <<<"$listing"; then
+    printf 'restricted'; return 0
+  fi
+  # An entry whose COMMAND LIST is exactly ALL is unrestricted, whatever the
+  # runas spec: `(ALL : ALL) ALL` and `(ALL) NOPASSWD: ALL` are both root. Tags
+  # (NOPASSWD:, SETENV:, ...) may appear in any combination before the command,
+  # so they are skipped rather than matched one shape at a time.
+  if grep -qE '^[[:space:]]*\([^)]*\)[[:space:]]*((NOPASSWD|PASSWD|SETENV|NOSETENV|NOEXEC|EXEC|LOG_INPUT|NOLOG_INPUT|LOG_OUTPUT|NOLOG_OUTPUT|FOLLOW|NOFOLLOW|MAIL|NOMAIL):[[:space:]]*)*ALL[[:space:]]*$' <<<"$listing"; then
+    printf 'root-equivalent'; return 0
+  fi
+  # Enumerated, and nothing in it is unrestricted.
+  if grep -qE '^[[:space:]]*\([^)]*\)' <<<"$listing"; then
+    printf 'restricted'; return 0
+  fi
+  printf 'undetermined'
 }
 
 # _host_render_workdir_dropin <validated-path> — the ONLY unit-file content this
@@ -247,10 +335,18 @@ _host_require_repointable() {
   load=$(_host_unit_property "$unit" LoadState)
   [[ "$load" == "loaded" ]] \
     || fail "$E_VALIDATION" "unit '$unit' is not loaded (LoadState=${load:-unknown}); refusing to touch /etc/systemd/system for a unit systemd does not know"
-  if _host_unit_runs_as_root "$unit"; then
-    fail "$E_VALIDATION" "refusing '$unit': it runs as root, and WorkingDirectory is a code pointer whenever ExecStart carries a relative argument (5dive-api's is 'node dist/index.js'). Repointing a root unit's cwd would let this subcommand exec caller-chosen content as root, which collapses the cli-root grant to root-all for every admin agent on the box. A root unit's cwd is a human/root operation — file a gate."
-  fi
-  return 0
+  local runas class
+  runas=$(_host_unit_property "$unit" User)
+  class=$(_host_account_class "$runas")
+  case "$class" in
+    restricted) return 0 ;;
+    root)
+      fail "$E_VALIDATION" "refusing '$unit': it runs as root. WorkingDirectory is a code pointer whenever ExecStart carries a relative argument (5dive-api's is 'node dist/index.js'), so repointing its cwd would let this subcommand exec caller-chosen content as root — which collapses the cli-root grant to root-all for every admin agent on the box. A root unit's cwd is a human/root operation: file a gate." ;;
+    root-equivalent)
+      fail "$E_VALIDATION" "refusing '$unit': it runs as '${runas}', which holds an UNRESTRICTED sudo grant (sudo -l -U ${runas} lists a bare ALL), so it is root-equivalent even though it is not literally root. WorkingDirectory is a code pointer whenever ExecStart carries a relative argument (5dive-api's is 'node dist/index.js'), so repointing its cwd execs caller-chosen content as an account that can sudo anything. Same refusal as root, for the same reason: file a gate." ;;
+    *)
+      fail "$E_VALIDATION" "refusing '$unit': cannot establish whether its user ('${runas:-<unset>}') is root-equivalent — sudo would not enumerate it, or the account does not exist. This guard FAILS CLOSED: not being able to show the target is safe is not the same as it being safe, and the cost of guessing wrong is every admin agent on the box at once." ;;
+  esac
 }
 
 # --- verbs -------------------------------------------------------------------

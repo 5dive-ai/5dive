@@ -158,6 +158,84 @@ _host_unit_property() {
   esac
 }
 
+# Drive the sudo seam too. The predicate is ROOT-EQUIVALENCE, not literal root:
+# `claude` is not root and holds ALL=(ALL) NOPASSWD: ALL, so a literal-root test
+# returns false on 5dive-api.service and repoint proceeds — exec'ing the caller's
+# file as an account that can sudo anything. These are the real `sudo -l -U`
+# output shapes, measured on this host.
+SUDO_LISTING=""
+_host_sudo_list() { [[ -n "$SUDO_LISTING" ]] && printf '%s' "$SUDO_LISTING"; }
+
+classifies() {   # <desc> <expected-class> <user> <listing>
+  local desc="$1" want="$2" user="$3"; SUDO_LISTING="$4"
+  local got; got=$(_host_account_class "$user" 2>/dev/null)
+  if [[ "$got" == "$want" ]]; then pass "$desc -> $got"; else bad "$desc -> got '$got', want '$want'"; fi
+}
+
+CLAUDE_LISTING='User claude may run the following commands on poke-two:
+    (ALL : ALL) ALL
+    (ALL) NOPASSWD: ALL'
+OPS_LISTING='User agent-ops may run the following commands on poke-two:
+    (root) NOPASSWD: /usr/local/bin/5dive, /usr/local/bin/5dive *'
+MAIN2_LISTING='User agent-main2 may run the following commands on poke-two:
+    (root) NOPASSWD: /usr/local/bin/5dive _audit_append
+    (root) NOPASSWD: /usr/local/bin/5dive agent _self_restart'
+NONE_LISTING='User agent-codextest is not allowed to run sudo on poke-two.'
+
+classifies "empty User= (systemd default)"        root            ""       ""
+classifies "literal root"                         root            "root"   ""
+classifies "uid 0 by another name"                root            "0"      ""
+classifies "an account with (ALL) NOPASSWD: ALL"  root-equivalent "nobody" "$CLAUDE_LISTING"
+classifies "an account with a bare (ALL : ALL) ALL"  root-equivalent "nobody" $'User x may run:\n    (ALL : ALL) ALL'
+classifies "an option-shaped User= never reaches sudo argv" undetermined "-x" "$CLAUDE_LISTING"
+classifies "cli-root admin grant is NOT root-equivalent (else the design refuses itself)" \
+                                                  restricted      "nobody" "$OPS_LISTING"
+classifies "a scoped standard grant"              restricted      "nobody" "$MAIN2_LISTING"
+classifies "an account sudo says cannot sudo"     restricted      "nobody" "$NONE_LISTING"
+classifies "an account that does not exist"       undetermined    "nosuchuser3221" ""
+classifies "sudo returns nothing (fail closed)"   undetermined    "nobody" ""
+classifies "sudo returns unparseable noise (fail closed)" undetermined "nobody" "sudo: error initializing audit plugin"
+SUDO_LISTING=""
+
+# The arm main asked for BY NAME. This is the unit that motivated the finding.
+STUB_USER="claude"; SUDO_LISTING="$CLAUDE_LISTING"
+_host_unit_property() {
+  case "$2" in
+    User)      printf '%s' "$STUB_USER" ;;
+    LoadState) printf 'loaded' ;;
+    *)         printf '' ;;
+  esac
+}
+refuses "5dive-api.service (User=claude, and claude is ALL=(ALL) NOPASSWD: ALL — root-equivalent, not literally root)" \
+        _host_require_repointable "5dive-api.service"
+
+# MUTANT: put the predicate back the way it was wrong and prove this arm dies.
+# An arm that passes against both the fixed and the broken predicate is not
+# testing the fix — it is decoration.
+_host_account_class_FIXED=$(declare -f _host_account_class)
+_host_account_class() {   # the literal-root-only predicate, i.e. the defect
+  local u="${1:-}"
+  if [[ -z "$u" || "$u" == "root" || "$u" == "0" ]]; then printf 'root'; else printf 'restricted'; fi
+}
+mutant_out=$( _host_require_repointable "5dive-api.service" 2>&1 ); mutant_rc=$?
+if (( mutant_rc == 0 )); then
+  pass "MUTANT (literal-root predicate) ACCEPTS 5dive-api.service — the arm above detects the regression"
+else
+  bad "MUTANT was still refused (rc=$mutant_rc) — the 5dive-api arm does not actually test the predicate: $mutant_out"
+fi
+eval "$_host_account_class_FIXED"   # restore the real predicate
+SUDO_LISTING="$NONE_LISTING"
+# Restore the LoadState-driven property stub the later arms depend on — the
+# named arm above pinned LoadState=loaded and would otherwise silently disarm
+# the "unit systemd does not know" assertion.
+_host_unit_property() {
+  case "$2" in
+    User)      printf '%s' "$STUB_USER" ;;
+    LoadState) printf '%s' "$STUB_LOAD" ;;
+    *)         printf '' ;;
+  esac
+}
+
 STUB_USER="root";   refuses "User=root"                        _host_require_repointable "x.service"
 # The fail-open case: systemd's default for a system unit IS root, so an EMPTY
 # User= must land on the same branch as the literal string "root". Reading empty
@@ -211,6 +289,10 @@ echo "== structural: what the SOURCE file can exec at all =="
 CODE="$TMP/cmd_host.code.sh"
 grep -vE '^[[:space:]]*#' "$SRC/cmd_host.sh" | grep -vE '^[[:space:]]*$' > "$CODE"
 
+# Anchored at COMMAND position (line start, $(, |, &&, ;) — binary names also
+# appear inside this file's refusal messages, and a grep that cannot tell a call
+# from a diagnostic reports the error text as the defect.
+cmd_position='(^[[:space:]]*|\$\([[:space:]]*|\|[[:space:]]*|&&[[:space:]]*|;[[:space:]]*)'
 structural_absent() {   # <desc> <extended-regex>
   local desc="$1" re="$2" hits
   hits=$(grep -nE "$re" "$CODE")
@@ -225,7 +307,32 @@ structural_absent "no eval"                        '(^|[^A-Za-z_])eval[[:space:]
 structural_absent "no sh -c / bash -c"             '(^|[^A-Za-z_-])(sh|bash|dash|zsh)[[:space:]]+-[a-z]*c'
 structural_absent "no systemd-run"                 'systemd-run'
 structural_absent "no editor handed to a child"    '(EDITOR|VISUAL)='
-structural_absent "no su / sudo -u re-entry"       '(^|[[:space:]])(su|sudo)[[:space:]]'
+
+# `sudo` is no longer absent from this file, and the rule has to say so honestly
+# rather than be deleted. _host_sudo_list asks sudo to ENUMERATE an account's
+# privileges (`sudo -n -l -U <user>`) — a read, and the only authoritative answer
+# to "is this account root-equivalent" (the drop-in is text; sudo is the enforced
+# answer). What must stay impossible is sudo/su used to EXECUTE: a runas
+# (`sudo -u`), a shell, or any command form. So the rule is now an allowlist of
+# exactly one form, anchored at command position — the refusal messages quote
+# `sudo -l -U` as prose, and a grep that cannot tell a call from a diagnostic
+# would report this file's own documentation as the defect.
+sudo_hits=$(grep -nE "${cmd_position}(su|sudo)([[:space:]]|\$)" "$CODE" | grep -vE 'sudo -n -l -U "\$1"')
+if [[ -z "$sudo_hits" ]]; then
+  pass "no su / sudo EXEC form — the only sudo call is the read-only privilege enumeration"
+else
+  bad "a sudo/su call outside the sanctioned read-only enumeration: $sudo_hits"
+fi
+# ...and that one sanctioned form appears exactly once, so it cannot multiply
+# quietly into a second, less careful call site.
+n_sudo=$(grep -cE '(^|[[:space:]])sudo[[:space:]]+-n[[:space:]]+-l[[:space:]]+-U' "$CODE")
+if [[ "$n_sudo" == "1" ]]; then
+  pass "exactly one sudo call site in the file"
+else
+  bad "expected exactly 1 sudo enumeration call site, found $n_sudo"
+fi
+structural_absent "no sudo runas (-u), which would exec as another account" \
+                                                   '(^|[[:space:]])sudo[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*-u[[:space:]]'
 structural_absent "no crontab verb other than a read" \
                                                    'crontab[^|]*(-e|-r|--remove|-l[[:space:]]+[^-])'
 structural_absent "no unit-file write outside the fixed basename" \
@@ -249,7 +356,6 @@ awk '
 # Anchored at COMMAND position (line start, $(, |, &&, ;) — the binary names also
 # appear inside this file's refusal messages, and a grep that cannot tell a call
 # from a diagnostic reports the error text as the defect.
-cmd_position='(^[[:space:]]*|\$\([[:space:]]*|\|[[:space:]]*|&&[[:space:]]*|;[[:space:]]*)'
 for binary in systemctl journalctl; do
   hits=$(grep -nE "${cmd_position}${binary}([[:space:]]|\$)" "$NOWRAP")
   if [[ -z "$hits" ]]; then
