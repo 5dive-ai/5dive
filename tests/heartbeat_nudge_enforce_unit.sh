@@ -587,5 +587,140 @@ _free=$(grep -n 'local free="" target="" cand lane' "$SRC/cmd_heartbeat.sh" | cu
   && ok_t "rung 2 CONSULTS the seat-advance hold, after the gate hold and before any lever — a helper nobody calls is the original bug" \
   || bad_t "rung 2 consults the seat-advance hold in place" "gate=[${_gate:-none}] seat=[${_seat:-none}] levers=[${_free:-none}]"
 
+# ---------------------------------------------------------------------------
+# 13. THE LATCH RACE (quinn, iteration 2 reject). "Once per row" was decided in
+#     bash — a pre-read of nudge_escalated_at — while the UPDATE that sets it
+#     guarded on STATUS only. changes() is 1 on any open row whether or not the
+#     latch is already set, so the stale pre-read was the only thing that could
+#     refuse a second arming, and a concurrent tick reads the same empty value.
+#
+#     REACHABLE, not theoretical: src/cmd_heartbeat.sh:4 says a single host cron
+#     runs `heartbeat tick`, there is no flock and no already-running guard, and
+#     cron starts tick N+1 while N is still running. Our own wiki records why a
+#     tick runs long (a-fixed-prompt-wait-becomes-a-timeout-on-harnesses-that-
+#     never-prompt: 45s burned per relay seat that never shows a prompt); a few
+#     of those at a 15m cadence make overlap the normal case.
+#
+#     WHY A SERIAL SECOND CALL CANNOT GRADE THIS, and why 44 green arms missed
+#     it: arm 3 calls _hb_nudge_enforce again after rung 1 landed, so it re-reads
+#     a POPULATED latch and correctly declines. The defect only exists in the
+#     window between the two callers' reads. These arms force that window open
+#     deterministically rather than racing two backgrounded processes and hoping
+#     — a timing-dependent arm that passes 4 times in 5 is not a guard.
+#
+#     THE BARRIER IS AROUND `db`, NOT INSIDE THE CODE UNDER TEST. It releases
+#     both callers only once BOTH have completed the stamps SELECT, which is the
+#     exact interleave cron produces. The function itself is unmodified.
+# ---------------------------------------------------------------------------
+eval "$(declare -f db | sed '1s/^db ()/_db_serial ()/')"   # keep the real one
+_BARRIER="$TMP/barrier"
+_barrier_arrive() {   # block until 2 callers have passed the stamps read
+  mkdir -p "$_BARRIER"; mktemp "$_BARRIER/a.XXXXXX" >/dev/null
+  local i=0
+  while (( $(find "$_BARRIER" -type f | wc -l) < 2 )) && (( i < 200 )); do
+    sleep 0.05; i=$((i+1))
+  done
+}
+db() {
+  local out rc
+  out=$(_db_serial "$1"); rc=$?
+  case "$1" in *"COALESCE(nudge_escalated_at,'')||x'1f'"*) _barrier_arrive ;; esac
+  printf '%s\n' "$out"
+  return "$rc"
+}
+ledn() { _db_serial "SELECT COUNT(*) FROM lifecycle_events WHERE kind='task.nudge_enforced' AND ident=$(sqlq "$1");"; }
+race()  {   # $1 id, $2 ident, $3 nudge count — two overlapping ticks on one row
+  rm -rf "$_BARRIER"
+  ( _hb_nudge_enforce dev "$1" "$2" "$3" >/dev/null 2>&1 ) &
+  ( _hb_nudge_enforce dev "$1" "$2" "$3" >/dev/null 2>&1 ) &
+  wait
+}
+
+# 13a — RUNG 1 under two overlapping ticks. quinn's measured shape, 5 runs of 5:
+# a `low` row went low -> HIGH (two escalations, medium skipped), TWO identical
+# dated notes, two ledger events, and nudge_escalated_n — the number rung 2's
+# threshold is keyed to — set by whichever write won. The duplicate note lands on
+# the artifact this whole design calls load-bearing.
+mk_row 27 'DIVE-9027' low 64
+race 27 DIVE-9027 64
+[[ "$(notes 27)" == "1" ]] \
+  && ok_t "rung 1 under two overlapping ticks writes exactly ONE body note — the latch is in SQL, not in a stale bash pre-read" \
+  || bad_t "rung 1 is race-safe: one note" "note count=[$(notes 27)] want 1 (duplicate paragraphs on the load-bearing artifact)"
+[[ "$(ledn DIVE-9027)" == "1" ]] \
+  && ok_t "…and emits exactly ONE task.nudge_enforced ledger event" \
+  || bad_t "rung 1 is race-safe: one ledger event" "ledger rows=[$(ledn DIVE-9027)] want 1"
+[[ "$(col 27 nudge_escalated_n)" == "64" ]] \
+  && ok_t "…and nudge_escalated_n — the number rung 2's threshold is keyed to — is left by the ONE caller that acted" \
+  || bad_t "rung 1 is race-safe: the rung-2 key is single-writer" "nudge_escalated_n=[$(col 27 nudge_escalated_n)] want 64"
+# The band assertion is made against a SERIAL CONTROL rather than a hardcoded
+# value, because "how far does one escalate move a row" is cmd_task_escalate's
+# business and not this harness's: it maps low/medium -> high deliberately
+# (cmd_task.sh: "low/medium -> high keeps the common 'this is stuck' tap
+# meaningful"), so a raced low row landing on `high` is ONE escalate, not two
+# skipping a band. Hardcoding the band here would have asserted that ladder and
+# gone red the day it changed. What must hold is that the race moved the row
+# exactly as far as one tick does — no further.
+#
+# BE HONEST ABOUT WHAT THIS ARM CAN SEE: it is a regression guard, NOT the race
+# detector. Mutation-checked — with rung 1's latch clause neutered it still
+# PASSES, because the two escalations are themselves a lost update
+# (cmd_task_escalate reads old_pri, both callers read `low`, both write `high`)
+# and because ledger_emit's idem_key drops the duplicate event. The arm that
+# actually dies on the unguarded code is the NOTE COUNT above — the body write
+# is the one lever with no dedupe of its own, which is exactly why the design
+# calls it the load-bearing half.
+_raced_pri=$(col 27 priority)
+mk_row 30 'DIVE-9030' low 64
+_hb_nudge_enforce dev 30 DIVE-9030 64 >/dev/null 2>&1
+[[ "$_raced_pri" == "$(col 30 priority)" ]] \
+  && ok_t "…and the raced row lands on the SAME band a single serial tick produces (${_raced_pri}) — one escalate, not two" \
+  || bad_t "rung 1 is race-safe: the band moves exactly as far as one tick" "raced=[$_raced_pri] serial control=[$(col 30 priority)]"
+
+# 13b — the loser must NARRATE its refusal, and name the reason it actually hit.
+# A refusal logged as "status is not todo/in_progress" on a row that is plainly
+# todo sends the next reader hunting a status bug; the same silent-hold problem
+# arm 12f grades, one layer down.
+mk_row 28 'DIVE-9028' low 64
+_HB_LOG_CAP="$TMP/race.log"; : >"$_HB_LOG_CAP"
+_hb_log() { printf '%s\n' "$1" >>"$_HB_LOG_CAP"; }
+race 28 DIVE-9028 64
+_hb_log() { :; }
+case "$(cat "$_HB_LOG_CAP")" in
+  *"rung 1 REFUSED"*"concurrent tick"*) ok_t "the losing caller SAYS it lost to a concurrent tick — not a phantom status refusal" ;;
+  *) bad_t "the losing caller narrates the real refusal" "log: [$(cat "$_HB_LOG_CAP")]" ;;
+esac
+
+# 13c — SAME SHAPE AT RUNG 2, and here the status guard cannot mask it: reassign
+# does NOT change status, so both callers' UPDATEs match on a todo row and the
+# row changes hands twice with two notes and both agents pinged twice. (The park
+# branch happens to survive a race because it writes status='blocked', which its
+# own status guard then refuses — an accident, not a guard. Both carry the latch
+# clause so neither depends on that accident.)
+mk_row 29 'DIVE-9029' high 32
+stamp_rung1 29 16
+busy creative; busy main          # dev2 free, so the reassign branch is taken
+race 29 DIVE-9029 32
+[[ "$(notes 29)" == "1" && "$(ledn DIVE-9029)" == "1" ]] \
+  && ok_t "rung 2 reassign under two overlapping ticks: ONE note, ONE ledger event — status alone could not have refused the second" \
+  || bad_t "rung 2 reassign is race-safe" "notes=[$(notes 29)] ledger=[$(ledn DIVE-9029)] want 1/1"
+# Corroborating, not detecting — mutation-checked: this one PASSES on the
+# unguarded code too, because both callers scan the same free list and pick the
+# same lane-mate. It guards the fixture, not the race. The note/ledger counts
+# above are what die when the latch clause is removed.
+[[ "$(col 29 assignee)" == "dev2" ]] \
+  && ok_t "…and the row lands on exactly one pair of hands" \
+  || bad_t "rung 2 reassign: one target" "assignee=[$(col 29 assignee)]"
+
+# 13d — WIRING, same posture as arms 11 and 12h. The arms above pass on a
+# lucky interleave too; assert the latch column is IN the WHERE clause that sets
+# it, which is the thing that makes changes()==0 the second caller's refusal.
+_r1=$(grep -c "AND nudge_escalated_at IS NULL" "$SRC/cmd_heartbeat.sh") || _r1=0
+_r2=$(grep -c "AND nudge_parked_at IS NULL" "$SRC/cmd_heartbeat.sh") || _r2=0
+(( _r1 >= 1 && _r2 >= 2 )) \
+  && ok_t "each latch column sits in the WHERE clause that SETS it (rung 1 x${_r1}, both rung-2 levers x${_r2}) — the pre-read is an optimisation, not the guard" \
+  || bad_t "the latch columns guard their own UPDATEs" "nudge_escalated_at IS NULL x${_r1} (want >=1), nudge_parked_at IS NULL x${_r2} (want >=2)"
+
+eval "$(declare -f _db_serial | sed '1s/^_db_serial ()/db ()/')"   # barrier off
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
