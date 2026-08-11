@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
+
+DIVE-1935's first iteration was rejected, and for the right reason. It added a
+`sudo -n -u claude gh auth token` arm to `_gate_gh_token` justified by *"agents hold
+passwordless sudo on this host"* — **a per-SEAT grant written as a HOST property.**
+Census at the time: `root-all` 7, `cli-root` 4, `cli-scoped` 5, where a cli-scoped
+sudoers (`NOPASSWD: /usr/local/bin/5dive *`) permits one binary as root and nothing as
+`claude`. So on 9 of 16 seats `sudo -n` was refused, `-n` made the refusal silent,
+`|| true` swallowed it, and resolution returned EMPTY.
+
+**THE FIX IS AN INSTRUMENT CHECK, NOT A FOURTH FALLBACK.** The reason the arm read as
+correct is that its premise was *unfalsifiable from the code*: no amount of re-reading
+a resolver tells you whether it resolves where you are, because every way it fails is
+silent by construction and an empty token is a legitimate state. Any next fallback
+inherits exactly that blind spot.
+
+- **Every resolution arm now leaves a crumb naming its own outcome** (`_gate_tok_why`),
+  and a **REFUSED** sudo is now distinguishable from a **PERMITTED** sudo that found no
+  login — read from sudo's own stderr, not from a second probe, so the call sequence
+  three sibling harnesses assert on is unchanged. The two states have different
+  remedies (this seat's sudoers vs. the host's gh login) and were previously the same
+  silence. Crumbs cross the command-substitution boundary in a file keyed on `$$`, the
+  `_GATE_ANON_STATEF` idiom next door.
+- **The diagnostics name the SEAT** (`user@host uid=N`). The defect was a per-seat fact
+  read as a host-wide one; a diagnostic without the seat reproduces it. Wired into the
+  no-rail refusal, the audited-UNVERIFIED close warning (plus `seat=` on the audit row —
+  the only surface on which an inert gate announces itself), and `task merge-audit`'s
+  unreachable failure.
+- **New `5dive task merge-gate-selftest [--pr=<url>] [--json]`.** Runs the real
+  resolution over the same rail selection the gate makes, then **GRADES it against a
+  control PR that IS merged** and requires `MERGED` to come back. *"A token resolved"*
+  was never the property the gate needs — a credential that cannot see the repo is as
+  blind as none, and the two were indistinguishable. Exit status is the verdict, so the
+  fleet census is reproducible by anyone on their own seat rather than a one-off
+  measurement by whoever held root.
+
+Measured on `agent-dev2` (a cli-scoped seat) with the shipped binary: all four token
+arms fail — arm 4 REFUSED by sudoers — and the self-test still passes, because the
+DIVE-2605 machine-account rail answers. That is the sentence the old code could not
+say, and it is why "no token" must not be read as "gate inert" either.
+
+New `tests/task_merge_gate_selftest_unit.sh` (8 assertions, no root, no network); T5
+and T6 are the positive controls — a blind seat and a rail that answers *wrongly* about
+the control must both FAIL, or the check measures nothing. Sibling gate suites re-run
+green: gh_resolve 7, result_pr 31, anon_rail 31, gate_subject_state 37.
+
 ## v0.19.0 — feat(task): a filing budget the CLI ENFORCES, per filer per rolling 24h (DIVE-3245)
 
 lodar's instinct (2026-08-11 07:42) was to forbid verifiers from filing low/medium rows.
