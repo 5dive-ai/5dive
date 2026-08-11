@@ -92,6 +92,7 @@ cat \
   src/cmd_skill.sh \
   src/cmd_init.sh \
   src/cmd_doctor.sh \
+  src/cmd_host.sh \
   src/cmd_watch.sh \
   src/cmd_compose.sh \
   src/cmd_whoami.sh \
