@@ -99,6 +99,9 @@ if [[ "$1" == "api" ]]; then
   printf '%s' "$json" | jq -r "$expr" 2>/dev/null; exit 0
 fi
 if [[ "$1" == "pr" && "$2" == "list" ]]; then
+  # GH_FAIL_OPEN models the query that could not RUN (no rail, invalid credential,
+  # timeout). It must stay distinguishable from an empty result set.
+  [[ "$state" == "open" && -n "${GH_FAIL_OPEN:-}" ]] && exit 1
   case "$state" in
     open)   fx="GH_STUB_OPEN_$(key "${repo##*/}")" ;;
     merged) fx="GH_STUB_MERGED_$(key "${repo##*/}")" ;;
@@ -158,6 +161,20 @@ A4=$(gh_explain --as=caller pr list --repo 5dive-ai/5dive)
 [[ "$A4" == *"you asked for --as=caller"* && "$A4" != *"actor=5dive-bot"* ]] \
   && ok_t 'A4 ANCHOR: an EXPLICIT --as=caller is still honoured, credential or not' \
   || bad_t 'A4 explicit intent overridden' "out=$A4"
+
+# A6 — the arm main asked for on the gate. A fallback that fires BOTH when the seat
+# holds nothing and when it holds something unusable is indistinguishable from one
+# that ignores the credential entirely and always takes the bot. It does not: the
+# route keys on RESOLUTION (`gh auth token`, which is offline and makes no network
+# call), so a present-but-invalid login still routes to its owner and fails as
+# itself. That is the correct direction — 5dive must not silently launder a caller's
+# broken credential into the machine account's.
+export GH_STUB_AUTH_TOKEN="tok-invalid-but-present"
+A6=$(gh_explain pr view 349)
+[[ "$A6" == *"actor=your own gh credential"* && "$A6" != *"actor=5dive-bot"* ]] \
+  && ok_t 'A6 a RESOLVED-but-invalid login is NOT diverted — the route keys on resolution, not validity' \
+  || bad_t 'A6 invalid credential must not divert' "out=$A6"
+export GH_STUB_AUTH_TOKEN=""
 
 A5=$(gh_explain pr create --repo 5dive-ai/5dive)
 [[ "$A5" == *"actor=5dive-bot"* && "$A5" == *"class=write"* ]] \
@@ -255,6 +272,27 @@ run_done B-4 --result='landed'
 [[ "$(statusof B-4)" == "done" ]] \
   && ok_t 'B4 ANCHOR: a MERGED PR for the branch still CLOSES (acceptance unchanged)' \
   || bad_t 'B4 acceptance regressed' "rc=$RC status=$(statusof B-4) out=$OUT"
+
+# B5 — the other condition on the gate: the new lookup must DEGRADE HONESTLY. A
+# query that could not run must never print as "no open PR" — that is the DIVE-2318
+# shape this whole ticket sits downstream of, and the sibling surface has already
+# been bitten by it (an invalid credential made `task done` refuse on a row whose
+# merge WAS on main, because the gate asked gh and not git).
+clear_fx; main_history
+export GH_FAIL_OPEN=1
+seed B-5 'Repo: 5dive-ai/5dive
+Branch: dive-2296-unreadable'
+run_done B-5 --result='landed'
+unset GH_FAIL_OPEN
+[[ "$OUT" == *"is UNKNOWN"* && "$OUT" == *"NOT 'there is no PR'"* ]] \
+  && ok_t 'B5 an unanswerable lookup prints UNKNOWN, never a green-looking blank' \
+  || bad_t 'B5 must degrade honestly' "out=$OUT"
+[[ "$OUT" != *"No OPEN PR was found"* ]] \
+  && ok_t 'B5 and does NOT assert an absence it never measured (DIVE-2318 shape)' \
+  || bad_t 'B5 false absence' "out=$OUT"
+[[ $RC -eq $E_CONFLICT && "$(statusof B-5)" != "done" ]] \
+  && ok_t 'B5 ANCHOR: and it still REFUSES — an unreadable probe is not an escape' \
+  || bad_t 'B5 must still refuse' "rc=$RC status=$(statusof B-5)"
 
 printf -- '-----\n%s: %s passed, %s failed\n' "$(basename "$0" .sh)" "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

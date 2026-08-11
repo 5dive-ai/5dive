@@ -3433,15 +3433,24 @@ _gate_pr_state() {
 # from the refusal arm only, never on an accepting path, so a close that passes
 # pays nothing for it.
 _gate_branch_open_pr() {
-  local slug="$1" branch="$2" tok="$3" out
+  local slug="$1" branch="$2" tok="$3" out rc=0
   out=$(_gate_gh "$tok" 10 pr list --repo "$slug" --head "$branch" --state open \
       --json number,statusCheckRollup \
       -q "[ (.[0].number // empty | tostring), ( .[0] // {} | $_GATE_ROLLUP_JQ ) ] | join(\"|\")" \
-      2>/dev/null || true)
-  # NO open PR is the common case here, and jq renders it as a rollup with no
-  # number in front of it ("NONE"), not as an empty string — an absence that still
-  # LOOKS like a value is exactly the collapse this function exists to undo, so
-  # require a number before believing there is a PR.
+      2>/dev/null) || rc=$?
+  # THREE ANSWERS, NOT TWO. A query that could not RUN — no rail, an invalid token,
+  # a timeout, gh absent — must never render as "there is no open PR". That is the
+  # DIVE-2318 defect exactly, and it is the one this ticket is downstream of: an
+  # unreached question printed as a measured no. It has already bitten the sibling
+  # surface (an invalid credential made `task done` refuse on a row whose merge WAS
+  # on main, because the gate asked gh and not git), so it is guarded here at birth.
+  #   Two independent signals, because either alone is incomplete: a non-zero rc,
+  # and EMPTY output. The second matters because the no-PR case is not empty — jq
+  # renders it as a bare rollup ("NONE"), so nothing at all means the payload was
+  # never valid JSON, whatever the exit status said.
+  if (( rc != 0 )) || [[ -z "$out" ]]; then printf 'UNREADABLE'; return 0; fi
+  # A number is required before believing there is a PR: an absence that still
+  # LOOKS like a value is the collapse this function exists to undo.
   [[ "$out" =~ ^[0-9]+\| ]] || out=""
   printf '%s' "$out"
 }
@@ -4942,13 +4951,22 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
           # and those want opposite responses (open one / wait). Look the open PR up
           # and say which state this is — the lookup is here, on the refusing path,
           # so nothing that closes pays for it.
-          local _open_slug="" _open_pr="" _open_probe=""
+          local _open_slug="" _open_pr="" _open_probe="" _open_unread=""
           while IFS= read -r _slug; do
             [[ -n "$_slug" ]] || continue
             _open_probe=$(_gate_branch_open_pr "$_slug" "$_branch" "$_ghtok")
+            # An UNREADABLE repo is carried, not discarded: a negative that skipped
+            # over a repo it could not ask is not a negative about that repo.
+            if [[ "$_open_probe" == "UNREADABLE" ]]; then
+              _open_unread="${_open_unread:+$_open_unread, }$_slug"; continue
+            fi
             if [[ -n "$_open_probe" ]]; then _open_slug="$_slug"; _open_pr="$_open_probe"; break; fi
           done < <(if [[ -n "$_task_slug" ]]; then printf '%s\n' "$_task_slug"; else _gate_repo_slugs; fi)
           local _open_note=" No OPEN PR was found for '$_branch' in $_searched either, so the next step is to land it: \`5dive push $ident\`."
+          # Say UNKNOWN out loud. A blank where a PR would be reads as "checked, none"
+          # and sends the maker to open a duplicate of a PR that may well exist.
+          [[ -n "$_open_unread" ]] \
+            && _open_note=" Whether an OPEN PR exists for '$_branch' is UNKNOWN — the lookup could not be answered in $_open_unread (no rail, an invalid credential, or a timeout). That is NOT 'there is no PR': before opening one, check by hand (\`5dive gh pr list --head $_branch --repo <owner>/<repo>\`), and if there is genuinely none, land it with \`5dive push $ident\`."
           if [[ -n "$_open_pr" ]]; then
             local _open_num="${_open_pr%%|*}" _open_checks="${_open_pr##*|}" _checks_note=""
             case "$_open_checks" in
