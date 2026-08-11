@@ -364,6 +364,30 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- reaching it at all. Deliberately a separate column, not a status: the
   -- dedup decision itself is unchanged by this.
   last_skipped_at  TEXT,
+  -- DIVE-2272 (decision DIVE-2270). The PER-TEMPLATE overlap policy. NULL means
+  -- 'skip' -- every template that predates this column keeps today's behaviour
+  -- byte for byte, which is why this is a nullable add and not a NOT NULL
+  -- DEFAULT 'skip': a backfilled default and an unset value would then be
+  -- indistinguishable, and 'nobody has classified this template yet' is a state
+  -- the classification pass needs to be able to SEE.
+  --   skip  = an open instance suppresses the next slot (today's dedup).
+  --   spawn = fire anyway, UP TO overlap_bound open instances; past the bound,
+  --           skip AND stamp last_skipped_at, i.e. degrade to exactly the
+  --           now-legible skip behaviour rather than invent new alarm machinery.
+  -- WHY PER-TEMPLATE: skip-if-open is a claim about the VALUE of a pile-up, and
+  -- that value is class-dependent. For a fungible chore (disk reclaim, hygiene
+  -- sweep) three open instances are three copies of one job and dedup is right.
+  -- For a reading-of-the-present job (recap, version loop) Tuesday's instance
+  -- cannot be discharged by Wednesday's run, so three open instances mean nobody
+  -- has read the inbox in three days -- the pile-up IS the alarm the dedup
+  -- deletes. Only the template's author knows the class; the scheduler cannot
+  -- infer it.
+  on_overlap       TEXT,
+  -- The bound for on_overlap='spawn'. NULL means the built-in default (3).
+  -- A JUDGMENT CALL, NOT A MEASUREMENT: 3 open recaps is unmistakable to a human
+  -- and 300 is a different outage. Tunable per template precisely so the number
+  -- is never mistaken for something derived.
+  overlap_bound    INTEGER,
   -- DIVE-138 step 2. A materialized instance links back to the recurring
   -- template it was cloned from via from_template_id (NULL for templates and
   -- ordinary tasks); the materializer's skip-if-open dedup keys on it. NOT a FK
@@ -1197,6 +1221,15 @@ tasks_db_init() {
 # "<column> <type>"; existing rows backfill to NULL. Pure expand (no contract),
 # so old queries/rows remain readable after downgrade. project_key deliberately
 # omits REFERENCES here because sqlite rejects a non-NULL FK default on ADD.
+# DIVE-2272: the fleet-wide fallback bound for an on_overlap='spawn' template that
+# sets no overlap_bound of its own. A JUDGMENT CALL, NOT A MEASUREMENT — 3 open
+# recaps is unmistakable to a human and 300 is a different outage. Env-tunable and
+# per-template overridable precisely so the number is never read as derived.
+# Lives here, not in cmd_heartbeat.sh, so the materializer and `task ls --recurring`
+# read the SAME default (the DIVE-2055 no-disagreement rule for that table).
+TASKS_OVERLAP_BOUND_DEFAULT="${HEARTBEAT_OVERLAP_BOUND:-3}"
+[[ "$TASKS_OVERLAP_BOUND_DEFAULT" =~ ^[1-9][0-9]*$ ]] || TASKS_OVERLAP_BOUND_DEFAULT=3
+
 _TASKS_ADDITIVE_COLUMNS=(
   'result TEXT' 'need_type TEXT' 'ask TEXT' 'need_options TEXT' 'recommend TEXT'
   'need_answer TEXT' 'need_answered_at TEXT'
@@ -1220,6 +1253,11 @@ _TASKS_ADDITIVE_COLUMNS=(
   'delivery_ref TEXT' 'delivered_at TEXT' 'delivery_ref_iteration INTEGER'
   'originated_by_objective INTEGER' 'originated_cycle INTEGER'
   'verify_unavailable INTEGER' 'last_skipped_at TEXT'
+  # DIVE-2272: per-template overlap policy. Both NULLABLE on purpose -- NULL is
+  # 'skip' / 'the default bound', so the migration is a no-op for every existing
+  # template AND an unclassified template stays visibly unclassified. See the
+  # CREATE TABLE comment for why the pile-up's value is per-template.
+  'on_overlap TEXT' 'overlap_bound INTEGER'
   'human_evidence TEXT' 'derived_actor TEXT' 'floor_provenance TEXT'
   # DIVE-3171: the ROUTING axis's provenance, sibling to floor_provenance. See the
   # CREATE TABLE comment for the values and for why it is stored, not derived.
