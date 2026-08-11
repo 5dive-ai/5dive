@@ -1,5 +1,77 @@
 # Changelog
 
+## v0.19.0 — feat(task): a filing budget the CLI ENFORCES, per filer per rolling 24h (DIVE-3245)
+
+lodar's instinct (2026-08-11 07:42) was to forbid verifiers from filing low/medium rows.
+main measured it before acting and the target was wrong: **verifiers filed 10 of 1092
+low/medium rows in a month. main filed 577.** Of the 1092, **245 were cancelled** and 51 are
+still untouched todo. main already had a filing cap in his own directives; it was not
+binding. *A rule nobody enforces is detection, not control.*
+
+**THE CAP IS 15 LOW/MEDIUM ROWS PER FILER PER ROLLING 24 HOURS.** Derived from 30 days of the
+real board (template-materialized and cli/system rows excluded) by asking how many rows each
+candidate cap WOULD have refused:
+
+| cap | main | olivia | dev | dev3 | everyone else |
+|---|---|---|---|---|---|
+| 10 | 327 | 151 | 78 | 3 | 0 |
+| 12 | 313 | 129 | 47 | 1 | 0 |
+| **15** | **282** | **97** | **18** | **0** | **0** |
+| 20 | 227 | 60 | 7 | 0 | 0 |
+
+**15 is the smallest cap at which no filer outside the top three is ever touched.** Below it
+the cap starts catching dev3, who is not the problem. The median filer's worst rolling-24h in
+that window is **4.5**, and **ten of fourteen filers never exceed 6** — so the ordinary case
+keeps more than 2x headroom while all three runaway filers are bound, dev included. A cap its
+author is exempt from is a suggestion.
+
+**ROLLING, NOT CALENDAR, and that is the design.** The thing being bound is a burst, not a
+mean. Max rolling-24h low/medium per filer, same 30-day window and same exclusions, so a
+reader can re-derive both tables from the board:
+
+| filer | max rolling 24h |
+|---|---|
+| olivia | **71** |
+| main | **60** |
+| dev | **24** |
+| dev3 | 13 |
+| marketing, dev2 | 6 |
+| quinn | 5 |
+| main2, editor, agent-main | 4 |
+| ops, creative | 2 |
+| notdevx, lodar | 1 |
+
+**15 sits below every one of the top three and above every one of the other eleven**, so it
+binds the 25-53/day stretch and the 65-spike entirely (15 < 25) while no ordinary filer ever
+reaches it. Note main is the highest by VOLUME (404 rows in 30 days) but **olivia spikes
+highest** — 71 in one rolling day — so this binds three seats, not one, and olivia meets it
+first. A calendar-day cap would let a burst straddle midnight and clear itself, which is the
+shape that produced the damage.
+
+At the moment of shipping, the last 24h reads dev 10, olivia 8, main 8 — so this does not fire
+today. It fires on the days that made it necessary.
+
+**THERE IS NO BYPASS FLAG, and no env override either.** An env-tunable cap is the bypass
+spelled differently and invisible in the record, and the population this exists to slow down
+is exactly the population that would export it. The escape is `--priority=high|urgent`, which
+is better than a flag because it is not a bypass — it is a claim about severity, recorded on
+the row and falsifiable later. High and urgent are never capped: *a quota that can block a
+serious finding will eventually eat one* (lodar, 2026-08-09).
+
+**The refusal names the alternative, not just the limit** — a refusal that only says "budget
+exhausted" buys silence, not judgement. It points at the body of the row the finding came
+from, and at `community/wiki/` for durable knowledge, which is where DIVE-3245 phase 2 will
+put findings, so the instruction does not change under people when that lands. The refused
+title is written to `policy_refusals` and the ledger rather than lost.
+
+Sits **beside** DIVE-2681's ratio cap, not on top of it: that one caps the proportion of
+internal-machinery titles fleet-wide, this caps one filer's volume whatever the titles say —
+and main's 404 low/medium rows in 30 days almost never classify as machinery, so the ratio cap
+never saw them. Distinct refusal slug, so `task refusals` can tell the two populations apart.
+
+Fails OPEN on an unreadable count, like the caps beside it: a quota that can break `task add`
+is worse than one that occasionally misses.
+
 ## v0.19.0 — feat(task): cap the rubber-stamp gate at the keystroke, not in a doc (DIVE-2848)
 
 `5dive/CLAUDE.md` line 61 has said "human gates only for money / irreversible / secrets /
