@@ -269,23 +269,40 @@ grep -q "$LEDGER_TS" <<<"$show_out" \
 #     Graded, not reasoned about, because "which way does this cut" was the open
 #     question on the row.
 # ---------------------------------------------------------------------------
-# A SEAT WITH NO HISTORY, on purpose: the arms above have already written real
-# task.started rows for dev2 at authority='self', which legitimately read as seat
-# advance. Reusing dev2 here would make the precondition fail and the arm below
-# prove nothing — a control has to start from a state where the thing under test
-# is the only thing that could move the answer.
-idx=$(addt "rung2-interaction" --assignee=rung2seat)
-idy=$(addt "rung2-subject" --assignee=rung2seat)
+# THE EVENT UNDER TEST IS EMITTED BY THE PRODUCT, NOT INSERTED BY THIS HARNESS.
+# The first version of this arm hand-wrote a lifecycle_events row with
+# authority='dispatcher' baked into the INSERT, and a mutant that flipped the
+# real emit to authority='self' SURVIVED it — 30/30 green over a defect that
+# would have disarmed the ladder. A fixture that carries the property being
+# asserted grades the fixture. So: run a real reclaim and read what it wrote.
+#
+# The SUBJECT is the reclaimed row itself. _hb_seat_advanced's tasks arm excludes
+# `id <> tid`, so asking about the reclaimed row removes the updated_at the
+# reclaim stamps on it and leaves the LEDGER arm as the only thing that can
+# answer — which is the arm this change adds to.
+#
+# A SEAT WITH NO HISTORY: the arms above wrote real task.started rows for dev2 at
+# authority='self', which legitimately read as seat advance. A control has to
+# start where the thing under test is the only thing that can move the answer.
+idz=$(addt "rung2-subject" --assignee=rung2seat)
 since='2026-08-11 00:00:00'
+db "UPDATE tasks SET status='in_progress', assignee='rung2seat',
+      started_at=datetime('now','-30 minutes'),
+      first_started_at=datetime('now','-30 minutes') WHERE id=${idz};"
 db "UPDATE tasks SET updated_at='2026-08-10 00:00:00' WHERE assignee='rung2seat';"
-_hb_seat_advanced rung2seat "$idy" "$since" rung2seat
+_hb_seat_advanced rung2seat "$idz" "$since" rung2seat
 [[ $? -ne 0 ]] && ok_t "rung 2 (precondition): a quiet seat does NOT read as advanced" \
   || bad_t "rung 2 (precondition): seat already reads as advanced — the arm below proves nothing" ""
-db "INSERT INTO lifecycle_events(ts,kind,ident,task_id,actor,authority,idem_key)
-      VALUES(datetime('now'),'task.reclaimed','X-2',${idx},'rung2seat','dispatcher','rung2|${idx}');"
-_hb_seat_advanced rung2seat "$idy" "$since" rung2seat
+_hb_claude_started() { date -u +%s; }           # rule (a): a REAL reclaim, real emit
+_hb_reclaim rung2seat 10 >/dev/null 2>&1
+_hb_claude_started() { echo ""; }
+[[ "$(evn "$idz" task.reclaimed)" == "1" ]] \
+  && ok_t "rung 2 (precondition): the reclaim really did emit its event" \
+  || bad_t "rung 2 (precondition): no event emitted — the arm below proves nothing" "n=[$(evn "$idz" task.reclaimed)]"
+db "UPDATE tasks SET updated_at='2026-08-10 00:00:00' WHERE assignee='rung2seat';"
+_hb_seat_advanced rung2seat "$idz" "$since" rung2seat
 [[ $? -ne 0 ]] \
-  && ok_t "rung 2: a task.reclaimed event does NOT read as seat advance — the ladder stays armed" \
+  && ok_t "rung 2: the reclaim's OWN event does NOT read as seat advance — the ladder stays armed" \
   || bad_t "rung 2: the reclaim event disarms the nudge ladder it is supposed to make visible" ""
 
 # ---------------------------------------------------------------------------
