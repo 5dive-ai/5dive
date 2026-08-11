@@ -99,6 +99,54 @@ grep -q 'task start' "$AUDIT_ROWS" \
   || bad_t "FINDING 2: \`task start\` still writes no audit row" "rows=[$(cat "$AUDIT_ROWS")]"
 
 # ---------------------------------------------------------------------------
+# 1b. The DISPATCHER claim stamps first_started_at from NULL.
+#
+# One arm per WRITE SITE, and each must start from NULL. `task start` is not the
+# majority path: DIVE-2244 moved the authoritative start to `_hb_claim_task`, so
+# a fix graded only through the verb leaves the path that carries most rows
+# unlocked. The re-claim arm further down asserts first_started_at is UNMOVED,
+# which cannot see this write at all — its fixture arrives with the field already
+# populated by `task start`, and "unmoved" passes identically when the write is
+# gone, because NULL staying NULL has no delta either. Found by quinn's mutation
+# of exactly this line (src/cmd_heartbeat.sh, the first_started_at= clause of
+# _hb_claim_task): 31/0 green with the original defect reproduced underneath.
+# ---------------------------------------------------------------------------
+idd=$(addt "dispatcher-claim" --assignee=dev2)
+[[ "$(fld "$idd" first_started_at)" == "NULL" && "$(fld "$idd" started_at)" == "NULL" ]] \
+  && ok_t "dispatcher claim: fixture starts from NULL on BOTH clocks (never through \`task start\`)" \
+  || bad_t "dispatcher claim: fixture was not NULL to begin with — the arm would prove nothing" \
+       "started=[$(fld "$idd" started_at)] first=[$(fld "$idd" first_started_at)]"
+_hb_claim_task dev2 "$idd" >/dev/null 2>&1
+sd=$(fld "$idd" started_at); fd=$(fld "$idd" first_started_at)
+[[ "$(status_of "$idd")" == "in_progress" ]] && ok_t "dispatcher claim: row moved to in_progress" \
+  || bad_t "dispatcher claim: row not claimed" "status=[$(status_of "$idd")]"
+[[ "$fd" != "NULL" && -n "$fd" ]] \
+  && ok_t "dispatcher claim: first_started_at STAMPED — the majority path is locked, not just \`task start\`" \
+  || bad_t "dispatcher claim: first_started_at left NULL by _hb_claim_task" "got=[$fd] started=[$sd]"
+[[ "$fd" == "$sd" ]] && ok_t "dispatcher claim: both clocks stamped to the same instant" \
+  || bad_t "dispatcher claim: clocks disagree" "started=[$sd] first=[$fd]"
+
+# And the composite the defect actually presented as: a DISPATCHER-claimed row
+# that is then reclaimed must still read its first start from the board. Without
+# the write above this is status=todo / started_at=NULL / first_started_at=NULL —
+# the original bug exactly, with every other arm in this file green.
+# Age the CLAIM clock only — first_started_at keeps whatever _hb_claim_task wrote,
+# which is the value under test. Rule (a) compares the claiming process against
+# started_at, so a claim stamped this second is never "older than the process".
+db "UPDATE tasks SET started_at=datetime('now','-30 minutes') WHERE id=${idd};"
+_hb_claude_started() { date -u +%s; }            # rule (a): claiming session gone
+_hb_reclaim dev2 100000 >/dev/null 2>&1
+_hb_claude_started() { echo ""; }
+[[ "$(status_of "$idd")" == "todo" && "$(fld "$idd" started_at)" == "NULL" ]] \
+  && ok_t "dispatcher claim + reclaim: row reverted to todo with started_at cleared" \
+  || bad_t "dispatcher claim + reclaim: row not reclaimed" \
+       "status=[$(status_of "$idd")] started=[$(fld "$idd" started_at)]"
+[[ "$(fld "$idd" first_started_at)" == "$fd" && "$fd" != "NULL" ]] \
+  && ok_t "dispatcher claim + reclaim: first_started_at SURVIVES — a dispatcher-claimed row is not blind" \
+  || bad_t "dispatcher claim + reclaim: first_started_at lost on the dispatcher path" \
+       "before=[$fd] after=[$(fld "$idd" first_started_at)]"
+
+# ---------------------------------------------------------------------------
 # 2/3/4. The three reclaim rules. One arm per rule — they are NOT
 # interchangeable: (a) reads the claiming process, (c) reads the budget, (b)
 # reads an idle sample, and each could regress on its own.
