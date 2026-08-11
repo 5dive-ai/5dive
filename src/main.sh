@@ -41,7 +41,8 @@ Agents:
   5dive market [<keyword>] [--role=<r>] [--rarity=<t>]  # browse/search the agent market; preview: 5dive market show <slug>
   5dive hire <role> --from-market [--as=<name>]  # hire from the open market; see '5dive hire --help'
   5dive agent list
-  5dive agent info <name>                            # type, CLI version, selected model, channel + state
+  5dive agent info <name>                            # type, CLI version, model, channel, state + OUTPUT (DIVE-3274:
+                                                     # whether the seat is transacting, not only whether it is up)
   5dive agent types
   5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz[,ch...]]
                             [--telegram-token=<bot-token>] [--discord-token=<token>]

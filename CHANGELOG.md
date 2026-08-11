@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
+
+DIVE-3272 taught the supervisor BOARD to see a seat that is alive and closing nothing. The
+drill-down people actually type kept printing only liveness: `state: active / enabled` was
+identical for a working seat and for `dev3`, which sat on an expired 1-week quota for four
+days with twenty rows queued behind it. Six green signals agreed about it, and that
+agreement is the defect, not evidence against the report
+(`community/wiki/every-signal-measured-liveness-none-measured-output.md`).
+
+`agent info` now prints two more lines and a `supervisor` block in `--json`:
+
+```
+state:       active / enabled · ⚠ NOT TRANSACTING (quota-exhausted: pane shows a model-capacity refusal: ...)
+output:      2 open row(s), nothing closed in 4d
+supervisor:  quota-exhausted / quota-exhausted — pane shows a model-capacity refusal: ... (tick 2m ago)
+```
+
+- **The two halves are not equally measurable from this surface, and it says which is
+  which.** `no-output` is a pure store read, so `info` re-runs `_sup_output_stats` itself:
+  measured at print time, no tick required, cannot go stale. `quota-exhausted` needs a root
+  `tmux capture-pane` hop that a read-only command running as any seat must not grow, so it
+  is INHERITED from `supervisor_events` and printed with its age and the tick's ARM STATE
+  attached. An unmeasured branch has to say less than the measured one (DIVE-2793), and an
+  unarmed monitor otherwise prints exactly what a quiet one prints (DIVE-2306).
+- **Freshness is decided by comparison, not by a wall-clock guess.** The tick writes an
+  `observe` row every tick for every non-healthy class, so an agent whose newest row
+  predates the newest fleet heartbeat was looked at and found healthy. A stale
+  `quota-exhausted` row is therefore never quoted as current.
+- **Four output states, never three.** `ok` / `idle` (no open rows — correctly idle, not
+  dry) / `unknown` (never closed anything: a new seat and a dark one read the same here) /
+  `unmeasured` (the store was not readable — nothing was measured, which is not a clear).
+  `transacting` is `null`, never `false`, for all but the dry case.
+- **The warning leads with the queue**, not the seat's symptom: the whole cost of the
+  incident was the rows stacked behind a seat nobody knew was dark, and the seat itself
+  cannot read its own `info` output.
+- **A stale TICK does not speak for the present either.** Past `_SUP_INFO_TICK_STALE`
+  (1h) the overlay reports `unobserved` and names the age instead of deriving `healthy`
+  from an observer that has stopped — the same absence-reads-as-health shape one level up
+  (main, at the DIVE-3274 push approval).
+- `agent list` is unchanged — it is the survey surface, and this is a per-agent drill-down
+  (three sqlite reads), deliberately not an N-way fan-out.
+
 ## Unreleased — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
 
 A gate reaches the filer's lead only if `_GATE_ENG_SHIP_RX` matches the ask or the row
