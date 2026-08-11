@@ -1692,6 +1692,32 @@ An internal-machinery finding gets its own ident ONLY if it has ALREADY blocked 
   # cap takes: if the count cannot be read the cap declines to enforce rather than
   # taking `task add` down. A quota that can break filing is worse than a quota
   # that occasionally misses.
+  #
+  # EVERY TERM OF THIS GUARD IS PART OF THE KEY — who can assert each one (the
+  # discipline quinn's it.2 reject asked for, after two doors were opened by
+  # clauses nobody had asked that question about). Stated here rather than left
+  # for the next reader to re-derive:
+  #
+  #   $kind == standard   CALLER-REACHABLE, via --recurring=<cron> (:1516) — and
+  #                       deliberately left reachable. It is the --priority=high
+  #                       case, not the --materialized case: it does not assert
+  #                       membership in an exemption, it makes the row a DIFFERENT
+  #                       OBJECT — a template with a validated cron, a permanent
+  #                       entry in `task ls --recurring`, and instances that
+  #                       materialize on a schedule under the filer's name. The
+  #                       property that made --body and --materialized bypasses is
+  #                       that they were free, silent and left no trace; a cron
+  #                       template is none of the three. NOT MEASURED — read off
+  #                       the source, not run against a seeded fixture.
+  #   $materialized       DERIVED from FUNCNAME (it.3). Not caller-reachable.
+  #   $_cap_exempt_prio   the high|urgent escape, defended above: a visible,
+  #                       recorded, falsifiable claim with a second reader.
+  #   store_is_prod       environment, not argv.
+  #
+  # And in the COUNT itself (_task_filer_low_med_24h): derived_actor is measured,
+  # from_template_id and origin are written by inserting verbs `task add` cannot
+  # reach. If you add a term to either, answer the question above IN THIS COMMENT
+  # before you add it.
   if [[ "$kind" == "standard" && -z "$materialized" && -z "$_cap_exempt_priority" ]] \
      && _task_filing_cap_store_is_prod; then
     # KEY ON THE DERIVATION, NOT THE CLAIM (DIVE-3245 it.2, quinn's reject).
