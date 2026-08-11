@@ -284,5 +284,42 @@ grep -qE '_br_cands=\$\(_gate_branch_refs_from_text [^)]*\) \|\| _br_cands=' "$S
   || bad_t "DIVE-2603: call site guarded" "the \$( ) assignment is unguarded — under set -e + pipefail a result naming no branch kills 'task done' with empty stdout and stderr"
 
 
+# --- 6. DIVE-3265 TRUE-POSITIVE ARMS: the control still FIRES ------------------
+# Marcus's merge condition, and it is the right one to insist on: this is a change
+# to a SAFETY CONTROL, so the arm that matters is not that the false positive
+# stopped firing — it is that the TRUE positive still does. "A gate that stops
+# crashing by learning to pass everything" is indistinguishable from a fix when you
+# only grade the thing that used to be red.
+#
+# 6a is the sharp one: a close carrying BOTH a real unlanded branch AND an artifact
+# filename must still REFUSE. If the extension filter were reachable as a laundering
+# route — name your branch, name a .md, watch the gate go quiet — that is a worse
+# defect than the one being fixed, and it would look identical from the outside.
+clear_fx
+export GH_STUB_COMMITS_5dive_main="$NO_MATCH_COMMITS"
+seed DIVE-2556
+run_done DIVE-2556 --result='delivered the note dive-2556-handoff.md; commit dc336f7 on branch dive-2556-maker-credit is UNPUSHED'
+if [[ $RC -ne 0 && "$(statusof DIVE-2556)" == "in_progress" ]]; then
+  ok_t 'DIVE-3265 6a TRUE POSITIVE: an .md alongside a REAL unlanded branch does not launder it — still REFUSED'
+else
+  bad_t 'DIVE-3265 6a TRUE POSITIVE: still refuses' "rc=$RC status=$(statusof DIVE-2556) — the extension filter became a bypass; that is worse than the bug it fixed. out=$OUT"
+fi
+printf '%s' "$OUT" | grep -q 'dive-2556-maker-credit' \
+  && ok_t 'DIVE-3265 6a: the refusal still names the BRANCH (and not the artifact)' \
+  || bad_t 'DIVE-3265 6a: refusal names the branch' "out=$OUT"
+printf '%s' "$OUT" | grep -q 'dive-2556-handoff.md' \
+  && bad_t 'DIVE-3265 6a: the refusal must NOT name the artifact' "the .md is back in the candidate set: $OUT" \
+  || ok_t 'DIVE-3265 6a: the artifact is absent from the refusal (it was never a candidate)'
+
+# 6b: the DIVE-1830 DECLARED-`Branch:` path is a DIFFERENT reader and must be
+# untouched by this change. Asserted structurally rather than inferred from the
+# sibling harness staying green: `_gate_branch_refs_from_text` has exactly TWO
+# callers, both on the unbound auto-detect path, so the bound gate cannot have
+# been widened. If a third caller ever appears, this arm is the tripwire.
+_callers=$(grep -cE '^[^#]*_gate_branch_refs_from_text "' "$SRC/cmd_task.sh")
+[[ "$_callers" == "2" ]] \
+  && ok_t 'DIVE-3265 6b: the extractor still has exactly 2 call sites — the declared-`Branch:` gate does not read it and was not widened' \
+  || bad_t 'DIVE-3265 6b: extractor call-site count' "found $_callers call sites, expected 2 — a new caller inherits this filter; re-argue the bias before shipping it"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

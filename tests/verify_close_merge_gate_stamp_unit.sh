@@ -187,9 +187,26 @@ E=$(mk "stamp arm E" "placeholder")
 if [[ -n "$E" ]]; then
   "$CLI" task set-body "$E" "Branch: ${E,,}-unlanded" >/dev/null 2>&1
   "$CLI" task verify "$E" --cmd=false >/dev/null 2>&1
+  "$CLI" task verify "$E" --cmd=false >/dev/null 2>&1; E_RC=$?
   res_of "$E" | grep -q "$STAMP" \
     && bad_t "E NEGATIVE: a FAIL must NOT stamp" "stamped on a failing verify" \
     || ok_t "E NEGATIVE: a failing verify records the FAIL without stamping"
+  # DIVE-3265 (Marcus's merge condition): ASSERT THE EXIT STATUS, NOT THE MESSAGE.
+  # A verb that fails while returning 0 is the nastier half of this ticket's class —
+  # every caller reading `$?` (a script, a loop, a cron) sees success and carries on.
+  # The message is for a human at a terminal; the status is the only thing the rest of
+  # the fleet reads, so it gets its own arm rather than riding on the prose.
+  #
+  # WHAT WAS ACTUALLY MEASURED, because it corrects the ticket body: the CRASH path
+  # exits 1, not 0. Built bundle, guard reverted as a negative control, no-branch row:
+  # rc=1, and the DIVE-2598 backstop prints "5dive task exited 1 without reporting a
+  # reason". So "rc=0 despite failing" does not reproduce at the CLI boundary and
+  # nothing was changed for it — but the property it was worried about is real and is
+  # now pinned here and at arm C, from both directions: a FAIL is non-zero, a clean
+  # close is zero.
+  [[ "$E_RC" -ne 0 ]] \
+    && ok_t "E: a failing verify EXITS NON-ZERO (rc=$E_RC) — a caller reading \$? cannot read it as success" \
+    || bad_t "E: a failing verify exits non-zero" "rc=0 on a FAIL — every scripted caller reads this run as a success"
 else
   bad_t "E: fixture row could not be created"
 fi
