@@ -5684,8 +5684,24 @@ $_body"
   # the ledger row below is: a fourth status verb added later cannot ship without
   # its trail. New cmd names (`task start` / `task done` / `task cancel`), so no
   # existing audit reader loses a row it was matching on.
-  _task_store_audit_log "task ${verb}" ok 0 -- "$ident" "status=$newstatus" \
-    "seat=$(id -un 2>/dev/null || printf '?')"
+  #
+  # NO `seat=` ARG, AND THE REASON IS BOTH CORRECTNESS AND COST. audit_log already
+  # derives the actor itself into three fields — `user` (_actor_identity), `derived`
+  # (the uid measurement) and `claimed` (populated ONLY when those two disagree,
+  # DIVE-2518). A `seat=$(id -un)` payload arg would be a FOURTH, WEAKER copy of the
+  # same fact: it records what this process says, cannot record a disagreement, and
+  # sits in the args array where nothing grades it. Provenance the row derives beats
+  # provenance the caller supplies. It was also the only forking expression on a path
+  # every status verb crosses, and a command substitution in an argument is expanded
+  # BEFORE the callee runs — so every test-store call paid a fork for a row the
+  # DIVE-2010 fence then withheld. MEASURED, and scoped to what was measured:
+  # removing it took tests/task_deliver_merge_gate_unit.sh from +918ms against
+  # pristine main to parity (13.2s both, two rounds). It did NOT account for the
+  # whole-corpus delta this branch carries (~+45s on 289 harnesses, unchanged by
+  # this edit) — that is still unattributed, and is written up in the PR body rather
+  # than guessed at here. Copying the idiom from the merge-gate site above is what
+  # put it here; that site is a rare path and this one is not.
+  _task_store_audit_log "task ${verb}" ok 0 -- "$ident" "status=$newstatus"
   local _lk="task.${newstatus}"
   [[ "$newstatus" == "in_progress" ]] && _lk="task.started"
   [[ -n "$handoff_ack" ]] && _lk="task.review"
