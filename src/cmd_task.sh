@@ -12603,7 +12603,19 @@ cmd_task_inbox() {
   routed_n="${routed_n:-0}"
   if (( JSON_MODE )); then
     local rows
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, need_type, ask, need_options, recommend, precedent_ref, need_answer, need_answered_at FROM tasks WHERE ${where} ${order};")
+    # DIVE-3224: `tier` is exported so a CONSUMER never has to re-derive the
+    # human/agent split to decide which gate gets a tap button. The telegram
+    # plugin's /inbox sourced `task ls --json` purely because this view withheld
+    # `tier` (its own comment says so), and rebuilding the "needs a human" filter
+    # plugin-side re-derived it wrong: it filtered on `need_type` alone, so the
+    # founder was shown all 12 open gates — 9 of them routed to agent seats, each
+    # with a ✅ apply-the-rec button on a question addressed to somebody else.
+    # Exporting the one missing field is what lets the predicate above stay the
+    # SINGLE copy. Do NOT answer the next such request by exporting
+    # `routed_reviewer`/`needs_capability` here — that invites a second copy of
+    # the rule, which is the DIVE-3171 two-copies-that-disagree shape and is the
+    # exact defect this line closes.
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, need_type, ask, need_options, recommend, tier, precedent_ref, need_answer, need_answered_at FROM tasks WHERE ${where} ${order};")
     [[ -n "$rows" ]] || rows="[]"
     # stdin, not --argjson — same ARG_MAX guard as `task ls`. (DIVE-222)
     # `routed_elsewhere` is additive under data{}; every existing consumer reads
