@@ -52,6 +52,21 @@ _task_usage() {
                                                     already DONE? (default: not yet)
       [--probe='<cmd>']                           --type=access: self-check the block
       [--secret-key=<ENV> --connector=<stem> | --out-of-band="<where>"]   (--type=secret needs one)
+      WHO CAN CLEAR IT, by type (DIVE-3228 — check this BEFORE you file, not after
+      'task answer' refuses you):
+        decision            any agent. Tier 1 by default.
+        approval            tier 1 by default: the routed lead clears it. At tier 2
+                            (you typed --tier=2, or the category floor fired on the
+                            ask) it is HUMAN-ONLY — a routed lead's answer is
+                            escalated to a human tap, not accepted.
+        access              tier 2 by default, but lead-clearable at that default:
+                            the routed lead clears it. Pinned --tier=2 or a category
+                            floor hit makes it HUMAN-ONLY.
+        manual              HUMAN-ONLY at tier 2 (its default) — a step only a person
+                            can perform.
+        secret              ALWAYS HUMAN-ONLY, at every tier. Never routed.
+      And on ANY type, --needs=spend_authority|human_tap|secret_provision is
+      HUMAN-ONLY by declaration: it outranks the tier and every routing kind.
   need <id> --withdraw                          cancel a pending gate that is now moot
   answer <id> --value="..." [--proof=<token>] [--channel-proof=<chat> [--channel-msg=<id>]]
       [--tap-uid=<tg user id> [--tap-username=<handle>] [--tap-msg=<message id>]]
@@ -8070,6 +8085,70 @@ _gate_lead_standing_eligible() {
   return 0
 }
 
+# DIVE-3228 — THE COMMENT AND THE CONDITION DISAGREED, AND THE CONDITION WON.
+#
+# `access` defaults to tier 2 (the `*) tier=2` arm at the type-default case below),
+# and DIVE-1243 made it lead-clearable BY TYPE: it is routable regardless of tier,
+# it bypasses the gate_builder_routing pref, and cmd_task_answer's
+# designated-reviewer exception lists it alongside approval/manual. So filing one
+# tells the filer it routed, and `routed_reviewer` really is set.
+#
+# Then the tier-2 floor in cmd_task_answer (`gtier == 2 && ! human`) refuses the
+# routed lead's answer, and the DIVE-1437 escalation immediately below it is scoped
+# `[[ $nt == approval || $nt == manual ]]` — `access` is not in that list, so it
+# does not even get the escalation's tap button; it takes the original hard
+# refusal. The comment eight lines above that condition asserts the opposite
+# ("`access` is DELIBERATELY lead-clearable by DIVE-1243"), which is how this
+# survived: every reader who checked the intent found it documented and correct.
+#
+# MEASURED, DIVE-3212 (ops -> main, 2026-08-11): filed --type=access, routed at
+# main explicitly, `task answer` refused with "DIVE-3212 is a tier-2 human gate
+# (access) — only a human can clear it; tap the button in Telegram". The filer did
+# everything right and still produced a gate only lodar could clear, for a push to
+# our own repo. It was already MOOT when it refused — the branch was pushed and
+# PR #585 opened before the answer was attempted — so it sat in the human inbox
+# describing work that was done.
+#
+# WHY THIS IS NOT "let the lead clear tier 2". The exemption is re-derived FROM THE
+# ROW rather than inferred from `_lead_clear` alone, and that is deliberate: relying
+# on the file-time invariant ("a floored/pinned access gate never gets routed, so a
+# routed one must be clean") is exactly the necessary-but-not-sufficient trap this
+# same row already produced once — the six-harness population that was derived
+# statically and measured to zero. A row written by an older build, or by any future
+# path that sets routed_reviewer, must not inherit clearance from an argument about
+# what cmd_task_need does today.
+#
+# So `access` at tier 2 is lead-clearable ONLY when the store can say it is tier 2
+# for the one reason that carries no human class:
+#   axis=type-default   -> 2 because `access` defaults to 2. Nobody chose it. ALLOW.
+#   axis=pinned         -> the caller typed --tier=2. DIVE-1957: a hard-human
+#                          contract no KIND-based override may cross. DENY.
+#   axis=ask / title-fallback -> the T2 category floor fired on money / secrets /
+#                          destructive / publish. DENY.
+#   '' or NULL          -> a pre-DIVE-2615 row: the column was never written, so the
+#                          reason is UNKNOWN. An unknown is not a type-default. DENY.
+# and a declared human-class `--needs` (spend_authority / human_tap / secret_provision)
+# denies on top of all of it — the filer STATING what the ask consumes outranks any
+# inference about the tier (DIVE-2241).
+#
+# `secret` can never reach here: it is never routed, so `_lead_clear` is 0 for it by
+# construction, and it is not this predicate's type anyway.
+#
+# _gate_access_lead_clearable <need_type> <tier> <floor_provenance> <needs_capability>
+#   -> 0 when a tier-2 `access` gate's ROUTED lead may clear it despite the T2 floor.
+_gate_access_lead_clearable() {
+  local nt="${1:-}" tier="${2:-}" floor_prov="${3:-}" needs="${4:-}"
+  [[ "$nt" == "access" ]] || return 1
+  [[ "$tier" == "2" ]] || return 1
+  # DIVE-2241: the declaration outranks the tier's provenance, so it is checked
+  # first and independently. An UNRECOGNISED capability is not a human one and
+  # changes nothing here, exactly as it changes nothing at filing time.
+  if [[ -n "${needs//[[:space:]]/}" ]] && _gate_needs_human "$needs"; then return 1; fi
+  # The ONE allowed provenance. Everything else — including empty — denies.
+  [[ "$floor_prov" == "axis=type-default" ]] || return 1
+  return 0
+}
+
 # DIVE-2099 iteration 2 — WHO holds the standing authority, anchored to a NAMED
 # agent. lodar answered the tier-2 decision gate 2026-07-27 with
 # `anchor-to-named-agent`, over `keep-chart-derived`.
@@ -12479,10 +12558,36 @@ cmd_task_inbox() {
   # CAST, which yields 0. Measured — the arm for this went red before the NULLIF.
   # (clear-recs has the same gap with the opposite sign: there '' reads as tier 0
   # and becomes ELIGIBLE for a blanket clear. Out of scope here, noted on the row.)
-  local human_where="${open_where}
-    AND ( COALESCE(routed_reviewer,'') = ''
+  # DIVE-3228: the `tier >= 2` escape used to capture a ROUTED `access` gate that a
+  # lead can now actually clear — so lodar was shown a question already addressed to
+  # somebody else, which is the complaint this row exists for. Same defect as
+  # DIVE-3117 part 2 above, one type further along.
+  #
+  # STRICTER THAN THE ANSWER-SIDE PREDICATE, ON PURPOSE, AND THAT IS THE WHOLE
+  # DESIGN NOTE. `_gate_access_lead_clearable` is bash and cannot run inside this
+  # SELECT, and restating it in SQL would be the two-copies-that-can-disagree
+  # problem DIVE-3171 names. So this clause is deliberately a SUBSET of it: it
+  # additionally requires `needs_capability` to be EMPTY, where the bash predicate
+  # tolerates an UNRECOGNISED capability. The two can therefore disagree in exactly
+  # one direction — a gate the lead may clear can still be SHOWN here — and never
+  # in the other. Showing a human one gate too many is recoverable; hiding one that
+  # no agent will clear is the defect this whole view exists to prevent, and it is
+  # the same fail-safe direction the UNKNOWN-tier note below relies on.
+  # DIVE-3228: ONE predicate, used by both the view and the withheld-count below.
+  # It used to be written out twice — once here and once, negated by hand, in
+  # `routed_n` — and adding the access clause to only the first would have made the
+  # count under-report exactly the gates this change withholds. A fix that records
+  # only its successes leaves the next regression with nothing to count, and a
+  # hand-maintained inverse is the form that rots silently, since both halves still
+  # run and neither errors.
+  local human_pred="( COALESCE(routed_reviewer,'') = ''
           OR CAST(COALESCE(NULLIF(tier,''),'2') AS INTEGER) >= 2
-          OR COALESCE(needs_capability,'') != '' )"
+          OR COALESCE(needs_capability,'') != '' )
+    AND NOT ( COALESCE(need_type,'') = 'access'
+              AND COALESCE(routed_reviewer,'') != ''
+              AND COALESCE(floor_provenance,'') = 'axis=type-default'
+              AND COALESCE(needs_capability,'') = '' )"
+  local human_where="${open_where} AND ${human_pred}"
   local where="$human_where"
   local order="ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, created_at"
   if (( send )); then
@@ -12494,7 +12599,7 @@ cmd_task_inbox() {
   # newly-quiet inbox is indistinguishable from a fleet with no open gates — the
   # same "an unnotified gate reads exactly like a notified one" shape this rail has
   # been burned by before. It is a count and a pointer, never the asks themselves.
-  local routed_n; routed_n=$(db "SELECT COUNT(*) FROM tasks WHERE ${open_where} AND NOT ( COALESCE(routed_reviewer,'') = '' OR CAST(COALESCE(NULLIF(tier,''),'2') AS INTEGER) >= 2 OR COALESCE(needs_capability,'') != '' );")
+  local routed_n; routed_n=$(db "SELECT COUNT(*) FROM tasks WHERE ${open_where} AND NOT ( ${human_pred} );")
   routed_n="${routed_n:-0}"
   if (( JSON_MODE )); then
     local rows
@@ -13830,7 +13935,32 @@ cmd_task_answer() {
   # only a NON-human answer on a tier-2 gate, which is precisely what a hard human
   # floor means on every box, armed or not — every real human path passes --human, so
   # DIVE-525 ("a real tap is never rejected") still holds by construction.
-  if [[ "$gtier" == "2" ]] && (( ! human )); then
+  # DIVE-3228: the `access` exemption, re-derived from the row (see
+  # _gate_access_lead_clearable for why it is re-derived and not taken from
+  # `_lead_clear` alone). `_lead_clear` is still REQUIRED — it carries the
+  # unforgeable half (`_gate_authenticated_actor` == routed_reviewer, DIVE-2004/2330),
+  # and this predicate only decides whether THAT seat's answer survives the floor.
+  # An access gate that was never routed has _lead_clear=0 and is untouched here,
+  # which is the DIVE-1243 fall-through the block below already describes.
+  local _access_lead_ok=0
+  if [[ "$_lead_clear" == "1" && "$nt" == "access" && "$gtier" == "2" ]]; then
+    local _al_floor _al_needs
+    _al_floor=$(db "SELECT COALESCE(floor_provenance,'') FROM tasks WHERE id=${id};")
+    _al_needs=$(db "SELECT COALESCE(needs_capability,'') FROM tasks WHERE id=${id};")
+    if _gate_access_lead_clearable "$nt" "$gtier" "$_al_floor" "$_al_needs"; then
+      _access_lead_ok=1
+    fi
+    # Record BOTH directions. A fix that logs only its successes leaves the next
+    # regression with nothing to count — this row's own DIVE-3117 lesson, and the
+    # denying branch is the one that will be argued about (it is where a filer whose
+    # access gate still reaches lodar has to be told WHY).
+    # DIVE-2054: task-store state for $ident, no channel proof — fenced.
+    _task_store_audit_log "task answer access-lead-clear" \
+      "$( ((_access_lead_ok)) && echo allowed || echo denied )" 0 -- \
+      "task=$ident" "type=$nt" "tier=$gtier" "routed_to=$_routed_rev" \
+      "floor_provenance=${_al_floor:-<null>}" "needs=${_al_needs:-<none>}" || true
+  fi
+  if [[ "$gtier" == "2" ]] && (( ! human )) && (( ! _access_lead_ok )); then
     local _caller3; _caller3=$(_gate_caller_user)
     # DIVE-1437: a tier-2 gate that was LEAD-ROUTED (routed_reviewer set) but is an
     # approval/manual builder gate is the DIVE-1429 stall — the DIVE-1145/1182

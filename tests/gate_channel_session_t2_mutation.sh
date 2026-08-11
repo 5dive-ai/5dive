@@ -148,8 +148,20 @@ grade "M9-form-not-recorded" "CS1 records the form as channel-session" \
 # so. That is the harness's own self-check working exactly as its header promises,
 # and it is why the mutation is asserted to apply rather than assumed to: a
 # no-op mutant is otherwise indistinguishable from a killed one.
+# RE-ANCHORED AGAIN 2026-08-11 (DIVE-3228), for the same reason and by the same
+# mechanism as the DIVE-2589 pass above: DIVE-3228 added the `&& (( ! _access_lead_ok ))`
+# conjunct so a ROUTED tier-2 `access` gate's lead can clear it, the anchor stopped
+# matching, and this mutant reported "mutation applies to the current source" —
+# graded NOTHING, and said so, on the very commit that moved the line. Twice now this
+# self-check has caught a floor edit before it could ship a silently-vacuous mutant,
+# which is the argument for asserting a mutation applies rather than assuming it.
+#
+# The MUTANT is unchanged (`if false`) because what it grades is unchanged: it kills
+# the floor outright and the CS11 decision arm must go red. The added conjunct cannot
+# fire for a `decision` gate — `_access_lead_ok` is set only under
+# `nt == access` — so the mutation still isolates the floor and nothing else.
 grade "M10-floor-provenance" "CS11 the same tier-2 DECISION gate REFUSES" \
-  '  if [[ "$gtier" == "2" ]] && (( ! human )); then' \
+  '  if [[ "$gtier" == "2" ]] && (( ! human )) && (( ! _access_lead_ok )); then' \
   '  if false; then'
 
 # ── the freshness bound, which iteration 1 let the caller set ────────────────
