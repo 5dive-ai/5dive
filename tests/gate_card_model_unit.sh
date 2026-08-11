@@ -106,6 +106,19 @@ _task_gate_card_record "DIVE-C1" "1234567890" "502" "none"
 chk "mint: a delivery with no via records NO card" "1" \
     "$(db "SELECT COUNT(*) FROM gate_cards WHERE task_id=$TID;")"
 
+# The re-nag batches several gates into ONE message, so `tasks=` is a comma list
+# and every ident in it needs its own card row pointing at that shared message.
+# Exercises the comma split directly — the path where a botched IFS would either
+# drop every card but the first or record one card named "DIVE-X,DIVE-Y".
+TIDM1=$(mk_task DIVE-M1); TIDM2=$(mk_task DIVE-M2)
+_task_gate_card_record "DIVE-M1,DIVE-M2" "999" "1500" "marketing"
+chk "batched re-nag: each ident in the comma list gets its own card" "1 1" \
+    "$(live_n "$TIDM1") $(live_n "$TIDM2")"
+chk "batched re-nag: both point at the one message that was actually sent" "1500 1500" \
+    "$(db "SELECT message_id FROM gate_cards WHERE task_id=$TIDM1;") $(db "SELECT message_id FROM gate_cards WHERE task_id=$TIDM2;")"
+chk "batched re-nag: and no card is named after the whole list" "0" \
+    "$(db "SELECT COUNT(*) FROM gate_cards WHERE ident LIKE '%,%';")"
+
 # ------------------------------------------------------------- invariant ----
 # The index is the enforcement. A second send into the same chat must not be able
 # to leave two live cards behind — that IS the four-DMs-in-three-minutes shape.
