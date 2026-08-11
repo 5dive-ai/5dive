@@ -12336,10 +12336,36 @@ cmd_task_inbox() {
   # CAST, which yields 0. Measured — the arm for this went red before the NULLIF.
   # (clear-recs has the same gap with the opposite sign: there '' reads as tier 0
   # and becomes ELIGIBLE for a blanket clear. Out of scope here, noted on the row.)
-  local human_where="${open_where}
-    AND ( COALESCE(routed_reviewer,'') = ''
+  # DIVE-3228: the `tier >= 2` escape used to capture a ROUTED `access` gate that a
+  # lead can now actually clear — so lodar was shown a question already addressed to
+  # somebody else, which is the complaint this row exists for. Same defect as
+  # DIVE-3117 part 2 above, one type further along.
+  #
+  # STRICTER THAN THE ANSWER-SIDE PREDICATE, ON PURPOSE, AND THAT IS THE WHOLE
+  # DESIGN NOTE. `_gate_access_lead_clearable` is bash and cannot run inside this
+  # SELECT, and restating it in SQL would be the two-copies-that-can-disagree
+  # problem DIVE-3171 names. So this clause is deliberately a SUBSET of it: it
+  # additionally requires `needs_capability` to be EMPTY, where the bash predicate
+  # tolerates an UNRECOGNISED capability. The two can therefore disagree in exactly
+  # one direction — a gate the lead may clear can still be SHOWN here — and never
+  # in the other. Showing a human one gate too many is recoverable; hiding one that
+  # no agent will clear is the defect this whole view exists to prevent, and it is
+  # the same fail-safe direction the UNKNOWN-tier note below relies on.
+  # DIVE-3228: ONE predicate, used by both the view and the withheld-count below.
+  # It used to be written out twice — once here and once, negated by hand, in
+  # `routed_n` — and adding the access clause to only the first would have made the
+  # count under-report exactly the gates this change withholds. A fix that records
+  # only its successes leaves the next regression with nothing to count, and a
+  # hand-maintained inverse is the form that rots silently, since both halves still
+  # run and neither errors.
+  local human_pred="( COALESCE(routed_reviewer,'') = ''
           OR CAST(COALESCE(NULLIF(tier,''),'2') AS INTEGER) >= 2
-          OR COALESCE(needs_capability,'') != '' )"
+          OR COALESCE(needs_capability,'') != '' )
+    AND NOT ( COALESCE(need_type,'') = 'access'
+              AND COALESCE(routed_reviewer,'') != ''
+              AND COALESCE(floor_provenance,'') = 'axis=type-default'
+              AND COALESCE(needs_capability,'') = '' )"
+  local human_where="${open_where} AND ${human_pred}"
   local where="$human_where"
   local order="ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, created_at"
   if (( send )); then
@@ -12351,7 +12377,7 @@ cmd_task_inbox() {
   # newly-quiet inbox is indistinguishable from a fleet with no open gates — the
   # same "an unnotified gate reads exactly like a notified one" shape this rail has
   # been burned by before. It is a count and a pointer, never the asks themselves.
-  local routed_n; routed_n=$(db "SELECT COUNT(*) FROM tasks WHERE ${open_where} AND NOT ( COALESCE(routed_reviewer,'') = '' OR CAST(COALESCE(NULLIF(tier,''),'2') AS INTEGER) >= 2 OR COALESCE(needs_capability,'') != '' );")
+  local routed_n; routed_n=$(db "SELECT COUNT(*) FROM tasks WHERE ${open_where} AND NOT ( ${human_pred} );")
   routed_n="${routed_n:-0}"
   if (( JSON_MODE )); then
     local rows

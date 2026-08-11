@@ -212,6 +212,52 @@ answer_as main DIVE-92283 >/dev/null
   && ok_t "E5 …and the lead's answer did NOT clear it — it still awaits a human" \
   || bad_t "E5 approval not cleared" "need_answered_at='$(col DIVE-92283 need_answered_at)' — the fix leaked into approval"
 
+# ================================================================================
+# I — THE SECOND READER. `task inbox` is "what is waiting on a HUMAN", and its
+# `tier >= 2` escape captured a routed access gate a lead can now clear — showing
+# lodar a question already addressed to somebody else. Changing the clearer without
+# changing this reader is how the row ships half-fixed, which its body asks for by
+# name (ENUMERATE THE READERS).
+# ================================================================================
+inbox_json() { ( JSON_MODE=1; cmd_task_inbox ) 2>/dev/null; }
+in_inbox()   { inbox_json | jq -e --arg i "$1" '.data.inbox[]?|select(.ident==$i)' >/dev/null 2>&1; }
+routed_n()   { inbox_json | jq -r '.data.routed_elsewhere // 0'; }
+open_n()     { db "SELECT COUNT(*) FROM tasks WHERE need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled');"; }
+
+mk_gate() { # <ident> <need_type> <tier> <routed> <floor_prov> <needs>
+  seed "$1" "inbox fixture"
+  db "UPDATE tasks SET need_type='$2', tier=$3, status='blocked', ask='an ask',
+        routed_reviewer=$(sqlq "$4"), floor_provenance=$(sqlq "$5"), needs_capability=$(sqlq "$6")
+      WHERE ident='$1';"
+}
+mk_gate DIVE-92284 access   2 main 'axis=type-default'    ''
+mk_gate DIVE-92285 access   2 main 'axis=ask;term=delete' ''
+mk_gate DIVE-92286 access   2 ''   'axis=type-default'    ''
+mk_gate DIVE-92287 access   2 main 'axis=type-default'    'human_tap'
+mk_gate DIVE-92288 approval 2 main 'axis=type-default'    ''
+
+in_inbox DIVE-92284 && bad_t "I1 lead-clearable access must NOT sit in the human inbox" "still listed" \
+                    || ok_t "I1 a ROUTED type-default access gate is no longer the human's"
+in_inbox DIVE-92285 && ok_t "I2 a CATEGORY-FLOORED access gate is still the human's" \
+                    || bad_t "I2 floored access hidden" "a floored gate vanished from the human inbox"
+in_inbox DIVE-92286 && ok_t "I3 an UNROUTED access gate is still the human's" \
+                    || bad_t "I3 unrouted access hidden" "no agent can clear it and nobody is shown it"
+in_inbox DIVE-92287 && ok_t "I4 a declared human_tap access gate is still the human's" \
+                    || bad_t "I4 human_tap access hidden" "a declared capability was overridden"
+in_inbox DIVE-92288 && ok_t "I5 a tier-2 APPROVAL is still the human's (scope control)" \
+                    || bad_t "I5 approval hidden" "the access clause leaked into approval"
+
+# I6 THE COMPLEMENT. `routed_elsewhere` is the count of what the filter WITHHELD, and
+# it used to be a hand-written negation of the same predicate — two copies that both
+# run and neither errors when they drift. Assert they still partition the open set.
+_i_shown=$(inbox_json | jq -r '.data.inbox|length'); _i_routed=$(routed_n); _i_open=$(open_n)
+[[ $(( _i_shown + _i_routed )) == "$_i_open" ]] \
+  && ok_t "I6 shown + routed_elsewhere == every open gate (the inverse is a true complement)" \
+  || bad_t "I6 complement" "shown=$_i_shown routed=$_i_routed open=$_i_open — the withheld count drifted from the view"
+(( _i_routed > 0 )) \
+  && ok_t "I6 …and the withheld count is NON-ZERO, so the arm above is not vacuous" \
+  || bad_t "I6 vacuity" "routed_elsewhere=0 — I6 would pass against a filter that withholds nothing"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 SUMMARY_PRINTED=1
 [[ "$FAIL" == "0" ]] || exit 1
