@@ -56,6 +56,61 @@ _HB_STALE_MIN_MINUTES=45
 # the claim is stamped AFTER _hb_mark_run — see the call site.
 _HB_STARVE_AFTER=3
 
+# DIVE-3218 — nudge-threshold ENFORCEMENT, the rung above _HB_STARVE_AFTER.
+#
+# _hb_mark_run has echoed a per-task nudge count since DIVE-1486 "so the caller
+# can decide whether the task is being starved". Until now the only caller that
+# read it LOGGED (the WARN under _HB_STARVE_AFTER, at the call site) and changed
+# nothing. Measured 2026-08-11: dev3 was woken about ONE urgent row, DIVE-2896,
+# 173 times over 3.5 days with zero state change — every wake a full fresh-context
+# opus session that re-read the same stale in-row note, re-derived the same "wait"
+# conclusion and exited, with no memory that it had done so 172 times already.
+# A counter nobody consumes is detection, not enforcement:
+#   community/wiki/a-nudge-counter-nobody-consumes-is-detection-not-enforcement.md
+#
+# _HB_STARVE_AFTER STAYS AS IT IS. It is a cheap, early, per-tick observation at
+# n>=3 feeding the `starved` tally in the tick summary; this ladder is a separate,
+# far higher bar that ACTS. Lowering the log threshold to meet the action, or
+# raising it to hide it, would silently redefine an emitted signal — the readers
+# of `starved` are the tick summary line and its JSON, both in this file, and
+# neither is touched here.
+#
+# THRESHOLDS ARE PER PRIORITY BAND: the cost of a wasted wake is identical across
+# bands but the tolerable latency is not — an urgent row must cross in HOURS, a
+# low one may take a day. They count NUDGES, not hours, because the count is the
+# burn: a row nudged 8 times has cost 8 whole sessions whatever the wall clock
+# says. At the common 15-minute cadence these are roughly 2h / 4h / 8h / 16h to
+# the first rung, and double that to the second.
+_HB_NUDGE_ENFORCE_AFTER_URGENT=8
+_HB_NUDGE_ENFORCE_AFTER_HIGH=16
+_HB_NUDGE_ENFORCE_AFTER_MEDIUM=32
+_HB_NUDGE_ENFORCE_AFTER_LOW=64
+
+# Resolve the first-rung threshold N for a priority band. Registry
+# `.config.heartbeat.nudgeEnforceAfter.<band>` wins when it is a positive
+# integer; otherwise the compiled default above. Config rather than a bare
+# hardcode (DIVE-3218) because the right N is fleet-shaped — it moves with tick
+# cadence and roster size — and must be tunable without a release cut.
+#
+# A MISSING OR GARBLED CONFIG FALLS BACK TO THE DEFAULT, NEVER TO "OFF". An
+# unreadable registry silently restoring the 173-wake world is the exact failure
+# this ladder exists to end, so there is deliberately no value that disables it
+# from config; raise N instead.
+_hb_nudge_enforce_after() {
+  local band="$1" reg="${2:-}" v="" dflt
+  case "$band" in
+    urgent) dflt=$_HB_NUDGE_ENFORCE_AFTER_URGENT ;;
+    high)   dflt=$_HB_NUDGE_ENFORCE_AFTER_HIGH ;;
+    low)    dflt=$_HB_NUDGE_ENFORCE_AFTER_LOW ;;
+    *)      dflt=$_HB_NUDGE_ENFORCE_AFTER_MEDIUM ;;
+  esac
+  [[ -n "$reg" ]] || reg=$(registry_read 2>/dev/null) || reg=""
+  if [[ -n "$reg" ]]; then
+    v=$(jq -r --arg b "$band" '.config.heartbeat.nudgeEnforceAfter[$b] // empty' <<<"$reg" 2>/dev/null || echo "")
+  fi
+  if [[ "$v" =~ ^[0-9]+$ ]] && (( v > 0 )); then printf '%s' "$v"; else printf '%s' "$dflt"; fi
+}
+
 # DIVE-2716 — how many of an agent's runnable todos the wake loop will step
 # through looking for one the tier guard clears. Bounded on purpose: each
 # candidate costs two small queries plus a registry read, and a queue where the
@@ -610,6 +665,316 @@ _hb_mark_run() {
       )')
   echo "$reg" | registry_write
   jq -r --arg n "$name" --arg tid "$task_id" '.agents[$n].heartbeat.nudges[$tid] // 0' <<<"$reg"
+}
+
+# DIVE-3218 — drop ONE task's nudge entry for one agent, under the registry lock.
+# _hb_mark_run's own prune already clears an entry once the row leaves 'todo', so
+# park and start reset the counter for free. The RE-ASSIGN rung does not: it
+# leaves the row in 'todo' under new hands, and without this the previous
+# assignee's count stays pegged at 2N forever — a stale number that reads as an
+# ongoing starvation nobody is experiencing. Must run under with_registry_lock,
+# like _hb_mark_run.
+_hb_clear_nudge() {
+  local name="$1" task_id="$2" reg
+  reg=$(registry_read) || return 1
+  echo "$reg" | jq --arg n "$name" --arg tid "$task_id" '
+    if (.agents[$n].heartbeat.nudges? // null) != null
+    then .agents[$n].heartbeat.nudges |= del(.[$tid])
+    else . end' | registry_write
+}
+
+# DIVE-3218 — append ONE dated line to a task body.
+#
+# THIS IS THE LOAD-BEARING HALF OF THE LADDER, not its bookkeeping. A
+# fresh-context seat has no memory of its own previous wakes; the row body is the
+# only thing it re-reads. An enforcement action that changes state without
+# writing WHY into the body therefore just relocates the re-deliberation instead
+# of ending it — the next seat wakes, finds a row at a priority it cannot account
+# for, and reasons from zero again. With the note, wake N+1 starts from a
+# recorded decision.
+#
+# APPEND, NEVER REWRITE: the body carries the filer's words and every earlier
+# note, and the ladder is the last thing that should be trusted to summarise
+# them.
+_hb_row_note() {
+  local id="$1" note="$2"
+  db "UPDATE tasks
+      SET body = COALESCE(body,'')
+                 || CASE WHEN COALESCE(body,'') = '' THEN '' ELSE char(10)||char(10) END
+                 || $(sqlq "$note"),
+          updated_at=datetime('now')
+      WHERE id=${id};" 2>/dev/null || true
+}
+
+# DIVE-3218 — consume the nudge count. Called once per delivered nudge, straight
+# after _hb_mark_run, with the post-increment count.
+#
+# TWO RUNGS, deliberately mirroring the DIVE-2853 recurring-stall ladder rather
+# than inventing a second shape: surface-then-change-hands, once per row each,
+# stamped in the ROW so the throttle survives a registry prune. What differs is
+# only what the two ladders can read — 2853 keys on HOURS since materialisation
+# for a beat whose later slots are being eaten by skip-if-open; this one keys on
+# COUNT of fruitless wakes for any standard row, and the two predicates cannot
+# see each other's rows.
+#
+#   RUNG 1, at N: escalate once (existing `task escalate` semantics — one
+#   priority band, capped at urgent, pings the owner) and write a dated line into
+#   the body. Escalation alone is a weak lever on a row that is already urgent —
+#   that is precisely why the body note is not optional.
+#
+#   RUNG 2, at 2N: change hands, or park with a wake date. Reassign to a FREE
+#   agent (never the current assignee — handing the row back to the party whose
+#   not-starting-it IS the fault is the no-op this rung exists to stop — and
+#   never the row's own verifier, the DIVE-3097 guard, since that manufactures
+#   the assignee==verifier shape by heartbeat). Lane first: a free agent under
+#   the same org parent, then any free agent. If nobody is free, PARK with a wake
+#   date so the row stops being nudged until then.
+#
+# NEVER CANCEL, and this is where the ladder parts company with DIVE-2853's
+# fallback. That one cancels because an open recurring instance SUPPRESSES every
+# later slot of its beat, so leaving it open is an ongoing outage. A standard row
+# suppresses nothing; it is merely starved. A starved row is not an unwanted row,
+# and auto-cancelling one would destroy work lodar asked for on the evidence that
+# nobody got to it.
+# DIVE-3218 (main, 2026-08-11) — the SIBLING of the unanswered-gate hold.
+#
+# `_hb_nudge_enforce` reads the priority band, the row's own stamps and the gate
+# hold. It reads NOTHING about the assignee's SEAT — so a seat working a
+# deliberate multi-row order accumulates nudges on rows 2..N BY CONSTRUCTION,
+# precisely because it is productively working row 1. At the `high` default of 8
+# those rows get reassigned out from under a seat doing exactly what it was told.
+# Measured, not hypothetical: two such notices fired on quinn's DIVE-3229 and
+# DIVE-3238 on the morning of 2026-08-11, both actively planned in an order main
+# had given them.
+#
+#   "A row waiting on an unanswered human gate is not starved — the wait is on a
+#    person." Its sibling: a row waiting behind its own assignee's OTHER work is
+#   not starved either — the wait is on a QUEUE.
+#
+# NO NEW SIGNAL. The question is answerable from rows this function already
+# reaches: did this seat advance ANYTHING between rung 1 firing and now? Two
+# independent readings, OR'd, because each covers the other's blind spot.
+#
+# THE TRAP THAT MAKES THE NAIVE VERSION USELESS: the engine's own writes are
+# attributed to the SEAT, so "any row of this assignee changed" is true even for
+# a seat that is completely dead.
+#   * rung 1 stamps `updated_at` on THIS row, and on every OTHER row of the same
+#     seat it fires on -> exclude $tid, and exclude rows carrying an engine
+#     nudge stamp inside the same window.
+#   * lifecycle_events rows written when the DISPATCHER claims a row carry
+#     `authority='dispatcher'` and the SEAT'S OWN NAME as `actor` (measured:
+#     olivia/dev/ops/quinn all appear this way). That is the engine claiming on
+#     the seat's behalf, NOT seat work -> excluded, together with 'heartbeat'.
+#     Measured on the live board 2026-08-11: zero seat events carry
+#     authority='heartbeat', so that exclusion costs nothing real.
+#
+# FAILS TOWARD HOLD, DELIBERATELY. An unreadable store, a missing column or a
+# missing lifecycle_events table yields "" from `db`, which reads as "no evidence
+# of advance" -> the ladder still fires. So the TASKS reading is primary (its
+# columns are the ones this function already selects) and the ledger reading only
+# WIDENS the hold; a store without lifecycle_events degrades to the tasks reading
+# rather than to a hold that silently never holds.
+_hb_seat_advanced() {
+  local name="$1" tid="$2" since="$3" asg="${4:-}"
+  [[ -n "$since" ]] || return 1
+  [[ "${tid:-}" =~ ^[0-9]+$ ]] || return 1
+  local seats hit=""
+  seats="$(sqlq "$name")"
+  [[ -n "$asg" && "$asg" != "$name" ]] && seats="${seats},$(sqlq "$asg")"
+
+  # (A) TASKS — "closed, delivered, rejected or updated any row in that window".
+  # `updated_at` is the broad one and the only one that catches a body note, so it
+  # is what we read; the engine-stamp exclusion is what keeps it honest.
+  hit=$(db "SELECT 1 FROM tasks
+             WHERE assignee IN (${seats})
+               AND id <> ${tid}
+               AND COALESCE(updated_at,'') > $(sqlq "$since")
+               AND NOT (COALESCE(nudge_escalated_at,'') > $(sqlq "$since")
+                     OR COALESCE(nudge_parked_at,'')    > $(sqlq "$since"))
+             LIMIT 1;" 2>/dev/null || echo "")
+  [[ -n "$hit" ]] && return 0
+
+  # (B) LEDGER — catches seat work that leaves no `updated_at` of its own,
+  # including work on THIS row. Absent table => "" => contributes nothing.
+  hit=$(db "SELECT 1 FROM lifecycle_events
+             WHERE actor IN (${seats})
+               AND actor <> 'task-engine'
+               AND authority NOT IN ('heartbeat','dispatcher')
+               AND ts > $(sqlq "$since")
+             LIMIT 1;" 2>/dev/null || echo "")
+  [[ -n "$hit" ]] && return 0
+  return 1
+}
+
+_hb_nudge_enforce() {
+  local name="$1" tid="$2" tident="$3" nudge_n="$4"
+  [[ "${nudge_n:-}" =~ ^[0-9]+$ ]] || return 0
+  [[ "${tid:-}" =~ ^[0-9]+$ ]] || return 0
+
+  local band n
+  band=$(db "SELECT COALESCE(NULLIF(priority,''),'medium') FROM tasks WHERE id=${tid};" 2>/dev/null || echo "medium")
+  [[ -n "$band" ]] || band="medium"
+  n=$(_hb_nudge_enforce_after "$band")
+  (( nudge_n >= n )) || return 0
+
+  local stamps esc_at="" esc_n="" park_at="" asg="" ver=""
+  stamps=$(db "SELECT COALESCE(nudge_escalated_at,'')||x'1f'||COALESCE(nudge_escalated_n,'')||x'1f'||COALESCE(nudge_parked_at,'')||x'1f'||COALESCE(assignee,'')||x'1f'||COALESCE(verifier,'')
+               FROM tasks WHERE id=${tid};" 2>/dev/null || echo "")
+  [[ -n "$stamps" ]] || return 0
+  IFS=$'\x1f' read -r esc_at esc_n park_at asg ver <<<"$stamps"
+  [[ "$esc_n" =~ ^[0-9]+$ ]] || esc_n=0
+
+  local today; today=$(date -u +%Y-%m-%d)
+
+  # ---- RUNG 2 --------------------------------------------------------------
+  # ALWAYS behind rung 1, and keyed to the count rung 1 fired at rather than to
+  # 2*N recomputed now: rung 1 ESCALATES, escalation raises the band, and a higher
+  # band has a SMALLER N — so a row escalated at the `high` threshold of 16 is
+  # already past an `urgent` 2N of 16 and both rungs would fire on one wake, which
+  # is not a ladder. One rung per wake, and rung 2 means "a further N fruitless
+  # wakes after we escalated and said so in the body".
+  if [[ -n "$esc_at" ]] && (( nudge_n >= esc_n + n )) && [[ -z "$park_at" ]]; then
+    # A row waiting on an UNANSWERED HUMAN GATE is not starved — the wait is on a
+    # person, and its nudges are the gate's own renag. NEITHER rung-2 lever
+    # applies: parking over a gate destroys it (DIVE-1453) and reassigning it
+    # only moves a row the new hands cannot act on either. Hold, say nothing, and
+    # leave the counter alone — we did not act, so nothing may read as if we had.
+    if [[ -n "$(db "SELECT 1 FROM tasks WHERE id=${tid} AND need_type IS NOT NULL AND need_answered_at IS NULL;" 2>/dev/null || echo "")" ]]; then
+      _hb_log "[nudge-enforce] ${tident} rung 2 HELD: unanswered human gate — not starvation; nothing written, nothing sent, counter left intact"
+      return 0
+    fi
+
+    # SIBLING HOLD (DIVE-3218, main 2026-08-11). A row waiting behind its own
+    # assignee's OTHER work is queued, not starved — the wait is on a queue, and
+    # neither rung-2 lever addresses a queue. Reassigning it takes a row off a
+    # seat that is demonstrably working and hands it to one that is merely idle.
+    # Same discipline as the gate hold above: hold, log, write nothing, send
+    # nothing, and leave the counter alone — we did not act, so nothing may read
+    # as if we had. Logged rather than silent because a silent hold is
+    # indistinguishable from a ladder that never armed.
+    if _hb_seat_advanced "$name" "$tid" "$esc_at" "$asg"; then
+      _hb_log "[nudge-enforce] ${tident} rung 2 HELD: assignee '${asg:-$name}' advanced other rows since rung 1 (${esc_at}) — queued behind its own work, not starved; nothing written, nothing sent, counter left intact"
+      return 0
+    fi
+
+    local free="" target="" cand lane cand_lane applied=0
+    lane=$(db "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$name");" 2>/dev/null || echo "")
+    if free=$(_hb_free_agents 2>/dev/null); then
+      while IFS= read -r cand; do
+        [[ -n "$cand" ]] || continue
+        [[ "$cand" == "$name" ]] && continue
+        [[ -n "$asg" && "$cand" == "$asg" ]] && continue
+        [[ -n "$ver" && "$cand" == "$ver" ]] && continue
+        if [[ -n "$lane" ]]; then
+          cand_lane=$(db "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$cand");" 2>/dev/null || echo "")
+          if [[ "$cand_lane" == "$lane" ]]; then target="$cand"; break; fi
+        fi
+        [[ -z "$target" ]] && target="$cand"
+      done <<<"$free"
+    else
+      # An unreadable registry is not evidence that nobody is free. Fall through
+      # to the park rung rather than reassigning on an unread fleet — the park is
+      # reversible and dated, a wrong reassignment is neither.
+      _hb_log "[nudge-enforce] ${tident} registry unreadable — no reassignment attempted; parking instead"
+    fi
+
+    if [[ -n "$target" ]]; then
+      # ACT FIRST, NARRATE ONLY WHAT LANDED. This UPDATE is GUARDED; when the
+      # guard matches zero rows the row is unchanged, and a body note, a ping and
+      # a ledger event emitted ahead of it are a lie told to the one reader with
+      # no other memory. On a design whose load-bearing half IS the body
+      # write-back, a false note is worse than no note. changes() is read in the
+      # SAME sqlite3 connection as the UPDATE — a second `db` invocation would
+      # report on its own statement, not this one.
+      applied=$(db "UPDATE tasks SET assignee=$(sqlq "$target"), nudge_parked_at=datetime('now'), updated_at=datetime('now')
+          WHERE id=${tid} AND status IN ('todo','in_progress');
+          SELECT changes();" 2>/dev/null || echo 0)
+      [[ "$applied" =~ ^[0-9]+$ ]] || applied=0
+      if (( applied == 0 )); then
+        _hb_log "[nudge-enforce] ${tident} rung 2 reassign REFUSED by its own guard (status is not todo/in_progress) — nothing written, nothing sent, latch left unarmed"
+        return 0
+      fi
+      _hb_row_note "$tid" "[${today}] nudge-enforcement (DIVE-3218): REASSIGNED ${asg:-unassigned} -> ${target} after ${nudge_n} heartbeat nudges (>= 2x the ${band} threshold of ${n}) produced no state change. Each of those nudges was a full fresh-context session that read this row and did not start it, so this is a hand-off, not a reprimand: whatever stopped ${asg:-the previous assignee} is not something another nudge to them can clear. ${target}: if you also decide NOT to start this, write WHY into this body before you exit — that sentence is the only memory the next seat has."
+      with_registry_lock _hb_clear_nudge "$name" "$tid" >/dev/null 2>&1 || true
+      ( cmd_send "$target" --from="task-engine" \
+          --message="🔁 ${tident} has been REASSIGNED to you by nudge enforcement: it was nudged ${nudge_n}x at '${asg:-unassigned}' with no state change (DIVE-3218). The reason is written into the row body — read it, then \`5dive task start ${tident}\`. If you decide not to start it, write why into the body rather than leaving it to be re-derived." ) >/dev/null 2>&1 || true
+      [[ -n "$asg" ]] && ( cmd_send "$asg" --from="task-engine" \
+          --message="🔁 ${tident} has been moved OFF you to '${target}' — ${nudge_n} nudges, no state change (DIVE-3218). Nothing for you to do; if you were mid-thought on it, say so to ${target} rather than both starting it." ) >/dev/null 2>&1 || true
+      ledger_emit "task.nudge_enforced" ident="$tident" task_id="$tid" \
+        actor="task-engine" authority="heartbeat" \
+        detail="rung2 reassign ${asg:-unassigned}->${target} after ${nudge_n} nudges (band ${band}, N=${n})" || true
+      _hb_log "[nudge-enforce] ${tident} nudged ${nudge_n}x (band ${band}, N=${n}) -> REASSIGNED ${asg:-unassigned} -> ${target}, reason written to body"
+    else
+      local wake_days=1
+      # Same discipline as the reassign branch above: the park UPDATE carries the
+      # DIVE-1453 gate guard AND a status guard, either of which can match zero
+      # rows. Run it, confirm it moved a row, and only then write the body note,
+      # ping the assignee and emit the ledger event. The gate clause is redundant
+      # with the hold at the top of rung 2 and stays anyway — it is the guard that
+      # protects a live human gate, and it should not depend on a caller's
+      # pre-check to be correct.
+      applied=$(db "UPDATE tasks SET status='blocked', parked_at=datetime('now'),
+                           park_reason=$(sqlq "parked by nudge enforcement (DIVE-3218): ${nudge_n} nudges at '${asg:-unassigned}' with no state change and no free agent to reassign to; auto-unparks on wake_at"),
+                           wake_at=datetime('now','+${wake_days} day'),
+                           nudge_parked_at=datetime('now'), updated_at=datetime('now')
+          WHERE id=${tid} AND status IN ('todo','in_progress')
+            AND NOT (need_type IS NOT NULL AND need_answered_at IS NULL);
+          SELECT changes();" 2>/dev/null || echo 0)
+      [[ "$applied" =~ ^[0-9]+$ ]] || applied=0
+      if (( applied == 0 )); then
+        _hb_log "[nudge-enforce] ${tident} rung 2 park REFUSED by its own guard (live human gate, or status not todo/in_progress) — nothing written, nothing sent, latch left unarmed"
+        return 0
+      fi
+      _hb_row_note "$tid" "[${today}] nudge-enforcement (DIVE-3218): PARKED for ${wake_days}d after ${nudge_n} heartbeat nudges (>= 2x the ${band} threshold of ${n}) produced no state change, and no free agent was available to hand it to. NOT cancelled and NOT unwanted — parking only stops the wakes, which were costing a full fresh-context session each and buying nothing. It auto-unparks to todo on its wake date. Whoever picks it up next: if you decide not to start it, write WHY into this body before you exit."
+      with_registry_lock _hb_clear_nudge "$name" "$tid" >/dev/null 2>&1 || true
+      [[ -n "$asg" ]] && ( cmd_send "$asg" --from="task-engine" \
+          --message="⏸ ${tident} has been PARKED for ${wake_days}d by nudge enforcement — ${nudge_n} nudges, no state change, no free agent to hand it to (DIVE-3218). It is not cancelled; it auto-unparks to todo on its wake date. The reason is in the row body. If it should come back sooner, \`5dive task start ${tident}\` unparks it." ) >/dev/null 2>&1 || true
+      ledger_emit "task.nudge_enforced" ident="$tident" task_id="$tid" \
+        actor="task-engine" authority="heartbeat" \
+        detail="rung2 park +${wake_days}d after ${nudge_n} nudges, no free agent (band ${band}, N=${n})" || true
+      _hb_log "[nudge-enforce] ${tident} nudged ${nudge_n}x (band ${band}, N=${n}), no free agent -> PARKED +${wake_days}d, reason written to body"
+    fi
+    return 0
+  fi
+
+  # ---- RUNG 1 --------------------------------------------------------------
+  if [[ -z "$esc_at" ]]; then
+    # Same act-then-narrate order as rung 2, for the same reason. The latch is
+    # stamped FIRST, under the one guard that can refuse it, so a closed row
+    # (nothing left to escalate) is never told in its own body that it was.
+    local applied1
+    applied1=$(db "UPDATE tasks SET nudge_escalated_at=datetime('now'), nudge_escalated_n=${nudge_n}, updated_at=datetime('now')
+                   WHERE id=${tid} AND status IN ('todo','in_progress');
+                   SELECT changes();" 2>/dev/null || echo 0)
+    [[ "$applied1" =~ ^[0-9]+$ ]] || applied1=0
+    if (( applied1 == 0 )); then
+      _hb_log "[nudge-enforce] ${tident} rung 1 REFUSED by its own guard (status is not todo/in_progress) — nothing written, latch left unarmed"
+      return 0
+    fi
+    ( cmd_task_escalate "$tid" --from=heartbeat ) >/dev/null 2>&1 || true
+    # Re-read the band AFTER escalating, for two reasons. (a) The note must state
+    # what actually happened: `task escalate` is capped at urgent, so on an
+    # already-urgent row it is a no-op and this note is the whole lever — say so
+    # rather than claiming a bump that did not occur. (b) The wake number the note
+    # promises must be the one rung 2 fires on: rung 2 recomputes N from the
+    # RAISED band, and a higher band carries a SMALLER N, so the pre-escalation N
+    # promised 32 where the code fires at 24.
+    local band2 n2 rung1_did
+    band2=$(db "SELECT COALESCE(NULLIF(priority,''),'medium') FROM tasks WHERE id=${tid};" 2>/dev/null || echo "$band")
+    [[ -n "$band2" ]] || band2="$band"
+    n2=$(_hb_nudge_enforce_after "$band2")
+    if [[ "$band2" == "$band" ]]; then
+      rung1_did="the row was ALREADY ${band} and escalation is capped there, so this written note is the only lever this rung has"
+    else
+      rung1_did="ESCALATED ${band} -> ${band2}"
+    fi
+    _hb_row_note "$tid" "[${today}] nudge-enforcement (DIVE-3218): ${rung1_did} — after ${nudge_n} heartbeat nudges (>= the ${band} threshold of ${n}) with no state change. Every one of those was a full fresh-context session that woke on this row, decided not to start it, and left no record of deciding — so the same conclusion was re-derived from zero each time. IF YOU WAKE ON THIS ROW AND DECIDE NOT TO START IT, WRITE WHY HERE before you exit; an unwritten decision is re-paid in full at the next wake. At $(( nudge_n + n2 )) nudges this row is reassigned or parked automatically."
+    ledger_emit "task.nudge_enforced" ident="$tident" task_id="$tid" \
+      actor="task-engine" authority="heartbeat" \
+      detail="rung1 escalate ${band}->${band2} after ${nudge_n} nudges (band ${band}, N=${n}); rung 2 at $(( nudge_n + n2 ))" || true
+    _hb_log "[nudge-enforce] ${tident} nudged ${nudge_n}x (band ${band}, N=${n}) -> rung 1 (${band}->${band2}), reason written to body; rung 2 at $(( nudge_n + n2 ))"
+  fi
+  return 0
 }
 
 # Increment + return this task's consecutive-reap count, stored in the registry
@@ -3749,6 +4114,9 @@ cmd_heartbeat_tick() {
         starved=$((starved + 1))
         _hb_log "[$name] WARN: ${task_ident} nudged ${nudge_n}x and is still not done (claimed then requeued each time) — possible listen-loop starvation; check the agent's task-claim path"
       fi
+      # DIVE-3218: and CONSUME that count. The WARN above is the observation; this
+      # is the lever. Separate threshold, separate ladder — see _hb_nudge_enforce.
+      _hb_nudge_enforce "$name" "$task_id" "$task_ident" "${nudge_n:-0}" || true
     else
       sk_fail=$((sk_fail + 1)); _hb_log "[$name] wake failed — will retry next tick"
     fi
