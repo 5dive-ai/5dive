@@ -338,6 +338,114 @@ _hb_nudge_enforce dev 13 DIVE-9013 8 >/dev/null 2>&1
 write_registry
 
 # ---------------------------------------------------------------------------
+# 10b. WHAT MUST NOT BE SAID WHEN THE WRITE DID NOT LAND (iteration 2 — quinn's
+#      reject). Every rung-2 write is GUARDED, and arms 5/6 grade only the
+#      resulting STATE (status, park_reason), which is identical whether the
+#      narration ran or not. So the whole load-bearing half — the body note, the
+#      pings, the ledger event — could fire ahead of an UPDATE that matched ZERO
+#      rows and every arm above would still pass. That is not a cosmetic ordering
+#      bug on THIS design: the body note is the only memory a fresh-context seat
+#      has, so a note claiming a park that never happened is strictly worse than
+#      silence — the next seat reasons from a state that does not exist. And
+#      because the once-per-row latch rides in the same refused statement, the
+#      false note, the false ping and the false ledger event RE-FIRE every N
+#      nudges forever.
+#
+#      These arms grade the NEGATIVE: on a refused write, note count 0, empty
+#      send log, no ledger event, latch still NULL, counter untouched.
+# ---------------------------------------------------------------------------
+led() { db "SELECT COUNT(*) FROM lifecycle_events WHERE kind='task.nudge_enforced' AND ident=$(sqlq "$1");"; }
+silent() {   # $1 id, $2 ident, $3 what-was-refused (for the failure text)
+  local id="$1" ident="$2" what="$3" bad=""
+  [[ "$(notes "$id")" == "0" ]]              || bad+=" note-count=[$(notes "$id")]"
+  [[ -z "$(sent)" ]]                         || bad+=" sends=[$(sent)]"
+  [[ "$(col "$id" nudge_parked_at)" == "NULL" ]] || bad+=" nudge_parked_at=[$(col "$id" nudge_parked_at)]"
+  [[ "$(led "$ident")" == "0" ]]             || bad+=" ledger-rows=[$(led "$ident")]"
+  [[ -z "$bad" ]] \
+    && ok_t "${what}: the row is told NOTHING — no body note, no ping, no ledger event, latch unarmed" \
+    || bad_t "${what}: nothing is said when the write did not land" "$bad"
+}
+
+# A. A live human gate + a FREE agent. Arm 6 covers the park side; the reassign
+#    side had no guard at all, so a gated row would have CHANGED HANDS — moving a
+#    row whose wait is on a person to a second agent who also cannot act on it.
+mk_row 14 'DIVE-9014' high 32
+stamp_rung1 14 16
+db "UPDATE tasks SET need_type='decision', need_asked_at=datetime('now','-2 days') WHERE id=14;"
+busy creative; busy main          # dev2 is free and IS a lane-mate — it would be picked
+_hb_nudge_enforce dev 14 DIVE-9014 32 >/dev/null 2>&1
+[[ "$(col 14 assignee)" == "dev" && "$(col 14 status)" == "todo" ]] \
+  && ok_t "a row on a live human gate is not REASSIGNED either — a gate is not starvation, whoever is free" \
+  || bad_t "a gated row is not reassigned" "assignee=[$(col 14 assignee)] status=[$(col 14 status)]"
+silent 14 DIVE-9014 "gated row, free agent available"
+[[ "$(nudge_count 14)" == "32" ]] \
+  && ok_t "and the counter is LEFT INTACT — clearing it would read as an enforcement that never happened" \
+  || bad_t "a held rung 2 leaves the counter intact" "count=[$(nudge_count 14)] want 32"
+
+# B. Same gate, nobody free — arm 6's fixture, graded for its NARRATION. This is
+#    the exact case quinn reproduced: status and park_reason both correct, and the
+#    body still claiming "PARKED for 1d ... auto-unparks on its wake date".
+mk_row 15 'DIVE-9015' high 32
+stamp_rung1 15 16
+db "UPDATE tasks SET need_type='decision', need_asked_at=datetime('now','-2 days') WHERE id=15;"
+busy creative; busy dev2; busy main
+_hb_nudge_enforce dev 15 DIVE-9015 32 >/dev/null 2>&1
+[[ "$(col 15 status)" == "todo" && "$(col 15 park_reason)" == "NULL" ]] \
+  && ok_t "gated + nobody free: still not parked (the DIVE-1453 guard holds)" \
+  || bad_t "gated + nobody free is not parked" "status=[$(col 15 status)] park_reason=[$(col 15 park_reason)]"
+silent 15 DIVE-9015 "gated row, nobody free"
+[[ "$(nudge_count 15)" == "32" ]] \
+  && ok_t "counter intact there too, so the row does not silently restart its ladder every N nudges" \
+  || bad_t "a refused park leaves the counter intact" "count=[$(nudge_count 15)] want 32"
+
+# C. The STATUS guard, with no gate in play — proving the changes() check itself
+#    and not just the early hold above. A row that reaches rung 2 outside
+#    todo/in_progress gets no note and nobody gets pinged about a move that the
+#    guard refused.
+mk_row 16 'DIVE-9016' high 32
+stamp_rung1 16 16
+db "UPDATE tasks SET status='done' WHERE id=16;"
+busy creative; busy main          # dev2 free, so a target IS selected
+_hb_nudge_enforce dev 16 DIVE-9016 32 >/dev/null 2>&1
+[[ "$(col 16 assignee)" == "dev" ]] \
+  && ok_t "rung 2's status guard refuses the reassign of a closed row" \
+  || bad_t "rung 2's status guard refuses a closed row" "assignee=[$(col 16 assignee)]"
+silent 16 DIVE-9016 "reassign refused by the status guard"
+
+# D. Rung 1 under the same discipline. Its latch UPDATE is the statement a guard
+#    can refuse, so it runs FIRST and nothing is written on a zero-row result.
+mk_row 17 'DIVE-9017' high 16
+db "UPDATE tasks SET status='cancelled' WHERE id=17;"
+_hb_nudge_enforce dev 17 DIVE-9017 16 >/dev/null 2>&1
+[[ "$(col 17 nudge_escalated_at)" == "NULL" && "$(col 17 priority)" == "high" && "$(notes 17)" == "0" && "$(led DIVE-9017)" == "0" ]] \
+  && ok_t "rung 1 on a closed row says nothing and arms no latch" \
+  || bad_t "rung 1 on a closed row is silent" "esc=[$(col 17 nudge_escalated_at)] pri=[$(col 17 priority)] notes=[$(notes 17)] ledger=[$(led DIVE-9017)]"
+
+# E. The COSMETIC LIE quinn also caught: rung 1's note promised rung 2 at
+#    nudge_n + N(pre-escalation band), but rung 2 recomputes N from the RAISED
+#    band, and a higher band carries a SMALLER N — the note said 32 where the
+#    code fires at 24. A wrong number in the one artifact a fresh seat reads is a
+#    wrong number, not a typo.
+mk_row 18 'DIVE-9018' high 16
+_hb_nudge_enforce dev 18 DIVE-9018 16 >/dev/null 2>&1
+case "$(body 18)" in
+  *"At 24 nudges"*) ok_t "rung 1's note names the wake rung 2 ACTUALLY fires on (16 + urgent's 8 = 24, not high's 16)" ;;
+  *) bad_t "rung 1's note names the real rung-2 wake" "body: $(body 18)" ;;
+esac
+case "$(body 18)" in
+  *"ESCALATED high -> urgent"*) ok_t "and it states the bump that actually landed, read back from the row" ;;
+  *) bad_t "rung 1's note states the bump that landed" "body: $(body 18)" ;;
+esac
+# An ALREADY-urgent row: `task escalate` is capped there, so the note must not
+# claim a bump. The note is the whole lever on exactly these rows.
+mk_row 19 'DIVE-9019' urgent 8
+_hb_nudge_enforce dev 19 DIVE-9019 8 >/dev/null 2>&1
+case "$(body 19)" in
+  *"ALREADY urgent"*) ok_t "on an already-urgent row the note says escalation was capped, not that it escalated" ;;
+  *) bad_t "an already-urgent row's note does not claim a bump" "body: $(body 19)" ;;
+esac
+
+# ---------------------------------------------------------------------------
 # 11. THE WIRING. Every arm above calls _hb_nudge_enforce directly, which grades
 #     the ladder and says NOTHING about whether the tick path invokes it — delete
 #     the call site and all 31 arms above still pass, which is precisely the

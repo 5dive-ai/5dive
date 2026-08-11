@@ -757,7 +757,17 @@ _hb_nudge_enforce() {
   # is not a ladder. One rung per wake, and rung 2 means "a further N fruitless
   # wakes after we escalated and said so in the body".
   if [[ -n "$esc_at" ]] && (( nudge_n >= esc_n + n )) && [[ -z "$park_at" ]]; then
-    local free="" target="" cand lane cand_lane
+    # A row waiting on an UNANSWERED HUMAN GATE is not starved — the wait is on a
+    # person, and its nudges are the gate's own renag. NEITHER rung-2 lever
+    # applies: parking over a gate destroys it (DIVE-1453) and reassigning it
+    # only moves a row the new hands cannot act on either. Hold, say nothing, and
+    # leave the counter alone — we did not act, so nothing may read as if we had.
+    if [[ -n "$(db "SELECT 1 FROM tasks WHERE id=${tid} AND need_type IS NOT NULL AND need_answered_at IS NULL;" 2>/dev/null || echo "")" ]]; then
+      _hb_log "[nudge-enforce] ${tident} rung 2 HELD: unanswered human gate — not starvation; nothing written, nothing sent, counter left intact"
+      return 0
+    fi
+
+    local free="" target="" cand lane cand_lane applied=0
     lane=$(db "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$name");" 2>/dev/null || echo "")
     if free=$(_hb_free_agents 2>/dev/null); then
       while IFS= read -r cand; do
@@ -779,9 +789,22 @@ _hb_nudge_enforce() {
     fi
 
     if [[ -n "$target" ]]; then
+      # ACT FIRST, NARRATE ONLY WHAT LANDED. This UPDATE is GUARDED; when the
+      # guard matches zero rows the row is unchanged, and a body note, a ping and
+      # a ledger event emitted ahead of it are a lie told to the one reader with
+      # no other memory. On a design whose load-bearing half IS the body
+      # write-back, a false note is worse than no note. changes() is read in the
+      # SAME sqlite3 connection as the UPDATE — a second `db` invocation would
+      # report on its own statement, not this one.
+      applied=$(db "UPDATE tasks SET assignee=$(sqlq "$target"), nudge_parked_at=datetime('now'), updated_at=datetime('now')
+          WHERE id=${tid} AND status IN ('todo','in_progress');
+          SELECT changes();" 2>/dev/null || echo 0)
+      [[ "$applied" =~ ^[0-9]+$ ]] || applied=0
+      if (( applied == 0 )); then
+        _hb_log "[nudge-enforce] ${tident} rung 2 reassign REFUSED by its own guard (status is not todo/in_progress) — nothing written, nothing sent, latch left unarmed"
+        return 0
+      fi
       _hb_row_note "$tid" "[${today}] nudge-enforcement (DIVE-3218): REASSIGNED ${asg:-unassigned} -> ${target} after ${nudge_n} heartbeat nudges (>= 2x the ${band} threshold of ${n}) produced no state change. Each of those nudges was a full fresh-context session that read this row and did not start it, so this is a hand-off, not a reprimand: whatever stopped ${asg:-the previous assignee} is not something another nudge to them can clear. ${target}: if you also decide NOT to start this, write WHY into this body before you exit — that sentence is the only memory the next seat has."
-      db "UPDATE tasks SET assignee=$(sqlq "$target"), nudge_parked_at=datetime('now'), updated_at=datetime('now')
-          WHERE id=${tid} AND status IN ('todo','in_progress');" 2>/dev/null || true
       with_registry_lock _hb_clear_nudge "$name" "$tid" >/dev/null 2>&1 || true
       ( cmd_send "$target" --from="task-engine" \
           --message="🔁 ${tident} has been REASSIGNED to you by nudge enforcement: it was nudged ${nudge_n}x at '${asg:-unassigned}' with no state change (DIVE-3218). The reason is written into the row body — read it, then \`5dive task start ${tident}\`. If you decide not to start it, write why into the body rather than leaving it to be re-derived." ) >/dev/null 2>&1 || true
@@ -793,13 +816,26 @@ _hb_nudge_enforce() {
       _hb_log "[nudge-enforce] ${tident} nudged ${nudge_n}x (band ${band}, N=${n}) -> REASSIGNED ${asg:-unassigned} -> ${target}, reason written to body"
     else
       local wake_days=1
-      _hb_row_note "$tid" "[${today}] nudge-enforcement (DIVE-3218): PARKED for ${wake_days}d after ${nudge_n} heartbeat nudges (>= 2x the ${band} threshold of ${n}) produced no state change, and no free agent was available to hand it to. NOT cancelled and NOT unwanted — parking only stops the wakes, which were costing a full fresh-context session each and buying nothing. It auto-unparks to todo on its wake date. Whoever picks it up next: if you decide not to start it, write WHY into this body before you exit."
-      db "UPDATE tasks SET status='blocked', parked_at=datetime('now'),
+      # Same discipline as the reassign branch above: the park UPDATE carries the
+      # DIVE-1453 gate guard AND a status guard, either of which can match zero
+      # rows. Run it, confirm it moved a row, and only then write the body note,
+      # ping the assignee and emit the ledger event. The gate clause is redundant
+      # with the hold at the top of rung 2 and stays anyway — it is the guard that
+      # protects a live human gate, and it should not depend on a caller's
+      # pre-check to be correct.
+      applied=$(db "UPDATE tasks SET status='blocked', parked_at=datetime('now'),
                            park_reason=$(sqlq "parked by nudge enforcement (DIVE-3218): ${nudge_n} nudges at '${asg:-unassigned}' with no state change and no free agent to reassign to; auto-unparks on wake_at"),
                            wake_at=datetime('now','+${wake_days} day'),
                            nudge_parked_at=datetime('now'), updated_at=datetime('now')
           WHERE id=${tid} AND status IN ('todo','in_progress')
-            AND NOT (need_type IS NOT NULL AND need_answered_at IS NULL);" 2>/dev/null || true
+            AND NOT (need_type IS NOT NULL AND need_answered_at IS NULL);
+          SELECT changes();" 2>/dev/null || echo 0)
+      [[ "$applied" =~ ^[0-9]+$ ]] || applied=0
+      if (( applied == 0 )); then
+        _hb_log "[nudge-enforce] ${tident} rung 2 park REFUSED by its own guard (live human gate, or status not todo/in_progress) — nothing written, nothing sent, latch left unarmed"
+        return 0
+      fi
+      _hb_row_note "$tid" "[${today}] nudge-enforcement (DIVE-3218): PARKED for ${wake_days}d after ${nudge_n} heartbeat nudges (>= 2x the ${band} threshold of ${n}) produced no state change, and no free agent was available to hand it to. NOT cancelled and NOT unwanted — parking only stops the wakes, which were costing a full fresh-context session each and buying nothing. It auto-unparks to todo on its wake date. Whoever picks it up next: if you decide not to start it, write WHY into this body before you exit."
       with_registry_lock _hb_clear_nudge "$name" "$tid" >/dev/null 2>&1 || true
       [[ -n "$asg" ]] && ( cmd_send "$asg" --from="task-engine" \
           --message="⏸ ${tident} has been PARKED for ${wake_days}d by nudge enforcement — ${nudge_n} nudges, no state change, no free agent to hand it to (DIVE-3218). It is not cancelled; it auto-unparks to todo on its wake date. The reason is in the row body. If it should come back sooner, \`5dive task start ${tident}\` unparks it." ) >/dev/null 2>&1 || true
@@ -813,13 +849,40 @@ _hb_nudge_enforce() {
 
   # ---- RUNG 1 --------------------------------------------------------------
   if [[ -z "$esc_at" ]]; then
-    _hb_row_note "$tid" "[${today}] nudge-enforcement (DIVE-3218): ESCALATED after ${nudge_n} heartbeat nudges (>= the ${band} threshold of ${n}) with no state change. Every one of those was a full fresh-context session that woke on this row, decided not to start it, and left no record of deciding — so the same conclusion was re-derived from zero each time. IF YOU WAKE ON THIS ROW AND DECIDE NOT TO START IT, WRITE WHY HERE before you exit; an unwritten decision is re-paid in full at the next wake. At $(( nudge_n + n )) nudges this row is reassigned or parked automatically."
+    # Same act-then-narrate order as rung 2, for the same reason. The latch is
+    # stamped FIRST, under the one guard that can refuse it, so a closed row
+    # (nothing left to escalate) is never told in its own body that it was.
+    local applied1
+    applied1=$(db "UPDATE tasks SET nudge_escalated_at=datetime('now'), nudge_escalated_n=${nudge_n}, updated_at=datetime('now')
+                   WHERE id=${tid} AND status IN ('todo','in_progress');
+                   SELECT changes();" 2>/dev/null || echo 0)
+    [[ "$applied1" =~ ^[0-9]+$ ]] || applied1=0
+    if (( applied1 == 0 )); then
+      _hb_log "[nudge-enforce] ${tident} rung 1 REFUSED by its own guard (status is not todo/in_progress) — nothing written, latch left unarmed"
+      return 0
+    fi
     ( cmd_task_escalate "$tid" --from=heartbeat ) >/dev/null 2>&1 || true
-    db "UPDATE tasks SET nudge_escalated_at=datetime('now'), nudge_escalated_n=${nudge_n}, updated_at=datetime('now') WHERE id=${tid};" 2>/dev/null || true
+    # Re-read the band AFTER escalating, for two reasons. (a) The note must state
+    # what actually happened: `task escalate` is capped at urgent, so on an
+    # already-urgent row it is a no-op and this note is the whole lever — say so
+    # rather than claiming a bump that did not occur. (b) The wake number the note
+    # promises must be the one rung 2 fires on: rung 2 recomputes N from the
+    # RAISED band, and a higher band carries a SMALLER N, so the pre-escalation N
+    # promised 32 where the code fires at 24.
+    local band2 n2 rung1_did
+    band2=$(db "SELECT COALESCE(NULLIF(priority,''),'medium') FROM tasks WHERE id=${tid};" 2>/dev/null || echo "$band")
+    [[ -n "$band2" ]] || band2="$band"
+    n2=$(_hb_nudge_enforce_after "$band2")
+    if [[ "$band2" == "$band" ]]; then
+      rung1_did="the row was ALREADY ${band} and escalation is capped there, so this written note is the only lever this rung has"
+    else
+      rung1_did="ESCALATED ${band} -> ${band2}"
+    fi
+    _hb_row_note "$tid" "[${today}] nudge-enforcement (DIVE-3218): ${rung1_did} — after ${nudge_n} heartbeat nudges (>= the ${band} threshold of ${n}) with no state change. Every one of those was a full fresh-context session that woke on this row, decided not to start it, and left no record of deciding — so the same conclusion was re-derived from zero each time. IF YOU WAKE ON THIS ROW AND DECIDE NOT TO START IT, WRITE WHY HERE before you exit; an unwritten decision is re-paid in full at the next wake. At $(( nudge_n + n2 )) nudges this row is reassigned or parked automatically."
     ledger_emit "task.nudge_enforced" ident="$tident" task_id="$tid" \
       actor="task-engine" authority="heartbeat" \
-      detail="rung1 escalate after ${nudge_n} nudges (band ${band}, N=${n})" || true
-    _hb_log "[nudge-enforce] ${tident} nudged ${nudge_n}x (band ${band}, N=${n}) -> ESCALATED once, reason written to body; rung 2 at $(( nudge_n + n ))"
+      detail="rung1 escalate ${band}->${band2} after ${nudge_n} nudges (band ${band}, N=${n}); rung 2 at $(( nudge_n + n2 ))" || true
+    _hb_log "[nudge-enforce] ${tident} nudged ${nudge_n}x (band ${band}, N=${n}) -> rung 1 (${band}->${band2}), reason written to body; rung 2 at $(( nudge_n + n2 ))"
   fi
   return 0
 }
