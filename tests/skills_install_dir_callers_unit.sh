@@ -12,7 +12,7 @@ set -uo pipefail
 # shellcheck disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
-trap 'printf "HARNESS-RC=%d\n" "$?"' EXIT
+trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.." || exit
 
 SRC=src
