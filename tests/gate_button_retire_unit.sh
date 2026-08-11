@@ -75,6 +75,18 @@ printf 'TELEGRAM_BOT_TOKEN=tok-marketing\n' >"$CONNECTORS_DIR/telegram-marketing
 printf 'TELEGRAM_BOT_TOKEN=tok-creative\n'  >"$CONNECTORS_DIR/telegram-creative.env"
 
 # Capture the edits instead of performing them. token|chat|message_id per line.
+# DIVE-3228 — DO NOT WRITE TO THE REAL FLEET AUDIT LOG.
+# `_task_store_audit_log` is fenced on STORE IDENTITY, and this suite declares its
+# own fixture DB as prod (the DIVE-1506 allowlist, needed to drive the human-facing
+# retire at all) — so that fence reads TRUE here and every retire row lands in
+# /var/log/5dive/agent-audit.log for real. Measured 2026-08-11: one run of this
+# suite leaked 19 rows into production telemetry, and it has been doing so since
+# DIVE-2410 (2317 fixture rows accumulated). Same DIVE-1968 contamination a whole
+# ticket was spent removing, arriving through the harness instead of the product.
+# Stubbing `audit_log` is the established isolation (gate_answer_audit_unit).
+AUDIT_CALLS="$TMP/audit.calls"; : >"$AUDIT_CALLS"
+audit_log() { printf '%s\n' "$*" >>"$AUDIT_CALLS"; }
+
 EDITS="$TMP/edits"; : >"$EDITS"
 EDIT_RESP='{"ok":true}'
 _mirror_edit_markup() {

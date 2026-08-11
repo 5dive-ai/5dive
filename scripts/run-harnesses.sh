@@ -25,6 +25,13 @@
 #      because the failing harness is the thing to fix first)
 #   4  every harness passed, run is OVER BUDGET
 #   3  the corpus could not be classified into tiers (see tests/lib/tier.sh)
+#   7  the TREE MOVED mid-run — harnesses graded more than one sha, so the
+#      summary describes no single commit (DIVE-3228). Not 1, for the same reason
+#      4 is not 1: nothing is known to be broken, the RESULT is unusable, and the
+#      remedy is to re-run against a tree nobody is writing to. 7 and not 6: 6 is
+#      already the DIVE-2728 budget-UNDETERMINED code, and two different
+#      "the run could not be graded" causes sharing an exit is the ambiguity this
+#      ladder exists to remove.
 #   5  every harness passed and the run is inside budget, but a harness HEADER
 #      claims a measured time the clock just refuted by >= 50% (DIVE-2555). Same
 #      reason 4 is not 1: the remedy is different, so the code is different.
@@ -367,17 +374,82 @@ elif (( BUDGET > 0 && CALIBRATE == 1 )); then
   undetermined=1
 fi
 
+# DIVE-3228 — THE SWEEP MUST GRADE ONE TREE, AND SAY SO.
+#
+# tests/lib/grading_tree.sh (DIVE-2211) already makes every grading harness print
+# `grading tree: <root> @ <sha>` — 370 of the 378 files under tests/ emit it, the
+# 8 that do not being tests/lib/* and tests/meta/*, which are libraries and
+# meta-harnesses rather than graders. So the per-harness attribution EXISTS. What
+# was missing is that nobody compared the lines to each other.
+#
+# THE FAILURE THAT FORCED THIS, measured 2026-08-11 on this branch: a 72-harness
+# sweep reported 72/0, and a commit landed in the worktree 2 minutes before it
+# finished. Some harnesses graded the old sha, some the new one, and the summary
+# line could not say which — an UNATTRIBUTABLE GREEN. That is worse than an
+# unattributable red: the red gets investigated, the green gets banked. Freezing
+# the tree by hand works exactly until someone forgets, which is the definition of
+# a control that is prose.
+#
+# WHAT THIS ASSERTS, AND WHAT IT DELIBERATELY DOES NOT. grading_tree.sh's own
+# header is explicit that it is NOT a gate: a dirty or stale tree is the normal
+# pre-commit case and must stay gradeable. This does not change that. It asserts
+# STABILITY, not cleanliness or currency — the run may grade any tree it likes,
+# including a filthy one, but it must grade ONE.
+#
+# SHA ONLY, never the dirty marker. A harness that writes a scratch file inside
+# the repo flips `+UNCOMMITTED CHANGES` mid-corpus without the graded code moving
+# at all, and reddening on that would be a flake generator bolted to the flake
+# detector.
+_gt_capture=$(mktemp "${TMPDIR:-/tmp}/run-harnesses-gt.XXXXXX" 2>/dev/null) || _gt_capture=""
+
 declare -a MS=() RC=() NAME=()
 failed=(); total_ms=0
 for t in "${CORPUS[@]}"; do
   printf '=== %s\n' "$t"
   s=$(date +%s%N)
-  bash "$t"; rc=$?
+  # STDERR, not stdout. grading_tree.sh emits its line with `_5d_grading_tree_line
+  # >&2` — the first cut of this check teed STDOUT, collected zero lines, and
+  # would have passed forever while asserting nothing. A vacuous control on the
+  # very ticket about unattributable greens; caught by reading the emitter instead
+  # of assuming its stream, and the non-vacuity arm in tests/ exists so the next
+  # person cannot reintroduce it.
+  #
+  # Process substitution, not a pipe: stderr is teed to the capture AND back to
+  # stderr, stdout is left completely alone, and `$?` remains bash's own rc (a
+  # pipe would hand us tee's, marking every failing harness as passed).
+  if [[ -n "$_gt_capture" ]]; then
+    bash "$t" 2> >(tee -a "$_gt_capture" >&2); rc=$?
+  else
+    bash "$t"; rc=$?
+  fi
   e=$(date +%s%N)
   ms=$(( (e - s) / 1000000 )); total_ms=$(( total_ms + ms ))
   MS+=("$ms"); RC+=("$rc"); NAME+=("$t")
   if (( rc != 0 )); then printf 'FAILED: %s\n' "$t"; failed+=("$t"); fi
 done
+
+# Distinct graded SHAs across the corpus. UNRESOLVED / NOT-A-GIT-TREE are not shas
+# and are excluded rather than counted as a second tree: a non-git export is a
+# legitimate way to run this corpus, and treating it as movement would red every
+# such run for a reason that has nothing to do with the code.
+_gt_shas=""
+if [[ -n "$_gt_capture" && -r "$_gt_capture" ]]; then
+  _gt_shas=$(sed -n 's/^grading tree: .* @ \([0-9a-f]\{7,\}\).*/\1/p' "$_gt_capture" | sort -u)
+fi
+rm -f "$_gt_capture" 2>/dev/null || true
+_gt_n=$(printf '%s' "$_gt_shas" | grep -c . 2>/dev/null || printf '0')
+if (( _gt_n > 1 )); then
+  printf '\n'
+  printf 'run-harnesses: FAIL — THE TREE MOVED MID-RUN. %s distinct graded SHAs:\n' "$_gt_n"
+  printf '  %s\n' $_gt_shas
+  printf 'Harnesses in this run graded DIFFERENT code, so the pass/fail summary below\n'
+  printf 'describes no single tree and cannot be attributed to a commit. This is not a\n'
+  printf 'test failure and does not share its exit code (7, not 1): nothing is known to\n'
+  printf 'be broken — the RESULT is unusable. Re-run against a tree nobody is writing to.\n'
+  printf 'Usual cause: a commit, rebase or checkout landed in the worktree while the\n'
+  printf 'corpus was still running.\n'
+  exit 7
+fi
 
 total_s=$(( (total_ms + 999) / 1000 ))
 # DIVE-2728: pct stays the percentage of the RAW cap and keeps its name — budget-report
