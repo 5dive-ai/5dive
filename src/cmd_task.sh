@@ -3213,11 +3213,44 @@ _gate_text_names_a_ref() {
 # ("three branches of this problem") can never match, so closes with no code at all
 # (research, decisions, coordination) are untouched — this is the DIVE-1690 shape
 # named as itself, not a blanket PR-or-branch requirement.
+#
+# DIVE-3265 — A FILE IS NOT A BRANCH, AND THE ANCHOR ABOVE CANNOT TELL THEM APART.
+# "<ident>-<kebab>" is also how we name the ARTIFACT a non-repo row delivers.
+# DIVE-3264's deliverable is a design doc, `community/designs/dive-3264-svc-5dive-
+# api-account-split.md`; that basename matched, and the gate then demanded a branch
+# of that name land on main. No branch could exist: the deliverable is a file in a
+# directory tree that is not a git repo at all. The row became UNCLOSEABLE BY
+# CONSTRUCTION, and every obvious escape is shut — results are PRESERVED (DIVE-2483)
+# so the offending text cannot be edited out of a later close, and `task set-branch
+# <id> ''` is rejected ("invalid branch name") so a binding that was never set cannot
+# be cleared. Scoped by CLASS, not by the instance (olivia, DIVE-3264): this fires
+# for EVERY non-repo deliverable — design docs, wiki-only rows, anything landing
+# under `community/` — so fixing the one filename would leave the next such row
+# blocked identically.
+#
+# THE DISCRIMINATOR IS THE EXTENSION, and the DIRECTION OF THE BIAS is the whole
+# argument for choosing it. The two errors are not symmetric:
+#   a MISS      — a maker describes an unlanded branch and we do not catch it. Costs
+#                 one unlanded branch, which the weekly hygiene digest (#139) still
+#                 flags, and the DIVE-1830 declared-`Branch:` gate still catches the
+#                 bound case. Recoverable.
+#   a FALSE HIT — the row can never close, by construction, with no escape short of
+#                 an audited `--force-merge-gate` on a row that has nothing to force.
+# So this filter drops rather than guesses. It is a suffix test on the candidate,
+# NOT a path test: a branch legitimately appears after a `/` in a forge URL
+# (`.../tree/<branch>`), so rejecting path-shaped tokens would cost that shape for
+# nothing the extension rule does not already buy.
+#
+# WHAT STAYS UNCOVERED, named so the next reader does not have to rediscover it: an
+# extension-LESS artifact path (a delivered directory, `community/designs/dive-N-x/`)
+# still reads as a branch. Unmeasured — every artifact in the measured population
+# carries an extension — and a one-line follow-up if it ever bites.
 _gate_branch_refs_from_text() {
   local text="$1" ident="$2"
   printf '%s\n' "$text" \
     | grep -ioE "(^|[^A-Za-z0-9])${ident}-[A-Za-z0-9][A-Za-z0-9_.-]*" 2>/dev/null \
     | sed -E 's/^[^A-Za-z0-9]//' \
+    | grep -ivE '\.(md|mdx|markdown|txt|rst|patch|diff|json|ya?ml|toml|sh|bash|[jt]sx?|mjs|cjs|py|rb|go|rs|sql|log|csv|tsv|html?|pdf|png|jpe?g|gif|svg|webp|zip|gz|tgz|tar|lock|env|ini|conf|cfg)$' \
     | tr 'A-Z' 'a-z' | sort -u
 }
 
@@ -7242,8 +7275,23 @@ cmd_task_verify() {
       # prose names, anchored on the "<ident>-" prefix. Reusing it is the point — if the
       # gate's idea of a binding changes, this stamp must change with it or it will go
       # quiet on exactly the rows the gate started catching.
+      # DIVE-3265: AN EMPTY BRANCH SET IS AN ANSWER, NOT A FAILURE — `|| _mg_branches=""`
+      # is load-bearing and its absence killed the verb outright. The extractor is a
+      # PROBE that legitimately finds nothing (most rows name no branch). Its pipeline
+      # ends in `grep`, which exits 1 on no-match; `pipefail` promotes that out of the
+      # function and through `head | paste`, and a bare `var=$(...)` under `set -euo
+      # pipefail` (src/header.sh) then kills the whole run. Measured on DIVE-3264 with
+      # the CLI's own suggested trace, last lines before exit:
+      #     ++ paste -sd, - / + _mg_branches= / + on_exit_audit / + local code=1
+      # That is why the two verbs behaved DIFFERENTLY on one row: `task done` found a
+      # (bogus) branch, so extraction succeeded and it refused cleanly, while `task
+      # verify --cmd` found none and CRASHED before any error path could print.
+      # DIVE-2603 fixed exactly this at the sibling call site ~2000 lines up; this site
+      # shipped later (DIVE-2938) and re-introduced it. Grepped the class, not the form:
+      # these two are the only callers of the extractor and both are guarded now, and
+      # tests/verify_close_merge_gate_stamp_unit.sh arm C pins THIS one from both ends.
       local _mg_branches
-      _mg_branches=$(_gate_branch_refs_from_text "$_mg_body" "$ident" 2>/dev/null | head -3 | paste -sd, -)
+      _mg_branches=$(_gate_branch_refs_from_text "$_mg_body" "$ident" 2>/dev/null | head -3 | paste -sd, -) || _mg_branches=""
       [[ -n "$_mg_branches" ]] && _mg_bind="branch(es) named in the body: ${_mg_branches}"
     fi
     if [[ -n "$_mg_bind" ]]; then
