@@ -14,8 +14,9 @@
 # erroring, and `--help` just re-printed the roster.
 #
 # Drives the BUILT binary (the bash surface a seat invokes), not `node cli.mjs`, because the whole
-# defect lived in the bash print + arg handling. No root/sudo/seal needed — `council init` seals
-# through the gate-proof rail unprivileged into an isolated STATE_DIR. Exit 0 == green.
+# defect lived in the bash print + arg handling. Seals genesis on the ROOT gate-proof rail into an
+# isolated STATE_DIR — see the rail block below for which of the two rails each environment has.
+# Exit 0 == green.
 set -uo pipefail
 trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # fires on every exit path (incl. SKIP early-exits)
 
@@ -30,11 +31,53 @@ for b in node jq openssl sha256sum; do
   command -v "$b" >/dev/null 2>&1 || { echo "SKIP: $b not on PATH (roster class-threshold e2e needs it)"; exit 0; }
 done
 
-TMP="$(mktemp -d)"
-FIVE="$TMP/5dive"
-if ! BUILD_OUT="$FIVE" bash "$ROOT/build.sh" >/dev/null 2>&1 || [[ ! -x "$FIVE" ]]; then
-  echo "SKIP: could not build a throwaway ./5dive (build.sh failed)"; exit 0
+# ================= THE SEAL RAIL, AND WHY THIS HARNESS RE-EXECS (DIVE-3282) =====================
+# `council init` seals the genesis record on the ROOT gate-proof rail, and there are TWO ways to
+# reach it (src/cmd_council.sh, _council_seal_stdin):
+#   · IN-PROCESS, when we already are root.
+#   · `sudo -n 5dive gate-proof sign` — resolved BY NAME off PATH, so it needs an INSTALLED
+#     /usr/local/bin/5dive. Not the binary this harness built; the one on the box.
+# This file shipped claiming "no root/sudo/seal needed", which was true of the ONE environment it
+# was written on: the control-plane host grants NOPASSWD to /usr/local/bin/5dive and nothing else,
+# so `sudo -n true` FAILS here while the by-name rail works. Neither CI probe environment installs
+# that binary (full-sweep's installed-host job seeds /var/lib/5dive, the plugin stubs and the
+# `claude` group — not the CLI), so on both runners the seal returned empty and the harness took
+# its SKIP. A skip in one environment is not an accusation; this was a skip in EVERY environment,
+# which harness-verdict-union reads as NEVER PROBED — it graded nothing, anywhere, and froze the
+# release cut behind a corpus-wide invariant.
+#
+# So take whichever rail the environment actually has, and SKIP only when it has neither:
+# re-exec under passwordless sudo when one exists (a runner has it; this host does not) and seal
+# in-process, else fall through to the by-name rail. This is the peer idiom already carrying
+# council_veto_e2e.sh and constitution_set_e2e.sh, not a new mechanism.
+#
+# ORDER IS LOAD-BEARING: build BEFORE the re-exec. build.sh runs `git rev-parse` in the checkout,
+# and root reading a tree owned by another user (the runner's is owned by `runner`) trips git's
+# dubious-ownership refusal — a rebuild on the far side of sudo would SKIP for a second reason.
+# The already-built path travels across as _ROSTER_CLASS_E2E_TMP, which doubles as the re-exec
+# guard: a `sudo` that returns 0 without conferring root must not loop.
+if [[ -z "${_ROSTER_CLASS_E2E_TMP:-}" ]]; then
+  TMP="$(mktemp -d)"
+  if ! BUILD_OUT="$TMP/5dive" bash "$ROOT/build.sh" >/dev/null 2>&1 || [[ ! -x "$TMP/5dive" ]]; then
+    echo "SKIP: could not build a throwaway ./5dive (build.sh failed)"; exit 0
+  fi
+  # `gate-proof sign` calls tasks_db_init, whose root branch mkdir+`chown root:claude`s a tasks dir
+  # it had to create — and that chown is unguarded, so on a pristine runner (no `claude` group) the
+  # seal would die INSIDE the signer with the isolated state dir already in hand. Pre-creating the
+  # directory takes the branch that never chowns. Same group-shaped trap DIVE-2525 hit on
+  # council_record_e2e.sh; fixed here in the harness, since this one owns its own STATE_DIR.
+  mkdir -p "$TMP/tasks"
+  if [[ ${EUID:-$(id -u)} -ne 0 ]] && sudo -n true 2>/dev/null; then
+    # Absolute path, not "$0": the verdict probe runs this file as `tests/.probe-<name>` from the
+    # repo root, and a re-exec that resolved a RELATIVE $0 under a different cwd would report
+    # "could not build" — a third skip reason invented by the fix for the first two.
+    exec sudo -n env PATH="$PATH" _ROSTER_CLASS_E2E_TMP="$TMP" \
+      bash "$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" "$@"
+  fi
+else
+  TMP="$_ROSTER_CLASS_E2E_TMP"
 fi
+FIVE="$TMP/5dive"
 export STATE_DIR="$TMP" COUNCIL_MOCK=1 COUNCIL_5DIVE_BIN="$FIVE"   # isolate — never touch a live state dir
 
 P=0; F=0
@@ -45,8 +88,18 @@ chk(){ if [ "$2" = "$3" ]; then ok "$1"; else no "$1 (want=$2 got=$3)"; fi; }
 # Six seats — the live Council's size, and the size at which the two numbers DIVERGE: majority
 # quorum is 4, all-seats quorum is 6. A 3-seat fixture would hide half the defect (2 vs 3 still
 # differ, but 6/4 is the exact pair the two inquorate rounds were decided on).
-"$FIVE" council init --seats="a:chair,b,c,d,e,f" --threshold="majority" --veto="tg:1234567890" >/dev/null 2>&1 \
-  || { echo "SKIP: council init could not seal genesis in this environment (no gate-proof rail)"; exit 0; }
+if ! "$FIVE" council init --seats="a:chair,b,c,d,e,f" --threshold="majority" --veto="tg:1234567890" >/dev/null 2>&1; then
+  # The two outcomes are NOT the same fact and must not share an exit code (DIVE-3282). Root HAS
+  # the in-process rail, so a seal that fails here is a defect in the product or in this fixture —
+  # exit 1 and say which. Only a non-root shell with no rail at all is an environment fact, and
+  # that is the sole case that may still skip.
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    echo "FAIL: council init could not seal genesis AS ROOT — the in-process gate-proof rail was available and did not work"
+    exit 1
+  fi
+  echo "SKIP: no gate-proof seal rail in this environment (not root, no passwordless sudo to re-exec through, no installed 5dive for the by-name rail)"
+  exit 0
+fi
 
 J="$("$FIVE" --json council roster 2>/dev/null)"
 [[ -n "$J" ]] || { echo "FAIL: roster --json produced nothing"; exit 1; }
