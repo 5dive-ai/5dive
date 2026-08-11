@@ -668,19 +668,26 @@ _task_verify_skip_reason() {
 # genuinely changed only tests/docs, and if you did, there is nothing for a
 # grader to grade.
 #
-# THE ADD-TIME OPT-OUT IS NOT PRESERVED HERE, which is the accurate form of a
-# claim this comment made the other way round until main's review caught it.
-# Nothing persists `--no-verify`: it is a local var (declared 866, set 903) read
-# only by `task add`'s own branches (1051, 1063), with no column behind it. So at
-# `task done` a `--no-verify` row is INDISTINGUISHABLE from a DIVE-969
-# auto-skipped one — both read verifier NULL, verify_unavailable NULL — and the
-# UPGRADE arm below tests exactly that shape, so it re-attaches a grader to an
-# explicit opt-out whose diff reached the blast radius. The direction is
-# conservative: it can only ADD a rail, never waive one, so DIVE-969's posture is
-# intact. What it does override is an explicit filer instruction. Accepted, not
-# unnoticed — DIVE-2730 persists the flag and makes the original claim true.
-# (`verify_unavailable=1` self-handles: _task_default_verifier returns empty
-# again in that org, so the upgrade cannot fire.)
+# THE ADD-TIME OPT-OUT IS RECORDED HERE, as of DIVE-2730, AND STILL LOSES TO THE
+# UPGRADE — two claims, and the second is the load-bearing one. This comment once
+# said the opt-out was "untouched"; main's review refuted it at source, because
+# `--no-verify` was a local var in `task add` with no column behind it. It died
+# with that process, so at `task done` a `--no-verify` row was INDISTINGUISHABLE
+# from a DIVE-969 auto-skipped one — both read verifier NULL, verify_unavailable
+# NULL. A decision and a default that produce the same stored state ARE the same
+# state; no amount of downstream reasoning recovers the difference.
+# `tasks.verify_optout` now stores it, so the override can be NAMED — which was
+# the actual defect, the silence, not the override.
+# The override itself is CORRECT and stays: the flag is declared at FILE time and
+# the blast radius is measured at DELIVERY time, so honouring the flag here would
+# let a sentence typed before the diff existed pre-authorise closing a scheduler
+# or credentials change ungraded. That is a waiver in DIVE-969's banned direction,
+# and it is the one way persisting this column could have turned a fix into a
+# bypass. The filer opted out of ROUTINE grading, not of grading a diff they had
+# not written yet.
+# (`verify_unavailable=1` is the genuine self-handling case, by a different route:
+# _task_default_verifier returns empty again in that org, so the upgrade cannot
+# fire for want of a grader rather than for want of permission.)
 #
 # Print the changed paths of the delivery bound to task <id>, one per line.
 # Empty output means UNKNOWN — no binding, no gh, no credential, no PR found —
@@ -1673,12 +1680,12 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
   local id
   id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, derived_actor, parent_id, project_key, kind, schedule, fresh,
                               acceptance_criteria, verify_command, max_iterations, verifier, task_budget, verify_unavailable,
-                              on_overlap, overlap_bound)
+                              verify_optout, on_overlap, overlap_bound)
            VALUES ($(sqlq "$title"), $(sqlq_or_null "$body"), $(sqlq "$priority"),
                    $(sqlq_or_null "$assignee"), $(sqlq "$creator"), $(sqlq_or_null "$derived_actor"), ${parent_sql}, $(sqlq "$project"),
                    $(sqlq "$kind"), ${schedule_sql}, ${fresh_sql},
                    $(sqlq_or_null "$accept"), $(sqlq_or_null "$verify_cmd"), ${max_iters:-NULL}, $(sqlq_or_null "$verifier"), $(sqlq_or_null "$task_budget"), $([[ $verify_unavailable == 1 ]] && echo 1 || echo NULL),
-                   ${on_overlap_sql}, ${overlap_bound_sql});
+                   $([[ -n "$no_verify" ]] && echo 1 || echo NULL), ${on_overlap_sql}, ${overlap_bound_sql});
            SELECT last_insert_rowid();")
   # Ident is stamped by the AFTER INSERT trigger from the project's counter, so
   # read it back rather than assuming the DIVE- prefix (DIVE-484).
@@ -2228,7 +2235,8 @@ cmd_task_verifier() {
   db "UPDATE tasks SET verifier=$(sqlq "$who"),
         acceptance_criteria=$(sqlq "$new_accept"),
         max_iterations=$([[ -n "$max_iters" ]] && echo "$max_iters" || echo "max_iterations"),
-        verify_unavailable=NULL${move_sql}
+        verify_unavailable=NULL,
+        verify_optout=NULL${move_sql}
       WHERE id=${id};"
   local msg="$ident is now verifier-graded → $who ('task done' hands off to grade instead of closing)"
   (( repoint )) && msg="$ident review re-pointed → $who (was with '$cur_vfier'; delivery re-stamped, maker '${maker:-?}' and iteration unchanged)"
@@ -4281,10 +4289,31 @@ _task_status_cmd() {
       # low priority) and gave it no grader — but the diff reached the scheduler,
       # the task store, credentials or deploy. This is a ROUND TRIP, not a block:
       # the grader's own `task done` (verifier==assignee) closes it normally.
+      #
+      # DIVE-2730: AN EXPLICIT `--no-verify` DOES NOT SUPPRESS THIS UPGRADE, and
+      # the temptation to make it do so is the whole reason to write this down.
+      # `--no-verify` is declared at FILE time; the blast radius is MEASURED at
+      # DELIVERY time. Letting the declaration win inverts which evidence decides
+      # — it lets a sentence typed before the diff existed pre-authorise closing a
+      # credentials or scheduler change ungraded, which is the exact control
+      # DIVE-2719 exists to impose and a waiver in DIVE-969's banned direction.
+      # What the filer opted out of was ROUTINE grading, not grading of a diff
+      # they had not written yet. (main, reviewing this change on DIVE-2730.)
+      #
+      # So the column is not a predicate here — it is what makes the override
+      # SAYABLE. The defect this row was filed for is that an explicit human
+      # instruction was overridden SILENTLY: before the column, `task done` could
+      # not tell a refusal from a default absence, so it could not name what it
+      # was overriding even if it wanted to. Now it can, and does.
+      local _optout; _optout=$(db "SELECT COALESCE(verify_optout,0) FROM tasks WHERE id=${id};")
       local _up; _up=$(_task_default_verifier "$_asignee" "")
       if [[ -n "$_up" ]]; then
         db "UPDATE tasks SET verifier=$(sqlq "$_up") WHERE id=${id};"
-        warn "$ident: graded after all (DIVE-2719) — filed without a verifier, but the delivered diff touches the blast radius (scheduler/task store/credentials/deploy), so it routes to '$_up' instead of closing outright."
+        if [[ "$_optout" == "1" ]]; then
+          warn "$ident: graded despite '--no-verify' (DIVE-2730) — the opt-out was declared at filing, before this diff existed, and the delivered diff touches the blast radius (scheduler/task store/credentials/deploy), where the delivery-time measurement wins over the file-time declaration. Routes to '$_up'."
+        else
+          warn "$ident: graded after all (DIVE-2719) — filed without a verifier, but the delivered diff touches the blast radius (scheduler/task store/credentials/deploy), so it routes to '$_up' instead of closing outright."
+        fi
         _task_route_to_verifier "$id" "$_up" "$_asignee" "$result" "$want_result"
         return
       fi

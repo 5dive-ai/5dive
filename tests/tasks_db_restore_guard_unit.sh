@@ -180,6 +180,7 @@ out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
 # gate_mode.
 # DIVE-3171 added route_provenance, the ROUTING axis's provenance beside
 # floor_provenance's TIER axis.
+# DIVE-2730 added verify_optout, the persisted add-time `--no-verify` (81 -> 82).
 # DIVE-2272 added on_overlap + overlap_bound, the per-template overlap policy
 # (79 -> 81). Both nullable on purpose: NULL means 'skip' / 'the default bound',
 # so the migration is a no-op for every template predating the column AND an
@@ -201,8 +202,8 @@ actual=$(sqlite3 "$TASKS_DB" \
     WHERE name IN ('delivery_ref','delivered_at','delivery_ref_iteration','parked_at','park_reason','escalated_at','escalated_by','human_evidence')
     ORDER BY name;" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
 column_count=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM pragma_table_info('tasks');" 2>/dev/null)
-[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "81" ]] \
-  && ok "fresh schema: all 81 columns, including the eight former holes, are present" \
+[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "82" ]] \
+  && ok "fresh schema: all 82 columns, including the eight former holes, are present" \
   || bad "fresh schema: init returned a partial tasks table" "rc=$rc count=$column_count got=[$actual] want=[$required] out=$out"
 
 # --- Case 10 (DIVE-2197): migrate arm still rejects a failed ALTER ------------
