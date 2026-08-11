@@ -63,6 +63,33 @@ A metric you cannot attack is not a metric, so the limits first, stated plainly:
   Non-trivial tasks are verifier-graded by default: an agent other than the maker grades
   the work against acceptance criteria before it can close, so the maker never grades
   their own work.
+- **not counted as shipped — experiment-fixture rows.** The board this metric is
+  computed from is a *live* board, and the agents on it file harness rows to test the
+  task engine itself. Those rows are indistinguishable from real work on every field a
+  filter normally looks at (same project, same `DIVE-` ident sequence, `kind='standard'`,
+  a verifier attached) and they carry no gate — so they are pure denominator and can only
+  push this number UP. They are excluded by an anchored title prefix, defined once in
+  [`five_fixture_title_prefixes()`](../src/lib/tasks_db.sh) and shared by every consumer
+  (the badge, `5dive proof status`, the corroborators below). Three properties of that
+  rule, because a filter on a published number is itself a claim:
+  - **It is published.** `zero-human.json` carries `fixtureExclusion` (the rule, and how
+    many rows it removed from the day and from the window), `history.jsonl` stamps the
+    per-day count, and `5dive proof publish` REFUSES to publish at all if the digest it
+    was handed cannot state its filter. There is no silent-filter path.
+  - **It is a prefix, never a substring.** The ticket that reported this defect
+    (DIVE-3227) has the fixture words in its own title while describing them; a substring
+    rule would have deleted the bug report from the ledger.
+  - **It is incomplete, and here is how.** An *unlabelled* harness family — rows whose
+    titles do not carry a known fixture prefix — stays invisible to it. That is why the
+    excluded count is printed everywhere the number is: a filter nobody can see eating a
+    real row is the same defect as the inflation it was added to remove. A
+    generation-signature rule (same creator, same title, repeated in a burst) was measured
+    on this population and rejected: it flags 221 of the window's 1333 shipped rows,
+    almost all of them real *recurring* work whose titles repeat by design.
+  - **Rows published before 2026-08-11 were not filtered.** `history.jsonl` is
+    append-only, so datapoints from before the rule existed carry no exclusion field and
+    contribute 0 to the window's excluded count; the window sum can therefore still
+    include unfiltered fixture rows from those days.
 - **human asks**: gates answered by a human. The store records who answered every gate
   (`need_answered_by`), and only answers with `human:*` provenance count. A one-tap
   approval on the phone counts: the interrupt is the cost, not the typing. Deliberately
@@ -76,7 +103,9 @@ A metric you cannot attack is not a metric, so the limits first, stated plainly:
 agents that cut this repo's releases. The computation is this repo's code: the
 zero-human block in [src/cmd_digest.sh](../src/cmd_digest.sh) (search `OSS-10` and
 `OSS-14`), unit-tested in
-[tests/digest_autonomy_unit.sh](../tests/digest_autonomy_unit.sh).
+[tests/digest_autonomy_unit.sh](../tests/digest_autonomy_unit.sh) and
+[tests/digest_fixture_exclusion_unit.sh](../tests/digest_fixture_exclusion_unit.sh) (the
+fixture exclusion, in both directions).
 
 ## How it updates
 

@@ -250,6 +250,7 @@ cmd_digest() {
   DIGEST_TASKS_F="$tmpd/tasks.json" DIGEST_USAGE_F="$tmpd/usage.json" DIGEST_HB_F="$tmpd/hb.txt" \
   DIGEST_LOOPS_F="$tmpd/loops.json" DIGEST_SUP_F="$tmpd/sup.json" DIGEST_OBJ_F="$tmpd/obj.json" \
   DIGEST_UPDATE_F="$tmpd/update.json" \
+  DIGEST_FIXTURE_PREFIXES="$(five_fixture_title_prefixes)" \
   DIGEST_WINDOW="$window" DIGEST_JSON="$as_json" python3 - >"$tmpd/out.txt" <<'PY'
 import os, json, time, datetime as dt
 
@@ -289,13 +290,32 @@ def to_epoch(s):
 # Recurring/scheduled rows are machinery, not standup-worthy items.
 work = [t for t in tasks if t.get("kind", "task") not in ("recurring", "schedule")]
 
+# DIVE-3227: an experiment fixture is not shipped work. The prefix list arrives
+# from five_fixture_title_prefixes() (src/lib/tasks_db.sh) — the ONE definition,
+# shared with the SQL-side consumers in cmd_proof.sh. An absent env var means an
+# EMPTY list: nothing is excluded and the emitted `rule` is empty, which is the
+# marker `proof publish` refuses on. This block is also driven standalone by
+# tests/digest_*_unit.sh, so it must not carry a second copy of the list.
+_FIXTURE_PREFIXES = tuple(p for p in (os.environ.get("DIGEST_FIXTURE_PREFIXES") or "").split("\n") if p)
+
+def is_fixture(t):
+    if not _FIXTURE_PREFIXES:
+        return False
+    return (t.get("title") or "").strip().lower().startswith(_FIXTURE_PREFIXES)
+
+fixtures_done, fixtures_asks = [], []
+
 done, in_progress, blocked, parked = [], [], [], []
 for t in work:
     st = t.get("status")
     if st == "done":
         de = to_epoch(t.get("done_at"))
         if de is not None and de >= since:
-            done.append(t)
+            # DIVE-3227: fixtures leave the ship count and are reported
+            # separately, never dropped silently. They stay in `work`, so an open
+            # gate on one is still surfaced — only the COUNTS of shipped work
+            # exclude them.
+            (fixtures_done if is_fixture(t) else done).append(t)
     elif st == "in_progress":
         in_progress.append(t)
     elif t.get("parked_at"):
@@ -396,9 +416,28 @@ for t in work:
     if by.startswith("human:"):
         ae = to_epoch(t.get("need_answered_at"))
         if ae is not None and ae >= since:
-            human_touches.append(t)
+            # DIVE-3227: exclude on BOTH sides of the ratio. No fixture carries a
+            # gate today (measured: 0 of 50), so this moves the number by zero now
+            # and keeps numerator and denominator drawn from one population — an
+            # ask kept in the numerator while its row left the denominator would
+            # understate autonomy for a reason no reader could reconstruct.
+            (fixtures_asks if is_fixture(t) else human_touches).append(t)
 ht_l = [{"ident": t.get("ident"), "type": t.get("need_type"),
          "answer": (t.get("need_answer") or "").strip()} for t in human_touches]
+
+# DIVE-3227: the exclusion travels with the number it changes. An empty `rule`
+# means no rule was supplied (the fail-open wiring case) and `proof publish`
+# refuses on it rather than emitting a public badge whose filter cannot be
+# stated.
+fixture_excluded = {
+    "shipped": len(fixtures_done),
+    "asks": len(fixtures_asks),
+    "prefixes": list(_FIXTURE_PREFIXES),
+    "rule": (("title (trimmed, lowercased) starts with: "
+              + ", ".join(repr(p) for p in _FIXTURE_PREFIXES))
+             if _FIXTURE_PREFIXES else ""),
+    "idents": [t.get("ident") for t in fixtures_done][:60],
+}
 
 # Usage: top agents by output tokens + their share-of-limit; flag anyone hot.
 #
@@ -533,10 +572,13 @@ point_in_time = {
 # with trend vs the prior window. Deterministic, from data already loaded; the
 # marketing-flagship framing of the OSS-10 zero-human numbers. Zero agent tokens.
 def _window_counts(lo, hi):
-    ship = sum(1 for t in work if t.get("status") == "done"
+    # DIVE-3227: the PRIOR window nets fixtures out too. Excluding them from one
+    # side of a before/after pair renders the filter as a trend.
+    ship = sum(1 for t in work if t.get("status") == "done" and not is_fixture(t)
                and lo <= (to_epoch(t.get("done_at")) or -1) < hi)
     ask = sum(1 for t in work
               if (t.get("need_answered_by") or "").startswith("human:")
+              and not is_fixture(t)
               and lo <= (to_epoch(t.get("need_answered_at")) or -1) < hi)
     return ship, ask
 prev_ship, prev_ask = _window_counts(since - window, since)
@@ -643,7 +685,8 @@ if as_json:
         "objectives": objectives,
         "done": done_l, "inProgress": ip_l, "blocked": blk_l, "autoCleared": auto_l,
         "throughput": throughput,
-        "zeroHuman": {"shipped": len(done_l), "humanTouches": len(ht_l), "gates": ht_l},
+        "zeroHuman": {"shipped": len(done_l), "humanTouches": len(ht_l), "gates": ht_l,
+                      "fixturesExcluded": fixture_excluded},
         "autonomy": autonomy,
         "precedentPrefill": {"count": len(prefilled), "accepted": len(accepted),
                              "acceptanceRate": prefill_rate,
@@ -669,6 +712,17 @@ else:
     if 0 < touches <= 4:
         kpi += " (" + ", ".join(g["ident"] for g in ht_l) + ")"
     out.append(kpi)
+    # DIVE-3227: print the filter where the number is rendered. A metric with an
+    # invisible exclusion is the defect this row was filed for, one layer down.
+    if fixture_excluded["shipped"] or fixture_excluded["asks"]:
+        _fx = (f"   ↳ excluded {fixture_excluded['shipped']} fixture-shaped row(s)"
+               f", {fixture_excluded['asks']} ask(s) — {fixture_excluded['rule']}")
+        _ids = [i for i in fixture_excluded["idents"][:4] if i]
+        if _ids:
+            _fx += " — " + ", ".join(_ids)
+            if len(fixture_excluded["idents"]) > 4:
+                _fx += ", …"
+        out.append(_fx)
     def _trend(cur, prev):
         d = cur - prev
         arrow = "↑" if d > 0 else ("↓" if d < 0 else "→")

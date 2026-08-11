@@ -47,6 +47,16 @@ fail() { echo "fail($1): $2" >&2; exit "$1"; }
 # db() runs the query against the fixture TASKS_DB, exactly like the real helper.
 db() { sqlite3 "$TASKS_DB" "$1"; }
 
+# DIVE-3227: _proof_ledger now excludes experiment-fixture rows by title, using
+# the single definition in src/lib/tasks_db.sh. Pull those three functions out of
+# THE PRODUCT FILE rather than restating them here — a harness that carries its
+# own copy of the rule grades the copy (a test of the instrument, DIVE-3175).
+eval "$(awk '/^sqlq\(\) \{/,/^\}/' src/lib/tasks_db.sh)"
+eval "$(awk '/^five_fixture_title_prefixes\(\) \{/,/^\}/' src/lib/tasks_db.sh)"
+eval "$(awk '/^five_fixture_title_sql\(\) \{/,/^\}/' src/lib/tasks_db.sh)"
+declare -F five_fixture_title_sql >/dev/null \
+  || { echo "FAIL - could not extract five_fixture_title_sql from src/lib/tasks_db.sh"; exit 1; }
+
 # shellcheck disable=SC1091
 source src/cmd_proof.sh
 
@@ -60,33 +70,39 @@ sqlite3 "$TASKS_DB" <<'SQL'
 CREATE TABLE tasks (
   status TEXT, kind TEXT, need_type TEXT,
   need_answered_by TEXT, need_answered_uid INTEGER, human_nonce_hash TEXT,
-  need_answered_at TEXT
+  need_answered_at TEXT, title TEXT
 );
 -- 5 clean shipped actions (done, standard, no gate)
-INSERT INTO tasks VALUES ('done','standard',NULL,NULL,NULL,NULL,NULL);
-INSERT INTO tasks VALUES ('done','standard',NULL,NULL,NULL,NULL,NULL);
-INSERT INTO tasks VALUES ('done','standard',NULL,NULL,NULL,NULL,NULL);
-INSERT INTO tasks VALUES ('done','standard',NULL,NULL,NULL,NULL,NULL);
-INSERT INTO tasks VALUES ('done','standard',NULL,NULL,NULL,NULL,NULL);
+INSERT INTO tasks VALUES ('done','standard',NULL,NULL,NULL,NULL,NULL,'ship a real thing');
+INSERT INTO tasks VALUES ('done','standard',NULL,NULL,NULL,NULL,NULL,'ship a real thing');
+INSERT INTO tasks VALUES ('done','standard',NULL,NULL,NULL,NULL,NULL,'ship a real thing');
+INSERT INTO tasks VALUES ('done','standard',NULL,NULL,NULL,NULL,NULL,'ship a real thing');
+INSERT INTO tasks VALUES ('done','standard',NULL,NULL,NULL,NULL,NULL,'ship a real thing');
 -- 2 shipped that needed a human (answered through a human rail, DIVE-1117)
-INSERT INTO tasks VALUES ('done','standard','decision','human:lodar',1000,NULL,'2026-07-01 10:00:00');
-INSERT INTO tasks VALUES ('done','standard','approval','human:olivia',1000,NULL,'2026-07-01 11:00:00');
+INSERT INTO tasks VALUES ('done','standard','decision','human:lodar',1000,NULL,'2026-07-01 10:00:00','ship a real thing');
+INSERT INTO tasks VALUES ('done','standard','approval','human:olivia',1000,NULL,'2026-07-01 11:00:00','ship a real thing');
 -- 1 shipped that needed a human (human-tap nonce, no human: prefix). DELIBERATELY
 -- unanswered: the nonce arm counts a gate DELIVERED to a human, answered or not.
-INSERT INTO tasks VALUES ('done','standard','manual',NULL,NULL,'abc123',NULL);
+INSERT INTO tasks VALUES ('done','standard','manual',NULL,NULL,'abc123',NULL,'ship a real thing');
 -- 1 shipped whose gate a LEAD cleared (uid captured, but NOT human) — NOT an ask
-INSERT INTO tasks VALUES ('done','standard','decision','lead:main',1000,NULL,'2026-07-01 12:00:00');
+INSERT INTO tasks VALUES ('done','standard','decision','lead:main',1000,NULL,'2026-07-01 12:00:00','ship a real thing');
 -- 1 shipped whose gate a bare AGENT answered (uid captured) — NOT an ask
-INSERT INTO tasks VALUES ('done','standard','approval','olivia',1000,NULL,'2026-07-01 13:00:00');
+INSERT INTO tasks VALUES ('done','standard','approval','olivia',1000,NULL,'2026-07-01 13:00:00','ship a real thing');
 -- DIVE-2119 re-file RESIDUE: a LIVE gate wearing the PREVIOUS gate's human
 -- answerer, need_answered_at NULL because nobody has answered THIS one. 8 rows
 -- on the live board looked like this. Counting it invents an ask that never
 -- happened, so it must NOT count — this is the row the guard exists for.
-INSERT INTO tasks VALUES ('done','standard','secret','human:lodar',1000,NULL,NULL);
+INSERT INTO tasks VALUES ('done','standard','secret','human:lodar',1000,NULL,NULL,'ship a real thing');
 -- excluded: a still-blocked task (not shipped)
-INSERT INTO tasks VALUES ('blocked','standard','decision','human:lodar',1000,NULL,'2026-07-01 14:00:00');
+INSERT INTO tasks VALUES ('blocked','standard','decision','human:lodar',1000,NULL,'2026-07-01 14:00:00','ship a real thing');
 -- excluded: a done RECURRING template (not a standard action)
-INSERT INTO tasks VALUES ('done','recurring',NULL,NULL,NULL,NULL,NULL);
+INSERT INTO tasks VALUES ('done','recurring',NULL,NULL,NULL,NULL,NULL,'ship a real thing');
+-- DIVE-3227 excluded: two EXPERIMENT-FIXTURE rows. Done, standard, no gate, and
+-- indistinguishable from real work on every other column — pure denominator, so
+-- they can only flatter the published badge. The second is padded and mixed-case
+-- to pin the lower(trim(title)) normalisation.
+INSERT INTO tasks VALUES ('done','standard',NULL,NULL,NULL,NULL,NULL,'stamp arm A');
+INSERT INTO tasks VALUES ('done','standard',NULL,NULL,NULL,NULL,NULL,'  Stamp Arm B  ');
 SQL
 # shipped = 11 done standard; asks = 3 (2 human-rail + 1 nonce; lead + agent
 # clearances excluded even though they carry a uid, and the DIVE-2119 re-file
@@ -132,9 +148,51 @@ nonce_off="$(sqlite3 "$TASKS_DB" "SELECT COUNT(*) FROM tasks
   && ok_t "a delivered-but-UNANSWERED nonce gate still counts (conservative, unguarded)" \
   || bad_t "the nonce arm must keep its delivered semantics" "unanswered-nonce rows=$nonce_off asks=$got_ask"
 
+# --- DIVE-3227: fixture rows are excluded, COUNTED, and the rule is anchored --
+# The two fixture rows above are already netted out of the 11/3/72.7 asserted
+# above — an exclusion that moved those numbers would have failed there. Here we
+# pin the count that must travel WITH the number (a silent filter on a published
+# metric is the same defect class as the inflation it removes).
+got_fx="$(jq -r '.fixturesExcluded' <<<"$led")"
+[ "$got_fx" = 2 ] \
+  && ok_t "fixturesExcluded reports what the filter removed (2)" \
+  || bad_t "fixturesExcluded" "got $got_fx"
+[ "$got_ship" = 11 ] \
+  && ok_t "shipped nets out fixture-shaped rows (11, not 13)" \
+  || bad_t "fixture rows must not count as shipped" "got $got_ship"
+
+# ANCHORING, in both directions and in ONE fixture db so the counts are exact:
+# a row whose title merely CONTAINS the words must still count as shipped —
+# DIVE-3227's own title contains them while reporting the bug, and a substring
+# rule would delete the bug report from the ledger.
+export TASKS_DB="$TMP/anchor.db"
+sqlite3 "$TASKS_DB" <<'SQL'
+CREATE TABLE tasks (status TEXT, kind TEXT, need_type TEXT, need_answered_by TEXT, need_answered_uid INTEGER, human_nonce_hash TEXT, need_answered_at TEXT, title TEXT);
+INSERT INTO tasks VALUES ('done','standard',NULL,NULL,NULL,NULL,NULL,'the badge counts stamp arm % rows as shipped work');
+INSERT INTO tasks VALUES ('done','standard',NULL,NULL,NULL,NULL,NULL,'stamp arm C');
+SQL
+led_a="$(_proof_ledger)"
+[ "$(jq -r '.shipped' <<<"$led_a")" = 1 ] && [ "$(jq -r '.fixturesExcluded' <<<"$led_a")" = 1 ] \
+  && ok_t "prefix-anchored: a title that CONTAINS the words still ships (1 kept, 1 excluded)" \
+  || bad_t "anchoring" "$led_a"
+
+# The predicate escapes LIKE metacharacters and carries ESCAPE, so a prefix is
+# matched literally. Asserted on the generated SQL because no prefix in the
+# shipped list contains one yet — this is what stops the next prefix widening the
+# rule silently.
+_pex="$(five_fixture_title_sql exclude)"; _pma="$(five_fixture_title_sql match)"
+case "$_pex$_pma" in
+  *"NOT LIKE"*"ESCAPE"*) ok_t "predicate carries NOT LIKE + ESCAPE (literal prefixes)" ;;
+  *) bad_t "predicate form" "exclude=$_pex match=$_pma" ;;
+esac
+case "$(five_fixture_title_sql bogus-mode 2>/dev/null; echo "rc=$?")" in
+  "0rc=1") ok_t "an unknown mode fails closed (prints 0, rc 1) — never a match-all" ;;
+  *) bad_t "unknown mode must fail closed" "$(five_fixture_title_sql bogus-mode 2>/dev/null; echo "rc=$?")" ;;
+esac
+
 # --- empty board: shipped 0, null pct, no divide-by-zero --------------------
 export TASKS_DB="$TMP/empty.db"
-sqlite3 "$TASKS_DB" 'CREATE TABLE tasks (status TEXT, kind TEXT, need_type TEXT, need_answered_by TEXT, need_answered_uid INTEGER, human_nonce_hash TEXT, need_answered_at TEXT);'
+sqlite3 "$TASKS_DB" 'CREATE TABLE tasks (status TEXT, kind TEXT, need_type TEXT, need_answered_by TEXT, need_answered_uid INTEGER, human_nonce_hash TEXT, need_answered_at TEXT, title TEXT);'
 led2="$(_proof_ledger)"
 [ "$(jq -r '.shipped' <<<"$led2")" = 0 ] && ok_t "empty board: shipped 0" || bad_t "empty shipped" "$led2"
 [ "$(jq -r '.autonomyPct' <<<"$led2")" = null ] && ok_t "empty board: null pct (no div0)" || bad_t "empty pct" "$led2"
@@ -142,9 +200,9 @@ led2="$(_proof_ledger)"
 # --- 100% autonomy: all clean, no asks --------------------------------------
 export TASKS_DB="$TMP/clean.db"
 sqlite3 "$TASKS_DB" <<'SQL'
-CREATE TABLE tasks (status TEXT, kind TEXT, need_type TEXT, need_answered_by TEXT, need_answered_uid INTEGER, human_nonce_hash TEXT, need_answered_at TEXT);
-INSERT INTO tasks VALUES ('done','standard',NULL,NULL,NULL,NULL,NULL);
-INSERT INTO tasks VALUES ('done','standard',NULL,NULL,NULL,NULL,NULL);
+CREATE TABLE tasks (status TEXT, kind TEXT, need_type TEXT, need_answered_by TEXT, need_answered_uid INTEGER, human_nonce_hash TEXT, need_answered_at TEXT, title TEXT);
+INSERT INTO tasks VALUES ('done','standard',NULL,NULL,NULL,NULL,NULL,'ship a real thing');
+INSERT INTO tasks VALUES ('done','standard',NULL,NULL,NULL,NULL,NULL,'ship a real thing');
 SQL
 led3="$(_proof_ledger)"
 [ "$(jq -r '.autonomyPct' <<<"$led3")" = 100 ] && ok_t "all-clean board: 100% autonomy" || bad_t "100pct" "$led3"

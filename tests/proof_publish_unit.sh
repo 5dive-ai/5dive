@@ -32,11 +32,16 @@ awk "/python3 <<'PROOFPY'/{f=1;next} f&&/^PROOFPY\$/{f=0} f" src/cmd_proof.sh > 
 # run_build <workdir> <day_shipped> <day_asks> <week_shipped> <week_asks> [today]
 # Runs the builder inside <workdir> (cwd == status-branch checkout). Echoes the
 # builder's stdout; returns its exit code.
+# DIVE-3227: every digest fixture below carries a fixturesExcluded block with a
+# stated rule, because the builder refuses one that does not. Callers drive the
+# refusal path with `FX_DAY= run_build ...` (set-but-empty) and a different count
+# with FX_DAY=<json fragment>.
+_FXDEF=',"fixturesExcluded":{"shipped":0,"asks":0,"rule":"title (trimmed, lowercased) starts with: stamp arm "}'
 run_build() {
   local wd="$1" ds="$2" da="$3" ws="$4" wa="$5" today="${6:-2026-07-11}"
   ( cd "$wd" && \
-    DAY_JSON="{\"zeroHuman\":{\"shipped\":$ds,\"humanTouches\":$da}}" \
-    WEEK_JSON="{\"zeroHuman\":{\"shipped\":$ws,\"humanTouches\":$wa}}" \
+    DAY_JSON="{\"zeroHuman\":{\"shipped\":$ds,\"humanTouches\":$da${FX_DAY-$_FXDEF}}}" \
+    WEEK_JSON="{\"zeroHuman\":{\"shipped\":$ws,\"humanTouches\":$wa${FX_WEEK-$_FXDEF}}}" \
     TODAY="$today" NOW_ISO="${today}T00:00:00Z" \
     CLI_VERSION="0.8.8" METHODOLOGY_URL="https://example.test/zero-human.md" \
     python3 "$TMP/proof.py" )
@@ -172,8 +177,8 @@ run_build "$W5" 12 2 3 0 2026-07-11 >/dev/null
 # ~200KB day blob (would E2BIG as an env string) and assert it builds verbatim.
 W6="$TMP/w6"; mkdir -p "$W6"
 PAD="$(head -c 200000 /dev/zero | tr '\0' 'x')"           # 200000 chars > 128KB
-printf '{"_pad":"%s","zeroHuman":{"shipped":6,"humanTouches":0}}' "$PAD" > "$TMP/day6.json"
-printf '{"zeroHuman":{"shipped":6,"humanTouches":0}}' > "$TMP/week6.json"
+printf '{"_pad":"%s","zeroHuman":{"shipped":6,"humanTouches":0,"fixturesExcluded":{"shipped":0,"asks":0,"rule":"title (trimmed, lowercased) starts with: stamp arm "}}}' "$PAD" > "$TMP/day6.json"
+printf '{"zeroHuman":{"shipped":6,"humanTouches":0,"fixturesExcluded":{"shipped":0,"asks":0,"rule":"title (trimmed, lowercased) starts with: stamp arm "}}}' > "$TMP/week6.json"
 [[ "$(wc -c < "$TMP/day6.json")" -gt 131072 ]] && ok_t "day6 blob exceeds MAX_ARG_STRLEN (would E2BIG via env)" || bad_t "day6 blob size"
 OUT6="$( cd "$W6" && \
   DAY_JSON_FILE="$TMP/day6.json" WEEK_JSON_FILE="$TMP/week6.json" \
@@ -192,8 +197,8 @@ OUT6="$( cd "$W6" && \
 # 26 lifetime, ledger opened 2026-07-25 12:04.
 W7="$TMP/w7"; mkdir -p "$W7"
 OUT7="$( cd "$W7" && \
-  DAY_JSON='{"zeroHuman":{"shipped":5,"humanTouches":1}}' \
-  WEEK_JSON='{"zeroHuman":{"shipped":27,"humanTouches":2}}' \
+  DAY_JSON='{"zeroHuman":{"shipped":5,"humanTouches":1,"fixturesExcluded":{"shipped":0,"asks":0,"rule":"title (trimmed, lowercased) starts with: stamp arm "}}}' \
+  WEEK_JSON='{"zeroHuman":{"shipped":27,"humanTouches":2,"fixturesExcluded":{"shipped":0,"asks":0,"rule":"title (trimmed, lowercased) starts with: stamp arm "}}}' \
   TODAY="2026-08-03" NOW_ISO="2026-08-03T21:00:00Z" \
   CLI_VERSION="0.18.0" METHODOLOGY_URL="https://example.test/zero-human.md" \
   CORR_ROWS="325|192|124|3" \
@@ -232,8 +237,8 @@ BADGE7_MSG="$(jget "$W7/badge.json" "['message']")"
 # explicit no-data marker, never a bare 0/0%, same rule `proof scorecard` uses.
 W8="$TMP/w8"; mkdir -p "$W8"
 ( cd "$W8" && \
-  DAY_JSON='{"zeroHuman":{"shipped":5,"humanTouches":1}}' \
-  WEEK_JSON='{"zeroHuman":{"shipped":27,"humanTouches":2}}' \
+  DAY_JSON='{"zeroHuman":{"shipped":5,"humanTouches":1,"fixturesExcluded":{"shipped":0,"asks":0,"rule":"title (trimmed, lowercased) starts with: stamp arm "}}}' \
+  WEEK_JSON='{"zeroHuman":{"shipped":27,"humanTouches":2,"fixturesExcluded":{"shipped":0,"asks":0,"rule":"title (trimmed, lowercased) starts with: stamp arm "}}}' \
   TODAY="2026-08-03" NOW_ISO="2026-08-03T21:00:00Z" \
   CLI_VERSION="0.18.0" METHODOLOGY_URL="https://example.test/zero-human.md" \
   python3 "$TMP/proof.py" ) >/dev/null
@@ -261,8 +266,8 @@ for i in 1 2 3 4 5 6 7; do
   printf '{"cliVersion":"0.18.0","date":"2026-07-%02d","day":{"humanAsks":1,"shipped":10},"week":{"humanAsks":0,"shipped":0}}\n' "$((3+i))" >> "$W9/history.jsonl"
 done
 ( cd "$W9" && \
-  DAY_JSON='{"zeroHuman":{"shipped":12,"humanTouches":2}}' \
-  WEEK_JSON='{"zeroHuman":{"shipped":3,"humanTouches":0}}' \
+  DAY_JSON='{"zeroHuman":{"shipped":12,"humanTouches":2,"fixturesExcluded":{"shipped":0,"asks":0,"rule":"title (trimmed, lowercased) starts with: stamp arm "}}}' \
+  WEEK_JSON='{"zeroHuman":{"shipped":3,"humanTouches":0,"fixturesExcluded":{"shipped":0,"asks":0,"rule":"title (trimmed, lowercased) starts with: stamp arm "}}}' \
   TODAY="2026-07-11" NOW_ISO="2026-07-11T00:00:00Z" \
   CLI_VERSION="0.18.0" METHODOLOGY_URL="https://example.test/zero-human.md" \
   CORR_ROWS="325|192|124|3" \
@@ -289,8 +294,8 @@ for i in $(seq 0 24); do
     "$(date -u -d "2026-06-16 +${i} day" +%F)" >> "$W10/history.jsonl"
 done
 OUT10="$( cd "$W10" && \
-  DAY_JSON='{"zeroHuman":{"shipped":12,"humanTouches":2}}' \
-  WEEK_JSON='{"zeroHuman":{"shipped":3,"humanTouches":0}}' \
+  DAY_JSON='{"zeroHuman":{"shipped":12,"humanTouches":2,"fixturesExcluded":{"shipped":0,"asks":0,"rule":"title (trimmed, lowercased) starts with: stamp arm "}}}' \
+  WEEK_JSON='{"zeroHuman":{"shipped":3,"humanTouches":0,"fixturesExcluded":{"shipped":0,"asks":0,"rule":"title (trimmed, lowercased) starts with: stamp arm "}}}' \
   TODAY="2026-07-11" NOW_ISO="2026-07-11T00:00:00Z" \
   CLI_VERSION="0.19.3" METHODOLOGY_URL="https://example.test/zero-human.md" \
   CORR_ROWS="325|192|124|3" \
@@ -340,8 +345,8 @@ cp "$W5/history.jsonl" "$W11/history.jsonl"
 # strip today's row so this run appends its own (the fixture history is Jun11..Jul11)
 grep -v '"date": "2026-07-11"' "$W11/history.jsonl" > "$W11/h" && mv "$W11/h" "$W11/history.jsonl"
 ( cd "$W11" && \
-  DAY_JSON='{"zeroHuman":{"shipped":12,"humanTouches":2}}' \
-  WEEK_JSON='{"zeroHuman":{"shipped":3,"humanTouches":0}}' \
+  DAY_JSON='{"zeroHuman":{"shipped":12,"humanTouches":2,"fixturesExcluded":{"shipped":0,"asks":0,"rule":"title (trimmed, lowercased) starts with: stamp arm "}}}' \
+  WEEK_JSON='{"zeroHuman":{"shipped":3,"humanTouches":0,"fixturesExcluded":{"shipped":0,"asks":0,"rule":"title (trimmed, lowercased) starts with: stamp arm "}}}' \
   TODAY="2026-07-11" NOW_ISO="2026-07-11T00:00:00Z" \
   CLI_VERSION="0.19.3" METHODOLOGY_URL="https://example.test/zero-human.md" \
   WINDOW_DAYS=7 \
@@ -409,6 +414,40 @@ if grep -nE -- '--7d|-7 days|hist\[-7:\]|"7d"' <<<"$PB" >/dev/null; then
 else
   ok_t "no hand-spelled 7-day span survives anywhere in _proof_build"
 fi
+
+# --- DIVE-3227: a denominator that cannot state its filter is NOT published ---
+# `shipped` now excludes experiment-fixture rows. A public number carrying an
+# unstated filter is the same defect class as the inflation the filter removes,
+# so the builder REFUSES (rc 4, nothing written) when the digest it was handed
+# carries no zeroHuman.fixturesExcluded.rule — an older digest, or the
+# DIGEST_FIXTURE_PREFIXES wiring broken. Fail-closed: one skipped day, loud.
+WFX="$TMP/wfx"; mkdir -p "$WFX"
+OUTFX="$(FX_DAY= run_build "$WFX" 5 1 27 2 2026-07-30 2>&1)"; RCFX=$?
+[[ $RCFX -eq 4 ]] && ok_t "no stated fixture rule => refuses with rc 4" || bad_t "refusal rc" "rc=$RCFX out=$OUTFX"
+[[ ! -e "$WFX/badge.json" && ! -e "$WFX/zero-human.json" && ! -e "$WFX/history.jsonl" ]] \
+  && ok_t "the refusal writes NOTHING (no half-published datapoint)" \
+  || bad_t "refusal must not write" "$(ls "$WFX")"
+grep -q "DIVE-3227" <<<"$OUTFX" && ok_t "the refusal names why (DIVE-3227)" || bad_t "refusal message" "$OUTFX"
+
+# The other direction — the guard must CORRECT, not merely block: the same call
+# WITH a stated rule publishes, and the excluded count is stamped onto the
+# append-only row and the public datapoint (0 excluded is still a claim).
+WFX2="$TMP/wfx2"; mkdir -p "$WFX2"
+OUTFX2="$(FX_DAY=',"fixturesExcluded":{"shipped":3,"asks":1,"rule":"title starts with: stamp arm "}' \
+          run_build "$WFX2" 5 1 27 2 2026-07-30 2>&1)"; RCFX2=$?
+[[ $RCFX2 -eq 0 ]] && ok_t "a stated fixture rule publishes (rc 0)" || bad_t "stated-rule rc" "rc=$RCFX2 out=$OUTFX2"
+[[ "$(jget "$WFX2/zero-human.json" "['day']['fixturesExcluded']")" == "3" ]] \
+  && ok_t "day.fixturesExcluded is stamped onto the datapoint (3)" \
+  || bad_t "day.fixturesExcluded" "$(cat "$WFX2/zero-human.json")"
+[[ "$(jget "$WFX2/zero-human.json" "['week']['fixturesExcluded']")" == "3" ]] \
+  && ok_t "week.fixturesExcluded sums the window's datapoints (3)" \
+  || bad_t "week.fixturesExcluded" "$(cat "$WFX2/zero-human.json")"
+[[ -n "$(jget "$WFX2/zero-human.json" "['fixtureExclusion']['rule']")" ]] \
+  && ok_t "the RULE itself is published, not just the count" \
+  || bad_t "fixtureExclusion.rule" "$(cat "$WFX2/zero-human.json")"
+[[ "$(python3 -c "import json,sys; print(json.loads(open(sys.argv[1]).read().splitlines()[-1])['day']['fixturesExcluded'])" "$WFX2/history.jsonl")" == "3" ]] \
+  && ok_t "history.jsonl carries the excluded count (absent = predates the rule)" \
+  || bad_t "history fixturesExcluded" "$(cat "$WFX2/history.jsonl")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]] || exit 1

@@ -205,8 +205,10 @@ awk "/python3 <<'PROOFPY'/{f=1;next} f&&/^PROOFPY\$/{f=0} f" src/cmd_proof.sh > 
 WD="$TMP/wd"; mkdir -p "$WD"
 run_build() { # <extra env assignments via caller env> ; runs in $WD
   ( cd "$WD" && \
-    DAY_JSON='{"zeroHuman":{"shipped":5,"humanTouches":1}}' \
-    WEEK_JSON='{"zeroHuman":{"shipped":5,"humanTouches":1}}' \
+    # DIVE-3227: the builder refuses a digest that cannot state its
+    # fixture-exclusion rule, so this fixture carries one.
+    DAY_JSON='{"zeroHuman":{"shipped":5,"humanTouches":1,"fixturesExcluded":{"shipped":0,"asks":0,"rule":"title (trimmed, lowercased) starts with: stamp arm "}}}' \
+    WEEK_JSON='{"zeroHuman":{"shipped":5,"humanTouches":1,"fixturesExcluded":{"shipped":0,"asks":0,"rule":"title (trimmed, lowercased) starts with: stamp arm "}}}' \
     TODAY="$1" TODAY_LABEL="Jul 25" NOW_ISO="${1}T00:00:00Z" \
     CLI_VERSION="0.14.9" METHODOLOGY_URL="https://example.test/zero-human.md" \
     python3 "$TMP/proof.py" >/dev/null 2>&1 )

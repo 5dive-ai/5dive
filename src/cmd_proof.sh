@@ -203,7 +203,14 @@ _proof_pref_write() {
 # test seam (point it at a fixture db).
 _proof_ledger() {
   local db_file="${TASKS_DB:-${TASKS_DIR:-/var/lib/5dive/tasks}/tasks.db}"
-  local shipped=0 asks=0 row=""
+  local shipped=0 asks=0 row="" fixtures=0
+  # DIVE-3227: experiment-fixture rows are not shipped work, and the exclusion
+  # comes from the SAME single definition the digest uses
+  # (five_fixture_title_prefixes), so `proof status` and the published badge
+  # cannot disagree about what counts as a ship.
+  local fx_excl fx_match
+  fx_excl="$(five_fixture_title_sql exclude)"
+  fx_match="$(five_fixture_title_sql match)"
   if [ -r "$db_file" ]; then
     # Single row "shipped|asks"; COALESCE guards the all-NULL SUM on an empty set.
     row="$(db "SELECT COUNT(*) || '|' || COALESCE(SUM(
@@ -213,9 +220,16 @@ _proof_ledger() {
                             OR (human_nonce_hash IS NOT NULL AND human_nonce_hash <> ''))
                       THEN 1 ELSE 0 END), 0)
                FROM tasks
-               WHERE status = 'done' AND kind = 'standard';" 2>/dev/null || true)"
+               WHERE status = 'done' AND kind = 'standard'
+                 AND ${fx_excl};" 2>/dev/null || true)"
     [ -n "$row" ] && { shipped="${row%%|*}"; asks="${row##*|}"; }
+    # Counted, not merely dropped: what the filter removed ships beside the
+    # number it changed, or the filter is unauditable.
+    fixtures="$(db "SELECT COUNT(*) FROM tasks
+                    WHERE status = 'done' AND kind = 'standard'
+                      AND (${fx_match});" 2>/dev/null || true)"
   fi
+  case "$fixtures" in ''|*[!0-9]*) fixtures=0 ;; esac
   case "$shipped" in ''|*[!0-9]*) shipped=0 ;; esac
   case "$asks"    in ''|*[!0-9]*) asks=0 ;; esac
   # pct = 1 - asks/shipped, one decimal, trailing .0 dropped. Null when no ships.
@@ -227,7 +241,8 @@ _proof_ledger() {
   fi
   jq -cn --argjson shipped "$shipped" --argjson asks "$asks" \
      --argjson autonomous "$((shipped - asks))" --argjson pct "$pct" \
-     '{shipped:$shipped, asks:$asks, autonomous:$autonomous, autonomyPct:$pct}'
+     --argjson fixtures "$fixtures" \
+     '{shipped:$shipped, asks:$asks, autonomous:$autonomous, autonomyPct:$pct, fixturesExcluded:$fixtures}'
 }
 
 # _proof_publish_gate — LOAD-BEARING guardrail (OSS-39, olivia/lodar). A PUBLIC
@@ -497,12 +512,17 @@ _proof_build() {
   # `proof scorecard`'s tier coverage) and the iteration-NULL disclosure: a NULL
   # iteration reads as first-pass (COALESCE(iteration,1)<=1), which biases the
   # rate UP by however many of the graded rows that affects.
+  # DIVE-3227: the published corroborators count shipped standard work too, so
+  # they take the badge's fixture exclusion — measured: 20 of the 30d window's
+  # 1333 rows, every one carrying a verifier, so they inflated `graded`,
+  # `shippedStandardTasks` and therefore coveragePct as well as the badge.
+  local fx_excl; fx_excl="$(five_fixture_title_sql exclude)"
   local sql_window="-${win_days} days" corr_rows
   corr_rows="$(db "SELECT
-      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window"))) || '|' ||
-      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window")) AND verifier IS NOT NULL AND verifier<>'') || '|' ||
-      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window")) AND verifier IS NOT NULL AND verifier<>'' AND COALESCE(iteration,1)<=1) || '|' ||
-      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window")) AND verifier IS NOT NULL AND verifier<>'' AND iteration IS NULL);" 2>/dev/null || true)"
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window")) AND ${fx_excl}) || '|' ||
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window")) AND ${fx_excl} AND verifier IS NOT NULL AND verifier<>'') || '|' ||
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window")) AND ${fx_excl} AND verifier IS NOT NULL AND verifier<>'' AND COALESCE(iteration,1)<=1) || '|' ||
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window")) AND ${fx_excl} AND verifier IS NOT NULL AND verifier<>'' AND iteration IS NULL);" 2>/dev/null || true)"
 
   # SECOND — policy-blocked attempts, carrying the fired-vs-instrumented site
   # split (a silent site is not evidence of compliance, DIVE-1922) and the
@@ -562,6 +582,31 @@ day = _load("DAY_JSON")
 week = _load("WEEK_JSON")
 today = os.environ["TODAY"]
 
+# DIVE-3227: the badge is 1 - asks/shipped, and `shipped` now EXCLUDES
+# experiment-fixture rows (five_fixture_title_prefixes, src/lib/tasks_db.sh).
+# A public number carrying a filter it cannot state is the same defect class as
+# the inflation the filter removes, so this REFUSES rather than publishing a
+# denominator of unknown provenance. It fires if the digest that produced these
+# numbers predates the rule or if the DIGEST_FIXTURE_PREFIXES wiring broke —
+# fail-closed on the public artifact, one skipped day, loud in the tick log.
+def _fixture_block(d, which):
+    zh = (d.get("zeroHuman") or {}) if isinstance(d, dict) else {}
+    fx = zh.get("fixturesExcluded")
+    rule = str((fx or {}).get("rule") or "").strip() if isinstance(fx, dict) else ""
+    if not rule:
+        print(f"proof publish: REFUSING — the {which} digest carries no "
+              "zeroHuman.fixturesExcluded.rule, so `shipped` cannot state which "
+              "experiment-fixture rows it excluded (DIVE-3227). Nothing published.",
+              file=sys.stderr)
+        sys.exit(4)
+    def _n(k):
+        try: return int(fx.get(k) or 0)
+        except Exception: return 0
+    return {"count": _n("shipped"), "asks": _n("asks"), "rule": rule}
+
+_fx_day = _fixture_block(day, "24h")
+_fx_win = _fixture_block(week, "window")
+
 hist_path = pathlib.Path("history.jsonl")
 hist = []
 if hist_path.exists():
@@ -573,7 +618,11 @@ if any(h.get("date") == today for h in hist):
 row = {
     "date": today,
     "day": {"shipped": day["zeroHuman"]["shipped"],
-            "humanAsks": day["zeroHuman"]["humanTouches"]},
+            "humanAsks": day["zeroHuman"]["humanTouches"],
+            # DIVE-3227: stamped onto the append-only row, so a reader can tell a
+            # datapoint that was filtered from one that predates the filter —
+            # ABSENT means unfiltered (the rows published before 2026-08-11).
+            "fixturesExcluded": _fx_day["count"]},
     "week": {"shipped": week["zeroHuman"]["shipped"],
              "humanAsks": week["zeroHuman"]["humanTouches"]},
     "cliVersion": os.environ["CLI_VERSION"],
@@ -606,6 +655,11 @@ _last = hist[-_win_days:]
 row["week"] = {
     "shipped": sum(h["day"]["shipped"] for h in _last),
     "humanAsks": sum(h["day"]["humanAsks"] for h in _last),
+    # DIVE-3227: how many fixture rows the window's datapoints netted out, summed
+    # on the same non-overlapping 24h basis. A pre-fix datapoint contributes 0
+    # because it never filtered — that is not the same as having nothing to
+    # filter, and `fixtureExclusion.basis` below says so on the public artifact.
+    "fixturesExcluded": sum(int(h["day"].get("fixturesExcluded") or 0) for h in _last),
 }
 
 # DIVE-2745: THE LABEL IS DERIVED FROM WHAT THE SLICE ACTUALLY HELD, never
@@ -830,6 +884,23 @@ datapoint = {
                   "a day, which is why calendarSpanDays is carried separately. The "
                   "corroborators below use a live SQL span instead and carry their own "
                   "window label; the two are different instruments and may disagree."),
+    },
+    # DIVE-3227: the denominator's filter, published beside the number it
+    # changes. Fixture rows are experiment-harness rows on the live board that
+    # look exactly like real work (kind='standard', a DIVE- ident, a verifier)
+    # and carry no gate, so they only ever flatter 1 - asks/shipped.
+    "fixtureExclusion": {
+        "rule": _fx_day["rule"],
+        "excludedFromDay": _fx_day["count"],
+        "excludedFromDayAsks": _fx_day["asks"],
+        "excludedFromWindow": row["week"].get("fixturesExcluded"),
+        "basis": ("excluded from BOTH sides of the ratio (shipped and asks) so the two "
+                  "are drawn from one population. excludedFromWindow sums only the "
+                  "PUBLISHED datapoints that carry the field: datapoints published "
+                  "before 2026-08-11 predate the rule and contribute 0, so this window "
+                  "sum can still include unfiltered fixture rows from those days. The "
+                  "rule is a title PREFIX and an unlabelled harness family stays "
+                  "invisible to it — see the methodology page."),
     },
     # DIVE-2654: denominator-side signals the badge does not carry on its own
     # face. Additive-only, same zero-human.json API contract as publishedBy.
@@ -1118,7 +1189,13 @@ _proof_onoff() {
       _ship="$(jq -r '.shipped' <<<"$led")"; _ask="$(jq -r '.asks' <<<"$led")"
       _apct="$(jq -r '.autonomyPct // empty' <<<"$led")"
       if [ -n "$_apct" ]; then
-        echo "autonomy: ${_apct}% — ${_ship} shipped, ${_ask} needed a human (lifetime, 1 − asks/shipped)"
+        # DIVE-3227: name the exclusion where the number is rendered, or the
+        # filter is invisible to the only person who could notice it eating a
+        # real row.
+        local _fxn; _fxn="$(jq -r '.fixturesExcluded // 0' <<<"$led" 2>/dev/null || echo 0)"
+        local _fxs=""; [ "${_fxn:-0}" -gt 0 ] 2>/dev/null \
+          && _fxs="; ${_fxn} experiment-fixture row$([ "$_fxn" = 1 ] || printf 's') excluded"
+        echo "autonomy: ${_apct}% — ${_ship} shipped, ${_ask} needed a human (lifetime, 1 − asks/shipped${_fxs})"
       else
         echo "autonomy: no shipped actions yet"
       fi
@@ -1408,12 +1485,21 @@ _proof_scorecard() {
            known_expr="project_key IS NOT NULL AND project_key<>'' AND priority IS NOT NULL AND priority<>''" ;;
   esac
 
+  # DIVE-3227: the scorecard counts the same shipped population as the badge, so
+  # it takes the same experiment-fixture exclusion. `proof status` and
+  # `proof scorecard` disagreeing about what a ship is would be its own defect.
+  local fx_excl fx_n
+  fx_excl="$(five_fixture_title_sql exclude)"
+  fx_n="$(db "SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard'
+              AND done_at>=datetime('now',$(sqlq "$sql_window"))
+              AND ($(five_fixture_title_sql match));" 2>/dev/null || true)"
+  case "$fx_n" in ''|*[!0-9]*) fx_n=0 ;; esac
   local rows
   rows="$(db "SELECT
-      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window"))) || '|' ||
-      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window")) AND verifier IS NOT NULL AND verifier<>'') || '|' ||
-      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window")) AND verifier IS NOT NULL AND verifier<>'' AND COALESCE(iteration,1)<=1) || '|' ||
-      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window")) AND ${known_expr});" 2>/dev/null || true)"
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window")) AND ${fx_excl}) || '|' ||
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window")) AND ${fx_excl} AND verifier IS NOT NULL AND verifier<>'') || '|' ||
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window")) AND ${fx_excl} AND verifier IS NOT NULL AND verifier<>'' AND COALESCE(iteration,1)<=1) || '|' ||
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window")) AND ${fx_excl} AND ${known_expr});" 2>/dev/null || true)"
 
   # DIVE-1922: the policy-refusal source now EXISTS, so this metric stops being
   # NO DATA. Two numbers are needed, not one. The count alone would read as
@@ -1446,6 +1532,7 @@ _proof_scorecard() {
   local group_rows
   group_rows="$(db "SELECT ${group_expr}, COUNT(*) FROM tasks
                     WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window"))
+                      AND ${fx_excl}
                     GROUP BY 1 ORDER BY 2 DESC, 1;" 2>/dev/null || true)"
 
   # DIVE-1923: the ship ledger now sources "autonomous rollback rate". Four
@@ -1464,7 +1551,7 @@ _proof_scorecard() {
   DIGEST_FILE="$work/digest.json" USAGE_FILE="$work/usage.json" DB_ROWS="$rows" GROUP_ROWS="$group_rows" \
   REFUSALS="$refusals" REFUSAL_SITES="$refusal_sites" SELF_PATH="$self" \
   SHIPS="$ships" ROLLBACKS="$rollbacks" ROLLBACKS_UNPROVEN="$rollbacks_unproven" LEDGER_SINCE="$ledger_since" \
-  WINDOW="$window" BY="$by" AS_JSON="$json" python3 <<'SCOREPY'
+  WINDOW="$window" BY="$by" AS_JSON="$json" FIXTURES_EXCLUDED="$fx_n" python3 <<'SCOREPY'
 import os, json, sys
 
 dg = json.load(open(os.environ["DIGEST_FILE"]))
@@ -1668,6 +1755,8 @@ out = {"window": os.environ["WINDOW"], "by": by,
        "metrics": metrics,
        "breakdown": {"by": by, "rows": groups},
        "coverage": coverage,
+       # DIVE-3227: the filter is reported wherever the number is.
+       "fixturesExcluded": int(os.environ.get("FIXTURES_EXCLUDED") or 0),
        "moneyNote": money_note}
 
 if as_json:
@@ -1675,6 +1764,9 @@ if as_json:
     sys.exit(0)
 
 print(f"SCORECARD — last {out['window']}   (local, read-only; the badge stays the headline)")
+if out["fixturesExcluded"]:
+    print(f"  ({out['fixturesExcluded']} experiment-fixture row(s) excluded from every "
+          "shipped count below — DIVE-3227)")
 print()
 w = max(len(m["name"]) for m in metrics)
 for m in metrics:

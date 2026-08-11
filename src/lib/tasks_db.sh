@@ -137,6 +137,64 @@ _tasks_store_fence() { # <sql>
   fi
 }
 
+# --- DIVE-3227: fixture-shaped task titles ----------------------------------
+# THE ONE definition of "this row is an experiment fixture, not shipped work".
+# Every consumer that COUNTS SHIPPED WORK (the zero-human badge, `proof status`,
+# the published corroborators, the digest) derives its rule from here, because
+# the rule is used in three different kinds — a shell list, a SQL predicate and
+# a python prefix test — and DIVE-1552/DIVE-2745 both happened when one sense of
+# a shared definition moved and the others did not.
+#
+# WHY A RULE IS NEEDED AT ALL. Experiment harnesses file rows on the LIVE board
+# that are indistinguishable from real work on every axis a census normally
+# checks: project_key='dive', a DIVE- ident, kind='standard', a verifier set.
+# Measured 2026-08-11: 50 `stamp arm %` rows (main/olivia/dev), 20 of them done,
+# all inside the badge's 30d window, and NONE carrying a gate — so they are pure
+# denominator and can only ever flatter `1 - asks/shipped` on a PUBLIC number.
+#
+# ANCHORED AS A PREFIX, NEVER A SUBSTRING. DIVE-3227 — the row reporting this
+# defect — contains the words "stamp arm %" while describing it, so a substring
+# rule excludes the bug report itself (measured: exactly 1 such row, that one).
+#
+# WHY NOT DIVE-3099'S GENERATION-SIGNATURE NET ((created_by, title) recurring
+# >=3 table-wide): that net was derived on the completions/day census and does
+# not port to this population. Measured on the badge's own 30d shipped set
+# (1333 rows) it flags 221, almost all REAL recurring work whose titles repeat
+# by construction — 'daily ceo loop ...' x22, 'refresh x-take-radar.md ...' x22,
+# 'check oss 5dive repo + cut a release if needed' x16. A rule tuned for one
+# population is not portable to another that merely has the same shape.
+#
+# THE RESIDUAL, NAMED RATHER THAN HIDDEN: an UNLABELLED harness family is
+# invisible to this rule (`prose A..E` is the known example — 66 rows, all
+# cancelled today, so it touches nothing, but a done one would). That is why
+# every consumer PRINTS the excluded count: a silent filter on a published metric
+# is the same defect class as the inflation it was added to fix.
+five_fixture_title_prefixes() {
+  printf '%s\n' 'stamp arm '
+}
+
+# five_fixture_title_sql [exclude|match] — the prefix list as a SQL predicate,
+# AND-able (exclude) or OR-able (match) into any WHERE clause over `tasks`.
+# `%`, `_` and `\` in a prefix are escaped and the comparison carries ESCAPE, so
+# a prefix always matches LITERALLY — an unescaped metacharacter would widen the
+# rule silently, and on this metric widening means eating real shipped rows. An
+# empty list degrades to the identity (1 for exclude, 0 for match), never to a
+# match-all.
+five_fixture_title_sql() {
+  local mode="${1:-exclude}" p esc out="" op cmp fallback
+  case "$mode" in
+    exclude) op=" AND "; cmp="NOT LIKE"; fallback="1" ;;
+    match)   op=" OR ";  cmp="LIKE";     fallback="0" ;;
+    *) printf '0'; return 1 ;;
+  esac
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    esc="$(printf '%s' "$p" | sed -e 's/\\/\\\\/g' -e 's/%/\\%/g' -e 's/_/\\_/g')"
+    out="${out}${out:+$op}lower(trim(title)) $cmp $(sqlq "${esc}%") ESCAPE '\\'"
+  done < <(five_fixture_title_prefixes)
+  printf '%s' "${out:-$fallback}"
+}
+
 # Quote an arbitrary string as a SQL literal: double embedded single quotes
 # and wrap. The sqlite3 CLI has no ergonomic bind-parameter path from bash,
 # so this is the safe way to inline a shell value — use it for EVERY
