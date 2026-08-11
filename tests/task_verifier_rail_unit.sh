@@ -474,5 +474,62 @@ e2e_out=$( set -euo pipefail
   && ok_t "T12c an internal-titled add under set -e produces OUTPUT, never a silent exit" \
   || bad_t "T12c an internal-titled add under set -e produces OUTPUT, never a silent exit" "rc=$e2e_rc (empty output)"
 
+# --- T13: DIVE-2812 — an accept-write is RECORDED -----------------------------
+# `task verifier --accept=` is the only writer of acceptance_criteria on an
+# existing row, and it wrote NOTHING to the audit log: a maker could rewrite the
+# bar they are graded against and leave no trace of who did it or what it said
+# before. These arms grade the call SITE (condition + payload) by capturing
+# `_task_store_audit_log`'s args — the real writer is shared with `set-body` and
+# withholds on a non-production store by design (DIVE-2010), so a harness on a
+# throwaway db cannot observe the row itself. Capturing the args is therefore
+# what is observable here; the arms below still fail if the call is deleted, if
+# it fires on a non-edit, or if it drops the actor or the prior text.
+db "DELETE FROM tasks;"
+AUDIT_CAP="$TMP/audit-capture.log"
+: > "$AUDIT_CAP"
+_task_store_audit_log() { printf '%s\n' "$*" >> "$AUDIT_CAP"; return 0; }
+acc_id=$(run add --assignee=alice --verifier=carol --accept="ORIGINAL BAR: the poll is removed" -- "a row filed with a criterion" | jf '.data.id')
+
+# T13a: re-pointing/refreshing the grader WITHOUT --accept is not an edit to the
+# bar and must write NO row. Without this arm a call that fires unconditionally
+# would pass T13b and bury real edits in noise.
+run verifier "$acc_id" carol >/dev/null
+[[ ! -s "$AUDIT_CAP" ]] \
+  && ok_t "T13a no --accept writes no accept-audit row (a re-point is not an edit to the bar)" \
+  || bad_t "T13a no --accept writes no accept-audit row (a re-point is not an edit to the bar)" "$(cat "$AUDIT_CAP")"
+
+# T13b: an --accept that MOVES the text writes one row carrying the actor and
+# the PRIOR criterion, so the bar a row was originally filed under is
+# recoverable from the log by someone who was not there.
+out13=$(run_as alice verifier "$acc_id" carol --accept="SOFTENED BAR: anything ships")
+cap=$(cat "$AUDIT_CAP")
+has "$cap" "task verifier set-accept" && has "$cap" "actor=alice" \
+  && has "$cap" "prior=ORIGINAL BAR: the poll is removed" && has "$cap" "prior_len=33" \
+  && ok_t "T13b an accept-write records cmd + actor + prior text + prior_len" \
+  || bad_t "T13b an accept-write records cmd + actor + prior text + prior_len" "$cap"
+
+# T13c: and the person typing it is told the bar moved, with the prior text in
+# the JSON — the audit row serves the later reader, this serves the only person
+# who can still catch a wrong overwrite while it is undoable.
+[[ "$(printf '%s' "$out13" | jf '.data.acceptanceChanged')" == "true" \
+   && "$(printf '%s' "$out13" | jf '.data.priorAcceptanceCriteria')" == "ORIGINAL BAR: the poll is removed" ]] \
+  && ok_t "T13c the command echoes acceptanceChanged + the prior criterion" \
+  || bad_t "T13c the command echoes acceptanceChanged + the prior criterion" "$out13"
+
+# T13d: re-passing the IDENTICAL criterion is a no-op on the bar — no row, and
+# the command does not claim a change. (Positive control that T13b's row came
+# from the text moving, not merely from --accept being present.)
+: > "$AUDIT_CAP"
+out13d=$(run verifier "$acc_id" carol --accept="SOFTENED BAR: anything ships")
+[[ ! -s "$AUDIT_CAP" && "$(printf '%s' "$out13d" | jf '.data.acceptanceChanged')" == "false" ]] \
+  && ok_t "T13d an identical --accept is not an edit (no row, acceptanceChanged=false)" \
+  || bad_t "T13d an identical --accept is not an edit (no row, acceptanceChanged=false)" "$(cat "$AUDIT_CAP") $out13d"
+
+# T13e: the write still LANDS — the audit row must not have displaced the
+# mutation this verb exists to perform.
+[[ "$(db "SELECT acceptance_criteria FROM tasks WHERE id=${acc_id};")" == "SOFTENED BAR: anything ships" ]] \
+  && ok_t "T13e the criterion itself is still rewritten (auditing did not replace the write)" \
+  || bad_t "T13e the criterion itself is still rewritten (auditing did not replace the write)" "$(db "SELECT acceptance_criteria FROM tasks WHERE id=${acc_id};")"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

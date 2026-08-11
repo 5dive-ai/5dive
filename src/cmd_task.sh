@@ -2357,12 +2357,51 @@ cmd_task_verifier() {
         verify_unavailable=NULL,
         verify_optout=NULL${move_sql}
       WHERE id=${id};"
+  # DIVE-2812 — RECORD THE EDIT TO THE BAR THE ROW IS GRADED AGAINST.
+  #
+  # `--accept=` on this verb is the ONLY writer of `acceptance_criteria` on an
+  # existing row, and it REPLACED the prior text with no trace: measured zero
+  # `"cmd":"task verifier"` rows fleet-wide, against 1672 for its audited sibling
+  # `task set-body` (DIVE-1920, which audits actor/mode/prior_len for exactly this
+  # reason). So a maker could rewrite the criterion they are graded against and
+  # nobody downstream could see that it moved, or what it used to say.
+  #
+  # This is why the field READ as immutable for months (DIVE-2812's original
+  # premise, retracted): a mutable value whose mutation leaves no trace is
+  # indistinguishable from an immutable one to every observer except the person
+  # who typed the command. The control is a RECORD of the edit, not a lock on the
+  # field — a legitimate re-scope must stay possible, it just must not be silent.
+  #
+  # Fires only when the text actually MOVES. Re-pointing a grader with no
+  # --accept, or passing back the identical criterion, is not an edit to the bar,
+  # and a row for it would be the noise that hides the real ones. `prior` carries
+  # the FULL previous text (truncated with a marker past 2000 chars, with a
+  # sha256 of the untruncated original alongside) so the criterion a row was
+  # originally filed under stays recoverable from the log, which is the auditable
+  # half this ticket was filed to get.
+  if [[ "$new_accept" != "$cur_accept" ]]; then
+    local _acc_prior="$cur_accept" _acc_sha=""
+    _acc_sha=$(printf '%s' "$cur_accept" | sha256sum 2>/dev/null | cut -c1-16) || _acc_sha=""
+    (( ${#_acc_prior} > 2000 )) && _acc_prior="${_acc_prior:0:2000}…[truncated, ${#cur_accept} chars total]"
+    _task_store_audit_log "task verifier set-accept" "ok" 0 -- \
+      "task=$ident" "actor=$(task_actor)" "verifier=$who" \
+      "prior_len=${#cur_accept}" "new_len=${#new_accept}" \
+      "prior_sha256=${_acc_sha:-unavailable}" "prior=${_acc_prior:-<none>}" || true
+  fi
   local msg="$ident is now verifier-graded → $who ('task done' hands off to grade instead of closing)"
   (( repoint )) && msg="$ident review re-pointed → $who (was with '$cur_vfier'; delivery re-stamped, maker '${maker:-?}' and iteration unchanged)"
   (( mid_handoff )) && (( ! repoint )) && msg="$ident is already with verifier $who for review — criteria updated, handoff untouched"
+  # DIVE-2812: say ON THE COMMAND that the bar moved, and echo what it used to
+  # say. The audit row is for the reader of the log later; this is for the one
+  # person who can still notice a wrong overwrite while it is undoable.
+  if [[ "$new_accept" != "$cur_accept" ]]; then
+    msg+=" — acceptance criteria CHANGED (${#cur_accept} chars -> ${#new_accept}; prior text recorded in the audit log)"
+  fi
   ok "$msg" \
-     '{id:($i|tonumber), ident:$id, verifier:$v, assignee:$a, acceptanceCriteria:$ac, midReview:($m=="1"), repointed:($r=="1")}' \
-     --arg i "$id" --arg id "$ident" --arg v "$who" --arg a "$new_owner" --arg ac "$new_accept" --arg m "$mid_handoff" --arg r "$repoint"
+     '{id:($i|tonumber), ident:$id, verifier:$v, assignee:$a, acceptanceCriteria:$ac, priorAcceptanceCriteria:$pac, acceptanceChanged:($ch=="1"), midReview:($m=="1"), repointed:($r=="1")}' \
+     --arg i "$id" --arg id "$ident" --arg v "$who" --arg a "$new_owner" --arg ac "$new_accept" \
+     --arg pac "$cur_accept" --arg ch "$([[ "$new_accept" != "$cur_accept" ]] && echo 1 || echo 0)" \
+     --arg m "$mid_handoff" --arg r "$repoint"
 }
 
 # DIVE-1935 (iteration 2): THE GATE ASSERTS ITS OWN INSTRUMENT.
