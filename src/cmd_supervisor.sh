@@ -53,6 +53,31 @@ _SUP_T_SLOW_MIN="${SUPERVISOR_T_SLOW_MIN:-10}"     # active work + no progress t
 # unhealthy signal instead. Same env-override escape hatch as the siblings above.
 _SUP_T_STRANDED_MIN="${SUPERVISOR_T_STRANDED_MIN:-45}"
 [[ "$_SUP_T_STRANDED_MIN" =~ ^[0-9]+$ ]] || _SUP_T_STRANDED_MIN=45
+# DIVE-3272: every signal above measures LIVENESS — is the unit up, is the tmux
+# session there, is the poller running, is a transcript still being appended to.
+# NONE of them measures OUTPUT. dev3 sat on an expired Qwen 1-week quota for four
+# days: the unit was active, tmux was alive, the transcript moved on every wake,
+# and the seat KEPT CLAIMING ROWS — so it read `healthy / active` throughout while
+# 20 rows, including a whole urgent lane, queued behind it. It was found only
+# because a human eyeballed queue depth. A seat that claims work and completes
+# none is indistinguishable from a seat that is working; this is the knob that
+# tells them apart. Days, not minutes: the longest legitimate drought (one seat
+# grinding a single hard multi-day row) must clear it, so the bias stays
+# FALSE-NEGATIVE like every other threshold in this file.
+_SUP_T_NO_OUTPUT_DAYS="${SUPERVISOR_T_NO_OUTPUT_DAYS:-3}"
+[[ "$_SUP_T_NO_OUTPUT_DAYS" =~ ^[0-9]+$ ]] || _SUP_T_NO_OUTPUT_DAYS=3
+# DIVE-3272: a model-capacity error in a seat's pane is a FLEET-health event, not
+# that seat's private problem — the cost is borne by every row queued behind it.
+# Nothing scraped for one before this. Pane-scoped for the same reason the
+# DIVE-1127 verify tripwire is: it is a harness-rendered error on the current
+# screen, not something the transcript records. Same false-positive exposure too
+# — an agent DISCUSSING a 429 (this very task's body quotes one) can trip it — so
+# the alert names the matched line and the recipient can dismiss it in one look.
+# Env-overridable so a new provider's phrasing is tunable without a release.
+_SUP_QUOTA_PANE_LINES="${SUPERVISOR_QUOTA_PANE_LINES:-40}"
+[[ "$_SUP_QUOTA_PANE_LINES" =~ ^[0-9]+$ ]] || _SUP_QUOTA_PANE_LINES=40
+_SUP_QUOTA_PAT="${SUPERVISOR_QUOTA_PAT:-}"
+[[ -n "$_SUP_QUOTA_PAT" ]] || _SUP_QUOTA_PAT='(api[[:space:]]+error|request[[:space:]]+rejected)[^|]{0,60}429|quota[[:space:]]+(has[[:space:]]+been[[:space:]]+)?exhausted|exhausted[[:space:]]+your[[:space:]]+(token|weekly|monthly)|hit[[:space:]]+your[[:space:]]+(monthly|weekly|daily)[[:space:]]+spend[[:space:]]+limit|usage[[:space:]]+limit[[:space:]]+reached|insufficient_quota|credit[[:space:]]+balance[[:space:]]+is[[:space:]]+too[[:space:]]+low'
 # Ignore a missing poller right after a service start — the plugin's bun server
 # takes a moment to boot, and a false poller-dead there would flag every
 # freshly-restarted agent.
@@ -169,6 +194,68 @@ _sup_verify_challenge() {  # <type> <user> <sess> <svc_running>
   printf '%s\n' "$pane" | _sup_verify_match
 }
 
+# DIVE-3272: pure signature match, no I/O — echoes the first pane line that looks
+# like a model-capacity/quota refusal, empty otherwise. Split out from
+# _sup_quota_pane for the same reason _sup_verify_match is: the false-positive-
+# critical regex has to be unit-testable without a live tmux.
+_sup_quota_match() {  # <pane-text-on-stdin>
+  grep -iE "$_SUP_QUOTA_PAT" 2>/dev/null | head -1 \
+    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-160
+}
+
+# DIVE-3272: does this agent's live pane show a capacity refusal? Root-only (the
+# sudo tmux hop) and running-service-only; anything else returns empty
+# (false-negative bias, like every other probe here). Deliberately NOT
+# claude-only — the incident seat was a qwen profile, and a quota wall is the one
+# failure every runtime shares.
+_sup_quota_pane() {  # <user> <sess> <svc_running>
+  local user="$1" sess="$2" svc_running="$3"
+  (( svc_running )) && [[ $EUID -eq 0 ]] || return 0
+  local pane
+  pane=$(sudo -n -u "$user" tmux capture-pane -p -t "$sess" -S "-${_SUP_QUOTA_PANE_LINES}" 2>/dev/null) || return 0
+  [[ -n "$pane" ]] || return 0
+  printf '%s\n' "$pane" | _sup_quota_match
+}
+
+# DIVE-3272: the OUTPUT signal — the one thing no probe above measures, read from
+# the store that was holding the answer the whole time, unread. Echoes
+# "<open-rows>|<days-since-last-close>"; the second is -1 when this seat has
+# never closed anything (unknown age => never classifies on its own, so a
+# brand-new seat can't be flagged for having produced nothing yet).
+_sup_output_stats() {  # <name>
+  local name="$1" open last days=-1
+  open=$(db "SELECT COUNT(*) FROM tasks
+             WHERE assignee=$(sqlq "$name") AND status IN ('todo','in_progress')
+               AND kind='standard';" 2>/dev/null || echo 0)
+  [[ "$open" =~ ^[0-9]+$ ]] || open=0
+  # done_at stamps BOTH terminal states, and a cancel is output too — a decision
+  # recorded is work done. Counting only status='done' would flag a seat that
+  # spent the window legitimately triaging its queue to empty.
+  last=$(db "SELECT CAST((julianday('now') - julianday(MAX(done_at))) AS INTEGER)
+             FROM tasks WHERE assignee=$(sqlq "$name") AND done_at IS NOT NULL;" 2>/dev/null || echo "")
+  [[ "$last" =~ ^[0-9]+$ ]] && days="$last"
+  printf '%s|%s\n' "$open" "$days"
+}
+
+# DIVE-3272: a seat that cannot transact is a FLEET-health event. The entire cost
+# of the incident was the 20 rows queued behind a seat nobody knew was dark, so
+# the alert leads with that and not with the seat's own symptom. Same delivery
+# shape as _sup_verify_alert — both legs best-effort, because one wedged channel
+# must never abort the tick for the rest of the fleet — and the caller owns the
+# dedup window.
+_sup_capacity_alert() {  # <name> <class> <detail>
+  local name="$1" class="$2" detail="$3"
+  local msg="[FLEET-HEALTH ${class}] agent '${name}' is UP and REACHABLE but NOT TRANSACTING: ${detail}. Every liveness signal (unit / tmux / poller / registry label) reads healthy — that agreement is the DIVE-3272 defect, not evidence against this alert. Check the seat's model capacity (auth-profile, quota reset) and reassign or park whatever is queued behind it."
+  5dive agent send main "$msg" >/dev/null 2>&1 \
+    || warn "capacity-alert: 'agent send main' failed for $name (alert still audited)"
+  # lodar is a human — reached through main's paired channel, same route the
+  # verify tripwire uses. Best-effort: a miss still leaves the agent-send leg
+  # and the audited alert row.
+  if _task_agent_channel main; then
+    _task_send_owner "$msg" >/dev/null 2>&1 || true
+  fi
+}
+
 # DIVE-1127: fire the same-day alert for a tripped account. Both legs are
 # best-effort — a delivery failure must NEVER abort the tick (one wedged account
 # can't blind the watcher for the rest of the fleet). main (CTO, D4 runbook
@@ -253,6 +340,11 @@ Classification (conservative — see docs/fleet-supervisor-design.md §4):
                   (cause: service-dead|tmux-dead|poller-dead|loop-stuck|no-progress)
   drift           active /goal targets a still-todo DIVE task while the agent
                   progresses elsewhere (cause: goal-drift) — recorded, NEVER acted on
+  no-output       holds open row(s) and has closed NOTHING for ${_SUP_T_NO_OUTPUT_DAYS}d+
+                  (cause: no-output) — the seat is claiming work and completing
+                  none, which every liveness signal reads as "active"; alerts
+  quota-exhausted pane shows a model-capacity/quota refusal (cause:
+                  quota-exhausted) — a fleet event, not the seat's own; alerts
   stalled         NO active work (no in_progress, no running loop) but a todo
                   task has sat assigned to this agent, untouched, for
                   ${_SUP_T_STRANDED_MIN}m+ (cause: idle-stranded) — gap#3:
@@ -369,11 +461,12 @@ _sup_cli_check() {
 # stdout so a test can assert against it without stubbing systemctl/tmux/pgrep.
 # args: desired svc_running(0/1) active sess tmux_state poller loop_stuck
 #       has_work(0/1) act_age cli_stale(true/false/unknown) goal_drift_task
-#       verify_excerpt stranded
+#       verify_excerpt stranded open_rows no_output_days quota_excerpt
 _sup_classify() {
   local desired="$1" svc_running="$2" active="$3" sess="$4" tmux_state="$5" poller="$6" \
         loop_stuck="$7" has_work="$8" act_age="$9" cli_stale="${10}" goal_drift_task="${11}" \
-        verify_excerpt="${12}" stranded="${13:-0}"
+        verify_excerpt="${12}" stranded="${13:-0}" \
+        open_rows="${14:-0}" no_output_days="${15:--1}" quota_excerpt="${16:-}"
   local class="healthy" cause="" detail=""
   # DIVE-1127: the verification-challenge tripwire wins FIRST — it is the highest
   # priority signal (same-day alert obligation) and, when present, explains any
@@ -396,10 +489,26 @@ _sup_classify() {
     class="stuck"; cause="tmux-dead"; detail="unit active but tmux session '${sess}' gone"
   elif [[ "$poller" == "dead" ]]; then
     class="stuck"; cause="poller-dead"; detail="telegram poller process not running"
+  elif [[ -n "$quota_excerpt" ]]; then
+    # DIVE-3272: placed ABOVE loop-stuck / no-progress on purpose — a capacity
+    # wall EXPLAINS both of those, and the response is different in kind (a
+    # profile flip or a quota reset, not a nudge/resume). Below the dead-signal
+    # branches because a down unit is the more specific reading.
+    class="quota-exhausted"; cause="quota-exhausted"
+    detail="pane shows a model-capacity refusal: ${quota_excerpt}"
   elif (( loop_stuck > 0 )); then
     class="stuck"; cause="loop-stuck"; detail="${loop_stuck} running loop(s) self-flagged stuck"
   elif (( has_work )) && (( act_age >= 0 )) && (( act_age >= _SUP_T_STUCK_MIN * 60 )); then
     class="stuck"; cause="no-progress"; detail="active work, no transcript progress for $((act_age / 60))m"
+  elif (( no_output_days >= 0 )) && (( no_output_days >= _SUP_T_NO_OUTPUT_DAYS )) && (( open_rows > 0 )); then
+    # DIVE-3272: the output drought. Ranked BELOW the hard dead signals — those
+    # are more specific and already surface — but ABOVE stale-cli / slow / drift
+    # / active, because a multi-day drought outranks a ten-minute progress gap
+    # and a box-level update notice, and because the branch it has to beat is
+    # the one that hid the incident: `has_work -> detail="active"`. A seat that
+    # is claiming rows and closing none must not print as active.
+    class="no-output"; cause="no-output"
+    detail="${open_rows} open row(s), nothing closed in ${no_output_days}d"
   elif [[ "$cli_stale" == "true" ]]; then
     # Box-level: the shared CLI is behind AND the nightly isn't catching up
     # (the /tmp-clobber class) — every agent is executing old code. Requires a
@@ -510,6 +619,19 @@ _sup_agent_record() {
   # --- signal: ID/age-verification challenge (DIVE-1127) — pane-scoped tripwire ---
   local verify_excerpt; verify_excerpt=$(_sup_verify_challenge "$type" "$user" "$sess" "$svc_running")
 
+  # --- signal: model-capacity refusal in the live pane (DIVE-3272) ---
+  local quota_excerpt; quota_excerpt=$(_sup_quota_pane "$user" "$sess" "$svc_running")
+
+  # --- signal: OUTPUT (DIVE-3272) — open rows held, and days since this seat
+  # last closed anything. The pair is the detector: either number alone is
+  # meaningless (0 open rows and no closes is a correctly idle seat; 20 open
+  # rows and a close this morning is a busy one).
+  local open_rows=0 no_output_days=-1 ostats
+  ostats=$(_sup_output_stats "$name")
+  open_rows="${ostats%%|*}"; no_output_days="${ostats##*|}"
+  [[ "$open_rows"      =~ ^[0-9]+$ ]]  || open_rows=0
+  [[ "$no_output_days" =~ ^-?[0-9]+$ ]] || no_output_days=-1
+
   # --- signal: stranded todo (DIVE-1416 gap#3) — a todo task assigned to this
   # agent, sitting untouched (never started) past the stranded window. Only
   # matters when the agent has NO active work at all (_sup_classify only
@@ -523,7 +645,8 @@ _sup_agent_record() {
   local class cause detail crow
   crow=$(_sup_classify "$desired" "$svc_running" "$active" "$sess" "$tmux_state" "$poller" \
                         "$loop_stuck" "$has_work" "$act_age" "$_SUP_CLI_STALE" "$goal_drift_task" \
-                        "$verify_excerpt" "$stranded")
+                        "$verify_excerpt" "$stranded" \
+                        "$open_rows" "$no_output_days" "$quota_excerpt")
   IFS=$'\x1f' read -r class cause detail <<<"$crow"
 
   jq -cn \
@@ -535,6 +658,8 @@ _sup_agent_record() {
     --argjson stranded "$stranded" \
     --arg goalDrift "$goal_drift_task" \
     --arg verifyExcerpt "$verify_excerpt" \
+    --arg quotaExcerpt "$quota_excerpt" \
+    --argjson openRows "$open_rows" --argjson noOutputDays "$no_output_days" \
     --arg class "$class" --arg cause "$cause" --arg detail "$detail" \
     '{name:$name, type:$type, channels:$channels, unit:$unit,
       signals:{service:$service, sub:$sub, uptimeSec:$uptime, tmux:$tmux, poller:$poller,
@@ -542,7 +667,10 @@ _sup_agent_record() {
                lastActivityAgeSec:(if $age < 0 then null else $age end),
                strandedTodo:$stranded,
                goalDriftTask:(if $goalDrift == "" then null else ($goalDrift|tonumber) end),
-               verifyChallenge:(if $verifyExcerpt == "" then null else $verifyExcerpt end)},
+               verifyChallenge:(if $verifyExcerpt == "" then null else $verifyExcerpt end),
+               openRows:$openRows,
+               daysSinceLastClose:(if $noOutputDays < 0 then null else $noOutputDays end),
+               quotaSignature:(if $quotaExcerpt == "" then null else $quotaExcerpt end)},
       classification:$class,
       cause:(if $cause == "" then null else $cause end),
       detail:$detail}'
@@ -610,6 +738,10 @@ _sup_summary_line() {
     "\([.[] | select(.classification == "update-pending")] | length) update-pending / " +
     "\([.[] | select(.classification == "stalled")]        | length) stalled / " +
     "\([.[] | select(.classification == "stuck")]          | length) stuck" +
+    (if ([.[] | select(.classification == "no-output")] | length) > 0
+     then " · ⚠ \([.[] | select(.classification == "no-output")] | length) NO-OUTPUT" else "" end) +
+    (if ([.[] | select(.classification == "quota-exhausted")] | length) > 0
+     then " · ⚠ \([.[] | select(.classification == "quota-exhausted")] | length) QUOTA-EXHAUSTED" else "" end) +
     (if ([.[] | select(.classification == "verify-challenge")] | length) > 0
      then " · ⚠ \([.[] | select(.classification == "verify-challenge")] | length) VERIFY-CHALLENGE" else "" end) +
     (if $stale == "true" then " · CLI \($cur) STALE (latest \($lat))"
@@ -801,21 +933,40 @@ cmd_supervisor_tick() {
   local alerted=0
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
-    [[ "$(jq -r '.classification' <<<"$row")" == "verify-challenge" ]] || continue
+    # DIVE-3272: the same always-live, deduped alert path now carries the two
+    # capacity classes. They belong here and NOT on the P2 ladder for the same
+    # reason the verify challenge does: a nudge/resume/rotate cannot fix a seat
+    # that has no model capacity, and rotating work onto it is what queued 20
+    # rows behind dev3 in the first place.
+    local cls; cls=$(jq -r '.classification' <<<"$row")
+    case "$cls" in verify-challenge|no-output|quota-exhausted) ;; *) continue ;; esac
     name=$(jq -r '.name' <<<"$row")
-    local excerpt; excerpt=$(jq -r '.signals.verifyChallenge // ""' <<<"$row")
+    local excerpt cause_s
+    case "$cls" in
+      verify-challenge) excerpt=$(jq -r '.signals.verifyChallenge // ""' <<<"$row"); cause_s="id-verification" ;;
+      quota-exhausted)  excerpt=$(jq -r '.detail // ""' <<<"$row");                  cause_s="quota-exhausted" ;;
+      *)                excerpt=$(jq -r '.detail // ""' <<<"$row");                  cause_s="no-output" ;;
+    esac
     local prev_alert
+    # Dedup is scoped BY CLASS (DIVE-3272): a seat can be both quota-walled and
+    # output-dry, and an unscoped window would let whichever fired first
+    # suppress the other for a day.
     prev_alert=$(db "SELECT COUNT(*) FROM supervisor_events
                      WHERE agent=$(sqlq "$name") AND event='alert'
+                       AND classification=$(sqlq "$cls")
                        AND ts >= datetime('now', '-${_SUP_ALERT_WINDOW_H} hours');" 2>/dev/null || echo 0)
     [[ "$prev_alert" =~ ^[0-9]+$ ]] || prev_alert=0
     (( prev_alert > 0 )) && continue
-    _sup_verify_alert "$name" "$excerpt"
+    if [[ "$cls" == "verify-challenge" ]]; then
+      _sup_verify_alert "$name" "$excerpt"
+    else
+      _sup_capacity_alert "$name" "$cls" "$excerpt"
+    fi
     db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
-        VALUES ($(sqlq "$name"), 'alert', 'verify-challenge', 'id-verification', $(sqlq "$row"));" 2>/dev/null \
+        VALUES ($(sqlq "$name"), 'alert', $(sqlq "$cls"), $(sqlq "$cause_s"), $(sqlq "$row"));" 2>/dev/null \
       && { alerted=$((alerted + 1)); events=$((events + 1)); } \
-      || warn "supervisor: verify-challenge alert insert failed for $name"
-    warn "supervisor: ALERT $name — ID/age-verification challenge; main+lodar pinged (D4 trigger 1)"
+      || warn "supervisor: $cls alert insert failed for $name"
+    warn "supervisor: ALERT $name — $cls: $excerpt"
   done < <(jq -c '.[]' <<<"$snap")
 
   # ── P2 (DIVE-857): ACT + ESCALATE — pre-cleared by lodar 2026-07-02, gated on
