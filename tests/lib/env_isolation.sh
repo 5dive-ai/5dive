@@ -101,3 +101,59 @@ _five_env_isolate() {
   return 0
 }
 _five_env_isolate
+
+# DIVE-3096: `unset` above only governs THIS shell.  sudo opens a PAM session,
+# and an active pam_env rule reads /etc/environment after that unset; a host
+# FIVE_* knob therefore comes back in the privileged command.  Do not "fix" the
+# host by sweeping or editing /etc/environment (DIVE-3092 forbids that fleet
+# shape).  Until sudo can carry an unset through an exact-path sudoers grant,
+# fail at the harness boundary instead: a test must not silently grade policy
+# restored on the other side of privilege escalation.
+_five_env_file_knobs() {
+  local file="$1" line name names=""
+  [[ -r "$file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ ^[[:space:]]*(FIVE_[A-Za-z0-9_]*)[[:space:]]*= ]]; then
+      name="${BASH_REMATCH[1]}"
+      case " $names " in *" $name "*) ;; *) names="${names:+$names }$name" ;; esac
+    fi
+  done < "$file"
+  printf '%s' "$names"
+}
+
+_five_env_sudo_pam_reads_etc_environment() {
+  local file="$1" line
+  [[ -r "$file" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    [[ "$line" =~ ^[[:space:]]*session[[:space:]].*pam_env\.so([[:space:]]|$) ]] || continue
+    [[ "$line" =~ (^|[[:space:]])readenv=0([[:space:]]|$) ]] && continue
+    # pam_env's default file is /etc/environment.  An explicit different
+    # envfile does not prove that this file is read; an explicit default does.
+    if [[ "$line" != *"envfile="* || "$line" =~ envfile=[\"\']?/etc/environment([\"\']?|[[:space:]]) ]]; then
+      return 0
+    fi
+  done < "$file"
+  return 1
+}
+
+_five_env_sudo_guard_install() {
+  local env_file="${1:-/etc/environment}" pam_file="${2:-/etc/pam.d/sudo}" knobs
+  type -P sudo >/dev/null 2>&1 || return 0
+  knobs=$(_five_env_file_knobs "$env_file")
+  [[ -n "$knobs" ]] || return 0
+  _five_env_sudo_pam_reads_etc_environment "$pam_file" || return 0
+
+  # Global by necessity: shell functions have dynamic rather than lexical
+  # scope, and the wrapper runs after this installer returns.
+  _5D_ENV_ISOLATION_SUDO_RESTORED="$knobs"
+  sudo() {
+    printf 'env isolation: REFUSED sudo because PAM restores host knob(s) %s from /etc/environment after this harness cleared FIVE_* (DIVE-3096). Host policy was NOT changed (DIVE-3092); run on a clean test host or neutralise the knob after the PAM boundary with an independently guarded arm.\n' \
+      "${_5D_ENV_ISOLATION_SUDO_RESTORED:-unknown FIVE_* knob}" >&2
+    return 125
+  }
+  return 0
+}
+
+_five_env_sudo_guard_install
