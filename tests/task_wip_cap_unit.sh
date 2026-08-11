@@ -179,7 +179,11 @@ trips=$(db "SELECT value FROM task_prefs WHERE key='wip_cap_trips';")
 
 # ── 8. the exemptions ───────────────────────────────────────────────────────
 db "UPDATE task_prefs SET value='1' WHERE key LIKE 'wip_cap:%';"
-if try_add "materialized child" --assignee=alpha --priority=medium --materialized; then
+# DIVE-3245 it.3: the exemption is no longer an argv flag — `--materialized` was an
+# unguarded token any caller could assert, so it is gone and the exemption is derived
+# from the call stack. This arm drives the SHIPPED door (`task_add_materialized`, what
+# the six internal writers call), not a stub of it.
+if ( task_add_materialized "materialized child" --assignee=alpha --priority=medium >/dev/null 2>&1 ); then
   ok_t "--materialized is exempt (a half-materialized plan is the worse failure)"
 else
   bad_t "materialized row refused" ""

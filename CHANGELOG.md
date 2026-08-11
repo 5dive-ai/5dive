@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased — fix(task): an exemption is a bypass flag whenever the exempt class is self-declared (DIVE-3245)
+
+The fix below closed the `--from` door by counting the **derived** actor. quinn graded it
+and found two more of the same class, and neither is `--from`: the key was now honest and
+both doors edited the **row set** instead — an honest actor counted over a population the
+caller controls. Measured on a fixture declared prod, filer seeded to exactly the cap:
+
+| assertion | rows filed over a full budget |
+|---|---|
+| `--body='[[5dive-loop:run]]'` (the loop exclusion read the BODY) | **25/25**, count read 0 |
+| `--materialized` (parsed off argv, guard was `-z "$materialized"`) | **20/20** — predates the fix |
+
+- **Loop scaffolding is marked by the WRITER, in a column `task add` cannot reach.** New
+  `tasks.origin` column, set to `task-loop` by the two `task loop start` INSERTs; the
+  count excludes `COALESCE(origin,'')=''`. `_LOOP_MARK` stays the right way to *find* loop
+  rows and is a wrong way to *decide* anything, because the caller writes it.
+- **The materialization exemption is DERIVED from the call stack.** `--materialized` is
+  gone — the six in-process writers (`cmd_goal` ×2, `cmd_loop`, `cmd_loop_pack`,
+  `cmd_objective`, `cmd_proof`) call `task_add_materialized` and the exemption is true iff
+  that frame is in `FUNCNAME`. An env marker would be the same defect one layer out;
+  `FUNCNAME` is the running shell's own stack and no argv or environment writes it.
+- **Every term of an enforcement query is part of the key.** For each clause, ask *who can
+  assert it*: `derived_actor` is measured, `priority` is a visible claim with a second
+  reader, `body` and `--materialized` were unilateral and invisible. That check now sits
+  in the counting function's header.
+- **The mutation suite gets the class it did not have.** M1–M7 all feed the exemption only
+  genuine members, so they grade *does the exemption work* and never *who else can stand
+  in it*. **M8** restores the body-marker predicate, **M9** the argv token; under both, the
+  "does it work" arm stays green — which is exactly why 29 green arms said nothing. The
+  new unit arms walk the VOLUME rather than testing one row against a full budget, because
+  a self-declared exemption does not rescue a row from someone else's budget, it stops the
+  filer's own rows from ever accumulating. Unit 30/0, mutation 37/0.
+- **Not re-derived: the cap is still 15.** The counted population moved again (origin), so
+  the 30-day table below was computed under an older key. The number stays the tunable
+  part; the structure is the deliverable.
+
 ## Unreleased — fix(task): the filing cap counted a CLAIM, so `--from` was the bypass flag it forbids (DIVE-3245)
 
 v0.19.0 shipped the per-filer filing cap with *"there is no bypass flag"* as its first

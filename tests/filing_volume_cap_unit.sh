@@ -226,13 +226,75 @@ chk "a genuinely unmeasurable actor is still exempt (derived cli, not claimed)" 
 
 # ---- loop scaffolding does not spend its author's budget --------------------
 # `task loop` INSERTs a run parent plus one row per step directly, at medium and
-# kind=standard, so they never reach the `--materialized` exemption. Uncounted:
+# kind=standard, so they never reach the materialization exemption. Uncounted:
 # one decision produces N rows and a five-step loop would burn a third of the
-# author's day. The marker is the same one `task loop` itself queries by.
+# author's day.
+#
+# These fixture rows carry the `_LOOP_MARK` body marker AS WELL as the origin
+# column, deliberately: they must be indistinguishable from real loop rows, so
+# this arm stays green under both the old predicate and the new one. It is the
+# "does the exemption work" question — and on its own it is exactly what let it.2
+# ship a self-declared exemption. The adversarial half is below.
 seed looper "$CAP" medium 2
-db "UPDATE tasks SET body='[[5dive-loop:work]]' WHERE created_by='looper';" >/dev/null 2>&1
+db "UPDATE tasks SET origin='task-loop', body='[[5dive-loop:work]]' WHERE created_by='looper';" >/dev/null 2>&1
 chk "loop-materialized rows do NOT count toward their author's cap" "0" \
     "$(rc_of looper medium 'a real filing on a loop lane')"
+
+# ---- WHO ELSE CAN STAND IN THE EXEMPTION (DIVE-3245 it.3) -------------------
+# it.1 fixed the KEY (count the derivation, not the claim). Both doors quinn found
+# next left the key honest and edited the ROW SET instead: an honest actor counted
+# over a population the caller controls. So every arm from here down asks the
+# question no arm above it asks — not "does the exemption work" but "who else can
+# assert membership in it".
+#
+# Door 1, measured at f3d4b8f: the exclusion read `body NOT LIKE '%[[5dive-loop:%'`
+# and `--body` is an ordinary flag. 25 consecutive low rows carrying the marker
+# filed over a full budget and the count read 0.
+#
+# THE ARM WALKS THE VOLUME rather than testing one row against a full budget, and
+# the difference is the whole exploit. A self-declared exemption does not rescue a
+# row from someone else's budget — it stops the filer's OWN rows from ever
+# accumulating, so the count never rises and no row is ever the one too many. Only
+# a filer who starts at zero and files past the cap can see that.
+_marker_rc=0
+for (( _i=0; _i<=CAP; _i++ )); do
+  ( JSON_MODE=0; as_filer marker
+    cmd_task_add "marker row $_i" --priority=low --body='[[5dive-loop:run]]'
+  ) >/dev/null 2>&1
+  _marker_rc=$?
+done
+chk "an ordinary filer CANNOT buy the loop exemption by writing the marker into --body" \
+    "$E_VALIDATION" "$_marker_rc"
+
+# Door 2, and it PREDATES the it.2 fix: `--materialized` was parsed off argv with
+# no guard, so 20/20 low rows filed over the cap. The token is gone — an argv
+# assertion now cannot even name the exemption, let alone reach it.
+chk "an ordinary filer CANNOT assert --materialized on argv" "$E_USAGE" \
+    "$( ( JSON_MODE=0; as_filer heavy
+          cmd_task_add 'asserting the exemption' --priority=low --materialized
+        ) >/dev/null 2>&1; printf '%s' "$?" )"
+chk "and the row it tried to file does not exist" "0" \
+    "$(db "SELECT COUNT(*) FROM tasks WHERE title='asserting the exemption';")"
+
+# The other direction, and it is a separate claim: closing a door must not brick
+# the room. The exemption exists because a cap firing halfway through a plan
+# leaves a HALF-materialized one, which is the worse failure. `task_add_materialized`
+# is the derived door the six internal writers call, and it still opens.
+chk "the DERIVED door still exempts: an over-budget filer materializing files fine" "0" \
+    "$( ( JSON_MODE=0; as_filer heavy
+          task_add_materialized 'a materialized child' --priority=medium
+        ) >/dev/null 2>&1; printf '%s' "$?" )"
+
+# And the writer must really MARK them, or the exclusion above is dead code and the
+# overcount returns silently. Marking and exempting are two facts; a suite that
+# only seeds the mark grades one of them.
+_task_resolve_coordinator() { printf 'main'; }
+cmd_send() { :; }
+( as_filer looper
+  cmd_task_loop_start --title='fixture loop' --steps='[{"label":"s1","agent":"looper"}]'
+) >/dev/null 2>&1
+chk "task loop start MARKS the rows it materialises (run parent + step)" "2" \
+    "$(db "SELECT COUNT(*) FROM tasks WHERE origin='task-loop' AND title IN ('fixture loop','s1');")"
 
 printf -- '-----\nRESULT: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

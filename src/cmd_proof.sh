@@ -288,7 +288,7 @@ _proof_publish_gate() {
 
   # No approval task yet — create one + file an approval gate to lodar, then block.
   local newident
-  newident="$(JSON_MODE=1 cmd_task_add --materialized "Approve public zero-human proof badge" \
+  newident="$(JSON_MODE=1 task_add_materialized "Approve public zero-human proof badge" \
       --from=proof --priority=high \
       --body="First public fire of the zero-human proof badge (\`5dive proof publish\`). Emitting it puts a public-facing brand/comms artifact live, so it needs lodar's explicit approval before anything publishes. Approve once you're ready for the badge to go live; publishing stays enabled afterward." \
       2>/dev/null | jq -r '.data.ident // empty' 2>/dev/null || true)"

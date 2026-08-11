@@ -165,7 +165,7 @@ require_sqlite() {
 # NOTE: projects/loop_runs/supervisor_events are ALSO defined inside gated
 # one-shot migration blocks in _tasks_db_migrate() below — edit both copies
 # together; tests/schema_sync_unit.sh fails CI if they diverge.
-_TASKS_SCHEMA_EPOCH='3251-1'   # DIVE-3251: +first_started_at
+_TASKS_SCHEMA_EPOCH='3245-3'   # DIVE-3245 it.3: +origin
 _tasks_schema() {
   cat <<'SQL'
 PRAGMA journal_mode=WAL;
@@ -267,6 +267,22 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- _TASKS_ADDITIVE_COLUMNS: a fresh store takes this CREATE and never runs the
   -- ALTER loop, per the rule above.
   gate_mode TEXT,
+  -- DIVE-3245 it.3: WHICH CLI VERB INSERTED THIS ROW, when it was not a filing.
+  -- NULL/'' means `task add` — a person (or an agent) chose to file it. Anything
+  -- else names the scaffolding writer: 'task-loop' for the run parent and steps
+  -- `task loop start` materialises from one decision.
+  --
+  -- WHY IT IS A COLUMN AND NOT A BODY MARKER, which is what it.2 shipped and what
+  -- quinn measured through: the filing cap EXCLUDES scaffolding, and it.2 spelled
+  -- that exclusion as `body NOT LIKE '%[[5dive-loop:%'`. `--body` is an ordinary
+  -- `task add` flag, so 25 consecutive low rows carrying the marker filed straight
+  -- over a full budget. An exemption is a bypass flag whenever the exempt class is
+  -- self-declared, and `task add` has no way to write this column at all.
+  -- The generalisation (community/wiki, a-quota-keyed-on-a-claim-…): every term in
+  -- an enforcement query is part of the key — for each clause ask who can assert it.
+  -- Declared HERE as well as in _TASKS_ADDITIVE_COLUMNS, per the rule above: a
+  -- fresh store takes this CREATE and never runs the ALTER loop.
+  origin TEXT,
   parent_id   INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   started_at  TEXT,
@@ -1330,6 +1346,10 @@ _TASKS_ADDITIVE_COLUMNS=(
   # template AND an unclassified template stays visibly unclassified. See the
   # CREATE TABLE comment for why the pile-up's value is per-template.
   'on_overlap TEXT' 'overlap_bound INTEGER'
+  # DIVE-3245 it.3: the inserting verb, for rows no filer chose to file. See the
+  # CREATE TABLE comment for why the filing cap's scaffolding exemption had to
+  # move off the body and onto a column `task add` cannot write.
+  'origin TEXT'
   'human_evidence TEXT' 'derived_actor TEXT' 'floor_provenance TEXT'
   # DIVE-3171: the ROUTING axis's provenance, sibling to floor_provenance. See the
   # CREATE TABLE comment for the values and for why it is stored, not derived.

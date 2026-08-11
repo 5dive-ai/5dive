@@ -311,7 +311,7 @@ _goal_materialize() {
     verifier=$(printf '%s' "$plan" | jq -r ".tasks[$i].verifier // \"\"")
     [[ -n "$lid" ]] || continue
     resolved=$(_goal_resolve_assignee "$aor")
-    add_json=$(JSON_MODE=1 cmd_task_add --materialized --project="$pkey" --assignee="$resolved" \
+    add_json=$(JSON_MODE=1 task_add_materialized --project="$pkey" --assignee="$resolved" \
                  --priority="${prio:-medium}" ${from:+--from="$from"} \
                  ${body:+--body="$body"} ${accept:+--accept="$accept"} \
                  ${verify:+--verify="$verify"} ${verifier:+--verifier="$verifier"} \
@@ -604,7 +604,7 @@ _goal_finish_with_plan() {
     anchor_id=$(db "SELECT id FROM tasks WHERE project_key=$(sqlq "$pkey") AND title LIKE 'Goal:%' AND kind='standard' ORDER BY id LIMIT 1;")
     if [[ -z "$anchor_id" ]]; then
       local add_json
-      add_json=$(JSON_MODE=1 cmd_task_add --materialized --project="$pkey" --priority=high ${planner:+--assignee="$planner"} ${from:+--from="$from"} \
+      add_json=$(JSON_MODE=1 task_add_materialized --project="$pkey" --priority=high ${planner:+--assignee="$planner"} ${from:+--from="$from"} \
                    --body="$(printf 'Goal: %s\n\nProposed plan (%s tasks, critical path %s) — approve to materialize:\n\n%s\n\n--- plan json ---\n%s' \
                              "$outcome" "$GOAL_TASK_COUNT" "$GOAL_CRIT_PATH" "$(_goal_render_plan "$plan")" "$plan")" \
                    -- "Goal: $outcome") || return $?

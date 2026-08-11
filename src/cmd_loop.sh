@@ -376,7 +376,7 @@ cmd_loop_spawn() {
   local task_body="${prompt}${marker}"
 
   local add_json
-  add_json=$(JSON_MODE=1 cmd_task_add --materialized --assignee="$agent" --project="$project" ${from:+--from="$from"} \
+  add_json=$(JSON_MODE=1 task_add_materialized --assignee="$agent" --project="$project" ${from:+--from="$from"} \
                --body="$task_body" -- "$title") || return $?
   local task_id task_ident
   task_id=$(printf '%s' "$add_json"   | jq -r '.data.id')

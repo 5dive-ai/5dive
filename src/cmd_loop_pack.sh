@@ -153,7 +153,7 @@ cmd_loop_pack_install() {
 — installed loop: $slug (5dive marketplace). runs on '$cron'."
   [[ -n "$ceiling" ]] && body="$body advisory budget: ${ceiling} tokens/run (bound hard with: 5dive usage budget $onto)."
   local out ident
-  out=$(cmd_task_add --materialized "$job" --body="$body" --recurring="$cron" --assignee="$onto" --project=dive 2>/dev/null) || true
+  out=$(task_add_materialized "$job" --body="$body" --recurring="$cron" --assignee="$onto" --project=dive 2>/dev/null) || true
   if (( JSON_MODE )); then
     ident=$(jq -r '.data.ident // empty' <<<"$out" 2>/dev/null)
   else

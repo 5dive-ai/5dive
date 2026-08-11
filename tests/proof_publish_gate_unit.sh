@@ -39,6 +39,11 @@ sqlq() { printf "'%s'" "$1"; }
 # Stubs record what the gate asked the task layer to do.
 ADD_LOG="$TMP/add.log"; NEED_LOG="$TMP/need.log"; : >"$ADD_LOG"; : >"$NEED_LOG"
 cmd_task_add()  { echo "add $*" >>"$ADD_LOG"; echo '{"data":{"ident":"DIVE-777"}}'; }
+# DIVE-3245 it.3: the materialization exemption is no longer an argv flag — it is
+# derived from the call stack, so the writers call `task_add_materialized` rather
+# than passing `--materialized`. Stubbed THROUGH the real wrapper's shape (it is a
+# one-line pass-through to cmd_task_add) so the log this file greps is unchanged.
+task_add_materialized() { cmd_task_add "$@"; }
 cmd_task_need() { echo "need $*" >>"$NEED_LOG"; return 0; }
 # db returns the gate record for the ident lookup, controlled per-case via GATE_REC
 # (format: answer<US>by<US>nonce). Empty by default (no answer yet).

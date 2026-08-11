@@ -1019,29 +1019,63 @@ _task_internal_subject_reason() {
 #     the derivation wins — those are charged to the seat that really ran the process,
 #     which is the entity a quota is trying to bind.
 # NULLIF because a written-but-empty string is not a recorded derivation.
+# THE ONLY DOOR TO THE MATERIALIZATION EXEMPTION (DIVE-3245 it.3).
+#
+# The six in-process writers that turn ONE already-approved decision into N rows
+# (cmd_goal x2, cmd_loop, cmd_loop_pack, cmd_objective, cmd_proof) call this
+# instead of passing a flag. A cap firing halfway through leaves a HALF-materialized
+# plan, which is strictly worse than an uncapped lane — that is why the exemption
+# exists and it has not changed. What changed is who can stand in it.
+#
+# WHY THE CALL STACK AND NOT A FLAG OR AN ENV VAR. `--materialized` was an argv
+# token with an unguarded parse, so any caller could assert membership: measured by
+# quinn grading it.2, 20/20 low rows over a full budget. An env marker is the same
+# defect one layer out — exportable, and invisible in the record. `FUNCNAME` is
+# neither: it is the running shell's own call stack, propagated into `$(...)`
+# substitutions, and no argv or environment can write it. Reaching it requires
+# already executing inside this CLI's source, at which point the quota is not the
+# weakest thing you can edit.
+task_add_materialized() { cmd_task_add "$@"; }
+_task_add_materialized_caller() {
+  local f
+  for f in "${FUNCNAME[@]}"; do
+    [[ "$f" == "task_add_materialized" ]] && return 0
+  done
+  return 1
+}
+
 _task_filer_low_med_24h() { # <derived-filer> -> count
   local who="$1"
   [[ -n "$who" ]] || { printf '0'; return 0; }
   # LOOP SCAFFOLDING IS MATERIALIZATION, NOT FILING (quinn, grading it.1 — flagged
   # not blocking, fixed here because it is the row's own named failure: "counting
   # rows the filer did not create"). `task loop` INSERTs its run parent and every
-  # step directly (:6979, :7003) at priority medium, kind standard — so they never
-  # reach the cap's own `--materialized` exemption and a five-step loop silently
-  # spent a third of its author's daily budget. One decision, N rows, same shape
-  # the WIP cap already exempts by name.
+  # step directly at priority medium, kind standard — so they never reach the cap's
+  # own materialization exemption and a five-step loop silently spent a third of
+  # its author's daily budget. One decision, N rows, same shape the WIP cap already
+  # exempts by name.
   #
-  # `_LOOP_MARK` is the established discriminator for exactly these rows (:7043,
-  # :13735), and it is DEFAULTED rather than read bare: it is assigned further down
-  # this file, and an unset expansion here would leave `NOT LIKE '%:%'`, which
-  # excludes nearly every row on the board and turns the cap off without failing.
-  # A control must not have a silent off state, so the fallback is the literal.
-  local loopmark="${_LOOP_MARK:-[[5dive-loop}"
+  # EVERY TERM OF THIS QUERY IS PART OF THE KEY — ASK WHO CAN ASSERT EACH ONE
+  # (DIVE-3245 it.3, quinn's second reject). it.1's lesson was about the KEY: count
+  # the derived actor, not the claim. That left the row SET, and it.2 spelled this
+  # exclusion as `body NOT LIKE '%[[5dive-loop:%'` — `--body` is an ordinary
+  # `task add` flag, so 25 low rows carrying the marker filed straight over a full
+  # budget and the count read 0. An exemption is a bypass flag whenever the exempt
+  # class is SELF-DECLARED. Clause by clause, as they stand now:
+  #   derived_actor/created_by  MEASURED from the uid (it.1)
+  #   priority                  a visible claim about severity, with a second reader
+  #   kind                      no `task add` flag writes it
+  #   from_template_id          written by the scheduler, unreachable from argv
+  #   origin                    written by the INSERTING VERB, likewise unreachable
+  # `origin` replaces the body marker for exactly that reason. `_LOOP_MARK` stays
+  # the discriminator `task loop` itself QUERIES by — it is a fine way to find loop
+  # rows, and an unsafe way to decide anything, because the caller writes it.
   db "SELECT COUNT(*) FROM tasks
        WHERE COALESCE(NULLIF(derived_actor,''), created_by)=$(sqlq "$who")
          AND kind='standard'
          AND priority IN ('low','medium')
          AND COALESCE(from_template_id,0)=0
-         AND body NOT LIKE '%' || $(sqlq "$loopmark") || ':%'
+         AND COALESCE(origin,'')=''
          AND created_at > datetime('now','-24 hours');" 2>/dev/null
 }
 
@@ -1424,10 +1458,14 @@ cmd_task_add() {
       # mandatory on the exception and is written into the body, because an
       # exception nobody can audit later is not an exception, it is an opt-out.
       --customer)          customer_facing="1" ;;
-      # DIVE-2794 arm two: set by the internal writers that turn one approved
-      # decision into N rows. Exempts the WIP cap only — never the DIVE-2681
-      # filing cap, which is about what a title IS, not how many there are.
-      --materialized)      materialized="1" ;;
+      # DIVE-2794 arm two used to be `--materialized`, an ARGV TOKEN, and DIVE-3245
+      # it.3 removed it: the guard was `-z "$materialized"` and the flag was parsed
+      # off argv unguarded, so 20/20 low rows filed over a full budget by asserting
+      # membership in the exemption. The exemption is now DERIVED from the call
+      # stack (see `task_add_materialized` and `_task_add_materialized_caller`), so
+      # the token below is deliberately absent and reaches the `-*` arm as an
+      # unknown flag. Do not re-add it: an exemption anything can assert is a
+      # bypass flag with a different name.
       --already-blocked=*) already_blocked="${1#*=}" ;;
       # DIVE-824: per-run spend cap carried on the row (sibling to verify --timeout).
       # Value is either a bare token count or a "$cost" dollar figure.
@@ -1441,6 +1479,10 @@ cmd_task_add() {
     esac
     shift
   done
+  # THE MATERIALIZATION EXEMPTION IS DERIVED, NOT ASSERTED (DIVE-3245 it.3).
+  # Nothing the caller supplies reaches this variable; it is true iff this call is
+  # nested inside `task_add_materialized`, which only in-process CLI code can enter.
+  _task_add_materialized_caller && materialized="1"
   local title="${words[*]:-}"
   [[ -n "$title" ]] || fail "$E_USAGE" "usage: 5dive task add <title...> [flags: 5dive task --help]"
   valid_task_priority "$priority" || fail "$E_VALIDATION" "bad priority '$priority' (low|medium|high|urgent)"
@@ -6993,9 +7035,13 @@ cmd_task_loop_start() {
   local run_body="Loop run.
 ${_LOOP_MARK}:run]]"
   local run
-  run=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, project_key, kind)
+  # origin='task-loop' (DIVE-3245 it.3): scaffolding, not a filing. Written HERE,
+  # by the verb that materialises it, because that is the one fact `task add`
+  # cannot state about itself — the filing cap's exclusion keys on this column
+  # rather than on the `_LOOP_MARK` in the body, which any `--body` can carry.
+  run=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, project_key, kind, origin)
             VALUES ($(sqlq "$title"), $(sqlq "$run_body"), 'medium',
-                    $(sqlq_or_null "$owner"), $(sqlq "$creator"), $(sqlq "${project,,}"), 'standard');
+                    $(sqlq_or_null "$owner"), $(sqlq "$creator"), $(sqlq "${project,,}"), 'standard', 'task-loop');
             SELECT last_insert_rowid();")
   local run_ident; run_ident=$(db "SELECT ident FROM tasks WHERE id=${run};")
 
@@ -7017,9 +7063,9 @@ ${_LOOP_MARK}:run]]"
     fi
     local sbody="${_LOOP_MARK}:${kind}]]"
     local sid
-    sid=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, parent_id, project_key, kind)
+    sid=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, parent_id, project_key, kind, origin)
               VALUES ($(sqlq "$label"), $(sqlq "$sbody"), 'medium',
-                      $(sqlq_or_null "$sassignee"), $(sqlq "$creator"), ${run}, $(sqlq "${project,,}"), 'standard');
+                      $(sqlq_or_null "$sassignee"), $(sqlq "$creator"), ${run}, $(sqlq "${project,,}"), 'standard', 'task-loop');
               SELECT last_insert_rowid();")
     if [[ -n "$prev" ]]; then
       db "INSERT OR IGNORE INTO task_deps (task_id, blocked_by) VALUES (${sid}, ${prev});

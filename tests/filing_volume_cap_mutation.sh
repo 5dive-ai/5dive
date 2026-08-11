@@ -35,7 +35,7 @@ set +e
 
 # ---- baseline: the harness is green against UNMUTATED source ----------------
 base_out=$(DIVE_TEST_SRC="$ROOT/src" bash "$UNIT" 2>&1)
-if [[ "$base_out" == *'RESULT: 25 passed, 0 failed'* ]]; then
+if [[ "$base_out" == *'RESULT: 30 passed, 0 failed'* ]]; then
   ok_t "baseline: unit harness is green before any mutation"
 else
   bad_t "baseline: unit harness is green before any mutation" "$(tail -4 <<<"$base_out")"
@@ -143,13 +143,37 @@ run_mutation m6-count-on-created-by \
 
 # ---- M7: loop scaffolding starts counting again ------------------------------
 # Same class as M4 and a different writer: `task loop` bypasses the add path
-# entirely, so its rows carry no `--materialized` and only the marker separates
-# them. Control: the ordinary over-budget refusal is untouched, so this exclusion
-# cannot have been implemented by simply counting less.
+# entirely, so its rows are separated only by the origin column. Control: the
+# ordinary over-budget refusal is untouched, so this exclusion cannot have been
+# implemented by simply counting less.
 run_mutation m7-count-loop-scaffolding \
-  "s@AND body NOT LIKE '%' || \$(sqlq \"\$loopmark\") || ':%'@@" \
+  "s@AND COALESCE(origin,'')=''@@" \
   'loop-materialized rows do NOT count' \
   'at the cap, a medium row is REFUSED'
+
+# ---- M8/M9: THE EXEMPTIONS GO BACK TO BEING SELF-DECLARED -------------------
+# The mutation class M1-M7 does not contain, and its absence is why it.2 shipped
+# two open doors under 29 green mutation arms. Every one of those perturbs the
+# RULE or the KEY, and each feeds the exemption only GENUINE members — so they
+# grade whether an exemption works and never whether an outsider can stand in it.
+# Read the CONTROLS: under both mutations below the "does the exemption work" arm
+# stays green. That is the whole finding, restored and measured.
+
+# M8 restores it.2's shipped predicate exactly: exclude on the body marker, which
+# `--body` writes. The genuine-loop arm cannot see it (those rows carry the marker
+# too, on purpose), so the named control is that arm and not the generic refusal.
+run_mutation m8-exemption-readable-from-body \
+  "s@AND COALESCE(origin,'')=''@AND body NOT LIKE '%[[5dive-loop:%'@" \
+  'an ordinary filer CANNOT buy the loop exemption' \
+  'loop-materialized rows do NOT count'
+
+# M9 restores the argv token. The parse arm is what reds; the DERIVED door keeps
+# working throughout, which is the point — the defect was never that the exemption
+# was wrong, only that it was assertable.
+run_mutation m9-materialized-back-on-argv \
+  's@--already-blocked=\*)@--materialized) materialized="1" ;; --already-blocked=*)@' \
+  'an ordinary filer CANNOT assert --materialized on argv' \
+  'the DERIVED door still exempts'
 
 printf -- '-----\nRESULT: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
