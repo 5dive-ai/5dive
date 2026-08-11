@@ -461,5 +461,131 @@ _mark=$(grep -n 'nudge_n=\$(with_registry_lock _hb_mark_run' "$SRC/cmd_heartbeat
   && ok_t "the tick path CALLS the ladder, after _hb_mark_run — a consumer that is never invoked is the original bug" \
   || bad_t "the tick path calls the ladder after _hb_mark_run" "call site line=[${_wire:-none}] _hb_mark_run line=[${_mark:-none}]"
 
+# ---------------------------------------------------------------------------
+# 12. THE SIBLING HOLD (main, 2026-08-11). The gate hold in arm 6 says a row
+#     waiting on a person is not starved. Its sibling: a row waiting behind its
+#     own assignee's OTHER work is not starved either — the wait is on a QUEUE,
+#     and neither rung-2 lever addresses a queue. A seat working a deliberate
+#     multi-row order accumulates nudges on rows 2..N BY CONSTRUCTION, precisely
+#     because it is productively working row 1.
+#
+#     Every arm here is fixtured so that WITHOUT the hold rung 2 would PARK
+#     (all other agents busy), so "did not fire" is a real observation and not
+#     the reassign branch quietly failing to find a target. 12b is the anchor
+#     that proves it.
+# ---------------------------------------------------------------------------
+# A row `dev` demonstrably moved AFTER rung 1 fired (rung 1 is stamped -1 hour).
+adv_row() { db "INSERT INTO tasks (ident,title,status,kind,assignee,created_at,updated_at)
+                VALUES ($(sqlq "$1"),'the row dev is actually working','in_progress','standard','dev',
+                        datetime('now','-3 days'),datetime('now'));"; }
+led() { db "INSERT INTO lifecycle_events (kind,actor,authority,idem_key,ts)
+            VALUES ('task.update',$(sqlq "$1"),$(sqlq "$2"),$(sqlq "idem-$1-$2-$3"),datetime('now'));"; }
+held() {  # $1 id -> "1" when rung 2 did nothing at all
+  [[ "$(col "$1" status)" == "todo" && "$(col "$1" nudge_parked_at)" == "NULL" \
+     && "$(col "$1" assignee)" == "dev" && "$(notes "$1")" == "0" ]] && echo 1 || echo 0; }
+
+# 12a — the measured case: dev advanced a DIFFERENT row since rung 1.
+mk_row 20 'DIVE-9020' high 32
+stamp_rung1 20 16
+busy creative; busy dev2; busy main
+adv_row 'DIVE-9020-other'
+_hb_nudge_enforce dev 20 DIVE-9020 32 >/dev/null 2>&1
+[[ "$(held 20)" == "1" ]] \
+  && ok_t "rung 2 HOLDS when the assignee advanced another row since rung 1 — queued behind its own work, not starved" \
+  || bad_t "rung 2 holds for a productively-working seat" "status=[$(col 20 status)] parked=[$(col 20 nudge_parked_at)] assignee=[$(col 20 assignee)] notes=[$(notes 20)]"
+[[ "$(nudge_count 20)" == "32" ]] \
+  && ok_t "a HOLD leaves the counter intact — we did not act, so nothing may read as if we had" \
+  || bad_t "the hold leaves the counter intact" "count=[$(nudge_count 20)] want 32"
+[[ -z "$(sent)" ]] \
+  && ok_t "a HOLD sends nothing — no seat is told about an action that did not happen" \
+  || bad_t "the hold sends nothing" "sends: [$(sent)]"
+
+# 12b — ANCHOR. Byte-identical fixture MINUS the advanced row: rung 2 DOES fire.
+# Without this, 12a passes just as well against a rung 2 that is broken outright.
+mk_row 21 'DIVE-9021' high 32
+stamp_rung1 21 16
+busy creative; busy dev2; busy main
+_hb_nudge_enforce dev 21 DIVE-9021 32 >/dev/null 2>&1
+[[ "$(held 21)" == "0" ]] \
+  && ok_t "ANCHOR: the same fixture with NO seat advance still fires (parks) — 12a is the hold, not a dead rung" \
+  || bad_t "ANCHOR: rung 2 fires when the seat advanced nothing" "status=[$(col 21 status)] parked=[$(col 21 nudge_parked_at)]"
+
+# 12c — TRAP ONE. Rung 1 stamps `updated_at` on every row it fires on, so a seat
+# whose OTHER rows the ENGINE touched looks busy to a naive "any row changed"
+# read — and a completely dead seat would hold forever. An engine-stamped row is
+# NOT evidence of seat work.
+mk_row 22 'DIVE-9022' high 32
+stamp_rung1 22 16
+busy creative; busy dev2; busy main
+db "INSERT INTO tasks (ident,title,status,kind,assignee,created_at,updated_at,nudge_escalated_at)
+    VALUES ('DIVE-9022-engine','a row the ENGINE escalated, not dev','todo','standard','dev',
+            datetime('now','-3 days'),datetime('now'),datetime('now'));"
+_hb_nudge_enforce dev 22 DIVE-9022 32 >/dev/null 2>&1
+[[ "$(held 22)" == "0" ]] \
+  && ok_t "an ENGINE-stamped sibling row is not counted as seat advance — a dead seat cannot hold the ladder off with the engine's own writes" \
+  || bad_t "engine-stamped rows do not count as advance" "status=[$(col 22 status)] parked=[$(col 22 nudge_parked_at)]"
+
+# 12d — TRAP TWO. Dispatcher claims are written to lifecycle_events with the
+# SEAT'S OWN NAME as actor (measured on the live board 2026-08-11: olivia, dev,
+# ops, quinn all appear this way under authority='dispatcher'). That is the
+# engine claiming ON the seat's behalf, not the seat working.
+mk_row 23 'DIVE-9023' high 32
+stamp_rung1 23 16
+busy creative; busy dev2; busy main
+led dev dispatcher 23
+led task-engine heartbeat 23
+_hb_nudge_enforce dev 23 DIVE-9023 32 >/dev/null 2>&1
+[[ "$(held 23)" == "0" ]] \
+  && ok_t "a dispatcher claim and a task-engine event are not seat advance — the engine cannot vouch for the seat it is judging" \
+  || bad_t "dispatcher/heartbeat ledger rows do not count as advance" "status=[$(col 23 status)] parked=[$(col 23 nudge_parked_at)]"
+
+# 12e — the ledger reading WIDENS the hold: seat work that left no `updated_at`
+# of its own on another row is still an advance.
+mk_row 24 'DIVE-9024' high 32
+stamp_rung1 24 16
+busy creative; busy dev2; busy main
+led dev self 24
+_hb_nudge_enforce dev 24 DIVE-9024 32 >/dev/null 2>&1
+[[ "$(held 24)" == "1" ]] \
+  && ok_t "seat work visible only on the ledger (authority='self') also holds rung 2" \
+  || bad_t "ledger-only seat work holds rung 2" "status=[$(col 24 status)] parked=[$(col 24 nudge_parked_at)]"
+
+# 12f — a SILENT hold is indistinguishable from a ladder that never armed, which
+# is the DIVE-3218 defect wearing a different hat. Assert the narration by
+# CONTENT, the same way the body notes are asserted above.
+mk_row 25 'DIVE-9025' high 32
+stamp_rung1 25 16
+busy creative; busy dev2; busy main
+adv_row 'DIVE-9025-other'
+_HB_LOG_CAP="$TMP/hold.log"; : >"$_HB_LOG_CAP"
+_hb_log() { printf '%s\n' "$1" >>"$_HB_LOG_CAP"; }
+_hb_nudge_enforce dev 25 DIVE-9025 32 >/dev/null 2>&1
+_hb_log() { :; }
+case "$(cat "$_HB_LOG_CAP")" in
+  *"rung 2 HELD"*"advanced other rows"*) ok_t "the hold NARRATES itself — a silent hold reads as a ladder that never armed" ;;
+  *) bad_t "the hold narrates itself" "log: [$(cat "$_HB_LOG_CAP")]" ;;
+esac
+
+# 12g — the hold is scoped to RUNG 2. A productively-working seat still gets
+# rung 1 (escalate + the written note), which costs the row nothing and is the
+# half that ends the re-derivation. Holding rung 1 too would restore the
+# 173-wake world for every busy seat on the fleet.
+mk_row 26 'DIVE-9026' high 16
+adv_row 'DIVE-9026-other'
+_hb_nudge_enforce dev 26 DIVE-9026 16 >/dev/null 2>&1
+[[ "$(col 26 nudge_escalated_at)" != "NULL" && "$(notes 26)" == "1" ]] \
+  && ok_t "the hold is RUNG 2 ONLY — rung 1 still escalates and writes its note for a busy seat" \
+  || bad_t "rung 1 is unaffected by the seat-advance hold" "esc=[$(col 26 nudge_escalated_at)] notes=[$(notes 26)]"
+
+# 12h — WIRING, same posture as arm 11: the helper existing proves nothing about
+# rung 2 consulting it. Assert the call sits inside rung 2 and AFTER the gate
+# hold, so the two holds cannot be reordered into one that shadows the other.
+_gate=$(grep -n 'rung 2 HELD: unanswered human gate' "$SRC/cmd_heartbeat.sh" | cut -d: -f1 | head -1) || _gate=""
+_seat=$(grep -n 'if _hb_seat_advanced "\$name" "\$tid" "\$esc_at"' "$SRC/cmd_heartbeat.sh" | cut -d: -f1 | head -1) || _seat=""
+_free=$(grep -n 'local free="" target="" cand lane' "$SRC/cmd_heartbeat.sh" | cut -d: -f1 | head -1) || _free=""
+[[ -n "$_gate" && -n "$_seat" && -n "$_free" ]] && (( _seat > _gate && _seat < _free )) \
+  && ok_t "rung 2 CONSULTS the seat-advance hold, after the gate hold and before any lever — a helper nobody calls is the original bug" \
+  || bad_t "rung 2 consults the seat-advance hold in place" "gate=[${_gate:-none}] seat=[${_seat:-none}] levers=[${_free:-none}]"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

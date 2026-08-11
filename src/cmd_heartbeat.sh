@@ -729,6 +729,76 @@ _hb_row_note() {
 # suppresses nothing; it is merely starved. A starved row is not an unwanted row,
 # and auto-cancelling one would destroy work lodar asked for on the evidence that
 # nobody got to it.
+# DIVE-3218 (main, 2026-08-11) — the SIBLING of the unanswered-gate hold.
+#
+# `_hb_nudge_enforce` reads the priority band, the row's own stamps and the gate
+# hold. It reads NOTHING about the assignee's SEAT — so a seat working a
+# deliberate multi-row order accumulates nudges on rows 2..N BY CONSTRUCTION,
+# precisely because it is productively working row 1. At the `high` default of 8
+# those rows get reassigned out from under a seat doing exactly what it was told.
+# Measured, not hypothetical: two such notices fired on quinn's DIVE-3229 and
+# DIVE-3238 on the morning of 2026-08-11, both actively planned in an order main
+# had given them.
+#
+#   "A row waiting on an unanswered human gate is not starved — the wait is on a
+#    person." Its sibling: a row waiting behind its own assignee's OTHER work is
+#   not starved either — the wait is on a QUEUE.
+#
+# NO NEW SIGNAL. The question is answerable from rows this function already
+# reaches: did this seat advance ANYTHING between rung 1 firing and now? Two
+# independent readings, OR'd, because each covers the other's blind spot.
+#
+# THE TRAP THAT MAKES THE NAIVE VERSION USELESS: the engine's own writes are
+# attributed to the SEAT, so "any row of this assignee changed" is true even for
+# a seat that is completely dead.
+#   * rung 1 stamps `updated_at` on THIS row, and on every OTHER row of the same
+#     seat it fires on -> exclude $tid, and exclude rows carrying an engine
+#     nudge stamp inside the same window.
+#   * lifecycle_events rows written when the DISPATCHER claims a row carry
+#     `authority='dispatcher'` and the SEAT'S OWN NAME as `actor` (measured:
+#     olivia/dev/ops/quinn all appear this way). That is the engine claiming on
+#     the seat's behalf, NOT seat work -> excluded, together with 'heartbeat'.
+#     Measured on the live board 2026-08-11: zero seat events carry
+#     authority='heartbeat', so that exclusion costs nothing real.
+#
+# FAILS TOWARD HOLD, DELIBERATELY. An unreadable store, a missing column or a
+# missing lifecycle_events table yields "" from `db`, which reads as "no evidence
+# of advance" -> the ladder still fires. So the TASKS reading is primary (its
+# columns are the ones this function already selects) and the ledger reading only
+# WIDENS the hold; a store without lifecycle_events degrades to the tasks reading
+# rather than to a hold that silently never holds.
+_hb_seat_advanced() {
+  local name="$1" tid="$2" since="$3" asg="${4:-}"
+  [[ -n "$since" ]] || return 1
+  [[ "${tid:-}" =~ ^[0-9]+$ ]] || return 1
+  local seats hit=""
+  seats="$(sqlq "$name")"
+  [[ -n "$asg" && "$asg" != "$name" ]] && seats="${seats},$(sqlq "$asg")"
+
+  # (A) TASKS — "closed, delivered, rejected or updated any row in that window".
+  # `updated_at` is the broad one and the only one that catches a body note, so it
+  # is what we read; the engine-stamp exclusion is what keeps it honest.
+  hit=$(db "SELECT 1 FROM tasks
+             WHERE assignee IN (${seats})
+               AND id <> ${tid}
+               AND COALESCE(updated_at,'') > $(sqlq "$since")
+               AND NOT (COALESCE(nudge_escalated_at,'') > $(sqlq "$since")
+                     OR COALESCE(nudge_parked_at,'')    > $(sqlq "$since"))
+             LIMIT 1;" 2>/dev/null || echo "")
+  [[ -n "$hit" ]] && return 0
+
+  # (B) LEDGER — catches seat work that leaves no `updated_at` of its own,
+  # including work on THIS row. Absent table => "" => contributes nothing.
+  hit=$(db "SELECT 1 FROM lifecycle_events
+             WHERE actor IN (${seats})
+               AND actor <> 'task-engine'
+               AND authority NOT IN ('heartbeat','dispatcher')
+               AND ts > $(sqlq "$since")
+             LIMIT 1;" 2>/dev/null || echo "")
+  [[ -n "$hit" ]] && return 0
+  return 1
+}
+
 _hb_nudge_enforce() {
   local name="$1" tid="$2" tident="$3" nudge_n="$4"
   [[ "${nudge_n:-}" =~ ^[0-9]+$ ]] || return 0
@@ -764,6 +834,19 @@ _hb_nudge_enforce() {
     # leave the counter alone — we did not act, so nothing may read as if we had.
     if [[ -n "$(db "SELECT 1 FROM tasks WHERE id=${tid} AND need_type IS NOT NULL AND need_answered_at IS NULL;" 2>/dev/null || echo "")" ]]; then
       _hb_log "[nudge-enforce] ${tident} rung 2 HELD: unanswered human gate — not starvation; nothing written, nothing sent, counter left intact"
+      return 0
+    fi
+
+    # SIBLING HOLD (DIVE-3218, main 2026-08-11). A row waiting behind its own
+    # assignee's OTHER work is queued, not starved — the wait is on a queue, and
+    # neither rung-2 lever addresses a queue. Reassigning it takes a row off a
+    # seat that is demonstrably working and hands it to one that is merely idle.
+    # Same discipline as the gate hold above: hold, log, write nothing, send
+    # nothing, and leave the counter alone — we did not act, so nothing may read
+    # as if we had. Logged rather than silent because a silent hold is
+    # indistinguishable from a ladder that never armed.
+    if _hb_seat_advanced "$name" "$tid" "$esc_at" "$asg"; then
+      _hb_log "[nudge-enforce] ${tident} rung 2 HELD: assignee '${asg:-$name}' advanced other rows since rung 1 (${esc_at}) — queued behind its own work, not starved; nothing written, nothing sent, counter left intact"
       return 0
     fi
 
