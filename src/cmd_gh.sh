@@ -259,7 +259,27 @@ cmd_gh() {
       fi
       actor="bot"; reason="you asked for --as=bot" ;;
     auto)
-      if [[ "$class" == "write" ]]; then actor="bot"; else actor="caller"; fi ;;
+      if [[ "$class" == "write" ]]; then
+        actor="bot"
+      elif [[ "$class" != "admin" ]] && ! _gh_caller_credential; then
+        # DIVE-2296: a maker with NO credential is the case `read -> caller` was
+        # never written for. The preference behind that arm ("the bot sees fewer
+        # repos than you do") is a PREFERENCE, not a safety property, and it is
+        # strictly worse than nothing when the caller holds nothing: routing to a
+        # credential that does not exist produces a gh auth refusal, and the maker
+        # reads that as "reads are closed to me" and falls back to asking another
+        # agent — the five-round-trip shape this ticket measured.
+        #
+        # This grants NO new authority. class=admin is excluded above (the bot is
+        # admin=false and an explicit --as=bot is refused for it two arms up), the
+        # very same token is already reachable by typing --as=bot by hand, and the
+        # bot's read visibility is a SUBSET of an authed caller's. The only thing
+        # that changes is that a seat with nothing to route to gets an answer
+        # instead of an error.
+        actor="bot"; reason="this class normally routes to you, but you hold NO gh credential on this seat, so it routes to the bot rather than refusing a read you are allowed to make (DIVE-2296)"
+      else
+        actor="caller"
+      fi ;;
   esac
 
   if [[ "$actor" == "bot" ]]; then
@@ -270,7 +290,12 @@ cmd_gh() {
     # Resolve FIRST, then name what was resolved. Saying "your own gh credential"
     # on a seat that holds none sends the reader looking for a routing bug when
     # the answer is that there is nothing to route to (DIVE-3135).
-    echo "[5dive gh] actor=your own gh credential — but NONE IS RESOLVED on this seat, so gh will refuse to authenticate (class=${class}: ${reason}). Provision one, or use --as=bot if this is a write." >&2
+    # DIVE-2296: the old text qualified the escape hatch as "--as=bot if this is a
+    # WRITE", which steered a credential-less maker AWAY from the one path that
+    # answers a read. --as=bot serves reads too; only admin-class work genuinely
+    # cannot go that way. With the auto-route above, reaching this line at all now
+    # means class=admin or an explicit --as=caller.
+    echo "[5dive gh] actor=your own gh credential — but NONE IS RESOLVED on this seat, so gh will refuse to authenticate (class=${class}: ${reason}). Provision one, or use --as=bot — that works for READS as well as writes, and is refused only for admin-class operations, which 5dive-bot genuinely cannot perform." >&2
   fi
   [[ $explain -eq 1 ]] && return 0
 

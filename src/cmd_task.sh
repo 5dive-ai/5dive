@@ -3413,6 +3413,48 @@ _gate_pr_state() {
       2>/dev/null || true
 }
 
+# DIVE-2296: _gate_branch_open_pr <slug> <branch> <tok> — is there an OPEN PR for
+# this head, and where are its checks? Prints `N|CHECKS` (CHECKS as in
+# _gate_pr_state: FAILURE / NONE / OK) or EMPTY for "no open PR found, or the
+# query could not run".
+#
+# WHY THIS EXISTS AT ALL. The branch-path refusal below reports the SAME sentence
+# for two states that demand opposite responses: no PR exists for this branch (go
+# open one), and a PR exists and is sitting in an 18-minute CI run (wait). For a
+# maker holding no gh credential that refusal is the ONLY window onto their own
+# work, so the collapse does not merely under-inform, it manufactures round trips:
+# measured on DIVE-2286, dev2 filed a gate asking main to open a PR that dev2 had
+# opened fifteen minutes earlier, then two more asking for a merge that was
+# waiting on checks. Three asks, all of them answerable by one read.
+#
+# This is DIAGNOSTIC ONLY and deliberately so: an OPEN PR accepts NOTHING here and
+# must not — done=merged-to-main is the whole point of the DIVE-1830 gate, and a
+# refusal that explains itself better is not a refusal that yields. It is called
+# from the refusal arm only, never on an accepting path, so a close that passes
+# pays nothing for it.
+_gate_branch_open_pr() {
+  local slug="$1" branch="$2" tok="$3" out rc=0
+  out=$(_gate_gh "$tok" 10 pr list --repo "$slug" --head "$branch" --state open \
+      --json number,statusCheckRollup \
+      -q "[ (.[0].number // empty | tostring), ( .[0] // {} | $_GATE_ROLLUP_JQ ) ] | join(\"|\")" \
+      2>/dev/null) || rc=$?
+  # THREE ANSWERS, NOT TWO. A query that could not RUN — no rail, an invalid token,
+  # a timeout, gh absent — must never render as "there is no open PR". That is the
+  # DIVE-2318 defect exactly, and it is the one this ticket is downstream of: an
+  # unreached question printed as a measured no. It has already bitten the sibling
+  # surface (an invalid credential made `task done` refuse on a row whose merge WAS
+  # on main, because the gate asked gh and not git), so it is guarded here at birth.
+  #   Two independent signals, because either alone is incomplete: a non-zero rc,
+  # and EMPTY output. The second matters because the no-PR case is not empty — jq
+  # renders it as a bare rollup ("NONE"), so nothing at all means the payload was
+  # never valid JSON, whatever the exit status said.
+  if (( rc != 0 )) || [[ -z "$out" ]]; then printf 'UNREADABLE'; return 0; fi
+  # A number is required before believing there is a PR: an absence that still
+  # LOOKS like a value is the collapse this function exists to undo.
+  [[ "$out" =~ ^[0-9]+\| ]] || out=""
+  printf '%s' "$out"
+}
+
 # DIVE-2656 PART 2: _gate_graded_sha <text> — the sha a verifier STATES it graded.
 #
 # This is a FENCE, not a scrape. It matches only a labelled declaration —
@@ -4904,7 +4946,38 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
           # a missing branch. It did exactly that to dev2 on DIVE-2286 and to dev3 on
           # DIVE-2301. So: state what was actually measured (no commit subject on main
           # names the ident, no merged PR for the branch) and give the remedy that works.
-          policy_refuse "$E_CONFLICT" done-before-branch-merged DIVE-1830 "$ident" "$ident cannot close: nothing on ${FIVE_GATE_MAIN_BRANCH:-main} in $_searched shows branch '$_branch' landed — no commit SUBJECT there names $ident (attribution) and no MERGED PR has that head. Ancestry is NOT one of the ways in: a squash rewrites the sha, so a branch tip is never an ancestor of a squash-merged main. Land it (5dive push $ident), then task done."
+          # DIVE-2296: "not landed" is TRUE here and it is not ENOUGH. It is the same
+          # sentence whether no PR exists for this branch or one is open and mid-CI,
+          # and those want opposite responses (open one / wait). Look the open PR up
+          # and say which state this is — the lookup is here, on the refusing path,
+          # so nothing that closes pays for it.
+          local _open_slug="" _open_pr="" _open_probe="" _open_unread=""
+          while IFS= read -r _slug; do
+            [[ -n "$_slug" ]] || continue
+            _open_probe=$(_gate_branch_open_pr "$_slug" "$_branch" "$_ghtok")
+            # An UNREADABLE repo is carried, not discarded: a negative that skipped
+            # over a repo it could not ask is not a negative about that repo.
+            if [[ "$_open_probe" == "UNREADABLE" ]]; then
+              _open_unread="${_open_unread:+$_open_unread, }$_slug"; continue
+            fi
+            if [[ -n "$_open_probe" ]]; then _open_slug="$_slug"; _open_pr="$_open_probe"; break; fi
+          done < <(if [[ -n "$_task_slug" ]]; then printf '%s\n' "$_task_slug"; else _gate_repo_slugs; fi)
+          local _open_note=" No OPEN PR was found for '$_branch' in $_searched either, so the next step is to land it: \`5dive push $ident\`."
+          # Say UNKNOWN out loud. A blank where a PR would be reads as "checked, none"
+          # and sends the maker to open a duplicate of a PR that may well exist.
+          [[ -n "$_open_unread" ]] \
+            && _open_note=" Whether an OPEN PR exists for '$_branch' is UNKNOWN — the lookup could not be answered in $_open_unread (no rail, an invalid credential, or a timeout). That is NOT 'there is no PR': before opening one, check by hand (\`5dive gh pr list --head $_branch --repo <owner>/<repo>\`), and if there is genuinely none, land it with \`5dive push $ident\`."
+          if [[ -n "$_open_pr" ]]; then
+            local _open_num="${_open_pr%%|*}" _open_checks="${_open_pr##*|}" _checks_note=""
+            case "$_open_checks" in
+              OK)      _checks_note="its checks are GREEN, so it is waiting on a MERGE, not on you" ;;
+              FAILURE) _checks_note="its checks are RED — fix the PR; merging it is not the next step" ;;
+              NONE)    _checks_note="it reports NO checks yet — they may not have started" ;;
+              *)       _checks_note="its check status could not be read" ;;
+            esac
+            _open_note=" AN OPEN PR ALREADY EXISTS for this branch: ${_open_slug}#${_open_num}, and ${_checks_note}. DO NOT open a second one, and do not ask anyone to — this refusal means 'not merged yet', which is exactly what an open PR looks like. Watch it with \`5dive gh pr view ${_open_num} --repo ${_open_slug}\` (that read routes to the bot when you hold no credential of your own, DIVE-2296)."
+          fi
+          policy_refuse "$E_CONFLICT" done-before-branch-merged DIVE-1830 "$ident" "$ident cannot close: nothing on ${FIVE_GATE_MAIN_BRANCH:-main} in $_searched shows branch '$_branch' landed — no commit SUBJECT there names $ident (attribution) and no MERGED PR has that head. Ancestry is NOT one of the ways in: a squash rewrites the sha, so a branch tip is never an ancestor of a squash-merged main.$_open_note"
         else
           # DIVE-2217: this is the OTHER accepting arm. Keep its repo in a variable
           # named for the evidence that assigned it, just as _attr_slug is owned by
