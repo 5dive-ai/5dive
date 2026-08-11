@@ -1513,8 +1513,14 @@ _hb_ident() {
 # awake by this point, and a db hiccup must not abort the tick.
 _hb_claim_task() {
   local name="$1" id="$2" n=""
+  # DIVE-3251: first_started_at is stamped by the SAME COALESCE, because DIVE-2244
+  # moved the authoritative start to this function — a first-start record written
+  # only by `task start` would be NULL for the majority of rows, which is the
+  # blindness this column exists to remove. Seeded from started_at too, so a row
+  # already claimed when this ships keeps its real start.
   db "UPDATE tasks SET status='in_progress',
         started_at=COALESCE(started_at, datetime('now')),
+        first_started_at=COALESCE(first_started_at, started_at, datetime('now')),
         updated_at=datetime('now')
       WHERE id=${id} AND status='todo' AND kind='standard';" 2>/dev/null || return 1
   # Confirm from the ROW, not from the UPDATE's exit code — sqlite exits 0 on an
@@ -1552,10 +1558,48 @@ _hb_claim_task() {
 # Flip one in_progress task back to todo. Clears started_at so its age and the
 # per-task nudge counter both restart cleanly, and stamps updated_at. Best-effort
 # (a dead db or already-moved task is harmless). Logs why.
+#
+# DIVE-3251 — WHAT THIS CLEARS AND WHAT IT MUST NOT.
+# The started_at=NULL is DELIBERATE and stays: this function's whole job is to
+# hand the row back as a clean slate, and the age math below
+# (COALESCE(started_at, created_at)) plus the per-task nudge counter both key off
+# it. What was WRONG was that started_at was also the only board-visible evidence
+# that work had ever happened, so every reclaim silently converted "worked on for
+# 90 minutes" into "never started" — 58 rows fleet-wide, 16 of them still open,
+# and main could only defend a working seat by going and reading git.
+# `first_started_at` now carries that evidence and IS NOT IN THIS UPDATE. Do not
+# add it: the reset field and the evidence field are separate on purpose, and
+# putting them back together re-opens this defect.
+#
+# The reclaim also EMITS ITS OWN LEDGER EVENT. It could not be counted before:
+# the task.started emit above deliberately uses a constant per-task idem_key, so
+# a UNIQUE collision silently drops every re-claim and the ledger records the
+# FIRST claim only. That is the right trade there (a nudge loop must not be able
+# to write unbounded rows) but it left reclaim cycles invisible to any reader —
+# and `task start` writes no audit row either, so separating "the start never
+# wrote" from "it wrote and something cleared it" took a second store and a lot
+# of luck. This event carries a per-reclaim idem_key (kind|id|epoch) so cycles
+# ARE countable, and its detail records the started_at value being erased, which
+# is the fact the row itself is about to stop carrying.
 _hb_reclaim_to_todo() {
   local name="$1" id="$2" why="$3"
+  # Read the value BEFORE the UPDATE destroys it — the whole point is that the
+  # erased timestamp survives somewhere a reader can find it.
+  local prev_started
+  prev_started=$(db "SELECT COALESCE(started_at,'') FROM tasks WHERE id=${id};" 2>/dev/null) || prev_started=""
   db "UPDATE tasks SET status='todo', started_at=NULL, updated_at=datetime('now')
       WHERE id=${id} AND status='in_progress';" 2>/dev/null || true
+  # NANOSECONDS, not seconds. lifecycle_events has a UNIQUE index on idem_key and
+  # a collision is a SILENT no-op — exactly how task.started lost its re-claims.
+  # A second-granularity key is enough for the real cadence and NOT enough for a
+  # guarantee, and "enough in practice" is what makes a counter quietly wrong
+  # later. Caught by tests/task_first_started_at_unit.sh, whose two reclaims land
+  # in the same second.
+  local now_stamp; now_stamp=$(date -u +%s%N 2>/dev/null) || now_stamp=""
+  ledger_emit "task.reclaimed" ident="$(_hb_ident "$id")" task_id="$id" \
+    actor="$name" authority="dispatcher" \
+    idem="task.reclaimed|${id}|${now_stamp}" \
+    detail="reclaim -> todo (DIVE-3251); why=${why}; cleared started_at=${prev_started:-<empty>}" || true
   _hb_log "[$name] reclaimed $(_hb_ident "$id") -> todo ($why)"
 }
 

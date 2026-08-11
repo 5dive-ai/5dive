@@ -2008,7 +2008,11 @@ cmd_task_show() {
     # DIVE-2316: delivery_ref is an enforcement input, so omission here made a
     # missing binding indistinguishable from a presenter that never read it.
     # Keep the field present in both states; "absent" is the observable value.
-    dbfmt -line "SELECT ident, title, status, priority, assignee, created_by, parent_id, created_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, body, result FROM tasks WHERE id=${id};"
+    # DIVE-3251: first_started_at sits next to started_at because the whole point
+    # of the split is that a reader can tell "reclaimed after real work" from
+    # "never started" FROM THE BOARD ALONE. A fix that records the first start but
+    # does not surface it here does not satisfy that.
+    dbfmt -line "SELECT ident, title, status, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, body, result FROM tasks WHERE id=${id};"
     # DIVE-1064: surface the creator's isolation tier (read-time from the
     # registry, no schema change) so a reader/agent can down-trust a task filed
     # by a lower-privilege peer.
@@ -5668,6 +5672,20 @@ $_body"
   # handoff_ack is the verifier picking the review up, and that is `task.review`,
   # a third state distinct from both delivered and done. Conflating it with
   # either would put a claim in the ledger that the rail was built to refuse.
+  # DIVE-3251 (FINDING 2) — A STATUS VERB THAT LEAVES NO TRAIL CANNOT BE DEBUGGED
+  # AFTER THE FACT. `task start` wrote ZERO audit rows fleet-wide while demonstrably
+  # working, so when 58 rows turned up with an empty started_at there was no way from
+  # agent-audit.log to tell "the start never wrote, and the OK was a lie" from "it
+  # wrote and something cleared it later" — two hypotheses with very different
+  # severity. Settling it needed a second, independent store (lifecycle_events) and
+  # the luck that it happened to carry a task.started kind.
+  #
+  # Emitted from the ONE place all three verbs funnel through, for the same reason
+  # the ledger row below is: a fourth status verb added later cannot ship without
+  # its trail. New cmd names (`task start` / `task done` / `task cancel`), so no
+  # existing audit reader loses a row it was matching on.
+  _task_store_audit_log "task ${verb}" ok 0 -- "$ident" "status=$newstatus" \
+    "seat=$(id -un 2>/dev/null || printf '?')"
   local _lk="task.${newstatus}"
   [[ "$newstatus" == "in_progress" ]] && _lk="task.started"
   [[ -n "$handoff_ack" ]] && _lk="task.review"
@@ -5763,7 +5781,14 @@ _task_start_preflight() {
   return 0
 }
 
-cmd_task_start()  { _task_status_cmd in_progress ", started_at=COALESCE(started_at, datetime('now'))" start "$@"; }
+# DIVE-3251: two clocks, written by the same COALESCE and cleared by different
+# things. `started_at` is the CURRENT claim's clock, which the heartbeat reclaim
+# ladder is allowed to NULL so the age and the per-task nudge counter restart.
+# `first_started_at` is the durable record that work ever started, and NOTHING in
+# the nudge path may touch it. Seeded from started_at as well as now(), so a row
+# already in flight when this ships records its real start rather than the moment
+# of its next re-claim. See src/lib/tasks_db.sh for the full rationale.
+cmd_task_start()  { _task_status_cmd in_progress ", started_at=COALESCE(started_at, datetime('now')), first_started_at=COALESCE(first_started_at, started_at, datetime('now'))" start "$@"; }
 # DIVE-2477: COALESCE, not a bare stamp — FIRST close wins. These wrote
 # done_at=datetime('now') unconditionally, so any second close silently moved the
 # original close timestamp forward: measured on a fixture, a row closed at T then
