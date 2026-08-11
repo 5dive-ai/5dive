@@ -137,7 +137,13 @@ seed()     { db "DELETE FROM tasks WHERE ident='$1';
 statusof() { db "SELECT status FROM tasks WHERE ident='$1';"; }
 resultof() { db "SELECT COALESCE(result,'') FROM tasks WHERE ident='$1';"; }
 refusals() { db "SELECT COUNT(*) FROM policy_refusals WHERE ident='$1';"; }
-run_done() { OUT=$(cmd_task_done "$@" 2>&1); RC=$?; }
+# DIVE-2096: this harness grades the PROSE text-binding gate, which by definition
+# runs with NO `delivery_ref` and no `Branch:` line — now exactly the shape the
+# DIVE-2096 pre-close check refuses before this gate is reached. Asserting the
+# reports-on case (`--no-pr`) is what keeps these arms grading the same code as
+# before; it is inert on the arms that DO bind a delivery_ref, so it goes on the
+# wrapper rather than arm by arm.
+run_done() { OUT=$(cmd_task_done "$@" --no-pr 2>&1); RC=$?; }
 clear_fx() { unset "${!GH_STUB_PR_@}" "${!GH_STUB_PRLIST_@}" "${!GH_STUB_LIST_FAIL_@}" 2>/dev/null; }
 
 # --- 1. what DECLARES a repo, and what merely mentions one -------------------

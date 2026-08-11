@@ -101,6 +101,15 @@ decision to add one is ever wrong on its own merits. See
     `--no-cal-post` skips it. Across runs: `scripts/tier-cal-window.sh <reports…>`
     (normalises wall-clock to µs/harness first, or deleting a harness reads as
     anti-correlation).
+  - **A stale `# TIER:` header is a CROSS-JOB verdict, not a per-job exit** (DIVE-3163
+    → DIVE-3188). One box cannot separate a stale claim from a slow runner, so
+    `run-harnesses.sh` only warns. The verdict lives in `tier-cal-window.sh`: the same
+    named file `WRONG` on **>=2 distinct jobs** is a STALE CLAIM; one job is a stopwatch
+    disagreement. Identity is `harvest_run_id`/`harvest_job` (every GitHub job is its own
+    VM), never `--runner-id` — full-sweep passes none. `header-drift-window.yml` runs it
+    nightly and lands the verdict on an issue; it **never reds**, because `release-cut.yml`
+    refuses to cut on any red on main's tip. `--drift-strict` and `--drift-fatal=required`
+    exist for humans and no workflow may pass either (`tests/header_drift_window_unit.sh`).
   - `--no-calibrate` grades against the raw cap (useful with no built bundle). The
     clamp floor is 1.0, so that is the **strictest** this gate gets, never a
     relaxation. `--cal-us=` / `--cal-baseline-us=` / `--cal-cli=` are harness seams;

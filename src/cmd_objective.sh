@@ -836,7 +836,7 @@ _objective_file_gate() {
   anchor_id=$(db "SELECT id FROM tasks WHERE project_key=$(sqlq "$pkey") AND title=$(sqlq "$title") AND kind='standard' ORDER BY id LIMIT 1;")
   if [[ -z "$anchor_id" ]]; then
     local add_json
-    add_json=$(JSON_MODE=1 cmd_task_add --project="$pkey" --priority=high ${from:+--from="$from"} \
+    add_json=$(JSON_MODE=1 cmd_task_add --materialized --project="$pkey" --priority=high ${from:+--from="$from"} \
                  --body="$(printf 'Objective re-plan cycle %s for "%s".\nProposed diff — create:%s reprioritize:%s cancel:%s. Approve to apply the origination batch.\n\n--- objective diff json ---\n%s' \
                            "$cycle_no" "$oname" "$OBJ_N_CREATE" "$OBJ_N_REPRI" "$OBJ_N_CANCEL" "$diff")" \
                  -- "$title") || return $?

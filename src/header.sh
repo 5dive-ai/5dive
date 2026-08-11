@@ -620,9 +620,23 @@ declare -A TYPE_PERSONA_FILE=(
   [pi]=".pi/agent/AGENTS.md"
   # antigravity reuses Google's ~/.gemini parent (see the TYPE_BIN note).
   [antigravity]=".gemini/GEMINI.md"
-  # hermes and openclaw are DELIBERATELY UNMAPPED: neither has been probe-verified
-  # on a live seat, and a guessed path is exactly the silent no-op this ticket
-  # removes. Creating one with a role warns loudly and installs nothing.
+  # hermes: NOT ~/.hermes/AGENTS.md, which is the path everyone guesses (DIVE-2245
+  # said so itself). hermes' prompt_builder loads AGENTS.md / CLAUDE.md from the
+  # CWD ONLY — a home-level one is never read — while SOUL.md is the identity slot
+  # it reads from HERMES_HOME (~/.hermes) and always injects. Measured on a live
+  # seat: NOT TOLD -> "I am Quill, the Release Archivist". `hermes gateway install`
+  # PRESEEDS SOUL.md with the Nous default identity during create, so this is an
+  # occupied slot like codex's — persona_install_doc PREPENDS, and an overwrite
+  # would delete the harness's own default persona.
+  [hermes]=".hermes/SOUL.md"
+  # openclaw injects a fixed set of WORKSPACE files every session (AGENTS.md,
+  # SOUL.md, TOOLS.md, IDENTITY.md, USER.md); the workspace root is ~/.openclaw/
+  # workspace, NOT the agent's --workdir and NOT a pi-shaped path. AGENTS.md is
+  # the operating-instructions slot, which is where a role + reporting line
+  # belongs (SOUL.md is tone/boundaries). Measured on a live seat: NOT TOLD ->
+  # "my job title on this team is Ledger Steward". openclaw's first-run bootstrap
+  # writes all of these during create, so this is an occupied slot too.
+  [openclaw]=".openclaw/workspace/AGENTS.md"
 )
 
 # OpenCode reads provider API keys directly from standard environment variables.
@@ -718,6 +732,23 @@ declare -A OPENCLAW_PROVIDER_ID=(
   [moonshot]="moonshot"
   [openrouter]="openrouter"
   [nous]=""
+  # DIVE-3130: openclaw 2026.7.1-2's catalog enumerates NO zai models
+  # (`models list --provider zai --plain` → "No models found"; the GLM ids it
+  # carries sit under byteplus/, novita/, nvidia/, together/ and volcengine/).
+  # zai is KEPT rather than dropped, deliberately: an unenumerated namespace is a
+  # NO-ORACLE state, not a proof of unroutability (see
+  # community/wiki/a-byo-model-pin-can-only-be-graded-off-ci.md), and the
+  # DIVE-1826 coding-endpoint pin in OPENCLAW_PROVIDER_URL still applies. What
+  # changed is that a zai seat can no longer be created WITHOUT a model: with no
+  # OPENCLAW_PROVIDER_MODEL row, _apply_byo_openclaw now refuses unless the
+  # operator passes --model. Do not add a [zai] model row here until an id is
+  # graded against `models list --provider zai --plain` on the installed version.
+  # DIVE-3184 makes that NO-ORACLE reading provable rather than assumed: on the
+  # same version, `models list --provider notaprovider --plain` prints "No models
+  # found." at exit 0, BYTE-IDENTICAL (diff-clean) to what zai, qwen and
+  # huggingface return. The oracle is one-sided — a hit is authoritative, a miss
+  # says nothing — so those three stay listed. Do not read them as
+  # measured-unroutable and delete them.
   [zai]="zai"
   [minimax]="minimax"
   [qwen]="qwen"
@@ -781,11 +812,21 @@ declare -A HERMES_PROVIDER_MODEL=(
 )
 declare -A OPENCLAW_PROVIDER_MODEL=(
   # Grade a pin here with `openclaw models list --provider <native> --plain`,
-  # NEVER with `--all`: `--all` is a SUBSET that omits the openai/ and google/
-  # namespaces entirely, and reading that omission as "no oracle" is what left
-  # [openai] and [google] ungraded until DIVE-2631. The per-provider list is the
-  # same static catalog (byte-identical to --all on `anthropic`, and unchanged
-  # with the network cut, so it cannot flap).
+  # NEVER with `--all`: `--all` is a SUBSET that omits the openai/, google/ AND
+  # minimax/ namespaces entirely, and reading that omission as "no oracle" is
+  # what left [openai] and [google] ungraded until DIVE-2631 and [minimax]
+  # unpinned until DIVE-3184. The per-provider list is the same static catalog
+  # (byte-identical to --all on `anthropic`, and unchanged with the network cut,
+  # so it cannot flap).
+  #
+  # THAT LIST OF THREE IS NOT THE LIST OF OMISSIONS — it is the list of
+  # omissions anyone has MEASURED. Four namespaces have ever been checked both
+  # ways and three of the four were missing from --all (anthropic 9/9 diff-clean;
+  # openai 20/0; google 7/0; minimax 3/0). The other 16 namespaces --all reports,
+  # and any it hides that nobody has thought to ask about, are unmeasured in this
+  # direction — and you cannot use --all to discover what --all is hiding. So the
+  # rule takes no exceptions and needs no reasoning about which namespaces are
+  # safe: use --provider, every time. It costs the same (DIVE-3183).
   #
   # And do NOT settle one of these against a DIFFERENT tool's catalog: models.dev
   # — which hermes itself prefers at runtime — lists both the old openai/gpt-4o
@@ -805,11 +846,20 @@ declare -A OPENCLAW_PROVIDER_MODEL=(
   # Measured on openclaw 2026.7.1-2: openai carries no gpt-4 family at all (20
   # ids, starting at gpt-5.3), google carries only 2.5.x/3.x (7 ids), moonshot
   # only k2.6 / k2.7-code, deepseek only chat / reasoner (DIVE-2628, DIVE-2631).
+  # minimax carries 3 ids — MiniMax-M2.7, -M2.7-highspeed, M3 — graded on
+  # 2026.7.1-2 (0790d9f) with anthropic=9 as the non-vacuity control; M2.7 is the
+  # general-purpose one, so it is the pin rather than M3 (DIVE-3183/3184).
+  #
+  # zai, qwen and huggingface deliberately have NO row: their per-provider list
+  # is empty on this version, which is a NO-ORACLE state and not a licence to
+  # guess. They keep refusing at create until the operator passes --model
+  # (DIVE-3130); the wizard's model field for them is DIVE-3183, not this table.
   [openai]="openai/gpt-5.6"
   [anthropic]="anthropic/claude-sonnet-5"
   [google]="google/gemini-3.5-flash"
   [deepseek]="deepseek/deepseek-chat"
   [moonshot]="moonshot/kimi-k2.6"
+  [minimax]="minimax/MiniMax-M2.7"
   [openrouter]="openrouter/auto"
 )
 declare -A BYO_PROVIDER_LABEL=(

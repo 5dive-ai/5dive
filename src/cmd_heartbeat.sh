@@ -869,8 +869,17 @@ _hb_send_line() {
   # would write "continue" (or a whole task line) into the API-key field and
   # submit it. Worse than the reported path, because no human is watching a tick.
   # Same fail-closed predicate, one shared definition (cmd_agent_runtime.sh).
+  # DIVE-2159: name the REAL cause. The guard now also refuses when it could not
+  # read the pane at all, and logging that as "pane is a credential/login prompt"
+  # would assert a state nobody measured — the same could-not-measure-reads-as-
+  # measured shape the guard exists to stop. A tick is the one place with no human
+  # watching, so the log line is the whole record.
   _agent_pane_safe_to_type "$name" || {
-    _hb_log "skip send to ${name}: pane is a credential/login prompt, not a chat input (DIVE-2137)" 2>/dev/null || true
+    if [[ "${_AGENT_PANE_REFUSAL_REASON:-}" == "unreadable" ]]; then
+      _hb_log "skip send to ${name}: could not read the pane (tmux capture-pane failed after retries) — fail-closed, nothing typed (DIVE-2159)" 2>/dev/null || true
+    else
+      _hb_log "skip send to ${name}: pane is a credential/login prompt, not a chat input (DIVE-2137)" 2>/dev/null || true
+    fi
     return 1
   }
   sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" -l -- "$text" 2>/dev/null || return 1
@@ -2840,6 +2849,183 @@ _hb_loop_ceiling_sweep() {
   return 0
 }
 
+# ── DIVE-2794: the per-TASK token budget, made HARD ───────────────────────────
+#
+# WHY A THIRD GUARD, when two already exist. The other two cannot see the burn
+# lodar keeps raising:
+#   - the per-AGENT cost budget (guard 1) is rolling-24h across everything a
+#     seat does, and its hard stop is opt-in because killing a whole agent over
+#     one row is disproportionate;
+#   - the per-LOOP ceiling (guard 2) is already hard (DIVE-972 + OSS-24) but
+#     only sees work that IS a loop.
+# The measured worst rows were neither. DIVE-2814 was 27% of one fleet day and
+# had no loop; DIVE-3045 burned 19.1M in 24h on a LOW-priority row blocked on a
+# credential nobody was provisioning. A per-loop ceiling would have capped
+# neither. `task_budget` is the field that would have — and it was stored,
+# validated and DISPLAYED but never read by anything. This sweep reads it.
+#
+# WHY A NUMBER AND NOT BETTER JUDGEMENT. DIVE-2814 was reasoning toward a
+# customer box we are forbidden to SSH into, so it had no inspectable object and
+# therefore no natural stopping condition. It was unbounded BY CONSTRUCTION, not
+# by carelessness, and no amount of care caps an open-ended loop.
+#
+# WHY IT PARKS AND DOES NOT KILL. Park = blocked + parked_at + park_reason, the
+# same shape as `task park`, and the heartbeat work-picker (_hb_pick_tasks) only
+# dispatches status='todo' — so a parked row is STRUCTURALLY excluded from the
+# next round and the spend stops, while the work itself is intact and one
+# `task unpark` away. Same proportionality call as OSS-24: halt the ROW, never
+# the agent, which would take down that seat's unrelated work.
+#
+# WHY THE GATE IS TIER-1 AND NOT TIER-0. Decided by main 2026-08-10 after being
+# argued both ways, and the losing option is written down because it is the one
+# a future reader will want to re-pick. A tier-0 gate APPLIES its own
+# recommendation immediately: the row would write a note explaining why it is
+# continuing, and then continue. But a row with no natural stopping condition
+# will always self-grant — that is the definition of the failure being capped —
+# so tier-0 turns the cap into a speed bump with a receipt, which is the fourth
+# detection-shaped control on a board whose whole complaint is that every burn
+# control we ship is detection. Tier-1 is lead-clearable, so it is still never a
+# human tap in lodar's DM. The tier is a PREF (`task_budget_gate_tier`), so
+# dropping to tier-0 is a settings change and not a code change.
+#
+# THE ASK CARRIES THE FACTS THAT DECIDE IT. A gate reading "DIVE-XXXX hit 5M,
+# continue?" is unanswerable and becomes a rubber stamp inside a day; one
+# reading "5M on a LOW row, running 19h" answers itself. So priority, age and
+# the real spend ride in the ask.
+#
+# THE INCIDENT CARVE-OUT, stated explicitly because discovering it at 3am on a
+# box that is down is the failure that gets this whole thing reverted:
+# **there is no implicit exemption, and that is deliberate.** `--customer` was
+# the obvious candidate and CANNOT be used: it is an add-time classifier bypass
+# that is never persisted (no column), so nothing at sweep time can read it.
+# Priority was rejected too — making `urgent` exempt just moves every runaway
+# row to urgent. The escape is explicit and per-row: `--task-budget=none`,
+# settable mid-incident on an existing row with `task set-budget <id> none`,
+# which is the part that makes it usable at 3am rather than only at filing time.
+# The fleet-wide kill switch is `task_budget_enforce=off`.
+#
+# THE ASK IS ALSO READ BY A KEYWORD CLASSIFIER, AND THAT DECIDES ITS WORDING.
+# Found by arm one firing correctly: the FIRST live trip (DIVE-2057, 2026-08-10,
+# ~40 min after the tag) parked and gated exactly as designed, and then landed in
+# the paired human's DM at tier 2. The tier defaulted to 1 correctly; the T2
+# CATEGORY FLOOR overrode it, because the ask said "tokens" and `token` is on
+# `_GATE_T2_FLOOR_RX` — it almost always means an API credential, and here it is a
+# unit of measure. The classifier cannot tell those apart, so EVERY budget trip
+# was being classified as a secrets gate and routed to a person. That is precisely
+# the outcome this arm was designed against: a budget guard that pages a human on
+# every trip converts a burn problem into a gate-spam problem and is switched off
+# inside a week.
+#
+# Two things therefore ride on the ask's WORDING, and both are load-bearing:
+#
+#   1. THE UNIT. `_hb_tok_scale` emits "21.0M" / "60k" — identical information to
+#      a human, and nothing at all to the credential classifier. Do NOT "improve"
+#      this back to a bare token count with the word `tokens`; the exact figures
+#      are preserved in `park_reason`, which no classifier reads.
+#   2. THE TITLE IS NOT QUOTED IN. DIVE-2224 answer A made the floor's subject the
+#      ASK, precisely so a ticket's DESCRIPTION could not be read as a REQUEST.
+#      Quoting `"${title}"` into the ask silently undid that here: a routine budget
+#      trip on a row titled "delete the stale rows" floored on `delete`. Measured —
+#      with the unit fixed but the title still quoted, the floor still fires.
+#
+# NOT fixed by widening `_GATE_T2_FLOOR_RX`: `token` belongs on that list for every
+# other gate, and weakening a safety control to unblock the thing it flags is the
+# DIVE-3175 anti-pattern. Reworded at source instead, so the gate is never
+# mis-filed rather than corrected afterwards (`--discusses`, DIVE-2089, is the
+# sanctioned appeal but only fires once the floor already has — file at 2, appeal
+# down; never reaching the human at all is better).
+#
+# A COMMENT IS NOT THE GUARD. tests/task_budget_enforce_unit.sh runs the real
+# `_gate_tier2_floor_hit` over the ask this sweep actually emits, with a
+# floor-word row title as the non-vacuous arm, so restoring either mistake goes
+# red instead of silently restoring the page-the-human behaviour.
+_TASK_BUDGET_BUILTIN=5000000
+# Token count -> a short human scale that carries no floor term. Rounds to one
+# decimal at M, to the nearest k below that, and leaves counts under 1000 bare.
+_hb_tok_scale() {
+  local n="${1:-0}"
+  [[ "$n" =~ ^[0-9]+$ ]] || { printf '%s' "$n"; return 0; }
+  if (( n >= 1000000 )); then
+    local t=$(( (n + 50000) / 100000 ))
+    printf '%d.%dM' $(( t / 10 )) $(( t % 10 ))
+  elif (( n >= 1000 )); then
+    printf '%dk' $(( (n + 500) / 1000 ))
+  else
+    printf '%d' "$n"
+  fi
+}
+_hb_task_budget_sweep() {
+  local enforce dflt tier
+  enforce=$(db "SELECT value FROM task_prefs WHERE key='task_budget_enforce';" 2>/dev/null || echo "")
+  [[ "${enforce:-on}" == "off" ]] && return 0
+  dflt=$(db "SELECT value FROM task_prefs WHERE key='task_budget_default';" 2>/dev/null || echo "")
+  [[ "$dflt" =~ ^[1-9][0-9]*$ ]] || dflt="$_TASK_BUDGET_BUILTIN"
+  tier=$(db "SELECT value FROM task_prefs WHERE key='task_budget_gate_tier';" 2>/dev/null || echo "")
+  [[ "$tier" =~ ^[0-2]$ ]] || tier=1
+
+  local row tid tident title prio budget started eff spent age
+  while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    IFS=$'\x1f' read -r tid tident title prio budget started <<<"$row"
+    [[ "$tid" =~ ^[0-9]+$ ]] || continue
+    # Effective budget. Three non-numeric cases are SKIPS, not zeroes:
+    #   'none'  -> the explicit per-row carve-out above
+    #   '$...'  -> the cost variant, which belongs to the per-agent cost guard;
+    #              silently reading it as tokens would compare dollars to tokens
+    #   ''      -> no budget set, so the fleet default applies (this is the
+    #              case that makes the guard exist at all)
+    case "$budget" in
+      none|NONE) continue ;;
+      \$*)       continue ;;
+      "")        eff="$dflt" ;;
+      *)         [[ "$budget" =~ ^[1-9][0-9]*$ ]] || continue; eff="$budget" ;;
+    esac
+    # DIVE-2304's rule, which this guard inherits by construction rather than by
+    # remembering: a spend that could not be READ is NOT-REACHED, never 0. A
+    # failed read here must never park a row — parking on an unreadable number
+    # is the same fail-open in the opposite direction, and it would halt live
+    # work over a transient python error.
+    spent=$(_spend_scan_task_ids "[${tid}]" 0 2>/dev/null) || {
+      _hb_log "[task-budget] ${tident} spend NOT-REACHED — budget NOT verified this tick (row untouched)"
+      continue
+    }
+    [[ "$spent" =~ ^[0-9]+$ ]] || {
+      _hb_log "[task-budget] ${tident} spend NOT-REACHED (non-numeric '${spent}') — budget NOT verified this tick"
+      continue
+    }
+    (( spent >= eff )) || continue
+
+    age=$(db "SELECT CAST((julianday('now')-julianday($(sqlq "$started")))*24 AS INT);" 2>/dev/null || echo "")
+    local _park_pred="id=${tid} AND status IN ('todo','in_progress') AND parked_at IS NULL"
+    local _reason="hit its token budget (~${spent}/${eff} tok) — parked by the heartbeat before it could spend more"
+    db "BEGIN IMMEDIATE;
+        $(_gate_archive_and_clear_sql task-budget "$_park_pred")
+        UPDATE tasks
+          SET status='blocked', parked_at=datetime('now'),
+              park_reason=$(sqlq "$_reason"),
+              need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL, gate_mode=NULL
+        WHERE ${_park_pred};
+        COMMIT;"
+    # Trip rate from day one, so the tier-1-vs-tier-0 call is re-decided on a
+    # number instead of on irritation. If this counter climbs fast the pref is
+    # the answer, but only a measured rate can say so.
+    db "INSERT INTO task_prefs (key,value) VALUES ('task_budget_trips','1')
+        ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INT)+1 AS TEXT), updated_at=datetime('now');" 2>/dev/null || true
+    # The title rides in the operator LOG, which no classifier reads, rather than
+    # in the ask — see the wording note above.
+    _hb_log "[task-budget] ${tident} breached budget (~${spent}/${eff} tok, ${prio}, ~${age:-?}h) — parked + gated: ${title}"
+    # The gate goes on the row AFTER the park, because the park clears the gate
+    # columns and would otherwise wipe the gate it just filed.
+    ( cmd_task_need "$tid" --type=decision --tier="$tier" \
+        --options="park|continue" --recommend="park" \
+        --ask="${tident} is at ~$(_hb_tok_scale "$spent") of a $(_hb_tok_scale "$eff") budget on a ${prio}-priority row running ~${age:-?}h. It is parked. Continue with a raised budget, or leave it parked?" ) >/dev/null 2>&1 || true
+  done < <(db "SELECT id||x'1f'||COALESCE(ident,'')||x'1f'||COALESCE(REPLACE(title,x'1f',' '),'')||x'1f'||COALESCE(priority,'')||x'1f'||COALESCE(task_budget,'')||x'1f'||COALESCE(started_at,'')
+               FROM tasks
+               WHERE status IN ('todo','in_progress') AND kind='standard'
+                 AND parked_at IS NULL AND started_at IS NOT NULL;" 2>/dev/null)
+  return 0
+}
+
 # DIVE-1019: run the per-agent token-budget engine once per tick. Idempotent —
 # alerts/hard-stops are deduped inside cmd_usage_budget_check, which also
 # refreshes the state cache that `watch` reads. Capture stdout so its summary
@@ -3105,6 +3291,10 @@ cmd_heartbeat_tick() {
   # DIVE-972: enforce per-loop token ceilings for async (non --wait) loops. Same
   # isolation contract — a failure here must never abort the wake loop.
   _hb_loop_ceiling_sweep || _hb_log "[loop-ceiling] pass errored (non-fatal)"
+  # DIVE-2794: enforce per-TASK token budgets (default 5M). The loop ceiling
+  # above only sees work that IS a loop; the two worst measured rows were not.
+  # Same isolation contract — a failure here must never abort the wake loop.
+  _hb_task_budget_sweep || _hb_log "[task-budget] pass errored (non-fatal)"
   # DIVE-1019: per-agent token budget guardrails — alert the owner at the soft
   # cap and (only if hard-stop is opted in) turn an agent off at the ceiling, and
   # refresh the state cache `watch` reads. Same isolation contract as above.

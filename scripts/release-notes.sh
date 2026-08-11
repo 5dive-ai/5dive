@@ -103,11 +103,25 @@ _rn_group() {
         printf "### %s\n\n", title[k]
         for (i = 1; i <= n; i++) {
           if (cls[i] != k) continue
-          if (body[i] ~ /[^ \t\n]/) printf "\n#### %s\n\n%s", subj[i], body[i]
-          else                      printf "- %s\n", subj[i]
+          # DIVE-3205 SUPERSEDES DIVE-3170 HERE, deliberately. That rule kept an
+          # entry WITH prose as a `#### heading` plus its body so nothing was
+          # dropped — right for a reader auditing our own reasoning, wrong for the
+          # page it publishes to: v0.19.17 went out at 245 lines / 15.7 KB.
+          # lodar 2026-08-11: "we ship 5dive to other companies and other people —
+          # just list changes, dont write an essay." Every entry is a bullet now,
+          # prose or not. The prose is not lost: it is in CHANGELOG.md at the tag,
+          # and the footer below says so.
+          printf "- %s\n", subj[i]
         }
         printf "\n"
       }
+      # Superseding a no-drop rule obliges us to say where the content went, or
+      # the shortening is exactly the silent one this file exists to prevent.
+      # GUARDED ON n: an unconditional footer makes EVERY range look like it has
+      # content, which silently defeats the DIVE-2452 refusal to publish an
+      # underivable body and starves the commit-subject fallback. Caught by
+      # tests/release_notes_unit.sh, which is the whole reason that guard has arms.
+      if (n > 0) printf "Full detail for every entry is in CHANGELOG.md at this tag.\n"
     }
   '
 }

@@ -139,6 +139,34 @@ out=$( ( cmd_gh --as=nobody pr view 1 ) 2>&1 )
   && ok_t "--as rejects an unknown identity" \
   || bad_t "--as rejects an unknown identity" "$out"
 
+# Child status is a first-class outcome. gh documents rc=8 for pending checks;
+# it must stay distinguishable from rc=1, where checks completed with a real
+# failure. The negative arm keeps this from passing under a blanket mute.
+_gh_caller_credential() { return 0; }
+gh() {
+  if [[ "${1:-}" == "pr" && "${2:-}" == "checks" && "${3:-}" == "123" ]]; then
+    printf 'pending-row-from-gh\n' >&2
+    return 8
+  fi
+  printf 'genuine-gh-failure\n' >&2
+  return 1
+}
+rc=0; out=$( ( _gh_child_exit 8 pr checks 123 ) 2>&1 ) || rc=$?
+[[ $rc -eq 8 && "$out" == *"checks are still pending"* ]] \
+  && ok_t "pending classifier itself preserves rc=8" \
+  || bad_t "pending classifier must not launder rc=8 into success" "rc=$rc out=[$out]"
+rc=0; out=$( ( cmd_gh --as=caller pr checks 123 ) 2>&1 ) || rc=$?
+[[ $rc -eq 8 && "$out" == *"pending-row-from-gh"* && "$out" == *"checks are still pending"* \
+   && "$out" != *"without reporting a reason"* && "$out" != *"5dive bug"* ]] \
+  && ok_t "pending gh checks stay rc=8 and report a state, never a 5dive bug" \
+  || bad_t "pending gh checks must be a first-class state" "rc=$rc out=[$out]"
+rc=0; out=$( ( cmd_gh --as=caller pr view 123 ) 2>&1 ) || rc=$?
+[[ $rc -eq 1 && "$out" == *"genuine-gh-failure"* && "$out" == *"gh exited 1"* \
+   && "$out" != *"checks are still pending"* && "$out" != *"without reporting a reason"* ]] \
+  && ok_t "a genuine gh failure stays loud and distinct from pending" \
+  || bad_t "a genuine gh failure must not be muted or called pending" "rc=$rc out=[$out]"
+unset -f gh
+
 # --- _gh_do: root-only, and it re-derives the class rather than trusting the
 # caller. The refusal has to survive a caller that routes an admin call anyway.
 out=$( ( cmd_gh_do ) 2>&1 )
@@ -148,6 +176,42 @@ out=$( ( cmd_gh_do ) 2>&1 )
 grep -q '_gh_route_class "${args\[@\]}"' "$SRC/cmd_gh.sh" \
   && ok_t "_gh_do re-derives the routing class as root (never trusts the caller)" \
   || bad_t "_gh_do re-derives the routing class as root" "no authoritative re-derivation in cmd_gh.sh"
+
+# Exercise the root helper without root, a connector, network, or gh. A copied
+# source file redirects the readonly connector path to a fixture; id/gh are
+# process-local stubs. Crucially the helper gets its own EXIT backstop, which is
+# where the false bug report arose before the parent could classify rc=8.
+probe_gh_do() { # <child-rc> <child-stderr>
+  local child_rc="$1" child_line="$2"
+  local bot_env="$TMP/github-bot.env" cmd_copy="$TMP/cmd-gh-probe.sh"
+  printf 'GH_BOT_TOKEN=fake-token\n' > "$bot_env"
+  sed "s#^readonly _GH_BOT_ENV=.*#readonly _GH_BOT_ENV=\"$bot_env\"#" \
+    "$SRC/cmd_gh.sh" > "$cmd_copy"
+  GH_DO_RC=0
+  GH_DO_OUT=$(GH_STUB_RC="$child_rc" GH_STUB_LINE="$child_line" \
+    SRC_ABS="$PWD/$SRC" CMD_GH_COPY="$cmd_copy" bash -c '
+      set -uo pipefail
+      . "$SRC_ABS/lib/error_codes.sh"
+      . "$SRC_ABS/lib/output.sh"
+      . "$CMD_GH_COPY"
+      CURRENT_VERB="_gh_do"; JSON_MODE=0
+      trap '\''rc=$?; _report_silent_exit "$rc"'\'' EXIT
+      id() { [[ "${1:-}" == "-u" ]] && { printf "0\\n"; return; }; command id "$@"; }
+      gh() { printf "%s\\n" "$GH_STUB_LINE" >&2; return "$GH_STUB_RC"; }
+      printf "pr\\0checks\\0123\\0" | cmd_gh_do
+    ' 2>&1) || GH_DO_RC=$?
+}
+
+probe_gh_do 8 pending-row-from-root-gh
+[[ $GH_DO_RC -eq 8 && "$GH_DO_OUT" == *"pending-row-from-root-gh"* \
+   && "$GH_DO_OUT" != *"without reporting a reason"* && "$GH_DO_OUT" != *"5dive bug"* ]] \
+  && ok_t "_gh_do preserves pending rc=8 without firing its own backstop" \
+  || bad_t "_gh_do pending path must not manufacture a CLI bug" "rc=$GH_DO_RC out=[$GH_DO_OUT]"
+probe_gh_do 1 genuine-failure-from-root-gh
+[[ $GH_DO_RC -eq 1 && "$GH_DO_OUT" == *"genuine-failure-from-root-gh"* \
+   && "$GH_DO_OUT" != *"without reporting a reason"* ]] \
+  && ok_t "_gh_do preserves a genuine rc=1 and its child error" \
+  || bad_t "_gh_do genuine failure must stay loud" "rc=$GH_DO_RC out=[$GH_DO_OUT]"
 
 # The credential invariant, checked as SHAPE because the live path needs a box:
 # argv travels on stdin (never the process table) and the token is only ever an

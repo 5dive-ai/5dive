@@ -19,6 +19,10 @@ _task_usage() {
   set-body <id> <text...>|--file=<path> [--append]   replace the body, or append to it
   set-title <id> <text...>                      overwrite the title (audited; refused once closed)
   set-branch <id> <branch>                      bind the row to a git branch
+  wip-cap-install [--relane=<lane>]             snapshot each lane's actionable count as its
+                                                frozen WIP ceiling (deliberate, once)
+  set-budget <id> <tokens|\$cost|none>           raise/lower the token budget, or 'none' to exempt
+                                                the row from the enforced ${_TASK_BUDGET_BUILTIN:-5000000}-token default
 
   start <id>                                    -> in_progress
   done <id> [--result=<text>|--result-file=<path>] [--no-graded-sha]
@@ -43,10 +47,14 @@ _task_usage() {
   need <id> --type=decision|secret|approval|manual|access --ask="..."|--ask-file=<path>
       [--options=A|B] [--recommend=<A>|--recommend-file=<path>] [--tier=0|1|2]
       [--needs=<capability>] [--discusses=<why>] [--rubber-stamp-ok="<why>"]
+      [--mode=approve-to-send|confirm-after-send]   --type=approval: is the action
+                                                    already DONE? (default: not yet)
       [--probe='<cmd>']                           --type=access: self-check the block
       [--secret-key=<ENV> --connector=<stem> | --out-of-band="<where>"]   (--type=secret needs one)
   need <id> --withdraw                          cancel a pending gate that is now moot
   answer <id> --value="..." [--proof=<token>] [--channel-proof=<chat> [--channel-msg=<id>]]
+      [--tap-uid=<tg user id> [--tap-username=<handle>] [--tap-msg=<message id>]]
+      [--relay-agent=<name>]     a button tap: WHO tapped, and whose bot carried it
   clear-recs --channel-proof=<chat_id> [--only=<id>]     apply pending recommendations
   inbox [--send [--channel-proof=<chat>]]       human-gated rows; --send DMs the owner
   coordinator [--json]                          the agent fronting the needs-you banner
@@ -189,6 +197,8 @@ cmd_task() {
     set-branch)      cmd_task_set_branch "$@" ;;
     set-body)        cmd_task_set_body "$@" ;;
     set-title)       cmd_task_set_title "$@" ;;
+    set-budget)      cmd_task_set_budget "$@" ;;
+    wip-cap-install) cmd_task_wip_cap_install "$@" ;;
     start)           cmd_task_start "$@" ;;
     done|close)      cmd_task_done "$@" ;;
     deliver)         cmd_task_deliver "$@" ;;
@@ -374,6 +384,86 @@ cmd_task_set_body() {
 # audited with the PRIOR title, because a retitle is exactly the edit that makes the
 # earlier discussion of a row unreadable if nobody can see what it used to say.
 # Refuses on a closed task, same guard as set-body: a closed row is frozen.
+# DIVE-2794 — set/raise/exempt a row's token budget AFTER it was filed.
+#
+# This verb is the difference between a usable carve-out and a theoretical one.
+# The enforced 5M default parks a row the heartbeat finds over budget, and the
+# incident case main flagged is a LIVE row at 3am that nobody filed with
+# `--task-budget=none` because nobody was thinking about budgets when the box
+# went down. Without a post-hoc setter the only escape is re-filing the row,
+# which loses its history mid-incident — so the exemption would exist only for
+# people who predicted they would need it. Unparking alone is NOT enough and is
+# the trap this closes: the sweep re-parks the row on the very next tick unless
+# the budget itself changed.
+# DIVE-2794 arm two — install the per-lane WIP caps. Deliberate, once, and the
+# ONLY thing that creates a cap: no cap is ever minted as a side effect of a
+# filing. Snapshots each lane's current actionable count as its frozen ceiling.
+#
+# Idempotent by default: a lane that already has a cap keeps it, because
+# re-snapshotting is exactly the "cap tracks the count" lock this arm exists to
+# avoid — running install twice must not ratchet anybody. --relane <lane> resets
+# one lane deliberately (a lead clear, the one sanctioned way a cap moves).
+cmd_task_wip_cap_install() {
+  tasks_db_init
+  local one=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --relane=*) one="${1#--relane=}" ;;
+      -*) fail "$E_USAGE" "unknown flag: $1 (usage: 5dive task wip-cap-install [--relane=<lane>])" ;;
+    esac
+    shift
+  done
+  local lane n installed=0 lines=""
+  while IFS= read -r lane; do
+    [[ -n "$lane" ]] || continue
+    [[ -z "$one" || "$lane" == "$one" ]] || continue
+    if [[ -z "$one" ]]; then
+      local have; have=$(db "SELECT value FROM task_prefs WHERE key=$(sqlq "wip_cap:$lane");" 2>/dev/null || echo "")
+      [[ "$have" =~ ^[0-9]+$ ]] && continue     # already installed: never re-snapshot
+    fi
+    n=$(_task_lane_actionable "$lane")
+    [[ "$n" =~ ^[0-9]+$ ]] || continue
+    # Floor of 1: a lane with no actionable rows would otherwise install cap 0,
+    # and `actionable >= cap` is then 0 >= 0 — a breach — so an EMPTY lane could
+    # never accept its first row and a brand-new agent would be frozen at birth.
+    (( n < 1 )) && n=1
+    db "INSERT INTO task_prefs (key,value) VALUES ($(sqlq "wip_cap:$lane"),$(sqlq "$n"))
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
+    installed=$((installed+1)); lines+="  ${lane}: ${n}"$'\n'
+  done < <(db "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL AND assignee!='' AND kind='standard';" 2>/dev/null)
+  ok "installed WIP caps for ${installed} lane(s)${lines:+
+$lines}" '{installed:$n}' --argjson n "${installed:-0}"
+}
+
+cmd_task_set_budget() {
+  tasks_db_init
+  local task="" val=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -*) fail "$E_USAGE" "unknown flag: $1" ;;
+      *)  if [[ -z "$task" ]]; then task="$1"; elif [[ -z "$val" ]]; then val="$1"; fi ;;
+    esac
+    shift
+  done
+  [[ -n "$task" && -n "$val" ]] \
+    || fail "$E_USAGE" "usage: 5dive task set-budget <id|DIVE-N> <tokens|\$cost|none>  (none = exempt this row from the enforced default)"
+  [[ "$val" =~ ^[1-9][0-9]*$ || "$val" =~ ^\$[0-9]+(\.[0-9]+)?$ || "$val" == "none" ]] \
+    || fail "$E_VALIDATION" "budget must be a token count (e.g. 50000), a dollar cost (e.g. \$1.50), or 'none'"
+  resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  local st; st=$(db "SELECT status FROM tasks WHERE id=${id};")
+  [[ "$st" != "done" && "$st" != "cancelled" ]] \
+    || fail "$E_VALIDATION" "$ident is already $st — a closed row spends nothing, so its budget is moot"
+  local prior; prior=$(db "SELECT COALESCE(task_budget,'(default)') FROM tasks WHERE id=${id};")
+  db "UPDATE tasks SET task_budget=$(sqlq "$val"), updated_at=datetime('now') WHERE id=${id};"
+  # Say the parked case out loud rather than leaving the caller to discover that
+  # raising a budget did not, by itself, restart anything.
+  local parked; parked=$(db "SELECT CASE WHEN parked_at IS NOT NULL THEN 1 ELSE 0 END FROM tasks WHERE id=${id};")
+  local hint=""
+  [[ "${parked:-0}" == "1" ]] && hint=" It is still PARKED — 5dive task unpark $ident to resume it."
+  ok "$ident budget ${prior} → ${val}.${hint}" '{ident:$i, budget:$b, parked:$p}' \
+     --arg i "$ident" --arg b "$val" --arg p "${parked:-0}"
+}
+
 cmd_task_set_title() {
   tasks_db_init
   local task=""
@@ -426,13 +516,36 @@ cmd_task_init() {
 # resolved live from the org chart — never a hardcoded agent:
 #   1. an agent explicitly tagged `--role=coordinator` (reuses the existing org
 #      role field; the disambiguator a multi-root org sets), when exactly one holds it
-#   2. else the lone org root (the single-CEO case — zero config)
-#   3. else empty — ambiguous (multi-root, none tagged) or empty org chart; we
+#   2. else the lone agent carrying the coordinator MARKER inside their role prose
+#      (DIVE-2041, below), when exactly one does
+#   3. else the lone org root (the single-CEO case — zero config)
+#   4. else empty — ambiguous (multi-root, none tagged) or empty org chart; we
 #      leave the task unassigned exactly as before rather than guess wrong.
 # Prints the coordinator name (or nothing). Safe on an empty/missing org table.
+#
+# DIVE-2041 — WHY TIER 2 EXISTS. `agents_org.role` does double duty: it is the
+# human prose the org chart and council roster RENDER ("AI CEO — conducts the
+# fleet (advisory)", "QA / testing") AND, at tier 1, an exact-match machine
+# sentinel. So the only way to tag a coordinator was to DESTROY that agent's
+# display text — which is exactly why DIVE-2031 was fixed by re-parenting an org
+# root instead (option B, `org set olivia --role=coordinator`, was rejected for
+# this reason). Tier 2 lets the marker live INSIDE the prose ("AI CEO — fleet
+# coordinator"), so tagging costs nothing. Space-anchored so "coordinator"
+# matches and "uncoordinated" does not, and uniqueness-checked like every other
+# resolver here: >1 holder is ambiguous and yields nothing rather than a guess.
+# Tier 1 is kept ahead of it so an exact tag still wins when prose elsewhere also
+# mentions the word. Measured on the live chart 2026-08-09: zero of 13 roles
+# contain the marker, so this tier adds no candidate today and the resolution
+# stays on the lone-root fallback — it widens what an operator CAN express, it
+# does not re-route anything already resolved.
 _task_resolve_coordinator() {
   if [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE role='coordinator';")" == "1" ]]; then
     db "SELECT name FROM agents_org WHERE role='coordinator' LIMIT 1;"
+    return
+  fi
+  local _marker="lower(' '||COALESCE(role,'')) LIKE '% coordinator%'"
+  if [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE ${_marker};")" == "1" ]]; then
+    db "SELECT name FROM agents_org WHERE ${_marker} LIMIT 1;"
     return
   fi
   if [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE reports_to IS NULL OR reports_to NOT IN (SELECT name FROM agents_org);")" == "1" ]]; then
@@ -628,6 +741,93 @@ _task_unparented_followup_advisory() {
 }
 
 # ---------------------------------------------------------------------------
+# ── DIVE-2794 arm two: the per-LANE WIP cap ──────────────────────────────────
+#
+# Tokens cap what one row may SPEND; this caps how many rows a lane may HOLD.
+# Same verb, same refusal path, same carve-out — one mechanism over two
+# resources, because two independent refusals on `task add` would disagree,
+# print different remedies, and teach the fleet that a failed add is noise.
+#
+# WHAT IS COUNTED: todo + in_progress only. Not blocked, not parked, not
+# recurring templates. The fleet holds 55 blocked rows right now; a cap that
+# counted them would be over on day one for every lane, with no satisfiable path
+# back under — the unsatisfiable-gate shape we have shipped once and had to
+# unwind. A blocked row consumes no attention, and attention is the resource.
+#
+# THE CAP IS FROZEN, NOT TRACKING. Initialised to the lane's own actionable count
+# the first time the lane is seen, then it never moves except by a lead clear.
+# A close lowers the COUNT, which is what creates headroom; it does NOT lower the
+# cap. The first spec said every close lowers the cap, and that is a lock rather
+# than a ratchet: after each close actionable == cap again, so the next add
+# refuses forever and the lane drains to zero and stops working (caught in review
+# before it was built). Frozen keeps every property that was actually wanted —
+# close-one-to-file-one, no lane can grow, nobody defends a magic N.
+_task_lane_actionable() {
+  db "SELECT COUNT(*) FROM tasks
+      WHERE assignee=$(sqlq "$1") AND kind='standard'
+        AND status IN ('todo','in_progress') AND parked_at IS NULL;" 2>/dev/null || echo ""
+}
+
+# _task_wip_cap <lane> — READ ONLY. A lane with no INSTALLED cap is not capped,
+# and the caller must treat a non-zero return as "no cap", never as zero.
+#
+# THE CAP IS INSTALLED, NEVER MINTED LAZILY, and the difference is the whole
+# defect CI found. The spec says "initialise each lane's cap to its own
+# actionable count AT INSTALL"; the first cut substituted "mint it the first time
+# anyone looks", which is not the same thing and is strictly worse. Minting on
+# first sight means the baseline is whatever the store happened to contain at
+# that instant — so every harness that points FIVEDIVE_PROD_TASKS_DB at its own
+# fixture (they do it deliberately, to exercise DIVE-2681) minted a cap from a
+# half-built fixture and then refused the rest of its own setup. DIVE-2681's
+# header already warns about exactly this: "a rig building a fixture is not a
+# filing decision". A title-based cap survives it because fixture titles rarely
+# classify; a COUNT-based cap cannot. Install is an explicit act
+# (`5dive task wip-cap-install`), so a store nobody installed against is a store
+# with no caps, which is the correct answer for every fixture and every fresh
+# board.
+_task_wip_cap() {
+  local key="wip_cap:$1" cur
+  cur=$(db "SELECT value FROM task_prefs WHERE key=$(sqlq "$key");" 2>/dev/null || echo "")
+  [[ "$cur" =~ ^[0-9]+$ ]] || return 1
+  # FLOOR OF 1, and this is the whole zero-lock defect rather than a rounding
+  # nicety. A lane with no actionable rows mints cap 0, and `actionable >= cap`
+  # is then 0 >= 0 — a breach — so an EMPTY lane could never accept its first
+  # row. A brand-new agent would be frozen from birth, and any lane that
+  # legitimately drained to empty would freeze permanently. That is the exact
+  # drain-to-zero failure this arm's frozen cap was designed to avoid, let back
+  # in through the INITIALISATION path instead of the update rule. Caught by CI
+  # (gate_evidence_form_unit / audit_task_store_fence_unit both start from an
+  # empty fixture lane), not by the arms I wrote — every one of those seeds rows
+  # first, so none of them could see it.
+  (( cur < 1 )) && cur=1
+  printf '%s' "$cur"
+}
+
+# _task_lanes_with_headroom <exclude> — lanes strictly under their cap, for the
+# redirect. Naming them is the whole point: "this lane is full" is a dead end,
+# "this lane is full, dev2 and quinn have room" is a next action.
+_task_lanes_with_headroom() {
+  local skip="$1" lane cap act out=""
+  while IFS= read -r lane; do
+    [[ -n "$lane" && "$lane" != "$skip" ]] || continue
+    cap=$(_task_wip_cap "$lane") || continue
+    act=$(_task_lane_actionable "$lane")
+    [[ "$act" =~ ^[0-9]+$ ]] || continue
+    (( act < cap )) && out+="${out:+, }${lane} ($((cap - act)) free)"
+  done < <(db "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL AND assignee!='' AND kind='standard';" 2>/dev/null)
+  printf '%s' "$out"
+}
+
+# _task_lane_oldest <lane> <n> — the oldest actionable rows, so a refusal says
+# what is actually holding the lane rather than only that it is held.
+_task_lane_oldest() {
+  db "SELECT '  · '||COALESCE(ident,'?')||'  '||substr(COALESCE(title,''),1,60)
+      FROM tasks
+      WHERE assignee=$(sqlq "$1") AND kind='standard'
+        AND status IN ('todo','in_progress') AND parked_at IS NULL
+      ORDER BY COALESCE(created_at,'') ASC LIMIT ${2:-3};" 2>/dev/null || echo ""
+}
+
 # THE FILING CAP (DIVE-2681). Two controls over one classifier.
 #
 # The measured problem: across the 508 rows filed in the 8 days to 2026-08-02,
@@ -942,21 +1142,50 @@ _gate_withdraw_actor() {
 # Deterministic + explainable: a role/charter routes ONLY on an unambiguous
 # single match; >1 holder or unknown -> empty (never guess which one).
 #   @name / bare name  -> taken as-is (explicit override; never re-routed)
-#   role:<r>           -> the lone agents_org holder whose role == <r> (ci)
+#   role:<r>           -> the lone holder whose role/title CONTAINS <r> (ci, DIVE-2041)
 #   charter:<kw>       -> the lone holder whose title (charter) contains <kw> (ci)
 # Safe on an empty/missing org table (COUNT != 1 -> empty).
+#
+# DIVE-2041 — `role:<r>` WAS DEAD FOR EVERY AGENT ON EVERY CHART. It matched
+# `lower(role) = lower(<r>)`, full-string equality, against a column whose every
+# real value is human prose: "QA / testing", "Backend lane — OSS CLI, API, core
+# council/constitution engine", "AI CEO — conducts the fleet (advisory)". So
+# `role:QA` could not match quinn, and in practice NO role: token could match ANY
+# agent. Same shape as the DIVE-2031 banner outage it was found next to: the
+# lookup resolved to empty, the task simply landed unassigned, and an unassigned
+# task is indistinguishable from ordinary behaviour — so nobody ever reported it.
+#
+# The predicate is the one already used by `_task_resolve_deputy` ~450 lines
+# above: space-anchored substring over role||title, uniqueness-checked. Not a new
+# mechanism — the sibling `charter:` token below has always done the substring
+# thing correctly, against `title`. Exact equality is TRIED FIRST so a chart that
+# does use terse role values keeps its existing, sharper resolution; the
+# substring pass only runs when exact found no unique holder, so this can only
+# turn empties into matches, never re-point an already-working token.
+#
+# `%` and `_` in the token are ESCAPED: they are LIKE wildcards, and an assignee
+# token is caller input, so `role:%` would otherwise "match" whatever single row
+# happened to exist and route work by accident.
+_org_like_escape() { local s="${1//\\/\\\\}"; s="${s//%/\\%}"; printf '%s' "${s//_/\\_}"; }
+
 _org_resolve_assignee() {
   local v="${1#@}"
   case "$v" in
     role:*)
       local r="${v#role:}"
-      [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE role IS NOT NULL AND lower(role)=lower($(sqlq "$r"));" 2>/dev/null)" == "1" ]] || { printf ''; return; }
-      db "SELECT name FROM agents_org WHERE role IS NOT NULL AND lower(role)=lower($(sqlq "$r")) LIMIT 1;"
+      if [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE role IS NOT NULL AND lower(role)=lower($(sqlq "$r"));" 2>/dev/null)" == "1" ]]; then
+        db "SELECT name FROM agents_org WHERE role IS NOT NULL AND lower(role)=lower($(sqlq "$r")) LIMIT 1;"
+        return
+      fi
+      local _rp="lower(' '||COALESCE(role,'')||' '||COALESCE(title,'')) LIKE '% '||lower($(sqlq "$(_org_like_escape "$r")"))||'%' ESCAPE '\'"
+      [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE ${_rp};" 2>/dev/null)" == "1" ]] || { printf ''; return; }
+      db "SELECT name FROM agents_org WHERE ${_rp} LIMIT 1;"
       ;;
     charter:*)
       local kw="${v#charter:}"
-      [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE title IS NOT NULL AND lower(title) LIKE '%'||lower($(sqlq "$kw"))||'%';" 2>/dev/null)" == "1" ]] || { printf ''; return; }
-      db "SELECT name FROM agents_org WHERE title IS NOT NULL AND lower(title) LIKE '%'||lower($(sqlq "$kw"))||'%' LIMIT 1;"
+      local _cp="title IS NOT NULL AND lower(title) LIKE '%'||lower($(sqlq "$(_org_like_escape "$kw")"))||'%' ESCAPE '\'"
+      [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE ${_cp};" 2>/dev/null)" == "1" ]] || { printf ''; return; }
+      db "SELECT name FROM agents_org WHERE ${_cp} LIMIT 1;"
       ;;
     *)
       printf '%s' "$v"
@@ -972,7 +1201,7 @@ cmd_task_add() {
   tasks_db_init
   local body="" priority="medium" assignee="" parent="" from="" recurring="" fresh="" project="dive"
   local accept="" verify_cmd="" max_iters="" verifier="" task_budget="" no_verify="" branch=""
-  local customer_facing="" already_blocked=""
+  local customer_facing="" already_blocked="" materialized=""
   # DIVE-2627: which flag supplied each prose value (see _read_prose_file).
   local body_src="" accept_src=""
   local -a words=()
@@ -1016,6 +1245,10 @@ cmd_task_add() {
       # mandatory on the exception and is written into the body, because an
       # exception nobody can audit later is not an exception, it is an opt-out.
       --customer)          customer_facing="1" ;;
+      # DIVE-2794 arm two: set by the internal writers that turn one approved
+      # decision into N rows. Exempts the WIP cap only — never the DIVE-2681
+      # filing cap, which is about what a title IS, not how many there are.
+      --materialized)      materialized="1" ;;
       --already-blocked=*) already_blocked="${1#*=}" ;;
       # DIVE-824: per-run spend cap carried on the row (sibling to verify --timeout).
       # Value is either a bare token count or a "$cost" dollar figure.
@@ -1038,8 +1271,12 @@ cmd_task_add() {
   # DIVE-824: --task-budget is EITHER a bare token count ("50000") OR a dollar
   # cost ("$1.50" / "$2"). Reject anything else so a malformed cap can't silently
   # store as a no-op. Stored verbatim; the loop runner interprets the form.
-  [[ -z "$task_budget" || "$task_budget" =~ ^[1-9][0-9]*$ || "$task_budget" =~ ^\$[0-9]+(\.[0-9]+)?$ ]] \
-    || fail "$E_VALIDATION" "--task-budget must be a token count (e.g. 50000) or a dollar cost (e.g. \$1.50)"
+  # DIVE-2794 adds a fourth accepted value: the literal `none`, which is the
+  # ONLY exemption from the now-enforced 5M default. It is spelled rather than
+  # implied on purpose — see _hb_task_budget_sweep's header for why --customer
+  # and priority were both rejected as implicit carve-outs.
+  [[ -z "$task_budget" || "$task_budget" =~ ^[1-9][0-9]*$ || "$task_budget" =~ ^\$[0-9]+(\.[0-9]+)?$ || "$task_budget" == "none" ]] \
+    || fail "$E_VALIDATION" "--task-budget must be a token count (e.g. 50000), a dollar cost (e.g. \$1.50), or 'none' to exempt this row from the enforced default"
   # DIVE-1697: --branch seeds the delegated-push 'Branch: <name>' binding into the
   # body up front (same line set-branch writes/upserts later).
   if [[ -n "$branch" ]]; then
@@ -1193,6 +1430,73 @@ An internal-machinery finding gets its own ident ONLY if it has ALREADY blocked 
   · it already blocked something   →  --already-blocked='<what it blocked>'
   · the scan is wrong, this is a customer surface  →  --customer
   · fleet-wide override (emergencies)  →  FIVE_FILING_CAP=0"
+    fi
+  fi
+  # DIVE-2794 arm two: the WIP cap, checked here so it shares the DIVE-2681
+  # store-identity and refusal machinery rather than adding a second, disagreeing
+  # refusal to the same verb.
+  #
+  # EXEMPT: MATERIALIZATION, NOT FILING. Six internal writers reach this function
+  # (cmd_goal x2, cmd_loop, cmd_loop_pack, cmd_objective, cmd_proof). They turn
+  # ONE already-approved decision into N rows, so a cap firing halfway through
+  # leaves a HALF-MATERIALIZED plan — some children exist, some do not, and a
+  # loop driver is already waiting on a child list that is short. That is a
+  # silent, undesigned state, and strictly worse than an uncapped lane. They pass
+  # --materialized and are exempt; the rows they create still COUNT toward the
+  # lane, so the next HUMAN filing is the one that gets refused.
+  #
+  # PRIORITY. lodar ruled 2026-08-09 that only low and med get the hard refusal —
+  # "a quota that can block a SERIOUS finding will eventually eat one". That rule
+  # stands here verbatim. What it does not say, because nobody asked, is that a
+  # high/urgent row must be filed to the lane first named: so on a full lane those
+  # are REDIRECTED, never refused. The message names the lanes with headroom and
+  # `--assignee=<other>` succeeds immediately, so nothing is ever lost. And if
+  # EVERY lane is at cap the row lands anyway, uncapped, and trips the counter
+  # loudly — at that point the fleet is genuinely saturated and refusing a serious
+  # finding is the worse of the two failures. That branch existing is precisely
+  # what lets the rest of the rule be strict.
+  if [[ "$kind" == "standard" && -z "$materialized" && "$task_budget" != "none" \
+        && "${FIVE_WIP_CAP:-1}" != "0" && -n "$assignee" ]] && _task_filing_cap_store_is_prod; then
+    local _wcap _wact
+    _wcap=$(_task_wip_cap "$assignee") || _wcap=""
+    _wact=$(_task_lane_actionable "$assignee")
+    if [[ "$_wcap" =~ ^[0-9]+$ && "$_wact" =~ ^[0-9]+$ ]] && (( _wact >= _wcap )); then
+      # Counted on every trip, including the redirect and the saturated-fleet
+      # landing. If lanes hit the cap constantly that is a signal about INFLOW,
+      # and it is the number that says whether the frozen cap wants a scheduled
+      # decay after all — measured, rather than argued.
+      db "INSERT INTO task_prefs (key,value) VALUES ('wip_cap_trips','1')
+          ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INT)+1 AS TEXT), updated_at=datetime('now');" 2>/dev/null || true
+      local _oldest; _oldest=$(_task_lane_oldest "$assignee" 3)
+      if [[ "$priority" == "high" || "$priority" == "urgent" ]]; then
+        local _free; _free=$(_task_lanes_with_headroom "$assignee")
+        if [[ -n "$_free" ]]; then
+          # DISTINCT SLUG from the hard refusal below, and not a cosmetic choice:
+          # the slug is the key `task refusals` and the ledger group by, so one
+          # slug over both branches would make a REDIRECT (nothing lost, re-file
+          # elsewhere) indistinguishable from a REFUSAL (close something first)
+          # in exactly the data main needs to separate them in. Caught by
+          # tests/policy_refusals_unit.sh's duplicate-slug arm.
+          policy_refuse "$E_VALIDATION" wip-cap-lane-redirect DIVE-2794 "(unfiled) ${title}" \
+            "lane '${assignee}' is at its WIP cap (${_wact}/${_wcap} actionable). A ${priority} row is never refused — it is REDIRECTED, so re-file it to a lane with room:
+${_oldest}
+  lanes with headroom:  ${_free}
+  →  5dive task add \"${title}\" --priority=${priority} --assignee=<one of the above>
+Nothing is lost: this title is recorded in policy_refusals, and the re-file succeeds immediately."
+        else
+          # Saturated fleet: land it. Loudly.
+          warn "every lane is at its WIP cap — filing '${title}' to '${assignee}' anyway because a ${priority} row is never refused. The fleet is saturated (lane ${_wact}/${_wcap}); this is recorded in wip_cap_trips."
+        fi
+      else
+        policy_refuse "$E_VALIDATION" wip-cap-lane-full DIVE-2794 "(unfiled) ${title}" \
+          "lane '${assignee}' is at its WIP cap (${_wact}/${_wcap} actionable). Close something before adding to it — the cap is frozen, so closing a row is what makes room:
+${_oldest}
+  · file it elsewhere            →  --assignee=<other lane>
+  · it is serious                →  --priority=high (high/urgent are redirected, never refused)
+  · exempt this row deliberately →  --task-budget=none
+  · fleet-wide override          →  FIVE_WIP_CAP=0
+REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
+      fi
     fi
   fi
   # The exception is recorded ON THE ROW, not just consumed at the prompt. A cap
@@ -1400,7 +1704,7 @@ cmd_task_ls() {
     # regression test asserts against (tests/task_reject_trace_unit.sh, arm C).
     # NB: no inline SQL `--` comments in this string —
     # dbfmt flattens newlines, so a `--` would comment out the rest of the query.
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, tier, kind, schedule, last_fired_at, last_skipped_at, parked_at, park_reason, wake_at, project_key, maker_agent, verifier,
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, need_answered_relay, need_answered_tap_uid, tier, gate_mode, kind, schedule, last_fired_at, last_skipped_at, parked_at, park_reason, wake_at, project_key, maker_agent, verifier,
              CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
                   THEN CASE WHEN handoff_ack_at IS NOT NULL THEN 'reviewing' ELSE 'delivered' END
                   ELSE NULL END AS handoff_state,
@@ -1506,6 +1810,14 @@ cmd_task_show() {
     # blocks below so an ordinary task's `show` stays clean.
     local gate
     gate=$(db "SELECT 'type: '||need_type||
+                      -- DIVE-2354: the ORDER, on the type line, because it changes
+                      -- what the type MEANS. A gate whose mode is absent says so —
+                      -- NULL is 'filed before the column existed', not 'before the
+                      -- action', and printing a default here would invent the claim.
+                      CASE WHEN gate_mode='confirm-after-send'
+                           THEN '  mode: confirm-after-send (the action ALREADY HAPPENED — this asks for RATIFICATION, not prior approval)'
+                           WHEN gate_mode IS NOT NULL THEN '  mode: '||gate_mode
+                           ELSE '' END||
                       CASE WHEN tier IS NOT NULL THEN '  (tier '||tier||')' ELSE '' END||
                       CASE WHEN need_options IS NOT NULL THEN '  options: '||need_options ELSE '' END||
                       CASE WHEN recommend IS NOT NULL THEN x'0a'||'recommend: '||recommend ELSE '' END||
@@ -1522,8 +1834,17 @@ cmd_task_show() {
                            THEN x'0a'||'tier set by: '||floor_provenance ELSE '' END||x'0a'||
                       'ask:  '||COALESCE(ask,'')||
                       CASE WHEN need_answered_at IS NOT NULL
-                           THEN x'0a'||'answer: '||CASE WHEN need_type='secret' THEN '(provided — loaded out-of-band)' ELSE COALESCE(need_answer,'') END||'  ('||need_answered_at||')'
-                           ELSE x'0a'||'answer: — pending' END
+                           -- DIVE-2354: an answer on a confirm-after-send gate is a
+                           -- RATIFICATION and must not read as a prior approval. The
+                           -- stored value is unchanged (approved/denied); what the
+                           -- record gains is the order the tap came in.
+                           THEN x'0a'||'answer: '||CASE WHEN need_type='secret' THEN '(provided — loaded out-of-band)' ELSE COALESCE(need_answer,'') END||'  ('||need_answered_at||')'||
+                                CASE WHEN gate_mode='confirm-after-send'
+                                     THEN x'0a'||'        ↩︎ RATIFIED AFTER THE FACT — the action had already been taken when this was answered'
+                                     ELSE '' END
+                           ELSE x'0a'||'answer: — pending'||
+                                CASE WHEN gate_mode='confirm-after-send'
+                                     THEN ' (awaiting RATIFICATION of an action already taken)' ELSE '' END END
                FROM tasks WHERE id=${id} AND need_type IS NOT NULL;")
     [[ -n "$gate" ]] && { echo; echo "human gate:"; printf '%s\n' "$gate" | indent2; }
     # DIVE-476: loop spec (only when any field is set) — the declarative verify
@@ -1636,7 +1957,7 @@ cmd_task_gate_history() {
     # archive internally but are not reader payload. Secret answers are always
     # redacted on both output paths, matching the live gate in `task show`.
     rows=$(dbfmt -json "SELECT id, ident, need_type, ask, need_options, recommend, tier,
-          need_asked_at,
+          need_asked_at, gate_mode,
           CASE WHEN need_type='secret' AND need_answer IS NOT NULL
                THEN '(provided - redacted)' ELSE need_answer END AS need_answer,
           need_answered_at, need_answered_by, need_answered_uid,
@@ -1656,7 +1977,7 @@ cmd_task_gate_history() {
     *)        printf '%s previous gates: %s recorded — archive coverage is NOT measured\n' "$ident" "$count" ;;
   esac
   (( count > 0 )) || return 0
-  dbfmt -box "SELECT id AS seq, need_type AS type, COALESCE(tier,'-') AS tier,
+  dbfmt -box "SELECT id AS seq, need_type AS type, COALESCE(gate_mode,'-') AS mode, COALESCE(tier,'-') AS tier,
       COALESCE(need_asked_at,'-') AS asked_at, COALESCE(ask,'-') AS ask,
       COALESCE(need_options,'-') AS options, COALESCE(recommend,'-') AS recommend,
       CASE WHEN need_type='secret' AND need_answer IS NOT NULL
@@ -3407,6 +3728,7 @@ _task_status_cmd() {
   local newstatus="$1" extra="$2" verb="$3"; shift 3
   tasks_db_init
   local result="" want_result=0 notify=0 no_preflight=0 force_merge_gate=0 keep_wt=0 no_graded_sha=0
+  local no_pr=0                          # DIVE-2096: "this close REPORTS ON a PR, it delivers none"
   local append_result=0 force_result=0   # DIVE-2464
   # DIVE-1955 (review, Marcus): every reason the merge-gate could NOT reach an answer,
   # accumulated so the close can be stamped UNVERIFIED in the DURABLE RECORD. A stderr
@@ -3434,6 +3756,11 @@ _task_status_cmd() {
       --notify)       notify=1 ;;
       --no-preflight) no_preflight=1 ;;
       --force-merge-gate) force_merge_gate=1 ;;  # DIVE-1835: audited escape from the mandatory auto-detect gate
+      # DIVE-2096: the NAMED opt-out for DIVE-1965's reports-on category. Distinct
+      # from --force-merge-gate on purpose: that one overrides a gate that RAN and
+      # disagreed; this one ASSERTS a fact about the close ("no PR is mine to bind"),
+      # which is a claim the operator can be held to and the audit row records.
+      --no-pr)        no_pr=1 ;;
       # DIVE-2940: the declared escape from the graded-sha PRE-CLOSE refusal below.
       # Deliberately NOT folded into --force-merge-gate: that flag escapes a gate
       # that RAN and disagreed (a sha mismatch, a red merge), and this one escapes
@@ -3987,6 +4314,61 @@ _task_status_cmd() {
     _task_slug=$(_gate_task_repo_slug "$_dref" "$_body")
     if [[ -z "$_dref" ]]; then
       _branch=$(_push_branch_from_body "$_body")
+    fi
+    # -----------------------------------------------------------------------
+    # DIVE-2096 — THE ORDERING PRE-CHECK: cited-not-delivered, BEFORE the close.
+    #
+    # Two agents hit the identical wall from opposite sides inside ~2h on
+    # 2026-07-26 (olivia on DIVE-2064, main on DIVE-2080). That is a tool defect,
+    # not two operator slips. The DIVE-2414 disclosure below already MEASURES a
+    # cited PR's state and says so — but it says so in the same breath as the
+    # close, and `done` freezes the body. The diagnosis and the point of no
+    # return arrive together, so the only remedy the warning can name (bounce it
+    # back to the maker to fix the verifier's own metadata) is wildly
+    # disproportionate to the error. Nothing anywhere hints at the correct
+    # sequence — merge -> `task deliver --pr` -> `done` — until it is too late to
+    # act on it. This is that hint, moved to the moment it is still actionable.
+    #
+    # THE SHAPE IS ORDERING, NOT INFERENCE, and that boundary is load-bearing:
+    #   * DIVE-1965 (done) deliberately separates a PR the task DELIVERED from one
+    #     it merely REPORTS ON. Kept intact — this refuses, it does not reclassify.
+    #   * DIVE-1962 (CANCELLED) proposed INFERRING the binding from a PR number in
+    #     prose. It was cancelled because that OVERCLAIMS: an incidental number
+    #     stamps an unrelated close UNVERIFIED. So prose is the TRIGGER for the
+    #     prompt and NEVER the SOURCE of the binding. Nothing below reads the
+    #     number into `delivery_ref`; the operator does that, with `task deliver`,
+    #     and only they can say which of the named refs is theirs.
+    #
+    # FIRES ONLY WITH NO DECLARED BINDING AT ALL — neither `delivery_ref` nor a
+    # `Branch:` line. Both are structured, intentional declarations, and either
+    # one sends this close down the DIVE-1830 declared path where the delivery IS
+    # verified (PR state, or ancestry+attribution for a branch). Refusing there
+    # would add friction to the fleet's dominant delegated-push flow and buy no
+    # safety, so "the field is bound" leaves behaviour byte-identical.
+    #
+    # The trigger is `_gate_text_names_a_ref`, deliberately the BROAD predicate
+    # (bash-only, no grep, no subprocess): it answers "was a PR mentioned", not
+    # "which one". An over-match here costs one refusal that `--no-pr` answers in
+    # a keystroke; an under-match costs the whole ticket. The sharp extractor is
+    # used only to NAME numbers in the message, and it is allowed to come back
+    # empty — a refusal must never depend on a parser that may be unusable.
+    if [[ -z "$_dref" && -z "$_branch" ]] && _gate_text_names_a_ref "$result
+$_body"; then
+      local _cnd_refs=""
+      if _gate_pr_refs_engine_ok; then
+        _cnd_refs=$(_gate_pr_refs_qualified_from_text "$result
+$_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
+      fi
+      local _cnd_named="${_cnd_refs:+ (${_cnd_refs//,/, })}"
+      if [[ $no_pr -eq 1 ]]; then
+        # The assertion is recorded, not just honoured. `--no-pr` is a CLAIM about
+        # this close ("no pull request here is mine"), and an unrecorded claim is
+        # indistinguishable from a bypass when someone reads the row back.
+        warn "$ident: closing with --no-pr — the PR reference(s)${_cnd_named:- named in the result/body} are asserted to be REPORTED ON, not delivered by this task (DIVE-2096, audited)."
+        _task_store_audit_log "task.done-no-pr" ok 0 -- "$ident" "refs=${_cnd_refs:-unparsed}"
+      elif [[ $force_merge_gate -eq 0 ]]; then
+        policy_refuse "$E_CONFLICT" done-cited-not-delivered DIVE-2096 "$ident" "$ident cannot close YET: its result/body names a pull request${_cnd_named} but NOTHING BINDS one to this task — \`delivery_ref\` is empty and the body declares no \`Branch:\` line. A citation in prose is not a binding: only the field is (DIVE-1962 was CANCELLED for trying to infer one from prose). Closing now would leave the named PR's merge state UNCHECKED, and \`done\` freezes the body, so you would learn that only after it was unfixable (DIVE-2096). CORRECT ORDER: merge it, then \`5dive task deliver $ident --pr=<url>\`, then \`5dive task done $ident\`. If this close only REPORTS ON that PR and delivers no code of its own — a review, triage, audit or coordination close, DIVE-1965's category — say so and it proceeds: \`5dive task done $ident --no-pr\` (audited). \`--force-merge-gate\` also overrides."
+      fi
     fi
     # DIVE-2682 (implements the DIVE-2671 design call): a binding can OUTLIVE the
     # iteration it was made for. The gate below asks "did the bound PR land"; it
@@ -6471,7 +6853,10 @@ cmd_task_park() {
       UPDATE tasks
         SET status='blocked', parked_at=datetime('now'), park_reason=$(sqlq "$reason"),
             wake_at=${wake_sql},
-            need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL
+            need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL,
+            -- DIVE-2354: a parked row holds no gate, so it must not keep reporting
+            -- which ORDER that gate was in. The archive above copied it to history.
+            gate_mode=NULL
       WHERE id=${tid} AND status NOT IN ('done','cancelled');
       COMMIT;"
   # DIVE-2410: park clears the gate columns, so whatever button that gate put in a
@@ -7652,7 +8037,7 @@ _gate_tapback_stats() {
 
 cmd_task_need() {
   tasks_db_init
-  local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw="" discusses="" needs="" oob="" rubber_stamp=""
+  local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw="" discusses="" needs="" oob="" rubber_stamp="" gate_mode=""
   # DIVE-2627: which flag supplied each prose value (see _read_prose_file).
   local ask_src="" recommend_src=""
   local -a positional=()
@@ -7705,6 +8090,10 @@ cmd_task_need() {
       # never inferred, and written to the gate row — an escape that leaves no
       # record is `--tier=2` with extra steps, which is the thing being fixed.
       --rubber-stamp-ok=*) rubber_stamp="${1#*=}" ;;
+      # DIVE-2354: WHICH ORDER this gate is in. Declared, never inferred — the
+      # filer is the only party who knows whether the action has already happened,
+      # and inferring it from timestamps would be a guess presented as a record.
+      --mode=*)      gate_mode="${1#*=}" ;;
       --)          shift; positional+=("$@"); break ;;
       -*)          fail "$E_USAGE" "unknown flag: $1" ;;
       *)           positional+=("$1") ;;
@@ -7820,6 +8209,9 @@ cmd_task_need() {
         $(_gate_archive_and_clear_sql withdraw "id=${id}")
         UPDATE tasks
           SET need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL,
+              -- DIVE-2354: same reason as the park path — a withdrawn gate has no
+              -- order to report, and the archive row above already carries it.
+              gate_mode=NULL,
               secret_key=NULL, connector=NULL, secret_oob=NULL, ask_shape=NULL,
               precedent_ref=NULL, precedent_kind=NULL, routed_reviewer=NULL,
               needs_capability=NULL,
@@ -7874,6 +8266,51 @@ cmd_task_need() {
       || fail "$E_VALIDATION" "--rubber-stamp-ok only applies to --type=decision or --type=approval — those are the two types the keystroke cap governs. manual/secret/access default to tier 2 by TYPE and need no escape from it."
     [[ ${#rubber_stamp} -ge 12 ]] \
       || fail "$E_VALIDATION" "--rubber-stamp-ok must state WHY a person has to answer this despite your own --recommend (it is recorded on the gate and read by whoever counts these exceptions later)"
+  fi
+
+  # DIVE-2354 — THE TWO ORDERS A GATE CAN BE IN, as data on the row.
+  #
+  # THE DEFECT, measured on the first run of the DIVE-2348 customer-feedback loop:
+  # a gate worded "lodar approves the reply BEFORE it is sent" cannot be satisfied
+  # honestly once the send has already happened (emails 13:27/13:30, loop fired the
+  # drafting step 13:40). Answering it asserts a before-the-fact approval that did
+  # not occur; cancelling it erases the decision point AND, on that run, deleted
+  # marketing's escalation path for a genuinely unapproved second email; leaving it
+  # open reads as a bypassed human. Nobody bypassed anyone and the record said
+  # somebody had. It recurs by construction: these loops race a LIVE Telegram
+  # thread, so a loop materialised from the board is routinely behind the
+  # conversation. That is the normal case for anything customer-facing, not a
+  # timing accident.
+  #
+  # THE FIX IS A THIRD STATE, not a new verb. `confirm-after-send` records that the
+  # tap came AFTER the action — a RATIFICATION. It is not "approved" and must never
+  # render as it (same shape as unreadable-vs-absent, DIVE-2327, and NOT-REACHED-vs-
+  # pass, DIVE-2039). NULL is the third value: a gate filed before this shipped
+  # does not say which order it was, and inferring one for it would manufacture the
+  # very claim this ticket is about.
+  #
+  # WHAT THIS DOES NOT DO, deliberately: nothing here clears anything. The human tap
+  # stays mandatory in BOTH modes. `confirm-after-send` is `--type=approval` only —
+  # approval is human-class (root-gated in cmd_task_answer, excluded from precedent
+  # auto-clear by _gate_human_class), so restricting the mode to it makes
+  # "ratification requires a person" true BY CONSTRUCTION rather than by a rule
+  # someone has to keep. A `decision` that already happened re-files as an approval;
+  # that is the same direction [[standing-authorisation-is-per-thread-dive2353]]
+  # already prescribes for an answer that licenses something.
+  if [[ -n "$gate_mode" ]]; then
+    case "$gate_mode" in
+      approve-to-send|confirm-after-send) ;;
+      *) fail "$E_VALIDATION" "bad --mode '$gate_mode' (approve-to-send|confirm-after-send)" ;;
+    esac
+    [[ "$type" == "approval" ]] \
+      || fail "$E_VALIDATION" "--mode only applies to --type=approval — a $type gate has no before/after order to record. If the action already happened and you need it ratified, re-file it as --type=approval --mode=confirm-after-send (a ratification must be a human tap, and approval is the type that guarantees one)."
+    # A tier-0 gate APPLIES the filer's own --recommend with no ping. On a
+    # confirm-after-send that is auto-ratification of an action the filer already
+    # took — precisely the thing this ticket says it is NOT asking for. Refused
+    # here rather than relying on approval's tier-2 type default, so the guarantee
+    # does not depend on a default someone may later think is a formality.
+    [[ "$tier" == "0" && "$gate_mode" == "confirm-after-send" ]] \
+      && fail "$E_VALIDATION" "--tier=0 auto-applies your own recommendation, which on --mode=confirm-after-send would ratify an action you have already taken with no human involved. A ratification needs the tap; file it at the type default."
   fi
 
   # DIVE-1243: self-check for the manager-clearable `access` class. An access gate
@@ -8633,7 +9070,7 @@ cmd_task_need() {
         "tapbacks=${_rs_taps}/${_rs_tot}" "reason=tier-2 with a recommendation and no declared capability" || true
       fail "$E_VALIDATION" "$ident: refusing this --tier=2 ${type} gate. You wrote --recommend=\"${recommend}\", which means you have already decided — what is left is asking a person to agree, and that is reassurance, not a gate. (Measured 2026-07-16..08-07: 96 of 107 judgment gates carrying a recommendation came back as the human tapping that same value. Only 7 gates in 346 were floored by category; the rest of tier 2 was typed by hand.) A tier is a CAPABILITY, not a difficulty. Your exits:
   --tier=0    apply \"${recommend}\" NOW. No ping, and still a permanent gate record plus a digest line. This is the exit you want on a decision you have already made — it was used 0 times in the 346 gates measured, which is a discoverability failure, not a missing feature.
-  --tier=1    route to your lead, or to this task's verifier if it carries a loop; the 48h TTL applies your recommendation if nobody answers. Use it when you want a second pair of eyes, not a person's authority.
+  --tier=1    route to your lead, or to this task's verifier if it carries a loop — except a push-for-review ask, which goes to the LEAD even on a loop, because the verifier cannot read the diff until it is pushed (DIVE-3117); the 48h TTL applies your recommendation if nobody answers. Use it when you want a second pair of eyes, not a person's authority.
   --needs=human_tap|spend_authority|secret_provision    DECLARE the human-held capability this ask consumes (a person's call on brand/strategy, money, or a credential only a human can issue). Tier 2 by declaration, never refused here.
   --rubber-stamp-ok=\"<why a person must answer this despite your recommendation>\"    the audited exception. Recorded on the gate row and readable afterwards.
 If you cannot name the capability, this is a decision you find uncomfortable, not a human gate."
@@ -8748,6 +9185,10 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
             -- COUNTABLE afterwards — an escape that leaves no row is --tier=2 with
             -- extra steps, which is the thing this ticket exists to end.
             gate_rubber_stamp=$(sqlq_or_null "$rubber_stamp"),
+            -- DIVE-2354: the declared order (approve-to-send | confirm-after-send).
+            -- Written on the SAME statement as need_type, so a row can never hold a
+            -- mode belonging to a gate it no longer carries.
+            gate_mode=$(sqlq_or_null "$gate_mode"),
             tier=${tier}, need_asked_at=datetime('now'), gate_pinged_at=NULL,
             gate_filed_by=$(sqlq "$actor")
       WHERE id=${id};
@@ -8992,7 +9433,43 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
     tier=2; tier_floored=1
   fi
 
-  local _verifier_route=0 _route_target=""
+  # DIVE-3117: THE ONE GATE CLASS WHERE THE VERIFIER-ROUTE DEFAULT INVERTS ITSELF.
+  #
+  # A push-for-review ask asks for the branch to be pushed. On a maker→verifier row
+  # the DIVE-1495 route above hands that gate to the VERIFIER — i.e. it asks the
+  # grader to authorise the push that is the only way the grader can read the diff.
+  # quinn stated it exactly on DIVE-2183: cannot approve a push before reading the
+  # diff, cannot read the diff until it is pushed. Measured FOUR times on
+  # 2026-08-09/10 (DIVE-3113, DIVE-2130, DIVE-2183, DIVE-2192), every one blocking a
+  # real push, every one cleared by hand from the root seat.
+  #
+  # THE TEST AT THE KEYSTROKE: if this gate clears, does the answerer GAIN the thing
+  # they needed in order to answer it? If yes, it is a cycle. Route it to the lead —
+  # the one seat that can authorise the push and is not the party blocked by it. The
+  # verifier still grades the work afterwards; that is `task reject`/`accept`, a
+  # different surface, and it is untouched here.
+  #
+  # WHY THIS IS A FLOOR ON THE ROUTING AXIS AND NOT A ROUTER REWRITE (main's framing,
+  # and it is the sharper one). The TIER machinery is correct — DIVE-2629 already put
+  # a floor on the tier axis of this exact gate class (branch names stop forcing T2)
+  # and it produced tier 1 on all four instances. What was missing is the SIBLING
+  # floor, on routing: `floor_provenance=axis=none` on all four, i.e. nothing
+  # engaged. DIVE-2629 left routed_reviewer EMPTY (no agent can clear it); this left
+  # it equal to the GRADER (the one agent who cannot answer it). Same symptom, and a
+  # tier-axis fix cannot reach the second case — which is why 2629 shipping did not
+  # prevent four occurrences of 3117 in one day.
+  #
+  # THE ASK ONLY, never the title (DIVE-2224). A title is written at ticket-creation
+  # time to describe a DEFECT; only the ask can be a REQUEST. This very ticket is
+  # titled "push-for-review gate routes to the loop VERIFIER…", so a title-reading
+  # classifier would strip the verifier off every genuine question filed on it. The
+  # negative control is graded in tests/gate_verifier_route_unit.sh.
+  #
+  # `_gate_push_for_review_hit` fails closed and is the SAME predicate DIVE-2629's
+  # tier floor uses, so the two axes cannot disagree about what an inert push is: a
+  # push ask that also names a merge/deploy/land-to-main is NOT inert, keeps its
+  # existing routing, and keeps flooring on its subject matter.
+  local _verifier_route=0 _route_target="" _pfr_lead_route=0
   if [[ ( "$type" == "decision" || "$type" == "approval" ) && "$tier" != "2" ]]; then
     local _vf; _vf=$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${id};")
     if [[ -n "$_vf" && "$_vf" != "$actor" ]]; then
@@ -9003,9 +9480,92 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
             (SELECT COALESCE(maker_agent,'') FROM tasks WHERE id=${id}) <> ''
             OR EXISTS(SELECT 1 FROM agents_org WHERE name=$(sqlq "$_vf"))
           THEN 1 ELSE 0 END;")
-      [[ "$_vf_is_agent" == "1" ]] && { _verifier_route=1; _route_target="$_vf"; }
+      if [[ "$_vf_is_agent" == "1" ]]; then
+        if _gate_push_for_review_hit "$ask"; then
+          _pfr_lead_route=1
+        else
+          _verifier_route=1; _route_target="$_vf"
+        fi
+      fi
     fi
   fi
+
+  # DIVE-3171 — EVERY GATE THE ORG ROOT FILES REACHES THE HUMAN BY CONSTRUCTION.
+  #
+  # `_gate_route_reviewer` walks UP the chart — reports_to, then the coordinator/root —
+  # skipping any candidate equal to the filer. For the ROOT of the chart BOTH candidates
+  # are the filer, so the walk falls off the end empty and the gate drops to the human
+  # ping. Not intermittently, and not about any one gate's subject: it is every gate the
+  # root ever files. DIVE-2612 already wrote the shape down from the FILER's side (its
+  # warn text: "for the root of the chart the coordinator fallback resolves to
+  # themselves"); this is the routing half of the same fact, which that ticket described
+  # and did not fix. lodar, 2026-08-10, in the third week of it: "why still this goes to
+  # me????? i was complaining for 3 weeks already".
+  #
+  # WHAT MAKES IT INVISIBLE: for every other seat the same code is correct, and the root
+  # is the one seat that files engineering gates while sitting ABOVE the engineering lead.
+  #
+  # THE SAME PREDICATE ON BOTH SIDES OF THE SAME DECISION. DIVE-2099 gave a NAMED agent
+  # STANDING authority over tier-1 engineering approvals, and `_gate_lead_standing_eligible`
+  # already decides whether a given gate is in scope. So `cmd_task_answer` ALREADY knows
+  # this gate is lead-clearable while the router does not — and a gate a lead is ALLOWED
+  # to clear must not be DELIVERED to a human. The predicate is REUSED verbatim rather
+  # than restated: two copies of "is this lead-clearable" are two things that can
+  # disagree, and the dangerous direction of disagreement is the router handing an agent
+  # a gate the answer path will then refuse.
+  #
+  # SEALED SOURCE, NEVER THE CHART. The fallback holder is `_gate_standing_lead` — the
+  # agent named in the constitution, trusted only while the live bytes still match the
+  # digest sealed into the council lineage. `agents_org` is agent-writable on a
+  # NOPASSWD:ALL host, which is exactly why DIVE-2099/2233 anchored authority to the seal;
+  # resolving THIS fallback from the chart would hand back the self-grant path they closed
+  # (re-parent yourself above the root, receive the root's gates). Note the direction the
+  # widening runs: the standing lead can ALREADY clear these gates unrouted (the DIVE-2099
+  # branch ignores `routed_reviewer` entirely), so this moves who is PINGED and shown the
+  # gate, never who may answer it.
+  #
+  # NARROW, AND FAIL CLOSED THREE WAYS — the ticket's negative arm is "do NOT widen this
+  # to route ALL unrouteable gates to the lead":
+  #   1. only when the chart resolves NOBODY. A filer who has a lead keeps that lead, and
+  #      a `decision` the root files (agent-clearable by type already) is untouched.
+  #   2. only when `_gate_lead_standing_eligible` says yes — `approval`, tier exactly 1, a
+  #      POSITIVE engineering classification, minus the tier-2 floor and the deny list. A
+  #      money/secret/brand/customer-box/tier-2 gate filed by the root still reaches the
+  #      human. That is the arm that stops this becoming a way to launder a hard gate past
+  #      a person, and it is why the eligibility predicate is the whole condition rather
+  #      than a piece of it.
+  #   3. only when the seal resolves a plain name that is NOT the filer. Drifted, unsealed,
+  #      no `authority.eng_approval_lead` key, an empty value, no council loader in scope,
+  #      or the root IS the named lead -> nothing -> the gate falls through to the human
+  #      exactly as it does today. Fail closed, same direction as everything it reuses.
+  #
+  # The verifier route wins where it fired: that gate already has an agent routee, so this
+  # is not the "nobody" case.
+  #
+  # `_sr_unrouteable` / `_sr_outcome` exist so the DECLINING branch is countable too.
+  # The three weeks this ticket is about were invisible in the store: an unrouted gate
+  # simply pinged the human and left no row saying a route had been ATTEMPTED and refused.
+  # A fix that only records its successes leaves the next regression with nothing to count
+  # (DIVE-3117's lesson, and its suppression row is the model).
+  local _standing_route=0 _standing_target="" _sr_filer="" _sr_unrouteable=0 _sr_outcome=""
+  if [[ "$_verifier_route" != "1" ]] && declare -F _gate_standing_lead >/dev/null 2>&1; then
+    _sr_filer=$(task_actor "")   # DIVE-2518: the DERIVATION, never the `--from` claim — same line the reviewer resolution below takes, for the same reason (this decides who may later clear).
+    if [[ -n "$_sr_filer" && -z "$(_gate_route_reviewer "$_sr_filer")" ]]; then
+      _sr_unrouteable=1; _sr_outcome=not-standing-eligible
+      local _sr_title; _sr_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
+      # DIVE-2224: ask and title as SEPARATE arguments — pre-joining them lets a
+      # bounded-distance pattern straddle the seam and GRANT on a phantom hit.
+      if _gate_lead_standing_eligible "$type" "$tier" "$ask" "$_sr_title"; then
+        _sr_outcome=no-standing-lead
+        local _sr_lead; _sr_lead=$(_gate_standing_lead 2>/dev/null || printf '')
+        if [[ -n "$_sr_lead" && "$_sr_lead" == "$_sr_filer" ]]; then _sr_outcome=standing-lead-is-filer; fi
+        if [[ -n "$_sr_lead" && "$_sr_lead" != "$_sr_filer" ]]; then
+          _standing_route=1; _standing_target="$_sr_lead"; _sr_outcome=routed
+        fi
+      fi
+    fi
+  fi
+
   local _routable=0
   case "$type" in
     decision) [[ "$tier" != "2" ]] && _routable=1 ;;
@@ -9042,6 +9602,23 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
   [[ "$_discusses_applied" == "1" ]] && _routable=1
   # DIVE-1495: a verifier-route gate is routable by kind (to the verifier agent).
   [[ "$_verifier_route" == "1" ]] && _routable=1
+  # DIVE-3171: the standing-lead fallback is routable BY KIND, for the same reason
+  # eng-ship is — `gate_builder_routing` defaults to OFF, so routable-but-pref-gated
+  # would move the ROUTING byte and still ping the human, which is the entire thing the
+  # ticket is about. And the root filer cannot reach the eng-ship kind to inherit its
+  # bypass: that downgrade only fires when `_es_reviewer` is non-empty, i.e. when a chart
+  # lead sits above the filer, which is precisely what the root does not have.
+  [[ "$_standing_route" == "1" ]] && _routable=1
+  # DIVE-3117: there is deliberately NO `_pfr_lead_route && _routable=1` line here.
+  # Suppressing the verifier route is the WHOLE change: the gate then takes the
+  # SAME path a push-for-review gate on a row with no loop already takes (eng-ship
+  # by kind, or the pref), so the loop's existence stops being an input to routing
+  # rather than becoming a second input pointing the other way. That is what the
+  # ticket's negative arm asks for, and it is why a no-verifier row keeps its
+  # routing byte-for-byte. Adding a line here would give a looped row a route a
+  # non-looped one does not have — the eng-ship guards (a resolvable lead, no true-
+  # human floor) would be crossed only in the one case that happened to be measured.
+  # Graded both ways in tests/gate_verifier_route_unit.sh.
   # DIVE-1957: backstop — an EXPLICIT --tier=2 is the caller's hard-human contract
   # and no KIND-based override may cross it, so the DIVE-1145 promise ("we never
   # route a tier-2 gate, floored OR filed with an explicit --tier=2") holds by
@@ -9067,6 +9644,41 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
       "task=$ident" "type=$type" "declared=$needs" "filer=$actor" \
       "resolved=$( ((_needs_human)) && echo human || echo unchanged )" || true
   fi
+  # DIVE-3117: record the suppression AT THE MOMENT IT HAPPENS, with the verifier it
+  # would have gone to. The four measured instances were only findable because each
+  # left a row naming its routed_reviewer; a fix that silently stops writing that
+  # name leaves the next regression with nothing to count. `routed=` says where it
+  # went INSTEAD — which is the pre-existing lead/human path, not a new one, so an
+  # empty value here is the honest "no lead resolved, this fell through to the
+  # human" and is exactly the state the DIVE-2004 warn below is about to explain.
+  # DIVE-2054: task-store state for $ident, no channel proof — fenced.
+  if [[ "$_pfr_lead_route" == "1" ]]; then
+    # Split rather than `[[ … ]] && x=$(f)`: an assignment's rc is its last command
+    # substitution's, and _gate_route_reviewer returns non-zero when it resolves
+    # nobody — the DIVE-2751 shape, absorbed here instead of argued about.
+    local _pfr_dest=""
+    if [[ "$_routable" == "1" ]]; then _pfr_dest=$(_gate_route_reviewer "$(task_actor "")") || _pfr_dest=""; fi
+    _task_store_audit_log "task need push-for-review verifier-route suppressed" ok 0 -- \
+      "task=$ident" "type=$type" "filer=$actor" "verifier=${_vf-}" \
+      "routed=${_pfr_dest:-human}" || true
+  fi
+  # DIVE-3171: one row per gate whose filer the ORG CHART could not route — recorded
+  # AFTER the `tier_arg=2` / `_needs_human` backstops, so `routed=` is what actually
+  # happened and not what this branch proposed. `outcome=` says which conjunct decided:
+  # `routed` (the seal named a lead and it took the gate), `not-standing-eligible` (the
+  # tier-2 floor / deny list / non-engineering / wrong type — acceptance arm 2, the human
+  # keeps it), `no-standing-lead` (drift, unsealed, absent key — arm 3, fail closed), or
+  # `standing-lead-is-filer` (the root IS the named holder; routing to them would be the
+  # self-clear path). Without this the declining branches are indistinguishable from a
+  # build that never had this code.
+  # DIVE-2054: task-store state for $ident, no channel proof — fenced.
+  if [[ "$_sr_unrouteable" == "1" ]]; then
+    local _sr_routed=human
+    [[ "$_standing_route" == "1" && "$_routable" == "1" ]] && _sr_routed="$_standing_target"
+    _task_store_audit_log "task need org-root standing-route" ok 0 -- \
+      "task=$ident" "type=$type" "tier=$tier" "filer=$_sr_filer" \
+      "outcome=$_sr_outcome" "standing_lead=${_standing_target:-<none>}" "routed=$_sr_routed" || true
+  fi
   if [[ "$_routable" == "1" ]]; then
     # DIVE-1243: `access` routing is intrinsic to the TYPE, so it does NOT wait on
     # the gate_builder_routing pref (which ship-gates the decision/approval/manual
@@ -9078,7 +9690,7 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
     # pref for the same reason eng-ship does. Routable-but-pref-gated would have left
     # answer A moving the TIER while the human still got the ping -- two layers, and
     # only the second one decides who is woken.
-    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_curation" == "1" || "$_internal_ops" == "1" || "$_discusses_applied" == "1" || "$_verifier_route" == "1" || "$_floored_by_title" == "1" ]]; then
+    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_curation" == "1" || "$_internal_ops" == "1" || "$_discusses_applied" == "1" || "$_verifier_route" == "1" || "$_floored_by_title" == "1" || "$_standing_route" == "1" ]]; then
       # DIVE-1495: a verifier-route targets the task's verifier directly; every
       # other kind resolves the filer's lead via the org chart.
       local _reviewer
@@ -9089,13 +9701,31 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
       # Recording the claim and obeying it are different things, and this is the line
       # where they part. Graded by T23, which seeds two DIFFERENT leads so a claim
       # that won would route somewhere visible.
-      if [[ "$_verifier_route" == "1" ]]; then _reviewer="$_route_target"; else _reviewer=$(_gate_route_reviewer "$(task_actor "")"); fi
+      # DIVE-3171: the standing-lead fallback resolves from the SEAL, and only in the
+      # case the chart already answered "nobody" — so it can never re-point a gate the
+      # chart did route.
+      if [[ "$_verifier_route" == "1" ]]; then _reviewer="$_route_target"
+      elif [[ "$_standing_route" == "1" ]]; then _reviewer="$_standing_target"
+      else _reviewer=$(_gate_route_reviewer "$(task_actor "")"); fi
       if [[ -n "$_reviewer" ]]; then
         # Persist the designated reviewer on the row. For approval/manual this is
         # what authorizes agent-<_reviewer> to clear the gate later; for decision
         # it is provenance only (decision is already agent-clearable by type).
-        db "UPDATE tasks SET routed_reviewer=$(sqlq "$_reviewer") WHERE id=${id};"
+        # DIVE-3171: record WHY this reviewer, in the same statement that records WHO.
+        # `cmd_task_answer` reads this to decide whether the clear is stamped `lead:`
+        # or `lead:standing:`, and the two facts must not be able to arrive separately
+        # — a row naming a reviewer with no source is the state this column exists to
+        # abolish. NULL therefore means "a build before this one wrote the name", never
+        # "the route had no source". Sibling to floor_provenance on the tier axis.
+        local _route_prov=chart
+        [[ "$_verifier_route" == "1" ]] && _route_prov=verifier-loop
+        [[ "$_standing_route" == "1" ]] && _route_prov=seal:standing-lead
+        db "UPDATE tasks SET routed_reviewer=$(sqlq "$_reviewer"), route_provenance=$(sqlq "$_route_prov") WHERE id=${id};"
         local _rrole="lead review"; [[ "$_verifier_route" == "1" ]] && _rrole="verifier review"
+        # DIVE-3171: name the SEALED fallback distinctly. "lead review" would read as the
+        # org chart having resolved somebody, and the whole point of this branch is that
+        # it did not — the reader needs to know which source picked this reviewer.
+        [[ "$_standing_route" == "1" ]] && _rrole="standing lead review (org root: no chart lead above the filer)"
         # DIVE-2011: the handoff goes through the SAME delivery assertion as the
         # human ping (task_need_notify dispatches on TASK_GATE_ROUTE_TO), so a
         # routed gate can no longer exit without a delivery verdict or leave the
@@ -10585,12 +11215,19 @@ _task_gate_reply_markup() { # <row_id> <type> <options> <recommend> <nonce> <cha
         | if ($kb | length) > 0 then {inline_keyboard: $kb} else empty end' 2>/dev/null) || reply_markup=""
     elif [[ "$need_type" == "approval" ]]; then
       local rl; rl=$(printf '%s' "$recommend" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
-      local appr='{"text":"'"${label}"'✅ Approve","callback_data":"tna:'"${numid}"':approved'"${np}"'"}'
-      local deny='{"text":"'"${label}"'🚫 Deny","callback_data":"tna:'"${numid}"':denied'"${np}"'"}'
+      # DIVE-2354: on a confirm-after-send gate the button that says "Approve" is
+      # asking for a claim the human cannot truthfully make — the action is already
+      # out. Only the LABELS change; callback_data stays byte-identical
+      # (tna:<id>:approved|denied), so every shipped plugin handler is untouched.
+      local _bm; _bm=$(db "SELECT COALESCE(gate_mode,'') FROM tasks WHERE id=${numid};" 2>/dev/null || echo "")
+      local _yes="✅ Approve" _no="🚫 Deny"
+      if [[ "$_bm" == "confirm-after-send" ]]; then _yes="✅ Confirm (after the fact)"; _no="🚫 Not authorised"; fi
+      local appr='{"text":"'"${label}${_yes}"'","callback_data":"tna:'"${numid}"':approved'"${np}"'"}'
+      local deny='{"text":"'"${label}${_no}"'","callback_data":"tna:'"${numid}"':denied'"${np}"'"}'
       case "$rl" in
-        approve|approved) appr='{"text":"'"${label}"'⭐ ✅ Approve","callback_data":"tna:'"${numid}"':approved'"${np}"'"}'
+        approve|approved) appr='{"text":"'"${label}"'⭐ '"${_yes}"'","callback_data":"tna:'"${numid}"':approved'"${np}"'"}'
                           reply_markup='{"inline_keyboard":[['"$appr"','"$deny"']]}' ;;
-        deny|denied)      deny='{"text":"'"${label}"'⭐ 🚫 Deny","callback_data":"tna:'"${numid}"':denied'"${np}"'"}'
+        deny|denied)      deny='{"text":"'"${label}"'⭐ '"${_no}"'","callback_data":"tna:'"${numid}"':denied'"${np}"'"}'
                           reply_markup='{"inline_keyboard":[['"$deny"','"$appr"']]}' ;;
         *)                reply_markup='{"inline_keyboard":[['"$appr"','"$deny"']]}' ;;
       esac
@@ -10958,7 +11595,17 @@ _task_need_notify_deliver() {
   # DIVE-148: lead with the agent's recommendation (✅ Recommended: <X>) before
   # the ask, so the human sees the advised choice first instead of hunting for
   # it. Applies to decision + approval gates; NULL/empty recommend = no line.
+  # DIVE-2354: a ratification must not arrive looking like a prior approval — the
+  # chat message IS the record the human answers from. Read from the ROW, not from a
+  # parameter (DIVE-2090, same reason the secret branch below does): the batch
+  # re-send calls this with whatever it happens to be holding.
+  local _gmode
+  _gmode=$(db "SELECT COALESCE(gate_mode,'') FROM tasks WHERE id=${numid};" 2>/dev/null || echo "")
   local text="🙋 [${ident}] needs you"
+  if [[ "$_gmode" == "confirm-after-send" ]]; then
+    text="↩︎ [${ident}] needs you to CONFIRM AN ACTION ALREADY TAKEN"
+    text+=$'\n'"This is a RATIFICATION, not a prior approval — the action has already happened. Confirming records that you signed it off after the fact; denying records that you did not."
+  fi
   # DIVE-1927: when the ask was escalated off an unpaired filer, NAME the filer.
   # The recipient's bot is not the asker's bot, so without this the alert reads as
   # the manager's own gate and there is no way to tell whose ask it is.
@@ -11091,25 +11738,71 @@ cmd_task_inbox() {
   # human-gated and blocked-by another task): need set, not yet answered. We
   # still exclude TERMINAL statuses (done/cancelled) — a closed task waits on
   # no one, so a lingering unanswered gate must not leak into the human inbox.
-  local where="need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled')"
+  local open_where="need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled')"
+  # DIVE-3117 part 2: this view is "what is waiting on a HUMAN", and until now it
+  # listed every open gate. A gate with `routed_reviewer` set is waiting on an
+  # AGENT seat — the org lead, or a designated reviewer — and `task answer`'s
+  # designated-reviewer exception is what clears it. Listing it here put a question
+  # already addressed to someone else on lodar's plate, and it is exactly why the
+  # ROUTING fix (part 1) took not one gate off that plate: routing decides which
+  # agent is NAMED on a gate, this clause decides who is SHOWN it. Two independent
+  # defects, one symptom.
+  #
+  # THREE ESCAPES, each a class a human genuinely still owns:
+  #   * routed_reviewer empty — nothing was routed. The human's gate by default,
+  #     and also where an UNROUTABLE gate lands (no lead resolves, `--needs` a
+  #     human capability, a tier-2 filing that never routes at all).
+  #   * tier >= 2 — a hard gate: money, irreversible, a secret, a human tap. Note
+  #     DIVE-1437 clears routed_reviewer when a lead cannot answer one, so a
+  #     stalled hard gate comes BACK to this list rather than vanishing from it;
+  #     that escalation is the return path this filter relies on existing.
+  #   * needs_capability set — a declared human capability (DIVE-2241). Today that
+  #     already implies BOTH tier 2 and _routable=0, so this disjunct is redundant
+  #     by consequence. It is stated anyway because the floor making it true lives
+  #     ~2400 lines away in cmd_task_need, and if that floor ever moved the failure
+  #     mode would be a human losing sight of a human-capability gate, silently.
+  # An UNKNOWN tier reads as 2 and stays VISIBLE — the fail-safe direction here,
+  # since showing a human one gate too many is recoverable and hiding one is the
+  # defect being fixed. `NULLIF(tier,'')` and not `clear-recs`'s bare COALESCE:
+  # `tier` is INTEGER-affinity but nullable, and SQLite stores an empty string as
+  # TEXT '' rather than converting it, so COALESCE alone passes '' straight to
+  # CAST, which yields 0. Measured — the arm for this went red before the NULLIF.
+  # (clear-recs has the same gap with the opposite sign: there '' reads as tier 0
+  # and becomes ELIGIBLE for a blanket clear. Out of scope here, noted on the row.)
+  local human_where="${open_where}
+    AND ( COALESCE(routed_reviewer,'') = ''
+          OR CAST(COALESCE(NULLIF(tier,''),'2') AS INTEGER) >= 2
+          OR COALESCE(needs_capability,'') != '' )"
+  local where="$human_where"
   local order="ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, created_at"
   if (( send )); then
     _task_inbox_send "$channel_proof" "$where" "$order"
     return
   fi
   [[ -z "$channel_proof" ]] || fail "$E_USAGE" "--channel-proof only applies with --send"
+  # What the filter WITHHELD, counted rather than merely not-shown. Without this a
+  # newly-quiet inbox is indistinguishable from a fleet with no open gates — the
+  # same "an unnotified gate reads exactly like a notified one" shape this rail has
+  # been burned by before. It is a count and a pointer, never the asks themselves.
+  local routed_n; routed_n=$(db "SELECT COUNT(*) FROM tasks WHERE ${open_where} AND NOT ( COALESCE(routed_reviewer,'') = '' OR CAST(COALESCE(NULLIF(tier,''),'2') AS INTEGER) >= 2 OR COALESCE(needs_capability,'') != '' );")
+  routed_n="${routed_n:-0}"
   if (( JSON_MODE )); then
     local rows
     rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, need_type, ask, need_options, recommend, precedent_ref, need_answer, need_answered_at FROM tasks WHERE ${where} ${order};")
     [[ -n "$rows" ]] || rows="[]"
     # stdin, not --argjson — same ARG_MAX guard as `task ls`. (DIVE-222)
-    printf '%s' "$rows" | jq -c '{ok:true, data:{inbox:.}}'
+    # `routed_elsewhere` is additive under data{}; every existing consumer reads
+    # data.inbox and is unaffected.
+    printf '%s' "$rows" | jq -c --argjson r "$routed_n" '{ok:true, data:{inbox:., routed_elsewhere:$r}}'
   else
     local cnt; cnt=$(db "SELECT COUNT(*) FROM tasks WHERE ${where};")
     if [[ "$cnt" == "0" ]]; then
       echo "inbox empty — nothing waiting on a human."
     else
       dbfmt -box "SELECT ident, priority, need_type, COALESCE(assignee,'-') AS owner, COALESCE(recommend,'-') AS recommend, COALESCE((SELECT ident FROM tasks p WHERE p.id=tasks.precedent_ref),'-') AS precedent, ask FROM tasks WHERE ${where} ${order};"
+    fi
+    if (( routed_n > 0 )); then
+      echo "(${routed_n} more open gate(s) routed to an agent seat — not yours to answer: 5dive task ls --status=blocked)"
     fi
   fi
 }
@@ -11231,6 +11924,83 @@ _task_inbox_send() {
   fi
 }
 
+# DIVE-3191: THE CURRENT GATE IS NOT THE WHOLE RECORD.
+#
+# `gate-proof verify` read `tasks` only, and `tasks` holds exactly ONE gate per row.
+# The standard unblock for an unsigned lead clear is to RE-FILE the gate and have a
+# signer clear it — which retires the unsigned closure into `gate_history`. So the
+# workaround that unblocks the push also ERASES it from the tool you would audit
+# with: the row reads an unqualified green forever, with nothing saying a prior
+# clear existed. Measured on DIVE-3170/3136/3113/2808 (DIVE-3176), which is how a
+# proposed sweep would have reported the store healthy.
+#
+# No new store is needed. `gate_history` (lib/tasks_db.sh) already carries
+# need_answered_at / need_answered_by / need_answered_uid / need_answer_sig, and
+# `_gate_closure_verify` is keyed on the task id plus the closure FACTS — so an
+# archived signature re-verifies against the archived facts. A displaced closure
+# that WAS signed therefore reports `valid`, not merely `present`.
+#
+# Two boundaries this must respect, or it reintroduces the defect one level down:
+#   1. A zero count is only CLEAN where the archive covers the row's whole life.
+#      `gate_history_coverage` (DIVE-2133) is an evidence boundary, not a count —
+#      out of coverage, zero means UNKNOWN and the green stays qualified.
+#   2. A gate retired with NO answer (withdrawn / parked / loop-ceiling) is not a
+#      closure. Counting those would over-accuse, which is the mirror of the
+#      under-count this fixes:
+#      community/wiki/a-current-gate-only-read-undercounts-the-census-and-over-accuses-the-ships.md
+#
+# Sets for the caller: _GPH_VERDICT _GPH_ARCHIVED _GPH_CLOSED _GPH_UNSIGNED
+# _GPH_INVALID _GPH_VALID _GPH_STATE _GPH_BASIS _GPH_COVERAGE _GPH_TEXT _GPH_TRAILER
+_gate_proof_history_scan() {
+  local vid="$1"
+  IFS='|' read -r _GPH_ARCHIVED _GPH_COVERAGE _GPH_STATE _GPH_BASIS < <(_gate_history_facts "$vid")
+  _GPH_CLOSED=0; _GPH_UNSIGNED=0; _GPH_INVALID=0; _GPH_VALID=0; _GPH_TEXT=""; _GPH_TRAILER=""
+  local _row _seq _t _a _by _at _uid _sig _ret _retat _vfs _stat _lines=""
+  while IFS= read -r _row; do
+    [[ -n "$_row" ]] || continue
+    IFS=$'\x1f' read -r _seq _t _a _by _at _uid _sig _ret _retat <<<"$_row"
+    # Boundary 2: no answer => it was displaced, never closed. Not a closure.
+    [[ -n "$_at" ]] || continue
+    _GPH_CLOSED=$(( _GPH_CLOSED + 1 ))
+    # Mirror the live path exactly: a secret's answer is NOT in the signed payload.
+    _vfs=""; [[ "$_t" != "secret" ]] && _vfs="$_a"
+    if [[ -z "$_sig" ]]; then
+      _GPH_UNSIGNED=$(( _GPH_UNSIGNED + 1 )); _stat=UNSIGNED
+    elif _gate_closure_verify "$vid" "$_t" "$_vfs" "$_by" "$_at" "$_uid" "$_sig"; then
+      _GPH_VALID=$(( _GPH_VALID + 1 )); _stat=valid
+    else
+      _GPH_INVALID=$(( _GPH_INVALID + 1 )); _stat=INVALID
+    fi
+    _lines+="  #${_seq} ${_t} ${_stat} — answered ${_at} by ${_by:-—}, retired ${_retat} (${_ret})"$'\n'
+  done < <(db "SELECT id||x'1f'||COALESCE(need_type,'')||x'1f'||COALESCE(need_answer,'')||x'1f'||
+      COALESCE(need_answered_by,'')||x'1f'||COALESCE(need_answered_at,'')||x'1f'||
+      COALESCE(CAST(need_answered_uid AS TEXT),'')||x'1f'||COALESCE(need_answer_sig,'')||x'1f'||
+      COALESCE(retired_by,'')||x'1f'||COALESCE(retired_at,'')
+    FROM gate_history WHERE task_id=${vid} ORDER BY id;")
+  if   (( _GPH_UNSIGNED > 0 )); then _GPH_VERDICT="SUPERSEDED-UNSIGNED"
+  elif (( _GPH_INVALID  > 0 )); then _GPH_VERDICT="SUPERSEDED-INVALID"
+  elif [[ "$_GPH_STATE" == complete ]]; then _GPH_VERDICT="clean"
+  else _GPH_VERDICT="UNKNOWN"
+  fi
+  local _cov
+  case "$_GPH_STATE" in
+    complete) _cov="archive covers this row's whole life" ;;
+    partial)  _cov="archive coverage begins ${_GPH_COVERAGE} (${_GPH_BASIS}), so a zero here cannot mean clean" ;;
+    *)        _cov="archive coverage is NOT measured, so a zero here cannot mean clean" ;;
+  esac
+  case "$_GPH_VERDICT" in
+    clean)
+      _GPH_TEXT="history: clean — 0 superseded closures of ${_GPH_ARCHIVED} archived gate(s); ${_cov}"$'\n' ;;
+    UNKNOWN)
+      _GPH_TEXT="history: UNKNOWN — ${_GPH_CLOSED} superseded closure(s) of ${_GPH_ARCHIVED} archived gate(s), all signed and valid; ${_cov}"$'\n'"$_lines" ;;
+    *)
+      _GPH_TEXT="history: ${_GPH_VERDICT} — ${_GPH_CLOSED} superseded closure(s) of ${_GPH_ARCHIVED} archived gate(s): ${_GPH_UNSIGNED} UNSIGNED, ${_GPH_INVALID} INVALID, ${_GPH_VALID} valid; ${_cov}"$'\n'"$_lines" ;;
+  esac
+  if (( _GPH_UNSIGNED > 0 || _GPH_INVALID > 0 )); then
+    _GPH_TRAILER=" — but its ARCHIVE holds ${_GPH_CLOSED} superseded closure(s), ${_GPH_UNSIGNED} unsigned and ${_GPH_INVALID} invalid; read them with '5dive task gate-history'"
+  fi
+}
+
 # DIVE-519: `5dive gate-proof <id|DIVE-N> <approval|secret>` — root-only. Mints a
 # human-origin proof token (RAW on stdout, never a --json envelope) that the
 # trusted answer paths attach as --proof to clear an approval/secret gate: the
@@ -11272,7 +12042,11 @@ cmd_gate_proof() {
       FROM tasks WHERE id=${vid};")
     local _nt _na _nb _nat _nuid _nsig
     IFS=$'\x1f' read -r _nt _na _nb _nat _nuid _nsig <<<"$_row"
-    [[ -n "$_nt" && -n "$_nat" ]] || fail "$E_CONFLICT" "$vident has no answered gate to verify"
+    # DIVE-3191: read the ARCHIVE before the early exit, because the row with no
+    # current answered gate is the same defect one level down — "nothing to verify"
+    # is not "nothing ever happened here".
+    _gate_proof_history_scan "$vid"
+    [[ -n "$_nt" && -n "$_nat" ]] || fail "$E_CONFLICT" "$vident has no answered gate to verify${_GPH_TRAILER}"
     local _vfs=""; [[ "$_nt" != "secret" ]] && _vfs="$_na"
     local _signed=absent _valid=false
     if [[ -n "$_nsig" ]]; then
@@ -11281,15 +12055,27 @@ cmd_gate_proof() {
     fi
     # DIVE-2054: the nonce/signature being verified is itself TASKS_DB state for
     # $vident (not an independent real-world channel/identity fact) — fenced.
-    _task_store_audit_log "gate-proof verify" "$([[ "$_valid" == true ]] && echo ok || echo error)" 0 -- \
-      "task=$vident" "type=$_nt" "signed=$_signed" "valid=$_valid" "uid=${_nuid:-}" "by=${_nb:-}"
+    # DIVE-3191: the audit row carries the history verdict too, or the audit trail
+    # inherits exactly the blind spot this change exists to close.
+    _task_store_audit_log "gate-proof verify" "$([[ "$_valid" == true && "$_GPH_VERDICT" == clean ]] && echo ok || echo error)" 0 -- \
+      "task=$vident" "type=$_nt" "signed=$_signed" "valid=$_valid" "uid=${_nuid:-}" "by=${_nb:-}" \
+      "history=$_GPH_VERDICT" "superseded=$_GPH_CLOSED" "superseded_unsigned=$_GPH_UNSIGNED" \
+      "superseded_invalid=$_GPH_INVALID" "coverage=$_GPH_STATE"
     if (( JSON_MODE )); then
-      ok "gate-proof verify $vident: signed=$_signed valid=$_valid" \
-        '{ident:$i, signed:$s, valid:($v=="true"), uid:$u, by:$b}' \
-        --arg i "$vident" --arg s "$_signed" --arg v "$_valid" --arg u "${_nuid:-}" --arg b "${_nb:-}"
+      ok "gate-proof verify $vident: signed=$_signed valid=$_valid history=$_GPH_VERDICT" \
+        '{ident:$i, signed:$s, valid:($v=="true"), uid:$u, by:$b,
+          history:{verdict:$hv, superseded_closures:($hc|tonumber), unsigned:($hu|tonumber),
+                   invalid:($hi|tonumber), valid:($hg|tonumber), coverage_state:$hst,
+                   coverage_basis:$hbs,
+                   coverage_started_at:(if $hcv=="" then null else $hcv end)}}' \
+        --arg i "$vident" --arg s "$_signed" --arg v "$_valid" --arg u "${_nuid:-}" --arg b "${_nb:-}" \
+        --arg hv "$_GPH_VERDICT" --arg hc "$_GPH_CLOSED" --arg hu "$_GPH_UNSIGNED" \
+        --arg hi "$_GPH_INVALID" --arg hg "$_GPH_VALID" --arg hst "$_GPH_STATE" \
+        --arg hbs "$_GPH_BASIS" --arg hcv "$_GPH_COVERAGE"
     else
       echo "ident:  $vident"; echo "signed: $_signed"; echo "valid:  $_valid"
       echo "uid:    ${_nuid:-—}"; echo "by:     ${_nb:-—}"
+      printf '%s' "$_GPH_TEXT"
     fi
     return
   fi
@@ -11519,9 +12305,254 @@ _loop_answer_is_bounce() {
   return 1
 }
 
+# ── DIVE-3128: a button tap, attributed and recorded ─────────────────────────
+#
+# WHO the tapping Telegram uid IS. Resolution order, widest evidence first:
+#
+#   1. ${STATE_DIR}/humans.json  — `{"humans": {"<tg-uid>": "<name>"}}`. An
+#      explicit operator-maintained map. It is the only source that can give a
+#      person the name the org actually calls them, so it wins.
+#   2. the Telegram @username carried on the SAME callback. Telegram owns this
+#      field; the relaying bot cannot set it for someone else. Shape-checked to
+#      Telegram's own handle grammar so nothing exotic reaches a provenance
+#      string.
+#   3. `tg:<uid>` — the honest non-answer.
+#
+# RUNG 3 IS THE POINT OF THE LADDER, not its fallback embarrassment. The defect
+# this closes is a row that named the WRONG principal, not a row that named
+# nobody: `human:tg:1234567890` says "a person we have not put a name to tapped
+# this", which a reader can act on, and it cannot collide with a roster name
+# because agent names are bare tokens and this one carries a colon. There is
+# deliberately no rung that falls back to the RELAYING AGENT'S name — that rung
+# is precisely DIVE-3045.
+#
+# The map file is read at CALL time, not resolved at source time, so a harness
+# that sets STATE_DIR after sourcing (every harness in tests/) points at its own
+# fixture rather than the box's.
+_gate_tap_human_name() {
+  local uid="${1:-}" uname="${2:-}" mapped=""
+  [[ "$uid" =~ ^-?[0-9]{1,20}$ ]] || { printf ''; return 1; }
+  local map="${HUMANS_MAP:-${STATE_DIR}/humans.json}"
+  if [[ -r "$map" ]]; then
+    mapped=$(jq -r --arg u "$uid" '(.humans[$u] // empty)' "$map" 2>/dev/null || true)
+    # A mapped value still has to be a plain token: this string is about to be
+    # concatenated into `human:<name>` and stored as provenance, and a mapping
+    # file carrying `lodar human:root` would forge a second field.
+    [[ "$mapped" =~ ^[A-Za-z][A-Za-z0-9_.-]{0,31}$ ]] && { printf '%s' "$mapped"; return 0; }
+  fi
+  uname="${uname#@}"
+  # Telegram's own handle rule: 5-32 chars, letters/digits/underscore, letter
+  # first. Same grammar cmd_telegram_resolve_handle validates against.
+  [[ "$uname" =~ ^[A-Za-z][A-Za-z0-9_]{4,31}$ ]] && { printf '%s' "$uname"; return 0; }
+  printf 'tg:%s' "$uid"
+}
+
+# THE TAP LEDGER. Before this, an inline-button tap was the LEAST logged path in
+# the system for the control that is supposed to be the most rigorously evidenced:
+# the callback arrived, a `task answer` ran, and the only trace was whatever the
+# answer itself stored. Reconstructing "did a human really press this, and which
+# human" meant reading someone else's shell history.
+#
+# Append-only JSONL next to the other append-only ledgers (the council's
+# veto-audit.jsonl), same permissions posture: 0600, root-owned when we are root.
+# Best-effort by construction — a box that cannot write this file must not lose a
+# human's answer over it — but "best effort" here means the WRITE may fail, never
+# that the call is skipped.
+#
+# THE RAW NONCE IS NEVER WRITTEN. `human_nonce_hash` is hash-only at rest for the
+# reason DIVE-916 gives, and a ledger that recorded the presented nonce would undo
+# that at a second address. We record only WHETHER one was presented.
+_gate_tap_log() {
+  local log="${GATE_TAP_LOG:-${STATE_DIR}/gate-taps.jsonl}"
+  local dir="${log%/*}"
+  [[ -d "$dir" ]] || mkdir -p "$dir" 2>/dev/null || return 0
+  local line
+  line=$(jq -cn \
+    --arg ts        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    --arg ident     "${1:-}" \
+    --arg tier      "${2:-}" \
+    --arg type      "${3:-}" \
+    --arg tap_uid   "${4:-}" \
+    --arg tap_user  "${5:-}" \
+    --arg tap_msg   "${6:-}" \
+    --arg relay     "${7:-}" \
+    --arg resolved  "${8:-}" \
+    --arg stamp     "${9:-}" \
+    --arg nonce     "${10:-}" \
+    --arg verdict   "${11:-}" \
+    --arg via       "${12:-}" \
+    '{ts:$ts, gate:$ident, tier:$tier, type:$type, tap_uid:$tap_uid,
+      tap_username:$tap_user, tap_message_id:$tap_msg, relay_agent:$relay,
+      resolved_human:$resolved, resolved_via:$via, stamped_as:$stamp,
+      human_proof:$nonce, verdict:$verdict}' 2>/dev/null) || return 0
+  printf '%s\n' "$line" >>"$log" 2>/dev/null || return 0
+  chmod 0600 "$log" 2>/dev/null || true
+  [[ $EUID -eq 0 ]] && chown root:root "$log" 2>/dev/null || true
+  return 0
+}
+
+# ── DIVE-3160: `_task_answer` — the delegated, SIGNED gate clear ─────────────
+#
+# THE DEFECT. A cli-scoped lead can CLEAR a gate it cannot SIGN. cmd_task_answer
+# signs the DIVE-756 closure in-process only at EUID 0; every other caller shells
+# out to `sudo -n 5dive gate-proof sign`, and a cli-scoped seat holds no grant for
+# it (its own `_sig_why` string says so, a few hundred lines below). Signing is
+# best-effort by design, so the answer LANDS UNSIGNED and `require_sig=1` on the
+# push/deploy root executors refuses it later — on the MAKER's next round-trip,
+# with a message about tampering. Standing to clear and capability to sign were
+# decided in two different places and nothing lined them up.
+#
+# WHY NOT THE OBVIOUS FIX — this is the load-bearing paragraph. "Grant a narrow
+# root verb that seals the STORED ROW" reads far safer than `gate-proof sign` over
+# stdin, and is not safer at all: /var/lib/5dive/tasks/tasks.db is `rw-rw----
+# root:claude` and EVERY agent seat is in group `claude` (measured 2026-08-10 on
+# both a cli-scoped seat and a root-all one), so a caller writes
+# `need_answered_by='human:lodar'` with plain sqlite3 FIRST and then asks for the
+# seal. tasks_db.sh's own note — "a raw-sqlite write that never ran
+# cmd_task_answer leaves an unsigned/invalid row that gate-proof verify flags" —
+# is the reason this HMAC exists at all. Narrowing the ARGUMENT (stdin -> ident)
+# changes the transport and never the trust: the payload is caller-authored
+# either way. The question is not what the verb accepts, it is who authored the
+# bytes it will attest to.
+#
+# So this primitive signs at ANSWER time, from facts it establishes ITSELF:
+#
+#   1. EUID 0 or refuse — reachable only through the exact-path NOPASSWD grant.
+#   2. WHO comes from SUDO_UID under sudo's env_reset, never argv, never --from.
+#      `_gate_uid_to_agent` fails closed on anything that is not an `agent-*` row.
+#   3. STANDING is re-derived AS ROOT FROM THE ROW (routed_reviewer, or the
+#      sealed constitution's standing lead) — never from anything the caller
+#      passed. Identity alone is not enough: a lead with standing on gate X must
+#      not clear gate Y. (_gh_do's posture, and main's condition 1.)
+#   4. It cannot stamp `human:*`. An agent-invoked path is by definition not a
+#      human tap, so the human-evidence flags are REFUSED here and `human` is
+#      additionally forced to 0 inside cmd_task_answer for this path (main's
+#      condition 2 — the DIVE-916/1115/2224 forged-human residual is a known open
+#      threat and a new root path must not become a fresh entrance to it).
+#   5. cmd_task_answer then runs its OWN authorization unchanged, at EUID 0, and
+#      signs in-process. Every check above is a SUBSET guard that refuses EARLIER;
+#      this primitive grants nothing and cannot widen who may clear what.
+#
+# SELF-CLEAR (main's open design question, settled here): a maker may not have its
+# own gate signed, and the maker is `maker_agent` — the loop spec's maker — NEVER
+# `assignee`. On DIVE-2159, the acceptance row for this ticket, `assignee` is the
+# VERIFIER (main2) and `maker_agent` is dev: a self-clear check keyed on assignee
+# would have refused the one legitimate clear this whole ticket exists to make
+# signable. When a row names no maker the check stays SILENT rather than guessing
+# from assignee — a guess in that column is exactly the error just described.
+# Every argument to `task answer` that can raise `human`, or that names an actor
+# the caller was not measured to be. A PREDICATE over ONE argument, so the harness
+# can grade the exact list the executor loops over rather than a copy of it — and
+# a source tripwire in that harness asserts the loop still calls this, because the
+# usual failure of an extracted check is a call site that quietly stops using it.
+_task_answer_forbidden_flag() {
+  case "${1:-}" in
+    --human|--human-proof=*|--channel-proof=*|--channel-msg=*|--tap-uid=*|--tap-username=*|--tap-msg=*|--relay-agent=*|--from=*) return 0 ;;
+  esac
+  return 1
+}
+
+cmd_task_answer_delegated() {
+  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "_task_answer is a privileged internal primitive (reachable only through the exact-path NOPASSWD grant)."
+
+  # Parameters over stdin, NUL-separated, never argv (main's condition 3): nothing
+  # gate-bearing lands in the process table, and the grant stays an exact command
+  # path with no wildcard, so it holds identically under classic sudo and sudo-rs.
+  # Same shape as _push_do and _gh_do.
+  local -a args=(); local a
+  while IFS= read -r -d '' a; do args+=("$a"); done
+  (( ${#args[@]} )) || fail "$E_VALIDATION" "_task_answer got no arguments on stdin."
+
+  # (2) WHO — the kernel's view of the DELEGATING caller. sudo's env_reset means
+  # SUDO_UID here was set by sudo itself; a caller-supplied one is stripped before
+  # this process starts. A root-all seat could of course forge it, but that seat
+  # can already reach `gate-proof sign` directly — this grant hands it nothing new.
+  local _ruid="${SUDO_UID:-}"
+  [[ "$_ruid" =~ ^[0-9]+$ ]] \
+    || fail "$E_AUTH_REQUIRED" "_task_answer: no SUDO_UID — reach this primitive through sudo from an agent seat, never as root directly (a root caller has no delegating agent to attribute the clear to)."
+  [[ "$_ruid" != "0" ]] \
+    || fail "$E_AUTH_REQUIRED" "_task_answer: SUDO_UID is root, which is not an agent seat."
+  local _actor; _actor=$(_gate_uid_to_agent "$_ruid")
+  [[ -n "$_actor" ]] \
+    || fail "$E_AUTH_REQUIRED" "_task_answer: uid ${_ruid} owns no agent-* passwd row, so this clear has no attributable agent."
+
+  # (4) NEVER human:*. Refused by NAME here so the refusal is greppable and lands
+  # before any write; `human=0` is forced again inside cmd_task_answer so a flag
+  # added later cannot reopen this.
+  for a in "${args[@]}"; do
+    _task_answer_forbidden_flag "$a" \
+      && fail "$E_VALIDATION" "_task_answer refuses ${a%%=*}: an agent-invoked clear is never a human tap, and provenance here is derived from SUDO_UID rather than passed in. Use '5dive task answer' for a human-sourced answer."
+  done
+
+  local _ident=""
+  for a in "${args[@]}"; do [[ "$a" == --* ]] && continue; _ident="$a"; break; done
+  [[ -n "$_ident" ]] || fail "$E_VALIDATION" "_task_answer got no task ident on stdin."
+
+  tasks_db_init
+  # (3) STANDING, re-derived as root from the ROW. All four columns are
+  # enum/agent-name/timestamp shaped, so the sqlite3 `|` separator is unambiguous.
+  local _row
+  _row=$(db "SELECT COALESCE(routed_reviewer,''),COALESCE(maker_agent,''),COALESCE(need_type,''),COALESCE(need_answered_at,'') FROM tasks WHERE ident=$(sqlq "$_ident") LIMIT 1;" 2>/dev/null || printf '')
+  [[ -n "$_row" ]] || fail "$E_VALIDATION" "_task_answer: no task ${_ident}."
+  local _rr _maker _ntype _answered _rest
+  _rr="${_row%%|*}";     _rest="${_row#*|}"
+  _maker="${_rest%%|*}"; _rest="${_rest#*|}"
+  _ntype="${_rest%%|*}"; _answered="${_rest#*|}"
+
+  [[ -n "$_ntype" ]]   || fail "$E_VALIDATION" "_task_answer: ${_ident} carries no gate."
+  [[ -z "$_answered" ]] || fail "$E_CONFLICT" "_task_answer: the gate on ${_ident} was already answered at ${_answered} — answer-once has no re-sign path (re-file a fresh gate)."
+
+  local _sl; _sl=$(_gate_standing_lead 2>/dev/null || printf '')
+  if [[ "$_actor" != "$_rr" ]] && [[ -z "$_sl" || "$_actor" != "$_sl" ]]; then
+    fail "$E_AUTH_REQUIRED" "_task_answer: ${_actor} holds no lead-clear standing on ${_ident} (routed reviewer: ${_rr:-<none>}). This primitive serves the lead-clear-that-cannot-sign case and nothing else."
+  fi
+
+  if [[ -n "$_maker" && "$_actor" == "$_maker" ]]; then
+    fail "$E_AUTH_REQUIRED" "_task_answer: ${_actor} is the MAKER of ${_ident} — signing your own gate is a self-clear, refused here even when the row routes the clear back to you."
+  fi
+
+  TASK_ANSWER_DELEGATED=1
+  cmd_task_answer "${args[@]}"
+}
+
+# The caller half: reach for the SIGNED path when, and only when, this seat is one
+# whose closures land unsigned today. A seat that can sign directly keeps today's
+# path byte for byte — routing a root-all seat through the executor would silently
+# apply the new refusals to flows that never had them, which is a policy change
+# this ticket was not asked to make. Failing closed is free here: on any refusal we
+# fall through to the existing path, which lands the answer exactly as it does
+# today (unsigned, with the DIVE-2760 notice naming the cause) — so this can make
+# a closure signed and can never make an answer fail.
+_task_answer_try_delegated() {
+  [[ $EUID -ne 0 ]]                        || return 1   # root already signs in-process
+  [[ -z "${TASK_ANSWER_DELEGATED:-}" ]]    || return 1   # no recursion from the executor
+  sudo -n -l /usr/local/bin/5dive gate-proof sign >/dev/null 2>&1 && return 1
+  sudo -n -l /usr/local/bin/5dive _task_answer    >/dev/null 2>&1 || return 1
+  local _out _rc=0
+  _out=$(printf '%s\0' "$@" | sudo -n /usr/local/bin/5dive _task_answer 2>&1) || _rc=$?
+  if (( _rc == 0 )); then printf '%s\n' "$_out"; return 0; fi
+  # It refused. Two different situations hide behind one exit code, so ASK THE ROW
+  # rather than parse the message: if the gate is answered, the write landed and
+  # re-running would trip answer-once or double-write; only an untouched gate may
+  # fall through.
+  local _ident="" a
+  for a in "$@"; do [[ "$a" == --* ]] && continue; _ident="$a"; break; done
+  if [[ -n "$_ident" ]]; then
+    local _now; _now=$(db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE ident=$(sqlq "$_ident") LIMIT 1;" 2>/dev/null || printf '')
+    if [[ -n "$_now" ]]; then printf '%s\n' "$_out"; return 0; fi
+  fi
+  warn "the signed clear (_task_answer) refused, so this answer will store UNSIGNED:"
+  printf '%s\n' "$_out" | sed 's/^/  /' >&2
+  return 1
+}
+
 cmd_task_answer() {
   tasks_db_init
+  # DIVE-3160: prefer the delegated SIGNED clear on a seat that cannot sign. Runs
+  # before any parsing so the executor sees the caller's arguments verbatim.
+  _task_answer_try_delegated "$@" && return 0
   local value="" value_set=0 from="" human=0 human_proof="" channel_proof="" channel_msg=""
+  local tap_uid="" tap_username="" tap_msg="" relay_agent=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -11556,6 +12587,22 @@ cmd_task_answer() {
       # WHICH conversation, and only this says the human actually spoke in it —
       # and it is checked against Telegram, not against the caller's word.
       --channel-msg=*) channel_msg="${1#*=}" ;;
+      # DIVE-3128: WHO TAPPED, and WHOSE BOT CARRIED IT — two flags because they
+      # are two facts. The tap handler reads both straight off Telegram's
+      # `callback_query`: `.from.id` is the person who pressed the button and
+      # `.from.username` is their handle, neither of which the relaying agent
+      # chooses. Before this the relay's own identity was all that reached the
+      # row and it wore the `human:` prefix (DIVE-3045).
+      #
+      # These are PROVENANCE, not authority. Nothing below is authorized by them:
+      # a tap still clears a tier-2 gate on the DIVE-916 nonce or a non-agent
+      # SUDO_UID exactly as before, and passing --tap-uid without that evidence
+      # buys nothing. What they change is what the record SAYS about an answer
+      # that was already going to land.
+      --tap-uid=*)      tap_uid="${1#*=}" ;;
+      --tap-username=*) tap_username="${1#*=}" ;;
+      --tap-msg=*)      tap_msg="${1#*=}" ;;
+      --relay-agent=*)  relay_agent="${1#*=}" ;;
       --)        shift; positional+=("$@"); break ;;
       -*)        fail "$E_USAGE" "unknown flag: $1" ;;
       *)         positional+=("$1") ;;
@@ -11834,8 +12881,35 @@ cmd_task_answer() {
   # stored assignee (the agent that hit the gate — `task need` stamps it) falling
   # back to created_by, the same COALESCE `owner` uses below, so the log still
   # answers "whose gate was this" without the answer feeding the decision.
+  # DIVE-3171 — THE ROUTED BRANCH MUST NOT SWALLOW THE STANDING PROVENANCE.
+  #
+  # This guard was `_lead_clear != 1`, i.e. "standing only gets a say when routing did
+  # not already grant clearance". Correct until DIVE-3171, because a gate whose reviewer
+  # came from the CHART is genuinely a routed clear. But DIVE-3171 routes the org root's
+  # eligible approvals to the SEALED standing lead — so routing now grants clearance to
+  # an agent whose authority came from the constitution, the routed branch fires first,
+  # and the row stamps `lead:<n>` for a clear the seal is the entire reason for. The
+  # authority chain stays intact and the RECORD stops carrying HOW, which is the exact
+  # class that cost three incidents on 2026-08-10 (two unattributed human taps read as
+  # agent self-clears; a census that reported "quinn cleared ZERO gates" and was wrong
+  # by four). `lead:standing:` is the only thing on the row separating "a lead cleared a
+  # gate routed to them" from "a lead cleared it under constitutional standing", and
+  # those are different authorities even when the same name appears in both.
+  #
+  # THE COUNTING ARGUMENT IS WHY IT IS FIXED NOW AND NOT LATER: anyone tallying
+  # `lead:standing:` for a root-filed gate would find it under `lead:` and conclude the
+  # standing path went unused — a silent shift in a number nobody re-derives.
+  #
+  # IT GRANTS NOTHING. The added disjunct only lets the block RUN; every conjunct inside
+  # is unchanged, so `_lead_standing=1` still requires the authenticated actor to BE the
+  # sealed lead and the gate to pass `_gate_lead_standing_eligible`. `_lead_clear` is
+  # already 1 on this path and cannot be raised by reaching here. The only reachable
+  # effect is the label — and it is scoped by `route_provenance` to rows THIS build
+  # wrote, so no historical stamp moves and the counts shift for exactly the population
+  # that was mislabelled.
   local _lead_standing=0
-  if [[ "$_lead_clear" != "1" && "$nt" == "approval" ]]; then
+  local _route_prov_row; _route_prov_row=$(db "SELECT COALESCE(route_provenance,'') FROM tasks WHERE id=${id};")
+  if [[ ( "$_lead_clear" != "1" || "$_route_prov_row" == "seal:standing-lead" ) && "$nt" == "approval" ]]; then
     local _ls_auth _ls_lead _ls_filer
     _ls_auth=$(_gate_authenticated_actor)
     _ls_filer=$(db "SELECT COALESCE(NULLIF(assignee,''), NULLIF(created_by,''), '') FROM tasks WHERE id=${id};")
@@ -12213,12 +13287,102 @@ cmd_task_answer() {
   # forever. `_lead_clear=1` also implies nt is approval|manual|access, the types
   # that always enter the evidence block, so _hp/_su are measured values here and
   # never their declaration defaults.
+  # DIVE-3160 (main's condition 2): the delegated executor must be STRUCTURALLY
+  # incapable of writing a `human:*` label, not merely conventionally unlikely to.
+  # `_task_answer` already refuses the human-evidence flags by name; this is the
+  # backstop, placed at the one point every raise-site (--human, _cp_ok, _cs_ok,
+  # and whatever the next one turns out to be) has already run and nothing has yet
+  # read `human` to decide provenance. An agent-invoked clear is `lead:*`, full
+  # stop — a new root path must not widen the DIVE-916/1115/2224 forged-human
+  # residual, which is open.
+  [[ -z "${TASK_ANSWER_DELEGATED:-}" ]] || human=0
   local _human_evid=$(( _hp || _su || _cp_ok ))
   local _human_claim="$human"
   if (( human && ! _human_evid )) && [[ "$_lead_clear" == "1" ]]; then
     human=0
   fi
-  (( human )) && answered_by="human:${answered_by}"
+  # ── DIVE-3128: NAME THE PERSON, NOT THE PIPE ──────────────────────────────
+  #
+  # `$answered_by` at this point is the ACTOR — the identity of the process that
+  # ran `task answer`. On the tap path that process is a BOT, so prefixing it with
+  # `human:` produced `human:olivia`: an assertion about a person, built out of a
+  # measurement of a relay. That is DIVE-3045, and it is not a forgery — it is the
+  # honest output of asking the wrong question.
+  #
+  # So when the caller carried a tap, the person who pressed the button is what
+  # gets stamped, and the relay is recorded in its OWN column further down. When
+  # no tap was carried, nothing here changes: `$answered_by` stays the actor and
+  # every existing path keeps its current stamp.
+  #
+  # `(( human ))` fences the whole thing. --tap-uid is provenance, never
+  # authority: an answer that did not already qualify as human-sourced does not
+  # become one by naming a Telegram id, so a tap presented without the DIVE-916
+  # nonce or a non-agent SUDO_UID is still refused upstream and never reaches here.
+  local _tap_name="" _tap_src="none"
+  if (( human )) && [[ -n "$tap_uid" ]]; then
+    _tap_name=$(_gate_tap_human_name "$tap_uid" "$tap_username") || _tap_name=""
+    if [[ -n "$_tap_name" ]]; then
+      case "$_tap_name" in tg:*) _tap_src="unnamed-uid" ;; *) _tap_src="resolved" ;; esac
+      answered_by="$_tap_name"
+    else
+      # A tap_uid that is not a Telegram id at all. Do NOT fall through to the
+      # actor — that silently restores the exact substitution this block removes.
+      _tap_src="bad-uid"
+      answered_by="tg:invalid"
+    fi
+  fi
+
+  # ── DIVE-3128: A `human:` STAMP MAY NOT NAME AN AGENT ─────────────────────
+  #
+  # The cheap invariant, and it is checked on EVERY human stamp rather than only
+  # on the tap path — because the tap path is where this was DISCOVERED, not the
+  # only place it can happen. Any relay that clears a gate while running as an
+  # agent reaches this line with an agent name in `$answered_by`, and the fix
+  # above only covers the callers that were taught to send `--tap-uid`.
+  #
+  # REFUSED, NOT REPAIRED. There is no honest repair available here: the code knows
+  # the name is wrong and has nothing better to put in its place, so it declines to
+  # make the claim. `unattributed:<name>` keeps every fact that WAS measured (a
+  # --human answer arrived, this process ran it) while withholding the one that was
+  # not, and it does not start with `human:` — so cmd_trace, cmd_digest, cmd_proof
+  # and the precedent engine, all of which key on `need_answered_by LIKE 'human:%'`,
+  # stop counting it as a human touch with no change on their side. That is the
+  # DIVE-2406 demotion pattern one screen up, applied to a different lie.
+  #
+  # It is a DEMOTION rather than a `fail`, deliberately. The answer itself is
+  # already authorized by evidence this block does not re-litigate, and refusing
+  # the WRITE would discard a decision a person may really have made and leave a
+  # tier-2 gate open with no way to close it. What is refused is the CLAIM.
+  #
+  # `human` is deliberately NOT cleared: the two `(( ! human ))` guards below add
+  # `lead:` / `lead:standing:` prefixes, and firing them here would relabel a
+  # refused human claim as an authorized lead clear — a second wrong answer.
+  local _attr_why="" _attr_unverified=0
+  if (( human )); then
+    if actor_human_name_ok "$answered_by"; then
+      [[ "${ACTOR_HUMAN_NAME_WHY:-}" == "roster-unmeasured" ]] && _attr_unverified=1
+      answered_by="human:${answered_by}"
+    else
+      local _attr_name="$answered_by"
+      _attr_why="${ACTOR_HUMAN_NAME_WHY:-refused}"
+      answered_by="unattributed:${_attr_name}"
+      warn "$ident: refusing to record this answer as human:${_attr_name} — '${_attr_name}' is a name on the AGENT roster, so the stamp would assert a human where the record can only show a relay (DIVE-3128). Stored as '${answered_by}'. A button tap should carry --tap-uid=<telegram user id> so the person who pressed it is named."
+      # STDERR IS NOT REDIRECTED HERE, and that is a correction rather than a
+      # style choice. `_task_store_audit_log`'s off-prod-store withholding is
+      # announced ONCE per invocation (DIVE-2010, `_TASK_STORE_AUDIT_FENCED`), so
+      # a `2>/dev/null` on the FIRST call through it eats the announcement for
+      # every later one — measured against tests/gate_answer_audit_unit.sh, whose
+      # "a silent fence is the same fail-open shape as no fence" arm went red the
+      # moment this row was added ahead of the write-site row with its stderr
+      # discarded. The sibling refusal sites can redirect because each of them
+      # `fail`s immediately after; this one returns and the write-site row still
+      # has to be able to speak.
+      _task_store_audit_log "task answer human-attribution" error 0 -- \
+        "task=$ident" "type=$nt" "tier=$gtier" "reason=$_attr_why" \
+        "refused_stamp=human:${_attr_name}" "stored=${answered_by}" \
+        "tap_uid=${tap_uid:-none}" "relay_agent=${relay_agent:-none}" || true
+    fi
+  fi
   # DIVE-1182: a routed builder gate cleared by its designated lead is recorded as
   # lead-sourced provenance (NOT human:*) — honest that an agent lead, not a human,
   # cleared it. Never overrides a genuine human:* answer.
@@ -12397,6 +13561,43 @@ cmd_task_answer() {
     "$(( ${_hp:-0} || ${_t2_hp:-0} ))" "$(( ${_su:-0} || ${_t2_su:-0} ))" \
     "${_cs_ok:-0}" "${_cp_ok:-0}" "${_lead_clear:-0}")
   db "UPDATE tasks SET human_evidence=$(sqlq "${_evform:-none}") WHERE id=${id};"
+
+  # DIVE-3128: the RELAY and the TAPPING UID, in their own columns.
+  #
+  # Written unconditionally (empty when there was no tap) so the columns mean
+  # "this is what the answer carried", not "somebody remembered to set them".
+  # A reader can now separate the two questions the old single string conflated:
+  # `need_answered_by` says who decided, `need_answered_relay` says whose bot
+  # carried it.
+  #
+  # NOT INSIDE THE DIVE-756 SIGNED CLOSURE, and say so rather than let a reader
+  # assume otherwise. The closure signs need_answer/at/by/uid — so the HUMAN NAME
+  # is tamper-evident, which is the field this ticket is about — while the relay
+  # is corroborating context that a raw DB edit could change without failing
+  # `gate-proof verify`. Widening the signed payload would invalidate every
+  # signature already stored on the board, so it is a separate decision.
+  db "UPDATE tasks SET need_answered_relay=$(sqlq "${relay_agent}"), need_answered_tap_uid=$(sqlq "${tap_uid}") WHERE id=${id};"
+
+  # DIVE-3128: THE TAP LEDGER. A button tap was the least-recorded path in the
+  # system for the most rigorously evidenced control. Written AFTER the row, and
+  # reading the persisted stamp back out rather than the variable, for the
+  # DIVE-2090 reason: a ledger built from intent greens identically whether or not
+  # the write landed.
+  if [[ -n "$tap_uid" || -n "$relay_agent" || -n "$tap_msg" ]]; then
+    local _tap_persisted; _tap_persisted=$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE id=${id};")
+    # THE VERDICT IS THREE-VALUED for the same reason the roster predicate is:
+    # `stored` must mean "checked the name against the roster and it was clean",
+    # never "could not look". A run with no readable registry says so in the
+    # ledger instead of producing a line indistinguishable from a verified one.
+    local _tap_verdict="stored"
+    if [[ -n "$_attr_why" ]]; then _tap_verdict="refused:${_attr_why}"
+    elif (( _attr_unverified )); then _tap_verdict="stored:roster-unmeasured"
+    fi
+    local _tap_nonce="absent"; [[ -n "$human_proof" ]] && _tap_nonce="presented"
+    _gate_tap_log "$ident" "${gtier:-}" "$nt" "$tap_uid" "$tap_username" "$tap_msg" \
+      "$relay_agent" "${_tap_name:-}" "$_tap_persisted" \
+      "$_tap_nonce" "$_tap_verdict" "$_tap_src" || true
+  fi
 
   # DIVE-2099: the authoritative record of a STANDING-authority clear. Emitted
   # AFTER the write and reading `need_answered_by` BACK OUT of the row, so it

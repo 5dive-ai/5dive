@@ -113,7 +113,15 @@ cmd_ui() {
   trap 'kill "$py" 2>/dev/null; rm -rf "$tmp"' INT TERM
   wait "$py" || rc=$?
   trap - INT TERM
-  kill "$py" 2>/dev/null
+  # `|| true` is load-bearing, not style. `wait` returned because the child is
+  # already reaped, so this belt-and-braces kill can only ever get ESRCH — and
+  # under `set -e` a bare failing command ends the function HERE: it published 1
+  # as the exit code of a fully successful run, discarded the rc computed above,
+  # and skipped the `rm` below, leaking a mode-700 temp dir per invocation. Note
+  # which path that is: the trap two lines up cleans up correctly, so the leak
+  # happened only on the runs that WORKED (DIVE-2813, and see
+  # community/wiki/set-e-deletes-exactly-the-cleanup-a-trap-would-have-kept.md).
+  kill "$py" 2>/dev/null || true
   rm -rf "$tmp"
   return "$rc"
 }
@@ -635,9 +643,10 @@ HTML
 _ui_server_py() {
   cat <<'PY'
 import json
+import os
 import subprocess
 import sys
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 HOST, PORT, PAGE, BUNDLE = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
 ONCE = "--once" in sys.argv[5:]
@@ -650,6 +659,17 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "5dive-ui"
     sys_version = ""
     protocol_version = "HTTP/1.1"
+    # A hazard CREATED by serving --once in-thread, so it is bounded here rather
+    # than left to be discovered. A bare TCP connect that sends no request line
+    # would park the single-shot server forever: nothing else is running to
+    # notice. The threaded version exited instead — the main thread never waited
+    # for the worker, which is the defect this file just fixed, but it also hid
+    # this. A read timeout ends the connection and handle_request() returns.
+    # None (the stdlib default) everywhere else: serve_forever keeps its threads.
+    # The override exists so a harness can grade this in seconds instead of
+    # waiting 30 out; the property was lost the first time precisely because no
+    # arm encoded it (DIVE-2813, arm 16 of tests/ui_views_e2e.sh).
+    timeout = float(os.environ.get("_5DIVE_UI_ONCE_READ_TIMEOUT") or 30) if ONCE else None
 
     def log_message(self, fmt, *args):          # one line per request, on stderr
         sys.stderr.write("%s %s\n" % (self.command, self.path.split("?", 1)[0]))
@@ -663,6 +683,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
+        if ONCE:
+            # One request means one connection. Under HTTP/1.1 the handler loops
+            # on a kept-alive socket, so without this the single-shot server
+            # stays inside handle_request() until the client hangs up.
+            self.send_header("Connection", "close")
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
@@ -706,7 +731,18 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    # --once is served WITHOUT threading, deliberately. ThreadingHTTPServer hands
+    # each request to a worker and returns from handle_request() on DISPATCH, not
+    # on completion — the main thread falls straight through to server_close() and
+    # exits, and interpreter shutdown kills the worker mid-write. Its threads are
+    # daemonic, and socketserver's join-on-close list only ever tracks NON-daemon
+    # threads, so nothing waits for the body. The signature is mostly a TRUNCATED
+    # 200 (status line and headers delivered, body cut), not a refused connection,
+    # so an arm grading only the status code scores it a pass. Served in-thread,
+    # handle_request() cannot return before the response is on the socket.
+    # serve_forever() keeps threading: there a slow /api/state (it shells out to
+    # the bundle) would otherwise block every other request. (DIVE-2813)
+    srv = (HTTPServer if ONCE else ThreadingHTTPServer)((HOST, PORT), Handler)
     sys.stderr.write("listening on http://%s:%d\n" % (HOST, PORT))
     sys.stderr.flush()
     try:
