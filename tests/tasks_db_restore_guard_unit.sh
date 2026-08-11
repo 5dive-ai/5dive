@@ -215,6 +215,13 @@ out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
 # one column merge with no textual conflict — the CREATE gains both lines — and the
 # count is then wrong by one with nothing in the diff to show it. DIVE-2848 landed
 # that way: 72 on both sides, 73 after the merge, and the only signal was this case.
+#
+# DIVE-3245 it.3 added origin, the INSERTING VERB, so the filing cap can exclude
+# scaffolding by a term `task add` cannot write (86 -> 87). And it landed exactly
+# the way the note above predicts: this branch forked before DIVE-3251, merged main
+# in with no textual conflict on this file, and the count was silently one short —
+# CI red on this case alone, with nothing in the branch's own diff to point at it.
+# 87 was READ off the merged tree (e1ea269) by running this case, not predicted.
 fresh_tree
 out=$(tasks_db_init 2>&1); rc=$?
 required='delivered_at delivery_ref delivery_ref_iteration escalated_at escalated_by human_evidence park_reason parked_at'
@@ -223,8 +230,8 @@ actual=$(sqlite3 "$TASKS_DB" \
     WHERE name IN ('delivery_ref','delivered_at','delivery_ref_iteration','parked_at','park_reason','escalated_at','escalated_by','human_evidence')
     ORDER BY name;" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
 column_count=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM pragma_table_info('tasks');" 2>/dev/null)
-[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "86" ]] \
-  && ok "fresh schema: all 86 columns, including the eight former holes, are present" \
+[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "87" ]] \
+  && ok "fresh schema: all 87 columns, including the eight former holes, are present" \
   || bad "fresh schema: init returned a partial tasks table" "rc=$rc count=$column_count got=[$actual] want=[$required] out=$out"
 
 # --- Case 10 (DIVE-2197): migrate arm still rejects a failed ALTER ------------
