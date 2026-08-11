@@ -319,7 +319,7 @@ fi
 # E. Structural — the shape must not come back, and DIVE-2210 must not move.
 # ---------------------------------------------------------------------------
 # No decision site may read isolation with its stderr swallowed again.
-bad_reads="$(grep -n "agents\[\$n\]\.isolation" src/cmd_heartbeat.sh src/cmd_task.sh 2>/dev/null || true)"
+bad_reads="$(grep -n "agents\[\$n\]\.isolation" src/cmd_heartbeat.sh src/cmd_task.sh src/task/*.sh 2>/dev/null || true)"
 eq_t "no raw isolation lookup left at the guard/show sites" "" "$bad_reads"
 
 # The guard must route through the predicate, not re-derive the polarity inline.

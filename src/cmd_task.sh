@@ -15,6 +15,10 @@
 #
 # Keep the src/task/*.sh order below identical to build.sh's: a handful of files
 # open with top-level `readonly`/regex assignments that later files read.
+# CONSEQUENCE, stated because it bit a test: sourcing this file a SECOND time is a
+# no-op, because the guards below are satisfied by the first load. A harness that
+# `unset -f`s a task function and re-sources to restore it must source the MODULE
+# that defines it (src/task/<file>.sh), not this loader.
 _task_src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 declare -F cmd_task >/dev/null 2>&1 || . "$_task_src_dir/task/dispatch.sh"
 declare -F _task_resolve_coordinator >/dev/null 2>&1 || . "$_task_src_dir/task/routing.sh"

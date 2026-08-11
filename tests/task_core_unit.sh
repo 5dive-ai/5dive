@@ -440,7 +440,10 @@ grep -q -- "--no-verify" "$TMP"/err \
   && ok_t "no-verify: the override NAMES the opt-out it is overriding" \
   || bad_t "override silent" "warn text does not mention the opt-out: $(tr '\n' ' ' <"$TMP"/err)"
 unset -f _task_delivery_paths _task_default_verifier
-. "$SRC/cmd_task.sh"
+# DIVE-3278: source the MODULE, not src/cmd_task.sh. cmd_task.sh is a loader whose
+# `declare -F` guards are already satisfied here, so re-sourcing it is a no-op and
+# would leave the two functions above unset for the rest of this file.
+. "$SRC/task/routing.sh"
 
 # An explicit later attach supersedes the earlier refusal — otherwise the row
 # carries a live opt-out flag that contradicts its own grader.
