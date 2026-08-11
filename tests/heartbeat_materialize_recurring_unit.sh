@@ -542,5 +542,51 @@ else
         "expected ${TASKS_OVERLAP_BOUND_DEFAULT} instances, got $(instances_of "$t_dflt")"
 fi
 
+# --- Arm 6: the LISTING must not tell a different story than the SCHEDULER.
+# The DIVE-2055 rule for this table, load-bearing now that there are two policies
+# for it to disagree about. `blocked_by` under skip names the blocking instance
+# (covered above); under spawn an open instance blocks NOTHING until the bound, so
+# naming it would send a reader to close a row that is suppressing nothing — the
+# same wasted trip DIVE-2273's forged last_skipped_at sends them on.
+t_disp=$(mk_tmpl_policy "display-policy spawn template" spawn 2)
+_hb_materialize_recurring "$((t0 + 3240))"      # 1 open, UNDER the bound
+# NB: the 2237 surface arms above ran `JSON_MODE=0 box_list=$(...)`, which is TWO
+# ASSIGNMENTS, not a prefixed command — so JSON_MODE stayed 0 from there on. Set
+# the renderer explicitly here rather than inheriting whatever the last arm left.
+JSON_MODE=1
+disp_json=$(cmd_task_ls --recurring)
+disp_under=$(jq -r '.data.tasks[] | select(.title=="display-policy spawn template") | .blocked_by' <<<"$disp_json")
+disp_pol=$(jq -r '.data.tasks[] | select(.title=="display-policy spawn template") | .on_overlap' <<<"$disp_json")
+if [[ "$disp_under" == "null" || -z "$disp_under" ]]; then
+  ok_t "2272 display: under the bound, a spawn template is NOT reported blocked"
+else
+  bad_t "2272 display: under the bound, a spawn template is NOT reported blocked" \
+        "blocked_by='${disp_under}' — the listing claims a suppression the scheduler is not applying"
+fi
+if [[ "$disp_pol" == "spawn" ]]; then
+  ok_t "2272 display: the policy itself is on the row, not left to be inferred"
+else
+  bad_t "2272 display: the policy itself is on the row, not left to be inferred" "got '${disp_pol}'"
+fi
+# AT the bound the scheduler really does skip, so now the listing must say so.
+_hb_materialize_recurring "$((t0 + 3360))"      # 2 open == bound
+JSON_MODE=1
+disp_at=$(jq -r '.data.tasks[] | select(.title=="display-policy spawn template") | .blocked_by' <<<"$(cmd_task_ls --recurring)")
+# And the same fact through the OTHER renderer, which is the one a human reads.
+JSON_MODE=0 && disp_box=$(cmd_task_ls --recurring); JSON_MODE=1
+: >"$LOG"
+_hb_materialize_recurring "$((t0 + 3480))"
+if [[ "$disp_at" == "bound 2/2" ]] && grep -q 'skip (bounded)' "$LOG"; then
+  ok_t "2272 display: AT the bound the listing reports 'bound 2/2' and the scheduler agrees it skipped"
+else
+  bad_t "2272 display: AT the bound the listing reports 'bound 2/2' and the scheduler agrees it skipped" \
+        "blocked_by='${disp_at}' log=$(cat "$LOG")"
+fi
+if grep -q 'bound 2/2' <<<"$disp_box" && grep -q 'on_overlap' <<<"$disp_box"; then
+  ok_t "2272 display: the box renderer carries the same bound + a policy column"
+else
+  bad_t "2272 display: the box renderer carries the same bound + a policy column" "$disp_box"
+fi
+
 echo "-- ${PASS} passed, ${FAIL} failed --"
 [[ $FAIL -eq 0 ]]
