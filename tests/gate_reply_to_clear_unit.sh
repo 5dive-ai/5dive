@@ -12,7 +12,9 @@
 #     was invited to answer DIVE-2802 by replying, with the exact string printed
 #     in the ask, and he tapped the button anyway. `channel_session=0` still.
 #     A path whose only invitation is a sentence competing with a button is not a
-#     reachable path, so the DEFAULT prompt is the fix and documentation is not.
+#     reachable path, so a PROMPT is the fix and documentation is not. (That the
+#     prompt should also LEAD did not survive contact with the human it was for;
+#     see THE RE-SCOPE below, which supersedes this line and nothing else here.)
 #   * lodar then scoped it (DIVE-2802 gate, answered 20:41): HIGH-STAKES ONLY,
 #     spend / secrets / irreversible. Not every tier-2 gate. The freshness window
 #     is a hardcoded 3600s ceiling nobody may widen, so a mandatory strong path
@@ -28,15 +30,34 @@
 #   C1-C5  the COPY names the exact string to send. Condition 5 of
 #          `_gate_channel_session_ok` needs BOTH the ident AND the answer value,
 #          so copy that says "reply to confirm" produces a refusal.
+#   C6-C8  the RE-SCOPE (olivia on DIVE-2818, 2026-08-06; see the note below).
+#          C6 pins the ORDER — tap sentence before the reply string — because the
+#          defect being fixed was never a missing sentence, it was which sentence
+#          led. C7 pins the recovery FRAMING and the absence of the superlative
+#          that made typing "strongest". C8 is the withheld-button case.
 #   R1-R4  THE ROUND TRIP, and it is the arm that matters. The string our DM tells
 #          the human to send is fed to the REAL `_gate_channel_session_ok` with
 #          only the Bot API stubbed. This grades the copy against the function
 #          that will actually judge it, rather than against a re-implementation of
 #          its rule — a mirrored comparison passes forever on the day the checker
 #          tightens, which is precisely when a test should fail.
-#   I1-I4  the WIRING. The helpers being correct proves nothing about whether the
+#   I1-I6  the WIRING. The helpers being correct proves nothing about whether the
 #          composed alert carries them, and a suite that grades only its own new
-#          functions would pass with the call sites never added.
+#          functions would pass with the call sites never added. I5 re-grades the
+#          order on the composed text, because the call sites are where the two
+#          halves (button and copy about the button) could be assembled the wrong
+#          way round; I6 grades the withheld-button suppression end to end.
+#
+# THE RE-SCOPE, and why the copy reads the way it does (olivia on the parent
+# DIVE-2818, 2026-08-06, after lodar ruled live: "asking user to type is not good
+# ux"). Observed, not theorised: he tried the typed path, was refused for sending
+# the answer without the ident, then tapped and it worked first press. So TAP IS
+# PRIMARY on every gate, high-stakes included, and the reply string is the
+# RECOVERY path for a button that is stale, already used, or a tap rail that is
+# down. Non-forgeability is untouched by the reordering — condition 2 still wants
+# the ident in the human's own words — so what changed is copy and order only,
+# which is exactly why C6/C7 assert on ORDER and FRAMING rather than presence:
+# every arm below C5 passed before the flip and would pass after a regression.
 #
 # Isolation matches the sibling harnesses: source src/ libs, throwaway STATE_DIR —
 # the live shared tasks.db is NEVER touched, and no network is reached (the one
@@ -124,12 +145,17 @@ _task_gate_high_stakes "$(rid DIVE-9009)" \
 
 # ==================== C: THE COPY NAMES THE EXACT STRING =====================
 
-txt=$(_task_gate_reply_cta DIVE-9001 approval "" "")
+# The 5th argument is the markup the CALLER computed. It is passed, never
+# re-derived here, so the copy about the button cannot contradict the button;
+# only its emptiness is read, so a representative keyboard stands in fine.
+KB='{"inline_keyboard":[[{"text":"✅ Approve","callback_data":"tna:1:approved"}]]}'
+
+txt=$(_task_gate_reply_cta DIVE-9001 approval "" "" "$KB")
 [[ "$txt" == *"DIVE-9001 approved"* && "$txt" == *"DIVE-9001 denied"* ]] \
   && ok_t "C1 an approval CTA prints both exact strings (approved / denied)" \
   || bad_t "C1 an approval CTA prints both exact strings (approved / denied)" "text: $txt"
 
-txt=$(_task_gate_reply_cta DIVE-9007 manual "" "")
+txt=$(_task_gate_reply_cta DIVE-9007 manual "" "" "$KB")
 [[ "$txt" == *"DIVE-9007 done"* ]] \
   && ok_t "C2 a manual CTA prints the exact string (done)" \
   || bad_t "C2 a manual CTA prints the exact string (done)" "text: $txt"
@@ -137,20 +163,57 @@ txt=$(_task_gate_reply_cta DIVE-9007 manual "" "")
 # The secret CTA must offer `provided` — the tap path's own value — and must NEVER
 # invite the credential into the chat log. DIVE-2232 is the live case: main nearly
 # received a raw credential in a persistent DM.
-txt=$(_task_gate_reply_cta DIVE-9002 secret "" "")
+txt=$(_task_gate_reply_cta DIVE-9002 secret "" "" "$KB")
 [[ "$txt" == *"DIVE-9002 provided"* ]] && [[ "$txt" != *"paste"* ]] \
   && ok_t "C3 a secret CTA offers 'provided' and never invites the credential into chat" \
   || bad_t "C3 a secret CTA offers 'provided' and never invites the credential into chat" "text: $txt"
 
-txt=$(_task_gate_reply_cta DIVE-9003 decision "A|B" "B")
+txt=$(_task_gate_reply_cta DIVE-9003 decision "A|B" "B" "$KB")
 [[ "$txt" == *"DIVE-9003 B"* ]] \
   && ok_t "C4 a decision CTA leads with the RECOMMENDED option value" \
   || bad_t "C4 a decision CTA leads with the RECOMMENDED option value" "text: $txt"
 
-txt=$(_task_gate_reply_cta DIVE-9006 decision "A|B" "")
+txt=$(_task_gate_reply_cta DIVE-9006 decision "A|B" "" "$KB")
 [[ "$txt" == *"DIVE-9006 A"* ]] \
   && ok_t "C5 a decision CTA with no recommendation falls back to the first option" \
   || bad_t "C5 a decision CTA with no recommendation falls back to the first option" "text: $txt"
+
+# C6 THE ORDER. Every C arm above passes just as well on the pre-re-scope copy
+# that led with "Strongest clear: REPLY ..." — presence was never the defect.
+# What lodar rejected was the typed string being the FIRST thing asked for, so
+# the assertion has to be positional: the tap sentence must sit ahead of the
+# string. Measured by offset (the prefix before each needle), not by eyeballing
+# a rendered blob, so a future edit that merely appends a tap line at the bottom
+# does not pass.
+txt=$(_task_gate_reply_cta DIVE-9001 approval "" "" "$KB")
+_pre_tap="${txt%%Tap a button*}"; _pre_str="${txt%%DIVE-9001 approved*}"
+if [[ "$txt" == *"Tap a button"* && ${#_pre_tap} -lt ${#_pre_str} ]]; then
+  ok_t "C6 the CTA asks for the TAP before it prints the reply string (tap primary)"
+else
+  bad_t "C6 the CTA asks for the TAP before it prints the reply string (tap primary)" "text: $txt"
+fi
+
+# C7 THE FRAMING. Ordering alone still allows "tap, or equally just reply" — the
+# reply must read as the path for when the tap is unavailable. The negative half
+# pins the superlative that made typing the recommended act; it is the exact word
+# the withdrawn copy used, so a revert reds here and not only at C6.
+txt=$(_task_gate_reply_cta DIVE-9003 decision "A|B" "B" "$KB")
+if [[ "$txt" == *"Recovery only"* && "$txt" == *"stale"* && "$txt" != *"Strongest"* ]]; then
+  ok_t "C7 the reply string is framed as RECOVERY, and the 'strongest clear' framing is gone"
+else
+  bad_t "C7 the reply string is framed as RECOVERY, and the 'strongest clear' framing is gone" "text: $txt"
+fi
+
+# C8 THE WITHHELD BUTTON. DIVE-2411 withholds the ✅ Provided tap on a secret gate
+# that names no delivery path, because the tap files "provided" over a payload
+# that landed nowhere — a real human tapped exactly that on DIVE-2232. A typed
+# "<ident> provided" clears the same gate the same way, so the prompt has to be
+# withheld wherever the button was. The caller's markup is the predicate: empty
+# markup, no prompt, and no second copy of the rule to drift.
+txt=$(_task_gate_reply_cta DIVE-9002 secret "" "" "")
+[[ -z "$txt" ]] \
+  && ok_t "C8 no tap button (empty markup) means no reply prompt either (DIVE-2411)" \
+  || bad_t "C8 no tap button (empty markup) means no reply prompt either (DIVE-2411)" "text: $txt"
 
 # ==================== R: THE ROUND TRIP against the REAL checker ==============
 # Only the Bot API is stubbed. Conditions 1-5 of `_gate_channel_session_ok` run
@@ -169,7 +232,7 @@ _gate_channel_api() { # <token> <method> ...
 
 # Extract the reply line our copy prints, exactly as a human would copy it.
 cta_line() { # <ident> <need_type> <options> <recommend>
-  _task_gate_reply_cta "$1" "$2" "${3:-}" "${4:-}" \
+  _task_gate_reply_cta "$1" "$2" "${3:-}" "${4:-}" "$KB" \
     | grep -oE "$1 [^)]*" | head -1 | sed 's/[[:space:]]*$//'
 }
 
@@ -219,14 +282,70 @@ fi
 # The tap must survive beside it. DIVE-525: a real human tap is NEVER rejected,
 # and the 3600s ceiling guarantees some genuine answers must fall back to it.
 [[ "$CAPTURED_KB" == *'"tna:'*':approved'* ]] \
-  && ok_t "I2 the tap button survives alongside the prompt (the fallback is intact)" \
-  || bad_t "I2 the tap button survives alongside the prompt (the fallback is intact)" "markup: $CAPTURED_KB"
+  && ok_t "I2 the tap button survives alongside the prompt (the tap is the primary path)" \
+  || bad_t "I2 the tap button survives alongside the prompt (the tap is the primary path)" "markup: $CAPTURED_KB"
+
+# I5 the ORDER on the COMPOSED alert, not just inside the helper. The call site is
+# where the flip can be undone without touching the copy at all — the prompt is
+# appended to a `text` that already carries the per-type instruction, so grading
+# only `_task_gate_reply_cta` would pass on an alert that reads reply-first.
+# Reuses the I1 capture, so it costs no second delivery.
+_pre_tap="${CAPTURED%%Tap a button*}"; _pre_str="${CAPTURED%%DIVE-9001 approved*}"
+if [[ "$CAPTURED" == *"Tap a button"* && ${#_pre_tap} -lt ${#_pre_str} ]]; then
+  ok_t "I5 the composed ALERT TEXT asks for the tap before the reply string"
+else
+  bad_t "I5 the composed ALERT TEXT asks for the tap before the reply string" "text: ${CAPTURED:0:400}"
+fi
+
+# I6 the withheld button, END TO END: DIVE-9002 is a secret gate with no
+# secret_key/connector and no --out-of-band, so _task_gate_reply_markup emits
+# nothing and the DIVE-2411 copy tells the human the gate must be RE-FILED. An
+# alert that then printed "reply DIVE-9002 provided" would offer a clear for a
+# credential with nowhere to go. C8 grades the helper's rule; this grades that the
+# call site actually hands it the markup rather than a placeholder.
+CAPTURED=""; CAPTURED_KB=""
+_task_need_notify_deliver DIVE-9002 secret "hand over the credential" "" "" "" "" "" >/dev/null 2>&1
+if [[ -z "$CAPTURED_KB" && "$CAPTURED" != *"High-stakes gate"* ]]; then
+  ok_t "I6 a button-less secret gate's alert carries NO reply prompt (DIVE-2411 end to end)"
+else
+  bad_t "I6 a button-less secret gate's alert carries NO reply prompt (DIVE-2411 end to end)" "markup='$CAPTURED_KB' text: ${CAPTURED:0:400}"
+fi
 
 CAPTURED=""
 _task_need_notify_deliver DIVE-9005 approval "approve the routine thing" "" "" "" "" "" >/dev/null 2>&1
 [[ "$CAPTURED" != *"High-stakes gate"* ]] \
   && ok_t "I3 a routine tier-2 approval gate's alert does NOT carry the prompt (lodar's scope)" \
   || bad_t "I3 a routine tier-2 approval gate's alert does NOT carry the prompt (lodar's scope)" "text: ${CAPTURED:0:400}"
+
+# I7 THE SECOND RENDER PATH. `_task_inbox_send` composes the batch re-nag alert
+# itself rather than calling `_task_need_notify_deliver`, so every arm above it
+# grades ONE of the two places this prompt is emitted. Measured, not assumed: a
+# mutant that hands the batch site an empty markup — suppressing the prompt on
+# every re-nag while the first delivery keeps it — passed the suite at 30/30
+# before this arm existed. A re-nag is precisely when the button has had time to
+# go stale, which is the case the recovery path is for, so a silently prompt-less
+# re-nag is the failure the whole row is about.
+#
+# THREE STUBS, each neutralising a PRECONDITION of reaching the render loop and
+# none of them the property under test (which is the emitted TEXT): root,
+# DIVE-1506's prod-DB fence, and the paired channel already stubbed above. The
+# subshell is not tidiness — `_task_inbox_send` finishes through `ok`, which
+# exits the process — so the capture crosses back through files.
+_INBOX_TXT="$TMP/inbox.txt"; _INBOX_KB="$TMP/inbox.kb"
+: >"$_INBOX_TXT"; : >"$_INBOX_KB"
+(
+  require_root() { :; }
+  _task_send_owner() { printf '%s' "$1" >"$_INBOX_TXT"; printf '%s' "${2:-}" >"$_INBOX_KB"; return 0; }
+  FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"
+  _task_inbox_send "" "ident='DIVE-9001'" "ORDER BY created_at"
+) >/dev/null 2>&1
+_bt=$(cat "$_INBOX_TXT" 2>/dev/null); _bk=$(cat "$_INBOX_KB" 2>/dev/null)
+if [[ "$_bt" == *"High-stakes gate"* && "$_bt" == *"DIVE-9001 approved"* \
+      && "$_bt" == *"Recovery only"* && "$_bt" != *"Strongest"* && "$_bk" == *'"tna:'* ]]; then
+  ok_t "I7 the batch RE-NAG alert carries the same recovery prompt, beside a real tap button"
+else
+  bad_t "I7 the batch RE-NAG alert carries the same recovery prompt, beside a real tap button" "markup='$_bk' text: ${_bt:0:400}"
+fi
 
 # A prompt on a channel whose plugin has no inbound handler is a dead affordance
 # the human only discovers AFTER typing. This allowlist is NARROWER than the tap
