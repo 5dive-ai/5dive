@@ -372,6 +372,71 @@ d=$(printf '' | _task_delivery_depth)
 [[ -z "$d" ]] \
   && ok_t "delivery depth: no paths -> unknown, never shallow" || bad_t "empty list class" "got '$d'"
 
+# --- T-2730: the add-time `--no-verify` SURVIVES to delivery.
+#
+# The defect these arms grade is not a wrong answer, it is a MISSING FACT: the
+# opt-out used to be a shell var that died with `task add`, so at `task done` an
+# explicit refusal and a never-railed row were the same NULL and the UPGRADE arm
+# above could not tell them apart. So the first two arms grade the WRITE (the
+# fact exists at all) and the last two grade the READ (the upgrade arm honours
+# it) — a column nobody reads would pass a write-only test and change nothing.
+idnv=$(run add --assignee=nvmaker --no-verify --body="w" -- "opted out of grading" | jf '.data.id')
+[[ "$(db "SELECT COALESCE(verify_optout,0) FROM tasks WHERE id=${idnv};")" == "1" ]] \
+  && ok_t "no-verify: the explicit opt-out is persisted (verify_optout=1)" \
+  || bad_t "optout write" "got '$(db "SELECT COALESCE(verify_optout,-1) FROM tasks WHERE id=${idnv};")'"
+
+# NON-VACUITY, and it is the whole point of the row: a column that read 1 for
+# every task would satisfy the arm above while re-collapsing the distinction it
+# exists to make. An ordinary add must leave it NULL.
+idpv=$(run add --assignee=nvmaker --priority=low --body="w" -- "ordinary row, no opt-out" | jf '.data.id')
+[[ "$(db "SELECT COALESCE(verify_optout,0) FROM tasks WHERE id=${idpv};")" == "0" ]] \
+  && ok_t "no-verify: an ordinary add leaves verify_optout NULL (refusal != absence)" \
+  || bad_t "optout non-vacuity" "ordinary row reads $(db "SELECT verify_optout FROM tasks WHERE id=${idpv};")"
+
+# The READ half, end to end through `task done`'s UPGRADE arm — and this is the
+# arm that grades main's merge condition on DIVE-2730, so it is written as the
+# BYPASS it refuses rather than as a feature. `--no-verify` is declared at FILE
+# time; the blast radius is measured at DELIVERY time. If the stored flag
+# suppressed the upgrade, a sentence typed before the diff existed would
+# pre-authorise closing a scheduler/credentials change ungraded — a waiver in
+# DIVE-969's banned direction. So the opted-out row MUST still route.
+#
+# Both fixtures are verifier-NULL rows with a deep delivery, exactly the shape
+# DIVE-2719 upgrades; the two stubs supply the diff and a willing grader, the
+# only inputs the arm needs, so the sole difference between them is the column.
+# Stubbed rather than mocked over the network: the gh-backed path is graded on
+# the box (see T-2719's note), and what is under test is the branch, not the fetch.
+_task_delivery_paths() { printf 'src/cmd_heartbeat.sh\n'; }
+_task_default_verifier() { printf 'nvgrader\n'; }
+run start "$idpv" >/dev/null
+run done "$idpv" --result="delivered" >/dev/null 2>&1
+[[ "$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${idpv};")" == "nvgrader" ]] \
+  && ok_t "no-verify: an ordinary deep delivery upgrades (DIVE-2719, unchanged)" \
+  || bad_t "upgrade baseline" "no grader attached to the non-opted-out row"
+
+run start "$idnv" >/dev/null
+run done "$idnv" --result="delivered" >/dev/null   # run() captures stderr to $TMP/err
+[[ "$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${idnv};")" == "nvgrader" ]] \
+  && ok_t "no-verify: the blast-radius upgrade OVERRIDES an explicit opt-out (file-time flag loses to delivery-time measurement)" \
+  || bad_t "optout must not bypass" "verifier='$(db "SELECT verifier FROM tasks WHERE id=${idnv};")' — a file-time flag suppressed a delivery-time rail"
+
+# ...and it says so. The defect DIVE-2730 was filed for is that the override was
+# SILENT, not that it happened — a persisted flag that changes no message would
+# leave that defect exactly where it was found.
+grep -q -- "--no-verify" "$TMP"/err \
+  && ok_t "no-verify: the override NAMES the opt-out it is overriding" \
+  || bad_t "override silent" "warn text does not mention the opt-out: $(tr '\n' ' ' <"$TMP"/err)"
+unset -f _task_delivery_paths _task_default_verifier
+. "$SRC/cmd_task.sh"
+
+# An explicit later attach supersedes the earlier refusal — otherwise the row
+# carries a live opt-out flag that contradicts its own grader.
+idnv2=$(run add --assignee=nvmaker --no-verify --body="w" -- "opted out, then graded anyway" | jf '.data.id')
+run verifier "$idnv2" nvgrader >/dev/null 2>&1
+[[ -z "$(db "SELECT COALESCE(verify_optout,'') FROM tasks WHERE id=${idnv2};")" ]] \
+  && ok_t "no-verify: 'task verifier' clears the opt-out it overrides" \
+  || bad_t "optout supersede" "still $(db "SELECT verify_optout FROM tasks WHERE id=${idnv2};") after an explicit attach"
+
 # The named exclusion list: data, not a code change.
 FIVE_VERIFY_EXCLUDE="main, dev2" _task_verify_excluded main \
   && ok_t "verify exclusion: a listed name is excluded" || bad_t "exclusion hit" "main not excluded"

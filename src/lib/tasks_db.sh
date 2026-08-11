@@ -165,7 +165,7 @@ require_sqlite() {
 # NOTE: projects/loop_runs/supervisor_events are ALSO defined inside gated
 # one-shot migration blocks in _tasks_db_migrate() below — edit both copies
 # together; tests/schema_sync_unit.sh fails CI if they diverge.
-_TASKS_SCHEMA_EPOCH='3098-1'   # DIVE-3098: +graded_at, +graded_by
+_TASKS_SCHEMA_EPOCH='2730-1'   # DIVE-2730: +verify_optout
 _tasks_schema() {
   cat <<'SQL'
 PRAGMA journal_mode=WAL;
@@ -608,7 +608,24 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- default" claim is never quietly false. NULL/0 for every task that got a real
   -- grader, opted out via --no-verify, or is trivial. Same integrity-invariant
   -- spirit as the council founder-excluded badge.
-  verify_unavailable      INTEGER
+  verify_unavailable      INTEGER,
+  -- DIVE-2730: the filer's EXPLICIT `--no-verify` at add time, set to 1 there and
+  -- NULL everywhere else. It exists because a decision and a default that produce
+  -- the same stored state ARE the same state: before this column, `--no-verify`
+  -- was a local shell var in `task add` that died with the process, so at
+  -- `task done` an explicit opt-out was byte-identical to a DIVE-969 auto-skipped
+  -- row (both verifier NULL, verify_unavailable NULL), so `task done` could not
+  -- NAME what it was overriding when DIVE-2719's UPGRADE arm re-attached a grader.
+  -- Distinct from verify_unavailable, which records that no distinct grader
+  -- EXISTED — this records that one was not WANTED.
+  -- IT IS A RECORD, NOT A CONTROL, and deliberately so: the upgrade still fires
+  -- on an opted-out row, because the flag is declared at FILE time and the blast
+  -- radius is measured at DELIVERY time, and a file-time sentence must not
+  -- pre-authorise closing a credentials diff nobody had written yet. What it buys
+  -- is that the override is stated instead of silent, and that the two NULLs stop
+  -- being one. Set only by `task add --no-verify`; cleared by
+  -- `task verifier <id> <agent>`, since an explicit attach supersedes the refusal.
+  verify_optout           INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_precedent ON tasks(need_type, ask_shape);
 CREATE INDEX IF NOT EXISTS idx_tasks_originated ON tasks(originated_by_objective);
@@ -1272,6 +1289,11 @@ _TASKS_ADDITIVE_COLUMNS=(
   'delivery_ref TEXT' 'delivered_at TEXT' 'delivery_ref_iteration INTEGER'
   'originated_by_objective INTEGER' 'originated_cycle INTEGER'
   'verify_unavailable INTEGER' 'last_skipped_at TEXT'
+  # DIVE-2730: the add-time `--no-verify`, persisted. Nullable — NULL is "the
+  # filer did not opt out", which is the truth for every pre-existing row, so the
+  # backfill is a no-op. See the CREATE TABLE comment for why an unpersisted
+  # refusal reads downstream as a default absence.
+  'verify_optout INTEGER'
   # DIVE-2272: per-template overlap policy. Both NULLABLE on purpose -- NULL is
   # 'skip' / 'the default bound', so the migration is a no-op for every existing
   # template AND an unclassified template stays visibly unclassified. See the
