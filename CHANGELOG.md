@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
+## v0.19.25 — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
 
 DIVE-3272 taught the supervisor BOARD to see a seat that is alive and closing nothing. The
 drill-down people actually type kept printing only liveness: `state: active / enabled` was
@@ -42,7 +42,7 @@ supervisor:  quota-exhausted / quota-exhausted — pane shows a model-capacity r
 - `agent list` is unchanged — it is the survey surface, and this is a per-agent drill-down
   (three sqlite reads), deliberately not an N-way fan-out.
 
-## Unreleased — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
+## v0.19.25 — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
 
 A gate reaches the filer's lead only if `_GATE_ENG_SHIP_RX` matches the ask or the row
 title. `gate_builder_routing` is OFF by default, so for an ordinary builder ship gate that
@@ -106,7 +106,7 @@ prose for identifiers.
   `gate_access_lead_clear`, `gate_internal_ops_floor`, `task_needs_human_parity`,
   `task_inbox_json_tier`, `push_unit`, `broker_surface`, + 15 more).
 
-## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
+## v0.19.25 — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
 
 DIVE-1935's first iteration was rejected, and for the right reason. It added a
 `sudo -n -u claude gh auth token` arm to `_gate_gh_token` justified by *"agents hold
