@@ -93,7 +93,7 @@ jobs:
           done
           # src/ fragments are concatenated by build.sh and carry no shebang of
           # their own, so the dialect has to be stated.
-          for f in src/*.sh; do
+          for f in src/*.sh src/task/*.sh; do
             echo "== shellcheck $f"
             shellcheck -S error --shell=bash "$f" || rc=1
           done

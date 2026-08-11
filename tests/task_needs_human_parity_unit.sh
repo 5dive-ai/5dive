@@ -153,7 +153,7 @@ fi
 # than calling the helper, and every behavioural arm above stays green while the tree
 # carries two copies that can drift apart on the next clause. main graded DIVE-3224's
 # merge by diffing the predicate byte-for-byte; this is that check, kept.
-n_disj=$(grep -c "^  printf '%s' \"( COALESCE(routed_reviewer,'') = ''" "$SRC/cmd_task.sh")
+n_disj=$(cat "$SRC/cmd_task.sh" "$SRC"/task/*.sh | grep -c "^  printf '%s' \"( COALESCE(routed_reviewer,'') = ''")
 [[ "$n_disj" == "1" ]] \
   && ok_t "S1 the human-gate disjunction is written EXACTLY once in cmd_task.sh" \
   || bad_t "S1 single copy" "found $n_disj definitions — a second copy is the defect this row closes"
@@ -161,12 +161,12 @@ n_disj=$(grep -c "^  printf '%s' \"( COALESCE(routed_reviewer,'') = ''" "$SRC/cm
 # projection — plus one definition. Written as an equality, not a floor: a third
 # caller appearing is not automatically wrong, but it is a new consumer of this
 # verdict and it should arrive with a reader looking at this line, not silently.
-n_call=$(grep -c '\$(_task_human_gate_pred)' "$SRC/cmd_task.sh")
-n_def=$(grep -c '^_task_human_gate_pred() {' "$SRC/cmd_task.sh")
+n_call=$(cat "$SRC/cmd_task.sh" "$SRC"/task/*.sh | grep -c '\$(_task_human_gate_pred)')
+n_def=$(cat "$SRC/cmd_task.sh" "$SRC"/task/*.sh | grep -c '^_task_human_gate_pred() {')
 [[ "$n_call" == "2" && "$n_def" == "1" ]] \
   && ok_t "S2 one definition, exactly two call sites (the inbox view and the ls projection)" \
   || bad_t "S2 call sites" "definitions=$n_def calls=$n_call — expected 1 and 2"
-grep -q "CASE WHEN \${_gate_open} AND ( \${_gate_human} ) THEN 1 ELSE 0 END AS needs_human" "$SRC/cmd_task.sh" \
+grep -q "CASE WHEN \${_gate_open} AND ( \${_gate_human} ) THEN 1 ELSE 0 END AS needs_human" "$SRC/cmd_task.sh" "$SRC"/task/*.sh \
   && ok_t "S3 the ls projection INTERPOLATES the helpers rather than restating them" \
   || bad_t "S3 interpolation" "the needs_human projection does not read from the helper variables"
 

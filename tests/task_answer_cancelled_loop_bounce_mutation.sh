@@ -19,7 +19,7 @@ PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n       %s\n' "$1" "${2:-}"; }
 
-target="$TMP/tree/src/cmd_task.sh"
+target="$TMP/tree/src/task/answer.sh"   # DIVE-3278: was src/cmd_task.sh
 old='  if (( _loop_bounce )) && [[ "$_prev_status" == "cancelled" ]]; then'
 new='  if false; then'
 if OLD="$old" NEW="$new" F="$target" python3 - <<'PY'

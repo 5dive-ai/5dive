@@ -300,10 +300,13 @@ if [[ -z "$MUTANT_CHILD" ]]; then
   mutate() { # <name> <sed-expr> <must-red-hint>
     local name="$1" expr="$2" hint="$3" md out rc
     md="$TMP/mut-$name"; mkdir -p "$md"; cp -r "$REPO_ROOT/src/." "$md/"
-    if ! sed -i "$expr" "$md/cmd_task.sh"; then
+    # DIVE-3278: `task` is src/task/*.sh now; sed the whole set and let the
+    # no-op check below still catch an anchor that moved out from under us.
+    if ! sed -i "$expr" "$md/cmd_task.sh" "$md"/task/*.sh; then
       MFAIL=$((MFAIL+1)); printf 'FAIL - mutant %s: sed could not apply\n' "$name"; return
     fi
-    if diff -q "$REPO_ROOT/src/cmd_task.sh" "$md/cmd_task.sh" >/dev/null; then
+    if diff -q "$REPO_ROOT/src/cmd_task.sh" "$md/cmd_task.sh" >/dev/null \
+       && diff -qr "$REPO_ROOT/src/task" "$md/task" >/dev/null; then
       MFAIL=$((MFAIL+1)); printf 'FAIL - mutant %s: the sed matched NOTHING — the anchor moved\n' "$name"; return
     fi
     out=$(MUT_SRC="$md" MUTANT_CHILD=1 bash "$REPO_ROOT/tests/$(basename "$0")" 2>&1); rc=$?

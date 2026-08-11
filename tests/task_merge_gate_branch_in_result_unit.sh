@@ -279,7 +279,7 @@ _r_hit="$(_rc_probe 'landed on DIVE-999-some-slug today')"
 [[ "${_r_hit%%|*}" == "0" && "${_r_hit#*|}" == "dive-999-some-slug" ]] \
   && ok_t "DIVE-2603: positive control — the extractor still finds a real branch (rc=0)" \
   || bad_t "DIVE-2603: positive control" "expected rc=0 and dive-999-some-slug, got ${_r_hit}"
-grep -qE '_br_cands=\$\(_gate_branch_refs_from_text [^)]*\) \|\| _br_cands=' "$SRC/cmd_task.sh" \
+grep -qE '_br_cands=\$\(_gate_branch_refs_from_text [^)]*\) \|\| _br_cands=' "$SRC/cmd_task.sh" "$SRC"/task/*.sh \
   && ok_t "DIVE-2603: the call site GUARDS the assignment so a no-match cannot kill the close" \
   || bad_t "DIVE-2603: call site guarded" "the \$( ) assignment is unguarded — under set -e + pipefail a result naming no branch kills 'task done' with empty stdout and stderr"
 
@@ -320,7 +320,7 @@ printf '%s' "$OUT" | grep -q 'dive-2556-handoff.md' \
 # shape this very ticket is about, caught by scripts/unguarded-probe-scan.sh in CI. A
 # bare substitution here would make the arm report "0 call sites" as a crash instead of
 # as the answer it is.
-_callers=$(grep -cE '^[^#]*_gate_branch_refs_from_text "' "$SRC/cmd_task.sh") || _callers=0
+_callers=$(cat "$SRC/cmd_task.sh" "$SRC"/task/*.sh | grep -cE '^[^#]*_gate_branch_refs_from_text "') || _callers=0
 [[ "$_callers" == "2" ]] \
   && ok_t 'DIVE-3265 6b: the extractor still has exactly 2 call sites — the declared-`Branch:` gate does not read it and was not widened' \
   || bad_t 'DIVE-3265 6b: extractor call-site count' "found $_callers call sites, expected 2 — a new caller inherits this filter; re-argue the bias before shipping it"

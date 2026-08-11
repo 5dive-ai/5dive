@@ -140,7 +140,7 @@ grep -q "refused for a reason" <<<"$OUT" \
 # --- Case 4: the instrumented-site count is DERIVED from the shipped bundle,
 #     never hand-maintained. A hand-kept constant drifts and then lies about
 #     coverage — and coverage is the only thing that keeps a 0 honest here.
-SITES_SRC="$(grep -oE 'policy_refuse "[^"]+" [a-z0-9-]+' src/cmd_task.sh | awk '{print $NF}' | sort -u | wc -l | tr -d ' ')"
+SITES_SRC="$(cat src/cmd_task.sh src/task/*.sh | grep -oE 'policy_refuse "[^"]+" [a-z0-9-]+' | awk '{print $NF}' | sort -u | wc -l | tr -d ' ')"
 SITES_BUNDLE="$(grep -oE 'policy_refuse "[^"]+" [a-z0-9-]+' "$BUNDLE" | awk '{print $NF}' | sort -u | wc -l | tr -d ' ')"
 [[ "$SITES_SRC" -gt 0 ]] \
   && ok_t "at least one policy site is instrumented ($SITES_SRC distinct policies)" \
@@ -150,7 +150,7 @@ SITES_BUNDLE="$(grep -oE 'policy_refuse "[^"]+" [a-z0-9-]+' "$BUNDLE" | awk '{pr
   || bad_t "bundle/source drift" "src=$SITES_SRC bundle=$SITES_BUNDLE — rebuild"
 # Slugs must be unique per policy: two sites sharing a slug would silently
 # collapse into one and under-report coverage.
-DUPES="$(grep -oE 'policy_refuse "[^"]+" [a-z0-9-]+' src/cmd_task.sh | awk '{print $NF}' | sort | uniq -d | tr '\n' ' ')"
+DUPES="$(cat src/cmd_task.sh src/task/*.sh | grep -oE 'policy_refuse "[^"]+" [a-z0-9-]+' | awk '{print $NF}' | sort | uniq -d | tr '\n' ' ')"
 [[ -z "$DUPES" ]] \
   && ok_t "every instrumented site has a DISTINCT policy slug" \
   || bad_t "duplicate slugs" "$DUPES"
@@ -182,13 +182,13 @@ if pinned_blob "$PRE_INSTRUMENT_REF" src/cmd_task.sh "$TMP/orig_task.sh"; then
   while read -r code slug; do
     # the message is unchanged by instrumentation, so match the site by its slug's
     # original `fail "<code>"` line via the message text that follows it
-    msg="$(grep -oE "policy_refuse \"[^\"]+\" ${slug} \"[^\"]*\" \"?[^\"]{0,40}" src/cmd_task.sh | head -1)"
+    msg="$(cat src/cmd_task.sh src/task/*.sh | grep -oE "policy_refuse \"[^\"]+\" ${slug} \"[^\"]*\" \"?[^\"]{0,40}" | head -1)"
     : "${msg:=}"
     [[ -n "$code" ]] || { drift=1; continue; }
-  done < <(grep -oE 'policy_refuse "\$E_[A-Z_]+" [a-z0-9-]+' src/cmd_task.sh | sed 's/policy_refuse "//; s/"//')
+  done < <(cat src/cmd_task.sh src/task/*.sh | grep -oE 'policy_refuse "\$E_[A-Z_]+" [a-z0-9-]+' | sed 's/policy_refuse "//; s/"//')
   # Direct check: the multiset of exit codes used at instrumented sites must be a
   # SUBSET of the codes those same messages carried on origin/main.
-  now_codes="$(grep -oE 'policy_refuse "\$E_[A-Z_]+"' src/cmd_task.sh | grep -oE '\$E_[A-Z_]+' | sort | uniq -c | tr -s ' ' | sed 's/^ //')"
+  now_codes="$(cat src/cmd_task.sh src/task/*.sh | grep -oE 'policy_refuse "\$E_[A-Z_]+"' | grep -oE '\$E_[A-Z_]+' | sort | uniq -c | tr -s ' ' | sed 's/^ //')"
   [[ -n "$now_codes" ]] && ok_t "instrumented sites carry explicit exit codes (not a hardcoded constant)" \
     || bad_t "no explicit codes" "policy_refuse sites do not pass an exit code"
   grep -q 'local code="\$1"' src/lib/tasks_db.sh \
@@ -207,7 +207,7 @@ if pinned_blob "$PRE_INSTRUMENT_REF" src/cmd_task.sh "$TMP/orig_task.sh"; then
     && ok_t "baseline ${PRE_INSTRUMENT_REF}:src/cmd_task.sh carries $base_fails direct fail sites — the subset check below has a denominator" \
     || bad_t "baseline carries NO direct fail sites" "${PRE_INSTRUMENT_REF}:src/cmd_task.sh has no \`fail \"\$E_…\"\` at all, so 'every code existed at a refusal there' cannot be answered — the pin is wrong or the file moved"
   unknown=""
-  for c in $(grep -oE 'policy_refuse "\$E_[A-Z_]+"' src/cmd_task.sh | grep -oE 'E_[A-Z_]+' | sort -u); do
+  for c in $(cat src/cmd_task.sh src/task/*.sh | grep -oE 'policy_refuse "\$E_[A-Z_]+"' | grep -oE 'E_[A-Z_]+' | sort -u); do
     grep -qF "fail \"\$${c}\"" "$TMP/orig_task.sh" || unknown="$unknown $c"
   done
   [[ -z "$unknown" ]] \
@@ -226,7 +226,7 @@ fi
 #     to validation errors the number inflates into meaninglessness, so pin the
 #     instrumented set: every slug must be one a human chose, not a generic.
 for bad in usage validation bad-arg unknown-arg missing-arg; do
-  grep -qE "policy_refuse \"[^\"]+\" ${bad}( |$)" src/cmd_task.sh \
+  grep -qE "policy_refuse \"[^\"]+\" ${bad}( |$)" src/cmd_task.sh src/task/*.sh \
     && bad_t "policy_refuse used for a validation error" "slug '$bad' is not a policy refusal"
 done
 ok_t "no validation-error slugs are instrumented as policy refusals"

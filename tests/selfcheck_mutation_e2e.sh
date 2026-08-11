@@ -122,8 +122,8 @@ assert_mutation() {
 # notify path that recorded nothing. The gate is filed, reports OK, records NOTHING —
 # the exact live state that left 194 undelivered rows.
 mut_gate() {
-  grep -q 'if (( ${TASK_GATE_DELIVERY_ROWS:-0} == 0 )); then' "$WORK/src/cmd_task.sh" || return 1
-  sed -i 's/if (( ${TASK_GATE_DELIVERY_ROWS:-0} == 0 )); then/if false; then/' "$WORK/src/cmd_task.sh"
+  grep -q 'if (( ${TASK_GATE_DELIVERY_ROWS:-0} == 0 )); then' "$WORK/src/task/notify.sh" || return 1
+  sed -i 's/if (( ${TASK_GATE_DELIVERY_ROWS:-0} == 0 )); then/if false; then/' "$WORK/src/task/notify.sh"
   rebuild
 }
 assert_mutation gate-delivery "the gate delivery assertion is removed" mut_gate "reported as pinged"
