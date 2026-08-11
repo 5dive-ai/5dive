@@ -347,8 +347,8 @@ write_registry
 #     it proves the call EXISTS and sits after _hb_mark_run (whose echoed count it
 #     consumes), not that a live tick reaches it.
 # ---------------------------------------------------------------------------
-_wire=$(grep -n '_hb_nudge_enforce "\$name" "\$task_id"' "$SRC/cmd_heartbeat.sh" | cut -d: -f1 | head -1)
-_mark=$(grep -n 'nudge_n=\$(with_registry_lock _hb_mark_run' "$SRC/cmd_heartbeat.sh" | cut -d: -f1 | head -1)
+_wire=$(grep -n '_hb_nudge_enforce "\$name" "\$task_id"' "$SRC/cmd_heartbeat.sh" | cut -d: -f1 | head -1) || _wire=""
+_mark=$(grep -n 'nudge_n=\$(with_registry_lock _hb_mark_run' "$SRC/cmd_heartbeat.sh" | cut -d: -f1 | head -1) || _mark=""
 [[ -n "$_wire" && -n "$_mark" ]] && (( _wire > _mark )) \
   && ok_t "the tick path CALLS the ladder, after _hb_mark_run — a consumer that is never invoked is the original bug" \
   || bad_t "the tick path calls the ladder after _hb_mark_run" "call site line=[${_wire:-none}] _hb_mark_run line=[${_mark:-none}]"
