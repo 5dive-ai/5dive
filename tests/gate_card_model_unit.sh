@@ -55,6 +55,21 @@ export FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"
 mkdir -p "$TASKS_DIR"
 tasks_db_init; _tasks_db_migrate >/dev/null 2>&1
 
+# DIVE-3228 — DO NOT WRITE TO THE REAL FLEET AUDIT LOG.
+# `_task_store_audit_log` is fenced on STORE IDENTITY, and this harness declares
+# its own fixture DB as prod (the DIVE-1506 allowlist, needed to drive the
+# human-facing path at all) — so that fence reads TRUE here and every audit row
+# lands in /var/log/5dive/agent-audit.log for real. Measured: an earlier cut of
+# this suite put 235 fixture rows (DIVE-C5..C8) into the production audit log,
+# which is the exact DIVE-1968 contamination a whole ticket was spent removing.
+# Stubbing `audit_log` is the established isolation (see gate_answer_audit_unit),
+# and the offset arm below proves it holds rather than assuming it.
+_REAL_AUDIT_BASE=/var/log/5dive/agent-audit.log
+_MINE_AUDIT_BEFORE=0
+[[ -r "$_REAL_AUDIT_BASE" ]] && _MINE_AUDIT_BEFORE=$(grep -c 'task=DIVE-C[0-9]' "$_REAL_AUDIT_BASE" 2>/dev/null || echo 0)
+AUDIT_CALLS="$TMP/audit.calls"; : >"$AUDIT_CALLS"
+audit_log() { printf '%s\n' "$*" >>"$AUDIT_CALLS"; }
+
 CONNECTORS_DIR="$TMP/connectors"; mkdir -p "$CONNECTORS_DIR"
 printf 'TELEGRAM_BOT_TOKEN=tok-marketing\n' >"$CONNECTORS_DIR/telegram-marketing.env"
 # _task_gate_bot_token falls back to an AMBIENT $TELEGRAM_BOT_TOKEN when the named
@@ -271,6 +286,23 @@ while IFS= read -r fn; do
   fi
 done <<<"$egress"
 chk "egress: EVERY Bot API caller in the sourced modules is stubbed" "" "$unstubbed"
+
+# ---- isolation: nothing from this suite reached the real fleet audit log ----
+# Counted BY THIS SUITE'S OWN FIXTURE IDENTS, not by the file's byte offset.
+# gate_answer_audit_unit's section-5 arm uses an offset on
+# /var/log/5dive/agent-audit.log, and on this box that is a shared file every
+# agent writes to continuously — so it reds whenever anyone else acts during the
+# run, whatever the cause. Measured 2026-08-11: it failed twice in sweeps while
+# passing 6/6 standalone, and a control/treatment pair (one unrelated line
+# appended mid-run by another process) reproduces the failure exactly. An ident
+# filter measures "did I write" instead of "did the file grow", which is the
+# question actually being asked.
+_REAL_AUDIT=/var/log/5dive/agent-audit.log
+_mine_before="${_MINE_AUDIT_BEFORE:-0}"
+_mine_after=0
+[[ -r "$_REAL_AUDIT" ]] && _mine_after=$(grep -c 'task=DIVE-C[0-9]' "$_REAL_AUDIT" 2>/dev/null || echo 0)
+chk "isolation: this suite wrote NO fixture rows to the real fleet audit log" \
+    "$_mine_before" "$_mine_after"
 
 printf -- '-----\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
