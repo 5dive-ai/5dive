@@ -2555,6 +2555,29 @@ _gate_gh_credentialed() {
 # remedy, so the same words, emitted from one place: two copies of a refusal this long
 # drift, and then they disagree about which remedies a verifier seat can reach, which
 # is the failure this ticket is about.
+# DIVE-1935 (found by quinn, 2026-08-11): CLAUSE 1 OF THE DOCUMENTED EXIT WAS A
+# TIP-EQUALITY TEST WEARING A MERGE TEST'S COSTUME, and it shipped in v0.19.20.
+#
+#     git ls-remote <repo-url> refs/heads/main | grep -q <merge-sha>
+#
+# `ls-remote <url> refs/heads/main` resolves ONE ref to its CURRENT VALUE, so that
+# matches only while the merge sha IS STILL THE TIP of main. Main moves 20+ commits a
+# day here, so the window in which the gate's own authorised exit works is about one
+# commit wide — and outside it the script exits non-zero and reports NOT MERGED for a
+# PR that merged. Failing CLOSED, on precisely the rows the exit exists to rescue, and
+# handed to the caller as the thing to run. quinn measured it against the live ref and
+# refused to run it.
+#
+# `git merge-base --is-ancestor <sha> origin/main` asks the question that was meant:
+# is the merge REACHABLE from main, whenever it landed. CLAUSE 3 (`git grep` over
+# origin/main for a symbol the PR added) is KEPT deliberately — it is the squash-proof
+# half, and it still answers when the sha exists nowhere on main because the PR was
+# squashed. The rewrite also drops a pipe that was never needed: `cmd | grep -q` under
+# `set -o pipefail` returns 141 when grep exits early on a match, i.e. it can fail
+# EXACTLY when it succeeds (community/wiki/grep-q-under-pipefail-turns-a-match-into-a
+# -failed-check.md). Latent for a one-line producer like this, per quinn, and not the
+# bug being fixed — but there is no reason to re-introduce the shape while rewriting
+# the line.
 _gate_refuse_no_rail() {
   local ident="$1" subject="$2"
   # DIVE-2770: name WHICH way the credential-free rail failed. Rate-limited clears
@@ -2566,7 +2589,7 @@ _gate_refuse_no_rail() {
   # one that structurally can never resolve, and that ambiguity is what let an inert
   # gate stay invisible for a fleet-wide census.
   local _tokwhy; _tokwhy="$(_gate_tok_why)"
-  policy_refuse "$E_CONFLICT" done-merge-gate-no-credential DIVE-2318 "$ident" "$ident cannot close: the merge gate COULD NOT CHECK whether ${subject} landed — no gh credential resolved in this caller's environment, the machine-account rail is unreachable, AND the credential-free rail could not answer either (DIVE-2770: an unauthenticated read of a public repo). No query ran at all. ${_why} This says NOTHING about the merge; do not read it as 'not merged'. WHICH OF TWO CAUSES THIS IS decides what you should do, and the gate cannot tell them apart from here. (a) BY FAULT: a builder that should hold the \`_gh_do\` grant is missing it — a provisioning problem with a name. Check it with \`5dive gh whoami\`; if the bot line is UNRESOLVED and you are a builder, that is the thing to fix (\`agent create --can-push\`), or re-run with a token (\`GH_TOKEN=\$(sudo -u claude gh auth token) 5dive task done $ident ...\`). (b) BY DESIGN: on a VERIFIER seat an UNRESOLVED bot line is the CORRECT state — \`_gh_do\` is the can-push grant a grader must not hold, so no credential is coming, and handing the close to agent-main is not open to you either when the DIVE-477 writer-is-not-grader rail names YOU as the verifier of record. In case (b) the authorised terminal move is \`5dive task verify $ident --cmd=<script>\`, where the script'\''s EXIT STATUS proves the merge rather than asserting it — e.g. \`git ls-remote <repo-url> refs/heads/main | grep -q <merge-sha> && git fetch -q origin main && git grep -q <a-symbol-the-PR-added> origin/main -- <path>\`. That answers this gate'\''s question by another instrument instead of bypassing it, and it is squash-proof where a sha comparison is not. \`--force-merge-gate\` does NOT reach this refusal: it escapes a gate that RAN and disagreed, never one that asked nothing. Copy your verdict into the BODY before you close (\`task set-body --append\`) — \`task verify\` OVERWRITES result, and a closed body is frozen. \`task merge-audit --limit=1\` reports the same missing credential. WHERE IT ACTUALLY STOPPED (DIVE-1935) — ${_tokwhy}; machine-account rail: $(_gate_gh_bot_ok && printf 'available' || printf 'not permitted on this seat'). Re-run that resolution on its own, graded against a known-merged PR, with \`5dive task merge-gate-selftest\`."
+  policy_refuse "$E_CONFLICT" done-merge-gate-no-credential DIVE-2318 "$ident" "$ident cannot close: the merge gate COULD NOT CHECK whether ${subject} landed — no gh credential resolved in this caller's environment, the machine-account rail is unreachable, AND the credential-free rail could not answer either (DIVE-2770: an unauthenticated read of a public repo). No query ran at all. ${_why} This says NOTHING about the merge; do not read it as 'not merged'. WHICH OF TWO CAUSES THIS IS decides what you should do, and the gate cannot tell them apart from here. (a) BY FAULT: a builder that should hold the \`_gh_do\` grant is missing it — a provisioning problem with a name. Check it with \`5dive gh whoami\`; if the bot line is UNRESOLVED and you are a builder, that is the thing to fix (\`agent create --can-push\`), or re-run with a token (\`GH_TOKEN=\$(sudo -u claude gh auth token) 5dive task done $ident ...\`). (b) BY DESIGN: on a VERIFIER seat an UNRESOLVED bot line is the CORRECT state — \`_gh_do\` is the can-push grant a grader must not hold, so no credential is coming, and handing the close to agent-main is not open to you either when the DIVE-477 writer-is-not-grader rail names YOU as the verifier of record. In case (b) the authorised terminal move is \`5dive task verify $ident --cmd=<script>\`, where the script'\''s EXIT STATUS proves the merge rather than asserting it — e.g. \`git fetch -q origin main && git merge-base --is-ancestor <merge-sha> origin/main && git grep -q <a-symbol-the-PR-added> origin/main -- <path>\`. That answers this gate'\''s question by another instrument instead of bypassing it, and it is squash-proof where a sha comparison is not. \`--force-merge-gate\` does NOT reach this refusal: it escapes a gate that RAN and disagreed, never one that asked nothing. Copy your verdict into the BODY before you close (\`task set-body --append\`) — \`task verify\` OVERWRITES result, and a closed body is frozen. \`task merge-audit --limit=1\` reports the same missing credential. WHERE IT ACTUALLY STOPPED (DIVE-1935) — ${_tokwhy}; machine-account rail: $(_gate_gh_bot_ok && printf 'available' || printf 'not permitted on this seat'). Re-run that resolution on its own, graded against a known-merged PR, with \`5dive task merge-gate-selftest\`."
 }
 
 # DIVE-2770: THE ANONYMOUS RAIL — the gate's own question has a credential-free
@@ -3891,8 +3914,23 @@ _gate_branch_ident_on_main() {
   #         "" = unreachable (no token, API down, timeout)
   local slug="$1" tok="$3" ident="$4" main_br n per page walked out hits count
   main_br="${FIVE_GATE_MAIN_BRANCH:-main}"
-  n="${FIVE_GATE_ANCESTRY_SCAN:-50}"
-  [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]] || n=50
+  # DIVE-1935, 2026-08-11: default raised 50 -> 250 ON FRICTION GROUNDS ONLY, and the
+  # distinction is the whole reason this comment exists. THERE ARE ZERO STUCK ROWS:
+  # of 37 rows refused in 24h, 30 closed and 5 were cancelled. Nobody should read this
+  # as unblocking a backlog and go looking for movement in a number that was never
+  # moving.
+  #
+  # What it buys is RETRIES. The refusal is inconclusive-by-construction — it walks the
+  # bound per repo across 8 repos and gives up — so a caller below the bound pays for it
+  # in attempts, not in a permanent block: DIVE-2093 burned 2, and quinn's DIVE-3184,
+  # DIVE-3229 and DIVE-3230 burned 3 each. On a day where main takes 20+ commits, 50 is
+  # simply too short to answer the question the scan was asked.
+  #
+  # `FIVE_GATE_ANCESTRY_SCAN` stays as the override, and stays deliberately: the bound
+  # exists so the walk terminates, and a raised default is not a reason to remove the
+  # knob that makes it tunable in either direction.
+  n="${FIVE_GATE_ANCESTRY_SCAN:-250}"
+  [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]] || n=250
   # SUBJECT LINE ONLY, not the whole message. Searching main widened the attribution
   # set: every commit reachable from a branch tip is on main, but not every commit on
   # main is reachable from that tip — so a whole-message match accepts INCIDENTAL

@@ -163,5 +163,27 @@ out=$(cmd_task_merge_gate_selftest --pr="https://example.com/x" 2>&1); rc=$?
   && ok_t "T7 --pr must be a pull-request URL" \
   || bad_t "T7 --pr validation" "rc=$rc out=$out"
 
+# --- T8/T9: THE ADVICE THE REFUSAL HANDS OUT MUST ALSO BE TRUE. -------------
+# These are TEXT assertions on the emitted string, and deliberately so: the exit the
+# `done-merge-gate-no-credential` refusal prints is a shell script the CALLER runs, so
+# its correctness cannot be executed from here — only read. It shipped wrong in
+# v0.19.20 (quinn, 2026-08-11): clause 1 was `git ls-remote <url> refs/heads/main |
+# grep -q <merge-sha>`, which resolves ONE ref to its CURRENT value and therefore only
+# matches while the merge sha is still the TIP of main. Main takes 20+ commits a day,
+# so the gate's own authorised exit worked for about one commit and reported NOT MERGED
+# for merged PRs outside that window — failing closed, on the rows it exists to rescue.
+# Comment lines are excluded because the defect is documented in one, on purpose.
+CODE_NOCOMMENT="$TMP/cmd_task.nocomment"
+grep -v '^[[:space:]]*#' "$SRC/cmd_task.sh" >"$CODE_NOCOMMENT"
+
+grep -q -- 'merge-base --is-ancestor <merge-sha> origin/main' "$CODE_NOCOMMENT" \
+  && ok_t "T8 the documented exit tests ANCESTRY (reachable from main whenever it landed)" \
+  || bad_t "T8 ancestry form in the refusal" "not found in emitted (non-comment) source"
+
+grep -q -- 'ls-remote <repo-url> refs/heads/main' "$CODE_NOCOMMENT" \
+  && bad_t "T9 the refusal must not hand out a tip-equality test" \
+          "the ls-remote|grep -q form is still emitted" \
+  || ok_t "T9 the tip-equality form is gone from the emitted refusal (kept only in a comment)"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
