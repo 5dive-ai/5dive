@@ -62,6 +62,7 @@ _task_usage() {
 
   loops [--stuck] [--escalate-stuck] [--all] [--runs] [--watch[=secs]] [--kill <loopId>]
   merge-audit [--limit=N] [--json]              closed rows whose named PR never merged
+  merge-gate-selftest [--pr=<url>] [--json]     can THIS seat's merge-gate actually query GitHub?
   gate-history <id>                             displaced gates + when they retired
   reclaim <id>|--all [--dry-run]                reclaim node_modules from closed worktrees
 
@@ -205,6 +206,7 @@ cmd_task() {
     done|close)      cmd_task_done "$@" ;;
     deliver)         cmd_task_deliver "$@" ;;
     merge-audit)     cmd_task_merge_audit "$@" ;;   # DIVE-1935 retrospective sweep
+    merge-gate-selftest) cmd_task_merge_gate_selftest "$@" ;;  # DIVE-1935 instrument check
     verify)          cmd_task_verify "$@" ;;
     verifier)        cmd_task_verifier "$@" ;;
     reject)          cmd_task_reject "$@" ;;
@@ -2348,6 +2350,55 @@ cmd_task_verifier() {
      --arg i "$id" --arg id "$ident" --arg v "$who" --arg a "$new_owner" --arg ac "$new_accept" --arg m "$mid_handoff" --arg r "$repoint"
 }
 
+# DIVE-1935 (iteration 2): THE GATE ASSERTS ITS OWN INSTRUMENT.
+#
+# Iteration 1 was rejected for a reason that is about EVIDENCE, not about the arm it
+# added: `_gate_gh_token`'s last arm was justified by "agents hold passwordless sudo
+# on this host", which is a per-SEAT grant written as a HOST property. Census from
+# `5dive agent list --json` at the time: root-all 7, cli-root 4, cli-scoped 5 — and a
+# `cli-scoped` sudoers (`NOPASSWD: /usr/local/bin/5dive *`) cannot run `gh` as
+# `claude` at all, so `sudo -n` is refused, `-n` makes that silent, `|| true` swallows
+# it, and resolution returns EMPTY on 9 of 16 seats.
+#
+# THE DEFECT WAS UNFALSIFIABLE FROM THE CODE, which is why a fourth fallback would
+# have inherited it: nothing the resolver does tells you WHICH arm declined, so an
+# inert gate looks identical from the seat where it works and from the seat where it
+# does not. Every arm below therefore leaves a CRUMB naming its own outcome, and the
+# refusals/warnings downstream print the crumbs plus the seat they were taken on.
+# `5dive task merge-gate-selftest` runs the same resolution deliberately and grades it
+# against a known-merged PR, so the census above is reproducible by anyone on their own
+# seat instead of being a one-off measurement by whoever happened to hold root.
+#
+# SUBSHELL, SO A FILE (the `_GATE_ANON_STATEF` idiom next door, same reason): every
+# caller reads the resolver through `$(...)`, so a variable set inside it dies with the
+# child. `$$` is the top-level pid even inside a command substitution, which is exactly
+# the property needed to hand the crumbs back to the parent.
+_GATE_TOK_TRACEF="${TMPDIR:-/tmp}/.5dive-gate-tok-trace.$$"
+
+_gate_tok_note() { printf '%s\n' "$1" >>"$_GATE_TOK_TRACEF" 2>/dev/null || true; }
+
+# _gate_seat — WHICH seat this ran on. The answer to "is the gate inert here?" is a
+# property of the account, not of the host, and every diagnostic that omits it invites
+# the same host-wide generalisation that produced this ticket.
+_gate_seat() {
+  printf '%s@%s uid=%s' "$(id -un 2>/dev/null || printf '?')" \
+                        "$(hostname -s 2>/dev/null || printf '?')" \
+                        "$(id -u 2>/dev/null || printf '?')"
+}
+
+# _gate_tok_why — the per-arm trace of the LAST resolution in this process, one line.
+# Non-destructive (unlike `_gate_anon_why`): several sites may print it, and a second
+# reader getting silence would reproduce this ticket's own failure shape.
+_gate_tok_why() {
+  local _t
+  # awk, not `paste -sd'; '`: paste treats a multi-char -d as a CYCLE of single
+  # delimiters, so it joins with ';' then ' ' alternately and the trace comes out
+  # mis-punctuated. Caught by reading the live output, not by the syntax check.
+  _t=$(awk '{printf "%s%s", (NR>1?"; ":""), $0}' "$_GATE_TOK_TRACEF" 2>/dev/null || printf '')
+  [[ -n "$_t" ]] || { printf 'no token resolution ran in this process'; return 0; }
+  printf 'seat %s: %s' "$(_gate_seat)" "$_t"
+}
+
 # _gate_gh_token — resolve a usable gh auth token for the DIVE-1830 merge-gate's
 # read-only PR-state queries. `task done` normally runs under sudo (EUID 0), which
 # has no gh login of its own, and the acting agent may itself be non-gh-authed
@@ -2370,18 +2421,30 @@ cmd_task_verifier() {
 # Only ever used for read-only `gh pr view`/`gh pr list`.
 _gate_gh_token() {
   local t u
+  : >"$_GATE_TOK_TRACEF" 2>/dev/null || true
   t="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
-  [[ -n "$t" ]] && { printf '%s' "$t"; return 0; }
+  if [[ -n "$t" ]]; then
+    _gate_tok_note "[1 env GH_TOKEN/GITHUB_TOKEN] RESOLVED"; printf '%s' "$t"; return 0
+  fi
+  _gate_tok_note "[1 env GH_TOKEN/GITHUB_TOKEN] absent"
   u="${SUDO_USER:-}"
   if [[ -n "$u" && "$u" != "root" ]] && command -v sudo >/dev/null 2>&1; then
     t=$(sudo -n -u "$u" gh auth token 2>/dev/null || true)
-    [[ -n "$t" ]] && { printf '%s' "$t"; return 0; }
+    if [[ -n "$t" ]]; then
+      _gate_tok_note "[2 sudo -u $u gh auth token] RESOLVED"; printf '%s' "$t"; return 0
+    fi
+    _gate_tok_note "[2 sudo -u $u gh auth token] empty (invoker not gh-authed, or sudo refused)"
+  else
+    _gate_tok_note "[2 sudo -u \$SUDO_USER] skipped (no non-root SUDO_USER)"
   fi
   # Our own gh login, when we happen to be running as an authed user directly.
   # DIVE-1935: this MUST stay ahead of the `claude` fallback below — a caller's own
   # credential always wins over borrowing another account's.
   t=$(gh auth token 2>/dev/null || true)
-  [[ -n "$t" ]] && { printf '%s' "$t"; return 0; }
+  if [[ -n "$t" ]]; then
+    _gate_tok_note "[3 own gh auth token] RESOLVED"; printf '%s' "$t"; return 0
+  fi
+  _gate_tok_note "[3 own gh auth token] empty (this account has no gh login)"
   # DIVE-1935: the `claude` fallback was gated on `id -un == root`, so it only ran
   # for root/sudo callers. Every agent-* account closes tasks as ITSELF (plain
   # `5dive task done`, no sudo) and none of them are gh-authed — so resolution
@@ -2389,9 +2452,29 @@ _gate_gh_token() {
   # was inert on every close it was written to police. Agents hold passwordless
   # sudo on this host, so try `claude` for non-root callers too; `sudo -n` keeps it
   # a silent no-op (never a password prompt) where that isn't true.
+  # DIVE-1935 iteration 2: `sudo -n` is REFUSED (not merely empty) on a cli-scoped
+  # seat, and the two outcomes have different remedies — "claude has no gh login"
+  # is a host fault, "you may not run sudo as claude" is this seat's sudoers. `-n`
+  # made both silent, so they were indistinguishable; separate them here.
   if command -v sudo >/dev/null 2>&1 && [[ "$(id -un 2>/dev/null)" != "claude" ]]; then
-    t=$(sudo -n -u claude gh auth token 2>/dev/null || true)
-    [[ -n "$t" ]] && { printf '%s' "$t"; return 0; }
+    # The classification reads sudo's OWN stderr rather than asking a second time
+    # (`sudo -n -u claude true`). Deliberate: an extra probe changes the call
+    # sequence three sibling harnesses assert on, and a diagnostic that alters the
+    # thing it is diagnosing is worth less than the sentence it prints.
+    local _e4; _e4="${TMPDIR:-/tmp}/.5dive-gate-sudo-err.$$"
+    t=$(sudo -n -u claude gh auth token 2>"$_e4" || true)
+    if [[ -n "$t" ]]; then
+      rm -f "$_e4" 2>/dev/null || true
+      _gate_tok_note "[4 sudo -u claude gh auth token] RESOLVED"; printf '%s' "$t"; return 0
+    fi
+    if grep -qiE 'password is required|not allowed to execute|may not run|no tty' "$_e4" 2>/dev/null; then
+      _gate_tok_note "[4 sudo -u claude gh auth token] REFUSED by sudoers on this seat (scoped grant: no general sudo)"
+    else
+      _gate_tok_note "[4 sudo -u claude gh auth token] empty (sudo permitted; claude holds no gh login)"
+    fi
+    rm -f "$_e4" 2>/dev/null || true
+  else
+    _gate_tok_note "[4 sudo -u claude] skipped (no sudo, or already running as claude)"
   fi
   printf ''
 }
@@ -2472,13 +2555,41 @@ _gate_gh_credentialed() {
 # remedy, so the same words, emitted from one place: two copies of a refusal this long
 # drift, and then they disagree about which remedies a verifier seat can reach, which
 # is the failure this ticket is about.
+# DIVE-1935 (found by quinn, 2026-08-11): CLAUSE 1 OF THE DOCUMENTED EXIT WAS A
+# TIP-EQUALITY TEST WEARING A MERGE TEST'S COSTUME, and it shipped in v0.19.20.
+#
+#     git ls-remote <repo-url> refs/heads/main | grep -q <merge-sha>
+#
+# `ls-remote <url> refs/heads/main` resolves ONE ref to its CURRENT VALUE, so that
+# matches only while the merge sha IS STILL THE TIP of main. Main moves 20+ commits a
+# day here, so the window in which the gate's own authorised exit works is about one
+# commit wide — and outside it the script exits non-zero and reports NOT MERGED for a
+# PR that merged. Failing CLOSED, on precisely the rows the exit exists to rescue, and
+# handed to the caller as the thing to run. quinn measured it against the live ref and
+# refused to run it.
+#
+# `git merge-base --is-ancestor <sha> origin/main` asks the question that was meant:
+# is the merge REACHABLE from main, whenever it landed. CLAUSE 3 (`git grep` over
+# origin/main for a symbol the PR added) is KEPT deliberately — it is the squash-proof
+# half, and it still answers when the sha exists nowhere on main because the PR was
+# squashed. The rewrite also drops a pipe that was never needed: `cmd | grep -q` under
+# `set -o pipefail` returns 141 when grep exits early on a match, i.e. it can fail
+# EXACTLY when it succeeds (community/wiki/grep-q-under-pipefail-turns-a-match-into-a
+# -failed-check.md). Latent for a one-line producer like this, per quinn, and not the
+# bug being fixed — but there is no reason to re-introduce the shape while rewriting
+# the line.
 _gate_refuse_no_rail() {
   local ident="$1" subject="$2"
   # DIVE-2770: name WHICH way the credential-free rail failed. Rate-limited clears
   # by itself; a private repo never will. One sentence, and it decides whether the
   # reader waits or reaches for `task verify`.
   local _why; _why="$(_gate_anon_why)"
-  policy_refuse "$E_CONFLICT" done-merge-gate-no-credential DIVE-2318 "$ident" "$ident cannot close: the merge gate COULD NOT CHECK whether ${subject} landed — no gh credential resolved in this caller's environment, the machine-account rail is unreachable, AND the credential-free rail could not answer either (DIVE-2770: an unauthenticated read of a public repo). No query ran at all. ${_why} This says NOTHING about the merge; do not read it as 'not merged'. WHICH OF TWO CAUSES THIS IS decides what you should do, and the gate cannot tell them apart from here. (a) BY FAULT: a builder that should hold the \`_gh_do\` grant is missing it — a provisioning problem with a name. Check it with \`5dive gh whoami\`; if the bot line is UNRESOLVED and you are a builder, that is the thing to fix (\`agent create --can-push\`), or re-run with a token (\`GH_TOKEN=\$(sudo -u claude gh auth token) 5dive task done $ident ...\`). (b) BY DESIGN: on a VERIFIER seat an UNRESOLVED bot line is the CORRECT state — \`_gh_do\` is the can-push grant a grader must not hold, so no credential is coming, and handing the close to agent-main is not open to you either when the DIVE-477 writer-is-not-grader rail names YOU as the verifier of record. In case (b) the authorised terminal move is \`5dive task verify $ident --cmd=<script>\`, where the script'\''s EXIT STATUS proves the merge rather than asserting it — e.g. \`git ls-remote <repo-url> refs/heads/main | grep -q <merge-sha> && git fetch -q origin main && git grep -q <a-symbol-the-PR-added> origin/main -- <path>\`. That answers this gate'\''s question by another instrument instead of bypassing it, and it is squash-proof where a sha comparison is not. \`--force-merge-gate\` does NOT reach this refusal: it escapes a gate that RAN and disagreed, never one that asked nothing. Copy your verdict into the BODY before you close (\`task set-body --append\`) — \`task verify\` OVERWRITES result, and a closed body is frozen. \`task merge-audit --limit=1\` reports the same missing credential."
+  # DIVE-1935 iteration 2: name WHICH seat and WHICH arm, not just "no credential".
+  # The generic sentence reads the same on a seat that is momentarily unauthed and on
+  # one that structurally can never resolve, and that ambiguity is what let an inert
+  # gate stay invisible for a fleet-wide census.
+  local _tokwhy; _tokwhy="$(_gate_tok_why)"
+  policy_refuse "$E_CONFLICT" done-merge-gate-no-credential DIVE-2318 "$ident" "$ident cannot close: the merge gate COULD NOT CHECK whether ${subject} landed — no gh credential resolved in this caller's environment, the machine-account rail is unreachable, AND the credential-free rail could not answer either (DIVE-2770: an unauthenticated read of a public repo). No query ran at all. ${_why} This says NOTHING about the merge; do not read it as 'not merged'. WHICH OF TWO CAUSES THIS IS decides what you should do, and the gate cannot tell them apart from here. (a) BY FAULT: a builder that should hold the \`_gh_do\` grant is missing it — a provisioning problem with a name. Check it with \`5dive gh whoami\`; if the bot line is UNRESOLVED and you are a builder, that is the thing to fix (\`agent create --can-push\`), or re-run with a token (\`GH_TOKEN=\$(sudo -u claude gh auth token) 5dive task done $ident ...\`). (b) BY DESIGN: on a VERIFIER seat an UNRESOLVED bot line is the CORRECT state — \`_gh_do\` is the can-push grant a grader must not hold, so no credential is coming, and handing the close to agent-main is not open to you either when the DIVE-477 writer-is-not-grader rail names YOU as the verifier of record. In case (b) the authorised terminal move is \`5dive task verify $ident --cmd=<script>\`, where the script'\''s EXIT STATUS proves the merge rather than asserting it — e.g. \`git fetch -q origin main && git merge-base --is-ancestor <merge-sha> origin/main && git grep -q <a-symbol-the-PR-added> origin/main -- <path>\`. That answers this gate'\''s question by another instrument instead of bypassing it, and it is squash-proof where a sha comparison is not. \`--force-merge-gate\` does NOT reach this refusal: it escapes a gate that RAN and disagreed, never one that asked nothing. Copy your verdict into the BODY before you close (\`task set-body --append\`) — \`task verify\` OVERWRITES result, and a closed body is frozen. \`task merge-audit --limit=1\` reports the same missing credential. WHERE IT ACTUALLY STOPPED (DIVE-1935) — ${_tokwhy}; machine-account rail: $(_gate_gh_bot_ok && printf 'available' || printf 'not permitted on this seat'). Re-run that resolution on its own, graded against a known-merged PR, with \`5dive task merge-gate-selftest\`."
 }
 
 # DIVE-2770: THE ANONYMOUS RAIL — the gate's own question has a credential-free
@@ -3803,8 +3914,23 @@ _gate_branch_ident_on_main() {
   #         "" = unreachable (no token, API down, timeout)
   local slug="$1" tok="$3" ident="$4" main_br n per page walked out hits count
   main_br="${FIVE_GATE_MAIN_BRANCH:-main}"
-  n="${FIVE_GATE_ANCESTRY_SCAN:-50}"
-  [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]] || n=50
+  # DIVE-1935, 2026-08-11: default raised 50 -> 250 ON FRICTION GROUNDS ONLY, and the
+  # distinction is the whole reason this comment exists. THERE ARE ZERO STUCK ROWS:
+  # of 37 rows refused in 24h, 30 closed and 5 were cancelled. Nobody should read this
+  # as unblocking a backlog and go looking for movement in a number that was never
+  # moving.
+  #
+  # What it buys is RETRIES. The refusal is inconclusive-by-construction — it walks the
+  # bound per repo across 8 repos and gives up — so a caller below the bound pays for it
+  # in attempts, not in a permanent block: DIVE-2093 burned 2, and quinn's DIVE-3184,
+  # DIVE-3229 and DIVE-3230 burned 3 each. On a day where main takes 20+ commits, 50 is
+  # simply too short to answer the question the scan was asked.
+  #
+  # `FIVE_GATE_ANCESTRY_SCAN` stays as the override, and stays deliberately: the bound
+  # exists so the walk terminates, and a raised default is not a reason to remove the
+  # knob that makes it tunable in either direction.
+  n="${FIVE_GATE_ANCESTRY_SCAN:-250}"
+  [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]] || n=250
   # SUBJECT LINE ONLY, not the whole message. Searching main widened the attribution
   # set: every commit reachable from a branch tip is on main, but not every commit on
   # main is reachable from that tip — so a whole-message match accepts INCIDENTAL
@@ -5240,8 +5366,12 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
       if [[ $_sc_total -gt 0 && $_sc_ok -eq 0 && -z "$_ghtok2" ]] && ! _gate_gh_bot_ok; then
         _scan_why="no-gh-rail-for-listing"
       fi
-      warn "$ident: merge-gate could not query GitHub ($_scan_why) — this close is UNVERIFIED, not verified-clean (DIVE-1935)."
-      _task_store_audit_log "task.merge-gate-unverified" ok 0 -- "$ident" "reason=$_scan_why"
+      # DIVE-1935 iteration 2: the audited-unverified close is the ONLY surface on
+      # which an inert gate announces itself, so it has to say where the instrument
+      # stopped. Without the seat, every reader generalises from their own.
+      local _uv_why; _uv_why="$(_gate_tok_why)"
+      warn "$ident: merge-gate could not query GitHub ($_scan_why) — this close is UNVERIFIED, not verified-clean (DIVE-1935). Instrument: ${_uv_why}. Grade it with \`5dive task merge-gate-selftest\`."
+      _task_store_audit_log "task.merge-gate-unverified" ok 0 -- "$ident" "reason=$_scan_why" "seat=$(id -un 2>/dev/null || printf '?')"
       _mg_unverified="${_mg_unverified:+$_mg_unverified; }repo scan did not complete ($_scan_why)"
     fi
     # DIVE-1935: the PR reference the maker TYPED is a declaration too. DIVE-1922
@@ -5799,6 +5929,98 @@ cmd_task_deliver() {
 # DIVE-1975: every finding also carries `delivered` or `cited` — the DIVE-1965
 # split, as a LABEL. See the long note at the classification site for why this
 # consumer labels where the gate skips.
+# `5dive task merge-gate-selftest [--pr=<url>] [--json]` — DIVE-1935 (iteration 2).
+#
+# THE GATE ASSERTS ITS OWN INSTRUMENT, on the seat where the assertion matters.
+#
+# WHY THIS VERB EXISTS AND A FOURTH FALLBACK DOES NOT. Iteration 1 shipped an arm
+# (`sudo -n -u claude gh auth token`) premised on "agents hold passwordless sudo on
+# this host". That premise is a per-SEAT grant written as a host property, it is false
+# for the cli-scoped seats, and — this is the part that matters — it was UNFALSIFIABLE
+# FROM THE CODE. No amount of re-reading the resolver tells you whether it resolves
+# where you are, because the failure is silent by construction (`sudo -n` cannot
+# prompt, `|| true` swallows the refusal, and an empty token is a legitimate state).
+# Any NEXT fallback inherits exactly that blind spot. So the fix is an instrument
+# check, not another arm: run the real resolution, print WHICH arm stopped it, and
+# then GRADE the result against a PR whose answer is already known.
+#
+# THE POSITIVE CONTROL IS THE POINT. "A token resolved" is not the property the gate
+# needs — the property is "this seat can get a true answer out of GitHub about whether
+# a PR merged". So the check spends one read-only query on a PR that IS merged and
+# requires the word MERGED to come back. A seat that resolves a credential which
+# cannot see the repo fails here, and should: from the gate's vantage that seat is as
+# blind as one holding nothing, and the two were indistinguishable before this.
+# Exit status is the verdict, so a census over the fleet is
+# `for a in $(...); do sudo -u "$a" 5dive task merge-gate-selftest --json; done`
+# rather than a one-off measurement by whoever happened to hold root.
+_GATE_SELFTEST_PR_DEFAULT="https://github.com/5dive-ai/5dive/pull/163"
+
+cmd_task_merge_gate_selftest() {
+  local pr="$_GATE_SELFTEST_PR_DEFAULT"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --pr=*)    pr="${1#*=}"
+                 [[ "$pr" =~ ^https?://[^[:space:]]+/pull/[0-9]+$ ]] \
+                   || fail "$E_VALIDATION" "--pr must be a full pull-request URL (…/pull/<n>)" ;;
+      --json)    JSON_MODE=1 ;;
+      -h|--help) printf 'usage: 5dive task merge-gate-selftest [--pr=<merged pull url>] [--json]\n'; return 0 ;;
+      *)         fail "$E_USAGE" "unknown flag: $1" ;;
+    esac
+    shift
+  done
+
+  local seat tok trace bot anon state rc=0 verdict detail
+  seat="$(_gate_seat)"
+  if command -v gh >/dev/null 2>&1; then
+    tok=$(_gate_gh_token)
+  else
+    tok=""; _gate_tok_note "[0 gh binary] ABSENT — no arm can run"
+  fi
+  trace=$(awk '{printf "%s%s", (NR>1?"; ":""), $0}' "$_GATE_TOK_TRACEF" 2>/dev/null || printf '')
+  _gate_gh_bot_ok && bot="available" || bot="not permitted on this seat"
+  _gate_anon_ok   && anon="usable"   || anon="unusable (no curl/jq, or FIVE_GATE_NO_ANON=1)"
+
+  # The graded probe. `_gate_gh` picks whichever rail this seat actually has, which is
+  # deliberately the SAME selection the gate makes — a self-test that hand-picks a rail
+  # tests the rail, not the gate.
+  if _gate_gh_reachable "$tok"; then
+    state=$(_gate_gh "$tok" 20 pr view "$pr" --json state -q '.state' 2>/dev/null || printf '')
+  else
+    state=""
+  fi
+
+  case "$state" in
+    MERGED) verdict="ok"
+            detail="this seat CAN query GitHub: the control PR $pr reads MERGED" ;;
+    "")     rc=1; verdict="blind"
+            detail="this seat CANNOT query GitHub — the merge-gate is INERT here and will close on a named, audited UNVERIFIED result instead of checking${_GATE_GH_LAST_ERR:+ ($_GATE_GH_LAST_ERR)}" ;;
+    *)      rc=1; verdict="wrong"
+            detail="the control PR $pr came back '$state', not MERGED — the rail answers but its answer is not trustworthy for this repo" ;;
+  esac
+
+  if [[ "$verdict" == "ok" ]]; then
+    ok "merge-gate selftest: $detail — $seat; token arms: ${trace:-none run}; machine-account rail: $bot; anonymous rail: $anon" \
+       '{verdict:$v, seat:$s, controlPr:$p, state:$st, tokenResolved:($tk=="1"), tokenTrace:$tr, botRail:$b, anonRail:$a}' \
+       --arg v "$verdict" --arg s "$seat" --arg p "$pr" --arg st "$state" \
+       --arg tk "$([[ -n "$tok" ]] && printf 1 || printf 0)" --arg tr "$trace" --arg b "$bot" --arg a "$anon"
+    return 0
+  fi
+  # A failing self-test is a FINDING, not a crash: it is the only surface on which an
+  # inert gate announces itself, so it prints the same fields and exits non-zero.
+  if (( JSON_MODE )); then
+    ok "merge-gate selftest: $detail" \
+       '{verdict:$v, seat:$s, controlPr:$p, state:$st, tokenResolved:($tk=="1"), tokenTrace:$tr, botRail:$b, anonRail:$a}' \
+       --arg v "$verdict" --arg s "$seat" --arg p "$pr" --arg st "$state" \
+       --arg tk "$([[ -n "$tok" ]] && printf 1 || printf 0)" --arg tr "$trace" --arg b "$bot" --arg a "$anon"
+    return "$rc"
+  fi
+  warn "merge-gate selftest FAILED on $seat: $detail"
+  warn "  token arms: ${trace:-none run}"
+  warn "  machine-account rail: $bot · anonymous rail: $anon"
+  warn "  a close from this seat is not verified-clean; grade it with \`task merge-audit --limit=1\` or hand the close to a seat that passes."
+  return "$rc"
+}
+
 cmd_task_merge_audit() {
   tasks_db_init
   local limit=200
@@ -5814,7 +6036,7 @@ cmd_task_merge_audit() {
   done
   command -v gh >/dev/null 2>&1 || fail "$E_GENERIC" "task merge-audit needs \`gh\` to resolve PR state — install gh."
   local tok slugs; tok=$(_gate_gh_token); slugs=$(_gate_repo_slugs | paste -sd, -)
-  _gate_gh_reachable "$tok" || fail "$E_GENERIC" "task merge-audit cannot reach GitHub — check 5dive gh whoami, then authenticate gh (or export GH_TOKEN) and re-run"
+  _gate_gh_reachable "$tok" || fail "$E_GENERIC" "task merge-audit cannot reach GitHub — $(_gate_tok_why); machine-account rail not permitted on this seat. Check \`5dive gh whoami\` and \`5dive task merge-gate-selftest\`, then authenticate gh (or export GH_TOKEN) and re-run"
   _gate_pr_refs_engine_ok || fail "$E_GENERIC" "task merge-audit cannot parse PR references on this host (grep -oE unusable) — fix grep and re-run"
   local rows findings=0 unver=0 amb=0 deliv_n=0 cited_n=0 json_rows=""
   rows=$(db "SELECT ident || '|' || COALESCE(delivery_ref,'') || '|' || REPLACE(REPLACE(COALESCE(delivery_ref,'') || ' ' || COALESCE(result,'') || ' ' || COALESCE(body,''), char(10), ' '), '|', ' ')
