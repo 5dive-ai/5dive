@@ -107,6 +107,13 @@ _HB_RECURRING_STALL_HOURS="${HEARTBEAT_RECURRING_STALL_HOURS:-24}"
 # only this rung bounds the outage.
 _HB_RECURRING_ESCALATE_HOURS="${HEARTBEAT_RECURRING_ESCALATE_HOURS:-24}"
 [[ "$_HB_RECURRING_ESCALATE_HOURS" =~ ^[0-9]+$ ]] || _HB_RECURRING_ESCALATE_HOURS=24
+# DIVE-2272: the fleet-wide fallback bound for on_overlap='spawn' templates that
+# do not set their own overlap_bound. Defined ONCE in lib/tasks_db.sh because the
+# scheduler and `task ls --recurring` must not be able to disagree about it — the
+# DIVE-2055 rule for that table is that the listing cannot tell a different story
+# than the materializer, and two independently-defaulted constants is exactly how
+# that drifts.
+_HB_OVERLAP_BOUND_DEFAULT="${TASKS_OVERLAP_BOUND_DEFAULT:-3}"
 _HB_STALL_MIN_MINUTES="${HEARTBEAT_STALL_MIN_MINUTES:-30}"
 [[ "$_HB_STALL_MIN_MINUTES" =~ ^[0-9]+$ ]] || _HB_STALL_MIN_MINUTES=30
 # Orphan reclaim. An in_progress task whose claiming claude session is GONE — the
@@ -1582,9 +1589,19 @@ _hb_wake() {
 # coarse (daily/hourly) recurring jobs; minute granularity finer than the tick
 # interval can also be missed. Both documented in the CHANGELOG.
 _hb_materialize_recurring() {
-  local now="$1" minute_start tid sched last_fired open open_read open_rc stamp_err n_made=0
+  local now="$1" minute_start tid sched last_fired policy bound open open_read open_rc stamp_err n_made=0
   minute_start=$(date -u -d "@${now}" +'%Y-%m-%d %H:%M:00')
-  while IFS=$'\t' read -r tid sched last_fired; do
+  # DIVE-2272: x'1f' + IFS=$'\x1f', NOT '|' + tr + IFS=$'\t'. Tab is an IFS
+  # WHITESPACE character, so bash collapses runs of it and an EMPTY field in the
+  # middle of the row silently disappears, shifting every column after it. The
+  # old 3-column form survived only because its one nullable field was LAST;
+  # adding on_overlap/overlap_bound after last_fired_at put an empty field in the
+  # middle, and the symptom was not a parse error but `last_fired` holding the
+  # policy string — after which the same-minute guard rejected every template and
+  # the materializer silently stopped firing anything. x'1f' is not IFS
+  # whitespace, so empty fields survive. Same separator the stall sweeps below
+  # already use, for the same reason.
+  while IFS=$'\x1f' read -r tid sched last_fired policy bound; do
     [[ -n "$tid" ]] || continue
     _cron_matches "$sched" "$now" || continue
     # Already fired this minute? (string compare on ISO 'YYYY-MM-DD HH:MM:SS';
@@ -1626,7 +1643,47 @@ _hb_materialize_recurring() {
       continue
     fi
     open="$open_read"
-    if [[ "$open" != "0" ]]; then
+    # DIVE-2272 (decision DIVE-2270): the PER-TEMPLATE overlap policy. Reached
+    # ONLY with a count that was actually read -- the UNREADABLE branch above
+    # `continue`s, so a failed read can never reach the bound comparison below.
+    # That ordering is the whole point of the DIVE-2273 prerequisite and it is
+    # load-bearing, not stylistic: the old sentinel 1 is CONSERVATIVE against a
+    # boolean test ("nonzero -> skip") and PERMISSIVE against a bound of 3
+    # ("1 < 3 -> spawn"), so promoting `open` from a boolean to a magnitude
+    # re-aims the error default without touching the error handling. Worse, the
+    # bound is spawn's safety valve and it is computed FROM THE SAME READ IT
+    # BACKSTOPS -- a failing read pins `open` at 1, the bound never trips, and
+    # the degrade path never engages in exactly the conditions that call for it.
+    # THE GENERAL RULE, worth more than this feature: when you widen how a value
+    # is CONSUMED, re-audit its error sentinel, because the sentinel was chosen
+    # against the OLD consumer. Keep the failure out of the magnitude entirely.
+    #
+    # NULL/'' policy = 'skip' = today's behaviour byte for byte, so this is a
+    # no-op migration for every template that predates the column.
+    if [[ "${policy:-}" == "spawn" ]]; then
+      # NULL/unparseable bound falls back to the built-in default. The default is
+      # a JUDGMENT CALL, NOT A MEASUREMENT (3 open recaps is unmistakable to a
+      # human; 300 is a different outage) -- tunable per template so the number
+      # is never mistaken for something derived.
+      [[ "${bound:-}" =~ ^[1-9][0-9]*$ ]] || bound="$_HB_OVERLAP_BOUND_DEFAULT"
+      if (( open < bound )); then
+        # Fire DESPITE open instances. For a reading-of-the-present job the
+        # pile-up is the signal, not the noise: Tuesday's recap is not
+        # discharged by Wednesday's run.
+        _hb_log "[materializer] $(_hb_ident "$tid") on-overlap=spawn — ${open} open (< ${bound}) — firing anyway"
+      else
+        # AT OR OVER THE BOUND: degrade to EXACTLY today's skip-and-stamp. This
+        # is deliberately the existing, already-legible suppression path rather
+        # than new alarm machinery -- `task ls --recurring` and the DIVE-2237
+        # reading table keep working unchanged, and a spawn-class template that
+        # has genuinely run away reads the same as any other suppressed one.
+        stamp_err=$(db "UPDATE tasks SET last_skipped_at=datetime('now') WHERE id=${tid};" 2>&1) \
+          || _hb_log "[materializer] $(_hb_ident "$tid") last_skipped_at stamp FAILED: ${stamp_err//$'\n'/ }" \
+          || true
+        _hb_log "[materializer] $(_hb_ident "$tid") on-overlap=spawn but ${open} open >= bound ${bound} — skip (bounded)"
+        continue
+      fi
+    elif [[ "$open" != "0" ]]; then
       # DIVE-2237: RECORD the skip. The dedup decision is unchanged -- we still
       # skip -- but a skip now leaves a trace on the row itself, not only in
       # _hb_log (which nothing surfaces and nobody reads). Without this, a
@@ -1647,7 +1704,7 @@ _hb_materialize_recurring() {
     else
       _hb_log "[materializer] $(_hb_ident "$tid") insert failed"
     fi
-  done < <(db "SELECT id, schedule, COALESCE(last_fired_at,'') FROM tasks WHERE kind='recurring' AND schedule IS NOT NULL AND status='todo';" 2>/dev/null | tr '|' '\t')
+  done < <(db "SELECT id||x'1f'||schedule||x'1f'||COALESCE(last_fired_at,'')||x'1f'||COALESCE(on_overlap,'skip')||x'1f'||COALESCE(overlap_bound,'') FROM tasks WHERE kind='recurring' AND schedule IS NOT NULL AND status='todo';" 2>/dev/null)
   _hb_log "[materializer] pass done — ${n_made} materialized"
   return 0
 }
@@ -2480,15 +2537,30 @@ _hb_stall_sweep() {
   # NOT KEYED TO ANY IDENT. DIVE-1237 is only where we noticed it; the defect is a
   # property of skip-if-open dedup on ANY template, and DIVE-1155/DIVE-1236 sit on
   # the same mechanism and would fail identically and just as quietly.
-  local rrow rid rident rasg rcreated rtmpl rhours
+  local rrow rid rident rasg rcreated rtmpl rpol rhours rsupp rsupp_main
   while IFS= read -r rrow; do
     [[ -n "$rrow" ]] || continue
-    IFS=$'\x1f' read -r rid rident rasg rcreated rtmpl <<<"$rrow"
+    IFS=$'\x1f' read -r rid rident rasg rcreated rtmpl rpol <<<"$rrow"
     [[ -n "$rid" ]] || continue
     rhours=$(( ($(date -u +%s) - $(date -u -d "$rcreated" +%s 2>/dev/null || date -u +%s)) / 3600 ))
+    # DIVE-2272: this notice's whole urgency claim — "the next slot is suppressed,
+    # so the beat is not late, it is NOT HAPPENING" — is only true under
+    # skip-if-open. On an on_overlap='spawn' template later slots keep firing, so
+    # asserting suppression there would be an instrument reporting a cause it did
+    # not observe (the DIVE-2273 defect class, one layer out). The row is still
+    # worth surfacing — a never-started instance is a real stall, and under spawn
+    # it also counts toward the bound that will eventually suppress the beat —
+    # but it must be described as what it is.
+    if [[ "$rpol" == "spawn" ]]; then
+      rsupp="Later slots are still firing (${rtmpl} is on-overlap=spawn), so the beat is LATE, not stopped — but this row counts toward the overlap bound, and once the bound is reached the beat suppresses like any other."
+      rsupp_main="template ${rtmpl} is on-overlap=spawn so the beat is still firing, but this row counts toward the bound that suppresses it (DIVE-2272)"
+    else
+      rsupp="While it sits open the schedule's next slot is SUPPRESSED (skip-if-open), so the beat is not late, it is not happening."
+      rsupp_main="every slot since is suppressed by skip-if-open (DIVE-2693)"
+    fi
     if [[ -n "$rasg" ]]; then
       ( cmd_send "$rasg" --from="task-engine" \
-          --message="⏳ ${rident} is a RECURRING instance you have never started — ${rhours}h old. While it sits open the schedule's next slot is SUPPRESSED (skip-if-open), so the beat is not late, it is not happening. Work it or close it: \`5dive task start ${rident}\`, or \`5dive task cancel ${rident} --result=...\` to let the schedule re-fire." ) >/dev/null 2>&1 || true
+          --message="⏳ ${rident} is a RECURRING instance you have never started — ${rhours}h old. ${rsupp} Work it or close it: \`5dive task start ${rident}\`, or \`5dive task cancel ${rident} --result=...\` to let the schedule re-fire." ) >/dev/null 2>&1 || true
     fi
     # DIVE-2853: NAME whether the addressee could even act, instead of leaving it to
     # be inferred from another day of silence. An assignee already holding an
@@ -2503,10 +2575,10 @@ _hb_stall_sweep() {
                 WHERE kind='standard' AND status='in_progress'
                   AND assignee=$(sqlq "${rasg:-}") ORDER BY id LIMIT 1;" 2>/dev/null || echo "")
     ( cmd_send "main" --from="task-engine" \
-        --message="⏳ Recurring beat stalled: ${rident} (from template ${rtmpl}) has sat todo and never-started for ${rhours}h, assignee '${rasg:-unassigned}'${rbusy:+ — who is OCCUPIED on ${rbusy}, so this notice may be undeliverable-in-effect (a goal-fenced assignee cannot take a second row)} — every slot since is suppressed by skip-if-open (DIVE-2693). If it is still unstarted in ${_HB_RECURRING_ESCALATE_HOURS}h the ladder reassigns or cancels it (DIVE-2853)." ) >/dev/null 2>&1 || true
+        --message="⏳ Recurring beat stalled: ${rident} (from template ${rtmpl}) has sat todo and never-started for ${rhours}h, assignee '${rasg:-unassigned}'${rbusy:+ — who is OCCUPIED on ${rbusy}, so this notice may be undeliverable-in-effect (a goal-fenced assignee cannot take a second row)} — ${rsupp_main}. If it is still unstarted in ${_HB_RECURRING_ESCALATE_HOURS}h the ladder reassigns or cancels it (DIVE-2853)." ) >/dev/null 2>&1 || true
     db "UPDATE tasks SET recurring_stall_pinged_at=datetime('now') WHERE id=${rid};"
     _hb_log "[recurring-stall] ${rident} never-started ${rhours}h (template ${rtmpl}) -> surfaced"
-  done < <(db "SELECT t.id||x'1f'||COALESCE(t.ident,'DIVE-'||t.id)||x'1f'||COALESCE(t.assignee,'')||x'1f'||t.created_at||x'1f'||COALESCE(p.ident,'DIVE-'||t.from_template_id)
+  done < <(db "SELECT t.id||x'1f'||COALESCE(t.ident,'DIVE-'||t.id)||x'1f'||COALESCE(t.assignee,'')||x'1f'||t.created_at||x'1f'||COALESCE(p.ident,'DIVE-'||t.from_template_id)||x'1f'||COALESCE(p.on_overlap,'skip')
                FROM tasks t LEFT JOIN tasks p ON p.id=t.from_template_id
                WHERE t.kind='standard' AND t.from_template_id IS NOT NULL
                  AND t.status='todo' AND t.started_at IS NULL
@@ -2546,11 +2618,23 @@ _hb_stall_sweep() {
   # ONCE PER INSTANCE (recurring_stall_escalated_at), so a reassignment cannot
   # thrash a row around a fleet — and if the NEW hands do not start it either, the
   # next window's rung is the cancel, which is what actually restores the beat.
-  local erow eid eident easg etmpl etcreator ehours ever ecand etarget
+  local erow eid eident easg etmpl etcreator ehours ever ecand etarget epol esupp
   local efree="" efree_read=0 efree_ok=0 ecancel_reason emsg
   while IFS= read -r erow; do
     [[ -n "$erow" ]] || continue
-    IFS=$'\x1f' read -r eid eident easg etmpl etcreator ehours ever <<<"$erow"
+    IFS=$'\x1f' read -r eid eident easg etmpl etcreator ehours ever epol <<<"$erow"
+    # DIVE-2272: every message and the cancel REASON below justify themselves with
+    # "skip-if-open suppresses the later slots". On an on_overlap='spawn' template
+    # that premise is false — later slots keep firing — so the same sentence would
+    # be a fabricated cause. The ladder's ACTION is deliberately unchanged for both
+    # policies (a never-started row is a stall either way, and under spawn it still
+    # consumes the bound), but what the record CLAIMS about the beat must match what
+    # the scheduler actually does.
+    if [[ "$epol" == "spawn" ]]; then
+      esupp="the beat's later slots are still firing (on-overlap=spawn), but this row consumes one of the template's bounded overlap slots"
+    else
+      esupp="the beat's later slots are SUPPRESSED while it sits open (skip-if-open)"
+    fi
     [[ -n "$eid" ]] || continue
     if (( efree_read == 0 )); then
       efree_read=1
@@ -2586,10 +2670,10 @@ _hb_stall_sweep() {
                            updated_at=datetime('now')
           WHERE id=${eid} AND status='todo' AND started_at IS NULL;" 2>/dev/null || true
       ( cmd_send "$etarget" --from="task-engine" \
-          --message="🔁 ${eident} (recurring beat from template ${etmpl}) has been REASSIGNED to you: it sat never-started for ${ehours}h with '${easg:-unassigned}', who was surfaced once and could not take it. While it sits open the schedule's next slot is SUPPRESSED (skip-if-open), so nothing is late — the beat is not happening. \`5dive task start ${eident}\`, or \`5dive task cancel ${eident} --result=...\` if it is genuinely not workable, which lets the schedule re-fire." ) >/dev/null 2>&1 || true
+          --message="🔁 ${eident} (recurring beat from template ${etmpl}) has been REASSIGNED to you: it sat never-started for ${ehours}h with '${easg:-unassigned}', who was surfaced once and could not take it. ${esupp^}. \`5dive task start ${eident}\`, or \`5dive task cancel ${eident} --result=...\` if it is genuinely not workable, which lets the schedule re-fire." ) >/dev/null 2>&1 || true
       if [[ -n "$easg" ]]; then
         ( cmd_send "$easg" --from="task-engine" \
-            --message="🔁 ${eident} has been moved OFF you to '${etarget}' — it was never started ${ehours}h after being flagged, and the beat's later slots are suppressed while it sits. Nothing for you to do; if you were about to start it, say so to ${etarget} rather than both starting it." ) >/dev/null 2>&1 || true
+            --message="🔁 ${eident} has been moved OFF you to '${etarget}' — it was never started ${ehours}h after being flagged, and ${esupp}. Nothing for you to do; if you were about to start it, say so to ${etarget} rather than both starting it." ) >/dev/null 2>&1 || true
       fi
       ( cmd_send "main" --from="task-engine" \
           --message="🔁 Recurring-stall ESCALATED: ${eident} (template ${etmpl}) reassigned '${easg:-unassigned}' -> '${etarget}' after ${ehours}h unstarted past its flag — a re-ping to the original assignee cannot clear a goal-fenced one, so the ladder changes hands (DIVE-2853)." ) >/dev/null 2>&1 || true
@@ -2598,11 +2682,11 @@ _hb_stall_sweep() {
         detail="reassigned ${easg:-unassigned}->${etarget} after ${ehours}h never-started (template ${etmpl})" || true
       _hb_log "[recurring-escalate] ${eident} ${ehours}h unstarted -> reassigned ${easg:-unassigned} -> ${etarget}"
     else
-      ecancel_reason="auto-cancelled by the recurring-stall ladder (DIVE-2853): materialized from template ${etmpl}, never started, surfaced once to '${easg:-unassigned}' and still unstarted ${ehours}h later, and no free agent was available to take it. Cancelled rather than left open BECAUSE skip-if-open counts every non-closed instance, so this row was suppressing every later slot of the beat — the schedule re-fires on its next slot. Not a judgement that the work is unwanted."
+      ecancel_reason="auto-cancelled by the recurring-stall ladder (DIVE-2853): materialized from template ${etmpl}, never started, surfaced once to '${easg:-unassigned}' and still unstarted ${ehours}h later, and no free agent was available to take it. Cancelled rather than left open BECAUSE ${esupp} — the schedule re-fires on its next slot. Not a judgement that the work is unwanted."
       db "UPDATE tasks SET status='cancelled', done_at=datetime('now'), updated_at=datetime('now'),
                            result=$(sqlq "$ecancel_reason"), recurring_stall_escalated_at=datetime('now')
           WHERE id=${eid} AND status='todo' AND started_at IS NULL;" 2>/dev/null || true
-      emsg="🗑 ${eident} (recurring beat from template ${etmpl}) was AUTO-CANCELLED after sitting never-started ${ehours}h past its stall flag, with no free agent to hand it to. The reason is written into the row's result; the template re-fires on its next slot, which is the only way the beat restarts (skip-if-open counts an open instance)."
+      emsg="🗑 ${eident} (recurring beat from template ${etmpl}) was AUTO-CANCELLED after sitting never-started ${ehours}h past its stall flag, with no free agent to hand it to. The reason is written into the row's result; the template re-fires on its next slot (${esupp})."
       if [[ -n "$easg" ]]; then
         ( cmd_send "$easg" --from="task-engine" --message="$emsg If you still want this instance, the next materialization is yours to start on time — or reply to say the row should not be assigned to you." ) >/dev/null 2>&1 || true
       fi
@@ -2612,7 +2696,7 @@ _hb_stall_sweep() {
         detail="auto-cancelled after ${ehours}h never-started, no free agent (template ${etmpl})" || true
       _hb_log "[recurring-escalate] ${eident} ${ehours}h unstarted, no free agent -> auto-cancelled so template ${etmpl} re-fires"
     fi
-  done < <(db "SELECT t.id||x'1f'||COALESCE(t.ident,'DIVE-'||t.id)||x'1f'||COALESCE(t.assignee,'')||x'1f'||COALESCE(p.ident,'DIVE-'||t.from_template_id)||x'1f'||COALESCE(p.created_by,'')||x'1f'||CAST((julianday('now')-julianday(t.created_at))*24 AS INTEGER)||x'1f'||COALESCE(t.verifier,'')
+  done < <(db "SELECT t.id||x'1f'||COALESCE(t.ident,'DIVE-'||t.id)||x'1f'||COALESCE(t.assignee,'')||x'1f'||COALESCE(p.ident,'DIVE-'||t.from_template_id)||x'1f'||COALESCE(p.created_by,'')||x'1f'||CAST((julianday('now')-julianday(t.created_at))*24 AS INTEGER)||x'1f'||COALESCE(t.verifier,'')||x'1f'||COALESCE(p.on_overlap,'skip')
                FROM tasks t LEFT JOIN tasks p ON p.id=t.from_template_id
                WHERE t.kind='standard' AND t.from_template_id IS NOT NULL
                  AND t.status='todo' AND t.started_at IS NULL
