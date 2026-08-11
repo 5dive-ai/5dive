@@ -29,8 +29,19 @@
 # needs a second process; the in-process `_gate_closure_sign` it re-execs to IS
 # driven, and arm 4 proves the archived signature actually re-verifies rather
 # than merely being non-empty.
-# TIER: core — 26.0s measured on this control-plane host (agent-main seat, non-root),
-# wall-clock of the whole file INCLUDING its two mutant re-execs.
+# TIER: nightly — 17.2s measured on the CI installed-host runner (unit-tests
+# test-installed-host, run 31451886133; 26.0s on the control-plane host, agent-main
+# seat, non-root). It does not fit the 300s PR core and the cost is INHERENT, not
+# incidental: the mutation grading re-execs this entire harness twice as children,
+# one per mutant, so a single pass is roughly a third of the wall-clock. Trimming it
+# means dropping the mutants — and every arm here asserts a REFUSAL or an ABSENCE,
+# both of which a do-nothing build satisfies, so without the mutants the arms are
+# worth nothing. The nightly sweep has its own 1320s budget and runs it in full.
+#
+# WHY THIS FILE AND NOT SOMEONE ELSE'S: the core tier came in at 341s against a 333s
+# effective cap on 2026-08-11 — over by 8s, confirmed on a second runner. This
+# harness is the second-largest cost in the tier and I added it hours earlier the
+# same night, so the overage is mine to pay down rather than another author's.
 # Run: bash tests/gate_proof_verify_history_unit.sh   (no root, no network)
 set -uo pipefail
 

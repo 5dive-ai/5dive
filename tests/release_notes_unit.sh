@@ -104,12 +104,26 @@ out=$(run_notes "$CUT_FROM" "$TO" "1.2.3"); rc=$?
 # An entry WITH prose keeps a heading and its prose — grouping must not silently
 # drop bodies. v0.19.6..v0.19.7 added 384 lines against 37 headings, so a
 # bullets-only renderer would have thrown 347 written lines away.
-[[ "$out" == *"### Features"* && "$out" == *"#### feat(gh): route agent writes"* ]] \
-  && ok_t "notes: an entry WITH prose keeps a (demoted) heading in its group" \
-  || bad_t "notes: prose entry keeps a demoted heading" "$out"
-[[ "$out" == *"Writes go out as the bot"* ]] \
-  && ok_t "notes: the prose body survives grouping (no content dropped)" \
-  || bad_t "notes: prose body survived grouping" "$out"
+# DIVE-3205 SUPERSEDES DIVE-3170's PROSE RULE — a deliberate reversal, not a bug fix.
+# DIVE-3170 decided an entry WITH prose keeps a demoted heading and its body, so no
+# content was dropped. That was right for a reader auditing our own reasoning and
+# wrong for the page it publishes to: v0.19.17 went out at 245 lines / 15.7 KB.
+# lodar, 2026-08-11 02:12Z: "we ship 5dive to other companies and other people — just
+# list changes, dont write an essay." The release body is now HEADLINES ONLY, for
+# everyone, and the prose lives one link away in CHANGELOG.md at the tag.
+# The two arms below are INVERTED rather than deleted, so the reversal is visible to
+# whoever reads this next instead of looking like the old rule was never there.
+[[ "$out" == *"### Features"* && "$out" == *"- feat(gh): route agent writes"* ]] \
+  && ok_t "notes: an entry WITH prose is ALSO reduced to a bullet (DIVE-3205 supersede)" \
+  || bad_t "notes: prose entry must become a bullet, not keep a heading" "$out"
+[[ "$out" != *"Writes go out as the bot"* ]] \
+  && ok_t "notes: the prose body does NOT reach the release page (DIVE-3205 supersede)" \
+  || bad_t "notes: fragment prose leaked into the release body" "$out"
+# Superseding the no-drop rule obliges us to say where the content went, or the
+# reversal really is a silent shortening — which is the failure this file names.
+[[ "$out" == *"CHANGELOG.md"* && "$out" == *"Full detail"* ]] \
+  && ok_t "notes: shortening is not dropping — the body links to the full text at the tag" \
+  || bad_t "notes: shortened without saying where the detail went" "$out"
 [[ "$out" != *"## Unreleased"* ]] \
   && ok_t "notes: the word 'Unreleased' never reaches the release body" \
   || bad_t "notes: 'Unreleased' reached the release body" "$out"
