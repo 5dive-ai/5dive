@@ -245,6 +245,16 @@ _host_sudo_list() {
   sudo -n -l -U "$1" 2>/dev/null
 }
 
+# _host_account_uid <user> — resolve a login name to a uid, or fail if unknown.
+# Separate function for the same reason _host_sudo_list is: it is the second
+# host-dependent lookup in the classifier, and a harness that cannot drive it
+# ends up asserting a property of the RUNNER (does an account named `claude`
+# exist here?) instead of a property of the code. That is not hypothetical — it
+# is exactly how this file's first harness passed locally and red-ed CI.
+_host_account_uid() {
+  id -u -- "$1" 2>/dev/null
+}
+
 # _host_account_class <user> — root | root-equivalent | restricted | undetermined
 #
 # THE PREDICATE THAT MATTERS IS ROOT-EQUIVALENCE, NOT LITERAL ROOT, and getting
@@ -268,10 +278,32 @@ _host_sudo_list() {
 # being wrong is every admin agent on the box at once.
 #
 # `restricted` is the ONLY class that proceeds, and it is the positively
-# established one. Note what is deliberately NOT root-equivalent: the cli-root
-# grant (`(root) NOPASSWD: /usr/local/bin/5dive *`) an admin agent holds. If that
-# counted, the design would refuse itself — cli-root is a boundary precisely
-# because of the no-exec-caller-input invariant this function exists to keep.
+# established one.
+#
+# TWO LIMITS ON WHAT `restricted` MEANS. Both are known and neither is measured
+# away, so do not read the word as "safe":
+#
+# 1. IT TESTS FOR A BARE `ALL`, NOT FOR A GTFOBINS GRANT. `(ALL) NOPASSWD: ALL`
+#    is caught. `(ALL) NOPASSWD: /bin/sh`, an editor, or any interpreter is NOT —
+#    those are root escapes with an ENUMERATED command list, and they classify as
+#    `restricted` here. That is knowingly out of scope for this pass, not an
+#    oversight: this same file's header cites `less`->`!sh` and `crontab -e` as
+#    the reason DIVE-3213's tier died, so the class is well known to us. Nothing
+#    on this host is exposed by it today — every WorkingDirectory-bearing unit is
+#    already refused on other grounds — which makes it latent, not live, and a
+#    latent hole is a row rather than a blocker. Whoever widens this predicate
+#    next: the shape to add is "does the enumerated command list contain anything
+#    that execs its own argument".
+#
+# 2. THE cli-root GRANT IS `restricted` CONDITIONALLY, NOT AS A MEASUREMENT.
+#    `(root) NOPASSWD: /usr/local/bin/5dive, /usr/local/bin/5dive *` classifies as
+#    `restricted`, so a unit running AS an admin seat IS repointable. That is
+#    sound exactly as long as no 5dive subcommand execs agent-controlled input as
+#    root — the invariant this file exists to protect. It is a dependency, not an
+#    independent fact: the day that invariant breaks, this classification is
+#    wrong too, and it will not announce itself. If cli-root were treated as
+#    root-equivalent instead, the design would refuse itself, which is why the
+#    dependency is accepted and written down rather than engineered away.
 _host_account_class() {
   local u="${1:-}"
   # systemd's default User= for a system unit is root, so ABSENT and "root" must
@@ -288,7 +320,7 @@ _host_account_class() {
     printf 'undetermined'; return 0
   fi
   local uid
-  uid=$(id -u -- "$u" 2>/dev/null) || { printf 'undetermined'; return 0; }
+  uid=$(_host_account_uid "$u") || { printf 'undetermined'; return 0; }
   [[ "$uid" == "0" ]] && { printf 'root'; return 0; }   # a second name for uid 0
 
   local listing

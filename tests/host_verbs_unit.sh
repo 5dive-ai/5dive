@@ -166,9 +166,21 @@ _host_unit_property() {
 SUDO_LISTING=""
 _host_sudo_list() { [[ -n "$SUDO_LISTING" ]] && printf '%s' "$SUDO_LISTING"; }
 
-classifies() {   # <desc> <expected-class> <user> <listing>
+# STUB THE ACCOUNT LOOKUP TOO, and this one is not belt-and-braces — it is the
+# defect this harness already shipped once. The first version left `id -u` live,
+# so two arms asserted "an account named claude exists on this machine" as though
+# it were a fact about the code: green on the 5dive host, RED on CI, where no such
+# user exists and the classifier correctly answered `undetermined`. A harness that
+# asks two questions and reports one answer cannot say which one it graded
+# (DIVE-2135's shape, arriving in a new file). STUB_UID="" means "no such account".
+STUB_UID="1000"
+_host_account_uid() { [[ -n "$STUB_UID" ]] && printf '%s' "$STUB_UID"; }
+
+classifies() {   # <desc> <expected-class> <user> <listing> [uid|"" for no-such-account]
   local desc="$1" want="$2" user="$3"; SUDO_LISTING="$4"
+  STUB_UID="${5-1000}"
   local got; got=$(_host_account_class "$user" 2>/dev/null)
+  STUB_UID="1000"
   if [[ "$got" == "$want" ]]; then pass "$desc -> $got"; else bad "$desc -> got '$got', want '$want'"; fi
 }
 
@@ -192,7 +204,7 @@ classifies "cli-root admin grant is NOT root-equivalent (else the design refuses
                                                   restricted      "nobody" "$OPS_LISTING"
 classifies "a scoped standard grant"              restricted      "nobody" "$MAIN2_LISTING"
 classifies "an account sudo says cannot sudo"     restricted      "nobody" "$NONE_LISTING"
-classifies "an account that does not exist"       undetermined    "nosuchuser3221" ""
+classifies "an account that does not exist"       undetermined    "nosuchuser3221" "$CLAUDE_LISTING" ""
 classifies "sudo returns nothing (fail closed)"   undetermined    "nobody" ""
 classifies "sudo returns unparseable noise (fail closed)" undetermined "nobody" "sudo: error initializing audit plugin"
 SUDO_LISTING=""
@@ -242,10 +254,17 @@ STUB_USER="root";   refuses "User=root"                        _host_require_rep
 # as "not root" would disable this guard on almost every unit on the box.
 STUB_USER="";       refuses "User= empty (systemd default is root)" _host_require_repointable "x.service"
 STUB_USER="0";      refuses "User=0"                           _host_require_repointable "x.service"
-STUB_USER="claude"; accepts "User=claude (the driver case: 5dive-api / 5dive-frontend)" \
+# The ACCEPT side. Deliberately a synthetic account with a stubbed listing, not
+# `claude` or `agent-marketing`: on this host both of those are bare-ALL and MUST
+# be refused (the 5dive-api arm above pins exactly that), and naming a real local
+# account here is what made this harness runner-dependent in the first place.
+STUB_USER="svc-unprivileged"; SUDO_LISTING="$NONE_LISTING"
+accepts "a service account sudo says cannot sudo — the only class that proceeds" \
                                                                _host_require_repointable "x.service"
-STUB_USER="agent-marketing"; accepts "User=agent-marketing (5dive-discord-welcome)" \
+STUB_USER="svc-scoped"; SUDO_LISTING="$MAIN2_LISTING"
+accepts "a service account with an enumerated, non-ALL grant" \
                                                                _host_require_repointable "x.service"
+SUDO_LISTING="$NONE_LISTING"
 STUB_USER="claude"; STUB_LOAD="not-found"
 refuses "a unit systemd does not know (LoadState!=loaded)"     _host_require_repointable "x.service"
 STUB_LOAD="loaded"
