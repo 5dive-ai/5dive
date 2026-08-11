@@ -1,5 +1,274 @@
 # Changelog
 
+## v0.19.20 — fix(heartbeat): the nudge counter now forces a state change instead of logging one (DIVE-3218)
+
+`_hb_mark_run` has incremented and echoed a per-task nudge count since DIVE-1486 "so
+the caller can decide whether the task is being starved". No caller decided. The one
+that read it — the `_HB_STARVE_AFTER` branch — wrote a WARN to the tick log, bumped a
+`starved` tally, and changed nothing.
+
+Measured 2026-08-11: dev3 was woken about ONE urgent row (DIVE-2896, filed with
+lodar's words "the fleet's most urgent priority") **173 times over 3.5 days** with
+zero state change. Every wake was a full fresh-context opus session that re-read the
+same stale in-row note, re-derived the same "wait" conclusion, and exited with no
+memory that it had done so 172 times already. The counter was correct throughout.
+Correct detection wired to no lever is the whole defect —
+`community/wiki/a-nudge-counter-nobody-consumes-is-detection-not-enforcement.md`.
+
+A two-rung ladder now **consumes** that count, modelled on the DIVE-2853
+recurring-stall ladder rather than built as a parallel one. The two cannot see each
+other's rows: 2853 keys on hours since materialisation for a beat whose later slots
+skip-if-open is eating; this keys on the count of fruitless wakes for any standard
+row.
+
+- **Rung 1, at N**: escalate once (existing `task escalate` semantics) **and append a
+  dated line to the row body**. The body write-back is the load-bearing half, not the
+  bookkeeping: a fresh-context seat's only memory of its own past wakes is what the
+  row says, so a state change made silently relocates the re-deliberation instead of
+  ending it. The note tells the next seat to write down a decision *not* to start.
+- **Rung 2, a further N wakes later**: change hands — reassign to a free agent in the
+  same org lane, never the current assignee (handing the row back to the party whose
+  non-pickup *is* the fault is the no-op the rung exists to stop) and never the row's
+  own verifier (DIVE-3097). If nobody is free, **park with a wake date**. Again with
+  an in-row write-back.
+- **Never cancel.** This is the deliberate divergence from DIVE-2853, whose fallback
+  *is* a cancel: an open recurring instance suppresses every later slot of its beat,
+  so leaving it open is an ongoing outage. A standard row suppresses nothing — it is
+  merely starved, and a starved row is not an unwanted row.
+
+**Rung 2 keys on `nudge_escalated_n + N`, never on a recomputed `2N`.** Rung 1
+escalates, escalation raises the priority band, and a higher band carries a *smaller*
+N — so a row escalated at the `high` threshold of 16 is already past an `urgent` 2N of
+16, and both rungs fire on the same wake. The new harness found this before it
+shipped; the stored count makes rung 2 mean "a further full threshold of fruitless
+wakes after we escalated and said so", which is immune to the band moving underneath
+it. Rung 2 is also never a first contact: a row inherited at 173 nudges takes rung 1
+first, so its hands never change without a written explanation already in the body.
+
+Thresholds are **per priority band** — the burn per wasted wake is identical across
+bands but the tolerable latency is not — and they count nudges, not hours, because the
+count *is* the burn. Defaults 8 / 16 / 32 / 64 (urgent / high / medium / low), roughly
+2h / 4h / 8h / 16h to rung 1 at the common 15-minute cadence. Overridable at
+`.config.heartbeat.nudgeEnforceAfter.<band>` in the registry, so N moves with cadence
+and roster size without a release cut. A missing, non-numeric or zero value falls back
+to the compiled default and **never disables the ladder** — an unreadable config
+silently restoring the 173-wake world is the exact failure this ends.
+
+`_HB_STARVE_AFTER` is untouched: it stays a cheap n>=3 log observation feeding the
+`starved` tally in the tick summary. Its only readers are that summary line and its
+JSON, both in `cmd_heartbeat.sh`, and neither changes here.
+
+New columns `nudge_escalated_at`, `nudge_escalated_n`, `nudge_parked_at` (tasks, 79 ->
+82). Both rungs latch once per row, so a reassignment cannot thrash a row around the
+fleet. New harness `tests/heartbeat_nudge_enforce_unit.sh` (32 arms, TIER core),
+including a source-level assertion that the tick path actually calls the ladder —
+delete the call site and every behavioural arm still passes, which is precisely the
+shape of the bug being fixed.
+
+## v0.19.20 — fix(task): an explicit `--no-verify` is recorded, so overriding it is no longer silent (DIVE-2730)
+
+`--no-verify` was an add-time shell variable with no column behind it, so it died with the
+`task add` process. By `task done` an EXPLICIT opt-out and a row nobody ever railed were the same
+stored state — verifier NULL, `verify_unavailable` NULL — so when DIVE-2719's UPGRADE arm attached a
+grader to a blast-radius delivery, it could not tell which one it was overriding, and said nothing.
+
+`tasks.verify_optout` (additive, nullable, NULL for every existing row) records the refusal at add
+time. A decision and a default that produce the same stored state ARE the same state; nothing
+downstream recovers the difference, however carefully it reasons, because the distinguishing fact was
+never written down.
+
+**The upgrade still fires on an opted-out row, deliberately.** `--no-verify` is declared at FILE
+time; the blast radius is measured at DELIVERY time. Letting the stored flag suppress the upgrade
+would let a sentence typed before the diff existed pre-authorise closing a scheduler, task-store,
+credentials or deploy change ungraded — a waiver in the direction DIVE-969 banned, and the one way
+persisting this column could have turned a fix into a bypass. The filer opted out of ROUTINE grading,
+not of grading a diff they had not written yet. So the column is a RECORD, not a control: what
+changes is that `task done` now names the opt-out it is overriding instead of silently routing.
+That silence was the defect the row was filed for.
+
+The flag is set only by `task add --no-verify` and cleared by `5dive task verifier <id> <agent>`,
+since an explicit later attach supersedes the earlier refusal. Because it gates nothing, a stale flag
+can at worst produce a slightly wrong explanatory sentence — it can never waive a rail.
+
+The instructive contrast is `verify_unavailable=1`, which self-handles on the same code path for a
+different reason: it is a persisted column, so `_task_default_verifier` returns empty again in that
+org and the upgrade cannot fire for want of a GRADER, rather than for want of permission.
+
+## v0.19.20 — fix(task): verification depth is re-measured at delivery, from the paths the work touched (DIVE-2719)
+
+The defect was the TIMING, not the ruleset. `task add` decided how deeply a task would be graded
+from its PRIORITY and a KEYWORD REGEX over its TITLE — because at `task add` there is no branch, no
+diff and no PR, so the words in the title are the only axis that exists. The classifier was being
+asked at the one moment it could not be answered.
+
+Measured on DIVE-2712: the title described a real user-facing Telegram defect, correctly, so it
+earned the full verifier rail. The delivered change was ONE LINE in a test stub. Four verifier
+iterations graded it. No title classifier could have known — the fact had not happened yet.
+
+So the question is asked again at DELIVERY, where the answer is a measurement. `task done` reads the
+changed paths off the PR the row already binds (`delivery_ref`, or the DIVE-1462 `Branch:` line) and
+either confirms the add-time guess, DOWNGRADES it (every path is a test, a doc or a changelog
+fragment — CI is the gate there, and a grading round-trip adds latency and no signal) or UPGRADES it
+(a row filed as a chore whose diff reached the scheduler, the task store, credentials or deploy now
+routes to a grader instead of closing outright). Path globs only, both lists under ten entries; this
+is deliberately not a taxonomy.
+
+Unknown stays unknown. No binding, no `gh`, no credential, or no PR found all produce an empty path
+list, and an empty list classifies as neither — so a missing credential can never widen or narrow
+the rail, and an ordinary unbound close does not spend a single API call.
+
+This is not the done-time waiver DIVE-969 banned. That ruling refuses a waiver the MAKER ASSERTS at
+peak completion-incentive; this asserts nothing. To be classified shallow you must have genuinely
+changed only tests and docs, in which case there is nothing for a grader to grade. A downgraded
+close still has to satisfy the DIVE-1830 merge gate.
+
+One limit, stated rather than glossed when this shipped, and **closed by DIVE-2730 in the same
+release**. The add-time opt-out (`--no-verify`) was not persisted — it was an add-time shell variable
+with no column behind it — so at `task done` a `--no-verify` row was indistinguishable from a
+DIVE-969 auto-skipped one: both carry a NULL verifier. The UPGRADE arm tests exactly that shape, so
+an explicit opt-out whose diff reached the blast radius was given a grader anyway, without being able to say so. The
+override itself was right — the flag is declared before the diff exists — and it could only ADD a
+rail, never waive one, so the DIVE-969 posture was intact throughout. What was missing was the
+record: `tasks.verify_optout` now stores the refusal and the upgrade names what it overrides. See
+DIVE-2730 below.
+
+**The same defect, one function over.** `_task_default_verifier` picked the GRADER by walking UP the
+org chart — project lead, coordinator, the maker's manager, the org root, the deputy. Every rung is a
+leader, so a leader was structurally guaranteed to win. lodar ruled on 2026-08-04: "you should never
+be verifier yourself" / "why our ceo acts as ci tool". The remedy applied that morning moved 58 rows
+off main and cleared 6 more, and did not touch the picker — so by that evening six MORE rows created
+the same day carried verifier=main again. Correcting the output of a rule leaves the rule producing
+it. A chart that names a QA agent has already answered who should grade, and nobody had asked it: the
+org's designated QA/testing/verification agent is now the FIRST rung, ahead of every leader.
+`FIVE_VERIFY_EXCLUDE=<names>` hard-excludes named agents from the default chain the way the maker is
+already excluded, so the next such ruling is data rather than a code change. It is empty by default —
+this ships inert on that half and changes no selection until an org sets it.
+
+## v0.19.20 — fix(gh,task): a maker with no GitHub credential can now READ the state of their own work (DIVE-2296)
+
+A builder holds no gh credential by design — one who cannot force-push cannot
+quietly rewrite what a reviewer already read. Nothing in that design says they may
+not LOOK. Measured on DIVE-2286: one task needed another agent at five points, and
+two of them were reads — a gate asking someone to open a PR the maker had opened
+fifteen minutes earlier, then two more asking for a merge that was waiting on an
+18-minute CI run. A maker who cannot read the state of their own work has exactly
+one move, and every one of them is a round trip.
+
+Two surfaces closed that window:
+
+- **`5dive gh` routed a READ to the caller's own credential**, which on a seat
+  holding none is a refusal — and the refusal named the escape as "`--as=bot` if
+  this is a **write**", steering the one caller who needed it away from the one
+  path that answers. A credential-less read now routes to the bot, and the
+  surviving refusal says `--as=bot` serves reads too. This grants no authority:
+  admin-class work is still refused there (5dive-bot is `admin=false`), the same
+  token was already reachable by typing `--as=bot` by hand, and the bot's read
+  visibility is a subset of an authed caller's. An authed caller and an explicit
+  `--as=caller` are unchanged.
+
+- **The DIVE-1830 merge gate's branch-path refusal** read identically whether no PR
+  existed for the branch or one was open and mid-CI — opposite situations, one
+  sentence. It now looks the open PR up and names it, with its check state, so
+  "wait" and "go open one" are distinguishable. Diagnostic only: an open PR accepts
+  nothing, `done=merged-to-main` is unchanged, and the lookup runs on the refusing
+  path so no close that passes pays for it.
+
+`tests/gh_credentialless_read_route_unit.sh` grades both halves, with anchors
+pinning that the authed-caller route, `--as=caller`, write routing and the gate's
+acceptance are all untouched.
+
+## v0.19.20 — feat(task): per-template `--on-overlap=skip|spawn` for recurring templates (DIVE-2272)
+
+Skip-if-open dedup is a claim about the **value of a pile-up**, and that value is class-dependent —
+so it cannot be a fleet-wide setting. For a fungible chore (disk reclaim, hygiene sweep) three open
+instances are three copies of one job: noise, and dedup is right. For a reading-of-the-present job
+(recap, version loop, CEO loop) Tuesday's instance cannot be discharged by Wednesday's run, so three
+open instances mean **nobody has read the inbox in three days** — the pile-up *is* the alarm the
+dedup deletes. Only the template's author knows which kind a template is; the scheduler cannot infer
+it. Decision and rejected options: `community/wiki/pile-up-is-noise-for-a-chore-and-signal-for-a-monitor.md`.
+
+- `--on-overlap=skip` — **the default, and today's behaviour byte for byte.** An open instance
+  suppresses the next slot.
+- `--on-overlap=spawn` — fire regardless of open instances, **up to a bound** (`--overlap-bound`,
+  default 3). At the bound it skips **and stamps `last_skipped_at`**, i.e. degrades to exactly the
+  already-legible suppression path rather than inventing new alarm machinery, so
+  `task ls --recurring` and the DIVE-2237 reading table keep working unchanged.
+- `5dive task set-overlap <template> <skip|spawn> [bound]` classifies an **existing** template.
+  Every template on the board predates the column, and re-creating one to classify it would cost its
+  ident, its history and its `last_fired_at` — the very record that says whether the beat is healthy.
+
+**The bound of 3 is a judgment call, not a measurement** (3 open recaps is unmistakable to a human;
+300 is a different outage). Per-template overridable and env-tunable (`HEARTBEAT_OVERLAP_BOUND`)
+precisely so the number is never read as derived.
+
+**No-op migration.** `on_overlap` and `overlap_bound` are both nullable: NULL means "skip" / "the
+default bound". Deliberately not `NOT NULL DEFAULT 'skip'` — a backfilled default and an unset value
+would then be indistinguishable, and *"nobody has classified this template yet"* is a state the
+classification pass has to be able to see.
+
+### The prerequisite this shipped behind, and why it was not tidiness
+
+DIVE-2273 (landed) had to come first. Today `open` is consumed as a **boolean** — any nonzero skips
+— so the old failure sentinel `1` was wrong but **conservative**: it erred toward not acting. This
+change promotes `open` to a **magnitude** compared against a bound, and that promotion re-aims the
+sentinel without touching the error handling: `1 < 3`, so a failed read would produce the
+**permissive** outcome and start *causing writes*. Worse, **the bound is spawn's safety valve and it
+is computed from the same unreliable read it backstops** — a failing read pins `open` at 1, the bound
+never trips, and the degrade path cannot engage in exactly the conditions that call for it.
+
+So the unreadable-count branch `continue`s **before** the policy branch: a failure never reaches the
+magnitude at all. The general rule, worth more than this feature: **when you widen how a value is
+consumed, re-audit its error sentinel — the sentinel was chosen against the old consumer.**
+
+Acceptance arms **force the count read to fail** (both forging inputs: a non-zero exit, and rc 0 with
+empty output) under `spawn` and assert the tick neither spawns nor stamps. A healthy-read arm proves
+nothing about this property. Verified by mutation: restoring the fail-open makes the spawn template
+spawn on an unreadable DB, and the arm goes red.
+
+### Cardinality: four consumers that assumed at most one open instance
+
+Allowing more than one open instance per template makes a claim every downstream reader had been
+free to assume. All readers of `from_template_id` were swept; `blocked_by`'s subquery was already
+`ORDER BY i.id LIMIT 1` and safe, but four consumers stated a **dedup premise as fact** and would
+have reported a cause they did not observe — the DIVE-2273 defect class, one layer out:
+
+- **`task ls --recurring`'s `blocked_by`** is now policy-aware. Under `spawn` an open instance does
+  not block, so printing its ident would send a reader to close a row that is suppressing nothing. A
+  spawn template reads `-` until it is **at** its bound, then `bound N/B`. The expression reproduces
+  the materializer's own branch and reads the same default constant, so the listing cannot tell a
+  different story than the scheduler (the DIVE-2055 rule for that table). A new `on_overlap` column
+  shows the policy directly.
+- **Recurring-stall rung 1** no longer asserts "the next slot is SUPPRESSED, so the beat is not late,
+  it is not happening" on a spawn template, where later slots keep firing. It says the beat is late,
+  and that the row consumes a bounded slot.
+- **Rung 2's auto-cancel** justified itself with "cancelled BECAUSE skip-if-open was suppressing every
+  later slot". The **action** is unchanged for both policies (a never-started row is a stall either
+  way), but the written reason now matches what the scheduler actually does.
+- **`task park`'s DIVE-2877 warning** said the park "STOPS THAT BEAT". Under `spawn` it does not — it
+  consumes one bounded slot for as long as it stays parked, and since the stall watchdog skips parked
+  rows, enough of them silently convert a spawn template into a suppressed one. Both facts are now
+  said, each under the policy that makes it true.
+
+### An empty field in the middle of a tab-separated row disappears
+
+Adding two columns to the materializer's driving query turned up a latent trap. The query was
+`|`-joined, `tr`'d to tabs, and read with `IFS=$'\t'` — but **tab is an IFS *whitespace* character**,
+so bash collapses runs of it and an **empty field in the middle of the row silently vanishes**,
+shifting every column after it. The old three-column form survived only because its one nullable
+field was **last**. With `on_overlap` after `last_fired_at`, the symptom was not a parse error but
+`last_fired` holding the policy string — after which the same-minute guard rejected every template
+and **the materializer silently stopped firing anything at all**. Now `x'1f'`-joined and read with
+`IFS=$'\x1f'`, the separator the stall sweeps beside it already use, which is not IFS whitespace and
+preserves empty fields.
+
+### Not in scope, deliberately
+
+Gate age still has no monitor outside the thing it watches. This flag shrinks the blast radius of a
+stuck recap; it does not fix that coupling. The per-template **classification** of the existing
+templates is also not applied here — it is a proposal that needs each template owner's confirmation
+(the rule: *would tomorrow's run discharge today's obligation?*), and applying it unilaterally would
+be the same "the scheduler cannot infer the class" mistake this change exists to fix.
+
 ## v0.19.0 — feat(task): a filing budget the CLI ENFORCES, per filer per rolling 24h (DIVE-3245)
 
 lodar's instinct (2026-08-11 07:42) was to forbid verifiers from filing low/medium rows.
