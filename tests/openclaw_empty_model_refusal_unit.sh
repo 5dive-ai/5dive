@@ -49,6 +49,20 @@ run_byo() { # <native> <canonical> [model]
     sudo()    { :; }
     mktemp()  { command mktemp -p "$TMPD" oc.XXXXXX; }
     mv()      { printf 'WROTE_AUTH=1\n'; command rm -f "$1"; }
+    # DIVE-3212: cmd_install is defined in cmd_auth.sh, which this harness
+    # SOURCES, so `declare -F cmd_install` is TRUE and the runtime-incomplete
+    # branch of _apply_byo_openclaw actually calls it on any box where
+    # /home/claude/.local/bin/node is absent — i.e. every CI runner, which has
+    # no `claude` user at all. `sudo` above is stubbed, so the install recipe
+    # never runs, the bin never appears, and cmd_install's DIVE-901 grace loop
+    # (src/cmd_auth.sh:473, `while [[ ! -x $bin && $_waited -lt 10 ]]; do sleep
+    # 1; ...`) sleeps its FULL 10s before failing. Three arms below carry a
+    # non-empty model and so reach that branch: 3 x 10s = the constant 30.1s
+    # this harness was charged in the core tier, which pushed the corpus over
+    # budget and refused the v0.19.18 cut. Real elapsed sleep, correctly
+    # attributed to this file — not a timeout and not an instrument artifact.
+    # It is in the stub list for the same reason `sudo` is: it mutates the box.
+    cmd_install() { printf 'CMD_INSTALL_STUBBED\n'; return 1; }
     _apply_byo_openclaw "$1" "$2" "sk-test-0123456789" "" "${3:-}"
   ) 2>&1
 }
@@ -127,6 +141,21 @@ grep -Eq '^  \[\[ -n "\$model" \]\] \\$' <<<"$create_src" \
   && ok_t "guard is an unconditional [[ -n \$model ]] || fail, not a nested if" \
   || bad_t "guard is not present in its unconditional form" \
            "$(grep -n 'n "\$model"' src/cmd_agent_create.sh)"
+
+# ── DIVE-3212: assert the OUTCOME, not the stub list ─────────────────────────
+# A missing stub in this harness does not fail — it SLEEPS, and a sleep is
+# invisible in a green log. The stub above is the fix; this arm is what stops it
+# being silently removed again, and it holds for any future call that blocks
+# rather than the one already named. Measured: 0.15s with the stub in place,
+# 30.3s without it on a box with no /home/claude runtime (both 12 passed), so
+# 5s separates the two by two orders of magnitude and leaves room for a loaded
+# runner. Grades wall clock, because CPU time is 0.15s in BOTH cases.
+if (( SECONDS < 5 )); then
+  ok_t "harness completes in ${SECONDS}s (< 5s: no arm blocked on a live install)"
+else
+  bad_t "harness took ${SECONDS}s — an arm is blocking, and the core tier pays it" \
+        "expected < 5s; a call that mutates or waits on the box is not stubbed (see cmd_install, DIVE-3212)"
+fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
