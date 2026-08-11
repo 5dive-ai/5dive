@@ -270,17 +270,17 @@ _sup_output_stats() {  # <name>
 # whose newest row predates the newest heartbeat was looked at and found
 # healthy. No row at all + no heartbeat at all is `unobserved`, which is a third
 # value on purpose — it must not read as either healthy or dry.
-_SUP_INFO_TICK_STALE=3600  # seconds. A tick that has not completed in an hour is
-                           # broken on any sane schedule, and "healthy" derived
-                           # from a dead observer is the absence-reads-as-health
-                           # shape this whole row exists to remove (main, at the
-                           # DIVE-3274 push approval). Past this the overlay
-                           # reports `unobserved` and names the age — the reading
-                           # is not refuted, it is simply no longer current, and
-                           # a surface that cannot tell the difference is the
-                           # defect. Deliberately NOT the tick interval: `info`
-                           # cannot see the cron that drives it, so the bound has
-                           # to be one no real schedule crosses.
+# How long before the OBSERVER ITSELF is stale. `healthy` derived from a tick
+# that stopped running is the absence-reads-as-health shape this row exists to
+# remove (main, at the DIVE-3274 push approval), so past this bound the overlay
+# reports `unobserved` and names the age: the recorded reading is not refuted,
+# it is simply no longer current, and a surface that cannot tell those apart is
+# the defect. 1h is 6x the shipped `*/10` cron. Env-overridable in the house
+# style because `info` CANNOT see the cron that drives the tick — a box on a
+# slower schedule would otherwise read `unobserved` forever, which is honest but
+# useless, and the knob is cheaper than a wrong constant.
+_SUP_INFO_TICK_STALE="${SUPERVISOR_INFO_TICK_STALE_SECS:-3600}"
+[[ "$_SUP_INFO_TICK_STALE" =~ ^[0-9]+$ ]] || _SUP_INFO_TICK_STALE=3600
 _SUP_INFO_TICK_TOL=120   # seconds. Per-agent rows are written BEFORE the fleet
                          # heartbeat that closes the tick, so a row from the SAME
                          # tick carries an EARLIER ts (measured: 1s). Without a
