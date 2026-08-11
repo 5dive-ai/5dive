@@ -457,7 +457,7 @@ declare -A SKILLS_AGENT_ID=(
 # Used for post-install verification, the cmd_skill_list dir-scan fallback,
 # and cmd_skill_rm. Probed empirically against npx skills v0.x — if upstream
 # changes a path, update here. Unknown types fall through to ".claude/skills"
-# in the lookup sites below.
+# in the resolver below.
 #
 # DIVE-2583 — THE CONTRACT, because prose elsewhere in this repo contradicted it:
 # every value here is $HOME-RELATIVE (it is joined to /home/agent-<name>/ at every
@@ -549,15 +549,44 @@ skill_default_source() {
 }
 
 # skills_install_dir <type> -> the $HOME-relative dir an installed skill body
-# lands in for that type. THE resolver: this is the expression cmd_pack.sh's
-# import path, cmd_skill add/list/rm and agent_setup.sh each spell by hand, and
-# DIVE-2583 exists because a rendered sentence stated a DIFFERENT answer than the
-# one the installer computed. Anything that TELLS a user where skills go must ask
-# this function, so the claim and the behaviour cannot drift apart. Total by
-# construction — never empty, for any input — which is exactly why "a harness with
-# no skills directory" describes nothing here.
+# lands in for that type. THE resolver: cmd_pack.sh's import path, cmd_skill
+# add/list/rm and agent_setup.sh all call this function. DIVE-2583 exists because
+# a rendered sentence stated a DIFFERENT answer than the installer computed.
+# Anything that tells or acts on where skills go must ask this function, so the
+# claim and behaviour cannot drift apart. Total by construction — never empty,
+# for any input — which is exactly why "a harness with no skills directory"
+# describes nothing here.
 skills_install_dir() {
   printf '%s\n' "${SKILLS_INSTALL_DIR[${1:-}]:-.claude/skills}"
+}
+
+# skills_install_dirs_all -> every distinct skills dir, one per line, sorted.
+#
+# WHY A SECOND VERB AND NOT "JUST USE THE RESOLVER" (DIVE-2609 x DIVE-3172,
+# 2026-08-11). The two rows collided head-on: DIVE-3172 stopped hardcoding
+# `.claude` literals in the self-update payload fingerprint and derived the paths
+# from the per-type maps — the right instinct — and did it by reading
+# SKILLS_INSTALL_DIR directly, which is exactly what DIVE-2609's contract forbids.
+# Neither could see the other; #558 sat 108 commits behind main.
+#
+# The obvious repair is not available. `skills_install_dir` takes a TYPE and returns
+# ONE path; the fingerprint needs EVERY value, because a payload set is a union over
+# types and not a lookup. Routing an enumeration through a single-key resolver is a
+# circle, so the shape gets its own verb rather than an exemption — a contract that
+# grows a hole every time a caller is inconvenient stops being a contract, and this
+# one caught a real regression on its first contact with it.
+#
+# NOTE WHAT IT ITERATES: the KEYS (`${!SKILLS_INSTALL_DIR[@]}`), then asks the
+# resolver for each one. So there is still exactly one executable read of the map's
+# VALUES in src/, the resolver's own, and this verb cannot drift from it by
+# construction — it is a caller, not a second copy. That is the property DIVE-2609
+# is protecting, and the reason a keys-expansion here is not the thing it forbids.
+skills_install_dirs_all() {
+  declare -p SKILLS_INSTALL_DIR >/dev/null 2>&1 || return 0
+  local _t
+  for _t in "${!SKILLS_INSTALL_DIR[@]}"; do
+    skills_install_dir "$_t"
+  done | LC_ALL=C sort -u
 }
 
 # api-key target per type: the env file (in /etc/5dive/connectors for the

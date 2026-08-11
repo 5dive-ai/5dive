@@ -198,7 +198,16 @@ _agent_payload_fingerprint() {
   # function on its own), and the .claude entries below mean an empty map still
   # yields the documented fallback set rather than nothing.
   local -a rels=()
-  for rel in "${SKILLS_INSTALL_DIR[@]-}" "${TYPE_PERSONA_FILE[@]-}"; do
+  # DIVE-2609: the skills dirs come from `skills_install_dirs_all`, NOT from a second
+  # read of SKILLS_INSTALL_DIR. The map has exactly one executable value-read in src/
+  # (the resolver in header.sh) and this file used to be a second one — a real
+  # regression, caught by tests/skills_install_dir_callers_unit.sh on its first
+  # contact with this code. TYPE_PERSONA_FILE has no such contract and is still read
+  # directly; `[@]-` keeps that safe under `set -u` when the map is absent.
+  while IFS= read -r rel; do
+    [[ -n "$rel" ]] && rels+=("$rel")
+  done < <(skills_install_dirs_all)
+  for rel in "${TYPE_PERSONA_FILE[@]-}"; do
     [[ -n "$rel" ]] && rels+=("$rel")
   done
   rels+=(".claude/skills" ".claude/CLAUDE.md" \
