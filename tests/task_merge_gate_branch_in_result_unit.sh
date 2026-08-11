@@ -316,7 +316,11 @@ printf '%s' "$OUT" | grep -q 'dive-2556-handoff.md' \
 # sibling harness staying green: `_gate_branch_refs_from_text` has exactly TWO
 # callers, both on the unbound auto-detect path, so the bound gate cannot have
 # been widened. If a third caller ever appears, this arm is the tripwire.
-_callers=$(grep -cE '^[^#]*_gate_branch_refs_from_text "' "$SRC/cmd_task.sh")
+# `|| _callers=0` because `grep -c` exits 1 on a zero count — the same unguarded-probe
+# shape this very ticket is about, caught by scripts/unguarded-probe-scan.sh in CI. A
+# bare substitution here would make the arm report "0 call sites" as a crash instead of
+# as the answer it is.
+_callers=$(grep -cE '^[^#]*_gate_branch_refs_from_text "' "$SRC/cmd_task.sh") || _callers=0
 [[ "$_callers" == "2" ]] \
   && ok_t 'DIVE-3265 6b: the extractor still has exactly 2 call sites — the declared-`Branch:` gate does not read it and was not widened' \
   || bad_t 'DIVE-3265 6b: extractor call-site count' "found $_callers call sites, expected 2 — a new caller inherits this filter; re-argue the bias before shipping it"
