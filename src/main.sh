@@ -369,7 +369,7 @@ Health:
     or an editor). Needs root for the mutating and journal/cron verbs — an admin
     agent reaches them through its existing \`/usr/local/bin/5dive *\` grant.
 
-  5dive doctor [--fix] [--dry-run] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins]
+  5dive doctor [--fix] [--dry-run] [--caps] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins|caps]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
     probes, stale shadow-credential heal (creds), registry integrity, channel
     health (allowlist + dead inbound telegram poller), host safety (needrestart
@@ -379,6 +379,14 @@ Health:
     ~/.claude/.credentials.json that shadows an env-token, restart an agent
     whose telegram poller died (silently drops inbound DMs), and force
     needrestart to list-only so a library upgrade can't bounce the whole fleet.
+    --caps (= --category=caps) answers, for THIS seat and without guessing,
+    whether it can read GitHub and how: github:read is derived from the seat's
+    measured sudo runas AND a live \`sudo -u claude gh auth status\`, since a
+    permitted uid switch says nothing about whether that token still works.
+    Roughly half the seats on a box have no such path, so a NO always names its
+    reason. It rides in data.capabilities, NOT in checks — a capability is not
+    a passed check. github:write stays NO: push identity is per-seat and the
+    claude-uid borrow is retired for pushes (DIVE-3017).
     A bare 'doctor' (no --fix) is a preview — every fixable check tells you so;
     --dry-run previews even alongside --fix. Output envelope always
     {ok:true,data:{...}}; branch on data.summary.errors in CI.

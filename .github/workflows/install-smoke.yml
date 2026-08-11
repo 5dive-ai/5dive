@@ -44,20 +44,60 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install shellcheck
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-      - name: Lint install + bundle + agent-start
-        # Linting the bundle (not src/) lets us skip --shell=bash gymnastics
-        # — bundle-drift already enforces that bundle == build.sh(src/).
+      - name: Lint install + sources + agent-start
         # DIVE-2125 (verifier): scripts/ was linted by NOTHING, so every helper the
         # CLI shells out to shipped unchecked. Widened rather than adding one file:
         # measured zero findings across scripts/*.sh at -S error, so the broad fix is
         # free today and closes the gap permanently instead of for one script.
+        #
+        # DIVE-3280: this step USED to lint the built bundle instead of src/, to
+        # "skip --shell=bash gymnastics". That is no longer affordable, and its
+        # failure mode is the expensive part.
+        #
+        # shellcheck's heap is SUPERLINEAR in the size of ONE parse unit. Measured
+        # on main @31abaf2 with shellcheck 0.9.0:
+        #
+        #     src/cmd_bug.sh        341 lines ->   35 MB
+        #     src/cmd_pack.sh     2,637 lines ->  265 MB
+        #     src/cmd_council.sh  5,764 lines ->  372 MB
+        #     src/cmd_task.sh    15,184 lines -> 3,489 MB
+        #     5dive (bundle)     72,391 lines -> "shellcheck: out of memory", exit 251
+        #
+        # On the runner that does not surface as a lint error. The RUNNER is killed,
+        # so the job ends as "The runner has received a shutdown signal" with NO file
+        # and NO line named — indistinguishable from an infra flake, and NOT fixable
+        # by the PR author, whose diff is innocent. PR #610 (+271 lines over a green
+        # main) died that way twice while main survived at 72,246 lines: the bundle
+        # was sitting ON the ceiling and any merge could tip it over.
+        #
+        # So: lint the SOURCES, ONE PROCESS PER FILE. That bounds the heap to the
+        # largest single file rather than to the whole product, and it prints the
+        # filename BEFORE linting it, so if a file ever does exhaust the runner the
+        # last line of the log names the culprit instead of naming nothing.
+        #
+        # `bash -n` on the built bundle keeps the concatenation itself covered
+        # (0.14 s, 4 MB) — parse errors are exactly the class shellcheck reported on
+        # the bundle (SC1036/SC1088 on PR #463), and bash -n catches those for free.
         run: |
           # DIVE-2091: the bundle is generated at tag time and is no longer
           # committed on main, so it has to be BUILT before anything reads it
-          # as a file. Without this, removing it from main turns shellcheck
-          # into a "file not found" failure on every PR.
+          # as a file. Without this, removing it from main turns the bundle
+          # check into a "file not found" failure on every PR.
           ./build.sh
-          shellcheck -S error install.sh 5dive 5dive-agent-start build.sh scripts/*.sh
+          bash -n 5dive
+          rc=0
+          # These carry a bash shebang; let shellcheck read it.
+          for f in install.sh 5dive-agent-start build.sh scripts/*.sh; do
+            echo "== shellcheck $f"
+            shellcheck -S error "$f" || rc=1
+          done
+          # src/ fragments are concatenated by build.sh and carry no shebang of
+          # their own, so the dialect has to be stated.
+          for f in src/*.sh; do
+            echo "== shellcheck $f"
+            shellcheck -S error --shell=bash "$f" || rc=1
+          done
+          exit "$rc"
 
   docker-install:
     runs-on: ubuntu-latest
