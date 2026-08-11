@@ -241,5 +241,83 @@ grep -q 'does not resolve' "$TMP/err6" && grep -q 'may repeat' "$TMP/err6" \
   && ok_t "unresolvable baseline is REPORTED, naming the repeat consequence" \
   || bad_t "unresolvable baseline not reported" "$(cat "$TMP/err6")"
 
+
+# ---------------------------------------------------------------------------
+# DIVE-3170: TWO CONSECUTIVE CUTS ON THE REAL COMMIT SHAPE.
+#
+# The whole defect lived in the gap between "the cut makes one commit" (what the
+# old fixtures modelled) and "the cut makes two" (what DIVE-2603 actually ships).
+# So this arm builds the real shape end to end: main keeps every fragment forever,
+# the cut branches off detached, folds, and commits assign-then-bundle, and the tag
+# names the bundle commit. Then it cuts a SECOND time with exactly one new fragment
+# and asserts the second body is DISJOINT from the first — acceptance 1 and 3.
+echo "-- DIVE-3170: two cuts on the real two-commit shape must not repeat entries"
+RG7="$TMP/repo-two-cuts"; mkdir -p "$RG7/changelog.d" "$RG7/scripts"
+cp "$SCRIPT" "$RG7/scripts/fold-changelog-fragments.sh"
+cp "$(dirname "$SCRIPT")/release-cut-baseline.sh" "$RG7/scripts/"
+( set -e; cd "$RG7"
+  git init -q -b main .; git config user.email a@b; git config user.name t
+  printf '# Changelog\n' > CHANGELOG.md
+  printf '## Unreleased — feat(a): alpha (DIVE-9201)\n\nA.\n' > changelog.d/DIVE-9201.md
+  printf '## Unreleased — feat(b): beta (DIVE-9202)\n\nB.\n' > changelog.d/DIVE-9202.md
+  git add -A; git commit -q -m 'main: two fragments'
+) >/dev/null 2>&1
+# cut() — mirrors release-cut.yml: detach, fold against the derived baseline, then
+# TWO commits (assign, bundle), tag the second, and return main to where it was.
+cut(){ ( set -e; cd "$RG7"
+    inc="$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
+    # `[[ -n "$inc" ]] && ...` would return 1 on the first cut and kill this
+    # subshell under set -e, silently producing no tag at all.
+    base=""
+    if [[ -n "$inc" ]]; then base="$(bash scripts/release-cut-baseline.sh "$inc")"; fi
+    git checkout -q --detach main
+    FOLD_RELEASED_BASELINE="$base" bash scripts/fold-changelog-fragments.sh >/dev/null
+    git add -A; git commit -q -m "release $1: assign"
+    printf 'bundle %s\n' "$1" > 5dive; git add -f 5dive; git commit -q -m "release $1: bundle"
+    git tag "$1"; git checkout -q main
+  ) >"$TMP/cut.log" 2>&1 || { echo "cut $1 FAILED:"; cat "$TMP/cut.log"; }; }
+cut v0.1.0
+_b1=$(git -C "$RG7" rev-parse main)
+body1=$(git -C "$RG7" diff "${_b1}..v0.1.0" -- CHANGELOG.md | sed -n 's/^+\([^+].*\)$/\1/p')
+grep -q 'DIVE-9201' <<<"$body1" && grep -q 'DIVE-9202' <<<"$body1" \
+  && ok_t "first cut folds both pending fragments" \
+  || bad_t "first cut body" "$body1"
+# main keeps its fragments (DIVE-2247, no push to a protected branch) — the very
+# condition that made the repeat possible, asserted rather than assumed.
+[[ $(cd "$RG7" && git ls-tree --name-only main changelog.d/ | wc -l) -eq 2 ]] \
+  && ok_t "main still carries both fragments after the cut (the precondition holds)" \
+  || bad_t "main's fragments" "$(cd "$RG7" && git ls-tree --name-only main changelog.d/)"
+# ONE new fragment lands, then cut again.
+( set -e; cd "$RG7"
+  printf '## Unreleased — feat(c): gamma (DIVE-9203)\n\nC.\n' > changelog.d/DIVE-9203.md
+  git add -A; git commit -q -m 'main: one more fragment' ) >/dev/null 2>&1
+cut v0.1.1
+# The notes range release-cut.yml uses: the MAIN commit the incumbent was cut
+# from (not "v0.1.0^", which is the assign commit — that is the whole bug).
+_b2=$( cd "$RG7" && bash scripts/release-cut-baseline.sh v0.1.0 2>"$TMP/err7" )
+[[ -n "$_b2" ]] \
+  && ok_t "baseline helper resolves v0.1.0 to a main commit through TWO release commits" \
+  || bad_t "baseline helper returned nothing for v0.1.0" "$(cat "$TMP/err7")"
+# THE ASSERTION IS ON THE RELEASE TREE, NOT ON A DIFF. An earlier version of this
+# arm diffed CHANGELOG.md over the notes range and PASSED even with the old broken
+# rule — because that diff's baseline was the previous ASSIGN commit, whose
+# CHANGELOG already contained the re-folded entries, so they cancelled out. In
+# production they do not cancel: stamp-changelog.sh rewrites every `## Unreleased`
+# heading to `## <version>` on each release commit, so the re-folded block differs
+# textually from the previous cut's and the whole of it reads as added. Asserting
+# on the tag's own CHANGELOG states the property directly and cannot cancel.
+c2=$(git -C "$RG7" show v0.1.1:CHANGELOG.md)
+grep -q 'DIVE-9203' <<<"$c2" \
+  && ok_t "second cut's CHANGELOG names the one genuinely new entry (positive control, acceptance 3)" \
+  || bad_t "second cut lost its own new entry" "$c2"
+if grep -qE 'DIVE-920[12]' <<<"$c2"; then
+  bad_t "second cut RE-FOLDED already-shipped entries — this is DIVE-3170" "$c2"
+else
+  ok_t "second cut's entries are DISJOINT from the first's (acceptance 1)"
+fi
+grep -q 'already shipped in a previous cut' "$TMP/cut.log" \
+  && ok_t "the fold REPORTS the skips, so a future regression is visible in the cut log" \
+  || bad_t "fold skipped nothing / said nothing on the second cut" "$(cat "$TMP/cut.log")"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

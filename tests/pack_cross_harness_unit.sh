@@ -79,19 +79,24 @@ check "T1a codex is a target"        "$(grep -cxF codex    <<<"$AGN")" "1"
 check "T1b opencode is a target"     "$(grep -cxF opencode <<<"$AGN")" "1"
 check "T1c claude is still a target" "$(grep -cxF claude   <<<"$AGN")" "1"
 
-# THE FLOOR, and the reason this is derived rather than declared. hermes and
-# openclaw pass is_known_type (they are in TYPE_BIN) but are deliberately absent
-# from TYPE_PERSONA_FILE because neither was ever probe-verified on a live seat
-# (DIVE-2223). Import onto one would create a unix account, a home and a unit,
+# DIVE-2245: hermes and openclaw were probed on live seats and are now mapped,
+# so they are targets. These two rows were `0` here until that measurement landed
+# — they assert the pack REACHES those harnesses, which is the payoff of the probe.
+check "T1d hermes IS a target (DIVE-2245 mapped it)"   "$(grep -cxF hermes   <<<"$AGN")" "1"
+check "T1e openclaw IS a target (DIVE-2245 mapped it)" "$(grep -cxF openclaw <<<"$AGN")" "1"
+
+# THE FLOOR, and the reason this is derived rather than declared. devin passes
+# is_known_type (it is in TYPE_BIN) but is deliberately absent from
+# TYPE_PERSONA_FILE because it was never probe-verified on a live seat
+# (DIVE-3129). Import onto it would create a unix account, a home and a unit,
 # then drop the persona — the pack's whole payload — and report success. A
 # membership assertion alone would pass on any non-empty list, so grade the
 # EXCLUSION explicitly; it is the half that can regress silently.
-check "T1d hermes is NOT a target (no persona path)"   "$(grep -cxF hermes   <<<"$AGN")" "0"
-check "T1e openclaw is NOT a target (no persona path)" "$(grep -cxF openclaw <<<"$AGN")" "0"
+check "T1d2 devin is NOT a target (no persona path)" "$(grep -cxF devin <<<"$AGN")" "0"
 # ...and prove the exclusion is caused by the persona map, not by an empty list:
-# hermes IS a known type, so is_known_type cannot be what filtered it.
-if is_known_type hermes; then ok_ "T1f hermes IS a known type — so the persona map is what excluded it"
-else bad_ "T1f hermes unexpectedly not a known type — T1d proves nothing"; fi
+# devin IS a known type, so is_known_type cannot be what filtered it.
+if is_known_type devin; then ok_ "T1f devin IS a known type — so the persona map is what excluded it"
+else bad_ "T1f devin unexpectedly not a known type — T1d2 proves nothing"; fi
 
 # Every emitted target must have a persona path. This is the invariant, stated
 # as a property rather than as a list, so adding a harness cannot quietly break it.
@@ -101,14 +106,14 @@ check "T1g every target has a TYPE_PERSONA_FILE entry" "$_bad" "0"
 
 # T1d/T1e/T1g above are satisfied by the ITERATION SOURCE alone — _pack_targets_from
 # walks ${!TYPE_PERSONA_FILE[@]}, so an absent key can never be emitted and the
-# non-empty guard inside the loop is never what excluded hermes. Mutation-graded
+# non-empty guard inside the loop is never what excluded devin. Mutation-graded
 # and confirmed: deleting that guard kills none of them. The guard is not dead,
 # though — it catches the OTHER way a harness can be unmapped, which is a key
-# present with an EMPTY value. header.sh documents hermes/openclaw as
-# "deliberately unmapped"; today that is by absence, and the natural way to make
-# the intent explicit later is `[hermes]=""`, which the iteration source alone
-# would then happily emit. Inject exactly that shape so the guard is load-bearing
-# for a defect no other arm can see.
+# present with an EMPTY value. header.sh documents devin as "deliberately
+# unmapped"; today that is by absence, and the natural way to make the intent
+# explicit later is `[devin]=""`, which the iteration source alone would then
+# happily emit. Inject exactly that shape so the guard is load-bearing for a
+# defect no other arm can see.
 TYPE_PERSONA_FILE[t2568empty]=""
 TYPE_BIN[t2568empty]="/nonexistent/t2568"
 TYPE_PERSONA_FILE[t2568mapped]=".t2568/AGENTS.md"
@@ -131,7 +136,10 @@ unset 'TYPE_PERSONA_FILE[t2568nobin]'
 # ------------------------------------------- 2. narrow-only manifest override --
 mk_manifest "$TMP/agnostic"
 mk_manifest "$TMP/narrow" '["claude","codex"]'
-mk_manifest "$TMP/widen"  '["hermes","openclaw"]'
+# DIVE-2245 moved hermes/openclaw INTO the map, so they are no longer the
+# unmapped-but-known example this arm needs — devin is. Using a mapped type here
+# would have turned "cannot widen" into a test that widens successfully.
+mk_manifest "$TMP/widen"  '["devin"]'
 
 A=$(_pack_harness_targets "$TMP/agnostic/manifest.json")
 N=$(_pack_harness_targets "$TMP/narrow/manifest.json")

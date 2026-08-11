@@ -376,8 +376,11 @@ persona_target() { # persona_target <name> <type>
     warn "[$name] fix: probe a live seat, then add [$type]=<path-relative-to-\$HOME> to TYPE_PERSONA_FILE in src/header.sh — or install the doc by hand"
     # A deferred residual is only as durable as the ticket that holds it: name
     # the row so whoever hits this lands on it instead of re-deriving the gap.
-    [[ "$type" == "hermes" || "$type" == "openclaw" ]] \
-      && warn "[$name] hermes/openclaw are unmapped on purpose (never probe-verified) — tracked as DIVE-2245"
+    # DIVE-2245 probed hermes and openclaw and both are mapped above, so this
+    # names what is ACTUALLY still unmapped — devin, a registered type (TYPE_BIN,
+    # TYPE_AUTH, TYPE_INSTALL, channels row) that has never been probe-verified.
+    [[ "$type" == "devin" ]] \
+      && warn "[$name] devin is unmapped on purpose (never probe-verified) — tracked as DIVE-3129"
     return 1
   fi
   printf '%s\n' "${root}/agent-${name}/${rel}"
@@ -1849,7 +1852,7 @@ PI_EXT
       sudo -u "$user" -H env PATH="$node_bin:/usr/bin:/bin" \
         pi remove "npm:${spec}" >/dev/null 2>&1 || true
       fail "$E_GENERIC" \
-        "pi default extension $spec failed to install or its npm integrity did not match the audited hash for $user (SECURITY: fail-closed). Check network to the npm registry, confirm $spec was not republished, or set FIVE_PI_DEFAULT_EXTENSIONS=0 to skip."
+        "pi extension $spec failed npm integrity for $user — check the registry, or set FIVE_PI_DEFAULT_EXTENSIONS=0"
     fi
   done
 }

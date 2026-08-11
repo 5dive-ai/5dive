@@ -200,7 +200,7 @@ cmd_deploy_do() {
   link_repo=$(jq -r '.link.repo // empty'   <<<"$pj")
   repo_id=$(  jq -r '.link.repoId // empty' <<<"$pj")
   [[ "$link_type" == "github" && -n "$link_org" && -n "$link_repo" ]] \
-    || fail "$E_GENERIC" "Vercel project '${proj}' has no linked GitHub repo (link.type='${link_type:-none}') — delegated deploy refuses to supply a repo the project did not already choose."
+    || fail "$E_GENERIC" "Vercel project '${proj}' has no linked GitHub repo — delegated deploy will not choose one for it"
 
   # --- the ONE action.
   local body out rc=0

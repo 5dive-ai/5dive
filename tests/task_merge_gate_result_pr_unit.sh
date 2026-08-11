@@ -163,7 +163,14 @@ PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 # run `task done` capturing stdout+stderr and the exit code.
-run_done() { OUT=$(cmd_task_done "$@" 2>&1); RC=$?; }
+# DIVE-2096: these harnesses grade the PROSE text-binding gate (DIVE-1935/1965/2414),
+# which by definition is exercised with NO `delivery_ref` and no `Branch:` line — and
+# that is now exactly the shape the DIVE-2096 pre-close check refuses, before any of
+# this gate runs. It is not a coverage loss: after DIVE-2096 the prose gate is reached
+# by ASSERTING the reports-on case (`--no-pr`), so asserting it here is what keeps
+# these arms grading the same code as before. `--no-pr` is inert on the arms that DO
+# bind a delivery_ref, so it is applied at the wrapper rather than arm by arm.
+run_done() { OUT=$(cmd_task_done "$@" --no-pr 2>&1); RC=$?; }
 
 # --- 1. the reference extractor: NAMED equivalence fixtures --------------------
 # The extractor was rewritten from PCRE to POSIX ERE to delete a silent-empty

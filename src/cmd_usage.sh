@@ -413,7 +413,7 @@ USAGE_JQ_HELPERS='
 # cmd_usage — entry point. Dispatches budget subcommand, else renders the board
 # (no agent arg) or a single-agent detail view.
 cmd_usage() {
-  # loops subcommand (DIVE-597): token spend aggregated over the LOOP-7
+  # loops subcommand: token spend aggregated over the
   # loop_runs table — the cost side of the loop control window. Read-only over
   # the shared (group-readable) tasks.db like `task loops`, so NO root needed —
   # handled before ensure_state's require_root.

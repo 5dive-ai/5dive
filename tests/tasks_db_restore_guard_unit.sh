@@ -173,11 +173,16 @@ out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
 
 # --- Case 9 (DIVE-2808): canonical schema is complete at birth ----------------
 # Eight columns lived only in the migration list. The completed CREATE must have
-# the full 73-column tasks surface before the skip-gate is allowed to save work.
+# the full 78-column tasks surface before the skip-gate is allowed to save work.
 # (71 at the time this case was written; DIVE-2853 added recurring_stall_escalated_at
-# on main, and DIVE-2848 added gate_rubber_stamp. The count is asserted literally on
-# purpose — this case exists to catch a canonical CREATE that silently drops a column,
-# so it must not derive its own expectation from the thing under test.)
+# on main, DIVE-2848 added gate_rubber_stamp, DIVE-3098 added graded_at+graded_by, and
+# DIVE-3128 added need_answered_relay + need_answered_tap_uid, and DIVE-2354 added
+# gate_mode.
+# DIVE-3171 added route_provenance, the ROUTING axis's provenance beside
+# floor_provenance's TIER axis.
+# The count is asserted literally on purpose — this case exists to catch a canonical
+# CREATE that silently drops a column, so it must not derive its own expectation from
+# the thing under test.)
 #
 # NOTE for the next person who merges main into a branch that adds a column: this
 # literal is exactly where that merge goes wrong SILENTLY. Two branches each adding
@@ -192,8 +197,8 @@ actual=$(sqlite3 "$TASKS_DB" \
     WHERE name IN ('delivery_ref','delivered_at','delivery_ref_iteration','parked_at','park_reason','escalated_at','escalated_by','human_evidence')
     ORDER BY name;" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
 column_count=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM pragma_table_info('tasks');" 2>/dev/null)
-[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "73" ]] \
-  && ok "fresh schema: all 73 columns, including the eight former holes, are present" \
+[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "79" ]] \
+  && ok "fresh schema: all 79 columns, including the eight former holes, are present" \
   || bad "fresh schema: init returned a partial tasks table" "rc=$rc count=$column_count got=[$actual] want=[$required] out=$out"
 
 # --- Case 10 (DIVE-2197): migrate arm still rejects a failed ALTER ------------

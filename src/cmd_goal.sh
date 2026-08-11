@@ -66,7 +66,7 @@ _goal_usage() {
       [--plan=<json>]       # supply a plan directly (skip the planner)
       [--from-gate=<id>]    # materialize a gated plan AFTER a human approved it:
                             #   recovers the plan from the anchor, requires a
-                            #   HUMAN 'approve' (DIVE-916), re-validates, builds.
+                            #   HUMAN 'approve', re-validates, builds.
                             #   The only path that materializes a T2 plan.
       [--from=<who>]        # actor override
       [--wait[=<sec>]]      # scripts only: block for the plan (bounded), legacy
@@ -81,7 +81,7 @@ _goal_usage() {
   nothing is materialized until a human approves; a T2 plan gates at hard tier 2
   and is materialized only via --from-gate=<id> on a human 'approve'.
 
-  ASYNC (DIVE-1349): by default \`goal add\` returns IMMEDIATELY with a job id
+  ASYNC: by default \`goal add\` returns IMMEDIATELY with a job id
   after spawning the planner (agent-driven planning is inherently async and a
   busy/slow planner must never hold an HTTP request to a gateway 502). Poll
   \`goal status <job>\`. Pass --plan=<json> to skip the planner (synchronous,
@@ -209,7 +209,7 @@ _goal_validate_plan() {
   while IFS=$'\t' read -r lid risk text; do
     [[ -n "$lid" ]] || continue
     if [[ "$risk" == "low" ]] && _gate_tier2_floor_hit "$text"; then
-      fail "$E_VALIDATION" "task $lid is declared risk=low but its text implies a Tier-2 action (spend/publish/secret/destructive/brand) — the planner cannot lower a tier"
+      fail "$E_VALIDATION" "task $lid is declared risk=low but its text implies a Tier-2 action — the planner cannot lower a tier"
     fi
   done < <(printf '%s' "$plan" | jq -r '.tasks[] | "\(.local_id)\t\(.risk//"low")\t\(.title) \(.body//"")"')
 
@@ -311,7 +311,7 @@ _goal_materialize() {
     verifier=$(printf '%s' "$plan" | jq -r ".tasks[$i].verifier // \"\"")
     [[ -n "$lid" ]] || continue
     resolved=$(_goal_resolve_assignee "$aor")
-    add_json=$(JSON_MODE=1 cmd_task_add --project="$pkey" --assignee="$resolved" \
+    add_json=$(JSON_MODE=1 cmd_task_add --materialized --project="$pkey" --assignee="$resolved" \
                  --priority="${prio:-medium}" ${from:+--from="$from"} \
                  ${body:+--body="$body"} ${accept:+--accept="$accept"} \
                  ${verify:+--verify="$verify"} ${verifier:+--verifier="$verifier"} \
@@ -403,9 +403,9 @@ _goal_approve_from_gate() {
   nans=$(db "SELECT COALESCE(need_answer,'')     FROM tasks WHERE id=${id};")
   nby=$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE id=${id};")
   [[ -n "$nt" ]]  || fail "$E_CONFLICT" "$ident carries no gate to approve"
-  [[ -n "$nat" ]] || fail "$E_CONFLICT" "$ident's plan gate is not answered yet — a human must approve it first (tap the button in Telegram / dashboard), then re-run"
+  [[ -n "$nat" ]] || fail "$E_CONFLICT" "$ident's plan gate is not answered yet — a human must approve it first, then re-run"
   [[ "$nby" == human:* ]] \
-    || fail "$E_AUTH_REQUIRED" "$ident's plan gate was not cleared by a human (answered by '${nby:-?}') — a plan may only be materialized on a HUMAN approval (DIVE-916); an agent/TTL-cleared gate cannot build it"
+    || fail "$E_AUTH_REQUIRED" "$ident's plan gate was not cleared by a human (answered by '${nby:-?}') — a plan materializes only on a HUMAN approval"
   [[ "$nans" == "approve" ]] \
     || fail "$E_CONFLICT" "$ident's plan gate was answered '${nans}', not 'approve' — nothing materialized (revise via re-planning, DIVE-982)"
 
@@ -604,7 +604,7 @@ _goal_finish_with_plan() {
     anchor_id=$(db "SELECT id FROM tasks WHERE project_key=$(sqlq "$pkey") AND title LIKE 'Goal:%' AND kind='standard' ORDER BY id LIMIT 1;")
     if [[ -z "$anchor_id" ]]; then
       local add_json
-      add_json=$(JSON_MODE=1 cmd_task_add --project="$pkey" --priority=high ${planner:+--assignee="$planner"} ${from:+--from="$from"} \
+      add_json=$(JSON_MODE=1 cmd_task_add --materialized --project="$pkey" --priority=high ${planner:+--assignee="$planner"} ${from:+--from="$from"} \
                    --body="$(printf 'Goal: %s\n\nProposed plan (%s tasks, critical path %s) — approve to materialize:\n\n%s\n\n--- plan json ---\n%s' \
                              "$outcome" "$GOAL_TASK_COUNT" "$GOAL_CRIT_PATH" "$(_goal_render_plan "$plan")" "$plan")" \
                    -- "Goal: $outcome") || return $?

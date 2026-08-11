@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
-# 5.7s measured on the 5dive control plane (agent-dev seat, 2026-08-09, two runs
-# 5.66s/5.48s) — fits the 300s core budget, so no TIER marker: core is the default.
+# 7.4s measured on the 5dive control plane (agent-dev seat, 2026-08-11, three runs
+# 7.13s/7.38s/7.38s, stdout to a file) — fits the 300s core budget, so no TIER
+# marker: core is the default. Was 5.7s on 2026-08-09 with two fewer filings and
+# before the rebase onto DIVE-3171/3117; re-measured because a stale claim is
+# graded (DIVE-2555) and this one had drifted 30% under.
 # It was 50s before the capture-shape note below; that 44x is not sqlite, it is
 # nine detached children each holding a command substitution's pipe open for 5s.
+# THE NUMBER DEPENDS ON HOW YOU RUN IT, and both readings are honest: piping this
+# harness's stdout (`| tail`) re-creates exactly that hold and reads ~12.5s. The
+# figure above is the file-redirect shape, which is what the runner does.
 # DIVE-2093 isolated unit harness — `task need` must say WHO it routed to and WHY,
 # at FILE TIME, and must say at file time when the routed seat cannot SIGN.
 #
@@ -243,8 +249,13 @@ grep -q 'not a re-sign verb' <<<"$ERR_N" \
 grep -qi 'do not grant .*gate-proof sign.* to a cli-scoped' <<<"$ERR_N" \
   && ok_t "the warn forecloses the WRONG fix (granting the signing verb to a cli-scoped seat is a forgery primitive)" \
   || bad_t "warn forecloses wrong fix" "err: $ERR_N"
-[[ "$(reviewer_of DIVE-8004)" == "olivia" ]] \
-  && ok_t "the gate still FILED and still routed — this is a warn, never a fail (a gate no broker checks is unharmed)" \
+# DIVE-3117 landed between this harness's first base and its merge: a
+# push-for-review ask on a loop task SUPPRESSES the verifier route and resolves the
+# chart lead instead, so the reviewer here is `main` and not the loop's verifier.
+# Asserted rather than accommodated — it is the behaviour the require_sig warn now
+# fires against, and pinning it means a future un-suppression cannot pass silently.
+[[ "$(reviewer_of DIVE-8004)" == "main" ]] \
+  && ok_t "the gate still FILED and still routed — this is a warn, never a fail (a gate no broker checks is unharmed); to the CHART LEAD, since DIVE-3117 suppresses the verifier route on a push-for-review ask" \
   || bad_t "gate still files" "routed_reviewer='$(reviewer_of DIVE-8004)'"
 
 # --- 5. require_sig, SIGNING seat: says so, and says nothing alarming ---------
@@ -287,11 +298,17 @@ reset_log; seed_loop DIVE-8008; GRANT='cli-scoped|root|0'
 JSON_MODE=1
 need DIVE-8008 --type=approval --ask="authorize the delegated push of this branch for review" --recommend="yes" --from=dev; OUT_J="$OUT"
 JSON_MODE=0
-[[ "$(jq -r '.data.route_basis' <<<"$OUT_J" 2>/dev/null)" == "verifier" ]] \
-  && ok_t "JSON: route_basis=verifier — a dashboard can flag a misroute without parsing prose" \
+# A push-for-review ask, so DIVE-3117 suppresses the verifier route and this is the
+# CHART rail carrying a require_sig verdict — the verifier-loop token is pinned on
+# DIVE-8009 below, where no suppression applies.
+[[ "$(jq -r '.data.route_basis' <<<"$OUT_J" 2>/dev/null)" == "chart" ]] \
+  && ok_t "JSON: route_basis=chart — a dashboard can flag a misroute without parsing prose" \
   || bad_t "json route_basis" "out: $OUT_J"
-[[ "$(jq -r '.data.route_trigger' <<<"$OUT_J" 2>/dev/null)" == "verifier-route" ]] \
-  && ok_t "JSON: route_trigger=verifier-route" || bad_t "json route_trigger" "out: $OUT_J"
+[[ "$(jq -r '.data.route_basis' <<<"$OUT_J" 2>/dev/null)" == "$(db "SELECT route_provenance FROM tasks WHERE ident='DIVE-8008';")" ]] \
+  && ok_t "JSON route_basis IS tasks.route_provenance, not a parallel derivation of it" \
+  || bad_t "basis == route_provenance" "json=$(jq -r '.data.route_basis' <<<"$OUT_J") col=$(db "SELECT route_provenance FROM tasks WHERE ident='DIVE-8008';")"
+[[ "$(jq -r '.data.route_trigger' <<<"$OUT_J" 2>/dev/null)" == "eng-ship" ]] \
+  && ok_t "JSON: route_trigger=eng-ship" || bad_t "json route_trigger" "out: $OUT_J"
 [[ "$(jq -r '.data.require_sig_seat' <<<"$OUT_J" 2>/dev/null)" == "no" ]] \
   && ok_t "JSON: require_sig_seat=no" || bad_t "json require_sig_seat" "out: $OUT_J"
 reset_log; seed_loop DIVE-8009
@@ -301,6 +318,100 @@ JSON_MODE=0
 [[ "$(jq -r '.data.require_sig_seat' <<<"$OUT_J2" 2>/dev/null)" == "null" ]] \
   && ok_t "JSON: require_sig_seat is NULL when the check did not apply — not-checked and can-sign stay distinguishable" \
   || bad_t "json require_sig_seat null" "out: $OUT_J2"
+# The verifier-loop token, on the one filing DIVE-3117 does NOT suppress (a
+# non-push decision). Pinned in JSON as well as prose, because the dashboard reads
+# this half and the two must carry the same token.
+[[ "$(jq -r '.data.route_basis' <<<"$OUT_J2" 2>/dev/null)" == "verifier-loop" ]] \
+  && ok_t "JSON: route_basis=verifier-loop on a non-push decision — the SAME token the row is stamped with" \
+  || bad_t "json verifier basis" "out: $OUT_J2"
+[[ "$(jq -r '.data.route_basis' <<<"$OUT_J2" 2>/dev/null)" == "$(db "SELECT route_provenance FROM tasks WHERE ident='DIVE-8009';")" ]] \
+  && ok_t "JSON route_basis == tasks.route_provenance on the verifier rail too — one value, both surfaces" \
+  || bad_t "verifier basis == provenance" "out: $OUT_J2"
+[[ "$(jq -r '.data.route_trigger' <<<"$OUT_J2" 2>/dev/null)" == "verifier-route" ]] \
+  && ok_t "JSON: route_trigger=verifier-route" || bad_t "json verifier trigger" "out: $OUT_J2"
+
+# --- 9. THE THIRD ROUTE: the sealed standing lead (DIVE-3171) -----------------
+# main2's iteration-2 blocker, and the reason this case exists: the why-clause used
+# to branch `verifier` vs a catch-all that printed the ORG CHART sentence. DIVE-3171
+# added a third route that fires PRECISELY WHEN THE CHART RESOLVES NOBODY, so the
+# catch-all asserted an `agents_org.reports_to` edge that by construction cannot
+# exist. The instrument built to name the true basis named a false one in exactly
+# the case where the basis is unusual.
+#
+# `main` is this fixture's org ROOT (reports_to NULL), so `_gate_route_reviewer`
+# returns empty for them and the standing branch is the only one left. The
+# derivation is re-pinned to `main` INSIDE the subshell — `--from` is provenance and
+# cannot move it (the seam's whole thesis), and the pin must not leak to case 10.
+# `_gate_standing_lead` is stubbed for the same reason `agent_sudo_grant` is: the
+# real one wants a sealed, undrifted constitution, which is graded by the council
+# harnesses. What is under test here is what the why-clause does with the basis.
+(
+  actor_seam_as main
+  _gate_standing_lead() { printf 'olivia'; }
+  reset_log; seed_plain DIVE-8010
+  need DIVE-8010 --type=approval --tier=1 --ask="approve the merge of the parser refactor" --recommend="yes" --from=main
+  printf 'REVIEWER=%s\nPROV=%s\n%s\n' \
+    "$(reviewer_of DIVE-8010)" "$(db "SELECT COALESCE(route_provenance,'') FROM tasks WHERE ident='DIVE-8010';")" "$OUT" >"$TMP/standing"
+)
+STD=$(cat "$TMP/standing")
+grep -q 'REVIEWER=olivia' <<<"$STD" \
+  && ok_t "STANDING: the third route is LIVE here (org root filer, no chart lead ⇒ routed to the sealed lead)" \
+  || bad_t "standing route live" "std: $STD"
+grep -q 'PROV=seal:standing-lead' <<<"$STD" \
+  && ok_t "STANDING: the row is stamped route_provenance=seal:standing-lead" \
+  || bad_t "standing provenance" "std: $STD"
+# The blocker was an ASSERTED edge, so assert against the chart arm's assertion FORM
+# ("X is the lead Y reports to (agents_org.reports_to)"), not against the bare column
+# name — the standing clause legitimately NAMES that column in order to DENY it, and
+# a substring grep cannot tell a claim from its negation.
+grep -qE 'is the lead [A-Za-z0-9_-]+ reports to' <<<"$STD" \
+  && bad_t "STANDING: the why-clause asserts a chart edge that does not exist" \
+      "this is main2's iteration-2 blocker exactly — the standing route has NO reports_to edge by construction: $STD" \
+  || ok_t "STANDING: the why-clause does NOT assert a reports_to edge — it does not exist here and is not claimed"
+grep -q 'routed by the ORG CHART' <<<"$STD" \
+  && bad_t "STANDING: the standing route claims the ORG CHART basis" "the chart resolved nobody; that is why this branch ran: $STD" \
+  || ok_t "STANDING: it does not claim the ORG CHART basis — the three bases are mutually distinguishable"
+grep -q 'NOT along an agents_org.reports_to edge' <<<"$STD" \
+  && ok_t "STANDING: it names the column it is NOT using and says so — the reader can rule the chart out, not merely fail to see it mentioned" \
+  || bad_t "standing denies the edge explicitly" "std: $STD"
+grep -q 'why: routed by the SEALED STANDING LEAD' <<<"$STD" \
+  && ok_t "STANDING: the why-clause names the SEAL as the basis" \
+  || bad_t "standing basis named" "std: $STD"
+grep -q 'authority.eng_approval_lead' <<<"$STD" \
+  && ok_t "STANDING: it names the sealed KEY the target came from, so the claim is checkable like the other two" \
+  || bad_t "standing key named" "std: $STD"
+grep -q 'the org chart resolved NOBODY' <<<"$STD" \
+  && ok_t "STANDING: it states the fact that made this route fire — main's DIVE-3171 note asks for exactly this" \
+  || bad_t "standing chart-nobody stated" "std: $STD"
+grep -q 'trigger=standing-lead' <<<"$STD" \
+  && ok_t "STANDING: trigger=standing-lead, NOT the pref — _eng_ship needs a chart lead above the filer, so it is 0 here and the old ladder fell through to 'gate_builder_routing=on'" \
+  || bad_t "standing trigger" "std: $STD"
+grep -q 'trigger=gate_builder_routing=on' <<<"$STD" \
+  && bad_t "STANDING: the trigger blames the pref" "the pref is not why this routed — the standing route bypasses it: $STD" \
+  || ok_t "STANDING: the pref is not blamed for a route it did not cause"
+
+# --- 10. THE UNKNOWN ARM: a basis this build does not name --------------------
+# The general rule this row is really about: a catch-all in an EXPLANATION is an
+# assertion about every case you did not enumerate. A FOURTH route added later must
+# degrade to "unknown", never to the most common case — which is precisely how the
+# standing route came to be described as a chart edge. Called directly, because the
+# whole point is a basis no current call site can produce.
+UNK=$(_gate_route_why 'some-future-route' quinn dev 'a-trigger')
+grep -q 'ORG CHART\|agents_org.reports_to\|LOOP MEMBERSHIP\|SEALED STANDING' <<<"$UNK" \
+  && bad_t "UNKNOWN: an unnamed basis is described as a mechanism it is not" "out: $UNK" \
+  || ok_t "UNKNOWN: an unnamed basis names NO mechanism — the catch-all cannot generate a falsehood"
+grep -q 'a basis this build does not name' <<<"$UNK" \
+  && ok_t "UNKNOWN: it says so in words, so a filer knows the line is uninformative rather than reading it as the chart" \
+  || bad_t "unknown says unknown" "out: $UNK"
+grep -q 'route_provenance=some-future-route' <<<"$UNK" \
+  && ok_t "UNKNOWN: it echoes the unrecognised token, so the next reader can grep for what produced it" \
+  || bad_t "unknown echoes token" "out: $UNK"
+grep -q 'trigger=a-trigger' <<<"$UNK" \
+  && ok_t "UNKNOWN: the trigger still reports — the two axes stay independent" || bad_t "unknown trigger" "out: $UNK"
+UNK_E=$(_gate_route_why '' quinn dev 'a-trigger')
+grep -q 'route_provenance=<empty>' <<<"$UNK_E" \
+  && ok_t "UNKNOWN: an EMPTY basis reads as <empty>, not as the chart — a legacy row with no provenance is absent, not chart-routed" \
+  || bad_t "empty basis unknown" "out: $UNK_E"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

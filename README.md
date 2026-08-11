@@ -126,8 +126,14 @@ The `claude` type can also run the official Claude Code harness against a third-
 
 ```sh
 sudo 5dive agent create cheap-coder --type=claude --provider=deepseek --api-key=<key> --auth-profile=deepseek
-# providers: openrouter (any model), deepseek (DeepSeek), moonshot (Kimi), zai (GLM)
+# providers: openrouter (any model), deepseek (DeepSeek), moonshot (Kimi), qwen (Alibaba Qwen), zai (GLM)
 # claude BYO requires --auth-profile=<name> (the account the key is saved under; reuse it to share the key across agents)
+
+# Already have the agent? You do NOT need to recreate it — point it at another account:
+sudo 5dive agent create kimi --type=claude --provider=moonshot --api-key=<key> --auth-profile=kimi
+sudo 5dive agent set-account cheap-coder kimi        # rebinds + restarts the agent; "default" clears
+# (`5dive account set-active-provider` is a DIFFERENT thing and is type=hermes only — it flips the
+#  active provider inside one hermes profile, and refuses on claude. For claude, switch the ACCOUNT.)
 
 # Pick the model too. --model overrides the primary tiers with any slug the
 # provider serves (OpenRouter translates every family); the background model
@@ -142,9 +148,9 @@ endpoint — a model you host yourself, or a vendor host we don't ship a row for
 # Open weights on a server you own. --model is required here: there is no catalog
 # entry to inherit per-tier model ids from, and an unpinned background tier would
 # 404 on the agent's own housekeeping turns.
-sudo 5dive agent create qwen-box --type=claude \
+sudo 5dive agent create mistral-box --type=claude \
   --base-url=https://llm.internal.example.com/anthropic \
-  --api-key=<key> --auth-profile=qwen-box --model=qwen3.8-max
+  --api-key=<key> --auth-profile=mistral-box --model=mistral-large-3
 
 # A local inference server (vLLM, llama.cpp, an Ollama Anthropic shim):
 sudo 5dive agent create local-box --type=claude \

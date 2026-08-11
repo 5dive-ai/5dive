@@ -165,7 +165,7 @@ require_sqlite() {
 # NOTE: projects/loop_runs/supervisor_events are ALSO defined inside gated
 # one-shot migration blocks in _tasks_db_migrate() below — edit both copies
 # together; tests/schema_sync_unit.sh fails CI if they diverge.
-_TASKS_SCHEMA_EPOCH='2808-1'
+_TASKS_SCHEMA_EPOCH='3098-1'   # DIVE-3098: +graded_at, +graded_by
 _tasks_schema() {
   cat <<'SQL'
 PRAGMA journal_mode=WAL;
@@ -224,11 +224,49 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- array column is already present. Keeping the two definitions complete makes
   -- that fast path both safe and cheap; the convergence assertion is the backstop.
   derived_actor TEXT,
+  -- DIVE-3098: a verifier grade recorded by `task verify --no-done` (graded_at) and
+  -- the actor who recorded it (graded_by). Structural on purpose — the
+  -- terminal-for-verifier predicate must not key on result TEXT, which the MAKER's
+  -- `task deliver --result=` also writes, or a maker could buy the exemption by
+  -- typing the right words. Declared HERE as well as in _TASKS_ADDITIVE_COLUMNS,
+  -- per the rule directly above: a fresh store takes this CREATE and never runs the
+  -- ALTER loop, so array-only lands a store that fails the DIVE-2197 assertion.
+  graded_at TEXT,
+  graded_by TEXT,
   -- DIVE-2615: why this gate has this tier — axis=pinned|type-default|secret-type
   -- |ask|title|title-fallback|none, plus ;term=<t> where a term is what fired.
   -- Declared HERE as well as in _TASKS_ADDITIVE_COLUMNS: a fresh store takes this
   -- CREATE, and the migration gate must find this column before it may skip.
   floor_provenance TEXT,
+  -- DIVE-3171: why this gate has this ROUTED_REVIEWER — the sibling axis to
+  -- floor_provenance above, which DIVE-3117 named as missing while fixing a routing
+  -- defect it could not measure ("the TIER axis had a floor, its sibling ROUTING axis
+  -- had none"). Values:
+  --   chart              _gate_route_reviewer resolved them from agents_org
+  --   verifier-loop      DIVE-1495 routed to the row's verifier
+  --   seal:standing-lead DIVE-3171 — the chart resolved NOBODY and the SEALED
+  --                      constitution's eng_approval_lead took the gate
+  -- NULL is a real third state, exactly as for floor_provenance (DIVE-2615): it means
+  -- this build never recorded it, NOT that the route had no source. Conflating the two
+  -- is what made the existing floor column unusable for a whole release.
+  -- WHY IT IS A COLUMN AND NOT A DERIVATION: `cmd_task_answer` reads it to decide
+  -- whether a lead-clear is stamped `lead:` or `lead:standing:`, and re-deriving it
+  -- would mean re-reading agents_org — an agent-writable table (DIVE-2233) — at answer
+  -- time, so a chart edit between filing and answering would silently change what the
+  -- record says HAPPENED. A recorded fact beats a re-derived one; that is the whole
+  -- lesson of the three 2026-08-10 provenance incidents.
+  route_provenance TEXT,
+  -- DIVE-2354: WHICH of the two orders this gate is in, as data.
+  --   approve-to-send   the action has NOT happened; the tap authorises it (default).
+  --   confirm-after-send the action ALREADY happened; the tap RATIFIES it after the fact.
+  -- NULL is a real third state and not a synonym for either: it means the gate was
+  -- filed before this column existed, so the record does not say which order it was
+  -- (the same distinction as unreadable-vs-absent, DIVE-2327). Readers must render
+  -- the three apart -- a ratification that renders as a prior approval is the exact
+  -- false record this ticket exists to end. Declared HERE as well as in
+  -- _TASKS_ADDITIVE_COLUMNS: a fresh store takes this CREATE and never runs the
+  -- ALTER loop, per the rule above.
+  gate_mode TEXT,
   parent_id   INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   started_at  TEXT,
@@ -294,6 +332,18 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- DIVE-1518: independently records which authenticated evidence form cleared
   -- the current gate (tap nonce, sudo uid, channel session, or proof).
   human_evidence   TEXT,
+  -- DIVE-3128: the RELAY, kept OUT of need_answered_by rather than folded into
+  -- it. A Telegram button tap reaches this CLI through some agent's bot, and
+  -- until now the relaying agent's own identity was what got the `human:`
+  -- prefix — so `human:olivia` meant either "a person tapped, olivia's bot
+  -- carried it" or "the olivia agent cleared its own human gate", with nothing
+  -- in the row to tell them apart (DIVE-3045). Two columns, two facts:
+  --   need_answered_by     WHO decided
+  --   need_answered_relay  WHOSE BOT carried the decision
+  -- need_answered_tap_uid is the Telegram user id of the person who tapped, kept
+  -- as TEXT because Telegram ids are opaque identifiers, not arithmetic.
+  need_answered_relay   TEXT,
+  need_answered_tap_uid TEXT,
   -- Recurring task templates (DIVE step 1). kind='recurring' marks a row as a
   -- TEMPLATE, not work: it's excluded from the work board, the heartbeat TODO
   -- count + wake, and the human inbox, so it's never picked up directly.
@@ -734,7 +784,13 @@ CREATE TABLE IF NOT EXISTS gate_history (
   human_nonce_hash  TEXT,
   retired_by        TEXT NOT NULL,
   retired_at        TEXT NOT NULL DEFAULT (datetime('now')),
-  floor_provenance  TEXT
+  floor_provenance  TEXT,
+  -- DIVE-3171: carried for the same reason floor_provenance is. A retired gate that
+  -- keeps its TIER's provenance and drops its ROUTE's is the half-record that makes a
+  -- later count wrong in one direction only, and the count at stake here is "how often
+  -- did the standing authority actually carry a gate".
+  route_provenance  TEXT,
+  gate_mode         TEXT
 );
 CREATE INDEX IF NOT EXISTS gate_history_task_idx ON gate_history(task_id, id);
 
@@ -1165,7 +1221,46 @@ _TASKS_ADDITIVE_COLUMNS=(
   'originated_by_objective INTEGER' 'originated_cycle INTEGER'
   'verify_unavailable INTEGER' 'last_skipped_at TEXT'
   'human_evidence TEXT' 'derived_actor TEXT' 'floor_provenance TEXT'
+  # DIVE-3171: the ROUTING axis's provenance, sibling to floor_provenance. See the
+  # CREATE TABLE comment for the values and for why it is stored, not derived.
+  'route_provenance TEXT'
+  # DIVE-3128: the tapping human vs the relaying bot, separated. See the CREATE
+  # TABLE comment above for why folding them into one string was the defect.
+  'need_answered_relay TEXT' 'need_answered_tap_uid TEXT'
+  # DIVE-3098: a verifier grade recorded by `task verify --no-done`. Structural on
+  # purpose — the terminal-for-verifier predicate must not key on result TEXT,
+  # which the MAKER's `task deliver --result=` also writes.
+  'graded_at TEXT' 'graded_by TEXT'
+  # DIVE-2354: approve-to-send | confirm-after-send. See the CREATE TABLE comment.
+  'gate_mode TEXT'
 )
+
+# DIVE-3098 - TERMINAL FOR THE VERIFIER, as ONE SQL boolean expression.
+#
+# Three readers evaluate this: `task ls`'s render, `_task_terminal_for_verifier`
+# (the goal Stop hook's answer), and the heartbeat rot-nudger's exclusion. They MUST
+# agree - a row the nudger exempts but the render still paints `todo` is the original
+# bug wearing different clothes. So it is written once here and interpolated, never
+# retyped. (Same rule that produced broker_strip_md_quotes: a two-reader binding
+# diverges the moment someone fixes one side.)
+#
+# Every conjunct is load-bearing:
+#   graded_at                - stamped ONLY by `task verify --no-done`, never by the
+#                              maker's `task deliver --result=`, so it cannot be
+#                              forged in prose.
+#   graded_by <> maker_agent - a self-verified close does not buy the exemption.
+#   delivery_ref             - a verdict with nothing to merge is not awaiting a merge.
+# status stays OPEN: terminal for the VERIFIER, non-terminal for the ROW.
+# NOT `readonly`: several harnesses and code paths source this lib twice, and a
+# readonly re-assignment errors on the second source — measured, it broke 8 arms of
+# tests/gate_route_delivery_unit.sh with a stderr line and nothing else. Every other
+# constant in this file (incl. _TASKS_SCHEMA_EPOCH) is a plain assignment for the
+# same reason; match the file.
+_TASKS_TFV_SQL="graded_at IS NOT NULL
+       AND delivery_ref IS NOT NULL AND TRIM(delivery_ref) <> ''
+       AND (maker_agent IS NULL OR graded_by IS NULL OR graded_by <> maker_agent)
+       AND status NOT IN ('done','cancelled')"
+
 _TASKS_DB_GATE_COLUMNS=''
 _TASKS_DB_GATE_EPOCH=''
 _TASKS_DB_GATE_SEEDS=''
@@ -1570,7 +1665,13 @@ CREATE TABLE IF NOT EXISTS gate_history (
   human_nonce_hash  TEXT,
   retired_by        TEXT NOT NULL,
   retired_at        TEXT NOT NULL DEFAULT (datetime('now')),
-  floor_provenance  TEXT
+  floor_provenance  TEXT,
+  -- DIVE-3171: carried for the same reason floor_provenance is. A retired gate that
+  -- keeps its TIER's provenance and drops its ROUTE's is the half-record that makes a
+  -- later count wrong in one direction only, and the count at stake here is "how often
+  -- did the standing authority actually carry a gate".
+  route_provenance  TEXT,
+  gate_mode         TEXT
 );
 CREATE INDEX IF NOT EXISTS gate_history_task_idx ON gate_history(task_id, id);
 MIG
@@ -1585,12 +1686,34 @@ MIG
   # already carries `floor_provenance TEXT`, added out-of-band by something that
   # left no trace in this repo — the column existed with no writer, no migration
   # and no reference in src/ or tests/, which is why it read NULL on all 79 rows.
+  # DIVE-2354: additive gate_mode on an ALREADY-CREATED gate_history, for the same
+  # reason floor_provenance needs one directly below -- the create-if-absent block
+  # above reaches only stores that have never filed a gate.
+  local has_gh_gatemode
+  has_gh_gatemode=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM pragma_table_info('gate_history') WHERE name='gate_mode' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_gh_gatemode" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+      "ALTER TABLE gate_history ADD COLUMN gate_mode TEXT;" >/dev/null 2>&1 || true
+  fi
+
   local has_gh_floorprov
   has_gh_floorprov=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
     "SELECT 1 FROM pragma_table_info('gate_history') WHERE name='floor_provenance' LIMIT 1;" 2>/dev/null)
   if [[ "$has_gh_floorprov" != "1" ]]; then
     sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
       "ALTER TABLE gate_history ADD COLUMN floor_provenance TEXT;" >/dev/null 2>&1 || true
+  fi
+
+  # DIVE-3171: additive route_provenance on an ALREADY-CREATED gate_history, for the
+  # same reason its two siblings above need one — the create-if-absent block reaches
+  # only stores that have never filed a gate, which is no box that has ever run.
+  local has_gh_routeprov
+  has_gh_routeprov=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM pragma_table_info('gate_history') WHERE name='route_provenance' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_gh_routeprov" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+      "ALTER TABLE gate_history ADD COLUMN route_provenance TEXT;" >/dev/null 2>&1 || true
   fi
 
   # DIVE-748 — additive scorecard column on already-created loop_runs tables.
@@ -2135,11 +2258,13 @@ _gate_archive_and_clear_sql() {
     "INSERT INTO gate_history (task_id, ident, need_type, ask, need_options, recommend," \
     "                          tier, need_asked_at, need_answer, need_answered_at," \
     "                          need_answered_by, need_answered_uid, need_answer_sig," \
-    "                          human_nonce_hash, retired_by, floor_provenance)" \
+    "                          human_nonce_hash, retired_by, floor_provenance," \
+    "                          route_provenance, gate_mode)" \
     "  SELECT id, ident, need_type, ask, need_options, recommend," \
     "         tier, need_asked_at, need_answer, need_answered_at," \
     "         need_answered_by, need_answered_uid, need_answer_sig," \
-    "         human_nonce_hash, $(sqlq "$verb"), floor_provenance" \
+    "         human_nonce_hash, $(sqlq "$verb"), floor_provenance," \
+    "         route_provenance, gate_mode" \
     "    FROM tasks" \
     "   WHERE (${pred})" \
     "     AND (need_type IS NOT NULL OR need_answer IS NOT NULL" \
