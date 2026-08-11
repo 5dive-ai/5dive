@@ -1,6 +1,165 @@
 # Changelog
 
-## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
+## v0.19.23 — fix(host): the FORK telegram plugins are delivered, from a ref, and you can now read which version each one runs (DIVE-3269)
+
+The five fork plugins (codex/grok/agy/pi/opencode) load
+`/usr/local/lib/5dive/telegram-<rt>/server.ts` directly — `agent-codex`'s
+`config.toml` names that path, and `agent_setup.sh` resolves
+`TELEGRAM_<RT>_PLUGIN_DIR` → that dir → the shared checkout, so the staged copy
+always wins because it exists.
+
+**Nothing on the host wrote it.** Measured 2026-08-11: all five staged copies
+predated DIVE-3224 by an hour, with that row *and* DIVE-3267 both merged into the
+same dead end. Not a slow schedule — no schedule. `5dive-refresh-plugins.sh` and the
+23:15 host-update cron serve only the CLAUDE lineage, which loads a versioned
+marketplace cache; the forks are in neither mechanism.
+
+**And it was invisible.** "Merged" and "running" were indistinguishable from every
+surface, which is why this went unnoticed rather than unfixed — so the readout below
+is half the fix, not a nicety.
+
+### New: `5dive-stage-fork-plugins.sh`
+
+Called by `5dive-refresh-plugins.sh` (already on the 23:15 cron), so both lineages
+are delivered by one entry point and one `--restart` pass. A second cron entry would
+be a second thing to forget, and forgetting is this row's defect.
+
+Three decisions, made rather than assumed, because each has a wrong answer that looks
+reasonable — and two of them are only wrong in a situation that does not arise on a
+healthy day:
+
+1. **Stage from a REF, via a BARE mirror.** The obvious implementation reads the
+   shared checkout at `/home/claude/projects/5dive/5dive-plugins`, which that day sat
+   on `dive-1428-gap23-inline-clear` at ca36c73 — a stage step pointed there ships
+   whatever someone left checked out to every fork agent, unreviewed, and looks
+   healthy doing it. A bare mirror has no working tree to be parked, so the failure
+   mode is structurally absent rather than avoided by care. It also keeps root's hands
+   off an agent-writable checkout, where `sudo git` leaves root-owned objects and
+   breaks the next agent that writes there. The repo is public, so no credentials.
+2. **Never degrade to another source.** If the ref will not resolve, staging SKIPS,
+   loudly, leaving the previous copy in place. Stale-but-reviewed beats
+   fresh-but-unreviewed.
+3. **Overlay, do not replace.** The staged dirs carry `node_modules` the repo does
+   not; a clean-and-copy would leave every fork agent unable to start. `bun install`
+   re-runs only when the lockfile actually moves.
+
+Each staged dir gets a `.5dive-stage.json` manifest (plugin, ref, sha, staged_at,
+source) — **provenance, never the verdict**; see `--status` below. Fork agents whose
+plugin changed join the existing deferred-restart pass.
+
+**The install is per-file rename-into-place.** This runs as root out of the 23:15 cron
+and overwrites what five live agents execute, with nobody watching. Files are extracted
+to a temp dir and validated (archive extracted cleanly, `server.ts` present) before
+anything is touched, then copied beside each target and `mv`d over it — a reader sees
+the old inode or the new one, never a truncated `server.ts`. A part-way failure cleans
+up its scratch files and says so loudly, because "some files new, some old" is the one
+state a later run may not notice.
+
+### New: `--status`, the question nobody could ask
+
+`sudo 5dive-refresh-plugins.sh --status` (or the staging script directly) prints each
+fork as **CURRENT**, **BEHIND `<sha>`**, **MODIFIED** (matches no ref — hand-edited,
+half-installed, or staged before this existed), or **UNKNOWN** when upstream is
+unreachable. Never a comparison it could not take — same posture as
+`ops/in-my-binary.sh`.
+
+**The verdict is hashed from the bytes on disk, not read from the manifest**, and that
+distinction is the row itself. A status verb that reports the version from a file the
+stage step wrote can only confirm THE STAGER RAN — it agrees with the writer by
+construction, which is "merged and running are indistinguishable" reproduced one layer
+up inside the fix for it. So every file the ref carries is hashed with `git hash-object`
+and compared to the blob id in the ref's tree. A hand-patched `server.ts` reads MODIFIED
+even though its manifest still names the current sha — and that is not hypothetical: the
+box carries a `server.ts.bak-dive3179-*` beside a staged plugin right now.
+
+### Not done here, deliberately
+
+The checkout fallback in `agent_setup.sh` is provably never-firing on a staged box and
+reads like a safety net it is not. It stays for now: it is on the agent-create path
+whose smoke cannot run on this host (DIVE-2847), and removing a net in the same change
+that first makes the primary self-maintaining is two changes wearing one hat.
+Recommended as its own row.
+
+### Tests
+
+New `tests/refresh_plugins_fork_stage_unit.sh` — 19 arms, 0.89s (min of 3 on this box; core tier), all green.
+It exercises the real script against temp dirs via the `FORK_*` env overrides, which
+is why the staging lives in its own file: `5dive-refresh-plugins.sh` refuses without a
+claude binary and enumerates real agents at load, so its fork half could only ever
+have been tested by delivering. **A delivery mechanism testable only by delivering is
+the shape this row exists to end.**
+
+The arms grade the decisions, not the plumbing: **S7** parks the source repo on a
+branch carrying poison *and* dirties its working tree, then asserts the staged bytes
+are still main's; **S6** points at a ref that cannot resolve and asserts the previous
+copy is untouched; **S5** plants a `node_modules` marker and asserts it survives a
+re-stage; **S2** asserts the claude-lineage `telegram` in the same `plugins/` dir is
+never staged, since staging it would overwrite a marketplace-managed tree.
+
+**R5** stages cleanly, then hand-edits the staged `server.ts` the way someone patching a
+live box does, and asserts the verdict moves off CURRENT — the arm that fails if
+`--status` ever goes back to trusting the manifest.
+
+Two mutation controls, because arms this shape pass for the wrong reason easily: pointed
+at the parked ref on purpose, the same script stages the poison (so **S7** passes because
+the implementation reads a ref, not because the mechanism cannot get it wrong); and with
+the content comparison forced to always-match, **R2/R3/R5/R5b** go red together (so they
+measure the hash, not the manifest).
+
+## v0.19.23 — feat(task): `ls --json` exports `needs_human`, the CLI's own verdict on whose gate it is (DIVE-3267)
+
+DIVE-3224 fixed the telegram plugin's `/inbox`, which filtered `task ls --json` on
+`need_type` — "has an unanswered gate", not "needs a HUMAN" — and showed lodar 12 gates
+of which 3 were his. Grading that merge, main found **the same wrong predicate still live
+one command over**: `/task`'s "🔔 Needs you" section, in all six plugin forks, with a
+comment above it asserting the false premise as its justification.
+
+Both copies existed for one reason, and it is this command's fault: **the real predicate
+was reachable only by re-deriving it.** `cmd_task_inbox` evaluates it and renders a view;
+any consumer that needed the *answer* for its own layout had to rebuild the *rule*.
+
+**So export the verdict.** `needs_human` is a computed boolean on `task ls --json`,
+evaluated from the same predicate `task inbox --json` uses. A consumer partitions on the
+answer in one call.
+
+That is not a loophole in DIVE-3224's prohibition, it is the prohibition's point.
+Forbidden: exporting the raw INPUTS (`routed_reviewer`, `needs_capability`) so a consumer
+can re-derive the rule — that is the second copy, and it drifts, which DIVE-3228 proved
+by landing a fourth clause the morning after DIVE-3224 was written. Exporting the RESULT
+is the opposite move: same single evaluation, one more view. `tier` (DIVE-3224) was the
+narrow version of this; `needs_human` is the general one.
+
+**The way to get this wrong is to paste the SQL into the `ls` query** — then the fix for
+two copies ships three. Both predicates are now single-source helpers,
+`_task_gate_open_pred` and `_task_human_gate_pred`, defined once above `cmd_task_inbox`
+and interpolated by both call sites. `gate_live` (DIVE-1347) now reads from the same
+open-predicate helper rather than restating it, closing a smaller instance of the same
+drift that was already in the tree.
+
+Deliberately **not** "have the consumer call `task inbox --json` too": two calls are two
+snapshots with a window between them, so a gate answered in that window lands a row in
+neither section or in both.
+
+New harness `tests/task_needs_human_parity_unit.sh` (18 arms). Its shape is the argument:
+
+- **P1** asserts `needs_human==1` is *exactly* the `inbox` ident set — and is worthless
+  alone, because parity between two views is trivially true on a fixture with no row they
+  could disagree about. So **P0** replays the pre-fix reading (`gate_live`) over the same
+  fixture and asserts it returns strictly more rows. The fixture seeds both sides of every
+  clause, including both sides of DIVE-3228's routed-`access` case.
+- **S1** asserts at source level that the disjunction is written exactly **once** in
+  `cmd_task.sh`, and **S2** that there is one definition and exactly two call sites. That
+  is the copy-paste failure caught mechanically rather than at the next founder complaint
+  — main graded DIVE-3224's merge by diffing the predicate byte-for-byte; this keeps that
+  check.
+- **F1** pins that `needs_human` is present and `0` (never omitted) on non-human rows.
+  That is load-bearing for the plugin, not for this CLI: a consumer on an older binary
+  sees the key absent *everywhere* and falls back to the old reading, which is only safe
+  because present-and-0 can never look like absent.
+
+Ships with 5dive-plugins DIVE-3267 (`/task` partitions on this field across all six forks).
+
+## v0.19.23 — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
 
 DIVE-1935's first iteration was rejected, and for the right reason. It added a
 `sudo -n -u claude gh auth token` arm to `_gate_gh_token` justified by *"agents hold
