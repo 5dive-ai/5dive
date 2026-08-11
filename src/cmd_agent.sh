@@ -611,8 +611,21 @@ cmd_info() {
   grant_implied=$(isolation_implied_by_grant "$grant_class")
   grant_english=$(sudo_grant_english "$grant_class")
 
+  # DIVE-3274: the OUTPUT overlay. `state:` below reports systemd + the registry
+  # — both LIVENESS labels — and a seat that is up, reachable and closing
+  # nothing prints identically to a working one. That is exactly what happened
+  # to dev3 for four days (DIVE-3272), and this is the surface people type. See
+  # sup_info_for_agent in cmd_supervisor.sh for why one half of the overlay is
+  # measured here and the other is inherited with its age attached. `|| true`:
+  # the overlay is best-effort like every other probe on this command — an
+  # unreadable store degrades to `unobserved`, never to a failed `info`.
+  local sup
+  sup=$(sup_info_for_agent "$name" 2>/dev/null || true)
+  [[ -n "$sup" ]] || sup='{"output":"unknown","transacting":null,"classification":"unobserved","verdict":null,"stateNote":"output unknown — the task store was not readable from here","line":"unobserved — the task store was not readable from here","note":"store unreadable"}'
+
   local obj
   obj=$(jq -c \
+    --argjson sup "$sup" \
     --arg n "$name" \
     --arg grantClass "$grant_class" \
     --arg grantRunas "$grant_runas" \
@@ -671,7 +684,12 @@ cmd_info() {
       # model pin, i.e. running on the built-in openclaw default and therefore
       # on a provider whose key it does not have. (No apostrophes in this jq
       # program: it is a single-quoted bash string, so one would end it.)
-      modelUnpinnedWithCreds: ($ocUnpinned == "1")
+      modelUnpinnedWithCreds: ($ocUnpinned == "1"),
+      # DIVE-3274: whether this seat is PRODUCING, alongside the liveness fields
+      # above. `active`/`enabled` answer "is it up", `supervisor.output` answers
+      # "does anything come out" — the question no signal on this command asked
+      # before, and the one a dark seat passes every other check on.
+      supervisor: $sup
     }' <<<"$reg")
 
   if (( JSON_MODE )); then
@@ -687,8 +705,16 @@ cmd_info() {
       "workdir:     \(.workdir)",
       "isolation:   \(.isolation) (label\(if .isolationLabelled then "" else ", defaulted — unset in registry" end))",
       "sudo:        \(if .sudo.measured then "\(.sudo.grant) — \(.sudo.scope); runas \(.sudo.runas)" else "unknown — not measurable from here; run `sudo -n -l` as agent-\(.name), or re-run this as root" end)\(if .sudo.extraEntries then " (+ entries this CLI did not write)" else "" end)",
-      "state:       \(.active) / \(.enabled)",
+      "state:       \(.active) / \(.enabled) · \(.supervisor.stateNote)",
+      "output:      \(.supervisor.note)",
+      "supervisor:  \(.supervisor.line)",
       "created:     \(.createdAt // "unknown")",
+      # DIVE-3274: leads with the QUEUE, not the seat symptom — the entire cost
+      # of the DIVE-3272 incident was the 20 rows stacked behind a seat nobody
+      # knew was dark, and the seat itself, by construction, cannot read this.
+      (if .supervisor.verdict then
+         "\nWARNING: this seat is UP and REACHABLE but NOT TRANSACTING (\(.supervisor.verdict)): \(.supervisor.note). Whatever is queued behind it is not moving. The `state:` line above and every other liveness signal (unit / tmux / poller / registry label) read healthy — that agreement is the DIVE-3272 defect, not evidence against this line. Check model capacity (auth-profile, quota reset) and reassign or park the queue: 5dive task ls --assignee=\(.name)"
+       else empty end),
       (if .modelUnpinnedWithCreds then
          "\nWARNING: this openclaw agent has a credential on disk and NO model pin. That is not a neutral default — openclaw model ids are `<provider>/<model>`, so with nothing pinned it uses its built-in default, whose provider prefix is not the one you configured. It will consult a credential that does not exist and return HTTP 401 while your key sits unused (DIVE-3112). Repair: sudo 5dive agent auth set openclaw --provider=<provider> --api-key=<key> --auth-profile=\(.authProfile // "<profile>") --model=<provider>/<model>"
        else empty end),

@@ -237,6 +237,228 @@ _sup_output_stats() {  # <name>
   printf '%s|%s\n' "$open" "$days"
 }
 
+# ── DIVE-3274: the same two facts, on the surface people actually type ────────
+#
+# DIVE-3272 taught the supervisor BOARD to see a seat that is up and closing
+# nothing. `agent info` — the drill-down people actually type — kept printing
+# only the systemd/registry LIVENESS label, so the defect survived there intact:
+# a dark seat and a working one printed the same `state: active / enabled`. Four
+# people trusted that line about dev3 for four days
+# (community/wiki/every-signal-measured-liveness-none-measured-output.md).
+#
+# The two capacity classes are NOT equally measurable from this surface, and the
+# overlay says which is which rather than flattening them into one confident
+# label:
+#
+#   no-output        A PURE STORE READ. `info` re-runs _sup_output_stats itself,
+#                    so this half is MEASURED at print time — it holds on a box
+#                    where the tick has never run, and it cannot go stale.
+#   quota-exhausted  Needs a root `tmux capture-pane` hop. `info` is read-only
+#                    and runs as any seat (ensure_state_ro), so it must not grow
+#                    one; this half is INHERITED from the event trail. It is
+#                    therefore printed WITH its age and the tick's arm state and
+#                    never as a bare classification — an unmeasured branch has
+#                    to say less than the measured one (DIVE-2793), and an
+#                    unarmed monitor otherwise prints exactly what a quiet one
+#                    prints (DIVE-2306). That is the same defect one level up:
+#                    silence from an instrument nobody armed reading as an
+#                    all-clear is how this class hides in the first place.
+#
+# Freshness is decided by COMPARING the agent's newest row against the newest
+# fleet heartbeat, not by a wall-clock guess: the tick writes an `observe` row
+# EVERY tick for every non-healthy class (see cmd_supervisor_tick), so an agent
+# whose newest row predates the newest heartbeat was looked at and found
+# healthy. No row at all + no heartbeat at all is `unobserved`, which is a third
+# value on purpose — it must not read as either healthy or dry.
+_SUP_INFO_TICK_TOL=120   # seconds. Per-agent rows are written BEFORE the fleet
+                         # heartbeat that closes the tick, so a row from the SAME
+                         # tick carries an EARLIER ts (measured: 1s). Without a
+                         # tolerance every current row would read as stale. Kept
+                         # well under the shortest sane tick interval so a row
+                         # from the PREVIOUS tick can never read as current.
+
+# Pure render of the `agent info` supervisor overlay — NO I/O, so a test can
+# assert every branch without a store, a tick or a tmux (same factoring as
+# _sup_classify / _sup_act_plan). Echoes one compact JSON object.
+# args: armed(true/false) tick_epoch row_epoch now
+#       rec_class rec_cause rec_detail open_rows days_since_close(-1 = never)
+#       store_readable(true/false)
+_sup_info_status() {
+  local armed="$1" tick="${2:-0}" row="${3:-0}" now="${4:-0}" \
+        rc="${5:-}" rcause="${6:-}" rdetail="${7:-}" open="${8:-0}" days="${9:--1}" \
+        store="${10:-true}"
+  [[ "$store" == "false" ]] || store="true"
+  [[ "$tick" =~ ^[0-9]+$ ]] || tick=0
+  [[ "$row"  =~ ^[0-9]+$ ]] || row=0
+  [[ "$now"  =~ ^[0-9]+$ ]] || now=0
+  [[ "$open" =~ ^[0-9]+$ ]] || open=0
+  [[ "$days" =~ ^-?[0-9]+$ ]] || days=-1
+  [[ "$armed" == "true" ]] || armed="false"
+
+  # --- the half this surface MEASURES for itself, at print time ---------------
+  # The PAIR is the detector; neither number means anything alone (0 open rows
+  # and no closes is a correctly idle seat, 20 open rows and a close this
+  # morning is a busy one), which is why each branch below reports both.
+  local output transacting note
+  if [[ "$store" != "true" ]]; then
+    # NOTHING was read. This branch exists because its absence was the same bug
+    # one level down: with the store unreadable the counters fall back to
+    # 0-open/never-closed, which renders as the perfectly benign "no open rows,
+    # nothing ever closed" — a measurement this surface did not take, printed in
+    # the voice of one it did. Caught end-to-end on a TASKS_DB pointed at a
+    # missing path, not by reading the code.
+    output="unmeasured"; transacting="null"
+    note="the task store was not readable from here — NOTHING was measured (not a clear)"
+  elif (( days < 0 )); then
+    # Never closed anything. Must read unknown, not infinitely dry, or every
+    # newly created agent is flagged on day one and the alarm is trained out of
+    # the fleet inside a week (DIVE-3272).
+    output="unknown"; transacting="null"
+    if (( open > 0 )); then
+      note="${open} open row(s) and has NEVER closed anything — a new seat and a dark one read the same here"
+    else
+      note="no open rows, nothing ever closed"
+    fi
+  elif (( days < _SUP_T_NO_OUTPUT_DAYS )); then
+    output="ok"; transacting="true"
+    note="${open} open row(s), last close ${days}d ago"
+  elif (( open == 0 )); then
+    output="idle"; transacting="null"
+    note="no open rows, last close ${days}d ago — correctly idle, not dry"
+  else
+    output="dry"; transacting="false"
+    note="${open} open row(s), nothing closed in ${days}d"
+  fi
+
+  # --- the half it INHERITS from the trail ------------------------------------
+  local cls="$rc" cause="$rcause" detail="$rdetail" current=false
+  (( row > 0 && tick > 0 && row + _SUP_INFO_TICK_TOL >= tick )) && current=true
+  if [[ "$store" != "true" ]]; then
+    cls="unobserved"; cause=""; detail=""; current=false
+  elif [[ "$armed" != "true" ]]; then
+    # The flag gates the whole tick. Whatever sits in the trail is not being
+    # refreshed, so it cannot be quoted as a current reading at any age.
+    cls="unobserved"; cause=""; detail=""
+  elif [[ "$current" != "true" ]]; then
+    if (( tick > 0 )); then cls="healthy"; cause=""; detail=""
+    else cls="unobserved"; cause=""; detail=""; fi
+  fi
+  [[ -n "$cls" ]] || cls="unobserved"
+
+  # --- the escalation: what the state line may NOT omit -----------------------
+  # Only the "up and reachable but not transacting" classes. A `stuck` seat is
+  # already visible in `state:` itself (the unit is down); these three are the
+  # ones every liveness signal reads green through.
+  local verdict=""
+  case "$cls" in quota-exhausted|verify-challenge|no-output) verdict="$cls" ;; esac
+  [[ -z "$verdict" && "$output" == "dry" ]] && verdict="no-output"
+
+  local state_note sup_line
+  case "$verdict" in
+    "") case "$output" in
+          ok)         state_note="transacting (last close ${days}d ago)" ;;
+          idle)       state_note="idle — no open rows (last close ${days}d ago)" ;;
+          unmeasured) state_note="output UNMEASURED — task store unreadable from here" ;;
+          *)          state_note="output unknown — ${note}" ;;
+        esac ;;
+    no-output) state_note="⚠ NOT TRANSACTING (no-output: ${note})" ;;
+    *)         state_note="⚠ NOT TRANSACTING (${cls}${detail:+: ${detail}})" ;;
+  esac
+
+  local age_s=$(( now > row && row > 0 ? now - row : -1 ))
+  local tick_age_s=$(( now > tick && tick > 0 ? now - tick : -1 ))
+  if [[ "$store" != "true" ]]; then
+    sup_line="unobserved — the task store was not readable from here, so NEITHER the event trail nor the output counters were read (this is not an all-clear)"
+  elif [[ "$armed" != "true" ]]; then
+    sup_line="unobserved — the tick is NOT ARMED on this box, so nothing refreshes this"
+    sup_line="${sup_line} (enable: sudo touch ${_SUP_ENABLED_FLAG})"
+  elif (( tick > 0 )); then
+    sup_line="${cls}${cause:+ / ${cause}}${detail:+ — ${detail}}"
+    sup_line="${sup_line} (tick $(_sup_info_ago "$tick_age_s") ago)"
+  else
+    sup_line="unobserved — armed, but no tick has completed yet on this box"
+  fi
+
+  jq -cn \
+    --arg cls "$cls" --arg cause "$cause" --arg detail "$detail" \
+    --arg output "$output" --arg note "$note" --arg verdict "$verdict" \
+    --arg stateNote "$state_note" --arg supLine "$sup_line" \
+    --argjson armed "$armed" --argjson current "$current" --argjson store "$store" \
+    --argjson transacting "$transacting" \
+    --argjson open "$open" --argjson days "$days" \
+    --argjson thresh "$_SUP_T_NO_OUTPUT_DAYS" \
+    --argjson age "$age_s" --argjson tickAge "$tick_age_s" \
+    '{
+       # MEASURED here, every call, with no dependency on the tick.
+       # "unmeasured" is a FOURTH output value and is never folded into one of
+       # the other three: an unread store must not print in the voice of a read
+       # one.
+       storeReadable: $store,
+       output: $output,
+       transacting: $transacting,          # null == unknown, never false
+       openRows: $open,
+       daysSinceClose: (if $days < 0 then null else $days end),
+       thresholdDays: $thresh,
+       # INHERITED from the trail — only as fresh as the tick that wrote it.
+       classification: $cls,
+       cause: (if $cause == "" then null else $cause end),
+       detail: (if $detail == "" then null else $detail end),
+       observedAgeSec: (if $age < 0 then null else $age end),
+       tickArmed: $armed,
+       tickAgeSec: (if $tickAge < 0 then null else $tickAge end),
+       fromCurrentTick: $current,
+       # The two rendered strings `agent info` prints, so the phrasing is
+       # asserted by the unit test and not re-derived in a jq program.
+       verdict: (if $verdict == "" then null else $verdict end),
+       stateNote: $stateNote,
+       line: $supLine,
+       note: $note
+     }'
+}
+
+# "4d" / "3h" / "12m" / "45s" — an age a reader can act on without doing
+# arithmetic. -1 (unknown) prints "?".
+_sup_info_ago() {
+  local s="${1:--1}"
+  [[ "$s" =~ ^[0-9]+$ ]] || { printf '?'; return 0; }
+  if   (( s >= 86400 )); then printf '%dd' $(( s / 86400 ))
+  elif (( s >= 3600 ));  then printf '%dh' $(( s / 3600 ))
+  elif (( s >= 60 ));    then printf '%dm' $(( s / 60 ))
+  else                        printf '%ds' "$s"; fi
+}
+
+# I/O half: gather this agent's overlay from the store + the arm flag, then hand
+# the numbers to the pure renderer. Best-effort by construction — every read is
+# guarded and an unreadable store degrades to `unobserved` + `output unknown`,
+# never to a confident all-clear and never to a failed `agent info`.
+sup_info_for_agent() {  # <name>
+  local name="$1" armed="false" tick=0 row=0 now rc="" rcause="" rdetail="" open=0 days=-1 \
+        store="false"
+  now=$(date +%s)
+  [[ -f "$_SUP_ENABLED_FLAG" ]] && armed="true"
+  # A store this seat cannot read is NOT zero rows and no closes. Probe it with
+  # a query that has a known-nonempty answer on any initialised store, so the
+  # difference between "read it, nothing there" and "never read it" survives to
+  # the renderer instead of collapsing into the benign-looking default.
+  [[ -s "$TASKS_DB" ]] \
+    && [[ "$(db "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks' LIMIT 1;" 2>/dev/null || echo "")" == "1" ]] \
+    && store="true"
+  if [[ "$store" == "true" ]]; then
+    local ostats; ostats=$(_sup_output_stats "$name" 2>/dev/null || echo "0|-1")
+    open="${ostats%%|*}"; days="${ostats##*|}"
+    tick=$(db "SELECT COALESCE(strftime('%s', MAX(ts)), 0) FROM supervisor_events
+               WHERE agent='(fleet)' AND event='heartbeat';" 2>/dev/null || echo 0)
+    local r
+    r=$(db "SELECT COALESCE(strftime('%s', ts), 0) || char(31) || classification
+                   || char(31) || COALESCE(cause,'') || char(31)
+                   || COALESCE(json_extract(signals, '\$.detail'), '')
+            FROM supervisor_events WHERE agent=$(sqlq "$name")
+            ORDER BY id DESC LIMIT 1;" 2>/dev/null || echo "")
+    IFS=$'\x1f' read -r row rc rcause rdetail <<<"$r"
+  fi
+  _sup_info_status "$armed" "$tick" "$row" "$now" "$rc" "$rcause" "$rdetail" "$open" "$days" "$store"
+}
+
 # DIVE-3272: a seat that cannot transact is a FLEET-health event. The entire cost
 # of the incident was the 20 rows queued behind a seat nobody knew was dark, so
 # the alert leads with that and not with the seat's own symptom. Same delivery
