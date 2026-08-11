@@ -430,6 +430,64 @@ _mirror_edit_markup() { # <token> <chat> <message_id> [reply_markup]
     "https://api.telegram.org/bot${token}/editMessageReplyMarkup" "${args[@]}" 2>/dev/null
 }
 
+# DIVE-3228 — delete a card outright. Same dry-run guard as the two edits beside
+# it, for the same DIVE-1500 reason: a fixture harness that can delete a real
+# message can destroy a real conversation, which is strictly worse than editing
+# one.
+#
+# Telegram lets a bot delete its OWN message for 48h. Past that, and in a few chat
+# types, it refuses — the caller falls back to a visible strike rather than
+# treating the refusal as done. Two refusals are the DESIRED end state reached
+# without us and callers must read them as success, not breakage:
+# "message to delete not found" (already gone, incl. a repeat retire pass — DIVE-2272
+# alone ran three over one message) and an already-deleted id.
+_mirror_delete_message() { # <token> <chat> <message_id>
+  local token="$1" chat="$2" mid="$3"
+  if [[ -n "${FIVEDIVE_NOTIFY_DRYRUN:-}" && "${FIVEDIVE_NOTIFY_DRYRUN}" != "0" ]]; then
+    local dry_line
+    dry_line=$(printf 'notify-dryrun delete_message chat=%s message_id=%s' "$chat" "$mid")
+    if [[ -n "${FIVEDIVE_NOTIFY_DRYRUN_LOG:-}" ]]; then
+      printf '%s\n' "$dry_line" >>"$FIVEDIVE_NOTIFY_DRYRUN_LOG" 2>/dev/null || true
+    fi
+    printf '%s\n' "$dry_line" >&2 || true
+    printf '%s' '{"ok":true,"dry_run":true}'
+    return 0
+  fi
+  curl -s --connect-timeout 5 --max-time 10 -X POST \
+    "https://api.telegram.org/bot${token}/deleteMessage" \
+    --data-urlencode "chat_id=${chat}" --data-urlencode "message_id=${mid}" 2>/dev/null
+}
+
+# DIVE-3228 — rewrite a card's TEXT. Two callers, both needing the text to change
+# and not just the keyboard:
+#   * the live card tracking its row (state changed, same underlying ask), and
+#   * the strike, when a human answered or when Telegram refused the delete.
+# reply_markup is OMITTED on purpose: editMessageText without it drops the inline
+# keyboard in the same call, so a struck card cannot keep a tappable button.
+#
+# "message is not modified" means the text we are writing is already there. That
+# is the end state, but it is NOT free of meaning to the caller — see the DIVE-3228
+# classification in _task_gate_card_apply, which reports anything that could leave
+# a live-LOOKING card and only calls a row ok when the card is provably settled.
+_mirror_edit_text() { # <token> <chat> <message_id> <text>
+  local token="$1" chat="$2" mid="$3" text="$4"
+  if [[ -n "${FIVEDIVE_NOTIFY_DRYRUN:-}" && "${FIVEDIVE_NOTIFY_DRYRUN}" != "0" ]]; then
+    local dry_line
+    dry_line=$(printf 'notify-dryrun edit_text chat=%s message_id=%s bytes=%s' \
+      "$chat" "$mid" "${#text}")
+    if [[ -n "${FIVEDIVE_NOTIFY_DRYRUN_LOG:-}" ]]; then
+      printf '%s\n' "$dry_line" >>"$FIVEDIVE_NOTIFY_DRYRUN_LOG" 2>/dev/null || true
+    fi
+    printf '%s\n' "$dry_line" >&2 || true
+    printf '%s' '{"ok":true,"dry_run":true}'
+    return 0
+  fi
+  curl -s --connect-timeout 5 --max-time 10 -X POST \
+    "https://api.telegram.org/bot${token}/editMessageText" \
+    --data-urlencode "chat_id=${chat}" --data-urlencode "message_id=${mid}" \
+    --data-urlencode "text=${text}" 2>/dev/null
+}
+
 # Rename a migrated group's key (old→new) in access.json, preserving the policy
 # value (incl. message_thread_id) and the file's owner/mode. Runs as root (the
 # mirror only fires under sudo), so chowning back to the agent owner is required

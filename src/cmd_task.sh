@@ -5297,7 +5297,7 @@ $_body"
   if [[ "$verb" == "done" || "$verb" == "cancel" ]]; then
     local _open_gate
     _open_gate=$(db "SELECT 1 FROM tasks WHERE id=${id} AND need_type IS NOT NULL AND need_answered_at IS NULL;" 2>/dev/null || echo "")
-    [[ -n "$_open_gate" ]] && { _task_gate_retire_buttons "$ident" "task ${verb} with the gate still open" || true; }
+    [[ -n "$_open_gate" ]] && { _task_gate_card_apply "$ident" die "task ${verb} with the gate still open" || true; }
   fi
   if (( notify )) && [[ "$verb" == "done" || "$verb" == "cancel" ]]; then
     local from_tmpl
@@ -5989,7 +5989,7 @@ cmd_task_reject() {
     # set — the gate now reads '(superseded ...)' with provenance auto:reject, so
     # a human tapping it would believe they authorized something an agent already
     # closed on their behalf.
-    _task_gate_retire_buttons "$ident" "superseded by auto:reject" || true
+    _task_gate_card_apply "$ident" die "superseded by auto:reject" || true
   fi
   # max_iterations reached -> stop bouncing, park it on a human to decide.
   # DIVE-2477 considered clearing done_at here too, by symmetry with the
@@ -6968,7 +6968,7 @@ cmd_task_park() {
       COMMIT;"
   # DIVE-2410: park clears the gate columns, so whatever button that gate put in a
   # human's chat now points at a question the task no longer holds.
-  _task_gate_retire_buttons "$tident" "parked" || true
+  _task_gate_card_apply "$tident" die "parked" || true
   # DIVE-2877: A PARK'S BLAST RADIUS EXCEEDS THE ROW IT IS APPLIED TO, and until
   # now nothing said so at the moment of the park. On an instance materialized
   # from a recurring template (from_template_id set) a park is not a delay of one
@@ -8444,7 +8444,7 @@ cmd_task_need() {
     # question is gone, so the button must go with it. A withdrawal is the path
     # most likely to leave a stale button standing, because unlike an answer
     # nothing about it ever reaches the human's chat.
-    _task_gate_retire_buttons "$ident" "withdrawn by ${w_name:-$w_kind}" || true
+    _task_gate_card_apply "$ident" die "withdrawn by ${w_name:-$w_kind}" || true
     local w_new; w_new=$(db "SELECT status FROM tasks WHERE id=${id};")
     ok "$ident gate withdrawn (${w_type}) — moot request cleared, no secret/grant recorded; task now ${w_new}" \
        '{ident:$id, withdrawn:true, was_type:$wt, status:$st}' \
@@ -9302,7 +9302,7 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
     warn "--rubber-stamp-ok changed nothing on this gate — the keystroke cap did not fire (type=${type}, tier=${tier}$( ((tier_floored)) && printf ', floored by category or declaration')). The declaration is still written to the row, so it stays readable; it just did not need to buy anything."
   fi
 
-  _task_gate_retire_buttons "$ident" "superseded by a re-filed gate" || true
+  _task_gate_card_apply "$ident" die "superseded by a re-filed gate" || true
 
   db "BEGIN IMMEDIATE;
       $(_gate_archive_and_clear_sql file "id=${id}")
@@ -10841,6 +10841,15 @@ _task_gate_delivery_log() { # <ok|error> <task_ids> <chat> <message_id> <detail>
   if [[ "${TASK_GATE_ESCALATING:-}" == "1" ]]; then _path="privileged-resend"
   elif [[ "${TASK_GATE_RENAG:-}" == "1" ]]; then _path="renag"
   fi
+  # DIVE-3228: the MODEL, not just the log. A confirmed human send IS a card in
+  # someone's chat, so record it as one here — file-time, re-nag and
+  # privileged-resend all reach this function, which is what makes "one card per
+  # gate however it was delivered" true rather than aspirational. Best-effort by
+  # construction (every write inside is `|| true`): a gate is settled by its task
+  # row, and the card ledger must never be able to fail a delivery.
+  if [[ "$result" == "ok" ]]; then
+    _task_gate_card_record "$idents" "${chat:-}" "${message_id:-}" "$_via" || true
+  fi
   local line
   line=$(printf 'gate-delivery result=%s tasks=%s chat=%s message_id=%s via=%s path=%s detail=%q' \
     "$result" "$idents" "${chat:-none}" "${message_id:-none}" "$_via" "$_path" "${detail:-none}")
@@ -11043,7 +11052,215 @@ _task_gate_deliveries() { # <ident>
 # harness can exercise this end to end while being physically unable to reach
 # Telegram (_mirror_edit_markup enforces that itself). An opt-in-only fence is
 # the mistake DIVE-1968 removed; this is store identity first, as there.
-_task_gate_retire_buttons() { # <ident> <why>
+# ---- DIVE-3228: the card as a modelled object -------------------------------
+#
+# Everything below replaces "parse gate-notify.log back with awk and hope the
+# message is still what we think it is". The log stays as the pre-table FALLBACK
+# (see _task_gate_card_apply's tail) and for telemetry; it is no longer the model.
+
+# Mint a card, or record that a second message displaced the live one. Called from
+# _task_gate_delivery_log on every CONFIRMED human send, so file-time, re-nag and
+# privileged-resend all land here — one card per gate however it was delivered.
+#
+# WHY IT SUPERSEDES RATHER THAN REFUSING. The partial unique index allows exactly
+# one live card per (task, chat). If a second send happens anyway, the truth is
+# that a second message really is in that chat, and a model that refuses the
+# INSERT would be tidier than reality — the failure mode this whole ticket is
+# about. So the old row is marked superseded and the new one inserted: the index
+# invariant holds, the chat is described accurately, and the digest's buzz count
+# (mints in the window) correctly counts the second buzz as the cost it was.
+_task_gate_card_record() { # <idents-csv> <chat> <message_id> <via>
+  local idents="$1" chat="$2" mid="$3" via="${4:-}"
+  # Same four exclusions the log-based reader applied, for the same reasons: an
+  # agent inbox is not a Telegram chat, and a receipt with no message id is not a
+  # message. A missing `via` is fatal here and not merely untidy — without it no
+  # later edit can resolve a token, which is an orphan by construction.
+  [[ -n "$chat" && "$chat" != "none" && "$chat" != agent:* ]] || return 0
+  [[ -n "$mid" && "$mid" != "none" && "$mid" != "0" ]] || return 0
+  [[ -n "$via" && "$via" != "none" ]] || return 0
+  local ident tid shape epoch
+  local _IFS="$IFS"; IFS=','
+  for ident in $idents; do
+    IFS="$_IFS"
+    [[ -n "$ident" && "$ident" != "unknown" ]] || continue
+    tid=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null) || tid=""
+    [[ -n "$tid" ]] || continue
+    shape=$(db "SELECT COALESCE(ask_shape,'') FROM tasks WHERE id=${tid} LIMIT 1;" 2>/dev/null) || shape=""
+    epoch=$(db "SELECT COALESCE(MAX(gate_epoch),0)+1 FROM gate_cards WHERE task_id=${tid};" 2>/dev/null) || epoch=1
+    [[ -n "$epoch" ]] || epoch=1
+    db "UPDATE gate_cards SET state='superseded', updated_at=datetime('now')
+         WHERE task_id=${tid} AND chat_id=$(sqlq "$chat") AND state='live';" >/dev/null 2>&1 || true
+    db "INSERT INTO gate_cards (task_id, ident, gate_epoch, ask_shape, chat_id, message_id, via, state)
+        VALUES (${tid}, $(sqlq "$ident"), ${epoch}, $(sqlq "$shape"), $(sqlq "$chat"), $(sqlq "$mid"), $(sqlq "$via"), 'live');" \
+      >/dev/null 2>&1 || true
+    IFS=','
+  done
+  IFS="$_IFS"
+  return 0
+}
+
+# Is there a live card for this task carrying the SAME underlying ask? The
+# re-file path asks this before sending anything.
+#
+# ask_shape and not the raw ask, because the question is "is this the same
+# question", not "is this the same string" — DIVE-2272's approval -> decision ->
+# approval flip is one ask filed three ways. _gate_ask_shape (OSS-11/DIVE-976) is
+# the existing normalizer and is already trusted for precedent matching, so this
+# reuses a primitive rather than minting a rival similarity rule.
+_task_gate_card_live_same_ask() { # <task_id> <ask_shape> -> chat<TAB>mid<TAB>via per line
+  local tid="$1" shape="$2"
+  db "SELECT chat_id||x'09'||message_id||x'09'||via FROM gate_cards
+       WHERE task_id=${tid} AND state='live' AND COALESCE(ask_shape,'')=$(sqlq "$shape");" 2>/dev/null
+}
+
+# The text a card carries once it stops tracking its row. Two shapes, and the
+# difference is whether a HUMAN decided something.
+#
+# A RECEIPT (main's ruling ii, DIVE-3228): past tense, timestamped, decision
+# named. A struck card that keeps present-tense phrasing reads as a live view of
+# a row it has stopped following — the same class of lie as the phantom card this
+# ticket removes, just quieter. So it must say it is a receipt.
+_task_gate_card_text() { # <ident> <kind: receipt|closed> <why> [answered_by]
+  local ident="$1" kind="$2" why="${3:-}" by="${4:-}"
+  local nt ans at row
+  row=$(db "SELECT COALESCE(need_type,'')||x'1f'||COALESCE(need_answer,'')||x'1f'||COALESCE(need_answered_at,'')
+             FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null) || row=""
+  IFS=$'\x1f' read -r nt ans at <<<"$row"
+  if [[ "$kind" == "receipt" ]]; then
+    # human:y00212 -> y00212. The prefix is provenance for the record, not a name
+    # to show the person who tapped the button.
+    local who="${by#human:}"
+    printf '\xe2\x9c\x85 [%s] %s answered' "$ident" "${nt:-gate}"
+    [[ -n "$ans" ]] && printf ' \xe2\x80\x94 %s' "$ans"
+    [[ -n "$who" ]] && printf ' by %s' "$who"
+    [[ -n "$at" ]] && printf ' at %sZ' "$at"
+    printf '\n\nThis is a receipt. It no longer tracks the task.'
+    return 0
+  fi
+  printf '\xe2\x9b\x94 [%s] this gate is closed' "$ident"
+  [[ -n "$why" ]] && printf ' (%s)' "$why"
+  printf '.\n\nNothing here is live and no action is needed.'
+}
+
+# Drive every live card for a task to its end state.
+#
+#   die      the ask went moot with no human decision — withdrawn, superseded,
+#            parked, auto:reject, done/cancel over an open gate. Nobody decided
+#            anything, so the card is pure noise: DELETE it.
+#   settle   a human answered. The card is THEIR record and must survive: strike
+#            it into a receipt, never delete. A lead:* answer is NOT a human
+#            answer and takes `die` — they never acted, so there is no record of
+#            theirs to keep.
+#
+# WHAT COUNTS AS RETIRED. The old code called a not-modified edit `ok` because
+# the keyboard was already gone — true, and beside the point once the CARD is
+# what we are retiring. Classification now tracks the state reachable from the
+# human's phone: a row is `ok` only when the card is provably gone or provably
+# struck, and ANY outcome that can leave a live-LOOKING card is an error row AND
+# a warn. Already-deleted and already-struck stay ok on purpose — they are the end
+# state reached, and DIVE-2272 alone ran three retire passes over one message, so
+# calling a repeat pass a failure would manufacture alarms for the fixed case.
+_task_gate_card_apply() { # <ident> <mode: die|settle> <why> [answered_by]
+  local ident="$1" mode="$2" why="${3:-gate closed}" by="${4:-}"
+  local _dry=0
+  [[ -n "${FIVEDIVE_NOTIFY_DRYRUN:-}" && "${FIVEDIVE_NOTIFY_DRYRUN}" != "0" ]] && _dry=1
+  if ! _task_human_send_allowed && (( ! _dry )); then
+    return 0
+  fi
+  local tid; tid=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null) || tid=""
+  local rows="" known=0
+  if [[ -n "$tid" ]]; then
+    known=$(db "SELECT COUNT(*) FROM gate_cards WHERE task_id=${tid};" 2>/dev/null) || known=0
+    known="${known:-0}"
+    rows=$(db "SELECT id||x'09'||chat_id||x'09'||message_id||x'09'||via
+                 FROM gate_cards WHERE task_id=${tid} AND state='live';" 2>/dev/null)
+  fi
+  if [[ -z "$rows" ]]; then
+    # THE FALLBACK IS KEYED ON "MODELLED AT ALL", NOT ON "HAS A LIVE CARD" — and
+    # the difference is not academic. Six call sites can retire the same gate, so
+    # the second one along finds every card already dead; keying the fallback on
+    # liveness sent it to the log-based path, which happily re-edited a message we
+    # had just deleted. Measured by the park arm of gate_button_retire_unit
+    # (park runs after the answer has already retired the card). A modelled gate
+    # with no live card has nothing to retire — that IS the end state.
+    if (( known == 0 )); then
+      # PRE-TABLE FALLBACK. A gate delivered before gate_cards existed has no row,
+      # and its message_id lives only in the log. Keep the old behaviour for
+      # exactly that window rather than leaving those cards unretirable; it ages out.
+      _task_gate_retire_buttons_legacy "$ident" "$why"
+    fi
+    return 0
+  fi
+  local cid chat mid via token resp ok desc result detail newstate text
+  while IFS=$'\t' read -r cid chat mid via; do
+    [[ -n "$cid" && -n "$chat" && -n "$mid" ]] || continue
+    token=$(_task_gate_bot_token "$via")
+    if [[ -z "$token" ]]; then
+      # The delivering agent was torn down, so NOBODY can edit this card. That is
+      # an orphan, and it is reported — a live-looking phantom nobody names is the
+      # defect this ticket exists to remove.
+      db "UPDATE gate_cards SET state='orphaned', updated_at=datetime('now'),
+           last_error='no bot token for delivering agent ${via}' WHERE id=${cid};" >/dev/null 2>&1 || true
+      _task_store_audit_log "gate card retire" "error" 1 -- \
+        "task=$ident" "chat=$chat" "message_id=$mid" "via=${via:-none}" "mode=$mode" \
+        "detail=no bot token for the delivering agent; card ORPHANED and still live in that chat" || true
+      warn "$ident: the agent that delivered message $mid in chat $chat is gone, so its gate card cannot be edited by anyone — it is still showing there."
+      continue
+    fi
+    result=error; detail=""; newstate=""
+    if [[ "$mode" == "die" ]]; then
+      resp=$(_mirror_delete_message "$token" "$chat" "$mid") || resp="${resp:-}"
+      ok=$(jq -r '.ok // false' <<<"$resp" 2>/dev/null) || ok=false
+      desc=$(jq -r '.description // empty' <<<"$resp" 2>/dev/null) || desc=""
+      if [[ "$ok" == "true" ]]; then
+        result=ok; detail="card deleted"; newstate="deleted"
+      elif [[ "$desc" == *"message to delete not found"* ]]; then
+        result=ok; detail="card already gone"; newstate="gone"
+      else
+        # Telegram refuses a delete past 48h and in some chat types. Fall back to a
+        # visible strike so the end state stays reachable, and name the reason so
+        # the fallback is diagnosable rather than mysterious.
+        detail="delete refused (${desc:-unknown})"
+      fi
+    fi
+    if [[ "$result" != "ok" ]]; then
+      if [[ "$mode" == "settle" ]]; then
+        text=$(_task_gate_card_text "$ident" receipt "$why" "$by")
+      else
+        text=$(_task_gate_card_text "$ident" closed "$why")
+      fi
+      resp=$(_mirror_edit_text "$token" "$chat" "$mid" "$text") || resp="${resp:-}"
+      ok=$(jq -r '.ok // false' <<<"$resp" 2>/dev/null) || ok=false
+      desc=$(jq -r '.description // empty' <<<"$resp" 2>/dev/null) || desc=""
+      if [[ "$ok" == "true" ]]; then
+        result=ok; detail="${detail:+${detail}; }card struck"; newstate="struck"
+      elif [[ "$desc" == *"not modified"* ]]; then
+        result=ok; detail="${detail:+${detail}; }card already struck"; newstate="struck"
+      elif [[ "$desc" == *"message to edit not found"* ]]; then
+        # Deleted out of band — they cleared their chat. The end state, and the
+        # next state change on an open gate mints a fresh card.
+        result=ok; detail="${detail:+${detail}; }card already gone"; newstate="gone"
+      else
+        result=error; detail="${detail:+${detail}; }strike FAILED (${desc:-unknown})"; newstate=""
+      fi
+    fi
+    if [[ -n "$newstate" ]]; then
+      db "UPDATE gate_cards SET state=$(sqlq "$newstate"), updated_at=datetime('now'), last_error=NULL
+           WHERE id=${cid};" >/dev/null 2>&1 || true
+    else
+      db "UPDATE gate_cards SET updated_at=datetime('now'), last_error=$(sqlq "$detail")
+           WHERE id=${cid};" >/dev/null 2>&1 || true
+    fi
+    _task_store_audit_log "gate card retire" "$result" \
+      "$([[ "$result" == "ok" ]] && echo 0 || echo 1)" -- \
+      "task=$ident" "chat=$chat" "message_id=$mid" "via=${via:-none}" \
+      "mode=$mode" "why=$why" "detail=${detail:-unconfirmed Bot API call}" || true
+    [[ "$result" == "ok" ]] || warn "$ident: could not retire the gate card on message $mid in chat $chat (${detail}) — it may still read as a live gate there."
+  done <<<"$rows"
+  return 0
+}
+
+_task_gate_retire_buttons_legacy() { # <ident> <why>
   local ident="$1" why="${2:-gate closed}"
   local _dry=0
   [[ -n "${FIVEDIVE_NOTIFY_DRYRUN:-}" && "${FIVEDIVE_NOTIFY_DRYRUN}" != "0" ]] && _dry=1
@@ -13783,7 +14000,14 @@ cmd_task_answer() {
   # AFTER the write, never before — the settled state is the DB row, and a
   # Telegram edit is best-effort. Covers the human tap, a lead-clear, and a
   # dashboard/CLI answer, since all three land in this one function.
-  _task_gate_retire_buttons "$ident" "answered by ${answered_by}" || true
+  # DIVE-3228: a HUMAN answer leaves a receipt (the card is their record of what
+  # they approved and must survive); a lead:* / auto:* answer kills it, because
+  # they never acted and there is no record of theirs to preserve.
+  if [[ "$answered_by" == human:* ]]; then
+    _task_gate_card_apply "$ident" settle "answered by ${answered_by}" "$answered_by" || true
+  else
+    _task_gate_card_apply "$ident" die "answered by ${answered_by}" "$answered_by" || true
+  fi
 
   # INST-4: the gate CLEAR — the row that decides whether this task's timeline
   # reads "zero-human" or "a human authorized it", so it is worth more care than

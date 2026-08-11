@@ -53,6 +53,41 @@ if ! declare -F five_self_bundle >/dev/null 2>&1; then
   [[ -r "$_five_self_lib" ]] && source "$_five_self_lib"
   unset _five_self_lib
 fi
+# DIVE-3228 — THE BUZZ COUNT, and why the badge beside it could not see this.
+#
+# `asked you N×` is built from need_answered_by LIKE 'human:%', i.e. gates the
+# human ANSWERED. His phone counts MESSAGES. On 2026-08-11 those were 6 and 19.
+# Worse than the arithmetic: a withdrawn gate is archived to gate_history and its
+# need_* fields are cleared OFF the tasks row, and this digest reads tasks rows —
+# so withdrawal DELETES the evidence from the metric's input AFTER the buzz has
+# been sent. 21 of that day's 36 filings were invisible to the badge by
+# construction. That is why a month of burn-control passes read a number trending
+# fine and moved on, and it is the argument for reading gate_cards instead: a
+# card row survives the withdrawal that erases the gate.
+#
+# A MINT IS EXACTLY ONE BUZZ — editing a Telegram message does not push — so the
+# count is mints in the window, not cards, not deliveries.
+#
+# UNKNOWABLE MUST NOT READ AS ZERO. A store predating gate_cards answers the
+# query with an error, and "no table" and "no buzzes" are the same absent-vs-
+# forbidden distinction this rail has been burned by before. It returns nothing
+# and the badge says `unknown`.
+_digest_buzz_count() { # <window-seconds> -> "<count>|<partial 0|1>" on stdout
+  tasks_db_init 2>/dev/null || return 1
+  local n first partial=0
+  n=$(db "SELECT COUNT(*) FROM gate_cards WHERE minted_at >= datetime('now','-${1} seconds');" 2>/dev/null) || return 1
+  [[ -n "$n" ]] || return 1
+  # A window reaching back before the table existed under-reports, and an
+  # under-report presented as a total is the defect being fixed. Say partial.
+  first=$(db "SELECT COALESCE(MIN(minted_at),'') FROM gate_cards;" 2>/dev/null) || first=""
+  if [[ -z "$first" ]]; then partial=1
+  else
+    partial=$(db "SELECT CASE WHEN $(sqlq "$first") > datetime('now','-${1} seconds') THEN 1 ELSE 0 END;" 2>/dev/null) || partial=0
+    partial="${partial:-0}"
+  fi
+  printf '%s|%s' "$n" "$partial"
+}
+
 _digest_pref_file() { echo "${STATE_DIR}/digest.json"; }
 _digest_pref_enabled() {
   local f; f="$(_digest_pref_file)"
@@ -247,9 +282,15 @@ cmd_digest() {
   else timeout 25 bash "$0" update --check --json >"$tmpd/update.json" 2>/dev/null || echo '{}' >"$tmpd/update.json"; fi
   [ -s "$tmpd/update.json" ] || echo '{}' >"$tmpd/update.json"
 
+  if _bz=$(_digest_buzz_count "$window"); then
+    printf '{"buzzes":%s,"partial":%s}\n' "${_bz%%|*}" "${_bz##*|}" >"$tmpd/buzz.json"
+  else
+    printf '{"buzzes":null,"partial":1}\n' >"$tmpd/buzz.json"
+  fi
+
   DIGEST_TASKS_F="$tmpd/tasks.json" DIGEST_USAGE_F="$tmpd/usage.json" DIGEST_HB_F="$tmpd/hb.txt" \
   DIGEST_LOOPS_F="$tmpd/loops.json" DIGEST_SUP_F="$tmpd/sup.json" DIGEST_OBJ_F="$tmpd/obj.json" \
-  DIGEST_UPDATE_F="$tmpd/update.json" \
+  DIGEST_UPDATE_F="$tmpd/update.json" DIGEST_BUZZ_F="$tmpd/buzz.json" \
   DIGEST_WINDOW="$window" DIGEST_JSON="$as_json" python3 - >"$tmpd/out.txt" <<'PY'
 import os, json, time, datetime as dt
 
@@ -265,6 +306,10 @@ def load(env, default):
         return d.get("data", d) if isinstance(d, dict) else d
     except Exception:
         return default
+
+buzz_data = load("DIGEST_BUZZ_F", {"buzzes": None, "partial": 1})
+buzzes = buzz_data.get("buzzes") if isinstance(buzz_data, dict) else None
+buzz_partial = bool(buzz_data.get("partial")) if isinstance(buzz_data, dict) else True
 
 tasks_data = load("DIGEST_TASKS_F", {"tasks": []})
 usage_data = load("DIGEST_USAGE_F", {"agents": [], "tasks": []})
@@ -678,8 +723,21 @@ else:
         return f" ({arrow}{abs(d)} vs {prev} prior {window_label}{partial})"
     _up = ("currently waiting on you" if autonomy["currentlyBlocked"]
            else f"ran {autonomy['uptimeDays']}d without needing you")
+    # DIVE-3228: TWO numbers, each labelled as what it actually measures. The old
+    # single "asked you N×" was the answered count wearing the asked count's name,
+    # and it is why 19 buzzes read as 6 for a month. Keeping only the answered
+    # number preserves that exact blindness, so both ship — a gate legitimately
+    # asked and a phone needlessly buzzed are different facts.
+    if isinstance(buzzes, int):
+        _bz = f" · buzzed your phone {buzzes}×" + ("*" if buzz_partial else "")
+    else:
+        # No gate_cards table (a store predating DIVE-3228). Unknown is not zero.
+        _bz = " · buzzed your phone: unknown"
     out.append(f"\U0001F9BE Autonomy — {_up} · shipped {len(done_l)}{_trend(len(done_l), prev_ship)}"
-               f" · asked you {len(ht_l)}×{_trend(len(ht_l), prev_ask)}")
+               f"{_bz}"
+               f" · you answered {len(ht_l)}×{_trend(len(ht_l), prev_ask)}")
+    if isinstance(buzzes, int) and buzz_partial:
+        out.append("   *buzz count covers only the span since gate cards were modelled")
     if objectives:
         out.append("")
         out.append(f"\U0001F9ED Objectives ({len(objectives)})")
