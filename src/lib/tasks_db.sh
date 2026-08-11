@@ -165,6 +165,7 @@ require_sqlite() {
 # NOTE: projects/loop_runs/supervisor_events are ALSO defined inside gated
 # one-shot migration blocks in _tasks_db_migrate() below — edit both copies
 # together; tests/schema_sync_unit.sh fails CI if they diverge.
+_TASKS_SCHEMA_EPOCH='2730-1'   # DIVE-2730: +verify_optout
 _tasks_schema() {
   cat <<'SQL'
 PRAGMA journal_mode=WAL;
@@ -218,19 +219,54 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- (`council`, `telegram`), so this is what makes a `--from` claim falsifiable
   -- after the fact rather than the only identity on file.
   --
-  -- MUST BE ADDED HERE **AND** in _tasks_db_migrate's array. A fresh store is built
-  -- from this schema and NEVER runs the migration (see tasks_db_init's if/else), so
-  -- a column added only to the array exists on every EXISTING board and on no NEW
-  -- one — and the failure lands on the first write to a brand-new store, which is
-  -- the one case a developer with a working board never exercises. Caught by
-  -- council_schedule_e2e, whose rig starts from an empty dir.
+  -- MUST BE ADDED HERE **AND** in _TASKS_ADDITIVE_COLUMNS. A fresh store is built
+  -- from this schema and DIVE-2808's gate skips the migration only when every
+  -- array column is already present. Keeping the two definitions complete makes
+  -- that fast path both safe and cheap; the convergence assertion is the backstop.
   derived_actor TEXT,
+  -- DIVE-3098: a verifier grade recorded by `task verify --no-done` (graded_at) and
+  -- the actor who recorded it (graded_by). Structural on purpose — the
+  -- terminal-for-verifier predicate must not key on result TEXT, which the MAKER's
+  -- `task deliver --result=` also writes, or a maker could buy the exemption by
+  -- typing the right words. Declared HERE as well as in _TASKS_ADDITIVE_COLUMNS,
+  -- per the rule directly above: a fresh store takes this CREATE and never runs the
+  -- ALTER loop, so array-only lands a store that fails the DIVE-2197 assertion.
+  graded_at TEXT,
+  graded_by TEXT,
   -- DIVE-2615: why this gate has this tier — axis=pinned|type-default|secret-type
   -- |ask|title|title-fallback|none, plus ;term=<t> where a term is what fired.
-  -- Declared HERE as well as in _tasks_db_migrate: a fresh store takes this CREATE
-  -- and never runs the migration, so the array entry alone left the column missing
-  -- on exactly the boxes that have no history to migrate.
+  -- Declared HERE as well as in _TASKS_ADDITIVE_COLUMNS: a fresh store takes this
+  -- CREATE, and the migration gate must find this column before it may skip.
   floor_provenance TEXT,
+  -- DIVE-3171: why this gate has this ROUTED_REVIEWER — the sibling axis to
+  -- floor_provenance above, which DIVE-3117 named as missing while fixing a routing
+  -- defect it could not measure ("the TIER axis had a floor, its sibling ROUTING axis
+  -- had none"). Values:
+  --   chart              _gate_route_reviewer resolved them from agents_org
+  --   verifier-loop      DIVE-1495 routed to the row's verifier
+  --   seal:standing-lead DIVE-3171 — the chart resolved NOBODY and the SEALED
+  --                      constitution's eng_approval_lead took the gate
+  -- NULL is a real third state, exactly as for floor_provenance (DIVE-2615): it means
+  -- this build never recorded it, NOT that the route had no source. Conflating the two
+  -- is what made the existing floor column unusable for a whole release.
+  -- WHY IT IS A COLUMN AND NOT A DERIVATION: `cmd_task_answer` reads it to decide
+  -- whether a lead-clear is stamped `lead:` or `lead:standing:`, and re-deriving it
+  -- would mean re-reading agents_org — an agent-writable table (DIVE-2233) — at answer
+  -- time, so a chart edit between filing and answering would silently change what the
+  -- record says HAPPENED. A recorded fact beats a re-derived one; that is the whole
+  -- lesson of the three 2026-08-10 provenance incidents.
+  route_provenance TEXT,
+  -- DIVE-2354: WHICH of the two orders this gate is in, as data.
+  --   approve-to-send   the action has NOT happened; the tap authorises it (default).
+  --   confirm-after-send the action ALREADY happened; the tap RATIFIES it after the fact.
+  -- NULL is a real third state and not a synonym for either: it means the gate was
+  -- filed before this column existed, so the record does not say which order it was
+  -- (the same distinction as unreadable-vs-absent, DIVE-2327). Readers must render
+  -- the three apart -- a ratification that renders as a prior approval is the exact
+  -- false record this ticket exists to end. Declared HERE as well as in
+  -- _TASKS_ADDITIVE_COLUMNS: a fresh store takes this CREATE and never runs the
+  -- ALTER loop, per the rule above.
+  gate_mode TEXT,
   parent_id   INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   started_at  TEXT,
@@ -281,6 +317,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- enforcement of "no valid sig ⇒ reject" is a later flip, not here.
   need_answered_uid INTEGER,
   need_answer_sig  TEXT,
+  escalated_at     TEXT,
+  escalated_by     TEXT,
   -- DIVE-916: per-gate HUMAN nonce that closes the sudo->--human forge. On a
   -- hard human gate (approval/secret/manual) `task need` mints a 16-byte nonce,
   -- stores ONLY its SHA-256 here, and embeds the RAW nonce solely in the trusted
@@ -291,6 +329,21 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- (SUDO_UID=agent-*, no nonce) is rejected under enforcement. Hash-only at
   -- rest, so a group-readable db leak can't reconstruct the nonce.
   human_nonce_hash TEXT,
+  -- DIVE-1518: independently records which authenticated evidence form cleared
+  -- the current gate (tap nonce, sudo uid, channel session, or proof).
+  human_evidence   TEXT,
+  -- DIVE-3128: the RELAY, kept OUT of need_answered_by rather than folded into
+  -- it. A Telegram button tap reaches this CLI through some agent's bot, and
+  -- until now the relaying agent's own identity was what got the `human:`
+  -- prefix — so `human:olivia` meant either "a person tapped, olivia's bot
+  -- carried it" or "the olivia agent cleared its own human gate", with nothing
+  -- in the row to tell them apart (DIVE-3045). Two columns, two facts:
+  --   need_answered_by     WHO decided
+  --   need_answered_relay  WHOSE BOT carried the decision
+  -- need_answered_tap_uid is the Telegram user id of the person who tapped, kept
+  -- as TEXT because Telegram ids are opaque identifiers, not arithmetic.
+  need_answered_relay   TEXT,
+  need_answered_tap_uid TEXT,
   -- Recurring task templates (DIVE step 1). kind='recurring' marks a row as a
   -- TEMPLATE, not work: it's excluded from the work board, the heartbeat TODO
   -- count + wake, and the human inbox, so it's never picked up directly.
@@ -311,6 +364,30 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- reaching it at all. Deliberately a separate column, not a status: the
   -- dedup decision itself is unchanged by this.
   last_skipped_at  TEXT,
+  -- DIVE-2272 (decision DIVE-2270). The PER-TEMPLATE overlap policy. NULL means
+  -- 'skip' -- every template that predates this column keeps today's behaviour
+  -- byte for byte, which is why this is a nullable add and not a NOT NULL
+  -- DEFAULT 'skip': a backfilled default and an unset value would then be
+  -- indistinguishable, and 'nobody has classified this template yet' is a state
+  -- the classification pass needs to be able to SEE.
+  --   skip  = an open instance suppresses the next slot (today's dedup).
+  --   spawn = fire anyway, UP TO overlap_bound open instances; past the bound,
+  --           skip AND stamp last_skipped_at, i.e. degrade to exactly the
+  --           now-legible skip behaviour rather than invent new alarm machinery.
+  -- WHY PER-TEMPLATE: skip-if-open is a claim about the VALUE of a pile-up, and
+  -- that value is class-dependent. For a fungible chore (disk reclaim, hygiene
+  -- sweep) three open instances are three copies of one job and dedup is right.
+  -- For a reading-of-the-present job (recap, version loop) Tuesday's instance
+  -- cannot be discharged by Wednesday's run, so three open instances mean nobody
+  -- has read the inbox in three days -- the pile-up IS the alarm the dedup
+  -- deletes. Only the template's author knows the class; the scheduler cannot
+  -- infer it.
+  on_overlap       TEXT,
+  -- The bound for on_overlap='spawn'. NULL means the built-in default (3).
+  -- A JUDGMENT CALL, NOT A MEASUREMENT: 3 open recaps is unmistakable to a human
+  -- and 300 is a different outage. Tunable per template precisely so the number
+  -- is never mistaken for something derived.
+  overlap_bound    INTEGER,
   -- DIVE-138 step 2. A materialized instance links back to the recurring
   -- template it was cloned from via from_template_id (NULL for templates and
   -- ordinary tasks); the materializer's skip-if-open dedup keys on it. NOT a FK
@@ -320,6 +397,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- working it regardless of the agent-level fresh setting.
   from_template_id INTEGER,
   fresh            INTEGER,
+  -- Parking is task state, not a separate table: these were historically
+  -- migration-only and therefore made a fresh canonical store incomplete.
+  parked_at        TEXT,
+  park_reason      TEXT,
   -- DIVE-476: loop-spec columns — make a task's verify loop declarative + durable
   -- so the (c) deterministic verify-runner (DIVE-475) reads its inputs off the row
   -- instead of every caller re-passing them. acceptance_criteria = the human-
@@ -396,6 +477,24 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- written reason so the template re-fires, and this column is what stops a
   -- reassignment from thrashing the row around the fleet tick after tick.
   recurring_stall_escalated_at TEXT,
+  -- DIVE-3218: nudge_escalated_at / nudge_parked_at throttle the two rungs of the
+  -- nudge-threshold ladder (heartbeat). They are stamped ONCE PER ROW, not per
+  -- wake: the ladder's job is to force a state change after N fruitless nudges,
+  -- and a rung that could re-fire every tick would escalate a row to urgent N
+  -- times over. Deliberately NOT cleared when the row is re-queued — the count
+  -- of sessions already burned on this row is a property of the row, not of its
+  -- current status, and re-arming the ladder on every requeue is how a reassign
+  -- turns into a thrash around the fleet (the DIVE-2853 lesson).
+  nudge_escalated_at TEXT,
+  -- DIVE-3218: the nudge COUNT at which rung 1 fired. Rung 2 keys on
+  -- nudge_escalated_n + N, never on 2*N recomputed from the current priority,
+  -- because rung 1's own escalation RAISES the band and a higher band has a
+  -- SMALLER N — so a row escalated at the high threshold of 16 is instantly past
+  -- an urgent 2N of 16 and both rungs fire on the same wake. Storing the count
+  -- makes rung 2 "one more full threshold of fruitless wakes AFTER we escalated",
+  -- which is what the ladder means and is immune to the band moving underneath it.
+  nudge_escalated_n INTEGER,
+  nudge_parked_at TEXT,
   -- DIVE-891: risk-tiered gates (adopted design DIVE-861). tier is set when the
   -- gate is filed: 0 = auto-clear (rec applies immediately, digest line only),
   -- 1 = agent-clearable + 48h TTL auto-applies the recommendation, 2 = hard
@@ -460,6 +559,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- inferred from --type or the ask text. The sealed list lives in the shipped source
   -- (_GATE_HUMAN_CAPABILITIES), NOT here and not in any writable table — see DIVE-2099.
   needs_capability    TEXT,
+  -- DIVE-2848 gate_rubber_stamp: the filer's DECLARED reason for routing a
+  -- decision/approval gate to the paired human at tier 2 *despite* having written
+  -- their own --recommend. That shape is refused by default at the keystroke (see
+  -- the cap in cmd_task_need): measured 2026-07-16..08-07, 96 of 107 judgment gates
+  -- carrying a recommendation came back as the human tapping that same value. The
+  -- escape exists so a real exception can still be filed, and this column is what
+  -- makes it AUDITABLE instead of invisible — the failure mode the cap replaces is
+  -- an agent typing --tier=2 with no record of why. NULL on every gate that did not
+  -- use the escape. Recorded verbatim, never inferred from the ask.
+  gate_rubber_stamp   TEXT,
   -- DIVE-1140 gate-shipped sweep. Stamped (once) when the heartbeat finds a
   -- commit referencing this OPEN gate's ident on a configured repo's origin/main
   -- — the gate is FLAGGED "likely shipped, verify+close" to its owner. Flag-only
@@ -476,6 +585,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- boundary is unchanged for anything not explicitly routed. `secret` is never
   -- routed (stays hard-human), and a tier-2 gate is never routed.
   routed_reviewer     TEXT,
+  -- DIVE-1376/DIVE-2728: merge-gate binding and the loop iteration it belongs to.
+  delivery_ref           TEXT,
+  delivered_at           TEXT,
+  delivery_ref_iteration INTEGER,
   -- OSS-27 (OSS-19 re-plan cycle): provenance for a task ORIGINATED by an
   -- objective's planner cycle. originated_by_objective = objectives.id that
   -- filed it; originated_cycle = the objective_cycles.cycle_no it was filed in.
@@ -495,7 +608,24 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- default" claim is never quietly false. NULL/0 for every task that got a real
   -- grader, opted out via --no-verify, or is trivial. Same integrity-invariant
   -- spirit as the council founder-excluded badge.
-  verify_unavailable      INTEGER
+  verify_unavailable      INTEGER,
+  -- DIVE-2730: the filer's EXPLICIT `--no-verify` at add time, set to 1 there and
+  -- NULL everywhere else. It exists because a decision and a default that produce
+  -- the same stored state ARE the same state: before this column, `--no-verify`
+  -- was a local shell var in `task add` that died with the process, so at
+  -- `task done` an explicit opt-out was byte-identical to a DIVE-969 auto-skipped
+  -- row (both verifier NULL, verify_unavailable NULL), so `task done` could not
+  -- NAME what it was overriding when DIVE-2719's UPGRADE arm re-attached a grader.
+  -- Distinct from verify_unavailable, which records that no distinct grader
+  -- EXISTED — this records that one was not WANTED.
+  -- IT IS A RECORD, NOT A CONTROL, and deliberately so: the upgrade still fires
+  -- on an opted-out row, because the flag is declared at FILE time and the blast
+  -- radius is measured at DELIVERY time, and a file-time sentence must not
+  -- pre-authorise closing a credentials diff nobody had written yet. What it buys
+  -- is that the override is stated instead of silent, and that the two NULLs stop
+  -- being one. Set only by `task add --no-verify`; cleared by
+  -- `task verifier <id> <agent>`, since an explicit attach supersedes the refusal.
+  verify_optout           INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_precedent ON tasks(need_type, ask_shape);
 CREATE INDEX IF NOT EXISTS idx_tasks_originated ON tasks(originated_by_objective);
@@ -713,7 +843,13 @@ CREATE TABLE IF NOT EXISTS gate_history (
   human_nonce_hash  TEXT,
   retired_by        TEXT NOT NULL,
   retired_at        TEXT NOT NULL DEFAULT (datetime('now')),
-  floor_provenance  TEXT
+  floor_provenance  TEXT,
+  -- DIVE-3171: carried for the same reason floor_provenance is. A retired gate that
+  -- keeps its TIER's provenance and drops its ROUTE's is the half-record that makes a
+  -- later count wrong in one direction only, and the count at stake here is "how often
+  -- did the standing authority actually carry a gate".
+  route_provenance  TEXT,
+  gate_mode         TEXT
 );
 CREATE INDEX IF NOT EXISTS gate_history_task_idx ON gate_history(task_id, id);
 
@@ -1051,7 +1187,7 @@ tasks_db_init() {
   # WAL read-lock, which never blocks writers. .timeout lets a genuine
   # first-run race serialise instead of erroring. stdout is discarded because
   # `PRAGMA journal_mode=WAL` echoes "wal".
-  local has
+  local has created_fresh=0
   has=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks' LIMIT 1;" 2>/dev/null)
   if [[ "$has" != "1" ]]; then
@@ -1060,85 +1196,303 @@ tasks_db_init() {
     # Only a genuinely fresh box (no sentinel, no snapshot) gets a new schema.
     if _tasks_board_existed; then
       _tasks_board_recover
-      _tasks_db_migrate            # bring the restored snapshot up to current schema
     else
-      sqlite3 -cmd ".timeout 5000" "$TASKS_DB" < <(_tasks_schema) >/dev/null \
-        || fail "$E_GENERIC" "failed to initialise tasks db at $TASKS_DB"
+      local fresh_payload row
+      # DIVE-2808: a fresh store is born at the current whole-schema epoch in the
+      # SAME sqlite invocation. Existing stores earn this receipt only after the
+      # complete migration and canonical-surface assertion below.
+      #
+      # The stamp lives HERE and not in _tasks_schema() on purpose. Every statement
+      # that block emits is `CREATE ... IF NOT EXISTS`, so replaying it over an
+      # existing store is a no-op — a contract the migration driver and several
+      # harnesses rely on, and a bare INSERT is the one statement that breaks it
+      # (UNIQUE constraint failed: task_prefs.key). Making the INSERT itself
+      # idempotent would be worse than leaving it out: an upsert would stamp the
+      # CURRENT epoch onto a store that a replay does not actually complete, since
+      # `CREATE TABLE IF NOT EXISTS tasks` adds no column to an existing tasks
+      # table. That is the lying-gate class this row exists to close. Only this
+      # arm has just proved it created the whole schema from nothing.
+      fresh_payload=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" < <(
+        _tasks_schema
+        printf "INSERT INTO task_prefs(key,value) VALUES ('schema_epoch',%s);\n" \
+          "$(sqlq "$_TASKS_SCHEMA_EPOCH")"
+        # DIVE-2808: the ledger start marker was seeded inside _tasks_db_migrate,
+        # which a fresh store no longer enters. Without this a brand-new board has
+        # no marker at all, and `trace` reads a ledger with nothing to say about
+        # anything as one that predates everything — absence read as evidence,
+        # which is the exact failure the marker exists to prevent.
+        printf "INSERT OR IGNORE INTO task_prefs(key,value) VALUES ('ledger_started',datetime('now'));\n"
+        printf "SELECT 'column:'||name FROM pragma_table_info('tasks');\n"
+      )) || fail "$E_GENERIC" "failed to initialise tasks db at $TASKS_DB"
+      _TASKS_DB_GATE_COLUMNS=''
+      while IFS= read -r row; do
+        [[ "$row" == column:* ]] || continue  # ignores PRAGMA journal_mode's "wal"
+        _TASKS_DB_GATE_COLUMNS+="${row#column:}"$'\n'
+      done <<<"$fresh_payload"
+      _TASKS_DB_GATE_COLUMNS="${_TASKS_DB_GATE_COLUMNS%$'\n'}"
       chmod 0660 "$TASKS_DB" 2>/dev/null || true
+      created_fresh=1
     fi
-  else
+  fi
+  # DIVE-2808: the canonical schema is complete, so almost every invocation can
+  # skip the expensive reconciliation. The gate requires the whole-schema epoch
+  # plus the SAME tasks-column array the migration consumes; pure-Bash membership
+  # avoids one grep process per column. Both arms retain DIVE-2197's assertion.
+  if ((created_fresh)); then
+    # The CREATE and epoch stamp succeeded in one sqlite invocation. Preserve DIVE-2197's
+    # independent resulting-set assertion without paying a redundant epoch read.
+    _tasks_db_assert_required_columns "$_TASKS_DB_GATE_COLUMNS"
+  elif _tasks_db_migration_needed; then
     _tasks_db_migrate
+  else
+    _tasks_db_assert_required_columns "$_TASKS_DB_GATE_COLUMNS"
   fi
   # DIVE-1479: stamp the durable "this board exists" sentinel (idempotent). On a
   # pre-existing board this is the one-time backfill so a later wipe is caught.
   _tasks_mark_initialized
 }
 
-# Idempotent additive migrations for already-initialised stores. sqlite has
-# no `ADD COLUMN IF NOT EXISTS`, so we check pragma_table_info first. Each
-# migration is a one-shot check + ALTER; running it on every init is cheap
-# (single PRAGMA read). Add new column migrations to the array below.
+# One source of truth for both migration and its skip-gate. Each entry is
+# "<column> <type>"; existing rows backfill to NULL. Pure expand (no contract),
+# so old queries/rows remain readable after downgrade. project_key deliberately
+# omits REFERENCES here because sqlite rejects a non-NULL FK default on ADD.
+# DIVE-2272: the fleet-wide fallback bound for an on_overlap='spawn' template that
+# sets no overlap_bound of its own. A JUDGMENT CALL, NOT A MEASUREMENT — 3 open
+# recaps is unmistakable to a human and 300 is a different outage. Env-tunable and
+# per-template overridable precisely so the number is never read as derived.
+# Lives here, not in cmd_heartbeat.sh, so the materializer and `task ls --recurring`
+# read the SAME default (the DIVE-2055 no-disagreement rule for that table).
+TASKS_OVERLAP_BOUND_DEFAULT="${HEARTBEAT_OVERLAP_BOUND:-3}"
+[[ "$TASKS_OVERLAP_BOUND_DEFAULT" =~ ^[1-9][0-9]*$ ]] || TASKS_OVERLAP_BOUND_DEFAULT=3
+
+_TASKS_ADDITIVE_COLUMNS=(
+  'result TEXT' 'need_type TEXT' 'ask TEXT' 'need_options TEXT' 'recommend TEXT'
+  'need_answer TEXT' 'need_answered_at TEXT'
+  "kind TEXT NOT NULL DEFAULT 'standard'" 'schedule TEXT' 'last_fired_at TEXT'
+  'from_template_id INTEGER' 'fresh INTEGER'
+  'parked_at TEXT' 'park_reason TEXT' 'need_answered_by TEXT'
+  'need_answered_uid INTEGER' 'need_answer_sig TEXT'
+  'escalated_at TEXT' 'escalated_by TEXT'
+  "project_key TEXT NOT NULL DEFAULT 'dive'" 'issue_number INTEGER'
+  'acceptance_criteria TEXT' 'verify_command TEXT' 'max_iterations INTEGER' 'verifier TEXT'
+  'iteration INTEGER' 'maker_agent TEXT' 'handoff_ack_at TEXT' 'task_budget TEXT'
+  'handoff_delivered_at TEXT' 'handoff_stale_pinged_at TEXT' 'handoff_rejected_at TEXT'
+  'recurring_stall_pinged_at TEXT' 'recurring_stall_escalated_at TEXT'
+  'nudge_escalated_at TEXT' 'nudge_escalated_n INTEGER' 'nudge_parked_at TEXT'
+  'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT'
+  'gate_filed_by TEXT'
+  'secret_key TEXT' 'connector TEXT' 'secret_oob TEXT' 'human_nonce_hash TEXT'
+  'ask_shape TEXT' 'precedent_ref INTEGER' 'precedent_kind TEXT'
+  'needs_capability TEXT'
+  'gate_rubber_stamp TEXT'
+  'shipped_flag_at TEXT' 'routed_reviewer TEXT'
+  'delivery_ref TEXT' 'delivered_at TEXT' 'delivery_ref_iteration INTEGER'
+  'originated_by_objective INTEGER' 'originated_cycle INTEGER'
+  'verify_unavailable INTEGER' 'last_skipped_at TEXT'
+  # DIVE-2730: the add-time `--no-verify`, persisted. Nullable — NULL is "the
+  # filer did not opt out", which is the truth for every pre-existing row, so the
+  # backfill is a no-op. See the CREATE TABLE comment for why an unpersisted
+  # refusal reads downstream as a default absence.
+  'verify_optout INTEGER'
+  # DIVE-2272: per-template overlap policy. Both NULLABLE on purpose -- NULL is
+  # 'skip' / 'the default bound', so the migration is a no-op for every existing
+  # template AND an unclassified template stays visibly unclassified. See the
+  # CREATE TABLE comment for why the pile-up's value is per-template.
+  'on_overlap TEXT' 'overlap_bound INTEGER'
+  'human_evidence TEXT' 'derived_actor TEXT' 'floor_provenance TEXT'
+  # DIVE-3171: the ROUTING axis's provenance, sibling to floor_provenance. See the
+  # CREATE TABLE comment for the values and for why it is stored, not derived.
+  'route_provenance TEXT'
+  # DIVE-3128: the tapping human vs the relaying bot, separated. See the CREATE
+  # TABLE comment above for why folding them into one string was the defect.
+  'need_answered_relay TEXT' 'need_answered_tap_uid TEXT'
+  # DIVE-3098: a verifier grade recorded by `task verify --no-done`. Structural on
+  # purpose — the terminal-for-verifier predicate must not key on result TEXT,
+  # which the MAKER's `task deliver --result=` also writes.
+  'graded_at TEXT' 'graded_by TEXT'
+  # DIVE-2354: approve-to-send | confirm-after-send. See the CREATE TABLE comment.
+  'gate_mode TEXT'
+)
+
+# DIVE-3098 - TERMINAL FOR THE VERIFIER, as ONE SQL boolean expression.
+#
+# Three readers evaluate this: `task ls`'s render, `_task_terminal_for_verifier`
+# (the goal Stop hook's answer), and the heartbeat rot-nudger's exclusion. They MUST
+# agree - a row the nudger exempts but the render still paints `todo` is the original
+# bug wearing different clothes. So it is written once here and interpolated, never
+# retyped. (Same rule that produced broker_strip_md_quotes: a two-reader binding
+# diverges the moment someone fixes one side.)
+#
+# Every conjunct is load-bearing:
+#   graded_at                - stamped ONLY by `task verify --no-done`, never by the
+#                              maker's `task deliver --result=`, so it cannot be
+#                              forged in prose.
+#   graded_by <> maker_agent - a self-verified close does not buy the exemption.
+#   delivery_ref             - a verdict with nothing to merge is not awaiting a merge.
+# status stays OPEN: terminal for the VERIFIER, non-terminal for the ROW.
+# NOT `readonly`: several harnesses and code paths source this lib twice, and a
+# readonly re-assignment errors on the second source — measured, it broke 8 arms of
+# tests/gate_route_delivery_unit.sh with a stderr line and nothing else. Every other
+# constant in this file (incl. _TASKS_SCHEMA_EPOCH) is a plain assignment for the
+# same reason; match the file.
+_TASKS_TFV_SQL="graded_at IS NOT NULL
+       AND delivery_ref IS NOT NULL AND TRIM(delivery_ref) <> ''
+       AND (maker_agent IS NULL OR graded_by IS NULL OR graded_by <> maker_agent)
+       AND status NOT IN ('done','cancelled')"
+
+_TASKS_DB_GATE_COLUMNS=''
+_TASKS_DB_GATE_EPOCH=''
+_TASKS_DB_GATE_SEEDS=''
+
+# Exact newline membership without a subprocess. The newline frame prevents a
+# prefix (need_ty) from satisfying a full column name (need_type).
+_tasks_columns_have_all_additive() { # <newline-delimited pragma names>
+  local cols="${1:-}" c name framed
+  framed=$'\n'"$cols"$'\n'
+  for c in "${_TASKS_ADDITIVE_COLUMNS[@]}"; do
+    name="${c%% *}"
+    [[ "$framed" == *$'\n'"$name"$'\n'* ]] || return 1
+  done
+  return 0
+}
+
+# DIVE-2808: the migration also SEEDS, it does not only alter shape, and a gate that
+# reasons only about SHAPE silently drops every seed. Each key below is written by
+# `_tasks_db_migrate` with an INSERT OR IGNORE that re-runs on every pass, so before
+# this gate existed a deleted row healed itself on the next invocation. Skipping the
+# migration removes that, and the loss is invisible to any schema comparison: the
+# store is shape-perfect and semantically wrong. A missing seed therefore sends the
+# store back through the migration once, which re-seeds it.
+#
+# ONE SOURCE OF TRUTH. This array is the gate's model of what the migration seeds,
+# and it is the same drift hazard as the column list: a copy that falls behind the
+# migration reports *current* on a store that is not. tests/tasks_db_restore_guard_unit.sh
+# Case 16 DERIVES the seeded keys from `_tasks_db_migrate`'s own source and reds if
+# the two disagree in either direction, so adding a seed to the migration without
+# adding it here cannot pass quietly.
+#
+# `ledger_started` (INST-4) was the first found: `trace` reads a missing marker as a
+# ledger that predates everything. `gate_history_coverage` (DIVE-2133) was the second
+# and was missed by the first cut — the coverage boundary the gate_history reader
+# needs to tell "no gates were displaced" from "the archive was not yet writing", so
+# losing it downgrades a truthful complete zero to `unknown`. Two of two seeds in the
+# migration were self-healing, which is why the list is enumerated rather than the
+# exception hand-carved.
+_TASKS_SELFHEAL_PREFS=(ledger_started gate_history_coverage)
+
+_tasks_db_migration_needed() {
+  local payload row k in_list=''
+  # The seed markers ride along in the SAME read as the epoch and the columns, so
+  # keeping their self-heal costs no extra process. See the note above.
+  for k in "${_TASKS_SELFHEAL_PREFS[@]}"; do in_list+="${in_list:+,}'${k//\'/\'\'}'"; done
+  payload=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 'epoch:'||COALESCE((SELECT value FROM task_prefs WHERE key='schema_epoch'),'')
+       UNION ALL
+     SELECT 'seed:'||key FROM task_prefs WHERE key IN ($in_list)
+       UNION ALL
+     SELECT 'column:'||name FROM pragma_table_info('tasks');" 2>/dev/null) || return 0
+  _TASKS_DB_GATE_COLUMNS=''
+  _TASKS_DB_GATE_EPOCH=''
+  _TASKS_DB_GATE_SEEDS=''
+  while IFS= read -r row; do
+    case "$row" in
+      epoch:*)  _TASKS_DB_GATE_EPOCH="${row#epoch:}" ;;
+      seed:*)   _TASKS_DB_GATE_SEEDS+="${row#seed:}"$'\n' ;;
+      column:*) _TASKS_DB_GATE_COLUMNS+="${row#column:}"$'\n' ;;
+    esac
+  done <<<"$payload"
+  _TASKS_DB_GATE_COLUMNS="${_TASKS_DB_GATE_COLUMNS%$'\n'}"
+  _TASKS_DB_GATE_SEEDS="${_TASKS_DB_GATE_SEEDS%$'\n'}"
+  [[ "$_TASKS_DB_GATE_EPOCH" == "$_TASKS_SCHEMA_EPOCH" ]] || return 0
+  _tasks_prefs_have_all_seeds "$_TASKS_DB_GATE_SEEDS" || return 0
+  ! _tasks_columns_have_all_additive "$_TASKS_DB_GATE_COLUMNS"
+}
+
+# Same newline-framed membership as the column check, and for the same reason: no
+# subprocess per key, and no prefix satisfying a longer name.
+_tasks_prefs_have_all_seeds() { # <newline-delimited present pref keys>
+  local present="${1:-}" k framed
+  framed=$'\n'"$present"$'\n'
+  for k in "${_TASKS_SELFHEAL_PREFS[@]}"; do
+    [[ "$framed" == *$'\n'"$k"$'\n'* ]] || return 1
+  done
+  return 0
+}
+
+# DIVE-2808: the epoch is a receipt that the curated migration GENERATION named by
+# $_TASKS_SCHEMA_EPOCH has run to completion on this store. It is deliberately NOT
+# a claim that the store matches the canonical schema item for item.
+#
+# The first cut asserted exactly that — every canonical table, index and non-tasks
+# column after migrating — and `fail`ed tasks_db_init when it did not hold, which
+# is every `5dive task` invocation rather than merely a slow one. It cannot hold:
+# the migration is a curated set of one-shot blocks that was never a convergence
+# engine, and `CREATE TABLE IF NOT EXISTS` cannot widen a table that already
+# exists, so neither the migration nor a replay of the canonical DDL can add a
+# missing column to an existing table or an index over a column that is absent.
+# Asserting a property no code path can repair converts a slow migration into an
+# outage; four unrelated harnesses (ledger, policy_refusals, rollback_rate,
+# whoami_for_chain) went red on precisely that, on a store shaped like a legacy box.
+#
+# What still covers the axis the first cut was reaching for:
+#   - The EPOCH itself, which is what Case 13 of tests/tasks_db_restore_guard_unit.sh
+#     exercises: a stale/absent epoch sends a tasks-current store back through the
+#     whole migration, so a hole OUTSIDE tasks (gate_history.floor_provenance) is
+#     still repaired. That win belongs to the epoch, not to the manifest assertion.
+#   - tests/schema_sync_unit.sh, which fails CI if the migration's copies of those
+#     CREATE TABLE statements drift from the canonical ones — so a table built by
+#     EITHER path carries the same columns.
+#   - DIVE-2197's resulting-column assertion, retained on BOTH arms below.
+# A store that is genuinely short of a canonical table or column is not made worse
+# by the gate: the pre-DIVE-2808 code re-ran the migration on every invocation and
+# never created those either. Converging one needs per-table ALTERs — its own row.
+_tasks_db_stamp_schema_epoch() {
+  sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "INSERT INTO task_prefs(key,value,updated_at)
+       VALUES ('schema_epoch',$(sqlq "$_TASKS_SCHEMA_EPOCH"),datetime('now'))
+       ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');" \
+    >/dev/null 2>&1 || fail "$E_GENERIC" "failed to stamp tasks-db schema epoch (DIVE-2808)"
+}
+
+# DIVE-2197's resulting-set assertion. It is called after a real migration and
+# on the skip path, so an ALTER failure and a lying gate are both loud.
+_tasks_db_assert_required_columns() {
+  local final_cols c name
+  local -a missing_columns=()
+  if (($#)); then
+    final_cols="$1"
+  else
+    final_cols=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+                 "SELECT name FROM pragma_table_info('tasks');" 2>/dev/null)
+  fi
+  local framed=$'\n'"$final_cols"$'\n'
+  for c in "${_TASKS_ADDITIVE_COLUMNS[@]}"; do
+    name="${c%% *}"
+    [[ "$framed" == *$'\n'"$name"$'\n'* ]] || missing_columns+=("$name")
+  done
+  ((${#missing_columns[@]} == 0)) || fail "$E_GENERIC" \
+    "tasks db schema incomplete after migration — missing columns: ${missing_columns[*]} (DIVE-2197)"
+}
+
+# Idempotent additive migrations for stores that fail the gate above.
 _tasks_db_migrate() {
-  local cols
+  local cols c name framed
   cols=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
          "SELECT name FROM pragma_table_info('tasks');" 2>/dev/null)
-  local c
-  # Each entry: "<column> <type>". Add new additive columns here; existing
-  # rows backfill to NULL. Pure expand (no contract), so old queries/rows are
-  # untouched and a downgrade still reads/writes the table fine.
-  # NB project_key uses a constant DEFAULT (no REFERENCES) — sqlite forbids
-  # ADD COLUMN with a foreign key unless the default is NULL. The FK is declared
-  # in _tasks_schema for fresh boxes; on migrated stores the project_key→projects
-  # link is enforced at the app layer (project add/resolve), same as parent_id's
-  # behavior pre-FK. issue_number is the per-project sequence (DIVE-484).
-  for c in 'result TEXT' 'need_type TEXT' 'ask TEXT' 'need_options TEXT' 'recommend TEXT' 'need_answer TEXT' 'need_answered_at TEXT' \
-           "kind TEXT NOT NULL DEFAULT 'standard'" 'schedule TEXT' 'last_fired_at TEXT' \
-           'from_template_id INTEGER' 'fresh INTEGER' \
-           'parked_at TEXT' 'park_reason TEXT' 'need_answered_by TEXT' \
-           'need_answered_uid INTEGER' 'need_answer_sig TEXT' \
-           'escalated_at TEXT' 'escalated_by TEXT' \
-           "project_key TEXT NOT NULL DEFAULT 'dive'" 'issue_number INTEGER' \
-           'acceptance_criteria TEXT' 'verify_command TEXT' 'max_iterations INTEGER' 'verifier TEXT' \
-           'iteration INTEGER' 'maker_agent TEXT' 'handoff_ack_at TEXT' 'task_budget TEXT' \
-           'handoff_delivered_at TEXT' 'handoff_stale_pinged_at TEXT' \
-           'handoff_rejected_at TEXT' \
-           'recurring_stall_pinged_at TEXT' 'recurring_stall_escalated_at TEXT' \
-           'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT' \
-           'gate_filed_by TEXT' \
-           'secret_key TEXT' 'connector TEXT' 'secret_oob TEXT' 'human_nonce_hash TEXT' \
-           'ask_shape TEXT' 'precedent_ref INTEGER' 'precedent_kind TEXT' \
-           'needs_capability TEXT' \
-           'shipped_flag_at TEXT' 'routed_reviewer TEXT' \
-           'delivery_ref TEXT' 'delivered_at TEXT' 'delivery_ref_iteration INTEGER' \
-           'originated_by_objective INTEGER' 'originated_cycle INTEGER' \
-           'verify_unavailable INTEGER' 'last_skipped_at TEXT' \
-           'human_evidence TEXT' \
-           'derived_actor TEXT' \
-           'floor_provenance TEXT'; do
-    # DIVE-2418: herestring, NOT a pipe. `printf | grep -q` lets grep exit on its
-    # first match while printf is still writing, and printf then takes SIGPIPE and
-    # emits "write error: Broken pipe" on stderr. This runs from tasks_db_init on
-    # essentially every `5dive task` invocation, so the stray line can surface
-    # anywhere — it is not test-only. It reddened CI on 0efcd66 by landing INSIDE a
-    # harness's captured stream (loop_panel_unit T6 redirects 2>&1 into the file it
-    # then jq-parses), so the assertion failed while the subject under test had
-    # succeeded. A herestring has no pipe, so no SIGPIPE is possible.
-    #
-    # THE MECHANISM IS NOT ESTABLISHED AND THIS FIX DOES NOT DEPEND ON IT. olivia
-    # built the exact shape at the real payload size (~70 short strings, far under
-    # the 64KB pipe buffer) with the match on line one and got ZERO broken pipes in
-    # 400 runs, so the obvious early-exit story does not reproduce where it actually
-    # occurs; CI under load is the untested variable. Removing the pipe removes the
-    # class regardless of which race fires. Semantics verified equivalent over five
-    # probes including the prefix case `grep -x` must reject (need_ty vs need_type).
-    #
-    # If anyone adds `set -o pipefail` on this path, the SIGPIPE stops being
-    # cosmetic and becomes a hard failure in schema migration.
-    if ! grep -qx "${c%% *}" <<<"$cols"; then
+  # DIVE-2808: the list moved to $_TASKS_ADDITIVE_COLUMNS so the skip-gate and this
+  # loop cannot drift, and the DIVE-2418 `grep -qx` herestring became pure-Bash
+  # membership — same prefix-rejecting semantics (need_ty vs need_type), and with no
+  # subprocess at all the SIGPIPE class that comment describes cannot exist here.
+  framed=$'\n'"$cols"$'\n'
+  for c in "${_TASKS_ADDITIVE_COLUMNS[@]}"; do
+    name="${c%% *}"
+    if [[ "$framed" != *$'\n'"$name"$'\n'* ]]; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true
     fi
   done
+  _tasks_db_assert_required_columns
+
   # OSS-11 precedent-lookup index (idempotent; harmless if the columns just
   # backfilled to NULL above — an all-NULL ask_shape simply never matches).
   sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
@@ -1390,7 +1744,13 @@ CREATE TABLE IF NOT EXISTS gate_history (
   human_nonce_hash  TEXT,
   retired_by        TEXT NOT NULL,
   retired_at        TEXT NOT NULL DEFAULT (datetime('now')),
-  floor_provenance  TEXT
+  floor_provenance  TEXT,
+  -- DIVE-3171: carried for the same reason floor_provenance is. A retired gate that
+  -- keeps its TIER's provenance and drops its ROUTE's is the half-record that makes a
+  -- later count wrong in one direction only, and the count at stake here is "how often
+  -- did the standing authority actually carry a gate".
+  route_provenance  TEXT,
+  gate_mode         TEXT
 );
 CREATE INDEX IF NOT EXISTS gate_history_task_idx ON gate_history(task_id, id);
 MIG
@@ -1405,12 +1765,34 @@ MIG
   # already carries `floor_provenance TEXT`, added out-of-band by something that
   # left no trace in this repo — the column existed with no writer, no migration
   # and no reference in src/ or tests/, which is why it read NULL on all 79 rows.
+  # DIVE-2354: additive gate_mode on an ALREADY-CREATED gate_history, for the same
+  # reason floor_provenance needs one directly below -- the create-if-absent block
+  # above reaches only stores that have never filed a gate.
+  local has_gh_gatemode
+  has_gh_gatemode=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM pragma_table_info('gate_history') WHERE name='gate_mode' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_gh_gatemode" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+      "ALTER TABLE gate_history ADD COLUMN gate_mode TEXT;" >/dev/null 2>&1 || true
+  fi
+
   local has_gh_floorprov
   has_gh_floorprov=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
     "SELECT 1 FROM pragma_table_info('gate_history') WHERE name='floor_provenance' LIMIT 1;" 2>/dev/null)
   if [[ "$has_gh_floorprov" != "1" ]]; then
     sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
       "ALTER TABLE gate_history ADD COLUMN floor_provenance TEXT;" >/dev/null 2>&1 || true
+  fi
+
+  # DIVE-3171: additive route_provenance on an ALREADY-CREATED gate_history, for the
+  # same reason its two siblings above need one — the create-if-absent block reaches
+  # only stores that have never filed a gate, which is no box that has ever run.
+  local has_gh_routeprov
+  has_gh_routeprov=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM pragma_table_info('gate_history') WHERE name='route_provenance' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_gh_routeprov" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+      "ALTER TABLE gate_history ADD COLUMN route_provenance TEXT;" >/dev/null 2>&1 || true
   fi
 
   # DIVE-748 — additive scorecard column on already-created loop_runs tables.
@@ -1615,6 +1997,7 @@ MIG
         "ALTER TABLE objectives ADD COLUMN run_mode TEXT NOT NULL DEFAULT 'live';" >/dev/null 2>&1 || true
     fi
   fi
+  _tasks_db_stamp_schema_epoch
 }
 
 # Per-connection setup, passed via -cmd / .timeout so it produces NO output
@@ -1954,11 +2337,13 @@ _gate_archive_and_clear_sql() {
     "INSERT INTO gate_history (task_id, ident, need_type, ask, need_options, recommend," \
     "                          tier, need_asked_at, need_answer, need_answered_at," \
     "                          need_answered_by, need_answered_uid, need_answer_sig," \
-    "                          human_nonce_hash, retired_by, floor_provenance)" \
+    "                          human_nonce_hash, retired_by, floor_provenance," \
+    "                          route_provenance, gate_mode)" \
     "  SELECT id, ident, need_type, ask, need_options, recommend," \
     "         tier, need_asked_at, need_answer, need_answered_at," \
     "         need_answered_by, need_answered_uid, need_answer_sig," \
-    "         human_nonce_hash, $(sqlq "$verb"), floor_provenance" \
+    "         human_nonce_hash, $(sqlq "$verb"), floor_provenance," \
+    "         route_provenance, gate_mode" \
     "    FROM tasks" \
     "   WHERE (${pred})" \
     "     AND (need_type IS NOT NULL OR need_answer IS NOT NULL" \

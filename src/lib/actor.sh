@@ -374,3 +374,82 @@ actor_claim_note() {
 # refusing the claim, and it costs no legitimate relay. A refusal would still be the
 # right tool for a verb where a claim cannot be provenance — there is not one today,
 # and adding the mechanism before there is a member is how guards end up unexercised.
+
+# ---------------------------------------------------------------------------
+# WHO TAPPED THE BUTTON (DIVE-3128)
+#
+# A tier-2 gate exists to prove a HUMAN was in the loop, and `need_answered_by`
+# is the one field whose entire job is to carry that proof. It did not.
+#
+# MEASURED, DIVE-3045: a gate delivered through agent-olivia's Telegram bot and
+# tapped by a person landed as `need_answered_by='human:olivia'` with
+# `need_answered_uid` = an AGENT's uid. "olivia" is a name on the roster, so the
+# row is indistinguishable from `the olivia agent answered its own human gate` —
+# the exact claim tier 2 exists to rule out. Nothing was forged and nobody
+# misused a flag: `task_actor` derives the RELAYING process's identity, which on
+# the tap path is the bot, and the `human:` prefix was pasted onto it.
+#
+# Two facts were collapsed into one string. They are separated here:
+#   need_answered_by       WHO decided        -> the tapping human
+#   need_answered_relay    WHOSE BOT carried it -> the relaying agent
+#
+# and one cheap invariant now holds over the first: a `human:<name>` where
+# `<name>` is a name the ROSTER knows is an agent is not a human attribution, so
+# it is refused rather than written.
+
+# actor_name_is_registered_agent <name> — is this name on the agent roster?
+#
+# THREE-STATE, and the third state is why this is not `[[ -n $(...) ]]`. The
+# registry answers "yes", "no, measured" and "I could not look", and a guard that
+# folds the third onto either of the other two is the not-reached-vs-pass collapse
+# `tier_unmeasured` exists to prevent (lib/registry.sh). Fold it onto "yes" and an
+# unreadable registry refuses every human tap on the box; fold it onto "no" and
+# the guard silently stops guarding.
+#   0  the roster MEASURES this name as an agent  -> refuse a human: stamp on it
+#   1  MEASURED, and it is not an agent           -> a human: stamp is fine
+#   2  could not measure                          -> say so, decide nothing here
+#
+# `unknown:no-tier` / `unknown:malformed-tier` return 0, NOT 2: per agent_tier's
+# own contract both mean the key IS under `.agents` and only the tier value was
+# unusable. The roster answered "this is an agent"; whether it also has a legible
+# isolation tier is a different question and not the one being asked.
+actor_name_is_registered_agent() {
+  local n="${1:-}"
+  [[ -n "$n" ]] || return 1
+  local t; t=$(agent_tier "$n" 2>/dev/null) || t="unknown:lookup-failed"
+  case "$t" in
+    unknown:unregistered)                   return 1 ;;
+    unknown:no-tier|unknown:malformed-tier) return 0 ;;
+    unknown:*)                              return 2 ;;
+    *)                                      return 0 ;;
+  esac
+}
+
+# actor_human_name_ok <name> — may `human:<name>` be written?
+#
+# THE RETURN CODE IS THE DECISION; ACTOR_HUMAN_NAME_WHY is the NOTE and is never
+# a second copy of it. 0 accepts, non-zero refuses. A name that could not be
+# MEASURED against the roster is ACCEPTED — there is no evidence of a collision —
+# but the note says `roster-unmeasured` so the record can distinguish "checked,
+# clean" from "could not check", which is the whole point of the three states
+# above. A caller that branches on `[[ -n "$ACTOR_HUMAN_NAME_WHY" ]]` instead of
+# on the status has re-collapsed them.
+#
+# `tg:<digits>` is accepted without consulting the roster at all. It is the
+# fallback identity the tap path mints when it cannot name the person, and it is
+# structurally incapable of colliding with an agent name (agent names are bare
+# tokens; this one carries a colon), so asking the registry about it would only
+# create a way for the fallback to fail.
+actor_human_name_ok() {
+  local n="${1:-}"
+  ACTOR_HUMAN_NAME_WHY=""
+  if [[ -z "$n" ]]; then ACTOR_HUMAN_NAME_WHY="empty-name"; return 1; fi
+  [[ "$n" == tg:* ]] && return 0
+  local rc=0
+  actor_name_is_registered_agent "$n" || rc=$?
+  case "$rc" in
+    0) ACTOR_HUMAN_NAME_WHY="roster-agent";      return 1 ;;
+    2) ACTOR_HUMAN_NAME_WHY="roster-unmeasured"; return 0 ;;
+    *) return 0 ;;
+  esac
+}

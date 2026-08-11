@@ -217,8 +217,14 @@ jobs:
           # cut would mint a NEW version every night on an unchanged main, burning a
           # number per night and republishing identical bytes under each. So the arm
           # that matters is the one asserting it DOES stop.
+          # DIVE-3170: NOT "${incumbent}^". A cut makes TWO commits (DIVE-2603 split
+          # assign from bundle), so the tag's first parent is the ASSIGN commit — a
+          # release tree, never main. scripts/release-cut-baseline.sh holds the one
+          # copy of the rule (walk first-parent to the first ancestor of main) and
+          # every site below uses THIS variable rather than respelling it.
+          cut_from=""
           if [[ -n "$incumbent" ]]; then
-            cut_from=$(git rev-parse -q --verify "refs/tags/${incumbent}^{commit}^" 2>/dev/null || true)
+            cut_from=$(bash scripts/release-cut-baseline.sh "refs/tags/${incumbent}" 2>/dev/null || true)
             if [[ -n "$cut_from" && "$cut_from" == "$sha" ]]; then
               echo "::notice::${incumbent} was cut from main's current tip ${sha:0:12} — main has not moved since the last cut. Nothing to publish."
               exit 0
@@ -447,7 +453,23 @@ jobs:
           # so stamp-changelog.sh sees the folded headings same as a manually-typed
           # one. Not fatal for the same reason the stamp isn't: a cut must not die
           # because a fragment drifted from the expected format.
-          if _folded=$(bash scripts/fold-changelog-fragments.sh 2>&1); then
+          #
+          # DIVE-2702: PASS THE ALREADY-CONSUMED BASELINE. The fold deletes fragments
+          # in this detached tree only — main keeps them (DIVE-2247: no push to a
+          # protected branch) — so without this the NEXT cut re-folds every fragment
+          # ever written and each release's notes repeat all previous releases'.
+          # DIVE-3170: this used to pass "${incumbent}^" and call itself "not a third
+          # copy of the tag-resolution rule". It WAS a third copy, spelled differently,
+          # and it was wrong: the tag's first parent is the assign commit, whose tree
+          # the fold has ALREADY emptied, so every fragment looked unshipped and all 52
+          # re-folded on every cut. It now reuses $cut_from — the one derivation, done
+          # once above. Empty incumbent (first cut ever) is still passed through as
+          # set-but-empty on purpose: "nothing has shipped yet, fold everything", which
+          # is different from the unset auto-detect case.
+          if [[ -n "${incumbent-}" && -z "${cut_from-}" ]]; then
+            echo "::warning::could not resolve the main commit ${incumbent} was cut from — every already-shipped fragment will fold again and these notes will repeat previous releases' entries (DIVE-2702, DIVE-3170)"
+          fi
+          if _folded=$(FOLD_RELEASED_BASELINE="${cut_from-}" bash scripts/fold-changelog-fragments.sh 2>&1); then
             echo "changelog.d fragments folded for ${tag}: ${_folded} (DIVE-2582)"
           else
             echo "::warning::changelog.d fragments could not be folded for ${tag} (${_folded}) — publishing anyway"
@@ -688,10 +710,10 @@ jobs:
           # `cut_from` is the main sha the incumbent tag was cut from — the same
           # comparand the main-moved check above uses, recomputed here because that
           # block returns early on the no-move path and never reaches this point.
-          _notes_from=""
-          if [[ -n "$incumbent" ]]; then
-            _notes_from=$(git rev-parse -q --verify "refs/tags/${incumbent}^{commit}^" 2>/dev/null || true)
-          fi
+          # DIVE-3170: $cut_from, not a fourth respelling of the tag rule. The
+          # main-moved block above returns early only on the no-move path, so the
+          # variable it set is still in scope and still correct here.
+          _notes_from="${cut_from-}"
           _notes_file="$(mktemp)"
           if ! bash scripts/release-notes.sh "$_notes_from" "$sha" "$version" > "$_notes_file"; then
             echo "::error::${tag} IS PUBLISHED as a tag, but its release notes could not be derived from ${_notes_from:-<root>}..${sha:0:12} — refusing to create a release page whose body would describe only how the cut was dispatched (DIVE-2452). Boxes are unaffected; write the notes by hand and create the release page."

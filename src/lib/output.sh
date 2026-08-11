@@ -163,7 +163,41 @@ fail() {
   # the bug-report verb there, with the actual verb/code filled in, rather than
   # leaving discovery to whoever happens to read .github/ISSUE_TEMPLATE.
   if [[ "$code" == "${E_GENERIC:-1}" ]]; then
-    echo "hint: run '5dive bug --verb=\"${CURRENT_VERB:-unknown}\" --exit=$code' to preview a diagnostic bug report (allowlisted fields only; nothing is filed until you add --file)" >&2
+    # DIVE-3136: the hint PREFILLS --what with the error text this function is
+    # already printing one line above. The two empty issues on the public repo
+    # (#526, #553) were filed by an agent following this very hint on a path
+    # with nobody at a prompt — so the fix is not "remind the caller to
+    # describe it", it is to hand them a command that already carries the one
+    # fact only this moment knows. #553 would then have read "accepts at most 1
+    # arg(s), received 2" instead of an unfilled template comment.
+    #
+    # THE SHELL-METACHARACTER STRIP, and why it is wider than it first looks.
+    # Quotes and newlines are stripped, not escaped: the hint is wrapped in
+    # single quotes for copy-paste, so a quote inside it would end the string
+    # early and hand the reader a command that runs as something else.
+    #
+    # $ ` and \ are stripped for a STRONGER reason, and stripping only the
+    # quotes (as this line first did — caught by quinn on DIVE-3136 review) was
+    # a live command injection, not a cosmetic gap. The --what payload sits
+    # inside DOUBLE quotes in the printed command, and double quotes do not
+    # suppress substitution: a message carrying $(...) or `...` executes the
+    # moment the reader pastes the line. And $msg is caller-influenced —
+    # `fail "unknown flag: $1"` puts an attacker-chosen token straight into it,
+    # so any verb reaching the E_GENERIC arm was a delivery vector.
+    #
+    # The whole job of this line is to hand a human a command to run. That is
+    # exactly why it must never hand them someone else's: a reader who trusts
+    # the tool enough to paste its suggestion is the one person with no defence
+    # left. The full error text is already printed verbatim one line above, so
+    # nothing is lost by making the COPYABLE copy inert.
+    local hint_what="${msg//$'\n'/ }"
+    hint_what="${hint_what//\'/}"     # would close the single-quoted wrapper
+    hint_what="${hint_what//\"/}"     # would close the --what= double quotes
+    hint_what="${hint_what//\$/}"     # $(...) and $VAR expand inside "..."
+    hint_what="${hint_what//\`/}"     # `...` expands inside "..." too
+    hint_what="${hint_what//\\/}"     # a trailing \ escapes the closing quote
+    hint_what="${hint_what:0:160}"
+    echo "hint: run '5dive bug --verb=\"${CURRENT_VERB:-unknown}\" --exit=$code --what=\"${hint_what}\"' to preview a diagnostic bug report (allowlisted fields plus the text you pass; nothing is filed until you add --file)" >&2
   fi
   # DIVE-2598: this exit carries a reason, so the EXIT-trap backstop stays quiet
   # for it. Set AFTER the message is emitted, never before — the flag asserts "the

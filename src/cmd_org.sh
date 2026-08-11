@@ -20,7 +20,7 @@ _org_usage() {
   READS (tree/show/ls) — any agent (group claude), no sudo.
   WRITES (set/rm)      — root only. The chart is trusted input to gate routing
                          (_gate_route_reviewer reads reports_to), so re-parenting is
-                         a fleet privilege change, not bookkeeping (DIVE-2124).
+                         a fleet privilege change, not bookkeeping.
   Add --json for machine output.
 USAGE
 }

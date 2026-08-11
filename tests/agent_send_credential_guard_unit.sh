@@ -48,7 +48,7 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
-trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
+trap 'rc=$?; rm -f "${CAPTURE_STATE:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other. DIVE-2159's capture-stub statefile is cleaned HERE for that reason — a second `trap ... EXIT` REPLACES this one and the HARNESS-RC line silently disappears.
 cd "$(dirname "$0")/.."
 
 # Counter shape matches the rest of tests/ on purpose: tests/meta/harness-verdict-probe.sh
@@ -135,6 +135,170 @@ allows "'API key: sk-… (redacted)' output line is allowed" \
   $'config dump\nAPI key: <redacted>\n\n❯ \n'
 
 allows "empty pane is allowed (readiness, not credential, decides)" ""
+
+# ---------------------------------------------------------------------------
+# DIVE-2159 — COULD-NOT-MEASURE MUST NOT RENDER AS MEASURED-AND-SAFE.
+#
+# Everything above grades the PREDICATE, which only ever sees a string. The
+# residual lived one level up, in the CAPTURE: `capture-pane ... || true`
+# discarded tmux's exit status, so a FAILED capture arrived as an empty string,
+# the predicate said "not a credential prompt", and _agent_pane_safe_to_type
+# returned 0 — SEND ANYWAY. The guard abstained exactly when it was needed:
+# a transient capture failure while the agent sits on a login prompt.
+#
+# The discriminator is the RETURN CODE, and it is real — measured on this box
+# (tmux 3.4, 2026-08-10), not assumed:
+#   `tmux capture-pane -p -t <missing>`         -> rc 1, empty stdout
+#   `sudo -u <unknown user> tmux capture-pane`  -> rc 1, empty stdout
+#   live pane with nothing drawn yet            -> rc 0, empty stdout
+# Cases (d) and (e) below are the pair that would collapse into one answer again
+# if a future change went back to reading emptiness instead of rc.
+#
+# Graded through the REAL _agent_pane_safe_to_type with only the one tmux call
+# stubbed, so the retry count, the fail-closed decision and the reason bookkeeping
+# are the shipped ones, not a re-implementation living in this file.
+# ---------------------------------------------------------------------------
+
+eval "$(awk '/^_agent_pane_safe_to_type\(\) \{$/ { on=1 } on { print } on && $0 == "}" { exit }' "$SRC")"
+eval "$(awk '/^_agent_credential_refusal_msg\(\) \{$/ { on=1 } on { print } on && $0 == "}" { exit }' "$SRC")"
+declare -F _agent_pane_safe_to_type >/dev/null \
+  || { echo "FAIL: could not extract _agent_pane_safe_to_type from $SRC"; exit 1; }
+declare -F _agent_credential_refusal_msg >/dev/null \
+  || { echo "FAIL: could not extract _agent_credential_refusal_msg from $SRC"; exit 1; }
+
+# The stubbed seam. CAPTURE_SCRIPT is one "rc|payload" entry per call; calls past
+# the end reuse the last entry, so "always fails" is a single-element script.
+#
+# The call counter lives in a FILE, not a variable, and that is not fussiness:
+# the shipped code reads the capture as `pane=$(_agent_capture_pane_for_guard …)`,
+# i.e. inside a command substitution, so every assignment the stub makes dies with
+# that subshell. A variable counter reads back 0 forever and the script never
+# advances — which silently turns every scripted sequence into "the first entry,
+# repeated", and a retry test into a no-retry test that still passes. (Measured:
+# the first draft of this file did exactly that; case (a) below went green while
+# grading nothing.) SLEEPS is different — `sleep` is called in the guard's own
+# shell, so a plain variable is correct there.
+CAPTURE_SCRIPT=(); SLEEPS=0
+# Pre-set under `set -u` so a guard that STOPS setting the reason produces a
+# readable FAIL instead of killing the harness on an unbound variable. Measured:
+# reverting the guard to its pre-fix shape aborted this file after one line, which
+# is a red — but a red that names the wrong thing.
+_AGENT_PANE_REFUSAL_REASON=""
+CAPTURE_STATE="$(mktemp)"   # cleaned by the EXIT trap at the top — do NOT add a second one
+_agent_capture_pane_for_guard() {
+  local i n spec
+  i=$(<"$CAPTURE_STATE"); n=${#CAPTURE_SCRIPT[@]}
+  printf '%s' "$((i+1))" >"$CAPTURE_STATE"
+  (( i >= n )) && i=$(( n - 1 ))
+  spec="${CAPTURE_SCRIPT[$i]}"
+  printf '%s' "${spec#*|}"
+  return "${spec%%|*}"
+}
+capture_calls() { cat "$CAPTURE_STATE"; }
+sleep() { SLEEPS=$((SLEEPS+1)); }              # keep the retry backoff off the clock
+_agent_cred_seed_failure() { printf '\n'; }    # no sudo/no boot breadcrumb in a unit
+
+# Run the guard against a scripted capture; leaves rc / capture_calls / SLEEPS
+# and _AGENT_PANE_REFUSAL_REASON for the assertions.
+guard_rc=0
+run_guard() {
+  CAPTURE_SCRIPT=("$@"); printf '0' >"$CAPTURE_STATE"; SLEEPS=0; guard_rc=0
+  _agent_pane_safe_to_type dummy || guard_rc=$?
+}
+eq_t() { if [[ "$2" == "$3" ]]; then ok_t "$1"; else bad_t "$1 (expected [$3], got [$2])"; fi; }
+
+SAFE_PANE=$'● Done — pushed the branch.\n\n❯ \n'
+
+# (a) THE DEFECT. Capture fails every time -> REFUSE. Before DIVE-2159 this
+# returned 0 and the payload was typed into a pane nobody could see.
+run_guard '1|'
+eq_t "capture that never succeeds REFUSES (rc 2), it does not fall through to send" "$guard_rc" "2"
+eq_t "…and the refusal reason is 'unreadable', not 'credential'" "$_AGENT_PANE_REFUSAL_REASON" "unreadable"
+# Bounded: it must retry, and it must STOP retrying. An unbounded loop here would
+# hang every send on a box whose tmux is broken.
+eq_t "…after exactly 3 bounded attempts" "$(capture_calls)" "3"
+eq_t "…with a backoff between attempts, not between the last one and the refusal" "$SLEEPS" "2"
+
+# (b) The reason retry comes before fail-closed: the motivating failure is a
+# FLAKE (busy tmux server, momentary permission fault). A bare fail-closed would
+# convert that flake into blocked inter-agent traffic.
+run_guard '1|' "0|$SAFE_PANE"
+eq_t "a transient capture failure is retried and the send proceeds" "$guard_rc" "0"
+eq_t "…having stopped capturing as soon as one succeeded" "$(capture_calls)" "2"
+eq_t "…and leaves no stale refusal reason behind" "$_AGENT_PANE_REFUSAL_REASON" ""
+
+# (c) Retrying must not lose the refusal it was built to protect: the flake-then-
+# login-prompt case is gh#214's exact state seen through a bad capture.
+run_guard '1|' "0|$CODEX_LOGIN"
+eq_t "flake then a LOGIN pane still refuses" "$guard_rc" "1"
+eq_t "…as a credential refusal, not an unreadable one" "$_AGENT_PANE_REFUSAL_REASON" "credential"
+
+# (d)+(e) THE PAIR. Same empty stdout, opposite meanings — kept apart by rc alone.
+run_guard '0|'
+eq_t "a REAL but blank pane (rc 0, no bytes) is allowed — measured-and-safe" "$guard_rc" "0"
+run_guard '1|'
+eq_t "an UNREADABLE pane (rc 1, no bytes) is refused — could-not-measure" "$guard_rc" "2"
+
+# (f) The escape hatch is checked BEFORE the capture, so it also unblocks a box
+# where capture is broken outright — otherwise the documented override could not
+# reach the very state it is documented for.
+CAPTURE_SCRIPT=('1|'); printf '0' >"$CAPTURE_STATE"; guard_rc=0
+FIVE_ALLOW_CREDENTIAL_PANE=1 _agent_pane_safe_to_type dummy || guard_rc=$?
+eq_t "FIVE_ALLOW_CREDENTIAL_PANE=1 still overrides an unreadable pane" "$guard_rc" "0"
+eq_t "…without even attempting a capture" "$(capture_calls)" "0"
+
+# (g) The reason is per-call state read by a LOOP (the heartbeat asks per agent).
+# A stale value would pin one agent's cause onto the next agent's refusal.
+run_guard '1|'
+run_guard "0|$SAFE_PANE"
+eq_t "the refusal reason resets between agents" "$_AGENT_PANE_REFUSAL_REASON" ""
+
+# (h) The RECEIPT. An unreadable pane must not be reported as a login prompt:
+# nobody saw one, and that claim sends the operator off to re-seed a credential
+# that may be fine. Same could-not-measure shape as the defect, one level up.
+_AGENT_PANE_REFUSAL_REASON="unreadable"; msg_u="$(_agent_credential_refusal_msg dummy)"
+_AGENT_PANE_REFUSAL_REASON="credential"; msg_c="$(_agent_credential_refusal_msg dummy)"
+if grep -qF 'DIVE-2159' <<<"$msg_u" && grep -qiF 'could not READ' <<<"$msg_u"; then
+  ok_t "unreadable-pane receipt names the real cause"
+else
+  bad_t "unreadable-pane receipt does not say the pane could not be read: $msg_u"
+fi
+if grep -qi 'is parked on a CREDENTIAL/LOGIN prompt' <<<"$msg_u"; then
+  bad_t "unreadable-pane receipt asserts a login prompt nobody measured: $msg_u"
+else
+  ok_t "unreadable-pane receipt does NOT assert an unmeasured login prompt"
+fi
+if grep -qiF 'NOTHING WAS TYPED' <<<"$msg_u"; then
+  ok_t "unreadable-pane receipt states that nothing was typed"
+else
+  bad_t "unreadable-pane receipt leaves the caller unsure whether the payload landed"
+fi
+if grep -qF 'DIVE-2137' <<<"$msg_c" && grep -qF 'CREDENTIAL/LOGIN prompt' <<<"$msg_c"; then
+  ok_t "the original credential receipt is unchanged"
+else
+  bad_t "the DIVE-2137 refusal text drifted: $msg_c"
+fi
+for _m in "$msg_u" "$msg_c"; do
+  grep -qF 'FIVE_ALLOW_CREDENTIAL_PANE=1' <<<"$_m" \
+    || bad_t "a refusal receipt stopped naming the override: $_m"
+done
+ok_t "both refusal receipts name the documented override"
+
+# DRIFT GUARD: the defect was an IDIOM — `|| true` on a command whose rc was the
+# only signal. Assert the shipped function neither swallows an rc nor reaches for
+# tmux behind the seam this file stubs (a raw capture here would be untested code
+# on the guard's own path, and the stub would silently grade nothing).
+guard_body="$(awk '/^_agent_pane_safe_to_type\(\) \{$/ { on=1 } on { print } on && $0 == "}" { exit }' "$SRC")"
+if grep -q '|| true' <<<"$guard_body"; then
+  bad_t "_agent_pane_safe_to_type discards an exit status again (|| true) — DIVE-2159"
+else
+  ok_t "_agent_pane_safe_to_type discards no exit status"
+fi
+if grep -q 'capture-pane' <<<"$guard_body"; then
+  bad_t "_agent_pane_safe_to_type captures directly — the stubbed seam is bypassed"
+else
+  ok_t "_agent_pane_safe_to_type captures only through _agent_capture_pane_for_guard"
+fi
 
 # ---------------------------------------------------------------------------
 # LOCKSTEP: the credential guard must sit on the ONE choke point every typed

@@ -260,6 +260,14 @@ case "$CH" in
       claude) ARGS+=(--channels "plugin:dashboard@5dive-plugins") ;;
       *) echo "channels=dashboard is claude-only (got type=$TYPE)" >&2; exit 2 ;;
     esac ;;
+  # DIVE-2895 Buzz (Nostr) channel — claude-only, same shape as dashboard. The
+  # plugin polls the relay itself and reads its keypair + watched channel UUIDs
+  # from ~/.claude/channels/buzz/config.json, so nothing is passed in argv.
+  buzz)
+    case "$TYPE" in
+      claude) ARGS+=(--channels "plugin:buzz@5dive-plugins") ;;
+      *) echo "channels=buzz is claude-only (got type=$TYPE)" >&2; exit 2 ;;
+    esac ;;
   *) echo "unknown channels: $CH" >&2; exit 2 ;;
 esac
 done

@@ -713,12 +713,12 @@ _objective_validate_diff() {
     prio=$(printf '%s' "$diff"  | jq -r ".reprioritize[$i].priority")
     [[ "$prio" =~ ^(low|medium|high|urgent)$ ]] || fail "$E_VALIDATION" "reprioritize $ident: bad priority '$prio' (low|medium|high|urgent)"
     _objective_owns_open "$obj_id" "$ident" \
-      || fail "$E_VALIDATION" "reprioritize $ident: not an OPEN task this objective originated — a planner may reprioritize ONLY its own originated tasks"
+      || fail "$E_VALIDATION" "reprioritize $ident: not an OPEN task this objective originated — a planner may only touch its own"
   done
   for ((i=0; i<ncan; i++)); do
     ident=$(printf '%s' "$diff" | jq -r ".cancel[$i].ident")
     _objective_owns_open "$obj_id" "$ident" \
-      || fail "$E_VALIDATION" "cancel $ident: not an OPEN task this objective originated — a planner may propose-cancel ONLY its own originated tasks (touching human/other tasks stays a gate)"
+      || fail "$E_VALIDATION" "cancel $ident: not an OPEN task this objective originated — a planner may only propose-cancel its own"
   done
   OBJ_N_CREATE="$ncre" OBJ_N_REPRI="$nrep" OBJ_N_CANCEL="$ncan"
 }
@@ -836,7 +836,7 @@ _objective_file_gate() {
   anchor_id=$(db "SELECT id FROM tasks WHERE project_key=$(sqlq "$pkey") AND title=$(sqlq "$title") AND kind='standard' ORDER BY id LIMIT 1;")
   if [[ -z "$anchor_id" ]]; then
     local add_json
-    add_json=$(JSON_MODE=1 cmd_task_add --project="$pkey" --priority=high ${from:+--from="$from"} \
+    add_json=$(JSON_MODE=1 cmd_task_add --materialized --project="$pkey" --priority=high ${from:+--from="$from"} \
                  --body="$(printf 'Objective re-plan cycle %s for "%s".\nProposed diff — create:%s reprioritize:%s cancel:%s. Approve to apply the origination batch.\n\n--- objective diff json ---\n%s' \
                            "$cycle_no" "$oname" "$OBJ_N_CREATE" "$OBJ_N_REPRI" "$OBJ_N_CANCEL" "$diff")" \
                  -- "$title") || return $?
@@ -848,7 +848,8 @@ _objective_file_gate() {
   # T2 create -> HARD tier-2 gate (never --yes-waived, never auto-cleared). Else a
   # count-only checkpoint stays the default agent-clearable tier-1 decision.
   local reason="create ${OBJ_N_CREATE}, reprioritize ${OBJ_N_REPRI}, cancel ${OBJ_N_CANCEL}"; local -a tier_arg=()
-  if [[ "$GOAL_HAS_T2" == "1" ]]; then reason="carries a Tier-2 task — ${reason}"; tier_arg=(--tier=2); fi
+  # DIVE-2848: declare human_tap alongside the pin — see the twin in cmd_goal.sh.
+  if [[ "$GOAL_HAS_T2" == "1" ]]; then reason="carries a Tier-2 task — ${reason}"; tier_arg=(--tier=2 --needs=human_tap); fi
   JSON_MODE=1 cmd_task_need "$anchor_id" --type=decision --options="approve|revise" --recommend="approve" "${tier_arg[@]}" ${from:+--from="$from"} \
     --ask="Approve objective '${oname}' re-plan cycle ${cycle_no}? (${reason}) Full diff in the task body." >/dev/null \
     || fail "$E_GENERIC" "objective replan: could not file the plan gate"
@@ -902,7 +903,7 @@ _objective_apply_from_gate() {
   nans=$(db "SELECT COALESCE(need_answer,'')     FROM tasks WHERE id=${id};")
   nby=$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE id=${id};")
   [[ -n "$nat" ]] || fail "$E_CONFLICT" "$ident's gate is not answered yet — a human must approve it first, then re-run"
-  [[ "$nby" == human:* ]] || fail "$E_AUTH_REQUIRED" "$ident's gate was not cleared by a human (answered by '${nby:-?}') — an objective diff may only be applied on a HUMAN approval (DIVE-916)"
+  [[ "$nby" == human:* ]] || fail "$E_AUTH_REQUIRED" "$ident's gate was not cleared by a human (answered by '${nby:-?}') — an objective diff applies only on a HUMAN approval"
   [[ "$nans" == "approve" ]] || fail "$E_CONFLICT" "$ident's gate was answered '${nans}', not 'approve' — nothing applied (re-plan to revise)"
   # Recover the diff from the anchor body + RE-VALIDATE from scratch.
   local body diff; body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")

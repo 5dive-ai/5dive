@@ -579,6 +579,24 @@ cmd_info() {
   model=$(resolve_agent_model "$type" "$name" || true)
   effort=$(resolve_agent_effort "$type" "$name" || true)
 
+  # DIVE-3113: for openclaw, an absent model is not a neutral "unset" — it is a
+  # SILENT SWITCH TO A DIFFERENT PROVIDER. openclaw model ids are
+  # `<provider>/<model>`, so with no pin it uses its built-in default, whose
+  # prefix names a vendor we hold no credential for, and the BYO key sitting
+  # right there on disk is never offered. The whole of DIVE-3112 was two hours
+  # spent on a valid key because every check that asked "is the key there?"
+  # passed. `model: —` was printed and read as cosmetic. Name it instead.
+  local oc_unpinned=0
+  if [[ "$type" == "openclaw" && -z "$model" ]]; then
+    local _oc_prof _oc_auth=""
+    _oc_prof=$(jq -r --arg n "$name" '.agents[$n].authProfile // ""' <<<"$reg")
+    if [[ -n "$_oc_prof" ]]; then
+      _oc_auth=$(profile_type_auth_path "$_oc_prof" openclaw 2>/dev/null) || _oc_auth=""
+    fi
+    [[ -n "$_oc_auth" ]] || _oc_auth="${TYPE_AUTH[openclaw]}"
+    [[ -s "$_oc_auth" ]] && oc_unpinned=1
+  fi
+
   # DIVE-2079: measure the ENFORCED sudo grant so `info` reports what this agent
   # can actually do, not only the label the registry stores. See
   # agent_sudo_grant/classify_sudo_grant in cmd_agent_create.sh for the classes
@@ -608,6 +626,7 @@ cmd_info() {
     --arg cliVersion "$cli_version" \
     --arg model "$model" \
     --arg effort "$effort" \
+    --arg ocUnpinned "$oc_unpinned" \
     '.agents[$n] as $a | {
       name: $n,
       type: $a.type,
@@ -647,7 +666,12 @@ cmd_info() {
       cliName: $cliName,
       cliVersion: (if $cliVersion == "" then null else $cliVersion end),
       model: (if $model == "" then null else $model end),
-      effort: (if $effort == "" then null else $effort end)
+      effort: (if $effort == "" then null else $effort end),
+      # DIVE-3113: true == an openclaw agent holding a BYO credential with no
+      # model pin, i.e. running on the built-in openclaw default and therefore
+      # on a provider whose key it does not have. (No apostrophes in this jq
+      # program: it is a single-quoted bash string, so one would end it.)
+      modelUnpinnedWithCreds: ($ocUnpinned == "1")
     }' <<<"$reg")
 
   if (( JSON_MODE )); then
@@ -657,7 +681,7 @@ cmd_info() {
       "name:        \(.name)",
       "type:        \(.type)",
       "cli:         \(.cliName) \(.cliVersion // "unknown")",
-      "model:       \(.model // "—")\(if .effort then " · effort \(.effort)" else "" end)",
+      "model:       \(.model // (if .modelUnpinnedWithCreds then "— UNPINNED (see warning below)" else "—" end))\(if .effort then " · effort \(.effort)" else "" end)",
       "channels:    \(.channels)\(if .botUsername then " (@\(.botUsername))" else "" end)",
       "profile:     \(.authProfile // "-")",
       "workdir:     \(.workdir)",
@@ -665,6 +689,9 @@ cmd_info() {
       "sudo:        \(if .sudo.measured then "\(.sudo.grant) — \(.sudo.scope); runas \(.sudo.runas)" else "unknown — not measurable from here; run `sudo -n -l` as agent-\(.name), or re-run this as root" end)\(if .sudo.extraEntries then " (+ entries this CLI did not write)" else "" end)",
       "state:       \(.active) / \(.enabled)",
       "created:     \(.createdAt // "unknown")",
+      (if .modelUnpinnedWithCreds then
+         "\nWARNING: this openclaw agent has a credential on disk and NO model pin. That is not a neutral default — openclaw model ids are `<provider>/<model>`, so with nothing pinned it uses its built-in default, whose provider prefix is not the one you configured. It will consult a credential that does not exist and return HTTP 401 while your key sits unused (DIVE-3112). Repair: sudo 5dive agent auth set openclaw --provider=<provider> --api-key=<key> --auth-profile=\(.authProfile // "<profile>") --model=<provider>/<model>"
+       else empty end),
       (if .sudo.diverges then
          "\nWARNING: the label and the enforced grant DISAGREE. Label \"\(.isolation)\" describes \(if .isolation == "admin" then "the 5dive CLI as root" elif .isolation == "standard" then "5dive agent _deliver/_capture only" else "no sudo" end); the enforced grant is \(.sudo.grant) (\(.sudo.scope), runas \(.sudo.runas)). Trust the grant, not the label. Nothing re-writes a drop-in after create (create_agent_user is the only writer), so a drifted grant stays drifted until someone edits /etc/sudoers.d/agent-\(.name) by hand or recreates the agent."
        else empty end)

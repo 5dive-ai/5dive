@@ -74,7 +74,7 @@ task_need_notify "$gid" decision "ship it?" "A|B" "A" >/dev/null 2>&1
   || no "task_need_notify leaked a fixture gate to the human (nsends=$(nsends))"
 
 out=$(_task_inbox_send "1234567890" "need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled')" "created_at" 2>&1); rc=$?
-[[ "$rc" != "0" && "$out" == *"1506"* ]] \
+[[ "$rc" != "0" && "$out" == *"not the prod DB"* ]] \
   && ok "task inbox --send: refuses on a fixture DB with a clear DIVE-1506 message" \
   || no "inbox --send did not fail-closed on a fixture DB (rc=$rc out=$out)"
 

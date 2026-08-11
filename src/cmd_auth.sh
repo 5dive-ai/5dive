@@ -1087,7 +1087,7 @@ opencode_validate_model_or_fail() {
   grep -qxF "$model_id" <<<"$catalog" && return 0
   local sugg; sugg=$(grep -F "${model_id%/*}/" <<<"$catalog" | head -5 \
     | awk 'NR>1{printf ", "}{printf "%s", $0}') || sugg=""
-  fail "$E_VALIDATION" "opencode has no model '$model_id' for provider '$provider'. A fresh agent would silently fall back to an unrelated default that may not support tool use.${sugg:+ Close matches: $sugg.} Run 'opencode models' for the full list."
+  fail "$E_VALIDATION" "opencode has no model '$model_id' for provider '$provider'.${sugg:+ Close matches: $sugg.} Run 'opencode models'"
 }
 
 # opencode_apply_model_default <agent-name> <provider> <model> [api-key] — pin
@@ -1167,7 +1167,7 @@ pi_validate_model_or_fail() {
   grep -qxF "$slug" <<<"$catalog" && return 0
   local sugg; sugg=$(grep -F "${slug%%/*}/" <<<"$catalog" | head -5 \
     | awk 'NR>1{printf ", "}{printf "%s", $0}') || sugg=""
-  fail "$E_VALIDATION" "pi has no model '$slug' for provider '$provider'. A fresh agent would boot without the pinned model (no runnable default).${sugg:+ Close matches: $sugg.} Run 'pi --list-models $provider' for the full list."
+  fail "$E_VALIDATION" "pi has no model '$slug' for provider '$provider'.${sugg:+ Close matches: $sugg.} Run 'pi --list-models $provider'"
 }
 
 # pi_apply_model_default <agent-name> <provider> <model> [api-key] — pin a pi
@@ -1214,19 +1214,44 @@ pi_apply_model_default() {
 # The "-" sentinel reads the key from stdin — use that from the API layer
 # so the key never touches process argv (and thus never shows up in `ps`).
 cmd_auth_set() {
-  local type="" api_key="" profile="" byo_provider=""
+  local type="" api_key="" profile="" byo_provider="" base_url="" byo_model=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --api-key=*)       api_key="${1#--api-key=}" ;;
       --auth-profile=*)  profile="${1#--auth-profile=}" ;;
       --provider=*)      byo_provider="${1#--provider=}" ;;
+      # DIVE-2809: the create path's --base-url/--model reach auth set too, so a
+      # key rotation on a custom-endpoint profile has a way to RESTATE the
+      # endpoint instead of losing it to the catalog. Without these two flags the
+      # guard in _apply_byo_claude would be a wall with no door.
+      --base-url=*)      base_url="${1#--base-url=}" ;;
+      --model=*)         byo_model="${1#--model=}" ;;
       -*)                fail "$E_USAGE" "unknown flag: $1" ;;
       *)                 [[ -z "$type" ]] && type="$1" || fail "$E_USAGE" "extra arg: $1" ;;
     esac
     shift
   done
-  [[ -n "$type" ]] || fail "$E_USAGE" "usage: 5dive agent auth set <type> --api-key=<key> [--auth-profile=<name>] [--provider=<id>]"
+  [[ -n "$type" ]] || fail "$E_USAGE" "usage: 5dive agent auth set <type> --api-key=<key> [--auth-profile=<name>] [--provider=<id>] [--base-url=<url>] [--model=<slug>]"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type"
+  # DIVE-2809: both new flags only mean anything on the BYO branch below, which
+  # is entered by --provider. Refuse rather than accept-and-ignore: an operator
+  # who passes --base-url without --provider is asking for exactly the endpoint
+  # pin this row exists to protect, and silently dropping it is the same class
+  # of bug. `pi` and `opencode` also take --provider but return from their own
+  # branches ABOVE the BYO block, so a flag they do not read would be accepted
+  # and dropped there — hence the type check as well as the --provider one.
+  if [[ -n "$base_url" ]]; then
+    [[ -n "$byo_provider" ]] \
+      || fail "$E_USAGE" "--base-url requires --provider=<id> (it configures a claude BYO endpoint; see 'agent create --base-url')"
+    [[ "$type" == "claude" ]] \
+      || fail "$E_VALIDATION" "--base-url is only supported for claude (got: $type — hermes/openclaw carry their own provider URL tables)"
+  fi
+  if [[ -n "$byo_model" ]]; then
+    [[ -n "$byo_provider" ]] \
+      || fail "$E_USAGE" "--model requires --provider=<id> (per-tier model ids are BYO-provider state)"
+    [[ "$type" == "claude" || "$type" == "hermes" || "$type" == "openclaw" ]] \
+      || fail "$E_VALIDATION" "--model is only supported for claude/hermes/openclaw (got: $type)"
+  fi
   [[ -n "$api_key" ]] || fail "$E_USAGE" "--api-key=<key> required (use --api-key=- to read from stdin)"
 
   if [[ "$api_key" == "-" ]]; then
@@ -1298,7 +1323,7 @@ cmd_auth_set() {
       # override env vars directly in combined.env, so skip that step for it.
       [[ "$type" == "claude" ]] || profile_type_dir "$profile" "$type" >/dev/null
     fi
-    apply_byo_provider "$type" "$byo_provider" "$api_key" "$profile"
+    apply_byo_provider "$type" "$byo_provider" "$api_key" "$profile" "$byo_model" "$base_url"
 
     # Restart any running agents that consume this credential so the new
     # provider takes effect immediately. Without this, hermes/openclaw
@@ -1842,7 +1867,7 @@ cmd_auth_start() {
     # via `auth set --api-key --provider`. (Grandfathered agents can still
     # re-auth over the TTY `auth login` handoff, which is left intact.)
     claude|codex|antigravity|grok) ;;
-    *) fail "$E_VALIDATION" "device-code flow supports claude/codex/antigravity/grok. hermes/openclaw are API-key only — use 'auth set --api-key --provider=<id>' for $type." ;;
+    *) fail "$E_VALIDATION" "device-code flow supports claude/codex/antigravity/grok — for $type use: auth set --api-key --provider=<id>" ;;
   esac
   local bin="${TYPE_BIN[$type]}"
   [[ -x "$bin" ]] || fail "$E_NOT_INSTALLED" "$type not installed at $bin"

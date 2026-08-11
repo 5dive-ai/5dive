@@ -142,20 +142,30 @@ MOVED=$(sed -n "/# >>> DIVE-2247 main-moved check/,/# <<< DIVE-2247 main-moved c
 run_moved(){
   local mode="$1" d; d=$(mktemp -d)
   ( set -e
-    cd "$d"; git init -q .; git config user.email a@b; git config user.name t
+    # -b main: the baseline helper resolves the cut point against MAIN by name
+    # (DIVE-3170), so a fixture on the local git default branch would grade nothing.
+    cd "$d"; git init -q -b main .; git config user.email a@b; git config user.name t
     printf 'a\n' > f; git add f; git -c user.name=t -c user.email=a@b commit -q -m base
     if [[ "$mode" != none ]]; then
-      # the release commit: a detached child of the main tip, exactly as the cut builds it
+      # DIVE-3170: the cut builds TWO detached commits, not one — assign, then
+      # bundle — and the tag names the second. This fixture used to build one, which
+      # is precisely why "${incumbent}^" read as main here and as a release tree in
+      # production. Model the real shape or the arms below grade a shape nobody ships.
+      printf 'assigned\n' > src-header; git add -f src-header
+      git -c user.name=t -c user.email=a@b commit -q -m "release v0.1.0: assign 0.1.0 before bundle build"
       printf 'bundle\n' > 5dive; git add -f 5dive
-      git -c user.name=t -c user.email=a@b commit -q -m "release v0.1.0"
+      git -c user.name=t -c user.email=a@b commit -q -m "release v0.1.0: bundle built"
       git tag v0.1.0
-      git reset -q --hard HEAD~1
+      git reset -q --hard HEAD~2
     fi
     if [[ "$mode" == moved ]]; then
       printf 'b\n' >> f; git add f; git -c user.name=t -c user.email=a@b commit -q -m "a real merge"
     fi
   ) >/dev/null 2>&1
   ( cd "$d"
+    # The extracted block shells out to the one baseline helper (DIVE-3170), so the
+    # fixture needs it on the same relative path the workflow uses.
+    mkdir -p scripts && cp "$ROOT/scripts/release-cut-baseline.sh" scripts/
     sha=$(git rev-parse HEAD)
     incumbent=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
     eval "$MOVED"

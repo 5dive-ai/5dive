@@ -211,6 +211,7 @@ anchor_to marcus
 # --------------------------------------------------------------------------------------
 seed_task DIVE-506 "pick the rollout order"
 cmd_task_need DIVE-506 --type=decision --tier=2 --options="A|B" --recommend=A \
+  --rubber-stamp-ok="fixture: this case needs a tier-2 decision to prove it mints a nonce (DIVE-2848 cap)" \
   --ask="which rollout order" --from=dev >/dev/null 2>&1
 [[ "$(tierof DIVE-506)" == "2" && -n "$(hashof DIVE-506)" ]] \
   && ok_t "S10 a tier-2 DECISION now mints a per-gate nonce (it minted none before)" \

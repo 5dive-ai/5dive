@@ -1,20 +1,32 @@
 #!/usr/bin/env bash
-# DIVE-2065 unit harness for scripts/version-bump-guard.sh (push-time) and
-# scripts/version-uniqueness-scan.sh (CI-side, wider-range twin).
+# DIVE-2065 unit harness for scripts/version-bump-guard.sh (push-time).
 #
 # Incident under test: c97a4f9 bumped FIVE_VERSION to 0.16.3 and rebuilt the
 # bundle; a same-day follow-up (2472df2) rebuilt the bundle AGAIN (real
 # content change) but its own version-bump step failed silently, so it
 # reused 0.16.3 with a different bundle. Nothing caught it — bundle-drift
 # only enforces bundle==build(src), not version-is-unique. Fixed after the
-# fact by renumbering the follow-up to 0.16.4; these guards stop the next
-# one from landing.
+# fact by renumbering the follow-up to 0.16.4; this guard stops the next one
+# from landing.
+#
+# DIVE-2453: this harness used to ALSO grade scripts/version-uniqueness-scan.sh,
+# the CI-side wider-range twin of the guard below. That script is DELETED, not
+# just untested: DIVE-2247 already retired its only caller (bundle-drift.yml's
+# uniqueness job) when version assignment moved to tag time — exactly one
+# writer, once per cut, so the multi-merge race it scanned for (DIVE-2118) is
+# now structurally impossible, the "retire a guard whose class can no longer
+# occur" case in this repo's CLAUDE.md. The script itself was left on disk
+# with nothing calling it but this harness — a check nothing runs grading a
+# script nothing calls. The invariant it tried to hold now lives at the
+# tag-time act itself: release-cut.yml refuses to cut a derived version that
+# already exists as a tag, or to re-point a published one (DIVE-2118
+# assertion, see that workflow's cut-time derivation block).
 #
 # Isolation: builds a throwaway git repo per scenario group under mktemp, with
-# synthetic src/header.sh + 5dive + 5dive.sha256 (fake content — the guards
-# only compare FIVE_VERSION strings and raw 5dive.sha256 bytes, they never
-# actually run build.sh or validate a real sha256, so no real bundle is
-# needed to exercise them). Never touches the real repo's git state.
+# synthetic src/header.sh + 5dive + 5dive.sha256 (fake content — the guard
+# only compares FIVE_VERSION strings and raw 5dive.sha256 bytes, it never
+# actually runs build.sh or validates a real sha256, so no real bundle is
+# needed to exercise it). Never touches the real repo's git state.
 # Run: bash tests/version_bump_guard_unit.sh  (no root, no network).
 set -uo pipefail
 
@@ -30,7 +42,6 @@ set -uo pipefail
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUMP_GUARD="$ROOT/scripts/version-bump-guard.sh"
-UNIQ_SCAN="$ROOT/scripts/version-uniqueness-scan.sh"
 
 TMP="$(mktemp -d /tmp/version-bump-guard-unit.XXXXXX)"
 cleanup() { rm -rf "$TMP"; }
@@ -191,36 +202,26 @@ assert_exit "bump-guard: does not fire when the bundle didn't change" 0 "$?"
 bash "$BUMP_GUARD" "$c2" "$c2" >/dev/null 2>&1
 assert_exit "bump-guard: BASE==NEW (nothing new) never blocks" 0 "$?"
 
-# --- version-uniqueness-scan.sh: CI-side, wider-range twin -------------
+# --- DIVE-2453: the retired script must stay retired -------------------
+# scripts/version-uniqueness-scan.sh does not exist any more; the CI job that
+# called it was deleted by DIVE-2247 and the property it checked now lives in
+# release-cut.yml's derived-tag-already-exists refusal (DIVE-2118). If this
+# fires, someone resurrected the file without restoring a caller or arguing
+# why release-cut.yml's guarantee is no longer enough — that decision belongs
+# in a ticket, not a silent re-add.
+if [[ -e "$ROOT/scripts/version-uniqueness-scan.sh" ]]; then
+  bad_t "version-uniqueness-scan.sh must not exist (DIVE-2453 retirement)" "found at $ROOT/scripts/version-uniqueness-scan.sh"
+else
+  ok_t "version-uniqueness-scan.sh stays retired (DIVE-2453)"
+fi
 
-bash "$UNIQ_SCAN" "$c1" "$c0" >/dev/null 2>&1
-assert_exit "uniqueness-scan: blocks the incident shape over its own delta" 1 "$?"
-
-bash "$UNIQ_SCAN" "$c2" "$c1" >/dev/null 2>&1
-assert_exit "uniqueness-scan: a genuine forward bump is clean" 0 "$?"
-
-# Wider delta spanning the incident AND its fix (c0..c2, i.e. c1 is included
-# as a NEW commit relative to c0): must still catch c1's collision. This is
-# the case a real CI job hits when a push lands more than one commit at once.
-bash "$UNIQ_SCAN" "$c2" "$c0" >/dev/null 2>&1
-assert_exit "uniqueness-scan: catches the collision even inside a wider multi-commit delta" 1 "$?"
-
-# Re-landing IDENTICAL content under a version already on BASE must not fire
-# (e.g. a rebase/cherry-pick replays the same release commit content).
-git checkout -q "$c2"
-c5="$(commit_unrelated "unrelated, still on top of the clean 0.1.1 state")"
-bash "$UNIQ_SCAN" "$c5" "$c2" >/dev/null 2>&1
-assert_exit "uniqueness-scan: does not fire on a delta that never touches header.sh/5dive.sha256" 0 "$?"
-
-# --- mutation proof: confirm the guards are not vacuously passing ------
+# --- mutation proof: confirm the guard is not vacuously passing --------
 # Feed the incident pair through with an intentionally WRONG base (equal to
 # NEW) to confirm the block above wasn't a fluke of argument order — this
 # must pass clean, proving the earlier block genuinely depended on BASE
 # actually differing from NEW's committed content.
 bash "$BUMP_GUARD" "$c1" "$c1" >/dev/null 2>&1
 assert_exit "bump-guard: sanity — comparing a commit against itself never blocks" 0 "$?"
-bash "$UNIQ_SCAN" "$c1" "$c1" >/dev/null 2>&1
-assert_exit "uniqueness-scan: sanity — comparing a commit against itself never blocks" 0 "$?"
 
 # --- DIVE-2071: extraction failure at NEW must block loudly, not fail open ---
 # Proof (a): NEW is missing src/header.sh outright. Pre-fix this returned
@@ -237,9 +238,6 @@ else
   bad_t "bump-guard: missing-header failure gets its own distinct message" "$out"
 fi
 
-out="$(bash "$UNIQ_SCAN" "$c6" "$c2" 2>&1)"; rc=$?
-assert_exit "uniqueness-scan: blocks when src/header.sh is missing at NEW (was fail-open)" 1 "$rc"
-
 # Proof (b): the FIVE_VERSION anchor in src/header.sh has drifted (renamed),
 # run against the REAL incident shape (same version, bundle rebuilt with
 # different content). Pre-fix this also returned rc=0 — it "silently passes
@@ -252,49 +250,6 @@ d1="$(commit_drifted_header 0.1.0 0.1.0 shaB "bundle rebuilt, version bump silen
 
 out="$(bash "$BUMP_GUARD" "$d1" "$d0" 2>&1)"; rc=$?
 assert_exit "bump-guard: blocks the incident even when the FIVE_VERSION anchor drifted (was fail-open)" 1 "$rc"
-
-out="$(bash "$UNIQ_SCAN" "$d1" "$d0" 2>&1)"; rc=$?
-assert_exit "uniqueness-scan: blocks the incident even when the FIVE_VERSION anchor drifted (was fail-open)" 1 "$rc"
-
-# --- DIVE-2071: name the actual colliding commit; do not always blame $BASE --
-# Genuine intra-range collision: BOTH claims of the version are introduced by
-# this range itself, with no instance on BASE at all. The pre-fix message
-# unconditionally said "already used on $BASE", which is wrong here — the
-# prior claim is another NEW commit, not history reachable from BASE.
-git checkout -q "$c2"
-e0="$(commit_release 0.5.0 0.5.0 shaX "unrelated baseline, 0.5.0")"
-e1="$(commit_release 0.6.0 0.6.0 shaY "first claim of 0.6.0, introduced by this range")"
-e2="$(commit_release 0.6.0 0.6.0 shaZ "second claim of 0.6.0, different bundle, same range")"
-
-out="$(bash "$UNIQ_SCAN" "$e2" "$e0" 2>&1)"; rc=$?
-assert_exit "uniqueness-scan: catches a genuine intra-range collision" 1 "$rc"
-if [[ "$out" == *"earlier in this range"* && "$out" == *"$e1"* ]]; then
-  ok_t "uniqueness-scan: intra-range collision names the earlier NEW commit"
-else
-  bad_t "uniqueness-scan: intra-range collision names the earlier NEW commit" "$out"
-fi
-if [[ "$out" != *"already used on $e0"* ]]; then
-  ok_t "uniqueness-scan: intra-range collision does not misattribute the prior claim to \$BASE"
-else
-  bad_t "uniqueness-scan: intra-range collision does not misattribute the prior claim to \$BASE" "$out"
-fi
-
-# Control: when the prior claim genuinely lives further back in BASE's own
-# history than BASE's tip (a docs-only commit sits on top, touching neither
-# file), the message must name the ORIGINAL claiming commit, not just repeat
-# the literal $BASE argument.
-git checkout -q "$c0"
-g_base_tip="$(commit_unrelated "docs-only commit on top of 0.1.0, BASE tip")"
-git checkout -q "$g_base_tip"
-g1="$(commit_release 0.1.0 0.1.0 shaB "reuse 0.1.0 with a different bundle")"
-
-out="$(bash "$UNIQ_SCAN" "$g1" "$g_base_tip" 2>&1)"; rc=$?
-assert_exit "uniqueness-scan: catches a collision whose origin predates BASE's own tip" 1 "$rc"
-if [[ "$out" == *"already used on $g_base_tip"* && "$out" == *"$c0"* ]]; then
-  ok_t "uniqueness-scan: names the actual historical commit, not just the BASE argument"
-else
-  bad_t "uniqueness-scan: names the actual historical commit, not just the BASE argument" "$out"
-fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

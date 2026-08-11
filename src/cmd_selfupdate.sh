@@ -11,16 +11,31 @@
 #      `uninstall` shells out to, so there's a single source of truth for
 #      "what gets updated" rather than a second copy that drifts.
 #
-#   2. Restarts every running agent so the refreshed plugins/CLIs actually
-#      load. A live agent keeps its old plugin (and shared CLI binary) in
-#      memory until it restarts — that's the usual reason a plugin "still
-#      shows the old version" after an upgrade.
+#   2. Restarts the agents whose IN-MEMORY payload the upgrade actually
+#      changed. A live agent keeps its plugins, its skills and its CLAUDE.md in
+#      memory until it restarts — that's the usual reason a plugin "still shows
+#      the old version" after an upgrade — so those, and only those, are worth
+#      a bounce.
 #
 # The agent AI CLIs themselves (claude/codex/grok/antigravity) self-update via
-# their own vendor autoupdaters; the restart in step 2 is what loads the latest
-# shared binary into each agent. Managed boxes have their own scheduler so they
+# their own vendor autoupdaters. Managed boxes have their own scheduler so they
 # don't need this, but running it there is harmless — `--upgrade` and the
 # restart loop are both idempotent.
+#
+# DIVE-3172 — THE CLI VERSION IS NOT A REASON TO RESTART ANYONE. This loop used
+# to bounce EVERY running agent unconditionally, on a nightly schedule, and a
+# `systemctl restart` mid-turn drops the agent's session and its in-flight work
+# with no record: a killed turn is indistinguishable afterwards from an agent
+# that simply went quiet. lodar reported it as "our nightly updates kills some
+# active agents mid tasks" (2026-08-10).
+#
+# The unconditional restart was buying nothing on most nights. MEASURED on this
+# host 2026-08-10: /usr/local/bin/5dive was replaced 0.19.10 -> 0.19.14 with
+# ZERO restarts and every running agent reported the new version on its next
+# command (`sudo -u agent-olivia 5dive --version` -> 0.19.14 immediately). The
+# CLI is exec'd per invocation, not held open, so a binary swap propagates on
+# its own. Only what the agent PROCESS holds across its lifetime needs a bounce.
+# On a CLI-only update the correct number of restarts is zero.
 
 # json_array <items...> — emit a compact JSON string array, "[]" when empty.
 # Guards the empty-array case (printf with no args would otherwise emit a stray
@@ -32,6 +47,187 @@ json_array() {
     printf '%s\n' "$@" | jq -R . | jq -cs .
   fi
 }
+
+# >>> DIVE-3172 agent payload fingerprint
+#     (tests/self_update_restart_predicate_unit.sh extracts this block VERBATIM
+#      between these markers and runs the shipped bytes — keep them.)
+#
+# _agent_home <unit-name> — the home directory whose payload that unit loads.
+# Resolved from passwd rather than assembled as a string: the fleet's agents are
+# `agent-<name>`, but the root seat runs as `claude` out of /home/claude, and a
+# hardcoded /home/agent-claude would fingerprint a directory that does not exist
+# — which reads as "unreadable", which restarts it every night. Falls back to the
+# conventional path so a box with no passwd entry still gets the old behaviour.
+_agent_home() {
+  local n="${1:-}" h=""
+  [[ -n "$n" ]] || return 0
+  h=$(getent passwd "agent-$n" 2>/dev/null | cut -d: -f6) || h=""
+  [[ -n "$h" ]] || h=$(getent passwd "$n" 2>/dev/null | cut -d: -f6) || h=""
+  printf '%s\n' "${h:-/home/agent-$n}"
+}
+
+# _agent_config_hashable <type> — is this agent type's CONFIG file inside the set
+# _agent_payload_fingerprint actually hashes?
+#
+# Only `claude` is, via the literal ~/.claude/settings.json below. Every other type
+# keeps its config somewhere we have NO map to derive (~/.codex/config.toml,
+# ~/.grok/config.toml, ~/.pi/agent/settings.json), written ad hoc by the boot path.
+#
+# This function exists because of what the conditional would otherwise DO to those
+# types. Today's unconditional restart picks a config-only change up — loudly and
+# wastefully, but correctly. Under a fingerprint that cannot see the file, the agent
+# compares EQUAL and is SKIPPED: a change that ships today would stop shipping. That
+# is a NEW silent failure introduced by this fix, not a pre-existing gap being
+# documented, and it is the same shape as the skills defect one layer down.
+#
+# So an unmeasurable type is never claimed unchanged. It restarts — the caller's own
+# rule ("an absent reading resolves to neither answer") applied per TYPE instead of
+# fleet-wide, which preserves today's exact behaviour for precisely the agents we
+# cannot measure and keeps the savings for the ones we can. An unknown or empty type
+# is unmeasurable too and takes the same branch.
+#
+# OWED, NOT HERE: a TYPE_CONFIG_FILE map is the real fix and would let these types
+# be compared like any other. It means touching every boot path that writes those
+# files ad hoc — different change, different risk — so it is on DIVE-3172's body as
+# owed rather than bundled into a fix that is otherwise ready.
+_agent_config_hashable() {
+  case "${1:-}" in
+    claude) return 0 ;;
+    *)      return 1 ;;
+  esac
+}
+
+# _agent_restart_needed <before> <after> <type> — 0 when the unit must be bounced.
+# The whole skip/restart decision lives here rather than inline in the loop so the
+# unit harness grades the SHIPPED bytes of it instead of a restatement that can drift.
+_agent_restart_needed() {
+  local before="${1:-}" after="${2:-}" type="${3:-}"
+  # UNREADABLE IS NOT UNCHANGED. If either side of the comparison is empty we could
+  # not observe the payload, so we fall back to the old unconditional behaviour and
+  # restart. Skipping on an unknown would convert a permission problem into a fleet
+  # that silently never picks up a plugin fix — a much quieter failure than the one
+  # this change is fixing. (DIVE-2230's rule: an absent reading resolves to neither
+  # answer.)
+  [[ -n "$before" && -n "$after" && "$before" == "$after" ]] || return 0
+  # NON-DERIVABLE CONFIG TYPES ALWAYS RESTART, DELIBERATELY. See above: equal
+  # fingerprints on such a type do not mean the payload held still, only that the
+  # part we can hash did.
+  _agent_config_hashable "$type" || return 0
+  return 1
+}
+
+# _agent_payload_fingerprint <agent-home> [lib-dir] — one hash over everything a
+# running agent loaded at startup and cannot pick up without a restart. Empty
+# output means "could not be read", which is NOT the same as "unchanged" — see
+# the caller.
+#
+# WHAT IS ON THE LIST, AND WHY THE CLI IS NOT.
+#   - $LIB_DIR/skills        staged skills, read when the agent session starts
+#   - ~/.claude/skills       the agent's own skills, same
+#   - ~/.claude/plugins/installed_plugins.json
+#                            the plugin VERSION PINS. `5dive-refresh-plugins.sh`
+#                            downloads each new version into
+#                            ~/.claude/plugins/cache/<mp>/<plugin>/<version>/ and
+#                            REPOINTS this manifest, so the manifest moving is
+#                            exactly the event a plugin update is. We hash the
+#                            manifest and not the cache on purpose: each cached
+#                            version is ~29M with its own node_modules, the old
+#                            versions linger, and hashing them would cost more
+#                            than the restart it is trying to avoid.
+#   - ~/.claude/settings.json  hooks, model and provider pins — read at startup
+#   - ~/.claude/CLAUDE.md      loaded into context at session start
+# The 5dive CLI binary is deliberately absent: it is exec'd per command, so a
+# swap needs no restart (measured — see the header).
+#
+# THE PAYLOAD PATHS ARE DERIVED FROM THE INSTALLER'S OWN MAPS, NEVER RE-LITERALED.
+# Skills and the instructions doc do NOT live under ~/.claude for every agent: the
+# install dir is resolved PER TYPE from SKILLS_INSTALL_DIR / TYPE_PERSONA_FILE, and
+# `5dive-refresh-skills.sh` writes through that same resolution. A hardcoded
+# ".claude/skills" therefore watched the wrong directory for every non-claude type.
+#
+# MEASURED on this fleet 2026-08-10, all 13 running units (`5dive agent skill <a> list`):
+#   andy 2 / codex 5 / ocqa 2 skill dirs under .agents/skills and ZERO under
+#   .claude/skills — 100% invisible; creative 15/7 and marketing 3/8 — partially
+#   invisible. 5 of 13 agents, 27 skill dirs. Those agents compared EQUAL forever and
+#   were SKIPPED every night, silently: the quiet failure the caller's comment below
+#   explicitly refuses. Note creative and marketing are type=claude and STILL have
+#   .agents/skills dirs, so this is NOT a clean type split and must not be "fixed" by
+#   special-casing non-claude types.
+#
+# WHY DERIVED AND NOT ONE MORE LITERAL. A path the fingerprint does not know about is
+# INDISTINGUISHABLE from a payload that did not change, so adding ".agents/skills" as a
+# second literal would fix today's three types and fail identically and silently on the
+# next type someone maps. Iterating the maps means the predicate cannot fall behind the
+# installer by construction: adding a type to SKILLS_INSTALL_DIR extends this hash for
+# free. The ".claude/*" entries stay in the set unconditionally because
+# skills_install_dir() falls back to ".claude/skills" for an UNMAPPED type.
+#
+# SORTED, and that is load-bearing rather than tidy. Bash associative-array iteration
+# order is not a contract; if the path list came out in a different order on the second
+# snapshot the hash would move on an unchanged payload and restart the whole fleet —
+# precisely the regression this change exists to prevent.
+#
+# STILL LITERAL, DELIBERATELY, AND NOT AN OVERSIGHT: ~/.claude/settings.json and
+# ~/.claude/plugins/installed_plugins.json. The plugin manifest is Claude-only (no other
+# harness has a plugin system). Per-type CONFIG does have real parallels — ~/.codex/
+# config.toml, ~/.grok/config.toml, ~/.pi/agent/settings.json — but unlike skills and the
+# persona doc there is NO map to derive them from; they are written ad hoc by the boot
+# path. Enumerating them here would recreate exactly the literal-drift defect this
+# function just fixed, one layer down, so it is raised as a DECISION (expose a
+# TYPE_CONFIG_FILE map vs enumerate) rather than quietly taken. Until that lands, a
+# config-only change on a non-claude agent is NOT detected — named so nobody reads this
+# fix as wider than it is.
+#
+# CONTENT, NEVER mtime OR SIZE. `refresh_managed_files()` in install.sh swaps the
+# managed files in UNCONDITIONALLY (`mv -f "$_bundle_tmp" ...`) with no
+# already-current branch, so the nightly rewrites them every night whether or not
+# a byte moved. An mtime predicate would therefore report "changed" on every run
+# and restart the whole fleet — today's behaviour wearing a conditional, which is
+# worse than today's because it would look fixed. (This is the same trap
+# DIVE-2287's freeze observer documents two functions down, for the same file.)
+#
+# The path is hashed alongside the bytes, so a file APPEARING or being REMOVED
+# moves the fingerprint too — a deleted skill is a payload change.
+_agent_payload_fingerprint() {
+  local home="${1:-}" lib="${2:-${LIB_DIR:-/usr/local/lib/5dive}}"
+  [[ -n "$home" ]] || return 0
+  command -v sha256sum >/dev/null 2>&1 || return 0
+  local p out rel
+  # Build the $HOME-relative payload set from the installer's maps. `[@]-` keeps
+  # this safe under `set -u` if a map is absent (the unit harness extracts this
+  # function on its own), and the .claude entries below mean an empty map still
+  # yields the documented fallback set rather than nothing.
+  local -a rels=()
+  for rel in "${SKILLS_INSTALL_DIR[@]-}" "${TYPE_PERSONA_FILE[@]-}"; do
+    [[ -n "$rel" ]] && rels+=("$rel")
+  done
+  rels+=(".claude/skills" ".claude/CLAUDE.md" \
+         ".claude/plugins/installed_plugins.json" ".claude/settings.json")
+  local -a paths=("$lib/skills")
+  while IFS= read -r rel; do
+    [[ -n "$rel" ]] && paths+=("$home/$rel")
+  done < <(printf '%s\n' "${rels[@]}" | LC_ALL=C sort -u)
+  out=$({
+    for p in "${paths[@]}"; do
+      [[ -e "$p" ]] || continue
+      if [[ -d "$p" ]]; then
+        # -print0/-z/-0 throughout: a path with a space or newline in it must
+        # not split into two hashed entries.
+        find "$p" -type f -print0 2>/dev/null | LC_ALL=C sort -z \
+          | xargs -0 -r sha256sum 2>/dev/null
+      else
+        sha256sum "$p" 2>/dev/null
+      fi
+    done
+  } | sha256sum) || return 0
+  # An agent home we could read NOTHING from yields the hash of the empty
+  # string. Return empty instead: "nothing to hash" and "hashed nothing" must
+  # not be the same value, or an unreadable home would compare equal to itself
+  # across the upgrade and silently never restart.
+  [[ "${out%% *}" == "$(printf '' | sha256sum | awk '{print $1}')" ]] && return 0
+  printf '%s\n' "${out%% *}"
+}
+# <<< DIVE-3172 agent payload fingerprint
 
 cmd_self_update() {
   [[ $# -eq 0 ]] || fail "$E_USAGE" "self-update takes no arguments"
@@ -46,27 +242,55 @@ cmd_self_update() {
   curl -fsSL "https://raw.githubusercontent.com/$(gh_org)/5dive/main/install.sh" -o "$installer" \
     || fail "$E_GENERIC" "failed to fetch installer"
 
-  step "Upgrading 5dive CLI + plugins"
-  # Send installer chatter to stderr so JSON stdout stays parseable.
-  bash "$installer" --upgrade >&2 || fail "$E_GENERIC" "upgrade failed"
-
-  # Restart running agents so the refreshed plugins/CLIs load. Best-effort per
-  # unit — one failed restart shouldn't abort the rest.
-  local -a restarted=() failed=()
+  # DIVE-3172: snapshot each running agent's in-memory payload BEFORE the
+  # upgrade. It has to be taken here — after the upgrade there is nothing left
+  # to compare against, which is why the old code had no predicate to apply.
+  local -a units=() names=() befores=()
   local unit name
   if command -v systemctl >/dev/null 2>&1; then
     while read -r unit; do
       [[ -z "$unit" ]] && continue
       name="${unit#5dive-agent@}"; name="${name%.service}"
-      if systemctl restart "$unit" 2>/dev/null; then
-        step "restarted $name"
-        restarted+=("$name")
-      else
-        warn "failed to restart agent '$name'"
-        failed+=("$name")
-      fi
+      units+=("$unit"); names+=("$name")
+      befores+=("$(_agent_payload_fingerprint "$(_agent_home "$name")")")
     done < <(systemctl list-units '5dive-agent@*' --state=running --no-legend --plain 2>/dev/null | awk '{print $1}')
   fi
+
+  step "Upgrading 5dive CLI + plugins"
+  # Send installer chatter to stderr so JSON stdout stays parseable.
+  bash "$installer" --upgrade >&2 || fail "$E_GENERIC" "upgrade failed"
+
+  # Restart only the agents whose payload actually moved. Best-effort per unit —
+  # one failed restart shouldn't abort the rest.
+  local -a restarted=() failed=() skipped=()
+  local i after before atype why
+  for i in "${!units[@]}"; do
+    name="${names[$i]}"; before="${befores[$i]}"
+    after="$(_agent_payload_fingerprint "$(_agent_home "$name")")"
+    # An agent whose type we cannot read is unmeasurable, which restarts — same
+    # branch as a type with non-derivable config, so a registry miss is safe.
+    atype=$(agent_type "$name" 2>/dev/null) || atype=""
+    if ! _agent_restart_needed "$before" "$after" "$atype"; then
+      step "skipped $name (payload unchanged)"
+      skipped+=("$name")
+      continue
+    fi
+    # Say WHICH reason out loud. "restarted" alone is emitted both by a real
+    # payload change and by a type we simply cannot measure, and an operator
+    # reading the nightly log has to be able to tell those apart — the second one
+    # is the population a TYPE_CONFIG_FILE map would move into the first.
+    why="payload changed"
+    if [[ -n "$before" && -n "$after" && "$before" == "$after" ]]; then
+      why="type '${atype:-unknown}' config not derivable — always restarts"
+    fi
+    if systemctl restart "${units[$i]}" 2>/dev/null; then
+      step "restarted $name ($why)"
+      restarted+=("$name")
+    else
+      warn "failed to restart agent '$name'"
+      failed+=("$name")
+    fi
+  done
 
   # DIVE-1095: refresh the materialized shared team-bot listener. It lives at
   # /opt/5dive/team-bot-listener.ts and is (re)written ONLY by `team-bot shared`,
@@ -85,15 +309,23 @@ cmd_self_update() {
     fi
   fi
 
-  local r f prose
+  local r f s prose
   r=$(json_array "${restarted[@]}")
   f=$(json_array "${failed[@]}")
+  s=$(json_array "${skipped[@]}")
   prose="self-update complete — ${#restarted[@]} agent(s) restarted"
+  # Say the skip count out loud. "0 agents restarted" alone is emitted both by a
+  # CLI-only night (the good case this change exists to produce) and by a box
+  # with no agents running at all, and an operator reading the nightly log has to
+  # be able to tell those apart.
+  (( ${#skipped[@]} )) && prose+=", ${#skipped[@]} skipped (payload unchanged)"
   (( ${#failed[@]} )) && prose+=", ${#failed[@]} failed to restart"
   [[ "$listener_refreshed" == "true" ]] && prose+=", team-bot listener refreshed"
+  # `skipped` is ADDITIVE — `restarted`/`failed` keep their exact prior meaning,
+  # so every existing consumer reads the field it always did.
   ok "$prose" \
-     '{restarted:$r, restarted_count:($r|length), failed:$f, listener_refreshed:$lr}' \
-     --argjson r "$r" --argjson f "$f" --argjson lr "$listener_refreshed"
+     '{restarted:$r, restarted_count:($r|length), skipped:$s, skipped_count:($s|length), failed:$f, listener_refreshed:$lr}' \
+     --argjson r "$r" --argjson f "$f" --argjson s "$s" --argjson lr "$listener_refreshed"
 }
 
 # version_lt A B — true when semver A is strictly older than B (sort -V).
@@ -137,18 +369,47 @@ readonly UPDATE_STALE_AFTER_SECS=$((36 * 3600))
 # resolves to neither: we seed it and answer `unknown`. Reporting a green from
 # an absent record would rebuild the fail-open one layer down.
 #
-# Prints exactly three lines (never fails the caller):
+# DIVE-2306 — AN UNKNOWN THAT WILL NEVER RESOLVE IS ITS OWN ANSWER. Everything
+# above is about the reading; this is about whether the reading can ever be
+# TAKEN on this box. The alarm needs a record it can both write and re-read: the
+# state is derived by comparing the running version against a stored one, so a
+# caller that cannot WRITE the record leaves it exactly where it was, and the
+# next caller is in the identical position. Two ways that happens, and both are
+# silent today:
+#
+#   1. `update --check` runs as an unprivileged operator against a STATE_DIR it
+#      cannot write. It answers `unknown` — honestly — and will answer `unknown`
+#      forever, because nothing it does moves the record.
+#   2. `supervisor --tick` is the caller guaranteed to run as root and therefore
+#      guaranteed able to write, and it NO-OPS unless the enable flag exists. On
+#      a box where the tick is off, (1) may be the only caller there is.
+#
+# In both, "we have not observed a freeze" is indistinguishable from "we cannot
+# observe one" — the alarm is UNARMED, and an unarmed alarm reporting `unknown`
+# reads as a monitor doing its job. So the observation now says which it is.
+# `armed=no` is not a state of the FLEET; it is a statement about this box's
+# ability to answer at all, which is why it is a fourth field and not a fourth
+# value of the state (a consumer reading only the state keeps its exact prior
+# meaning — the same additive rule DIVE-2287 applied one layer up).
+#
+# Prints exactly four lines (never fails the caller):
 #   1  state       moving | frozen | unknown
 #   2  age_secs    seconds since the running version was first observed ('' if unknown)
 #   3  detail      human phrase — always the OBSERVED claim ("not observed to
 #                  change"), never the stronger unobserved one ("did not change")
+#   4  armed       yes | no — whether this box can record the observation at all.
+#                  `no` means the state above cannot change no matter how long
+#                  the fleet stays frozen.
 _CLI_FREEZE_AFTER_SECS=$((7 * 86400))
 _cli_freeze_observe() {
   local cur="${1:-}" record="${2:-}" now="${3:-}"
-  _cfo_out() { printf '%s\n%s\n%s\n' "$1" "$2" "$3"; }
+  # 4th arg defaults to `yes`: every site that reaches a conclusion FROM a
+  # readable record is by construction armed, so only the unrecordable paths
+  # have to say so.
+  _cfo_out() { printf '%s\n%s\n%s\n%s\n' "$1" "$2" "$3" "${4:-yes}"; }
   [[ -n "$now" ]] || now=$(date +%s)
-  [[ -n "$cur" ]] || { _cfo_out unknown "" "the running version is unreadable"; return 0; }
-  [[ -n "$record" ]] || { _cfo_out unknown "" "no state dir to record version movement in"; return 0; }
+  [[ -n "$cur" ]] || { _cfo_out unknown "" "the running version is unreadable" no; return 0; }
+  [[ -n "$record" ]] || { _cfo_out unknown "" "no state dir to record version movement in" no; return 0; }
 
   local seen_ver="" seen_at=""
   if [[ -r "$record" ]]; then
@@ -163,16 +424,32 @@ _cli_freeze_observe() {
     # Best-effort write. A read-only STATE_DIR (`update --check` runs as a
     # non-root operator) must not fail the command — it degrades to `unknown`,
     # which is what an unrecordable observation honestly is.
+    #
+    # DIVE-2306: whether the write LANDED is the armed/unarmed answer, and it is
+    # only knowable here. `-w` on the directory is a permission, not an outcome
+    # (a full disk, a read-only mount remounted under us, an immutable file all
+    # pass it), so the flag is set from the redirect's own status.
+    local wrote=0
     if [[ -w "$(dirname "$record")" || -w "$record" ]]; then
-      printf '{"version":%s,"first_seen_epoch":%s,"first_seen_at":%s}\n' \
+      if printf '{"version":%s,"first_seen_epoch":%s,"first_seen_at":%s}\n' \
         "$(printf '%s' "$cur" | jq -R .)" "$now" \
         "$(date -u -d "@$now" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null | jq -R .)" \
-        > "$record" 2>/dev/null || true
+        > "$record" 2>/dev/null; then
+        wrote=1
+      fi
     fi
+    local armed=no; (( wrote )) && armed=yes
     if [[ -n "$seen_ver" && "$seen_ver" != "$cur" ]]; then
-      _cfo_out moving "0" "version changed ${seen_ver} -> ${cur}"
-    else
+      # An unwritable record here is the sharpest case: the version DID move,
+      # the record still names the old one, and every future call re-reports
+      # this same "changed" — a monitor stuck on a transition it can never
+      # leave. Loud in the state, honest in `armed`.
+      _cfo_out moving "0" "version changed ${seen_ver} -> ${cur}" "$armed"
+    elif (( wrote )); then
       _cfo_out unknown "" "no prior observation of this box's version — clock starts now"
+    else
+      _cfo_out unknown "" \
+        "the version observation cannot be recorded on this box (${record} is not writable by this caller) — the freeze alarm is UNARMED and will stay unknown" no
     fi
     return 0
   fi
@@ -411,6 +688,11 @@ cmd_update_check() {
   local -a fz=()
   mapfile -t fz < <(_cli_freeze_observe "$current" "${STATE_DIR}/cli-version-seen.json")
   local frozen_state="${fz[0]:-unknown}" frozen_age="${fz[1]:-}" frozen_detail="${fz[2]:-}"
+  # DIVE-2306. `update --check` is the caller most likely to be UNARMED — it is
+  # the unprivileged one — and it is also the caller a human runs by hand, so it
+  # is where "this box cannot answer that question" has to be said.
+  local frozen_armed="${fz[3]:-yes}" frozen_armed_json=true
+  [[ "$frozen_armed" == yes ]] || frozen_armed_json=false
 
   local prose
   if [[ "$behind" == true ]]; then
@@ -422,6 +704,9 @@ cmd_update_check() {
     prose="CLI $current is up to date"
   fi
   [[ "$frozen_state" == frozen ]] && prose+=" · ⚠ $frozen_detail"
+  # An unarmed alarm never says "frozen", so this line is the only thing that
+  # distinguishes a fleet that is moving from one nobody is watching.
+  [[ "$frozen_armed_json" == false ]] && prose+=" · ⚠ freeze alarm UNARMED: $frozen_detail"
 
   # `behind`/`stale` keep their existing meaning and are only ever emitted on
   # the consistent path — the indeterminate branch above exits before here, so
@@ -435,9 +720,10 @@ cmd_update_check() {
   # or unwritable record is "unknown", and a caller must not be able to read a
   # green out of an observation we never made.
   ok "$prose" \
-     '{current:$cur, latest:$lat, behind:$beh, ahead:$ahd, stale:$stl, frozen:$fz, frozenAgeSec:$fza, frozenDetail:$fzd, lastUpdateOk:$luo, lastUpdateAt:$lua, source:$src}' \
+     '{current:$cur, latest:$lat, behind:$beh, ahead:$ahd, stale:$stl, frozen:$fz, frozenAgeSec:$fza, frozenDetail:$fzd, frozenArmed:$fzarm, lastUpdateOk:$luo, lastUpdateAt:$lua, source:$src}' \
      --arg cur "$current" --arg lat "$latest" --arg src "$detail" \
      --arg fz "$frozen_state" --arg fzd "$frozen_detail" \
+     --argjson fzarm "$frozen_armed_json" \
      --argjson fza "${frozen_age:-null}" \
      --argjson beh "$behind" --argjson ahd "$ahead" --argjson stl "$stale" \
      --argjson luo "$last_ok_json" --argjson lua "$last_at_json"

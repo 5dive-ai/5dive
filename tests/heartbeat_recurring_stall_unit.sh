@@ -79,7 +79,13 @@ CREATE TABLE tasks (
   id INTEGER PRIMARY KEY, ident TEXT, title TEXT, status TEXT, assignee TEXT,
   kind TEXT NOT NULL DEFAULT 'standard', created_at TEXT, started_at TEXT,
   from_template_id INTEGER, parked_at TEXT, need_type TEXT, need_answered_at TEXT,
-  recurring_stall_pinged_at TEXT, schedule TEXT
+  recurring_stall_pinged_at TEXT, schedule TEXT,
+  -- DIVE-2272: rung 1's SELECT now also reads the TEMPLATE's overlap policy, so
+  -- that its notice can stop asserting "the next slot is suppressed" on a
+  -- template where later slots keep firing. This fixture re-creates the schema by
+  -- hand, so a column the live query reads must be added here or the extracted
+  -- predicate fails to parse and every arm below goes vacuous.
+  on_overlap TEXT
 );
 -- the template itself
 INSERT INTO tasks (id,ident,status,kind,schedule,created_at) VALUES

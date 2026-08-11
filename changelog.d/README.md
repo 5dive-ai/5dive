@@ -31,3 +31,13 @@ commit, never main), folds every fragment here into `CHANGELOG.md`'s top
 tree only*. Fragments are not deleted from main by this step — same
 "Unreleased never clears off main" property `CHANGELOG.md` itself already has
 (see the header of `scripts/stamp-changelog.sh`); this is not a new limitation.
+
+**So how does the next cut not fold it twice?** It checks (DIVE-2702). A fragment
+still sitting on main that is *byte-identical* to the copy the previous release
+tag's parent carried has already shipped, so the fold skips it. Two consequences
+worth knowing when you write one:
+
+- Leaving your fragment on main after it ships is expected. Nothing to clean up.
+- **Editing** a fragment after it shipped makes it new content, so it folds again
+  and the entry appears in a second release's notes. If that is not what you want,
+  write a new fragment instead of editing the shipped one.
