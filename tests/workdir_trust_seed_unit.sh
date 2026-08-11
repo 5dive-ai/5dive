@@ -258,5 +258,9 @@ for m in M2 M3 M4 M5 M6; do
 done
 
 echo
-if (( fail )); then echo "RESULT: FAIL"; exit 1; fi
-echo "RESULT: PASS"
+if (( fail )); then echo "RESULT: FAIL"; else echo "RESULT: PASS"; fi
+# DIVE-2003/DIVE-2018: the LAST EXECUTABLE LINE must name the verdict variable, or
+# tests/meta/harness-verdict-probe.sh reports UNPROBEABLE and changed-harnesses fails.
+# The old tail exited from inside the `if` and ended on a bare `echo`, which names
+# nothing. Same shape as tests/names_the_tree_contract_unit.sh's tail.
+[[ "$fail" -eq 0 ]]
