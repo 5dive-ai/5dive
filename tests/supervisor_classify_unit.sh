@@ -81,5 +81,71 @@ t "regression: goal-drift still fires with no stranded work" \
 t "regression: plain has_work -> healthy/(no cause)" \
   $'healthy\x1f' "$(cls "" 1 active s unknown n/a 0 1 -1 false "" "" 0)"
 
+
+# --- DIVE-3272: the OUTPUT classes -------------------------------------------
+# args 14/15/16 are open_rows, no_output_days, quota_excerpt. Every `cls` call
+# above omits them on purpose: their defaults (0 / -1 / "") must leave every
+# pre-existing verdict byte-identical, which is what those regressions assert.
+N=$_SUP_T_NO_OUTPUT_DAYS
+
+# The incident shape itself: a seat holding open rows, transcript moving, unit
+# and tmux fine — which used to print `healthy / active`.
+t "DIVE-3272: open rows + drought past N -> no-output (this is the incident)" \
+  $'no-output\x1fno-output' "$(cls "" 1 active s unknown n/a 0 1 -1 false "" "" 0 20 "$N" "")"
+t "DIVE-3272: drought past N with NO active work still flags (claiming is not required)" \
+  $'no-output\x1fno-output' "$(cls "" 1 active s unknown n/a 0 0 -1 false "" "" 0 20 $((N + 5)) "")"
+
+# --- the two halves are only meaningful together -----------------------------
+t "DIVE-3272: drought but ZERO open rows -> healthy (a correctly idle seat)" \
+  $'healthy\x1f' "$(cls "" 1 active s unknown n/a 0 0 -1 false "" "" 0 0 $((N + 90)) "")"
+t "DIVE-3272: open rows but closed something today -> healthy (a busy seat)" \
+  $'healthy\x1f' "$(cls "" 1 active s unknown n/a 0 1 -1 false "" "" 0 20 0 "")"
+t "DIVE-3272: one day short of N -> healthy (threshold is >=, not >)" \
+  $'healthy\x1f' "$(cls "" 1 active s unknown n/a 0 1 -1 false "" "" 0 20 $((N - 1)) "")"
+t "DIVE-3272: never closed anything (days=-1) -> healthy, NOT no-output" \
+  $'healthy\x1f' "$(cls "" 1 active s unknown n/a 0 1 -1 false "" "" 0 20 -1 "")"
+
+# --- precedence: below the hard dead signals, ABOVE the ones that hid it ------
+t "DIVE-3272: service-dead still wins over no-output (more specific)" \
+  $'stuck\x1fservice-dead' "$(cls "" 0 active s unknown n/a 0 1 -1 false "" "" 0 20 "$N" "")"
+t "DIVE-3272: no-progress still wins over no-output" \
+  $'stuck\x1fno-progress' "$(cls "" 1 active s unknown n/a 0 1 $((_SUP_T_STUCK_MIN * 60)) false "" "" 0 20 "$N" "")"
+t "DIVE-3272: no-output BEATS stale-cli (a box notice must not mask a dark seat)" \
+  $'no-output\x1fno-output' "$(cls "" 1 active s unknown n/a 0 0 -1 true "" "" 0 20 "$N" "")"
+t "DIVE-3272: no-output BEATS slow" \
+  $'no-output\x1fno-output' "$(cls "" 1 active s unknown n/a 0 1 $((_SUP_T_SLOW_MIN * 60)) false "" "" 0 20 "$N" "")"
+t "DIVE-3272: no-output BEATS drift" \
+  $'no-output\x1fno-output' "$(cls "" 1 active s unknown n/a 0 0 -1 false "42" "" 0 20 "$N" "")"
+t "DIVE-3272: no-output BEATS stalled/idle-stranded" \
+  $'no-output\x1fno-output' "$(cls "" 1 active s unknown n/a 0 0 -1 false "" "" 5 20 "$N" "")"
+
+# --- the quota class ---------------------------------------------------------
+t "DIVE-3272: quota signature -> quota-exhausted" \
+  $'quota-exhausted\x1fquota-exhausted' "$(cls "" 1 active s unknown n/a 0 1 -1 false "" "" 0 0 -1 "429 quota exhausted")"
+t "DIVE-3272: quota-exhausted beats loop-stuck and no-progress (it explains them)" \
+  $'quota-exhausted\x1fquota-exhausted' "$(cls "" 1 active s unknown n/a 1 1 $((_SUP_T_STUCK_MIN * 60)) false "" "" 0 20 "$N" "429 quota exhausted")"
+t "DIVE-3272: verify-challenge still outranks quota-exhausted" \
+  $'verify-challenge\x1fid-verification' "$(cls "" 1 active s unknown n/a 0 1 -1 false "" "ID check pane" 0 0 -1 "429 quota exhausted")"
+t "DIVE-3272: tmux-dead still outranks quota-exhausted (dead unit is more specific)" \
+  $'stuck\x1ftmux-dead' "$(cls "" 1 active s dead n/a 0 1 -1 false "" "" 0 0 -1 "429 quota exhausted")"
+
+# --- the quota REGEX, isolated (no tmux) -------------------------------------
+q() { printf '%s\n' "$1" | _sup_quota_match; }
+# The verbatim line off dev3's pane on 2026-08-11 — the whole reason this exists.
+t "DIVE-3272 regex: dev3's real 429 line matches" "MATCH" \
+  "$( [[ -n "$(q '● API Error: Request rejected (429) · Your token-plan 1-week quota has been exhausted.')" ]] && echo MATCH || echo MISS )"
+t "DIVE-3272 regex: the spend-limit phrasing matches" "MATCH" \
+  "$( [[ -n "$(q "You've hit your monthly spend limit. Opus 5 5h: 0% 1w: 100%")" ]] && echo MATCH || echo MISS )"
+t "DIVE-3272 regex: insufficient_quota matches" "MATCH" \
+  "$( [[ -n "$(q 'openai error: insufficient_quota')" ]] && echo MATCH || echo MISS )"
+# Negative controls with a NON-ZERO expected value: these are the false
+# positives that would page main about a healthy seat.
+t "DIVE-3272 regex: an HTTP 429 in ordinary prose does NOT match" "MISS" \
+  "$( [[ -n "$(q 'we should retry on 429 responses from the upstream')" ]] && echo MATCH || echo MISS )"
+t "DIVE-3272 regex: a bare 4290 does NOT match" "MISS" \
+  "$( [[ -n "$(q 'total tokens: 4290')" ]] && echo MATCH || echo MISS )"
+t "DIVE-3272 regex: an empty pane does NOT match" "MISS" \
+  "$( [[ -n "$(q '')" ]] && echo MATCH || echo MISS )"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

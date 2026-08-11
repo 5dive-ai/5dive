@@ -85,6 +85,69 @@ the arms are wired to the logic they grade. It says nothing whatever about an ax
 mutation moves — and a harness that reaches the rule the way the exploit does cannot grade
 the exploit. Fixture filers are now unix principals (pinned uid + passwd seam) rather than
 argv strings, so the derivation ladder under test is the shipped one.
+## Unreleased — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
+
+A gate reaches the filer's lead only if `_GATE_ENG_SHIP_RX` matches the ask or the row
+title. `gate_builder_routing` is OFF by default, so for an ordinary builder ship gate that
+regex is the ONLY live route. Miss it and `routed_reviewer` stays NULL — and an empty
+`routed_reviewer` is the first clause of `cmd_task_inbox`'s human predicate, so **an
+unrouted gate IS a founder gate.** `--tier=1` is no protection: tier and routing are
+separate axes and only routing keeps a gate off the founder.
+
+Measured 2026-08-11 filing DIVE-3224's own push gate — the row about gates reaching the
+founder wrongly. `--ask="Push dive-3224-inbox to 5dive-cli AND 5dive-plugins and open both
+PRs?"` returned `OK — DIVE-3224 needs a human (approval, tier 1)`. Lowercased, "open both
+PRs" is `prs`, and the regex member is `\bpr\b` — the word boundary fails. `push … to
+5dive-cli` misses `push .*(branch|for review|…)` too. Two near-misses in one sentence that
+was entirely about pushing a branch and opening PRs. Re-worded to "Push-for-review: … open
+a pull request on each?", same command and flags: `routed to main for lead review`.
+
+- **Row state now routes it (`row-ship-state`).** A `Branch: <name>` line is structured
+  state, written through `task set-branch` / `task add --branch` and validated to a git
+  ref-name there — the same binding `5dive push` requires before it will push the row, read
+  through the same parser (`_push_branch_from_body`). A branch-bound row IS a ship handoff
+  whatever the ask says. Read the binding; do not parse prose for it.
+- **Deliberately NOT a widened regex.** `prs`, `PR's`, `pull-request` and the next synonym
+  are unbounded and each addition looks locally correct. This removes the class for rows
+  that already record the answer instead of enlarging the classifier.
+- **Routing only.** It does not feed the DIVE-1359 tier downgrade. Tier decides CLEARANCE,
+  routing decides WHO IS WOKEN, and widening a tier control to unblock a routing complaint
+  is how a safety control gets widened mid-ship. Guards are eng-ship's own (`tier_floored=0`,
+  the three routable types); the DIVE-1957 explicit-`--tier=2` veto and the DIVE-2241
+  `_needs_human` backstop both run below it and are graded crossing it unchanged.
+- **`eng-ship` still wins the trigger name** when both apply, so every receipt that exists
+  today is byte-for-byte unchanged and `row-ship-state` appears only where the prose
+  classifier came up empty. `route_provenance` stays `chart` — the TARGET still came from
+  the org chart, and basis and trigger are different facts.
+- **The unrouted receipt now names the axis that decided.** The routed arm has printed WHO
+  and WHY since DIVE-2093; this arm printed a cheerful `OK` and nothing else, so the only
+  difference between "routed to your lead" and "landed on the founder" was a clause that
+  ISN'T THERE — and a reader cannot see an absent clause. It now prints `[NOT ROUTED — no
+  lead was named, so this gate sits on the PAIRED HUMAN: <reason>]`, with five
+  distinguishable reasons (declared human class · secret by type · T2 category floor, naming
+  the term · explicit `--tier=2` · not routable by type · no kind matched, naming the lead
+  that was skipped and the `set-branch` remedy · no lead in the chart, which takes the
+  OPPOSITE remedy and must not be told to re-word). JSON gains `routed_to:null` and
+  `route_declined`. This half is the one that generalises: it cannot make the classifier
+  right, but it converts every silent miss into a visible one, including the ones no row
+  binding can catch.
+
+Same class as DIVE-3265 one subsystem over, where the merge gate scraped a branch name out
+of the maker's result prose and demanded that phantom branch land: **a control that infers
+structured state by parsing prose.** Read the binding, read the row's fields, never parse
+prose for identifiers.
+
+- **Tests:** new `tests/gate_row_state_routing_unit.sh` **27/0** (nightly — 29.1s, sibling
+  of `gate_ship_routing_unit.sh`'s 27.5s). Includes a PREMISE arm that asserts the DIVE-3224
+  ask still misses `_gate_eng_ship_hit` directly, so if the regex ever grows to cover it the
+  harness says the row-state cases stopped isolating anything instead of going quietly green;
+  a negative control on the identical ask with no binding; and C6, a body that merely
+  MENTIONS a branch in prose, which must NOT route — that is the whole distinction the fix
+  rests on. Touched-harness set re-run green: 29/29 (`gate_ship_routing`, `gate_route_why`,
+  `gate_route_delivery`, `gate_verifier_route`, `gate_tier2_explicit_pin`,
+  `gate_needs_capability`, `gate_lead_standing`, `gate_root_filer_standing_route`,
+  `gate_access_lead_clear`, `gate_internal_ops_floor`, `task_needs_human_parity`,
+  `task_inbox_json_tier`, `push_unit`, `broker_surface`, + 15 more).
 
 ## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
 

@@ -10512,6 +10512,47 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
     fi
   fi
 
+  # DIVE-3266: ROUTE ON ROW STATE, NOT ON THE ASK'S PROSE.
+  #
+  # Every routable KIND above classifies by reading text a human wrote for a human —
+  # `_eng_ship` is a regex over the ask and the title, and with gate_builder_routing
+  # OFF (the default) it is the ONLY live route for an ordinary builder ship gate.
+  # Miss the regex and `routed_reviewer` stays NULL, which is the first clause of
+  # cmd_task_inbox's human predicate: an unrouted gate IS a founder gate. Measured
+  # 2026-08-11 filing DIVE-3224's own push gate — "open both PRs" lowercases to
+  # `prs` and the member is `\bpr\b`, so the word boundary fails on a sentence that
+  # was entirely about pushing a branch and opening PRs.
+  #
+  # A `Branch: <name>` line is the opposite kind of input: STRUCTURED STATE, written
+  # deliberately by `task set-branch` / `task add --branch` and validated to a git
+  # ref-name there. It is the same binding `5dive push` requires before it will push
+  # this row, so a branch-bound row IS a ship handoff whatever the ask's wording is.
+  # Read the binding; do not parse prose for it.
+  #
+  # NOT a widened regex (`prs`, `PR's`, `pull-request`, the next synonym — unbounded,
+  # and each addition looks locally correct). This removes the class for rows that
+  # already record the answer instead of enlarging the classifier.
+  #
+  # Scoped to ROUTING ONLY, deliberately. It does NOT feed the DIVE-1359 tier
+  # downgrade: tier decides CLEARANCE, routing decides WHO IS WOKEN, and widening a
+  # tier control to unblock a routing complaint is how a safety control gets widened
+  # mid-ship. Same guards as eng-ship (tier_floored=0, the three routable types), and
+  # the DIVE-1957 `--tier=2` veto plus the DIVE-2241 `_needs_human` backstop both run
+  # BELOW this line, so a pinned or human-class gate still crosses it untouched.
+  # Sibling instance of the same defect, one subsystem over: DIVE-3265, where the
+  # merge gate scraped a branch name out of the maker's result prose and then demanded
+  # that phantom branch land.
+  local _row_ship=0
+  if [[ "$tier_floored" == "0" && ( "$type" == "decision" || "$type" == "approval" || "$type" == "manual" ) ]]; then
+    local _rowship_body _rowship_branch=""
+    _rowship_body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
+    # Split rather than `[[ … ]] && v=$(f)`: an assignment's rc is its last command
+    # substitution's, so the helper's non-zero on "no binding" would leak into the
+    # compound (the DIVE-2751 shape). Absorbed here instead of argued about.
+    _rowship_branch=$(_push_branch_from_body "$_rowship_body" 2>/dev/null) || _rowship_branch=""
+    [[ -n "$_rowship_branch" ]] && _row_ship=1
+  fi
+
   local _routable=0
   case "$type" in
     decision) [[ "$tier" != "2" ]] && _routable=1 ;;
@@ -10531,6 +10572,10 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
   # DIVE-1359: an eng-ship gate is lead-routed by kind (set above), so it is
   # always routable regardless of type default / explicit --tier.
   [[ "$_eng_ship" == "1" ]] && _routable=1
+  # DIVE-3266: a branch-bound row is lead-routed BY ROW STATE, for the same reason
+  # eng-ship is by kind — routable-but-pref-gated would leave the human pinged, and
+  # who is pinged is the entire complaint.
+  [[ "$_row_ship" == "1" ]] && _routable=1
   # DIVE-1381: a content-curation gate is likewise lead-routed by kind.
   [[ "$_curation" == "1" ]] && _routable=1
   # DIVE-1480: an internal-ops/recovery gate the destructive floor over-fired on is
@@ -10636,7 +10681,9 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
     # pref for the same reason eng-ship does. Routable-but-pref-gated would have left
     # answer A moving the TIER while the human still got the ping -- two layers, and
     # only the second one decides who is woken.
-    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_curation" == "1" || "$_internal_ops" == "1" || "$_discusses_applied" == "1" || "$_verifier_route" == "1" || "$_floored_by_title" == "1" || "$_standing_route" == "1" ]]; then
+    # DIVE-3266: row-state ship routing bypasses the pref too — a branch binding is a
+    # harder fact than any regex hit, so pref-gating it would re-open the exact hole.
+    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_row_ship" == "1" || "$_curation" == "1" || "$_internal_ops" == "1" || "$_discusses_applied" == "1" || "$_verifier_route" == "1" || "$_floored_by_title" == "1" || "$_standing_route" == "1" ]]; then
       # DIVE-1495: a verifier-route targets the task's verifier directly; every
       # other kind resolves the filer's lead via the org chart.
       local _reviewer
@@ -10688,6 +10735,11 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
         if   [[ "$_verifier_route"   == "1" ]]; then _rtrigger="verifier-route"
         elif [[ "$type"              == "access" ]]; then _rtrigger="access-type"
         elif [[ "$_eng_ship"         == "1" ]]; then _rtrigger="eng-ship"
+        # DIVE-3266: BELOW eng-ship on purpose. When the ask/title already read as an
+        # eng ship, that is what the filer can act on and every existing receipt stays
+        # byte-for-byte; `row-ship-state` is named only when the BINDING is the sole
+        # reason this routed — i.e. exactly the case the prose classifier missed.
+        elif [[ "$_row_ship"         == "1" ]]; then _rtrigger="row-ship-state"
         elif [[ "$_curation"         == "1" ]]; then _rtrigger="curation"
         elif [[ "$_internal_ops"     == "1" ]]; then _rtrigger="internal-ops"
         elif [[ "$_discusses_applied" == "1" ]]; then _rtrigger="declared-discussion"
@@ -11017,9 +11069,50 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
     notified=0
     unnotified_note=" [UNNOTIFIED — nobody was pinged; answer on the dashboard or: 5dive task answer ${ident}]"
   fi
-  ok "$ident needs a human ($type, tier $tier)${floor_note}${prec_note}${unnotified_note} — $ask" \
-     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), floor_term:(($ft|select(length>0)) // null), needs_capability:(($nc|select(length>0)) // null), needs_human:($nh=="1"), rubber_stamp_ok:(($rs|select(length>0)) // null), notified:($nf=="1"), ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), precedent_ref:(($pr|select(length>0)|tonumber?) // null), assignee:$ac}' \
-     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg ft "$floor_term" --arg nc "$needs" --arg nh "$_needs_human" --arg rs "$rubber_stamp" --arg nf "$notified" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg pr "$precedent_ref" --arg ac "$actor"
+  # DIVE-3266: SAY THAT IT DID NOT ROUTE, AND NAME THE AXIS THAT DECIDED.
+  #
+  # Reaching here means routed_reviewer is NULL, and an empty routed_reviewer is the
+  # FIRST clause of cmd_task_inbox's human predicate — so this gate is the paired
+  # human's. The routed arm has printed WHO and WHY since DIVE-2093; this arm printed
+  # a cheerful `OK — <id> needs a human (approval, tier 1)` and nothing else, so the
+  # only difference between "routed to your lead" and "landed on the founder" was a
+  # clause that ISN'T THERE. A reader cannot see an absent clause, and `--tier=1` is
+  # no protection: tier and routing are separate axes and only routing keeps a gate
+  # off the founder. Measured on DIVE-3224 (both receipts in this row's body).
+  #
+  # This is the cheap half of the fix and it is the half that generalises: it cannot
+  # make the classifier right, but it converts a SILENT miss into a visible one, for
+  # every miss including the ones no row-state binding can catch. Unconditional on
+  # purpose — the DIVE-1955 wallpaper test asks whether a warning fires where nothing
+  # is wrong, and here nothing is ever "not wrong": the founder is being woken every
+  # time this line prints, and the reasons differ, so the reason is the payload.
+  local _nr_reason
+  if [[ "$_needs_human" == "1" ]]; then
+    _nr_reason="a human-class capability was declared (--needs=${needs}), which resolves to the human by constant, not by lookup"
+  elif [[ "$type" == "secret" ]]; then
+    _nr_reason="secret gates are human-only by type and never route"
+  elif [[ "$tier_floored" == "1" ]]; then
+    _nr_reason="the T2 category floor fired${floor_term:+ on '${floor_term}'}, and a floored gate is human-only by class"
+  elif [[ "$tier_arg" == "2" ]]; then
+    _nr_reason="you passed --tier=2, a hard-human contract no routing kind may cross"
+  elif [[ "$_routable" != "1" ]]; then
+    _nr_reason="a $type at tier $tier is not routable by type"
+  else
+    # Routable, and it still did not route. Both remaining causes are invisible at
+    # the filing site, and they take OPPOSITE remedies — re-word vs. do not bother.
+    local _nr_rev _nr_pref
+    _nr_rev=$(_gate_route_reviewer "$(task_actor "")") || _nr_rev=""
+    _nr_pref=$(_task_pref_get gate_builder_routing); _nr_pref="${_nr_pref:-off}"
+    if [[ -z "$_nr_rev" ]]; then
+      _nr_reason="the org chart resolves no lead above $(task_actor "") (for the chart's root the coordinator fallback resolves to themselves), so re-wording or re-filing will not route it either"
+    else
+      _nr_reason="no routing kind matched — the ask and the row TITLE did not read as an eng ship, and this row carries no 'Branch:' binding — and gate_builder_routing is ${_nr_pref}, so ${_nr_rev} was never considered. Bind the branch (5dive task set-branch ${ident} <branch>) or say 'push-for-review'/'pull request' in the ask, then re-file"
+    fi
+  fi
+  local _nr_note=" [NOT ROUTED — no lead was named, so this gate sits on the PAIRED HUMAN: ${_nr_reason}]"
+  ok "$ident needs a human ($type, tier $tier)${floor_note}${prec_note}${unnotified_note}${_nr_note} — $ask" \
+     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), floor_term:(($ft|select(length>0)) // null), needs_capability:(($nc|select(length>0)) // null), needs_human:($nh=="1"), rubber_stamp_ok:(($rs|select(length>0)) // null), notified:($nf=="1"), routed_to:null, route_declined:$rd, ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), precedent_ref:(($pr|select(length>0)|tonumber?) // null), assignee:$ac}' \
+     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg ft "$floor_term" --arg nc "$needs" --arg nh "$_needs_human" --arg rs "$rubber_stamp" --arg nf "$notified" --arg rd "$_nr_reason" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg pr "$precedent_ref" --arg ac "$actor"
 }
 
 # _task_owner_channel — resolve the filing agent's bot token + the per-type
