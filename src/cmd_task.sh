@@ -22,6 +22,7 @@ _task_usage() {
   wip-cap-install [--relane=<lane>]             snapshot each lane's actionable count as its
                                                 frozen WIP ceiling (deliberate, once)
   set-budget <id> <tokens|\$cost|none>           raise/lower the token budget, or 'none' to exempt
+  set-overlap <tmpl> <skip|spawn> [bound]       recurring template: does an open instance suppress the next slot?
                                                 the row from the enforced ${_TASK_BUDGET_BUILTIN:-5000000}-token default
 
   start <id>                                    -> in_progress
@@ -198,6 +199,7 @@ cmd_task() {
     set-body)        cmd_task_set_body "$@" ;;
     set-title)       cmd_task_set_title "$@" ;;
     set-budget)      cmd_task_set_budget "$@" ;;
+    set-overlap)     cmd_task_set_overlap "$@" ;;
     wip-cap-install) cmd_task_wip_cap_install "$@" ;;
     start)           cmd_task_start "$@" ;;
     done|close)      cmd_task_done "$@" ;;
@@ -433,6 +435,73 @@ cmd_task_wip_cap_install() {
   done < <(db "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL AND assignee!='' AND kind='standard';" 2>/dev/null)
   ok "installed WIP caps for ${installed} lane(s)${lines:+
 $lines}" '{installed:$n}' --argjson n "${installed:-0}"
+}
+
+# DIVE-2272 (decision DIVE-2270). Classify an EXISTING recurring template.
+#
+# WHY A VERB AND NOT ONLY AN `add` FLAG: every template on the board predates the
+# column, and the classification the decision calls for is a per-template judgment
+# its AUTHOR has to make ("would tomorrow's run discharge today's obligation?").
+# Requiring a template to be deleted and re-created to answer that would lose its
+# ident, its history and its last_fired_at — i.e. the cost of classifying would be
+# paid in exactly the record that says whether the beat is healthy.
+cmd_task_set_overlap() {
+  tasks_db_init
+  local task="" pol="" bound=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -*) fail "$E_USAGE" "unknown flag: $1" ;;
+      *)  if [[ -z "$task" ]]; then task="$1"
+          elif [[ -z "$pol" ]]; then pol="$1"
+          elif [[ -z "$bound" ]]; then bound="$1"
+          else fail "$E_USAGE" "unexpected extra argument '$1'"; fi ;;
+    esac
+    shift
+  done
+  [[ -n "$task" && -n "$pol" ]] \
+    || fail "$E_USAGE" "usage: 5dive task set-overlap <template|DIVE-N> <skip|spawn> [bound]  (skip = an open instance suppresses the next slot, today's default; spawn = fire anyway up to <bound> open instances, then skip and record it)"
+  [[ "$pol" == "skip" || "$pol" == "spawn" ]] \
+    || fail "$E_VALIDATION" "bad policy '$pol' (skip|spawn)"
+  if [[ -n "$bound" ]]; then
+    [[ "$pol" == "spawn" ]] \
+      || fail "$E_VALIDATION" "a bound only means anything under 'spawn' (under skip the FIRST open instance already suppresses, so no bound is ever reached)"
+    [[ "$bound" =~ ^[1-9][0-9]*$ ]] || fail "$E_VALIDATION" "bad bound '$bound' (positive integer)"
+  fi
+  resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  local kind; kind=$(db "SELECT kind FROM tasks WHERE id=${id};")
+  [[ "$kind" == "recurring" ]] \
+    || fail "$E_VALIDATION" "$ident is kind='$kind', not a recurring TEMPLATE — the overlap policy governs whether a template's NEXT SLOT fires, and a one-off row has no next slot. Did you mean the template this instance came from? (5dive task show $ident)"
+  local prior prior_bound
+  prior=$(db "SELECT COALESCE(on_overlap,'skip') FROM tasks WHERE id=${id};")
+  prior_bound=$(db "SELECT COALESCE(overlap_bound,'') FROM tasks WHERE id=${id};")
+  # An explicit 'skip' stores 'skip' rather than NULL: "the author looked at this
+  # and chose dedup" and "nobody has classified it yet" are different states, and
+  # the classification pass needs to be able to see which templates it still owes.
+  # The bound is cleared under skip — leaving a stale one would imply a threshold
+  # that nothing consults.
+  local bound_sql="NULL"
+  [[ "$pol" == "spawn" && -n "$bound" ]] && bound_sql="$bound"
+  [[ "$pol" == "spawn" && -z "$bound" && -n "$prior_bound" ]] && bound_sql="$prior_bound"
+  db "UPDATE tasks SET on_overlap=$(sqlq "$pol"), overlap_bound=${bound_sql}, updated_at=datetime('now') WHERE id=${id};"
+  local eff_bound; eff_bound=$(db "SELECT COALESCE(overlap_bound, ${TASKS_OVERLAP_BOUND_DEFAULT:-3}) FROM tasks WHERE id=${id};")
+  local open_now; open_now=$(db "SELECT COUNT(*) FROM tasks WHERE from_template_id=${id} AND status NOT IN ('done','cancelled');" 2>/dev/null) || open_now="?"
+  [[ "$open_now" =~ ^[0-9]+$ ]] || open_now="?"
+  local note=""
+  if [[ "$pol" == "spawn" ]]; then
+    note=" Next slot fires while fewer than ${eff_bound} instances are open (${open_now} now); at the bound it skips and stamps last_skipped_at, exactly as skip does today."
+    # Say the already-over-bound case out loud: switching to spawn does not, by
+    # itself, restart a beat that is already past its threshold.
+    [[ "$open_now" =~ ^[0-9]+$ ]] && (( open_now >= eff_bound )) \
+      && note+=" NOTE: ${open_now} open is ALREADY at/over the bound, so this template stays suppressed until some of those close — switching to spawn did not restart it."
+  else
+    note=" Any open instance now suppresses the next slot (5dive task ls --recurring shows which one under blocked_by)."
+  fi
+  ledger_emit "task.overlap_policy_set" ident="$ident" task_id="$id" \
+    actor="$(task_actor)" \
+    detail="on_overlap ${prior} -> ${pol} (bound ${bound_sql/NULL/default ${TASKS_OVERLAP_BOUND_DEFAULT:-3}})" || true
+  ok "$ident on-overlap ${prior} → ${pol} (bound ${eff_bound}).${note}" \
+     '{ident:$i, on_overlap:$p, prior:$pr, bound:($b|tonumber), open_instances:$o}' \
+     --arg i "$ident" --arg p "$pol" --arg pr "$prior" --arg b "$eff_bound" --arg o "$open_now"
 }
 
 cmd_task_set_budget() {
@@ -1200,6 +1269,7 @@ cmd_task_add() {
     "refusing to write to the production task board from a test run (FIVEDIVE_HARNESS/FIVEDIVE_TEST/FIVEDIVE_E2E/COUNCIL_MOCK/FIVEDIVE_NO_HUMAN_SEND is set and TASKS_DB resolves to $(_task_real_prod_tasks_db)). Point TASKS_DB/STATE_DIR at a throwaway store."
   tasks_db_init
   local body="" priority="medium" assignee="" parent="" from="" recurring="" fresh="" project="dive"
+  local on_overlap="" overlap_bound=""   # DIVE-2272: per-template overlap policy
   local accept="" verify_cmd="" max_iters="" verifier="" task_budget="" no_verify="" branch=""
   local customer_facing="" already_blocked="" materialized=""
   # DIVE-2627: which flag supplied each prose value (see _read_prose_file).
@@ -1221,6 +1291,9 @@ cmd_task_add() {
       --from=*)      from="${1#*=}" ;;
       --recurring=*) recurring="${1#*=}" ;;
       --schedule=*)  recurring="${1#*=}" ;;
+      # DIVE-2272 (decision DIVE-2270): the per-template overlap policy.
+      --on-overlap=*)    on_overlap="${1#*=}" ;;
+      --overlap-bound=*) overlap_bound="${1#*=}" ;;
       --fresh)       fresh="1" ;;
       --no-fresh)    fresh="0" ;;
       # DIVE-476: loop-spec — declarative verify loop persisted on the row so the
@@ -1293,6 +1366,27 @@ cmd_task_add() {
     valid_cron_expr "$recurring" || fail "$E_VALIDATION" "bad --recurring '$recurring' (need a 5-field cron expr, e.g. \"0 2 * * *\")"
     [[ -z "$parent" ]] || fail "$E_VALIDATION" "--recurring can't be combined with --parent (a template has no parent)"
     kind="recurring"; schedule_sql=$(sqlq "$recurring")
+  fi
+  # DIVE-2272: the overlap policy is a property of a TEMPLATE. Refuse it on a
+  # standard row rather than storing a column nothing will ever read — a flag
+  # that is silently inert is the same defect class as a guard that swallows its
+  # own failure, one layer up.
+  local on_overlap_sql="NULL" overlap_bound_sql="NULL"
+  if [[ -n "$on_overlap" || -n "$overlap_bound" ]]; then
+    [[ "$kind" == "recurring" ]] \
+      || fail "$E_VALIDATION" "--on-overlap/--overlap-bound only apply to a recurring TEMPLATE (add --recurring=<cron>); on a one-off task there is no next slot to skip or spawn"
+  fi
+  if [[ -n "$on_overlap" ]]; then
+    [[ "$on_overlap" == "skip" || "$on_overlap" == "spawn" ]] \
+      || fail "$E_VALIDATION" "bad --on-overlap '$on_overlap' (skip|spawn). skip = an open instance suppresses the next slot (the default, today's behaviour); spawn = fire anyway up to --overlap-bound open instances, then skip and record the suppression"
+    on_overlap_sql=$(sqlq "$on_overlap")
+  fi
+  if [[ -n "$overlap_bound" ]]; then
+    [[ "$overlap_bound" =~ ^[1-9][0-9]*$ ]] \
+      || fail "$E_VALIDATION" "bad --overlap-bound '$overlap_bound' (positive integer)"
+    [[ "$on_overlap" == "spawn" ]] \
+      || fail "$E_VALIDATION" "--overlap-bound only means anything with --on-overlap=spawn (under skip the first open instance already suppresses, so there is no bound to reach)"
+    overlap_bound_sql="$overlap_bound"
   fi
   # DIVE-484: resolve the target project (default 'dive'). Accept the key
   # case-insensitively; the row must exist (create one with `5dive project add`).
@@ -1578,11 +1672,13 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
   local derived_actor="$ACTOR_BOARD"
   local id
   id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, derived_actor, parent_id, project_key, kind, schedule, fresh,
-                              acceptance_criteria, verify_command, max_iterations, verifier, task_budget, verify_unavailable)
+                              acceptance_criteria, verify_command, max_iterations, verifier, task_budget, verify_unavailable,
+                              on_overlap, overlap_bound)
            VALUES ($(sqlq "$title"), $(sqlq_or_null "$body"), $(sqlq "$priority"),
                    $(sqlq_or_null "$assignee"), $(sqlq "$creator"), $(sqlq_or_null "$derived_actor"), ${parent_sql}, $(sqlq "$project"),
                    $(sqlq "$kind"), ${schedule_sql}, ${fresh_sql},
-                   $(sqlq_or_null "$accept"), $(sqlq_or_null "$verify_cmd"), ${max_iters:-NULL}, $(sqlq_or_null "$verifier"), $(sqlq_or_null "$task_budget"), $([[ $verify_unavailable == 1 ]] && echo 1 || echo NULL));
+                   $(sqlq_or_null "$accept"), $(sqlq_or_null "$verify_cmd"), ${max_iters:-NULL}, $(sqlq_or_null "$verifier"), $(sqlq_or_null "$task_budget"), $([[ $verify_unavailable == 1 ]] && echo 1 || echo NULL),
+                   ${on_overlap_sql}, ${overlap_bound_sql});
            SELECT last_insert_rowid();")
   # Ident is stamped by the AFTER INSERT trigger from the project's counter, so
   # read it back rather than assuming the DIVE- prefix (DIVE-484).
@@ -1704,14 +1800,14 @@ cmd_task_ls() {
     # regression test asserts against (tests/task_reject_trace_unit.sh, arm C).
     # NB: no inline SQL `--` comments in this string —
     # dbfmt flattens newlines, so a `--` would comment out the rest of the query.
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, need_answered_relay, need_answered_tap_uid, tier, gate_mode, kind, schedule, last_fired_at, last_skipped_at, parked_at, park_reason, wake_at, project_key, maker_agent, verifier,
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, need_answered_relay, need_answered_tap_uid, tier, gate_mode, kind, schedule, last_fired_at, last_skipped_at, on_overlap, overlap_bound, parked_at, park_reason, wake_at, project_key, maker_agent, verifier,
              CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
                   THEN CASE WHEN handoff_ack_at IS NOT NULL THEN 'reviewing' ELSE 'delivered' END
                   ELSE NULL END AS handoff_state,
              handoff_ack_at, handoff_delivered_at, handoff_rejected_at,
              CASE WHEN need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled') THEN 1 ELSE 0 END AS gate_live,
              CASE WHEN verify_unavailable = 1 AND verifier IS NULL AND status NOT IN ('done','cancelled') THEN 1 ELSE 0 END AS verify_unavailable,
-             CASE WHEN kind='recurring' THEN (SELECT i.ident FROM tasks i WHERE i.from_template_id=tasks.id AND i.status NOT IN ('done','cancelled') ORDER BY i.id LIMIT 1) ELSE NULL END AS blocked_by
+             CASE WHEN kind='recurring' THEN CASE WHEN COALESCE(on_overlap,'skip')='spawn' THEN (SELECT CASE WHEN COUNT(*) >= COALESCE(tasks.overlap_bound, ${TASKS_OVERLAP_BOUND_DEFAULT:-3}) THEN 'bound '||COUNT(*)||'/'||COALESCE(tasks.overlap_bound, ${TASKS_OVERLAP_BOUND_DEFAULT:-3}) ELSE NULL END FROM tasks i WHERE i.from_template_id=tasks.id AND i.status NOT IN ('done','cancelled')) ELSE (SELECT i.ident FROM tasks i WHERE i.from_template_id=tasks.id AND i.status NOT IN ('done','cancelled') ORDER BY i.id LIMIT 1) END ELSE NULL END AS blocked_by
            FROM tasks WHERE ${where} ${order};")
     [[ -n "$rows" ]] || rows="[]"
     # Feed rows via stdin, not --argjson: a big board (179+ tasks w/ bodies)
@@ -1726,7 +1822,18 @@ cmd_task_ls() {
     # to go find it. blocked_by is derived live from the same predicate the
     # materializer dedups on, so this listing cannot tell a different story than
     # the scheduler (the DIVE-2055 rule for this table).
-    dbfmt -box "SELECT ident, status, COALESCE(schedule,'-') AS schedule, COALESCE(assignee,'-') AS assignee, COALESCE(last_fired_at,'never') AS last_fired, COALESCE(last_skipped_at,'-') AS last_skipped, COALESCE((SELECT i.ident FROM tasks i WHERE i.from_template_id=tasks.id AND i.status NOT IN ('done','cancelled') ORDER BY i.id LIMIT 1),'-') AS blocked_by, title FROM tasks WHERE ${where} ${order};"
+    #
+    # DIVE-2272: that rule is why blocked_by is now POLICY-AWARE rather than "is
+    # there any open instance". On an on_overlap='spawn' template an open instance
+    # does NOT block — the next slot fires anyway — so printing its ident under a
+    # column named blocked_by would send a reader to close a row that is
+    # suppressing nothing, the same wasted trip DIVE-2273's forged last_skipped_at
+    # sends them on. A spawn template reads '-' until it is AT its bound, and then
+    # reads 'bound N/B', because that is the point at which the scheduler really
+    # does start skipping. The expression reproduces the materializer's own branch,
+    # including the same default bound (TASKS_OVERLAP_BOUND_DEFAULT), so the two
+    # cannot drift.
+    dbfmt -box "SELECT ident, status, COALESCE(schedule,'-') AS schedule, COALESCE(assignee,'-') AS assignee, COALESCE(last_fired_at,'never') AS last_fired, COALESCE(last_skipped_at,'-') AS last_skipped, COALESCE(CASE WHEN kind='recurring' THEN CASE WHEN COALESCE(on_overlap,'skip')='spawn' THEN (SELECT CASE WHEN COUNT(*) >= COALESCE(tasks.overlap_bound, ${TASKS_OVERLAP_BOUND_DEFAULT:-3}) THEN 'bound '||COUNT(*)||'/'||COALESCE(tasks.overlap_bound, ${TASKS_OVERLAP_BOUND_DEFAULT:-3}) ELSE NULL END FROM tasks i WHERE i.from_template_id=tasks.id AND i.status NOT IN ('done','cancelled')) ELSE (SELECT i.ident FROM tasks i WHERE i.from_template_id=tasks.id AND i.status NOT IN ('done','cancelled') ORDER BY i.id LIMIT 1) END ELSE NULL END,'-') AS blocked_by, COALESCE(on_overlap,'skip') AS on_overlap, title FROM tasks WHERE ${where} ${order};"
   else
     # DIVE-2316: the binding audit is a list question — "which closed rows have
     # no pointer?"  Show the column whenever closed rows were requested, and
@@ -6901,13 +7008,36 @@ cmd_task_park() {
     # ident has no spaces, so one row split on the first space keeps this to a
     # single query. Empty when the row is not a materialized instance.
     local _tmpl_row=""
-    _tmpl_row=$(db "SELECT p.ident || ' ' || COALESCE(p.schedule,'?')
+    # DIVE-2272: carry the template's overlap policy. A park's blast radius is
+    # policy-dependent — under skip it stops the beat outright, under spawn it
+    # consumes one bounded slot — and a warning that names the wrong one is worse
+    # than none: it teaches the operator the warning does not mean what it says.
+    # ident/schedule/policy/bound are all whitespace-free EXCEPT schedule (a cron
+    # expr has spaces), so the tail fields are peeled off the RIGHT and whatever
+    # remains in the middle is the schedule.
+    _tmpl_row=$(db "SELECT p.ident || ' ' || COALESCE(p.schedule,'?') || ' ' || COALESCE(p.on_overlap,'skip') || ' ' || COALESCE(p.overlap_bound, ${TASKS_OVERLAP_BOUND_DEFAULT:-3})
                     FROM tasks t JOIN tasks p ON p.id = t.from_template_id
                     WHERE t.id=${tid};" 2>/dev/null || echo "")
     if [[ -n "$_tmpl_row" ]]; then
-      _tmpl_ident="${_tmpl_row%% *}"
-      local _tmpl_sched="${_tmpl_row#* }"
-      warn "$tident is a recurring INSTANCE of ${_tmpl_ident} (schedule: ${_tmpl_sched}) — this park STOPS THAT BEAT, it does not delay one row (DIVE-2877). The materializer counts a parked instance as ${_tmpl_ident}'s open slot, so ${_tmpl_ident} will not fire again until this row is unparked or closed, and the occurrences inside the window are DROPPED with no catch-up. The recurring-stall watchdog skips parked rows, so nothing will report it. If you meant to pause the JOB: park the template instead — '5dive task park ${_tmpl_ident} --reason=<why> --wake=<when>' (a blocked template is skipped by the materializer, and unparking it resumes the schedule). If you meant to skip just THIS occurrence: '5dive task cancel $tident --result=\"<why>\"' — a cancel frees the slot, so the next tick fires normally."
+      local _tmpl_rest _tmpl_pol _tmpl_bound
+      _tmpl_ident="${_tmpl_row%% *}"; _tmpl_rest="${_tmpl_row#* }"
+      _tmpl_bound="${_tmpl_rest##* }"; _tmpl_rest="${_tmpl_rest% *}"
+      _tmpl_pol="${_tmpl_rest##* }";   _tmpl_rest="${_tmpl_rest% *}"
+      local _tmpl_sched="$_tmpl_rest"
+      local _park_blast
+      if [[ "$_tmpl_pol" == "spawn" ]]; then
+        # Under spawn the beat keeps firing, so the honest warning is about the
+        # BOUND, not a stop. Still worth saying: a parked row counts open forever,
+        # the stall watchdog skips parked rows, and enough of them silently
+        # convert a spawn template into a suppressed one.
+        local _park_open
+        _park_open=$(db "SELECT COUNT(*) FROM tasks i JOIN tasks p ON p.id=i.from_template_id WHERE p.ident=$(sqlq "$_tmpl_ident") AND i.status NOT IN ('done','cancelled');" 2>/dev/null) || _park_open="?"
+        [[ "$_park_open" =~ ^[0-9]+$ ]] || _park_open="?"
+        _park_blast="this park does NOT stop that beat — ${_tmpl_ident} is on-overlap=spawn, so later slots keep firing — but it does CONSUME one of its ${_tmpl_bound} overlap slots for as long as it stays parked (the materializer counts a parked instance as open; ${_park_open} open now). At the bound the template degrades to skip-and-stamp, i.e. the beat stops after all, and the recurring-stall watchdog skips parked rows so nothing will report the drift."
+      else
+        _park_blast="this park STOPS THAT BEAT, it does not delay one row (DIVE-2877). The materializer counts a parked instance as ${_tmpl_ident}'s open slot, so ${_tmpl_ident} will not fire again until this row is unparked or closed, and the occurrences inside the window are DROPPED with no catch-up. The recurring-stall watchdog skips parked rows, so nothing will report it."
+      fi
+      warn "$tident is a recurring INSTANCE of ${_tmpl_ident} (schedule: ${_tmpl_sched}) — ${_park_blast} If you meant to pause the JOB: park the template instead — '5dive task park ${_tmpl_ident} --reason=<why> --wake=<when>' (a blocked template is skipped by the materializer, and unparking it resumes the schedule). If you meant to skip just THIS occurrence: '5dive task cancel $tident --result=\"<why>\"' — a cancel frees the slot, so the next tick fires normally."
     fi
   fi
   local wake_note=""; [[ "$wake_sql" != "NULL" ]] && wake_note=" — wakes $(db "SELECT wake_at FROM tasks WHERE id=${tid};") UTC"
@@ -7359,6 +7489,86 @@ _GATE_ENG_SHIP_RX='\bmerg(e|es|ed|ing)\b|pull request|\bpr\b|\bdiff\b|ship it|sh
 _gate_eng_ship_hit() {
   local text; text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
   [[ "$text" =~ $_GATE_ENG_SHIP_RX ]]
+}
+
+# --- DIVE-2093: say WHO the gate routed to and WHY, at FILE TIME --------------
+#
+# The routed `ok` line has always named the reviewer and the ROLE ("routed to
+# main2 for verifier review"). What it never named is the PROPERTY that picked
+# that reviewer, and that omission is the whole defect: three agents in 36 hours
+# (dev3 on DIVE-2084, main on DIVE-2146, olivia right behind them; then main2 on
+# DIVE-2798 and DIVE-2808) filed a gate asking for an ACTION and had it land on
+# the loop's verifier, who could judge the work and could not perform the act.
+# Every one of those cost a round trip, and none of them was visible on the
+# board — a gate pending on the wrong principal renders exactly like a gate
+# pending on the right one.
+#
+# The filer is the only party who knows what the ask actually needs, and the
+# moment of filing is the only moment at which re-filing is free. So the fix is
+# to hand them the routing basis right there instead of leaving them to infer it
+# from an answer that never comes.
+#
+# `basis` is the property that chose the target, NOT the trigger that made the
+# gate routable at all — those are different questions and the filer needs both.
+# `basis` is `tasks.route_provenance` VERBATIM — the same value the row is stamped
+# with, threaded from the one place it is computed rather than re-derived here.
+# DIVE-2093 iteration 3, and the reason is a defect this function shipped with: it
+# used to take a two-valued lead/verifier flag and print the ORG CHART sentence for
+# everything that was not `verifier`. DIVE-3171 then added a THIRD route (the sealed
+# standing lead, which fires precisely when the chart resolves NOBODY), so the
+# catch-all asserted an `agents_org.reports_to` edge that by construction does not
+# exist — a routing explanation naming the wrong property, which is this row's own
+# defect class emitted by the fix for it.
+#
+# THE GENERAL RULE, and it is why the last arm reads the way it does: a catch-all in
+# an EXPLANATION is not a default, it is an assertion about every case you did not
+# enumerate. `*)` is safe when it says "some other reason"; it is a falsehood
+# generator when it names a specific mechanism and cites a specific table. A
+# diagnostic must degrade to UNKNOWN, never to the most common case — the same
+# absent-vs-forbidden reasoning as DIVE-2318.
+# community/wiki/a-why-clause-that-enumerates-bases-lies-about-the-one-it-omits.md
+#
+# _gate_route_why <route_provenance> <reviewer> <filer> <trigger>
+_gate_route_why() {
+  local basis="$1" reviewer="$2" filer="$3" trigger="$4"
+  case "$basis" in
+    verifier-loop)
+      printf 'why: routed by LOOP MEMBERSHIP — %s is this task'"'"'s verifier of record (tasks.verifier). That property carries NO information about which capabilities %s holds, so if this ask needs an ACTION performed (open a PR, push, spend, provision a secret) rather than a judgement made, it is on the wrong desk: re-file with --tier=2, or --needs=<capability>, or hand it to a holder. trigger=%s' \
+        "$reviewer" "$reviewer" "$trigger" ;;
+    seal:standing-lead)
+      printf 'why: routed by the SEALED STANDING LEAD — the org chart resolved NOBODY above %s (they are its root), so this went to %s under the sealed authority.eng_approval_lead and NOT along an agents_org.reports_to edge, which does not exist here (route_provenance=seal:standing-lead, DIVE-3171/2099). That seal names an ENGINEERING-APPROVAL holder and says nothing else about what %s can do, so an ask needing some other capability is still on the wrong desk. trigger=%s' \
+        "${filer:-the filer}" "$reviewer" "$reviewer" "$trigger" ;;
+    chart)
+      printf 'why: routed by the ORG CHART — %s is the lead %s reports to (agents_org.reports_to). trigger=%s' \
+        "$reviewer" "${filer:-the filer}" "$trigger" ;;
+    *)
+      printf 'why: routed to %s by a basis this build does not name (route_provenance=%s) — so this line cannot tell you WHICH property picked them, and you should not read it as the org chart having resolved anybody. Check the routing source before relying on %s being able to answer. trigger=%s' \
+        "$reviewer" "${basis:-<empty>}" "$reviewer" "$trigger" ;;
+  esac
+}
+
+# Can this seat mint a DIVE-756 closure signature? Echoes `<yes|no|unknown>|<class>`.
+#
+# The classes come from the same measurement `agent info` renders
+# (classify_sudo_grant), and the yes/no split is the one DIVE-2760's own answer-
+# time warning already states in prose: root-all and cli-root seats hold sudo for
+# `5dive gate-proof sign`; cli-scoped seats do not.
+#
+# `custom` and `unknown` return UNKNOWN and never `no`. DIVE-2318: an unmeasured
+# grant is the absence of a measurement, not evidence of absence, and the cost of
+# the two errors is asymmetric here — a false `no` sends the filer to re-route a
+# gate that would have cleared fine, on a box where the peer read simply did not
+# work (DIVE-2135 makes that read possible, not guaranteed).
+_gate_seat_can_sign() {
+  local name="$1" grant cls
+  [[ -n "$name" ]] || { printf 'unknown|unknown\n'; return 0; }
+  grant=$(agent_sudo_grant "agent-${name}" 2>/dev/null) || grant=""
+  cls="${grant%%|*}"; [[ -n "$cls" ]] || cls="unknown"
+  case "$cls" in
+    root-all|cli-root) printf 'yes|%s\n' "$cls" ;;
+    cli-scoped|none)   printf 'no|%s\n' "$cls" ;;
+    *)                 printf 'unknown|%s\n' "$cls" ;;
+  esac
 }
 
 # DIVE-2099: the org lead's STANDING authority to clear an ENGINEERING approval
@@ -9726,6 +9936,79 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
         # org chart having resolved somebody, and the whole point of this branch is that
         # it did not — the reader needs to know which source picked this reviewer.
         [[ "$_standing_route" == "1" ]] && _rrole="standing lead review (org root: no chart lead above the filer)"
+        # DIVE-2093: the routable cascade above is a DISJUNCTION, so "which clause
+        # fired" is a short-circuit artefact and not a fact about the gate. Name the
+        # most SPECIFIC kind that applies instead — that is the one the filer can act
+        # on. The pref is reported only when no kind applies, because then it really
+        # is the only reason this gate routed at all.
+        #
+        # DIVE-2093 iteration 3 (main2's blocker 2): the standing arm sits at the BOTTOM,
+        # immediately above the pref. A specific KIND still wins when one applies — the
+        # standing route decides the TARGET, not what made the gate routable — but when
+        # no kind applies, `_standing_route` is why this routed and the pref is NOT, so
+        # reporting `gate_builder_routing=on` there is the same false-basis defect this
+        # row exists to fix, one field over.
+        local _rtrigger
+        if   [[ "$_verifier_route"   == "1" ]]; then _rtrigger="verifier-route"
+        elif [[ "$type"              == "access" ]]; then _rtrigger="access-type"
+        elif [[ "$_eng_ship"         == "1" ]]; then _rtrigger="eng-ship"
+        elif [[ "$_curation"         == "1" ]]; then _rtrigger="curation"
+        elif [[ "$_internal_ops"     == "1" ]]; then _rtrigger="internal-ops"
+        elif [[ "$_discusses_applied" == "1" ]]; then _rtrigger="declared-discussion"
+        elif [[ "$_floored_by_title" == "1" ]]; then _rtrigger="floored-by-title"
+        elif [[ "$_standing_route"   == "1" ]]; then _rtrigger="standing-lead"
+        else _rtrigger="gate_builder_routing=on"
+        fi
+        # DIVE-2093 iteration 3 (main2's blocker 1): the basis is `$_route_prov` ITSELF,
+        # not a second variable derived alongside it. The old code kept `_rbasis` as a
+        # parallel two-valued lead/verifier flag, so DIVE-3171's THIRD route landed in
+        # the catch-all and the prose asserted an `agents_org.reports_to` edge that by
+        # construction does not exist — main's own comment four lines up names that exact
+        # hazard. One assignment now feeds the DB column and the sentence, so they cannot
+        # diverge, and a FOURTH route cannot be added without `_gate_route_why` seeing a
+        # basis string it does not know (which it now reports as unknown, not as chart).
+        local _rwhy
+        _rwhy=$(_gate_route_why "$_route_prov" "$_reviewer" "$(task_actor "")" "$_rtrigger")
+        # DIVE-2093 (2026-08-07 recurrence, DIVE-2808): the sharper variant. Routing
+        # reached a principal who could ANSWER and could not SIGN, which is worse than
+        # the original "could not act", because it fails SILENTLY at answer time and
+        # surfaces on somebody ELSE's command — the board shows an APPROVED gate whose
+        # authorization no privileged path will honour, and a closed-unsigned gate looks
+        # DONE where a pending-on-the-wrong-person one at least looks unfinished.
+        #
+        # DIVE-2760 already warns the ANSWERER when the mint comes back empty, and that
+        # notice fires correctly. It shortens the loop, it does not close it: by then a
+        # diff has been read and an answer given. Filing is the only point at which
+        # nobody has yet acted, so this is where the check belongs.
+        #
+        # Deliberately narrow (DIVE-1955 wallpaper): require_sig is 1 only on the push
+        # and deploy root executors, so this fires only when the ask is push/deploy
+        # shaped. It is a warn and never a `fail` — the same reasoning as DIVE-2760's
+        # write: a gate no broker will ever check is unharmed by an unsigned closure,
+        # and refusing the filing would cost more than the misroute does.
+        local _rsig="" _cs="" _csv="" _csc=""
+        if _gate_eng_ship_hit "$ask" || [[ "$_eng_ship" == "1" ]]; then
+          _cs=$(_gate_seat_can_sign "$_reviewer"); _csv="${_cs%%|*}"; _csc="${_cs#*|}"
+          case "$_csv" in
+            yes) _rsig=" [require_sig: ${_reviewer} can sign this closure (grant=${_csc})]" ;;
+            no)
+              _rsig=" [require_sig: ⚠ ${_reviewer} CANNOT sign this closure (grant=${_csc}) — see the warning above]"
+              warn "$ident routed to $_reviewer, who CANNOT MINT A CLOSURE SIGNATURE (sudo grant: ${_csc})."
+              warn "  This ask is push/deploy shaped, and the root-only executor verifies the"
+              warn "  DIVE-756 signed closure before any delegated push or deploy."
+              warn "  what happens if you leave it: $_reviewer can ANSWER the gate and the board"
+              warn "    will show it APPROVED — but need_answer_sig lands EMPTY, and the push is"
+              warn "    REFUSED later, on the MAKER's command, reading as tampering rather than"
+              warn "    as this (DIVE-2760/2808). 'task answer' is not a re-sign verb, so the"
+              warn "    only repair at that point is to re-file the gate from scratch."
+              warn "  fix: get it answered from a seat that signs — root (\`sudo 5dive task answer"
+              warn "    $ident ...\`) or an agent whose grant is root-all/cli-root; --tier=2 if it"
+              warn "    is genuinely the human's. Do NOT grant \`gate-proof sign\` to a cli-scoped"
+              warn "    seat: it signs arbitrary stdin, so the grant forges ANY closure, human:* included."
+              ;;
+            *) _rsig=" [require_sig: whether ${_reviewer} can sign is NOT MEASURABLE from this seat (grant=${_csc}) — unknown, not a no; check it first if a delegated push is refused later]" ;;
+          esac
+        fi
         # DIVE-2011: the handoff goes through the SAME delivery assertion as the
         # human ping (task_need_notify dispatches on TASK_GATE_ROUTE_TO), so a
         # routed gate can no longer exit without a delivery verdict or leave the
@@ -9775,9 +10058,10 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
           _fbt_term=$(_gate_tier2_floor_term "$_ft_title" 2>/dev/null) || _fbt_term=""
           _fbt=" [floored_by=title: the T2 category floor matched '${_fbt_term}' in the TASK TITLE, not in the ask — escalate to the human if the ask really is asking for that]"
         fi
-        ok "$ident routed to $_reviewer for ${_rrole} ($type, tier $tier)${_rnote}${_fbt} — $ask" \
-           '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), routed_to:$rv, delivery:$ds, notified:($ds=="delivered"), ask:$ak, recommend:(($rc|select(length>0)) // null)}' \
-           --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg rv "$_reviewer" --arg ds "$_rstate" --arg ak "$ask" --arg rc "$recommend"
+        ok "$ident routed to $_reviewer for ${_rrole} ($type, tier $tier)${_rnote}${_fbt}${_rsig} [${_rwhy}] — $ask" \
+           '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), routed_to:$rv, route_basis:$rb, route_trigger:$rt, require_sig_seat:(($cs|select(length>0)) // null), delivery:$ds, notified:($ds=="delivered"), ask:$ak, recommend:(($rc|select(length>0)) // null)}' \
+           --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg rv "$_reviewer" --arg ds "$_rstate" --arg ak "$ask" --arg rc "$recommend" \
+           --arg rb "$_route_prov" --arg rt "$_rtrigger" --arg cs "$_csv"
         # No separate undelivered row: the lead-route row above already carries
         # delivery=<state>, and a second row for the same event is how one send
         # becomes two data points (the re-inflation DIVE-1968 spent a round undoing).
