@@ -1007,6 +1007,56 @@ CREATE TABLE IF NOT EXISTS gate_history (
 );
 CREATE INDEX IF NOT EXISTS gate_history_task_idx ON gate_history(task_id, id);
 
+-- DIVE-3228: the gate CARD in a human's chat, modelled instead of emitted.
+--
+-- THE DEFECT THIS REPLACES. A gate DM was a fire-and-forget emission while every
+-- other surface (inbox, banner, dashboard) re-derives from the row. So the card
+-- froze at the instant it was sent and drifted the moment the row moved, and
+-- `retire` was a best-effort patch on a message we had stopped modelling — it
+-- read chat/message_id back out of gate-notify.log with awk, because the log was
+-- the only record that the message existed at all. Measured 2026-08-11: dev2
+-- filed, withdrew and re-filed gates on DIVE-2272 four times in three minutes;
+-- lodar was buzzed for a gate that had not existed for twelve seconds.
+--
+-- ONE LIVE CARD PER TASK PER CHAT, and the partial unique index is the
+-- enforcement rather than a convention — a second send cannot happen from a path
+-- nobody thought about, which is how the four-in-three-minutes shape arose.
+-- Keyed per CHAT and not per task alone because a gate legitimately reaches more
+-- than one chat: the escalation walks UP the org chart when the filer is unpaired.
+--
+-- `via` is NOT decorative. A message_id is scoped to a BOT-CHAT PAIR (DIVE-2073),
+-- so editing it with the wrong bot's token edits a different message or nothing.
+-- Every later edit resolves the delivering bot's token from this column.
+--
+-- STATES. live = in the chat, tracking the row. deleted = the gate died and the
+-- card went with it. struck = a HUMAN answered; the card is their receipt and
+-- stops following the row (DIVE-3228 main ruling ii). gone = deleted out of band
+-- (they cleared their chat), so the next state change mints a fresh one.
+-- orphaned = the delivering agent was torn down and NOBODY can edit this card;
+-- it is reported, never silently left as a live-looking phantom.
+--
+-- Defined identically inside _tasks_db_migrate for pre-existing stores; keep the
+-- two copies byte-identical (tests/schema_sync_unit.sh).
+CREATE TABLE IF NOT EXISTS gate_cards (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id      INTEGER NOT NULL,
+  ident        TEXT    NOT NULL,
+  gate_epoch   INTEGER NOT NULL DEFAULT 1,
+  ask_shape    TEXT,
+  chat_id      TEXT    NOT NULL,
+  message_id   TEXT    NOT NULL,
+  via          TEXT    NOT NULL,
+  state        TEXT    NOT NULL DEFAULT 'live',
+  minted_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+  updated_at   TEXT,
+  last_error   TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS gate_cards_live_idx ON gate_cards(task_id, chat_id) WHERE state = 'live';
+CREATE INDEX IF NOT EXISTS gate_cards_task_idx ON gate_cards(task_id, id);
+-- The digest's buzz count is a window read over mints (an EDIT does not push, so
+-- a mint is exactly one phone buzz). Indexed because it runs per digest window.
+CREATE INDEX IF NOT EXISTS gate_cards_minted_idx ON gate_cards(minted_at);
+
 -- OSS-21: fleet-wide policy prefs as a tiny key/value store. Currently holds
 -- precedent_autoclear (on|off, default off when the row is absent) — the switch
 -- that lets a resolved tier-1 gate clear itself from proven human precedent.
@@ -2059,6 +2109,44 @@ CREATE TABLE IF NOT EXISTS gate_history (
   gate_mode         TEXT
 );
 CREATE INDEX IF NOT EXISTS gate_history_task_idx ON gate_history(task_id, id);
+MIG
+  fi
+
+  # DIVE-3228 gate_cards — additive, gated on absence, same posture as
+  # gate_history directly above: a brand-new table nothing else references, so
+  # creating it cannot touch the queue and takes no write lock on every command.
+  # Keep this definition byte-identical to the one in _tasks_schema above
+  # (tests/schema_sync_unit.sh).
+  #
+  # STARTS EMPTY AND NO BACKFILL IS POSSIBLE, deliberately. The cards already
+  # sitting in a human's chat were emitted before anything modelled them; their
+  # message_ids exist only in gate-notify.log, and adopting them from a log we are
+  # replacing precisely because it is not a model would import the untrustworthy
+  # half of the old rail into the new one. So pre-existing cards stay with the
+  # log-based retire fallback (_task_gate_deliveries) and age out; the table owns
+  # every card minted from here.
+  local has_gate_cards
+  has_gate_cards=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='gate_cards' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_gate_cards" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" <<'MIG' >/dev/null 2>&1 || true
+CREATE TABLE IF NOT EXISTS gate_cards (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id      INTEGER NOT NULL,
+  ident        TEXT    NOT NULL,
+  gate_epoch   INTEGER NOT NULL DEFAULT 1,
+  ask_shape    TEXT,
+  chat_id      TEXT    NOT NULL,
+  message_id   TEXT    NOT NULL,
+  via          TEXT    NOT NULL,
+  state        TEXT    NOT NULL DEFAULT 'live',
+  minted_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+  updated_at   TEXT,
+  last_error   TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS gate_cards_live_idx ON gate_cards(task_id, chat_id) WHERE state = 'live';
+CREATE INDEX IF NOT EXISTS gate_cards_task_idx ON gate_cards(task_id, id);
+CREATE INDEX IF NOT EXISTS gate_cards_minted_idx ON gate_cards(minted_at);
 MIG
   fi
 

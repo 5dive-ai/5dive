@@ -41,6 +41,24 @@ chk() { # <desc> <expected> <actual>
   else FAIL=$((FAIL+1)); printf 'FAIL %s\n       expected: %s\n       actual:   %s\n' "$1" "$2" "$3"; fi
 }
 
+egress_open() { # -> names of Bot API callers that could still reach the network
+  case "$(command -v curl 2>/dev/null)" in
+    "$TMP/bin/"*) return 0 ;;   # PATH-intercepted curl closes the whole surface
+  esac
+  local fn out=""
+  while IFS= read -r fn; do
+    [[ -n "$fn" ]] || continue
+    declare -f "$fn" 2>/dev/null | grep -q 'api\.telegram\.org' && out="$out $fn"
+  done < <(_egress_names)
+  printf '%s' "$out"
+}
+_egress_names() {
+  awk '/^[_a-zA-Z][_a-zA-Z0-9]*\(\)[[:space:]]*\{/{fn=$1; sub(/\(\).*/,"",fn)}
+       /api\.telegram\.org/{if(fn!="")print fn}' \
+      "$SRC/cmd_agent_runtime.sh" "$SRC/cmd_task.sh" 2>/dev/null | sort -u
+}
+
+
 STATE_DIR="$TMP"; TASKS_DIR="$TMP/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 # DIVE-1506 positive allowlist: this harness deliberately drives the human-facing
 # retire path, so declare its ISOLATED db as prod. Nothing here can reach Telegram
@@ -63,6 +81,24 @@ _mirror_edit_markup() {
   printf '%s|%s|%s\n' "$1" "$2" "$3" >>"$EDITS"
   printf '%s' "$EDIT_RESP"
 }
+# DIVE-3228 added deleteMessage and editMessageText as egress. Stub BOTH here or
+# this harness silently regains a way to reach Telegram — the exact hole the
+# original stub existed to close.
+DELETES="$TMP/deletes"; : >"$DELETES"
+DELETE_RESP='{"ok":true}'
+_mirror_delete_message() {
+  printf '%s|%s|%s\n' "$1" "$2" "$3" >>"$DELETES"
+  printf '%s' "$DELETE_RESP"
+}
+TEXTS="$TMP/texts"; : >"$TEXTS"
+TEXT_RESP='{"ok":true}'
+_mirror_edit_text() {
+  printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" >>"$TEXTS"
+  printf '%s' "$TEXT_RESP"
+}
+deletes() { sort "$DELETES" | tr '\n' ' ' | sed 's/ $//'; }
+texts() { cat "$TEXTS"; }
+reset_deletes() { : >"$DELETES"; : >"$TEXTS"; }
 edits() { sort "$EDITS" | tr '\n' ' ' | sed 's/ $//'; }
 reset_edits() { : >"$EDITS"; }
 
@@ -84,7 +120,7 @@ row ok    DIVE-B,DIVE-A -1001       555  marketing   # batched re-nag, whole-fie
 row ok    DIVE-AA      424242       666  marketing   # substring trap: DIVE-A is a prefix
 
 reset_edits
-_task_gate_retire_buttons DIVE-A "answered by human:test" >/dev/null 2>&1
+_task_gate_card_apply DIVE-A die "answered by human:test" >/dev/null 2>&1
 chk "retires exactly this gate's real messages, deduped" \
     "tok-marketing|-1001|555 tok-marketing|424242|111 tok-marketing|424242|222" "$(edits)"
 
@@ -92,17 +128,17 @@ chk "retires exactly this gate's real messages, deduped" \
 # be editable when it is genuinely in scope, so "444 was skipped" is a property of
 # the filter and not of a helper that edits nothing.
 reset_edits
-_task_gate_retire_buttons DIVE-B "answered by human:test" >/dev/null 2>&1
+_task_gate_card_apply DIVE-B die "answered by human:test" >/dev/null 2>&1
 chk "liveness: the other task's 444 and the shared batch 555 ARE editable for DIVE-B" \
     "tok-creative|424242|444 tok-marketing|-1001|555" "$(edits)"
 
 reset_edits
-_task_gate_retire_buttons DIVE-AA "answered by human:test" >/dev/null 2>&1
+_task_gate_card_apply DIVE-AA die "answered by human:test" >/dev/null 2>&1
 chk "liveness: 666 IS editable for DIVE-AA (so its absence above is the whole-field match)" \
     "tok-marketing|424242|666" "$(edits)"
 
 reset_edits
-_task_gate_retire_buttons DIVE-NOSUCH "answered by human:test" >/dev/null 2>&1
+_task_gate_card_apply DIVE-NOSUCH die "answered by human:test" >/dev/null 2>&1
 chk "a task with no deliveries edits nothing" "" "$(edits)"
 
 # ------------------------------------------------------------------- token ---
@@ -110,14 +146,14 @@ chk "a task with no deliveries edits nothing" "" "$(edits)"
 # delivering bot's edits a different message or nothing at all (DIVE-2073).
 reset_edits
 TELEGRAM_BOT_TOKEN=tok-CALLER
-_task_gate_retire_buttons DIVE-B "answered by human:test" >/dev/null 2>&1
+_task_gate_card_apply DIVE-B die "answered by human:test" >/dev/null 2>&1
 chk "uses the DELIVERING bot's token (via=), never the caller's" \
     "tok-creative|424242|444 tok-marketing|-1001|555" "$(edits)"
 unset TELEGRAM_BOT_TOKEN
 
 : >"$LOG"; row ok DIVE-T 424242 777 ghostagent
 reset_edits
-_task_gate_retire_buttons DIVE-T "answered by human:test" >/dev/null 2>&1
+_task_gate_card_apply DIVE-T die "answered by human:test" >/dev/null 2>&1
 chk "an unresolvable delivering bot performs no edit (rather than a wrong one)" "" "$(edits)"
 
 # --------------------------------------------------------- benign refusals ---
@@ -130,8 +166,8 @@ for pair in \
   '{"ok":false,"description":"Bad Request: message to edit not found"}|ok' \
   '{"ok":false,"description":"Bad Request: chat not found"}|error'; do
   EDIT_RESP="${pair%|*}"; want="${pair##*|}"
-  reset_edits
-  out=$(_task_gate_retire_buttons DIVE-R "answered by human:test" 2>&1)
+  reset_edits; reset_deletes
+  out=$(_task_gate_card_apply DIVE-R die "answered by human:test" 2>&1)
   got=ok; grep -q 'could not retire the gate button' <<<"$out" && got=error
   chk "Bot API '$(jq -r '.description // "ok"' <<<"${pair%|*}")' grades as $want" "$want" "$got"
 done
@@ -144,12 +180,12 @@ EDIT_RESP='{"ok":true}'
 : >"$LOG"; row ok DIVE-F 424242 999 marketing
 reset_edits
 FIVEDIVE_PROD_TASKS_DB="$TMP/not-the-prod-store.db" \
-  _task_gate_retire_buttons DIVE-F "answered by human:test" >/dev/null 2>&1
+  _task_gate_card_apply DIVE-F die "answered by human:test" >/dev/null 2>&1
 chk "fence holds: a non-prod store performs no edit" "" "$(edits)"
 
 reset_edits
 FIVEDIVE_PROD_TASKS_DB="$TMP/not-the-prod-store.db" FIVEDIVE_NOTIFY_DRYRUN=1 \
-  _task_gate_retire_buttons DIVE-F "answered by human:test" >/dev/null 2>&1
+  _task_gate_card_apply DIVE-F die "answered by human:test" >/dev/null 2>&1
 chk "fence is not vacuous: the SAME input under dry-run does edit" \
     "tok-marketing|424242|999" "$(edits)"
 
@@ -181,6 +217,14 @@ unset -f curl
 # coupled to its producer. A format drift in _task_gate_delivery_log breaks these,
 # which is the point: the hand-built rows above cannot catch that.
 _mirror_edit_markup() { printf '%s|%s|%s\n' "$1" "$2" "$3" >>"$EDITS"; printf '%s' '{"ok":true}'; }
+# DIVE-3228: the dry-run arms above deliberately exercise the REAL primitives, so
+# every stub in this file has to be re-established HERE or the wiring arms run
+# against live curl. Measured while building this: with only the markup stub
+# restored, a wiring arm reached api.telegram.org for real. Three egress points
+# now, three stubs — a missing one is not a failing assertion, it is an outbound
+# request from a unit test, which is the DIVE-1500 shape.
+_mirror_delete_message() { printf '%s|%s|%s\n' "$1" "$2" "$3" >>"$DELETES"; printf '%s' '{"ok":true}'; }
+_mirror_edit_text() { printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" >>"$TEXTS"; printf '%s' '{"ok":true}'; }
 ACCESS="$TMP/access.json"
 printf '%s\n' '{"allowFrom":["1234567890"],"groups":{}}' >"$ACCESS"
 _task_owner_channel() { TASK_CH_TOKEN=tok-marketing TASK_CH_ACCESS="$ACCESS" TASK_CH_TYPE=claude TASK_CH_AGENT=marketing; return 0; }
@@ -188,6 +232,15 @@ _task_agent_channel() { _task_owner_channel; }
 _mirror_send() { printf '%s' '{"ok":true,"result":{"message_id":15491}}'; }
 _mirror_log_button_reject() { :; }
 _mirror_follow_migration() { :; }
+# _gate_channel_api reaches the Bot API directly (the nonce/echo cleanup path).
+# The egress fence below found it genuinely unstubbed in this section — narrow,
+# but "narrow" is what the near miss looked like too.
+_gate_channel_api() { printf '%s' '{"ok":true}'; }
+# THE SEAM THAT FAILED. `unset -f curl` ran above, so nothing intercepts the
+# process boundary here and function stubs are the ONLY thing between these arms
+# and api.telegram.org. Assert it AT the point of risk rather than trusting that
+# the stubs above are still the whole surface.
+chk "egress: the surface is CLOSED at the wiring seam (no curl intercept here)" "" "$(egress_open)"
 
 # cmd_task_answer fires a REAL inter-agent resume ping through cmd_send, and this
 # harness declares its fixture store as prod to get past the DIVE-1506 send fence
@@ -226,13 +279,13 @@ for arm in answer withdraw; do
   if [[ -z "$ident" ]]; then chk "wiring/$arm: seeded a gate" "yes" "no"; continue; fi
   chk "wiring/$arm: the real emitter logged a retirable delivery" "1" \
       "$(_task_gate_deliveries "$ident" | grep -c '15491')"
-  reset_edits
+  reset_edits; reset_deletes
   case "$arm" in
     answer)   ( cmd_task_answer   "$ident" --value=A ) >/dev/null 2>&1 ;;
     withdraw) ( cmd_task_need     "$ident" --withdraw ) >/dev/null 2>&1 ;;
   esac
-  chk "wiring/$arm: the close path retired the delivered button" \
-      "tok-marketing|1234567890|15491" "$(edits)"
+  chk "wiring/$arm: the close path DELETED the delivered card (DIVE-3228)" \
+      "tok-marketing|1234567890|15491" "$(deletes)"
 done
 
 # DIVE-2773 (replaces the old `done` arm above): a cancel over a LIVE gate is refused,
@@ -243,7 +296,7 @@ ident=$(seed_gate "DIVE-2773 wiring arm: cancel over a live gate")
 if [[ -z "$ident" ]]; then chk "wiring/cancel-refused: seeded a gate" "yes" "no"; else
   chk "wiring/cancel-refused: the real emitter logged a retirable delivery" "1" \
       "$(_task_gate_deliveries "$ident" | grep -c '15491')"
-  reset_edits
+  reset_edits; reset_deletes
   ( cmd_task_cancel "$ident" --result="moot" ) >/dev/null 2>&1; _c2773_rc=$?
   chk "wiring/cancel-refused: the cancel is REFUSED over a live gate" "refused" \
       "$( (( _c2773_rc != 0 )) && echo refused || echo "landed rc=$_c2773_rc" )"
@@ -264,10 +317,10 @@ chk "the resume ping went through the stub (containment is live, not rotted)" "1
 # run BEFORE the new delivery, or the fresh button is stripped by its own filing.
 ident=$(seed_gate "DIVE-2410 wiring arm: refile")
 if [[ -z "$ident" ]]; then chk "wiring/refile: seeded a gate" "yes" "no"; else
-  reset_edits
+  reset_edits; reset_deletes
   ( cmd_task_need "$ident" --type=approval --ask="really proceed?" ) >/dev/null 2>&1
-  chk "wiring/refile: the outgoing gate's button was retired" \
-      "tok-marketing|1234567890|15491" "$(edits)"
+  chk "wiring/refile: the outgoing gate's card was DELETED" \
+      "tok-marketing|1234567890|15491" "$(deletes)"
   chk "wiring/refile: and the REPLACEMENT gate's own button survives its filing" "1" \
       "$(_task_gate_deliveries "$ident" | grep -c '15491')"
 fi
@@ -284,10 +337,21 @@ fi
 ident=$(seed_gate "DIVE-2410 wiring arm: park")
 if [[ -z "$ident" ]]; then chk "wiring/park: seeded a gate" "yes" "no"; else
   ( cmd_task_answer "$ident" --value=A ) >/dev/null 2>&1
-  reset_edits
+  reset_edits; reset_deletes
+  # DIVE-3228: under the card model the ANSWER above already deleted this gate's
+  # card, so by the time park runs there is nothing live left and park's retire is
+  # correctly a no-op. That would leave park's wiring ungraded again — olivia's
+  # iteration-1 finding, that deleting the call left the suite green. So put the
+  # card back to `live` first, which is not a contrivance: it is exactly the state
+  # a gate is in when the answer's retire could not land (no token for the
+  # delivering bot, an orphaned card later recovered), and it is why more than one
+  # call site retires at all. Park is then the next chance to kill the card, and
+  # this arm grades that it takes it.
+  db "UPDATE gate_cards SET state='live'
+       WHERE task_id=(SELECT id FROM tasks WHERE ident='$ident');" >/dev/null 2>&1
   ( cmd_task_park "$ident" --reason="fixture park" --wake=+7d ) >/dev/null 2>&1
-  chk "wiring/park: park NULLs the gate columns and retires the delivered button" \
-      "tok-marketing|1234567890|15491" "$(edits)"
+  chk "wiring/park: park NULLs the gate columns and DELETES the delivered card" \
+      "tok-marketing|1234567890|15491" "$(deletes)"
 fi
 
 # verifier auto:reject: the gate is still OPEN and the reject stamps it
@@ -300,10 +364,10 @@ ident=$(seed_gate "DIVE-2410 wiring arm: reject")
 if [[ -z "$ident" ]]; then chk "wiring/reject: seeded a gate" "yes" "no"; else
   db "UPDATE tasks SET maker_agent='fixture-maker', verifier=$(sqlq "$(task_actor "")"),
         status='todo' WHERE ident=$(sqlq "$ident");"
-  reset_edits
+  reset_edits; reset_deletes
   ( cmd_task_reject "$ident" --feedback="fixture bounce" ) >/dev/null 2>&1
-  chk "wiring/reject: auto:reject supersedes the gate and retires its button" \
-      "tok-marketing|1234567890|15491" "$(edits)"
+  chk "wiring/reject: auto:reject supersedes the gate and DELETES its card" \
+      "tok-marketing|1234567890|15491" "$(deletes)"
   chk "wiring/reject: and the gate really was superseded (the arm graded the retire, not a refusal)" \
       "auto:reject" \
       "$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident=$(sqlq "$ident");")"
@@ -337,11 +401,11 @@ fi
 # button in the chat.
 ident=$(seed_gate "DIVE-2410 file-time arm: tier0")
 if [[ -z "$ident" ]]; then chk "file-time/tier-0: seeded a gate" "yes" "no"; else
-  reset_edits
+  reset_edits; reset_deletes
   ( cmd_task_need "$ident" --type=decision --ask="t0 proceed?" \
       --options="A|B" --recommend=A --tier=0 ) >/dev/null 2>&1
-  chk "file-time/tier-0: the OUTGOING gate's button was retired by the re-file retire" \
-      "tok-marketing|1234567890|15491" "$(edits)"
+  chk "file-time/tier-0: the OUTGOING gate's card was DELETED by the re-file retire" \
+      "tok-marketing|1234567890|15491" "$(deletes)"
   chk "file-time/tier-0: and the auto-cleared gate delivered NO button of its own" "1" \
       "$(grep -c 'gate-delivery result=ok' "$LOG")"
   chk "file-time/tier-0: it really did auto-clear (the arm graded a settle, not a refusal)" \
@@ -389,7 +453,7 @@ if [[ -z "$_pshape" || -z "$_tident" ]]; then
   chk "file-time/precedent: seeded two nonce-verified precedents" "yes" "no"
 else
   : >"$LOG"          # fresh target, never gated before: ANY delivery here is its own
-  reset_edits
+  reset_edits; reset_deletes
   ( cmd_task_need "$_tident" --type=decision --ask="proceed?" \
       --options="A|B" --recommend=A --tier=1 ) >/dev/null 2>&1
   chk "file-time/precedent: it really did auto-clear (the arm graded a settle, not a refusal)" \
@@ -406,7 +470,7 @@ _task_pref_set precedent_autoclear off >/dev/null 2>&1
 # share an answer: a MISSING log is silent (nothing was ever delivered), an
 # EXISTING-but-unreadable one warns.
 reset_edits
-out=$(FIVEDIVE_GATE_NOTIFY_LOG="$TMP/never-written.log" _task_gate_retire_buttons DIVE-A x 2>&1)
+out=$(FIVEDIVE_GATE_NOTIFY_LOG="$TMP/never-written.log" _task_gate_card_apply DIVE-A die x 2>&1)
 chk "a MISSING delivery log is silent (nothing was delivered — not a fault)" "0" \
     "$(grep -c 'cannot read the gate-delivery log' <<<"$out")"
 
@@ -417,7 +481,7 @@ if [[ "$(id -u)" == "0" ]] || [[ -r "$BLIND" ]]; then
   printf 'SKIP an unreadable delivery log warns — cannot make a file unreadable as uid %s\n' "$(id -u)"
 else
   _TASK_GATE_RETIRE_BLIND=""
-  out=$(FIVEDIVE_GATE_NOTIFY_LOG="$BLIND" _task_gate_retire_buttons DIVE-A x 2>&1)
+  out=$(FIVEDIVE_GATE_NOTIFY_LOG="$BLIND" _task_gate_card_apply DIVE-A die x 2>&1)
   chk "an EXISTING but unreadable delivery log warns (the no-op is observable)" "1" \
       "$(grep -c 'cannot read the gate-delivery log' <<<"$out")"
 fi
@@ -497,6 +561,25 @@ chk "the FIRST gate message PINGS (no disable_notification on the wire)" "absent
 chk "every message after the first carries disable_notification=true ON THE WIRE" "2" \
     "$(tail -n +2 "$SENDS" | grep -c 'disable_notification=true')"
 chk "each gate carries its OWN keyboard" "3" "$(grep -c 'reply_markup=' "$SENDS" 2>/dev/null || echo 0)"
+
+# ------------------------------------------------------- egress surface -----
+# DIVE-3228. This is the harness the near miss happened IN: it stubbed the one Bot
+# API primitive that existed, two were added beside it, and a wiring arm reached
+# api.telegram.org for real — with a fake token, so nothing failed and nothing was
+# sent, which is exactly why nothing caught it. Re-stubbing the three we know about
+# fixes today only. So the surface is ENUMERATED from the sourced modules and
+# required to be CLOSED, rather than hand-listed.
+#
+# TWO VALID CLOSURES, and conflating them is what made my first cut of this arm
+# wrong: a function stub, OR a curl intercepted on PATH — which the last section of
+# this file uses, and which is the stronger of the two since it closes the process
+# boundary rather than a set of names. The property graded is "no real request can
+# leave", not "these particular functions are overridden".
+# Non-vacuity: without this a rename, or an awk that stops matching, makes every
+# egress arm green forever while the surface is wide open.
+chk "egress: the enumeration actually finds Bot API callers (not vacuous)" "yes" \
+    "$([[ "$(_egress_names | grep -c .)" -ge 3 ]] && echo yes || echo no)"
+chk "egress: the surface is CLOSED at the end of the run" "" "$(egress_open)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == "0" ]]
