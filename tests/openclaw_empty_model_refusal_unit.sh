@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # DIVE-3130: `--type=openclaw --provider=<p>` where <p> has NO
-# OPENCLAW_PROVIDER_MODEL row (zai, minimax, qwen, huggingface) and no --model
+# OPENCLAW_PROVIDER_MODEL row (zai, qwen, huggingface — minimax got one in
+# DIVE-3184 and is now a control arm below) and no --model
 # must REFUSE before the credential write, instead of writing a key with no
 # model pin. openclaw then falls back to its built-in default, whose first path
 # segment picks the provider AND the credential, so the seat reports AUTH ok and
@@ -66,8 +67,10 @@ fi
   && ok_t "refusal names the remedy and the oracle to grade it with" \
   || bad_t "refusal does not tell the operator how to proceed" "$out"
 
-# Same hole, other providers with an id row and no model row.
-for p in minimax qwen huggingface; do
+# Same hole, other providers with an id row and no model row. minimax was in
+# this list until DIVE-3184 graded an id for it; it now sits in the control arm
+# below, which is the same assertion with the sign flipped.
+for p in qwen huggingface; do
   out=$(run_byo "$p" "$p"); rc=$?
   (( rc == 90 )) && [[ "$out" == *"no default model for provider '$p'"* ]] \
     && ok_t "openclaw+$p with no --model refuses too" \
@@ -82,6 +85,21 @@ out=$(run_byo openai openai); rc=$?
 [[ "$out" != *"no default model"* ]] \
   && ok_t "openclaw+openai (has a catalog row) is not caught by the guard" \
   || bad_t "the guard fires on a provider that HAS a model row" "rc=$rc out=$out"
+# DIVE-3184: minimax moved out of the refusing set by being GIVEN a row, so it
+# grades the transition, not just the guard: the refusal must stop firing AND
+# the id that stopped it must be the graded pin, reaching openclaw_normalize_
+# model unchanged (a wrong-provider prefix would fail there instead, so passing
+# both arms is what says the row is routable and not merely non-empty).
+out=$(run_byo minimax minimax); rc=$?
+[[ "$out" != *"no default model"* ]] \
+  && ok_t "openclaw+minimax with no --model now proceeds (DIVE-3184 row)" \
+  || bad_t "the minimax row did not satisfy the guard" "rc=$rc out=$out"
+[[ "${OPENCLAW_PROVIDER_MODEL[minimax]:-}" == "minimax/MiniMax-M2.7" ]] \
+  && ok_t "minimax pin is the graded id (minimax/MiniMax-M2.7)" \
+  || bad_t "minimax pin is not the graded id" "got '${OPENCLAW_PROVIDER_MODEL[minimax]:-<unset>}'"
+[[ "$out" != *"selects provider"* ]] \
+  && ok_t "the minimax pin's prefix routes to native 'minimax' (normalize clean)" \
+  || bad_t "the minimax pin fails openclaw_normalize_model" "$out"
 out=$(run_byo zai zai "zai/glm-4.6"); rc=$?
 [[ "$out" != *"no default model"* ]] \
   && ok_t "openclaw+zai WITH --model still proceeds (zai kept, not dropped)" \

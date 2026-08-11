@@ -1153,8 +1153,10 @@ _apply_byo_openclaw() {
   # openai" — while `agent list` still prints AUTH ok, because the sentinel is
   # the credential file and the credential file is there.
   # Measured 2026-08-10 on this host (openclaw 2026.7.1-2) via --provider=zai;
-  # the same hole is open for minimax, qwen and huggingface, which also have an
-  # OPENCLAW_PROVIDER_ID row and no model row.
+  # the same hole is open for qwen and huggingface, which also have an
+  # OPENCLAW_PROVIDER_ID row and no model row. minimax was in that set until
+  # DIVE-3184 graded an id for it (3 in its per-provider list) and added the row
+  # — which is the intended exit from this refusal: supply the thing it asks for.
   # The remedy is deliberately NOT "add a model row": an id must be graded
   # against `openclaw models list --provider <native> --plain` first (see the
   # OPENCLAW_PROVIDER_MODEL header), and for zai that list is empty on this
