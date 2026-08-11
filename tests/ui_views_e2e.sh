@@ -382,13 +382,24 @@ chk "16 --once came up" "1" "$stall_up"
 if (( stall_up )); then
   # Connect and say NOTHING. The fd is held open for the whole poll, so the
   # server is never released by a hangup — only by its own read timeout.
-  if exec 9<>"/dev/tcp/127.0.0.1/$PORT3" 2>/dev/null; then
+  # BRACED ON PURPOSE. `exec` with only redirections applies them to the CURRENT
+  # shell and they OUTLIVE the statement — so the flat form, `exec 9<>… 2>/dev/null`,
+  # opens fd 9 and also silences this harness's stderr for the whole rest of the run.
+  # Nothing here can see that: every assertion is graded on stdout, so the file still
+  # reported PASS=72 FAIL=0 and its exit status stayed correctly wired. What it broke
+  # was the verdict probe, whose canary prints to STDERR — the probe saw no canary,
+  # concluded the harness had exited before its verdict, and reported `not-reached` in
+  # EVERY environment that runs it. not-reached everywhere is NEVER PROBED, which reds
+  # harness-verdict-union and refuses the release cut (DIVE-3148: six merged fixes
+  # stranded, including the `5dive gh` fix every seat was waiting on).
+  # Braced, the hush is scoped to the group and only fd 9 survives it.
+  if { exec 9<>"/dev/tcp/127.0.0.1/$PORT3"; } 2>/dev/null; then
     stall_gone=0
     for _ in $(seq 1 60); do            # 15s: ample for a 2s timeout, and bounded
       kill -0 "$STALL_PID" 2>/dev/null || { stall_gone=1; break; }
       sleep 0.25
     done
-    exec 9<&- 2>/dev/null; exec 9>&- 2>/dev/null
+    { exec 9<&-; exec 9>&-; } 2>/dev/null   # braced for the same reason as the open
     chk "16 a silent client does not park it" "1" "$stall_gone"
     # Same reap discipline as arm 15: never `wait` on a server still running.
     stall_rc="never-exited"; (( stall_gone )) && { wait "$STALL_PID"; stall_rc=$?; }

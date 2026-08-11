@@ -389,6 +389,15 @@ sudo_grant_batch_reset() { unset _SUDOERS_BATCH_STATE; declare -gA _SUDOERS_BATC
 #   sudo -l       `    (root) NOPASSWD: /usr/local/bin/5dive, ...`
 # `sudo -l`'s "Matching Defaults entries" preamble carries no parens, so it is
 # skipped by the same test.
+# NOTE FOR THE NEXT EDITOR (DIVE-3160): the recognized-verb list below is a
+# SECOND copy of the verbs render_standard_sudoers emits, and the two drift
+# silently in one direction only — a verb added there and not here lands as
+# `has_other`, which flags every correctly-provisioned agent as carrying an
+# unrecognized grant. That is how this comment came to be written: the
+# `_task_answer` line was added to the renderer, and agent_sudo_grant_unit.sh +
+# gh_actor_routing_unit.sh both went red on `extra=1` within the same run. The
+# duplication is deliberate (the classifier must also read drop-ins this CLI did
+# NOT write), so the guard is the harnesses, not a shared constant.
 classify_sudo_grant() {
   local line runas cmds cmd
   local has_all=0 has_cli=0 has_a2a=0 has_other=0 any=0 runas_any=0
@@ -415,7 +424,8 @@ classify_sudo_grant() {
         "/usr/local/bin/5dive agent _deliver"*|"/usr/local/bin/5dive agent _capture"*|\
         "/usr/local/bin/5dive agent _self_restart"*|"/usr/local/bin/5dive _audit_append"*|\
         "/usr/local/bin/5dive _push_do"*|\
-        "/usr/local/bin/5dive _gh_do"*)                  has_a2a=1 ;;
+        "/usr/local/bin/5dive _gh_do"*|\
+        "/usr/local/bin/5dive _task_answer"*)            has_a2a=1 ;;
         *)                                              has_other=1 ;;
       esac
     done
@@ -527,6 +537,18 @@ ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _audit_append
 # inside _self_restart, never from argv, so it can restart ONLY itself, never a
 # peer. Deferred internally; needs no raw systemd-run/systemctl grant.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _self_restart
+# DIVE-3160: let this agent's LEAD-CLEAR land SIGNED. A cli-scoped seat can clear
+# a gate it is routed and cannot sign it (signing needs the root-only key), so its
+# closure stores unsigned and a delegated push or deploy is refused later, on
+# someone else's round-trip, as tampering. EXACT path, NO args, NO wildcard: the
+# parameters travel over stdin, the caller is derived from SUDO_UID inside
+# _task_answer, and the lead-clear STANDING is re-derived there from the task row
+# as root. UNCONDITIONAL on purpose, unlike the push and deploy grants: this verb
+# confers no authority of its own - it refuses unless the row already routes the
+# clear to this agent - so gating it behind a flag would only recreate the split
+# between standing and capability that it exists to close. It cannot stamp a
+# human answer: every human-evidence form is refused inside the primitive.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _task_answer
 SUDOERS
   if [[ "$can_push" == "1" ]]; then
     cat <<SUDOERS
@@ -1119,6 +1141,29 @@ _apply_byo_openclaw() {
   # costs them a profile that lies about being healthy.
   local openclaw_base_url="${OPENCLAW_PROVIDER_URL[$canonical]:-}"
   local model="${override_model:-${OPENCLAW_PROVIDER_MODEL[$canonical]:-}}"
+  # DIVE-3130: KEY WRITTEN + NO MODEL PIN IS A REFUSAL FOR EVERY PROVIDER, not
+  # only for the ones the check below can reach. The DIVE-3113 block above fails
+  # closed on a model id that names the WRONG provider — but it is guarded by
+  # `[[ -n "$model" ]]`, so a canonical id with NO OPENCLAW_PROVIDER_MODEL row and
+  # no --model resolves to the empty string and walks straight through it. That
+  # produces the exact state DIVE-3113 exists to prevent: openclaw falls back to
+  # its BUILT-IN default (openai/gpt-5.5), whose first path segment picks the
+  # provider AND the credential, so the seat authenticates as openai with no
+  # openai key and every message dies on "auth or provider access failed for
+  # openai" — while `agent list` still prints AUTH ok, because the sentinel is
+  # the credential file and the credential file is there.
+  # Measured 2026-08-10 on this host (openclaw 2026.7.1-2) via --provider=zai;
+  # the same hole is open for qwen and huggingface, which also have an
+  # OPENCLAW_PROVIDER_ID row and no model row. minimax was in that set until
+  # DIVE-3184 graded an id for it (3 in its per-provider list) and added the row
+  # — which is the intended exit from this refusal: supply the thing it asks for.
+  # The remedy is deliberately NOT "add a model row": an id must be graded
+  # against `openclaw models list --provider <native> --plain` first (see the
+  # OPENCLAW_PROVIDER_MODEL header), and for zai that list is empty on this
+  # version — so the honest outcome is an explicit --model from the operator,
+  # not a pin we guessed.
+  [[ -n "$model" ]] \
+    || fail "$E_VALIDATION" "openclaw has no default model for provider '$canonical' (native id: $native), and no --model was given. Writing the key with no model pin would create a seat that reports AUTH ok and returns 401 on every message: openclaw would fall back to its built-in default, whose provider prefix selects a credential you have not supplied. Pass --model=<id> that openclaw routes to '$native' — grade it with: openclaw models list --provider $native --plain"
   if [[ -n "$model" ]]; then
     local normalized
     if ! normalized=$(openclaw_normalize_model "$native" "$model"); then
@@ -1494,24 +1539,89 @@ cmd_create() {
   # precaution we refuse grok here. Every provisioning path (agent create, hire,
   # pack import, clone) funnels through cmd_create, so this blocks all of them.
   # Unfreeze condition (olivia): a VERIFIED xAI client-side patch + a pinnable
-  # version, NEVER the server-side toggle alone. That condition is still UNMET
-  # (re-checked 2026-08-08 for DIVE-2910: no client-side fix through Grok Build
-  # v0.2.121 / 1.0.0 — the upload path ships in every binary and in the
-  # open-source repo, the config.toml disable_codebase_upload key is an opt-in
-  # local override rather than a default-off fix, and xAI's only mitigation
-  # remains its revocable server-side flag of 2026-07-13).
-  # DIVE-2894/2910: the owner (lodar, 2026-08-07 18:07Z) answered the unfreeze
-  # gate "arm" anyway. That is a recorded owner RISK ACCEPTANCE, not a fix and
-  # not a withdrawal of the condition above — so an armed host is a host where
-  # the owner accepted a live, unpatched exfiltration risk. Set the override
-  # only on hosts named by that decision, never to route around the freeze on
-  # your own authority, and never read an armed host as evidence of a patch.
+  # version, NEVER the server-side toggle alone.
+  #
+  # THAT CONDITION IS HALF MET, AND WHICH HALF MATTERS. Read this before you
+  # conclude anything from an armed box (DIVE-2894 source read, 2026-08-10 —
+  # it corrected the 2026-08-08 reading that used to sit here):
+  #   - FIRST HALF, SATISFIED: `upload_session_state` and `upload_full_prompt_txt`
+  #     are genuine client-side STUBS in the current open-source Grok Build
+  #     source — and have been since the first public commit (2026-07-16). So
+  #     they are not a new fix and nothing about xAI's behaviour changed; the
+  #     earlier "no client-side fix through v0.2.121 / 1.0.0" note was wrong.
+  #   - SECOND HALF, NOT SATISFIED: `xai-org/grok-build` has ZERO tags and ZERO
+  #     releases, every commit titled "Synced from monorepo". Nothing ties the
+  #     source we verified to the binary a box actually installs. There is no
+  #     version to pin, and no amount of further code reading closes that gap.
+  #   - STILL UPLOADING on the paths that remain: prompt images, turn results,
+  #     session metadata, and a working-directory `memory.tar.gz`.
+  #
+  # DIVE-2894/2910/3185: the owner (lodar — 2026-08-07 18:07Z for the internal
+  # host, again 2026-08-10 19:17Z for managed customer boxes) answered "arm"
+  # anyway, with the residual above in front of him. That is a recorded owner
+  # RISK ACCEPTANCE ON A PARTIALLY-SATISFIED CONDITION. It is not a fix, not a
+  # pinnable version, and not a withdrawal of the condition — an armed box is a
+  # box where the owner accepted a live, unpatched exfiltration risk.
+  #
+  # So: never read an armed box as evidence of a patch, and never arm one on
+  # your own authority. A marker written by 5dive provisioning is the sanctioned
+  # case and is what that acceptance covers; a marker you placed by hand to get
+  # past this guard is not, and is the thing the sentence below has always meant.
   # The warn below fires on every armed create and is meant to stay noisy.
-  if [[ "$type" == "grok" && "${FIVE_GROK_UNFREEZE_VERIFIED:-}" != "1" ]]; then
+  #
+  # DIVE-3185 — WHAT ARMS IT CHANGED, AND WHY IT IS A FILE AND NOT AN ENV VAR.
+  # lodar (2026-08-10 19:17Z) accepted the risk for CUSTOMER boxes too, not just
+  # the one internal host of DIVE-2910. The scope grew; the mechanism therefore
+  # had to change, twice, and both reversals are worth knowing:
+  #   1. NOT an env var swept over SSH to every box (DIVE-3092 forbade it and
+  #      DIVE-3185 briefly re-prescribed it). "Revocable" requires knowing WHICH
+  #      boxes carry it and reversing them reliably. A line in /etc/environment
+  #      on someone else's machine gives you no inventory, no diff, and no
+  #      rollback that is not a second sweep. A release gives you all three.
+  #   2. NOT a bare bundle-versioned relaxation either. 5dive-ai/5dive is public
+  #      and boxes install the newest TAG, so a guard that simply went permissive
+  #      would unfreeze grok for every OSS installer — implementing something
+  #      broader than the decision it claims to implement, and handing an
+  #      unpatched exfiltration path to people who never saw our risk acceptance.
+  # Hence: the guard stays in the bundle (reviewable in a diff, versioned,
+  # revocable by a release) and PERMITS only where a managed-fleet marker written
+  # by OUR provisioning is present. Auditability comes from the release; scope
+  # comes from the predicate. Default is still REFUSE, and the OSS path is the
+  # unmarked path, so nothing about a stranger's install changes.
+  #
+  # THE MARKER IS A SPEED BUMP, NOT A SECURITY BOUNDARY. Say it here because
+  # this is where someone would otherwise assume the opposite and build
+  # something load-bearing on it. `agent create` is root-gated, so anyone who
+  # can create the marker could already have deleted this guard from a public
+  # repo — the marker grants no capability that did not already exist. What it
+  # buys is DELIBERATENESS: a knowing opt-in by someone who read the source is a
+  # categorically different act from a permissive default that reaches everyone
+  # who ran an installer. It does not enforce scope against a determined user
+  # and must never be described as if it does.
+  #
+  # UN-ARMING (the reverse must exist or this is a one-way door — DIVE-3185
+  # acceptance 4): remove the marker; the guard keys on PRESENCE, so `=0` or an
+  # empty file does nothing. Revert the provisioning template BEFORE sweeping
+  # existing boxes, or boxes built in between come up armed. Verify per box with
+  # the zero-cost DIVE-2910 probe (`agent create <n> --type=grok --channels=bogus`
+  # must reach the channels error, not this refusal) through the control plane.
+  # And the load-bearing caveat: un-arming stops the NEXT create and nothing
+  # else. This gate is on CREATE, not on RUN — grok agents already provisioned
+  # keep running. "Revocable" does not mean "recallable".
+  # Full reverse:
+  # community/wiki/un-arming-the-grok-unfreeze-what-the-env-var-can-and-cannot-reverse.md
+  #
+  # FIVE_GROK_ARM_MARKER overrides the path. It is a test seam (it is what lets
+  # tests/grok_freeze_guard_unit.sh grade the GUARD instead of the HOST, in both
+  # directions, after DIVE-3090 caught that harness inheriting a host's arm and
+  # provisioning a live grok agent for 8h16m). It is not a control — see the
+  # speed-bump paragraph above.
+  local grok_arm_marker="${FIVE_GROK_ARM_MARKER:-/etc/5dive/arm/grok-unfreeze}"
+  if [[ "$type" == "grok" && ! -e "$grok_arm_marker" ]]; then
     fail "$E_VALIDATION" "grok provisioning is frozen — unfreeze needs a verified xAI client-side fix and a pinnable version"
   fi
   if [[ "$type" == "grok" ]]; then
-    warn "FIVE_GROK_UNFREEZE_VERIFIED=1 set, bypassing the DIVE-1221 Grok exfiltration freeze. Only valid if a VERIFIED xAI client-side patch is pinned."
+    warn "managed-fleet arm marker present ($grok_arm_marker), bypassing the DIVE-1221 Grok exfiltration freeze. Owner risk acceptance (lodar 2026-08-10), NOT a patch — the xAI upload path is still unfixed and unpinnable."
   fi
   valid_channel "$channels" || fail "$E_VALIDATION" "invalid channels: $channels (none|telegram|discord|dashboard|buzz, comma-separable)"
   # DIVE-856: claude agents are chat-capable in the web dashboard by default.

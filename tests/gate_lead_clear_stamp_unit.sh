@@ -68,8 +68,21 @@ FIXTURE_MARK="dive2406-fixture"
 [[ -r "$REALLOG" ]] && REALLOG_OFFSET=$(wc -c <"$REALLOG" 2>/dev/null || echo 0)
 
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
+# DIVE-3128: PIN THE ROSTER. `header.sh` computes REGISTRY at SOURCE time from the
+# default STATE_DIR, so moving STATE_DIR afterwards leaves it pointing at
+# /var/lib/5dive/agents.json — the box's real fleet. The new roster guard on the
+# `human:` stamp reads it, so without this pin arms 2 and 4 below grade differently
+# depending on which agents happen to exist on the machine running the suite: on a
+# control-plane box `main` IS registered and arm 2 sees the refusal, on a bare CI
+# runner there is no registry at all and it does not. `main` and `dev` are on this
+# fixture roster and `lodar` is deliberately NOT, which is what makes arm 4 a real
+# non-vacuity check rather than an accident of the host.
+REGISTRY="$TMP/agents.json"
 JSON_MODE=1
 mkdir -p "$TASKS_DIR"
+cat >"$REGISTRY" <<'REG'
+{"schemaVersion": 1, "agents": {"main": {"isolation": "vm"}, "dev": {"isolation": "vm"}}}
+REG
 set +e   # AFTER sourcing: header.sh turns `set -e` back on.
 tasks_db_init
 export FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"   # DIVE-2010 fence: let the row through
@@ -143,18 +156,37 @@ else
   bad_t "a demotion the log cannot show is a demotion nobody can audit" "row='$ROW1'"
 fi
 
-# --- 2. lead-clear + CORROBORATED --human -> human:. ALREADY GREEN before the --
-#        fix; this is the arm that fails if the demotion is made unconditional.
+# --- 2. lead-clear + CORROBORATED --human -> NOT the lead: demotion. ----------
+#        THE PROPERTY THIS ARM GUARDS IS UNCHANGED — "a corroborated --human must
+#        not be relabelled as a lead clear" — but the string it lands on moved,
+#        and the reason is worth stating because the expected value looks like a
+#        regression and is not.
+#
+#        This arm used to expect `human:main`, and DIVE-3128 says that stamp was
+#        never a legitimate human attribution: `main` is a name on the AGENT
+#        roster, so `human:main` cannot distinguish "a person cleared this through
+#        main's session" from "the main agent cleared its own human gate" — which
+#        is the one thing the field exists to establish. It is the DIVE-3045 shape
+#        exactly, arriving through the lead path instead of a Telegram tap. So the
+#        claim is now refused and stored as `unattributed:main`.
+#
+#        THE ARM STILL GRADES WHAT IT WAS BUILT FOR. `unattributed:main` is not
+#        `lead:main`: make the DIVE-2400 demotion unconditional and this arm reds,
+#        exactly as before. What it no longer does is assert that an agent name may
+#        wear a `human:` prefix.
 reset
 SUDO_NONAGENT=0            # non-agent SUDO_UID: a real human-evidence form
 t2=$(mkgate "ship the persona batch" "fixture routed approval, real human $FIXTURE_MARK")
 ( actor_seam_as main; cmd_task_answer "$t2" --value="approved" --human --from=main >/dev/null 2>&1 )
 BY2=$(nby "$t2")
-if [[ "$BY2" == "human:main" ]]; then
-  ok_t "a CORROBORATED --human still stamps human:main (no genuine tap relabelled)"
-else
+if [[ "$BY2" == "unattributed:main" ]]; then
+  ok_t "a CORROBORATED --human is NOT demoted to lead: — and, DIVE-3128, is not stamped human:<roster agent> either"
+elif [[ "$BY2" == "lead:main" ]]; then
   bad_t "the fix must not demote an evidenced human answer" \
-        "need_answered_by='$BY2' (expected human:main)"
+        "need_answered_by='$BY2' — an evidenced human answer took the lead-clear demotion"
+else
+  bad_t "unexpected provenance on the corroborated lead-clear" \
+        "need_answered_by='$BY2' (expected unattributed:main)"
 fi
 
 # --- 3. DISTINCTNESS: the two cases must not be the same string ---------------
@@ -193,11 +225,26 @@ AUTH="main"
 #        why the fix carries ONE condition. `_gate_standing_lead` reads the sealed
 #        constitution (unavailable in a fixture) so it is the seam; ELIGIBILITY is
 #        the real predicate and runs unstubbed.
+#        DIVE-3171 MADE THE ISOLATION AN ACCIDENT, so it is now stated. This suite
+#        seeds NO `agents_org` rows, so every fixture filer is one the chart cannot
+#        route — and DIVE-3171 routes exactly that filer's eligible tier-1 eng
+#        approval to `_gate_standing_lead`, which this arm stubs to `main`. So
+#        `task need` began PERSISTING routed_reviewer=main here, the DIVE-1182
+#        ROUTED branch won, and the arm stamped `lead:main` and reported that it had
+#        graded nothing (which is the harness working: it refused to score a pass on
+#        a path that never ran). The arm's SUBJECT is unchanged and its isolation is
+#        now an INPUT it writes down, exactly as `mkgate` above writes down the
+#        opposite input for the routed arms — "routed_reviewer is the INPUT to the
+#        path under test, not part of what it decides". Clearing it after filing is
+#        therefore not an accommodation of DIVE-3171; it is the same discipline the
+#        routed arms already had, applied to the arm that needs the column EMPTY.
+#        The new interaction is not lost — arm 5b below grades it directly.
 reset
 SUDO_NONAGENT=1
 _gate_standing_lead() { printf 'main'; }
 t5=$(addt --assignee=dev -- "fixture standing approval $FIXTURE_MARK")
 cmd_task_need "$t5" --type=approval --ask="merge the CLI fix to main" --tier=1 >/dev/null 2>&1
+db "UPDATE tasks SET routed_reviewer=NULL WHERE id=${t5};" >/dev/null 2>&1
 ( actor_seam_as main; cmd_task_answer "$t5" --value="approved" --human --from=main >/dev/null 2>&1 )
 BY5=$(nby "$t5"); ROW5=$(row)
 if [[ "$BY5" == "lead:standing:main" ]]; then
@@ -210,6 +257,72 @@ else
   bad_t "standing clear did not engage — this arm graded nothing" \
         "need_answered_by='$BY5' row='$ROW5'"
 fi
+
+# --- 5b. DIVE-3171: THE STANDING PROVENANCE SURVIVES THE ROUTE. ------------------
+#         The gate DIVE-3171 mints carries a routed_reviewer, so the DIVE-1182 ROUTED
+#         branch fires first and would stamp `lead:<n>` — for a clear the SEAL is the
+#         entire reason for. The two labels are different authorities even when the
+#         same name appears in both: `lead:<n>` says the row named the reviewer,
+#         `lead:standing:<n>` says the constitution did. Losing the second is the
+#         class that cost three incidents on 2026-08-10, and it would move a count
+#         nobody re-derives (a tally of `lead:standing:` for a root-filed gate would
+#         read as "the standing path went unused"). So the route's SOURCE is persisted
+#         at file time and the stamp is decided from it.
+#
+#         Both halves are graded, and the first is what stops the second passing
+#         vacuously: an empty `route_provenance` would mean the standing route never
+#         fired, and then a `lead:standing:` stamp would be coming from somewhere else.
+reset
+SUDO_NONAGENT=1
+_gate_standing_lead() { printf 'main'; }
+t5b=$(addt --assignee=dev -- "fixture standing-routed approval $FIXTURE_MARK")
+cmd_task_need "$t5b" --type=approval --ask="merge the CLI fix to main" --tier=1 >/dev/null 2>&1
+RR5B=$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE id=${t5b};")
+RP5B=$(db "SELECT COALESCE(route_provenance,'') FROM tasks WHERE id=${t5b};")
+[[ "$RR5B" == "main" && "$RP5B" == "seal:standing-lead" ]] \
+  && ok_t "DIVE-3171 persists WHO routed and WHY, in one write (route_provenance=seal:standing-lead)" \
+  || bad_t "DIVE-3171 persists the route and its source" "routed_reviewer='$RR5B' route_provenance='$RP5B' (either empty means the standing route did not fire, so the stamp arm below grades nothing)"
+( actor_seam_as main; cmd_task_answer "$t5b" --value="approved" --human --from=main >/dev/null 2>&1 )
+BY5B=$(nby "$t5b")
+[[ "$BY5B" == "lead:standing:main" ]] \
+  && ok_t "a standing-ROUTED clear still stamps lead:standing:main — routing does not swallow the seal" \
+  || bad_t "standing-routed clear keeps its standing provenance" "need_answered_by='$BY5B' (expected lead:standing:main; 'lead:main' means the routed branch swallowed it)"
+
+# --- 5c. NEGATIVE CONTROL for 5b: a CHART-routed clear must NOT acquire the ------
+#         standing label. Without this, 5b passes just as well under "always stamp
+#         lead:standing: when the actor is the standing lead" — which would relabel
+#         every routed clear in the fleet and move the very count 5b exists to protect,
+#         in the other direction. The discriminator is `route_provenance`, so this arm
+#         files the same eligible gate and then overwrites the column with `chart`,
+#         leaving every other input identical.
+reset
+SUDO_NONAGENT=1
+_gate_standing_lead() { printf 'main'; }
+t5c=$(addt --assignee=dev -- "fixture chart-routed approval $FIXTURE_MARK")
+cmd_task_need "$t5c" --type=approval --ask="merge the CLI fix to main" --tier=1 >/dev/null 2>&1
+db "UPDATE tasks SET routed_reviewer='main', route_provenance='chart' WHERE id=${t5c};" >/dev/null 2>&1
+( actor_seam_as main; cmd_task_answer "$t5c" --value="approved" --human --from=main >/dev/null 2>&1 )
+BY5C=$(nby "$t5c")
+[[ "$BY5C" == "lead:main" ]] \
+  && ok_t "a CHART-routed clear stays lead:main — the standing label is scoped by route_provenance" \
+  || bad_t "chart-routed clear does not acquire the standing label" "need_answered_by='$BY5C' (expected lead:main)"
+
+# --- 5d. NEGATIVE CONTROL: a row from BEFORE this build (route_provenance NULL) ---
+#         keeps its existing stamp. NULL is "this build never recorded it", not
+#         "seal", so no historical row is relabelled by the migration backfilling the
+#         column to NULL. This is the arm that says the count shift is confined to
+#         gates minted by the new route.
+reset
+SUDO_NONAGENT=1
+_gate_standing_lead() { printf 'main'; }
+t5d=$(addt --assignee=dev -- "fixture legacy routed approval $FIXTURE_MARK")
+cmd_task_need "$t5d" --type=approval --ask="merge the CLI fix to main" --tier=1 >/dev/null 2>&1
+db "UPDATE tasks SET routed_reviewer='main', route_provenance=NULL WHERE id=${t5d};" >/dev/null 2>&1
+( actor_seam_as main; cmd_task_answer "$t5d" --value="approved" --human --from=main >/dev/null 2>&1 )
+BY5D=$(nby "$t5d")
+[[ "$BY5D" == "lead:main" ]] \
+  && ok_t "a pre-DIVE-3171 row (route_provenance NULL) keeps lead:main — no historical stamp moves" \
+  || bad_t "legacy row keeps its stamp" "need_answered_by='$BY5D' (expected lead:main)"
 
 # --- 7. suite guard: no fixture row reached the real fleet log ----------------
 # Graded by CONTENT, not by byte offset. The offset comparison other harnesses use

@@ -137,7 +137,14 @@ seed()     { db "DELETE FROM tasks WHERE ident='$1';
 statusof() { db "SELECT status FROM tasks WHERE ident='$1';"; }
 resultof() { db "SELECT COALESCE(result,'') FROM tasks WHERE ident='$1';"; }
 refusals() { db "SELECT COUNT(*) FROM policy_refusals WHERE ident='$1';"; }
-run_done() { OUT=$(cmd_task_done "$@" 2>&1); RC=$?; }
+# DIVE-2096: these harnesses grade the PROSE text-binding gate (DIVE-1935/1965/2414),
+# which by definition is exercised with NO `delivery_ref` and no `Branch:` line — and
+# that is now exactly the shape the DIVE-2096 pre-close check refuses, before any of
+# this gate runs. It is not a coverage loss: after DIVE-2096 the prose gate is reached
+# by ASSERTING the reports-on case (`--no-pr`), so asserting it here is what keeps
+# these arms grading the same code as before. `--no-pr` is inert on the arms that DO
+# bind a delivery_ref, so it is applied at the wrapper rather than arm by arm.
+run_done() { OUT=$(cmd_task_done "$@" --no-pr 2>&1); RC=$?; }
 clear_fx() { unset "${!GH_STUB_PR_@}" "${!GH_STUB_PRLIST_@}" "${!GH_STUB_LIST_FAIL_@}" 2>/dev/null; }
 
 # --- 1. the classifier itself -------------------------------------------------
@@ -197,7 +204,7 @@ export GH_STUB_PR_5dive_api_10="$OPEN_X"
 export GH_STUB_PR_5dive_api_17="$OPEN_X"
 : >"$AUDIT_CALLS"
 seed INVOFF-1
-out=$(FIVEDIVE_PROD_TASKS_DB="$TMP/somewhere-else/tasks.db" cmd_task_done INVOFF-1 \
+out=$(FIVEDIVE_PROD_TASKS_DB="$TMP/somewhere-else/tasks.db" cmd_task_done INVOFF-1 --no-pr \
   --result='Shipped as PR #168, merged and green. Follow-ups still open: PR #10 and PR #17 in the api repo.' \
   2>"$TMP/offstore.err"); rc=$?
 [[ $rc -eq 0 && "$(statusof INVOFF-1)" == "done" ]] \

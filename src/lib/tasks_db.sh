@@ -165,7 +165,7 @@ require_sqlite() {
 # NOTE: projects/loop_runs/supervisor_events are ALSO defined inside gated
 # one-shot migration blocks in _tasks_db_migrate() below — edit both copies
 # together; tests/schema_sync_unit.sh fails CI if they diverge.
-_TASKS_SCHEMA_EPOCH='3098-1'   # DIVE-3098: +graded_at, +graded_by
+_TASKS_SCHEMA_EPOCH='2730-1'   # DIVE-2730: +verify_optout
 _tasks_schema() {
   cat <<'SQL'
 PRAGMA journal_mode=WAL;
@@ -238,6 +238,35 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- Declared HERE as well as in _TASKS_ADDITIVE_COLUMNS: a fresh store takes this
   -- CREATE, and the migration gate must find this column before it may skip.
   floor_provenance TEXT,
+  -- DIVE-3171: why this gate has this ROUTED_REVIEWER — the sibling axis to
+  -- floor_provenance above, which DIVE-3117 named as missing while fixing a routing
+  -- defect it could not measure ("the TIER axis had a floor, its sibling ROUTING axis
+  -- had none"). Values:
+  --   chart              _gate_route_reviewer resolved them from agents_org
+  --   verifier-loop      DIVE-1495 routed to the row's verifier
+  --   seal:standing-lead DIVE-3171 — the chart resolved NOBODY and the SEALED
+  --                      constitution's eng_approval_lead took the gate
+  -- NULL is a real third state, exactly as for floor_provenance (DIVE-2615): it means
+  -- this build never recorded it, NOT that the route had no source. Conflating the two
+  -- is what made the existing floor column unusable for a whole release.
+  -- WHY IT IS A COLUMN AND NOT A DERIVATION: `cmd_task_answer` reads it to decide
+  -- whether a lead-clear is stamped `lead:` or `lead:standing:`, and re-deriving it
+  -- would mean re-reading agents_org — an agent-writable table (DIVE-2233) — at answer
+  -- time, so a chart edit between filing and answering would silently change what the
+  -- record says HAPPENED. A recorded fact beats a re-derived one; that is the whole
+  -- lesson of the three 2026-08-10 provenance incidents.
+  route_provenance TEXT,
+  -- DIVE-2354: WHICH of the two orders this gate is in, as data.
+  --   approve-to-send   the action has NOT happened; the tap authorises it (default).
+  --   confirm-after-send the action ALREADY happened; the tap RATIFIES it after the fact.
+  -- NULL is a real third state and not a synonym for either: it means the gate was
+  -- filed before this column existed, so the record does not say which order it was
+  -- (the same distinction as unreadable-vs-absent, DIVE-2327). Readers must render
+  -- the three apart -- a ratification that renders as a prior approval is the exact
+  -- false record this ticket exists to end. Declared HERE as well as in
+  -- _TASKS_ADDITIVE_COLUMNS: a fresh store takes this CREATE and never runs the
+  -- ALTER loop, per the rule above.
+  gate_mode TEXT,
   parent_id   INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   started_at  TEXT,
@@ -303,6 +332,18 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- DIVE-1518: independently records which authenticated evidence form cleared
   -- the current gate (tap nonce, sudo uid, channel session, or proof).
   human_evidence   TEXT,
+  -- DIVE-3128: the RELAY, kept OUT of need_answered_by rather than folded into
+  -- it. A Telegram button tap reaches this CLI through some agent's bot, and
+  -- until now the relaying agent's own identity was what got the `human:`
+  -- prefix — so `human:olivia` meant either "a person tapped, olivia's bot
+  -- carried it" or "the olivia agent cleared its own human gate", with nothing
+  -- in the row to tell them apart (DIVE-3045). Two columns, two facts:
+  --   need_answered_by     WHO decided
+  --   need_answered_relay  WHOSE BOT carried the decision
+  -- need_answered_tap_uid is the Telegram user id of the person who tapped, kept
+  -- as TEXT because Telegram ids are opaque identifiers, not arithmetic.
+  need_answered_relay   TEXT,
+  need_answered_tap_uid TEXT,
   -- Recurring task templates (DIVE step 1). kind='recurring' marks a row as a
   -- TEMPLATE, not work: it's excluded from the work board, the heartbeat TODO
   -- count + wake, and the human inbox, so it's never picked up directly.
@@ -323,6 +364,30 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- reaching it at all. Deliberately a separate column, not a status: the
   -- dedup decision itself is unchanged by this.
   last_skipped_at  TEXT,
+  -- DIVE-2272 (decision DIVE-2270). The PER-TEMPLATE overlap policy. NULL means
+  -- 'skip' -- every template that predates this column keeps today's behaviour
+  -- byte for byte, which is why this is a nullable add and not a NOT NULL
+  -- DEFAULT 'skip': a backfilled default and an unset value would then be
+  -- indistinguishable, and 'nobody has classified this template yet' is a state
+  -- the classification pass needs to be able to SEE.
+  --   skip  = an open instance suppresses the next slot (today's dedup).
+  --   spawn = fire anyway, UP TO overlap_bound open instances; past the bound,
+  --           skip AND stamp last_skipped_at, i.e. degrade to exactly the
+  --           now-legible skip behaviour rather than invent new alarm machinery.
+  -- WHY PER-TEMPLATE: skip-if-open is a claim about the VALUE of a pile-up, and
+  -- that value is class-dependent. For a fungible chore (disk reclaim, hygiene
+  -- sweep) three open instances are three copies of one job and dedup is right.
+  -- For a reading-of-the-present job (recap, version loop) Tuesday's instance
+  -- cannot be discharged by Wednesday's run, so three open instances mean nobody
+  -- has read the inbox in three days -- the pile-up IS the alarm the dedup
+  -- deletes. Only the template's author knows the class; the scheduler cannot
+  -- infer it.
+  on_overlap       TEXT,
+  -- The bound for on_overlap='spawn'. NULL means the built-in default (3).
+  -- A JUDGMENT CALL, NOT A MEASUREMENT: 3 open recaps is unmistakable to a human
+  -- and 300 is a different outage. Tunable per template precisely so the number
+  -- is never mistaken for something derived.
+  overlap_bound    INTEGER,
   -- DIVE-138 step 2. A materialized instance links back to the recurring
   -- template it was cloned from via from_template_id (NULL for templates and
   -- ordinary tasks); the materializer's skip-if-open dedup keys on it. NOT a FK
@@ -412,6 +477,24 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- written reason so the template re-fires, and this column is what stops a
   -- reassignment from thrashing the row around the fleet tick after tick.
   recurring_stall_escalated_at TEXT,
+  -- DIVE-3218: nudge_escalated_at / nudge_parked_at throttle the two rungs of the
+  -- nudge-threshold ladder (heartbeat). They are stamped ONCE PER ROW, not per
+  -- wake: the ladder's job is to force a state change after N fruitless nudges,
+  -- and a rung that could re-fire every tick would escalate a row to urgent N
+  -- times over. Deliberately NOT cleared when the row is re-queued — the count
+  -- of sessions already burned on this row is a property of the row, not of its
+  -- current status, and re-arming the ladder on every requeue is how a reassign
+  -- turns into a thrash around the fleet (the DIVE-2853 lesson).
+  nudge_escalated_at TEXT,
+  -- DIVE-3218: the nudge COUNT at which rung 1 fired. Rung 2 keys on
+  -- nudge_escalated_n + N, never on 2*N recomputed from the current priority,
+  -- because rung 1's own escalation RAISES the band and a higher band has a
+  -- SMALLER N — so a row escalated at the high threshold of 16 is instantly past
+  -- an urgent 2N of 16 and both rungs fire on the same wake. Storing the count
+  -- makes rung 2 "one more full threshold of fruitless wakes AFTER we escalated",
+  -- which is what the ladder means and is immune to the band moving underneath it.
+  nudge_escalated_n INTEGER,
+  nudge_parked_at TEXT,
   -- DIVE-891: risk-tiered gates (adopted design DIVE-861). tier is set when the
   -- gate is filed: 0 = auto-clear (rec applies immediately, digest line only),
   -- 1 = agent-clearable + 48h TTL auto-applies the recommendation, 2 = hard
@@ -525,7 +608,24 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- default" claim is never quietly false. NULL/0 for every task that got a real
   -- grader, opted out via --no-verify, or is trivial. Same integrity-invariant
   -- spirit as the council founder-excluded badge.
-  verify_unavailable      INTEGER
+  verify_unavailable      INTEGER,
+  -- DIVE-2730: the filer's EXPLICIT `--no-verify` at add time, set to 1 there and
+  -- NULL everywhere else. It exists because a decision and a default that produce
+  -- the same stored state ARE the same state: before this column, `--no-verify`
+  -- was a local shell var in `task add` that died with the process, so at
+  -- `task done` an explicit opt-out was byte-identical to a DIVE-969 auto-skipped
+  -- row (both verifier NULL, verify_unavailable NULL), so `task done` could not
+  -- NAME what it was overriding when DIVE-2719's UPGRADE arm re-attached a grader.
+  -- Distinct from verify_unavailable, which records that no distinct grader
+  -- EXISTED — this records that one was not WANTED.
+  -- IT IS A RECORD, NOT A CONTROL, and deliberately so: the upgrade still fires
+  -- on an opted-out row, because the flag is declared at FILE time and the blast
+  -- radius is measured at DELIVERY time, and a file-time sentence must not
+  -- pre-authorise closing a credentials diff nobody had written yet. What it buys
+  -- is that the override is stated instead of silent, and that the two NULLs stop
+  -- being one. Set only by `task add --no-verify`; cleared by
+  -- `task verifier <id> <agent>`, since an explicit attach supersedes the refusal.
+  verify_optout           INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_precedent ON tasks(need_type, ask_shape);
 CREATE INDEX IF NOT EXISTS idx_tasks_originated ON tasks(originated_by_objective);
@@ -743,7 +843,13 @@ CREATE TABLE IF NOT EXISTS gate_history (
   human_nonce_hash  TEXT,
   retired_by        TEXT NOT NULL,
   retired_at        TEXT NOT NULL DEFAULT (datetime('now')),
-  floor_provenance  TEXT
+  floor_provenance  TEXT,
+  -- DIVE-3171: carried for the same reason floor_provenance is. A retired gate that
+  -- keeps its TIER's provenance and drops its ROUTE's is the half-record that makes a
+  -- later count wrong in one direction only, and the count at stake here is "how often
+  -- did the standing authority actually carry a gate".
+  route_provenance  TEXT,
+  gate_mode         TEXT
 );
 CREATE INDEX IF NOT EXISTS gate_history_task_idx ON gate_history(task_id, id);
 
@@ -1150,6 +1256,15 @@ tasks_db_init() {
 # "<column> <type>"; existing rows backfill to NULL. Pure expand (no contract),
 # so old queries/rows remain readable after downgrade. project_key deliberately
 # omits REFERENCES here because sqlite rejects a non-NULL FK default on ADD.
+# DIVE-2272: the fleet-wide fallback bound for an on_overlap='spawn' template that
+# sets no overlap_bound of its own. A JUDGMENT CALL, NOT A MEASUREMENT — 3 open
+# recaps is unmistakable to a human and 300 is a different outage. Env-tunable and
+# per-template overridable precisely so the number is never read as derived.
+# Lives here, not in cmd_heartbeat.sh, so the materializer and `task ls --recurring`
+# read the SAME default (the DIVE-2055 no-disagreement rule for that table).
+TASKS_OVERLAP_BOUND_DEFAULT="${HEARTBEAT_OVERLAP_BOUND:-3}"
+[[ "$TASKS_OVERLAP_BOUND_DEFAULT" =~ ^[1-9][0-9]*$ ]] || TASKS_OVERLAP_BOUND_DEFAULT=3
+
 _TASKS_ADDITIVE_COLUMNS=(
   'result TEXT' 'need_type TEXT' 'ask TEXT' 'need_options TEXT' 'recommend TEXT'
   'need_answer TEXT' 'need_answered_at TEXT'
@@ -1163,6 +1278,7 @@ _TASKS_ADDITIVE_COLUMNS=(
   'iteration INTEGER' 'maker_agent TEXT' 'handoff_ack_at TEXT' 'task_budget TEXT'
   'handoff_delivered_at TEXT' 'handoff_stale_pinged_at TEXT' 'handoff_rejected_at TEXT'
   'recurring_stall_pinged_at TEXT' 'recurring_stall_escalated_at TEXT'
+  'nudge_escalated_at TEXT' 'nudge_escalated_n INTEGER' 'nudge_parked_at TEXT'
   'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT'
   'gate_filed_by TEXT'
   'secret_key TEXT' 'connector TEXT' 'secret_oob TEXT' 'human_nonce_hash TEXT'
@@ -1173,11 +1289,29 @@ _TASKS_ADDITIVE_COLUMNS=(
   'delivery_ref TEXT' 'delivered_at TEXT' 'delivery_ref_iteration INTEGER'
   'originated_by_objective INTEGER' 'originated_cycle INTEGER'
   'verify_unavailable INTEGER' 'last_skipped_at TEXT'
+  # DIVE-2730: the add-time `--no-verify`, persisted. Nullable — NULL is "the
+  # filer did not opt out", which is the truth for every pre-existing row, so the
+  # backfill is a no-op. See the CREATE TABLE comment for why an unpersisted
+  # refusal reads downstream as a default absence.
+  'verify_optout INTEGER'
+  # DIVE-2272: per-template overlap policy. Both NULLABLE on purpose -- NULL is
+  # 'skip' / 'the default bound', so the migration is a no-op for every existing
+  # template AND an unclassified template stays visibly unclassified. See the
+  # CREATE TABLE comment for why the pile-up's value is per-template.
+  'on_overlap TEXT' 'overlap_bound INTEGER'
   'human_evidence TEXT' 'derived_actor TEXT' 'floor_provenance TEXT'
+  # DIVE-3171: the ROUTING axis's provenance, sibling to floor_provenance. See the
+  # CREATE TABLE comment for the values and for why it is stored, not derived.
+  'route_provenance TEXT'
+  # DIVE-3128: the tapping human vs the relaying bot, separated. See the CREATE
+  # TABLE comment above for why folding them into one string was the defect.
+  'need_answered_relay TEXT' 'need_answered_tap_uid TEXT'
   # DIVE-3098: a verifier grade recorded by `task verify --no-done`. Structural on
   # purpose — the terminal-for-verifier predicate must not key on result TEXT,
   # which the MAKER's `task deliver --result=` also writes.
   'graded_at TEXT' 'graded_by TEXT'
+  # DIVE-2354: approve-to-send | confirm-after-send. See the CREATE TABLE comment.
+  'gate_mode TEXT'
 )
 
 # DIVE-3098 - TERMINAL FOR THE VERIFIER, as ONE SQL boolean expression.
@@ -1610,7 +1744,13 @@ CREATE TABLE IF NOT EXISTS gate_history (
   human_nonce_hash  TEXT,
   retired_by        TEXT NOT NULL,
   retired_at        TEXT NOT NULL DEFAULT (datetime('now')),
-  floor_provenance  TEXT
+  floor_provenance  TEXT,
+  -- DIVE-3171: carried for the same reason floor_provenance is. A retired gate that
+  -- keeps its TIER's provenance and drops its ROUTE's is the half-record that makes a
+  -- later count wrong in one direction only, and the count at stake here is "how often
+  -- did the standing authority actually carry a gate".
+  route_provenance  TEXT,
+  gate_mode         TEXT
 );
 CREATE INDEX IF NOT EXISTS gate_history_task_idx ON gate_history(task_id, id);
 MIG
@@ -1625,12 +1765,34 @@ MIG
   # already carries `floor_provenance TEXT`, added out-of-band by something that
   # left no trace in this repo — the column existed with no writer, no migration
   # and no reference in src/ or tests/, which is why it read NULL on all 79 rows.
+  # DIVE-2354: additive gate_mode on an ALREADY-CREATED gate_history, for the same
+  # reason floor_provenance needs one directly below -- the create-if-absent block
+  # above reaches only stores that have never filed a gate.
+  local has_gh_gatemode
+  has_gh_gatemode=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM pragma_table_info('gate_history') WHERE name='gate_mode' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_gh_gatemode" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+      "ALTER TABLE gate_history ADD COLUMN gate_mode TEXT;" >/dev/null 2>&1 || true
+  fi
+
   local has_gh_floorprov
   has_gh_floorprov=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
     "SELECT 1 FROM pragma_table_info('gate_history') WHERE name='floor_provenance' LIMIT 1;" 2>/dev/null)
   if [[ "$has_gh_floorprov" != "1" ]]; then
     sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
       "ALTER TABLE gate_history ADD COLUMN floor_provenance TEXT;" >/dev/null 2>&1 || true
+  fi
+
+  # DIVE-3171: additive route_provenance on an ALREADY-CREATED gate_history, for the
+  # same reason its two siblings above need one — the create-if-absent block reaches
+  # only stores that have never filed a gate, which is no box that has ever run.
+  local has_gh_routeprov
+  has_gh_routeprov=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM pragma_table_info('gate_history') WHERE name='route_provenance' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_gh_routeprov" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+      "ALTER TABLE gate_history ADD COLUMN route_provenance TEXT;" >/dev/null 2>&1 || true
   fi
 
   # DIVE-748 — additive scorecard column on already-created loop_runs tables.
@@ -2175,11 +2337,13 @@ _gate_archive_and_clear_sql() {
     "INSERT INTO gate_history (task_id, ident, need_type, ask, need_options, recommend," \
     "                          tier, need_asked_at, need_answer, need_answered_at," \
     "                          need_answered_by, need_answered_uid, need_answer_sig," \
-    "                          human_nonce_hash, retired_by, floor_provenance)" \
+    "                          human_nonce_hash, retired_by, floor_provenance," \
+    "                          route_provenance, gate_mode)" \
     "  SELECT id, ident, need_type, ask, need_options, recommend," \
     "         tier, need_asked_at, need_answer, need_answered_at," \
     "         need_answered_by, need_answered_uid, need_answer_sig," \
-    "         human_nonce_hash, $(sqlq "$verb"), floor_provenance" \
+    "         human_nonce_hash, $(sqlq "$verb"), floor_provenance," \
+    "         route_provenance, gate_mode" \
     "    FROM tasks" \
     "   WHERE (${pred})" \
     "     AND (need_type IS NOT NULL OR need_answer IS NOT NULL" \

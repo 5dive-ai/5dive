@@ -381,5 +381,212 @@ else
   bad_t "2271 differential: the same skip stamps after the write recovers"
 fi
 
+# ===========================================================================
+# DIVE-2272: the per-template overlap policy (--on-overlap=skip|spawn).
+#
+# The arms below are ordered so the DANGEROUS one is not vacuous. Arm 4 is the
+# ticket's non-negotiable requirement: FORCE THE COUNT READ TO FAIL under
+# on_overlap='spawn' and assert the tick neither spawns nor stamps. Exercising a
+# healthy read proves nothing about the property that matters, because the whole
+# hazard is that promoting `open` from a BOOLEAN to a MAGNITUDE re-aims its error
+# sentinel — the old `|| echo 1` is conservative against "nonzero -> skip" and
+# PERMISSIVE against "1 < 3 -> spawn", and the bound that is supposed to backstop
+# spawn is computed from the very read that is failing.
+mk_tmpl_policy() {  # mk_tmpl_policy <title> <skip|spawn> [bound] -> row id
+  local tid; tid=$(mk_template "$1" todo)
+  db "UPDATE tasks SET on_overlap=$(sqlq "$2"), overlap_bound=${3:-NULL} WHERE id=${tid};" >/dev/null
+  printf '%s' "$tid"
+}
+open_of() { db "SELECT COUNT(*) FROM tasks WHERE from_template_id=${1} AND status NOT IN ('done','cancelled');"; }
+
+# --- Arm 1: the NO-OP MIGRATION. A template with on_overlap NULL (every template
+# that predates this column) must behave byte-for-byte as before: fire once, then
+# be suppressed by its own open instance, stamping last_skipped_at.
+t_legacy=$(mk_template "legacy NULL-policy template" todo)
+_hb_materialize_recurring "$((t0 + 1080))"
+legacy_after_first=$(instances_of "$t_legacy")
+: >"$LOG"
+_hb_materialize_recurring "$((t0 + 1200))"
+if [[ "$legacy_after_first" == "1" && "$(instances_of "$t_legacy")" == "1" \
+      && -n "$(last_skipped_of "$t_legacy")" ]]; then
+  ok_t "2272 no-op migration: on_overlap NULL still dedups and stamps (today's behaviour)"
+else
+  bad_t "2272 no-op migration: on_overlap NULL still dedups and stamps (today's behaviour)" \
+        "first=${legacy_after_first} now=$(instances_of "$t_legacy") last_skipped='$(last_skipped_of "$t_legacy")'"
+fi
+
+# --- Arm 2: an EXPLICIT skip is identical to NULL. Stored as a value (not left
+# NULL) so "classified as skip" and "never classified" stay distinguishable, but
+# the SCHEDULER must not be able to tell them apart.
+t_skip=$(mk_tmpl_policy "explicit skip template" skip)
+_hb_materialize_recurring "$((t0 + 1320))"
+_hb_materialize_recurring "$((t0 + 1440))"
+if [[ "$(instances_of "$t_skip")" == "1" && -n "$(last_skipped_of "$t_skip")" ]]; then
+  ok_t "2272 explicit skip: behaves exactly like the NULL default"
+else
+  bad_t "2272 explicit skip: behaves exactly like the NULL default" \
+        "instances=$(instances_of "$t_skip") last_skipped='$(last_skipped_of "$t_skip")'"
+fi
+
+# --- Arm 3: spawn fires DESPITE open instances, up to the bound, and at the bound
+# degrades to EXACTLY today's skip-and-stamp rather than new alarm machinery.
+t_spawn=$(mk_tmpl_policy "spawn template (bound 3)" spawn 3)
+_hb_materialize_recurring "$((t0 + 1560))"
+_hb_materialize_recurring "$((t0 + 1680))"
+if [[ "$(instances_of "$t_spawn")" == "2" ]]; then
+  ok_t "2272 spawn: fires a SECOND instance while the first is still open"
+else
+  bad_t "2272 spawn: fires a SECOND instance while the first is still open" \
+        "expected 2 instances, got $(instances_of "$t_spawn")"
+fi
+_hb_materialize_recurring "$((t0 + 1800))"     # -> 3 open, i.e. AT the bound
+spawn_at_bound=$(instances_of "$t_spawn")
+db "UPDATE tasks SET last_skipped_at=NULL WHERE id=${t_spawn};" >/dev/null
+: >"$LOG"
+_hb_materialize_recurring "$((t0 + 1920))"     # the tick that must NOT fire
+if [[ "$spawn_at_bound" == "3" && "$(instances_of "$t_spawn")" == "3" ]]; then
+  ok_t "2272 spawn bound: the 4th slot does NOT fire — 3 open is the ceiling"
+else
+  bad_t "2272 spawn bound: the 4th slot does NOT fire — 3 open is the ceiling" \
+        "at_bound=${spawn_at_bound} after=$(instances_of "$t_spawn")"
+fi
+if [[ -n "$(last_skipped_of "$t_spawn")" ]] && grep -q 'skip (bounded)' "$LOG"; then
+  ok_t "2272 spawn bound: degrades to skip AND stamps last_skipped_at (the legible path)"
+else
+  bad_t "2272 spawn bound: degrades to skip AND stamps last_skipped_at (the legible path)" \
+        "last_skipped='$(last_skipped_of "$t_spawn")' log=$(cat "$LOG")"
+fi
+# The differential: closing one instance drops below the bound and the beat resumes.
+db "UPDATE tasks SET status='done' WHERE id=(SELECT MIN(id) FROM tasks WHERE from_template_id=${t_spawn});" >/dev/null
+_hb_materialize_recurring "$((t0 + 2040))"
+if [[ "$(open_of "$t_spawn")" == "3" && "$(instances_of "$t_spawn")" == "4" ]]; then
+  ok_t "2272 spawn differential: back under the bound, the beat fires again"
+else
+  bad_t "2272 spawn differential: back under the bound, the beat fires again" \
+        "open=$(open_of "$t_spawn") total=$(instances_of "$t_spawn")"
+fi
+
+# --- Arm 4 (THE REQUIRED ONE): FORCE THE COUNT READ TO FAIL under spawn.
+#
+# This is the arm the ticket says cannot be omitted. Under the OLD collapse the
+# read failure became the literal 1; 1 < 3, so the bound would not trip and the
+# tick would SPAWN on a DB it could not read — a fail-open that WRITES, and one
+# the bound cannot backstop because the bound is derived from the same read.
+# Both forging inputs are exercised: a non-zero exit AND rc 0 with empty output.
+t_spawn_err=$(mk_tmpl_policy "spawn template, unreadable count" spawn 3)
+t_spawn_ctl=$(mk_tmpl_policy "spawn control, healthy read"      spawn 3)
+_hb_materialize_recurring "$((t0 + 2160))"     # one real instance each
+db "UPDATE tasks SET last_fired_at='${SENTINEL}', last_skipped_at=NULL WHERE id IN (${t_spawn_err}, ${t_spawn_ctl});" >/dev/null
+err_before=$(instances_of "$t_spawn_err")
+
+for mode in error empty; do
+  : >"$LOG"
+  DB_FAIL_MATCH="from_template_id=${t_spawn_err} AND status NOT IN"
+  DB_FAIL_MODE="$mode"
+  _hb_materialize_recurring "$((t0 + 2280))"
+  DB_FAIL_MATCH=''
+  # Grade the stub itself first: if it never fired, every assertion below is
+  # vacuous and this is the only line that would say so.
+  if grep -q 'UNREADABLE' "$LOG"; then
+    ok_t "2272 spawn read-fail (${mode}): the failed count is logged AS a failed read"
+  else
+    bad_t "2272 spawn read-fail (${mode}): the failed count is logged AS a failed read" "$(cat "$LOG")"
+  fi
+  if [[ "$(instances_of "$t_spawn_err")" == "$err_before" ]]; then
+    ok_t "2272 spawn read-fail (${mode}): does NOT spawn — the failure never reaches the bound"
+  else
+    bad_t "2272 spawn read-fail (${mode}): does NOT spawn — the failure never reaches the bound" \
+          "the fail-open reversed direction and WROTE: ${err_before} -> $(instances_of "$t_spawn_err")"
+  fi
+  if [[ -z "$(last_skipped_of "$t_spawn_err")" ]]; then
+    ok_t "2272 spawn read-fail (${mode}): stamps NO suppression — an error is not a dedup decision"
+  else
+    bad_t "2272 spawn read-fail (${mode}): stamps NO suppression — an error is not a dedup decision" \
+          "forged suppression at '$(last_skipped_of "$t_spawn_err")'"
+  fi
+  if [[ "$(last_fired_of "$t_spawn_err")" == "$SENTINEL" ]]; then
+    ok_t "2272 spawn read-fail (${mode}): last_fired_at untouched — the tick stamped nothing"
+  else
+    bad_t "2272 spawn read-fail (${mode}): last_fired_at untouched — the tick stamped nothing" \
+          "sentinel '${SENTINEL}', now '$(last_fired_of "$t_spawn_err")'"
+  fi
+  db "UPDATE tasks SET last_fired_at='${SENTINEL}' WHERE id=${t_spawn_ctl};" >/dev/null
+done
+
+# The control + the differential, together: a healthy spawn template in the SAME
+# passes kept firing (so the fault was targeted, not global), and the injured one
+# recovers the moment the stub is removed (so the arms above measured the fault
+# and not some unrelated ineligibility).
+if [[ "$(instances_of "$t_spawn_ctl")" -gt 1 ]]; then
+  ok_t "2272 spawn control: a healthy spawn template in the SAME pass still fires"
+else
+  bad_t "2272 spawn control: a healthy spawn template in the SAME pass still fires" \
+        "instances=$(instances_of "$t_spawn_ctl")"
+fi
+_hb_materialize_recurring "$((t0 + 2400))"
+if [[ "$(instances_of "$t_spawn_err")" -gt "$err_before" ]]; then
+  ok_t "2272 spawn differential: the same template fires once the read recovers"
+else
+  bad_t "2272 spawn differential: the same template fires once the read recovers" \
+        "still ${err_before}"
+fi
+
+# --- Arm 5: the default bound applies when the template sets none, and it is the
+# SHARED constant — not a second copy that can drift from `task ls --recurring`.
+t_dflt=$(mk_tmpl_policy "spawn template, default bound" spawn)
+for i in 1 2 3 4 5; do _hb_materialize_recurring "$((t0 + 2520 + i * 120))"; done
+if [[ "$(instances_of "$t_dflt")" == "${TASKS_OVERLAP_BOUND_DEFAULT}" ]]; then
+  ok_t "2272 default bound: an unset overlap_bound stops at TASKS_OVERLAP_BOUND_DEFAULT (${TASKS_OVERLAP_BOUND_DEFAULT})"
+else
+  bad_t "2272 default bound: an unset overlap_bound stops at TASKS_OVERLAP_BOUND_DEFAULT (${TASKS_OVERLAP_BOUND_DEFAULT})" \
+        "expected ${TASKS_OVERLAP_BOUND_DEFAULT} instances, got $(instances_of "$t_dflt")"
+fi
+
+# --- Arm 6: the LISTING must not tell a different story than the SCHEDULER.
+# The DIVE-2055 rule for this table, load-bearing now that there are two policies
+# for it to disagree about. `blocked_by` under skip names the blocking instance
+# (covered above); under spawn an open instance blocks NOTHING until the bound, so
+# naming it would send a reader to close a row that is suppressing nothing — the
+# same wasted trip DIVE-2273's forged last_skipped_at sends them on.
+t_disp=$(mk_tmpl_policy "display-policy spawn template" spawn 2)
+_hb_materialize_recurring "$((t0 + 3240))"      # 1 open, UNDER the bound
+# NB: the 2237 surface arms above ran `JSON_MODE=0 box_list=$(...)`, which is TWO
+# ASSIGNMENTS, not a prefixed command — so JSON_MODE stayed 0 from there on. Set
+# the renderer explicitly here rather than inheriting whatever the last arm left.
+JSON_MODE=1
+disp_json=$(cmd_task_ls --recurring)
+disp_under=$(jq -r '.data.tasks[] | select(.title=="display-policy spawn template") | .blocked_by' <<<"$disp_json")
+disp_pol=$(jq -r '.data.tasks[] | select(.title=="display-policy spawn template") | .on_overlap' <<<"$disp_json")
+if [[ "$disp_under" == "null" || -z "$disp_under" ]]; then
+  ok_t "2272 display: under the bound, a spawn template is NOT reported blocked"
+else
+  bad_t "2272 display: under the bound, a spawn template is NOT reported blocked" \
+        "blocked_by='${disp_under}' — the listing claims a suppression the scheduler is not applying"
+fi
+if [[ "$disp_pol" == "spawn" ]]; then
+  ok_t "2272 display: the policy itself is on the row, not left to be inferred"
+else
+  bad_t "2272 display: the policy itself is on the row, not left to be inferred" "got '${disp_pol}'"
+fi
+# AT the bound the scheduler really does skip, so now the listing must say so.
+_hb_materialize_recurring "$((t0 + 3360))"      # 2 open == bound
+JSON_MODE=1
+disp_at=$(jq -r '.data.tasks[] | select(.title=="display-policy spawn template") | .blocked_by' <<<"$(cmd_task_ls --recurring)")
+# And the same fact through the OTHER renderer, which is the one a human reads.
+JSON_MODE=0 && disp_box=$(cmd_task_ls --recurring); JSON_MODE=1
+: >"$LOG"
+_hb_materialize_recurring "$((t0 + 3480))"
+if [[ "$disp_at" == "bound 2/2" ]] && grep -q 'skip (bounded)' "$LOG"; then
+  ok_t "2272 display: AT the bound the listing reports 'bound 2/2' and the scheduler agrees it skipped"
+else
+  bad_t "2272 display: AT the bound the listing reports 'bound 2/2' and the scheduler agrees it skipped" \
+        "blocked_by='${disp_at}' log=$(cat "$LOG")"
+fi
+if grep -q 'bound 2/2' <<<"$disp_box" && grep -q 'on_overlap' <<<"$disp_box"; then
+  ok_t "2272 display: the box renderer carries the same bound + a policy column"
+else
+  bad_t "2272 display: the box renderer carries the same bound + a policy column" "$disp_box"
+fi
+
 echo "-- ${PASS} passed, ${FAIL} failed --"
 [[ $FAIL -eq 0 ]]

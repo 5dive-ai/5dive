@@ -1,5 +1,150 @@
 # Changelog
 
+## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
+
+DIVE-1935's first iteration was rejected, and for the right reason. It added a
+`sudo -n -u claude gh auth token` arm to `_gate_gh_token` justified by *"agents hold
+passwordless sudo on this host"* — **a per-SEAT grant written as a HOST property.**
+Census at the time: `root-all` 7, `cli-root` 4, `cli-scoped` 5, where a cli-scoped
+sudoers (`NOPASSWD: /usr/local/bin/5dive *`) permits one binary as root and nothing as
+`claude`. So on 9 of 16 seats `sudo -n` was refused, `-n` made the refusal silent,
+`|| true` swallowed it, and resolution returned EMPTY.
+
+**THE FIX IS AN INSTRUMENT CHECK, NOT A FOURTH FALLBACK.** The reason the arm read as
+correct is that its premise was *unfalsifiable from the code*: no amount of re-reading
+a resolver tells you whether it resolves where you are, because every way it fails is
+silent by construction and an empty token is a legitimate state. Any next fallback
+inherits exactly that blind spot.
+
+- **Every resolution arm now leaves a crumb naming its own outcome** (`_gate_tok_why`),
+  and a **REFUSED** sudo is now distinguishable from a **PERMITTED** sudo that found no
+  login — read from sudo's own stderr, not from a second probe, so the call sequence
+  three sibling harnesses assert on is unchanged. The two states have different
+  remedies (this seat's sudoers vs. the host's gh login) and were previously the same
+  silence. Crumbs cross the command-substitution boundary in a file keyed on `$$`, the
+  `_GATE_ANON_STATEF` idiom next door.
+- **The diagnostics name the SEAT** (`user@host uid=N`). The defect was a per-seat fact
+  read as a host-wide one; a diagnostic without the seat reproduces it. Wired into the
+  no-rail refusal, the audited-UNVERIFIED close warning (plus `seat=` on the audit row —
+  the only surface on which an inert gate announces itself), and `task merge-audit`'s
+  unreachable failure.
+- **New `5dive task merge-gate-selftest [--pr=<url>] [--json]`.** Runs the real
+  resolution over the same rail selection the gate makes, then **GRADES it against a
+  control PR that IS merged** and requires `MERGED` to come back. *"A token resolved"*
+  was never the property the gate needs — a credential that cannot see the repo is as
+  blind as none, and the two were indistinguishable. Exit status is the verdict, so the
+  fleet census is reproducible by anyone on their own seat rather than a one-off
+  measurement by whoever held root.
+
+Measured on `agent-dev2` (a cli-scoped seat) with the shipped binary: all four token
+arms fail — arm 4 REFUSED by sudoers — and the self-test still passes, because the
+DIVE-2605 machine-account rail answers. That is the sentence the old code could not
+say, and it is why "no token" must not be read as "gate inert" either.
+
+New `tests/task_merge_gate_selftest_unit.sh` (10 assertions, no root, no network); T5
+and T6 are the positive controls — a blind seat and a rail that answers *wrongly* about
+the control must both FAIL, or the check measures nothing. Sibling gate suites re-run
+green: gh_resolve 7, result_pr 31, anon_rail 31, gate_subject_state 37.
+
+### Also in this change — two fixes routed by main, same file, same credential-less close path
+
+**The gate's own documented exit was a FALSE NEGATIVE, and it shipped in v0.19.20** (found by
+quinn, measured against the live ref). The `done-merge-gate-no-credential` refusal handed the
+caller `git ls-remote <repo-url> refs/heads/main | grep -q <merge-sha>` as the authorised terminal
+move. That resolves ONE ref to its CURRENT value, so it matches only while the merge sha is still
+the **tip** of main — and main takes 20+ commits a day here. The window in which the gate's own
+exit worked was about one commit wide; outside it the script exits non-zero and reports NOT MERGED
+for a PR that merged, **failing closed on precisely the rows the exit exists to rescue.** Now
+`git merge-base --is-ancestor <merge-sha> origin/main` — reachability, whenever it landed. Clause 3
+(`git grep` over `origin/main` for a symbol the PR added) is KEPT: it is the squash-proof half and
+still answers when the sha is nowhere on main. The rewrite also drops a pipe that was never needed
+(`cmd | grep -q` under `pipefail` can return 141 exactly when it matches — latent for a one-line
+producer, per quinn, and not the bug being fixed, but no reason to re-introduce while rewriting).
+Guarded by two new text assertions: the emitted refusal must contain the ancestry form and must not
+contain the tip-equality one. They are text assertions on purpose — the exit is a script the CALLER
+runs, so its correctness can only be read from here, not executed.
+
+**`FIVE_GATE_ANCESTRY_SCAN` default raised 50 → 250, ON FRICTION GROUNDS ONLY.** There are **zero
+stuck rows** — of 37 rows refused in 24h, 30 closed and 5 were cancelled — so nobody should read
+this as unblocking a backlog and go looking for movement in a number that was never moving. What it
+buys is retries: the refusal is inconclusive-by-construction (it walks the bound per repo across 8
+repos and gives up), so a caller below the bound pays in attempts — DIVE-2093 burned 2, and quinn's
+DIVE-3184, DIVE-3229 and DIVE-3230 burned 3 each. On a day where main takes 20+ commits, 50 is too
+short to answer the question the scan was asked. The `FIVE_GATE_ANCESTRY_SCAN` override stays.
+
+
+## v0.19.0 — feat(task): a filing budget the CLI ENFORCES, per filer per rolling 24h (DIVE-3245)
+
+lodar's instinct (2026-08-11 07:42) was to forbid verifiers from filing low/medium rows.
+main measured it before acting and the target was wrong: **verifiers filed 10 of 1092
+low/medium rows in a month. main filed 577.** Of the 1092, **245 were cancelled** and 51 are
+still untouched todo. main already had a filing cap in his own directives; it was not
+binding. *A rule nobody enforces is detection, not control.*
+
+**THE CAP IS 15 LOW/MEDIUM ROWS PER FILER PER ROLLING 24 HOURS.** Derived from 30 days of the
+real board (template-materialized and cli/system rows excluded) by asking how many rows each
+candidate cap WOULD have refused:
+
+| cap | main | olivia | dev | dev3 | everyone else |
+|---|---|---|---|---|---|
+| 10 | 327 | 151 | 78 | 3 | 0 |
+| 12 | 313 | 129 | 47 | 1 | 0 |
+| **15** | **282** | **97** | **18** | **0** | **0** |
+| 20 | 227 | 60 | 7 | 0 | 0 |
+
+**15 is the smallest cap at which no filer outside the top three is ever touched.** Below it
+the cap starts catching dev3, who is not the problem. The median filer's worst rolling-24h in
+that window is **4.5**, and **ten of fourteen filers never exceed 6** — so the ordinary case
+keeps more than 2x headroom while all three runaway filers are bound, dev included. A cap its
+author is exempt from is a suggestion.
+
+**ROLLING, NOT CALENDAR, and that is the design.** The thing being bound is a burst, not a
+mean. Max rolling-24h low/medium per filer, same 30-day window and same exclusions, so a
+reader can re-derive both tables from the board:
+
+| filer | max rolling 24h |
+|---|---|
+| olivia | **71** |
+| main | **60** |
+| dev | **24** |
+| dev3 | 13 |
+| marketing, dev2 | 6 |
+| quinn | 5 |
+| main2, editor, agent-main | 4 |
+| ops, creative | 2 |
+| notdevx, lodar | 1 |
+
+**15 sits below every one of the top three and above every one of the other eleven**, so it
+binds the 25-53/day stretch and the 65-spike entirely (15 < 25) while no ordinary filer ever
+reaches it. Note main is the highest by VOLUME (404 rows in 30 days) but **olivia spikes
+highest** — 71 in one rolling day — so this binds three seats, not one, and olivia meets it
+first. A calendar-day cap would let a burst straddle midnight and clear itself, which is the
+shape that produced the damage.
+
+At the moment of shipping, the last 24h reads dev 10, olivia 8, main 8 — so this does not fire
+today. It fires on the days that made it necessary.
+
+**THERE IS NO BYPASS FLAG, and no env override either.** An env-tunable cap is the bypass
+spelled differently and invisible in the record, and the population this exists to slow down
+is exactly the population that would export it. The escape is `--priority=high|urgent`, which
+is better than a flag because it is not a bypass — it is a claim about severity, recorded on
+the row and falsifiable later. High and urgent are never capped: *a quota that can block a
+serious finding will eventually eat one* (lodar, 2026-08-09).
+
+**The refusal names the alternative, not just the limit** — a refusal that only says "budget
+exhausted" buys silence, not judgement. It points at the body of the row the finding came
+from, and at `community/wiki/` for durable knowledge, which is where DIVE-3245 phase 2 will
+put findings, so the instruction does not change under people when that lands. The refused
+title is written to `policy_refusals` and the ledger rather than lost.
+
+Sits **beside** DIVE-2681's ratio cap, not on top of it: that one caps the proportion of
+internal-machinery titles fleet-wide, this caps one filer's volume whatever the titles say —
+and main's 404 low/medium rows in 30 days almost never classify as machinery, so the ratio cap
+never saw them. Distinct refusal slug, so `task refusals` can tell the two populations apart.
+
+Fails OPEN on an unreadable count, like the caps beside it: a quota that can break `task add`
+is worse than one that occasionally misses.
+
 ## v0.19.0 — feat(task): cap the rubber-stamp gate at the keystroke, not in a doc (DIVE-2848)
 
 `5dive/CLAUDE.md` line 61 has said "human gates only for money / irreversible / secrets /

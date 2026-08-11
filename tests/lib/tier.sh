@@ -396,13 +396,27 @@ tier_cal_clamp_pct() {
 #   WARN  measured exceeds the claim by >= 10% AND by >= 1s. Printed with the exact
 #         replacement line. This is the band a busier host or a slower runner can
 #         produce, and the honest remedy is to update the number, not to red a build.
-#   FAIL  >= 50% AND >= 3s over  ->  exit 5. Runner variance does not double a
-#         harness that is already several seconds long. A claim that far under is
-#         not a stale measurement, it is a wrong one, and it was load-bearing
-#         evidence in a review that already happened.
+#   FAIL  >= 50% AND >= 3s over. Filed on the reasoning that "runner variance does
+#         not double a harness that is already several seconds long", so a claim
+#         that far under is a wrong measurement and not merely a stale one — and it
+#         was load-bearing evidence in a review that already happened.
 #
-# Exit 5 is its OWN code for the same reason over-budget is 4 and a red harness is
-# 1: a red that could mean either gets triaged as neither.
+#         DIVE-3163 MEASURED THAT REASONING FALSE, 2026-08-10, three samples: the
+#         same sha went red then green with no code change; three unrelated
+#         harnesses drifted +47/+66/+73% together in one shard on a branch touching
+#         none of them; and corpus_tier_budget_unit.sh drew 62.1s against its own
+#         41.4s claim (+50%, exactly on this line) on a branch that does not touch
+#         it. Variance of this magnitude on this corpus is measured, not theoretical.
+#
+#         THE THRESHOLDS BELOW ARE UNCHANGED. Raising them would hide the signal
+#         instead of confirming it, and the drift is worth surfacing. What changed is
+#         the VERDICT: the FAIL band prints as a stale-claim warning and no longer
+#         exits 5 unless run-harnesses.sh was passed --drift-fatal=required. The
+#         argument, the numbers, and why the calibration probe cannot substitute for
+#         the missing cross-runner confirmation are beside the drift print there.
+#
+# Exit 5 is still its OWN code for the same reason over-budget is 4 and a red harness
+# is 1: a red that could mean either gets triaged as neither.
 TIER_CLAIM_DRIFT_WARN_PCT=10
 TIER_CLAIM_DRIFT_WARN_S=1
 TIER_CLAIM_DRIFT_FAIL_PCT=50
