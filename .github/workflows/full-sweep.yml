@@ -230,6 +230,15 @@ jobs:
       # dependency true by construction instead of by alphabetical accident.
       - name: Build the bundle (harness precondition, not an accident of ordering)
         run: ./build.sh
+      # DIVE-3017: bun is a PRECONDITION of acp_stdio_unit.sh, which grades the ACP
+      # server, and the full corpus selects it. Without this step the harness reds the
+      # shard that owns it (proven: full-pristine (2) and full-installed-host (2), both
+      # environments, one cause). Declared per job rather than once, because a job that
+      # can select the file and lacks the step is exactly the failure — see the
+      # `acp-graded` job below, which asserts the OUTCOME so a dropped step cannot
+      # quietly go back to being a skip.
+      - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
+        uses: oven-sh/setup-bun@v2
       - name: Run the FULL corpus (budgeted, shard ${{ matrix.shard }})
         run: |
           bash scripts/run-harnesses.sh --tier=full \
@@ -293,6 +302,15 @@ jobs:
       # dependency true by construction instead of by alphabetical accident.
       - name: Build the bundle (harness precondition, not an accident of ordering)
         run: ./build.sh
+      # DIVE-3017: bun is a PRECONDITION of acp_stdio_unit.sh, which grades the ACP
+      # server, and the full corpus selects it. Without this step the harness reds the
+      # shard that owns it (proven: full-pristine (2) and full-installed-host (2), both
+      # environments, one cause). Declared per job rather than once, because a job that
+      # can select the file and lacks the step is exactly the failure — see the
+      # `acp-graded` job below, which asserts the OUTCOME so a dropped step cannot
+      # quietly go back to being a skip.
+      - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
+        uses: oven-sh/setup-bun@v2
       - name: Run the FULL corpus (installed host, budgeted, shard ${{ matrix.shard }})
         run: |
           bash scripts/run-harnesses.sh --tier=full \
@@ -348,6 +366,15 @@ jobs:
       # dependency true by construction instead of by alphabetical accident.
       - name: Build the bundle (harness precondition, not an accident of ordering)
         run: ./build.sh
+      # DIVE-3017: bun is a PRECONDITION of acp_stdio_unit.sh, which grades the ACP
+      # server, and the full corpus selects it. Without this step the harness reds the
+      # shard that owns it (proven: full-pristine (2) and full-installed-host (2), both
+      # environments, one cause). Declared per job rather than once, because a job that
+      # can select the file and lacks the step is exactly the failure — see the
+      # `acp-graded` job below, which asserts the OUTCOME so a dropped step cannot
+      # quietly go back to being a skip.
+      - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
+        uses: oven-sh/setup-bun@v2
       - name: Every harness must be able to FAIL
         run: |
           bash tests/meta/harness-verdict-probe.sh --assume-clean \
@@ -427,6 +454,15 @@ jobs:
       # dependency true by construction instead of by alphabetical accident.
       - name: Build the bundle (harness precondition, not an accident of ordering)
         run: ./build.sh
+      # DIVE-3017: bun is a PRECONDITION of acp_stdio_unit.sh, which grades the ACP
+      # server, and the full corpus selects it. Without this step the harness reds the
+      # shard that owns it (proven: full-pristine (2) and full-installed-host (2), both
+      # environments, one cause). Declared per job rather than once, because a job that
+      # can select the file and lacks the step is exactly the failure — see the
+      # `acp-graded` job below, which asserts the OUTCOME so a dropped step cannot
+      # quietly go back to being a skip.
+      - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
+        uses: oven-sh/setup-bun@v2
       - name: Every harness must be able to FAIL (installed host)
         run: |
           bash tests/meta/harness-verdict-probe.sh --assume-clean \
@@ -560,6 +596,47 @@ jobs:
   # that says how much room is left, and it is the one that moves.
   #
   # if: always() — the runs worth summarising most are the ones that went over.
+  # DIVE-3017 item 3, and the form matters: this asserts the OUTCOME, not the
+  # DECLARATION. The obvious version — extend the enumerator that checks every
+  # harness-running job builds the bundle, to also check it installs bun — was
+  # disproved by evidence already in the run that prompted it: unit-tests `test` HAS
+  # a bun step, that step SUCCEEDED, and acp_stdio_unit.sh failed anyway because the
+  # resolver never looked at the PATH setup-bun had exported. An inspecting check
+  # would have passed on a red job.
+  #
+  # So the invariant is read back out of the TSV the shards already upload: in each
+  # environment, across the union of its shards, acp_stdio_unit.sh RAN, exited rc=0,
+  # and took seconds rather than milliseconds. That triple is satisfied only by the
+  # ACP server actually having been driven — a missing bun step reds it, an
+  # ACP_ALLOW_SKIP escape sneaking into CI reds it (rc=0 in ~37ms), a fast failure
+  # reds it (rc=1 in ~64ms), and a shard split that stops selecting the file reds it
+  # (zero rows). Nobody has to remember which jobs to edit.
+  acp-graded:
+    runs-on: ubuntu-latest
+    needs: [full-pristine, full-installed-host]
+    steps:
+      # DIVE-2229: full history, like every other checkout in this file. This job
+      # runs no pinned-baseline harness itself, but the rule is deliberately blanket
+      # (tests/baseline_pin_unit.sh arm D sweeps every checkout in this workflow), and
+      # a per-job exemption is exactly the thing that goes stale when the job later
+      # grows a step that does need a baseline.
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/download-artifact@v4
+        with: { pattern: "full-*", merge-multiple: true }
+      # Reports named EXPLICITLY, not globbed, and once per environment: a lane that
+      # died has to red this job rather than quietly reduce the union it is checked
+      # against. Splitting the two environments means a pass in one cannot cover for
+      # the other going ungraded.
+      - name: The ACP server must have been GRADED (pristine)
+        run: |
+          bash tests/meta/harness-graded-union.sh --harness=acp_stdio_unit.sh --min-ms=1000 \
+            full-pristine-1.txt full-pristine-2.txt full-pristine-3.txt
+      - name: The ACP server must have been GRADED (installed host)
+        run: |
+          bash tests/meta/harness-graded-union.sh --harness=acp_stdio_unit.sh --min-ms=1000 \
+            full-installed-1.txt full-installed-2.txt full-installed-3.txt
+
   budget-report:
     runs-on: ubuntu-latest
     needs: [full-pristine, full-installed-host]

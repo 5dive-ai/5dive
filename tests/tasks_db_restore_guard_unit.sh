@@ -173,11 +173,40 @@ out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
 
 # --- Case 9 (DIVE-2808): canonical schema is complete at birth ----------------
 # Eight columns lived only in the migration list. The completed CREATE must have
-# the full 72-column tasks surface before the skip-gate is allowed to save work.
+# the full 78-column tasks surface before the skip-gate is allowed to save work.
 # (71 at the time this case was written; DIVE-2853 added recurring_stall_escalated_at
-# on main. The count is asserted literally on purpose — this case exists to catch a
-# canonical CREATE that silently drops a column, so it must not derive its own
-# expectation from the thing under test.)
+# on main, DIVE-2848 added gate_rubber_stamp, DIVE-3098 added graded_at+graded_by, and
+# DIVE-3128 added need_answered_relay + need_answered_tap_uid, and DIVE-2354 added
+# gate_mode.
+# DIVE-3171 added route_provenance, the ROUTING axis's provenance beside
+# floor_provenance's TIER axis.
+# DIVE-2272 added on_overlap + overlap_bound, the per-template overlap policy
+# (79 -> 81). Both nullable on purpose: NULL means 'skip' / 'the default bound',
+# so the migration is a no-op for every template predating the column AND an
+# unclassified template stays visibly unclassified.
+# DIVE-3218 added THREE more at once — nudge_escalated_at, nudge_escalated_n and
+# nudge_parked_at, the two rungs of the nudge-enforcement ladder plus the count
+# rung 1 fired at. 81 -> 84.
+#
+# DIVE-2730 added verify_optout, the persisted add-time `--no-verify` (84 -> 85).
+#
+# THIS LITERAL WAS RESOLVED BY ARITHMETIC, NOT BY PICKING A SIDE (2026-08-11), and
+# it has now been resolved that way TWICE in one day, by two different branches.
+# First pass: DIVE-3218 and DIVE-2272 both forked at 79 and each was internally
+# right — 82 and 81 — so either taken verbatim ships a count wrong by the other's
+# columns. 79+3+2=84. Second pass, this branch: DIVE-2730 forked from 81 and read
+# 82 while main had moved to 84, so the same trap re-armed against the same file
+# within the hour. 84+1=85. BOTH numbers were confirmed by running this case
+# against the merged tree rather than trusted from the addition.
+# The count is asserted literally on purpose — this case exists to catch a canonical
+# CREATE that silently drops a column, so it must not derive its own expectation from
+# the thing under test.)
+#
+# NOTE for the next person who merges main into a branch that adds a column: this
+# literal is exactly where that merge goes wrong SILENTLY. Two branches each adding
+# one column merge with no textual conflict — the CREATE gains both lines — and the
+# count is then wrong by one with nothing in the diff to show it. DIVE-2848 landed
+# that way: 72 on both sides, 73 after the merge, and the only signal was this case.
 fresh_tree
 out=$(tasks_db_init 2>&1); rc=$?
 required='delivered_at delivery_ref delivery_ref_iteration escalated_at escalated_by human_evidence park_reason parked_at'
@@ -186,8 +215,8 @@ actual=$(sqlite3 "$TASKS_DB" \
     WHERE name IN ('delivery_ref','delivered_at','delivery_ref_iteration','parked_at','park_reason','escalated_at','escalated_by','human_evidence')
     ORDER BY name;" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
 column_count=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM pragma_table_info('tasks');" 2>/dev/null)
-[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "72" ]] \
-  && ok "fresh schema: all 72 columns, including the eight former holes, are present" \
+[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "85" ]] \
+  && ok "fresh schema: all 85 columns, including the eight former holes, are present" \
   || bad "fresh schema: init returned a partial tasks table" "rc=$rc count=$column_count got=[$actual] want=[$required] out=$out"
 
 # --- Case 10 (DIVE-2197): migrate arm still rejects a failed ALTER ------------

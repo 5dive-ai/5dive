@@ -55,7 +55,7 @@ readonly _GH_BOT_KEY="GH_BOT_TOKEN"
 
 _gh_usage() {
   cat >&2 <<'EOF'
-5dive gh — run `gh` as the right identity (DIVE-2448)
+5dive gh — run `gh` as the right identity
 
   5dive gh <gh args...>              Route by operation: writes go out as the
                                      machine account, admin + read stay on your
@@ -68,7 +68,7 @@ _gh_usage() {
   5dive gh whoami                    Resolve BOTH identities (caller and bot).
 
 Why: an agent `gh` write authenticates as the human account, so the audit trail
-cannot tell an agent action from a human one (DIVE-2232). Routing writes here
+cannot tell an agent action from a human one. Routing writes here
 makes the actor field mean something again.
 EOF
 }
@@ -179,6 +179,51 @@ _gh_bot_available() {
   grep -q "^${_GH_BOT_KEY}=" "$_GH_BOT_ENV" 2>/dev/null
 }
 
+# _gh_caller_credential — 0 when THIS seat actually holds a gh credential.
+# OFFLINE: `gh auth token` resolves GH_TOKEN/GITHUB_TOKEN and the hosts config
+# and makes no network call, so asking before we name an identity costs nothing.
+# DIVE-3135: the banner used to assert `actor=your own gh credential` on a seat
+# that has none — the same defect class as DIVE-3128's `human:<relaying agent>`,
+# an identity named before it was resolved.
+_gh_caller_credential() { gh auth token >/dev/null 2>&1; }
+
+# _gh_child_exit <rc> — a non-zero from the WRAPPED gh is gh's failure, not ours.
+#
+# DIVE-3135: without this the silent-exit backstop (lib/output.sh) fires and
+# overwrites gh's own message with "5dive gh exited N without reporting a reason.
+# This is a bug in the CLI, not a refusal". For a routed passthrough that text is
+# false in both halves — gh DID report a reason, and the reason is often a refusal
+# (rc 4 = "please run gh auth login"). It is what made issues #526 (rc 1) and #553
+# (rc 4) read as unrelated: the sentence a reader needed was printed and then
+# talked over. So we claim the report and re-state the status as gh's.
+#
+# The DIVE-2792 distinction is PRESERVED and in fact sharpened: an internal CLI
+# failure still reaches the backstop as class="generic" with the bug text, while a
+# wrapped child's non-zero now carries class="passthrough" and says whose status
+# it is. A reader can tell them apart on the class alone.
+_gh_child_exit() {
+  local rc="${1:-0}"
+  shift || true
+  (( rc == 0 )) && return 0
+  mark_reported
+  if (( rc == 8 )) && [[ "${1:-}" == "pr" && "${2:-}" == "checks" ]]; then
+    echo "[5dive gh] checks are still pending (gh exit 8). This is a CI state, not a 5dive failure; poll again or use gh's --watch mode." >&2
+    if (( ${JSON_MODE:-0} )); then
+      jq -cn \
+        --arg m "Checks are still pending (gh exit 8). This is a CI state, not a 5dive failure." \
+        '{ok:false, error:{code:8, class:"pending", message:$m}}' 2>/dev/null || true
+    fi
+    return "$rc"
+  fi
+  echo "[5dive gh] gh exited ${rc} — that is gh's OWN exit status, not a 5dive failure. Its message is above; 5dive routed the call and ran it to completion." >&2
+  if (( ${JSON_MODE:-0} )); then
+    jq -cn --argjson c "$rc" \
+      --arg m "gh exited ${rc}. This is the wrapped gh's own exit status, passed through verbatim — 5dive routed the call and did not itself fail. Read gh's stderr for the reason." \
+      '{ok:false, error:{code:$c, class:"passthrough", message:$m}}' 2>/dev/null || true
+  fi
+  return 0
+}
+
 # cmd_gh — the user-facing verb.
 cmd_gh() {
   local as="auto" explain=0
@@ -210,39 +255,73 @@ cmd_gh() {
       # cannot perform one, so honouring the flag here would trade a clear
       # refusal for a 403 the caller has to decode.
       if [[ "$class" == "admin" ]]; then
-        fail "$E_CONFLICT" "refusing --as=bot for an admin-class operation: 5dive-bot is admin=false on every repo (measured DIVE-2444), so this cannot succeed as the bot. Re-run without --as=bot to use your own credential."
+        fail "$E_CONFLICT" "refusing --as=bot for an admin-class operation: 5dive-bot is admin=false — re-run without --as=bot"
       fi
       actor="bot"; reason="you asked for --as=bot" ;;
     auto)
-      if [[ "$class" == "write" ]]; then actor="bot"; else actor="caller"; fi ;;
+      if [[ "$class" == "write" ]]; then
+        actor="bot"
+      elif [[ "$class" != "admin" ]] && ! _gh_caller_credential; then
+        # DIVE-2296: a maker with NO credential is the case `read -> caller` was
+        # never written for. The preference behind that arm ("the bot sees fewer
+        # repos than you do") is a PREFERENCE, not a safety property, and it is
+        # strictly worse than nothing when the caller holds nothing: routing to a
+        # credential that does not exist produces a gh auth refusal, and the maker
+        # reads that as "reads are closed to me" and falls back to asking another
+        # agent — the five-round-trip shape this ticket measured.
+        #
+        # This grants NO new authority. class=admin is excluded above (the bot is
+        # admin=false and an explicit --as=bot is refused for it two arms up), the
+        # very same token is already reachable by typing --as=bot by hand, and the
+        # bot's read visibility is a SUBSET of an authed caller's. The only thing
+        # that changes is that a seat with nothing to route to gets an answer
+        # instead of an error.
+        actor="bot"; reason="this class normally routes to you, but you hold NO gh credential on this seat, so it routes to the bot rather than refusing a read you are allowed to make (DIVE-2296)"
+      else
+        actor="caller"
+      fi ;;
   esac
 
   if [[ "$actor" == "bot" ]]; then
     echo "[5dive gh] actor=5dive-bot (class=${class}: ${reason})" >&2
-  else
+  elif _gh_caller_credential; then
     echo "[5dive gh] actor=your own gh credential (class=${class}: ${reason})" >&2
+  else
+    # Resolve FIRST, then name what was resolved. Saying "your own gh credential"
+    # on a seat that holds none sends the reader looking for a routing bug when
+    # the answer is that there is nothing to route to (DIVE-3135).
+    # DIVE-2296: the old text qualified the escape hatch as "--as=bot if this is a
+    # WRITE", which steered a credential-less maker AWAY from the one path that
+    # answers a read. --as=bot serves reads too; only admin-class work genuinely
+    # cannot go that way. With the auto-route above, reaching this line at all now
+    # means class=admin or an explicit --as=caller.
+    echo "[5dive gh] actor=your own gh credential — but NONE IS RESOLVED on this seat, so gh will refuse to authenticate (class=${class}: ${reason}). Provision one, or use --as=bot — that works for READS as well as writes, and is refused only for admin-class operations, which 5dive-bot genuinely cannot perform." >&2
   fi
   [[ $explain -eq 1 ]] && return 0
 
+  local rc=0
   if [[ "$actor" == "caller" ]]; then
-    gh "$@"
-    return $?
+    gh "$@" || rc=$?
+    _gh_child_exit "$rc" "$@"
+    return "$rc"
   fi
 
   # Hand off to the root-only helper. Args travel NUL-separated over stdin, never
   # argv, so the NOPASSWD grant stays an exact command path (sudo-rs safe, no arg
   # wildcard) and no argument of a credential-bearing call lands in the process
   # table. The helper re-derives the class and reads the token itself.
-  local rc=0
   printf '%s\0' "$@" | sudo -n /usr/local/bin/5dive _gh_do || rc=$?
   # Distinguish "you may not route" from "the routed call failed". sudo exits 1
   # for a missing grant, which is indistinguishable from gh's own 1 by rc alone —
   # so ask sudo directly, and only after a failure (the probe costs nothing on the
   # happy path). `sudo -n -l <cmd>` is 0 exactly when this account may run it.
   if [[ $rc -ne 0 ]] && ! sudo -n -l /usr/local/bin/5dive _gh_do >/dev/null 2>&1; then
-    fail "$E_GENERIC" "routing to 5dive-bot needs the NOPASSWD grant for '/usr/local/bin/5dive _gh_do', which this account does not have — so nothing ran and this says NOTHING about the gh call itself. A builder agent gets the grant with 'agent create --can-push'; meanwhile re-run with --as=caller, which works today and records the write as the human account."
+    fail "$E_GENERIC" "routing to 5dive-bot needs a NOPASSWD grant this account lacks, so nothing ran — re-run with --as=caller"
   fi
-  return $rc
+  # Past the grant probe, a non-zero came from the routed gh (or from _gh_do's own
+  # refusal, which printed its reason in that process) — either way it is reported.
+  _gh_child_exit "$rc" "$@"
+  return "$rc"
 }
 
 # cmd_gh_whoami — resolve BOTH identities and print them. The point of the verb
@@ -282,7 +361,7 @@ cmd_gh_do() {
   [[ "$class" == "admin" ]] && fail "$E_CONFLICT" "_gh_do refuses an admin-class operation: 5dive-bot is admin=false on every repo, so this cannot succeed as the bot."
 
   [[ -r "$_GH_BOT_ENV" ]] \
-    || fail "$E_GENERIC" "machine-account credential is not provisioned: $_GH_BOT_ENV is missing or unreadable. Provision it with '5dive secret write ${_GH_BOT_KEY} --connector=github-bot'."
+    || fail "$E_GENERIC" "machine-account credential missing ($_GH_BOT_ENV) — 5dive secret write ${_GH_BOT_KEY} --connector=github-bot"
   local tok
   # shellcheck disable=SC1090
   tok=$(set -a; . "$_GH_BOT_ENV"; set +a; printf '%s' "${GH_BOT_TOKEN:-}")
@@ -291,5 +370,13 @@ cmd_gh_do() {
   # GITHUB_TOKEN is cleared so a stale one in root's environment cannot win over
   # the token we just resolved — gh prefers GH_TOKEN, but a reader six months out
   # should not have to know that to believe this line.
-  GH_TOKEN="$tok" GITHUB_TOKEN="" gh "${args[@]}"
+  # Capture the wrapped child's status HERE, before this helper's own EXIT trap
+  # can misclassify it as an unexplained 5dive death. The user-facing parent
+  # preserves the status and explains pending vs failure; this marker only says
+  # the root helper did run gh and therefore must not emit the silent-exit bug
+  # report on top of gh's own output.
+  local rc=0
+  GH_TOKEN="$tok" GITHUB_TOKEN="" gh "${args[@]}" || rc=$?
+  (( rc != 0 )) && mark_reported
+  return "$rc"
 }

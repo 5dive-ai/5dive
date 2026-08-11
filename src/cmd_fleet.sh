@@ -24,7 +24,7 @@ FLEET_REGISTRY="${STATE_DIR}/fleet.json"
 
 _fleet_usage() {
   cat <<USAGE
-5dive fleet — register and view the boxes in your fleet (DIVE-204 phase 1)
+5dive fleet — register and view the boxes in your fleet ( phase 1)
 
   5dive fleet add <name> --host=<addr> [--user=<u>] [--port=<n>] [--key=<path>]
                                           # register a peer box (default user=claude, port=22)

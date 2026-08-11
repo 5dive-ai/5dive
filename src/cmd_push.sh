@@ -45,10 +45,18 @@ _push_expected_author() {
 
 # _push_branch_from_body <body> — pull a "Branch: <name>" line out of a task
 # body (case-insensitive, first match). Empty if absent.
+#
+# DIVE-3081: strips a markdown/quote wrapper via broker_strip_md_quotes, and MUST
+# keep doing so in lockstep with broker_task_target's use of the same helper — the
+# DIVE-1462 refusal compares this function's value against the broker's, so a
+# strip applied to only one side still refuses, just with a different pair of
+# look-alike names. Same reason the helper is shared rather than inlined.
 _push_branch_from_body() {
+  local raw
   # `|| true` so a no-match grep can't trip `set -euo pipefail` when this runs
   # inside a command substitution (branch=$(...)).
-  printf '%s\n' "$1" | grep -ioP '^\s*branch:\s*\K\S+' | head -1 || true
+  raw=$(printf '%s\n' "$1" | grep -ioP '^\s*branch:\s*\K\S+' | head -1 || true)
+  broker_strip_md_quotes "$raw"
 }
 
 # _push_repo_slug <url> — OWNER/REPO from an https/ssh github URL, no .git.
@@ -217,7 +225,7 @@ _push_author_scan() {
       # pre-policy commit in it as a violation. Say what is missing instead.
       local diag="the author check could not determine WHICH commits '${branch}' adds to $(_push_repo_slug "$repourl") — fetching that repo's main failed (${why}) and this work tree has no cached refs/remotes/origin/main to fall back on. Without a bound the only scannable range is the branch's ENTIRE history, which would report every pre-policy commit in it as an author violation; that is a fabricated result, so it is not produced."
       [[ "$mode" == preflight ]] && { warn "author check SKIPPED here — ${diag} It is re-run authoritatively inside the push as root, which fetches with the App credential. (DIVE-2161)"; return 0; }
-      fail "$E_GENERIC" "author check COULD NOT RUN — ${diag} Restore the bound and retry: give this tree a fetchable origin/main ('git remote add origin <url> && git fetch origin main'), or clear whatever blocked the fetch (see the reason above). (DIVE-2161)"
+      fail "$E_GENERIC" "author check COULD NOT RUN — ${diag} Give this tree a fetchable origin/main and retry"
     fi
   fi
   offenders=$("${G[@]}" log --format='%H %an <%ae>' "$rangespec" 2>/dev/null \

@@ -1,0 +1,165 @@
+name: Header-drift window
+
+# DIVE-3188 — THE RAIL. Without this file, items 1-4 of that row are a correct
+# instrument nobody runs, which is the state DIVE-3163's merge left behind: the
+# facts land in every CI log and every report artifact, and NOTHING READS THEM.
+#
+# WHY A SCHEDULED WORKFLOW AND NOT A PER-PR CHECK. The question is "did a DIFFERENT
+# BOX see this same file drift", and it is unanswerable from inside any one job by
+# construction — that is the whole finding of DIVE-3163, where a per-job `exit 5`
+# fired on stale headers and on runner variance alike with nothing to tell them
+# apart. A cross-job read needs a window of jobs, so it runs where a window exists:
+# after the fact, over harvested logs.
+#
+# WHY IT NEVER GOES RED ON A FINDING, and this is the load-bearing constraint on the
+# whole design rather than caution. release-cut.yml grades EVERY check-run on main's
+# tip and refuses to cut on ANY red without reading which red it is. A scheduled
+# workflow run creates a check-run on main's tip. So a job that reddened on a stale
+# header would freeze release cuts on a stopwatch disagreement — which is EXACTLY the
+# harm DIVE-3163 measured and removed (the v0.19.14 cut, frozen ~40 minutes, PR #565
+# and PR #554 held, three agents charged a differential each). Re-creating it through
+# a scheduled door instead of a per-PR one would be the same defect with a new
+# address. `--drift-strict` therefore exists in the script and is NOT passed here.
+#
+# SO WHERE THE VERDICT LANDS: a step summary, an uploaded artifact carrying the
+# harvested reports the verdict was computed from, and a single long-lived GitHub
+# issue that is rewritten every run. The issue is the durable half — and it is also
+# this rail's own liveness signal, on the DIVE-1924 badge-staleness principle: the
+# body carries the date it was written, so a rail that dies leaves an issue visibly
+# frozen rather than a silence indistinguishable from "nothing recurred".
+
+on:
+  schedule:
+    # 04:47 UTC. AFTER full-sweep.yml's 03:17 so the night's shards are harvestable,
+    # and off the hour because the hour is where every other fleet cron already is.
+    - cron: '47 4 * * *'
+  workflow_dispatch:
+    inputs:
+      last:
+        description: 'How many runs of each workflow to harvest'
+        required: false
+        default: '20'
+      drift_min_jobs:
+        description: 'Distinct jobs a file must be WRONG on to be a stale claim'
+        required: false
+        default: '2'
+
+permissions:
+  contents: read
+  actions: read          # gh run view --log, which is what the harvester reads
+  issues: write          # the landing place for the verdict
+
+concurrency:
+  group: header-drift-window
+  cancel-in-progress: false
+
+jobs:
+  window:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Harvest the window from CI logs
+        id: harvest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LAST: ${{ github.event.inputs.last || '20' }}
+        run: |
+          set -uo pipefail
+          mkdir -p tier-cal-window
+          # BOTH workflows, because the drift signal is not confined to one. All three
+          # DIVE-3163 samples fired on full-sweep's full-pristine shards, and
+          # unit-tests.yml is where the core corpus is graded — a window over one of
+          # them would answer "does it recur" from half the boxes that could have seen
+          # it, and a recurrence missed reads exactly like a recurrence absent.
+          for wf in full-sweep.yml unit-tests.yml; do
+            echo "::group::harvest $wf"
+            scripts/tier-cal-harvest.sh --last="$LAST" --branch=main \
+              --workflow="$wf" --out=tier-cal-window || true
+            echo "::endgroup::"
+          done
+          n="$(find tier-cal-window -name '*.report' -type f | wc -l | tr -d ' ')"
+          echo "reports=$n" >> "$GITHUB_OUTPUT"
+          echo "harvested $n report(s)"
+
+      - name: Read the window
+        id: window
+        env:
+          MIN_JOBS: ${{ github.event.inputs.drift_min_jobs || '2' }}
+        run: |
+          set -uo pipefail
+          # NOT --drift-strict, and NOT by omission: see the header. A finding here must
+          # never be able to freeze a release cut.
+          if [ "${{ steps.harvest.outputs.reports }}" = "0" ]; then
+            {
+              echo "tier-cal-window: NO REPORTS HARVESTED."
+              echo "An empty window is not a window and must not be read as 'nothing recurred'."
+              echo "Check log retention and the workflow names above."
+            } | tee window.txt
+          else
+            scripts/tier-cal-window.sh tier-cal-window/*.report \
+              --drift-min-jobs="$MIN_JOBS" > window.txt 2>&1 || true
+            cat window.txt
+          fi
+          # The whole verdict, not a grep of it: a summary that quotes only the line it
+          # expected cannot show a reader the case it did not expect.
+          {
+            echo "## Header-drift window (DIVE-3188)"
+            echo
+            echo '```'
+            cat window.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the harvested window
+        uses: actions/upload-artifact@v4
+        with:
+          name: header-drift-window
+          # The REPORTS travel with the verdict. A verdict whose inputs did not survive
+          # cannot be re-read by the person it accuses, and this one accuses a named file.
+          path: |
+            window.txt
+            tier-cal-window/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Land the verdict on its issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          TITLE='Header-drift window (DIVE-3188)'
+          MARKER='<!-- dive-3188-header-drift-window -->'
+          STAMP="$(date -u '+%Y-%m-%d %H:%M UTC')"
+          {
+            echo "$MARKER"
+            echo "Rewritten by [\`header-drift-window.yml\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) at **${STAMP}**."
+            echo
+            echo "A STALE CLAIM below means one named file overran its own \`# TIER:\` header by the"
+            echo "FAIL margin on two or more DISTINCT jobs — distinct ephemeral boxes, so the"
+            echo "slow-runner explanation does not cover it. Re-measure the header and widen it with"
+            echo "its environment and date; the replacement line is printed in the run log."
+            echo
+            echo "A single-box \`WRONG\` is NOT a stale claim and is listed as a stopwatch"
+            echo "disagreement, because that reading was measured false three times on 2026-08-10"
+            echo "(DIVE-3163) including a green re-run at the same sha."
+            echo
+            echo '```'
+            cat window.txt
+            echo '```'
+            echo
+            echo "_This body is rewritten every run. If the timestamp above is stale, the RAIL is"
+            echo "dead — that is a different failure from 'nothing recurred', and it looks the same"
+            echo "from anywhere else (DIVE-1924)._"
+          } > issue-body.md
+
+          num="$(gh issue list --state open --limit 50 --json number,title \
+                   --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)"
+          if [ -n "${num:-}" ]; then
+            gh issue edit "$num" --body-file issue-body.md
+            echo "updated issue #$num"
+          else
+            gh issue create --title "$TITLE" --body-file issue-body.md
+          fi

@@ -81,9 +81,21 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   source "$SRC/$f"
 done
 
-# Suite guard: remember the REAL log's length up front, so the check at the
-# bottom fails if THIS run grew it (same shape as
-# tests/audit_task_store_fence_unit.sh).
+# Suite guard: remember where the REAL log ended before this run, so the check at
+# the bottom can read ONLY the bytes appended during it.
+#
+# DIVE-3250: this used to compare the offset before/after and fail if it MOVED.
+# That measured "did the file grow", not "did I grow it" — and every agent on this
+# box appends to it continuously, so on a live host it was a false red BY
+# CONSTRUCTION (measured: two full gate-corpus sweeps red on a frozen clean tree,
+# 6/6 green standalone on a quiet box; one unrelated line appended mid-run
+# reproduces it exactly). Do NOT restore the byte-equality arm here, and do not
+# copy it from tests/audit_task_store_fence_unit.sh / audit_nonroot_unit.sh /
+# audit_exit_trap_row_unit.sh — they still carry the defective shape (DIVE-3251).
+# The property this suite actually wants is "no row from THIS suite reached the
+# real log", which is an identity filter, not an offset. Same shape as the arm
+# already proven on main in tests/gate_evidence_form_unit.sh, which fences the
+# identical command surface.
 REALLOG=/var/log/5dive/agent-audit.log
 REALLOG_OFFSET=0
 [[ -r "$REALLOG" ]] && REALLOG_OFFSET=$(wc -c <"$REALLOG" 2>/dev/null || echo 0)
@@ -201,14 +213,34 @@ else
   bad_t "a silent fence is the same fail-open shape as no fence" "$(cat "$TMP/off.err")"
 fi
 
-# --- 5. suite guard: the real fleet log must be untouched --------------------
-NOW_OFFSET=0
-[[ -r "$REALLOG" ]] && NOW_OFFSET=$(wc -c <"$REALLOG" 2>/dev/null || echo 0)
-if [[ "$NOW_OFFSET" == "$REALLOG_OFFSET" ]]; then
-  ok_t "this suite wrote nothing to the real fleet audit log"
-else
-  bad_t "suite grew the REAL audit log" "$REALLOG_OFFSET -> $NOW_OFFSET"
+# --- 5. suite guard: no row from THIS suite reached the real fleet log -------
+# Read only the bytes appended since we started, then keep only rows bearing this
+# run's identity (our user + the command surface this suite exercises). Rows from
+# the other agents writing to this box concurrently are EXPECTED and must not red.
+LEAKED=""
+PROBED=0
+if [[ -r "$REALLOG" ]]; then
+  PROBED=1
+  LEAKED=$(tail -c "+$((REALLOG_OFFSET + 1))" "$REALLOG" 2>/dev/null \
+    | jq -rc --arg me "$(id -un 2>/dev/null)" \
+        'select(.user == $me)
+         | select(.cmd | startswith("task answer") or startswith("task need"))
+         | .cmd + " " + ((.args // []) | join(" "))' \
+        2>/dev/null | head -5)
 fi
+if [[ "$PROBED" -eq 0 ]]; then
+  # An unreadable log is not a pass — it is an UNPROBED guard, and it says so
+  # rather than scoring green (same reasoning as gate_lead_clear_stamp_unit.sh).
+  printf 'skip - real fleet log not readable here; leak guard UNPROBED (not a pass)\n'
+elif [[ -z "$LEAKED" ]]; then
+  ok_t "no row from THIS suite reached the real fleet audit log"
+else
+  bad_t "this suite LEAKED fixture rows into the REAL audit log" "$LEAKED"
+fi
+# Report the offset delta as CONTEXT so no reader mistakes this for a proof that
+# the file never moved. It moves; other agents write to it.
+[[ -r "$REALLOG" ]] && printf '# note: real log grew %s bytes during this run (concurrent agents; expected)\n' \
+  "$(( $(wc -c <"$REALLOG" 2>/dev/null || echo 0) - REALLOG_OFFSET ))"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

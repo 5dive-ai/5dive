@@ -58,63 +58,13 @@ same() { # <name> <expected> <actual>
 
 TMP=$(mktemp -d)
 
-# ---------------------------------------------------------------- the baseline
-# The pre-INST-5 copies of these functions, renamed so both live in one shell.
-#
-# WHY A PINNED SHA AND NOT `origin/main` (DIVE-2549). This file originally read
-# its "before" from origin/main, which was correct for exactly as long as INST-5
-# was unmerged. The moment #363 landed, origin/main WAS the refactored tree, the
-# guard below fired on every run, and the harness went red on main and on every
-# branch cut from it — green once, red forever after. That is the anchor-baseline
-# class tests/lib/pinned_baseline.sh was written for (DIVE-2229): a baseline named
-# by a BRANCH moves out from under the claim. The fix is to name the commit.
-#
-# cd29fa5 is the tip of main immediately BEFORE #363 (84ed56c^) — the last commit
-# that carries the pre-refactor bodies of _push_gate_check / _push_bind_branch.
-#
-# WHAT PINNING MAKES THIS FILE, said out loud because it is a stronger claim than
-# the one it replaced: these arms are no longer a one-shot pre-merge safety check
-# that expires on merge, they are a STANDING fence that the push path's refusal
-# text and exit statuses have not moved since before the refactor. A deliberate
-# future change to push's refusals therefore reds here BY DESIGN; the response is
-# to move the pin in the same commit that changes the behaviour and say why, not
-# to loosen the comparison.
-#
-# WHY NOT "SKIP WHEN THE BASELINE ALREADY CARRIES THE REFACTOR". That was the
-# obvious cheaper fix and it is the wrong one: a skip is counted as green by every
-# reader of the tally, so the differential arms — the ones that decide whether the
-# push gate is still inert — would stop running while the file kept reporting
-# success. The refusal below is loud precisely because being unable to differ is
-# not the same as having differed and found nothing.
-PRE_INST5_REF="cd29fa54449f5740830cb8d5db1491ae0a98e5af"   # 84ed56c^ — full sha: fetchable
-BASE="${BROKER_BASELINE_REF:-$PRE_INST5_REF}"
-# pinned_blob fetches the one commit at depth 1 if the checkout is shallow, and
-# returns non-zero having written nothing if it still cannot resolve it. A caller
-# must RED on that, never skip.
-if ! ( cd "$ROOT" && pinned_blob "$BASE" src/cmd_push.sh "$TMP/base_push.sh" ); then
-  echo "REFUSING: baseline ${BASE}:src/cmd_push.sh is unreachable — the differential arms cannot run."
-  echo "  $(pinned_unavailable_msg "$BASE")"
-  exit 1
-fi
-# Guard the extraction itself: the baseline must actually still CONTAIN the
-# pre-refactor bodies. With the pin above this can no longer fire from ordinary
-# merges — it now fences the PIN: a ref that does not predate INST-5 (a hand-set
-# BROKER_BASELINE_REF, or a pin someone advanced without re-reading this block)
-# would make the "old" side a wrapper too and every arm would pass for the wrong
-# reason.
-grep -q 'gansweredat=\$(db' "$TMP/base_push.sh" \
-  || { echo "REFUSING: ${BASE} already carries the refactored wrapper — nothing to differ against."; exit 1; }
-
-extract() { awk -v f="$1" '$0 ~ "^"f"\\(\\) \\{" {p=1} p{print} p&&/^\}$/{exit}' "$TMP/base_push.sh"; }
-{
-  for fn in _push_gate_check _push_task_branch _push_bind_branch _push_branch_from_body; do
-    extract "$fn"
-  done
-} | sed -E 's/(^|[^A-Za-z0-9_])_push_(gate_check|task_branch|bind_branch|branch_from_body)\b/\1old_push_\2/g' \
-  > "$TMP/old.sh"
-for fn in old_push_gate_check old_push_task_branch old_push_bind_branch old_push_branch_from_body; do
-  grep -q "^${fn}() {" "$TMP/old.sh" || { echo "REFUSING: could not extract ${fn} from ${BASE}"; exit 1; }
-done
+# RETIRED (DIVE-2645): section 1 was a pinned-baseline differential proving the
+# INST-5 wrapper refactor left push's refusals byte-identical. That refactor is
+# merged and was proven inert; the class it guarded — a refactor silently moving
+# push's behaviour — can no longer occur. What the arms had become was a freeze on
+# refusal TEXT: any deliberate edit reds them, and the pin must predate INST-5, so
+# no pin can ever carry the new text. Sections 2-7 below grade live behaviour and
+# are kept.
 
 # ------------------------------------------------------------------- the stubs
 E_VALIDATION=2; E_USAGE=1; E_GENERIC=1; E_PERMISSION=3
@@ -145,7 +95,6 @@ audit_log() { printf '%s\n' "$*" >> "$AUDIT_LOG_CALLS"; }
 # shellcheck source=../src/lib/broker.sh
 . "$ROOT/src/lib/broker.sh"
 # shellcheck source=/dev/null
-. "$TMP/old.sh"
 # The new wrappers, taken from the real file rather than retyped here.
 eval "$(awk '/^_push_gate_check\(\) \{/,/^\}$/' "$ROOT/src/cmd_push.sh")"
 eval "$(awk '/^_push_bind_branch\(\) \{/,/^\}$/' "$ROOT/src/cmd_push.sh")"
@@ -163,58 +112,6 @@ reset_row() { ROW=( [need_type]="" [need_answered_at]="" [need_answer]="" \
                     [need_answered_by]="" [need_answered_uid]="" [need_answer_sig]="sig-fixture" \
                     [routed_reviewer]="" [body]="" ); CLOSURE_RC=0; UID_AGENT=""; }
 
-echo "== 1. the push path is INERT: new wrappers == origin/main, string for string"
-declare -a SEEN=()
-case_gate() { # <name> then the caller has already set ROW
-  local n="$1" old new
-  old=$(run old_push_gate_check 7 DIVE-7 "${2:-0}")
-  new=$(run _push_gate_check     7 DIVE-7 "${2:-0}")
-  same "gate/${n}" "$old" "$new"
-  SEEN+=("$new")
-}
-
-reset_row;                                              case_gate "no gate at all"
-reset_row; ROW[need_type]=approval;                     case_gate "gate OPEN (unanswered)"
-reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t; ROW[need_answer]="no, not yet"
-                                                        case_gate "gate REJECTED"
-reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t; ROW[need_answer]=yes
-           ROW[need_answered_by]=agent-dev; ROW[routed_reviewer]=main
-                                                        case_gate "unauthorized, reviewer named"
-reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t; ROW[need_answer]=yes
-           ROW[need_answered_by]=agent-dev;              case_gate "unauthorized, no reviewer"
-reset_row; ROW[need_type]=decision; ROW[need_answered_at]=t; ROW[need_answer]=yes
-           ROW[need_answered_by]=main; ROW[routed_reviewer]=main
-           ROW[need_answered_uid]=1234567890; UID_AGENT=dev
-                                                        case_gate "decision by reviewer, uid mismatch"
-reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t; ROW[need_answer]=yes
-           ROW[need_answered_by]="human:lodar";          case_gate "AUTHORIZED (human)"
-reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t; ROW[need_answer]=yes
-           ROW[need_answered_by]="lead:main";            case_gate "AUTHORIZED (lead)"
-reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t; ROW[need_answer]=yes
-           ROW[need_answered_by]="human:lodar"; CLOSURE_RC=1
-                                                        case_gate "signed-closure failure" 1
-
-case_bind() { # <name> <branch-arg>
-  local n="$1" b="$2" old new
-  old=$(run old_push_bind_branch 7 DIVE-7 "$b")
-  new=$(run _push_bind_branch     7 DIVE-7 "$b")
-  same "bind/${n}" "$old" "$new"
-  SEEN+=("$new")
-}
-reset_row;                                       case_bind "task declares no branch" feat/x
-reset_row; ROW[body]=$'Branch: feat/a\n';        case_bind "branch mismatch"          feat/b
-reset_row; ROW[body]=$'Branch: feat/a\n';        case_bind "branch matches"           feat/a
-reset_row; ROW[body]=$'branch:   feat/a  \n';    case_bind "case+space insensitive"   feat/a
-
-echo "-- non-vacuity: the arms above must not all be one sentence"
-uniq_n=$(printf '%s\n' "${SEEN[@]}" | sort -u | wc -l)
-want "the ${#SEEN[@]} differential arms produced >=8 distinct outcomes (got ${uniq_n})" "[[ $uniq_n -ge 8 ]]"
-want "at least one arm SUCCEEDED (rc=0), so the harness can reach the pass path" \
-     'printf "%s\n" "${SEEN[@]}" | grep -qx "rc=0"'
-want "at least one arm REFUSED (rc=9), so the harness can reach the fail path" \
-     'printf "%s\n" "${SEEN[@]}" | grep -q "^gate on\|^no gate on\|^task DIVE-7 declares"'
-
-echo
 echo "== 2. the parameterization is LIVE, not dead: deploy says deploy"
 reset_row
 d_nogate=$(run broker_gate_check deploy 7 DIVE-7)

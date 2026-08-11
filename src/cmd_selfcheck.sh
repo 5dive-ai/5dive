@@ -67,6 +67,7 @@ SELFCHECK_PROBES=(
   bundle-integrity
   snapshot-rails
   scorecard-honesty
+  ship-ledger-liveness
 )
 
 _sc_title() {
@@ -80,6 +81,7 @@ _sc_title() {
     bundle-integrity)  echo "the installed bundle's sha256 matches the commit it claims" ;;
     snapshot-rails)    echo "the crontab snapshot committed what it says it saved" ;;
     scorecard-honesty) echo "a partial read renders as NO DATA, never as a number" ;;
+    ship-ledger-liveness) echo "the ship ledger's ZERO is a measurement, not an absence — a push crossed the rail post-arming and was captured" ;;
     *)                 echo "$1" ;;
   esac
 }
@@ -244,7 +246,8 @@ _sc_probe_t2_forge() {
     : > "$d/gate-proof.enforce"     # the live fleet posture since 2026-07-30
 
     seed() { db "INSERT INTO tasks (ident,title,status,created_by) VALUES ('$1','selfcheck','todo','main');" >/dev/null 2>&1
-             cmd_task_need "$1" --type=decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 >/dev/null 2>&1; }
+             cmd_task_need "$1" --type=decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 \
+               --needs=human_tap >/dev/null 2>&1; }   # DIVE-2848: this prover NEEDS a hard-human gate to forge against, so it declares one instead of hand-pinning a tier the cap now refuses
     by() { db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident='$1';"; }
 
     # (a) THE FORGE: an ordinary agent, unprivileged, no sudo — what every agent is.
@@ -776,6 +779,269 @@ _sc_probe_scorecard_honesty() {
   else _sc_pass "over an empty store ${#rows[@]} metric rows: $nodata degraded to NO DATA and each names what was missed; every number declares its coverage [graded $self]"; fi
 }
 
+# --- probe: ship-ledger liveness (DIVE-2129) ----------------------------------
+# ZERO ROWS IS VACUOUS UNTIL A PUSH CROSSES THE RAIL POST-ARMING.
+#
+# DIVE-1923 built the ship ledger (`5dive push` -> ship_events) and its close said
+# "if no row appears after the fleet rolls and pushes, that is a real signal". It
+# was not, and the measurement is why this probe exists:
+#
+#   instrument armed (binary mtime): 2026-07-26 23:35:15Z
+#   last push through the rail:      2026-07-26 23:14:41Z
+#   pushes AFTER arming:             0
+#
+# An UNINSTALLED or UNEXERCISED instrument renders IDENTICALLY to a healthy one
+# with no events. So `ship_events` = 0 is three different facts wearing one face,
+# and this probe separates them — three verdicts, never two:
+#
+#   NOT-REACHED  zero pushes crossed the rail since the RUNNING bundle acquired
+#                the writer. Not a pass, not a fail. States the arming stamp and
+#                the last-push stamp so the reader can see the window is empty.
+#   LIVE (pass)  >=1 post-arming push AND >=1 post-arming ship_events row. The
+#                capture path is proven end to end, in production, on this box.
+#   BROKEN (fail) >=1 post-arming push and ZERO rows. The only alarming state.
+#
+# The DENOMINATOR — post-arming pushes — is the whole deliverable. Without it this
+# is a soak with no traffic that passes forever.
+#
+# FOUR CONSTRAINTS, each from a measurement, each load-bearing:
+#
+# 1. THE DENOMINATOR MUST NOT COME FROM ship_events. Counting pushes from the
+#    table whose emptiness is under test makes 0/0 self-certifying: a dead writer
+#    reports "no pushes, therefore fine" forever. It comes from OUTSIDE.
+#
+# 2. FILTER result=ok. 519 of 528 audit push rows on this host were `error`, one
+#    of them a refused push of DIVE-1923 itself. A refused push never reaches the
+#    writer, so counting it manufactures a FALSE BROKEN. `ok` is 9/528 here —
+#    the filter removes 98% of the source, which is the point, not an edge case.
+#
+# 3. BROKEN IS STICKY ACROSS ARMING EPOCHS. The window is anchored to the bundle,
+#    and the bundle's mtime moves on every install — so an alarm raised in one
+#    epoch would be silently forgotten by the next roll, which happens nightly.
+#    A BROKEN is written down and re-asserted until a LIVE at-or-after it clears
+#    it. The record is this probe's own; it is never the ledger (see below).
+#
+# 4. THE DENOMINATOR SOURCE MUST BE PROVEN RECORDING BEFORE AN EMPTY DENOMINATOR
+#    IS TRUSTED. This is constraint 1 one level out, and it is not hypothetical:
+#    probed live 2026-07-26 23:41:35Z, a refused `push` wrote NO audit row at all,
+#    though the AUDIT_CMD="push" dispatch site is byte-identical across 0.16.23,
+#    0.16.24 and the installed binary — and the sink was ALIVE (a `task set-body`
+#    3 seconds later by the same user on the same binary wrote one). So push
+#    events are recorded NON-UNIFORMLY and "no push rows since arming" means
+#    EITHER "no pushes" OR "pushes this sink did not record". A denominator that
+#    can be empty for reasons unrelated to traffic cannot establish non-vacuity
+#    by being empty.
+#
+#    Hence TWO WITNESSES, and they are genuinely two — different writers, different
+#    files: the agent audit log (5dive's own sink) and the systemd journal's sudo
+#    records of `5dive _push_do` (sudo's sink, which caught pushes the audit log
+#    missed). Two logs with ONE writer are one witness.
+#
+# HOW THE TWO WITNESSES COMBINE, stated because "combine two logs" hides a choice:
+#   * a POSITIVE from either is credible on its own — a recorded push happened,
+#     and neither sink invents rows. So non-vacuity is the UNION.
+#   * an EMPTY is credible only when BOTH are proven recording (each produced at
+#     least one row of ANY kind since arming) and BOTH agree it is empty.
+#   * when exactly one is empty and the other is not, and the ledger is ALSO
+#     empty, both readings are wrong: preferring the positive raises an alarm on
+#     one uncorroborated witness, preferring the empty asserts no-traffic against
+#     direct evidence of traffic. That is `witness-disagreement`, its own
+#     not-reached reason — never a silent preference for one of them.
+#
+# READS THE ARTIFACT, NOT A VERSION STRING. A version number is a claim; the
+# symbol is the thing. Arming is `^ship_ledger_record()` AND
+# `^_push_record_ship_ledger()` present in the running bundle — both anchored at
+# column 0 so this comment, and the grep that carries them, cannot match
+# themselves and arm the probe by existing.
+#
+# DOES NOT SEED THE LEDGER, EVER. A synthetic first row corrupts the exact number
+# DIVE-1923 exists to make honest; main and I both refused it deliberately. The
+# only thing this probe writes is its own sticky record, under STATE_DIR/selfcheck
+# and never inside ship_events.
+
+# The sticky record. Overridable for tests. NEVER the ledger.
+_sc_sll_state_file() {
+  printf '%s' "${SELFCHECK_SLL_STATE:-${STATE_DIR:-/var/lib/5dive}/selfcheck/ship-ledger-liveness.state}"
+}
+# Append-only, last-write-wins on read: the file is the probe's own history and a
+# rewrite would lose the epoch an alarm was first raised in.
+_sc_sll_get() {
+  local f; f="$(_sc_sll_state_file)"
+  [[ -r "$f" ]] || return 0
+  sed -n "s/^$1=//p" "$f" 2>/dev/null | tail -1
+}
+_sc_sll_put() {
+  local f d; f="$(_sc_sll_state_file)"; d="$(dirname -- "$f")"
+  mkdir -p "$d" 2>/dev/null || return 1
+  printf '%s=%s\n' "$1" "$2" >> "$f" 2>/dev/null || return 1
+}
+
+# The store the CLI itself resolves — NOT a guess. /var/lib/5dive/tasks.db exists
+# on this host as a 0-byte stray and answers `no such table: ship_events`, i.e. a
+# plausible wrong path returns a FALSE BROKEN. Resolve it the one way, or not at all.
+_sc_sll_db() { printf '%s' "${TASKS_DB:-${STATE_DIR:-/var/lib/5dive}/tasks/tasks.db}"; }
+
+# WITNESS A — 5dive's own audit sink. Emits "<ok_pushes>|<rows_any_cmd>|<status>".
+# rows_any_cmd is the proof-of-recording half of constraint 4: it is what lets an
+# empty push count mean "no pushes" rather than "this sink wrote nothing at all".
+_sc_sll_audit() {
+  local since_iso="$1" log="${AUDIT_LOG:-/var/log/5dive/agent-audit.log}"
+  [[ -r "$log" ]] || { printf '0|0|unreadable\n'; return; }
+  command -v jq >/dev/null 2>&1 || { printf '0|0|no-jq\n'; return; }
+  # -R + fromjson? so ONE malformed line cannot abort the stream and shrink the
+  # denominator to a number that then reads as "no traffic".
+  jq -rR 'fromjson? // empty
+          | [ (.ts // ""), (.cmd // ""), (.result // "") ] | @tsv' "$log" 2>/dev/null \
+  | awk -F'\t' -v s="$since_iso" '
+      { ts=$1
+        if (length(ts) < 19) next
+        # Offsets other than UTC would make the lexical compare below silently
+        # wrong, so they are counted and reported, never quietly included.
+        if (ts !~ /(\+00:00|Z)$/) { off++; next }
+        if (substr(ts,1,19) < s) next
+        any++
+        if ($2 == "push" && $3 == "ok") push++
+      }
+      END { printf "%d|%d|%s\n", push+0, any+0, (off+0 ? "mixed-offset" : "ok") }'
+}
+
+# WITNESS B — sudo's own journal, a DIFFERENT writer to a DIFFERENT sink. Emits
+# "<pushes>|<rows_any>|<status>". `5dive push` re-enters as root via
+# `sudo 5dive _push_do`, so every push leaves a sudo record even when 5dive's own
+# audit dispatch does not fire.
+_sc_sll_journal() {
+  local since_epoch="$1" out
+  command -v journalctl >/dev/null 2>&1 || { printf '0|0|no-journalctl\n'; return; }
+  out="$(journalctl -q --no-pager --since "@${since_epoch}" 2>/dev/null)" \
+    || { printf '0|0|unreadable\n'; return; }
+  [[ -n "$out" ]] || { printf '0|0|silent\n'; return; }
+  local any push
+  any=$(printf '%s\n' "$out" | grep -c . || true)
+  push=$(printf '%s\n' "$out" | grep -c 'COMMAND=[^ ]*5dive _push_do' || true)
+  printf '%d|%d|ok\n' "${push:-0}" "${any:-0}"
+}
+
+_sc_probe_ship_ledger_liveness() {
+  local bundle; bundle="${SELFCHECK_SLL_BUNDLE:-$(_sc_self 2>/dev/null || true)}"
+  if [[ -z "$bundle" || ! -r "$bundle" ]]; then
+    _sc_notreached "no-bundle" "could not resolve a readable running bundle to grade (looked at '${bundle:-<none>}'), so the arming epoch is unknowable"
+    return
+  fi
+  _sc_note "  bundle: $bundle"
+
+  # Arming reads the ARTIFACT. Both patterns anchored at column 0 — the writer's
+  # definition and the push call site — so neither this file's prose nor this very
+  # grep can satisfy them.
+  if ! grep -q '^ship_ledger_record()' "$bundle" 2>/dev/null \
+     || ! grep -q '^_push_record_ship_ledger()' "$bundle" 2>/dev/null; then
+    _sc_notreached "not-armed" "the running bundle ($bundle) carries no ship-ledger writer, so ship_events cannot fill and its emptiness says nothing about the capture path"
+    return
+  fi
+
+  local armed_epoch armed_iso now_iso
+  armed_epoch=$(stat -c %Y "$bundle" 2>/dev/null) || armed_epoch=""
+  [[ -n "$armed_epoch" ]] \
+    || { _sc_notreached "no-arming-stamp" "the running bundle ($bundle) is armed but its mtime is unreadable, so the observation window has no start"; return; }
+  armed_iso=$(date -u -d "@$armed_epoch" +%Y-%m-%dT%H:%M:%S 2>/dev/null)
+  now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  local armed_sql; armed_sql=$(date -u -d "@$armed_epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+
+  # --- the sticky record, read BEFORE this run's own verdict is computed -------
+  local sticky_broken sticky_live sticky_out=0 sticky_note="" persist_ok=1
+  sticky_broken="$(_sc_sll_get broken_at)"
+  sticky_live="$(_sc_sll_get live_at)"
+  if [[ -n "$sticky_broken" ]] && [[ -z "$sticky_live" || "$sticky_live" < "$sticky_broken" ]]; then
+    sticky_out=1
+  fi
+  _sc_sll_put armed_at "$armed_iso" || persist_ok=0
+  [[ -n "$(_sc_sll_get armed_first_seen)" ]] || _sc_sll_put armed_first_seen "$armed_iso" || true
+  if (( ! persist_ok )); then sticky_note=" [STICKY RECORD UNWRITABLE at $(_sc_sll_state_file) — a BROKEN observed here will not survive the next install, which is constraint 3 unmet on this box]"; fi
+
+  # --- the denominator: two witnesses, neither of them ship_events ------------
+  local a b a_push a_any a_st b_push b_any b_st
+  a="$(_sc_sll_audit "$armed_iso")"; b="$(_sc_sll_journal "$armed_epoch")"
+  IFS='|' read -r a_push a_any a_st <<<"$a"
+  IFS='|' read -r b_push b_any b_st <<<"$b"
+  _sc_note "  witnesses since $armed_iso: audit=${a_push} ok-push / ${a_any} rows ($a_st); journal=${b_push} _push_do / ${b_any} rows ($b_st)"
+
+  # Proven RECORDING, not merely readable: a sink that produced no row of any kind
+  # in this window cannot certify that the window had no pushes.
+  local a_live=0 b_live=0
+  if [[ "$a_st" == "ok" ]] && (( a_any > 0 )); then a_live=1; fi
+  if [[ "$b_st" == "ok" ]] && (( b_any > 0 )); then b_live=1; fi
+
+  local last_push="none recorded"
+  local lp; lp=$(command -v jq >/dev/null 2>&1 && [[ -r "${AUDIT_LOG:-/var/log/5dive/agent-audit.log}" ]] \
+        && jq -rR 'fromjson? // empty | select(.cmd=="push" and .result=="ok") | .ts' \
+             "${AUDIT_LOG:-/var/log/5dive/agent-audit.log}" 2>/dev/null | tail -1)
+  if [[ -n "$lp" ]]; then last_push="$lp"; fi
+
+  # --- the numerator: the ledger, resolved the way the CLI resolves it ---------
+  local db rows table
+  db="$(_sc_sll_db)"
+  if [[ ! -r "$db" ]] || ! command -v sqlite3 >/dev/null 2>&1; then
+    _sc_notreached "ledger-unreadable" "the ship ledger store ($db) is not readable from here (or sqlite3 is absent), so this run measured neither the numerator nor the denominator${sticky_note}"
+    return
+  fi
+  table=$(sqlite3 -cmd ".timeout 3000" "$db" \
+          "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ship_events' LIMIT 1;" 2>/dev/null)
+  if [[ "$table" == "1" ]]; then
+    rows=$(sqlite3 -cmd ".timeout 3000" "$db" \
+           "SELECT COUNT(*) FROM ship_events WHERE ts >= '$armed_sql';" 2>/dev/null)
+    [[ "$rows" =~ ^[0-9]+$ ]] || rows=0
+  else
+    rows=0
+  fi
+  local tnote=""
+  if [[ "$table" != "1" ]]; then tnote=" (the ship_events table does not exist in $db — the migration never ran here)"; fi
+
+  local window="armed $armed_iso, now $now_iso; last recorded ok push $last_push; witnesses audit=$a_push/${a_any} ($a_st) journal=$b_push/${b_any} ($b_st); ship_events since arming = $rows$tnote"
+
+  # --- verdict ---------------------------------------------------------------
+  local pushes=$(( a_push > b_push ? a_push : b_push ))
+
+  if (( pushes > 0 )); then
+    if (( rows > 0 )); then
+      _sc_sll_put live_at "$now_iso" || persist_ok=0
+      local cleared=""
+      if (( sticky_out )); then cleared=" This LIVE clears the sticky BROKEN recorded at $sticky_broken."; fi
+      _sc_pass "LIVE — $pushes push(es) crossed the rail since the running bundle acquired the writer, and the ledger holds $rows row(s) in the same window, so the capture path is proven end to end here. Emptiness is no longer the only reading available.$cleared [$window]${sticky_note}"
+      return
+    fi
+    # Zero rows against a real denominator. Alarm — but only on a CORROBORATED
+    # denominator, or on a disagreement named as one.
+    if (( a_push > 0 && b_push > 0 )); then
+      if (( ! sticky_out )); then
+        _sc_sll_put broken_at "$now_iso" || persist_ok=0
+        _sc_sll_put broken_window "$window" || true
+      fi
+      _sc_fail "BROKEN — $pushes push(es) are recorded by BOTH independent witnesses since arming and the ledger holds ZERO rows in that window. This is the real signal DIVE-1923's close was reaching for: the capture path is armed, exercised, and not writing.$tnote [$window]${sticky_note}"
+      return
+    fi
+    if (( (a_push > 0 && b_live) || (b_push > 0 && a_live) )); then
+      _sc_notreached "witness-disagreement" "the ledger is empty since arming and the two witnesses disagree about whether any push happened (audit=$a_push, journal=$b_push) while BOTH are recording. Alarming would rest a BROKEN on one uncorroborated witness; claiming no-traffic would deny direct evidence of traffic. Neither is supported, so neither is asserted. [$window]${sticky_note}"
+      return
+    fi
+    # One witness saw traffic; the other is not proven to be recording at all, so
+    # it cannot corroborate OR contradict. An uncorroborated alarm on a rail whose
+    # sinks are known to be non-uniform is exactly the false BROKEN constraint 2
+    # exists to prevent.
+    _sc_notreached "uncorroborated-denominator" "the ledger is empty since arming and the only witness reporting traffic (audit=$a_push, journal=$b_push) has no live partner to corroborate it (audit recording=$a_live, journal recording=$b_live), so a BROKEN here would rest on a single sink already measured to record pushes non-uniformly. [$window]${sticky_note}"
+    return
+  fi
+
+  # --- denominator is empty: is it trustworthy? -------------------------------
+  if (( sticky_out )); then
+    _sc_fail "BROKEN (sticky) — no push has crossed the rail in the CURRENT arming epoch, but a BROKEN was recorded at $sticky_broken and no LIVE has been observed since. The bundle's mtime moved (nightly rolls do this) and the window reset; the alarm does not reset with it. Recorded window: $(_sc_sll_get broken_window). [$window]${sticky_note}"
+    return
+  fi
+  if (( ! a_live || ! b_live )); then
+    _sc_notreached "denominator-source-unproven" "ZERO post-arming pushes were counted, but that emptiness is not trustworthy: audit sink $( ((a_live)) && echo "is recording" || echo "produced NO row of any kind since arming (status=$a_st)"), journal sink $( ((b_live)) && echo "is recording" || echo "produced NO row of any kind since arming (status=$b_st)"). An empty count from a sink not proven to be writing means 'not observed', not 'no traffic'. [$window]${sticky_note}"
+    return
+  fi
+  _sc_notreached "no-post-arming-push" "NOT-REACHED, and this is the honest state, not a pass: both witnesses are proven to be recording and BOTH count ZERO pushes since the running bundle acquired the writer at $armed_iso. ship_events = $rows in that window says nothing about the capture path — an unexercised instrument renders identically to a healthy one. [$window]${sticky_note}"
+}
+
 _sc_dispatch() {
   case "$1" in
     lead-clear-seal)   _sc_probe_lead_clear_seal ;;
@@ -787,6 +1053,7 @@ _sc_dispatch() {
     bundle-integrity)  _sc_probe_bundle_integrity ;;
     snapshot-rails)    _sc_probe_snapshot_rails ;;
     scorecard-honesty) _sc_probe_scorecard_honesty ;;
+    ship-ledger-liveness) _sc_probe_ship_ledger_liveness ;;
     *)                 _sc_error "unknown probe: $1" ;;
   esac
 }

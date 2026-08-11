@@ -88,6 +88,7 @@ cat \
   src/cmd_agent_pairing.sh \
   src/cmd_agent_runtime.sh \
   src/cmd_cos.sh \
+  src/cmd_acp.sh \
   src/cmd_skill.sh \
   src/cmd_init.sh \
   src/cmd_doctor.sh \

@@ -309,7 +309,7 @@ actor_seam_as dev; cmd_task_need DIVE-5 --type=decision --ask="approve the \$500
 # Guards the hard-human contract: 2 = never auto-applies, always pings. Before
 # the effective-tier fix this left tier_floored=0 and silently routed to the lead.
 seed DIVE-6; HUMAN_PINGED=0; route_reset
-actor_seam_as dev; cmd_task_need DIVE-6 --type=decision --tier=2 --ask="pick the launch date?" --options="mon|tue" --recommend="mon" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-6 --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --ask="pick the launch date?" --options="mon|tue" --recommend="mon" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "route on: explicit --tier=2 decision → human (not routed)" || bad_t "explicit T2 decision → human" "HUMAN_PINGED=$HUMAN_PINGED"
 [[ ! -s "$ROUTE_FILE" ]] && ok_t "explicit --tier=2 decision: no lead route fired" || bad_t "explicit T2 no route" "sent=$(route_last)"
 

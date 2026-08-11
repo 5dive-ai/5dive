@@ -638,21 +638,110 @@ _agent_cred_seed_failure() {
   sudo -u "agent-${name}" cat "/home/agent-${name}/.5dive-cred-seed-failed" 2>/dev/null | head -1 || true
 }
 
+# DIVE-2159 (residual on DIVE-2137, found by main while merging PR #238) —
+# THE GUARD USED TO FAIL OPEN WHEN IT COULD NOT SEE THE PANE.
+#
+# The read below was `... 2>/dev/null || true`, which throws away capture-pane's
+# exit status. A FAILED capture therefore reached the predicate as an empty
+# string, and an empty string is not a credential prompt, so safe_to_type
+# returned 0: SEND ANYWAY. COULD-NOT-MEASURE rendered identically to
+# MEASURED-AND-SAFE — inside the guard built to stop exactly that class.
+#
+# The dangerous case is not "pane missing because the agent is gone" (the send
+# fails anyway). It is "capture failed transiently WHILE the agent is parked on a
+# login prompt" — precisely when the guard is load-bearing, and precisely the
+# state gh#214 described. A guard that abstains under stress is weakest exactly
+# when it is needed.
+#
+# The two states ARE distinguishable; the `|| true` was discarding the
+# discriminator. Measured on this box 2026-08-10, tmux 3.4:
+#   missing pane, or `sudo -u` to an unknown user -> rc 1, empty stdout
+#   live pane with nothing drawn yet              -> rc 0, empty stdout
+# So the signal is the RETURN CODE, never the emptiness.
+#
+# Split out as its own function so the retry-and-decide logic below can be graded
+# without tmux, sudo or a live agent (tests/agent_send_credential_guard_unit.sh
+# stubs this one call). The seam is deliberately this single line: every DECISION
+# stays inside the function the ship path actually runs.
+_agent_capture_pane_for_guard() {
+  local name="$1"
+  sudo -u "agent-${name}" tmux capture-pane -p -t "agent-${name}" 2>/dev/null
+}
+
+# Why the last refusal fired, read by _agent_credential_refusal_msg and by the
+# heartbeat's skip log: 'credential' (the pane IS a login surface) or 'unreadable'
+# (we never got to see the pane). Reset at the top of every call — the heartbeat
+# asks this per agent inside a loop, and a stale reason would report the previous
+# agent's cause for this one's refusal.
+_AGENT_PANE_REFUSAL_REASON=""
+
 # Capture the target pane and decide whether typing into it is safe.
-# 0 = safe to type, 1 = REFUSE (pane is a credential/login surface).
-# Escape hatch for an operator who genuinely means to type into a login screen:
-# FIVE_ALLOW_CREDENTIAL_PANE=1. Named in the refusal message so it is findable.
+# 0 = safe to type, 1 = REFUSE (pane is a credential/login surface),
+# 2 = REFUSE (pane could not be read — see DIVE-2159 note above).
+# Both nonzero codes are refusals and callers may treat them alike; they differ
+# only so the receipt can name the real cause instead of asserting a login prompt
+# nobody actually saw.
+#
+# POSTURE, chosen deliberately rather than defaulted (DIVE-2159 offered three):
+#   RETRY the capture a couple of times, then FAIL CLOSED, loudly.
+# Retry first because the motivating failure is transient (a busy tmux server, a
+# momentary permission fault) and a bare fail-closed would turn that flake into
+# blocked inter-agent traffic. Fail closed after, because the alternative is the
+# defect itself. Loud because a silent abstention is what kept gh#214's root
+# cause invisible for a day — so the refusal is a hard error on send/ask/_deliver
+# and a logged skip in the heartbeat, never a warning nobody reads.
+#
+# Escape hatch for an operator who genuinely means to type into a login screen,
+# or into a pane we cannot read: FIVE_ALLOW_CREDENTIAL_PANE=1. Checked BEFORE the
+# capture, so it also unblocks a box where capture is broken outright. Named in
+# both refusal messages so it is findable.
 _agent_pane_safe_to_type() {
-  local name="$1" pane
+  local name="$1" pane="" rc=0 try=0 got=0
+  local tries="${_AGENT_PANE_CAPTURE_TRIES:-3}"
+  _AGENT_PANE_REFUSAL_REASON=""
   [[ "${FIVE_ALLOW_CREDENTIAL_PANE:-0}" == "1" ]] && return 0
-  pane=$(sudo -u "agent-${name}" tmux capture-pane -p -t "agent-${name}" 2>/dev/null || true)
-  _agent_pane_credential_prompt "$pane" && return 1
+  while (( try < tries )); do
+    try=$((try+1))
+    rc=0
+    pane=$(_agent_capture_pane_for_guard "$name") || rc=$?
+    if (( rc == 0 )); then
+      got=1
+      break
+    fi
+    if (( try < tries )); then
+      sleep "${_AGENT_PANE_CAPTURE_RETRY_SLEEP:-0.25}"
+    fi
+  done
+  if (( got == 0 )); then
+    _AGENT_PANE_REFUSAL_REASON="unreadable"
+    return 2
+  fi
+  if _agent_pane_credential_prompt "$pane"; then
+    _AGENT_PANE_REFUSAL_REASON="credential"
+    return 1
+  fi
   return 0
 }
 
 # Shared refusal text for the three inject sites, so the message can't drift.
+#
+# DIVE-2159: branches on WHY the guard refused. An unreadable pane must not be
+# reported as "parked on a CREDENTIAL/LOGIN prompt" — nobody saw a login prompt,
+# and asserting one sends the operator off to re-seed a credential that may be
+# perfectly fine. Same failure shape as the defect itself, one level up: a
+# confident claim about a state that was never measured.
 _agent_credential_refusal_msg() {
   local name="$1" why
+  if [[ "${_AGENT_PANE_REFUSAL_REASON:-}" == "unreadable" ]]; then
+    local u="refused to send: could not READ agent '${name}'s pane after ${_AGENT_PANE_CAPTURE_TRIES:-3} attempts"
+    u+=" (tmux capture-pane failed), so the credential guard could not tell a chat input from a login prompt."
+    u+=" Refusing rather than typing blind — the message body would become the agent's stored API key if that pane is a"
+    u+=" login screen (DIVE-2159, residual on DIVE-2137/gh#214). NOTHING WAS TYPED."
+    u+=" Check the agent is up (5dive agent list; 5dive agent tail ${name}) and resend."
+    u+=" To type into an unreadable pane on purpose: FIVE_ALLOW_CREDENTIAL_PANE=1."
+    printf '%s\n' "$u"
+    return 0
+  fi
   why="$(_agent_cred_seed_failure "$name")"
   local m="refused to send: agent '${name}' is parked on a CREDENTIAL/LOGIN prompt, not a chat input"
   m+=" — typing there would store the message body as its API key (DIVE-2137, gh#214)."
@@ -1516,6 +1605,31 @@ _envelope_caller() {
   printf '%s' "$who"
 }
 
+# DIVE-2183 — the refusal side of the `--from` story, at both acceptors.
+# envelope_peer_forgery() decides; this exists only to turn its one refusing
+# verdict into a fail() and to keep that decision out of two call sites.
+#
+# WHY IT IS FED `_envelope_caller` AND NOT `auto_sender_from_sudo`, which is what
+# DIVE-2182 specified. auto_sender_from_sudo reads $SUDO_USER alone, and the
+# population this guard defends against does not use sudo to send: an admin agent
+# holds NOPASSWD:ALL, so it runs `5dive agent send` as its own uid and the inner
+# `sudo -u agent-X tmux` elevates from there. $SUDO_USER is empty on that path, so a
+# SUDO_USER-only guard would measure no caller, take the unmeasured branch, and wave
+# through every forgery by the exact callers who can commit one — a guard that is
+# green because it never fires. `_envelope_caller` resolves EUID first (DIVE-2281),
+# which is also the resolver behind from=/tier=/via=, so the refusal and the
+# envelope can never disagree about who called.
+#
+# The signature line carries no trailing comment on purpose: tests/ extracts
+# function bodies with `^name() {$`, and a comment there makes this unreachable
+# from the harness that grades it.
+_agent_refuse_peer_forgery() {
+  local claimed="$1" measured="$2" verb="$3" v   # <claimed> <measured> <send|ask>
+  v="$(envelope_peer_forgery "$claimed" "$measured")"
+  [[ "$v" == refuse:* ]] || return 0
+  fail "$E_PERMISSION" "agent ${verb}: --from='${claimed}' is a REGISTERED AGENT and this process measures as '${v#refuse:}' — a peer's identity is not claimable. Send as yourself (--from=${v#refuse:} or drop the flag), or use a synthetic label that is not an agent name for a script/rail sender."
+}
+
 # DIVE-2385 — WAKE-THEN-SEND, so deferred work does not depend on the recipient
 # being awake at the instant the scheduler fires.
 #
@@ -1647,7 +1761,7 @@ agent_wake_gate_ready() {
     return 0
   fi
   if ! wait_agent_input_ready "$name" "$budget"; then
-    fail "$E_NOT_RUNNING" "woke agent '$name' but its input prompt never rendered within ${budget}s — refusing to type into a booting TUI and report a send that would be lost. --wake budgets ${AGENT_WAKE_BUDGET_SECS}s in total for the wake and this wait; size a scheduler's timeout against that."
+    fail "$E_NOT_RUNNING" "woke agent '$name' but its input prompt never rendered in ${budget}s — refusing to type into a booting TUI"
   fi
   AGENT_WAKE_READY="proven"
 }
@@ -1718,7 +1832,7 @@ cmd_send() {
   # message the flag exists to prevent, with an exit 0 printed over it. Checked
   # BEFORE the exec for that reason.
   if (( wake )) && a2a_needs_scoped "$name"; then
-    fail "$E_PERMISSION" "--wake starts the target's systemd unit and needs admin/root; this caller only holds the scoped a2a delivery grant. Re-run via sudo, or schedule the work as a task row instead."
+    fail "$E_PERMISSION" "--wake needs admin/root; this caller holds only the a2a delivery grant — re-run via sudo, or file a task row"
   fi
   if a2a_needs_scoped "$name"; then
     exec sudo -n /usr/local/bin/5dive agent _deliver "$name" "$message"
@@ -1806,6 +1920,10 @@ cmd_send() {
       # DIVE-2281: same resolver as the sender above, so from= and tier= cannot
       # disagree, and the tier stops reading unknown:no-caller on the direct path.
       _caller="$(_envelope_caller)"
+      # DIVE-2183: and REFUSE, before the header is built or a keystroke reaches
+      # the target's pane, when the claim is another registered agent's name. The
+      # first of the two --from acceptors.
+      _agent_refuse_peer_forgery "$sender" "$_caller" send
       _tier="$(envelope_tier "$_caller")"
       local header="[5dive-msg from=${sender} id=${msg_id}"
       header+=" tier=${_tier}"
@@ -1953,7 +2071,7 @@ cmd_ask() {
   # (abstainKind=capture-failed), which convene already records distinguishably
   # from a real abstention.
   if (( allow_unfenced )) && [[ "$from" == council* ]]; then
-    fail "$E_VALIDATION" "--allow-unfenced is refused on a council ask: a ballot may never fall back to pane scraping (it is the path that returns furniture as a vote). A seat that cannot fence must record as a CAPTURE FAILURE, not as an abstention."
+    fail "$E_VALIDATION" "--allow-unfenced is refused on a council ask — a seat that cannot fence records as a CAPTURE FAILURE, not an abstain"
   fi
   if [[ -z "$message" && ${#positional[@]} -gt 0 ]]; then
     message="${positional[*]}"
@@ -1997,6 +2115,16 @@ cmd_ask() {
   [[ -n "$sender" ]] || sender="ask"
   valid_sender_label "$sender" \
     || fail "$E_VALIDATION" "invalid --from label '$sender' (lowercase letter start, [a-z0-9-], <=32 chars)"
+  # DIVE-2183: the SECOND --from acceptor, and the weaker one before this — DIVE-2182
+  # scoped its finding to `send`, and `ask` was found later to accept the identical
+  # claim. Placed ABOVE the scoped/unscoped branch, so it covers both: the scoped
+  # branch's `_deliver` re-derives the envelope and cannot be forged, but a forged
+  # `--from` there still reaches this command's JSON summary and its audit row.
+  # `_gcaller` is the same resolver as `_audit_caller` and `_dcaller` below
+  # (DIVE-2281's one-resolver rule), so the refusal, the audit row and the rendered
+  # via= cannot disagree about who called.
+  local _gcaller; _gcaller="$(_envelope_caller)"
+  _agent_refuse_peer_forgery "$sender" "$_gcaller" ask
   msg_id="$(gen_msg_id)"
 
   # DIVE-2797: same row shape as cmd_send — `ask` is a send that waits, and it

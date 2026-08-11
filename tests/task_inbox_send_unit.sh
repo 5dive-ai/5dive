@@ -130,5 +130,106 @@ grep -q "and 2 more" "$LAST_TEXT"; has_more=$?
   && ok_t "digest caps at 10 gates and notes the overflow" \
   || bad_t "cap broken" "rc=$rc gate_messages=$n_ids more=$has_more sends=$(nsends)"
 
+# ---------------------------------------------------------------------------
+# DIVE-3117 part 2 — the human inbox must not list a gate that is waiting on an
+# AGENT. Every arm below is graded by MUTATION on `routed_reviewer`, the field
+# the view actually reads: the SAME row is listed, one field is flipped, and the
+# listing must change. An arm that seeds two different rows would pass against a
+# filter keyed on anything those rows happen not to share.
+# Note the fixtures above all carry tier=2 with no routed_reviewer, so they are
+# untouched by this clause by construction — that is itself the tier-2 negative
+# control, restated explicitly below rather than left implicit.
+mk_rgate() { # ident type tier routed_reviewer needs_capability   (tier: '' => NULL, "''" => empty string)
+  local _tier; case "$3" in '') _tier=NULL ;; "''") _tier="''" ;; *) _tier="$(sqlq "$3")" ;; esac
+  db "INSERT INTO tasks (ident,title,priority,assignee,created_by,kind,status,need_type,tier,ask,recommend,need_asked_at,routed_reviewer,needs_capability)
+      VALUES ($(sqlq "$1"),'gate','high','dev','dev','standard','blocked',$(sqlq "$2"),${_tier},'approve delegated push for review',
+              'approve',datetime('now'),$(sqlq_or_null "$4"),$(sqlq_or_null "$5"));
+      SELECT last_insert_rowid();"
+}
+inbox_idents() { ( JSON_MODE=1; cmd_task_inbox 2>/dev/null | jq -r '.data.inbox[].ident' | sort | tr '\n' ' ' ); }
+inbox_routed_n() { ( JSON_MODE=1; cmd_task_inbox 2>/dev/null | jq -r '.data.routed_elsewhere' ); }
+
+# THE MUTATION ARM. One row, one field. Unrouted -> listed; routed to an agent
+# seat -> gone. This is DIVE-2159/DIVE-2245's exact shape: type=approval, tier 1,
+# routed_reviewer=main2, correctly routed and listing for a human anyway.
+reset
+r1=$(mk_rgate DIVE-2159 approval 1 '' '')
+before=$(inbox_idents)
+db "UPDATE tasks SET routed_reviewer='main2' WHERE id=${r1};"
+after=$(inbox_idents)
+[[ "$before" == "DIVE-2159 " && "$after" == "" ]] \
+  && ok_t "MUTATION: flipping routed_reviewer on ONE row takes it out of the human inbox" \
+  || bad_t "routed_reviewer mutation did not change the listing" "before='$before' after='$after'"
+
+# The withheld gate is COUNTED, not merely absent — an inbox that went quiet must
+# not read the same as a fleet with no open gates.
+[[ "$(inbox_routed_n)" == "1" ]] \
+  && ok_t "a withheld routed gate is counted in routed_elsewhere" \
+  || bad_t "routed_elsewhere miscounted" "got=$(inbox_routed_n)"
+out=$(cmd_task_inbox 2>&1)
+[[ "$out" == *"routed to an agent seat"* ]] \
+  && ok_t "prose inbox names the withheld count instead of reading empty" \
+  || bad_t "withheld gates are silently absent from the prose inbox" "out=$out"
+
+# NEGATIVE 1 — tier 2 is a hard gate: routed or not, it stays on the human's list.
+# Same mutation, opposite verdict, so the arm cannot pass by the filter being off.
+reset
+r2=$(mk_rgate DIVE-2245 approval 2 '' '')
+before=$(inbox_idents)
+db "UPDATE tasks SET routed_reviewer='main2' WHERE id=${r2};"
+after=$(inbox_idents)
+# NOTE the assertion is the LISTING only. An earlier draft also required
+# routed_elsewhere==0 here, which reds this control on pristine main for a reason
+# that has nothing to do with its subject (the field does not exist there yet) —
+# a negative control has to be green on BOTH trees or it is not a control. The
+# counter gets its own positive arm below.
+[[ "$before" == "DIVE-2245 " && "$after" == "DIVE-2245 " ]] \
+  && ok_t "NEGATIVE: a tier-2 gate keeps listing when routed to an agent" \
+  || bad_t "a tier-2 routed gate was hidden from the human" "before='$before' after='$after'"
+[[ "$(inbox_routed_n)" == "0" ]] \
+  && ok_t "a tier-2 routed gate is not counted as withheld" \
+  || bad_t "tier-2 routed gate counted as withheld" "got=$(inbox_routed_n)"
+
+# NEGATIVE 2 — a declared human capability keeps listing even at tier 1 and even
+# routed. Production cannot reach that state today (--needs forces tier 2 and
+# _routable=0), so this arm seeds it directly: it grades the CLAUSE, which is
+# there precisely so a change to that faraway floor cannot silently hide a
+# human-capability gate.
+reset
+mk_rgate DIVE-2246 approval 1 'main2' 'human_tap' >/dev/null
+[[ "$(inbox_idents)" == "DIVE-2246 " ]] \
+  && ok_t "NEGATIVE: needs_capability keeps a routed tier-1 gate on the human's list" \
+  || bad_t "a declared human-capability gate was hidden" "idents=$(inbox_idents)"
+
+# NEGATIVE 3 — an UNKNOWN tier reads as 2 and stays visible. The fail-safe
+# direction: one gate too many is recoverable, a hidden one is the defect.
+# BOTH unknowns, because they are not the same value in SQLite: `tier` is
+# INTEGER-affinity but nullable, and an empty string is stored as TEXT '' rather
+# than converted, so a bare COALESCE(tier,'2') hands '' to CAST and gets 0. This
+# arm was RED on the first implementation for exactly that reason; NULLIF fixed it.
+reset
+mk_rgate DIVE-2247 approval '' 'main2' '' >/dev/null
+[[ "$(inbox_idents)" == "DIVE-2247 " ]] \
+  && ok_t "NEGATIVE: a NULL-tier routed gate stays visible (unknown tier reads as hard)" \
+  || bad_t "a NULL-tier routed gate was hidden" "idents=$(inbox_idents)"
+reset
+mk_rgate DIVE-2249 approval "''" 'main2' '' >/dev/null
+[[ "$(inbox_idents)" == "DIVE-2249 " ]] \
+  && ok_t "NEGATIVE: an EMPTY-STRING tier routed gate stays visible too (NULLIF, not COALESCE alone)" \
+  || bad_t "an empty-string tier routed gate was hidden" "idents=$(inbox_idents) tier=$(db "SELECT quote(tier) FROM tasks WHERE ident='DIVE-2249';")"
+
+# The same clause governs --send, which is the path that actually reaches the
+# human's phone. A filter on the listing alone would leave the buzz intact.
+reset
+r5=$(mk_rgate DIVE-2248 approval 1 '' '')
+out=$(cmd_task_inbox --send 2>&1)
+sent_before=$(nsends)
+: >"$SEND_LOG"
+db "UPDATE tasks SET routed_reviewer='main2', gate_pinged_at=NULL WHERE id=${r5};"
+out=$(cmd_task_inbox --send 2>&1); rc=$?
+[[ "$sent_before" == "1" && "$(nsends)" == "0" && "$out" == *"nothing to send"* ]] \
+  && ok_t "--send stops delivering a gate once it is routed to an agent" \
+  || bad_t "--send still pushed a routed gate to the human" "before=$sent_before after=$(nsends) rc=$rc out=$out"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 exit $(( FAIL > 0 ))
