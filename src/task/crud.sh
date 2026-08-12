@@ -80,6 +80,35 @@ cmd_task_add() {
   done
   local title="${words[*]:-}"
   [[ -n "$title" ]] || fail "$E_USAGE" "usage: 5dive task add <title...> [flags: 5dive task --help]"
+  # DIVE-3107: a flag written AFTER the `--` end-of-flags separator is not a flag
+  # at all — it is positional title text, and the parser above accepts it in
+  # silence. DIVE-3100 was filed with a 628-char title whose text began
+  # `--body=MEASURED 2026-08-09...` and an EMPTY body; nobody saw it until the
+  # grader read the row days later, by which point delivered title/body are
+  # frozen and the row could not be repaired in place. Add-time is the only
+  # moment the filer can still act on it, so refuse here rather than store it.
+  # Two independent tells, either sufficient:
+  #   1. a `--<word>=` token in the title — a flag name that leaked across `--`
+  #   2. a title over 200 chars — no legitimate title is that long
+  # Skipped for --materialized (the internal writers in cmd_goal/cmd_loop/
+  # cmd_objective/cmd_proof/cmd_loop_pack): they build the argv programmatically
+  # with every flag already on the correct side of `--`, so the swallow this
+  # guards cannot occur there, while their titles are user prose ("Goal: <outcome>")
+  # that may legitimately run long — and a refusal mid-batch aborts a whole
+  # materialization. Unlike the DIVE-2681 filing cap, which is about what a title
+  # MEANS, this one is about how the command line was TYPED.
+  if [[ -z "$materialized" ]]; then
+    local _w _leaked=""
+    for _w in "${words[@]}"; do
+      if [[ "$_w" =~ ^--[A-Za-z][A-Za-z0-9-]*= ]]; then _leaked="${_w%%=*}"; break; fi
+    done
+    if [[ -n "$_leaked" ]]; then
+      fail "$E_USAGE" "refusing: the title contains the flag token '${_leaked}=' — it was written AFTER the '--' end-of-flags separator, so it parsed as TITLE TEXT and '${_leaked}' was never applied (this is how DIVE-3100 got a 628-char title and an empty body). Move every flag BEFORE the '--': 5dive task add ${_leaked}=\"...\" -- \"<title>\". Title as parsed (${#title} chars): ${title:0:120}$([[ ${#title} -gt 120 ]] && printf '...')"
+    fi
+    if (( ${#title} > 200 )); then
+      fail "$E_USAGE" "refusing: the title is ${#title} chars (limit 200) — a title that long is almost always body text swallowed past the '--' end-of-flags separator, where flags parse as positional title words instead. Put the prose in --body=/--body-file= BEFORE the '--' and keep the title to one line. Title as parsed: ${title:0:120}..."
+    fi
+  fi
   valid_task_priority "$priority" || fail "$E_VALIDATION" "bad priority '$priority' (low|medium|high|urgent)"
   # DIVE-476: --max-iters is the maker→verifier loop cap; must be a positive int.
   [[ -z "$max_iters" || "$max_iters" =~ ^[1-9][0-9]*$ ]] \
