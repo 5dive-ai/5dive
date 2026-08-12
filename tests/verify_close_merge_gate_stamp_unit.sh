@@ -163,7 +163,7 @@ fi
 # there with the same shape; this site shipped later (DIVE-2938) and reintroduced
 # it. Both callers of the extractor are guarded now — pin both, or the next new
 # call site repeats it a third time.
-grep -qE '_mg_branches=\$\(_gate_branch_refs_from_text .*\) \|\| _mg_branches=' "$ROOT/src/cmd_task.sh" \
+grep -qE '_mg_branches=\$\(_gate_branch_refs_from_text .*\) \|\| _mg_branches=' "$ROOT/src/cmd_task.sh" "$ROOT"/src/task/*.sh \
   && ok_t "G: the verify-stamp call site GUARDS the probe assignment (DIVE-3265)" \
   || bad_t "G: verify-stamp call site guarded" "unguarded \$( ) — under set -e + pipefail a body naming no branch kills 'task verify' with empty stdout AND empty stderr"
 

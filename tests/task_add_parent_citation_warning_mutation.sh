@@ -34,7 +34,7 @@ else
 fi
 
 cp -a "$ROOT/src" "$MUT_TMP/src"
-target="$MUT_TMP/src/cmd_task.sh"
+target="$MUT_TMP/src/task/routing.sh"   # DIVE-3278: was src/cmd_task.sh
 # shellcheck disable=SC2016
 anchor='  _target_ident="$_TASK_FOLLOWUP_IDENT"'
 anchor_count=$(grep -Fxc "$anchor" "$target")

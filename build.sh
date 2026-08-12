@@ -96,6 +96,17 @@ cat \
   src/cmd_watch.sh \
   src/cmd_compose.sh \
   src/cmd_whoami.sh \
+  src/task/dispatch.sh \
+  src/task/routing.sh \
+  src/task/crud.sh \
+  src/task/gate_evidence.sh \
+  src/task/status.sh \
+  src/task/delivery.sh \
+  src/task/loops.sh \
+  src/task/need.sh \
+  src/task/notify.sh \
+  src/task/inbox.sh \
+  src/task/answer.sh \
   src/cmd_task.sh \
   src/cmd_trace.sh \
   src/cmd_org.sh \

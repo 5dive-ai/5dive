@@ -48,24 +48,37 @@ grade() {
   local name="$1" want="$2" old="$3" new="$4"
   local dir="$TMP/$name"; rm -rf "$dir"; mkdir -p "$dir"
   cp -r src "$dir/src"
-  if ! OLD="$old" NEW="$new" F="$dir/src/cmd_task.sh" python3 - <<'PY'
-import os, sys
-p, old, new = os.environ["F"], os.environ["OLD"], os.environ["NEW"]
-s = open(p).read()
-n = s.count(old)
+  # DIVE-3278: `task` was split out of src/cmd_task.sh into src/task/*.sh, so an
+  # anchor may live in any of them. Still require exactly ONE occurrence across the
+  # WHOLE set — counting per-file would let a duplicated anchor through.
+  if ! OLD="$old" NEW="$new" D="$dir/src" python3 - <<'PYMUT'
+import os, sys, glob
+d, old, new = os.environ["D"], os.environ["OLD"], os.environ["NEW"]
+files = [os.path.join(d, "cmd_task.sh")] + sorted(glob.glob(os.path.join(d, "task", "*.sh")))
+hits = [(p, open(p).read()) for p in files]
+n = sum(s.count(old) for _, s in hits)
 if n != 1:
-    sys.stderr.write("mutation did not apply cleanly: %d occurrences of %r\n" % (n, old[:90]))
+    sys.stderr.write("mutation did not apply cleanly: %d occurrences of %r across %d files\n"
+                     % (n, old[:90], len(files)))
     sys.exit(1)
-open(p, "w").write(s.replace(old, new))
-PY
+for p, s in hits:
+    if old in s:
+        open(p, "w").write(s.replace(old, new))
+PYMUT
   then
     bad_t "$name — mutation applies to the current source" "the anchor is gone or duplicated; this mutant graded NOTHING"
     return
   fi
   # A mutant that breaks the PARSE reddens every arm for the wrong reason, which
   # would read as a kill while grading nothing.
-  if ! bash -n "$dir/src/cmd_task.sh" 2>/dev/null; then
-    bad_t "$name — mutated source still parses" "the substitution produced a syntax error; every arm would red for the wrong reason"
+  # `bash -n a.sh b.sh` parses ONLY a.sh — the rest become positional params and
+  # exit 0 regardless, so this must be one invocation per file (DIVE-3278).
+  local _m _bad_parse=""
+  for _m in "$dir/src/cmd_task.sh" "$dir"/src/task/*.sh; do
+    bash -n "$_m" 2>/dev/null || { _bad_parse="$_m"; break; }
+  done
+  if [[ -n "$_bad_parse" ]]; then
+    bad_t "$name — mutated source still parses" "the substitution produced a syntax error in ${_bad_parse##*/}; every arm would red for the wrong reason"
     return
   fi
   local out rc
