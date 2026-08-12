@@ -9,8 +9,36 @@ create_agent_user() {
     adduser --disabled-password --gecos "" "$user" >/dev/null
   fi
   # Admin/standard join the claude group (shared workspace access); sandboxed stays isolated.
+  # DIVE-3294: this ONE predicate decides both the group membership and whether the
+  # home is minted traversable. Do not add a second `!= sandboxed` test elsewhere in
+  # this function: two predicates encoding one policy is how a sandboxed agent ends up
+  # group-claude on one path and not the other, with nothing failing loudly on drift.
+  # AGENT_SHARED_GROUP is the same STATE_DIR-style test seam as AGENT_HOME_ROOT, and it
+  # is the single source of the group name so the membership line and the home group
+  # cannot disagree.
+  local shared_group="${AGENT_SHARED_GROUP:-claude}"
   local groups="systemd-journal"
-  [[ "$isolation" != "sandboxed" ]] && groups="claude,systemd-journal"
+  if [[ "$isolation" != "sandboxed" ]]; then
+    groups="${shared_group},systemd-journal"
+    # DIVE-3294: adduser mints the home 0750 with a PRIVATE group of one (HOME_MODE in
+    # /etc/login.defs + USERGROUPS=yes), so no sibling can traverse it. A worktree an
+    # agent puts in its own home is then unstattable from every other seat, prints as
+    # `prunable` in their `git worktree list` while fully intact, and the next prune
+    # anywhere in the shared checkout deletes its .git/worktrees/<name> admin dir —
+    # silently, and `git worktree repair` cannot rebuild one that was deleted.
+    # Mint the shape the host user already proves correct: /home/claude is 0750
+    # claude:claude and every agent traverses it (install.sh). chgrp alone is not
+    # enough on a host whose HOME_MODE is 0700, hence the explicit g+x.
+    # NOT `chmod o+x`: that is smaller in permission bits and LARGER in principals
+    # (every uid vs exactly the shared group), so it would hand every future sandboxed
+    # agent traversal into every home minted after it — reinstating precisely what the
+    # DIVE-1033 teardown exists to revoke.
+    local home="${AGENT_HOME_ROOT:-/home}/${user}"
+    if [[ -d "$home" ]]; then
+      chgrp "$shared_group" "$home" && chmod g+x "$home" \
+        || warn "could not make ${home} traversable by group ${shared_group} — worktrees this agent creates there will be invisible to every other seat and a prune will destroy them (DIVE-3294)"
+    fi
+  fi
   usermod -aG "$groups" "$user"
   # DIVE-1033: sandboxed agents are NOT in the claude group, so /home/claude
   # (0750) is unreachable — but the shared runtime lives there (claude at
