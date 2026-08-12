@@ -34,9 +34,10 @@ _task_usage() {
                                                 is NOT the ident number
   wip-cap-install [--relane=<lane>]             snapshot each lane's actionable count as its
                                                 frozen WIP ceiling (deliberate, once)
-  set-budget <id> <tokens|\$cost|none>           raise/lower the token budget, or 'none' to exempt
+  set-budget <id> <tokens|\$cost|none>           raise/lower the token budget, or 'none' to exempt the row.
+                                                There is NO built-in default: a row with no budget, on a host
+                                                with no task_budget_default pref, is never enforced
   set-overlap <tmpl> <skip|spawn> [bound]       recurring template: does an open instance suppress the next slot?
-                                                the row from the enforced ${_TASK_BUDGET_BUILTIN:-5000000}-token default
 
   start <id>                                    -> in_progress
   done <id> [--result=<text>|--result-file=<path>] [--no-graded-sha]

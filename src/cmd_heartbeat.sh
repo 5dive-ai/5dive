@@ -3454,7 +3454,44 @@ _hb_loop_ceiling_sweep() {
 # `_gate_tier2_floor_hit` over the ask this sweep actually emits, with a
 # floor-word row title as the non-vacuous arm, so restoring either mistake goes
 # red instead of silently restoring the page-the-human behaviour.
-_TASK_BUDGET_BUILTIN=5000000
+#
+# THERE IS NO BUILT-IN DEFAULT BUDGET, AND THAT IS THE WHOLE OF DIVE-3341.
+# Decided by lodar 2026-08-12 ("i think 5m cap shouldn't be default flag") after
+# a `claude-luca` audit on customer box 5dive-teal-fox-cx43: an enforced
+# `_TASK_BUDGET_BUILTIN=5000000` parked 9 customer rows and 6 of ours, 2 urgent
+# each side. The arithmetic underneath is worse than a badly-chosen number:
+# `_spend_scan_task_ids` keys its window by ASSIGNEE and sums every transcript
+# under that agent's home inside `[started_at, now]`. **Nothing in the scan
+# filters by task — there is no per-task token signal in a transcript to filter
+# on.** So the charge is what the assignee spent on EVERYTHING while the row sat
+# open: it grows with the row's WALL-CLOCK AGE and is independent of any work
+# done on it, and two rows open on one agent are each billed that agent's full
+# spend. An old row therefore parks for existing.
+#
+# The measurement defect is real and is tracked separately. This constant is a
+# distinct and larger fault, because it applied that number to rows NOBODY OPTED
+# IN: an empty `task_budget` fell through to `eff="$dflt"`, so every row on every
+# box was enforced against a constant no operator ever typed, and `enforce`
+# defaults ON when the pref is unset. **A row with no budget is now not evaluated
+# at all — not scanned, not charged, not parkable.** That is deliberately a
+# stronger statement than "not parked": computing an unattributable number and
+# then declining to act on it still burns the scan and still invites a later
+# reader to wire a consequence to it.
+#
+# What stays, because both are a budget somebody TYPED:
+#   * `--task-budget=<n>` / `task set-budget` — explicit, per row.
+#   * `task_budget_default` in `task_prefs` — explicit, per host.
+# Absent both, the sweep has no opinion about the row. Do NOT restore a fallback
+# constant here; `tests/task_budget_enforce_unit.sh` arm 0 fails on the mere
+# EXISTENCE of `_TASK_BUDGET_BUILTIN`, and its behavioural arm proves the
+# untouched row with a fixture that breaches 5M — so a re-added default goes red
+# rather than silently re-arming every box.
+#
+# SEQUENCING, which decides whether this reaches anyone: customer boxes install
+# the newest TAG, not `main` HEAD, so this is inert until a release cut. Until
+# then the per-host levers are the only mitigation (`task_budget_enforce=off`,
+# or `task set-budget <id> none` per row).
+#
 # Token count -> a short human scale that carries no floor term. Rounds to one
 # decimal at M, to the nearest k below that, and leaves counts under 1000 bare.
 _hb_tok_scale() {
@@ -3474,7 +3511,11 @@ _hb_task_budget_sweep() {
   enforce=$(db "SELECT value FROM task_prefs WHERE key='task_budget_enforce';" 2>/dev/null || echo "")
   [[ "${enforce:-on}" == "off" ]] && return 0
   dflt=$(db "SELECT value FROM task_prefs WHERE key='task_budget_default';" 2>/dev/null || echo "")
-  [[ "$dflt" =~ ^[1-9][0-9]*$ ]] || dflt="$_TASK_BUDGET_BUILTIN"
+  # An unset/malformed pref is NO default, not a built-in one (DIVE-3341). A
+  # malformed value folds into the same branch on purpose: it is an operator who
+  # meant to set a cap and mistyped it, and inventing a number for them is how a
+  # cap nobody chose gets enforced again.
+  [[ "$dflt" =~ ^[1-9][0-9]*$ ]] || dflt=""
   tier=$(db "SELECT value FROM task_prefs WHERE key='task_budget_gate_tier';" 2>/dev/null || echo "")
   [[ "$tier" =~ ^[0-2]$ ]] || tier=1
 
@@ -3487,12 +3528,14 @@ _hb_task_budget_sweep() {
     #   'none'  -> the explicit per-row carve-out above
     #   '$...'  -> the cost variant, which belongs to the per-agent cost guard;
     #              silently reading it as tokens would compare dollars to tokens
-    #   ''      -> no budget set, so the fleet default applies (this is the
-    #              case that makes the guard exist at all)
+    #   ''      -> no budget on the row: the host pref applies IF an operator set
+    #              one, and otherwise this row is not evaluated at all. The
+    #              `continue` is above the scan on purpose — an unasked-for row
+    #              is never charged a number, not charged one and forgiven.
     case "$budget" in
       none|NONE) continue ;;
       \$*)       continue ;;
-      "")        eff="$dflt" ;;
+      "")        [[ -n "$dflt" ]] || continue; eff="$dflt" ;;
       *)         [[ "$budget" =~ ^[1-9][0-9]*$ ]] || continue; eff="$budget" ;;
     esac
     # DIVE-2304's rule, which this guard inherits by construction rather than by
@@ -3512,7 +3555,13 @@ _hb_task_budget_sweep() {
 
     age=$(db "SELECT CAST((julianday('now')-julianday($(sqlq "$started")))*24 AS INT);" 2>/dev/null || echo "")
     local _park_pred="id=${tid} AND status IN ('todo','in_progress') AND parked_at IS NULL"
-    local _reason="hit its token budget (~${spent}/${eff} tok) — parked by the heartbeat before it could spend more"
+    # park_reason must state the metric TRUTHFULLY (DIVE-3341 acceptance 4). The
+    # old wording — "before it could spend more" — asserted the row was spending
+    # this. It was not: the figure is the ASSIGNEE'S whole agent-wide total for
+    # the window, and on an idle row it is the age of the row wearing the costume
+    # of its work. No classifier reads park_reason, so the caveat rides here in
+    # full and the ask carries a shorter form of it.
+    local _reason="reached its token budget (~${spent}/${eff} tok) — parked by the heartbeat. THE FIGURE IS NOT THIS ROW'S OWN: it is everything its assignee used between started_at and now, because no per-task token signal exists to attribute against (DIVE-3341). Treat it as an upper bound, never as this row's cost."
     db "BEGIN IMMEDIATE;
         $(_gate_archive_and_clear_sql task-budget "$_park_pred")
         UPDATE tasks
@@ -3533,7 +3582,7 @@ _hb_task_budget_sweep() {
     # columns and would otherwise wipe the gate it just filed.
     ( cmd_task_need "$tid" --type=decision --tier="$tier" \
         --options="park|continue" --recommend="park" \
-        --ask="${tident} is at ~$(_hb_tok_scale "$spent") of a $(_hb_tok_scale "$eff") budget on a ${prio}-priority row running ~${age:-?}h. It is parked. Continue with a raised budget, or leave it parked?" ) >/dev/null 2>&1 || true
+        --ask="${tident} is parked: ~$(_hb_tok_scale "$spent") against the $(_hb_tok_scale "$eff") budget someone set for it, on a ${prio}-priority row running ~${age:-?}h. That figure is everything its assignee used in the window, not this row alone, so read it as a ceiling. Continue with a raised budget, or leave it parked?" ) >/dev/null 2>&1 || true
   done < <(db "SELECT id||x'1f'||COALESCE(ident,'')||x'1f'||COALESCE(REPLACE(title,x'1f',' '),'')||x'1f'||COALESCE(priority,'')||x'1f'||COALESCE(task_budget,'')||x'1f'||COALESCE(started_at,'')
                FROM tasks
                WHERE status IN ('todo','in_progress') AND kind='standard'

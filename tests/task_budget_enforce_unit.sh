@@ -64,12 +64,98 @@ parked_of() { db "SELECT status||'/'||CASE WHEN parked_at IS NOT NULL THEN 'park
 GATELOG="$TMP/gates.txt"; : > "$GATELOG"
 cmd_task_need() { printf '%s\n' "$*" >> "$GATELOG"; return 0; }
 
-# ── 0. the shipped default is the number the ticket specifies ────────────────
-# A pref can be set to anything; the arm that matters is what a fleet with NO
-# pref gets, because that is every row today.
-[[ "${_TASK_BUDGET_BUILTIN}" == "5000000" ]] \
-  && ok_t "built-in default budget is 5M tokens" \
-  || bad_t "built-in default" "got ${_TASK_BUDGET_BUILTIN}"
+# ── 0. NO BUDGET + NO PREF -> THE ROW IS NOT EVALUATED AT ALL ───────────────
+# DIVE-3341, lodar 2026-08-12: "i think 5m cap shouldn't be default flag". This
+# harness previously asserted the OPPOSITE here — that a fleet with no pref gets
+# an enforced 5M — and that assertion is what shipped the incident: an enforced
+# constant nobody typed parked 9 rows on customer box 5dive-teal-fox-cx43 and 6
+# of ours, 2 urgent each side.
+#
+# THIS IS THE ARM THAT MUST BE ABLE TO FAIL, and the fixture is built backwards
+# from that. A 60k row proves nothing against a 5M default — it would sit live
+# under the OLD code too, so the obvious version of this arm is vacuous. So the
+# fixture carries 6.0M against a row aged 1500h: pre-fix it parks, post-fix it
+# must be untouched. The non-vacuity control at the bottom RUNS the pre-fix
+# comparison to prove that, rather than asserting it in a comment.
+#
+# Its own agent and its own HOME, deliberately: dropping 6M into the shared
+# fixture would silently re-price every arm below (arm 1 asserts 60000/50000,
+# arm 6 asserts a 999999 budget stays live) and they would fail for a reason
+# that has nothing to do with what they test.
+AGBIG="budgetbig"
+BIGHOME="$TMP/home-$AGBIG"
+mkdir -p "$BIGHOME/.claude/projects/proj"
+printf '{"agents":{"%s":{"type":"claude"},"%s":{"type":"claude"}}}' "$AG" "$AGBIG" > "$REGISTRY"
+LOOP_HOME_OVERRIDE_JSON=$(printf '{"%s":"%s","%s":"%s"}' "$AG" "$FAKEHOME" "$AGBIG" "$BIGHOME")
+printf '{"type":"assistant","timestamp":"%s","message":{"model":"claude-opus-4-8","usage":{"input_tokens":2000000,"output_tokens":2000000,"cache_creation_input_tokens":2000000,"cache_read_input_tokens":0}}}\n' "$ts1" \
+  > "$BIGHOME/.claude/projects/proj/session.jsonl"
+big_start=$((now - 1500*3600))
+db "INSERT INTO tasks (ident,title,status,assignee,kind,priority,task_budget,started_at,created_at,updated_at)
+    VALUES ('DIVE-9000','an idle row nobody asked to cap','in_progress','$AGBIG','standard','medium',NULL,
+            datetime($big_start,'unixepoch'),datetime($big_start,'unixepoch'),datetime($big_start,'unixepoch'));"
+id_nodflt=$(db "SELECT id FROM tasks WHERE ident='DIVE-9000';")
+
+# TRIPWIRE: the constant itself must be gone, not merely unreferenced. A dormant
+# `_TASK_BUDGET_BUILTIN` is one `||` away from re-arming every box, so re-adding
+# it goes red here even if nothing reads it yet.
+[[ -z "${_TASK_BUDGET_BUILTIN+set}" ]] \
+  && ok_t "there is no built-in default budget constant to fall back to" \
+  || bad_t "_TASK_BUDGET_BUILTIN is back" "got '${_TASK_BUDGET_BUILTIN:-}' — an unasked-for cap is enforceable again"
+
+# NEVER SCANNED, not merely never parked. Computing an unattributable number and
+# then declining to act on it leaves the charge sitting there for the next reader
+# to wire a consequence to; the skip has to be ABOVE the scan. Spy delegates to
+# the real reader so this cannot pass by breaking it.
+SCANLOG="$TMP/scans.txt"; : > "$SCANLOG"
+eval "_spend_scan_orig() $(declare -f _spend_scan_task_ids | tail -n +2)"
+_spend_scan_task_ids() { printf '%s\n' "$1" >> "$SCANLOG"; _spend_scan_orig "$@"; }
+[[ -z "$(db "SELECT value FROM task_prefs WHERE key='task_budget_default';" 2>/dev/null)" ]] \
+  && ok_t "precondition: this host has no task_budget_default pref set" \
+  || bad_t "fixture leak: a default pref is already set" "arm 0 cannot test the unset case"
+[[ -z "$(db "SELECT value FROM task_prefs WHERE key='task_budget_enforce';" 2>/dev/null)" ]] \
+  && ok_t "precondition: enforcement pref is UNSET (and therefore armed)" \
+  || bad_t "fixture leak: enforce pref already set" "the unset-is-armed case is what shipped"
+_hb_task_budget_sweep >/dev/null 2>&1
+[[ "$(parked_of "$id_nodflt")" == "in_progress/live" ]] \
+  && ok_t "a row with NO budget on a host with NO default is UNTOUCHED (6.0M, aged 1500h)" \
+  || bad_t "an unasked-for row was parked" "$(parked_of "$id_nodflt")"
+grep -qF "[${id_nodflt}]" "$SCANLOG" \
+  && bad_t "the unasked-for row was SCANNED" "skip must sit above the scan, not below it: $(cat "$SCANLOG")" \
+  || ok_t "...and it is never SCANNED — no unattributable number is even computed"
+[[ -z "$(db "SELECT park_reason FROM tasks WHERE id=$id_nodflt;")" ]] \
+  && ok_t "...and it carries no park_reason" \
+  || bad_t "park_reason written on an unevaluated row" "$(db "SELECT park_reason FROM tasks WHERE id=$id_nodflt;")"
+unset -f _spend_scan_task_ids _spend_scan_orig
+source "$SRC/cmd_loop.sh"
+
+# NON-VACUITY, and it is the load-bearing half of this arm: the SAME row, with
+# the 5M number supplied as an EXPLICIT pref, parks. That proves (a) the fixture
+# really does breach the constant this ticket removed, so pre-fix this row parked
+# — the arm above is not passing because 6.0M is small; and (b) removing the
+# DEFAULT did not remove the FEATURE, which is exactly the line lodar drew: a
+# budget someone typed is still a budget.
+db "INSERT INTO task_prefs (key,value) VALUES ('task_budget_default','5000000')
+    ON CONFLICT(key) DO UPDATE SET value=excluded.value;"
+_hb_task_budget_sweep >/dev/null 2>&1
+[[ "$(parked_of "$id_nodflt")" == "blocked/parked" ]] \
+  && ok_t "control: that same row DOES park once 5M is an EXPLICIT host pref (pre-fix behaviour)" \
+  || bad_t "control failed — the arm above is vacuous" "$(parked_of "$id_nodflt")"
+
+# park_reason must not claim the row spent this (DIVE-3341 acceptance 4). The
+# figure is the ASSIGNEE'S agent-wide total for the window; on this fixture the
+# row is idle and 1500h old, so the number is its AGE wearing the costume of its
+# work. Asserted on the emitted string, not on a comment.
+reason_big=$(db "SELECT park_reason FROM tasks WHERE id=$id_nodflt;")
+[[ "$reason_big" == *"NOT THIS ROW'S OWN"* && "$reason_big" == *"assignee"* ]] \
+  && ok_t "park_reason states the metric truthfully (assignee-wide, not this row's)" \
+  || bad_t "park_reason misattributes the spend to the row" "$reason_big"
+[[ "$reason_big" != *"before it could spend more"* ]] \
+  && ok_t "...and drops the old claim that the row was spending it" \
+  || bad_t "the untruthful wording is back" "$reason_big"
+
+# Reset the counter this control incremented, so arm 3 still grades arm 1's trip
+# and not the sum of two arms.
+db "DELETE FROM task_prefs WHERE key='task_budget_trips';"
 
 # Shrink the default for the remaining arms so a 60k fixture can breach it.
 db "INSERT INTO task_prefs (key,value) VALUES ('task_budget_default','50000')
