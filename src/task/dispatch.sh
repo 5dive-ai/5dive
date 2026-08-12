@@ -15,7 +15,7 @@ _task_usage() {
 5dive task — shared task queue (sqlite at ${STATE_DIR}/tasks/tasks.db)
 
   init                                          one-time root bootstrap of the store
-  add <title...> [--body=<text>|--body-file=<path>] [--from=<who>] [--parent=<id>]
+  add <title...> [--body=<text>|--body-file=<path>] [--from=<who>] [--parent=<DIVE-N>]
       [--priority=low|medium|high|urgent] [--branch=<name>]
       [--assignee=<agent|role:<r>|charter:<kw>>]
       [--recurring="<5-field cron>"] [--accept=<criteria>|--accept-file=<path>] [--verify=<cmd>]
@@ -28,6 +28,10 @@ _task_usage() {
   set-body <id> <text...>|--file=<path> [--append]   replace the body, or append to it
   set-title <id> <text...>                      overwrite the title (audited; refused once closed)
   set-branch <id> <branch>                      bind the row to a git branch
+  set-parent <id> <DIVE-N|none>                 attach the row to its parent (audited; works on a
+                                                closed row; 'none' detaches). Name the parent by
+                                                IDENT — a bare number is the global row id, which
+                                                is NOT the ident number
   wip-cap-install [--relane=<lane>]             snapshot each lane's actionable count as its
                                                 frozen WIP ceiling (deliberate, once)
   set-budget <id> <tokens|\$cost|none>           raise/lower the token budget, or 'none' to exempt
@@ -223,6 +227,7 @@ cmd_task() {
     set-branch)      cmd_task_set_branch "$@" ;;
     set-body)        cmd_task_set_body "$@" ;;
     set-title)       cmd_task_set_title "$@" ;;
+    set-parent)      cmd_task_set_parent "$@" ;;   # DIVE-3275 re-parent a filed row
     set-budget)      cmd_task_set_budget "$@" ;;
     set-overlap)     cmd_task_set_overlap "$@" ;;
     wip-cap-install) cmd_task_wip_cap_install "$@" ;;
@@ -598,6 +603,144 @@ cmd_task_set_title() {
   ok "$ident retitled: \"$prior\" -> \"$text\"" \
      '{ident:$id, changed:true, prior_title:$p, title:$t}' \
      --arg id "$ident" --arg p "$prior" --arg t "$text"
+}
+
+# ---------------------------------------------------------------------------
+# `5dive task set-parent <id|DIVE-N> <DIVE-N|id|none>` — DIVE-3275.
+#
+# `parent_id` was INSERT-only: `task add --parent=<id>` was the sole moment a
+# parent edge could ever be written, so a row split out of another one and filed
+# without `--parent` could never be attached afterwards. The relationship then
+# survives only as prose in a body, and `task show <parent>` renders no edge to
+# it. That already cost a real verification: DIVE-3138 was split out of DIVE-2895
+# in words but filed unparented, so the maker closing DIVE-2895 asserted an item
+# was blocked on work DIVE-3138 had finished 2h36m earlier. The fix list said
+# "set parent_id on DIVE-3138" and there was no verb that could.
+# (community/wiki/a-split-out-row-with-no-parent-link-is-invisible-to-the-row-it-came-from.md)
+#
+# A CLOSED ROW CAN BE RE-PARENTED — deliberately NOT set-title's refusal (spec
+# decided by olivia, 2026-08-12). Closing freezes the record of what was
+# ASSERTED — body and result, the text a later reader quotes back. `parent_id` is
+# not an assertion by the closer; it is a navigation edge, and its ABSENCE is the
+# entire defect: DIVE-3138 was already closed when its missing edge produced the
+# false premise. A blanket closed-row refusal would ship a verb that cannot fix
+# the case that motivated it. So: audited like set-title, and it does not reopen
+# the row, touch `done_at`, or bump `updated_at` — the write is to the graph, and
+# nothing about the closed record's own timeline changes.
+cmd_task_set_parent() {
+  tasks_db_init
+  local task="" parent="" parent_from_flag=0
+  local -a positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --parent=*)  parent="${1#*=}"; parent_from_flag=1 ;;
+      --)          shift; positional+=("$@"); break ;;
+      -*)          fail "$E_USAGE" "unknown flag: $1" ;;
+      *)           positional+=("$1") ;;
+    esac
+    shift
+  done
+  task="${positional[0]:-}"
+  if (( parent_from_flag )); then
+    [[ ${#positional[@]} -le 1 ]] \
+      || fail "$E_USAGE" "--parent conflicts with the positional parent — name the parent exactly once"
+  else
+    parent="${positional[1]:-}"
+  fi
+  [[ -n "$task" && -n "$parent" ]] \
+    || fail "$E_USAGE" "usage: 5dive task set-parent <id|DIVE-N> <DIVE-N|none>   (none detaches)"
+  [[ ${#positional[@]} -le 2 ]] \
+    || fail "$E_USAGE" "usage: 5dive task set-parent <id|DIVE-N> <DIVE-N|none>   (got ${#positional[@]} positional arguments)"
+
+  _task_resolve_ref_strict "$task" "the task to re-parent"
+  local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+
+  # A recurring TEMPLATE has no parent by construction — `task add` already
+  # refuses `--recurring` with `--parent` because instances are top-level. Say
+  # the same thing here rather than letting the graph disagree with the filer.
+  local kind; kind=$(db "SELECT COALESCE(kind,'standard') FROM tasks WHERE id=${id};")
+  [[ "$kind" != "recurring" ]] \
+    || fail "$E_VALIDATION" "$ident is a recurring TEMPLATE — templates are top-level by construction (task add refuses --recurring with --parent for the same reason)"
+
+  local prior_pid prior_ident
+  prior_pid=$(db "SELECT COALESCE(parent_id,'') FROM tasks WHERE id=${id};")
+  prior_ident="none"; [[ -n "$prior_pid" ]] && prior_ident=$(ident_of "$prior_pid")
+
+  local new_pid="" new_ident="none"
+  if [[ "${parent,,}" != "none" ]]; then
+    _task_resolve_ref_strict "$parent" "the parent"
+    new_pid="$RESOLVED_TASK_ID"; new_ident="$RESOLVED_TASK_IDENT"
+    # `parent_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE` — a row that is
+    # its own parent is not merely odd, it is a cycle of length one, and every
+    # tree walker here assumes acyclicity.
+    [[ "$new_pid" != "$id" ]] \
+      || fail "$E_VALIDATION" "$ident cannot be its own parent"
+    _task_parent_cycle_check "$id" "$new_pid" "$ident" "$new_ident"
+  fi
+
+  if [[ "${prior_pid:-}" == "${new_pid:-}" ]]; then
+    _task_print_children "${new_pid:-$prior_pid}" "$new_ident"
+    ok "$ident parent unchanged (already $new_ident)" \
+       '{ident:$id, changed:false, parent:$p, children:($c|split(",")|map(select(length>0)))}' \
+       --arg id "$ident" --arg p "$new_ident" --arg c "$_TASK_CHILDREN_CSV"
+    return 0
+  fi
+
+  local set_sql="NULL"; [[ -n "$new_pid" ]] && set_sql="$new_pid"
+  db "UPDATE tasks SET parent_id=${set_sql} WHERE id=${id};"
+  # The PRIOR parent is the payload: without it the audit row records that a
+  # re-parent happened and destroys the only copy of the edge it replaced.
+  _task_store_audit_log "task set-parent" "ok" 0 -- \
+    "task=$ident" "actor=$(task_actor)" "prior=$prior_ident" "new=$new_ident" || true
+
+  # A parent edge is verified by the READER's view, not by the writer's exit code
+  # — that is the whole lesson of the wiki page above. Printing the parent's
+  # resulting child list makes the command self-verifying and removes the
+  # follow-up `task show <parent>` everyone forgets. On a detach we print the
+  # FORMER parent's list, which is where the absence has to be visible.
+  local shown_pid="$new_pid" shown_ident="$new_ident"
+  [[ -n "$shown_pid" ]] || { shown_pid="$prior_pid"; shown_ident="$prior_ident"; }
+  _task_print_children "$shown_pid" "$shown_ident"
+  ok "$ident parent $prior_ident -> $new_ident" \
+     '{ident:$id, changed:true, prior_parent:$pp, parent:$p, children:($c|split(",")|map(select(length>0)))}' \
+     --arg id "$ident" --arg pp "$prior_ident" --arg p "$new_ident" \
+     --arg c "$_TASK_CHILDREN_CSV"
+}
+
+# Refuse a cycle: walk the prospective parent's ancestor chain and refuse if the
+# child appears in it. The walk is BOUNDED — a pre-existing cycle in the store
+# (from a raw sqlite write, say) must make this command refuse, never hang.
+_task_parent_cycle_check() {
+  local child_id="$1" walk="$2" child_ident="$3" parent_ident="$4"
+  local hops=0 seen=""
+  while [[ -n "$walk" ]]; do
+    if (( ++hops > 64 )); then
+      fail "$E_VALIDATION" "ancestor chain above $parent_ident is deeper than 64 rows or already cyclic — refusing rather than walking it further (chain seen: ${seen#,})"
+    fi
+    seen+=",$(ident_of "$walk")"
+    walk=$(db "SELECT COALESCE(parent_id,'') FROM tasks WHERE id=${walk};")
+    [[ "$walk" != "$child_id" ]] \
+      || fail "$E_VALIDATION" "that would make a cycle: $child_ident is already an ancestor of $parent_ident (chain: ${seen#,})"
+  done
+  return 0
+}
+
+# Render the parent's children, and expose them as a CSV for the --json arm.
+_TASK_CHILDREN_CSV=""
+_task_print_children() {
+  local pid="$1" pident="$2" rows=""
+  _TASK_CHILDREN_CSV=""
+  [[ -n "$pid" ]] || return 0
+  rows=$(db "SELECT ident||'  ['||status||']  '||title FROM tasks WHERE parent_id=${pid} ORDER BY id;")
+  _TASK_CHILDREN_CSV=$(db "SELECT group_concat(ident, ',') FROM (SELECT ident FROM tasks WHERE parent_id=${pid} ORDER BY id);")
+  (( JSON_MODE )) && return 0
+  echo "subtasks of ${pident} now:"
+  if [[ -n "$rows" ]]; then
+    printf '%s\n' "$rows" | indent2
+  else
+    printf '%s\n' "(none)" | indent2
+  fi
+  return 0
 }
 
 cmd_task_init() {
