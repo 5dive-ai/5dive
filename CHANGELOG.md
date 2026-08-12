@@ -1,5 +1,81 @@
 # Changelog
 
+## Unreleased — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
+
+DIVE-2483's gate answer said the preservation notice lands on **stdout**. It lands on **stderr**,
+via the fleet's `warn()`. Six arms were written for that condition and all six were green, because
+every one of them captured `2>&1` — the merge happens *before* the comparison, so the arm set was
+satisfied by either channel and could not fail in the direction of the routing condition it was
+written for. The limit was known and recorded as a sentence; a sentence does not go red.
+
+`tests/task_result_loss_open_row_unit.sh` grows three arms (30 → 33) that capture **one stream per
+arm**:
+
+- **O7** — stderr alone (`2>&1 >/dev/null`) carries the announcement *and* the byte count.
+- **O8** — stdout alone (`2>/dev/null`) does **not**. This is the arm no merged capture can
+  contain, and it is what makes stderr a decision with a guard on it rather than a convention.
+- **O9** — stdout alone is not empty (it still carries the close line), so O8 — a negative arm on a
+  capture — is graded against real output rather than against silence.
+
+**stderr stays the convention and that is deliberate**: an advisory must not corrupt a parsed
+stdout, and moving a fleet-wide `warn()` is not this row's call. What changes is that a future move
+to stdout now reds a named arm instead of silently breaking every caller that parses the close.
+
+Graded by mutation, and the two mutants point opposite ways:
+
+- **Same bytes, different channel** (`warn` → `echo`, so the identical string goes to fd 1) reds
+  **O7 and O8 and nothing else** — 31/2. Every content arm above stays green. That disjointness *is*
+  the finding: no content assertion in this file can see a routing change, which is exactly how the
+  original six passed.
+- **Announcement deleted** reds **O1/O2/O3/O6/O7** — 28/5 — while **O8 stays green**, because a
+  negative arm is satisfied by an absence. Neither arm is sufficient alone; the pair is the guard.
+
+Still open and scoped out on purpose: `task reject` remains an unguarded writer of the result
+column (`src/cmd_task.sh:4235`). That is a design question about accumulating verifier feedback, not
+this gap.
+
+## Unreleased — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
+
+DIVE-3272 taught the supervisor BOARD to see a seat that is alive and closing nothing. The
+drill-down people actually type kept printing only liveness: `state: active / enabled` was
+identical for a working seat and for `dev3`, which sat on an expired 1-week quota for four
+days with twenty rows queued behind it. Six green signals agreed about it, and that
+agreement is the defect, not evidence against the report
+(`community/wiki/every-signal-measured-liveness-none-measured-output.md`).
+
+`agent info` now prints two more lines and a `supervisor` block in `--json`:
+
+```
+state:       active / enabled · ⚠ NOT TRANSACTING (quota-exhausted: pane shows a model-capacity refusal: ...)
+output:      2 open row(s), nothing closed in 4d
+supervisor:  quota-exhausted / quota-exhausted — pane shows a model-capacity refusal: ... (tick 2m ago)
+```
+
+- **The two halves are not equally measurable from this surface, and it says which is
+  which.** `no-output` is a pure store read, so `info` re-runs `_sup_output_stats` itself:
+  measured at print time, no tick required, cannot go stale. `quota-exhausted` needs a root
+  `tmux capture-pane` hop that a read-only command running as any seat must not grow, so it
+  is INHERITED from `supervisor_events` and printed with its age and the tick's ARM STATE
+  attached. An unmeasured branch has to say less than the measured one (DIVE-2793), and an
+  unarmed monitor otherwise prints exactly what a quiet one prints (DIVE-2306).
+- **Freshness is decided by comparison, not by a wall-clock guess.** The tick writes an
+  `observe` row every tick for every non-healthy class, so an agent whose newest row
+  predates the newest fleet heartbeat was looked at and found healthy. A stale
+  `quota-exhausted` row is therefore never quoted as current.
+- **Four output states, never three.** `ok` / `idle` (no open rows — correctly idle, not
+  dry) / `unknown` (never closed anything: a new seat and a dark one read the same here) /
+  `unmeasured` (the store was not readable — nothing was measured, which is not a clear).
+  `transacting` is `null`, never `false`, for all but the dry case.
+- **The warning leads with the queue**, not the seat's symptom: the whole cost of the
+  incident was the rows stacked behind a seat nobody knew was dark, and the seat itself
+  cannot read its own `info` output.
+- **A stale TICK does not speak for the present either.** Past `_SUP_INFO_TICK_STALE`
+  (1h) the overlay reports `unobserved` and names the age instead of deriving `healthy`
+  from an observer that has stopped — the same absence-reads-as-health shape one level up
+  (main, at the DIVE-3274 push approval).
+- `agent list` is unchanged — it is the survey surface, and this is a per-agent drill-down
+  (three sqlite reads), deliberately not an N-way fan-out.
+
 ## Unreleased — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
 
 A gate reaches the filer's lead only if `_GATE_ENG_SHIP_RX` matches the ask or the row
