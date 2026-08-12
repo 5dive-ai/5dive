@@ -1,6 +1,111 @@
 # Changelog
 
-## Unreleased — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
+## v0.19.26 — feat(task): `set-parent`, and the bare-number parent guard on `task add` (DIVE-3275)
+
+`parent_id` was **INSERT-only**: `task add --parent=` was the sole moment a parent
+edge could ever be written, so a row filed without it could never be attached
+afterwards and the relationship survived only as prose in a body.
+
+That already cost a verification. `DIVE-3138` was split out of `DIVE-2895` with the
+words *"split out of DIVE-2895 items (1) and (2)"* but filed unparented, so
+`task show DIVE-2895` rendered no edge to it and the maker closing `DIVE-2895`
+asserted an item was blocked on work `DIVE-3138` had finished 2h36m earlier. The
+fix list said *"set parent_id on DIVE-3138"* — and no verb could.
+
+```
+5dive task set-parent <id|DIVE-N> <DIVE-N|none>      # 'none' detaches
+```
+
+### A CLOSED row CAN be re-parented — deliberately not `set-title`'s refusal
+
+A close freezes the record of what was **asserted** — body and result, the text a
+later reader quotes back. `parent_id` is not an assertion by the closer; it is a
+navigation edge, and its **absence** is the entire defect: `DIVE-3138` was already
+closed when its missing edge produced the false premise. A blanket closed-row
+refusal would have shipped a verb that cannot fix the case that motivated it.
+
+Audited like `set-title` (prior parent + new parent + actor), and it does not
+reopen the row, touch `done_at`, or bump `updated_at` — the write is to the graph,
+and nothing about the closed record's own timeline changes.
+
+### The bare-number guard, which `task add --parent` does not have
+
+`resolve_task_id()` branches on argument **shape**: `^[0-9]+$` is the global row
+`id`, `^[A-Za-z]+-[0-9]+$` is the `ident`. The two number spaces have diverged —
+measured on the live store: **`DIVE-2895` is row id 3082, and row id 2895 is
+`DIVE-2708`**, a cancelled row from another month. A bare number is therefore a
+valid id naming the wrong row with no error at all, which is exactly how
+`DIVE-3273` was filed under the wrong parent.
+
+So a bare number whose row carries a **different** ident number is refused, naming
+both the row it resolved to and the one the caller probably meant:
+
+```
+$ 5dive task set-parent DIVE-3138 2895
+error: '2895' as the parent is the global row id, which resolves to DIVE-2708
+("Daily lodar personal-X take …") — not to an ident numbered 2895. … re-run
+naming the row you mean: … DIVE-2708 (or DIVE-2895 if that is what you meant).
+```
+
+An *agreeing* bare number is accepted with a loud warning; the ident form is the
+quiet path, so the warning never becomes background noise. Applied to **both**
+arguments — a mis-resolved child re-parents the wrong row, the identical failure.
+
+The previous remedy for this was a written rule (*"always `--parent=DIVE-####`"*),
+and a rule is not a guard.
+
+**The same guard is now on `task add --parent`, the surface that actually
+misfired** — folded into this row rather than filed separately (main's call): it
+is one function away on the same surface, and a separate ident would have bought
+a second review of the same code. `task add --parent=2895` now refuses instead of
+silently filing under `DIVE-2708`, and refuses **before the INSERT**, since a row
+created under the wrong parent is the damage. The guard itself lives in
+`src/lib/tasks_db.sh` beside `resolve_task_id()`, because it is a statement about
+that function's two number spaces rather than about any one verb — so its refusal
+names the argument (`--parent`, `the parent`, `the task to re-parent`) instead of
+naming a verb. Both help lines now read `--parent=<DIVE-N>`; `--parent=<id>` is
+what made the bare form look intended.
+
+### The receipt prints the parent's child list
+
+A parent edge is verified by the **reader's** view, not by the writer's exit code.
+`set-parent` therefore prints the parent's resulting subtask list, so the command
+is self-verifying and the follow-up `task show <parent>` that everyone forgets is
+gone. On a detach it prints the **former** parent's list — that is where the
+absence has to be visible.
+
+### Also refused
+
+`parent_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE`, so a wrong parent does
+not merely mis-render, it arms the child's deletion. Refused: self-parenting; a
+cycle (the target's ancestor chain is walked, **bounded at 64 hops**, so a
+pre-existing cycle in the store refuses rather than hangs); a nonexistent parent;
+and a recurring **template**, which is top-level by construction — the same thing
+`task add` already says when it refuses `--recurring` with `--parent`.
+
+### Tests
+
+New `tests/task_set_parent_unit.sh` — 57 arms, no root, no network, core tier.
+The arms grade the decisions rather than the `UPDATE`: **A1** re-parents a row that
+is already `done` and asserts it did not reopen; **C5** plants a pre-existing cycle
+by raw sqlite write and asserts the walk refuses instead of spinning; **D1/D2**
+reproduce the id/ident divergence with explicit row ids and assert the refusal on
+both arguments; **D3** asserts an agreeing bare number still warns while **D4**
+asserts the ident form warns about nothing; **F1** grades the acceptance shape —
+`task show <parent>` renders the edge — because that view is the whole point; and
+**G1d** asserts the refused `task add` created **no row at all**.
+
+Four mutation controls, all killed: copying `set-title`'s closed-row refusal reds
+section A; neutering the shared bare-number guard reds **both** section D
+(`set-parent`) and section G (`task add`), which is what proves it is one guard and
+not two; removing the cycle walk reds section C; and reverting the add path to a
+bare `resolve_task_id` reds section G alone.
+
+Knowledge compiled into the page this row came from:
+`community/wiki/a-split-out-row-with-no-parent-link-is-invisible-to-the-row-it-came-from.md`
+(Delta 2026-08-12), plus an index line in its new reader's words.
+
+## v0.19.26 — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
 
 DIVE-2483's gate answer said the preservation notice lands on **stdout**. It lands on **stderr**,
 via the fleet's `warn()`. Six arms were written for that condition and all six were green, because
@@ -34,7 +139,7 @@ Still open and scoped out on purpose: `task reject` remains an unguarded writer 
 column (`src/cmd_task.sh:4235`). That is a design question about accumulating verifier feedback, not
 this gap.
 
-## Unreleased — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
+## v0.19.26 — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
 
 DIVE-3272 taught the supervisor BOARD to see a seat that is alive and closing nothing. The
 drill-down people actually type kept printing only liveness: `state: active / enabled` was
@@ -76,7 +181,7 @@ supervisor:  quota-exhausted / quota-exhausted — pane shows a model-capacity r
 - `agent list` is unchanged — it is the survey surface, and this is a per-agent drill-down
   (three sqlite reads), deliberately not an N-way fan-out.
 
-## Unreleased — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
+## v0.19.26 — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
 
 A gate reaches the filer's lead only if `_GATE_ENG_SHIP_RX` matches the ask or the row
 title. `gate_builder_routing` is OFF by default, so for an ordinary builder ship gate that
@@ -140,7 +245,7 @@ prose for identifiers.
   `gate_access_lead_clear`, `gate_internal_ops_floor`, `task_needs_human_parity`,
   `task_inbox_json_tier`, `push_unit`, `broker_surface`, + 15 more).
 
-## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
+## v0.19.26 — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
 
 DIVE-1935's first iteration was rejected, and for the right reason. It added a
 `sudo -n -u claude gh auth token` arm to `_gate_gh_token` justified by *"agents hold
