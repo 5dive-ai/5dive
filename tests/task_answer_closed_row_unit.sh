@@ -244,7 +244,7 @@ as dev2 cmd_task_answer "$f" --value="Approve →" >/dev/null; rcf=$?
 # being the next person to touch the function.
 _answer_fn() {   # the function body, comments stripped so prose can neither
                  # mask a real violation nor invent a phantom one
-  awk '/^cmd_task_answer\(\) \{$/{on=1} on{print} on&&/^\}$/{exit}' "$SRC/cmd_task.sh" \
+  cat "$SRC/cmd_task.sh" "$SRC"/task/*.sh | awk '/^cmd_task_answer\(\) \{$/{on=1} on{print} on&&/^\}$/{exit}' \
     | grep -v '^[[:space:]]*#'
 }
 _status_writes() {   # stdin -> one flattened SQL statement per line

@@ -43,7 +43,7 @@ ok(){ if eval "$2"; then echo "ok   - $1"; pass=$((pass+1)); else echo "FAIL - $
 _PUSH_DEFAULT_REPO="https://github.com/5dive-ai/5dive.git"
 _push_repo_slug(){ printf '%s' "$1" | sed -E 's#^https://github\.com/##; s#\.git$##'; }
 # shellcheck disable=SC1090
-eval "$(sed -n '/^_gate_repo_slugs() {/,/^}/p' "$SRC/cmd_task.sh")"
+eval "$(cat "$SRC/cmd_task.sh" "$SRC"/task/*.sh | sed -n '/^_gate_repo_slugs() {/,/^}/p')"
 
 # ---- 1. THE DEFAULT SET ----
 slugs="$(FIVE_GATE_REPOS='' _gate_repo_slugs)"
@@ -78,24 +78,24 @@ ok "comma AND whitespace separated overrides both parse" \
 # Graded on the source text: this is the one property the widened list depends on, and
 # a future edit that widens further while dropping the disclosure must go red here.
 ok "the attribution ACCEPT line still exists" \
-  "grep -q 'names \$ident in its SUBJECT' \"\$SRC/cmd_task.sh\""
+  "grep -q 'names \$ident in its SUBJECT' \"\$SRC\"/cmd_task.sh \"\$SRC\"/task/*.sh"
 ok "the ACCEPT interpolates a scope clause" \
-  "grep -q 'done=merged-to-main satisfied.\$_attr_scope' \"\$SRC/cmd_task.sh\""
+  "grep -q 'done=merged-to-main satisfied.\$_attr_scope' \"\$SRC\"/cmd_task.sh \"\$SRC\"/task/*.sh"
 ok "the scope clause names the searched set" \
-  "grep -q 'the gate searched \$_searched' \"\$SRC/cmd_task.sh\""
+  "grep -q 'the gate searched \$_searched' \"\$SRC\"/cmd_task.sh \"\$SRC\"/task/*.sh"
 ok "the scope clause says repos outside the set were NOT looked at" \
-  "grep -q 'repos outside that set were NOT looked at' \"\$SRC/cmd_task.sh\""
+  "grep -q 'repos outside that set were NOT looked at' \"\$SRC\"/cmd_task.sh \"\$SRC\"/task/*.sh"
 ok "the scope clause offers the terminating remedy (Repo: line / delivery_ref)" \
-  "grep -q 'line or bind the delivery_ref, and re-check' \"\$SRC/cmd_task.sh\""
+  "grep -q 'line or bind the delivery_ref, and re-check' \"\$SRC\"/cmd_task.sh \"\$SRC\"/task/*.sh"
 ok "the scope clause is CONDITIONAL on the task declaring no repo" \
-  "grep -B3 'the gate searched \$_searched' \"\$SRC/cmd_task.sh\" | grep -q 'if \[\[ -z \"\$_task_slug\" \]\]'"
+  "grep -B3 'the gate searched \$_searched' \"\$SRC\"/cmd_task.sh \"\$SRC\"/task/*.sh | grep -q 'if \[\[ -z \"\$_task_slug\" \]\]'"
 ok "_attr_scope is declared local (no global leak under set -u)" \
-  "grep -q 'local _slug _bmerged=.*_attr_scope=' \"\$SRC/cmd_task.sh\""
+  "grep -q 'local _slug _bmerged=.*_attr_scope=' \"\$SRC\"/cmd_task.sh \"\$SRC\"/task/*.sh"
 
 # ---- 4. THE REFUSALS KEPT THEIR SCOPE DISCLOSURE (no regression) ----
 ok "the DIVE-1830 refusal still names \$_searched" \
-  "grep -q 'in \$_searched shows branch' \"\$SRC/cmd_task.sh\""
+  "grep -q 'in \$_searched shows branch' \"\$SRC\"/cmd_task.sh \"\$SRC\"/task/*.sh"
 ok "the scan-bound refusal still offers the unsearched-repo explanation" \
-  "grep -q 'the branch lives in a repo that was NEVER SCANNED' \"\$SRC/cmd_task.sh\""
+  "grep -q 'the branch lives in a repo that was NEVER SCANNED' \"\$SRC\"/cmd_task.sh \"\$SRC\"/task/*.sh"
 
 echo; echo "$pass passed, $fail failed"; [[ $fail -eq 0 ]]

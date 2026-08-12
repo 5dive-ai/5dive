@@ -190,6 +190,14 @@ out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
 #
 # DIVE-2730 added verify_optout, the persisted add-time `--no-verify` (84 -> 85).
 #
+# DIVE-3251 added first_started_at, the durable first-start clock split out of
+# started_at so the reclaim ladder can keep resetting the age without destroying
+# the evidence that work happened (85 -> 86). 85 was READ AT THE MERGED BASE
+# (bb07d4b, DIVE-2730 already landed), not carried from any pre-merge figure, and
+# 86 was confirmed by RUNNING this case against the merged tree — not predicted
+# from the addition. See the note below: on this literal, prediction is how the
+# last three branches each got it wrong.
+#
 # THIS LITERAL WAS RESOLVED BY ARITHMETIC, NOT BY PICKING A SIDE (2026-08-11), and
 # it has now been resolved that way TWICE in one day, by two different branches.
 # First pass: DIVE-3218 and DIVE-2272 both forked at 79 and each was internally
@@ -215,8 +223,8 @@ actual=$(sqlite3 "$TASKS_DB" \
     WHERE name IN ('delivery_ref','delivered_at','delivery_ref_iteration','parked_at','park_reason','escalated_at','escalated_by','human_evidence')
     ORDER BY name;" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
 column_count=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM pragma_table_info('tasks');" 2>/dev/null)
-[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "85" ]] \
-  && ok "fresh schema: all 85 columns, including the eight former holes, are present" \
+[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "86" ]] \
+  && ok "fresh schema: all 86 columns, including the eight former holes, are present" \
   || bad "fresh schema: init returned a partial tasks table" "rc=$rc count=$column_count got=[$actual] want=[$required] out=$out"
 
 # --- Case 10 (DIVE-2197): migrate arm still rejects a failed ALTER ------------

@@ -127,15 +127,15 @@ sg=$(db "SELECT need_type||'|'||COALESCE(secret_key,'')||'|'||COALESCE(connector
   || bad_t "secret gate did not store its on-box drop target" "got: $sg"
 
 echo "== (3) static invariants: Telegram is notify-only; on-box human clear; drop fallback =="
-grep -Eq 'task_need_notify .*\|\| true' src/cmd_task.sh \
+grep -Eq 'task_need_notify .*\|\| true' src/task/*.sh \
   && ok_t "gate NOTIFY is best-effort (|| true) — a Telegram failure never blocks a gate" \
-  || bad_t "gate notify is not best-effort guarded" "expected 'task_need_notify ... || true' in src/cmd_task.sh"
+  || bad_t "gate notify is not best-effort guarded" "expected 'task_need_notify ... || true' in src/task/*.sh"
 
-grep -q '_gate_sudo_uid_nonagent' src/cmd_task.sh \
+grep -q '_gate_sudo_uid_nonagent' src/task/*.sh \
   && ok_t "hard gates clear on-box via a non-agent SUDO_UID (no Telegram nonce required)" \
   || bad_t "no on-box human-evidence path" "expected _gate_sudo_uid_nonagent form in cmd_task_answer"
 
-grep -Eqi 'ONBOX|on-box|drop' src/cmd_task.sh src/cmd_secret.sh \
+grep -Eqi 'ONBOX|on-box|drop' src/task/*.sh src/cmd_secret.sh \
   && ok_t "secret gates have an on-box credential-drop fallback" \
   || bad_t "no on-box credential-drop fallback found" "expected an ONBOX / drop path"
 

@@ -114,15 +114,28 @@ da=$(db "SELECT done_at IS NOT NULL FROM tasks WHERE id=$id3;")
 # --- DIVE-2316: delivery_ref is visible through the CLI, including absence.
 # JSON show already reads the whole row; the regression was the human presenter
 # omitting the enforcement field. Prove both states before the list audit below.
+#
+# DIVE-3251: THE ANCHOR IS NOW PADDING-INSENSITIVE, and the reason is worth
+# knowing before someone "tightens" it back. `dbfmt -line` is sqlite3's own -line
+# mode, which RIGHT-ALIGNS every field name to the width of the WIDEST name in
+# the SELECT. So adding any column longer than the current widest re-indents
+# EVERY line of `task show` at once, and a `^name = value` anchor breaks on a
+# change that has nothing to do with the field it is guarding. `first_started_at`
+# (16 chars) did exactly that to `delivery_ref` (12).
+#
+# What DIVE-2316 is actually about is that the human presenter must not OMIT the
+# enforcement field, and both arms below still grade precisely that. The leading
+# whitespace was never the property under test. Machine consumers read the JSON
+# path, which is untouched by the presenter's alignment.
 show_absent=$( (JSON_MODE=0 cmd_task_show "$id3") 2>"$TMP"/err )
-echo "$show_absent" | grep -q '^delivery_ref = absent$' \
+echo "$show_absent" | grep -qE '^ *delivery_ref = absent$' \
   && ok_t "DIVE-2316: task show makes an absent delivery_ref explicit" \
   || bad_t "DIVE-2316 show absent" "$show_absent"
 
 delivery_url='https://github.com/example/project/pull/999'
 db "UPDATE tasks SET delivery_ref=$(sqlq "$delivery_url") WHERE id=$id3;"
 show_bound=$( (JSON_MODE=0 cmd_task_show "$id3") 2>"$TMP"/err )
-echo "$show_bound" | grep -Fqx "delivery_ref = $delivery_url" \
+echo "$show_bound" | grep -qE "^ *delivery_ref = $(printf '%s' "$delivery_url" | sed 's/[.[\*^$\/]/\\&/g')\$" \
   && ok_t "DIVE-2316: task show prints the bound delivery_ref" \
   || bad_t "DIVE-2316 show bound" "$show_bound"
 
@@ -427,7 +440,10 @@ grep -q -- "--no-verify" "$TMP"/err \
   && ok_t "no-verify: the override NAMES the opt-out it is overriding" \
   || bad_t "override silent" "warn text does not mention the opt-out: $(tr '\n' ' ' <"$TMP"/err)"
 unset -f _task_delivery_paths _task_default_verifier
-. "$SRC/cmd_task.sh"
+# DIVE-3278: source the MODULE, not src/cmd_task.sh. cmd_task.sh is a loader whose
+# `declare -F` guards are already satisfied here, so re-sourcing it is a no-op and
+# would leave the two functions above unset for the rest of this file.
+. "$SRC/task/routing.sh"
 
 # An explicit later attach supersedes the earlier refusal — otherwise the row
 # carries a live opt-out flag that contradicts its own grader.

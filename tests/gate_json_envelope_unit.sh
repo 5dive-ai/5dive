@@ -92,7 +92,7 @@ pref=$(printf '%s' "$out2" | jq -r '.data.precedent_ref' 2>/dev/null)
 # Matches `select(...))` followed by a pipe, i.e. the closing paren lands BEFORE
 # the pipe so any trailing `// null` can only bind to the piped filter. The safe
 # forms close after the whole pipeline, or use map()/[ ... ] comprehensions.
-bad_sites=$(grep -n 'select(length[^)]*))|' src/*.sh | grep -v 'map(select' || true)
+bad_sites=$(grep -n 'select(length[^)]*))|' src/*.sh src/task/*.sh | grep -v 'map(select' || true)
 [[ -z "$bad_sites" ]] \
   && ok_t "no select(...)-then-pipe binding where // null cannot enclose the expression" \
   || bad_t "dangerous jq binding reintroduced" "$bad_sites"

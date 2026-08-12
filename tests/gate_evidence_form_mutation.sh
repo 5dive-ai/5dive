@@ -36,15 +36,23 @@ grade() {
   local name="$1" want="$2" old="$3" new="$4"
   local dir="$TMP/$name"; rm -rf "$dir"; mkdir -p "$dir"
   cp -r src "$dir/src"
-  if ! OLD="$old" NEW="$new" F="$dir/src/cmd_task.sh" python3 - <<'PY'
-import os, sys
-p, old, new = os.environ["F"], os.environ["OLD"], os.environ["NEW"]
-s = open(p).read()
-n = s.count(old)
+  # DIVE-3278: `task` was split out of src/cmd_task.sh into src/task/*.sh, so an
+  # anchor may live in any of them. Still require exactly ONE occurrence across
+  # the WHOLE set — that is the property this check was protecting, and counting
+  # per-file would let a duplicated anchor through.
+  if ! OLD="$old" NEW="$new" D="$dir/src" python3 - <<'PY'
+import os, sys, glob
+d, old, new = os.environ["D"], os.environ["OLD"], os.environ["NEW"]
+files = [os.path.join(d, "cmd_task.sh")] + sorted(glob.glob(os.path.join(d, "task", "*.sh")))
+hits = [(p, open(p).read()) for p in files]
+n = sum(s.count(old) for _, s in hits)
 if n != 1:
-    sys.stderr.write("mutation did not apply cleanly: %d occurrences of %r\n" % (n, old[:90]))
+    sys.stderr.write("mutation did not apply cleanly: %d occurrences of %r across %d files\n"
+                     % (n, old[:90], len(files)))
     sys.exit(1)
-open(p, "w").write(s.replace(old, new))
+for p, s in hits:
+    if old in s:
+        open(p, "w").write(s.replace(old, new))
 PY
   then
     bad_t "$name — mutation applies to the current source" "the anchor is gone or duplicated; this mutant graded NOTHING"
@@ -52,7 +60,8 @@ PY
   fi
   # Prove the mutant actually differs on disk. An unwritable or unchanged copy
   # would run as a CONTROL and green identically to a killed mutant.
-  if diff -q src/cmd_task.sh "$dir/src/cmd_task.sh" >/dev/null 2>&1; then
+  if diff -qr src/cmd_task.sh "$dir/src/cmd_task.sh" >/dev/null 2>&1 \
+     && diff -qr src/task "$dir/src/task" >/dev/null 2>&1; then
     bad_t "$name — mutant differs from the baseline on disk" "the copy is byte-identical to src: this mutant graded NOTHING"
     return
   fi

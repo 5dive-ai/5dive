@@ -40,11 +40,13 @@ run_mutation() {
   local label="$1" expr="$2" must_red="$3" must_green="$4"
   local dir="$MUT_TMP/$label"
   rm -rf "$dir"; mkdir -p "$dir"; cp -a "$ROOT/src" "$dir/src"
-  local target="$dir/src/cmd_task.sh"
+  # DIVE-3278: `task` is src/cmd_task.sh + src/task/*.sh now. sed the whole set and
+  # fingerprint the whole set, so a no-op still reads as a no-op.
+  local target=("$dir/src/cmd_task.sh" "$dir"/src/task/*.sh)
   local before after
-  before=$(md5sum "$target" | cut -d' ' -f1)
-  sed -i "$expr" "$target"
-  after=$(md5sum "$target" | cut -d' ' -f1)
+  before=$(cat "${target[@]}" | md5sum | cut -d' ' -f1)
+  sed -i "$expr" "${target[@]}"
+  after=$(cat "${target[@]}" | md5sum | cut -d' ' -f1)
   if [[ "$before" == "$after" ]]; then
     bad_t "$label: mutation applied (anchor still matches the source)" "sed was a no-op — the anchor has drifted"
     return
@@ -52,10 +54,16 @@ run_mutation() {
   ok_t "$label: mutation applied to a copy of src"
   # A mutation must stay SYNTAX-VALID, or every arm reds for the wrong reason and
   # the result says nothing about the cap.
-  if bash -n "$target" 2>/dev/null; then
+  # `bash -n a.sh b.sh` parses ONLY a.sh — the rest become positional params and
+  # exit 0 regardless, so this must be one invocation per file (DIVE-3278).
+  local _m _bad_parse=""
+  for _m in "${target[@]}"; do
+    bash -n "$_m" 2>/dev/null || { _bad_parse="$_m"; break; }
+  done
+  if [[ -z "$_bad_parse" ]]; then
     ok_t "$label: mutated source still parses (the red is behaviour, not a syntax error)"
   else
-    bad_t "$label: mutated source still parses" "bash -n failed"
+    bad_t "$label: mutated source still parses" "bash -n failed on ${_bad_parse##*/}"
     return
   fi
   local out; out=$(DIVE_TEST_SRC="$dir/src" bash "$UNIT" 2>&1)

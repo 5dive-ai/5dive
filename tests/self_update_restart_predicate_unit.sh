@@ -58,12 +58,24 @@ fi
 # map the installer actually writes through, and the drift would be invisible.
 maps="$(sed -n '/^declare -A SKILLS_INSTALL_DIR=(/,/^)$/p; /^declare -A TYPE_PERSONA_FILE=(/,/^)$/p' \
   src/header.sh)"
+# DIVE-2609: the block no longer reads SKILLS_INSTALL_DIR itself — it asks
+# `skills_install_dirs_all`, which asks the resolver. Both functions therefore have to
+# come across with the maps, and their ABSENCE has to be fatal HERE rather than
+# silently degrading. If they were missing, the enumeration would yield nothing, the
+# fingerprint would fall back to its documented `.claude/*` set, and the derived-path
+# arms below would pass while grading exactly the blind spot this harness exists to
+# catch. That is the same vacuous-pass trap the map extraction above guards, one
+# dependency further along.
+resolver="$(sed -n '/^skills_install_dir() {/,/^}$/p; /^skills_install_dirs_all() {/,/^}$/p' \
+  src/header.sh)"
 if grep -q 'SKILLS_INSTALL_DIR=(' <<<"$maps" && grep -q 'TYPE_PERSONA_FILE=(' <<<"$maps" \
-   && grep -q '\.agents/skills' <<<"$maps" && grep -q '\.codex/AGENTS\.md' <<<"$maps"; then
-  ok_t "per-type payload maps are extractable from src/header.sh (non-.claude paths present)"
+   && grep -q '\.agents/skills' <<<"$maps" && grep -q '\.codex/AGENTS\.md' <<<"$maps" \
+   && grep -q 'skills_install_dir() {' <<<"$resolver" \
+   && grep -q 'skills_install_dirs_all() {' <<<"$resolver"; then
+  ok_t "per-type payload maps + the skills-dir resolver/enumerator are extractable from src/header.sh (non-.claude paths present)"
 else
-  bad_t "per-type payload maps missing" \
-        "SKILLS_INSTALL_DIR / TYPE_PERSONA_FILE not extractable — the derived-path arms below would grade a .claude-only fallback and pass vacuously"
+  bad_t "per-type payload maps or the skills-dir resolver missing" \
+        "SKILLS_INSTALL_DIR / TYPE_PERSONA_FILE / skills_install_dir / skills_install_dirs_all not extractable — the derived-path arms below would grade a .claude-only fallback and pass vacuously"
   echo; echo "$PASS passed, $FAIL failed"; exit 1
 fi
 
@@ -73,6 +85,7 @@ WORK="$(mktemp -d)"
 fp() {
   bash -c "set -uo pipefail
 $maps
+$resolver
 $block
 _agent_payload_fingerprint \"\$1\" \"\$2\"" _ "$1" "$2"
 }

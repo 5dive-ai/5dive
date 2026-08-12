@@ -131,7 +131,7 @@ render() {  # render <file> <function> — source in a subshell, print the usage
     "$2" 2>&1 ) || true
 }
 
-declare -A USAGES=( [src/cmd_task.sh]=_task_usage [src/cmd_pack.sh]=_pack_usage )
+declare -A USAGES=( [src/task/dispatch.sh]=_task_usage [src/cmd_pack.sh]=_pack_usage )
 for f in "${!USAGES[@]}"; do
   fn="${USAGES[$f]}"
   if ! grep -q "^${fn}()" "$f"; then
@@ -156,7 +156,7 @@ for f in "${!USAGES[@]}"; do
 done
 
 # The task help specifically must still SHOW the commands it used to run.
-out=$(render src/cmd_task.sh _task_usage)
+out=$(render src/task/dispatch.sh _task_usage)
 { grep -q "reclaim" <<<"$out" && grep -q "verify" <<<"$out"; } \
   && ok_t "task help still documents the verbs whose examples used to be executed" \
   || bad_t "task help still documents the verbs whose examples used to be executed" "$(head -3 <<<"$out")"

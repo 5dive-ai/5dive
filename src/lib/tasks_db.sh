@@ -165,7 +165,7 @@ require_sqlite() {
 # NOTE: projects/loop_runs/supervisor_events are ALSO defined inside gated
 # one-shot migration blocks in _tasks_db_migrate() below — edit both copies
 # together; tests/schema_sync_unit.sh fails CI if they diverge.
-_TASKS_SCHEMA_EPOCH='2730-1'   # DIVE-2730: +verify_optout
+_TASKS_SCHEMA_EPOCH='3251-1'   # DIVE-3251: +first_started_at
 _tasks_schema() {
   cat <<'SQL'
 PRAGMA journal_mode=WAL;
@@ -625,7 +625,31 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- is that the override is stated instead of silent, and that the two NULLs stop
   -- being one. Set only by `task add --no-verify`; cleared by
   -- `task verifier <id> <agent>`, since an explicit attach supersedes the refusal.
-  verify_optout           INTEGER
+  verify_optout           INTEGER,
+  -- DIVE-3251: THE FIRST TIME REAL WORK STARTED ON THIS ROW, and the one clock in
+  -- this table that no nudge/reclaim path may touch. `started_at` is the CURRENT
+  -- claim's clock and the heartbeat ladder deliberately clears it on reclaim, "so
+  -- its age and the per-task nudge counter both restart cleanly"
+  -- (_hb_reclaim_to_todo, src/cmd_heartbeat.sh) — a real requirement, not a typo.
+  -- The defect was that one field was carrying BOTH meanings: resetting the age
+  -- also destroyed the only board-visible evidence that the work had ever
+  -- happened, so 58 rows fleet-wide read as never-started while carrying a
+  -- `task.started` ledger event (16 of them still open at filing time).
+  --
+  -- SO: TWO FIELDS. `started_at` = the resettable claim clock the ladder owns.
+  -- `first_started_at` = the durable record of first start, written once by
+  -- COALESCE at every start path (`task start` and the dispatcher claim) and
+  -- NEVER cleared by reclaim, handoff, or reassign. Read `started_at` to ask "is
+  -- a seat on this now"; read `first_started_at` to ask "did real work happen".
+  --
+  -- IT IS A LOWER BOUND ON AGE, NOT THE LAST START, for rows backfilled from the
+  -- ledger: the ledger's idem_key is constant per task (cmd_heartbeat.sh, the
+  -- task.started emit), so a reclaimed-and-reclaimed row recorded its FIRST claim
+  -- only. Going forward the reclaim emits its own `task.reclaimed` event, so
+  -- cycles become countable from the ledger for rows reclaimed after this ships.
+  -- Declared HERE as well as in _TASKS_ADDITIVE_COLUMNS, per the rule above: a
+  -- fresh store takes this CREATE and never runs the ALTER loop.
+  first_started_at        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_precedent ON tasks(need_type, ask_shape);
 CREATE INDEX IF NOT EXISTS idx_tasks_originated ON tasks(originated_by_objective);
@@ -1294,6 +1318,13 @@ _TASKS_ADDITIVE_COLUMNS=(
   # backfill is a no-op. See the CREATE TABLE comment for why an unpersisted
   # refusal reads downstream as a default absence.
   'verify_optout INTEGER'
+  # DIVE-3251: the durable first-start clock, split out of `started_at` so the
+  # reclaim ladder can keep restarting the age without destroying the evidence
+  # that work happened. Nullable — NULL means "this build never recorded it",
+  # which is a real third state and NOT a synonym for never-started; the
+  # migration below backfills it from the ledger where a start was recorded,
+  # and from started_at otherwise. See the CREATE TABLE comment.
+  'first_started_at TEXT'
   # DIVE-2272: per-template overlap policy. Both NULLABLE on purpose -- NULL is
   # 'skip' / 'the default bound', so the migration is a no-op for every existing
   # template AND an unclassified template stays visibly unclassified. See the
@@ -1492,6 +1523,52 @@ _tasks_db_migrate() {
     fi
   done
   _tasks_db_assert_required_columns
+
+  # DIVE-3251 — BACKFILL first_started_at. Runs AFTER the column loop above, on
+  # purpose: the sweep and the fix read the same ledger by the same predicate, so
+  # splitting them would run the sweep against a schema the fix is about to
+  # change. The sweep runs LAST.
+  #
+  # THE VALUE COMES FROM THE LEDGER, NEVER FROM now(). A `task start` re-run (or
+  # any datetime('now') here) would stamp today and mis-state the age a second
+  # time, in the same direction, while LOOKING repaired. MIN(ts) over this task's
+  # `task.started` events is the earliest recorded true start; started_at is used
+  # only where no ledger row exists. A row with neither is LEFT UNREPAIRED — an
+  # unrepaired NULL you can see beats a fabricated timestamp you cannot.
+  #
+  # STATUS IS NOT TOUCHED. `first_started_at` answers "did real work happen";
+  # `status` answers "is a seat on it now". The reclaim collapsed those two into
+  # one field and THAT IS THE DEFECT — repeating it here would assert a seat is
+  # working a row it may have genuinely dropped. It is also load-bearing for
+  # safety: the ladder's age query is filtered `status='in_progress'`, so an old
+  # timestamp on a `todo` row feeds nothing. Note this is ALSO why the backfill
+  # target is first_started_at and NOT started_at: `task start` COALESCEs
+  # started_at, so a backfilled old started_at would survive the next claim and
+  # the row would arrive at rule (c) instantly ancient — the repair would trigger
+  # the bug it repairs, on the exact rows it just repaired.
+  #
+  # Gated on a cheap EXISTS so it takes no write lock on the common path, and
+  # idempotent by construction (it only ever fills a NULL).
+  local _fsa_todo
+  _fsa_todo=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM tasks t
+      WHERE t.first_started_at IS NULL
+        AND (COALESCE(t.started_at,'') <> ''
+             OR EXISTS (SELECT 1 FROM lifecycle_events e
+                         WHERE e.task_id=t.id AND e.kind='task.started'))
+      LIMIT 1;" 2>/dev/null) || _fsa_todo=""
+  if [[ "$_fsa_todo" == "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+      "UPDATE tasks SET first_started_at = COALESCE(
+           (SELECT MIN(e.ts) FROM lifecycle_events e
+             WHERE e.task_id=tasks.id AND e.kind='task.started'),
+           NULLIF(started_at,''))
+        WHERE first_started_at IS NULL
+          AND (COALESCE(started_at,'') <> ''
+               OR EXISTS (SELECT 1 FROM lifecycle_events e
+                           WHERE e.task_id=tasks.id AND e.kind='task.started'));" \
+      >/dev/null 2>&1 || true
+  fi
 
   # OSS-11 precedent-lookup index (idempotent; harmless if the columns just
   # backfilled to NULL above — an all-NULL ask_shape simply never matches).
@@ -2075,6 +2152,44 @@ resolve_task_id() {
   [[ -n "$found" ]] || fail "$E_NOT_FOUND" "no such task: $ref"
   RESOLVED_TASK_ID="$found"
   RESOLVED_TASK_IDENT=$(db "SELECT ident FROM tasks WHERE id=${found};")
+}
+
+# Resolve a task ref for a PARENT EDGE, refusing a bare number whose row carries
+# a different ident number. DIVE-3275. Lives beside resolve_task_id() because it
+# is a statement about that function's two number spaces, not about any one verb.
+#
+# resolve_task_id() branches on argument SHAPE: `^[0-9]+$` is the global row id,
+# `^[A-Za-z]+-[0-9]+$` is the ident. THE TWO SPACES HAVE DIVERGED — measured on
+# the live store 2026-08-12: DIVE-2895 is row id 3082, and row id 2895 is
+# DIVE-2708, a cancelled row from another month. So a bare number is a VALID id
+# naming the WRONG row, with no error: that is how DIVE-3273 was filed under
+# DIVE-2708, and `task add`'s own `--parent=<id>` help text is what made the bare
+# form look intended.
+#
+# Why this guard is stricter than the rest of the CLI's ref handling, rather than
+# resolve_task_id() itself being tightened: a wrong ref elsewhere shows you the
+# wrong row and you notice. A wrong PARENT is invisible (the edge renders on a
+# row nobody is looking at) and `parent_id INTEGER REFERENCES tasks(id) ON DELETE
+# CASCADE` silently arms the child's deletion with it. Tightening every caller of
+# resolve_task_id() would be a much larger behaviour change for cases that are
+# self-revealing.
+#
+# <role> names the argument in the refusal ("the parent", "the task to re-parent")
+# so a two-argument verb says WHICH one was wrong.
+_task_resolve_ref_strict() {
+  local ref="$1" role="$2"
+  resolve_task_id "$ref"
+  [[ "$ref" =~ ^[0-9]+$ ]] || return 0   # the ident form is the quiet path
+  local title; title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${RESOLVED_TASK_ID};")
+  local ident_number="${RESOLVED_TASK_IDENT##*-}"
+  if [[ "$ident_number" != "$ref" ]]; then
+    fail "$E_VALIDATION" "'$ref' as $role is the global row id, which resolves to ${RESOLVED_TASK_IDENT} (\"${title}\") — not to an ident numbered $ref. The two number spaces diverged; name the row you mean by IDENT: ${RESOLVED_TASK_IDENT} (or DIVE-${ref}, if that is what you meant)."
+  fi
+  # It agrees TODAY. That is a coincidence of this row's history, not a property
+  # of the argument form, so it still warns — and the ident form warns about
+  # nothing, which is what keeps this warning worth reading.
+  warn "$role was given as the bare number $ref, which resolved to ${RESOLVED_TASK_IDENT} (\"${title}\"). Prefer the ident form — a bare number is a global row id, not an ident."
+  return 0
 }
 
 # Resolve a known numeric row id to its display ident (DIVE-484). Used by call

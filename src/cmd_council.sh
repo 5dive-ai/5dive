@@ -3694,6 +3694,15 @@ function motionFromFlags() {
 // registry bench is only a fallback for an uninitialized/ad-hoc council with no lineage yet.
 function cmdRoster() {
   const registryPath = flag('registry')
+  // DIVE-2890: the roster's threshold line used to be the GENESIS-sealed default spec alone, which
+  // is the `ordinary` rule. The enforced bar is per decision-CLASS (see convene's `policy:
+  // constitution.thresholds`), and for `constitutional` it is 2/3 with quorum ALL. Printing the
+  // default alone under-reported the constitutional quorum — wrong in the REASSURING direction (a
+  // seat mid-ballot reads "quorum 4", sees 4 cast, concludes its vote is redundant, abstains, and
+  // under require_quorum:true that abstention is what inquorates the motion). So resolve and emit
+  // EVERY declared class against the live roster size; bash prints the table.
+  const cpFlag = flag('constitution-path')
+  const constitution = E.loadConstitution(cpFlag === true || cpFlag == null ? '' : String(cpFlag))
   const lineageSeats = readJsonFlag('seats-json', { optional: true })
   let baseSeats, thresholdSpec, seededAt
   if (lineageSeats && lineageSeats.length) {
@@ -3714,6 +3723,32 @@ function cmdRoster() {
   const seatCount = (baseSeats || []).length
   const threshold = E.resolveThreshold(seatCount, thresholdSpec)
   const quorum = E.quorumSize(seatCount, thresholdSpec)
+  // Per-class table, resolved against THIS roster's seat count. normalizeConstitution() always
+  // fills every class in THRESHOLD_POLICY (declared or defaulted), so this is never partial.
+  const classSpecs = (constitution && constitution.thresholds) || E.THRESHOLD_POLICY
+  const classes = Object.keys(classSpecs).map(cls => {
+    const spec = classSpecs[cls] || {}
+    return {
+      class: cls,
+      threshold: E.resolveThreshold(seatCount, spec),
+      quorum: E.quorumSize(seatCount, spec),
+      requireQuorum: !!spec.requireQuorum,
+      spec,
+    }
+  })
+  // `--class=<name>` used to be SILENTLY ACCEPTED AND IGNORED: it printed the default line, so the
+  // one flag that looks like it answers "what is the bar for the motion in front of me" returned
+  // the wrong answer without erroring. Now it filters, and an unknown class fails closed.
+  const clsFlag = flag('class')
+  let onlyClass = null
+  if (clsFlag != null && clsFlag !== true) {
+    onlyClass = String(clsFlag)
+    if (!classes.some(c => c.class === onlyClass)) {
+      die(`unknown decision class '${onlyClass}' — declared classes: ${classes.map(c => c.class).join(', ')}`, 2)
+    }
+  } else if (clsFlag === true) {
+    die(`--class needs a value — declared classes: ${classes.map(c => c.class).join(', ')}`, 2)
+  }
   // CNCL-17: optionally fold each seat's TRACK RECORD (calibration vs real outcomes) into the
   // roster so membership is read alongside performance. bash passes the computed record via
   // --track-json (receipts scored against task outcomes); absent → roster stays as before.
@@ -3726,6 +3761,11 @@ function cmdRoster() {
     : baseSeats
   out({ council: 'council', seats, seatCount, threshold, quorum,
     thresholdSpec, seededAt,
+    // `classes` is the ENFORCED per-class bar; `threshold`/`quorum` above stay the genesis-sealed
+    // default spec (unchanged contract for existing callers), and are the `ordinary` case.
+    classes: onlyClass ? classes.filter(c => c.class === onlyClass) : classes,
+    selectedClass: onlyClass,
+    constitution: { path: constitution.path, source: constitution.source, valid: constitution.valid },
     scoredReceipts: tr ? tr.scoredReceipts : undefined })
 }
 
@@ -4750,7 +4790,26 @@ _council_seal_stdin() {
 # council roster — the current seats + live threshold (from the persisted council bench), the
 # founder-veto principal (from genesis), and the sealed lineage head (seq + digest).
 _council_roster() {
-  local dir="$1"
+  local dir="$1"; shift || true
+  # DIVE-2890: `--class=<name>` was SILENTLY ACCEPTED AND IGNORED here (roster took no args at all,
+  # so any flag fell through to the default print). Parse it, and reject anything else rather than
+  # answering a question that was not asked — `roster --help` used to just re-print the roster.
+  local want_class=""
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --class=*) want_class="${a#--class=}" ;;
+      -h|--help)
+        cat <<'ROSTERHELP'
+ 5dive council roster [--class=<ordinary|promote|demote|expel|constitutional>] [--json]
+      The current seats, the per-decision-CLASS pass threshold + quorum resolved against
+      those seats, the founder-veto principal, and the sealed lineage head. --class narrows
+      the table to one class (fails closed on an unknown class).
+ROSTERHELP
+        return 0 ;;
+      *) fail "$E_USAGE" "unknown roster flag: $a (try: 5dive council roster --help)" ;;
+    esac
+  done
   [[ -f "$COUNCIL_GENESIS" ]] || fail "$E_VALIDATION" "the Council has no genesis roster — seed it: sudo 5dive council init --seats=<a:chair,b,c> --threshold=<spec> --veto=<p>"
   # DIVE-1664: derive the roster VIEW from the ROOT-SEALED lineage — the SAME source `promote`/
   # `demote` mutate — so `roster` can never disagree with `log`/the lineage about membership. The
@@ -4768,7 +4827,14 @@ _council_roster() {
     [[ -n "$rthreshold" && "$rthreshold" != "null" ]] && roster_args+=(--threshold-json="$rthreshold")
     [[ -n "$rstamped" ]] && roster_args+=(--seeded-at="$rstamped")
   fi
-  local raw; raw="$(node "$dir/cli.mjs" roster "${roster_args[@]}")" || return $?
+  roster_args+=(--constitution-path="$(_council_constitution_path)")
+  [[ -n "$want_class" ]] && roster_args+=(--class="$want_class")
+  # DIVE-2890: cli.mjs exits 2 with its OWN message on an unknown --class. Mark it reported so the
+  # EXIT backstop in lib/output.sh does not append its generic "exited N without reporting a reason
+  # … this is a bug in the CLI" block over a deliberate, already-explained usage refusal.
+  local raw rrc=0
+  raw="$(node "$dir/cli.mjs" roster "${roster_args[@]}")" || rrc=$?
+  if (( rrc )); then mark_reported; return "$rrc"; fi
   local vprincipal vresolved head_seq head_digest hlen
   vprincipal="$(jq -r '.veto.principal // "none"' "$COUNCIL_GENESIS" 2>/dev/null)"
   vresolved="$(jq -r '.veto.resolved // ""' "$COUNCIL_GENESIS" 2>/dev/null)"
@@ -4781,7 +4847,14 @@ _council_roster() {
   else
     echo "council:   council ($(printf '%s' "$raw" | jq -r '.seatCount') seats)"
     printf '%s' "$raw" | jq -r '.seats[] | "  seat \(.id)\(if .chair then " (chair)" else "" end)"'
-    echo "threshold: $(printf '%s' "$raw" | jq -r '.threshold') to pass, quorum $(printf '%s' "$raw" | jq -r '.quorum') (spec: $(printf '%s' "$raw" | jq -c '.thresholdSpec'))"
+    # DIVE-2890: the per-CLASS table, not the default spec alone. The old single line printed the
+    # ordinary rule unlabelled, so on a constitutional motion it under-reported quorum (4, not 6).
+    echo "thresholds (per decision class, resolved over $(printf '%s' "$raw" | jq -r '.seatCount') seat(s)):"
+    printf '%s' "$raw" | jq -r '.classes[] | "  \(.class | . + (" " * (15 - length)))\(.threshold) to pass, quorum \(.quorum)\(if .requireQuorum then " (require_quorum: EVERY seat must cast)" else "" end) (spec: \(.spec | tojson))"'
+    echo "  ^ genesis-sealed default spec: $(printf '%s' "$raw" | jq -c '.thresholdSpec') (governs the ordinary class)"
+    if _council_constitution_drifted; then
+      echo "  ! WARNING: the live constitution.yaml no longer matches the sealed digest — these rows are the LIVE file, which a convene will REFUSE to enforce (5dive council verify)." >&2
+    fi
     echo "veto:      $(_council_principal_label "$vprincipal")"
     echo "lineage:   seq $head_seq, ${hlen} record(s), head ${head_digest:0:16}…"
   fi

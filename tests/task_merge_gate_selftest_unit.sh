@@ -174,7 +174,7 @@ out=$(cmd_task_merge_gate_selftest --pr="https://example.com/x" 2>&1); rc=$?
 # for merged PRs outside that window — failing closed, on the rows it exists to rescue.
 # Comment lines are excluded because the defect is documented in one, on purpose.
 CODE_NOCOMMENT="$TMP/cmd_task.nocomment"
-grep -v '^[[:space:]]*#' "$SRC/cmd_task.sh" >"$CODE_NOCOMMENT"
+grep -vh '^[[:space:]]*#' "$SRC/cmd_task.sh" "$SRC"/task/*.sh >"$CODE_NOCOMMENT"
 
 grep -q -- 'merge-base --is-ancestor <merge-sha> origin/main' "$CODE_NOCOMMENT" \
   && ok_t "T8 the documented exit tests ANCESTRY (reachable from main whenever it landed)" \

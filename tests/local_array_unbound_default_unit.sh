@@ -230,7 +230,7 @@ grade "C: stub format matches the production filter (.status/.agent)" \
 # line-anchored grep missed on four sites (one of them cmd_loop.sh `results`,
 # whose population is conditional on n>0 — the live-shaped one).
 # ---------------------------------------------------------------------------
-bare=$(grep -rnE 'local +-a +' "$SRC"/*.sh "$SRC"/lib/*.sh | python3 -c '
+bare=$(grep -rnE 'local +-a +' "$SRC"/*.sh "$SRC"/lib/*.sh "$SRC"/task/*.sh | python3 -c '
 import sys, re
 for line in sys.stdin:
     loc, _, rest = line.partition(":"); ln, _, txt = rest.partition(":")
@@ -299,7 +299,7 @@ grade "F: compose mgrs/reports are mapfile-populated (=> NOT a live crash)" 2 "$
 unresolved=$(python3 - <<'PY'
 import re, glob
 out = []
-for f in sorted(glob.glob("src/*.sh") + glob.glob("src/lib/*.sh")):
+for f in sorted(glob.glob("src/*.sh") + glob.glob("src/lib/*.sh") + glob.glob("src/task/*.sh")):
     lines = open(f).readlines()
     fstart, cur = {}, 0
     for i, l in enumerate(lines):

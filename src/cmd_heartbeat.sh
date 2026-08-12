@@ -886,12 +886,22 @@ _hb_nudge_enforce() {
       # write-back, a false note is worse than no note. changes() is read in the
       # SAME sqlite3 connection as the UPDATE — a second `db` invocation would
       # report on its own statement, not this one.
+      # `nudge_parked_at IS NULL` is the ONCE-PER-ROW clause, and it belongs here
+      # rather than in the `[[ -z "$park_at" ]]` pre-read above. The pre-read is
+      # an optimisation: it is taken from a stamps SELECT that a concurrent tick
+      # can have run before either caller wrote, so both see empty and both
+      # proceed. A status-only guard cannot refuse the second one — reassign does
+      # not change status, so changes() is 1 for both and the row changes hands
+      # twice with two identical notes on the artifact this design calls
+      # load-bearing. With the latch column in the WHERE, changes()==0 IS the
+      # second caller's refusal and the branch below already does the right thing.
       applied=$(db "UPDATE tasks SET assignee=$(sqlq "$target"), nudge_parked_at=datetime('now'), updated_at=datetime('now')
-          WHERE id=${tid} AND status IN ('todo','in_progress');
+          WHERE id=${tid} AND status IN ('todo','in_progress')
+            AND nudge_parked_at IS NULL;
           SELECT changes();" 2>/dev/null || echo 0)
       [[ "$applied" =~ ^[0-9]+$ ]] || applied=0
       if (( applied == 0 )); then
-        _hb_log "[nudge-enforce] ${tident} rung 2 reassign REFUSED by its own guard (status is not todo/in_progress) — nothing written, nothing sent, latch left unarmed"
+        _hb_log "[nudge-enforce] ${tident} rung 2 reassign REFUSED by its own guard (row not todo/in_progress, or nudge_parked_at already set by a concurrent tick) — this caller wrote nothing and sent nothing"
         return 0
       fi
       _hb_row_note "$tid" "[${today}] nudge-enforcement (DIVE-3218): REASSIGNED ${asg:-unassigned} -> ${target} after ${nudge_n} heartbeat nudges (>= 2x the ${band} threshold of ${n}) produced no state change. Each of those nudges was a full fresh-context session that read this row and did not start it, so this is a hand-off, not a reprimand: whatever stopped ${asg:-the previous assignee} is not something another nudge to them can clear. ${target}: if you also decide NOT to start this, write WHY into this body before you exit — that sentence is the only memory the next seat has."
@@ -918,11 +928,12 @@ _hb_nudge_enforce() {
                            wake_at=datetime('now','+${wake_days} day'),
                            nudge_parked_at=datetime('now'), updated_at=datetime('now')
           WHERE id=${tid} AND status IN ('todo','in_progress')
-            AND NOT (need_type IS NOT NULL AND need_answered_at IS NULL);
+            AND NOT (need_type IS NOT NULL AND need_answered_at IS NULL)
+            AND nudge_parked_at IS NULL;
           SELECT changes();" 2>/dev/null || echo 0)
       [[ "$applied" =~ ^[0-9]+$ ]] || applied=0
       if (( applied == 0 )); then
-        _hb_log "[nudge-enforce] ${tident} rung 2 park REFUSED by its own guard (live human gate, or status not todo/in_progress) — nothing written, nothing sent, latch left unarmed"
+        _hb_log "[nudge-enforce] ${tident} rung 2 park REFUSED by its own guard (live human gate, row not todo/in_progress, or nudge_parked_at already set by a concurrent tick) — this caller wrote nothing and sent nothing"
         return 0
       fi
       _hb_row_note "$tid" "[${today}] nudge-enforcement (DIVE-3218): PARKED for ${wake_days}d after ${nudge_n} heartbeat nudges (>= 2x the ${band} threshold of ${n}) produced no state change, and no free agent was available to hand it to. NOT cancelled and NOT unwanted — parking only stops the wakes, which were costing a full fresh-context session each and buying nothing. It auto-unparks to todo on its wake date. Whoever picks it up next: if you decide not to start it, write WHY into this body before you exit."
@@ -942,13 +953,24 @@ _hb_nudge_enforce() {
     # Same act-then-narrate order as rung 2, for the same reason. The latch is
     # stamped FIRST, under the one guard that can refuse it, so a closed row
     # (nothing left to escalate) is never told in its own body that it was.
+    # `nudge_escalated_at IS NULL` is what makes "once per row" a FACT rather than
+    # a hope. The `[[ -z "$esc_at" ]]` above is a stale pre-read: cron starts tick
+    # N+1 while N is still running (src/cmd_heartbeat.sh:4 — one host cron, no
+    # flock, and a tick runs long whenever a relay seat never shows a prompt), so
+    # two callers read the same empty stamp and a status-only guard says 1 to
+    # both. Measured on a fixture, 5 runs of 5: a `low` row went low -> HIGH (two
+    # escalations, medium skipped), TWO identical dated notes in the body, two
+    # ledger events, and nudge_escalated_n — the number rung 2's threshold is
+    # keyed to — set by whichever write won. Put the latch column in the WHERE
+    # clause that sets it and changes()==0 becomes the second caller's refusal.
     local applied1
     applied1=$(db "UPDATE tasks SET nudge_escalated_at=datetime('now'), nudge_escalated_n=${nudge_n}, updated_at=datetime('now')
-                   WHERE id=${tid} AND status IN ('todo','in_progress');
+                   WHERE id=${tid} AND status IN ('todo','in_progress')
+                     AND nudge_escalated_at IS NULL;
                    SELECT changes();" 2>/dev/null || echo 0)
     [[ "$applied1" =~ ^[0-9]+$ ]] || applied1=0
     if (( applied1 == 0 )); then
-      _hb_log "[nudge-enforce] ${tident} rung 1 REFUSED by its own guard (status is not todo/in_progress) — nothing written, latch left unarmed"
+      _hb_log "[nudge-enforce] ${tident} rung 1 REFUSED by its own guard (row not todo/in_progress, or nudge_escalated_at already set by a concurrent tick) — this caller wrote nothing; the latch is whatever the winning caller left"
       return 0
     fi
     ( cmd_task_escalate "$tid" --from=heartbeat ) >/dev/null 2>&1 || true
@@ -1491,8 +1513,14 @@ _hb_ident() {
 # awake by this point, and a db hiccup must not abort the tick.
 _hb_claim_task() {
   local name="$1" id="$2" n=""
+  # DIVE-3251: first_started_at is stamped by the SAME COALESCE, because DIVE-2244
+  # moved the authoritative start to this function — a first-start record written
+  # only by `task start` would be NULL for the majority of rows, which is the
+  # blindness this column exists to remove. Seeded from started_at too, so a row
+  # already claimed when this ships keeps its real start.
   db "UPDATE tasks SET status='in_progress',
         started_at=COALESCE(started_at, datetime('now')),
+        first_started_at=COALESCE(first_started_at, started_at, datetime('now')),
         updated_at=datetime('now')
       WHERE id=${id} AND status='todo' AND kind='standard';" 2>/dev/null || return 1
   # Confirm from the ROW, not from the UPDATE's exit code — sqlite exits 0 on an
@@ -1530,10 +1558,48 @@ _hb_claim_task() {
 # Flip one in_progress task back to todo. Clears started_at so its age and the
 # per-task nudge counter both restart cleanly, and stamps updated_at. Best-effort
 # (a dead db or already-moved task is harmless). Logs why.
+#
+# DIVE-3251 — WHAT THIS CLEARS AND WHAT IT MUST NOT.
+# The started_at=NULL is DELIBERATE and stays: this function's whole job is to
+# hand the row back as a clean slate, and the age math below
+# (COALESCE(started_at, created_at)) plus the per-task nudge counter both key off
+# it. What was WRONG was that started_at was also the only board-visible evidence
+# that work had ever happened, so every reclaim silently converted "worked on for
+# 90 minutes" into "never started" — 58 rows fleet-wide, 16 of them still open,
+# and main could only defend a working seat by going and reading git.
+# `first_started_at` now carries that evidence and IS NOT IN THIS UPDATE. Do not
+# add it: the reset field and the evidence field are separate on purpose, and
+# putting them back together re-opens this defect.
+#
+# The reclaim also EMITS ITS OWN LEDGER EVENT. It could not be counted before:
+# the task.started emit above deliberately uses a constant per-task idem_key, so
+# a UNIQUE collision silently drops every re-claim and the ledger records the
+# FIRST claim only. That is the right trade there (a nudge loop must not be able
+# to write unbounded rows) but it left reclaim cycles invisible to any reader —
+# and `task start` writes no audit row either, so separating "the start never
+# wrote" from "it wrote and something cleared it" took a second store and a lot
+# of luck. This event carries a per-reclaim idem_key (kind|id|epoch) so cycles
+# ARE countable, and its detail records the started_at value being erased, which
+# is the fact the row itself is about to stop carrying.
 _hb_reclaim_to_todo() {
   local name="$1" id="$2" why="$3"
+  # Read the value BEFORE the UPDATE destroys it — the whole point is that the
+  # erased timestamp survives somewhere a reader can find it.
+  local prev_started
+  prev_started=$(db "SELECT COALESCE(started_at,'') FROM tasks WHERE id=${id};" 2>/dev/null) || prev_started=""
   db "UPDATE tasks SET status='todo', started_at=NULL, updated_at=datetime('now')
       WHERE id=${id} AND status='in_progress';" 2>/dev/null || true
+  # NANOSECONDS, not seconds. lifecycle_events has a UNIQUE index on idem_key and
+  # a collision is a SILENT no-op — exactly how task.started lost its re-claims.
+  # A second-granularity key is enough for the real cadence and NOT enough for a
+  # guarantee, and "enough in practice" is what makes a counter quietly wrong
+  # later. Caught by tests/task_first_started_at_unit.sh, whose two reclaims land
+  # in the same second.
+  local now_stamp; now_stamp=$(date -u +%s%N 2>/dev/null) || now_stamp=""
+  ledger_emit "task.reclaimed" ident="$(_hb_ident "$id")" task_id="$id" \
+    actor="$name" authority="dispatcher" \
+    idem="task.reclaimed|${id}|${now_stamp}" \
+    detail="reclaim -> todo (DIVE-3251); why=${why}; cleared started_at=${prev_started:-<empty>}" || true
   _hb_log "[$name] reclaimed $(_hb_ident "$id") -> todo ($why)"
 }
 

@@ -131,7 +131,7 @@ _task_chain_channel dev3 && got="$TASK_CH_AGENT" || got=""
 [[ "$got" == "main" && -n "$TASK_CH_ACCESS" ]] \
   && ok_t "_task_chain_channel resolves TASK_CH_* into the caller's shell" \
   || bad_t "chain resolver sets caller state" "agent='$got' access='$TASK_CH_ACCESS'"
-grep -q '\$(_task_chain_channel' src/*.sh 2>/dev/null \
+grep -q '\$(_task_chain_channel' src/*.sh src/task/*.sh 2>/dev/null \
   && bad_t "no command-substitution call sites" "a \$(_task_chain_channel ...) call site would discard the resolved channel" \
   || ok_t "no \$(_task_chain_channel ...) call sites exist"
 

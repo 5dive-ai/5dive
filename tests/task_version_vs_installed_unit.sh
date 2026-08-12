@@ -18,7 +18,7 @@ set -uo pipefail
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.."
-SRC="${1:-src/cmd_task.sh}"
+SRC="${1:-src/task/gate_evidence.sh}"
 
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }

@@ -345,14 +345,14 @@ run_done DEP-7 --result='trust me'
 # blind to a FIFTH written next year in the old style, and an unpatched accepting path
 # is this entire defect re-created — which is exactly how DIVE-2641 came to be filed
 # naming two sites when there were three. Grade the shape as well as the behaviour.
-_bad_lines=$(grep -n 'done=merged-to-main satisfied' "$SRC/cmd_task.sh" \
+_bad_lines=$(grep -hn 'done=merged-to-main satisfied' "$SRC/cmd_task.sh" "$SRC"/task/*.sh \
              | grep -v '^[0-9]*:[[:space:]]*#' \
              | grep -v '_gate_merged_not_deployed' || true)
 [[ -z "$_bad_lines" ]] \
   && ok_t 'D8: EVERY accepting arm in cmd_task.sh calls _gate_merged_not_deployed on its own line' \
   || bad_t 'an accepting arm prints the grade without the note' "$_bad_lines"
 # ...and the assertion above is not vacuous: there ARE accepting arms to find.
-_n_accepts=$(grep -c 'done=merged-to-main satisfied.*_gate_merged_not_deployed' "$SRC/cmd_task.sh")
+_n_accepts=$(cat "$SRC/cmd_task.sh" "$SRC"/task/*.sh | grep -c 'done=merged-to-main satisfied.*_gate_merged_not_deployed')
 [[ "$_n_accepts" -ge 4 ]] \
   && ok_t "D8: non-vacuity — $_n_accepts accepting arms matched, so D8 is grading a real population" \
   || bad_t 'D8 is vacuous: fewer than 4 accepting arms found' "n=$_n_accepts"

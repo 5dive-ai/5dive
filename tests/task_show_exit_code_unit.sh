@@ -208,11 +208,11 @@ if declare -F _gate_tier2_floor_term >/dev/null; then
   # in the control section below.
   # Whole-line comments are dropped first: a name in a comment cannot die under
   # set -u, and this file's own fix note names the phantom it removed.
-  phantom=$(grep -vE '^[[:space:]]*#' "$SRC/cmd_task.sh" \
+  phantom=$(grep -vhE '^[[:space:]]*#' "$SRC/cmd_task.sh" "$SRC"/task/*.sh \
             | grep -ohE '\$\{?(_dd_|_ft_|_fbt)[a-zA-Z0-9_]*' \
             | sed -E 's/^\$\{?//' | sort -u \
             | while read -r v; do
-                grep -qE "(^|[ \t;(&|])${v}=" "$SRC/cmd_task.sh" || printf '%s\n' "$v"
+                grep -qE "(^|[ \t;(&|])${v}=" "$SRC/cmd_task.sh" "$SRC"/task/*.sh || printf '%s\n' "$v"
               done)
   [[ -z "$phantom" ]] && ok_t "no read-once phantom identifier on the gate-term paths" \
     || bad_t "an identifier is READ but never assigned (dies 'unbound variable' under set -u)" "$phantom"

@@ -91,15 +91,15 @@ done
 # SOURCE TRIPWIRE. Extracting the check moved it out of the loop's body; this is
 # the assertion that the loop did not quietly stop calling it (the standard
 # failure of an extracted guard).
-if grep -q '_task_answer_forbidden_flag "\$a"' "$SRC/cmd_task.sh"; then
+if grep -q '_task_answer_forbidden_flag "\$a"' "$SRC/cmd_task.sh" "$SRC"/task/*.sh; then
   ok "arm2: the executor's arg loop still calls the predicate"
 else
   bad "arm2: the executor's arg loop still calls the predicate" \
       "cmd_task_answer_delegated no longer calls _task_answer_forbidden_flag"
 fi
 # The structural backstop must sit where every raise-site has already run.
-b=$(grep -n 'TASK_ANSWER_DELEGATED:-}" ]] || human=0' "$SRC/cmd_task.sh" | head -1 | cut -d: -f1)
-e=$(grep -n 'local _human_evid=' "$SRC/cmd_task.sh" | head -1 | cut -d: -f1)
+b=$(grep -n 'TASK_ANSWER_DELEGATED:-}" ]] || human=0' "$SRC/task/answer.sh" | head -1 | cut -d: -f1)
+e=$(grep -n 'local _human_evid=' "$SRC/task/answer.sh" | head -1 | cut -d: -f1)
 if [[ -n "$b" && -n "$e" && "$b" -lt "$e" ]]; then
   ok "arm2: human=0 backstop precedes the provenance decision"
 else
