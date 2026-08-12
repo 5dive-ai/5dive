@@ -201,7 +201,7 @@ _pins_seams() {
 _file_facts() {   # DIVE-3302: ONE awk for the three per-file predicates that were
   # three separate awk spawns. Each rule is a verbatim copy of the standalone it
   # replaces. `claims_id` is deliberately NOT folded in here — see the note at the
-  # call site. Equivalence differential-graded by A9 across the corpus.
+  # call site. Equivalence differential-graded by A9 below, over the whole corpus.
   awk '
     /^[[:space:]]*#/ { next }
     /^[[:space:]]*_gate_(caller_uid|passwd_stream)\(\)/ { pins=1 }
@@ -225,14 +225,6 @@ _file_facts() {   # DIVE-3302: ONE awk for the three per-file predicates that we
   ' "$1"
 }
 
-_claims_id() {   # DIVE-3302: single-spawn replacement for the id()-stub grep trio
-  awk '
-    /^[[:space:]]*id\(\)/ { seen=1; if ($0 ~ /-un/) { f=1; exit } ; if ($0 ~ /\{/) inblk=1; next }
-    inblk { if ($0 ~ /-un/) { f=1; exit } ; if ($0 ~ /\}/) inblk=0 }
-    END { exit !(seen && f) }
-  ' "$1"
-}
-
 _scan_identity_stubs() {
   local dir="$1" f base claims_id pins srcs asrt
   for f in "$dir"/*.sh; do
@@ -247,7 +239,7 @@ _scan_identity_stubs() {
     # DIVE-3302: ONE awk yields all four predicates. Was 4-6 spawns per file, and
     # this runs once per file per mutant (53 A7 mutants + 8 A8), which is where the
     # core tier's overage lived. Equivalence to the four originals is differential-
-    # graded by A9 across the whole corpus, not asserted here.
+    # graded by A9 below, over the whole corpus, not asserted here.
     # claims_id keeps the ORIGINAL grep trio verbatim. My folded awk detected one
     # file the trio misses (its `[^}]*` is blocked by the `}` inside `${1:-}`), which
     # would have RAISED population A 8->9 — a semantic fix smuggled inside a cost fix.
@@ -526,6 +518,44 @@ rm -f "$TMP"/*.sh
   && ok_t "A8 rule (2) reds on every real \`id -un\` harness whose resolver call is removed ($a8_n mutants, $a8_prose still name it in surviving prose)" \
   || bad_t "A8 rule (2) is violable on the real corpus" \
      "$(printf '%s of %s mutant(s) went UNDETECTED:\n' "${#a8_missed[@]}" "$a8_n"; printf '     %s\n' "${a8_missed[@]:-<none — but only $a8_n file(s) were mutable>}")"
+
+# ── A9 — THE ARM THE HEADER CLAIMED AND THE FILE DID NOT HAVE ──────────────────
+# DIVE-3302 iteration 2, found by quinn on review. The fold added `_file_facts` as a
+# SECOND implementation of three predicates that still exist as standalones, and the
+# header asserted twice that the two were "differential-graded by A9 across the
+# corpus". THERE WAS NO A9. A citation of an arm that does not exist is worse than no
+# citation: it answers the reviewer's question in the reassuring direction and closes
+# the check that silence would have invited.
+#
+# It also has to exist for a second reason, which is quinn's actual finding. The scan
+# and the count census now read `_file_facts` (239, 277) while the A6 census LISTING
+# (below) and the A7/A8 mutant SELECTION still call the standalones. Two
+# implementations, identical today, with nothing enforcing it. If they ever diverge
+# the scan grades a different population than the mutants target — arm count
+# unchanged, every arm green. That is this file's own documented blind spot, which
+# `_pins_seams`' header claims cannot happen ("the guard's own census listing uses
+# this same function so the two cannot drift"); after the fold that sentence was
+# false until this arm made it true again.
+#
+# Runs over the WHOLE corpus, not a sample: a differential that skips files cannot
+# say the two agree, only that it did not look. This is cheap (one extra pass, no
+# mutants) and the harness is nightly now.
+a9_diff=(); a9_n=0
+for f in tests/*.sh; do
+  base="${f##*/}"
+  [[ "$base" == "$SELF" || -n "${ALLOW[$base]:-}" ]] && continue
+  _pins_seams      "$f" && _p=1 || _p=0
+  _sources_actor   "$f" && _s=1 || _s=0
+  _asserts_resolver "$f" && _a=1 || _a=0
+  read -r _fp _fs _fa <<<"$(_file_facts "$f")"
+  a9_n=$((a9_n+1))
+  [[ "$_p $_s $_a" == "$_fp $_fs $_fa" ]] \
+    || a9_diff+=("$base: standalones=($_p $_s $_a) _file_facts=($_fp $_fs $_fa)")
+done
+(( a9_n >= 300 && ${#a9_diff[@]} == 0 )) \
+  && ok_t "A9 _file_facts agrees with all three standalone predicates on every file in the corpus ($a9_n files, 3 predicates each)" \
+  || bad_t "A9 the folded predicate and the standalones DISAGREE (or the corpus went missing)" \
+     "$(printf 'compared %s file(s), %s disagreement(s):\n' "$a9_n" "${#a9_diff[@]}"; printf '     %s\n' "${a9_diff[@]:-<none — but only $a9_n file(s) were compared, expected >=300>}")"
 
 printf '\n%s: %d passed, %d failed\n' "$SELF" "$PASS" "$FAIL"
 (( FAIL == 0 ))
