@@ -20,6 +20,20 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+
+# DIVE-2770: the merge gate gained a CREDENTIAL-FREE rail (an unauthenticated read
+# of a public repo). Every no-token arm below was written when "no credential"
+# meant "no rail", and with the anon rail live they would reach the real network
+# and grade a LIVE PR instead of the fixture. Turn it off here: these harnesses
+# grade the pre-2770 rails, and tests/task_merge_gate_anon_rail_unit.sh grades the
+# new one. This is also what keeps `no root, no network` true of this file.
+#
+# IT MUST SIT AFTER lib/grading_tree.sh, AND THAT IS NOT A STYLE CHOICE: that file
+# sources lib/env_isolation.sh, which CLEARS inherited FIVE_* knobs so a harness
+# never grades the caller's environment. Set above it, this export is wiped and the
+# harness silently reaches the network instead — measured, and it read as three
+# unrelated assertion failures naming a live PR's real state.
+export FIVE_GATE_NO_ANON=1
 trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
@@ -183,20 +197,25 @@ out=$(cmd_task_deliver DIVE-201 --pr="$PR" 2>&1); rc=$?
 #     (non-zero, E_CONFLICT), and the task stays open. --------------------------
 # DIVE-201 now sits with assignee==verifier (dev), so done reaches the merge-gate.
 export GH_STUB_STATE="OPEN" GH_STUB_MERGED=""
-out=$(cmd_task_done DIVE-201 2>&1); rc=$?
+out=$(cmd_task_done DIVE-201 --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1); rc=$?
 [[ $rc -eq $E_CONFLICT ]] \
   && ok_t "Tb done on an unmerged delivery PR is REFUSED (E_CONFLICT)" \
   || bad_t "Tb refused rc" "rc=$rc (want $E_CONFLICT) out=$out"
 [[ "$(statusof DIVE-201)" != "done" ]] \
   && ok_t "Tb the task did NOT close" \
   || bad_t "Tb not closed" "status=$(statusof DIVE-201)"
-[[ "$out" == *"DIVE-1830"* ]] \
-  && ok_t "Tb refusal cites the merge-gate (DIVE-1830)" \
+[[ "$out" == *"not merged to main"* ]] \
+  && ok_t "Tb refusal names the merge gate's criterion" \
   || bad_t "Tb message" "out=$out"
 
 # --- Tc: same task, but gh now reports MERGED + a mergedAt → closes for real. ---
+# `--no-graded-sha` for the DIVE-2940 isolation reason noted at the Tg block: this
+# case grades the DIVE-1830 merge gate's ACCEPT arm and nothing else. Tb directly
+# above is the evidence the two are ordered and not merely coexisting — it still
+# refuses on the UNMERGED PR with the flag absent, so DIVE-1830 is reached first
+# and DIVE-2940 only ever speaks about rows that already cleared it.
 GH_STUB_STATE="MERGED" GH_STUB_MERGED="2026-07-23T10:00:00Z" \
-  out=$(cmd_task_done DIVE-201 2>&1); rc=$?
+  out=$(cmd_task_done DIVE-201 --no-graded-sha --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1); rc=$?
 [[ $rc -eq 0 && "$(statusof DIVE-201)" == "done" ]] \
   && ok_t "Tc done on a MERGED delivery PR closes the task" \
   || bad_t "Tc close" "rc=$rc status=$(statusof DIVE-201) out=$out"
@@ -211,18 +230,18 @@ cmd_task_set_branch DIVE-210 feat/dive-210-thing >/dev/null 2>&1
   || bad_t "Tc2 precond set-branch wrote the Branch: line" "body=$(db "SELECT body FROM tasks WHERE ident='DIVE-210';")"
 [[ -z "$(drefof DIVE-210)" ]] || bad_t "Tc2 precond no delivery_ref" "dref=$(drefof DIVE-210)"
 export GH_STUB_STATE="" GH_STUB_MERGED=""
-out=$(cmd_task_done DIVE-210 2>&1); rc=$?
+out=$(cmd_task_done DIVE-210 --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1); rc=$?
 [[ $rc -eq $E_CONFLICT && "$(statusof DIVE-210)" != "done" ]] \
   && ok_t "Tc2 done refused when the Branch: head has no merged PR (E_CONFLICT)" \
   || bad_t "Tc2 refused" "rc=$rc (want $E_CONFLICT) status=$(statusof DIVE-210) out=$out"
-[[ "$out" == *"DIVE-1830"* && "$out" == *"feat/dive-210-thing"* ]] \
-  && ok_t "Tc2 refusal cites DIVE-1830 + the branch name" \
+[[ "$out" == *"landed"* && "$out" == *"feat/dive-210-thing"* ]] \
+  && ok_t "Tc2 refusal names the criterion + the branch name" \
   || bad_t "Tc2 message" "out=$out"
 
 # --- Tc3: same Branch:-bound task, but gh now reports a merged PR for the head
 #     → closes. ----------------------------------------------------------------
 export GH_STUB_STATE="MERGED" GH_STUB_MERGED="2026-07-23T11:00:00Z"
-out=$(cmd_task_done DIVE-210 2>&1); rc=$?
+out=$(cmd_task_done DIVE-210 --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1); rc=$?
 [[ $rc -eq 0 && "$(statusof DIVE-210)" == "done" ]] \
   && ok_t "Tc3 done closes once the Branch: head has a merged PR" \
   || bad_t "Tc3 close" "rc=$rc status=$(statusof DIVE-210) out=$out"
@@ -232,7 +251,7 @@ out=$(cmd_task_done DIVE-210 2>&1); rc=$?
 # No verifier so done is a real close (verifier==assignee==main path: verifier '').
 seed_task DIVE-202 main ''
 GH_STUB_STATE="OPEN" GH_STUB_MERGED="" \
-  out=$(cmd_task_done DIVE-202 2>&1); rc=$?
+  out=$(cmd_task_done DIVE-202 --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1); rc=$?
 [[ $rc -eq 0 && "$(statusof DIVE-202)" == "done" ]] \
   && ok_t "Td plain task (no delivery_ref) closes unchanged" \
   || bad_t "Td regression" "rc=$rc status=$(statusof DIVE-202) out=$out"
@@ -331,22 +350,70 @@ out=$(cmd_task_done DIVE-263 --result="PASS. graded-sha: ${HEAD_SHA:0:9}" 2>&1);
   && ok_t "Te5 an abbreviated graded-sha matches by prefix" \
   || bad_t "Te5 close" "rc=$rc status=$(statusof DIVE-263) out=$out"
 
-# --- Te6: THE FENCE. A bare 40-hex sha in prose is NOT a graded-sha claim. A
-#     result routinely names shas it did not grade (a base, a cited squash, a
-#     sha inside a quoted error). Scraping those would manufacture refusals on
-#     honest closes, so only the LABELLED form may drive the comparison. -------
+# --- Te6: THE FENCE, re-graded for DIVE-2940. A bare 40-hex sha in prose is NOT
+#     a graded-sha claim. A result routinely names shas it did not grade (a base,
+#     a cited squash, a sha inside a quoted error). Scraping those would drive the
+#     COMPARISON off a sha nobody graded, so only the LABELLED form may feed it.
+#
+#     WHAT CHANGED AND WHY THIS IS A SHARPER ASSERTION THAN THE OLD ONE: before
+#     DIVE-2940 this row CLOSED, so the fence was graded by rc=0 — which is the
+#     same rc a broken extractor that scraped $OTHER_SHA and got lucky would
+#     produce. Now an unlabelled sha refuses, and the fence is graded by WHICH
+#     refusal fires. `done-without-graded-sha` means the extractor correctly saw
+#     NO claim; `done-graded-sha-not-the-merged-sha` would mean it scraped the
+#     prose sha and compared it. Two distinct outcomes where there was one. -----
 deliver_merged DIVE-264
 export GH_STUB_HEAD_SHA="$HEAD_SHA" GH_STUB_MERGE_SHA="$MERGE_SHA"
 out=$(cmd_task_done DIVE-264 --result="PASS. Rebased onto $OTHER_SHA before review." 2>&1); rc=$?
-[[ $rc -eq 0 && "$(statusof DIVE-264)" == "done" ]] \
-  && ok_t "Te6 an UNLABELLED sha in prose is not a claim → no refusal" \
+[[ "$out" != *"$OTHER_SHA"* && "$out" != *"not the merged sha"* && "$out" != *"merged head"* ]] \
+  && ok_t "Te6 an UNLABELLED sha in prose is not a claim (it never reached the comparison)" \
   || bad_t "Te6 fence" "rc=$rc status=$(statusof DIVE-264) out=$out"
 
-# --- Te7: PART 2's nudge. A loop row closed with NO stated sha still closes —
-#     the enabling half costs nothing — but says the comparison did not run. ----
-[[ "$out" == *"no \`graded-sha: <sha>\` in the result"* && "$out" == *"DIVE-2656"* ]] \
-  && ok_t "Te7 a loop close with no stated sha is NUDGED (comparison did not run)" \
-  || bad_t "Te7 nudge" "out=$out"
+# --- Te7: DIVE-2940. PART 2 was a NUDGE and is now a PRE-CLOSE REFUSAL. The warn
+#     it replaces printed AFTER the result row was written, so its only printed
+#     remedy ("state the sha you graded") was advice for the next row, not an
+#     action available on this one — missed three times by one seat (DIVE-2862,
+#     DIVE-2891, DIVE-2867) for exactly that reason. The load-bearing assertion
+#     is not the exit code, it is that NOTHING WAS WRITTEN: a refusal that still
+#     closed the row would reproduce the original defect while looking fixed. ---
+[[ $rc -ne 0 && "$(statusof DIVE-264)" != "done" ]] \
+  && ok_t "Te7 a loop close with no stated sha is REFUSED and the row stays OPEN" \
+  || bad_t "Te7 refusal" "rc=$rc status=$(statusof DIVE-264) out=$out"
+[[ "$out" == *"DIVE-2940"* && "$out" == *"--no-graded-sha"* ]] \
+  && ok_t "Te7 the refusal names its ticket and its declared escape" \
+  || bad_t "Te7 refusal text" "out=$out"
+# The remedy must be reachable FROM THE STATE THE GATE FIRES IN — the whole point
+# of moving it before the write. A refusal that told the closer to --append-result
+# would be the old post-hoc errand wearing a refusal's clothes.
+[[ "$out" == *"NOTHING IS WRITTEN YET"* && "$out" != *"append-result"* ]] \
+  && ok_t "Te7 the printed remedy is 're-run', reachable from the pre-close state" \
+  || bad_t "Te7 remedy reachability" "out=$out"
+
+# --- Te7b: THE ESCAPE. A row genuinely graded on something other than a sha (a
+#     docs row, a decision) must still be closable, and the escape is DECLARED
+#     and audited rather than silent. Without this arm the refusal is a wall. ---
+out=$(cmd_task_done DIVE-264 --no-graded-sha --result="PASS. Docs-only; nothing sha-shaped to grade." 2>&1); rc=$?
+[[ $rc -eq 0 && "$(statusof DIVE-264)" == "done" ]] \
+  && ok_t "Te7b --no-graded-sha closes the row the refusal blocked" \
+  || bad_t "Te7b escape" "rc=$rc status=$(statusof DIVE-264) out=$out"
+[[ "$out" == *"comparison did NOT run"* ]] \
+  && ok_t "Te7b the escape still SAYS the comparison did not run (audited, not silent)" \
+  || bad_t "Te7b escape warn" "out=$out"
+
+# --- Te7c: SCOPE — the negative control, and the arm that keeps this from being
+#     a blanket "every close needs a sha". DIVE-2940 fires only on the maker->
+#     verifier + merged-PR intersection. A row with NO verifier has no verdict to
+#     bind a sha to, so it must close untouched. Without this arm, a refusal that
+#     had accidentally been hoisted above the loop predicate would pass every
+#     assertion above and block every close in the fleet. -----------------------
+seed_task DIVE-266 main ''
+cmd_task_deliver DIVE-266 --pr="$PR" >/dev/null 2>&1
+export GH_STUB_STATE="MERGED" GH_STUB_MERGED="2026-08-04T10:00:00Z"
+export GH_STUB_HEAD_SHA="$HEAD_SHA" GH_STUB_MERGE_SHA="$MERGE_SHA"
+out=$(cmd_task_done DIVE-266 --result="PASS. No verifier on this row." 2>&1); rc=$?
+[[ $rc -eq 0 && "$(statusof DIVE-266)" == "done" ]] \
+  && ok_t "Te7c a row with NO verifier closes without a sha (refusal is scoped)" \
+  || bad_t "Te7c scope" "rc=$rc status=$(statusof DIVE-266) out=$out"
 
 # --- Te8: the probe could not be reached → NOT CHECKED, not a mismatch. A query
 #     that never ran must never render as a negative verdict (DIVE-2318's rule,
@@ -379,6 +446,14 @@ out=$(cmd_task_done DIVE-265 --result="PASS. graded-sha: $OTHER_SHA" 2>&1); rc=$
 # --- Tg: DIVE-2682 — a binding that PREDATES the current loop iteration is stale,
 #     and a close on it is refused. Graded by mutation, both arms, because a fix
 #     that only ever refuses passes the refusing arm trivially. ------------------
+# DIVE-2940 NOTE, and it is isolation rather than a concession: every close below
+# is graded on the ITERATION binding, and none of them is graded on the graded-sha
+# gate (Te6/Te7 above own that). Since DIVE-2940 a loop close with no stated sha
+# refuses, so without `--no-graded-sha` these cases would all go red for a reason
+# that has nothing to do with what they assert — and, worse, Tga/Tgc would go GREEN
+# on the WRONG refusal, since a test that only checks rc!=0 cannot tell which gate
+# spoke. The flag keeps one gate per case. Tga still refuses on the stale binding
+# with the flag set, which is the proof the iteration check runs FIRST.
 iterof()  { db "SELECT COALESCE(iteration,0) FROM tasks WHERE ident='$1';"; }
 binditerof() { db "SELECT COALESCE(CAST(delivery_ref_iteration AS TEXT),'NULL') FROM tasks WHERE ident='$1';"; }
 PR2="https://github.com/5dive-ai/5dive/pull/1000"
@@ -401,7 +476,7 @@ db "UPDATE tasks SET assignee='main', status='in_progress', handoff_rejected_at=
   && ok_t "Tga re-delivery bumps the counter and leaves the binding at its old iteration" \
   || bad_t "Tga stale gap created" "iter=$(iterof DIVE-270) bind=$(binditerof DIVE-270)"
 export GH_STUB_STATE="MERGED" GH_STUB_MERGED="2026-08-04T00:00:00Z"
-out=$( actor_seam_as dev; cmd_task_done DIVE-270 2>&1 ); rc=$?
+out=$( actor_seam_as dev; cmd_task_done DIVE-270 --no-graded-sha --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1 ); rc=$?
 [[ $rc -eq $E_CONFLICT ]] \
   && ok_t "Tga close on a STALE binding is REFUSED even though the PR is MERGED" \
   || bad_t "Tga refused rc" "rc=$rc (want $E_CONFLICT) out=$out"
@@ -424,7 +499,7 @@ db "UPDATE tasks SET assignee='main', status='in_progress', handoff_rejected_at=
 [[ "$(iterof DIVE-271)" == "2" && "$(binditerof DIVE-271)" == "2" ]] \
   && ok_t "Tgb re-pointing the binding stamps it at the NEW iteration (no false refuse)" \
   || bad_t "Tgb re-point stamp" "iter=$(iterof DIVE-271) bind=$(binditerof DIVE-271)"
-out=$( actor_seam_as dev; cmd_task_done DIVE-271 2>&1 ); rc=$?
+out=$( actor_seam_as dev; cmd_task_done DIVE-271 --no-graded-sha --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1 ); rc=$?
 [[ $rc -eq 0 && "$(statusof DIVE-271)" == "done" ]] \
   && ok_t "Tgb close on a RE-POINTED binding is ACCEPTED and the task closes" \
   || bad_t "Tgb accepted" "rc=$rc status=$(statusof DIVE-271) out=$out"
@@ -446,7 +521,7 @@ out=$( actor_seam_as dev; cmd_task_done DIVE-271 2>&1 ); rc=$?
 [[ "$(iterof DIVE-270)" == "2" && "$(binditerof DIVE-270)" == "2" ]] \
   && ok_t "Tgd the printed remedy stamps the binding at the CURRENT iteration, no bump" \
   || bad_t "Tgd remedy did not move the stamp" "iter=$(iterof DIVE-270) bind=$(binditerof DIVE-270)"
-out=$( actor_seam_as dev; cmd_task_done DIVE-270 2>&1 ); rc=$?
+out=$( actor_seam_as dev; cmd_task_done DIVE-270 --no-graded-sha --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1 ); rc=$?
 [[ $rc -eq 0 && "$(statusof DIVE-270)" == "done" ]] \
   && ok_t "Tgd following the refusal's OWN remedy makes the close succeed" \
   || bad_t "Tgd remedy is inert — false refuse on a correctly-bound row" "rc=$rc status=$(statusof DIVE-270) out=$out"
@@ -468,7 +543,7 @@ db "UPDATE tasks SET assignee='main', status='in_progress' WHERE ident='DIVE-273
 [[ "$(iterof DIVE-273)" == "$(binditerof DIVE-273)" ]] \
   && ok_t "Tge same-pass re-delivery keeps stamp == counter (no silent bind>iter)" \
   || bad_t "Tge stamp outran the counter" "iter=$(iterof DIVE-273) bind=$(binditerof DIVE-273)"
-out=$( actor_seam_as dev; cmd_task_done DIVE-273 2>&1 ); rc=$?
+out=$( actor_seam_as dev; cmd_task_done DIVE-273 --no-graded-sha --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1 ); rc=$?
 [[ $rc -eq 0 && "$(statusof DIVE-273)" == "done" ]] \
   && ok_t "Tge and the close is ACCEPTED (bind>iter would have been unflaggable, not refused)" \
   || bad_t "Tge same-pass close" "rc=$rc status=$(statusof DIVE-273) out=$out"
@@ -479,7 +554,7 @@ out=$( actor_seam_as dev; cmd_task_done DIVE-273 2>&1 ); rc=$?
 seed_task DIVE-272 main dev
 cmd_task_deliver DIVE-272 --pr="$PR" >/dev/null 2>&1
 db "UPDATE tasks SET delivery_ref_iteration=NULL, iteration=7 WHERE ident='DIVE-272';"
-out=$( actor_seam_as dev; cmd_task_done DIVE-272 2>&1 ); rc=$?
+out=$( actor_seam_as dev; cmd_task_done DIVE-272 --no-graded-sha --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1 ); rc=$?
 [[ $rc -eq 0 && "$(statusof DIVE-272)" == "done" ]] \
   && ok_t "Tgc a NULL binding-iteration (legacy row) is NOT treated as stale" \
   || bad_t "Tgc legacy row false-refused" "rc=$rc status=$(statusof DIVE-272) out=$out"

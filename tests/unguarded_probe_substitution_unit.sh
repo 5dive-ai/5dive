@@ -233,7 +233,14 @@ fi
 # file:line:VAR — the sites DIVE-2604 guarded. A fix that is reverted, moved, or
 # re-merged into a `local` must make this arm red, or the guard is decorative.
 SITES=(
-  "src/cmd_objective.sh:n"      "src/cmd_task.sh:n"          "src/cmd_selfcheck.sh:nwired"
+  # DIVE-3278: was "src/cmd_task.sh:n". The four `n` guard sites split across TWO
+  # files; this arm follows the two in src/task/gate_evidence.sh, which are the ones
+  # the scanner actually flags. MEASURED, so nobody reads the other file as
+  # forgotten: stripping the two `n` guards in src/task/notify.sh produces NO scanner
+  # finding (rc=0, empty output) — they were never detectable, on main either, where
+  # this entry passed on the gate_evidence sites alone. Coverage is preserved exactly,
+  # not widened.
+  "src/cmd_objective.sh:n"      "src/task/gate_evidence.sh:n"  "src/cmd_selfcheck.sh:nwired"
   "src/cmd_supervisor.sh:task"  "src/cmd_pack.sh:found"      "src/cmd_account.sh:base_url"
   "src/cmd_agent_telegram.sh:token" "src/cmd_cos.sh:atok"    "src/cmd_selfupdate.sh:start_line"
   "src/cmd_doctor.sh:last_event" "src/cmd_loop_pack.sh:ident" "src/cmd_agent_config.sh:token_for_install"
@@ -241,18 +248,20 @@ SITES=(
 cp -a "$ROOT/src" "$TMP/mut-src"
 for site in "${SITES[@]}"; do
   f="${site%:*}"; v="${site##*:}"; base="$(basename "$f")"
+  # DIVE-3278: `task` moved to src/task/*.sh, so a site is no longer always
+  # directly under src/. Address it by its RELATIVE PATH, not its basename.
   mdir="$TMP/m/$base.$v"; mkdir -p "$mdir"; cp -a "$TMP/mut-src" "$mdir/src"
   # Remove ONLY this variable's guard suffix, and confirm the removal landed —
   # an inert mutation and a working scanner leave identical evidence.
-  before=$(grep -c " || ${v}=" "$mdir/src/$base") || before=0
-  sed -i -E "s/\) \|\| ${v}=(\"\"|''|0)$/)/" "$mdir/src/$base"
-  after=$(grep -c " || ${v}=" "$mdir/src/$base") || after=0
+  before=$(grep -c " || ${v}=" "$mdir/$f") || before=0
+  sed -i -E "s/\) \|\| ${v}=(\"\"|''|0)$/)/" "$mdir/$f"
+  after=$(grep -c " || ${v}=" "$mdir/$f") || after=0
   if (( after >= before )); then
     bad_t "F/$base:$v: mutation landed" "guard count did not drop ($before -> $after) — the fix moved or its shape changed"
     continue
   fi
   mout=$(cd "$mdir" && bash "$SCAN" --root=src 2>&1); mrc=$?
-  if (( mrc == 1 )) && [[ "$mout" == *"src/$base"* && "$mout" == *"$v=\$("* ]]; then
+  if (( mrc == 1 )) && [[ "$mout" == *"$f"* && "$mout" == *"$v=\$("* ]]; then
     ok_t "F/$base: stripping \`|| $v=…\` makes the scanner name it (differential)"
   else
     bad_t "F/$base: scanner must flag $v after its guard is stripped" "rc=$mrc out=[${mout//$'\n'/ }]"
@@ -264,7 +273,7 @@ done
 # installation lookup are the incidents this class is named after. They are in
 # the same tree the scanner just cleared, so E covers them — but only by name
 # here, so a future reader can see they were not forgotten.
-for pair in "src/cmd_task.sh:_gate_branch_refs_from_text" "src/cmd_push.sh:installation"; do
+for pair in "src/task/gate_evidence.sh:_gate_branch_refs_from_text" "src/cmd_push.sh:installation"; do
   f="${pair%:*}"; needle="${pair##*:}"
   if grep -q "$needle" "$ROOT/$f"; then
     ok_t "G: $(basename "$f") still carries the $needle site (E cleared it)"

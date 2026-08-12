@@ -217,8 +217,14 @@ jobs:
           # cut would mint a NEW version every night on an unchanged main, burning a
           # number per night and republishing identical bytes under each. So the arm
           # that matters is the one asserting it DOES stop.
+          # DIVE-3170: NOT "${incumbent}^". A cut makes TWO commits (DIVE-2603 split
+          # assign from bundle), so the tag's first parent is the ASSIGN commit — a
+          # release tree, never main. scripts/release-cut-baseline.sh holds the one
+          # copy of the rule (walk first-parent to the first ancestor of main) and
+          # every site below uses THIS variable rather than respelling it.
+          cut_from=""
           if [[ -n "$incumbent" ]]; then
-            cut_from=$(git rev-parse -q --verify "refs/tags/${incumbent}^{commit}^" 2>/dev/null || true)
+            cut_from=$(bash scripts/release-cut-baseline.sh "refs/tags/${incumbent}" 2>/dev/null || true)
             if [[ -n "$cut_from" && "$cut_from" == "$sha" ]]; then
               echo "::notice::${incumbent} was cut from main's current tip ${sha:0:12} — main has not moved since the last cut. Nothing to publish."
               exit 0
@@ -240,6 +246,25 @@ jobs:
           _ci_fetch_runs() {
             gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${sha}/check-runs" \
               --jq '.check_runs[] | [.name, .status, (.conclusion // "pending"), (.details_url // "")] | @tsv' 2>/dev/null
+          }
+          # DIVE-3314: echo main's CURRENT tip iff it is a STRICT DESCENDANT of $1.
+          # Outside the fence for the same reason _ci_fetch_runs is: the block below is
+          # extracted and executed by tests/release_cut_guards_unit.sh, which supplies its
+          # own stub, so no arm of that harness can reach git or the network here. If the
+          # function is absent the caller sees an empty answer and REFUSES — the safe
+          # direction, and the one every pre-existing arm of that harness already asserts.
+          #
+          # THE ANCESTRY TEST IS THE WHOLE SAFETY ARGUMENT, so it is not optional and it is
+          # not `!=`. Re-pointing at an unrelated tip (a force-push, a rewritten main) would
+          # let this job publish a tree whose relationship to the graded one is unknown.
+          # `--is-ancestor` says the new tip CONTAINS every commit we were about to cut.
+          _retarget_tip() {
+            local _t
+            git fetch -q origin main 2>/dev/null || return 0
+            _t=$(git rev-parse FETCH_HEAD 2>/dev/null) || return 0
+            [[ -n "$_t" && "$_t" != "$1" ]] || return 0
+            git merge-base --is-ancestor "$1" "$_t" 2>/dev/null || return 0
+            printf '%s\n' "$_t"
           }
           runs=$(_ci_fetch_runs)
           # >>> DIVE-2144 release-cut guard block (extracted verbatim by tests/release_cut_guards_unit.sh)
@@ -284,6 +309,22 @@ jobs:
           [[ "$_poll_int" =~ ^[1-9][0-9]*$ ]] || _poll_int=60
           _poll_started=$SECONDS
           _look=0
+          # DIVE-3314: at most this many re-targets, and they DO NOT extend the poll
+          # budget. A retarget is only ever the answer to "the sha we hold was abandoned
+          # by a newer merge"; against a main merging faster than a sweep completes, an
+          # unbounded chase parks this job on a runner until the job timeout and still
+          # publishes nothing. Two is enough to absorb the observed collision (one merge
+          # inside one cut window) and small enough that a pathological main refuses.
+          _RETARGET_MAX=2
+          _retargets=0
+          # DIVE-3314: LEARNED ONCE, KEPT. This was re-cleared on every look, so the
+          # sibling filter silently disengaged on any look where our own row was not in
+          # the board — and after a retarget that is EVERY look, because our check-run
+          # lives on the sha this run was triggered on and never appears on the new one.
+          # Our job's NAME is a property of this workflow, not of the sha, so carrying it
+          # forward is what DIVE-2466's own text already describes ("we defer EVERY red
+          # until our own row has been seen ONCE").
+          _self_name=""
           while :; do
             _look=$(( _look + 1 ))
             # DIVE-2466 iter2 (olivia's reject): dropping only THIS RUN's check-runs
@@ -325,9 +366,9 @@ jobs:
             # If our own row is absent we drop nothing extra and behave exactly as
             # before this change (run-id filter only). In real execution the check-run
             # exists before the step runs, so the fallback bought nothing.
-            _self_name=""
             if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
-              _self_name=$(awk -F'\t' -v self="/actions/runs/${GITHUB_RUN_ID}/" 'index($4, self) { print $1; exit }' <<<"$runs")
+              _found=$(awk -F'\t' -v self="/actions/runs/${GITHUB_RUN_ID}/" 'index($4, self) { print $1; exit }' <<<"$runs")
+              [[ -n "$_found" ]] && _self_name="$_found"
               runs=$(awk -F'\t' -v self="/actions/runs/${GITHUB_RUN_ID}/" 'index($4, self) == 0' <<<"$runs")
               if [[ -n "$_self_name" ]]; then
                 runs=$(awk -F'\t' -v jn="$_self_name" '$1 != jn' <<<"$runs")
@@ -365,11 +406,89 @@ jobs:
               echo "CI shows red on ${sha:0:12}, but our OWN check-run row is not visible yet, so sibling release-cut rows could not be dropped — NOT acting on an unattributable red; re-looking (DIVE-2466) [look ${_look}]"
               printf '%s\n' "$bad" | sed 's/^/  deferred: /'
             elif [[ -n "$bad" ]]; then
+              # DIVE-3314 SUPERSESSION RETARGET — the one red that is not a verdict.
+              #
+              # full-sweep's concurrency group is keyed on the ref with cancel-in-progress,
+              # and its header says so: "merges closer together than one sweep collapse into
+              # a single run of the newest tip". So a sha overtaken by a newer merge has its
+              # verdict DELIBERATELY never produced. `cancelled` is correctly not green — a
+              # predicate that requires green must refuse it, and widening the guard to accept
+              # `cancelled` would cut from an ungraded tree. But refusing is not the end of the
+              # story either: the verdict this job is waiting for is one the concurrency policy
+              # GUARANTEES will not arrive, so the refusal is permanent, not "not yet". Measured
+              # 2026-08-12: 3 of the last 4 pushes to main had their sweep cancelled, v0.19.26
+              # went uncut on run 31563209367, and queue-blockers.sh:350 excludes `cancelled`
+              # from red by design — so the board shows green while cuts refuse indefinitely.
+              #
+              # The answer is not to relax what green means. It is to stop grading a sha that
+              # was abandoned: re-point at the descendant that subsumed it and grade THAT, which
+              # is a strictly STRONGER tree than the one we were about to publish. Three
+              # conditions, all required, all fail-closed:
+              #   1. EVERY red row is `cancelled`, AND THERE IS AT LEAST ONE. One genuine
+              #      failure/timed_out and we refuse — a descendant may or may not have fixed it
+              #      and this job does not get to assume; only the ABSENCE of a verdict is
+              #      retargetable, never a bad one.
+              #   1b. THE BOARD MUST BE SETTLED — `-z "$incomplete"`. main + dev, 2026-08-12:
+              #      cancelled means no verdict will EVER exist; queued means one is coming, and
+              #      an impatient cut that hopped to a descendant rather than waiting would be
+              #      worse than the bug this fixes. A `queued`/`in_progress` row is `$2 !=
+              #      completed`, so it is NOT in `bad` — it is invisible to condition 1, which is
+              #      exactly why condition 1 alone is not enough. Measured: a board of one
+              #      cancellation plus one queued row retargeted, twice, while work on the sha we
+              #      were abandoning was still running. The retarget's whole claim is "the verdict
+              #      for this sha will never arrive", and that is only knowable once nothing is
+              #      still producing one. Unsettled => the pre-existing refusal fires, unchanged;
+              #      no red is waited out, and the real collision (a whole sweep cancelled in one
+              #      instant, run 31563209367) leaves `incomplete` empty and is unaffected.
+              #      THE COUNT IS NOT REDUNDANT. "every red is cancelled" is vacuously true of an
+              #      empty set, and DIVE-2867 is precisely a cut printing "CI is RED ... Failing:"
+              #      with an empty list — so the enclosing `-n "$bad"` is today the only thing
+              #      between this and retargeting on nothing. That is a correctness argument that
+              #      lives in a DIFFERENT branch condition and would not survive this block being
+              #      moved. Assert the positive here, where the decision is made.
+              #   2. The new tip is a strict DESCENDANT (_retarget_tip's --is-ancestor test), so
+              #      everything we were about to cut is contained in what we grade instead.
+              #   3. Budget: at most _RETARGET_MAX, inside the SAME unextended poll deadline.
+              # Reaching this branch at all already means the red was attributable (the deferral
+              # above owns the other case), so these rows are not sibling-release-cut residue.
+              #
+              # TERMINATION, stated rather than implied — a retarget re-enters the SAME loop with
+              # a new `sha`, so the descendant is graded by every rule above and nothing else:
+              #   green            -> break, cut it (the descendant, never the abandoned sha)
+              #   any non-cancelled red -> refuse HERE, immediately. It does not walk further.
+              #   incomplete       -> keep polling it to the shared deadline, then refuse. It does
+              #                       not walk further; an unfinished verdict is one that is coming.
+              #   all-cancelled again, and main moved AGAIN -> at most one more hop, then refuse.
+              # So the only walk is condition-1-and-2 twice, and the deadline bounds even that.
+              _uncancelled=$(awk -F'\t' '$3 != "cancelled"' <<<"$bad")
+              _ncancelled=$(awk -F'\t' '$3 == "cancelled"' <<<"$bad" | grep -c . || true)
+              _newtip=""
+              if [[ -z "$_uncancelled" ]] && (( _ncancelled > 0 )) && [[ -z "$incomplete" ]] && (( _retargets < _RETARGET_MAX )); then
+                _newtip=$(_retarget_tip "$sha")
+              fi
+              if [[ -n "$_newtip" ]]; then
+                if [[ -n "${cut_from:-}" && "$cut_from" == "$_newtip" ]]; then
+                  echo "::notice::${sha:0:12} was superseded by ${_newtip:0:12}, which is the commit the incumbent tag was already cut from — nothing to publish (DIVE-3314)."
+                  exit 0
+                fi
+                _retargets=$(( _retargets + 1 ))
+                echo "::notice::every red on ${sha:0:12} is 'cancelled' and main has moved to ${_newtip:0:12}, a descendant of it — that sweep was collapsed into the newer tip's by design and its verdict will never arrive. Re-targeting the cut at ${_newtip:0:12} and grading THAT (DIVE-3314) [retarget ${_retargets}/${_RETARGET_MAX}]"
+                printf '%s\n' "$bad" | sed 's/^/  abandoned: /'
+                sha="$_newtip"
+                runs=$(_ci_fetch_runs)
+                continue
+              fi
               echo "::error::CI is RED on ${sha:0:12} — refusing to cut ${tag}. Failing:"
               printf '%s\n' "$bad" | sed 's/^/  /'
               exit 1
             fi
-            if (( total > 0 )) && [[ -z "$incomplete" ]]; then
+            # DIVE-3314: `-z "$bad"` is load-bearing, not belt-and-braces. A DEFERRED red
+            # (the branch above) falls through to here, and without this a board that is
+            # red-but-unattributable AND fully completed breaks out as GREEN and publishes
+            # it. Unreachable before the retarget landed only because our own in_progress
+            # row kept `incomplete` non-empty on the sha we were triggered on; on a
+            # re-targeted sha that row does not exist, so nothing else holds the door.
+            if (( total > 0 )) && [[ -z "$bad" ]] && [[ -z "$incomplete" ]]; then
               echo "CI green on ${sha:0:12}: ${total}/${total} completed, none failing."
               break
             fi
@@ -447,7 +566,23 @@ jobs:
           # so stamp-changelog.sh sees the folded headings same as a manually-typed
           # one. Not fatal for the same reason the stamp isn't: a cut must not die
           # because a fragment drifted from the expected format.
-          if _folded=$(bash scripts/fold-changelog-fragments.sh 2>&1); then
+          #
+          # DIVE-2702: PASS THE ALREADY-CONSUMED BASELINE. The fold deletes fragments
+          # in this detached tree only — main keeps them (DIVE-2247: no push to a
+          # protected branch) — so without this the NEXT cut re-folds every fragment
+          # ever written and each release's notes repeat all previous releases'.
+          # DIVE-3170: this used to pass "${incumbent}^" and call itself "not a third
+          # copy of the tag-resolution rule". It WAS a third copy, spelled differently,
+          # and it was wrong: the tag's first parent is the assign commit, whose tree
+          # the fold has ALREADY emptied, so every fragment looked unshipped and all 52
+          # re-folded on every cut. It now reuses $cut_from — the one derivation, done
+          # once above. Empty incumbent (first cut ever) is still passed through as
+          # set-but-empty on purpose: "nothing has shipped yet, fold everything", which
+          # is different from the unset auto-detect case.
+          if [[ -n "${incumbent-}" && -z "${cut_from-}" ]]; then
+            echo "::warning::could not resolve the main commit ${incumbent} was cut from — every already-shipped fragment will fold again and these notes will repeat previous releases' entries (DIVE-2702, DIVE-3170)"
+          fi
+          if _folded=$(FOLD_RELEASED_BASELINE="${cut_from-}" bash scripts/fold-changelog-fragments.sh 2>&1); then
             echo "changelog.d fragments folded for ${tag}: ${_folded} (DIVE-2582)"
           else
             echo "::warning::changelog.d fragments could not be folded for ${tag} (${_folded}) — publishing anyway"
@@ -469,6 +604,19 @@ jobs:
           else
             echo "::warning::CHANGELOG could not be stamped for ${tag} (${_stamped}) — publishing anyway; the release BODY is derived from the git range and is unaffected."
           fi
+          # DIVE-2603: build.sh stamps HEAD only when the tracked source tree is
+          # clean. Commit every tag-time source edit BEFORE building so the stamp
+          # names the exact bytes being concatenated. The bundle rides in a second
+          # release commit below; therefore its stamped source commit is the tagged
+          # commit's parent and ancestry remains directly checkable.
+          git add -f src/header.sh
+          if [ -f CHANGELOG.md ]; then git add -f CHANGELOG.md; fi
+          if [ -d changelog.d ]; then git add -A -f changelog.d; fi
+          git -c user.name=lodar -c user.email=markounik@gmail.com \
+              commit -q -m "release ${tag}: assign ${version} before bundle build (DIVE-2247, DIVE-2603)"
+          source_sha=$(git rev-parse HEAD)
+          [ -z "$(git status --porcelain --untracked-files=no)" ] \
+            || { echo "::error::tracked release source is dirty after commit ${source_sha} — refusing to stamp a false build identity"; exit 1; }
           ./build.sh || { echo "::error::build.sh failed — refusing to cut ${tag} with no bundle"; exit 1; }
           [ -s 5dive ] && [ -s 5dive.sha256 ] \
             || { echo "::error::build.sh produced no bundle/checksum — refusing to cut ${tag}"; exit 1; }
@@ -481,18 +629,12 @@ jobs:
           _bundle_ver=$(grep -m1 -oP "(?<=^readonly FIVE_VERSION=\")[^\"]+" 5dive)
           [ "v${_bundle_ver}" = "$tag" ] \
             || { echo "::error::built bundle says FIVE_VERSION=${_bundle_ver} but this cut is ${tag} — refusing to publish a bundle that disagrees with its own tag"; exit 1; }
-          git add -f 5dive 5dive.sha256 src/header.sh
-          # DIVE-2452: the stamped CHANGELOG rides in the release commit. Guarded
-          # rather than appended to the line above: `git add` fails the whole step on
-          # a pathspec that matches nothing, and the stamp is explicitly non-fatal —
-          # a cut must not die because a repo has no CHANGELOG.md.
-          if [ -f CHANGELOG.md ]; then git add -f CHANGELOG.md; fi
-          # DIVE-2582: the fold step above deletes any folded changelog.d/
-          # fragments from the working tree — stage that removal too, same guard
-          # shape (dir may legitimately not exist).
-          if [ -d changelog.d ]; then git add -A -f changelog.d; fi
+          _bundle_build_sha=$(grep -m1 -oP '(?<=^readonly FIVE_BUILD_SHA=")[^"]+' 5dive)
+          [ "$_bundle_build_sha" = "$source_sha" ] \
+            || { echo "::error::built bundle says FIVE_BUILD_SHA=${_bundle_build_sha:-missing} but its committed source is ${source_sha} — refusing to publish a false identity"; exit 1; }
+          git add -f 5dive 5dive.sha256
           git -c user.name=lodar -c user.email=markounik@gmail.com \
-              commit -q -m "release ${tag}: assign ${version} + built bundle (DIVE-2091 bundle-at-tag-time, DIVE-2247 version-at-tag-time)"
+              commit -q -m "release ${tag}: bundle built from ${source_sha} (DIVE-2091, DIVE-2603)"
           # DIVE-2433: `sha` is about to stop meaning "the commit whose check-runs we
           # read". Keep the graded one under its own name so the tag can say which
           # object each claim is about instead of silently attributing the parent's
@@ -505,7 +647,7 @@ jobs:
             || { echo "::error::release commit ${sha} does not carry the bundle — refusing to cut ${tag}"; exit 1; }
           [ "$(git show "${sha}:5dive" | sha256sum | cut -d" " -f1)" = "$_want" ] \
             || { echo "::error::bundle in the release commit differs from the one just built — refusing to cut ${tag}"; exit 1; }
-          echo "release commit ${sha} carries bundle ${_want} (FIVE_VERSION=${_bundle_ver})"
+          echo "release commit ${sha} carries bundle ${_want} (FIVE_VERSION=${_bundle_ver}, FIVE_BUILD_SHA=${_bundle_build_sha})"
           # <<< DIVE-2091 release-commit block
 
           # ── DIVE-2433: GRADE THE RELEASE COMMIT ──────────────────────────────
@@ -602,12 +744,19 @@ jobs:
           # The tag is NOT deleted on failure. A published tag that cannot be served is
           # a state a human must see; auto-removing it would hide the one occurrence
           # that proves the window is real.
-          # PROBE THE MANDATORY OBJECT, NOT THE OPTIONAL ONE (dev, review of #313).
-          # install.sh:264 `curl "$REPO/5dive" || die` is FATAL. install.sh:273
-          # `curl "$REPO/5dive.sha256" || _want=""` is fail-SOFT BY DESIGN — DIVE-1271
-          # made an absent checksum warn rather than brick a box. The first cut of this
-          # probe fetched the .sha256, so it proved the object install.sh treats as
-          # OPTIONAL was servable and said nothing about the one it dies on.
+          # PROBE EVERY OBJECT install.sh CAN DIE ON — and that set GREW (DIVE-2248).
+          # The first cut of this probe fetched only the .sha256 and said nothing about
+          # the bundle, so dev's review of #313 correctly reversed it to probe the
+          # bundle. That reasoning carried a premise which is no longer safe to leave
+          # standing: that `curl "$REPO/5dive.sha256" || _want=""` is fail-SOFT, so an
+          # unservable checksum could not brick a box. DIVE-2248 makes a missing NETWORK
+          # checksum FATAL in install.sh, which promotes the .sha256 from optional to
+          # mandatory and re-scopes this probe with it.
+          #
+          # So BOTH are probed with the same retry budget now. A probe whose coverage was
+          # derived from a policy does not update itself when the policy does, and the
+          # failure is silent in the safe-looking direction: the cut goes green and the
+          # box dies. Anyone tightening install.sh's fetch path must re-read THIS block.
           #
           # And they are two INDEPENDENT CDN objects with independent cache generations —
           # DIVE-1977 exists because they disagreed. Proving one servable is not evidence
@@ -639,12 +788,26 @@ jobs:
           # Also confirm the two objects AGREE at this one immutable sha — DIVE-1977's own
           # prescription. install.sh reads both, and a stale .sha256 against a fresh bundle
           # is the disagreement that row was filed for.
-          _servedsha="$(curl -fsSL --max-time 10 "${_base}/5dive.sha256" 2>/dev/null | tr -d '[:space:]')" || _servedsha=""
-          if [ -n "$_servedsha" ] && [ "$_servedsha" != "$_want" ]; then
+          # DIVE-2248: same 6-try budget as the bundle above, and an EMPTY result is now
+          # a failure rather than a skip. Previously a single 10s try with `|| _servedsha=""`
+          # meant an unservable checksum satisfied this step by being absent — the exact
+          # not-reached-reads-as-passed shape, guarding the object install.sh now dies on.
+          _servedsha=""
+          for _try in 1 2 3 4 5 6; do
+            _servedsha="$(curl -fsSL --max-time 60 "${_base}/5dive.sha256" 2>/dev/null | tr -d '[:space:]')" || _servedsha=""
+            [ -n "$_servedsha" ] && break
+            echo "  attempt ${_try}/6: ${tag} checksum not yet servable at ${sha:0:12} — waiting for propagation"
+            sleep 10
+          done
+          if [ -z "$_servedsha" ]; then
+            echo "::error::${tag} IS PUBLISHED BUT ITS 5dive.sha256 IS NOT SERVABLE. raw.githubusercontent returned nothing for ${_base}/5dive.sha256 after 6 tries. Since DIVE-2248 install.sh REFUSES a network bundle whose checksum it cannot fetch, so every new install and every unattended self-update fails until this resolves. The tag was deliberately NOT deleted — a human needs to see this."
+            exit 1
+          fi
+          if [ "$_servedsha" != "$_want" ]; then
             echo "::error::${tag}: the served 5dive.sha256 (${_servedsha}) disagrees with the bundle this cut verified (${_want}) at ${sha:0:12}. The two CDN objects are out of step (DIVE-1977)."
             exit 1
           fi
-          echo "${tag}: bundle verified SERVABLE and byte-correct at ${sha:0:12} (${_got:0:16}…) — install.sh's FATAL fetch path is proven, not assumed"
+          echo "${tag}: bundle AND checksum verified SERVABLE and byte-correct at ${sha:0:12} (${_got:0:16}…) — both of install.sh's fatal fetch paths are proven, not assumed"
 
           # >>> DIVE-2452 release-notes block
           #     (extracted verbatim by tests/release_notes_unit.sh — keep the fences.)
@@ -660,10 +823,10 @@ jobs:
           # `cut_from` is the main sha the incumbent tag was cut from — the same
           # comparand the main-moved check above uses, recomputed here because that
           # block returns early on the no-move path and never reaches this point.
-          _notes_from=""
-          if [[ -n "$incumbent" ]]; then
-            _notes_from=$(git rev-parse -q --verify "refs/tags/${incumbent}^{commit}^" 2>/dev/null || true)
-          fi
+          # DIVE-3170: $cut_from, not a fourth respelling of the tag rule. The
+          # main-moved block above returns early only on the no-move path, so the
+          # variable it set is still in scope and still correct here.
+          _notes_from="${cut_from-}"
           _notes_file="$(mktemp)"
           if ! bash scripts/release-notes.sh "$_notes_from" "$sha" "$version" > "$_notes_file"; then
             echo "::error::${tag} IS PUBLISHED as a tag, but its release notes could not be derived from ${_notes_from:-<root>}..${sha:0:12} — refusing to create a release page whose body would describe only how the cut was dispatched (DIVE-2452). Boxes are unaffected; write the notes by hand and create the release page."

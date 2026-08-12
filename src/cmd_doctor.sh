@@ -15,6 +15,9 @@
 # check helpers below don't need to pass it around.
 DOCTOR_CHECKS='[]'
 DOCTOR_REPAIR=0
+# Capability report (DIVE-3076). Empty means "not built this run" — the JSON
+# key is then `null`, which a reader must not confuse with a measured NO.
+DOCTOR_CAPS=''
 
 # doctor_add <category> <name> <severity> <message> [fixable:true|false] [repaired:true|false]
 doctor_add() {
@@ -423,11 +426,162 @@ doctor_check_reaped_homes() {
     "$n quarantined agent home(s) under $dir, oldest is ${oldest_name} (~${days}d old) — operator-managed by design (DIVE-2165, no TTL); delete by hand once you're sure: sudo rm -rf $dir/<name>"
 }
 
+# --- caps: the per-seat capability probe (DIVE-3076) ------------------------
+#
+# WHAT THIS ANSWERS, AND WHY IT IS NOT A DOC. DIVE-3017: a seat declined to
+# grade two items on the stated ground that it had no authenticated remote path,
+# citing three true observations — https `git ls-remote` prompts, `gh auth
+# status` is logged out, `/home/claude/.ssh/id_ed25519` is Permission denied.
+# The conclusion was still false for four of nine seats: `sudo -u claude gh auth
+# status` is logged in. Two seats spent a round trip each on a capability
+# question, and a verifier nearly handed a grade back to the maker — the exact
+# outcome the independence rule exists to prevent.
+#
+# The failure class is AN AGENT FORMING A FALSE BELIEF ABOUT ITS OWN
+# CAPABILITY. A wiki page cannot close that: a page only reaches the agent who
+# thinks to look it up, and the whole defect is believing there is nothing to
+# look up. So the answer has to be DERIVED, per seat, by a command the seat
+# already runs.
+#
+# AND IT IS NOT UNIFORM — this is the part that makes a documented answer worse
+# than none. Measured across the live fleet 2026-08-09 (olivia,
+# community/wiki/sudo-u-claude-is-per-seat-and-the-registry-already-measured-it.md):
+#
+#   olivia, main, dev, community      -> `sudo -u claude id -un` prints claude
+#   dev2, dev3, main2, quinn, codex   -> sudo: a password is required
+#
+# Publishing "just use sudo -u claude" fixes a false negative for four seats and
+# MINTS A FALSE POSITIVE FOR FIVE. A confident YES on a seat with no path is the
+# one output this probe must never produce, which is what the negative arm of
+# caps_probe_unit.sh grades (with a reason string, not an absence).
+#
+# WE DO NOT MEASURE THIS AFRESH. `agent_sudo_grant`'s `runas` field already
+# predicted all nine results above with zero misses, because it is the same
+# fact: `runas: any` means the sudoers entry permits an arbitrary runas target,
+# `runas: root` means root ONLY. Note that isolation is the WRONG field to key
+# on — two seats can both be `isolation: admin` and differ here, since `root-all`
+# implies beyond-admin and `cli-root` does not.
+#
+# BOTH ARMS ARE REQUIRED. `runas: any` says the uid switch is PERMITTED. It says
+# nothing about whether the claude uid's `gh` token is still valid or still
+# scoped, so the account and scopes are read off a LIVE call and never off a
+# cached string. A permitted switch onto a dead token is the one genuinely
+# check-shaped state here, and it is the only one that files a row.
+#
+# WHY THIS IS A REPORT AND NOT A PILE OF CHECKS (the DIVE-2328 lesson, applied
+# rather than re-learned): the dashboard renders `severity == "ok"` rows as
+# PASSED CHECKS in green. `github:write NO` is a correct, permanent, by-design
+# state on every seat — as a passing check it asserts a health nobody claimed,
+# and as a `warn` it would light up half the fleet forever for being configured
+# the way it is meant to be. Capability facts ride ALONGSIDE the checks in
+# `capabilities`, exactly as env_overrides does, and touch no count.
+
+# Seam 1 — WHICH SEAT IS ASKING. `doctor` is require_root, so `id -un` is always
+# `root` and answers the wrong question; the seat is the REAL sudo caller. Empty
+# means the caller is not an agent seat (a human, or cron, invoking as root
+# directly), which is a different answer and not a failure. $SUDO_USER is
+# forgeable by anyone who can set an env var, so this must never feed
+# AUTHORIZATION — a seat that lies here gets a capability report for another
+# seat, which grants it nothing it did not already have.
+doctor_caps_seat() {
+  local s="${SUDO_USER:-}"
+  [[ "$s" == agent-* ]] && printf '%s' "$s"
+  return 0
+}
+
+# Seam 2 — THE MEASURED GRANT for a seat, as `class|runas`. Wraps
+# agent_sudo_grant (which fails closed to `unknown|-`) so the harness can drive
+# the derivation without a sudoers fixture for every case.
+doctor_caps_runas() {
+  local g rest
+  g=$(agent_sudo_grant "$1" 2>/dev/null) || g="unknown|-|0"
+  [[ -n "$g" ]] || g="unknown|-|0"
+  rest="${g#*|}"
+  printf '%s|%s' "${g%%|*}" "${rest%%|*}"
+}
+
+# Seam 3 — THE LIVE TOKEN PROBE. Echoes `account<TAB>scopes` and returns 0 only
+# when the claude uid answers as an authenticated gh. `sudo -n` so a seat
+# without the grant is refused immediately instead of blocking doctor on a
+# password prompt. Failure text is returned on stdout too (rc says which it is),
+# because "permitted but the token is dead" has to name what went wrong.
+doctor_caps_gh_probe() {
+  local out acct scopes
+  if ! out=$(sudo -n -u claude gh auth status 2>&1); then
+    printf '%s' "$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | head -1)"
+    return 1
+  fi
+  acct=$(printf '%s\n' "$out" | sed -n 's/.*account \([^ ]*\).*/\1/p' | head -1)
+  scopes=$(printf '%s\n' "$out" | sed -n "s/.*[Tt]oken scopes: *//p" | head -1)
+  scopes="${scopes//\'/}"
+  printf '%s\t%s' "${acct:-unknown}" "${scopes:-none reported}"
+  return 0
+}
+
+# doctor_build_caps — SETS $DOCTOR_CAPS; writes NOTHING to stdout. Files at
+# most ONE check (the dead-token case); everything else is a fact about how this
+# box is configured.
+#
+# THE RETURN CHANNEL IS A GLOBAL ON PURPOSE, and the first cut got this wrong in
+# a way that only the harness saw. Written as `DOCTOR_CAPS=$(doctor_build_caps)`
+# it reads fine and the report is correct — but a command substitution is a
+# SUBSHELL, so the one thing here that is not a report, the `doctor_add` warn for
+# a permitted-but-dead token, was appended to a copy of DOCTOR_CHECKS that died
+# with the subshell. The report a reader sees would have been right while the
+# check row that makes the dead path VISIBLE in --json silently never existed.
+# A function that both emits a value and mutates accumulator state cannot be
+# called by substitution; this one therefore emits no value at all.
+doctor_build_caps() {
+  local seat class runas probe read_state read_detail write_detail seat_label
+
+  seat=$(doctor_caps_seat)
+  if [[ -n "$seat" ]]; then
+    local cr; cr=$(doctor_caps_runas "$seat")
+    class="${cr%%|*}"; runas="${cr#*|}"
+    seat_label="${seat#agent-} (sudo grant ${class}, runas ${runas})"
+  else
+    # Not an agent seat: the caller reached root directly, so the uid switch is
+    # not in question. Reported as its own state rather than folded into `any`,
+    # so nobody reads a human's YES as a statement about their seat.
+    class="not-an-agent-seat"; runas="any"
+    seat_label="${SUDO_USER:-root} — not an agent seat; this is the ROOT caller's answer, not a seat's"
+  fi
+
+  write_detail='push identity is per-seat and the claude-uid borrow is RETIRED for the push class (DIVE-3017) — this report is NOT permission to reopen it. Delegated route: `5dive push` (brokered, gated).'
+
+  if [[ "$runas" != "any" ]]; then
+    # THE NEGATIVE ARM. The reason is load-bearing: without it a reader on a
+    # cli-root seat goes hunting for a password that does not exist.
+    read_state="NO"
+    read_detail="this seat's sudo grant is ${class}: root only, not arbitrary uids — there is no \`sudo -u claude\` path from here, and no password will make one. Route the read to a seat with runas=any (\`5dive agent list --json | jq -r '.data[]|select(.sudo.runas==\"any\")|.name'\`)."
+  elif probe=$(doctor_caps_gh_probe); then
+    read_state="YES"
+    read_detail="via \`sudo -u claude gh\` (account ${probe%%$'\t'*}, scopes ${probe#*$'\t'}). A READ of a build product under a shared token mints nothing and authors nothing — verifier independence attaches to accepting a maker's CLAIM, not to whose credential opened the file."
+  else
+    read_state="NO"
+    read_detail="\`sudo -u claude\` is permitted here (runas any) but gh is not usable as that uid: ${probe:-no output}"
+    # The one genuinely check-shaped state: the fleet-wide read path is
+    # advertised and dead. Every seat that trusts the advertisement is about to
+    # burn a round trip discovering this.
+    doctor_add caps github-read-token warn \
+      "the claude-uid read path is permitted from this seat but its gh token is not usable: ${probe:-no output} — re-auth as claude (sudo -u claude gh auth login) or the fleet's documented CI-read route is dead"
+  fi
+
+  DOCTOR_CAPS=$(jq -cn \
+    --arg seat "$seat_label" --arg class "$class" --arg runas "$runas" \
+    --arg rstate "$read_state" --arg rdetail "$read_detail" --arg wdetail "$write_detail" \
+    '{seat: $seat, sudoGrant: $class, runas: $runas,
+      "github:read":  {state: $rstate, detail: $rdetail},
+      "github:write": {state: "NO",    detail: $wdetail}}')
+  return 0
+}
+
 cmd_doctor() {
   require_root
   local filter="" want_fix=0 dry=0
   DOCTOR_REPAIR=0
   DOCTOR_CHECKS='[]'
+  DOCTOR_CAPS=''
   while [[ $# -gt 0 ]]; do
     case "$1" in
       # --fix is the discoverable alias for the older --repair (both apply the
@@ -436,6 +590,9 @@ cmd_doctor() {
       # already a preview — every fixable check says "run with --fix".)
       --fix|--repair) want_fix=1 ;;
       --dry-run)      dry=1 ;;
+      # --caps is the name DIVE-3076 asked for and the name an agent will
+      # type; it is exactly --category=caps, never a second code path.
+      --caps)         filter="caps" ;;
       --category=*)   filter="${1#--category=}" ;;
       -*)             fail "$E_USAGE" "unknown flag: $1" ;;
       *)              fail "$E_USAGE" "extra arg: $1" ;;
@@ -449,12 +606,12 @@ cmd_doctor() {
     # `--category=policy` failed usage for every caller who read the error message
     # and did what it said. Pre-existing; fixed here because this change lands its
     # surface under that category and would otherwise be unreachable by filter.
-    ""|deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins) ;;
-    *) fail "$E_USAGE" "unknown --category (deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins)" ;;
+    ""|deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins|caps) ;;
+    *) fail "$E_USAGE" "unknown --category (deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins|caps)" ;;
   esac
 
   local run_deps=0 run_types=0 run_auth=0 run_creds=0 run_registry=0 run_shelld=0 run_channels=0 run_host=0 run_memory=0 run_policy=0
-  local run_plugins=0
+  local run_plugins=0 run_caps=0
   [[ -z "$filter" || "$filter" == "deps"     ]] && run_deps=1
   [[ -z "$filter" || "$filter" == "types"    ]] && run_types=1
   [[ -z "$filter" || "$filter" == "auth"     ]] && run_auth=1
@@ -466,6 +623,7 @@ cmd_doctor() {
   [[ -z "$filter" || "$filter" == "memory"   ]] && run_memory=1
   [[ -z "$filter" || "$filter" == "policy"   ]] && run_policy=1
   [[ -z "$filter" || "$filter" == "plugins"  ]] && run_plugins=1
+  [[ -z "$filter" || "$filter" == "caps"     ]] && run_caps=1
 
   # --- deps ---
   if (( run_deps )); then
@@ -718,6 +876,44 @@ cmd_doctor() {
   #      is on a Teams org whose admin hasn't allowlisted us via remote
   #      managed-settings (remote overrides local). Linked from README.
   if (( run_channels )); then
+    # DIVE-2041 (follow-up to the DIVE-2031 outage): the pinned "needs-you"
+    # banner is single-pinner by design — only the resolved org coordinator
+    # posts it (DIVE-1568), and every other agent unpins any banner it left
+    # behind. When `task coordinator` resolves to NOBODY, "every other agent"
+    # is ALL of them: the banner is unpinned in every paired DM and re-unpinned
+    # on a 60s timer forever, while every component reports success. That is
+    # how 12 pending human gates sat invisible for days.
+    #
+    # This check is the surface that names it. It computes the resolution HERE
+    # rather than asking the plugin, deliberately: the plugin can only report
+    # what it saw on its last tick, and a bot that is down reports nothing at
+    # all — the state we most need to see. Severity is keyed to CONSEQUENCE,
+    # not to the config: no coordinator with an empty gate queue is a latent
+    # warn; no coordinator while human gates are pending is a live outage of a
+    # human-safety surface, so it is an error and `summary.errors` carries it.
+    if [[ -f "${TASKS_DB:-}" ]]; then
+      local coord roots pending fixhint
+      coord=$(_task_resolve_coordinator 2>/dev/null || true)
+      if [[ -n "$coord" ]]; then
+        doctor_add channels needs-banner-coordinator ok \
+          "task coordinator resolves to '$coord' — the pinned needs-you banner has an owner"
+      else
+        roots=$(db "SELECT COUNT(*) FROM agents_org WHERE reports_to IS NULL OR reports_to NOT IN (SELECT name FROM agents_org);" 2>/dev/null || echo 0)
+        pending=$(db "SELECT COUNT(*) FROM tasks WHERE need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled');" 2>/dev/null || echo 0)
+        fixhint="fix: give the chart ONE root (5dive org set <agent> --manager=<mgr>), or put 'coordinator' in one agent's role (5dive org set <agent> --role='<their prose> coordinator')"
+        if [[ "${roots:-0}" == "0" ]]; then
+          doctor_add channels needs-banner-coordinator warn \
+            "no org chart — no coordinator, so the pinned needs-you banner is suppressed in every paired DM (5dive org set …)" false false
+        elif [[ "${pending:-0}" -gt 0 ]]; then
+          doctor_add channels needs-banner-coordinator error \
+            "NO coordinator resolves (${roots} org roots, none tagged) and ${pending} human gate(s) are pending — the pinned needs-you banner is suppressed in EVERY paired DM and nothing else reports it (DIVE-2031/2041); ${fixhint}" false false
+        else
+          doctor_add channels needs-banner-coordinator warn \
+            "no coordinator resolves (${roots} org roots, none tagged) — the pinned needs-you banner is suppressed in every paired DM; harmless while 0 gates are pending, invisible the moment one opens (DIVE-2031/2041); ${fixhint}" false false
+        fi
+      fi
+    fi
+
     local ms=/etc/claude-code/managed-settings.json
     # DIVE-1843: the DIVE-1816 fix reconciles this allowlist on install.sh rerun
     # only, so boxes provisioned before the dashboard channel shipped stayed
@@ -878,9 +1074,23 @@ cmd_doctor() {
           # Oldest (longest-running) claude process for this user = the
           # persistent session, not a transient hook subprocess. Pick max
           # elapsed-time among matches.
+          #
+          # DIVE-2041: `|| true` — this is the UNGUARDED TWIN of the identical
+          # pipeline ~30 lines below, whose comment already spells out why it is
+          # needed: a bare `x=$(pipeline)` inherits the pipeline's status, and
+          # under `set -euo pipefail` pgrep's no-match exit 1 aborts the ENTIRE
+          # doctor run before the envelope prints. One registered agent with no
+          # live claude process is enough, so it fires on any box with an idle
+          # agent. Measured on the control plane 2026-08-09 against the INSTALLED
+          # release and an origin/main build alike: `5dive doctor
+          # --category=channels` exits 1 with no JSON and no summary, so the
+          # dashboard's periodic `doctor --json` gets nothing for the category.
+          # Fixed here rather than filed because this change's own surface lands
+          # in this category and would otherwise be unreachable — the same
+          # reasoning the DIVE-2327 --category=policy fix used in this function.
           cpid=$(pgrep -u "$user" -f 'claude' 2>/dev/null \
                  | while read -r p; do echo "$(ps -o etimes= -p "$p" 2>/dev/null | tr -d ' ') $p"; done \
-                 | sort -rn | awk 'NR==1{print $2}')
+                 | sort -rn | awk 'NR==1{print $2}' || true)
           if [[ -n "$cpid" && -n "$ondisk_ver" ]]; then
             local etimes start_epoch now_epoch
             etimes=$(ps -o etimes= -p "$cpid" 2>/dev/null | tr -d ' ')
@@ -950,7 +1160,7 @@ cmd_doctor() {
       if [[ -z "$_free" ]]; then
         doctor_add host "disk ${_mnt}" warn "could not read free space for ${_mnt} (df failed) — UNKNOWN, not fine"
       elif (( _free < DISK_ERROR_KB )); then
-        doctor_add host "disk ${_mnt}" error "only ${_gb}G free on ${_mnt} (${_pct}% used) — agents are about to fail with ENOSPC in ways that read as 'that tool is broken'; reclaim: 5dive task reclaim --all --dry-run"
+        doctor_add host "disk ${_mnt}" error "only ${_gb}G free on ${_mnt} (${_pct}% used) — reclaim: 5dive task reclaim --all --dry-run"
       elif (( _free < DISK_WARN_KB )); then
         doctor_add host "disk ${_mnt}" warn "${_gb}G free on ${_mnt} (${_pct}% used) — one npm install is ~1G; reclaim: 5dive task reclaim --all --dry-run"
       else
@@ -1159,6 +1369,14 @@ cmd_doctor() {
     [[ -n "$DOCTOR_ENV_OVERRIDES" ]] || DOCTOR_ENV_OVERRIDES="$_5D_ENV_OV_UNAVAILABLE"
   fi
 
+  # --- caps (report; see doctor_build_caps) ---
+  # Constant fallback, never a function call: doctor_build_caps ships in this
+  # same file, so it is missing in exactly the cases a fallback exists for.
+  if (( run_caps )); then
+    doctor_build_caps
+    [[ -n "$DOCTOR_CAPS" ]] || DOCTOR_CAPS='{"seat":"unknown","sudoGrant":"unknown","runas":"unknown","github:read":{"state":"UNKNOWN","detail":"the capability probe itself failed to run — this is NOT a NO; nothing was measured"},"github:write":{"state":"NO","detail":"push identity is per-seat; the claude-uid borrow is RETIRED for the push class (DIVE-3017)."}}'
+  fi
+
   # --- summary + output ---
   local summary
   summary=$(jq -c '{
@@ -1183,7 +1401,8 @@ cmd_doctor() {
   local payload
   payload=$(jq -cn --argjson checks "$DOCTOR_CHECKS" --argjson summary "$summary" \
     --argjson eov "${DOCTOR_ENV_OVERRIDES:-{\}}" \
-    '{summary: $summary, checks: $checks, env_overrides: $eov}')
+    --argjson caps "${DOCTOR_CAPS:-null}" \
+    '{summary: $summary, checks: $checks, env_overrides: $eov, capabilities: $caps}')
 
   if (( JSON_MODE )); then
     jq -c '{ok:true, data: .}' <<<"$payload"
@@ -1197,6 +1416,18 @@ cmd_doctor() {
     jq -r '.summary |
       "summary: \(.total) checks, \(.passed) ok, \(.warnings) warn, \(.errors) error" +
       (if .repaired > 0 then ", \(.repaired) repaired" else "" end)
+    ' <<<"$payload"
+    # Capabilities, above env overrides and below the summary, and likewise a
+    # REPORT not results. Two lines, both derived per-seat at run time. The
+    # detail is printed in full rather than truncated: on the NO arm the reason
+    # IS the payload — a bare NO sends the reader hunting for a password that
+    # does not exist.
+    jq -r '
+      .capabilities // empty |
+      "", "── capabilities (per-seat report, not checks) ──",
+      "  seat          \(.seat)",
+      "  github:read   \(.["github:read"].state)  \(.["github:read"].detail)",
+      "  github:write  \(.["github:write"].state)  \(.["github:write"].detail)"
     ' <<<"$payload"
     # Its own section, below the summary, so it reads as a report rather than as results.
     # Prints NOTHING when there is nothing to say — which is why the negative is graded by

@@ -42,19 +42,76 @@ _report_import() {
     -d "{\"slug\":\"$slug\"}" >/dev/null 2>&1
 }
 
-_marketplace_index() { curl -fsSL --max-time 20 "$(_marketplace_base)/index.json" 2>/dev/null; }
+# Fetch one required marketplace object while preserving the failure class.
+# Returns: 0=2xx, 1=HTTP 404, 2=other HTTP non-2xx, 3=timeout, 4=transport.
+_marketplace_get_required() {
+  local url="$1" out="$2" http rc
+  if http=$(curl -sSL --max-time 20 -o "$out" -w '%{http_code}' "$url" 2>/dev/null); then
+    case "$http" in
+      2??) return 0 ;;
+      404) return 1 ;;
+      *)   return 2 ;;
+    esac
+  else
+    rc=$?
+    (( rc == 28 )) && return 3
+    return 4
+  fi
+}
+
+_marketplace_index() {
+  local tmp rc
+  tmp=$(mktemp)
+  if _marketplace_get_required "$(_marketplace_base)/index.json" "$tmp"; then
+    cat "$tmp"
+    rm -f "$tmp"
+    return 0
+  else
+    rc=$?
+    rm -f "$tmp"
+    return "$rc"
+  fi
+}
 
 # Resolve registry pack <slug> → a local .tar.gz (same shape `agent export` writes,
-# so cmd_import's existing flow is unchanged). Echoes the path; returns 1 if absent.
+# so cmd_import's existing flow is unchanged). Echoes the path. The return value
+# deliberately preserves WHICH registry step failed so callers never turn a
+# transient fetch failure into the much stronger claim that the slug does not exist:
+#   1 = the fetched, valid index has no such slug
+#   2/3/4/5 = index HTTP 404 / other non-2xx / timeout / transport
+#   6 = the fetched index is malformed
+#   7/8/9/10 = manifest HTTP 404 / other non-2xx / timeout / transport
+#   11 = the fetched files could not be assembled locally
 _marketplace_fetch_pack() {
-  local slug="$1" base idx entry path
+  local slug="$1" base idx entry path rc
   base=$(_marketplace_base)
-  idx=$(_marketplace_index) || return 1
+  if idx=$(_marketplace_index); then
+    :
+  else
+    rc=$?
+    case "$rc" in
+      1) return 2 ;;
+      2) return 3 ;;
+      3) return 4 ;;
+      *) return 5 ;;
+    esac
+  fi
+  jq -e '.packs | type == "array"' >/dev/null 2>&1 <<<"$idx" || return 6
   entry=$(jq -e --arg s "$slug" '.packs[] | select(.slug==$s)' <<<"$idx" 2>/dev/null) || return 1
-  path=$(jq -r '.path // empty' <<<"$entry"); [[ -n "$path" ]] || return 1
+  path=$(jq -r '.path // empty' <<<"$entry"); [[ -n "$path" ]] || return 6
   local dl; dl=$(mktemp -d)
-  curl -fsSL --max-time 20 "$base/$path/manifest.json" -o "$dl/manifest.json" 2>/dev/null \
-    || { rm -rf "$dl"; return 1; }
+  if _marketplace_get_required "$base/$path/manifest.json" "$dl/manifest.json"; then
+    :
+  else
+    rc=$?
+    rm -rf "$dl"
+    case "$rc" in
+      1) return 7 ;;
+      2) return 8 ;;
+      3) return 9 ;;
+      *) return 10 ;;
+    esac
+  fi
   local f
   for f in CLAUDE.md card.md avatar.png; do
     curl -fsSL --max-time 20 "$base/$path/$f" -o "$dl/$f" 2>/dev/null || true
@@ -92,8 +149,28 @@ _marketplace_fetch_pack() {
     done < <(jq -r '.memoryFiles[]? // empty' "$dl/manifest.json" 2>/dev/null)
   fi
   local out; out=$(mktemp --suffix=.tar.gz)
-  tar -czf "$out" -C "$dl" . 2>/dev/null || { rm -rf "$dl" "$out"; return 1; }
+  tar -czf "$out" -C "$dl" . 2>/dev/null || { rm -rf "$dl" "$out"; return 11; }
   rm -rf "$dl"; echo "$out"
+}
+
+# Render the classified fetch failure. Kept in one helper because both the
+# read-only inspect path and the provisioning import path resolve registry slugs.
+_marketplace_fetch_pack_fail() {
+  local slug="$1" rc="$2"
+  case "$rc" in
+    1) fail "$E_NOT_FOUND" "no pack '$slug' in the registry index (browse: 5dive agent marketplace ls)" ;;
+    2) fail "$E_NOT_FOUND" "character-pack registry index returned HTTP 404 ($(_marketplace_base)/index.json)" ;;
+    3) fail "$E_GENERIC" "character-pack registry index returned a non-2xx HTTP response ($(_marketplace_base)/index.json)" ;;
+    4) fail "$E_GENERIC" "timed out fetching the character-pack registry index ($(_marketplace_base)/index.json)" ;;
+    5) fail "$E_GENERIC" "transport failure fetching the character-pack registry index ($(_marketplace_base)/index.json)" ;;
+    6) fail "$E_GENERIC" "character-pack registry index is malformed ($(_marketplace_base))" ;;
+    7) fail "$E_NOT_FOUND" "pack '$slug' is listed in the registry index, but its manifest returned HTTP 404 (registry is inconsistent)" ;;
+    8) fail "$E_GENERIC" "pack '$slug' is listed in the registry index, but its manifest returned a non-2xx HTTP response" ;;
+    9) fail "$E_GENERIC" "pack '$slug' is listed in the registry index, but its manifest fetch timed out" ;;
+    10) fail "$E_GENERIC" "pack '$slug' is listed in the registry index, but its manifest had a transport failure" ;;
+    11) fail "$E_GENERIC" "pack '$slug' was fetched, but could not be assembled locally" ;;
+    *) fail "$E_GENERIC" "could not resolve pack '$slug' from the character-pack registry (unexpected fetch status $rc)" ;;
+  esac
 }
 
 # _pack_skill_refs <skills-dir> -> JSON array of skill specs for the manifest.
@@ -192,7 +269,10 @@ _install_bundled_skill() {
 # --as=cris leaves "You are Dario" in CLAUDE.md). Rewrite the persona name across
 # the identity + memory docs so the imported agent owns its chosen name. Both the
 # Capitalized display form (Dario) and the lowercase slug form (dario) are
-# replaced; word-boundary anchored so we don't mangle substrings.
+# replaced. A lowercase slug is a complete lexical token here: apostrophe-linked
+# continuations count as part of the token, so the agent `don` does not corrupt
+# ordinary prose such as "don't". The display form deliberately permits a
+# following apostrophe so possessives still rename (`Don's` -> `Cris's`).
 _pack_rename_persona() {
   local dir="$1" old="$2" new="$3"
   local old_l="${old,,}" new_l="${new,,}"
@@ -201,7 +281,31 @@ _pack_rename_persona() {
   local f
   for f in "$dir/CLAUDE.md" "$dir/card.md" "$dir/persona.yaml" "$dir"/memory/*.md; do
     [[ -f "$f" ]] || continue
-    sed -i -E "s/\\b${old_c}\\b/${new_c}/g; s/\\b${old_l}\\b/${new_l}/g" "$f" 2>/dev/null || true
+    # `\b` splits at punctuation, including the apostrophe inside a contraction.
+    # Lookarounds let adjacent names share a delimiter without consuming it, and
+    # one combined substitution never re-processes a replacement that happens to
+    # contain the old slug (e.g. `a` -> `a-one`). re.escape also keeps a malformed
+    # third-party manifest value from becoming regex syntax.
+    python3 - "$f" "$old_l" "$new_l" "$old_c" "$new_c" 2>/dev/null <<'PY' || true
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+old_l, new_l, old_c, new_c = sys.argv[2:]
+pattern = re.compile(
+    # Match the display name before a possessive suffix without consuming that
+    # suffix, but reject every other apostrophe-linked continuation (notably a
+    # sentence-leading contraction such as "Don't").
+    rf"(?P<display>(?<![\w'’]){re.escape(old_c)}(?=(?:['’]s)?(?![\w'’])))"
+    rf"|(?P<slug>(?<![\w'’]){re.escape(old_l)}(?![\w'’]))"
+)
+with path.open("r", encoding="utf-8", errors="surrogateescape", newline="") as handle:
+    text = handle.read()
+text = pattern.sub(lambda match: new_c if match.group("display") else new_l, text)
+with path.open("w", encoding="utf-8", errors="surrogateescape", newline="") as handle:
+    handle.write(text)
+PY
   done
 }
 
@@ -524,7 +628,7 @@ cmd_marketplace() {
 #   5dive market show <slug>               # preview one persona (tier, skills, card, DID)
 _market_usage() {
   cat <<'USAGE'
-5dive market — browse & search the agent market before you hire (DIVE-1020)
+5dive market — browse & search the agent market before you hire
 
   5dive market                          # browse every pack, rarity-first
   5dive market <keyword>                # search slug/name/tagline/role/tags/skills
@@ -538,7 +642,7 @@ _market_usage() {
   Then: 5dive hire <role> --from-market --dry-run   (preview a real hire, provisions nothing)
         5dive agent inspect <slug>                  (full install-time disclosure, incl. which harnesses it lands on)
         5dive agent import <slug> --as=<name>       (clone this exact persona)
-        5dive agent import <slug> --as=<name> --type=codex     (DIVE-2568: onto a non-Claude harness)
+        5dive agent import <slug> --as=<name> --type=codex     (onto a non-Claude harness)
 
   A pack is HARNESS-AGNOSTIC. `type` in the catalog is what it was packed as and
   is only the import default — the persona, memory, avatar and skills are plain
@@ -963,8 +1067,13 @@ cmd_inspect() {
   local resolved_tmp=""
   if [[ ! -f "$pack" ]]; then
     if [[ "$pack" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
-      resolved_tmp=$(_marketplace_fetch_pack "$pack") \
-        || fail "$E_NOT_FOUND" "no pack '$pack' in the registry (browse: 5dive agent marketplace ls)"
+      local fetch_rc
+      if resolved_tmp=$(_marketplace_fetch_pack "$pack"); then
+        :
+      else
+        fetch_rc=$?
+        _marketplace_fetch_pack_fail "$pack" "$fetch_rc"
+      fi
       pack="$resolved_tmp"
     else
       fail "$E_NOT_FOUND" "pack not found: $pack"
@@ -992,12 +1101,12 @@ cmd_inspect() {
 
 _pack_usage() {
   cat <<USAGE
-5dive agent export / import — portable agent packs (DIVE-39)
+5dive agent export / import — portable agent packs
 
   5dive agent export <name> [--format=pack|agents-md] [--with-memory]
                             [--approve-memory=<dir>] [--audience=publish|self] [-o <path>|--out=<path>]
                                   # write a shareable pack. Default = config only.
-                                  # --format=agents-md (DIVE-2565) writes ONE markdown
+                                  # --format=agents-md writes ONE markdown
                                   # file that IS an AGENTS.md: YAML frontmatter = the
                                   # agent spec, body = the persona doc, memory as fenced
                                   # '## memory/<file>' sections. Readable, diffable,
@@ -1005,7 +1114,7 @@ _pack_usage() {
                                   # 5dive installed. Skills travel as NAMES not bodies and
                                   # hooks are never carried; the file says both out loud.
                                   # 'agent import <file.md>' splits it back.
-                                  # --audience (DIVE-2567) picks who the pack is FOR, and
+                                  # --audience picks who the pack is FOR, and
                                   # DEFAULTS TO publish: staged memory is scanned for
                                   # operational detail (host paths, agent/human names,
                                   # hostnames, task ids, repo names, chat ids, sudo posture,
@@ -1027,11 +1136,11 @@ _pack_usage() {
                                   #   2) export <name> --approve-memory=<draft dir>  -> seals the
                                   #      reviewed memory into the pack. Nothing is packed unreviewed.
   5dive agent marketplace [ls]    # browse the character-pack registry (<org>/character-packs)
-  5dive agent inspect <pack|slug> # DIVE-995: read-only "this pack runs X" disclosure —
+  5dive agent inspect <pack|slug> # read-only "this pack runs X" disclosure —
                                   # hooks (arbitrary shell), skills, plugins, whether it
                                   # re-renders the system prompt, seeds memory, or adopts a
                                   # signing key. Run this BEFORE importing a third-party pack.
-  5dive agent import <pack|slug> --as=<name> [--channels=none|telegram|discord|dashboard[,ch...]]
+  5dive agent import <pack|slug> --as=<name> [--channels=none|telegram|discord|dashboard|buzz[,ch...]]
                             [--telegram-token=<tok>] [--discord-token=<tok>]
                             [--auth-profile=<name>] [--workdir=<path>] [--report-import] [--allow-hooks]
                             [--type=<type>] [--provider=<id> --api-key=<key|->] [--model=<slug>]
@@ -1569,6 +1678,28 @@ _agents_md_is() {
 # Explode a single-file export back into a pack STAGE at <outdir>: manifest.json,
 # CLAUDE.md, memory/*.md. Deliberately reconstructs a v1 pack rather than a
 # second import path, so everything downstream in cmd_import is untouched.
+# _agents_md_tool_refs <rendered-file> — echo the harness-bound tool identifiers
+# named in an exported body, space-separated and de-duplicated; empty if none.
+#
+# DIVE-2749. Pure and file-in/string-out ON PURPOSE: the warning it feeds lives
+# inline in the export path, which no harness drives, so the detection is split
+# out here where tests/pack_agents_md_unit.sh can grade it directly. A guard
+# that cannot be graded is the class this whole ticket is about.
+#
+# NOT EXHAUSTIVE, and every caller must say so. Two shapes:
+#   * `mcp__*` — structural, any MCP tool on any harness.
+#   * a named set — the Claude-native pickers that actually appear in persona
+#     bodies (measured on DIVE-2575's `creative` export).
+# A hardcoded name list is brittle by construction, which is why the structural
+# half carries most of the weight and why an empty result means "none of the
+# shapes we look for", never "this body is portable".
+_agents_md_tool_refs() {
+  local f="$1"
+  [[ -r "$f" ]] || return 0
+  grep -oE 'mcp__[A-Za-z0-9_]+|\<(AskUserQuestion|ExitPlanMode|TodoWrite|NotebookEdit|SlashCommand)\>' "$f" 2>/dev/null \
+    | sort -u | paste -sd' ' - 2>/dev/null || true
+}
+
 _agents_md_explode() {
   local file="$1" outdir="$2"
   _agents_md_is "$file" || return 1
@@ -1731,14 +1862,14 @@ cmd_export() {
       kept="${counts%% *}"; excluded="${counts##* }"
       if (( kept == 0 )); then
         rm -rf "$draft"
-        fail "$E_GENERIC" "nothing shareable: 0 reference/project knowledge facts ($excluded private user/feedback or opted-out facts excluded). Only metadata.type 'reference' or 'project' facts are eligible — 'user' and 'feedback' are private by definition and never exported. This agent has none of the former, so there is nothing to distil; write the shareable knowledge as reference/project facts first. Nothing written."
+        fail "$E_GENERIC" "nothing shareable: 0 reference/project knowledge facts ($excluded private or opted-out). Only metadata.type 'reference' or 'project' facts are eligible — 'user' and 'feedback' are never exported. Nothing written."
       fi
       if ! _pack_secret_tripwire "$draft"; then
         rm -rf "$draft"
         # DIVE-2679: name the ONE wrong turn this refusal invites. The reporter's next
         # move was --audience=self, because the usage text presents it as the escape
         # hatch; it is not one, and finding that out by re-running is a wasted cycle.
-        fail "$E_GENERIC" "a scoped fact tripped the secret tripwire (file:line: rule above) — refusing. Remove the credential from that fact, or tag the fact 'private: true' to exclude it, then retry. NOTE: --audience=self does NOT bypass this — it only skips the operational-detail leak-check; a real token never leaves in either audience."
+        fail "$E_GENERIC" "a scoped fact tripped the secret tripwire (file:line: rule above) — remove the credential or tag the fact 'private: true' (--audience=self does NOT bypass this)"
       fi
       # DIVE-2567: the draft exists to be REVIEWED, so here the leak-check REPORTS
       # rather than refuses — refusing to write the draft would leave the human
@@ -1872,7 +2003,7 @@ cmd_export() {
   # next format adds. Fails closed for the publish audience.
   if [[ -d "$stage/memory" ]] && ! _pack_memory_publish_gate "$audience" "$stage/memory" "$name"; then
     rm -rf "$stage" "$mem_tmp"
-    fail "$E_GENERIC" "refusing to export: staged memory carries operational detail a published pack must not (file:line:category above — host paths, agent/human names, hostnames, task ids, repo names, chat ids, sudo posture, credential locations). Distill those facts — the LESSON without the specifics — and retry; or, for YOUR OWN backup/clone only, re-run with --audience=self. Nothing was written and nothing was silently redacted."
+    fail "$E_GENERIC" "refusing to export: staged memory carries operational detail (file:line above) — distill it, or use --audience=self"
   fi
 
   # DIVE-2565: same stage, different container. Renders AFTER the tripwire above,
@@ -1888,6 +2019,35 @@ cmd_export() {
     rm -rf "$stage"; [[ -n "$mem_tmp" ]] && rm -rf "$mem_tmp"
     (( has_avatar )) && warn "dropped the avatar (binary): a single-file export carries no image — use --format=pack to keep avatar.png"
     (( n_hooks > 0 )) && warn "dropped $n_hooks hook block(s): a single-file export never carries arbitrary shell (export --format=pack if you need them)"
+    # DIVE-2749: hooks and avatar get a `dropped` declaration because they
+    # VISIBLY cannot travel. Tool references inside the persona body get none,
+    # because nothing knows they are harness-bound — so the body travels
+    # byte-faithfully and instructs the reader to use tools it may not have.
+    # Measured on DIVE-2575: `creative` is a claude agent, its exported body
+    # names mcp__plugin_telegram_telegram__reply / AskUserQuestion /
+    # ExitPlanMode, and a codex seat handed that file did NOT error — it
+    # believed the instruction and asserted "the user reads my messages on
+    # Telegram", false of a codex seat with channels none.
+    #
+    # NO EXISTING TEST CAN CATCH THIS CLASS: a round-trip test is
+    # export/import/diff, and byte equality is MAXIMISED by exactly this
+    # failure. The assertion that catches it is about the INTERSECTION with the
+    # importing harness, which is a different question.
+    #
+    # We deliberately do NOT claim the target lacks these. Same discipline as
+    # the skills warning below (DIVE-2583): at export time we do not know which
+    # harness the file lands on, and unearned specificity is the mistake that
+    # text already made once. The honest claim is narrower and still actionable
+    # — these identifiers belong to THIS seat's harness, the file does not say
+    # so, and a reader will follow them.
+    #
+    # Detection is two-part and NOT exhaustive, and the warning says so rather
+    # than letting a clean run read as "no harness-bound references": `mcp__*`
+    # is structural (any MCP tool, any harness), the named set is the Claude
+    # pickers that actually show up in persona bodies. A silent pass here means
+    # "none of the shapes we look for", never "portable".
+    local tool_refs; tool_refs=$(_agents_md_tool_refs "$out")
+    [[ -n "$tool_refs" ]] && warn "the body names harness-bound tool reference(s) and does not declare them as such: ${tool_refs} — these are identifiers of THIS seat's harness, they travel verbatim, and an importing harness that lacks them will not error, it will believe them (DIVE-2575). Verify each exists where you import, or edit the body. Detection covers mcp__* plus common native pickers and is NOT exhaustive"
     local skill_n; skill_n=$(jq -r 'length' <<<"$skills" 2>/dev/null || echo 0)
     # DIVE-2583: same correction as the rendered section — the FILE carries no
     # bodies (true everywhere); importing it still installs into the importing
@@ -1995,8 +2155,13 @@ cmd_import() {
     if [[ "$pack" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
       step "Resolving '$pack' from the character-pack registry"
       import_slug="$pack"   # remember the registry slug for opt-in --report-import
-      resolved_tmp=$(_marketplace_fetch_pack "$pack") \
-        || fail "$E_NOT_FOUND" "no pack '$pack' in the registry (browse: 5dive agent marketplace ls)"
+      local fetch_rc
+      if resolved_tmp=$(_marketplace_fetch_pack "$pack"); then
+        :
+      else
+        fetch_rc=$?
+        _marketplace_fetch_pack_fail "$pack" "$fetch_rc"
+      fi
       pack="$resolved_tmp"
     else
       fail "$E_NOT_FOUND" "pack not found: $pack"

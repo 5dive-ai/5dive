@@ -211,6 +211,7 @@ anchor_to marcus
 # --------------------------------------------------------------------------------------
 seed_task DIVE-506 "pick the rollout order"
 cmd_task_need DIVE-506 --type=decision --tier=2 --options="A|B" --recommend=A \
+  --rubber-stamp-ok="fixture: this case needs a tier-2 decision to prove it mints a nonce (DIVE-2848 cap)" \
   --ask="which rollout order" --from=dev >/dev/null 2>&1
 [[ "$(tierof DIVE-506)" == "2" && -n "$(hashof DIVE-506)" ]] \
   && ok_t "S10 a tier-2 DECISION now mints a per-gate nonce (it minted none before)" \
@@ -351,11 +352,24 @@ cmd_task_need DIVE-508 --type=decision --tier=2 --options="A|B" \
   --ask="which rollout order" --from=dev >/dev/null 2>&1
 SAVED_UID="$SUDO_UID"; export SUDO_UID=0   # root: a real, non-agent uid
 _gate_is_root() { return 0; }
+# DIVE-2371: the non-agent evidence form now needs a STRUCTURAL half too
+# (`_gate_human_principal` = the uid test AND `_gate_cgroup_human_capable`). This
+# arm describes the dashboard exec / human-on-box, which IS the accepted surface,
+# so flip the cgroup with the uid — otherwise the answer below reads the host's
+# real cgroup and S15 grades the fixture. Scoped to S15 and restored with the uid
+# below, so S16/S17 keep the agent pin. The precond on the next line deliberately
+# still asserts the UID half alone: it is what it names.
+_gate_caller_cgroup() { printf '%s' '/system.slice/shelld.service'; }
 _gate_sudo_uid_nonagent \
   && ok_t "S15 precond: the real resolver accepts SUDO_UID=0 as non-agent evidence" \
   || bad_t "S15 precond" "_gate_sudo_uid_nonagent refused SUDO_UID=0 under the root seam"
 out=$(cmd_task_answer DIVE-508 --value=A --from=main --human 2>&1); rc=$?
 export SUDO_UID="$SAVED_UID"
+# Restore the AGENT side of the structural half with the uid. Pinned explicitly
+# rather than left to read the host, so S16/S17 grade the same on a box and on a
+# runner — the DIVE-2365 lesson that a property true by accident of who ran the
+# suite is not a property at all.
+_gate_caller_cgroup() { printf '%s' '/system.slice/system-5dive.slice/5dive-agent@dev.service'; }
 agent_caller_on                            # back to the AGENT pin for S16/S17 below
 [[ $rc -eq 0 && "$(answered DIVE-508)" == "closed" ]] \
   && ok_t "S15 a non-agent SUDO_UID still clears with no nonce (forms stay equivalent)" \

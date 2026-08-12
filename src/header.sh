@@ -36,6 +36,13 @@ esac
 # the floor if it is not. Graded by tests/release_cut_assign_unit.sh.
 readonly FIVE_VERSION="0.0.0-dev"
 
+# Build identity, not a release number. build.sh replaces this sentinel only in
+# the generated bundle with the 40-hex commit whose clean source it concatenated
+# (or <sha>-dirty when the bytes do not equal HEAD). Both sentinels are non-hex,
+# so neither an unbuilt nor a dirty artifact can masquerade as identity whose
+# ancestry install.sh can verify (DIVE-2603).
+readonly FIVE_BUILD_SHA="unbuilt"
+
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
 # rename, so probe the new org once per process and fall back to the old
@@ -450,7 +457,7 @@ declare -A SKILLS_AGENT_ID=(
 # Used for post-install verification, the cmd_skill_list dir-scan fallback,
 # and cmd_skill_rm. Probed empirically against npx skills v0.x — if upstream
 # changes a path, update here. Unknown types fall through to ".claude/skills"
-# in the lookup sites below.
+# in the resolver below.
 #
 # DIVE-2583 — THE CONTRACT, because prose elsewhere in this repo contradicted it:
 # every value here is $HOME-RELATIVE (it is joined to /home/agent-<name>/ at every
@@ -542,15 +549,44 @@ skill_default_source() {
 }
 
 # skills_install_dir <type> -> the $HOME-relative dir an installed skill body
-# lands in for that type. THE resolver: this is the expression cmd_pack.sh's
-# import path, cmd_skill add/list/rm and agent_setup.sh each spell by hand, and
-# DIVE-2583 exists because a rendered sentence stated a DIFFERENT answer than the
-# one the installer computed. Anything that TELLS a user where skills go must ask
-# this function, so the claim and the behaviour cannot drift apart. Total by
-# construction — never empty, for any input — which is exactly why "a harness with
-# no skills directory" describes nothing here.
+# lands in for that type. THE resolver: cmd_pack.sh's import path, cmd_skill
+# add/list/rm and agent_setup.sh all call this function. DIVE-2583 exists because
+# a rendered sentence stated a DIFFERENT answer than the installer computed.
+# Anything that tells or acts on where skills go must ask this function, so the
+# claim and behaviour cannot drift apart. Total by construction — never empty,
+# for any input — which is exactly why "a harness with no skills directory"
+# describes nothing here.
 skills_install_dir() {
   printf '%s\n' "${SKILLS_INSTALL_DIR[${1:-}]:-.claude/skills}"
+}
+
+# skills_install_dirs_all -> every distinct skills dir, one per line, sorted.
+#
+# WHY A SECOND VERB AND NOT "JUST USE THE RESOLVER" (DIVE-2609 x DIVE-3172,
+# 2026-08-11). The two rows collided head-on: DIVE-3172 stopped hardcoding
+# `.claude` literals in the self-update payload fingerprint and derived the paths
+# from the per-type maps — the right instinct — and did it by reading
+# SKILLS_INSTALL_DIR directly, which is exactly what DIVE-2609's contract forbids.
+# Neither could see the other; #558 sat 108 commits behind main.
+#
+# The obvious repair is not available. `skills_install_dir` takes a TYPE and returns
+# ONE path; the fingerprint needs EVERY value, because a payload set is a union over
+# types and not a lookup. Routing an enumeration through a single-key resolver is a
+# circle, so the shape gets its own verb rather than an exemption — a contract that
+# grows a hole every time a caller is inconvenient stops being a contract, and this
+# one caught a real regression on its first contact with it.
+#
+# NOTE WHAT IT ITERATES: the KEYS (`${!SKILLS_INSTALL_DIR[@]}`), then asks the
+# resolver for each one. So there is still exactly one executable read of the map's
+# VALUES in src/, the resolver's own, and this verb cannot drift from it by
+# construction — it is a caller, not a second copy. That is the property DIVE-2609
+# is protecting, and the reason a keys-expansion here is not the thing it forbids.
+skills_install_dirs_all() {
+  declare -p SKILLS_INSTALL_DIR >/dev/null 2>&1 || return 0
+  local _t
+  for _t in "${!SKILLS_INSTALL_DIR[@]}"; do
+    skills_install_dir "$_t"
+  done | LC_ALL=C sort -u
 }
 
 # api-key target per type: the env file (in /etc/5dive/connectors for the
@@ -613,9 +649,23 @@ declare -A TYPE_PERSONA_FILE=(
   [pi]=".pi/agent/AGENTS.md"
   # antigravity reuses Google's ~/.gemini parent (see the TYPE_BIN note).
   [antigravity]=".gemini/GEMINI.md"
-  # hermes and openclaw are DELIBERATELY UNMAPPED: neither has been probe-verified
-  # on a live seat, and a guessed path is exactly the silent no-op this ticket
-  # removes. Creating one with a role warns loudly and installs nothing.
+  # hermes: NOT ~/.hermes/AGENTS.md, which is the path everyone guesses (DIVE-2245
+  # said so itself). hermes' prompt_builder loads AGENTS.md / CLAUDE.md from the
+  # CWD ONLY — a home-level one is never read — while SOUL.md is the identity slot
+  # it reads from HERMES_HOME (~/.hermes) and always injects. Measured on a live
+  # seat: NOT TOLD -> "I am Quill, the Release Archivist". `hermes gateway install`
+  # PRESEEDS SOUL.md with the Nous default identity during create, so this is an
+  # occupied slot like codex's — persona_install_doc PREPENDS, and an overwrite
+  # would delete the harness's own default persona.
+  [hermes]=".hermes/SOUL.md"
+  # openclaw injects a fixed set of WORKSPACE files every session (AGENTS.md,
+  # SOUL.md, TOOLS.md, IDENTITY.md, USER.md); the workspace root is ~/.openclaw/
+  # workspace, NOT the agent's --workdir and NOT a pi-shaped path. AGENTS.md is
+  # the operating-instructions slot, which is where a role + reporting line
+  # belongs (SOUL.md is tone/boundaries). Measured on a live seat: NOT TOLD ->
+  # "my job title on this team is Ledger Steward". openclaw's first-run bootstrap
+  # writes all of these during create, so this is an occupied slot too.
+  [openclaw]=".openclaw/workspace/AGENTS.md"
 )
 
 # OpenCode reads provider API keys directly from standard environment variables.
@@ -711,6 +761,23 @@ declare -A OPENCLAW_PROVIDER_ID=(
   [moonshot]="moonshot"
   [openrouter]="openrouter"
   [nous]=""
+  # DIVE-3130: openclaw 2026.7.1-2's catalog enumerates NO zai models
+  # (`models list --provider zai --plain` → "No models found"; the GLM ids it
+  # carries sit under byteplus/, novita/, nvidia/, together/ and volcengine/).
+  # zai is KEPT rather than dropped, deliberately: an unenumerated namespace is a
+  # NO-ORACLE state, not a proof of unroutability (see
+  # community/wiki/a-byo-model-pin-can-only-be-graded-off-ci.md), and the
+  # DIVE-1826 coding-endpoint pin in OPENCLAW_PROVIDER_URL still applies. What
+  # changed is that a zai seat can no longer be created WITHOUT a model: with no
+  # OPENCLAW_PROVIDER_MODEL row, _apply_byo_openclaw now refuses unless the
+  # operator passes --model. Do not add a [zai] model row here until an id is
+  # graded against `models list --provider zai --plain` on the installed version.
+  # DIVE-3184 makes that NO-ORACLE reading provable rather than assumed: on the
+  # same version, `models list --provider notaprovider --plain` prints "No models
+  # found." at exit 0, BYTE-IDENTICAL (diff-clean) to what zai, qwen and
+  # huggingface return. The oracle is one-sided — a hit is authoritative, a miss
+  # says nothing — so those three stay listed. Do not read them as
+  # measured-unroutable and delete them.
   [zai]="zai"
   [minimax]="minimax"
   [qwen]="qwen"
@@ -774,11 +841,21 @@ declare -A HERMES_PROVIDER_MODEL=(
 )
 declare -A OPENCLAW_PROVIDER_MODEL=(
   # Grade a pin here with `openclaw models list --provider <native> --plain`,
-  # NEVER with `--all`: `--all` is a SUBSET that omits the openai/ and google/
-  # namespaces entirely, and reading that omission as "no oracle" is what left
-  # [openai] and [google] ungraded until DIVE-2631. The per-provider list is the
-  # same static catalog (byte-identical to --all on `anthropic`, and unchanged
-  # with the network cut, so it cannot flap).
+  # NEVER with `--all`: `--all` is a SUBSET that omits the openai/, google/ AND
+  # minimax/ namespaces entirely, and reading that omission as "no oracle" is
+  # what left [openai] and [google] ungraded until DIVE-2631 and [minimax]
+  # unpinned until DIVE-3184. The per-provider list is the same static catalog
+  # (byte-identical to --all on `anthropic`, and unchanged with the network cut,
+  # so it cannot flap).
+  #
+  # THAT LIST OF THREE IS NOT THE LIST OF OMISSIONS — it is the list of
+  # omissions anyone has MEASURED. Four namespaces have ever been checked both
+  # ways and three of the four were missing from --all (anthropic 9/9 diff-clean;
+  # openai 20/0; google 7/0; minimax 3/0). The other 16 namespaces --all reports,
+  # and any it hides that nobody has thought to ask about, are unmeasured in this
+  # direction — and you cannot use --all to discover what --all is hiding. So the
+  # rule takes no exceptions and needs no reasoning about which namespaces are
+  # safe: use --provider, every time. It costs the same (DIVE-3183).
   #
   # And do NOT settle one of these against a DIFFERENT tool's catalog: models.dev
   # — which hermes itself prefers at runtime — lists both the old openai/gpt-4o
@@ -798,11 +875,20 @@ declare -A OPENCLAW_PROVIDER_MODEL=(
   # Measured on openclaw 2026.7.1-2: openai carries no gpt-4 family at all (20
   # ids, starting at gpt-5.3), google carries only 2.5.x/3.x (7 ids), moonshot
   # only k2.6 / k2.7-code, deepseek only chat / reasoner (DIVE-2628, DIVE-2631).
+  # minimax carries 3 ids — MiniMax-M2.7, -M2.7-highspeed, M3 — graded on
+  # 2026.7.1-2 (0790d9f) with anthropic=9 as the non-vacuity control; M2.7 is the
+  # general-purpose one, so it is the pin rather than M3 (DIVE-3183/3184).
+  #
+  # zai, qwen and huggingface deliberately have NO row: their per-provider list
+  # is empty on this version, which is a NO-ORACLE state and not a licence to
+  # guess. They keep refusing at create until the operator passes --model
+  # (DIVE-3130); the wizard's model field for them is DIVE-3183, not this table.
   [openai]="openai/gpt-5.6"
   [anthropic]="anthropic/claude-sonnet-5"
   [google]="google/gemini-3.5-flash"
   [deepseek]="deepseek/deepseek-chat"
   [moonshot]="moonshot/kimi-k2.6"
+  [minimax]="minimax/MiniMax-M2.7"
   [openrouter]="openrouter/auto"
 )
 declare -A BYO_PROVIDER_LABEL=(
@@ -820,6 +906,51 @@ declare -A BYO_PROVIDER_LABEL=(
 )
 valid_byo_provider() {
   [[ -n "${BYO_PROVIDER_LABEL[$1]:-}" ]]
+}
+
+# The canonical id a claude BYO agent carries when its endpoint came from
+# --base-url rather than from the CLAUDE_PROVIDER_BASEURL catalog. It is a
+# LABEL, not a vendor: nothing keys a model default or a native provider id off
+# it, and it is deliberately absent from BYO_PROVIDER_LABEL so the pickers that
+# enumerate that table (init step 6, the dashboard tiles) do not offer a vendor
+# with no endpoint behind it (DIVE-2757).
+CLAUDE_CUSTOM_PROVIDER_ID="custom"
+
+# Validate an operator-supplied Anthropic-compatible endpoint for claude BYO.
+#
+# This value is written into an auth profile's combined.env and loaded by
+# systemd as an EnvironmentFile, so the syntactic rules are not cosmetic: a
+# newline forges a second variable in that file, and whitespace or a quote
+# changes how systemd parses the line. Reject anything but a bare URL.
+#
+# SCHEME. https:// is required, because the agent's API key rides this URL on
+# every request and a plaintext http:// endpoint puts it on the wire. The one
+# exception is a loopback host — a local inference server (vLLM, llama.cpp,
+# Ollama's anthropic shim) is reached over http://127.0.0.1 and never leaves the
+# box, so requiring TLS there would refuse the most common self-hosted shape for
+# no gain. A private-LAN address is NOT exempt: it is off-box, it is a real
+# network, and "the LAN is trusted" is exactly the assumption that is wrong.
+valid_base_url() {
+  local url="$1" host=""
+  [[ -n "$url" ]] || return 1
+  (( ${#url} <= 512 )) || return 1
+  # No whitespace (incl. newline/tab), quotes, backslash, or shell metacharacters.
+  # Single-quoted so nothing in the class is expanded; `-` is last, `]` absent.
+  # `]` must be first in the class and `-` last for both to be literal.
+  local _re='^[]A-Za-z0-9._~:/?#@!$&*+,;=%[-]+$'
+  [[ "$url" =~ $_re ]] || return 1
+  case "$url" in
+    https://*) return 0 ;;
+    http://*)
+      # Strip scheme, then any /path or ?query — what remains is host[:port].
+      host="${url#http://}"; host="${host%%/*}"; host="${host%%\?*}"
+      # A bracketed IPv6 literal is full of colons, so the port strip has to
+      # respect the brackets or `[::1]:8080` truncates to `[:`.
+      if [[ "$host" == \[*\]* ]]; then host="${host%%\]*}]"; else host="${host%:*}"; fi
+      [[ "$host" == "127.0.0.1" || "$host" == "localhost" || "$host" == "[::1]" ]]
+      return $? ;;
+    *) return 1 ;;
+  esac
 }
 
 # --- Claude (Claude Code) harness BYO custom-provider catalog -----------------
@@ -866,30 +997,93 @@ valid_byo_provider() {
 # there is no claude-haiku-5 on OpenRouter, 4.5 is the current haiku. NOTE the opus
 # slot was the only stale entry — its sibling sonnet was already at 5, so one tier had
 # been bumped and the other had not.
+# Qwen / Alibaba Model Studio (DIVE-2756): verified LIVE with a real Token Plan key
+# 2026-08-07 — not doc-and-probe-only like the pre-ship research. A full /v1/messages
+# POST to token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic returned 200 with
+# a real completion, and a claude-type agent ran qwen3.8-max through this exact env
+# shape for hours the same day. BEWARE THE KEY-SPACE SPLIT: Alibaba serves TWO
+# credential families that do NOT interchange. Token Plan (subscription) keys auth
+# ONLY on token-plan.<region>.maas.aliyuncs.com; pay-as-you-go Model Studio keys auth
+# on dashscope[-intl|-us].aliyuncs.com. Measured 2026-08-07 with the same key across
+# all three hosts: 200 on token-plan, `403 {"message":"invalid api-key"}` on both
+# dashscope hosts — a discriminating auth layer rejecting a FOREIGN key, which is what
+# makes the split real rather than a route difference. The tile ships the endpoint it
+# was SMOKED on (token-plan); a pay-as-you-go key points at its own host through the
+# generic `agent create --base-url` (DIVE-2757) instead of an unsmoked catalog default
+# — a tile that 403s for every customer is worse than no tile. Region is part of the
+# host (ap-southeast-1); operators on another region override via --base-url the same
+# way. Auth rides ANTHROPIC_AUTH_TOKEN (Bearer) with ANTHROPIC_API_KEY empty — both
+# already handled by _apply_byo_claude, same shape as openrouter. Model ids verified
+# live the same day: qwen3.8-max answers on opus+sonnet tiers, qwen3.6-flash on the
+# haiku tier. No context-cap var is set deliberately: the harness has no per-provider
+# context knob, and a wrong one would silently TRUNCATE rather than error (the row's
+# open question, resolved as "don't guess"). Region availability re-checked 2026-08-07
+# (live probe + vendor confirmation): Token Plan is served ONLY from ap-southeast-1 —
+# token-plan.eu-central-1 answers 400 BadRequest.IllegalEndpoint ("Workspace endpoint
+# is invalid"), there is no eu-west-1 host, and us-east-1/cn-beijing reject the key
+# (separate key namespaces). There is NO EU Token Plan endpoint to switch to for
+# latency; EU-based boxes pay the ~170ms RTT to Singapore. Do not re-investigate
+# without a new signal (a region added upstream, or a workspace provisioned in it).
 declare -A CLAUDE_PROVIDER_BASEURL=(
   [deepseek]="https://api.deepseek.com/anthropic"
   [moonshot]="https://api.moonshot.ai/anthropic"
   [openrouter]="https://openrouter.ai/api"
+  [qwen]="https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic"
   [zai]="https://api.z.ai/api/anthropic"
 )
 declare -A CLAUDE_PROVIDER_OPUS_MODEL=(
   [deepseek]="deepseek-v4-pro"
   [moonshot]="kimi-k2.5"
   [openrouter]="anthropic/claude-opus-5"
+  [qwen]="qwen3.8-max"
   [zai]="glm-5.2"
 )
 declare -A CLAUDE_PROVIDER_SONNET_MODEL=(
   [deepseek]="deepseek-v4-pro"
   [moonshot]="kimi-k2.5"
   [openrouter]="anthropic/claude-sonnet-5"
+  [qwen]="qwen3.8-max"
   [zai]="glm-5-turbo"
 )
 declare -A CLAUDE_PROVIDER_HAIKU_MODEL=(
   [deepseek]="deepseek-v4-flash"
   [moonshot]="kimi-k2.5"
   [openrouter]="anthropic/claude-haiku-4.5"
+  [qwen]="qwen3.6-flash"
   [zai]="glm-4.5-air"
 )
+
+# claude_baseurl_catalog_provider <url> — reverse the CLAUDE_PROVIDER_BASEURL
+# catalog: echo the canonical vendor id that serves <url>, or nothing when no
+# row does. Empty output is the load-bearing answer: it means the url came from
+# somewhere other than this table — i.e. an operator's --base-url (DIVE-2757) —
+# which is the one value a re-derivation from the catalog must not silently
+# overwrite (DIVE-2809). Exit status is not the signal; read stdout.
+claude_baseurl_catalog_provider() {
+  local url="$1" cand
+  [[ -n "$url" ]] || return 0
+  for cand in "${!CLAUDE_PROVIDER_BASEURL[@]}"; do
+    if [[ "${CLAUDE_PROVIDER_BASEURL[$cand]}" == "$url" ]]; then
+      echo "$cand"; return 0
+    fi
+  done
+  return 0
+}
+
+# profile_env_value <profile> <VAR> — read one KEY=VALUE out of an auth
+# profile's combined.env without creating anything (the writer's counterpart is
+# profile_set_var in cmd_auth.sh, which is root-only and DOES create). Empty
+# output for an absent file, an absent profile or an unset var — a caller that
+# needs to tell those apart must check the file itself. Lives in header.sh
+# rather than next to the writer because the create path reads it in contexts
+# that do not source cmd_auth.sh.
+profile_env_value() {
+  local profile="$1" var="$2" file="${AUTH_PROFILES_DIR}/${1}/combined.env" v
+  [[ -n "$profile" && -r "$file" ]] || return 0
+  v=$(grep -E "^${var}=" "$file" 2>/dev/null | tail -1 | cut -d= -f2-) || v=""
+  v="${v%\"}"; v="${v#\"}"
+  printf '%s' "$v"
+}
 
 # Resolve a canonical UI id to the agent CLI's native provider id. Empty
 # result means the type doesn't support that vendor and the caller should
@@ -975,6 +1169,6 @@ require_loaded() {
   local ctx="$1" fn; shift
   for fn in "$@"; do
     declare -F "$fn" >/dev/null && continue
-    fail "$E_GENERIC" "${ctx}: required predicate '${fn}' is not loaded (src/lib/broker.sh missing from this build) — refusing rather than proceeding unchecked."
+    fail "$E_GENERIC" "${ctx}: required predicate '${fn}' is not loaded (src/lib/broker.sh missing from this build) — refusing"
   done
 }

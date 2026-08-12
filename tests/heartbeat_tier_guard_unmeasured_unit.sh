@@ -162,8 +162,17 @@ done
 # Extract the block between its two banner comments from an arbitrary source
 # TEXT, so the same harness can run the current tree and origin/main's pre-fix
 # copy without either being retyped here.
+# DIVE-2716 moved the block INSIDE a candidate loop, so the lines that used to
+# follow it (`# --- Same-account spread`) are now preceded by the loop's own
+# `break`/`done`, which do not eval standalone. The range therefore ends at an
+# explicit sentinel — and still accepts the old terminator, so the PINNED pre-fix
+# copy below (which has no sentinel) extracts exactly as it always did. Ending on
+# EITHER marker is what keeps the anchor comparing like with like.
 _extract_guard() {  # stdin = a cmd_heartbeat.sh body
-  awk '/# --- DIVE-1065 tier guard/ { on=1 } /# --- Same-account spread/ { on=0 } on { print }'
+  awk '/# --- DIVE-1065 tier guard/ { on=1 }
+       /# --- end DIVE-1065 tier guard/ { on=0 }
+       /# --- Same-account spread/ { on=0 }
+       on { print }'
 }
 
 # Build a decider function from a guard block. `continue` inside the block ends
@@ -310,7 +319,7 @@ fi
 # E. Structural — the shape must not come back, and DIVE-2210 must not move.
 # ---------------------------------------------------------------------------
 # No decision site may read isolation with its stderr swallowed again.
-bad_reads="$(grep -n "agents\[\$n\]\.isolation" src/cmd_heartbeat.sh src/cmd_task.sh 2>/dev/null || true)"
+bad_reads="$(grep -n "agents\[\$n\]\.isolation" src/cmd_heartbeat.sh src/cmd_task.sh src/task/*.sh 2>/dev/null || true)"
 eq_t "no raw isolation lookup left at the guard/show sites" "" "$bad_reads"
 
 # The guard must route through the predicate, not re-derive the polarity inline.

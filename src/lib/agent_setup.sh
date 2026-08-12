@@ -376,8 +376,11 @@ persona_target() { # persona_target <name> <type>
     warn "[$name] fix: probe a live seat, then add [$type]=<path-relative-to-\$HOME> to TYPE_PERSONA_FILE in src/header.sh — or install the doc by hand"
     # A deferred residual is only as durable as the ticket that holds it: name
     # the row so whoever hits this lands on it instead of re-deriving the gap.
-    [[ "$type" == "hermes" || "$type" == "openclaw" ]] \
-      && warn "[$name] hermes/openclaw are unmapped on purpose (never probe-verified) — tracked as DIVE-2245"
+    # DIVE-2245 probed hermes and openclaw and both are mapped above, so this
+    # names what is ACTUALLY still unmapped — devin, a registered type (TYPE_BIN,
+    # TYPE_AUTH, TYPE_INSTALL, channels row) that has never been probe-verified.
+    [[ "$type" == "devin" ]] \
+      && warn "[$name] devin is unmapped on purpose (never probe-verified) — tracked as DIVE-3129"
     return 1
   fi
   printf '%s\n' "${root}/agent-${name}/${rel}"
@@ -494,7 +497,8 @@ install_default_skill_for_agent() {
   local name="$1" type="$2" source="$3" skill="$4"
   local user="agent-${name}" home="/home/agent-${name}"
   local agent_id="${SKILLS_AGENT_ID[$type]:-claude-code}"
-  local install_dir="${SKILLS_INSTALL_DIR[$type]:-.claude/skills}"
+  local install_dir
+  install_dir=$(skills_install_dir "$type")
   # DIVE-2370: today every caller passes an internal template constant, so this is a
   # pre-emptive guard rather than a fix for a live hole HERE — recorded as such so nobody
   # reads it as an incident. It is still the right place for it: the sibling site in
@@ -604,7 +608,7 @@ install_channel_plugin_for_agent() {
   # SSH key configured. Explicit https URL sidesteps the shorthand
   # resolver entirely.
   local mkt_repo="https://github.com/anthropics/claude-plugins-official.git"
-  if [[ "$plugin" == "telegram" || "$plugin" == "dashboard" ]]; then
+  if [[ "$plugin" == "telegram" || "$plugin" == "dashboard" || "$plugin" == "buzz" ]]; then
     marketplace="5dive-plugins"
     mkt_repo="https://github.com/$(gh_org)/5dive-plugins.git"
   fi
@@ -1849,7 +1853,7 @@ PI_EXT
       sudo -u "$user" -H env PATH="$node_bin:/usr/bin:/bin" \
         pi remove "npm:${spec}" >/dev/null 2>&1 || true
       fail "$E_GENERIC" \
-        "pi default extension $spec failed to install or its npm integrity did not match the audited hash for $user (SECURITY: fail-closed). Check network to the npm registry, confirm $spec was not republished, or set FIVE_PI_DEFAULT_EXTENSIONS=0 to skip."
+        "pi extension $spec failed npm integrity for $user — check the registry, or set FIVE_PI_DEFAULT_EXTENSIONS=0"
     fi
   done
 }
@@ -1864,6 +1868,12 @@ install_channel_for_agent() {
   # poll-fork runtimes (codex/grok/agy/opencode) have no dashboard variant yet.
   if [[ "$plugin" == "dashboard" && "$type" != "claude" ]]; then
     fail "$E_VALIDATION" "channels=dashboard is claude-only (agent '$name' is type $type)"
+  fi
+  # DIVE-2895: same for buzz — it is a claude channel plugin (MCP notification
+  # inbound), and the poll-fork runtimes have no Buzz variant. Refuse here so
+  # the failure names the reason, rather than at 5dive-agent-start's dispatch.
+  if [[ "$plugin" == "buzz" && "$type" != "claude" ]]; then
+    fail "$E_VALIDATION" "channels=buzz is claude-only (agent '$name' is type $type)"
   fi
   case "$type" in
     claude)      install_channel_plugin_for_agent "$plugin" "$name" "$allowed_users" ;;
@@ -1904,7 +1914,8 @@ reconcile_managed_settings() {
         .channelsEnabled = true
       | .allowedChannelPlugins = ((.allowedChannelPlugins // []) as $have
           | $have + ([{"plugin":"telegram","marketplace":"5dive-plugins"},
-                      {"plugin":"dashboard","marketplace":"5dive-plugins"}]
+                      {"plugin":"dashboard","marketplace":"5dive-plugins"},
+                      {"plugin":"buzz","marketplace":"5dive-plugins"}]
               | map(select(. as $need
                   | ($have | any(.plugin == $need.plugin and .marketplace == $need.marketplace)) | not))))
       ' "$msj" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then

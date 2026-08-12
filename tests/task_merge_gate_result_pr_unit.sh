@@ -27,6 +27,20 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+
+# DIVE-2770: the merge gate gained a CREDENTIAL-FREE rail (an unauthenticated read
+# of a public repo). Every no-token arm below was written when "no credential"
+# meant "no rail", and with the anon rail live they would reach the real network
+# and grade a LIVE PR instead of the fixture. Turn it off here: these harnesses
+# grade the pre-2770 rails, and tests/task_merge_gate_anon_rail_unit.sh grades the
+# new one. This is also what keeps `no root, no network` true of this file.
+#
+# IT MUST SIT AFTER lib/grading_tree.sh, AND THAT IS NOT A STYLE CHOICE: that file
+# sources lib/env_isolation.sh, which CLEARS inherited FIVE_* knobs so a harness
+# never grades the caller's environment. Set above it, this export is wiped and the
+# harness silently reaches the network instead — measured, and it read as three
+# unrelated assertion failures naming a live PR's real state.
+export FIVE_GATE_NO_ANON=1
 trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
@@ -149,7 +163,14 @@ PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 # run `task done` capturing stdout+stderr and the exit code.
-run_done() { OUT=$(cmd_task_done "$@" 2>&1); RC=$?; }
+# DIVE-2096: these harnesses grade the PROSE text-binding gate (DIVE-1935/1965/2414),
+# which by definition is exercised with NO `delivery_ref` and no `Branch:` line — and
+# that is now exactly the shape the DIVE-2096 pre-close check refuses, before any of
+# this gate runs. It is not a coverage loss: after DIVE-2096 the prose gate is reached
+# by ASSERTING the reports-on case (`--no-pr`), so asserting it here is what keeps
+# these arms grading the same code as before. `--no-pr` is inert on the arms that DO
+# bind a delivery_ref, so it is applied at the wrapper rather than arm by arm.
+run_done() { OUT=$(cmd_task_done "$@" --no-pr 2>&1); RC=$?; }
 
 # --- 1. the reference extractor: NAMED equivalence fixtures --------------------
 # The extractor was rewritten from PCRE to POSIX ERE to delete a silent-empty

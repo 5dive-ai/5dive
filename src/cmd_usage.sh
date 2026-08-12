@@ -413,7 +413,7 @@ USAGE_JQ_HELPERS='
 # cmd_usage — entry point. Dispatches budget subcommand, else renders the board
 # (no agent arg) or a single-agent detail view.
 cmd_usage() {
-  # loops subcommand (DIVE-597): token spend aggregated over the LOOP-7
+  # loops subcommand: token spend aggregated over the
   # loop_runs table — the cost side of the loop control window. Read-only over
   # the shared (group-readable) tasks.db like `task loops`, so NO root needed —
   # handled before ensure_state's require_root.
@@ -563,6 +563,12 @@ usage_render_board() {
           else empty end ]
     | .[]' --argjson b "$budgets" <<<"$data" 2>/dev/null)
   [[ -n "$over" ]] && { echo; echo "$over"; }
+  # DIVE-2751: second instance of the same shape as cmd_task_show — this trailing
+  # conditional render is the last command in the last function `cmd_usage` calls,
+  # so `5dive usage` (the default board render; `usage board` parses "board" as an
+  # AGENT name) exited 1 whenever NO agent was over its budget, i.e. on
+  # the healthy path. Measured rc=1 on the installed CLI before this fix.
+  return 0
 }
 
 # usage_render_agent — one agent: per-model breakdown + its tasks in window.
@@ -920,6 +926,16 @@ cmd_usage_budget_check() {
     echo "budget check: ${checked} agent(s) — ${n_soft} soft, ${n_hard} at ceiling, ${n_stop} stopped$( ((dry)) && echo ' (dry-run)')"
     (( n_unknown > 0 )) && echo "  ⚠ ${n_unknown} NOT checked — transcripts unreadable from here, burn is unknown (not 0): ${unknown_names}"
   fi
+  # DIVE-2751 (found by main2 on iteration 1): third instance, and the one with a
+  # live caller. The test above is INVERTED relative to health — n_unknown == 0 is
+  # the GOOD state — so as the last statement of this branch it returned 1 on every
+  # healthy run. cmd_heartbeat.sh's `_hb_budget_sweep` does
+  #   out=$(cmd_usage_budget_check 2>/dev/null) || return 1
+  # so the budget sweep reported failure on every healthy tick and only "succeeded"
+  # when some agent's transcripts were unreadable. My first sweep missed this
+  # because its pattern required `[[ ]]` AND a braced block; this is `(( ))` and
+  # unbraced — see the widened guard in tests/task_show_exit_code_unit.sh.
+  return 0
 }
 
 # cmd_cost — DIVE-1019 budget-focused burn view. Reuses the usage plumbing: one

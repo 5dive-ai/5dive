@@ -53,6 +53,31 @@ _SUP_T_SLOW_MIN="${SUPERVISOR_T_SLOW_MIN:-10}"     # active work + no progress t
 # unhealthy signal instead. Same env-override escape hatch as the siblings above.
 _SUP_T_STRANDED_MIN="${SUPERVISOR_T_STRANDED_MIN:-45}"
 [[ "$_SUP_T_STRANDED_MIN" =~ ^[0-9]+$ ]] || _SUP_T_STRANDED_MIN=45
+# DIVE-3272: every signal above measures LIVENESS — is the unit up, is the tmux
+# session there, is the poller running, is a transcript still being appended to.
+# NONE of them measures OUTPUT. dev3 sat on an expired Qwen 1-week quota for four
+# days: the unit was active, tmux was alive, the transcript moved on every wake,
+# and the seat KEPT CLAIMING ROWS — so it read `healthy / active` throughout while
+# 20 rows, including a whole urgent lane, queued behind it. It was found only
+# because a human eyeballed queue depth. A seat that claims work and completes
+# none is indistinguishable from a seat that is working; this is the knob that
+# tells them apart. Days, not minutes: the longest legitimate drought (one seat
+# grinding a single hard multi-day row) must clear it, so the bias stays
+# FALSE-NEGATIVE like every other threshold in this file.
+_SUP_T_NO_OUTPUT_DAYS="${SUPERVISOR_T_NO_OUTPUT_DAYS:-3}"
+[[ "$_SUP_T_NO_OUTPUT_DAYS" =~ ^[0-9]+$ ]] || _SUP_T_NO_OUTPUT_DAYS=3
+# DIVE-3272: a model-capacity error in a seat's pane is a FLEET-health event, not
+# that seat's private problem — the cost is borne by every row queued behind it.
+# Nothing scraped for one before this. Pane-scoped for the same reason the
+# DIVE-1127 verify tripwire is: it is a harness-rendered error on the current
+# screen, not something the transcript records. Same false-positive exposure too
+# — an agent DISCUSSING a 429 (this very task's body quotes one) can trip it — so
+# the alert names the matched line and the recipient can dismiss it in one look.
+# Env-overridable so a new provider's phrasing is tunable without a release.
+_SUP_QUOTA_PANE_LINES="${SUPERVISOR_QUOTA_PANE_LINES:-40}"
+[[ "$_SUP_QUOTA_PANE_LINES" =~ ^[0-9]+$ ]] || _SUP_QUOTA_PANE_LINES=40
+_SUP_QUOTA_PAT="${SUPERVISOR_QUOTA_PAT:-}"
+[[ -n "$_SUP_QUOTA_PAT" ]] || _SUP_QUOTA_PAT='(api[[:space:]]+error|request[[:space:]]+rejected)[^|]{0,60}429|quota[[:space:]]+(has[[:space:]]+been[[:space:]]+)?exhausted|exhausted[[:space:]]+your[[:space:]]+(token|weekly|monthly)|hit[[:space:]]+your[[:space:]]+(monthly|weekly|daily)[[:space:]]+spend[[:space:]]+limit|usage[[:space:]]+limit[[:space:]]+reached|insufficient_quota|credit[[:space:]]+balance[[:space:]]+is[[:space:]]+too[[:space:]]+low'
 # Ignore a missing poller right after a service start — the plugin's bun server
 # takes a moment to boot, and a false poller-dead there would flag every
 # freshly-restarted agent.
@@ -169,6 +194,312 @@ _sup_verify_challenge() {  # <type> <user> <sess> <svc_running>
   printf '%s\n' "$pane" | _sup_verify_match
 }
 
+# DIVE-3272: pure signature match, no I/O — echoes the first pane line that looks
+# like a model-capacity/quota refusal, empty otherwise. Split out from
+# _sup_quota_pane for the same reason _sup_verify_match is: the false-positive-
+# critical regex has to be unit-testable without a live tmux.
+_sup_quota_match() {  # <pane-text-on-stdin>
+  grep -iE "$_SUP_QUOTA_PAT" 2>/dev/null | head -1 \
+    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-160
+}
+
+# DIVE-3272: does this agent's live pane show a capacity refusal? Root-only (the
+# sudo tmux hop) and running-service-only; anything else returns empty
+# (false-negative bias, like every other probe here). Deliberately NOT
+# claude-only — the incident seat was a qwen profile, and a quota wall is the one
+# failure every runtime shares.
+_sup_quota_pane() {  # <user> <sess> <svc_running>
+  local user="$1" sess="$2" svc_running="$3"
+  (( svc_running )) && [[ $EUID -eq 0 ]] || return 0
+  local pane
+  pane=$(sudo -n -u "$user" tmux capture-pane -p -t "$sess" -S "-${_SUP_QUOTA_PANE_LINES}" 2>/dev/null) || return 0
+  [[ -n "$pane" ]] || return 0
+  printf '%s\n' "$pane" | _sup_quota_match
+}
+
+# DIVE-3272: the OUTPUT signal — the one thing no probe above measures, read from
+# the store that was holding the answer the whole time, unread. Echoes
+# "<open-rows>|<days-since-last-close>"; the second is -1 when this seat has
+# never closed anything (unknown age => never classifies on its own, so a
+# brand-new seat can't be flagged for having produced nothing yet).
+_sup_output_stats() {  # <name>
+  local name="$1" open last days=-1
+  open=$(db "SELECT COUNT(*) FROM tasks
+             WHERE assignee=$(sqlq "$name") AND status IN ('todo','in_progress')
+               AND kind='standard';" 2>/dev/null || echo 0)
+  [[ "$open" =~ ^[0-9]+$ ]] || open=0
+  # done_at stamps BOTH terminal states, and a cancel is output too — a decision
+  # recorded is work done. Counting only status='done' would flag a seat that
+  # spent the window legitimately triaging its queue to empty.
+  last=$(db "SELECT CAST((julianday('now') - julianday(MAX(done_at))) AS INTEGER)
+             FROM tasks WHERE assignee=$(sqlq "$name") AND done_at IS NOT NULL;" 2>/dev/null || echo "")
+  [[ "$last" =~ ^[0-9]+$ ]] && days="$last"
+  printf '%s|%s\n' "$open" "$days"
+}
+
+# ── DIVE-3274: the same two facts, on the surface people actually type ────────
+#
+# DIVE-3272 taught the supervisor BOARD to see a seat that is up and closing
+# nothing. `agent info` — the drill-down people actually type — kept printing
+# only the systemd/registry LIVENESS label, so the defect survived there intact:
+# a dark seat and a working one printed the same `state: active / enabled`. Four
+# people trusted that line about dev3 for four days
+# (community/wiki/every-signal-measured-liveness-none-measured-output.md).
+#
+# The two capacity classes are NOT equally measurable from this surface, and the
+# overlay says which is which rather than flattening them into one confident
+# label:
+#
+#   no-output        A PURE STORE READ. `info` re-runs _sup_output_stats itself,
+#                    so this half is MEASURED at print time — it holds on a box
+#                    where the tick has never run, and it cannot go stale.
+#   quota-exhausted  Needs a root `tmux capture-pane` hop. `info` is read-only
+#                    and runs as any seat (ensure_state_ro), so it must not grow
+#                    one; this half is INHERITED from the event trail. It is
+#                    therefore printed WITH its age and the tick's arm state and
+#                    never as a bare classification — an unmeasured branch has
+#                    to say less than the measured one (DIVE-2793), and an
+#                    unarmed monitor otherwise prints exactly what a quiet one
+#                    prints (DIVE-2306). That is the same defect one level up:
+#                    silence from an instrument nobody armed reading as an
+#                    all-clear is how this class hides in the first place.
+#
+# Freshness is decided by COMPARING the agent's newest row against the newest
+# fleet heartbeat, not by a wall-clock guess: the tick writes an `observe` row
+# EVERY tick for every non-healthy class (see cmd_supervisor_tick), so an agent
+# whose newest row predates the newest heartbeat was looked at and found
+# healthy. No row at all + no heartbeat at all is `unobserved`, which is a third
+# value on purpose — it must not read as either healthy or dry.
+# How long before the OBSERVER ITSELF is stale. `healthy` derived from a tick
+# that stopped running is the absence-reads-as-health shape this row exists to
+# remove (main, at the DIVE-3274 push approval), so past this bound the overlay
+# reports `unobserved` and names the age: the recorded reading is not refuted,
+# it is simply no longer current, and a surface that cannot tell those apart is
+# the defect. 1h is 6x the shipped `*/10` cron. Env-overridable in the house
+# style because `info` CANNOT see the cron that drives the tick — a box on a
+# slower schedule would otherwise read `unobserved` forever, which is honest but
+# useless, and the knob is cheaper than a wrong constant.
+_SUP_INFO_TICK_STALE="${SUPERVISOR_INFO_TICK_STALE_SECS:-3600}"
+[[ "$_SUP_INFO_TICK_STALE" =~ ^[0-9]+$ ]] || _SUP_INFO_TICK_STALE=3600
+_SUP_INFO_TICK_TOL=120   # seconds. Per-agent rows are written BEFORE the fleet
+                         # heartbeat that closes the tick, so a row from the SAME
+                         # tick carries an EARLIER ts (measured: 1s). Without a
+                         # tolerance every current row would read as stale. Kept
+                         # well under the shortest sane tick interval so a row
+                         # from the PREVIOUS tick can never read as current.
+
+# Pure render of the `agent info` supervisor overlay — NO I/O, so a test can
+# assert every branch without a store, a tick or a tmux (same factoring as
+# _sup_classify / _sup_act_plan). Echoes one compact JSON object.
+# args: armed(true/false) tick_epoch row_epoch now
+#       rec_class rec_cause rec_detail open_rows days_since_close(-1 = never)
+#       store_readable(true/false)
+_sup_info_status() {
+  local armed="$1" tick="${2:-0}" row="${3:-0}" now="${4:-0}" \
+        rc="${5:-}" rcause="${6:-}" rdetail="${7:-}" open="${8:-0}" days="${9:--1}" \
+        store="${10:-true}"
+  [[ "$store" == "false" ]] || store="true"
+  [[ "$tick" =~ ^[0-9]+$ ]] || tick=0
+  [[ "$row"  =~ ^[0-9]+$ ]] || row=0
+  [[ "$now"  =~ ^[0-9]+$ ]] || now=0
+  [[ "$open" =~ ^[0-9]+$ ]] || open=0
+  [[ "$days" =~ ^-?[0-9]+$ ]] || days=-1
+  [[ "$armed" == "true" ]] || armed="false"
+
+  # --- the half this surface MEASURES for itself, at print time ---------------
+  # The PAIR is the detector; neither number means anything alone (0 open rows
+  # and no closes is a correctly idle seat, 20 open rows and a close this
+  # morning is a busy one), which is why each branch below reports both.
+  local output transacting note
+  if [[ "$store" != "true" ]]; then
+    # NOTHING was read. This branch exists because its absence was the same bug
+    # one level down: with the store unreadable the counters fall back to
+    # 0-open/never-closed, which renders as the perfectly benign "no open rows,
+    # nothing ever closed" — a measurement this surface did not take, printed in
+    # the voice of one it did. Caught end-to-end on a TASKS_DB pointed at a
+    # missing path, not by reading the code.
+    output="unmeasured"; transacting="null"
+    note="the task store was not readable from here — NOTHING was measured (not a clear)"
+  elif (( days < 0 )); then
+    # Never closed anything. Must read unknown, not infinitely dry, or every
+    # newly created agent is flagged on day one and the alarm is trained out of
+    # the fleet inside a week (DIVE-3272).
+    output="unknown"; transacting="null"
+    if (( open > 0 )); then
+      note="${open} open row(s) and has NEVER closed anything — a new seat and a dark one read the same here"
+    else
+      note="no open rows, nothing ever closed"
+    fi
+  elif (( days < _SUP_T_NO_OUTPUT_DAYS )); then
+    output="ok"; transacting="true"
+    note="${open} open row(s), last close ${days}d ago"
+  elif (( open == 0 )); then
+    output="idle"; transacting="null"
+    note="no open rows, last close ${days}d ago — correctly idle, not dry"
+  else
+    output="dry"; transacting="false"
+    note="${open} open row(s), nothing closed in ${days}d"
+  fi
+
+  # --- the half it INHERITS from the trail ------------------------------------
+  local cls="$rc" cause="$rcause" detail="$rdetail" current=false
+  (( row > 0 && tick > 0 && row + _SUP_INFO_TICK_TOL >= tick )) && current=true
+  if [[ "$store" != "true" ]]; then
+    cls="unobserved"; cause=""; detail=""; current=false
+  elif [[ "$armed" != "true" ]]; then
+    # The flag gates the whole tick. Whatever sits in the trail is not being
+    # refreshed, so it cannot be quoted as a current reading at any age.
+    cls="unobserved"; cause=""; detail=""
+  elif (( tick > 0 && now > tick && now - tick > _SUP_INFO_TICK_STALE )); then
+    # The observer itself has stopped. Whatever the trail says — including
+    # nothing — is a reading from a dead instrument, so it cannot be forwarded as
+    # either a class or a clear.
+    cls="unobserved"; cause=""; detail=""; current=false
+  elif [[ "$current" != "true" ]]; then
+    # The newest tick looked at this agent and wrote no row. The tick writes an
+    # `observe` row EVERY tick for EVERY non-healthy class, so that silence is a
+    # positive reading and not an absence.
+    if (( tick > 0 )); then cls="healthy"; cause=""; detail=""
+    else cls="unobserved"; cause=""; detail=""; fi
+  fi
+  [[ -n "$cls" ]] || cls="unobserved"
+
+  # --- the escalation: what the state line may NOT omit -----------------------
+  # Only the "up and reachable but not transacting" classes. A `stuck` seat is
+  # already visible in `state:` itself (the unit is down); these three are the
+  # ones every liveness signal reads green through.
+  local verdict=""
+  case "$cls" in quota-exhausted|verify-challenge|no-output) verdict="$cls" ;; esac
+  [[ -z "$verdict" && "$output" == "dry" ]] && verdict="no-output"
+
+  local state_note sup_line
+  case "$verdict" in
+    "") case "$output" in
+          ok)         state_note="transacting (last close ${days}d ago)" ;;
+          idle)       state_note="idle — no open rows (last close ${days}d ago)" ;;
+          unmeasured) state_note="output UNMEASURED — task store unreadable from here" ;;
+          *)          state_note="output unknown — ${note}" ;;
+        esac ;;
+    no-output) state_note="⚠ NOT TRANSACTING (no-output: ${note})" ;;
+    *)         state_note="⚠ NOT TRANSACTING (${cls}${detail:+: ${detail}})" ;;
+  esac
+
+  local age_s=$(( now > row && row > 0 ? now - row : -1 ))
+  local tick_age_s=$(( now > tick && tick > 0 ? now - tick : -1 ))
+  if [[ "$store" != "true" ]]; then
+    sup_line="unobserved — the task store was not readable from here, so NEITHER the event trail nor the output counters were read (this is not an all-clear)"
+  elif [[ "$armed" != "true" ]]; then
+    sup_line="unobserved — the tick is NOT ARMED on this box, so nothing refreshes this"
+    sup_line="${sup_line} (enable: sudo touch ${_SUP_ENABLED_FLAG})"
+  elif (( tick > 0 && now > tick && now - tick > _SUP_INFO_TICK_STALE )); then
+    sup_line="unobserved — the last supervisor tick completed $(_sup_info_ago "$tick_age_s") ago and nothing has refreshed this since"
+    (( row > 0 )) && sup_line="${sup_line}; newest recorded row for this agent: ${rc:-none} ($(_sup_info_ago "$age_s") ago)"
+  elif (( tick > 0 )); then
+    sup_line="${cls}${cause:+ / ${cause}}${detail:+ — ${detail}}"
+    sup_line="${sup_line} (tick $(_sup_info_ago "$tick_age_s") ago)"
+  else
+    sup_line="unobserved — armed, but no tick has completed yet on this box"
+  fi
+
+  jq -cn \
+    --arg cls "$cls" --arg cause "$cause" --arg detail "$detail" \
+    --arg output "$output" --arg note "$note" --arg verdict "$verdict" \
+    --arg stateNote "$state_note" --arg supLine "$sup_line" \
+    --argjson armed "$armed" --argjson current "$current" --argjson store "$store" \
+    --argjson transacting "$transacting" \
+    --argjson open "$open" --argjson days "$days" \
+    --argjson thresh "$_SUP_T_NO_OUTPUT_DAYS" \
+    --argjson age "$age_s" --argjson tickAge "$tick_age_s" \
+    '{
+       # MEASURED here, every call, with no dependency on the tick.
+       # "unmeasured" is a FOURTH output value and is never folded into one of
+       # the other three: an unread store must not print in the voice of a read
+       # one.
+       storeReadable: $store,
+       output: $output,
+       transacting: $transacting,          # null == unknown, never false
+       openRows: $open,
+       daysSinceClose: (if $days < 0 then null else $days end),
+       thresholdDays: $thresh,
+       # INHERITED from the trail — only as fresh as the tick that wrote it.
+       classification: $cls,
+       cause: (if $cause == "" then null else $cause end),
+       detail: (if $detail == "" then null else $detail end),
+       observedAgeSec: (if $age < 0 then null else $age end),
+       tickArmed: $armed,
+       tickAgeSec: (if $tickAge < 0 then null else $tickAge end),
+       fromCurrentTick: $current,
+       # The two rendered strings `agent info` prints, so the phrasing is
+       # asserted by the unit test and not re-derived in a jq program.
+       verdict: (if $verdict == "" then null else $verdict end),
+       stateNote: $stateNote,
+       line: $supLine,
+       note: $note
+     }'
+}
+
+# "4d" / "3h" / "12m" / "45s" — an age a reader can act on without doing
+# arithmetic. -1 (unknown) prints "?".
+_sup_info_ago() {
+  local s="${1:--1}"
+  [[ "$s" =~ ^[0-9]+$ ]] || { printf '?'; return 0; }
+  if   (( s >= 86400 )); then printf '%dd' $(( s / 86400 ))
+  elif (( s >= 3600 ));  then printf '%dh' $(( s / 3600 ))
+  elif (( s >= 60 ));    then printf '%dm' $(( s / 60 ))
+  else                        printf '%ds' "$s"; fi
+}
+
+# I/O half: gather this agent's overlay from the store + the arm flag, then hand
+# the numbers to the pure renderer. Best-effort by construction — every read is
+# guarded and an unreadable store degrades to `unobserved` + `output unknown`,
+# never to a confident all-clear and never to a failed `agent info`.
+sup_info_for_agent() {  # <name>
+  local name="$1" armed="false" tick=0 row=0 now rc="" rcause="" rdetail="" open=0 days=-1 \
+        store="false"
+  now=$(date +%s)
+  [[ -f "$_SUP_ENABLED_FLAG" ]] && armed="true"
+  # A store this seat cannot read is NOT zero rows and no closes. Probe it with
+  # a query that has a known-nonempty answer on any initialised store, so the
+  # difference between "read it, nothing there" and "never read it" survives to
+  # the renderer instead of collapsing into the benign-looking default.
+  [[ -s "$TASKS_DB" ]] \
+    && [[ "$(db "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks' LIMIT 1;" 2>/dev/null || echo "")" == "1" ]] \
+    && store="true"
+  if [[ "$store" == "true" ]]; then
+    local ostats; ostats=$(_sup_output_stats "$name" 2>/dev/null || echo "0|-1")
+    open="${ostats%%|*}"; days="${ostats##*|}"
+    tick=$(db "SELECT COALESCE(strftime('%s', MAX(ts)), 0) FROM supervisor_events
+               WHERE agent='(fleet)' AND event='heartbeat';" 2>/dev/null || echo 0)
+    local r
+    r=$(db "SELECT COALESCE(strftime('%s', ts), 0) || char(31) || classification
+                   || char(31) || COALESCE(cause,'') || char(31)
+                   || COALESCE(json_extract(signals, '\$.detail'), '')
+            FROM supervisor_events WHERE agent=$(sqlq "$name")
+            ORDER BY id DESC LIMIT 1;" 2>/dev/null || echo "")
+    IFS=$'\x1f' read -r row rc rcause rdetail <<<"$r"
+  fi
+  _sup_info_status "$armed" "$tick" "$row" "$now" "$rc" "$rcause" "$rdetail" "$open" "$days" "$store"
+}
+
+# DIVE-3272: a seat that cannot transact is a FLEET-health event. The entire cost
+# of the incident was the 20 rows queued behind a seat nobody knew was dark, so
+# the alert leads with that and not with the seat's own symptom. Same delivery
+# shape as _sup_verify_alert — both legs best-effort, because one wedged channel
+# must never abort the tick for the rest of the fleet — and the caller owns the
+# dedup window.
+_sup_capacity_alert() {  # <name> <class> <detail>
+  local name="$1" class="$2" detail="$3"
+  local msg="[FLEET-HEALTH ${class}] agent '${name}' is UP and REACHABLE but NOT TRANSACTING: ${detail}. Every liveness signal (unit / tmux / poller / registry label) reads healthy — that agreement is the DIVE-3272 defect, not evidence against this alert. Check the seat's model capacity (auth-profile, quota reset) and reassign or park whatever is queued behind it."
+  5dive agent send main "$msg" >/dev/null 2>&1 \
+    || warn "capacity-alert: 'agent send main' failed for $name (alert still audited)"
+  # lodar is a human — reached through main's paired channel, same route the
+  # verify tripwire uses. Best-effort: a miss still leaves the agent-send leg
+  # and the audited alert row.
+  if _task_agent_channel main; then
+    _task_send_owner "$msg" >/dev/null 2>&1 || true
+  fi
+}
+
 # DIVE-1127: fire the same-day alert for a tripped account. Both legs are
 # best-effort — a delivery failure must NEVER abort the tick (one wedged account
 # can't blind the watcher for the rest of the fleet). main (CTO, D4 runbook
@@ -234,7 +565,7 @@ _sup_goal_drift() {  # <type> <home> <name> <now> <act_epoch>
 
 _sup_usage() {
   cat <<USAGE
-5dive supervisor — observe-only fleet health board (DIVE-724 P1)
+5dive supervisor — observe-only fleet health board ( P1)
 
   5dive supervisor                 # per-agent board: detect + classify, zero actions
   5dive supervisor --watch[=secs]  # live repaint (default 5s; q quits)
@@ -247,20 +578,25 @@ Classification (conservative — see docs/fleet-supervisor-design.md §4):
   healthy         running + progressing, or legitimately idle/stopped with no active work
   slow            active work but no transcript progress for ${_SUP_T_SLOW_MIN}m+ — recorded, never acted on
   update-pending  box CLI is behind the published release — an update signal, NOT
-                  a wedged agent (cause: stale-cli); recorded, NEVER acted on (DIVE-974)
+                  a wedged agent (cause: stale-cli); recorded, NEVER acted on
   stuck           service/tmux/poller dead, a loop self-flagged stuck, or no progress
                   for ${_SUP_T_STUCK_MIN}m+ with active work
                   (cause: service-dead|tmux-dead|poller-dead|loop-stuck|no-progress)
   drift           active /goal targets a still-todo DIVE task while the agent
                   progresses elsewhere (cause: goal-drift) — recorded, NEVER acted on
+  no-output       holds open row(s) and has closed NOTHING for ${_SUP_T_NO_OUTPUT_DAYS}d+
+                  (cause: no-output) — the seat is claiming work and completing
+                  none, which every liveness signal reads as "active"; alerts
+  quota-exhausted pane shows a model-capacity/quota refusal (cause:
+                  quota-exhausted) — a fleet event, not the seat's own; alerts
   stalled         NO active work (no in_progress, no running loop) but a todo
                   task has sat assigned to this agent, untouched, for
-                  ${_SUP_T_STRANDED_MIN}m+ (cause: idle-stranded) — DIVE-1416 gap#3:
+                  ${_SUP_T_STRANDED_MIN}m+ (cause: idle-stranded) — gap#3:
                   "idle" alone used to read as healthy even while actionable
                   work was stranded; recorded, NEVER acted on (observe-only,
                   same as slow/drift/update-pending)
 
-Poller + activity signals cover claude/codex/grok/antigravity/opencode (DIVE-971).
+Poller + activity signals cover claude/codex/grok/antigravity/opencode.
 P1 takes ZERO recovery actions. Add --json to any form for machine output.
 USAGE
 }
@@ -277,6 +613,10 @@ _SUP_CLI_BEHIND="unknown"
 _SUP_CLI_STALE="unknown"
 _SUP_CLI_FROZEN="unknown"
 _SUP_CLI_FROZEN_DETAIL=""
+# DIVE-2306: three-state strings, like BEHIND/STALE above and for the same
+# reason — "we did not measure it" is not "false".
+_SUP_CLI_AHEAD="unknown"
+_SUP_CLI_FROZEN_ARMED="unknown"
 _sup_cli_check() {
   (( _SUP_CLI_CHECKED )) && return 0
   _SUP_CLI_CHECKED=1
@@ -295,6 +635,10 @@ _sup_cli_check() {
   mapfile -t fz < <(_cli_freeze_observe "$FIVE_VERSION" "${STATE_DIR}/cli-version-seen.json")
   _SUP_CLI_FROZEN="${fz[0]:-unknown}"
   _SUP_CLI_FROZEN_DETAIL="${fz[2]:-}"
+  # DIVE-2306: an `unknown` freeze reading from a box that cannot record the
+  # observation is not a monitor waiting for data — it is a monitor that will
+  # never have any. The board has to be able to tell those apart.
+  case "${fz[3]:-}" in yes) _SUP_CLI_FROZEN_ARMED="true" ;; no) _SUP_CLI_FROZEN_ARMED="false" ;; esac
   # DIVE-2042: the published version is read through _published_cli_probe, which
   # pins both fetches to one immutable sha and verifies the bundle against its
   # own checksum. Anything short of a CONSISTENT read leaves staleness UNKNOWN
@@ -313,9 +657,15 @@ _sup_cli_check() {
   _SUP_CLI_LATEST="$latest"
   if ! version_lt "$FIVE_VERSION" "$latest"; then
     _SUP_CLI_BEHIND="false"; _SUP_CLI_STALE="false"
+    # DIVE-2306: `update --check` has reported `ahead` as its own state since
+    # DIVE-2287; the board folded it into this not-behind branch, so the one
+    # surface the dashboard reads could not show it. A box above the newest
+    # release is the state DIVE-2243's guard refuses every upgrade from — the
+    # installer will say so and the board should not disagree by silence.
+    if version_lt "$latest" "$FIVE_VERSION"; then _SUP_CLI_AHEAD="true"; else _SUP_CLI_AHEAD="false"; fi
     return 0
   fi
-  _SUP_CLI_BEHIND="true"
+  _SUP_CLI_BEHIND="true"; _SUP_CLI_AHEAD="false"
   # Same nightly-log heuristic as cmd_update_check: a healthy recent nightly
   # means the gap closes on its own (behind-but-fine); a failed/absent/old one
   # means the box is genuinely running old code.
@@ -355,11 +705,12 @@ _sup_cli_check() {
 # stdout so a test can assert against it without stubbing systemctl/tmux/pgrep.
 # args: desired svc_running(0/1) active sess tmux_state poller loop_stuck
 #       has_work(0/1) act_age cli_stale(true/false/unknown) goal_drift_task
-#       verify_excerpt stranded
+#       verify_excerpt stranded open_rows no_output_days quota_excerpt
 _sup_classify() {
   local desired="$1" svc_running="$2" active="$3" sess="$4" tmux_state="$5" poller="$6" \
         loop_stuck="$7" has_work="$8" act_age="$9" cli_stale="${10}" goal_drift_task="${11}" \
-        verify_excerpt="${12}" stranded="${13:-0}"
+        verify_excerpt="${12}" stranded="${13:-0}" \
+        open_rows="${14:-0}" no_output_days="${15:--1}" quota_excerpt="${16:-}"
   local class="healthy" cause="" detail=""
   # DIVE-1127: the verification-challenge tripwire wins FIRST — it is the highest
   # priority signal (same-day alert obligation) and, when present, explains any
@@ -382,10 +733,26 @@ _sup_classify() {
     class="stuck"; cause="tmux-dead"; detail="unit active but tmux session '${sess}' gone"
   elif [[ "$poller" == "dead" ]]; then
     class="stuck"; cause="poller-dead"; detail="telegram poller process not running"
+  elif [[ -n "$quota_excerpt" ]]; then
+    # DIVE-3272: placed ABOVE loop-stuck / no-progress on purpose — a capacity
+    # wall EXPLAINS both of those, and the response is different in kind (a
+    # profile flip or a quota reset, not a nudge/resume). Below the dead-signal
+    # branches because a down unit is the more specific reading.
+    class="quota-exhausted"; cause="quota-exhausted"
+    detail="pane shows a model-capacity refusal: ${quota_excerpt}"
   elif (( loop_stuck > 0 )); then
     class="stuck"; cause="loop-stuck"; detail="${loop_stuck} running loop(s) self-flagged stuck"
   elif (( has_work )) && (( act_age >= 0 )) && (( act_age >= _SUP_T_STUCK_MIN * 60 )); then
     class="stuck"; cause="no-progress"; detail="active work, no transcript progress for $((act_age / 60))m"
+  elif (( no_output_days >= 0 )) && (( no_output_days >= _SUP_T_NO_OUTPUT_DAYS )) && (( open_rows > 0 )); then
+    # DIVE-3272: the output drought. Ranked BELOW the hard dead signals — those
+    # are more specific and already surface — but ABOVE stale-cli / slow / drift
+    # / active, because a multi-day drought outranks a ten-minute progress gap
+    # and a box-level update notice, and because the branch it has to beat is
+    # the one that hid the incident: `has_work -> detail="active"`. A seat that
+    # is claiming rows and closing none must not print as active.
+    class="no-output"; cause="no-output"
+    detail="${open_rows} open row(s), nothing closed in ${no_output_days}d"
   elif [[ "$cli_stale" == "true" ]]; then
     # Box-level: the shared CLI is behind AND the nightly isn't catching up
     # (the /tmp-clobber class) — every agent is executing old code. Requires a
@@ -496,6 +863,19 @@ _sup_agent_record() {
   # --- signal: ID/age-verification challenge (DIVE-1127) — pane-scoped tripwire ---
   local verify_excerpt; verify_excerpt=$(_sup_verify_challenge "$type" "$user" "$sess" "$svc_running")
 
+  # --- signal: model-capacity refusal in the live pane (DIVE-3272) ---
+  local quota_excerpt; quota_excerpt=$(_sup_quota_pane "$user" "$sess" "$svc_running")
+
+  # --- signal: OUTPUT (DIVE-3272) — open rows held, and days since this seat
+  # last closed anything. The pair is the detector: either number alone is
+  # meaningless (0 open rows and no closes is a correctly idle seat; 20 open
+  # rows and a close this morning is a busy one).
+  local open_rows=0 no_output_days=-1 ostats
+  ostats=$(_sup_output_stats "$name")
+  open_rows="${ostats%%|*}"; no_output_days="${ostats##*|}"
+  [[ "$open_rows"      =~ ^[0-9]+$ ]]  || open_rows=0
+  [[ "$no_output_days" =~ ^-?[0-9]+$ ]] || no_output_days=-1
+
   # --- signal: stranded todo (DIVE-1416 gap#3) — a todo task assigned to this
   # agent, sitting untouched (never started) past the stranded window. Only
   # matters when the agent has NO active work at all (_sup_classify only
@@ -509,7 +889,8 @@ _sup_agent_record() {
   local class cause detail crow
   crow=$(_sup_classify "$desired" "$svc_running" "$active" "$sess" "$tmux_state" "$poller" \
                         "$loop_stuck" "$has_work" "$act_age" "$_SUP_CLI_STALE" "$goal_drift_task" \
-                        "$verify_excerpt" "$stranded")
+                        "$verify_excerpt" "$stranded" \
+                        "$open_rows" "$no_output_days" "$quota_excerpt")
   IFS=$'\x1f' read -r class cause detail <<<"$crow"
 
   jq -cn \
@@ -521,6 +902,8 @@ _sup_agent_record() {
     --argjson stranded "$stranded" \
     --arg goalDrift "$goal_drift_task" \
     --arg verifyExcerpt "$verify_excerpt" \
+    --arg quotaExcerpt "$quota_excerpt" \
+    --argjson openRows "$open_rows" --argjson noOutputDays "$no_output_days" \
     --arg class "$class" --arg cause "$cause" --arg detail "$detail" \
     '{name:$name, type:$type, channels:$channels, unit:$unit,
       signals:{service:$service, sub:$sub, uptimeSec:$uptime, tmux:$tmux, poller:$poller,
@@ -528,7 +911,10 @@ _sup_agent_record() {
                lastActivityAgeSec:(if $age < 0 then null else $age end),
                strandedTodo:$stranded,
                goalDriftTask:(if $goalDrift == "" then null else ($goalDrift|tonumber) end),
-               verifyChallenge:(if $verifyExcerpt == "" then null else $verifyExcerpt end)},
+               verifyChallenge:(if $verifyExcerpt == "" then null else $verifyExcerpt end),
+               openRows:$openRows,
+               daysSinceLastClose:(if $noOutputDays < 0 then null else $noOutputDays end),
+               quotaSignature:(if $quotaExcerpt == "" then null else $quotaExcerpt end)},
       classification:$class,
       cause:(if $cause == "" then null else $cause end),
       detail:$detail}'
@@ -587,7 +973,8 @@ _sup_render_board() {
 _sup_summary_line() {
   local snap="$1"
   jq -r --arg stale "$_SUP_CLI_STALE" --arg cur "$FIVE_VERSION" --arg lat "$_SUP_CLI_LATEST" \
-        --arg frozen "$_SUP_CLI_FROZEN" --arg frozendet "$_SUP_CLI_FROZEN_DETAIL" '
+        --arg frozen "$_SUP_CLI_FROZEN" --arg frozendet "$_SUP_CLI_FROZEN_DETAIL" \
+        --arg ahead "$_SUP_CLI_AHEAD" --arg armed "$_SUP_CLI_FROZEN_ARMED" '
     "\(length) agents — " +
     "\([.[] | select(.classification == "healthy")]        | length) healthy / " +
     "\([.[] | select(.classification == "slow")]           | length) slow / " +
@@ -595,15 +982,29 @@ _sup_summary_line() {
     "\([.[] | select(.classification == "update-pending")] | length) update-pending / " +
     "\([.[] | select(.classification == "stalled")]        | length) stalled / " +
     "\([.[] | select(.classification == "stuck")]          | length) stuck" +
+    (if ([.[] | select(.classification == "no-output")] | length) > 0
+     then " · ⚠ \([.[] | select(.classification == "no-output")] | length) NO-OUTPUT" else "" end) +
+    (if ([.[] | select(.classification == "quota-exhausted")] | length) > 0
+     then " · ⚠ \([.[] | select(.classification == "quota-exhausted")] | length) QUOTA-EXHAUSTED" else "" end) +
     (if ([.[] | select(.classification == "verify-challenge")] | length) > 0
      then " · ⚠ \([.[] | select(.classification == "verify-challenge")] | length) VERIFY-CHALLENGE" else "" end) +
     (if $stale == "true" then " · CLI \($cur) STALE (latest \($lat))"
      elif $stale == "unknown" then " · CLI staleness unknown (probe unavailable)"
      else " · CLI \($cur) ok" end) +
+    # DIVE-2306: `ahead` was reachable only from `update --check`. It is the
+    # state the installer refuses to move, so a board that renders "CLI ok" for
+    # it contradicts the installer without either of them being wrong.
+    (if $ahead == "true" then " · ⚠ CLI \($cur) AHEAD of release \($lat) — the installer will refuse (a release cut is owed)"
+     else "" end) +
     # DIVE-2287: appended, never substituted. A frozen fleet reads "CLI ok" on
     # the staleness half — that IS the failure — so this line has to be able to
     # say "ok" and "FROZEN" in the same breath.
     (if $frozen == "frozen" then " · ⚠ FLEET FROZEN: \($frozendet) — no release has reached this box; check the release cutter"
+     else "" end) +
+    # DIVE-2306: and the same argument one level down — a board that cannot
+    # record the observation prints the freeze half as silence, which is what
+    # "not frozen" looks like.
+    (if $armed == "false" then " · ⚠ freeze alarm UNARMED on this box: \($frozendet)"
      else "" end)' <<<"$snap"
 }
 
@@ -732,8 +1133,17 @@ _sup_act_exec() {  # <name> <verb> <cause>
 cmd_supervisor_tick() {
   require_root "supervisor --tick"
   if [[ ! -f "$_SUP_ENABLED_FLAG" ]]; then
-    ok "supervisor tick: disabled — observe pass skipped (enable: sudo touch ${_SUP_ENABLED_FLAG})" \
-       '{enabled:false, skipped:true}'
+    # DIVE-2306: name what the no-op costs, rather than only what it skips. This
+    # tick is the only caller guaranteed to run as root and therefore guaranteed
+    # able to WRITE the DIVE-2287 version record; `update --check` runs as an
+    # operator and degrades to `unknown` on a STATE_DIR it cannot write. So on a
+    # box where the tick is off, the freeze alarm may have no writer at all —
+    # and an alarm with no writer reports `unknown` forever, which reads exactly
+    # like a monitor that has simply not fired yet. Stated here, and again in
+    # `update --check` / the board / the digest as `frozenArmed:false`, because
+    # a notice on a disabled cron path is seen by nobody by construction.
+    ok "supervisor tick: disabled — observe pass skipped (enable: sudo touch ${_SUP_ENABLED_FLAG}) · the DIVE-2287 version-freeze record is not being refreshed by this tick; if no other caller can write it, the freeze alarm is unarmed on this box" \
+       '{enabled:false, skipped:true, freezeRecordRefreshed:false}'
     return 0
   fi
   tasks_db_init
@@ -767,21 +1177,40 @@ cmd_supervisor_tick() {
   local alerted=0
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
-    [[ "$(jq -r '.classification' <<<"$row")" == "verify-challenge" ]] || continue
+    # DIVE-3272: the same always-live, deduped alert path now carries the two
+    # capacity classes. They belong here and NOT on the P2 ladder for the same
+    # reason the verify challenge does: a nudge/resume/rotate cannot fix a seat
+    # that has no model capacity, and rotating work onto it is what queued 20
+    # rows behind dev3 in the first place.
+    local cls; cls=$(jq -r '.classification' <<<"$row")
+    case "$cls" in verify-challenge|no-output|quota-exhausted) ;; *) continue ;; esac
     name=$(jq -r '.name' <<<"$row")
-    local excerpt; excerpt=$(jq -r '.signals.verifyChallenge // ""' <<<"$row")
+    local excerpt cause_s
+    case "$cls" in
+      verify-challenge) excerpt=$(jq -r '.signals.verifyChallenge // ""' <<<"$row"); cause_s="id-verification" ;;
+      quota-exhausted)  excerpt=$(jq -r '.detail // ""' <<<"$row");                  cause_s="quota-exhausted" ;;
+      *)                excerpt=$(jq -r '.detail // ""' <<<"$row");                  cause_s="no-output" ;;
+    esac
     local prev_alert
+    # Dedup is scoped BY CLASS (DIVE-3272): a seat can be both quota-walled and
+    # output-dry, and an unscoped window would let whichever fired first
+    # suppress the other for a day.
     prev_alert=$(db "SELECT COUNT(*) FROM supervisor_events
                      WHERE agent=$(sqlq "$name") AND event='alert'
+                       AND classification=$(sqlq "$cls")
                        AND ts >= datetime('now', '-${_SUP_ALERT_WINDOW_H} hours');" 2>/dev/null || echo 0)
     [[ "$prev_alert" =~ ^[0-9]+$ ]] || prev_alert=0
     (( prev_alert > 0 )) && continue
-    _sup_verify_alert "$name" "$excerpt"
+    if [[ "$cls" == "verify-challenge" ]]; then
+      _sup_verify_alert "$name" "$excerpt"
+    else
+      _sup_capacity_alert "$name" "$cls" "$excerpt"
+    fi
     db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
-        VALUES ($(sqlq "$name"), 'alert', 'verify-challenge', 'id-verification', $(sqlq "$row"));" 2>/dev/null \
+        VALUES ($(sqlq "$name"), 'alert', $(sqlq "$cls"), $(sqlq "$cause_s"), $(sqlq "$row"));" 2>/dev/null \
       && { alerted=$((alerted + 1)); events=$((events + 1)); } \
-      || warn "supervisor: verify-challenge alert insert failed for $name"
-    warn "supervisor: ALERT $name — ID/age-verification challenge; main+lodar pinged (D4 trigger 1)"
+      || warn "supervisor: $cls alert insert failed for $name"
+    warn "supervisor: ALERT $name — $cls: $excerpt"
   done < <(jq -c '.[]' <<<"$snap")
 
   # ── P2 (DIVE-857): ACT + ESCALATE — pre-cleared by lodar 2026-07-02, gated on
@@ -905,10 +1334,13 @@ cmd_supervisor() {
           --arg cur "$FIVE_VERSION" --arg lat "$_SUP_CLI_LATEST" \
           --arg beh "$_SUP_CLI_BEHIND" --arg stl "$_SUP_CLI_STALE" \
           --arg frz "$_SUP_CLI_FROZEN" --arg frzd "$_SUP_CLI_FROZEN_DETAIL" \
+          --arg ahd "$_SUP_CLI_AHEAD" --arg frzarm "$_SUP_CLI_FROZEN_ARMED" \
           --argjson tstuck "$_SUP_T_STUCK_MIN" --argjson tslow "$_SUP_T_SLOW_MIN" \
           '{ok:true, data:{agents:.,
              cli:{current:$cur, latest:(if $lat == "" then null else $lat end), behind:$beh, stale:$stl,
-                  frozen:$frz, frozenDetail:(if $frzd == "" then null else $frzd end)},
+                  ahead:$ahd,
+                  frozen:$frz, frozenDetail:(if $frzd == "" then null else $frzd end),
+                  frozenArmed:$frzarm},
              tStuckMin:$tstuck, tSlowMin:$tslow}}'
       else
         _sup_render_board "$snap"

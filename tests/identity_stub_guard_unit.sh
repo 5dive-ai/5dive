@@ -1,4 +1,24 @@
 #!/usr/bin/env bash
+# TIER: nightly — 11.1s measured on ubuntu-latest by the core/pristine-confirm runner
+# itself (run 31554029604, 2026-08-12, the tier report's own top-10 line; 8.2s on the
+# faster core/pristine box in the same run). Demoted under the MUTATION-HARNESS RULE
+# (DIVE-2867): a mutant-killing grader re-scans a corpus once per mutant, so its cost is
+# mutants x corpus-walk BY CONSTRUCTION and does not shrink with tuning. A7 mutates every
+# file in population B (53 today) and A8 every file in population A (8), and the header
+# below says so in its own words — "this harness gets more expensive with every harness
+# anyone adds". That is the class DIVE-2867 already decided is nightly.
+#
+# WHY IT WAS MISSED THEN AND NOT NOW. DIVE-2867 enumerated the class by FILENAME —
+# `tests/*_mutation.sh`, six files, three already nightly and three demoted, explicitly
+# "to make the class uniform rather than picking files by size". This file mutates by
+# construction and is named `_unit.sh`, so a census keyed on the suffix could not return
+# it. The rule was right; its enumeration was keyed on the name instead of the shape.
+#
+# WHAT IS NOT LOST. The demotion changes WHEN, never WHAT: every arm runs unchanged in
+# the nightly sweep, and `changed-harnesses` runs this file on any PR that touches it —
+# that job is capped for PROBING only and its plain run "stays uncapped, because the
+# harness you touched runs is the promise". So the guard still fires at the moment a
+# harness is edited; what stops is paying 11s on the 297 PRs that touch nothing here.
 # tests/identity_stub_guard_unit.sh — DIVE-2601.
 #
 # THE CLASS THIS GUARD CLOSES. Since DIVE-2330 the caller derivation does not read
@@ -37,6 +57,21 @@
 # silent by construction (a green arm that grades nothing looks exactly like a green
 # arm that grades something) and 10s against a 300s per-job budget is not the line
 # item worth demoting. If the tier gets tight, A7's 43 mutants are the knob.
+#
+# DIVE-3302 (2026-08-12): the tier got tight — core was 18s over its 363s cap and
+# every merge and cut on 5dive-ai/5dive was frozen behind a red `test-confirm`.
+# Reduced WITHOUT touching the knob: the four per-file predicates were 4-6 process
+# spawns each, run once per file per mutant (53 A7 + 8 A8) on top of a 388-file
+# eligibility walk in each arm. Three are now ONE awk (`_file_facts`); `claims_id`
+# stays the original grep trio deliberately (see its call site). 12.04s -> 9.49s
+# CPU, 3-run means, same session and box — single-run wall clock on this shared
+# host swings 12-19s and cannot resolve a 2.5s change. Population, mutant counts
+# and arm count all UNCHANGED (8/53/1, 53, 8, 15/0): a cost change with no coverage
+# delta, so A7's mutants are still there for whoever needs the next second.
+# Memoising the real-file predicates was implemented, measured and REJECTED —
+# 1.21s SLOWER (it swaps a short-circuiting two-predicate test for an
+# always-compute-three across 388 files) and it adds a staleness hazard no arm
+# catches. ops lost the same optimisation earlier to a vacuous cache guard.
 
 set -u
 # shellcheck source=/dev/null
@@ -154,32 +189,66 @@ _asserts_resolver() {
 # fixture; the guard's own line 353 census listing uses this same function so the two
 # cannot drift.
 _pins_seams() {
-  grep -qE '^[[:space:]]*_gate_(caller_uid|passwd_stream)\(\)' "$1" && return 0
+  # DIVE-3302: the grep arm folded into the awk — one spawn, same two predicates.
   awk '
+    /^[[:space:]]*_gate_(caller_uid|passwd_stream)\(\)/ { f=1; exit }
     /^[[:space:]]*#/ { next }
     /(^|\$\(|`|[;&|({])[[:space:]]*actor_seam_as([[:space:]]|$)/ { f=1 }
     END { exit !f }
   ' "$1"
 }
 
+_file_facts() {   # DIVE-3302: ONE awk for the three per-file predicates that were
+  # three separate awk spawns. Each rule is a verbatim copy of the standalone it
+  # replaces. `claims_id` is deliberately NOT folded in here — see the note at the
+  # call site. Equivalence differential-graded by A9 below, over the whole corpus.
+  awk '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*_gate_(caller_uid|passwd_stream)\(\)/ { pins=1 }
+    /(^|\$\(|`|[;&|({])[[:space:]]*actor_seam_as([[:space:]]|$)/ { pins=1 }
+    /(^|\$\(|`|[;&|({])[[:space:]]*(_gate_authenticated_actor|_gate_uid_to_agent|actor_seam_selftest)([[:space:]]|$|\)|")/ { asserts=1 }
+    inlist {
+      list = list " " $0
+      if ($0 ~ /(^|;)[[:space:]]*do([[:space:]]|$)/) { inlist=0; if (list ~ /lib\/(actor|actor_seam)\.sh/) srcs=1 }
+      next
+    }
+    /^[[:space:]]*for[[:space:]]+[A-Za-z_][A-Za-z_0-9]*[[:space:]]+in[[:space:]]/ {
+      list=$0; inlist=1
+      if ($0 ~ /(^|;)[[:space:]]*do([[:space:]]|$)/) { inlist=0; if (list ~ /lib\/(actor|actor_seam)\.sh/) srcs=1 }
+      next
+    }
+    /lib\/(actor|actor_seam)\.sh/ {
+      if ($0 ~ /(^|[;&|({])[[:space:]]*(source|\.)[[:space:]]/) srcs=1
+      else if ($0 ~ /(^|[;&|({[:space:]])(eval[[:space:]]+"?\$\(|_load_from[[:space:]])/) srcs=1
+    }
+    END { printf "%d %d %d", pins, srcs, asserts }
+  ' "$1"
+}
+
 _scan_identity_stubs() {
-  local dir="$1" f base claims_id pins
+  local dir="$1" f base claims_id pins srcs asrt
   for f in "$dir"/*.sh; do
     [[ -e "$f" ]] || continue
-    base="$(basename "$f")"
+    base="${f##*/}"
     [[ "$base" == "$SELF" ]] && continue                    # self-exclusion (A3)
     [[ -n "${ALLOW[$base]:-}" ]] && continue
 
     # Population A — an `id()` stub that ANSWERS -un is making an identity claim. A
     # stub that only handles `id -u` (deploy_unit, agent_git_identity_unit) is pinning
     # a numeric uid for a different guard and is out of scope.
+    # DIVE-3302: ONE awk yields all four predicates. Was 4-6 spawns per file, and
+    # this runs once per file per mutant (53 A7 mutants + 8 A8), which is where the
+    # core tier's overage lived. Equivalence to the four originals is differential-
+    # graded by A9 below, over the whole corpus, not asserted here.
+    # claims_id keeps the ORIGINAL grep trio verbatim. My folded awk detected one
+    # file the trio misses (its `[^}]*` is blocked by the `}` inside `${1:-}`), which
+    # would have RAISED population A 8->9 — a semantic fix smuggled inside a cost fix.
+    # Filed separately; this change is performance-only, zero delta.
     claims_id=0
     if grep -qE '^[[:space:]]*id\(\)' "$f" \
        && { grep -qE '^[[:space:]]*id\(\).*\-un' "$f" \
             || grep -qzE 'id\(\)[[:space:]]*\{[^}]*\-un' "$f"; }; then claims_id=1; fi
-    # Population B — pins the seams the derivation actually reads.
-    pins=0
-    _pins_seams "$f" && pins=1
+    read -r pins srcs asrt <<<"$(_file_facts "$f")"
 
     (( claims_id || pins )) || continue
 
@@ -189,7 +258,7 @@ _scan_identity_stubs() {
     # '' — so `[[ -z "$pin" ]]` becomes "the empty string is empty" and cannot fail —
     # and the product code under test runs with its actor derivation missing. All
     # three symptoms are silent. Measured in gate_tier2_nonce_evidence_unit.sh.
-    if (( pins )) && ! _sources_actor "$f"; then
+    if (( pins )) && (( ! srcs )); then
       printf '%s\tpins the identity seams but never sources lib/actor.sh — the override lands on nothing, any assertion through the resolver is command-not-found (yields '"''"', which is the PASS value), and the product code runs with its actor derivation missing\n' "$base"
       continue
     fi
@@ -199,7 +268,7 @@ _scan_identity_stubs() {
       continue
     fi
     # (2) and the pin must be asserted through the real resolver
-    if (( claims_id )) && ! _asserts_resolver "$f"; then
+    if (( claims_id )) && (( ! asrt )); then
       printf '%s\tpins the identity seams but never asserts the pin through the real resolver (_gate_authenticated_actor / _gate_uid_to_agent / actor_seam_selftest)\n' "$base"
     fi
   done
@@ -209,15 +278,16 @@ _scan_identity_stubs() {
 # as the scan, deliberately NOT a second implementation of the rules: it counts who
 # is LOOKED AT, which is the number a shrinking guard makes disappear quietly.
 _census() {
-  local dir="$1" f base a=0 b=0
+  local dir="$1" f base a=0 b=0 _c _p _s _a
   for f in "$dir"/*.sh; do
     [[ -e "$f" ]] || continue
-    base="$(basename "$f")"
+    base="${f##*/}"
     [[ "$base" == "$SELF" || -n "${ALLOW[$base]:-}" ]] && continue
     if grep -qE '^[[:space:]]*id\(\)' "$f" \
        && { grep -qE '^[[:space:]]*id\(\).*\-un' "$f" \
             || grep -qzE 'id\(\)[[:space:]]*\{[^}]*\-un' "$f"; }; then a=$((a+1)); fi
-    _pins_seams "$f" && b=$((b+1))
+    read -r _p _s _a <<<"$(_file_facts "$f")"   # DIVE-3302: one awk for the three
+    (( _p )) && b=$((b+1))
   done
   printf '%s %s' "$a" "$b"
 }
@@ -417,7 +487,7 @@ DROP_RESOLVER='{ if ($0 ~ /^[[:space:]]*#/ || $0 ~ /printf/) print; else { gsub(
 
 a7_n=0; a7_prose=0; a7_missed=()
 for f in tests/*.sh; do
-  base="$(basename "$f")"
+  base="${f##*/}"
   [[ "$base" == "$SELF" || -n "${ALLOW[$base]:-}" ]] && continue
   _pins_seams "$f" || continue
   _sources_actor "$f" || continue                       # only files that currently PASS rule (0)
@@ -433,7 +503,7 @@ done
 
 a8_n=0; a8_prose=0; a8_missed=()
 for f in tests/*.sh; do
-  base="$(basename "$f")"
+  base="${f##*/}"
   [[ "$base" == "$SELF" || -n "${ALLOW[$base]:-}" ]] && continue
   grep -qE '^[[:space:]]*id\(\)' "$f" \
     && { grep -qE '^[[:space:]]*id\(\).*\-un' "$f" || grep -qzE 'id\(\)[[:space:]]*\{[^}]*\-un' "$f"; } || continue
@@ -448,6 +518,44 @@ rm -f "$TMP"/*.sh
   && ok_t "A8 rule (2) reds on every real \`id -un\` harness whose resolver call is removed ($a8_n mutants, $a8_prose still name it in surviving prose)" \
   || bad_t "A8 rule (2) is violable on the real corpus" \
      "$(printf '%s of %s mutant(s) went UNDETECTED:\n' "${#a8_missed[@]}" "$a8_n"; printf '     %s\n' "${a8_missed[@]:-<none — but only $a8_n file(s) were mutable>}")"
+
+# ── A9 — THE ARM THE HEADER CLAIMED AND THE FILE DID NOT HAVE ──────────────────
+# DIVE-3302 iteration 2, found by quinn on review. The fold added `_file_facts` as a
+# SECOND implementation of three predicates that still exist as standalones, and the
+# header asserted twice that the two were "differential-graded by A9 across the
+# corpus". THERE WAS NO A9. A citation of an arm that does not exist is worse than no
+# citation: it answers the reviewer's question in the reassuring direction and closes
+# the check that silence would have invited.
+#
+# It also has to exist for a second reason, which is quinn's actual finding. The scan
+# and the count census now read `_file_facts` (239, 277) while the A6 census LISTING
+# (below) and the A7/A8 mutant SELECTION still call the standalones. Two
+# implementations, identical today, with nothing enforcing it. If they ever diverge
+# the scan grades a different population than the mutants target — arm count
+# unchanged, every arm green. That is this file's own documented blind spot, which
+# `_pins_seams`' header claims cannot happen ("the guard's own census listing uses
+# this same function so the two cannot drift"); after the fold that sentence was
+# false until this arm made it true again.
+#
+# Runs over the WHOLE corpus, not a sample: a differential that skips files cannot
+# say the two agree, only that it did not look. This is cheap (one extra pass, no
+# mutants) and the harness is nightly now.
+a9_diff=(); a9_n=0
+for f in tests/*.sh; do
+  base="${f##*/}"
+  [[ "$base" == "$SELF" || -n "${ALLOW[$base]:-}" ]] && continue
+  _pins_seams      "$f" && _p=1 || _p=0
+  _sources_actor   "$f" && _s=1 || _s=0
+  _asserts_resolver "$f" && _a=1 || _a=0
+  read -r _fp _fs _fa <<<"$(_file_facts "$f")"
+  a9_n=$((a9_n+1))
+  [[ "$_p $_s $_a" == "$_fp $_fs $_fa" ]] \
+    || a9_diff+=("$base: standalones=($_p $_s $_a) _file_facts=($_fp $_fs $_fa)")
+done
+(( a9_n >= 300 && ${#a9_diff[@]} == 0 )) \
+  && ok_t "A9 _file_facts agrees with all three standalone predicates on every file in the corpus ($a9_n files, 3 predicates each)" \
+  || bad_t "A9 the folded predicate and the standalones DISAGREE (or the corpus went missing)" \
+     "$(printf 'compared %s file(s), %s disagreement(s):\n' "$a9_n" "${#a9_diff[@]}"; printf '     %s\n' "${a9_diff[@]:-<none — but only $a9_n file(s) were compared, expected >=300>}")"
 
 printf '\n%s: %d passed, %d failed\n' "$SELF" "$PASS" "$FAIL"
 (( FAIL == 0 ))

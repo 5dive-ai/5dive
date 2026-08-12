@@ -713,12 +713,12 @@ _objective_validate_diff() {
     prio=$(printf '%s' "$diff"  | jq -r ".reprioritize[$i].priority")
     [[ "$prio" =~ ^(low|medium|high|urgent)$ ]] || fail "$E_VALIDATION" "reprioritize $ident: bad priority '$prio' (low|medium|high|urgent)"
     _objective_owns_open "$obj_id" "$ident" \
-      || fail "$E_VALIDATION" "reprioritize $ident: not an OPEN task this objective originated — a planner may reprioritize ONLY its own originated tasks"
+      || fail "$E_VALIDATION" "reprioritize $ident: not an OPEN task this objective originated — a planner may only touch its own"
   done
   for ((i=0; i<ncan; i++)); do
     ident=$(printf '%s' "$diff" | jq -r ".cancel[$i].ident")
     _objective_owns_open "$obj_id" "$ident" \
-      || fail "$E_VALIDATION" "cancel $ident: not an OPEN task this objective originated — a planner may propose-cancel ONLY its own originated tasks (touching human/other tasks stays a gate)"
+      || fail "$E_VALIDATION" "cancel $ident: not an OPEN task this objective originated — a planner may only propose-cancel its own"
   done
   OBJ_N_CREATE="$ncre" OBJ_N_REPRI="$nrep" OBJ_N_CANCEL="$ncan"
 }
@@ -758,7 +758,32 @@ _objective_invoke_planner() {
 _objective_build_contract() {
   local oname="$1" obj_id="$2" cur="$3" prev="$4" trend="$5" target="$6" direction="$7" unit="$8" max_new="$9"
   local gap="n/a"; [[ -n "$target" && -n "$cur" ]] && gap=$(awk -v t="$target" -v c="$cur" 'BEGIN{printf "%g", t-c}')
-  local open_tasks; open_tasks=$(db "SELECT '  ['||ident||']  ('||status||', '||priority||')  '||title FROM tasks WHERE originated_by_objective=${obj_id} AND status NOT IN ('done','cancelled') ORDER BY id;")
+  # OSS-37: a burnt-out maker->verifier loop is INVISIBLE in a bare status column.
+  # `task reject` at max_iterations does not close or reopen the row — it writes the
+  # feedback and files a manual gate on a human (cmd_task.sh, "max_iterations reached
+  # -> stop bouncing, park it on a human to decide"), leaving the task open at
+  # status 'blocked'. Injected as just "(blocked, high)" that is indistinguishable
+  # from a task blocked on a sibling dependency, so the planner reads a dead task as
+  # in-flight progress and re-plans around nothing, cycle after cycle — the "just
+  # parks" failure OSS-19 phase A2 names. Annotate it with _task_stuck_loop_pred — the
+  # SHARED definition `loop board --stuck` / `--escalate-stuck` also calls, not a copy
+  # of it. Re-typing the predicate inline here (the first draft did) buys
+  # does-not-currently-drift; calling the one definition is what buys cannot-drift.
+  # Its `status NOT IN ('done','cancelled')` is redundant against the WHERE below and
+  # is kept anyway: dropping the redundant clause is precisely how a second copy starts.
+  # Every operand of a `||` chain is COALESCE-guarded: one NULL in SQLite collapses
+  # the whole concatenation to NULL, which would silently DROP the task's line
+  # rather than lose the marker. (max_iterations is non-NULL inside the WHEN.)
+  local stuck_pred; stuck_pred="$(_task_stuck_loop_pred)"
+  local open_tasks; open_tasks=$(db "SELECT '  ['||ident||']  ('||status||', '||priority||')  '||title
+      || CASE WHEN ${stuck_pred}
+              THEN '   ** STUCK: verifier rejected it '||COALESCE(iteration,0)||'/'||max_iterations
+                   ||'x, the loop is spent'
+                   || CASE WHEN (need_type IS NOT NULL AND need_answered_at IS NULL)
+                           THEN ' and it is parked on an unanswered human gate' ELSE '' END
+                   ||' **'
+              ELSE '' END
+    FROM tasks WHERE originated_by_objective=${obj_id} AND status NOT IN ('done','cancelled') ORDER BY id;")
   [[ -n "$open_tasks" ]] || open_tasks="  (none yet)"
   local last_out; last_out=$(db "SELECT '  ['||ident||']  '||status||COALESCE('  — '||NULLIF(result,''),'') FROM tasks WHERE originated_by_objective=${obj_id} AND status IN ('done','cancelled') ORDER BY id DESC LIMIT 12;")
   [[ -n "$last_out" ]] || last_out="  (none yet)"
@@ -776,6 +801,13 @@ OBJECTIVE: ${oname}
 
 YOUR OPEN ORIGINATED TASKS (only these are yours to reprioritize/cancel):
 ${open_tasks}
+
+A task marked ** STUCK ** has burned its whole maker-verifier budget and been
+rejected at the cap: it is NOT in flight and will not close on its own, so do not
+keep counting it as progress. Re-plan around it — cancel it (it is yours) and/or
+create a different, smaller approach to the same gap. If it is also parked on an
+unanswered human gate, that gate is NOT yours to clear, answer, or wait on: a
+human still owns that decision and your cancel does not resolve it.
 
 RECENT CLOSED ORIGINATED OUTCOMES:
 ${last_out}
@@ -804,7 +836,7 @@ _objective_file_gate() {
   anchor_id=$(db "SELECT id FROM tasks WHERE project_key=$(sqlq "$pkey") AND title=$(sqlq "$title") AND kind='standard' ORDER BY id LIMIT 1;")
   if [[ -z "$anchor_id" ]]; then
     local add_json
-    add_json=$(JSON_MODE=1 cmd_task_add --project="$pkey" --priority=high ${from:+--from="$from"} \
+    add_json=$(JSON_MODE=1 cmd_task_add --materialized --project="$pkey" --priority=high ${from:+--from="$from"} \
                  --body="$(printf 'Objective re-plan cycle %s for "%s".\nProposed diff — create:%s reprioritize:%s cancel:%s. Approve to apply the origination batch.\n\n--- objective diff json ---\n%s' \
                            "$cycle_no" "$oname" "$OBJ_N_CREATE" "$OBJ_N_REPRI" "$OBJ_N_CANCEL" "$diff")" \
                  -- "$title") || return $?
@@ -816,7 +848,8 @@ _objective_file_gate() {
   # T2 create -> HARD tier-2 gate (never --yes-waived, never auto-cleared). Else a
   # count-only checkpoint stays the default agent-clearable tier-1 decision.
   local reason="create ${OBJ_N_CREATE}, reprioritize ${OBJ_N_REPRI}, cancel ${OBJ_N_CANCEL}"; local -a tier_arg=()
-  if [[ "$GOAL_HAS_T2" == "1" ]]; then reason="carries a Tier-2 task — ${reason}"; tier_arg=(--tier=2); fi
+  # DIVE-2848: declare human_tap alongside the pin — see the twin in cmd_goal.sh.
+  if [[ "$GOAL_HAS_T2" == "1" ]]; then reason="carries a Tier-2 task — ${reason}"; tier_arg=(--tier=2 --needs=human_tap); fi
   JSON_MODE=1 cmd_task_need "$anchor_id" --type=decision --options="approve|revise" --recommend="approve" "${tier_arg[@]}" ${from:+--from="$from"} \
     --ask="Approve objective '${oname}' re-plan cycle ${cycle_no}? (${reason}) Full diff in the task body." >/dev/null \
     || fail "$E_GENERIC" "objective replan: could not file the plan gate"
@@ -870,7 +903,7 @@ _objective_apply_from_gate() {
   nans=$(db "SELECT COALESCE(need_answer,'')     FROM tasks WHERE id=${id};")
   nby=$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE id=${id};")
   [[ -n "$nat" ]] || fail "$E_CONFLICT" "$ident's gate is not answered yet — a human must approve it first, then re-run"
-  [[ "$nby" == human:* ]] || fail "$E_AUTH_REQUIRED" "$ident's gate was not cleared by a human (answered by '${nby:-?}') — an objective diff may only be applied on a HUMAN approval (DIVE-916)"
+  [[ "$nby" == human:* ]] || fail "$E_AUTH_REQUIRED" "$ident's gate was not cleared by a human (answered by '${nby:-?}') — an objective diff applies only on a HUMAN approval"
   [[ "$nans" == "approve" ]] || fail "$E_CONFLICT" "$ident's gate was answered '${nans}', not 'approve' — nothing applied (re-plan to revise)"
   # Recover the diff from the anchor body + RE-VALIDATE from scratch.
   local body diff; body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")

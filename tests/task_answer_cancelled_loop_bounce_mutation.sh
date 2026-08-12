@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TIER: core
+# TIER: nightly — 4.9s measured on ubuntu-latest by the core/installed-host runner itself (run 31292045115, 2026-08-09; the tier report's own top-10 line). Demoted under the mutation-harness rule (DIVE-2867): same class as gate_evidence_form_mutation.sh — a copied source tree per mutant, cost fixed by construction. Three of six *_mutation.sh files were already nightly before this change.
 # DIVE-2261 connectivity grade: delete the cancelled-status refusal from a
 # copied source tree and require the named C1 arm to turn red.
 # Run: bash tests/task_answer_cancelled_loop_bounce_mutation.sh
@@ -19,7 +19,7 @@ PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n       %s\n' "$1" "${2:-}"; }
 
-target="$TMP/tree/src/cmd_task.sh"
+target="$TMP/tree/src/task/answer.sh"   # DIVE-3278: was src/cmd_task.sh
 old='  if (( _loop_bounce )) && [[ "$_prev_status" == "cancelled" ]]; then'
 new='  if false; then'
 if OLD="$old" NEW="$new" F="$target" python3 - <<'PY'

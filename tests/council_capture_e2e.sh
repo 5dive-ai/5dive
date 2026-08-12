@@ -29,7 +29,7 @@ set -uo pipefail
 trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT"
 
-pass=0; fail=0
+pass=0; fail=0; skip=0
 ok()  { if [[ "$1" == 0 ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
 has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 
@@ -102,7 +102,8 @@ mkdir -p "$TMP/yessudo"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/yessudo/sudo"; chmod +x "$TMP/yessudo/sudo"
 
 if [[ "$(id -u)" -eq 0 ]]; then
-  echo "note: running as root — the ask-rail pre-flight always passes for root; skipping its refusal leg"
+  skip=$((skip+4))
+  echo "note: running as root — the ask-rail pre-flight always passes for root; skipping its refusal leg (4 arms skipped)"
 else
   outp="$(PATH="$TMP/nosudo:$PATH" COUNCIL_5DIVE_BIN="$STUB2" "$BIN" council convene "ship it?" \
             --seats=alpha,beta,gamma --mode=quick --ask-rail --timeout=2 --json 2>&1)"
@@ -194,5 +195,5 @@ has "$rem" "5dive council needs node on PATH and none was found" && ok 0 "the no
 has "$rem" "root's PATH does not inherit nvm" && ok 0 "the node failure explains WHY sudo breaks it" || ok 1 "node failure explains the sudo cause"
 has "$rem" "ln -s" && ok 0 "the node failure hands over a copy-pasteable permanent fix" || ok 1 "node failure carries a remediation command"
 
-echo "DIVE-1869 capture/delivery E2E: $pass passed, $fail failed"
+echo "DIVE-1869 capture/delivery E2E: $pass passed, $fail failed, $skip skipped"
 [[ "$fail" == 0 ]]

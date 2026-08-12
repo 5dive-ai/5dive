@@ -62,10 +62,10 @@ PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
-mk() {  # mk <assignee> <verifier|""> [status]
-  local asg="$1" vf="$2" st="${3:-todo}"
+mk() {  # mk <assignee> <verifier|""> [status] [created_by]
+  local asg="$1" vf="$2" st="${3:-todo}" cb="${4-main}"
   db "INSERT INTO tasks (title,status,priority,assignee,created_by,kind,verifier)
-        VALUES ('t','${st}','high',$(sqlq "$asg"),'main','standard',$(sqlq_or_null "$vf"));
+        VALUES ('t','${st}','high',$(sqlq "$asg"),$(sqlq_or_null "$cb"),'standard',$(sqlq_or_null "$vf"));
       UPDATE tasks SET ident='DIVE-'||id WHERE id=last_insert_rowid();
       SELECT last_insert_rowid();"
 }
@@ -99,14 +99,102 @@ solo=$(mk dev "")
   && ok_t "solo task (no verifier) => no clause" \
   || bad_t "solo task (no verifier) => no clause"
 
-# The verifier BEFORE any handoff: no maker_agent, so nothing has been delivered
-# and they are just an ordinary owner — the reject verb itself would refuse here
-# ("not in a maker→verifier loop (no maker to bounce to)"), so naming it would
-# point the agent at a command the rail rejects.
+# DIVE-2834 — THE THIRD ROLE. The verifier-of-record BEFORE any handoff: no
+# maker_agent, so nothing has been delivered. DIVE-2111 gave this state NOTHING, on
+# the reasoning that `reject` is refused with no maker (true) and that the agent is
+# therefore "just an ordinary owner" (false — that IS the role). Its complete action
+# is to make the decision the row was routed to it for and route the row on.
 grade=$(mk olivia olivia)
-[[ -z "$(_hb_loop_terminal_clause olivia "$grade" "DIVE-$grade")" ]] \
-  && ok_t "verifier pre-delivery (no maker_agent) => no clause" \
-  || bad_t "verifier pre-delivery (no maker_agent) => no clause"
+r=$(_hb_loop_terminal_clause olivia "$grade" "DIVE-$grade")
+[[ -n "$r" ]] && ok_t "verifier-of-record pre-delivery => routing clause emitted" \
+  || bad_t "verifier-of-record pre-delivery => routing clause emitted" "got empty"
+[[ "$r" == *"task assign DIVE-$grade main"* ]] \
+  && ok_t "routing clause names 'task assign' and the created_by destination" \
+  || bad_t "routing clause names 'task assign' + destination" "got: $r"
+# `reject` is REFUSED while maker_agent is empty, so the clause must not offer it as
+# a runnable action NOW. It may only appear after the re-read pivot, as the action
+# the role turns into once a delivery lands. Split on the pivot and assert the
+# before-half is reject-free — a flat "does not contain" would forbid the correct
+# forward-looking mention too, and a flat "contains" would pass on the bug.
+[[ "$r" == *"'task reject' would refuse"* ]] \
+  && ok_t "routing clause states reject is refused in the CURRENT state" \
+  || bad_t "routing clause states reject is refused now" "got: $r"
+[[ "${r%%AND RE-READ*}" != *"5dive task reject"* ]] \
+  && ok_t "routing clause offers no runnable 'task reject' before the re-read pivot" \
+  || bad_t "routing clause offers a reject the rail would refuse" "got: $r"
+[[ "${r#*AND RE-READ}" == *"5dive task reject DIVE-$grade"* ]] \
+  && ok_t "routing clause offers reject only AFTER a delivery-back (the next role)" \
+  || bad_t "routing clause offers reject after a delivery-back" "got: $r"
+[[ "$r" == *"treat the goal as MET"* ]] \
+  && ok_t "routing clause declares the reassign terminal for the goal" \
+  || bad_t "routing clause declares the reassign terminal" "got: $r"
+[[ "$r" == *"assignee ="* ]] \
+  && ok_t "routing clause names the observable state (an 'assignee =' line)" \
+  || bad_t "routing clause names the observable state" "got: $r"
+[[ "$r" == *"cancelling a live row to clear your board"* ]] \
+  && ok_t "routing clause forbids the empty-cancel exit (DIVE-2683)" \
+  || bad_t "routing clause forbids the empty-cancel exit" "got: $r"
+
+# olivia's iteration-1 REJECT, and the arms that keep it fixed. The predicate
+# `verifier == assignee && maker_agent EMPTY` is ALSO the shape of a row that is
+# simply the owner's to do — measured on the live board, 3 of the 6 rows in the
+# guard's firing set (DIVE-2456, DIVE-1956, DIVE-1789) were owners doing or
+# grading their own work, and for each the correct terminal was the `done` the
+# first cut warned against and never offered. So the clause must assert only what
+# the loop spec settles, and must offer BOTH terminals.
+[[ "$r" != *"This row was routed to you for a DECISION, not to build"* ]] \
+  && ok_t "routing clause does NOT assert the routed-for-decision role as fact" \
+  || bad_t "routing clause asserts a role the predicate cannot select" "got: $r"
+[[ "$r" == *"IF IT WAS ROUTED TO YOU FOR A DECISION"* && "$r" == *"IF THE WORK IS YOURS TO DO"* ]] \
+  && ok_t "routing clause states BOTH branches conditionally, not one as premise" \
+  || bad_t "routing clause states both branches conditionally" "got: $r"
+# Split on the re-read pivot before asserting this one. A flat "contains task
+# done" PASSES ON THE BUG — the rejected version already named `task done` in the
+# forward-looking verifier-transition sentence AFTER the pivot, while offering it
+# nowhere as a terminal for this state. The before-half is the only place that
+# distinguishes a terminal on offer now from a role this may turn into.
+[[ "${r%%AND RE-READ*}" == *"5dive task done DIVE-$grade"* ]] \
+  && ok_t "routing clause offers 'task done' NOW, before the re-read pivot" \
+  || bad_t "routing clause offers 'task done' as a present terminal" "got: $r"
+# The generator genuinely cannot tell the two apart, and must say so rather than
+# guess — that admission is what stops the next reader treating it as a role read.
+[[ "$r" == *"does NOT settle"* || "$r" == *"identical in the spec"* ]] \
+  && ok_t "routing clause admits the spec cannot distinguish the two states" \
+  || bad_t "routing clause admits what it cannot derive" "got: $r"
+[[ "$r" != *$'\n'* && "${r:0:1}" == " " ]] \
+  && ok_t "routing clause is a single space-prefixed line" \
+  || bad_t "routing clause is a single space-prefixed line" "got: [$r]"
+
+# THE SNAPSHOT HALF (DIVE-2834). maker_agent is a LIVE column and the tick cannot
+# re-mint this text mid-session (its busy-guard skips an in_progress agent), so the
+# ONE variant that can be overtaken must name the role it turns into and send the
+# reader back to `task show` at the moment of acting.
+[[ "$r" == *"RE-READ"* && "$r" == *"live column"* ]] \
+  && ok_t "routing clause tells the agent to re-derive the role when it acts" \
+  || bad_t "routing clause tells the agent to re-derive the role" "got: $r"
+[[ "$r" == *"handoff: delivered (awaiting verifier ACK)"* && "$r" == *"maker: main"* ]] \
+  && ok_t "routing clause names the delivered-back state it can be overtaken by" \
+  || bad_t "routing clause names the delivered-back state" "got: $r"
+
+# Negatives specific to the routing variant: with no named party to route to, the
+# correct output is silence (the base nudge's own gate path is the exit).
+noc=$(mk olivia olivia todo "")
+[[ -z "$(_hb_loop_terminal_clause olivia "$noc" "DIVE-$noc")" ]] \
+  && ok_t "routing variant: created_by empty => no clause" \
+  || bad_t "routing variant: created_by empty => no clause"
+selfc=$(mk olivia olivia todo olivia)
+[[ -z "$(_hb_loop_terminal_clause olivia "$selfc" "DIVE-$selfc")" ]] \
+  && ok_t "routing variant: created_by is the woken agent => no clause" \
+  || bad_t "routing variant: created_by is the woken agent => no clause"
+
+# EVERY VERB THE CLAUSES NAME MUST EXIST. The routing variant is the first to name
+# `task assign`/`task set-body`; a clause that points at a verb the dispatcher does
+# not have re-wedges the session exactly as before, with every assert above green.
+for verb in assign set-body; do
+  grep -qE "^[[:space:]]*(${verb}\|[a-z-]+|[a-z-]+\|${verb}|${verb})\)" "$SRC/cmd_task.sh" "$SRC"/task/*.sh \
+    && ok_t "verb 'task ${verb}' named by the clause exists in the dispatcher" \
+    || bad_t "verb 'task ${verb}' named by the clause exists" "not in $SRC/cmd_task.sh or $SRC/task/*.sh"
+done
 
 # A delivered task, woken for the verifier: assignee is olivia, not dev.
 [[ -z "$(_hb_loop_terminal_clause dev "$grade" "DIVE-$grade")" ]] \
@@ -213,6 +301,24 @@ rshow=$(cmd_task_show "$live" 2>&1)
 [[ -z "$(_hb_loop_terminal_clause olivia "$live" "DIVE-$live")" ]] \
   && ok_t "post-reject re-wake of the verifier => no clause" \
   || bad_t "post-reject re-wake of the verifier => no clause"
+
+# ---- 5. DIVE-2834 LIVENESS: a real `task assign` produces the state the routing
+# clause names, and the clause STOPS once the row has left the agent. Same trap as
+# the other two halves: without this the clause could name a string no verb emits.
+task_actor() { echo olivia; }
+aout=$(cmd_task_assign "$grade" main 2>&1)
+ashow=$(cmd_task_show "$grade" 2>&1)
+[[ "$ashow" == *"assignee = main"* ]] \
+  && ok_t "liveness: 'task show' prints the 'assignee = main' the routing clause names" \
+  || bad_t "liveness: 'task show' prints 'assignee = main'" "got: $aout / $ashow"
+[[ -z "$(_hb_loop_terminal_clause olivia "$grade" "DIVE-$grade")" ]] \
+  && ok_t "post-reassign re-wake of the router => no clause (goal already met)" \
+  || bad_t "post-reassign re-wake of the router => no clause"
+# And the row is now the MAKER's: reassign did not silently close or cancel it.
+gst=$(db "SELECT status FROM tasks WHERE id=${grade};")
+[[ "$gst" == "todo" ]] \
+  && ok_t "liveness: reassign leaves the row open (todo) — it routes, never closes" \
+  || bad_t "liveness: reassign leaves the row open" "got: $gst"
 
 echo
 printf 'tests: %d passed, %d failed\n' "$PASS" "$FAIL"

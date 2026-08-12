@@ -45,6 +45,20 @@ set -uo pipefail
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+
+# DIVE-2770: the merge gate gained a CREDENTIAL-FREE rail (an unauthenticated read
+# of a public repo). Every no-token arm below was written when "no credential"
+# meant "no rail", and with the anon rail live they would reach the real network
+# and grade a LIVE PR instead of the fixture. Turn it off here: these harnesses
+# grade the pre-2770 rails, and tests/task_merge_gate_anon_rail_unit.sh grades the
+# new one. This is also what keeps `no root, no network` true of this file.
+#
+# IT MUST SIT AFTER lib/grading_tree.sh, AND THAT IS NOT A STYLE CHOICE: that file
+# sources lib/env_isolation.sh, which CLEARS inherited FIVE_* knobs so a harness
+# never grades the caller's environment. Set above it, this export is wiped and the
+# harness silently reaches the network instead — measured, and it read as three
+# unrelated assertion failures naming a live PR's real state.
+export FIVE_GATE_NO_ANON=1
 trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
@@ -103,6 +117,15 @@ if [[ "$1" == "pr" && "$2" == "list" ]]; then
   printf '%s' "${!lx:-[]}" | jq -r "$expr" 2>/dev/null; exit 0
 fi
 if [[ "$1" == "pr" && "$2" == "view" ]]; then
+  # DIVE-2720: GH_STUB_NOSTATE models the OTHER unresolved route — the query
+  # SUCCEEDS (exit 0) but the payload carries no .state key at all, so `gh -q .state`
+  # emits the LITERAL four-character string 'null'. That is not empty, so it reaches
+  # the gate as a value rather than as an absence. Distinct from the empty case below,
+  # which models a query that never returned.
+  if [[ -n "${GH_STUB_NOSTATE:-}" ]]; then
+    printf '%s' "{\"mergedAt\":${GH_STUB_MERGED:-null},\"statusCheckRollup\":[]}" \
+      | jq -r "$expr" 2>/dev/null; exit 0
+  fi
   # An EMPTY GH_STUB_STATE models a query that returned nothing at all (the ref is
   # invisible to this token / deleted / gh failed), not a PR in state "".
   [[ -n "${GH_STUB_STATE:-}" ]] || exit 1
@@ -153,7 +176,7 @@ commits()   { local o="["; local s; for s in "$@"; do o="$o{\"commit\":{\"messag
 no_token()  { unset GH_TOKEN GITHUB_TOKEN; export SUDO_USER=""; export GH_STUB_AUTH_TOKEN=""; }
 a_token()   { unset GH_TOKEN GITHUB_TOKEN; export SUDO_USER=""; export GH_STUB_AUTH_TOKEN="tok-2318"; }
 clear_fx()  { local v; for v in $(compgen -v | grep -E '^GH_STUB_(COMMITS|CMP|PRLIST)_' || true); do unset "$v"; done
-              unset GH_STUB_STATE GH_STUB_MERGED; }
+              unset GH_STUB_STATE GH_STUB_MERGED GH_STUB_NOSTATE; }
 
 # ---------------------------------------------------------------------------
 # T1 — NO CREDENTIAL, declared delivery_ref. The refusal must name the missing
@@ -168,11 +191,17 @@ run_done D-1 --result='landed'
 [[ "$(slugof D-1)" == "done-merge-gate-no-credential" ]] \
   && ok_t 'T1 refuses under its OWN slug (the cause is recorded, not just the block)' \
   || bad_t 'T1 slug' "slug=[$(slugof D-1)] out=$OUT"
+# DIVE-2645: this refusal is NOT cut. main landed _gate_refuse_no_rail (DIVE-2770) while
+# this branch waited, WITH tests/task_merge_gate_anon_rail_unit.sh pinning "COULD NOT CHECK",
+# "BY FAULT" and "BY DESIGN" in it. Its length is carrying a real second next-action (a
+# verifier seat must reach for 'task verify --cmd=', not GH_TOKEN), so by this row's own
+# boundary it is substance, not archaeology. Cutting it means deleting a guard main just
+# added — a decision for main, not a merge resolution.
 [[ "$OUT" == *"COULD NOT CHECK"* && "$OUT" == *"no gh credential"* ]] \
   && ok_t 'T1 the message names the missing credential, like merge-audit already does' \
   || bad_t 'T1 names the credential' "out=$OUT"
 # THE REGRESSION ITSELF: the old string asserted a merge verdict nobody measured.
-[[ "$OUT" != *"is not merged to main yet"* && "$OUT" != *"state=unknown"* ]] \
+[[ "$OUT" != *"not merged to main"* && "$OUT" != *"state=unknown"* ]] \
   && ok_t 'T1 does NOT claim the PR is unmerged — an unknown is not a negative' \
   || bad_t 'T1 must not assert a merge verdict' "out=$OUT"
 
@@ -186,9 +215,29 @@ run_done D-2 --result='landed'
 [[ $RC -eq $E_CONFLICT && "$(slugof D-2)" == "done-pr-state-unresolved" ]] \
   && ok_t 'T2 an unanswerable PR query refuses as UNRESOLVED, not as not-merged' \
   || bad_t 'T2 unresolved slug' "rc=$RC slug=[$(slugof D-2)] out=$OUT"
-[[ "$OUT" == *"COULD NOT READ"* && "$OUT" != *"is not merged to main yet"* ]] \
+[[ "$OUT" == *"could not read"* && "$OUT" != *"not merged to main"* ]] \
   && ok_t 'T2 says the question was never answered' \
   || bad_t 'T2 wording' "out=$OUT"
+
+# ---------------------------------------------------------------------------
+# T2b — DIVE-2720. Token present, and the PR query SUCCEEDS — but the payload has
+# no .state field, so `gh -q .state` hands back the LITERAL string 'null'. Four
+# characters, not empty, so it slipped T2's `-z "$_state"` guard and fell through
+# to the DIVE-1830 refusal, which printed "not merged to main yet (..., state=null
+# — MEASURED, not assumed)". Same defect as T1/T2 by a different route: a question
+# that was never ANSWERED rendered as a measured no, with MEASURED stamped on it.
+# The unresolved route here is a SUCCESSFUL call with an unusable payload, not a
+# failed one — which is exactly why the empty-string guard did not cover it.
+# ---------------------------------------------------------------------------
+clear_fx; a_token; export GH_STUB_NOSTATE=1
+seed D-20; bind_pr D-20 'https://github.com/5dive-ai/5dive/pull/2720'
+run_done D-20 --result='landed'
+[[ $RC -eq $E_CONFLICT && "$(slugof D-20)" == "done-pr-state-unresolved" ]] \
+  && ok_t 'T2b a payload with NO .state refuses as UNRESOLVED, not as not-merged (DIVE-2720)' \
+  || bad_t 'T2b unresolved slug' "rc=$RC slug=[$(slugof D-20)] out=$OUT"
+[[ "$OUT" != *"is not merged to main yet"* && "$OUT" != *"state=null"* ]] \
+  && ok_t 'T2b never asserts a merge verdict off the literal string null' \
+  || bad_t 'T2b must not assert a merge verdict' "out=$OUT"
 
 # ---------------------------------------------------------------------------
 # T3 — ANCHOR. A real negative must survive all of this: an OPEN PR is a MEASURED
@@ -226,7 +275,7 @@ run_done B-2 --result='landed'
 [[ $RC -eq $E_CONFLICT && "$(slugof B-2)" == "done-attribution-unresolved" ]] \
   && ok_t 'T5 an unreachable attribution scan refuses as UNRESOLVED, under its own slug' \
   || bad_t 'T5 unreachable slug' "rc=$RC slug=[$(slugof B-2)] out=$OUT"
-[[ "$OUT" == *"COULD NOT SCAN"* && "$OUT" != *"MEASURED"* ]] \
+[[ "$OUT" == *"could not be scanned"* && "$OUT" != *"landed"* ]] \
   && ok_t 'T5 describes the scan, and asserts nothing about the branch' \
   || bad_t 'T5 wording' "out=$OUT"
 
@@ -270,7 +319,7 @@ eval "$attr_impl"
 # exact assertion). Pin the phrase that immediately precedes $_attr_unreach in the
 # message instead, so the comma-joined list is graded in its own position.
 [[ $RC -eq $E_CONFLICT && "$(slugof B-6)" == "done-attribution-unresolved" \
-   && "$OUT" == *"COULD NOT SCAN main in lodar/5dive-api, lodar/5dive-frontend for a commit naming"* ]] \
+   && "$OUT" == *"main in lodar/5dive-api, lodar/5dive-frontend could not be scanned"* ]] \
   && ok_t 'T5c DIVE-2324: names EVERY unreachable repo, not just the last' \
   || bad_t 'T5c accumulate unreachable' "rc=$RC slug=[$(slugof B-6)] out=$OUT"
 

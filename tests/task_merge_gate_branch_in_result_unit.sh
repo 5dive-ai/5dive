@@ -30,6 +30,20 @@ set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+
+# DIVE-2770: the merge gate gained a CREDENTIAL-FREE rail (an unauthenticated read
+# of a public repo). Every no-token arm below was written when "no credential"
+# meant "no rail", and with the anon rail live they would reach the real network
+# and grade a LIVE PR instead of the fixture. Turn it off here: these harnesses
+# grade the pre-2770 rails, and tests/task_merge_gate_anon_rail_unit.sh grades the
+# new one. This is also what keeps `no root, no network` true of this file.
+#
+# IT MUST SIT AFTER lib/grading_tree.sh, AND THAT IS NOT A STYLE CHOICE: that file
+# sources lib/env_isolation.sh, which CLEARS inherited FIVE_* knobs so a harness
+# never grades the caller's environment. Set above it, this export is wiped and the
+# harness silently reaches the network instead — measured, and it read as three
+# unrelated assertion failures naming a live PR's real state.
+export FIVE_GATE_NO_ANON=1
 trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
@@ -137,6 +151,48 @@ out=$(_gate_branch_refs_from_text 'closing DIVE-2556 as verified, no code involv
   && ok_t 'extractor does NOT match the bare ident with no trailing slug' \
   || bad_t 'extractor over-matched a bare ident' "out=$out"
 
+# --- 0b. DIVE-3265: A FILE IS NOT A BRANCH ------------------------------------
+# The measured defect. A non-repo row delivers an ARTIFACT named by the same
+# "<ident>-<kebab>" convention as a branch; the extractor could not tell them
+# apart, so DIVE-3264's design doc made the gate demand that a branch of that
+# name land on main — impossible, the deliverable is a file in a tree that is not
+# a git repo — and the row became uncloseable with no escape (results are
+# PRESERVED, `set-branch <id> ''` is rejected). Graded as a CLASS, not as the one
+# filename: the path form, the bare-basename form, and a non-.md artifact.
+#
+# THE POSITIVE CONTROLS ARE THE LOAD-BEARING HALF. Every negative below is
+# satisfiable by an extractor that returns nothing at all, so each is paired with
+# a hit the filter must still let through — the same discipline the DIVE-2603
+# rc arms at the bottom of this file use.
+#
+# MUTATION GRADE: delete the `grep -ivE '\.(md|...)$'` line from the extractor ->
+# the three negatives FAIL. Widen it to strip any dotted suffix (`\.[a-z]+$`) ->
+# the `v1.2` positive FAILS.
+out=$(_gate_branch_refs_from_text 'design doc delivered: community/designs/dive-3264-svc-5dive-api-account-split.md' 'DIVE-3264')
+[[ -z "$out" ]] \
+  && ok_t 'DIVE-3265: an artifact PATH ending .md is not read as a branch (the measured DIVE-3264 shape)' \
+  || bad_t 'DIVE-3265: artifact path must not extract' "out=$out — this is the refusal that bricked DIVE-3264"
+out=$(_gate_branch_refs_from_text 'wrote dive-3264-svc-5dive-api-account-split.md and handed it over' 'DIVE-3264')
+[[ -z "$out" ]] \
+  && ok_t 'DIVE-3265: a bare .md BASENAME (no path) is not read as a branch either' \
+  || bad_t 'DIVE-3265: bare basename must not extract' "out=$out"
+out=$(_gate_branch_refs_from_text 'applied DIVE-3264-account-split.patch on top' 'DIVE-3264')
+[[ -z "$out" ]] \
+  && ok_t 'DIVE-3265: the rule is the CLASS of artifact extensions, not just .md' \
+  || bad_t 'DIVE-3265: .patch must not extract' "out=$out"
+out=$(_gate_branch_refs_from_text 'landed dive-3264-svc-account-split on main' 'DIVE-3264')
+[[ "$out" == "dive-3264-svc-account-split" ]] \
+  && ok_t 'DIVE-3265 positive control: the SAME slug with no extension is still a branch' \
+  || bad_t 'DIVE-3265 positive control: extension-less slug still extracts' "out=$out — the filter is over-broad and DIVE-2577 coverage is gone"
+out=$(_gate_branch_refs_from_text 'pushed https://github.com/5dive-ai/5dive/tree/dive-3264-svc-account-split' 'DIVE-3264')
+[[ "$out" == "dive-3264-svc-account-split" ]] \
+  && ok_t 'DIVE-3265: a branch inside a forge URL still extracts (the rule is a SUFFIX test, not a path test)' \
+  || bad_t 'DIVE-3265: forge-URL branch still extracts' "out=$out — a path-shaped rejection would cost this shape for nothing"
+out=$(_gate_branch_refs_from_text 'cut branch dive-3264-retry-v1.2 for the second attempt' 'DIVE-3264')
+[[ "$out" == "dive-3264-retry-v1.2" ]] \
+  && ok_t 'DIVE-3265: a dotted branch name that is not an ARTIFACT extension survives' \
+  || bad_t 'DIVE-3265: dotted non-extension branch survives' "out=$out — the filter must be an extension denylist, not 'any dotted suffix'"
+
 # --- 1. THE DIVE-2556 SHAPE: unbound, result names an unlanded branch -> REFUSE
 clear_fx
 export GH_STUB_COMMITS_5dive_main="$NO_MATCH_COMMITS"
@@ -147,7 +203,7 @@ if [[ $RC -ne 0 && "$(statusof DIVE-2556)" == "in_progress" && "$(refusals DIVE-
 else
   bad_t 'DIVE-2556 shape must refuse' "rc=$RC status=$(statusof DIVE-2556) refusals=$(refusals DIVE-2556) out=$OUT"
 fi
-[[ "$OUT" == *"dive-2556-maker-credit"* && "$OUT" == *DIVE-2577* ]] \
+[[ "$OUT" == *"dive-2556-maker-credit"* && "$OUT" == *"landed"* ]] \
   && ok_t 'the refusal names the branch and the ticket' \
   || bad_t 'refusal should name branch + DIVE-2577' "out=$OUT"
 
@@ -223,10 +279,51 @@ _r_hit="$(_rc_probe 'landed on DIVE-999-some-slug today')"
 [[ "${_r_hit%%|*}" == "0" && "${_r_hit#*|}" == "dive-999-some-slug" ]] \
   && ok_t "DIVE-2603: positive control — the extractor still finds a real branch (rc=0)" \
   || bad_t "DIVE-2603: positive control" "expected rc=0 and dive-999-some-slug, got ${_r_hit}"
-grep -qE '_br_cands=\$\(_gate_branch_refs_from_text [^)]*\) \|\| _br_cands=' "$SRC/cmd_task.sh" \
+grep -qE '_br_cands=\$\(_gate_branch_refs_from_text [^)]*\) \|\| _br_cands=' "$SRC/cmd_task.sh" "$SRC"/task/*.sh \
   && ok_t "DIVE-2603: the call site GUARDS the assignment so a no-match cannot kill the close" \
   || bad_t "DIVE-2603: call site guarded" "the \$( ) assignment is unguarded — under set -e + pipefail a result naming no branch kills 'task done' with empty stdout and stderr"
 
+
+# --- 6. DIVE-3265 TRUE-POSITIVE ARMS: the control still FIRES ------------------
+# Marcus's merge condition, and it is the right one to insist on: this is a change
+# to a SAFETY CONTROL, so the arm that matters is not that the false positive
+# stopped firing — it is that the TRUE positive still does. "A gate that stops
+# crashing by learning to pass everything" is indistinguishable from a fix when you
+# only grade the thing that used to be red.
+#
+# 6a is the sharp one: a close carrying BOTH a real unlanded branch AND an artifact
+# filename must still REFUSE. If the extension filter were reachable as a laundering
+# route — name your branch, name a .md, watch the gate go quiet — that is a worse
+# defect than the one being fixed, and it would look identical from the outside.
+clear_fx
+export GH_STUB_COMMITS_5dive_main="$NO_MATCH_COMMITS"
+seed DIVE-2556
+run_done DIVE-2556 --result='delivered the note dive-2556-handoff.md; commit dc336f7 on branch dive-2556-maker-credit is UNPUSHED'
+if [[ $RC -ne 0 && "$(statusof DIVE-2556)" == "in_progress" ]]; then
+  ok_t 'DIVE-3265 6a TRUE POSITIVE: an .md alongside a REAL unlanded branch does not launder it — still REFUSED'
+else
+  bad_t 'DIVE-3265 6a TRUE POSITIVE: still refuses' "rc=$RC status=$(statusof DIVE-2556) — the extension filter became a bypass; that is worse than the bug it fixed. out=$OUT"
+fi
+printf '%s' "$OUT" | grep -q 'dive-2556-maker-credit' \
+  && ok_t 'DIVE-3265 6a: the refusal still names the BRANCH (and not the artifact)' \
+  || bad_t 'DIVE-3265 6a: refusal names the branch' "out=$OUT"
+printf '%s' "$OUT" | grep -q 'dive-2556-handoff.md' \
+  && bad_t 'DIVE-3265 6a: the refusal must NOT name the artifact' "the .md is back in the candidate set: $OUT" \
+  || ok_t 'DIVE-3265 6a: the artifact is absent from the refusal (it was never a candidate)'
+
+# 6b: the DIVE-1830 DECLARED-`Branch:` path is a DIFFERENT reader and must be
+# untouched by this change. Asserted structurally rather than inferred from the
+# sibling harness staying green: `_gate_branch_refs_from_text` has exactly TWO
+# callers, both on the unbound auto-detect path, so the bound gate cannot have
+# been widened. If a third caller ever appears, this arm is the tripwire.
+# `|| _callers=0` because `grep -c` exits 1 on a zero count — the same unguarded-probe
+# shape this very ticket is about, caught by scripts/unguarded-probe-scan.sh in CI. A
+# bare substitution here would make the arm report "0 call sites" as a crash instead of
+# as the answer it is.
+_callers=$(cat "$SRC/cmd_task.sh" "$SRC"/task/*.sh | grep -cE '^[^#]*_gate_branch_refs_from_text "') || _callers=0
+[[ "$_callers" == "2" ]] \
+  && ok_t 'DIVE-3265 6b: the extractor still has exactly 2 call sites — the declared-`Branch:` gate does not read it and was not widened' \
+  || bad_t 'DIVE-3265 6b: extractor call-site count' "found $_callers call sites, expected 2 — a new caller inherits this filter; re-argue the bias before shipping it"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

@@ -161,7 +161,7 @@ _council_help() {
                                      [--bench=<name>] [--class=<decisionClass>]
                                      [--threshold=<n>]
                                      [--timeout=120] [--idle-secs=5] [--poll-secs=2] [--standalone]
-      Convene a council over a question. By DEFAULT (CNCL-7) it DISPATCHES the question
+      Convene a council over a question. By DEFAULT it DISPATCHES the question
       to the real seated agents — each seat votes via its OWN harness over the
       `5dive agent ask` rail, no shared model key. A seat that times out or replies
       without a COUNCIL-VOTE line is a recorded ABSTAIN; a convene that falls below
@@ -169,7 +169,7 @@ _council_help() {
       is BLIND (no seat sees another before its own vote); adversarial adds a rebuttal
       round, recorded separately. Emits an auditable verdict (deterministic tally over
       the current roster) and a tamper-evident, root-signed receipt. On a primary-council
-      PASS it also OFFERS the founder veto to the genesis principal (CNCL-9, non-blocking):
+      PASS it also OFFERS the founder veto to the genesis principal (, non-blocking):
       the pass stands, the receipt stamps executeAfter + a one-time tap nonce, and a ping
       fires. Defaults to the 5-seat standing Council. --standalone selects the deferred
       single-key modelCall seam instead of dispatch.
@@ -179,14 +179,14 @@ _council_help() {
                             [--bench=<name>] [--mode=quick|deliberate|adversarial] [--class=<c>]
                             [--max-actions=N] [--ballot-deadline=<secs>] [--context-cmd="<sh>"] [--no-cron]
   5dive council schedule ls | show <name> | rm <name> | run <name> [--dry]
-      Productize a recurring convene (CNCL-23). `add` binds a NAMED convene template to a cron
+      Productize a recurring convene. `add` binds a NAMED convene template to a cron
       expression and installs a managed crontab line (rides the existing cron rail — NO daemon;
       --no-cron just saves the config + prints the line). The question template may embed {{date}}
       and {{context}}; --context-cmd is a shell snippet run at each fire whose (bounded) stdout fills
       {{context}} (e.g. funnel numbers + open queue). `run <name>` is what cron calls: it gathers
-      context, convenes on the DEFAULT ballot rail (no pane-scrape, CNCL-18 — convene seals its own
+      context, convenes on the DEFAULT ballot rail (no pane-scrape, — convene seals its own
       receipt into the lineage), then files up to --max-actions `ACTION: <title>` items from seat
-      rationales as `--from=council` board tasks. An inquorate run is a CNCL-18 signal, never fatal.
+      rationales as `--from=council` board tasks. An inquorate run is a signal, never fatal.
       `schedule add|rm` write the root-owned council dir — run under sudo. Config: schedules.json.
 
   5dive council veto exercise --receipt=<sealed digest> --nonce=<tap nonce>
@@ -201,14 +201,14 @@ _council_help() {
   5dive council sign-vote --seat=<id> --vote=<approve|reject|escalate|abstain>
                           --convene=<id> (--qdigest=<hex> | --question=<text>)
                           --key-file=<seat PKCS8 PEM | "-"> [--rationale=…] [--emit=line|json]
-      (CNCL-10) A SEAT signs its own vote at source, from its OWN harness — sign-at-source,
+ A SEAT signs its own vote at source, from its OWN harness — sign-at-source,
       so the shell is the surface (a seat has no node of its own). Emits the `COUNCIL-SIG:`
       line the seat pastes after its COUNCIL-VOTE line (--emit=json for the full row). The
       convene id + question digest are in the signed bytes, so the signature is replay-proof.
 
   5dive council verify-votes --votes=<json|@file> --roster=<json|@file>
                              --convene=<id> (--qdigest=<hex> | --question=<text>)
-      (CNCL-10) Re-check EVERY co-signed vote against the roster pubkeys + revocation, bound
+ Re-check EVERY co-signed vote against the roster pubkeys + revocation, bound
       to THIS convene. Exits non-zero if any non-abstain vote is unsigned/forged/replayed/
       revoked, so a caller can gate on the exit code.
 
@@ -221,7 +221,7 @@ _council_help() {
       privileged governance writes and need sudo).
 
   5dive council gate-clear <task|DIVE-N> [--mode=deliberate] [--seats=a,b,c] [--dry-run]
-      (CNCL-12) Route an OPEN tier-1 gate to the council. The escalate-only guardrail
+ Route an OPEN tier-1 gate to the council. The escalate-only guardrail
       runs first: a tier>=2 gate or a human-only type (secret/approval/manual/access)
       is NEVER self-cleared — it is bumped to a human with a one-paragraph brief. A genuine
       tier-1 gate is convened (default: the primary Council), and the sealed verdict either
@@ -229,7 +229,7 @@ _council_help() {
       --dry-run prints the planned action without touching the gate.
 
   5dive council rot-triage [<task|DIVE-N> | --all] [--older-than-hours=48] [--dry-run]
-      (CNCL-12) Rot-triage stale tier-2 gates: a tier-2 gate left UNANSWERED for 48h+
+ Rot-triage stale tier-2 gates: a tier-2 gate left UNANSWERED for 48h+
       is convened ONLY to re-brief it sharper for the human (and, in that brief, propose
       a rescope or a park+wake). It NEVER clears a tier-2 gate — tier-2 stays human-only
       (fail-closed). --all scans every stale tier-2 gate; --dry-run lists them without
@@ -1239,6 +1239,41 @@ export function canonicalTranscript(rec) {
   const unreached = (rec.votes || []).filter(v => v && v.capture === false)
   if (unreached.length) {
     L.push(`unreached: ${unreached.map(v => `${norm(v.seat)}:${norm(v.abstainKind || 'unknown')}`).slice().sort().join(',')}`)
+  }
+  // DIVE-2891: SEAL WHICH SILENCE IT WAS. `unreached:` above covers the seats we can show were
+  // never asked (capture === false). It does NOT cover the case that actually killed the 2026-08-07
+  // round: a seat we DID reach, that simply never answered. Under `quorum: all` +
+  // `require_quorum: true` an abstention is a SILENT VETO, so "withheld consent" and "could not
+  // answer" are the two readings a receipt most needs to separate — and until now it sealed nothing
+  // that could. codex's ballot went in_progress -> todo with 32 minutes left while the registry
+  // reported active/enabled; at the deadline the receipt sealed a bare abstain and the quota lock
+  // existed only in a tmux pane nobody had captured.
+  //
+  // These kinds record the BALLOT'S OBSERVED BEHAVIOUR (claimed/released/held/closed-without-voting),
+  // never a diagnosis. That distinction is load-bearing: the whole failure thread on this council is
+  // instruments that were right about a fact and wrong about the cause, in the direction that reads
+  // as recoverable.
+  //
+  // CONDITIONAL, on the CNCL-19 / DIVE-1869 precedent: emitted only for the `silent:` kinds this
+  // change introduces, tested BY THEIR OWN NAME.
+  //
+  // Iteration 1 filtered on `capture !== false && abstainKind`, on the stated premise that every
+  // pre-existing abstainKind site also sets capture:false. THAT PREMISE IS FALSE and olivia measured
+  // it: cli.mjs's `unparsed` kind — a seat that DID reply, off-format — has carried capture:true
+  // since long before this row. Two things followed from the wrong predicate, and they are the same
+  // defect pointing in both directions in time. Backwards: any historical receipt with an unparsed
+  // abstain would re-seal under NEW bytes and fail `council verify`. Forwards: a seat that spoke
+  // would be sealed onto a line named `silent:` — this row's own failure class, a record asserting
+  // a silence for a seat that was heard.
+  //
+  // A prefix test on the kind is not a tighter filter for the same idea; it is the idea. The
+  // historical invariance is then true BY CONSTRUCTION rather than by a census of writers that
+  // nothing enforces: no pre-existing kind starts with `silent:` because the prefix is minted here.
+  // Same substitution this row already made to council_dispatch_unit's DIVE-2220 arm — stop using a
+  // neighbouring field as a proxy for the property you mean, and assert the property.
+  const silent = (rec.votes || []).filter(v => v && v.vote === 'abstain' && String(v.abstainKind || '').startsWith('silent:'))
+  if (silent.length) {
+    L.push(`silent: ${silent.map(v => `${norm(v.seat)}:${norm(v.abstainKind)}`).slice().sort().join(',')}`)
   }
   const vd = rec.verdict || {}
   const t = vd.tally || {}
@@ -2307,7 +2342,18 @@ export function dispatchBallotVote(opts = {}) {
   // on its queued ballot until the deadline abstains it out. Halfway through the window we send ONE
   // best-effort wake nudge into the seat agent's pane. Injectable + never-throws; a nudge that can't
   // land just means the seat isn't roused early — the deadline/abstain path is unchanged either way.
-  const nudge = opts._nudge || ((agent, msg) => nudgeSeatAgent(agent, msg))
+  // DIVE-2914: this seam FAILS CLOSED when the caller has already declared itself offline. `_nudge`
+  // defaults to a LIVE rail (nudgeSeatAgent -> `5dive agent send <seat> …`) that is NOT part of the
+  // collect loop, so a harness that stubs `_exec` and forgets this one does not become offline — it
+  // becomes a test that messages a real seat. Not hypothetical: council_abstain_engagement_unit.mjs
+  // injected `_exec` alone and addressed three `agent send codex …` notices PER RUN to a live,
+  // quota-locked seat, about a stub ident (DIVE-77) that exists on no board.
+  // A caller that stubbed `_exec` has declared the CLI rail unavailable; the only coherent default for
+  // the OTHER exec rail is then a no-op that RECORDS why, which is also the honest ledger entry —
+  // nothing was sent. Production (seatVoteFor) injects NO seams at all, so this branch cannot reach it.
+  const nudge = opts._nudge || (opts._exec
+    ? () => ({ ok: false, why: 'nudge suppressed: _exec stubbed without _nudge (offline test context, DIVE-2914)' })
+    : ((agent, msg) => nudgeSeatAgent(agent, msg)))
   const nudgeFrac = Number(opts.nudgeFrac) > 0 && Number(opts.nudgeFrac) < 1 ? Number(opts.nudgeFrac) : 0.5
   // (d) COLLECT (shared by the agent + human branches): poll task show until the ballot task closes
   // with a result, or the deadline elapses. The collection-loop deadline is AUTHORITATIVE regardless
@@ -2324,16 +2370,47 @@ export function dispatchBallotVote(opts = {}) {
     // the deadline path — a seat that votes anyway needs no excuse for a lost nudge.
     let failure = priorFailure || null
     let delivered = false
+    // DIVE-2891 — THE ENGAGEMENT LEDGER. At 6/6 with requireQuorum, an abstention is a SILENT VETO,
+    // so "the seat withheld consent" and "the seat could not answer" have to stop rendering
+    // identically. Today they do not: a quota-locked seat and a seat that ignored its ballot both
+    // land on the same `no vote by deadline` string, and the receipt seals no field a later reader
+    // can separate them by. Proven live 2026-08-07 — codex's ballot went in_progress -> todo at
+    // ~10:40Z with 32 minutes left while `agent info codex` reported active/enabled, and the pane
+    // (the ONLY place the wall was legible) read "You've hit your usage limit".
+    //
+    // The signal was already in our hands and being thrown away: this loop polls `task show` every
+    // tick and reads a status it only ever tests for done/cancelled. The TRANSITIONS separate the
+    // cases at zero extra cost and with no pane-scraping:
+    //   · never left `todo`          -> the seat never claimed the ballot at all
+    //   · in_progress -> back to todo -> the seat ENGAGED AND THEN COULD NOT FINISH (the fingerprint
+    //                                    observed on the quota lock: claim, fail, release)
+    //   · still `in_progress` at the deadline -> the seat is working and ran out of window
+    //
+    // NAME THE OBSERVATION, NEVER THE CAUSE. A release is not proof of a throttle — it is what the
+    // throttle looked like once. This whole page of failures is instruments that were right about a
+    // fact and wrong about the cause, in the direction that reads as recoverable, so these kinds say
+    // what the ballot DID and leave the diagnosis to a reader who can see the pane.
+    let sawPickup = false        // the ballot reached in_progress at least once
+    let releases = 0             // in_progress -> todo transitions (claimed, then handed back)
+    let lastStatus = null
     while (now() < deadlineAt) {
       let row = null
       try {
         const env = JSON.parse(exec(['task', 'show', String(taskId), '--json']))
         row = env && env.data && env.data.task
       } catch { row = null }
+      if (row && row.status) {
+        if (row.status === 'in_progress') sawPickup = true
+        if (lastStatus === 'in_progress' && row.status === 'todo') releases += 1
+        lastStatus = row.status
+      }
       if (row && (row.status === 'done' || row.status === 'cancelled')) {
         const result = row.result || ''
         return E.parseVote(result) ||
-          { vote: 'abstain', rationale: `${seat.id} ${kind} ${taskId}: closed with no COUNCIL-VOTE line (deadline/no-vote)` }
+          // DIVE-2891: a ballot the seat CLOSED without a vote line is a fourth silence, and the
+          // most misleading one — the task went done, so every board and digest reads it as worked.
+          { vote: 'abstain', abstainKind: 'silent:closed-no-vote',
+            rationale: `${seat.id} ${kind} ${taskId}: closed with no COUNCIL-VOTE line (deadline/no-vote). OBSERVED: the seat CLOSED the ballot (${row.status}) without casting — the ballot was worked, the vote was not recorded.` }
       }
       if (nudgeInfo && !nudged && now() >= nudgeAt) {
         nudged = true
@@ -2379,7 +2456,19 @@ export function dispatchBallotVote(opts = {}) {
     // show about delivery. `nudged` says a wake reached the seat; `queued` says only that the ballot
     // task was minted into its queue and the mid-window nudge never fired.
     const told = nudgeInfo ? (delivered ? `; nudged ${nudgeInfo.agent} mid-window` : '; ballot queued, no mid-window nudge fired') : ''
-    return { vote: 'abstain', rationale: `${seat.id} ${kind} ${taskId}: no vote by deadline ${deadlineIso} (deadline/no-vote${told})` }
+    // DIVE-2891: this abstention is REAL for tally purposes and stays so — the vote, the counts and
+    // quorum are untouched, which is the whole point of remedy (a). What changes is that the record
+    // now says WHICH silence it was, from the transitions this loop already watched. `capture` is
+    // deliberately NOT set: we cannot show the seat was never asked, so calling it a capture failure
+    // would be a stronger claim than the evidence, and would move counts captureAudit feeds.
+    const silence = releases > 0 ? 'released' : (lastStatus === 'in_progress' ? 'held-open' : 'no-pickup')
+    const seen = releases > 0
+      ? `CLAIMED THEN RELEASED the ballot ${releases}x (last status ${lastStatus || 'unknown'}) — the seat engaged and did not finish`
+      : (lastStatus === 'in_progress'
+        ? 'held the ballot in_progress to the deadline — the seat engaged and ran out of window'
+        : `never moved the ballot off ${lastStatus || 'todo'} — the seat did not claim it`)
+    return { vote: 'abstain', abstainKind: `silent:${silence}`,
+             rationale: `${seat.id} ${kind} ${taskId}: no vote by deadline ${deadlineIso} (deadline/no-vote${told}). OBSERVED: ${seen}. This records what the ballot did, NOT why — a release is what the 2026-08-07 quota lock looked like, it is not proof of one; read the seat's pane before calling this dissent or a throttle.` }
   }
   return async (seat, ctx) => {
     const prompt = E.seatPrompt(seat, ctx)   // blind in round 1 (engine-guaranteed)
@@ -2619,7 +2708,7 @@ function knownRegistryAgents() {
 function preflightSeats(seats) {
   const known = knownRegistryAgents()
   if (known === null) {
-    die("council pre-flight FAILED: could not read the agent registry (`5dive agent list --json`) — refusing to convene rather than silently abstain unreachable seats.", 6)
+    die(`council pre-flight FAILED: could not read the agent registry (5dive agent list --json) — refusing to convene`, 6)
   }
   const unresolved = seats
     .map(s => ({ id: (s && s.id) || String(s), agent: E.resolveSeatAgent(s) }))
@@ -2648,7 +2737,7 @@ function canDeliver() {
 }
 function preflightDelivery() {
   if (canDeliver()) return
-  die("council pre-flight FAILED: this caller cannot reach the seat-delivery rail — `5dive agent _deliver` is root-scoped and `sudo -n` is denied here, so EVERY seat ballot would fail on delivery and be recorded as an abstain (a permissions outage sealing as a unanimous abstention). Re-run the convene as root (`sudo 5dive council convene ...`), or re-provision this agent so it holds the `_deliver` grant. Refusing to convene.", 6)
+  die(`council pre-flight FAILED: cannot reach the seat-delivery rail — no \`_deliver\` grant here; re-run with sudo`, 6)
 }
 
 // DIVE-1739: seat LIVENESS map — registry name -> health {asleep,deaf,...} from `agent list --json`.
@@ -2706,7 +2795,12 @@ export function preflightLiveness(seats, opts = {}) {
   if (health === null) {
     die('council liveness pre-flight FAILED: could not read seat health (`agent list --json`) — refusing to dispatch a full-quorum motion rather than gamble it into a structural inquorate.', 6)
   }
-  const nudge = opts._nudge || nudgeSeatAgent
+  // DIVE-2914: same fail-closed rule as dispatchBallotVote's seam. A caller that injected `_health`
+  // has declared itself offline (no real `agent list`); defaulting the WAKE rail to a live
+  // `agent send` there would message real seats from a test that believes it is isolated.
+  const nudge = opts._nudge || (opts._health
+    ? () => ({ ok: false, why: 'nudge suppressed: _health stubbed without _nudge (offline test context, DIVE-2914)' })
+    : nudgeSeatAgent)
   const unreachable = []
   for (const s of seats) {
     if (E.seatIsHuman(s)) continue
@@ -2964,7 +3058,7 @@ async function cmdConvene() {
         }))
       } catch { /* best-effort: the loud refusal below is unaffected */ }
     }
-    die(`council convene FAILED TO DELIVER — 0 of ${vf.seatCount} seats were reached (${vf.captureFailed} capture failure(s): ${who}). This is a TRANSPORT/PERMISSIONS outage, NOT an abstention, so no verdict was reached and NO receipt was sealed. First failure: ${why}. Fix the rail (root/_deliver grant, agent running, task queue writable) and re-convene.`, 7)
+    die(`council convene FAILED TO DELIVER — 0 of ${vf.seatCount} seats reached (${vf.captureFailed} capture failure(s): ${who}). Transport/permissions outage, NOT an abstention: no verdict, NO receipt was sealed. First failure: ${why}. Fix the rail, then re-convene.`, 7)
   }
   out({
     council: input.councilName, mode: result.mode, question,
@@ -3014,7 +3108,7 @@ function cmdBench() {
   // `sudo bench rm council` would bypass the whole governance layer). Motions land in a later
   // wave; until then the guard is the load-bearing invariant.
   if ((action === 'add' || action === 'rm') && positionals[1] === 'council') {
-    die("'council' is the primary governance body — its seats change ONLY via promote/demote motions, never raw bench add/rm (re-seed the whole roster with: sudo 5dive council init --force).", 7)
+    die("'council' seats change only via promote/demote motions — to re-seed: sudo 5dive council init --force", 7)
   }
   if (action === 'add') {
     const name = positionals[1]; if (!name) die('bench add needs a name')
@@ -3144,7 +3238,7 @@ function cmdInit() {
   const principal = flag('veto')
   if (!principal || principal === true) die('init needs --veto=<principal> (a resolvable human, e.g. human:main)')
   const resolved = flag('veto-resolved')   // bash resolves the principal -> tg user_id
-  if (!resolved || resolved === true) die(`veto principal "${principal}" did not resolve to a real recipient — init rejects an unknown/unresolvable principal (fail-closed).`, 6)
+  if (!resolved || resolved === true) die(`veto principal "${principal}" did not resolve — use human:<agent> (a paired agent) or tg:<user_id>`, 6)
   let rec
   try {
     rec = E.buildGenesisRecord({
@@ -3231,7 +3325,7 @@ function cmdConstitutionMerge() {
   else baseText = E.renderConstitutionV0()
   let raw
   try { raw = E.parseConstitutionFrontmatter(baseText) }
-  catch (e) { die(`constitution-merge: the current constitution does not parse (${String(e && e.message || e)}) — refusing a structured write onto an unreadable base (fail-closed)`, 4) }
+  catch (e) { die(`constitution-merge: current constitution does not parse (${String(e && e.message || e)}) — refusing to write onto it`, 4) }
 
   // Read + STRICTLY whitelist the STDIN patch. Anything outside hard_gates/ship/comms is refused.
   let patch
@@ -3239,7 +3333,7 @@ function cmdConstitutionMerge() {
   catch (e) { die(`constitution-merge: invalid JSON on stdin (${String(e && e.message || e)})`, 2) }
   if (!patch || typeof patch !== 'object' || Array.isArray(patch)) die('constitution-merge: stdin must be a JSON object of structured fields', 2)
   const badTop = Object.keys(patch).filter(k => !MERGE_TOP.has(k))
-  if (badTop.length) die(`constitution-merge: field(s) not settable via the structured write path: ${badTop.join(', ')} (only hard_gates/ship/comms — governance changes go through 'council amend')`, 2)
+  if (badTop.length) die(`constitution-merge: not settable here: ${badTop.join(', ')} — only hard_gates/ship/comms (governance: council amend)`, 2)
 
   if (Object.hasOwn(patch, 'hard_gates')) {
     const hg = patch.hard_gates
@@ -3268,7 +3362,7 @@ function cmdConstitutionMerge() {
   // write can never produce a constitution that would not parse under the one shared parser.
   const text = serializeConstitution(raw)
   try { E.normalizeConstitution(E.parseConstitutionFrontmatter(text)) }
-  catch (e) { die(`constitution-merge: the merged constitution failed validation (${String(e && e.message || e)}) — refusing to emit (fail-closed)`, 4) }
+  catch (e) { die(`constitution-merge: merged constitution failed validation (${String(e && e.message || e)}) — refusing to emit`, 4) }
   process.stdout.write(text)
 }
 
@@ -3282,9 +3376,70 @@ function cmdDriftCheck() {
   process.exit(res.drifted ? 7 : 0)
 }
 
+// DIVE-2889 — THE BALLOT MUST CARRY THE CANDIDATE, NOT A 12-CHAR PREFIX OF ITS DIGEST.
+//
+// MEASURED (olivia as chair, from dev's finding on DIVE-2887, re-measured before filing): the
+// eng_approval_lead amendment was balloted TWICE on digest 6498adcb…, which RESOLVES TO NO FILE
+// ANYWHERE ON DISK. Both approving rationales claimed a direct read of the on-disk content — and
+// both statements were true about 8ee23dff… (the LIVE constitution), which is not what was
+// balloted. Two seats ran a verification that silently resolved to the live file and got a
+// CONFIRMATION instead of a finding. codex rejected both rounds on exactly this ground and was
+// right both times; the inquorate failure is the only thing that stopped an unreviewed policy
+// from sealing.
+//
+// THE SHARP DISTINCTION, and the reason no amount of seat diligence fixes this: "the candidate is
+// unavailable" and "the candidate is available and fine" are THE SAME SENTENCE ONE DIGEST APART.
+// A seat reading the ballot could not tell them apart, because the ballot named neither the path
+// nor the full digest — and the precedent block propagates a prior VERDICT and its prose but NOT
+// the digest that verdict was about, so case law cannot separate them either.
+//
+// TWO GUARDS, and the first is the one that matters:
+//
+//   1. THE DIGEST MUST BE THE DIGEST OF THE BYTES WE ARE BALLOTING. We already hold the candidate
+//      text here (we just parsed it), so re-derive its sha256 and REFUSE on mismatch. This is what
+//      makes 6498adcb… structurally unreachable: a digest that no longer corresponds to the bytes
+//      at the named path cannot reach a seat at all. Fail closed at mint, per the row — "a motion
+//      whose bytes cannot be located should not reach seats at all".
+//   2. THE BALLOT CARRIES path + FULL digest + diff-vs-live. Not so a stale objection stops
+//      recurring (that was the earlier, wrong framing, corrected on the wiki page) but so a seat's
+//      `verify` CANNOT silently resolve to the live file: with the full digest in the row,
+//      `sha256sum <path>` is a one-command binding rather than an eyeball comparison against a
+//      truncated prefix, and a seat with no sibling row to read still has a route to the bytes.
+//      Before this, both seats that went looking (DIVE-2882, DIVE-2886) had to locate the
+//      candidate independently, and that it worked is not the same as it being delivered.
+//
+// WHY THE DIFF IS CAPPED: this question becomes the ballot BODY for human seats too, delivered as
+// a Telegram message with a hard length limit — an uncapped diff would turn a governance change
+// into a capture failure, which is the same fail-open in a new coat. So the cap is deliberate and
+// the ballot always names the exact command for the full diff; the binding (path + full digest) is
+// never truncated, because that is the part a seat cannot reconstruct.
+// Sized against the transport, not against taste. The human-seat ballot body is
+// `${question}` + a ~250-char tap suffix, and a PRECEDENT block (one line per prior decision) can
+// precede the ask — all of it inside one Telegram message. Measured with a 400-line diff: 40
+// lines / 1600 chars puts the whole question near ~1.9k, leaving ~2k of headroom. The binding
+// itself is never counted against this cap; only the diff is clipped.
+const AMEND_DIFF_MAX_LINES = 40
+const AMEND_DIFF_MAX_CHARS = 1600
+
+// Cap the diff for the ballot body while making the truncation LOUD and self-repairing — a seat
+// that sees the marker knows it is reading a prefix and is told the command that yields the whole.
+function clipAmendDiff(diff, cmd) {
+  const raw = String(diff == null ? '' : diff).replace(/\s+$/, '')
+  if (!raw) return `(no textual diff — the candidate's bytes differ from live only in ways \`diff -u\` does not show, or live is absent; bind with the digest above, NOT with this block)`
+  const lines = raw.split('\n')
+  let clipped = lines.slice(0, AMEND_DIFF_MAX_LINES).join('\n')
+  if (clipped.length > AMEND_DIFF_MAX_CHARS) clipped = clipped.slice(0, AMEND_DIFF_MAX_CHARS)
+  if (clipped.length < raw.length) {
+    return `${clipped}\n… TRUNCATED (${lines.length} diff lines total; this ballot shows the first ${Math.min(lines.length, AMEND_DIFF_MAX_LINES)}). `
+      + `THIS IS A PREFIX, NOT THE DIFF — read the whole of it before voting: ${cmd}`
+  }
+  return clipped
+}
+
 // `amend-plan` — validate the PROPOSED constitution (must parse+normalize), then emit the
 // constitutional-class deliberation question over the full current roster (no recusal, full
-// quorum + 2/3 + founder veto follow from the constitutional class). Fails closed on a bad file.
+// quorum + 2/3 + founder veto follow from the constitutional class). Fails closed on a bad file,
+// and (DIVE-2889) on a candidate whose bytes it cannot bind to the digest it is about to ballot.
 function cmdAmendPlan() {
   const roster = readJsonFlag('seats-json')
   if (!Array.isArray(roster) || !roster.length) die('amend-plan needs the current roster --seats-json (fail-closed)', 3)
@@ -3292,13 +3447,56 @@ function cmdAmendPlan() {
   if (!proposed || proposed === true) die('amend-plan needs --constitution=@<file> (the proposed constitution.yaml)')
   const text = String(proposed).startsWith('@') ? fs.readFileSync(String(proposed).slice(1), 'utf-8') : String(proposed)
   try { E.normalizeConstitution(E.parseConstitutionFrontmatter(text)) }
-  catch (e) { die(`the proposed constitution.yaml is not a valid constitution — refusing to convene an amendment on it: ${String(e && e.message || e)}`, 4) }
+  catch (e) { die(`proposed constitution.yaml is not valid — refusing to convene an amendment: ${String(e && e.message || e)}`, 4) }
   const digest = flag('constitution-digest') === true || flag('constitution-digest') == null ? '' : String(flag('constitution-digest'))
+  const candPath = flag('constitution-path') === true || flag('constitution-path') == null ? '' : String(flag('constitution-path'))
+
+  // DIVE-2889 guard 1 — fail closed unless the digest we are about to ballot IS the digest of the
+  // bytes we just read. A prefix is not a binding and an unbindable motion does not reach seats.
+  if (!/^[0-9a-f]{64}$/i.test(digest)) {
+    die(`amend-plan needs the FULL 64-hex --constitution-digest of the candidate (got ${digest ? `"${digest}"` : 'nothing'}) — `
+      + `a ballot that carries only a truncated digest cannot be bound to a file by any seat (fail-closed, DIVE-2889)`, 4)
+  }
+  const actual = E.digestConstitution(text)
+  if (actual.toLowerCase() !== digest.toLowerCase()) {
+    die(`REFUSING TO MINT THIS BALLOT (DIVE-2889): the digest to be balloted (${digest}) is NOT the digest of the candidate's bytes `
+      + `(${actual}). This is the exact shape that put 6498adcb… in front of two rounds of seats while every "I verified the on-disk `
+      + `content" rationale was in fact describing the LIVE constitution. Re-digest the candidate and convene again.`, 4)
+  }
+  if (!candPath) {
+    die(`amend-plan needs --constitution-path=<path the seats can resolve> (fail-closed, DIVE-2889) — the ballot must name where the `
+      + `candidate's bytes live, or a seat's verification silently resolves to the live constitution and returns a confirmation`, 4)
+  }
+
+  const diffCmd = `diff -u ${flag('live-path') && flag('live-path') !== true ? String(flag('live-path')) : '<live constitution.yaml>'} ${candPath}`
+  const livePath = flag('live-path') === true || flag('live-path') == null ? '' : String(flag('live-path'))
+  const liveDigest = flag('live-digest') === true || flag('live-digest') == null ? '' : String(flag('live-digest'))
+  const diffRaw = flag('diff') === true || flag('diff') == null ? '' : String(flag('diff'))
+  const diffText = diffRaw.startsWith('@') ? (() => { try { return fs.readFileSync(diffRaw.slice(1), 'utf-8') } catch { return '' } })() : diffRaw
+
+  // The binding block. Deliberately BEFORE the ask, and deliberately naming what each field is for
+  // — a seat that reads only this block still has everything it needs to bind, and a seat that
+  // skips it has no honest way to claim it verified anything.
+  const binding = `\nCANDIDATE BINDING — the bytes this motion is about (DIVE-2889; verify before you vote):
+  path        ${candPath}
+  sha256      ${digest}
+  live        ${livePath || '(unknown)'}${liveDigest ? ` sha256 ${liveDigest}` : ''}
+  bind it     sha256sum ${candPath}     <- must print the sha256 above, exactly
+DO NOT verify by reading the live constitution: it will agree with itself and return a confirmation
+instead of a finding. That is what happened in both dead rounds of the eng_approval_lead amendment.
+If \`sha256sum\` does not reproduce the digest above, the ballot and the file have diverged — REJECT
+and say so; do not vote on bytes you could not bind.
+
+DIFF vs the live constitution (${diffCmd}):
+${clipAmendDiff(diffText, diffCmd)}
+`
+
   const question = `Constitution amendment motion (constitutional): should the Council RATIFY the proposed constitution.yaml `
-    + `(digest ${digest ? digest.slice(0, 12) + '…' : '?'})? This is the hardest bar — a 2/3 supermajority of ALL `
+    + `(sha256 ${digest})?${binding}This is the hardest bar — a 2/3 supermajority of ALL `
     + `${roster.length} seat(s) with full quorum, founder-veto-able. On a pass the new constitution is sealed into the `
     + `hash-chain and becomes the enforced governance policy. Approve to ratify, reject to keep the current constitution, escalate only if it genuinely needs a human.`
-  out({ class: 'constitutional', recuse: [], subject: null, votingSeats: roster, votingSeatSpec: seatsToSpec(roster), question, constitutionDigest: digest })
+  out({ class: 'constitutional', recuse: [], subject: null, votingSeats: roster, votingSeatSpec: seatsToSpec(roster), question,
+        constitutionDigest: digest, candidatePath: candPath, livePath: livePath || null, liveDigest: liveDigest || null })
 }
 
 // `amend-apply` — on a PASS only: build the hash-chained constitutional motion record carrying the
@@ -3309,7 +3507,7 @@ function cmdAmendApply() {
   if (!Array.isArray(roster) || !roster.length) die('amend-apply needs the current roster --seats-json (fail-closed)', 3)
   const verdict = readJsonFlag('verdict')
   if (!verdict || verdict.recommendation !== 'approve' || verdict.escalated) {
-    die(`amendment did not carry (recommendation=${verdict && verdict.recommendation}) — the constitution is unchanged, no lineage record written`, 5)
+    die(`amendment did not carry (${verdict && verdict.recommendation}) — constitution unchanged, no lineage record`, 5)
   }
   const digest = flag('constitution-digest') === true || flag('constitution-digest') == null ? '' : String(flag('constitution-digest'))
   if (!digest) die('amend-apply needs --constitution-digest=<sha256 of the ratified constitution.yaml> (fail-closed)', 4)
@@ -3496,6 +3694,15 @@ function motionFromFlags() {
 // registry bench is only a fallback for an uninitialized/ad-hoc council with no lineage yet.
 function cmdRoster() {
   const registryPath = flag('registry')
+  // DIVE-2890: the roster's threshold line used to be the GENESIS-sealed default spec alone, which
+  // is the `ordinary` rule. The enforced bar is per decision-CLASS (see convene's `policy:
+  // constitution.thresholds`), and for `constitutional` it is 2/3 with quorum ALL. Printing the
+  // default alone under-reported the constitutional quorum — wrong in the REASSURING direction (a
+  // seat mid-ballot reads "quorum 4", sees 4 cast, concludes its vote is redundant, abstains, and
+  // under require_quorum:true that abstention is what inquorates the motion). So resolve and emit
+  // EVERY declared class against the live roster size; bash prints the table.
+  const cpFlag = flag('constitution-path')
+  const constitution = E.loadConstitution(cpFlag === true || cpFlag == null ? '' : String(cpFlag))
   const lineageSeats = readJsonFlag('seats-json', { optional: true })
   let baseSeats, thresholdSpec, seededAt
   if (lineageSeats && lineageSeats.length) {
@@ -3516,6 +3723,32 @@ function cmdRoster() {
   const seatCount = (baseSeats || []).length
   const threshold = E.resolveThreshold(seatCount, thresholdSpec)
   const quorum = E.quorumSize(seatCount, thresholdSpec)
+  // Per-class table, resolved against THIS roster's seat count. normalizeConstitution() always
+  // fills every class in THRESHOLD_POLICY (declared or defaulted), so this is never partial.
+  const classSpecs = (constitution && constitution.thresholds) || E.THRESHOLD_POLICY
+  const classes = Object.keys(classSpecs).map(cls => {
+    const spec = classSpecs[cls] || {}
+    return {
+      class: cls,
+      threshold: E.resolveThreshold(seatCount, spec),
+      quorum: E.quorumSize(seatCount, spec),
+      requireQuorum: !!spec.requireQuorum,
+      spec,
+    }
+  })
+  // `--class=<name>` used to be SILENTLY ACCEPTED AND IGNORED: it printed the default line, so the
+  // one flag that looks like it answers "what is the bar for the motion in front of me" returned
+  // the wrong answer without erroring. Now it filters, and an unknown class fails closed.
+  const clsFlag = flag('class')
+  let onlyClass = null
+  if (clsFlag != null && clsFlag !== true) {
+    onlyClass = String(clsFlag)
+    if (!classes.some(c => c.class === onlyClass)) {
+      die(`unknown decision class '${onlyClass}' — declared classes: ${classes.map(c => c.class).join(', ')}`, 2)
+    }
+  } else if (clsFlag === true) {
+    die(`--class needs a value — declared classes: ${classes.map(c => c.class).join(', ')}`, 2)
+  }
   // CNCL-17: optionally fold each seat's TRACK RECORD (calibration vs real outcomes) into the
   // roster so membership is read alongside performance. bash passes the computed record via
   // --track-json (receipts scored against task outcomes); absent → roster stays as before.
@@ -3528,6 +3761,11 @@ function cmdRoster() {
     : baseSeats
   out({ council: 'council', seats, seatCount, threshold, quorum,
     thresholdSpec, seededAt,
+    // `classes` is the ENFORCED per-class bar; `threshold`/`quorum` above stay the genesis-sealed
+    // default spec (unchanged contract for existing callers), and are the `ordinary` case.
+    classes: onlyClass ? classes.filter(c => c.class === onlyClass) : classes,
+    selectedClass: onlyClass,
+    constitution: { path: constitution.path, source: constitution.source, valid: constitution.valid },
     scoredReceipts: tr ? tr.scoredReceipts : undefined })
 }
 
@@ -3568,7 +3806,7 @@ function cmdMotionApply() {
   const roster = readJsonFlag('seats-json')
   const verdict = readJsonFlag('verdict')
   if (!verdict || verdict.recommendation !== 'approve' || verdict.escalated) {
-    die(`motion did not carry (recommendation=${verdict && verdict.recommendation}) — the roster is unchanged, no lineage record written`, 5)
+    die(`motion did not carry (${verdict && verdict.recommendation}) — roster unchanged, no lineage record`, 5)
   }
   const cls = E.classifyMotion(motion)
   let newSeats
@@ -3638,7 +3876,7 @@ const main = async () => {
   if (sub === 'sign-vote') return cmdSignVote()
   if (sub === 'verify-votes') return cmdVerifyVotes()
   if (sub === 'ballot-tap') return cmdBallotTap()
-  die(`unknown council subcommand: ${sub} (constitution|convene|schedule|bench|init|veto|gate-map|seal-augment|read-binding|sign-vote|verify-votes|ballot-tap|roster|motion-plan|motion-apply|verify-chain)`)
+  die(`unknown council subcommand: ${sub} (try: 5dive council --help)`)
 }
 // Run as the CLI entrypoint only when executed directly (node cli.mjs …). Guarded so a test can
 // `import` this module (e.g. to exercise dispatchBallotVote's pure logic) WITHOUT triggering the
@@ -3981,7 +4219,7 @@ _council_veto() {
   [[ -n "$rcanon" ]] || fail "$E_GENERIC" "sealed receipt carries no canonical bytes to re-verify (fail-closed)"
   if [[ "$(id -u)" -eq 0 ]]; then rseal="$(printf '%s' "$rcanon" | cmd_gate_proof_sign_stdin 2>/dev/null)" || rseal=""
   else rseal="$(printf '%s' "$rcanon" | sudo -n 5dive gate-proof sign 2>/dev/null)" || rseal=""; fi
-  [[ -n "$rseal" ]] || fail "$E_GENERIC" "cannot re-seal the receipt canonical (need root + an enforce key) — refusing to trust an unverifiable receipt (fail-closed)"
+  [[ -n "$rseal" ]] || fail "$E_GENERIC" "cannot re-seal the receipt canonical (needs root + an enforce key) — refusing an unverifiable receipt"
   [[ "$rseal" == "$rcpt_digest" ]] || { _council_veto_audit "receipt-tampered" "$rcpt_digest"; fail "$E_PERMISSION" "receipt canonical does not re-seal to its sealedDigest — the receipt was tampered (refused + logged, fail-closed)"; }
 
   # AUTHENTICATE the tap: sha256(presented nonce) must equal the nonce DIGEST minted for THIS offer.
@@ -4260,7 +4498,7 @@ _council_init_or_lineage() {
 
   # ---- init (sudo-gated, one-time) ----------------------------------------
   if [[ ! -w "$COUNCIL_DIR" ]]; then
-    fail "$E_PERMISSION" "council init seeds the governance body — it writes ${COUNCIL_DIR} (root-owned) and must be human/sudo-run: sudo 5dive council init $*"
+    fail "$E_PERMISSION" "council init writes root-owned governance files — run: sudo 5dive council init $*"
   fi
   # Resolve the veto principal up front so init refuses an unresolvable one BEFORE any write.
   local principal="" seats_flag="" threshold_flag="" assume_yes=0 forced=0 a
@@ -4290,7 +4528,7 @@ _council_init_or_lineage() {
 
   [[ -n "$principal" ]] || fail "$E_USAGE" "council init needs --veto=<principal> (e.g. human:main)"
   local resolved; resolved="$(_council_resolve_principal "$principal")"
-  [[ -n "$resolved" ]] || fail "$E_USAGE" "veto principal '$principal' did not resolve to a real recipient — init rejects an unknown principal (fail-closed). Use human:<agent> (a paired agent) or tg:<user_id>."
+  [[ -n "$resolved" ]] || fail "$E_USAGE" "veto principal '$principal' did not resolve — use human:<agent> (a paired agent) or tg:<user_id>"
 
   # DIVE-2278: a tg:<digits> principal is the ONE form the display filter cannot save. The
   # principal string is copied verbatim into the canonical bytes that get SEALED into genesis,
@@ -4552,8 +4790,27 @@ _council_seal_stdin() {
 # council roster — the current seats + live threshold (from the persisted council bench), the
 # founder-veto principal (from genesis), and the sealed lineage head (seq + digest).
 _council_roster() {
-  local dir="$1"
-  [[ -f "$COUNCIL_GENESIS" ]] || fail "$E_VALIDATION" "the Council has no genesis roster — human-seed it first: sudo 5dive council init --seats=<a:chair,b,c> --threshold=<spec> --veto=<principal>"
+  local dir="$1"; shift || true
+  # DIVE-2890: `--class=<name>` was SILENTLY ACCEPTED AND IGNORED here (roster took no args at all,
+  # so any flag fell through to the default print). Parse it, and reject anything else rather than
+  # answering a question that was not asked — `roster --help` used to just re-print the roster.
+  local want_class=""
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --class=*) want_class="${a#--class=}" ;;
+      -h|--help)
+        cat <<'ROSTERHELP'
+ 5dive council roster [--class=<ordinary|promote|demote|expel|constitutional>] [--json]
+      The current seats, the per-decision-CLASS pass threshold + quorum resolved against
+      those seats, the founder-veto principal, and the sealed lineage head. --class narrows
+      the table to one class (fails closed on an unknown class).
+ROSTERHELP
+        return 0 ;;
+      *) fail "$E_USAGE" "unknown roster flag: $a (try: 5dive council roster --help)" ;;
+    esac
+  done
+  [[ -f "$COUNCIL_GENESIS" ]] || fail "$E_VALIDATION" "the Council has no genesis roster — seed it: sudo 5dive council init --seats=<a:chair,b,c> --threshold=<spec> --veto=<p>"
   # DIVE-1664: derive the roster VIEW from the ROOT-SEALED lineage — the SAME source `promote`/
   # `demote` mutate — so `roster` can never disagree with `log`/the lineage about membership. The
   # current roster = the LATEST lineage record that carries seats (genesis or a motion; a veto entry
@@ -4570,7 +4827,14 @@ _council_roster() {
     [[ -n "$rthreshold" && "$rthreshold" != "null" ]] && roster_args+=(--threshold-json="$rthreshold")
     [[ -n "$rstamped" ]] && roster_args+=(--seeded-at="$rstamped")
   fi
-  local raw; raw="$(node "$dir/cli.mjs" roster "${roster_args[@]}")" || return $?
+  roster_args+=(--constitution-path="$(_council_constitution_path)")
+  [[ -n "$want_class" ]] && roster_args+=(--class="$want_class")
+  # DIVE-2890: cli.mjs exits 2 with its OWN message on an unknown --class. Mark it reported so the
+  # EXIT backstop in lib/output.sh does not append its generic "exited N without reporting a reason
+  # … this is a bug in the CLI" block over a deliberate, already-explained usage refusal.
+  local raw rrc=0
+  raw="$(node "$dir/cli.mjs" roster "${roster_args[@]}")" || rrc=$?
+  if (( rrc )); then mark_reported; return "$rrc"; fi
   local vprincipal vresolved head_seq head_digest hlen
   vprincipal="$(jq -r '.veto.principal // "none"' "$COUNCIL_GENESIS" 2>/dev/null)"
   vresolved="$(jq -r '.veto.resolved // ""' "$COUNCIL_GENESIS" 2>/dev/null)"
@@ -4583,7 +4847,14 @@ _council_roster() {
   else
     echo "council:   council ($(printf '%s' "$raw" | jq -r '.seatCount') seats)"
     printf '%s' "$raw" | jq -r '.seats[] | "  seat \(.id)\(if .chair then " (chair)" else "" end)"'
-    echo "threshold: $(printf '%s' "$raw" | jq -r '.threshold') to pass, quorum $(printf '%s' "$raw" | jq -r '.quorum') (spec: $(printf '%s' "$raw" | jq -c '.thresholdSpec'))"
+    # DIVE-2890: the per-CLASS table, not the default spec alone. The old single line printed the
+    # ordinary rule unlabelled, so on a constitutional motion it under-reported quorum (4, not 6).
+    echo "thresholds (per decision class, resolved over $(printf '%s' "$raw" | jq -r '.seatCount') seat(s)):"
+    printf '%s' "$raw" | jq -r '.classes[] | "  \(.class | . + (" " * (15 - length)))\(.threshold) to pass, quorum \(.quorum)\(if .requireQuorum then " (require_quorum: EVERY seat must cast)" else "" end) (spec: \(.spec | tojson))"'
+    echo "  ^ genesis-sealed default spec: $(printf '%s' "$raw" | jq -c '.thresholdSpec') (governs the ordinary class)"
+    if _council_constitution_drifted; then
+      echo "  ! WARNING: the live constitution.yaml no longer matches the sealed digest — these rows are the LIVE file, which a convene will REFUSE to enforce (5dive council verify)." >&2
+    fi
     echo "veto:      $(_council_principal_label "$vprincipal")"
     echo "lineage:   seq $head_seq, ${hlen} record(s), head ${head_digest:0:16}…"
   fi
@@ -4709,6 +4980,16 @@ _council_verify() {
       [[ -n "$target" && "$rcpt_ok" != "1" ]] && echo "  receipt: $target not found or does not re-seal" >&2
     fi
   fi
+  # DIVE-2711: a FAILED verify has already printed its reason on both rails above
+  # (the JSON envelope with constitutionOk/constitution, or the "council verify:
+  # FAILED" block on stderr), so mark it reported. Without this, the EXIT backstop
+  # in lib/output.sh treats the non-zero return as a SILENT exit and appends its
+  # generic "exited N without reporting a reason … this is a bug in the CLI" text.
+  # On the stderr rail that is merely noise; under --json it emits a SECOND JSON
+  # object on STDOUT, so the output stops being one document and every reader
+  # breaks — `jq -r .data.constitutionOk` returns "false\nnull" rather than
+  # "false". A drift verdict is a correct, deliberate non-zero exit, not a crash.
+  (( all_ok )) || mark_reported
   (( all_ok )) && return 0 || return "$E_GENERIC"
 }
 
@@ -4721,7 +5002,7 @@ _council_motion() {
   local dir="$1" kind="$2"; shift 2
   mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
   if [[ ! -w "$COUNCIL_DIR" ]]; then
-    fail "$E_PERMISSION" "council $kind mutates the governance roster — it writes ${COUNCIL_DIR} (root-owned) and must be sudo-run: sudo 5dive council $kind $*"
+    fail "$E_PERMISSION" "council $kind writes the root-owned governance roster — run: sudo 5dive council $kind $*"
   fi
   [[ -f "$COUNCIL_GENESIS" && -f "$COUNCIL_LINEAGE" ]] || fail "$E_VALIDATION" "the Council has no genesis roster — seed it first: sudo 5dive council init …"
   local subject="" lens="" mode="adversarial" dry=0 a
@@ -4815,7 +5096,7 @@ _council_amend() {
   local dir="$1"; shift
   mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
   if [[ ! -w "$COUNCIL_DIR" ]]; then
-    fail "$E_PERMISSION" "council amend rewrites the constitution — it writes ${COUNCIL_DIR} + $(_council_constitution_path) (root-owned) and must be sudo-run: sudo 5dive council amend $*"
+    fail "$E_PERMISSION" "council amend rewrites the root-owned constitution — run: sudo 5dive council amend $*"
   fi
   [[ -f "$COUNCIL_GENESIS" && -f "$COUNCIL_LINEAGE" ]] || fail "$E_VALIDATION" "the Council has no genesis roster — seed it first: sudo 5dive council init …"
   local file="" mode="deliberate" dry=0 a
@@ -4833,6 +5114,31 @@ _council_amend() {
   local new_digest; new_digest="$(sha256sum < "$file" 2>/dev/null | awk '{print $1}')"
   [[ -n "$new_digest" ]] || fail "$E_GENERIC" "could not digest the proposed constitution $file"
 
+  # DIVE-2889 — RESOLVE THE CANDIDATE TO A REAL, ABSOLUTE PATH BEFORE ANY SEAT SEES A BALLOT.
+  # The eng_approval_lead amendment was balloted twice on a digest that resolves to no file
+  # anywhere on disk, while both approving rationales described the LIVE constitution. A seat
+  # cannot bind bytes it cannot name, so the ballot has to carry the name — and a relative path
+  # is not a name once the ballot leaves this process and lands in another agent's task body.
+  local cand_abs; cand_abs="$(readlink -f -- "$file" 2>/dev/null || true)"
+  [[ -n "$cand_abs" && -r "$cand_abs" ]] \
+    || fail "$E_NOT_FOUND" "could not resolve the proposed constitution '$file' to a readable absolute path — a motion whose bytes cannot be located must not reach seats (fail-closed, DIVE-2889)"
+  # Re-digest through the RESOLVED path, not the argument. If the two disagree the file moved or
+  # changed under us between the two reads, and the ballot would name bytes that no longer exist.
+  local cand_recheck; cand_recheck="$(sha256sum < "$cand_abs" 2>/dev/null | awk '{print $1}')"
+  [[ "$cand_recheck" == "$new_digest" ]] \
+    || fail "$E_CONFLICT" "the proposed constitution changed between reads ($new_digest -> ${cand_recheck:-unreadable}) — refusing to ballot a digest that no longer names the file (fail-closed, DIVE-2889)"
+
+  # Live side of the binding: seats are told what the candidate is being compared AGAINST, so
+  # "verified the on-disk content" can no longer be true of the wrong file without the ballot
+  # contradicting it. An absent live file is a legitimate state (pre-genesis), not a failure.
+  local live_path live_digest cand_diff diff_tmp
+  live_path="$(_council_constitution_path)"
+  live_digest="$(sha256sum < "$live_path" 2>/dev/null | awk '{print $1}')" || live_digest=""
+  diff_tmp="$(mktemp)"
+  # `diff` exits 1 when the files differ, which is the ORDINARY case here — never let that kill
+  # the amend under `set -e`, and never let it read as an error.
+  diff -u "$live_path" "$cand_abs" > "$diff_tmp" 2>/dev/null || true
+
   # Current roster + hash-chain head from the SEALED lineage tail.
   local head head_seats prev_digest last_seq seq
   head="$(tail -n1 "$COUNCIL_LINEAGE" 2>/dev/null)"
@@ -4841,8 +5147,11 @@ _council_amend() {
   prev_digest="$(printf '%s' "$head" | jq -r '.digest // ""')"
   last_seq="$(printf '%s' "$head" | jq -r '.seq // -1')"; [[ "$last_seq" =~ ^[0-9]+$ ]] && seq=$((last_seq+1)) || seq=0
 
-  local plan question
-  plan="$(node "$dir/cli.mjs" amend-plan --seats-json="$head_seats" --constitution="@$file" --constitution-digest="$new_digest")" || return $?
+  local plan question _amend_rc
+  plan="$(node "$dir/cli.mjs" amend-plan --seats-json="$head_seats" --constitution="@$cand_abs" --constitution-digest="$new_digest" \
+    --constitution-path="$cand_abs" --live-path="$live_path" --live-digest="$live_digest" --diff="@$diff_tmp")" \
+    || { _amend_rc=$?; rm -f "$diff_tmp"; return $_amend_rc; }   # preserve amend-plan's exit code — its fail-closed refusals are distinguishable by code
+  rm -f "$diff_tmp"
   question="$(printf '%s' "$plan" | jq -r '.question')"
 
   if (( dry )); then
@@ -5085,7 +5394,7 @@ cmd_council() {
   case "$sub" in
     ""|-h|--help|help) _council_help; return 0 ;;
     convene|schedule|bench|init|lineage|veto|gate-clear|rot-triage|roster|log|record|verify|promote|demote|expel|amend|sign-vote|verify-votes|ballot-tap) ;;
-    *) fail "$E_USAGE" "unknown council command: $sub (convene|schedule|bench|init|lineage|roster|log|record|verify|promote|demote|expel|amend|veto|gate-clear|rot-triage|sign-vote|verify-votes|ballot-tap)" ;;
+    *) fail "$E_USAGE" "unknown council command: $sub (try: 5dive council --help)" ;;
   esac
 
   local dir; dir="$(mktemp -d -t 5dive-council.XXXXXX)" || fail "$E_GENERIC" "mktemp failed"

@@ -1,7 +1,7 @@
 # -------- helpers --------
 
 require_root() {
-  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "must run as root (try: sudo 5dive $*)"
+  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "must run as root — try: sudo 5dive ${*:-${FIVE_ARGV[*]:-}}"
 }
 
 # -------- DIVE-2627: file input for the prose flags --------
@@ -87,7 +87,7 @@ valid_channel() {
   [[ -n "$1" ]] || return 1
   local IFS=',' c
   for c in $1; do
-    [[ "$c" =~ ^(none|telegram|discord|dashboard)$ ]] || return 1
+    [[ "$c" =~ ^(none|telegram|discord|dashboard|buzz)$ ]] || return 1
     if [[ "$c" == "none" && "$1" != "none" ]]; then return 1; fi
   done
   return 0

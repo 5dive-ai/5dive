@@ -70,6 +70,14 @@ broker_surface() {
     push.target)   printf 'branch' ;;
     push.ask)      printf 'approve delegated push for review of branch <b>' ;;
     push.ticket)   printf 'DIVE-1462' ;;
+    # DIVE-3081: the verb that OWNS the body line, named in the look-alike-values
+    # refusal so the reader is pointed at the canonical writer instead of hand-
+    # editing the body again (hand-editing is how the malformed value got in).
+    # Empty is a legal answer — deploy has no such verb yet, and the refusal then
+    # just omits the repair sentence rather than naming a command that does not
+    # exist. Any surface added here must answer this field.
+    push.fixcmd)   printf '5dive task set-branch' ;;
+    deploy.fixcmd) printf '' ;;
     deploy.noun)   printf 'deploy' ;;
     deploy.Noun)   printf 'Deploy' ;;
     deploy.cap)    printf 'delegated_deploy' ;;
@@ -95,6 +103,12 @@ broker_gate_check() {
   local noun; noun=$(broker_surface "$surface" noun)
   local ask;  ask=$(broker_surface "$surface" ask)
   local gtype ganswer gansweredat gby guid gsig reviewer authorized=0
+  # DIVE-2801: cleared FIRST, before any of the arms below can `fail` out. Every
+  # earlier refusal (no gate, open, rejected, unauthorized) returns without ever
+  # reaching the signature block, and a state left over from a PREVIOUS call would
+  # then be rendered as this call's answer — a stale "verified" is the same false
+  # green in a longer-lived process. Unset renders as "NOT CHECKED", by design.
+  BROKER_GATE_SIG_STATE=""
   gtype=$(db "SELECT COALESCE(need_type,'')          FROM tasks WHERE id=${id};")
   gansweredat=$(db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE id=${id};")
   ganswer=$(db "SELECT COALESCE(need_answer,'')       FROM tasks WHERE id=${id};")
@@ -103,7 +117,7 @@ broker_gate_check() {
   gsig=$(db "SELECT COALESCE(need_answer_sig,'')      FROM tasks WHERE id=${id};")
   reviewer=$(db "SELECT COALESCE(routed_reviewer,'')  FROM tasks WHERE id=${id};")
   if [[ -z "$gtype" ]]; then
-    fail "$E_VALIDATION" "no gate on ${ident}: file a ${noun}-for-review gate first (5dive task need ${ident} --type=approval --ask='${ask}') — a ${noun}-for-review ask files as a lead-routed tier-1 gate the org lead can clear (not a human-only tier-2 in the human's DM), and ${noun} runs once a human OR that lead clears it."
+    fail "$E_VALIDATION" "no gate on ${ident} — file a ${noun}-for-review gate first: 5dive task need ${ident} --type=approval --ask='${ask}' (files tier-1 to the org lead, who can clear it)"
   fi
   if [[ -z "$gansweredat" ]]; then
     fail "$E_VALIDATION" "gate on ${ident} is OPEN (unanswered ${gtype}) — ${noun} refused until it clears (5dive task answer ${ident} ...)."
@@ -191,10 +205,92 @@ broker_gate_check() {
     fi
     fail "$E_VALIDATION" "gate on ${ident} was not cleared by an authority delegated ${noun} accepts${detail}"
   fi
-  if [[ "$require_sig" == "1" ]] \
-      && ! _gate_closure_verify "$id" "$gtype" "$ganswer" "$gby" "$gansweredat" "$guid" "$gsig"; then
-    fail "$E_VALIDATION" "gate on ${ident} has no valid signed closure — delegated ${noun} refused (the authoritative gate record may be unsigned or tampered)."
+  # DIVE-2801: THREE closure states, not two, and the preflight can tell them apart.
+  #
+  # The agent-side preflight cannot VERIFY the root-HMAC closure — it has no root
+  # key, and that is the design, not a gap. But it can read whether a signature
+  # EXISTS, and an absent one is NOT "unverified": `_gate_closure_verify` returns 1
+  # on an empty sig before it computes anything, so an unsigned closure is a refusal
+  # the root executor is CERTAIN to make. The preflight therefore has exactly enough
+  # information to predict the real run on this axis, and reporting "gate cleared" on
+  # it was a green the privileged write does not honour — DIVE-2798 measured it:
+  # `push --dry-run` printed OK and the real push refused the same row seconds later
+  # with nothing changed between them.
+  #
+  # So the state is published for callers to RENDER (a dry-run must say what it did
+  # NOT check), and the one state we can decide unprivileged is decided here:
+  #   absent     — no signature at all; the executor will refuse -> refuse now
+  #   unverified — a signature is present and this caller could not check it
+  #   verified   — checked against the root HMAC and it holds (require_sig=1 only)
+  # Refusing on `absent` in the preflight is not a new policy: it is the executor's
+  # existing policy, applied where it can still be applied honestly. Every other gate
+  # defect (open, rejected, unauthorized) already hard-fails the preflight; not
+  # failing on this one was the inconsistency that made the rehearsal lie.
+  # The EXECUTOR arm is unchanged, deliberately, down to the byte: it covers both
+  # unsigned AND tampered, its message is the one DIVE-2798 measured, and a preflight
+  # that preempted it would move the authoritative refusal to a less privileged
+  # reader. The new arm below is the `elif` — it fires only where require_sig=0.
+  BROKER_GATE_SIG_STATE="unverified"
+  if [[ "$require_sig" == "1" ]]; then
+    if ! _gate_closure_verify "$id" "$gtype" "$ganswer" "$gby" "$gansweredat" "$guid" "$gsig"; then
+      fail "$E_VALIDATION" "gate on ${ident} has no valid signed closure — delegated ${noun} refused"
+    fi
+    BROKER_GATE_SIG_STATE="verified"
+  elif [[ -z "$gsig" ]]; then
+    BROKER_GATE_SIG_STATE="absent"
+    fail "$E_VALIDATION" "gate on ${ident} carries NO closure signature — the root-only executor verifies it before any delegated ${noun} and refuses an unsigned one. Re-answer the gate: 5dive task answer ${ident} ..."
   fi
+}
+
+# broker_gate_sig_note — the one sentence a REHEARSAL owes its reader about the
+# closure check (DIVE-2801). Reads BROKER_GATE_SIG_STATE, which broker_gate_check
+# sets on every call. Empty state means no gate check ran in this process, and that
+# is reported as such: a dry-run that stayed silent because it never measured is the
+# same false green in a different costume.
+broker_gate_sig_note() {
+  case "${BROKER_GATE_SIG_STATE:-}" in
+    verified)   printf 'closure signature VERIFIED against the root HMAC' ;;
+    unverified) printf 'closure signature present but NOT verified here — the root executor verifies it at %s time' "$(broker_surface "${1:-push}" noun)" ;;
+    absent)     printf 'closure signature ABSENT' ;;
+    *)          printf 'closure signature NOT CHECKED — no gate check ran in this process' ;;
+  esac
+}
+
+# broker_strip_md_quotes <value> — DIVE-3081. Drop the markdown/quote wrapper a
+# human reflexively puts around a value that lives in a PROSE body.
+#
+# The `<Key>: <value>` line is simultaneously human prose (it renders as markdown
+# on the dashboard) and a machine binding (it is the value a cleared gate binds
+# to). A maker note that opens "Branch: `my-branch` — head `abc123`, PR #521" is
+# the natural way to write the first and an unsatisfiable value for the second:
+# `\S+` keeps the backticks, and no git ref can ever equal `` `my-branch` ``. The
+# gate is answered, the push refuses with DIVE-1462's ANTI-SUBSTITUTION error, and
+# the two names it quotes differ only by two invisible characters — so the error
+# reads as "the binding is stale, re-file the gate" and spends a second human tap
+# for zero semantic change. See
+# community/wiki/a-markdown-quoted-value-cannot-satisfy-a-machine-read-binding.md
+#
+# Symmetric by construction: the ONLY safe fix is one both readers of the line
+# apply, because the refusal compares two independently-parsed values. Stripping
+# in one parser and not the other converts an unsatisfiable binding into a
+# DIFFERENT unsatisfiable binding. Hence one function, called by both
+# broker_task_target (the authoritative bound value) and _push_branch_from_body
+# (the value push derives to act on). Do not inline this.
+#
+# Strips only PAIRED wrappers, and only ones no legal git ref name can contain
+# anyway (backtick, single/double quote, <>, and a trailing markdown comma/period
+# is NOT stripped — a ref may legally end in a period-free token and we refuse to
+# guess where prose ends). An unpaired leading backtick is left alone: that is a
+# malformed line, and a value we silently half-repaired is worse than a refusal.
+broker_strip_md_quotes() {
+  local v="$1"
+  case "$v" in
+    '`'*'`')  v="${v#\`}"; v="${v%\`}" ;;
+    '"'*'"')  v="${v#\"}"; v="${v%\"}" ;;
+    "'"*"'")  v="${v#\'}"; v="${v%\'}" ;;
+    '<'*'>')  v="${v#<}";  v="${v%>}"  ;;
+  esac
+  printf '%s' "$v"
 }
 
 # broker_task_target <surface> <id> — the target a task AUTHORITATIVELY declares
@@ -204,9 +300,11 @@ broker_task_target() {
   local surface="$1" id="$2"
   local key; key=$(broker_surface "$surface" key)
   local body; body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
+  local raw
   # `|| true` so a no-match grep can't trip `set -euo pipefail` when this runs
   # inside a command substitution.
-  printf '%s\n' "$body" | grep -ioP "^\s*${key}:\s*\K\S+" | head -1 || true
+  raw=$(printf '%s\n' "$body" | grep -ioP "^\s*${key}:\s*\K\S+" | head -1 || true)
+  broker_strip_md_quotes "$raw"
 }
 
 # broker_bind_target <surface> <id> <ident> <value> — DIVE-1462 (STEER-4),
@@ -227,10 +325,24 @@ broker_bind_target() {
   local ticket; ticket=$(broker_surface "$surface" ticket)
   local task_value; task_value=$(broker_task_target "$surface" "$id")
   if [[ -z "$task_value" ]]; then
-    fail "$E_VALIDATION" "task ${ident} declares no ${target} — add a '${key}: <name>' line to its body so the cleared gate binds to a specific ${target} (delegated ${noun} refuses an unbound ${target})."
+    fail "$E_VALIDATION" "task ${ident} declares no ${target} — add a '${key}: <name>' line to its body, then retry"
   fi
   if [[ "$value" != "$task_value" ]]; then
-    fail "$E_VALIDATION" "${target} '${value}' is not the ${target} bound to ${ident}'s cleared gate ('${task_value}') — a cleared gate authorizes only its task's own declared ${target}. ${Noun} refused (${ticket})."
+    # DIVE-3081: when the two values differ only in characters that do not survive a
+    # glance (a leftover markdown wrapper, a stray quote, a trailing CR from a pasted
+    # body), the binding is NOT stale and re-filing the gate changes nothing. Say so
+    # inside the refusal — the reader is looking at two strings they have already
+    # decided are identical. Fires only on the look-alike case; a genuinely different
+    # ${target} gets the plain message, unchanged.
+    local hint="" a b fixcmd
+    a=$(printf '%s' "$value"      | tr -d '`'"'"'"<>[](),. \r\t')
+    b=$(printf '%s' "$task_value" | tr -d '`'"'"'"<>[](),. \r\t')
+    if [[ -n "$a" && "$a" == "$b" ]]; then
+      hint=" NOTE: these differ only in punctuation/whitespace, so the binding is NOT stale and re-filing the gate will not change that — the declared '${key}:' line is malformed."
+      fixcmd=$(broker_surface "$surface" fixcmd)
+      [[ -n "$fixcmd" ]] && hint+=" Rewrite it: ${fixcmd} ${ident} ${a}"
+    fi
+    fail "$E_VALIDATION" "'${value}' is not the ${target} bound to ${ident}'s cleared gate ('${task_value}') — ${noun} refused.${hint}"
   fi
 }
 

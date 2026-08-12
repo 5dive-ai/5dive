@@ -41,9 +41,10 @@ Agents:
   5dive market [<keyword>] [--role=<r>] [--rarity=<t>]  # browse/search the agent market; preview: 5dive market show <slug>
   5dive hire <role> --from-market [--as=<name>]  # hire from the open market; see '5dive hire --help'
   5dive agent list
-  5dive agent info <name>                            # type, CLI version, selected model, channel + state
+  5dive agent info <name>                            # type, CLI version, model, channel, state + OUTPUT (DIVE-3274:
+                                                     # whether the seat is transacting, not only whether it is up)
   5dive agent types
-  5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard[,ch...]]
+  5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz[,ch...]]
                             [--telegram-token=<bot-token>] [--discord-token=<token>]
                             [--workdir=<path>] [--auth-profile=<name>]
                             [--provider=<id> --api-key=<key|->]
@@ -78,7 +79,7 @@ Agents:
   5dive agent rm <name> [--purge-home]               # aliases: 5dive agent fire <name>  /  5dive fire <name>
                                                      # home is quarantined to /home/.5dive-reaped/ (root 0700);
                                                      # --purge-home deletes it instead (irreversible)
-  5dive agent config <name> set channels=<none|telegram|discord|dashboard[,ch...]>
+  5dive agent config <name> set channels=<none|telegram|discord|dashboard|buzz[,ch...]>
                                                      # comma-separable; dashboard (claude-only, no token)
                                                      # enables web-dashboard chat — the one-tap Enable chat
                                                      # path. New claude creates include it by default.
@@ -148,7 +149,7 @@ Agents:
                                                      # receiver sees who's pinging it. --raw skips wrapping.
                                                      # --from is a CLAIM. When it does not match the
                                                      # measured caller the envelope also carries
-                                                     # via=<real-caller> (DIVE-2552); an unverifiable
+                                                     # via=<real-caller>; an unverifiable
                                                      # claim reads via=unknown:no-caller.
                                                      # --reply-to-chat adds a hint telling the receiver
                                                      # to reply directly in that Telegram/Discord chat
@@ -194,8 +195,12 @@ Auth (lower-level; the dashboard uses these — prefer 'account' for human-drive
   5dive agent auth status [--probe] [--type=<type>]    # real --print probe reveals stale creds
   5dive agent auth login <type>                        # interactive TTY (hands off this process)
   5dive agent auth set <type> --api-key=<key|-> [--auth-profile=<name>] [--provider=<id>]
+                              [--base-url=<url>] [--model=<slug>]
                                                        # --provider=<id> required for hermes/openclaw;
                                                        # id is one of: ${!BYO_PROVIDER_LABEL[*]}
+                                                       # --base-url (claude only) restates a custom
+                                                       # endpoint; without it a profile pinned off the
+                                                       # catalog is refused, not reverted (DIVE-2809)
   5dive agent auth start <type> [--auth-profile=<name>]      # non-TTY device-code: returns session id
   5dive agent auth poll <session_id>                         # {state, url, error}
   5dive agent auth submit <session_id> --code=<callback>     # paste the claude callback code
@@ -219,16 +224,21 @@ Projects (ident namespaces for the queue; default 'dive' = DIVE-N):
   5dive project ls | show <key>
   # tasks then number per project: FROG-1, FROG-2 …
 
-  5dive loop spawn --role=<r> --agent=<a> --prompt="…" [--ceiling=<tok>] [--wait[=<sec>]]  # LOOP-7 orchestration (JSON in/out)
-  5dive goal add "<outcome>" [--dry-run] [--max-tasks=N] [--yes]   # outcome -> validated, guardrailed task graph (DIVE-984)
-  5dive objective add "<name>" --metric-cmd="<cmd>" --target=<n> [--direction=up|down] [--unit=%] [--public]  # standing goal bound to a read-only metric (OSS-19)
-  5dive objective ls | show <name> | tick [<name>] | pause <name> | resume <name> [--force] | rm <name>  # resume preflights the planner role (OSS-33)
-  5dive objective replan <name> [--max-new-per-cycle=N] [--no-progress-limit=N] [--dry-run] [--yes] [--force] [--from-gate=<id>]  # re-plan cycle: preflight -> metric -> guardrailed diff -> gate -> apply; explicit stops (OSS-27/OSS-33)
+  5dive loop spawn --role=<r> --agent=<a> --prompt="…" [--ceiling=<tok>] [--wait[=<sec>]]  # orchestration (JSON in/out)
+  5dive goal add "<outcome>" [--dry-run] [--max-tasks=N] [--yes]   # outcome -> validated, guardrailed task graph
+  5dive objective add "<name>" --metric-cmd="<cmd>" --target=<n> [--direction=up|down] [--unit=%] [--public]  # standing goal bound to a read-only metric
+  5dive objective ls | show <name> | tick [<name>] | pause <name> | resume <name> [--force] | rm <name>  # resume preflights the planner role
+  5dive objective replan <name> [--max-new-per-cycle=N] [--no-progress-limit=N] [--dry-run] [--yes] [--force] [--from-gate=<id>]  # re-plan cycle: preflight -> metric -> guardrailed diff -> gate -> apply; explicit stops (/)
 
 Org chart (who reports to whom):
   5dive org set <agent> --manager=<agent> [--role=<text>] [--title=<text>]
   5dive org tree | show <agent> | ls | rm <agent>
   # full surface: 5dive org --help
+
+Web UI for this host (org chart, queue, gates):
+  5dive ui [--port=8735] [--host=127.0.0.1]          # open the three views in a browser. Read-only, no sign-in.
+  5dive ui --data | --html                           # the JSON the views render / the page itself
+  # full surface: 5dive ui --help
 
 Heartbeat (wake an agent only when it has queued tasks, one per tick):
   5dive heartbeat on  <name> [--every=<dur>] [--fresh]      # enrol (default 30m, fresh off: no /clear between tasks)
@@ -253,34 +263,34 @@ Usage (per-agent / per-task token burn — subscription tokens, no dollars):
   5dive usage budget set <agent> --daily=<tok> [--ceiling=<tok>] [--hard-stop]  # soft warn + optional hard-stop ceiling
   5dive usage budget ls | clear <agent>              # hard-stop is OFF by default (warn-only); check runs on the heartbeat
 
-Trace (causal timeline for one task, goal → ship — INST-1):
+Trace (causal timeline for one task, goal → ship —):
   5dive trace <id|DIVE-N> [--json] [--no-audit]      # read-only: origin (goal/parent/objective/loop) + lifecycle + gate provenance + verdict
 
-Memory (queryable team memory — read-path, DIVE-726):
+Memory (queryable team memory — read-path,):
   5dive memory search "<query>" [--limit=N] [--max-tokens=T]  # BM25-ranked snippets from the agent's memory stores + wiki, with provenance
 
-Zero-human proof (publish your own badge — OSS-17):
+Zero-human proof (publish your own badge —):
   5dive proof publish [--dry-run] [--repo=<url>] [--branch=<b>]  # push badge/datapoint/history, computed verbatim from digest
   5dive proof on --repo=<url> [--branch=status] [--at=<0-23>]    # save config + install daily root cron
   5dive proof off | status [--json]                             # remove cron (config kept) | report + staleness
   # methodology + self-publish guide: docs/zero-human.md
 
-Delegated push (bring your own GitHub App — DIVE-1376):
+Delegated push (bring your own GitHub App —):
   5dive push <id|DIVE-N> [--branch=<b>] [--dry-run]  # push ONLY the task's branch, ONLY after its gate clears; author enforced
   5dive push <id|DIVE-N> --open-pr[=<base>]          # ...and open its pull request on the same root-side rail, as 5dive-bot (DIVE-2605)
   5dive deploy <id|DIVE-N> [--target=<project@ref>] [--env=production|preview] [--dry-run]
-                                                     # INST-5: deploy ONLY the project@ref the task declares, ONLY after its gate clears
+                                                     # deploy ONLY the project@ref the task declares, ONLY after its gate clears
   5dive push setup                                   # scaffold + check the GitHub App credential (bring-your-own; root)
   # Branch comes from --branch or a 'Branch: <name>' line in the task body. The credential is YOUR GitHub App
   # (contents:write, installed on your ship repos), held root-side in /etc/5dive/connectors — never a human token.
   # Full setup walkthrough: docs/delegated-push.md
 
-Actor-routed gh (DIVE-2448):
+Actor-routed gh:
   5dive gh <gh args...>                    # writes go out as the machine account; admin + reads stay on your credential
   5dive gh --as=bot|caller <gh args...>    # force one identity | --explain prints the decision and runs nothing
   5dive gh whoami                          # resolve BOTH identities, so "who did that write go out as" is measurable
   # An agent gh write authenticates as the HUMAN account, so the audit trail cannot tell agent from human
-  # (DIVE-2232). The PAT stays root-side in /etc/5dive/connectors/github-bot.env — the agent never holds it.
+  #. The PAT stays root-side in /etc/5dive/connectors/github-bot.env — the agent never holds it.
 
 Identity:
   5dive whoami [--json]                    # the CURRENT process: actor, authority, tier + the SOURCE of each; exit 6 if unmeasurable
@@ -311,17 +321,55 @@ Health:
     two environments (tests/meta/selfcheck-union.sh) to prove no probe is
     skipped everywhere.
 
-  5dive bug [--verb=<name>] [--exit=<code>] [--no-probes] [--file]
+  5dive bug --what=<text> [--verb=<name>] [--exit=<code>] [--argv=<line>]
+            [--no-probes] [--file]
     Preview (default) or file a diagnostic bug report against 5dive-ai/5dive.
     Payload is a fixed ALLOWLIST — version, OS, bash version, install method,
-    the verb that failed + its exit code, and selfcheck probe name+verdict
-    pairs — never the free-text reason/detail fields underneath them. Bare
-    \`5dive bug\` only builds and prints the payload; NEVER auto-files. --file
-    re-prints the identical payload and then opens it (via \`5dive gh issue
-    create\`, so it lands as 5dive-bot); a TTY also gets an interactive y/N.
-    Agents take the same --file flag a human does — no separate unattended path.
+    the verb that failed + its exit code, selfcheck probe name+verdict pairs
+    (never the free-text reason/detail fields underneath them), and the two
+    fields you supply: --what and --argv. --what is REQUIRED to --file: a TTY
+    is prompted for it, and with no TTY an empty report is REFUSED rather than
+    opened against a public repo (DIVE-3136). Bare \`5dive bug\` only builds and
+    prints the payload; NEVER auto-files. --file re-prints the identical
+    payload and then opens it (via \`5dive gh issue create\`, so it lands as
+    5dive-bot); a TTY also gets an interactive y/N. Agents take the same --file
+    flag a human does — no separate unattended path.
 
-  5dive doctor [--fix] [--dry-run] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins]
+  5dive acp
+    Speak ACP (Agent Client Protocol) over stdin/stdout so an ACP client — Buzz
+    (block/buzz), Zed — can select 5dive as a coding-agent runtime. NOT
+    interactive: the client spawns it. A session ATTACHES to a named fleet agent
+    (its memory, tasks, org position and heartbeat intact) rather than opening a
+    blank one; the roster travels as ACP availableCommands, so /<name> or
+    /attach <name> picks the agent and /agents re-lists them. Runs on bun.
+
+  5dive host unit list [--pattern=<unit-glob>]       # systemd units, --no-pager pinned in code
+  5dive host unit show --unit=<unit>                 # a FIXED property set (User, WorkingDirectory,
+                                                     # ExecStart, DropInPaths, Result, ...)
+  5dive host unit repoint --unit=<u>.service --workdir=<abs-path> [--no-restart]
+                                                     # write a fixed one-directive drop-in
+                                                     # (<unit>.d/50-5dive-workdir.conf), daemon-reload,
+                                                     # restart — one audited operation.
+                                                     # REFUSES a unit that runs as root: WorkingDirectory
+                                                     # is a code pointer whenever ExecStart carries a
+                                                     # relative argument, so repointing a root unit would
+                                                     # exec caller-chosen content as root.
+  5dive host unit revert --unit=<u>.service [--no-restart]
+                                                     # remove exactly that drop-in, reload, restart
+  5dive host journal --unit=<unit> [--lines=N] [--since=<N>m|<N>h|<N>d]
+                                                     # journalctl --no-pager; --since is structured,
+                                                     # free-form time strings are refused
+  5dive host cron show|snapshot|diff --user=<user>   # READ-ONLY. \`crontab -l -u\` only; there is no
+                                                     # write/edit path (crontab -e is an EDITOR escape).
+                                                     # diff compares against the CLI's own snapshot,
+                                                     # never a caller-supplied file.
+    Host remediation for a privileged seat, delivered as scoped subcommands
+    rather than raw systemctl/journalctl/crontab grants (DIVE-3221; DIVE-1088
+    excluded those grants because each is a one-line root escape via the pager
+    or an editor). Needs root for the mutating and journal/cron verbs — an admin
+    agent reaches them through its existing \`/usr/local/bin/5dive *\` grant.
+
+  5dive doctor [--fix] [--dry-run] [--caps] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins|caps]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
     probes, stale shadow-credential heal (creds), registry integrity, channel
     health (allowlist + dead inbound telegram poller), host safety (needrestart
@@ -331,6 +379,14 @@ Health:
     ~/.claude/.credentials.json that shadows an env-token, restart an agent
     whose telegram poller died (silently drops inbound DMs), and force
     needrestart to list-only so a library upgrade can't bounce the whole fleet.
+    --caps (= --category=caps) answers, for THIS seat and without guessing,
+    whether it can read GitHub and how: github:read is derived from the seat's
+    measured sudo runas AND a live \`sudo -u claude gh auth status\`, since a
+    permitted uid switch says nothing about whether that token still works.
+    Roughly half the seats on a box have no such path, so a NO always names its
+    reason. It rides in data.capabilities, NOT in checks — a capability is not
+    a passed check. github:write stays NO: push identity is per-seat and the
+    claude-uid borrow is retired for pushes (DIVE-3017).
     A bare 'doctor' (no --fix) is a preview — every fixable check tells you so;
     --dry-run previews even alongside --fix. Output envelope always
     {ok:true,data:{...}}; branch on data.summary.errors in CI.
@@ -346,6 +402,19 @@ Full docs: https://5dive.ai/docs/5dive-cli
 USAGE
 }
 
+# _five_is_passthrough_verb <verb> — 0 when the verb hands its remaining argv to
+# ANOTHER program verbatim, so 5dive's own global flags must stop being parsed at
+# it (DIVE-3135). Kept as a named list rather than a heuristic: adding a verb here
+# is a deliberate statement that its tail belongs to someone else, and getting it
+# wrong in the permissive direction would silently disable `--json` for a verb
+# that implements it.
+_five_is_passthrough_verb() {
+  case "${1:-}" in
+    gh) return 0 ;;
+    *)  return 1 ;;
+  esac
+}
+
 main() {
   # DIVE-2249: mark that this process entered through the real CLI entrypoint.
   # The tasks-store fence (src/lib/tasks_db.sh) allows writes to the PRODUCTION
@@ -355,14 +424,35 @@ main() {
   # it that touched the store would be fenced against its own entrypoint.
   _TASKS_STORE_ENTRY=cli
 
+  # The argv this process was invoked with, so require_root's hint can name the
+  # command the caller actually typed instead of a bare `sudo 5dive `.
+  FIVE_ARGV=("$@")
+
   # Global --json: strip every occurrence before dispatch so each subcommand
   # gets the same arg shape regardless of where the flag was placed.
+  #
+  # EXCEPT after a PASSTHROUGH verb (DIVE-3135). `5dive gh` documents
+  # `<gh args...>` and hands them to another tool, so a flag after it is that
+  # tool's, not ours. Stripping `--json` out of `gh pr view 51 --json state` left
+  # `state` behind as a stray positional and gh's own parser answered "accepts at
+  # most 1 arg(s), received 2" — public issues #526 and #553, and the reason a
+  # credential-less seat could not read a PR at all. A passthrough verb therefore
+  # ENDS global flag parsing, the same way `--` does. `5dive --json gh ...` still
+  # works: the flag is before the verb, which is where a 5dive-level flag belongs.
   local -a rest=()
-  local a
+  local a passthrough=0 seen_verb=0
   for a in "$@"; do
+    if (( passthrough )); then rest+=("$a"); continue; fi
     if [[ "$a" == "--json" ]]; then
       JSON_MODE=1
       continue
+    fi
+    # The first token that is not a global flag IS the verb — test it once, so a
+    # later argument that merely spells `gh` (`5dive task add "fix gh routing"`)
+    # cannot turn global parsing off midway.
+    if (( ! seen_verb )); then
+      seen_verb=1
+      _five_is_passthrough_verb "$a" && passthrough=1
     fi
     rest+=("$a")
   done
@@ -391,6 +481,22 @@ main() {
   # can't race across concurrent dashboard clicks. Read-only commands (list,
   # logs, stats, types, auth status/poll) bypass the lock and the audit log.
   case "$top" in
+    _task_answer)
+      # DIVE-3160: hidden, privileged, delegated SIGNED gate clear. Reachable ONLY
+      # via NOPASSWD sudo (the scoped render_standard_sudoers line). Reads the
+      # `task answer` arguments NUL-separated on STDIN — never argv, so the grant
+      # stays an exact command path with no wildcard — re-derives the caller from
+      # SUDO_UID and its lead-clear standing FROM THE ROW as root, refuses every
+      # human-evidence form, and only then runs cmd_task_answer at EUID 0, where
+      # the DIVE-756 closure signs in-process instead of shelling out to a
+      # `gate-proof sign` grant a cli-scoped seat does not have.
+      #
+      # Not audited HERE, for the _gh_do reason: the parent `task answer` verb is
+      # audited and reaches this primitive through a PIPE, not `exec`, so the
+      # outer EXIT trap still fires and attribution survives (DIVE-2797 is about
+      # the exec case, which this deliberately is not). Never advertised.
+      cmd_task_answer_delegated
+      exit $? ;;
     _audit_append)
       # DIVE-1268: hidden, privileged, APPEND-ONLY audit primitive. Reachable
       # ONLY via NOPASSWD sudo — the admin whole-CLI grant, or the scoped
@@ -484,12 +590,36 @@ main() {
         info)    cmd_info "$@" ;;
         types)   cmd_types "$@" ;;
         logs)    cmd_logs "$@" ;;
-        send)    cmd_send "$@" ;;
-        ask)     cmd_ask "$@" ;;
+        # DIVE-2797: the send rail is AUDITED. `task inbox send` had 78 rows in
+        # agent-audit.log and `agent send` had zero, so an inter-agent message —
+        # including an admin-tier one carrying a forgeable `--from=` — left no
+        # artifact naming who sent it. A recipient could re-verify the CLAIM and
+        # never the SOURCE, because no source record existed.
+        #
+        # AUDIT_ARGS is a PLACEHOLDER here, not the payload. The handler rewrites
+        # it once it has parsed its flags (see cmd_send / cmd_ask / cmd_deliver),
+        # because the dispatcher cannot tell a target from a `--message=` body and
+        # the message body must never land in a shared log. If the handler fails
+        # before that point the row still carries the verb, the exit code and the
+        # derived actor — attribution survives a usage error.
+        send)
+          AUDIT_CMD="agent send"; AUDIT_ARGS=("to=<unparsed>")
+          cmd_send "$@" ;;
+        ask)
+          AUDIT_CMD="agent ask"; AUDIT_ARGS=("to=<unparsed>")
+          cmd_ask "$@" ;;
         # DIVE-1065: hidden privileged delivery primitive. Only reachable via the
         # scoped-sudoers grant a standard agent gets (write_standard_sudoers);
         # `cmd_send` re-execs into it for non-root agent callers. Not advertised.
-        _deliver) cmd_deliver "$@" ;;
+        # DIVE-2797: audited for the same reason, and it is NOT redundant with the
+        # `send` row above. cmd_send reaches this primitive with `exec`, which
+        # replaces the process — the outer EXIT trap never fires, so a scoped
+        # (standard-tier) a2a send would have been audited by NOBODY if only
+        # `send` were wired. That is the DIVE-2788 shape this ticket names as its
+        # sibling: a guard covering a narrower population than its name.
+        _deliver)
+          AUDIT_CMD="agent _deliver"; AUDIT_ARGS=("to=<unparsed>")
+          cmd_deliver "$@" ;;
         # DIVE-1074: hidden privileged READ primitive (bounded reply-window read),
         # the sibling of _deliver. `cmd_ask` re-execs into it for a standard-tier
         # non-root caller to read back the reply. Scoped-sudoers only, not advertised.
@@ -713,6 +843,21 @@ main() {
       # src/lib/models.sh). Read-only. The telegram plugin reads
       # `5dive models --json` at boot so its /model picker can't drift again.
       cmd_models "$@" ;;
+    host)
+      # DIVE-3221: hardened host-remediation verbs, reached through the CLI-root
+      # grant an `admin` agent already holds (no new sudoers class, no new tier —
+      # lodar answered B on DIVE-3213). Every verb takes structured, validated
+      # parameters only: no unit-file content, no shell string, no editor, no
+      # caller-supplied path. See the header of src/cmd_host.sh for the finite
+      # set of commands each verb can exec as root, and why `repoint` refuses a
+      # root-running unit.
+      #
+      # Audited as a whole: `unit list`/`unit show`/`journal`/`cron show` are
+      # reads, but they are reads a privileged seat performs about ANOTHER user's
+      # box state, and the row that answers "who repointed this unit" is worth
+      # more than the noise it costs.
+      AUDIT_CMD="host"; AUDIT_ARGS=("$@")
+      cmd_host "$@" ;;
     doctor)
       # Only audit when a mutating run is requested (--fix/--repair); read-only
       # runs (and --dry-run previews) would spam the log.
@@ -774,6 +919,11 @@ main() {
     org)
       # Agent org chart (sqlite, same store as tasks). Read/write, no audit/lock.
       cmd_org "$@" ;;
+    ui)
+      # DIVE-2655: the free single-host web UI (org chart / queue / gates).
+      # Reads the same group-writable store as tasks + org; GET/HEAD only, no
+      # root, no lock, no write path. Loopback bind unless the caller opts out.
+      cmd_ui "$@" ;;
     project|projects)
       # Project namespaces for the task queue (DIVE-484). Same group-writable
       # store as tasks; read/write, no root/lock.
@@ -960,6 +1110,12 @@ main() {
         AUDIT_CMD="self-update"; AUDIT_ARGS=("$@")
         cmd_self_update "$@"
       fi ;;
+    acp)
+      # DIVE-3017: ACP over stdio, spawned BY a client (Buzz's runtime picker), so
+      # this verb's stdout is the wire. AUDIT_CMD is deliberately NOT set: cmd_acp
+      # `exec`s into bun, which replaces the process before the dispatcher's EXIT
+      # trap can fire (DIVE-2797), so the row is written inside cmd_acp instead.
+      cmd_acp "$@" ;;
     -h|--help|help) usage ;;
     *) fail "$E_USAGE" "unknown command: $top" ;;
   esac

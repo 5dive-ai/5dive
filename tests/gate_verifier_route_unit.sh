@@ -84,6 +84,21 @@ HUMAN_PINGED=0
 # notify path ran. The routed rail runs for real against the `5dive` stub.
 _task_need_notify_deliver() { HUMAN_PINGED=1; }
 audit_log() { :; }
+# DIVE-3117 (quinn, iteration 2): the suppression audit row is not merely unasserted,
+# it is structurally UNOBSERVABLE from the sink side. `_task_store_audit_log` is fenced
+# behind `_task_human_send_allowed` (DIVE-2010), so against an isolated fixture TASKS_DB
+# it writes NOTHING and warns once — "assert the row landed" cannot be made to work here,
+# and a harness that queried the store would grade the fence, not the caller. So grade the
+# CALL SITE with a spy. What a future refactor would silently drop is the call and its
+# arguments, and that is exactly what this records.
+SUPPRESS_LOG="$TMP/suppress.log"; : >"$SUPPRESS_LOG"
+_task_store_audit_log() { printf '%s\n' "$*" >>"$SUPPRESS_LOG"; return 0; }
+suppress_reset() { : >"$SUPPRESS_LOG"; }
+# `grep -c` PRINTS 0 and EXITS 1 on no match, so a `|| echo 0` fallback appends a
+# SECOND line and the count becomes "0\n0" — which compares equal to neither 0 nor 1.
+# Caught by the zero-match arm below; the one-match arm was green throughout.
+suppress_n()     { local n; n=$(grep -c 'verifier-route suppressed' "$SUPPRESS_LOG" 2>/dev/null); printf '%s' "${n:-0}"; }
+suppress_last()  { grep 'verifier-route suppressed' "$SUPPRESS_LOG" 2>/dev/null | tail -n1; }
 ROUTE_FILE="$TMP/route.log"
 5dive() { if [[ "${1:-}" == "agent" && "${2:-}" == "send" ]]; then printf '%s\n' "${3:-}" >>"$ROUTE_FILE"; fi; return 0; }
 export -f 5dive 2>/dev/null || true
@@ -178,6 +193,119 @@ fixture_actor fixture-runner
    && "$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident='DIVE-506';")" == "" ]] \
   && ok_t "refused reject wrote nothing (status and gate untouched)" \
   || bad_t "refused reject wrote nothing" "status=$(db "SELECT status FROM tasks WHERE ident='DIVE-506';") answered_by=$(db "SELECT need_answered_by FROM tasks WHERE ident='DIVE-506';")"
+
+# ---- 7. DIVE-3117: a PUSH-FOR-REVIEW ask never routes to the row's verifier ----
+# The gate asks for the branch to be pushed; the verifier cannot read the diff until
+# it IS pushed. Every arm below needs the lead and the verifier to be DIFFERENT
+# agents — the fixtures above reuse `main` as both, so an assertion written against
+# them would pass whichever seat the router picked. `grader` is a fixture name, not a
+# fleet seat, and dev's lead stays `main`.
+db "INSERT INTO agents_org(name,reports_to,role) VALUES('grader','main','builder');"
+seed_loop_g() {
+  db "INSERT INTO tasks(ident,title,status,created_by,assignee,verifier,maker_agent,iteration,max_iterations)
+      VALUES('$1','${2:-loop task}','todo','dev','dev','grader','dev',1,5);"
+}
+PUSH_ASK='approve delegated push for review of branch dive-3117-pfr-lead-route'
+
+route_reset; suppress_reset; seed_loop_g DIVE-3117; fixture_actor dev
+cmd_task_need DIVE-3117 --type=approval --ask="$PUSH_ASK" --from=dev >/dev/null 2>&1
+rr=$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-3117';")
+[[ "$(route_last)" == "main" && "$rr" == "main" ]] \
+  && ok_t "push-for-review approval routes to the LEAD, not the verifier" \
+  || bad_t "push-for-review approval routes to the LEAD, not the verifier" "route_last=$(route_last) routed_reviewer=$rr human=$HUMAN_PINGED"
+# The invariant stated on the ticket, asserted directly and in BOTH directions: a
+# push-for-review ask must produce a routed_reviewer that is NEITHER empty (the
+# DIVE-2629 failure — no agent can clear it) NOR the verifier (this one — the single
+# agent who cannot answer it). The two have opposite causes, so an arm covering one
+# is not evidence about the other.
+[[ -n "$rr" && "$rr" != "grader" ]] \
+  && ok_t "routed_reviewer is neither empty nor the verifier" \
+  || bad_t "routed_reviewer is neither empty nor the verifier" "routed_reviewer='$rr' verifier=grader"
+# The suppression is the ONLY trace a future regression could be counted from — the
+# four measured instances were findable only because each row named its
+# routed_reviewer, and after the fix no row does. Assert the call fires once and
+# carries the verifier it did NOT go to plus where it went INSTEAD.
+sup=$(suppress_last)
+[[ "$(suppress_n)" == "1" && "$sup" == *"verifier=grader"* && "$sup" == *"routed=main"* && "$sup" == *"task=DIVE-3117"* ]] \
+  && ok_t "suppression audit row fires once, naming the verifier it did NOT go to and where it went" \
+  || bad_t "suppression audit row missing or malformed" "n=$(suppress_n) last='$sup'"
+
+# 7b. NEGATIVE ARM (the ticket names it): a push-for-review ask on a row with NO
+# verifier keeps its current routing. It must reach the lead by the SAME eng-ship
+# path, so the loop's existence is not an input to routing in either direction.
+route_reset; fixture_actor dev
+db "INSERT INTO tasks(ident,title,status,created_by,assignee) VALUES('DIVE-3118','plain task','todo','dev','dev');"
+cmd_task_need DIVE-3118 --type=approval --ask="$PUSH_ASK" --from=dev >/dev/null 2>&1
+rr_nl=$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-3118';")
+[[ "$(route_last)" == "main" && "$rr_nl" == "main" ]] \
+  && ok_t "no-verifier row keeps its lead routing (fix is not conditional on the loop)" \
+  || bad_t "no-verifier row keeps its lead routing" "route_last=$(route_last) routed_reviewer=$rr_nl human=$HUMAN_PINGED"
+
+# 7c. NEGATIVE CONTROL: verifier-routing is SUPPRESSED for one ask class, not
+# disabled. A non-push question on the same loop shape still reaches the verifier —
+# without this arm, deleting the DIVE-1495 route entirely would pass 7 and 7b.
+route_reset; suppress_reset; seed_loop_g DIVE-3119; fixture_actor dev
+cmd_task_need DIVE-3119 --type=decision --options='A|B' --recommend='A' \
+  --ask='Which schema for the field?' --from=dev >/dev/null 2>&1
+[[ "$(suppress_n)" == "0" ]] \
+  && ok_t "NEGATIVE: no suppression row when the verifier route actually fires" \
+  || bad_t "suppression row emitted on a gate that WAS verifier-routed" "n=$(suppress_n) last=$(suppress_last)"
+[[ "$(route_last)" == "grader" ]] \
+  && ok_t "a non-push gate on the same loop still routes to the verifier" \
+  || bad_t "a non-push gate on the same loop still routes to the verifier" "route_last=$(route_last)"
+
+# 7d. NEGATIVE CONTROL (DIVE-2224): the classifier reads the ASK, never the TITLE.
+# This ticket's own title contains 'push-for-review'; a title-reading classifier
+# would strip the verifier off every genuine question filed on it.
+route_reset; fixture_actor dev
+seed_loop_g DIVE-3120 'push-for-review gate routes to the loop VERIFIER'
+cmd_task_need DIVE-3120 --type=decision --options='A|B' --recommend='A' \
+  --ask='Which schema for the field?' --from=dev >/dev/null 2>&1
+[[ "$(route_last)" == "grader" ]] \
+  && ok_t "a push-for-review TITLE does not lead-route a non-push ask" \
+  || bad_t "a push-for-review TITLE does not lead-route a non-push ask" "route_last=$(route_last)"
+
+# 7e. NEGATIVE CONTROL: NOT-INERT pushes are unchanged. `_gate_push_for_review_hit`
+# fails closed, so "push … then merge to main" is not an inert push-for-review and
+# keeps the DIVE-1495 route — the same narrowing DIVE-2629 made on the tier axis.
+route_reset; seed_loop_g DIVE-3121; fixture_actor dev
+cmd_task_need DIVE-3121 --type=approval \
+  --ask='push branch dive-3117-pfr-lead-route for review, then merge to main' --from=dev >/dev/null 2>&1
+[[ "$(route_last)" == "grader" ]] \
+  && ok_t "a not-inert push (merge to main named) keeps the verifier route" \
+  || bad_t "a not-inert push (merge to main named) keeps the verifier route" "route_last=$(route_last)"
+
+# 7f. The tier-2 human floor still wins over the whole class: a push ask that also
+# names a spend stays with the human and reaches NO agent, verifier or lead.
+route_reset; seed_loop_g DIVE-3122; fixture_actor dev
+cmd_task_need DIVE-3122 --type=approval \
+  --ask='approve delegated push for review of branch dive-3117-x and the $900 runner spend' --from=dev >/dev/null 2>&1
+[[ "$HUMAN_PINGED" == "1" && "$(route_sent)" == "0" ]] \
+  && ok_t "a push ask naming a spend stays human (T2 floor outranks the class)" \
+  || bad_t "a push ask naming a spend stays human" "human=$HUMAN_PINGED sent=$(route_sent) routed=$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-3122';")"
+# 7g. DIVE-3307 — END TO END, the live DIVE-3302 ask byte-for-byte. The unit arms in
+# tests/gate_described_not_requested_unit.sh grade the PREDICATE; this one grades the
+# ROUTE, because a predicate assertion alone cannot show that the verifier suppression
+# actually re-engaged. Before the fix this ask reached the grader — the one agent who
+# cannot approve a push before reading a diff they cannot read until it is pushed.
+route_reset; seed_loop_g DIVE-3123; fixture_actor dev
+cmd_task_need DIVE-3123 --type=approval \
+  --ask='approve delegated push for review of branch dive-3302-core-budget - coverage-neutral perf fix reclaiming CPU in identity_stub_guard toward the core-tier overage freezing all merges' --from=dev >/dev/null 2>&1
+[[ "$(route_last)" != "grader" ]] \
+  && ok_t "a push ask that DESCRIBES a merge freeze does not route to the verifier (DIVE-3307)" \
+  || bad_t "a push ask that DESCRIBES a merge freeze does not route to the verifier (DIVE-3307)" "route_last=$(route_last)"
+
+# 7h. NEGATIVE CONTROL for 7g, and the arm that fails the non-fix the ticket forbids
+# (deleting terms from _GATE_PUSH_NOT_INERT_RX): a REQUESTED merge in the same shape
+# of ask keeps the DIVE-1495 verifier route.
+route_reset; seed_loop_g DIVE-3124; fixture_actor dev
+cmd_task_need DIVE-3124 --type=approval \
+  --ask='approve delegated push for review of branch dive-3302-core-budget while merges are frozen, then merge it to main' --from=dev >/dev/null 2>&1
+[[ "$(route_last)" == "grader" ]] \
+  && ok_t "a described merge freeze does not launder a REQUESTED merge beside it (DIVE-3307)" \
+  || bad_t "a described merge freeze does not launder a REQUESTED merge beside it (DIVE-3307)" "route_last=$(route_last)"
+
+fixture_actor fixture-runner
 
 echo "-----"
 echo "gate_verifier_route_unit: $PASS passed, $FAIL failed"

@@ -89,14 +89,20 @@ grep -qi "MAKER" "$TMP"/err && ok_t "A refusal explains the maker/verifier split
 
 # --- B: THE MEASURED BUG — a non-verifier rejecting an already-DONE task.
 B=$(seed_closed "B outsider reopens a graded task")
-[[ "$(status_of "$B")" == "done" && "$(res_of "$B")" == "$ACK" ]] \
+# DIVE-2483 (iteration 2): this arm used to assert result == "$ACK" EXACTLY.
+# That equality pinned the WIPE: seed_closed builds its fixture by having the
+# verifier close over the maker's "maker delivery v1", which under the old guard
+# DESTROYED it. The fixture performed the very data loss DIVE-2483 was filed to
+# stop, then asserted it had happened. The contract now is that the ACK is
+# PRESENT and the maker's record SURVIVES beneath it, which is what this checks.
+[[ "$(status_of "$B")" == "done" && "$(res_of "$B")" == *"$ACK"* ]] \
   || bad_t "B fixture" "expected a closed, graded task; got $(status_of "$B")"
 out=$(as dev2 cmd_task_reject "$B" --feedback="please add X"); rc=$?
 (( rc != 0 )) && ok_t "B outsider's reject over a closed task exits non-zero (rc=$rc)" \
   || bad_t "B should refuse" "rc=$rc — this is olivia's exact repro"
 [[ "$(status_of "$B")" == "done" ]] \
   && ok_t "B task stays DONE — the reopen is blocked" || bad_t "B reopened" "status=$(status_of "$B")"
-[[ "$(res_of "$B")" == "$ACK" ]] \
+[[ "$(res_of "$B")" == *"$ACK"* ]] \
   && ok_t "B the verifier's ACK survives intact" || bad_t "B ACK destroyed" "result=$(res_of "$B")"
 [[ "$(refusals "$B" reject-over-closed)" == "1" ]] \
   && ok_t "B refusal audited to policy_refusals" || bad_t "B not audited" "no reject-over-closed row"
@@ -119,8 +125,20 @@ D=$(seed_closed "D verifier reopens own grade")
 out=$(as main cmd_task_reject "$D" --feedback="I was wrong, reopening"); rc=$?
 (( rc == 0 )) && ok_t "D the grader may reopen their own grade (rc=0)" \
   || bad_t "D grader locked out" "rc=$rc $(cat "$TMP"/err)"
-[[ "$(res_of "$D")" == *"superseded result (DIVE-2067, preserved)"* ]] \
-  && ok_t "D prior result preserved under a superseded marker" || bad_t "D marker missing" "$(res_of "$D")"
+# DIVE-2773: reject no longer hand-rolls this preservation — it routes through
+# `_task_guard_result_over_closed`, the one predicate DIVE-2483 extracted, so the seam it
+# writes on a CLOSED row is that guard's DIVE-2464 marker rather than reject's private
+# DIVE-2067 copy. The MARKER CHANGED and the GUARANTEE DID NOT, so this arm asserts the
+# guarantee first and the marker second: what must never regress is that the prior record
+# survives verbatim. (`task verify`'s closed path still writes the DIVE-2067 marker; a
+# grep for superseded records wants both strings. The reason reject moved is that its
+# private predicate fired only on a `done` row, so on the ordinary delivered-`todo` bounce
+# it preserved nothing at all — see tests/task_close_needs_a_reason_unit.sh arm K.)
+[[ "$(res_of "$D")" == *"I was wrong, reopening"* ]] \
+  && ok_t "D the reject feedback is recorded" || bad_t "D feedback missing" "$(res_of "$D")"
+[[ "$(res_of "$D")" == *"appended by a later close (DIVE-2464)"* ]] \
+  && ok_t "D prior result preserved under the SHARED guard's seam (DIVE-2773: was reject's private DIVE-2067 marker)" \
+  || bad_t "D marker missing" "$(res_of "$D")"
 [[ "$(res_of "$D")" == *"the seal only grades the bundle"* ]] \
   && ok_t "D the ACK's actual TEXT survives, not just a marker" || bad_t "D ACK text lost" "$(res_of "$D")"
 

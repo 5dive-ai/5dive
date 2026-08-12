@@ -21,6 +21,24 @@ cd "$(dirname "$0")"
 # temp dir without dirtying the tracked ./5dive artifact. Defaults to the repo ./5dive.
 OUT="${BUILD_OUT:-5dive}"
 
+# DIVE-2603: FIVE_VERSION is assigned only when a release tag is cut, so a
+# working-tree bundle permanently says 0.0.0-dev. Carry the source identity as
+# a separate fact that remains meaningful both before and after tag time. A
+# dirty tree is deliberately stamped <sha>-dirty: the artifact contains bytes
+# HEAD does not, so install.sh must reject the stamp as ancestry evidence and
+# fall back to the version path instead of trusting a false identity.
+BUILD_SHA="$(git rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" || {
+  echo "error: cannot resolve the source commit for $OUT" >&2
+  exit 1
+}
+if [[ ! "$BUILD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "error: source commit is not a full git sha: $BUILD_SHA" >&2
+  exit 1
+fi
+if [[ -n "$(git status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
+  BUILD_SHA="${BUILD_SHA}-dirty"
+fi
+
 # DIVE-2681: BUILD_OUT may name the bundle ANYTHING, and .gitignore only knows
 # about `/5dive` + `/5dive.sha256` (DIVE-2091). So `BUILD_OUT=./5dive-fix` builds
 # a 3.3MB bundle that git happily tracks, and one `git add -A` puts it on main —
@@ -70,15 +88,29 @@ cat \
   src/cmd_agent_pairing.sh \
   src/cmd_agent_runtime.sh \
   src/cmd_cos.sh \
+  src/cmd_acp.sh \
   src/cmd_skill.sh \
   src/cmd_init.sh \
   src/cmd_doctor.sh \
+  src/cmd_host.sh \
   src/cmd_watch.sh \
   src/cmd_compose.sh \
   src/cmd_whoami.sh \
+  src/task/dispatch.sh \
+  src/task/routing.sh \
+  src/task/crud.sh \
+  src/task/gate_evidence.sh \
+  src/task/status.sh \
+  src/task/delivery.sh \
+  src/task/loops.sh \
+  src/task/need.sh \
+  src/task/notify.sh \
+  src/task/inbox.sh \
+  src/task/answer.sh \
   src/cmd_task.sh \
   src/cmd_trace.sh \
   src/cmd_org.sh \
+  src/cmd_ui.sh \
   src/cmd_hire.sh \
   src/cmd_project.sh \
   src/cmd_goal.sh \
@@ -105,6 +137,7 @@ cat \
   src/cmd_secret.sh \
   src/cmd_selfupdate.sh \
   src/main.sh \
+  | sed -E "s/^readonly FIVE_BUILD_SHA=\"[^\"]*\"/readonly FIVE_BUILD_SHA=\"$BUILD_SHA\"/" \
   > "$OUT"
 
 # DIVE-1261: publish a sha256 of the bundle so the installer can verify the fetched binary before
@@ -128,6 +161,10 @@ chmod +x "$OUT" 2>/dev/null || true
 # when someone empties out FIVE_VERSION by accident.
 if ! grep -qE '^readonly FIVE_VERSION="[^"]+"' "$OUT"; then
   echo "error: $OUT is missing FIVE_VERSION — check src/header.sh" >&2
+  exit 1
+fi
+if ! grep -qE "^readonly FIVE_BUILD_SHA=\"${BUILD_SHA}\"$" "$OUT"; then
+  echo "error: $OUT is missing FIVE_BUILD_SHA=$BUILD_SHA — check src/header.sh" >&2
   exit 1
 fi
 
@@ -155,4 +192,4 @@ if [[ -n "$guard_line" && "$def_line" -gt "$guard_line" ]]; then
   exit 1
 fi
 
-echo "built $OUT ($(wc -l < "$OUT") lines, $(grep -oE '^readonly FIVE_VERSION="[^"]+"' "$OUT" | cut -d'"' -f2)) + $OUT.sha256 ($(cut -c1-16 "$OUT.sha256")…)"
+echo "built $OUT ($(wc -l < "$OUT") lines, $(grep -oE '^readonly FIVE_VERSION="[^"]+"' "$OUT" | cut -d'"' -f2) at ${BUILD_SHA:0:12}) + $OUT.sha256 ($(cut -c1-16 "$OUT.sha256")…)"

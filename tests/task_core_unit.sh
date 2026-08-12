@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TIER: nightly — 24.4s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
+# TIER: nightly — 34.5s measured on the dev VM 2026-08-08 (DIVE-2912). The DIVE-2912 arms add +0s: interleaved n=2 on one sitting read base 34/35s against branch 34/34s, so the gap from the 27s claimed here on 2026-08-04 (DIVE-2719; 24.4s, DIVE-2525) is drift in the box, not in the corpus, and is re-stated rather than re-attributed. Does not fit the 300s PR core; the nightly sweep runs it.
 # OSS-7 isolated unit harness for the task-core verbs — the most-used surface
 # that had no coverage (only the loop/gate slices were tested). Same isolation
 # contract as the loop harnesses: source src/ directly, point STATE_DIR at a
@@ -110,6 +110,48 @@ res=$(db "SELECT result FROM tasks WHERE id=$id3;")
 da=$(db "SELECT done_at IS NOT NULL FROM tasks WHERE id=$id3;")
 [[ "$st" == "in_progress" && "$st2" == "done" && "$res" == "all good" && "$da" == "1" ]] \
   && ok_t "lifecycle start->done with result + done_at" || bad_t "lifecycle" "st=$st st2=$st2 res=$res"
+
+# --- DIVE-2316: delivery_ref is visible through the CLI, including absence.
+# JSON show already reads the whole row; the regression was the human presenter
+# omitting the enforcement field. Prove both states before the list audit below.
+#
+# DIVE-3251: THE ANCHOR IS NOW PADDING-INSENSITIVE, and the reason is worth
+# knowing before someone "tightens" it back. `dbfmt -line` is sqlite3's own -line
+# mode, which RIGHT-ALIGNS every field name to the width of the WIDEST name in
+# the SELECT. So adding any column longer than the current widest re-indents
+# EVERY line of `task show` at once, and a `^name = value` anchor breaks on a
+# change that has nothing to do with the field it is guarding. `first_started_at`
+# (16 chars) did exactly that to `delivery_ref` (12).
+#
+# What DIVE-2316 is actually about is that the human presenter must not OMIT the
+# enforcement field, and both arms below still grade precisely that. The leading
+# whitespace was never the property under test. Machine consumers read the JSON
+# path, which is untouched by the presenter's alignment.
+show_absent=$( (JSON_MODE=0 cmd_task_show "$id3") 2>"$TMP"/err )
+echo "$show_absent" | grep -qE '^ *delivery_ref = absent$' \
+  && ok_t "DIVE-2316: task show makes an absent delivery_ref explicit" \
+  || bad_t "DIVE-2316 show absent" "$show_absent"
+
+delivery_url='https://github.com/example/project/pull/999'
+db "UPDATE tasks SET delivery_ref=$(sqlq "$delivery_url") WHERE id=$id3;"
+show_bound=$( (JSON_MODE=0 cmd_task_show "$id3") 2>"$TMP"/err )
+echo "$show_bound" | grep -qE "^ *delivery_ref = $(printf '%s' "$delivery_url" | sed 's/[.[\*^$\/]/\\&/g')\$" \
+  && ok_t "DIVE-2316: task show prints the bound delivery_ref" \
+  || bad_t "DIVE-2316 show bound" "$show_bound"
+
+# The operator's audit is normally list-shaped. Seed a second DONE row with no
+# binding, then require the human table to distinguish the bound and absent rows.
+id_no_ref=$(run add -- "done without a delivery binding" | jf '.data.id')
+run done "$id_no_ref" --result="no code delivery" >/dev/null
+done_ls=$( (JSON_MODE=0 cmd_task_ls --status=done) 2>"$TMP"/err )
+[[ "$done_ls" == *"delivery_ref"* && "$done_ls" == *"$delivery_url"* && "$done_ls" == *"absent"* ]] \
+  && ok_t "DIVE-2316: task ls --status=done surfaces bound and absent delivery_ref values" \
+  || bad_t "DIVE-2316 done listing" "$done_ls"
+
+ls_json_ref=$(run ls --status=done | jq -r --argjson i "$id3" '.data.tasks[] | select(.id==$i) | .delivery_ref')
+[[ "$ls_json_ref" == "$delivery_url" ]] \
+  && ok_t "DIVE-2316: task ls JSON carries delivery_ref" \
+  || bad_t "DIVE-2316 ls JSON" "got=$ls_json_ref"
 
 # --- T5: cancel is terminal with done_at
 idc=$(run add -- "doomed" | jf '.data.id')
@@ -310,6 +352,237 @@ r3=$(run add --assignee=eng --body="w" -- "explicit name wins")
 r4=$(run add --assignee=@eng --body="w" -- "at-name form")
 [[ "$(echo "$r4" | jf '.data.assignee')" == "eng" ]] \
   && ok_t "@name is stripped to bare name" || bad_t "@name" "$(echo "$r4" | jf '.data.assignee')"
+
+# --- T-2719: verification DEPTH is re-measured at delivery, and the default
+# GRADER is no longer structurally a leader.
+#
+# _task_delivery_depth is the pure half (path list on stdin -> class), so it is
+# graded directly: no gh, no network, no PR. The gh-backed half
+# (_task_delivery_paths) is exercised on the box, not here — every one of its
+# failure paths prints nothing, and "prints nothing" is the input the class
+# function already gets its unknown-stays-unknown arm from (T-2719d).
+d=$(printf 'tests/foo_unit.sh\ndocs/x.md\nchangelog.d/DIVE-1.md\n' | _task_delivery_depth)
+[[ "$d" == "shallow" ]] \
+  && ok_t "delivery depth: tests/docs/changelog only -> shallow" || bad_t "shallow class" "got '$d'"
+
+# deep WINS over shallow — a mixed set is never downgraded, and the deep path is
+# read even though it arrives after two shallow ones.
+d=$(printf 'docs/x.md\ntests/y.sh\nsrc/cmd_heartbeat.sh\n' | _task_delivery_depth)
+[[ "$d" == "deep" ]] \
+  && ok_t "delivery depth: a blast-radius path beats a shallow majority" || bad_t "deep wins" "got '$d'"
+
+# ORDINARY code is neither: the class must stay EMPTY so the caller changes
+# nothing. Without this arm the two above are satisfied by a function that only
+# ever answers deep-or-shallow, which would rewrite every close on the fleet.
+d=$(printf 'src/cmd_agent.sh\ntests/y.sh\n' | _task_delivery_depth)
+[[ -z "$d" ]] \
+  && ok_t "delivery depth: ordinary code -> unchanged behaviour (empty)" || bad_t "ordinary class" "got '$d'"
+
+# T-2719d: an EMPTY list is UNKNOWN, not shallow. This is the arm that keeps a
+# missing gh credential from silently waiving the rail — the all_shallow flag is
+# vacuously true on an empty list, so nothing but the `have` guard stops it.
+d=$(printf '' | _task_delivery_depth)
+[[ -z "$d" ]] \
+  && ok_t "delivery depth: no paths -> unknown, never shallow" || bad_t "empty list class" "got '$d'"
+
+# --- T-2730: the add-time `--no-verify` SURVIVES to delivery.
+#
+# The defect these arms grade is not a wrong answer, it is a MISSING FACT: the
+# opt-out used to be a shell var that died with `task add`, so at `task done` an
+# explicit refusal and a never-railed row were the same NULL and the UPGRADE arm
+# above could not tell them apart. So the first two arms grade the WRITE (the
+# fact exists at all) and the last two grade the READ (the upgrade arm honours
+# it) — a column nobody reads would pass a write-only test and change nothing.
+idnv=$(run add --assignee=nvmaker --no-verify --body="w" -- "opted out of grading" | jf '.data.id')
+[[ "$(db "SELECT COALESCE(verify_optout,0) FROM tasks WHERE id=${idnv};")" == "1" ]] \
+  && ok_t "no-verify: the explicit opt-out is persisted (verify_optout=1)" \
+  || bad_t "optout write" "got '$(db "SELECT COALESCE(verify_optout,-1) FROM tasks WHERE id=${idnv};")'"
+
+# NON-VACUITY, and it is the whole point of the row: a column that read 1 for
+# every task would satisfy the arm above while re-collapsing the distinction it
+# exists to make. An ordinary add must leave it NULL.
+idpv=$(run add --assignee=nvmaker --priority=low --body="w" -- "ordinary row, no opt-out" | jf '.data.id')
+[[ "$(db "SELECT COALESCE(verify_optout,0) FROM tasks WHERE id=${idpv};")" == "0" ]] \
+  && ok_t "no-verify: an ordinary add leaves verify_optout NULL (refusal != absence)" \
+  || bad_t "optout non-vacuity" "ordinary row reads $(db "SELECT verify_optout FROM tasks WHERE id=${idpv};")"
+
+# The READ half, end to end through `task done`'s UPGRADE arm — and this is the
+# arm that grades main's merge condition on DIVE-2730, so it is written as the
+# BYPASS it refuses rather than as a feature. `--no-verify` is declared at FILE
+# time; the blast radius is measured at DELIVERY time. If the stored flag
+# suppressed the upgrade, a sentence typed before the diff existed would
+# pre-authorise closing a scheduler/credentials change ungraded — a waiver in
+# DIVE-969's banned direction. So the opted-out row MUST still route.
+#
+# Both fixtures are verifier-NULL rows with a deep delivery, exactly the shape
+# DIVE-2719 upgrades; the two stubs supply the diff and a willing grader, the
+# only inputs the arm needs, so the sole difference between them is the column.
+# Stubbed rather than mocked over the network: the gh-backed path is graded on
+# the box (see T-2719's note), and what is under test is the branch, not the fetch.
+_task_delivery_paths() { printf 'src/cmd_heartbeat.sh\n'; }
+_task_default_verifier() { printf 'nvgrader\n'; }
+run start "$idpv" >/dev/null
+run done "$idpv" --result="delivered" >/dev/null 2>&1
+[[ "$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${idpv};")" == "nvgrader" ]] \
+  && ok_t "no-verify: an ordinary deep delivery upgrades (DIVE-2719, unchanged)" \
+  || bad_t "upgrade baseline" "no grader attached to the non-opted-out row"
+
+run start "$idnv" >/dev/null
+run done "$idnv" --result="delivered" >/dev/null   # run() captures stderr to $TMP/err
+[[ "$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${idnv};")" == "nvgrader" ]] \
+  && ok_t "no-verify: the blast-radius upgrade OVERRIDES an explicit opt-out (file-time flag loses to delivery-time measurement)" \
+  || bad_t "optout must not bypass" "verifier='$(db "SELECT verifier FROM tasks WHERE id=${idnv};")' — a file-time flag suppressed a delivery-time rail"
+
+# ...and it says so. The defect DIVE-2730 was filed for is that the override was
+# SILENT, not that it happened — a persisted flag that changes no message would
+# leave that defect exactly where it was found.
+grep -q -- "--no-verify" "$TMP"/err \
+  && ok_t "no-verify: the override NAMES the opt-out it is overriding" \
+  || bad_t "override silent" "warn text does not mention the opt-out: $(tr '\n' ' ' <"$TMP"/err)"
+unset -f _task_delivery_paths _task_default_verifier
+# DIVE-3278: source the MODULE, not src/cmd_task.sh. cmd_task.sh is a loader whose
+# `declare -F` guards are already satisfied here, so re-sourcing it is a no-op and
+# would leave the two functions above unset for the rest of this file.
+. "$SRC/task/routing.sh"
+
+# An explicit later attach supersedes the earlier refusal — otherwise the row
+# carries a live opt-out flag that contradicts its own grader.
+idnv2=$(run add --assignee=nvmaker --no-verify --body="w" -- "opted out, then graded anyway" | jf '.data.id')
+run verifier "$idnv2" nvgrader >/dev/null 2>&1
+[[ -z "$(db "SELECT COALESCE(verify_optout,'') FROM tasks WHERE id=${idnv2};")" ]] \
+  && ok_t "no-verify: 'task verifier' clears the opt-out it overrides" \
+  || bad_t "optout supersede" "still $(db "SELECT verify_optout FROM tasks WHERE id=${idnv2};") after an explicit attach"
+
+# The named exclusion list: data, not a code change.
+FIVE_VERIFY_EXCLUDE="main, dev2" _task_verify_excluded main \
+  && ok_t "verify exclusion: a listed name is excluded" || bad_t "exclusion hit" "main not excluded"
+FIVE_VERIFY_EXCLUDE="main, dev2" _task_verify_excluded eng \
+  && bad_t "exclusion miss" "eng excluded by a list that does not name it" \
+  || ok_t "verify exclusion: an unlisted name is untouched"
+_task_verify_excluded main \
+  && bad_t "exclusion default" "excluded with FIVE_VERIFY_EXCLUDE unset" \
+  || ok_t "verify exclusion: ships inert (unset list excludes nobody)"
+
+# BASELINE FIRST, so the QA rung below is proven to be what moved the answer and
+# not something the fixture already did: with no QA agent in the chart, the
+# picker walks up and lands on the leader.
+org_seed vfmaker --manager=vflead
+org_seed vflead --title="Engineering Lead"
+base_v=$(_task_default_verifier vfmaker "")
+[[ -n "$base_v" && "$base_v" != "vfmaker" ]] \
+  && ok_t "default verifier baseline: walks up to '$base_v' with no QA in the chart" \
+  || bad_t "verifier baseline" "got '$base_v'"
+
+# Now name a QA agent. It must win — the chart had already answered who grades.
+org_seed vfquinn --title="QA / testing"
+v=$(_task_default_verifier vfmaker "")
+[[ "$v" == "vfquinn" ]] \
+  && ok_t "default verifier: a designated QA agent outranks the up-chain leader" \
+  || bad_t "QA rung" "got '$v' (baseline was '$base_v')"
+[[ "$v" != "$base_v" ]] \
+  && ok_t "default verifier: the QA rung CHANGED the answer (not a coincidence)" \
+  || bad_t "QA rung non-vacuity" "same answer as the baseline"
+
+# ...and the exclusion list reaches the picker, not just the predicate.
+v=$(FIVE_VERIFY_EXCLUDE="vfquinn" _task_default_verifier vfmaker "")
+[[ -n "$v" && "$v" != "vfquinn" ]] \
+  && ok_t "default verifier: an excluded candidate is skipped for the next rung" \
+  || bad_t "picker exclusion" "got '$v'"
+
+# The maker is still never their own grader, with or without the new rungs.
+v=$(_task_default_verifier vfquinn "")
+[[ "$v" != "vfquinn" ]] \
+  && ok_t "default verifier: the QA agent does not grade its own work" || bad_t "self-grade" "got '$v'"
+
+# --- T-2912: the QA rung's DECLINE is observable, and a descriptive title can no
+# longer evict the declared QA agent.
+#
+# The live defect: main2 was seated with "verifier" in its TITLE, the QA scan
+# matched two agents, the COUNT==1 rule returned empty, and the chain fell
+# through — which did not promote main2 (it is nowhere in a dev-assigned row's
+# chain) but silently DEMOTED quinn off every row on the board. So the arms below
+# grade two separate things: that the right agent is picked, and that a decline
+# says so out loud.
+#
+# The chart is wiped and reseeded in the PRODUCTION shape (olivia root -> main ->
+# builders, one role-declared QA agent, one exec clone whose title says
+# "verifier"). Every prior arm's fixture is a tidy convenience chart; this defect
+# only exists in the real one, and a resolver arm seeded from a tidy chart is
+# exactly how the last such bug passed its tests.
+qa_out() {   # <maker> -> prints the pick; stderr captured to $TMP/qaerr
+  _task_resolve_qa "$1" 2>"$TMP/qaerr"
+}
+db "DELETE FROM agents_org;"
+org_seed olivia --role="AI CEO — conducts the fleet (advisory)" --title="Olivia · CEO"
+org_seed main   --manager=olivia --role="engineering + infra + the 5dive CLI" --title="Marcus · CTO"
+org_seed dev    --manager=main   --role="Backend lane" --title="Lead Engineer"
+org_seed main2  --manager=main   --role="engineering" --title="Marcus-2 · Exec clone / verifier"
+
+# BASELINE, with no QA agent seated yet: the picker walks up to a leader. Without
+# this the arm below is satisfied by a fixture that could only ever say quinn.
+qa_base=$(_task_default_verifier dev "")
+[[ -n "$qa_base" && "$qa_base" != "dev" ]] \
+  && ok_t "T-2912 baseline: no QA agent seated -> picker walks up to '$qa_base'" \
+  || bad_t "T-2912 baseline" "got '$qa_base'"
+
+# Now seat the dedicated QA agent by ROLE, beside the clone whose TITLE says
+# "verifier". This is the exact live table, and it used to return NOTHING.
+org_seed quinn --manager=main --role="QA / testing"
+pick=$(qa_out dev)
+[[ "$pick" == "quinn" ]] \
+  && ok_t "T-2912: a declared role='QA' outranks another agent's descriptive title" \
+  || bad_t "T-2912 role beats title" "got '$pick' (this is the DIVE-2912 regression)"
+[[ ! -s "$TMP/qaerr" ]] \
+  && ok_t "T-2912: a pick it CAN make stays quiet (no warn noise per task add)" \
+  || bad_t "T-2912 quiet pick" "warned anyway: $(cat "$TMP/qaerr")"
+v=$(_task_default_verifier dev "" 2>/dev/null)
+[[ "$v" == "quinn" && "$v" != "$qa_base" ]] \
+  && ok_t "T-2912: the full picker routes to the QA agent, not up the chart" \
+  || bad_t "T-2912 picker" "got '$v' (baseline was '$qa_base')"
+
+# GENUINE ambiguity — two agents whose ROLE declares QA. The rung is still
+# skipped (we do not guess), but it now NAMES both, which is the whole defect:
+# the old code returned an empty string and said nothing.
+org_seed quinn2 --manager=main --role="QA / release testing"
+pick=$(qa_out dev)
+[[ -z "$pick" ]] \
+  && ok_t "T-2912: two role-declared QA agents -> still declines to guess" \
+  || bad_t "T-2912 ambiguity" "guessed '$pick'"
+if grep -q 'quinn' "$TMP/qaerr" && grep -q 'quinn2' "$TMP/qaerr" && grep -qi 'skip' "$TMP/qaerr"; then
+  ok_t "T-2912: the decline WARNS and names every match"
+else
+  bad_t "T-2912 loud decline" "stderr did not name both matches: $(cat "$TMP/qaerr")"
+fi
+
+# ...and FIVE_VERIFY_EXCLUDE now resolves that ambiguity, which is what the list
+# is shaped for. It used to be read only by the chain below this function, so an
+# excluded name still counted toward the count that suppressed the pick.
+pick=$(FIVE_VERIFY_EXCLUDE="quinn2" qa_out dev)
+[[ "$pick" == "quinn" ]] \
+  && ok_t "T-2912: FIVE_VERIFY_EXCLUDE disambiguates the QA scan itself" \
+  || bad_t "T-2912 exclusion in predicate" "got '$pick'"
+[[ ! -s "$TMP/qaerr" ]] \
+  && ok_t "T-2912: a disambiguated scan stops warning" \
+  || bad_t "T-2912 exclusion quiet" "$(cat "$TMP/qaerr")"
+
+# A QA agent marked in the TITLE ALONE still wins — the role-first pass is a
+# tie-break, not a narrowing, so an org that never filled in `role` is untouched.
+db "DELETE FROM agents_org;"
+org_seed tmaker --manager=tlead
+org_seed tlead  --title="Engineering Lead"
+org_seed tqa    --manager=tlead --title="QA / testing"
+pick=$(qa_out tmaker)
+[[ "$pick" == "tqa" ]] \
+  && ok_t "T-2912: a title-only QA agent is still resolved (widen pass)" \
+  || bad_t "T-2912 title-only" "got '$pick'"
+
+# NO QA agent anywhere is not an event: empty AND silent, or every `task add` on
+# an org that never named one would print a warning.
+db "DELETE FROM agents_org WHERE name='tqa';"
+pick=$(qa_out tmaker)
+[[ -z "$pick" && ! -s "$TMP/qaerr" ]] \
+  && ok_t "T-2912: no QA agent at all -> empty and SILENT (unchanged behaviour)" \
+  || bad_t "T-2912 no-QA silence" "pick='$pick' stderr='$(cat "$TMP/qaerr")'"
 
 echo "-----"
 echo "task_core_unit: $PASS passed, $FAIL failed"

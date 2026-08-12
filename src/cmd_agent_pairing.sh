@@ -465,7 +465,7 @@ cmd_pair() {
   case "$type" in
     claude|codex|grok|antigravity) ;;
     openclaw|hermes)
-      fail "$E_VALIDATION" "type=$type doesn't use pair codes — the bot token configured at create time is sufficient. To approve specific Telegram/Discord users for an openclaw agent, run: sudo -u agent-${name} openclaw pairing list" ;;
+      fail "$E_VALIDATION" "type=$type does not use pair codes — approve users with: sudo -u agent-${name} openclaw pairing list" ;;
     *)
       fail "$E_VALIDATION" "pairing only applies to claude, codex, grok and antigravity agents (got type=$type)" ;;
   esac

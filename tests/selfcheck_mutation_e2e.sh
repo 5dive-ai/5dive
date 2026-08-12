@@ -37,16 +37,46 @@ command -v sqlite3 >/dev/null 2>&1 || { printf 'skip - sqlite3 absent\n'; exit 0
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/sc-mut.XXXXXX") || exit 2
 PASS=0; FAIL=0
-ok_t()   { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
-fail_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n' "$1"; }
+# DIVE-2783: record WHICH rail each arm belonged to, so the end of the run can prove
+# the corpus was exercised. `$FAIL -eq 0` alone cannot: it is equally true of a run
+# that proved six rails and of a run that proved nothing, which is the
+# succeeding-in-appearance shape this whole harness exists to catch — and is exactly
+# how it failed, dying before any arm ran.
+RAILS_SEEN=""
+_rail() { case "$1" in \[*\]*) RAILS_SEEN="$RAILS_SEEN ${1%%]*}]" ;; esac; }
+ok_t()   { PASS=$((PASS+1)); _rail "$1"; printf 'ok   - %s\n' "$1"; }
+fail_t() { FAIL=$((FAIL+1)); _rail "$1"; printf 'FAIL - %s\n' "$1"; }
 
 # A pristine copy of the tree, rebuilt into its own bundle.
 WORK="$TMP/repo"
 mkdir -p "$WORK"
 cp -R "$REPO/src" "$REPO/tests" "$REPO/build.sh" "$WORK/" 2>/dev/null
 cp "$REPO/5dive.sha256" "$WORK/" 2>/dev/null || true
+# DIVE-2783: build.sh has hard-required a resolvable source commit since DIVE-2603
+# (#488) — `git rev-parse --verify 'HEAD^{commit}'` or exit 1. This copy is
+# deliberately NOT a git repo (it is a throwaway precisely so the prover never
+# mutates the tree it grades), so every rebuild() failed and the harness died at the
+# line below before a single arm ran — on BOTH full-sweep shards, main's only red.
+#
+# Give the copy its own one-commit history rather than teaching build.sh to build
+# without one: the identity stamp is the whole point of DIVE-2603, and weakening it
+# to accommodate a test fixture is the tail wagging the dog. Mutations after this
+# point leave the copy dirty, which build.sh stamps `<sha>-dirty` BY DESIGN — that
+# is a stamp, not a refusal, so every later rebuild() still succeeds.
+git -C "$WORK" init -q \
+  && git -C "$WORK" add -A \
+  && git -C "$WORK" -c user.name='harness' -c user.email='harness@example.com' \
+       -c commit.gpgsign=false commit -qm 'throwaway baseline for the mutation prover' -q \
+  || { printf 'FAIL: could not give the pristine copy a git identity (build.sh needs one since DIVE-2603)\n'; exit 1; }
 rebuild() { (cd "$WORK" && bash build.sh >/dev/null 2>&1); }
-rebuild || { printf 'FAIL: could not build the pristine copy\n'; exit 1; }
+# Name the reason. The bare message here cost a full triage cycle: it says the build
+# failed but not why, so a red on a shard nobody can shell into is unattributable and
+# gets guessed at from commit timing instead of read off the error.
+rebuild || {
+  printf 'FAIL: could not build the pristine copy:\n%s\n' \
+    "$( (cd "$WORK" && bash build.sh 2>&1) | tail -5 )"
+  exit 1
+}
 
 # Run one probe against the throwaway bundle, with the probes that read a checkout
 # pointed at the throwaway checkout rather than the live one.
@@ -92,8 +122,8 @@ assert_mutation() {
 # notify path that recorded nothing. The gate is filed, reports OK, records NOTHING —
 # the exact live state that left 194 undelivered rows.
 mut_gate() {
-  grep -q 'if (( ${TASK_GATE_DELIVERY_ROWS:-0} == 0 )); then' "$WORK/src/cmd_task.sh" || return 1
-  sed -i 's/if (( ${TASK_GATE_DELIVERY_ROWS:-0} == 0 )); then/if false; then/' "$WORK/src/cmd_task.sh"
+  grep -q 'if (( ${TASK_GATE_DELIVERY_ROWS:-0} == 0 )); then' "$WORK/src/task/notify.sh" || return 1
+  sed -i 's/if (( ${TASK_GATE_DELIVERY_ROWS:-0} == 0 )); then/if false; then/' "$WORK/src/task/notify.sh"
   rebuild
 }
 assert_mutation gate-delivery "the gate delivery assertion is removed" mut_gate "reported as pinged"
@@ -190,6 +220,71 @@ mut_bundle() {
   printf '%s\n' "0000000000000000000000000000000000000000000000000000000000000000" > "$WORK/5dive.sha256"
 }
 assert_mutation bundle-integrity "the tracked checksum describes another bundle" mut_bundle "different generations"
+
+# ── rail 4b: THE RELEASE-COMMIT SHAPE (DIVE-2798) ────────────────────────────
+# The shape this harness never built, and the reason a green corpus still could not
+# cut v0.19.3. `release-cut.yml` commits the source, builds the bundle (stamped with
+# that source commit), then commits the BUNDLE onto a second commit. So on the commit
+# that gets tagged, HEAD is the bundle commit and the bundle names HEAD^ — and the
+# probe's rebuild stamps HEAD. A raw `cmp` is unsatisfiable there BY CONSTRUCTION:
+# a bundle cannot carry the sha of the commit that contains it.
+#
+# Every arm below runs in that shape rather than in the working-tree shape, because
+# the defect is invisible in the working-tree shape — which is precisely why every
+# PR was green and the failure waited for a release. And the shape is BUILT here, not
+# asserted: the arms after it must still go red, or "release commits pass" would be
+# indistinguishable from "the probe stopped checking".
+_release_commit_shape() {   # leaves $WORK at: HEAD = bundle commit, bundle stamped HEAD^
+  git -C "$WORK" add -A >/dev/null 2>&1 || return 1
+  git -C "$WORK" -c user.name='harness' -c user.email='harness@example.com' \
+      -c commit.gpgsign=false commit -qm 'release: assign version before bundle build' >/dev/null 2>&1 || return 1
+  (cd "$WORK" && bash build.sh >/dev/null 2>&1) || return 1
+  git -C "$WORK" add -A -f 5dive 5dive.sha256 >/dev/null 2>&1 || return 1
+  git -C "$WORK" -c user.name='harness' -c user.email='harness@example.com' \
+      -c commit.gpgsign=false commit -qm 'release: bundle built from the parent' >/dev/null 2>&1 || return 1
+}
+if _release_commit_shape; then
+  _rc_head=$(git -C "$WORK" rev-parse HEAD)
+  _rc_parent=$(git -C "$WORK" rev-parse 'HEAD^1')
+  _rc_stamp=$(grep -m1 -E '^readonly FIVE_BUILD_SHA="[^"]*"$' "$WORK/5dive" | sed -E 's/.*="([^"]*)".*/\1/')
+  # The fixture must actually BE the shape, or the arms below prove nothing about it.
+  [[ "$_rc_stamp" == "$_rc_parent" && "$_rc_stamp" != "$_rc_head" ]] \
+    && ok_t "[bundle-integrity] fixture IS the release shape: bundle stamps HEAD^ (${_rc_stamp:0:12}), not HEAD (${_rc_head:0:12})" \
+    || fail_t "[bundle-integrity] fixture is NOT the release shape (stamp=${_rc_stamp:0:12} head=${_rc_head:0:12} parent=${_rc_parent:0:12}) — every arm below would be vacuous"
+
+  probe bundle-integrity
+  [[ $RC -eq 0 ]] \
+    && ok_t "[bundle-integrity] PASSES on a release commit (DIVE-2798: the cut is no longer self-blocking)" \
+    || fail_t "[bundle-integrity] still red on a release commit — the v0.19.3 blocker is not fixed: $OUT"
+
+  # ACCEPTANCE, and the whole point: a stale bundle must STILL be caught in this
+  # shape. If tolerating the stamp had widened into tolerating the bundle, this is
+  # where it shows, so it is asserted here rather than only in the working-tree shape.
+  printf '\n# DIVE-2798 staleness probe\n' >> "$WORK/src/cmd_selfcheck.sh"
+  probe bundle-integrity
+  [[ $RC -ne 0 ]] && grep -q 'is not what src/ builds' <<<"$OUT" \
+    && ok_t "[bundle-integrity] a STALE bundle is still RED on a release commit (not weakened to a no-op)" \
+    || fail_t "[bundle-integrity] stale bundle passed on a release commit — the fix is a no-op: $OUT"
+  git -C "$WORK" checkout -q -- src/cmd_selfcheck.sh 2>/dev/null || true
+
+  # And the stamp itself is ASSERTED, not exempted: a bundle whose only difference
+  # from src/ is a stamp naming a commit this checkout cannot corroborate is a
+  # forged identity, and comparing modulo the stamp without this arm would pass it.
+  # The checksum is regenerated so the red can only come from the identity check.
+  sed -i -E 's/^readonly FIVE_BUILD_SHA="[^"]*"$/readonly FIVE_BUILD_SHA="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"/' "$WORK/5dive"
+  sha256sum "$WORK/5dive" | awk '{print $1}' > "$WORK/5dive.sha256"
+  probe bundle-integrity
+  [[ $RC -ne 0 ]] && grep -q 'cannot corroborate' <<<"$OUT" \
+    && ok_t "[bundle-integrity] a FORGED build stamp is RED (the stamp is asserted, not waived)" \
+    || fail_t "[bundle-integrity] a bundle claiming a foreign build sha passed: $OUT"
+
+  restore
+  probe bundle-integrity
+  [[ $RC -eq 0 ]] && ok_t "[bundle-integrity] green again once restored (release shape left no residue)" \
+    || fail_t "[bundle-integrity] did not recover after the release-shape arms: $OUT"
+else
+  fail_t "[bundle-integrity] could not build the release-commit fixture — DIVE-2798 is UNPROVEN, not passing"
+fi
 
 # ── rail 5: the audit log, PRIVILEGED half ───────────────────────────────────
 # Same mutation as rail 2, measured from the other side. Skipped-not-silent when
@@ -348,6 +443,20 @@ else
 fi
 SC_ENV=()
 rm -rf "$SC_LC"
+
+# DIVE-2783: prove the corpus RAN. Every rail below is unconditional on every box;
+# audit-nonroot is deliberately absent from the list because it self-skips as root,
+# and a floor that reds on a legitimate skip would be its own false signal.
+#
+# This is the arm that makes the fix gradeable. Restoring the build and leaving the
+# prover silent — an early exit, a copy that builds but produces no bundle, a rail
+# that stops being invoked — passes `$FAIL -eq 0` and fails here.
+for _r in gate-delivery harness-verdicts bundle-integrity scorecard-honesty lead-clear-seal; do
+  case "$RAILS_SEEN" in
+    *"[$_r]"*) ;;
+    *) fail_t "[corpus] rail '$_r' produced NO arm at all — the prover was SILENT on it, which is indistinguishable from a pass on \$FAIL alone" ;;
+  esac
+done
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

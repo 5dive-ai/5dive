@@ -59,9 +59,13 @@ grep -q 'override_model:-\${OPENCLAW_PROVIDER_MODEL' <<<"$o" \
 
 # Backward-compat: a 4-arg call (auth re-login path) still resolves to the
 # catalog default (override_model defaults to empty).
-grep -q 'apply_byo_provider "$type" "$byo_provider" "$api_key" "$profile"$' src/cmd_auth.sh \
-  && ok_t "auth re-login 4-arg call still valid (override defaults empty)" \
-  || ok_t "auth re-login call shape changed (acceptable if still <=5 args)"
+# DIVE-2809 gave `auth set` its own --model/--base-url, so the call is now 6-arg
+# and forwards both. Anchor on that shape: the arm exists to catch the forward
+# being DROPPED, and a fallback that ok_t's either way cannot (it did not).
+grep -q 'apply_byo_provider "$type" "$byo_provider" "$api_key" "$profile" "$byo_model" "$base_url"$' src/cmd_auth.sh \
+  && ok_t "auth set forwards \$model (and \$base_url) to apply_byo_provider" \
+  || bad_t "auth set no longer forwards \$model to apply_byo_provider" \
+           "$(grep -n 'apply_byo_provider "\$type"' src/cmd_auth.sh)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
