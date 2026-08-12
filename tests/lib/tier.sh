@@ -57,7 +57,7 @@
 # re-installing the ratchet this row exists to remove. The run prints its
 # percentage-of-budget every time, so the trend is legible in the number rather than
 # only in the red.
-TIER_BUDGET_CORE=300
+TIER_BUDGET_CORE=1
 TIER_BUDGET_FULL=1320
 
 # DIVE-2728: A SECOND IS NOT A STABLE UNIT ON RENTED HARDWARE, so the cap above is
