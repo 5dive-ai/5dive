@@ -424,17 +424,46 @@ jobs:
               # was abandoned: re-point at the descendant that subsumed it and grade THAT, which
               # is a strictly STRONGER tree than the one we were about to publish. Three
               # conditions, all required, all fail-closed:
-              #   1. EVERY red row is `cancelled`. One genuine failure/timed_out and we refuse —
-              #      a descendant may or may not have fixed it and this job does not get to
-              #      assume; only the absence of a verdict is retargetable, never a bad one.
+              #   1. EVERY red row is `cancelled`, AND THERE IS AT LEAST ONE. One genuine
+              #      failure/timed_out and we refuse — a descendant may or may not have fixed it
+              #      and this job does not get to assume; only the ABSENCE of a verdict is
+              #      retargetable, never a bad one.
+              #   1b. THE BOARD MUST BE SETTLED — `-z "$incomplete"`. main + dev, 2026-08-12:
+              #      cancelled means no verdict will EVER exist; queued means one is coming, and
+              #      an impatient cut that hopped to a descendant rather than waiting would be
+              #      worse than the bug this fixes. A `queued`/`in_progress` row is `$2 !=
+              #      completed`, so it is NOT in `bad` — it is invisible to condition 1, which is
+              #      exactly why condition 1 alone is not enough. Measured: a board of one
+              #      cancellation plus one queued row retargeted, twice, while work on the sha we
+              #      were abandoning was still running. The retarget's whole claim is "the verdict
+              #      for this sha will never arrive", and that is only knowable once nothing is
+              #      still producing one. Unsettled => the pre-existing refusal fires, unchanged;
+              #      no red is waited out, and the real collision (a whole sweep cancelled in one
+              #      instant, run 31563209367) leaves `incomplete` empty and is unaffected.
+              #      THE COUNT IS NOT REDUNDANT. "every red is cancelled" is vacuously true of an
+              #      empty set, and DIVE-2867 is precisely a cut printing "CI is RED ... Failing:"
+              #      with an empty list — so the enclosing `-n "$bad"` is today the only thing
+              #      between this and retargeting on nothing. That is a correctness argument that
+              #      lives in a DIFFERENT branch condition and would not survive this block being
+              #      moved. Assert the positive here, where the decision is made.
               #   2. The new tip is a strict DESCENDANT (_retarget_tip's --is-ancestor test), so
               #      everything we were about to cut is contained in what we grade instead.
               #   3. Budget: at most _RETARGET_MAX, inside the SAME unextended poll deadline.
               # Reaching this branch at all already means the red was attributable (the deferral
               # above owns the other case), so these rows are not sibling-release-cut residue.
+              #
+              # TERMINATION, stated rather than implied — a retarget re-enters the SAME loop with
+              # a new `sha`, so the descendant is graded by every rule above and nothing else:
+              #   green            -> break, cut it (the descendant, never the abandoned sha)
+              #   any non-cancelled red -> refuse HERE, immediately. It does not walk further.
+              #   incomplete       -> keep polling it to the shared deadline, then refuse. It does
+              #                       not walk further; an unfinished verdict is one that is coming.
+              #   all-cancelled again, and main moved AGAIN -> at most one more hop, then refuse.
+              # So the only walk is condition-1-and-2 twice, and the deadline bounds even that.
               _uncancelled=$(awk -F'\t' '$3 != "cancelled"' <<<"$bad")
+              _ncancelled=$(awk -F'\t' '$3 == "cancelled"' <<<"$bad" | grep -c . || true)
               _newtip=""
-              if [[ -z "$_uncancelled" ]] && (( _retargets < _RETARGET_MAX )); then
+              if [[ -z "$_uncancelled" ]] && (( _ncancelled > 0 )) && [[ -z "$incomplete" ]] && (( _retargets < _RETARGET_MAX )); then
                 _newtip=$(_retarget_tip "$sha")
               fi
               if [[ -n "$_newtip" ]]; then

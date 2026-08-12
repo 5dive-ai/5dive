@@ -345,6 +345,31 @@ ok "the cap is hardcoded in the workflow"  "$(grep -c '_RETARGET_MAX=2' "$WF")" 
 # would move to is the commit the incumbent tag was already cut from, publish nothing.
 ok "descendant == the incumbent's cut_from -> exit 0, publish nothing" \
    "$(CUT_FROM="$NEWTIP" retarget_run "$NEWTIP" "$CANCELLED" "$GREENB")" "NOTHING retargets=0"
+# --- main's three merge-gate checks, 2026-08-12, pinned as arms ---------------
+# (1) CANCELLED vs QUEUED (dev's catch). cancelled = no verdict will ever exist; queued = one is
+# coming. THIS ARM FAILED WHEN FIRST WRITTEN and bought the `-z "$incomplete"` precondition: a
+# queued row is `$2 != completed`, so it is not in `bad` and condition 1 CANNOT SEE IT — the board
+# retargeted twice while work on the sha being abandoned was still running, which is exactly the
+# impatient-hop main named. The retarget now requires a SETTLED board, so this refuses instead.
+CANCELLED_PLUS_QUEUED=$(printf 'harness-verdict-union\tcompleted\tcancelled\nharness-verdict-slow\tqueued\tpending')
+ok "a QUEUED row beside cancellations -> REFUSES, never retargets" \
+   "$(POLL_BUDGET=3 retarget_run "$NEWTIP" "$CANCELLED_PLUS_QUEUED")" "RED retargets=0"
+ok "...and the same board with the queued row FINISHED does retarget (the control)" \
+   "$(retarget_run "$NEWTIP" "$(printf 'harness-verdict-union\tcompleted\tcancelled\nharness-verdict-slow\tcompleted\tsuccess')" "$GREENB")" "GREEN retargets=1"
+ok "the settled-board precondition is in the workflow" \
+   "$(grep -c 'z "\$_uncancelled" \]\] && (( _ncancelled > 0 )) && \[\[ -z "\$incomplete"' "$WF")" "1"
+# (2) TERMINATION AT THE DESCENDANT. The red case is arm'd above; this is the other half — an
+# in-flight descendant is polled to the deadline and refused there. It does NOT walk further.
+ok "a descendant that never settles -> refuses at the deadline, no second hop" \
+   "$(POLL_BUDGET=4 retarget_run "$NEWTIP" "$CANCELLED" "$INFLIGHT")" "IN-FLIGHT retargets=1"
+# (3) VACUOUS-TRUE ON AN EMPTY SET. "every red is cancelled" is true of no reds at all, and
+# DIVE-2867 is a cut printing 'CI is RED ... Failing:' with an empty list. The block now counts
+# cancellations positively; the shape that can reach it looking empty is a bad row with a BLANK
+# conclusion, which must refuse rather than retarget.
+ok "a red row with a BLANK conclusion -> RED, never retargets on nothing" \
+   "$(retarget_run "$NEWTIP" "$(printf 'ghost\tcompleted\t')" "$GREENB")" "RED retargets=0"
+ok "the positive cancellation count is in the workflow" "$(grep -c '_ncancelled > 0' "$WF")" "1"
+
 # A deferred red must never fall through the green test. Before DIVE-3314 the only thing
 # stopping that was our own in_progress row keeping `incomplete` non-empty — a property of
 # the sha we were TRIGGERED on, which a re-targeted sha does not have.
