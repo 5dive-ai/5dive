@@ -111,6 +111,7 @@ cat \
   src/cmd_task.sh \
   src/cmd_trace.sh \
   src/cmd_org.sh \
+  src/cmd_human.sh \
   src/cmd_ui.sh \
   src/cmd_hire.sh \
   src/cmd_project.sh \

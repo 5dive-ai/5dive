@@ -649,6 +649,152 @@ _gate_route_reviewer() {
   done
 }
 
+# ---- DIVE-3342: which PERSON does a gate belong to? ----
+#
+# Everything above this line resolves an AGENT. That is what "routing" has meant
+# since DIVE-1495, and it is only half of a gate's delivery: the other half —
+# whose phone rings when the agent rail expires, or when the gate is human-only
+# by tier — was never routed at all. It was read off `last-human-chat.json`,
+# i.e. whoever most recently DM'd that bot, with a fan-out to the whole
+# allowFrom when no pointer resolved. See src/cmd_human.sh for the measured harm
+# and why zero human rows must keep the old behaviour exactly.
+#
+# _human_registry_active — is the human registry IN USE on this store? Presence,
+# not a flag: a box with no `humans` rows is a box that has not adopted this, and
+# gate delivery there must be byte-identical to its pre-DIVE-3342 self. Returns 1
+# when the table is absent too (an old store mid-migration), because "cannot see
+# the registry" and "registry is empty" both mean "do not change behaviour" — the
+# opposite of the absent-vs-forbidden conflation _task_agent_paired warns about,
+# and safe in this direction precisely because the fallback is the status quo.
+_human_registry_active() {
+  local n
+  n=$(db "SELECT COUNT(*) FROM humans;" 2>/dev/null) || return 1
+  [[ "${n:-0}" =~ ^[0-9]+$ ]] && (( n > 0 ))
+}
+
+# _human_owner_of_agent <agent> — the person who owns that agent's gates. Walks
+# the explicit human_agents link, then UP the org chart, one level at a time.
+#
+# It does NOT fall back to the coordinator/org root the way _gate_route_reviewer
+# does, and that omission is deliberate. The root fallback is what makes
+# _gate_route_reviewer return the filer itself at the top of the chart
+# (community/wiki/the-org-root-cannot-resolve-a-reviewer-because-it-is-its-own-fallback.md);
+# reused here it would mean "no owner is linked anywhere" silently resolving to
+# whichever person happens to be linked to the root — a confident wrong recipient,
+# which is the exact failure being fixed. Empty is a legitimate answer here and
+# the callers are built to handle it.
+_human_owner_of_agent() {
+  local cur="${1:-}" hit="" seen="" depth=0
+  while [[ -n "$cur" ]] && (( depth < 8 )); do
+    case ",$seen," in *",$cur,"*) return ;; esac   # cycle guard: the chart is agent-writable
+    seen="${seen:+$seen,}$cur"
+    hit=$(db "SELECT ha.human_id FROM human_agents ha JOIN humans h ON h.id=ha.human_id
+              WHERE ha.agent=$(sqlq "$cur") ORDER BY ha.human_id LIMIT 1;" 2>/dev/null)
+    if [[ -n "$hit" ]]; then printf '%s' "$hit"; return; fi
+    cur=$(db "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$cur") LIMIT 1;" 2>/dev/null)
+    depth=$(( depth + 1 ))
+  done
+}
+
+# _human_gate_recipient <numeric task id> — the person this gate belongs to, i.e.
+# the human who may CLEAR it. Ordered candidates, first hit wins; every one of
+# them is a CLEARANCE relationship, never a traffic observation:
+#
+#   1. tasks.human_owner        — stamped at file time (or declared with
+#                                 `task need --owner=`). The gate's own record of
+#                                 whose it is; re-resolving past it would let the
+#                                 chart move a live gate to someone else.
+#   2. owner-of(routed_reviewer) — the agent rail's owner. When a tier-1 gate's
+#                                 24h rail expires, the person above THAT rail is
+#                                 who inherits it.
+#   3. owner-of(gate_filed_by)   — the filer's owner (gate_filed_by, not
+#                                 created_by: a task and the gates on it have
+#                                 different principals — DIVE-3171).
+#   4. owner-of(assignee)/owner-of(created_by) — last structural resorts.
+#   5. the SOLE human on record  — a one-person registry has exactly one possible
+#                                 clearer, so requiring a link there would be
+#                                 ceremony. With two or more rows this arm is off:
+#                                 that is the ambiguity the ticket is about, and
+#                                 guessing is what we are removing.
+#
+# Sets HUMAN_RECIPIENT_ID and HUMAN_RECIPIENT_BASIS — the answer and the arm that
+# produced it — so both `5dive human recipient` and the delivery log can say WHY,
+# rather than leaving a silent empty the way _gate_route_reviewer does. The id is
+# ALSO printed for convenience, but callers that need the basis must call this
+# WITHOUT a command substitution: `$( )` is a subshell, so a var it assigns dies
+# with it and the basis would read empty exactly where the explanation matters.
+_human_gate_recipient() {
+  local numid="${1:-}" row who=""
+  HUMAN_RECIPIENT_BASIS="no candidate"; HUMAN_RECIPIENT_ID=""
+  [[ "$numid" =~ ^[0-9]+$ ]] || { HUMAN_RECIPIENT_BASIS="not a task row"; return; }
+  row=$(db "SELECT COALESCE(human_owner,'')||x'1f'||COALESCE(routed_reviewer,'')||x'1f'||COALESCE(gate_filed_by,'')||x'1f'||COALESCE(assignee,'')||x'1f'||COALESCE(created_by,'')
+            FROM tasks WHERE id=${numid};" 2>/dev/null)
+  [[ -n "$row" ]] || { HUMAN_RECIPIENT_BASIS="no such row"; return; }
+  local stamped reviewer filer assignee creator
+  IFS=$'\x1f' read -r stamped reviewer filer assignee creator <<<"$row"
+
+  if [[ -n "$stamped" ]]; then
+    # Only a LIVE row counts. A stamp naming a deleted account must re-resolve,
+    # not resolve to a person who is no longer on the box.
+    who=$(db "SELECT id FROM humans WHERE id=$(sqlq "$stamped") LIMIT 1;" 2>/dev/null)
+    if [[ -n "$who" ]]; then HUMAN_RECIPIENT_BASIS="gate owner (stamped)"; HUMAN_RECIPIENT_ID="$who"; printf '%s' "$who"; return; fi
+  fi
+  local pair
+  for pair in "routed reviewer ${reviewer}" "gate filer ${filer}" "assignee ${assignee}" "creator ${creator}"; do
+    local label="${pair% *}" agent="${pair##* }"
+    [[ -n "$agent" ]] || continue
+    who=$(_human_owner_of_agent "$agent")
+    if [[ -n "$who" ]]; then HUMAN_RECIPIENT_BASIS="owner of ${label} ${agent}"; HUMAN_RECIPIENT_ID="$who"; printf '%s' "$who"; return; fi
+  done
+  local n; n=$(db "SELECT COUNT(*) FROM humans;" 2>/dev/null)
+  if [[ "${n:-0}" == "1" ]]; then
+    who=$(db "SELECT id FROM humans LIMIT 1;" 2>/dev/null)
+    HUMAN_RECIPIENT_BASIS="sole human on record"; HUMAN_RECIPIENT_ID="$who"
+    printf '%s' "$who"; return
+  fi
+  HUMAN_RECIPIENT_BASIS="no human owns this gate's clearers (${n:-0} humans on record, none linked up the chain)"
+}
+
+# _human_transport_id <human id> <telegram|buzz|discord> — that person's id on one
+# transport, empty if they are not on it. One identity, three addresses: the whole
+# point of the record is that a gate names the PERSON and delivery picks the
+# address, instead of the address being all we ever had.
+_human_transport_id() {
+  local id="${1:-}" transport="${2:-telegram}" col
+  case "$transport" in
+    telegram) col="telegram_id" ;;
+    buzz)     col="buzz_npub" ;;
+    discord)  col="discord_id" ;;
+    *) return ;;
+  esac
+  [[ -n "$id" ]] || return
+  db "SELECT COALESCE(${col},'') FROM humans WHERE id=$(sqlq "$id") LIMIT 1;" 2>/dev/null
+}
+
+# _human_gate_ids_by_owner <comma-separated task ids> — partition a BATCH of gate
+# rows by resolved owner, one line per owner: `<human|->\t<ids>`. Batch re-nags
+# (the heartbeat sweep, `task inbox --send`) render one message for many gates;
+# on a multi-human box those gates need not share an owner, and sending the
+# rendered batch to all of them would page each person with other people's rows —
+# the reported harm with the volume turned up. Callers loop over this instead.
+_human_gate_ids_by_owner() {
+  local idlist="${1:-}" id who
+  [[ -n "$idlist" ]] || return
+  local -A groups=()
+  local IFS=','
+  for id in $idlist; do
+    [[ "$id" =~ ^[0-9]+$ ]] || continue
+    _human_gate_recipient "$id" >/dev/null
+    who="$HUMAN_RECIPIENT_ID"
+    groups["${who:--}"]="${groups["${who:--}"]:+${groups["${who:--}"]},}${id}"
+  done
+  unset IFS
+  local k
+  for k in $(printf '%s\n' "${!groups[@]}" | sort); do
+    printf '%s\t%s\n' "$k" "${groups[$k]}"
+  done
+}
+
 # DIVE-1401 (olivia review, iter 2): the TRUSTED caller identity for gate-withdraw
 # AUTHORIZATION. This is deliberately NOT task_actor: --from is caller-asserted and
 # SUDO_USER/SUDO_UID are plain env vars a NON-root process can forge with no real

@@ -198,6 +198,15 @@ out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
 # from the addition. See the note below: on this literal, prediction is how the
 # last three branches each got it wrong.
 #
+# DIVE-3342 added human_owner, the person a gate belongs to, stamped at filing so
+# delivery names a clearer rather than the bot's last chat (86 -> 87). 87 was
+# MEASURED by running this case on the REBASED tree (base 7bd8dae), not predicted:
+# the branch was first delivered based on c1dafe2 with this literal left at 86, and
+# this case is what caught it — CI red on the delivered sha, on exactly the
+# additive-column path the note below describes, found by the verifier and not by
+# the 25-harness regression set the branch chose for itself. main had since moved
+# to 7bd8dae, which adds no column, so the rebase left 87 standing rather than 88.
+#
 # THIS LITERAL WAS RESOLVED BY ARITHMETIC, NOT BY PICKING A SIDE (2026-08-11), and
 # it has now been resolved that way TWICE in one day, by two different branches.
 # First pass: DIVE-3218 and DIVE-2272 both forked at 79 and each was internally
@@ -223,8 +232,8 @@ actual=$(sqlite3 "$TASKS_DB" \
     WHERE name IN ('delivery_ref','delivered_at','delivery_ref_iteration','parked_at','park_reason','escalated_at','escalated_by','human_evidence')
     ORDER BY name;" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
 column_count=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM pragma_table_info('tasks');" 2>/dev/null)
-[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "86" ]] \
-  && ok "fresh schema: all 86 columns, including the eight former holes, are present" \
+[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "87" ]] \
+  && ok "fresh schema: all 87 columns, including the eight former holes, are present" \
   || bad "fresh schema: init returned a partial tasks table" "rc=$rc count=$column_count got=[$actual] want=[$required] out=$out"
 
 # --- Case 10 (DIVE-2197): migrate arm still rejects a failed ALTER ------------

@@ -271,7 +271,9 @@ _task_inbox_send() {
     fi
     # First message pings; the rest arrive silently.
     if (( first_sent )); then export FIVEDIVE_NOTIFY_SILENT=1; fi
-    _task_send_owner "$gate_text" "$markup" "$id"
+    # DIVE-3342: per-gate, so each gate reaches ITS owner (or nobody) — the
+    # per-gate loop this site already had is what makes that free.
+    _task_send_gate_owner "$gate_text" "$markup" "$id"
     if [[ "${TASK_SEND_DELIVERED:-0}" == "1" ]]; then
       sent=$(( sent + 1 )); first_sent=1
       all_ids+="${all_ids:+,}${id}"
@@ -290,7 +292,9 @@ _task_inbox_send() {
                FROM tasks WHERE ${where} ${order} LIMIT ${cap};")
   if (( total > cap )) && (( sent > 0 )); then
     export FIVEDIVE_NOTIFY_SILENT=1
-    _task_send_owner "…and $(( total - cap )) more gate(s) — 5dive task inbox on the box, or the dashboard." "" ""
+    # DIVE-3342: the tail carries no rows, so it has nobody to resolve from —
+    # address it to whoever just received the batch rather than to the allowlist.
+    _task_send_gate_owner "…and $(( total - cap )) more gate(s) — 5dive task inbox on the box, or the dashboard." "" "" "${TASK_GATE_LAST_OWNER:-}"
   fi
   if [[ -n "$_prev_silent" ]]; then export FIVEDIVE_NOTIFY_SILENT="$_prev_silent"; else unset FIVEDIVE_NOTIFY_SILENT; fi
   TASK_SEND_MESSAGE_IDS="$all_mids"
