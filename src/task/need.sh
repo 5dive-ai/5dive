@@ -217,13 +217,83 @@ _GATE_PUSH_FOR_REVIEW_RX='delegated push|push[- ]for[- ]review|5dive push|push[^
 # in a way DIVE-2224 forbids across a seam: this matches inside ONE field.
 _GATE_PUSH_NOT_INERT_RX='\bmerg(e|es|ed|ing)\b|deploy|redeploy|\brelease\b|roll ?out|\broll(ing|ed)? out\b|roll[^.]*fleet|fleet[- ]?roll|\bto\b[^.]{0,60}\b(main|master|prod|production|trunk)\b|\bland (the|it|this)\b'
 
+# DIVE-3307: _GATE_PUSH_NOT_INERT_RX above reads SUBJECT MATTER, not the requested
+# ACTION. An ask that merely DESCRIBES a merge/deploy trips it and is graded as a
+# request to perform one. Measured on DIVE-3302's live gate: "…toward the core-tier
+# overage freezing all merges" un-suppressed the DIVE-3117 lead route on the word
+# `merges` and sent the gate back to the verifier — the one agent who structurally
+# cannot answer it. Delete that clause and the same ask routes to the lead.
+#
+# It is the DIVE-2089 shape and it is recursive: the better you describe the merge
+# freeze you are trying to fix, the more reliably the gate to fix it misroutes. It
+# fires hardest when urgency is highest, because that is when a filer explains the
+# blockage in the ask.
+#
+# need.sh:2686 already states this distinction for the SIBLING axis — "THE ASK ONLY,
+# never the title (DIVE-2224). A title is written to describe a DEFECT; only the ask
+# can be a REQUEST." The same distinction is needed WITHIN the ask: a clause saying
+# what is BLOCKED is not a request to unblock it by hand.
+#
+# THE FIX IS A DISCRIMINATOR, NOT A SHORTER LIST — deliberately, and the ticket
+# forbids the other one. Every term stays in _GATE_PUSH_NOT_INERT_RX: it exists so a
+# push ask that genuinely ALSO asks to merge or deploy keeps its routing and its
+# DIVE-2629 tier-2 subject floor. What is added is the bounded set of FRAMES in
+# which one of those terms is unambiguously a noun naming a blocked state. Those
+# spans — and only those — are removed before the not-inert test, the same move
+# DIVE-2629 makes on branch identifiers and for the same reason: grade the action
+# the gate AUTHORISES.
+#
+# THREE PROPERTIES, all biased toward KEEPING the non-inert verdict:
+#
+#   1. LEADING WORD BOUNDARY, the DIVE-2301 wrapper. Without it "delegated" ends in
+#      "gated", so "delegated release of branch X" contains "gated release" and a
+#      real release request would be redacted away mid-word. Frames must start at a
+#      word edge.
+#   2. SPANS, NOT TERMS. Only the matched described-frame span is removed. A
+#      requested action sitting BESIDE a described one survives, so one description
+#      cannot launder a request next to it ("merge freeze is lifted, so merge it to
+#      main after" is still NOT inert).
+#   3. SCOPED TO THE NOT-INERT TEST. _GATE_PUSH_FOR_REVIEW_RX still reads the
+#      original ask, so redaction can never push a text OUT of the class; and the
+#      redacted string is discarded, so DIVE-2629's floor still reads the full
+#      prose. Removing a span can only SHORTEN the text, which for the bounded
+#      `\bto\b … main` clause can only make it match MORE readily — the safe
+#      direction.
+#
+# BOTH AXES MOVE, BY CONSTRUCTION, and that is the point of doing it here:
+# _gate_push_for_review_hit is shared with DIVE-2629's tier floor (need.sh:2696), so
+# the routing and tier axes cannot end up disagreeing about what an inert push is.
+# Graded on both axes in tests/gate_described_not_requested_unit.sh.
+_GATE_ACTION_DESCRIBED_RX='(^|[^[:alnum:]_])((freez|block|hold|held|halt|stall|paus|gat|delay|queu|defer|suspend)(e|es|ed|ing|s)?[[:space:]]+((on|of)[[:space:]]+)?((the|all|any|every|a|an|our|their|further|new|more|pending|remaining)[[:space:]]+)*(merge|deploy|deployment|release|rollout|roll[[:space:]]out)(s|es)?|(merge|deploy|deployment|release|rollout)s?[- ](freeze|freezes|window|windows|queue|queues|ban|bans|moratorium|embargo|backlog|hold|holds|lock|locks)|(merge|deploy|deployment|release|rollout)s?[[:space:]]+(are|is|was|were|remain|remains|stay|stays)[[:space:]]+(currently[[:space:]]+)?(frozen|blocked|held|paused|stalled|halted|gated|queued))'
+
+# Remove every DESCRIBED-action span from $1. Pure bash — this sits on the gate-filing
+# hot path and _gate_redact_branch_refs next door is fork-free for the same reason.
+# Each match is replaced by a space rather than deleted so two surviving words cannot
+# be glued into a third. Every alternative in the RX requires literal words, so
+# BASH_REMATCH[0] is never empty and the loop always consumes.
+_gate_redact_described_actions() {
+  local t="${1-}" out="" m
+  while [[ "$t" =~ $_GATE_ACTION_DESCRIBED_RX ]]; do
+    m="${BASH_REMATCH[0]}"
+    out+="${t%%"$m"*} "
+    t="${t#*"$m"}"
+  done
+  printf '%s%s' "$out" "$t"
+}
+
 # 0 iff the text describes an INERT push-for-review: a feature branch going to a
 # remote for PR review. Fails closed — anything that also names a prod-touching
 # verb is NOT inert and gets no exemption.
 _gate_push_for_review_hit() {
   local text; text=$(printf '%s' "${1-}" | tr '[:upper:]' '[:lower:]')
   [[ "$text" =~ $_GATE_PUSH_FOR_REVIEW_RX ]] || return 1
-  [[ "$text" =~ $_GATE_PUSH_NOT_INERT_RX ]] && return 1
+  # DIVE-3307: only pay for the described/requested discrimination when a trigger term
+  # is actually present. The overwhelmingly common ask names none and returns here
+  # exactly as it did before this change.
+  if [[ "$text" =~ $_GATE_PUSH_NOT_INERT_RX ]]; then
+    local requested; requested=$(_gate_redact_described_actions "$text")
+    [[ "$requested" =~ $_GATE_PUSH_NOT_INERT_RX ]] && return 1
+  fi
   return 0
 }
 

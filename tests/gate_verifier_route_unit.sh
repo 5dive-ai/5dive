@@ -283,6 +283,28 @@ cmd_task_need DIVE-3122 --type=approval \
 [[ "$HUMAN_PINGED" == "1" && "$(route_sent)" == "0" ]] \
   && ok_t "a push ask naming a spend stays human (T2 floor outranks the class)" \
   || bad_t "a push ask naming a spend stays human" "human=$HUMAN_PINGED sent=$(route_sent) routed=$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-3122';")"
+# 7g. DIVE-3307 — END TO END, the live DIVE-3302 ask byte-for-byte. The unit arms in
+# tests/gate_described_not_requested_unit.sh grade the PREDICATE; this one grades the
+# ROUTE, because a predicate assertion alone cannot show that the verifier suppression
+# actually re-engaged. Before the fix this ask reached the grader — the one agent who
+# cannot approve a push before reading a diff they cannot read until it is pushed.
+route_reset; seed_loop_g DIVE-3123; fixture_actor dev
+cmd_task_need DIVE-3123 --type=approval \
+  --ask='approve delegated push for review of branch dive-3302-core-budget - coverage-neutral perf fix reclaiming CPU in identity_stub_guard toward the core-tier overage freezing all merges' --from=dev >/dev/null 2>&1
+[[ "$(route_last)" != "grader" ]] \
+  && ok_t "a push ask that DESCRIBES a merge freeze does not route to the verifier (DIVE-3307)" \
+  || bad_t "a push ask that DESCRIBES a merge freeze does not route to the verifier (DIVE-3307)" "route_last=$(route_last)"
+
+# 7h. NEGATIVE CONTROL for 7g, and the arm that fails the non-fix the ticket forbids
+# (deleting terms from _GATE_PUSH_NOT_INERT_RX): a REQUESTED merge in the same shape
+# of ask keeps the DIVE-1495 verifier route.
+route_reset; seed_loop_g DIVE-3124; fixture_actor dev
+cmd_task_need DIVE-3124 --type=approval \
+  --ask='approve delegated push for review of branch dive-3302-core-budget while merges are frozen, then merge it to main' --from=dev >/dev/null 2>&1
+[[ "$(route_last)" == "grader" ]] \
+  && ok_t "a described merge freeze does not launder a REQUESTED merge beside it (DIVE-3307)" \
+  || bad_t "a described merge freeze does not launder a REQUESTED merge beside it (DIVE-3307)" "route_last=$(route_last)"
+
 fixture_actor fixture-runner
 
 echo "-----"
