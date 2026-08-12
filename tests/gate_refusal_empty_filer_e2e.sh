@@ -142,17 +142,45 @@ a_status=$(sqlite3 "$DB" "SELECT status FROM tasks WHERE ident='$Q';")
   || bad "A6: the row moved despite the refusal" "status='$a_status'"
 
 # ── B: withdraw over the same row (the PRE-EXISTING half, same shape) ─────────
+# SEAT-DEPENDENT BY CONSTRUCTION, and the first cut of these arms got it wrong:
+# they asserted a REFUSAL, passed on this dev seat, and went red in CI. Cause is not
+# a tree difference — `_gate_withdraw_actor` returns "human" at EUID 0 with a
+# non-agent SUDO_UID (DIVE-1401/DIVE-2330), and CI runs as root. So the same tree
+# legitimately REFUSES for a non-root agent seat and legitimately SUCCEEDS for root.
+# An arm that hardcodes either outcome grades the seat, not the code.
+#
+# What is seat-INVARIANT is the thing this ticket is about: the resolvers run BEFORE
+# the authorization decision (their values feed w_ok), so the errexit abort fires on
+# BOTH paths. Assert that, then branch on the authorization outcome and assert the
+# correct behaviour for whichever seat we are on — announcing which, so a reader is
+# never guessing what was graded.
 b_err=$("$FIVE" task need "$Q" --withdraw 2>&1 >/dev/null); b_rc=$?
 b_type=$(sqlite3 "$DB" "SELECT COALESCE(need_type,'') FROM tasks WHERE ident='$Q';")
-(( b_rc != 0 )) && [[ "$b_err" != *"without reporting a reason"* ]] \
-  && ok "B1: the WITHDRAW refusal also survives an empty filer (rc=$b_rc, no bug banner)" \
+if [[ $EUID -eq 0 ]]; then b_seat="root (resolves to 'human' — withdraw AUTHORIZED)"
+else                       b_seat="agent seat uid=$EUID (withdraw NOT authorized)"; fi
+echo "     [seat] $b_seat"
+
+# B1 is the arm this harness exists for, and it holds on either seat: the guard must
+# RUN TO COMPLETION rather than die under errexit while resolving a lead it only
+# needed for a message. rc=1 + the bug banner is the iteration-1 symptom.
+(( b_rc != 1 )) && [[ "$b_err" != *"without reporting a reason"* ]] \
+  && ok "B1: the withdraw path survives an empty filer — no errexit abort (rc=$b_rc, no bug banner)" \
   || bad "B1: the withdraw path aborts on an empty filer" "rc=$b_rc err='$b_err'"
-[[ "$b_err" == *"withdraw"* ]] \
-  && ok "B2: ...and it is the withdraw guard's own message, not a shell error" \
-  || bad "B2: the withdraw refusal text is missing" "err='$b_err'"
-[[ "$b_type" == "decision" ]] \
-  && ok "B3: the gate survives the refused withdraw" \
-  || bad "B3: the gate was cleared by a refused withdraw" "need_type='$b_type'"
+
+if (( b_rc == 0 )); then
+  # Authorized caller: the withdraw is supposed to WORK, and the gate is supposed to
+  # be gone. Asserting a refusal here would be asserting a bug.
+  [[ -z "$b_type" ]] \
+    && ok "B2[root]: an AUTHORIZED withdraw completes and clears the gate" \
+    || bad "B2[root]: the withdraw returned 0 but the gate is still set" "need_type='$b_type'"
+else
+  [[ "$b_err" == *"withdraw"* ]] \
+    && ok "B2[agent]: the refusal is the withdraw guard's own message, not a shell error" \
+    || bad "B2[agent]: the withdraw refusal text is missing" "rc=$b_rc err='$b_err'"
+  [[ "$b_type" == "decision" ]] \
+    && ok "B3[agent]: the gate survives the refused withdraw" \
+    || bad "B3[agent]: the gate was cleared by a refused withdraw" "need_type='$b_type'"
+fi
 
 printf '\n%d passed, %d failed\n' "$P" "$F"
 [[ $F -eq 0 ]]
