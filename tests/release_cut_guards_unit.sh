@@ -235,8 +235,16 @@ echo "== DIVE-2466: an UNATTRIBUTABLE red is deferred, not acted on =="
 # MEASURED against the pristine block 2026-08-02: RED, looks=1, rc=1.
 RACE_L1=$(printf 'scan\tcompleted\tsuccess\t%s\ncut\tcompleted\tfailure\t%s' "$OTHER_URL" "$SIB_URL")
 RACE_L2=$(printf 'scan\tcompleted\tsuccess\t%s\ncut\tcompleted\tfailure\t%s\ncut\tin_progress\tpending\t%s' "$OTHER_URL" "$SIB_URL" "$SELF_URL")
+# DIVE-3314 RETUNED, DELIBERATELY: 2 -> 3. `looks` counts '[look ' lines, and a deferral
+# prints a second one in the same iteration, so the old "GREEN looks=2" was ONE iteration:
+# the block deferred the red and then broke out GREEN on that same pass, because the green
+# test asked only "all completed?" and never "and nothing bad?". The verdict was right by
+# luck — the outstanding row was the sibling corpse — but a deferred red reaching the green
+# branch at all is the hole DIVE-3314 closes, and it is load-bearing on a re-targeted sha
+# where our own in_progress row is not there to keep `incomplete` non-empty. It now does
+# what its own name says: defers on look 1, re-reads, drops the sibling on look 2 (2+1=3).
 ok "self row absent on look 1 -> defer the red, drop the sibling on look 2" \
-   "$(POLL_RUNID=30332498204 poll_run "$RACE_L1" "$RACE_L2")" "GREEN looks=2"
+   "$(POLL_RUNID=30332498204 poll_run "$RACE_L1" "$RACE_L2")" "GREEN looks=3"
 # The deferral must NOT have widened into "ignore reds while unattributable forever":
 # once our own row is present the sibling is droppable and a THIRD-PARTY red still bites.
 RACE_REAL=$(printf 'test\tcompleted\tfailure\t%s\ncut\tin_progress\tpending\t%s' "$OTHER_URL" "$SELF_URL")
@@ -265,6 +273,84 @@ ok "the ceiling is hardcoded in the workflow" "$(grep -c '_POLL_CEILING=2700' "$
 echo "== DIVE-2466 ARM 1: the cron is off the top of the hour, and armed twice =="
 ok "no cron at the top of an hour"  "$(grep -cE "cron: '0 " "$WF")" "0"
 ok "two schedule entries"           "$(grep -cE "^    - cron: '" "$WF")" "2"
+
+echo "== DIVE-3314: a sha ABANDONED by a newer merge is re-targeted, not refused forever =="
+# full-sweep collapses the older of two close merges into the newer tip's run BY DESIGN,
+# so an overtaken sha's verdict never arrives and a cut pointed at it refuses PERMANENTLY.
+# Measured 2026-08-12: v0.19.26 uncut on run 31563209367 with three `cancelled`
+# harness-verdict rows, 3 of the last 4 pushes to main cancelled the same way.
+# `_retarget_tip` is stubbed here for the same reason `_ci_fetch_runs` is: the block must
+# not reach git or the network from a unit harness, and its absence must REFUSE, not cut.
+retarget_run(){ # $1 = tip the stub offers ('' = none) ; $2.. = one fixture per look
+  local tip="$1"; shift
+  local i=0 f out rc
+  rm -f "$POLLDIR"/look.* "$POLLDIR"/n
+  for f in "$@"; do i=$((i+1)); printf '%s' "$f" > "$POLLDIR/look.$i"; done
+  printf '1' > "$POLLDIR/n"
+  out=$(runs="$1" sha=deadbeefcafe tag=v9.9.9 POLLDIR="$POLLDIR" NFIX="$#" TIP="$tip" \
+        GITHUB_RUN_ID="${POLL_RUNID:-}" cut_from="${CUT_FROM:-}" \
+        RELEASE_CUT_POLL_SECONDS="${POLL_BUDGET:-30}" RELEASE_CUT_POLL_INTERVAL=1 bash -c '
+    set -uo pipefail
+    _ci_fetch_runs(){
+      local n; n=$(cat "$POLLDIR/n"); n=$((n+1))
+      (( n > NFIX )) && n=$NFIX
+      printf "%s" "$n" > "$POLLDIR/n"
+      cat "$POLLDIR/look.$n" 2>/dev/null
+    }
+    _retarget_tip(){ [[ -n "$TIP" ]] && printf "%s\n" "$TIP"; return 0; }
+    '"$GUARD"'
+  ' 2>&1); rc=$?
+  local n_rt; n_rt=$(grep -c 'Re-targeting the cut' <<<"$out")
+  local v
+  if (( rc != 0 )); then
+    if   grep -q 'CI NOT REACHED'    <<<"$out"; then v=NOT-REACHED
+    elif grep -q 'CI still IN FLIGHT' <<<"$out"; then v=IN-FLIGHT
+    elif grep -q 'CI is RED'          <<<"$out"; then v=RED
+    else v="OTHER-FAIL:$out"; fi
+  else
+    if   grep -q 'CI green on'         <<<"$out"; then v=GREEN
+    elif grep -q 'nothing to publish'  <<<"$out"; then v=NOTHING
+    else v="OTHER-OK:$out"; fi
+  fi
+  echo "$v retargets=$n_rt"
+}
+# The three cancelled harness-verdict rows of run 31563209367, verbatim in shape.
+CANCELLED=$(printf 'test\tcompleted\tsuccess\nharness-verdict-union\tcompleted\tcancelled\nharness-verdict-installed\tcompleted\tcancelled\nharness-verdict-pristine\tcompleted\tcancelled')
+NEWTIP=ef471d6a1111
+# THE TICKET: the abandoned sha is re-graded at the descendant that subsumed it.
+ok "all-cancelled + a descendant tip -> retarget, then GREEN on the descendant" \
+   "$(retarget_run "$NEWTIP" "$CANCELLED" "$GREENB")" "GREEN retargets=1"
+# NO descendant (main did not move) -> the pre-DIVE-3314 behaviour EXACTLY. `cancelled`
+# on a sha nothing overtook is a red with no excuse and must still refuse on look 1.
+ok "all-cancelled + NO newer tip -> still RED, immediately, no retarget" \
+   "$(retarget_run "" "$CANCELLED" "$GREENB")" "RED retargets=0"
+# The narrowness that makes this safe: only a MISSING verdict is retargetable. A real
+# failure sitting beside the cancellations refuses even though a descendant is on offer.
+CANCELLED_PLUS_RED=$(printf 'harness-verdict-union\tcompleted\tcancelled\nfull-shard-3\tcompleted\tfailure')
+ok "a genuine failure among the cancellations -> RED even with a descendant available" \
+   "$(retarget_run "$NEWTIP" "$CANCELLED_PLUS_RED" "$GREENB")" "RED retargets=0"
+ok "timed_out is not a cancellation -> RED with a descendant available" \
+   "$(retarget_run "$NEWTIP" "$(printf 'harness-verdict-union\tcompleted\ttimed_out')" "$GREENB")" "RED retargets=0"
+# The descendant's own verdict is graded, not assumed: a red THERE still refuses.
+ok "retarget onto a descendant that is itself RED -> refuses" \
+   "$(retarget_run "$NEWTIP" "$CANCELLED" "$REDB")" "RED retargets=1"
+# ...and an in-flight descendant is waited for, which is the entire point of retargeting.
+ok "retarget onto an in-flight descendant -> polls, then GREEN" \
+   "$(retarget_run "$NEWTIP" "$CANCELLED" "$INFLIGHT" "$GREENB")" "GREEN retargets=1"
+# BOUNDED. A main merging faster than a sweep completes must refuse, not chase forever.
+ok "a main that keeps moving is chased at most twice, then REFUSES" \
+   "$(retarget_run "$NEWTIP" "$CANCELLED")" "RED retargets=2"
+ok "the cap is hardcoded in the workflow"  "$(grep -c '_RETARGET_MAX=2' "$WF")" "1"
+# The retarget re-opens "has main moved?", so the answer is re-asserted: if the tip we
+# would move to is the commit the incumbent tag was already cut from, publish nothing.
+ok "descendant == the incumbent's cut_from -> exit 0, publish nothing" \
+   "$(CUT_FROM="$NEWTIP" retarget_run "$NEWTIP" "$CANCELLED" "$GREENB")" "NOTHING retargets=0"
+# A deferred red must never fall through the green test. Before DIVE-3314 the only thing
+# stopping that was our own in_progress row keeping `incomplete` non-empty — a property of
+# the sha we were TRIGGERED on, which a re-targeted sha does not have.
+DEFERRED_ALL_DONE=$(printf 'scan\tcompleted\tsuccess\t%s\ncut\tcompleted\tfailure\t%s' "$OTHER_URL" "$SIB_URL")
+ok "a deferred red on a fully-completed board is NOT green" \
+   "$(POLL_RUNID=30332498204 POLL_BUDGET=3 poll_run "$DEFERRED_ALL_DONE" | cut -d' ' -f1)" "IN-FLIGHT"
 
 echo "== non-vacuity: each guard must RED when mutated =="
 # DIVE-2238: this helper used to announce a no-op mutation with `echo` and bump

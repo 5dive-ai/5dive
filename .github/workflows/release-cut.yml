@@ -247,6 +247,25 @@ jobs:
             gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${sha}/check-runs" \
               --jq '.check_runs[] | [.name, .status, (.conclusion // "pending"), (.details_url // "")] | @tsv' 2>/dev/null
           }
+          # DIVE-3314: echo main's CURRENT tip iff it is a STRICT DESCENDANT of $1.
+          # Outside the fence for the same reason _ci_fetch_runs is: the block below is
+          # extracted and executed by tests/release_cut_guards_unit.sh, which supplies its
+          # own stub, so no arm of that harness can reach git or the network here. If the
+          # function is absent the caller sees an empty answer and REFUSES — the safe
+          # direction, and the one every pre-existing arm of that harness already asserts.
+          #
+          # THE ANCESTRY TEST IS THE WHOLE SAFETY ARGUMENT, so it is not optional and it is
+          # not `!=`. Re-pointing at an unrelated tip (a force-push, a rewritten main) would
+          # let this job publish a tree whose relationship to the graded one is unknown.
+          # `--is-ancestor` says the new tip CONTAINS every commit we were about to cut.
+          _retarget_tip() {
+            local _t
+            git fetch -q origin main 2>/dev/null || return 0
+            _t=$(git rev-parse FETCH_HEAD 2>/dev/null) || return 0
+            [[ -n "$_t" && "$_t" != "$1" ]] || return 0
+            git merge-base --is-ancestor "$1" "$_t" 2>/dev/null || return 0
+            printf '%s\n' "$_t"
+          }
           runs=$(_ci_fetch_runs)
           # >>> DIVE-2144 release-cut guard block (extracted verbatim by tests/release_cut_guards_unit.sh)
           # DIVE-2238: DROP THIS RUN'S OWN CHECK-RUNS BEFORE COUNTING ANYTHING.
@@ -290,6 +309,22 @@ jobs:
           [[ "$_poll_int" =~ ^[1-9][0-9]*$ ]] || _poll_int=60
           _poll_started=$SECONDS
           _look=0
+          # DIVE-3314: at most this many re-targets, and they DO NOT extend the poll
+          # budget. A retarget is only ever the answer to "the sha we hold was abandoned
+          # by a newer merge"; against a main merging faster than a sweep completes, an
+          # unbounded chase parks this job on a runner until the job timeout and still
+          # publishes nothing. Two is enough to absorb the observed collision (one merge
+          # inside one cut window) and small enough that a pathological main refuses.
+          _RETARGET_MAX=2
+          _retargets=0
+          # DIVE-3314: LEARNED ONCE, KEPT. This was re-cleared on every look, so the
+          # sibling filter silently disengaged on any look where our own row was not in
+          # the board — and after a retarget that is EVERY look, because our check-run
+          # lives on the sha this run was triggered on and never appears on the new one.
+          # Our job's NAME is a property of this workflow, not of the sha, so carrying it
+          # forward is what DIVE-2466's own text already describes ("we defer EVERY red
+          # until our own row has been seen ONCE").
+          _self_name=""
           while :; do
             _look=$(( _look + 1 ))
             # DIVE-2466 iter2 (olivia's reject): dropping only THIS RUN's check-runs
@@ -331,9 +366,9 @@ jobs:
             # If our own row is absent we drop nothing extra and behave exactly as
             # before this change (run-id filter only). In real execution the check-run
             # exists before the step runs, so the fallback bought nothing.
-            _self_name=""
             if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
-              _self_name=$(awk -F'\t' -v self="/actions/runs/${GITHUB_RUN_ID}/" 'index($4, self) { print $1; exit }' <<<"$runs")
+              _found=$(awk -F'\t' -v self="/actions/runs/${GITHUB_RUN_ID}/" 'index($4, self) { print $1; exit }' <<<"$runs")
+              [[ -n "$_found" ]] && _self_name="$_found"
               runs=$(awk -F'\t' -v self="/actions/runs/${GITHUB_RUN_ID}/" 'index($4, self) == 0' <<<"$runs")
               if [[ -n "$_self_name" ]]; then
                 runs=$(awk -F'\t' -v jn="$_self_name" '$1 != jn' <<<"$runs")
@@ -371,11 +406,60 @@ jobs:
               echo "CI shows red on ${sha:0:12}, but our OWN check-run row is not visible yet, so sibling release-cut rows could not be dropped — NOT acting on an unattributable red; re-looking (DIVE-2466) [look ${_look}]"
               printf '%s\n' "$bad" | sed 's/^/  deferred: /'
             elif [[ -n "$bad" ]]; then
+              # DIVE-3314 SUPERSESSION RETARGET — the one red that is not a verdict.
+              #
+              # full-sweep's concurrency group is keyed on the ref with cancel-in-progress,
+              # and its header says so: "merges closer together than one sweep collapse into
+              # a single run of the newest tip". So a sha overtaken by a newer merge has its
+              # verdict DELIBERATELY never produced. `cancelled` is correctly not green — a
+              # predicate that requires green must refuse it, and widening the guard to accept
+              # `cancelled` would cut from an ungraded tree. But refusing is not the end of the
+              # story either: the verdict this job is waiting for is one the concurrency policy
+              # GUARANTEES will not arrive, so the refusal is permanent, not "not yet". Measured
+              # 2026-08-12: 3 of the last 4 pushes to main had their sweep cancelled, v0.19.26
+              # went uncut on run 31563209367, and queue-blockers.sh:350 excludes `cancelled`
+              # from red by design — so the board shows green while cuts refuse indefinitely.
+              #
+              # The answer is not to relax what green means. It is to stop grading a sha that
+              # was abandoned: re-point at the descendant that subsumed it and grade THAT, which
+              # is a strictly STRONGER tree than the one we were about to publish. Three
+              # conditions, all required, all fail-closed:
+              #   1. EVERY red row is `cancelled`. One genuine failure/timed_out and we refuse —
+              #      a descendant may or may not have fixed it and this job does not get to
+              #      assume; only the absence of a verdict is retargetable, never a bad one.
+              #   2. The new tip is a strict DESCENDANT (_retarget_tip's --is-ancestor test), so
+              #      everything we were about to cut is contained in what we grade instead.
+              #   3. Budget: at most _RETARGET_MAX, inside the SAME unextended poll deadline.
+              # Reaching this branch at all already means the red was attributable (the deferral
+              # above owns the other case), so these rows are not sibling-release-cut residue.
+              _uncancelled=$(awk -F'\t' '$3 != "cancelled"' <<<"$bad")
+              _newtip=""
+              if [[ -z "$_uncancelled" ]] && (( _retargets < _RETARGET_MAX )); then
+                _newtip=$(_retarget_tip "$sha")
+              fi
+              if [[ -n "$_newtip" ]]; then
+                if [[ -n "${cut_from:-}" && "$cut_from" == "$_newtip" ]]; then
+                  echo "::notice::${sha:0:12} was superseded by ${_newtip:0:12}, which is the commit the incumbent tag was already cut from — nothing to publish (DIVE-3314)."
+                  exit 0
+                fi
+                _retargets=$(( _retargets + 1 ))
+                echo "::notice::every red on ${sha:0:12} is 'cancelled' and main has moved to ${_newtip:0:12}, a descendant of it — that sweep was collapsed into the newer tip's by design and its verdict will never arrive. Re-targeting the cut at ${_newtip:0:12} and grading THAT (DIVE-3314) [retarget ${_retargets}/${_RETARGET_MAX}]"
+                printf '%s\n' "$bad" | sed 's/^/  abandoned: /'
+                sha="$_newtip"
+                runs=$(_ci_fetch_runs)
+                continue
+              fi
               echo "::error::CI is RED on ${sha:0:12} — refusing to cut ${tag}. Failing:"
               printf '%s\n' "$bad" | sed 's/^/  /'
               exit 1
             fi
-            if (( total > 0 )) && [[ -z "$incomplete" ]]; then
+            # DIVE-3314: `-z "$bad"` is load-bearing, not belt-and-braces. A DEFERRED red
+            # (the branch above) falls through to here, and without this a board that is
+            # red-but-unattributable AND fully completed breaks out as GREEN and publishes
+            # it. Unreachable before the retarget landed only because our own in_progress
+            # row kept `incomplete` non-empty on the sha we were triggered on; on a
+            # re-targeted sha that row does not exist, so nothing else holds the door.
+            if (( total > 0 )) && [[ -z "$bad" ]] && [[ -z "$incomplete" ]]; then
               echo "CI green on ${sha:0:12}: ${total}/${total} completed, none failing."
               break
             fi
