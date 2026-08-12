@@ -1432,9 +1432,107 @@ if len(summ) == 1:
         n = j.get('needs')
         return [n] if isinstance(n, str) else (n or [])
     depended = [o for o, j in jobs.items() if jn in needs_of(j)]
-    chk(not gated and not depended,
-        'the un-sharded total is PRINTED, NEVER ENFORCED — the job that prints it exits 0 on every path and nothing gates on it (an enforced sum is 313 > 300 on day one and the split would fix nothing)',
-        'gating exits: %s; jobs depending on it: %s' % (gated or 'none', depended or 'none'))
+    # 96 — the total's VALUE is graded by nothing. Its PRODUCTION is graded next door, and
+    # that dependent is the one thing allowed to need this job: a presence check is not a
+    # budget. So the arm reads WHAT the dependent does rather than counting dependents —
+    # a job that reads `unsharded_total_s` and never mentions a budget is the permitted
+    # shape, and anything else that hangs off the printing job is a second cap arriving
+    # through the back door. Comments are stripped first: this file's own remedy text says
+    # "budget" in a comment, and an arm that reads the prose instead of the code is the
+    # vacuity the jobs_missing_build arm above already learned once.
+    def code_of(job):
+        out = []
+        for r in runs(job):
+            for ln in r.splitlines():
+                if not ln.strip().startswith('#'):
+                    out.append(ln)
+        return '\n'.join(out)
+    stray, valuey = [], []
+    for o in depended:
+        c = code_of(jobs[o])
+        if 'unsharded_total_s' not in c:
+            stray.append(o)
+        elif re.search(r'budget|TIER_BUDGET|\b300\b', c):
+            valuey.append(o)
+    chk(not gated and not stray and not valuey,
+        'the un-sharded total is PRINTED, NEVER ENFORCED — the printing job exits 0 on every path, and the only job allowed to depend on it is the one that grades whether the figure was PRODUCED, which may not mention a budget (an enforced sum is 331 > 300 on day one and the split would fix nothing)',
+        'gating exits: %s; dependents that are not the presence check: %s; dependents that compare it to a budget: %s'
+        % (gated or 'none', stray or 'none', valuey or 'none'))
+
+# 97 — AND IT MUST NOT BE SWITCHABLE OFF. Found by quinn grading this row's own PR: a
+# one-line `if: false` on the total-printing job SURVIVES arms 95 and 96 at 140/0. 95 grades
+# the job's EXISTENCE and 96 grades that it does not gate — the job is still in the `jobs`
+# map, still carries the step, still matches every pattern, and never runs again. And because
+# the total deliberately gates nothing (arm 96 is the reason), nothing else reds either: the
+# instrument that keeps the corpus legible is turned off in one line with every check green.
+#
+# 96 says the total must not GATE. This says it must not be GATEABLE. They are not the same
+# claim, and the first one being green is what made the second one invisible.
+#
+# THE GENERAL SHAPE, because it is the second wrong-object guard measured on 2026-08-12 (the
+# other read a log's mtime, which shows a cron FIRED rather than that its work SUCCEEDED):
+# an arm asserts a property OF AN OBJECT, and a parsed workflow offers two objects that read
+# alike — the job as WRITTEN and the job as RUN. Name which one the property lives on. Here
+# it is liveness, so `if:` is part of the assertion and not decoration.
+#
+#   community/wiki/a-presence-arm-cannot-see-a-job-disabled-with-if-false.md
+#
+# No `if:` at all, or exactly `always()`. Anything else — `false`, a `github.event_name`
+# test, `success()` — reds, because a total that is conditional is a total that can be absent
+# without anything saying so. `always()` is required rather than merely allowed for the same
+# reason it is required on the aggregators (arm 93): the runs worth summarising most are the
+# ones that went over, and those are the runs where a shard failed.
+if len(summ) == 1:
+    jn = summ[0]
+    # 97a — the WEAK half, labelled weak so nobody mistakes it for the check. A parsed `if:`
+    # sees one of the five causes of an absent figure. Kept because it is free and it fails at
+    # review time, NOT because it grades production.
+    cond = jobs[jn].get('if')
+    cond_s = '' if cond is None else str(cond).strip()
+    chk(cond_s in ('', 'always()'),
+        'DECLARED liveness only (weak, and not the check): the printing job carries no `if:` or exactly always() — this sees `if: false` and nothing else, so 97b below is the arm that matters',
+        'if=%r on job %s' % (cond, jn))
+
+    # 97b — THE ARM THAT MATTERS: something grades the figure that was EMITTED. Four
+    # properties, because each one alone is satisfiable by a job that grades nothing:
+    #   exists      a job reads the machine-readable line out of the run's own output
+    #   can fail    it exits non-zero on an absence (a reader that cannot red is a print)
+    #   no value    it does not compare the figure to a budget (that is arm 96's clause,
+    #               asserted from the other side)
+    #   is required every required-name aggregator lists it, or it is a job that can sit
+    #               red for a week with the merge gate green
+    graders = [o for o, j in jobs.items()
+               if jn in needs_of(j) and 'unsharded_total_s' in code_of(j)]
+    problems = []
+    if not graders:
+        problems.append('no job reads unsharded_total_s out of the emitted output')
+    for g in graders:
+        c = code_of(jobs[g])
+        # NOT a search for "return 1 appears somewhere". Measured: removing the job's
+        # propagation (`|| rc=1` -> `|| true`, `exit "$rc"` -> `exit 0`) left the `return 1`s
+        # inside its helper untouched, so a permissive search stayed GREEN on a job that can
+        # no longer fail — output saying failure over a status saying success. The status is
+        # what CI reads, so grade the LAST exit: it must propagate a variable or be non-zero.
+        exits = re.findall(r'^\s*exit\s+(\S+)', c, re.M)
+        if not exits or exits[-1] in ('0',):
+            problems.append('%s ends with `exit %s` — it cannot fail whatever it prints'
+                            % (g, exits[-1] if exits else '(none)'))
+        # And it must PROVE it can fail, on every run, in both directions. A structural arm
+        # in this file cannot know whether the CI job still reds on a broken production —
+        # only the job's own positive control can, so the arm asserts the control EXISTS and
+        # the job refuses to report a green without it (DIVE-3317's keeper).
+        if 'SELFTEST FAIL' not in c or c.count('SELFTEST FAIL') < 3:
+            problems.append('%s carries no positive control with all three arms (absent -> red, empty -> red, real -> green)' % g)
+        if not re.search(r'if\s+!\s+selftest', c):
+            problems.append('%s does not refuse to report a green when its own control fails' % g)
+    REQUIRED_AGG = ['test', 'test-installed-host']
+    for agg in REQUIRED_AGG:
+        n = needs_of(jobs.get(agg) or {})
+        if not any(g in n for g in graders):
+            problems.append('required check %s does not require the figure to have been produced' % agg)
+    chk(not problems,
+        'the EMITTED figure is graded: a job reads the un-sharded total out of the run output, can fail on its absence, never compares it to a budget, and both required checks require it (an if:-only arm survives a broken glob, a renamed step, an early return and a dropped upload — measured)',
+        ' | '.join(problems))
 PY
   )
 else bad "unit-tests.yml is readable from the harness (DIVE-3315 arms)" "no file at $_wf3315"; fi

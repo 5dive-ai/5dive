@@ -675,7 +675,10 @@ jobs:
   # case where the corpus went red. Anything that is not `success` fails here, `skipped`
   # and `cancelled` included.
   test:
-    needs: [core-pristine, acp-graded-pristine]
+    # core-total-produced is in here on purpose, and it is why this check waits on the
+    # installed-host shards too: the honesty instrument being ALIVE is part of what the merge
+    # gate covers, and a job nothing requires is a job that can go red for a week.
+    needs: [core-pristine, acp-graded-pristine, core-total-produced]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -683,14 +686,15 @@ jobs:
         run: |
           rc=0
           for d in "core-pristine=${{ needs['core-pristine'].result }}" \
-                   "acp-graded-pristine=${{ needs['acp-graded-pristine'].result }}"; do
+                   "acp-graded-pristine=${{ needs['acp-graded-pristine'].result }}" \
+                   "core-total-produced=${{ needs['core-total-produced'].result }}"; do
             printf '%s\n' "$d"
             [ "${d#*=}" = success ] || rc=1
           done
           exit "$rc"
 
   test-installed-host:
-    needs: [core-installed-host, rails-installed-host, acp-graded-installed]
+    needs: [core-installed-host, rails-installed-host, acp-graded-installed, core-total-produced]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -702,7 +706,8 @@ jobs:
           rc=0
           for d in "core-installed-host=${{ needs['core-installed-host'].result }}" \
                    "rails-installed-host=${{ needs['rails-installed-host'].result }}" \
-                   "acp-graded-installed=${{ needs['acp-graded-installed'].result }}"; do
+                   "acp-graded-installed=${{ needs['acp-graded-installed'].result }}" \
+                   "core-total-produced=${{ needs['core-total-produced'].result }}"; do
             printf '%s\n' "$d"
             [ "${d#*=}" = success ] || rc=1
           done
@@ -767,6 +772,14 @@ jobs:
       - name: Re-sum the shards and print the UN-SHARDED core total
         run: |
           total_row() {   # <label> <glob>
+            # DIVE-3315 (quinn, grading this row's own PR): the table is for a HUMAN and
+            # cannot be graded. This function also emits ONE machine-readable line per
+            # environment into an artifact, which is the object `core-total-produced` grades:
+            #
+            #   unsharded_total_s <environment> <total_s> <harnesses> <shards_reporting>
+            #
+            # Emitted from the same variables the table is printed from, so a table that
+            # reads empty cannot leave the line looking healthy.
             local label="$1" pat="$2" n=0 s=0 b=0 shards=0 f need=0
             for f in $pat; do
               [[ -r "$f" ]] || continue
@@ -780,7 +793,10 @@ jobs:
             (( ${b:-0} > 0 )) && need=$(( (s + b - 1) / b ))
             printf '| %s | %d | %d | %ds | %ds per shard | %d |\n' \
               "$label" "$shards" "$n" "$s" "${b:-0}" "$need"
+            printf 'unsharded_total_s %s %d %d %d\n' "$label" "$s" "$n" "$shards" \
+              >> core-unsharded-total.txt
           }
+          : > core-unsharded-total.txt
           {
             echo "## Core tier wall-clock (DIVE-3315: two capped shards, one un-sharded total)"
             echo
@@ -810,6 +826,129 @@ jobs:
             fi
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
-          # WIRED TO NOTHING, on purpose. See the comment above this job: a total that
-          # can red is a second budget, and this one would red on day one.
+          echo
+          echo "machine-readable (this is the object core-total-produced grades):"
+          cat core-unsharded-total.txt
+          # THIS JOB IS WIRED TO NOTHING, on purpose. See the comment above it: a total that
+          # can red is a second budget, and this one would red on day one. Whether the figure
+          # was PRODUCED is a different question from whether it PASSES, and it is graded next
+          # door — `core-total-produced` reds on an absence, never on a value.
           exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: core-unsharded-total
+          path: core-unsharded-total.txt
+          # warn, not error: a missing file must not red THIS job (it exits 0 on every path
+          # by design). The absence is graded by core-total-produced, which is the job whose
+          # whole purpose is to fail on it.
+          if-no-files-found: warn
+
+  # DIVE-3315 — GRADE THE ARTIFACT, NOT THE YAML. Folded into this row rather than filed as a
+  # follow-up: a separate row is exactly how the guard ships without the thing it guards.
+  #
+  # WHY THIS EXISTS AT ALL, and it is the third instance of one object error on this row.
+  # Arm 95 in tests/corpus_tier_budget_unit.sh pinned the total-printing job by parsing the
+  # workflow — which grades its EXISTENCE, so a one-line `if: false` on it stayed green at
+  # 140/0 (quinn, measured). The obvious repair — assert the job's `if:` is `always()` — is
+  # the SAME error one level out: it grades DECLARED liveness. Measured too: leave `if:
+  # always()` untouched, point `total_row`'s glob at a pattern that matches nothing, and the
+  # `if:` whitelist still reads 141/0 while the run emits an empty table.
+  #
+  # What a parsed workflow cannot see: a renamed or deleted step inside the job, an early
+  # return before the printf, a glob that matches nothing, a download that failed under
+  # continue-on-error, or the job never running because something upstream of it did not.
+  # Those are five causes with one symptom — the figure is absent — so the check has to be
+  # on the SYMPTOM, in the run's own output, which is the same object `changed-harnesses`
+  # grades: what executed, not what was configured.
+  #
+  # PRODUCED, NEVER PASSING. This job must not compare the figure to anything: 331s pristine
+  # and 320s installed-host against a 300s PER-JOB cap would red on day one, which is the
+  # second budget this whole row exists to refuse. It asks one question — was the number
+  # emitted — and `tests/corpus_tier_budget_unit.sh` arm 96 holds that open by refusing any
+  # dependent of the printing job that mentions a budget.
+  #
+  # AND IT IS INSIDE THE MERGE GATE: both required-name aggregators list it, so a change that
+  # turns the instrument off cannot merge. That is not gating on the number; it is gating on
+  # the number existing.
+  core-total-produced:
+    runs-on: ubuntu-latest
+    needs: [core-pristine, core-installed-host, core-budget-report]
+    if: always()
+    steps:
+      - uses: actions/download-artifact@v4
+        # continue-on-error: a MISSING artifact is the defect this job exists to catch, so it
+        # must reach the grading step rather than dying in the download.
+        continue-on-error: true
+        with: { pattern: core-unsharded-total, merge-multiple: true }
+      - name: The un-sharded total must have been EMITTED — whatever the cause of an absence
+        env:
+          PRISTINE_RESULT: ${{ needs['core-pristine'].result }}
+          INSTALLED_RESULT: ${{ needs['core-installed-host'].result }}
+        run: |
+          f=core-unsharded-total.txt
+          rc=0
+          grade() {   # <environment> <that environment's shard-job result>
+            local env="$1" res="$2" line total n shards
+            # A red shard already blocks this run, and its total is legitimately partial.
+            # Manufacturing a second red here would add no information and would train people
+            # to read this job as noise — which is how a real absence gets waved through.
+            if [ "$res" != success ]; then
+              printf '%s: NOT GRADED — its shards did not all succeed (%s), so an absent total is explained by a red that already blocks this run.\n' "$env" "$res"
+              return 0
+            fi
+            if [ ! -r "$f" ]; then
+              printf '%s: FAIL — shards were GREEN and no total artifact exists at all. The figure was not produced: the printing job was disabled, never ran, or its upload was dropped.\n' "$env"
+              return 1
+            fi
+            line="$(grep -E "^unsharded_total_s[[:space:]]+${env}[[:space:]]" "$f" | head -1)"
+            if [ -z "$line" ]; then
+              printf '%s: FAIL — the artifact exists but carries no un-sharded figure for this environment.\n' "$env"
+              return 1
+            fi
+            read -r _ _ total n shards <<<"$line"
+            # An EMPTY table is the shape a broken glob produces, and 0s over 0 harnesses from
+            # 0 shards reads as a produced total unless something says otherwise.
+            if ! [ "${total:-0}" -gt 0 ] 2>/dev/null || ! [ "${n:-0}" -gt 0 ] 2>/dev/null \
+               || ! [ "${shards:-0}" -gt 0 ] 2>/dev/null; then
+              printf '%s: FAIL — a figure is present but it is not a measurement: total=%s harnesses=%s shards=%s.\n' \
+                "$env" "$total" "$n" "$shards"
+              return 1
+            fi
+            printf '%s: PRODUCED — %ss over %s harnesses from %s shards (value deliberately not graded here).\n' \
+              "$env" "$total" "$n" "$shards"
+          }
+          # POSITIVE CONTROL, ON EVERY RUN, BEFORE THE REAL GRADE — DIVE-3317's keeper: a
+          # monitor that breaks LOUD gets fixed, one that breaks SILENT does not, and a check
+          # that cannot fire launders an absence as "checked". This one is a guard on an
+          # honesty instrument, so it owes proof that it can still fail. It drives the SAME
+          # grade() over fixtures whose verdict is known, in a throwaway directory.
+          #
+          # BOTH DIRECTIONS. Only-can-fail would be satisfied by a check that fails on
+          # everything, which gets muted within a week and is then worse than absent.
+          selftest() {
+            local d rc=0
+            d="$(mktemp -d)" || return 1
+            (
+              cd "$d" || exit 1
+              f=core-unsharded-total.txt
+              if grade pristine success >/dev/null 2>&1; then
+                echo "SELFTEST FAIL: no artifact at all graded as PRODUCED"; exit 1; fi
+              printf 'unsharded_total_s pristine 0 0 0\n' > "$f"
+              if grade pristine success >/dev/null 2>&1; then
+                echo "SELFTEST FAIL: an empty table (0s over 0 harnesses) graded as PRODUCED"; exit 1; fi
+              printf 'unsharded_total_s pristine 307 297 2\n' > "$f"
+              if ! grade pristine success >/dev/null 2>&1; then
+                echo "SELFTEST FAIL: a real figure did NOT grade as produced — this check reds every run and will be muted"; exit 1; fi
+            ) || rc=1
+            rm -rf "$d"
+            return "$rc"
+          }
+          if ! selftest; then
+            echo "core-total-produced: BLOCKED — this check cannot demonstrate that it still fails on an absent or empty figure, so its green would mean nothing. Refusing to report one."
+            exit 1
+          fi
+          echo "selftest: reds on an absent figure, reds on an empty table, passes a real one."
+          grade pristine "$PRISTINE_RESULT" || rc=1
+          grade installed-host "$INSTALLED_RESULT" || rc=1
+          exit "$rc"
