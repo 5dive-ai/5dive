@@ -43,96 +43,28 @@ else
 fi
 
 TD="$(mktemp -d)"
-mkdir -p "$TD/bin"
-# Hermetic GitHub API double. Identity arms select the response through explicit
-# fixture variables; every ordinary version-only arm stays offline.
-cat > "$TD/bin/curl" <<'FAKE_CURL'
-#!/usr/bin/env bash
-url="${*: -1}"
-case "$url" in
-  */commits/v*)
-    [[ "${FAKE_LEGACY_PARENT:-}" =~ ^[0-9a-f]{40}$ ]] || exit 22
-    printf '{\n  "sha": "%040d",\n  "parents": [\n    { "sha": "%s" }\n  ]\n}\n' 1 "$FAKE_LEGACY_PARENT"
-    ;;
-  */compare/*)
-    [[ "${FAKE_RELATION:-}" =~ ^(ahead|behind|identical|diverged)$ ]] || exit 22
-    printf '{ "status": "%s" }\n' "$FAKE_RELATION"
-    ;;
-  *) exit 22 ;;
-esac
-FAKE_CURL
-chmod +x "$TD/bin/curl"
 # A "5dive binary" here is only ever grepped for its FIVE_VERSION line, so a
 # one-line stand-in exercises the real read path. `--none--` writes a file that
 # carries no version at all (the unreadable case).
-mkbin() { # $1=path $2=version|--none-- [$3=build-sha]
+mkbin() { # $1=path $2=version|--none--
   if [[ "$2" == "--none--" ]]; then printf '#!/usr/bin/env bash\necho hi\n' > "$1"
-  else
-    printf '#!/usr/bin/env bash\nreadonly FIVE_VERSION="%s"\n' "$2" > "$1"
-    [[ -z "${3:-}" ]] || printf 'readonly FIVE_BUILD_SHA="%s"\n' "$3" >> "$1"
-  fi
+  else printf '#!/usr/bin/env bash\nreadonly FIVE_VERSION="%s"\n' "$2" > "$1"; fi
 }
 
 # Run the extracted guard against an installed version and a candidate version.
 # Prints stderr; returns the guard's rc. `--absent--` as the installed version
 # means no binary on disk at all (fresh install).
-run_guard() { # installed candidate [allow] [tag] [installed-sha] [candidate-sha] [relation] [legacy-parent]
+run_guard() { # $1=installed $2=candidate [$3=FIVE_ALLOW_DOWNGRADE] [$4=GH_PINNED_TAG]
   local inst="$TD/installed" cand="$TD/candidate"
   rm -f "$inst" "$cand"
-  [[ "$1" == "--absent--" ]] || mkbin "$inst" "$1" "${5:-}"
-  mkbin "$cand" "$2" "${6:-}"
-  env -i PATH="$TD/bin:/usr/bin:/bin" \
+  [[ "$1" == "--absent--" ]] || mkbin "$inst" "$1"
+  mkbin "$cand" "$2"
+  env -i PATH="/usr/bin:/bin" \
     FIVE_ALLOW_DOWNGRADE="${3:-0}" GH_PINNED_TAG="${4:-}" GH_PINNED_SHA="" REPO="" \
-    GH_ORG="5dive-ai" FAKE_RELATION="${7:-}" FAKE_LEGACY_PARENT="${8:-}" \
     bash -c "set -euo pipefail
 $guard
-set +e
-assert_version_monotonic '$inst' '$cand'
-rc=\$?
-printf '__DIRECTION=%s __INSTALLED_SHA=%s __CANDIDATE_SHA=%s\\n' \
-  \"\$INSTALL_DIRECTION\" \"\$INSTALL_INSTALLED_SHA\" \"\$INSTALL_CANDIDATE_SHA\"
-exit \"\$rc\"" 2>&1
+assert_version_monotonic '$inst' '$cand'" 2>&1
 }
-
-OLD_SHA=1111111111111111111111111111111111111111
-NEW_SHA=2222222222222222222222222222222222222222
-
-# DIVE-2603: the first stamped current-main bundle must install over a legacy
-# published bundle. The legacy tag's detached release commit maps to OLD_SHA;
-# GitHub says NEW_SHA descends from it, so the 0.0.0-dev sentinel is irrelevant.
-out="$(run_guard 0.19.2 0.0.0-dev 0 '' '' "$NEW_SHA" ahead "$OLD_SHA")"; rc=$?
-if (( rc == 0 )) && [[ "$out" == *"__DIRECTION=forward __INSTALLED_SHA=$OLD_SHA __CANDIDATE_SHA=$NEW_SHA"* && "$out" != *"DOWNGRADE"* && "$out" != *"refusing"* ]]; then
-  ok_t "published legacy -> current main PROCEEDS by ancestry, despite 0.0.0-dev"
-else
-  bad_t "current main was mistaken for a downgrade" "rc=$rc out: ${out//$'\n'/ | }"
-fi
-
-# The highest-consequence fallback: GitHub ancestry is unavailable (offline or
-# rate-limited), the installed release is real, and the candidate carries the
-# tag-time sentinel. release_version() is the only line preventing the original
-# false DOWNGRADE refusal here, so this case must reach and grade it directly.
-out="$(run_guard 0.18.0 0.0.0-dev 0 '' '' "$NEW_SHA" '' "$OLD_SHA")"; rc=$?
-if (( rc == 0 )) && [[ "$out" == *"__DIRECTION=unchecked __INSTALLED_SHA=$OLD_SHA __CANDIDATE_SHA=$NEW_SHA"* && "$out" == *"release versions not comparable"* && "$out" != *"refusing to DOWNGRADE"* ]]; then
-  ok_t "ancestry unavailable + sentinel candidate PROCEEDS through the version fallback"
-else
-  bad_t "sentinel fallback recreated the false downgrade" "rc=$rc out: ${out//$'\n'/ | }"
-fi
-
-# A candidate whose stamped build is an ancestor of the installed build is the
-# real rollback. The refusal names identities, not misleading version numbers.
-out="$(run_guard 0.0.0-dev 0.0.0-dev 0 '' "$NEW_SHA" "$OLD_SHA" behind)"; rc=$?
-if (( rc != 0 )) && [[ "$out" == *"candidate $OLD_SHA is an ancestor of installed $NEW_SHA"* ]]; then
-  ok_t "ancestor candidate REFUSED, naming both build shas"
-else
-  bad_t "identity rollback was not refused" "rc=$rc out: ${out//$'\n'/ | }"
-fi
-
-out="$(run_guard 0.0.0-dev 0.0.0-dev 1 '' "$NEW_SHA" "$OLD_SHA" behind)"; rc=$?
-if (( rc == 0 )) && [[ "$out" == *"ROLLBACK build $NEW_SHA -> $OLD_SHA"* && "$out" == *"FIVE_ALLOW_DOWNGRADE=1"* ]]; then
-  ok_t "the explicit hatch permits and announces an identity rollback"
-else
-  bad_t "identity rollback hatch failed" "rc=$rc out: ${out//$'\n'/ | }"
-fi
 
 # 1. THE DEFECT: a strictly lower candidate is refused, and the refusal names
 #    both versions and where the lower one came from.
@@ -198,83 +130,32 @@ fi
 # --- the printed line -------------------------------------------------------
 # The report is what made this invisible: it asserted a direction nothing had
 # measured. Run the shipped branch verbatim with old/new pinned.
-run_report() { # old-ver new-ver [direction] [old-sha] [new-sha]
+run_report() { # $1=_old_ver $2=_new_ver
   env -i PATH="/usr/bin:/bin" bash -c "set -euo pipefail
 $(sed -n '/^# >>> DIVE-2243 monotonicity guard/,/^# <<< DIVE-2243 monotonicity guard/p' install.sh)
 _old_ver='$1'; _new_ver='$2'; BIN_DIR='$TD'
-INSTALL_DIRECTION='${3:-unchecked}'; INSTALL_INSTALLED_SHA='${4:-}'; INSTALL_CANDIDATE_SHA='${5:-}'
 $report" 2>&1
 }
 
-out="$(run_report 0.16.33 0.16.32 rollback)"
+out="$(run_report 0.16.33 0.16.32)"
 if [[ "$out" == *"5dive DOWNGRADED: 0.16.33 -> 0.16.32"* && "$out" != *"upgraded: 0.16.33"* ]]; then
   ok_t "report says DOWNGRADED (never 'upgraded') when the new version is lower"
 else
   bad_t "report announced a downgrade as an upgrade" "out: ${out//$'\n'/ | }"
 fi
 
-out="$(run_report 0.16.32 0.17.0 forward)"
+out="$(run_report 0.16.32 0.17.0)"
 if [[ "$out" == *"5dive upgraded: 0.16.32 -> 0.17.0"* && "$out" != *"DOWNGRADED"* ]]; then
   ok_t "report still says upgraded on a real forward move"
 else
   bad_t "forward move mis-reported" "out: ${out//$'\n'/ | }"
 fi
 
-out="$(run_report 0.16.9 0.16.10 forward)"
+out="$(run_report 0.16.9 0.16.10)"
 if [[ "$out" == *"5dive upgraded: 0.16.9 -> 0.16.10"* && "$out" != *"DOWNGRADED"* ]]; then
   ok_t "report uses version sort (0.16.9 -> 0.16.10 is forward)"
 else
   bad_t "report lexically mis-sorted a forward patch move" "out: ${out//$'\n'/ | }"
-fi
-
-out="$(run_report 0.19.2 0.0.0-dev forward "$OLD_SHA" "$NEW_SHA")"
-if [[ "$out" == *"5dive upgraded:"* && "$out" == *"$OLD_SHA"* && "$out" == *"$NEW_SHA"* && "$out" != *"DOWNGRADED"* ]]; then
-  ok_t "report calls legacy release -> current main an upgrade and names both shas"
-else
-  bad_t "report repeated the false sentinel downgrade" "out: ${out//$'\n'/ | }"
-fi
-
-# The artifact carries the checkout identity build.sh actually read, while the
-# split source keeps an unmistakable non-identity sentinel.
-build_out="$TD/built-5dive"
-build_log="$(BUILD_OUT="$build_out" ./build.sh 2>&1)"; rc=$?
-expected_sha="$(git rev-parse HEAD)"
-expected_identity="$expected_sha"
-[[ -z "$(git status --porcelain --untracked-files=normal)" ]] || expected_identity="${expected_sha}-dirty"
-stamped_sha="$(grep -m1 '^readonly FIVE_BUILD_SHA=' "$build_out" 2>/dev/null | cut -d'"' -f2)"
-if (( rc == 0 )) && [[ "$stamped_sha" == "$expected_identity" && "$build_log" == *"at ${expected_sha:0:12}"* ]]; then
-  ok_t "build.sh stamps the generated bundle with its honest source identity"
-else
-  bad_t "bundle build identity is missing or wrong" "rc=$rc expected=$expected_identity stamped=${stamped_sha:-missing} log=$build_log"
-fi
-if grep -qx 'readonly FIVE_BUILD_SHA="unbuilt"' src/header.sh && ! grep -q 'FIVE_BUILD_SHA="unbuilt"' "$build_out"; then
-  ok_t "split source sentinel cannot masquerade as a built artifact identity"
-else
-  bad_t "build/source identity sentinel contract drifted" ""
-fi
-
-# A dirty checkout must not claim its clean HEAD. Clone the committed fixture,
-# copy in this harness's build.sh (so an uncommitted maker run grades the new
-# code too), dirty a bundle input, and inspect the artifact it really produces.
-dirty_repo="$TD/dirty-repo"
-git clone -q "$ROOT" "$dirty_repo"
-cp "$ROOT/build.sh" "$dirty_repo/build.sh"
-printf '\n# dirty fixture\n' >> "$dirty_repo/src/header.sh"
-dirty_head="$(git -C "$dirty_repo" rev-parse HEAD)"
-dirty_out="$TD/dirty-5dive"
-dirty_log="$(cd "$dirty_repo" && BUILD_OUT="$dirty_out" ./build.sh 2>&1)"; rc=$?
-dirty_stamp="$(grep -m1 '^readonly FIVE_BUILD_SHA=' "$dirty_out" 2>/dev/null | cut -d'"' -f2)"
-if (( rc == 0 )) && [[ "$dirty_stamp" == "${dirty_head}-dirty" ]]; then
-  ok_t "dirty tree is stamped sha-dirty instead of claiming clean HEAD"
-else
-  bad_t "dirty tree claimed a clean build identity" "rc=$rc head=$dirty_head stamp=${dirty_stamp:-missing} log=$dirty_log"
-fi
-
-out="$(run_guard 0.18.0 0.18.1 0 '' "$NEW_SHA" "${OLD_SHA}-dirty" behind)"; rc=$?
-if (( rc == 0 )) && [[ "$out" == *"__DIRECTION=forward __INSTALLED_SHA=$NEW_SHA __CANDIDATE_SHA="* && "$out" != *"${OLD_SHA}-dirty"* && "$out" != *"refusing"* ]]; then
-  ok_t "install guard rejects a sha-dirty candidate when both artifacts are stamped"
-else
-  bad_t "install guard trusted a dirty build identity" "rc=$rc out: ${out//$'\n'/ | }"
 fi
 
 # --- wiring -----------------------------------------------------------------

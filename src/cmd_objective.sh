@@ -758,32 +758,7 @@ _objective_invoke_planner() {
 _objective_build_contract() {
   local oname="$1" obj_id="$2" cur="$3" prev="$4" trend="$5" target="$6" direction="$7" unit="$8" max_new="$9"
   local gap="n/a"; [[ -n "$target" && -n "$cur" ]] && gap=$(awk -v t="$target" -v c="$cur" 'BEGIN{printf "%g", t-c}')
-  # OSS-37: a burnt-out maker->verifier loop is INVISIBLE in a bare status column.
-  # `task reject` at max_iterations does not close or reopen the row — it writes the
-  # feedback and files a manual gate on a human (cmd_task.sh, "max_iterations reached
-  # -> stop bouncing, park it on a human to decide"), leaving the task open at
-  # status 'blocked'. Injected as just "(blocked, high)" that is indistinguishable
-  # from a task blocked on a sibling dependency, so the planner reads a dead task as
-  # in-flight progress and re-plans around nothing, cycle after cycle — the "just
-  # parks" failure OSS-19 phase A2 names. Annotate it with _task_stuck_loop_pred — the
-  # SHARED definition `loop board --stuck` / `--escalate-stuck` also calls, not a copy
-  # of it. Re-typing the predicate inline here (the first draft did) buys
-  # does-not-currently-drift; calling the one definition is what buys cannot-drift.
-  # Its `status NOT IN ('done','cancelled')` is redundant against the WHERE below and
-  # is kept anyway: dropping the redundant clause is precisely how a second copy starts.
-  # Every operand of a `||` chain is COALESCE-guarded: one NULL in SQLite collapses
-  # the whole concatenation to NULL, which would silently DROP the task's line
-  # rather than lose the marker. (max_iterations is non-NULL inside the WHEN.)
-  local stuck_pred; stuck_pred="$(_task_stuck_loop_pred)"
-  local open_tasks; open_tasks=$(db "SELECT '  ['||ident||']  ('||status||', '||priority||')  '||title
-      || CASE WHEN ${stuck_pred}
-              THEN '   ** STUCK: verifier rejected it '||COALESCE(iteration,0)||'/'||max_iterations
-                   ||'x, the loop is spent'
-                   || CASE WHEN (need_type IS NOT NULL AND need_answered_at IS NULL)
-                           THEN ' and it is parked on an unanswered human gate' ELSE '' END
-                   ||' **'
-              ELSE '' END
-    FROM tasks WHERE originated_by_objective=${obj_id} AND status NOT IN ('done','cancelled') ORDER BY id;")
+  local open_tasks; open_tasks=$(db "SELECT '  ['||ident||']  ('||status||', '||priority||')  '||title FROM tasks WHERE originated_by_objective=${obj_id} AND status NOT IN ('done','cancelled') ORDER BY id;")
   [[ -n "$open_tasks" ]] || open_tasks="  (none yet)"
   local last_out; last_out=$(db "SELECT '  ['||ident||']  '||status||COALESCE('  — '||NULLIF(result,''),'') FROM tasks WHERE originated_by_objective=${obj_id} AND status IN ('done','cancelled') ORDER BY id DESC LIMIT 12;")
   [[ -n "$last_out" ]] || last_out="  (none yet)"
@@ -801,13 +776,6 @@ OBJECTIVE: ${oname}
 
 YOUR OPEN ORIGINATED TASKS (only these are yours to reprioritize/cancel):
 ${open_tasks}
-
-A task marked ** STUCK ** has burned its whole maker-verifier budget and been
-rejected at the cap: it is NOT in flight and will not close on its own, so do not
-keep counting it as progress. Re-plan around it — cancel it (it is yours) and/or
-create a different, smaller approach to the same gap. If it is also parked on an
-unanswered human gate, that gate is NOT yours to clear, answer, or wait on: a
-human still owns that decision and your cancel does not resolve it.
 
 RECENT CLOSED ORIGINATED OUTCOMES:
 ${last_out}

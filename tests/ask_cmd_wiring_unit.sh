@@ -80,7 +80,7 @@ sudo() {
   case "$*" in
     *"tmux has-session"*)  return 0 ;;
     *"tmux capture-pane"*) _frame ;;
-    *"agent _deliver"*)        printf '%s\n' '{"ok":true,"data":{"delivered":true}}'; return 0 ;;
+    *"agent _deliver"*)    return 0 ;;
     *"agent _capture"*)    _frame ;;
     *)                     return 0 ;;
   esac
@@ -90,9 +90,6 @@ wait_agent_input_ready()    { return 0; }
 inject_and_submit()         { return 0; }
 mirror_interagent_outbound(){ :; }
 auto_sender_from_sudo()     { echo dev; }
-_envelope_caller()          { echo dev; }
-envelope_tier()             { echo standard; }
-envelope_via()              { :; }
 gen_msg_id()                { echo "$MID"; }
 step()                      { :; }
 

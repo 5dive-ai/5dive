@@ -469,19 +469,6 @@ jobs:
           else
             echo "::warning::CHANGELOG could not be stamped for ${tag} (${_stamped}) — publishing anyway; the release BODY is derived from the git range and is unaffected."
           fi
-          # DIVE-2603: build.sh stamps HEAD only when the tracked source tree is
-          # clean. Commit every tag-time source edit BEFORE building so the stamp
-          # names the exact bytes being concatenated. The bundle rides in a second
-          # release commit below; therefore its stamped source commit is the tagged
-          # commit's parent and ancestry remains directly checkable.
-          git add -f src/header.sh
-          if [ -f CHANGELOG.md ]; then git add -f CHANGELOG.md; fi
-          if [ -d changelog.d ]; then git add -A -f changelog.d; fi
-          git -c user.name=lodar -c user.email=markounik@gmail.com \
-              commit -q -m "release ${tag}: assign ${version} before bundle build (DIVE-2247, DIVE-2603)"
-          source_sha=$(git rev-parse HEAD)
-          [ -z "$(git status --porcelain --untracked-files=no)" ] \
-            || { echo "::error::tracked release source is dirty after commit ${source_sha} — refusing to stamp a false build identity"; exit 1; }
           ./build.sh || { echo "::error::build.sh failed — refusing to cut ${tag} with no bundle"; exit 1; }
           [ -s 5dive ] && [ -s 5dive.sha256 ] \
             || { echo "::error::build.sh produced no bundle/checksum — refusing to cut ${tag}"; exit 1; }
@@ -494,12 +481,18 @@ jobs:
           _bundle_ver=$(grep -m1 -oP "(?<=^readonly FIVE_VERSION=\")[^\"]+" 5dive)
           [ "v${_bundle_ver}" = "$tag" ] \
             || { echo "::error::built bundle says FIVE_VERSION=${_bundle_ver} but this cut is ${tag} — refusing to publish a bundle that disagrees with its own tag"; exit 1; }
-          _bundle_build_sha=$(grep -m1 -oP '(?<=^readonly FIVE_BUILD_SHA=")[^"]+' 5dive)
-          [ "$_bundle_build_sha" = "$source_sha" ] \
-            || { echo "::error::built bundle says FIVE_BUILD_SHA=${_bundle_build_sha:-missing} but its committed source is ${source_sha} — refusing to publish a false identity"; exit 1; }
-          git add -f 5dive 5dive.sha256
+          git add -f 5dive 5dive.sha256 src/header.sh
+          # DIVE-2452: the stamped CHANGELOG rides in the release commit. Guarded
+          # rather than appended to the line above: `git add` fails the whole step on
+          # a pathspec that matches nothing, and the stamp is explicitly non-fatal —
+          # a cut must not die because a repo has no CHANGELOG.md.
+          if [ -f CHANGELOG.md ]; then git add -f CHANGELOG.md; fi
+          # DIVE-2582: the fold step above deletes any folded changelog.d/
+          # fragments from the working tree — stage that removal too, same guard
+          # shape (dir may legitimately not exist).
+          if [ -d changelog.d ]; then git add -A -f changelog.d; fi
           git -c user.name=lodar -c user.email=markounik@gmail.com \
-              commit -q -m "release ${tag}: bundle built from ${source_sha} (DIVE-2091, DIVE-2603)"
+              commit -q -m "release ${tag}: assign ${version} + built bundle (DIVE-2091 bundle-at-tag-time, DIVE-2247 version-at-tag-time)"
           # DIVE-2433: `sha` is about to stop meaning "the commit whose check-runs we
           # read". Keep the graded one under its own name so the tag can say which
           # object each claim is about instead of silently attributing the parent's
@@ -512,7 +505,7 @@ jobs:
             || { echo "::error::release commit ${sha} does not carry the bundle — refusing to cut ${tag}"; exit 1; }
           [ "$(git show "${sha}:5dive" | sha256sum | cut -d" " -f1)" = "$_want" ] \
             || { echo "::error::bundle in the release commit differs from the one just built — refusing to cut ${tag}"; exit 1; }
-          echo "release commit ${sha} carries bundle ${_want} (FIVE_VERSION=${_bundle_ver}, FIVE_BUILD_SHA=${_bundle_build_sha})"
+          echo "release commit ${sha} carries bundle ${_want} (FIVE_VERSION=${_bundle_ver})"
           # <<< DIVE-2091 release-commit block
 
           # ── DIVE-2433: GRADE THE RELEASE COMMIT ──────────────────────────────

@@ -152,17 +152,10 @@ getent() {
 }
 _gate_passwd_stream() { _agentrow; printf '%s\n' "$(</etc/passwd)"; }
 _gate_caller_uid() { printf '%s' "$CALLER_UID"; }
-as_agent()        { FAKE_CALLER="agent-dev"; CALLER_UID="$AGENT_UID"; unset SUDO_UID; _gate_is_root() { return 1; }
-                    _gate_caller_cgroup() { printf '%s' '/system.slice/system-5dive.slice/5dive-agent@dev.service'; }; }
+as_agent()        { FAKE_CALLER="agent-dev"; CALLER_UID="$AGENT_UID"; unset SUDO_UID; _gate_is_root() { return 1; }; }
 # The human-on-box / dashboard-exec path: a NON-agent SUDO_UID, trusted only at EUID 0
 # (DIVE-1413), which is why the root seam is stubbed rather than the assertion weakened.
-# DIVE-2371 added the STRUCTURAL half — `_gate_human_principal` is the uid test AND
-# `_gate_cgroup_human_capable` — so this persona now has to carry a human-capable
-# cgroup too. Without it L2 ("a REAL human path still clears") reads the host's real
-# cgroup and reds, which grades the fixture rather than the bypass this file is about.
-# Stub the READER only; the accept/deny logic stays the shipped bytes.
-as_human_on_box() { FAKE_CALLER="root"; CALLER_UID=0; export SUDO_UID=0; _gate_is_root() { return 0; }
-                    _gate_caller_cgroup() { printf '%s' '/system.slice/shelld.service'; }; }
+as_human_on_box() { FAKE_CALLER="root"; CALLER_UID=0; export SUDO_UID=0; _gate_is_root() { return 0; }; }
 as_agent
 
 # The two preconditions every arm below inherits, asserted through the REAL resolvers

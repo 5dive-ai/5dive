@@ -731,24 +731,6 @@ inject_and_submit() {
   return 1
 }
 
-# rc=1 from inject_and_submit means the payload was typed, but the pane still
-# looked idle after every submit retry. Keep one machine-stable reason for both
-# public receipts: `send` and the scoped `_deliver` path must not disagree about
-# why their success boolean is false (DIVE-2362).
-_agent_submit_unconfirmed_reason() {
-  printf '%s\n' 'pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)'
-}
-
-# `ask` has no successful reply to return when its initial submit cannot be
-# confirmed. Use the same non-fatal receipt as `send`: the payload may actually
-# have landed, but neither a caller nor a person should mistake that for proof.
-_agent_ask_unconfirmed() {
-  local name="$1" sender="$2" msg_id="$3" reason="$4"
-  ok "question to agent '$name' is unconfirmed — ${reason}." \
-     '{name:$n, sent:false, from:$s, msg_id:$i, reason:$r}' \
-     --arg n "$name" --arg s "$sender" --arg i "$msg_id" --arg r "$reason"
-}
-
 # _ask_accumulate <transcript-file> — reassemble a scrolling stream from repeated
 # screen snapshots. Reads one snapshot on stdin, folds it into the transcript,
 # prints the whole transcript. DIVE-1901: a full-screen TUI is an alternate-screen
@@ -1185,27 +1167,16 @@ cmd_deliver() {
   if ! wait_agent_input_ready "$target"; then
     step "agent '$target' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
   fi
-  local _rc=0 _delivered=1 _reason="" _summary=""
+  local _rc=0
   inject_and_submit "$target" "$payload" || _rc=$?
   if (( _rc == 3 )); then
     fail "$E_AUTH_REQUIRED" "$(_agent_credential_refusal_msg "$target")"
   elif (( _rc != 0 )); then
-    _delivered=0
-    _reason="$(_agent_submit_unconfirmed_reason)"
+    step "agent '$target': payload may not have submitted — pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)"
   fi
-  if (( _delivered )); then
-    # Byte-for-byte rc=0 compatibility: this is the pre-DIVE-2362 receipt.
-    ok "delivered to agent '$target'." \
-       '{name:$n, delivered:true, from:$s, tier:($t|select(length>0))}' \
-       --arg n "$target" --arg s "$s" --arg t "$tier"
-  else
-    _summary="delivery to agent '$target' is unconfirmed — ${_reason}."
-    ok "$_summary" \
-       '({name:$n, delivered:false, from:$s}
-         + (if ($t|length) > 0 then {tier:$t} else {} end)
-         + {reason:$r})' \
-       --arg n "$target" --arg s "$s" --arg t "$tier" --arg r "$_reason"
-  fi
+  ok "delivered to agent '$target'." \
+     '{name:$n, delivered:true, from:$s, tier:($t|select(length>0))}' \
+     --arg n "$target" --arg s "$s" --arg t "$tier"
 }
 
 # DIVE-1074: privileged inter-agent READ primitive — the read half of `ask` for a
@@ -1817,13 +1788,12 @@ cmd_send() {
     step "agent '$name' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
   fi
 
-  local _rc=0 _sent=1 _reason="" _summary=""
+  local _rc=0
   inject_and_submit "$name" "$payload" || _rc=$?
   if (( _rc == 3 )); then
     fail "$E_AUTH_REQUIRED" "$(_agent_credential_refusal_msg "$name")"
   elif (( _rc != 0 )); then
-    _sent=0
-    _reason="$(_agent_submit_unconfirmed_reason)"
+    step "agent '$name': payload may not have submitted — pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)"
   fi
 
   # Mirror the outbound into the sender's group chat (best-effort). Gated on a
@@ -1840,23 +1810,9 @@ cmd_send() {
   # key was typed. "unprovable" = this runtime has no prompt marker, so the delivery
   # is an assumption. A scheduler that treats those the same is making the exact
   # mistake this ticket is about.
-  if (( _sent )); then
-    # Byte-for-byte rc=0 compatibility: this is the pre-DIVE-2362 receipt.
-    ok "sent to agent '$name'." \
-       '{name:$n, sent:true, bytes:($p|length), woken:($w=="1"), ready:($rd|select(length>0)), from:($s|select(length>0)), msg_id:($i|select(length>0)), reply_to_chat:($rc|select(length>0)), reply_to_msg:($rm|select(length>0))}' \
-       --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY"
-  else
-    _summary="send to agent '$name' is unconfirmed — ${_reason}."
-    ok "$_summary" \
-       '({name:$n, sent:false, bytes:($p|length), woken:($w=="1")}
-         + (if ($rd|length) > 0 then {ready:$rd} else {} end)
-         + (if ($s|length) > 0 then {from:$s} else {} end)
-         + (if ($i|length) > 0 then {msg_id:$i} else {} end)
-         + (if ($rc|length) > 0 then {reply_to_chat:$rc} else {} end)
-         + (if ($rm|length) > 0 then {reply_to_msg:$rm} else {} end)
-         + {reason:$reason})' \
-       --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY" --arg reason "$_reason"
-  fi
+  ok "sent to agent '$name'." \
+     '{name:$n, sent:true, bytes:($p|length), woken:($w=="1"), ready:($rd|select(length>0)), from:($s|select(length>0)), msg_id:($i|select(length>0)), reply_to_chat:($rc|select(length>0)), reply_to_msg:($rm|select(length>0))}' \
+     --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY"
 }
 
 # Synchronous send + wait — the inter-agent counterpart to cmd_send. Drops the
@@ -1988,28 +1944,12 @@ cmd_ask() {
     # a blanket "missing grant?" here would relabel a fail-closed secret guard as
     # a provisioning problem — the caller would go re-provision the agent and
     # resend, straight back into the prompt. Pass rc 6 and its message through.
-    local _derr _drc=0 _dout _derr_file="$ask_tmp/deliver.err"
-    # DIVE-2362: _deliver rc=1 is deliberately non-fatal and therefore exits 0
-    # with delivered:false. Capture its JSON receipt instead of discarding stdout;
-    # otherwise scoped ask would wait for a reply after hiding the exact doubt
-    # direct ask now reports. stderr stays separate so rc=3 retains its refusal.
-    # Keep `agent _deliver` immediately after the binary: standard agents are
-    # granted exactly `/usr/local/bin/5dive agent _deliver *` in sudoers, so a
-    # global flag before the subcommand is a positional policy denial.
-    _dout=$(sudo -n /usr/local/bin/5dive agent _deliver --json --id="$msg_id" "$name" "$ask_message" 2>"$_derr_file") || _drc=$?
-    _derr=$(<"$_derr_file")
+    local _derr _drc=0
+    _derr=$(sudo -n /usr/local/bin/5dive agent _deliver --id="$msg_id" "$name" "$ask_message" 2>&1 >/dev/null) || _drc=$?
     if (( _drc == E_AUTH_REQUIRED )); then
       fail "$E_AUTH_REQUIRED" "${_derr#*: }"
     elif (( _drc != 0 )); then
       fail "$E_GENERIC" "scoped delivery to '$name' failed (missing _deliver grant? re-provision the agent)${_derr:+ — $_derr}"
-    fi
-    jq -e '.ok == true and (.data.delivered == true or .data.delivered == false)' <<<"$_dout" >/dev/null 2>&1 \
-      || fail "$E_GENERIC" "scoped delivery to '$name' returned no usable receipt"
-    if [[ "$(jq -r '.data.delivered' <<<"$_dout")" == false ]]; then
-      local _reason; _reason=$(jq -r '.data.reason // empty' <<<"$_dout")
-      [[ -n "$_reason" ]] || _reason="$(_agent_submit_unconfirmed_reason)"
-      _agent_ask_unconfirmed "$name" "$sender" "$msg_id" "$_reason"
-      return 0
     fi
   else
     require_agent "$name"
@@ -2045,9 +1985,7 @@ cmd_ask() {
     if (( _rc == 3 )); then
       fail "$E_AUTH_REQUIRED" "$(_agent_credential_refusal_msg "$name")"
     elif (( _rc != 0 )); then
-      local _reason; _reason="$(_agent_submit_unconfirmed_reason)"
-      _agent_ask_unconfirmed "$name" "$sender" "$msg_id" "$_reason"
-      return 0
+      step "agent '$name': question may not have submitted — pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)"
     fi
   fi
 

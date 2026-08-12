@@ -3,26 +3,12 @@
 # budget: the tier resolver (tests/lib/tier.sh) and the budgeted runner
 # (scripts/run-harnesses.sh).
 #
-# TIER: nightly — 41.4s measured (GitHub Actions ubuntu-latest, core/pristine job,
-# run 30988600395, 2026-08-05). This is a META-harness: it grades the tier resolver
-# and the budgeted runner, so NO product path a customer reaches runs through it —
-# the standard nightly criterion. It costs 14% of the 300s core budget it is itself
-# grading, which makes it the strongest nightly candidate in the corpus on its own
-# merits. CLAUDE.md ranks merge and retire ahead of demotion and neither applies: it
-# has no sibling to fold into, and the mechanism it guards is live. A regression in
-# the runner is now caught within 24h instead of per-PR; that latency is acceptable
-# because the runner FAILS LOUD (exit 4 with numbers), so a break announces itself
-# rather than passing silently. If it ever starts failing OPEN, revisit this first.
-# Decision: main, 2026-08-05.
-#
-# THE "SMALL AND FAST" CLAIM THIS HEADER USED TO MAKE IS RETIRED, not quietly
-# dropped. It read: "WHY THIS FILE IS ITSELF SMALL AND FAST, and says so ... the
-# honest version is not to skip the coverage, it is to pay the budget it enforces."
-# That was true when written and is now false — at 41.4s this file is the SLOWEST in
-# core. Leaving it standing two lines above a nightly marker would be exactly the
-# stale unverified number this harness exists to catch (see the DIVE-2555 arms
-# below, which grade a demotion's claim against the clock). The coverage is still
-# paid for; it is paid nightly.
+# WHY THIS FILE IS ITSELF SMALL AND FAST, and says so. It is a harness added by the
+# row whose whole subject is that harnesses are added faster than they are retired.
+# The honest version of that is not to skip the coverage — it is to pay the budget
+# it enforces. Throwaway corpus of three one-line harnesses, no sleeps longer than
+# the assertion needs, and every arm below is one this mechanism can actually get
+# wrong.
 #
 # THE ARMS, and the mutation each one would catch:
 #   1-3   default is core; an explicit `# TIER: core` is legal; a marker below the

@@ -272,12 +272,6 @@ _sc_probe_t2_forge() {
     _gate_passwd_stream() { _agentrow; printf '%s\n' "$(</etc/passwd)"; }
     _gate_caller_uid() { printf '%s' "$AUID"; }
     _gate_is_root() { return 1; }
-    # DIVE-2371: authorization is now the uid test AND a STRUCTURAL cgroup test, so
-    # pin the second half for the same reason the comment above pins the first —
-    # unpinned it is answered by whoever ran the probe (an agent unit on a box, a
-    # runner cgroup in CI), and a arm that refuses for an environmental reason is
-    # not grading the floor. An ordinary agent really does live in an agent unit.
-    _gate_caller_cgroup() { printf '%s' '/system.slice/system-5dive.slice/5dive-agent@fixture.service'; }
     unset SUDO_UID
     printf 'pinned=%s\n' "$(_gate_authenticated_actor)"
     seed DIVE-990001
@@ -294,14 +288,6 @@ _sc_probe_t2_forge() {
     _gate_caller_uid() { printf '%s' "0"; }
     _gate_passwd_stream() { printf '%s\n' "$(</etc/passwd)"; }
     _gate_is_root() { return 0; }
-    # DIVE-2371: the liveness arm has to model BOTH halves or it grades a refusal.
-    # Pinned to the DASHBOARD, which is what "a real human path" concretely IS on a
-    # box: the one non-Telegram surface a customer clears from, and the surface the
-    # accept list exists for. Left unpinned this arm reads the host's real cgroup and
-    # fails on every agent box and every CI runner — the probe would then report
-    # "the floor refuses everything" fleet-wide, which is a statement about where it
-    # ran, not about the floor.
-    _gate_caller_cgroup() { printf '%s' '/system.slice/shelld.service'; }
     export SUDO_UID=0
     ( cmd_task_answer DIVE-990002 --value=A --human ) >/dev/null 2>&1
     printf 'human=%s\n' "$(by DIVE-990002)"

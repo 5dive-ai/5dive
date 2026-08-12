@@ -42,76 +42,19 @@ _report_import() {
     -d "{\"slug\":\"$slug\"}" >/dev/null 2>&1
 }
 
-# Fetch one required marketplace object while preserving the failure class.
-# Returns: 0=2xx, 1=HTTP 404, 2=other HTTP non-2xx, 3=timeout, 4=transport.
-_marketplace_get_required() {
-  local url="$1" out="$2" http rc
-  if http=$(curl -sSL --max-time 20 -o "$out" -w '%{http_code}' "$url" 2>/dev/null); then
-    case "$http" in
-      2??) return 0 ;;
-      404) return 1 ;;
-      *)   return 2 ;;
-    esac
-  else
-    rc=$?
-    (( rc == 28 )) && return 3
-    return 4
-  fi
-}
-
-_marketplace_index() {
-  local tmp rc
-  tmp=$(mktemp)
-  if _marketplace_get_required "$(_marketplace_base)/index.json" "$tmp"; then
-    cat "$tmp"
-    rm -f "$tmp"
-    return 0
-  else
-    rc=$?
-    rm -f "$tmp"
-    return "$rc"
-  fi
-}
+_marketplace_index() { curl -fsSL --max-time 20 "$(_marketplace_base)/index.json" 2>/dev/null; }
 
 # Resolve registry pack <slug> → a local .tar.gz (same shape `agent export` writes,
-# so cmd_import's existing flow is unchanged). Echoes the path. The return value
-# deliberately preserves WHICH registry step failed so callers never turn a
-# transient fetch failure into the much stronger claim that the slug does not exist:
-#   1 = the fetched, valid index has no such slug
-#   2/3/4/5 = index HTTP 404 / other non-2xx / timeout / transport
-#   6 = the fetched index is malformed
-#   7/8/9/10 = manifest HTTP 404 / other non-2xx / timeout / transport
-#   11 = the fetched files could not be assembled locally
+# so cmd_import's existing flow is unchanged). Echoes the path; returns 1 if absent.
 _marketplace_fetch_pack() {
-  local slug="$1" base idx entry path rc
+  local slug="$1" base idx entry path
   base=$(_marketplace_base)
-  if idx=$(_marketplace_index); then
-    :
-  else
-    rc=$?
-    case "$rc" in
-      1) return 2 ;;
-      2) return 3 ;;
-      3) return 4 ;;
-      *) return 5 ;;
-    esac
-  fi
-  jq -e '.packs | type == "array"' >/dev/null 2>&1 <<<"$idx" || return 6
+  idx=$(_marketplace_index) || return 1
   entry=$(jq -e --arg s "$slug" '.packs[] | select(.slug==$s)' <<<"$idx" 2>/dev/null) || return 1
-  path=$(jq -r '.path // empty' <<<"$entry"); [[ -n "$path" ]] || return 6
+  path=$(jq -r '.path // empty' <<<"$entry"); [[ -n "$path" ]] || return 1
   local dl; dl=$(mktemp -d)
-  if _marketplace_get_required "$base/$path/manifest.json" "$dl/manifest.json"; then
-    :
-  else
-    rc=$?
-    rm -rf "$dl"
-    case "$rc" in
-      1) return 7 ;;
-      2) return 8 ;;
-      3) return 9 ;;
-      *) return 10 ;;
-    esac
-  fi
+  curl -fsSL --max-time 20 "$base/$path/manifest.json" -o "$dl/manifest.json" 2>/dev/null \
+    || { rm -rf "$dl"; return 1; }
   local f
   for f in CLAUDE.md card.md avatar.png; do
     curl -fsSL --max-time 20 "$base/$path/$f" -o "$dl/$f" 2>/dev/null || true
@@ -149,28 +92,8 @@ _marketplace_fetch_pack() {
     done < <(jq -r '.memoryFiles[]? // empty' "$dl/manifest.json" 2>/dev/null)
   fi
   local out; out=$(mktemp --suffix=.tar.gz)
-  tar -czf "$out" -C "$dl" . 2>/dev/null || { rm -rf "$dl" "$out"; return 11; }
+  tar -czf "$out" -C "$dl" . 2>/dev/null || { rm -rf "$dl" "$out"; return 1; }
   rm -rf "$dl"; echo "$out"
-}
-
-# Render the classified fetch failure. Kept in one helper because both the
-# read-only inspect path and the provisioning import path resolve registry slugs.
-_marketplace_fetch_pack_fail() {
-  local slug="$1" rc="$2"
-  case "$rc" in
-    1) fail "$E_NOT_FOUND" "no pack '$slug' in the registry index (browse: 5dive agent marketplace ls)" ;;
-    2) fail "$E_NOT_FOUND" "character-pack registry index returned HTTP 404 ($(_marketplace_base)/index.json)" ;;
-    3) fail "$E_GENERIC" "character-pack registry index returned a non-2xx HTTP response ($(_marketplace_base)/index.json)" ;;
-    4) fail "$E_GENERIC" "timed out fetching the character-pack registry index ($(_marketplace_base)/index.json)" ;;
-    5) fail "$E_GENERIC" "transport failure fetching the character-pack registry index ($(_marketplace_base)/index.json)" ;;
-    6) fail "$E_GENERIC" "character-pack registry index is malformed ($(_marketplace_base))" ;;
-    7) fail "$E_NOT_FOUND" "pack '$slug' is listed in the registry index, but its manifest returned HTTP 404 (registry is inconsistent)" ;;
-    8) fail "$E_GENERIC" "pack '$slug' is listed in the registry index, but its manifest returned a non-2xx HTTP response" ;;
-    9) fail "$E_GENERIC" "pack '$slug' is listed in the registry index, but its manifest fetch timed out" ;;
-    10) fail "$E_GENERIC" "pack '$slug' is listed in the registry index, but its manifest had a transport failure" ;;
-    11) fail "$E_GENERIC" "pack '$slug' was fetched, but could not be assembled locally" ;;
-    *) fail "$E_GENERIC" "could not resolve pack '$slug' from the character-pack registry (unexpected fetch status $rc)" ;;
-  esac
 }
 
 # _pack_skill_refs <skills-dir> -> JSON array of skill specs for the manifest.
@@ -269,10 +192,7 @@ _install_bundled_skill() {
 # --as=cris leaves "You are Dario" in CLAUDE.md). Rewrite the persona name across
 # the identity + memory docs so the imported agent owns its chosen name. Both the
 # Capitalized display form (Dario) and the lowercase slug form (dario) are
-# replaced. A lowercase slug is a complete lexical token here: apostrophe-linked
-# continuations count as part of the token, so the agent `don` does not corrupt
-# ordinary prose such as "don't". The display form deliberately permits a
-# following apostrophe so possessives still rename (`Don's` -> `Cris's`).
+# replaced; word-boundary anchored so we don't mangle substrings.
 _pack_rename_persona() {
   local dir="$1" old="$2" new="$3"
   local old_l="${old,,}" new_l="${new,,}"
@@ -281,31 +201,7 @@ _pack_rename_persona() {
   local f
   for f in "$dir/CLAUDE.md" "$dir/card.md" "$dir/persona.yaml" "$dir"/memory/*.md; do
     [[ -f "$f" ]] || continue
-    # `\b` splits at punctuation, including the apostrophe inside a contraction.
-    # Lookarounds let adjacent names share a delimiter without consuming it, and
-    # one combined substitution never re-processes a replacement that happens to
-    # contain the old slug (e.g. `a` -> `a-one`). re.escape also keeps a malformed
-    # third-party manifest value from becoming regex syntax.
-    python3 - "$f" "$old_l" "$new_l" "$old_c" "$new_c" 2>/dev/null <<'PY' || true
-import pathlib
-import re
-import sys
-
-path = pathlib.Path(sys.argv[1])
-old_l, new_l, old_c, new_c = sys.argv[2:]
-pattern = re.compile(
-    # Match the display name before a possessive suffix without consuming that
-    # suffix, but reject every other apostrophe-linked continuation (notably a
-    # sentence-leading contraction such as "Don't").
-    rf"(?P<display>(?<![\w'’]){re.escape(old_c)}(?=(?:['’]s)?(?![\w'’])))"
-    rf"|(?P<slug>(?<![\w'’]){re.escape(old_l)}(?![\w'’]))"
-)
-with path.open("r", encoding="utf-8", errors="surrogateescape", newline="") as handle:
-    text = handle.read()
-text = pattern.sub(lambda match: new_c if match.group("display") else new_l, text)
-with path.open("w", encoding="utf-8", errors="surrogateescape", newline="") as handle:
-    handle.write(text)
-PY
+    sed -i -E "s/\\b${old_c}\\b/${new_c}/g; s/\\b${old_l}\\b/${new_l}/g" "$f" 2>/dev/null || true
   done
 }
 
@@ -1067,13 +963,8 @@ cmd_inspect() {
   local resolved_tmp=""
   if [[ ! -f "$pack" ]]; then
     if [[ "$pack" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
-      local fetch_rc
-      if resolved_tmp=$(_marketplace_fetch_pack "$pack"); then
-        :
-      else
-        fetch_rc=$?
-        _marketplace_fetch_pack_fail "$pack" "$fetch_rc"
-      fi
+      resolved_tmp=$(_marketplace_fetch_pack "$pack") \
+        || fail "$E_NOT_FOUND" "no pack '$pack' in the registry (browse: 5dive agent marketplace ls)"
       pack="$resolved_tmp"
     else
       fail "$E_NOT_FOUND" "pack not found: $pack"
@@ -2104,13 +1995,8 @@ cmd_import() {
     if [[ "$pack" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
       step "Resolving '$pack' from the character-pack registry"
       import_slug="$pack"   # remember the registry slug for opt-in --report-import
-      local fetch_rc
-      if resolved_tmp=$(_marketplace_fetch_pack "$pack"); then
-        :
-      else
-        fetch_rc=$?
-        _marketplace_fetch_pack_fail "$pack" "$fetch_rc"
-      fi
+      resolved_tmp=$(_marketplace_fetch_pack "$pack") \
+        || fail "$E_NOT_FOUND" "no pack '$pack' in the registry (browse: 5dive agent marketplace ls)"
       pack="$resolved_tmp"
     else
       fail "$E_NOT_FOUND" "pack not found: $pack"

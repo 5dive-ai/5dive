@@ -97,17 +97,6 @@ _gate_clear_lead_denied_reason() { printf 'n/a'; }
 # The two human-evidence forms. Default: NEITHER present — the DIVE-2400 shape.
 SUDO_NONAGENT=1
 _gate_sudo_uid_nonagent() { return "$SUDO_NONAGENT"; }
-# DIVE-2371: the authorization sites now call `_gate_human_principal` = this uid
-# test AND a STRUCTURAL cgroup test. Drive the second half off the SAME switch, or
-# the SUDO_NONAGENT=0 arms below read the HOST's real cgroup, the sudo-uid evidence
-# form silently disappears, and the harness reds as "the fix must not demote an
-# evidenced human answer" — a true statement about the fixture, not about the code.
-# Stub the READER only; the accept/deny logic stays shipped bytes, and no env
-# override exists on purpose (a widening knob is the forge class DIVE-2371 closes).
-_gate_caller_cgroup() {
-  if [[ "$SUDO_NONAGENT" == "0" ]]; then printf '%s' '/system.slice/shelld.service'
-  else printf '%s' '/system.slice/system-5dive.slice/5dive-agent@dev.service'; fi
-}
 reset() { : >"$AUDIT_CALLS"; unset _TASK_STORE_AUDIT_FENCED; }
 
 # A routed approval gate: `task need` does the routing from preferences we cannot

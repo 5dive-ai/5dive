@@ -438,25 +438,13 @@ jobs:
             done
             # A missing shard is not a smaller corpus. Say the count, so a report
             # assembled from two of three shards cannot read as a faster sweep.
-            #
-            # DIVE-2592: and say the total IN THE UNITS OF THE POLICY DIAL. "1668s against
-            # a 1320s budget (126%)" is the number people read off this table, and it is
-            # comparing an UN-SHARDED total to a PER-JOB cap — two different things, which
-            # is why it reads as alarming and produces no decision. The shard count is the
-            # dial, so the legible form of the same fact is the MINIMUM number of shards
-            # this corpus now needs: when that reaches the configured count, adding one is
-            # the decision on the table, and it is exactly as visible a policy change as
-            # raising the ceiling would be.
-            local need=0
-            (( ${b:-0} > 0 )) && need=$(( (s + b - 1) / b ))
-            printf '| %s | %d | %d | %ds | %ds per shard | %d of %d shards |\n' \
-              "$label" "$shards" "$n" "$s" "${b:-0}" "$need" "$shards"
+            printf '| %s | %d | %d | %ds | %ds per shard |\n' "$label" "$shards" "$n" "$s" "${b:-0}"
           }
           {
             echo "## Full-sweep wall-clock"
             echo
-            echo "| environment | shards reporting | harnesses | TOTAL wall-clock | budget | shards NEEDED |"
-            echo "|---|---:|---:|---:|---:|---:|"
+            echo "| environment | shards reporting | harnesses | TOTAL wall-clock | budget |"
+            echo "|---|---:|---:|---:|---:|"
             total_row pristine 'full-pristine-*.txt'
             total_row installed-host 'full-installed-*.txt'
             echo

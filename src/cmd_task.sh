@@ -620,70 +620,6 @@ _task_is_trivial() {
   [[ -n "$(_task_verify_skip_reason "$1" "$2" "$3")" ]]
 }
 
-# DIVE-2449: parse the narrow title shape that implies a numbered follow-up to
-# an existing epic. This is deliberately NOT a generic DIVE-N mention parser:
-# "follow-up to DIVE-2382" is ordinary prose, while "DIVE-2382 fix #3" carries
-# the series coordinate that board readers otherwise mistake for a real parent
-# link. Results are globals so callers can invoke this bare (rather than through
-# a command substitution that would hide assignments).
-_task_numbered_followup_parse() {
-  local _title="${1^^}"
-  local _re='(^|[^A-Z0-9])(DIVE-[0-9]+)[[:space:]]+(FIX|ORPHAN|PART|ITEM)[[:space:]]*#?([0-9]+)([^A-Z0-9]|$)'
-  _TASK_FOLLOWUP_IDENT=""
-  _TASK_FOLLOWUP_KIND=""
-  _TASK_FOLLOWUP_NUMBER=""
-  if [[ "$_title" =~ $_re ]]; then
-    _TASK_FOLLOWUP_IDENT="${BASH_REMATCH[2]}"
-    _TASK_FOLLOWUP_KIND="${BASH_REMATCH[3],,}"
-    _TASK_FOLLOWUP_NUMBER="${BASH_REMATCH[4]}"
-  fi
-  return 0
-}
-
-# Inspect an unparented title and expose an advisory only when all of these are
-# measured: the numbered-follow-up shape above, the cited ident exists, and no
-# --parent was supplied by the caller. Open rows with the SAME coordinate are
-# returned as a comma-separated ident list so the add output answers the
-# existence question by text as well as warning that no graph edge was made.
-# Empty/no-match is a normal result and always returns zero: an advisory must
-# never make `task add` fail under set -e.
-_task_unparented_followup_advisory() {
-  local _title="$1" _target_ident _target_kind _target_number
-  local _candidate_id _candidate_title _candidate_ident _matches=""
-  _TASK_FOLLOWUP_WARN_IDENT=""
-  _TASK_FOLLOWUP_WARN_KIND=""
-  _TASK_FOLLOWUP_WARN_NUMBER=""
-  _TASK_FOLLOWUP_WARN_MATCHES=""
-
-  _task_numbered_followup_parse "$_title"
-  _target_ident="$_TASK_FOLLOWUP_IDENT"
-  _target_kind="$_TASK_FOLLOWUP_KIND"
-  _target_number="$_TASK_FOLLOWUP_NUMBER"
-  [[ -n "$_target_ident" ]] || return 0
-  [[ "$(db "SELECT COUNT(*) FROM tasks WHERE upper(ident)=$(sqlq "$_target_ident");")" == "1" ]] || return 0
-
-  while IFS= read -r _candidate_id; do
-    [[ -n "$_candidate_id" ]] || continue
-    _candidate_title=$(db "SELECT title FROM tasks WHERE id=${_candidate_id};")
-    _task_numbered_followup_parse "$_candidate_title"
-    if [[ "$_TASK_FOLLOWUP_IDENT" == "$_target_ident" \
-       && "$_TASK_FOLLOWUP_KIND" == "$_target_kind" \
-       && "$_TASK_FOLLOWUP_NUMBER" == "$_target_number" ]]; then
-      _candidate_ident=$(db "SELECT ident FROM tasks WHERE id=${_candidate_id};")
-      _matches+="${_matches:+,}${_candidate_ident}"
-    fi
-  done < <(db "SELECT id FROM tasks
-               WHERE status NOT IN ('done','cancelled')
-                 AND instr(upper(title), $(sqlq "$_target_ident")) > 0
-               ORDER BY id;")
-
-  _TASK_FOLLOWUP_WARN_IDENT="$_target_ident"
-  _TASK_FOLLOWUP_WARN_KIND="$_target_kind"
-  _TASK_FOLLOWUP_WARN_NUMBER="$_target_number"
-  _TASK_FOLLOWUP_WARN_MATCHES="$_matches"
-  return 0
-}
-
 # ---------------------------------------------------------------------------
 # THE FILING CAP (DIVE-2681). Two controls over one classifier.
 #
@@ -1040,18 +976,6 @@ cmd_task_add() {
   if [[ -n "$parent" ]]; then
     resolve_task_id "$parent"; parent_sql="$RESOLVED_TASK_ID"
   fi
-  # DIVE-2449: an explicit --parent is the graph edge, so it suppresses this
-  # advisory regardless of prose. Without one, measure the narrow numbered
-  # follow-up title before inserting the row; the warning itself is emitted only
-  # after the new ident exists, and JSON carries the same receipt.
-  local followup_warn_ident="" followup_warn_kind="" followup_warn_number="" followup_warn_matches=""
-  if [[ "$kind" == "standard" && -z "$parent" ]]; then
-    _task_unparented_followup_advisory "$title"
-    followup_warn_ident="$_TASK_FOLLOWUP_WARN_IDENT"
-    followup_warn_kind="$_TASK_FOLLOWUP_WARN_KIND"
-    followup_warn_number="$_TASK_FOLLOWUP_WARN_NUMBER"
-    followup_warn_matches="$_TASK_FOLLOWUP_WARN_MATCHES"
-  fi
   # DIVE-980: an explicit --assignee may be a literal agent name OR an org-chart
   # TOKEN (role:<r> / charter:<kw> / @name). Route tokens through the org chart;
   # a literal name is trusted verbatim (explicit --assignee always wins). A token
@@ -1215,13 +1139,6 @@ An internal-machinery finding gets its own ident ONLY if it has ALREADY blocked 
        '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"recurring", schedule:$s, fresh:($f=="1")}' \
        --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg s "$recurring" --arg f "$fresh_sql"
   else
-    if [[ -n "$followup_warn_ident" ]]; then
-      local _followup_match_note=""
-      if [[ -n "$followup_warn_matches" ]]; then
-        _followup_match_note=" Open title match(es) for the same token: ${followup_warn_matches}."
-      fi
-      warn "$ident: title cites existing ${followup_warn_ident} ${followup_warn_kind} #${followup_warn_number} without --parent, so no child link was created.${_followup_match_note} If this is a child, file it with --parent=${followup_warn_ident}."
-    fi
     local coord_note=""
     (( auto_coordinated )) && coord_note=" → coordinator: $assignee"
     local verify_note=""
@@ -1235,9 +1152,8 @@ An internal-machinery finding gets its own ident ONLY if it has ALREADY blocked 
     [[ -n "$verify_skipped" ]] \
       && verify_note=" · NOT verifier-graded ($verify_skipped) — 'task done' will close it outright; attach a grader with: 5dive task verifier $ident <agent>"
     ok "created ${ident} — $title${coord_note}${verify_note}" \
-       '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", autoCoordinated:($ac=="1"), verifyDefaulted:($vd=="1"), verifyUnavailable:($vu=="1"), verifySkipped:($vs!=""), verifySkipReason:$vs, verifier:$v, parentLinkWarning:($wi!=""), citedParent:$wi, citedSeries:(if $wi=="" then "" else ($wk+" #"+$wn) end), openTitleMatches:($wm|split(",")|map(select(length>0)))}' \
-       --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg ac "$auto_coordinated" --arg vd "$verify_defaulted" --arg vu "$verify_unavailable" --arg vs "$verify_skipped" --arg v "${verifier:-}" \
-       --arg wi "$followup_warn_ident" --arg wk "$followup_warn_kind" --arg wn "$followup_warn_number" --arg wm "$followup_warn_matches"
+       '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", autoCoordinated:($ac=="1"), verifyDefaulted:($vd=="1"), verifyUnavailable:($vu=="1"), verifySkipped:($vs!=""), verifySkipReason:$vs, verifier:$v}' \
+       --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg ac "$auto_coordinated" --arg vd "$verify_defaulted" --arg vu "$verify_unavailable" --arg vs "$verify_skipped" --arg v "${verifier:-}"
   fi
 }
 
@@ -1302,7 +1218,7 @@ cmd_task_ls() {
     # the mark stands AND no verifier has since been assigned; the dashboard renders
     # it as an "Unverified" badge. NB: no inline SQL `--` comments in this string —
     # dbfmt flattens newlines, so a `--` would comment out the rest of the query.
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, tier, kind, schedule, last_fired_at, last_skipped_at, parked_at, park_reason, wake_at, project_key, maker_agent, verifier,
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, tier, kind, schedule, last_fired_at, last_skipped_at, parked_at, park_reason, wake_at, project_key, maker_agent, verifier,
              CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
                   THEN CASE WHEN handoff_ack_at IS NOT NULL THEN 'reviewing' ELSE 'delivered' END
                   ELSE NULL END AS handoff_state,
@@ -1326,15 +1242,7 @@ cmd_task_ls() {
     # the scheduler (the DIVE-2055 rule for this table).
     dbfmt -box "SELECT ident, status, COALESCE(schedule,'-') AS schedule, COALESCE(assignee,'-') AS assignee, COALESCE(last_fired_at,'never') AS last_fired, COALESCE(last_skipped_at,'-') AS last_skipped, COALESCE((SELECT i.ident FROM tasks i WHERE i.from_template_id=tasks.id AND i.status NOT IN ('done','cancelled') ORDER BY i.id LIMIT 1),'-') AS blocked_by, title FROM tasks WHERE ${where} ${order};"
   else
-    # DIVE-2316: the binding audit is a list question — "which closed rows have
-    # no pointer?"  Show the column whenever closed rows were requested, and
-    # render the missing value explicitly instead of turning it into another
-    # invisible blank.  The default open queue stays compact.
-    if [[ "$status" == "done" || $all -eq 1 ]]; then
-      dbfmt -box "SELECT ident, status, priority, COALESCE(assignee,'-') AS assignee, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, title FROM tasks WHERE ${where} ${order};"
-    else
-      dbfmt -box "SELECT ident, status, priority, COALESCE(assignee,'-') AS assignee, title FROM tasks WHERE ${where} ${order};"
-    fi
+    dbfmt -box "SELECT ident, status, priority, COALESCE(assignee,'-') AS assignee, title FROM tasks WHERE ${where} ${order};"
   fi
 }
 
@@ -1354,10 +1262,7 @@ cmd_task_show() {
       --argjson g "$previous_gates" \
       '{ok:true, data:{task:($t[0]), subtasks:$s, blocked_by:$b, previous_gates:$g}}'
   else
-    # DIVE-2316: delivery_ref is an enforcement input, so omission here made a
-    # missing binding indistinguishable from a presenter that never read it.
-    # Keep the field present in both states; "absent" is the observable value.
-    dbfmt -line "SELECT ident, title, status, priority, assignee, created_by, parent_id, created_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, body, result FROM tasks WHERE id=${id};"
+    dbfmt -line "SELECT ident, title, status, priority, assignee, created_by, parent_id, created_at, started_at, done_at, body, result FROM tasks WHERE id=${id};"
     # DIVE-1064: surface the creator's isolation tier (read-time from the
     # registry, no schema change) so a reader/agent can down-trust a task filed
     # by a lower-privilege peer.
@@ -1742,315 +1647,7 @@ _gate_gh_bot_ok() {
 # it stopped being a correct one the moment a second rail existed.
 _gate_gh_reachable() {
   [[ -n "${1:-}" ]] && return 0
-  _gate_gh_bot_ok && return 0
-  # DIVE-2770: a third way to ASK — see the anonymous rail below.
-  _gate_anon_ok
-}
-
-# _gate_gh_credentialed <tok> — 0 when the caller HOLDS a rail of its OWN (a token,
-# or the `_gh_do` grant), as opposed to only the anonymous one.
-#
-# DIVE-2770: `_gate_gh_reachable` is now true for a caller holding nothing, because
-# the anon rail can answer for a PUBLIC repo. That is the fix — and it makes the two
-# states downstream diverge. "A credential resolved and the query came back empty"
-# and "there was never a credential, and the credential-free rail could not see this
-# repo either" have DIFFERENT remedies, and a refusal that prints the first sentence
-# for the second case is the exact DIVE-2318 defect this ticket inherited, one
-# refusal further down: measured here on a private-repo close, which landed on
-# `done-pr-state-unresolved` saying "a gh credential resolved" to a seat that has
-# never held one. Reachability decides whether to ASK; this decides what an empty
-# answer MEANS.
-_gate_gh_credentialed() {
-  [[ -n "${1:-}" ]] && return 0
   _gate_gh_bot_ok
-}
-
-# DIVE-2770: ONE refusal string, TWO sites. The EARLY site fires when no rail of any
-# kind exists (no token, no bot grant, and no curl/jq to read anonymously with). The
-# LATE site fires when the anonymous rail was the only one and it could not see this
-# repo — a private repo, which is the ordinary case. Same epistemic state and the same
-# remedy, so the same words, emitted from one place: two copies of a refusal this long
-# drift, and then they disagree about which remedies a verifier seat can reach, which
-# is the failure this ticket is about.
-_gate_refuse_no_rail() {
-  local ident="$1" subject="$2"
-  # DIVE-2770: name WHICH way the credential-free rail failed. Rate-limited clears
-  # by itself; a private repo never will. One sentence, and it decides whether the
-  # reader waits or reaches for `task verify`.
-  local _why; _why="$(_gate_anon_why)"
-  policy_refuse "$E_CONFLICT" done-merge-gate-no-credential DIVE-2318 "$ident" "$ident cannot close: the merge gate COULD NOT CHECK whether ${subject} landed — no gh credential resolved in this caller's environment, the machine-account rail is unreachable, AND the credential-free rail could not answer either (DIVE-2770: an unauthenticated read of a public repo). No query ran at all. ${_why} This says NOTHING about the merge; do not read it as 'not merged'. WHICH OF TWO CAUSES THIS IS decides what you should do, and the gate cannot tell them apart from here. (a) BY FAULT: a builder that should hold the \`_gh_do\` grant is missing it — a provisioning problem with a name. Check it with \`5dive gh whoami\`; if the bot line is UNRESOLVED and you are a builder, that is the thing to fix (\`agent create --can-push\`), or re-run with a token (\`GH_TOKEN=\$(sudo -u claude gh auth token) 5dive task done $ident ...\`). (b) BY DESIGN: on a VERIFIER seat an UNRESOLVED bot line is the CORRECT state — \`_gh_do\` is the can-push grant a grader must not hold, so no credential is coming, and handing the close to agent-main is not open to you either when the DIVE-477 writer-is-not-grader rail names YOU as the verifier of record. In case (b) the authorised terminal move is \`5dive task verify $ident --cmd=<script>\`, where the script'\''s EXIT STATUS proves the merge rather than asserting it — e.g. \`git ls-remote <repo-url> refs/heads/main | grep -q <merge-sha> && git fetch -q origin main && git grep -q <a-symbol-the-PR-added> origin/main -- <path>\`. That answers this gate'\''s question by another instrument instead of bypassing it, and it is squash-proof where a sha comparison is not. \`--force-merge-gate\` does NOT reach this refusal: it escapes a gate that RAN and disagreed, never one that asked nothing. Copy your verdict into the BODY before you close (\`task set-body --append\`) — \`task verify\` OVERWRITES result, and a closed body is frozen. \`task merge-audit --limit=1\` reports the same missing credential."
-}
-
-# DIVE-2770: THE ANONYMOUS RAIL — the gate's own question has a credential-free
-# answer, and demanding a credential for it deadlocked a MERGED row.
-#
-# ORIGIN, measured (DIVE-2449 / PR #483, squash 0396d920). The DIVE-477 rail
-# requires a close come from the VERIFIER OF RECORD. That seat holds no gh
-# credential BY DESIGN — `_gh_do` is the can-push grant a grader must not hold —
-# so `_gate_gh_reachable` was false and the close refused. The one agent permitted
-# to close could not see the evidence; the one who could see it was barred from
-# closing. Neither was misconfigured. The two rails enclosed each other, and the
-# refusal printed two remedies (`5dive gh whoami`, "hand it to agent-main") that
-# the caller the rail requires cannot reach.
-#
-# THE DEFECT IS THE PREMISE, NOT THE PLUMBING. "Did pull/483 land?" is answerable
-# ANONYMOUSLY on a public repo: `GET /repos/O/R/pulls/N` needs no token, and
-# `git ls-remote` reads refs without one. The gate was asking a public question
-# through a private door. This rail asks it through the public one, and it is
-# tried LAST — after the caller's token and after the bot rail — so no close that
-# resolves a credential today changes path at all. The rail can only ever ADD an
-# answer where there was none.
-#
-# WHY THIS IS NOT A WIDENING, which is the objection to answer first. It grants
-# nobody anything: an unauthenticated read of a public repo is available to the
-# whole internet, and it is READ-ONLY by construction (a curl GET with no
-# credential to escalate with). On a PRIVATE repo it 404s and the close lands on
-# exactly the refusal it lands on today. This is the fix DIVE-2770 asked for in
-# preference to granting verifier seats `_gh_do`, which would trade a bookkeeping
-# problem for a security regression.
-#
-# SQUASH IS THE SECOND BUG WEARING THE FIRST ONE'S CLOTHES, and it lives in the
-# reshape below rather than in a separate branch. REST reports a squash-merged PR
-# as `state: "closed"`; gh's `--json state` reports `"MERGED"`. Copying `.state`
-# across would render every merged PR as CLOSED and false-refuse
-# `done-before-pr-merged` on precisely the population this rail exists to unblock.
-# So gh's state is DERIVED from `.merged`, never copied — and `merged` is a fact a
-# squash does not disturb, which is why this rail answers "did it land" for a
-# squash merge where no sha comparison can.
-_GATE_ANON_API="${FIVE_GATE_ANON_API:-https://api.github.com}"
-
-# _gate_anon_ok — 0 when an unauthenticated GitHub read is even possible here.
-# FIVE_GATE_NO_ANON=1 turns the rail off: harnesses that grade the no-rail
-# refusal need the pre-DIVE-2770 world back, and so does any operator who wants
-# it. It is an opt-OUT, not an opt-in — a fix nobody enables is not a fix.
-_gate_anon_ok() {
-  [[ "${FIVE_GATE_NO_ANON:-0}" == "1" ]] && return 1
-  command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1
-}
-
-# DIVE-2770: THE ANONYMOUS RAIL HAS A BUDGET, AND IT IS SHARED. Unauthenticated
-# api.github.com is 60 requests/hour PER IP — not per agent, per IP — so the whole
-# fleet on one box draws from one bucket, and the bucket is small enough to empty by
-# hand (measured: exhausted during this ticket's own end-to-end run, with
-# `x-ratelimit-remaining: 0`, and the rail correctly declined rather than guessing).
-# Two consequences are designed for here rather than discovered later:
-#
-#   1. EXHAUSTION MUST NOT WEAR THE PRIVATE-REPO COSTUME. A 403-with-remaining-0 and
-#      a 404 are both "the rail could not answer", and stopping there prints "this
-#      repo is private" for a condition that clears by itself inside an hour. That is
-#      the same defect this whole ticket is about — an unreached question rendered as
-#      an answered one — so the code that cannot tell them apart is the code that has
-#      to. `_gate_anon_why` is where the difference is spent.
-#   2. SPEND LESS. The declared path asks for the SAME PR twice (once for `.state`,
-#      once for `.mergedAt`) and `_gate_pr_shas` asks a third time. Memoising the
-#      response for the life of the process turns three requests into one, which is
-#      the difference between ~10 closes an hour and ~30 for the whole fleet.
-# SUBSHELL, AND WHY THIS IS A FILE. Every gate call site reads `_gate_gh` through a
-# command substitution — `_state=$(_gate_gh ... || echo "")` — so the rail runs in a
-# CHILD shell and any variable it sets dies with that child. Measured here: a shell
-# variable carrying the outcome read back EMPTY at the refusal, and an in-memory
-# response cache never hit once because each call had its own copy. So the outcome
-# crosses the boundary in a file, keyed by the top-level pid (`$$` is the parent's
-# even inside `$( )`, which is exactly the property needed). The sibling
-# `.5dive-gate-gh-err.$$` file next door is the same idiom for the same reason.
-#
-# An in-memory cache is deliberately NOT reinstated on top of this: it would be
-# inert for the same reason, and an optimisation that a test asserts but that never
-# fires is worse than no optimisation. The duplicate reads were removed at the CALL
-# SITE instead (one `pr view` for state AND mergedAt), which spends less on every
-# rail rather than only on this one.
-_GATE_ANON_STATEF="${TMPDIR:-/tmp}/.5dive-anon-outcome.$$"
-
-# _gate_anon_get <secs> <api-path> — ONE bounded, unauthenticated GET.
-# stdout is the body; a NON-ZERO rc means the read did not happen. The outcome is
-# recorded for `_gate_anon_why`: an absent answer is unresolved, never "no"
-# (DIVE-2318, one rail further down), and the three ways it can be absent have three
-# different remedies.
-_gate_anon_get() {
-  local secs="${1:-10}" path="${2#/}" code="" out="" reset="" _b _h
-  [[ "$secs" == "0" ]] && secs=10
-  _b="${TMPDIR:-/tmp}/.5dive-anon.$$.$BASHPID"; _h="${_b}.h"
-  code=$(timeout "${secs}s" curl -sSL -o "$_b" -D "$_h" -w '%{http_code}' \
-          -H 'Accept: application/vnd.github+json' \
-          -H 'X-GitHub-Api-Version: 2022-11-28' \
-          "${_GATE_ANON_API}/${path}" 2>/dev/null) || code=""
-  out=$(cat "$_b" 2>/dev/null || printf '')
-  if [[ "$code" == "403" || "$code" == "429" ]] \
-     && grep -qi '^x-ratelimit-remaining:[[:space:]]*0' "$_h" 2>/dev/null; then
-    reset=$(grep -i '^x-ratelimit-reset:' "$_h" 2>/dev/null | tr -dc '0-9' || printf '')
-    printf 'ratelimit|%s' "$reset" >"$_GATE_ANON_STATEF" 2>/dev/null || true
-  else
-    printf '%s|' "${code:-network}" >"$_GATE_ANON_STATEF" 2>/dev/null || true
-  fi
-  rm -f "$_b" "$_h" 2>/dev/null || true
-  [[ "$code" == 2* ]] || return 1
-  printf '%s' "$out"
-}
-
-# _gate_anon_why — ONE clause naming why the anonymous rail could not answer, for a
-# refusal to paste. Empty when the rail answered or was never tried: a refusal that
-# explains a rail nobody used is noise, and noise is how a reader learns to skip the
-# sentence that matters.
-_gate_anon_why() {
-  local _st="" _code="" _reset=""
-  _st=$(cat "$_GATE_ANON_STATEF" 2>/dev/null || printf '')
-  # Read once, then unlink: this is a per-invocation crumb in TMPDIR, and the only
-  # reader is the refusal it was written for. A close that never refuses leaves one
-  # ~12-byte file behind, which is the same shape as the `.5dive-gate-gh-err.$$`
-  # sibling and is bounded at ONE per CLI invocation (fixed name, last write wins)
-  # rather than one per request.
-  rm -f "$_GATE_ANON_STATEF" 2>/dev/null || true
-  _code="${_st%%|*}"; _reset="${_st#*|}"
-  case "$_code" in
-    ""|2*)     printf '' ;;
-    ratelimit) local _w=""
-               [[ -n "$_reset" ]] \
-                 && _w=" (it refills at $(date -u -d "@${_reset}" '+%H:%M UTC' 2>/dev/null || printf 'the top of the hour'))"
-               printf 'AND NOTE WHICH FAILURE THIS WAS: the credential-free rail is RATE-LIMITED, not blind — unauthenticated api.github.com allows 60 requests per hour PER IP, and this host shares one IP across every agent on it%s. That is TRANSIENT: re-run `task done` after it refills and the gate should answer without any credential.' "$_w" ;;
-    404)       printf 'AND NOTE WHICH FAILURE THIS WAS: the credential-free rail got a 404, which for an unauthenticated read means the repo is PRIVATE (or the ref is gone). There is no anonymous read of it at all, so waiting will not clear this one.' ;;
-    network)   printf 'AND NOTE WHICH FAILURE THIS WAS: the credential-free rail could not reach github.com at all — network or timeout, so retry is worth one attempt.' ;;
-    *)         printf 'AND NOTE WHICH FAILURE THIS WAS: the credential-free rail was refused with HTTP %s.' "$_code" ;;
-  esac
-}
-
-# The REST->gh reshape. Only the fields the gate actually asks for, so a shape it
-# has never requested cannot be silently invented. `statusCheckRollup` is injected
-# by the caller as $roll because it is a SECOND request — leaving the key absent
-# would let the rollup filter render NONE ("no checks reported") for a question
-# nobody asked, which is the succeeding-in-appearance shape DIVE-1935 is about.
-readonly _GATE_ANON_PR_SHAPE='{
-  state: (if (.merged // false) then "MERGED"
-          elif ((.state // "") == "open") then "OPEN"
-          else "CLOSED" end),
-  mergedAt: .merged_at,
-  title: (.title // ""),
-  headRefName: (.head.ref // ""),
-  headRefOid: (.head.sha // ""),
-  mergeCommit: (if ((.merge_commit_sha // "") == "") then null
-                else {oid: .merge_commit_sha} end),
-  number: (.number // 0),
-  url: (.html_url // "")
-}'
-
-# _gate_anon_rollup <secs> <slug> <sha> — the check state of one commit, as a
-# gh-shaped statusCheckRollup array. Two GETs because GitHub keeps check-runs
-# (Actions) and commit statuses (legacy/external) in different places and gh
-# merges them; asking only one would report OK for a repo whose reds live in the
-# other. Conclusions are upcased because the rollup filter matches "FAILURE",
-# and REST spells it "failure".
-_gate_anon_rollup() {
-  local secs="${1:-10}" slug="$2" sha="$3" cr="" st=""
-  [[ -n "$sha" ]] || { printf '[]'; return 1; }
-  cr=$(_gate_anon_get "$secs" "repos/${slug}/commits/${sha}/check-runs" \
-        | jq -c '[ (.check_runs // [])[]
-                   | {name: (.name // ""),
-                      conclusion: ((.conclusion // "") | ascii_upcase),
-                      completedAt: (.completed_at // .started_at // "")} ]' 2>/dev/null) || cr=""
-  st=$(_gate_anon_get "$secs" "repos/${slug}/commits/${sha}/status" \
-        | jq -c '[ (.statuses // [])[]
-                   | {context: (.context // ""),
-                      state: ((.state // "") | ascii_upcase),
-                      createdAt: (.created_at // "")} ]' 2>/dev/null) || st=""
-  # Both unreachable is UNRESOLVED, not "no checks" — say so with the rc.
-  if [[ -z "$cr" && -z "$st" ]]; then printf '[]'; return 1; fi
-  jq -cn --argjson a "${cr:-[]}" --argjson b "${st:-[]}" '$a + $b' 2>/dev/null || { printf '[]'; return 1; }
-}
-
-# _gate_anon_gh <secs> <gh args...> — serve a READ-ONLY gh call over the anon rail.
-#
-# rc 0 with output = ANSWERED. rc 1 = this rail could not answer, for any reason:
-# an unsupported query shape, a private repo, a network failure, OR a listing that
-# matched nothing. That last one is deliberate and is the whole discipline of this
-# function: the anon rail cannot see a fork-headed PR and does not paginate a long
-# closed-PR list, so an empty listing here is a question that was not REACHED, and
-# rendering it as "not merged" would reintroduce DIVE-2318 on a new rail. Only a
-# POSITIVE finding is allowed to travel.
-#
-# Shapes served, and the omission is deliberate: `pr view` and `pr list --head
-# --state merged` are the two ways the fail-CLOSED gate asks "did this land", and
-# `api` passes through because those call sites are written against REST already.
-# `pr list --state open` — the fail-OPEN auto-detect scan — is NOT served: it is a
-# 200-row listing whose emptiness the scan reads as coverage, and an anon rail
-# that pages differently would convert "I did not see it" into "there is none".
-# That scan keeps reporting UNVERIFIED for a credential-less caller, exactly as
-# it does today.
-_gate_anon_gh() {
-  local secs="${1:-10}"; shift
-  _gate_anon_ok || return 1
-  local -a a=("$@") pos=()
-  local expr='.' repo="" json="" head="" pstate="" i=0
-  while [[ $i -lt ${#a[@]} ]]; do
-    case "${a[$i]}" in
-      -q|--jq)  expr="${a[$((i+1))]:-.}";  i=$((i+2)) ;;
-      -q*)      expr="${a[$i]#-q}";        i=$((i+1)) ;;
-      --repo)   repo="${a[$((i+1))]:-}";   i=$((i+2)) ;;
-      --json)   json="${a[$((i+1))]:-}";   i=$((i+2)) ;;
-      --head)   head="${a[$((i+1))]:-}";   i=$((i+2)) ;;
-      --state)  pstate="${a[$((i+1))]:-}"; i=$((i+2)) ;;
-      --limit)  i=$((i+2)) ;;
-      -*)       i=$((i+1)) ;;
-      *)        pos+=("${a[$i]}");         i=$((i+1)) ;;
-    esac
-  done
-  local _body="" _out="" _slug="" _num="" _roll="null" _sha=""
-  case "${pos[0]:-}" in
-    api)
-      # REST in, REST out — these call sites already speak this schema.
-      [[ -n "${pos[1]:-}" ]] || return 1
-      _body=$(_gate_anon_get "$secs" "${pos[1]}") || return 1
-      ;;
-    pr)
-      case "${pos[1]:-}" in
-        view)
-          local _ref="${pos[2]:-}"
-          if [[ "$_ref" =~ ^https?://[^/]+/([^/]+)/([^/]+)/pull/([0-9]+) ]]; then
-            _slug="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"; _num="${BASH_REMATCH[3]}"
-          elif [[ "$_ref" =~ ^[0-9]+$ && -n "$repo" ]]; then
-            _slug="$repo"; _num="$_ref"
-          else
-            return 1
-          fi
-          _body=$(_gate_anon_get "$secs" "repos/${_slug}/pulls/${_num}") || return 1
-          ;;
-        list)
-          # Only the fail-CLOSED "did this branch land" listing. See the header.
-          [[ -n "$repo" && -n "$head" && "$pstate" == "merged" ]] || return 1
-          _slug="$repo"
-          _body=$(_gate_anon_get "$secs" \
-                    "repos/${_slug}/pulls?state=closed&per_page=100&head=${_slug%%/*}:${head}") || return 1
-          _body=$(printf '%s' "$_body" | jq -c '[ .[] | select((.merged_at // null) != null) ]' 2>/dev/null) || return 1
-          # Nothing matched is NOT REACHED, never "not merged" (see the header).
-          [[ -n "$_body" && "$_body" != "[]" ]] || return 1
-          ;;
-        *) return 1 ;;
-      esac
-      ;;
-    *) return 1 ;;
-  esac
-  [[ -n "$_body" ]] || return 1
-  if [[ "${pos[0]:-}" == "api" ]]; then
-    _out=$(printf '%s' "$_body" | jq -r "($expr)" 2>/dev/null) || return 1
-    [[ -n "$_out" ]] || return 1
-    printf '%s' "$_out"
-    return 0
-  fi
-  # A rollup is fetched only when the caller ASKED for one, and a rollup that
-  # could not be read declines the whole call rather than answering "no checks".
-  if [[ ",${json}," == *,statusCheckRollup,* ]]; then
-    _sha=$(printf '%s' "$_body" | jq -r 'if type == "array" then (.[0].head.sha // "") else (.head.sha // "") end' 2>/dev/null) || _sha=""
-    _roll=$(_gate_anon_rollup "$secs" "$_slug" "$_sha") || return 1
-  fi
-  if [[ "${pos[1]:-}" == "list" ]]; then
-    _out=$(printf '%s' "$_body" \
-            | jq -r --argjson roll "$_roll" \
-                "[ .[] | ${_GATE_ANON_PR_SHAPE} + {statusCheckRollup: \$roll} ] | ($expr)" 2>/dev/null) || return 1
-  else
-    _out=$(printf '%s' "$_body" \
-            | jq -r --argjson roll "$_roll" \
-                "${_GATE_ANON_PR_SHAPE} + {statusCheckRollup: \$roll} | ($expr)" 2>/dev/null) || return 1
-  fi
-  [[ -n "$_out" ]] || return 1
-  printf '%s' "$_out"
 }
 
 # _gate_gh <tok> <secs> <gh args...> — run ONE read-only gh call by whichever rail
@@ -2109,18 +1706,7 @@ _gate_gh() {
     # to run it with. Returning 0 here made an unusable bot rail count as a
     # completed scan, which is the same laundering as a failed listing.
     if ! _gate_gh_bot_ok; then
-      # DIVE-2770: LAST rail, and only reached when the caller holds nothing.
-      # An unauthenticated read of a public repo answers "did this land" without
-      # any grant at all; on a private repo it declines and we fall through to
-      # the same no-rail state as before.
-      local _anon_out=""
-      if _anon_out=$(_gate_anon_gh "$secs" "$@"); then
-        _GATE_GH_LAST_ERR=""
-        rm -f "$_errf" 2>/dev/null || true
-        printf '%s' "$_anon_out"
-        return 0
-      fi
-      _GATE_GH_LAST_ERR="no gh rail: no token, the gate bot is not usable here, and the anonymous rail could not answer (private repo, or a query it does not serve)"
+      _GATE_GH_LAST_ERR="no gh rail: no token, and the gate bot is not usable here"
       rm -f "$_errf" 2>/dev/null || true
       printf ''
       return 1
@@ -3109,27 +2695,7 @@ _task_guard_result_over_closed() {
         "$ident" "open_status=$_cl_st" "overwritten_result=$_cl_prev"
       warn "$ident: --force-result REPLACED a result this OPEN row already carried. The overwritten text is in the audit log (task.force-result-over-open); the board copy is gone (DIVE-2483)."
     else
-      # DIVE-2483 iteration 2 (olivia's reject). The gate answer named FOUR
-      # conditions; the two expressible as DB-column state shipped, and the two
-      # about what the OPERATOR SEES were dropped. Both are here now.
-      #
-      # CONDITION 2 — DATE THE SEAM. There is no result_by column (that was this
-      # row's first blocker), so the seam marker IS the provenance: it is the only
-      # thing on the board that says a second writer arrived and when. An undated
-      # marker tells a reader that two texts were joined and nothing about the
-      # order of events, which is most of what provenance is for.
-      local _seam_at; _seam_at=$(date -u '+%Y-%m-%d %H:%M:%SZ')
-      result="${_cl_prev}"$'\n\n'"--- appended ${_seam_at} by a later write (DIVE-2483); the text above was already on the row ---"$'\n'"${result}"
-      # CONDITION 1 — SAY IT HAPPENED. This is the one the gate answer flagged as
-      # "most likely to be dropped as cosmetic", and it was dropped. Without it a
-      # bare open-row close prints exactly `ok - <ident> done` — BYTE-IDENTICAL to
-      # the output that accompanied the DIVE-2712 wipe. The bytes were rescued and
-      # the silence that made their loss undetectable was shipped intact, so an
-      # operator cannot tell the fixed behaviour from the defect at the terminal.
-      # The byte count is not decoration: it is the cheapest thing that makes the
-      # claim falsifiable at a glance — a reader who expected 2.6KB and sees 40
-      # knows to look, and one who sees nothing at all never does.
-      warn "$ident: this row already carried a result and it was PRESERVED, not replaced — ${#_cl_prev} bytes kept above your text, under a dated seam (DIVE-2483). Run '5dive task show $ident' to read both, or '5dive trace $ident' for who wrote the earlier one."
+      result="${_cl_prev}"$'\n\n'"--- appended by a later write (DIVE-2483); the text above was already on the row ---"$'\n'"${result}"
     fi
   fi
   _TASK_GUARDED_RESULT="$result"
@@ -3280,11 +2846,9 @@ _task_status_cmd() {
     #
     # DO NOT go looking for cleared delivery columns; there are none, and a
     # reading of this rail that expects them is wrong at the schema level.
-    # A maker→verifier handoff returns before the merge-gate, so on a loop
-    # delivered by `task done` these columns are NULL and always were. The two
-    # writers — explicit `task deliver --pr=` and DIVE-2316's later merge-gate
-    # discovery write — are both unreachable on this early-return path.
-    # `handoff_ack_at` is set to NULL by
+    # `delivered_at` and `delivery_ref` have exactly ONE writer — cmd_task_deliver,
+    # the `task deliver --pr=` flow — so on a loop delivered by `task done` they
+    # are NULL and always were. `handoff_ack_at` is set to NULL by
     # _task_route_to_verifier as PART of delivering. All three are therefore NULL
     # *while the row is legitimately delivered*, which is why observing them NULL
     # after a stray `task start` says nothing about that start. T6 of the harness
@@ -3667,7 +3231,7 @@ _task_status_cmd() {
       # fires only when BOTH rails are gone, which for a builder means the `_gh_do`
       # grant is missing — a provisioning fault with a name, not a standing condition.
       if ! _gate_gh_reachable "$_ghtok"; then
-        _gate_refuse_no_rail "$ident" "${_dref:-branch '$_branch'}"
+        policy_refuse "$E_CONFLICT" done-merge-gate-no-credential DIVE-2318 "$ident" "$ident cannot close: the merge gate COULD NOT CHECK whether ${_dref:-branch '$_branch'} landed — no gh credential resolved in this caller's environment AND the machine-account rail is unreachable, so no query ran at all. This says NOTHING about the merge; do not read it as 'not merged'. Resolution order is GH_TOKEN/GITHUB_TOKEN in env, then \`gh auth token\` for the sudo invoker, then your own, then \`sudo -n -u claude gh auth token\` (needs sudoers scope most agents do not have), and finally the root-only \`_gh_do\` rail as 5dive-bot (DIVE-2605), which needs the NOPASSWD grant a builder gets from \`agent create --can-push\`. Check that grant with \`5dive gh whoami\`; if the bot line is UNRESOLVED that is the thing to fix. Otherwise re-run with a token (\`GH_TOKEN=\$(sudo -u claude gh auth token) 5dive task done $ident ...\`) or hand the close to an agent that holds one (agent-main). Verify with \`5dive task merge-audit --limit=1\`, which reports the same missing credential."
       fi
       if [[ -n "$_dref" ]]; then
         # DIVE-1955: a delivery_ref that is a full pull URL carries its own repo and
@@ -3686,31 +3250,8 @@ _task_status_cmd() {
           warn "$ident: bare delivery_ref resolved to $_dref by ident evidence (DIVE-1955) — bind the full URL next time."
         fi
         local _state _merged
-        # DIVE-2770 considered joining these two reads into one (they ask for the
-        # SAME PR, and the credential-free rail draws on a 60-request hourly budget
-        # shared by the whole host). It is REVERTED on purpose: five sibling
-        # harnesses stub `gh` by dispatching on the exact `-q` filter string, so
-        # changing the filter silently returns nothing and reads as a merge-gate
-        # failure in files that have nothing to do with this rail. Saving two
-        # requests is not worth editing five fixtures, each edit being a chance to
-        # weaken a guard. The cost is instead made VISIBLE and asserted —
-        # tests/task_merge_gate_anon_rail_unit.sh T9 pins how many requests one
-        # graded close spends, so a future change that multiplies it is caught.
         _state=$(_gate_gh "$_ghtok" 0 pr view "$_dref" --json state,mergedAt -q '.state' 2>/dev/null || echo "")
         _merged=$(_gate_gh "$_ghtok" 0 pr view "$_dref" --json state,mergedAt -q '.mergedAt' 2>/dev/null || echo "")
-        # DIVE-2720: NORMALISE the literal 'null' to empty, at CAPTURE, so every
-        # reader below inherits it. `gh -q .state` renders a MISSING .state as the
-        # four-character string 'null' — not empty — so a SUCCESSFUL query with an
-        # unusable payload slipped the `-z "$_state"` guard below and landed on the
-        # DIVE-1830 refusal, which printed "not merged to main yet (..., state=null
-        # — MEASURED, not assumed)". Same defect class as DIVE-2318/2705 by a third
-        # route: the earlier two reached it through a FAILED call, this one through a
-        # call that succeeded and answered nothing. jq's null and a query that never
-        # returned are the same epistemic state — unresolved — so they get the same
-        # representation here rather than a second parallel branch that can drift
-        # from the first. Line ~3265 already special-cased 'null' for _merged and
-        # nothing did for _state; that asymmetry was the hole.
-        if [[ "$_state" == "null" ]]; then _state=""; fi
         # DIVE-2318: an EMPTY state is "the question was not answered", not "the answer
         # was no". A token is present by here (guarded above), so an empty state means
         # the query itself failed — network, timeout, a PR/repo this token cannot see,
@@ -3719,15 +3260,6 @@ _task_status_cmd() {
         # nobody measured. Own slug, because a refusal record that cannot answer WHICH
         # of the two happened is the same defect one level down.
         if [[ -z "$_state" ]]; then
-          # DIVE-2770: WHICH unresolved is this? A caller that holds a rail got an
-          # empty answer from it; a caller that holds nothing never had one to get an
-          # empty answer from — the anonymous rail simply cannot see a private repo.
-          # Printing "a gh credential resolved" at a seat that has never held one is
-          # DIVE-2318's own defect one refusal further down, so route by what the
-          # caller actually holds rather than by what it could reach.
-          if ! _gate_gh_credentialed "$_ghtok"; then
-            _gate_refuse_no_rail "$ident" "$_dref"
-          fi
           policy_refuse "$E_CONFLICT" done-pr-state-unresolved DIVE-2318 "$ident" "$ident cannot close: the merge gate COULD NOT READ the state of $_dref — a gh credential resolved, but the query returned nothing. This is NOT a finding that the PR is unmerged; it was never answered. Likely: the PR/repo is not visible to this token, the ref is wrong or deleted, or gh/the network failed. Check by hand (\`gh pr view $_dref --json state,mergedAt\`); if it IS merged, re-run \`task done\` from an environment whose token can see it. Use \`task cancel\` to abandon."
         fi
         if [[ "$_state" != "MERGED" || -z "$_merged" || "$_merged" == "null" ]]; then
@@ -4054,32 +3586,6 @@ _task_status_cmd() {
       [[ $_sc_ok -eq $_sc_total && $_sc_total -gt 0 ]] && _scan_ran=1
       [[ -n "$_auto_hit" ]] && _scan_ran=1
     fi
-    # DIVE-2316: the mandatory gate already resolved a concrete PR in a concrete
-    # repo. Persist that identity before refusing the premature close, so the
-    # next invocation takes the declared, fail-closed path instead of throwing
-    # the discovery away and starting from an unbound row again. This is also
-    # provenance: the compliant "PR open -> refused -> merge -> close" sequence
-    # must not leave a weaker record than a post-hoc `task deliver --pr=` repair.
-    #
-    # Never overwrite a concurrently supplied binding. The initial read above
-    # was empty, but a `task deliver` can race this network scan; the WHERE keeps
-    # its explicit pointer authoritative. Stamp the current loop iteration for
-    # the DIVE-2682 stale-binding guard, even though ordinary non-loop rows use 0.
-    if [[ -n "$_auto_hit" && -n "$_sc_hit_slug" ]]; then
-      local _auto_ref _stored_ref
-      _auto_ref="https://github.com/${_sc_hit_slug}/pull/${_auto_hit}"
-      db "UPDATE tasks
-            SET delivery_ref=$(sqlq "$_auto_ref"),
-                delivered_at=datetime('now'),
-                delivery_ref_iteration=COALESCE(iteration,0)
-          WHERE id=${id} AND COALESCE(delivery_ref,'')='';"
-      _stored_ref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};")
-      if [[ "$_stored_ref" == "$_auto_ref" ]]; then
-        warn "$ident: auto-detected delivery PR $_auto_ref from its title/head branch and persisted the binding (DIVE-2316)."
-      else
-        warn "$ident: auto-detected delivery PR $_auto_ref, but preserved the concurrently recorded binding $_stored_ref (DIVE-2316)."
-      fi
-    fi
     # DIVE-1935: SAY SO when the scan could not run. A fail-open gate that returns
     # "no hit" for a gh outage and "no hit" for a clean repo is indistinguishable
     # from a working one — the same succeeding-in-appearance shape DIVE-1922 was
@@ -4102,23 +3608,6 @@ _task_status_cmd() {
       # reporting real failures, that proxy made a partial bot-rail scan announce
       # itself as "no-gh-token": wrong, and the more reassuring of the two.
       [[ $_sc_total -gt 0 && $_sc_ok -lt $_sc_total ]] && _scan_why="partial-repo-scan-${_sc_ok}-of-${_sc_total}"
-      # DIVE-2770: the anonymous rail makes _gate_gh_reachable true for a caller
-      # who holds nothing, so this loop is now ENTERED where it used to be skipped
-      # — and every repo declines, because the anon rail deliberately does not
-      # serve the open-PR listing (see _gate_anon_gh). "partial-repo-scan-0-of-3"
-      # would then name a coverage problem where there is a credential one: zero
-      # answers with no token and no bot is not partial coverage, it is no rail for
-      # THIS query.
-      #
-      # NOTE THE `_sc_total -gt 0`, which is the whole care in this line. Without it
-      # this also relabels the case where the loop was never ENTERED at all — the
-      # pre-2770 no-rail state, which three sibling harnesses assert as
-      # `no-gh-token` and which this ticket did not change. A new label belongs only
-      # on the new situation; widening it to an old one is churn wearing a fix's
-      # clothes.
-      if [[ $_sc_total -gt 0 && $_sc_ok -eq 0 && -z "$_ghtok2" ]] && ! _gate_gh_bot_ok; then
-        _scan_why="no-gh-rail-for-listing"
-      fi
       warn "$ident: merge-gate could not query GitHub ($_scan_why) — this close is UNVERIFIED, not verified-clean (DIVE-1935)."
       _task_store_audit_log "task.merge-gate-unverified" ok 0 -- "$ident" "reason=$_scan_why"
       _mg_unverified="${_mg_unverified:+$_mg_unverified; }repo scan did not complete ($_scan_why)"
@@ -4724,10 +4213,8 @@ _task_route_to_verifier() {
   # moments is what would false-REFUSE the well-behaved maker who re-points the
   # binding and delivers in one breath.
   #
-  # Only cmd_task_deliver passes 1: it is the only caller of THIS helper that
-  # just (re)pointed the binding. DIVE-2316's merge-gate discovery write is a
-  # separate writer on the non-loop close path and never calls this helper.
-  # A plain `task done`
+  # Only cmd_task_deliver passes 1: it is the sole writer of delivery_ref, so it
+  # is the only caller that just (re)pointed the binding. A plain `task done`
   # re-delivery passes 0 and deliberately leaves the stamp behind at its old
   # iteration — that gap IS the signal the gate reads.
   local set_binding_iter=""
@@ -5019,10 +4506,9 @@ cmd_task_loops() {
 
   [[ "$watch_secs" =~ ^[1-9][0-9]*$ ]] || fail "$E_VALIDATION" "--watch=<seconds> must be a positive integer"
   # A loop is "stuck" once it has a cap, has reached it, and still isn't closed.
-  # OSS-37: the definition moved to _task_stuck_loop_pred (lib/tasks_db.sh) when the
-  # objective planner became its second caller. Held here as a local it could only be
-  # reused by re-typing, and two copies that agree today is the thing DIVE-1963 named.
-  local stuck_pred; stuck_pred="$(_task_stuck_loop_pred)"
+  local stuck_pred="(verifier IS NOT NULL AND max_iterations IS NOT NULL
+                     AND COALESCE(iteration,0) >= max_iterations
+                     AND status NOT IN ('done','cancelled'))"
   local where="verifier IS NOT NULL"
   (( show_all )) || where+=" AND status NOT IN ('done','cancelled')"
   (( only_stuck )) && where+=" AND ${stuck_pred}"
@@ -10238,100 +9724,6 @@ cmd_task_clear_recs() {
      '{cleared:($n|tonumber), gates:$g}' --arg n "$n" --argjson g "$gates_json"
 }
 
-# DIVE-2572: does a loop-gate answer BOUNCE to the previous step, or ADVANCE?
-#
-# THE DEFECT THIS REPLACES: five BARE SUBSTRING tests over the whole free-text
-# answer — *"better"*, *"reject"*, *"deny"*, *"denied"*, *"declin"*. Any answer
-# containing those letters ANYWHERE was classified as a bounce, whatever it
-# actually decided.
-#
-# MEASURED ON THE LIVE BOARD before choosing a fix, because the row asked for
-# that rather than a hunch: 268 answered gates, 14 carry a trigger substring. Of
-# the answers that are a HUMAN decision on a loop-shaped row, FIVE OF FIVE would
-# have been misclassified as bounces, and every one of them APPROVES:
-#   DIVE-2552  "approve — ..."      trigger: "uppercase is rejected" (what a regex does)
-#   DIVE-2565  "approve — ..."      trigger: "deny-by-default flow"  (a design pattern's NAME)
-#   DIVE-2596  "approve — ..."      trigger: "See my reject feedback on this task"
-#   CNCL-9     "clear-now ..."      trigger: "the rebase I filed in the reject"
-#   DIVE-1572  "a — render inline"  trigger: "B rejected:" (naming the option NOT chosen)
-# The only true denials in the whole set are the bare word "denied" (DIVE-1513,
-# DIVE-1614) — short, leading, unambiguous.
-#
-# THE FAILURE IS SYSTEMATIC, NOT RANDOM, and that is what settles the design: an
-# approval that RESOLVES a previous bounce naturally cites that bounce ("see my
-# reject feedback", "the rebase I filed in the reject"), and a decision between
-# options names the option it turned down ("B rejected"). So the reviewer doing
-# the most careful job — referring back to what they asked for — is the one most
-# likely to be read as bouncing. Option (d) from the row ("prose answers are the
-# exception") is refuted by the same data: prose is what substantive answers ARE.
-#
-# SO: read the decision out of the DECISION SEGMENT (option (b)) — the first
-# non-blank line up to the first em-dash, colon, semicolon, comma or stop — and
-# warn rather than silently choose when a trigger appears later in the prose.
-#
-# Option (a), anchoring to the leading TOKEN, was built first and refuted by the
-# existing suite: task_answer_cancelled_loop_bounce_unit went 5/7 on the fixture
-# "Do better ↩", an ordinary bounce whose decision word is the SECOND token.
-# Short imperatives are the register a real bounce is written in, so the leading
-# token trades one systematic miss for another. Recorded because it generalises:
-# the measurement above sampled only FALSE POSITIVES and said nothing about what
-# TRUE bounces look like, and the true-bounce shape is what killed design (a).
-#
-# THREE THINGS INHERITED FROM THE SAME DEFECT ONE FILE OVER (DIVE-2614,
-# community/wiki/a-verdict-regex-scans-every-line-not-the-verdict.md), applied
-# here deliberately rather than rediscovered:
-#   1. WORD BOUNDARY. Without \b, "deny" prefix-matches nothing useful but
-#      "better" matches "betterment" and "decline" matches "declined" only by
-#      accident of stemming.
-#   2. INFLECTIONS ARE ENUMERATED BY HAND. With \b, `reject` no longer matches
-#      "rejected" — that gap has now been confirmed three times in this codebase.
-#      Collapsing to (reject|deny|declin)(e|es|ed|ing)?\b is NOT equivalent: it
-#      re-admits stems we never intended. Any new stem needs its forms added here.
-#   3. FIRST NON-BLANK LINE, NOT LINE 1. A leading blank line would otherwise
-#      make the verdict read empty — and empty means ADVANCE here, i.e. a false
-#      APPROVE, which is the worse direction and exactly the trap main caught in
-#      review on DIVE-2614. `|| true` because grep exits 1 on an all-blank value
-#      and pipefail would kill the caller.
-#
-# "better" is kept, but only inside the decision segment. Unanchored it was the
-# worst arm in the set ("approve, this is better than the alternative" bounced);
-# in a decision segment it is a real bounce signal ("better: rework it", "Do
-# better").
-#
-# THE SAFETY PROPERTY THIS RELIES ON IS ABOUT SEGMENTS, NOT ABOUT FIRST WORDS, and
-# it is measured rather than assumed (olivia's reject, iteration 1 — the earlier
-# comment claimed "no answer on the board STARTS with it", which is a different
-# and weaker claim than the code needs). Swept all 268 answered gates on the live
-# board and extracted each one's decision segment: exactly TWO carry any stem at
-# all — DIVE-1513 and DIVE-1614, both the bare word "denied", both true denials —
-# and ZERO carry "better". So on the entire recorded population this rule fires
-# twice and is right both times.
-# Note the scope: that is a statement about answers ALREADY WRITTEN, not a
-# guarantee about future phrasing. It is why the advisory below exists.
-#
-# Returns 0 for BOUNCE, 1 for ADVANCE. Sets _LOOP_BOUNCE_AMBIGUOUS=1 when the
-# answer ADVANCES but carries a trigger word later on, so the caller can say so.
-_LOOP_BOUNCE_STEMS='reject|rejects|rejected|rejecting|deny|denies|denied|denying|decline|declines|declined|declining|better'
-_loop_answer_is_bounce() {
-  local _v="${1:-}" _first="" _seg=""
-  _LOOP_BOUNCE_AMBIGUOUS=0
-  _first=$(printf '%s' "$_v" | grep -m1 -v '^[[:space:]]*$' || true)
-  _first="${_first#"${_first%%[![:space:]]*}"}"
-  # THE DECISION SEGMENT: the first non-blank line, cut at the first em-dash,
-  # colon, semicolon, comma or sentence stop. Everything after that is the
-  # REASONING, and the reasoning is where the false positives live.
-  _seg="${_first%%[—:;,.]*}"
-  if printf '%s' "$_seg" | grep -qE "\b(${_LOOP_BOUNCE_STEMS})\b"; then
-    return 0
-  fi
-  # Advancing — but say so when the vocabulary appears anywhere, rather than
-  # silently choosing. This is the compatibility window: it surfaces the real
-  # population before anything is gated on it
-  # (community/wiki/a-control-partitions-a-population-and-populations-drift.md).
-  printf '%s' "$_v" | grep -qE "\b(${_LOOP_BOUNCE_STEMS})\b" && _LOOP_BOUNCE_AMBIGUOUS=1
-  return 1
-}
-
 cmd_task_answer() {
   tasks_db_init
   local value="" value_set=0 from="" human=0 human_proof="" channel_proof="" channel_msg=""
@@ -10455,15 +9847,12 @@ cmd_task_answer() {
   # recorded, and refusing there would leave a gate answered under a non-zero rc.
   local _lk _loop_bounce=0 _run="" _prev="" _prev_status="" _prev_ident="" _lv=""
   _lk=$(_loop_kind "$id")
-  # DIVE-2572: the bounce/advance decision is read from the DECISION SEGMENT (the
-  # first non-blank line up to its first dash/colon/comma/stop), not from a bare
-  # substring over the whole answer. See _loop_answer_is_bounce.
   if [[ "$_lk" == gate:* ]]; then
     # Resolve the relay direction before any answer write.  A refusal below must
     # leave the gate pending; discovering the cancelled predecessor after the
     # answer was stamped would make a non-zero return lie about what committed.
     _lv=$(printf '%s' "${value:-}" | tr '[:upper:]' '[:lower:]')
-    if _loop_answer_is_bounce "$_lv"; then
+    if [[ "$_lv" == *"better"* || "$_lv" == *"reject"* || "$_lv" == *"deny"* || "$_lv" == *"denied"* || "$_lv" == *"declin"* ]]; then
       _loop_bounce=1
       _run=$(db "SELECT COALESCE(parent_id,'') FROM tasks WHERE id=${id};")
       _prev=$(db "SELECT id FROM tasks WHERE parent_id=${_run:-0} AND id<${id} AND body LIKE '%${_LOOP_MARK}:%' ORDER BY id DESC LIMIT 1;")
@@ -10471,14 +9860,6 @@ cmd_task_answer() {
         _prev_status=$(db "SELECT status FROM tasks WHERE id=${_prev};")
         _prev_ident=$(db "SELECT ident FROM tasks WHERE id=${_prev};")
       fi
-    elif (( ${_LOOP_BOUNCE_AMBIGUOUS:-0} )); then
-      # DIVE-2572: ADVANCING, and the answer carries bounce vocabulary later in
-      # its prose. Under the old bare-substring matcher this exact shape was
-      # classified as a BOUNCE — five for five on the live board. Naming it is
-      # the compatibility window: a reader who genuinely meant to bounce learns
-      # the form in the one place they will read it, and nobody's careful prose
-      # is silently reinterpreted in the meantime.
-      warn "$ident: answered as ADVANCE. The decision is read from the first line up to its first dash/colon/comma/stop, and this answer carries bounce vocabulary only AFTER that — under the previous matcher its presence anywhere would have bounced this to the previous loop step (DIVE-2572). If you meant to BOUNCE, put the word in that opening segment: 'reject — <why>', or 'do better'."
     fi
   fi
   # DIVE-2261: cancellation is an abandonment record, not completed work ready
@@ -10743,8 +10124,7 @@ cmd_task_answer() {
     # sufficient — that was the sudo→--human forge (DIVE-916 threat).
     # (_hp/_su declared at function scope above — DIVE-2406 reads them at the stamp.)
     [[ -n "$human_proof" ]] && _human_nonce_verify "$id" "$human_proof" && _hp=1
-    # DIVE-2371: AUTHORIZATION site — structural principal test, fails closed.
-    _gate_human_principal && _su=1
+    _gate_sudo_uid_nonagent && _su=1
     # DIVE-1305: a verified paired-human channel proof is the fourth evidence
     # form — but _cp_ok is already gated to tier<2 above, so it can satisfy the
     # evidence rule only for a tier-1 approval/access gate (never a tier-2 hard
@@ -10909,8 +10289,7 @@ cmd_task_answer() {
     if [[ -n "$_t2_hash" ]]; then
       local _t2_hp=0 _t2_su=0
       [[ -n "$human_proof" ]] && _human_nonce_verify "$id" "$human_proof" && _t2_hp=1
-      # DIVE-2371: AUTHORIZATION site (tier-2 floor) — same structural test.
-      _gate_human_principal && _t2_su=1
+      _gate_sudo_uid_nonagent && _t2_su=1
       # DIVE-2412: THE CITATION IS THE THIRD EVIDENCE FORM, and it has to be named
       # HERE rather than only in the `human` flag it also raises. This site is what
       # decides whether a tier-2 `--human` claim was PROVED, and it is scoped to

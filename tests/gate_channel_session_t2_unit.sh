@@ -83,16 +83,6 @@ audit_log() { :; }
 # 1 = false = an agent-* caller contributes no sudo-uid evidence.
 _PIN_SUDO_HUMAN=1
 _gate_sudo_uid_nonagent() { return "$_PIN_SUDO_HUMAN"; }
-# DIVE-2371: authorization = this uid test AND a STRUCTURAL cgroup test
-# (`_gate_human_principal`). CS13 flips the pin to the non-agent case, so the
-# second half has to follow the SAME switch — otherwise CS13 reads the host's real
-# cgroup, the sudo-uid evidence never appears alongside the channel-session, and
-# the differential pin this file relies on silently stops being differential.
-# Stub the READER only; the accept/deny logic stays the shipped bytes.
-_gate_caller_cgroup() {
-  if [[ "$_PIN_SUDO_HUMAN" == "0" ]]; then printf '%s' '/system.slice/shelld.service'
-  else printf '%s' '/system.slice/system-5dive.slice/5dive-agent@dev.service'; fi
-}
 # DIVE-2601: the `id -un` stub that used to sit here was measured at ZERO
 # invocations across a full run of this file — nothing asks it, so it named a
 # caller nobody read. Deleted rather than left as documentation of a control that

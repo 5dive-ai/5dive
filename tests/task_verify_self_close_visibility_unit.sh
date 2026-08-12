@@ -133,14 +133,7 @@ before=$(wc -l <"$AUDIT_CALLS")
 unknown_out=$(run_with_identity "" nobody verify "$U" --cmd=true); unknown_rc=$?
 after=$(wc -l <"$AUDIT_CALLS")
 [[ $unknown_rc -ne 0 && "$(col "$U" status)" == "todo" \
-   # DIVE-2483 (iteration 2): was a PREFIX match on the verdict. That pinned the
-   # WIPE in a subtler form than an equality would — on a DELIVERED (open) row the
-   # maker's record now correctly sits ABOVE the verdict, so the verdict is no
-   # longer the prefix. Every other assertion in this arm is untouched and still
-   # does the real work: rc!=0, status stays todo, no self-verified-close marker,
-   # audit unchanged, and the refusal names the unauthenticated caller.
-   && "$(col "$U" result)" == *"✅ verify PASS (exit 0): true"* \
-   && "$(col "$U" result)" == *"maker delivery"* \
+   && "$(col "$U" result)" == "✅ verify PASS (exit 0): true"* \
    && "$(col "$U" result)" != *"self-verified-close"* && "$before" == "$after" \
    && "$(cat "$TMP/err")" == *"caller identity could not be authenticated"* ]] \
   && ok_t "unidentified caller records PASS evidence but cannot close a delivered loop" \

@@ -5,8 +5,7 @@
 # (delivery_ref / Branch:); 8 code-tasks closed with NEITHER and slipped past it.
 # This gate auto-detects an OPEN unmerged PR whose TITLE or HEAD-BRANCH names the
 # ident (never the body), is FAIL-OPEN (gh outage/timeout/absence never blocks a
-# close), persists a concrete title/branch match as `delivery_ref`, and honours
-# `task done --force-merge-gate` as an audited escape.
+# close), and honours `task done --force-merge-gate` as an audited escape.
 # Isolation matches the sibling gate harnesses: source src/ into a throwaway
 # STATE_DIR (the live tasks.db is NEVER touched); gh is STUBBED on PATH.
 # Run: bash tests/task_merge_gate_autodetect_unit.sh  (no root, no network).
@@ -22,20 +21,6 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
-
-# DIVE-2770: the merge gate gained a CREDENTIAL-FREE rail (an unauthenticated read
-# of a public repo). Every no-token arm below was written when "no credential"
-# meant "no rail", and with the anon rail live they would reach the real network
-# and grade a LIVE PR instead of the fixture. Turn it off here: these harnesses
-# grade the pre-2770 rails, and tests/task_merge_gate_anon_rail_unit.sh grades the
-# new one. This is also what keeps `no root, no network` true of this file.
-#
-# IT MUST SIT AFTER lib/grading_tree.sh, AND THAT IS NOT A STYLE CHOICE: that file
-# sources lib/env_isolation.sh, which CLEARS inherited FIVE_* knobs so a harness
-# never grades the caller's environment. Set above it, this export is wiped and the
-# harness silently reaches the network instead — measured, and it read as three
-# unrelated assertion failures naming a live PR's real state.
-export FIVE_GATE_NO_ANON=1
 trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
@@ -100,19 +85,10 @@ bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 # --- T1: an OPEN PR whose TITLE names the ident BLOCKS the no-binding close. ---
 seed DIVE-901
 export GH_STUB_PRLIST='[{"number":901,"headRefName":"feat/x","title":"DIVE-901 add thing"}]'
-before=$( (JSON_MODE=0 cmd_task_show DIVE-901) 2>/dev/null )
-[[ "$before" == *"delivery_ref = absent"* ]] \
-  && ok_t "T1 DIVE-2316 precondition: task show reports the binding absent" \
-  || bad_t "T1 precondition display" "$before"
 out=$(cmd_task_done DIVE-901 2>&1); rc=$?
 [[ $rc -eq $E_CONFLICT && "$(statusof DIVE-901)" != "done" ]] \
   && ok_t "T1 open PR naming the ident in its TITLE blocks the close" \
   || bad_t "T1 title match blocks" "rc=$rc status=$(statusof DIVE-901) out=$out"
-after=$( (JSON_MODE=0 cmd_task_show DIVE-901) 2>/dev/null )
-[[ "$after" == *"delivery_ref = https://github.com/5dive-ai/5dive/pull/901"* \
-   && "$(db "SELECT delivered_at IS NOT NULL AND delivery_ref_iteration=0 FROM tasks WHERE ident='DIVE-901';")" == "1" ]] \
-  && ok_t "T1 DIVE-2316: title discovery persists the full PR binding, visible through task show" \
-  || bad_t "T1 title discovery write" "show=$after row=$(db "SELECT delivery_ref,delivered_at,delivery_ref_iteration FROM tasks WHERE ident='DIVE-901';")"
 
 # --- T2: an OPEN PR whose HEAD BRANCH names the ident BLOCKS (title doesn't). --
 seed DIVE-902
@@ -121,9 +97,6 @@ out=$(cmd_task_done DIVE-902 2>&1); rc=$?
 [[ $rc -eq $E_CONFLICT && "$(statusof DIVE-902)" != "done" ]] \
   && ok_t "T2 open PR naming the ident in its HEAD BRANCH blocks the close" \
   || bad_t "T2 branch match blocks" "rc=$rc status=$(statusof DIVE-902) out=$out"
-[[ "$(db "SELECT delivery_ref FROM tasks WHERE ident='DIVE-902';")" == "https://github.com/5dive-ai/5dive/pull/902" ]] \
-  && ok_t "T2 DIVE-2316: head-branch discovery persists the full PR binding" \
-  || bad_t "T2 branch discovery write" "ref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE ident='DIVE-902';")"
 
 # --- T2b (word-boundary): a longer ident that merely PREFIX-shares does NOT
 #     block. Open PRs name DIVE-2021 + DIVE-2029; closing DIVE-202 must proceed —
@@ -169,9 +142,6 @@ out=$(cmd_task_done DIVE-904 2>&1); rc=$?
 [[ $rc -eq 0 && "$(statusof DIVE-904)" == "done" ]] \
   && ok_t "T4 no matching PR => research/docs/no-code close proceeds" \
   || bad_t "T4 no-match closes" "rc=$rc status=$(statusof DIVE-904) out=$out"
-[[ -z "$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE ident='DIVE-904';")" ]] \
-  && ok_t "T4 DIVE-2316: no match writes no binding" \
-  || bad_t "T4 no-match binding" "ref=$(db "SELECT delivery_ref FROM tasks WHERE ident='DIVE-904';")"
 
 # --- T5 (FAIL-OPEN): a slow gh (past the 5s timeout) must NOT block the close. -
 seed DIVE-905

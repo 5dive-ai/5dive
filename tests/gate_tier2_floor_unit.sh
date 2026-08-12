@@ -104,15 +104,6 @@ tierof()  { db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='$1';"; }
 # own header claims, rather than weakening an assertion.
 export SUDO_UID=0
 _gate_is_root() { return 0; }
-# DIVE-2371: the human-evidence test grew a STRUCTURAL half — the authorization
-# sites now call `_gate_human_principal` = the uid test AND `_gate_cgroup_human_capable`.
-# Same reasoning as the root seam directly above, one predicate later: the caller
-# this harness DESCRIBES is the dashboard exec / post-sudo human-on-box, and that
-# surface is an ACCEPTED cgroup, so pin it rather than weaken an assertion. Left
-# unpinned, T2 reads the host's real cgroup (an agent unit, or a CI runner), the
-# tier-2 guard refuses correctly, and the arm grades the fixture instead of the
-# floor. Stub the READER only; accept/deny stays the shipped bytes.
-_gate_caller_cgroup() { printf '%s' '/system.slice/shelld.service'; }
 
 touch "$GATE_PROOF_ENFORCE"   # enforcement ON for the floor tests
 
