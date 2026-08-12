@@ -1,4 +1,19 @@
 #!/usr/bin/env bash
+# TIER: nightly — 12.3s measured on ubuntu-latest by the core/pristine-confirm runner
+# itself (run 31554029604, 2026-08-12, the tier report's own top-10 line; 10.0s on the
+# faster core/pristine box in the same run), and that is BEFORE the vestigial-poll fix
+# one commit back on this branch. The cost is the FIXTURE, not the arms: this harness
+# stands up the REAL council seal (see the note below — stubbing `_gate_standing_lead`
+# would grade the stub) and sources 20+ files of src/ to do it. tests/gate_lead_standing_
+# unit.sh, whose seal fixtures this file deliberately mirrors, is ALREADY nightly at
+# 26.4s for exactly that reason (DIVE-2525). Two harnesses anchored on one expensive
+# fixture belong in one tier; core kept the cheaper half of a pair by accident, not by
+# argument.
+#
+# WHAT IS NOT LOST. `changed-harnesses` runs this file on any PR that touches it, and
+# that job's cap is on PROBING only — the plain run "stays uncapped, because the harness
+# you touched runs is the promise". A routing change is therefore still graded at the
+# moment it is written; what stops is paying 12s on every PR that touches nothing here.
 # DIVE-3171: EVERY gate the ORG ROOT files reached the paired human by construction.
 # `_gate_route_reviewer` walks reports_to then the coordinator/root, skipping any
 # candidate equal to the filer — so for the ROOT both candidates ARE the filer, the walk

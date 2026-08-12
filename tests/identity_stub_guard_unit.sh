@@ -1,4 +1,24 @@
 #!/usr/bin/env bash
+# TIER: nightly — 11.1s measured on ubuntu-latest by the core/pristine-confirm runner
+# itself (run 31554029604, 2026-08-12, the tier report's own top-10 line; 8.2s on the
+# faster core/pristine box in the same run). Demoted under the MUTATION-HARNESS RULE
+# (DIVE-2867): a mutant-killing grader re-scans a corpus once per mutant, so its cost is
+# mutants x corpus-walk BY CONSTRUCTION and does not shrink with tuning. A7 mutates every
+# file in population B (53 today) and A8 every file in population A (8), and the header
+# below says so in its own words — "this harness gets more expensive with every harness
+# anyone adds". That is the class DIVE-2867 already decided is nightly.
+#
+# WHY IT WAS MISSED THEN AND NOT NOW. DIVE-2867 enumerated the class by FILENAME —
+# `tests/*_mutation.sh`, six files, three already nightly and three demoted, explicitly
+# "to make the class uniform rather than picking files by size". This file mutates by
+# construction and is named `_unit.sh`, so a census keyed on the suffix could not return
+# it. The rule was right; its enumeration was keyed on the name instead of the shape.
+#
+# WHAT IS NOT LOST. The demotion changes WHEN, never WHAT: every arm runs unchanged in
+# the nightly sweep, and `changed-harnesses` runs this file on any PR that touches it —
+# that job is capped for PROBING only and its plain run "stays uncapped, because the
+# harness you touched runs is the promise". So the guard still fires at the moment a
+# harness is edited; what stops is paying 11s on the 297 PRs that touch nothing here.
 # tests/identity_stub_guard_unit.sh — DIVE-2601.
 #
 # THE CLASS THIS GUARD CLOSES. Since DIVE-2330 the caller derivation does not read
