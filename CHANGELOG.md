@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
+
+`5dive agent config <name> set channels=<current>,buzz` could not succeed on any seat that was not
+**created** with buzz. `cmd_config` dispatches `install_channel_for_agent` for telegram, discord and
+dashboard; there was no buzz block. The fail-closed staging gate below it *does* check buzz — it
+polls 15s for `~/.claude/plugins/cache/5dive-plugins/buzz` and fails when absent — so the gate was
+**unsatisfiable**, not merely strict. Its own remediation text (`Re-run: … set channels=<same>`)
+re-entered the identical path and failed identically, forever.
+
+Worse, the registry and `agents.d/<name>.env` writes commit hundreds of lines **ahead** of that
+gate. A refused call therefore left the seat declaring `channels: telegram,buzz` with no plugin
+staged, and `5dive-agent-start` passes `--channels plugin:buzz@5dive-plugins` on the seat's next
+start (supervisor wake, reboot, `agent start`, selfupdate). The gate refused the restart it was
+watching and baked in the deaf session it existed to prevent.
+
+- **The dispatch** — `channels=…,buzz` now calls `install_channel_for_agent "$type" buzz "$name" ""`,
+  the same token-free shape as dashboard.
+- **The rollback** — a staging-gate refusal restores the pre-call channel list in both the registry
+  and the env file, so a refusal changes nothing. The message says so, and no longer advises an
+  identical re-run.
+- **The claude-only pre-check** — `channels=buzz` on a non-claude type is refused *before* the
+  registry write, matching dashboard. `install_channel_for_agent` already refused it, but only
+  after the seat had been recorded as declaring it.
+
+`tests/buzz_channel_wiring_unit.sh` 18 → 23 arms. The five-site checklist it grades was green
+throughout: it asserted every site that **recognises** buzz and none that **installs** it. The new
+arms grade the satisfier next to the gate, and drive `cmd_config` for real — with a positive control
+that the same call reaches the restart once the cache is staged, so the rollback arms cannot pass
+against a `cmd_config` that simply refuses everything.
+
 ## Unreleased — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
 
 DIVE-2483's gate answer said the preservation notice lands on **stdout**. It lands on **stderr**,

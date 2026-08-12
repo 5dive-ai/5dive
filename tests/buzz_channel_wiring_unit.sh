@@ -82,6 +82,134 @@ else
         "buzz falls through to '*) continue' — restart into a possibly-deaf session is not refused"
 fi
 
+# --- 4b. THE SATISFIER, not just the gate (DIVE-3333) -----------------------
+# Arm 4 above passed for months while `config set channels=<cur>,buzz` was
+# UNSATISFIABLE on every seat not created with buzz. A gate that names a value
+# proves the value is RECOGNISED, never that it is REACHABLE: the gate polls for
+# a plugin cache dir, and nothing in cmd_config ever created one for buzz.
+# cmd_create staged it (which is why the one seat created with --channels buzz
+# looked fine) and cmd_config did not, so the gate refused forever and its own
+# "Re-run: …" advice re-entered the identical path. Grade the dispatch that
+# SATISFIES the gate, not only the gate that reads the list.
+if grep -qE 'install_channel_for_agent "\$type" buzz "\$name"' "$SRC/cmd_agent_config.sh"; then
+  ok_t "cmd_agent_config DISPATCHES the buzz install (satisfies the gate)"
+else
+  bad_t "cmd_agent_config DISPATCHES the buzz install (satisfies the gate)" \
+        "no buzz install dispatch — the staging gate at arm 4 is unsatisfiable on any seat not CREATED with buzz"
+fi
+
+# --- 4c. claude-only pre-check lands BEFORE the registry write --------------
+# install_channel_for_agent refuses buzz on non-claude types (arm 3), but it
+# runs AFTER `registry_write`. Without a pre-loop check the refusal still leaves
+# a codex/grok/pi seat declaring a channel it can never have.
+if grep -qE 'channels=buzz is claude-only' "$SRC/cmd_agent_config.sh"; then
+  ok_t "cmd_agent_config rejects buzz on non-claude BEFORE the registry write"
+else
+  bad_t "cmd_agent_config rejects buzz on non-claude BEFORE the registry write" \
+        "a non-claude seat is left declaring buzz by a call that always fails"
+fi
+
+# --- 4d. BEHAVIORAL: a gate refusal ROLLS BACK the declared channel ---------
+# The registry + agents.d env write commit at the top of cmd_config, hundreds of
+# lines ahead of the fail-closed gate. A refusal that leaves them written does
+# not prevent the deaf session, it DEFERS it: the seat boots
+# `--channels plugin:buzz@5dive-plugins` on its next supervisor wake / reboot /
+# `agent start` / selfupdate with no plugin staged. Drive the real function with
+# an install stub that stages nothing, and assert the declared value is restored.
+# Greps cannot see this — only running it can.
+if command -v jq >/dev/null 2>&1; then
+  RB_TMP=$(mktemp -d)
+  RB_REG="$RB_TMP/agents.json"
+  export RB_HOME="$RB_TMP/home"; mkdir -p "$RB_HOME"
+  cat >"$RB_REG" <<'JSON'
+{"agents":{"rbseat":{"type":"claude","channels":"telegram"}}}
+JSON
+  (
+    set +e
+    ENV_DIR="$RB_TMP/agents.d";        mkdir -p "$ENV_DIR"
+    CONNECTORS_DIR="$RB_TMP/connectors"; mkdir -p "$CONNECTORS_DIR"
+    printf 'TELEGRAM_BOT_TOKEN=x\n' >"$CONNECTORS_DIR/telegram-rbseat.env"
+    declare -A TYPE_CHANNELS=([claude]=1)
+    ensure_state()  { :; }
+    registry_read() { cat "$RB_REG"; }
+    registry_write(){ cat >"$RB_REG"; }
+    # The stub is the whole point: it stages NO plugin cache dir, so the gate
+    # must refuse — exactly what a marketplace fetch failure looks like.
+    install_channel_for_agent() { :; }
+    write_channel_secret() { :; }
+    teardown_telegram_wiring() { :; }
+    ensure_hermes_gateway() { :; }
+    fetch_bot_username() { return 1; }
+    write_runtime_model() { :; }
+    write_runtime_effort() { :; }
+    link_agent_profile() { :; }
+    write_agent_env() { printf 'AGENT_CHANNELS=%s\n' "$3" >"$ENV_DIR/$1.env"; }
+    step() { :; }
+    ok()   { :; }
+    fail() { printf 'FAILMSG:%s\n' "${2:-}"; exit "${1:-1}"; }
+    systemd-run() { :; }        # never reached on the refusal path
+    # shellcheck source=/dev/null
+    source "$SRC/cmd_agent_config.sh"
+    cmd_config rbseat set channels=telegram,buzz
+  ) >"$RB_TMP/out" 2>&1
+  rb_rc=$?
+  rb_chan=$(jq -r '.agents.rbseat.channels' "$RB_REG" 2>/dev/null)
+  rb_env=$(grep -h '^AGENT_CHANNELS=' "$RB_TMP/agents.d/rbseat.env" 2>/dev/null | cut -d= -f2-)
+  [[ "$rb_rc" != "0" ]] \
+    && ok_t "gate refusal is a non-zero exit (rc=$rb_rc)" \
+    || bad_t "gate refusal is a non-zero exit" "rc=0 — the refusal did not fail the call"
+  [[ "$rb_chan" == "telegram" ]] \
+    && ok_t "gate refusal ROLLS BACK registry channels to the pre-call value" \
+    || bad_t "gate refusal ROLLS BACK registry channels" \
+             "registry left at '$rb_chan' (expected 'telegram') — the seat boots --channels plugin:buzz@… deaf on its next start"
+  [[ "$rb_env" == "telegram" ]] \
+    && ok_t "gate refusal ROLLS BACK the agents.d env file too" \
+    || bad_t "gate refusal ROLLS BACK the agents.d env file" \
+             "env left at '$rb_env' (expected 'telegram') — 5dive-agent-start reads THIS file"
+  grep -q 'rolled back' "$RB_TMP/out" \
+    && ok_t "the refusal message tells the operator the change was rolled back" \
+    || bad_t "the refusal message tells the operator the change was rolled back" \
+             "got: $(grep FAILMSG "$RB_TMP/out" | head -1)"
+  # POSITIVE CONTROL on the harness itself: with a stub that DOES stage the
+  # cache dir the same call must reach the restart, not the rollback. Without
+  # this arm every assertion above would still pass against a cmd_config that
+  # refuses unconditionally.
+  cat >"$RB_REG" <<'JSON'
+{"agents":{"rbseat":{"type":"claude","channels":"telegram"}}}
+JSON
+  (
+    set +e
+    ENV_DIR="$RB_TMP/agents.d"; CONNECTORS_DIR="$RB_TMP/connectors"
+    declare -A TYPE_CHANNELS=([claude]=1)
+    ensure_state()  { :; }
+    registry_read() { cat "$RB_REG"; }
+    registry_write(){ cat >"$RB_REG"; }
+    install_channel_for_agent() { mkdir -p "$RB_HOME/.claude/plugins/cache/5dive-plugins/$2"; }
+    write_channel_secret() { :; }; teardown_telegram_wiring() { :; }
+    ensure_hermes_gateway() { :; }; fetch_bot_username() { return 1; }
+    write_runtime_model() { :; }; write_runtime_effort() { :; }
+    link_agent_profile() { :; }
+    write_agent_env() { printf 'AGENT_CHANNELS=%s\n' "$3" >"$ENV_DIR/$1.env"; }
+    step() { :; }; ok() { printf 'REACHED_OK\n'; }
+    fail() { printf 'FAILMSG:%s\n' "${2:-}"; exit "${1:-1}"; }
+    systemd-run() { printf 'REACHED_RESTART\n'; }
+    # shellcheck source=/dev/null
+    source "$SRC/cmd_agent_config.sh"
+    # Point the gate's hardcoded /home/agent-<n> at the fixture tree.
+    eval "$(declare -f cmd_config | sed 's#/home/agent-\${name}#$RB_HOME#')"
+    cmd_config rbseat set channels=telegram,buzz
+  ) >"$RB_TMP/out2" 2>&1
+  if grep -q 'REACHED_RESTART' "$RB_TMP/out2"; then
+    ok_t "POSITIVE CONTROL: with the cache staged the same call reaches the restart"
+  else
+    bad_t "POSITIVE CONTROL: with the cache staged the same call reaches the restart" \
+          "never reached systemd-run — the rollback arms above may be passing against an unconditional refusal. out2: $(head -3 "$RB_TMP/out2" | tr '\n' ' ')"
+  fi
+  rm -rf "$RB_TMP"
+else
+  printf 'SKIP - rollback behavioral arms (no jq on PATH)\n'
+fi
+
 # --- 5. 5dive-agent-start emits the channel arg, claude-only ----------------
 if grep -qE 'ARGS\+=\(--channels "plugin:buzz@5dive-plugins"\)' 5dive-agent-start; then
   ok_t "5dive-agent-start emits --channels plugin:buzz@5dive-plugins"

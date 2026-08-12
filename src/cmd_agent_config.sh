@@ -1,9 +1,10 @@
 cmd_config() {
   # Usage: 5dive agent config <name> set <key>=<value> [<key>=<value>...]
   #   keys:
-  #     channels                  (none|telegram|discord|dashboard, comma-
+  #     channels                  (none|telegram|discord|dashboard|buzz, comma-
   #                                separable — "telegram,dashboard" runs both;
-  #                                dashboard is claude-only and token-free)
+  #                                dashboard and buzz are claude-only and
+  #                                token-free)
   #     model                     (model id for the agent's CLI — claude/codex/
   #                                grok/antigravity; written into the type's
   #                                runtime config, applied on the deferred restart)
@@ -37,6 +38,15 @@ cmd_config() {
     || fail "$E_NOT_FOUND" "no agent named '$name'"
   local type
   type=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
+  # DIVE-3333: the channels value as it stands BEFORE this call mutates $reg.
+  # The registry write (below) commits ahead of the channel dispatch and the
+  # fail-closed staging gate, so a gate refusal would otherwise leave the seat
+  # declaring a channel it has no plugin for — and the next start (supervisor
+  # wake, reboot, `agent start`, selfupdate) passes `--channels plugin:<ch>@…`
+  # into a session with no such plugin. That is the deaf session the gate
+  # exists to prevent. Keep the pre-call value so the gate can roll back.
+  local prev_channels
+  prev_channels=$(jq -r --arg n "$name" '.agents[$n].channels // "none"' <<<"$reg")
   # env_dirty marks that we need to rewrite agents.d/<name>.env from the
   # post-update registry at the end — channels/workdir/auth-profile all live there.
   local env_dirty=0
@@ -69,6 +79,13 @@ cmd_config() {
         fi
         if [[ "$type" != "claude" ]] && channel_in_list dashboard "$v"; then
           fail "$E_VALIDATION" "channels=dashboard is claude-only (agent '$name' is type $type)"
+        fi
+        # DIVE-3333: same claude-only rule for buzz (agent_setup.sh refuses it
+        # in install_channel_for_agent, and 5dive-agent-start refuses it again).
+        # Catch it HERE, ahead of the registry write, so a codex/grok/pi seat
+        # can't be left declaring buzz by a call that was always going to fail.
+        if [[ "$type" != "claude" ]] && channel_in_list buzz "$v"; then
+          fail "$E_VALIDATION" "channels=buzz is claude-only (agent '$name' is type $type)"
         fi
         reg=$(jq --arg n "$name" --arg v "$v" '.agents[$n].channels = $v' <<<"$reg")
         channels_changed_to="$v"
@@ -338,6 +355,17 @@ cmd_config() {
     step "Installing dashboard channel for agent '$name' (type=$type)"
     install_channel_for_agent "$type" dashboard "$name" ""
   fi
+  # DIVE-3333 buzz attach. Same token-free shape as dashboard above: the buzz
+  # plugin carries no per-agent secret, so the dispatch is gated purely on
+  # channels= in this call. Without this block `config set channels=<cur>,buzz`
+  # never staged the plugin, and the fail-closed gate below — which DOES check
+  # buzz — was unsatisfiable on every seat not CREATED with buzz (cmd_create
+  # stages it, cmd_config did not). The advice it printed ("Re-run: … set
+  # channels=<same>") re-entered the identical path and failed identically.
+  if [[ -n "$channels_changed_to" ]] && channel_in_list buzz "$channels_changed_to"; then
+    step "Installing buzz channel for agent '$name' (type=$type)"
+    install_channel_for_agent "$type" buzz "$name" ""
+  fi
   if [[ -n "$new_model" ]]; then
     step "Writing model=$new_model into $type runtime config"
     write_runtime_model "$type" "$name" "$new_model"
@@ -371,8 +399,27 @@ cmd_config() {
       while [[ ! -d "$gate_dir" ]] && (( gate_waited < 15 )); do
         sleep 1; gate_waited=$((gate_waited + 1))
       done
-      [[ -d "$gate_dir" ]] || fail "$E_GENERIC" \
-        "$gate_ch plugin not staged for agent '$name' ($gate_dir missing) — refusing to restart into a session with no $gate_ch tool. Re-run: sudo 5dive agent config $name set channels=$channels_changed_to"
+      if [[ ! -d "$gate_dir" ]]; then
+        # DIVE-3333: roll the declared channel list back to its pre-call value
+        # before failing. The registry + agents.d env write committed above,
+        # long before this gate; leaving them means we refuse the restart here
+        # but the seat still boots `--channels plugin:<ch>@<marketplace>` on
+        # its NEXT start (supervisor wake, reboot, `agent start`, selfupdate)
+        # with no plugin staged — exactly the deaf session this gate exists to
+        # prevent, just deferred. Rolling back keeps the refusal honest: the
+        # call fails and changes nothing.
+        local rb_reg
+        rb_reg=$(registry_read)
+        rb_reg=$(jq --arg n "$name" --arg v "$prev_channels" \
+          '.agents[$n].channels = $v' <<<"$rb_reg")
+        printf '%s\n' "$rb_reg" | registry_write
+        local rb_workdir rb_profile
+        rb_workdir=$(jq -r --arg n "$name" '.agents[$n].workdir // empty' <<<"$rb_reg")
+        rb_profile=$(jq -r --arg n "$name" '.agents[$n].authProfile // empty' <<<"$rb_reg")
+        write_agent_env "$name" "$type" "$prev_channels" "$rb_workdir" "$rb_profile"
+        fail "$E_GENERIC" \
+          "$gate_ch plugin not staged for agent '$name' ($gate_dir missing) — refusing to restart into a session with no $gate_ch tool. No restart fired and channels was rolled back to '$prev_channels'; the seat is unchanged. Re-running the same command will fail the same way — check that the $gate_marketplace marketplace is reachable for user agent-$name (\`sudo -u agent-$name ls ~/.claude/plugins/cache/$gate_marketplace\`) and see the install output above for why staging did not complete."
+      fi
     done
   fi
   # Defer the restart so the calling process (often `sudo -n 5dive agent
