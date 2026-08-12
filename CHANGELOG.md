@@ -1,6 +1,105 @@
 # Changelog
 
-## Unreleased — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
+## v0.19.27 — feat(agent): `agent send` enforces a ROUND cap, not a character cap (DIVE-3318)
+
+The a2a terseness rule has been live in `CLAUDE.md` and unenforced. It is now a refusal in
+both delivery paths.
+
+**Not a character cap, and the measurement is why.** `agent-audit.log` has carried `bytes=`
+on every send since DIVE-2797 and nobody had read it. Over the 24h to 2026-08-12T05:38Z on
+this box: **1047 messages, 1624 KB — roughly 415k tokens of text against ~97M tokens of
+fleet burn, 0.43%.** Message LENGTH is not the cost. A character cap would target the wrong
+axis and would strip exactly the evidence blocks worth sending. The cost is that each
+inbound makes the recipient re-read logs, re-check state and re-derive — a 2 KB message is
+answered with twenty tool calls, which is also why "be concise" does not work.
+
+Two controls, deliberately **not** the same strength — a control may only refuse what it can
+actually identify:
+
+- **Round cap — a WARNING.** Two sends per (sender → recipient → topic), rolling 24h; the
+  third and later warn on stderr, naming the count, the row and the remedy (`task set-body`),
+  and the send proceeds. Topic is the first task ident in the body, or the pair itself when
+  there is none. Per direction, so a topic affords two full exchanges before it says anything.
+
+  The row as filed said "refuse, not warn". That was overturned on the gate by a day of
+  evidence: on DIVE-3320 the same day, **every message that made the work right arrived at
+  round 3 or later** — a local-path-origin correction (502 phantom commits), a
+  multi-commit-squash correction, an `--all` correction (19,060 was an artifact), plus the two
+  rounds that produced the staged-vs-safe distinction. A hard cap would have shipped a wrong
+  recipe to eight seats. **A round counter cannot tell agreement from a correction, and the
+  correction is the expensive one to lose** — so the counter warns, and the warning explicitly
+  tells a correction to send anyway.
+- **Acknowledgement refusal — still a REFUSAL.** The ack detector *can* see that a message
+  carries nothing, which is exactly what the counter cannot do. A short body that is substantially "ack / agreed / taking it
+  / thank you" and carries no RESULT, EVIDENCE, BLOCKER, NEXT or question is refused and
+  costs no round. A message that merely *opens* with "agreed —" and then reports something
+  is not an ack and is not touched.
+
+Enforced in **both** `cmd_send` (direct/root) and `cmd_deliver` (the scoped `_deliver` grant
+every standard-isolation agent re-execs into) — a cap in `cmd_send` alone would be a cap on
+admins, i.e. on nobody being counted. **No sender is exempt by role**: the lead was the
+largest single sender in the measurement, so a lead exemption exempts the problem. The
+one-way notification rails (gate routing, supervisor alerts) are marked as non-rounds and
+carry that marker across the `sudo` re-exec, because sudo scrubs the environment and a
+refused gate ping is a gate nobody hears about.
+
+`5dive digest` now prints the per-sender send/KB split and any topic sitting at the cap.
+
+## v0.19.27 — fix(agent): trust the agent's effective workdir so it never parks on the folder-trust dialog (DIVE-2743)
+
+`preseed_claude_agent()` writes exactly ONE trusted project into a new agent's
+`~/.claude.json`: `/home/claude/projects`. But a **sandboxed** agent's workdir defaults to
+`/home/agent-<name>`, and **any** agent created with `--workdir=<path outside the projects
+root>` lands elsewhere too — at every isolation tier, not just sandboxed. `tmux` launches
+claude with `-c "$WORKDIR"`, so those agents come up in a directory with no trust entry and
+park on the interactive *"Do you trust the files in this folder?"* dialog, which a headless
+agent cannot answer. It is the folder-trust half of the first-boot problem; the
+custom-API-key half was DIVE-1591, and this is the confound that muddied its probes.
+
+`5dive-agent-start` now seeds trust for the effective workdir before the launch.
+
+**Boot-time, not create-time.** A create-path fix would cover new agents and leave every
+already-stranded agent needing a recreate; at boot they back-fill for free on the next
+restart. It also sidesteps an ordering trap in the obvious patch: the create path calls
+`preseed_claude_agent` at `cmd_agent_create.sh:1752` and only defaults the sandboxed workdir
+at `:1885`, so threading `$workdir` through would pass an **empty string for exactly the
+sandboxed case** — a change that looks like a fix, changes nothing, and passes any harness
+that supplies an explicit `--workdir`. That patch is a graded mutant in the new harness.
+
+**The ticket assumed exact-match; the bundle does a parent walk.** Measured in the 2.1.222
+binary on this host, the trust check canonicalizes cwd and walks its parents:
+
+```js
+let n = canon(cwd);
+while (true) { if (config.projects?.[n]?.hasTrustDialogAccepted) return true;
+               let i = canon(resolve(n, "..")); if (i === n) break; n = i }
+return false;
+```
+
+That does **not** move the cause — `/home/agent-<name>` walks to `/home` then `/` and never
+meets the trusted root, so the reported stall is real. It moves the **skip condition**: a
+workdir at or *under* the root is already covered by the walk, so the seed skips it and the
+JSON stays clean. An equality-only skip would grow a redundant entry per project subdir
+forever; that is a graded mutant too.
+
+**Assert the field, not the key.** Claude Code creates the project entry *itself* on first
+visit with `hasTrustDialogAccepted: false` (the bundle's default project object), which is
+why a live probe saw the dialog re-arm on an agent whose config already carried the workdir
+key. So this is a **read-modify-write that merges the flag onto whatever entry is there**,
+not a write — and `~/.claude.json` also holds Claude Code's own state (`numStartups`,
+`machineID`, `userID`, `seenNotifications`, `pluginUsage`) beside our theme/onboarding/root
+preseed, so a `jq -n` rewrite here would trade a trust stall for a theme-picker stall.
+
+New harness `tests/workdir_trust_seed_unit.sh` (57 assertions, 0.9s measured on the 5dive control plane, core) extracts the real
+block from the real script by its guard line and runs it against fake homes and fake workdir
+roots — no root, no network, no claude binary, no host paths. It proves the extraction found
+real code before trusting a result, and it grades six mutants against the shipped bytes:
+the fix reverted, a `jq -n` rewrite, an entry added without the boolean, a guard keyed on the
+sandboxed path shape, an equality-only skip, and — the ticket's named one — the workdir
+resolved too early, i.e. the create-path patch that passes an empty string for exactly the
+sandboxed case. Every one goes red on the arm it should break.
+
+## v0.19.27 — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
 
 DIVE-2483's gate answer said the preservation notice lands on **stdout**. It lands on **stderr**,
 via the fleet's `warn()`. Six arms were written for that condition and all six were green, because
@@ -34,7 +133,7 @@ Still open and scoped out on purpose: `task reject` remains an unguarded writer 
 column (`src/cmd_task.sh:4235`). That is a design question about accumulating verifier feedback, not
 this gap.
 
-## Unreleased — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
+## v0.19.27 — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
 
 DIVE-3272 taught the supervisor BOARD to see a seat that is alive and closing nothing. The
 drill-down people actually type kept printing only liveness: `state: active / enabled` was
@@ -76,7 +175,7 @@ supervisor:  quota-exhausted / quota-exhausted — pane shows a model-capacity r
 - `agent list` is unchanged — it is the survey surface, and this is a per-agent drill-down
   (three sqlite reads), deliberately not an N-way fan-out.
 
-## Unreleased — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
+## v0.19.27 — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
 
 A gate reaches the filer's lead only if `_GATE_ENG_SHIP_RX` matches the ask or the row
 title. `gate_builder_routing` is OFF by default, so for an ordinary builder ship gate that
@@ -140,7 +239,7 @@ prose for identifiers.
   `gate_access_lead_clear`, `gate_internal_ops_floor`, `task_needs_human_parity`,
   `task_inbox_json_tier`, `push_unit`, `broker_surface`, + 15 more).
 
-## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
+## v0.19.27 — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
 
 DIVE-1935's first iteration was rejected, and for the right reason. It added a
 `sudo -n -u claude gh auth token` arm to `_gate_gh_token` justified by *"agents hold
