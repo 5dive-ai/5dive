@@ -1,3 +1,13 @@
+# DIVE-3318: `a2a_round_guard` and `a2a_rounds_report` live in src/lib/a2a_rounds.sh.
+# In the BUILT bundle that file is cat'd ahead of this one and this line is dead
+# code (build.sh's "lib/ helpers -> cmd_*" ordering). In the SPLIT tree it is
+# load-bearing: the unit harnesses source individual cmd_* files with a minimal
+# lib set, and without this an `agent send` path hits `a2a_round_guard: command
+# not found` and dies at rc=3 — which is what tests/agent_send_unconfirmed_unit.sh
+# caught. Same shape as src/cmd_task.sh's module loader.
+declare -F a2a_round_guard >/dev/null 2>&1 \
+  || . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/a2a_rounds.sh"
+
 # Shared: resolve a registry entry or die. Echo nothing on success; used for
 # presence checks in the lifecycle commands below.
 require_agent() {
@@ -1218,6 +1228,8 @@ cmd_deliver() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --id=*) msgid="${1#--id=}" ;;
+      # DIVE-3318: set by cmd_send when a notification rail re-execs into here.
+      --notify) _5DIVE_A2A_NOTIFY=1 ;;
       --)     shift; _pos+=("$@"); break ;;
       *)      _pos+=("$1") ;;
     esac
@@ -1248,6 +1260,16 @@ cmd_deliver() {
   # a registered agent. Mirrors auto_sender_from_sudo + the DIVE-1064 tier stamp.
   local s="${SUDO_USER#agent-}" _caller=""
   if [[ "${SUDO_USER:-}" == agent-* ]]; then _caller="$s"; else s="human"; fi
+
+  # DIVE-3318: the round cap on the SCOPED path. This is the branch every
+  # standard-isolation agent's `agent send` re-execs into, so a cap enforced only
+  # in cmd_send would be a cap on admins and root — i.e. on nobody who is being
+  # counted. `_caller` is the derived sudo caller, never a --from claim (_deliver
+  # accepts none), so the count cannot be spoofed onto another pair.
+  local _a2a_refusal
+  if ! _a2a_refusal="$(a2a_round_guard "$_caller" "$target" "$message")"; then
+    fail "$E_VALIDATION" "$_a2a_refusal"
+  fi
   # DIVE-2210: ALWAYS stamped, never conditional. A non-agent caller gets
   # tier=unknown:no-caller rather than a clean envelope with the field missing.
   local tier
@@ -1835,7 +1857,27 @@ cmd_send() {
     fail "$E_PERMISSION" "--wake needs admin/root; this caller holds only the a2a delivery grant — re-run via sudo, or file a task row"
   fi
   if a2a_needs_scoped "$name"; then
+    # DIVE-3318: sudo scrubs the environment, so `_5DIVE_A2A_NOTIFY` set by a
+    # notification rail would not survive this re-exec and cmd_deliver would grade
+    # a gate handoff as a conversational round — refusing the ping that tells a
+    # reviewer a gate exists. Carried across as an explicit flag instead. It is
+    # exactly as forgeable as the env var (any holder of the _deliver grant can
+    # pass it), and no more: this is a rail marker, not a privilege.
+    if [[ "${_5DIVE_A2A_NOTIFY:-0}" == "1" ]]; then
+      exec sudo -n /usr/local/bin/5dive agent _deliver --notify "$name" "$message"
+    fi
     exec sudo -n /usr/local/bin/5dive agent _deliver "$name" "$message"
+  fi
+
+  # DIVE-3318: the round cap. Placed AFTER the scoped-`_deliver` exec above, so a
+  # scoped caller is graded exactly once — by cmd_deliver, on the far side of the
+  # re-exec — and never counted twice for one send. Before require_agent only in
+  # the sense that it costs nothing; the refusal itself lands before a keystroke
+  # reaches the target's pane either way.
+  local _a2a_from _a2a_refusal
+  _a2a_from="$(_envelope_caller)"
+  if ! _a2a_refusal="$(a2a_round_guard "$_a2a_from" "$name" "$message")"; then
+    fail "$E_VALIDATION" "$_a2a_refusal"
   fi
 
   require_agent "$name"
