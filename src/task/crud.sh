@@ -142,7 +142,15 @@ cmd_task_add() {
   fi
   local parent_sql="NULL"
   if [[ -n "$parent" ]]; then
-    resolve_task_id "$parent"; parent_sql="$RESOLVED_TASK_ID"
+    # DIVE-3275: the SAME guard `task set-parent` carries, on the surface that
+    # actually misfired. `--parent=2895` filed DIVE-3273 under DIVE-2708 with no
+    # error at all — a valid global row id naming a row from another month —
+    # because the id and ident number spaces have diverged and this line took the
+    # number on faith. The remedy shipped at the time was a written rule ("always
+    # --parent=DIVE-####"); a rule is not a guard, and the wrong-row edge is
+    # invisible by construction, since it renders on a row nobody is looking at.
+    # See _task_resolve_ref_strict (src/lib/tasks_db.sh) for the measurement.
+    _task_resolve_ref_strict "$parent" "--parent"; parent_sql="$RESOLVED_TASK_ID"
   fi
   # DIVE-2449: an explicit --parent is the graph edge, so it suppresses this
   # advisory regardless of prose. Without one, measure the narrow numbered

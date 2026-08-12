@@ -2154,6 +2154,44 @@ resolve_task_id() {
   RESOLVED_TASK_IDENT=$(db "SELECT ident FROM tasks WHERE id=${found};")
 }
 
+# Resolve a task ref for a PARENT EDGE, refusing a bare number whose row carries
+# a different ident number. DIVE-3275. Lives beside resolve_task_id() because it
+# is a statement about that function's two number spaces, not about any one verb.
+#
+# resolve_task_id() branches on argument SHAPE: `^[0-9]+$` is the global row id,
+# `^[A-Za-z]+-[0-9]+$` is the ident. THE TWO SPACES HAVE DIVERGED — measured on
+# the live store 2026-08-12: DIVE-2895 is row id 3082, and row id 2895 is
+# DIVE-2708, a cancelled row from another month. So a bare number is a VALID id
+# naming the WRONG row, with no error: that is how DIVE-3273 was filed under
+# DIVE-2708, and `task add`'s own `--parent=<id>` help text is what made the bare
+# form look intended.
+#
+# Why this guard is stricter than the rest of the CLI's ref handling, rather than
+# resolve_task_id() itself being tightened: a wrong ref elsewhere shows you the
+# wrong row and you notice. A wrong PARENT is invisible (the edge renders on a
+# row nobody is looking at) and `parent_id INTEGER REFERENCES tasks(id) ON DELETE
+# CASCADE` silently arms the child's deletion with it. Tightening every caller of
+# resolve_task_id() would be a much larger behaviour change for cases that are
+# self-revealing.
+#
+# <role> names the argument in the refusal ("the parent", "the task to re-parent")
+# so a two-argument verb says WHICH one was wrong.
+_task_resolve_ref_strict() {
+  local ref="$1" role="$2"
+  resolve_task_id "$ref"
+  [[ "$ref" =~ ^[0-9]+$ ]] || return 0   # the ident form is the quiet path
+  local title; title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${RESOLVED_TASK_ID};")
+  local ident_number="${RESOLVED_TASK_IDENT##*-}"
+  if [[ "$ident_number" != "$ref" ]]; then
+    fail "$E_VALIDATION" "'$ref' as $role is the global row id, which resolves to ${RESOLVED_TASK_IDENT} (\"${title}\") — not to an ident numbered $ref. The two number spaces diverged; name the row you mean by IDENT: ${RESOLVED_TASK_IDENT} (or DIVE-${ref}, if that is what you meant)."
+  fi
+  # It agrees TODAY. That is a coincidence of this row's history, not a property
+  # of the argument form, so it still warns — and the ident form warns about
+  # nothing, which is what keeps this warning worth reading.
+  warn "$role was given as the bare number $ref, which resolved to ${RESOLVED_TASK_IDENT} (\"${title}\"). Prefer the ident form — a bare number is a global row id, not an ident."
+  return 0
+}
+
 # Resolve a known numeric row id to its display ident (DIVE-484). Used by call
 # sites that already hold the numeric id (params, subqueries) and must render a
 # user-facing label without assuming the DIVE-<id> shortcut.
