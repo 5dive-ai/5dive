@@ -270,7 +270,7 @@ DIVE-3184, DIVE-3229 and DIVE-3230 burned 3 each. On a day where main takes 20+ 
 short to answer the question the scan was asked. The `FIVE_GATE_ANCESTRY_SCAN` override stays.
 
 
-## v0.19.0 — feat(task): a filing budget the CLI ENFORCES, per filer per rolling 24h (DIVE-3245)
+## v0.19.20 — feat(task): a filing budget the CLI ENFORCES, per filer per rolling 24h (DIVE-3245)
 
 lodar's instinct (2026-08-11 07:42) was to forbid verifiers from filing low/medium rows.
 main measured it before acting and the target was wrong: **verifiers filed 10 of 1092
@@ -342,7 +342,7 @@ never saw them. Distinct refusal slug, so `task refusals` can tell the two popul
 Fails OPEN on an unreadable count, like the caps beside it: a quota that can break `task add`
 is worse than one that occasionally misses.
 
-## v0.19.0 — feat(task): cap the rubber-stamp gate at the keystroke, not in a doc (DIVE-2848)
+## v0.19.10 — feat(task): cap the rubber-stamp gate at the keystroke, not in a doc (DIVE-2848)
 
 `5dive/CLAUDE.md` line 61 has said "human gates only for money / irreversible / secrets /
 brand" since **2026-06-29**. Five weeks later lodar: *"im fighting with unnecessary human
@@ -395,7 +395,7 @@ on a plan gate carrying a Tier-2 task (better than the pin — it also stops the
 misrouted to the anchor task's verifier); `cmd_selfcheck.sh`'s forge prover does the same;
 fixtures carry the audited escape with a fixture reason.
 
-## v0.19.0 — feat(pii): the pre-push guard reaches the fleet, not one repo (DIVE-2788)
+## v0.19.3 — feat(pii): the pre-push guard reaches the fleet, not one repo (DIVE-2788)
 
 `scripts/install-pii-push-guard.sh` said **"fleet-wide"** in its own docstring and
 refused every origin but `5dive-ai/5dive`. Not an oversight — the install mechanism
@@ -460,7 +460,7 @@ branch does not exist on the remote. Fleet coverage on this host went **1 → 22
 23**; the remaining one is a worktree owned by a uid this session cannot assume, and
 its origin is a local path whose target is guarded.
 
-## v0.19.0 — fix(tasks-db): converge schemas without taxing every init (DIVE-2197, DIVE-2808)
+## v0.19.10 — fix(tasks-db): converge schemas without taxing every init (DIVE-2197, DIVE-2808)
 
 The canonical `tasks` CREATE now contains all 72 columns, including the eight that
 previously existed only in the additive migration list (`delivery_ref`,
