@@ -34,9 +34,10 @@ _task_usage() {
                                                 is NOT the ident number
   wip-cap-install [--relane=<lane>]             snapshot each lane's actionable count as its
                                                 frozen WIP ceiling (deliberate, once)
-  set-budget <id> <tokens|\$cost|none>           raise/lower the token budget, or 'none' to exempt the row.
-                                                There is NO built-in default: a row with no budget, on a host
-                                                with no task_budget_default pref, is never enforced
+  set-budget <id> <tokens|\$cost|none>           record an ADVISORY per-row token budget. Nothing enforces it
+                                                (DIVE-3343: a row's own token spend is not measurable, so the
+                                                guard that parked on it was removed). Use the per-agent cost
+                                                budget for a control that actually halts
   set-overlap <tmpl> <skip|spawn> [bound]       recurring template: does an open instance suppress the next slot?
 
   start <id>                                    -> in_progress

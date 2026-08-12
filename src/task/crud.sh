@@ -121,7 +121,7 @@ cmd_task_add() {
   # implied on purpose — see _hb_task_budget_sweep's header for why --customer
   # and priority were both rejected as implicit carve-outs.
   [[ -z "$task_budget" || "$task_budget" =~ ^[1-9][0-9]*$ || "$task_budget" =~ ^\$[0-9]+(\.[0-9]+)?$ || "$task_budget" == "none" ]] \
-    || fail "$E_VALIDATION" "--task-budget must be a token count (e.g. 50000), a dollar cost (e.g. \$1.50), or 'none' to exempt this row from the enforced default"
+    || fail "$E_VALIDATION" "--task-budget must be a token count (e.g. 50000), a dollar cost (e.g. \$1.50), or 'none'. NOTE: advisory only since DIVE-3343 — nothing enforces it"
   # DIVE-1697: --branch seeds the delegated-push 'Branch: <name>' binding into the
   # body up front (same line set-branch writes/upserts later).
   if [[ -n "$branch" ]]; then
