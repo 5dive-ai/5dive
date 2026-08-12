@@ -490,7 +490,9 @@ sup_info_for_agent() {  # <name>
 _sup_capacity_alert() {  # <name> <class> <detail>
   local name="$1" class="$2" detail="$3"
   local msg="[FLEET-HEALTH ${class}] agent '${name}' is UP and REACHABLE but NOT TRANSACTING: ${detail}. Every liveness signal (unit / tmux / poller / registry label) reads healthy — that agreement is the DIVE-3272 defect, not evidence against this alert. Check the seat's model capacity (auth-profile, quota reset) and reassign or park whatever is queued behind it."
-  5dive agent send main "$msg" >/dev/null 2>&1 \
+  # DIVE-3318: a one-way machine notice nobody replies to is not a round — see
+  # a2a_round_guard. NOT a sender exemption; never set this by hand.
+  _5DIVE_A2A_NOTIFY=1 5dive agent send main "$msg" >/dev/null 2>&1 \
     || warn "capacity-alert: 'agent send main' failed for $name (alert still audited)"
   # lodar is a human — reached through main's paired channel, same route the
   # verify tripwire uses. Best-effort: a miss still leaves the agent-send leg
@@ -508,7 +510,9 @@ _sup_capacity_alert() {  # <name> <class> <detail>
 _sup_verify_alert() {  # <name> <excerpt>
   local name="$1" excerpt="$2"
   local msg="[TRIPWIRE id-verification] claude account 'agent-${name}' looks STALLED on an ID/age-verification challenge (anthropic-tos-hedge D4 trigger 1). Response: flip this account to the OpenRouter-Claude profile same-day (A1 runbook). Pane signature: ${excerpt}"
-  5dive agent send main "$msg" >/dev/null 2>&1 \
+  # DIVE-3318: a one-way machine notice nobody replies to is not a round — see
+  # a2a_round_guard. NOT a sender exemption; never set this by hand.
+  _5DIVE_A2A_NOTIFY=1 5dive agent send main "$msg" >/dev/null 2>&1 \
     || warn "verify-tripwire: 'agent send main' failed for $name (alert still audited)"
   # lodar is a human, not an agent — reach them through main's paired Telegram
   # channel (main is the human-facing bot). Resolve main's channel, then DM the

@@ -77,6 +77,7 @@ cat \
   src/lib/registry.sh \
   src/lib/tasks_db.sh \
   src/lib/actor.sh \
+  src/lib/a2a_rounds.sh \
   src/cmd_auth.sh \
   src/cmd_account.sh \
   src/cmd_agent.sh \

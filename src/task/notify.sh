@@ -1514,7 +1514,9 @@ _task_need_route_deliver() {
     # No scratch dir means no rc channel, so the send would be unobservable again.
     # Send it anyway (delivery beats measurement) but record the blind spot as what
     # it is rather than claiming a verdict we cannot have.
-    ( 5dive agent send "$reviewer" "$msg" --from="$filer" >/dev/null 2>&1 & ) || true
+    # DIVE-3318: a one-way machine notice nobody replies to is not a round — see
+    # a2a_round_guard. NOT a sender exemption; never set this by hand.
+    ( _5DIVE_A2A_NOTIFY=1 5dive agent send "$reviewer" "$msg" --from="$filer" >/dev/null 2>&1 & ) || true
     TASK_GATE_ROUTE_STATE="inflight"
     _task_gate_delivery_log error "$ident" "agent:${reviewer}" "" \
       "lead-route handoff to ${reviewer} dispatched UNOBSERVED: no writable scratch dir for the send's exit status" \
@@ -1526,7 +1528,9 @@ _task_need_route_deliver() {
   # cleanup has a single owner and cannot race the parent's poll).
   ( {
       local _crc=0 _cout=""
-      _cout=$(5dive agent send "$reviewer" "$msg" --from="$filer" 2>&1) || _crc=$?
+      # DIVE-3318: a one-way machine notice nobody replies to is not a round — see
+      # a2a_round_guard. NOT a sender exemption; never set this by hand.
+      _cout=$(_5DIVE_A2A_NOTIFY=1 5dive agent send "$reviewer" "$msg" --from="$filer" 2>&1) || _crc=$?
       if (( _crc == 0 )); then
         _task_gate_delivery_log ok "$ident" "agent:${reviewer}" "" \
           "lead-route handoff delivered to ${reviewer} (${role}) via 5dive agent send"
