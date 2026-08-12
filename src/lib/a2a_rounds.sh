@@ -67,15 +67,55 @@ a2a_topic_of() {
   printf '%s' "${ident:-pair}"
 }
 
-# True when the body is substantially an acknowledgement. Two conditions, both
-# required, because either alone is wrong:
+# The ack SHAPES, and the FILLER that can legally sit between them. Neither list
+# is a refusal on its own — see a2a_is_ack, which refuses only what is left after
+# every one of them has been removed.
+A2A_ACK_PHRASES=(
+  ack acked acknowledged agreed agree "got it" "will do" "taking it"
+  "taking this" "taking care of it" "on it" thanks "thank you" thx
+  "sounds good" "makes sense" noted understood roger "+1" sgtm lgtm
+  confirmed "no objection" "no notes" "nothing to add" "fair enough"
+  "you are right" "you're right" "good catch" "will ping" "will ping you"
+  "will report back" "will let you know" "will do it" "doing it"
+)
+# Words that carry nothing on their own: connectives, pronouns and pleasantries.
+# Removed so "got it — taking this one, thanks" reduces to empty, and so an ack
+# is not spared by a trailing "too".
+A2A_ACK_FILLER=(
+  and but so then also too as "as well" now "for now" "right now" ok okay
+  yes yeah yep yup sure cool great perfect nice np "no problem" "of course"
+  it this that one them "the rest" "that one" "this one" "will be" i "i will"
+  "me too" "same here" "for sure" "no worries" anyway again already still
+)
+
+# Trim leading and trailing whitespace/punctuation. Applied only AFTER a phrase
+# match has been tried on the string as it stands, because trimming first would
+# eat the "+" of "+1" and leave a bare digit that no phrase matches.
+a2a__trim_edges() {
+  local s="$1"
+  while [[ -n "$s" && "$s" == [[:space:][:punct:]]* ]]; do s="${s#?}"; done
+  while [[ -n "$s" && "$s" == *[[:space:][:punct:]] ]]; do s="${s%?}"; done
+  printf '%s' "$s"
+}
+
+# True when the body is substantially an acknowledgement.
 #
-#   - it MATCHES an ack shape, and
-#   - it carries no RESULT/EVIDENCE/BLOCKER/NEXT section and asks nothing.
+# THE TEST IS ON THE RESIDUE, NOT THE OPENER — and that distinction is the whole
+# correctness of this function (main2, iteration 1 of DIVE-3318). An earlier
+# version refused a body that STARTED with an ack phrase and carried none of our
+# house section words. But corrections open with agreement in ordinary English:
+# "good catch — it was 19,060 because --all counted the artifact rows too",
+# "you're right, the sha is c391971 not c391972", "agreed. do not merge yet".
+# Every one of those was hard-refused, which is precisely the message the gate
+# answer protected by name — a heuristic anti-correlated with what it must spare.
+# Testing for our RESULT/EVIDENCE vocabulary does not rescue it either: that is a
+# vocabulary test, and this ships as an OSS CLI where nobody types "RESULT:".
 #
-# The second half is what keeps a real message that merely OPENS with "agreed —"
-# and then delivers a measurement from being refused. A bare "ack" is terminal;
-# "agreed, and here is the count" is not an ack, it is a result.
+# So: strip every ack phrase, filler word and piece of punctuation from the body,
+# repeatedly, and refuse only if NOTHING IS LEFT. "agreed" -> empty -> refused.
+# "agreed. do not merge yet" -> "do not merge yet" -> sent. This keeps the design's
+# own principle honest — a control may only refuse what it can IDENTIFY — because
+# an empty residue is a claim about the WHOLE body, not about its first token.
 a2a_is_ack() {
   local msg="$1" body
   # Strip any [5dive-msg ...] envelope, lowercase, collapse whitespace.
@@ -85,6 +125,8 @@ a2a_is_ack() {
   body="${body%"${body##*[![:space:]]}"}"
 
   # Carries substance or asks a question -> not an ack, whatever it opens with.
+  # Kept as a cheap early exit; the residue test below is what actually decides,
+  # and it does not depend on this house vocabulary being present.
   case "$msg" in
     *RESULT*|*EVIDENCE*|*BLOCKER*|*NEXT*|*'?'*) return 1 ;;
   esac
@@ -93,18 +135,21 @@ a2a_is_ack() {
   # it, will ping when the run lands" and below anything carrying an argument.
   (( ${#body} <= 240 )) || return 1
 
-  local p
-  for p in ack acked acknowledged agreed agree "got it" "will do" "taking it" \
-           "taking this" "on it" thanks "thank you" thx "sounds good" \
-           "makes sense" noted understood roger "+1" sgtm lgtm confirmed \
-           "no objection" "no notes" "nothing to add" "fair enough" \
-           "you are right" "you're right" "good catch"; do
-    # Prefix match on a WORD boundary, so "acknowledged" matches but "acking the
-    # release" does not become an ack by sharing three letters with one.
-    [[ "$body" == "$p" ]] && return 0
-    [[ "$body" == "$p"[^a-z0-9]* ]] && return 0
+  local residue="$body" prev="" p matched
+  while [[ "$residue" != "$prev" ]]; do
+    prev="$residue"
+    matched=0
+    for p in "${A2A_ACK_PHRASES[@]}" "${A2A_ACK_FILLER[@]}"; do
+      # Whole-word match, so "acknowledged" matches but "acking the release"
+      # does not become an ack by sharing three letters with one.
+      if [[ "$residue" == "$p" ]]; then residue=""; matched=1; break; fi
+      if [[ "$residue" == "$p"[^a-z0-9]* ]]; then
+        residue="${residue#"$p"}"; matched=1; break
+      fi
+    done
+    (( matched )) || residue="$(a2a__trim_edges "$residue")"
   done
-  return 1
+  [[ -z "$residue" ]]
 }
 
 # Rounds already spent on (from -> to, topic) inside the window. Unreadable or
@@ -155,7 +200,7 @@ a2a_round_prune() {
 # The refusal texts. Kept as functions so the unit test grades the exact string
 # an agent will read, and so both delivery paths refuse identically.
 a2a_ack_refusal_msg() {
-  printf '%s' "refused: this send is an acknowledgement with no RESULT or EVIDENCE. \"Ack\", \"agreed\", \"taking it\" and \"thank you\" are terminal — the other agent does not need to be told you received it, and answering an ack costs them a full re-investigation. If you have something to report, lead with RESULT or EVIDENCE and send that instead."
+  printf '%s' "refused: after removing the acknowledgement itself this message says nothing — every word of it is \"ack\" / \"agreed\" / \"taking it\" / \"thanks\" or filler. Those are terminal: the other agent does not need to be told you received it, and an inbound costs them a full re-investigation, which is the real price of a round (not its length). Add the thing you actually want them to know — a result, a measurement, a disagreement, even one clause — and send that. A message that opens with \"agreed\" and then says something is NOT refused."
 }
 
 # The ROUND text is a warning, not a refusal, and it says so. It names the count,

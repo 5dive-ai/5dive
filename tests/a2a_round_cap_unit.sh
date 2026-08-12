@@ -51,6 +51,24 @@ for m in "agreed — RESULT: 12 of 12 harnesses green" \
          "acking the release is not the same as an ack" ; do
   if a2a_is_ack "$m"; then bad "not-ack: '$m' must NOT be refused"; else ok "not-ack: ${m:0:34}…"; fi
 done
+# THE ARM THAT WAS MISSING (main2, iteration 1). The harness had a negative
+# control in one direction — a message opening with "agreed" that carries our
+# RESULT vocabulary — and NONE in the other: a CORRECTION in plain prose that
+# opens with agreement. That is the nearest non-ack to an ack's surface, it is
+# exactly what the gate answer protected by name, and the opener-word detector
+# hard-refused every one of these. They are real messages from 2026-08-12, near
+# verbatim. No house section word appears in any of them on purpose: this ships
+# as an OSS CLI where nobody types "RESULT:", so passing must not depend on it.
+for m in "good catch - it was 19,060 because --all counted the artifact rows too, on DIVE-3320." \
+         "you're right, the sha is c391971 not c391972" \
+         "confirmed - the ledger prunes at 24h, not 12h as you said" \
+         "noted - DIVE-3320 is the precondition, not DIVE-3140" \
+         "agreed. do not merge yet" \
+         "ack, but the smoke never ran on that tree" \
+         "thanks, though the count is off by one" \
+         "on it — the origin is a local path, so those 502 commits are phantom" ; do
+  if a2a_is_ack "$m"; then bad "correction refused as an ack: '$m'"; else ok "correction survives: ${m:0:38}…"; fi
+done
 # A long body is not an ack even if it opens like one.
 long="agreed. $(printf 'x%.0s' {1..300})"
 if a2a_is_ack "$long"; then bad "not-ack: a 300-char body is not an ack"; else ok "not-ack: long body"; fi
