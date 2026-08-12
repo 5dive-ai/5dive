@@ -61,55 +61,84 @@ else
   bad "ack: envelope-wrapped ack was not detected"
 fi
 
-echo "== round counting and the cap =="
-out="$(a2a_round_guard main dev2 'DIVE-3318 first pass, here is the plan')"
-check "round 1 allowed" "$?:$out" "0:"
-out="$(a2a_round_guard main dev2 'DIVE-3318 second pass with the numbers')"
-check "round 2 allowed" "$?:$out" "0:"
-out="$(a2a_round_guard main dev2 'DIVE-3318 third pass')" ; rc=$?
-check "round 3 REFUSED (rc)" "$rc" "1"
-case "$out" in
-  *"refused"*"DIVE-3318"*"task set-body"*) ok "refusal names the row and the remedy" ;;
-  *) bad "refusal text is missing the row or the remedy: $out" ;;
+echo "== the round cap WARNS, it does not refuse (main, gate answer 2026-08-12) =="
+# The row as filed said "Refuse, not warn". Overturned on the gate: on DIVE-3320 the
+# same day, every message that made the work right arrived at round 3 or later, so a
+# hard cap would have shipped a wrong recipe to eight seats. A counter cannot tell
+# agreement from a correction; the ack detector CAN tell, so it still refuses. These
+# arms encode that split, and they are the arms that must fail if anyone re-hardens
+# the counter without re-arguing it.
+out="$(a2a_round_guard main dev2 'DIVE-3318 first pass, here is the plan' 2>/dev/null)"
+check "round 1 allowed, silent" "$?:$out" "0:"
+out="$(a2a_round_guard main dev2 'DIVE-3318 second pass with the numbers' 2>/dev/null)"
+check "round 2 allowed, silent" "$?:$out" "0:"
+# Round 3: rc MUST be 0 (the send proceeds) and stdout MUST be empty (nothing for the
+# caller to fail on) — the warning goes to stderr.
+err="$(a2a_round_guard main dev2 'DIVE-3318 third pass' 2>&1 >/dev/null)"; rc=$?
+check "round 3 is ALLOWED (rc 0 — the send proceeds)" "$rc" "0"
+out="$(a2a_round_guard main dev2 'DIVE-3318 fourth pass' 2>/dev/null)"
+check "over-cap stdout stays EMPTY (a caller must not fail on it)" "$out" ""
+case "$err" in
+  *"a2a round cap"*"round 3"*"DIVE-3318"*"task set-body"*)
+    ok "the warning names the count, the row and the remedy" ;;
+  *) bad "warning text is missing the count, row or remedy: $err" ;;
+esac
+case "$err" in
+  *refused*) bad "the round warning must not call itself a refusal: $err" ;;
+  *) ok "the round warning does not claim to be a refusal" ;;
+esac
+# The one case the counter cannot see must be blessed in the text itself, or the
+# warning talks a correction out of being sent — which is the exact loss the gate
+# answer was about.
+case "$err" in
+  *CORRECTION*|*correction*) ok "the warning explicitly blesses a correction" ;;
+  *) bad "the warning does not tell a correction to send anyway: $err" ;;
 esac
 
+echo "== the counter still COUNTS past the cap (the digest needs it) =="
+: > "$A2A_ROUND_LEDGER"
+for i in 1 2 3 4; do a2a_round_guard main dev2 "DIVE-5 pass $i" >/dev/null 2>&1; done
+check "all 4 rounds recorded, not stopped at the cap" "$(a2a_round_count main dev2 DIVE-5)" "4"
+
 echo "== the cap is per topic, per direction, per pair =="
-rc=0; a2a_round_guard main dev2 'DIVE-9999 a different row' >/dev/null || rc=$?
-check "a different TOPIC is not capped" "$rc" "0"
-rc=0; a2a_round_guard dev2 main 'DIVE-3318 the reply' >/dev/null || rc=$?
-check "the reverse DIRECTION has its own count" "$rc" "0"
-rc=0; a2a_round_guard main quinn 'DIVE-3318 same row, other peer' >/dev/null || rc=$?
-check "a different PAIR is not capped" "$rc" "0"
-# Two exchanges = four messages on one topic; the fifth is the one refused.
-rc=0; a2a_round_guard dev2 main 'DIVE-3318 the second reply' >/dev/null || rc=$?
-check "each side gets two turns (4 messages total)" "$rc" "0"
-rc=0; a2a_round_guard dev2 main 'DIVE-3318 a third reply' >/dev/null || rc=$?
-check "the fifth message on the topic is refused" "$rc" "1"
+: > "$A2A_ROUND_LEDGER"
+for i in 1 2; do a2a_round_guard main dev2 "DIVE-3318 pass $i" >/dev/null 2>&1; done
+warns() {  # <from> <to> <msg> -> "warn" | "quiet"
+  local e; e="$(a2a_round_guard "$1" "$2" "$3" 2>&1 >/dev/null)"
+  [[ "$e" == *"a2a round cap"* ]] && printf 'warn' || printf 'quiet'
+}
+check "a different TOPIC does not warn"          "$(warns main dev2 'DIVE-9999 a different row')" "quiet"
+check "the reverse DIRECTION has its own count"  "$(warns dev2 main 'DIVE-3318 the reply')"       "quiet"
+check "a different PAIR does not warn"           "$(warns main quinn 'DIVE-3318 other peer')"     "quiet"
+check "each side gets two turns before warning"  "$(warns dev2 main 'DIVE-3318 second reply')"    "quiet"
+check "the fifth message on the topic WARNS"     "$(warns dev2 main 'DIVE-3318 a third reply')"   "warn"
 
 echo "== no sender is exempt by role =="
 # main was 49% of the measured volume; a lead exemption exempts the problem.
 : > "$A2A_ROUND_LEDGER"
-for i in 1 2; do a2a_round_guard main dev2 "DIVE-1 pass $i" >/dev/null; done
-rc=0; a2a_round_guard main dev2 'DIVE-1 pass 3' >/dev/null || rc=$?
-check "the lead is capped like everyone else" "$rc" "1"
+for i in 1 2; do a2a_round_guard main dev2 "DIVE-1 pass $i" >/dev/null 2>&1; done
+check "the lead is warned like everyone else" "$(warns main dev2 'DIVE-1 pass 3')" "warn"
 
 echo "== an ack is refused before it is counted =="
 : > "$A2A_ROUND_LEDGER"
-a2a_round_guard main dev2 'ack' >/dev/null
+out="$(a2a_round_guard main dev2 'ack')"; rc=$?
+check "an ack is still REFUSED (the detector can see it carries nothing)" "$rc" "1"
+case "$out" in *refused*) ok "the ack refusal goes to STDOUT so the caller can fail on it" ;;
+  *) bad "ack refusal not on stdout: $out" ;; esac
 check "an ack does not consume a round" "$(a2a_round_count main dev2 pair)" "0"
 
 echo "== rounds age out =="
 : > "$A2A_ROUND_LEDGER"
 printf 'main\tdev2\tDIVE-7\t1\nmain\tdev2\tDIVE-7\t2\n' > "$A2A_ROUND_LEDGER"
 check "epoch-1 rounds are outside the window" "$(a2a_round_count main dev2 DIVE-7)" "0"
-rc=0; a2a_round_guard main dev2 'DIVE-7 after the window' >/dev/null || rc=$?
-check "an aged-out topic is sendable again" "$rc" "0"
+check "an aged-out topic is quiet again" "$(warns main dev2 'DIVE-7 after the window')" "quiet"
 
-echo "== the notification rail is not a round =="
+echo "== the notification rail is neither refused nor warned =="
 : > "$A2A_ROUND_LEDGER"
 for i in 1 2 3 4; do
-  rc=0; _5DIVE_A2A_NOTIFY=1 a2a_round_guard main dev2 "DIVE-8 gate routed to you" >/dev/null || rc=$?
+  e="$(_5DIVE_A2A_NOTIFY=1 a2a_round_guard main dev2 "DIVE-8 gate routed to you" 2>&1 >/dev/null)"; rc=$?
   check "gate handoff $i is never refused" "$rc" "0"
+  check "gate handoff $i is not even warned about" "${e:-quiet}" "quiet"
 done
 check "and it records no rounds" "$(a2a_round_count main dev2 DIVE-8)" "0"
 

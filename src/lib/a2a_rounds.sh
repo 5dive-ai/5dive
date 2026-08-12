@@ -10,24 +10,43 @@
 # answered with twenty tool calls. That is also why "be concise" does not work —
 # concision does not reduce the digging a message provokes.
 #
-# Two controls, both refusals (a warning an agent may ignore is the rule we
-# already have in CLAUDE.md, and it is unenforced — that is what this row is
-# for):
+# Two controls, and they are DELIBERATELY NOT THE SAME STRENGTH. The dividing
+# principle, and the reason this file reads the way it does:
 #
-#   1. ROUND CAP per (sender, recipient, topic). Third round refused.
-#   2. ACK REFUSAL. A send that is substantially "ack / agreed / taking it /
-#      thank you" carrying no RESULT or EVIDENCE is the round that should never
-#      have been sent. Refused regardless of round count, and never recorded.
+#   **A control may only refuse what it can actually identify.**
+#
+#   1. ACK REFUSAL — a REFUSAL. A send that is substantially "ack / agreed /
+#      taking it / thank you" carrying no RESULT or EVIDENCE is the round that
+#      should never have been sent, and the detector can SEE that it carries
+#      nothing. Refused regardless of round count, and never recorded.
+#   2. ROUND CAP — a WARNING. A counter cannot tell agreement from a CORRECTION,
+#      and the correction is the expensive one to lose.
+#
+# The row as filed said "Refuse, not warn" for both. That was overturned on the
+# gate (main, 2026-08-12 06:36Z) by a day of evidence, and the evidence is the
+# strongest argument in this file: on DIVE-3320 that same day, EVERY message that
+# made the work right arrived at round 3 or later — dev2's local-path-origin
+# correction (502 phantom commits), dev's multi-commit-squash correction (the
+# instrument was blind to the exact case it was introduced for), ops's `--all`
+# correction (19,060 was an artifact), plus the two rounds that produced the
+# STAGED-vs-SAFE distinction. A hard cap at round 3 would have shipped a wrong
+# recipe to eight seats.
+#
+# So the counter warns and the detector refuses. That is not a softening — it is
+# the cap pointed at the failure mode it can actually see. The rule exists to stop
+# two agents AGREEING at length, and an acknowledgement is the one shape that is
+# provably agreement.
 #
 # NO SENDER IS EXEMPT BY ROLE. The lead was the largest single sender in the
 # measurement above (96 of 222 sends, 49% of volume), so a lead exemption
 # exempts the problem.
 
 # One round = one send in one direction on one topic. The cap is per DIRECTED
-# pair, so each side gets A2A_ROUND_CAP turns: at cap 2 a topic affords
-# A->B, B->A, A->B, B->A — "two exchanges per topic", and the third round in
-# either direction is refused. Deliberately not overridable by env: an override
-# is the exemption this control exists to remove.
+# pair, so each side gets A2A_ROUND_CAP turns before the WARNING starts: at cap 2
+# a topic affords A->B, B->A, A->B, B->A — "two exchanges per topic" — and the
+# third round in either direction is warned about, by name, with the count and the
+# remedy. Deliberately not overridable by env: an override is the exemption this
+# control exists to remove.
 A2A_ROUND_CAP=2
 
 # Rounds age out, so a topic is not silenced forever by a conversation that
@@ -139,7 +158,11 @@ a2a_ack_refusal_msg() {
   printf '%s' "refused: this send is an acknowledgement with no RESULT or EVIDENCE. \"Ack\", \"agreed\", \"taking it\" and \"thank you\" are terminal — the other agent does not need to be told you received it, and answering an ack costs them a full re-investigation. If you have something to report, lead with RESULT or EVIDENCE and send that instead."
 }
 
-a2a_round_refusal_msg() {
+# The ROUND text is a warning, not a refusal, and it says so. It names the count,
+# cites the rule and names the remedy — the three things that let a sender decide
+# for themselves — and then gets out of the way. It explicitly blesses the one case
+# the counter cannot see, so a correction is never talked out of being sent.
+a2a_round_warning_msg() {
   local from="$1" to="$2" topic="$3" n="$4"
   local where
   if [[ "$topic" == "pair" ]]; then
@@ -147,14 +170,20 @@ a2a_round_refusal_msg() {
   else
     where="$topic"
   fi
-  printf 'refused: %s round %s to %s on %s — the cap is %s per topic per direction. A third round is a document, not a conversation: put it in the row body (`5dive task set-body %s`) and let them read it once, instead of a send that costs them another full re-investigation. Rounds age out after %sh.' \
+  printf 'a2a round cap: this is %s round %s to %s on %s — over the cap of %s per topic per direction. If this is another pass at agreement, put it in the row body (`5dive task set-body %s`) and let them read it once. If it is a CORRECTION or carries a measurement, send it: this is a warning precisely because a round counter cannot tell those apart, and a lost correction costs more than an extra round. Rounds age out after %sh.' \
     "$from" "$(( n + 1 ))" "$to" "$where" "$A2A_ROUND_CAP" "$where" "$(( A2A_ROUND_WINDOW_SECS / 3600 ))"
 }
 
 # The guard both send paths call, AFTER the body and both endpoints are
-# resolved and BEFORE a keystroke reaches the target's pane. Prints the refusal
-# on stdout and returns non-zero; the caller decides how to fail (so the audit
-# row and exit code stay owned by the command).
+# resolved and BEFORE a keystroke reaches the target's pane.
+#
+# TWO CHANNELS, and the split is the whole design:
+#   - a REFUSAL (ack only) goes to STDOUT and returns non-zero. The caller decides
+#     how to fail, so the audit row and exit code stay owned by the command.
+#   - a WARNING (round cap) goes to STDERR and returns ZERO. The send proceeds.
+#     stderr, because the callers capture stdout in a command substitution — a
+#     warning written to stdout would be swallowed into the refusal variable and
+#     shown to nobody, which is the same silent control this row exists to fix.
 #
 # `_5DIVE_A2A_NOTIFY=1` skips the guard. This is NOT a sender exemption and no
 # agent may set it by hand: it is set only by the in-repo NOTIFICATION rails
@@ -176,9 +205,12 @@ a2a_round_guard() {
   topic="$(a2a_topic_of "$msg")"
   n="$(a2a_round_count "$from" "$to" "$topic")"
   if (( n >= A2A_ROUND_CAP )); then
-    a2a_round_refusal_msg "$from" "$to" "$topic" "$n"
-    return 1
+    a2a_round_warning_msg "$from" "$to" "$topic" "$n" >&2
+    printf '\n' >&2
   fi
+  # Recorded on EVERY round, including the ones past the cap. The count is what
+  # the digest reports and what makes an over-cap pair visible; stopping the
+  # ledger at the cap would make the loudest conversations the least legible.
   a2a_record_round "$from" "$to" "$topic"
   a2a_round_prune
   return 0
@@ -196,7 +228,7 @@ a2a_round_guard() {
 a2a_rounds_report() {
   local window="${1:-86400}" log="${AUDIT_LOG:-/var/log/5dive/agent-audit.log}"
   local hours=$(( window / 3600 ))
-  printf '\n\U0001F4EC A2A rounds — last %sh (cap %s per topic per direction)\n' \
+  printf '\n\U0001F4EC A2A rounds — last %sh (soft cap %s per topic per direction; over-cap warns, it does not refuse)\n' \
     "$hours" "$A2A_ROUND_CAP"
 
   if [[ -r "$log" ]] && command -v awk >/dev/null 2>&1; then
@@ -238,8 +270,8 @@ a2a_rounds_report() {
       $4 ~ /^[0-9]+$/ && $4 >= c { k=$1" -> "$2" on "$3; n[k]++ }
       END {
         hot=0
-        for (k in n) if (n[k] >= cap) { if (hot++ == 0) print "  at the cap (next round refused):"; print "  • " k }
-        if (hot == 0) print "  no topic is at the cap"
+        for (k in n) if (n[k] >= cap) { if (hot++ == 0) print "  over the cap (next round warns):"; print "  • " k }
+        if (hot == 0) print "  no topic is over the cap"
       }' "$A2A_ROUND_LEDGER" 2>/dev/null
   else
     printf '  (round ledger not readable here: %s)\n' "$A2A_ROUND_LEDGER"
