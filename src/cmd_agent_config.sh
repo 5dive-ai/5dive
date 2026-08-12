@@ -418,7 +418,7 @@ cmd_config() {
         rb_profile=$(jq -r --arg n "$name" '.agents[$n].authProfile // empty' <<<"$rb_reg")
         write_agent_env "$name" "$type" "$prev_channels" "$rb_workdir" "$rb_profile"
         fail "$E_GENERIC" \
-          "$gate_ch plugin not staged for agent '$name' ($gate_dir missing) — refusing to restart into a session with no $gate_ch tool. No restart fired and channels was rolled back to '$prev_channels'; the seat is unchanged. Re-running the same command will fail the same way — check that the $gate_marketplace marketplace is reachable for user agent-$name (\`sudo -u agent-$name ls ~/.claude/plugins/cache/$gate_marketplace\`) and see the install output above for why staging did not complete."
+          "$gate_ch plugin not staged for agent '$name' ($gate_dir missing) — refusing to restart into a session with no $gate_ch tool. No restart fired and channels was rolled back to '$prev_channels'. NOTE: only channels is rolled back — any model=/effort=/workdir=/autonomy= in the same call stayed applied and take effect on the next restart. Re-running the same command will fail the same way — check that the $gate_marketplace marketplace is reachable for user agent-$name (\`sudo -u agent-$name ls ~/.claude/plugins/cache/$gate_marketplace\`) and see the install output above for why staging did not complete."
       fi
     done
   fi

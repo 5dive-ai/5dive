@@ -18,8 +18,11 @@ watching and baked in the deaf session it existed to prevent.
 - **The dispatch** — `channels=…,buzz` now calls `install_channel_for_agent "$type" buzz "$name" ""`,
   the same token-free shape as dashboard.
 - **The rollback** — a staging-gate refusal restores the pre-call channel list in both the registry
-  and the env file, so a refusal changes nothing. The message says so, and no longer advises an
-  identical re-run.
+  and the env file, and no longer advises an identical re-run. Scope is stated in the message and is
+  deliberately narrow: **only `channels` is rolled back.** A `model=`/`effort=`/`workdir=`/`autonomy=`
+  in the same call stays applied and takes effect on the next restart — those are independently
+  valid writes, and reverting them would discard a change the operator asked for over a staging
+  failure unrelated to it.
 - **The claude-only pre-check** — `channels=buzz` on a non-claude type is refused *before* the
   registry write, matching dashboard. `install_channel_for_agent` already refused it, but only
   after the seat had been recorded as declaring it.
