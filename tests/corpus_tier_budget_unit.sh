@@ -1330,5 +1330,114 @@ if [[ -f "$_wf" ]]; then
   else bad "unit-tests.yml arms the cross-runner gate on both core jobs" "armed=$_armed prior=$_prior"; fi
 else bad "unit-tests.yml is readable from the harness" "no file at $_wf"; fi
 
+# ---- 92-96 DIVE-3315: THE SPLIT, AND THE FOUR NAMES THE MERGE GATE KNOWS
+# core is TWO independently capped jobs per environment now. The corpus read 313s against
+# a 312s effective cap with ~6% runner spread, and the trimming levers were measured
+# exhausted (~7s available against ~13s needed, olivia's by-construction census on
+# DIVE-3313), so a cap breached by 1s on the draw of a runner was presenting as a flaky
+# test. The cap is PER JOB, so two shards of ~157s each hold the SAME 300s: the corpus is
+# split, the constraint is not relaxed.
+#
+# Four things have to stay true or the split is a capacity raise in disguise, a broken
+# merge gate, or both. All four are graded by PARSING the workflow, not by grepping it —
+# a `grep 'always()'` matches the comment that explains why it is there, which is the
+# vacuity this file keeps re-learning (see the jobs_missing_build arm above).
+#
+#   92  the four REQUIRED status-check names still exist as jobs. `test` is required on
+#       main; a matrix job reports as `test (1)`, so sharding under the old name leaves
+#       the required context unable to ever report and every PR waits on a check that
+#       cannot arrive. The names survive as aggregators over the shards.
+#   93  those aggregators FAIL CLOSED. A job skipped because its dependency failed
+#       reports SKIPPED, and GitHub counts a skipped required check as satisfied — so the
+#       one-line `needs:`-only version passes the merge gate exactly when the corpus went
+#       red. `if: always()` plus an explicit .result comparison, or it is not a gate.
+#   94  every core invocation is sharded, and the DIVISOR is the matrix length rather
+#       than a literal — a divisor spelled twice drifts, and the runner would then split
+#       the corpus a different number of ways than the matrix runs it.
+#   95  one job re-sums the shards and prints the UN-SHARDED total. Two shards reporting
+#       157s read as comfortable while the corpus still costs 313s; sharding is the
+#       obvious way to lose the number the whole tier scheme exists to surface.
+#   96  and that total is PRINTED, NEVER ENFORCED, and nothing gates on the job that
+#       prints it. Held to the 300s per-job cap the sum reads 313 > 300 on day one and
+#       the split fixes nothing — the number is an instrument, not a second budget.
+_wf3315="$(dirname "${BASH_SOURCE[0]}")/../.github/workflows/unit-tests.yml"
+if [[ -r "$_wf3315" ]]; then
+  while IFS=$'\t' read -r _v _name _detail; do
+    [[ -n "$_v" ]] || continue
+    if [[ "$_v" == ok ]]; then ok "$_name"; else bad "$_name" "$_detail"; fi
+  done < <(python3 - "$_wf3315" <<'PY' 2>&1
+import re, sys, yaml
+wf = sys.argv[1]
+d = yaml.safe_load(open(wf)) or {}
+jobs = d.get('jobs') or {}
+def chk(good, name, detail=''):
+    print('%s\t%s\t%s' % ('ok' if good else 'bad', name, detail.replace('\t', ' ')))
+def runs(job):
+    return [s.get('run') or '' for s in (job.get('steps') or []) if isinstance(s, dict)]
+
+# 92 — the names branch protection requires, pinned here so a rename is a red in the
+# repo rather than a queue of PRs blocked on a context that will never report.
+REQUIRED = ['test', 'test-installed-host', 'test-confirm', 'test-installed-host-confirm']
+missing = [c for c in REQUIRED if c not in jobs]
+chk(not missing,
+    'every REQUIRED status check on main is still a job NAME in unit-tests.yml (sharding must not rename the merge gate out from under branch protection)',
+    'missing: ' + ','.join(missing))
+
+# 93 — fail closed. Grades the aggregator's `if:` and the presence of a .result test.
+bad_agg = []
+for c in REQUIRED:
+    j = jobs.get(c) or {}
+    if str(j.get('if', '')).strip() != 'always()':
+        bad_agg.append('%s: if=%r, so a failed dependency SKIPS it and a skipped required check reads as satisfied' % (c, j.get('if')))
+        continue
+    if not any('.result' in r for r in runs(j)):
+        bad_agg.append('%s: runs always() but never compares a dependency .result — it is green by construction' % c)
+chk(not bad_agg,
+    'each required check RUNS on always() and asserts its dependencies\' .result (a bare needs: is satisfied by a skip, which is the merge gate passing precisely when the corpus went red)',
+    ' | '.join(bad_agg))
+
+# 94 — sharded, with the divisor taken from the matrix length.
+bad_shard, sharded = [], 0
+for jn, j in jobs.items():
+    for r in runs(j):
+        flat = re.sub(r'\\\n\s*', ' ', r)
+        for line in flat.splitlines():
+            if 'run-harnesses.sh' not in line or '--tier=core' not in line:
+                continue
+            # NOT \S+: the value is `${{ matrix.shard }}/${{ strategy.job-total }}`, which
+            # contains spaces, and splitting on the first one reads the divisor as `${{`.
+            m = re.search(r'--shard=(.+?)(?=\s+--|\s*$)', line)
+            if not m:
+                bad_shard.append('%s: a core invocation with no --shard=' % jn)
+                continue
+            sharded += 1
+            div = m.group(1).split('/')[-1]
+            if not re.search(r'strategy\.job-total|matrix\.shards', div):
+                bad_shard.append('%s: literal divisor %s — spelled twice, it drifts from the matrix' % (jn, div))
+chk(sharded >= 4 and not bad_shard,
+    'every core invocation in unit-tests.yml is SHARDED and takes its divisor from the matrix length, in both environments and in both confirm jobs (%d invocations)' % sharded,
+    ' | '.join(bad_shard) or 'sharded=%d' % sharded)
+
+# 95/96 — the un-sharded total: printed, and wired to nothing.
+summ = [jn for jn, j in jobs.items()
+        if any('wall_clock_s' in r and 'GITHUB_STEP_SUMMARY' in r for r in runs(j))]
+chk(len(summ) == 1,
+    'exactly one job re-sums the shards and prints the UN-SHARDED core total (per-shard is what the budget enforces; the total is what the trend is read from)',
+    'jobs printing a re-summed total: %s' % (summ or 'none'))
+if len(summ) == 1:
+    jn = summ[0]
+    body = '\n'.join(runs(jobs[jn]))
+    gated = re.findall(r'exit\s+[1-9]\b|\|\|\s*exit|exit\s+"\$\{?rc', body)
+    def needs_of(j):
+        n = j.get('needs')
+        return [n] if isinstance(n, str) else (n or [])
+    depended = [o for o, j in jobs.items() if jn in needs_of(j)]
+    chk(not gated and not depended,
+        'the un-sharded total is PRINTED, NEVER ENFORCED — the job that prints it exits 0 on every path and nothing gates on it (an enforced sum is 313 > 300 on day one and the split would fix nothing)',
+        'gating exits: %s; jobs depending on it: %s' % (gated or 'none', depended or 'none'))
+PY
+  )
+else bad "unit-tests.yml is readable from the harness (DIVE-3315 arms)" "no file at $_wf3315"; fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
