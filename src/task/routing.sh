@@ -691,6 +691,51 @@ _gate_withdraw_actor() {
   printf 'none'
 }
 
+# DIVE-3340: THE HUMAN-SIDE EXIT FROM A PENDING GATE, rendered in ONE place.
+#
+# Two refusals need this sentence — `cancel` over an open gate (task/status.sh) and
+# `--withdraw` refused as unauthorized (task/need.sh) — and until this ticket NEITHER
+# of them said it. Both named only `--withdraw`, which is the AGENT-side exit, and the
+# authorized set for a withdraw is `human | filer | filer's lead | coordinator`
+# (_gate_withdraw_actor above). **A person typing into a chat bot satisfies none of
+# them**: the command runs on an agent seat, so the actor resolves to `agent <seat>`,
+# and the human's identity deliberately does not travel through the bot (DIVE-1401,
+# DIVE-2330 — SUDO_* are forgeable below root, so authorization fails closed and must
+# keep doing so). Measured 2026-08-12 on a CUSTOMER box: the owner tried to cancel his
+# own row, was told to withdraw first, and the withdraw refused him. Two refusals, each
+# individually correct, composing into a closed loop.
+#
+# ANSWERING IS THE ROUTE OUT, and it needs no withdraw authorization at all: it is the
+# human's own act, it is what the buttons in their chat are for, and once
+# need_answered_at is set the cancel guard stops firing. So it is named FIRST wherever
+# a human is the one reading — the door they can open, before the one they cannot.
+#
+# Shared rather than inlined twice on purpose: this is the same class as DIVE-2382,
+# where a refusal that named a SMALLER set than the code checked converted an available
+# action into an impossible one for every reader. Two copies of an exit route drift, and
+# the drift is invisible — a refusal is read once, by someone who will not re-derive it.
+# See community/wiki/a-refusal-that-names-a-smaller-set-than-the-code-checked.md.
+#
+# Type-shaped because the verb genuinely differs, and getting it wrong publishes a route
+# that refuses — which is the defect this function exists to fix, one layer down. A
+# `secret` must never be typed into the board (it would be recorded), and a `manual`
+# gate records that the step was PERFORMED rather than carrying a value; both take
+# `task answer <id>` with NO --value. The tap route is named for every type because a
+# tier-2 gate's own alert carries the per-gate human nonce that only the CLI mints
+# (DIVE-916) — the buttons are the answer surface a human actually has.
+#   $1 = ident (DIVE-N)   $2 = need_type
+_gate_answer_route() {
+  local _ar_ident="$1" _ar_type="$2"
+  case "$_ar_type" in
+    secret)
+      printf "answer it yourself — place the secret out-of-band, then '5dive task answer %s' with NO --value (the value must never be written to the board)" "$_ar_ident" ;;
+    manual)
+      printf "answer it yourself — '5dive task answer %s' with NO --value (it records that the step was performed)" "$_ar_ident" ;;
+    *)
+      printf "answer it yourself — tap a button on the gate's own alert in chat, or '5dive task answer %s --value=<answer>'" "$_ar_ident" ;;
+  esac
+}
+
 # DIVE-980: shared org-chart assignee resolution. Resolve an assignee TOKEN to a
 # concrete agent via the org chart (agents_org). Prints the resolved name, or
 # NOTHING when a role/charter token has no UNIQUE holder — callers decide whether

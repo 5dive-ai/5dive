@@ -1479,7 +1479,17 @@ cmd_task_need() {
     # and the reader needs to see that as a stated absence.
     w_who="the gate's filer (${w_filer:-unrecorded})"
     [[ -n "$w_holder" && "$w_holder" != "$w_filer" ]] && w_who+=" — held by ${w_holder}, who does NOT authorize a withdraw since they did not file it"
-    (( w_ok )) || policy_refuse "$E_AUTH_REQUIRED" gate-withdraw-not-authorized DIVE-1401 "$ident" "only ${w_who}, their lead (${w_lead:-none}), the org coordinator (${w_coord:-none}) or a human can withdraw this gate"
+    # DIVE-3340: SAY WHAT TO DO, not only who may. DIVE-2382 fixed the SET this message
+    # enumerates; it left the message a pure list of principals, which tells a refused
+    # caller nothing about how to make progress. That is the second half of the closed
+    # loop measured on a customer box 2026-08-12 — `cancel` sent the reader here, and
+    # here sent them nowhere. Answering does not consult this authorization block at all
+    # (it is the human's own act, and it clears the gate so the cancel guard stops
+    # firing), so it is the route a refused non-filer should be pointed at. Named after
+    # the set, not instead of it: a legitimate filer/lead/coordinator misreading their
+    # own name in the list is the DIVE-2106 failure, and dropping the enumeration to
+    # make room for the route would re-create it.
+    (( w_ok )) || policy_refuse "$E_AUTH_REQUIRED" gate-withdraw-not-authorized DIVE-1401 "$ident" "only ${w_who}, their lead (${w_lead:-none}), the org coordinator (${w_coord:-none}) or a human can withdraw this gate. If that is not you, do NOT hunt for a way in — $(_gate_answer_route "$ident" "$w_type"), which needs none of the above and unblocks the row (a cancel is then accepted too). Withdrawing only retires a question that is MOOT; answering is what a still-live one wants."
     # Clear every gate field and unblock back to todo when no dependency edge
     # still holds it. The withdrawn gate is archived to gate_history first, in
     # the same transaction (DIVE-2119).
