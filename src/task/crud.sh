@@ -679,7 +679,20 @@ cmd_task_show() {
   resolve_task_id "$1"; local id="$RESOLVED_TASK_ID"
   if (( JSON_MODE )); then
     local task subs deps previous_gates
-    task=$(dbfmt -json "SELECT * FROM tasks WHERE id=${id};")
+    # DIVE-3340 iter2 (main2): export the VERDICTS here too. `SELECT *` returns
+    # only stored columns, so `gate_live`/`needs_human` — which `task ls --json`
+    # has computed since DIVE-1347/DIVE-3267 — read NULL on this surface. A
+    # consumer that reaches for `show` (the telegram plugin's task-detail view
+    # does) therefore has no verdict available and rebuilds the rule from the
+    # raw inputs, which is precisely the DIVE-3224/DIVE-3267 conflation those
+    # fields exist to end. Same two single-source predicates, evaluated in the
+    # same query as the row, so the two surfaces cannot disagree.
+    local _gate_open _gate_human
+    _gate_open=$(_task_gate_open_pred); _gate_human=$(_task_human_gate_pred)
+    task=$(dbfmt -json "SELECT *,
+             CASE WHEN ${_gate_open} THEN 1 ELSE 0 END AS gate_live,
+             CASE WHEN ${_gate_open} AND ( ${_gate_human} ) THEN 1 ELSE 0 END AS needs_human
+           FROM tasks WHERE id=${id};")
     subs=$(dbfmt -json "SELECT id,ident,title,status FROM tasks WHERE parent_id=${id} ORDER BY id;")
     deps=$(dbfmt -json "SELECT t.id,t.ident,t.title,t.status FROM task_deps d JOIN tasks t ON t.id=d.blocked_by WHERE d.task_id=${id} ORDER BY t.id;")
     previous_gates=$(_gate_history_summary_json "$id")

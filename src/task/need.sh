@@ -1458,8 +1458,20 @@ cmd_task_need() {
     # The lead route follows the PRINCIPAL, so it moves with it: condition 3 is "the
     # filer's lead", and resolving it from the holder would leave a second copy of the
     # same defect one rung up.
-    w_lead=$(_gate_route_reviewer "$w_filer")
-    w_coord=$(_task_resolve_coordinator)
+    # DIVE-3340 iter2: same rc-1-on-empty-filer shape as the cancel guard (see
+    # status.sh). PRE-EXISTING here — it fails identically on origin/main — and
+    # folded in under this row's filing cap rather than a new ident, because the
+    # two sites are one defect and splitting them leaves the half a reader lands
+    # on looking deliberate. Without it the withdraw refusal aborts rc=1 instead
+    # of naming its authorized set, on exactly the empty-filer rows a fresh
+    # customer box produces. NB this expression is COALESCE(gate_filed_by,
+    # created_by) while the cancel guard's is COALESCE(gate_filed_by, assignee) —
+    # a fixture must clear all three to reach the empty cell on both verbs.
+    # Graded by tests/gate_refusal_empty_filer_e2e.sh, which runs the BUILT
+    # bundle: the unit harness is `set -uo pipefail` with no -e and therefore
+    # cannot reproduce an errexit abort at all.
+    w_lead=$(_gate_route_reviewer "$w_filer") || w_lead=""
+    w_coord=$(_task_resolve_coordinator) || w_coord=""
     [[ "$w_kind" == "human" ]] && w_ok=1                                    # a genuine human caller
     [[ -n "$w_name" && "$w_name" == "$w_filer" ]] && w_ok=1                # the filer
     [[ -n "$w_name" && -n "$w_lead"  && "$w_name" == "$w_lead"  ]] && w_ok=1  # filer's lead

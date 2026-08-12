@@ -676,8 +676,19 @@ _task_status_cmd() {
       # conclusion its reader reaches, not by whether it is technically true.
       local _cg_filer; _cg_filer=$(db "SELECT COALESCE(NULLIF(gate_filed_by,''), assignee, '') FROM tasks WHERE id=${id};")
       local _cg_lead _cg_coord
-      _cg_lead=$(_gate_route_reviewer "$_cg_filer")
-      _cg_coord=$(_task_resolve_coordinator)
+      # DIVE-3340 iter2 (main2): `|| x=""` is LOAD-BEARING, not defensive noise.
+      # `_gate_route_reviewer` opens `[[ -n "$_filer" ]] || return`, and a bare
+      # `return` inherits the FAILED test's rc — so an EMPTY filer returns 1 while
+      # an unresolvable NON-empty filer returns 0 (the trailing `if` inside the
+      # `for` sets the rc, and a false `if` with no `else` is 0). The bundle is
+      # `set -euo pipefail` and an assignment's rc is its command substitution's,
+      # so without this the refusal below never printed at all: rc=1, "exited
+      # without reporting a reason", on the one path this ticket is about. The
+      # `${_cg_filer:-unknown}` two lines down proves the empty-filer state was
+      # anticipated by the text and not by the control flow. Same shape as the
+      # DIVE-2751 note at need.sh's push-for-review route. Arm: EMPTY-FILER below.
+      _cg_lead=$(_gate_route_reviewer "$_cg_filer") || _cg_lead=""
+      _cg_coord=$(_task_resolve_coordinator) || _cg_coord=""
       policy_refuse "$E_CONFLICT" cancel-over-open-gate DIVE-2773 "$ident" \
         "$ident has a PENDING '${_gt}' gate (filed by '${_cg_filer:-unknown}') and a cancel deletes the question, silently retiring the human's buttons. TWO EXITS: (1) $(_gate_answer_route "$ident" "$_gt") — no authorization needed, and it is what the buttons in the human's chat are for; or (2) withdraw it as moot: 5dive task need $ident --withdraw — but ONLY '${_cg_filer:-unknown}', their lead (${_cg_lead:-none}), the org coordinator (${_cg_coord:-none}) or a genuine human unix caller may do that, so a chat-bot seat cannot."
     fi

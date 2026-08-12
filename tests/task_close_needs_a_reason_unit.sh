@@ -302,6 +302,40 @@ p_err=$(cat "$TMP"/err)
   && ok_t "P2: and DIVE-2382's resolved-value enumeration is still intact" \
   || bad_t "P2: the DIVE-2382 principal enumeration regressed" "err='$p_err'"
 
+# ── (Q lives elsewhere) EMPTY-FILER refusal: tests/gate_refusal_empty_filer_e2e.sh ─
+# The iteration-1 regression main2 found (an empty gate filer aborting the cancel
+# refusal rc=1 under errexit) CANNOT be graded from this file. This harness runs
+# `set -uo pipefail` — no `-e` — so it has no errexit to abort. Arms written here
+# passed identically with the guard present and absent (measured, 39/0 both ways),
+# which is a vacuous arm wearing a pass. They moved to a harness that builds the
+# real bundle, because `set -euo pipefail` only exists there (src/header.sh:14).
+
+# ── R: `task show --json` exports the VERDICTS, not just the raw gate inputs ───
+# main2's second defect is a CONSUMER of this. The telegram plugin's task-detail
+# view calls `task show --json` and had to rebuild "is a gate open" from
+# need_type/need_answered_at, which omits the status clause — so 19 live
+# done/cancelled rows with a lingering gate rendered "waiting on a HUMAN ANSWER".
+# `ls --json` has carried gate_live/needs_human since DIVE-1347/DIVE-3267; `show`
+# returned NULL because `SELECT *` yields stored columns only. The arm that
+# matters is the TERMINAL one — a verdict that is right on open rows and absent
+# on closed ones is the bug, not the fix.
+R=$(gate_row "show json verdict" decision dev)
+r_open=$(as dev cmd_task_show "$R" | jq -r '.data.task.gate_live // "ABSENT"')
+r_hum=$(as dev cmd_task_show "$R" | jq -r '.data.task.needs_human // "ABSENT"')
+[[ "$r_open" == "1" && "$r_hum" == "1" ]] \
+  && ok_t "R1: an OPEN gated row exports gate_live=1 and needs_human=1 on show --json" \
+  || bad_t "R1: show --json does not export the verdicts" "gate_live='$r_open' needs_human='$r_hum'"
+db "UPDATE tasks SET status='cancelled' WHERE ident=$(sqlq "$R");"
+r_tclosed=$(as dev cmd_task_show "$R" | jq -r '.data.task.gate_live')
+r_thum=$(as dev cmd_task_show "$R" | jq -r '.data.task.needs_human')
+r_traw=$(as dev cmd_task_show "$R" | jq -r '.data.task.need_type // "ABSENT"')
+[[ "$r_traw" == "decision" ]] \
+  && ok_t "R/DISTINCTNESS: the terminal row still carries the RAW need_type, so the inputs and the verdict genuinely disagree here" \
+  || bad_t "R/DISTINCTNESS: need_type vanished — R2 would pass for the wrong reason" "need_type='$r_traw'"
+[[ "$r_tclosed" == "0" && "$r_thum" == "0" ]] \
+  && ok_t "R2: a CANCELLED row with a lingering gate exports gate_live=0 / needs_human=0" \
+  || bad_t "R2: a terminal row still reads as an open human gate" "gate_live='$r_tclosed' needs_human='$r_thum'"
+
 # ── K: `task reject` on a DELIVERED (todo) row PRESERVES the maker's result ───
 # THE DIVE-2762 CLASS, ONE VERB OVER. reject kept a PRIVATE copy of the old,
 # wrong predicate — `if [[ $st == 'done' && -n $prev ]]` — so its preservation
