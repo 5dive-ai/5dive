@@ -37,6 +37,21 @@
 # silent by construction (a green arm that grades nothing looks exactly like a green
 # arm that grades something) and 10s against a 300s per-job budget is not the line
 # item worth demoting. If the tier gets tight, A7's 43 mutants are the knob.
+#
+# DIVE-3302 (2026-08-12): the tier got tight — core was 18s over its 363s cap and
+# every merge and cut on 5dive-ai/5dive was frozen behind a red `test-confirm`.
+# Reduced WITHOUT touching the knob: the four per-file predicates were 4-6 process
+# spawns each, run once per file per mutant (53 A7 + 8 A8) on top of a 388-file
+# eligibility walk in each arm. Three are now ONE awk (`_file_facts`); `claims_id`
+# stays the original grep trio deliberately (see its call site). 12.04s -> 9.49s
+# CPU, 3-run means, same session and box — single-run wall clock on this shared
+# host swings 12-19s and cannot resolve a 2.5s change. Population, mutant counts
+# and arm count all UNCHANGED (8/53/1, 53, 8, 15/0): a cost change with no coverage
+# delta, so A7's mutants are still there for whoever needs the next second.
+# Memoising the real-file predicates was implemented, measured and REJECTED —
+# 1.21s SLOWER (it swaps a short-circuiting two-predicate test for an
+# always-compute-three across 388 files) and it adds a staleness hazard no arm
+# catches. ops lost the same optimisation earlier to a vacuous cache guard.
 
 set -u
 # shellcheck source=/dev/null
@@ -154,32 +169,74 @@ _asserts_resolver() {
 # fixture; the guard's own line 353 census listing uses this same function so the two
 # cannot drift.
 _pins_seams() {
-  grep -qE '^[[:space:]]*_gate_(caller_uid|passwd_stream)\(\)' "$1" && return 0
+  # DIVE-3302: the grep arm folded into the awk — one spawn, same two predicates.
   awk '
+    /^[[:space:]]*_gate_(caller_uid|passwd_stream)\(\)/ { f=1; exit }
     /^[[:space:]]*#/ { next }
     /(^|\$\(|`|[;&|({])[[:space:]]*actor_seam_as([[:space:]]|$)/ { f=1 }
     END { exit !f }
   ' "$1"
 }
 
+_file_facts() {   # DIVE-3302: ONE awk for the three per-file predicates that were
+  # three separate awk spawns. Each rule is a verbatim copy of the standalone it
+  # replaces. `claims_id` is deliberately NOT folded in here — see the note at the
+  # call site. Equivalence differential-graded by A9 across the corpus.
+  awk '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*_gate_(caller_uid|passwd_stream)\(\)/ { pins=1 }
+    /(^|\$\(|`|[;&|({])[[:space:]]*actor_seam_as([[:space:]]|$)/ { pins=1 }
+    /(^|\$\(|`|[;&|({])[[:space:]]*(_gate_authenticated_actor|_gate_uid_to_agent|actor_seam_selftest)([[:space:]]|$|\)|")/ { asserts=1 }
+    inlist {
+      list = list " " $0
+      if ($0 ~ /(^|;)[[:space:]]*do([[:space:]]|$)/) { inlist=0; if (list ~ /lib\/(actor|actor_seam)\.sh/) srcs=1 }
+      next
+    }
+    /^[[:space:]]*for[[:space:]]+[A-Za-z_][A-Za-z_0-9]*[[:space:]]+in[[:space:]]/ {
+      list=$0; inlist=1
+      if ($0 ~ /(^|;)[[:space:]]*do([[:space:]]|$)/) { inlist=0; if (list ~ /lib\/(actor|actor_seam)\.sh/) srcs=1 }
+      next
+    }
+    /lib\/(actor|actor_seam)\.sh/ {
+      if ($0 ~ /(^|[;&|({])[[:space:]]*(source|\.)[[:space:]]/) srcs=1
+      else if ($0 ~ /(^|[;&|({[:space:]])(eval[[:space:]]+"?\$\(|_load_from[[:space:]])/) srcs=1
+    }
+    END { printf "%d %d %d", pins, srcs, asserts }
+  ' "$1"
+}
+
+_claims_id() {   # DIVE-3302: single-spawn replacement for the id()-stub grep trio
+  awk '
+    /^[[:space:]]*id\(\)/ { seen=1; if ($0 ~ /-un/) { f=1; exit } ; if ($0 ~ /\{/) inblk=1; next }
+    inblk { if ($0 ~ /-un/) { f=1; exit } ; if ($0 ~ /\}/) inblk=0 }
+    END { exit !(seen && f) }
+  ' "$1"
+}
+
 _scan_identity_stubs() {
-  local dir="$1" f base claims_id pins
+  local dir="$1" f base claims_id pins srcs asrt
   for f in "$dir"/*.sh; do
     [[ -e "$f" ]] || continue
-    base="$(basename "$f")"
+    base="${f##*/}"
     [[ "$base" == "$SELF" ]] && continue                    # self-exclusion (A3)
     [[ -n "${ALLOW[$base]:-}" ]] && continue
 
     # Population A — an `id()` stub that ANSWERS -un is making an identity claim. A
     # stub that only handles `id -u` (deploy_unit, agent_git_identity_unit) is pinning
     # a numeric uid for a different guard and is out of scope.
+    # DIVE-3302: ONE awk yields all four predicates. Was 4-6 spawns per file, and
+    # this runs once per file per mutant (53 A7 mutants + 8 A8), which is where the
+    # core tier's overage lived. Equivalence to the four originals is differential-
+    # graded by A9 across the whole corpus, not asserted here.
+    # claims_id keeps the ORIGINAL grep trio verbatim. My folded awk detected one
+    # file the trio misses (its `[^}]*` is blocked by the `}` inside `${1:-}`), which
+    # would have RAISED population A 8->9 — a semantic fix smuggled inside a cost fix.
+    # Filed separately; this change is performance-only, zero delta.
     claims_id=0
     if grep -qE '^[[:space:]]*id\(\)' "$f" \
        && { grep -qE '^[[:space:]]*id\(\).*\-un' "$f" \
             || grep -qzE 'id\(\)[[:space:]]*\{[^}]*\-un' "$f"; }; then claims_id=1; fi
-    # Population B — pins the seams the derivation actually reads.
-    pins=0
-    _pins_seams "$f" && pins=1
+    read -r pins srcs asrt <<<"$(_file_facts "$f")"
 
     (( claims_id || pins )) || continue
 
@@ -189,7 +246,7 @@ _scan_identity_stubs() {
     # '' — so `[[ -z "$pin" ]]` becomes "the empty string is empty" and cannot fail —
     # and the product code under test runs with its actor derivation missing. All
     # three symptoms are silent. Measured in gate_tier2_nonce_evidence_unit.sh.
-    if (( pins )) && ! _sources_actor "$f"; then
+    if (( pins )) && (( ! srcs )); then
       printf '%s\tpins the identity seams but never sources lib/actor.sh — the override lands on nothing, any assertion through the resolver is command-not-found (yields '"''"', which is the PASS value), and the product code runs with its actor derivation missing\n' "$base"
       continue
     fi
@@ -199,7 +256,7 @@ _scan_identity_stubs() {
       continue
     fi
     # (2) and the pin must be asserted through the real resolver
-    if (( claims_id )) && ! _asserts_resolver "$f"; then
+    if (( claims_id )) && (( ! asrt )); then
       printf '%s\tpins the identity seams but never asserts the pin through the real resolver (_gate_authenticated_actor / _gate_uid_to_agent / actor_seam_selftest)\n' "$base"
     fi
   done
@@ -209,15 +266,16 @@ _scan_identity_stubs() {
 # as the scan, deliberately NOT a second implementation of the rules: it counts who
 # is LOOKED AT, which is the number a shrinking guard makes disappear quietly.
 _census() {
-  local dir="$1" f base a=0 b=0
+  local dir="$1" f base a=0 b=0 _c _p _s _a
   for f in "$dir"/*.sh; do
     [[ -e "$f" ]] || continue
-    base="$(basename "$f")"
+    base="${f##*/}"
     [[ "$base" == "$SELF" || -n "${ALLOW[$base]:-}" ]] && continue
     if grep -qE '^[[:space:]]*id\(\)' "$f" \
        && { grep -qE '^[[:space:]]*id\(\).*\-un' "$f" \
             || grep -qzE 'id\(\)[[:space:]]*\{[^}]*\-un' "$f"; }; then a=$((a+1)); fi
-    _pins_seams "$f" && b=$((b+1))
+    read -r _p _s _a <<<"$(_file_facts "$f")"   # DIVE-3302: one awk for the three
+    (( _p )) && b=$((b+1))
   done
   printf '%s %s' "$a" "$b"
 }
@@ -417,7 +475,7 @@ DROP_RESOLVER='{ if ($0 ~ /^[[:space:]]*#/ || $0 ~ /printf/) print; else { gsub(
 
 a7_n=0; a7_prose=0; a7_missed=()
 for f in tests/*.sh; do
-  base="$(basename "$f")"
+  base="${f##*/}"
   [[ "$base" == "$SELF" || -n "${ALLOW[$base]:-}" ]] && continue
   _pins_seams "$f" || continue
   _sources_actor "$f" || continue                       # only files that currently PASS rule (0)
@@ -433,7 +491,7 @@ done
 
 a8_n=0; a8_prose=0; a8_missed=()
 for f in tests/*.sh; do
-  base="$(basename "$f")"
+  base="${f##*/}"
   [[ "$base" == "$SELF" || -n "${ALLOW[$base]:-}" ]] && continue
   grep -qE '^[[:space:]]*id\(\)' "$f" \
     && { grep -qE '^[[:space:]]*id\(\).*\-un' "$f" || grep -qzE 'id\(\)[[:space:]]*\{[^}]*\-un' "$f"; } || continue
