@@ -2242,7 +2242,11 @@ _hb_gate_ttl_sweep() {
     [[ -n "$lines_main" ]] && text+=$'\n'"$lines_main"
     [[ -n "$lines_manual" ]] && text+=$'\n\n'"🛠 Manual steps — one ~15-min batch clears these:"$'\n'"$lines_manual"
     text+=$'\n\n'"Answer from the original alert's buttons, the dashboard, or tap a /task link. Re-pings weekly until answered."
-    _task_send_owner "$text" "" "$reminder_ids" || true
+    # DIVE-3342: a gate reminder is a gate send — it goes to the person who may
+    # clear these rows. A batch spanning two owners is refused and logged by the
+    # send (never delivered to the wrong person); those rows still re-nag
+    # per-owner through _hb_gate_renag_sweep, which partitions.
+    _task_send_gate_owner "$text" "" "$reminder_ids" || true
     # OSS-12: SLA escalation — walk the org chart. If any of this agent's stale
     # gates has aged past _HB_GATE_ESCALATE_DAYS, also loop in its org-chart
     # parent (agents_org.reports_to) so the gate escalates up the chain instead
@@ -2290,7 +2294,32 @@ _HB_GATE_RENAG_WHERE="need_type IS NOT NULL AND need_answered_at IS NULL
        OR gate_pinged_at < datetime(COALESCE(need_asked_at,updated_at,created_at),'+1 hour')
        OR gate_pinged_at <= datetime('now','-24 hours'))"
 
+# DIVE-3342: partition a re-nag batch by the PERSON each gate belongs to, then
+# run the renderer once per owner. This sweep is the surface that caused the
+# reported harm — a customer CTO re-nagged nightly for six days on rows he had no
+# relationship to — and the reason was structural: the batch renders one message
+# for every gate a recipient agent holds and then sent it to whoever last DM'd
+# that agent's bot. Rendering per owner is what makes "deliver to the clearer"
+# expressible for a batch; without it, a mixed batch can only be refused.
+# Rows nobody owns (group `-`) still go through the renderer: it calls
+# _task_send_gate_owner, which holds them on the agent rail and records why,
+# rather than falling back to the allowlist.
 _hb_gate_renag_batch() { # <recipient_agent> <comma-separated task ids> <route_label>
+  local recipient="$1" idlist="$2" label="${3:-}"
+  if ! _human_registry_active; then
+    _hb_gate_renag_batch_one "$recipient" "$idlist" "$label"
+    return $?
+  fi
+  local line owner ids rc=0
+  while IFS=$'\t' read -r owner ids; do
+    [[ -n "$ids" ]] || continue
+    _hb_log "[gate-renag] owner=${owner} rows=${ids} (partitioned by human owner)"
+    _hb_gate_renag_batch_one "$recipient" "$ids" "$label" || rc=$?
+  done < <(_human_gate_ids_by_owner "$idlist")
+  return $rc
+}
+
+_hb_gate_renag_batch_one() { # <recipient_agent> <comma-separated task ids> <route_label>
   local recipient="$1" idlist="$2" route_label="$3"
   [[ -n "$recipient" && "$idlist" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 0
   # DIVE-1927: an unpaired recipient used to mean "retry next heartbeat" forever —
@@ -2360,7 +2389,7 @@ _hb_gate_renag_batch() { # <recipient_agent> <comma-separated task ids> <route_l
   # is root and names no agent; without this every :NN:02 delivery is
   # indistinguishable from a file-time send by the same uid.
   TASK_GATE_RENAG=1
-  _task_send_owner "$text" "$reply_markup" "$idlist"
+  _task_send_gate_owner "$text" "$reply_markup" "$idlist"
   TASK_GATE_RENAG=""
   if [[ "${TASK_SEND_DELIVERED:-0}" == "1" ]]; then
     # Do not invalidate the original alert's nonce until the new button-bearing

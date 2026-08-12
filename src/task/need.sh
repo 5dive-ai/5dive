@@ -1328,6 +1328,7 @@ _gate_tapback_stats() {
 cmd_task_need() {
   tasks_db_init
   local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw="" discusses="" needs="" oob="" rubber_stamp="" gate_mode=""
+  local gate_owner=""   # DIVE-3342
   # DIVE-2627: which flag supplied each prose value (see _read_prose_file).
   local ask_src="" recommend_src=""
   local -a positional=()
@@ -1376,6 +1377,14 @@ cmd_task_need() {
       # inferred — inferring it from --type or from the ask text would be the
       # DIVE-2089 mistake one layer up (reading subject matter to guess intent).
       --needs=*)     needs="${1#*=}" ;;
+      # DIVE-3342: name the PERSON this gate belongs to (humans.id). Optional — the
+      # filer usually should not have to say, and when they do not, task_need_notify
+      # resolves it from who may CLEAR the gate. Use it when the gate is somebody
+      # specific's (a spend approval only the budget holder can give) and the org
+      # chart does not express that.
+      --owner=*)     gate_owner="${1#*=}"
+                     [[ -n "$(db "SELECT 1 FROM humans WHERE id=$(sqlq "$gate_owner") LIMIT 1;" 2>/dev/null)" ]] \
+                       || fail "$E_NOT_FOUND" "no human account '$gate_owner' (5dive human ls; add it with: sudo 5dive human add $gate_owner --telegram=<chat id>)" ;;
       # DIVE-2848: the AUDITED exception to the keystroke cap below. Declared,
       # never inferred, and written to the gate row — an escape that leaves no
       # record is `--tier=2` with extra steps, which is the thing being fixed.
@@ -2493,6 +2502,15 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
   # nothing in the output distinguished it from success. One cheap read-back turns
   # the whole class (bad SQL, a locked store, a failed BEGIN IMMEDIATE) from a
   # false green into a refusal, BEFORE anyone is notified about it.
+  # DIVE-3342: an explicitly declared owner is written here, on the row, before
+  # anything is notified — task_need_notify then stamps only when this is empty, so
+  # the filer's declaration always beats the resolver. Validated at parse time
+  # against a LIVE human row: a typo'd owner that silently fell back to resolution
+  # would be the confident-wrong-recipient failure this ticket is about.
+  if [[ -n "$gate_owner" ]]; then
+    db "UPDATE tasks SET human_owner=$(sqlq "$gate_owner") WHERE id=${id};" 2>/dev/null || true
+  fi
+
   if [[ "$(db "SELECT CASE WHEN status='blocked' AND need_type IS NOT NULL
                              AND need_asked_at IS NOT NULL THEN 1 ELSE 0 END
                FROM tasks WHERE id=${id};" 2>/dev/null)" != "1" ]]; then

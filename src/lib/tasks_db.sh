@@ -267,6 +267,18 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- _TASKS_ADDITIVE_COLUMNS: a fresh store takes this CREATE and never runs the
   -- ALTER loop, per the rule above.
   gate_mode TEXT,
+  -- DIVE-3342: the PERSON this gate belongs to — humans.id, stamped when the gate
+  -- is filed (or declared with `task need --owner=`). routed_reviewer above names
+  -- the AGENT who may clear it; this names the human who may, which until now was
+  -- never recorded anywhere and was re-derived at send time from whoever last
+  -- DM'd the bot. Recorded, not re-derived, for the same reason
+  -- route_provenance is (DIVE-3171): the org chart is agent-writable and a chart
+  -- edit between filing and paging would otherwise move a live gate to a
+  -- different person. NULL is a real third state — a gate filed before this
+  -- column, or one whose clearers no human owns — and it means "no person is
+  -- named", never "send it to everybody". Declared HERE as well as in
+  -- _TASKS_ADDITIVE_COLUMNS, per the rule above.
+  human_owner TEXT,
   parent_id   INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   started_at  TEXT,
@@ -667,6 +679,33 @@ CREATE TABLE IF NOT EXISTS agents_org (
   title       TEXT,
   updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- DIVE-3342: HUMANS as first-class records. agents_org above says who reports to
+-- whom; nothing said who the PEOPLE are. A person existed only as a numeric chat
+-- id inside one bot's access.json allowFrom, so gate routing could name an agent
+-- clearer but never a person, and which human a gate actually paged was decided
+-- by last-human-chat.json — whoever DM'd that bot most recently — fanning out to
+-- the whole allowlist when no pointer resolved. Rationale, the measured harm, and
+-- why ZERO rows must preserve the old delivery path exactly: src/cmd_human.sh.
+-- A row here is an IDENTITY, never a grant: a telegram_id is still only
+-- deliverable if the receiving bot's allowFrom contains it (enforced at the send
+-- site, where the bot is known). Keep these two definitions byte-identical to the
+-- copies in _tasks_db_migrate below (tests/schema_sync_unit.sh).
+CREATE TABLE IF NOT EXISTS humans (
+  id           TEXT PRIMARY KEY,
+  display_name TEXT,
+  telegram_id  TEXT,
+  buzz_npub    TEXT,
+  discord_id   TEXT,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS human_agents (
+  human_id TEXT NOT NULL REFERENCES humans(id) ON DELETE CASCADE,
+  agent    TEXT NOT NULL,
+  PRIMARY KEY (human_id, agent)
+);
+CREATE INDEX IF NOT EXISTS human_agents_agent_idx ON human_agents(agent);
 
 CREATE INDEX IF NOT EXISTS tasks_status_idx   ON tasks(status);
 CREATE INDEX IF NOT EXISTS tasks_assignee_idx ON tasks(assignee, status);
@@ -1343,6 +1382,9 @@ _TASKS_ADDITIVE_COLUMNS=(
   'graded_at TEXT' 'graded_by TEXT'
   # DIVE-2354: approve-to-send | confirm-after-send. See the CREATE TABLE comment.
   'gate_mode TEXT'
+  # DIVE-3342: humans.id of the person who may CLEAR this gate. See the CREATE
+  # TABLE comment — recorded at filing, never re-derived from bot traffic.
+  'human_owner TEXT'
 )
 
 # DIVE-3098 - TERMINAL FOR THE VERIFIER, as ONE SQL boolean expression.
@@ -2073,6 +2115,38 @@ MIG
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE objectives ADD COLUMN run_mode TEXT NOT NULL DEFAULT 'live';" >/dev/null 2>&1 || true
     fi
+  fi
+  # DIVE-3342 humans + human_agents for existing stores. Guarded on the table it
+  # creates (the DIVE-1922 lesson: nesting it under another table's absence check
+  # means it never runs on any live box and the feature is a silent no-op that
+  # looks exactly like "nobody has been added yet"). Two brand-new tables, never
+  # referenced by tasks/projects, so creating them cannot touch the queue — and
+  # they start EMPTY, which is deliberately load-bearing here: an empty registry
+  # is the signal that gate delivery keeps its pre-DIVE-3342 behaviour, so this
+  # migration changes NOTHING about how any existing box pages its human until
+  # someone runs `5dive human add`. Keep both definitions byte-identical to the
+  # copies in _tasks_schema above (tests/schema_sync_unit.sh).
+  local has_humans
+  has_humans=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='humans' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_humans" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" <<'MIG' >/dev/null 2>&1 || true
+CREATE TABLE IF NOT EXISTS humans (
+  id           TEXT PRIMARY KEY,
+  display_name TEXT,
+  telegram_id  TEXT,
+  buzz_npub    TEXT,
+  discord_id   TEXT,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS human_agents (
+  human_id TEXT NOT NULL REFERENCES humans(id) ON DELETE CASCADE,
+  agent    TEXT NOT NULL,
+  PRIMARY KEY (human_id, agent)
+);
+CREATE INDEX IF NOT EXISTS human_agents_agent_idx ON human_agents(agent);
+MIG
   fi
   _tasks_db_stamp_schema_epoch
 }

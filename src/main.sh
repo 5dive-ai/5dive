@@ -235,6 +235,12 @@ Org chart (who reports to whom):
   5dive org tree | show <agent> | ls | rm <agent>
   # full surface: 5dive org --help
 
+Human accounts (who may CLEAR a gate — one identity, all transports):
+  5dive human add <id> [--name=] [--telegram=<chat id>] [--buzz=<npub>] [--discord=<id>]
+  5dive human link <id> --agent=<name>               # that human owns that agent's gates
+  5dive human ls | show <id> | owner <agent> | recipient <ident> | rm <id>
+  # With NO human accounts, gate delivery is unchanged. full surface: 5dive human --help
+
 Web UI for this host (org chart, queue, gates):
   5dive ui [--port=8735] [--host=127.0.0.1]          # open the three views in a browser. Read-only, no sign-in.
   5dive ui --data | --html                           # the JSON the views render / the page itself
@@ -919,6 +925,13 @@ main() {
     org)
       # Agent org chart (sqlite, same store as tasks). Read/write, no audit/lock.
       cmd_org "$@" ;;
+    human|humans)
+      # DIVE-3342: human accounts — one identity per person carrying their
+      # telegram/buzz/discord ids, so a gate can name the PERSON who may clear it
+      # instead of delivery guessing from whoever last DM'd the bot. Same store as
+      # tasks/org; reads unprivileged, writes take root themselves (the table is
+      # trusted input to gate delivery). No lock: plain sqlite writes, like org.
+      cmd_human "$@" ;;
     ui)
       # DIVE-2655: the free single-host web UI (org chart / queue / gates).
       # Reads the same group-writable store as tasks + org; GET/HEAD only, no
