@@ -1,6 +1,40 @@
 # Changelog
 
-## Unreleased — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
+## v0.19.29 — fix(task): `task add` refuses a flag swallowed past `--` instead of storing it as title text (DIVE-3107)
+
+`5dive task add ... -- "<title>" --body="<text>"` puts `--body=` on the **wrong side** of the
+end-of-flags separator, so it never parses as a flag at all: it is appended to the positional
+title words. The add succeeded, silently. DIVE-3100 was filed that way — a **628-char title**
+whose text began `--body=MEASURED 2026-08-09…`, with the body column **empty**. Nobody saw it
+until a grader read the row days later, and by then delivered title/body are frozen, so the row
+could not be repaired in place.
+
+Add-time is the only moment the filer can still act on it, so it is now a refusal there. Two
+independent tells, either sufficient:
+
+- **A `--<word>=` token in the title.** The refusal names the leaked flag (`--body`, `--accept`, …),
+  says it landed after the `--`, and shows the title as parsed, so the swallow is visible in the
+  same breath rather than discovered later.
+- **A title over 200 characters.** No legitimate title is that long; this catches the same accident
+  when the swallowed text carries no `=` (a `--body-file` payload pasted inline, for instance).
+
+**A `--word` with no `=` is not a tell** — `"a title with -- a dash and --verbose"` still files.
+The refusal is on the equals form, which is unambiguously a flag name that crossed the separator.
+
+**`--materialized` is exempt from both tells**, and that is the narrow carve-out, not a general
+opt-out. The internal writers (`cmd_goal`, `cmd_loop`, `cmd_objective`, `cmd_proof`,
+`cmd_loop_pack`) build their argv programmatically with every flag already on the correct side of
+`--`, so the swallow this guards **cannot occur** on those paths — while their titles are user
+prose (`Goal: <outcome>`) that may legitimately run long, and a refusal mid-batch would abort a
+whole materialization over a cosmetic length. Unlike the DIVE-2681 filing cap, which is about what
+a title **means**, this guard is about how the command line was **typed**.
+
+`tests/task_add_flag_swallow_unit.sh` (new, core tier, 1.4s measured locally on the control plane):
+11 arms — the exact DIVE-3100 shape refused, no row written on refusal, a second leaked flag
+(`--accept=`), the length tell reporting its measured length, the correct invocation still filing
+with its body intact, the `--word`-without-`=` non-false-positive, and the `--materialized` exemption.
+
+## v0.19.29 — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
 
 `5dive agent config <name> set channels=<current>,buzz` could not succeed on any seat that was not
 **created** with buzz. `cmd_config` dispatches `install_channel_for_agent` for telegram, discord and
@@ -33,7 +67,7 @@ arms grade the satisfier next to the gate, and drive `cmd_config` for real — w
 that the same call reaches the restart once the cache is staged, so the rollback arms cannot pass
 against a `cmd_config` that simply refuses everything.
 
-## Unreleased — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
+## v0.19.29 — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
 
 DIVE-2483's gate answer said the preservation notice lands on **stdout**. It lands on **stderr**,
 via the fleet's `warn()`. Six arms were written for that condition and all six were green, because
@@ -67,7 +101,7 @@ Still open and scoped out on purpose: `task reject` remains an unguarded writer 
 column (`src/cmd_task.sh:4235`). That is a design question about accumulating verifier feedback, not
 this gap.
 
-## Unreleased — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
+## v0.19.29 — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
 
 DIVE-3272 taught the supervisor BOARD to see a seat that is alive and closing nothing. The
 drill-down people actually type kept printing only liveness: `state: active / enabled` was
@@ -109,7 +143,7 @@ supervisor:  quota-exhausted / quota-exhausted — pane shows a model-capacity r
 - `agent list` is unchanged — it is the survey surface, and this is a per-agent drill-down
   (three sqlite reads), deliberately not an N-way fan-out.
 
-## Unreleased — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
+## v0.19.29 — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
 
 A gate reaches the filer's lead only if `_GATE_ENG_SHIP_RX` matches the ask or the row
 title. `gate_builder_routing` is OFF by default, so for an ordinary builder ship gate that
@@ -173,7 +207,7 @@ prose for identifiers.
   `gate_access_lead_clear`, `gate_internal_ops_floor`, `task_needs_human_parity`,
   `task_inbox_json_tier`, `push_unit`, `broker_surface`, + 15 more).
 
-## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
+## v0.19.29 — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
 
 DIVE-1935's first iteration was rejected, and for the right reason. It added a
 `sudo -n -u claude gh auth token` arm to `_gate_gh_token` justified by *"agents hold
