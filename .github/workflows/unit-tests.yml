@@ -802,7 +802,7 @@ jobs:
             echo
             echo "| environment | shards reporting | harnesses | UN-SHARDED total | budget | shards NEEDED |"
             echo "|---|---:|---:|---:|---:|---:|"
-            total_row pristine 'core-pristine-[0-9]*.txt'
+            total_row pristine 'nothing-matches-this-glob-*.txt'
             total_row installed-host 'core-installed-[0-9]*.txt'
             echo
             echo "Per-shard (this is what the budget is enforced on):"
