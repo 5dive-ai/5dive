@@ -87,8 +87,18 @@ ROUTE_FILE="$TMP/route.log"
 5dive() { if [[ "${1:-}" == "agent" && "${2:-}" == "send" ]]; then printf '%s\n' "${3:-}" >>"$ROUTE_FILE"; fi; return 0; }
 export -f 5dive 2>/dev/null || true
 route_reset() { : >"$ROUTE_FILE"; HUMAN_PINGED=0; spy_reset; }
-route_sent()  { local i n; for i in $(seq 1 10); do [[ -s "$ROUTE_FILE" ]] && break; sleep 0.05; done; n=$(grep -c . "$ROUTE_FILE" 2>/dev/null); echo "${n:-0}"; }
-route_last()  { local i; for i in $(seq 1 10); do [[ -s "$ROUTE_FILE" ]] && break; sleep 0.05; done; tail -n1 "$ROUTE_FILE" 2>/dev/null; }
+# DIVE-3298: these two used to poll `for i in $(seq 1 10); do ... sleep 0.05; done`
+# before reading ROUTE_FILE. There is nothing to wait for. The `5dive` send is the
+# plain bash FUNCTION defined above, called in-process by cmd_task_need — no
+# subshell, no `&`, no external process — so the write has already happened by the
+# time the call returns. The poll only ever ran to completion on the arms that
+# EXPECT an empty file (the A2 quartet, A3, A4, A6), where it burned the full
+# 10x0.05s before confirming the emptiness it was always going to confirm: 3.56s of
+# the harness's 14.75s, entirely on its negative arms. Measured 31/31 both ways.
+# If the routed send is ever moved off-process, restore a wait HERE — but assert on
+# the process, not on a sleep that passes by timing out.
+route_sent()  { local n; n=$(grep -c . "$ROUTE_FILE" 2>/dev/null); echo "${n:-0}"; }
+route_last()  { tail -n1 "$ROUTE_FILE" 2>/dev/null; }
 rr_of()       { db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='$1';"; }
 rp_of()       { db "SELECT COALESCE(route_provenance,'') FROM tasks WHERE ident='$1';"; }
 tier_of()     { db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='$1';"; }
