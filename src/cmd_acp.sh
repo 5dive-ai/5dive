@@ -183,7 +183,12 @@ type Roster = { agents: Agent[]; status: RosterStatus; detail: string };
 async function roster(): Promise<Roster> {
   let detail = "";
   let sawCli = false;
-  for (const argv of rosterArgvs()) {
+  const candidates = rosterArgvs();
+  for (let i = 0; i < candidates.length; i++) {
+    const argv = candidates[i];
+    // Candidate 0 IS our CLI (or the ACP_CLI_BIN override). Candidate 1 is `sudo`,
+    // a DIFFERENT binary that merely tries to reach ours.
+    const isDirect = i === 0;
     const cmd = [...argv, "agent", "list", "--json"];
     let out = "", errTxt = "", code = -1;
     try {
@@ -197,17 +202,22 @@ async function roster(): Promise<Roster> {
       log(`${cmd[0]}: ${(e as Error).message}`);
       continue;
     }
-    // NEITHER not-found shape we actually meet is a 127. Bun.spawn THROWS for a
-    // missing binary (caught above), and `sudo -n <missing>` exits **1** with
-    // sudo's own "command not found" — 127 is a shell convention and no shell is
-    // in this path. Measured, not assumed. Reaching SUDO is not reaching our CLI:
-    // without this, a laptop that has sudo and no 5dive sets sawCli on the sudo
-    // candidate and reports `unreachable` — "make this machine one (`5dive init`)"
-    // — naming a binary the reader does not have, in exactly the download-and-run
-    // case this whole change exists for. It must read `no-cli`: "install the CLI".
-    const notFound = code === 127 || /^sudo: .*: command not found\b/m.test(errTxt);
-    if (notFound) { if (!detail) detail = errTxt || `${cmd[0]}: not found`; continue; }
-    sawCli = true;
+    if (code === 127) { if (!detail) detail = errTxt || `${cmd[0]}: not found`; continue; }
+    // DOES THIS PROVE OUR CLI EXISTS? Only the DIRECT candidate proves it by merely
+    // running — it IS the binary. `sudo` running proves only that SUDO exists, so it
+    // may claim the CLI only by producing a 5dive ANSWER (below).
+    //
+    // Deliberately NOT decided from sudo's failure: the exit status is a sudo-version
+    // property (a missing command is 1 here, NOT the 127 a shell would give — measured)
+    // and the wording is gettext-localised, so "command not found" is absent on a
+    // non-English laptop. Both are the wrong thing to pin, and the laptop is the case
+    // this exists for. Pinning presence on OUR OWN output instead is locale-proof and
+    // version-proof. (quinn flagged the 1-vs-127 hinge on review; this removes it.)
+    //
+    // What it prevents: a machine with sudo and no 5dive reporting `unreachable` —
+    // "make this machine one (`5dive init`)" — naming a binary the reader does not
+    // have, in exactly the registry download-and-run case. It must read `no-cli`.
+    if (isDirect) sawCli = true;
     // Our own CLI answers a STRUCTURED envelope on stdout even when it fails —
     // {"ok":false,"error":{"code":10,"class":"permission","message":"must run as
     // root — try: sudo …"}} — so the reason is READ, not grepped off stderr. Fall
@@ -220,6 +230,9 @@ async function roster(): Promise<Roster> {
     }
     const env = (j && typeof j === "object") ? (j as any) : null;
     const d = env && "data" in env ? env.data : j;
+    // A 5dive envelope is our CLI SPEAKING, so it settles presence for the sudo
+    // candidate too — this is the locale-proof half of the sawCli rule above.
+    if (env) sawCli = true;
     if (code === 0 && Array.isArray(d)) {
       const agents = (d as Agent[]).filter((a) => a && typeof a.name === "string");
       // A SUCCESSFUL read of an empty fleet is authoritative: do not escalate to

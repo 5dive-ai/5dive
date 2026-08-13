@@ -404,12 +404,16 @@ want "$(! grep -q 'password is required' <<<"$c" && echo true)" \
   "and never hands the user sudo's complaint instead of 5dive's"
 
 # (f) SUDO EXISTS AND 5DIVE DOES NOT — the registry's own download-and-run case,
-# and the arm that caught a real misdiagnosis. `sudo -n <missing>` exits **1** with
-# sudo's own "command not found" (measured; 127 is a shell convention and no shell
-# is in this path), so a `code === 127` test alone lets the SUDO candidate set
-# "we reached the CLI". The box then reads as `unreachable` and tells a reader with
-# no 5dive binary to run `5dive init`. PATH is ONLY this dir: the real 5dive must be
-# invisible, so unlike arm (e) it deliberately does not append $PATH.
+# and the arm that caught a real misdiagnosis: the box read as `unreachable` and told
+# a reader with no 5dive binary to run `5dive init`. PATH is ONLY this dir: the real
+# 5dive must be invisible, so unlike arm (e) it deliberately does not append $PATH.
+#
+# THE STUB ANSWERS IN FRENCH ON PURPOSE. sudo's failure is not a usable signal — its
+# exit status for a missing command is a sudo-version property (1 here, not the 127 a
+# shell gives) and its wording is gettext-localised. Presence is therefore decided on
+# OUR side (direct-candidate-ran, or a 5dive envelope came back), never by reading
+# sudo. A localised stub is what holds that: a regression to matching English
+# "command not found" passes an English stub and reds this one.
 mkdir -p "$WORK/nfbin"
 # ABSOLUTE shebang, unlike every other stub here: PATH is stripped to this dir, so
 # `#!/usr/bin/env bash` would need `bash` ON that PATH, fail to exec, and reach the
@@ -417,7 +421,7 @@ mkdir -p "$WORK/nfbin"
 # whether or not the code under test is correct. (It did; that is why this is here.)
 cat > "$WORK/nfbin/sudo" <<'PB3'
 #!/bin/bash
-for a in "$@"; do [[ "$a" == -* ]] && continue; echo "sudo: $a: command not found" >&2; exit 1; done
+for a in "$@"; do [[ "$a" == -* ]] && continue; echo "sudo: $a : commande introuvable" >&2; exit 1; done
 PB3
 chmod +x "$WORK/nfbin/sudo"
 {
