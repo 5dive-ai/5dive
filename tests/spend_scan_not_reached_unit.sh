@@ -128,10 +128,39 @@ scan "$T_OK"
 scan "$T_GONE"
 nr_t "missing transcript root" 'does not exist'
 
-# ======================= STATE 2: root present, UNREADABLE ===================
+# ============ STATE 2a: root present, unreadable — AT ANY UID ================
+# quinn, clearing this row's push gate: "if CI executes as uid 0, every EACCES
+# arm skips and the harness reports green having never touched the defect this
+# row exists to fix — a green that skipped the point is not a grade."
+#
+# So the defect CLASS is graded first by a condition permission bits cannot
+# express: the transcript dir is a regular FILE, which raises ENOTDIR for root
+# too (usage_coverage_unit.sh's trick, DIVE-2069). Root can read everything and
+# still cannot listdir a file. The EACCES arms below remain the unprivileged
+# extra — they are the shape production actually takes — but this one means the
+# harness can never be green WITHOUT having exercised an unreadable root.
+printf 'runner uid=%s (%s) — arms marked ANY-UID grade the defect regardless\n' "$(id -u)" "$(id -un)"
+H_NOTDIR="$TMP/home-notdiragent"; mkdir -p "$H_NOTDIR/.claude"
+: > "$H_NOTDIR/.claude/projects"          # a FILE where the transcript dir belongs
+LOOP_HOME_OVERRIDE_JSON=$(python3 -c '
+import json,os,sys
+m = json.loads(sys.argv[1]); m["notdiragent"] = sys.argv[2]; print(json.dumps(m))' \
+  "$LOOP_HOME_OVERRIDE_JSON" "$H_NOTDIR")
+python3 - "$REGISTRY" <<'PY'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["agents"]["notdiragent"] = {"type": "claude"}
+json.dump(d, open(p, "w"))
+PY
+T_NOTDIR=$(mk_task SS-10 notdiragent)
+scan "$T_NOTDIR"
+nr_t "ANY-UID: transcript root unreadable (ENOTDIR, defeats root too)" 'unreadable'
+
+# ======================= STATE 2b: root present, UNREADABLE ==================
 # The production condition, and the reporter's: /home/agent-* is mode 700 on a
-# shared host, so any peer's spend read as 0. Only meaningful unprivileged —
-# root reads a 000 dir regardless, so this is SKIPPED rather than faked.
+# shared host, so any peer's spend read as 0. EACCES is only expressible
+# unprivileged — root reads a 000 dir regardless — so this is SKIPPED rather
+# than faked, and 2a above is what keeps a root run from being a vacuous green.
 if [[ "$(id -u)" -eq 0 ]]; then
   printf 'skip - EACCES arms not runnable as root (the whole defect is invisible to a uid that can read everything)\n'
 else
