@@ -197,7 +197,16 @@ async function roster(): Promise<Roster> {
       log(`${cmd[0]}: ${(e as Error).message}`);
       continue;
     }
-    if (code === 127) { if (!detail) detail = errTxt || `${cmd[0]}: not found`; continue; }
+    // NEITHER not-found shape we actually meet is a 127. Bun.spawn THROWS for a
+    // missing binary (caught above), and `sudo -n <missing>` exits **1** with
+    // sudo's own "command not found" — 127 is a shell convention and no shell is
+    // in this path. Measured, not assumed. Reaching SUDO is not reaching our CLI:
+    // without this, a laptop that has sudo and no 5dive sets sawCli on the sudo
+    // candidate and reports `unreachable` — "make this machine one (`5dive init`)"
+    // — naming a binary the reader does not have, in exactly the download-and-run
+    // case this whole change exists for. It must read `no-cli`: "install the CLI".
+    const notFound = code === 127 || /^sudo: .*: command not found\b/m.test(errTxt);
+    if (notFound) { if (!detail) detail = errTxt || `${cmd[0]}: not found`; continue; }
     sawCli = true;
     // Our own CLI answers a STRUCTURED envelope on stdout even when it fails —
     // {"ok":false,"error":{"code":10,"class":"permission","message":"must run as

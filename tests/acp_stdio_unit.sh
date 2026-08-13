@@ -403,6 +403,40 @@ want "$(grep -q 'DIRECT-ANSWER' <<<"$c" && echo true)" \
 want "$(! grep -q 'password is required' <<<"$c" && echo true)" \
   "and never hands the user sudo's complaint instead of 5dive's"
 
+# (f) SUDO EXISTS AND 5DIVE DOES NOT — the registry's own download-and-run case,
+# and the arm that caught a real misdiagnosis. `sudo -n <missing>` exits **1** with
+# sudo's own "command not found" (measured; 127 is a shell convention and no shell
+# is in this path), so a `code === 127` test alone lets the SUDO candidate set
+# "we reached the CLI". The box then reads as `unreachable` and tells a reader with
+# no 5dive binary to run `5dive init`. PATH is ONLY this dir: the real 5dive must be
+# invisible, so unlike arm (e) it deliberately does not append $PATH.
+mkdir -p "$WORK/nfbin"
+# ABSOLUTE shebang, unlike every other stub here: PATH is stripped to this dir, so
+# `#!/usr/bin/env bash` would need `bash` ON that PATH, fail to exec, and reach the
+# server as a THROW — the no-CLI answer, by the wrong route. The arm then passes
+# whether or not the code under test is correct. (It did; that is why this is here.)
+cat > "$WORK/nfbin/sudo" <<'PB3'
+#!/bin/bash
+for a in "$@"; do [[ "$a" == -* ]] && continue; echo "sudo: $a: command not found" >&2; exit 1; done
+PB3
+chmod +x "$WORK/nfbin/sudo"
+{
+  req '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2}}'
+  req '{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp"}}'
+  req '{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"5dive-1","prompt":[{"type":"text","text":"do the thing"}]}}'
+# `env` sets the stripped PATH on the SERVER only. Writing `PATH=... timeout` would
+# resolve `timeout` itself against the stripped PATH, find nothing, and run no
+# server at all — whereupon the `5dive init` assertion below passes on empty output.
+} | ( unset ACP_CLI_BIN; timeout 60 env PATH="$WORK/nfbin" "$BUN" "$ACP_RUN_DIR/acp-server.ts" ) \
+    2>>"$WORK/err.log" >"$WORK/nosudocli.jsonl" || true
+c=$(chunks_of "$WORK/nosudocli.jsonl")
+want "$([[ -n "$c" ]] && echo true)" \
+  "sudo present, 5dive absent: the server answered at all — empty output would pass the negative below for free"
+want "$(grep -q 'CLI is not reachable' <<<"$c" && echo true)" \
+  "sudo present, 5dive absent: reads as an absent CLI, not an absent fleet: ${c:0:70}"
+want "$(! grep -qi '5dive init' <<<"$c" && echo true)" \
+  "sudo present, 5dive absent: and never tells a reader with no 5dive binary to run \`5dive init\`"
+
 # (d) NEGATIVE CONTROL over the three arms above. They are substring greps, and a
 # server that answered ONE generic empty-roster sentence to every cause would pass
 # any one of them read alone. The distinctness is the deliverable, so assert it:
