@@ -197,10 +197,26 @@ cmd_task_add() {
   # TOKEN (role:<r> / charter:<kw> / @name). Route tokens through the org chart;
   # a literal name is trusted verbatim (explicit --assignee always wins). A token
   # with no UNIQUE holder is a hard, EXPLAINABLE error — never a silent misroute.
+  local role_pick_note=""
   if [[ -n "$assignee" ]]; then
     case "$assignee" in
       role:*|charter:*|@*)
-        local _resolved; _resolved=$(_org_resolve_assignee "$assignee")
+        local _resolved _token="$assignee"; _resolved=$(_org_resolve_assignee "$assignee")
+        # DIVE-3366: a role with TWO holders is not an unanswerable question — it
+        # is the one the board most needs answered, and answering it with a
+        # refusal is what sends every row to the seat the filer remembers. Runs
+        # ONLY on the empty (previously fatal) path, so a token that already
+        # resolved is untouched. The verifier seat is excluded from the
+        # candidates, which is how a loop row gets a build lane that is not its
+        # own grader instead of the refusal below.
+        if [[ -z "$_resolved" && "$_token" == role:* ]] \
+           && _task_role_least_loaded "${_token#role:}" "$verifier"; then
+          _resolved="$_TASK_ROLE_PICK"
+          # Recorded on the row, not only warned at the prompt: the counts that
+          # made this choice have moved by the time anyone audits it.
+          role_pick_note="ROUTED BY LOAD (DIVE-3366): --assignee=${_token} -> ${_resolved}${verifier:+ (verifier '${verifier}' excluded from the candidates)}. Open-row counts at filing: ${_TASK_ROLE_PICK_BASIS}."
+          warn "$role_pick_note"
+        fi
         [[ -n "$_resolved" ]] || fail "$E_NOT_FOUND" "--assignee='$assignee' has no unique holder in the org chart — name an agent, or fix the role: 5dive org set"
         assignee="$_resolved"
         ;;
@@ -439,6 +455,18 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
     body="${body:+$body
 
 }FILING-CAP EXCEPTION (already blocked shipped work): ${already_blocked}"
+  fi
+  # DIVE-3366 acceptance 1: "its choice is recorded so it can be audited". Same
+  # reason as the cap exception directly above — a router whose choice leaves no
+  # trace cannot be audited, and this one is worse than the cap: the INPUT that
+  # decided it (each seat's open-row count) is a moving number, so by the time
+  # anyone asks why this lane got the row, the counts that answer no longer exist
+  # anywhere. Recorded on the row, not only in the warn line at the prompt, which
+  # the filer's terminal is the only witness to.
+  if [[ -n "$role_pick_note" ]]; then
+    body="${body:+$body
+
+}${role_pick_note}"
   fi
   # DIVE-969: verifier-by-default posture. For a NON-TRIVIAL standard task where
   # the creator neither wired the loop themselves (--accept/--verify/--verifier)
@@ -710,6 +738,14 @@ cmd_task_ls() {
                   ELSE status END AS status,
              priority, COALESCE(assignee,'-') AS assignee, title FROM tasks WHERE ${where} ${order};"
     fi
+    # DIVE-3366 acceptance 3: the skew belongs ON THE BOARD, under the queue,
+    # because that is where the routing decision is actually made — a number in a
+    # digest nobody reads at filing time is why lodar had to raise this by hand
+    # three times in one day. Suppressed under --assignee/--mine: a single-lane
+    # view is not a routing view, and a note about two other seats there is noise.
+    # Human path only; the --json branch returns above and its consumers must not
+    # find a new advisory in their payload.
+    [[ -n "$assignee" ]] || _task_role_skew_note
   fi
 }
 
