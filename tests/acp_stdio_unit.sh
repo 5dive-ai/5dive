@@ -76,6 +76,69 @@ rc=0
 out=$(cmd_acp --nonsense 2>&1 >/dev/null) || rc=$?
 want "$([[ $rc -eq 2 ]] && echo true)" "an argument is a usage error (2), got $rc"
 
+# --- 1b. WHERE the server stages (DIVE-3361) -----------------------------------
+# The ACP registry's required verify-auth job spawns this verb as an unprivileged
+# sandbox user, so a root-only staging default is not cosmetic: `cat >
+# /opt/5dive/acp-server.ts` is Permission denied and the listing fails with no ACP
+# frame on the wire at all. Graded here, ABOVE the bun gate, because a stub bin
+# answers the preflight — so these arms still run on a box with no bun.
+#
+# THE UNWRITABLE DEFAULT IS A FILE'S CHILD, NOT A chmod. A `chmod 500` directory is
+# writable by root, so on a container CI that runs this harness as root the arms
+# below would grade the opposite branch; `$WORK/notadir` is a regular file, so
+# `mkdir -p "$WORK/notadir/5dive"` is ENOTDIR for every uid there is.
+printf 'not a directory\n' > "$WORK/notadir"
+cat > "$WORK/fake-bun" <<'FAKE_BUN'
+#!/usr/bin/env bash
+exit 0
+FAKE_BUN
+chmod +x "$WORK/fake-bun"
+
+# (a) default unreachable + a HOME: falls back to the XDG cache dir and RUNS.
+rc=0
+( export ACP_RUN_DIR_DEFAULT="$WORK/notadir/5dive" ACP_BUN_BIN="$WORK/fake-bun" HOME="$WORK/h1"
+  unset ACP_RUN_DIR XDG_CACHE_HOME
+  cmd_acp ) >/dev/null 2>"$WORK/stage-a.err" || rc=$?
+want "$([[ $rc -eq 0 && -f "$WORK/h1/.cache/5dive/acp-server.ts" ]] && echo true)" \
+  "an unwritable default stages under \$HOME/.cache/5dive instead (rc=$rc)"
+
+# (b) XDG_CACHE_HOME wins over \$HOME/.cache when it is set — that variable is one
+# of the few the registry client passes through to us, so it is the tier CI may hit.
+rc=0
+( export ACP_RUN_DIR_DEFAULT="$WORK/notadir/5dive" ACP_BUN_BIN="$WORK/fake-bun" HOME="$WORK/h2" XDG_CACHE_HOME="$WORK/xdg"
+  unset ACP_RUN_DIR
+  cmd_acp ) >/dev/null 2>"$WORK/stage-b.err" || rc=$?
+want "$([[ $rc -eq 0 && -f "$WORK/xdg/5dive/acp-server.ts" && ! -e "$WORK/h2/.cache/5dive/acp-server.ts" ]] && echo true)" \
+  "XDG_CACHE_HOME takes the fallback ahead of \$HOME/.cache (rc=$rc)"
+
+# (c) A WRITABLE default is still used first: a managed box does not move.
+rc=0
+( export ACP_RUN_DIR_DEFAULT="$WORK/optlike" ACP_BUN_BIN="$WORK/fake-bun" HOME="$WORK/h3"
+  unset ACP_RUN_DIR XDG_CACHE_HOME
+  cmd_acp ) >/dev/null 2>"$WORK/stage-c.err" || rc=$?
+want "$([[ $rc -eq 0 && -f "$WORK/optlike/acp-server.ts" && ! -e "$WORK/h3/.cache/5dive/acp-server.ts" ]] && echo true)" \
+  "a writable default still wins — the VM's /opt/5dive layout is unchanged (rc=$rc)"
+
+# (d) An EXPLICIT ACP_RUN_DIR is the only candidate. Falling back past a directory
+# the caller named would stage, and then exec, somewhere they never asked for.
+rc=0
+out=$( ( export ACP_RUN_DIR="$WORK/notadir/mine" ACP_BUN_BIN="$WORK/fake-bun" HOME="$WORK/h4"
+         unset XDG_CACHE_HOME
+         cmd_acp ) 2>&1 >/dev/null ) || rc=$?
+want "$([[ $rc -ne 0 && ! -e "$WORK/h4/.cache/5dive/acp-server.ts" ]] && echo true)" \
+  "an explicit ACP_RUN_DIR does NOT silently fall back to \$HOME (rc=$rc)"
+want "$(grep -q 'notadir/mine' <<<"$out" && ! grep -q 'h4' <<<"$out" && echo true)" \
+  "that failure names the directory the caller chose, and only it: ${out:0:80}"
+
+# (e) Nowhere to stage at all: fail naming the override, not a dead pipe.
+rc=0
+out=$( ( export ACP_RUN_DIR_DEFAULT="$WORK/notadir/5dive" ACP_BUN_BIN="$WORK/fake-bun"
+         unset ACP_RUN_DIR XDG_CACHE_HOME HOME
+         cmd_acp ) 2>&1 >/dev/null ) || rc=$?
+want "$([[ $rc -ne 0 ]] && echo true)" "no writable candidate is a clean failure, not a crash (rc=$rc)"
+want "$(grep -q 'ACP_RUN_DIR' <<<"$out" && echo true)" \
+  "and it names ACP_RUN_DIR, the thing the reader can act on: ${out:0:80}"
+
 BUN=$(ACP_BUN_BIN="" _acp_resolve_bun)
 if [[ ! -x "$BUN" ]]; then
   # DIVE-3059: THIS DEFAULTS TO FAIL, and the reason is that the previous version
@@ -138,6 +201,36 @@ want "$([[ "$(j 'select(.id==1)|.result.protocolVersion')" == "1" ]] && echo tru
   "initialize negotiates DOWN from the client's 2 to the 1 we speak"
 want "$([[ "$(j 'select(.id==1)|.result.agentCapabilities.loadSession')" == "false" ]] && echo true)" \
   "initialize declares loadSession:false (we do not resume client-held ids)"
+
+# --- authMethods: the ONE field the ACP registry gates the listing on (DIVE-3361)
+# Their REQUIRED verify-auth job reads this and nothing else gets looked at first:
+# .github/workflows/client.py :: validate_auth_methods refuses an empty array
+# outright ("No authMethods in response"), then keeps only methods whose type is
+# agent or terminal. Graded HERE because `authMethods: []` is not a smaller answer,
+# it is the whole PR red on the first exchange — and the suite was fully green with
+# the empty array, so nothing would have caught a revert of the fix.
+#
+# THE TYPE IS RESOLVED THE WAY THEY RESOLVE IT rather than read off a field of ours.
+# Their priority: (1) a literal `type`, (2) `_meta` "terminal-auth"/"agent-auth",
+# (3) default "agent". The spec's AuthMethod has no `type`, so we say it through
+# `_meta`; porting their three steps here makes this arm grade the CONTRACT, so it
+# still fails if the `_meta` key is dropped AND their step-3 default moves.
+ACP_TYPE_JQ='.type // (._meta // {} | if has("terminal-auth") then "terminal" elif has("agent-auth") then "agent" else null end) // "agent"'
+n_auth=$(jq -r 'select(.id==1)|.result.authMethods|length' "$WORK/out.jsonl" 2>/dev/null | head -1)
+want "$([[ "${n_auth:-0}" -ge 1 ]] && echo true)" \
+  "initialize answers >=1 authMethod — an empty array is their outright refusal (got ${n_auth:-none})"
+auth_types=$(jq -r "select(.id==1)|.result.authMethods[]|$ACP_TYPE_JQ" "$WORK/out.jsonl" 2>/dev/null | tr '\n' ' ')
+want "$(grep -qE '(^| )(agent|terminal)( |$)' <<<"$auth_types" && echo true)" \
+  "and one resolves, under THEIR rules, to agent or terminal (got: ${auth_types:-none})"
+want "$(jq -e 'select(.id==1)|.result.authMethods[0]|(.id//""|length>0) and (.name//""|length>0)' "$WORK/out.jsonl" >/dev/null 2>&1 && echo true)" \
+  "the method carries a non-empty id and name — both are read straight into the listing"
+# POSITIVE CONTROL, and it is not decoration: the two arms above are substring
+# greps over a value derived from a file, so a malformed frame, an absent .id==1
+# response or a mistyped jq path all present as the same green. Run the SAME
+# expression over a frame that MUST fail it.
+ctl=$(jq -rn "[{\"id\":\"x\",\"name\":\"x\",\"type\":\"password\"}]|.[]|$ACP_TYPE_JQ" 2>/dev/null | tr '\n' ' ')
+want "$(! grep -qE '(^| )(agent|terminal)( |$)' <<<"$ctl" && [[ -n "${ctl// /}" ]] && echo true)" \
+  "control: that same expression REFUSES a password-only method (got: ${ctl:-none}) — so the arms can fail"
 want "$([[ "$(j 'select(.id==2)|.result.sessionId')" == "5dive-1" ]] && echo true)" \
   "session/new returns a sessionId"
 
