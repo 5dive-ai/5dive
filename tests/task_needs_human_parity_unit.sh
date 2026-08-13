@@ -157,18 +157,29 @@ n_disj=$(cat "$SRC/cmd_task.sh" "$SRC"/task/*.sh | grep -c "^  printf '%s' \"( C
 [[ "$n_disj" == "1" ]] \
   && ok_t "S1 the human-gate disjunction is written EXACTLY once in cmd_task.sh" \
   || bad_t "S1 single copy" "found $n_disj definitions — a second copy is the defect this row closes"
-# Exactly two CALL SITES — `cmd_task_inbox` (the view) and the `task ls --json`
-# projection — plus one definition. Written as an equality, not a floor: a third
-# caller appearing is not automatically wrong, but it is a new consumer of this
-# verdict and it should arrive with a reader looking at this line, not silently.
+# Exactly THREE call sites — `cmd_task_inbox` (the view), the `task ls --json`
+# projection, and (DIVE-3340) the `task show --json` projection — plus one
+# definition. Written as an equality, not a floor: a further caller is not
+# automatically wrong, but it is a new consumer of this verdict and it should arrive
+# with a reader looking at this line, not silently. THAT IS WHAT HAPPENED HERE — this
+# arm went red on DIVE-3340's iteration-2 CI run and is updated deliberately, not
+# relaxed. The third site exists because the telegram plugin's task-detail view calls
+# `show`, not `ls`, so the verdict was unreachable from the one surface that most
+# needed it and the plugin rebuilt the rule from raw inputs instead — dropping the
+# status clause and telling a human that 19 closed rows were waiting on their answer.
 n_call=$(cat "$SRC/cmd_task.sh" "$SRC"/task/*.sh | grep -c '\$(_task_human_gate_pred)')
 n_def=$(cat "$SRC/cmd_task.sh" "$SRC"/task/*.sh | grep -c '^_task_human_gate_pred() {')
-[[ "$n_call" == "2" && "$n_def" == "1" ]] \
-  && ok_t "S2 one definition, exactly two call sites (the inbox view and the ls projection)" \
-  || bad_t "S2 call sites" "definitions=$n_def calls=$n_call — expected 1 and 2"
-grep -q "CASE WHEN \${_gate_open} AND ( \${_gate_human} ) THEN 1 ELSE 0 END AS needs_human" "$SRC/cmd_task.sh" "$SRC"/task/*.sh \
-  && ok_t "S3 the ls projection INTERPOLATES the helpers rather than restating them" \
-  || bad_t "S3 interpolation" "the needs_human projection does not read from the helper variables"
+[[ "$n_call" == "3" && "$n_def" == "1" ]] \
+  && ok_t "S2 one definition, exactly three call sites (the inbox view, the ls projection, the show projection)" \
+  || bad_t "S2 call sites" "definitions=$n_def calls=$n_call — expected 1 and 3"
+# S3 covers BOTH projections. Counting call sites proves the helper is CALLED; only
+# this proves its value is what the SQL actually reads. The show arm is not optional
+# decoration: a third caller that resolved the helpers and then restated the rule
+# inline would pass S2 and be exactly the drift S1 exists to prevent.
+n_proj=$(cat "$SRC/cmd_task.sh" "$SRC"/task/*.sh | grep -c "CASE WHEN \${_gate_open} AND ( \${_gate_human} ) THEN 1 ELSE 0 END AS needs_human")
+[[ "$n_proj" == "2" ]] \
+  && ok_t "S3 BOTH the ls and show projections INTERPOLATE the helpers rather than restating them" \
+  || bad_t "S3 interpolation" "found $n_proj interpolated needs_human projections — expected 2 (ls + show)"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 SUMMARY_PRINTED=1

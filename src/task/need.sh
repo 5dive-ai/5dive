@@ -1467,8 +1467,20 @@ cmd_task_need() {
     # The lead route follows the PRINCIPAL, so it moves with it: condition 3 is "the
     # filer's lead", and resolving it from the holder would leave a second copy of the
     # same defect one rung up.
-    w_lead=$(_gate_route_reviewer "$w_filer")
-    w_coord=$(_task_resolve_coordinator)
+    # DIVE-3340 iter2: same rc-1-on-empty-filer shape as the cancel guard (see
+    # status.sh). PRE-EXISTING here — it fails identically on origin/main — and
+    # folded in under this row's filing cap rather than a new ident, because the
+    # two sites are one defect and splitting them leaves the half a reader lands
+    # on looking deliberate. Without it the withdraw refusal aborts rc=1 instead
+    # of naming its authorized set, on exactly the empty-filer rows a fresh
+    # customer box produces. NB this expression is COALESCE(gate_filed_by,
+    # created_by) while the cancel guard's is COALESCE(gate_filed_by, assignee) —
+    # a fixture must clear all three to reach the empty cell on both verbs.
+    # Graded by tests/gate_refusal_empty_filer_e2e.sh, which runs the BUILT
+    # bundle: the unit harness is `set -uo pipefail` with no -e and therefore
+    # cannot reproduce an errexit abort at all.
+    w_lead=$(_gate_route_reviewer "$w_filer") || w_lead=""
+    w_coord=$(_task_resolve_coordinator) || w_coord=""
     [[ "$w_kind" == "human" ]] && w_ok=1                                    # a genuine human caller
     [[ -n "$w_name" && "$w_name" == "$w_filer" ]] && w_ok=1                # the filer
     [[ -n "$w_name" && -n "$w_lead"  && "$w_name" == "$w_lead"  ]] && w_ok=1  # filer's lead
@@ -1488,7 +1500,17 @@ cmd_task_need() {
     # and the reader needs to see that as a stated absence.
     w_who="the gate's filer (${w_filer:-unrecorded})"
     [[ -n "$w_holder" && "$w_holder" != "$w_filer" ]] && w_who+=" — held by ${w_holder}, who does NOT authorize a withdraw since they did not file it"
-    (( w_ok )) || policy_refuse "$E_AUTH_REQUIRED" gate-withdraw-not-authorized DIVE-1401 "$ident" "only ${w_who}, their lead (${w_lead:-none}), the org coordinator (${w_coord:-none}) or a human can withdraw this gate"
+    # DIVE-3340: SAY WHAT TO DO, not only who may. DIVE-2382 fixed the SET this message
+    # enumerates; it left the message a pure list of principals, which tells a refused
+    # caller nothing about how to make progress. That is the second half of the closed
+    # loop measured on a customer box 2026-08-12 — `cancel` sent the reader here, and
+    # here sent them nowhere. Answering does not consult this authorization block at all
+    # (it is the human's own act, and it clears the gate so the cancel guard stops
+    # firing), so it is the route a refused non-filer should be pointed at. Named after
+    # the set, not instead of it: a legitimate filer/lead/coordinator misreading their
+    # own name in the list is the DIVE-2106 failure, and dropping the enumeration to
+    # make room for the route would re-create it.
+    (( w_ok )) || policy_refuse "$E_AUTH_REQUIRED" gate-withdraw-not-authorized DIVE-1401 "$ident" "only ${w_who}, their lead (${w_lead:-none}), the org coordinator (${w_coord:-none}) or a human can withdraw this gate. If that is not you, do NOT hunt for a way in — $(_gate_answer_route "$ident" "$w_type"), which needs none of the above and unblocks the row (a cancel is then accepted too). Withdrawing only retires a question that is MOOT; answering is what a still-live one wants."
     # Clear every gate field and unblock back to todo when no dependency edge
     # still holds it. The withdrawn gate is archived to gate_history first, in
     # the same transaction (DIVE-2119).
