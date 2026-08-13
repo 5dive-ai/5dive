@@ -298,6 +298,160 @@ done < "$WORK/out.jsonl"
 want "$([[ $badlines -eq 0 && $frames -ge 8 ]] && echo true)" \
   "every stdout line is one parseable JSON frame ($badlines bad of $frames)"
 
+# --- 4. NO FLEET: the laptop that installs us from the ACP registry (DIVE-3370) --
+# `5dive acp` enumerates the LOCAL fleet, so the machine most likely to run us
+# first has none and gets an empty agent list. What is graded here is that the
+# empty list SAYS WHICH of the four causes it is — the CLI absent, a box that
+# hosts no fleet, a fleet it cannot read, a fleet with no agents — because those
+# have four different next actions and they used to collapse into one silent [].
+#
+# Driven through ACP_CLI_BIN, i.e. the same seam the roster resolves through, so
+# each arm is the REAL server reading a REAL `agent list` answer.
+nofleet() {   # $1 = stub script body, $2 = out file
+  cat > "$WORK/stub-nofleet" <<STUBX
+#!/usr/bin/env bash
+$1
+STUBX
+  chmod +x "$WORK/stub-nofleet"
+  {
+    req '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2}}'
+    req '{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp"}}'
+    req '{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"5dive-1","prompt":[{"type":"text","text":"do the thing"}]}}'
+  } | ( ACP_CLI_BIN="$WORK/stub-nofleet" timeout 60 "$BUN" "$ACP_RUN_DIR/acp-server.ts" ) \
+      2>>"$WORK/err.log" >"$2" || true
+}
+chunks_of() { jq -r 'select(.method=="session/update")|.params.update|select(.sessionUpdate=="agent_message_chunk")|.content.text' "$1" 2>/dev/null | tr '\n' ' '; }
+descs_of()  { jq -r 'select(.method=="session/update")|.params.update|select(.sessionUpdate=="available_commands_update")|.availableCommands[].description' "$1" 2>/dev/null | tr '\n' '|'; }
+
+# (a) A BOX THAT HOSTS NO FLEET. The real shape, measured: our CLI answers a
+# structured envelope on stdout and exits 10, so the reason is READ off
+# .error.message rather than grepped out of stderr.
+nofleet 'printf "%s\n" "{\"ok\":false,\"error\":{\"code\":10,\"class\":\"permission\",\"message\":\"must run as root — try: sudo 5dive agent list --json\"}}"
+echo "error: must run as root" >&2
+exit 10' "$WORK/nofleet.jsonl"
+c=$(chunks_of "$WORK/nofleet.jsonl"); d=$(descs_of "$WORK/nofleet.jsonl")
+want "$(grep -q 'LOCAL fleet' <<<"$c" && echo true)" \
+  "no fleet: the reply names the LOCAL-only limit as the cause, not a failure: ${c:0:70}"
+want "$(grep -q 'must run as root' <<<"$c" && echo true)" \
+  "no fleet: and quotes the CLI's OWN message, read from the JSON envelope"
+want "$(grep -qi '5dive init' <<<"$c" && echo true)" \
+  "no fleet: and names a next action a laptop user can actually take"
+want "$(grep -q 'no 5dive fleet is readable' <<<"$d" && echo true)" \
+  "no fleet: the command PICKER carries the cause too — it is all a client draws before the user types: ${d:0:80}"
+want "$(jq -e 'select(.id==1)|.result.authMethods|length>=1' "$WORK/nofleet.jsonl" >/dev/null 2>&1 && echo true)" \
+  "no fleet: initialize STILL answers authMethods — the registry's verify-auth job runs on a fleetless box too"
+want "$(jq -e 'select(.id==3)|.result.stopReason=="end_turn"' "$WORK/nofleet.jsonl" >/dev/null 2>&1 && echo true)" \
+  "no fleet: the prompt is answered, not refused — an empty fleet is not an error"
+
+# (b) A FLEET THAT IS THERE AND EMPTY reads differently from one we could not
+# read. Same empty list, different next action, so this is the arm that proves
+# the status is diagnosed rather than inferred from length.
+nofleet 'printf "%s\n" "{\"ok\":true,\"data\":[]}"' "$WORK/emptyfleet.jsonl"
+c=$(chunks_of "$WORK/emptyfleet.jsonl"); d=$(descs_of "$WORK/emptyfleet.jsonl")
+want "$(grep -q 'no agents yet' <<<"$c" && grep -q 'agent create' <<<"$c" && echo true)" \
+  "empty fleet: reads as a host with no agents yet, and points at \`agent create\`: ${c:0:70}"
+want "$(! grep -q 'LOCAL fleet' <<<"$c" && echo true)" \
+  "empty fleet: and does NOT reuse the no-fleet-here text — a successful read is authoritative"
+want "$(grep -q 'no agents yet' <<<"$d" && echo true)" \
+  "empty fleet: the picker carries that cause: ${d:0:80}"
+
+# (c) NO CLI AT ALL. Distinct from both: nothing about fleets is knowable. Run
+# without the stub rather than through it — the case is a binary that is not there.
+rm -f "$WORK/stub-nofleet"
+{
+  req '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2}}'
+  req '{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp"}}'
+  req '{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"5dive-1","prompt":[{"type":"text","text":"do the thing"}]}}'
+} | ( ACP_CLI_BIN="$WORK/stub-nofleet" timeout 60 "$BUN" "$ACP_RUN_DIR/acp-server.ts" ) \
+    2>>"$WORK/err.log" >"$WORK/nocli.jsonl" || true
+c=$(chunks_of "$WORK/nocli.jsonl"); d=$(descs_of "$WORK/nocli.jsonl")
+want "$(grep -q 'CLI is not reachable' <<<"$c" && echo true)" \
+  "no CLI: reads as an absent CLI, not as an absent fleet: ${c:0:70}"
+want "$(grep -q "not on this process's PATH" <<<"$d" && echo true)" \
+  "no CLI: the picker says so too: ${d:0:80}"
+
+# (e) WHOSE MESSAGE THE READER GETS. The roster read probes the CLI DIRECTLY before
+# it tries `sudo -n` (rosterArgvs): `agent list` is a rootless read, and on a laptop
+# the sudo attempt fails with "sudo: a password is required" — a sentence about sudo
+# that says nothing about 5dive. Reverting to sudo-first would put that sentence in
+# front of the user, so grade which of the two answers is the one explained.
+#
+# HONEST LIMIT: under a ROOT runner rosterArgvs never emits the sudo candidate, so
+# this arm is vacuous there — it grades the ordering on a non-root box (the GitHub
+# runner is `runner`) and cannot go falsely red on either.
+mkdir -p "$WORK/pathbin"
+cat > "$WORK/pathbin/5dive" <<'PB1'
+#!/usr/bin/env bash
+printf '%s\n' '{"ok":false,"error":{"code":10,"class":"permission","message":"DIRECT-ANSWER: no fleet on this box"}}'
+exit 10
+PB1
+cat > "$WORK/pathbin/sudo" <<'PB2'
+#!/usr/bin/env bash
+echo "sudo: a password is required" >&2
+exit 1
+PB2
+chmod +x "$WORK/pathbin/5dive" "$WORK/pathbin/sudo"
+{
+  req '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2}}'
+  req '{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp"}}'
+  req '{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"5dive-1","prompt":[{"type":"text","text":"do the thing"}]}}'
+} | ( unset ACP_CLI_BIN; PATH="$WORK/pathbin:$PATH" timeout 60 "$BUN" "$ACP_RUN_DIR/acp-server.ts" ) \
+    2>>"$WORK/err.log" >"$WORK/direct.jsonl" || true
+c=$(chunks_of "$WORK/direct.jsonl")
+want "$(grep -q 'DIRECT-ANSWER' <<<"$c" && echo true)" \
+  "roster reads the CLI directly and explains THAT answer: ${c:0:70}"
+want "$(! grep -q 'password is required' <<<"$c" && echo true)" \
+  "and never hands the user sudo's complaint instead of 5dive's"
+
+# (f) SUDO EXISTS AND 5DIVE DOES NOT — the registry's own download-and-run case,
+# and the arm that caught a real misdiagnosis: the box read as `unreachable` and told
+# a reader with no 5dive binary to run `5dive init`. PATH is ONLY this dir: the real
+# 5dive must be invisible, so unlike arm (e) it deliberately does not append $PATH.
+#
+# THE STUB ANSWERS IN FRENCH ON PURPOSE. sudo's failure is not a usable signal — its
+# exit status for a missing command is a sudo-version property (1 here, not the 127 a
+# shell gives) and its wording is gettext-localised. Presence is therefore decided on
+# OUR side (direct-candidate-ran, or a 5dive envelope came back), never by reading
+# sudo. A localised stub is what holds that: a regression to matching English
+# "command not found" passes an English stub and reds this one.
+mkdir -p "$WORK/nfbin"
+# ABSOLUTE shebang, unlike every other stub here: PATH is stripped to this dir, so
+# `#!/usr/bin/env bash` would need `bash` ON that PATH, fail to exec, and reach the
+# server as a THROW — the no-CLI answer, by the wrong route. The arm then passes
+# whether or not the code under test is correct. (It did; that is why this is here.)
+cat > "$WORK/nfbin/sudo" <<'PB3'
+#!/bin/bash
+for a in "$@"; do [[ "$a" == -* ]] && continue; echo "sudo: $a : commande introuvable" >&2; exit 1; done
+PB3
+chmod +x "$WORK/nfbin/sudo"
+{
+  req '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2}}'
+  req '{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp"}}'
+  req '{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"5dive-1","prompt":[{"type":"text","text":"do the thing"}]}}'
+# `env` sets the stripped PATH on the SERVER only. Writing `PATH=... timeout` would
+# resolve `timeout` itself against the stripped PATH, find nothing, and run no
+# server at all — whereupon the `5dive init` assertion below passes on empty output.
+} | ( unset ACP_CLI_BIN; timeout 60 env PATH="$WORK/nfbin" "$BUN" "$ACP_RUN_DIR/acp-server.ts" ) \
+    2>>"$WORK/err.log" >"$WORK/nosudocli.jsonl" || true
+c=$(chunks_of "$WORK/nosudocli.jsonl")
+want "$([[ -n "$c" ]] && echo true)" \
+  "sudo present, 5dive absent: the server answered at all — empty output would pass the negative below for free"
+want "$(grep -q 'CLI is not reachable' <<<"$c" && echo true)" \
+  "sudo present, 5dive absent: reads as an absent CLI, not an absent fleet: ${c:0:70}"
+want "$(! grep -qi '5dive init' <<<"$c" && echo true)" \
+  "sudo present, 5dive absent: and never tells a reader with no 5dive binary to run \`5dive init\`"
+
+# (d) NEGATIVE CONTROL over the three arms above. They are substring greps, and a
+# server that answered ONE generic empty-roster sentence to every cause would pass
+# any one of them read alone. The distinctness is the deliverable, so assert it:
+# the three replies must differ from each other.
+want "$([[ "$(chunks_of "$WORK/nofleet.jsonl")" != "$(chunks_of "$WORK/emptyfleet.jsonl")" \
+        && "$(chunks_of "$WORK/emptyfleet.jsonl")" != "$(chunks_of "$WORK/nocli.jsonl")" \
+        && "$(chunks_of "$WORK/nofleet.jsonl")" != "$(chunks_of "$WORK/nocli.jsonl")" ]] && echo true)" \
+  "control: the three causes produce three DIFFERENT replies — one generic sentence would pass each arm alone"
+want "$([[ -n "$(chunks_of "$WORK/nocli.jsonl")" ]] && echo true)" \
+  "control: and the no-CLI run spoke at all — an empty stdout would satisfy the distinctness arm"
+
 printf '%s\n' "--- server stderr (diagnostics belong here):"
 head -5 "$WORK/err.log" || true
 if [[ $FAILED -ne 0 ]]; then printf 'FAILED %d of %d checks\n' "$FAILED" "$CHECKS"; exit 1; fi
