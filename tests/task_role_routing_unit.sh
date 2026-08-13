@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TIER: pr-core — 3.1s measured on the dev VM 2026-08-13 (DIVE-3366). Isolated
+# TIER: core — 3.1s measured on the dev VM 2026-08-13 (DIVE-3366). Isolated
 # unit harness for role-based routing at FILING time: least-loaded resolution of
 # `--assignee=role:<r>` when a role has two or more seats, the audit trail that
 # records which counts chose the lane, the lane-skew note on the board, the
