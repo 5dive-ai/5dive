@@ -16,6 +16,34 @@
 # nothing guarding the two against drift, and one loader per filename is enough.
 ACP_RUN_DIR_DEFAULT="/opt/5dive"
 
+# WHERE THE SERVER STAGES — a LIST, because the first entry is root's (DIVE-3361).
+#
+# /opt/5dive is this VM's layout and stays FIRST so a managed box is unchanged. But
+# `5dive acp` exists to be spawned on a machine that is not ours, and the ACP
+# registry's required verify-auth job runs us as an unprivileged sandbox user: there
+# the very first thing the verb does is `cat > /opt/5dive/acp-server.ts`, which is
+# Permission denied, so initialize is never answered and the listing fails with no
+# ACP frame on the wire at all. ACP_RUN_DIR already existed as an override, and an
+# override is no help — the DEFAULT is what a client spawning us gets.
+#
+# An explicit ACP_RUN_DIR is the ONLY candidate when set: falling back past a
+# directory the caller named would stage somewhere they did not ask for and exec it.
+#
+# NO /tmp TIER ON PURPOSE. We `exec` the file we stage, and mkdir -p succeeds
+# straight through a symlink a local user pre-planted in a world-writable parent, so
+# a /tmp fallback trades a clear error for a file somebody else can swap. With HOME
+# and XDG_CACHE_HOME both unset the verb now fails naming ACP_RUN_DIR, which is
+# actionable; that is the improvement over the dead pipe, and it does not need /tmp.
+_acp_run_dir_candidates() {
+  if [[ -n "${ACP_RUN_DIR:-}" ]]; then printf '%s\n' "$ACP_RUN_DIR"; return 0; fi
+  printf '%s\n' "$ACP_RUN_DIR_DEFAULT"
+  [[ -n "${XDG_CACHE_HOME:-}" ]] && printf '%s\n' "$XDG_CACHE_HOME/5dive"
+  # Their client sets HOME to a fresh temp dir it creates, so this is the tier that
+  # actually carries the registry run.
+  [[ -n "${HOME:-}" ]] && printf '%s\n' "$HOME/.cache/5dive"
+  return 0
+}
+
 # TWO NEAR-IDENTICAL COPIES OF THIS PROBE LIST EXIST AND WERE DELIBERATELY LEFT UNFIXED:
 # _cos_resolve_bun (cmd_cos.sh) and _team_bot_resolve_bun (cmd_agent_teambot.sh). This one
 # is the canonical/fixed copy — you are reading the answer to "which of the three is the
@@ -51,10 +79,12 @@ _acp_resolve_bun() {
   printf '/usr/local/bin/bun'
 }
 
-# Stage the embedded server into $1 (idempotent).
+# Stage the embedded server into $1 (idempotent). Returns non-zero if $1 cannot take
+# the file — mkdir is NOT the test, since the failing case on a shared box is an
+# existing directory that is not ours to write (DIVE-3361).
 _acp_install_runner() {
   mkdir -p "$1" || return 1
-  cat > "$1/acp-server.ts" <<'ACP_SERVER_TS'
+  cat > "$1/acp-server.ts" <<'ACP_SERVER_TS' || return 1
 // DIVE-3017 — ACP over stdio for `5dive acp`. Staged by cmd_acp.sh; run on bun.
 //
 // stdout carries the PROTOCOL and nothing else. Every diagnostic goes to stderr —
@@ -307,7 +337,34 @@ async function dispatch(line: string): Promise<void> {
         loadSession: false,
         promptCapabilities: { image: false, audio: false, embeddedContext: false },
       },
-      authMethods: [],
+      // DIVE-3361 — AT LEAST ONE authMethod, and an empty array is not a smaller
+      // answer, it is the whole ACP registry listing. Their REQUIRED verify-auth
+      // job spawns us and reads exactly this frame
+      // (.github/workflows/client.py :: validate_auth_methods):
+      //     if not auth_methods: return False, "No authMethods in response"
+      // so `authMethods: []` is rejected on the first exchange, before anything
+      // else about the agent is looked at.
+      //
+      // NO `type` FIELD, deliberately: the spec's AuthMethod is { id, name,
+      // description } and `type` is not in it. Their parser INFERS the type it
+      // gates on — `_meta` "terminal-auth" -> terminal, "agent-auth" -> agent,
+      // and absent both it defaults to "agent" — so the `_meta` key states it
+      // through the documented extension channel instead of inventing a field or
+      // leaning on their default staying where it is.
+      //
+      // It is also TRUE rather than a checkbox. There is no 5dive sign-in to
+      // perform in this process: the server shells to the local `5dive`, which
+      // carries its own credentials and audit trail, which is why `authenticate`
+      // below has nothing to do and answers {}.
+      authMethods: [
+        {
+          id: "5dive-cli",
+          name: "5dive CLI credentials",
+          description:
+            "Uses the credentials of the 5dive CLI already installed here. No separate sign-in step: if `5dive agent list` shows your fleet, this is authenticated.",
+          _meta: { "agent-auth": true },
+        },
+      ],
     });
   }
   if (method === "authenticate") return ok(id, {});
@@ -347,7 +404,7 @@ for await (const c of Bun.stdin.stream()) {
 // stdin closed: finish what is open rather than dropping a turn on the floor.
 while (inflight.size) await Promise.allSettled([...inflight]);
 ACP_SERVER_TS
-  chmod 644 "$1/acp-server.ts"
+  chmod 644 "$1/acp-server.ts" || return 1
 }
 
 cmd_acp() {
@@ -363,8 +420,17 @@ cmd_acp() {
   # COMMAND is absent, so with `5dive` on PATH and bun missing the client spawns us
   # and gets a process that dies with no reason attached. Say why, on stderr, once.
   [[ -x "$bun" ]] || fail "$E_NOT_INSTALLED" "bun not found at $bun — 5dive acp runs its ACP server on bun. Install it (curl -fsSL https://bun.sh/install | bash) or point ACP_BUN_BIN at an existing binary."
-  local dir="${ACP_RUN_DIR:-$ACP_RUN_DIR_DEFAULT}"
-  _acp_install_runner "$dir" || fail "$E_GENERIC" "could not stage the ACP server in $dir"
+  # First candidate that actually TAKES the file wins; the per-attempt stderr is
+  # dropped because a Permission denied on /opt is expected off our VM, not news.
+  # A total failure names every directory tried, which is the message that used to
+  # name only /opt/5dive on a box where /opt was never the reachable one.
+  local dir="" cand tried=""
+  while IFS= read -r cand; do
+    [[ -n "$cand" ]] || continue
+    tried="${tried:+$tried, }$cand"
+    if _acp_install_runner "$cand" 2>/dev/null; then dir="$cand"; break; fi
+  done < <(_acp_run_dir_candidates)
+  [[ -n "$dir" ]] || fail "$E_GENERIC" "could not stage the ACP server in any of: ${tried:-<none: HOME and XDG_CACHE_HOME are both unset>} — point ACP_RUN_DIR at a writable directory."
   [[ -t 0 ]] && printf '%s\n' "5dive acp speaks JSON-RPC on stdin/stdout; you are on a TTY. This verb is meant to be spawned by an ACP client." >&2
   # `exec` hands the pipes straight to bun. Note for whoever reads the audit log:
   # this replaces the process, so the dispatcher's EXIT-trap row never fires
