@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
+## v0.19.33 — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
 
 Nothing validated these columns. The work-picker dispatches on `assignee`, so a row on a name that is
 not a registered agent was **structurally undispatchable** — not blocked, not parked, not flagged, and
@@ -24,7 +24,7 @@ never once a dispatch target) and corroborated here (5 open rows).
 - **`wip-cap-install`** read the same unvalidated column (it had minted `wip_cap:cli`, a lane ceiling
   for an agent that does not exist). It now skips unregistered lanes and **names the skip**.
 
-## Unreleased — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
+## v0.19.33 — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
 
 `5dive agent config <name> set channels=<current>,buzz` could not succeed on any seat that was not
 **created** with buzz. `cmd_config` dispatches `install_channel_for_agent` for telegram, discord and
@@ -57,7 +57,7 @@ arms grade the satisfier next to the gate, and drive `cmd_config` for real — w
 that the same call reaches the restart once the cache is staged, so the rollback arms cannot pass
 against a `cmd_config` that simply refuses everything.
 
-## Unreleased — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
+## v0.19.33 — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
 
 DIVE-2483's gate answer said the preservation notice lands on **stdout**. It lands on **stderr**,
 via the fleet's `warn()`. Six arms were written for that condition and all six were green, because
@@ -91,7 +91,7 @@ Still open and scoped out on purpose: `task reject` remains an unguarded writer 
 column (`src/cmd_task.sh:4235`). That is a design question about accumulating verifier feedback, not
 this gap.
 
-## Unreleased — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
+## v0.19.33 — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
 
 DIVE-3272 taught the supervisor BOARD to see a seat that is alive and closing nothing. The
 drill-down people actually type kept printing only liveness: `state: active / enabled` was
@@ -133,7 +133,7 @@ supervisor:  quota-exhausted / quota-exhausted — pane shows a model-capacity r
 - `agent list` is unchanged — it is the survey surface, and this is a per-agent drill-down
   (three sqlite reads), deliberately not an N-way fan-out.
 
-## Unreleased — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
+## v0.19.33 — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
 
 A gate reaches the filer's lead only if `_GATE_ENG_SHIP_RX` matches the ask or the row
 title. `gate_builder_routing` is OFF by default, so for an ordinary builder ship gate that
@@ -197,7 +197,7 @@ prose for identifiers.
   `gate_access_lead_clear`, `gate_internal_ops_floor`, `task_needs_human_parity`,
   `task_inbox_json_tier`, `push_unit`, `broker_surface`, + 15 more).
 
-## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
+## v0.19.33 — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
 
 DIVE-1935's first iteration was rejected, and for the right reason. It added a
 `sudo -n -u claude gh auth token` arm to `_gate_gh_token` justified by *"agents hold
