@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
+
+Nothing validated these columns. The work-picker dispatches on `assignee`, so a row on a name that is
+not a registered agent was **structurally undispatchable** — not blocked, not parked, not flagged, and
+nothing anywhere said so. Reported from customer box `5dive-teal-fox-cx43` (7 rows on `assignee='cli'`,
+never once a dispatch target) and corroborated here (5 open rows).
+
+- **The validator is split in two, because "the same validation on `created_by`" would have refused
+  every root and cron filing.** `cli` is `lib/actor.sh`'s documented sentinel for an unattributable
+  invocation. `assignee`/`verifier` must be a **dispatchable lane** (`cli` refused, with its own
+  message); `created_by`/`--from` must be a **known principal** = lane *or* sentinel (`cli` accepted,
+  `agent-main` still refused — that is the class that misroutes gates).
+- **Prefix drift is NAMED** — `--assignee='agent-dev' … did you mean 'dev'?`. A bare "unknown agent"
+  gets worked around by re-typing the same wrong name. The hint stays quiet when it would be guessing.
+- **An unreadable registry refuses NOTHING.** The roster is `ok` or `unestablished:<why>`, never a
+  silent empty — an empty roster treated as authoritative refuses every name, which is a louder way of
+  being wrong than the bug. Read from `$STATE_DIR/agents.json` re-derived at call time, not the
+  source-time `$REGISTRY` (which points at the host fleet while a harness grades a scratch board).
+- **`5dive task orphans [--all]`** surfaces rows already on a dead lane — prevention does nothing for
+  the reported symptom. It refuses to answer when the roster is unestablished rather than printing the
+  whole board as broken.
+- **`wip-cap-install`** read the same unvalidated column (it had minted `wip_cap:cli`, a lane ceiling
+  for an agent that does not exist). It now skips unregistered lanes and **names the skip**.
+
 ## Unreleased — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
 
 `5dive agent config <name> set channels=<current>,buzz` could not succeed on any seat that was not

@@ -206,6 +206,17 @@ cmd_task_add() {
         ;;
     esac
   fi
+  # DIVE-3344: and now that the token is resolved, the name has to NAME SOMETHING.
+  # "a literal name is trusted verbatim" above was the whole defect: the picker
+  # dispatches on this column, so a typo'd lane is a row that is never picked and
+  # never says why. Checked on the EXPLICIT input only — the DIVE-333 default
+  # below is derived from the project lead / org coordinator, and refusing an add
+  # because the CHART is stale would punish the filer for someone else's data.
+  # `task orphans` is what surfaces that case. See _task_require_lane (routing.sh)
+  # for why `cli` is refused here and accepted two lines down.
+  _task_require_lane "$assignee" "--assignee"
+  _task_require_lane "$verifier" "--verifier"
+  _task_require_principal "$from" "--from"
   # fresh: per-task clean-session pref (DIVE-138). Recurring templates default to
   # fresh=1 (clean each run — Mark's decision for the community/marketing jobs)
   # and carry it onto every materialized instance; an explicit --fresh/--no-fresh
@@ -943,6 +954,10 @@ cmd_task_assign() {
   [[ $# -ge 2 ]] || fail "$E_USAGE" "usage: 5dive task assign <id|DIVE-N> <agent>"
   resolve_task_id "$1"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   local who="$2"
+  # DIVE-3344: the raw reassignment verb, and the one that can move a live row
+  # onto a lane that does not exist. Refused BEFORE the write — an orphaned row is
+  # not recoverable by the machine, because nothing ever looks at it again.
+  _task_require_lane "$who" "<agent>"
   # DIVE-3097: refuse landing the ASSIGNEE onto this row's own VERIFIER — the
   # identical end state `task verifier` already refuses from the other
   # direction (DIVE-474: "'X' is <ident>'s own assignee — a maker can't grade
@@ -1020,6 +1035,10 @@ cmd_task_verifier() {
     || fail "$E_USAGE" "usage: 5dive task verifier <id|DIVE-N> <agent> [--accept=<criteria>] [--max-iters=<n>]"
   [[ -z "$max_iters" || "$max_iters" =~ ^[1-9][0-9]*$ ]] \
     || fail "$E_VALIDATION" "--max-iters must be a positive integer"
+  # DIVE-3344: a verifier is a DISPATCH TARGET too — delivering writes
+  # assignee=<verifier> — so a typo'd grader orphans the row at handoff, one step
+  # further from anyone noticing than a typo'd assignee does.
+  _task_require_lane "$who" "<agent>"
   resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   local st kind title asignee cur_accept cur_vfier maker delivered
   st=$(db "SELECT status FROM tasks WHERE id=${id};")

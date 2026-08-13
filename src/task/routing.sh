@@ -895,3 +895,214 @@ _org_resolve_assignee() {
   esac
 }
 
+# ---------------------------------------------------------------------------
+# DIVE-3344 — nothing validated that `assignee` / `created_by` named a REAL
+# agent, and the two columns fail in OPPOSITE directions.
+#
+# The work-picker dispatches on `assignee`, so a row on a name that is not a
+# registered agent is STRUCTURALLY UNDISPATCHABLE — not blocked, not parked, not
+# flagged. It is never picked, and nothing anywhere says so. Reported from a
+# customer box (7 rows on `assignee='cli'`, never once a dispatch target in their
+# whole heartbeat log) and corroborated here: 3 open rows on `cli`, 1 on
+# `agent-marketing`. `created_by` misroutes rather than drops — their DIVE-350 has
+# been orphaned since 2026-07-29 because its gate routes to a creator that does
+# not exist.
+#
+# TWO CLASSES, and the second is the nastier:
+#   1. a name that is not an agent at all
+#   2. PREFIX DRIFT — `agent-marketing` beside `marketing`, `agent-main` beside
+#      `main`. Worse than class 1 because it LOOKS right to a reader and sorts
+#      next to the real lane in any listing. So the refusal NAMES the near miss:
+#      a bare "unknown agent" gets worked around by re-typing the same wrong name.
+#
+# `cli` IS NOT A TYPO, AND THIS IS THE MEASUREMENT THAT SPLIT THE VALIDATOR IN
+# TWO. lib/actor.sh sets `ACTOR_BOARD="cli"` as its documented sentinel for "could
+# not attribute this invocation" (root, cron, a build bot) — see actor_board_name,
+# whose own header calls out that 43 call sites inherit it. 25 rows on this board
+# carry `created_by='cli'` BY DESIGN; the recent ones are root-cron recurring
+# instances. DIVE-3344's acceptance asked for "the same validation on created_by",
+# and the same validation would have refused every root and cron filing on the
+# board. So:
+#   assignee / verifier -> must be a DISPATCHABLE LANE. `cli` is refused.
+#   created_by / --from -> must be a KNOWN PRINCIPAL = lane OR sentinel. `cli` is
+#                          accepted; `agent-main` is still refused, which is the
+#                          class that actually misroutes gates.
+#
+# THE AUTHORITY IS THE REGISTRY, and when it cannot be read this REFUSES NOTHING.
+# actor.sh already settled that question ("the registry is the authority on
+# agent-ness — DIVE-2371: a username PREFIX is not"), and registry_read_checked
+# exists precisely so a caller can tell an absent fleet from an unreadable one.
+# A roster we could not establish is `unestablished:<why>`, never a silent empty:
+# an empty roster treated as authoritative would refuse EVERY name, which on a
+# fresh install or inside a unit harness means the guard breaks the board instead
+# of the typo. `agents_org` is unioned in because it names lanes a lagging
+# registry may miss, but it can only WIDEN acceptance — it never establishes the
+# roster on its own, so an unreadable registry beside a populated org chart still
+# refuses nothing rather than refusing the four agents the chart omits.
+# ---------------------------------------------------------------------------
+
+# Non-agent principals that legitimately own a `created_by` and NEVER an
+# assignee — nothing wakes them. Measured on this board 2026-08-12: cli 25,
+# council 97, lodar 4, editor 4, proof 2 (`5dive proof` files with --from=proof).
+_TASK_PRINCIPAL_SENTINELS="cli council telegram dashboard lodar editor proof cron"
+
+_TASK_ROSTER=""; _TASK_ROSTER_STATE=""
+
+# _task_roster — SETS `_TASK_ROSTER` (newline-separated lane names) and
+# `_TASK_ROSTER_STATE` (`ok` or `unestablished:<why>`). Read the variables.
+#
+# IT DELIBERATELY PRINTS NOTHING, and that is a bug fix, not a style choice. The
+# first cut of this returned the roster on stdout, so every caller wrote
+# `roster=$(_task_roster)` — and a variable assigned inside `$( )` is assigned in
+# a SUBSHELL and lost. `_TASK_ROSTER_STATE` therefore came back EMPTY at each of
+# those call sites, which is neither `ok` nor `unestablished:*`, so `wip-cap-install`
+# skipped nothing and `task orphans` reported "the roster is " and refused. The
+# failure direction is what matters: the state that survived was the one that
+# means "could not measure", so the guards went QUIET rather than loud. Callers
+# must not re-introduce the substitution.
+#
+# CHECK THE STATE, never the emptiness of the roster: they are different facts.
+_task_roster() {
+  if [[ -z "$_TASK_ROSTER_STATE" ]]; then
+    local body rc reg="" org="" why=""
+    # THE ROSTER AND THE BOARD MUST COME FROM THE SAME STATE DIR, and that is why
+    # the path is re-derived here instead of using the global $REGISTRY.
+    # header.sh binds REGISTRY="${STATE_DIR}/agents.json" ONCE, at source time.
+    # STATE_DIR is env-overridable (DIVE-1475) and ~60 unit harnesses repoint it
+    # AFTER sourcing to get a scratch board — which moves TASKS_DB and leaves
+    # REGISTRY pointing at the HOST's real fleet. A guard reading this host's 18
+    # live agents while grading a temp board is comparing two different worlds: it
+    # armed against every fixture on the box and reported 16 harnesses red, none of
+    # which was about agent names. In production the two paths are the same string,
+    # so this changes nothing there; the assignment-prefix keeps the override
+    # scoped to the substitution's subshell.
+    local _reg="${STATE_DIR:-/var/lib/5dive}/agents.json"
+    # `&& rc=0 || rc=$?`, NOT `; rc=$?`. registry_read_checked's whole point is
+    # that it returns 3/4/5 instead of inventing a body — and under the bundle's
+    # `set -euo pipefail` an ASSIGNMENT whose substitution exits non-zero kills the
+    # process before the next line runs. With `; rc=$?` a host with no registry
+    # (every fresh store) died on `task add` with "exited 3 without reporting a
+    # reason": the guard's own not-measured path took the board down. Being part of
+    # an `||` list is what makes the non-zero survivable.
+    body=$(REGISTRY="$_reg" registry_read_checked 2>/dev/null) && rc=0 || rc=$?
+    case "$rc" in
+      0) reg=$(printf '%s\n' "$body" | jq -r '(.agents // {}) | keys[]?' 2>/dev/null || true)
+         [[ -n "$reg" ]] || why="registry-names-no-agents" ;;
+      3) why="no-registry-file" ;;
+      4) why="registry-unreadable" ;;
+      5) why="registry-unparseable" ;;
+      *) why="registry-rc${rc}" ;;
+    esac
+    org=$(db "SELECT name FROM agents_org WHERE name IS NOT NULL AND name<>'';" 2>/dev/null || true)
+    # `|| true` on the grep: an all-blank union exits 1, and this file is cat into
+    # a bundle that runs under `set -euo pipefail`.
+    _TASK_ROSTER=$(printf '%s\n%s\n' "$reg" "$org" | grep -v '^[[:space:]]*$' | sort -u || true)
+    # `ok` requires the AUTHORITY to have answered with at least one agent. The
+    # org chart widens the roster but cannot establish it.
+    if [[ -n "$reg" ]]; then _TASK_ROSTER_STATE="ok"
+    else _TASK_ROSTER_STATE="unestablished:${why:-unknown}"; fi
+  fi
+  return 0
+}
+
+_task_roster_has() {
+  [[ -n "$1" ]] || return 1
+  _task_roster
+  grep -qxF -- "$1" <<<"$_TASK_ROSTER"
+}
+
+# _task_roster_nearmiss <name> — the roster entry the caller most likely meant,
+# or nothing. Ordered by how the drift actually occurs on real boards; the first
+# two rungs are the `agent-` prefix, which is the measured case and is exactly
+# the prefix actor_board_name strips on its passwd rung.
+_task_roster_nearmiss() {
+  local name="$1" roster cand
+  _task_roster; roster="$_TASK_ROSTER"
+  [[ -n "$name" && -n "$roster" ]] || { printf ''; return; }
+  # EVERY branch below is an `if`, and this function ends in `return 0`, because
+  # the bundle runs under `set -euo pipefail`: a trailing `[[ … ]] && printf …`
+  # exits 1 on the no-suggestion path, and `marks+="$(_task_roster_nearmiss x)"`
+  # would then kill `task orphans` mid-listing. That is how the first cut of this
+  # shipped a verb that died with "exited 1 without reporting a reason" — the unit
+  # harness runs `set +e` and could not see it.
+  # 1. agent-<x> -> <x>   2. <x> -> agent-<x>
+  for cand in "${name#agent-}" "agent-${name}"; do
+    [[ "$cand" == "$name" ]] && continue
+    if grep -qxF -- "$cand" <<<"$roster"; then printf '%s' "$cand"; return 0; fi
+  done
+  # 3. case only
+  cand=$(grep -ixF -- "$name" <<<"$roster" | head -1 || true)
+  if [[ -n "$cand" ]]; then printf '%s' "$cand"; return 0; fi
+  # 4. a UNIQUE roster entry that contains, or is contained by, the name. Unique
+  #    only — suggesting one of several is a guess dressed as help. `dev` would
+  #    otherwise "suggest" dev2/dev3 arbitrarily.
+  local hits n_hits
+  hits=$(while IFS= read -r cand; do
+           [[ -n "$cand" ]] || continue
+           case "$name" in *"$cand"*) printf '%s\n' "$cand"; continue ;; esac
+           case "$cand" in *"$name"*) printf '%s\n' "$cand" ;; esac
+         done <<<"$roster")
+  n_hits=$(printf '%s' "$hits" | grep -c . || true)
+  if [[ "$n_hits" == "1" ]]; then printf '%s' "${hits//$'\n'/}"; fi
+  return 0
+}
+
+# Emitted once per process when a guard could not run. A guard that cannot
+# measure must SAY it did not measure — a silent skip and a pass look identical.
+_TASK_ROSTER_WARNED=""
+_task_roster_unestablished_note() {
+  if [[ -n "$_TASK_ROSTER_WARNED" ]]; then return 0; fi
+  _TASK_ROSTER_WARNED=1
+  # A genuinely absent fleet (fresh install, unit harness) is not a defect and is
+  # not worth a line on every add. An UNREADABLE or CORRUPT registry is.
+  case "$_TASK_ROSTER_STATE" in
+    unestablished:registry-unreadable|unestablished:registry-unparseable)
+      warn "agent-name validation SKIPPED (${_TASK_ROSTER_STATE#unestablished:}) — ${STATE_DIR:-/var/lib/5dive}/agents.json could not be read, so '$1' was accepted unchecked. Fix the registry: 5dive doctor" ;;
+  esac
+  return 0
+}
+
+# _task_require_lane <name> <flag> — REFUSE a name that is not a dispatchable
+# lane. Callers pass the flag spelling the user typed so the refusal is actionable.
+_task_require_lane() {
+  local name="$1" flag="$2" hint=""
+  [[ -n "$name" ]] || return 0
+  _task_roster
+  [[ "$_TASK_ROSTER_STATE" == "ok" ]] || { _task_roster_unestablished_note "$name"; return 0; }
+  if _task_roster_has "$name"; then return 0; fi
+  # The sentinel gets its own refusal: it is a legal created_by, so "not a
+  # registered agent" would read as a contradiction to anyone who has seen it in
+  # that column.
+  if grep -qw -- "$name" <<<"$_TASK_PRINCIPAL_SENTINELS"; then
+    fail "$E_VALIDATION" "${flag}='${name}' is not a lane — '${name}' is the actor sentinel for an invocation that could not be attributed to an agent (root, cron, a build bot). It is legal as a CREATOR and never as an owner: nothing wakes it, so the row would sit undispatched forever. Name a real agent: 5dive agent list"
+  fi
+  hint=$(_task_roster_nearmiss "$name")
+  fail "$E_VALIDATION" "${flag}='${name}' is not a registered agent$([[ -n "$hint" ]] && printf -- " — did you mean '%s'?" "$hint") (nothing wakes an unregistered lane, so this row would never be dispatched; see: 5dive agent list)"
+}
+
+# _task_require_principal <name> <flag> — for created_by/--from. Lane OR sentinel.
+_task_require_principal() {
+  local name="$1" flag="$2" hint=""
+  [[ -n "$name" ]] || return 0
+  _task_roster
+  [[ "$_TASK_ROSTER_STATE" == "ok" ]] || { _task_roster_unestablished_note "$name"; return 0; }
+  if _task_roster_has "$name"; then return 0; fi
+  if grep -qw -- "$name" <<<"$_TASK_PRINCIPAL_SENTINELS"; then return 0; fi
+  hint=$(_task_roster_nearmiss "$name")
+  fail "$E_VALIDATION" "${flag}='${name}' is not a registered agent or a known principal$([[ -n "$hint" ]] && printf -- " — did you mean '%s'?" "$hint") (a creator that does not exist misroutes every gate this row ever files; known non-agent principals: ${_TASK_PRINCIPAL_SENTINELS})"
+}
+
+# _task_roster_sql_notin — a SQL fragment listing the roster, for the surfacer.
+# Prints nothing when the roster is unestablished, so a caller that interpolates
+# it cannot turn "could not measure" into "everything is an orphan".
+_task_roster_sql_notin() {
+  local roster n out=""
+  _task_roster; roster="$_TASK_ROSTER"
+  [[ "$_TASK_ROSTER_STATE" == "ok" ]] || { printf ''; return; }
+  while IFS= read -r n; do
+    [[ -n "$n" ]] || continue
+    out+="${out:+,}$(sqlq "$n")"
+  done <<<"$roster"
+  printf '%s' "$out"
+}
+
