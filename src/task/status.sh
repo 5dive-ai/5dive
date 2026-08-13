@@ -608,7 +608,7 @@ _task_status_cmd() {
       if [[ -n "$_maker" && "$_actor" != "$_vfier" && "$_actor" != "cli" \
             && "$_st" != "done" && "$_st" != "cancelled" ]]; then
         policy_refuse "$E_CONFLICT" done-over-delivered-loop DIVE-2007 "$ident" \
-          "$ident is DELIVERED to verifier '${_vfier}' (iteration ${_iter}, maker '${_maker}') and has NOT been graded — a 'task done' from '${_actor}' would close it ungraded, which is the maker grading its own work (writer != grader, DIVE-477). Only '${_vfier}' can close it. To CORRECT the result text do NOT re-run done: send the correction to '${_vfier}' (5dive agent send ${_vfier} \"...\") and let them fold it in. Real exits: '5dive task reject $ident --feedback=...' (verifier bounces it back), '5dive task verify $ident --cmd=\"<acceptance test>\"' (evidence-backed close), or '5dive task cancel $ident --result=...' (abandon)."
+          "$ident is DELIVERED to verifier '${_vfier}' (iteration ${_iter}, maker '${_maker}') and has NOT been graded — a 'task done' from '${_actor}' would close it ungraded, which is the maker grading its own work (writer != grader, DIVE-477). Only '${_vfier}' can grade it. To CORRECT the result text do NOT re-run done: send the correction to '${_vfier}' (5dive agent send ${_vfier} \"...\") and let them fold it in. Real exits: '5dive task reject $ident --feedback=...' (verifier bounces it back), '5dive task verify $ident --no-done --cmd=\"<acceptance test>\"' (record machine evidence and hold at graded->merge), or '5dive task cancel $ident --result=...' (abandon)."
       fi
     fi
   fi
@@ -1908,4 +1908,3 @@ _task_merge_owner() {
   who=$(db "SELECT COALESCE(NULLIF(maker_agent,''), COALESCE(assignee,'?')) FROM tasks WHERE id=${id};" 2>/dev/null)
   printf '%s' "${who:-?}"
 }
-
