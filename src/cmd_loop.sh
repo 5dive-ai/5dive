@@ -185,6 +185,148 @@ print(int(total))
 PY
 }
 
+# _spend_scan_task_sessions <task_ids_json> — DIVE-3349. The per-task reader that
+# sits ALONGSIDE _spend_scan_task_ids above and answers a DIFFERENT question.
+#
+# That one keys on ASSIGNEE and globs every transcript under the seat's home
+# inside the row's [started_at, done_at or now] window. A transcript line carries
+# a timestamp and a usage block and NOTHING that names a task, so what it produces
+# is the seat's whole spend for the WIDTH of the window — and the width is the
+# row's wall-clock age. An OPEN, IDLE row therefore outscores an actively worked
+# one, and two rows open on one seat are EACH billed the seat's full spend (they
+# do not sum to the day; they each approach it). That is what DIVE-3343 removed
+# the per-task budget over. Both halves compiled:
+#   community/wiki/per-task-token-attribution-the-session-id-is-the-signal.md
+#   community/wiki/a-task-attributed-token-figure-measures-the-rows-age-not-its-work.md
+#
+# This reader sums ONLY the transcripts NAMED by that row's session segments,
+# clipped to each segment's own window. Contract — and every arm gets its OWN
+# exit code, because a caller that maps any of them onto 0 rebuilds the DIVE-2304
+# fail-open where "unreadable" and "idle" became the same observation:
+#
+#   rc 0 -> a real integer on stdout
+#   rc 3 -> the word AMBIGUOUS. Two segments on ONE session overlap in time
+#           across DIFFERENT rows. A refusal is the honest output and a SPLIT is
+#           not: apportioning a seat's spend across its open rows is the invention
+#           DIVE-3343 died of, wearing a better disguise (DIVE-3348 §1).
+#   rc 4 -> the word NOT-REACHED. No segments at all; a segment whose session_id
+#           is NULL (an invocation with no session — cron, a human shell, a
+#           non-claude seat); or a named transcript that could not be found/read.
+#
+# NOT-REACHED on a PARTIALLY-named row is deliberate and it is the conservative
+# call. Summing the named segments and quietly dropping the NULL ones returns a
+# number that is real, smaller than the truth, and indistinguishable from a
+# complete answer — and a figure that understates while LOOKING measured is worse
+# than no figure, because only the second one can ever be caught.
+#
+# Says nothing on stdout but the one token; the CAUSE goes to stderr, unswallowed,
+# for the reason written above _spend_scan_task_ids: a `2>/dev/null` on that call
+# is what hid the broken ceiling for its whole life. Do not add one here.
+_spend_scan_task_sessions() {
+  TASK_DB="${TASKS_DB:-${STATE_DIR}/tasks/tasks.db}" \
+    SESS_KIDS="$1" python3 - <<'PY'
+import os, json, glob, time, sqlite3, datetime as dt, pwd, sys
+now = int(time.time())
+def bail(word, rc, why):
+    print(word); sys.stderr.write("task-sessions: %s (%s)\n" % (word, why)); raise SystemExit(rc)
+try:    kids = [int(x) for x in json.loads(os.environ.get("SESS_KIDS") or "[]")]
+except Exception: kids = []
+if not kids: bail("NOT-REACHED", 4, "no task ids given")
+def to_epoch(s):
+    if not s: return None
+    s = s.strip()
+    try:
+        if s.endswith("Z"): s = s[:-1] + "+00:00"
+        d = dt.datetime.fromisoformat(s.replace(" ", "T", 1) if " " in s and "T" not in s else s)
+        if d.tzinfo is None: d = d.replace(tzinfo=dt.timezone.utc)
+        return int(d.timestamp())
+    except Exception: return None
+try:
+    con = sqlite3.connect(os.environ["TASK_DB"]); con.row_factory = sqlite3.Row
+    q = ("SELECT task_id,session_id,agent,started_at,ended_at FROM task_sessions "
+         "WHERE task_id IN (%s)" % ",".join("?"*len(kids)))
+    mine = con.execute(q, kids).fetchall()
+except Exception as e:
+    bail("NOT-REACHED", 4, "segment store unreadable: %s" % e)
+if not mine: bail("NOT-REACHED", 4, "no session segments recorded for %s" % kids)
+segs = []
+for r in mine:
+    st = to_epoch(r["started_at"])
+    if st is None: bail("NOT-REACHED", 4, "segment on task %s has an unparseable started_at" % r["task_id"])
+    if not (r["session_id"] or "").strip():
+        bail("NOT-REACHED", 4, "task %s has a segment with NO session id (claimed outside a "
+                               "session); refusing the assignee-window fallback" % r["task_id"])
+    if not (r["agent"] or "").strip():
+        bail("NOT-REACHED", 4, "segment on task %s names no seat, so its transcript has no home to open" % r["task_id"])
+    segs.append({"tid": r["task_id"], "sid": r["session_id"].strip(),
+                 "agent": r["agent"].strip(), "s": st, "e": to_epoch(r["ended_at"]) or now})
+# --- overlap => AMBIGUOUS. Read the WHOLE table for these session ids, not just
+# the requested rows: the row that overlaps mine is usually NOT the one asked about.
+sids = sorted({g["sid"] for g in segs})
+try:
+    q = ("SELECT task_id,session_id,started_at,ended_at FROM task_sessions "
+         "WHERE session_id IN (%s)" % ",".join("?"*len(sids)))
+    allsegs = con.execute(q, sids).fetchall()
+except Exception:
+    allsegs = mine
+by = {}
+for r in allsegs:
+    st = to_epoch(r["started_at"])
+    if st is None: continue
+    by.setdefault(r["session_id"], []).append((st, to_epoch(r["ended_at"]) or now, r["task_id"]))
+for sid, lst in by.items():
+    lst.sort()
+    for i in range(len(lst)):
+        for j in range(i+1, len(lst)):
+            if lst[j][2] == lst[i][2]: continue          # same row, sequential re-claims
+            # strict: a segment that ends exactly as the next begins does NOT overlap,
+            # which is the ordinary two-rows-in-sequence case and must stay measurable.
+            if lst[i][0] < lst[j][1] and lst[j][0] < lst[i][1]:
+                bail("AMBIGUOUS", 3, "session %s has interleaved segments for tasks %s and %s — "
+                                     "a split would be an invention" % (sid, lst[i][2], lst[j][2]))
+try: con.close()
+except Exception: pass
+try:    _HOME_OVR = json.loads(os.environ.get("LOOP_HOME_OVERRIDE_JSON") or "{}")
+except Exception: _HOME_OVR = {}
+def home_of(name):
+    if name in _HOME_OVR: return _HOME_OVR[name]   # test hook; unset in production
+    try: return pwd.getpwnam("agent-"+name).pw_dir
+    except KeyError: return "/home/agent-"+name
+buckets = {}
+for g in segs: buckets.setdefault((g["sid"], g["agent"]), []).append(g)
+total = 0
+for (sid, agent), ws in buckets.items():
+    paths = glob.glob(os.path.join(home_of(agent), ".claude", "projects", "*", sid + ".jsonl"))
+    if not paths:
+        bail("NOT-REACHED", 4, "no transcript named %s.jsonl under %s's home" % (sid, agent))
+    read_any = False
+    for path in paths:
+        try: f = open(path, "r", errors="ignore")
+        except OSError: continue
+        read_any = True
+        with f:
+            for line in f:
+                if '"usage"' not in line or '"assistant"' not in line: continue
+                try: o = json.loads(line)
+                except Exception: continue
+                if o.get("type") != "assistant": continue
+                ts = to_epoch(o.get("timestamp"))
+                if ts is None: continue
+                u = (o.get("message") or {}).get("usage") or {}
+                # Same limit-moving metric as `5dive usage` and as the scan above:
+                # input + output + cache-WRITE, cache-read excluded.
+                tot = (int(u.get("input_tokens") or 0) + int(u.get("output_tokens") or 0)
+                       + int(u.get("cache_creation_input_tokens") or 0))
+                for w in ws:
+                    if w["s"] <= ts <= w["e"]:
+                        total += tot; break
+    if not read_any:
+        bail("NOT-REACHED", 4, "transcript %s.jsonl exists but could not be opened (it is chmod 600 "
+                               "under %s's home; the scan must run as that seat)" % (sid, agent))
+print(int(total))
+PY
+}
+
 
 # --- live token accounting (DIVE-972: advisory ceiling -> enforceable) --------
 # The ceiling was a no-op because nothing ever wrote loop_runs.tokens_spent — it
