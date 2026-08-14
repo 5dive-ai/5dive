@@ -2080,6 +2080,11 @@ cmd_ask() {
   local name="" message="" from="" from_set=0
   local reply_to_chat="" reply_to_msg=""
   local timeout=120 idle=5 poll=2 buf_lines=2000 allow_unfenced=0
+  # DIVE-3388 arm 2: how long to give the injected question to ECHO into the pane
+  # before declaring a delivery failure. A delivery that never lands buys nothing by
+  # waiting the full --timeout (measured: 180s waits, two of three were delivery
+  # failures), so this grace bounds it. 0 disables the fast-fail.
+  local deliver_grace=30
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -2092,6 +2097,7 @@ cmd_ask() {
       --allow-unfenced)   allow_unfenced=1 ;;
       --poll-secs=*)      poll="${1#--poll-secs=}" ;;
       --buffer-lines=*)   buf_lines="${1#--buffer-lines=}" ;;
+      --deliver-secs=*)   deliver_grace="${1#--deliver-secs=}" ;;
       --)                 shift; positional+=("$@"); break ;;
       -*)                 fail "$E_USAGE" "unknown flag: $1" ;;
       *)                  positional+=("$1") ;;
@@ -2102,7 +2108,7 @@ cmd_ask() {
     name="${positional[0]}"
     positional=("${positional[@]:1}")
   fi
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent ask <name> <text...> [--from=<sender>] [--reply-to-chat=<id> [--reply-to-msg=<id>]] [--timeout=120] [--idle-secs=5] [--poll-secs=2] [--allow-unfenced]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent ask <name> <text...> [--from=<sender>] [--reply-to-chat=<id> [--reply-to-msg=<id>]] [--timeout=120] [--idle-secs=5] [--poll-secs=2] [--deliver-secs=30] [--allow-unfenced]"
   # DIVE-1901: --allow-unfenced re-enables pane scraping, which is the path that
   # has fabricated every bad reply this ticket has caught. It exists for a seat
   # that genuinely cannot follow the reply-format instruction — never for a
@@ -2119,8 +2125,8 @@ cmd_ask() {
     message="${positional[*]}"
   fi
   [[ -n "$message" ]] || fail "$E_USAGE" "message is empty"
-  for n in "$timeout" "$idle" "$poll" "$buf_lines"; do
-    [[ "$n" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "timeout/idle/poll/buffer-lines must be positive integers"
+  for n in "$timeout" "$idle" "$poll" "$buf_lines" "$deliver_grace"; do
+    [[ "$n" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "timeout/idle/poll/buffer-lines/deliver-secs must be non-negative integers"
   done
   (( poll >= 1 )) || fail "$E_VALIDATION" "--poll-secs must be >= 1"
 
@@ -2350,6 +2356,19 @@ cmd_ask() {
     if [[ "$slice" != "$prev_slice" ]]; then
       last_change=$now
       prev_slice="$slice"
+    fi
+
+    # DIVE-3388 arm 2: FAST-FAIL a delivery failure instead of burning the full
+    # --timeout. On the DIRECT path the injected question echoes its `id=<msg_id>`
+    # marker into the pane the moment it lands; if the marker has not appeared by
+    # deliver_grace, the seat never received it and the rest of the wait buys
+    # nothing. Today this only surfaces as a bare timeout at the deadline (measured
+    # by lodar 2026-08-14: three 180s waits, two of them delivery failures). The
+    # SCOPED path is exempt: _capture returns only the post-marker reply window, so
+    # the question marker is not observable there. deliver_grace=0 disables this.
+    if (( ! use_scoped )) && (( deliver_grace > 0 )) && (( now - start >= deliver_grace )) \
+       && ! grep -qF "id=${msg_id}" "$acc_file" 2>/dev/null; then
+      fail "$E_TIMEOUT" "delivery failure: the injected question never appeared in agent '$name''s pane within ${deliver_grace}s (msg_id=${msg_id}) — the seat did not receive it, so waiting the full ${timeout}s would buy nothing. Check the agent is up and at an input prompt (5dive agent info ${name}), then retry. (--deliver-secs=0 disables this fast-fail)"
     fi
 
     if (( now - start >= timeout )); then
