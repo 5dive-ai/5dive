@@ -642,6 +642,55 @@ New harness `tests/task_needs_human_parity_unit.sh` (18 arms). Its shape is the 
 
 Ships with 5dive-plugins DIVE-3267 (`/task` partitions on this field across all six forks).
 
+## v0.19.22 — fix(task): `inbox --json` exports `tier`, so /inbox stops showing the founder other people's gates (DIVE-3224)
+
+lodar, 2026-08-11, minutes apart: *"im frustrated some tech asks still go to human
+instead of agent main"* and *"what about 14 gates awaiting you … this still spams my
+inbox every time I press /inbox"*. The second is not the first one lingering. It is a
+separate defect on the display side, and it is one predicate.
+
+Measured that morning: `/inbox` listed **12 gates, 3 of them his** (DIVE-3172 a
+CODEOWNER click, DIVE-3150 an npm token, DIVE-3215 customer comms). The other 9 were
+routed to agent seats — dev, dev2, dev3, cli, main2, quinn — and **each carried a ✅
+apply-the-recommendation button**, so the surface was not merely noisy: it invited him
+to answer questions already addressed to somebody else. DIVE-2093's gate was routed to
+main2 and rendered in the founder's chat with a tap button on it.
+
+`cmd_task_inbox` has known the difference since DIVE-3117 part 2 (a gate with
+`routed_reviewer` set waits on an agent seat) and grew a fourth clause in DIVE-3228
+(a routed `access` gate its lead can now clear). **The telegram plugin never called
+it.** It shelled `task ls --json` and kept every row carrying a `need_type` — "has an
+unanswered gate", not "needs a human".
+
+The old comment says honestly why it drifted, and the reason is this command's fault:
+`inbox --json` withheld `tier`, which the ✅ button path needs to tell a soft gate from
+a hard one. So the plugin reached for a view that had `tier` and rebuilt the filter by
+hand, minus the routing half.
+
+**`tier` is now in the `inbox --json` SELECT** — one field, so the predicate above can
+stay the single copy. The fix deliberately does NOT export `routed_reviewer` /
+`needs_capability` for consumers to re-implement the rule with: that is what produced
+this bug, and DIVE-3228 is the proof it would have drifted again — a plugin-side copy
+written before it would have gone on showing the routed `access` gates it excludes.
+
+A NULL tier ships as an **absent key**, not `tier: null` (`dbfmt -json` omits nulls,
+and jq answers `null` for an absent path either way). Consumers must read both as 2 —
+visible, not auto-clearable — matching this view's own fail-safe direction: showing a
+human one gate too many is recoverable, hiding one is the defect.
+
+New harness `tests/task_inbox_json_tier_unit.sh` (14 arms). Two are armed controls,
+because the obvious versions of these arms pass against a broken build: **T2** asserts
+`tier` reads back per-row rather than as a constant (a uniform `tier: null` would
+satisfy a mere presence check and then hand the consumer's unknown-tier fail-safe the
+entire fleet), and **R0** reproduces the pre-fix `need_type`-only read and shows the
+routed gates DO come back — without it, R4/R5 would be green against a filter that
+never ran.
+
+Plugin side ships separately (5dive-plugins): `/inbox` now sources this view and its
+local filter is deleted. On a host whose CLI predates this change `tier` is simply
+absent, every gate reads as 2, and they route through the `inbox --send` nonce digest —
+fewer inline buttons, never an unreachable gate.
+
 ## v0.19.22 — feat(host): `5dive host` — hardened host-remediation verbs under the CLI-root grant an admin agent already holds (DIVE-3221)
 
 A devops seat provisioned at the **highest** isolation tier (`admin`) has full **detection** of the
@@ -1687,7 +1736,7 @@ The verdict comes from `envelope_provenance`, which composes over the existing
 `envelope_via` rather than re-deciding, so the audit row and the `[5dive-msg …]` header a
 recipient reads can never disagree. The message **body is not logged** — only its length.
 
-## v0.19.17 — feat(task): per-task token budgets are ENFORCED, default 5M (DIVE-2794)
+## v0.19.15 — feat(task): per-task token budgets are ENFORCED, default 5M (DIVE-2794)
 
 `task_budget` has been stored, validated and displayed since DIVE-824 and read by **nothing**.
 It looked like a control and was a label. This makes it halt.
@@ -2272,6 +2321,54 @@ org's designated QA/testing/verification agent is now the FIRST rung, ahead of e
 already excluded, so the next such ruling is data rather than a code change. It is empty by default —
 this ships inert on that half and changes no selection until an org sets it.
 
+## v0.19.2 — fix(task): verification depth is re-measured at delivery, from the paths the work touched (DIVE-2719)
+
+The defect was the TIMING, not the ruleset. `task add` decided how deeply a task would be graded
+from its PRIORITY and a KEYWORD REGEX over its TITLE — because at `task add` there is no branch, no
+diff and no PR, so the words in the title are the only axis that exists. The classifier was being
+asked at the one moment it could not be answered.
+
+Measured on DIVE-2712: the title described a real user-facing Telegram defect, correctly, so it
+earned the full verifier rail. The delivered change was ONE LINE in a test stub. Four verifier
+iterations graded it. No title classifier could have known — the fact had not happened yet.
+
+So the question is asked again at DELIVERY, where the answer is a measurement. `task done` reads the
+changed paths off the PR the row already binds (`delivery_ref`, or the DIVE-1462 `Branch:` line) and
+either confirms the add-time guess, DOWNGRADES it (every path is a test, a doc or a changelog
+fragment — CI is the gate there, and a grading round-trip adds latency and no signal) or UPGRADES it
+(a row filed as a chore whose diff reached the scheduler, the task store, credentials or deploy now
+routes to a grader instead of closing outright). Path globs only, both lists under ten entries; this
+is deliberately not a taxonomy.
+
+Unknown stays unknown. No binding, no `gh`, no credential, or no PR found all produce an empty path
+list, and an empty list classifies as neither — so a missing credential can never widen or narrow
+the rail, and an ordinary unbound close does not spend a single API call.
+
+This is not the done-time waiver DIVE-969 banned. That ruling refuses a waiver the MAKER ASSERTS at
+peak completion-incentive; this asserts nothing. To be classified shallow you must have genuinely
+changed only tests and docs, in which case there is nothing for a grader to grade. A downgraded
+close still has to satisfy the DIVE-1830 merge gate.
+
+One limit, stated rather than glossed. The add-time opt-out (`--no-verify`) is **not** persisted —
+it is an add-time shell variable with no column behind it — so at `task done` a `--no-verify` row is
+indistinguishable from a DIVE-969 auto-skipped one: both carry a NULL verifier. The UPGRADE arm
+tests exactly that shape, so an explicit opt-out whose diff reaches the blast radius is given a
+grader anyway. The misfire can only ADD a rail, never waive one, so the DIVE-969 posture is intact,
+and `verify_unavailable=1` self-handles (no distinct grader exists, so nothing is attached).
+DIVE-2730 persists the flag so the opt-out survives to delivery.
+
+**The same defect, one function over.** `_task_default_verifier` picked the GRADER by walking UP the
+org chart — project lead, coordinator, the maker's manager, the org root, the deputy. Every rung is a
+leader, so a leader was structurally guaranteed to win. lodar ruled on 2026-08-04: "you should never
+be verifier yourself" / "why our ceo acts as ci tool". The remedy applied that morning moved 58 rows
+off main and cleared 6 more, and did not touch the picker — so by that evening six MORE rows created
+the same day carried verifier=main again. Correcting the output of a rule leaves the rule producing
+it. A chart that names a QA agent has already answered who should grade, and nobody had asked it: the
+org's designated QA/testing/verification agent is now the FIRST rung, ahead of every leader.
+`FIVE_VERIFY_EXCLUDE=<names>` hard-excludes named agents from the default chain the way the maker is
+already excluded, so the next such ruling is data rather than a code change. It is empty by default —
+this ships inert on that half and changes no selection until an org sets it.
+
 ## v0.19.1 — fix(heartbeat): a tier HOLD skips the held TASK, not the whole agent (DIVE-2716)
 
 The wake loop picked ONE todo per agent (`_hb_pick_task`, LIMIT 1) and, when DIVE-1065's
@@ -2722,6 +2819,57 @@ cause of it. Same 237 harnesses, same commit, two jobs — pristine 305s (over b
 not a 494ms harness. The cap pressure is a standing corpus-size problem already flagged there.
 
 
+## v0.19.2 — fix(push): a mint failure says which of four things went wrong (DIVE-2566)
+
+A delegated push to any `lodar/*` repo used to die with a bare **rc=22** — curl's exit for HTTP>=400,
+leaking through `set -euo pipefail`. That is not a 5dive code at all (`error_codes.sh` tops out at
+`E_PERMISSION=10`), so the operator got a number from another namespace with no message, sitting under
+an error string that named four possible causes at once. It read as a missing sudo grant and cost a
+builder an hour; the real cause was a GitHub App with no installation on the target account.
+
+The `set -e` half shipped separately (the lookup guard, PR #395). This is the legibility half:
+
+- **The mint fails `E_AUTH_REQUIRED`, not the `E_GENERIC` catch-all**, and a 404 gets its own sentence:
+  *the GitHub App has no installation covering `<owner>/<repo>` … retrying will not help.* That is the
+  one cause an operator cannot fix by trying again, so it says so and points at DIVE-2033 (a human-only
+  account-level step). No new code was added to the ladder on purpose — `error_codes.sh` says to keep
+  `err_class_for()` in sync, so a new code has a reader outside this file, and this genuinely is an
+  authentication class rather than a class of its own.
+- **`_push_fetch_why`'s four-way string is split.** *Could not read Username* / *terminal prompts
+  disabled* means git wanted to prompt and nothing was ever presented; *Authentication failed* means a
+  credential **was** presented and rejected. Opposite diagnoses with different fixes, previously one
+  sentence. A cause list is not a cause.
+
+**Two arms that could not fail are now behavioural.** olivia mutation-graded the DIVE-2563 arms and found
+two survive a mutation restoring the exact defect they name: replacing `inst="$_inst_for_repo"` with `:`
+(the installation is looked up, announced, never adopted) and stripping `${_why}` from the mint's `fail()`
+(the body is parsed, then discarded). Both left the suite 94/0. They now **execute** the source's own
+lines — extracting the adoption block and the failure block and running them under a real shell with a
+real 404 body — rather than grepping that a string is present. Presence-of-string is not reachability,
+which is this row's own lesson: DIVE-2566 exists because a fallback that was *present* in the source was
+*unreachable* at runtime while the suite stayed green.
+
+**Caught by the row's own guard, and worth recording.** CI red on `unguarded_probe_substitution_unit`:
+the new arms' anchor lookups were themselves unguarded `$( )` probe substitutions — this row's exact
+defect class, committed inside its own fix. Now guarded (`|| _a_start=""` etc.), which also makes each
+arm's loud "could not locate its subject" path *reachable* instead of dying before it.
+
+The scan surfaced **six** sites, not three — and the reason is a coverage gap in the scanner, corrected
+here by olivia's measurement rather than by my first reading of it.
+
+`push_unit.sh` has **always** carried a real `bash -c 'set -euo pipefail` region (the DIVE-2566 `_probe`
+helper), so its probe substitutions were genuinely at risk the whole time. They were invisible, not
+exempt: eligibility is a **file-level, line-anchored `^set -e`** test, and that region writes its mode
+line on the same line as `bash -c '`, so nothing matched. ARM A happens to write `set -euo pipefail` at
+**column 0 inside a quoted string**, which the regex reads as a top-level mode line — so the file became
+*visible*, by accident, and three pre-existing unguarded probes (620, 823, 824) appeared alongside my
+three. Write ARM A the normal indented way and the whole file goes dark again.
+
+So the scanner was right about this file for a wrong reason. All six sites are fixed rather than worked
+around. The standing gap — eligibility decided per FILE while the property is per BLOCK, which makes
+guard membership turn on the indentation of a string literal — is filed as DIVE-2733, with olivia's
+measurement (22 of 312 `tests/*.sh` eligible, 290 skipped).
+
 ## v0.19.3 — fix(agent): do not confirm an unconfirmed send (DIVE-2362)
 
 `agent send`, direct `agent ask`, and their scoped `_deliver` path now report
@@ -2777,6 +2925,98 @@ Two surfaces closed that window:
 `tests/gh_credentialless_read_route_unit.sh` grades both halves, with anchors
 pinning that the authed-caller route, `--as=caller`, write routing and the gate's
 acceptance are all untouched.
+
+## v0.19.20 — feat(task): per-template `--on-overlap=skip|spawn` for recurring templates (DIVE-2272)
+
+Skip-if-open dedup is a claim about the **value of a pile-up**, and that value is class-dependent —
+so it cannot be a fleet-wide setting. For a fungible chore (disk reclaim, hygiene sweep) three open
+instances are three copies of one job: noise, and dedup is right. For a reading-of-the-present job
+(recap, version loop, CEO loop) Tuesday's instance cannot be discharged by Wednesday's run, so three
+open instances mean **nobody has read the inbox in three days** — the pile-up *is* the alarm the
+dedup deletes. Only the template's author knows which kind a template is; the scheduler cannot infer
+it. Decision and rejected options: `community/wiki/pile-up-is-noise-for-a-chore-and-signal-for-a-monitor.md`.
+
+- `--on-overlap=skip` — **the default, and today's behaviour byte for byte.** An open instance
+  suppresses the next slot.
+- `--on-overlap=spawn` — fire regardless of open instances, **up to a bound** (`--overlap-bound`,
+  default 3). At the bound it skips **and stamps `last_skipped_at`**, i.e. degrades to exactly the
+  already-legible suppression path rather than inventing new alarm machinery, so
+  `task ls --recurring` and the DIVE-2237 reading table keep working unchanged.
+- `5dive task set-overlap <template> <skip|spawn> [bound]` classifies an **existing** template.
+  Every template on the board predates the column, and re-creating one to classify it would cost its
+  ident, its history and its `last_fired_at` — the very record that says whether the beat is healthy.
+
+**The bound of 3 is a judgment call, not a measurement** (3 open recaps is unmistakable to a human;
+300 is a different outage). Per-template overridable and env-tunable (`HEARTBEAT_OVERLAP_BOUND`)
+precisely so the number is never read as derived.
+
+**No-op migration.** `on_overlap` and `overlap_bound` are both nullable: NULL means "skip" / "the
+default bound". Deliberately not `NOT NULL DEFAULT 'skip'` — a backfilled default and an unset value
+would then be indistinguishable, and *"nobody has classified this template yet"* is a state the
+classification pass has to be able to see.
+
+### The prerequisite this shipped behind, and why it was not tidiness
+
+DIVE-2273 (landed) had to come first. Today `open` is consumed as a **boolean** — any nonzero skips
+— so the old failure sentinel `1` was wrong but **conservative**: it erred toward not acting. This
+change promotes `open` to a **magnitude** compared against a bound, and that promotion re-aims the
+sentinel without touching the error handling: `1 < 3`, so a failed read would produce the
+**permissive** outcome and start *causing writes*. Worse, **the bound is spawn's safety valve and it
+is computed from the same unreliable read it backstops** — a failing read pins `open` at 1, the bound
+never trips, and the degrade path cannot engage in exactly the conditions that call for it.
+
+So the unreadable-count branch `continue`s **before** the policy branch: a failure never reaches the
+magnitude at all. The general rule, worth more than this feature: **when you widen how a value is
+consumed, re-audit its error sentinel — the sentinel was chosen against the old consumer.**
+
+Acceptance arms **force the count read to fail** (both forging inputs: a non-zero exit, and rc 0 with
+empty output) under `spawn` and assert the tick neither spawns nor stamps. A healthy-read arm proves
+nothing about this property. Verified by mutation: restoring the fail-open makes the spawn template
+spawn on an unreadable DB, and the arm goes red.
+
+### Cardinality: four consumers that assumed at most one open instance
+
+Allowing more than one open instance per template makes a claim every downstream reader had been
+free to assume. All readers of `from_template_id` were swept; `blocked_by`'s subquery was already
+`ORDER BY i.id LIMIT 1` and safe, but four consumers stated a **dedup premise as fact** and would
+have reported a cause they did not observe — the DIVE-2273 defect class, one layer out:
+
+- **`task ls --recurring`'s `blocked_by`** is now policy-aware. Under `spawn` an open instance does
+  not block, so printing its ident would send a reader to close a row that is suppressing nothing. A
+  spawn template reads `-` until it is **at** its bound, then `bound N/B`. The expression reproduces
+  the materializer's own branch and reads the same default constant, so the listing cannot tell a
+  different story than the scheduler (the DIVE-2055 rule for that table). A new `on_overlap` column
+  shows the policy directly.
+- **Recurring-stall rung 1** no longer asserts "the next slot is SUPPRESSED, so the beat is not late,
+  it is not happening" on a spawn template, where later slots keep firing. It says the beat is late,
+  and that the row consumes a bounded slot.
+- **Rung 2's auto-cancel** justified itself with "cancelled BECAUSE skip-if-open was suppressing every
+  later slot". The **action** is unchanged for both policies (a never-started row is a stall either
+  way), but the written reason now matches what the scheduler actually does.
+- **`task park`'s DIVE-2877 warning** said the park "STOPS THAT BEAT". Under `spawn` it does not — it
+  consumes one bounded slot for as long as it stays parked, and since the stall watchdog skips parked
+  rows, enough of them silently convert a spawn template into a suppressed one. Both facts are now
+  said, each under the policy that makes it true.
+
+### An empty field in the middle of a tab-separated row disappears
+
+Adding two columns to the materializer's driving query turned up a latent trap. The query was
+`|`-joined, `tr`'d to tabs, and read with `IFS=$'\t'` — but **tab is an IFS *whitespace* character**,
+so bash collapses runs of it and an **empty field in the middle of the row silently vanishes**,
+shifting every column after it. The old three-column form survived only because its one nullable
+field was **last**. With `on_overlap` after `last_fired_at`, the symptom was not a parse error but
+`last_fired` holding the policy string — after which the same-minute guard rejected every template
+and **the materializer silently stopped firing anything at all**. Now `x'1f'`-joined and read with
+`IFS=$'\x1f'`, the separator the stall sweeps beside it already use, which is not IFS whitespace and
+preserves empty fields.
+
+### Not in scope, deliberately
+
+Gate age still has no monitor outside the thing it watches. This flag shrinks the blast radius of a
+stuck recap; it does not fix that coupling. The per-template **classification** of the existing
+templates is also not applied here — it is a proposal that needs each template owner's confirmation
+(the rule: *would tomorrow's run discharge today's obligation?*), and applying it unilaterally would
+be the same "the scheduler cannot infer the class" mistake this change exists to fix.
 
 ## v0.19.15 — feat(agent): map the hermes and openclaw persona paths, measured on live seats (DIVE-2245)
 
@@ -2967,6 +3207,48 @@ Mutation-graded (`tests/task_done_cited_preclose_unit.sh`, 19 arms): the harness
 against two mutant trees — the pre-check neutered, and the `--no-pr` opt-out neutered — and
 **requires each to red**, because assertions about a refusal and about absences of one both pass
 trivially against a build where the check does nothing.
+
+## v0.19.19 — fix(task): a routed gate says WHO it went to and WHY, at file time (DIVE-2093)
+
+`task need` has always printed the reviewer and the ROLE — *"routed to main2 for verifier
+review"*. It never printed the **property that chose that reviewer**, and that omission cost
+five round trips across four agents in two weeks: dev3 on DIVE-2084 ("open the PR" landed on
+someone holding no `gh`), main on DIVE-2146, olivia immediately after, main2 on DIVE-2798 and
+again on DIVE-2808. Every one of them was **invisible on the board** — a gate pending on the
+wrong principal renders exactly like a gate pending on the right one, so the only way anyone
+learned was the answer that never came.
+
+The routed line now carries the basis:
+
+```
+OK — DIVE-2798 routed to main2 for verifier review (approval, tier 1) [why: routed by LOOP
+MEMBERSHIP — main2 is this task's verifier of record (tasks.verifier). That property carries
+NO information about which capabilities main2 holds, so if this ask needs an ACTION performed
+(open a PR, push, spend, provision a secret) rather than a judgement made, it is on the wrong
+desk: re-file with --tier=2, or --needs=<capability>, or hand it to a holder.
+trigger=verifier-route]
+```
+
+The lead rail names its own edge instead (`agents_org.reports_to`, both ends), so the two
+bases are never confusable. `--json` carries `route_basis` and `route_trigger` for readers
+that should not be parsing prose. The reported trigger is the **most specific** routable kind
+that applies, not whichever clause of the disjunction short-circuited first.
+
+**And the sharper variant, from DIVE-2808.** When the ask is push/deploy shaped, the filing
+now measures whether the routed seat can mint a DIVE-756 closure signature at all, and says so
+in the same breath. A `cli-scoped` seat can ANSWER an approval and cannot SIGN it — so the
+board shows an approved gate, `need_answer_sig` lands empty, and the delegated push is refused
+later, on the MAKER's command, reading as tampering. DIVE-2760 already warns the answerer;
+that shortens the loop and does not close it, because by then a diff has been read and an
+answer given. **Filing is the only moment at which nobody has yet acted.**
+
+An unmeasurable sudo grant reports `unknown, not a no` (DIVE-2318) and never produces the
+warn: a false negative would send a filer to re-route a gate that would have cleared fine.
+Non-push asks print no require_sig clause at all — a notice that fires on every gate is
+wallpaper (DIVE-1955) and stops being read.
+
+This does **not** re-route anything. Routing on (gate type, requested capability) rather than
+on loop membership is the other half, and it sequences with DIVE-2089.
 
 ## v0.19.26 — refactor(task): split the 15k-line `src/cmd_task.sh` into `src/task/*.sh` (DIVE-3278)
 
@@ -3162,6 +3444,43 @@ No new harnesses, so no new `# TIER:` headers.
   probe read the runner FASTER than baseline while the workload read 47-73% slower — it
   prices CPU iterations while these harnesses are priced by process spawn and IO, so it can
   neither clear nor convict them. The thresholds are unchanged.
+
+## v0.19.2 — fix(task): the result guard keys on the COLUMN, not on whether the row is closed (DIVE-2483)
+
+The guard standing between a `--result=` write and an existing record only ran when the row was
+already `done` or `cancelled`. That is the rare cell. The cell the maker→verifier rail
+**manufactures on every loop** is the other one: a delivered row is OPEN and already carries the
+maker's record, so the routine case was unprotected.
+
+Three verbs reached it and each was found separately, months apart — `task done` (DIVE-2483, a
+killed heredoc expanded to nothing and replaced a 2.6KB note with a zero-length string, exit 0),
+`task verify --cmd=` (DIVE-2624, a maker's delivery record replaced by a verify verdict), and
+`task deliver` (DIVE-2476). So did the *remedy*: `--append-result` was parsed, accepted and
+**silently inert** on an open row, because it was implemented inside the refusal's branch
+(DIVE-2717/DIVE-2712). A flag that no-ops in the situation its help text describes is worse than an
+absent one — an operator reaches for it precisely when they perceive the risk, and a clean `OK` is
+affirmative evidence that the protection ran.
+
+Now: both reads happen unconditionally and the gate is *"bytes are about to be lost"*.
+
+- **Open row carrying someone's result → AUTO-APPEND.** Prior text verbatim on top, yours under a
+  marker. Preservation is the default rather than a flag, which removes the class instead of
+  patching it; `--append-result` still works and is simply a no-op here.
+- **Closed row → unchanged.** The DIVE-2464 refusal, `--append-result` and the audited
+  `--force-result` all behave exactly as before.
+- **An EMPTY `--result=` over a non-empty column → refused at every status and under every flag,
+  `--force-result` included.** There is no legitimate reason to blank a result, and the value
+  arrives from ordinary shell accidents rather than decisions. It is also the least visible loss
+  available: a zero-length result renders as a blank field, indistinguishable from one nobody ever
+  wrote, so unlike a replacement with real text it leaves nothing for a reader to notice.
+- **`task verify` is guarded on the not-done path**, where DIVE-2067's preservation never reached.
+
+**Why auto-append and not a uniform refusal**, which was the other candidate: `task reject` writes
+the *verifier's* feedback into `result`, so after any rejection the row is open and carries someone
+else's text — and the maker's next `task done --result=` at iteration 2 is exactly this cell. A
+uniform refusal would have turned the second iteration of every graded task on the fleet into a
+refusal, training people to reach for `--force-result`. `tests/task_result_loss_open_row_unit.sh`
+arm R is the regression arm for that rail and is not optional.
 
 ## v0.19.2 — fix(task): the preservation is now ANNOUNCED, and the seam is dated (DIVE-2483)
 
