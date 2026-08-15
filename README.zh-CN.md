@@ -29,7 +29,7 @@
 <p align="center">
   <a href="#快速开始">快速开始</a> ·
   <a href="#为什么选-5dive">为什么选 5dive</a> ·
-  <a href="#快速导览">快速导览</a> ·
+  <a href="#值得一试">值得一试</a> ·
   <a href="docs/zero-human.md">零人工证明</a> ·
   <a href="#交给你的-ai-智能体">让 AI 智能体使用</a> ·
   <a href="#安全与隔离">安全</a> ·
@@ -91,7 +91,7 @@ sudo 5dive agent pair   my-agent --code=<pairing-code>
 
 **作为服务运行，而不是一次会话。** 关掉终端，智能体依然在线；随时从 Telegram 给它们发消息。
 
-**小主机也能跑。** 5dive 不会在编程智能体 CLI 外再套一层沉重的运行时：只有 Bash、SQLite 和 systemd。单智能体配置在 1 GB 内存的虚拟机上即可运行。
+**小主机也能跑。** 5dive 不会在编程智能体 CLI 外再套一层沉重的运行时：只有 Bash、SQLite 和 systemd。单智能体配置在 1 GB 内存的虚拟机上也能轻松运行。
 
 **支持所有主流智能体 CLI。** `claude`、`codex`、`antigravity`、`grok`、`openclaw`、`hermes`、`opencode`、`pi`，八种类型组成同一支团队。
 
@@ -117,18 +117,6 @@ sudo 5dive agent pair   my-agent --code=<pairing-code>
 ```
 
 没有消息代理、没有协议、没有框架。共享文件系统，共享 CLI。
-
----
-
-## 快速导览
-
-| 能做什么 | 试一下 |
-|----------|--------|
-| 搭起一家可自主运转的公司 | `5dive company` |
-| 把一个目标变成带护栏的任务图 | `5dive goal add "Ship billing v2"` |
-| 召集一次可审计的多智能体决策 | `5dive council convene "Should we ship?" --mode=adversarial` |
-| 实时查看所有智能体 | `5dive watch` |
-| 搜索团队的长期记忆 | `5dive memory search "release checklist"` |
 
 ---
 
@@ -173,6 +161,19 @@ sudo 5dive agent config glm-coder set model=z-ai/glm-5.2
 ```
 
 在会话中，Claude Code 内置的 `/model <slug>` 也能即时接受任意自定义 slug（仅当前会话生效）。
+
+---
+
+## 值得一试
+
+- **自主运转的公司**——用 `5dive company` 快速搭建。
+- **带护栏的目标执行**——用 `5dive goal add "Ship billing v2"` 把结果转成任务图。
+- **持续运行的智能体循环**——用 `5dive loop spawn --role=researcher --agent=scout --prompt="Track competitor launches"` 执行有边界的自主工作。
+- **可审计的多智能体决策**——用 `5dive council convene "Should we ship?" --mode=adversarial` 发起。
+- **端到端溯源**——用 `5dive trace DIVE-42` 查看任务的完整因果时间线。
+- **实时智能体观测**——用 `5dive watch` 查看整个团队。
+- **团队长期记忆**——用 `5dive memory search "release checklist"` 搜索。
+- **ACP 客户端接入**——用 `5dive acp` 连接 Zed、Buzz 等客户端。
 
 ---
 
