@@ -171,6 +171,7 @@ sudo 5dive agent config glm-coder set model=z-ai/glm-5.2
 - **可审计的多智能体决策**——用 `5dive council convene "Should we ship?" --mode=adversarial` 发起。
 - **实时智能体观测**——用 `5dive watch` 查看整个团队。
 - **团队长期记忆**——用 `5dive memory search "release checklist"` 搜索。
+- **ACP 客户端接入**——用 `5dive acp` 连接 Zed、Buzz 等客户端。
 
 ---
 

@@ -185,6 +185,7 @@ In-session, Claude Code's built-in `/model <slug>` also accepts any custom slug 
 - **Auditable multi-agent decisions** — convene one with `5dive council convene "Should we ship?" --mode=adversarial`.
 - **Live agent observability** — watch the whole team with `5dive watch`.
 - **Durable team memory** — search it with `5dive memory search "release checklist"`.
+- **ACP client integration** — connect clients such as Zed and Buzz with `5dive acp`.
 
 ---
 
