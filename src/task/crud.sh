@@ -592,7 +592,7 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
 
 cmd_task_ls() {
   tasks_db_init
-  local status="" assignee="" mine=0 all=0 from="" recurring=0 project=""
+  local status="" assignee="" mine=0 all=0 from="" recurring=0 project="" no_body=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --status=*)   status="${1#*=}" ;;
@@ -602,6 +602,14 @@ cmd_task_ls() {
       --all)        all=1 ;;
       --recurring)  recurring=1 ;;
       --from=*)     from="${1#*=}" ;;
+      # DIVE-3388: the JSON contract is read by agents, not humans, and `ls`
+      # SELECTs every row's full body+result — a single `task ls --json` on a
+      # 179-task board dumps hundreds of KB into the caller's context before any
+      # filtering is possible. Bodies are opt-in-cost here: `--no-body` strips
+      # body+result from every emitted row. The strip is a jq post-pass (not SQL
+      # column surgery) so the SELECT and its MAX_ARG_STRLEN stdin-feed stay
+      # untouched, and the only behaviour change is what reaches the caller.
+      --no-body)    no_body=1 ;;
       -*)           fail "$E_USAGE" "unknown flag: $1" ;;
       *)            fail "$E_USAGE" "unexpected arg: $1" ;;
     esac
@@ -691,7 +699,11 @@ cmd_task_ls() {
     # Feed rows via stdin, not --argjson: a big board (179+ tasks w/ bodies)
     # blows past MAX_ARG_STRLEN (128K per argv string) -> execve E2BIG
     # ("Argument list too long"). stdin has no such cap. (DIVE-222)
-    printf '%s' "$rows" | jq -c '{ok:true, data:{tasks:.}}'
+    if (( no_body )); then
+      printf '%s' "$rows" | jq -c '{ok:true, data:{tasks:(map(del(.body, .result)))}}'
+    else
+      printf '%s' "$rows" | jq -c '{ok:true, data:{tasks:.}}'
+    fi
   elif (( recurring )); then
     # DIVE-2237: last_fired alone cannot distinguish SUPPRESSED from BROKEN.
     # last_skipped names the last tick the materializer found this template due
@@ -751,8 +763,21 @@ cmd_task_ls() {
 
 cmd_task_show() {
   tasks_db_init
-  [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task show <id|DIVE-N>"
-  resolve_task_id "$1"; local id="$RESOLVED_TASK_ID"
+  # DIVE-3388: --no-body strips the (often multi-KB) body+result from both the
+  # JSON and text renderings, for callers that want the row's state/gates without
+  # pulling the full text into context. Same opt-in-cost rule as `task ls`.
+  local no_body=0
+  local -a pos=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-body) no_body=1 ;;
+      -*)        fail "$E_USAGE" "unknown flag: $1" ;;
+      *)         pos+=("$1") ;;
+    esac
+    shift
+  done
+  [[ ${#pos[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task show <id|DIVE-N> [--no-body]"
+  resolve_task_id "${pos[0]}"; local id="$RESOLVED_TASK_ID"
   if (( JSON_MODE )); then
     local task subs deps previous_gates
     # DIVE-3340 iter2 (main2): export the VERDICTS here too. `SELECT *` returns
@@ -774,9 +799,15 @@ cmd_task_show() {
     previous_gates=$(_gate_history_summary_json "$id")
     [[ -n "$subs" ]] || subs="[]"
     [[ -n "$deps" ]] || deps="[]"
-    jq -cn --argjson t "$task" --argjson s "$subs" --argjson b "$deps" \
-      --argjson g "$previous_gates" \
-      '{ok:true, data:{task:($t[0]), subtasks:$s, blocked_by:$b, previous_gates:$g}}'
+    if (( no_body )); then
+      jq -cn --argjson t "$task" --argjson s "$subs" --argjson b "$deps" \
+        --argjson g "$previous_gates" \
+        '{ok:true, data:{task:($t[0] | del(.body, .result)), subtasks:$s, blocked_by:$b, previous_gates:$g}}'
+    else
+      jq -cn --argjson t "$task" --argjson s "$subs" --argjson b "$deps" \
+        --argjson g "$previous_gates" \
+        '{ok:true, data:{task:($t[0]), subtasks:$s, blocked_by:$b, previous_gates:$g}}'
+    fi
   else
     # DIVE-2316: delivery_ref is an enforcement input, so omission here made a
     # missing binding indistinguishable from a presenter that never read it.
@@ -785,7 +816,11 @@ cmd_task_show() {
     # of the split is that a reader can tell "reclaimed after real work" from
     # "never started" FROM THE BOARD ALONE. A fix that records the first start but
     # does not surface it here does not satisfy that.
-    dbfmt -line "SELECT ident, title, status, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, body, result FROM tasks WHERE id=${id};"
+    if (( no_body )); then
+      dbfmt -line "SELECT ident, title, status, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref FROM tasks WHERE id=${id};"
+    else
+      dbfmt -line "SELECT ident, title, status, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, body, result FROM tasks WHERE id=${id};"
+    fi
     # DIVE-1064: surface the creator's isolation tier (read-time from the
     # registry, no schema change) so a reader/agent can down-trust a task filed
     # by a lower-privilege peer.
