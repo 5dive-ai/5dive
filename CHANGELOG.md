@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased — fix(usage): the middle wildcard is a read too (DIVE-3419)
+
+Both transcript readers in `cmd_usage.sh` used `projects/*/*.jsonl`. `usage_collect` was guarded at the
+**top** (`probe_readable` on `projects/`) and the **bottom** (per-file `except OSError`) of a *three*-level
+path; the middle `*` is a directory listing that `glob.glob()` performs itself and swallows every `OSError`
+from. So a project subdir the caller could not read dropped out of the agent's total with no exception and
+no reason, leaving the agent in the READABLE set with **a fraction of its burn and `coverage.complete` still
+true** — and every "⚠ N NOT checked — burn is unknown (not 0)" banner built on that flag stayed quiet on it.
+
+- **A guard at the top and the bottom of a path does not cover a glob's MIDDLE wildcards**, and no third
+  probe can fix it — there is no exception to catch. Each level is now enumerated with `os.listdir`, which
+  may raise. `ENOENT` (a session rolling over) and `ENOTDIR` (a stray file in `projects/`) stay silent: both
+  mean "nothing unread here", and flagging them would disable coverage in the other direction.
+- **`activity_collect` had no readability contract at any level** and still resolved `home` through the
+  guessed `/home/agent-<name>` fallback DIVE-3345 deleted from its sibling. It now gets a **reporting**
+  contract, not the fail-closed NOT-REACHED one the spend scanner owes: nothing persists this trail over
+  durable state, so it emits the trail and NAMES what is missing from it (`.partial`, printed above the
+  counts). An unresolvable agent exits non-zero with empty stdout and a named cause instead of rendering a
+  clean "did nothing".
+- Replacing `glob` **widens** coverage: `glob` hid dot-prefixed names at both levels, and a dot-prefixed
+  session file is still burn.
+- `tests/usage_middle_wildcard_unit.sh` — 23 arms, unprivileged, anchor-first, paired sick/healed, an
+  ANY-UID arm (`ELOOP`, which root cannot resolve either) so a uid-0 CI run cannot be a vacuous green, and
+  over-fire controls. **9/14 pre-fix, 23/0 after.**
+
 ## Unreleased — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
 
 Nothing validated these columns. The work-picker dispatches on `assignee`, so a row on a name that is
