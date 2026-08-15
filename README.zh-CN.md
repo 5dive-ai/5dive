@@ -29,6 +29,7 @@
 <p align="center">
   <a href="#快速开始">快速开始</a> ·
   <a href="#为什么选-5dive">为什么选 5dive</a> ·
+  <a href="#值得一试">值得一试</a> ·
   <a href="docs/zero-human.md">零人工证明</a> ·
   <a href="#交给你的-ai-智能体">让 AI 智能体使用</a> ·
   <a href="#安全与隔离">安全</a> ·
@@ -89,6 +90,8 @@ sudo 5dive agent pair   my-agent --code=<pairing-code>
 **订阅归你所有。** 官方 CLI 使用你自己的 Pro/Max 订阅或 key。没有中间商，没有 OAuth 代理。
 
 **作为服务运行，而不是一次会话。** 关掉终端，智能体依然在线；随时从 Telegram 给它们发消息。
+
+**小主机也能跑。** 5dive 不会在编程智能体 CLI 外再套一层沉重的运行时：只有 Bash、SQLite 和 systemd。单智能体配置在 1 GB 内存的虚拟机上也能轻松运行。
 
 **支持所有主流智能体 CLI。** `claude`、`codex`、`antigravity`、`grok`、`openclaw`、`hermes`、`opencode`、`pi`，八种类型组成同一支团队。
 
@@ -158,6 +161,40 @@ sudo 5dive agent config glm-coder set model=z-ai/glm-5.2
 ```
 
 在会话中，Claude Code 内置的 `/model <slug>` 也能即时接受任意自定义 slug（仅当前会话生效）。
+
+---
+
+## 值得一试
+
+`5dive company`<br>
+一条命令搭建一家自主运转的公司。
+
+`5dive task`<br>
+管理共享任务队列和所有智能体之间的交接。
+
+`5dive goal add "Ship billing v2"`<br>
+把一个结果转成带护栏的任务图。
+
+`5dive loop spawn --role=researcher --agent=scout --prompt="Track competitor launches"`<br>
+让智能体在明确边界内持续自主工作。
+
+`5dive council convene "Should we ship?" --mode=adversarial`<br>
+发起一次可审计的多智能体对抗式评审。
+
+`5dive trace DIVE-42`<br>
+查看任务从起点到结论的完整因果时间线。
+
+`5dive watch`<br>
+实时查看整个团队。
+
+`5dive ui`<br>
+在本地浏览器中查看组织架构、任务队列和人工关卡。
+
+`5dive memory search "release checklist"`<br>
+搜索团队带来源的长期记忆。
+
+`5dive acp`<br>
+通过 ACP 连接 Zed、Buzz 等客户端。
 
 ---
 
@@ -264,7 +301,7 @@ sudo 5dive agent import olivia --as=ceo    # 从 pack 创建具名智能体
 
 `--as` 是该智能体在你主机上的名字；pack 会提供人格、模型和技能。导入时加 `--channels=telegram` 可同时配置 bot。Pack 位于 [`5dive-ai/character-packs`](https://github.com/5dive-ai/character-packs) 仓库，`5dive.yaml` 也可以通过 `pack: <slug>` 引用。
 
-### 常用命令一览
+### 命令参考
 
 ```
 5dive agent list / create / start / stop / restart / rm
@@ -273,6 +310,14 @@ sudo 5dive agent import olivia --as=ceo    # 从 pack 创建具名智能体
 5dive agent logs <name> [--follow]
 5dive agent config <name> set model=<id> / effort=<low|medium|high|xhigh|max>
 5dive agent <name> tui
+
+5dive company                            # 搭建一家自主运转的公司
+5dive goal add "<outcome>"                # 将结果转成带护栏的任务图
+5dive loop spawn --role=<r> --agent=<a> --prompt="<work>"
+5dive council convene "<question>" --mode=adversarial
+5dive trace <task>                       # 从起点到结论的因果时间线
+5dive memory search "<query>"             # 搜索带来源的长期知识
+5dive acp                                # 连接 Zed、Buzz 等 ACP 客户端
 
 5dive task      add / ls / assign / start / done / need / inbox / answer
 5dive heartbeat on / off / ls / tick     # 唤醒有排队任务的智能体
