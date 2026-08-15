@@ -139,7 +139,7 @@ _loop_eff_ceiling() {
 _spend_scan_task_ids() {
   REGISTRY="$REGISTRY" TASK_DB="${TASKS_DB:-${STATE_DIR}/tasks/tasks.db}" \
     LOOP_KIDS="$1" LOOP_SINCE="${2:-0}" python3 - <<'PY'
-import os, json, glob, time, sqlite3, datetime as dt, pwd, errno, sys
+import os, json, time, sqlite3, datetime as dt, pwd, errno, sys   # no glob: DIVE-3417
 # DIVE-3345: reasons collect here and are reported ONCE, at the end, by finish().
 # Accumulating rather than exiting on the first one is deliberate: with several
 # agents in the window the operator wants every blind spot named, not the first.
@@ -229,6 +229,62 @@ def probe_readable(home, projects):
             return False, "home %s not readable by this uid (needs root)" % home
         return False, "home %s unreadable: %s" % (home, e.strerror or e.errno)
     return True, None          # home readable, no transcript dir yet: genuinely idle
+# DIVE-3417 — probe_readable() above covers `projects/`, and the per-file
+# `except OSError` below covers each `*.jsonl`. Between them sat a THIRD read
+# that nothing covered: the middle `*` of `projects/*/*.jsonl` is a directory
+# listing too, and `glob.glob()` performs it by SWALLOWING every OSError and
+# yielding nothing for that entry. So a project subdir this uid cannot read
+# dropped out of the sum with no exception, no stderr, and rc 0 — a well-formed
+# number that is a FRACTION of the truth. That is the same CLOBBER shape
+# DIVE-3345 exists to kill (_loop_refresh_spend accepts rc 0 + numeric and
+# PERSISTS it over the accumulated tokens_spent), not the milder blind-guard
+# shape, and it is MORE reachable on a normalised host, not less: the
+# /etc/cron.d/5dive-agent-home-traversal stopgap (DIVE-3294) makes the UPPER
+# path traversable every 20m, manufacturing exactly the readable-projects/-over-
+# unreadable-subdir state rather than preventing it.
+#
+# The generalisable rule, and why this could not be fixed by adding one more
+# probe: a guard at the TOP and the BOTTOM of a path does not cover a glob's
+# MIDDLE wildcards. Every wildcard is a directory read that can fail, and glob
+# cannot report what it skipped — so the level is enumerated explicitly here,
+# with os.listdir, which is allowed to raise.
+def list_sessions(projects):
+    """-> (paths, reason). reason is not None => NOT-REACHED, paths meaningless.
+
+    Enumerates `projects/*/*.jsonl` one level at a time. Two skips are kept
+    deliberately, because both mean "there is nothing unread here" rather than
+    "we failed to read it", and both match what the glob did:
+      * ENOENT  — the entry vanished between the listing and the read (sessions
+                  and their dirs roll over under a live agent).
+      * ENOTDIR — a regular FILE sitting directly in projects/. It cannot
+                  contain <it>/*.jsonl, so no transcript is being missed.
+    Anything else (EACCES on a 700 subdir, ELOOP on a self-referential symlink,
+    EIO) is a read we could not perform, and is reported.
+
+    One deliberate WIDENING over glob.glob: glob hides entries whose name starts
+    with a dot, at both levels. A dot-prefixed session file is still spend, and
+    silently not counting it is the very shape this function exists to refuse.
+    """
+    out = []
+    try:
+        entries = sorted(os.listdir(projects))
+    except OSError as e:
+        # ENOENT here is the state probe_readable JUST classified as genuinely
+        # idle: a readable home that has no transcript dir yet. NOT-REACHING it
+        # would over-fire on every agent that has never run, which disables the
+        # ceiling as thoroughly as the fail-open does. Anything else is a race
+        # against the probe above — still an unread level, not an empty one.
+        if e.errno == errno.ENOENT: return [], None
+        return [], "transcript dir %s became unreadable mid-scan: %s" % (projects, e.strerror or e.errno)
+    for d in entries:
+        sub = os.path.join(projects, d)
+        try:
+            names = sorted(os.listdir(sub))
+        except OSError as e:
+            if e.errno in (errno.ENOENT, errno.ENOTDIR): continue
+            return [], "project dir %s unreadable: %s" % (sub, e.strerror or e.errno)
+        out.extend(os.path.join(sub, n) for n in names if n.endswith(".jsonl"))
+    return out, None
 total = 0
 for name, ws in wins.items():
     meta = reg.get("agents", {}).get(name)
@@ -252,7 +308,10 @@ for name, ws in wins.items():
         not_reached("%s: %s" % (name, why)); continue
     lo = min(w["start"] for w in ws)
     blind = False
-    for path in glob.glob(os.path.join(projects, "*", "*.jsonl")):
+    sessions, why = list_sessions(projects)
+    if why is not None:
+        not_reached("%s: %s" % (name, why)); continue
+    for path in sessions:
         try:
             if os.path.getmtime(path) < lo: continue
             f = open(path, "r", errors="ignore")
