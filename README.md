@@ -198,6 +198,12 @@ Inspect a task's complete causal timeline from origin to verdict.
 `5dive watch`<br>
 Watch the whole team in real time.
 
+`5dive ui`<br>
+Open local browser views for the org chart, task queue, and human gates.
+
+`5dive task inbox`<br>
+Review every decision waiting on a human.
+
 `5dive memory search "release checklist"`<br>
 Search the team's durable memory with provenance.
 

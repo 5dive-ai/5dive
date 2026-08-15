@@ -184,6 +184,12 @@ sudo 5dive agent config glm-coder set model=z-ai/glm-5.2
 `5dive watch`<br>
 实时查看整个团队。
 
+`5dive ui`<br>
+在本地浏览器中查看组织架构、任务队列和人工关卡。
+
+`5dive task inbox`<br>
+查看所有等待人工处理的决策。
+
 `5dive memory search "release checklist"`<br>
 搜索团队带来源的长期记忆。
 
