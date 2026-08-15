@@ -305,6 +305,14 @@ sudo 5dive agent import olivia --as=ceo    # 从 pack 创建具名智能体
 5dive agent config <name> set model=<id> / effort=<low|medium|high|xhigh|max>
 5dive agent <name> tui
 
+5dive company                            # 搭建一家自主运转的公司
+5dive goal add "<outcome>"                # 将结果转成带护栏的任务图
+5dive loop spawn --role=<r> --agent=<a> --prompt="<work>"
+5dive council convene "<question>" --mode=adversarial
+5dive trace <task>                       # 从起点到结论的因果时间线
+5dive memory search "<query>"             # 搜索带来源的长期知识
+5dive acp                                # 连接 Zed、Buzz 等 ACP 客户端
+
 5dive task      add / ls / assign / start / done / need / inbox / answer
 5dive heartbeat on / off / ls / tick     # 唤醒有排队任务的智能体
 5dive org       set / tree               # 谁向谁汇报

@@ -337,6 +337,14 @@ It is read-only and binds to loopback (there is no sign-in, so `--host` refuses 
 5dive agent config <name> set model=<id> / effort=<low|medium|high|xhigh|max>
 5dive agent <name> tui
 
+5dive company                            # stand up a self-steering company
+5dive goal add "<outcome>"                # outcome -> guarded task graph
+5dive loop spawn --role=<r> --agent=<a> --prompt="<work>"
+5dive council convene "<question>" --mode=adversarial
+5dive trace <task>                       # causal timeline from origin to verdict
+5dive memory search "<query>"             # durable knowledge with provenance
+5dive acp                                # connect from Zed, Buzz, or another ACP client
+
 5dive task      add / ls / assign / start / done / need / inbox / answer
 5dive heartbeat on / off / ls / tick     # wake agents that have queued work
 5dive org       set / tree               # who reports to whom
