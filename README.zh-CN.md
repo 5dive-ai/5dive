@@ -168,7 +168,9 @@ sudo 5dive agent config glm-coder set model=z-ai/glm-5.2
 
 - **自主运转的公司**——用 `5dive company` 快速搭建。
 - **带护栏的目标执行**——用 `5dive goal add "Ship billing v2"` 把结果转成任务图。
+- **持续运行的智能体循环**——用 `5dive loop spawn --role=researcher --agent=scout --prompt="Track competitor launches"` 执行有边界的自主工作。
 - **可审计的多智能体决策**——用 `5dive council convene "Should we ship?" --mode=adversarial` 发起。
+- **端到端溯源**——用 `5dive trace DIVE-42` 查看任务的完整因果时间线。
 - **实时智能体观测**——用 `5dive watch` 查看整个团队。
 - **团队长期记忆**——用 `5dive memory search "release checklist"` 搜索。
 - **ACP 客户端接入**——用 `5dive acp` 连接 Zed、Buzz 等客户端。

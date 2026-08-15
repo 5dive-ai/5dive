@@ -182,7 +182,9 @@ In-session, Claude Code's built-in `/model <slug>` also accepts any custom slug 
 
 - **Self-steering companies** — stand one up with `5dive company`.
 - **Guarded goal execution** — turn an outcome into a task graph with `5dive goal add "Ship billing v2"`.
+- **Persistent agent loops** — run bounded autonomous work with `5dive loop spawn --role=researcher --agent=scout --prompt="Track competitor launches"`.
 - **Auditable multi-agent decisions** — convene one with `5dive council convene "Should we ship?" --mode=adversarial`.
+- **End-to-end provenance** — inspect a task's causal timeline with `5dive trace DIVE-42`.
 - **Live agent observability** — watch the whole team with `5dive watch`.
 - **Durable team memory** — search it with `5dive memory search "release checklist"`.
 - **ACP client integration** — connect clients such as Zed and Buzz with `5dive acp`.
