@@ -27,6 +27,7 @@
 <p align="center">
   <a href="#quickstart">Quickstart</a> ·
   <a href="#why-5dive">Why 5dive</a> ·
+  <a href="#quick-tour">Quick tour</a> ·
   <a href="docs/zero-human.md">Zero-human proof</a> ·
   <a href="#for-your-ai-agent">Use from your AI agent</a> ·
   <a href="#security--isolation">Security</a> ·
@@ -100,6 +101,18 @@ Each agent is its own Linux user running an official agentic AI CLI session (`cl
 </p>
 
 No broker, no protocol, no framework. Shared filesystem, shared CLI.
+
+---
+
+## Quick tour
+
+| What it does | Try it |
+|--------------|--------|
+| Stand up a self-steering company | `5dive company` |
+| Turn an outcome into a guarded task graph | `5dive goal add "Ship billing v2"` |
+| Convene an auditable multi-agent decision | `5dive council convene "Should we ship?" --mode=adversarial` |
+| Watch every agent live | `5dive watch` |
+| Search the team's durable memory | `5dive memory search "release checklist"` |
 
 ---
 
