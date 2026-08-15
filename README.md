@@ -27,7 +27,7 @@
 <p align="center">
   <a href="#quickstart">Quickstart</a> ·
   <a href="#why-5dive">Why 5dive</a> ·
-  <a href="#quick-tour">Quick tour</a> ·
+  <a href="#features">Features</a> ·
   <a href="docs/zero-human.md">Zero-human proof</a> ·
   <a href="#for-your-ai-agent">Use from your AI agent</a> ·
   <a href="#security--isolation">Security</a> ·
@@ -104,18 +104,6 @@ No broker, no protocol, no framework. Shared filesystem, shared CLI.
 
 ---
 
-## Quick tour
-
-| What it does | Try it |
-|--------------|--------|
-| Stand up a self-steering company | `5dive company` |
-| Turn an outcome into a guarded task graph | `5dive goal add "Ship billing v2"` |
-| Convene an auditable multi-agent decision | `5dive council convene "Should we ship?" --mode=adversarial` |
-| Watch every agent live | `5dive watch` |
-| Search the team's durable memory | `5dive memory search "release checklist"` |
-
----
-
 ## Agent types
 
 | Type | Model family | Auth | Channels |
@@ -187,6 +175,16 @@ sudo 5dive agent config glm-coder set model=z-ai/glm-5.2
 ```
 
 In-session, Claude Code's built-in `/model <slug>` also accepts any custom slug live (session-scoped).
+
+---
+
+## Features
+
+- **Self-steering companies** — stand one up with `5dive company`.
+- **Guarded goal execution** — turn an outcome into a task graph with `5dive goal add "Ship billing v2"`.
+- **Auditable multi-agent decisions** — convene one with `5dive council convene "Should we ship?" --mode=adversarial`.
+- **Live agent observability** — watch the whole team with `5dive watch`.
+- **Durable team memory** — search it with `5dive memory search "release checklist"`.
 
 ---
 
