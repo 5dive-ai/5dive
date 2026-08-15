@@ -169,6 +169,9 @@ sudo 5dive agent config glm-coder set model=z-ai/glm-5.2
 `5dive company`<br>
 一条命令搭建一家自主运转的公司。
 
+`5dive task`<br>
+管理共享任务队列和所有智能体之间的交接。
+
 `5dive goal add "Ship billing v2"`<br>
 把一个结果转成带护栏的任务图。
 
@@ -186,9 +189,6 @@ sudo 5dive agent config glm-coder set model=z-ai/glm-5.2
 
 `5dive ui`<br>
 在本地浏览器中查看组织架构、任务队列和人工关卡。
-
-`5dive task inbox`<br>
-查看所有等待人工处理的决策。
 
 `5dive memory search "release checklist"`<br>
 搜索团队带来源的长期记忆。

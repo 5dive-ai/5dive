@@ -183,6 +183,9 @@ In-session, Claude Code's built-in `/model <slug>` also accepts any custom slug 
 `5dive company`<br>
 Stand up a self-steering company in one command.
 
+`5dive task`<br>
+Manage the shared task queue and every agent-to-agent handoff.
+
 `5dive goal add "Ship billing v2"`<br>
 Turn an outcome into a guarded task graph.
 
@@ -200,9 +203,6 @@ Watch the whole team in real time.
 
 `5dive ui`<br>
 Open local browser views for the org chart, task queue, and human gates.
-
-`5dive task inbox`<br>
-Review every decision waiting on a human.
 
 `5dive memory search "release checklist"`<br>
 Search the team's durable memory with provenance.
