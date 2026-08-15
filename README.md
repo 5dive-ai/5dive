@@ -180,14 +180,29 @@ In-session, Claude Code's built-in `/model <slug>` also accepts any custom slug 
 
 ## Things to try
 
-- **Self-steering companies** — stand one up with `5dive company`.
-- **Guarded goal execution** — turn an outcome into a task graph with `5dive goal add "Ship billing v2"`.
-- **Persistent agent loops** — run bounded autonomous work with `5dive loop spawn --role=researcher --agent=scout --prompt="Track competitor launches"`.
-- **Auditable multi-agent decisions** — convene one with `5dive council convene "Should we ship?" --mode=adversarial`.
-- **End-to-end provenance** — inspect a task's causal timeline with `5dive trace DIVE-42`.
-- **Live agent observability** — watch the whole team with `5dive watch`.
-- **Durable team memory** — search it with `5dive memory search "release checklist"`.
-- **ACP client integration** — connect clients such as Zed and Buzz with `5dive acp`.
+`5dive company`<br>
+**Self-steering companies.** Stand one up in one command.
+
+`5dive goal add "Ship billing v2"`<br>
+**Guarded goal execution.** Turn an outcome into a task graph.
+
+`5dive loop spawn --role=researcher --agent=scout --prompt="Track competitor launches"`<br>
+**Persistent agent loops.** Run bounded autonomous work.
+
+`5dive council convene "Should we ship?" --mode=adversarial`<br>
+**Auditable multi-agent decisions.** Convene an adversarial review.
+
+`5dive trace DIVE-42`<br>
+**End-to-end provenance.** Inspect a task's complete causal timeline.
+
+`5dive watch`<br>
+**Live agent observability.** Watch the whole team in real time.
+
+`5dive memory search "release checklist"`<br>
+**Durable team memory.** Search retained knowledge with provenance.
+
+`5dive acp`<br>
+**ACP client integration.** Connect clients such as Zed and Buzz.
 
 ---
 

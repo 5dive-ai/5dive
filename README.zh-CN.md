@@ -166,14 +166,29 @@ sudo 5dive agent config glm-coder set model=z-ai/glm-5.2
 
 ## 值得一试
 
-- **自主运转的公司**——用 `5dive company` 快速搭建。
-- **带护栏的目标执行**——用 `5dive goal add "Ship billing v2"` 把结果转成任务图。
-- **持续运行的智能体循环**——用 `5dive loop spawn --role=researcher --agent=scout --prompt="Track competitor launches"` 执行有边界的自主工作。
-- **可审计的多智能体决策**——用 `5dive council convene "Should we ship?" --mode=adversarial` 发起。
-- **端到端溯源**——用 `5dive trace DIVE-42` 查看任务的完整因果时间线。
-- **实时智能体观测**——用 `5dive watch` 查看整个团队。
-- **团队长期记忆**——用 `5dive memory search "release checklist"` 搜索。
-- **ACP 客户端接入**——用 `5dive acp` 连接 Zed、Buzz 等客户端。
+`5dive company`<br>
+**自主运转的公司。** 一条命令完成搭建。
+
+`5dive goal add "Ship billing v2"`<br>
+**带护栏的目标执行。** 把一个结果转成任务图。
+
+`5dive loop spawn --role=researcher --agent=scout --prompt="Track competitor launches"`<br>
+**持续运行的智能体循环。** 在明确边界内自主工作。
+
+`5dive council convene "Should we ship?" --mode=adversarial`<br>
+**可审计的多智能体决策。** 发起一次对抗式评审。
+
+`5dive trace DIVE-42`<br>
+**端到端溯源。** 查看任务的完整因果时间线。
+
+`5dive watch`<br>
+**实时智能体观测。** 实时查看整个团队。
+
+`5dive memory search "release checklist"`<br>
+**团队长期记忆。** 搜索带来源的沉淀知识。
+
+`5dive acp`<br>
+**ACP 客户端接入。** 连接 Zed、Buzz 等客户端。
 
 ---
 
