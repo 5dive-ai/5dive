@@ -84,7 +84,7 @@ sudo 5dive agent pair   my-agent --code=<pairing-code>
 
 **Runs as a service, not a session.** Agents stay alive when you close the terminal. Message them from Telegram any time.
 
-**Runs on tiny boxes.** 5dive adds no heavy runtime around your coding CLI: just Bash, SQLite, and systemd. A single-agent setup can run on a 1 GB VM.
+**Runs on tiny boxes.** 5dive adds no heavy runtime around your coding CLI: just Bash, SQLite, and systemd. A single-agent setup can comfortably run on a 1 GB VM.
 
 **Every major agent CLI.** `claude`, `codex`, `antigravity`, `grok`, `openclaw`, `hermes`, `opencode`, `pi`, all under one team.
 

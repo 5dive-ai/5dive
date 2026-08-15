@@ -91,7 +91,7 @@ sudo 5dive agent pair   my-agent --code=<pairing-code>
 
 **作为服务运行，而不是一次会话。** 关掉终端，智能体依然在线；随时从 Telegram 给它们发消息。
 
-**小主机也能跑。** 5dive 不会在编程智能体 CLI 外再套一层沉重的运行时：只有 Bash、SQLite 和 systemd。单智能体配置在 1 GB 内存的虚拟机上即可运行。
+**小主机也能跑。** 5dive 不会在编程智能体 CLI 外再套一层沉重的运行时：只有 Bash、SQLite 和 systemd。单智能体配置在 1 GB 内存的虚拟机上也能轻松运行。
 
 **支持所有主流智能体 CLI。** `claude`、`codex`、`antigravity`、`grok`、`openclaw`、`hermes`、`opencode`、`pi`，八种类型组成同一支团队。
 
