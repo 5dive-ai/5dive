@@ -139,23 +139,28 @@ trap 'rm -f "$tmp"' EXIT
 
 for f in "${frags[@]}"; do
   path="${fragdir}/${f}"
-  # DIVE-2702: already consumed by an earlier cut? Compare BLOBS, not idents —
-  # an edited fragment is new content and must fold again.
-  if [[ -n "$baseline" ]]; then
-    released_blob="$(git rev-parse --verify -q "${baseline}:${prefix}${path}" 2>/dev/null || true)"
-    if [[ -n "$released_blob" && "$released_blob" == "$(git hash-object -- "$path" 2>/dev/null)" ]]; then
-      echo "fold-changelog-fragments: ${path} already shipped in a previous cut (unchanged since ${baseline}) — skipping (DIVE-2702)" >&2
-      skipped_released=$((skipped_released + 1))
-      continue
-    fi
-  fi
-  # First non-blank line must anchor a well-formed heading, same pattern
-  # stamp-changelog.sh anchors on — a fragment that drifted from the format is
-  # reported and skipped, never silently folded as prose.
+  # Validate before consulting the baseline. A malformed file was never folded,
+  # so its mere presence in an older main tree is not evidence that it shipped.
+  # It must remain visible for repair, not disappear from the release tree under
+  # the already-consumed cleanup below.
   first_content_line="$(grep -m1 -v '^[[:space:]]*$' "$path" || true)"
   if [[ ! "$first_content_line" =~ ^##[[:space:]]+Unreleased([[:space:]]|$) ]]; then
     echo "fold-changelog-fragments: ${path} does not start with '## Unreleased' — skipping (not folded, not deleted)" >&2
     continue
+  fi
+  # DIVE-2702: already consumed by an earlier cut? Compare BLOBS, not idents —
+  # an edited fragment is new content and must fold again. DIVE-3291: "skip"
+  # means skip adding its prose a second time, not keep the source fragment in
+  # this release tree. The detached cut must consume both new and already-shipped
+  # valid fragments; main remains untouched by the cut (DIVE-2247).
+  if [[ -n "$baseline" ]]; then
+    released_blob="$(git rev-parse --verify -q "${baseline}:${prefix}${path}" 2>/dev/null || true)"
+    if [[ -n "$released_blob" && "$released_blob" == "$(git hash-object -- "$path" 2>/dev/null)" ]]; then
+      echo "fold-changelog-fragments: ${path} already shipped in a previous cut (unchanged since ${baseline}) — skipping prose and deleting the consumed fragment from this release tree (DIVE-2702, DIVE-3291)" >&2
+      rm -f "$path"
+      skipped_released=$((skipped_released + 1))
+      continue
+    fi
   fi
   cat "$path" >> "$tmp"
   printf '\n' >> "$tmp"
