@@ -15,14 +15,18 @@
 #
 # Run: bash tests/burn_leaks_no_body_ask_fastfail_unit.sh
 set -uo pipefail
+# DIVE-2692 corpus contract: the full-sweep runner observes a harness's exit code only
+# through this marker. One folded trap (bash keeps only the LAST EXIT registration), with
+# `rc=$?` FIRST so no cleanup can overwrite $?, and ${TMP:-} so it is safe on an exit that
+# happens before TMP is assigned below.
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
 SRC=src
-TMP="$(mktemp -d /tmp/burn-leaks.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
+TMP="$(mktemp -d /tmp/burn-leaks.XXXXXX)"   # cleanup is folded into the EXIT trap above
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
