@@ -327,7 +327,7 @@ Three views over the box you are on:
 
 It is read-only and binds to loopback (there is no sign-in, so `--host` refuses a routable address unless you set `FIVE_UI_ALLOW_REMOTE=1`). Anything that changes state has a CLI verb. `5dive ui --data` prints the same JSON the views render, so you can pipe it somewhere else.
 
-### Commands at a glance
+### Command reference
 
 ```
 5dive agent list / create / start / stop / restart / rm
