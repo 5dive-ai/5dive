@@ -167,28 +167,28 @@ sudo 5dive agent config glm-coder set model=z-ai/glm-5.2
 ## 值得一试
 
 `5dive company`<br>
-**自主运转的公司。** 一条命令完成搭建。
+一条命令搭建一家自主运转的公司。
 
 `5dive goal add "Ship billing v2"`<br>
-**带护栏的目标执行。** 把一个结果转成任务图。
+把一个结果转成带护栏的任务图。
 
 `5dive loop spawn --role=researcher --agent=scout --prompt="Track competitor launches"`<br>
-**持续运行的智能体循环。** 在明确边界内自主工作。
+让智能体在明确边界内持续自主工作。
 
 `5dive council convene "Should we ship?" --mode=adversarial`<br>
-**可审计的多智能体决策。** 发起一次对抗式评审。
+发起一次可审计的多智能体对抗式评审。
 
 `5dive trace DIVE-42`<br>
-**端到端溯源。** 查看任务的完整因果时间线。
+查看任务从起点到结论的完整因果时间线。
 
 `5dive watch`<br>
-**实时智能体观测。** 实时查看整个团队。
+实时查看整个团队。
 
 `5dive memory search "release checklist"`<br>
-**团队长期记忆。** 搜索带来源的沉淀知识。
+搜索团队带来源的长期记忆。
 
 `5dive acp`<br>
-**ACP 客户端接入。** 连接 Zed、Buzz 等客户端。
+通过 ACP 连接 Zed、Buzz 等客户端。
 
 ---
 
@@ -295,7 +295,7 @@ sudo 5dive agent import olivia --as=ceo    # 从 pack 创建具名智能体
 
 `--as` 是该智能体在你主机上的名字；pack 会提供人格、模型和技能。导入时加 `--channels=telegram` 可同时配置 bot。Pack 位于 [`5dive-ai/character-packs`](https://github.com/5dive-ai/character-packs) 仓库，`5dive.yaml` 也可以通过 `pack: <slug>` 引用。
 
-### 常用命令一览
+### 命令参考
 
 ```
 5dive agent list / create / start / stop / restart / rm
@@ -304,6 +304,14 @@ sudo 5dive agent import olivia --as=ceo    # 从 pack 创建具名智能体
 5dive agent logs <name> [--follow]
 5dive agent config <name> set model=<id> / effort=<low|medium|high|xhigh|max>
 5dive agent <name> tui
+
+5dive company                            # 搭建一家自主运转的公司
+5dive goal add "<outcome>"                # 将结果转成带护栏的任务图
+5dive loop spawn --role=<r> --agent=<a> --prompt="<work>"
+5dive council convene "<question>" --mode=adversarial
+5dive trace <task>                       # 从起点到结论的因果时间线
+5dive memory search "<query>"             # 搜索带来源的长期知识
+5dive acp                                # 连接 Zed、Buzz 等 ACP 客户端
 
 5dive task      add / ls / assign / start / done / need / inbox / answer
 5dive heartbeat on / off / ls / tick     # 唤醒有排队任务的智能体

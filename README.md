@@ -181,28 +181,28 @@ In-session, Claude Code's built-in `/model <slug>` also accepts any custom slug 
 ## Things to try
 
 `5dive company`<br>
-**Self-steering companies.** Stand one up in one command.
+Stand up a self-steering company in one command.
 
 `5dive goal add "Ship billing v2"`<br>
-**Guarded goal execution.** Turn an outcome into a task graph.
+Turn an outcome into a guarded task graph.
 
 `5dive loop spawn --role=researcher --agent=scout --prompt="Track competitor launches"`<br>
-**Persistent agent loops.** Run bounded autonomous work.
+Run bounded autonomous work in a persistent agent loop.
 
 `5dive council convene "Should we ship?" --mode=adversarial`<br>
-**Auditable multi-agent decisions.** Convene an adversarial review.
+Convene an auditable adversarial review with multiple agents.
 
 `5dive trace DIVE-42`<br>
-**End-to-end provenance.** Inspect a task's complete causal timeline.
+Inspect a task's complete causal timeline from origin to verdict.
 
 `5dive watch`<br>
-**Live agent observability.** Watch the whole team in real time.
+Watch the whole team in real time.
 
 `5dive memory search "release checklist"`<br>
-**Durable team memory.** Search retained knowledge with provenance.
+Search the team's durable memory with provenance.
 
 `5dive acp`<br>
-**ACP client integration.** Connect clients such as Zed and Buzz.
+Connect Zed, Buzz, and other clients over ACP.
 
 ---
 
@@ -327,7 +327,7 @@ Three views over the box you are on:
 
 It is read-only and binds to loopback (there is no sign-in, so `--host` refuses a routable address unless you set `FIVE_UI_ALLOW_REMOTE=1`). Anything that changes state has a CLI verb. `5dive ui --data` prints the same JSON the views render, so you can pipe it somewhere else.
 
-### Commands at a glance
+### Command reference
 
 ```
 5dive agent list / create / start / stop / restart / rm
@@ -336,6 +336,14 @@ It is read-only and binds to loopback (there is no sign-in, so `--host` refuses 
 5dive agent logs <name> [--follow]
 5dive agent config <name> set model=<id> / effort=<low|medium|high|xhigh|max>
 5dive agent <name> tui
+
+5dive company                            # stand up a self-steering company
+5dive goal add "<outcome>"                # outcome -> guarded task graph
+5dive loop spawn --role=<r> --agent=<a> --prompt="<work>"
+5dive council convene "<question>" --mode=adversarial
+5dive trace <task>                       # causal timeline from origin to verdict
+5dive memory search "<query>"             # durable knowledge with provenance
+5dive acp                                # connect from Zed, Buzz, or another ACP client
 
 5dive task      add / ls / assign / start / done / need / inbox / answer
 5dive heartbeat on / off / ls / tick     # wake agents that have queued work
