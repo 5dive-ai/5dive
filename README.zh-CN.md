@@ -29,6 +29,7 @@
 <p align="center">
   <a href="#快速开始">快速开始</a> ·
   <a href="#为什么选-5dive">为什么选 5dive</a> ·
+  <a href="#快速导览">快速导览</a> ·
   <a href="docs/zero-human.md">零人工证明</a> ·
   <a href="#交给你的-ai-智能体">让 AI 智能体使用</a> ·
   <a href="#安全与隔离">安全</a> ·
@@ -90,6 +91,8 @@ sudo 5dive agent pair   my-agent --code=<pairing-code>
 
 **作为服务运行，而不是一次会话。** 关掉终端，智能体依然在线；随时从 Telegram 给它们发消息。
 
+**小主机也能跑。** 5dive 不会在编程智能体 CLI 外再套一层沉重的运行时：只有 Bash、SQLite 和 systemd。单智能体配置在 1 GB 内存的虚拟机上即可运行。
+
 **支持所有主流智能体 CLI。** `claude`、`codex`、`antigravity`、`grok`、`openclaw`、`hermes`、`opencode`、`pi`，八种类型组成同一支团队。
 
 **默认安全。** 每个智能体都是独立的 Linux 用户，可选三档隔离级别。MIT 协议，没有 open-core 拆分。
@@ -114,6 +117,18 @@ sudo 5dive agent pair   my-agent --code=<pairing-code>
 ```
 
 没有消息代理、没有协议、没有框架。共享文件系统，共享 CLI。
+
+---
+
+## 快速导览
+
+| 能做什么 | 试一下 |
+|----------|--------|
+| 搭起一家可自主运转的公司 | `5dive company` |
+| 把一个目标变成带护栏的任务图 | `5dive goal add "Ship billing v2"` |
+| 召集一次可审计的多智能体决策 | `5dive council convene "Should we ship?" --mode=adversarial` |
+| 实时查看所有智能体 | `5dive watch` |
+| 搜索团队的长期记忆 | `5dive memory search "release checklist"` |
 
 ---
 

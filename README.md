@@ -27,6 +27,7 @@
 <p align="center">
   <a href="#quickstart">Quickstart</a> ·
   <a href="#why-5dive">Why 5dive</a> ·
+  <a href="#quick-tour">Quick tour</a> ·
   <a href="docs/zero-human.md">Zero-human proof</a> ·
   <a href="#for-your-ai-agent">Use from your AI agent</a> ·
   <a href="#security--isolation">Security</a> ·
@@ -83,6 +84,8 @@ sudo 5dive agent pair   my-agent --code=<pairing-code>
 
 **Runs as a service, not a session.** Agents stay alive when you close the terminal. Message them from Telegram any time.
 
+**Runs on tiny boxes.** 5dive adds no heavy runtime around your coding CLI: just Bash, SQLite, and systemd. A single-agent setup can run on a 1 GB VM.
+
 **Every major agent CLI.** `claude`, `codex`, `antigravity`, `grok`, `openclaw`, `hermes`, `opencode`, `pi`, all under one team.
 
 **Safe by default.** Each agent is its own Linux user under one of three isolation tiers. MIT, no open-core split.
@@ -98,6 +101,18 @@ Each agent is its own Linux user running an official agentic AI CLI session (`cl
 </p>
 
 No broker, no protocol, no framework. Shared filesystem, shared CLI.
+
+---
+
+## Quick tour
+
+| What it does | Try it |
+|--------------|--------|
+| Stand up a self-steering company | `5dive company` |
+| Turn an outcome into a guarded task graph | `5dive goal add "Ship billing v2"` |
+| Convene an auditable multi-agent decision | `5dive council convene "Should we ship?" --mode=adversarial` |
+| Watch every agent live | `5dive watch` |
+| Search the team's durable memory | `5dive memory search "release checklist"` |
 
 ---
 
