@@ -27,7 +27,7 @@
 <p align="center">
   <a href="#quickstart">Quickstart</a> ·
   <a href="#why-5dive">Why 5dive</a> ·
-  <a href="#features">Features</a> ·
+  <a href="#things-to-try">Things to try</a> ·
   <a href="docs/zero-human.md">Zero-human proof</a> ·
   <a href="#for-your-ai-agent">Use from your AI agent</a> ·
   <a href="#security--isolation">Security</a> ·
@@ -178,7 +178,7 @@ In-session, Claude Code's built-in `/model <slug>` also accepts any custom slug 
 
 ---
 
-## Features
+## Things to try
 
 - **Self-steering companies** — stand one up with `5dive company`.
 - **Guarded goal execution** — turn an outcome into a task graph with `5dive goal add "Ship billing v2"`.

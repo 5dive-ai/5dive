@@ -29,7 +29,7 @@
 <p align="center">
   <a href="#快速开始">快速开始</a> ·
   <a href="#为什么选-5dive">为什么选 5dive</a> ·
-  <a href="#核心功能">核心功能</a> ·
+  <a href="#值得一试">值得一试</a> ·
   <a href="docs/zero-human.md">零人工证明</a> ·
   <a href="#交给你的-ai-智能体">让 AI 智能体使用</a> ·
   <a href="#安全与隔离">安全</a> ·
@@ -164,7 +164,7 @@ sudo 5dive agent config glm-coder set model=z-ai/glm-5.2
 
 ---
 
-## 核心功能
+## 值得一试
 
 - **自主运转的公司**——用 `5dive company` 快速搭建。
 - **带护栏的目标执行**——用 `5dive goal add "Ship billing v2"` 把结果转成任务图。
