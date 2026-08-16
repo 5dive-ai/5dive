@@ -543,6 +543,76 @@ PY
   mv -f "$tmp" "$file"
 }
 
+# DIVE-2766: DECLARED channels are not BOUND channels.
+#
+# `channels:` on `info` is read straight out of the registry, so a box where
+# every channel was REFUSED at runtime still prints
+# `channels: telegram,dashboard (@bot)` beside `state: active`. That is accurate
+# about what was declared and it is rendered in the grammar of an observation,
+# which is how four consecutive red `telegram-roundtrip-openrouter` runs were
+# triaged as credential routing while the agent had simply never bound a channel
+# (DIVE-2765 / DIVE-2754). Same class as the DIVE-2362 send receipt: the field
+# describes the CALL, not the delivery.
+#
+# What is measurable from here is the refusal, not the success. The gate is
+# inside the Claude Code binary and it announces itself in the session's own
+# output — `--channels ignored (…)` followed by one of the `Channels are not …`
+# branches (`community/wiki/the-channels-gate-is-inside-claude-code-not-our-plugin-staging.md`).
+# There is NO corresponding success banner in the binary (checked against
+# 2.1.233), so this probe can prove REFUSED and can never prove BOUND.
+#
+# Hence three states and deliberately not two:
+#   n/a       — nothing declared, so there is nothing to bind.
+#   refused   — POSITIVE evidence: the refusal banner is in the pane.
+#   unknown   — everything else, INCLUDING a clean capture. The banner prints at
+#               session start and rolls off the scrollback, so "not found" is
+#               not "bound". Reporting a clean capture as bound would rebuild
+#               this ticket's defect one layer down.
+# Never `bound`. An unprobeable state renders UNKNOWN, never silently as the
+# declared value — the v0.16 "fails loud" direction, where NOT-REACHED is not a
+# synonym for green.
+#
+# Emits `<state>|<detail>|<evidence>` on stdout and always exits 0: like every
+# other probe on this command it degrades to a reported unknown, never a failed
+# `info`.
+agent_channels_binding() { # agent_channels_binding <name> <declared-channels>
+  local name="$1" declared="$2" pane="" line=""
+  case "$declared" in
+    ""|none|null) printf 'n/a||\n'; return 0 ;;
+  esac
+  # Same instrument the runtime commands use (cmd_agent_runtime.sh). A missing
+  # session, a denied sudo and an absent tmux are one answer here — unknown —
+  # and the detail says which, because "cannot probe" and "probed clean" have
+  # completely different remedies and render identically otherwise.
+  if ! sudo -n -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null; then
+    printf 'unknown|no readable tmux session for agent-%s (not running, or this caller cannot read it) — run this as root on the box|\n' "$name"
+    return 0
+  fi
+  pane=$(sudo -n -u "agent-${name}" tmux capture-pane -t "agent-${name}" -p -J -S -2000 2>/dev/null) || pane=""
+  if [[ -z "$pane" ]]; then
+    printf 'unknown|tmux capture-pane returned nothing for agent-%s|\n' "$name"
+    return 0
+  fi
+  # Match the FAMILY, not one branch: the binary picks between several
+  # `Channels are not …` endings (capability / third-party / org policy) and it
+  # gained a new one between 2.1.222 and 2.1.233, so pinning the exact sentence
+  # would have gone quietly blind on an upgrade.
+  # `Channels are not …` is preferred over `--channels ignored` when both are in
+  # the pane (they print as a pair): the second line names WHICH branch of the
+  # gate fired, and the branch is the whole diagnosis. Taking whichever came
+  # first would have surfaced the line that says only "something was ignored".
+  line=$(grep -m1 -E 'Channels are not ' <<<"$pane" 2>/dev/null) || line=""
+  [[ -n "$line" ]] || line=$(grep -m1 -E 'channels ignored' <<<"$pane" 2>/dev/null) || line=""
+  if [[ -n "$line" ]]; then
+    # Trim to keep one banner line on one output line.
+    line="${line//|/ }"
+    printf 'refused|the session announced the channel gate|%s\n' "$(printf '%s' "$line" | tr -d '\r' | cut -c1-160)"
+    return 0
+  fi
+  printf 'unknown|no refusal banner in the last 2000 lines of the pane — the banner prints at session start and rolls off, so this is NOT evidence the channels bound|\n'
+  return 0
+}
+
 # Single-agent detail: registry identity/config + live systemd state, plus the
 # resolved coding-CLI version and selected model. Added so each fork's /status
 # reads one uniform source (cliName/cliVersion/model) instead of shelling each
@@ -619,6 +689,17 @@ cmd_info() {
   # measured here and the other is inherited with its age attached. `|| true`:
   # the overlay is best-effort like every other probe on this command — an
   # unreadable store degrades to `unobserved`, never to a failed `info`.
+  # DIVE-2766: measure the channel BINDING beside the declared value. See
+  # agent_channels_binding for why this can report REFUSED and can never report
+  # BOUND, and why a clean capture is `unknown` rather than a green.
+  local _chan_declared _cb _cb_state _cb_detail _cb_evidence
+  _chan_declared=$(jq -r --arg n "$name" '.agents[$n].channels // "none"' <<<"$reg")
+  _cb=$(agent_channels_binding "$name" "$_chan_declared" || true)
+  [[ -n "$_cb" ]] || _cb='unknown|channel binding probe did not run|'
+  _cb_state="${_cb%%|*}"
+  _cb_detail="${_cb#*|}"; _cb_detail="${_cb_detail%%|*}"
+  _cb_evidence="${_cb##*|}"
+
   local sup
   sup=$(sup_info_for_agent "$name" 2>/dev/null || true)
   [[ -n "$sup" ]] || sup='{"output":"unknown","transacting":null,"classification":"unobserved","verdict":null,"stateNote":"output unknown — the task store was not readable from here","line":"unobserved — the task store was not readable from here","note":"store unreadable"}'
@@ -640,10 +721,28 @@ cmd_info() {
     --arg model "$model" \
     --arg effort "$effort" \
     --arg ocUnpinned "$oc_unpinned" \
+    --arg cbState "$_cb_state" \
+    --arg cbDetail "$_cb_detail" \
+    --arg cbEvidence "$_cb_evidence" \
     '.agents[$n] as $a | {
       name: $n,
       type: $a.type,
+      # DIVE-2766: `channels` is the DECLARED value and always was. It keeps its
+      # name and its shape so no consumer breaks, but it is no longer the only
+      # channel field on this record, and `channelsBinding` below is the one that
+      # answers the question a reader of `channels` thought they were asking.
       channels: ($a.channels // "none"),
+      channelsDeclared: ($a.channels // "none"),
+      channelsBinding: {
+        state: $cbState,
+        # `measured` is true ONLY for a positive refusal. `n/a` measured nothing
+        # (there was nothing to measure) and `unknown` measured nothing either;
+        # collapsing those into a true would hand a consumer the same false
+        # confidence in JSON that the printed line used to hand a human.
+        measured: ($cbState == "refused"),
+        detail: (if $cbDetail == "" then null else $cbDetail end),
+        evidence: (if $cbEvidence == "" then null else $cbEvidence end)
+      },
       workdir: ($a.workdir // $default_wd),
       authProfile: ($a.authProfile // null),
       botUsername: ($a.botUsername // null),
@@ -700,7 +799,13 @@ cmd_info() {
       "type:        \(.type)",
       "cli:         \(.cliName) \(.cliVersion // "unknown")",
       "model:       \(.model // (if .modelUnpinnedWithCreds then "— UNPINNED (see warning below)" else "—" end))\(if .effort then " · effort \(.effort)" else "" end)",
-      "channels:    \(.channels)\(if .botUsername then " (@\(.botUsername))" else "" end)",
+      # DIVE-2766: the word DECLARED is the fix. It is what this line always
+      # reported and never said, and the `bound:` line under it is what the
+      # reader was actually after.
+      "channels:    \(.channels)\(if .botUsername then " (@\(.botUsername))" else "" end)\(if .channelsBinding.state == "n/a" then "" else " — DECLARED (registry)" end)",
+      (if .channelsBinding.state == "n/a" then empty else
+        "bound:       \(if .channelsBinding.state == "refused" then "NO — REFUSED at runtime" else "unknown — \(.channelsBinding.detail // "not probeable from here")" end)\(if .channelsBinding.evidence then "\n             ↳ \(.channelsBinding.evidence)" else "" end)"
+       end),
       "profile:     \(.authProfile // "-")",
       "workdir:     \(.workdir)",
       "isolation:   \(.isolation) (label\(if .isolationLabelled then "" else ", defaulted — unset in registry" end))",
@@ -714,6 +819,9 @@ cmd_info() {
       # knew was dark, and the seat itself, by construction, cannot read this.
       (if .supervisor.verdict then
          "\nWARNING: this seat is UP and REACHABLE but NOT TRANSACTING (\(.supervisor.verdict)): \(.supervisor.note). Whatever is queued behind it is not moving. The `state:` line above and every other liveness signal (unit / tmux / poller / registry label) read healthy — that agreement is the DIVE-3272 defect, not evidence against this line. Check model capacity (auth-profile, quota reset) and reassign or park the queue: 5dive task ls --assignee=\(.name)"
+       else empty end),
+      (if .channelsBinding.state == "refused" then
+         "\nWARNING: this agent DECLARES channels (\(.channelsDeclared)) and its session REFUSED them. It cannot receive or reply on any of them, however healthy every other line above looks — the registry, the unit and the bot username are all still correct, which is exactly why this reads as paired. The gate is inside the coding-CLI binary, not our plugin staging, so re-running `agent create` or re-installing the plugins will not move it (DIVE-2765). Do not attribute an unanswered message or a red round-trip on this agent to credential routing until this line is clear."
        else empty end),
       (if .modelUnpinnedWithCreds then
          "\nWARNING: this openclaw agent has a credential on disk and NO model pin. That is not a neutral default — openclaw model ids are `<provider>/<model>`, so with nothing pinned it uses its built-in default, whose provider prefix is not the one you configured. It will consult a credential that does not exist and return HTTP 401 while your key sits unused (DIVE-3112). Repair: sudo 5dive agent auth set openclaw --provider=<provider> --api-key=<key> --auth-profile=\(.authProfile // "<profile>") --model=<provider>/<model>"
