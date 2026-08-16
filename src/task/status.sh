@@ -1857,6 +1857,17 @@ $_body"
   ledger_emit "$_lk" ident="$ident" task_id="$id" actor="$(task_actor)" out="$result" \
     detail="$verb${handoff_ack:+ → verifier ${handoff_ack}}"
 
+  # DIVE-3503 — the task boundary is the natural lifetime bound for anything the
+  # agent launched for this task, and until now NOTHING happened here: four seats
+  # were wedged in one day by shells that outlived the row, and a human unstuck
+  # them by hand three separate times. Reaps only agent-written `bash -c` shells
+  # older than the grace age, never the caller's own ancestors and never the
+  # seat's machinery — see src/lib/reap.sh for the measured predicate. Runs AFTER
+  # every write above, so a reaper fault can never cost the status transition.
+  case "$verb" in
+    done|cancel) declare -F _reap_at_task_boundary >/dev/null 2>&1 && _reap_at_task_boundary "$verb" "$ident" || true ;;
+  esac
+
   local ok_msg="$ident $verb"
   [[ -n "$handoff_ack" ]] && ok_msg+=" — verifier ACK: reviewing"
   ok "$ok_msg" \
