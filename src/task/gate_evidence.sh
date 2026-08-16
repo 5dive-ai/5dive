@@ -563,6 +563,57 @@ _GATE_GH_LAST_ERR=""
 # cannot see is an ordinary, expected condition on a multi-repo close, and
 # spraying gh's error text on every gate would be noise that trains readers to
 # ignore it (the alarm-fatigue shape DIVE-2711 names).
+# DIVE-3496: the CREDENTIAL-FREE rails, lifted out of _gate_gh so both the
+# no-token path and the blind-token escalation below reach them by the same code.
+# Behaviour on the no-token path is unchanged — this is an extraction, not a
+# rewrite; the escalation is the only new caller.
+_gate_gh_nocred() {
+  local secs="${1:-0}"; shift
+  local _rc=0 _errf
+  _errf="${TMPDIR:-/tmp}/.5dive-gate-gh-nocred-err.$$"
+  # No rail at all is NOT "the query ran and found nothing" — there was nothing
+  # to run it with. Returning 0 here made an unusable bot rail count as a
+  # completed scan, which is the same laundering as a failed listing.
+  if ! _gate_gh_bot_ok; then
+    # DIVE-2770: LAST rail, and only reached when the caller holds nothing.
+    # An unauthenticated read of a public repo answers "did this land" without
+    # any grant at all; on a private repo it declines and we fall through to
+    # the same no-rail state as before.
+    local _anon_out=""
+    if _anon_out=$(_gate_anon_gh "$secs" "$@"); then
+      _GATE_GH_LAST_ERR=""
+      rm -f "$_errf" 2>/dev/null || true
+      printf '%s' "$_anon_out"
+      return 0
+    fi
+    _GATE_GH_LAST_ERR="no gh rail: no token, the gate bot is not usable here, and the anonymous rail could not answer (private repo, or a query it does not serve)"
+    rm -f "$_errf" 2>/dev/null || true
+    printf ''
+    return 1
+  fi
+  [[ "$secs" == "0" ]] && secs=10
+  printf '%s\0' "$@" | timeout "${secs}s" sudo -n "$_GATE_GH_DO" _gh_do 2>"$_errf" || _rc=$?
+  [[ -s "$_errf" ]] && _GATE_GH_LAST_ERR="$(cat "$_errf" 2>/dev/null || printf '')"
+  rm -f "$_errf" 2>/dev/null || true
+  return "$_rc"
+}
+
+# DIVE-3496: does this stderr say THE CREDENTIAL CANNOT SEE THE REPOSITORY, as
+# opposed to any other failure? Kept deliberately narrow. GitHub does not
+# distinguish "private and invisible to you" from "does not exist" — both are the
+# same 404 / GraphQL resolution failure — and that is fine here, because the only
+# thing this predicate authorises is ASKING A SECOND RAIL. A repo that truly does
+# not exist fails on the second rail too and lands in the same unresolved state.
+#
+# "Could not resolve to a PullRequest" is deliberately NOT matched: that is a
+# credential which CAN see the repo answering about a PR number, and re-asking a
+# narrower rail cannot improve it.
+_gate_gh_blind_err() {
+  local f="${1:-}"
+  [[ -s "$f" ]] || return 1
+  grep -qiE 'could not resolve to a repository|not found \(http 404\)|http 404|resource not accessible by integration' "$f" 2>/dev/null
+}
+
 _gate_gh() {
   local tok="${1:-}" secs="${2:-0}"; shift 2
   local -a bound=()
@@ -572,29 +623,66 @@ _gate_gh() {
   if [[ -n "$tok" ]]; then
     [[ "$secs" != "0" ]] && bound=(timeout "${secs}s")
     GH_TOKEN="$tok" "${bound[@]}" gh "$@" 2>"$_errf" || _rc=$?
-  else
-    # No rail at all is NOT "the query ran and found nothing" — there was nothing
-    # to run it with. Returning 0 here made an unusable bot rail count as a
-    # completed scan, which is the same laundering as a failed listing.
-    if ! _gate_gh_bot_ok; then
-      # DIVE-2770: LAST rail, and only reached when the caller holds nothing.
-      # An unauthenticated read of a public repo answers "did this land" without
-      # any grant at all; on a private repo it declines and we fall through to
-      # the same no-rail state as before.
-      local _anon_out=""
-      if _anon_out=$(_gate_anon_gh "$secs" "$@"); then
+    # DIVE-3496: A RESOLVED TOKEN IS NOT A RAIL THAT CAN SEE THE REPO, and until
+    # now the first was silently read as the second.
+    #
+    # _gate_gh_token returns the FIRST credential it can resolve and every rail
+    # below that point is then unreachable — the bot rail and the anonymous rail
+    # are in the `else` arm, i.e. they are tried only when the caller holds
+    # NOTHING. A caller holding a token that is blind to the target repo
+    # therefore forecloses two rails that would have answered, and the gate
+    # renders the result as an unresolved merge state.
+    #
+    # Measured 2026-08-16 on this host, which is what makes this concrete rather
+    # than defensive. Verifier seats are provisioned with `gh` authenticated as a
+    # GitHub App INSTALLATION token (`ghs_`) minted against the single pinned
+    # installation — the 5dive-ai org, 21 repos. Arm 3 of _gate_gh_token ("our
+    # own gh login") resolves it and it wins:
+    #   agent-main2's token -> lodar/5dive-api : GraphQL: Could not resolve to a
+    #                                            Repository (the merge gate's UNKNOWN)
+    #   agent-main2's token -> 5dive-ai/5dive  : answers normally
+    #   the BOT rail (_gh_do, the 5dive-bot PAT) -> lodar/5dive-api : answers,
+    #                                            "mergedAt" and all
+    # So the answer was one rail away the whole time and nothing could reach it.
+    # DIVE-2192 was merged, deployed and green, and could not be closed from
+    # either seat (community/wiki/a-grader-that-cannot-read-the-repo-cannot-close-the-row.md).
+    #
+    # WHY THIS CANNOT WEAKEN THE GATE, on the DIVE-2605 argument:
+    #  * it fires ONLY on a non-zero exit whose stderr says "cannot see this
+    #    repository" — never on a call that ran and answered, so no close that
+    #    passes or refuses today changes path, and no green close spends an extra
+    #    request (tests/task_merge_gate_anon_rail_unit.sh T9 pins that count);
+    #  * the escalation rails are read-only by construction — `_gh_do` re-derives
+    #    its routing class as root and refuses a write, and the anonymous rail has
+    #    no credential to write with;
+    #  * if the escalation also fails we return the ORIGINAL non-zero status and
+    #    empty stdout, which is byte-for-byte the state the caller sees today. The
+    #    gate's fail-closed reading of an empty answer is untouched.
+    # It can only ever convert an UNANSWERED query into an answered one.
+    #
+    # Streaming (not capturing) the primary call is deliberate: it keeps every
+    # existing path identical. `gh ... --json` emits its payload only after a
+    # successful request, so a failed primary call has printed nothing and the
+    # escalation's output cannot be appended to a partial one.
+    if (( _rc != 0 )) && _gate_gh_blind_err "$_errf"; then
+      local _blind; _blind="$(head -n1 "$_errf" 2>/dev/null || printf '')"
+      local _esc_out="" _esc_rc=0
+      _esc_out=$(_gate_gh_nocred "$secs" "$@") || _esc_rc=$?
+      if (( _esc_rc == 0 )); then
         _GATE_GH_LAST_ERR=""
         rm -f "$_errf" 2>/dev/null || true
-        printf '%s' "$_anon_out"
+        printf '%s' "$_esc_out"
         return 0
       fi
-      _GATE_GH_LAST_ERR="no gh rail: no token, the gate bot is not usable here, and the anonymous rail could not answer (private repo, or a query it does not serve)"
+      _GATE_GH_LAST_ERR="the caller's own credential cannot see this repository (${_blind}); the credential-free rails were tried too and could not answer: ${_GATE_GH_LAST_ERR}"
       rm -f "$_errf" 2>/dev/null || true
       printf ''
-      return 1
+      return "$_rc"
     fi
-    [[ "$secs" == "0" ]] && secs=10
-    printf '%s\0' "$@" | timeout "${secs}s" sudo -n "$_GATE_GH_DO" _gh_do 2>"$_errf" || _rc=$?
+  else
+    _gate_gh_nocred "$secs" "$@" || _rc=$?
+    rm -f "$_errf" 2>/dev/null || true
+    return "$_rc"
   fi
   [[ -s "$_errf" ]] && _GATE_GH_LAST_ERR="$(cat "$_errf" 2>/dev/null || printf '')"
   rm -f "$_errf" 2>/dev/null || true

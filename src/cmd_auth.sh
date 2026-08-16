@@ -578,7 +578,11 @@ profile_type_auth_path() {
     hermes)   echo "${dir}/auth.json" ;;
     # openclaw/antigravity/grok use HOME redirect so the credential lives
     # at the same relative path each tool would write under a real $HOME.
-    openclaw)    echo "${dir}/.openclaw/agents/main/agent/auth-profiles.json" ;;
+    # DIVE-3489: openclaw's per-agent auth moved from auth-profiles.json into a
+    # sqlite store. This path feeds mtime-based sign-in detection, so pointing it
+    # at the JSON watched a file that a successful auth no longer touches — the
+    # poll would sit forever on a profile that had in fact authenticated.
+    openclaw)    echo "${dir}/.openclaw/agents/main/agent/openclaw-agent.sqlite" ;;
     antigravity) echo "${dir}/.gemini/antigravity-cli/antigravity-oauth-token" ;;
     grok)        echo "${dir}/.grok/auth.json" ;;
     # claude detection in cmd_auth_poll is log-grep-based, not file-mtime —
@@ -795,16 +799,35 @@ TOML
       ;;
     openclaw)
       local osrc="${pdir}/.openclaw"
+      local ostore="${osrc}/agents/main/agent/openclaw-agent.sqlite"
       local oauth="${osrc}/agents/main/agent/auth-profiles.json"
-      [[ -e "$oauth" ]] || return 0
+      # DIVE-3489: the auth STORE is the credential now; auth-profiles.json is
+      # inert to openclaw. The old guard was `[[ -e "$oauth" ]] || return 0`,
+      # which meant a profile written by the fixed create path — sqlite present,
+      # no JSON — bound SILENTLY AS A NO-OP and the operator got a profile that
+      # linked nothing. Gate on either being present, then link whichever exist.
+      [[ -e "$ostore" || -e "$oauth" ]] || return 0
       install -d -m 2770 -o claude -g claude \
         /home/claude/.openclaw \
         /home/claude/.openclaw/agents \
         /home/claude/.openclaw/agents/main \
         /home/claude/.openclaw/agents/main/agent
-      _paperclip_link_file "$oauth" "/home/claude/.openclaw/agents/main/agent/auth-profiles.json"
-      [[ -e "${osrc}/openclaw.json" ]] \
-        && _paperclip_link_file "${osrc}/openclaw.json" "/home/claude/.openclaw/openclaw.json"
+      # The store's -wal/-shm siblings are deliberately NOT linked: sqlite
+      # resolves them relative to the database file it opened, and openclaw
+      # opens the link target, so they are created beside the real store in the
+      # profile dir where they belong.
+      [[ -e "$ostore" ]] \
+        && _paperclip_link_file "$ostore" "/home/claude/.openclaw/agents/main/agent/openclaw-agent.sqlite"
+      [[ -e "$oauth" ]] \
+        && _paperclip_link_file "$oauth" "/home/claude/.openclaw/agents/main/agent/auth-profiles.json"
+      # openclaw.json carries the profile REGISTRATION that makes the store's
+      # credential selectable (DIVE-3489), so it is no longer optional garnish.
+      if [[ -e "${osrc}/openclaw.json" ]]; then
+        _paperclip_link_file "${osrc}/openclaw.json" "/home/claude/.openclaw/openclaw.json"
+      fi
+      # Explicit: the arm used to end on a `[[ -e … ]] &&` chain, so a profile
+      # with no openclaw.json returned 1 from a successful bind.
+      return 0
       ;;
     claude)
       # claude reads CLAUDE_CODE_OAUTH_TOKEN from env, not a file — copy the
@@ -2293,9 +2316,13 @@ cmd_auth_poll() {
             # past the session baseline is a sound ok signal:
             #   codex       — ~/.codex/auth.json     (CLI polls OpenAI itself)
             #   hermes      — ~/.hermes/auth.json    (CLI polls OpenAI itself)
-            #   openclaw    — ~/.openclaw/agents/main/agent/auth-profiles.json
+            #   openclaw    — ~/.openclaw/agents/main/agent/openclaw-agent.sqlite
             #                 (CLI polls OpenAI itself, then upsertAuthProfile
-            #                 writes the file synchronously before exit)
+            #                 writes the store synchronously before exit).
+            #                 DIVE-3489: this was auth-profiles.json. Measured for
+            #                 the paste-api-key path; the device leg writes the
+            #                 same per-agent auth store openclaw names in its own
+            #                 ProviderAuthError text, but was not re-measured.
             #   grok        — ~/.grok/auth.json
             #                 (CLI polls xAI's device-auth endpoint, writes
             #                 auth.json on token receipt)

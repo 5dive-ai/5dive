@@ -61,6 +61,40 @@ mk_home() {   # mk_home <name> -> echoes the home, seeded with one in-window tur
     "$ts" > "$h/.claude/projects/proj/session.jsonl"
   printf '%s' "$h"
 }
+# DIVE-3468. mk_home_fanout <name> — a home whose session ALSO fanned work out
+# to a subagent. Every fixture above writes its turns into <sid>.jsonl and none
+# creates the sibling directory, which is exactly why the 26 arms above could
+# not see this defect: they model a seat that never delegates.
+#
+# The real layout, measured on agent-quinn and agent-dev3, is TWO levels:
+#
+#     projects/<proj>/<sid>.jsonl                     <- the parent transcript
+#     projects/<proj>/<sid>/subagents/agent-*.jsonl   <- the sidechain turns
+#
+# The parent file holds NONE of the sidechain turns (uuid sets disjoint on all
+# four dev3 pairs), so this is additional spend, not a re-count of it.
+mk_home_fanout() {
+  local n="$1"; local h; local ts
+  h=$(mk_home "$n")
+  ts=$(date -u -d "@$((start+20))" +%FT%TZ)
+  mkdir -p "$h/.claude/projects/proj/session/subagents"
+  printf '{"type":"assistant","isSidechain":true,"timestamp":"%s","message":{"usage":{"input_tokens":7000,"output_tokens":3000,"cache_creation_input_tokens":11000,"cache_read_input_tokens":42}}}\n' \
+    "$ts" > "$h/.claude/projects/proj/session/subagents/agent-deadbeef.jsonl"
+  printf '%s' "$h"
+}
+# mk_decoy <home> — tool-results/ is a sibling of subagents/ in the SAME
+# directory: same depth, same .jsonl suffix, and a well-formed billable
+# assistant turn inside. It is NOT transcript turns. A `*/*/*.jsonl` sweep — the
+# obvious over-broad way to reach the subagents — counts it, and this fixture is
+# the only thing in the corpus that says so. Present on all 9 readable seats, so
+# that fix would over-charge fleet-wide. Its value is deliberately absurd: if it
+# is ever swept in, the total cannot be mistaken for anything else.
+mk_decoy() {
+  local ts; ts=$(date -u -d "@$((start+25))" +%FT%TZ)
+  mkdir -p "$1/.claude/projects/proj/session/tool-results"
+  printf '{"type":"assistant","timestamp":"%s","message":{"usage":{"input_tokens":900000,"output_tokens":900000,"cache_creation_input_tokens":900000}}}\n' \
+    "$ts" > "$1/.claude/projects/proj/session/tool-results/blob.jsonl"
+}
 mk_task() {   # mk_task <ident> <assignee> -> echoes the row id
   db "INSERT INTO tasks (ident,title,status,assignee,kind,started_at,created_at,updated_at)
       VALUES ('$1','spend fixture','in_progress','$2','standard',
@@ -88,13 +122,22 @@ H_IDLE="$TMP/home-idleagent";     mkdir -p "$H_IDLE"                        # no
 H_EMPTY="$TMP/home-emptyagent";   mkdir -p "$H_EMPTY/.claude/projects"      # dir exists, nothing in it
 H_GONE="$TMP/home-goneagent"                                               # never created
 H_BOT=$(mk_home botagent)       # non-claude type: skipped, and must stay skipped
+# DIVE-3468: a seat that DELEGATES. Same one in-window parent turn as H_OK, plus
+# a subagent turn one level deeper, plus the tool-results decoy beside it.
+H_FAN=$(mk_home_fanout fanoutagent)
+mk_decoy "$H_FAN"
+# 30000 parent + (7000 + 3000 + 11000) subagent = 51000. The subagent's
+# cache_read_input_tokens (42) is excluded by the same metric as the parent's,
+# so an exact match here also holds the metric, not just the file set.
+EXPECT_FAN=51000
 
 REGISTRY="$TMP/registry.json"
 cat > "$REGISTRY" <<'JSON'
 {"agents":{"okagent":{"type":"claude"},"denyagent":{"type":"claude"},
            "fileagent":{"type":"claude"},"idleagent":{"type":"claude"},
            "emptyagent":{"type":"claude"},"goneagent":{"type":"claude"},
-           "noaccountagent":{"type":"claude"},"botagent":{"type":"codex"}}}
+           "noaccountagent":{"type":"claude"},"botagent":{"type":"codex"},
+           "fanoutagent":{"type":"claude"}}}
 JSON
 export REGISTRY LOOP_HOME_OVERRIDE_JSON
 # `noaccountagent` is deliberately ABSENT from the override map: it exercises the
@@ -102,7 +145,8 @@ export REGISTRY LOOP_HOME_OVERRIDE_JSON
 # override can never reach.
 LOOP_HOME_OVERRIDE_JSON=$(cat <<JSON
 {"okagent":"$H_OK","denyagent":"$H_DENY","fileagent":"$H_FILE",
- "idleagent":"$H_IDLE","emptyagent":"$H_EMPTY","goneagent":"$H_GONE","botagent":"$H_BOT"}
+ "idleagent":"$H_IDLE","emptyagent":"$H_EMPTY","goneagent":"$H_GONE","botagent":"$H_BOT",
+ "fanoutagent":"$H_FAN"}
 JSON
 )
 
@@ -115,6 +159,7 @@ T_GONE=$(mk_task SS-6 goneagent)
 T_UNRG=$(mk_task SS-7 notinregistry)
 T_NOAC=$(mk_task SS-8 noaccountagent)
 T_BOT=$(mk_task  SS-9 botagent)
+T_FAN=$(mk_task SS-11 fanoutagent)
 
 # ===================== ANCHOR: the scanner can reach a number =================
 # Runs FIRST and on the same code path as every arm below. If this is red, every
@@ -206,6 +251,63 @@ OUT=$(_spend_scan_task_ids '[]' 0 2>/dev/null); RC=$?
 [[ "$RC" == "0" && "$OUT" == "0" ]] \
   && ok_t "no child tasks at all -> still a plain 0 (unchanged)" \
   || bad_t "empty kids" "rc=$RC out='$OUT'"
+
+# ================= DIVE-3468: the seat that DELEGATES =========================
+# The defect these arms exist for: subagent turns are written to a sibling
+# DIRECTORY, projects/<proj>/<sid>/subagents/*.jsonl, and a one-level glob stops
+# short of them. Every arm above models a seat that never delegates, which is
+# exactly why 26 green arms could not see it.
+#
+# It fails in the worst available direction. There is no rc, no NOT-REACHED, no
+# named cause — just a smaller correct-looking integer, under-charging precisely
+# the rows that fan work out, i.e. the expensive ones. Nothing inside the numbers
+# falsifies it, which is why it needs an arm that knows the true total.
+#
+# Independently replicated on a THIRD seat before this was written (agent-dev,
+# not the agent-quinn/agent-dev3 pair in the row): 116 turns, all
+# isSidechain:true, every one carrying the PARENT's sessionId, and the parent
+# .jsonl holding ZERO of their uuids — so the second glob ADDS turns rather than
+# re-counting them. 3,174,912 tokens, 3.1% of that seat's true total, were being
+# silently dropped.
+scan "$T_FAN"
+[[ "$RC" == "0" && "$OUT" == "$EXPECT_FAN" ]] \
+  && ok_t "subagent turns are INCLUDED: parent+sidechain summed (=$OUT)" \
+  || bad_t "subagent turns excluded" "rc=$RC out='$OUT' want=$EXPECT_FAN err=$ERR"
+
+# The pre-fix figure, asserted as a NON-match. Without this the arm above only
+# says "the number is 51000"; with it, the number is also demonstrably not the
+# one the old reader produced, so a future change that silently reverts the glob
+# cannot pass by coincidence.
+[[ "$OUT" != "$EXPECT" ]] \
+  && ok_t "the fanout total is NOT the parent-only total the one-level glob returned ($EXPECT)" \
+  || bad_t "still parent-only" "out='$OUT' — the second glob is not reaching subagents/"
+
+# The over-broad fix must stay refused. tool-results/ sits at the SAME depth as
+# subagents/, with the same .jsonl suffix and a well-formed billable turn inside,
+# and it is present on all 9 readable seats — so a `*/*/*.jsonl` sweep would
+# over-charge fleet-wide. The decoy's value is 2,700,000: if it is ever swept in,
+# the total cannot be mistaken for anything else.
+(( OUT < 2700000 )) \
+  && ok_t "tool-results/ decoy NOT swept in (a */*/*.jsonl fix would have added 2,700,000)" \
+  || bad_t "decoy counted" "out='$OUT' — the glob is too broad, not too narrow"
+
+# The unreadable-level contract must hold at the NEW depth too, or the fix trades
+# a silent undercount for a silent undercount one level deeper. Same pairing
+# discipline as every arm above: break it, assert NOT-REACHED, heal it, assert the
+# real total recomputes through the same code.
+if [[ $EUID -ne 0 ]]; then
+  chmod 000 "$H_FAN/.claude/projects/proj/session/subagents"
+  scan "$T_FAN"
+  nr_t "unreadable subagents/ dir is NOT-REACHED, not a quiet short total" \
+       'unreadable|not read|NOT-REACHED|Permission denied'
+  chmod 755 "$H_FAN/.claude/projects/proj/session/subagents"
+  scan "$T_FAN"
+  [[ "$RC" == "0" && "$OUT" == "$EXPECT_FAN" ]] \
+    && ok_t "healed subagents/ dir recomputes the full total through the same code (=$OUT)" \
+    || bad_t "heal did not recompute" "rc=$RC out='$OUT' want=$EXPECT_FAN err=$ERR"
+else
+  ok_t "SKIP unreadable-subagents arms (running as root: chmod 000 does not deny)"
+fi
 
 # ============ acceptance 4: the GUESSED home, and the unknown assignee ========
 scan "$T_NOAC"

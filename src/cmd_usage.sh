@@ -214,6 +214,35 @@ def list_sessions(projects):
                 continue
             return [], "project dir %s unreadable: %s" % (sub, e.strerror or e.errno)
         out.extend(os.path.join(sub, n) for n in names if n.endswith(".jsonl"))
+        # DIVE-3468: a subagent's turns are NOT in the session file. Claude Code
+        # writes sidechain turns to a sibling DIRECTORY,
+        # projects/<proj>/<sid>/subagents/*.jsonl, so a two-level enumeration
+        # stops one level short of them — while every turn in there carries the
+        # PARENT's sessionId, so the attribution was always right and only the
+        # path was out of range. Measured excluded: ~9% of one agent-quinn
+        # session (62 turns / 294,684 tokens).
+        #
+        # This is the SAME failure this function exists to refuse, one level
+        # deeper: no error, no reason, just a smaller correct-looking integer
+        # inside coverage.complete=true — under-counting exactly the agents that
+        # fan work out to subagents, i.e. the expensive ones.
+        #
+        # ENOENT (a session with no subagents) and ENOTDIR (`n` is the .jsonl
+        # file itself, not a dir) are real absences and stay silent, exactly as
+        # above. Anything else is a read we could not perform and is reported —
+        # a swallowed EACCES here would rebuild the DIVE-3419 blind spot.
+        #
+        # Only `<sid>/subagents/` is descended into. The `tool-results/` sibling
+        # in the same tree is not transcript turns; a `*/*` sweep would take it.
+        for n in names:
+            subag = os.path.join(sub, n, "subagents")
+            try:
+                sa_names = sorted(os.listdir(subag))
+            except OSError as e:
+                if e.errno in (errno.ENOENT, errno.ENOTDIR):
+                    continue
+                return [], "subagent dir %s unreadable: %s" % (subag, e.strerror or e.errno)
+            out.extend(os.path.join(subag, m) for m in sa_names if m.endswith(".jsonl"))
     return out, None
 
 # --- scan transcripts: per agent per model token sums + per-turn timeline ---
@@ -1186,6 +1215,23 @@ def list_sessions(projects):
                 partial.append("project dir %s unreadable: %s" % (sub, e.strerror or e.errno))
             continue
         out.extend(os.path.join(sub, n) for n in names if n.endswith(".jsonl"))
+        # DIVE-3468: subagent turns live one level deeper, in
+        # <sid>/subagents/*.jsonl, and carry the PARENT's sessionId — so this
+        # trail was silently short of the truth for exactly the sessions that
+        # fanned work out. Same enumeration discipline as the level above:
+        # ENOENT/ENOTDIR are real absences, anything else is NAMED in `partial`
+        # rather than swallowed, which is the whole contract of this function.
+        # Only <sid>/subagents/ is descended into — tool-results/ beside it is
+        # not transcript turns.
+        for n in names:
+            subag = os.path.join(sub, n, "subagents")
+            try:
+                sa_names = sorted(os.listdir(subag))
+            except OSError as e:
+                if e.errno not in (errno.ENOENT, errno.ENOTDIR):
+                    partial.append("subagent dir %s unreadable: %s" % (subag, e.strerror or e.errno))
+                continue
+            out.extend(os.path.join(subag, m) for m in sa_names if m.endswith(".jsonl"))
     return out
 
 for path in list_sessions(os.path.join(home, ".claude", "projects")):

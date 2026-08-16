@@ -47,7 +47,12 @@ check() { if [[ "$2" == "$3" ]]; then echo "ok: $1"; else echo "FAIL: $1 (want=$
 # files under 0700 dot-dirs (DIVE-1900 — the dirs were the other half of the
 # bug; a 0640 file under a 0700 dir is still unreadable to group=claude).
 AGY_CRED="$AUTH_PROFILES_DIR/acme/antigravity/.gemini/antigravity-cli/antigravity-oauth-token"
-OC_CRED="$AUTH_PROFILES_DIR/acme/openclaw/.openclaw/agents/main/agent/auth-profiles.json"
+# DIVE-3489: openclaw's credential is the sqlite auth store, not auth-profiles.json
+# (the runtime does not read the JSON at all). The assertion is unchanged — the
+# CREDENTIAL a seat must be able to read ends up 0640 under a 0750 dir — only the
+# file it is made of moved, so this fixture has to be the store the normalizer
+# now resolves via _auth_profile_file.
+OC_CRED="$AUTH_PROFILES_DIR/acme/openclaw/.openclaw/agents/main/agent/openclaw-agent.sqlite"
 mkdir -p "$AUTH_PROFILES_DIR/acme/codex" "$AUTH_PROFILES_DIR/acme/grok/.grok" \
          "$AUTH_PROFILES_DIR/acme/hermes" "$(dirname "$AGY_CRED")" "$(dirname "$OC_CRED")"
 echo '{"token":"c"}' > "$AUTH_PROFILES_DIR/acme/codex/auth.json"

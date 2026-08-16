@@ -808,9 +808,15 @@ EOF
   # up a team/company/council" is worse than an admin agent missing the pitch (main gate,
   # DIVE-1571). No em-dashes (public-copy rule). {name}=agent name; a nameless agent drops
   # the name clause.
-  local iso=""
-  [[ -n "$agent_name" ]] && iso=$(sed -n 's/^AGENT_ISOLATION=//p' "${ENV_DIR}/${agent_name}.env" 2>/dev/null | head -1)
-  iso="${iso:-standard}"
+  # DIVE-2218: same fallback, said out loud. agent_env_isolation() cannot return
+  # empty and cannot invent a tier, so "we could not read it" arrives as an
+  # unknown:<reason> and the fail-safe below fires on the PREDICATE rather than on
+  # an empty string that a missing file, an unreadable one and a blank field all
+  # produce alike. Behaviour here is unchanged, deliberately: this site was never
+  # the defect, it is the model the other two were fixed to match.
+  local iso
+  iso="$(agent_env_isolation "$agent_name")"
+  agent_env_isolation_unmeasured "$iso" && iso="standard"
   if [[ "$iso" == "admin" ]]; then
     local intro="hey, i'm your agent, and i'm not alone."
     [[ -n "$agent_name" ]] && intro="hey, i'm ${agent_name}, your agent, and i'm not alone."
