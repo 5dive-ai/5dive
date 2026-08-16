@@ -223,16 +223,26 @@ OC_BLOCK="$(extract_block openclaw)"
 assert_no_missing_fn "openclaw block" "$OC_BLOCK"
 
 PROFILE_OC="$TMP/profile-oc"
-OC_SHARED="$PROFILE_OC/.openclaw/agents/main/agent/auth-profiles.json"
+# DIVE-3489: the credential this block must seed is the sqlite auth STORE.
+# openclaw does not read auth-profiles.json at all, so seeding the JSON left the
+# agent booting UNAUTHENTICATED while this block reported cred_seed_ok. The
+# assertion is unchanged in intent — the credential reaches the seat on a plain
+# read with no sudo — only the file that IS the credential moved.
+OC_SHARED="$PROFILE_OC/.openclaw/agents/main/agent/openclaw-agent.sqlite"
+OC_SHARED_JSON="$PROFILE_OC/.openclaw/agents/main/agent/auth-profiles.json"
 mkdir -p "$(dirname "$OC_SHARED")"
 printf '{"token":"oc-valid"}\n' > "$OC_SHARED"
+printf '{"token":"oc-legacy"}\n' > "$OC_SHARED_JSON"
 OC_HOME="$TMP/home-oc"; mkdir -p "$OC_HOME"
 
 out=$(run_block "$OC_BLOCK" TYPE=openclaw HOME="$OC_HOME" \
         PROFILE_STATE_DIR="$PROFILE_OC" WORKDIR="$TMP")
-LOCAL_OC="$OC_HOME/.openclaw/agents/main/agent/auth-profiles.json"
-check "openclaw: auth-profiles.json seeded with sudo unavailable" \
+LOCAL_OC="$OC_HOME/.openclaw/agents/main/agent/openclaw-agent.sqlite"
+check "openclaw: auth store seeded with sudo unavailable" \
       "$( [[ -s "$LOCAL_OC" ]] && cat "$LOCAL_OC" )" '{"token":"oc-valid"}'
+check "openclaw: legacy auth-profiles.json still carried alongside the store" \
+      "$( [[ -s "$OC_HOME/.openclaw/agents/main/agent/auth-profiles.json" ]] && cat "$OC_HOME/.openclaw/agents/main/agent/auth-profiles.json" )" \
+      '{"token":"oc-legacy"}'
 
 if [[ $EUID -ne 0 ]]; then
   chmod 0000 "$OC_SHARED"

@@ -1205,29 +1205,36 @@ _apply_byo_openclaw() {
 
   local openclaw_bin="${TYPE_BIN[openclaw]}"
   local openclaw_node="/home/claude/.local/bin/node"
-  if [[ -n "$openclaw_base_url" || -n "$model" ]]; then
-    # The npm launcher uses `#!/usr/bin/env node`. Do not rely on sudo/systemd's
-    # PATH to resolve that shebang during fresh create: invoke the stable Node
-    # link installed alongside OpenClaw explicitly. Keep ~/.local/bin on PATH
-    # for any subprocess OpenClaw starts while writing the config.
-    #
-    # Install-on-demand rather than an immediate refusal, because the two
-    # preconditions are NOT the same check: `agent create`'s install gate tests
-    # ${TYPE_BIN[openclaw]}, while the write below also needs the node link the
-    # same recipe creates. A box where those two disagree (a dangling node link
-    # after an nvm prune, or `agent auth set` on an openclaw-less box — that path
-    # has no install gate at all) passes the gate and fails here.
-    if [[ ! -x "$openclaw_node" || ! -x "$openclaw_bin" ]] \
-       && declare -F cmd_install >/dev/null 2>&1; then
-      step "openclaw runtime incomplete — installing before writing any credential"
-      local _prev_json="${JSON_MODE:-0}"
-      JSON_MODE=0
-      cmd_install openclaw >&2 || true
-      JSON_MODE="$_prev_json"
-    fi
-    [[ -x "$openclaw_node" ]] \
-      || fail "$E_NOT_INSTALLED" "node runtime missing for openclaw (run: 5dive agent install openclaw --upgrade)"
+  # DIVE-3489: UNCONDITIONAL now. This block used to be gated on
+  # `[[ -n "$openclaw_base_url" || -n "$model" ]]` because the runtime was only
+  # needed for the openclaw.json writes — the credential itself was a jq
+  # heredoc that needed no openclaw at all. It is not any more: the key write
+  # below goes through openclaw's own CLI, so the runtime is a precondition of
+  # EVERY openclaw BYO apply, not just the ones that also pin a model.
+  #
+  # The npm launcher uses `#!/usr/bin/env node`. Do not rely on sudo/systemd's
+  # PATH to resolve that shebang during fresh create: invoke the stable Node
+  # link installed alongside OpenClaw explicitly. Keep ~/.local/bin on PATH
+  # for any subprocess OpenClaw starts while writing the config.
+  #
+  # Install-on-demand rather than an immediate refusal, because the two
+  # preconditions are NOT the same check: `agent create`'s install gate tests
+  # ${TYPE_BIN[openclaw]}, while the write below also needs the node link the
+  # same recipe creates. A box where those two disagree (a dangling node link
+  # after an nvm prune, or `agent auth set` on an openclaw-less box — that path
+  # has no install gate at all) passes the gate and fails here.
+  if [[ ! -x "$openclaw_node" || ! -x "$openclaw_bin" ]] \
+     && declare -F cmd_install >/dev/null 2>&1; then
+    step "openclaw runtime incomplete — installing before writing any credential"
+    local _prev_json="${JSON_MODE:-0}"
+    JSON_MODE=0
+    cmd_install openclaw >&2 || true
+    JSON_MODE="$_prev_json"
   fi
+  [[ -x "$openclaw_node" ]] \
+    || fail "$E_NOT_INSTALLED" "node runtime missing for openclaw (run: 5dive agent install openclaw --upgrade)"
+  [[ -e "$openclaw_bin" ]] \
+    || fail "$E_NOT_INSTALLED" "openclaw missing (run: 5dive agent install openclaw --upgrade)"
   # ── end DIVE-3113 preconditions; writes start here ─────────────────────────
 
   if [[ -n "$profile" ]]; then
@@ -1241,19 +1248,64 @@ _apply_byo_openclaw() {
     "${base}/.openclaw/agents/main" \
     "$oc_dir"
 
+  # ── DIVE-3489: write through openclaw's own CLI, never the store ───────────
+  # This used to hand-write `{version:1, profiles:{…}}` into auth-profiles.json.
+  # openclaw moved its per-agent auth into a sqlite store and does not read that
+  # file at all — not even as a migration source. Measured on 2026-08-16 against
+  # openclaw 2026.7.1-2, in a throwaway HOME, both directions:
+  #
+  #   * NEGATIVE: a byte-valid auth-profiles.json with the correct provider id
+  #     and profile id present on disk ->
+  #       Auth state store: ~/.openclaw/agents/main/agent/openclaw-agent.sqlite
+  #       Profiles: (none)
+  #   * POSITIVE: the command below, same HOME ->
+  #       Auth profile: openrouter:manual (openrouter/api_key)
+  #     and openclaw-agent.sqlite appears (110592 bytes, +-wal/-shm).
+  #
+  # So every openclaw BYO create since that migration shipped a credential the
+  # runtime never consulted: the seat reported AUTH ok (our sentinel was the
+  # file we had just written) and failed at first use with ProviderAuthError.
+  #
+  # Do NOT "fix" this by teaching us to write sqlite. The store format is
+  # openclaw's, it has now moved once, and cmd_auth.sh:488 already records that
+  # an openclaw upgrade invalidates assumptions graded against the old shape.
+  # Hand-writing a second private format buys the same debt again.
+  #
+  # The CLI also does a half a file write cannot: it REGISTERS the profile in
+  # openclaw.json under `auth.profiles.<id> = {provider, mode}`. The key stays
+  # in the sqlite; the registration is what makes it selectable.
+  #
+  # Flag placement is load-bearing: `--agent` belongs to the `models auth`
+  # PARENT, not to `paste-api-key` (on the subcommand it errors with
+  # `OpenClaw does not recognize option "--agent"`). `--profile-id` defaults to
+  # `<provider>:manual`, which is the exact id the old jq write constructed, so
+  # this is behaviour-preserving for anything reading the profile id.
+  #
+  # Key travels on STDIN, never in argv — argv is world-readable in /proc.
   local profile_id="${native}:manual"
-  local auth_file="${oc_dir}/auth-profiles.json"
-  step "Writing openclaw BYO auth-profiles.json for '$canonical' (native id: $native)"
-  local tmp
-  tmp=$(mktemp -p "$oc_dir" .auth-profiles.XXXXXX) \
-    || fail "$E_GENERIC" "mktemp failed in $oc_dir"
-  jq -cn --arg pid "$profile_id" --arg p "$native" --arg k "$api_key" \
-    '{version:1, profiles:{($pid):{type:"api_key", provider:$p, key:$k}}}' \
-    > "$tmp" \
-    || { rm -f "$tmp"; fail "$E_GENERIC" "failed to write $auth_file"; }
-  chown claude:claude "$tmp"
-  chmod 0600 "$tmp"
-  mv "$tmp" "$auth_file"
+  step "Writing openclaw BYO credential for '$canonical' via openclaw models auth (native id: $native, profile: $profile_id)"
+  printf '%s\n' "$api_key" \
+    | sudo -u claude -H env \
+        HOME="$base" \
+        PATH="/home/claude/.local/bin:/usr/bin:/bin" \
+        "$openclaw_node" "$openclaw_bin" \
+        models auth --agent main paste-api-key \
+        --provider "$native" --profile-id "$profile_id" >&2 \
+    || fail "$E_GENERIC" "openclaw models auth paste-api-key failed for provider '$native' (HOME=$base). No credential was written; re-run once the openclaw runtime is healthy."
+
+  # Grade our own write rather than trusting the exit code: openclaw is the only
+  # thing that can say whether the store took, and asking it costs one process.
+  # This is the check whose absence let the old path report success for months.
+  local _oc_seen
+  _oc_seen=$(sudo -u claude -H env \
+      HOME="$base" \
+      PATH="/home/claude/.local/bin:/usr/bin:/bin" \
+      "$openclaw_node" "$openclaw_bin" \
+      models auth --agent main list 2>/dev/null) || _oc_seen=""
+  grep -qF "$profile_id" <<<"$_oc_seen" \
+    || fail "$E_GENERIC" "openclaw accepted the key write but does not list profile '$profile_id' back (HOME=$base). Do not treat this seat as authenticated — it is the DIVE-3489 shape: a credential in a store the runtime does not read."
+
+  local auth_store="${oc_dir}/openclaw-agent.sqlite"
 
   # Any openclaw.json write (provider base_url pin and/or default model) goes
   # through the same stable-node invocation — resolved in the precondition block
@@ -1298,7 +1350,7 @@ _apply_byo_openclaw() {
         PATH="/home/claude/.local/bin:/usr/bin:/bin" \
         "$openclaw_node" "$openclaw_bin" \
         config set agents.defaults.model.primary "$model" >&2 \
-        || fail "$E_GENERIC" "openclaw model pin failed (agents.defaults.model.primary=$model). The key IS written to ${auth_file}, so this profile now holds a credential with no model — openclaw would fall back to its built-in default, whose provider is not '$native', and 401. Repair with: sudo -u claude -H env HOME=$base PATH=/home/claude/.local/bin:/usr/bin:/bin $openclaw_node $openclaw_bin config set agents.defaults.model.primary $model"
+        || fail "$E_GENERIC" "openclaw model pin failed (agents.defaults.model.primary=$model). The key IS written to ${auth_store}, so this profile now holds a credential with no model — openclaw would fall back to its built-in default, whose provider is not '$native', and 401. Repair with: sudo -u claude -H env HOME=$base PATH=/home/claude/.local/bin:/usr/bin:/bin $openclaw_node $openclaw_bin config set agents.defaults.model.primary $model"
     fi
   fi
 
@@ -1343,14 +1395,30 @@ _apply_byo_openclaw() {
 # read anything of claude's, so it is correct at every isolation level.
 #
 # Copies (never moves) two things:
-#   1. auth-profiles.json  -> $HOME/.openclaw/agents/main/agent/, 0600, seat-owned
-#   2. agents.defaults.model AND models.providers, deep-merged into the seat's own
-#      openclaw.json. models.providers is in the set on purpose: the boot seed
-#      syncs only agents.defaults, so a provider baseUrl override (zai — see
-#      OPENCLAW_PROVIDER_URL) written by _apply_byo_openclaw reached the shared
-#      config and never the seat. Same class of bug, one line away.
+#   1. the AUTH STORE openclaw-agent.sqlite (with its -wal/-shm siblings) ->
+#      $HOME/.openclaw/agents/main/agent/, 0600, seat-owned.
+#      DIVE-3489: this was auth-profiles.json. openclaw moved per-agent auth into
+#      a sqlite store and does not read the JSON at all, so copying it pushed an
+#      inert file into the seat and the seat still booted UNAUTHENTICATED — the
+#      same defect as the write side, one hop later. Legacy auth-profiles.json is
+#      still carried when present so a profile written by an older CLI is not
+#      silently dropped; it is additive, and it is not what authenticates.
+#   2. agents.defaults.model, models.providers AND auth.profiles, deep-merged
+#      into the seat's own openclaw.json. models.providers is in the set on
+#      purpose: the boot seed syncs only agents.defaults, so a provider baseUrl
+#      override (zai — see OPENCLAW_PROVIDER_URL) written by _apply_byo_openclaw
+#      reached the shared config and never the seat. auth.profiles joins it for
+#      DIVE-3489: `models auth paste-api-key` writes the key to the sqlite and
+#      the REGISTRATION (`{provider, mode}`, no key) to openclaw.json. Both
+#      halves have to land or the store holds a credential nothing selects.
 # Merge, not overwrite: the seat's openclaw.json already holds its channels,
 # gateway mode and gateway token by the time we run.
+#
+# WAL safety on the sqlite copy: every writer we have is openclaw's own one-shot
+# CLI, which has exited by the time either caller reaches here, so there is no
+# live writer to tear a page. The -wal/-shm siblings are copied with it rather
+# than assumed checkpointed — the measured post-write state had a 0-byte -wal and
+# a 32K -shm, so the set is what is known good, not the .sqlite alone.
 #
 # Best-effort by contract (warn, never fail): the credential is on disk either
 # way, and the boot seed remains as the second chance. Returns 0 always.
@@ -1364,12 +1432,13 @@ seed_openclaw_state_into_seat() { # <name> [profile]
   if [[ -n "$profile" ]]; then
     base="$(profile_type_dir "$profile" openclaw)" || return 0
   fi
+  local src_store="${base}/.openclaw/agents/main/agent/openclaw-agent.sqlite"
   local src_auth="${base}/.openclaw/agents/main/agent/auth-profiles.json"
   local src_cfg="${base}/.openclaw/openclaw.json"
   local dst_dir="${home}/.openclaw/agents/main/agent"
   local dst_cfg="${home}/.openclaw/openclaw.json"
 
-  [[ -s "$src_auth" || -s "$src_cfg" ]] || return 0
+  [[ -s "$src_store" || -s "$src_auth" || -s "$src_cfg" ]] || return 0
   step "Seeding openclaw credential + model default into ${home}/.openclaw"
 
   # -o/-g only work as root; fall back to a plain mkdir so the function stays
@@ -1380,6 +1449,32 @@ seed_openclaw_state_into_seat() { # <name> [profile]
     || mkdir -p "$dst_dir" 2>/dev/null \
     || { warn "openclaw seed: could not create ${dst_dir} — the agent may boot UNAUTHENTICATED"; return 0; }
 
+  # DIVE-3489: the auth STORE first — this is the one that authenticates.
+  # openclaw-agent.sqlite plus whichever of its -wal/-shm siblings exist; each
+  # lands atomically via a temp in the destination dir so a failed copy cannot
+  # leave a half-written store where a whole one used to be.
+  if [[ -s "$src_store" ]]; then
+    local _sf _base _tmp _copied=1
+    for _sf in "$src_store" "${src_store}-wal" "${src_store}-shm"; do
+      [[ -e "$_sf" ]] || continue
+      _base=$(basename "$_sf")
+      if _tmp=$(mktemp -p "$dst_dir" ".${_base}.XXXXXX" 2>/dev/null) \
+         && cat "$_sf" > "$_tmp" 2>/dev/null; then
+        chown "$user":"$user" "$_tmp" 2>/dev/null || true
+        chmod 0600 "$_tmp"
+        mv "$_tmp" "${dst_dir}/${_base}"
+      else
+        rm -f "${_tmp:-}" 2>/dev/null || true
+        _copied=0
+      fi
+    done
+    (( _copied )) \
+      || warn "openclaw seed: could not copy the auth store $src_store into $dst_dir — the agent will boot UNAUTHENTICATED and every message will fail with ProviderAuthError"
+  fi
+
+  # Legacy JSON, additive: still carried when a pre-DIVE-3489 profile has one, so
+  # a downgrade or an older third-party reader is not left with nothing. It is
+  # NOT what authenticates — do not treat its presence as a credential witness.
   if [[ -s "$src_auth" ]]; then
     local tmp
     if tmp=$(mktemp -p "$dst_dir" .auth-profiles.XXXXXX 2>/dev/null) && cat "$src_auth" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
@@ -1388,17 +1483,24 @@ seed_openclaw_state_into_seat() { # <name> [profile]
       mv "$tmp" "${dst_dir}/auth-profiles.json"
     else
       rm -f "${tmp:-}" 2>/dev/null || true
-      warn "openclaw seed: could not copy $src_auth into $dst_dir — the agent will boot UNAUTHENTICATED"
+      warn "openclaw seed: could not copy legacy $src_auth into $dst_dir (the auth store above is what authenticates)"
     fi
   fi
 
   if [[ -s "$src_cfg" ]]; then
     local patch
+    # DIVE-3489: auth.profiles joins the set. `models auth paste-api-key` splits
+    # its write — the KEY into openclaw-agent.sqlite, the REGISTRATION
+    # (`auth.profiles.<id> = {provider, mode}`, no key) into openclaw.json. The
+    # store copied above is inert without the registration, so seeding one and
+    # not the other reproduces this row's defect with the halves swapped.
     patch=$(jq -c '
       (.agents.defaults.model? // null) as $m
       | (.models.providers? // null) as $p
+      | (.auth.profiles? // null) as $a
       | (if $m == null then {} else {agents: {defaults: {model: $m}}} end)
-        * (if $p == null then {} else {models: {providers: $p}} end)' \
+        * (if $p == null then {} else {models: {providers: $p}} end)
+        * (if $a == null then {} else {auth: {profiles: $a}} end)' \
       "$src_cfg" 2>/dev/null) || patch=""
     if [[ -n "$patch" && "$patch" != "{}" && "$patch" != "null" ]]; then
       [[ -s "$dst_cfg" ]] || printf '{}\n' > "$dst_cfg"
@@ -1576,16 +1678,22 @@ selfcheck_cred_reached_agent() { # <name> <type> <profile> <byo_provider>
   # a seat with no sudo. Witness 2 cannot see it either: on the BYO path with no
   # --auth-profile it resolves src="" and returns without a word, which is why a
   # measured-broken seat printed a clean create. Two things must be true on the
-  # seat and both are cheap to read: a non-empty auth-profiles.json, and a
+  # seat and both are cheap to read: a non-empty auth STORE, and a
   # non-null agents.defaults.model.primary (a null primary sends openclaw to its
   # built-in default, whose provider prefix picks a credential we never wrote —
   # DIVE-3113/3130, and it 401s while looking configured).
+  #
+  # DIVE-3489: the credential witness is openclaw-agent.sqlite, NOT
+  # auth-profiles.json. Reading the JSON here is what made a dead credential
+  # print as a healthy seat: the witness confirmed our own write into a file the
+  # runtime does not read, which is the same fail-open shape the row was filed
+  # for. A witness must read the store the RUNTIME reads.
   if [[ "$type" == "openclaw" ]]; then
     local _oc_home="${AGENT_HOME_ROOT:-/home}/${user}"
-    local _oc_auth="${_oc_home}/.openclaw/agents/main/agent/auth-profiles.json"
+    local _oc_auth="${_oc_home}/.openclaw/agents/main/agent/openclaw-agent.sqlite"
     local _oc_cfg="${_oc_home}/.openclaw/openclaw.json"
     if [[ ! -s "$_oc_auth" ]]; then
-      printf 'issue:openclaw credential never reached the seat (%s is missing/empty) — the agent boots UNAUTHENTICATED and every message 401s while the profile itself looks fine. Re-seed as root: sudo 5dive agent restart %s\n' \
+      printf 'issue:openclaw credential never reached the seat (%s is missing/empty) — the agent boots UNAUTHENTICATED and every message fails with ProviderAuthError while the profile itself looks fine. Re-seed as root: sudo 5dive agent restart %s\n' \
         "$_oc_auth" "$name"
     else
       local _oc_primary
