@@ -892,10 +892,19 @@ cmd_task_answer() {
   # DIVE-2356 UPDATED THE FIRST HALF OF THAT REASONING, AND READ THIS BEFORE
   # TIGHTENING THIS BLOCK. A tier-2 decision now DOES mint a per-gate nonce at
   # filing — so "it has no nonce" is no longer why evidence is not required here.
-  # The reason is now narrower and entirely about the TAP: the decision option
-  # buttons still do not carry the nonce (telegram-pi's TNA_RE is greedy and would
-  # swallow it), so a real human tap arrives with no proof to offer and an evidence
-  # requirement would reject it — the DIVE-525 trap.
+  # The reason was then narrowed to the TAP — the decision option buttons carried
+  # no nonce, because telegram-pi's TNA_RE was greedy and would swallow it — so a
+  # real human tap arrived with no proof to offer and an evidence requirement would
+  # have rejected it, the DIVE-525 trap.
+  #
+  # DIVE-2269: THAT TAP-SIDE REASON IS SPENT, ON BOTH CLAUSES. DIVE-2233 put the
+  # nonce suffix on decision buttons exactly like approval/secret/manual, and
+  # DIVE-2374 brought telegram-pi and telegram-opencode to the tolerant regex, so
+  # no shipped fork swallows it any more (pinned empty by S12e in
+  # tests/gate_t2_nonce_proof_unit.sh, and by test/tna-harness.test.ts in
+  # 5dive-plugins). A real human decision tap now DOES arrive with proof.
+  # This is a comment correction only — the block below is unchanged, because what
+  # still blocks tightening is the BACKLOG, not the tap: see the next paragraph.
   #
   # The sanctioned next step is NOT an evidence requirement. It is the far weaker
   # "refuse a tier>=2 answer whose human_nonce_hash IS NULL", and it must not land
