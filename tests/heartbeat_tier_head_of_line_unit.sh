@@ -84,7 +84,7 @@ tasks_db_init
 cat > "$REGISTRY" <<'JSON'
 {"agents":{
   "dev":   {"isolation":"admin",     "heartbeat":{"enabled":true,"everyMin":30,"lastRunAt":0}},
-  "main2": {"isolation":"standard",  "heartbeat":{"enabled":false}},
+  "main2": {"isolation":"sandboxed",  "heartbeat":{"enabled":false}},
   "ghost": {"heartbeat":{"enabled":false}}
 }}
 JSON
@@ -173,8 +173,8 @@ HB_NEW="$SRC/cmd_heartbeat.sh"
 # 1 + 2. A held head is stepped over; the held rows stay held.
 # ---------------------------------------------------------------------------
 reset_board
-T_HELD_U=$(mk "held urgent, standard creator" urgent main2)     # guard: HOLD
-T_HELD_H=$(mk "held high, standard creator"   high   main2)     # guard: HOLD
+T_HELD_U=$(mk "held urgent, sandboxed creator" urgent main2)     # guard: HOLD
+T_HELD_H=$(mk "held high, sandboxed creator"   high   main2)     # guard: HOLD
 T_RUN=$(mk    "runnable high, human creator"  high   lodar)     # guard: clears
 T_LOW=$(mk    "runnable medium, self"         medium dev)
 
@@ -185,12 +185,12 @@ eq_t "held urgent row stays todo (not auto-run)"  "todo" "$(status_of "$T_HELD_U
 eq_t "held high row stays todo (not auto-run)"    "todo" "$(status_of "$T_HELD_H")"
 eq_t "the woken row was CLAIMED by the dispatcher" "in_progress" "$(status_of "$T_RUN")"
 
-if grep -q "created by lower-tier main2(standard)" "$LOG1"; then
+if grep -q "main2(sandboxed) < assignee(admin)" "$LOG1"; then
   ok_t "each hold still NAMES itself in the log (a hold, not a silent drop)"
 else
   bad_t "the hold was not logged" "$(cat "$LOG1")"
 fi
-n_holds=$(grep -c "created by lower-tier" "$LOG1")
+n_holds=$(grep -c "main2(sandboxed) < assignee(admin)" "$LOG1")
 eq_t "both held rows were considered and held (not just the head)" "2" "$n_holds"
 if grep -q "tier guard held 2 higher-priority todo(s); waking on" "$LOG1"; then
   ok_t "the tick summarises WHAT it stepped over and what it woke instead"
@@ -321,7 +321,7 @@ PRE_FIX_REF="c59c1e7812191bcbc23a704bb07d541b2c0a30bd"
 OLD_HB="$TMP/old_cmd_heartbeat.sh"
 if pinned_blob "$PRE_FIX_REF" src/cmd_heartbeat.sh "$OLD_HB"; then
   reset_board
-  O_HELD=$(mk "held urgent, standard creator" urgent main2)
+  O_HELD=$(mk "held urgent, sandboxed creator" urgent main2)
   O_RUN=$(mk  "runnable high, human creator"  high   lodar)
   LOG5="$TMP/tick5.log"; : > "$LOG5"
   old_got=$(run_tick "$OLD_HB" "$LOG5")
@@ -330,7 +330,7 @@ if pinned_blob "$PRE_FIX_REF" src/cmd_heartbeat.sh "$OLD_HB"; then
   # VACUITY GRADE. "No wake" is also what a dead harness produces. The pre-fix
   # run must have reached the guard and held THIS row, or the red above is not
   # attributable to the defect.
-  if grep -q "created by lower-tier main2(standard)" "$LOG5"; then
+  if grep -q "main2(sandboxed) < assignee(admin)" "$LOG5"; then
     ok_t "ANCHOR is non-vacuous: the pre-fix tick reached the guard and held the head"
   else
     bad_t "ANCHOR is VACUOUS: pre-fix tick never logged a hold" \
@@ -339,7 +339,7 @@ if pinned_blob "$PRE_FIX_REF" src/cmd_heartbeat.sh "$OLD_HB"; then
   # DIFFERENTIAL: same board, same harness, new code — the row the pre-fix tick
   # could not reach IS reached.
   reset_board
-  N_HELD=$(mk "held urgent, standard creator" urgent main2)
+  N_HELD=$(mk "held urgent, sandboxed creator" urgent main2)
   N_RUN=$(mk  "runnable high, human creator"  high   lodar)
   LOG6="$TMP/tick6.log"; : > "$LOG6"
   new_got=$(run_tick "$HB_NEW" "$LOG6")
@@ -359,21 +359,21 @@ if pinned_blob "$PRE_FIX_REF" src/cmd_heartbeat.sh "$OLD_HB"; then
   # in for the measured 83-behind-one-head; the assertion is that ZERO of them
   # are reached pre-fix, which is the stall itself rather than a proxy for it.
   reset_board
-  mk "held head, standard creator" urgent main2 >/dev/null
+  mk "held head, sandboxed creator" urgent main2 >/dev/null
   for i in 1 2 3 4 5; do mk "runnable behind $i" high lodar >/dev/null; done
   LOG9="$TMP/tick9.log"; : > "$LOG9"
   old_n=$(run_tick "$OLD_HB" "$LOG9")
   eq_t "ANCHOR/N: pre-fix reaches ZERO of the 5 runnable rows behind the held head" \
        "0" "$(n_claimed)"
   eq_t "ANCHOR/N: pre-fix wake target is NONE with 5 rows runnable" "NONE" "$old_n"
-  if grep -q "created by lower-tier main2(standard)" "$LOG9"; then
+  if grep -q "main2(sandboxed) < assignee(admin)" "$LOG9"; then
     ok_t "ANCHOR/N is non-vacuous: the pre-fix tick reached the guard and held the head"
   else
     bad_t "ANCHOR/N is VACUOUS: pre-fix tick never logged a hold" "$(cat "$LOG9")"
   fi
   # Same board, same harness, post-fix: the queue behind the head is reachable.
   reset_board
-  mk "held head, standard creator" urgent main2 >/dev/null
+  mk "held head, sandboxed creator" urgent main2 >/dev/null
   for i in 1 2 3 4 5; do mk "runnable behind $i" high lodar >/dev/null; done
   LOG10="$TMP/tick10.log"; : > "$LOG10"
   new_n=$(run_tick "$HB_NEW" "$LOG10")

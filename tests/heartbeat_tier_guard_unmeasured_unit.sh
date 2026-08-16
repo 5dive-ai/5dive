@@ -99,6 +99,7 @@ FIXTURE='{"agents":{
   "dev":{"isolation":"admin"},
   "boss":{"isolation":"admin"},
   "sandy":{"isolation":"sandboxed"},
+  "vera":{"isolation":"standard"},
   "ghost":{},
   "weird":{"isolation":"admin tier=root"}}}'
 
@@ -204,7 +205,7 @@ outcome() {
   case "$out" in
     *WAKE*)               printf 'WAKE\n' ;;
     *"NOT MEASURED"*)     printf 'HOLD:unmeasured\n' ;;
-    *"created by lower-tier"*) printf 'HOLD:escalation\n' ;;
+    *"< assignee("*)      printf 'HOLD:escalation\n' ;;
     *)                    printf 'HOLD:other\n' ;;
   esac
 }
@@ -223,6 +224,11 @@ CAUSES=(
   "registry-no-agents-map|boss|nomap|HOLD:unmeasured"
   "lower-tier-creator|sandy|ok|HOLD:escalation"
   "equal-tier-creator|boss|ok|WAKE"
+  # DIVE-3506. The narrowing, as its own cause: a STANDARD creator onto an ADMIN
+  # assignee is a rank gap and is NOT confinement, so it must now WAKE. This is
+  # the one arm that grades the change — without it the whole file passes
+  # identically before and after, because `sandy` is sandboxed either way.
+  "standard-creator-wakes-now|vera|ok|WAKE"
 )
 
 _set_world() {  # $1 = condition
@@ -303,6 +309,13 @@ if pinned_blob "$PRE_FIX_REF" src/cmd_heartbeat.sh "$OLD_SRC"; then
     # is being graded against a baseline that was broken for another reason.
     eq_t "ANCHOR: pre-fix held the real escalation" "HOLD:escalation" "${OLD_OUT[7]}"
     eq_t "ANCHOR: pre-fix woke on a human creator"  "WAKE"            "${OLD_OUT[0]}"
+    # DIVE-3506 mutation control. The standard->admin arm is only meaningful if
+    # the OLD block genuinely HELD it; if the pre-fix build woke on it too, the
+    # WAKE expectation above is satisfied by a guard that never changed and the
+    # narrowing is ungraded. This is the assertion that would go red if someone
+    # restored `_cr < _ar`.
+    eq_t "ANCHOR: pre-fix HELD a standard-tier creator (the misfire this narrows)" \
+         "HOLD:escalation" "${OLD_OUT[9]}"
     if (( n_new > n_old )); then
       ok_t "fix strictly increases distinguishable decisions ($n_old -> $n_new)"
     else
