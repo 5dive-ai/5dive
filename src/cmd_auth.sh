@@ -1342,6 +1342,18 @@ cmd_auth_set() {
     local _agent
     while IFS= read -r _agent; do
       [[ -n "$_agent" ]] || continue
+      # DIVE-3442: a rotated openclaw key reaches the seat only if something
+      # copies it in. The boot seed cannot — /home/claude/.openclaw is 0700 and a
+      # standard-isolation seat has no sudo — so the restart below would bounce
+      # the gateway onto the SAME stale credential and report success. We are
+      # root here (require_root above); push it in before the bounce.
+      # The affected list is selected by auth-profile, not by type, so a
+      # no-profile rotation sweeps in every unprofiled seat on the box — check
+      # the seat's OWN registered type before writing openclaw paths into it.
+      if [[ "$type" == "openclaw" ]] && declare -F seed_openclaw_state_into_seat >/dev/null 2>&1 \
+         && [[ "$(registry_read | jq -r --arg n "$_agent" '.agents[$n].type // ""')" == "openclaw" ]]; then
+        seed_openclaw_state_into_seat "$_agent" "$profile"
+      fi
       step "Restarting 5dive-agent@${_agent}.service"
       systemctl restart "5dive-agent@${_agent}.service" >&2 2>&1 \
         || warn "restart of agent '$_agent' failed — check journalctl -u 5dive-agent@${_agent}"
