@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased — fix(council): `authority.gate_clear_leads` can actually be set (DIVE-3493)
+
+The constitution validator and the authority reader accepted **disjoint** subsets of YAML, so the
+key was unsettable through any path: `council amend` threw `use inline arrays in constitution v0`
+on a block sequence, while the node-free reader that ENFORCES the key accepts only a block sequence
+and treats an inline `[a, b]` as absent. The shipped template documents the block form as its
+worked example — so the template failed the validator shipping beside it.
+
+- **The validator now accepts a block sequence of plain scalars**, at the key's own indent or one
+  level in (both are legal YAML and the reader accepts both). It stays a strict subset: a mapping
+  inside a sequence, a nested sequence, an empty entry, a sequence with no owning key, and mixing
+  keys and entries under one name are all still refused rather than half-interpreted.
+- **A non-empty INLINE list is now refused for `authority.gate_clear_leads`.** That shape validates
+  and seals today and is then ignored by the enforcer — a document naming holders while every one
+  of them is denied, under an audit reason (`no-gate-clear-leads-key`) indistinguishable from
+  "never sealed". An empty `[]` stays valid: it grants nobody under either half and is the
+  documented safe default.
+- **`constitution set --json` no longer rewrites a sealed list into the unreadable shape.** That
+  verb re-serializes the whole document, and its array emitter was inline-only — so editing an
+  unrelated guardrail would have silently revoked the allowlist.
+- The reader was NOT widened. Teaching it a shape it deliberately refuses would trade a syntax bug
+  for a security one; the fix is on the writer side, which is where the asymmetry was.
+- Because no motion could have succeeded, `sealed=1` being zero across the audit history means
+  *"no motion could have succeeded"*, not *"nobody convened one"* — an instrument that measured its
+  own writer.
+
 ## Unreleased — feat(task): an inert push-for-review clears at filing, pinging nobody (DIVE-3481)
 
 lodar, 2026-08-16, on a routine branch-push approval waking the org lead: *"why dev2 cannot do
