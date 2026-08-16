@@ -8,7 +8,10 @@
 # measurement-only pipeline: add + validation rejects, tick appends a reading
 # (and records a FAILED metric as value=NULL rc!=0, not a silent skip), the
 # read-only contract (non-numeric stdout => failure), dup/name rejects,
-# pause/resume/rm, and rm cascading its readings.
+# pause/resume, and the DIVE-2512 tombstone: `rm` RETIRES (keeps the objective row
+# plus its audited objective_cycles + objective_readings), `ls` hides retired rows
+# but says how many it hid, an empty list can no longer be confused with a wipe,
+# and only `rm --purge --yes` still destroys — naming BOTH child tables when it does.
 # Run: bash tests/objective_unit.sh  (no root, no network).
 set -uo pipefail
 
@@ -117,13 +120,102 @@ run cmd_objective_setstatus active "boom" >/dev/null
 st=$(db "SELECT status FROM objectives WHERE name='boom';")
 [[ "$st" == "active" ]] && ok_t "resume restores active status" || bad_t "resume" "status=$st"
 
-# ---- (12) rm cascades its readings ----
+# ---- (12) DIVE-2512: rm TOMBSTONES — it must not take cycles/readings with it ----
+# Plant an audited cycle row first. Without one, a test that only counts readings
+# would have passed against the OLD hard-DELETE too (readings were named in the old
+# success message; the SILENT loss was objective_cycles). The cycle row is the
+# discriminator, so it is planted deliberately rather than assumed.
 oid=$(db "SELECT id FROM objectives WHERE name='ratio';")
-run cmd_objective_rm "ratio" >/dev/null
+db "INSERT INTO objective_cycles (objective_id, cycle_no, reading_value, outcome)
+    VALUES ($oid, 1, 96.5, 'applied');"
+pre_cycles=$(db   "SELECT COUNT(*) FROM objective_cycles   WHERE objective_id=$oid;")
+pre_reads=$(db    "SELECT COUNT(*) FROM objective_readings WHERE objective_id=$oid;")
+[[ "$pre_cycles" -ge 1 && "$pre_reads" -ge 1 ]] \
+  && ok_t "precondition: 'ratio' has $pre_cycles cycle(s) + $pre_reads reading(s) to lose" \
+  || bad_t "tombstone precondition" "cycles=$pre_cycles readings=$pre_reads (test proves nothing)"
+
+out=$(run cmd_objective_rm "ratio" --reason="metric has no autonomous lever left" --ref=DIVE-1928); rc=$?
+st=$(db       "SELECT status FROM objectives WHERE id=$oid;")
+kept_cyc=$(db "SELECT COUNT(*) FROM objective_cycles   WHERE objective_id=$oid;")
+kept_rd=$(db  "SELECT COUNT(*) FROM objective_readings WHERE objective_id=$oid;")
+[[ $rc -eq 0 && "$st" == "retired" && "$kept_cyc" == "$pre_cycles" && "$kept_rd" == "$pre_reads" ]] \
+  && ok_t "rm retires (status=retired) and KEEPS all cycles + readings" \
+  || bad_t "rm tombstone" "rc=$rc status=$st cycles=$kept_cyc/$pre_cycles readings=$kept_rd/$pre_reads"
+
+# the row itself must answer who/when/why/whose-authority
+IFS="|" read -r r_at r_by r_why r_ref < <(db "SELECT COALESCE(retired_at,''), COALESCE(retired_by,''), COALESCE(retired_reason,''), COALESCE(retired_ref,'') FROM objectives WHERE id=$oid;")
+[[ -n "$r_at" && -n "$r_by" && "$r_why" == "metric has no autonomous lever left" && "$r_ref" == "DIVE-1928" ]] \
+  && ok_t "tombstone records retired_at/by/reason/ref on the row" \
+  || bad_t "tombstone provenance" "at=$r_at by=$r_by why=$r_why ref=$r_ref"
+
+# the success message must NAME what survives (the old one said only "readings deleted")
+printf '%s' "$out" | jq -e '.data.retired==true and .data.cycles_kept>=1 and .data.readings_kept>=1 and .data.retired_ref=="DIVE-1928"' >/dev/null \
+  && ok_t "rm result names the kept cycles + readings and the authorizing ref" \
+  || bad_t "rm result payload" "out=$out"
+
+# ---- (12b) a retired objective does not tick ----
+before=$(db "SELECT COUNT(*) FROM objective_readings WHERE objective_id=$oid;")
+run cmd_objective_tick >/dev/null
+after=$(db "SELECT COUNT(*) FROM objective_readings WHERE objective_id=$oid;")
+[[ "$before" == "$after" ]] && ok_t "tick (all) skips a retired objective" \
+  || bad_t "retired still ticks" "before=$before after=$after"
+
+# ---- (12c) ls hides retired by default, --all shows it, and the count is surfaced ----
+out=$(run cmd_objective_ls); rc=$?
+hid=$(printf '%s' "$out" | jq -r '[.data.objectives[].name] | index("ratio") // "absent"')
+n_hidden=$(printf '%s' "$out" | jq -r '.data.retired_hidden')
+[[ $rc -eq 0 && "$hid" == "absent" && "$n_hidden" -ge 1 ]] \
+  && ok_t "ls hides retired by default and reports retired_hidden=$n_hidden" \
+  || bad_t "ls default" "idx=$hid hidden=$n_hidden out=$out"
+out=$(run cmd_objective_ls --all)
+printf '%s' "$out" | jq -e '[.data.objectives[].name] | index("ratio") != null' >/dev/null \
+  && ok_t "ls --all shows the retired objective" || bad_t "ls --all" "out=$out"
+
+# ---- (12d) the empty render distinguishes retired from never-existed (DIVE-2507) ----
+# THE bug this task exists for: a bare ls that shows nothing had two causes — an
+# authorized retirement and a catastrophic wipe — and they rendered identically.
+JSON_MODE=0
+db "UPDATE objectives SET status='retired';"
+txt=$(run cmd_objective_ls)
+grep -qi "retired" <<<"$txt" && ok_t "empty ls says 'retired', not 'no objectives yet'" \
+  || bad_t "empty-render honesty" "text=$txt"
+db "UPDATE objectives SET status='active' WHERE name<>'ratio';"
+JSON_MODE=1
+
+# ---- (12e) re-adding a retired name says WHICH conflict it is ----
+out=$(run cmd_objective_add "ratio" --metric-cmd="echo 1" --target=1); rc=$?
+[[ $rc -eq "$E_CONFLICT" ]] && ok_t "add over a tombstone => conflict (named as retired)" \
+  || bad_t "add over tombstone" "rc=$rc out=$out"
+
+# ---- (12f) rm again on a retired objective refuses instead of destroying ----
+out=$(run cmd_objective_rm "ratio"); rc=$?
+still=$(db "SELECT COUNT(*) FROM objective_cycles WHERE objective_id=$oid;")
+[[ $rc -eq "$E_CONFLICT" && "$still" == "$pre_cycles" ]] \
+  && ok_t "rm on an already-retired objective refuses (history intact)" \
+  || bad_t "double rm" "rc=$rc cycles=$still"
+
+# ---- (12g) resume un-retires and clears the tombstone ----
+run cmd_objective_setstatus active "ratio" >/dev/null
+IFS="|" read -r st2 rat2 < <(db "SELECT status, COALESCE(retired_at,'') FROM objectives WHERE id=$oid;")
+[[ "$st2" == "active" && -z "$rat2" ]] && ok_t "resume un-retires and clears retired_at" \
+  || bad_t "un-retire" "status=$st2 retired_at=$rat2"
+run cmd_objective_rm "ratio" --reason="re-retire for the purge test" >/dev/null
+
+# ---- (12h) --purge without --yes refuses; with --yes it deletes and SAYS the counts ----
+out=$(run cmd_objective_rm "ratio" --purge); rc=$?
+surv=$(db "SELECT COUNT(*) FROM objectives WHERE id=$oid;")
+[[ $rc -eq "$E_CONFLICT" && "$surv" == "1" ]] && ok_t "--purge without --yes refuses (nothing destroyed)" \
+  || bad_t "purge needs --yes" "rc=$rc surv=$surv"
+out=$(run cmd_objective_rm "ratio" --purge --yes); rc=$?
 gone=$(db "SELECT COUNT(*) FROM objectives WHERE name='ratio';")
 orphans=$(db "SELECT COUNT(*) FROM objective_readings WHERE objective_id=$oid;")
-[[ "$gone" == "0" && "$orphans" == "0" ]] && ok_t "rm deletes objective and cascades its readings" \
-  || bad_t "rm cascade" "gone=$gone orphans=$orphans"
+orph_cyc=$(db "SELECT COUNT(*) FROM objective_cycles WHERE objective_id=$oid;")
+[[ $rc -eq 0 && "$gone" == "0" && "$orphans" == "0" && "$orph_cyc" == "0" ]] \
+  && ok_t "--purge --yes deletes the objective and cascades cycles + readings" \
+  || bad_t "purge cascade" "rc=$rc gone=$gone readings=$orphans cycles=$orph_cyc"
+printf '%s' "$out" | jq -e '.data.purged==true and .data.cycles_deleted>=1 and .data.readings_deleted>=1' >/dev/null \
+  && ok_t "purge result names BOTH destroyed tables (the old message named only readings)" \
+  || bad_t "purge payload" "out=$out"
 
 # ---- (13) show/ls on a missing objective fails cleanly ----
 out=$(run cmd_objective_show "ghost"); rc=$?

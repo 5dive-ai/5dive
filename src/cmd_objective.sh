@@ -109,8 +109,18 @@ cmd_objective_add() {
     [[ "$(db "SELECT 1 FROM projects WHERE key=$(sqlq "$project");")" == "1" ]] \
       || fail "$E_NOT_FOUND" "no such project: $project"
   fi
-  [[ "$(db "SELECT 1 FROM objectives WHERE name=$(sqlq "$name");")" == "1" ]] \
-    && fail "$E_CONFLICT" "objective '$name' already exists"
+  # DIVE-2512: name is UNIQUE and a retired objective KEEPS its row, so a re-add
+  # under the same name now collides with a tombstone. Say which it is — "already
+  # exists" on an objective the operator believes they removed is the confusing
+  # answer, and both exits out of it are non-obvious.
+  local _existing_status
+  _existing_status=$(db "SELECT status FROM objectives WHERE name=$(sqlq "$name");")
+  if [[ "$_existing_status" == "retired" ]]; then
+    fail "$E_CONFLICT" "objective '$name' exists but is RETIRED (its cycles and readings are kept — 5dive objective show \"$name\").
+  bring it back:                 5dive objective resume \"$name\"
+  or free the name, destroying that history: 5dive objective rm \"$name\" --purge --yes"
+  fi
+  [[ -n "$_existing_status" ]] && fail "$E_CONFLICT" "objective '$name' already exists"
 
   local by; by="$(auto_sender_from_sudo 2>/dev/null || true)"; [[ -n "$by" ]] || by="${USER:-unknown}"
   db "INSERT INTO objectives
@@ -126,8 +136,26 @@ cmd_objective_add() {
      --arg n "$name" --arg d "$direction" --arg t "${target:-}" --arg u "${unit:-}" --arg p "$public"
 }
 
+# DIVE-2512: retired objectives are HIDDEN by default and shown under --all.
+# That is the half of the tombstone that fixes the reader, not the writer: with
+# retirements kept as rows, a bare `ls` that shows nothing has two possible
+# causes, and this is what collapses it back to one. Hidden-but-counted — the
+# text render says "N retired" and the JSON carries `retired_hidden` — so an
+# empty list means only-and-exactly "nothing was ever here", which is the
+# precondition for ever alarming on an empty objectives table (DIVE-2507).
 cmd_objective_ls() {
   tasks_db_init
+  local all=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all|-a) all=1 ;;
+      -*)       fail "$E_USAGE" "unknown flag: $1 (usage: 5dive objective ls [--all])" ;;
+      *)        fail "$E_USAGE" "unexpected arg: $1 (usage: 5dive objective ls [--all])" ;;
+    esac
+    shift
+  done
+  local where="WHERE o.status <> 'retired'"; [[ -n "$all" ]] && where=""
+  local n_retired; n_retired=$(db "SELECT COUNT(*) FROM objectives WHERE status='retired';")
   if (( JSON_MODE )); then
     # Attach the latest reading (value + ts) per objective, plus the company-view
     # fields (DIVE-1452): planner, replan cadence (review cron), per-cycle cap, and
@@ -142,14 +170,21 @@ cmd_objective_ls() {
              (SELECT value FROM objective_readings r WHERE r.objective_id=o.id ORDER BY r.id DESC LIMIT 1) AS current,
              (SELECT ts    FROM objective_readings r WHERE r.objective_id=o.id ORDER BY r.id DESC LIMIT 1) AS current_ts,
              (SELECT COUNT(*) FROM tasks t WHERE t.originated_by_objective=o.id AND t.status='done') AS verified_total
-      FROM objectives o ORDER BY o.created_at;")
+      FROM objectives o $where ORDER BY o.created_at;")
     [[ -n "$rows" ]] || rows="[]"
-    printf '%s' "$rows" | jq -c '{ok:true, data:{objectives:(map(.public=(.public==1)))}}'
+    printf '%s' "$rows" | jq -c --argjson hidden "${n_retired:-0}" --argjson all "$( [[ -n "$all" ]] && echo true || echo false )" \
+      '{ok:true, data:{objectives:(map(.public=(.public==1))),
+        retired_hidden:(if $all then 0 else $hidden end), showing_retired:$all}}'
     return
   fi
-  local n; n=$(db "SELECT COUNT(*) FROM objectives;")
+  local n; n=$(db "SELECT COUNT(*) FROM objectives o $where;")
   if [[ "$n" == "0" ]]; then
-    echo "no objectives yet — add one: 5dive objective add \"<name>\" --metric-cmd=… --target=…"
+    if [[ -z "$all" && "${n_retired:-0}" != "0" ]]; then
+      # The whole point of DIVE-2512: never let a retirement render as a wipe.
+      echo "no live objectives — ${n_retired} retired (see them: 5dive objective ls --all)"
+    else
+      echo "no objectives yet — add one: 5dive objective add \"<name>\" --metric-cmd=… --target=…"
+    fi
     return
   fi
   dbfmt -box "
@@ -160,7 +195,10 @@ cmd_objective_ls() {
            o.status AS status,
            CASE o.public WHEN 1 THEN 'yes' ELSE 'no' END AS public,
            COALESCE(o.project_key, '-') AS project
-    FROM objectives o ORDER BY o.created_at;"
+    FROM objectives o $where ORDER BY o.created_at;"
+  [[ -z "$all" && "${n_retired:-0}" != "0" ]] \
+    && printf '\n(%s retired objective(s) hidden — 5dive objective ls --all)\n' "$n_retired"
+  return 0
 }
 
 cmd_objective_show() {
@@ -193,6 +231,17 @@ cmd_objective_show() {
   dbfmt -line "SELECT name, metric_cmd, target, direction, unit, review, planner,
                       project_key, max_new_per_cycle, budget, public, status,
                       created_by, created_at FROM objectives WHERE id=$OBJECTIVE_ID;"
+  # DIVE-2512: on a tombstone the row itself answers who/when/why/whose-authority.
+  # Rendered only when retired, so the common case keeps its shape.
+  if [[ "$(db "SELECT status FROM objectives WHERE id=$OBJECTIVE_ID;")" == "retired" ]]; then
+    printf '\nRETIRED %s by %s%s\n  reason: %s\n  history KEPT: %s cycle(s), %s reading(s)\n' \
+      "$(db "SELECT COALESCE(retired_at,'?')     FROM objectives WHERE id=$OBJECTIVE_ID;")" \
+      "$(db "SELECT COALESCE(retired_by,'?')     FROM objectives WHERE id=$OBJECTIVE_ID;")" \
+      "$(r=$(db "SELECT COALESCE(retired_ref,'') FROM objectives WHERE id=$OBJECTIVE_ID;"); [[ -n "$r" ]] && printf '   authorized by: %s' "$r")" \
+      "$(db "SELECT COALESCE(NULLIF(retired_reason,''),'(none recorded)') FROM objectives WHERE id=$OBJECTIVE_ID;")" \
+      "$(db "SELECT COUNT(*) FROM objective_cycles   WHERE objective_id=$OBJECTIVE_ID;")" \
+      "$(db "SELECT COUNT(*) FROM objective_readings WHERE objective_id=$OBJECTIVE_ID;")"
+  fi
   printf '\ncurrent: %s%s   trend: %s   inflight: %s\n' \
     "${cur:-—}" "$( [[ -n "$cur" ]] && db "SELECT COALESCE(unit,'') FROM objectives WHERE id=$OBJECTIVE_ID;")" \
     "$trend" "${inflight:-0}"
@@ -357,6 +406,13 @@ cmd_objective_setstatus() {
   done
   [[ -n "$ref" ]] || fail "$E_USAGE" "usage: 5dive objective ${status/active/resume} <name> [--force]"
   _objective_resolve "$ref"
+  # DIVE-2512: 'retired' is a tombstone, not a third pause. Pausing one would
+  # silently un-retire it into a state that still reads as ongoing work while
+  # blanking nothing — so refuse and name the one verb that reverses a retirement.
+  local prev_status; prev_status=$(db "SELECT status FROM objectives WHERE id=$OBJECTIVE_ID;")
+  if [[ "$prev_status" == "retired" && "$status" != "active" ]]; then
+    fail "$E_CONFLICT" "objective '$OBJECTIVE_NAME' is retired — un-retire it first: 5dive objective resume \"$OBJECTIVE_NAME\""
+  fi
   # OSS-33 PREFLIGHT: refuse to RESUME (status->active) a loop whose planner role
   # cannot do the work — an explicit, reasoned refusal (never a silent no-op start).
   # --force overrides for a deliberate human who knows the gap (e.g. wiring an org
@@ -371,9 +427,24 @@ cmd_objective_setstatus() {
       fi
     fi
   fi
-  db "UPDATE objectives SET status=$(sqlq "$status"), updated_at=datetime('now') WHERE id=$OBJECTIVE_ID;"
+  # DIVE-2512: resuming a tombstone CLEARS it. The retirement stamp describes the
+  # row's current state, so leaving retired_at set on an active objective would
+  # make the row assert two contradictory things at once. The audit trail that
+  # actually matters — objective_cycles + objective_readings — is untouched either
+  # way; that is what the tombstone was protecting, not these four fields.
+  local unretired=""
+  if [[ "$prev_status" == "retired" && "$status" == "active" ]]; then
+    unretired=1
+    db "UPDATE objectives SET status='active', retired_at=NULL, retired_by=NULL,
+           retired_reason=NULL, retired_ref=NULL, updated_at=datetime('now')
+         WHERE id=$OBJECTIVE_ID;"
+  else
+    db "UPDATE objectives SET status=$(sqlq "$status"), updated_at=datetime('now') WHERE id=$OBJECTIVE_ID;"
+  fi
   local note=""; [[ "$status" == "active" && -n "$PREFLIGHT_DETAIL" && -z "$PREFLIGHT_REASON" ]] && note=" (${PREFLIGHT_DETAIL})"
-  ok "objective '$OBJECTIVE_NAME' -> ${status}${note}" '{name:$n, status:$s}' --arg n "$OBJECTIVE_NAME" --arg s "$status"
+  [[ -n "$unretired" ]] && note="${note} — un-retired; it ticks and re-plans again"
+  ok "objective '$OBJECTIVE_NAME' -> ${status}${note}" '{name:$n, status:$s, unretired:$u}' \
+     --arg n "$OBJECTIVE_NAME" --arg s "$status" --argjson u "$( [[ -n "$unretired" ]] && echo true || echo false )"
 }
 
 # OSS-27/OSS-35 shadow-first: flip an objective's run mode. shadow => every
@@ -391,14 +462,89 @@ cmd_objective_setmode() {
   ok "objective '$OBJECTIVE_NAME' run mode -> ${mode}${note}" '{name:$n, run_mode:$m}' --arg n "$OBJECTIVE_NAME" --arg m "$mode"
 }
 
+# DIVE-2512 — RETIRE, do not delete.
+#
+# This used to be one `DELETE FROM objectives`, and objective_cycles +
+# objective_readings both carry `REFERENCES objectives(id) ON DELETE CASCADE`, so
+# a single `objective rm` silently emptied all three tables. Measured on the one
+# real invocation (funnel-channel-acquisition, retired 2026-07-25 on lodar's
+# tier-2 gate answer in DIVE-1928): objectives 1->0, objective_cycles 4->0,
+# objective_readings 221->0. The success message said only "(readings deleted)" —
+# it never named the audited cycles rows, which ARE the record of whether the loop
+# ever worked.
+#
+# The second-order cost is the one that actually bit: seven days later `objective
+# ls` printed [] and that was filed as an incident (DIVE-2507). An AUTHORIZED
+# RETIREMENT and a CATASTROPHIC TABLE WIPE rendered identically, and separating
+# them took an offsite-snapshot diff plus a board-history search. Note that the
+# natural-looking fix — alarm on an empty objectives table — would have fired a
+# FALSE alarm on this exact event; the tombstone is what makes such an alarm safe
+# to add later, because with retired rows kept, [] means only-and-exactly "nothing
+# was ever here".
+#
+# So: rm sets status='retired' and KEEPS the row, the cycles and the readings,
+# stamping who/when/why/on-whose-authority onto the row itself. Real destruction
+# is reserved for an explicit --purge, whose message names BOTH child tables and
+# their row counts. Compiled: community/wiki/objective-replan-driver-mechanics.md.
 cmd_objective_rm() {
   tasks_db_init
-  local ref="${1:-}"
-  [[ -n "$ref" ]] || fail "$E_USAGE" "usage: 5dive objective rm <name>"
+  local ref="" reason="" auth_ref="" purge="" yes=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --reason=*) reason="${1#*=}" ;;
+      --ref=*)    auth_ref="${1#*=}" ;;
+      --purge)    purge=1 ;;
+      --yes|-y)   yes=1 ;;
+      -*)         fail "$E_USAGE" "unknown flag: $1" ;;
+      *)          [[ -z "$ref" ]] && ref="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
+    esac
+    shift
+  done
+  [[ -n "$ref" ]] || fail "$E_USAGE" 'usage: 5dive objective rm <name> [--reason="<why>"] [--ref=<task ident>] [--purge --yes]'
   _objective_resolve "$ref"
-  # readings cascade via the FK (foreign_keys=ON in db()).
-  db "DELETE FROM objectives WHERE id=$OBJECTIVE_ID;"
-  ok "objective '$OBJECTIVE_NAME' removed (readings deleted)" '{name:$n, removed:true}' --arg n "$OBJECTIVE_NAME"
+
+  local cycles readings status
+  cycles=$(db   "SELECT COUNT(*) FROM objective_cycles   WHERE objective_id=$OBJECTIVE_ID;")
+  readings=$(db "SELECT COUNT(*) FROM objective_readings WHERE objective_id=$OBJECTIVE_ID;")
+  status=$(db   "SELECT status FROM objectives WHERE id=$OBJECTIVE_ID;")
+
+  if [[ -n "$purge" ]]; then
+    # The only path that still destroys history. Never the default, and it says
+    # out loud what it takes with it — the old message's sin was naming readings
+    # and staying silent about the audited cycles.
+    [[ -n "$yes" ]] || fail "$E_CONFLICT" \
+      "refusing to purge '$OBJECTIVE_NAME': this DESTROYS ${cycles} audited cycle row(s) and ${readings} reading(s) and cannot be undone.
+  keep the history (what you almost certainly want): 5dive objective rm \"$OBJECTIVE_NAME\" --reason=\"…\"
+  destroy it anyway:                                 5dive objective rm \"$OBJECTIVE_NAME\" --purge --yes"
+    db "DELETE FROM objectives WHERE id=$OBJECTIVE_ID;"
+    ok "objective '$OBJECTIVE_NAME' PURGED — ${cycles} audited cycle row(s) and ${readings} reading(s) destroyed with it" \
+       '{name:$n, purged:true, cycles_deleted:$c, readings_deleted:$r}' \
+       --arg n "$OBJECTIVE_NAME" --argjson c "${cycles:-0}" --argjson r "${readings:-0}"
+    return
+  fi
+
+  if [[ "$status" == "retired" ]]; then
+    local was_at; was_at=$(db "SELECT COALESCE(retired_at,'?') FROM objectives WHERE id=$OBJECTIVE_ID;")
+    fail "$E_CONFLICT" "objective '$OBJECTIVE_NAME' is already retired (${was_at}) — its ${cycles} cycle(s) and ${readings} reading(s) are kept.
+  bring it back:      5dive objective resume \"$OBJECTIVE_NAME\"
+  destroy it for real: 5dive objective rm \"$OBJECTIVE_NAME\" --purge --yes"
+  fi
+
+  local by; by="$(auto_sender_from_sudo 2>/dev/null || true)"; [[ -n "$by" ]] || by="${USER:-unknown}"
+  db "UPDATE objectives
+         SET status='retired',
+             retired_at=datetime('now'),
+             retired_by=$(sqlq "$by"),
+             retired_reason=$(sqlq_or_null "$reason"),
+             retired_ref=$(sqlq_or_null "$auth_ref"),
+             updated_at=datetime('now')
+       WHERE id=$OBJECTIVE_ID;"
+  local auth_note=""
+  [[ -n "$auth_ref" ]] && auth_note=" [authorized by ${auth_ref}]"
+  ok "objective '$OBJECTIVE_NAME' retired${auth_note} — ${cycles} audited cycle row(s) and ${readings} reading(s) KEPT (5dive objective ls --all, or show \"$OBJECTIVE_NAME\"); it no longer ticks or re-plans. Destroy the history only with: rm \"$OBJECTIVE_NAME\" --purge --yes" \
+     '{name:$n, retired:true, retired_by:$b, retired_reason:(if $why=="" then null else $why end), retired_ref:(if $ref=="" then null else $ref end), cycles_kept:$c, readings_kept:$r}' \
+     --arg n "$OBJECTIVE_NAME" --arg b "$by" --arg why "$reason" --arg ref "$auth_ref" \
+     --argjson c "${cycles:-0}" --argjson r "${readings:-0}"
 }
 
 # Run the metric for one objective (by name/id) or ALL active objectives, append
