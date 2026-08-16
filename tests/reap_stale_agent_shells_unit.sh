@@ -21,6 +21,7 @@
 # Arm 0 is a PINNED-EMPTY positive control: if the selector is broken shut, the
 # "nothing legitimate is reaped" arms pass vacuously and the file is worthless.
 set -uo pipefail
+trap 'rc=$?; rm -f "${ZF:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
 # Three-state: if the helper is unreachable (a staged copy that did not carry
@@ -160,6 +161,50 @@ dropped=$(jq -c -n --arg fp "PANE-B" --argjson c 2 '
   {activeDefer:{fp:"PANE-A",n:1,escFp:"PANE-A"}}
   | .activeDefer = {fp:$fp, n:$c} | .activeDefer')
 is "NEGATIVE CONTROL: bare assignment drops escFp" "$dropped" '{"fp":"PANE-B","n":2}'
+
+# ------------------------------------------------ did the kill actually work --
+# The reaper counts what it ENDED, not what it signalled, so the discriminator
+# it uses gets graded. A bare `kill -0` would answer "still running" for a
+# zombie — a process that is over but whose parent has not waited yet — and our
+# victims' parents are runtimes that may not wait for seconds, so that reads as
+# a failed kill on a successful one.
+echo "== _reap_pid_ended =="
+_reap_pid_ended "$$" && bad "_reap_pid_ended says THIS shell has ended" \
+                     || ok "a running process is not ended"
+
+sleep 0 & gone=$!; wait "$gone" 2>/dev/null || true
+_reap_pid_ended "$gone" && ok "a reaped pid is ended" \
+                        || bad "_reap_pid_ended says a fully-exited pid is still running"
+
+# Zombie arm — the reason _reap_pid_ended is not a bare `kill -0`, so it is the
+# arm that must not be skipped. Staged in a GRANDCHILD: a direct child of this
+# shell is waited on and never lingers as Z, so the zombie has to belong to a
+# parent that is still alive and not waiting — which is also the real case (our
+# victims' parents are runtimes that wait late or not at all).
+ZF=$(mktemp) || ZF=""
+holder=""
+if [[ -n "$ZF" ]]; then
+  ZF="$ZF" bash -c 'bash -c "exit 0" & echo $! >"$ZF"; sleep 3' & holder=$!
+fi
+z=""; zstate=""
+for _ in $(seq 1 50); do z=$(cat "$ZF" 2>/dev/null || true); [[ -n "$z" ]] && break; sleep 0.02; done
+if [[ -n "$z" ]]; then
+  for _ in $(seq 1 50); do
+    zraw=$(cat "/proc/$z/stat" 2>/dev/null) || { zstate="reaped-early"; break; }
+    zraw="${zraw##*) }"; zstate="${zraw%% *}"
+    [[ "$zstate" == "Z" ]] && break
+    sleep 0.02
+  done
+fi
+if [[ "$zstate" == "Z" ]]; then
+  _reap_pid_ended "$z" && ok "a zombie is ended (a bare kill -0 would say still running)" \
+                       || bad "_reap_pid_ended reports a zombie as still running — a successful kill would read as failed"
+  kill -0 "$z" 2>/dev/null && ok "NEGATIVE CONTROL: bare kill -0 does answer 'running' for it" \
+                          || bad "NEGATIVE CONTROL: kill -0 already says gone — the arm above grades nothing"
+else
+  bad "zombie arm NOT STAGED (state=${zstate:-no-pid}) — the zombie branch went ungraded"
+fi
+[[ -z "$holder" ]] || { kill -TERM "$holder" 2>/dev/null || true; wait "$holder" 2>/dev/null || true; }
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 ))

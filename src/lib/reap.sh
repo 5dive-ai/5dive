@@ -158,6 +158,22 @@ _reap_seat_table() {
     | awk '{ pid=$1; ppid=$2; et=$3; $1=$2=$3=""; sub(/^ +/,""); printf "%s\t%s\t%s\t%s\n", pid, ppid, et, $0 }'
 }
 
+# ---- did this pid actually end? ----
+# `kill -0` alone answers NO for a zombie: the process is over, but its entry
+# survives until its parent waits, and a signal-permission probe still succeeds.
+# We kill trees whose parent is a runtime that may not reap for seconds, so a
+# bare `kill -0` re-check would report a false failure on a successful kill.
+# Reads the state field out of /proc/<pid>/stat, splitting after the LAST `)`
+# because comm is unescaped and can contain both spaces and parens.
+# Returns 0 = ended (gone, or a zombie awaiting its parent), 1 = still running.
+_reap_pid_ended() {
+  local p="$1" raw
+  kill -0 "$p" 2>/dev/null || return 0
+  raw=$(cat "/proc/$p/stat" 2>/dev/null) || return 0
+  raw="${raw##*) }"
+  [[ "${raw%% *}" == "Z" ]]
+}
+
 # ---- the acting reaper ----
 #
 # _reap_stale_shells <seat> [--min-age=SEC] [--dry-run] [--reason=<text>]
@@ -216,10 +232,10 @@ _reap_stale_shells() {
   done
   # De-dup, preserving nothing but identity: a nested victim would otherwise be
   # signalled twice, which is harmless but makes the log lie about the count.
-  tree_pids=$(tr ' ' '\n' <<<"$tree_pids" | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ')
+  tree_pids=$(tr ' ' '\n' <<<"$tree_pids" | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ') || tree_pids=""
 
   for pid in $victims; do
-    local cmd_short; cmd_short=$(grep -E "^${pid}"$'\t' <<<"$class_table" | cut -f4 | cut -c1-160)
+    local cmd_short; cmd_short=$(grep -E "^${pid}"$'\t' <<<"$class_table" | cut -f4 | cut -c1-160) || cmd_short=""
     printf '5dive: reaping stale agent shell pid=%s (age>=%ss%s): %s\n' \
       "$pid" "$min_age" "${reason:+, $reason}" "$cmd_short" >&2
     n=$((n + 1))
@@ -236,6 +252,19 @@ _reap_stale_shells() {
   for p in $tree_pids; do
     kill -0 "$p" 2>/dev/null && { kill -KILL "$p" 2>/dev/null || true; }
   done
+
+  # Count what was ENDED, not what was signalled. `kill` is best-effort here —
+  # the heartbeat path runs as root and a seat's own `task done` does not, so a
+  # refused signal is a live possibility — and a remedy that reports success
+  # without checking the act is the exact shape this row exists to fix
+  # (DIVE-1486's escalation "worked" 176 times while nothing was ever unstuck).
+  local survivors=""
+  for p in $victims; do
+    _reap_pid_ended "$p" || { survivors+="${p} "; n=$((n - 1)); }
+  done
+  [[ -z "$survivors" ]] || printf '5dive: reap FAILED, still running after TERM+KILL (not counted): %s\n' \
+    "${survivors% }" >&2
+
   printf '%s' "$n"
   return 0
 }
