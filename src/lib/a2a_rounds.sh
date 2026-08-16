@@ -10,7 +10,7 @@
 # answered with twenty tool calls. That is also why "be concise" does not work —
 # concision does not reduce the digging a message provokes.
 #
-# Two controls, and they are DELIBERATELY NOT THE SAME STRENGTH. The dividing
+# Three controls, and they are DELIBERATELY NOT THE SAME STRENGTH. The dividing
 # principle, and the reason this file reads the way it does:
 #
 #   **A control may only refuse what it can actually identify.**
@@ -21,6 +21,11 @@
 #      nothing. Refused regardless of round count, and never recorded.
 #   2. ROUND CAP — a WARNING. A counter cannot tell agreement from a CORRECTION,
 #      and the correction is the expensive one to lose.
+#   3. HANDBACK REFUSAL (DIVE-3499) — a REFUSAL. "This recipient is the assignee
+#      of an OPEN row this message names" is a database fact, not a read on tone,
+#      and the remedy (`task reject --feedback=` / `set-body` / `assign`) puts
+#      the SAME text in front of the SAME agent. Refusing what you can identify
+#      AND redirect costs nothing; see the block above a2a_handback_refusal.
 #
 # The row as filed said "Refuse, not warn" for both. That was overturned on the
 # gate (main, 2026-08-12 06:36Z) by a day of evidence, and the evidence is the
@@ -219,6 +224,136 @@ a2a_round_warning_msg() {
     "$from" "$(( n + 1 ))" "$to" "$where" "$A2A_ROUND_CAP" "$where" "$(( A2A_ROUND_WINDOW_SECS / 3600 ))"
 }
 
+# ---------------------------------------------------------------------------
+# DIVE-3499: HANDING WORK BACK IS A ROW, NOT A MESSAGE — enforced.
+#
+# Rule 0 of the fleet's a2a section was a sentence in an auto-loaded file, read
+# ~1100 times a day and enforced by nothing. lodar's reply to it was "how will
+# you enforce that?", and the honest alternative to this guard was deleting the
+# rule: an unenforced line pays a per-turn byte cost fleet-wide to buy a reminder
+# that decays.
+#
+# WHAT IT REFUSES, and why this one may refuse where the ROUND CAP above only
+# warns. The file's dividing principle is "a control may only refuse what it can
+# actually IDENTIFY", and there is a second half to it that DIVE-3318 never
+# needed: a refusal is cheap when it names a channel that carries the SAME text
+# to the SAME agent. Both hold here:
+#
+#   IDENTIFIABLE — "the recipient is the assignee of an OPEN row named in this
+#   message" is a database fact, not a guess about tone. No vocabulary test, no
+#   opener-word heuristic; the two failure modes that made the ack detector hard
+#   are both absent.
+#
+#   NOT LOSSY — the remedy is `task reject --feedback=` / `task assign` /
+#   `task set-body`, all of which land the text on the row the recipient is
+#   already dispatched against. The round cap could not refuse because a refused
+#   correction was a LOST correction. A refusal here is a redirect.
+#
+# And the redirect is the whole point of the rule: the maker wakes FRESH, so a
+# ping about work they already own does not cost a message, it costs a full
+# reload of a PR they had closed out (lodar, 2026-08-16).
+#
+# WHAT IT DOES NOT REFUSE, stated here so the carve-outs are read as chosen:
+#   - A QUESTION (the body contains `?`). Rule 0's own carve-out is "a2a is for a
+#     decision you need from a NAMED seat now", and a decision you need now is
+#     asked, not asserted. This is the one soft edge in the guard and it is
+#     deliberate: it is trivially satisfiable by anyone determined to send, which
+#     is correct — the target is the REFLEX, not the exception.
+#   - A send with no derivable sender (root, a human relay). Handled by the
+#     caller's `[[ -n "$from" ]]` above.
+#   - The notification rails (`_5DIVE_A2A_NOTIFY=1`), already exempt.
+#   - Rows that are done/cancelled, and rows the recipient does not own.
+#
+# FAILS OPEN on an unreachable board. `db`/`sqlq` are absent when this library is
+# sourced on its own, and a control that refuses the fleet's sends because its
+# own store did not answer is worse than the traffic it removes — same failure
+# direction the round ledger already chose, and stated so it is not later read as
+# an oversight.
+# ---------------------------------------------------------------------------
+
+# Every task ident in the body, in order, deduped. `a2a_topic_of` deliberately
+# takes only the FIRST (one send is about one topic); a handback can name the row
+# it hands back anywhere in the body, so this one takes them all.
+a2a_idents_of() {
+  local rest="$1" seen=" " id
+  while [[ "$rest" =~ ([A-Z][A-Z0-9]+-[0-9]+) ]]; do
+    id="${BASH_REMATCH[1]}"
+    [[ "$seen" == *" ${id} "* ]] || { printf '%s\n' "$id"; seen+="${id} "; }
+    rest="${rest#*"$id"}"
+  done
+}
+
+# Every PR number the body names: a full `/pull/<n>` URL, a bare `#<n>`, or
+# `PR <n>` / `PR#<n>`. Numbers only — they are matched against the delivery_ref
+# BOUND TO A ROW THE RECIPIENT OWNS, which is what keeps a bare `#12` from
+# meaning every repo's twelfth PR.
+a2a_pr_nums_of() {
+  printf '%s\n' "$1" \
+    | grep -oE '(/pull/[0-9]+|#[0-9]+|\bPRs?[[:space:]]*#?[0-9]+)' 2>/dev/null \
+    | grep -oE '[0-9]+' 2>/dev/null | sort -un
+}
+
+# The open row `to` owns that this ident/PR is bound to, or nothing.
+# Prints `<ident>` on a hit. Returns non-zero when the board is unreachable, so
+# the caller can tell "no such row" from "could not look".
+a2a_open_row_owned() {
+  local to="$1" ident="${2:-}" pr="${3:-}"
+  declare -F db >/dev/null 2>&1 || return 2
+  declare -F sqlq >/dev/null 2>&1 || return 2
+  local where
+  if [[ -n "$ident" ]]; then
+    where="ident=$(sqlq "$ident")"
+  elif [[ "$pr" =~ ^[0-9]+$ ]]; then
+    # Digits only (checked here, not trusted from the caller), so the two LIKEs
+    # are safe to inline. `%/pull/N` catches the bound URL; `%#N` catches the
+    # `owner/repo#N` shorthand some rows bind instead.
+    where="(delivery_ref LIKE '%/pull/${pr}' OR delivery_ref LIKE '%#${pr}')"
+  else
+    return 1
+  fi
+  local hit
+  hit="$(db "SELECT ident FROM tasks
+              WHERE assignee=$(sqlq "$to")
+                AND status NOT IN ('done','cancelled')
+                AND ${where}
+              LIMIT 1;" 2>/dev/null)" || return 2
+  [[ -n "$hit" ]] || return 1
+  printf '%s' "$hit"
+}
+
+a2a_handback_refusal_msg() {
+  local to="$1" row="$2" what="$3"
+  printf 'refused: %s already owns %s (open, %s), so this is handing work back — and handing work back is a ROW, not a message. Put it where they are already dispatched: `5dive task reject %s --feedback="…"` to send it back with the reason, `5dive task set-body %s` to add context, or `5dive task assign %s <seat>` to move it. They wake FRESH on that row, so a ping about it does not cost a message — it costs them a full reload of work they had closed out. a2a is for a DECISION you need from a named seat now; if that is what this is, ask it as a question and it will send.' \
+    "$to" "$row" "$what" "$row" "$row" "$row"
+}
+
+# Prints the refusal text and returns 0 when the send must be refused; returns
+# non-zero (printing nothing) when it may proceed. Inverted against the usual
+# shell convention on purpose: the caller's `if _hb="$(...)"` needs the text and
+# the verdict in one call, exactly like a2a_is_ack + a2a_ack_refusal_msg.
+a2a_handback_refusal() {
+  local from="$1" to="$2" msg="$3"
+  # A question is a decision asked of a named seat, which is what a2a is FOR.
+  case "$msg" in *'?'*) return 1 ;; esac
+  local id row
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    if row="$(a2a_open_row_owned "$to" "$id" "")"; then
+      a2a_handback_refusal_msg "$to" "$row" "assigned to them"
+      return 0
+    fi
+  done < <(a2a_idents_of "$msg")
+  local n
+  while IFS= read -r n; do
+    [[ -n "$n" ]] || continue
+    if row="$(a2a_open_row_owned "$to" "" "$n")"; then
+      a2a_handback_refusal_msg "$to" "$row" "and PR #${n} is bound to it"
+      return 0
+    fi
+  done < <(a2a_pr_nums_of "$msg")
+  return 1
+}
+
 # The guard both send paths call, AFTER the body and both endpoints are
 # resolved and BEFORE a keystroke reaches the target's pane.
 #
@@ -236,7 +371,7 @@ a2a_round_warning_msg() {
 # one-way machine notices that nobody replies to and which are therefore not
 # rounds. A conversation routed through it is a rule broken, not a rule obeyed.
 a2a_round_guard() {
-  local from="$1" to="$2" msg="$3"
+  local from="$1" to="$2" msg="$3" _hb
   [[ "${_5DIVE_A2A_NOTIFY:-0}" == "1" ]] && return 0
   # An unmeasurable sender still gets the ack check (it needs no identity) but
   # cannot be round-counted against a pair — record nothing rather than build a
@@ -246,6 +381,14 @@ a2a_round_guard() {
     return 1
   fi
   [[ -n "$from" && -n "$to" ]] || return 0
+  # DIVE-3499: handing work back is a ROW, not a message. Placed after the
+  # measured-sender requirement above (a human/root caller with no derivable
+  # identity is not the reflex this refuses) and BEFORE the ledger write, so a
+  # refused send is not counted as a round — same treatment the ack refusal gets.
+  if _hb="$(a2a_handback_refusal "$from" "$to" "$msg")"; then
+    printf '%s' "$_hb"
+    return 1
+  fi
   local topic n
   topic="$(a2a_topic_of "$msg")"
   n="$(a2a_round_count "$from" "$to" "$topic")"

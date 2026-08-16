@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased — feat(a2a): handing work back is a ROW, not a message — refused, not advised (DIVE-3499)
+
+`5dive agent send` now **refuses** a message when the recipient is the assignee of an **open** row
+the message names — by ident, by a `/pull/<n>` URL, or by the `#<n>` bound to that row — and points
+the sender at `task reject --feedback=` / `task set-body` / `task assign` instead.
+
+The rule was a line in an auto-loaded file, read ~1100 times a day and enforced by nothing. The
+maker wakes **fresh**, so a ping about work they already own does not cost a message, it costs a
+full reload of a PR they had closed out.
+
+- **This one may refuse where the round cap only warns**, and the split is deliberate. A control may
+  only refuse what it can identify — "the recipient owns this open row" is a database fact, not a
+  read on tone — and a refusal is cheap only when it names a channel carrying the same text to the
+  same agent. The round cap has no such channel; this one is a redirect, not a loss.
+- **Carve-outs, all chosen:** a body containing `?` sends (a2a is for a decision you need from a
+  named seat *now*, and that is asked, not asserted); a sender with no derivable identity (a human
+  or root relay) sends; the notification rails (`_5DIVE_A2A_NOTIFY=1`) stay exempt; done/cancelled
+  rows and rows the recipient does not own are untouched. `blocked` counts as open — a row parked on
+  a gate is the most likely thing to get pinged about.
+- **Fails OPEN when the board is unreachable.** A control that silenced the fleet because its own
+  store did not answer is worse than the traffic it removes.
+- A refused send is **not** recorded as a round, the same treatment the acknowledgement refusal gets.
+- Graded by `tests/a2a_handback_guard_unit.sh` against a real sqlite board (0.9s, core tier).
+
 ## Unreleased — fix(council): `authority.gate_clear_leads` can actually be set (DIVE-3493)
 
 The constitution validator and the authority reader accepted **disjoint** subsets of YAML, so the
