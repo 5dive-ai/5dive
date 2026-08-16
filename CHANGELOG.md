@@ -1,6 +1,93 @@
 # Changelog
 
-## Unreleased — fix(usage): the middle wildcard is a read too (DIVE-3419)
+## v0.19.35 — fix(openclaw): push the BYO credential + model pin into the seat (DIVE-3442)
+
+An openclaw agent created with an API key (`--provider=… --api-key=…`, and the
+dashboard/`5dive init` wizards that call it) booted with its chat channel wired
+and no way to reach its LLM provider: every message came back 401 / "auth or
+provider access failed", while the auth profile, `agent create`'s own output and
+`agent list` all reported healthy.
+
+Measured on a live seat: the seat's own
+`~/.openclaw/agents/main/agent/auth-profiles.json` did not exist and its
+`openclaw.json` carried `primary: null`, while the shared copy under
+`/home/claude` was correct on every field. The launch-time seed that is supposed
+to copy them in is a *pull*, and both of its arms fail for a standard-isolation
+seat — the shared directory is `0700 claude:claude` (no group traversal) and
+such a seat has no passwordless sudo for the fallback.
+
+`agent create` and `agent auth set` now push both files into the seat while they
+still hold root: the credential lands seat-owned at mode 0600, and
+`agents.defaults.model` plus `models.providers` are merged into the seat's own
+`openclaw.json` (so a provider `baseUrl` override — z.ai — reaches the seat too,
+which it never did before). Nothing depends on the seat being able to read the
+shared directory, so the shared credential's permissions are left as they are.
+
+Two silences that hid this are closed as well: `agent create`'s self-check now
+grades the seat's own credential and model pin (its previous witness said
+nothing at all on the BYO-without-profile path), and a boot-time "credential
+exists but is unreadable" verdict now leaves the breadcrumb the agent-list
+health rail reads instead of only a line in the journal.
+
+## v0.19.35 — fix(release): an EDIT to a historical CHANGELOG heading is not a new entry (DIVE-3435)
+
+v0.19.34's release page carried every release back to 0.19.0. **The range was correct and the filter
+was missing** — the first instinct, that `cut_from` failed to resolve and the range fell back to
+`<root>`, is wrong and DIVE-3170's baseline resolver should not be re-opened:
+`release-cut-baseline.sh` resolves v0.19.33 → `f8d202e` and v0.19.34 → `78b6a6a`, so the notes ran
+over exactly the one-release range lodar expected.
+
+`_rn_changelog_added` takes every line CHANGELOG.md GAINED over the range. Three commits inside that
+range hand-edited CHANGELOG.md **on main** to restamp historical headings (DIVE-3292, DIVE-3291,
+DIVE-3391). Rewriting `## Unreleased — foo` to `## v0.19.2 — foo` is a deleted line plus an added
+line, and to `git diff` an added line is an added line: 2696 added lines, ~50 of them version
+headings for releases that shipped weeks ago, every one rendered as a bullet by `_rn_group`.
+
+**Why v0.19.33 looked fine, and why this read as a random regression.** Its range touched
+CHANGELOG.md zero times (`git diff fee61e6..f8d202e -- CHANGELOG.md` → 0 added lines), so arm 1
+produced nothing, the non-blank guard failed, and it fell through to the commit-subject fallback.
+It was correct **by fallback**. Arm 1 has been latent-broken since it was written and only fires when
+someone edits CHANGELOG.md on main — rare, because DIVE-2247 stopped the workflow pushing to main and
+DIVE-2582 moved new entries to `changelog.d/` fragments. That rarity is the whole of the
+intermittency.
+
+**The fix.** `_rn_group`'s sed now carries the version token through to awk instead of discarding it,
+and awk drops any entry whose heading names a version other than the one being cut — the entry AND
+its accumulated body, since the prose under a restamped heading is historical too and is where the
+bulk of the 2696 lines went. Two forms are kept: `## Unreleased` (written on main, not yet stamped)
+and `## v<version-being-cut>`. **The second is load-bearing, not belt-and-braces**: `release-cut.yml`
+passes the detached RELEASE commit as the `to` end, and `stamp-changelog.sh` has already rewritten
+this cut's headings by then, so every section the release actually ships reaches the diff in stamped
+form. The rule is only sound because main is never stamped (DIVE-2247), which makes "a `## v<X>`
+heading on main" a historical edit by definition rather than by heuristic.
+
+**The failure mode of the fix is the known-good path.** On a healthy cut the only headings present
+are `Unreleased` and this version's own stamp, so the filter is a no-op. When it does fire on an
+all-historical range the filtered result is empty, the existing `grep -q '[^[:space:]]'` guard fails,
+and it falls through to `_rn_commit_summary` — precisely what made v0.19.33 correct. It must not, and
+does not, `exit 1` and kill a cut over a docs commit.
+
+**Measured, on the real ranges.** Replaying `release-notes.sh f8d202e 78b6a6a 0.19.34`: 96 lines
+before, 29 after, and the entries for DIVE-2129, DIVE-2183, DIVE-2245, DIVE-2272, DIVE-2641,
+DIVE-2655 and the rest of the 0.19.0-era block are gone. Replaying v0.19.33's own range
+(`fee61e6..f8d202e`) is **byte-identical** at 577 bytes — though that control is weak on its own,
+because that range takes the fallback arm this change does not touch; the arm-1 controls are the 40
+pre-existing harness assertions, all still green.
+
+`tests/release_notes_unit.sh` gains 8 arms (48 passed / 0 failed, ~0.55s, core tier, no root and no
+network). Graded against the pre-fix script on the same tree: **44 passed / 4 failed**, the reds
+landing on exactly the leak — historical heading present in the body, and the all-restamp range
+failing to fall through. One existing fixture heading was restamped `## v0.19.9` → `## v1.2.3`: that
+arm asserts a STAMPED heading renders as a bullet, and under the new rule it has to name the version
+being cut (1.2.3) to be that; the foreign-version case it used to occupy is now covered explicitly by
+its own arm, so both directions are graded rather than one silently replacing the other.
+
+**Known residual, deliberate and noted in the code**: the `pre` blob in `_rn_group` — added lines
+appearing before any heading — is not version-filtered. It is the heading-less-fragment path, there
+is no version token to filter on, and narrowing it blind risks dropping real content. Same class of
+leak, narrower. v0.19.34's page is not retrofitted; this is a fix-forward.
+
+## v0.19.35 — fix(usage): the middle wildcard is a read too (DIVE-3419)
 
 Both transcript readers in `cmd_usage.sh` used `projects/*/*.jsonl`. `usage_collect` was guarded at the
 **top** (`probe_readable` on `projects/`) and the **bottom** (per-file `except OSError`) of a *three*-level
@@ -30,7 +117,7 @@ true** — and every "⚠ N NOT checked — burn is unknown (not 0)" banner buil
   ANY-UID arm (`ELOOP`, which root cannot resolve either) so a uid-0 CI run cannot be a vacuous green, and
   over-fire controls. **9/14 pre-fix, 23/0 after.**
 
-## Unreleased — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
+## v0.19.35 — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
 
 Nothing validated these columns. The work-picker dispatches on `assignee`, so a row on a name that is
 not a registered agent was **structurally undispatchable** — not blocked, not parked, not flagged, and
@@ -54,7 +141,7 @@ never once a dispatch target) and corroborated here (5 open rows).
 - **`wip-cap-install`** read the same unvalidated column (it had minted `wip_cap:cli`, a lane ceiling
   for an agent that does not exist). It now skips unregistered lanes and **names the skip**.
 
-## Unreleased — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
+## v0.19.35 — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
 
 `5dive agent config <name> set channels=<current>,buzz` could not succeed on any seat that was not
 **created** with buzz. `cmd_config` dispatches `install_channel_for_agent` for telegram, discord and
@@ -87,7 +174,7 @@ arms grade the satisfier next to the gate, and drive `cmd_config` for real — w
 that the same call reaches the restart once the cache is staged, so the rollback arms cannot pass
 against a `cmd_config` that simply refuses everything.
 
-## Unreleased — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
+## v0.19.35 — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
 
 DIVE-2483's gate answer said the preservation notice lands on **stdout**. It lands on **stderr**,
 via the fleet's `warn()`. Six arms were written for that condition and all six were green, because
@@ -121,7 +208,7 @@ Still open and scoped out on purpose: `task reject` remains an unguarded writer 
 column (`src/cmd_task.sh:4235`). That is a design question about accumulating verifier feedback, not
 this gap.
 
-## Unreleased — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
+## v0.19.35 — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
 
 DIVE-3272 taught the supervisor BOARD to see a seat that is alive and closing nothing. The
 drill-down people actually type kept printing only liveness: `state: active / enabled` was
@@ -163,7 +250,7 @@ supervisor:  quota-exhausted / quota-exhausted — pane shows a model-capacity r
 - `agent list` is unchanged — it is the survey surface, and this is a per-agent drill-down
   (three sqlite reads), deliberately not an N-way fan-out.
 
-## Unreleased — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
+## v0.19.35 — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
 
 A gate reaches the filer's lead only if `_GATE_ENG_SHIP_RX` matches the ask or the row
 title. `gate_builder_routing` is OFF by default, so for an ordinary builder ship gate that
@@ -227,7 +314,7 @@ prose for identifiers.
   `gate_access_lead_clear`, `gate_internal_ops_floor`, `task_needs_human_parity`,
   `task_inbox_json_tier`, `push_unit`, `broker_surface`, + 15 more).
 
-## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
+## v0.19.35 — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
 
 DIVE-1935's first iteration was rejected, and for the right reason. It added a
 `sudo -n -u claude gh auth token` arm to `_gate_gh_token` justified by *"agents hold
