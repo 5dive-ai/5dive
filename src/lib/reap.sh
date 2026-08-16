@@ -34,11 +34,32 @@
 #   * pid 1, the seat unit, tmux, the run loop, the runtime, MCP servers.
 #   * anything younger than the grace age (default 900s) — a shell that has been
 #     alive fifteen minutes past its task boundary is not the fast case.
-#   * anything whose command line carries the opt-out token 5DIVE_KEEP_ALIVE.
-#     A deliberate long background job is a legitimate thing to want; killing it
-#     would be a new defect, not a fix. This is the named escape, and it is a
-#     token in the command line so it survives into `ps` where the predicate can
-#     see it: `5DIVE_KEEP_ALIVE=1 nohup ./long-build.sh &`.
+#   * anything carrying the opt-out FIVEDIVE_KEEP_ALIVE, read from the process's
+#     ENVIRONMENT (/proc/<pid>/environ) as well as its command line. A deliberate
+#     long background job is a legitimate thing to want; killing it would be a
+#     new defect, not a fix, so this escape has to actually work:
+#       FIVEDIVE_KEEP_ALIVE=1 nohup ./long-build.sh &
+#
+#     It reads environ and not just `ps` because a variable-assignment prefix is
+#     NEVER part of argv — `env`/`nohup` exec away and the assignment is consumed
+#     by the shell, so `ps` shows `nohup ./long-build.sh` with no token anywhere.
+#     Iteration 2 checked the command line only, so the escape documented to
+#     agents was inert and an opted-out job was killed anyway (measured by quinn
+#     on this host, DIVE-3503 it.2). Environ is readable on both call paths: the
+#     task-boundary reaper runs as the seat over its own pids, the heartbeat as
+#     root. Children inherit the variable, so a protected job protects its tree.
+#
+#     The name changed here too, and that is the load-bearing half of the fix:
+#     `5DIVE_KEEP_ALIVE` is not a valid shell identifier (it begins with a
+#     digit), so the invocation we documented did not "fail to be visible" — it
+#     did not run. Measured: `5DIVE_KEEP_ALIVE=1 nohup ./x &` exits 127
+#     (`command not found`) and `export 5DIVE_KEEP_ALIVE=1` is refused as `not a
+#     valid identifier`. FIVEDIVE_* matches FIVEDIVE_REAP/FIVEDIVE_REAP_MIN_AGE
+#     below. The old spelling is still honoured in the command line only, for
+#     anyone who pasted it as a literal comment token; it is not documented.
+#
+#     NOT read on a host without /proc (non-Linux): there the environ arm is
+#     inert and only a token literally in argv spares a shell.
 #
 # NEVER `pkill -f` HERE. The incident is itself the proof: an `-f` pattern in it
 # matched a seat on another machine that was merely QUOTING the string, plus the
@@ -64,9 +85,12 @@ _reap_enabled() { [[ "${FIVEDIVE_REAP:-1}" != "0" ]]; }
 _reap_is_agent_shell() {
   local cmd="$1"
   [[ -n "$cmd" ]] || return 1
-  # The named opt-out. Checked first: it must beat every other arm, including
-  # command lines that look exactly like the incident's.
-  [[ "$cmd" == *5DIVE_KEEP_ALIVE* ]] && return 1
+  # The named opt-out, in the command line. Checked first: it must beat every
+  # other arm, including command lines that look exactly like the incident's.
+  # This arm only sees a token literally in argv; the documented env-var form is
+  # invisible here by construction and is handled by _reap_keep_alive_env below.
+  [[ "$cmd" == *FIVEDIVE_KEEP_ALIVE* ]] && return 1
+  [[ "$cmd" == *5DIVE_KEEP_ALIVE* ]] && return 1   # legacy spelling, undocumented
   # The seat's own machinery, in the order `ps` shows it. `--login` is the run
   # loop's shell and is NEVER an agent-written command; run-loop.sh and
   # 5dive-agent-start name themselves; tmux/claude/bun/node are not shells.
@@ -84,6 +108,37 @@ _reap_is_agent_shell() {
     bash\ -lc\ *|/bin/bash\ -lc\ *)                    return 0 ;;
   esac
   return 1
+}
+
+# ---- the opt-out, read from the process ENVIRONMENT ----
+#
+# _reap_keep_alive_env <pid> -> 0 if this process opted out, 1 otherwise.
+#
+# `FIVEDIVE_KEEP_ALIVE=1 nohup ./long-build.sh &` puts the variable in the
+# child's environment and NOWHERE in its argv, so the string predicate above
+# cannot see it and only /proc/<pid>/environ can. PRESENCE is the opt-out; the
+# value is not read, so it matches the command-line arm exactly (a token is a
+# token) and `=0` does not mean "off".
+#
+# Unreadable environ (no /proc, or the process exited between the ps and here)
+# is NOT treated as an opt-out: sparing on failure-to-read would silently
+# disable the whole reaper on any host where the file is missing, which is the
+# "remedy that reports success while doing nothing" this row exists to punish.
+_reap_keep_alive_env() {
+  local p="$1" env_raw
+  [[ -r "/proc/$p/environ" ]] || return 1
+  env_raw=$(tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null) || return 1
+  grep -qE '^(FIVEDIVE|5DIVE)_KEEP_ALIVE=' <<<"$env_raw"
+}
+
+# The composition the class loop actually applies: the pure command-line class
+# test, then the environment opt-out. It exists as a function so the unit test
+# grades THIS, driven by a real staged pid and its real /proc/<pid>/cmdline,
+# rather than re-typing the loop's two conditions and grading its own copy —
+# which is exactly how iteration 2 stayed green while the opt-out was dead.
+_reap_is_reapable() {   # <pid> <cmdline>
+  _reap_is_agent_shell "$2" || return 1
+  ! _reap_keep_alive_env "$1"
 }
 
 # ---- pure selector ----
@@ -166,6 +221,13 @@ _reap_seat_table() {
 # Reads the state field out of /proc/<pid>/stat, splitting after the LAST `)`
 # because comm is unescaped and can contain both spaces and parens.
 # Returns 0 = ended (gone, or a zombie awaiting its parent), 1 = still running.
+#
+# NARROWED (quinn, it.2): bash's `kill -0` cannot separate EPERM from ESRCH, so
+# a LIVE process this uid may not signal also reads as "ended" — the refused
+# signal named in the paragraph above is the one case this answers wrong. That
+# is unreachable on both call paths today, because `ps -u <seat>` only yields
+# pids the caller may signal (own uid, or root), so it is a latent edge and not
+# a live hole; measured from this seat, _reap_pid_ended 1 returns ENDED for pid 1.
 _reap_pid_ended() {
   local p="$1" raw
   kill -0 "$p" 2>/dev/null || return 0
@@ -206,7 +268,7 @@ _reap_stale_shells() {
   # string function the unit test can drive directly.
   local class_table="" line pid rest
   while IFS=$'\t' read -r pid ppid etimes cmd; do
-    if _reap_is_agent_shell "$cmd"; then
+    if _reap_is_reapable "$pid" "$cmd"; then
       class_table+="${pid}"$'\t'"${ppid}"$'\t'"${etimes}"$'\t'"${cmd}"$'\n'
     fi
   done <<<"$table"

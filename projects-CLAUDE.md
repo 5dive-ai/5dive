@@ -54,6 +54,14 @@ six and a half hours.
   (`pgrep -f pat | grep -vE "^($$|$BASHPID)$"`) — but prefer the PID.
 - **Never `pkill -f` on this host.** Kill by PID, from the process tree.
 - Background shells older than 15 minutes are reaped for you at `task
-  done|cancel|deliver`. If you genuinely want one to outlive the task, put the
-  token `5DIVE_KEEP_ALIVE` in its command line
-  (`5DIVE_KEEP_ALIVE=1 nohup ./long-build.sh &`) and it is left alone.
+  done|cancel|deliver`. If you genuinely want one to outlive the task, set
+  `FIVEDIVE_KEEP_ALIVE` on it and it is left alone — the reaper reads it from the
+  process's environment, so the ordinary form works and children inherit it:
+
+  ```sh
+  FIVEDIVE_KEEP_ALIVE=1 nohup ./long-build.sh &
+  ```
+
+  Spell it `FIVEDIVE_`, not `5DIVE_`: a name may not begin with a digit, so
+  `5DIVE_KEEP_ALIVE=1 ./x` is not an assignment at all — bash reads it as a
+  command, exits 127, and your job never starts.

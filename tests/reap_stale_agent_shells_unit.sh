@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# TIER: core — 0.1s measured on the 5dive control plane (agent-dev seat): pure
-# string/awk grading, no ps, no kill, no DB, no network.
+# TIER: core — 0.5s measured on the 5dive control plane (agent-dev seat): mostly
+# pure string/awk grading, plus four short-lived staged decoys (two for the
+# environ opt-out, one zombie, one live) that are killed by PID on exit. No DB,
+# no network, no `ps` of the real seat, and nothing it kills is not its own.
 #
 # DIVE-3503 — the reaper's predicate, graded on a FABRICATED process table.
 #
@@ -75,10 +77,98 @@ spared "node server"    '/usr/bin/node src/server.js'
 spared "empty cmdline"  ''
 
 echo "== class predicate: the named opt-out beats every reapable shape =="
-# Same command line as the dev incident, plus the token. Must be spared, or the
-# escape hatch documented to agents in projects-CLAUDE.md does not exist.
-spared "opt-out token"  $'bash -c 5DIVE_KEEP_ALIVE=1 until ! pgrep -f \'timeout 300 bash tests/\'; do sleep 20; done'
-spared "opt-out env"    'bash -c 5DIVE_KEEP_ALIVE=1 nohup ./long-build.sh'
+# A token literally in argv. This arm is a LITERAL on purpose — it grades the
+# pure string function, and a shell can really produce this command line.
+spared "opt-out token in argv" \
+  $'bash -c FIVEDIVE_KEEP_ALIVE=1; until ! pgrep -f \'timeout 300 bash tests/\'; do sleep 20; done'
+spared "legacy spelling in argv" \
+  $'bash -c 5DIVE_KEEP_ALIVE=1; until ! pgrep -f \'timeout 300 bash tests/\'; do sleep 20; done'
+
+echo "== the opt-out, driven by REAL staged processes =="
+#
+# WHY THIS SECTION IS NOT LITERALS. Iteration 2 asserted
+#   spared "opt-out env" 'bash -c 5DIVE_KEEP_ALIVE=1 nohup ./long-build.sh'
+# — a command line the documented invocation CANNOT produce. A variable
+# assignment is consumed by the shell and never lands in argv, so the arm graded
+# its own fixture, stayed green, and the escape hatch was dead: quinn staged the
+# documented form on this host and the reaper killed it (DIVE-3503 it.2). So
+# every claim below is read off a real /proc/<pid>/cmdline and /proc/<pid>/environ.
+#
+# It also turned out the old spelling never ran at all — `5DIVE_KEEP_ALIVE` is
+# not a valid shell identifier (leading digit) — which is graded here too.
+A=""; B=""
+cleanup_staged() { local p; for p in $A $B; do kill -KILL "$p" 2>/dev/null; done; }
+trap 'rc=$?; cleanup_staged; rm -f "${ZF:-}"; echo "HARNESS-RC=$rc"' EXIT
+
+WEDGE='until [ -f /nonexistent/5dive-never ]; do sleep 1; done'
+if [[ ! -r /proc/self/cmdline ]]; then
+  bad "STAGING: /proc is not readable — the environ opt-out cannot be graded on this host"
+else
+  # A: the DOCUMENTED invocation, spelled exactly as projects-CLAUDE.md spells it.
+  #    Written inline rather than through a helper: an assignment prefix on a
+  #    FUNCTION call persists in the calling shell in bash, which would leak the
+  #    token into B and turn the negative control green for the wrong reason.
+  FIVEDIVE_KEEP_ALIVE=1 nohup bash -c "$WEDGE" >/dev/null 2>&1 &
+  A=$!
+  # B: the identical wedge with NO opt-out. Negative control: without it, an arm
+  #    that spared everything would read exactly like a working opt-out.
+  nohup bash -c "$WEDGE" >/dev/null 2>&1 &
+  B=$!
+  disown "$A" "$B" 2>/dev/null || true   # else the EXIT kill prints "Killed" job notices
+  sleep 0.3
+  if ! kill -0 "$A" 2>/dev/null || ! kill -0 "$B" 2>/dev/null; then
+    bad "STAGING: could not stage the decoys (A=$A B=$B) — the arms below cannot be graded"
+  else
+    A_CMD=$(tr '\0' ' ' <"/proc/$A/cmdline"); A_CMD="${A_CMD% }"
+    B_CMD=$(tr '\0' ' ' <"/proc/$B/cmdline"); B_CMD="${B_CMD% }"
+
+    # The fact iteration 2's fixture got wrong, asserted directly.
+    if [[ "$A_CMD" == *KEEP_ALIVE* ]]; then
+      bad "the token is ABSENT from argv — fixture assumption, must hold for the rest to mean anything (got: $A_CMD)"
+    else
+      ok "the token is ABSENT from the opted-out process's argv (real cmdline: $A_CMD)"
+    fi
+    # ...so the string predicate MUST call it reapable. If it did not, the
+    # environ arm below would pass for the wrong reason.
+    if _reap_is_agent_shell "$A_CMD"; then
+      ok "string predicate alone would REAP the opted-out process (so only environ can spare it)"
+    else
+      bad "string predicate spared the opted-out process on its own — the environ arm is vacuous"
+    fi
+
+    if _reap_keep_alive_env "$A"; then ok "environ opt-out SEEN on the staged opted-out pid"
+    else bad "environ opt-out NOT seen on the staged opted-out pid — the documented escape is inert"; fi
+    if _reap_keep_alive_env "$B"; then bad "environ opt-out claimed on the UNPROTECTED twin — it spares everything"
+    else ok "NEGATIVE CONTROL: environ opt-out not claimed on the unprotected twin"; fi
+
+    # The composition the acting reaper applies, on the real pid + real cmdline.
+    if _reap_is_reapable "$A" "$A_CMD"; then
+      bad "COMPOSITION: the documented opt-out would be REAPED — this is the it.2 blocker, unfixed"
+    else
+      ok "COMPOSITION: the documented opt-out is spared"
+    fi
+    if _reap_is_reapable "$B" "$B_CMD"; then
+      ok "COMPOSITION: the unprotected twin is reaped"
+    else
+      bad "COMPOSITION: the unprotected twin was spared — the reaper selects nothing"
+    fi
+
+    # An unreadable environ must NOT read as an opt-out, or a missing /proc
+    # silently disables the whole reaper while every arm still reads green.
+    if _reap_keep_alive_env 999999999; then
+      bad "an unreadable environ was treated as an opt-out — /proc absent would disable the reaper"
+    else
+      ok "an unreadable environ is NOT an opt-out"
+    fi
+  fi
+
+  # The name itself, which is why the docs changed: a leading digit is not a
+  # valid identifier, so the OLD invocation never started the job.
+  bash -c '5DIVE_KEEP_ALIVE=1 true' >/dev/null 2>&1
+  is "old spelling is not an assignment — the documented job exited 127" "$?" "127"
+  bash -c 'FIVEDIVE_KEEP_ALIVE=1 true' >/dev/null 2>&1
+  is "new spelling is a valid assignment prefix — the job runs" "$?" "0"
+fi
 
 # ------------------------------------------------------------- selector arms --
 # Table columns: PID \t PPID \t ELAPSED_SECONDS \t COMMAND
