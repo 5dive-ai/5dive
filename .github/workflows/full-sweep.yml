@@ -334,9 +334,51 @@ jobs:
   # clean-green baseline, which lets these jobs skip their own clean run (halving
   # them) WITHOUT becoming unsound. Run standalone (no --assume-clean) the script
   # does the clean run itself, so it is never unsound locally either.
+  #
+  # DIVE-3488: AND THAT IS THE ANSWER TO "WHY NOT OVERLAP THE PROBE WITH THE SHARDS".
+  # Asked directly, because the sweep's 30-50 min was holding a release cut and the
+  # obvious read of it is a `needs:` edit. It is not, and the reason is not the one
+  # you would look for first:
+  #
+  #   NOTHING FLOWS SHARD -> PROBE AS AN ARTIFACT. These jobs upload probe-*.txt;
+  #   they download nothing. There is no data dependency to preserve, so the barrier
+  #   looks incidental and it is not.
+  #
+  # The dependency is SEMANTIC and it is spelled `--assume-clean` on the run line
+  # below. The probe's verdict is "the harness exited non-zero once I broke it", and
+  # that is only evidence about WIRING if the harness exited ZERO before I broke it.
+  # The shard is what establishes that. Overlap the two and the probe must run its
+  # own clean pass — which is a THIRD full pass over the corpus, not a saving.
+  #
+  # Measured on run 31944611014 (main, b898240), which is the run the row was filed
+  # against, so this is arithmetic on real seconds rather than an estimate:
+  #     full-pristine shards           459s / 505s / 723s   (3 jobs, concurrent)
+  #     full-installed-host shards     498s / 506s / 701s   (3 jobs, concurrent)
+  #     harness-verdict-pristine      1475s                 (ONE job, whole corpus)
+  # The barrier costs the ~700s of the slowest shard. Removing `--assume-clean` to
+  # buy that back adds a clean pass of ~1500s of corpus work to a job that is not
+  # sharded. Paying 1500 to save 700 is not an optimisation, and it also gives up the
+  # only baseline the verdict has. SO THE BARRIER STAYS.
+  #
+  # THE 22 MINUTES WERE NEVER THE BARRIER. They were that the corpus above is sharded
+  # three ways and the job that RE-RUNS the same corpus was a single runner — 1475s
+  # against shards of 459-723s. That is the fix below: the same matrix, the same
+  # stride, the same cap. It changes NOTHING about what runs (DIVE-2525's tier budget
+  # is untouched, no harness is demoted, no corpus is trimmed) and it takes the
+  # critical path from `slowest shard + 1475s` to `slowest shard + ~500s`.
+  #
+  # WHAT SHARDING A COVERAGE PROBE WOULD COST IF THE CLAIM LIVED HERE — it does not,
+  # and that is why this is safe. A single probe run has never been allowed to assert
+  # coverage (DIVE-2018: `not-reached` is not a failure, so no one run can). The claim
+  # belongs to harness-verdict-union, which reads every report and FAILS CLOSED on a
+  # missing one, and every report is named explicitly there. A shard that dies reds
+  # the union instead of quietly shrinking the corpus we say we cover.
   harness-verdict-pristine:
     runs-on: ubuntu-latest
     needs: full-pristine
+    strategy:
+      fail-fast: false
+      matrix: { shard: [1, 2, 3] }
     # DIVE-2789: NOT ON A PULL REQUEST. The PR trigger above puts the whole corpus
     # on a branch; it does not put a SECOND whole pass on one. The verdict probe
     # re-runs every harness once per injected mutation, so these four jobs roughly
@@ -375,10 +417,11 @@ jobs:
       # quietly go back to being a skip.
       - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
         uses: oven-sh/setup-bun@v2
-      - name: Every harness must be able to FAIL
+      - name: Every harness must be able to FAIL (shard ${{ matrix.shard }})
         run: |
           bash tests/meta/harness-verdict-probe.sh --assume-clean \
-            --label=pristine --report=probe-pristine.txt
+            --shard=${{ matrix.shard }}/${{ strategy.job-total }} \
+            --label=pristine --report=probe-pristine-${{ matrix.shard }}.txt
       # DIVE-2018: this run's `not-reached` set is not a failure and must not be — a
       # harness that skips before its verdict has not been shown to be unwired, and
       # three correctly-wired files were falsely accused that way. Which is exactly
@@ -388,16 +431,26 @@ jobs:
       # silently shrink the union.
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: probe-pristine, path: probe-pristine.txt, if-no-files-found: error }
+        with:
+          name: "probe-pristine-${{ matrix.shard }}"
+          path: "probe-pristine-${{ matrix.shard }}.txt"
+          if-no-files-found: error
 
   # DIVE-2018: the probe used to run ONLY on the pristine runner, so the harnesses CI
   # never probed were precisely the ones that skip without live state — the gate and
   # install paths, i.e. the most environment-sensitive code we have. Probing here too
   # is what makes the union non-trivial: this environment reaches harnesses the
   # pristine one cannot.
+  # DIVE-3488: sharded for the reason written at harness-verdict-pristine above —
+  # and THIS lane is the one that was on the critical path (it starts last, because
+  # full-installed-host's slowest shard finishes last). Read that comment before
+  # editing either matrix; they are one decision spelled twice.
   harness-verdict-installed:
     runs-on: ubuntu-latest
     needs: full-installed-host
+    strategy:
+      fail-fast: false
+      matrix: { shard: [1, 2, 3] }
     # DIVE-2789: NOT ON A PULL REQUEST. The PR trigger above puts the whole corpus
     # on a branch; it does not put a SECOND whole pass on one. The verdict probe
     # re-runs every harness once per injected mutation, so these four jobs roughly
@@ -463,13 +516,17 @@ jobs:
       # quietly go back to being a skip.
       - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
         uses: oven-sh/setup-bun@v2
-      - name: Every harness must be able to FAIL (installed host)
+      - name: Every harness must be able to FAIL (installed host, shard ${{ matrix.shard }})
         run: |
           bash tests/meta/harness-verdict-probe.sh --assume-clean \
-            --label=installed-host --report=probe-installed.txt
+            --shard=${{ matrix.shard }}/${{ strategy.job-total }} \
+            --label=installed-host --report=probe-installed-${{ matrix.shard }}.txt
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: probe-installed, path: probe-installed.txt, if-no-files-found: error }
+        with:
+          name: "probe-installed-${{ matrix.shard }}"
+          path: "probe-installed-${{ matrix.shard }}.txt"
+          if-no-files-found: error
 
   # DIVE-2412: A HARNESS CAN BE UNPROBED FOR TIME RATHER THAN FOR SHAPE, and the two
   # want different answers. The probe's per-harness `timeout` is 180s, which is what
@@ -586,8 +643,17 @@ jobs:
       # exists to close. Every report is named EXPLICITLY, not globbed, for the same
       # reason: a lane that died has to red this job rather than quietly drop back to
       # a smaller corpus than the one it used to cover.
+      # DIVE-3488: SEVEN reports now, still named one by one and still never globbed.
+      # The probe lanes are sharded; the union is not, and must not be — it is the
+      # only place the whole-corpus claim is made, and it can only make it by reading
+      # every shard of every environment. A missing name here is a shard whose death
+      # would go unnoticed, which is the hole this job exists to close.
       - name: Every harness must be probed in SOME environment
-        run: bash tests/meta/harness-verdict-union.sh probe-pristine.txt probe-installed.txt probe-slow.txt
+        run: |
+          bash tests/meta/harness-verdict-union.sh \
+            probe-pristine-1.txt probe-pristine-2.txt probe-pristine-3.txt \
+            probe-installed-1.txt probe-installed-2.txt probe-installed-3.txt \
+            probe-slow.txt
 
   # Build 3 of DIVE-2525: THE NUMBER, WHERE SOMEBODY WILL SEE IT. The runner already
   # prints it in each job's log, and a number in a log is what "visible for two weeks

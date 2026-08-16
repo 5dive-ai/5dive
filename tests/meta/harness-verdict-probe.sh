@@ -26,10 +26,23 @@
 # so the suite never runs this, and this never recurses into itself.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 2
-ASSUME_CLEAN=0; ONLY=""; REPORT=""; LABEL=""; TIMEOUT=${PROBE_TIMEOUT:-180}
+ASSUME_CLEAN=0; ONLY=""; REPORT=""; LABEL=""; SHARD=""; TIMEOUT=${PROBE_TIMEOUT:-180}
 for a in "$@"; do case "$a" in
   --assume-clean) ASSUME_CLEAN=1 ;;
   --only=*) ONLY="${a#--only=}" ;;      # one basename, or a comma-separated list
+  # DIVE-3488: i/N, 1-based, same stride and same spelling as run-harnesses.sh's
+  # --shard. The corpus this probe re-runs is ALREADY sharded three ways by
+  # full-sweep.yml's `full-pristine` / `full-installed-host` matrices; this one job
+  # then re-ran all of it single-file, so the probe pass measured 1475s against
+  # shards of 459-723s and WAS the sweep's second half.
+  #
+  # Sharding here is sound for a reason that does not hold for most instruments:
+  # the coverage claim was NEVER this job's to make. harness-verdict-union.sh owns
+  # it, over the UNION of every report, and it fails closed on a missing one. A
+  # shard reports what it observed; the union still asserts every harness in
+  # tests/*.sh was probed SOMEWHERE. `# corpus=` below stays the whole tree's count
+  # in every shard, so a shard cannot shrink the corpus the union checks against.
+  --shard=*) SHARD="${a#--shard=}" ;;   # i/N, 1-based
   # DIVE-2018: a machine-readable verdict per harness, so the UNION of several
   # environments can be asserted to cover the corpus. NOT-REACHED is correctly not
   # a failure in any single run (a skip is not an accusation), which is precisely
@@ -178,6 +191,43 @@ counter_verdict() {   # -> "<var>\t<lineno>\t<last|not-last>"
 
 CORPUS_N=0; for t in tests/*.sh; do [[ -e "$t" ]] && CORPUS_N=$(( CORPUS_N + 1 )); done
 only_set=" ${ONLY//,/ } "
+
+# DIVE-3488: SELECT FIRST, then loop — the stride has to be taken over the list this
+# run would actually probe, so --only and --shard compose instead of one silently
+# eating the other.
+SELECTED=()
+for t in tests/*.sh; do
+  [[ -e "$t" ]] || continue
+  b=$(basename "$t")
+  # --only takes a LIST so a second environment can re-probe exactly the harnesses
+  # the first one skipped, instead of paying for the whole corpus twice.
+  [[ -n "$ONLY" && "$only_set" != *" $b "* ]] && continue
+  SELECTED+=("$t")
+done
+
+if [[ -n "$SHARD" ]]; then
+  if [[ ! "$SHARD" =~ ^([0-9]+)/([0-9]+)$ ]]; then
+    printf 'probe: --shard must be i/N (1-based), got %s\n' "$SHARD" >&2; exit 2
+  fi
+  si="${BASH_REMATCH[1]}"; sn="${BASH_REMATCH[2]}"
+  if (( si < 1 || sn < 1 || si > sn )); then
+    printf 'probe: --shard=%s is out of range\n' "$SHARD" >&2; exit 2
+  fi
+  picked=()
+  for i in "${!SELECTED[@]}"; do (( i % sn == si - 1 )) && picked+=("${SELECTED[$i]}"); done
+  SELECTED=("${picked[@]}")
+  # The label carries the shard, because the union keys its per-environment detail
+  # on the label: three reports all called `pristine` would overwrite each other in
+  # the NEVER PROBED explanation and print one shard's verdict as the environment's.
+  # Coverage would still be right; the sentence a human reads would not.
+  [[ -n "$LABEL" ]] && LABEL="$LABEL-s$si"
+  # A shard that selected nothing reports green having probed none of the corpus it
+  # names — the same UNDETERMINED state run-harnesses.sh refuses, for the same reason.
+  if (( ${#SELECTED[@]} == 0 )); then
+    printf 'probe: FAIL — shard %s selected 0 harnesses; an empty shard is not a probed one\n' "$SHARD" >&2
+    exit 1
+  fi
+fi
 # DIVE-2039: every line of this script's output was buffered into arrays and printed
 # at the END, so a full sweep wrote ZERO BYTES for tens of minutes — indistinguishable
 # from a hang, both to a person and to CI, which has to guess whether to keep waiting.
@@ -186,11 +236,9 @@ only_set=" ${ONLY//,/ } "
 # the summary and the report file carries the verdicts, and both formats are read by
 # harness-verdict-union.sh, so neither may gain a line.
 PROBED_N=0
-for t in tests/*.sh; do
+for t in "${SELECTED[@]:-}"; do
+  [[ -n "$t" ]] || continue
   b=$(basename "$t")
-  # --only takes a LIST so a second environment can re-probe exactly the harnesses
-  # the first one skipped, instead of paying for the whole corpus twice.
-  [[ -n "$ONLY" && "$only_set" != *" $b "* ]] && continue
   PROBED_N=$(( PROBED_N + 1 ))
   printf '  probing %d/%d %s\n' "$PROBED_N" "$CORPUS_N" "$b" >&2
   if (( ! ASSUME_CLEAN )); then
