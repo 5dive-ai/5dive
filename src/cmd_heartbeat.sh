@@ -1161,10 +1161,30 @@ _hb_mark_active_defer() {
   else
     n=1
   fi
+  # DIVE-3503: MERGE, do not replace. This ran every deferred tick and a bare
+  # `= {fp,n}` would drop .escFp — the record of what the last force-nudge was
+  # aimed at — one tick after the escalation wrote it, so the repeat-detection
+  # below could never see a match and the honest-escalation path would be dead
+  # code that always read "fresh episode".
   reg=$(echo "$reg" | jq --arg n "$name" --arg fp "$fp" --argjson c "$n" '
-    .agents[$n].heartbeat.activeDefer = {fp:$fp, n:$c}')
+    .agents[$n].heartbeat.activeDefer = ((.agents[$n].heartbeat.activeDefer // {}) + {fp:$fp, n:$c})')
   echo "$reg" | registry_write
   printf '%s' "$n"
+}
+
+# DIVE-3503 — record the pane fingerprint an active-defer escalation FIRED ON.
+# Survives _hb_clear_active_defer's counter reset on purpose: the counter is the
+# episode's nudge budget, this is the evidence of what the last remedy was aimed
+# at. Equality on the next escalation means the seat never completed a turn in
+# between, which is the only available proof that the typed nudge did not land.
+# Must run under with_registry_lock, like its siblings.
+_hb_mark_escalation_fp() {
+  local name="$1" fp="$2"
+  [[ -n "$fp" ]] || return 0
+  local reg; reg=$(registry_read)
+  reg=$(echo "$reg" | jq --arg n "$name" --arg fp "$fp" '
+    .agents[$n].heartbeat.activeDefer = ((.agents[$n].heartbeat.activeDefer // {}) + {escFp:$fp})')
+  echo "$reg" | registry_write
 }
 
 # DIVE-1486 — clear an agent's active-defer counter once it's no longer being
@@ -4641,8 +4661,43 @@ cmd_heartbeat_tick() {
       defer_fp=$(_hb_pane_fingerprint "$name")
       defer_n=$(with_registry_lock _hb_mark_active_defer "$name" "$defer_fp")
       if [[ "${defer_n:-0}" =~ ^[0-9]+$ ]] && (( defer_n >= _HB_ACTIVE_DEFER_ESCALATE )); then
+        # DIVE-3503 — MAKE THE ESCALATION HONEST. The force-nudge below types a
+        # line into the pane, which a runtime blocked on a child that never exits
+        # cannot consume; the clear then wiped the counter, so the log read
+        # `#1 → #2 → escalation → #1 → #2 → escalation` for eleven hours on dev2
+        # and every episode looked HANDLED. 176 escalations all-time, and the
+        # counter can never reach a number anyone would alarm on.
+        #
+        # So: remember the pane fingerprint we escalated ON. If we escalate again
+        # with that SAME fingerprint, the seat has not completed a turn since —
+        # the typed nudge is PROVEN useless on this seat, in this state, and
+        # repeating it is the thing that hid the stall. Reach for a real lever
+        # (reap the blocking child, by PID, src/lib/reap.sh) and say so loudly.
+        # NOT a higher threshold: the counter was never too low, it was zeroed by
+        # a remedy that did nothing.
+        local prev_esc_fp
+        prev_esc_fp=$(registry_read | jq -r --arg n "$name" '.agents[$n].heartbeat.activeDefer.escFp // ""' 2>/dev/null)
+        if [[ -n "$defer_fp" && "$defer_fp" == "$prev_esc_fp" ]]; then
+          local reaped=0
+          if declare -F _reap_stale_shells >/dev/null 2>&1; then
+            reaped=$(_reap_stale_shells "$name" --reason="active-defer escalation repeated on an unchanged pane" || echo 0)
+          fi
+          _hb_log "[$name] active-defer escalation REPEATED on an unchanged pane — the typed nudge did not land last time, so it will not land now (DIVE-3503). Reaped ${reaped:-0} stale agent shell(s) by PID; escalating."
+          if [[ "${reaped:-0}" =~ ^[0-9]+$ ]] && (( reaped == 0 )); then
+            # Nothing reapable and still not advancing: this is past what the
+            # heartbeat can fix by itself. Surface it rather than resetting.
+            ( cmd_send "main" --from="task-engine" \
+                --message="🟠 Seat '${name}' has been stranded across ${defer_n} deferred heartbeat ticks with an UNCHANGED pane, through a repeat force-nudge, and has no reapable stale shell — the nudge is proven not to land and the seat cannot take ${task_ident}. Needs a look (DIVE-3503/DIVE-1486)." ) >/dev/null 2>&1 || true
+          fi
+        fi
         _hb_log "[$name] active-defer escalation — pane unchanged ${defer_n} ticks (>=${_HB_ACTIVE_DEFER_ESCALATE}) with ${task_ident} todo waiting → idle-stranded, force-nudging (DIVE-1486)"
+        # Clear the COUNTER (the episode's nudge budget) but keep the fingerprint
+        # we escalated on, so the next escalation can tell "same wedged pane" from
+        # "a fresh episode". _hb_mark_active_defer rewrites .fp on every tick and
+        # leaves .escFp alone; _hb_clear_active_defer drops both once the seat
+        # actually wakes, which is the only event that proves the pane moved.
         with_registry_lock _hb_clear_active_defer "$name" >/dev/null 2>&1 || true
+        with_registry_lock _hb_mark_escalation_fp "$name" "$defer_fp" >/dev/null 2>&1 || true
         # deliberately no `continue` — fall through to the wake below.
       else
         sk_active=$((sk_active + 1)); _hb_log "[$name] active (mid-turn/conversation) — defer nudge this tick (active-defer #${defer_n})"; continue

@@ -74,6 +74,7 @@ cat \
   src/lib/broker.sh \
   src/lib/disk.sh \
   src/lib/audit.sh \
+  src/lib/reap.sh \
   src/lib/registry.sh \
   src/lib/agent_env.sh \
   src/lib/tasks_db.sh \

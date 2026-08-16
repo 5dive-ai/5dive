@@ -477,6 +477,11 @@ _task_route_to_verifier() {
   # verifier rail exists to prevent, asserted by our own evidence base.
   ledger_emit task.delivered ident="$ident" task_id="$id" actor="$(task_actor "")" \
     out="${result:-}" detail="delivered to verifier ${vfier} (iteration ${iter}${iter_note}; awaiting ACK)"
+  # DIVE-3503 — `task deliver` is a terminal boundary for the MAKER even though
+  # the row stays open, so it reaps like done/cancel. Same predicate, same
+  # protections; see src/lib/reap.sh.
+  declare -F _reap_at_task_boundary >/dev/null 2>&1 && _reap_at_task_boundary "deliver" "$ident" || true
+
   ok "$ident ready for review — delivered to verifier '$vfier' (iteration ${iter}${iter_note}; awaiting ACK)" \
      '{id:($i|tonumber), ident:$id, status:"todo", routedTo:$v, role:"verifier", handoff:"delivered", acknowledged:false, iteration:($n|tonumber)}' \
      --arg i "$id" --arg id "$ident" --arg v "$vfier" --arg n "$iter"
