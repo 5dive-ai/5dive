@@ -1402,15 +1402,44 @@ _TASKS_ADDITIVE_COLUMNS=(
 #                              forged in prose.
 #   graded_by <> maker_agent - a self-verified close does not buy the exemption.
 #   delivery_ref             - a verdict with nothing to merge is not awaiting a merge.
+#   handoff_rejected_at      - DIVE-3428, below. A grade is not a LATCH.
 # status stays OPEN: terminal for the VERIFIER, non-terminal for the ROW.
 # NOT `readonly`: several harnesses and code paths source this lib twice, and a
 # readonly re-assignment errors on the second source — measured, it broke 8 arms of
 # tests/gate_route_delivery_unit.sh with a stderr line and nothing else. Every other
 # constant in this file (incl. _TASKS_SCHEMA_EPOCH) is a plain assignment for the
 # same reason; match the file.
+# DIVE-3428 — A GRADE IS NOT A LATCH, and until this conjunct existed the predicate
+# treated it as one: it asked "has a grade ever been recorded?" and never "is the
+# latest verdict still a pass?". Measured on DIVE-3315 — graded_at 2026-08-12 (quinn,
+# PASS), handoff_rejected_at 2026-08-16 (codex, FAIL) — the reject FOUR DAYS newer,
+# and both board branches still rendered `graded->merge:olivia`.
+#
+# NOT COSMETIC: the label is consumed as an INSTRUCTION. `_hb_loop_terminal_clause`
+# formats the same predicate into the /goal wrapper as "TERMINAL FOR THIS GOAL ...
+# Treat the goal as MET and stop", so a row with a live verifier FAIL and real
+# outstanding maker work told an agent to stop, and named the outstanding act as a
+# MERGE of a PR that must not be merged in its graded state.
+#
+# `<` AND NOT `<=`, WHICH THE ROW ASKED FOR — the tie is reachable and it is not a
+# rounding detail. graded_at is stamped by the `verify` else-branch, which is
+# `rc != 0 || no_done`, so a FAIL verify stamps it; a verifier who runs `task verify`
+# then `task reject` lands both stamps in the SAME second at datetime()'s one-second
+# resolution (the tie DIVE-2624 measured on this very column pair and solved with a
+# token instead of a clock). `<=` would hand that tie to the GRADE and reprint the
+# exact label this row exists to remove. The tie goes to the REJECT because the two
+# errors are not symmetric: a false `graded->merge` tells an agent to STOP on live
+# work, while a false plain status merely makes someone open the row.
+#
+# The OLDER-reject arm is still a real state and still renders graded->merge:
+# graded_at is COALESCE'd (first grade wins), so a reject that predates the
+# first-ever grade is a verifier who bounced and then graded a pass without a
+# re-delivery. handoff_rejected_at is a TOKEN spent (NULLed) by the next delivery,
+# so a live one means the maker has not answered the bounce yet.
 _TASKS_TFV_SQL="graded_at IS NOT NULL
        AND delivery_ref IS NOT NULL AND TRIM(delivery_ref) <> ''
        AND (maker_agent IS NULL OR graded_by IS NULL OR graded_by <> maker_agent)
+       AND (handoff_rejected_at IS NULL OR handoff_rejected_at < graded_at)
        AND status NOT IN ('done','cancelled')"
 
 _TASKS_DB_GATE_COLUMNS=''

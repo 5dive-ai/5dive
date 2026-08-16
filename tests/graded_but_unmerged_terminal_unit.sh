@@ -200,6 +200,116 @@ N3=$(mkrow self_graded)
 _task_terminal_for_verifier "$N3" && bad_t "D3: a SELF-GRADED row must NOT qualify" "maker bought its own exemption" || ok_t "D3: self-graded (graded_by == maker) does not qualify"
 nudged "$N3" && ok_t "D3: and it still nudges" || bad_t "D3: still nudges"
 
+echo "── (e) DIVE-3428: a grade is NOT a latch — a live reject that post-dates it wins ──"
+# Measured on DIVE-3315: graded_at 2026-08-12 (quinn, PASS), handoff_rejected_at
+# 2026-08-16 (codex, FAIL). The reject four days newer, the board still painting
+# `graded->merge:olivia`, and the /goal wrapper reading that render back as "TERMINAL
+# FOR THIS GOAL ... Treat the goal as MET and stop".
+#
+# EVERY FIXTURE HERE IS BUILT BY THE REAL `task reject` VERB and only its CLOCK
+# RELATION is then arranged. A raw-UPDATE fixture would prove the SQL agrees with
+# itself while saying nothing about the state the product actually reaches — and the
+# whole defect is that a real reject reaches a state the predicate cannot see.
+mkreject() { # <how graded_at relates to the reject> -> id
+  local rel="$1" id; id=$(mkrow graded_and_bound)
+  [[ "$id" =~ ^[0-9]+$ ]] || { printf '0'; return; }
+  ( cmd_task_reject "$id" --feedback="the diff does not do what the result claims" ) >/dev/null 2>&1
+  case "$rel" in
+    newer) db "UPDATE tasks SET graded_at=datetime(handoff_rejected_at,'-4 days') WHERE id=${id};" ;;
+    tie)   db "UPDATE tasks SET graded_at=handoff_rejected_at WHERE id=${id};" ;;
+    older) db "UPDATE tasks SET graded_at=datetime(handoff_rejected_at,'+1 minute') WHERE id=${id};" ;;
+  esac
+  printf '%s' "$id"
+}
+# E0/PRECONDITION. Three separate ways this section could go vacuously green: the
+# verb refuses (no row state changes), the verb stops stamping the column, or a
+# re-delivery spends the token before the assertion reads it. Assert the cause is
+# present and in the real-world DIRECTION before grading any absence.
+R0=$(mkrow graded_and_bound)
+( cmd_task_reject "$R0" --feedback="bounced" ) >/dev/null 2>&1
+[[ -n "$(db "SELECT COALESCE(handoff_rejected_at,'') FROM tasks WHERE id=${R0};")" ]] \
+  && ok_t "E0/PRECONDITION: the real \`task reject\` verb stamps handoff_rejected_at" \
+  || bad_t "E0/PRECONDITION: reject stamped the column" "every arm below would be vacuous"
+[[ "$(db "SELECT handoff_rejected_at >= graded_at FROM tasks WHERE id=${R0};")" == "1" ]] \
+  && ok_t "E0: and unarranged it lands at-or-after the grade — the older arm is the rare one, not the norm" \
+  || bad_t "E0: reject lands at-or-after the grade" "got grade=$(db "SELECT graded_at FROM tasks WHERE id=${R0};") reject=$(db "SELECT handoff_rejected_at FROM tasks WHERE id=${R0};")"
+
+R1=$(mkreject newer)
+# MUTATION CONTROL, and it is the load-bearing half: prove the row is separated by
+# the NEW conjunct and not by something the reject also changed (it moves status,
+# assignee and result too). The pre-DIVE-3428 predicate, evaluated verbatim against
+# the same fixture, must still say TRUE — otherwise the arms below pass for a reason
+# that has nothing to do with this diff.
+_TFV_PRE_3428="graded_at IS NOT NULL
+       AND delivery_ref IS NOT NULL AND TRIM(delivery_ref) <> ''
+       AND (maker_agent IS NULL OR graded_by IS NULL OR graded_by <> maker_agent)
+       AND status NOT IN ('done','cancelled')"
+[[ "$(db "SELECT CASE WHEN ${_TFV_PRE_3428} THEN 1 ELSE 0 END FROM tasks WHERE id=${R1};")" == "1" ]] \
+  && ok_t "E1/MUTATION CONTROL: the pre-DIVE-3428 predicate says TRUE here — this fixture is the bug" \
+  || bad_t "E1/MUTATION CONTROL: old predicate TRUE" "the absence arms below would not be grading this conjunct"
+_task_terminal_for_verifier "$R1" \
+  && bad_t "E1: a reject NEWER than the grade must NOT qualify" "predicate still true — a grade is being latched" \
+  || ok_t "E1: a reject NEWER than the grade drops the row out of the predicate"
+# THE WRAPPER ARM TAKES $MAKER, NOT $ME, AND THAT IS NOT A DETAIL. The clause opens
+# with `WHERE ... assignee=<name>` and a reject moves assignee to the MAKER, so asking
+# it as the verifier returns early on the row query and the arm passes without ever
+# reaching the predicate — measured: with $ME it stayed green under the mutant that
+# deleted the conjunct outright. The maker is also the seat the DIVE-3315 wrapper was
+# actually handed to. Its discrimination control is E2 below: same actor, same shape,
+# only the clock relation differs.
+[[ "$(db "SELECT assignee FROM tasks WHERE id=${R1};")" == "$MAKER" ]] \
+  && ok_t "E1/PRECONDITION: the reject moved the row to $MAKER, so the wrapper arm asks as the seat that holds it" \
+  || bad_t "E1/PRECONDITION: assignee is $MAKER" "the clause would return early and the next arm would be vacuous"
+grep -q "GRADED AND WAITING" <<<"$(_hb_loop_terminal_clause "$MAKER" "$R1" "DIVE-$R1")" \
+  && bad_t "E1: and the /goal wrapper must not call it TERMINAL" "the DIVE-3315 instruction, reprinted" \
+  || ok_t "E1: and the /goal wrapper no longer tells the agent to stop"
+# BOTH board branches, because DIVE-3098 fixed two of them and this omission
+# propagated to both: --all is where a reader who went looking for detail lands.
+for view in --all ''; do
+  r=$( ( JSON_MODE=0; cmd_task_ls ${view:+$view} ) 2>/dev/null | grep -E "\bDIVE-${R1}\b|row-graded_and_bound" | grep -E "\bDIVE-${R1}\b" | head -1 )
+  if [[ -z "$r" ]]; then
+    bad_t "E1: the rejected row is absent from \`task ls ${view:-(compact)}\`" "cannot grade a render that did not print"
+  elif grep -q "graded->merge:" <<<"$r"; then
+    bad_t "E1: \`task ls ${view:-(compact)}\` still renders graded->merge" "got: $(sed 's/^ *//' <<<"$r")"
+  else
+    ok_t "E1: \`task ls ${view:-(compact)}\` renders its plain status, not graded->merge"
+  fi
+done
+
+# E2/POSITIVE CONTROL — the other arm, and it is what makes E1 a discrimination
+# rather than a blanket suppression. graded_at is COALESCE'd (first grade wins), so a
+# reject that PREDATES the first-ever grade is a verifier who bounced and then graded
+# a pass without a re-delivery. That row is still waiting on a merge.
+R2=$(mkreject older)
+_task_terminal_for_verifier "$R2" \
+  && ok_t "E2/POSITIVE CONTROL: a reject OLDER than the grade still qualifies — not a blanket suppression" \
+  || bad_t "E2/POSITIVE CONTROL: older reject still qualifies" "the fix over-fires and hides genuine merge-waiting rows"
+render2=$( ( JSON_MODE=0; cmd_task_ls --all ) 2>/dev/null | grep -E "\bDIVE-${R2}\b" | head -1 )
+grep -q "graded->merge:${MAKER}" <<<"$render2" \
+  && ok_t "E2: and it still renders graded->merge:${MAKER}" \
+  || bad_t "E2: older reject still renders graded->merge" "got: $(sed 's/^ *//' <<<"$render2")"
+# The wrapper's discrimination control: SAME actor and SAME post-reject row shape as
+# E1, differing only in which clock is newer. Without this, E1's wrapper arm could be
+# green because the clause never speaks to a maker at all.
+grep -q "GRADED AND WAITING" <<<"$(_hb_loop_terminal_clause "$MAKER" "$R2" "DIVE-$R2")" \
+  && ok_t "E2/CONTROL: and the wrapper DOES still say TERMINAL here — E1's silence is the clock, not the seat" \
+  || bad_t "E2/CONTROL: wrapper terminal on the older-reject row" "E1's wrapper arm cannot distinguish anything"
+
+# E3/THE TIE, which is why this conjunct is `<` and not the `<=` the row proposed.
+# graded_at is stamped by verify's else-branch (`rc != 0 || no_done`), so a FAIL
+# verify stamps it; a verifier who runs `task verify` then `task reject` lands both
+# in the same second at datetime()'s one-second resolution — the same tie DIVE-2624
+# measured on this exact column pair. `<=` hands that tie to the grade and reprints
+# the label. The tie goes to the reject because the errors are not symmetric: a false
+# graded->merge stops an agent on live work, a false plain status costs one read.
+R3=$(mkreject tie)
+[[ "$(db "SELECT handoff_rejected_at = graded_at FROM tasks WHERE id=${R3};")" == "1" ]] \
+  && ok_t "E3/PRECONDITION: the tie fixture really has both stamps in the same second" \
+  || bad_t "E3/PRECONDITION: timestamps equal" "this arm is not testing the tie"
+_task_terminal_for_verifier "$R3" \
+  && bad_t "E3: a same-second reject must NOT qualify" "the tie went to the grade — this is the \`<=\` bug" \
+  || ok_t "E3: a same-second reject drops the row out too (the tie goes to the reject)"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" -eq 0 ]]
