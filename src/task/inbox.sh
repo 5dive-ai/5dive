@@ -64,6 +64,91 @@ _task_human_gate_pred() {
               AND COALESCE(needs_capability,'') = '' )"
 }
 
+# ── DIVE-3474 arm 2 — the ROUTED-GATE QUEUE ──────────────────────────────────
+#
+# The counterpart of the human `inbox`, and it exists because arm 2 stops the
+# file-time a2a ping: a gate the reviewer is never pinged about has to be
+# FINDABLE, or the change trades an interrupt for a lost decision. This is the
+# surface a routed reviewer reads on its next natural wake.
+#
+# ONE PREDICATE, called — never pasted (the rule the human predicate above states
+# and `tests/task_needs_human_parity_unit.sh` enforces). And it is the VERDICT
+# surface: a consumer asks "what may I clear" and gets rows, rather than being
+# handed `routed_reviewer` and left to rebuild the rule — the second copy that
+# drifted the morning DIVE-3228 landed.
+#
+# The rows carry every field the decision needs — ask, options, recommend, filer,
+# age, urgency and the exact answer command — for the same reason: a view that
+# withholds one field makes its consumer go and re-derive the whole thing, and
+# whatever it re-derives is the copy that goes stale.
+_task_agent_gate_pred() { # <agent>
+  printf '%s' "$(_task_gate_open_pred)
+    AND COALESCE(routed_reviewer,'') = $(sqlq "${1:-}")
+    AND CAST(COALESCE(NULLIF(tier,''),'2') AS INTEGER) < 2"
+}
+
+cmd_task_queue() {
+  tasks_db_init
+  local who="" json=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --for=*) who="${1#*=}" ;;
+      --json)  json=1; JSON_MODE=1 ;;
+      -h|--help)
+        printf 'usage: 5dive task queue [--for=<agent>] [--json]\n\n  Gates ROUTED TO YOU and still unanswered — filed without waking your\n  window (DIVE-3474). Answer one with: 5dive task answer <ident> --value="<choice>"\n'
+        return 0 ;;
+      -*) fail "$E_USAGE" "unknown flag: $1" ;;
+      *)  fail "$E_USAGE" "unexpected arg: $1 (task queue takes no positional args)" ;;
+    esac
+    shift
+  done
+  if [[ -z "$who" ]]; then task_actor_claim ""; who="$ACTOR_BOARD"; fi
+  local pred; pred=$(_task_agent_gate_pred "$who")
+
+  if (( json )); then
+    local rows
+    rows=$(db "SELECT ident||x'1f'||COALESCE(need_type,'')||x'1f'||COALESCE(tier,'')||x'1f'||COALESCE(gate_filed_by,created_by,'')||x'1f'||COALESCE(gate_urgent,0)||x'1f'||CAST((julianday('now')-julianday(COALESCE(need_asked_at,updated_at,created_at)))*24 AS INT)||x'1f'||COALESCE(need_options,'')||x'1f'||COALESCE(recommend,'')||x'1f'||replace(COALESCE(ask,''),x'0a',' ')
+               FROM tasks WHERE ${pred} ORDER BY COALESCE(gate_urgent,0) DESC, COALESCE(need_asked_at,updated_at,created_at);" 2>/dev/null || printf '')
+    local out="[]" line
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      local id ty ti fb ur ag op rc ak rest
+      id="${line%%$'\x1f'*}"; rest="${line#*$'\x1f'}"
+      ty="${rest%%$'\x1f'*}"; rest="${rest#*$'\x1f'}"
+      ti="${rest%%$'\x1f'*}"; rest="${rest#*$'\x1f'}"
+      fb="${rest%%$'\x1f'*}"; rest="${rest#*$'\x1f'}"
+      ur="${rest%%$'\x1f'*}"; rest="${rest#*$'\x1f'}"
+      ag="${rest%%$'\x1f'*}"; rest="${rest#*$'\x1f'}"
+      op="${rest%%$'\x1f'*}"; rest="${rest#*$'\x1f'}"
+      rc="${rest%%$'\x1f'*}"; ak="${rest#*$'\x1f'}"
+      out=$(jq -cn --argjson a "$out" --arg id "$id" --arg ty "$ty" --arg ti "$ti" --arg fb "$fb" \
+        --arg ur "$ur" --arg ag "$ag" --arg op "$op" --arg rc "$rc" --arg ak "$ak" \
+        '$a + [{ident:$id, need_type:$ty, tier:(($ti|select(length>0)|tonumber?) // null), filed_by:$fb,
+                urgent:($ur=="1"), age_hours:(($ag|tonumber?) // 0),
+                options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null),
+                ask:$ak, answer_cmd:("5dive task answer "+$id+" --value=<choice>")}]' 2>/dev/null) || out="$out"
+    done <<<"$rows"
+    printf '%s\n' "$(jq -cn --argjson q "$out" --arg w "$who" '{ok:true, data:{reviewer:$w, count:($q|length), gates:$q}}' 2>/dev/null)"
+    return 0
+  fi
+
+  local n; n=$(db "SELECT COUNT(*) FROM tasks WHERE ${pred};" 2>/dev/null || printf '0')
+  if [[ "${n:-0}" == "0" ]]; then
+    printf '%s: no gates routed to you are waiting.\n' "$who"
+    return 0
+  fi
+  printf '%s gate(s) routed to %s and unanswered — filed WITHOUT waking your window (DIVE-3474):\n\n' "$n" "$who"
+  db "SELECT '  ['||ident||'] '||need_type||CASE WHEN COALESCE(gate_urgent,0)=1 THEN ' URGENT' ELSE '' END
+             ||'  (from '||COALESCE(gate_filed_by,created_by,'?')||', '
+             ||CAST((julianday('now')-julianday(COALESCE(need_asked_at,updated_at,created_at)))*24 AS INT)||'h ago)'||x'0a'
+             ||'    ask:       '||replace(COALESCE(ask,''),x'0a',' ')||x'0a'
+             ||CASE WHEN COALESCE(need_options,'')!='' THEN '    options:   '||need_options||x'0a' ELSE '' END
+             ||CASE WHEN COALESCE(recommend,'')!='' THEN '    recommends: '||recommend||x'0a' ELSE '' END
+             ||'    answer:    5dive task answer '||ident||' --value=\"<choice>\"'||x'0a'
+        FROM tasks WHERE ${pred} ORDER BY COALESCE(gate_urgent,0) DESC, COALESCE(need_asked_at,updated_at,created_at);" 2>/dev/null || true
+  return 0
+}
+
 cmd_task_inbox() {
   tasks_db_init
   local send=0 channel_proof=""

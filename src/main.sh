@@ -534,6 +534,17 @@ main() {
       # token is read root-side in _gh_do and never lands in argv.
       AUDIT_CMD="gh"; AUDIT_ARGS=("$@")
       cmd_gh "$@" ;;
+    _merge_do)
+      # DIVE-3474 arm 1: hidden, privileged. Reachable ONLY via NOPASSWD sudo (the
+      # UNCONDITIONAL render_standard_sudoers line — it confers no authority of its
+      # own, exactly like _task_answer). Reads ONE task ident on STDIN and nothing
+      # else, re-derives the caller from SUDO_UID and its merge standing from the
+      # ROW as root (graded_by = this seat, over the shared graded-awaiting-merge
+      # predicate), and merges the pull request the ROW names — never one the
+      # caller does. Not audited here; the parent `task merge` verb is, and the
+      # primitive writes its own store-audit row naming the grader.
+      cmd_task_merge_do
+      exit $? ;;
     _gh_do)
       # DIVE-2448: hidden, privileged. Reachable ONLY via NOPASSWD sudo. Reads the
       # gh argv NUL-separated on STDIN (never argv, so the grant stays exact-path

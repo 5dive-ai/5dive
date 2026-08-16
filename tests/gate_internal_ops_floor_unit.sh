@@ -66,6 +66,17 @@ ROUTE_FILE="$TMP/route.log"; : >"$ROUTE_FILE"
 export -f 5dive 2>/dev/null || true
 route_reset() { HUMAN_PINGED=0; : >"$ROUTE_FILE"; }
 route_to()    { local i; for i in $(seq 1 12); do [[ -s "$ROUTE_FILE" ]] && break; sleep 0.05; done; tail -n1 "$ROUTE_FILE" 2>/dev/null; }
+# DIVE-3474 changed HOW a routed gate reaches the lead, not WHETHER it does: a
+# non-urgent routed gate is QUEUED (no `agent send`, no window re-send) and the
+# lead meets it on its next natural wake. The arm(s) below assert the gate reached
+# a NAMED seat, and that property is unchanged — so the check gains the queue as a
+# second way of being reached rather than being relaxed. It calls the REAL queue
+# predicate (`_task_agent_gate_pred`, the one `5dive task queue` and the heartbeat
+# nudge both use), so a row queued where nobody looks still fails here.
+queued_for() { # <ident> <agent> -> 1 if `5dive task queue --for=<agent>` would list it
+  local n; n=$(db "SELECT COUNT(*) FROM tasks WHERE ident='$1' AND $(_task_agent_gate_pred "$2");" 2>/dev/null)
+  [[ "${n:-0}" != "0" ]] && echo 1 || echo 0
+}
 
 # Org chart: main is the lone coordinator; dev reports to main (so reviewer(dev)=main).
 db "INSERT INTO agents_org(name,reports_to,role) VALUES('main',NULL,'coordinator');"
@@ -83,7 +94,7 @@ actor_seam_as dev; cmd_task_need DIVE-301 --type=decision --from=dev \
 [[ "$(tierof DIVE-301)" == "1" ]] && ok_t "repro: board-wipe decision downgraded to tier 1 (not hard-human)" || bad_t "repro tier 1" "got '$(tierof DIVE-301)'"
 [[ "$(routedof DIVE-301)" == "main" ]] && ok_t "repro: routed_reviewer=main (the lead's call)" || bad_t "repro routed main" "got '$(routedof DIVE-301)'"
 [[ "$HUMAN_PINGED" == "0" ]] && ok_t "repro: paired human NOT pinged" || bad_t "repro no human ping" "HUMAN_PINGED=$HUMAN_PINGED"
-[[ "$(route_to)" == "main" ]] && ok_t "repro: lead-route send went to main" || bad_t "repro route to main" "got '$(route_to)'"
+[[ "$(route_to)" == "main" || "$(queued_for DIVE-301 main)" == "1" ]] && ok_t "repro: the gate reached main — sent, or queued for its next wake" || bad_t "repro reached main" "route_to='$(route_to)' queued=$(queued_for DIVE-301 main)"
 
 # --- 2: SAFETY — a genuine prod-destructive ask (no internal-ops vocab) stays hard-human
 route_reset; seed DIVE-302

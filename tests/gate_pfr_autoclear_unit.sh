@@ -93,6 +93,18 @@ seed() {
       VALUES('$1','ship the a2a wake change','todo','main','dev2',$(sqlq "${2-}"));"
 }
 PFR_ASK='approve the delegated push of branch dive-3474-a2a-wake to origin for PR review'
+# DIVE-3474 changed what "delivered" MEANS for a routed gate. Before it, delivery
+# was an `agent send` at filing time; after it, a routed non-urgent gate is QUEUED
+# and the reviewer meets it on its next natural wake. The two arms below assert
+# "the gate still reaches someone", and that intent is unchanged — so the predicate
+# gains the queue as a third way of being reached, rather than being relaxed. It is
+# the REAL queue predicate (`_task_agent_gate_pred`, the one `5dive task queue` and
+# the heartbeat nudge both call), not a re-typed WHERE clause, so an arm that queued
+# the row somewhere nobody looks still fails here.
+queued_for() { # <ident> <agent> -> 1 if `5dive task queue --for=<agent>` would list it
+  local n; n=$(db "SELECT COUNT(*) FROM tasks WHERE ident='$1' AND $(_task_agent_gate_pred "$2");" 2>/dev/null)
+  [[ "${n:-0}" != "0" ]] && echo 1 || echo 0
+}
 gby()    { db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident='$1';"; }
 gans()   { db "SELECT COALESCE(need_answer,'')      FROM tasks WHERE ident='$1';"; }
 gsig()   { db "SELECT COALESCE(need_answer_sig,'')  FROM tasks WHERE ident='$1';"; }
@@ -257,9 +269,9 @@ SIGN_OK=1
 [[ "$(gstat DIVE-912)" == "blocked" ]] \
   && ok_t "…the row stays BLOCKED, so nothing reads as authorised" \
   || bad_t "unsignable row stays blocked" "got=$(gstat DIVE-912)"
-[[ "$(route_sent)" != "0" || "$HUMAN_PINGED" == "1" ]] \
-  && ok_t "…and the gate is still DELIVERED to someone (today's behaviour, unchanged)" \
-  || bad_t "unsignable gate still routes" "route_sent=$(route_sent) human=$HUMAN_PINGED"
+[[ "$(route_sent)" != "0" || "$HUMAN_PINGED" == "1" || "$(queued_for DIVE-912 main)" == "1" ]] \
+  && ok_t "…and the gate is still DELIVERED to someone — sent, human-pinged, or QUEUED (DIVE-3474)" \
+  || bad_t "unsignable gate still routes" "route_sent=$(route_sent) human=$HUMAN_PINGED queued=$(queued_for DIVE-912 main)"
 
 # ============================ 5. THE KILL SWITCH =================================
 _task_pref_set pfr_autoclear off
@@ -268,9 +280,9 @@ route_reset; seed DIVE-913 'Branch: dive-3474-a2a-wake'; fixture_actor dev2
 [[ -z "$(gby DIVE-913)" ]] \
   && ok_t "pref pfr_autoclear=off restores the gate (no auto-clear)" \
   || bad_t "pref off restores the gate" "got=$(gby DIVE-913)"
-[[ "$(route_sent)" != "0" || "$HUMAN_PINGED" == "1" ]] \
-  && ok_t "…and with the pref off the gate is delivered exactly as before" \
-  || bad_t "pref off still delivers" "route_sent=$(route_sent) human=$HUMAN_PINGED"
+[[ "$(route_sent)" != "0" || "$HUMAN_PINGED" == "1" || "$(queued_for DIVE-913 main)" == "1" ]] \
+  && ok_t "…and with the pref off the gate is still delivered — now via the queue (DIVE-3474)" \
+  || bad_t "pref off still delivers" "route_sent=$(route_sent) human=$HUMAN_PINGED queued=$(queued_for DIVE-913 main)"
 _task_pref_set pfr_autoclear on
 route_reset; seed DIVE-914 'Branch: dive-3474-a2a-wake'; fixture_actor dev2
 ( cmd_task_need DIVE-914 --type=approval --recommend='approve' --ask="$PFR_ASK" --from=dev2 ) >/dev/null 2>&1

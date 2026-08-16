@@ -145,8 +145,14 @@ RC_C=$?
 [[ "$(reviewer_of DIVE-9001)" == "olivia" ]] \
   && ok_t "CONTROL (no --needs): gate routes to the verifier olivia — the pre-existing behaviour is live here" \
   || bad_t "control routes to verifier" "routed_reviewer='$(reviewer_of DIVE-9001)' rc=$RC_C out=$OUT_C err=$(cat "$TMP/e_c")"
-grep -q '^olivia$' "$ROUTE_FILE" && ok_t "CONTROL: olivia was actually SENT the handoff" \
-  || bad_t "control sends to olivia" "route: $(cat "$ROUTE_FILE")"
+# DIVE-3474 arm 2: the routed handoff no longer WAKES olivia — it lands in her
+# queue. The fact this control exists to pin is unchanged (the gate reached the
+# agent rail and not the human), so it is graded on the rail that now carries it.
+[[ ! -s "$ROUTE_FILE" ]] && ok_t "CONTROL: olivia's window was NOT woken (DIVE-3474: routed gates queue)" \
+  || bad_t "control does not wake olivia" "route: $(cat "$ROUTE_FILE")"
+grep -q 'DIVE-9001' <<<"$(cmd_task_queue --for=olivia --json 2>/dev/null)" \
+  && ok_t "CONTROL: olivia was actually HANDED the gate — it is in her queue" \
+  || bad_t "control queues to olivia" "queue: $(cmd_task_queue --for=olivia --json 2>/dev/null)"
 grep -q 'routed to olivia for verifier review' <<<"$OUT_C" \
   && ok_t "CONTROL: the ok line says routed to olivia for verifier review — the human was not addressed" \
   || bad_t "control ok line names the verifier" "out: $OUT_C"

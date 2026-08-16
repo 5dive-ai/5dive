@@ -253,6 +253,17 @@ out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
 # touching the literal: a clean clone at origin/main a95bce2 scored 56/0 on this
 # harness while this branch scored 55/1 with got==want, so the count was the only
 # thing failing and the one column is the whole delta.
+#
+# 91 -> 92 (DIVE-3474, merge of origin/main b898240 into dive-3474-a2a-wake):
+# +gate_urgent. THIS IS THE COLLISION THE PARAGRAPHS ABOVE PREDICT, and it is the
+# first time it has been caught by something other than this literal. Both sides
+# independently moved the SAME literal 90 -> 91 — DIVE-3483 for stranded_pinged_at
+# on main, DIVE-3474 for gate_urgent on the branch — and each control run was
+# correct against its own base. The merged tree has BOTH columns, so 91 is wrong on
+# it while looking exactly like a number that was already justified. The value below
+# was READ off the merged tree the way this file instructs (patch `bad` to print its
+# detail, run, read `count=`, revert): count=92. Do not derive it by adding one.
+
 fresh_tree
 out=$(tasks_db_init 2>&1); rc=$?
 required='delivered_at delivery_ref delivery_ref_iteration escalated_at escalated_by human_evidence park_reason parked_at'
@@ -261,8 +272,8 @@ actual=$(sqlite3 "$TASKS_DB" \
     WHERE name IN ('delivery_ref','delivered_at','delivery_ref_iteration','parked_at','park_reason','escalated_at','escalated_by','human_evidence')
     ORDER BY name;" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
 column_count=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM pragma_table_info('tasks');" 2>/dev/null)
-[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "91" ]] \
-  && ok "fresh schema: all 91 columns, including the eight former holes, are present" \
+[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "92" ]] \
+  && ok "fresh schema: all 92 columns, including the eight former holes, are present" \
   || bad "fresh schema: init returned a partial tasks table" "rc=$rc count=$column_count got=[$actual] want=[$required] out=$out"
 
 # --- Case 10 (DIVE-2197): migrate arm still rejects a failed ALTER ------------

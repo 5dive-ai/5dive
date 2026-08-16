@@ -114,6 +114,17 @@ route_reset() { : >"$ROUTE_FILE"; HUMAN_PINGED=0; spy_reset; }
 # the process, not on a sleep that passes by timing out.
 route_sent()  { local n; n=$(grep -c . "$ROUTE_FILE" 2>/dev/null); echo "${n:-0}"; }
 route_last()  { tail -n1 "$ROUTE_FILE" 2>/dev/null; }
+# DIVE-3474 changed HOW a routed gate reaches the lead, not WHETHER it does: a
+# non-urgent routed gate is QUEUED (no `agent send`, no window re-send) and the
+# lead meets it on its next natural wake. The arm(s) below assert the gate reached
+# a NAMED seat, and that property is unchanged — so the check gains the queue as a
+# second way of being reached rather than being relaxed. It calls the REAL queue
+# predicate (`_task_agent_gate_pred`, the one `5dive task queue` and the heartbeat
+# nudge both use), so a row queued where nobody looks still fails here.
+queued_for() { # <ident> <agent> -> 1 if `5dive task queue --for=<agent>` would list it
+  local n; n=$(db "SELECT COUNT(*) FROM tasks WHERE ident='$1' AND $(_task_agent_gate_pred "$2");" 2>/dev/null)
+  [[ "${n:-0}" != "0" ]] && echo 1 || echo 0
+}
 rr_of()       { db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='$1';"; }
 rp_of()       { db "SELECT COALESCE(route_provenance,'') FROM tasks WHERE ident='$1';"; }
 tier_of()     { db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='$1';"; }
@@ -172,9 +183,9 @@ ENG_ASK='approve delegated push for review of branch dive-3171-root-filer (@abc1
 # and the human is NOT pinged.
 route_reset; seed DIVE-3901; fixture_actor olivia
 cmd_task_need DIVE-3901 --type=approval --ask="$ENG_ASK" --from=olivia >/dev/null 2>&1
-[[ "$(route_last)" == "main" && "$(rr_of DIVE-3901)" == "main" ]] \
+[[ ( "$(route_last)" == "main" || "$(queued_for DIVE-3901 main)" == "1" ) && "$(rr_of DIVE-3901)" == "main" ]] \
   && ok_t "A1 root's tier-1 eng approval routes to the sealed standing lead 'main'" \
-  || bad_t "A1 root's tier-1 eng approval routes to 'main'" "route_last=$(route_last) routed_reviewer=$(rr_of DIVE-3901) tier=$(tier_of DIVE-3901)"
+  || bad_t "A1 root's tier-1 eng approval routes to 'main'" "route_last=$(route_last) queued=$(queued_for DIVE-3901 main) routed_reviewer=$(rr_of DIVE-3901) tier=$(tier_of DIVE-3901)"
 [[ "$HUMAN_PINGED" == "0" ]] \
   && ok_t "A1 the paired human is NOT pinged (the three weeks this ticket is about)" \
   || bad_t "A1 human not pinged" "HUMAN_PINGED=$HUMAN_PINGED"
@@ -250,9 +261,9 @@ anchor_to main
 # here would mean the fallback is evaluating gates it has no business evaluating.
 route_reset; seed DIVE-3908; fixture_actor dev
 cmd_task_need DIVE-3908 --type=approval --ask="$ENG_ASK" --from=dev >/dev/null 2>&1
-[[ "$(route_last)" == "main" && "$(rr_of DIVE-3908)" == "main" && "$HUMAN_PINGED" == "0" ]] \
+[[ ( "$(route_last)" == "main" || "$(queued_for DIVE-3908 main)" == "1" ) && "$(rr_of DIVE-3908)" == "main" && "$HUMAN_PINGED" == "0" ]] \
   && ok_t "A5 a builder's identical gate still routes via the CHART to main" \
-  || bad_t "A5 builder routes via the chart" "route_last=$(route_last) routed_reviewer=$(rr_of DIVE-3908) human=$HUMAN_PINGED"
+  || bad_t "A5 builder routes via the chart" "route_last=$(route_last) queued=$(queued_for DIVE-3908 main) routed_reviewer=$(rr_of DIVE-3908) human=$HUMAN_PINGED"
 [[ "$(spy_n)" == "0" ]] \
   && ok_t "A5 the fallback does not even evaluate a routeable filer's gate" \
   || bad_t "A5 fallback stays out of the routeable path" "spy=$(spy_last)"
@@ -280,9 +291,9 @@ cmd_task_need DIVE-3909 --type=decision --options='A|B' --recommend='A' --ask="$
 # verifier route and the arm would grade 3117 instead of this.
 route_reset; seed_loop DIVE-3910; fixture_actor olivia
 cmd_task_need DIVE-3910 --type=approval --ask='OK to land the refactor of the task router?' --from=olivia >/dev/null 2>&1
-[[ "$(route_last)" == "quinn" && "$(rr_of DIVE-3910)" == "quinn" ]] \
+[[ ( "$(route_last)" == "quinn" || "$(queued_for DIVE-3910 quinn)" == "1" ) && "$(rr_of DIVE-3910)" == "quinn" ]] \
   && ok_t "A7 a live verifier route still wins over the standing fallback" \
-  || bad_t "A7 verifier route wins" "route_last=$(route_last) routed_reviewer=$(rr_of DIVE-3910)"
+  || bad_t "A7 verifier route wins" "route_last=$(route_last) queued=$(queued_for DIVE-3910 quinn) routed_reviewer=$(rr_of DIVE-3910)"
 [[ "$(spy_n)" == "0" ]] \
   && ok_t "A7 the fallback does not evaluate a verifier-routed gate" \
   || bad_t "A7 fallback stays out of the verifier path" "spy=$(spy_last)"
