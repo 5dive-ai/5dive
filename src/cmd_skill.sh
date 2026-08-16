@@ -122,8 +122,24 @@ cmd_skill_add() {
   install_dir=$(skills_install_dir "$type")
 
   # Determine isolation so we can choose the right install strategy.
-  local isolation
-  isolation=$(grep -oP '(?<=AGENT_ISOLATION=)\S+' "${ENV_DIR}/${name}.env" 2>/dev/null || echo "admin")
+  #
+  # DIVE-2218: the old `|| echo "admin"` spelled a read failure as a real tier.
+  # Every test below is `== "sandboxed"`, so the POLARITY it produced was already
+  # the safe one and is kept: an unmeasured agent takes the non-sandboxed strategy
+  # and the install runs as the agent user. Guessing the other way would run a
+  # freshly-cloned repo's install as ROOT for an agent that may not be sandboxed --
+  # a functional failure is the correct thing to degrade to, an escalation is not.
+  # What changes is that the hole is no longer NAMED like a measurement: the value
+  # stays `unknown:*` so nothing downstream can read it as a tier, the registry
+  # gets a chance to answer first, and the guess is announced instead of silent.
+  local isolation isolation_pair isolation_src
+  isolation_pair="$(agent_isolation_2src "$name")"
+  isolation="${isolation_pair%%$'\t'*}"; isolation_src="${isolation_pair#*$'\t'}"
+  if [[ "$isolation" == unknown:* ]]; then
+    warn "agent '$name': isolation not measured ($isolation_src) — using the non-sandboxed install strategy; if this agent IS sandboxed the install will fail rather than silently run as root"
+  elif [[ "$isolation_src" == env:disagrees-registry:* ]]; then
+    warn "agent '$name': isolation disagrees across sources ($isolation_src) — using the env file's value"
+  fi
 
   # Channel for the install heredoc to hand its manifest numbers back to us:
   # heredoc stdout is mirrored to stderr for humans, so the machine-readable

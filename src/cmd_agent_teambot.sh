@@ -1098,6 +1098,43 @@ PY
      --arg b "$bot_username" --argjson g "$groups"
 }
 
+# _team_bot_env_rewrite_iso <name> -- DIVE-2218. The isolation to PERSIST when the
+# shared-relay wiring rewrites an agent's env file, or rc 1 with a reason on stdout
+# meaning DO NOT REWRITE IT.
+#
+# The loop below rebuilds `<name>.env` from three values it just read out of that
+# same file. The old `iso="${iso:-admin}"` turned every read failure into the TOP
+# tier and then wrote it down, so a transient failure became a durable admin label
+# that `5dive agent info` compares against the enforced sudoers grant and
+# cmd_skill.sh reads. Two rules, and neither is a defaulted tier:
+#
+#   * File unreadable or absent -- do not rewrite AT ALL. Isolation is not the only
+#     field that read as empty: AGENT_WORKDIR and AGENT_AUTH_PROFILE came from the
+#     same failed read and write_agent_env DROPS an empty workdir/profile, so a
+#     rewrite here does not merely mislabel the tier, it blanks the agent's runtime
+#     config. Leaving the file untouched costs this agent its channels= update,
+#     which the caller warns about and which a rerun fixes.
+#   * File readable, tier missing or malformed -- the other fields ARE trustworthy,
+#     so fall back to the registry (the second source of truth, DIVE-2213's
+#     agent_tier). Persisting a MEASURED registry value reconciles the two sources.
+#     If the registry cannot answer either, still refuse: writing `standard` here
+#     would be a smaller guess than `admin`, but it would be a guess, PERSISTED,
+#     which is the defect and not a lesser version of it.
+_team_bot_env_rewrite_iso() {
+  local name="$1" e pair v src
+  e="$(agent_env_isolation "$name")"
+  case "$e" in
+    unknown:no-env-file|unknown:env-unreadable) printf '%s\n' "$e"; return 1 ;;
+  esac
+  pair="$(agent_isolation_2src "$name")"
+  v="${pair%%$'\t'*}"; src="${pair#*$'\t'}"
+  if [[ "$v" == unknown:* ]]; then printf '%s\n' "$src"; return 1; fi
+  # A disagreement between the two sources is surfaced, not silently resolved.
+  [[ "$src" == env:disagrees-registry:* ]] \
+    && warn "team-bot: $name isolation disagrees across sources ($src); persisting the env file's value"
+  printf '%s\n' "$v"
+}
+
 _team_bot_do_shared() {
   local group="$1" owner="$2" agents_filter="$3" token="$4"
   [[ -n "$token" ]] || fail "$E_USAGE" "team-bot shared requires --token=<shared bot token>"
@@ -1260,7 +1297,12 @@ PY
     ef="${ENV_DIR}/${name}.env"
     wd=$(sed -n 's/^AGENT_WORKDIR=//p' "$ef" 2>/dev/null | head -1)
     pf=$(sed -n 's/^AGENT_AUTH_PROFILE=//p' "$ef" 2>/dev/null | head -1)
-    iso=$(sed -n 's/^AGENT_ISOLATION=//p' "$ef" 2>/dev/null | head -1); iso="${iso:-admin}"
+    # DIVE-2218: never persist a GUESSED tier. rc 1 => the read failed, so every
+    # value above is a hole too and the file must be left alone.
+    if ! iso=$(_team_bot_env_rewrite_iso "$name"); then
+      warn "team-bot: $name isolation not measured ($iso) — leaving ${ef} untouched; its channels= update was skipped"
+      continue
+    fi
     # Keep a DIVE-856 default dashboard channel alongside the relay —
     # mirrors _team_bot_persist_shared's registry merge.
     cur_ch=$(jq -r --arg n "$name" '.agents[$n].channels // "none"' <<<"$reg")

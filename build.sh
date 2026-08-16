@@ -75,6 +75,7 @@ cat \
   src/lib/disk.sh \
   src/lib/audit.sh \
   src/lib/registry.sh \
+  src/lib/agent_env.sh \
   src/lib/tasks_db.sh \
   src/lib/actor.sh \
   src/lib/a2a_rounds.sh \
