@@ -4290,10 +4290,37 @@ cmd_heartbeat_tick() {
       fi
       # Only measured values reach the ranking. `unknown:unregistered` ranks 0
       # via the catch-all, which is the human/external fall-through above.
+      #
+      # DIVE-3506 — NARROWED from "any rank gap" to "the creator is SANDBOXED".
+      # The old predicate was `_cr < _ar`, which holds standard->admin as well as
+      # sandboxed->admin. Measured 2026-08-16: the fleet is 12 admin + 5 standard
+      # and **zero sandboxed**, so in practice the guard fired on exactly one
+      # shape — a standard-tier VERIFIER filing a follow-up onto an admin-tier
+      # MAKER — which is the maker/verifier loop working, not an escalation. Cost
+      # of that misfire, measured: dev2 held 5 runnable `high` todos every 5
+      # minutes for SIX DAYS (2026-08-10T22:40Z onward, 7865 log lines), reading
+      # active/enabled/quota-ok the whole time, and dev3 the same on 1-2 rows.
+      #
+      # What DIVE-1065 was actually built to stop is privilege-escalation-by-
+      # queue: an agent that is CONFINED enqueueing work onto an unconfined one
+      # so the heartbeat runs it for them. That is the sandboxed tier and only
+      # the sandboxed tier — `standard` is where our verifiers live and they are
+      # not an untrusted population. Narrowing to `sandboxed` keeps the whole
+      # protection against the case the ticket describes and removes the case it
+      # never meant to describe.
+      #
+      # NOTE this is deliberately still a TIER test and not an org-chart test:
+      # `agent_tier` reads the registry's `isolation`, so re-parenting an agent
+      # does not move this line, and it must not — confinement is the property
+      # being reasoned about, not seniority.
+      #
+      # (lodar's call, 2026-08-16: "i think we should strip this rule completely
+      # - it ruins our backlog queue", then "agreed on sandboxed tier logic" when
+      # shown that sandboxed->admin is a real vector with no live instances.)
       local _cr _ar
       _cr=$(_hb_tier_rank "$_ctier"); _ar=$(_hb_tier_rank "$_atier")
-      if (( _cr > 0 && _ar > 0 && _cr < _ar )); then
-        _hb_log "[$name] task ${task_ident} created by lower-tier ${_cby}(${_ctier}) < assignee(${_atier}) — holding, not auto-running; considering the next candidate"
+      if [[ "$_ctier" == "sandboxed" ]] && (( _cr > 0 && _ar > 0 && _cr < _ar )); then
+        _hb_log "[$name] task ${task_ident} created by SANDBOXED ${_cby}(${_ctier}) < assignee(${_atier}) — holding, not auto-running (DIVE-1065/3504); considering the next candidate. Exits: reassign to a sandboxed-or-lower seat (5dive task assign), drive it once by hand (5dive heartbeat wake-task ${name} ${task_id} ${task_ident}), or re-file it from an unconfined seat."
         continue
       fi
     fi
