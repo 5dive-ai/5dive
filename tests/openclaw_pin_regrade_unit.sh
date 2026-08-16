@@ -207,6 +207,12 @@ grep -q 'NOT-MEASURED' <<<"$(msg_of openclaw-runtime)" \
 OPENCLAW_PIN_NODE_BIN="/bin/sh"
 
 echo
-(( FAILED )) && { echo "RESULT: FAIL"; exit 1; }
-echo "RESULT: PASS"
-exit 0
+(( FAILED )) && echo "RESULT: FAIL" || echo "RESULT: PASS"
+# Verdict LAST, and in a shape tests/meta/harness-verdict-probe.sh can read.
+# The earlier `(( FAILED )) && { …; exit 1; }` / `exit 0` pair was correctly
+# wired and still UNPROBEABLE — the probe identifies the verdict VARIABLE from
+# the last executable line, and `exit 0` names none, so it could not inject its
+# mutation and refused to count this harness clean. That refusal is the point of
+# DIVE-2013: an unprobeable harness and a harness whose exit status is not wired
+# to its assertions are indistinguishable from outside.
+exit $(( FAILED > 0 ))
