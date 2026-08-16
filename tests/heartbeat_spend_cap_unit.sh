@@ -61,9 +61,12 @@ eq_t()  { if [[ "$2" == "$3" ]]; then ok_t "$1"; else bad_t "$1" "want '$3' got 
 cls_t() { local want="$3" got; got=$(_hb_wall_class "$2"); eq_t "$1" "$got" "$want"; }
 
 # --- 1. The two walls, on the text Claude Code actually prints ----------------
-# The monthly-spend dialog CONTAINS "wait for limit to reset". If the reset-time
-# arm were tested first, every hard cap would read as retryable — which is the
-# defect, not a nicety. This is the ordering regression.
+# The monthly-spend dialog CONTAINS "wait for limit to reset", so the HEADER has
+# to be the discriminator and the action line must not be. NOTE what this arm
+# does and does not reach: it dies on the rate-limit arm's FIRST grep (`monthly
+# spend limit` contains no `usage limit` / `weekly limit`), so it proves the
+# header wins — it does NOT exercise block order. The arm that does is section
+# 1b, and the difference was found by quinn mutating this tree (DIVE-3465 it.1).
 MONTHLY=$'You'"'"'ve hit your monthly spend limit\n\n  1. Stop and wait for limit to reset\n  2. Upgrade your plan'
 cls_t "monthly spend dialog = spend-cap (despite offering a reset)" "$MONTHLY" "spend-cap"
 
@@ -78,6 +81,35 @@ cls_t "weekly SPEND ceiling = spend-cap" "$WEEKLY_SPEND" "spend-cap"
 
 CREDIT=$'Usage limit reached\n\nYour credit balance is too low to run this request. Upgrade your plan or purchase more credits.'
 cls_t "credit-balance refusal = spend-cap" "$CREDIT" "spend-cap"
+
+# --- 1b. THE ORDERING REGRESSION, on a pane that satisfies BOTH arms ----------
+# Order in _hb_wall_class is only load-bearing for a pane that would match the
+# rate-limit arm TOO, and until DIVE-3465 iteration 2 no fixture here was such a
+# pane — so swapping the two guard clauses left the whole corpus green while
+# turning a hard cap into a retry. That is the exact collapse this row exists to
+# stop, one tidy-up reorder away.
+#
+# This pane is not exotic: `Usage limit reached` is the header on the harness's
+# own CREDIT fixture below, and a monthly ceiling surfacing under it satisfies
+# the rate-limit arm's limit-word grep (`usage limit`) AND its reset-phrase grep
+# (`wait for ... limit to reset`) while also naming a spend ceiling.
+#
+#   shipped order (spend-cap tested first)  -> spend-cap   <- the only safe answer
+#   swapped order (reset-time tested first) -> rate-limit  <- the defect
+#
+# MUTATION RECEIPT (DIVE-3465 it.2, run before the fixture was called done):
+# with the spend-cap and rate-limit blocks swapped in src/cmd_heartbeat.sh, THESE
+# arms fail and the rest of the corpus stays green. If a future edit reorders
+# those blocks, this is the assertion that must go red first.
+BOTH_SIGNATURES=$'Usage limit reached\n\nYou'"'"'ve hit your monthly spend limit\n\n  1. Stop and wait for limit to reset\n  2. Upgrade your plan'
+cls_t "ORDERING: spend ceiling under a usage-limit header = spend-cap, not rate-limit" \
+      "$BOTH_SIGNATURES" "spend-cap"
+
+# The same collapse with the other hard-cap signature, so the guard does not rest
+# on a single wording of the ceiling line.
+BOTH_CREDIT=$'Usage limit reached\n\nYour credit balance is too low.\n\n  1. Stop and wait for limit to reset\n  2. Purchase more credits'
+cls_t "ORDERING: low credit balance under a usage-limit header = spend-cap" \
+      "$BOTH_CREDIT" "spend-cap"
 
 # --- 2. The third outcome, emitted rather than folded -------------------------
 # A wall (both signature lines present) that names neither a spend ceiling nor a
