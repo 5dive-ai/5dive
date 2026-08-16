@@ -229,6 +229,44 @@ def probe_readable(home, projects):
             return False, "home %s not readable by this uid (needs root)" % home
         return False, "home %s unreadable: %s" % (home, e.strerror or e.errno)
     return True, None          # home readable, no transcript dir yet: genuinely idle
+
+# DIVE-3468: enumerate the transcript set one level at a time, so an unread level
+# is a REASON rather than a silently shorter list. Two levels are collected:
+#
+#     projects/<proj>/<sid>.jsonl                     the parent transcript
+#     projects/<proj>/<sid>/subagents/*.jsonl         the sidechain turns
+#
+# ENOENT (a session rolling over mid-scan, or a session with no subagents) and
+# ENOTDIR (a regular file where a dir would be — including `<sid>.jsonl` itself
+# when probed for a subagents/ child) are real absences and stay silent, because
+# both mean "nothing unread here". Anything else — EACCES on a 700 dir, ELOOP,
+# EIO — is a read we could not perform and is returned as the reason.
+def list_sessions(projects):
+    """-> (paths, reason). reason is not None => this agent was not fully read."""
+    out = []
+    try:
+        entries = sorted(os.listdir(projects))
+    except OSError as e:
+        if e.errno == errno.ENOENT:
+            return [], None    # never run: genuinely empty, not unread
+        return [], "transcript dir %s unreadable: %s" % (projects, e.strerror or e.errno)
+    for d in entries:
+        sub = os.path.join(projects, d)
+        try:
+            names = sorted(os.listdir(sub))
+        except OSError as e:
+            if e.errno in (errno.ENOENT, errno.ENOTDIR): continue
+            return [], "project dir %s unreadable: %s" % (sub, e.strerror or e.errno)
+        out.extend(os.path.join(sub, n) for n in names if n.endswith(".jsonl"))
+        for n in names:
+            subag = os.path.join(sub, n, "subagents")
+            try:
+                sa_names = sorted(os.listdir(subag))
+            except OSError as e:
+                if e.errno in (errno.ENOENT, errno.ENOTDIR): continue
+                return [], "subagent dir %s unreadable: %s" % (subag, e.strerror or e.errno)
+            out.extend(os.path.join(subag, m) for m in sa_names if m.endswith(".jsonl"))
+    return out, None
 total = 0
 for name, ws in wins.items():
     meta = reg.get("agents", {}).get(name)
@@ -252,7 +290,53 @@ for name, ws in wins.items():
         not_reached("%s: %s" % (name, why)); continue
     lo = min(w["start"] for w in ws)
     blind = False
-    for path in glob.glob(os.path.join(projects, "*", "*.jsonl")):
+    # DIVE-3468: TWO globs, because a subagent's turns are not in the session
+    # file. Claude Code writes sidechain turns to a sibling DIRECTORY,
+    # projects/<proj>/<sid>/subagents/*.jsonl, which the one-level glob cannot
+    # reach — while every turn in it carries the PARENT's sessionId, so the
+    # attribution was always correct and only the path was out of range. The
+    # design note this reader was built on asserted the opposite ("sidechain
+    # turns land in the parent .jsonl, so a session-scoped sum picks them up for
+    # free"); it is false, measured on two seats.
+    #
+    # It fails in the worst available direction: no error, no NOT-REACHED, just a
+    # smaller correct-looking integer, under-charging exactly the rows that fan
+    # work out to subagents — i.e. the expensive ones. Nothing inside the numbers
+    # falsifies it.
+    #
+    # Measured: agent-quinn, 62 sidechain turns / 294,684 tokens (~9% of that
+    # session) excluded; agent-dev3, 4 files / 434 turns / 1,059,608 tokens.
+    # No double-count: the uuid sets of the parent and the subagent files are
+    # DISJOINT on all four dev3 pairs, so adding the second glob adds turns
+    # rather than re-counting them.
+    #
+    # The tool-results/ sibling in the same tree is NOT transcript turns and is
+    # deliberately not enumerated — it is on all 9 readable seats, so a `*/*`
+    # sweep here would have swept it in everywhere.
+    #
+    # AND NOT WITH glob.glob(). Reaching the files with a second glob is only
+    # half the fix: glob SWALLOWS every OSError in a wildcard level and yields
+    # nothing for that entry, so an unreadable subagents/ dir would go back to
+    # being a silently smaller correct-looking integer — this row's own defect,
+    # rebuilt one level deeper, by the change meant to remove it. (Caught by
+    # `spend_scan_not_reached_unit.sh`'s unreadable-subagents arm, which reds on
+    # the two-glob version.)
+    #
+    # So enumerate explicitly, same discipline as usage_collect's list_sessions
+    # (DIVE-3417/3419). This also closes the PRE-EXISTING hole at the middle
+    # level: `projects/*/*.jsonl`'s own middle wildcard was glob-swallowed here
+    # too, so an unreadable PROJECT dir was already dropping out of this total
+    # silently. probe_readable() covers the top and the per-file `except OSError`
+    # below covers the bottom; nothing covered the middle.
+    #
+    # Verdict is NOT-REACHED, not a warning, because this reader's caller
+    # (_loop_refresh_spend) PERSISTS what it returns over durable state — a short
+    # total silently becomes the record. That is the DIVE-3419 split: the same
+    # unread level is a reporting `partial` in cmd_activity and a hard rc 2 here.
+    sessions, why = list_sessions(projects)
+    if why is not None:
+        not_reached("%s: %s" % (name, why)); continue
+    for path in sessions:
         try:
             if os.path.getmtime(path) < lo: continue
             f = open(path, "r", errors="ignore")
