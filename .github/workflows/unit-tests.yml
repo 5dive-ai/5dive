@@ -767,10 +767,18 @@ jobs:
     needs: [core-pristine, core-installed-host]
     if: always()
     steps:
+      # DIVE-3477: this job now needs the repo, because the growth metric's reference
+      # constant lives in tests/lib/tier.sh beside the tier definition -- a reference
+      # spelled here would be moved by a one-line edit in a file nobody reviews as the
+      # policy change it is, which is the rule --budget and --cal-us already follow.
+      # CHECKOUT FIRST: the artifacts below are downloaded into the working directory.
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: { pattern: 'core-*', merge-multiple: true }
       - name: Re-sum the shards and print the UN-SHARDED core total
         run: |
+          # DIVE-3477: the growth reference, from beside the tier definition.
+          . tests/lib/tier.sh
           total_row() {   # <label> <glob>
             # DIVE-3315 (quinn, grading this row's own PR): the table is for a HUMAN and
             # cannot be graded. This function also emits ONE machine-readable line per
@@ -780,13 +788,17 @@ jobs:
             #
             # Emitted from the same variables the table is printed from, so a table that
             # reads empty cannot leave the line looking healthy.
-            local label="$1" pat="$2" n=0 s=0 b=0 shards=0 f need=0
+            local label="$1" pat="$2" n=0 s=0 b=0 shards=0 f need=0 draws=""
             for f in $pat; do
               [[ -r "$f" ]] || continue
               shards=$(( shards + 1 ))
               n=$(( n + $(sed -n 's/^# harnesses=//p' "$f" | head -1) ))
               s=$(( s + $(sed -n 's/^# wall_clock_s=//p' "$f" | head -1) ))
               b=$(sed -n 's/^# budget_s=//p' "$f" | head -1)
+              # DIVE-3477: the UNCLAMPED draw, which is the one that says what box this
+              # shard ran on. cal_scale_pct_applied has already been floored at 100 by
+              # policy, so it cannot describe a fast runner and is the wrong field here.
+              draws="${draws:+$draws,}$(sed -n 's/^# cal_scale_pct=//p' "$f" | head -1)"
             done
             # A missing shard is not a smaller corpus. Say the count, so a total assembled
             # from one of two shards cannot read as a corpus that got faster.
@@ -794,6 +806,48 @@ jobs:
             printf '| %s | %d | %d | %ds | %ds per shard | %d |\n' \
               "$label" "$shards" "$n" "$s" "${b:-0}" "$need"
             printf 'unsharded_total_s %s %d %d %d\n' "$label" "$s" "$n" "$shards" \
+              >> core-unsharded-total.txt
+            # DIVE-3477, HALF ONE -- THE DRAWS, BESIDE THE TOTAL. Under sharding each
+            # shard runs on its own independently-calibrated runner, so the total above
+            # is a sum of wall-clock measured on as many different-speed boxes as there
+            # are shards. It is not a quantity observed on any single box, and there is
+            # no single draw you could divide it by afterwards to recover one. Measured
+            # on run 31940232740, four shards of one run: 89 / 122 / 122 / 98.
+            #
+            # Emitting the draws does not repair that and is not claimed to: it makes the
+            # total's provenance READABLE, which is the least a number nobody can trend
+            # owes the next person who trends it anyway. The figure that IS comparable
+            # across runs is the one below.
+            #
+            # A SEPARATE LINE, not extra fields on unsharded_total_s: the presence check
+            # next door binds that line with `read -r _ _ total n shards`, so an appended
+            # field would land in `shards` and turn a grader red for a reason that has
+            # nothing to do with the corpus.
+            printf 'unsharded_draws_pct %s %s\n' "$label" "${draws:-none}" \
+              >> core-unsharded-total.txt
+            # DIVE-3477, HALF TWO -- THE CORPUS-GROWTH TRIPWIRE, which is the condition
+            # main's ruling attached to the shard landing: sharding restores headroom,
+            # and restored headroom is exactly how corpus growth becomes invisible again.
+            #
+            # Raw microseconds per harness against a FIXED reference. Shard-count
+            # independent because it divides by the harness COUNT; clamp-independent
+            # because it reads no calibration field; comparable across runs because the
+            # reference does not move when capacity does. The rationale for each of those
+            # three, and the reference's environment and date, are in tests/lib/tier.sh.
+            #
+            # EMITTED, NEVER ENFORCED, on exactly the terms the total above already has:
+            # this job exits 0 on every path and nothing in CI keys off the VALUE.
+            # Whether a WINDOW of these has cleared the reference is decided out of band
+            # by scripts/core-growth-tripwire.sh, because per-run draw spans 74-141% and
+            # a per-run threshold would false-fire on the runner alone. Firing files a
+            # row; it does not red a build and it adds no required check.
+            local u=0 ref=0 pct=0
+            (( n > 0 )) && u="$(tier_core_us_per_harness "$s" "$n")"
+            if ref="$(tier_core_us_per_harness_ref "$label")"; then
+              pct="$(tier_core_growth_pct_of_ref "$u" "$label")"
+            fi
+            printf 'core_us_per_harness %s %d %d %d ref=%d pct_of_ref=%d\n' \
+              "$label" "$u" "$n" "$shards" "$ref" "$pct" \
               >> core-unsharded-total.txt
           }
           : > core-unsharded-total.txt
@@ -825,6 +879,14 @@ jobs:
               echo "(no reports — no pristine shard finished)"
             fi
             echo '```'
+            echo
+            echo "Corpus growth (DIVE-3477) -- raw us/harness against a FIXED reference, and the draws the total above is a sum over:"
+            echo '```'
+            grep '^core_us_per_harness ' core-unsharded-total.txt || echo "(no growth figure produced)"
+            grep '^unsharded_draws_pct ' core-unsharded-total.txt || echo "(no draws produced)"
+            echo '```'
+            echo
+            echo "A single run cannot say the corpus grew: per-run us/harness moves ~20% on runner draw alone. scripts/core-growth-tripwire.sh reads a WINDOW of these and is what decides whether the tripwire has fired."
           } | tee -a "$GITHUB_STEP_SUMMARY"
           echo
           echo "machine-readable (this is the object core-total-produced grades):"
@@ -915,8 +977,26 @@ jobs:
                 "$env" "$total" "$n" "$shards"
               return 1
             fi
-            printf '%s: PRODUCED — %ss over %s harnesses from %s shards (value deliberately not graded here).\n' \
-              "$env" "$total" "$n" "$shards"
+            # DIVE-3477: and the GROWTH figure, on the same terms. Its production is
+            # graded here rather than in a new job because a new job would be a new
+            # required context, and main's ruling authorised a metric, not a gate. This
+            # check is already inside the merge gate via both aggregators, so grading the
+            # figure's EXISTENCE here is what stops the instrument being deleted in one
+            # line -- the failure arm 97 in tests/corpus_tier_budget_unit.sh was written
+            # for, now applied to the number that replaced the one it was written about.
+            gline="$(grep -E "^core_us_per_harness[[:space:]]+${env}[[:space:]]" "$f" | head -1)"
+            if [ -z "$gline" ]; then
+              printf '%s: FAIL — the un-sharded total is present but the GROWTH figure is not. Sharding restored headroom, and this is the number that stays comparable across runs once it has; its presence is the condition the shard landed under.\n' "$env"
+              return 1
+            fi
+            read -r _ _ us gn gshards _ <<<"$gline"
+            if ! [ "${us:-0}" -gt 0 ] 2>/dev/null || ! [ "${gn:-0}" -gt 0 ] 2>/dev/null; then
+              printf '%s: FAIL — a growth figure is present but it is not a measurement: us_per_harness=%s harnesses=%s shards=%s.\n' \
+                "$env" "$us" "$gn" "$gshards"
+              return 1
+            fi
+            printf '%s: PRODUCED — %ss over %s harnesses from %s shards, and %s us per harness (both values deliberately not graded here).\n' \
+              "$env" "$total" "$n" "$shards" "$us"
           }
           # POSITIVE CONTROL, ON EVERY RUN, BEFORE THE REAL GRADE — DIVE-3317's keeper: a
           # monitor that breaks LOUD gets fixed, one that breaks SILENT does not, and a check
@@ -938,6 +1018,11 @@ jobs:
               if grade pristine success >/dev/null 2>&1; then
                 echo "SELFTEST FAIL: an empty table (0s over 0 harnesses) graded as PRODUCED"; exit 1; fi
               printf 'unsharded_total_s pristine 307 297 2\n' > "$f"
+              # DIVE-3477: a total with no growth figure beside it is the shape a deleted
+              # or renamed emission produces, and it is the one the shard landed against.
+              if grade pristine success >/dev/null 2>&1; then
+                echo "SELFTEST FAIL: a total with no growth figure beside it graded as PRODUCED"; exit 1; fi
+              printf 'core_us_per_harness pristine 1033670 297 2 ref=1000000 pct_of_ref=103\n' >> "$f"
               if ! grade pristine success >/dev/null 2>&1; then
                 echo "SELFTEST FAIL: a real figure did NOT grade as produced — this check reds every run and will be muted"; exit 1; fi
             ) || rc=1
@@ -948,7 +1033,7 @@ jobs:
             echo "core-total-produced: BLOCKED — this check cannot demonstrate that it still fails on an absent or empty figure, so its green would mean nothing. Refusing to report one."
             exit 1
           fi
-          echo "selftest: reds on an absent figure, reds on an empty table, passes a real one."
+          echo "selftest: reds on an absent figure, reds on an empty table, reds on a total with no growth figure beside it, passes a real one."
           grade pristine "$PRISTINE_RESULT" || rc=1
           grade installed-host "$INSTALLED_RESULT" || rc=1
           exit "$rc"
