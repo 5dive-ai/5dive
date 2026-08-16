@@ -1,6 +1,96 @@
 # Changelog
 
-## Unreleased — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
+## v0.19.34 — fix(loop): an unreadable agent home is NOT-REACHED, not 0 tokens (DIVE-3345)
+
+`_spend_scan_task_ids` is the one spend reader behind both the per-LOOP token ceiling and the
+per-TASK budget sweep. Its header has promised since DIVE-2794 that **a spend that could not be
+READ is NOT-REACHED, never 0**, and both callers are built around that promise — `_loop_refresh_spend`
+has an rc-2 branch that refuses to persist, the budget sweep has two "budget NOT verified this tick"
+branches. **Nothing in the scanner could produce the non-zero exit they branch on.** It resolved each
+agent's transcript root through `home_of()`, which fell back to a GUESSED `/home/agent-<name>`; if
+that path was missing, or present but unreadable by the calling uid, `glob.glob()` returned `[]`, the
+per-agent loop contributed nothing, and the function printed `0` and exited `0`. The carefully-built
+fail-closed path was bypassed by a fail-open one sitting underneath it.
+
+**Reported by `claude-luca` from customer box 5dive-teal-fox-cx43 via lodar.** Their first scan
+returned 0 for every row purely because they could not read peer agents' homes; they had to re-run
+under sudo. It took a human's suspicion to catch, which is the whole problem: nobody investigates a
+guard that never fires. This is not a customer-only condition — `/home/agent-*` is mode 700 on every
+shared host we run, so **any unprivileged sweep read every peer's spend as zero.**
+
+**The consequence is worse than a blind guard, and it is measured, not argued.** Against the pre-fix
+scanner the new harness reds on `CLOBBERED`: an unreadable home returned a clean `0`, so
+`_loop_refresh_spend` accepted it as a successful read and **wrote that 0 over the accumulated
+`tokens_spent` in durable state.** DIVE-2304 built the anti-clobber guard specifically to stop that,
+and this fail-open walked straight past it — because the failure never *looked* like a failure. A
+fail-open underneath a fail-closed path does not merely disable the guard above it; it feeds that
+guard a lie in the format it trusts.
+
+**Three states, and only the third is a legitimate zero.**
+
+| transcript root | before | now |
+|---|---|---|
+| missing / unresolvable | `0`, rc 0 | NOT-REACHED, rc 2, cause on stderr |
+| present but unreadable (EACCES on home or dir) | `0`, rc 0 | NOT-REACHED, rc 2, cause on stderr |
+| readable, nothing recorded | `0`, rc 0 | `0`, rc 0 — unchanged |
+
+The probe is `usage_collect`'s (DIVE-1929), reused rather than reinvented, with **one deliberate
+divergence named in the code**: usage treats a missing home as "this agent recorded nothing", because
+it reports fleet coverage over a roster. Here the home is derived from an agent the registry lists and
+a task the db says is started, so a missing home means our resolution is wrong — not that the agent is
+idle. Probe order is usage's too, transcript dir before home, because a home is commonly mode 700
+while the dir underneath it is still reachable by path.
+
+**Acceptance 4, the fallback in a different coat.** `home_of()`'s `/home/agent-<name>` guess is gone —
+a name with no account on this host has no transcript root, and inventing a path that then globs empty
+does not produce 0 spend, it produces an unread one and calls it 0. Its sibling went with it: an
+assignee absent from the registry used to DEFAULT to `type: "claude"` and then get its home guessed —
+two fail-opens in series, both landing on 0, and that pair is how DIVE-3344's `cli` rows scored a
+number at all. A registered non-claude agent is still a plain skip; it has no claude transcripts, and
+that is the only `continue` left in the loop that still means zero.
+
+Two more inputs on the same fault line: an individual transcript file we cannot open is now
+NOT-REACHED rather than silently omitted (a PARTIAL sum reported as a total is the same lie, one level
+down; a vanished file — ENOENT, a session rolling over — is still tolerated), and an unreadable task db
+no longer produces an empty window set and therefore a confident 0. **One case is deliberately left
+open and named in the code**: a task id ABSENT from a readable db still yields 0, because the loop
+caller derives ids from `loop_runs.child_task_ids`, which can legitimately name a deleted row, and
+NOT-REACHING there would wedge live loops over a row nobody will restore.
+
+**Neither guard becomes trigger-happy.** NOT-REACHED does not park a row and does not halt a loop —
+both callers already treat it as "not verified this tick, row untouched", which is the direction
+DIVE-2304 chose on purpose.
+
+`tests/spend_scan_not_reached_unit.sh` — 24 arms, core tier, ~1.4s, no root and no network.
+**Acceptance 3 is the point of the file**: the sick arms run as a uid that genuinely cannot read the
+fixture (`chmod 000`, unprivileged), because the old code passes any test written by an owner who can
+read everything — which is exactly why this shipped. As root the EACCES arms **skip and say so** rather
+than fake a pass.
+
+**And a skip is not a grade — quinn's condition on clearing this row's push gate, closed rather than
+noted.** "If CI executes as uid 0, every EACCES arm skips and the harness reports green having never
+touched the defect this row exists to fix." So the defect CLASS is graded first by a condition
+permission bits cannot express: an ANY-UID arm puts a regular FILE where the transcript dir belongs,
+and **ENOTDIR defeats root as well** (usage_coverage_unit.sh's trick, DIVE-2069) — root can read
+everything and still cannot `listdir` a file. Measured with `id` shadowed to report uid 0: the
+harness runs **14/0 post-fix and 5/9 pre-fix**, the ANY-UID arm among the reds. A root runner is
+therefore never a vacuous green, and the harness prints its own uid so the log says which run it was.
+`runs-on: ubuntu-latest` with no container, so CI is in fact unprivileged and gets all 24.
+
+Every sick arm is paired with the SAME fixture healed, which must recompute a real
+30000 through the same code: without that pairing a green "reports NOT-REACHED" is unfalsifiable,
+since a zero from an empty input is indistinguishable from a zero from a clean check — the bug itself.
+The anchor arm earned its place immediately by catching a harness bug (a `local n=… h="…$n"` line,
+whose words bash expands before the locals exist) that had left every fixture home an empty path; four
+NOT-REACHED arms were green at the time, for the wrong reason.
+
+Graded against the pre-fix scanner on the same tree: **8 passed, 14 failed**, with the reds landing on
+exactly the NOT-REACHED arms plus `CLOBBERED`, and the healthy/legitimate-zero arms green in BOTH
+directions — so the fix is proved to fire on the defect and proved not to have over-fired onto idle
+agents. Siblings re-run green on the merged tree: `loop_spend_not_reached_unit` 17/0,
+`loop_ceiling_enforce_unit` 5/0, `task_budget_enforce_unit` 41/0, `corpus_tier_budget_unit` 135/0.
+
+## v0.19.34 — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
 
 Nothing validated these columns. The work-picker dispatches on `assignee`, so a row on a name that is
 not a registered agent was **structurally undispatchable** — not blocked, not parked, not flagged, and
@@ -24,7 +114,7 @@ never once a dispatch target) and corroborated here (5 open rows).
 - **`wip-cap-install`** read the same unvalidated column (it had minted `wip_cap:cli`, a lane ceiling
   for an agent that does not exist). It now skips unregistered lanes and **names the skip**.
 
-## Unreleased — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
+## v0.19.34 — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
 
 `5dive agent config <name> set channels=<current>,buzz` could not succeed on any seat that was not
 **created** with buzz. `cmd_config` dispatches `install_channel_for_agent` for telegram, discord and
@@ -57,7 +147,7 @@ arms grade the satisfier next to the gate, and drive `cmd_config` for real — w
 that the same call reaches the restart once the cache is staged, so the rollback arms cannot pass
 against a `cmd_config` that simply refuses everything.
 
-## Unreleased — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
+## v0.19.34 — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
 
 DIVE-2483's gate answer said the preservation notice lands on **stdout**. It lands on **stderr**,
 via the fleet's `warn()`. Six arms were written for that condition and all six were green, because
@@ -91,7 +181,7 @@ Still open and scoped out on purpose: `task reject` remains an unguarded writer 
 column (`src/cmd_task.sh:4235`). That is a design question about accumulating verifier feedback, not
 this gap.
 
-## Unreleased — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
+## v0.19.34 — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
 
 DIVE-3272 taught the supervisor BOARD to see a seat that is alive and closing nothing. The
 drill-down people actually type kept printing only liveness: `state: active / enabled` was
@@ -133,7 +223,7 @@ supervisor:  quota-exhausted / quota-exhausted — pane shows a model-capacity r
 - `agent list` is unchanged — it is the survey surface, and this is a per-agent drill-down
   (three sqlite reads), deliberately not an N-way fan-out.
 
-## Unreleased — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
+## v0.19.34 — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
 
 A gate reaches the filer's lead only if `_GATE_ENG_SHIP_RX` matches the ask or the row
 title. `gate_builder_routing` is OFF by default, so for an ordinary builder ship gate that
@@ -197,7 +287,7 @@ prose for identifiers.
   `gate_access_lead_clear`, `gate_internal_ops_floor`, `task_needs_human_parity`,
   `task_inbox_json_tier`, `push_unit`, `broker_surface`, + 15 more).
 
-## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
+## v0.19.34 — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
 
 DIVE-1935's first iteration was rejected, and for the right reason. It added a
 `sudo -n -u claude gh auth token` arm to `_gate_gh_token` justified by *"agents hold
