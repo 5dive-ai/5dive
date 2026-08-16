@@ -389,17 +389,56 @@ cmd_auth_status() {
   local probe_flag="--no-probe"
   local t=""
   local profile=""
+  local agent=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --probe)         probe_flag="" ;;
       --no-probe)      probe_flag="--no-probe" ;;
       --type=*)        t="${1#--type=}" ;;
       --auth-profile=*) profile="${1#--auth-profile=}" ;;
+      --agent=*)       agent="${1#--agent=}" ;;
       -*)              fail "$E_USAGE" "unknown flag: $1" ;;
       *)               [[ -z "$t" ]] && t="$1" || fail "$E_USAGE" "extra arg: $1" ;;
     esac
     shift
   done
+
+  # DIVE-3104: --agent resolves the credential scope from the REGISTRY instead
+  # of asking the operator to know it. A bare --type query resolves the type's
+  # DEFAULT sentinel path (auth_creds_present with no profile), so it can only
+  # ever answer "is this type authed for the default profile" — it cannot see a
+  # per-AGENT credential gap by construction, and it returned `ok` for hermes /
+  # openclaw seats whose own profile-scoped credential was empty and which
+  # could not think (DIVE-3100). The per-agent path was reachable before this
+  # only via --auth-profile=<p>, which requires already knowing the profile
+  # name, i.e. exactly the fact an operator asking "is agent X authed" lacks.
+  if [[ -n "$agent" ]]; then
+    [[ -z "$profile" ]] || fail "$E_USAGE" "--agent and --auth-profile are mutually exclusive"
+    # registry_read() collapses absent / unreadable / truncated / genuinely-empty
+    # onto {"agents":{}} (see its doc comment in src/lib/registry.sh), so a
+    # caller that cannot read the registry would be told the agent DOES NOT
+    # EXIST — a wrong answer dressed as a definite one. _checked distinguishes
+    # them, which is the whole point of asking about a specific agent.
+    local _reg _atype _rrc=0
+    _reg=$(registry_read_checked 2>/dev/null) || _rrc=$?
+    case "$_rrc" in
+      0) : ;;
+      3) fail "$E_NOT_FOUND" "no agent registry on this host — cannot resolve agent '$agent'" ;;
+      4) fail "$E_NOT_FOUND" "agent registry unreadable as $(id -un) — re-run as root" ;;
+      5) fail "$E_NOT_FOUND" "agent registry is not parseable as JSON — cannot resolve agent '$agent'" ;;
+      *) fail "$E_NOT_FOUND" "agent registry read failed (rc=$_rrc) — cannot resolve agent '$agent'" ;;
+    esac
+    jq -e --arg n "$agent" '.agents | has($n)' <<<"$_reg" >/dev/null 2>&1 \
+      || fail "$E_NOT_FOUND" "unknown agent: $agent"
+    _atype=$(jq -r --arg n "$agent" '.agents[$n].type // empty' <<<"$_reg")
+    profile=$(jq -r --arg n "$agent" '.agents[$n].authProfile // empty' <<<"$_reg")
+    if [[ -n "$t" && -n "$_atype" && "$t" != "$_atype" ]]; then
+      fail "$E_USAGE" "agent '$agent' is type '$_atype', not '$t' — drop --type"
+    fi
+    [[ -n "$_atype" ]] && t="$_atype"
+    [[ -n "$t" ]] || fail "$E_NOT_FOUND" "agent '$agent' has no type recorded in the registry"
+  fi
+
   # DIVE-296: --auth-profile scopes the check to one profile, so it only makes
   # sense for a single type. Guard rather than silently checking the default.
   [[ -n "$profile" && -z "$t" ]] \
@@ -424,10 +463,76 @@ cmd_auth_status() {
     out+="\"$type\":\"$s\""
   done
   out+="}"
+
+  # DIVE-3104: say WHICH credential scope produced the answer, and — for a
+  # query that resolved the DEFAULT scope — name the registered agents this
+  # result provably does not cover. A green with no scope attached is the whole
+  # defect: it reads as "these agents are authed" when it means "the default
+  # profile is authed". Per the org rule that a figure without its scope is not
+  # a figure, the scope travels with the result rather than in the docs.
+  local scope_kind="default" scope_label="default profile"
+  if [[ -n "$agent" ]]; then
+    scope_kind="agent"
+    scope_label="agent ${agent} (profile: ${profile:-default})"
+  elif [[ -n "$profile" ]]; then
+    scope_kind="profile"
+    scope_label="profile ${profile}"
+  fi
+  # Agents of a queried type that are bound to a NON-default profile: their
+  # credential lives on a path this default-scope answer never opened.
+  #
+  # And it is measured with registry_read_CHECKED, not registry_read: the plain
+  # helper returns {"agents":{}} for an unreadable or truncated registry, which
+  # renders as "0 agents uncovered" — a clean green — and puts the DIVE-3100
+  # false green back inside the one line written to kill it. Zero-uncovered and
+  # coverage-unmeasured must not print the same thing, so an unmeasured read
+  # yields uncoveredStatus=unknown:<reason> with uncoveredAgents null, never [].
+  local uncovered="[]" uncovered_status="measured"
+  if [[ "$scope_kind" == "default" ]]; then
+    local _reg2 _rrc2=0
+    _reg2=$(registry_read_checked 2>/dev/null) || _rrc2=$?
+    case "$_rrc2" in
+      0) uncovered=$(jq -c --argjson types "$(printf '%s\n' "${types[@]}" | jq -R . | jq -sc .)" \
+           '[.agents // {} | to_entries[]
+             | select((.value.authProfile // "") != "")
+             | select(.value.type as $t | $types | index($t))
+             | {name: .key, type: .value.type, authProfile: .value.authProfile}]' \
+           <<<"$_reg2" 2>/dev/null) || { uncovered="[]"; uncovered_status="unknown:coverage-query-failed"; }
+         ;;
+      3) uncovered_status="unknown:no-registry" ;;
+      4) uncovered_status="unknown:registry-unreadable" ;;
+      5) uncovered_status="unknown:registry-unparsable" ;;
+      *) uncovered_status="unknown:registry-read-failed" ;;
+    esac
+    [[ "$uncovered_status" == "measured" ]] || uncovered="null"
+  fi
+
   if (( JSON_MODE )); then
-    echo "$out" | jq -c '{ok:true, data: .}'
+    echo "$out" | jq -c --arg k "$scope_kind" --arg l "$scope_label" \
+      --arg a "$agent" --arg p "$profile" --argjson u "$uncovered" \
+      --arg us "$uncovered_status" \
+      '{ok:true, data: ., scope:{kind:$k, label:$l,
+                                 agent:(if $a == "" then null else $a end),
+                                 authProfile:(if $p == "" then null else $p end),
+                                 uncoveredAgents:$u,
+                                 uncoveredStatus:$us}}'
+    [[ "$uncovered_status" == "measured" ]] \
+      || echo "COVERAGE UNKNOWN (${uncovered_status#unknown:}): this answer's blind spot could not be measured — it is NOT zero agents, it is unmeasured." >&2
   else
     echo "$out" | jq -r 'to_entries[] | "\(.key): \(.value)"' | sort
+    echo "scope: ${scope_label}" >&2
+    if [[ "$uncovered_status" != "measured" ]]; then
+      echo "COVERAGE UNKNOWN (${uncovered_status#unknown:}): this answer's blind spot could not be measured — it is NOT zero agents, it is unmeasured." >&2
+      echo "  re-run as a caller that can read the agent registry, or check one agent at a time: 5dive agent auth status --agent=<name>" >&2
+      return 0
+    fi
+    local _nu
+    _nu=$(jq -r 'length' <<<"$uncovered" 2>/dev/null || echo 0)
+    if (( _nu > 0 )); then
+      echo "NOT COVERED: ${_nu} agent(s) of this type read a profile-scoped credential this answer never opened —" >&2
+      jq -r '.[] | "  \(.name) (\(.type), profile: \(.authProfile)) — 5dive agent auth status --agent=\(.name)"' \
+        <<<"$uncovered" >&2
+    fi
   fi
 }
 

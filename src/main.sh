@@ -193,6 +193,9 @@ Accounts (a named auth profile — group sign-ins so multiple agents share one l
 
 Auth (lower-level; the dashboard uses these — prefer 'account' for human-driven flows):
   5dive agent auth status [--probe] [--type=<type>]    # real --print probe reveals stale creds
+  5dive agent auth status --agent=<name> [--probe]     # THIS agent's own credential (DIVE-3104:
+                                                       # a bare --type answer is the DEFAULT profile
+                                                       # and cannot see a per-agent gap)
   5dive agent auth login <type>                        # interactive TTY (hands off this process)
   5dive agent auth set <type> --api-key=<key|-> [--auth-profile=<name>] [--provider=<id>]
                               [--base-url=<url>] [--model=<slug>]
