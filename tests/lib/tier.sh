@@ -175,6 +175,129 @@ TIER_CAL_MIN_ITERS=5
 TIER_CAL_MAX_ITERS=20000
 TIER_CAL_SAMPLES=2
 
+# ------------------------------------------------------------------ DIVE-3477
+# THE CORPUS-GROWTH TRIPWIRE. Raw microseconds per harness, against a FIXED
+# reference. It is NOT a second budget, it is wired to no failure, and nothing
+# in CI keys off its VALUE — scripts/core-growth-tripwire.sh decides when it has
+# fired, and firing files a row.
+#
+# WHY IT EXISTS. #622 shards the core tier, which restores headroom, and restored
+# headroom is precisely how corpus growth becomes invisible again: two jobs
+# reporting 157s read as comfortable while the corpus still costs 313s. main's
+# ruling clearing that merge made this its condition -- "raw
+# microseconds-per-harness against a FIXED reference, emitted per run,
+# independent of shard count and of the calibration clamp. If that number climbs
+# we find out on the run it climbs, not in a fortnight when the new headroom is
+# gone too."
+#
+# EACH PROPERTY IS TRACEABLE TO A FAILURE THIS THREAD MEASURED:
+#
+#   PER HARNESS, NOT PER RUN. Raw wall-clock moves when the corpus GROWS, which
+#   is the event this exists to catch. Dividing by the harness COUNT is also what
+#   makes the figure indifferent to how the corpus was split: two shards or
+#   three, sum(wall) over sum(harnesses) is the same quantity.
+#
+#   NOT wall/draw. Dividing a corpus by its run's calibration probe ASSUMES the
+#   probe explains the corpus -- the exact proposition DIVE-2736's cross-run
+#   instrument exists to TEST, and which that instrument marked DISCORDANT on the
+#   very run the arithmetic was applied to. Measured (DIVE-3476): wall/draw said
+#   305s/280s, "on the line, both sides"; normalising per HARNESS against a
+#   window said 340s/353s -- both over, and a SIGN FLIP on the leg carrying the
+#   conclusion. community/wiki/
+#   normalising-a-corpus-by-its-own-calibration-probe-assumes-the-thing-on-trial.md
+#
+#   NOT MULTIPLIED BY cal_scale_pct, and never compared to a clamped cap. The
+#   clamp is the mechanism that made growth invisible; a metric that inherits it
+#   inherits the defect. tier_core_us_per_harness below reads no calibration
+#   field at all, which is a property tests/corpus_tier_budget_unit.sh asserts
+#   rather than a promise made here.
+#
+# THE REFERENCE, WITH ITS ENVIRONMENT AND ITS DATE, because a figure with no
+# environment cannot be refuted by the next reader (DIVE-2555):
+#
+#   ENVIRONMENT   GitHub-hosted `ubuntu-latest`, `unit-tests` on main, core tier.
+#   DATE          2026-08-16.
+#   METHOD        median microseconds-per-harness over the 15 most recent main
+#                 `unit-tests` runs, 05:06Z-09:31Z, read with
+#                 scripts/tier-cal-window.sh (main2, DIVE-3476).
+#   CORROBORATION dev3 re-measured independently over the 6 most recent
+#                 un-sharded main runs (07:05Z-09:31Z, 309-311 harnesses):
+#                 pristine 1069454, installed-host 1129031 -- 2.3% and 0.4% BELOW
+#                 the constants below. Two windows of different widths, same
+#                 order of magnitude and the same ranking between the legs.
+#
+# IT STARTS AT PARITY ON PURPOSE. That is the whole reason it can exist while
+# TIER_BUDGET_CORE cannot be raised: a reference set at today's cost does not red
+# on day one. The first sharded run on main (31941359141) reads 980707 pristine
+# and 1106109 installed-host -- 89% and 97% of these. Under, both legs, run one.
+#
+# WHY THE TWO LEGS GET TWO CONSTANTS. installed-host runs ~6% dearer per harness
+# than pristine in every window measured. One shared constant would start one leg
+# off parity, which is the single property that makes this metric shippable.
+TIER_CORE_US_PER_HARNESS_REF_PRISTINE=1094155
+TIER_CORE_US_PER_HARNESS_REF_INSTALLED=1133986
+
+# HOW FAR OVER THE REFERENCE A WINDOW MEDIAN MUST SIT BEFORE IT HAS FIRED.
+#
+# "WE FIND OUT ON THE RUN IT CLIMBS" IS THE RIGHT INTENT AND A SINGLE RAW RUN
+# CANNOT DELIVER IT. Measured, per-run raw microseconds-per-harness on main, the
+# 6 un-sharded runs of 2026-08-16 07:05Z-09:31Z:
+#
+#     pristine         935483 .. 1148867      (median 1069454)
+#     installed-host   883495 .. 1151612      (median 1129031)
+#
+# That is a +-10% / -22%..+2% spread over three hours in which the corpus moved
+# by TWO harnesses. It is runner draw: the same six runs drew 94-125%, and
+# main2's 137-point census over five days spans 74-141%. A per-run threshold
+# against a fixed reference would therefore false-fire on draw alone, constantly
+# -- and an alarm that cries wolf is muted, which is how the signal is lost a
+# SECOND way.
+#
+# So emission and firing are split and must not be collapsed: the raw figure is
+# EMITTED every run, unadjusted, exactly as the ruling specified, and the FIRING
+# decision is taken on the MEDIAN of a window, which is what survives that
+# spread. 110 sits above the full observed per-run spread, so a window median
+# that clears it is not a draw.
+TIER_CORE_GROWTH_FIRE_PCT=110
+# A median needs an interior; below this a window is its own endpoints. Same
+# fail-closed call scripts/tier-cal-window.sh makes at --min-runs=3, set one
+# wider because this reads ONE figure per run rather than a paired sign test.
+TIER_CORE_GROWTH_MIN_RUNS=5
+
+# tier_core_us_per_harness <summed_wall_clock_s> <summed_harnesses>
+#
+# The whole metric, in one line of integer arithmetic, SUMMED across every shard
+# of ONE environment. Reads no calibration field, by construction and not by
+# discipline.
+tier_core_us_per_harness() {
+  local s="${1:?tier_core_us_per_harness <wall_clock_s> <harnesses>}" n="${2:?}"
+  (( n > 0 )) || return 2
+  printf '%d\n' $(( s * 1000000 / n ))
+}
+
+# tier_core_us_per_harness_ref <environment>
+#
+# The constant is spelled ONCE, above, and every reader comes through here --
+# the same rule --budget and --cal-us already follow, and for the same reason: a
+# reference spelled in the caller is moved by a one-line edit in a file nobody
+# reviews as the policy change it is.
+tier_core_us_per_harness_ref() {
+  case "${1:?tier_core_us_per_harness_ref <environment>}" in
+    pristine)       printf '%d\n' "$TIER_CORE_US_PER_HARNESS_REF_PRISTINE" ;;
+    installed-host) printf '%d\n' "$TIER_CORE_US_PER_HARNESS_REF_INSTALLED" ;;
+    *) return 2 ;;
+  esac
+}
+
+# tier_core_growth_pct_of_ref <us_per_harness> <environment>
+tier_core_growth_pct_of_ref() {
+  local u="${1:?tier_core_growth_pct_of_ref <us_per_harness> <environment>}" r
+  r="$(tier_core_us_per_harness_ref "${2:?}")" || return 2
+  (( r > 0 )) || return 2
+  printf '%d\n' $(( u * 100 / r ))
+}
+
+
 # DIVE-2710 §2.5: TIER_CAL_BASELINE_US is a measurement with no environment attached,
 # which is exactly the thing nobody ever re-reads. The runner measures it every run, so
 # grading it is free: past this drift the run says RE-BASELINE rather than absorbing the

@@ -918,6 +918,130 @@ if [[ -z "$_ord" ]]; then
   ok "every job that runs the budgeted runner BUILDS THE BUNDLE FIRST, in that job — the calibration probe spawns it, and a missing bundle now fails closed"
 else bad "every job that runs the budgeted runner builds the bundle first, in that job" "offending job(s): $_ord"; fi
 
+# ------------------ DIVE-3477: THE CORPUS-GROWTH TRIPWIRE, GRADED AS ARITHMETIC
+# The shard restored headroom, which is how corpus growth becomes invisible again, so
+# main's ruling made a growth metric the condition it landed under: raw microseconds per
+# harness against a FIXED reference, independent of shard count and of the calibration
+# clamp. Those three properties are the deliverable — so they are graded HERE, on the
+# function, rather than asserted in the comment beside it. An assertion in a comment is
+# not a control (arm 98's own lesson, one row later).
+want "us per harness is the summed wall over the summed harness COUNT" \
+  "1048231" "$(tier_core_us_per_harness 326 311)"
+
+# SHARD-COUNT INDEPENDENCE. Arm 98 pins the matrix at two; this metric must be
+# indifferent to that number regardless, because a metric that moves when the matrix does
+# is a metric that reports a capacity change as a corpus change. Same corpus, same total
+# wall, split three ways instead of two:
+want "two shards and three shards over the SAME corpus give the same figure" \
+  "$(tier_core_us_per_harness $((149 + 177)) $((156 + 155)))" \
+  "$(tier_core_us_per_harness $((109 + 108 + 109)) $((104 + 104 + 103)))"
+want "and an UNSHARDED run of that corpus gives it too — this is the number main's runs already carry" \
+  "$(tier_core_us_per_harness 326 311)" "$(tier_core_us_per_harness $((326)) $((311)))"
+
+# The runner's own report is the only input, and a corpus that GREW must move it: 320
+# harnesses at 345s is 3% dearer per harness than 311 at 326s, which is the movement a
+# raw wall-clock sum against a per-shard cap cannot show once sharding restored headroom.
+_g1="$(tier_core_us_per_harness 326 311)"; _g2="$(tier_core_us_per_harness 345 320)"
+if (( _g2 > _g1 )); then
+  ok "a corpus that grew reads DEARER even when the wall-clock barely moved — the whole point of dividing by the count"
+else bad "a grown corpus reads dearer" "$_g1 vs $_g2"; fi
+
+if tier_core_us_per_harness 326 0 >/dev/null 2>&1; then
+  bad "a zero harness count REFUSES rather than dividing by it" "returned 0"
+else ok "a zero harness count REFUSES rather than dividing by it"; fi
+
+# CLAMP INDEPENDENCE, asserted on the code and not on the intent. wall/draw is circular —
+# it assumes the probe explains the corpus, which is the proposition DIVE-2736 exists to
+# TEST and which it marked DISCORDANT on the very run that arithmetic was applied to
+# (DIVE-3476: 305s/280s by hand against 340s/353s by the instrument, a sign flip on the
+# leg carrying the conclusion). So the metric must not be able to read a calibration
+# field, and "must not" is a property of the function body.
+_calread="$(sed -n '/^tier_core_us_per_harness()/,/^}/p' tests/lib/tier.sh \
+             | grep -cE 'cal_|CAL_|SCALE|scale|effective' || true)"
+want "the growth figure reads NO calibration field — the clamp is the mechanism that made growth invisible, and a metric that inherits it inherits the defect" \
+  "0" "$_calread"
+
+# THE REFERENCE IS SPELLED ONCE, beside the tier definition. Same rule as --budget and
+# --cal-us: a reference spelled in the caller is moved by a one-line YAML edit that nobody
+# reviews as the policy change it is.
+want "the reference constant is spelled exactly once in the tree" \
+  "1" "$(grep -rn '^TIER_CORE_US_PER_HARNESS_REF_PRISTINE=' --include='*.sh' --include='*.yml' . 2>/dev/null | wc -l)"
+_wfref="$(grep -rnE '109415[0-9]|113398[0-9]' .github/workflows/ 2>/dev/null || true)"
+if [[ -z "$_wfref" ]]; then
+  ok "NO workflow spells the reference value — it comes through tier_core_us_per_harness_ref or not at all"
+else bad "NO workflow spells the reference value" "$_wfref"; fi
+if tier_core_us_per_harness_ref not-an-environment >/dev/null 2>&1; then
+  bad "an unknown environment REFUSES rather than inventing a reference" "returned 0"
+else ok "an unknown environment REFUSES rather than inventing a reference"; fi
+
+# IT STARTS AT PARITY, WHICH IS THE ONLY REASON IT CAN SHIP. TIER_BUDGET_CORE cannot be
+# met today (340s/353s at typical per-harness cost against a 300s cap), so a metric
+# referenced to anything but TODAY would red on day one and be muted by the end of the
+# week. The first sharded run on main, 31941359141: pristine 137s+168s over 156+155
+# harnesses, installed-host 176s+168s over the same corpus.
+want "the reference starts UNDER parity on run one, pristine" \
+  "89" "$(tier_core_growth_pct_of_ref "$(tier_core_us_per_harness $((137 + 168)) $((156 + 155)))" pristine)"
+want "the reference starts UNDER parity on run one, installed-host" \
+  "97" "$(tier_core_growth_pct_of_ref "$(tier_core_us_per_harness $((176 + 168)) $((156 + 155)))" installed-host)"
+
+# THE FIRING HALF. Split from emission deliberately: per-run us/harness moved 935483 ..
+# 1148867 on main across three hours in which the corpus moved by two harnesses, so a
+# per-run threshold against a fixed reference fires on the runner and gets muted. The
+# window median is what survives that, and these arms grade that it does.
+_TW=scripts/core-growth-tripwire.sh
+_twd="$TMP/tw"; rm -rf "$_twd"; mkdir -p "$_twd"
+_mkrun() {   # <file> <pristine_us> <installed_us>
+  { printf 'unsharded_total_s pristine 326 311 2\n'
+    printf 'core_us_per_harness pristine %s 311 2 ref=1094155 pct_of_ref=0\n' "$2"
+    printf 'core_us_per_harness installed-host %s 311 2 ref=1133986 pct_of_ref=0\n' "$3"
+  } > "$1"
+}
+for i in 1 2 3 4 5; do _mkrun "$_twd/at-ref-$i.txt" 1094155 1133986; done
+_OUT="$(bash "$_TW" "$_twd"/at-ref-*.txt 2>&1)"; _RC=$?
+if (( _RC == 0 )) && [[ "$_OUT" == *"pristine        CLEAR"* && "$_OUT" == *"installed-host  CLEAR"* ]]; then
+  ok "a window sitting AT the reference is CLEAR — the metric does not fire on the day it ships"
+else bad "a window at the reference is CLEAR" "rc=$_RC $_OUT"; fi
+
+# A window of four is under the floor. UNDETERMINED, not CLEAR: an environment that drops
+# out of the window silently is an environment nobody is watching.
+_OUT="$(bash "$_TW" "$_twd"/at-ref-1.txt "$_twd"/at-ref-2.txt "$_twd"/at-ref-3.txt "$_twd"/at-ref-4.txt 2>&1)"; _RC=$?
+if [[ "$_OUT" == *UNDETERMINED* && "$_OUT" != *CLEAR* && "$_OUT" != *FIRED* ]]; then
+  ok "a window under the run floor reports UNDETERMINED rather than CLEAR — too few points reads exactly like enough of them"
+else bad "a short window is UNDETERMINED" "rc=$_RC $_OUT"; fi
+
+# A DRAW SPIKE MUST NOT FIRE IT. Two runs of the five drawing 141% (the census maximum)
+# against three at the reference: the mean would clear 110%, the median does not.
+for i in 1 2 3; do _mkrun "$_twd/spike-$i.txt" 1094155 1133986; done
+for i in 4 5; do _mkrun "$_twd/spike-$i.txt" 1542758 1598920; done
+_OUT="$(bash "$_TW" "$_twd"/spike-*.txt 2>&1)"; _RC=$?
+if (( _RC == 0 )) && [[ "$_OUT" == *"pristine        CLEAR"* ]]; then
+  ok "two runner-draw spikes in five runs do NOT fire the tripwire — a median is what survives a 74-141% draw spread, and an alarm that cries wolf is muted"
+else bad "a draw spike does not fire the tripwire" "rc=$_RC $_OUT"; fi
+
+# AND IT MUST STILL FIRE ON A REAL RISE, or it is a green that means nothing. Every run
+# 15% dearer per harness.
+for i in 1 2 3 4 5; do _mkrun "$_twd/grown-$i.txt" 1258278 1304084; done
+_OUT="$(bash "$_TW" "$_twd"/grown-*.txt 2>&1)"; _RC=$?
+if (( _RC == 0 )) && [[ "$_OUT" == *FIRED* && "$_OUT" == *"FILE A ROW"* ]]; then
+  ok "a corpus 15% dearer across the whole window FIRES, and says to file a row"
+else bad "a real rise FIRES" "rc=$_RC $_OUT"; fi
+_OUT="$(bash "$_TW" --strict "$_twd"/grown-*.txt 2>&1)"; _RC=$?
+if (( _RC == 7 )); then
+  ok "--strict is the seam for an agent that wants an exit code to hang a filing action off (rc=7)"
+else bad "--strict exits 7 on a fired window" "rc=$_RC"; fi
+
+# FIRING FILES A ROW. IT DOES NOT RED A BUILD. main authorised a metric, not a gate, and
+# widening one mid-ship is how a tripwire becomes a second cap nobody agreed to.
+# INVOCATION, not mention. The printing job's summary text names the tripwire on purpose
+# — a reader who finds the emitted figure must be able to find the thing that reads it —
+# so the arm looks for the script in COMMAND position and nowhere else.
+_twwf="$(grep -rhE '(^|[|&;]|bash )[[:space:]]*(\./)?scripts/core-growth-tripwire\.sh' .github/workflows/ 2>/dev/null | grep -v '^[[:space:]]*#' || true)"
+if [[ -z "$_twwf" ]]; then
+  ok "NO workflow runs the tripwire — firing files a row, it does not red a build, and there is no new required context"
+else bad "NO workflow runs the tripwire" "$_twwf"; fi
+rm -rf "$_twd"
+
+
 # ------------------------ 61-73 DIVE-2736: THE PROBE IS GRADED AGAINST THE CORPUS
 # THE MEASUREMENT THAT FORCED THIS, on core/installed-host, same PR, 13 minutes apart:
 #
