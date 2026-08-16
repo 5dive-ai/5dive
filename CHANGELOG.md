@@ -1,6 +1,59 @@
 # Changelog
 
-## Unreleased — fix(usage): the middle wildcard is a read too (DIVE-3419)
+## v0.19.36 — fix(task): the merge gate learns two shapes it could not express (DIVE-3458)
+
+`task done` refuses to close a row until its bound pull request is merged to main.
+That is right when merging is our action, and wrong in two measured cases where the
+row could never satisfy it by any work we do.
+
+**A submission into a repository we do not own.** Merging is a third party's
+decision on their timeline — six rows (awesome-list submissions) were in that class,
+two already blocked. The gate no longer applies when the bound delivery names a repo
+whose owner is not ours, decided from the reference's host and owner and never from
+the title. The close still records what was submitted, where, its measured state,
+and whose decision the merge is: it asserts the submission was made, never that it
+was accepted. It is audited as a foreign delivery rather than as a bypassed safety
+check, which is what `--force-merge-gate` recorded when used for this six times in a
+fortnight.
+
+**A closed-unmerged binding whose work landed by another route.** A pull request
+closed rather than merged, whose commits are on main anyway, was unclosable from any
+seat: the gate read only the merge flag, and the remedy it printed — merge it —
+cannot be performed on a closed PR whose content is already in main. It now accepts
+on the evidence it already trusts everywhere else, ancestry of the pull request's
+head plus a commit on main naming the row, and both are required so an empty branch
+cannot close a row that delivered nothing. When it still refuses, the message names
+what was measured and offers remedies that exist.
+
+Neither arm weakens the gate: an unmerged pull request in our own repositories is
+refused exactly as before, and any probe that cannot reach its answer declines the
+new acceptance rather than granting it.
+
+## v0.19.36 — fix(agent-start): a seat running on a possibly STALE token now says so where anyone looks (DIVE-3455)
+
+`assert_cred_seeded` splits the present-but-unreadable credential into two
+verdicts, and DIVE-3442 gave the breadcrumb to only one of them. The other —
+the agent's own copy is PRESENT while the shared/profile copy cannot be read —
+still printed to stderr and stopped there. `agent list`'s health rail and
+`selfcheck_cred_reached_agent` both read `~/.5dive-cred-seed-failed` and neither
+reads journald, so that branch stayed exactly as invisible as the bug DIVE-3442
+fixed, and it is the worse of the two: the seat authenticates fine today on a
+local token that no future rotation can replace, and looks healthy right up
+until the old key is revoked.
+
+It now writes the breadcrumb too, with text that names **STALE** rather than
+UNAUTHENTICATED. They are different faults with different repairs — this seat is
+running on the wrong token, the other cannot start at all — and keeping them
+distinct is what `cred_seed_why` exists for. The health rail's fixed prose no
+longer asserts "it is UNAUTHED" over a recorded reason that may say otherwise.
+
+The write itself is now a single `cred_seed_breadcrumb_write` used by every
+caller. It had two implementations (`cred_seed_failed`, plus an inlined copy in
+the branch DIVE-3442 fixed), which is how a third branch came to be written with
+none: a rule with more than one implementation is one the next branch can be
+written without.
+
+## v0.19.36 — fix(usage): the middle wildcard is a read too (DIVE-3419)
 
 Both transcript readers in `cmd_usage.sh` used `projects/*/*.jsonl`. `usage_collect` was guarded at the
 **top** (`probe_readable` on `projects/`) and the **bottom** (per-file `except OSError`) of a *three*-level
@@ -30,7 +83,7 @@ true** — and every "⚠ N NOT checked — burn is unknown (not 0)" banner buil
   ANY-UID arm (`ELOOP`, which root cannot resolve either) so a uid-0 CI run cannot be a vacuous green, and
   over-fire controls. **9/14 pre-fix, 23/0 after.**
 
-## Unreleased — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
+## v0.19.36 — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
 
 Nothing validated these columns. The work-picker dispatches on `assignee`, so a row on a name that is
 not a registered agent was **structurally undispatchable** — not blocked, not parked, not flagged, and
@@ -54,7 +107,7 @@ never once a dispatch target) and corroborated here (5 open rows).
 - **`wip-cap-install`** read the same unvalidated column (it had minted `wip_cap:cli`, a lane ceiling
   for an agent that does not exist). It now skips unregistered lanes and **names the skip**.
 
-## Unreleased — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
+## v0.19.36 — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
 
 `5dive agent config <name> set channels=<current>,buzz` could not succeed on any seat that was not
 **created** with buzz. `cmd_config` dispatches `install_channel_for_agent` for telegram, discord and
@@ -87,7 +140,7 @@ arms grade the satisfier next to the gate, and drive `cmd_config` for real — w
 that the same call reaches the restart once the cache is staged, so the rollback arms cannot pass
 against a `cmd_config` that simply refuses everything.
 
-## Unreleased — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
+## v0.19.36 — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
 
 DIVE-2483's gate answer said the preservation notice lands on **stdout**. It lands on **stderr**,
 via the fleet's `warn()`. Six arms were written for that condition and all six were green, because
@@ -121,7 +174,7 @@ Still open and scoped out on purpose: `task reject` remains an unguarded writer 
 column (`src/cmd_task.sh:4235`). That is a design question about accumulating verifier feedback, not
 this gap.
 
-## Unreleased — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
+## v0.19.36 — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
 
 DIVE-3272 taught the supervisor BOARD to see a seat that is alive and closing nothing. The
 drill-down people actually type kept printing only liveness: `state: active / enabled` was
@@ -163,7 +216,7 @@ supervisor:  quota-exhausted / quota-exhausted — pane shows a model-capacity r
 - `agent list` is unchanged — it is the survey surface, and this is a per-agent drill-down
   (three sqlite reads), deliberately not an N-way fan-out.
 
-## Unreleased — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
+## v0.19.36 — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
 
 A gate reaches the filer's lead only if `_GATE_ENG_SHIP_RX` matches the ask or the row
 title. `gate_builder_routing` is OFF by default, so for an ordinary builder ship gate that
@@ -227,7 +280,7 @@ prose for identifiers.
   `gate_access_lead_clear`, `gate_internal_ops_floor`, `task_needs_human_parity`,
   `task_inbox_json_tier`, `push_unit`, `broker_surface`, + 15 more).
 
-## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
+## v0.19.36 — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
 
 DIVE-1935's first iteration was rejected, and for the right reason. It added a
 `sudo -n -u claude gh auth token` arm to `_gate_gh_token` justified by *"agents hold
