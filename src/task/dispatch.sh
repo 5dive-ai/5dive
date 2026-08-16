@@ -259,6 +259,7 @@ cmd_task() {
     answer)          cmd_task_answer "$@" ;;
     clear-recs)      cmd_task_clear_recs "$@" ;;
     precedent)       cmd_task_precedent "$@" ;;
+    pfr-autoclear)   cmd_task_pfr_autoclear "$@" ;;   # DIVE-3481 inert push-for-review auto-clear switch
     routing)         cmd_task_routing "$@" ;;
     reclaim)         cmd_task_reclaim "$@" ;;   # DIVE-1967 worktree node_modules reclaim
     rm|delete)       cmd_task_rm "$@" ;;
