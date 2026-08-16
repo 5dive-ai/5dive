@@ -332,6 +332,27 @@ fi
 # called from a context that didn't set it — taking the rest of the seed's
 # diagnostics down with it. (That is not hypothetical: it is what the
 # block-extraction unit test caught the first time this was written.)
+#
+# DIVE-3456 — THE INVARIANT THIS SINGLE PATH RESTS ON, stated here because it is
+# stated nowhere else and it is not visible from this function.
+# ONE breadcrumb path per seat, written by SIX credential families (devin, codex,
+# grok, hermes, openclaw, antigravity) and cleared by five `cred_seed_ok` call
+# sites plus two `cred_seed_breadcrumb_write` verdicts in assert_cred_seeded. In
+# file order a later family's success `rm` sits AFTER an earlier family's failure
+# write, so on its face a healthy antigravity seed erases a failed openclaw
+# verdict and the seat renders healthy.
+# It cannot happen today, and the ONLY reason is this: every seed block is gated
+# on `[[ "$TYPE" == <one value> ]]` at top level, and TYPE is assigned once from
+# AGENT_TYPE and never reassigned — so exactly one credential family ever seeds
+# in one boot, and the single path has exactly one writer per boot.
+# THE DAY THAT STOPS BEING TRUE — a type that wraps another, a fallback
+# provider, a multi-runtime seat — this becomes last-writer-wins and the LOSING
+# family's failure GOES SILENT, which is precisely the invisible-failure class
+# DIVE-3442 was spent on. If you add a seed block that can run alongside another,
+# do not add it against this path: make the breadcrumb per-type (and teach both
+# readers — `selfcheck_cred_reached_agent` in cmd_agent_create.sh and
+# `_agent_cred_seed_failure` in cmd_agent_runtime.sh, which each read this one
+# fixed path) to read all of them, before the second family ships.
 cred_seed_breadcrumb_path() { printf '%s/.5dive-cred-seed-failed' "${HOME:-/tmp}"; }
 # DIVE-3455: ONE implementation of the write. Four callers want the breadcrumb
 # with different prose — cred_seed_failed's `warn:` line and assert_cred_seeded's

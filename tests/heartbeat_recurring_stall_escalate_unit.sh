@@ -133,7 +133,7 @@ case " $(sent) " in
   *)         bad_t "the OLD assignee is told in the same breath" "sends went to: [$(sent)]" ;;
 esac
 case " $(sent) " in
-  *" main "*) ok_t "the coordinator is told" ;;
+  *" ops "*) ok_t "the coordinator is told" ;;
   *)          bad_t "the coordinator is told" "sends went to: [$(sent)]" ;;
 esac
 [[ -n "$(db "SELECT 1 FROM lifecycle_events WHERE kind='task.recurring_stall_escalated' AND ident='DIVE-2694' LIMIT 1;")" ]] \
