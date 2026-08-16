@@ -121,9 +121,13 @@ report_stale() {
   # None of the three -> FINDING. It may be the only copy. Report it; never delete it.
   # Age is still printed, as a fact about the branch. It is not the classifier.
   #
-  # THE FAILURE DIRECTION IS DELIBERATE: a missing or truncated evidence source
-  # makes this section report MORE findings, never fewer. Nothing is ever
-  # attributed on the ABSENCE of a reading.
+  # THE FAILURE DIRECTION IS DELIBERATE, AND IT IS OWED PER ARM: a missing or
+  # truncated evidence source makes this section report MORE findings, never
+  # fewer. Nothing is ever attributed on the ABSENCE of a reading — and nothing
+  # is moved OUT of the findings section on one either, which is the half arm 2
+  # got wrong first (DIVE-2394 iteration 2). Every arm below therefore has a
+  # distinct "could not read this" state, its own counter, and its own footer:
+  # a run that could not see an evidence source must say which one.
   local ident_prefixes="${BRANCH_HYGIENE_IDENT_PREFIXES:-DIVE|OSS|CNCL|INST|MOB|STEER|CX}"
   local max_subject_pages="${BRANCH_HYGIENE_SUBJECT_PAGES:-20}"
 
@@ -168,8 +172,39 @@ report_stale() {
   done
   if [[ "$subj_state" == ok ]] && (( page > max_subject_pages )); then subj_state=truncated; fi
 
-  # Pass 2 — classify.
-  local br_findings=0 br_landed=0 br_orphan=0 br_unknown=0
+  # Arm 2's evidence-availability probe. `gh api` exits non-zero for a 404 (no
+  # common ancestor, which is a FACT about the branch) and for a rate limit, a
+  # 5xx or a token-scope refusal (which is the absence of a reading) alike, so
+  # an empty compare status has two causes whose remedies are OPPOSITE: "by
+  # design, ignore this forever" and "this told you nothing, re-run it". Reading
+  # both as ORPHAN files the branch under "preserved, not stale, do not sweep"
+  # and drops it out of the findings section — measured on the DIVE-2394 report
+  # mock with both compare arms rate-limited: 2 findings became 0, and
+  # `dive-2067-verify-over-closed` (the branch from the DIVE-2389 audit that
+  # held a live defect fix existing nowhere else) landed in the preserved
+  # bucket. A digest reading "0 findings" is an all-clear.
+  #
+  # Discriminate by asking the SAME endpoint a question whose answer is known:
+  # <default>...<default> is `identical` whenever compare is readable at all.
+  # Asked LAZILY, only when a compare comes back empty, so a run with no orphan
+  # branch pays nothing; and the `unavailable` verdict is sticky for the rest of
+  # the run, because that direction over-reports.
+  local cmp_state=ok
+  compare_endpoint_readable() {
+    [[ "$cmp_state" == ok ]] || return 1
+    local probe
+    probe=$("$GH_BIN" api \
+      "repos/$repo/compare/$(urlencode "$default_branch")...$(urlencode "$default_branch")" \
+      --jq .status 2>/dev/null || true)
+    [[ "$probe" == identical ]] && return 0
+    cmp_state=unavailable
+    return 1
+  }
+
+  # Pass 2 — classify. `cmp_unavail` is a per-run tally, NOT a fifth bucket: the
+  # four buckets below must still sum to the branch count, so a branch whose
+  # arm-2 read failed is counted where arms 1 and 3 actually placed it.
+  local br_findings=0 br_landed=0 br_orphan=0 br_unknown=0 cmp_unavail=0
   local f_out="$rtmp/findings" l_out="$rtmp/landed" o_out="$rtmp/other"
   : >"$f_out"; : >"$l_out"; : >"$o_out"
 
@@ -196,7 +231,9 @@ report_stale() {
     # Arm 2, and the orphan detector with it. `status` on this repo is an
     # INTENTIONAL orphan with no common ancestor — the zero-human badge, written
     # daily by `5dive proof publish` — and an ancestry-based sweep flags it every
-    # single week. Compare fails on it, which is the signal, not an error.
+    # single week. Compare fails on it, which is the signal, not an error — but
+    # ONLY once `compare_endpoint_readable` has separated that failure from a
+    # compare nobody could read; see the probe above.
     local cmp_status
     cmp_status=$("$GH_BIN" api \
       "repos/$repo/compare/$(urlencode "$default_branch")...$(urlencode "$branch")" \
@@ -208,9 +245,21 @@ report_stale() {
         continue
         ;;
       "")
-        echo "- \`${branch}\` — ORPHAN no-common-ancestor with \`${default_branch}\` (by design, or unreadable this run) — preserved, not stale, do not sweep — ${age_note}" >>"$o_out"
-        br_orphan=$((br_orphan + 1))
-        continue
+        # Empty has two causes. Ask the probe which one this is, and never let
+        # them share a detail string: one says "ignore this forever", the other
+        # says "re-run, this run told you nothing".
+        if compare_endpoint_readable; then
+          echo "- \`${branch}\` — ORPHAN no-common-ancestor with \`${default_branch}\` (by design) — preserved, not stale, do not sweep — ${age_note}" >>"$o_out"
+          br_orphan=$((br_orphan + 1))
+          continue
+        fi
+        # Arm 2 did not RUN for this branch, so it says nothing about it — and an
+        # arm that said nothing must not be able to move a branch OUT of the
+        # findings section. Fall through to arm 3 and let the branch be
+        # classified on the arms that did run. `status` then reports as a
+        # no-ident FINDING instead of ORPHAN, which over-reports; that is the
+        # signed direction, and the footer says which arm was missing.
+        cmp_unavail=$((cmp_unavail + 1))
         ;;
     esac
 
@@ -262,6 +311,11 @@ report_stale() {
   if (( br_orphan > 0 || br_unknown > 0 )); then
     echo "#### Neither — preserved, and not counted as findings"
     cat "$o_out"
+    echo
+  fi
+
+  if [[ "$cmp_state" == unavailable ]]; then
+    echo "_The \`compare\` endpoint could not be read this run: arm 2 did not run for ${cmp_unavail} branch(es), and no branch was attributed OR filed as an orphan on its absence. A branch with no common ancestor is indistinguishable from an unreadable compare while this is true, so \`${default_branch}\`-orphans such as an intentional badge branch report as findings here. Re-run before acting on this section._"
     echo
   fi
 
