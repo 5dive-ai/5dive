@@ -383,11 +383,19 @@ r=$(new "$tB2"); rcB2="${r%%:*}"; fB2="${r#*:}"
   && ok_t "DIVE-3374: the boundary turn is charged ONCE, to the later segment (100 / 1200)" \
   || bad_t "boundary turn mis-charged" "f1=$fB1 f2=$fB2 (expected 100/1200; 1000/1200 is the double-charge)"
 # (iii) THE ARITHMETIC. The parts must sum to the corpus, not to corpus+boundary.
-sumB=$(( ${fB1:-0} + ${fB2:-0} ))
-[[ "$sumB" == "$SESSION_CORPUS" ]] \
-  && ok_t "DIVE-3374: the two rows SUM to the session corpus ($sumB == $SESSION_CORPUS)" \
-  || bad_t "the parts oversum the whole — the shared second is billed twice" \
-           "sum=$sumB corpus=$SESSION_CORPUS oversum=$((sumB-SESSION_CORPUS))"
+# Both figures are checked for NUMBERHOOD first: the reader's other exits are the
+# WORDS AMBIGUOUS / NOT-REACHED, and `$(( AMBIGUOUS + ... ))` under `set -u` is an
+# unbound-variable abort that kills the harness mid-file — every arm after this
+# point would then be silently unrun rather than red.
+if [[ "$fB1" =~ ^[0-9]+$ && "$fB2" =~ ^[0-9]+$ ]]; then
+  sumB=$(( fB1 + fB2 ))
+  [[ "$sumB" == "$SESSION_CORPUS" ]] \
+    && ok_t "DIVE-3374: the two rows SUM to the session corpus ($sumB == $SESSION_CORPUS)" \
+    || bad_t "the parts oversum the whole — the shared second is billed twice" \
+             "sum=$sumB corpus=$SESSION_CORPUS oversum=$((sumB-SESSION_CORPUS))"
+else
+  bad_t "the parts cannot be summed — a figure is not a number" "f1=$fB1 f2=$fB2"
+fi
 # (iv) the control, so the arm is not vacuous: the shipped assignee-window reader
 # eats the decoy session AND double-charges the same boundary second.
 oB1=$(old "$tB1"); oB2=$(old "$tB2")
