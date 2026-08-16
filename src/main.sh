@@ -230,7 +230,9 @@ Projects (ident namespaces for the queue; default 'dive' = DIVE-N):
   5dive loop spawn --role=<r> --agent=<a> --prompt="…" [--ceiling=<tok>] [--wait[=<sec>]]  # orchestration (JSON in/out)
   5dive goal add "<outcome>" [--dry-run] [--max-tasks=N] [--yes]   # outcome -> validated, guardrailed task graph
   5dive objective add "<name>" --metric-cmd="<cmd>" --target=<n> [--direction=up|down] [--unit=%] [--public]  # standing goal bound to a read-only metric
-  5dive objective ls | show <name> | tick [<name>] | pause <name> | resume <name> [--force] | rm <name>  # resume preflights the planner role
+  5dive objective ls [--all] | show <name> | tick [<name>] | pause <name> | resume <name> [--force]  # resume preflights the planner role
+  5dive objective rm <name> [--reason="<why>"] [--ref=<task>]      # RETIRES (tombstone): keeps the audited cycles + readings, hidden from ls
+  5dive objective rm <name> --purge --yes                          # the destructive one: deletes the cycles + readings too
   5dive objective replan <name> [--max-new-per-cycle=N] [--no-progress-limit=N] [--dry-run] [--yes] [--force] [--from-gate=<id>]  # re-plan cycle: preflight -> metric -> guardrailed diff -> gate -> apply; explicit stops (/)
 
 Org chart (who reports to whom):

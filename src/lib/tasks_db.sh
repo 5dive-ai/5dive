@@ -1037,7 +1037,8 @@ INSERT OR IGNORE INTO task_prefs(key,value)
 --   direction  up|down — which way is "better" (target gap + trend sign)
 --   public     1 => eligible for the public proof feed (rides proof publish in a
 --              later phase; this build does not touch cmd_proof.sh)
---   status     active|paused — paused objectives are not ticked
+--   status     active|paused|retired — only 'active' is ticked; 'retired' is the
+--              DIVE-2512 tombstone (see the retired_* columns below)
 -- Additive, never referenced by tasks/projects, so it can't touch the queue.
 -- Defined identically inside _tasks_db_migrate for pre-existing stores; keep the
 -- two copies byte-identical (tests/schema_sync_unit.sh).
@@ -1055,6 +1056,18 @@ CREATE TABLE IF NOT EXISTS objectives (
   budget            INTEGER,
   public            INTEGER NOT NULL DEFAULT 0,
   status            TEXT NOT NULL DEFAULT 'active',
+  -- DIVE-2512 tombstone. `objective rm` RETIRES (status='retired') instead of
+  -- DELETEing, because the FKs below are ON DELETE CASCADE: one hard delete took
+  -- objective_cycles and objective_readings with it, after which an authorized
+  -- retirement rendered IDENTICALLY to a catastrophic table wipe (DIVE-2507 was
+  -- filed as an incident over exactly that, and reconstructing the truth needed an
+  -- offsite-snapshot diff). These four columns make the row itself answer "who
+  -- decided this, when, why, on whose authority". Real deletion is reserved for an
+  -- explicit `objective rm --purge`.
+  retired_at        TEXT,
+  retired_by        TEXT,
+  retired_reason    TEXT,
+  retired_ref       TEXT,
   -- OSS-27 shadow-first run mode (OSS-35): 'live' (default) applies a re-plan
   -- cycle's non-origination changes within the objective's own-task autonomy,
   -- 'shadow' forces PROPOSE-ONLY -- the entire diff rides ONE gate a human
@@ -2160,6 +2173,18 @@ CREATE TABLE IF NOT EXISTS objectives (
   budget            INTEGER,
   public            INTEGER NOT NULL DEFAULT 0,
   status            TEXT NOT NULL DEFAULT 'active',
+  -- DIVE-2512 tombstone. `objective rm` RETIRES (status='retired') instead of
+  -- DELETEing, because the FKs below are ON DELETE CASCADE: one hard delete took
+  -- objective_cycles and objective_readings with it, after which an authorized
+  -- retirement rendered IDENTICALLY to a catastrophic table wipe (DIVE-2507 was
+  -- filed as an incident over exactly that, and reconstructing the truth needed an
+  -- offsite-snapshot diff). These four columns make the row itself answer "who
+  -- decided this, when, why, on whose authority". Real deletion is reserved for an
+  -- explicit `objective rm --purge`.
+  retired_at        TEXT,
+  retired_by        TEXT,
+  retired_reason    TEXT,
+  retired_ref       TEXT,
   -- OSS-27 shadow-first run mode (OSS-35): 'live' (default) applies a re-plan
   -- cycle's non-origination changes within the objective's own-task autonomy,
   -- 'shadow' forces PROPOSE-ONLY -- the entire diff rides ONE gate a human
@@ -2289,6 +2314,19 @@ MIG
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE objectives ADD COLUMN run_mode TEXT NOT NULL DEFAULT 'live';" >/dev/null 2>&1 || true
     fi
+    # DIVE-2512 tombstone columns for stores whose objectives table predates them.
+    # Pure expand, all NULLable with no default: a NULL retired_at on every existing
+    # row is exactly right — none of them was retired through the new path, and any
+    # objective an OLD binary already hard-deleted is gone and cannot be backfilled.
+    # Deliberately NOT guarded on retired_at alone: each column is checked on its own
+    # so a store that took a partial expand (one ALTER lost to a lock) still converges
+    # on the next run instead of being permanently one column short.
+    local _tomb_col
+    for _tomb_col in retired_at retired_by retired_reason retired_ref; do
+      grep -qx "$_tomb_col" <<<"$obj_cols" && continue
+      sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+        "ALTER TABLE objectives ADD COLUMN $_tomb_col TEXT;" >/dev/null 2>&1 || true
+    done
   fi
   # DIVE-3342 humans + human_agents for existing stores. Guarded on the table it
   # creates (the DIVE-1922 lesson: nesting it under another table's absence check

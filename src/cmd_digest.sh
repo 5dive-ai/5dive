@@ -245,7 +245,7 @@ cmd_digest() {
                       (SELECT value FROM objective_readings r WHERE r.objective_id=o.id AND r.value IS NOT NULL ORDER BY r.id DESC LIMIT 1) AS current,
                       (SELECT value FROM objective_readings r WHERE r.objective_id=o.id AND r.value IS NOT NULL AND r.ts < datetime('now', $(sqlq "$_obj_wstart")) ORDER BY r.id DESC LIMIT 1) AS baseline,
                       (SELECT COUNT(*) FROM tasks t WHERE o.project_key IS NOT NULL AND t.project_key=o.project_key AND t.kind='standard' AND t.status NOT IN ('done','cancelled')) AS inflight
-               FROM objectives o ORDER BY o.created_at;" >"$tmpd/obj.json" 2>/dev/null || echo '[]' >"$tmpd/obj.json"
+               FROM objectives o WHERE o.status <> 'retired' ORDER BY o.created_at;" >"$tmpd/obj.json" 2>/dev/null || echo '[]' >"$tmpd/obj.json"
   [ -s "$tmpd/obj.json" ] || echo '[]' >"$tmpd/obj.json"
 
   # DIVE-2306: the fleet-freeze / ahead reading. DIVE-2287 built an alarm that

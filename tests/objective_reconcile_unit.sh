@@ -121,5 +121,30 @@ _hb_objective_reconcile
 cx=$(db "SELECT outcome FROM objective_cycles WHERE objective_id=$OID AND cycle_no=92;")
 [[ "$cx" == "planner_failed" ]] && ok_t "cancelled planner task -> planner_failed" || bad_t "cancelled" "outcome=$cx"
 
+# --- DIVE-2512: a RETIRED objective's straggler cycle is NOT reconciled ---
+# Reconcile re-drives validate -> gate/materialize, so without this filter a cycle
+# left in flight when somebody retired the objective would ORIGINATE TASKS for a
+# loop that has been shut down. Built as a POSITIVE-CONTROL PAIR on one row: the
+# identical setup is proven to reconcile while the objective is live, and only then
+# retired and re-run, so "it did not move" cannot be an inert fixture.
+db "INSERT INTO objective_cycles (objective_id,cycle_no,proposed,gated,tokens_spent,outcome,planner_loop_id,planner_task_id)
+    VALUES ($OID, 93, 0,0,0,'awaiting_planner','L-RET', NULL);"
+rj=$(JSON_MODE=1 cmd_task_add --assignee=alice --body="x" -- "loop:worker retired" 2>/dev/null); rtid=$(printf '%s' "$rj" | jq -r '.data.id')
+db "UPDATE objective_cycles SET planner_task_id=${rtid} WHERE objective_id=$OID AND cycle_no=93;"
+db "UPDATE tasks SET status='cancelled' WHERE id=${rtid};"
+# control: live objective, this exact row DOES move
+_hb_objective_reconcile
+ctl=$(db "SELECT outcome FROM objective_cycles WHERE objective_id=$OID AND cycle_no=93;")
+[[ "$ctl" == "planner_failed" ]] && ok_t "control: the same straggler DOES reconcile while the objective is live" \
+  || bad_t "retired-filter control" "outcome=$ctl (the treatment arm below would be vacuous)"
+# treatment: same row re-armed, objective retired -> untouched
+db "UPDATE objective_cycles SET outcome='awaiting_planner' WHERE objective_id=$OID AND cycle_no=93;"
+db "UPDATE objectives SET status='retired', retired_at=datetime('now') WHERE id=$OID;"
+_hb_objective_reconcile
+rx=$(db "SELECT outcome FROM objective_cycles WHERE objective_id=$OID AND cycle_no=93;")
+[[ "$rx" == "awaiting_planner" ]] && ok_t "retired objective: straggler cycle left alone (no origination after a retirement)" \
+  || bad_t "retired straggler reconciled" "outcome=$rx"
+db "UPDATE objectives SET status='active', retired_at=NULL WHERE id=$OID;"
+
 printf 'objective_reconcile_unit: %s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == "0" ]]
