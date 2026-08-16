@@ -1557,7 +1557,14 @@ selfcheck_cred_reached_agent() { # <name> <type> <profile> <byo_provider>
   local bc="${AGENT_HOME_ROOT:-/home}/${user}/.5dive-cred-seed-failed" why=""
   if [[ -s "$bc" ]]; then
     why=$(tr -d '\n' < "$bc" 2>/dev/null | cut -c1-400)
-    printf 'issue:credential did NOT reach the agent (it is UNAUTHED despite a completed login) — the boot seed recorded: %s. Re-seed as root: sudo 5dive agent restart %s\n' \
+    # DIVE-3455: the fixed half of this line must not name a fault the breadcrumb
+    # may not be describing. Two faults reach here now — the seat booted with NO
+    # credential, and the seat booted on a LOCAL one that could not be compared
+    # with the profile's (STALE, and no re-auth will replace it). "It is UNAUTHED"
+    # is false for the second and sends the operator looking for a dead seat that
+    # is in fact running. The recorded reason below distinguishes them; this half
+    # states only what is true of both.
+    printf 'issue:credential did NOT reach the agent (a completed login is not proof the seat received it) — the boot seed recorded: %s. Re-seed as root: sudo 5dive agent restart %s\n' \
       "$why" "$name"
     return 0
   fi
