@@ -1078,7 +1078,14 @@ _hb_clear_active_defer() {
 # so the pane really is parked on a dialog, not mid-turn text.
 _hb_pane_is_usage_limit() {
   local pane="$1"
-  grep -qiE 'hit your (monthly[ -]?spend|usage|5[ -]?hour) limit|usage limit reached|reached your .* limit|limit reached' <<<"$pane" || return 1
+  # DIVE-3465 widened the HEADER alternation to the weekly/daily variants. It was
+  # written when the only walls in evidence were "monthly spend" and "5-hour", so
+  # a seat parked on "You've hit your weekly limit" (rolling) or "your weekly
+  # spend limit" (a ceiling) matched NOTHING here: the DIVE-1666 self-heal never
+  # fired on it and the classifier below never got to see it. The two-signature
+  # discipline is unchanged, so this does not widen the false-match surface -- a
+  # header line on its own still does not match (asserted in both harnesses).
+  grep -qiE 'hit your ((monthly|weekly|daily)([ -]?spend)?|usage|5[ -]?hour) limit|usage limit reached|reached your .* limit|limit reached' <<<"$pane" || return 1
   grep -qiE 'upgrade your plan|wait for .*limit to reset|limit will reset|resets? (at|in) ' <<<"$pane" || return 1
   return 0
 }
@@ -1089,9 +1096,156 @@ _hb_pane_is_usage_limit() {
 # a real prompt and keep deferring, never restart on a missing signal).
 _hb_usage_limit_frozen() {
   local name="$1" pane
-  pane=$(sudo -u "agent-${name}" tmux capture-pane -p -t "agent-${name}" 2>/dev/null) || return 1
+  pane=$(_hb_pane_capture "$name") || return 1
   [[ -n "$pane" ]] || return 1
   _hb_pane_is_usage_limit "$pane"
+}
+
+# DIVE-3465 — the one place the seat's live screen is read. Split out of
+# _hb_usage_limit_frozen (identical behaviour) so the wall CLASSIFIER below can
+# read the same pane without a second capture, and so a harness can stub one
+# function instead of shelling out to tmux. Empty output and a failed capture
+# are both "no reading" — callers must treat that as COULD-NOT-DETERMINE, never
+# as evidence of health.
+_hb_pane_capture() {
+  local name="$1"
+  sudo -u "agent-${name}" tmux capture-pane -p -t "agent-${name}" 2>/dev/null
+}
+
+# --- DIVE-3465: a retryable rate limit and a hard spend cap are two states -----
+# _hb_pane_is_usage_limit above answers ONE question — "is this session parked on
+# a wall dialog" — and it matches BOTH variants on purpose ("tolerant of CC copy
+# drift across the monthly-spend and 5-hour variants"). That tolerance is exactly
+# the collapse this row exists to undo, because the two walls need OPPOSITE
+# responses:
+#
+#   rate limit (rolling 5h / 7d window)  RETRYABLE. The window rolls back on its
+#       own, so press-continue / restart-and-retry is the correct answer and is
+#       what DIVE-1666/DIVE-1677 built.
+#   spend cap (monthly / weekly ceiling, credit balance)  NOT retryable until a
+#       human raises the ceiling or billing resets. Every dispatch into it is a
+#       whole session that cannot produce work: ~20 of 50 analysed sessions
+#       produced nothing, DIVE-3384 was re-attempted across 15+ sessions and
+#       still read `todo`, and the answer to the wall was ~30-40 `continue`s.
+#
+# _hb_wall_class is PURE — no tmux, no registry, no clock — so the discrimination
+# that the whole fix hangs off is unit-testable on transcript text.
+#
+# THREE outcomes, not two. A pane that IS a wall but matches neither
+# discriminator returns `undetermined` and says so. Folding "I could not tell"
+# into either verdict is the class this repo keeps re-learning
+# (tests/lib/grading_tree.sh, DIVE-2274, DIVE-3450's clamp) — and here it would
+# fold specifically toward "retry", which is the defect itself.
+#
+# ORDER IS LOAD-BEARING: the monthly-spend dialog ALSO offers "Stop and wait for
+# limit to reset", so if the reset-time arm were tested first every hard cap
+# would read as retryable. The HEADER is the discriminator, not the action line.
+_hb_wall_class() {
+  local pane="$1"
+  _hb_pane_is_usage_limit "$pane" || { printf 'none'; return 1; }
+  if grep -qiE 'hit your (monthly|weekly|daily)[ -]?spend limit|spend limit (reached|exceeded)|credit balance is too low|insufficient_quota|purchase more credits' <<<"$pane"; then
+    printf 'spend-cap'; return 0
+  fi
+  if grep -qiE '(5[ -]?hour|five[ -]?hour|usage|weekly|session) limit' <<<"$pane" \
+     && grep -qiE 'resets? (at|in) |limit will reset|try again (at|in|after)|wait for .*limit to reset' <<<"$pane"; then
+    printf 'rate-limit'; return 0
+  fi
+  printf 'undetermined'; return 0
+}
+
+# DIVE-3465 — how often a HELD seat may be PROBED to see whether the cap lifted.
+# Read this carefully: the interval decides WHEN WE LOOK. It does NOT decide when
+# the hold ends. The hold is released only by an observation — a transacting peer
+# on the same account, or the wall gone from the seat's own screen — never by
+# elapsed time, so a cap that outlasts the interval keeps holding
+# (feedback_a_pause_without_a_wake_row_outlives_its_reason). Env-overridable.
+_HB_SPEND_CAP_PROBE_MIN="${HEARTBEAT_SPEND_CAP_PROBE_MIN:-20}"
+[[ "$_HB_SPEND_CAP_PROBE_MIN" =~ ^[0-9]+$ ]] || _HB_SPEND_CAP_PROBE_MIN=20
+
+# DIVE-3465 — record that this seat is behind a hard spend cap, and echo the
+# running observation count. `at` is the FIRST observation (never overwritten, so
+# the log can say how long the seat has been held); `lastSeenAt` is this one.
+# Deliberately NOT folded into _hb_clear_active_defer's del list: that clear
+# fires on any wake/recovery bookkeeping, and releasing a billing hold as a side
+# effect of a counter reset is a release with no measurement behind it.
+# Must run under with_registry_lock, like _hb_mark_usage_heal.
+_hb_mark_spend_cap() {
+  local name="$1" now="$2" reg n at
+  reg=$(registry_read)
+  n=$(jq -r --arg n "$name" '.agents[$n].heartbeat.spendCap.n // 0' <<<"$reg")
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0; n=$(( n + 1 ))
+  at=$(jq -r --arg n "$name" '.agents[$n].heartbeat.spendCap.at // 0' <<<"$reg")
+  [[ "$at" =~ ^[0-9]+$ ]] && (( at > 0 )) || at="$now"
+  reg=$(jq --arg n "$name" --argjson at "$at" --argjson seen "$now" --argjson c "$n" '
+    .agents[$n].heartbeat.spendCap = {
+      at: $at, lastSeenAt: $seen, n: $c,
+      probedAt: (.agents[$n].heartbeat.spendCap.probedAt // 0)
+    }' <<<"$reg")
+  echo "$reg" | registry_write
+  printf '%s' "$n"
+}
+
+# DIVE-3465 — epoch of the FIRST spend-cap observation for this seat (0 = no
+# hold). This is the dispatch gate: non-zero means no row may be handed to it.
+_hb_spend_cap_at() {
+  local name="$1" reg; reg=$(registry_read)
+  jq -r --arg n "$name" '.agents[$n].heartbeat.spendCap.at // 0' <<<"$reg" 2>/dev/null || echo 0
+}
+
+# DIVE-3465 — epoch of the last release PROBE (0 = never probed).
+_hb_spend_cap_probed() {
+  local name="$1" reg; reg=$(registry_read)
+  jq -r --arg n "$name" '.agents[$n].heartbeat.spendCap.probedAt // 0' <<<"$reg" 2>/dev/null || echo 0
+}
+
+# DIVE-3465 — stamp a release probe. Must run under with_registry_lock.
+_hb_mark_spend_cap_probe() {
+  local name="$1" now="$2" reg; reg=$(registry_read)
+  reg=$(jq --arg n "$name" --argjson at "$now" '
+    if (.agents[$n].heartbeat.spendCap? // null) != null
+    then .agents[$n].heartbeat.spendCap.probedAt = $at else . end' <<<"$reg")
+  echo "$reg" | registry_write
+}
+
+# DIVE-3465 — drop the hold. Only _hb_spend_cap_lifted's verdict may call this.
+# Must run under with_registry_lock.
+_hb_clear_spend_cap() {
+  local name="$1" reg; reg=$(registry_read)
+  reg=$(echo "$reg" | jq --arg n "$name" '
+    if .agents[$n].heartbeat then .agents[$n].heartbeat |= del(.spendCap) else . end')
+  echo "$reg" | registry_write
+}
+
+# DIVE-3465 — has the cap actually LIFTED? Three-state, and the third state is
+# the point: 0 = lifted (proven by a live observation), 1 = still capped, 2 =
+# COULD-NOT-DETERMINE. An unreadable seat is 2, and 2 holds — "I could not look"
+# is not headroom.
+#
+# Two independent LIVE proofs, in cost order:
+#   (a) a sibling on the same authProfile is transacting RIGHT NOW. A spend cap
+#       is billed on the ACCOUNT, so a peer taking turns proves the account can
+#       still spend. Free, and it needs no probe.
+#   (b) the wall is gone from this seat's own screen. The dialog is a live
+#       artifact that does not self-clear, so its ABSENCE is a present-tense
+#       reading, unlike the supervisor's `quota-exhausted` pane verdict — which
+#       carries no tense and self-matches the investigator, and which this
+#       function deliberately does not consult (see the row body's TRAP).
+#
+# RESIDUAL, stated rather than left to be discovered: a seat restarted by the
+# probe below that then sits idle shows a clean pane without having asked the
+# API for anything, so (b) can read "lifted" one probe early. The cost of that
+# is ONE dispatched session, after which the wall re-arms the hold — bounded,
+# and the failure this replaces was one dispatched session per tick, forever.
+_hb_spend_cap_lifted() {
+  local name="$1" acct="$2" reg="$3" pane cls=""
+  if _hb_account_has_headroom "$name" "$acct" "$reg"; then return 0; fi
+  pane=$(_hb_pane_capture "$name") || return 2
+  [[ -n "$pane" ]] || return 2
+  cls=$(_hb_wall_class "$pane") || cls="none"
+  case "$cls" in
+    none) return 0 ;;
+    *)    return 1 ;;
+  esac
 }
 
 # DIVE-1666 — does this agent's auth account have PROVEN headroom right now? The
@@ -3784,7 +3938,7 @@ cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
   local reg now; reg=$(registry_read); now=$(date +%s)
-  local checked=0 woke=0 reaped=0 reclaimed=0 starved=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0 sk_spread=0 sk_active=0 sk_budget=0 sk_held=0
+  local checked=0 woke=0 reaped=0 reclaimed=0 starved=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0 sk_spread=0 sk_active=0 sk_budget=0 sk_held=0 sk_capped=0
   local today; today=$(date +%F)   # DIVE-1858 wake-budget day key (YYYY-MM-DD)
   # DIVE-138: materialize due recurring templates FIRST so a freshly-cloned todo
   # is eligible for the wake loop below this same tick. Isolated — a failure here
@@ -3901,6 +4055,58 @@ cmd_heartbeat_tick() {
     if [[ "${inprog:-0}" != "0" ]]; then
       sk_busy=$((sk_busy + 1)); _hb_log "[$name] busy — $inprog in_progress, skip"; continue
     fi
+
+    # --- DIVE-3465 hard-cap dispatch hold --------------------------------------
+    # THE STOP, and it is placed HERE deliberately: above the task pick, so a
+    # held seat never claims a row at all. A row nudged into a capped seat is
+    # claimed, produces nothing, and is reclaimed to `todo` — which is how
+    # DIVE-3384 consumed 15+ sessions while still reading untouched. A row left
+    # `todo` with a reason in the log is strictly better than that.
+    #
+    # The hold is armed further down (the rc==3 classifier) and released ONLY by
+    # a live measurement. Three outcomes, all of them logged — including the one
+    # that says nothing could be measured.
+    local _cap_at=0
+    _cap_at=$(_hb_spend_cap_at "$name" 2>/dev/null || echo 0)
+    [[ "$_cap_at" =~ ^[0-9]+$ ]] || _cap_at=0
+    if (( _cap_at > 0 )); then
+      local _cap_acct _cap_held_m _lift_rc=0 _cap_probed=0
+      _cap_acct=$(jq -r --arg n "$name" '.agents[$n].authProfile // ("@self:" + $n)' <<<"$reg")
+      _cap_held_m=$(( (now - _cap_at) / 60 ))
+      _hb_spend_cap_lifted "$name" "$_cap_acct" "$reg" || _lift_rc=$?
+      case "$_lift_rc" in
+        0)
+          with_registry_lock _hb_clear_spend_cap "$name" >/dev/null 2>&1 || true
+          _hb_log "[$name] spend-cap hold RELEASED after ${_cap_held_m}m — measured, not waited out: account '${_cap_acct}' is transacting or the wall is gone from the seat's screen; dispatching again (DIVE-3465)"
+          ;;
+        2)
+          sk_capped=$((sk_capped + 1))
+          _hb_log "[$name] spend-cap hold KEPT (${_cap_held_m}m) — quota state COULD-NOT-DETERMINE: seat pane unreadable and no transacting peer on '${_cap_acct}'. An unreadable probe is not headroom (DIVE-3465)"
+          continue
+          ;;
+        *)
+          # Still capped. Probe on the interval — the interval says when to LOOK,
+          # the pane read above says when the hold ENDS. The probe restarts the
+          # seat (fresh:true → no context lost) so the stale dialog cannot outlive
+          # the cap that raised it; it dispatches nothing.
+          _cap_probed=$(_hb_spend_cap_probed "$name" 2>/dev/null || echo 0)
+          [[ "$_cap_probed" =~ ^[0-9]+$ ]] || _cap_probed=0
+          if (( now - _cap_probed >= _HB_SPEND_CAP_PROBE_MIN * 60 )); then
+            with_registry_lock _hb_mark_spend_cap_probe "$name" "$now" >/dev/null 2>&1 || true
+            if systemctl restart "5dive-agent@${name}.service" 2>/dev/null; then
+              _hb_log "[$name] spend-cap hold (${_cap_held_m}m) — release PROBE fired (restart, no row dispatched); next tick re-reads the seat's screen (DIVE-3465)"
+            else
+              _hb_log "[$name] spend-cap hold (${_cap_held_m}m) — release probe restart FAILED (systemctl); hold stands, retry next window (DIVE-3465)"
+            fi
+          else
+            _hb_log "[$name] spend-cap hold (${_cap_held_m}m) — account '${_cap_acct}' still refusing; next probe in $(( (_cap_probed + _HB_SPEND_CAP_PROBE_MIN * 60 - now + 59) / 60 ))m, no row dispatched (DIVE-3465)"
+          fi
+          sk_capped=$((sk_capped + 1))
+          continue
+          ;;
+      esac
+    fi
+
     # Wake the agent against ONE concrete todo — the /goal condition needs a
     # concrete DIVE-N to evaluate reliably — but consider the queue IN ORDER
     # until one is actually runnable.
@@ -4070,6 +4276,39 @@ cmd_heartbeat_tick() {
       # only surface to the human when NO account headroom is provable (a real
       # capacity/billing call, not a stuck dialog).
       if _hb_usage_limit_frozen "$name"; then
+        # DIVE-3465 — CLASSIFY the wall before choosing a response. Everything
+        # below this point (press-continue, restart-to-test-the-window, the heal
+        # throttle) is a RETRY, and retrying is only correct against the rolling
+        # 5h/7d window. Against a monthly/weekly spend ceiling a restart cannot
+        # help by construction, and each one buys another dispatched session that
+        # produces nothing. So a spend cap arms the dispatch hold and stops here.
+        local _pane="" _wcls="undetermined"
+        _pane=$(_hb_pane_capture "$name") || _pane=""
+        if [[ -n "$_pane" ]]; then _wcls=$(_hb_wall_class "$_pane") || _wcls="none"; fi
+        if [[ "$_wcls" == "spend-cap" ]]; then
+          local _cn; _cn=$(with_registry_lock _hb_mark_spend_cap "$name" "$now")
+          sk_capped=$((sk_capped + 1))
+          _hb_log "[$name] HARD SPEND CAP on account '${acct}' (observation #${_cn:-?}) — NOT retryable: no restart, no press-continue, and no row will be dispatched to this seat until a live reading says the account can spend again (DIVE-3465)"
+          # Surface once per throttle window. This is a capacity/billing fact, so
+          # it goes to the fleet coordinator, not to the paired chat.
+          local sc_key="spend_cap_alert_${name}" sc_last sc_cut
+          sc_last=$(db "SELECT value FROM task_prefs WHERE key='${sc_key}';" 2>/dev/null)
+          sc_cut=$(date -u -d '6 hours ago' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
+          if [[ -z "$sc_last" || ( -n "$sc_cut" && "$sc_last" < "$sc_cut" ) ]]; then
+            ( cmd_send "main" --from="task-engine" \
+                --message="🔴 Spend cap, not a rate limit: agent '${name}' (account '${acct}') is refusing every request with a SPEND-limit wall, which does not reset on its own the way the 5-hour window does. The task engine has STOPPED handing rows to that seat and will re-check by measurement — nothing is queued behind a retry loop. Raising or resetting the ceiling is a billing call for lodar. (DIVE-3465)" ) >/dev/null 2>&1 || true
+            db "INSERT INTO task_prefs (key,value) VALUES ('${sc_key}', datetime('now'))
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');" 2>/dev/null || true
+          fi
+          continue
+        fi
+        if [[ "$_wcls" != "rate-limit" ]]; then
+          # EMIT THE NEGATIVE. The pane is a wall — the matcher above proved that
+          # — but nothing in it discriminates the two states. That is a third
+          # outcome, not a quiet vote for "retryable", so it is logged as such
+          # before the retry path runs on it.
+          _hb_log "[$name] WARN: parked on a wall dialog but its class is COULD-NOT-DETERMINE (read '${_wcls}') — neither a proven spend cap nor a proven rate limit; falling through to the DIVE-1666 retry path and saying so rather than silently assuming headroom (DIVE-3465)"
+        fi
         local heal_last heal_gap headroom=1
         _hb_account_has_headroom "$name" "$acct" "$reg" && headroom=0
         # DIVE-1677: headroom is PROVEN (a healthy peer on the pooled account), so
@@ -4219,8 +4458,8 @@ cmd_heartbeat_tick() {
                   | sort_by(.value.heartbeat.lastRunAt // 0)
                   | .[].key' <<<"$reg")
 
-  ok "heartbeat tick: woke ${woke} / slept ${_HB_SLEPT} / reclaimed ${reclaimed} / reaped ${reaped} / starved ${starved} / tier-held ${sk_held} / spread-deferred ${sk_spread} / active-deferred ${sk_active} / budget-skipped ${sk_budget} / checked ${checked}" \
+  ok "heartbeat tick: woke ${woke} / slept ${_HB_SLEPT} / reclaimed ${reclaimed} / reaped ${reaped} / starved ${starved} / tier-held ${sk_held} / spread-deferred ${sk_spread} / active-deferred ${sk_active} / budget-skipped ${sk_budget} / spend-capped ${sk_capped} / checked ${checked}" \
      '{checked:($c|tonumber), woke:($w|tonumber), slept:($sl|tonumber), sleepArmed:($sa|tonumber), reclaimed:($rc|tonumber), reaped:($r|tonumber), starved:($st|tonumber),
-       skipped:{notDue:($nd|tonumber), busy:($b|tonumber), noWork:($nw|tonumber), spread:($sp|tonumber), active:($ac|tonumber), budget:($bu|tonumber), failed:($sf|tonumber), tierHeld:($th|tonumber)}}' \
-     --arg c "$checked" --arg w "$woke" --arg sl "$_HB_SLEPT" --arg sa "$_HB_SLEEP_ARMED" --arg rc "$reclaimed" --arg r "$reaped" --arg st "$starved" --arg nd "$sk_notdue" --arg b "$sk_busy" --arg nw "$sk_nowork" --arg sp "$sk_spread" --arg ac "$sk_active" --arg bu "$sk_budget" --arg sf "$sk_fail" --arg th "$sk_held"
+       skipped:{notDue:($nd|tonumber), busy:($b|tonumber), noWork:($nw|tonumber), spread:($sp|tonumber), active:($ac|tonumber), budget:($bu|tonumber), failed:($sf|tonumber), tierHeld:($th|tonumber), spendCapped:($sc|tonumber)}}' \
+     --arg c "$checked" --arg w "$woke" --arg sl "$_HB_SLEPT" --arg sa "$_HB_SLEEP_ARMED" --arg rc "$reclaimed" --arg r "$reaped" --arg st "$starved" --arg nd "$sk_notdue" --arg b "$sk_busy" --arg nw "$sk_nowork" --arg sp "$sk_spread" --arg ac "$sk_active" --arg bu "$sk_budget" --arg sf "$sk_fail" --arg th "$sk_held" --arg sc "$sk_capped"
 }
