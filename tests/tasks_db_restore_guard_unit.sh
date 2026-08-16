@@ -65,6 +65,10 @@ row_count() { sqlite3 "$TASKS_DB" "SELECT count(*) FROM tasks;" 2>/dev/null || e
 set +e   # header.sh enabled `set -e`; asserts below deliberately probe states
 
 # --- Case 1: genuine fresh box -> silent create is CORRECT, sentinel stamped ---
+# 90 -> 91 (DIVE-3474, base c710eac): +gate_urgent. Control run first, as the
+# paragraph above requires: a same-seat worktree at origin/main scored 56/0 on this
+# harness while the branch scored 55/1 with `got==want` on the same line — so the
+# count was the only failing term and the delta is this one column, not a tree red.
 fresh_tree
 out=$(tasks_db_init 2>&1); rc=$?
 [[ $rc -eq 0 ]] && ok "fresh: init succeeds" || bad "fresh: init rc=$rc ($out)"
@@ -247,6 +251,10 @@ out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
 # while the branch scored 55/1, which is what separated "my two columns" from a
 # pre-existing tree red before the literal was touched at all. Do that control first:
 # editing this number to make a red go away is the one change that cannot fail loudly.
+# 90 -> 91 (DIVE-3474, base c710eac): +gate_urgent. Control run first, as the
+# paragraph above requires: a same-seat worktree at origin/main scored 56/0 on this
+# harness while the branch scored 55/1 with `got==want` on the same line — so the
+# count was the only failing term and the delta is this one column, not a tree red.
 fresh_tree
 out=$(tasks_db_init 2>&1); rc=$?
 required='delivered_at delivery_ref delivery_ref_iteration escalated_at escalated_by human_evidence park_reason parked_at'
@@ -255,8 +263,8 @@ actual=$(sqlite3 "$TASKS_DB" \
     WHERE name IN ('delivery_ref','delivered_at','delivery_ref_iteration','parked_at','park_reason','escalated_at','escalated_by','human_evidence')
     ORDER BY name;" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
 column_count=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM pragma_table_info('tasks');" 2>/dev/null)
-[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "90" ]] \
-  && ok "fresh schema: all 90 columns, including the eight former holes, are present" \
+[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "91" ]] \
+  && ok "fresh schema: all 91 columns, including the eight former holes, are present" \
   || bad "fresh schema: init returned a partial tasks table" "rc=$rc count=$column_count got=[$actual] want=[$required] out=$out"
 
 # --- Case 10 (DIVE-2197): migrate arm still rejects a failed ALTER ------------

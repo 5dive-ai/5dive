@@ -1991,6 +1991,19 @@ _hb_wake() {
   [[ -n "$recall" ]] && nudge="${nudge} Relevant memory to check first (verify before relying; re-search with '5dive memory search'): ${recall}."
   [[ -n "$compile_hint" ]] && nudge="${nudge}${compile_hint}"
 
+  # DIVE-3474 arm 2 — THE QUEUE IS DISCOVERED HERE. Removing the file-time a2a
+  # ping is only safe if the reviewer meets the gate on its next natural wake, so
+  # the wake itself carries the count. Without this line the change trades an
+  # interrupt for a lost decision, which is the one outcome the ticket forbids.
+  # Count-only and appended to a nudge that is already being sent: it costs no
+  # extra wake, and it names the verb rather than the rows, so a seat with a long
+  # queue does not get a wall of asks pasted into an unrelated goal.
+  local _gq=0
+  _gq=$(db "SELECT COUNT(*) FROM tasks WHERE $(_task_agent_gate_pred "$name");" 2>/dev/null) || _gq=0
+  if [[ "${_gq:-0}" =~ ^[0-9]+$ ]] && (( _gq > 0 )); then
+    nudge="${nudge} Separately: ${_gq} gate(s) are ROUTED TO YOU and waiting — they were filed WITHOUT interrupting you (DIVE-3474). Read them with '5dive task queue' and answer each with '5dive task answer <ident> --value=\"<choice>\"' before you finish this turn; the filer's recommendation is shown but is NOT the answer (measured: 54 of 121 answered gates returned it, so the majority did not)."
+  fi
+
   _hb_send_line "$name" "$nudge" || { _hb_log "[$name] nudge send failed"; return 1; }
   return 0
 }
@@ -2283,8 +2296,23 @@ _hb_gate_ttl_sweep() {
 # dropping the gate. T2 uses the filing agent's paired-human channel; T1 routes
 # through the existing org-lead resolver. One message/keyboard is built per
 # resolved recipient, regardless of how many gates are due.
+# DIVE-3474 arm 2 — THE GRACE. Arm 2 stops the FILE-TIME ping, and without this
+# conjunct the interrupt simply moves fifteen minutes downstream: this sweep would
+# fire the first re-nag over the agent rail before the reviewer has had a natural
+# wake to find the gate in its queue. So a routed, NON-URGENT gate gets a grace
+# window in which only the natural wake may deliver it. `--urgent` (gate_urgent=1)
+# skips the grace entirely and re-nags on the old 15-minute clock, and every
+# escalation rung past the grace is UNCHANGED — including the fall-through to the
+# paired human, which is what keeps a queued gate from becoming a lost one.
+# Deliberately keyed on `routed_reviewer`: an unrouted gate is the HUMAN's, its
+# holder has no wake this queue is visible at, and nothing here may quiet it.
+_HB_GATE_RENAG_GRACE_HOURS="${FIVEDIVE_GATE_RENAG_ROUTED_GRACE_HOURS:-2}"
 _HB_GATE_RENAG_WHERE="need_type IS NOT NULL AND need_answered_at IS NULL
   AND status NOT IN ('done','cancelled') AND COALESCE(tier,2) != 0
+  AND ( COALESCE(routed_reviewer,'') = ''
+        OR COALESCE(gate_urgent,0) = 1
+        OR COALESCE(need_asked_at,updated_at,created_at)
+             <= datetime('now','-${_HB_GATE_RENAG_GRACE_HOURS} hours') )
   AND (COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-1 hour')
        OR (gate_pinged_at IS NULL
            AND COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-15 minutes')))

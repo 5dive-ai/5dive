@@ -1627,6 +1627,42 @@ _task_need_route_deliver() {
   local role="${TASK_GATE_ROUTE_ROLE:-review}"
   TASK_GATE_ROUTE_STATE="failed"
   [[ -n "$reviewer" ]] || return 3
+
+  # ── DIVE-3474 arm 2 — THE GATE QUEUES; IT DOES NOT INTERRUPT ────────────────
+  #
+  # THE COST IS THE WAKE, NOT THE MESSAGE. Measured 2026-08-12: 222 a2a sends,
+  # 387 KB fleet-wide in 24h — under 0.5% of fleet burn. Length is not the
+  # quantity to attack. What is expensive is that every inbound to a NON-FRESH
+  # seat (main, marketing) starts a turn that re-sends that seat's whole
+  # accumulated window, and `5dive agent send` below is exactly that event.
+  #
+  # AND THE GATE ITSELF STAYS. The obvious "fix" — auto-apply when the lead would
+  # only have agreed with the filer — is refuted by the board's own number: of
+  # 121 answered gates, 54 returned exactly the filer's recommendation, so
+  # auto-applying would have been WRONG on the other 67. A gate that disagrees
+  # with its filer 55% of the time is doing real work. Same decision, same
+  # record, same clearer: only the INTERRUPT is removed.
+  #
+  # So the default is to leave the gate where the reviewer will find it on its
+  # next natural wake (`5dive task queue`, and the wake preamble that names it)
+  # rather than to manufacture a wake for it. `--urgent` is the filer's explicit
+  # opt-out, and it is a SEPARATE FIELD from --recommend on purpose: "I think this
+  # cannot wait" and "I think the answer is X" are different claims, and the
+  # measured 54/121 is precisely what happens when the second is read as the first.
+  #
+  # WHY THIS IS NOT A LOST DECISION, which is the failure mode a queue invites:
+  # the row is already blocked + pending, so it is on the board, in the digest, in
+  # `task queue --for=<reviewer>`, and the heartbeat gate re-nag still escalates an
+  # unanswered routed gate — over the agent rail first and to the paired human
+  # after _HB_GATE_AGENT_RAIL_HOURS. Nothing here shortens that ladder; it only
+  # declines to fire the FIRST rung at file time.
+  if [[ "${TASK_GATE_ROUTE_URGENT:-0}" != "1" ]]; then
+    TASK_GATE_ROUTE_STATE="queued"
+    _task_gate_delivery_log ok "$ident" "queue:${reviewer}" "" \
+      "lead-route gate QUEUED for ${reviewer} (${role}) — no a2a send, no wake (DIVE-3474); answerable from the queue at their next turn"
+    TASK_GATE_DELIVERY_ROWS=$(( ${TASK_GATE_DELIVERY_ROWS:-0} + 1 ))
+    return 0
+  fi
   # The ident, not the row id: _task_gate_delivery_log resolves numeric ids with a
   # DB read, and the detached child must not touch the store the parent is writing.
   local msg="🧭 [${ident}] routed to you for ${role} (${need_type} gate). ${ask}"

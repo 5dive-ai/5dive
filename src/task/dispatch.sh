@@ -65,6 +65,11 @@ _task_usage() {
   need <id> --type=decision|secret|approval|manual|access --ask="..."|--ask-file=<path>
       [--options=A|B] [--recommend=<A>|--recommend-file=<path>] [--tier=0|1|2]
       [--needs=<capability>] [--discusses=<why>] [--rubber-stamp-ok="<why>"]
+      [--urgent]   a ROUTED gate normally QUEUES for the reviewer's next natural
+                   wake instead of waking their session (DIVE-3474). --urgent
+                   pings at file time. It is NOT --recommend: "I think the answer
+                   is X" and "this cannot wait" are separate claims (measured: 54
+                   of 121 answered gates returned the filer's recommendation).
       [--mode=approve-to-send|confirm-after-send]   --type=approval: is the action
                                                     already DONE? (default: not yet)
       [--probe='<cmd>']                           --type=access: self-check the block
@@ -89,10 +94,12 @@ _task_usage() {
       [--tap-uid=<tg user id> [--tap-username=<handle>] [--tap-msg=<message id>]]
       [--relay-agent=<name>]     a button tap: WHO tapped, and whose bot carried it
   clear-recs --channel-proof=<chat_id> [--only=<id>]     apply pending recommendations
+  queue [--for=<agent>] [--json]                gates ROUTED TO YOU, filed without waking you
   inbox [--send [--channel-proof=<chat>]]       human-gated rows; --send DMs the owner
   coordinator [--json]                          the agent fronting the needs-you banner
 
   loops [--stuck] [--escalate-stuck] [--all] [--runs] [--watch[=secs]] [--kill <loopId>]
+  merge <id>                                    merge the PR on a row THIS seat graded PASS (DIVE-3474)
   merge-audit [--limit=N] [--json]              closed rows whose named PR never merged
   merge-gate-selftest [--pr=<url>] [--json]     can THIS seat's merge-gate actually query GitHub?
   gate-history <id>                             displaced gates + when they retired
@@ -239,6 +246,7 @@ cmd_task() {
     start)           cmd_task_start "$@" ;;
     done|close)      cmd_task_done "$@" ;;
     deliver)         cmd_task_deliver "$@" ;;
+    merge)           cmd_task_merge "$@" ;;         # DIVE-3474 verifier merges what IT graded
     merge-audit)     cmd_task_merge_audit "$@" ;;   # DIVE-1935 retrospective sweep
     merge-gate-selftest) cmd_task_merge_gate_selftest "$@" ;;  # DIVE-1935 instrument check
     verify)          cmd_task_verify "$@" ;;
@@ -254,6 +262,7 @@ cmd_task() {
     escalate)        cmd_task_escalate "$@" ;;
     need)            cmd_task_need "$@" ;;
     gate-escalate)   cmd_task_gate_escalate "$@" ;;   # DIVE-1927 internal, root-only
+    queue)           cmd_task_queue "$@" ;;         # DIVE-3474 gates routed TO ME
     inbox)           cmd_task_inbox "$@" ;;
     coordinator)     cmd_task_coordinator "$@" ;;
     answer)          cmd_task_answer "$@" ;;

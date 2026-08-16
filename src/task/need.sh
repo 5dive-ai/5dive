@@ -1329,6 +1329,7 @@ cmd_task_need() {
   tasks_db_init
   local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw="" discusses="" needs="" oob="" rubber_stamp="" gate_mode=""
   local gate_owner=""   # DIVE-3342
+  local urgent=0        # DIVE-3474 arm 2
   # DIVE-2627: which flag supplied each prose value (see _read_prose_file).
   local ask_src="" recommend_src=""
   local -a positional=()
@@ -1356,6 +1357,13 @@ cmd_task_need() {
       # now moot (e.g. a secret gate for fixtures never needed). This is NOT a
       # grant — it never records a secret/approval as provided — so it is safe for
       # the gate's filer or an org lead to run without a human tap. See branch below.
+      # DIVE-3474 arm 2: the filer's explicit "this cannot wait". A SEPARATE FIELD
+      # from --recommend, and the separation is the whole point — of 121 answered
+      # gates, 54 returned exactly the filer's recommendation, so a recommendation
+      # is evidence about the ANSWER and never about the CLOCK. Without this flag a
+      # routed gate is QUEUED for the reviewer's next natural wake instead of
+      # waking their window; with it, the file-time a2a ping fires as it did before.
+      --urgent)      urgent=1 ;;
       --withdraw)    withdraw=1 ;;
       # DIVE-931 secure credential drop: name WHERE a secret gate's value lands.
       # Both together enable the burnable drop link in the gate message.
@@ -3189,7 +3197,12 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
         # path sets it: under `sudo -u agent-X` the ambient identity is the
         # invoker, not the filer.
         local _nrc=0
+        # DIVE-3474: persisted BEFORE the deliverer runs, so the queue view and the
+        # heartbeat rails read the same fact the send decision was made on rather
+        # than re-deriving an urgency nobody recorded.
+        db "UPDATE tasks SET gate_urgent=${urgent} WHERE id=${id};" 2>/dev/null || true
         TASK_GATE_FILER="$actor" TASK_GATE_ROUTE_TO="$_reviewer" TASK_GATE_ROUTE_ROLE="$_rrole" \
+        TASK_GATE_ROUTE_URGENT="$urgent" \
         TASK_GATE_FLOORED_BY="$([[ "$_floored_by_title" == "1" ]] && printf 'title' || printf '')" \
           task_need_notify "$ident" "$type" "$ask" "$options" "$recommend" || _nrc=$?
         # Never print a bare "routed to X" on an unobserved send again. The claim
@@ -3210,6 +3223,7 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
           "reviewer=$_reviewer" "filer=$actor" "delivery=$_rstate" || true
         case "$_rstate" in
           delivered) ;;
+          queued)    _rnote=" [QUEUED, not pinged — ${_reviewer}'s window was NOT woken for this (DIVE-3474). The gate is filed, blocked and answerable now; they pick it up from '5dive task queue' on their next turn, and the heartbeat re-nag escalates it if nobody does. File with --urgent if it genuinely cannot wait for that.]" ;;
           inflight)  _rnote=" [handoff dispatched — delivery not yet confirmed; the gate-delivery row lands when the send completes]" ;;
           *)         _rnote=" [HANDOFF NOT DELIVERED — ${_reviewer} was NOT pinged${TASK_NOTIFY_FAIL_REASON:+ (${TASK_NOTIFY_FAIL_REASON})}; the gate stands, the re-nag escalates it (<=15 min), and it is answerable now with: 5dive task answer ${ident}]" ;;
         esac

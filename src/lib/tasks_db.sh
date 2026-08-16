@@ -635,6 +635,15 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- boundary is unchanged for anything not explicitly routed. `secret` is never
   -- routed (stays hard-human), and a tier-2 gate is never routed.
   routed_reviewer     TEXT,
+  -- DIVE-3474 arm 2. A routed gate QUEUES by default — it is filed, blocked and
+  -- answerable, and the reviewer picks it up on its next natural wake instead of
+  -- having its window woken by an a2a send. `gate_urgent` is the filer's explicit
+  -- override and it is a SEPARATE COLUMN from `recommend` on purpose: measured on
+  -- this board, 54 of 121 answered gates returned exactly the filer's
+  -- recommendation, so a recommendation is evidence about the ANSWER and carries
+  -- no information about the CLOCK. Reading one as the other is the mistake this
+  -- split exists to prevent. NULL/0 = queue; 1 = ping at file time.
+  gate_urgent         INTEGER,
   -- DIVE-1376/DIVE-2728: merge-gate binding and the loop iteration it belongs to.
   delivery_ref           TEXT,
   delivered_at           TEXT,
@@ -1388,6 +1397,11 @@ _TASKS_ADDITIVE_COLUMNS=(
   'needs_capability TEXT'
   'gate_rubber_stamp TEXT'
   'shipped_flag_at TEXT' 'routed_reviewer TEXT'
+  # DIVE-3474 arm 2: the filer's `--urgent`, persisted, and deliberately NOT
+  # inferable from `recommend`. A routed gate defaults to the reviewer's QUEUE
+  # (no a2a wake); this column is the one thing that buys a file-time ping. NULL
+  # is "not urgent", which is the truth for every pre-existing row.
+  'gate_urgent INTEGER'
   'delivery_ref TEXT' 'delivered_at TEXT' 'delivery_ref_iteration INTEGER'
   'originated_by_objective INTEGER' 'originated_cycle INTEGER'
   'verify_unavailable INTEGER' 'last_skipped_at TEXT'

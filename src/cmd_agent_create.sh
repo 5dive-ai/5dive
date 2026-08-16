@@ -453,7 +453,8 @@ classify_sudo_grant() {
         "/usr/local/bin/5dive agent _self_restart"*|"/usr/local/bin/5dive _audit_append"*|\
         "/usr/local/bin/5dive _push_do"*|\
         "/usr/local/bin/5dive _gh_do"*|\
-        "/usr/local/bin/5dive _task_answer"*)            has_a2a=1 ;;
+        "/usr/local/bin/5dive _task_answer"*|\
+        "/usr/local/bin/5dive _merge_do"*)              has_a2a=1 ;;
         *)                                              has_other=1 ;;
       esac
     done
@@ -577,6 +578,20 @@ ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _self_restart
 # between standing and capability that it exists to close. It cannot stamp a
 # human answer: every human-evidence form is refused inside the primitive.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _task_answer
+# DIVE-3474: let a VERIFIER merge the pull request on a row IT ITSELF graded PASS.
+# EXACT path, NO args, NO wildcard: one task ident travels over stdin, the caller
+# is derived from SUDO_UID inside _merge_do, and the merge standing is re-derived
+# there from the row as root over the same graded-awaiting-merge predicate the
+# board paints. The pull request comes from that row, never from the caller.
+# UNCONDITIONAL for the _task_answer reason and NOT alongside the push grant: this
+# verb confers no authority of its own - it refuses on any row this seat did not
+# grade - so gating it behind can-push would recreate the split between standing
+# and capability it exists to close, and would hand a grader the push capability
+# the writer-is-not-grader rail says a grader must not hold.
+# NOTE FOR THE NEXT EDITOR: this heredoc is UNQUOTED, so a backtick or a dollar
+# sign in a COMMENT is executed and its output lands in the sudoers file. Keep
+# this block free of both.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _merge_do
 SUDOERS
   if [[ "$can_push" == "1" ]]; then
     cat <<SUDOERS

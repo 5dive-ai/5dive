@@ -685,3 +685,173 @@ cmd_task_reject() {
      --arg i "$id" --arg id "$ident" --arg m "$maker" --arg n "$iter"
 }
 
+
+# ── DIVE-3474 arm 1 — `task merge`: a verifier merges what IT graded ──────────
+#
+# THE DEFECT, measured on this board 2026-08-16: quinn graded DIVE-3457 and
+# DIVE-3450 PASS — re-derived the maker's counts, drove her own mutants, confirmed
+# every required check green at the graded head — and then filed, twice, "my token
+# is read-only so I cannot do it. Please merge #658". agent-main pressed a button.
+#
+# NO JUDGEMENT IS ADDED BY THE SECOND SEAT. Nothing about the merge decision is
+# re-derived there; the second seat holds a credential, not an opinion. It is a
+# token-permission artifact wearing the shape of an approval, and every one of
+# those asks wakes a NON-FRESH window (main), which is the most expensive event
+# this fleet has. Removing an ILLEGITIMATE ask is autonomy, not unsupervised
+# action — lodar's 2026-08-03 test on the strict reading.
+#
+# WHAT THIS IS NOT: a merge grant. The standing is the row, not the seat. It is
+# keyed on `graded_by = <this seat>` over the SAME predicate the board already
+# uses to paint "graded->merge" (`_TASKS_TFV_SQL`), so a verifier can merge
+# exactly the pull request it has itself passed and NOTHING else — not a peer's
+# row, not a row it merely assigned, not one whose grade a later reject retired.
+#
+# WHY `_TASKS_TFV_SQL` AND NOT A FRESH PREDICATE. That constant is the single
+# source for the graded-awaiting-merge rule and carries four conjuncts this rail
+# would otherwise have to re-type: writer!=grader (DIVE-477), a live reject
+# retires a grade (DIVE-3428), a grade is not a pass (DIVE-3430), and a verdict
+# with no delivery_ref has nothing to merge. Re-typing it is how the board and
+# the rail drift, and a drift HERE is a merge nobody authorised. Same rule the
+# constant's own comment states: written once, interpolated, never retyped.
+#
+# THE SUDO POSTURE IS `_task_answer`'s (DIVE-3160), deliberately, because the
+# shape is identical: the grant confers NO authority of its own — it refuses
+# unless the row already names this seat as the grader — so gating it behind a
+# capability flag would recreate the exact split between standing and capability
+# that both tickets exist to close. Hence UNCONDITIONAL in render_standard_sudoers,
+# alongside `_task_answer` and not alongside `_push_do`.
+#
+#   1. EUID 0 or refuse — reachable only through the exact-path NOPASSWD grant.
+#   2. WHO comes from SUDO_UID under sudo's env_reset, never argv, never --from.
+#   3. STANDING re-derived AS ROOT FROM THE ROW. The caller passes an ident and
+#      nothing else; the PR URL comes from `delivery_ref` in the store, never from
+#      the caller, so a caller cannot name a pull request the row does not.
+#   4. The merge goes out as the machine account (`_GH_BOT_ENV`), the same
+#      credential and the same attribution rule as every other agent write
+#      (DIVE-2232/2448).
+#
+# _task_merge_standing_sql <actor> — the WHERE that decides this rail, as one
+# string, so the verb and the root executor grade the identical rule. PURE: no
+# I/O, no root, unit-testable without a box.
+_task_merge_standing_sql() {
+  printf '%s' "${_TASKS_TFV_SQL} AND graded_by = $(sqlq "${1:-}")"
+}
+
+# cmd_task_merge — the caller half. Resolves nothing security-relevant itself:
+# every check below is re-run authoritatively inside the root executor, and these
+# exist only so a refusal arrives with its reason instead of as a sudo exit code.
+cmd_task_merge() {
+  local ident="" json=0 a
+  for a in "$@"; do
+    case "$a" in
+      --json) json=1 ;;
+      -h|--help)
+        printf 'usage: 5dive task merge <ident> [--json]\n\n  Merge the pull request bound to a row THIS SEAT graded PASS.\n  Refused on any row this seat did not itself grade (DIVE-3474).\n'
+        return 0 ;;
+      --*) fail "$E_VALIDATION" "task merge: unknown flag '$a' — usage: 5dive task merge <ident> [--json]" ;;
+      *) [[ -z "$ident" ]] && ident="$a" ;;
+    esac
+  done
+  [[ -n "$ident" ]] || fail "$E_VALIDATION" "task merge needs a task ident — usage: 5dive task merge <ident>"
+  (( json )) && JSON_MODE=1
+  tasks_db_init
+
+  local actor; task_actor_claim ""; actor="$ACTOR_BOARD"
+  _task_merge_preflight "$ident" "$actor"   # names the refusal; never authorises
+
+  local rc=0 out=""
+  out=$(printf '%s\0' "$ident" | sudo -n /usr/local/bin/5dive _merge_do 2>&1) || rc=$?
+  if (( rc != 0 )) && ! sudo -n -l /usr/local/bin/5dive _merge_do >/dev/null 2>&1; then
+    fail "$E_PERMISSION" "$ident: this seat holds no _merge_do grant, so NOTHING RAN — the merge was not attempted and was not refused on standing. A seat provisioned before DIVE-3474 does not carry the grant until it is re-provisioned (5dive agent provision <seat>). Until then the merge stays with a seat that holds one."
+  fi
+  [[ -n "$out" ]] && printf '%s\n' "$out" >&2
+  (( rc == 0 )) || { mark_reported; return "$rc"; }
+  ok "$ident merged — the pull request this seat graded PASS is on the target branch; no second seat was asked" \
+     '{ident:$id, merged:true, actor:$ac}' --arg id "$ident" --arg ac "$actor"
+}
+
+# _task_merge_preflight <ident> <actor> — the caller-side refusal texts. Split out
+# so the harness can grade each refusal by NAME rather than by exit code, and so
+# the negative case (a row this seat did NOT grade) has a message a reader can act
+# on instead of a bare permission error.
+_task_merge_preflight() {
+  local ident="$1" actor="$2" row
+  row=$(db "SELECT COALESCE(graded_by,'')||x'1f'||COALESCE(graded_verdict,'')||x'1f'||COALESCE(delivery_ref,'')||x'1f'||COALESCE(handoff_rejected_at,'')||x'1f'||COALESCE(graded_at,'')||x'1f'||status
+            FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null || printf '')
+  [[ -n "$row" ]] || fail "$E_VALIDATION" "no task ${ident}."
+  local gb gv dr hr ga st rest
+  gb="${row%%$'\x1f'*}";   rest="${row#*$'\x1f'}"
+  gv="${rest%%$'\x1f'*}";  rest="${rest#*$'\x1f'}"
+  dr="${rest%%$'\x1f'*}";  rest="${rest#*$'\x1f'}"
+  hr="${rest%%$'\x1f'*}";  rest="${rest#*$'\x1f'}"
+  ga="${rest%%$'\x1f'*}";  st="${rest#*$'\x1f'}"
+
+  [[ -n "$ga" ]] \
+    || fail "$E_CONFLICT" "${ident} carries NO grade (graded_at is NULL), so there is nothing for this rail to act on. This verb merges what a verifier has already passed; it is not a way to merge something first and grade it after. Grade it: 5dive task verify ${ident} --cmd=<acceptance test>"
+  # THE NEGATIVE, asserted by name. Without this arm the grant is unbounded in the
+  # one direction nobody would notice: a verifier merging a row someone ELSE graded
+  # is indistinguishable, at the GitHub end, from a legitimate merge.
+  [[ "$gb" == "$actor" ]] \
+    || fail "$E_AUTH_REQUIRED" "${ident} was graded by '${gb:-<nobody>}', not by '${actor}' — REFUSED. This rail removes one ask only: the verifier asking a second seat to press the button on a pull request IT ITSELF passed. It is not a merge capability, so it does not extend to a row this seat did not grade. If '${gb:-the grader}' should merge it, that seat runs this verb; otherwise it stays a normal merge."
+  [[ -n "$dr" ]] \
+    || fail "$E_CONFLICT" "${ident} is graded but carries no delivery_ref, so no pull request is bound to it and there is nothing to merge. Bind it: 5dive task deliver ${ident} --pr=<url>."
+  [[ -z "$gv" || "$gv" == "pass" ]] \
+    || fail "$E_CONFLICT" "${ident}'s recorded verdict is '${gv}', not a pass (DIVE-3430) — a grade is not a pass, and this rail merges only what was passed."
+  [[ -z "$hr" || ( -n "$ga" && ! "$hr" > "$ga" ) ]] \
+    || fail "$E_CONFLICT" "${ident} was REJECTED at ${hr}, after the grade at ${ga} (DIVE-3428: a grade is not a latch) — the maker has not answered that bounce, so the graded head is not the head to merge."
+  case "$st" in
+    done|cancelled) fail "$E_CONFLICT" "${ident} is ${st} — a terminal row is not a merge queue." ;;
+  esac
+}
+
+# cmd_task_merge_do — ROOT-ONLY (`_merge_do`). Re-derives everything: the caller
+# from SUDO_UID, the standing from the row, and the pull request from the row's
+# own delivery_ref. Accepts an IDENT and nothing else, so there is no argument
+# through which a caller can name a different pull request or a different grader.
+cmd_task_merge_do() {
+  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "_merge_do is a privileged internal primitive (reachable only through the exact-path NOPASSWD grant)."
+  local -a args=(); local a
+  while IFS= read -r -d '' a; do args+=("$a"); done
+  (( ${#args[@]} == 1 )) || fail "$E_VALIDATION" "_merge_do takes exactly one task ident on stdin and no flags — got ${#args[@]} argument(s). The pull request is read from the row, never from the caller."
+  local ident="${args[0]}"
+  [[ "$ident" == --* ]] && fail "$E_VALIDATION" "_merge_do takes a task ident, not a flag ('${ident}')."
+
+  local _ruid="${SUDO_UID:-}"
+  [[ "$_ruid" =~ ^[0-9]+$ ]] \
+    || fail "$E_AUTH_REQUIRED" "_merge_do: no SUDO_UID — reach this primitive through sudo from an agent seat, never as root directly (a root caller has no grading seat to attribute the merge to)."
+  [[ "$_ruid" != "0" ]] \
+    || fail "$E_AUTH_REQUIRED" "_merge_do: SUDO_UID is root, which is not an agent seat."
+  local actor; actor=$(_gate_uid_to_agent "$_ruid")
+  [[ -n "$actor" ]] \
+    || fail "$E_AUTH_REQUIRED" "_merge_do: uid ${_ruid} owns no agent-* passwd row, so this merge has no attributable grader."
+
+  tasks_db_init
+  # STANDING + SUBJECT in ONE query over the shared predicate: a row that does not
+  # match is refused, and the delivery_ref of a row that does match is the only
+  # pull request this call can reach.
+  local pr
+  pr=$(db "SELECT delivery_ref FROM tasks WHERE ident=$(sqlq "$ident") AND $(_task_merge_standing_sql "$actor") LIMIT 1;" 2>/dev/null || printf '')
+  [[ -n "$pr" ]] \
+    || fail "$E_AUTH_REQUIRED" "_merge_do: ${actor} holds no merge standing on ${ident} — the row must be graded PASS BY ${actor}, still carry the delivery_ref that grade was recorded against, and not have been rejected since. Re-derived here as root from the row; the caller's view of it is not consulted. \`5dive task show ${ident}\` prints the fields this predicate reads."
+
+  [[ -r "$_GH_BOT_ENV" ]] \
+    || fail "$E_GENERIC" "machine-account credential missing ($_GH_BOT_ENV) — 5dive secret write ${_GH_BOT_KEY} --connector=github-bot"
+  local tok
+  # shellcheck disable=SC1090
+  tok=$(set -a; . "$_GH_BOT_ENV"; set +a; printf '%s' "${GH_BOT_TOKEN:-}")
+  [[ -n "$tok" ]] || fail "$E_GENERIC" "$_GH_BOT_ENV exists but carries no ${_GH_BOT_KEY}."
+
+  local rc=0
+  GH_TOKEN="$tok" GITHUB_TOKEN="" gh pr merge "$pr" --squash || rc=$?
+  if (( rc != 0 )); then
+    mark_reported
+    printf '_merge_do: `gh pr merge %s --squash` exited %s as the machine account. That is GitHub'"'"'s answer, not a standing refusal — %s DOES hold merge standing on %s here. A required check that is red or still running, a protected branch the machine account cannot merge, and a conflict all land on this line; read gh'"'"'s message above.\n' \
+      "$pr" "$rc" "$actor" "$ident" >&2
+    return "$rc"
+  fi
+  # Audited as the GRADER's act, not root's: the whole point of the rail is that
+  # the seat that graded is the seat that merged.
+  _task_store_audit_log "task merge" "ok" 0 -- "task=$ident" "pr=$pr" "grader=$actor" "actor=$actor" 2>/dev/null || true
+  printf '%s merged by %s (the seat that graded it) as the machine account.\n' "$pr" "$actor" >&2
+  return 0
+}

@@ -96,8 +96,15 @@ ROUTE_FILE="$TMP/route.log"; : >"$ROUTE_FILE"
 5dive() { if [[ "${1:-}" == "agent" && "${2:-}" == "send" ]]; then printf '%s\n' "${3:-}" >>"$ROUTE_FILE"; fi; return 0; }
 export -f 5dive 2>/dev/null || true
 ERR="$TMP/err.txt"
-reset()    { HUMAN_PINGED=0; : >"$ROUTE_FILE"; : >"$ERR"; }
-route_to() { local i; for i in $(seq 1 12); do [[ -s "$ROUTE_FILE" ]] && break; sleep 0.05; done; tail -n1 "$ROUTE_FILE" 2>/dev/null; }
+# DIVE-3474 arm 2: a routed gate QUEUES rather than waking the reviewer, so the
+# seat it was handed to is read off the gate-delivery row (`chat=queue:<who>`, or
+# `chat=agent:<who>` on the --urgent rail) instead of off the send stub. The
+# property under test — WHICH seat, and human-vs-agent — is unchanged.
+NOTIFY_LOG="$TMP/gate-notify.log"; : >"$NOTIFY_LOG"
+export FIVEDIVE_GATE_NOTIFY_LOG="$NOTIFY_LOG"
+reset()    { HUMAN_PINGED=0; : >"$ROUTE_FILE"; : >"$NOTIFY_LOG"; : >"$ERR"; }
+route_to() { local i; for i in $(seq 1 20); do grep -qE 'chat=(queue|agent):' "$NOTIFY_LOG" 2>/dev/null && break; sleep 0.05; done
+             grep -oE 'chat=(queue|agent):[^ ]+' "$NOTIFY_LOG" 2>/dev/null | sed 's/.*://' | tail -n1; }
 tierof()   { db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='$1';"; }
 routedof() { db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='$1';"; }
 warned()   { grep -qF -- "$1" "$ERR"; }
