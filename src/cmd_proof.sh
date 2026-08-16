@@ -370,7 +370,7 @@ _proof_identity() {
   # the answer as if it were the target's — a false green on exactly the
   # configure-vs-02:00-publish split this function exists to catch.
   if [ -n "$as" ] && [ "$as" != "$(actor_caller_unix_name)" ]; then
-    if [ "$EUID" = "0" ] && command -v runuser >/dev/null 2>&1; then
+    if _gate_is_root && command -v runuser >/dev/null 2>&1; then
       gname="$(runuser -u "$as" -- git config --global user.name 2>/dev/null || true)"
       gemail="$(runuser -u "$as" -- git config --global user.email 2>/dev/null || true)"
     else

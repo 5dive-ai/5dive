@@ -252,8 +252,11 @@ sudo_grant_lines() {
     # decides whether `sudo -n -l` (which reports the CALLER's grants) may be
     # published as the answer for $user. A shim printing a peer's name made this
     # function return the caller's OWN sudo grants labelled as that peer's — a
-    # wrong answer about who may do what. $EUID is a bash builtin and unshimmable.
-    if [[ "$EUID" == "0" ]]; then
+    # wrong answer about who may do what. Both now read $EUID (a bash builtin, so
+    # unshimmable) — the root test through `_gate_is_root`, which is the codebase's
+    # existing spelling of it and keeps the branch stubbable from a harness without
+    # being reachable from a PATH shim.
+    if _gate_is_root; then
       if out=$(sudo -n -l -U "$user" 2>/dev/null); then printf '%s\n' "$out"; return 0; fi
     elif [[ "$user" == "$(actor_caller_unix_name)" ]]; then
       if out=$(sudo -n -l 2>/dev/null); then printf '%s\n' "$out"; return 0; fi

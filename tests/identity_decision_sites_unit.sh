@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: core — 0.5s measured (DIVE-2538): pure text analysis, no db, no network, no root.
 # DIVE-2538 — the eight raw identity reads that still fed DECISIONS after DIVE-2518
 # collapsed the attribution sites onto the sealed derivation. This harness is the
 # COMPLETENESS check for that set, and it is deliberately not a grep for the token
