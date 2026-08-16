@@ -1084,6 +1084,48 @@ _gate_repo_slugs() {
   printf '%s' "$raw" | tr ',' ' ' | tr -s '[:space:]' '\n' | awk 'NF && !seen[$0]++'
 }
 
+# ── DIVE-3458: a delivery into a repo we do not own ────────────────────────
+# The merge gate refuses `task done` until the bound PR is merged. That is right
+# for our own repos, where merging is OUR action and "delivered but not landed"
+# is the failure it exists to catch (DIVE-2096, DIVE-2656). It is WRONG for a
+# submission into someone else's repository: merging is a third party's decision
+# on their timeline, and NO WORK WE DO can satisfy the gate. Six rows were in that
+# class on 2026-08-16 (awesome-list submissions), two already blocked on it.
+#
+# Holding those rows open is not the conservative option, it is the corrosive one:
+# an open row is supposed to mean WE OWE WORK, and a population of rows open
+# because a stranger has not clicked anything destroys that meaning for every
+# other row on the board. The rows themselves already say so — DIVE-3439's
+# acceptance is verbatim "DONE = the PR/submission URL on this row."
+#
+# THE TEST IS THE HOST AND OWNER OF THE BOUND REF, never the title or a keyword.
+# A title-keyword test is what bound PR #649 to DIVE-3419 and cost two refused
+# closes. Owners come from _gate_repo_slugs, so the FIVE_GATE_REPOS seam keeps
+# working and there is no second list to drift.
+#
+# FAIL CLOSED on anything unparseable: a ref that yields no owner/repo, or is not
+# a github.com ref at all, is NOT foreign and keeps the full gate. The expensive
+# mistake here is exempting one of our own deliveries, not gating a foreign one.
+_gate_our_owners() {
+  _gate_repo_slugs | awk -F/ 'NF==2 && $1 != "" { print tolower($1) }' | awk '!seen[$0]++'
+}
+
+# _gate_foreign_delivery <delivery-ref> — rc 0 when the ref names a repository
+# whose OWNER is not one of ours. rc 1 otherwise (including "cannot tell").
+_gate_foreign_delivery() {
+  local ref="$1" slug owner o
+  [[ "$ref" =~ ^https?://github\.com/ || "$ref" =~ ^git@github\.com: ]] || return 1
+  slug=$(_gate_slug_from_url "$ref") || slug=""
+  [[ -n "$slug" && "$slug" == */* ]] || return 1
+  owner="${slug%%/*}"; owner="${owner,,}"
+  [[ -n "$owner" ]] || return 1
+  while read -r o; do
+    [[ -n "$o" ]] || continue
+    [[ "$o" == "$owner" ]] && return 1
+  done < <(_gate_our_owners)
+  return 0
+}
+
 # _gate_slug_from_url <text> — OWNER/REPO out of the first github URL in <text>, or
 # empty. Accepts a pull URL, a repo URL and an ssh remote.
 _gate_slug_from_url() {

@@ -148,6 +148,11 @@ _task_status_cmd() {
   # Same rule we shipped in DIVE-1869 — a check that could not reach its answer must
   # not render as one. Blocking nothing is fine; blessing by silence is not.
   local _mg_unverified=""
+  # DIVE-3458: the foreign-delivery record. Separate from _mg_unverified on
+  # purpose — UNVERIFIED means "we could not check"; this means "we checked, and
+  # the merge is not ours to make". Collapsing them would put a scare-mark on a
+  # close that is exactly as complete as it will ever be.
+  local _mg_foreign=""
   # ...and whether the gate had ANY subject to verify in the first place. See
   # _gate_text_names_a_ref: an unverified reason only earns a mark on the record when
   # something was actually pending verification.
@@ -904,7 +909,46 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
       if ! _gate_gh_reachable "$_ghtok"; then
         _gate_refuse_no_rail "$ident" "${_dref:-branch '$_branch'}"
       fi
-      if [[ -n "$_dref" ]]; then
+      # DIVE-3458: THE DELIVERY IS A SUBMISSION INTO A REPO WE DO NOT OWN.
+      #
+      # The gate below asks "did it merge to main", and for a repo whose merge
+      # button belongs to a stranger that question can never be answered by any
+      # work we do. `--force-merge-gate` discharges it per row and is the wrong
+      # instrument at this frequency: reaching for an override six times in a
+      # fortnight for a legitimate, intended, REPEATING shape says the gate is
+      # missing a case, and it records as "someone bypassed a safety check",
+      # which is the wrong audit trail for the normal path of an approved
+      # campaign.
+      #
+      # WHAT IS NOT DROPPED — and this is the half that matters. The gate's value
+      # here was never the refusal, it is the RECORD. Losing the sentence is how
+      # "we submitted it" quietly becomes "we're listed there" in a later report.
+      # So this arm still MEASURES the PR's state and writes it into the result:
+      # what was submitted, where, whether it is merged, and whose decision that
+      # is. A close on this arm asserts the SUBMISSION, never the acceptance.
+      #
+      # Deliberately NOT exempted from the gh-reachability guard above: recording
+      # "not merged" without reading it would be the assertion this arm exists to
+      # avoid making.
+      if [[ -n "$_dref" ]] && _gate_foreign_delivery "$_dref"; then
+        local _fslug _fowner _fstate _fwhat
+        _fslug=$(_gate_slug_from_url "$_dref")
+        _fowner="${_fslug%%/*}"
+        _fstate=$(_gate_gh "$_ghtok" 0 pr view "$_dref" --json state -q '.state' 2>/dev/null || echo "")
+        # Same DIVE-2720 normalisation as the owned path: gh renders a missing
+        # .state as the four-character string 'null', and a successful query that
+        # answered nothing is the same epistemic state as one that never ran.
+        [[ "$_fstate" == "null" ]] && _fstate=""
+        case "$_fstate" in
+          MERGED) _fwhat="MERGED — ${_fowner} accepted it" ;;
+          OPEN)   _fwhat="OPEN (not merged) — awaiting ${_fowner}, who alone can merge it" ;;
+          CLOSED) _fwhat="CLOSED WITHOUT MERGE by ${_fowner} — the submission was declined or superseded" ;;
+          *)      _fwhat="state NOT READ (the query did not answer) — this is 'not checked', not 'not merged'" ;;
+        esac
+        _task_store_audit_log "task.foreign-delivery" ok 0 -- "$ident" "foreign_repo=$_fslug ref=$_dref state=${_fstate:-unread}"
+        warn "$ident: delivery $_dref is a submission into $_fslug, a repository we do not own — the merged-to-main gate does not apply (DIVE-3458). MEASURED: $_fwhat. This close asserts the SUBMISSION was made; it does NOT assert that $_fowner accepted it."
+        _mg_foreign="[delivery: $_dref submitted to $_fslug, a repository outside our control. MEASURED at close: ${_fwhat}. Merging is ${_fowner}'s decision, not ours — this close records the SUBMISSION and asserts nothing about its acceptance. (DIVE-3458)]"
+      elif [[ -n "$_dref" ]]; then
         # DIVE-1955: a delivery_ref that is a full pull URL carries its own repo and
         # `gh pr view <url>` needs no --repo. A BARE delivery_ref (`#6`, `6`) does
         # not identify a pull request at all, and this is the fail-CLOSED declared
@@ -966,7 +1010,58 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
           policy_refuse "$E_CONFLICT" done-pr-state-unresolved DIVE-2318 "$ident" "$ident cannot close: gh could not read $_dref, so the merge is UNKNOWN, not absent — check by hand (gh pr view $_dref --json state,mergedAt) and re-run, or task cancel to abandon."
         fi
         if [[ "$_state" != "MERGED" || -z "$_merged" || "$_merged" == "null" ]]; then
-          policy_refuse "$E_CONFLICT" done-before-pr-merged DIVE-1830 "$ident" "$ident cannot close: $_dref is not merged to main (state=$_state, measured) — merge it, then task done"
+          # DIVE-3458 ARM 2: THE PR IS NOT MERGED AND THE WORK IS ON MAIN ANYWAY.
+          #
+          # Measured on DIVE-3292: delivery_ref pull/629 CLOSED, merged=null, while
+          # fd945c2 ("docs(changelog): … (DIVE-3292)") is an ancestor of origin/main.
+          # The change LANDED — as a direct commit, with the PR closed rather than
+          # merged. This gate read only the PR's merge flag, so it could not tell
+          # "delivered by another route" from "never delivered", and the remedy it
+          # printed was IMPOSSIBLE TO PERFORM: you cannot merge a closed PR whose
+          # content is already in main. `--force-merge-gate` does not reach here
+          # either (main2's source read: the flag escapes gates that RAN AND
+          # DISAGREED, never this binding check), so the row was unclosable from any
+          # seat by any means.
+          #
+          # The predicate is the one this gate already trusts everywhere else — is
+          # the work on main — asked with the machinery DIVE-2101/2120 built:
+          #   * ancestry of the PR's head sha (compare/main...<sha>, ahead_by==0), and
+          #   * ATTRIBUTION, a commit on main whose SUBJECT names the ident.
+          # BOTH are required, and the second is not belt-and-braces: ancestry alone
+          # is trivially true for an EMPTY branch whose tip IS main's tip, which is
+          # DIVE-2101's vacuity shape — it would accept a row that delivered nothing.
+          #
+          # Fail-safe direction: either probe returning EMPTY (no token, API down,
+          # deleted branch) DECLINES the acceptance and falls through to the refusal
+          # below exactly as if this arm did not exist. It can only ever ADD an
+          # acceptance on measured evidence, never manufacture a refusal.
+          local _cu_slug _cu_shas _cu_head _cu_anc="" _cu_attr=""
+          _cu_slug=$(_gate_slug_from_url "$_dref")
+          if [[ -n "$_cu_slug" ]]; then
+            _cu_shas=$(_gate_pr_shas "$_dref" "$_ghtok" "$_cu_slug")
+            _cu_head="${_cu_shas%%|*}"
+            if [[ -n "$_cu_head" ]]; then
+              _cu_anc=$(_gate_branch_ancestry "$_cu_slug" "$_cu_head" "$_ghtok")
+              [[ "$_cu_anc" == "1" ]] && _cu_attr=$(_gate_branch_ident_on_main "$_cu_slug" "" "$_ghtok" "$ident")
+            fi
+          fi
+          if [[ "$_cu_anc" == "1" && "$_cu_attr" == "1" ]]; then
+            _task_store_audit_log "task.landed-without-merge" ok 0 -- "$ident" "ref=$_dref state=$_state head=$_cu_head slug=$_cu_slug"
+            warn "$ident: $_dref is NOT merged (state=$_state, measured) but its head ${_cu_head:0:12} IS an ancestor of ${FIVE_GATE_MAIN_BRANCH:-main} in $_cu_slug, and a commit on main names $ident in its SUBJECT — the work LANDED BY ANOTHER ROUTE (DIVE-3458). done=merged-to-main satisfied on ancestry+attribution, not on the PR's merge flag.$(_gate_merged_not_deployed "$_cu_slug")"
+            _mg_foreign="[delivery: $_dref is CLOSED/UNMERGED (state=$_state), and the work is nonetheless ON ${FIVE_GATE_MAIN_BRANCH:-main} in $_cu_slug — head ${_cu_head:0:12} is an ancestor and a commit subject on main names $ident. Closed on ancestry+attribution, NOT on the pull request's merge flag. (DIVE-3458)]"
+          else
+            # Name what was MEASURED and why, so the refusal cannot print advice the
+            # reader is unable to follow. A CLOSED PR gets the remedy that exists.
+            local _cu_why="" _cu_fix="merge it, then task done"
+            case "$_cu_anc" in
+              1) _cu_why=" Its head IS on main, but NO commit subject on main names $ident (attribution=${_cu_attr:-unread}), which is what an EMPTY branch looks like — ancestry alone would accept a row that delivered nothing (DIVE-2101)." ;;
+              0) _cu_why=" Its head is measurably NOT on main either, so the work has not landed by another route." ;;
+              *) _cu_why=" Whether its head is on main COULD NOT BE READ, so 'landed by another route' is unresolved here, not ruled out." ;;
+            esac
+            [[ "$_state" == "CLOSED" ]] \
+              && _cu_fix="it is CLOSED, so it cannot be merged — if the work landed another way, land or cite a commit on main whose SUBJECT names $ident and re-run; if it landed in a different PR, re-point the binding (\`task deliver $ident --pr=<url>\`); if it never landed, this row is not done"
+            policy_refuse "$E_CONFLICT" done-before-pr-merged DIVE-1830 "$ident" "$ident cannot close: $_dref is not merged to main (state=$_state, measured).$_cu_why — $_cu_fix"
+          fi
         fi
         # DIVE-2656: MERGED is not the same as MERGED-WHAT-THE-VERIFIER-GRADED.
         #
@@ -1613,6 +1708,19 @@ $_body"
   # looking — not solved by making this marker louder.
   # Appended, never substituted, so the maker's own text is untouched; and only on a
   # real `done` (a cancel was never gated, so it has nothing to disclaim).
+  # DIVE-3458: ride the foreign-delivery record on the result, for the same reason
+  # the UNVERIFIED marker rides it — stderr scrolls away and the audit row is a
+  # different artifact than the one anyone reads. Appended, never substituted, and
+  # only on a real `done`. It goes FIRST so the two markers cannot interleave into
+  # one sentence if a close somehow earns both.
+  if [[ -n "$_mg_foreign" && "$verb" == "done" ]]; then
+    local _fg_base="$result"
+    (( want_result )) || _fg_base=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
+    result="${_fg_base}${_fg_base:+
+
+}${_mg_foreign}"
+    want_result=1
+  fi
   if [[ -n "$_mg_unverified" && $_mg_had_subject -eq 1 && "$verb" == "done" ]]; then
     local _mg_base="$result"
     (( want_result )) || _mg_base=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
