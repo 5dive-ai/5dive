@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased — feat(task): an inert push-for-review clears at filing, pinging nobody (DIVE-3481)
+
+lodar, 2026-08-16, on a routine branch-push approval waking the org lead: *"why dev2 cannot do
+delegated push himself and burns your token for approval?"* An approval gate whose ask is an
+**inert branch push** — classified by the shared `_gate_push_for_review_hit`, which fails closed on
+any prod-touching verb — on a row whose `Branch:` binding names a **non-protected ref** now applies
+the filer's own recommendation at filing: provenance `auto:pfr`, uid 0, a **signed** closure, the
+permanent gate record and digest line intact, and **no ping to anyone**.
+
+- **Measured, and the number is class-specific.** Across the whole gate history (528 gates carrying
+  an ask) 166 classify inert; 110 were answered; 101 carried a recommendation and **all 101 came
+  back applying it — zero disagreements**. The fleet-wide figure that DIVE-3474 arm 2 correctly
+  refused to auto-apply on is 54 of 121; this subclass is not that population.
+- **The premise this was filed on was wrong, and correcting it NARROWED the change.** It was filed
+  as "the 48h TTL grants this anyway". It does not: the TTL sweep excludes
+  `approval|secret|manual|access` (DIVE-2235) and 143 of the 166 are `approval` — the type a push
+  gate must take. 45 are still unanswered. The lead clear is load-bearing today, so this is a **new
+  grant**, not a TTL set to zero.
+- **Every guard fails closed:** `approval` only; tier 1 with the tier-2 category floor un-fired and
+  no explicit `--tier=2`; no declared `--needs`; not `--mode=confirm-after-send`; a `--recommend`
+  **the filer typed** (never a precedent prefill — that would stack two automated decisions); and a
+  `Branch:` binding read through the same parser `5dive push` acts on, naming a non-protected ref.
+  Repo ownership is enforced downstream by the push executor's own repo resolution and
+  installation-scoped token; no row carries a repo binding, so it is not re-derived at filing.
+- **The closure must SIGN or there is no auto-clear at all.** An unsigned self-clear would be a push
+  refused later, on someone else's round-trip, with the lead who could have cleared it already
+  skipped — strictly worse than the ping. A seat that cannot mint one warns once and routes
+  normally, exactly as before.
+- `broker_gate_check` authorizes `auto:pfr` on **approval gates only** — the one auto-clear
+  provenance it accepts. `need_answered_by` sits inside the signed closure the root executor
+  re-verifies, so a raw-DB forge of the string fails exactly as a forged `lead:X` does (DIVE-1555).
+- **`5dive task pfr-autoclear [on|off|status]`**, default **on**, restores the lead ping with no
+  release.
+
 ## Unreleased — fix(usage): the middle wildcard is a read too (DIVE-3419)
 
 Both transcript readers in `cmd_usage.sh` used `projects/*/*.jsonl`. `usage_collect` was guarded at the
