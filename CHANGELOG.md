@@ -1,6 +1,138 @@
 # Changelog
 
-## Unreleased — fix(usage): the middle wildcard is a read too (DIVE-3419)
+## v0.19.37 — fix(heartbeat): surface a row stranded on a BUSY seat (DIVE-3483)
+
+A task assigned to an agent that is alive and working on something else could sit
+untouched indefinitely without any rail saying so. Two rails looked for it and
+neither could see it: the supervisor's `idle-stranded` verdict requires that seat
+to have no active work, and the heartbeat's fleet-stall alarm requires the entire
+fleet to be idle. Both take idleness as a precondition, and the shape that actually
+occurs is a busy seat holding a row it never chooses.
+
+Measured on the live board before the fix: `idle-stranded` was detected 4187 times
+in seven days across 11 agents and acted on zero times — it is observe-only by
+design — while the alarm that does send has fired once in the board's history. The
+signal was never missing; it had no consumer.
+
+A new sweep arm reports a non-recurring row that has sat unstarted on an assignee
+past a window (default 24h, `HEARTBEAT_STRANDED_HOURS`), measured from the moment
+it was dropped for a row started once and abandoned, and from creation otherwise.
+The report names what that seat is actively doing and how much else it is holding,
+because both real instances were lane problems rather than priority problems and
+re-pinging the same seat cannot clear one. It goes to ops with the other monitors.
+
+It reports and never reassigns: changing hands is a recovery action, and this rail
+stays observe-and-report like the supervisor it complements. Each row is announced
+exactly once and never again — a rail that pings thousands of times gets muted, and
+a muted rail is the silent monitoring it was built to remove. Rows waiting on a
+human, parked rows, recurring instances and deliveries awaiting a verifier are all
+left to the rails that already own them.
+
+## v0.19.37 — fix(heartbeat): fleet-health monitor pings route to ops, not main (DIVE-3480)
+
+Nine hardcoded `cmd_send "main"` calls in the heartbeat's monitoring sweeps
+(gap#2 delivered-awaiting-verifier, gap#3 fleet-stall, answered-gate delivery,
+blocked-sweep recovery and orphan surface, recurring-stall notice/escalation/
+cancellation, pinger-liveness canary) predate the ops seat and routed every
+fleet-health observation to main's accumulating context window. They now route
+to ops, whose lane this is since the 2026-08-16 monitoring handover.
+
+The one deliberate exception: the capacity/billing escalation (an account
+genuinely rate/spend-limited after a failed self-heal) stays on main — it is
+framed as a human call for lodar, and billing routes through main.
+
+## v0.19.37 — fix(release): a release entry must BELONG to the range, not merely be stamped with it (DIVE-3472)
+
+DIVE-3435 filtered release-note entries on the heading's version token. That catches a
+heading someone restamped on main to some *other* version, and it is blind to the far
+more common shape: main's `CHANGELOG.md` is never stamped and never cleared, so a section
+that shipped weeks ago still reads `## Unreleased` there — and `stamp-changelog.sh`
+rewrites *every* `Unreleased` heading on the release commit to the version being cut. The
+already-shipped section therefore arrives at the range's end wearing this cut's version,
+passes the token filter, and renders as new.
+
+Measured on 2026-08-16: main carried 7 stale `## Unreleased` headings, v0.19.36's page
+carried 9 entries — 7 of them v0.19.35's — and one entry (DIVE-3344) had shipped in four
+consecutive public releases as a fixed tail that repeats on every cut.
+
+The predicate is now MEMBERSHIP rather than shape: an entry belongs to this cut only if
+its subject was not already in `CHANGELOG.md` at the range's start. That is the footer's
+own range restated as a set difference, and it is immune to the stamp by construction —
+restamping rewrites the version token and never the subject. Re-derived over the real
+v0.19.36 range, the body drops from 9 entries to the 2 whose commits are in it.
+
+The heading-less-fragment residual (`pre`) is unchanged and still documented in place.
+
+## v0.19.37 — feat(doctor): re-grade openclaw model pins against the installed catalog (DIVE-3457)
+
+An `OPENCLAW_PROVIDER_MODEL` row is graded against
+`openclaw models list --provider <native> --plain` **at the moment the row is
+written** — that is the rule in `header.sh`, and DIVE-3184 is a worked example of
+following it. Nothing re-checked it afterwards. The installed openclaw then
+upgrades underneath the row, and the pin already written into a seat's
+`openclaw.json` is never rewritten: `_apply_byo_openclaw` validates at *write*
+time and the write already happened, the boot seed re-syncs whatever is there,
+and DIVE-3442's push is a faithful copy of an already-graded value (correct
+behaviour, for a copier).
+
+So a pin that has stopped resolving is a **dated observation gone stale, not a
+bad write** — and at the file level it is byte-identical to one that still
+resolves, dying in the same place with the same 401. See
+`community/wiki/an-unconfigured-model-authenticates-against-the-wrong-provider.md`:
+the error names auth and hides provider selection.
+
+**Correction to the ticket's premise, measured before building anything.** The
+catalog *rows* were already re-checked: `/home/agent-dev3/byo-model-drift-check.sh`
+has run nightly on `poke-two` (cron `23 5 * * *`) since 2026-08-03, reads the pins
+from `git show origin/main:src/header.sh`, and files a task row on drift
+(DIVE-2626). Its 2026-08-16 05:23 run reported `pins=27 graded=13 skipped=0
+excluded=14 unaccounted=0 drift=0`. What it does **not** do is read a single
+already-written pin — `grep -cE 'openclaw\.json|agents\.defaults'` over that
+script is **0**. And nothing in this repo does either: `models list` appears in
+`origin/main` only inside comments and one error string, never on a code path.
+So the uncovered half is the pin **on disk**, not the pin in the table.
+
+`5dive doctor --category=models` now re-grades, against the **installed**
+catalog:
+
+* every `OPENCLAW_PROVIDER_MODEL` row — a second, host-local instrument that
+  agrees with the nightly cron rather than replacing it (it grades against the
+  openclaw installed *here*, which the cron's control-plane view cannot see), and
+* every already-written pin on the box — the shared
+  `/home/claude/.openclaw/openclaw.json`, each auth profile's
+  `<profile>/openclaw/.openclaw/openclaw.json`, and each seat's
+  `/home/agent-*/.openclaw/openclaw.json`.
+
+A stale pin is an `error` naming the exact re-grade command (rows) or the file
+to repair (written pins). A provider that enumerates **nothing** is a `warn`
+NO-ORACLE, never an error: an unenumerated namespace is not a proof of
+unroutability (DIVE-3130/3184), and grading it as an error would tell an
+operator to delete a good row.
+
+**Two controls run before any verdict, and their failure suppresses the sweep
+rather than colouring it.** On the version the rows were graded against every
+pin resolves, so an all-green run proves only that the probe returned:
+
+* *non-vacuity* — the control provider's list must be non-empty. `models list`
+  prints `No models found.` at **exit 0** both for a provider it does not
+  enumerate and for one spelled wrong (DIVE-3184 measured those byte-identical),
+  so an openclaw answering nothing for everything would otherwise report every
+  pin stale: the false alarm, mirror of the false green.
+* *discrimination* — a sentinel known **absent** must miss. `openai/gpt-4o` is
+  the sentinel because it is live on models.dev and absent here (openai starts
+  at gpt-5.3 on 2026.7.1-2, DIVE-2631). A hit means the matcher is looser than
+  an exact id comparison and every green below it is worthless.
+
+**Opt-in on purpose — a bare `doctor` does not run it.** Each provider costs a
+full openclaw process (5.8s measured), so the seven rows are ~36s, and the
+dashboard polls `doctor --json`. It is likewise not a create-time probe in
+`selfcheck_cred_reached_agent`: that rail re-runs continuously and the answer
+cannot change between runs on a fixed build (dev2 + quinn, DIVE-3442). The
+trigger is instead the one event that can invalidate a pin without touching a
+byte of it — `5dive agent install openclaw --upgrade` now prints the re-grade
+command when the version actually moves.
+
+## v0.19.37 — fix(usage): the middle wildcard is a read too (DIVE-3419)
 
 Both transcript readers in `cmd_usage.sh` used `projects/*/*.jsonl`. `usage_collect` was guarded at the
 **top** (`probe_readable` on `projects/`) and the **bottom** (per-file `except OSError`) of a *three*-level
@@ -30,7 +162,7 @@ true** — and every "⚠ N NOT checked — burn is unknown (not 0)" banner buil
   ANY-UID arm (`ELOOP`, which root cannot resolve either) so a uid-0 CI run cannot be a vacuous green, and
   over-fire controls. **9/14 pre-fix, 23/0 after.**
 
-## Unreleased — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
+## v0.19.37 — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
 
 Nothing validated these columns. The work-picker dispatches on `assignee`, so a row on a name that is
 not a registered agent was **structurally undispatchable** — not blocked, not parked, not flagged, and
@@ -54,7 +186,7 @@ never once a dispatch target) and corroborated here (5 open rows).
 - **`wip-cap-install`** read the same unvalidated column (it had minted `wip_cap:cli`, a lane ceiling
   for an agent that does not exist). It now skips unregistered lanes and **names the skip**.
 
-## Unreleased — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
+## v0.19.37 — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
 
 `5dive agent config <name> set channels=<current>,buzz` could not succeed on any seat that was not
 **created** with buzz. `cmd_config` dispatches `install_channel_for_agent` for telegram, discord and
@@ -87,7 +219,7 @@ arms grade the satisfier next to the gate, and drive `cmd_config` for real — w
 that the same call reaches the restart once the cache is staged, so the rollback arms cannot pass
 against a `cmd_config` that simply refuses everything.
 
-## Unreleased — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
+## v0.19.37 — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
 
 DIVE-2483's gate answer said the preservation notice lands on **stdout**. It lands on **stderr**,
 via the fleet's `warn()`. Six arms were written for that condition and all six were green, because
@@ -121,7 +253,7 @@ Still open and scoped out on purpose: `task reject` remains an unguarded writer 
 column (`src/cmd_task.sh:4235`). That is a design question about accumulating verifier feedback, not
 this gap.
 
-## Unreleased — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
+## v0.19.37 — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
 
 DIVE-3272 taught the supervisor BOARD to see a seat that is alive and closing nothing. The
 drill-down people actually type kept printing only liveness: `state: active / enabled` was
@@ -163,7 +295,7 @@ supervisor:  quota-exhausted / quota-exhausted — pane shows a model-capacity r
 - `agent list` is unchanged — it is the survey surface, and this is a per-agent drill-down
   (three sqlite reads), deliberately not an N-way fan-out.
 
-## Unreleased — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
+## v0.19.37 — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
 
 A gate reaches the filer's lead only if `_GATE_ENG_SHIP_RX` matches the ask or the row
 title. `gate_builder_routing` is OFF by default, so for an ordinary builder ship gate that
@@ -227,7 +359,7 @@ prose for identifiers.
   `gate_access_lead_clear`, `gate_internal_ops_floor`, `task_needs_human_parity`,
   `task_inbox_json_tier`, `push_unit`, `broker_surface`, + 15 more).
 
-## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
+## v0.19.37 — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
 
 DIVE-1935's first iteration was rejected, and for the right reason. It added a
 `sudo -n -u claude gh auth token` arm to `_gate_gh_token` justified by *"agents hold
