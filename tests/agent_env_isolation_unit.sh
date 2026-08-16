@@ -46,6 +46,9 @@ set -uo pipefail
 # No 2>/dev/null on the source — the helper's stderr line IS the payload.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+# DIVE-2229: pinned-commit baselines, fail-closed. Same no-2>/dev/null rule.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/pinned_baseline.sh" \
+  || printf 'pinned baseline helper: UNRESOLVED (tests/lib/pinned_baseline.sh not reachable)\n' >&2
 trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692
 cd "$(dirname "$0")/.."
 SRC=src
@@ -160,16 +163,32 @@ else
   mk_reg '{"agents":{"boxed":{"isolation":"sandboxed"},"plain":{"isolation":"standard"},"root":{"isolation":"admin"},"notier":{},"disagree":{"isolation":"sandboxed"}}}'
 fi
 
-# Differential anchor: the PRE-FIX expression, extracted from origin/main rather
-# than retyped, on the same input T15 refuses. A retyped baseline only agrees with
-# my reading of the old code (DIVE-2213's technique).
-old=$(git show origin/main:src/cmd_agent_teambot.sh 2>/dev/null \
-        | grep -m1 -F 'iso="${iso:-admin}"')
-if [[ -z "$old" ]]; then
-  printf 'note - T19b baseline UNRESOLVED (no origin/main), pre-fix arm not graded\n'
+# Differential anchor: the PRE-FIX expression, extracted rather than retyped, on
+# the same input T15 refuses. A retyped baseline only agrees with my reading of
+# the old code (DIVE-2213's technique).
+#
+# PINNED TO A COMMIT, NOT TO origin/main (DIVE-2229). The first cut of this arm
+# read the baseline from `origin/main`, which is wrong twice over: (a) it is a
+# branch ref, which tests/baseline_pin_unit.sh forbids corpus-wide and which red
+# this harness's own PR; (b) it is SELF-VACUATING — the moment this change merges,
+# origin/main no longer contains `iso="${iso:-admin}"`, the extraction goes empty
+# and the one arm proving the pre-fix bug existed stops running forever, silently.
+# ec564b9 is this branch's base, the last commit before the fix, and it is on main.
+# Unresolvable is a FAILURE, never a note: a not-reached arm is counted green by
+# every reader of the tally.
+PRE_FIX_REF="ec564b943515bba0761ff7683f1fe7cf99df7f2c"   # main immediately before DIVE-2218
+OLD_TEAMBOT="$TMP/cmd_agent_teambot.pre-fix.sh"
+if pinned_blob "$PRE_FIX_REF" src/cmd_agent_teambot.sh "$OLD_TEAMBOT"; then
+  old=$(grep -m1 -F 'iso="${iso:-admin}"' "$OLD_TEAMBOT")
+  if [[ -z "$old" ]]; then
+    bad_t "T19b pre-fix expression is EXTRACTABLE at ${PRE_FIX_REF}" \
+          "the ref resolved but src/cmd_agent_teambot.sh there has no 'iso=\${iso:-admin}' line — the pin names the wrong commit, or the expression was written differently than this arm assumes; either way the equality below would be vacuous"
+  else
+    ef="$ENV_DIR/ghost.env"; eval "$old" ; # sets iso from the absent file, then defaults
+    eq_t "T19b pre-fix expression really did manufacture 'admin' from an absent file" "$iso" "admin"
+  fi
 else
-  ef="$ENV_DIR/ghost.env"; eval "$old" ; # sets iso from the absent file, then defaults
-  eq_t "T19b pre-fix expression really did manufacture 'admin' from an absent file" "$iso" "admin"
+  bad_t "T19b pre-fix collapse NOT re-measured" "$(pinned_unavailable_msg "$PRE_FIX_REF")"
 fi
 
 # ------------------------------------------------- T20-T21: the pairing fail-safe
