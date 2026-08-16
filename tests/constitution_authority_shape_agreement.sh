@@ -70,6 +70,20 @@ read_bash() {
 
 doc() { printf '%s' "$2" > "$TMP/$1.yaml"; printf '%s' "$TMP/$1.yaml"; }
 
+# --- A0 THE READER UNDER TEST IS THE SHIPPED ONE -------------------------------------
+# "the node-free reader is UNTOUCHED" is the whole safety argument of this change, and an
+# untouched file is only safe if it is the file being exercised. A copy, a stub, or a
+# stale sourced bundle would grade the same green. Name it.
+shopt -s extdebug
+reader_src="$(declare -F _gate_clear_leads | awk '{print $3}')"
+shopt -u extdebug
+[[ "$reader_src" == *"src/task/need.sh" && -f "$reader_src" ]] \
+  && ok_t "A0 the enforcing reader under test is the real src/task/need.sh ($reader_src)" \
+  || bad_t "A0 reader provenance" "_gate_clear_leads came from '${reader_src:-nowhere}', not src/task/need.sh"
+git diff --quiet HEAD -- src/task/need.sh 2>/dev/null \
+  && ok_t "A0 src/task/need.sh is unmodified against HEAD — the reader is not being bent to fit" \
+  || bad_t "A0 reader untouched" "src/task/need.sh differs from HEAD; the safety argument of this change is that it does not"
+
 # --- A1..A3 THE AGREEMENT: accepted + non-empty => the reader reads the same names ---
 # Both indentations, because YAML permits a block sequence at its key's own indent as
 # well as one level in, and the bash reader accepts both. A validator that took only one
@@ -188,6 +202,55 @@ a key under a block sequence|authority:\n  gate_clear_leads:\n    - main\n  gate
 an empty sequence entry|authority:\n  gate_clear_leads:\n    -\n
 a sequence with no owning key|- main\n
 CASES
+
+# --- A8 THE CONTROL, INSIDE THE HARNESS ----------------------------------------------
+# A green suite proves nothing unless the same suite can go red. So run A1 and A4 against
+# the PRE-FIX validator (main's own bytes) and require them to fail in the two specific
+# directions this row exists to close. A substitution that silently did not apply and a
+# test that cannot fail look identical from the outside — both all-green — so the swap is
+# asserted BEFORE the arms: the mutant must differ from the file under test, and it must
+# still be importable. If either check cannot be made, this is a FAIL, never a skip.
+# The control MUTATES the current validator rather than fetching the pre-fix one: a git ref
+# is a moving target (once this lands, `origin/main` carries the fix and a base-ref control
+# silently inverts), while a mutation stays valid for as long as the code it removes exists.
+mutant_validate() {
+  node --input-type=module -e '
+    import { readFileSync } from "node:fs"
+    const E = await import(process.argv[1])
+    try {
+      const c = E.normalizeConstitution(E.parseConstitutionFrontmatter(readFileSync(process.argv[2], "utf8")))
+      process.stdout.write(c.authority.gateClearLeads.join("\n"))
+    } catch (e) { process.stdout.write("INVALID " + String(e && e.message || e)) }
+  ' "$1" "$2" 2>&1
+}
+# $1 label · $2 sed program · $3 document · $4 expected output
+mutate_and_expect() {
+  local label="$1" prog="$2" docf="$3" want="$4" m="$TMP/mutant.$RANDOM.mjs" got
+  sed "$prog" src/council/engine.mjs > "$m"
+  if cmp -s "$m" src/council/engine.mjs; then
+    bad_t "A8 mutation '$label' DID NOT APPLY" "the mutant is byte-identical to the validator under test — this arm proves nothing, and a mutation that silently missed looks exactly like a passing test"
+    return
+  fi
+  ok_t "A8 mutation '$label' landed (mutant differs from the file under test)"
+  got="$(mutant_validate "$m" "$TMP/flowempty.yaml")"
+  [[ "$got" == "" ]] \
+    && ok_t "A8 mutation '$label': the mutant still LOADS (its red below is the mutation, not a syntax error)" \
+    || bad_t "A8 mutation '$label' unusable" "the mutant failed on a document every version accepts ('$got')"
+  got="$(mutant_validate "$m" "$docf")"
+  [[ "$got" == "$want" ]] \
+    && ok_t "A8 mutation '$label' goes RED as required — this suite can fail" \
+    || bad_t "A8 mutation '$label' did not go red" "wanted '$want', got '$got'"
+}
+# M1 — remove block-sequence support: the block form must stop validating, which is the bug
+# this row closes and the shape the enforcing reader is the only consumer of.
+mutate_and_expect 'block sequences unsupported (the pre-fix parser)' \
+  's#frame\.value\.push(val)#throw new Error("mutant: use inline arrays in constitution v0")#' \
+  "$TMP/block_indented.yaml" 'INVALID mutant: use inline arrays in constitution v0'
+# M2 — remove the flow refusal: a list the enforcer denies must start validating again. This
+# is the security arm; if it cannot be made to fail, the guard is not being exercised.
+mutate_and_expect 'flow refusal removed (the silent false grant)' \
+  's|authority\.gate_clear_leads\.yamlFlow|false|' \
+  "$TMP/flow.yaml" "$(printf 'main\nolivia')"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
