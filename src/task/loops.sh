@@ -737,9 +737,31 @@ cmd_task_verify() {
     # up. graded_by is the ACTOR, so terminal_for_verifier can additionally require
     # grader != maker and a self-verified close cannot buy the exemption.
     # COALESCE: first grade wins, same rule as done_at (DIVE-2477).
+    #
+    # DIVE-3430: and stamp WHAT the verdict was. graded_at alone records only THAT
+    # someone graded, so a FAIL recorded here rendered `graded->merge` — the
+    # DIVE-3315 instruction, with no reject token for DIVE-3428's conjunct to catch.
+    #
+    # DERIVED FROM $rc, NEVER FROM WHICH BRANCH THIS IS. This else is entered on
+    # `rc != 0` (a FAIL, any flags) AND on `--no-done` with `rc == 0` (a PASS
+    # recorded without closing). Calling it "the FAIL branch" and hardcoding 'fail'
+    # would record every --no-done PASS as a failure and drop correctly-delivered
+    # rows out of graded->merge — the exact INVERSE of the bug being fixed, and the
+    # `--cmd=false` probe on the row would not have caught it because it exercises
+    # both cases with rc != 0.
+    #
+    # BARE SET, NOT COALESCE, and this asymmetry with the two lines above is
+    # deliberate — see the CREATE TABLE comment. graded_at/graded_by are provenance
+    # (who first graded, when) and must not be rewritten by a re-grade; the verdict
+    # is a CURRENT STATE and must be, or a verifier could never clear their own
+    # earlier FAIL and a legitimately re-graded row would be permanently unmergeable.
+    # graded_verdict_at carries the current verdict's own clock so the skew from a
+    # frozen graded_at is readable rather than silent.
     db "UPDATE tasks SET result=$(sqlq "$result_txt"),
            graded_at=COALESCE(graded_at, datetime('now')),
-           graded_by=COALESCE(graded_by, $(sqlq "$(task_actor "")"))
+           graded_by=COALESCE(graded_by, $(sqlq "$(task_actor "")")),
+           graded_verdict=$( (( rc == 0 )) && printf "'pass'" || printf "'fail'" ),
+           graded_verdict_at=datetime('now')
         WHERE id=${id};"
   fi
 
