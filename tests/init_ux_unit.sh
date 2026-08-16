@@ -48,6 +48,17 @@ do
   [[ "$body" == *"$needle"* ]] || { echo "FAIL: missing masked-input wiring: $needle" >&2; exit 1; }
 done
 
+# DIVE-3505: the pty below now runs with ECHO cleared (see the note in drive()),
+# which is what makes it deterministic -- but it also retires the coverage the
+# echo race was providing by accident. A `_init_secret` that lost its `-s` would
+# have leaked the secret via KERNEL echo, and with echo off the pty can no longer
+# see that. Measured: mutating `read -r -s -n1` -> `read -r -n1` fails the old
+# harness and passes the echo-off one. So assert the no-echo read structurally,
+# where it is a fact about the source rather than a race against the tty.
+secret_body="$(declare -f _init_secret)"
+[[ "$secret_body" == *'read -r -s -n1'* ]] \
+  || { echo "FAIL: _init_secret must read with -s (no terminal echo)" >&2; exit 1; }
+
 [[ "$body" == *'_init_section 4 4 "Review and create"'* ]] \
   || { echo "FAIL: missing pre-create review stage" >&2; exit 1; }
 
@@ -58,14 +69,35 @@ import pty
 import select
 import shlex
 import sys
+import termios
 import time
 
 root = sys.argv[1]
 
 
+# DIVE-3505: this harness, not the product, owned a pty ECHO race that reds
+# `test-installed-host` at random. `_init_secret` reads with `read -r -s -n1`,
+# and bash's `-s` turns echo off on ENTRY and restores it on EXIT -- per call,
+# so with `-n1` that is one echo-off/echo-on cycle PER CHARACTER. Writing a
+# whole payload in one os.write leaves the unconsumed tail sitting in the tty
+# input buffer, and the kernel echoes it the moment echo comes back on. The
+# product was innocent: the failing runs showed the kernel echo AND the
+# product's own `*******` mask AND RESULT_LEN=7 all at once.
+#
+# Two independent layers, because either alone leaves a window:
+#   1. Clear ECHO in the CHILD before execv. Doing it from the parent after
+#      pty.fork() races the child: if bash has already entered a `read -s`, the
+#      termios it restores on exit is the one it saved -- echo ON -- and the
+#      buffered tail echoes anyway. Clearing it before bash exists means every
+#      save/restore cycle can only ever restore echo-off.
+#   2. Write payloads one byte at a time (below), so no unconsumed tail is ever
+#      parked in the buffer for an echo-on window to flush.
 def drive(shell_body, interactions, timeout=5, term="xterm-256color"):
     pid, fd = pty.fork()
     if pid == 0:
+        attrs = termios.tcgetattr(0)
+        attrs[3] &= ~termios.ECHO
+        termios.tcsetattr(0, termios.TCSANOW, attrs)
         os.environ["TERM"] = term
         os.environ["NO_COLOR"] = "1"
         command = f"source {shlex.quote(root)}/src/cmd_init.sh; {shell_body}"
@@ -82,7 +114,8 @@ def drive(shell_body, interactions, timeout=5, term="xterm-256color"):
                 ready, _, _ = select.select([fd], [], [], 0.1)
                 if ready:
                     output.extend(os.read(fd, 4096))
-            os.write(fd, payload)
+            for byte in payload:
+                os.write(fd, bytes([byte]))
 
         while time.monotonic() < deadline:
             ready, _, _ = select.select([fd], [], [], 0.1)
