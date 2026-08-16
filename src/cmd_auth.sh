@@ -414,9 +414,20 @@ cmd_auth_status() {
   # name, i.e. exactly the fact an operator asking "is agent X authed" lacks.
   if [[ -n "$agent" ]]; then
     [[ -z "$profile" ]] || fail "$E_USAGE" "--agent and --auth-profile are mutually exclusive"
-    local _reg _atype
-    _reg=$(registry_read 2>/dev/null) || _reg=""
-    [[ -n "$_reg" ]] || fail "$E_NOT_FOUND" "agent registry unreadable as $(id -un) — re-run as root"
+    # registry_read() collapses absent / unreadable / truncated / genuinely-empty
+    # onto {"agents":{}} (see its doc comment in src/lib/registry.sh), so a
+    # caller that cannot read the registry would be told the agent DOES NOT
+    # EXIST — a wrong answer dressed as a definite one. _checked distinguishes
+    # them, which is the whole point of asking about a specific agent.
+    local _reg _atype _rrc=0
+    _reg=$(registry_read_checked 2>/dev/null) || _rrc=$?
+    case "$_rrc" in
+      0) : ;;
+      3) fail "$E_NOT_FOUND" "no agent registry on this host — cannot resolve agent '$agent'" ;;
+      4) fail "$E_NOT_FOUND" "agent registry unreadable as $(id -un) — re-run as root" ;;
+      5) fail "$E_NOT_FOUND" "agent registry is not parseable as JSON — cannot resolve agent '$agent'" ;;
+      *) fail "$E_NOT_FOUND" "agent registry read failed (rc=$_rrc) — cannot resolve agent '$agent'" ;;
+    esac
     jq -e --arg n "$agent" '.agents | has($n)' <<<"$_reg" >/dev/null 2>&1 \
       || fail "$E_NOT_FOUND" "unknown agent: $agent"
     _atype=$(jq -r --arg n "$agent" '.agents[$n].type // empty' <<<"$_reg")
@@ -469,30 +480,52 @@ cmd_auth_status() {
   fi
   # Agents of a queried type that are bound to a NON-default profile: their
   # credential lives on a path this default-scope answer never opened.
-  local uncovered="[]"
+  #
+  # And it is measured with registry_read_CHECKED, not registry_read: the plain
+  # helper returns {"agents":{}} for an unreadable or truncated registry, which
+  # renders as "0 agents uncovered" — a clean green — and puts the DIVE-3100
+  # false green back inside the one line written to kill it. Zero-uncovered and
+  # coverage-unmeasured must not print the same thing, so an unmeasured read
+  # yields uncoveredStatus=unknown:<reason> with uncoveredAgents null, never [].
+  local uncovered="[]" uncovered_status="measured"
   if [[ "$scope_kind" == "default" ]]; then
-    local _reg2
-    _reg2=$(registry_read 2>/dev/null) || _reg2=""
-    if [[ -n "$_reg2" ]]; then
-      uncovered=$(jq -c --argjson types "$(printf '%s\n' "${types[@]}" | jq -R . | jq -sc .)" \
-        '[.agents // {} | to_entries[]
-          | select((.value.authProfile // "") != "")
-          | select(.value.type as $t | $types | index($t))
-          | {name: .key, type: .value.type, authProfile: .value.authProfile}]' \
-        <<<"$_reg2" 2>/dev/null) || uncovered="[]"
-    fi
+    local _reg2 _rrc2=0
+    _reg2=$(registry_read_checked 2>/dev/null) || _rrc2=$?
+    case "$_rrc2" in
+      0) uncovered=$(jq -c --argjson types "$(printf '%s\n' "${types[@]}" | jq -R . | jq -sc .)" \
+           '[.agents // {} | to_entries[]
+             | select((.value.authProfile // "") != "")
+             | select(.value.type as $t | $types | index($t))
+             | {name: .key, type: .value.type, authProfile: .value.authProfile}]' \
+           <<<"$_reg2" 2>/dev/null) || { uncovered="[]"; uncovered_status="unknown:coverage-query-failed"; }
+         ;;
+      3) uncovered_status="unknown:no-registry" ;;
+      4) uncovered_status="unknown:registry-unreadable" ;;
+      5) uncovered_status="unknown:registry-unparsable" ;;
+      *) uncovered_status="unknown:registry-read-failed" ;;
+    esac
+    [[ "$uncovered_status" == "measured" ]] || uncovered="null"
   fi
 
   if (( JSON_MODE )); then
     echo "$out" | jq -c --arg k "$scope_kind" --arg l "$scope_label" \
       --arg a "$agent" --arg p "$profile" --argjson u "$uncovered" \
+      --arg us "$uncovered_status" \
       '{ok:true, data: ., scope:{kind:$k, label:$l,
                                  agent:(if $a == "" then null else $a end),
                                  authProfile:(if $p == "" then null else $p end),
-                                 uncoveredAgents:$u}}'
+                                 uncoveredAgents:$u,
+                                 uncoveredStatus:$us}}'
+    [[ "$uncovered_status" == "measured" ]] \
+      || echo "COVERAGE UNKNOWN (${uncovered_status#unknown:}): this answer's blind spot could not be measured — it is NOT zero agents, it is unmeasured." >&2
   else
     echo "$out" | jq -r 'to_entries[] | "\(.key): \(.value)"' | sort
     echo "scope: ${scope_label}" >&2
+    if [[ "$uncovered_status" != "measured" ]]; then
+      echo "COVERAGE UNKNOWN (${uncovered_status#unknown:}): this answer's blind spot could not be measured — it is NOT zero agents, it is unmeasured." >&2
+      echo "  re-run as a caller that can read the agent registry, or check one agent at a time: 5dive agent auth status --agent=<name>" >&2
+      return 0
+    fi
     local _nu
     _nu=$(jq -r 'length' <<<"$uncovered" 2>/dev/null || echo 0)
     if (( _nu > 0 )); then

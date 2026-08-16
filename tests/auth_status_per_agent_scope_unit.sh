@@ -33,7 +33,12 @@ set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
-trap 'rc=$?; rm -rf "${TMP:-}" 2>/dev/null; echo "HARNESS-RC=$rc"' EXIT
+# Guarded on BASHPID: bash fires an inherited EXIT trap when a SUBSHELL ends,
+# and the refusal arms below run cmd_auth_status (whose `fail` exits) inside
+# command substitutions. Unguarded, the first refusal rm -rf'd "$TMP" and
+# printed a HARNESS-RC line mid-run, ending the corpus early with a passing
+# tail — a harness that stops is not a harness that passed.
+trap 'rc=$?; [[ "$BASHPID" == "$$" ]] || exit "$rc"; rm -rf "${TMP:-}" 2>/dev/null; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/auth-status-per-agent-unit.XXXXXX)"
@@ -67,6 +72,16 @@ cat > "$TMP/agents.json" <<'JSON'
 }}
 JSON
 registry_read() { cat "$TMP/agents.json"; }
+# The seam the coverage list actually lives in. registry_read() cannot express
+# "I could not read it" — it returns {"agents":{}} for absent / unreadable /
+# truncated alike — so an always-succeeding stub of it makes the fail-open
+# unreachable by construction (quinn, iteration 1). REG_RC drives the CHECKED
+# helper's documented codes: 3 absent, 4 unreadable, 5 unparseable.
+REG_RC=0
+registry_read_checked() {
+  [[ "$REG_RC" == "0" ]] || return "$REG_RC"
+  cat "$TMP/agents.json"
+}
 
 # shellcheck source=/dev/null
 source "$SRC/cmd_auth.sh"
@@ -75,15 +90,23 @@ source "$SRC/cmd_auth.sh"
 # auth_status_one would shell out to a vendor CLI; the routing is the change.
 auth_status_one() { printf 'scope=%s' "${3:-DEFAULT}"; }
 
-# `fail` exits; capture its message instead of dying so we can grade refusals.
-fail() { echo "FAILCALL: $2" >&2; return 66; }
+# Real `fail` EXITS, so every refusal site is terminal. Every call below runs
+# cmd_auth_status inside a command substitution, i.e. a subshell, so exiting
+# here reproduces that without killing the harness. A `return` stub would let
+# execution fall through past a refusal and emit a SECOND, contradictory
+# message — which is a harness artefact, not product behaviour.
+fail() { echo "FAILCALL: $2" >&2; exit 66; }
 
 fails=0
 check() { if [[ "$2" == "$3" ]]; then echo "ok: $1"; else echo "FAIL: $1 (want=$3 got=$2)"; fails=1; fi; }
 contains() { if [[ "$2" == *"$3"* ]]; then echo "ok: $1"; else echo "FAIL: $1 (want substring=$3 got=$2)"; fails=1; fi; }
 
-run_json() { JSON_MODE=1 cmd_auth_status "$@" 2>/dev/null; }
-run_err()  { JSON_MODE=1 cmd_auth_status "$@" 2>&1 >/dev/null; }
+# Every invocation runs in an explicit subshell with the EXIT trap CLEARED: the
+# `fail` stub above exits, and bash fires an inherited EXIT trap when a subshell
+# exits — which would rm -rf "$TMP" out from under the rest of the run.
+run_json() { ( trap - EXIT; JSON_MODE=1 cmd_auth_status "$@" 2>/dev/null ); }
+run_err()  { ( trap - EXIT; JSON_MODE=1 cmd_auth_status "$@" 2>&1 >/dev/null ); }
+run_text_err() { ( trap - EXIT; JSON_MODE=0 cmd_auth_status "$@" 2>&1 >/dev/null ); }
 
 # --- 1. THE FIX: --agent resolves that agent's own profile ----------------
 out=$(run_json --agent=finn)
@@ -127,6 +150,65 @@ JSON
 out=$(run_json --type=hermes)
 check "no profile-bound agents of the type -> uncovered list is empty" \
   "$(jq -r '.scope.uncoveredAgents | length' <<<"$out")" "0"
+cat > "$TMP/agents.json" <<'JSON'
+{"agents":{
+  "finn":   {"type":"hermes",   "authProfile":"hermes-finn"},
+  "ray":    {"type":"openclaw", "authProfile":"openclaw-ray"},
+  "nobody": {"type":"hermes",   "authProfile":""},
+  "cc":     {"type":"claude",   "authProfile":"cc-prof"}
+}}
+JSON
+
+check "a measured coverage list says so" \
+  "$(jq -r '.scope.uncoveredStatus' <<<"$(run_json --type=hermes)")" "measured"
+
+# --- 3b. UNMEASURED COVERAGE IS NOT ZERO COVERAGE ------------------------
+# The fail-open this row exists to kill, one layer in: if the registry read
+# fails, the "NOT COVERED: N agent(s)" block reads 0 and disappears, and the
+# answer is a clean green again — silence rendered identically to safety. The
+# uncovered list must therefore be null + a reason, never [].
+for rc_case in "4:registry-unreadable" "5:registry-unparsable" "3:no-registry"; do
+  REG_RC="${rc_case%%:*}"; want="unknown:${rc_case#*:}"
+  out=$(run_json --type=hermes)
+  check "registry rc=${REG_RC}: coverage reports ${want}, not a number" \
+    "$(jq -r '.scope.uncoveredStatus' <<<"$out")" "$want"
+  check "registry rc=${REG_RC}: uncoveredAgents is null, NOT an empty list" \
+    "$(jq -r '.scope.uncoveredAgents | if . == null then "null" else "list(\(length))" end' <<<"$out")" "null"
+  contains "registry rc=${REG_RC}: text mode says COVERAGE UNKNOWN out loud" \
+    "$(REG_RC=$REG_RC run_text_err --type=hermes)" "COVERAGE UNKNOWN"
+  contains "registry rc=${REG_RC}: text mode does NOT print a zero-uncovered green" \
+    "$(REG_RC=$REG_RC run_text_err --type=hermes)" "NOT zero agents"
+  # The type-level auth answer itself is still delivered — the registry says
+  # nothing about whether the default credential is present.
+  check "registry rc=${REG_RC}: the auth answer itself still arrives" \
+    "$(jq -r '.data.hermes' <<<"$out")" "scope=DEFAULT"
+  # ...and --agent must not answer "unknown agent" (i.e. "does not exist")
+  # about an agent it simply could not look up.
+  # A bare `err=$(...)` would take errexit (inherited from header.sh) straight
+  # to the EXIT trap, because a refusal exits non-zero — the harness would stop
+  # here with a passing tail. Grade the refusal instead of tripping over it.
+  if err=$(REG_RC=$REG_RC run_err --agent=finn); then
+    err="UNEXPECTED-SUCCESS(rc=0): $err"
+  fi
+  contains "registry rc=${REG_RC}: --agent=finn refuses with a registry reason" "$err" "registry"
+  if [[ "$err" == *"unknown agent: finn"* ]]; then
+    echo "FAIL: registry rc=${REG_RC}: --agent=finn reported the agent does not exist"; fails=1
+  else
+    echo "ok: registry rc=${REG_RC}: --agent=finn does not claim the agent does not exist"
+  fi
+done
+REG_RC=0
+
+# Malformed body that still READS: registry_read_checked is stubbed here, so
+# this grades the caller's own jq failing rather than the helper's rc path.
+cat > "$TMP/agents.json" <<'JSON'
+{"agents":{"finn": {"type":"hermes", "authProf
+JSON
+out=$(run_json --type=hermes)
+check "malformed registry body: coverage is unknown, not zero" \
+  "$(jq -r '.scope.uncoveredStatus' <<<"$out")" "unknown:coverage-query-failed"
+check "malformed registry body: uncoveredAgents is null" \
+  "$(jq -r '.scope.uncoveredAgents | if . == null then "null" else "list" end' <<<"$out")" "null"
 cat > "$TMP/agents.json" <<'JSON'
 {"agents":{
   "finn":   {"type":"hermes",   "authProfile":"hermes-finn"},
