@@ -627,6 +627,17 @@ doctor_build_caps() {
 OPENCLAW_PIN_CONTROL_PROVIDER="openai"
 OPENCLAW_PIN_CONTROL_ABSENT="openai/gpt-4o"
 
+# The node the openclaw shim is executed under. A VARIABLE and not a literal,
+# and that is a fix, not a refactor: with the path hardcoded, the runtime guard
+# below is a THIRD live seam the offline harness could not stub, so on any box
+# without openclaw installed the check emitted one warn and returned at its
+# first line. Every arm of tests/openclaw_pin_regrade_unit.sh then observed an
+# empty tree — including the two arms that assert a verdict is ABSENT, which
+# passed on that emptiness and reported the suppression working. An
+# absence-assertion arm passes on empty output; the seam it depends on has to
+# be injectable or the positive control cannot be written.
+OPENCLAW_PIN_NODE_BIN="${OPENCLAW_PIN_NODE_BIN:-/home/claude/.local/bin/node}"
+
 # openclaw_catalog_ids <native> — the provider's `--plain` id list on stdout.
 # rc 1 when the runtime is missing (caller must not read that as an empty
 # catalog). "No models found." is filtered out here rather than at the call
@@ -634,7 +645,7 @@ OPENCLAW_PIN_CONTROL_ABSENT="openai/gpt-4o"
 # catalog look like a one-id catalog.
 openclaw_catalog_ids() {
   local native="$1"
-  local node="/home/claude/.local/bin/node" bin="${TYPE_BIN[openclaw]:-}"
+  local node="$OPENCLAW_PIN_NODE_BIN" bin="${TYPE_BIN[openclaw]:-}"
   [[ -n "$bin" && -x "$node" && -x "$bin" ]] || return 1
   sudo -u claude -H env HOME=/home/claude PATH=/home/claude/.local/bin:/usr/bin:/bin \
     "$node" "$bin" models list --provider "$native" --plain 2>/dev/null \
@@ -665,7 +676,7 @@ openclaw_written_pins() {
 # against the INSTALLED catalog. Adds its own checks via doctor_add.
 doctor_check_openclaw_model_pins() {
   local bin="${TYPE_BIN[openclaw]:-}"
-  local node="/home/claude/.local/bin/node"
+  local node="$OPENCLAW_PIN_NODE_BIN"
   if [[ -z "$bin" || ! -x "$node" || ! -x "$bin" ]]; then
     doctor_add models openclaw-runtime warn \
       "openclaw is not installed here, so no pin was graded — this is a NOT-MEASURED, not a clean bill of health (install: 5dive agent install openclaw --upgrade)"
@@ -696,8 +707,16 @@ doctor_check_openclaw_model_pins() {
     "controls passed on $version: '$OPENCLAW_PIN_CONTROL_PROVIDER' enumerates $ctl_n ids (non-vacuity) and absent sentinel '$OPENCLAW_PIN_CONTROL_ABSENT' did not match (discrimination)"
 
   # ── catalog rows ────────────────────────────────────────────────────────
-  local canonical native pin ids n stale=0 noracle=0 graded=0
+  # `rows` is counted in the loop rather than read as ${#OPENCLAW_PROVIDER_MODEL[@]}
+  # in the summary line. Not cosmetic: tests/local_array_unbound_default_unit.sh
+  # arm G resolves every such read against a creation earlier in the SAME
+  # function, so a file-scope `declare -A` in src/header.sh can never satisfy it
+  # and the read reds a guard that is green on main. Widening that guard to
+  # accept file-scope globals is a change to the guard's own non-vacuity and
+  # does not belong in this diff (DIVE-3457, quinn iteration 1).
+  local canonical native pin ids n stale=0 noracle=0 graded=0 rows=0
   for canonical in $(printf '%s\n' "${!OPENCLAW_PROVIDER_MODEL[@]}" | sort); do
+    rows=$((rows + 1))
     pin="${OPENCLAW_PROVIDER_MODEL[$canonical]}"
     native="${OPENCLAW_PROVIDER_ID[$canonical]:-$canonical}"
     ids=$(openclaw_catalog_ids "$native")
@@ -741,7 +760,7 @@ doctor_check_openclaw_model_pins() {
 
   doctor_add models openclaw-pin-summary \
     "$( (( stale > 0 )) && printf error || printf ok )" \
-    "graded ${graded}/${#OPENCLAW_PROVIDER_MODEL[@]} catalog rows + ${wrote} written pin(s) against installed openclaw $version — ${stale} stale, ${noracle} no-oracle"
+    "graded ${graded}/${rows} catalog rows + ${wrote} written pin(s) against installed openclaw $version — ${stale} stale, ${noracle} no-oracle"
   return 0
 }
 

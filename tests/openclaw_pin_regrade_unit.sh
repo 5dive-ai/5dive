@@ -30,7 +30,17 @@ ok()  { echo "ok: $1"; }
 # TYPE_BIN/node gate: the check refuses early when the runtime is absent. Point
 # both at things that exist so the arms below reach the graded code, and stub
 # the probe itself.
+#
+# THE NODE PATH IS THE THIRD SEAM, and leaving it live is what failed CI on
+# iteration 1. openclaw_catalog_ids and openclaw_written_pins were stubbed; the
+# runtime guard inside doctor_check_openclaw_model_pins was not, and it tests a
+# path that exists only on a box with openclaw installed. On a clean runner the
+# check emitted ONE warn and returned before grading anything, so every arm saw
+# an empty tree — and the two arms that assert "no row verdict was emitted"
+# stayed GREEN on that emptiness. ARM 0 below is the positive control that makes
+# those two arms mean something.
 TYPE_BIN[openclaw]="/bin/sh"
+OPENCLAW_PIN_NODE_BIN="/bin/sh"
 CATALOG=""            # newline-separated ids the stub returns for ANY provider
 CATALOG_openai=""     # per-provider override for the control provider
 openclaw_catalog_ids() {
@@ -67,6 +77,23 @@ count_sev() { jq -r --arg s "$1" '[.[] | select(.severity==$s)] | length' <<<"$D
 unset OPENCLAW_PROVIDER_MODEL OPENCLAW_PROVIDER_ID
 declare -A OPENCLAW_PROVIDER_MODEL=( [deepseek]="deepseek/deepseek-chat" )
 declare -A OPENCLAW_PROVIDER_ID=( [deepseek]="deepseek" )
+
+# ── ARM 0 (POSITIVE CONTROL): the graded path is actually REACHED ───────────
+# Load-bearing for arms 4 and 5. Those assert a verdict is ABSENT, and an
+# absence assertion passes on empty output — so unless something proves the run
+# got PAST the runtime guard, "suppressed by a failing control" and "the check
+# returned at line 1 because this box has no openclaw" are the same observation.
+# This arm is that proof, and its mutation (ARM 8) shows it can fail.
+CATALOG_openai=$'openai/gpt-5.6\nopenai/gpt-5.3'
+CATALOG=$'deepseek/deepseek-chat'
+WRITTEN=""
+run_arm
+[[ -z "$(sev_of openclaw-runtime)" ]] \
+  && ok "REACH control: the runtime guard did not fire (openclaw seam is stubbed)" \
+  || bad "runtime guard fired" "openclaw-runtime='$(sev_of openclaw-runtime)' — every arm below would grade an empty tree"
+[[ -n "$(sev_of openclaw-row-deepseek)" ]] \
+  && ok "REACH control: a row verdict was emitted, so the sweep ran" \
+  || bad "sweep did not run" "no openclaw-row-deepseek verdict; the arms asserting ABSENCE are vacuous"
 
 # ── ARM 1 (control arm): pin present in the catalog → ok, no error ──────────
 CATALOG_openai=$'openai/gpt-5.6\nopenai/gpt-5.3'
@@ -113,9 +140,9 @@ run_arm
 [[ "$(sev_of openclaw-pin-control)" == "error" ]] \
   && ok "MUTATION vacuous control: control reports error" \
   || bad "vacuous control" "got '$(sev_of openclaw-pin-control)'"
-[[ -z "$(sev_of openclaw-row-deepseek)" ]] \
-  && ok "MUTATION vacuous control: no row verdict was emitted" \
-  || bad "vacuous control leaked a verdict" "row severity '$(sev_of openclaw-row-deepseek)'"
+[[ -z "$(sev_of openclaw-row-deepseek)" && -z "$(sev_of openclaw-runtime)" ]] \
+  && ok "MUTATION vacuous control: no row verdict was emitted (and the run REACHED the sweep)" \
+  || bad "vacuous control leaked a verdict" "row='$(sev_of openclaw-row-deepseek)' runtime='$(sev_of openclaw-runtime)'"
 
 # ── ARM 5 (MUTATION): discrimination control fails → NO verdict at all ──────
 # Sentinel present means the matcher is looser than an exact id compare, so
@@ -125,9 +152,9 @@ run_arm
 [[ "$(sev_of openclaw-pin-control)" == "error" ]] \
   && ok "MUTATION loose matcher: control reports error" \
   || bad "loose-matcher control" "got '$(sev_of openclaw-pin-control)'"
-[[ -z "$(sev_of openclaw-row-deepseek)" ]] \
-  && ok "MUTATION loose matcher: no row verdict was emitted" \
-  || bad "loose matcher leaked a verdict" "row severity '$(sev_of openclaw-row-deepseek)'"
+[[ -z "$(sev_of openclaw-row-deepseek)" && -z "$(sev_of openclaw-runtime)" ]] \
+  && ok "MUTATION loose matcher: no row verdict was emitted (and the run REACHED the sweep)" \
+  || bad "loose matcher leaked a verdict" "row='$(sev_of openclaw-row-deepseek)' runtime='$(sev_of openclaw-runtime)'"
 
 # ── ARM 6 (MUTATION): an ALREADY-WRITTEN seat pin has gone stale ────────────
 # The row table can be perfect and a seat still dead: _apply_byo_openclaw
@@ -157,6 +184,27 @@ fi
 grep -q 'policy|plugins|caps|models) ;;' "$SRC/cmd_doctor.sh" \
   && ok "static: --category=models passes the allow-list" \
   || bad "allow-list" "--category=models is dispatched but not allowed"
+
+# ── ARM 8 (MUTATION of ARM 0): the runtime is absent → NOT-MEASURED, no verdict ─
+# Point the node seam at nothing and the check must say so LOUDLY and grade
+# nothing. This reproduces iteration 1's CI signature on purpose: it is the only
+# arm that can distinguish "the controls suppressed the sweep" from "this box
+# never had openclaw", and without it ARM 0 is an unfalsifiable green.
+OPENCLAW_PIN_NODE_BIN="/nonexistent/node"
+CATALOG_openai=$'openai/gpt-5.6'
+CATALOG=$'deepseek/deepseek-chat'
+WRITTEN=""
+run_arm
+[[ "$(sev_of openclaw-runtime)" == "warn" ]] \
+  && ok "MUTATION absent runtime: reports NOT-MEASURED as warn" \
+  || bad "absent runtime" "expected warn, got '$(sev_of openclaw-runtime)'"
+[[ -z "$(sev_of openclaw-row-deepseek)" && -z "$(sev_of openclaw-pin-control)" && -z "$(sev_of openclaw-pin-summary)" ]] \
+  && ok "MUTATION absent runtime: nothing was graded (no row, no control, no summary)" \
+  || bad "absent runtime graded anyway" "row='$(sev_of openclaw-row-deepseek)' ctl='$(sev_of openclaw-pin-control)' sum='$(sev_of openclaw-pin-summary)'"
+grep -q 'NOT-MEASURED' <<<"$(msg_of openclaw-runtime)" \
+  && ok "MUTATION absent runtime: message says NOT-MEASURED, not a clean bill of health" \
+  || bad "absent-runtime message" "$(msg_of openclaw-runtime)"
+OPENCLAW_PIN_NODE_BIN="/bin/sh"
 
 echo
 (( FAILED )) && { echo "RESULT: FAIL"; exit 1; }
