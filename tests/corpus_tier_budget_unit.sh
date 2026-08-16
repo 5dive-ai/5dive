@@ -15,6 +15,17 @@
 # rather than passing silently. If it ever starts failing OPEN, revisit this first.
 # Decision: main, 2026-08-05.
 #
+# DIVE-3479, 2026-08-16: `nightly` is a statement about the CORPUS — it keeps this
+# file out of the 300s core tier — and it was read as a statement about the whole PR
+# path, which it is not. The DIVE-3315 arms at the bottom grade unit-tests.yml's own
+# structure, and a WORKFLOW-ONLY edit changes no `tests/*.sh`, so `changed-harnesses`
+# selected nothing and those arms first reported on the nightly union, after the
+# merge they were built to gate. The tier is unchanged (promoting it would spend 14%
+# of one shard's cap grading the cap); the workflow now runs this file in its own
+# unconditional `workflow-structure-guards` job, required by both pristine and
+# installed-host aggregators. Arm 99 holds that job in place. Cost: 41.4s on a
+# parallel runner, off the ~300s critical path, 0s against TIER_BUDGET_CORE.
+#
 # THE "SMALL AND FAST" CLAIM THIS HEADER USED TO MAKE IS RETIRED, not quietly
 # dropped. It read: "WHY THIS FILE IS ITSELF SMALL AND FAST, and says so ... the
 # honest version is not to skip the coverage, it is to pay the budget it enforces."
@@ -1697,16 +1708,52 @@ if len(summ) == 1:
 #   * `matrix: { include: [...] }` with three entries drops the `shard` key, so counting
 #     only jobs that HAVE the key would silently grade nothing — the count of sharded core
 #     corpus jobs is asserted too, at exactly one per environment
-#   * a third capacity job added ALONGSIDE the two (`core-pristine-3`) never touches a
-#     matrix at all, and is caught by that same count
+#   * a third capacity job added ALONGSIDE the two (`core-pristine-3`), with its matrix key
+#     renamed or with no matrix at all, is a capacity raise that declares no N anywhere
+#
+# DIVE-3479 — THE THIRD BULLET USED TO SAY IT WAS "caught by that same count", AND IT WAS
+# NOT. Measured on the merged tree (`792c78c`): a third `--tier=core` job with its matrix
+# key renamed `shard` -> `part`, divisor still `strategy.job-total`, bundle built, passed
+# **143/0**. The count only ever looked at jobs that HAD a `shard` key, so renaming the key
+# made the new job invisible to the thing counting it, and 2 x 300s of extra capacity per
+# environment landed green — the exact capacity raise main ruled must come back as a gate.
+# That claim was an assertion in a comment, unbacked by a control, INSIDE the arm whose
+# thesis is that an assertion in a comment is not a control. The same recursion as DIVE-2089.
+#
+# So the count is now over CORE JOBS, not over jobs that declare a shard key, and every
+# core job must land in one of exactly two named buckets:
+#   * DECLARED  — a literal `shard:` matrix; this is capacity, and N is pinned here
+#   * DYNAMIC   — the confirm rail's `include: ${{ ... }}`, built at run time from the
+#                 shards that went over, so it is bounded BY the declared count and adds
+#                 no capacity of its own
+# Anything else reds by name. Capacity is JOBS x CAP, not shards x cap: a core job the
+# count cannot classify is the same raise arriving through a hole in the classifier, and
+# `else: pass` is how the first version of this arm got it wrong.
+#
+# STILL NOT COVERED, said plainly rather than in a claim: a job that buys core capacity
+# without a literal `run-harnesses.sh ... --tier=core` in a `run:` step — the tier arriving
+# through a variable, or the invocation living behind `uses:` in a composite or reusable
+# workflow — is not seen by `core_jobs` at all and no clause below can see it either.
+#
 # `strategy.job-total` stays the runner's divisor throughout: arm 94 requires it and this
 # arm deliberately does not introduce a literal 2 into the workflow to satisfy itself. The
 # matrix stays the single source of N; this file is the single source of what N may BE.
 CORE_SHARDS = 2
+# One corpus job per environment (pristine, installed-host) and one confirm job per
+# environment. Both are counts of JOBS, and both are capacity: another corpus job is
+# another 300s cap, and another confirm job is another box re-running a shard.
+CORE_ENVS = 2
 
 def matrix_of(job):
     s = job.get('strategy')
     return s.get('matrix') if isinstance(s, dict) else None
+
+def is_runtime_include(m):
+    # The confirm rail: `matrix: { include: ${{ fromJson(needs[...].outputs.x) }} }`. One
+    # key, and its value is an EXPRESSION rather than a list — a literal `include:` list is
+    # a declared matrix wearing the confirm rail's clothes and must not be classified here.
+    return (isinstance(m, dict) and set(m) == {'include'}
+            and isinstance(m.get('include'), str) and '${{' in m['include'])
 
 core_jobs = [jn for jn, j in jobs.items()
              if any('run-harnesses.sh' in r and '--tier=core' in r for r in runs(j))]
@@ -1714,18 +1761,43 @@ core_jobs = [jn for jn, j in jobs.items()
 # time from the shards that went over (one entry per over-budget shard, possibly none). N
 # is not declared there and must not be pinned there — the corpus jobs are the ones that
 # DECLARE the split, and they are the ones this arm is about.
-declared = {jn: matrix_of(jobs[jn]).get('shard')
-            for jn in core_jobs
-            if isinstance(matrix_of(jobs[jn]), dict) and 'shard' in matrix_of(jobs[jn])}
+declared, dynamic, unclassified = {}, [], []
+for jn in core_jobs:
+    m = matrix_of(jobs[jn])
+    if isinstance(m, dict) and 'shard' in m:
+        declared[jn] = m['shard']
+    elif is_runtime_include(m):
+        dynamic.append(jn)
+    else:
+        unclassified.append(jn)
 
 want = list(range(1, CORE_SHARDS + 1))
 shard_problems = []
-if len(declared) != 2:
+# The buckets sum to the population by construction; assert the population is not empty,
+# because every clause below is vacuously satisfied by a core_jobs that found nothing.
+if not core_jobs:
     shard_problems.append(
-        'expected exactly 2 core corpus jobs declaring a literal shard matrix, one per '
+        'no job in this workflow runs `run-harnesses.sh --tier=core` in a `run:` step — '
+        'either the core corpus left the PR path or this arm has stopped being able to see '
+        'it, and both of those are the same green')
+if unclassified:
+    shard_problems.append(
+        'core corpus job(s) %s declare no literal `shard` matrix and are not the run-time '
+        'confirm rail — each is another independently capped core job, i.e. the same '
+        'capacity raise as another shard, arriving where the count cannot see it (renaming '
+        'the matrix key, or adding a third job with no matrix at all, was measured green '
+        'before DIVE-3479)' % ', '.join(sorted(unclassified)))
+if len(dynamic) != CORE_ENVS:
+    shard_problems.append(
+        'expected exactly %d core jobs whose matrix is built at run time (the confirm rail, '
+        'one per environment); found %d (%s)'
+        % (CORE_ENVS, len(dynamic), ', '.join(sorted(dynamic)) or 'none'))
+if len(declared) != CORE_ENVS:
+    shard_problems.append(
+        'expected exactly %d core corpus jobs declaring a literal shard matrix, one per '
         'environment; found %d (%s) — a core job that does not declare its shards puts N '
         'somewhere this arm cannot read it'
-        % (len(declared), ', '.join(sorted(declared)) or 'none'))
+        % (CORE_ENVS, len(declared), ', '.join(sorted(declared)) or 'none'))
 for jn in sorted(declared):
     v = declared[jn]
     if not isinstance(v, list) or not all(isinstance(x, int) for x in v):
@@ -1739,8 +1811,67 @@ for jn in sorted(declared):
             'TIER_BUDGET_CORE and must come back as a gate (then move CORE_SHARDS here)'
             % (jn, v, want))
 chk(not shard_problems,
-    'the core shard count is PINNED at %d per environment and the pin is parsed, not asserted in a comment (a third shard is a declared capacity raise: it must arrive as a policy decision that edits this line, not as one character in the workflow)' % CORE_SHARDS,
+    'the core shard count is PINNED at %d per environment, over CORE JOBS rather than over jobs that happen to carry a shard key, and the pin is parsed rather than asserted in a comment (a third shard, a third capacity job with the key renamed, and a third capacity job with no matrix at all are all the same declared capacity raise: each must arrive as a policy decision that edits this line, not as one character in the workflow)' % CORE_SHARDS,
     ' | '.join(shard_problems))
+
+# 99 — AND THE GUARD MUST RUN ON THE PATH IT GUARDS. DIVE-3479 finding 2.
+#
+# This file is `TIER: nightly`, and the PR path selects harnesses by DIFF: `changed-harnesses`
+# runs the harnesses whose `tests/*.sh` file the PR touched. A WORKFLOW-ONLY edit — which is
+# precisely the shape of the `[1, 2] -> [1, 2, 3]` mutation arm 98 exists to stop — changes no
+# test file, so every arm above ran on NO PR job at all and first reported on `full-sweep`,
+# within a day, after the merge. A post-merge detector, not a pre-merge gate; same family as
+# community/wiki/a-control-enforced-on-one-path-is-absent-on-the-parallel-one.md.
+#
+# The fix is NOT promoting this harness out of `nightly`: it costs 41.4s (measured in CI, run
+# 30988600395), and the core tier is the thing DIVE-2525/3315 are trying to shrink — promoting
+# it would spend 14% of one shard's 300s cap to grade the cap. It runs in its OWN job instead:
+# 41.4s on a parallel runner, off the critical path of a ~300s core job, and 0s against
+# TIER_BUDGET_CORE. The tier line stays `nightly`, which is a statement about the CORPUS, not
+# a claim that nothing else may invoke it.
+#
+# The job is UNCONDITIONAL on purpose. A `paths:` filter or an `if:` would make it `skipped` on
+# most PRs, and a skipped dependency reds every aggregator that requires it — the deadlock in
+# community/wiki/required-check-path-filter-deadlock.md, bought to save 41s.
+#
+# RESIDUAL, because this arm cannot escape its own recursion: the guard job is declared in the
+# workflow it guards, so a workflow-only edit that removes BOTH the job and the aggregators'
+# `needs:` entry is still invisible pre-merge (it reds here on the nightly union within a day).
+# Removing only one of the two fails closed: drop the job and `needs:` names a job that does not
+# exist, which is an INVALID workflow — no run, no required context ever reported, queue blocked.
+GUARD_JOB = 'workflow-structure-guards'
+GUARD_HARNESS = 'tests/corpus_tier_budget_unit.sh'
+GUARD_AGGS = ['test', 'test-installed-host']
+def _needs(j):
+    n = (j or {}).get('needs')
+    return [n] if isinstance(n, str) else (n or [])
+guard_problems = []
+g = jobs.get(GUARD_JOB)
+if not g:
+    guard_problems.append(
+        'no job `%s` — the arms above then grade the workflow only on the nightly union, i.e. '
+        'after the merge they exist to gate' % GUARD_JOB)
+else:
+    if not any(GUARD_HARNESS in r for r in runs(g)):
+        guard_problems.append('%s does not run %s' % (GUARD_JOB, GUARD_HARNESS))
+    if g.get('if') is not None:
+        guard_problems.append(
+            '%s carries `if: %r` — a conditional guard is `skipped` on the runs it was meant to '
+            'watch, and a skipped dependency reds the aggregators instead' % (GUARD_JOB, g.get('if')))
+for agg in GUARD_AGGS:
+    j = jobs.get(agg) or {}
+    if GUARD_JOB not in _needs(j):
+        guard_problems.append('required check %s does not need %s' % (agg, GUARD_JOB))
+    elif GUARD_JOB not in '\n'.join(runs(j)):
+        # `needs:` alone only ORDERS the jobs. DIVE-3315's own lesson: a job whose dependency
+        # failed is skipped, and a skipped required check reads as satisfied — so the aggregator
+        # has to compare this dependency's `.result` by name, not merely wait for it.
+        guard_problems.append(
+            '%s needs %s but never compares its .result — it waits for the guard and then '
+            'reports green whatever the guard said' % (agg, GUARD_JOB))
+chk(not guard_problems,
+    'the structural arms run PRE-MERGE on every PR, in their own job, required by both pristine and installed-host aggregators (a workflow-only edit touches no tests/*.sh, so `changed-harnesses` runs nothing and these arms would otherwise first report on the nightly union, after the merge)',
+    ' | '.join(guard_problems))
 PY
   )
 else bad "unit-tests.yml is readable from the harness (DIVE-3315 arms)" "no file at $_wf3315"; fi
