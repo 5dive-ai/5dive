@@ -400,6 +400,13 @@ _hb_usage() {
   5dive heartbeat off <name>              # stop waking the agent (keeps its settings)
   5dive heartbeat ls                      # show enrolled agents + next-wake + queued count
   5dive heartbeat tick                    # cron driver: wake every due agent that has work
+  5dive heartbeat wake-task <agent> <task_id> [<ident>]
+                                          # root: drive ONE agent onto ONE task now, bypassing the
+                                          # cadence. The manual exit from a tier-guard hold, and
+                                          # what \`loop\` uses to start a just-spawned row.
+  5dive heartbeat held [--json] [--stalled-hours=<h>]
+                                          # seats whose ENTIRE runnable queue is tier-guard held
+                                          # (breach-only: prints nothing when no seat is stranded)
   5dive heartbeat wake-mode <name> [always_on|cold] [--cap=<n>] [--sleep-after=<min>]
                                           # opt-in reactive wake mode + wake-budget + auto-sleep.
                                           # no args after <name> => show current mode/budget/sleep/cost.
@@ -434,6 +441,7 @@ cmd_heartbeat() {
     ls|list|status)  cmd_heartbeat_ls "$@" ;;
     tick)            cmd_heartbeat_tick "$@" ;;
     wake-task)       cmd_heartbeat_wake_task "$@" ;;
+    held)            cmd_heartbeat_held "$@" ;;
     wake-mode)       cmd_heartbeat_wake_mode "$@" ;;
     -h|--help|help)  _hb_usage ;;
     *) fail "$E_USAGE" "unknown heartbeat command: $sub (try: 5dive heartbeat --help)" ;;
@@ -600,6 +608,102 @@ _hb_wake_mode_write() {
   shown_slp=$(_hb_sleep_after_min "$name" "$reg")
   ok "wake mode for '$name' set to '$mode' (cap ${shown_cap}/day; sleeps after ${shown_slp}m idle; cost/wake ${_HB_WAKE_COST_EST})" \
      '{name:$n, mode:$m, capPerDay:$c, sleepAfterMin:($s|tonumber)}' --arg n "$name" --arg m "$mode" --arg c "$shown_cap" --arg s "$shown_slp"
+}
+
+# --- DIVE-3501: the all-held seat, made observable off the log -----------------
+#
+# THE FAILURE THIS SURFACES. The tier guard holding a row is CORRECT (DIVE-1065).
+# What was wrong is that a seat whose ENTIRE runnable queue is held has no
+# observable difference from a healthy idle seat: the rows read `todo`, the unit
+# reads `active`, quota is fine, and the only trace is a `_hb_log` line on stderr
+# that lands in /var/log/5dive-heartbeat.log — 7865 of them by 2026-08-16, read by
+# nobody. dev2 sat with 5 runnable high rows, all held, every 5 minutes for six
+# days while every liveness signal said it was fine.
+#
+# WHY THIS PREDICATE IS STATELESS, and why that is the point. It threads NO
+# consecutive-tick counter through the tick. It is a pure query over `tasks` +
+# the registry: a seat with >= 1 runnable todo, where EVERY one would be held
+# (rank(created_by) < rank(assignee), both MEASURED, creator != assignee), and
+# whose last wake is >= --stalled-hours old. So it is exactly reproducible from
+# the DB at any later time, it survives a heartbeat restart, and each clause is
+# independently mutation-gradable — break the rank comparison, or weaken the
+# "every" quantifier to "any", and the test goes red on each separately. A tick
+# counter would be gradable only by simulating ticks.
+#
+# RUNNABLE means what the PICKER means by it, so this is `_hb_pick_tasks` at a
+# wide limit rather than a second hand-written todo query — a re-implementation
+# would drift from the dep-aware ordering the guard actually sees.
+#
+# BREACH-ONLY (DIVE-3460): silent when no seat is stranded. A monitor that prints
+# a reassuring line every day is a monitor nobody reads
+# (community/wiki/a-monitor-with-no-reader-is-not-a-monitor.md).
+_HB_HELD_STALL_HOURS=${_HB_HELD_STALL_HOURS:-6}
+# Wide enough to cover any real queue; still bounded so a pathological board
+# cannot make this scan unboundedly.
+_HB_HELD_SCAN=${_HB_HELD_SCAN:-500}
+
+cmd_heartbeat_held() {
+  local as_json="${JSON_MODE:-0}" hours="$_HB_HELD_STALL_HOURS"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) as_json=1 ;;
+      --stalled-hours=*) hours="${1#*=}" ;;
+      -h|--help) echo "usage: 5dive heartbeat held [--json] [--stalled-hours=<h>]"; return 0 ;;
+      *) fail "$E_USAGE" "heartbeat held: unknown arg: $1" ;;
+    esac
+    shift
+  done
+  [[ "$hours" =~ ^[0-9]+$ ]] || fail "$E_USAGE" "heartbeat held: --stalled-hours must be a whole number of hours"
+  local reg now; reg=$(registry_read); now=$(date +%s)
+  local rows="[]" name
+  for name in $(jq -r '.agents | to_entries[] | .key' <<<"$reg" 2>/dev/null); do
+    local ids id cand=0 held=0 idents="" _cby _ctier _atier _cr _ar
+    ids=$(_hb_pick_tasks "$name" "$_HB_HELD_SCAN")
+    [[ -n "$ids" ]] || continue
+    _atier=$(agent_tier "$name")
+    while read -r id; do
+      [[ -n "$id" ]] || continue
+      cand=$((cand + 1))
+      _cby=$(db "SELECT COALESCE(created_by,'') FROM tasks WHERE id=${id};" 2>/dev/null || echo "")
+      # Same three clauses as the guard, in the same order. A row that is NOT
+      # held is enough to clear the seat — the whole point of the predicate is
+      # the universal quantifier.
+      [[ -n "$_cby" && "$_cby" != "$name" ]] || continue
+      _ctier=$(agent_tier "$_cby")
+      if tier_unmeasured "$_ctier" || tier_unmeasured "$_atier"; then
+        # The DIVE-2213 unmeasured hold is also a hold; count it.
+        held=$((held + 1))
+        idents+="${idents:+ }$(db "SELECT COALESCE(ident,'') FROM tasks WHERE id=${id};" 2>/dev/null || echo "")"
+        continue
+      fi
+      _cr=$(_hb_tier_rank "$_ctier"); _ar=$(_hb_tier_rank "$_atier")
+      if (( _cr > 0 && _ar > 0 && _cr < _ar )); then
+        held=$((held + 1))
+        idents+="${idents:+ }$(db "SELECT COALESCE(ident,'') FROM tasks WHERE id=${id};" 2>/dev/null || echo "")"
+      fi
+    done <<<"$ids"
+    (( cand > 0 && held == cand )) || continue
+    local lastRun stalledSec
+    lastRun=$(jq -r --arg n "$name" '.agents[$n].heartbeat.lastRunAt // 0' <<<"$reg")
+    [[ "$lastRun" =~ ^[0-9]+$ ]] || lastRun=0
+    stalledSec=$(( now - lastRun ))
+    (( stalledSec >= hours * 3600 )) || continue
+    rows=$(jq -c --arg n "$name" --arg t "$_atier" --argjson h "$held" \
+                 --argjson s "$stalledSec" --arg ids "$idents" \
+      '. + [{agent:$n, tier:$t, heldCount:$h, stalledSec:$s,
+             stalledHours:(($s/3600)|floor), idents:($ids|split(" ")|map(select(length>0)))}]' <<<"$rows")
+  done
+  if [ "$as_json" = 1 ]; then
+    # stdin, not --argjson for the row array (DIVE-222).
+    printf '%s' "$rows" | jq -c --argjson h "$hours" \
+      '{ok:true, data:{stalledHours:$h, seats:., count:(.|length)}}'
+    return 0
+  fi
+  # Breach-only: no seats => no output at all.
+  [[ "$(jq -r 'length' <<<"$rows")" != "0" ]] || return 0
+  printf 'tier-guard stranded seats (entire runnable queue held, idle >= %sh):\n' "$hours"
+  jq -r '.[] | "  \(.agent) (\(.tier)) — \(.heldCount) held, idle \(.stalledHours)h: \(.idents|join(", "))"' <<<"$rows"
+  printf 'exits: 5dive task assign <id> <equal-or-higher-tier agent>, or 5dive heartbeat wake-task <agent> <task_id>\n'
 }
 
 cmd_heartbeat_ls() {
@@ -4313,10 +4417,25 @@ cmd_heartbeat_tick() {
       # if _cand_n hit _HB_PICK_SCAN there may be runnable rows we never reached,
       # which is a different (and much louder) situation than "the queue is held".
       sk_held=$((sk_held + _cand_n))
+      # DIVE-3501: BOTH branches must name an exit, and every verb named here
+      # must EXIST. The scan-cap branch used to advise a `task` subcommand that
+      # is not a verb — it appeared nowhere in the CLI except in that one
+      # sentence, so an operator who followed the guard's own advice got an
+      # unknown-subcommand error. The all-held branch — the one that actually
+      # strands a seat forever — named no remedy at all. Both now name the two
+      # exits that are real: re-route the row so creator >= assignee
+      # (`task assign`), or drive it manually once (`heartbeat wake-task`,
+      # dispatched at :436 and now documented in --help).
+      #
+      # The advice is DUPLICATED rather than hoisted into a variable on purpose:
+      # tests/heartbeat_hold_remedy_and_stranded_seat_unit.sh asserts, against
+      # the verb list `--help` prints AT RUNTIME, that no LOG STRING in this file
+      # names a verb the CLI does not have. A hoisted string would sit on a line
+      # the scan cannot see is a log line, and the guard would go quietly blind.
       if (( _cand_n >= _HB_PICK_SCAN )); then
-        _hb_log "[$name] tier guard held all ${_cand_n} candidate(s) SCANNED — scan cap _HB_PICK_SCAN=${_HB_PICK_SCAN} reached, runnable rows past it were NOT examined; authorize a held task (5dive task authorize) or fix the creator/assignee tiers"
+        _hb_log "[$name] tier guard held all ${_cand_n} candidate(s) SCANNED — scan cap _HB_PICK_SCAN=${_HB_PICK_SCAN} reached, runnable rows past it were NOT examined; exits: 5dive task assign <id> <equal-or-higher-tier agent>, or 5dive heartbeat wake-task ${name} <task_id> to run one now"
       else
-        _hb_log "[$name] tier guard held all ${_cand_n} runnable todo(s) — stay idle"
+        _hb_log "[$name] tier guard held all ${_cand_n} runnable todo(s) — stay idle; this seat has NO runnable work until something changes; exits: 5dive task assign <id> <equal-or-higher-tier agent>, or 5dive heartbeat wake-task ${name} <task_id> to run one now"
       fi
       continue
     fi
