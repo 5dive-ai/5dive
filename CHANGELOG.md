@@ -1,6 +1,40 @@
 # Changelog
 
-## Unreleased — feat(task): an inert push-for-review clears at filing, pinging nobody (DIVE-3481)
+## v0.19.38 — fix(heartbeat): tell a retryable rate limit from a hard spend cap, and stop dispatching into the cap (DIVE-3465)
+
+The task engine had ONE question about a stalled seat — "is it parked on a wall dialog?" — and one
+answer for every wall: retry. `_hb_pane_is_usage_limit` (DIVE-1666) matches the monthly-spend and
+5-hour variants alike, on purpose, because for ITS question the difference does not matter. For the
+next question it is the whole point:
+
+- a **rolling 5h/7d rate limit** rolls back on its own, so press-continue / restart-and-retry is
+  correct — that is what DIVE-1666/DIVE-1677 built;
+- a **monthly or weekly spend ceiling** does not, and every retry against it is a whole dispatched
+  session that cannot produce work. Measured over 172 sessions (2026-07-20..08-16): ~20 of 50
+  analysed sessions accomplished literally nothing, DIVE-3384 was re-attempted across 15+ separate
+  sessions and still read `todo`, and the answer to the wall was ~30-40 `continue`s.
+
+`_hb_wall_class` now classifies the parked dialog — **pure, no tmux and no clock, so the
+discrimination the whole fix hangs off is unit-testable on transcript text** — into `spend-cap`,
+`rate-limit`, or `undetermined`. Order is load-bearing: the monthly dialog itself offers "Stop and
+wait for limit to reset", so the header discriminates and the action line cannot.
+
+On `spend-cap` the seat takes a **dispatch hold**, placed ABOVE the task pick so a held seat never
+claims a row at all (a row left `todo` with a reason in the log beats one claimed, blanked and
+reclaimed fifteen times). No restart, no press-continue, and one throttled line to the fleet
+coordinator saying a ceiling is a billing call, not a stuck dialog.
+
+The hold **expires on a measurement, never on a timer**: a sibling transacting on the same account,
+or the wall gone from the seat's own screen. The probe interval (`HEARTBEAT_SPEND_CAP_PROBE_MIN`,
+default 20m) decides when to LOOK, and a restart-probe dispatches nothing — a harness asserts the
+release verdict reads no clock. An unreadable seat returns COULD-NOT-DETERMINE and **holds**: not
+being able to look is not headroom.
+
+Also found while classifying: the DIVE-1666 header alternation never matched the **weekly** wall at
+all (`hit your weekly limit` / `weekly spend limit`), so a seat parked on one was not even seen as
+frozen. Widened to the weekly/daily variants with the two-signature discipline unchanged.
+
+## v0.19.38 — feat(task): an inert push-for-review clears at filing, pinging nobody (DIVE-3481)
 
 lodar, 2026-08-16, on a routine branch-push approval waking the org lead: *"why dev2 cannot do
 delegated push himself and burns your token for approval?"* An approval gate whose ask is an
@@ -34,7 +68,7 @@ permanent gate record and digest line intact, and **no ping to anyone**.
 - **`5dive task pfr-autoclear [on|off|status]`**, default **on**, restores the lead ping with no
   release.
 
-## Unreleased — fix(usage): the middle wildcard is a read too (DIVE-3419)
+## v0.19.38 — fix(usage): the middle wildcard is a read too (DIVE-3419)
 
 Both transcript readers in `cmd_usage.sh` used `projects/*/*.jsonl`. `usage_collect` was guarded at the
 **top** (`probe_readable` on `projects/`) and the **bottom** (per-file `except OSError`) of a *three*-level
@@ -64,7 +98,7 @@ true** — and every "⚠ N NOT checked — burn is unknown (not 0)" banner buil
   ANY-UID arm (`ELOOP`, which root cannot resolve either) so a uid-0 CI run cannot be a vacuous green, and
   over-fire controls. **9/14 pre-fix, 23/0 after.**
 
-## Unreleased — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
+## v0.19.38 — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
 
 Nothing validated these columns. The work-picker dispatches on `assignee`, so a row on a name that is
 not a registered agent was **structurally undispatchable** — not blocked, not parked, not flagged, and
@@ -88,7 +122,7 @@ never once a dispatch target) and corroborated here (5 open rows).
 - **`wip-cap-install`** read the same unvalidated column (it had minted `wip_cap:cli`, a lane ceiling
   for an agent that does not exist). It now skips unregistered lanes and **names the skip**.
 
-## Unreleased — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
+## v0.19.38 — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
 
 `5dive agent config <name> set channels=<current>,buzz` could not succeed on any seat that was not
 **created** with buzz. `cmd_config` dispatches `install_channel_for_agent` for telegram, discord and
@@ -121,7 +155,7 @@ arms grade the satisfier next to the gate, and drive `cmd_config` for real — w
 that the same call reaches the restart once the cache is staged, so the rollback arms cannot pass
 against a `cmd_config` that simply refuses everything.
 
-## Unreleased — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
+## v0.19.38 — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
 
 DIVE-2483's gate answer said the preservation notice lands on **stdout**. It lands on **stderr**,
 via the fleet's `warn()`. Six arms were written for that condition and all six were green, because
@@ -155,7 +189,7 @@ Still open and scoped out on purpose: `task reject` remains an unguarded writer 
 column (`src/cmd_task.sh:4235`). That is a design question about accumulating verifier feedback, not
 this gap.
 
-## Unreleased — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
+## v0.19.38 — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
 
 DIVE-3272 taught the supervisor BOARD to see a seat that is alive and closing nothing. The
 drill-down people actually type kept printing only liveness: `state: active / enabled` was
@@ -197,7 +231,7 @@ supervisor:  quota-exhausted / quota-exhausted — pane shows a model-capacity r
 - `agent list` is unchanged — it is the survey surface, and this is a per-agent drill-down
   (three sqlite reads), deliberately not an N-way fan-out.
 
-## Unreleased — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
+## v0.19.38 — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
 
 A gate reaches the filer's lead only if `_GATE_ENG_SHIP_RX` matches the ask or the row
 title. `gate_builder_routing` is OFF by default, so for an ordinary builder ship gate that
@@ -261,7 +295,7 @@ prose for identifiers.
   `gate_access_lead_clear`, `gate_internal_ops_floor`, `task_needs_human_parity`,
   `task_inbox_json_tier`, `push_unit`, `broker_surface`, + 15 more).
 
-## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
+## v0.19.38 — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
 
 DIVE-1935's first iteration was rejected, and for the right reason. It added a
 `sudo -n -u claude gh auth token` arm to `_gate_gh_token` justified by *"agents hold
