@@ -37,7 +37,11 @@ case "$args" in
       $'reused-head\tREUSED\tfalse' \
       $'changed-head\tCHANGED\tfalse' \
       $'protected-release\tPROTECTED\ttrue' \
-      $'no-pr\tNONE\tfalse'
+      $'no-pr\tNONE\tfalse' \
+      $'superseded-match\t1111111111111111111111111111111111111111\tfalse' \
+      $'superseded-mismatch\t2222222222222222222222222222222222222222\tfalse' \
+      $'superseded-unresolved\t3333333333333333333333333333333333333333\tfalse' \
+      $'superseded-reused\t4444444444444444444444444444444444444444\tfalse'
     ;;
   *"-f head=acme:merged-old"*"-f state=closed"*|*"-f state=closed"*"-f head=acme:merged-old"*)
     echo '[{"number":12,"merged_at":"2026-07-01T00:00:00Z","head":{"sha":"MERGED"}}]'
@@ -51,8 +55,44 @@ case "$args" in
   *"-f head=acme:changed-head"*"-f state=closed"*|*"-f state=closed"*"-f head=acme:changed-head"*)
     echo '[{"number":15,"merged_at":"2026-07-04T00:00:00Z","head":{"sha":"CHANGED"}}]'
     ;;
+  # DIVE-3490 fixtures. All four PRs are closed UNMERGED (merged_at null), so
+  # the merged predicate can never reach them; only content identity against
+  # refs/pull/N/head can, and each arm below fails it a different way.
+  *"-f head=acme:superseded-match"*"-f state=closed"*|*"-f state=closed"*"-f head=acme:superseded-match"*)
+    echo '[{"number":20,"merged_at":null,"head":{"sha":"1111111111111111111111111111111111111111"}}]'
+    ;;
+  *"-f head=acme:superseded-mismatch"*"-f state=closed"*|*"-f state=closed"*"-f head=acme:superseded-mismatch"*)
+    echo '[{"number":21,"merged_at":null,"head":{"sha":"2222222222222222222222222222222222222222"}}]'
+    ;;
+  *"-f head=acme:superseded-unresolved"*"-f state=closed"*|*"-f state=closed"*"-f head=acme:superseded-unresolved"*)
+    echo '[{"number":22,"merged_at":null,"head":{"sha":"3333333333333333333333333333333333333333"}}]'
+    ;;
+  # The closed PR exists but its head is an OLDER sha than the branch now holds:
+  # the branch was pushed again after the PR closed. Identity must not match, and
+  # the pull ref must never be consulted at all.
+  *"-f head=acme:superseded-reused"*"-f state=closed"*|*"-f state=closed"*"-f head=acme:superseded-reused"*)
+    echo '[{"number":23,"merged_at":null,"head":{"sha":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}}]'
+    ;;
   *"-f state=closed"*)
     echo '[]'
+    ;;
+  "api repos/acme/demo/git/ref/pull/20/head --jq .object.sha")
+    echo 1111111111111111111111111111111111111111
+    ;;
+  # Pull ref resolves, but to a different commit than the branch head: the
+  # branch moved after the PR closed, so GitHub is NOT preserving this head.
+  "api repos/acme/demo/git/ref/pull/21/head --jq .object.sha")
+    echo 9999999999999999999999999999999999999999
+    ;;
+  # THE fail-closed arm: the pull ref does not resolve (deleted PR, fork head,
+  # network). An absent ref must PRESERVE, never pass for want of a mismatch.
+  "api repos/acme/demo/git/ref/pull/22/head --jq .object.sha")
+    echo "gh: Not Found (HTTP 404)" >&2
+    exit 1
+    ;;
+  "api repos/acme/demo/git/ref/pull/23/head --jq .object.sha")
+    echo "unexpected pull-ref lookup for a non-identical head: $args" >&2
+    exit 98
     ;;
   "api repos/acme/demo/branches/merged-old --jq .commit.sha")
     echo MERGED
@@ -74,6 +114,19 @@ esac
 MOCK
 chmod +x "$TMP/gh"
 
+# A bare `! grep -q ...` SKIPS errexit (shellcheck SC2251): if the forbidden
+# string IS present, the `!` inverts it to rc 1 and the harness sails on green.
+# Every negative assertion in this file is load-bearing -- one of them is the
+# whole "not armed under --apply" guarantee -- so they go through a helper that
+# exits. Positive-controlled: inverting any one of them fails the run.
+refute() {
+  local why="$1" pattern="$2"
+  if grep -q "$pattern"; then
+    echo "REFUTED-ASSERTION FAILED: $why (found: $pattern)" >&2
+    exit 1
+  fi
+}
+
 dry_output=$(GH_BIN="$TMP/gh" GITHUB_REPOSITORY=acme/demo \
   BRANCH_HYGIENE_PRESERVE=merged-preserved \
   "$ROOT/scripts/branch-hygiene.sh" --dry-run)
@@ -83,7 +136,19 @@ grep -q 'PRESERVE open-or-explicit branch=merged-preserved' <<<"$dry_output"
 grep -q 'PRESERVE no-exact-merged-pr branch=reused-head' <<<"$dry_output"
 grep -q 'DELETE-CANDIDATE branch=merged-old sha=MERGED pr=#12' <<<"$dry_output"
 grep -q 'DELETE-CANDIDATE branch=changed-head sha=CHANGED pr=#15' <<<"$dry_output"
-grep -q 'SUMMARY candidates=2 deleted=0' <<<"$dry_output"
+
+# DIVE-3490 identity predicate, dry-run. One match, and three distinct refusals.
+grep -q 'DELETE-CANDIDATE branch=superseded-match sha=1111111111111111111111111111111111111111 pr=#20 via=pullref-identity pullref=1111111111111111111111111111111111111111' <<<"$dry_output"
+grep -q 'PRESERVE superseded-identity-mismatch branch=superseded-mismatch .* pr=#21 pullref=9999999999999999999999999999999999999999' <<<"$dry_output"
+grep -q 'PRESERVE superseded-identity-unresolved branch=superseded-unresolved .* pr=#22' <<<"$dry_output"
+# A branch pushed past its own closed PR falls back to the ORIGINAL message and
+# never reaches the pull ref at all (the mock exits 98 if it does).
+grep -q 'PRESERVE no-exact-merged-pr branch=superseded-reused' <<<"$dry_output"
+# The unresolved arm must not be reported as a candidate under any name.
+refute 'an unresolved pull ref became a candidate' 'DELETE-CANDIDATE branch=superseded-unresolved' <<<"$dry_output"
+refute 'a mismatched pull ref became a candidate' 'DELETE-CANDIDATE branch=superseded-mismatch' <<<"$dry_output"
+
+grep -q 'SUMMARY candidates=3 deleted=0' <<<"$dry_output"
 
 : >"$TMP/deletes.log"
 apply_output=$(GH_BIN="$TMP/gh" GH_MOCK_LOG="$TMP/deletes.log" \
@@ -92,9 +157,19 @@ apply_output=$(GH_BIN="$TMP/gh" GH_MOCK_LOG="$TMP/deletes.log" \
 
 grep -q 'DELETED branch=merged-old sha=MERGED pr=#12' <<<"$apply_output"
 grep -q 'PRESERVE changed-since-inventory branch=changed-head old=CHANGED new=NEW-SHA' <<<"$apply_output"
-grep -q 'SUMMARY candidates=2 deleted=1' <<<"$apply_output"
 [[ $(wc -l <"$TMP/deletes.log") -eq 1 ]]
 grep -q 'heads%2Fmerged-old' "$TMP/deletes.log"
+
+# DIVE-3490: the identity predicate is NOT armed under --apply. The weekly
+# schedule runs --apply unattended, so a branch that PASSES identity must still
+# be preserved there and must not appear in the delete log. This is the arm that
+# would fail if someone later wires the predicate into the unattended path.
+grep -q 'PRESERVE superseded-identity-not-armed branch=superseded-match sha=1111111111111111111111111111111111111111 pr=#20' <<<"$apply_output"
+refute 'the identity predicate was armed under --apply' 'DELETE-CANDIDATE branch=superseded-match' <<<"$apply_output"
+refute 'an identity-matched branch reached the delete API' superseded <"$TMP/deletes.log"
+# candidates stays 2 under --apply where dry-run saw 3: the identity match is
+# preserved, not counted. That difference IS the guarantee.
+grep -q 'SUMMARY candidates=2 deleted=1' <<<"$apply_output"
 
 echo "branch_hygiene_unit: PASS"
 
@@ -130,7 +205,12 @@ case "$args" in
       $'dive-2067-verify-over-closed\tD2067' \
       $'salvage/untracked-test-harnesses-2026-07-26\tSALV' \
       $'status\tSTATUS' \
-      $'contained-branch\tCONT'
+      $'contained-branch\tCONT' \
+      $'dive-3491-superseded-ok\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+      $'dive-3492-superseded-moved\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+      $'dive-3493-superseded-gone\tcccccccccccccccccccccccccccccccccccccccc' \
+      $'dive-3494-pushed-past\tdddddddddddddddddddddddddddddddddddddddd' \
+      $'salvage/preserved-2026-08-01\teeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
     ;;
   *"pulls?state=open"*"@tsv"*)
     : # no stale open PRs in this fixture
@@ -188,9 +268,50 @@ case "$args" in
   *"-f head=acme:merged-old"*"-f state=closed"*|*"-f state=closed"*"-f head=acme:merged-old"*)
     echo '[{"number":12,"merged_at":"2026-07-01T00:00:00Z","head":{"sha":"MERGED"}}]'
     ;;
+  # DIVE-3490 arm-4 fixtures. Every one of these PRs is closed UNMERGED, so arms
+  # 1-3 cannot reach any of them: #30 and #34 are byte-identical to their pull
+  # ref, #31 moved, #32's ref is gone, #33's PR head is an older commit.
+  *"-f head=acme:dive-3491-superseded-ok"*)
+    echo '[{"number":30,"merged_at":null,"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]'
+    ;;
+  *"-f head=acme:dive-3492-superseded-moved"*)
+    echo '[{"number":31,"merged_at":null,"head":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}]'
+    ;;
+  *"-f head=acme:dive-3493-superseded-gone"*)
+    echo '[{"number":32,"merged_at":null,"head":{"sha":"cccccccccccccccccccccccccccccccccccccccc"}}]'
+    ;;
+  *"-f head=acme:dive-3494-pushed-past"*)
+    echo '[{"number":33,"merged_at":null,"head":{"sha":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}}]'
+    ;;
+  *"-f head=acme:salvage/preserved-2026-08-01"*)
+    echo '[{"number":34,"merged_at":null,"head":{"sha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}}]'
+    ;;
   *"-f state=closed"*)
     echo '[]'
     ;;
+  "api repos/acme/demo/git/ref/pull/30/head --jq .object.sha")
+    echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    ;;
+  "api repos/acme/demo/git/ref/pull/34/head --jq .object.sha")
+    echo eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+    ;;
+  # Resolves, but to another commit: GitHub is not preserving THIS head.
+  "api repos/acme/demo/git/ref/pull/31/head --jq .object.sha")
+    echo 9999999999999999999999999999999999999999
+    ;;
+  # Fail-closed arm: the ref is gone. Must NOT discharge the finding.
+  "api repos/acme/demo/git/ref/pull/32/head --jq .object.sha")
+    echo "gh: Not Found (HTTP 404)" >&2
+    exit 1
+    ;;
+  # The PR head is an older commit than the branch holds, so arm 4 must decide
+  # `none` from the PR list alone and never ask for this ref.
+  "api repos/acme/demo/git/ref/pull/33/head --jq .object.sha")
+    echo "unexpected pull-ref lookup for a non-identical head: $args" >&2
+    exit 98
+    ;;
+  # There is deliberately NO pull-ref arm for #12: arm 1 discharges merged-old
+  # before arm 4 runs, and asking here would fall to the catch-all and exit 99.
   *)
     echo "unexpected gh invocation: $args" >&2
     exit 99
@@ -210,13 +331,39 @@ grep -q '`dive-2067-verify-over-closed` — \*\*FINDING\*\* unattributed (DIVE-2
 grep -q '`salvage/untracked-test-harnesses-2026-07-26` — \*\*FINDING\*\* no-ident' <<<"$report_output"
 grep -q '`status` — ORPHAN no-common-ancestor' <<<"$report_output"
 
+# ARM 4 (DIVE-3490). A closed-UNMERGED PR whose pull ref is byte-identical to the
+# branch head discharges the finding -- and says plainly that the work did not land.
+grep -q '`dive-3491-superseded-ok` — PRESERVED pull-ref-identity #30' <<<"$report_output"
+grep -q 'byte-identical to `refs/pull/30/head`.*the work did not land' <<<"$report_output"
+grep -q 'restore: `git push origin aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:refs/heads/dive-3491-superseded-ok`' <<<"$report_output"
+# It needs no ident, so it reaches the branch arm 3 can never judge.
+grep -q '`salvage/preserved-2026-08-01` — PRESERVED pull-ref-identity #34' <<<"$report_output"
+refute 'a pull-ref-preserved branch was also reported as a no-ident finding' \
+  'salvage/preserved-2026-08-01. — \*\*FINDING\*\*' <<<"$report_output"
+
+# THE FAILURE DIRECTION FOR ARM 4: each of its three negative states must leave
+# the branch a FINDING. A mismatched ref, an unresolvable ref and a PR head that
+# is not this commit are all "no evidence", never "safe to delete".
+grep -q '`dive-3492-superseded-moved` — \*\*FINDING\*\* unattributed (DIVE-3492)' <<<"$report_output"
+grep -q '`dive-3493-superseded-gone` — \*\*FINDING\*\* unattributed (DIVE-3493)' <<<"$report_output"
+grep -q '`dive-3494-pushed-past` — \*\*FINDING\*\* unattributed (DIVE-3494)' <<<"$report_output"
+refute 'a mismatched pull ref discharged a finding' 'dive-3492-superseded-moved. — PRESERVED' <<<"$report_output"
+refute 'an unresolvable pull ref discharged a finding' 'dive-3493-superseded-gone. — PRESERVED' <<<"$report_output"
+
+# One digest, ONE verdict per branch: the old standalone pull-ref section is gone,
+# so no branch can be printed as both a finding and a restorable dead branch.
+refute 'the superseded section was reinstated alongside the classifier' \
+  'Dead branches restorable from their own pull ref' <<<"$report_output"
+refute 'a branch got two contradictory verdicts' 'Deleting destroys nothing' <<<"$report_output"
+
 # A date in a branch name is not an ident: the salvage branch must not read as CX-2026 etc.
-! grep -q 'salvage/untracked-test-harnesses-2026-07-26.*unattributed' <<<"$report_output"
+refute 'a date in a branch name was read as an ident' \
+  'salvage/untracked-test-harnesses-2026-07-26.*unattributed' <<<"$report_output"
 
 # The findings section names the rescue, and age is no longer a section heading.
 grep -q 'refs/rescued/<branch>' <<<"$report_output"
 grep -q 'Branches that may be the only copy (evidence, not age)' <<<"$report_output"
-! grep -q 'Branches with no activity' <<<"$report_output"
+refute 'the age-based branch section came back' 'Branches with no activity' <<<"$report_output"
 
 # Age is still printed as a fact about each branch.
 grep -q 'since last commit (2026-07-01)' <<<"$report_output"
@@ -224,20 +371,28 @@ grep -q 'since last commit (2026-07-01)' <<<"$report_output"
 # DEAD_BRANCH_DAYS was set; the report must say it is not read rather than pretend.
 grep -q 'DEAD_BRANCH_DAYS=14 was set and is NOT read' <<<"$report_output"
 
-grep -q '2 finding(s), 3 with landing evidence, 1 orphan, 0 unknown' <<<"$report_output"
+grep -q '5 finding(s), 5 not the only copy (2 of those preserved by pull ref, not landed), 1 orphan, 0 unknown' <<<"$report_output"
 
 # The read-only invariant the ops runner greps for (branch-hygiene-report.sh).
-! grep -q '^DELETED ' <<<"$report_output"
+refute 'the report path deleted something' '^DELETED ' <<<"$report_output"
 
 # THE FAILURE DIRECTION. With the subject corpus unreadable, the branch that WAS
 # attributed by subject must stop being attributed -- never the other way round.
 fail_output=$(GH_BIN="$RTMP/gh" GITHUB_REPOSITORY=acme/demo MOCK_SUBJECTS_FAIL=1 \
   "$ROOT/scripts/branch-hygiene.sh" --report)
 
-! grep -q 'LANDED subject-attribution' <<<"$fail_output"
+refute 'a branch was attributed by subject with the corpus unreadable' \
+  'LANDED subject-attribution' <<<"$fail_output"
 grep -q '`dive-3330-verify-merge-gate` — UNKNOWN evidence-unavailable (DIVE-3330)' <<<"$fail_output"
 grep -q '`dive-2067-verify-over-closed` — UNKNOWN evidence-unavailable (DIVE-2067)' <<<"$fail_output"
 grep -q 'Arm 3 did not run, and nothing was attributed on its absence' <<<"$fail_output"
-grep -q '1 finding(s), 2 with landing evidence, 1 orphan, 2 unknown' <<<"$fail_output"
+
+# Arm 4 reads neither the subject corpus nor an ident, so it still discharges on a
+# run where arm 3 could not run at all -- and the arm-4 negatives still degrade to
+# UNKNOWN rather than to a pass.
+grep -q '`dive-3491-superseded-ok` — PRESERVED pull-ref-identity #30' <<<"$fail_output"
+grep -q '`salvage/preserved-2026-08-01` — PRESERVED pull-ref-identity #34' <<<"$fail_output"
+grep -q '`dive-3493-superseded-gone` — UNKNOWN evidence-unavailable (DIVE-3493)' <<<"$fail_output"
+grep -q '1 finding(s), 4 not the only copy (2 of those preserved by pull ref, not landed), 1 orphan, 5 unknown' <<<"$fail_output"
 
 echo "branch_hygiene_unit: report-by-evidence PASS"

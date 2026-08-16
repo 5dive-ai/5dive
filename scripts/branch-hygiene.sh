@@ -3,6 +3,13 @@
 #
 # This intentionally asks the GitHub API for PR merge state. Git ancestry is not
 # sufficient because this repository normally squash-merges pull requests.
+#
+# A second predicate (DIVE-3490, `superseded_identity`) reaches branches whose PR
+# was closed UNMERGED, on proof of content identity with the permanent
+# `refs/pull/N/head`. In --report it is the FOURTH ARM of the evidence classifier
+# (DIVE-2394), the one that discharges a finding. On the delete path it is
+# REPORT/DRY-RUN ONLY and deliberately not armed under --apply -- see the comment
+# on the function and at its call sites.
 
 set -euo pipefail
 
@@ -36,6 +43,62 @@ owner="${repo%%/*}"
 
 urlencode() {
   jq -rn --arg value "$1" '$value | @uri'
+}
+
+# DIVE-3490: a branch whose PR was closed UNMERGED can never become a delete
+# candidate below, because that predicate requires `merged_at != null`. Three
+# such branches sat on this repo, each with a maintainer comment naming the
+# replacement PR, each unreachable by the automation forever.
+#
+# The safe widening is NOT "closed as superseded". That is a human judgement
+# written on a PR, and a predicate keyed on it is really keyed on
+# `closed && !merged` -- which also matches abandoned-but-WANTED work. This is
+# CONTENT IDENTITY instead: the branch head must be byte-identical to
+# `refs/pull/N/head` for its own closed PR, and that ref must RESOLVE. GitHub
+# retains pull refs permanently, so a branch passing this test can only ever be
+# a commit GitHub is already preserving; restoring it is one
+# `git push origin <sha>:refs/heads/<name>` and needs no backup we maintain.
+# Safe by construction rather than by trusting a close reason (main, 2026-08-16).
+#
+# FAIL CLOSED, and this is the whole hazard: an unresolvable pull ref (network
+# blip, deleted PR, fork head) must be PRESERVE, never a mismatch-free pass.
+# All three negative states are named by the caller, because "unresolved" reads
+# exactly like "nothing to do" when it is silent.
+#
+# Echoes: <state>\t<pr_number>\t<pullref_sha>, state = match|mismatch|unresolved|none
+superseded_identity() {
+  local sha="$1" closed_prs="$2"
+  local pr_number pullref_sha rc=0
+
+  # Closed, unmerged, and its head is THIS exact sha. Latest such PR wins, so a
+  # recycled branch name resolves against its own PR rather than an older one.
+  pr_number=$(jq -r --arg sha "$sha" '
+    [.[] | select(.merged_at == null and .head.sha == $sha)]
+    | sort_by(.number) | last
+    | if . == null then empty else .number end
+  ' <<<"$closed_prs")
+
+  if [[ -z "$pr_number" ]]; then
+    printf 'none\t\t\n'
+    return 0
+  fi
+
+  pullref_sha=$("$GH_BIN" api "repos/$repo/git/ref/pull/$pr_number/head" \
+    --jq .object.sha 2>/dev/null) || rc=$?
+  if (( rc != 0 )) || [[ ! "$pullref_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    printf 'unresolved\t%s\t%s\n' "$pr_number" "${pullref_sha:-<none>}"
+    return 0
+  fi
+  if [[ "$pullref_sha" != "$sha" ]]; then
+    printf 'mismatch\t%s\t%s\n' "$pr_number" "$pullref_sha"
+    return 0
+  fi
+  printf 'match\t%s\t%s\n' "$pr_number" "$pullref_sha"
+}
+
+closed_prs_for() {
+  "$GH_BIN" api --method GET "repos/$repo/pulls" \
+    -f state=closed -f "head=$owner:$1" -f per_page=100
 }
 
 # --report is a read-only digest pass: it FLAGS (never deletes/labels/closes)
@@ -104,7 +167,8 @@ report_stale() {
   # by age hands the reader the wrong axis, and the reflex answer to "dead branch,
   # 40d" is delete. See community/wiki/a-stale-branch-pile-can-be-the-only-copy.md.
   #
-  # Three arms, ANY ONE of which means the work landed:
+  # Four arms, ANY ONE of which means this branch is NOT the only copy of its work
+  # (arms 1-3: it landed; arm 4: GitHub preserves this exact commit regardless):
   #   1. merged-pr  — a closed PR whose head SHA equals the branch's current SHA.
   #                   The same predicate the --apply path deletes on.
   #   2. contained  — the branch is an ancestor of the default branch (compare
@@ -117,8 +181,13 @@ report_stale() {
   #                   later guards' comments. The false positive gets STRONGER the
   #                   more important the missing work was, because a good finding is
   #                   cited more.
+  #   4. pull-ref   — the head is byte-identical to `refs/pull/N/head` of its own
+  #                   CLOSED-UNMERGED PR (DIVE-3490). Not a landing claim: the work
+  #                   never merged. GitHub retains pull refs permanently, so the
+  #                   commit survives the branch's deletion and this discharges the
+  #                   finding all the same. See `superseded_identity` above.
   #
-  # None of the three -> FINDING. It may be the only copy. Report it; never delete it.
+  # None of the four -> FINDING. It may be the only copy. Report it; never delete it.
   # Age is still printed, as a fact about the branch. It is not the classifier.
   #
   # THE FAILURE DIRECTION IS DELIBERATE: a missing or truncated evidence source
@@ -169,7 +238,7 @@ report_stale() {
   if [[ "$subj_state" == ok ]] && (( page > max_subject_pages )); then subj_state=truncated; fi
 
   # Pass 2 — classify.
-  local br_findings=0 br_landed=0 br_orphan=0 br_unknown=0
+  local br_findings=0 br_landed=0 br_orphan=0 br_unknown=0 br_pullref=0
   local f_out="$rtmp/findings" l_out="$rtmp/landed" o_out="$rtmp/other"
   : >"$f_out"; : >"$l_out"; : >"$o_out"
 
@@ -180,13 +249,17 @@ report_stale() {
       age_note="$(( (now - commit_epoch) / 86400 ))d since last commit (${commit_date%%T*})"
     fi
 
-    local merged_pr
-    merged_pr=$("$GH_BIN" api --method GET "repos/$repo/pulls" \
-      -f state=closed -f "head=$owner:$branch" -f per_page=100 2>/dev/null \
-      | jq -r --arg sha "$sha" '
+    # Fetched ONCE and reused by arms 1 and 4 -- they ask the same page of closed
+    # PRs for opposite halves of it (merged_at set / merged_at null). Both arms
+    # attribute only on a POSITIVE read: if this call fails, `closed_prs` is `[]`,
+    # neither arm fires, and the branch falls through toward FINDING.
+    local closed_prs merged_pr
+    closed_prs=$(closed_prs_for "$branch" 2>/dev/null || true)
+    [[ -n "$closed_prs" ]] || closed_prs='[]'
+    merged_pr=$(jq -r --arg sha "$sha" '
           [.[] | select(.merged_at != null and .head.sha == $sha)]
           | sort_by(.merged_at) | last
-          | if . == null then "" else "#\(.number)" end' 2>/dev/null || true)
+          | if . == null then "" else "#\(.number)" end' <<<"$closed_prs" 2>/dev/null || true)
     if [[ -n "$merged_pr" ]]; then
       echo "- \`${branch}\` — LANDED merged-pr ${merged_pr} — ${age_note}" >>"$l_out"
       br_landed=$((br_landed + 1))
@@ -213,6 +286,36 @@ report_stale() {
         continue
         ;;
     esac
+
+    # ARM 4 (DIVE-3490) — content identity with the branch's own closed-unmerged
+    # pull ref. It sits HERE, after the two cheap positive arms and BEFORE the
+    # ident/subject arm, for three reasons:
+    #   - arms 1 and 2 are strictly stronger claims (the work is on the default
+    #     branch); asking the pull ref for a branch they already discharged is a
+    #     wasted API call and a wrong label.
+    #   - it does not need an ident and does not read the subject corpus, so it
+    #     still discharges a branch whose name carries no ident and still works on
+    #     a run where arm 3's corpus is unavailable.
+    #   - it is the arm that discharges a FINDING, which is the only reason it
+    #     exists: without it, all three of this repo's closed-unmerged branches
+    #     read "may be the only copy" forever, and the reader learns to ignore
+    #     the section.
+    #
+    # The claim it makes is DIFFERENT from arms 1-3 and is labelled differently:
+    # the work did NOT land, GitHub is simply preserving this exact commit
+    # permanently, so deleting the branch destroys nothing. Same failure
+    # direction as the rest of the classifier: mismatch, unresolved and none all
+    # fall through to the arms below and end at FINDING. Nothing is discharged
+    # on the ABSENCE of a reading.
+    local ident_state ident_pr ident_pullref
+    IFS=$'\t' read -r ident_state ident_pr ident_pullref \
+      < <(superseded_identity "$sha" "$closed_prs")
+    if [[ "$ident_state" == match ]]; then
+      echo "- \`${branch}\` — PRESERVED pull-ref-identity #${ident_pr} — head is byte-identical to \`refs/pull/${ident_pr}/head\` of its own closed-unmerged PR, a ref GitHub retains permanently; the work did not land, but deleting this branch destroys nothing (restore: \`git push origin ${sha}:refs/heads/${branch}\`) — ${age_note}" >>"$l_out"
+      br_landed=$((br_landed + 1))
+      br_pullref=$((br_pullref + 1))
+      continue
+    fi
 
     local ident
     ident=$(grep -oiE "(${ident_prefixes})[-_]?[0-9]+" <<<"$branch" | head -1 \
@@ -255,7 +358,10 @@ report_stale() {
   fi
   echo
 
-  echo "#### Branches with evidence their work landed"
+  # Not "work landed" alone any more: arm 4 puts branches here whose work did NOT
+  # land but whose exact head GitHub preserves. Both mean the same thing to the
+  # reader -- this branch is not the only copy -- and each line says which it is.
+  echo "#### Branches that are not the only copy (landed, or preserved by GitHub)"
   if (( br_landed > 0 )); then cat "$l_out"; else echo "- none"; fi
   echo
 
@@ -281,7 +387,7 @@ report_stale() {
     echo
   fi
 
-  echo "_Flagged ${pr_flagged} stale PR(s). Branches: ${br_findings} finding(s), ${br_landed} with landing evidence, ${br_orphan} orphan, ${br_unknown} unknown. This is a report only; nothing was deleted, labelled, or closed._"
+  echo "_Flagged ${pr_flagged} stale PR(s). Branches: ${br_findings} finding(s), ${br_landed} not the only copy (${br_pullref} of those preserved by pull ref, not landed), ${br_orphan} orphan, ${br_unknown} unknown. This is a report only; nothing was deleted, labelled, or closed._"
 }
 
 if [[ "$mode" == "report" ]]; then
@@ -325,8 +431,7 @@ while IFS=$'\t' read -r branch sha protected; do
 
   # Requiring the PR head SHA to equal the branch's current SHA prevents an old
   # merged PR from deleting a later branch that reused the same name.
-  closed_prs=$("$GH_BIN" api --method GET "repos/$repo/pulls" \
-    -f state=closed -f "head=$owner:$branch" -f per_page=100)
+  closed_prs=$(closed_prs_for "$branch")
   merge_row=$(jq -r --arg sha "$sha" '
     [.[] | select(.merged_at != null and .head.sha == $sha)]
     | sort_by(.merged_at) | last
@@ -334,8 +439,38 @@ while IFS=$'\t' read -r branch sha protected; do
   ' <<<"$closed_prs")
 
   if [[ -z "$merge_row" ]]; then
-    echo "PRESERVE no-exact-merged-pr branch=$branch sha=$sha"
-    ((skipped_count += 1))
+    # No merged PR at this head. Before preserving, ask the identity predicate
+    # (DIVE-3490) -- but NEVER under --apply. The weekly schedule runs --apply
+    # unattended (branch-hygiene.yml: `if: github.event_name == 'schedule'`),
+    # and this predicate's authorisation was explicitly conditioned on its first
+    # live output being a list a human reads. Arming it therefore needs a
+    # deliberate change to that workflow, not a merge of this file.
+    ident_state=""
+    IFS=$'\t' read -r ident_state ident_pr ident_pullref \
+      < <(superseded_identity "$sha" "$closed_prs")
+    case "$ident_state" in
+      match)
+        if [[ "$mode" == "apply" ]]; then
+          echo "PRESERVE superseded-identity-not-armed branch=$branch sha=$sha pr=#$ident_pr"
+          ((skipped_count += 1))
+        else
+          echo "DELETE-CANDIDATE branch=$branch sha=$sha pr=#$ident_pr via=pullref-identity pullref=$ident_pullref"
+          ((candidate_count += 1))
+        fi
+        ;;
+      mismatch)
+        echo "PRESERVE superseded-identity-mismatch branch=$branch sha=$sha pr=#$ident_pr pullref=$ident_pullref"
+        ((skipped_count += 1))
+        ;;
+      unresolved)
+        echo "PRESERVE superseded-identity-unresolved branch=$branch sha=$sha pr=#$ident_pr"
+        ((skipped_count += 1))
+        ;;
+      *)
+        echo "PRESERVE no-exact-merged-pr branch=$branch sha=$sha"
+        ((skipped_count += 1))
+        ;;
+    esac
     continue
   fi
 
