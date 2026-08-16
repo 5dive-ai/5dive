@@ -196,6 +196,34 @@ jobs:
   # the core jobs never ran, so there is no clean-green baseline in this workflow to
   # assume. The probe does its own clean run for the few files named, which is what
   # makes that flag unnecessary rather than merely omitted.
+  # DIVE-3479: THE GUARD RUNS ON THE PATH IT GUARDS.
+  #
+  # `tests/corpus_tier_budget_unit.sh` carries the DIVE-3315 arms that grade THIS FILE's
+  # structure — the required check names, the aggregators' fail-closed shape, the un-sharded
+  # total being emitted and graded, and the pinned core shard count. It is `TIER: nightly`,
+  # and `changed-harnesses` below selects harnesses by the diff's `tests/*.sh`. So a
+  # WORKFLOW-ONLY edit — exactly the shape of the `[1, 2] -> [1, 2, 3]` capacity change those
+  # arms exist to stop — ran none of them on any PR job, and reached CI only on the nightly
+  # union, within a day, after the merge.
+  #
+  # Not promoted out of `nightly` to fix that: 41.4s (run 30988600395) inside the core tier
+  # would spend 14% of one shard's 300s cap grading the cap, in the tier DIVE-2525/3315 are
+  # shrinking. Here it is 41.4s on a parallel runner, off the ~300s critical path, and zero
+  # against TIER_BUDGET_CORE.
+  #
+  # UNCONDITIONAL on purpose: a `paths:` filter would make this `skipped` on most PRs, and the
+  # aggregators below fail closed on anything that is not `success`. The arm that keeps this
+  # job wired (99, in the harness itself) asserts it carries no `if:` for that reason.
+  workflow-structure-guards:
+    runs-on: ubuntu-latest
+    # The harness reads files and parses YAML; it builds nothing and runs no corpus. Measured
+    # 67s on the shared control-plane box, 41.4s on a CI runner.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Grade this workflow's own structure (DIVE-3315 arms, DIVE-3479 arm 99)
+        run: bash tests/corpus_tier_budget_unit.sh
+
   changed-harnesses:
     runs-on: ubuntu-latest
     # This job's cost is set by the DIFF, not by the corpus, so it has no budget of
@@ -678,23 +706,24 @@ jobs:
     # core-total-produced is in here on purpose, and it is why this check waits on the
     # installed-host shards too: the honesty instrument being ALIVE is part of what the merge
     # gate covers, and a job nothing requires is a job that can go red for a week.
-    needs: [core-pristine, acp-graded-pristine, core-total-produced]
+    needs: [core-pristine, acp-graded-pristine, core-total-produced, workflow-structure-guards]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Both pristine shards, and the ACP grade over their union, must be green
+      - name: Both pristine shards, the ACP grade over their union, and the workflow's own structure must be green
         run: |
           rc=0
           for d in "core-pristine=${{ needs['core-pristine'].result }}" \
                    "acp-graded-pristine=${{ needs['acp-graded-pristine'].result }}" \
-                   "core-total-produced=${{ needs['core-total-produced'].result }}"; do
+                   "core-total-produced=${{ needs['core-total-produced'].result }}" \
+                   "workflow-structure-guards=${{ needs['workflow-structure-guards'].result }}"; do
             printf '%s\n' "$d"
             [ "${d#*=}" = success ] || rc=1
           done
           exit "$rc"
 
   test-installed-host:
-    needs: [core-installed-host, rails-installed-host, acp-graded-installed, core-total-produced]
+    needs: [core-installed-host, rails-installed-host, acp-graded-installed, core-total-produced, workflow-structure-guards]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -707,7 +736,8 @@ jobs:
           for d in "core-installed-host=${{ needs['core-installed-host'].result }}" \
                    "rails-installed-host=${{ needs['rails-installed-host'].result }}" \
                    "acp-graded-installed=${{ needs['acp-graded-installed'].result }}" \
-                   "core-total-produced=${{ needs['core-total-produced'].result }}"; do
+                   "core-total-produced=${{ needs['core-total-produced'].result }}" \
+                   "workflow-structure-guards=${{ needs['workflow-structure-guards'].result }}"; do
             printf '%s\n' "$d"
             [ "${d#*=}" = success ] || rc=1
           done
