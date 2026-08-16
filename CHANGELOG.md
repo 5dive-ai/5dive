@@ -22,9 +22,20 @@ from the merged-and-tidy ones. A reader handed "dead branch, 40d" reaches for de
 - **A branch with no common ancestor is ORPHAN, not stale.** This repo's `status` branch is an
   intentional orphan written daily by `5dive proof publish`; an ancestry-based sweep flagged it
   every single week.
-- **The failure direction is signed:** an unreadable or truncated commit-subject corpus makes the
-  digest report MORE findings, never fewer. Nothing is attributed on the *absence* of a reading —
-  a branch whose evidence could not be fetched reads `UNKNOWN evidence-unavailable`.
+- **The failure direction is signed, and it is owed PER ARM:** an unreadable or truncated evidence
+  source makes the digest report MORE findings, never fewer. Nothing is attributed on the *absence*
+  of a reading, and nothing is moved OUT of the findings section on one either. An unreadable
+  commit-subject corpus reads `UNKNOWN evidence-unavailable` and arm 3 is skipped.
+- **An unreadable `compare` is not an orphan.** `gh api` exits non-zero for a genuine
+  no-common-ancestor 404 and for a rate limit, a 5xx or a token-scope refusal alike, so an empty
+  compare status has two causes whose remedies are *opposite*: "by design, ignore this forever" and
+  "re-run, this told you nothing". Reading both as ORPHAN filed the branch under *preserved, not
+  stale, do not sweep* — on the report fixture with compare rate-limited, 2 findings became 0 and
+  the branch holding a live defect fix that existed nowhere else vanished from the findings
+  section, while the digest read as an all-clear. Arm 2 now asks the same endpoint a question whose
+  answer is known (`compare/<default>...<default>` is `identical` whenever it is readable at all),
+  lazily and once per run; when it cannot be read, the branch falls through to arm 3 rather than
+  being preserved out of sight, and a footer names the arm that did not run.
 - **`DEAD_BRANCH_DAYS` is no longer read.** Setting it prints a line saying so rather than being
   silently ignored; the weekly workflow no longer sets it. Branch age is still printed per branch,
   as a fact, not as the classifier.

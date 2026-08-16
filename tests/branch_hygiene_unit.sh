@@ -255,7 +255,23 @@ case "$args" in
   "api repos/acme/demo/commits/"*" --jq .commit.committer.date")
     echo 2026-07-01T00:00:00Z
     ;;
+  *"compare/main...main"*)
+    # Arm 2's availability probe: the question whose answer is known. It must be
+    # answerable exactly when the compare endpoint is readable, and fail with the
+    # rest of the endpoint when it is not -- that is what separates a genuine
+    # no-common-ancestor from a compare nobody could read.
+    [[ -n "${MOCK_PROBE_LOG:-}" ]] && echo probe >>"$MOCK_PROBE_LOG"
+    if [[ -n "${MOCK_COMPARE_FAIL:-}" ]]; then
+      echo "mock: compare rate-limited" >&2
+      exit 1
+    fi
+    echo identical
+    ;;
   *"compare/main...contained-branch"*)
+    if [[ -n "${MOCK_COMPARE_FAIL:-}" ]]; then
+      echo "mock: compare rate-limited" >&2
+      exit 1
+    fi
     echo behind
     ;;
   *"compare/main...status"*)
@@ -263,6 +279,10 @@ case "$args" in
     exit 1
     ;;
   *"compare/main..."*)
+    if [[ -n "${MOCK_COMPARE_FAIL:-}" ]]; then
+      echo "mock: compare rate-limited" >&2
+      exit 1
+    fi
     echo diverged
     ;;
   *"-f head=acme:merged-old"*"-f state=closed"*|*"-f state=closed"*"-f head=acme:merged-old"*)
@@ -329,7 +349,7 @@ grep -q '`contained-branch` — LANDED contained-in-`main`' <<<"$report_output"
 grep -q '`dive-3330-verify-merge-gate` — LANDED subject-attribution DIVE-3330' <<<"$report_output"
 grep -q '`dive-2067-verify-over-closed` — \*\*FINDING\*\* unattributed (DIVE-2067)' <<<"$report_output"
 grep -q '`salvage/untracked-test-harnesses-2026-07-26` — \*\*FINDING\*\* no-ident' <<<"$report_output"
-grep -q '`status` — ORPHAN no-common-ancestor' <<<"$report_output"
+grep -q '`status` — ORPHAN no-common-ancestor with `main` (by design)' <<<"$report_output"
 
 # ARM 4 (DIVE-3490). A closed-UNMERGED PR whose pull ref is byte-identical to the
 # branch head discharges the finding -- and says plainly that the work did not land.
@@ -394,5 +414,42 @@ grep -q '`dive-3491-superseded-ok` — PRESERVED pull-ref-identity #30' <<<"$fai
 grep -q '`salvage/preserved-2026-08-01` — PRESERVED pull-ref-identity #34' <<<"$fail_output"
 grep -q '`dive-3493-superseded-gone` — UNKNOWN evidence-unavailable (DIVE-3493)' <<<"$fail_output"
 grep -q '1 finding(s), 4 not the only copy (2 of those preserved by pull ref, not landed), 1 orphan, 5 unknown' <<<"$fail_output"
+
+# THE SAME FAILURE DIRECTION, OWED PER ARM (DIVE-2394 iteration 2). Arm 2's evidence source is
+# the `compare` endpoint, and `gh api` exits non-zero for a genuine no-common-ancestor 404 and
+# for a rate limit alike. Reading both as ORPHAN filed the branch under "preserved, not stale,
+# do not sweep" -- measured on this fixture before the fix: 2 findings became 0, and
+# `dive-2067-verify-over-closed` (the DIVE-2389 branch that held a live defect fix existing
+# nowhere else) disappeared out of the findings section. A digest reading "0 findings" is an
+# all-clear, and by the page this row compiled, the deletion reflex is formed by the digest.
+: >"$RTMP/probe.log"
+cmpfail_output=$(GH_BIN="$RTMP/gh" GITHUB_REPOSITORY=acme/demo MOCK_COMPARE_FAIL=1 \
+  MOCK_PROBE_LOG="$RTMP/probe.log" "$ROOT/scripts/branch-hygiene.sh" --report)
+
+# The probe is asked LAZILY and its `unavailable` verdict is STICKY: one call, not one per
+# branch. Cost is half of it; the other half is that a compare recovering mid-run must not
+# hand two branches in the same digest verdicts derived from different endpoint states.
+[[ $(wc -l <"$RTMP/probe.log") -eq 1 ]]
+
+# MORE findings, never fewer: the 2 baseline findings survive and the branches arm 2 can no
+# longer speak for join them, rather than being preserved out of sight.
+grep -q '`dive-2067-verify-over-closed` — \*\*FINDING\*\* unattributed (DIVE-2067)' <<<"$cmpfail_output"
+grep -q '`contained-branch` — \*\*FINDING\*\*' <<<"$cmpfail_output"
+! grep -q 'LANDED contained-in-' <<<"$cmpfail_output"
+
+# An unreadable compare is NEVER reported as an orphan verdict: the two have opposite remedies.
+! grep -q 'ORPHAN' <<<"$cmpfail_output"
+grep -q 'compare` endpoint could not be read this run: arm 2 did not run for 5 branch(es)' <<<"$cmpfail_output"
+
+# Arm 3 still runs and is still trusted -- one unreadable arm does not blind the others.
+grep -q '`dive-3330-verify-merge-gate` — LANDED subject-attribution DIVE-3330' <<<"$cmpfail_output"
+
+grep -q '4 finding(s), 2 with landing evidence, 0 orphan, 0 unknown' <<<"$cmpfail_output"
+! grep -q '^DELETED ' <<<"$cmpfail_output"
+
+# And the probe is what discriminates: with compare readable, the intentional orphan is still
+# an orphan and is still NOT a finding. (Guards the probe being wired to a constant `true`.)
+grep -q '`status` — ORPHAN' <<<"$report_output"
+! grep -q 'arm 2 did not run' <<<"$report_output"
 
 echo "branch_hygiene_unit: report-by-evidence PASS"
