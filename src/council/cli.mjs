@@ -1090,11 +1090,22 @@ function serializeConstitutionScalar(v) {
   if (Array.isArray(v)) return '[' + v.map(serializeConstitutionScalar).join(', ') + ']'
   return `'${String(v).replace(/'/g, "''")}'`
 }
+// DIVE-3493 — a non-empty list is re-emitted as a BLOCK sequence, never inline. This verb
+// re-serializes the WHOLE document (it only ever CHANGES hard_gates/ship/comms, but it
+// rewrites every key it read), so an inline emitter here would silently convert a sealed
+// `authority.gate_clear_leads` into the one shape the enforcing reader in src/task/need.sh
+// treats as absent — revoking the allowlist as a side effect of a guardrail edit, and now
+// also failing this verb's own re-validation. Empty stays `[]`: block form cannot say it.
+function serializeConstitutionList(k, v, pad) {
+  if (!v.length) return `${pad}${k}: []\n`
+  return `${pad}${k}:\n` + v.map(x => `${pad}  - ${serializeConstitutionScalar(x)}\n`).join('')
+}
 function serializeConstitutionNode(obj, indent) {
   const pad = ' '.repeat(indent)
   let out = ''
   for (const [k, v] of Object.entries(obj)) {
-    if (v && typeof v === 'object' && !Array.isArray(v)) {
+    if (Array.isArray(v)) out += serializeConstitutionList(k, v, pad)
+    else if (v && typeof v === 'object') {
       const inner = serializeConstitutionNode(v, indent + 2)
       out += inner ? `${pad}${k}:\n${inner}` : `${pad}${k}:\n`
     } else out += `${pad}${k}: ${serializeConstitutionScalar(v)}\n`
@@ -1111,7 +1122,8 @@ function serializeConstitution(raw) {
     + '# is the sealed digest: after this file is sealed, enforcement fails CLOSED on any drift from it.\n'
   for (const k of keys) {
     const v = raw[k]
-    if (v && typeof v === 'object' && !Array.isArray(v)) {
+    if (Array.isArray(v)) out += serializeConstitutionList(k, v, '')
+    else if (v && typeof v === 'object') {
       const inner = serializeConstitutionNode(v, 2)
       out += inner ? `${k}:\n${inner}` : `${k}:\n`
     } else out += `${k}: ${serializeConstitutionScalar(v)}\n`

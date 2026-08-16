@@ -41,7 +41,11 @@ comms:
 # Why these rules: explain the company's governance choices in comments like this.
 ```
 
-The v0 parser accepts two-space mappings, scalar values, and inline arrays.
+The v0 parser accepts two-space mappings, scalar values, inline arrays, and block
+sequences of plain scalars (`  - name` on its own line). `authority.gate_clear_leads`
+must use the **block** form and is refused inline when it names anyone: bash is what
+enforces that key, its node-free reader accepts only the block shape, and a document
+that lists holders inline would seal names the enforcer then denies.
 `hard_gates` values are case-insensitive POSIX ERE patterns. Supplying the
 `hard_gates` map replaces the shipped class map, so an organization can add or
 remove a class without patching the CLI. Bash compile-probes the combined
