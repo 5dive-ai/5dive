@@ -1271,6 +1271,103 @@ if [[ "$TYPE" == "claude" ]]; then
   unset _primary_auth _creds_re _deadline _waited _af _line 2>/dev/null || :
 fi
 
+# DIVE-2743: trust the agent's EFFECTIVE workdir before the first launch.
+#
+# preseed_claude_agent() writes exactly ONE trusted project into ~/.claude.json:
+# "/home/claude/projects". But a sandboxed agent's workdir defaults to
+# /home/agent-<name> (cmd_agent_create.sh), and ANY agent created with
+# --workdir=<path outside the projects root> lands elsewhere too, at EVERY
+# isolation tier — nothing about this is sandbox-specific. tmux launches claude
+# with -c "$WORKDIR", so such an agent comes up in a directory with no trust
+# entry and parks on the interactive "Do you trust the files in this folder?"
+# dialog, which a headless agent cannot answer. This is the folder-trust half of
+# the first-boot problem; the custom-API-key half is DIVE-1591.
+#
+# Measured in the 2.1.222 bundle on this host. The ticket assumed the projects
+# key is matched by EXACT cwd; it is a PARENT WALK — which changes the skip
+# condition, not the fix:
+#
+#   if (config.projects?.[canon(cwd)]?.hasTrustDialogAccepted) return true;
+#   let n = canon(cwd);
+#   while (true) { if (config.projects?.[n]?.hasTrustDialogAccepted) return true;
+#                  let i = canon(resolve(n,"..")); if (i === n) break; n = i }
+#   return false;
+#
+# So: a workdir AT OR UNDER the trusted root is already covered by the walk —
+# skip it, and the JSON stays clean. And /home/agent-<name> walks to /home then
+# / and never meets /home/claude/projects, so the reported case is real and the
+# walk does not rescue it. The walk canonicalizes each key and the cwd claude
+# sees is already symlink-resolved, so seed the canonical form.
+#
+# ASSERT THE FIELD, NOT THE KEY. Claude Code creates the project entry itself on
+# first visit with hasTrustDialogAccepted:FALSE (the bundle's default project
+# object), so "the workdir key exists" is NOT "trust granted" — a live probe saw
+# the dialog re-arm on an agent whose config already carried the key. That makes
+# this a READ-MODIFY-WRITE and not a write: ~/.claude.json also holds Claude
+# Code's own state (numStartups, machineID, userID, seenNotifications) alongside
+# our theme/onboarding/root-trust preseed, so a `jq -n` here re-arms the theme
+# picker and drops the root trust entry — strictly worse than the stall it fixes.
+#
+# Boot-time rather than create-time (the parked DIVE-2743 decision): create-path
+# only would fix new agents and leave every already-stranded agent needing a
+# recreate; at boot they back-fill for free on the next restart. Best-effort
+# throughout — this runs under `set -e` and must NEVER stop an agent launching.
+if [[ "$TYPE" == "claude" && -n "${WORKDIR:-}" ]]; then
+  _wtr_cfg="$HOME/.claude.json"
+  # Canonicalize both sides the way the bundle's trust walk does. `cd && pwd -P`
+  # rather than `realpath -m` so an unreadable path degrades to the literal
+  # instead of to a guess; WORKDIR was already accessibility-checked at the top.
+  _wtr_dir=$(cd "$WORKDIR" 2>/dev/null && pwd -P) || _wtr_dir=""
+  [[ -n "$_wtr_dir" ]] || _wtr_dir="$WORKDIR"
+  _wtr_root=$(cd "$DEFAULT_WORKDIR" 2>/dev/null && pwd -P) || _wtr_root=""
+  [[ -n "$_wtr_root" ]] || _wtr_root="$DEFAULT_WORKDIR"
+  # Keyed on the effective workdir differing from the trusted root, NOT on the
+  # sandboxed branch: an --workdir=/srv/x agent at standard isolation is the same
+  # defect. At-or-under the root is already covered by the parent walk.
+  if [[ "$_wtr_dir" != "$_wtr_root" && "$_wtr_dir" != "$_wtr_root"/* ]]; then
+    _wtr_base='{}'
+    if [[ -r "$_wtr_cfg" ]] && jq -e 'type == "object"' "$_wtr_cfg" >/dev/null 2>&1; then
+      _wtr_base=$(cat "$_wtr_cfg")
+    elif [[ -e "$_wtr_cfg" ]]; then
+      echo "[5dive] agent=${NAME} WARN: ${_wtr_cfg} unreadable or not a JSON object — seeding a fresh one" >&2
+    fi
+    # Merge onto whatever entry is already there (Claude Code may have written
+    # one with the flag false); never replace .projects wholesale.
+    _wtr_next=$(jq -c --arg d "$_wtr_dir" '
+        ((if (.projects | type) == "object" then .projects else {} end)) as $p
+        | ((if ($p[$d] | type) == "object" then $p[$d] else {} end)) as $e
+        | .projects = ($p + { ($d): ($e + {
+            hasTrustDialogAccepted: true,
+            hasCompletedProjectOnboarding: true
+          }) })
+      ' <<<"$_wtr_base" 2>/dev/null) || _wtr_next=""
+    if [[ -n "$_wtr_next" ]]; then
+      if _wtr_tmp=$(mktemp "${_wtr_cfg}.XXXXXX" 2>/dev/null); then
+        if printf '%s\n' "$_wtr_next" > "$_wtr_tmp" 2>/dev/null \
+           && chmod 600 "$_wtr_tmp" 2>/dev/null \
+           && mv "$_wtr_tmp" "$_wtr_cfg" 2>/dev/null; then
+          # Say which path ran. A silent success and a block that never ran are
+          # the same journal line, and that ambiguity cost a whole smoke cycle on
+          # DIVE-1591 (2026-08-05): an unattributable red needs an instrument,
+          # not another run. The workdir is a path, not a credential, so it can
+          # be logged in full.
+          echo "[5dive] agent=${NAME} trusted workdir ${_wtr_dir} in ${_wtr_cfg}" >&2
+        else
+          rm -f "$_wtr_tmp" 2>/dev/null || :
+          echo "[5dive] agent=${NAME} WARN: could not write ${_wtr_cfg} — the folder-trust dialog may arm for ${_wtr_dir}" >&2
+        fi
+      else
+        echo "[5dive] agent=${NAME} WARN: no temp file beside ${_wtr_cfg} — skipping the workdir trust seed" >&2
+      fi
+    else
+      echo "[5dive] agent=${NAME} WARN: could not build the workdir trust seed for ${_wtr_dir} — leaving ${_wtr_cfg} untouched" >&2
+    fi
+  else
+    echo "[5dive] agent=${NAME} workdir ${_wtr_dir} is under the trusted root ${_wtr_root} — no trust seed needed" >&2
+  fi
+  unset _wtr_cfg _wtr_dir _wtr_root _wtr_base _wtr_next _wtr_tmp 2>/dev/null || :
+fi
+
 CMD_STR=$(printf '%q ' "$BIN" "${ARGS[@]}")
 
 # Headless first-boot for openclaw with no channel. The old prelude ran the

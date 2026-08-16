@@ -77,6 +77,7 @@ cat \
   src/lib/registry.sh \
   src/lib/tasks_db.sh \
   src/lib/actor.sh \
+  src/lib/a2a_rounds.sh \
   src/cmd_auth.sh \
   src/cmd_account.sh \
   src/cmd_agent.sh \
@@ -110,6 +111,7 @@ cat \
   src/cmd_task.sh \
   src/cmd_trace.sh \
   src/cmd_org.sh \
+  src/cmd_human.sh \
   src/cmd_ui.sh \
   src/cmd_hire.sh \
   src/cmd_project.sh \
