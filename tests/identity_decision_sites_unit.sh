@@ -94,6 +94,14 @@ SITES=(
   "src/cmd_proof.sh|_proof_publish|6|the STORED lastPublishedBy.user staleness record"
   "src/cmd_objective.sh|cmd_objective_add|7|the STORED objectives.created_by acting agent"
   "src/task/notify.sh|_task_owner_channel|8|WHICH AGENT'S TELEGRAM BOT a notification reaches"
+  # Item 9 is NOT one of the parent's seven, nor the reconciliation's eight. It came out
+  # of grepping the CLASS (`auto_sender_from_sudo` included) across all of src/ instead
+  # of only the named sites — the exact move this row's own wiki page prescribes and the
+  # exact one a fix-the-list pass skips, because the list resolved and a resolved list
+  # feels like the check. Same construct as item 7, one function over, and it is the
+  # field DIVE-2512's tombstone rests on: a forgeable `retired_by` is what makes an
+  # authorized retirement indistinguishable from a wipe again.
+  "src/cmd_objective.sh|cmd_objective_rm|9|the STORED objectives.retired_by tombstone attribution"
 )
 
 for spec in "${SITES[@]}"; do
@@ -246,6 +254,46 @@ else
   no "CONTROL FAILED — the SUDO_UID classifier does not flag a bare unguarded read (enclosing fn resolved to '$_su_ctl_fn'); the arm above cannot fail"
 fi
 rm -f "$_su_ctl"
+
+# --- the CLASS sweep: every remaining auto_sender_from_sudo caller ------------
+# The site table above is a LIST, and a list only ever proves things about its own
+# entries. Item 9 was not on it: `cmd_objective_rm` carried the identical construct as
+# item 7 one function over, and the eight-item triage — itself already a reconciliation
+# against a parent's hand-named sites — did not have it. What surfaced it was sweeping
+# the CLASS across all of src/ rather than re-reading the list.
+#
+# So this arm is the one that outlives the row. `auto_sender_from_sudo` is
+# `${SUDO_USER:-}` plus an `agent-*` prefix test and nothing else (lib/validation.sh),
+# forgeable by any caller with no privilege. Every remaining call of it must be either
+# inside a real-root guard — where sudo stamped the value — or a named, reasoned
+# not-a-defect. A NEW caller is a red here even if nobody thinks to re-triage.
+#
+#   cmd_agent_runtime.sh `_envelope_caller` — the DIVE-2182/2183 gap, left open ON
+#   PURPOSE with the argument written above the function; not this row's to close.
+#   cmd_agent_runtime.sh `cmd_ask` — a label for THIS command's JSON summary. The
+#   scoped `_deliver` path re-derives the sender independently, and that derivation is
+#   item 1, now sealed. Display, and the comment at the site says so.
+asfs_exempt() {
+  case "$1:$2" in
+    src/cmd_agent_runtime.sh:_envelope_caller|src/cmd_agent_runtime.sh:cmd_ask) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+_asfs_bad=""; _asfs_guarded=0; _asfs_exempt=0
+while IFS=: read -r f l rest; do
+  [[ "$f" == src/lib/validation.sh ]] && continue           # the definition itself
+  code=$(printf '%s' "$rest" | sed 's/#.*$//')
+  [[ "$code" == *auto_sender_from_sudo* ]] || continue      # comment-only mention
+  IFS=$'\t' read -r fn fl < <(_su_enclosing_fn "$f" "$l")
+  fbody=$(awk -v S="$fl" 'NR>=S {print} NR>=S && /^}/ {exit}' "$f")
+  if printf '%s' "$fbody" | grep -qE '_gate_is_root|EUID -eq 0|require_root'; then _asfs_guarded=$((_asfs_guarded+1))
+  elif asfs_exempt "$f" "$fn"; then _asfs_exempt=$((_asfs_exempt+1))
+  else _asfs_bad+="${f}:${l} (${fn:-<top level>}) "
+  fi
+done < <(grep -rn 'auto_sender_from_sudo' src/ 2>/dev/null)
+[[ -z "$_asfs_bad" ]] \
+  && ok "class sweep: every auto_sender_from_sudo caller is root-guarded (${_asfs_guarded}) or a named not-a-defect (${_asfs_exempt}) — no unguarded twin of items 7/9 left" \
+  || no "an unguarded auto_sender_from_sudo caller decides outside a root check — triage it by AXIS (routing/storage/gating are all decisions; only never-branched-on text is display): ${_asfs_bad}"
 
 printf '\nidentity_decision_sites_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
