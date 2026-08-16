@@ -1,6 +1,81 @@
 # Changelog
 
-## Unreleased — feat(task): an inert push-for-review clears at filing, pinging nobody (DIVE-3481)
+## v0.19.39 — fix(openclaw): write the BYO credential to the store openclaw actually reads (DIVE-3489)
+
+An openclaw agent created with an API key (`--provider=… --api-key=…`, and the
+dashboard / `5dive init` wizards that call it) reported `AUTH ok` on every
+surface and then failed at first use:
+
+```
+ProviderAuthError: No API key found for provider "openrouter".
+Auth store: ~/.openclaw/agents/main/agent/openclaw-agent.sqlite
+```
+
+openclaw moved per-agent auth out of `auth-profiles.json` and into a sqlite auth
+store. We were still writing the JSON — correct format, correct provider id,
+correct profile id, correct permissions, into a file the runtime no longer
+consults. Measured against openclaw 2026.7.1-2 in a throwaway `HOME`, both
+directions: a byte-valid `auth-profiles.json` lists `Profiles: (none)`, and
+`models auth --agent main paste-api-key --provider <id>` creates the sqlite and
+lists the profile back.
+
+Every openclaw BYO create since that migration shipped a dead credential.
+
+The credential is now written through openclaw's own CLI rather than by hand, so
+the store layout stops being ours to track — and the write is graded by asking
+openclaw to list the profile back, rather than by observing that our own file
+exists, which is what let the old path report success. Six further places
+referenced the old file and moved with it: the push into the agent's home, the
+copy that runs at every agent start (so a restart repairs an affected seat), the
+`AUTH ok` sentinel, the credential witness in `agent create`'s self-check, the
+auth-profile bind and its sign-in poller, and the account provider readout.
+
+`models auth paste-api-key` splits its write — the key into the sqlite, the
+profile registration (`auth.profiles.<id>`, no key) into `openclaw.json` — so
+both halves are now seeded into the seat; a store without its registration holds
+a credential nothing selects.
+
+Existing seats: `sudo 5dive agent restart <name>` re-seeds from the shared/profile
+copy. A seat whose shared copy is also pre-migration needs the key set again
+(`sudo 5dive agent auth set openclaw --provider=… --api-key=…`).
+
+Not covered: the interactive device/OAuth sign-in leg writes through the same
+per-agent auth store openclaw names in its own error text, and its sentinel moved
+with the rest, but that leg was not re-measured here.
+
+## v0.19.39 — fix(spend): count subagent turns, and stop losing a level in silence (DIVE-3468)
+
+Per-task and per-agent spend readers enumerated `projects/<proj>/<sid>.jsonl` and stopped there.
+Claude Code writes a subagent's turns to a sibling **directory** —
+`projects/<proj>/<sid>/subagents/*.jsonl` — so every sidechain turn was excluded from the figure,
+while carrying the parent's `sessionId`, meaning the attribution was always correct and only the
+path was out of reach.
+
+It failed in the worst available direction: no error, no NOT-REACHED, no reason — just a smaller
+correct-looking integer, under-charging exactly the rows that fan work out to subagents, i.e. the
+expensive ones. Nothing inside the numbers falsified it.
+
+Measured on three seats. On `agent-dev`, 3,174,912 tokens — 3.1% of the true total on sessions that
+delegate — were being dropped; one session's subagent file held 116 turns against the parent's 232,
+all `isSidechain:true`, with **zero** uuid overlap, so the second level is additional spend and not
+a re-count.
+
+Fixed in all three readers (`_spend_scan_task_ids`, `usage_collect`, `cmd_activity`).
+
+Two things the obvious fix gets wrong, and both are guarded now:
+
+- **`tool-results/` is not transcript turns.** It sits beside `subagents/` at the same depth with
+  the same suffix and well-formed billable turns inside, and it is present on every readable seat —
+  so the tempting `*/*/*.jsonl` sweep over-charges fleet-wide. Only `<sid>/subagents/` is descended
+  into.
+- **A second `glob.glob()` would have rebuilt the defect one level deeper.** glob swallows every
+  OSError in a wildcard level and yields nothing, so an unreadable `subagents/` dir would again be a
+  quiet short total. The levels are enumerated explicitly instead, and an unread one is reported —
+  NOT-REACHED in the spend scanner, whose caller persists what it returns, and a named `partial` in
+  the activity trail, which one human reads. That also closes a **pre-existing** hole at the project
+  level in the same reader, where the middle wildcard was glob-swallowed too.
+
+## v0.19.39 — feat(task): an inert push-for-review clears at filing, pinging nobody (DIVE-3481)
 
 lodar, 2026-08-16, on a routine branch-push approval waking the org lead: *"why dev2 cannot do
 delegated push himself and burns your token for approval?"* An approval gate whose ask is an
@@ -34,7 +109,7 @@ permanent gate record and digest line intact, and **no ping to anyone**.
 - **`5dive task pfr-autoclear [on|off|status]`**, default **on**, restores the lead ping with no
   release.
 
-## Unreleased — fix(usage): the middle wildcard is a read too (DIVE-3419)
+## v0.19.39 — fix(usage): the middle wildcard is a read too (DIVE-3419)
 
 Both transcript readers in `cmd_usage.sh` used `projects/*/*.jsonl`. `usage_collect` was guarded at the
 **top** (`probe_readable` on `projects/`) and the **bottom** (per-file `except OSError`) of a *three*-level
@@ -64,7 +139,7 @@ true** — and every "⚠ N NOT checked — burn is unknown (not 0)" banner buil
   ANY-UID arm (`ELOOP`, which root cannot resolve either) so a uid-0 CI run cannot be a vacuous green, and
   over-fire controls. **9/14 pre-fix, 23/0 after.**
 
-## Unreleased — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
+## v0.19.39 — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
 
 Nothing validated these columns. The work-picker dispatches on `assignee`, so a row on a name that is
 not a registered agent was **structurally undispatchable** — not blocked, not parked, not flagged, and
@@ -88,7 +163,7 @@ never once a dispatch target) and corroborated here (5 open rows).
 - **`wip-cap-install`** read the same unvalidated column (it had minted `wip_cap:cli`, a lane ceiling
   for an agent that does not exist). It now skips unregistered lanes and **names the skip**.
 
-## Unreleased — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
+## v0.19.39 — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
 
 `5dive agent config <name> set channels=<current>,buzz` could not succeed on any seat that was not
 **created** with buzz. `cmd_config` dispatches `install_channel_for_agent` for telegram, discord and
@@ -121,7 +196,7 @@ arms grade the satisfier next to the gate, and drive `cmd_config` for real — w
 that the same call reaches the restart once the cache is staged, so the rollback arms cannot pass
 against a `cmd_config` that simply refuses everything.
 
-## Unreleased — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
+## v0.19.39 — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
 
 DIVE-2483's gate answer said the preservation notice lands on **stdout**. It lands on **stderr**,
 via the fleet's `warn()`. Six arms were written for that condition and all six were green, because
@@ -155,7 +230,7 @@ Still open and scoped out on purpose: `task reject` remains an unguarded writer 
 column (`src/cmd_task.sh:4235`). That is a design question about accumulating verifier feedback, not
 this gap.
 
-## Unreleased — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
+## v0.19.39 — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
 
 DIVE-3272 taught the supervisor BOARD to see a seat that is alive and closing nothing. The
 drill-down people actually type kept printing only liveness: `state: active / enabled` was
@@ -197,7 +272,7 @@ supervisor:  quota-exhausted / quota-exhausted — pane shows a model-capacity r
 - `agent list` is unchanged — it is the survey surface, and this is a per-agent drill-down
   (three sqlite reads), deliberately not an N-way fan-out.
 
-## Unreleased — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
+## v0.19.39 — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
 
 A gate reaches the filer's lead only if `_GATE_ENG_SHIP_RX` matches the ask or the row
 title. `gate_builder_routing` is OFF by default, so for an ordinary builder ship gate that
@@ -261,7 +336,7 @@ prose for identifiers.
   `gate_access_lead_clear`, `gate_internal_ops_floor`, `task_needs_human_parity`,
   `task_inbox_json_tier`, `push_unit`, `broker_surface`, + 15 more).
 
-## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
+## v0.19.39 — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
 
 DIVE-1935's first iteration was rejected, and for the right reason. It added a
 `sudo -n -u claude gh auth token` arm to `_gate_gh_token` justified by *"agents hold
