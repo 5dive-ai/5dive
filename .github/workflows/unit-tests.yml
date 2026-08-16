@@ -772,7 +772,11 @@ jobs:
       # spelled here would be moved by a one-line edit in a file nobody reviews as the
       # policy change it is, which is the rule --budget and --cal-us already follow.
       # CHECKOUT FIRST: the artifacts below are downloaded into the working directory.
+      # fetch-depth: 0 like every other checkout in this file -- DIVE-2229's rule is
+      # whole-file, and `tests/baseline_pin_unit.sh` grades it per STEP, so a depth-1
+      # checkout here reds that harness whether or not this job resolves a pinned commit.
       - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
       - uses: actions/download-artifact@v4
         with: { pattern: 'core-*', merge-multiple: true }
       - name: Re-sum the shards and print the UN-SHARDED core total
