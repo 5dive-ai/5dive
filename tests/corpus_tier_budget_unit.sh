@@ -1330,5 +1330,296 @@ if [[ -f "$_wf" ]]; then
   else bad "unit-tests.yml arms the cross-runner gate on both core jobs" "armed=$_armed prior=$_prior"; fi
 else bad "unit-tests.yml is readable from the harness" "no file at $_wf"; fi
 
+# ---- 92-96 DIVE-3315: THE SPLIT, AND THE FOUR NAMES THE MERGE GATE KNOWS
+# core is TWO independently capped jobs per environment now. The corpus read 313s against
+# a 312s effective cap with ~6% runner spread, and the trimming levers were measured
+# exhausted (~7s available against ~13s needed, olivia's by-construction census on
+# DIVE-3313), so a cap breached by 1s on the draw of a runner was presenting as a flaky
+# test. The cap is PER JOB, so two shards of ~157s each hold the SAME 300s: the corpus is
+# split, the constraint is not relaxed.
+#
+# Four things have to stay true or the split is a capacity raise in disguise, a broken
+# merge gate, or both. All four are graded by PARSING the workflow, not by grepping it —
+# a `grep 'always()'` matches the comment that explains why it is there, which is the
+# vacuity this file keeps re-learning (see the jobs_missing_build arm above).
+#
+#   92  the four REQUIRED status-check names still exist as jobs. `test` is required on
+#       main; a matrix job reports as `test (1)`, so sharding under the old name leaves
+#       the required context unable to ever report and every PR waits on a check that
+#       cannot arrive. The names survive as aggregators over the shards.
+#   93  those aggregators FAIL CLOSED. A job skipped because its dependency failed
+#       reports SKIPPED, and GitHub counts a skipped required check as satisfied — so the
+#       one-line `needs:`-only version passes the merge gate exactly when the corpus went
+#       red. `if: always()` plus an explicit .result comparison, or it is not a gate.
+#   94  every core invocation is sharded, and the DIVISOR is the matrix length rather
+#       than a literal — a divisor spelled twice drifts, and the runner would then split
+#       the corpus a different number of ways than the matrix runs it.
+#   95  one job re-sums the shards and prints the UN-SHARDED total. Two shards reporting
+#       157s read as comfortable while the corpus still costs 313s; sharding is the
+#       obvious way to lose the number the whole tier scheme exists to surface.
+#   96  and that total is PRINTED, NEVER ENFORCED, and nothing gates on the job that
+#       prints it. Held to the 300s per-job cap the sum reads 313 > 300 on day one and
+#       the split fixes nothing — the number is an instrument, not a second budget.
+_wf3315="$(dirname "${BASH_SOURCE[0]}")/../.github/workflows/unit-tests.yml"
+if [[ -r "$_wf3315" ]]; then
+  while IFS=$'\t' read -r _v _name _detail; do
+    [[ -n "$_v" ]] || continue
+    if [[ "$_v" == ok ]]; then ok "$_name"; else bad "$_name" "$_detail"; fi
+  done < <(python3 - "$_wf3315" <<'PY' 2>&1
+import re, sys, yaml
+wf = sys.argv[1]
+d = yaml.safe_load(open(wf)) or {}
+jobs = d.get('jobs') or {}
+def chk(good, name, detail=''):
+    print('%s\t%s\t%s' % ('ok' if good else 'bad', name, detail.replace('\t', ' ')))
+def runs(job):
+    return [s.get('run') or '' for s in (job.get('steps') or []) if isinstance(s, dict)]
+
+# 92 — the names branch protection requires, pinned here so a rename is a red in the
+# repo rather than a queue of PRs blocked on a context that will never report.
+REQUIRED = ['test', 'test-installed-host', 'test-confirm', 'test-installed-host-confirm']
+missing = [c for c in REQUIRED if c not in jobs]
+chk(not missing,
+    'every REQUIRED status check on main is still a job NAME in unit-tests.yml (sharding must not rename the merge gate out from under branch protection)',
+    'missing: ' + ','.join(missing))
+
+# 93 — fail closed. Grades the aggregator's `if:` and the presence of a .result test.
+bad_agg = []
+for c in REQUIRED:
+    j = jobs.get(c) or {}
+    if str(j.get('if', '')).strip() != 'always()':
+        bad_agg.append('%s: if=%r, so a failed dependency SKIPS it and a skipped required check reads as satisfied' % (c, j.get('if')))
+        continue
+    if not any('.result' in r for r in runs(j)):
+        bad_agg.append('%s: runs always() but never compares a dependency .result — it is green by construction' % c)
+chk(not bad_agg,
+    'each required check RUNS on always() and asserts its dependencies\' .result (a bare needs: is satisfied by a skip, which is the merge gate passing precisely when the corpus went red)',
+    ' | '.join(bad_agg))
+
+# 94 — sharded, with the divisor taken from the matrix length.
+bad_shard, sharded = [], 0
+for jn, j in jobs.items():
+    for r in runs(j):
+        flat = re.sub(r'\\\n\s*', ' ', r)
+        for line in flat.splitlines():
+            if 'run-harnesses.sh' not in line or '--tier=core' not in line:
+                continue
+            # NOT \S+: the value is `${{ matrix.shard }}/${{ strategy.job-total }}`, which
+            # contains spaces, and splitting on the first one reads the divisor as `${{`.
+            m = re.search(r'--shard=(.+?)(?=\s+--|\s*$)', line)
+            if not m:
+                bad_shard.append('%s: a core invocation with no --shard=' % jn)
+                continue
+            sharded += 1
+            div = m.group(1).split('/')[-1]
+            if not re.search(r'strategy\.job-total|matrix\.shards', div):
+                bad_shard.append('%s: literal divisor %s — spelled twice, it drifts from the matrix' % (jn, div))
+chk(sharded >= 4 and not bad_shard,
+    'every core invocation in unit-tests.yml is SHARDED and takes its divisor from the matrix length, in both environments and in both confirm jobs (%d invocations)' % sharded,
+    ' | '.join(bad_shard) or 'sharded=%d' % sharded)
+
+# 95/96 — the un-sharded total: printed, and wired to nothing.
+summ = [jn for jn, j in jobs.items()
+        if any('wall_clock_s' in r and 'GITHUB_STEP_SUMMARY' in r for r in runs(j))]
+chk(len(summ) == 1,
+    'exactly one job re-sums the shards and prints the UN-SHARDED core total (per-shard is what the budget enforces; the total is what the trend is read from)',
+    'jobs printing a re-summed total: %s' % (summ or 'none'))
+if len(summ) == 1:
+    jn = summ[0]
+    body = '\n'.join(runs(jobs[jn]))
+    gated = re.findall(r'exit\s+[1-9]\b|\|\|\s*exit|exit\s+"\$\{?rc', body)
+    def needs_of(j):
+        n = j.get('needs')
+        return [n] if isinstance(n, str) else (n or [])
+    depended = [o for o, j in jobs.items() if jn in needs_of(j)]
+    # 96 — the total's VALUE is graded by nothing. Its PRODUCTION is graded next door, and
+    # that dependent is the one thing allowed to need this job: a presence check is not a
+    # budget. So the arm reads WHAT the dependent does rather than counting dependents —
+    # a job that reads `unsharded_total_s` and never mentions a budget is the permitted
+    # shape, and anything else that hangs off the printing job is a second cap arriving
+    # through the back door. Comments are stripped first: this file's own remedy text says
+    # "budget" in a comment, and an arm that reads the prose instead of the code is the
+    # vacuity the jobs_missing_build arm above already learned once.
+    def code_of(job):
+        out = []
+        for r in runs(job):
+            for ln in r.splitlines():
+                if not ln.strip().startswith('#'):
+                    out.append(ln)
+        return '\n'.join(out)
+    stray, valuey = [], []
+    for o in depended:
+        c = code_of(jobs[o])
+        if 'unsharded_total_s' not in c:
+            stray.append(o)
+        elif re.search(r'budget|TIER_BUDGET|\b300\b', c):
+            valuey.append(o)
+    chk(not gated and not stray and not valuey,
+        'the un-sharded total is PRINTED, NEVER ENFORCED — the printing job exits 0 on every path, and the only job allowed to depend on it is the one that grades whether the figure was PRODUCED, which may not mention a budget (an enforced sum is 331 > 300 on day one and the split would fix nothing)',
+        'gating exits: %s; dependents that are not the presence check: %s; dependents that compare it to a budget: %s'
+        % (gated or 'none', stray or 'none', valuey or 'none'))
+
+# 97 — AND IT MUST NOT BE SWITCHABLE OFF. Found by quinn grading this row's own PR: a
+# one-line `if: false` on the total-printing job SURVIVES arms 95 and 96 at 140/0. 95 grades
+# the job's EXISTENCE and 96 grades that it does not gate — the job is still in the `jobs`
+# map, still carries the step, still matches every pattern, and never runs again. And because
+# the total deliberately gates nothing (arm 96 is the reason), nothing else reds either: the
+# instrument that keeps the corpus legible is turned off in one line with every check green.
+#
+# 96 says the total must not GATE. This says it must not be GATEABLE. They are not the same
+# claim, and the first one being green is what made the second one invisible.
+#
+# THE GENERAL SHAPE, because it is the second wrong-object guard measured on 2026-08-12 (the
+# other read a log's mtime, which shows a cron FIRED rather than that its work SUCCEEDED):
+# an arm asserts a property OF AN OBJECT, and a parsed workflow offers two objects that read
+# alike — the job as WRITTEN and the job as RUN. Name which one the property lives on. Here
+# it is liveness, so `if:` is part of the assertion and not decoration.
+#
+#   community/wiki/a-presence-arm-cannot-see-a-job-disabled-with-if-false.md
+#
+# No `if:` at all, or exactly `always()`. Anything else — `false`, a `github.event_name`
+# test, `success()` — reds, because a total that is conditional is a total that can be absent
+# without anything saying so. `always()` is required rather than merely allowed for the same
+# reason it is required on the aggregators (arm 93): the runs worth summarising most are the
+# ones that went over, and those are the runs where a shard failed.
+if len(summ) == 1:
+    jn = summ[0]
+    # 97a — the WEAK half, labelled weak so nobody mistakes it for the check. A parsed `if:`
+    # sees one of the five causes of an absent figure. Kept because it is free and it fails at
+    # review time, NOT because it grades production.
+    cond = jobs[jn].get('if')
+    cond_s = '' if cond is None else str(cond).strip()
+    chk(cond_s in ('', 'always()'),
+        'DECLARED liveness only (weak, and not the check): the printing job carries no `if:` or exactly always() — this sees `if: false` and nothing else, so 97b below is the arm that matters',
+        'if=%r on job %s' % (cond, jn))
+
+    # 97b — THE ARM THAT MATTERS: something grades the figure that was EMITTED. Four
+    # properties, because each one alone is satisfiable by a job that grades nothing:
+    #   exists      a job reads the machine-readable line out of the run's own output
+    #   can fail    it exits non-zero on an absence (a reader that cannot red is a print)
+    #   no value    it does not compare the figure to a budget (that is arm 96's clause,
+    #               asserted from the other side)
+    #   is required every required-name aggregator lists it, or it is a job that can sit
+    #               red for a week with the merge gate green
+    graders = [o for o, j in jobs.items()
+               if jn in needs_of(j) and 'unsharded_total_s' in code_of(j)]
+    problems = []
+    if not graders:
+        problems.append('no job reads unsharded_total_s out of the emitted output')
+    for g in graders:
+        c = code_of(jobs[g])
+        # NOT a search for "return 1 appears somewhere". Measured: removing the job's
+        # propagation (`|| rc=1` -> `|| true`, `exit "$rc"` -> `exit 0`) left the `return 1`s
+        # inside its helper untouched, so a permissive search stayed GREEN on a job that can
+        # no longer fail — output saying failure over a status saying success. The status is
+        # what CI reads, so grade the LAST exit: it must propagate a variable or be non-zero.
+        exits = re.findall(r'^\s*exit\s+(\S+)', c, re.M)
+        if not exits or exits[-1] in ('0',):
+            problems.append('%s ends with `exit %s` — it cannot fail whatever it prints'
+                            % (g, exits[-1] if exits else '(none)'))
+        # And it must PROVE it can fail, on every run, in both directions. A structural arm
+        # in this file cannot know whether the CI job still reds on a broken production —
+        # only the job's own positive control can, so the arm asserts the control EXISTS and
+        # the job refuses to report a green without it (DIVE-3317's keeper).
+        if 'SELFTEST FAIL' not in c or c.count('SELFTEST FAIL') < 3:
+            problems.append('%s carries no positive control with all three arms (absent -> red, empty -> red, real -> green)' % g)
+        if not re.search(r'if\s+!\s+selftest', c):
+            problems.append('%s does not refuse to report a green when its own control fails' % g)
+    REQUIRED_AGG = ['test', 'test-installed-host']
+    for agg in REQUIRED_AGG:
+        n = needs_of(jobs.get(agg) or {})
+        if not any(g in n for g in graders):
+            problems.append('required check %s does not require the figure to have been produced' % agg)
+    chk(not problems,
+        'the EMITTED figure is graded: a job reads the un-sharded total out of the run output, can fail on its absence, never compares it to a budget, and both required checks require it (an if:-only arm survives a broken glob, a renamed step, an early return and a dropped upload — measured)',
+        ' | '.join(problems))
+
+# 98 — THE SHARD COUNT IS A PINNED NUMBER, NOT A SENTENCE. Found by codex grading this
+# row's own PR: changing BOTH core matrices from [1, 2] to [1, 2, 3] passes 142/0. Every
+# arm above stays green because every one of them is about the shape of the split and not
+# its SIZE — 94 asks that a divisor be taken from the matrix length and is happier the
+# longer the matrix gets, 95/96/97 are about the total being printed and ungated, and 92/93
+# key on aggregator names that were deliberately built to survive a shard-count change
+# (`the contract with the merge gate is the aggregator's name, not the corpus's shape`).
+# So the one property nothing held was N.
+#
+# This job's own header says a third shard `is exactly as visible, and exactly as much a
+# policy decision, as raising the number would have been`. Measured, it was neither: the
+# mutation adds a full extra independently-capped job per environment — the same capacity a
+# forbidden TIER_BUDGET_CORE raise would buy — and arrives silently, on green.
+#
+# THAT IS THIS ROW'S OWN DEFECT ONE LEVEL OUT, and main's lead review predicted it in
+# advance (residual 4): `an assertion in a comment is not a control`. The row shipped an
+# honesty instrument, then a guard for the instrument (97), and the guard for the SIZE was
+# left as prose. Written down because the class keeps recurring, not because the fix is
+# clever: a rule that names itself a policy decision must be enforced by something that
+# reds, or the next reader satisfies it by editing one character.
+#
+#   community/wiki/an-assertion-in-a-comment-is-not-a-control.md
+#
+# WHAT THIS IS NOT. It is not a second budget and it does not touch one: TIER_BUDGET_CORE,
+# the calibration cap and the runner scaling factor are all untouched by this arm and by
+# this commit. It pins N, and N only.
+#
+# THE POLICY MECHANISM the exception rides on is this constant. The number is spelled ONCE
+# here, so raising it is a deliberate edit to a test file, in the diff, next to a message
+# that says what it costs — reviewable in the same way and at the same weight as raising
+# the cap, which is exactly the standing rule main set. A workflow-only change to [1, 2, 3]
+# now reds; a change that means it must come back as a gate and move this line too.
+#
+# FAIL CLOSED, because the interesting evasions are not `3`:
+#   * a computed matrix (`shard: ${{ fromJson(...) }}`) moves N out of this file and out of
+#     review entirely — a non-literal reds rather than being skipped as unparseable
+#   * `matrix: { include: [...] }` with three entries drops the `shard` key, so counting
+#     only jobs that HAVE the key would silently grade nothing — the count of sharded core
+#     corpus jobs is asserted too, at exactly one per environment
+#   * a third capacity job added ALONGSIDE the two (`core-pristine-3`) never touches a
+#     matrix at all, and is caught by that same count
+# `strategy.job-total` stays the runner's divisor throughout: arm 94 requires it and this
+# arm deliberately does not introduce a literal 2 into the workflow to satisfy itself. The
+# matrix stays the single source of N; this file is the single source of what N may BE.
+CORE_SHARDS = 2
+
+def matrix_of(job):
+    s = job.get('strategy')
+    return s.get('matrix') if isinstance(s, dict) else None
+
+core_jobs = [jn for jn, j in jobs.items()
+             if any('run-harnesses.sh' in r and '--tier=core' in r for r in runs(j))]
+# The confirm jobs are core invocations too, but their matrix is `include:` built at run
+# time from the shards that went over (one entry per over-budget shard, possibly none). N
+# is not declared there and must not be pinned there — the corpus jobs are the ones that
+# DECLARE the split, and they are the ones this arm is about.
+declared = {jn: matrix_of(jobs[jn]).get('shard')
+            for jn in core_jobs
+            if isinstance(matrix_of(jobs[jn]), dict) and 'shard' in matrix_of(jobs[jn])}
+
+want = list(range(1, CORE_SHARDS + 1))
+shard_problems = []
+if len(declared) != 2:
+    shard_problems.append(
+        'expected exactly 2 core corpus jobs declaring a literal shard matrix, one per '
+        'environment; found %d (%s) — a core job that does not declare its shards puts N '
+        'somewhere this arm cannot read it'
+        % (len(declared), ', '.join(sorted(declared)) or 'none'))
+for jn in sorted(declared):
+    v = declared[jn]
+    if not isinstance(v, list) or not all(isinstance(x, int) for x in v):
+        shard_problems.append(
+            '%s: shard matrix %r is not a literal list of integers — a computed matrix '
+            'sets the shard count outside this file, where no review sees it' % (jn, v))
+    elif v != want:
+        shard_problems.append(
+            '%s: shard matrix is %r, pinned at %r — each shard is another independently '
+            'capped job, so this is a capacity change of the same weight as raising '
+            'TIER_BUDGET_CORE and must come back as a gate (then move CORE_SHARDS here)'
+            % (jn, v, want))
+chk(not shard_problems,
+    'the core shard count is PINNED at %d per environment and the pin is parsed, not asserted in a comment (a third shard is a declared capacity raise: it must arrive as a policy decision that edits this line, not as one character in the workflow)' % CORE_SHARDS,
+    ' | '.join(shard_problems))
+PY
+  )
+else bad "unit-tests.yml is readable from the harness (DIVE-3315 arms)" "no file at $_wf3315"; fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

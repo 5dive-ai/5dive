@@ -501,6 +501,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- DIVE-2403 ate 07-31..08-04. Both recovered cleanly downstream, which is exactly
   -- what kept the fault quiet.
   recurring_stall_pinged_at TEXT,
+  -- DIVE-3483: stranded_pinged_at throttles arm (a6) — the stranded-on-a-BUSY-seat
+  -- surface — to one ping per row (same shipped_flag_at pattern as the two above).
+  -- Its own column on purpose. Reusing handoff_stale_pinged_at would have shipped
+  -- this arm mostly dead, exactly as DIVE-2207 found when it was tempted to reuse
+  -- the same one: rows that already burned that stamp on a delivery would be
+  -- permanently silent here, and those are ordinary rows that can strand later.
+  -- Never cleared. A row is announced once in its life; the announcement says
+  -- "this is a lane problem", and repeating it at the same seat is precisely the
+  -- non-remedy the arm exists to point out.
+  stranded_pinged_at TEXT,
   -- DIVE-2853: recurring_stall_escalated_at throttles the SECOND rung — the one
   -- that changes hands — to once per instance. The first rung's notice goes to the
   -- row's assignee, i.e. to the party whose non-pickup IS the fault, so repeating it
@@ -1388,6 +1398,7 @@ _TASKS_ADDITIVE_COLUMNS=(
   'iteration INTEGER' 'maker_agent TEXT' 'handoff_ack_at TEXT' 'task_budget TEXT'
   'handoff_delivered_at TEXT' 'handoff_stale_pinged_at TEXT' 'handoff_rejected_at TEXT'
   'recurring_stall_pinged_at TEXT' 'recurring_stall_escalated_at TEXT'
+  'stranded_pinged_at TEXT'
   'gate_answered_nudged_at TEXT'
   'nudge_escalated_at TEXT' 'nudge_escalated_n INTEGER' 'nudge_parked_at TEXT'
   'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT'

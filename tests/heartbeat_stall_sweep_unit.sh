@@ -117,8 +117,8 @@ db "UPDATE tasks SET handoff_delivered_at=datetime('now','-${_HB_VERIFY_STALE_MI
 _hb_stall_sweep >/dev/null 2>&1
 grep -q $'^olivia\t.*delivered to you' "$SEND_LOG" \
   && ok_t "stale delivery pings the verifier" || bad_t "verifier not pinged" "$(cat "$SEND_LOG")"
-grep -q $'^main\t.*Delivered-awaiting-verifier' "$SEND_LOG" \
-  && ok_t "stale delivery also pings main (never invisible)" || bad_t "main not pinged" "$(cat "$SEND_LOG")"
+grep -q $'^ops\t.*Delivered-awaiting-verifier' "$SEND_LOG" \
+  && ok_t "stale delivery also pings ops (never invisible)" || bad_t "ops not pinged" "$(cat "$SEND_LOG")"
 [[ "$(db "SELECT COALESCE(handoff_stale_pinged_at,'NULL') FROM tasks WHERE id=${a};")" != "NULL" ]] \
   && ok_t "stale-ping flag stamped" || bad_t "flag not stamped" ""
 
@@ -168,8 +168,8 @@ _hb_stall_sweep >/dev/null 2>&1
 grep -q $'^olivia\t.*gate that was blocking it was ANSWERED' "$SEND_LOG" \
   && ok_t "A5 answered-gate delivery nudges the verifier (ack stamped, old throttle burned)" \
   || bad_t "A5 answered-gate delivery not surfaced" "$(cat "$SEND_LOG")"
-grep -q $'^main\t.*Answered-gate delivery' "$SEND_LOG" \
-  && ok_t "A5 it also reaches main (never invisible)" || bad_t "A5 main not pinged" "$(cat "$SEND_LOG")"
+grep -q $'^ops\t.*Answered-gate delivery' "$SEND_LOG" \
+  && ok_t "A5 it also reaches ops (never invisible)" || bad_t "A5 ops not pinged" "$(cat "$SEND_LOG")"
 
 # --- A6: the MESSAGE must not be gap#2's. "still unacknowledged" is false here —
 #     the verifier did act, and DIVE-2196 is the row that proves a false nudge costs
@@ -253,13 +253,13 @@ _hb_stall_sweep >/dev/null 2>&1
   && ok_t "no alarm yet — condition hasn't persisted _HB_STALL_MIN_MINUTES" \
   || bad_t "alarmed too early" "$(cat "$SEND_LOG")"
 
-# --- B3: backdate the persistence clock past the threshold -> alarms main
+# --- B3: backdate the persistence clock past the threshold -> alarms ops
 db "UPDATE task_prefs SET value=datetime('now','-${_HB_STALL_MIN_MINUTES} minutes','-1 minutes')
     WHERE key='stall_first_seen_at';"
 : >"$SEND_LOG"
 _hb_stall_sweep >/dev/null 2>&1
-grep -q $'^main\t.*fleet-stall' "$SEND_LOG" \
-  && ok_t "persisted stall (past _HB_STALL_MIN_MINUTES) alarms main" \
+grep -q $'^ops\t.*fleet-stall' "$SEND_LOG" \
+  && ok_t "persisted stall (past _HB_STALL_MIN_MINUTES) alarms ops" \
   || bad_t "no stall alarm" "$(cat "$SEND_LOG")"
 [[ -n "$(db "SELECT value FROM task_prefs WHERE key='stall_alerted_at';")" ]] \
   && ok_t "stall alert throttle key stamped" || bad_t "throttle key missing" ""
@@ -289,7 +289,7 @@ _hb_stall_sweep >/dev/null 2>&1
 
 # --- B7 GUARDRAIL: a PINGED tier-2 gate genuinely awaiting the human (e.g.
 #     overnight) is PARKED, not stranded — must NOT start the stall clock, or
-#     an idle night re-alarms main every _HB_STALL_MIN_MINUTES for no reason
+#     an idle night re-alarms ops every _HB_STALL_MIN_MINUTES for no reason
 #     (the alert-fatigue class this design already killed once).
 reset_all
 g=$(addt --assignee=dev -- "human's court")
@@ -346,7 +346,7 @@ db "UPDATE task_prefs SET value=datetime('now','-${_HB_STALL_MIN_MINUTES} minute
     WHERE key='stall_first_seen_at';"
 : >"$SEND_LOG"
 _hb_stall_sweep >/dev/null 2>&1
-_alert=$(grep $'^main\t' "$SEND_LOG" | grep 'fleet-stall' | head -1)
+_alert=$(grep $'^ops\t' "$SEND_LOG" | grep 'fleet-stall' | head -1)
 
 [[ -n "$_alert" ]] \
   && ok_t "B10 the stall alert fired (fixture is live, the label arms below are not vacuous)" \
@@ -383,7 +383,7 @@ _hb_stall_sweep >/dev/null 2>&1
   && ok_t "no eligible gates -> canary never trips" || bad_t "canary tripped with nothing eligible" ""
 
 # --- C2: an eligible (stale, unpinged) T2 gate exists + gate_pinged_at has never
-#     advanced fleet-wide -> canary trips, alarms main
+#     advanced fleet-wide -> canary trips, alarms ops
 reset_all
 g=$(addt --assignee=dev -- "stale gate")
 db "UPDATE tasks SET status='blocked', need_type='approval', tier=2,
@@ -391,7 +391,7 @@ db "UPDATE tasks SET status='blocked', need_type='approval', tier=2,
      WHERE id=${g};"
 : >"$SEND_LOG"
 _hb_stall_sweep >/dev/null 2>&1
-grep -q $'^main\t.*pinger-liveness canary tripped' "$SEND_LOG" \
+grep -q $'^ops\t.*pinger-liveness canary tripped' "$SEND_LOG" \
   && ok_t "eligible gate + no fleet-wide gate_pinged_at advance -> canary trips" \
   || bad_t "canary did not trip" "$(cat "$SEND_LOG")"
 [[ -n "$(db "SELECT value FROM task_prefs WHERE key='pinger_canary_alerted_at';")" ]] \
@@ -498,6 +498,148 @@ _hb_stall_sweep >/dev/null 2>&1
 [[ "$(db "SELECT status||'/'||assignee FROM tasks WHERE id=${d};")" == "todo/olivia" ]] \
   && ok_t "D6 ...and that row really is the todo/verifier shape the alarm used to miscount" \
   || bad_t "D6 fixture shape" "got $(db "SELECT status||'/'||assignee FROM tasks WHERE id=${d};")"
+
+
+# =============================================================================
+# (e) DIVE-3483 — A ROW STRANDED ON A **BUSY** SEAT.
+#
+# The arm exists because both pre-existing rails take IDLENESS as a precondition
+# (the supervisor needs the SEAT idle, (b) needs the whole FLEET idle), so the one
+# shape neither can see is a live seat holding a row it never chooses. Every arm
+# below therefore keeps a seat ACTIVE — an in_progress row for the same assignee —
+# because a fixture with an idle seat would pass against the old code too and
+# grade nothing.
+# =============================================================================
+strandmsg() { grep -c $'^ops\t.*Stranded' "$SEND_LOG"; }
+
+# --- E1: todo, past the window, on a seat that is demonstrably ACTIVE -> surfaced
+reset_all
+e=$(addt --assignee=dev -- "stranded row")
+ebusy=$(addt --assignee=dev -- "what dev is actually doing")
+db "UPDATE tasks SET status='in_progress' WHERE id=${ebusy};"
+db "UPDATE tasks SET created_at=datetime('now','-${_HB_STRANDED_HOURS} hours','-1 hour') WHERE id=${e};"
+: >"$SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+[[ "$(strandmsg)" -ge 1 ]] \
+  && ok_t "E1 a row stranded past the window on an ACTIVE seat is surfaced (the shape both old rails miss)" \
+  || bad_t "E1 stranded row not surfaced" "$(cat "$SEND_LOG")"
+[[ "$(db "SELECT COALESCE(stranded_pinged_at,'NULL') FROM tasks WHERE id=${e};")" != "NULL" ]] \
+  && ok_t "E1 ...and the per-row stamp is set" || bad_t "E1 stamp not set" ""
+
+# --- E2: it NAMES THE LANE — the active row and the seat's other load. Without
+#     this the reader has to re-investigate, which is the cost the row was filed over.
+grep -q $'^ops\t.*Stranded.*ACTIVE on' "$SEND_LOG" \
+  && ok_t "E2 the alert names what the seat is actively doing" \
+  || bad_t "E2 lane not named" "$(grep $'^ops\t.*Stranded' "$SEND_LOG" | head -1)"
+grep -q $'^ops\t.*LANE problem' "$SEND_LOG" \
+  && ok_t "E2 ...and says it is a lane problem, not a priority problem" \
+  || bad_t "E2 remedy not named" ""
+
+# --- E3: THROTTLE. This is the whole design — naive surfacing emits thousands of
+#     pings, gets muted, and recreates the silent-monitoring defect of DIVE-3460.
+: >"$SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+[[ "$(strandmsg)" == "0" ]] \
+  && ok_t "E3 THROTTLE: a second sweep does not re-ping the same row (once per row, not once per sweep)" \
+  || bad_t "E3 re-pinged" "$(cat "$SEND_LOG")"
+
+# --- E4: under the window -> silent. Proves the arm can produce a NEGATIVE at all,
+#     so E1 is evidence of a working predicate rather than an unconditional send.
+reset_all
+f=$(addt --assignee=dev -- "young row")
+fbusy=$(addt --assignee=dev -- "seat is busy")
+db "UPDATE tasks SET status='in_progress' WHERE id=${fbusy};"
+db "UPDATE tasks SET created_at=datetime('now','-1 hour') WHERE id=${f};"
+: >"$SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+[[ "$(strandmsg)" == "0" ]] \
+  && ok_t "E4 a row inside the window is NOT surfaced (the instrument can return a negative)" \
+  || bad_t "E4 young row surfaced" "$(cat "$SEND_LOG")"
+
+# --- E5: a RECURRING instance is (a2)'s row, not this arm's. Two rails announcing
+#     one row is how a monitor earns its mute.
+reset_all
+g=$(addt --assignee=dev -- "recurring instance")
+gbusy=$(addt --assignee=dev -- "seat is busy")
+db "UPDATE tasks SET status='in_progress' WHERE id=${gbusy};"
+db "UPDATE tasks SET created_at=datetime('now','-${_HB_STRANDED_HOURS} hours','-1 hour'),
+                     from_template_id=${gbusy} WHERE id=${g};"
+: >"$SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+[[ "$(strandmsg)" == "0" ]] \
+  && ok_t "E5 a recurring instance is left to the (a2) rail, not double-announced here" \
+  || bad_t "E5 recurring instance double-announced" "$(cat "$SEND_LOG")"
+
+# --- E6: a delivery awaiting its verifier is gap#2's row, not this arm's.
+reset_all
+h=$(addt --assignee=dev --verifier=olivia -- "delivered, awaiting grade")
+( cmd_task_done "$h" --result="closed in fixture setup" ) >/dev/null 2>&1
+db "UPDATE tasks SET created_at=datetime('now','-${_HB_STRANDED_HOURS} hours','-1 hour'),
+                     handoff_stale_pinged_at=datetime('now') WHERE id=${h};"
+: >"$SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+[[ "$(strandmsg)" == "0" ]] \
+  && ok_t "E6 a maker->verifier delivery is left to gap#2, not double-announced here" \
+  || bad_t "E6 delivery double-announced" "$(cat "$SEND_LOG")"
+
+# --- E7: waiting on a HUMAN is not stranded — the remedy is not the seat's, and
+#     nagging the seat about it is the DIVE-2196 harm.
+reset_all
+i=$(addt --assignee=dev -- "blocked on a human gate")
+ibusy=$(addt --assignee=dev -- "seat is busy")
+db "UPDATE tasks SET status='in_progress' WHERE id=${ibusy};"
+db "UPDATE tasks SET created_at=datetime('now','-${_HB_STRANDED_HOURS} hours','-1 hour'),
+                     need_type='approval', need_answered_at=NULL WHERE id=${i};"
+: >"$SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+[[ "$(strandmsg)" == "0" ]] \
+  && ok_t "E7 a row with an unanswered human gate is NOT surfaced as stranded" \
+  || bad_t "E7 gated row surfaced" "$(cat "$SEND_LOG")"
+
+# --- E8: a PARKED row is a deliberate quiet wait, not a stall.
+reset_all
+j=$(addt --assignee=dev -- "parked on purpose")
+jbusy=$(addt --assignee=dev -- "seat is busy")
+db "UPDATE tasks SET status='in_progress' WHERE id=${jbusy};"
+db "UPDATE tasks SET created_at=datetime('now','-${_HB_STRANDED_HOURS} hours','-1 hour'),
+                     parked_at=datetime('now') WHERE id=${j};"
+: >"$SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+[[ "$(strandmsg)" == "0" ]] \
+  && ok_t "E8 a parked row is a deliberate wait, not a stall" \
+  || bad_t "E8 parked row surfaced" "$(cat "$SEND_LOG")"
+
+# --- E9: THE REGRESSION THIS ARM WAS FILED FOR, end to end. A row DROPPED after
+#     one start (first_started_at set, started_at NULL) on a seat that is alive and
+#     working elsewhere. That is DIVE-3330's exact shape: it sat 3 days while every
+#     rail read healthy. Measured from the DROP, not from creation.
+reset_all
+k=$(addt --assignee=codex -- "started once, dropped, never resumed")
+kbusy=$(addt --assignee=codex -- "codex is alive and doing other work")
+db "UPDATE tasks SET status='in_progress' WHERE id=${kbusy};"
+db "UPDATE tasks SET created_at=datetime('now','-9 days'),
+                     first_started_at=datetime('now','-${_HB_STRANDED_HOURS} hours','-1 hour'),
+                     started_at=NULL WHERE id=${k};"
+: >"$SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+[[ "$(strandmsg)" -ge 1 ]] \
+  && ok_t "E9 REGRESSION (DIVE-3330 shape): a dropped row on a live, busy seat is surfaced" \
+  || bad_t "E9 dropped row not surfaced" "$(cat "$SEND_LOG")"
+
+# --- E10: and the drop clock is the one that governs — a row dropped RECENTLY is
+#     silent even though it was CREATED long ago. Without this, E9 would also pass
+#     on a naive created_at-only predicate.
+reset_all
+l=$(addt --assignee=codex -- "old row, restarted recently")
+lbusy=$(addt --assignee=codex -- "codex is busy")
+db "UPDATE tasks SET status='in_progress' WHERE id=${lbusy};"
+db "UPDATE tasks SET created_at=datetime('now','-9 days'),
+                     first_started_at=datetime('now','-1 hour'), started_at=NULL WHERE id=${l};"
+: >"$SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+[[ "$(strandmsg)" == "0" ]] \
+  && ok_t "E10 the DROP clock governs, not created_at (a 9-day-old row touched an hour ago is silent)" \
+  || bad_t "E10 stale created_at drove the alert" "$(cat "$SEND_LOG")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

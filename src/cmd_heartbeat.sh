@@ -155,6 +155,12 @@ _HB_VERIFY_STALE_MIN="${HEARTBEAT_VERIFY_STALE_MIN:-60}"
 # outlived its own cadence and started suppressing the NEXT slot.
 _HB_RECURRING_STALL_HOURS="${HEARTBEAT_RECURRING_STALL_HOURS:-24}"
 [[ "$_HB_RECURRING_STALL_HOURS" =~ ^[0-9]+$ ]] || _HB_RECURRING_STALL_HOURS=24
+# DIVE-3483: how long a NON-recurring row may sit todo on a seat before arm (a6)
+# says so once. 24h is deliberately generous — a row untouched for a full day on a
+# live seat is not "busy today", and the two rows that forced this arm had sat 3
+# and 4 days. Tighten it and the arm starts announcing rows that are merely queued.
+_HB_STRANDED_HOURS="${HEARTBEAT_STRANDED_HOURS:-24}"
+[[ "$_HB_STRANDED_HOURS" =~ ^[0-9]+$ ]] || _HB_STRANDED_HOURS=24
 # DIVE-2853: how long AFTER that one-shot notice an instance may still sit
 # todo-and-never-started before the ladder CHANGES HANDS. Same default window as
 # the first rung, so a daily beat gets one full extra cadence with its original
@@ -2632,7 +2638,7 @@ _hb_blocked_sweep() {
           --message="▶️ Unblocked: ${dident} — all blockers done, now on your queue." ) >/dev/null 2>&1 || true
     done
     _hb_log "[blocked-sweep] auto-recovered: ${idlist}"
-    ( cmd_send "main" --from="task-engine" \
+    ( cmd_send "ops" --from="task-engine" \
         --message="🔧 Auto-recovered ${#rec[@]} stale-blocked task(s) whose blockers were all done: ${idlist}" ) >/dev/null 2>&1 || true
   fi
 
@@ -2647,7 +2653,7 @@ _hb_blocked_sweep() {
     last=$(db "SELECT value FROM task_prefs WHERE key='blocked_sweep_pinged_at';" 2>/dev/null)
     cutoff=$(date -u -d '24 hours ago' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
     if [[ -z "$last" || ( -n "$cutoff" && "$last" < "$cutoff" ) ]]; then
-      ( cmd_send "main" --from="task-engine" \
+      ( cmd_send "ops" --from="task-engine" \
           --message="⚠️ Blocked with no live reason (no open dependency, no human gate, no park) — likely manually blocked + forgotten. Unblock (5dive task unblock <id>) or cancel if dead: ${orphan}" ) >/dev/null 2>&1 || true
       db "INSERT INTO task_prefs (key,value) VALUES ('blocked_sweep_pinged_at', datetime('now'))
           ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
@@ -2990,7 +2996,7 @@ _hb_stall_sweep() {
     vmins=$(( ($(date -u +%s) - $(date -u -d "$vdelivered" +%s 2>/dev/null || date -u +%s)) / 60 ))
     ( cmd_send "$vfier" --from="task-engine" \
         --message="📥 ${vident} was delivered to you for review ${vmins}m ago and is still unacknowledged — run \`5dive task start ${vident}\` then \`task done\`/\`task reject\` so it doesn't rot in your queue." ) >/dev/null 2>&1 || true
-    ( cmd_send "main" --from="task-engine" \
+    ( cmd_send "ops" --from="task-engine" \
         --message="📥 Delivered-awaiting-verifier: ${vident} handed to '${vfier}' ${vmins}m ago, still unacknowledged — surfaced so it never sits invisible (DIVE-1416 gap#2)." ) >/dev/null 2>&1 || true
     db "UPDATE tasks SET handoff_stale_pinged_at=datetime('now') WHERE id=${vid};"
     _hb_log "[stall-sweep] ${vident} delivered->${vfier} unacked ${vmins}m -> surfaced"
@@ -3062,7 +3068,7 @@ _hb_stall_sweep() {
     rbusy=$(db "SELECT COALESCE(ident,'DIVE-'||id) FROM tasks
                 WHERE kind='standard' AND status='in_progress'
                   AND assignee=$(sqlq "${rasg:-}") ORDER BY id LIMIT 1;" 2>/dev/null || echo "")
-    ( cmd_send "main" --from="task-engine" \
+    ( cmd_send "ops" --from="task-engine" \
         --message="⏳ Recurring beat stalled: ${rident} (from template ${rtmpl}) has sat todo and never-started for ${rhours}h, assignee '${rasg:-unassigned}'${rbusy:+ — who is OCCUPIED on ${rbusy}, so this notice may be undeliverable-in-effect (a goal-fenced assignee cannot take a second row)} — ${rsupp_main}. If it is still unstarted in ${_HB_RECURRING_ESCALATE_HOURS}h the ladder reassigns or cancels it (DIVE-2853)." ) >/dev/null 2>&1 || true
     db "UPDATE tasks SET recurring_stall_pinged_at=datetime('now') WHERE id=${rid};"
     _hb_log "[recurring-stall] ${rident} never-started ${rhours}h (template ${rtmpl}) -> surfaced"
@@ -3163,7 +3169,7 @@ _hb_stall_sweep() {
         ( cmd_send "$easg" --from="task-engine" \
             --message="🔁 ${eident} has been moved OFF you to '${etarget}' — it was never started ${ehours}h after being flagged, and ${esupp}. Nothing for you to do; if you were about to start it, say so to ${etarget} rather than both starting it." ) >/dev/null 2>&1 || true
       fi
-      ( cmd_send "main" --from="task-engine" \
+      ( cmd_send "ops" --from="task-engine" \
           --message="🔁 Recurring-stall ESCALATED: ${eident} (template ${etmpl}) reassigned '${easg:-unassigned}' -> '${etarget}' after ${ehours}h unstarted past its flag — a re-ping to the original assignee cannot clear a goal-fenced one, so the ladder changes hands (DIVE-2853)." ) >/dev/null 2>&1 || true
       ledger_emit "task.recurring_stall_escalated" ident="$eident" task_id="$eid" \
         actor="task-engine" authority="heartbeat" \
@@ -3178,7 +3184,7 @@ _hb_stall_sweep() {
       if [[ -n "$easg" ]]; then
         ( cmd_send "$easg" --from="task-engine" --message="$emsg If you still want this instance, the next materialization is yours to start on time — or reply to say the row should not be assigned to you." ) >/dev/null 2>&1 || true
       fi
-      ( cmd_send "main" --from="task-engine" --message="$emsg No free agent existed at escalation time, so reassignment had nowhere to go (DIVE-2853)." ) >/dev/null 2>&1 || true
+      ( cmd_send "ops" --from="task-engine" --message="$emsg No free agent existed at escalation time, so reassignment had nowhere to go (DIVE-2853)." ) >/dev/null 2>&1 || true
       ledger_emit "task.recurring_stall_escalated" ident="$eident" task_id="$eid" \
         actor="task-engine" authority="heartbeat" \
         detail="auto-cancelled after ${ehours}h never-started, no free agent (template ${etmpl})" || true
@@ -3251,7 +3257,7 @@ _hb_stall_sweep() {
     gmins=$(( ($(date -u +%s) - $(date -u -d "$ganswered" +%s 2>/dev/null || date -u +%s)) / 60 ))
     ( cmd_send "$gfier" --from="task-engine" \
         --message="✅ ${gident}: the human gate that was blocking it was ANSWERED ${gmins}m ago, so grading is genuinely yours again — nothing is waiting on a person. Pick it back up: \`5dive task start ${gident}\` then \`task done\`/\`task reject\` (DIVE-2207)." ) >/dev/null 2>&1 || true
-    ( cmd_send "main" --from="task-engine" \
+    ( cmd_send "ops" --from="task-engine" \
         --message="✅ Answered-gate delivery: ${gident} is back on verifier '${gfier}' — its gate was answered ${gmins}m ago and the row had left gap#2's view, so it is surfaced here rather than sitting invisible (DIVE-2207)." ) >/dev/null 2>&1 || true
     db "UPDATE tasks SET gate_answered_nudged_at=datetime('now') WHERE id=${gid};"
     _hb_log "[stall-sweep] ${gident} gate answered ${gmins}m ago, back on ${gfier} -> surfaced"
@@ -3280,6 +3286,77 @@ _hb_stall_sweep() {
                  AND gate_answered_nudged_at IS NULL
                  AND parked_at IS NULL
                  AND need_answered_at <= datetime('now','-${_HB_VERIFY_STALE_MIN} minutes');")
+
+  # (a6) DIVE-3483 — A ROW STRANDED ON A **BUSY** SEAT.
+  #
+  # The gap this closes, measured on the live board 2026-08-16: idle-stranded was
+  # detected 4187 times in 7 days across 11 agents and acted on ZERO times, while
+  # (b) below — the only arm that actually sends — has fired ONCE in the board's
+  # history (task_prefs.stall_alerted_at = 2026-08-12). Detection without a
+  # consumer on one side, an alarm that cannot fire on the other.
+  #
+  # WHY NEITHER EXISTING RAIL SEES IT. Both take IDLENESS as a precondition, and
+  # the real shape is a LIVE seat holding a row it never chooses:
+  #   * cmd_supervisor.sh's `stalled` needs THAT SEAT to have no active work, so a
+  #     seat working its own charter classifies healthy and its stranded row is
+  #     invisible; and it is observe-only by design ("recorded, NEVER acted on").
+  #   * (b) needs the WHOLE FLEET idle (in_prog==0 AND running_loops==0). With 132
+  #     open rows that is essentially never true, so a row that is not moving stays
+  #     silent because OTHER agents are busy — which says nothing about this row.
+  # Both live instances were LANE problems, not priority problems: DIVE-3339 (the
+  # only defect between lodar and a two-way buzz conversation) sat 4 days
+  # never-started on a lane at its WIP cap, and DIVE-3330 (a close path that walks
+  # past the merge gate) sat 3 days dropped on a seat that was demonstrably alive.
+  # lodar found both by reading the board; no rail did.
+  #
+  # DELIBERATELY NOT A RECOVERY ACTION. This surfaces and names the lane; it never
+  # reassigns. Hands-changing is the (a3) ladder's job and it is scoped to recurring
+  # instances on purpose — auto-moving arbitrary work is a P2 action and this rail,
+  # like the supervisor, stays observe-and-report.
+  #
+  # THROTTLE IS THE WHOLE DESIGN. Naive surfacing here emits those 4187 pings, gets
+  # muted, and recreates the silent-monitoring defect DIVE-3460 exists to remove. So
+  # it is one ping per ROW (stranded_pinged_at, the shipped_flag_at pattern), never
+  # one per sweep. A row is announced once and then never again.
+  local srow sid sident sasg ssince stmpl sdays sbusy sload
+  while IFS= read -r srow; do
+    [[ -n "$srow" ]] || continue
+    IFS=$'\x1f' read -r sid sident sasg ssince <<<"$srow"
+    [[ -n "$sid" && -n "$sasg" ]] || continue
+    sdays=$(( ($(date -u +%s) - $(date -u -d "$ssince" +%s 2>/dev/null || date -u +%s)) / 86400 ))
+    # NAME THE LANE, so the reader can act in one step instead of re-investigating.
+    # What the seat IS doing is the evidence that it is alive and simply not choosing
+    # this row — the distinction the two blind rails above cannot draw.
+    sbusy=$(db "SELECT COALESCE(ident,'DIVE-'||id) FROM tasks
+                WHERE kind='standard' AND status='in_progress'
+                  AND assignee=$(sqlq "$sasg") ORDER BY id LIMIT 1;" 2>/dev/null || echo "")
+    sload=$(db "SELECT COUNT(*) FROM tasks
+                WHERE kind='standard' AND status='todo'
+                  AND assignee=$(sqlq "$sasg");" 2>/dev/null || echo "")
+    [[ "$sload" =~ ^[0-9]+$ ]] || sload=""
+    ( cmd_send "ops" --from="task-engine" \
+        --message="🧊 Stranded ${sdays}d: ${sident} has sat todo on '${sasg}' for ${sdays} day(s) without being started${sbusy:+, while that seat is ACTIVE on ${sbusy}}${sload:+ and holds ${sload} other todo row(s)} — so this is a LANE problem, not a priority problem, and re-pinging the same seat will not clear it (reassign, or cancel it if it is dead). Surfaced once per row and never again (DIVE-3483)." ) >/dev/null 2>&1 || true
+    db "UPDATE tasks SET stranded_pinged_at=datetime('now') WHERE id=${sid};"
+    _hb_log "[stranded] ${sident} todo ${sdays}d on ${sasg}${sbusy:+ (active on ${sbusy})} -> surfaced"
+  done < <(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id)||x'1f'||COALESCE(assignee,'')||x'1f'||COALESCE(first_started_at,created_at)
+               FROM tasks
+               WHERE kind='standard' AND status='todo' AND assignee IS NOT NULL
+                 AND stranded_pinged_at IS NULL
+                 -- a recurring instance is (a2)'s row, not this one — it has its own
+                 -- suppression story (skip-if-open eats the beat) and its own ladder.
+                 AND from_template_id IS NULL
+                 -- a delivery awaiting its verifier is gap#2's row above. Same
+                 -- reason (a2) is excluded: two rails announcing one row is how a
+                 -- monitor earns its mute.
+                 AND NOT (maker_agent IS NOT NULL AND verifier IS NOT NULL
+                          AND assignee=verifier AND handoff_ack_at IS NULL)
+                 -- waiting on a HUMAN is not stranded; the remedy is not the seat's.
+                 AND NOT (need_type IS NOT NULL AND need_answered_at IS NULL)
+                 AND parked_at IS NULL
+                 -- measured from the DROP for a row started once and abandoned, from
+                 -- creation otherwise. Deliberately not updated_at: any row touch
+                 -- bumps that, so it cannot answer 'how long has this not moved'.
+                 AND COALESCE(first_started_at,created_at) <= datetime('now','-${_HB_STRANDED_HOURS} hours');")
 
   # (b) GAP#3 core — fleet-idle-while-actionable-work-is-open, persisting.
   local in_prog running_loops stranded_todo open_gates parked_gates total_stranded
@@ -3408,7 +3485,7 @@ _hb_stall_sweep() {
             _hdr="❓ possible fleet-stall (UNPROVEN)"
             _tail="The session probe could not measure every agent, so this is a QUESTION, not a finding — is the fleet actually stalled? Check \`5dive task ls\` / \`5dive task inbox\`"
           fi
-          ( cmd_send "main" --from="task-engine" \
+          ( cmd_send "ops" --from="task-engine" \
               --message="${_hdr}: ${total_stranded} stranded actionable item(s) (${stranded_todo} assigned-but-unstarted, ${open_gates} fleet-actionable gate(s)) idle $((since_secs / 60))m+ with 0 in_progress and 0 running loops, ${parked_gates} parked on the human (context, not counted) — and ${_act_detail}. ${_tail} (DIVE-1416 gap#3, session probe DIVE-2122, claim/probe honesty DIVE-2244, labels DIVE-2207)." ) >/dev/null 2>&1 || true
           db "INSERT INTO task_prefs (key,value) VALUES ('stall_alerted_at', datetime('now'))
               ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
@@ -3447,7 +3524,7 @@ _hb_stall_sweep() {
       last_alert=$(db "SELECT value FROM task_prefs WHERE key='pinger_canary_alerted_at';" 2>/dev/null)
       cutoff=$(date -u -d '6 hours ago' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
       if [[ -z "$last_alert" || ( -n "$cutoff" && "$last_alert" < "$cutoff" ) ]]; then
-        ( cmd_send "main" --from="task-engine" \
+        ( cmd_send "ops" --from="task-engine" \
             --message="🚨 pinger-liveness canary tripped: ${eligible} human gate(s) are past their reminder window (72h+ unanswered, unpinged 7d+) but gate_pinged_at hasn't advanced fleet-wide in over an hour — the gate-ping batch looks dead (DIVE-1434 regression class). Check /var/log/5dive-heartbeat.log for batch errors." ) >/dev/null 2>&1 || true
         db "INSERT INTO task_prefs (key,value) VALUES ('pinger_canary_alerted_at', datetime('now'))
             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"

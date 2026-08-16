@@ -307,8 +307,8 @@ HELP
         case "$key" in
           q|Q) quit=1; break ;;
           r|R) break ;;
-          j|J) (( count > 0 && selected < count - 1 )) && ((selected++)) ;;
-          k|K) (( selected > 0 ))                      && ((selected--)) ;;
+          j|J) (( count > 0 && selected < count - 1 )) && selected=$(( selected + 1 )) ;;
+          k|K) (( selected > 0 ))                      && selected=$(( selected - 1 )) ;;
           $'\x1b')
             # Arrow keys: ESC [ A (up) / B (down). Short timeouts so a bare
             # ESC press doesn't hang.
@@ -317,8 +317,8 @@ HELP
             read -rsn1 -t 0.05 rest2 || true
             if [[ "$rest1" == "[" ]]; then
               case "$rest2" in
-                A) (( selected > 0 ))                      && ((selected--)) ;;
-                B) (( count > 0 && selected < count - 1 )) && ((selected++)) ;;
+                A) (( selected > 0 ))                      && selected=$(( selected - 1 )) ;;
+                B) (( count > 0 && selected < count - 1 )) && selected=$(( selected + 1 )) ;;
               esac
             fi ;;
           ""|$'\n'|$'\r')

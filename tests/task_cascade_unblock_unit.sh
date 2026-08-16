@@ -131,8 +131,8 @@ _hb_blocked_sweep
 [[ "$(st "$b")" == "todo" && "$(edges "$b")" == "0" ]] \
   && ok_t "sweep auto-recovers blocked-whose-blockers-all-done -> todo" \
   || bad_t "sweep recover" "B status=$(st "$b") edges=$(edges "$b")"
-grep -q $'^main\t' "$SEND_LOG" \
-  && ok_t "sweep recovery pings main" || bad_t "recover ping" "no main ping"
+grep -q $'^ops\t' "$SEND_LOG" \
+  && ok_t "sweep recovery pings ops" || bad_t "recover ping" "no ops ping"
 
 # --- T7 (b) SURFACE (never auto-unblock): blocked, no edge, no gate, no park
 o=$(addt --assignee=frank -- "orphan blocked")
