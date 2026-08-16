@@ -309,10 +309,29 @@ _task_wip_cap() {
 # _task_lanes_with_headroom <exclude> — lanes strictly under their cap, for the
 # redirect. Naming them is the whole point: "this lane is full" is a dead end,
 # "this lane is full, dev2 and quinn have room" is a next action.
+#
+# DIVE-3366 — AND EVERY NAME IT OFFERS MUST BE DISPATCHABLE. This enumerates
+# DISTINCT assignee over the whole tasks table, so any name anybody ever typed
+# into that column becomes a suggestion the moment a cap exists for it. Measured
+# 2026-08-13 while filing DIVE-3366: a refused `--assignee=dev2` offered ELEVEN
+# lanes that are not registered agents — `__nosuchagent_probe__`, `cli`,
+# `designer`, `distributor`, `editor`, `lodar`, `loop`, `proof`, `seo`,
+# `tgfreeprobe`, `writer` — each reading "(1 free)" because `wip-cap-install`
+# minted a ceiling for a name somebody once typed. This is the third live
+# instance of the class DIVE-3344 fixed at `--assignee`, and it is the worst of
+# the three: not a silent drop, but an active recommendation of an undispatchable
+# lane, delivered at the exact moment the filer is looking for somewhere to put
+# work — so the filer follows it, and the row is never picked.
+#
+# Roster-state-gated, not roster-emptiness-gated (`_task_require_lane`'s rule): a
+# roster we could not establish must narrow nothing, or a box with an unreadable
+# registry answers "no lanes have room" and the redirect becomes a dead end.
 _task_lanes_with_headroom() {
   local skip="$1" lane cap act out=""
+  _task_roster
   while IFS= read -r lane; do
     [[ -n "$lane" && "$lane" != "$skip" ]] || continue
+    if [[ "$_TASK_ROSTER_STATE" == "ok" ]] && ! _task_roster_has "$lane"; then continue; fi
     cap=$(_task_wip_cap "$lane") || continue
     act=$(_task_lane_actionable "$lane")
     [[ "$act" =~ ^[0-9]+$ ]] || continue
@@ -649,6 +668,152 @@ _gate_route_reviewer() {
   done
 }
 
+# ---- DIVE-3342: which PERSON does a gate belong to? ----
+#
+# Everything above this line resolves an AGENT. That is what "routing" has meant
+# since DIVE-1495, and it is only half of a gate's delivery: the other half —
+# whose phone rings when the agent rail expires, or when the gate is human-only
+# by tier — was never routed at all. It was read off `last-human-chat.json`,
+# i.e. whoever most recently DM'd that bot, with a fan-out to the whole
+# allowFrom when no pointer resolved. See src/cmd_human.sh for the measured harm
+# and why zero human rows must keep the old behaviour exactly.
+#
+# _human_registry_active — is the human registry IN USE on this store? Presence,
+# not a flag: a box with no `humans` rows is a box that has not adopted this, and
+# gate delivery there must be byte-identical to its pre-DIVE-3342 self. Returns 1
+# when the table is absent too (an old store mid-migration), because "cannot see
+# the registry" and "registry is empty" both mean "do not change behaviour" — the
+# opposite of the absent-vs-forbidden conflation _task_agent_paired warns about,
+# and safe in this direction precisely because the fallback is the status quo.
+_human_registry_active() {
+  local n
+  n=$(db "SELECT COUNT(*) FROM humans;" 2>/dev/null) || return 1
+  [[ "${n:-0}" =~ ^[0-9]+$ ]] && (( n > 0 ))
+}
+
+# _human_owner_of_agent <agent> — the person who owns that agent's gates. Walks
+# the explicit human_agents link, then UP the org chart, one level at a time.
+#
+# It does NOT fall back to the coordinator/org root the way _gate_route_reviewer
+# does, and that omission is deliberate. The root fallback is what makes
+# _gate_route_reviewer return the filer itself at the top of the chart
+# (community/wiki/the-org-root-cannot-resolve-a-reviewer-because-it-is-its-own-fallback.md);
+# reused here it would mean "no owner is linked anywhere" silently resolving to
+# whichever person happens to be linked to the root — a confident wrong recipient,
+# which is the exact failure being fixed. Empty is a legitimate answer here and
+# the callers are built to handle it.
+_human_owner_of_agent() {
+  local cur="${1:-}" hit="" seen="" depth=0
+  while [[ -n "$cur" ]] && (( depth < 8 )); do
+    case ",$seen," in *",$cur,"*) return ;; esac   # cycle guard: the chart is agent-writable
+    seen="${seen:+$seen,}$cur"
+    hit=$(db "SELECT ha.human_id FROM human_agents ha JOIN humans h ON h.id=ha.human_id
+              WHERE ha.agent=$(sqlq "$cur") ORDER BY ha.human_id LIMIT 1;" 2>/dev/null)
+    if [[ -n "$hit" ]]; then printf '%s' "$hit"; return; fi
+    cur=$(db "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$cur") LIMIT 1;" 2>/dev/null)
+    depth=$(( depth + 1 ))
+  done
+}
+
+# _human_gate_recipient <numeric task id> — the person this gate belongs to, i.e.
+# the human who may CLEAR it. Ordered candidates, first hit wins; every one of
+# them is a CLEARANCE relationship, never a traffic observation:
+#
+#   1. tasks.human_owner        — stamped at file time (or declared with
+#                                 `task need --owner=`). The gate's own record of
+#                                 whose it is; re-resolving past it would let the
+#                                 chart move a live gate to someone else.
+#   2. owner-of(routed_reviewer) — the agent rail's owner. When a tier-1 gate's
+#                                 24h rail expires, the person above THAT rail is
+#                                 who inherits it.
+#   3. owner-of(gate_filed_by)   — the filer's owner (gate_filed_by, not
+#                                 created_by: a task and the gates on it have
+#                                 different principals — DIVE-3171).
+#   4. owner-of(assignee)/owner-of(created_by) — last structural resorts.
+#   5. the SOLE human on record  — a one-person registry has exactly one possible
+#                                 clearer, so requiring a link there would be
+#                                 ceremony. With two or more rows this arm is off:
+#                                 that is the ambiguity the ticket is about, and
+#                                 guessing is what we are removing.
+#
+# Sets HUMAN_RECIPIENT_ID and HUMAN_RECIPIENT_BASIS — the answer and the arm that
+# produced it — so both `5dive human recipient` and the delivery log can say WHY,
+# rather than leaving a silent empty the way _gate_route_reviewer does. The id is
+# ALSO printed for convenience, but callers that need the basis must call this
+# WITHOUT a command substitution: `$( )` is a subshell, so a var it assigns dies
+# with it and the basis would read empty exactly where the explanation matters.
+_human_gate_recipient() {
+  local numid="${1:-}" row who=""
+  HUMAN_RECIPIENT_BASIS="no candidate"; HUMAN_RECIPIENT_ID=""
+  [[ "$numid" =~ ^[0-9]+$ ]] || { HUMAN_RECIPIENT_BASIS="not a task row"; return; }
+  row=$(db "SELECT COALESCE(human_owner,'')||x'1f'||COALESCE(routed_reviewer,'')||x'1f'||COALESCE(gate_filed_by,'')||x'1f'||COALESCE(assignee,'')||x'1f'||COALESCE(created_by,'')
+            FROM tasks WHERE id=${numid};" 2>/dev/null)
+  [[ -n "$row" ]] || { HUMAN_RECIPIENT_BASIS="no such row"; return; }
+  local stamped reviewer filer assignee creator
+  IFS=$'\x1f' read -r stamped reviewer filer assignee creator <<<"$row"
+
+  if [[ -n "$stamped" ]]; then
+    # Only a LIVE row counts. A stamp naming a deleted account must re-resolve,
+    # not resolve to a person who is no longer on the box.
+    who=$(db "SELECT id FROM humans WHERE id=$(sqlq "$stamped") LIMIT 1;" 2>/dev/null)
+    if [[ -n "$who" ]]; then HUMAN_RECIPIENT_BASIS="gate owner (stamped)"; HUMAN_RECIPIENT_ID="$who"; printf '%s' "$who"; return; fi
+  fi
+  local pair
+  for pair in "routed reviewer ${reviewer}" "gate filer ${filer}" "assignee ${assignee}" "creator ${creator}"; do
+    local label="${pair% *}" agent="${pair##* }"
+    [[ -n "$agent" ]] || continue
+    who=$(_human_owner_of_agent "$agent")
+    if [[ -n "$who" ]]; then HUMAN_RECIPIENT_BASIS="owner of ${label} ${agent}"; HUMAN_RECIPIENT_ID="$who"; printf '%s' "$who"; return; fi
+  done
+  local n; n=$(db "SELECT COUNT(*) FROM humans;" 2>/dev/null)
+  if [[ "${n:-0}" == "1" ]]; then
+    who=$(db "SELECT id FROM humans LIMIT 1;" 2>/dev/null)
+    HUMAN_RECIPIENT_BASIS="sole human on record"; HUMAN_RECIPIENT_ID="$who"
+    printf '%s' "$who"; return
+  fi
+  HUMAN_RECIPIENT_BASIS="no human owns this gate's clearers (${n:-0} humans on record, none linked up the chain)"
+}
+
+# _human_transport_id <human id> <telegram|buzz|discord> — that person's id on one
+# transport, empty if they are not on it. One identity, three addresses: the whole
+# point of the record is that a gate names the PERSON and delivery picks the
+# address, instead of the address being all we ever had.
+_human_transport_id() {
+  local id="${1:-}" transport="${2:-telegram}" col
+  case "$transport" in
+    telegram) col="telegram_id" ;;
+    buzz)     col="buzz_npub" ;;
+    discord)  col="discord_id" ;;
+    *) return ;;
+  esac
+  [[ -n "$id" ]] || return
+  db "SELECT COALESCE(${col},'') FROM humans WHERE id=$(sqlq "$id") LIMIT 1;" 2>/dev/null
+}
+
+# _human_gate_ids_by_owner <comma-separated task ids> — partition a BATCH of gate
+# rows by resolved owner, one line per owner: `<human|->\t<ids>`. Batch re-nags
+# (the heartbeat sweep, `task inbox --send`) render one message for many gates;
+# on a multi-human box those gates need not share an owner, and sending the
+# rendered batch to all of them would page each person with other people's rows —
+# the reported harm with the volume turned up. Callers loop over this instead.
+_human_gate_ids_by_owner() {
+  local idlist="${1:-}" id who
+  [[ -n "$idlist" ]] || return
+  local -A groups=()
+  local IFS=','
+  for id in $idlist; do
+    [[ "$id" =~ ^[0-9]+$ ]] || continue
+    _human_gate_recipient "$id" >/dev/null
+    who="$HUMAN_RECIPIENT_ID"
+    groups["${who:--}"]="${groups["${who:--}"]:+${groups["${who:--}"]},}${id}"
+  done
+  unset IFS
+  local k
+  for k in $(printf '%s\n' "${!groups[@]}" | sort); do
+    printf '%s\t%s\n' "$k" "${groups[$k]}"
+  done
+}
+
 # DIVE-1401 (olivia review, iter 2): the TRUSTED caller identity for gate-withdraw
 # AUTHORIZATION. This is deliberately NOT task_actor: --from is caller-asserted and
 # SUDO_USER/SUDO_UID are plain env vars a NON-root process can forge with no real
@@ -689,6 +854,51 @@ _gate_withdraw_actor() {
     [[ "$_u" == "$_cuid" ]] && { printf 'human'; return; }
   done < <(_gate_passwd_stream)
   printf 'none'
+}
+
+# DIVE-3340: THE HUMAN-SIDE EXIT FROM A PENDING GATE, rendered in ONE place.
+#
+# Two refusals need this sentence — `cancel` over an open gate (task/status.sh) and
+# `--withdraw` refused as unauthorized (task/need.sh) — and until this ticket NEITHER
+# of them said it. Both named only `--withdraw`, which is the AGENT-side exit, and the
+# authorized set for a withdraw is `human | filer | filer's lead | coordinator`
+# (_gate_withdraw_actor above). **A person typing into a chat bot satisfies none of
+# them**: the command runs on an agent seat, so the actor resolves to `agent <seat>`,
+# and the human's identity deliberately does not travel through the bot (DIVE-1401,
+# DIVE-2330 — SUDO_* are forgeable below root, so authorization fails closed and must
+# keep doing so). Measured 2026-08-12 on a CUSTOMER box: the owner tried to cancel his
+# own row, was told to withdraw first, and the withdraw refused him. Two refusals, each
+# individually correct, composing into a closed loop.
+#
+# ANSWERING IS THE ROUTE OUT, and it needs no withdraw authorization at all: it is the
+# human's own act, it is what the buttons in their chat are for, and once
+# need_answered_at is set the cancel guard stops firing. So it is named FIRST wherever
+# a human is the one reading — the door they can open, before the one they cannot.
+#
+# Shared rather than inlined twice on purpose: this is the same class as DIVE-2382,
+# where a refusal that named a SMALLER set than the code checked converted an available
+# action into an impossible one for every reader. Two copies of an exit route drift, and
+# the drift is invisible — a refusal is read once, by someone who will not re-derive it.
+# See community/wiki/a-refusal-that-names-a-smaller-set-than-the-code-checked.md.
+#
+# Type-shaped because the verb genuinely differs, and getting it wrong publishes a route
+# that refuses — which is the defect this function exists to fix, one layer down. A
+# `secret` must never be typed into the board (it would be recorded), and a `manual`
+# gate records that the step was PERFORMED rather than carrying a value; both take
+# `task answer <id>` with NO --value. The tap route is named for every type because a
+# tier-2 gate's own alert carries the per-gate human nonce that only the CLI mints
+# (DIVE-916) — the buttons are the answer surface a human actually has.
+#   $1 = ident (DIVE-N)   $2 = need_type
+_gate_answer_route() {
+  local _ar_ident="$1" _ar_type="$2"
+  case "$_ar_type" in
+    secret)
+      printf "answer it yourself — place the secret out-of-band, then '5dive task answer %s' with NO --value (the value must never be written to the board)" "$_ar_ident" ;;
+    manual)
+      printf "answer it yourself — '5dive task answer %s' with NO --value (it records that the step was performed)" "$_ar_ident" ;;
+    *)
+      printf "answer it yourself — tap a button on the gate's own alert in chat, or '5dive task answer %s --value=<answer>'" "$_ar_ident" ;;
+  esac
 }
 
 # DIVE-980: shared org-chart assignee resolution. Resolve an assignee TOKEN to a
@@ -747,5 +957,373 @@ _org_resolve_assignee() {
       printf '%s' "$v"
       ;;
   esac
+}
+
+# ---------------------------------------------------------------------------
+# DIVE-3366 — ROUTE BY ROLE WHEN THE ROLE HAS TWO SEATS.
+#
+# `role:<r>` above routes ONLY on a unique holder and returns empty on two, and
+# that empty is the lane skew. The refusal pushes the filer back to typing a
+# name, and the name a filer remembers is the busiest seat — so the mechanism
+# that exists to distribute work actively concentrates it as soon as a second
+# holder is seated. Measured 2026-08-13 04:59Z with quinn and main2 both holding
+# the verifier role: quinn 14 open, main2 0. lodar raised the same imbalance
+# three times in one day; a directive repeated three times is a mechanism
+# question, not a discipline question.
+#
+# WIDENING ONLY. These run where `_org_resolve_assignee` already came back EMPTY
+# — an ambiguity that was a hard error one line later at the call site — so they
+# can only turn a refusal into a route, never re-point a token that already
+# resolved. Same discipline the DIVE-2041 substring pass was added under, and the
+# reason `_org_resolve_assignee` itself is left exactly as it is: `goal validate`
+# and `objective` read it to ask "does this resolve deterministically", and a
+# load-based answer is not the same question.
+#
+# THE PICK IS RECORDED ON THE ROW, because a load-based choice cannot be
+# reconstructed afterwards: the counts that decided it have moved by the time
+# anyone reads the row. `_TASK_ROLE_PICK_BASIS` carries every candidate's count
+# as measured at filing, and the caller writes it into the body.
+#
+# ONLY DISPATCHABLE SEATS ARE CANDIDATES. The org chart names lanes the registry
+# does not — that is exactly the name DIVE-3344 refuses at `--assignee` — and
+# picking one here would mint the undispatchable row through the back door, with
+# the router's authority on it, so nobody would think to question the name. When
+# the roster is `unestablished:*` the filter is skipped rather than treated as an
+# empty roster, for the reason `_task_require_lane` documents: a roster we could
+# not establish must refuse nothing.
+# ---------------------------------------------------------------------------
+_TASK_ROLE_PICK=""; _TASK_ROLE_PICK_BASIS=""
+
+# _org_role_holders <role> — every chart seat matching the role token, one per
+# line, name-ordered. Same two passes as `_org_resolve_assignee`, in the same
+# order and with the same LIKE escaping: exact `role` equality first so a chart
+# with terse role values keeps its sharp answer, substring over role||title only
+# when exact matched nothing.
+_org_role_holders() {
+  local r="$1" exact
+  exact=$(db "SELECT name FROM agents_org
+              WHERE role IS NOT NULL AND lower(role)=lower($(sqlq "$r")) ORDER BY name;" 2>/dev/null || true)
+  if [[ -n "$exact" ]]; then printf '%s\n' "$exact"; return 0; fi
+  db "SELECT name FROM agents_org
+      WHERE lower(' '||COALESCE(role,'')||' '||COALESCE(title,''))
+            LIKE '% '||lower($(sqlq "$(_org_like_escape "$r")"))||'%' ESCAPE '\'
+      ORDER BY name;" 2>/dev/null || true
+  return 0
+}
+
+# _task_role_least_loaded <role> [exclude_lane] — SETS `_TASK_ROLE_PICK` (the
+# chosen seat) and `_TASK_ROLE_PICK_BASIS` (the counts that chose it). Read the
+# variables; this PRINTS NOTHING, for the `_task_roster` reason one function
+# down — a caller writing `x=$(...)` assigns the globals in a subshell and loses
+# them. Returns 0 when a seat was picked, 1 when none was (no holders, none
+# dispatchable, or the only holder was the excluded one) so the caller can fall
+# through to its own refusal.
+#
+# `exclude_lane` is how acceptance 2's second half is met: the verifier seat is
+# simply not a candidate for the build, so `--assignee=role:verifier
+# --verifier=quinn` routes the build to the OTHER holder instead of refusing.
+_task_role_least_loaded() {
+  local role="$1" exclude="${2:-}" lane act best="" best_n="" basis=""
+  _TASK_ROLE_PICK=""; _TASK_ROLE_PICK_BASIS=""
+  [[ -n "$role" ]] || return 1
+  _task_roster
+  while IFS= read -r lane; do
+    [[ -n "$lane" ]] || continue
+    [[ "$lane" == "$exclude" ]] && continue
+    if [[ "$_TASK_ROSTER_STATE" == "ok" ]] && ! _task_roster_has "$lane"; then continue; fi
+    act=$(_task_lane_actionable "$lane")
+    [[ "$act" =~ ^[0-9]+$ ]] || continue
+    basis+="${basis:+, }${lane} ${act}"
+    # STRICTLY less-than over name-ordered candidates, so equal counts always
+    # pick the same seat. A router that alternates on a tie files the two halves
+    # of one decomposition into two different lanes, which is worse than either
+    # lane being busy.
+    if [[ -z "$best" ]] || (( act < best_n )); then best="$lane"; best_n="$act"; fi
+  done < <(_org_role_holders "$role")
+  [[ -n "$best" ]] || return 1
+  _TASK_ROLE_PICK="$best"; _TASK_ROLE_PICK_BASIS="$basis"
+  return 0
+}
+
+# _task_role_skew_note — acceptance 3. One line on the board when a role's
+# busiest seat holds FACTOR times its idlest, NAMING BOTH COUNTS, because the
+# bare ratio is what made this invisible for a day: "quinn is loaded" reads as a
+# quinn problem, "quinn 14, main2 0" names the routing.
+#
+# THE WORST ROLE ONLY, once. The requirement is "say so once"; a per-role list
+# printed under every `task ls` is the shape readers learn to skip, and this note
+# has to survive being seen a hundred times a day.
+#
+# THE FACTOR NEEDS A FLOOR ON THE COUNT, and that floor is the whole reason this
+# is not just `max >= FACTOR * min`: min=0 makes every ratio infinite, so a role
+# whose two seats hold 2 and 0 would announce a skew on an essentially empty
+# board. The floor is on the BUSY side, so the note fires only when there is
+# genuinely something to re-lane.
+#
+# AND IT SPLITS THE BUSY SEAT'S COUNT INTO GRADING vs BUILDING, which is the part
+# that stops this note from being read the way the depth number that prompted it
+# was read. DIVE-3366 was filed on "quinn 14 open / main2 0, both verifiers" and
+# diagnosed as nine build rows quinn was also booked to grade. Measured after the
+# fact: four of those rows carried a NON-NULL `maker_agent`, which makes
+# `assignee == verifier` the CORRECT shape of a DELIVERED row — the handoff
+# reassigns the row to its grader and parks the builder in `maker_agent` — so
+# they were deliveries awaiting a grade, not a seat grading its own build. A
+# grading backlog and a mis-laned builder want OPPOSITE fixes (wake the grader vs
+# re-lane the work), so a note that names one number for both sends half its
+# readers the wrong way. `maker_agent` is the discriminator; the seat count never
+# was. See community/wiki/assignee-equals-verifier-is-the-delivered-shape.md.
+_task_role_skew_note() {
+  local factor="${FIVE_ROLE_SKEW_FACTOR:-3}" floor="${FIVE_ROLE_SKEW_FLOOR:-3}"
+  [[ "$factor" =~ ^[0-9]+$ && "$floor" =~ ^[0-9]+$ ]] || return 0
+  (( factor >= 2 )) || return 0
+  local role lane act n min max min_lane max_lane ratio
+  local w_role="" w_ratio=0 w_max=0 w_min=0 w_maxlane="" w_minlane=""
+  _task_roster
+  while IFS= read -r role; do
+    [[ -n "$role" ]] || continue
+    min=""; max=""; min_lane=""; max_lane=""; n=0
+    while IFS= read -r lane; do
+      [[ -n "$lane" ]] || continue
+      if [[ "$_TASK_ROSTER_STATE" == "ok" ]] && ! _task_roster_has "$lane"; then continue; fi
+      act=$(_task_lane_actionable "$lane")
+      [[ "$act" =~ ^[0-9]+$ ]] || continue
+      n=$((n+1))
+      if [[ -z "$min" ]] || (( act < min )); then min="$act"; min_lane="$lane"; fi
+      if [[ -z "$max" ]] || (( act > max )); then max="$act"; max_lane="$lane"; fi
+    done < <(db "SELECT name FROM agents_org
+                 WHERE role IS NOT NULL AND lower(role)=lower($(sqlq "$role")) ORDER BY name;" 2>/dev/null || true)
+    (( n >= 2 )) || continue
+    (( max >= floor )) || continue
+    (( max >= min * factor )) || continue
+    ratio=$(( max / (min > 0 ? min : 1) ))
+    if (( ratio > w_ratio )); then
+      w_ratio=$ratio; w_role="$role"; w_max=$max; w_min=$min
+      w_maxlane="$max_lane"; w_minlane="$min_lane"
+    fi
+  done < <(db "SELECT DISTINCT role FROM agents_org WHERE role IS NOT NULL AND role<>'' ORDER BY role;" 2>/dev/null || true)
+  [[ -n "$w_role" ]] || return 0
+  # The split, measured on the busy seat only: it is the seat whose number gets
+  # acted on, and one extra query beats a reader guessing which fix applies.
+  local grading building=""
+  grading=$(db "SELECT COUNT(*) FROM tasks
+                WHERE assignee=$(sqlq "$w_maxlane") AND kind='standard'
+                  AND status IN ('todo','in_progress') AND parked_at IS NULL
+                  AND maker_agent IS NOT NULL AND maker_agent<>'' AND assignee=verifier;" 2>/dev/null || echo "")
+  if [[ "$grading" =~ ^[0-9]+$ ]] && (( grading <= w_max )); then
+    building=" (${grading} awaiting its grade, $(( w_max - grading )) to build)"
+  fi
+  warn "LANE SKEW in role '${w_role}' (DIVE-3366): ${w_maxlane} holds ${w_max} open${building}, ${w_minlane} holds ${w_min} — a grading backlog wants the GRADER woken, a build backlog wants the work RE-LANED, so read the split before acting. File to the role, not the name (--assignee=role:${w_role} picks the idler seat and records why), or name ${w_minlane} on the next row."
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# DIVE-3344 — nothing validated that `assignee` / `created_by` named a REAL
+# agent, and the two columns fail in OPPOSITE directions.
+#
+# The work-picker dispatches on `assignee`, so a row on a name that is not a
+# registered agent is STRUCTURALLY UNDISPATCHABLE — not blocked, not parked, not
+# flagged. It is never picked, and nothing anywhere says so. Reported from a
+# customer box (7 rows on `assignee='cli'`, never once a dispatch target in their
+# whole heartbeat log) and corroborated here: 3 open rows on `cli`, 1 on
+# `agent-marketing`. `created_by` misroutes rather than drops — their DIVE-350 has
+# been orphaned since 2026-07-29 because its gate routes to a creator that does
+# not exist.
+#
+# TWO CLASSES, and the second is the nastier:
+#   1. a name that is not an agent at all
+#   2. PREFIX DRIFT — `agent-marketing` beside `marketing`, `agent-main` beside
+#      `main`. Worse than class 1 because it LOOKS right to a reader and sorts
+#      next to the real lane in any listing. So the refusal NAMES the near miss:
+#      a bare "unknown agent" gets worked around by re-typing the same wrong name.
+#
+# `cli` IS NOT A TYPO, AND THIS IS THE MEASUREMENT THAT SPLIT THE VALIDATOR IN
+# TWO. lib/actor.sh sets `ACTOR_BOARD="cli"` as its documented sentinel for "could
+# not attribute this invocation" (root, cron, a build bot) — see actor_board_name,
+# whose own header calls out that 43 call sites inherit it. 25 rows on this board
+# carry `created_by='cli'` BY DESIGN; the recent ones are root-cron recurring
+# instances. DIVE-3344's acceptance asked for "the same validation on created_by",
+# and the same validation would have refused every root and cron filing on the
+# board. So:
+#   assignee / verifier -> must be a DISPATCHABLE LANE. `cli` is refused.
+#   created_by / --from -> must be a KNOWN PRINCIPAL = lane OR sentinel. `cli` is
+#                          accepted; `agent-main` is still refused, which is the
+#                          class that actually misroutes gates.
+#
+# THE AUTHORITY IS THE REGISTRY, and when it cannot be read this REFUSES NOTHING.
+# actor.sh already settled that question ("the registry is the authority on
+# agent-ness — DIVE-2371: a username PREFIX is not"), and registry_read_checked
+# exists precisely so a caller can tell an absent fleet from an unreadable one.
+# A roster we could not establish is `unestablished:<why>`, never a silent empty:
+# an empty roster treated as authoritative would refuse EVERY name, which on a
+# fresh install or inside a unit harness means the guard breaks the board instead
+# of the typo. `agents_org` is unioned in because it names lanes a lagging
+# registry may miss, but it can only WIDEN acceptance — it never establishes the
+# roster on its own, so an unreadable registry beside a populated org chart still
+# refuses nothing rather than refusing the four agents the chart omits.
+# ---------------------------------------------------------------------------
+
+# Non-agent principals that legitimately own a `created_by` and NEVER an
+# assignee — nothing wakes them. Measured on this board 2026-08-12: cli 25,
+# council 97, lodar 4, editor 4, proof 2 (`5dive proof` files with --from=proof).
+_TASK_PRINCIPAL_SENTINELS="cli council telegram dashboard lodar editor proof cron"
+
+_TASK_ROSTER=""; _TASK_ROSTER_STATE=""
+
+# _task_roster — SETS `_TASK_ROSTER` (newline-separated lane names) and
+# `_TASK_ROSTER_STATE` (`ok` or `unestablished:<why>`). Read the variables.
+#
+# IT DELIBERATELY PRINTS NOTHING, and that is a bug fix, not a style choice. The
+# first cut of this returned the roster on stdout, so every caller wrote
+# `roster=$(_task_roster)` — and a variable assigned inside `$( )` is assigned in
+# a SUBSHELL and lost. `_TASK_ROSTER_STATE` therefore came back EMPTY at each of
+# those call sites, which is neither `ok` nor `unestablished:*`, so `wip-cap-install`
+# skipped nothing and `task orphans` reported "the roster is " and refused. The
+# failure direction is what matters: the state that survived was the one that
+# means "could not measure", so the guards went QUIET rather than loud. Callers
+# must not re-introduce the substitution.
+#
+# CHECK THE STATE, never the emptiness of the roster: they are different facts.
+_task_roster() {
+  if [[ -z "$_TASK_ROSTER_STATE" ]]; then
+    local body rc reg="" org="" why=""
+    # THE ROSTER AND THE BOARD MUST COME FROM THE SAME STATE DIR, and that is why
+    # the path is re-derived here instead of using the global $REGISTRY.
+    # header.sh binds REGISTRY="${STATE_DIR}/agents.json" ONCE, at source time.
+    # STATE_DIR is env-overridable (DIVE-1475) and ~60 unit harnesses repoint it
+    # AFTER sourcing to get a scratch board — which moves TASKS_DB and leaves
+    # REGISTRY pointing at the HOST's real fleet. A guard reading this host's 18
+    # live agents while grading a temp board is comparing two different worlds: it
+    # armed against every fixture on the box and reported 16 harnesses red, none of
+    # which was about agent names. In production the two paths are the same string,
+    # so this changes nothing there; the assignment-prefix keeps the override
+    # scoped to the substitution's subshell.
+    local _reg="${STATE_DIR:-/var/lib/5dive}/agents.json"
+    # `&& rc=0 || rc=$?`, NOT `; rc=$?`. registry_read_checked's whole point is
+    # that it returns 3/4/5 instead of inventing a body — and under the bundle's
+    # `set -euo pipefail` an ASSIGNMENT whose substitution exits non-zero kills the
+    # process before the next line runs. With `; rc=$?` a host with no registry
+    # (every fresh store) died on `task add` with "exited 3 without reporting a
+    # reason": the guard's own not-measured path took the board down. Being part of
+    # an `||` list is what makes the non-zero survivable.
+    body=$(REGISTRY="$_reg" registry_read_checked 2>/dev/null) && rc=0 || rc=$?
+    case "$rc" in
+      0) reg=$(printf '%s\n' "$body" | jq -r '(.agents // {}) | keys[]?' 2>/dev/null || true)
+         [[ -n "$reg" ]] || why="registry-names-no-agents" ;;
+      3) why="no-registry-file" ;;
+      4) why="registry-unreadable" ;;
+      5) why="registry-unparseable" ;;
+      *) why="registry-rc${rc}" ;;
+    esac
+    org=$(db "SELECT name FROM agents_org WHERE name IS NOT NULL AND name<>'';" 2>/dev/null || true)
+    # `|| true` on the grep: an all-blank union exits 1, and this file is cat into
+    # a bundle that runs under `set -euo pipefail`.
+    _TASK_ROSTER=$(printf '%s\n%s\n' "$reg" "$org" | grep -v '^[[:space:]]*$' | sort -u || true)
+    # `ok` requires the AUTHORITY to have answered with at least one agent. The
+    # org chart widens the roster but cannot establish it.
+    if [[ -n "$reg" ]]; then _TASK_ROSTER_STATE="ok"
+    else _TASK_ROSTER_STATE="unestablished:${why:-unknown}"; fi
+  fi
+  return 0
+}
+
+_task_roster_has() {
+  [[ -n "$1" ]] || return 1
+  _task_roster
+  grep -qxF -- "$1" <<<"$_TASK_ROSTER"
+}
+
+# _task_roster_nearmiss <name> — the roster entry the caller most likely meant,
+# or nothing. Ordered by how the drift actually occurs on real boards; the first
+# two rungs are the `agent-` prefix, which is the measured case and is exactly
+# the prefix actor_board_name strips on its passwd rung.
+_task_roster_nearmiss() {
+  local name="$1" roster cand
+  _task_roster; roster="$_TASK_ROSTER"
+  [[ -n "$name" && -n "$roster" ]] || { printf ''; return; }
+  # EVERY branch below is an `if`, and this function ends in `return 0`, because
+  # the bundle runs under `set -euo pipefail`: a trailing `[[ … ]] && printf …`
+  # exits 1 on the no-suggestion path, and `marks+="$(_task_roster_nearmiss x)"`
+  # would then kill `task orphans` mid-listing. That is how the first cut of this
+  # shipped a verb that died with "exited 1 without reporting a reason" — the unit
+  # harness runs `set +e` and could not see it.
+  # 1. agent-<x> -> <x>   2. <x> -> agent-<x>
+  for cand in "${name#agent-}" "agent-${name}"; do
+    [[ "$cand" == "$name" ]] && continue
+    if grep -qxF -- "$cand" <<<"$roster"; then printf '%s' "$cand"; return 0; fi
+  done
+  # 3. case only
+  cand=$(grep -ixF -- "$name" <<<"$roster" | head -1 || true)
+  if [[ -n "$cand" ]]; then printf '%s' "$cand"; return 0; fi
+  # 4. a UNIQUE roster entry that contains, or is contained by, the name. Unique
+  #    only — suggesting one of several is a guess dressed as help. `dev` would
+  #    otherwise "suggest" dev2/dev3 arbitrarily.
+  local hits n_hits
+  hits=$(while IFS= read -r cand; do
+           [[ -n "$cand" ]] || continue
+           case "$name" in *"$cand"*) printf '%s\n' "$cand"; continue ;; esac
+           case "$cand" in *"$name"*) printf '%s\n' "$cand" ;; esac
+         done <<<"$roster")
+  n_hits=$(printf '%s' "$hits" | grep -c . || true)
+  if [[ "$n_hits" == "1" ]]; then printf '%s' "${hits//$'\n'/}"; fi
+  return 0
+}
+
+# Emitted once per process when a guard could not run. A guard that cannot
+# measure must SAY it did not measure — a silent skip and a pass look identical.
+_TASK_ROSTER_WARNED=""
+_task_roster_unestablished_note() {
+  if [[ -n "$_TASK_ROSTER_WARNED" ]]; then return 0; fi
+  _TASK_ROSTER_WARNED=1
+  # A genuinely absent fleet (fresh install, unit harness) is not a defect and is
+  # not worth a line on every add. An UNREADABLE or CORRUPT registry is.
+  case "$_TASK_ROSTER_STATE" in
+    unestablished:registry-unreadable|unestablished:registry-unparseable)
+      warn "agent-name validation SKIPPED (${_TASK_ROSTER_STATE#unestablished:}) — ${STATE_DIR:-/var/lib/5dive}/agents.json could not be read, so '$1' was accepted unchecked. Fix the registry: 5dive doctor" ;;
+  esac
+  return 0
+}
+
+# _task_require_lane <name> <flag> — REFUSE a name that is not a dispatchable
+# lane. Callers pass the flag spelling the user typed so the refusal is actionable.
+_task_require_lane() {
+  local name="$1" flag="$2" hint=""
+  [[ -n "$name" ]] || return 0
+  _task_roster
+  [[ "$_TASK_ROSTER_STATE" == "ok" ]] || { _task_roster_unestablished_note "$name"; return 0; }
+  if _task_roster_has "$name"; then return 0; fi
+  # The sentinel gets its own refusal: it is a legal created_by, so "not a
+  # registered agent" would read as a contradiction to anyone who has seen it in
+  # that column.
+  if grep -qw -- "$name" <<<"$_TASK_PRINCIPAL_SENTINELS"; then
+    fail "$E_VALIDATION" "${flag}='${name}' is not a lane — '${name}' is the actor sentinel for an invocation that could not be attributed to an agent (root, cron, a build bot). It is legal as a CREATOR and never as an owner: nothing wakes it, so the row would sit undispatched forever. Name a real agent: 5dive agent list"
+  fi
+  hint=$(_task_roster_nearmiss "$name")
+  fail "$E_VALIDATION" "${flag}='${name}' is not a registered agent$([[ -n "$hint" ]] && printf -- " — did you mean '%s'?" "$hint") (nothing wakes an unregistered lane, so this row would never be dispatched; see: 5dive agent list)"
+}
+
+# _task_require_principal <name> <flag> — for created_by/--from. Lane OR sentinel.
+_task_require_principal() {
+  local name="$1" flag="$2" hint=""
+  [[ -n "$name" ]] || return 0
+  _task_roster
+  [[ "$_TASK_ROSTER_STATE" == "ok" ]] || { _task_roster_unestablished_note "$name"; return 0; }
+  if _task_roster_has "$name"; then return 0; fi
+  if grep -qw -- "$name" <<<"$_TASK_PRINCIPAL_SENTINELS"; then return 0; fi
+  hint=$(_task_roster_nearmiss "$name")
+  fail "$E_VALIDATION" "${flag}='${name}' is not a registered agent or a known principal$([[ -n "$hint" ]] && printf -- " — did you mean '%s'?" "$hint") (a creator that does not exist misroutes every gate this row ever files; known non-agent principals: ${_TASK_PRINCIPAL_SENTINELS})"
+}
+
+# _task_roster_sql_notin — a SQL fragment listing the roster, for the surfacer.
+# Prints nothing when the roster is unestablished, so a caller that interpolates
+# it cannot turn "could not measure" into "everything is an orphan".
+_task_roster_sql_notin() {
+  local roster n out=""
+  _task_roster; roster="$_TASK_ROSTER"
+  [[ "$_TASK_ROSTER_STATE" == "ok" ]] || { printf ''; return; }
+  while IFS= read -r n; do
+    [[ -n "$n" ]] || continue
+    out+="${out:+,}$(sqlq "$n")"
+  done <<<"$roster"
+  printf '%s' "$out"
 }
 

@@ -114,14 +114,42 @@ _loop_eff_ceiling() {
 # fail-open would have had to be found and fixed twice.
 #
 # Contract: echoes an integer on success. Says NOTHING on failure and returns
-# non-zero; stderr is deliberately NOT swallowed here (see _loop_refresh_spend:
-# a 2>/dev/null on this call is what hid the broken ceiling for its whole life).
-# The NOT-REACHED bookkeeping stays with each CALLER, because "unreadable" means
-# something different to a loop ceiling than to a task budget.
+# non-zero (rc 2); stderr is deliberately NOT swallowed here (see
+# _loop_refresh_spend: a 2>/dev/null on this call is what hid the broken ceiling
+# for its whole life). The NOT-REACHED bookkeeping stays with each CALLER,
+# because "unreadable" means something different to a loop ceiling than to a
+# task budget.
+#
+# DIVE-3345 — that contract was only half-built. Every caller was written around
+# it (_loop_refresh_spend's rc-2 branch, the task-budget sweep's two "NOT
+# verified this tick" branches), but NOTHING in here could produce a non-zero
+# exit for an unreadable INPUT. An agent home that was missing, GUESSED, or
+# merely unreadable by the calling uid made glob() return [], contributed
+# nothing to `total`, and this function printed 0 and exited 0 — so the
+# carefully-built fail-closed path above was bypassed by a fail-open one
+# underneath it, and the failure looked exactly like an idle agent. Reported by
+# `claude-luca` from a customer box whose first scan read 0 for EVERY row purely
+# because it could not read peer agents' homes; it took a human's suspicion to
+# catch, because nobody investigates a guard that never fires.
+#
+# The three states are separated below and ONLY the third is a legitimate 0:
+#   * transcript root missing / unresolvable   -> NOT-REACHED, rc 2
+#   * transcript root present but unreadable   -> NOT-REACHED, rc 2
+#   * transcript root readable, nothing in it  -> 0, rc 0
 _spend_scan_task_ids() {
   REGISTRY="$REGISTRY" TASK_DB="${TASKS_DB:-${STATE_DIR}/tasks/tasks.db}" \
     LOOP_KIDS="$1" LOOP_SINCE="${2:-0}" python3 - <<'PY'
-import os, json, glob, time, sqlite3, datetime as dt, pwd
+import os, json, glob, time, sqlite3, datetime as dt, pwd, errno, sys
+# DIVE-3345: reasons collect here and are reported ONCE, at the end, by finish().
+# Accumulating rather than exiting on the first one is deliberate: with several
+# agents in the window the operator wants every blind spot named, not the first.
+_nr = []
+def not_reached(msg): _nr.append(msg)
+def finish(total):
+    if _nr:
+        sys.stderr.write("spend-scan: NOT-REACHED — " + "; ".join(_nr) + "\n")
+        raise SystemExit(2)      # say NOTHING on stdout: a 0 here IS the defect
+    print(int(total)); raise SystemExit(0)
 since = int(os.environ.get("LOOP_SINCE") or 0)
 now = int(time.time())
 try:    kids = [int(x) for x in json.loads(os.environ.get("LOOP_KIDS") or "[]")]
@@ -148,7 +176,14 @@ try:
         e = to_epoch(r["done_at"]) or now
         wins.setdefault(a, []).append({"start": max(s, since), "end": e, "tok": 0})
     con.close()
-except Exception: pass
+except Exception as e:
+    # Same class as the home cases below: a task db we could not READ produced an
+    # empty `wins`, therefore a total of 0, therefore a clean exit. (A task id
+    # that is simply ABSENT from a readable db still yields 0 — deliberately left
+    # alone: the loop caller derives kids from loop_runs.child_task_ids, which can
+    # legitimately name a deleted row, and NOT-REACHING there would wedge live
+    # loops over a row nobody will restore. Named here rather than fixed silently.)
+    not_reached("task db %s unreadable: %s" % (os.environ.get("TASK_DB"), e))
 for a in wins: wins[a].sort(key=lambda w: w["start"], reverse=True)
 try:    reg = json.load(open(os.environ["REGISTRY"]))
 except Exception: reg = {"agents": {}}
@@ -157,16 +192,78 @@ except Exception: _HOME_OVR = {}
 def home_of(name):
     if name in _HOME_OVR: return _HOME_OVR[name]  # test hook; unset in production
     try: return pwd.getpwnam("agent-"+name).pw_dir
-    except KeyError: return "/home/agent-"+name
+    except KeyError: return None
+    # DIVE-3345 acceptance 4: the old `return "/home/agent-"+name` was the same
+    # fail-open wearing a different coat, and it is how DIVE-3344's `cli` rows
+    # scored a number at all. A name with no account on this host has no
+    # transcript root to read; inventing a path that then globs empty does not
+    # produce 0 spend, it produces an unread one and calls it 0.
+def probe_readable(home, projects):
+    """-> (readable, reason). readable=True means we saw everything there was.
+
+    The probe order is usage_collect's (DIVE-1929): the TRANSCRIPT DIR first,
+    because a home is commonly mode 700 while the dir underneath it is still
+    reachable by path, and probing the home first files a readable agent as a
+    blind spot. ONE deliberate divergence from that function, named here because
+    copying it silently would have re-imported a fail-open: usage treats a
+    MISSING home as "this agent recorded nothing", since it is reporting fleet
+    coverage over a roster. Here the home is derived from an agent the registry
+    lists and a task the db says is started, so a missing home means our
+    resolution is wrong — not that the agent is idle.
+    """
+    try:
+        os.listdir(projects); return True, None
+    except OSError as e:
+        if e.errno in (errno.EACCES, errno.EPERM):
+            return False, "transcript dir %s not readable by this uid (needs root)" % projects
+        if e.errno != errno.ENOENT:
+            return False, "transcript dir %s unreadable: %s" % (projects, e.strerror or e.errno)
+    # ENOENT on the dir is ambiguous — a path under an UNREADABLE parent reports
+    # "missing" too (os.path.exists lies here). Confirm it from the home.
+    try:
+        os.listdir(home)
+    except OSError as e:
+        if e.errno == errno.ENOENT:
+            return False, "transcript root %s does not exist" % home
+        if e.errno in (errno.EACCES, errno.EPERM):
+            return False, "home %s not readable by this uid (needs root)" % home
+        return False, "home %s unreadable: %s" % (home, e.strerror or e.errno)
+    return True, None          # home readable, no transcript dir yet: genuinely idle
 total = 0
 for name, ws in wins.items():
-    if reg.get("agents", {}).get(name, {}).get("type", "claude") != "claude": continue
+    meta = reg.get("agents", {}).get(name)
+    if meta is None:
+        # Unknown to the registry. The old `.get(name, {}).get("type","claude")`
+        # DEFAULTED an unregistered assignee to a claude agent and then guessed
+        # its home — two fail-opens in series, both landing on 0. We can neither
+        # classify it nor locate it, and that is a failed read, not an idle one.
+        not_reached("%s: not in the agent registry — cannot classify or locate" % name)
+        continue
+    # A non-claude agent has no claude transcripts to read: a real skip, not a
+    # failed one, and the only `continue` in this loop that still means 0.
+    if meta.get("type", "claude") != "claude": continue
+    home = home_of(name)
+    if home is None:
+        not_reached("%s: no agent-%s account on this host — transcript root unresolvable" % (name, name))
+        continue
+    projects = os.path.join(home, ".claude", "projects")
+    readable, why = probe_readable(home, projects)
+    if not readable:
+        not_reached("%s: %s" % (name, why)); continue
     lo = min(w["start"] for w in ws)
-    for path in glob.glob(os.path.join(home_of(name), ".claude", "projects", "*", "*.jsonl")):
+    blind = False
+    for path in glob.glob(os.path.join(projects, "*", "*.jsonl")):
         try:
             if os.path.getmtime(path) < lo: continue
             f = open(path, "r", errors="ignore")
-        except OSError: continue
+        except OSError as e:
+            # ENOENT = the file vanished mid-scan (a session rolling over): a
+            # real absence, tolerated. Anything else means we are blind to part
+            # of this agent's spend, and a PARTIAL sum reported as a total is the
+            # same fail-open at file granularity — a smaller lie, still a lie.
+            if e.errno == errno.ENOENT: continue
+            not_reached("%s: transcript %s unreadable: %s" % (name, path, e.strerror or e.errno))
+            blind = True; break
         with f:
             for line in f:
                 if '"usage"' not in line or '"assistant"' not in line: continue
@@ -180,8 +277,9 @@ for name, ws in wins.items():
                 for w in ws:  # newest-started window wins (matches usage_collect)
                     if w["start"] <= ts <= w["end"]:
                         w["tok"] += tot; break
+    if blind: continue          # do not fold a knowingly-partial agent into the total
     total += sum(w["tok"] for w in ws)
-print(int(total))
+finish(total)
 PY
 }
 

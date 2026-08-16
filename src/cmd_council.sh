@@ -2768,8 +2768,13 @@ function seatHealthMap() {
 function nudgeSeatAgent(agent, msg) {
   const bin = process.env.COUNCIL_5DIVE_BIN || '5dive'
   try {
+    // DIVE-3318: a wake nudge is a one-way machine notice nobody replies to, so it is
+    // not a conversational ROUND and must not be counted against the a2a round cap — a
+    // convene addresses several nudges to the same seat per run, and a refused nudge is
+    // a dozing seat nobody wakes. NOT a sender exemption: see a2a_round_guard.
     execFileSync(bin, ['agent', 'send', String(agent), String(msg)],
-      { encoding: 'utf-8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] })
+      { encoding: 'utf-8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, _5DIVE_A2A_NOTIFY: '1' } })
     return { ok: true }
   } catch (e) {
     // DIVE-2220: report WHY, never a bare false. This rail is the only wake a heartbeat-less seat

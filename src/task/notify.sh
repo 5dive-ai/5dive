@@ -1084,6 +1084,128 @@ _task_send_owner() {
   return 0
 }
 
+# _task_send_gate_owner — DIVE-3342. The send path for a GATE, as distinct from
+# the informational sends (digest, close-notify, escalation ping) that keep using
+# _task_send_owner above. A gate has an owner; a digest does not.
+#
+# The rule this enforces, and it is the whole ticket: **a gate is delivered to the
+# person who may CLEAR it, or it is not delivered to a person at all.** No pointer
+# from bot traffic may redirect it, and an unresolved recipient does NOT fan out to
+# every id in allowFrom — it stays on the agent rail with the reason recorded, and
+# the caller's existing not-delivered handling takes over unchanged (the receipt is
+# left unstamped, so the row keeps re-nagging and the agent rail keeps escalating).
+#
+# Three-state by construction:
+#   registry empty  -> delegate to _task_send_owner. Every host today has one
+#                      paired human, where the pointer and the fan-out both
+#                      resolve to that person and nothing misroutes; changing
+#                      their delivery would be a regression dressed as a fix.
+#   resolved + on this bot -> send to exactly that chat. Nothing else is tried:
+#                      not the pointer, not the other allowFrom ids, not the
+#                      groups (a forum topic is multi-member, so falling back to
+#                      one is the same wrong-audience defect the ticket reports).
+#   resolved + NOT on this bot, or unresolved -> refuse, log why, stay on the rail.
+#
+# The allowFrom check is the invariant that keeps a `humans` row an IDENTITY rather
+# than a GRANT: the registry may NARROW a gate's audience, never widen it. Same
+# posture the pointer arm above already takes ("a stale or hand-edited pointer must
+# never widen the audience") — applied to the registry, which is likewise written
+# by a human editing state rather than by the person proving they can be reached.
+# Always returns 0; TASK_SEND_DELIVERED / TASK_SEND_FAILED carry the outcome.
+_task_send_gate_owner() {
+  local text="$1" reply_markup="${2:-}" task_ids="${3:-}" owner_override="${4:-}"
+  if ! _human_registry_active; then
+    _task_send_owner "$text" "$reply_markup" "$task_ids"
+    return 0
+  fi
+  TASK_SEND_DELIVERED=0 TASK_SEND_MESSAGE_IDS="" TASK_SEND_FAILED=0
+  local token="$TASK_CH_TOKEN" access_file="$TASK_CH_ACCESS"
+  # DIVE-1506 fail-closed chokepoint, same as _task_send_owner: a fixture/e2e DB
+  # must never reach a paired human. Checked here too because this function is a
+  # second door onto the same transport, and a chokepoint with a bypass is not one.
+  if ! _task_human_send_allowed; then
+    TASK_SEND_FAILED=1
+    warn "DIVE-1506: refused a human gate-send — active task DB (${TASKS_DB:-${STATE_DIR:-/var/lib/5dive}/tasks/tasks.db}) is not the prod DB (fail-closed; set FIVEDIVE_PROD_TASKS_DB if this IS prod)"
+    return 0
+  fi
+
+  # One send, one owner. A batch spanning several owners is refused rather than
+  # split here: the text is already rendered and carries every row in the batch,
+  # so "deliver it to each owner" would page each person with the others' gates.
+  # Batch callers partition with _human_gate_ids_by_owner and render per owner.
+  local hid="$owner_override" first=1 id owner
+  [[ -n "$owner_override" ]] && task_ids=""      # a courtesy line addressed to an
+                                                 # owner we already delivered to
+                                                 # carries no rows of its own.
+  local IFS=','
+  for id in $task_ids; do
+    [[ "$id" =~ ^[0-9]+$ ]] || continue
+    # No command substitution: HUMAN_RECIPIENT_BASIS is why the refusal below can
+    # name a reason, and a $( ) subshell would drop it.
+    _human_gate_recipient "$id" >/dev/null
+    owner="$HUMAN_RECIPIENT_ID"
+    if (( first )); then hid="$owner"; first=0
+    elif [[ "$owner" != "$hid" ]]; then
+      unset IFS
+      TASK_SEND_FAILED=1
+      _task_gate_delivery_log error "$task_ids" "" "" \
+        "batch spans more than one human owner — not delivered; re-nag per owner (DIVE-3342)" \
+        "partition the batch with _human_gate_ids_by_owner and render one message per owner"
+      return 0
+    fi
+  done
+  unset IFS
+
+  if [[ -z "$hid" ]]; then
+    TASK_SEND_FAILED=1
+    _task_gate_delivery_log error "$task_ids" "" "" \
+      "no human owns this gate's clearers (${HUMAN_RECIPIENT_BASIS:-unresolved}) — held on the agent rail, NOT broadcast to the allowlist (DIVE-3342)" \
+      "name the person: sudo 5dive human link <human> --agent=<the gate's reviewer or filer>"
+    return 0
+  fi
+
+  local chat; chat=$(_human_transport_id "$hid" telegram)
+  if [[ -z "$chat" ]]; then
+    TASK_SEND_FAILED=1
+    _task_gate_delivery_log error "$task_ids" "" "" \
+      "gate owner ${hid} has no telegram id on record — held on the agent rail (DIVE-3342)" \
+      "sudo 5dive human add ${hid} --telegram=<chat id>"
+    return 0
+  fi
+  # The narrowing invariant: on record is not the same as reachable on THIS bot.
+  if ! jq -e --arg c "$chat" '(.allowFrom // []) | index($c) != null' "$access_file" >/dev/null 2>&1; then
+    TASK_SEND_FAILED=1
+    _task_gate_delivery_log error "$task_ids" "" "" \
+      "gate owner ${hid} is not paired to this bot (chat ${chat} absent from access.json allowFrom) — held on the agent rail rather than sent to whoever is (DIVE-3342)" \
+      "have ${hid} /start this agent's bot, or route the gate to an agent ${hid} owns"
+    return 0
+  fi
+  _task_post_owner_target "$token" "$chat" "" "$text" "$access_file" "$reply_markup" "$task_ids"
+  # Remembered so a follow-on courtesy line ("…and 3 more gates") goes to the SAME
+  # person instead of resolving from nothing and fanning out.
+  [[ "$TASK_SEND_DELIVERED" == "1" ]] && TASK_GATE_LAST_OWNER="$hid"
+  _task_stamp_confirmed_delivery "$task_ids"
+  return 0
+}
+
+# _task_stamp_human_owner <ident|numeric id> — DIVE-3342. Resolve and record the
+# person this gate belongs to. No-op when the registry is unused (nothing to
+# resolve, and a NULL there keeps every existing row exactly as it reads today) or
+# when the row already names one.
+_task_stamp_human_owner() {
+  local key="${1:-}" numid who
+  [[ -n "$key" ]] || return 0
+  _human_registry_active || return 0
+  if [[ "$key" =~ ^[0-9]+$ ]]; then numid="$key"
+  else numid=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$key");" 2>/dev/null); fi
+  [[ "$numid" =~ ^[0-9]+$ ]] || return 0
+  local cur; cur=$(db "SELECT COALESCE(human_owner,'') FROM tasks WHERE id=${numid};" 2>/dev/null)
+  [[ -z "$cur" ]] || return 0
+  who=$(_human_gate_recipient "$numid")
+  [[ -n "$who" ]] || return 0
+  db "UPDATE tasks SET human_owner=$(sqlq "$who") WHERE id=${numid};" 2>/dev/null || true
+}
+
 # _task_close_notify — DM the paired human a one-line ✅/⚠️ summary when a task
 # is closed with --notify (used by the heartbeat nudge so autonomous queue work
 # surfaces a finish line without full progress streaming). Best-effort: every
@@ -1425,6 +1547,15 @@ task_need_notify() {
   TASK_GATE_DELIVERY_ROWS=0
   TASK_SEND_DELIVERED=0
   local _rc=0
+  # DIVE-3342: STAMP the gate's human owner here, once, before any delivery — the
+  # one point both the routed and unrouted filing paths pass through. Recorded
+  # rather than re-derived at send time for the DIVE-3171 reason: agents_org and
+  # human_agents are both writable state, so a chart edit between filing and the
+  # 24h rail expiry would silently move a live gate to a different person, and the
+  # row would have no witness to what the routing DECIDED. Never overwrites an
+  # existing value (an explicit `--owner=` or an earlier stamp on a re-nagged
+  # gate); empty when nobody resolves, which is a real answer and not a broadcast.
+  _task_stamp_human_owner "$1" || true
   if [[ -n "${TASK_GATE_ROUTE_TO:-}" ]]; then
     _task_need_route_deliver "$@" || _rc=$?
   else
@@ -1514,7 +1645,9 @@ _task_need_route_deliver() {
     # No scratch dir means no rc channel, so the send would be unobservable again.
     # Send it anyway (delivery beats measurement) but record the blind spot as what
     # it is rather than claiming a verdict we cannot have.
-    ( 5dive agent send "$reviewer" "$msg" --from="$filer" >/dev/null 2>&1 & ) || true
+    # DIVE-3318: a one-way machine notice nobody replies to is not a round — see
+    # a2a_round_guard. NOT a sender exemption; never set this by hand.
+    ( _5DIVE_A2A_NOTIFY=1 5dive agent send "$reviewer" "$msg" --from="$filer" >/dev/null 2>&1 & ) || true
     TASK_GATE_ROUTE_STATE="inflight"
     _task_gate_delivery_log error "$ident" "agent:${reviewer}" "" \
       "lead-route handoff to ${reviewer} dispatched UNOBSERVED: no writable scratch dir for the send's exit status" \
@@ -1526,7 +1659,9 @@ _task_need_route_deliver() {
   # cleanup has a single owner and cannot race the parent's poll).
   ( {
       local _crc=0 _cout=""
-      _cout=$(5dive agent send "$reviewer" "$msg" --from="$filer" 2>&1) || _crc=$?
+      # DIVE-3318: a one-way machine notice nobody replies to is not a round — see
+      # a2a_round_guard. NOT a sender exemption; never set this by hand.
+      _cout=$(_5DIVE_A2A_NOTIFY=1 5dive agent send "$reviewer" "$msg" --from="$filer" 2>&1) || _crc=$?
       if (( _crc == 0 )); then
         _task_gate_delivery_log ok "$ident" "agent:${reviewer}" "" \
           "lead-route handoff delivered to ${reviewer} (${role}) via 5dive agent send"
@@ -1836,7 +1971,7 @@ _task_need_notify_deliver() {
     esac
   fi
 
-  _task_send_owner "$text" "$reply_markup" "$numid"
+  _task_send_gate_owner "$text" "$reply_markup" "$numid"
   return 0
 }
 

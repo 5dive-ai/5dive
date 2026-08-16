@@ -1,3 +1,13 @@
+# DIVE-3318: `a2a_round_guard` and `a2a_rounds_report` live in src/lib/a2a_rounds.sh.
+# In the BUILT bundle that file is cat'd ahead of this one and this line is dead
+# code (build.sh's "lib/ helpers -> cmd_*" ordering). In the SPLIT tree it is
+# load-bearing: the unit harnesses source individual cmd_* files with a minimal
+# lib set, and without this an `agent send` path hits `a2a_round_guard: command
+# not found` and dies at rc=3 — which is what tests/agent_send_unconfirmed_unit.sh
+# caught. Same shape as src/cmd_task.sh's module loader.
+declare -F a2a_round_guard >/dev/null 2>&1 \
+  || . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/a2a_rounds.sh"
+
 # cmd_digest — deterministic per-fleet standup digest (DIVE-544 Tier 1).
 #
 # Builds the overnight recap from data every fleet already has: the task queue
@@ -825,6 +835,20 @@ else:
                "still-stuck are as-of-now readings, unchanged by the window.")
     print("\n".join(out))
 PY
+
+  # DIVE-3318 clause 3: the per-sender send/bytes split and live round pressure.
+  # Appended to the rendered text rather than threaded through the python block,
+  # because its two sources (the audit log and the round ledger) are files this
+  # shell can read and the renderer deliberately takes only staged JSON.
+  #
+  # TEXT MODE ONLY. `out.txt` holds a JSON DOCUMENT under --json, and appending a
+  # text block to it produces a file that is neither — which is not a cosmetic
+  # defect: `5dive proof` parses `digest --json` and died on a traceback
+  # (tests/rollback_rate_unit.sh, 35/35 on origin/main -> 33/35 with the
+  # unconditional append). A machine-readable stream has exactly one shape.
+  if [ "$as_json" != 1 ]; then
+    a2a_rounds_report "$window" >>"$tmpd/out.txt" 2>/dev/null || true
+  fi
 
   if [ "$do_send" = 1 ]; then
     # Deliver via the same paired-chat path the gate alerts use (follows

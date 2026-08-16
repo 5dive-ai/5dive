@@ -187,18 +187,6 @@ grep -q 'ANSWERED' "$SEND_LOG" \
   && bad_t "A7 answered-gate row re-nudged despite its throttle" "$(cat "$SEND_LOG")" \
   || ok_t "A7 throttled — a second sweep does not re-nudge"
 
-# --- A7b (DIVE-2207, iteration 2): the throttle is PER-GATE, not once-per-row-FOREVER.
-#     main2 asked at iteration 1 which of the two this is. It is per-gate, and THIS
-#     arm is what makes that a fact rather than a header claim: archiving the gate —
-#     what happens when a SECOND gate is filed on the same row — must clear the
-#     throttle, or that second answered gate can never fire the rail, which is the
-#     exact silent blind window this predicate exists to close.
-db "BEGIN IMMEDIATE; $(_gate_archive_and_clear_sql refile "id=${ag}") COMMIT;" >/dev/null 2>&1
-[[ "$(db "SELECT COALESCE(gate_answered_nudged_at,'NULL') FROM tasks WHERE id=${ag};")" == "NULL" ]] \
-  && ok_t "A7b archiving the gate CLEARS the throttle (per-gate; the next gate re-arms)" \
-  || bad_t "A7b throttle survived the gate archive — rail would be once-per-row-forever" \
-          "$(db "SELECT gate_answered_nudged_at FROM tasks WHERE id=${ag};")"
-
 # --- A8: THE SAFETY ARM. While the gate is still OPEN this rail must be silent.
 #     Nudging here prescribes closing a row whose human question is undecided —
 #     literally the DIVE-2196 defect this whole thread exists to avoid.

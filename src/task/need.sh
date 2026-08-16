@@ -1328,6 +1328,7 @@ _gate_tapback_stats() {
 cmd_task_need() {
   tasks_db_init
   local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw="" discusses="" needs="" oob="" rubber_stamp="" gate_mode=""
+  local gate_owner=""   # DIVE-3342
   # DIVE-2627: which flag supplied each prose value (see _read_prose_file).
   local ask_src="" recommend_src=""
   local -a positional=()
@@ -1376,6 +1377,14 @@ cmd_task_need() {
       # inferred — inferring it from --type or from the ask text would be the
       # DIVE-2089 mistake one layer up (reading subject matter to guess intent).
       --needs=*)     needs="${1#*=}" ;;
+      # DIVE-3342: name the PERSON this gate belongs to (humans.id). Optional — the
+      # filer usually should not have to say, and when they do not, task_need_notify
+      # resolves it from who may CLEAR the gate. Use it when the gate is somebody
+      # specific's (a spend approval only the budget holder can give) and the org
+      # chart does not express that.
+      --owner=*)     gate_owner="${1#*=}"
+                     [[ -n "$(db "SELECT 1 FROM humans WHERE id=$(sqlq "$gate_owner") LIMIT 1;" 2>/dev/null)" ]] \
+                       || fail "$E_NOT_FOUND" "no human account '$gate_owner' (5dive human ls; add it with: sudo 5dive human add $gate_owner --telegram=<chat id>)" ;;
       # DIVE-2848: the AUDITED exception to the keystroke cap below. Declared,
       # never inferred, and written to the gate row — an escape that leaves no
       # record is `--tier=2` with extra steps, which is the thing being fixed.
@@ -1458,8 +1467,20 @@ cmd_task_need() {
     # The lead route follows the PRINCIPAL, so it moves with it: condition 3 is "the
     # filer's lead", and resolving it from the holder would leave a second copy of the
     # same defect one rung up.
-    w_lead=$(_gate_route_reviewer "$w_filer")
-    w_coord=$(_task_resolve_coordinator)
+    # DIVE-3340 iter2: same rc-1-on-empty-filer shape as the cancel guard (see
+    # status.sh). PRE-EXISTING here — it fails identically on origin/main — and
+    # folded in under this row's filing cap rather than a new ident, because the
+    # two sites are one defect and splitting them leaves the half a reader lands
+    # on looking deliberate. Without it the withdraw refusal aborts rc=1 instead
+    # of naming its authorized set, on exactly the empty-filer rows a fresh
+    # customer box produces. NB this expression is COALESCE(gate_filed_by,
+    # created_by) while the cancel guard's is COALESCE(gate_filed_by, assignee) —
+    # a fixture must clear all three to reach the empty cell on both verbs.
+    # Graded by tests/gate_refusal_empty_filer_e2e.sh, which runs the BUILT
+    # bundle: the unit harness is `set -uo pipefail` with no -e and therefore
+    # cannot reproduce an errexit abort at all.
+    w_lead=$(_gate_route_reviewer "$w_filer") || w_lead=""
+    w_coord=$(_task_resolve_coordinator) || w_coord=""
     [[ "$w_kind" == "human" ]] && w_ok=1                                    # a genuine human caller
     [[ -n "$w_name" && "$w_name" == "$w_filer" ]] && w_ok=1                # the filer
     [[ -n "$w_name" && -n "$w_lead"  && "$w_name" == "$w_lead"  ]] && w_ok=1  # filer's lead
@@ -1479,7 +1500,17 @@ cmd_task_need() {
     # and the reader needs to see that as a stated absence.
     w_who="the gate's filer (${w_filer:-unrecorded})"
     [[ -n "$w_holder" && "$w_holder" != "$w_filer" ]] && w_who+=" — held by ${w_holder}, who does NOT authorize a withdraw since they did not file it"
-    (( w_ok )) || policy_refuse "$E_AUTH_REQUIRED" gate-withdraw-not-authorized DIVE-1401 "$ident" "only ${w_who}, their lead (${w_lead:-none}), the org coordinator (${w_coord:-none}) or a human can withdraw this gate"
+    # DIVE-3340: SAY WHAT TO DO, not only who may. DIVE-2382 fixed the SET this message
+    # enumerates; it left the message a pure list of principals, which tells a refused
+    # caller nothing about how to make progress. That is the second half of the closed
+    # loop measured on a customer box 2026-08-12 — `cancel` sent the reader here, and
+    # here sent them nowhere. Answering does not consult this authorization block at all
+    # (it is the human's own act, and it clears the gate so the cancel guard stops
+    # firing), so it is the route a refused non-filer should be pointed at. Named after
+    # the set, not instead of it: a legitimate filer/lead/coordinator misreading their
+    # own name in the list is the DIVE-2106 failure, and dropping the enumeration to
+    # make room for the route would re-create it.
+    (( w_ok )) || policy_refuse "$E_AUTH_REQUIRED" gate-withdraw-not-authorized DIVE-1401 "$ident" "only ${w_who}, their lead (${w_lead:-none}), the org coordinator (${w_coord:-none}) or a human can withdraw this gate. If that is not you, do NOT hunt for a way in — $(_gate_answer_route "$ident" "$w_type"), which needs none of the above and unblocks the row (a cancel is then accepted too). Withdrawing only retires a question that is MOOT; answering is what a still-live one wants."
     # Clear every gate field and unblock back to todo when no dependency edge
     # still holds it. The withdrawn gate is archived to gate_history first, in
     # the same transaction (DIVE-2119).
@@ -2493,6 +2524,15 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
   # nothing in the output distinguished it from success. One cheap read-back turns
   # the whole class (bad SQL, a locked store, a failed BEGIN IMMEDIATE) from a
   # false green into a refusal, BEFORE anyone is notified about it.
+  # DIVE-3342: an explicitly declared owner is written here, on the row, before
+  # anything is notified — task_need_notify then stamps only when this is empty, so
+  # the filer's declaration always beats the resolver. Validated at parse time
+  # against a LIVE human row: a typo'd owner that silently fell back to resolution
+  # would be the confident-wrong-recipient failure this ticket is about.
+  if [[ -n "$gate_owner" ]]; then
+    db "UPDATE tasks SET human_owner=$(sqlq "$gate_owner") WHERE id=${id};" 2>/dev/null || true
+  fi
+
   if [[ "$(db "SELECT CASE WHEN status='blocked' AND need_type IS NOT NULL
                              AND need_asked_at IS NOT NULL THEN 1 ELSE 0 END
                FROM tasks WHERE id=${id};" 2>/dev/null)" != "1" ]]; then

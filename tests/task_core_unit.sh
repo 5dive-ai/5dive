@@ -333,10 +333,37 @@ r2=$(run add --assignee=charter:backend --body="w" -- "route by charter")
 [[ "$(echo "$r2" | jf '.data.assignee')" == "eng" ]] \
   && ok_t "--assignee=charter:backend resolves to eng" || bad_t "charter token resolve" "$(echo "$r2" | jf '.data.assignee')"
 
-# ambiguous role (two designers) is a hard, explainable error — never a guess
+# DIVE-3366 INVERTED THIS ARM, deliberately, and the old assertion is quoted here
+# because a reader finding a route where this file used to demand a refusal will
+# otherwise assume the guard rotted. It read:
+#
+#   # ambiguous role (two designers) is a hard, explainable error — never a guess
+#   run add --assignee=role:designer ... ; [[ $? -ne 0 && err == *"unique holder"* ]]
+#
+# The refusal was the lane skew. Two seats on a role is the case where routing
+# has the MOST to say, and answering it with an error sent the filer back to
+# typing a name — and the name a filer remembers is the busiest seat (measured
+# 2026-08-13: quinn 14 open, main2 0, both verifiers, lodar raising it three
+# times in one day). A role with two holders now routes to the idler and RECORDS
+# the counts that chose it; tests/task_role_routing_unit.sh grades that rail.
+#
+# `_org_resolve_assignee` itself is unchanged — it still returns empty on two
+# holders, which is what `goal validate` needs — so the arms above still pass and
+# the widening lives at the `task add` call site only.
 run add --assignee=role:designer --body="w" -- "ambiguous role" >/dev/null 2>"$TMP"/err
+rc_amb=$?
+amb_who=$(db "SELECT assignee FROM tasks WHERE title='ambiguous role';")
+amb_body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE title='ambiguous role';")
+[[ $rc_amb -eq 0 && ( "$amb_who" == "d1" || "$amb_who" == "d2" ) && "$amb_body" == *"ROUTED BY LOAD"* ]] \
+  && ok_t "two-holder role routes by load and records the pick (DIVE-3366, was a refusal)" \
+  || bad_t "two-holder role routes by load" "rc=$rc_amb who=$amb_who body=$amb_body err=$(cat "$TMP"/err)"
+
+# AND THE REFUSAL STILL EXISTS for the case that has no answer: a role NO seat
+# holds. DIVE-3366 widened the two-holder empty into a route; it must not have
+# turned the zero-holder empty into one, which would land a row on nobody.
+run add --assignee=role:nosuchrole --body="w" -- "unheld role" >/dev/null 2>"$TMP"/err
 [[ $? -ne 0 && "$(cat "$TMP"/err)" == *"unique holder"* ]] \
-  && ok_t "ambiguous role token rejected (explainable)" || bad_t "ambiguous role guard" "$(cat "$TMP"/err)"
+  && ok_t "a role NO seat holds is still refused (explainable)" || bad_t "unheld role guard" "$(cat "$TMP"/err)"
 
 # unknown role token is rejected too
 run add --assignee=role:ghost --body="w" -- "unknown role" >/dev/null 2>"$TMP"/err

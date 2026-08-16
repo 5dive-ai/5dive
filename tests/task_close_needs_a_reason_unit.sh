@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # TIER: nightly — 36s measured on the control-plane VM (bare `bash tests/task_close_needs_a_reason_unit.sh`,
 # built tree, 2026-08-05): does not fit the 300s PR core, where it would be 12% of the whole
+# DIVE-3340 (13 arms added, M/N/P): 12.5s on the control plane, bare bash in a SRC worktree with
+# no built bundle, against a 9.3s baseline run of origin/main's copy of this file on the same box
+# and the same src — so the arms cost +3.2s (two samples each, low sample kept per the one-sided-
+# noise rule). That 12.5s is a DIFFERENT instrument from the 36s above, not a refutation of it, so
+# the header number and the tier are left standing rather than replaced across instruments —
+# re-tiering on a number measured a different way is how a stale claim gets minted.
 # budget on its own. Nothing here is network-priced — the cost is ~20 real `task add`/close/
 # reject round-trips through the audit, reclaim and cascade rails, and the arms that make this
 # harness worth having (F, G, K, L) are precisely the ones that need the REAL rail rather than a
@@ -193,6 +199,142 @@ as dev cmd_task_cancel "$H" --result="withdrew the gate, then abandoned the work
 (( i2_rc == 0 )) && [[ "$(status_of "$H")" == "cancelled" ]] \
   && ok_t "I: after the withdrawal the cancel lands (rc=0)" \
   || bad_t "I: the row is wedged — neither close verb works after a withdrawal" "rc=$i2_rc status=$(status_of "$H")"
+
+# ── M/P (DIVE-3340): BOTH REFUSALS NAME THE HUMAN-SIDE EXIT ───────────────────
+# Arms H..I above prove the named exit WORKS. They cannot see that it is the wrong
+# exit for most readers of the message. Measured on a customer box 2026-08-12: the
+# box owner tried to cancel his own row through the chat bot, was told "withdraw it
+# first", and the withdraw refused him — `--withdraw` authorizes on
+# human/filer/lead/coordinator and a person typing into a bot is NONE of those (the
+# command executes on an agent seat and the human's identity deliberately does not
+# travel through the bot: DIVE-1401/DIVE-2330 fail closed on purpose). Two
+# individually-correct refusals composing into a closed loop.
+#
+# ANSWERING is the exit that needs no authorization at all, and neither refusal named
+# it. These arms assert it is named on both, and named FIRST on the one a human reads.
+#
+# THESE ARE THE NEGATIVE CONTROLS, and the direction of the mutation is the point:
+# the pre-DIVE-3340 text passes any assertion that only greps for "withdraw", so a
+# substring test written against the old message grades nothing here. Restoring either
+# old string with the code untouched must red these arms and only these.
+# See community/wiki/a-refusal-that-names-a-smaller-set-than-the-code-checked.md.
+#
+# Fixture, not `task need`: same reasoning as arm H — this grades refusal TEXT, and
+# routing through the filing path drags the tier floor and the ping rails into an
+# assertion that is not about them.
+gate_row() { # $1=title suffix  $2=need_type  $3=gate_filed_by  -> prints ident
+  local _g; _g=$(add "DIVE-3340 $1" --assignee=dev)
+  db "UPDATE tasks SET need_type=$(sqlq "$2"), ask='which surface?', need_answered_at=NULL,
+        gate_filed_by=$(sqlq "$3"), tier=2 WHERE ident=$(sqlq "$_g");"
+  printf '%s' "$_g"
+}
+gate_type_of() { db "SELECT COALESCE(need_type,'') FROM tasks WHERE ident=$(sqlq "$1");"; }
+
+M=$(gate_row "cancel refusal" decision dev)
+[[ "$(gate_type_of "$M")" == "decision" ]] \
+  && ok_t "M/REACHABILITY: the fixture row really carries a pending decision gate" \
+  || bad_t "M/REACHABILITY: gate fixture did not take — every M arm is vacuous" "got '$(gate_type_of "$M")'"
+as dev cmd_task_cancel "$M" --result="abandoning this" >/dev/null; m_rc=$?
+m_err=$(cat "$TMP"/err)
+(( m_rc != 0 )) && [[ "$(status_of "$M")" == "todo" ]] \
+  && ok_t "M/REACHABILITY: the cancel is refused, so the text under test is the one that shipped" \
+  || bad_t "M/REACHABILITY: the cancel was not refused — the M text arms grade nothing" "rc=$m_rc status=$(status_of "$M")"
+[[ "$m_err" == *"5dive task answer $M --value="* ]] \
+  && ok_t "M1: the cancel refusal names the ANSWER route (the exit a human can take)" \
+  || bad_t "M1: the cancel refusal does not name the answer route" "err='$m_err'"
+[[ "$m_err" == *"5dive task need $M --withdraw"* ]] \
+  && ok_t "M2: and it still names --withdraw (the agent-side exit is not dropped)" \
+  || bad_t "M2: --withdraw vanished from the cancel refusal" "err='$m_err'"
+# ORDER, asserted rather than assumed: the acceptance is the human route FIRST. Both
+# substrings are already proven present by M1/M2, so the prefix-length compare is a
+# real position test and not two absences reading equal.
+m_pre_ans="${m_err%%5dive task answer*}"; m_pre_wd="${m_err%%5dive task need*}"
+(( ${#m_pre_ans} < ${#m_pre_wd} )) \
+  && ok_t "M3: the answer route is named BEFORE --withdraw (${#m_pre_ans} < ${#m_pre_wd})" \
+  || bad_t "M3: --withdraw is still named first — the door the reader cannot open" "ans@${#m_pre_ans} withdraw@${#m_pre_wd}"
+# The withdraw route now carries its authorized set inline, so a chat-bot seat learns
+# from the FIRST refusal that route 2 is closed to it instead of discovering it on the
+# second. Without this the message still sends the reader into the loop, just later.
+[[ "$m_err" == *"org coordinator"* && "$m_err" == *"genuine human unix caller"* ]] \
+  && ok_t "M4: the cancel refusal states WHO may withdraw, so a bot seat is not sent into the loop" \
+  || bad_t "M4: --withdraw is still published as unconditionally available" "err='$m_err'"
+
+# The route is TYPE-SHAPED, and publishing the wrong verb is the same defect one layer
+# down: a secret must never be typed into the board and a manual gate records that the
+# step was PERFORMED, so both take `task answer` with NO --value. A single hardcoded
+# `--value=` sentence would be a refusal naming a route that refuses.
+for _gt3340 in manual secret; do
+  N=$(gate_row "cancel refusal / $_gt3340" "$_gt3340" dev)
+  [[ "$(gate_type_of "$N")" == "$_gt3340" ]] \
+    || bad_t "N/REACHABILITY[$_gt3340]: gate fixture did not take — the arm is vacuous" "got '$(gate_type_of "$N")'"
+  as dev cmd_task_cancel "$N" --result="abandoning this" >/dev/null
+  n_err=$(cat "$TMP"/err)
+  [[ "$n_err" == *"5dive task answer $N"* && "$n_err" == *"NO --value"* && "$n_err" != *"--value=<answer>"* ]] \
+    && ok_t "N[$_gt3340]: the refusal's answer route says NO --value (never a value on this type)" \
+    || bad_t "N[$_gt3340]: the refusal published the --value form on a $_gt3340 gate" "err='$n_err'"
+done
+
+# ── P: the WITHDRAW refusal points a non-filer at answering ───────────────────
+# The other half of the loop. Pre-DIVE-3340 this message was a pure list of
+# principals: correct (DIVE-2382 fixed the SET) and actionless, so `cancel` sent the
+# reader here and here sent them nowhere.
+P=$(gate_row "withdraw refusal" decision dev)
+p_lead=$(_gate_route_reviewer dev); p_coord=$(_task_resolve_coordinator)
+# DISTINCTNESS, and it is load-bearing: if the caller happens to BE the filer's lead
+# or the coordinator the withdraw SUCCEEDS and every P arm below grades a message that
+# was never emitted. A fixture where two authorization routes share one agent name
+# tests their union and neither of them (DIVE-2382's own fixture had this bug).
+[[ "outsider" != "dev" && "outsider" != "$p_lead" && "outsider" != "$p_coord" ]] \
+  && ok_t "P/DISTINCTNESS: caller 'outsider' is not the filer (dev), its lead ('${p_lead:-none}') or the coordinator ('${p_coord:-none}')" \
+  || bad_t "P/DISTINCTNESS: the caller shares an authorization route — the P arms are vacuous" "lead='$p_lead' coord='$p_coord'"
+as outsider cmd_task_need "$P" --withdraw >/dev/null; p_rc=$?
+p_err=$(cat "$TMP"/err)
+(( p_rc != 0 )) && [[ "$(gate_type_of "$P")" == "decision" ]] \
+  && ok_t "P/REACHABILITY: a non-filer agent's withdraw is refused and the gate survives (rc=$p_rc)" \
+  || bad_t "P/REACHABILITY: the withdraw was NOT refused — the P text arms grade nothing" "rc=$p_rc need_type='$(gate_type_of "$P")'"
+[[ "$p_err" == *"5dive task answer $P --value="* ]] \
+  && ok_t "P1: the withdraw refusal points the refused caller at ANSWERING" \
+  || bad_t "P1: the withdraw refusal still only lists who may — no route out" "err='$p_err'"
+# DIVE-2382's set must survive the addition. Dropping the enumeration to make room for
+# the route would re-create the failure that ticket fixed: a legitimate
+# filer/lead/coordinator has to be able to find their own name in the list.
+[[ "$p_err" == *"the gate's filer (dev)"* && "$p_err" == *"org coordinator (${p_coord:-none})"* ]] \
+  && ok_t "P2: and DIVE-2382's resolved-value enumeration is still intact" \
+  || bad_t "P2: the DIVE-2382 principal enumeration regressed" "err='$p_err'"
+
+# ── (Q lives elsewhere) EMPTY-FILER refusal: tests/gate_refusal_empty_filer_e2e.sh ─
+# The iteration-1 regression main2 found (an empty gate filer aborting the cancel
+# refusal rc=1 under errexit) CANNOT be graded from this file. This harness runs
+# `set -uo pipefail` — no `-e` — so it has no errexit to abort. Arms written here
+# passed identically with the guard present and absent (measured, 39/0 both ways),
+# which is a vacuous arm wearing a pass. They moved to a harness that builds the
+# real bundle, because `set -euo pipefail` only exists there (src/header.sh:14).
+
+# ── R: `task show --json` exports the VERDICTS, not just the raw gate inputs ───
+# main2's second defect is a CONSUMER of this. The telegram plugin's task-detail
+# view calls `task show --json` and had to rebuild "is a gate open" from
+# need_type/need_answered_at, which omits the status clause — so 19 live
+# done/cancelled rows with a lingering gate rendered "waiting on a HUMAN ANSWER".
+# `ls --json` has carried gate_live/needs_human since DIVE-1347/DIVE-3267; `show`
+# returned NULL because `SELECT *` yields stored columns only. The arm that
+# matters is the TERMINAL one — a verdict that is right on open rows and absent
+# on closed ones is the bug, not the fix.
+R=$(gate_row "show json verdict" decision dev)
+r_open=$(as dev cmd_task_show "$R" | jq -r '.data.task.gate_live // "ABSENT"')
+r_hum=$(as dev cmd_task_show "$R" | jq -r '.data.task.needs_human // "ABSENT"')
+[[ "$r_open" == "1" && "$r_hum" == "1" ]] \
+  && ok_t "R1: an OPEN gated row exports gate_live=1 and needs_human=1 on show --json" \
+  || bad_t "R1: show --json does not export the verdicts" "gate_live='$r_open' needs_human='$r_hum'"
+db "UPDATE tasks SET status='cancelled' WHERE ident=$(sqlq "$R");"
+r_tclosed=$(as dev cmd_task_show "$R" | jq -r '.data.task.gate_live')
+r_thum=$(as dev cmd_task_show "$R" | jq -r '.data.task.needs_human')
+r_traw=$(as dev cmd_task_show "$R" | jq -r '.data.task.need_type // "ABSENT"')
+[[ "$r_traw" == "decision" ]] \
+  && ok_t "R/DISTINCTNESS: the terminal row still carries the RAW need_type, so the inputs and the verdict genuinely disagree here" \
+  || bad_t "R/DISTINCTNESS: need_type vanished — R2 would pass for the wrong reason" "need_type='$r_traw'"
+[[ "$r_tclosed" == "0" && "$r_thum" == "0" ]] \
+  && ok_t "R2: a CANCELLED row with a lingering gate exports gate_live=0 / needs_human=0" \
+  || bad_t "R2: a terminal row still reads as an open human gate" "gate_live='$r_tclosed' needs_human='$r_thum'"
 
 # ── K: `task reject` on a DELIVERED (todo) row PRESERVES the maker's result ───
 # THE DIVE-2762 CLASS, ONE VERB OVER. reject kept a PRIVATE copy of the old,

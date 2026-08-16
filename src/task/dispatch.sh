@@ -32,11 +32,15 @@ _task_usage() {
                                                 closed row; 'none' detaches). Name the parent by
                                                 IDENT — a bare number is the global row id, which
                                                 is NOT the ident number
+  orphans [--all]                               rows whose assignee/verifier/creator is not a
+                                                registered agent (undispatchable, DIVE-3344)
   wip-cap-install [--relane=<lane>]             snapshot each lane's actionable count as its
                                                 frozen WIP ceiling (deliberate, once)
-  set-budget <id> <tokens|\$cost|none>           raise/lower the token budget, or 'none' to exempt
+  set-budget <id> <tokens|\$cost|none>           record an ADVISORY per-row token budget. Nothing enforces it
+                                                (DIVE-3343: a row's own token spend is not measurable, so the
+                                                guard that parked on it was removed). Use the per-agent cost
+                                                budget for a control that actually halts
   set-overlap <tmpl> <skip|spawn> [bound]       recurring template: does an open instance suppress the next slot?
-                                                the row from the enforced ${_TASK_BUDGET_BUILTIN:-5000000}-token default
 
   start <id>                                    -> in_progress
   done <id> [--result=<text>|--result-file=<path>] [--no-graded-sha]
@@ -231,6 +235,7 @@ cmd_task() {
     set-budget)      cmd_task_set_budget "$@" ;;
     set-overlap)     cmd_task_set_overlap "$@" ;;
     wip-cap-install) cmd_task_wip_cap_install "$@" ;;
+    orphans)         cmd_task_orphans "$@" ;;       # DIVE-3344 undispatchable rows
     start)           cmd_task_start "$@" ;;
     done|close)      cmd_task_done "$@" ;;
     deliver)         cmd_task_deliver "$@" ;;
@@ -446,13 +451,20 @@ cmd_task_wip_cap_install() {
     esac
     shift
   done
-  local lane n installed=0 lines=""
+  local lane n installed=0 lines="" skipped_lanes=""
   while IFS= read -r lane; do
     [[ -n "$lane" ]] || continue
     [[ -z "$one" || "$lane" == "$one" ]] || continue
     if [[ -z "$one" ]]; then
       local have; have=$(db "SELECT value FROM task_prefs WHERE key=$(sqlq "wip_cap:$lane");" 2>/dev/null || echo "")
       [[ "$have" =~ ^[0-9]+$ ]] && continue     # already installed: never re-snapshot
+    fi
+    # DIVE-3344: this loop reads the SAME unvalidated column, and it minted
+    # `wip_cap:cli` in task_prefs — a lane ceiling for an agent that does not
+    # exist. A cap on a name nothing dispatches to is not a control, it is a row
+    # that makes the fake lane look real to the next reader of task_prefs.
+    if ! _task_roster_has "$lane" && [[ "$_TASK_ROSTER_STATE" == "ok" ]]; then
+      skipped_lanes+="  ${lane}"$'\n'; continue
     fi
     n=$(_task_lane_actionable "$lane")
     [[ "$n" =~ ^[0-9]+$ ]] || continue
@@ -464,8 +476,99 @@ cmd_task_wip_cap_install() {
         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
     installed=$((installed+1)); lines+="  ${lane}: ${n}"$'\n'
   done < <(db "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL AND assignee!='' AND kind='standard';" 2>/dev/null)
+  # NAMED, not silently dropped. A skip that prints nothing is how `wip_cap:cli`
+  # got there in the first place — the installer's own output said only how many
+  # lanes it wrote.
   ok "installed WIP caps for ${installed} lane(s)${lines:+
-$lines}" '{installed:$n}' --argjson n "${installed:-0}"
+$lines}${skipped_lanes:+
+  skipped — not a registered agent (see: 5dive task orphans):
+$skipped_lanes}" '{installed:$n, skippedLanes:($s|split("\n")|map(select(length>0)|ltrimstr("  ")))}' \
+    --argjson n "${installed:-0}" --arg s "$skipped_lanes"
+}
+
+# DIVE-3344 — the SURFACER. Prevention at the write does nothing for the rows
+# already sitting on a dead lane, and those are the whole reported symptom: the
+# customer's 7 `assignee='cli'` rows and our 3 sat silent for months because an
+# undispatchable row is indistinguishable from a row whose turn has not come.
+#
+# Three columns, because all three are dispatch or routing targets and all three
+# were unvalidated:
+#   assignee    -> nothing wakes it. The row is never picked.
+#   verifier    -> the row orphans at HANDOFF, one step later.
+#   created_by  -> every gate this row files routes to a creator who is not there
+#                  (the reported DIVE-350, orphaned since 2026-07-29). Sentinels
+#                  (`cli`, `council`, `lodar`, …) are legal here and excluded.
+#
+# REFUSES TO ANSWER when the roster is unestablished rather than calling every row
+# an orphan — an unreadable registry would otherwise print the whole board as
+# broken, which is the loudest possible way to be wrong.
+cmd_task_orphans() {
+  tasks_db_init
+  local all=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all) all=1 ;;   # include closed rows (historical audit)
+      -*) fail "$E_USAGE" "unknown flag: $1 (usage: 5dive task orphans [--all])" ;;
+    esac
+    shift
+  done
+  local lanes; lanes=$(_task_roster_sql_notin)
+  if [[ -z "$lanes" ]]; then
+    fail "$E_GENERIC" "cannot list orphans: the agent roster is ${_TASK_ROSTER_STATE} — with no roster every row would look orphaned, which is worse than no answer. Fix the registry first: 5dive doctor"
+  fi
+  local sentinels="" p
+  for p in $_TASK_PRINCIPAL_SENTINELS; do sentinels+="${sentinels:+,}$(sqlq "$p")"; done
+  local scope="status IN ('todo','in_progress','blocked')"
+  [[ -n "$all" ]] && scope="1=1"
+  # NULLIF(...,'') so dbfmt's null-key pruning drops the columns that found
+  # nothing — a present `badAssignee` key then MEANS a bad assignee.
+  local q="SELECT ident, status,
+       NULLIF(CASE WHEN assignee   IS NOT NULL AND assignee   NOT IN (${lanes}) THEN assignee   ELSE '' END,'') AS badAssignee,
+       NULLIF(CASE WHEN verifier   IS NOT NULL AND verifier   NOT IN (${lanes}) THEN verifier   ELSE '' END,'') AS badVerifier,
+       NULLIF(CASE WHEN created_by IS NOT NULL AND created_by NOT IN (${lanes}) AND created_by NOT IN (${sentinels}) THEN created_by ELSE '' END,'') AS badCreator,
+       substr(title,1,60) AS title
+     FROM tasks
+     WHERE ${scope} AND kind='standard'
+       AND (   (assignee   IS NOT NULL AND assignee   NOT IN (${lanes}))
+            OR (verifier   IS NOT NULL AND verifier   NOT IN (${lanes}))
+            OR (created_by IS NOT NULL AND created_by NOT IN (${lanes}) AND created_by NOT IN (${sentinels})))
+     ORDER BY id;"
+  local rows; rows=$(dbfmt -json "$q")
+  # dbfmt -json prints NOTHING for an empty result set (deliberate, DIVE-1610) —
+  # not "[]". Normalise before jq so a clean board is a clean board and not a
+  # parse error reported as zero orphans.
+  [[ -n "$rows" ]] || rows='[]'
+  local n; n=$(printf '%s' "$rows" | jq 'length')
+  local scope_label; scope_label=$([[ -n "$all" ]] && echo all || echo open)
+  if [[ "${n:-0}" == "0" ]]; then
+    ok "no orphaned rows — every assignee, verifier and creator on the ${scope_label} board names a registered agent" \
+       '{orphans:0, scope:$s}' --arg s "$scope_label"
+    return 0
+  fi
+  # Read the JSON back rather than the raw sqlite3 output: `db` uses the default
+  # `|` separator and a task TITLE may contain one, which would split a row.
+  local out="" line ident st marks val col hint
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    ident=$(printf '%s' "$line" | jq -r '.ident'); st=$(printf '%s' "$line" | jq -r '.status')
+    marks=""
+    for col in badAssignee badVerifier badCreator; do
+      val=$(printf '%s' "$line" | jq -r --arg k "$col" '.[$k] // empty')
+      [[ -n "$val" ]] || continue
+      hint=$(_task_roster_nearmiss "$val")
+      marks+="${marks:+, }${col#bad}='${val}'"
+      # NOT `$([[ -n "$hint" ]] && printf …)`: on the no-hint path that
+      # substitution exits 1, and an assignment takes the substitution's status —
+      # which under the bundle's `set -euo pipefail` killed this verb mid-listing
+      # with "exited 1 without reporting a reason".
+      if [[ -n "$hint" ]]; then marks+=" (did you mean '${hint}'?)"; fi
+    done
+    out+="  ${ident}  [${st}]  ${marks}"$'\n'"        $(printf '%s' "$line" | jq -r '.title // ""')"$'\n'
+  done < <(printf '%s' "$rows" | jq -c '.[]')
+  warn "${n} row(s) name something that is not a registered agent — an undispatchable row is never picked and never says so:
+${out}Re-point with: 5dive task assign <ident> <agent>   ·   roster: 5dive agent list"
+  ok "" '{orphans:($n|tonumber), scope:$s, rows:$rows}' \
+    --arg n "$n" --arg s "$scope_label" --argjson rows "$rows"
 }
 
 # DIVE-2272 (decision DIVE-2270). Classify an EXISTING recurring template.
