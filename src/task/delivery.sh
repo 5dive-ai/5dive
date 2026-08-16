@@ -459,6 +459,14 @@ _task_route_to_verifier() {
             started_at=NULL, handoff_ack_at=NULL,
             handoff_delivered_at=datetime('now'), handoff_stale_pinged_at=NULL${set_result}${set_binding_iter}
       WHERE id=${id};"
+  # DIVE-3349: close the session segment. This is the ONE status transition that
+  # returns BEFORE `_task_status_cmd`'s funnel, so the hook there cannot see it —
+  # and a delivered row is not being worked (it is sitting in the verifier's
+  # queue), so a segment left open here would keep charging this row for every
+  # later turn of a session that has moved on. `task deliver` with NO distinct
+  # verifier deliberately does NOT reach this line: it leaves the row in_progress
+  # and the maker is still working, so its segment stays open.
+  _task_session_close "$id"
   local iter; iter=$(db "SELECT iteration FROM tasks WHERE id=${id};")
   local iter_note=""
   [[ "$iter" == "$prev_iter" ]] && iter_note=" — re-delivery of the same pass, not rework"

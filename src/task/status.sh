@@ -1734,6 +1734,17 @@ $_body"
     set_result=", result=$(sqlq_or_null "$result")"
   fi
   db "UPDATE tasks SET status=$(sqlq "$newstatus")${extra}${set_result} WHERE id=${id};"
+  # DIVE-3349: the SESSION SEGMENT, written from the one funnel every status verb
+  # crosses and immediately after the status write it describes — the same reason
+  # the audit row and the ledger row below sit here rather than in each verb: a
+  # fourth status verb added later cannot ship without its segment. Design, and
+  # why an absent session id is NULL rather than a fallback: src/lib/tasks_db.sh.
+  # Best-effort by construction; a bookkeeping insert must not fail a close that
+  # has already committed on the line above.
+  case "$newstatus" in
+    in_progress)             _task_session_open  "$id" ;;
+    done|cancelled|blocked)  _task_session_close "$id" ;;
+  esac
   [[ -n "$handoff_ack" ]] && handoff_ack_at=$(db "SELECT handoff_ack_at FROM tasks WHERE id=${id};")
   # DIVE-552: if this close finished a LOOP STEP, advance the relay — free the
   # next step (a freed agent step the heartbeat wakes; a freed gate fires its

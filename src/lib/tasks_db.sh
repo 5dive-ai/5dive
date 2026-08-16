@@ -831,6 +831,40 @@ CREATE TABLE IF NOT EXISTS loop_runs (
 );
 CREATE INDEX IF NOT EXISTS loop_runs_status_idx ON loop_runs(status);
 
+-- DIVE-3349: per-task token attribution — SEGMENTS of a session, appended on
+-- every start/stop transition. `CLAUDE_CODE_SESSION_ID` is in every agent seat's
+-- environment and is exactly the basename of that session's transcript, and
+-- `task start` runs INSIDE the session that will do the work — so the binding is
+-- READ at claim time instead of inferred from a window. Compiled:
+-- community/wiki/per-task-token-attribution-the-session-id-is-the-signal.md.
+--
+-- Segments, NOT a session column on `tasks`, and the two hard cases are why: a
+-- session that picks up a second row must yield two DIFFERENT figures (disjoint
+-- segments), and a row worked across several sessions must SUM (several segments
+-- carrying one task_id). A single column answers neither.
+--
+-- `agent` is the fifth column the design note does not name, and it is here to
+-- FIND the file rather than to answer the question: the transcript is chmod 600
+-- under the seat's own home, so without the seat there is no path to open and the
+-- reader would have to fan out across every home — the unreadable scan the
+-- assignee-keyed version already pays for.
+--
+-- session_id NULL is the invocation with no session at all (cron, a human shell,
+-- a non-claude agent type). It reads NOT-REACHED and must NEVER fall back to the
+-- assignee-window sum: that reinstates the quantity DIVE-3343 removed for being
+-- unmeasurable, under a name that now sounds measured.
+-- Fully additive — never referenced by tasks/projects, so it cannot touch the queue.
+CREATE TABLE IF NOT EXISTS task_sessions (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id    INTEGER NOT NULL,
+  session_id TEXT,
+  agent      TEXT,
+  started_at TEXT NOT NULL,
+  ended_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS task_sessions_task_idx    ON task_sessions(task_id);
+CREATE INDEX IF NOT EXISTS task_sessions_session_idx ON task_sessions(session_id);
+
 -- DIVE-1349: async goal-planner jobs. `goal add` (default, no --wait) spawns the
 -- planner loop WITHOUT blocking and records the job here, returning a job id
 -- immediately so the dashboard goals page never holds an HTTP request past the
@@ -1862,6 +1896,28 @@ CREATE TABLE IF NOT EXISTS loop_runs (
   updated_at       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS loop_runs_status_idx ON loop_runs(status);
+MIG
+  fi
+
+  # DIVE-3349 task_sessions table — additive, gated on absence like loop_runs
+  # above so it takes no write lock on every command. Brand-new table, never
+  # referenced by tasks/projects. See the CREATE TABLE comment for why this is
+  # segments and why `agent` is a column.
+  local has_task_sessions
+  has_task_sessions=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_sessions' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_task_sessions" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" <<'MIG' >/dev/null 2>&1 || true
+CREATE TABLE IF NOT EXISTS task_sessions (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id    INTEGER NOT NULL,
+  session_id TEXT,
+  agent      TEXT,
+  started_at TEXT NOT NULL,
+  ended_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS task_sessions_task_idx    ON task_sessions(task_id);
+CREATE INDEX IF NOT EXISTS task_sessions_session_idx ON task_sessions(session_id);
 MIG
   fi
 
@@ -3156,4 +3212,73 @@ policy_refuse() {
     idem="refuse:${policy}:${ident}:$(date +%s%N 2>/dev/null || echo $$)" \
     in="$msg" detail="${policy}${ticket:+ (${ticket})} — refused with code ${code}"
   fail "$code" "$msg"
+}
+
+# --- DIVE-3349: session segments — the per-task token signal ------------------
+#
+# See the `task_sessions` CREATE TABLE comment for the design and for why an
+# absent session id is NULL rather than a fallback. These two writers are called
+# from the ONE funnel every status verb crosses (`_task_status_cmd`) and from the
+# delivery fork that returns before it (`_task_route_to_verifier`), for the same
+# reason the audit row there is: a fourth status verb added later cannot ship
+# without its segment.
+#
+# Both are best-effort and NEVER fail the status write that already committed. A
+# missing segment reads NOT-REACHED downstream, which is the honest outcome; a
+# `task done` that errored because a bookkeeping insert failed would not be.
+
+# _task_session_env_id — the current session id, or empty.
+# VALIDATED, not merely read: this value later names a file we open, and the
+# reader globs `<home>/.claude/projects/*/<id>.jsonl`. A value carrying `/` or `*`
+# from a hostile or broken environment would widen that glob past the one
+# transcript it is supposed to name, so anything that is not a plain basename is
+# treated as ABSENT (NULL → NOT-REACHED) rather than stored and trusted.
+_task_session_env_id() {
+  local s="${CLAUDE_CODE_SESSION_ID:-}"
+  [[ "$s" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{7,}$ ]] || return 0
+  printf '%s' "$s"
+}
+
+# _task_session_open <task_id> — append a segment for the CURRENT session.
+# Idempotent per (task, session): a second `task start` inside the same session
+# leaves the open segment alone instead of opening a second one, so a re-claim
+# cannot manufacture a self-overlap and turn its own row AMBIGUOUS.
+_task_session_open() {
+  local id="$1"; [[ "$id" =~ ^[0-9]+$ ]] || return 0
+  local sid who open
+  sid=$(_task_session_env_id)
+  # The seat, derived from the CALLER'S UID through the sealed seam — never from
+  # $SUDO_USER, and this is a correction the fixture forced rather than a
+  # preference. `agent`'s whole job is to name the home the reader will open a
+  # transcript under, and `SUDO_USER` is an ordinary variable nothing verifies:
+  # DIVE-2518 closed exactly that path for actor attribution
+  # (`SUDO_USER=agent-olivia 5dive task ls --mine` acted as another agent and left
+  # no trace). Reading it here would have reopened the hole one column over, and
+  # the failure mode is the quiet one — the reader would look under the WRONG
+  # seat's home, find no transcript of that name, and report NOT-REACHED, which is
+  # indistinguishable from an honest un-instrumented row.
+  # A caller whose uid is not an `agent-*` seat (cron, a human shell, root) yields
+  # EMPTY, stored NULL, read NOT-REACHED — the same refusal as an absent session
+  # id, for the same reason: there is no home to open.
+  who=$(_gate_uid_to_agent "$(_gate_caller_uid)" 2>/dev/null) || who=""
+  open=$(db "SELECT 1 FROM task_sessions
+               WHERE task_id=${id} AND ended_at IS NULL
+                 AND session_id IS $(sqlq_or_null "$sid") LIMIT 1;" 2>/dev/null) || open=""
+  [[ "$open" == "1" ]] && return 0
+  db "INSERT INTO task_sessions (task_id, session_id, agent, started_at)
+      VALUES (${id}, $(sqlq_or_null "$sid"), $(sqlq_or_null "$who"), datetime('now'));" \
+    >/dev/null 2>&1 || true
+  return 0
+}
+
+# _task_session_close <task_id> — stamp ended_at on EVERY open segment of this
+# row, not just this session's. A row that stopped is not being worked in any
+# session, and a segment left open keeps accruing every later turn of a session
+# that has long since moved on to a different task — which is the window bug this
+# whole change exists to remove, rebuilt one segment at a time.
+_task_session_close() {
+  local id="$1"; [[ "$id" =~ ^[0-9]+$ ]] || return 0
+  db "UPDATE task_sessions SET ended_at=datetime('now')
+       WHERE task_id=${id} AND ended_at IS NULL;" >/dev/null 2>&1 || true
+  return 0
 }
