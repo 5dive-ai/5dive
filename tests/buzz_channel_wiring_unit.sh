@@ -136,6 +136,24 @@ JSON
     # The stub is the whole point: it stages NO plugin cache dir, so the gate
     # must refuse — exactly what a marketplace fetch failure looks like.
     install_channel_for_agent() { :; }
+    # DIVE-3450 gear 0: and BECAUSE the stub above guarantees the cache dir never
+    # appears, cmd_config's gate loop (src/cmd_agent_config.sh:399) is guaranteed
+    # to run to its full bound — 15 x `sleep 1`. That is 15.13s of this harness's
+    # 15.20s, and not one of the four assertions below runs during it; they all
+    # land AFTER the wait. A negative-path arm drives a timeout ON PURPOSE, so the
+    # bound stops being a worst case and becomes a fixed invoice paid on every CI
+    # run forever — the tell was this file's local:CI runtime ratio of 1.01 while
+    # every other harness in the tier's top 14 sat at 1.44-1.84 (compute scales
+    # with the machine, a sleep does not).
+    #
+    # Record the polls instead of serving them. The loop still runs its full 15
+    # iterations, still exits with the dir absent, and still refuses — every
+    # assertion below grades exactly the state it graded before. What is gone is
+    # only the dead air, and the count is now ASSERTED rather than merely endured,
+    # so a gate that stopped polling (or lost its bound) is caught here instead of
+    # being invisible. See
+    # community/wiki/a-test-that-stubs-out-what-it-waits-for-pays-the-full-timeout-every-run.md
+    sleep() { printf 'GATE_SLEEP\n'; }
     write_channel_secret() { :; }
     teardown_telegram_wiring() { :; }
     ensure_hermes_gateway() { :; }
@@ -170,6 +188,17 @@ JSON
     && ok_t "the refusal message tells the operator the change was rolled back" \
     || bad_t "the refusal message tells the operator the change was rolled back" \
              "got: $(grep FAILMSG "$RB_TMP/out" | head -1)"
+  # DIVE-3450 gear 0: the polls the stub above recorded instead of serving. Two
+  # things are graded that nothing graded while this was real wall-clock: the gate
+  # DOES absorb an in-flight stager rather than refusing on first look, and its
+  # wait is BOUNDED. Asserting a range, not the constant, so retuning the bound is
+  # not a test edit — an UNBOUNDED loop is the failure this catches, and it would
+  # previously have hung CI rather than failed it.
+  rb_polls=$(grep -c '^GATE_SLEEP$' "$RB_TMP/out")
+  (( rb_polls >= 1 && rb_polls <= 60 )) \
+    && ok_t "the staging gate polls for the cache dir and its wait is BOUNDED ($rb_polls polls)" \
+    || bad_t "the staging gate polls for the cache dir and its wait is BOUNDED" \
+             "$rb_polls polls — 0 means the gate refused without absorbing an in-flight stager; >60 means the bound is gone and CI pays it every run"
   # POSITIVE CONTROL on the harness itself: with a stub that DOES stage the
   # cache dir the same call must reach the restart, not the rollback. Without
   # this arm every assertion above would still pass against a cmd_config that
