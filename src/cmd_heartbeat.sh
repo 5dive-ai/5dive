@@ -3232,10 +3232,17 @@ _hb_stall_sweep() {
                WHERE verifier IS NOT NULL AND maker_agent IS NOT NULL
                  AND assignee=verifier AND status NOT IN ('done','cancelled')
                  AND handoff_delivered_at IS NOT NULL
-                 -- `need_answered_at IS NOT NULL` is SUBSUMED by the comparison at
+                 -- NB NO BACKTICKS IN THIS COMMENT. It sits inside a double-quoted
+                 -- bash string, so a backtick pair is COMMAND SUBSTITUTION, not prose
+                 -- quoting: as first written this block ran 'need_answered_at IS NOT
+                 -- NULL' and 'NULL <= datetime(...)' as shell commands and went red on
+                 -- shellcheck SC1036/SC1088, the paren in datetime() being the fatal
+                 -- part. bash -n does NOT catch it (the pairs balance) and neither did
+                 -- the unit arms, which still passed.
+                 -- 'need_answered_at IS NOT NULL' is SUBSUMED by the comparison at
                  -- the bottom and is kept only to state the intent (post-answer
                  -- only) where a reader looks first. Proven, not assumed: in SQLite
-                 -- `NULL <= datetime(...)` is NULL, not true, so an open gate is
+                 -- a NULL <= datetime comparison yields NULL, not true, so an open gate is
                  -- already excluded by the window clause. Deleting this line reds
                  -- NOTHING — it is the one clause here that no mutation can grade,
                  -- so do not read arm A8 as evidence that it works. A8 grades the
