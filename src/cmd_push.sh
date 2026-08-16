@@ -315,7 +315,7 @@ _push_pii_payload() {
   # PII_GUARD_HOME is EXCLUSIVE when set — the same meaning it has in
   # scripts/install-pii-push-guard.sh, and the property that makes "no payload"
   # reachable in a harness on a box that does have the shared home installed.
-  local -a homes
+  local -a homes=()
   if [[ -n "${PII_GUARD_HOME:-}" ]]; then
     homes=("$PII_GUARD_HOME")
   else
