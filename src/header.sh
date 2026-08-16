@@ -266,10 +266,23 @@ declare -A TYPE_AUTH=(
   # Apr 2026 Anthropic policy change: third-party harnesses can no longer ride
   # the user's Claude Pro/Max subscription token (suspension risk). hermes and
   # openclaw both sign in via OpenAI's /codex/device flow now. hermes writes
-  # ~/.hermes/auth.json; openclaw writes its agent-scoped auth-profiles.json
-  # under the default agent id "main" (resolved by openclaw's resolveAgentDir).
+  # ~/.hermes/auth.json; openclaw writes its agent-scoped auth store under the
+  # default agent id "main" (resolved by openclaw's resolveAgentDir).
+  #
+  # DIVE-3489: that store is openclaw-agent.sqlite, NOT auth-profiles.json.
+  # openclaw moved per-agent auth into sqlite and does not read the JSON at all —
+  # measured against 2026.7.1-2 in a throwaway HOME: a byte-valid
+  # auth-profiles.json yields `Profiles: (none)`, and `models auth paste-api-key`
+  # creates the sqlite. This constant is the AUTH-ok sentinel (auth_creds_present,
+  # cmd_agent.sh's fallback), so leaving it on the JSON after the write side moved
+  # would report every correctly-authenticated openclaw seat as signed out.
+  #
+  # Scope note, deliberately not overstated: this is measured for the BYO
+  # paste-api-key path. The interactive device/OAuth flow (`models auth login`)
+  # writes through the same per-agent auth store openclaw names in its own error
+  # text, so it is the same file — but that leg was NOT re-measured here.
   [hermes]="/home/claude/.hermes/auth.json"
-  [openclaw]="/home/claude/.openclaw/agents/main/agent/auth-profiles.json"
+  [openclaw]="/home/claude/.openclaw/agents/main/agent/openclaw-agent.sqlite"
   # antigravity tries the OS keyring first (via DBus secret-service) and
   # falls back to a file at ~/.gemini/antigravity-cli/antigravity-oauth-token
   # (mode 0600). Verified empirically against agy 1.0.1: after the device-
@@ -598,7 +611,8 @@ declare -A TYPE_API_FILE=(
   [claude]="anthropic.env"
   # hermes and openclaw intentionally omitted: both now sign in via OpenAI's
   # /codex/device flow and store credentials in their own files (~/.hermes/
-  # auth.json, ~/.openclaw/agents/main/agent/auth-profiles.json). The
+  # auth.json, ~/.openclaw/agents/main/agent/openclaw-agent.sqlite — DIVE-3489,
+  # openclaw moved off auth-profiles.json and does not read it). The
   # anthropic.env path no longer feeds either CLI. cmd_auth_set already
   # fails gracefully when a type isn't in this map.
   [codex]="openai.env"
@@ -717,9 +731,11 @@ declare -A PI_PROVIDER_VAR=(
 # Native ids were verified empirically:
 #   - hermes auth add <p> --type api-key --api-key <k>   (writes ~/.hermes/auth.json,
 #       auto-resolves base_url from the in-tree provider catalog).
-#   - openclaw writes auth-profiles.json with type:"api_key" entries; provider
-#       ids must match openclaw's built-in provider registry (anthropic, openai,
-#       google, deepseek, moonshot, openrouter all present).
+#   - openclaw: `models auth --agent main paste-api-key --provider <id>` with the
+#       key on stdin (DIVE-3489 — it writes the sqlite auth store AND registers
+#       the profile in openclaw.json; the older auth-profiles.json write is inert).
+#       provider ids must match openclaw's built-in provider registry (anthropic,
+#       openai, google, deepseek, moonshot, openrouter all present).
 #
 # hermes-moonshot is a special case: its registry has a Kimi provider but no
 # `hermes auth add moonshot` subcommand — the key is read from KIMI_API_KEY in

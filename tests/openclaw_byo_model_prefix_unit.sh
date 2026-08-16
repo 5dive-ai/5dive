@@ -88,7 +88,11 @@ line_of() { grep -n -- "$1" <<<"$o" | head -1 | cut -d: -f1; }
 
 l_norm=$(line_of 'openclaw_normalize_model')
 l_node=$(line_of 'node runtime missing for openclaw')
-l_key=$(line_of 'auth-profiles.json for')
+# DIVE-3489: the credential write is `models auth paste-api-key` now, not the jq
+# auth-profiles.json heredoc. Anchor on the SUBCOMMAND rather than on the step
+# text — the ordering property under test is unchanged, and a prose anchor is
+# what made this arm red on a rename instead of on a regression.
+l_key=$(line_of 'paste-api-key')
 
 if [[ -n "$l_norm" && -n "$l_node" && -n "$l_key" ]]; then
   (( l_node < l_key )) \

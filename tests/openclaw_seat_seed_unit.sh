@@ -52,9 +52,20 @@ warn() { WARNS+="$*"$'\n'; }
 # Shared source, as _apply_byo_openclaw leaves it.
 SHARED="$TMP/shared"
 mkdir -p "$SHARED/.openclaw/agents/main/agent"
+# DIVE-3489: the CREDENTIAL is openclaw-agent.sqlite. A byte blob stands in for
+# the real store — the helper copies it, it never parses it, so the format is not
+# what is under test here; the fact that the credential-bearing file travels is.
+# The -wal sibling is deliberately EMPTY: a 0-byte -wal is the normal state after
+# a clean checkpoint, and treating it as a failed read is a live bug shape.
+printf 'SQLite format 3\000fake-store-bytes\n' \
+  > "$SHARED/.openclaw/agents/main/agent/openclaw-agent.sqlite"
+: > "$SHARED/.openclaw/agents/main/agent/openclaw-agent.sqlite-wal"
+# Legacy JSON alongside it: still carried (additive), never the credential.
 printf '{"version":1,"profiles":{"openrouter:manual":{"type":"api_key","provider":"openrouter","key":"sk-or-test-1234567890"}}}\n' \
   > "$SHARED/.openclaw/agents/main/agent/auth-profiles.json"
-printf '{"agents":{"defaults":{"model":{"primary":"openrouter/auto"}}},"models":{"providers":{"zai":{"baseUrl":"https://example.invalid/coding"}}}}\n' \
+# auth.profiles is the REGISTRATION half `models auth paste-api-key` writes into
+# openclaw.json (provider + mode, no key). The store is unselectable without it.
+printf '{"agents":{"defaults":{"model":{"primary":"openrouter/auto"}}},"models":{"providers":{"zai":{"baseUrl":"https://example.invalid/coding"}}},"auth":{"profiles":{"openrouter:manual":{"provider":"openrouter","mode":"api_key"}}}}\n' \
   > "$SHARED/.openclaw/openclaw.json"
 
 # The seat as `agent create` leaves it just before the push: its own
@@ -83,12 +94,32 @@ has "$(declare -f seed_openclaw_state_into_seat)" 'base="/home/claude"' \
 profile_type_dir() { printf '%s' "$SHARED"; }
 AGENT_HOME_ROOT="$SEATS" seed_openclaw_state_into_seat octest qa-profile
 
-SEAT_AUTH="$SEATS/agent-octest/.openclaw/agents/main/agent/auth-profiles.json"
+SEAT_DIR="$SEATS/agent-octest/.openclaw/agents/main/agent"
+SEAT_AUTH="$SEAT_DIR/openclaw-agent.sqlite"
+SEAT_JSON="$SEAT_DIR/auth-profiles.json"
 SEAT_CFG="$SEATS/agent-octest/.openclaw/openclaw.json"
-check "seat now has its own auth-profiles.json" "$( [[ -s "$SEAT_AUTH" ]] && echo yes )" "yes"
+check "seat now has its own auth STORE (openclaw-agent.sqlite)" "$( [[ -s "$SEAT_AUTH" ]] && echo yes )" "yes"
 check "seat credential is byte-identical to the shared one" \
-      "$(cmp -s "$SEAT_AUTH" "$SHARED/.openclaw/agents/main/agent/auth-profiles.json" && echo same)" "same"
+      "$(cmp -s "$SEAT_AUTH" "$SHARED/.openclaw/agents/main/agent/openclaw-agent.sqlite" && echo same)" "same"
 check "seat credential is 0600" "$(stat -c '%a' "$SEAT_AUTH")" "600"
+# DIVE-3489: a 0-byte -wal is the normal post-checkpoint state and must still
+# travel — an -s guard on the siblings would silently drop it.
+check "empty -wal sibling travels rather than being read as a failed copy" \
+      "$( [[ -e "$SEAT_AUTH-wal" ]] && echo yes )" "yes"
+# Additive, not the credential: the legacy JSON is still carried so a profile
+# written by an older CLI is not dropped.
+check "legacy auth-profiles.json still carried alongside the store" \
+      "$( [[ -s "$SEAT_JSON" ]] && echo yes )" "yes"
+# The half a store copy cannot supply. Without the registration the seat holds a
+# credential nothing selects — this row's defect with the halves swapped.
+check "profile REGISTRATION reaches the seat's openclaw.json" \
+      "$(jq -r '.auth.profiles["openrouter:manual"].provider' "$SEAT_CFG")" "openrouter"
+check "registration carries no key" \
+      "$(jq -r '.auth.profiles["openrouter:manual"].key // "absent"' "$SEAT_CFG")" "absent"
+# The seat's pre-existing config must survive the merge — it holds the gateway
+# token and channels by the time we run.
+check "seat gateway token survives the merge" \
+      "$(jq -r '.gateway.token' "$SEAT_CFG")" "gw-secret"
 check "seat model pin lands" "$(jq -r '.agents.defaults.model.primary' "$SEAT_CFG")" "openrouter/auto"
 # models.providers is in the copy set on purpose: the boot seed syncs only
 # agents.defaults, so a zai baseUrl override reached the shared config and never
@@ -141,8 +172,8 @@ has "$out" "issue:openclaw credential never reached the seat" \
 # 401s on every message because openclaw falls back to a built-in default whose
 # provider prefix selects a credential nobody wrote.
 mkdir -p "$TMP/nullmodel/agent-octest3/.openclaw/agents/main/agent"
-printf '{"version":1,"profiles":{"x":{"type":"api_key"}}}\n' \
-  > "$TMP/nullmodel/agent-octest3/.openclaw/agents/main/agent/auth-profiles.json"
+printf 'SQLite format 3\000fake-store-bytes\n' \
+  > "$TMP/nullmodel/agent-octest3/.openclaw/agents/main/agent/openclaw-agent.sqlite"
 printf '{"agents":{"defaults":{"model":{"primary":null}}},"gateway":{"mode":"local"}}\n' \
   > "$TMP/nullmodel/agent-octest3/.openclaw/openclaw.json"
 out=$(AGENT_HOME_ROOT="$TMP/nullmodel" selfcheck_cred_reached_agent octest3 openclaw "" openrouter 2>&1)
@@ -159,13 +190,32 @@ hasnt "$out" "issue:openclaw" "no false alarm on a correctly seeded seat"
 # A bare-string model (openclaw accepts it) must not blow up the jq probe —
 # indexing a string with .primary is a jq ERROR, not a null.
 mkdir -p "$TMP/strmodel/agent-octest4/.openclaw/agents/main/agent"
-printf '{"version":1,"profiles":{"x":{"type":"api_key"}}}\n' \
-  > "$TMP/strmodel/agent-octest4/.openclaw/agents/main/agent/auth-profiles.json"
+printf 'SQLite format 3\000fake-store-bytes\n' \
+  > "$TMP/strmodel/agent-octest4/.openclaw/agents/main/agent/openclaw-agent.sqlite"
 printf '{"agents":{"defaults":{"model":"openrouter/auto"}}}\n' \
   > "$TMP/strmodel/agent-octest4/.openclaw/openclaw.json"
 out=$(AGENT_HOME_ROOT="$TMP/strmodel" selfcheck_cred_reached_agent octest4 openclaw "" openrouter 2>&1)
 has "$out" "ok:openclaw seat has its own credential and model pin (openrouter/auto)" \
     "string-shaped model pin is read, not mis-flagged"
+
+# ---------- DIVE-3489: the regression this row was filed for ----------
+# A seat holding ONLY auth-profiles.json is exactly what every openclaw BYO
+# create shipped: a byte-valid credential in a store openclaw does not read. It
+# reported AUTH ok and died at first use with ProviderAuthError. The witness must
+# now call it what it is. This arm is the one that reds on the pre-fix witness,
+# so it is what makes the rest of this section evidence rather than fixture
+# maintenance — with the model pin PRESENT and valid, so the only thing it can
+# be reacting to is the credential.
+mkdir -p "$TMP/jsononly/agent-octest5/.openclaw/agents/main/agent"
+printf '{"version":1,"profiles":{"openrouter:manual":{"type":"api_key","provider":"openrouter","key":"sk-or-test-1234567890"}}}\n' \
+  > "$TMP/jsononly/agent-octest5/.openclaw/agents/main/agent/auth-profiles.json"
+printf '{"agents":{"defaults":{"model":{"primary":"openrouter/auto"}}}}\n' \
+  > "$TMP/jsononly/agent-octest5/.openclaw/openclaw.json"
+out=$(AGENT_HOME_ROOT="$TMP/jsononly" selfcheck_cred_reached_agent octest5 openclaw "" openrouter 2>&1)
+has "$out" "issue:openclaw credential never reached the seat" \
+    "a seat with ONLY the inert auth-profiles.json is flagged, not passed as healthy"
+hasnt "$out" "ok:openclaw seat has its own credential" \
+    "the inert JSON is never accepted as the credential witness"
 
 # ---------- 4. the boot-time verdict must leave a breadcrumb ----------
 # assert_cred_seeded already printed an ERROR for a present-but-unreadable

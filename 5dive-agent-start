@@ -840,14 +840,24 @@ if [[ "$TYPE" == "hermes" ]]; then
   fi
 fi
 
-# Same shared/0600 problem as codex/hermes: openclaw writes its OAuth tokens to
-# ~/.openclaw/agents/main/agent/auth-profiles.json (mode 0600) after
-# `openclaw models auth login --provider openai-codex --method device-code`.
+# Same shared/0600 problem as codex/hermes: openclaw writes its credentials to
+# ~/.openclaw/agents/main/agent/openclaw-agent.sqlite (mode 0600) — after a
+# `models auth login --provider openai-codex --method device-code`, and after the
+# BYO `models auth paste-api-key` that `agent create` runs.
 # agent-<name> can't read a 0600 file owned by `claude` even though it's in the
 # claude group. Seed the agent's own copy from the shared file via sudo (re-
 # seeding only when the shared copy is newer, e.g. after a fresh device-code
 # login). openclaw's resolveStateDir respects the process HOME, so $HOME/
 # .openclaw is the path each agent process reads.
+#
+# DIVE-3489: the seeded artifact is the SQLITE STORE, not auth-profiles.json.
+# openclaw moved per-agent auth into sqlite and does not read the JSON at all
+# (measured against 2026.7.1-2: a byte-valid auth-profiles.json lists
+# `Profiles: (none)`), so this block used to copy an inert file, report
+# cred_seed_ok, and leave the agent booting UNAUTHENTICATED. This is the
+# restart-heals path — the second chance seed_openclaw_state_into_seat's comment
+# refers to — so it has to move with the write side or a restart cannot repair a
+# seat that the fixed create path provisioned.
 if [[ "$TYPE" == "openclaw" ]]; then
   AGENT_OPENCLAW_DIR="$HOME/.openclaw/agents/main/agent"
   install -d -m 700 "$HOME/.openclaw"
@@ -855,12 +865,13 @@ if [[ "$TYPE" == "openclaw" ]]; then
   install -d -m 700 "$HOME/.openclaw/agents/main"
   install -d -m 700 "$AGENT_OPENCLAW_DIR"
   # Profile-scoped login lands at $PROFILE_STATE_DIR/.openclaw/agents/main/
-  # agent/auth-profiles.json — that's the path cmd_auth_start created via
-  # HOME=$PROFILE_STATE_DIR redirect. Default profile keeps the legacy
-  # shared /home/claude/.openclaw layout.
-  SHARED_OPENCLAW_AUTH="${PROFILE_STATE_DIR:+$PROFILE_STATE_DIR/.openclaw/agents/main/agent/auth-profiles.json}"
-  SHARED_OPENCLAW_AUTH="${SHARED_OPENCLAW_AUTH:-/home/claude/.openclaw/agents/main/agent/auth-profiles.json}"
-  LOCAL_OPENCLAW_AUTH="$AGENT_OPENCLAW_DIR/auth-profiles.json"
+  # agent/ — that's the path cmd_auth_start created via HOME=$PROFILE_STATE_DIR
+  # redirect. Default profile keeps the legacy shared /home/claude/.openclaw
+  # layout.
+  SHARED_OPENCLAW_DIR="${PROFILE_STATE_DIR:+$PROFILE_STATE_DIR/.openclaw/agents/main/agent}"
+  SHARED_OPENCLAW_DIR="${SHARED_OPENCLAW_DIR:-/home/claude/.openclaw/agents/main/agent}"
+  SHARED_OPENCLAW_AUTH="$SHARED_OPENCLAW_DIR/openclaw-agent.sqlite"
+  LOCAL_OPENCLAW_AUTH="$AGENT_OPENCLAW_DIR/openclaw-agent.sqlite"
   # The shared openclaw state dirs land at mode 0700 owner=claude, so the
   # agent user can't even traverse them — `[[ -e "$SHARED" ]]` returns false
   # and the seed block silently no-ops. The agent user has NOPASSWD sudo
@@ -871,20 +882,37 @@ if [[ "$TYPE" == "openclaw" ]]; then
   # the seed silently no-op'd on a perfectly valid profile credential. Plain
   # read first (creds are normalized 0640 g=claude under group-traversable
   # dirs), `sudo -n` only as the fallback for a stale 0600 file.
-  if { [[ -e "$SHARED_OPENCLAW_AUTH" ]] || sudo -n test -e "$SHARED_OPENCLAW_AUTH" 2>/dev/null; } \
-      && { [[ ! -f "$LOCAL_OPENCLAW_AUTH" ]] \
-           || [[ "$SHARED_OPENCLAW_AUTH" -nt "$LOCAL_OPENCLAW_AUTH" ]] \
-           || sudo -n test "$SHARED_OPENCLAW_AUTH" -nt "$LOCAL_OPENCLAW_AUTH" 2>/dev/null; }; then
-    TMP="$(mktemp -p "$AGENT_OPENCLAW_DIR" .auth-profiles.XXXXXX)"
-    if { cat "$SHARED_OPENCLAW_AUTH" 2>/dev/null || sudo -n cat "$SHARED_OPENCLAW_AUTH" 2>/dev/null; } > "$TMP" && [[ -s "$TMP" ]]; then
-      chmod 600 "$TMP"
-      mv "$TMP" "$LOCAL_OPENCLAW_AUTH"
-      cred_seed_ok
-    else
-      rm -f "$TMP"
-      cred_seed_failed "could not seed openclaw auth-profiles.json from $SHARED_OPENCLAW_AUTH ($(cred_seed_why "$SHARED_OPENCLAW_AUTH")) — agent will boot UNAUTHENTICATED"
+  #
+  # The -wal/-shm siblings and the legacy auth-profiles.json ride along in the
+  # same loop. Only the sqlite drives cred_seed_ok/failed: the siblings are
+  # frequently absent on a cleanly-closed store, and the JSON is inert, so
+  # letting either of them speak for the credential is how a false green gets
+  # minted. Order matters — the -wal is copied AFTER the db it belongs to.
+  for _OC_SEED_NAME in openclaw-agent.sqlite openclaw-agent.sqlite-wal openclaw-agent.sqlite-shm auth-profiles.json; do
+    _OC_SEED_SRC="$SHARED_OPENCLAW_DIR/$_OC_SEED_NAME"
+    _OC_SEED_DST="$AGENT_OPENCLAW_DIR/$_OC_SEED_NAME"
+    _OC_SEED_IS_CRED=0
+    if [[ "$_OC_SEED_NAME" == "openclaw-agent.sqlite" ]]; then _OC_SEED_IS_CRED=1; fi
+    if { [[ -e "$_OC_SEED_SRC" ]] || sudo -n test -e "$_OC_SEED_SRC" 2>/dev/null; } \
+        && { [[ ! -f "$_OC_SEED_DST" ]] \
+             || [[ "$_OC_SEED_SRC" -nt "$_OC_SEED_DST" ]] \
+             || sudo -n test "$_OC_SEED_SRC" -nt "$_OC_SEED_DST" 2>/dev/null; }; then
+      TMP="$(mktemp -p "$AGENT_OPENCLAW_DIR" ".${_OC_SEED_NAME}.XXXXXX")"
+      # -s on the sqlite only: a 0-byte -wal is the NORMAL post-checkpoint state
+      # and must copy, not be treated as a failed read.
+      if { cat "$_OC_SEED_SRC" 2>/dev/null || sudo -n cat "$_OC_SEED_SRC" 2>/dev/null; } > "$TMP" \
+         && { (( ! _OC_SEED_IS_CRED )) || [[ -s "$TMP" ]]; }; then
+        chmod 600 "$TMP"
+        mv "$TMP" "$_OC_SEED_DST"
+        if (( _OC_SEED_IS_CRED )); then cred_seed_ok; fi
+      else
+        rm -f "$TMP"
+        if (( _OC_SEED_IS_CRED )); then
+          cred_seed_failed "could not seed the openclaw auth store openclaw-agent.sqlite from $_OC_SEED_SRC ($(cred_seed_why "$_OC_SEED_SRC")) — agent will boot UNAUTHENTICATED and every message will fail with ProviderAuthError"
+        fi
+      fi
     fi
-  fi
+  done
   # DIVE-1900: loud on the wrong-layer failure (see assert_cred_seeded above).
   assert_cred_seeded openclaw "$SHARED_OPENCLAW_AUTH" "$LOCAL_OPENCLAW_AUTH"
 
