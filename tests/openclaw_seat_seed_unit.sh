@@ -199,5 +199,11 @@ else
   chmod 0644 "$UNREADABLE"
 fi
 
-if (( fail )); then echo "RESULT: FAIL"; exit 1; fi
-echo "RESULT: PASS"
+# Verdict shape is load-bearing, not style: tests/meta/harness-verdict-probe.sh
+# proves a harness is WIRED by injecting `fail=$((fail+1))` before the verdict and
+# asserting the exit status flips. It recognises `exit $(( VAR > 0 ))` (and a few
+# siblings) within the last handful of statements; a bare `if (( fail )); then
+# exit 1; fi` is UNPROBEABLE — "not counted clean", which is a red check, not a
+# green one. Keep the counter numeric-only for the same reason.
+if (( fail )); then echo "RESULT: FAIL"; else echo "RESULT: PASS"; fi
+exit $(( fail > 0 ))
