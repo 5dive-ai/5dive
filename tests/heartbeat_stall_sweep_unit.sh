@@ -117,8 +117,8 @@ db "UPDATE tasks SET handoff_delivered_at=datetime('now','-${_HB_VERIFY_STALE_MI
 _hb_stall_sweep >/dev/null 2>&1
 grep -q $'^olivia\t.*delivered to you' "$SEND_LOG" \
   && ok_t "stale delivery pings the verifier" || bad_t "verifier not pinged" "$(cat "$SEND_LOG")"
-grep -q $'^main\t.*Delivered-awaiting-verifier' "$SEND_LOG" \
-  && ok_t "stale delivery also pings main (never invisible)" || bad_t "main not pinged" "$(cat "$SEND_LOG")"
+grep -q $'^ops\t.*Delivered-awaiting-verifier' "$SEND_LOG" \
+  && ok_t "stale delivery also pings ops (never invisible)" || bad_t "ops not pinged" "$(cat "$SEND_LOG")"
 [[ "$(db "SELECT COALESCE(handoff_stale_pinged_at,'NULL') FROM tasks WHERE id=${a};")" != "NULL" ]] \
   && ok_t "stale-ping flag stamped" || bad_t "flag not stamped" ""
 
@@ -168,8 +168,8 @@ _hb_stall_sweep >/dev/null 2>&1
 grep -q $'^olivia\t.*gate that was blocking it was ANSWERED' "$SEND_LOG" \
   && ok_t "A5 answered-gate delivery nudges the verifier (ack stamped, old throttle burned)" \
   || bad_t "A5 answered-gate delivery not surfaced" "$(cat "$SEND_LOG")"
-grep -q $'^main\t.*Answered-gate delivery' "$SEND_LOG" \
-  && ok_t "A5 it also reaches main (never invisible)" || bad_t "A5 main not pinged" "$(cat "$SEND_LOG")"
+grep -q $'^ops\t.*Answered-gate delivery' "$SEND_LOG" \
+  && ok_t "A5 it also reaches ops (never invisible)" || bad_t "A5 ops not pinged" "$(cat "$SEND_LOG")"
 
 # --- A6: the MESSAGE must not be gap#2's. "still unacknowledged" is false here —
 #     the verifier did act, and DIVE-2196 is the row that proves a false nudge costs
@@ -253,13 +253,13 @@ _hb_stall_sweep >/dev/null 2>&1
   && ok_t "no alarm yet — condition hasn't persisted _HB_STALL_MIN_MINUTES" \
   || bad_t "alarmed too early" "$(cat "$SEND_LOG")"
 
-# --- B3: backdate the persistence clock past the threshold -> alarms main
+# --- B3: backdate the persistence clock past the threshold -> alarms ops
 db "UPDATE task_prefs SET value=datetime('now','-${_HB_STALL_MIN_MINUTES} minutes','-1 minutes')
     WHERE key='stall_first_seen_at';"
 : >"$SEND_LOG"
 _hb_stall_sweep >/dev/null 2>&1
-grep -q $'^main\t.*fleet-stall' "$SEND_LOG" \
-  && ok_t "persisted stall (past _HB_STALL_MIN_MINUTES) alarms main" \
+grep -q $'^ops\t.*fleet-stall' "$SEND_LOG" \
+  && ok_t "persisted stall (past _HB_STALL_MIN_MINUTES) alarms ops" \
   || bad_t "no stall alarm" "$(cat "$SEND_LOG")"
 [[ -n "$(db "SELECT value FROM task_prefs WHERE key='stall_alerted_at';")" ]] \
   && ok_t "stall alert throttle key stamped" || bad_t "throttle key missing" ""
@@ -289,7 +289,7 @@ _hb_stall_sweep >/dev/null 2>&1
 
 # --- B7 GUARDRAIL: a PINGED tier-2 gate genuinely awaiting the human (e.g.
 #     overnight) is PARKED, not stranded — must NOT start the stall clock, or
-#     an idle night re-alarms main every _HB_STALL_MIN_MINUTES for no reason
+#     an idle night re-alarms ops every _HB_STALL_MIN_MINUTES for no reason
 #     (the alert-fatigue class this design already killed once).
 reset_all
 g=$(addt --assignee=dev -- "human's court")
@@ -346,7 +346,7 @@ db "UPDATE task_prefs SET value=datetime('now','-${_HB_STALL_MIN_MINUTES} minute
     WHERE key='stall_first_seen_at';"
 : >"$SEND_LOG"
 _hb_stall_sweep >/dev/null 2>&1
-_alert=$(grep $'^main\t' "$SEND_LOG" | grep 'fleet-stall' | head -1)
+_alert=$(grep $'^ops\t' "$SEND_LOG" | grep 'fleet-stall' | head -1)
 
 [[ -n "$_alert" ]] \
   && ok_t "B10 the stall alert fired (fixture is live, the label arms below are not vacuous)" \
@@ -383,7 +383,7 @@ _hb_stall_sweep >/dev/null 2>&1
   && ok_t "no eligible gates -> canary never trips" || bad_t "canary tripped with nothing eligible" ""
 
 # --- C2: an eligible (stale, unpinged) T2 gate exists + gate_pinged_at has never
-#     advanced fleet-wide -> canary trips, alarms main
+#     advanced fleet-wide -> canary trips, alarms ops
 reset_all
 g=$(addt --assignee=dev -- "stale gate")
 db "UPDATE tasks SET status='blocked', need_type='approval', tier=2,
@@ -391,7 +391,7 @@ db "UPDATE tasks SET status='blocked', need_type='approval', tier=2,
      WHERE id=${g};"
 : >"$SEND_LOG"
 _hb_stall_sweep >/dev/null 2>&1
-grep -q $'^main\t.*pinger-liveness canary tripped' "$SEND_LOG" \
+grep -q $'^ops\t.*pinger-liveness canary tripped' "$SEND_LOG" \
   && ok_t "eligible gate + no fleet-wide gate_pinged_at advance -> canary trips" \
   || bad_t "canary did not trip" "$(cat "$SEND_LOG")"
 [[ -n "$(db "SELECT value FROM task_prefs WHERE key='pinger_canary_alerted_at';")" ]] \

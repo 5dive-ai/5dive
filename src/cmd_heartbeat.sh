@@ -2604,7 +2604,7 @@ _hb_blocked_sweep() {
           --message="▶️ Unblocked: ${dident} — all blockers done, now on your queue." ) >/dev/null 2>&1 || true
     done
     _hb_log "[blocked-sweep] auto-recovered: ${idlist}"
-    ( cmd_send "main" --from="task-engine" \
+    ( cmd_send "ops" --from="task-engine" \
         --message="🔧 Auto-recovered ${#rec[@]} stale-blocked task(s) whose blockers were all done: ${idlist}" ) >/dev/null 2>&1 || true
   fi
 
@@ -2619,7 +2619,7 @@ _hb_blocked_sweep() {
     last=$(db "SELECT value FROM task_prefs WHERE key='blocked_sweep_pinged_at';" 2>/dev/null)
     cutoff=$(date -u -d '24 hours ago' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
     if [[ -z "$last" || ( -n "$cutoff" && "$last" < "$cutoff" ) ]]; then
-      ( cmd_send "main" --from="task-engine" \
+      ( cmd_send "ops" --from="task-engine" \
           --message="⚠️ Blocked with no live reason (no open dependency, no human gate, no park) — likely manually blocked + forgotten. Unblock (5dive task unblock <id>) or cancel if dead: ${orphan}" ) >/dev/null 2>&1 || true
       db "INSERT INTO task_prefs (key,value) VALUES ('blocked_sweep_pinged_at', datetime('now'))
           ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
@@ -2962,7 +2962,7 @@ _hb_stall_sweep() {
     vmins=$(( ($(date -u +%s) - $(date -u -d "$vdelivered" +%s 2>/dev/null || date -u +%s)) / 60 ))
     ( cmd_send "$vfier" --from="task-engine" \
         --message="📥 ${vident} was delivered to you for review ${vmins}m ago and is still unacknowledged — run \`5dive task start ${vident}\` then \`task done\`/\`task reject\` so it doesn't rot in your queue." ) >/dev/null 2>&1 || true
-    ( cmd_send "main" --from="task-engine" \
+    ( cmd_send "ops" --from="task-engine" \
         --message="📥 Delivered-awaiting-verifier: ${vident} handed to '${vfier}' ${vmins}m ago, still unacknowledged — surfaced so it never sits invisible (DIVE-1416 gap#2)." ) >/dev/null 2>&1 || true
     db "UPDATE tasks SET handoff_stale_pinged_at=datetime('now') WHERE id=${vid};"
     _hb_log "[stall-sweep] ${vident} delivered->${vfier} unacked ${vmins}m -> surfaced"
@@ -3034,7 +3034,7 @@ _hb_stall_sweep() {
     rbusy=$(db "SELECT COALESCE(ident,'DIVE-'||id) FROM tasks
                 WHERE kind='standard' AND status='in_progress'
                   AND assignee=$(sqlq "${rasg:-}") ORDER BY id LIMIT 1;" 2>/dev/null || echo "")
-    ( cmd_send "main" --from="task-engine" \
+    ( cmd_send "ops" --from="task-engine" \
         --message="⏳ Recurring beat stalled: ${rident} (from template ${rtmpl}) has sat todo and never-started for ${rhours}h, assignee '${rasg:-unassigned}'${rbusy:+ — who is OCCUPIED on ${rbusy}, so this notice may be undeliverable-in-effect (a goal-fenced assignee cannot take a second row)} — ${rsupp_main}. If it is still unstarted in ${_HB_RECURRING_ESCALATE_HOURS}h the ladder reassigns or cancels it (DIVE-2853)." ) >/dev/null 2>&1 || true
     db "UPDATE tasks SET recurring_stall_pinged_at=datetime('now') WHERE id=${rid};"
     _hb_log "[recurring-stall] ${rident} never-started ${rhours}h (template ${rtmpl}) -> surfaced"
@@ -3135,7 +3135,7 @@ _hb_stall_sweep() {
         ( cmd_send "$easg" --from="task-engine" \
             --message="🔁 ${eident} has been moved OFF you to '${etarget}' — it was never started ${ehours}h after being flagged, and ${esupp}. Nothing for you to do; if you were about to start it, say so to ${etarget} rather than both starting it." ) >/dev/null 2>&1 || true
       fi
-      ( cmd_send "main" --from="task-engine" \
+      ( cmd_send "ops" --from="task-engine" \
           --message="🔁 Recurring-stall ESCALATED: ${eident} (template ${etmpl}) reassigned '${easg:-unassigned}' -> '${etarget}' after ${ehours}h unstarted past its flag — a re-ping to the original assignee cannot clear a goal-fenced one, so the ladder changes hands (DIVE-2853)." ) >/dev/null 2>&1 || true
       ledger_emit "task.recurring_stall_escalated" ident="$eident" task_id="$eid" \
         actor="task-engine" authority="heartbeat" \
@@ -3150,7 +3150,7 @@ _hb_stall_sweep() {
       if [[ -n "$easg" ]]; then
         ( cmd_send "$easg" --from="task-engine" --message="$emsg If you still want this instance, the next materialization is yours to start on time — or reply to say the row should not be assigned to you." ) >/dev/null 2>&1 || true
       fi
-      ( cmd_send "main" --from="task-engine" --message="$emsg No free agent existed at escalation time, so reassignment had nowhere to go (DIVE-2853)." ) >/dev/null 2>&1 || true
+      ( cmd_send "ops" --from="task-engine" --message="$emsg No free agent existed at escalation time, so reassignment had nowhere to go (DIVE-2853)." ) >/dev/null 2>&1 || true
       ledger_emit "task.recurring_stall_escalated" ident="$eident" task_id="$eid" \
         actor="task-engine" authority="heartbeat" \
         detail="auto-cancelled after ${ehours}h never-started, no free agent (template ${etmpl})" || true
@@ -3223,7 +3223,7 @@ _hb_stall_sweep() {
     gmins=$(( ($(date -u +%s) - $(date -u -d "$ganswered" +%s 2>/dev/null || date -u +%s)) / 60 ))
     ( cmd_send "$gfier" --from="task-engine" \
         --message="✅ ${gident}: the human gate that was blocking it was ANSWERED ${gmins}m ago, so grading is genuinely yours again — nothing is waiting on a person. Pick it back up: \`5dive task start ${gident}\` then \`task done\`/\`task reject\` (DIVE-2207)." ) >/dev/null 2>&1 || true
-    ( cmd_send "main" --from="task-engine" \
+    ( cmd_send "ops" --from="task-engine" \
         --message="✅ Answered-gate delivery: ${gident} is back on verifier '${gfier}' — its gate was answered ${gmins}m ago and the row had left gap#2's view, so it is surfaced here rather than sitting invisible (DIVE-2207)." ) >/dev/null 2>&1 || true
     db "UPDATE tasks SET gate_answered_nudged_at=datetime('now') WHERE id=${gid};"
     _hb_log "[stall-sweep] ${gident} gate answered ${gmins}m ago, back on ${gfier} -> surfaced"
@@ -3380,7 +3380,7 @@ _hb_stall_sweep() {
             _hdr="❓ possible fleet-stall (UNPROVEN)"
             _tail="The session probe could not measure every agent, so this is a QUESTION, not a finding — is the fleet actually stalled? Check \`5dive task ls\` / \`5dive task inbox\`"
           fi
-          ( cmd_send "main" --from="task-engine" \
+          ( cmd_send "ops" --from="task-engine" \
               --message="${_hdr}: ${total_stranded} stranded actionable item(s) (${stranded_todo} assigned-but-unstarted, ${open_gates} fleet-actionable gate(s)) idle $((since_secs / 60))m+ with 0 in_progress and 0 running loops, ${parked_gates} parked on the human (context, not counted) — and ${_act_detail}. ${_tail} (DIVE-1416 gap#3, session probe DIVE-2122, claim/probe honesty DIVE-2244, labels DIVE-2207)." ) >/dev/null 2>&1 || true
           db "INSERT INTO task_prefs (key,value) VALUES ('stall_alerted_at', datetime('now'))
               ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
@@ -3419,7 +3419,7 @@ _hb_stall_sweep() {
       last_alert=$(db "SELECT value FROM task_prefs WHERE key='pinger_canary_alerted_at';" 2>/dev/null)
       cutoff=$(date -u -d '6 hours ago' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
       if [[ -z "$last_alert" || ( -n "$cutoff" && "$last_alert" < "$cutoff" ) ]]; then
-        ( cmd_send "main" --from="task-engine" \
+        ( cmd_send "ops" --from="task-engine" \
             --message="🚨 pinger-liveness canary tripped: ${eligible} human gate(s) are past their reminder window (72h+ unanswered, unpinged 7d+) but gate_pinged_at hasn't advanced fleet-wide in over an hour — the gate-ping batch looks dead (DIVE-1434 regression class). Check /var/log/5dive-heartbeat.log for batch errors." ) >/dev/null 2>&1 || true
         db "INSERT INTO task_prefs (key,value) VALUES ('pinger_canary_alerted_at', datetime('now'))
             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
