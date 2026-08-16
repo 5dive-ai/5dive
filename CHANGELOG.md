@@ -19,6 +19,11 @@ true** — and every "⚠ N NOT checked — burn is unknown (not 0)" banner buil
   durable state, so it emits the trail and NAMES what is missing from it (`.partial`, printed above the
   counts). An unresolvable agent exits non-zero with empty stdout and a named cause instead of rendering a
   clean "did nothing".
+- **The `PARTIAL` banner is graded at the PRESENTER seam** (`tests/activity_presenter_partial_unit.sh`,
+  DIVE-3421). The collector harness asserts the `.partial` field in the JSON; a field that is populated
+  correctly and never rendered is the same silence this row removes, so the banner itself — its count, its
+  named levels, its position above the numbers it qualifies, and its absence on a complete read — is
+  asserted against the real `cmd_activity` with only the collector stubbed.
 - Replacing `glob` **widens** coverage: `glob` hid dot-prefixed names at both levels, and a dot-prefixed
   session file is still burn.
 - `tests/usage_middle_wildcard_unit.sh` — 23 arms, unprivileged, anchor-first, paired sick/healed, an
