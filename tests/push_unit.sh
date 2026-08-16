@@ -56,6 +56,19 @@ JSON_MODE=0
 # config-only (DIVE-1461): supplied per-test via GITHUB_APP_COMMIT_AUTHOR.
 export GITHUB_APP_ENV="$TMP/no-app-env"
 unset GITHUB_APP_COMMIT_AUTHOR
+# DIVE-2268: the push rail now runs a fail-closed CONTENT scan, so every arm in
+# this file needs a scanner payload. Stage a HERMETIC guard home instead of
+# letting the ladder find the box's /usr/local/share/5dive/pii-guard — a harness
+# whose verdicts depend on how the host was installed grades the host.
+# PII_GUARD_HOME is EXCLUSIVE, so this is the ONLY payload any arm below sees.
+export PII_GUARD_HOME="$TMP/pii-guard"
+mkdir -p "$PII_GUARD_HOME"
+cp scripts/pii-scan.sh "$PII_GUARD_HOME/pii-scan.sh"
+# The planted marker is a RESERVED fake (@example.com, per CLAUDE.md) and the
+# denylist stores only its sha256 — no real identifier exists in this file or in
+# anything it writes.
+PII_MARKER='planted-pii@example.com'
+printf '%s\n' "$(printf '%s' "$PII_MARKER" | sha256sum | cut -d" " -f1)" > "$PII_GUARD_HOME/pii-denylist.txt"
 mkdir -p "$TASKS_DIR"
 printf '%064d\n' 1496 > "$GATE_PROOF_KEY"
 set +e
@@ -669,6 +682,10 @@ out=$(scan3 feature-dirty "file://$REPO3" authoritative); rc=$?
 # arm re-introduces one piece of the pre-fix behaviour into the SHIPPED source and
 # demands the corresponding assertion goes red. The sed is verified to have
 # actually changed the file — a mutation that did not land greens like a pass.
+# NOTE (DIVE-2268): the cref loop these arms anchor on now lives in the SHARED
+# _push_range_base, at two-space indent — the anchors were re-pointed with the
+# extraction. That is the point of the cmp check: an anchor that silently stops
+# matching turns a mutation arm into a green that mutated nothing.
 mutate() { # <name> <sed-expr> -> path to the mutated source, or "" if sed no-op'd
   local f="$TMP/mut-$1.sh"
   sed "$2" "$SRC/cmd_push.sh" > "$f"
@@ -703,7 +720,7 @@ out=$(cached_push DIVE-962); rc=$?
 
 # M0 — take the cached bound away and the refusal above stops being produced:
 # proof that it is the cached rung doing the grading, not an ambient fetch.
-if M0=$(mutate m0 's|^    for cref in refs/remotes/origin/main refs/remotes/origin/master; do|    for cref in refs/remotes/__no_such_ref__; do|'); then
+if M0=$(mutate m0 's|^  for cref in refs/remotes/origin/main refs/remotes/origin/master; do|  for cref in refs/remotes/__no_such_ref__; do|'); then
   out=$(mut_cached_push "$M0" DIVE-961); rc=$?
   { [[ $rc -eq 0 ]] && ! grep -q "author check FAILED" <<<"$out" \
       && grep -q "author check SKIPPED here" <<<"$out"; } \
@@ -725,7 +742,7 @@ else
 fi
 
 # M2 — drop the cached-bound fallback: the reported case stops passing.
-if M2=$(mutate m2 's|^    for cref in refs/remotes/origin/main refs/remotes/origin/master; do|    for cref in refs/remotes/__no_such_ref__; do|'); then
+if M2=$(mutate m2 's|^  for cref in refs/remotes/origin/main refs/remotes/origin/master; do|  for cref in refs/remotes/__no_such_ref__; do|'); then
   cache_on
   out=$(mut_scan3 "$M2" feature-clean "$UNFETCHABLE" authoritative); rc=$?
   [[ $rc -ne 0 ]] \
@@ -997,6 +1014,195 @@ else
   bad_t "installation: source shape survives a failing lookup (DIVE-2566)" \
         "source shape gave '${_src_out:-<died before the fallback>}', unguarded control gave '${_unguarded_out:-<died, correct>}' — the source's own shape must reach the fallback AND the unguarded control must not"
 fi
+
+# --- DIVE-2268: the delegated rail runs a fail-closed PII CONTENT scan --------
+# MEASURED (DIVE-2267): pii-guard.yml's PUSH branch scans `git log -1 --format=%B`
+# and NO content, and scripts/git-hooks/pre-push is per-checkout and absent from a
+# fresh clone by git's design (DIVE-2255). So `5dive push` — the rail agents
+# actually push through — scanned nothing. These arms grade the scan by MUTATION:
+# each positive arm is re-run with the scan neutralised and must go the other way,
+# because "the scan was invoked" passes on a scanner that always returns clean.
+
+PII_REPO="$TMP/pii-repo"; mkdir -p "$PII_REPO"
+( cd "$PII_REPO"
+  git init -q -b main
+  git config user.name test; git config user.email test@example.test
+  echo base > f.txt; git add f.txt
+  git commit -q -m "base" --author="$AUTHOR"
+  git update-ref refs/remotes/origin/main HEAD      # the cached bound (DIVE-2161)
+  # clean branch: adds a line with no denylisted identifier in it
+  git checkout -q -b feature-clean
+  echo "a perfectly ordinary added line" >> f.txt
+  git commit -q -am "clean work" --author="$AUTHOR"
+  # dirty-CONTENT branch: the marker is in an ADDED LINE, never in the message
+  git checkout -q main; git checkout -q -b feature-dirty-line
+  echo "contact: __MARKER__" >> f.txt
+  git commit -q -am "innocuous subject" --author="$AUTHOR"
+  # dirty-MESSAGE branch: the marker is only in the commit message
+  git checkout -q main; git checkout -q -b feature-dirty-msg
+  echo "harmless" >> f.txt
+  git commit -q -am "reported by __MARKER__" --author="$AUTHOR"
+  # deletion-only branch: no added lines at all -> an EMPTY scan, not a failed one
+  git checkout -q main; git checkout -q -b feature-deletion
+  : > f.txt
+  git commit -q -am "drop the file contents" --author="$AUTHOR"
+  git checkout -q main
+) >/dev/null 2>&1
+# The marker is substituted AFTER the repo is built so the literal never appears
+# in a heredoc the PII pre-push guard would itself flag on this very repo.
+( cd "$PII_REPO"
+  for b in feature-dirty-line feature-dirty-msg; do
+    git checkout -q "$b"
+    if [[ "$b" == feature-dirty-line ]]; then
+      sed -i "s/__MARKER__/$PII_MARKER/" f.txt
+      git commit -q -am "innocuous subject" --amend --author="$AUTHOR"
+    else
+      git commit -q --amend -m "reported by $PII_MARKER" --author="$AUTHOR"
+    fi
+  done
+  git checkout -q main
+) >/dev/null 2>&1
+
+pii_push() {  # pii_push <ident> — dry-run in the PII fixture, cached bound
+  ( cd "$PII_REPO"; cmd_push "$1" --repo="file://$PII_REPO" --dry-run ) 2>&1
+}
+
+# NEGATIVE CONTROL, and it is not optional: "fail closed" is trivially satisfied
+# by a guard that refuses everything, so a clean push MUST still succeed.
+seed_task DIVE-2268 "Branch: feature-clean" approval "2026-07-18 00:00:00" "yes ship it"
+out=$(pii_push DIVE-2268); rc=$?
+{ [[ $rc -eq 0 ]] && grep -q "dry-run: would push" <<<"$out"; } \
+  && ok_t "2268 negative control: a CLEAN push still succeeds" \
+  || bad_t "2268 negative control: a CLEAN push still succeeds" "rc=$rc :: $out"
+grep -q "PII content scan clean" <<<"$out" \
+  && ok_t "2268: the dry-run SAYS the content scan ran and what bound it rests on" \
+  || bad_t "2268: the dry-run SAYS the content scan ran and what bound it rests on" "$out"
+
+# A deletion-only push has NO added lines. That is an empty scan, not a failed
+# one — grep exits 1 there and, under pipefail, would red every such push.
+seed_task DIVE-2269 "Branch: feature-deletion" approval "2026-07-18 00:00:00" "yes"
+out=$(pii_push DIVE-2269); rc=$?
+[[ $rc -eq 0 ]] \
+  && ok_t "2268: a deletion-only push is an EMPTY scan, not a failed one" \
+  || bad_t "2268: a deletion-only push is an EMPTY scan, not a failed one" "rc=$rc :: $out"
+
+# THE ARM: a denylisted identifier in an ADDED LINE must REFUSE the push.
+seed_task DIVE-2270 "Branch: feature-dirty-line" approval "2026-07-18 00:00:00" "yes"
+out=$(pii_push DIVE-2270); rc=$?
+{ [[ $rc -ne 0 ]] && grep -q "PII content scan REFUSED this push" <<<"$out"; } \
+  && ok_t "2268: a denylisted id in an ADDED LINE refuses the push" \
+  || bad_t "2268: a denylisted id in an ADDED LINE refuses the push" "rc=$rc :: $out"
+{ grep -q "sha256=" <<<"$out" && ! grep -qF "$PII_MARKER" <<<"$out"; } \
+  && ok_t "2268: the refusal prints the HASH of the hit, never the plaintext" \
+  || bad_t "2268: the refusal prints the HASH of the hit, never the plaintext" "$out"
+
+# And in a COMMIT MESSAGE anywhere in the range, not just the head commit — the
+# exact coverage `git log -1` on the CI push path did not have.
+seed_task DIVE-2271 "Branch: feature-dirty-msg" approval "2026-07-18 00:00:00" "yes"
+out=$(pii_push DIVE-2271); rc=$?
+{ [[ $rc -ne 0 ]] && grep -q "PII content scan REFUSED this push" <<<"$out"; } \
+  && ok_t "2268: a denylisted id in a COMMIT MESSAGE refuses the push" \
+  || bad_t "2268: a denylisted id in a COMMIT MESSAGE refuses the push" "rc=$rc :: $out"
+
+# --- MUTATION ARM 1: neutralise the scan CALL. The refusal arm above must go the
+# other way, or it was being graded by something other than the scan.
+# ASSERT THE MUTATION LANDS. Overriding a name that no longer exists is a
+# mutation that mutated nothing; here it would fail red rather than green, but
+# "it fails in the safe direction" is a claim worth being an assertion.
+declare -F _push_pii_scan >/dev/null \
+  && ok_t "2268 MUTATION precondition: _push_pii_scan is a real function, so neutralising it is a real mutation" \
+  || bad_t "2268 MUTATION precondition: _push_pii_scan is a real function, so neutralising it is a real mutation" "no such function — the arm below would be neutralising nothing"
+out=$( _push_pii_scan() { :; }; pii_push DIVE-2270 ); rc=$?
+[[ $rc -eq 0 ]] \
+  && ok_t "2268 MUTATION: with the scan call neutralised, the dirty push PASSES (the arm is load-bearing)" \
+  || bad_t "2268 MUTATION: with the scan call neutralised, the dirty push PASSES (the arm is load-bearing)" "rc=$rc :: $out"
+
+# --- MUTATION ARM 2: keep the call, replace the SCANNER with one that always
+# reports clean. This is the shape "assert the scan was invoked" cannot catch and
+# that this repo has caught repeatedly (DIVE-2228/2230/2265): the arm must be
+# graded by the scanner's VERDICT, not by the fact that a scanner ran.
+ALWAYS_CLEAN="$TMP/always-clean"; mkdir -p "$ALWAYS_CLEAN"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$ALWAYS_CLEAN/pii-scan.sh"
+: > "$ALWAYS_CLEAN/pii-denylist.txt"
+# ASSERT THE MUTATION LANDS: the stub, not the real scanner, is what resolves.
+( PII_GUARD_HOME="$ALWAYS_CLEAN"; _push_pii_payload && [[ "$_PUSH_PII_SCAN" == "$ALWAYS_CLEAN/pii-scan.sh" ]] ) \
+  && ok_t "2268 MUTATION precondition: the always-clean stub is the scanner that resolves" \
+  || bad_t "2268 MUTATION precondition: the always-clean stub is the scanner that resolves" "the override did not land — the arm below would be re-running the REAL scanner"
+out=$( PII_GUARD_HOME="$ALWAYS_CLEAN" pii_push DIVE-2270 ); rc=$?
+[[ $rc -eq 0 ]] \
+  && ok_t "2268 MUTATION: an always-clean SCANNER lets the dirty push through (the arm grades the verdict)" \
+  || bad_t "2268 MUTATION: an always-clean SCANNER lets the dirty push through (the arm grades the verdict)" "rc=$rc :: $out"
+
+# --- FAIL CLOSED 1: no scanner payload. Not "skip", not "clean" — refuse, and
+# name what is missing. This is DIVE-2264's lesson at a new site.
+out=$( PII_GUARD_HOME="$TMP/no-such-guard-home" pii_push DIVE-2268 ); rc=$?
+{ [[ $rc -ne 0 ]] && grep -q "PII content scan COULD NOT RUN" <<<"$out" \
+    && grep -qi "not a clean push" <<<"$out"; } \
+  && ok_t "2268 FAIL CLOSED: a missing scanner payload REFUSES, it does not report clean" \
+  || bad_t "2268 FAIL CLOSED: a missing scanner payload REFUSES, it does not report clean" "rc=$rc :: $out"
+
+# --- FAIL CLOSED 2: the scanner exits a code that is neither 0 (clean) nor 1
+# (hit). 2 is "denylist not found". A caller that read any non-zero as "found" or
+# any non-one as "clean" would be guessing; UNDETERMINED is neither.
+UNDET="$TMP/undetermined"; mkdir -p "$UNDET"
+printf '#!/usr/bin/env bash\nexit 2\n' > "$UNDET/pii-scan.sh"
+: > "$UNDET/pii-denylist.txt"
+out=$( PII_GUARD_HOME="$UNDET" pii_push DIVE-2268 ); rc=$?
+{ [[ $rc -ne 0 ]] && grep -q "PII content scan UNDETERMINED" <<<"$out" \
+    && grep -qi "NOT a pass" <<<"$out"; } \
+  && ok_t "2268 FAIL CLOSED: scanner rc=2 is UNDETERMINED, not clean" \
+  || bad_t "2268 FAIL CLOSED: scanner rc=2 is UNDETERMINED, not clean" "rc=$rc :: $out"
+
+# --- FAIL CLOSED 2b: an EMPTY range. Named in the body next to "script missing"
+# and "base rev unresolvable" for the same reason — it is a third way to report
+# green having scanned zero bytes.
+( cd "$PII_REPO"; git branch -q -f feature-empty main ) >/dev/null 2>&1
+seed_task DIVE-2272 "Branch: feature-empty" approval "2026-07-18 00:00:00" "yes"
+out=$(pii_push DIVE-2272); rc=$?
+{ [[ $rc -ne 0 ]] && grep -q "is EMPTY" <<<"$out" \
+    && grep -qi "empty scan is not a clean scan" <<<"$out"; } \
+  && ok_t "2268 FAIL CLOSED: an EMPTY range refuses, naming itself — it does not report clean" \
+  || bad_t "2268 FAIL CLOSED: an EMPTY range refuses, naming itself — it does not report clean" "rc=$rc :: $out"
+
+# --- FAIL CLOSED 3: no range bound. The authoritative pass (root's _push_do)
+# REFUSES; the agent pre-flight, which by design holds no GitHub credential,
+# SKIPS with the reason and defers. Called directly: `fail` exits, so subshell.
+PII_NOBASE="$TMP/pii-nobase"; mkdir -p "$PII_NOBASE"
+( cd "$PII_NOBASE"
+  git init -q -b main
+  git config user.name test; git config user.email test@example.test
+  git commit -q --allow-empty -m base --author="$AUTHOR"
+  git checkout -q -b feature-nb
+  git commit -q --allow-empty -m work --author="$AUTHOR"
+) >/dev/null 2>&1
+UNFETCHABLE_2268="file://$TMP/definitely-not-a-repo"
+out=$( _push_pii_scan "$PII_NOBASE" "$UNFETCHABLE_2268" feature-nb authoritative 2>&1 ); rc=$?
+{ [[ $rc -ne 0 ]] && grep -q "PII content scan COULD NOT RUN" <<<"$out"; } \
+  && ok_t "2268 FAIL CLOSED: an unbounded range REFUSES in the authoritative pass" \
+  || bad_t "2268 FAIL CLOSED: an unbounded range REFUSES in the authoritative pass" "rc=$rc :: $out"
+out=$( _push_pii_scan "$PII_NOBASE" "$UNFETCHABLE_2268" feature-nb preflight 2>&1 ); rc=$?
+{ [[ $rc -eq 0 ]] && grep -q "PII content scan SKIPPED here" <<<"$out"; } \
+  && ok_t "2268: the pre-flight SKIPS an unbounded range and SAYS so (it is re-run as root)" \
+  || bad_t "2268: the pre-flight SKIPS an unbounded range and SAYS so (it is re-run as root)" "rc=$rc :: $out"
+
+# --- the shared bound resolver (DIVE-2268 extracted it from _push_author_scan;
+# a second scan resolving its own bound is a second bound to keep in step).
+# PII_REPO's default branch IS main, so `git fetch <url> main` succeeds here: the
+# FRESH rung. $REPO defaults to master and only has a cached origin/main: the
+# CACHED rung. Both are asserted, because a resolver that only ever returns one
+# of them would still pass a single-rung test.
+_push_range_base "$PII_REPO" "file://$PII_REPO" feature-clean
+[[ "$_PUSH_RB_KIND" == fresh && -n "$_PUSH_RB_BASE" ]] \
+  && ok_t "2268: _push_range_base takes the FRESH bound when the remote is fetchable" \
+  || bad_t "2268: _push_range_base takes the FRESH bound when the remote is fetchable" "kind=$_PUSH_RB_KIND base=$_PUSH_RB_BASE"
+_push_range_base "$REPO" "$UNFETCHABLE" feature-ok
+{ [[ "$_PUSH_RB_KIND" == cached && -n "$_PUSH_RB_BASE" && -n "$_PUSH_RB_CREF" && -n "$_PUSH_RB_WHY" ]]; } \
+  && ok_t "2268: _push_range_base degrades to the CACHED bound, naming the ref AND why it fell back" \
+  || bad_t "2268: _push_range_base degrades to the CACHED bound, naming the ref AND why it fell back" "kind=$_PUSH_RB_KIND base=$_PUSH_RB_BASE cref=$_PUSH_RB_CREF why=$_PUSH_RB_WHY"
+_push_range_base "$PII_NOBASE" "$UNFETCHABLE_2268" feature-nb
+[[ "$_PUSH_RB_KIND" == none && -z "$_PUSH_RB_BASE" && -n "$_PUSH_RB_WHY" ]] \
+  && ok_t "2268: _push_range_base reports 'none' with a NAMED cause, not a silent widening" \
+  || bad_t "2268: _push_range_base reports 'none' with a NAMED cause, not a silent widening" "kind=$_PUSH_RB_KIND why=$_PUSH_RB_WHY"
 
 # ---------------------------------------------------------------------------
 # DIVE-2801 clause 2: the usage refusal must not recommend a remedy it cannot
