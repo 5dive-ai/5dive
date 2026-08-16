@@ -247,9 +247,15 @@ sudo_grant_lines() {
     # root may list any user; a non-root caller may list only itself, and that
     # answer is authoritative for it (this is the `sudo -n -l` an agent is told
     # to run on itself). -n so a policy needing a password never blocks `info`.
-    if [[ "$(id -u)" == "0" ]]; then
+    # DIVE-2538 item 3: both predicates were PATH-resolved `id` calls, and both
+    # decide. `id -u == 0` picks the "may list any user" branch; `$user == $(id -un)`
+    # decides whether `sudo -n -l` (which reports the CALLER's grants) may be
+    # published as the answer for $user. A shim printing a peer's name made this
+    # function return the caller's OWN sudo grants labelled as that peer's — a
+    # wrong answer about who may do what. $EUID is a bash builtin and unshimmable.
+    if [[ "$EUID" == "0" ]]; then
       if out=$(sudo -n -l -U "$user" 2>/dev/null); then printf '%s\n' "$out"; return 0; fi
-    elif [[ "$user" == "$(id -un)" ]]; then
+    elif [[ "$user" == "$(actor_caller_unix_name)" ]]; then
       if out=$(sudo -n -l 2>/dev/null); then printf '%s\n' "$out"; return 0; fi
     fi
   fi
@@ -2153,7 +2159,11 @@ cmd_create() {
       IFS=',' read -r -a skills_specs <<<"$skills_arg"
     fi
   else
-    if [[ "${SUDO_USER:-}" == agent-* ]]; then
+    # DIVE-2538 item 2: was `[[ "${SUDO_USER:-}" == agent-* ]]`. Same prefix rule as
+    # item 1 — an env var deciding a class. Lower stakes than the a2a counter (it
+    # only decides a default skill), but it is the same construct and it is what a
+    # class-grep for the rule must come back clean on.
+    if [[ -n "$(actor_routing_agent)" ]]; then
       skills_specs=("5dive-cli")
     fi
   fi

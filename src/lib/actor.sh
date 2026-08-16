@@ -111,6 +111,58 @@ _gate_authenticated_actor() {
 # after the fact and not only at answer time.
 _gate_agent_for_uid() { _gate_uid_to_agent "${1:-}"; }
 
+# DIVE-2538: the ROUTING name — which agent a notification is delivered TO, and
+# which agent an a2a/`--from`-less action counts AGAINST. Unforgeable by an agent,
+# and unlike `_gate_authenticated_actor` it can see through a de-elevating relay.
+#
+# Why this is not just `_gate_authenticated_actor`. That function gates the SUDO_UID
+# branch on `_gate_is_root`, which is correct for AUTHORIZATION and wrong here.
+# [[a-uid-first-derivation-cannot-see-through-sudo-u]] measured the consequence: under
+# `sudo -u claude` (this repo's mandated smoke shape) EUID is claude's, not 0, so the
+# SUDO_UID naming the real invoker is discarded and the derivation reports `claude` —
+# which is in no registry, so the channel resolves to NOBODY. An empty answer is safe
+# at an ATTRIBUTION site (the row still writes the `cli` sentinel) and unsafe at a
+# ROUTING one, where empty means "reaches nobody" and every consumer renders that as
+# either a SILENT skip or a hard E_AUTH_REQUIRED. So a routing site needs a resolver
+# that is strict about forgery WITHOUT going empty on the legitimate relay.
+#
+# The seam that makes the SUDO_UID branch safe here is that an agent can never REACH
+# it. Order matters and is load-bearing:
+#
+#   1. The caller's OWN euid. If that uid is an agent, we answer from it and never
+#      look at the environment at all. Every agent-* seat lands here, so the
+#      DIVE-2518 forgery (`SUDO_USER=agent-olivia 5dive …` from agent-dev, no
+#      privilege required) is closed: dev's euid answers `dev` and the env is not read.
+#   2. Only a NON-agent euid (root, `claude`, a human seat) falls through to
+#      SUDO_UID — and to arrive there from an agent seat you must actually invoke
+#      sudo, which REWRITES SUDO_UID/SUDO_USER with the real invoker. Measured on
+#      this host 2026-08-16: `SUDO_UID=999999 SUDO_USER=agent-olivia sudo -n -u claude
+#      env` prints SUDO_UID=1007 SUDO_USER=agent-dev. sudo is the corroborator; we are
+#      not trusting the variable, we are trusting the transition that stamped it.
+#
+# RESIDUAL, signed deliberately: a non-agent uid that is NOT root/`claude` could set
+# SUDO_UID by hand. It buys that principal an agent's notification channel and nothing
+# else — no gate clears on this value, `actor_claim`/`actor_board_name` are untouched,
+# and it is strictly narrower than the status quo it replaces, where ANY agent could
+# forge ANY peer with one env var. Widening this to authorization is the thing not to do.
+actor_routing_agent() {
+  local a
+  a=$(_gate_uid_to_agent "$(_gate_caller_uid)")
+  if [[ -n "$a" ]]; then printf '%s' "$a"; return 0; fi
+  if [[ -n "${SUDO_UID:-}" ]]; then
+    a=$(_gate_uid_to_agent "$SUDO_UID")
+    [[ -n "$a" ]] && { printf '%s' "$a"; return 0; }
+  fi
+  printf ''; return 1
+}
+
+# DIVE-2538: the caller's real unix name for a COMPARISON or a STORED field, replacing
+# `$(id -un)` — which resolves through the caller's PATH (DIVE-2330 measured a shim
+# returning another agent's name from a process whose real uid was 1004). Unlike
+# `_gate_caller_user` this returns EMPTY rather than `?` when passwd has no row: the
+# callers below feed it to `[[ x == y ]]`, and `?` would compare equal to a literal `?`.
+actor_caller_unix_name() { actor_uid_to_name "$(_gate_caller_uid)"; }
+
 # DIVE-2383: the caller's real username, for the audit log's `caller=` field. Was a
 # bare `id -un` at four sites in cmd_task.sh, which resolves through the CALLER'S
 # PATH — so the one field a forensic reader uses to attribute an action was writable

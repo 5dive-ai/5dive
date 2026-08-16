@@ -54,16 +54,27 @@ _task_agent_channel() {
   return 1
 }
 
+# DIVE-2538 item 8. The return value is passed straight to `_task_agent_channel`, so
+# it selects WHICH AGENT'S TELEGRAM BOT receives a task notification: the axis is
+# MISROUTE — wrong recipient at the time, not a wrong name in a log after the fact.
+#
+# Both pre-fix arms were forgeable and BOTH had to go. The primary arm was
+# `auto_sender_from_sudo` ($SUDO_USER + an `agent-*` prefix test, validation.sh) and
+# the `${USER:-$(id -un)}` fallback was the ELSE branch — reached only when SUDO_USER
+# is absent or non-agent, i.e. the UNCOMMON case. Two reviews in a row graded the
+# fallback and judged the FUNCTION on it. Recorded because it is the trap here:
+# patching only the fallback leaves the deciding branch untouched AND makes a
+# completeness grep for `${USER:-$(id -un)}` come back clean, so the check certifies
+# the miss. The completeness key for this site is "no forgeable input reaches
+# _task_agent_channel", which is read off the branches — not off the token.
+#
+# `actor_routing_agent` rather than the strict `_gate_authenticated_actor`: this is a
+# routing site, empty means "reaches nobody", and the strict resolver goes empty on
+# `sudo -u claude` — the relay shape this repo's own smoke tests mandate. See its
+# comment in lib/actor.sh for why its SUDO_UID branch is corroborated and why an
+# agent can never reach it.
 _task_owner_channel() {
-  local name="" s
-  s=$(auto_sender_from_sudo)
-  if [[ -n "$s" ]]; then
-    name="$s"
-  else
-    local u="${USER:-$(id -un 2>/dev/null)}"
-    [[ "$u" == agent-* ]] && name="${u#agent-}"
-  fi
-  _task_agent_channel "$name"
+  _task_agent_channel "$(actor_routing_agent)"
 }
 
 # DIVE-1927: is <name> PAIRED AT ALL — independent of whether THIS uid may read
@@ -1769,8 +1780,8 @@ _task_need_notify_deliver() {
   # the filer, so everything below must key off the gate row's own filer.
   local _self; _self="${TASK_GATE_FILER:-}"; [[ -n "$_self" ]] || _self=$(task_actor "")
   # DIVE-1968: try the FILER'S OWN channel BY NAME before anything else.
-  # `_task_owner_channel` resolves the CALLER (auto_sender_from_sudo -> $SUDO_USER,
-  # else $USER, and only when either is agent-*), never the gate's filer. So it is
+  # `_task_owner_channel` resolves the CALLER (DIVE-2538: `actor_routing_agent` —
+  # the caller's own euid, else a sudo-stamped SUDO_UID), never the gate's filer. So it is
   # a structural no-op in precisely the two contexts that matter — the root re-nag
   # sweep and the privileged re-send, where the name resolves EMPTY and
   # `_task_agent_channel ""` returns 1 immediately — and when a PEER agent drives
