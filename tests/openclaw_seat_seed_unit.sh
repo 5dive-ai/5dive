@@ -114,8 +114,11 @@ has "$create_src" 'seed_openclaw_state_into_seat "$name" "$profile"' \
     "cmd_create pushes openclaw state into the seat"
 # It has to run AFTER the channel install, or the channel writer's own
 # openclaw.json write lands on top of the merge.
-create_line=$(grep -n 'seed_openclaw_state_into_seat "\$name"' src/cmd_agent_create.sh | head -1 | cut -d: -f1)
-chan_line=$(grep -n 'install_channel_for_agent "\$type" telegram' src/cmd_agent_create.sh | head -1 | cut -d: -f1)
+# `|| var=` on both: under `set -o pipefail` a grep that finds nothing makes the
+# whole substitution non-zero, and an unguarded one aborted this harness mid-run
+# under mutation — it reported the first FAIL and then never reached RESULT.
+create_line=$(grep -n 'seed_openclaw_state_into_seat "\$name"' src/cmd_agent_create.sh | head -1 | cut -d: -f1) || create_line=""
+chan_line=$(grep -n 'install_channel_for_agent "\$type" telegram' src/cmd_agent_create.sh | head -1 | cut -d: -f1) || chan_line=""
 if [[ -n "$create_line" && -n "$chan_line" && "$create_line" -gt "$chan_line" ]]; then
   echo "ok: the push runs after the channel install (merge lands on top)"
 else
