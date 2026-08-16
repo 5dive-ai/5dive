@@ -15,6 +15,17 @@
 # rather than passing silently. If it ever starts failing OPEN, revisit this first.
 # Decision: main, 2026-08-05.
 #
+# DIVE-3479, 2026-08-16: `nightly` is a statement about the CORPUS — it keeps this
+# file out of the 300s core tier — and it was read as a statement about the whole PR
+# path, which it is not. The DIVE-3315 arms at the bottom grade unit-tests.yml's own
+# structure, and a WORKFLOW-ONLY edit changes no `tests/*.sh`, so `changed-harnesses`
+# selected nothing and those arms first reported on the nightly union, after the
+# merge they were built to gate. The tier is unchanged (promoting it would spend 14%
+# of one shard's cap grading the cap); the workflow now runs this file in its own
+# unconditional `workflow-structure-guards` job, required by both pristine and
+# installed-host aggregators. Arm 99 holds that job in place. Cost: 41.4s on a
+# parallel runner, off the ~300s critical path, 0s against TIER_BUDGET_CORE.
+#
 # THE "SMALL AND FAST" CLAIM THIS HEADER USED TO MAKE IS RETIRED, not quietly
 # dropped. It read: "WHY THIS FILE IS ITSELF SMALL AND FAST, and says so ... the
 # honest version is not to skip the coverage, it is to pay the budget it enforces."
@@ -918,6 +929,130 @@ if [[ -z "$_ord" ]]; then
   ok "every job that runs the budgeted runner BUILDS THE BUNDLE FIRST, in that job — the calibration probe spawns it, and a missing bundle now fails closed"
 else bad "every job that runs the budgeted runner builds the bundle first, in that job" "offending job(s): $_ord"; fi
 
+# ------------------ DIVE-3477: THE CORPUS-GROWTH TRIPWIRE, GRADED AS ARITHMETIC
+# The shard restored headroom, which is how corpus growth becomes invisible again, so
+# main's ruling made a growth metric the condition it landed under: raw microseconds per
+# harness against a FIXED reference, independent of shard count and of the calibration
+# clamp. Those three properties are the deliverable — so they are graded HERE, on the
+# function, rather than asserted in the comment beside it. An assertion in a comment is
+# not a control (arm 98's own lesson, one row later).
+want "us per harness is the summed wall over the summed harness COUNT" \
+  "1048231" "$(tier_core_us_per_harness 326 311)"
+
+# SHARD-COUNT INDEPENDENCE. Arm 98 pins the matrix at two; this metric must be
+# indifferent to that number regardless, because a metric that moves when the matrix does
+# is a metric that reports a capacity change as a corpus change. Same corpus, same total
+# wall, split three ways instead of two:
+want "two shards and three shards over the SAME corpus give the same figure" \
+  "$(tier_core_us_per_harness $((149 + 177)) $((156 + 155)))" \
+  "$(tier_core_us_per_harness $((109 + 108 + 109)) $((104 + 104 + 103)))"
+want "and an UNSHARDED run of that corpus gives it too — this is the number main's runs already carry" \
+  "$(tier_core_us_per_harness 326 311)" "$(tier_core_us_per_harness $((326)) $((311)))"
+
+# The runner's own report is the only input, and a corpus that GREW must move it: 320
+# harnesses at 345s is 3% dearer per harness than 311 at 326s, which is the movement a
+# raw wall-clock sum against a per-shard cap cannot show once sharding restored headroom.
+_g1="$(tier_core_us_per_harness 326 311)"; _g2="$(tier_core_us_per_harness 345 320)"
+if (( _g2 > _g1 )); then
+  ok "a corpus that grew reads DEARER even when the wall-clock barely moved — the whole point of dividing by the count"
+else bad "a grown corpus reads dearer" "$_g1 vs $_g2"; fi
+
+if tier_core_us_per_harness 326 0 >/dev/null 2>&1; then
+  bad "a zero harness count REFUSES rather than dividing by it" "returned 0"
+else ok "a zero harness count REFUSES rather than dividing by it"; fi
+
+# CLAMP INDEPENDENCE, asserted on the code and not on the intent. wall/draw is circular —
+# it assumes the probe explains the corpus, which is the proposition DIVE-2736 exists to
+# TEST and which it marked DISCORDANT on the very run that arithmetic was applied to
+# (DIVE-3476: 305s/280s by hand against 340s/353s by the instrument, a sign flip on the
+# leg carrying the conclusion). So the metric must not be able to read a calibration
+# field, and "must not" is a property of the function body.
+_calread="$(sed -n '/^tier_core_us_per_harness()/,/^}/p' tests/lib/tier.sh \
+             | grep -cE 'cal_|CAL_|SCALE|scale|effective' || true)"
+want "the growth figure reads NO calibration field — the clamp is the mechanism that made growth invisible, and a metric that inherits it inherits the defect" \
+  "0" "$_calread"
+
+# THE REFERENCE IS SPELLED ONCE, beside the tier definition. Same rule as --budget and
+# --cal-us: a reference spelled in the caller is moved by a one-line YAML edit that nobody
+# reviews as the policy change it is.
+want "the reference constant is spelled exactly once in the tree" \
+  "1" "$(grep -rn '^TIER_CORE_US_PER_HARNESS_REF_PRISTINE=' --include='*.sh' --include='*.yml' . 2>/dev/null | wc -l)"
+_wfref="$(grep -rnE '109415[0-9]|113398[0-9]' .github/workflows/ 2>/dev/null || true)"
+if [[ -z "$_wfref" ]]; then
+  ok "NO workflow spells the reference value — it comes through tier_core_us_per_harness_ref or not at all"
+else bad "NO workflow spells the reference value" "$_wfref"; fi
+if tier_core_us_per_harness_ref not-an-environment >/dev/null 2>&1; then
+  bad "an unknown environment REFUSES rather than inventing a reference" "returned 0"
+else ok "an unknown environment REFUSES rather than inventing a reference"; fi
+
+# IT STARTS AT PARITY, WHICH IS THE ONLY REASON IT CAN SHIP. TIER_BUDGET_CORE cannot be
+# met today (340s/353s at typical per-harness cost against a 300s cap), so a metric
+# referenced to anything but TODAY would red on day one and be muted by the end of the
+# week. The first sharded run on main, 31941359141: pristine 137s+168s over 156+155
+# harnesses, installed-host 176s+168s over the same corpus.
+want "the reference starts UNDER parity on run one, pristine" \
+  "89" "$(tier_core_growth_pct_of_ref "$(tier_core_us_per_harness $((137 + 168)) $((156 + 155)))" pristine)"
+want "the reference starts UNDER parity on run one, installed-host" \
+  "97" "$(tier_core_growth_pct_of_ref "$(tier_core_us_per_harness $((176 + 168)) $((156 + 155)))" installed-host)"
+
+# THE FIRING HALF. Split from emission deliberately: per-run us/harness moved 935483 ..
+# 1148867 on main across three hours in which the corpus moved by two harnesses, so a
+# per-run threshold against a fixed reference fires on the runner and gets muted. The
+# window median is what survives that, and these arms grade that it does.
+_TW=scripts/core-growth-tripwire.sh
+_twd="$TMP/tw"; rm -rf "$_twd"; mkdir -p "$_twd"
+_mkrun() {   # <file> <pristine_us> <installed_us>
+  { printf 'unsharded_total_s pristine 326 311 2\n'
+    printf 'core_us_per_harness pristine %s 311 2 ref=1094155 pct_of_ref=0\n' "$2"
+    printf 'core_us_per_harness installed-host %s 311 2 ref=1133986 pct_of_ref=0\n' "$3"
+  } > "$1"
+}
+for i in 1 2 3 4 5; do _mkrun "$_twd/at-ref-$i.txt" 1094155 1133986; done
+_OUT="$(bash "$_TW" "$_twd"/at-ref-*.txt 2>&1)"; _RC=$?
+if (( _RC == 0 )) && [[ "$_OUT" == *"pristine        CLEAR"* && "$_OUT" == *"installed-host  CLEAR"* ]]; then
+  ok "a window sitting AT the reference is CLEAR — the metric does not fire on the day it ships"
+else bad "a window at the reference is CLEAR" "rc=$_RC $_OUT"; fi
+
+# A window of four is under the floor. UNDETERMINED, not CLEAR: an environment that drops
+# out of the window silently is an environment nobody is watching.
+_OUT="$(bash "$_TW" "$_twd"/at-ref-1.txt "$_twd"/at-ref-2.txt "$_twd"/at-ref-3.txt "$_twd"/at-ref-4.txt 2>&1)"; _RC=$?
+if [[ "$_OUT" == *UNDETERMINED* && "$_OUT" != *CLEAR* && "$_OUT" != *FIRED* ]]; then
+  ok "a window under the run floor reports UNDETERMINED rather than CLEAR — too few points reads exactly like enough of them"
+else bad "a short window is UNDETERMINED" "rc=$_RC $_OUT"; fi
+
+# A DRAW SPIKE MUST NOT FIRE IT. Two runs of the five drawing 141% (the census maximum)
+# against three at the reference: the mean would clear 110%, the median does not.
+for i in 1 2 3; do _mkrun "$_twd/spike-$i.txt" 1094155 1133986; done
+for i in 4 5; do _mkrun "$_twd/spike-$i.txt" 1542758 1598920; done
+_OUT="$(bash "$_TW" "$_twd"/spike-*.txt 2>&1)"; _RC=$?
+if (( _RC == 0 )) && [[ "$_OUT" == *"pristine        CLEAR"* ]]; then
+  ok "two runner-draw spikes in five runs do NOT fire the tripwire — a median is what survives a 74-141% draw spread, and an alarm that cries wolf is muted"
+else bad "a draw spike does not fire the tripwire" "rc=$_RC $_OUT"; fi
+
+# AND IT MUST STILL FIRE ON A REAL RISE, or it is a green that means nothing. Every run
+# 15% dearer per harness.
+for i in 1 2 3 4 5; do _mkrun "$_twd/grown-$i.txt" 1258278 1304084; done
+_OUT="$(bash "$_TW" "$_twd"/grown-*.txt 2>&1)"; _RC=$?
+if (( _RC == 0 )) && [[ "$_OUT" == *FIRED* && "$_OUT" == *"FILE A ROW"* ]]; then
+  ok "a corpus 15% dearer across the whole window FIRES, and says to file a row"
+else bad "a real rise FIRES" "rc=$_RC $_OUT"; fi
+_OUT="$(bash "$_TW" --strict "$_twd"/grown-*.txt 2>&1)"; _RC=$?
+if (( _RC == 7 )); then
+  ok "--strict is the seam for an agent that wants an exit code to hang a filing action off (rc=7)"
+else bad "--strict exits 7 on a fired window" "rc=$_RC"; fi
+
+# FIRING FILES A ROW. IT DOES NOT RED A BUILD. main authorised a metric, not a gate, and
+# widening one mid-ship is how a tripwire becomes a second cap nobody agreed to.
+# INVOCATION, not mention. The printing job's summary text names the tripwire on purpose
+# — a reader who finds the emitted figure must be able to find the thing that reads it —
+# so the arm looks for the script in COMMAND position and nowhere else.
+_twwf="$(grep -rhE '(^|[|&;]|bash )[[:space:]]*(\./)?scripts/core-growth-tripwire\.sh' .github/workflows/ 2>/dev/null | grep -v '^[[:space:]]*#' || true)"
+if [[ -z "$_twwf" ]]; then
+  ok "NO workflow runs the tripwire — firing files a row, it does not red a build, and there is no new required context"
+else bad "NO workflow runs the tripwire" "$_twwf"; fi
+rm -rf "$_twd"
+
+
 # ------------------------ 61-73 DIVE-2736: THE PROBE IS GRADED AGAINST THE CORPUS
 # THE MEASUREMENT THAT FORCED THIS, on core/installed-host, same PR, 13 minutes apart:
 #
@@ -1573,16 +1708,52 @@ if len(summ) == 1:
 #   * `matrix: { include: [...] }` with three entries drops the `shard` key, so counting
 #     only jobs that HAVE the key would silently grade nothing — the count of sharded core
 #     corpus jobs is asserted too, at exactly one per environment
-#   * a third capacity job added ALONGSIDE the two (`core-pristine-3`) never touches a
-#     matrix at all, and is caught by that same count
+#   * a third capacity job added ALONGSIDE the two (`core-pristine-3`), with its matrix key
+#     renamed or with no matrix at all, is a capacity raise that declares no N anywhere
+#
+# DIVE-3479 — THE THIRD BULLET USED TO SAY IT WAS "caught by that same count", AND IT WAS
+# NOT. Measured on the merged tree (`792c78c`): a third `--tier=core` job with its matrix
+# key renamed `shard` -> `part`, divisor still `strategy.job-total`, bundle built, passed
+# **143/0**. The count only ever looked at jobs that HAD a `shard` key, so renaming the key
+# made the new job invisible to the thing counting it, and 2 x 300s of extra capacity per
+# environment landed green — the exact capacity raise main ruled must come back as a gate.
+# That claim was an assertion in a comment, unbacked by a control, INSIDE the arm whose
+# thesis is that an assertion in a comment is not a control. The same recursion as DIVE-2089.
+#
+# So the count is now over CORE JOBS, not over jobs that declare a shard key, and every
+# core job must land in one of exactly two named buckets:
+#   * DECLARED  — a literal `shard:` matrix; this is capacity, and N is pinned here
+#   * DYNAMIC   — the confirm rail's `include: ${{ ... }}`, built at run time from the
+#                 shards that went over, so it is bounded BY the declared count and adds
+#                 no capacity of its own
+# Anything else reds by name. Capacity is JOBS x CAP, not shards x cap: a core job the
+# count cannot classify is the same raise arriving through a hole in the classifier, and
+# `else: pass` is how the first version of this arm got it wrong.
+#
+# STILL NOT COVERED, said plainly rather than in a claim: a job that buys core capacity
+# without a literal `run-harnesses.sh ... --tier=core` in a `run:` step — the tier arriving
+# through a variable, or the invocation living behind `uses:` in a composite or reusable
+# workflow — is not seen by `core_jobs` at all and no clause below can see it either.
+#
 # `strategy.job-total` stays the runner's divisor throughout: arm 94 requires it and this
 # arm deliberately does not introduce a literal 2 into the workflow to satisfy itself. The
 # matrix stays the single source of N; this file is the single source of what N may BE.
 CORE_SHARDS = 2
+# One corpus job per environment (pristine, installed-host) and one confirm job per
+# environment. Both are counts of JOBS, and both are capacity: another corpus job is
+# another 300s cap, and another confirm job is another box re-running a shard.
+CORE_ENVS = 2
 
 def matrix_of(job):
     s = job.get('strategy')
     return s.get('matrix') if isinstance(s, dict) else None
+
+def is_runtime_include(m):
+    # The confirm rail: `matrix: { include: ${{ fromJson(needs[...].outputs.x) }} }`. One
+    # key, and its value is an EXPRESSION rather than a list — a literal `include:` list is
+    # a declared matrix wearing the confirm rail's clothes and must not be classified here.
+    return (isinstance(m, dict) and set(m) == {'include'}
+            and isinstance(m.get('include'), str) and '${{' in m['include'])
 
 core_jobs = [jn for jn, j in jobs.items()
              if any('run-harnesses.sh' in r and '--tier=core' in r for r in runs(j))]
@@ -1590,18 +1761,43 @@ core_jobs = [jn for jn, j in jobs.items()
 # time from the shards that went over (one entry per over-budget shard, possibly none). N
 # is not declared there and must not be pinned there — the corpus jobs are the ones that
 # DECLARE the split, and they are the ones this arm is about.
-declared = {jn: matrix_of(jobs[jn]).get('shard')
-            for jn in core_jobs
-            if isinstance(matrix_of(jobs[jn]), dict) and 'shard' in matrix_of(jobs[jn])}
+declared, dynamic, unclassified = {}, [], []
+for jn in core_jobs:
+    m = matrix_of(jobs[jn])
+    if isinstance(m, dict) and 'shard' in m:
+        declared[jn] = m['shard']
+    elif is_runtime_include(m):
+        dynamic.append(jn)
+    else:
+        unclassified.append(jn)
 
 want = list(range(1, CORE_SHARDS + 1))
 shard_problems = []
-if len(declared) != 2:
+# The buckets sum to the population by construction; assert the population is not empty,
+# because every clause below is vacuously satisfied by a core_jobs that found nothing.
+if not core_jobs:
     shard_problems.append(
-        'expected exactly 2 core corpus jobs declaring a literal shard matrix, one per '
+        'no job in this workflow runs `run-harnesses.sh --tier=core` in a `run:` step — '
+        'either the core corpus left the PR path or this arm has stopped being able to see '
+        'it, and both of those are the same green')
+if unclassified:
+    shard_problems.append(
+        'core corpus job(s) %s declare no literal `shard` matrix and are not the run-time '
+        'confirm rail — each is another independently capped core job, i.e. the same '
+        'capacity raise as another shard, arriving where the count cannot see it (renaming '
+        'the matrix key, or adding a third job with no matrix at all, was measured green '
+        'before DIVE-3479)' % ', '.join(sorted(unclassified)))
+if len(dynamic) != CORE_ENVS:
+    shard_problems.append(
+        'expected exactly %d core jobs whose matrix is built at run time (the confirm rail, '
+        'one per environment); found %d (%s)'
+        % (CORE_ENVS, len(dynamic), ', '.join(sorted(dynamic)) or 'none'))
+if len(declared) != CORE_ENVS:
+    shard_problems.append(
+        'expected exactly %d core corpus jobs declaring a literal shard matrix, one per '
         'environment; found %d (%s) — a core job that does not declare its shards puts N '
         'somewhere this arm cannot read it'
-        % (len(declared), ', '.join(sorted(declared)) or 'none'))
+        % (CORE_ENVS, len(declared), ', '.join(sorted(declared)) or 'none'))
 for jn in sorted(declared):
     v = declared[jn]
     if not isinstance(v, list) or not all(isinstance(x, int) for x in v):
@@ -1615,8 +1811,67 @@ for jn in sorted(declared):
             'TIER_BUDGET_CORE and must come back as a gate (then move CORE_SHARDS here)'
             % (jn, v, want))
 chk(not shard_problems,
-    'the core shard count is PINNED at %d per environment and the pin is parsed, not asserted in a comment (a third shard is a declared capacity raise: it must arrive as a policy decision that edits this line, not as one character in the workflow)' % CORE_SHARDS,
+    'the core shard count is PINNED at %d per environment, over CORE JOBS rather than over jobs that happen to carry a shard key, and the pin is parsed rather than asserted in a comment (a third shard, a third capacity job with the key renamed, and a third capacity job with no matrix at all are all the same declared capacity raise: each must arrive as a policy decision that edits this line, not as one character in the workflow)' % CORE_SHARDS,
     ' | '.join(shard_problems))
+
+# 99 — AND THE GUARD MUST RUN ON THE PATH IT GUARDS. DIVE-3479 finding 2.
+#
+# This file is `TIER: nightly`, and the PR path selects harnesses by DIFF: `changed-harnesses`
+# runs the harnesses whose `tests/*.sh` file the PR touched. A WORKFLOW-ONLY edit — which is
+# precisely the shape of the `[1, 2] -> [1, 2, 3]` mutation arm 98 exists to stop — changes no
+# test file, so every arm above ran on NO PR job at all and first reported on `full-sweep`,
+# within a day, after the merge. A post-merge detector, not a pre-merge gate; same family as
+# community/wiki/a-control-enforced-on-one-path-is-absent-on-the-parallel-one.md.
+#
+# The fix is NOT promoting this harness out of `nightly`: it costs 41.4s (measured in CI, run
+# 30988600395), and the core tier is the thing DIVE-2525/3315 are trying to shrink — promoting
+# it would spend 14% of one shard's 300s cap to grade the cap. It runs in its OWN job instead:
+# 41.4s on a parallel runner, off the critical path of a ~300s core job, and 0s against
+# TIER_BUDGET_CORE. The tier line stays `nightly`, which is a statement about the CORPUS, not
+# a claim that nothing else may invoke it.
+#
+# The job is UNCONDITIONAL on purpose. A `paths:` filter or an `if:` would make it `skipped` on
+# most PRs, and a skipped dependency reds every aggregator that requires it — the deadlock in
+# community/wiki/required-check-path-filter-deadlock.md, bought to save 41s.
+#
+# RESIDUAL, because this arm cannot escape its own recursion: the guard job is declared in the
+# workflow it guards, so a workflow-only edit that removes BOTH the job and the aggregators'
+# `needs:` entry is still invisible pre-merge (it reds here on the nightly union within a day).
+# Removing only one of the two fails closed: drop the job and `needs:` names a job that does not
+# exist, which is an INVALID workflow — no run, no required context ever reported, queue blocked.
+GUARD_JOB = 'workflow-structure-guards'
+GUARD_HARNESS = 'tests/corpus_tier_budget_unit.sh'
+GUARD_AGGS = ['test', 'test-installed-host']
+def _needs(j):
+    n = (j or {}).get('needs')
+    return [n] if isinstance(n, str) else (n or [])
+guard_problems = []
+g = jobs.get(GUARD_JOB)
+if not g:
+    guard_problems.append(
+        'no job `%s` — the arms above then grade the workflow only on the nightly union, i.e. '
+        'after the merge they exist to gate' % GUARD_JOB)
+else:
+    if not any(GUARD_HARNESS in r for r in runs(g)):
+        guard_problems.append('%s does not run %s' % (GUARD_JOB, GUARD_HARNESS))
+    if g.get('if') is not None:
+        guard_problems.append(
+            '%s carries `if: %r` — a conditional guard is `skipped` on the runs it was meant to '
+            'watch, and a skipped dependency reds the aggregators instead' % (GUARD_JOB, g.get('if')))
+for agg in GUARD_AGGS:
+    j = jobs.get(agg) or {}
+    if GUARD_JOB not in _needs(j):
+        guard_problems.append('required check %s does not need %s' % (agg, GUARD_JOB))
+    elif GUARD_JOB not in '\n'.join(runs(j)):
+        # `needs:` alone only ORDERS the jobs. DIVE-3315's own lesson: a job whose dependency
+        # failed is skipped, and a skipped required check reads as satisfied — so the aggregator
+        # has to compare this dependency's `.result` by name, not merely wait for it.
+        guard_problems.append(
+            '%s needs %s but never compares its .result — it waits for the guard and then '
+            'reports green whatever the guard said' % (agg, GUARD_JOB))
+chk(not guard_problems,
+    'the structural arms run PRE-MERGE on every PR, in their own job, required by both pristine and installed-host aggregators (a workflow-only edit touches no tests/*.sh, so `changed-harnesses` runs nothing and these arms would otherwise first report on the nightly union, after the merge)',
+    ' | '.join(guard_problems))
 PY
   )
 else bad "unit-tests.yml is readable from the harness (DIVE-3315 arms)" "no file at $_wf3315"; fi
