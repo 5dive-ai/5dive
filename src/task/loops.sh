@@ -435,8 +435,14 @@ _task_verify_merge_binding() {
     printf 'a PR named in the body'
   else
     branches=$(_gate_branch_refs_from_text "$body" "$ident" 2>/dev/null | head -3 | paste -sd, -) || branches=""
-    [[ -n "$branches" ]] && printf 'branch(es) named in the body: %s' "$branches"
+    # Explicit `return 0`: a trailing `[[ -n ... ]] && printf` supplies this
+    # function's exit status, so an empty $branches (no binding — the common,
+    # correct case) would make the helper return 1 to every caller.
+    if [[ -n "$branches" ]]; then
+      printf 'branch(es) named in the body: %s' "$branches"
+    fi
   fi
+  return 0
 }
 
 # DIVE-475: deterministic verify-runner — proven-done, not claimed-done. Run a
@@ -723,9 +729,18 @@ cmd_task_verify() {
   else
     printf '%s\n' "$result_txt" >&2
     if (( rc == 0 )); then
-      (( flipped )) && ok "$ident verify PASS — marked done" \
-                    || (( merge_hold )) && ok "$ident verify PASS — graded; merge still owed" \
-                    || ok "$ident verify PASS (status unchanged, --no-done)"
+      # Three EXCLUSIVE branches. A bare `A && B || C && D || E` chain cannot
+      # express that: bash groups it left-to-right, so with flipped=1 the first
+      # ok() returns 0, the `||` short-circuits past the merge_hold test, and the
+      # 'merge still owed' message runs unconditionally — telling the operator a
+      # merge is owed on the unbound row that binds nothing (main, iteration 1).
+      if (( flipped )); then
+        ok "$ident verify PASS — marked done"
+      elif (( merge_hold )); then
+        ok "$ident verify PASS — graded; merge still owed"
+      else
+        ok "$ident verify PASS (status unchanged, --no-done)"
+      fi
     else
       warn "$ident verify FAIL (exit $rc) — status unchanged"
     fi

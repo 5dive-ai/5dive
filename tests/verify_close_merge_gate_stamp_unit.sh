@@ -82,7 +82,12 @@ A=$(mk "hold arm A" "Branch: IDENT-some-feature-branch")
 if [[ -n "$A" ]]; then
   # The DIVE-2577 rule anchors on the row's OWN ident, so the body must name it.
   "$CLI" task set-body "$A" "Branch: ${A,,}-some-feature-branch" >/dev/null 2>&1
-  "$CLI" task verify "$A" --cmd=true >/dev/null 2>&1; A_RC=$?
+  A_OUT=$("$CLI" task verify "$A" --cmd=true 2>&1); A_RC=$?
+  # The other half of the message pair graded at arm C: a HELD row must say the
+  # merge is still owed and must NOT also claim it was marked done.
+  { grep -q 'merge still owed' <<<"$A_OUT" && ! grep -q 'marked done' <<<"$A_OUT"; } \
+    && ok_t "A: the held row says ONLY 'merge still owed' — never also 'marked done'" \
+    || bad_t "A: the held row's MESSAGE is exclusive" "expected 'merge still owed' without 'marked done'; got: $A_OUT"
   [[ "$A_RC" -eq 0 ]] \
     && ok_t "A: passing verify still exits 0 while holding the close" \
     || bad_t "A: passing verify still exits 0" "rc=$A_RC"
@@ -134,7 +139,17 @@ fi
 # fail when the verb never ran is not coverage.
 C=$(mk "stamp arm C" "A research row. No branch, no PR, nothing to land.")
 if [[ -n "$C" ]]; then
-  "$CLI" task verify "$C" --cmd=true >/dev/null 2>&1; C_RC=$?
+  C_OUT=$("$CLI" task verify "$C" --cmd=true 2>&1); C_RC=$?
+  # DIVE-3330 iteration 2 (main): grade the OPERATOR-FACING MESSAGE, not only the
+  # state. The three success messages shipped as a bare `A && B || C && D || E`
+  # chain, which bash groups left-to-right, so the 'merge still owed' branch ran
+  # unconditionally after the flipped branch succeeded — the unbound control closed
+  # correctly and then told the operator a merge was owed on a row that binds
+  # nothing. Every state arm here stayed green through it, because none of them
+  # read stderr. This arm is what makes a mutation of those three lines red.
+  { grep -q 'marked done' <<<"$C_OUT" && ! grep -q 'merge still owed' <<<"$C_OUT"; } \
+    && ok_t "C: the unbound control says ONLY 'marked done' — no false merge-owed claim" \
+    || bad_t "C: the unbound control's MESSAGE is exclusive" "expected 'marked done' without 'merge still owed'; got: $C_OUT"
   res_of "$C" | grep -q "$HOLD" \
     && bad_t "C NEGATIVE: no binding -> must NOT be held" "held a row with nothing to merge" \
     || ok_t "C NEGATIVE: no binding -> no merge hold"
