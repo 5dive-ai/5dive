@@ -110,10 +110,17 @@ stored=$(db "SELECT COALESCE(human_nonce_hash,'') FROM tasks WHERE id=${g2};")
 # DECISION, which minted nothing before — now gets a hash rotated in on a confirmed
 # send. This sweep is the rescue path for the 43 tier-2 decision gates measured
 # nonce-less in DIVE-2355: they acquire evidence on their next reminder instead of
-# waiting to be re-filed. Deliberately asserts the STORED HASH only, not a button:
-# the decision keyboard still carries no nonce in its callback_data (telegram-pi's
-# TNA_RE is greedy and would swallow it), which is why the assertion above for the
-# APPROVAL gate can pair callback_data to the hash and this one cannot.
+# waiting to be re-filed. Asserts the STORED HASH only, not a button.
+#
+# DIVE-2269: the reason that USED to be given here — "the decision keyboard carries
+# no nonce, telegram-pi's TNA_RE is greedy and would swallow it" — is spent twice
+# over. DIVE-2233 put the nonce on decision buttons too, and DIVE-2374 brought
+# telegram-pi/telegram-opencode to the tolerant regex (pinned empty by S12e in
+# tests/gate_t2_nonce_proof_unit.sh). So this arm is now weaker than it could be,
+# not blocked from being stronger: pairing g1's decision callback_data to the stored
+# hash the way the APPROVAL arm above does is a live option, deliberately NOT taken
+# in this comment-only change because it was not re-derived here. What DIVE-2356
+# owns is the stored hash, and that is what this asserts.
 [[ "$(db "SELECT COALESCE(human_nonce_hash,'') FROM tasks WHERE id=${g1};")" =~ ^[0-9a-f]{64}$ ]] \
   && ok_t "tier-2 DECISION gate gets a nonce rotated in by the re-nag (DIVE-2356)" \
   || bad_t "tier-2 decision re-nag mint" "hash='$(db "SELECT COALESCE(human_nonce_hash,'') FROM tasks WHERE id=${g1};")'"
