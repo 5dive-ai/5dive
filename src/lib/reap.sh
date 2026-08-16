@@ -266,7 +266,11 @@ _reap_stale_shells() {
   # Candidates: the reapable CLASS first (pure predicate on the command line),
   # then the age/ancestor filter. Two passes so the class test stays a pure
   # string function the unit test can drive directly.
-  local class_table="" line pid rest
+  # Every name the read below binds is declared here. Both call sites invoke
+  # this function inside $( ), so an undeclared `cmd`/`ppid` would die with the
+  # subshell today — but `cmd` is a heavily reused name in this codebase and a
+  # future direct call would clobber the caller's.
+  local class_table="" pid ppid etimes cmd
   while IFS=$'\t' read -r pid ppid etimes cmd; do
     if _reap_is_reapable "$pid" "$cmd"; then
       class_table+="${pid}"$'\t'"${ppid}"$'\t'"${etimes}"$'\t'"${cmd}"$'\n'
@@ -308,6 +312,14 @@ _reap_stale_shells() {
   # TERM the whole tree, give it a second, then KILL whatever is left. The
   # incident's runaway survived TERM to its parent and reparented to init, so the
   # second pass is not belt-and-braces — it is the only thing that ended it.
+  #
+  # LIMIT, deliberate: the keep-alive opt-out is checked on the VICTIM only
+  # (_reap_is_reapable, above); $tree_pids descendants are signalled without a
+  # re-check. Not reachable that we can find — every way to put the token in a
+  # child's environ also leaves it in the parent's environ or argv, so the
+  # parent is spared first and the tree is never collected — and re-checking
+  # here would be worse than the hole: a protected descendant would leave its
+  # unprotected parent half-killed.
   local p
   for p in $tree_pids; do kill -TERM "$p" 2>/dev/null || true; done
   sleep 1

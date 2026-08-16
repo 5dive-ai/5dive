@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# TIER: core — 0.5s measured on the 5dive control plane (agent-dev seat): mostly
-# pure string/awk grading, plus four short-lived staged decoys (two for the
-# environ opt-out, one zombie, one live) that are killed by PID on exit. No DB,
-# no network, no `ps` of the real seat, and nothing it kills is not its own.
+# TIER: core — 0.5s measured on the 5dive control plane (agent-dev seat), and it
+# does not grow under load: 0.45s x3 idle, and 48 runs at 16-way concurrency on
+# 4 cores with 4 spinners were green. Mostly pure string/awk grading, plus
+# staged decoys (two for the environ opt-out, a zombie and the holder that keeps
+# it unreaped, one live). The holder is nominally long-lived — it has to outlast
+# the arm it serves — but every staged pid is killed by PID from the EXIT trap
+# on every path, so nothing survives the run. No DB, no network, no `ps` of the
+# real seat, and nothing it kills is not its own.
 #
 # DIVE-3503 — the reaper's predicate, graded on a FABRICATED process table.
 #
@@ -96,9 +100,48 @@ echo "== the opt-out, driven by REAL staged processes =="
 #
 # It also turned out the old spelling never ran at all — `5DIVE_KEEP_ALIVE` is
 # not a valid shell identifier (leading digit) — which is graded here too.
-A=""; B=""
-cleanup_staged() { local p; for p in $A $B; do kill -KILL "$p" 2>/dev/null; done; }
+A=""; B=""; holder=""
+# NOTE: this trap REPLACES the one set at the top of the file, so everything
+# this harness stages has to be ended from here — including the zombie holder
+# staged below, which by design outlives the arm that consumes it. A harness
+# for "your background shell outlives your task" must not leak one itself.
+cleanup_staged() { local p; for p in $A $B $holder; do kill -KILL "$p" 2>/dev/null; done; }
 trap 'rc=$?; cleanup_staged; rm -f "${ZF:-}"; echo "HARNESS-RC=$rc"' EXIT
+
+# ---- staged here, graded ~45 arms below (see "Zombie arm") ------------------
+# Staging a zombie is itself a wait on a producer, so it obeys this row's own
+# rule, and the first cut of it broke both halves of that rule (measured flaky
+# by quinn on the verifier seat: 2 reds in 16 sequential runs and 2 in 6
+# concurrent, always `state=reaped-early`). Three things make it deterministic:
+#
+#   1. `exec sleep` — the holder becomes a process that never calls wait(), so
+#      the zombie cannot be reaped out from under the poll. A bash holder that
+#      merely slept longer is NOT the fix: it exits at the end of its lifetime
+#      and hands the zombie to init, which reaps it instantly.
+#      `exec` alone is not enough, though, and this cost a measured 1 red in 18
+#      concurrent runs before it was fixed:
+#   2. The child must not die while its parent is STILL BASH. Non-interactive
+#      bash reaps background children in its SIGCHLD handler, so a child that
+#      exits inside the window between the `&` and the `exec` is reaped by the
+#      holder itself and never becomes visible. The child therefore waits for
+#      the holder to BECOME the non-waiting process — /proc/<ppid>/comm flips
+#      from `bash` to `sleep` at the exec — and only then exits. That is an
+#      ordering, not a margin: there is no race left to lose under any load,
+#      rather than one made rarer by a longer sleep.
+#   3. It is staged HERE and consumed ~45 arms below, so the staging cost
+#      overlaps the rest of the file. This is TIER: core — every idle second in
+#      it is paid on every unrelated PR.
+ZHOLD=60      # holder lifetime; >= 10x ZDEADLINE, and ended by cleanup_staged
+ZDEADLINE=5   # wall-clock budget for each poll at the arm
+# Bounded like everything else here: if the exec never happens the child gives
+# up after ~5s rather than waiting forever, and the arm below then reports what
+# it actually saw.
+ZWAIT='n=0; while [ "$(cat /proc/$PPID/comm 2>/dev/null)" != sleep ] && [ $n -lt 500 ]; do n=$((n+1)); sleep 0.01; done'
+ZF=$(mktemp) || ZF=""
+if [[ -n "$ZF" ]]; then
+  ZF="$ZF" ZWAIT="$ZWAIT" bash -c 'bash -c "$ZWAIT" & echo $! >"$ZF"; exec sleep '"$ZHOLD" & holder=$!
+  disown "$holder" 2>/dev/null || true
+fi
 
 WEDGE='until [ -f /nonexistent/5dive-never ]; do sleep 1; done'
 if [[ ! -r /proc/self/cmdline ]]; then
@@ -271,18 +314,30 @@ _reap_pid_ended "$gone" && ok "a reaped pid is ended" \
 # shell is waited on and never lingers as Z, so the zombie has to belong to a
 # parent that is still alive and not waiting — which is also the real case (our
 # victims' parents are runtimes that wait late or not at all).
-ZF=$(mktemp) || ZF=""
-holder=""
-if [[ -n "$ZF" ]]; then
-  ZF="$ZF" bash -c 'bash -c "exit 0" & echo $! >"$ZF"; sleep 3' & holder=$!
-fi
+#
+# The holder was staged at the top of the file; only the wait for it lives here.
+# That wait was the second half of quinn's flake and it is bounded the way this
+# row says a wait must be: by the CLOCK, not by an iteration count (the old
+# 50 x 0.02s was 1s of sleep plus ~100 forks whose cost is load-dependent, a
+# budget that cannot be compared with the holder's lifetime), and it observes
+# the PRODUCER (`kill -0 $holder`) and not only the /proc proxy — so "the holder
+# died first" is reported AS THAT instead of as "reaped-early".
 z=""; zstate=""
-for _ in $(seq 1 50); do z=$(cat "$ZF" 2>/dev/null || true); [[ -n "$z" ]] && break; sleep 0.02; done
+zend=$(( SECONDS + ZDEADLINE ))
+while [[ -n "$ZF" ]]; do
+  z=$(cat "$ZF" 2>/dev/null || true); [[ -n "$z" ]] && break
+  kill -0 "$holder" 2>/dev/null || { zstate="holder-died-before-it-published-a-pid"; break; }
+  (( SECONDS >= zend )) && { zstate="timed-out-after-${ZDEADLINE}s-waiting-for-the-pid"; break; }
+  sleep 0.02
+done
 if [[ -n "$z" ]]; then
-  for _ in $(seq 1 50); do
+  zend=$(( SECONDS + ZDEADLINE ))
+  while :; do
     zraw=$(cat "/proc/$z/stat" 2>/dev/null) || { zstate="reaped-early"; break; }
     zraw="${zraw##*) }"; zstate="${zraw%% *}"
     [[ "$zstate" == "Z" ]] && break
+    kill -0 "$holder" 2>/dev/null || { zstate="holder-died-first(last-state=$zstate)"; break; }
+    (( SECONDS >= zend )) && { zstate="timed-out-after-${ZDEADLINE}s(last-state=$zstate)"; break; }
     sleep 0.02
   done
 fi
@@ -294,7 +349,10 @@ if [[ "$zstate" == "Z" ]]; then
 else
   bad "zombie arm NOT STAGED (state=${zstate:-no-pid}) — the zombie branch went ungraded"
 fi
-[[ -z "$holder" ]] || { kill -TERM "$holder" 2>/dev/null || true; wait "$holder" 2>/dev/null || true; }
+# End it as soon as the arm is done with it; the EXIT trap (cleanup_staged) is
+# the backstop for every path that does not reach here. No `wait` — it was
+# disowned at staging, so it is no longer a job this shell can wait for.
+[[ -z "$holder" ]] || kill -TERM "$holder" 2>/dev/null || true
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 ))
