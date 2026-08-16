@@ -78,6 +78,7 @@ cat \
   src/lib/agent_env.sh \
   src/lib/tasks_db.sh \
   src/lib/actor.sh \
+  src/lib/routing_receipt.sh \
   src/lib/a2a_rounds.sh \
   src/cmd_auth.sh \
   src/cmd_account.sh \

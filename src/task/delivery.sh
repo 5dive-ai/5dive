@@ -750,6 +750,17 @@ cmd_task_reject() {
   ok "$ident rejected — bounced back to maker '$maker' (iteration $iter${maxi:+/$maxi})" \
      '{id:($i|tonumber), ident:$id, status:"todo", bouncedTo:$m, role:"maker", iteration:($n|tonumber)}' \
      --arg i "$id" --arg id "$ident" --arg m "$maker" --arg n "$iter"
+  # DIVE-3499: the sender-visible receipt. A verifier who has just bounced a row
+  # cannot otherwise tell "the maker will pick this up" from "this vanished", and
+  # closes the gap by pinging them — which costs the maker a full reload of a PR
+  # they had closed out. Cannot fail; see src/lib/routing_receipt.sh.
+  # The `|| true` and the stderr drop are the additive-only contract AT THE CALL
+  # SITE, not belt-and-braces: a tree that sources a SUBSET of src/ — which is
+  # what most harnesses do — has no routing_receipt, and bash turns that into
+  # rc=127 on a verb that had already succeeded. Measured on
+  # tests/task_reject_trace_unit.sh before this line existed. The wrapper's own
+  # containment cannot cover the case where the wrapper is what is missing.
+  routing_receipt "$ident" "$maker" "now owns it (bounced back)" 2>/dev/null || true
 }
 
 
