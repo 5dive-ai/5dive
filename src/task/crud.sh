@@ -1088,6 +1088,15 @@ cmd_task_assign() {
                         THEN datetime('now') ELSE started_at END
       WHERE id=${id};"
   ok "$ident assigned to $who" '{id:($i|tonumber), ident:$id, assignee:$a}' --arg i "$id" --arg id "$ident" --arg a "$who"
+  # DIVE-3499: sender-visible receipt — owner, queue position, next wake. Cannot
+  # fail; see src/lib/routing_receipt.sh.
+  # The `|| true` and the stderr drop are the additive-only contract AT THE CALL
+  # SITE, not belt-and-braces: a tree that sources a SUBSET of src/ — which is
+  # what most harnesses do — has no routing_receipt, and bash turns that into
+  # rc=127 on a verb that had already succeeded. Measured on
+  # tests/task_reject_trace_unit.sh before this line existed. The wrapper's own
+  # containment cannot cover the case where the wrapper is what is missing.
+  routing_receipt "$ident" "$who" "now owns it" 2>/dev/null || true
 }
 
 # DIVE-1880: attach the maker→verifier rail to an ALREADY-FILED task. `--verifier`

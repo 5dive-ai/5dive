@@ -410,6 +410,21 @@ cmd_task_set_body() {
     --arg id "$ident" --arg m "$mode" \
     --argjson pl "$prior_len" --argjson nl "$new_len" \
     --argjson pls "$prior_lines" --argjson nls "$new_lines"
+  # DIVE-3499: a body write is the third routing verb — it is how work is handed
+  # over WITHOUT a message (rule 0: "handing work back is a row, not a message").
+  # The measured ping this row exists to delete was exactly this shape: ops wrote
+  # a full triage onto DIVE-3330's body, the row was already todo and already
+  # assignee=dev2, and ops pinged a human-shaped seat anyway because nothing told
+  # it the write had landed anywhere a person would see. Cannot fail; see
+  # src/lib/routing_receipt.sh.
+  local _sb_owner; _sb_owner=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};" 2>/dev/null || echo "")
+  # The `|| true` and the stderr drop are the additive-only contract AT THE CALL
+  # SITE, not belt-and-braces: a tree that sources a SUBSET of src/ — which is
+  # what most harnesses do — has no routing_receipt, and bash turns that into
+  # rc=127 on a verb that had already succeeded. Measured on
+  # tests/task_reject_trace_unit.sh before this line existed. The wrapper's own
+  # containment cannot cover the case where the wrapper is what is missing.
+  routing_receipt "$ident" "$_sb_owner" "owns it (body $mode)" 2>/dev/null || true
 }
 
 # `5dive task set-title <id|DIVE-N> <text...>` — DIVE-2848. `set-body` has existed
