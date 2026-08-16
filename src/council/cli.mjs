@@ -567,8 +567,13 @@ function seatHealthMap() {
 function nudgeSeatAgent(agent, msg) {
   const bin = process.env.COUNCIL_5DIVE_BIN || '5dive'
   try {
+    // DIVE-3318: a wake nudge is a one-way machine notice nobody replies to, so it is
+    // not a conversational ROUND and must not be counted against the a2a round cap — a
+    // convene addresses several nudges to the same seat per run, and a refused nudge is
+    // a dozing seat nobody wakes. NOT a sender exemption: see a2a_round_guard.
     execFileSync(bin, ['agent', 'send', String(agent), String(msg)],
-      { encoding: 'utf-8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] })
+      { encoding: 'utf-8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, _5DIVE_A2A_NOTIFY: '1' } })
     return { ok: true }
   } catch (e) {
     // DIVE-2220: report WHY, never a bare false. This rail is the only wake a heartbeat-less seat
@@ -1493,6 +1498,15 @@ function motionFromFlags() {
 // registry bench is only a fallback for an uninitialized/ad-hoc council with no lineage yet.
 function cmdRoster() {
   const registryPath = flag('registry')
+  // DIVE-2890: the roster's threshold line used to be the GENESIS-sealed default spec alone, which
+  // is the `ordinary` rule. The enforced bar is per decision-CLASS (see convene's `policy:
+  // constitution.thresholds`), and for `constitutional` it is 2/3 with quorum ALL. Printing the
+  // default alone under-reported the constitutional quorum — wrong in the REASSURING direction (a
+  // seat mid-ballot reads "quorum 4", sees 4 cast, concludes its vote is redundant, abstains, and
+  // under require_quorum:true that abstention is what inquorates the motion). So resolve and emit
+  // EVERY declared class against the live roster size; bash prints the table.
+  const cpFlag = flag('constitution-path')
+  const constitution = E.loadConstitution(cpFlag === true || cpFlag == null ? '' : String(cpFlag))
   const lineageSeats = readJsonFlag('seats-json', { optional: true })
   let baseSeats, thresholdSpec, seededAt
   if (lineageSeats && lineageSeats.length) {
@@ -1513,6 +1527,32 @@ function cmdRoster() {
   const seatCount = (baseSeats || []).length
   const threshold = E.resolveThreshold(seatCount, thresholdSpec)
   const quorum = E.quorumSize(seatCount, thresholdSpec)
+  // Per-class table, resolved against THIS roster's seat count. normalizeConstitution() always
+  // fills every class in THRESHOLD_POLICY (declared or defaulted), so this is never partial.
+  const classSpecs = (constitution && constitution.thresholds) || E.THRESHOLD_POLICY
+  const classes = Object.keys(classSpecs).map(cls => {
+    const spec = classSpecs[cls] || {}
+    return {
+      class: cls,
+      threshold: E.resolveThreshold(seatCount, spec),
+      quorum: E.quorumSize(seatCount, spec),
+      requireQuorum: !!spec.requireQuorum,
+      spec,
+    }
+  })
+  // `--class=<name>` used to be SILENTLY ACCEPTED AND IGNORED: it printed the default line, so the
+  // one flag that looks like it answers "what is the bar for the motion in front of me" returned
+  // the wrong answer without erroring. Now it filters, and an unknown class fails closed.
+  const clsFlag = flag('class')
+  let onlyClass = null
+  if (clsFlag != null && clsFlag !== true) {
+    onlyClass = String(clsFlag)
+    if (!classes.some(c => c.class === onlyClass)) {
+      die(`unknown decision class '${onlyClass}' — declared classes: ${classes.map(c => c.class).join(', ')}`, 2)
+    }
+  } else if (clsFlag === true) {
+    die(`--class needs a value — declared classes: ${classes.map(c => c.class).join(', ')}`, 2)
+  }
   // CNCL-17: optionally fold each seat's TRACK RECORD (calibration vs real outcomes) into the
   // roster so membership is read alongside performance. bash passes the computed record via
   // --track-json (receipts scored against task outcomes); absent → roster stays as before.
@@ -1525,6 +1565,11 @@ function cmdRoster() {
     : baseSeats
   out({ council: 'council', seats, seatCount, threshold, quorum,
     thresholdSpec, seededAt,
+    // `classes` is the ENFORCED per-class bar; `threshold`/`quorum` above stay the genesis-sealed
+    // default spec (unchanged contract for existing callers), and are the `ordinary` case.
+    classes: onlyClass ? classes.filter(c => c.class === onlyClass) : classes,
+    selectedClass: onlyClass,
+    constitution: { path: constitution.path, source: constitution.source, valid: constitution.valid },
     scoredReceipts: tr ? tr.scoredReceipts : undefined })
 }
 

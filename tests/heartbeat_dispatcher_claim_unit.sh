@@ -349,5 +349,70 @@ cmd_heartbeat_tick >/dev/null 2>&1
   && ok_t "[2541] NEGATIVE CONTROL: a tick that claims nothing emits nothing" \
   || bad_t "[2541] a tick that claims nothing must emit nothing" "count=$(ev_count "$N1") wakes=$WAKE_CALLS"
 
+# --- DIVE-3465: a seat behind a hard SPEND CAP must not be handed a row -------
+# This harness is the seam that FORCES the dispatch path to run, so the hold is
+# graded where it acts (the claim) and not only where it is computed. The unit
+# arms for the classifier and the release verdict live in
+# tests/heartbeat_spend_cap_unit.sh; what is asserted HERE is the wiring: a held
+# seat reaches neither the pick nor the wake, and the row it would have been
+# handed is still `todo` afterwards — untouched, not claimed-and-reclaimed, which
+# is the difference between a row that waits and DIVE-3384's fifteen blank
+# sessions.
+db "DELETE FROM tasks;"; db "DELETE FROM lifecycle_events;"
+C1=$(mk "must not be claimed while the account is capped")
+seed_cap() {  # seed_cap <spendCapAt>  — enrolled, due, and held
+  jq -n --argjson at "$1" \
+    '{agents:{dev:{authProfile:"acct-dev",heartbeat:{enabled:true,everyMin:30,fresh:false,lastRunAt:0,spendCap:{at:$at,lastSeenAt:$at,n:1,probedAt:$at}}}}}' \
+    > "$REGISTRY"
+}
+# Both live instruments stubbed: no tmux, no sudo, no systemctl in a harness.
+_hb_account_has_headroom() { return 1; }
+_hb_pane_capture()         { printf '%s' "$CAP_PANE"; return "${CAP_PANE_RC:-0}"; }
+systemctl()                { return 0; }
+CAP_PANE=$'You\'ve hit your monthly spend limit\n  1. Stop and wait for limit to reset\n  2. Upgrade your plan'
+CAP_PANE_RC=0
+
+seed_cap "$(date +%s)"; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+(( WAKE_CALLS == 0 )) \
+  && ok_t "[3465] a spend-capped seat is not woken" \
+  || bad_t "[3465] a spend-capped seat must not be woken" "wakes=$WAKE_CALLS"
+[[ "$(db "SELECT status FROM tasks WHERE id=$C1;")" == "todo" ]] \
+  && ok_t "[3465] the row it would have been handed is left todo, unclaimed" \
+  || bad_t "[3465] row must stay todo under a spend-cap hold" "got $(db "SELECT status FROM tasks WHERE id=$C1;")"
+(( $(ev_count "$C1") == 0 )) \
+  && ok_t "[3465] no task.started event under a hold — the claim never happens" \
+  || bad_t "[3465] a held seat must claim nothing" "count=$(ev_count "$C1")"
+
+# An unreadable seat is COULD-NOT-DETERMINE, and it must HOLD, not dispatch.
+CAP_PANE=""; CAP_PANE_RC=1
+seed_cap "$(date +%s)"; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+(( WAKE_CALLS == 0 )) \
+  && ok_t "[3465] COULD-NOT-DETERMINE holds — an unreadable seat is not headroom" \
+  || bad_t "[3465] unreadable seat must hold, not dispatch" "wakes=$WAKE_CALLS"
+
+# RELEASE: the wall is gone from the seat's screen -> the hold lifts, the seat is
+# dispatched again, AND the hold is cleared from the registry (not left to rot).
+CAP_PANE=$'agent-dev $ '; CAP_PANE_RC=0
+seed_cap "$(date +%s)"; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+(( WAKE_CALLS == 1 )) \
+  && ok_t "[3465] a measured release re-enables dispatch on the same tick" \
+  || bad_t "[3465] release must dispatch" "wakes=$WAKE_CALLS"
+[[ "$(jq -r '.agents.dev.heartbeat.spendCap // "gone"' "$REGISTRY")" == "gone" ]] \
+  && ok_t "[3465] the released hold is removed from the registry" \
+  || bad_t "[3465] release must clear the hold" "got $(jq -c '.agents.dev.heartbeat.spendCap' "$REGISTRY")"
+
+# NEGATIVE CONTROL for the whole block: with NO hold recorded, the identical
+# fixture dispatches. Without this, every assertion above would also pass if the
+# tick had simply stopped working.
+db "UPDATE tasks SET status='todo', started_at=NULL WHERE id=$C1;"; db "DELETE FROM lifecycle_events;"
+seed_reg 0; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+(( WAKE_CALLS == 1 )) \
+  && ok_t "[3465] NEGATIVE CONTROL: same fixture with no hold IS dispatched" \
+  || bad_t "[3465] un-held seat must still be dispatched" "wakes=$WAKE_CALLS"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

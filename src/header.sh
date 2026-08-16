@@ -266,10 +266,23 @@ declare -A TYPE_AUTH=(
   # Apr 2026 Anthropic policy change: third-party harnesses can no longer ride
   # the user's Claude Pro/Max subscription token (suspension risk). hermes and
   # openclaw both sign in via OpenAI's /codex/device flow now. hermes writes
-  # ~/.hermes/auth.json; openclaw writes its agent-scoped auth-profiles.json
-  # under the default agent id "main" (resolved by openclaw's resolveAgentDir).
+  # ~/.hermes/auth.json; openclaw writes its agent-scoped auth store under the
+  # default agent id "main" (resolved by openclaw's resolveAgentDir).
+  #
+  # DIVE-3489: that store is openclaw-agent.sqlite, NOT auth-profiles.json.
+  # openclaw moved per-agent auth into sqlite and does not read the JSON at all —
+  # measured against 2026.7.1-2 in a throwaway HOME: a byte-valid
+  # auth-profiles.json yields `Profiles: (none)`, and `models auth paste-api-key`
+  # creates the sqlite. This constant is the AUTH-ok sentinel (auth_creds_present,
+  # cmd_agent.sh's fallback), so leaving it on the JSON after the write side moved
+  # would report every correctly-authenticated openclaw seat as signed out.
+  #
+  # Scope note, deliberately not overstated: this is measured for the BYO
+  # paste-api-key path. The interactive device/OAuth flow (`models auth login`)
+  # writes through the same per-agent auth store openclaw names in its own error
+  # text, so it is the same file — but that leg was NOT re-measured here.
   [hermes]="/home/claude/.hermes/auth.json"
-  [openclaw]="/home/claude/.openclaw/agents/main/agent/auth-profiles.json"
+  [openclaw]="/home/claude/.openclaw/agents/main/agent/openclaw-agent.sqlite"
   # antigravity tries the OS keyring first (via DBus secret-service) and
   # falls back to a file at ~/.gemini/antigravity-cli/antigravity-oauth-token
   # (mode 0600). Verified empirically against agy 1.0.1: after the device-
@@ -457,7 +470,7 @@ declare -A SKILLS_AGENT_ID=(
 # Used for post-install verification, the cmd_skill_list dir-scan fallback,
 # and cmd_skill_rm. Probed empirically against npx skills v0.x — if upstream
 # changes a path, update here. Unknown types fall through to ".claude/skills"
-# in the lookup sites below.
+# in the resolver below.
 #
 # DIVE-2583 — THE CONTRACT, because prose elsewhere in this repo contradicted it:
 # every value here is $HOME-RELATIVE (it is joined to /home/agent-<name>/ at every
@@ -549,15 +562,44 @@ skill_default_source() {
 }
 
 # skills_install_dir <type> -> the $HOME-relative dir an installed skill body
-# lands in for that type. THE resolver: this is the expression cmd_pack.sh's
-# import path, cmd_skill add/list/rm and agent_setup.sh each spell by hand, and
-# DIVE-2583 exists because a rendered sentence stated a DIFFERENT answer than the
-# one the installer computed. Anything that TELLS a user where skills go must ask
-# this function, so the claim and the behaviour cannot drift apart. Total by
-# construction — never empty, for any input — which is exactly why "a harness with
-# no skills directory" describes nothing here.
+# lands in for that type. THE resolver: cmd_pack.sh's import path, cmd_skill
+# add/list/rm and agent_setup.sh all call this function. DIVE-2583 exists because
+# a rendered sentence stated a DIFFERENT answer than the installer computed.
+# Anything that tells or acts on where skills go must ask this function, so the
+# claim and behaviour cannot drift apart. Total by construction — never empty,
+# for any input — which is exactly why "a harness with no skills directory"
+# describes nothing here.
 skills_install_dir() {
   printf '%s\n' "${SKILLS_INSTALL_DIR[${1:-}]:-.claude/skills}"
+}
+
+# skills_install_dirs_all -> every distinct skills dir, one per line, sorted.
+#
+# WHY A SECOND VERB AND NOT "JUST USE THE RESOLVER" (DIVE-2609 x DIVE-3172,
+# 2026-08-11). The two rows collided head-on: DIVE-3172 stopped hardcoding
+# `.claude` literals in the self-update payload fingerprint and derived the paths
+# from the per-type maps — the right instinct — and did it by reading
+# SKILLS_INSTALL_DIR directly, which is exactly what DIVE-2609's contract forbids.
+# Neither could see the other; #558 sat 108 commits behind main.
+#
+# The obvious repair is not available. `skills_install_dir` takes a TYPE and returns
+# ONE path; the fingerprint needs EVERY value, because a payload set is a union over
+# types and not a lookup. Routing an enumeration through a single-key resolver is a
+# circle, so the shape gets its own verb rather than an exemption — a contract that
+# grows a hole every time a caller is inconvenient stops being a contract, and this
+# one caught a real regression on its first contact with it.
+#
+# NOTE WHAT IT ITERATES: the KEYS (`${!SKILLS_INSTALL_DIR[@]}`), then asks the
+# resolver for each one. So there is still exactly one executable read of the map's
+# VALUES in src/, the resolver's own, and this verb cannot drift from it by
+# construction — it is a caller, not a second copy. That is the property DIVE-2609
+# is protecting, and the reason a keys-expansion here is not the thing it forbids.
+skills_install_dirs_all() {
+  declare -p SKILLS_INSTALL_DIR >/dev/null 2>&1 || return 0
+  local _t
+  for _t in "${!SKILLS_INSTALL_DIR[@]}"; do
+    skills_install_dir "$_t"
+  done | LC_ALL=C sort -u
 }
 
 # api-key target per type: the env file (in /etc/5dive/connectors for the
@@ -569,7 +611,8 @@ declare -A TYPE_API_FILE=(
   [claude]="anthropic.env"
   # hermes and openclaw intentionally omitted: both now sign in via OpenAI's
   # /codex/device flow and store credentials in their own files (~/.hermes/
-  # auth.json, ~/.openclaw/agents/main/agent/auth-profiles.json). The
+  # auth.json, ~/.openclaw/agents/main/agent/openclaw-agent.sqlite — DIVE-3489,
+  # openclaw moved off auth-profiles.json and does not read it). The
   # anthropic.env path no longer feeds either CLI. cmd_auth_set already
   # fails gracefully when a type isn't in this map.
   [codex]="openai.env"
@@ -688,9 +731,11 @@ declare -A PI_PROVIDER_VAR=(
 # Native ids were verified empirically:
 #   - hermes auth add <p> --type api-key --api-key <k>   (writes ~/.hermes/auth.json,
 #       auto-resolves base_url from the in-tree provider catalog).
-#   - openclaw writes auth-profiles.json with type:"api_key" entries; provider
-#       ids must match openclaw's built-in provider registry (anthropic, openai,
-#       google, deepseek, moonshot, openrouter all present).
+#   - openclaw: `models auth --agent main paste-api-key --provider <id>` with the
+#       key on stdin (DIVE-3489 — it writes the sqlite auth store AND registers
+#       the profile in openclaw.json; the older auth-profiles.json write is inert).
+#       provider ids must match openclaw's built-in provider registry (anthropic,
+#       openai, google, deepseek, moonshot, openrouter all present).
 #
 # hermes-moonshot is a special case: its registry has a Kimi provider but no
 # `hermes auth add moonshot` subcommand — the key is read from KIMI_API_KEY in

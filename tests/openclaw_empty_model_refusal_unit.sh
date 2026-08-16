@@ -120,11 +120,14 @@ out=$(run_byo zai zai "zai/glm-4.6"); rc=$?
   || bad_t "an explicit --model does not satisfy the guard" "rc=$rc out=$out"
 
 # ── Ordering, structurally: the refusal must sit inside the DIVE-3113
-# precondition block, above the auth-profiles.json write. The behavioural arms
+# precondition block, above the credential write. The behavioural arms
 # above run with a stubbed writer; this one holds the ordering on any box.
 body=$(declare -f _apply_byo_openclaw)
 guard_line=$(grep -n 'no default model for provider' <<<"$body" | head -1 | cut -d: -f1)
-write_line=$(grep -n 'Writing openclaw BYO auth-profiles.json' <<<"$body" | head -1 | cut -d: -f1)
+# DIVE-3489: anchor on the subcommand that performs the write, not on its step
+# text. The credential write moved from a jq auth-profiles.json heredoc to
+# `models auth paste-api-key`; the ordering this arm holds is unchanged.
+write_line=$(grep -n 'paste-api-key' <<<"$body" | head -1 | cut -d: -f1)
 if [[ -n "$guard_line" && -n "$write_line" ]] && (( guard_line < write_line )); then
   ok_t "empty-model refusal precedes the credential write in the source"
 else

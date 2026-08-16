@@ -61,8 +61,8 @@ fi
 # `eval "$(...)"` mangles.
 # NB `_task_real_prod_tasks_db` is a ONE-LINER — its closing brace is not at column
 # 0, so a `/^}/`-terminated range would run past it and swallow the next function.
-grep -E '^_task_real_prod_tasks_db\(\)' src/cmd_task.sh  >"$D/fence.sh"
-sed -n '/^_task_board_write_allowed()/,/^}/p' src/cmd_task.sh >>"$D/fence.sh"
+grep -hE '^_task_real_prod_tasks_db\(\)' src/cmd_task.sh src/task/*.sh  >"$D/fence.sh"
+cat src/cmd_task.sh src/task/*.sh | sed -n '/^_task_board_write_allowed()/,/^}/p' >>"$D/fence.sh"
 # shellcheck disable=SC1090
 . "$D/fence.sh"
 

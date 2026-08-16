@@ -110,15 +110,62 @@ fi
 # --- C: NEGATIVE — no binding at all -> NOT stamped ------------------------
 # The arm that keeps this from becoming noise. A row with nothing to merge has no
 # question to leave unanswered.
+#
+# DIVE-3265 — THIS ARM WAS BLIND, AND THAT BLINDNESS IS WHY THE CRASH SHIPPED.
+# `grep -q "$STAMP"` returning false has TWO causes and the arm could not tell
+# them apart: (a) the row closed cleanly and correctly carried no stamp, or
+# (b) `task verify` DIED before writing anything, so `result` is empty and of
+# course does not contain the stamp. (b) is what actually happened on every run
+# from the day DIVE-2938 shipped: the no-binding body is exactly the input that
+# makes the extractor's `grep` exit 1, `pipefail` promote it, and the unguarded
+# `$( )` kill the verb under `set -euo pipefail`. The arm was green throughout.
+# So the negative is now stated from BOTH ends — no stamp AND the close actually
+# happened (rc 0, status done, result written). An absence assertion that cannot
+# fail when the verb never ran is not coverage.
 C=$(mk "stamp arm C" "A research row. No branch, no PR, nothing to land.")
 if [[ -n "$C" ]]; then
-  "$CLI" task verify "$C" --cmd=true >/dev/null 2>&1
+  "$CLI" task verify "$C" --cmd=true >/dev/null 2>&1; C_RC=$?
   res_of "$C" | grep -q "$STAMP" \
     && bad_t "C NEGATIVE: no binding -> must NOT be stamped" "stamped a row with nothing to merge" \
     || ok_t "C NEGATIVE: no binding -> not stamped"
+  [[ "$C_RC" -eq 0 ]] \
+    && ok_t "C: the close SUCCEEDED (rc=0) — DIVE-3265, the arm above is not green by crash" \
+    || bad_t "C: the close SUCCEEDED (rc=0)" "rc=$C_RC — an unguarded probe assignment killed the verb; the stamp arm above passed for the wrong reason"
+  [[ "$("$CLI" task show "$C" 2>/dev/null | grep -m1 'status' | tr -d ' ')" == "status=done" ]] \
+    && ok_t "C: the row actually reached status=done (DIVE-3265 control)" \
+    || bad_t "C: the row actually reached status=done" "status never flipped — verify did not complete"
 else
   bad_t "C: fixture row could not be created"
 fi
+
+# --- F: DIVE-3265 — a body naming an ARTIFACT FILE is not a branch binding ----
+# The merge-gate's discovery rule is shared with `task done`, so a file basename
+# misread as a branch does not just mis-stamp here — one file over it produces a
+# refusal the row can never satisfy. Graded at the verb because that is where the
+# reader meets it: a design-doc row must close CLEAN and unstamped.
+F=$(mk "stamp arm F" "placeholder")
+if [[ -n "$F" ]]; then
+  "$CLI" task set-body "$F" "Delivered: community/designs/${F,,}-svc-account-split.md" >/dev/null 2>&1
+  "$CLI" task verify "$F" --cmd=true >/dev/null 2>&1; F_RC=$?
+  res_of "$F" | grep -q "$STAMP" \
+    && bad_t "F NEGATIVE: an .md artifact must NOT read as a branch binding" \
+             "stamped a non-repo deliverable; one file over, this same rule REFUSES the close outright (DIVE-3264)" \
+    || ok_t "F NEGATIVE: a design-doc deliverable is not stamped as an unchecked branch"
+  [[ "$F_RC" -eq 0 && "$("$CLI" task show "$F" 2>/dev/null | grep -m1 'status' | tr -d ' ')" == "status=done" ]] \
+    && ok_t "F: the design-doc row closes clean (rc=0, done)" \
+    || bad_t "F: the design-doc row closes clean" "rc=$F_RC"
+else
+  bad_t "F: fixture row could not be created"
+fi
+
+# --- G: DIVE-3265 source pin — the sibling call site is GUARDED ---------------
+# DIVE-2603 fixed this exact hazard at the `task done` call site and pinned it
+# there with the same shape; this site shipped later (DIVE-2938) and reintroduced
+# it. Both callers of the extractor are guarded now — pin both, or the next new
+# call site repeats it a third time.
+grep -qE '_mg_branches=\$\(_gate_branch_refs_from_text .*\) \|\| _mg_branches=' "$ROOT/src/cmd_task.sh" "$ROOT"/src/task/*.sh \
+  && ok_t "G: the verify-stamp call site GUARDS the probe assignment (DIVE-3265)" \
+  || bad_t "G: verify-stamp call site guarded" "unguarded \$( ) — under set -e + pipefail a body naming no branch kills 'task verify' with empty stdout AND empty stderr"
 
 # --- D: NEGATIVE — --no-done does not close, so it must not stamp ----------
 D=$(mk "stamp arm D" "placeholder")
@@ -140,9 +187,26 @@ E=$(mk "stamp arm E" "placeholder")
 if [[ -n "$E" ]]; then
   "$CLI" task set-body "$E" "Branch: ${E,,}-unlanded" >/dev/null 2>&1
   "$CLI" task verify "$E" --cmd=false >/dev/null 2>&1
+  "$CLI" task verify "$E" --cmd=false >/dev/null 2>&1; E_RC=$?
   res_of "$E" | grep -q "$STAMP" \
     && bad_t "E NEGATIVE: a FAIL must NOT stamp" "stamped on a failing verify" \
     || ok_t "E NEGATIVE: a failing verify records the FAIL without stamping"
+  # DIVE-3265 (Marcus's merge condition): ASSERT THE EXIT STATUS, NOT THE MESSAGE.
+  # A verb that fails while returning 0 is the nastier half of this ticket's class —
+  # every caller reading `$?` (a script, a loop, a cron) sees success and carries on.
+  # The message is for a human at a terminal; the status is the only thing the rest of
+  # the fleet reads, so it gets its own arm rather than riding on the prose.
+  #
+  # WHAT WAS ACTUALLY MEASURED, because it corrects the ticket body: the CRASH path
+  # exits 1, not 0. Built bundle, guard reverted as a negative control, no-branch row:
+  # rc=1, and the DIVE-2598 backstop prints "5dive task exited 1 without reporting a
+  # reason". So "rc=0 despite failing" does not reproduce at the CLI boundary and
+  # nothing was changed for it — but the property it was worried about is real and is
+  # now pinned here and at arm C, from both directions: a FAIL is non-zero, a clean
+  # close is zero.
+  [[ "$E_RC" -ne 0 ]] \
+    && ok_t "E: a failing verify EXITS NON-ZERO (rc=$E_RC) — a caller reading \$? cannot read it as success" \
+    || bad_t "E: a failing verify exits non-zero" "rc=0 on a FAIL — every scripted caller reads this run as a success"
 else
   bad_t "E: fixture row could not be created"
 fi

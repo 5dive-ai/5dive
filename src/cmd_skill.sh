@@ -119,7 +119,7 @@ cmd_skill_add() {
   type=$(agent_type "$name")
   [[ -n "$type" ]] || fail "$E_NOT_FOUND" "agent '$name' has no type recorded in registry"
   agent_id="${SKILLS_AGENT_ID[$type]:-claude-code}"
-  install_dir="${SKILLS_INSTALL_DIR[$type]:-.claude/skills}"
+  install_dir=$(skills_install_dir "$type")
 
   # Determine isolation so we can choose the right install strategy.
   #
@@ -337,7 +337,7 @@ _skill_list_json() {
   local type agent_id install_dir
   type=$(agent_type "$name")
   agent_id="${SKILLS_AGENT_ID[$type]:-claude-code}"
-  install_dir="${SKILLS_INSTALL_DIR[$type]:-.claude/skills}"
+  install_dir=$(skills_install_dir "$type")
 
   # `npx skills list --json` prints clean JSON when available. If the
   # skills CLI isn't reachable (no network, npx cache cold) we fall back
@@ -444,7 +444,7 @@ cmd_skill_rm() {
 
   local type install_dir
   type=$(agent_type "$name")
-  install_dir="${SKILLS_INSTALL_DIR[$type]:-.claude/skills}"
+  install_dir=$(skills_install_dir "$type")
 
   # DIVE-2338: assert the CONCATENATED path stays inside the install dir. The name check
   # above is exact but is a refusal of two tokens; this is the structural one, and it is

@@ -63,7 +63,7 @@ cat > "$R/CHANGELOG.md" <<'EOF'
 
 Writes go out as the bot; admin and reads stay on the caller.
 
-## v0.19.9 — fix(ui): a stamped heading carrying no prose
+## v1.2.3 — fix(ui): a stamped heading carrying no prose
 
 ## Unreleased — fix(old): something that shipped in the last tag
 
@@ -93,11 +93,18 @@ out=$(run_notes "$CUT_FROM" "$TO" "1.2.3"); rc=$?
   || bad_t "notes: excludes an older 'Unreleased' section" "leaked a previously-released section: $out"
 
 # A headline-only entry becomes a bullet under its type group. The fixture entry
-# is written in the STAMPED form (`## v0.19.9 — ...`), which is the form that
+# is written in the STAMPED form (`## v1.2.3 — ...`), which is the form that
 # actually reaches this script: stamp-changelog.sh rewrites the headings before
 # release-notes runs, so the old Unreleased-only substitution matched nothing and
 # shipped 37 raw H2s on v0.19.9. Anchor the arm on the stamped form or the
 # regression is invisible again.
+#
+# DIVE-3435 RESTAMPED THIS FIXTURE FROM `## v0.19.9` TO `## v1.2.3`, and the edit
+# is the point rather than a cosmetic tidy: the version being cut here is 1.2.3, so
+# under the new rule a `v0.19.9` heading is a heading someone edited AFTER 0.19.9
+# shipped, and it is dropped. Both forms are now covered — this arm keeps proving a
+# stamped heading FOR THIS CUT renders, and the DIVE-3435 arms below prove a
+# stamped heading for SOME OTHER version does not.
 [[ "$out" == *"### Fixes"* && "$out" == *"- fix(ui): a stamped heading carrying no prose"* ]] \
   && ok_t "notes: a STAMPED headline-only entry becomes a bullet under its group" \
   || bad_t "notes: stamped headline-only entry becomes a grouped bullet" "$out"
@@ -136,6 +143,189 @@ out=$(run_notes "$CUT_FROM" "$TO" "1.2.3"); rc=$?
 [[ "$out" == *"Notes derived from"* && "$out" == *"CHANGELOG.md over"* ]] \
   && ok_t "notes: names its own source (CHANGELOG arm)" \
   || bad_t "notes: names its own source" "$out"
+
+# --- DIVE-3435: an EDIT to a historical heading is not a new entry -------------
+#
+# WHAT SHIPPED. v0.19.34's page carried every release back to 0.19.0. The range was
+# CORRECT (`release-cut-baseline.sh` resolved v0.19.33 -> f8d202e, v0.19.34 ->
+# 78b6a6a); what was missing was a filter. Three commits inside that range
+# hand-edited CHANGELOG.md ON MAIN to restamp historical headings (DIVE-3292,
+# DIVE-3291, DIVE-3391). Rewriting `## Unreleased — foo` to `## v0.19.2 — foo` is a
+# deleted line plus an added line, and `_rn_changelog_added` takes every added line,
+# so ~50 historical headings and their prose (2696 added lines) rendered as bullets.
+#
+# WHY v0.19.33 LOOKED FINE, and why that made this read as a random regression: its
+# range touched CHANGELOG.md ZERO times, so arm 1 produced nothing and it fell
+# through to the commit-subject fallback. It was correct BY FALLBACK. Arm 1 has been
+# latent-broken since it was written and only fires when someone edits CHANGELOG.md
+# on main — rare, because DIVE-2247 stopped the workflow pushing to main and
+# DIVE-2582 moved new entries to changelog.d/ fragments.
+RS_FROM=$(git -C "$R" rev-parse HEAD)
+cat > "$R/CHANGELOG.md" <<'EOF'
+# Changelog
+
+## Unreleased — feat(new): new thing
+
+## v0.19.2 — feat(hist): old thing
+
+Prose that belongs to a release that shipped weeks ago.
+EOF
+git -C "$R" add CHANGELOG.md
+git -C "$R" commit -q -m "docs(changelog): correct a stale release heading and add an entry"
+RS_TO=$(git -C "$R" rev-parse HEAD)
+
+out=$(run_notes "$RS_FROM" "$RS_TO" "1.2.6"); rc=$?
+[[ $rc -eq 0 ]] \
+  && ok_t "restamp: derives a body when the range mixes new and restamped entries (rc=0)" \
+  || bad_t "restamp: derives a body" "rc=$rc err=$(cat "$TMP/err")"
+[[ "$out" == *"new thing"* ]] \
+  && ok_t "restamp: the genuinely NEW Unreleased entry is kept" \
+  || bad_t "restamp: new entry kept" "$out"
+[[ "$out" != *"old thing"* ]] \
+  && ok_t "restamp: a heading naming an ALREADY-SHIPPED version is dropped" \
+  || bad_t "restamp: historical heading leaked" "leaked a previous release's entry: $out"
+# The BODY under a restamped heading is historical too — that is where the bulk of
+# v0.19.34's 2696 lines went, so dropping the heading alone would have fixed a
+# fiftieth of it.
+[[ "$out" != *"shipped weeks ago"* ]] \
+  && ok_t "restamp: the PROSE under a historical heading is dropped with it" \
+  || bad_t "restamp: historical prose leaked" "$out"
+
+# ONLY-HISTORICAL: the filter empties arm 1, the existing non-blank guard fails, and
+# it falls through to the commit subjects — which is precisely the path that made
+# v0.19.33 correct. THE FAILURE MODE OF THE FIX IS THE KNOWN-GOOD PATH. It must not
+# exit 1: that would kill a cut over a docs commit.
+OH_FROM=$(git -C "$R" rev-parse HEAD)
+cat > "$R/CHANGELOG.md" <<'EOF'
+# Changelog
+
+## v0.19.1 — feat(hist): another already-shipped thing
+
+## v0.19.2 — feat(hist): old thing
+
+Prose that belongs to a release that shipped weeks ago.
+EOF
+git -C "$R" add CHANGELOG.md
+git -C "$R" commit -q -m "docs(changelog): restamp two more stale headings"
+OH_TO=$(git -C "$R" rev-parse HEAD)
+
+out=$(run_notes "$OH_FROM" "$OH_TO" "1.2.7"); rc=$?
+[[ $rc -eq 0 ]] \
+  && ok_t "restamp-only: a docs-only restamp does NOT abort the cut (rc=0)" \
+  || bad_t "restamp-only: must not exit 1" "rc=$rc err=$(cat "$TMP/err")"
+[[ "$out" == *"CHANGELOG.md gained nothing in this range"* ]] \
+  && ok_t "restamp-only: falls through to the commit-subject fallback" \
+  || bad_t "restamp-only: falls through to the fallback" "$out"
+[[ "$out" == *"docs(changelog): restamp two more stale headings"* ]] \
+  && ok_t "restamp-only: the fallback body is non-empty" \
+  || bad_t "restamp-only: fallback body non-empty" "$out"
+[[ "$out" != *"another already-shipped thing"* && "$out" != *"old thing"* ]] \
+  && ok_t "restamp-only: no historical entry reaches the body by either arm" \
+  || bad_t "restamp-only: historical entry leaked" "$out"
+
+# --- DIVE-3472: THE STAMP MAKES AN ALREADY-SHIPPED SECTION LOOK NEW ------------
+#
+# WHAT SHIPPED, and why DIVE-3435 did not catch it. That fix filters on the
+# heading's VERSION TOKEN — right for a heading someone restamped on main to some
+# OTHER version, blind to this. main's CHANGELOG.md is never stamped and never
+# cleared (DIVE-2247), so a section that shipped weeks ago still reads
+# `## Unreleased` on main; `stamp-changelog.sh` then rewrites EVERY `Unreleased`
+# heading on the release commit to the version being cut. The already-shipped
+# section arrives at `to` reading `## v<cutver>`, `names_this_cut()` says yes, and
+# it renders as new — as a FIXED TAIL that repeats every cut. Measured 2026-08-16:
+# main carried 7 stale `Unreleased` headings; v0.19.36's page carried 9 entries,
+# 7 of them v0.19.35's, and DIVE-3344 shipped in four consecutive public releases.
+#
+# THE FIXTURE RUNS THE REAL STAMP. Hand-writing the stamped form would be asserting
+# against my own model of the bug; the leak only exists because stamp-changelog.sh
+# and release-notes.sh disagree, so both must be in the fixture or the harness
+# grades one of them alone.
+MB_FROM=$(git -C "$R" rev-parse HEAD)
+cat > "$R/CHANGELOG.md" <<'EOF'
+# Changelog
+
+## Unreleased — fix(stale): shipped in the PREVIOUS cut and never cleared on main
+
+Prose that already reached a published release page.
+EOF
+git -C "$R" add CHANGELOG.md
+git -C "$R" commit -q -m "fix(stale): shipped in the previous cut"
+MB_BASE=$(git -C "$R" rev-parse HEAD)   # stands in for main's tip as of the last cut
+
+cat > "$R/CHANGELOG.md" <<'EOF'
+# Changelog
+
+## Unreleased — feat(fresh): arrived inside THIS range
+
+## Unreleased — fix(stale): shipped in the PREVIOUS cut and never cleared on main
+
+Prose that already reached a published release page.
+EOF
+git -C "$R" add CHANGELOG.md
+git -C "$R" commit -q -m "feat(fresh): arrived inside this range"
+# The detached release commit: the stamp runs HERE and nowhere else, exactly as
+# release-cut.yml does it.
+( cd "$R" && bash "$SCRIPTS/stamp-changelog.sh" 1.2.8 CHANGELOG.md ) >/dev/null 2>&1
+git -C "$R" add CHANGELOG.md
+git -C "$R" commit -q -m "release v1.2.8: stamp changelog"
+MB_TO=$(git -C "$R" rev-parse HEAD)
+
+# PRECONDITION — the instrument can produce the negative. If the stale heading is
+# not an ADDED line over this range, the fixture is not reproducing the bug and
+# every assert below would pass against a filter that does nothing.
+mb_added=$(git -C "$R" diff "${MB_BASE}..${MB_TO}" -- CHANGELOG.md | sed -n 's/^+\([^+].*\)$/\1/p')
+[[ "$mb_added" == *"## v1.2.8 — fix(stale)"* ]] \
+  && ok_t "stamp-leak: PRECONDITION — the already-shipped heading IS an added line, stamped to this cut" \
+  || bad_t "stamp-leak: precondition" "the fixture does not reproduce the leak; added=$mb_added"
+
+out=$(run_notes "$MB_BASE" "$MB_TO" "1.2.8"); rc=$?
+[[ $rc -eq 0 ]] \
+  && ok_t "stamp-leak: derives a body (rc=0)" \
+  || bad_t "stamp-leak: derives a body" "rc=$rc err=$(cat "$TMP/err")"
+# MEMBERSHIP, POSITIVE: the entry that arrived in the range is present.
+[[ "$out" == *"arrived inside THIS range"* ]] \
+  && ok_t "stamp-leak: the entry that ARRIVED in this range is kept" \
+  || bad_t "stamp-leak: real entry kept" "$out"
+# MEMBERSHIP, NEGATIVE — THE ASSERT. Present in CHANGELOG.md, stamped with THIS
+# cut's version, and still outside the range. Grade by whether it BELONGS, never by
+# how many entries survived: a count cannot tell 2-of-9 from 9-of-9.
+[[ "$out" != *"shipped in the PREVIOUS cut"* ]] \
+  && ok_t "stamp-leak: an already-shipped section restamped to THIS cut does NOT leak" \
+  || bad_t "stamp-leak: stale entry leaked" "an already-published entry reached the body: $out"
+[[ "$out" != *"already reached a published release page"* ]] \
+  && ok_t "stamp-leak: the prose under the stale section is dropped with it" \
+  || bad_t "stamp-leak: stale prose leaked" "$out"
+# EVERY bullet resolves to something inside the range — the acceptance stated as one
+# assertion rather than as a per-entry spot check.
+mb_bullets=$(printf '%s\n' "$out" | grep -c '^- ' || true)
+[[ "$mb_bullets" -eq 1 ]] \
+  && ok_t "stamp-leak: exactly the 1 in-range entry renders (no padding tail)" \
+  || bad_t "stamp-leak: bullet count" "expected 1 in-range bullet, got ${mb_bullets}: $out"
+
+# ALL-STALE: a cut whose range adds only already-shipped restamped headings must
+# fall through to the commit subjects, not exit 1 — same rule as restamp-only above.
+AS_FROM=$(git -C "$R" rev-parse HEAD)
+cat > "$R/CHANGELOG.md" <<'EOF'
+# Changelog
+
+## Unreleased — fix(stale): shipped in the PREVIOUS cut and never cleared on main
+
+Prose that already reached a published release page.
+EOF
+git -C "$R" add CHANGELOG.md
+git -C "$R" commit -q -m "chore(changelog): drop the stamped entry, leave the stale one"
+( cd "$R" && bash "$SCRIPTS/stamp-changelog.sh" 1.2.9 CHANGELOG.md ) >/dev/null 2>&1
+git -C "$R" add CHANGELOG.md
+git -C "$R" commit -q -m "release v1.2.9: stamp changelog"
+AS_TO=$(git -C "$R" rev-parse HEAD)
+
+out=$(run_notes "$AS_FROM" "$AS_TO" "1.2.9"); rc=$?
+[[ $rc -eq 0 ]] \
+  && ok_t "stamp-leak all-stale: does NOT abort the cut (rc=0)" \
+  || bad_t "stamp-leak all-stale: must not exit 1" "rc=$rc err=$(cat "$TMP/err")"
+[[ "$out" != *"shipped in the PREVIOUS cut"* ]] \
+  && ok_t "stamp-leak all-stale: no already-shipped entry reaches the body by either arm" \
+  || bad_t "stamp-leak all-stale: stale entry leaked" "$out"
 
 # --- fallback: range with commits but no CHANGELOG change ----------------------
 FB_FROM=$(git -C "$R" rev-parse HEAD)

@@ -180,6 +180,41 @@ out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
 # gate_mode.
 # DIVE-3171 added route_provenance, the ROUTING axis's provenance beside
 # floor_provenance's TIER axis.
+# DIVE-2272 added on_overlap + overlap_bound, the per-template overlap policy
+# (79 -> 81). Both nullable on purpose: NULL means 'skip' / 'the default bound',
+# so the migration is a no-op for every template predating the column AND an
+# unclassified template stays visibly unclassified.
+# DIVE-3218 added THREE more at once — nudge_escalated_at, nudge_escalated_n and
+# nudge_parked_at, the two rungs of the nudge-enforcement ladder plus the count
+# rung 1 fired at. 81 -> 84.
+#
+# DIVE-2730 added verify_optout, the persisted add-time `--no-verify` (84 -> 85).
+#
+# DIVE-3251 added first_started_at, the durable first-start clock split out of
+# started_at so the reclaim ladder can keep resetting the age without destroying
+# the evidence that work happened (85 -> 86). 85 was READ AT THE MERGED BASE
+# (bb07d4b, DIVE-2730 already landed), not carried from any pre-merge figure, and
+# 86 was confirmed by RUNNING this case against the merged tree — not predicted
+# from the addition. See the note below: on this literal, prediction is how the
+# last three branches each got it wrong.
+#
+# DIVE-3342 added human_owner, the person a gate belongs to, stamped at filing so
+# delivery names a clearer rather than the bot's last chat (86 -> 87). 87 was
+# MEASURED by running this case on the REBASED tree (base 7bd8dae), not predicted:
+# the branch was first delivered based on c1dafe2 with this literal left at 86, and
+# this case is what caught it — CI red on the delivered sha, on exactly the
+# additive-column path the note below describes, found by the verifier and not by
+# the 25-harness regression set the branch chose for itself. main had since moved
+# to 7bd8dae, which adds no column, so the rebase left 87 standing rather than 88.
+#
+# THIS LITERAL WAS RESOLVED BY ARITHMETIC, NOT BY PICKING A SIDE (2026-08-11), and
+# it has now been resolved that way TWICE in one day, by two different branches.
+# First pass: DIVE-3218 and DIVE-2272 both forked at 79 and each was internally
+# right — 82 and 81 — so either taken verbatim ships a count wrong by the other's
+# columns. 79+3+2=84. Second pass, this branch: DIVE-2730 forked from 81 and read
+# 82 while main had moved to 84, so the same trap re-armed against the same file
+# within the hour. 84+1=85. BOTH numbers were confirmed by running this case
+# against the merged tree rather than trusted from the addition.
 # The count is asserted literally on purpose — this case exists to catch a canonical
 # CREATE that silently drops a column, so it must not derive its own expectation from
 # the thing under test.)
@@ -189,6 +224,35 @@ out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
 # one column merge with no textual conflict — the CREATE gains both lines — and the
 # count is then wrong by one with nothing in the diff to show it. DIVE-2848 landed
 # that way: 72 on both sides, 73 after the merge, and the only signal was this case.
+# DIVE-2207 landed the same way (86 -> 87): main added the DIVE-2853/3218 columns
+# while the branch added gate_answered_nudged_at, the rebase took both with no
+# textual conflict, and this literal was the only thing that noticed. 87 was READ
+# from this case's own failure detail on the merged tree, not derived by adding one.
+#
+# AND IT RE-ARMED ON THE SAME BRANCH (87 -> 88, 2026-08-16). DIVE-2207 sat open
+# behind a closed row for 11 days; by the time it was rebased for landing, main had
+# moved another 61 commits and added one more column, so the 87 this branch had
+# already measured-and-fixed once was stale AGAIN. The literal is not wrong once per
+# branch, it is wrong once per REBASE — re-read it on every base change, not only
+# when you are the one adding the column.
+#
+# READ IT LIKE THIS, because `bad` takes a detail argument and never prints it, so
+# "read it from the failure detail" is not followable as the harness stands:
+#   sed -i '41s/.*/bad() { FAIL=$((FAIL+1)); printf "  FAIL %s | %s\\n" "$1" "$2"; }/' <this file>
+# run, read `count=`, revert. 88 was obtained that way on base 83d130e, with
+# got==want in the same line (so the count was the ONLY thing failing).
+#
+# 88 -> 90 (DIVE-3430, base 37e7ef0): +graded_verdict, +graded_verdict_at. Read the
+# same way — a same-seat CONTROL worktree at origin/main scored 56/0 on this harness
+# while the branch scored 55/1, which is what separated "my two columns" from a
+# pre-existing tree red before the literal was touched at all. Do that control first:
+# editing this number to make a red go away is the one change that cannot fail loudly.
+#
+# 90 -> 91 (DIVE-3483, base a95bce2): +stranded_pinged_at, the per-row throttle for
+# the stranded-on-a-busy-seat sweep arm. Control done as instructed above and BEFORE
+# touching the literal: a clean clone at origin/main a95bce2 scored 56/0 on this
+# harness while this branch scored 55/1 with got==want, so the count was the only
+# thing failing and the one column is the whole delta.
 fresh_tree
 out=$(tasks_db_init 2>&1); rc=$?
 required='delivered_at delivery_ref delivery_ref_iteration escalated_at escalated_by human_evidence park_reason parked_at'
@@ -197,8 +261,8 @@ actual=$(sqlite3 "$TASKS_DB" \
     WHERE name IN ('delivery_ref','delivered_at','delivery_ref_iteration','parked_at','park_reason','escalated_at','escalated_by','human_evidence')
     ORDER BY name;" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
 column_count=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM pragma_table_info('tasks');" 2>/dev/null)
-[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "79" ]] \
-  && ok "fresh schema: all 79 columns, including the eight former holes, are present" \
+[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "91" ]] \
+  && ok "fresh schema: all 91 columns, including the eight former holes, are present" \
   || bad "fresh schema: init returned a partial tasks table" "rc=$rc count=$column_count got=[$actual] want=[$required] out=$out"
 
 # --- Case 10 (DIVE-2197): migrate arm still rejects a failed ALTER ------------

@@ -133,7 +133,7 @@ case " $(sent) " in
   *)         bad_t "the OLD assignee is told in the same breath" "sends went to: [$(sent)]" ;;
 esac
 case " $(sent) " in
-  *" main "*) ok_t "the coordinator is told" ;;
+  *" ops "*) ok_t "the coordinator is told" ;;
   *)          bad_t "the coordinator is told" "sends went to: [$(sent)]" ;;
 esac
 [[ -n "$(db "SELECT 1 FROM lifecycle_events WHERE kind='task.recurring_stall_escalated' AND ident='DIVE-2694' LIMIT 1;")" ]] \
@@ -325,6 +325,81 @@ _hb_stall_sweep >/dev/null 2>&1
 [[ "$(col 9 assignee)" == "creative" ]] \
   && ok_t "ANCHOR: with no verifier on the row, the same fixture picks creative — arm 8's skip is the verifier exclusion, not luck" \
   || bad_t "ANCHOR: with no verifier the ladder still prefers the template creator" "assignee=[$(col 9 assignee)] want creative"
+
+# ---------------------------------------------------------------------------
+# 9. DIVE-2861: THE BUSY-COUNT FAIL-CLOSED PAIR. _hb_free_agents decides "free"
+#    from one COUNT(*) per agent, and BOTH of that count's failure modes fall
+#    back to BUSY:
+#
+#      busy=$(db "SELECT COUNT(*) ... assignee=..." 2>/dev/null || echo 1)
+#      [[ "$busy" =~ ^[0-9]+$ ]] || busy=1
+#
+#    Inverting either to 0 makes a NOT-free agent read as FREE, so the ladder
+#    hands the stalled row to an agent that cannot take it — which is the
+#    founding defect of DIVE-2853 itself, reproduced by the fix for it. The
+#    shipped code is correct and its comment states the asymmetry properly; only
+#    the pin was missing. Both inversions left every arm above GREEN (19/19 when
+#    olivia graded cd7ad4c, still 27/27 at 1aa6f85 before these two arms).
+#
+#    THIS WAS NEVER "THE HARNESS CANNOT REACH IT". The control that makes the
+#    survivors interpretable — rewrite the reassign target to a bogus agent —
+#    turns 4 arms above RED, so the _hb_free_agents -> reassign path demonstrably
+#    executes. It reached the branch and simply never drove the count with an
+#    answer that FAILS or GARBLES. These two arms drive exactly those inputs.
+#
+#    HOW: db() is wrapped for this section only, and faults ONLY the per-agent
+#    busy count, ONLY for one named agent. Every other query the sweep makes —
+#    the stall SELECT, the reassign UPDATE, the ledger insert — runs for real, so
+#    an arm that fails here failed on the guard and not on a crippled fixture.
+#
+#    WHY CREATIVE IS THE FAULTED AGENT: arm 1 already proved that THIS EXACT
+#    fixture reassigns to creative when the count answers normally (template
+#    creator, first preference), and arm 8's anchor proved the next free agent
+#    past creative is anton. So arm 1 is this section's anchor, and "the row
+#    landed on anton instead" has exactly one available cause: creative was read
+#    as BUSY. Neither arm can pass by the sweep doing nothing — a sweep that no-ops
+#    leaves the row on dev, which is neither creative nor anton.
+#
+#    WHY THE HIT COUNT IS ASSERTED TOO: if the injector's SQL pattern ever stops
+#    matching, the sweep runs unfaulted, creative is genuinely free, the row lands
+#    on creative and both arms go red — correctly, but naming the wrong cause. The
+#    counter separates "the guard regressed" from "the injector missed". It lives
+#    in a FILE and not a variable because the count is read inside `busy=$(db ...)`,
+#    a command substitution, whose subshell would discard an in-memory increment.
+# ---------------------------------------------------------------------------
+eval "_real_db() $(declare -f db | tail -n +2)"   # rename, never re-implement: the
+                                                  # real db() keeps its store fence.
+BUSY_FAULT_WHO=""; BUSY_FAULT_MODE=""; BUSY_HITS="$TMP/busy_fault_hits"; : >"$BUSY_HITS"
+db() {
+  if [[ -n "$BUSY_FAULT_WHO" && "$1" == *"COUNT(*) FROM tasks"*"status='in_progress'"*"assignee='${BUSY_FAULT_WHO}';"* ]]; then
+    printf '%s\n' "$BUSY_FAULT_WHO/$BUSY_FAULT_MODE" >>"$BUSY_HITS"
+    case "$BUSY_FAULT_MODE" in
+      # The `|| echo 1` fallback's input: non-zero rc, nothing on stdout.
+      fail)   return 1 ;;
+      # The regex guard's input: rc 0, non-numeric stdout. A BARE TOKEN and not a
+      # sentence, deliberately: it is the harsher shape, because it is also the one
+      # that would reach `(( busy == 0 ))` if the guard were DELETED rather than
+      # inverted. A multi-word string makes that arithmetic a syntax error, which
+      # is falsey and would let a deleted guard pass this arm.
+      garble) printf 'not-a-count\n'; return 0 ;;
+    esac
+  fi
+  _real_db "$@"
+}
+hits() { wc -l <"$BUSY_HITS" | tr -d ' '; }
+
+for fault in "fail:a FAILED busy count (db returns non-zero)" \
+             "garble:a GARBLED busy count (db returns non-numeric output)"; do
+  BUSY_FAULT_MODE="${fault%%:*}"; what="${fault#*:}"
+  mk_fixture; busy dev
+  : >"$BUSY_HITS"; BUSY_FAULT_WHO="creative"
+  _hb_stall_sweep >/dev/null 2>&1
+  BUSY_FAULT_WHO=""
+  got=$(col 1 assignee); n=$(hits)
+  [[ "$got" == "anton" && "$n" -ge 1 ]] \
+    && ok_t "$what reads that agent as BUSY — the stalled row is NOT handed to it (creative skipped, lands on anton)" \
+    || bad_t "$what reads that agent as BUSY" "assignee=[$got] want anton; injector fired ${n}x (0 = the fault never applied, so this says nothing about the guard; 'creative' = a count that failed or garbled was believed, and the ladder just handed a stalled row to an agent that cannot take it — the DIVE-2853 defect, self-inflicted)"
+done
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

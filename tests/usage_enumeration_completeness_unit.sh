@@ -50,6 +50,7 @@ import re, sys, os, glob
 
 root = sys.argv[1]
 files = sorted(glob.glob(os.path.join(root, 'src', '*.sh'))
+               + glob.glob(os.path.join(root, 'src', 'task', '*.sh'))
                + glob.glob(os.path.join(root, 'src', 'council', '*.sh')))
 
 def strip_heredocs(lines):

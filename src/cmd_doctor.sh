@@ -15,6 +15,9 @@
 # check helpers below don't need to pass it around.
 DOCTOR_CHECKS='[]'
 DOCTOR_REPAIR=0
+# Capability report (DIVE-3076). Empty means "not built this run" — the JSON
+# key is then `null`, which a reader must not confuse with a measured NO.
+DOCTOR_CAPS=''
 
 # doctor_add <category> <name> <severity> <message> [fixable:true|false] [repaired:true|false]
 doctor_add() {
@@ -423,11 +426,350 @@ doctor_check_reaped_homes() {
     "$n quarantined agent home(s) under $dir, oldest is ${oldest_name} (~${days}d old) — operator-managed by design (DIVE-2165, no TTL); delete by hand once you're sure: sudo rm -rf $dir/<name>"
 }
 
+# --- caps: the per-seat capability probe (DIVE-3076) ------------------------
+#
+# WHAT THIS ANSWERS, AND WHY IT IS NOT A DOC. DIVE-3017: a seat declined to
+# grade two items on the stated ground that it had no authenticated remote path,
+# citing three true observations — https `git ls-remote` prompts, `gh auth
+# status` is logged out, `/home/claude/.ssh/id_ed25519` is Permission denied.
+# The conclusion was still false for four of nine seats: `sudo -u claude gh auth
+# status` is logged in. Two seats spent a round trip each on a capability
+# question, and a verifier nearly handed a grade back to the maker — the exact
+# outcome the independence rule exists to prevent.
+#
+# The failure class is AN AGENT FORMING A FALSE BELIEF ABOUT ITS OWN
+# CAPABILITY. A wiki page cannot close that: a page only reaches the agent who
+# thinks to look it up, and the whole defect is believing there is nothing to
+# look up. So the answer has to be DERIVED, per seat, by a command the seat
+# already runs.
+#
+# AND IT IS NOT UNIFORM — this is the part that makes a documented answer worse
+# than none. Measured across the live fleet 2026-08-09 (olivia,
+# community/wiki/sudo-u-claude-is-per-seat-and-the-registry-already-measured-it.md):
+#
+#   olivia, main, dev, community      -> `sudo -u claude id -un` prints claude
+#   dev2, dev3, main2, quinn, codex   -> sudo: a password is required
+#
+# Publishing "just use sudo -u claude" fixes a false negative for four seats and
+# MINTS A FALSE POSITIVE FOR FIVE. A confident YES on a seat with no path is the
+# one output this probe must never produce, which is what the negative arm of
+# caps_probe_unit.sh grades (with a reason string, not an absence).
+#
+# WE DO NOT MEASURE THIS AFRESH. `agent_sudo_grant`'s `runas` field already
+# predicted all nine results above with zero misses, because it is the same
+# fact: `runas: any` means the sudoers entry permits an arbitrary runas target,
+# `runas: root` means root ONLY. Note that isolation is the WRONG field to key
+# on — two seats can both be `isolation: admin` and differ here, since `root-all`
+# implies beyond-admin and `cli-root` does not.
+#
+# BOTH ARMS ARE REQUIRED. `runas: any` says the uid switch is PERMITTED. It says
+# nothing about whether the claude uid's `gh` token is still valid or still
+# scoped, so the account and scopes are read off a LIVE call and never off a
+# cached string. A permitted switch onto a dead token is the one genuinely
+# check-shaped state here, and it is the only one that files a row.
+#
+# WHY THIS IS A REPORT AND NOT A PILE OF CHECKS (the DIVE-2328 lesson, applied
+# rather than re-learned): the dashboard renders `severity == "ok"` rows as
+# PASSED CHECKS in green. `github:write NO` is a correct, permanent, by-design
+# state on every seat — as a passing check it asserts a health nobody claimed,
+# and as a `warn` it would light up half the fleet forever for being configured
+# the way it is meant to be. Capability facts ride ALONGSIDE the checks in
+# `capabilities`, exactly as env_overrides does, and touch no count.
+
+# Seam 1 — WHICH SEAT IS ASKING. `doctor` is require_root, so `id -un` is always
+# `root` and answers the wrong question; the seat is the REAL sudo caller. Empty
+# means the caller is not an agent seat (a human, or cron, invoking as root
+# directly), which is a different answer and not a failure. $SUDO_USER is
+# forgeable by anyone who can set an env var, so this must never feed
+# AUTHORIZATION — a seat that lies here gets a capability report for another
+# seat, which grants it nothing it did not already have.
+doctor_caps_seat() {
+  local s="${SUDO_USER:-}"
+  [[ "$s" == agent-* ]] && printf '%s' "$s"
+  return 0
+}
+
+# Seam 2 — THE MEASURED GRANT for a seat, as `class|runas`. Wraps
+# agent_sudo_grant (which fails closed to `unknown|-`) so the harness can drive
+# the derivation without a sudoers fixture for every case.
+doctor_caps_runas() {
+  local g rest
+  g=$(agent_sudo_grant "$1" 2>/dev/null) || g="unknown|-|0"
+  [[ -n "$g" ]] || g="unknown|-|0"
+  rest="${g#*|}"
+  printf '%s|%s' "${g%%|*}" "${rest%%|*}"
+}
+
+# Seam 3 — THE LIVE TOKEN PROBE. Echoes `account<TAB>scopes` and returns 0 only
+# when the claude uid answers as an authenticated gh. `sudo -n` so a seat
+# without the grant is refused immediately instead of blocking doctor on a
+# password prompt. Failure text is returned on stdout too (rc says which it is),
+# because "permitted but the token is dead" has to name what went wrong.
+doctor_caps_gh_probe() {
+  local out acct scopes
+  if ! out=$(sudo -n -u claude gh auth status 2>&1); then
+    printf '%s' "$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | head -1)"
+    return 1
+  fi
+  acct=$(printf '%s\n' "$out" | sed -n 's/.*account \([^ ]*\).*/\1/p' | head -1)
+  scopes=$(printf '%s\n' "$out" | sed -n "s/.*[Tt]oken scopes: *//p" | head -1)
+  scopes="${scopes//\'/}"
+  printf '%s\t%s' "${acct:-unknown}" "${scopes:-none reported}"
+  return 0
+}
+
+# doctor_build_caps — SETS $DOCTOR_CAPS; writes NOTHING to stdout. Files at
+# most ONE check (the dead-token case); everything else is a fact about how this
+# box is configured.
+#
+# THE RETURN CHANNEL IS A GLOBAL ON PURPOSE, and the first cut got this wrong in
+# a way that only the harness saw. Written as `DOCTOR_CAPS=$(doctor_build_caps)`
+# it reads fine and the report is correct — but a command substitution is a
+# SUBSHELL, so the one thing here that is not a report, the `doctor_add` warn for
+# a permitted-but-dead token, was appended to a copy of DOCTOR_CHECKS that died
+# with the subshell. The report a reader sees would have been right while the
+# check row that makes the dead path VISIBLE in --json silently never existed.
+# A function that both emits a value and mutates accumulator state cannot be
+# called by substitution; this one therefore emits no value at all.
+doctor_build_caps() {
+  local seat class runas probe read_state read_detail write_detail seat_label
+
+  seat=$(doctor_caps_seat)
+  if [[ -n "$seat" ]]; then
+    local cr; cr=$(doctor_caps_runas "$seat")
+    class="${cr%%|*}"; runas="${cr#*|}"
+    seat_label="${seat#agent-} (sudo grant ${class}, runas ${runas})"
+  else
+    # Not an agent seat: the caller reached root directly, so the uid switch is
+    # not in question. Reported as its own state rather than folded into `any`,
+    # so nobody reads a human's YES as a statement about their seat.
+    class="not-an-agent-seat"; runas="any"
+    seat_label="${SUDO_USER:-root} — not an agent seat; this is the ROOT caller's answer, not a seat's"
+  fi
+
+  write_detail='push identity is per-seat and the claude-uid borrow is RETIRED for the push class (DIVE-3017) — this report is NOT permission to reopen it. Delegated route: `5dive push` (brokered, gated).'
+
+  if [[ "$runas" != "any" ]]; then
+    # THE NEGATIVE ARM. The reason is load-bearing: without it a reader on a
+    # cli-root seat goes hunting for a password that does not exist.
+    read_state="NO"
+    read_detail="this seat's sudo grant is ${class}: root only, not arbitrary uids — there is no \`sudo -u claude\` path from here, and no password will make one. Route the read to a seat with runas=any (\`5dive agent list --json | jq -r '.data[]|select(.sudo.runas==\"any\")|.name'\`)."
+  elif probe=$(doctor_caps_gh_probe); then
+    read_state="YES"
+    read_detail="via \`sudo -u claude gh\` (account ${probe%%$'\t'*}, scopes ${probe#*$'\t'}). A READ of a build product under a shared token mints nothing and authors nothing — verifier independence attaches to accepting a maker's CLAIM, not to whose credential opened the file."
+  else
+    read_state="NO"
+    read_detail="\`sudo -u claude\` is permitted here (runas any) but gh is not usable as that uid: ${probe:-no output}"
+    # The one genuinely check-shaped state: the fleet-wide read path is
+    # advertised and dead. Every seat that trusts the advertisement is about to
+    # burn a round trip discovering this.
+    doctor_add caps github-read-token warn \
+      "the claude-uid read path is permitted from this seat but its gh token is not usable: ${probe:-no output} — re-auth as claude (sudo -u claude gh auth login) or the fleet's documented CI-read route is dead"
+  fi
+
+  DOCTOR_CAPS=$(jq -cn \
+    --arg seat "$seat_label" --arg class "$class" --arg runas "$runas" \
+    --arg rstate "$read_state" --arg rdetail "$read_detail" --arg wdetail "$write_detail" \
+    '{seat: $seat, sudoGrant: $class, runas: $runas,
+      "github:read":  {state: $rstate, detail: $rdetail},
+      "github:write": {state: "NO",    detail: $wdetail}}')
+  return 0
+}
+
+# ── openclaw model-pin re-grade (DIVE-3457) ────────────────────────────────
+#
+# WHY THIS EXISTS. An OPENCLAW_PROVIDER_MODEL row is graded against
+# `openclaw models list --provider <native> --plain` AT THE MOMENT THE ROW IS
+# WRITTEN (that is the rule in the header; DIVE-3184 is a worked example of
+# following it). Nothing re-checks it afterwards. The installed openclaw then
+# upgrades underneath the row, and the already-written pin in a seat's
+# openclaw.json is never rewritten. So a pin that has stopped resolving is a
+# DATED OBSERVATION GONE STALE, not a bad write — and it is BYTE-IDENTICAL at
+# the file level to one that still resolves, dying at the same place with the
+# same 401 (community/wiki/an-unconfigured-model-authenticates-against-the-
+# wrong-provider.md: the error names auth and hides provider selection).
+#
+# WHY IT IS NOT IN THE DEFAULT SWEEP, and why it is not a create-time probe.
+# Each provider costs a full openclaw process: measured 5.8s for one
+# `--provider minimax --plain` on this host, so the seven catalog rows are ~40s.
+# The dashboard polls `doctor --json`, and `selfcheck_cred_reached_agent` re-runs
+# continuously on the agent-list health rail — paying 40s there buys nothing,
+# because the answer cannot change between runs on a fixed openclaw build
+# (dev2 + quinn, DIVE-3442). So this is its OWN opt-in category: it runs from
+# `doctor --category=models`, on a schedule or right after an openclaw upgrade,
+# and never from a bare `doctor`.
+#
+# WHY THE CONTROLS ARE PART OF THE CHECK AND NOT PART OF THE TEST. On the
+# version the rows were graded against, every row resolves — so an all-green run
+# proves only that the probe RETURNED. Two controls run first, every time, and
+# their failure SUPPRESSES the verdict rather than colouring it:
+#
+#   non-vacuity  the control provider's list must be non-empty. `models list`
+#                prints "No models found." at EXIT 0 for a provider it does not
+#                enumerate AND for a provider spelled wrong (DIVE-3184 measured
+#                those two byte-identical), so an openclaw that answers nothing
+#                for everything would otherwise report all seven pins STALE —
+#                the false ALARM, the mirror of the false green.
+#   discrimination  a sentinel id known ABSENT must MISS. openai carries no
+#                gpt-4 family at all on 2026.7.1-2 (20 ids, starting at gpt-5.3
+#                — DIVE-2631), while models.dev still lists gpt-4o as present,
+#                which is exactly why it is the sentinel: it is a live id
+#                somewhere else and absent HERE. If it hits, the matcher is
+#                looser than an exact id comparison and every green below is
+#                worthless.
+#
+# The oracle is one-sided in the other direction too, and this check inherits
+# that: a HIT is authoritative, a MISS on a provider whose whole list is empty
+# says nothing (DIVE-3130/3184 — zai, qwen and huggingface enumerate nothing and
+# are deliberately unpinned). A pin under an EMPTY list is therefore reported
+# `warn` NO-ORACLE, never `error` stale.
+
+OPENCLAW_PIN_CONTROL_PROVIDER="openai"
+OPENCLAW_PIN_CONTROL_ABSENT="openai/gpt-4o"
+
+# The node the openclaw shim is executed under. A VARIABLE and not a literal,
+# and that is a fix, not a refactor: with the path hardcoded, the runtime guard
+# below is a THIRD live seam the offline harness could not stub, so on any box
+# without openclaw installed the check emitted one warn and returned at its
+# first line. Every arm of tests/openclaw_pin_regrade_unit.sh then observed an
+# empty tree — including the two arms that assert a verdict is ABSENT, which
+# passed on that emptiness and reported the suppression working. An
+# absence-assertion arm passes on empty output; the seam it depends on has to
+# be injectable or the positive control cannot be written.
+OPENCLAW_PIN_NODE_BIN="${OPENCLAW_PIN_NODE_BIN:-/home/claude/.local/bin/node}"
+
+# openclaw_catalog_ids <native> — the provider's `--plain` id list on stdout.
+# rc 1 when the runtime is missing (caller must not read that as an empty
+# catalog). "No models found." is filtered out here rather than at the call
+# sites: it is prose on stdout at exit 0, and leaving it in makes an empty
+# catalog look like a one-id catalog.
+openclaw_catalog_ids() {
+  local native="$1"
+  local node="$OPENCLAW_PIN_NODE_BIN" bin="${TYPE_BIN[openclaw]:-}"
+  [[ -n "$bin" && -x "$node" && -x "$bin" ]] || return 1
+  sudo -u claude -H env HOME=/home/claude PATH=/home/claude/.local/bin:/usr/bin:/bin \
+    "$node" "$bin" models list --provider "$native" --plain 2>/dev/null \
+    | grep -vxF 'No models found.' | grep . || true
+}
+
+# openclaw_written_pins — every ALREADY-WRITTEN model pin on this box, one
+# `<path>\t<pin>` row per line. These are the rows the catalog table cannot
+# speak for: `_apply_byo_openclaw` validates at WRITE time and the write already
+# happened, DIVE-3442's push is a faithful copy of an already-graded value, and
+# the boot seed re-syncs whatever is there. Three shapes hold one:
+#   shared   /home/claude/.openclaw/openclaw.json
+#   profile  <auth-profiles>/<name>/openclaw/.openclaw/openclaw.json  (HOME redirect)
+#   seat     /home/agent-*/.openclaw/openclaw.json  (start-time sync target)
+openclaw_written_pins() {
+  local f pin
+  for f in /home/claude/.openclaw/openclaw.json \
+           "${AUTH_PROFILES_DIR}"/*/openclaw/.openclaw/openclaw.json \
+           /home/agent-*/.openclaw/openclaw.json; do
+    [[ -f "$f" ]] || continue
+    pin=$(jq -r '.agents.defaults.model.primary // empty' "$f" 2>/dev/null) || continue
+    [[ -n "$pin" ]] || continue
+    printf '%s\t%s\n' "$f" "$pin"
+  done
+}
+
+# doctor_check_openclaw_model_pins — re-grade catalog rows AND written pins
+# against the INSTALLED catalog. Adds its own checks via doctor_add.
+doctor_check_openclaw_model_pins() {
+  local bin="${TYPE_BIN[openclaw]:-}"
+  local node="$OPENCLAW_PIN_NODE_BIN"
+  if [[ -z "$bin" || ! -x "$node" || ! -x "$bin" ]]; then
+    doctor_add models openclaw-runtime warn \
+      "openclaw is not installed here, so no pin was graded — this is a NOT-MEASURED, not a clean bill of health (install: 5dive agent install openclaw --upgrade)"
+    return 0
+  fi
+
+  local version
+  version=$(sudo -u claude -H env HOME=/home/claude PATH=/home/claude/.local/bin:/usr/bin:/bin \
+    "$node" "$bin" --version 2>/dev/null | head -1)
+  [[ -n "$version" ]] || version="unknown"
+
+  # ── controls, before any verdict ────────────────────────────────────────
+  local ctl_ids ctl_n
+  ctl_ids=$(openclaw_catalog_ids "$OPENCLAW_PIN_CONTROL_PROVIDER")
+  ctl_n=$(grep -c . <<<"${ctl_ids}" 2>/dev/null || printf 0)
+  [[ -n "$ctl_ids" ]] || ctl_n=0
+  if (( ctl_n == 0 )); then
+    doctor_add models openclaw-pin-control error \
+      "non-vacuity control FAILED: '$OPENCLAW_PIN_CONTROL_PROVIDER' enumerates 0 ids on $version, so the probe cannot tell a stale pin from a silent catalog — NO pin was graded this run (a verdict here would have called every pin stale)"
+    return 0
+  fi
+  if grep -qxF "$OPENCLAW_PIN_CONTROL_ABSENT" <<<"$ctl_ids"; then
+    doctor_add models openclaw-pin-control error \
+      "discrimination control FAILED: sentinel '$OPENCLAW_PIN_CONTROL_ABSENT' is supposed to be ABSENT from '$OPENCLAW_PIN_CONTROL_PROVIDER' on this build and it MATCHED — the matcher is looser than an exact id comparison, so NO pin was graded this run"
+    return 0
+  fi
+  doctor_add models openclaw-pin-control ok \
+    "controls passed on $version: '$OPENCLAW_PIN_CONTROL_PROVIDER' enumerates $ctl_n ids (non-vacuity) and absent sentinel '$OPENCLAW_PIN_CONTROL_ABSENT' did not match (discrimination)"
+
+  # ── catalog rows ────────────────────────────────────────────────────────
+  # `rows` is counted in the loop rather than read as ${#OPENCLAW_PROVIDER_MODEL[@]}
+  # in the summary line. Not cosmetic: tests/local_array_unbound_default_unit.sh
+  # arm G resolves every such read against a creation earlier in the SAME
+  # function, so a file-scope `declare -A` in src/header.sh can never satisfy it
+  # and the read reds a guard that is green on main. Widening that guard to
+  # accept file-scope globals is a change to the guard's own non-vacuity and
+  # does not belong in this diff (DIVE-3457, quinn iteration 1).
+  local canonical native pin ids n stale=0 noracle=0 graded=0 rows=0
+  for canonical in $(printf '%s\n' "${!OPENCLAW_PROVIDER_MODEL[@]}" | sort); do
+    rows=$((rows + 1))
+    pin="${OPENCLAW_PROVIDER_MODEL[$canonical]}"
+    native="${OPENCLAW_PROVIDER_ID[$canonical]:-$canonical}"
+    ids=$(openclaw_catalog_ids "$native")
+    n=$(grep -c . <<<"${ids}" 2>/dev/null || printf 0)
+    [[ -n "$ids" ]] || n=0
+    if (( n == 0 )); then
+      noracle=$((noracle + 1))
+      doctor_add models "openclaw-row-${canonical}" warn \
+        "NO ORACLE: '$native' enumerates nothing on $version, so pin '$pin' is neither confirmed nor refuted — an unenumerated namespace is not a proof of unroutability (DIVE-3130/3184). Do not delete the row on this."
+    elif grep -qxF "$pin" <<<"$ids"; then
+      graded=$((graded + 1))
+      doctor_add models "openclaw-row-${canonical}" ok \
+        "pin '$pin' still resolves on $version ($n ids in '$native')"
+    else
+      stale=$((stale + 1))
+      doctor_add models "openclaw-row-${canonical}" error \
+        "STALE PIN: '$pin' is ABSENT from '$native' on $version ($n ids). Every new openclaw seat on provider '$canonical' will be created with an id this build cannot resolve, report AUTH ok, and 401. Re-grade and edit OPENCLAW_PROVIDER_MODEL[$canonical] in src/header.sh: openclaw models list --provider $native --plain"
+    fi
+  done
+
+  # ── already-written pins ────────────────────────────────────────────────
+  local line path wpin wnative wids wn wrote=0
+  while IFS=$'\t' read -r path wpin; do
+    [[ -n "$path" ]] || continue
+    wrote=$((wrote + 1))
+    wnative="${wpin%%/*}"
+    wids=$(openclaw_catalog_ids "$wnative")
+    wn=$(grep -c . <<<"${wids}" 2>/dev/null || printf 0)
+    [[ -n "$wids" ]] || wn=0
+    if (( wn == 0 )); then
+      doctor_add models "openclaw-written-${wrote}" warn \
+        "NO ORACLE for written pin '$wpin' in $path: provider '$wnative' enumerates nothing on $version"
+    elif grep -qxF "$wpin" <<<"$wids"; then
+      doctor_add models "openclaw-written-${wrote}" ok \
+        "written pin '$wpin' still resolves on $version ($path)"
+    else
+      doctor_add models "openclaw-written-${wrote}" error \
+        "STALE WRITTEN PIN: '$wpin' in $path is ABSENT from '$wnative' on $version ($wn ids). This seat is already on disk — nothing rewrites it, so it will 401 on every message while reporting AUTH ok. Repair: sudo -u claude -H env HOME=$(dirname "$(dirname "$path")") PATH=/home/claude/.local/bin:/usr/bin:/bin $node $bin config set agents.defaults.model.primary <graded-id>"
+    fi
+  done < <(openclaw_written_pins)
+
+  doctor_add models openclaw-pin-summary \
+    "$( (( stale > 0 )) && printf error || printf ok )" \
+    "graded ${graded}/${rows} catalog rows + ${wrote} written pin(s) against installed openclaw $version — ${stale} stale, ${noracle} no-oracle"
+  return 0
+}
+
 cmd_doctor() {
   require_root
   local filter="" want_fix=0 dry=0
   DOCTOR_REPAIR=0
   DOCTOR_CHECKS='[]'
+  DOCTOR_CAPS=''
   while [[ $# -gt 0 ]]; do
     case "$1" in
       # --fix is the discoverable alias for the older --repair (both apply the
@@ -436,6 +778,9 @@ cmd_doctor() {
       # already a preview — every fixable check says "run with --fix".)
       --fix|--repair) want_fix=1 ;;
       --dry-run)      dry=1 ;;
+      # --caps is the name DIVE-3076 asked for and the name an agent will
+      # type; it is exactly --category=caps, never a second code path.
+      --caps)         filter="caps" ;;
       --category=*)   filter="${1#--category=}" ;;
       -*)             fail "$E_USAGE" "unknown flag: $1" ;;
       *)              fail "$E_USAGE" "extra arg: $1" ;;
@@ -449,12 +794,17 @@ cmd_doctor() {
     # `--category=policy` failed usage for every caller who read the error message
     # and did what it said. Pre-existing; fixed here because this change lands its
     # surface under that category and would otherwise be unreachable by filter.
-    ""|deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins) ;;
-    *) fail "$E_USAGE" "unknown --category (deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins)" ;;
+    ""|deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins|caps|models) ;;
+    *) fail "$E_USAGE" "unknown --category (deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins|caps|models)" ;;
   esac
 
   local run_deps=0 run_types=0 run_auth=0 run_creds=0 run_registry=0 run_shelld=0 run_channels=0 run_host=0 run_memory=0 run_policy=0
-  local run_plugins=0
+  local run_plugins=0 run_caps=0
+  # DIVE-3457: `models` is the ONE category a bare `doctor` does NOT run. It
+  # shells to openclaw once per provider (5.8s measured), and the dashboard
+  # polls `doctor --json`. Opt-in keeps the poll cheap; the schedule and the
+  # post-upgrade run ask for it by name.
+  local run_models=0
   [[ -z "$filter" || "$filter" == "deps"     ]] && run_deps=1
   [[ -z "$filter" || "$filter" == "types"    ]] && run_types=1
   [[ -z "$filter" || "$filter" == "auth"     ]] && run_auth=1
@@ -466,6 +816,8 @@ cmd_doctor() {
   [[ -z "$filter" || "$filter" == "memory"   ]] && run_memory=1
   [[ -z "$filter" || "$filter" == "policy"   ]] && run_policy=1
   [[ -z "$filter" || "$filter" == "plugins"  ]] && run_plugins=1
+  [[ -z "$filter" || "$filter" == "caps"     ]] && run_caps=1
+  [[ "$filter" == "models" ]] && run_models=1
 
   # --- deps ---
   if (( run_deps )); then
@@ -1211,6 +1563,18 @@ cmd_doctor() {
     [[ -n "$DOCTOR_ENV_OVERRIDES" ]] || DOCTOR_ENV_OVERRIDES="$_5D_ENV_OV_UNAVAILABLE"
   fi
 
+  # --- caps (report; see doctor_build_caps) ---
+  # Constant fallback, never a function call: doctor_build_caps ships in this
+  # same file, so it is missing in exactly the cases a fallback exists for.
+  if (( run_caps )); then
+    doctor_build_caps
+    [[ -n "$DOCTOR_CAPS" ]] || DOCTOR_CAPS='{"seat":"unknown","sudoGrant":"unknown","runas":"unknown","github:read":{"state":"UNKNOWN","detail":"the capability probe itself failed to run — this is NOT a NO; nothing was measured"},"github:write":{"state":"NO","detail":"push identity is per-seat; the claude-uid borrow is RETIRED for the push class (DIVE-3017)."}}'
+  fi
+
+  if (( run_models )); then
+    doctor_check_openclaw_model_pins
+  fi
+
   # --- summary + output ---
   local summary
   summary=$(jq -c '{
@@ -1235,7 +1599,8 @@ cmd_doctor() {
   local payload
   payload=$(jq -cn --argjson checks "$DOCTOR_CHECKS" --argjson summary "$summary" \
     --argjson eov "${DOCTOR_ENV_OVERRIDES:-{\}}" \
-    '{summary: $summary, checks: $checks, env_overrides: $eov}')
+    --argjson caps "${DOCTOR_CAPS:-null}" \
+    '{summary: $summary, checks: $checks, env_overrides: $eov, capabilities: $caps}')
 
   if (( JSON_MODE )); then
     jq -c '{ok:true, data: .}' <<<"$payload"
@@ -1249,6 +1614,18 @@ cmd_doctor() {
     jq -r '.summary |
       "summary: \(.total) checks, \(.passed) ok, \(.warnings) warn, \(.errors) error" +
       (if .repaired > 0 then ", \(.repaired) repaired" else "" end)
+    ' <<<"$payload"
+    # Capabilities, above env overrides and below the summary, and likewise a
+    # REPORT not results. Two lines, both derived per-seat at run time. The
+    # detail is printed in full rather than truncated: on the NO arm the reason
+    # IS the payload — a bare NO sends the reader hunting for a password that
+    # does not exist.
+    jq -r '
+      .capabilities // empty |
+      "", "── capabilities (per-seat report, not checks) ──",
+      "  seat          \(.seat)",
+      "  github:read   \(.["github:read"].state)  \(.["github:read"].detail)",
+      "  github:write  \(.["github:write"].state)  \(.["github:write"].detail)"
     ' <<<"$payload"
     # Its own section, below the summary, so it reads as a report rather than as results.
     # Prints NOTHING when there is nothing to say — which is why the negative is graded by

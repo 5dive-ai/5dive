@@ -93,9 +93,10 @@ broker_surface() {
 # broker_gate_check <surface> <id> <ident> [require-signature] — the ONE
 # cleared-gate predicate, formerly _push_gate_check (DIVE-1376/1460/1496). The
 # task must carry an answered, non-rejected gate cleared by either a proven
-# human OR the gate's designated routed reviewer. A bare agent answer and every
-# auto-clear provenance are deliberately excluded: neither authorizes a
-# privileged write. The friendly agent-side preflight checks the persisted
+# human OR the gate's designated routed reviewer. A bare agent answer is deliberately
+# excluded, and so is every auto-clear provenance EXCEPT the one DIVE-3481 delegates by
+# name (`auto:pfr` on an approval gate — see the arm below for the whole grant): none
+# of the others authorizes a privileged write. The friendly agent-side preflight checks the persisted
 # provenance; the root-only executor passes require-signature=1 and also
 # verifies the root-HMAC closure, so raw DB edits cannot forge authorization.
 broker_gate_check() {
@@ -178,6 +179,28 @@ broker_gate_check() {
   # signature check. (The exact-match line is kept as belt-and-braces.)
   [[ "$gby" == lead:* ]] && authorized=1
   [[ -n "$reviewer" && "$gby" == "lead:${reviewer}" ]] && authorized=1
+  # DIVE-3481: the ONE auto-clear provenance this predicate accepts, and the sentence
+  # above ("every auto-clear provenance is deliberately excluded") is now scoped to
+  # this exception rather than absolute. `auto:pfr` is stamped ONLY by cmd_task_need's
+  # inert push-for-review path, which fires solely on `type=approval` at tier 1 with
+  # the T2 category floor un-fired, no declared capability, a non-empty recommendation,
+  # and a `Branch:` binding on the row that is not a protected ref — the ask itself
+  # having passed `_gate_push_for_review_hit`, which fails closed on any prod-touching
+  # verb. Measured: 101 of 101 answered gates in that class applied the filer's
+  # recommendation, which is why this class and no other is delegated.
+  #
+  # EXACT MATCH AND TYPE-BOUND, not a `auto:pfr*` glob and not provenance alone. The
+  # push surface is the whole point of the grant, so a `manual`/`access`/`decision` row
+  # carrying this string is not authorized by it — that would be a provenance minted
+  # for one authority spent on another.
+  #
+  # Why the string is not the security boundary: `need_answered_by` is inside the
+  # SIGNED closure, the root executor passes require_sig=1 and re-verifies it, and the
+  # HMAC key is 0400 root:root — so a raw-DB write of `auto:pfr` fails
+  # `_gate_closure_verify` exactly as a forged `lead:X` does (DIVE-1555's argument,
+  # unchanged). The minting path refuses to clear at all when it cannot sign, so an
+  # unsigned `auto:pfr` row is not a state this system produces.
+  [[ "$gby" == "auto:pfr" && "$gtype" == "approval" ]] && authorized=1
   # DIVE-2004: a `decision` gate cleared by its own designated reviewer could never
   # authorize an action, because `lead:` is minted ONLY for approval|manual|access —
   # so the refusal accused the reviewer who had in fact cleared it. The predicate

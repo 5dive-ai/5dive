@@ -41,7 +41,8 @@ Agents:
   5dive market [<keyword>] [--role=<r>] [--rarity=<t>]  # browse/search the agent market; preview: 5dive market show <slug>
   5dive hire <role> --from-market [--as=<name>]  # hire from the open market; see '5dive hire --help'
   5dive agent list
-  5dive agent info <name>                            # type, CLI version, selected model, channel + state
+  5dive agent info <name>                            # type, CLI version, model, channel, state + OUTPUT (DIVE-3274:
+                                                     # whether the seat is transacting, not only whether it is up)
   5dive agent types
   5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz[,ch...]]
                             [--telegram-token=<bot-token>] [--discord-token=<token>]
@@ -234,6 +235,12 @@ Org chart (who reports to whom):
   5dive org tree | show <agent> | ls | rm <agent>
   # full surface: 5dive org --help
 
+Human accounts (who may CLEAR a gate — one identity, all transports):
+  5dive human add <id> [--name=] [--telegram=<chat id>] [--buzz=<npub>] [--discord=<id>]
+  5dive human link <id> --agent=<name>               # that human owns that agent's gates
+  5dive human ls | show <id> | owner <agent> | recipient <ident> | rm <id>
+  # With NO human accounts, gate delivery is unchanged. full surface: 5dive human --help
+
 Web UI for this host (org chart, queue, gates):
   5dive ui [--port=8735] [--host=127.0.0.1]          # open the three views in a browser. Read-only, no sign-in.
   5dive ui --data | --html                           # the JSON the views render / the page itself
@@ -342,7 +349,33 @@ Health:
     blank one; the roster travels as ACP availableCommands, so /<name> or
     /attach <name> picks the agent and /agents re-lists them. Runs on bun.
 
-  5dive doctor [--fix] [--dry-run] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins]
+  5dive host unit list [--pattern=<unit-glob>]       # systemd units, --no-pager pinned in code
+  5dive host unit show --unit=<unit>                 # a FIXED property set (User, WorkingDirectory,
+                                                     # ExecStart, DropInPaths, Result, ...)
+  5dive host unit repoint --unit=<u>.service --workdir=<abs-path> [--no-restart]
+                                                     # write a fixed one-directive drop-in
+                                                     # (<unit>.d/50-5dive-workdir.conf), daemon-reload,
+                                                     # restart — one audited operation.
+                                                     # REFUSES a unit that runs as root: WorkingDirectory
+                                                     # is a code pointer whenever ExecStart carries a
+                                                     # relative argument, so repointing a root unit would
+                                                     # exec caller-chosen content as root.
+  5dive host unit revert --unit=<u>.service [--no-restart]
+                                                     # remove exactly that drop-in, reload, restart
+  5dive host journal --unit=<unit> [--lines=N] [--since=<N>m|<N>h|<N>d]
+                                                     # journalctl --no-pager; --since is structured,
+                                                     # free-form time strings are refused
+  5dive host cron show|snapshot|diff --user=<user>   # READ-ONLY. \`crontab -l -u\` only; there is no
+                                                     # write/edit path (crontab -e is an EDITOR escape).
+                                                     # diff compares against the CLI's own snapshot,
+                                                     # never a caller-supplied file.
+    Host remediation for a privileged seat, delivered as scoped subcommands
+    rather than raw systemctl/journalctl/crontab grants (DIVE-3221; DIVE-1088
+    excluded those grants because each is a one-line root escape via the pager
+    or an editor). Needs root for the mutating and journal/cron verbs — an admin
+    agent reaches them through its existing \`/usr/local/bin/5dive *\` grant.
+
+  5dive doctor [--fix] [--dry-run] [--caps] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins|caps|models]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
     probes, stale shadow-credential heal (creds), registry integrity, channel
     health (allowlist + dead inbound telegram poller), host safety (needrestart
@@ -352,6 +385,14 @@ Health:
     ~/.claude/.credentials.json that shadows an env-token, restart an agent
     whose telegram poller died (silently drops inbound DMs), and force
     needrestart to list-only so a library upgrade can't bounce the whole fleet.
+    --caps (= --category=caps) answers, for THIS seat and without guessing,
+    whether it can read GitHub and how: github:read is derived from the seat's
+    measured sudo runas AND a live \`sudo -u claude gh auth status\`, since a
+    permitted uid switch says nothing about whether that token still works.
+    Roughly half the seats on a box have no such path, so a NO always names its
+    reason. It rides in data.capabilities, NOT in checks — a capability is not
+    a passed check. github:write stays NO: push identity is per-seat and the
+    claude-uid borrow is retired for pushes (DIVE-3017).
     A bare 'doctor' (no --fix) is a preview — every fixable check tells you so;
     --dry-run previews even alongside --fix. Output envelope always
     {ok:true,data:{...}}; branch on data.summary.errors in CI.
@@ -808,6 +849,21 @@ main() {
       # src/lib/models.sh). Read-only. The telegram plugin reads
       # `5dive models --json` at boot so its /model picker can't drift again.
       cmd_models "$@" ;;
+    host)
+      # DIVE-3221: hardened host-remediation verbs, reached through the CLI-root
+      # grant an `admin` agent already holds (no new sudoers class, no new tier —
+      # lodar answered B on DIVE-3213). Every verb takes structured, validated
+      # parameters only: no unit-file content, no shell string, no editor, no
+      # caller-supplied path. See the header of src/cmd_host.sh for the finite
+      # set of commands each verb can exec as root, and why `repoint` refuses a
+      # root-running unit.
+      #
+      # Audited as a whole: `unit list`/`unit show`/`journal`/`cron show` are
+      # reads, but they are reads a privileged seat performs about ANOTHER user's
+      # box state, and the row that answers "who repointed this unit" is worth
+      # more than the noise it costs.
+      AUDIT_CMD="host"; AUDIT_ARGS=("$@")
+      cmd_host "$@" ;;
     doctor)
       # Only audit when a mutating run is requested (--fix/--repair); read-only
       # runs (and --dry-run previews) would spam the log.
@@ -869,6 +925,13 @@ main() {
     org)
       # Agent org chart (sqlite, same store as tasks). Read/write, no audit/lock.
       cmd_org "$@" ;;
+    human|humans)
+      # DIVE-3342: human accounts — one identity per person carrying their
+      # telegram/buzz/discord ids, so a gate can name the PERSON who may clear it
+      # instead of delivery guessing from whoever last DM'd the bot. Same store as
+      # tasks/org; reads unprivileged, writes take root themselves (the table is
+      # trusted input to gate delivery). No lock: plain sqlite writes, like org.
+      cmd_human "$@" ;;
     ui)
       # DIVE-2655: the free single-host web UI (org chart / queue / gates).
       # Reads the same group-writable store as tasks + org; GET/HEAD only, no

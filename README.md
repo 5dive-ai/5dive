@@ -27,6 +27,7 @@
 <p align="center">
   <a href="#quickstart">Quickstart</a> ·
   <a href="#why-5dive">Why 5dive</a> ·
+  <a href="#things-to-try">Things to try</a> ·
   <a href="docs/zero-human.md">Zero-human proof</a> ·
   <a href="#for-your-ai-agent">Use from your AI agent</a> ·
   <a href="#security--isolation">Security</a> ·
@@ -82,6 +83,8 @@ sudo 5dive agent pair   my-agent --code=<pairing-code>
 **A subscription that's yours.** Official CLIs on your own Pro/Max or keys. No middleman, no OAuth proxy.
 
 **Runs as a service, not a session.** Agents stay alive when you close the terminal. Message them from Telegram any time.
+
+**Runs on tiny boxes.** 5dive adds no heavy runtime around your coding CLI: just Bash, SQLite, and systemd. A single-agent setup can comfortably run on a 1 GB VM.
 
 **Every major agent CLI.** `claude`, `codex`, `antigravity`, `grok`, `openclaw`, `hermes`, `opencode`, `pi`, all under one team.
 
@@ -172,6 +175,43 @@ sudo 5dive agent config glm-coder set model=z-ai/glm-5.2
 ```
 
 In-session, Claude Code's built-in `/model <slug>` also accepts any custom slug live (session-scoped).
+
+---
+
+## Things to try
+
+`5dive company`<br>
+Stand up a self-steering company in one command.
+
+`5dive task`<br>
+Manage the shared task queue and every agent-to-agent handoff.
+
+`5dive goal add "Ship billing v2"`<br>
+Turn an outcome into a guarded task graph.
+
+`5dive loop spawn --role=researcher --agent=scout --prompt="Track competitor launches"`<br>
+Run bounded autonomous work in a persistent agent loop.
+
+`sudo 5dive council init --seats=alice:chair,bob,carol --threshold=majority --veto=human:you`<br>
+Seed the Council's genesis roster. A human does this once; the primary Council refuses to convene until it exists.
+
+`5dive council convene "Should we ship?" --mode=adversarial`<br>
+Convene an auditable adversarial review with multiple agents.
+
+`5dive trace DIVE-42`<br>
+Inspect a task's complete causal timeline from origin to verdict.
+
+`5dive watch`<br>
+Watch the whole team in real time.
+
+`5dive ui`<br>
+Open local browser views for the org chart, task queue, and human gates.
+
+`5dive memory search "release checklist"`<br>
+Search the team's durable memory with provenance.
+
+`5dive acp`<br>
+Connect Zed, Buzz, and other clients over ACP.
 
 ---
 
@@ -296,7 +336,7 @@ Three views over the box you are on:
 
 It is read-only and binds to loopback (there is no sign-in, so `--host` refuses a routable address unless you set `FIVE_UI_ALLOW_REMOTE=1`). Anything that changes state has a CLI verb. `5dive ui --data` prints the same JSON the views render, so you can pipe it somewhere else.
 
-### Commands at a glance
+### Command reference
 
 ```
 5dive agent list / create / start / stop / restart / rm
@@ -305,6 +345,15 @@ It is read-only and binds to loopback (there is no sign-in, so `--host` refuses 
 5dive agent logs <name> [--follow]
 5dive agent config <name> set model=<id> / effort=<low|medium|high|xhigh|max>
 5dive agent <name> tui
+
+5dive company                            # stand up a self-steering company
+5dive goal add "<outcome>"                # outcome -> guarded task graph
+5dive loop spawn --role=<r> --agent=<a> --prompt="<work>"
+sudo 5dive council init --seats=<a:chair,b,c> --threshold=<spec> --veto=<principal>
+5dive council convene "<question>" --mode=adversarial
+5dive trace <task>                       # causal timeline from origin to verdict
+5dive memory search "<query>"             # durable knowledge with provenance
+5dive acp                                # connect from Zed, Buzz, or another ACP client
 
 5dive task      add / ls / assign / start / done / need / inbox / answer
 5dive heartbeat on / off / ls / tick     # wake agents that have queued work

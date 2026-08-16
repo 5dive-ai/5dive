@@ -148,9 +148,18 @@ case "$int" in *"class=read"*|*"actor="*)
 # quinn's seat held no gh credential and the banner said `actor=your own gh
 # credential` anyway — an identity asserted before it was resolved (the DIVE-3128
 # class). Both directions are graded: a resolved seat must NOT gain the warning.
-noc=$(GH_STUB_TOKEN="" GH_STUB_RC=0 "$FIVE" gh pr view 51 2>&1 >/dev/null)
+# DIVE-2296 MOVED THIS ARM ONE PATH ACROSS, and did not weaken it. A plain READ
+# from a credential-less seat no longer reaches this message at all: it routes to
+# the bot, because a read routed to a credential that does not exist is a refusal
+# and the maker who gets it has no other way to see their own work. The DIVE-3135
+# property — never NAME an identity that has not resolved — is unchanged and is
+# graded here on a path that still names the caller, an explicit --as=caller.
+noc=$(GH_STUB_TOKEN="" GH_STUB_RC=0 "$FIVE" gh --as=caller pr view 51 2>&1 >/dev/null)
 case "$noc" in *"NONE IS RESOLVED"*) ok "G credential-less seat is told so" ;;
   *) bad "G credential-less seat is told so" "banner asserted an identity: $noc" ;; esac
+rte=$(GH_STUB_TOKEN="" GH_STUB_RC=0 "$FIVE" gh --explain pr view 51 2>&1 >/dev/null)
+case "$rte" in *"actor=5dive-bot"*) ok "G a credential-less READ routes to the bot rather than refusing (DIVE-2296)" ;;
+  *) bad "G credential-less read must route" "got: $rte" ;; esac
 yes=$(GH_STUB_RC=0 "$FIVE" gh pr view 51 2>&1 >/dev/null)
 case "$yes" in *"NONE IS RESOLVED"*)
     bad "G a resolved seat is NOT warned" "false warning on a seat with a token: $yes" ;;

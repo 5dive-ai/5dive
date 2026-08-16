@@ -114,15 +114,28 @@ da=$(db "SELECT done_at IS NOT NULL FROM tasks WHERE id=$id3;")
 # --- DIVE-2316: delivery_ref is visible through the CLI, including absence.
 # JSON show already reads the whole row; the regression was the human presenter
 # omitting the enforcement field. Prove both states before the list audit below.
+#
+# DIVE-3251: THE ANCHOR IS NOW PADDING-INSENSITIVE, and the reason is worth
+# knowing before someone "tightens" it back. `dbfmt -line` is sqlite3's own -line
+# mode, which RIGHT-ALIGNS every field name to the width of the WIDEST name in
+# the SELECT. So adding any column longer than the current widest re-indents
+# EVERY line of `task show` at once, and a `^name = value` anchor breaks on a
+# change that has nothing to do with the field it is guarding. `first_started_at`
+# (16 chars) did exactly that to `delivery_ref` (12).
+#
+# What DIVE-2316 is actually about is that the human presenter must not OMIT the
+# enforcement field, and both arms below still grade precisely that. The leading
+# whitespace was never the property under test. Machine consumers read the JSON
+# path, which is untouched by the presenter's alignment.
 show_absent=$( (JSON_MODE=0 cmd_task_show "$id3") 2>"$TMP"/err )
-echo "$show_absent" | grep -q '^delivery_ref = absent$' \
+echo "$show_absent" | grep -qE '^ *delivery_ref = absent$' \
   && ok_t "DIVE-2316: task show makes an absent delivery_ref explicit" \
   || bad_t "DIVE-2316 show absent" "$show_absent"
 
 delivery_url='https://github.com/example/project/pull/999'
 db "UPDATE tasks SET delivery_ref=$(sqlq "$delivery_url") WHERE id=$id3;"
 show_bound=$( (JSON_MODE=0 cmd_task_show "$id3") 2>"$TMP"/err )
-echo "$show_bound" | grep -Fqx "delivery_ref = $delivery_url" \
+echo "$show_bound" | grep -qE "^ *delivery_ref = $(printf '%s' "$delivery_url" | sed 's/[.[\*^$\/]/\\&/g')\$" \
   && ok_t "DIVE-2316: task show prints the bound delivery_ref" \
   || bad_t "DIVE-2316 show bound" "$show_bound"
 
@@ -320,10 +333,37 @@ r2=$(run add --assignee=charter:backend --body="w" -- "route by charter")
 [[ "$(echo "$r2" | jf '.data.assignee')" == "eng" ]] \
   && ok_t "--assignee=charter:backend resolves to eng" || bad_t "charter token resolve" "$(echo "$r2" | jf '.data.assignee')"
 
-# ambiguous role (two designers) is a hard, explainable error — never a guess
+# DIVE-3366 INVERTED THIS ARM, deliberately, and the old assertion is quoted here
+# because a reader finding a route where this file used to demand a refusal will
+# otherwise assume the guard rotted. It read:
+#
+#   # ambiguous role (two designers) is a hard, explainable error — never a guess
+#   run add --assignee=role:designer ... ; [[ $? -ne 0 && err == *"unique holder"* ]]
+#
+# The refusal was the lane skew. Two seats on a role is the case where routing
+# has the MOST to say, and answering it with an error sent the filer back to
+# typing a name — and the name a filer remembers is the busiest seat (measured
+# 2026-08-13: quinn 14 open, main2 0, both verifiers, lodar raising it three
+# times in one day). A role with two holders now routes to the idler and RECORDS
+# the counts that chose it; tests/task_role_routing_unit.sh grades that rail.
+#
+# `_org_resolve_assignee` itself is unchanged — it still returns empty on two
+# holders, which is what `goal validate` needs — so the arms above still pass and
+# the widening lives at the `task add` call site only.
 run add --assignee=role:designer --body="w" -- "ambiguous role" >/dev/null 2>"$TMP"/err
+rc_amb=$?
+amb_who=$(db "SELECT assignee FROM tasks WHERE title='ambiguous role';")
+amb_body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE title='ambiguous role';")
+[[ $rc_amb -eq 0 && ( "$amb_who" == "d1" || "$amb_who" == "d2" ) && "$amb_body" == *"ROUTED BY LOAD"* ]] \
+  && ok_t "two-holder role routes by load and records the pick (DIVE-3366, was a refusal)" \
+  || bad_t "two-holder role routes by load" "rc=$rc_amb who=$amb_who body=$amb_body err=$(cat "$TMP"/err)"
+
+# AND THE REFUSAL STILL EXISTS for the case that has no answer: a role NO seat
+# holds. DIVE-3366 widened the two-holder empty into a route; it must not have
+# turned the zero-holder empty into one, which would land a row on nobody.
+run add --assignee=role:nosuchrole --body="w" -- "unheld role" >/dev/null 2>"$TMP"/err
 [[ $? -ne 0 && "$(cat "$TMP"/err)" == *"unique holder"* ]] \
-  && ok_t "ambiguous role token rejected (explainable)" || bad_t "ambiguous role guard" "$(cat "$TMP"/err)"
+  && ok_t "a role NO seat holds is still refused (explainable)" || bad_t "unheld role guard" "$(cat "$TMP"/err)"
 
 # unknown role token is rejected too
 run add --assignee=role:ghost --body="w" -- "unknown role" >/dev/null 2>"$TMP"/err
@@ -371,6 +411,74 @@ d=$(printf 'src/cmd_agent.sh\ntests/y.sh\n' | _task_delivery_depth)
 d=$(printf '' | _task_delivery_depth)
 [[ -z "$d" ]] \
   && ok_t "delivery depth: no paths -> unknown, never shallow" || bad_t "empty list class" "got '$d'"
+
+# --- T-2730: the add-time `--no-verify` SURVIVES to delivery.
+#
+# The defect these arms grade is not a wrong answer, it is a MISSING FACT: the
+# opt-out used to be a shell var that died with `task add`, so at `task done` an
+# explicit refusal and a never-railed row were the same NULL and the UPGRADE arm
+# above could not tell them apart. So the first two arms grade the WRITE (the
+# fact exists at all) and the last two grade the READ (the upgrade arm honours
+# it) — a column nobody reads would pass a write-only test and change nothing.
+idnv=$(run add --assignee=nvmaker --no-verify --body="w" -- "opted out of grading" | jf '.data.id')
+[[ "$(db "SELECT COALESCE(verify_optout,0) FROM tasks WHERE id=${idnv};")" == "1" ]] \
+  && ok_t "no-verify: the explicit opt-out is persisted (verify_optout=1)" \
+  || bad_t "optout write" "got '$(db "SELECT COALESCE(verify_optout,-1) FROM tasks WHERE id=${idnv};")'"
+
+# NON-VACUITY, and it is the whole point of the row: a column that read 1 for
+# every task would satisfy the arm above while re-collapsing the distinction it
+# exists to make. An ordinary add must leave it NULL.
+idpv=$(run add --assignee=nvmaker --priority=low --body="w" -- "ordinary row, no opt-out" | jf '.data.id')
+[[ "$(db "SELECT COALESCE(verify_optout,0) FROM tasks WHERE id=${idpv};")" == "0" ]] \
+  && ok_t "no-verify: an ordinary add leaves verify_optout NULL (refusal != absence)" \
+  || bad_t "optout non-vacuity" "ordinary row reads $(db "SELECT verify_optout FROM tasks WHERE id=${idpv};")"
+
+# The READ half, end to end through `task done`'s UPGRADE arm — and this is the
+# arm that grades main's merge condition on DIVE-2730, so it is written as the
+# BYPASS it refuses rather than as a feature. `--no-verify` is declared at FILE
+# time; the blast radius is measured at DELIVERY time. If the stored flag
+# suppressed the upgrade, a sentence typed before the diff existed would
+# pre-authorise closing a scheduler/credentials change ungraded — a waiver in
+# DIVE-969's banned direction. So the opted-out row MUST still route.
+#
+# Both fixtures are verifier-NULL rows with a deep delivery, exactly the shape
+# DIVE-2719 upgrades; the two stubs supply the diff and a willing grader, the
+# only inputs the arm needs, so the sole difference between them is the column.
+# Stubbed rather than mocked over the network: the gh-backed path is graded on
+# the box (see T-2719's note), and what is under test is the branch, not the fetch.
+_task_delivery_paths() { printf 'src/cmd_heartbeat.sh\n'; }
+_task_default_verifier() { printf 'nvgrader\n'; }
+run start "$idpv" >/dev/null
+run done "$idpv" --result="delivered" >/dev/null 2>&1
+[[ "$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${idpv};")" == "nvgrader" ]] \
+  && ok_t "no-verify: an ordinary deep delivery upgrades (DIVE-2719, unchanged)" \
+  || bad_t "upgrade baseline" "no grader attached to the non-opted-out row"
+
+run start "$idnv" >/dev/null
+run done "$idnv" --result="delivered" >/dev/null   # run() captures stderr to $TMP/err
+[[ "$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${idnv};")" == "nvgrader" ]] \
+  && ok_t "no-verify: the blast-radius upgrade OVERRIDES an explicit opt-out (file-time flag loses to delivery-time measurement)" \
+  || bad_t "optout must not bypass" "verifier='$(db "SELECT verifier FROM tasks WHERE id=${idnv};")' — a file-time flag suppressed a delivery-time rail"
+
+# ...and it says so. The defect DIVE-2730 was filed for is that the override was
+# SILENT, not that it happened — a persisted flag that changes no message would
+# leave that defect exactly where it was found.
+grep -q -- "--no-verify" "$TMP"/err \
+  && ok_t "no-verify: the override NAMES the opt-out it is overriding" \
+  || bad_t "override silent" "warn text does not mention the opt-out: $(tr '\n' ' ' <"$TMP"/err)"
+unset -f _task_delivery_paths _task_default_verifier
+# DIVE-3278: source the MODULE, not src/cmd_task.sh. cmd_task.sh is a loader whose
+# `declare -F` guards are already satisfied here, so re-sourcing it is a no-op and
+# would leave the two functions above unset for the rest of this file.
+. "$SRC/task/routing.sh"
+
+# An explicit later attach supersedes the earlier refusal — otherwise the row
+# carries a live opt-out flag that contradicts its own grader.
+idnv2=$(run add --assignee=nvmaker --no-verify --body="w" -- "opted out, then graded anyway" | jf '.data.id')
+run verifier "$idnv2" nvgrader >/dev/null 2>&1
+[[ -z "$(db "SELECT COALESCE(verify_optout,'') FROM tasks WHERE id=${idnv2};")" ]] \
+  && ok_t "no-verify: 'task verifier' clears the opt-out it overrides" \
+  || bad_t "optout supersede" "still $(db "SELECT verify_optout FROM tasks WHERE id=${idnv2};") after an explicit attach"
 
 # The named exclusion list: data, not a code change.
 FIVE_VERIFY_EXCLUDE="main, dev2" _task_verify_excluded main \

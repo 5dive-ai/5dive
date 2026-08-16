@@ -254,6 +254,66 @@ migrated=$(jq '.schemaVersion = 2
   && ok_t "migration preserves an already-explicit standard agent" \
   || bad_t "migration keeps old2=standard" "$(jq -c .agents <<<"$migrated")"
 
+# ---- 4. DIVE-3294: the home is minted traversable, non-sandboxed ONLY -------
+# Structural first: ONE `!= sandboxed` predicate must decide group membership AND
+# home traversal. A second one is exactly how a sandboxed agent ends up
+# group-claude on one path and closed on the other with nothing failing loudly.
+# (The `== "sandboxed"` at the setfacl block is a DIFFERENT policy — DIVE-1033's
+# traverse grant on /home/claude — and is deliberately not counted here.)
+ISO_BODY="$(declare -f create_agent_user)"
+n_ne=$(grep -c '!= "sandboxed"' <<<"$ISO_BODY")
+[[ "$n_ne" -eq 1 ]] \
+  && ok_t "create_agent_user: exactly ONE '!= sandboxed' predicate gates group + home" \
+  || bad_t "one predicate must decide group membership and home traversal" "found $n_ne '!= sandboxed' tests; a second one will drift from the first"
+
+# Behavioural. Stub only the root-requiring externals; chgrp/chmod run for real
+# against a temp home, so this grades the effect and not an echoed expectation.
+export AGENT_HOME_ROOT="$TMP/homes"
+mkdir -p "$AGENT_HOME_ROOT"
+HOME_MODE_STUB=0700      # the hostile case: chgrp alone would NOT be enough
+adduser() { mkdir -p "$AGENT_HOME_ROOT/${!#}"; chmod "$HOME_MODE_STUB" "$AGENT_HOME_ROOT/${!#}"; }
+usermod() { :; }
+setfacl() { printf '%s\n' "$*" >>"$TMP/setfacl.log"; }
+write_admin_sudoers() { :; }
+write_standard_sudoers() { :; }
+seed_agent_git_identity() { :; }
+
+# A group we are genuinely a member of and that is NOT our primary, so a chgrp is
+# observable. Where none exists the group arm cannot run; the MODE arm below still
+# does, and the gap is printed rather than passed over.
+ISO_PRIMARY="$(id -gn)"; ISO_SHARED=""
+for g in $(id -Gn); do [[ "$g" != "$ISO_PRIMARY" ]] && { ISO_SHARED="$g"; break; }; done
+export AGENT_SHARED_GROUP="${ISO_SHARED:-$ISO_PRIMARY}"
+
+create_agent_user iso3294std standard >/dev/null 2>&1
+STD_HOME="$AGENT_HOME_ROOT/agent-iso3294std"
+(( 0$(stat -c '%a' "$STD_HOME") & 0010 )) \
+  && ok_t "non-sandboxed home gains g+x (chgrp alone is insufficient at HOME_MODE 0700)" \
+  || bad_t "non-sandboxed home must be group-traversable" "mode $(stat -c '%a' "$STD_HOME")"
+if [[ -n "$ISO_SHARED" ]]; then
+  [[ "$(stat -c '%G' "$STD_HOME")" == "$AGENT_SHARED_GROUP" ]] \
+    && ok_t "non-sandboxed home is chgrp'd to the shared group" \
+    || bad_t "non-sandboxed home group" "want $AGENT_SHARED_GROUP, got $(stat -c '%G' "$STD_HOME")"
+else
+  printf 'NOTE - group arm NOT RUN: no secondary group for %s, so a chgrp is unobservable here. Mode arm still graded.\n' "$ISO_PRIMARY"
+fi
+
+# The safety property, and it is portable — no group membership needed to grade it.
+create_agent_user iso3294box sandboxed >/dev/null 2>&1
+BOX_HOME="$AGENT_HOME_ROOT/agent-iso3294box"
+[[ "$(stat -c '%a' "$BOX_HOME")" == "700" ]] \
+  && ok_t "sandboxed home stays CLOSED (0700) — no traversal granted to anyone" \
+  || bad_t "sandboxed home must stay closed" "mode $(stat -c '%a' "$BOX_HOME"), want 700"
+[[ "$(stat -c '%G' "$BOX_HOME")" == "$ISO_PRIMARY" ]] \
+  && ok_t "sandboxed home is NOT chgrp'd to the shared group" \
+  || bad_t "sandboxed home group must be untouched" "got $(stat -c '%G' "$BOX_HOME")"
+# Regression guard: the new branch must not have disturbed DIVE-1033's ACL grant.
+grep -q 'u:agent-iso3294box:--x' "$TMP/setfacl.log" 2>/dev/null \
+  && ok_t "DIVE-1033 traverse-only ACL on /home/claude still granted to sandboxed" \
+  || bad_t "sandboxed must still get its DIVE-1033 ACL" "$(cat "$TMP/setfacl.log" 2>/dev/null)"
+unset -f adduser usermod setfacl write_admin_sudoers write_standard_sudoers seed_agent_git_identity
+unset AGENT_HOME_ROOT AGENT_SHARED_GROUP
+
 echo "-----"
 printf 'PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

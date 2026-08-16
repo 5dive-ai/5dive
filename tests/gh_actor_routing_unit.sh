@@ -118,10 +118,28 @@ out=$( ( cmd_gh --explain pr comment 349 --body hi ) 2>&1 )
 [[ "$out" == *"actor=5dive-bot"* && "$out" == *"class=write"* ]] \
   && ok_t "explain: a write names the bot as the actor" \
   || bad_t "explain: a write names the bot as the actor" "$out"
+# DIVE-2296 SPLIT THIS ARM IN TWO, and the split is the finding. `read -> caller`
+# was written as if the caller always HAS a credential; the seats it matters most
+# for hold none, and routing a read to a credential that does not exist is a
+# refusal, not a preference. So the contract is now conditional on resolution, and
+# both directions are graded — stub `_gh_caller_credential`, because the answer is
+# a property of the seat this harness happens to run on and must not be one.
+_gh_caller_credential() { return 0; }        # an AUTHED caller
 out=$( ( cmd_gh --explain pr view 349 ) 2>&1 )
 [[ "$out" == *"actor=your own gh credential"* && "$out" == *"class=read"* ]] \
-  && ok_t "explain: a read stays on the caller and says so" \
-  || bad_t "explain: a read stays on the caller and says so" "$out"
+  && ok_t "explain: a read stays on the caller when the caller HAS a credential" \
+  || bad_t "explain: a read stays on the caller when the caller HAS a credential" "$out"
+_gh_caller_credential() { return 1; }        # a builder seat: nothing to route to
+out=$( ( cmd_gh --explain pr view 349 ) 2>&1 )
+[[ "$out" == *"actor=5dive-bot"* && "$out" == *"DIVE-2296"* ]] \
+  && ok_t "explain: a read from a CREDENTIAL-LESS seat routes to the bot instead of refusing (DIVE-2296)" \
+  || bad_t "explain: credential-less read must route" "$out"
+out=$( ( cmd_gh --explain api --method GET /repos/5dive-ai/5dive/collaborators ) 2>&1 )
+[[ "$out" != *"actor=5dive-bot"* ]] \
+  && ok_t "explain: ANCHOR — an ADMIN call is never rerouted, credential or not (the bot is admin=false)" \
+  || bad_t "explain: admin must not route to the bot" "$out"
+unset -f _gh_caller_credential
+source "$SRC/cmd_gh.sh"
 out=$( ( cmd_gh --explain --as=caller pr comment 349 --body hi ) 2>&1 )
 [[ "$out" == *"actor=your own gh credential"* ]] \
   && ok_t "explain: --as=caller overrides a write back to the caller" \

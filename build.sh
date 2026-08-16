@@ -78,6 +78,7 @@ cat \
   src/lib/agent_env.sh \
   src/lib/tasks_db.sh \
   src/lib/actor.sh \
+  src/lib/a2a_rounds.sh \
   src/cmd_auth.sh \
   src/cmd_account.sh \
   src/cmd_agent.sh \
@@ -93,12 +94,25 @@ cat \
   src/cmd_skill.sh \
   src/cmd_init.sh \
   src/cmd_doctor.sh \
+  src/cmd_host.sh \
   src/cmd_watch.sh \
   src/cmd_compose.sh \
   src/cmd_whoami.sh \
+  src/task/dispatch.sh \
+  src/task/routing.sh \
+  src/task/crud.sh \
+  src/task/gate_evidence.sh \
+  src/task/status.sh \
+  src/task/delivery.sh \
+  src/task/loops.sh \
+  src/task/need.sh \
+  src/task/notify.sh \
+  src/task/inbox.sh \
+  src/task/answer.sh \
   src/cmd_task.sh \
   src/cmd_trace.sh \
   src/cmd_org.sh \
+  src/cmd_human.sh \
   src/cmd_ui.sh \
   src/cmd_hire.sh \
   src/cmd_project.sh \

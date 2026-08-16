@@ -73,7 +73,7 @@ extract_fn() { # <name>
   awk -v m="$1() {" 'substr($0,1,length(m))==m { on=1 } on { print } on && $0 == "}" { exit }' "$START"
 }
 HELPER=""
-for _fn in assert_cred_seeded cred_seed_breadcrumb_path cred_seed_failed cred_seed_ok cred_src_readable cred_seed_why; do
+for _fn in assert_cred_seeded cred_seed_breadcrumb_path cred_seed_breadcrumb_write cred_seed_failed cred_seed_ok cred_src_readable cred_seed_why; do
   _def="$(extract_fn "$_fn")"
   [[ -n "$_def" ]] || { echo "FAIL: could not extract $_fn from $START"; exit 1; }
   HELPER+="$_def"$'\n'
@@ -85,7 +85,7 @@ done
 assert_no_missing_fn() { # <label> <block>
   local label="$1" block="$2" missing=""
   local fn
-  for fn in $(grep -oE '\b(assert_cred_seeded|cred_seed_breadcrumb_path|cred_seed_failed|cred_seed_ok|cred_src_readable|cred_seed_why)\b' <<<"$block" | sort -u); do
+  for fn in $(grep -oE '\b(assert_cred_seeded|cred_seed_breadcrumb_path|cred_seed_breadcrumb_write|cred_seed_failed|cred_seed_ok|cred_src_readable|cred_seed_why)\b' <<<"$block" | sort -u); do
     grep -qE "^${fn}\(\) \{" <<<"$HELPER" || missing+=" $fn"
   done
   if [[ -n "$missing" ]]; then
@@ -149,6 +149,17 @@ if [[ $EUID -ne 0 ]]; then
   # unreadable shared one re-seeds nothing. Before this it also SAID nothing —
   # the agent kept running on a token no re-auth could ever replace, which is
   # the exact silent shape this block exists to kill.
+  #
+  # DIVE-3455: "announced" meant announced TO JOURNALD. `agent list`'s health rail
+  # and selfcheck_cred_reached_agent both read ~/.5dive-cred-seed-failed and
+  # NEITHER reads journald, so this branch stayed exactly as invisible as the bug
+  # DIVE-3442 fixed. Grade the FILE, not the stderr string — the stderr line was
+  # already there and the seat was still rendered healthy.
+  BC_AGY="$AGY_HOME/.5dive-cred-seed-failed"
+  rm -f "$BC_AGY"   # precondition, not decoration: a leftover from an earlier arm
+                    # would satisfy the assertion below without the code doing a thing
+  check "agy: no stale breadcrumb going in (the arm below is not pre-satisfied)" \
+        "$( [[ -e "$BC_AGY" ]] && echo yes )" ""
   chmod 0000 "$AGY_SHARED"
   out=$(run_block "$AGY_BLOCK" TYPE=antigravity HOME="$AGY_HOME" \
           PROFILE_STATE_DIR="$PROFILE" WORKDIR="$TMP")
@@ -156,7 +167,27 @@ if [[ $EUID -ne 0 ]]; then
         "$(cat "$LOCAL_AGY")" "ya29.rotated-agy-token"
   has "$out" 'may be STALE' \
       "agy: present-local + unreadable-shared is announced, not silent"
+  check "agy: stale-local case leaves the breadcrumb the health rail reads" \
+        "$( [[ -s "$BC_AGY" ]] && echo yes )" "yes"
+  has "$(cat "$BC_AGY" 2>/dev/null)" 'may be STALE' \
+      "agy: breadcrumb names the STALE fault, not just that something went wrong"
+  # STALE and UNAUTHENTICATED are different faults with different repairs (this
+  # seat is running; the other cannot start), and collapsing them is the failure
+  # mode cred_seed_why exists to prevent.
+  if grep -q 'UNAUTHENTICATED' "$BC_AGY" 2>/dev/null; then
+    echo "FAIL: agy: stale breadcrumb collapses STALE into UNAUTHENTICATED"; fail=1
+  else
+    echo "ok: agy: stale breadcrumb does not claim the seat is UNAUTHENTICATED"
+  fi
   chmod 0644 "$AGY_SHARED"
+  # ...and it must not outlive the fault: a breadcrumb nobody clears turns into a
+  # permanent red on a seat that is now seeding fine.
+  sleep 1
+  printf 'ya29.recovered-agy-token\n' > "$AGY_SHARED"
+  run_block "$AGY_BLOCK" TYPE=antigravity HOME="$AGY_HOME" \
+    PROFILE_STATE_DIR="$PROFILE" WORKDIR="$TMP" >/dev/null
+  check "agy: a successful re-seed clears the stale breadcrumb" \
+        "$( [[ -e "$BC_AGY" ]] && echo yes )" ""
 
   # ...and an UNTRAVERSABLE profile dir must not read as "no credential" —
   # unknown has to fail toward the alarm, never toward a false all-clear.
@@ -192,16 +223,26 @@ OC_BLOCK="$(extract_block openclaw)"
 assert_no_missing_fn "openclaw block" "$OC_BLOCK"
 
 PROFILE_OC="$TMP/profile-oc"
-OC_SHARED="$PROFILE_OC/.openclaw/agents/main/agent/auth-profiles.json"
+# DIVE-3489: the credential this block must seed is the sqlite auth STORE.
+# openclaw does not read auth-profiles.json at all, so seeding the JSON left the
+# agent booting UNAUTHENTICATED while this block reported cred_seed_ok. The
+# assertion is unchanged in intent — the credential reaches the seat on a plain
+# read with no sudo — only the file that IS the credential moved.
+OC_SHARED="$PROFILE_OC/.openclaw/agents/main/agent/openclaw-agent.sqlite"
+OC_SHARED_JSON="$PROFILE_OC/.openclaw/agents/main/agent/auth-profiles.json"
 mkdir -p "$(dirname "$OC_SHARED")"
 printf '{"token":"oc-valid"}\n' > "$OC_SHARED"
+printf '{"token":"oc-legacy"}\n' > "$OC_SHARED_JSON"
 OC_HOME="$TMP/home-oc"; mkdir -p "$OC_HOME"
 
 out=$(run_block "$OC_BLOCK" TYPE=openclaw HOME="$OC_HOME" \
         PROFILE_STATE_DIR="$PROFILE_OC" WORKDIR="$TMP")
-LOCAL_OC="$OC_HOME/.openclaw/agents/main/agent/auth-profiles.json"
-check "openclaw: auth-profiles.json seeded with sudo unavailable" \
+LOCAL_OC="$OC_HOME/.openclaw/agents/main/agent/openclaw-agent.sqlite"
+check "openclaw: auth store seeded with sudo unavailable" \
       "$( [[ -s "$LOCAL_OC" ]] && cat "$LOCAL_OC" )" '{"token":"oc-valid"}'
+check "openclaw: legacy auth-profiles.json still carried alongside the store" \
+      "$( [[ -s "$OC_HOME/.openclaw/agents/main/agent/auth-profiles.json" ]] && cat "$OC_HOME/.openclaw/agents/main/agent/auth-profiles.json" )" \
+      '{"token":"oc-legacy"}'
 
 if [[ $EUID -ne 0 ]]; then
   chmod 0000 "$OC_SHARED"

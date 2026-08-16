@@ -260,6 +260,7 @@ cp "$(dirname "$SCRIPT")/release-cut-baseline.sh" "$RG7/scripts/"
   printf '# Changelog\n' > CHANGELOG.md
   printf '## Unreleased — feat(a): alpha (DIVE-9201)\n\nA.\n' > changelog.d/DIVE-9201.md
   printf '## Unreleased — feat(b): beta (DIVE-9202)\n\nB.\n' > changelog.d/DIVE-9202.md
+  printf 'legacy prose with no release heading\n' > changelog.d/DIVE-9200.md
   git add -A; git commit -q -m 'main: two fragments'
 ) >/dev/null 2>&1
 # cut() — mirrors release-cut.yml: detach, fold against the derived baseline, then
@@ -284,8 +285,8 @@ grep -q 'DIVE-9201' <<<"$body1" && grep -q 'DIVE-9202' <<<"$body1" \
   || bad_t "first cut body" "$body1"
 # main keeps its fragments (DIVE-2247, no push to a protected branch) — the very
 # condition that made the repeat possible, asserted rather than assumed.
-[[ $(cd "$RG7" && git ls-tree --name-only main changelog.d/ | wc -l) -eq 2 ]] \
-  && ok_t "main still carries both fragments after the cut (the precondition holds)" \
+[[ $(cd "$RG7" && git ls-tree --name-only main changelog.d/ | wc -l) -eq 3 ]] \
+  && ok_t "main still carries both valid fragments after the cut (the precondition holds)" \
   || bad_t "main's fragments" "$(cd "$RG7" && git ls-tree --name-only main changelog.d/)"
 # ONE new fragment lands, then cut again.
 ( set -e; cd "$RG7"
@@ -315,6 +316,13 @@ if grep -qE 'DIVE-920[12]' <<<"$c2"; then
 else
   ok_t "second cut's entries are DISJOINT from the first's (acceptance 1)"
 fi
+# DIVE-3291: already-shipped VALID fragments are consumed from the next tag's
+# tree even though their prose is not folded again. The malformed control stays:
+# presence in the baseline cannot prove content that never folded was shipped.
+tag2_fragments=$(git -C "$RG7" ls-tree -r --name-only v0.1.1 -- changelog.d)
+[[ "$tag2_fragments" == "changelog.d/DIVE-9200.md" ]] \
+  && ok_t "second cut drops shipped fragments from the tag tree and preserves only malformed input (DIVE-3291)" \
+  || bad_t "second cut tag-tree fragment population" "$tag2_fragments"
 grep -q 'already shipped in a previous cut' "$TMP/cut.log" \
   && ok_t "the fold REPORTS the skips, so a future regression is visible in the cut log" \
   || bad_t "fold skipped nothing / said nothing on the second cut" "$(cat "$TMP/cut.log")"

@@ -191,9 +191,9 @@ selfc=$(mk olivia olivia todo olivia)
 # `task assign`/`task set-body`; a clause that points at a verb the dispatcher does
 # not have re-wedges the session exactly as before, with every assert above green.
 for verb in assign set-body; do
-  grep -qE "^[[:space:]]*(${verb}\|[a-z-]+|[a-z-]+\|${verb}|${verb})\)" "$SRC/cmd_task.sh" \
+  grep -qE "^[[:space:]]*(${verb}\|[a-z-]+|[a-z-]+\|${verb}|${verb})\)" "$SRC/cmd_task.sh" "$SRC"/task/*.sh \
     && ok_t "verb 'task ${verb}' named by the clause exists in the dispatcher" \
-    || bad_t "verb 'task ${verb}' named by the clause exists" "not in $SRC/cmd_task.sh"
+    || bad_t "verb 'task ${verb}' named by the clause exists" "not in $SRC/cmd_task.sh or $SRC/task/*.sh"
 done
 
 # A delivered task, woken for the verifier: assignee is olivia, not dev.

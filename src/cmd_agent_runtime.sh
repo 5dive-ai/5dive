@@ -1,3 +1,13 @@
+# DIVE-3318: `a2a_round_guard` and `a2a_rounds_report` live in src/lib/a2a_rounds.sh.
+# In the BUILT bundle that file is cat'd ahead of this one and this line is dead
+# code (build.sh's "lib/ helpers -> cmd_*" ordering). In the SPLIT tree it is
+# load-bearing: the unit harnesses source individual cmd_* files with a minimal
+# lib set, and without this an `agent send` path hits `a2a_round_guard: command
+# not found` and dies at rc=3 — which is what tests/agent_send_unconfirmed_unit.sh
+# caught. Same shape as src/cmd_task.sh's module loader.
+declare -F a2a_round_guard >/dev/null 2>&1 \
+  || . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/a2a_rounds.sh"
+
 # Shared: resolve a registry entry or die. Echo nothing on success; used for
 # presence checks in the lifecycle commands below.
 require_agent() {
@@ -1218,6 +1228,8 @@ cmd_deliver() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --id=*) msgid="${1#--id=}" ;;
+      # DIVE-3318: set by cmd_send when a notification rail re-execs into here.
+      --notify) _5DIVE_A2A_NOTIFY=1 ;;
       --)     shift; _pos+=("$@"); break ;;
       *)      _pos+=("$1") ;;
     esac
@@ -1248,6 +1260,16 @@ cmd_deliver() {
   # a registered agent. Mirrors auto_sender_from_sudo + the DIVE-1064 tier stamp.
   local s="${SUDO_USER#agent-}" _caller=""
   if [[ "${SUDO_USER:-}" == agent-* ]]; then _caller="$s"; else s="human"; fi
+
+  # DIVE-3318: the round cap on the SCOPED path. This is the branch every
+  # standard-isolation agent's `agent send` re-execs into, so a cap enforced only
+  # in cmd_send would be a cap on admins and root — i.e. on nobody who is being
+  # counted. `_caller` is the derived sudo caller, never a --from claim (_deliver
+  # accepts none), so the count cannot be spoofed onto another pair.
+  local _a2a_refusal
+  if ! _a2a_refusal="$(a2a_round_guard "$_caller" "$target" "$message")"; then
+    fail "$E_VALIDATION" "$_a2a_refusal"
+  fi
   # DIVE-2210: ALWAYS stamped, never conditional. A non-agent caller gets
   # tier=unknown:no-caller rather than a clean envelope with the field missing.
   local tier
@@ -1835,7 +1857,27 @@ cmd_send() {
     fail "$E_PERMISSION" "--wake needs admin/root; this caller holds only the a2a delivery grant — re-run via sudo, or file a task row"
   fi
   if a2a_needs_scoped "$name"; then
+    # DIVE-3318: sudo scrubs the environment, so `_5DIVE_A2A_NOTIFY` set by a
+    # notification rail would not survive this re-exec and cmd_deliver would grade
+    # a gate handoff as a conversational round — refusing the ping that tells a
+    # reviewer a gate exists. Carried across as an explicit flag instead. It is
+    # exactly as forgeable as the env var (any holder of the _deliver grant can
+    # pass it), and no more: this is a rail marker, not a privilege.
+    if [[ "${_5DIVE_A2A_NOTIFY:-0}" == "1" ]]; then
+      exec sudo -n /usr/local/bin/5dive agent _deliver --notify "$name" "$message"
+    fi
     exec sudo -n /usr/local/bin/5dive agent _deliver "$name" "$message"
+  fi
+
+  # DIVE-3318: the round cap. Placed AFTER the scoped-`_deliver` exec above, so a
+  # scoped caller is graded exactly once — by cmd_deliver, on the far side of the
+  # re-exec — and never counted twice for one send. Before require_agent only in
+  # the sense that it costs nothing; the refusal itself lands before a keystroke
+  # reaches the target's pane either way.
+  local _a2a_from _a2a_refusal
+  _a2a_from="$(_envelope_caller)"
+  if ! _a2a_refusal="$(a2a_round_guard "$_a2a_from" "$name" "$message")"; then
+    fail "$E_VALIDATION" "$_a2a_refusal"
   fi
 
   require_agent "$name"
@@ -2038,6 +2080,11 @@ cmd_ask() {
   local name="" message="" from="" from_set=0
   local reply_to_chat="" reply_to_msg=""
   local timeout=120 idle=5 poll=2 buf_lines=2000 allow_unfenced=0
+  # DIVE-3388 arm 2: how long to give the injected question to ECHO into the pane
+  # before declaring a delivery failure. A delivery that never lands buys nothing by
+  # waiting the full --timeout (measured: 180s waits, two of three were delivery
+  # failures), so this grace bounds it. 0 disables the fast-fail.
+  local deliver_grace=30
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -2050,6 +2097,7 @@ cmd_ask() {
       --allow-unfenced)   allow_unfenced=1 ;;
       --poll-secs=*)      poll="${1#--poll-secs=}" ;;
       --buffer-lines=*)   buf_lines="${1#--buffer-lines=}" ;;
+      --deliver-secs=*)   deliver_grace="${1#--deliver-secs=}" ;;
       --)                 shift; positional+=("$@"); break ;;
       -*)                 fail "$E_USAGE" "unknown flag: $1" ;;
       *)                  positional+=("$1") ;;
@@ -2060,7 +2108,7 @@ cmd_ask() {
     name="${positional[0]}"
     positional=("${positional[@]:1}")
   fi
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent ask <name> <text...> [--from=<sender>] [--reply-to-chat=<id> [--reply-to-msg=<id>]] [--timeout=120] [--idle-secs=5] [--poll-secs=2] [--allow-unfenced]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent ask <name> <text...> [--from=<sender>] [--reply-to-chat=<id> [--reply-to-msg=<id>]] [--timeout=120] [--idle-secs=5] [--poll-secs=2] [--deliver-secs=30] [--allow-unfenced]"
   # DIVE-1901: --allow-unfenced re-enables pane scraping, which is the path that
   # has fabricated every bad reply this ticket has caught. It exists for a seat
   # that genuinely cannot follow the reply-format instruction — never for a
@@ -2077,8 +2125,8 @@ cmd_ask() {
     message="${positional[*]}"
   fi
   [[ -n "$message" ]] || fail "$E_USAGE" "message is empty"
-  for n in "$timeout" "$idle" "$poll" "$buf_lines"; do
-    [[ "$n" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "timeout/idle/poll/buffer-lines must be positive integers"
+  for n in "$timeout" "$idle" "$poll" "$buf_lines" "$deliver_grace"; do
+    [[ "$n" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "timeout/idle/poll/buffer-lines/deliver-secs must be non-negative integers"
   done
   (( poll >= 1 )) || fail "$E_VALIDATION" "--poll-secs must be >= 1"
 
@@ -2308,6 +2356,19 @@ cmd_ask() {
     if [[ "$slice" != "$prev_slice" ]]; then
       last_change=$now
       prev_slice="$slice"
+    fi
+
+    # DIVE-3388 arm 2: FAST-FAIL a delivery failure instead of burning the full
+    # --timeout. On the DIRECT path the injected question echoes its `id=<msg_id>`
+    # marker into the pane the moment it lands; if the marker has not appeared by
+    # deliver_grace, the seat never received it and the rest of the wait buys
+    # nothing. Today this only surfaces as a bare timeout at the deadline (measured
+    # by lodar 2026-08-14: three 180s waits, two of them delivery failures). The
+    # SCOPED path is exempt: _capture returns only the post-marker reply window, so
+    # the question marker is not observable there. deliver_grace=0 disables this.
+    if (( ! use_scoped )) && (( deliver_grace > 0 )) && (( now - start >= deliver_grace )) \
+       && ! grep -qF "id=${msg_id}" "$acc_file" 2>/dev/null; then
+      fail "$E_TIMEOUT" "delivery failure: the injected question never appeared in agent '$name''s pane within ${deliver_grace}s (msg_id=${msg_id}) — the seat did not receive it, so waiting the full ${timeout}s would buy nothing. Check the agent is up and at an input prompt (5dive agent info ${name}), then retry. (--deliver-secs=0 disables this fast-fail)"
     fi
 
     if (( now - start >= timeout )); then

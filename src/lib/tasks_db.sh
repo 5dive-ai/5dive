@@ -165,7 +165,7 @@ require_sqlite() {
 # NOTE: projects/loop_runs/supervisor_events are ALSO defined inside gated
 # one-shot migration blocks in _tasks_db_migrate() below — edit both copies
 # together; tests/schema_sync_unit.sh fails CI if they diverge.
-_TASKS_SCHEMA_EPOCH='3098-1'   # DIVE-3098: +graded_at, +graded_by
+_TASKS_SCHEMA_EPOCH='3251-1'   # DIVE-3251: +first_started_at
 _tasks_schema() {
   cat <<'SQL'
 PRAGMA journal_mode=WAL;
@@ -233,6 +233,28 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- ALTER loop, so array-only lands a store that fails the DIVE-2197 assertion.
   graded_at TEXT,
   graded_by TEXT,
+  -- DIVE-3430: WHAT the grade was. graded_at above records only THAT someone
+  -- graded, and it is stamped by `verify`'s else-branch, which is entered on a FAIL
+  -- exactly as readily as on a `--no-done` pass — so a FAIL rendered `graded->merge`
+  -- with no reject token anywhere for DIVE-3428's conjunct to catch.
+  --   graded_verdict     'pass'|'fail', the LATEST verdict, written with a bare SET.
+  --   graded_verdict_at  when THAT verdict was recorded.
+  -- The two write rules differ ON PURPOSE and the pair is why that is safe:
+  -- graded_at/graded_by are COALESCE'd (first grade wins, DIVE-2477's rule) because
+  -- they answer WHO FIRST GRADED THIS AND WHEN — provenance, which a re-grade must
+  -- not rewrite. graded_verdict answers IS THE LATEST VERDICT STILL A PASS, which a
+  -- re-grade must rewrite or a verifier could never clear their own earlier FAIL.
+  -- Those are different questions, so a shared write rule is wrong for one of them
+  -- either way; graded_verdict_at makes the resulting skew READABLE instead of a
+  -- trap, so no reader has to assume the verdict and graded_at describe one event.
+  -- NULL verdict = graded before this column existed. The predicate reads NULL as
+  -- 'pass' deliberately: that is the pre-DIVE-3430 behaviour, so the migration is a
+  -- pure ALTER with NO backfill and no already-graded row silently leaves the board.
+  -- A backfill could not do better — it cannot know a legacy row's verdict, and one
+  -- keyed on graded_at would have to re-run on every migrate pass and would then
+  -- resurrect exactly the FAILs this column exists to record.
+  graded_verdict TEXT,
+  graded_verdict_at TEXT,
   -- DIVE-2615: why this gate has this tier — axis=pinned|type-default|secret-type
   -- |ask|title|title-fallback|none, plus ;term=<t> where a term is what fired.
   -- Declared HERE as well as in _TASKS_ADDITIVE_COLUMNS: a fresh store takes this
@@ -267,6 +289,18 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- _TASKS_ADDITIVE_COLUMNS: a fresh store takes this CREATE and never runs the
   -- ALTER loop, per the rule above.
   gate_mode TEXT,
+  -- DIVE-3342: the PERSON this gate belongs to — humans.id, stamped when the gate
+  -- is filed (or declared with `task need --owner=`). routed_reviewer above names
+  -- the AGENT who may clear it; this names the human who may, which until now was
+  -- never recorded anywhere and was re-derived at send time from whoever last
+  -- DM'd the bot. Recorded, not re-derived, for the same reason
+  -- route_provenance is (DIVE-3171): the org chart is agent-writable and a chart
+  -- edit between filing and paging would otherwise move a live gate to a
+  -- different person. NULL is a real third state — a gate filed before this
+  -- column, or one whose clearers no human owns — and it means "no person is
+  -- named", never "send it to everybody". Declared HERE as well as in
+  -- _TASKS_ADDITIVE_COLUMNS, per the rule above.
+  human_owner TEXT,
   parent_id   INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   started_at  TEXT,
@@ -364,6 +398,30 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- reaching it at all. Deliberately a separate column, not a status: the
   -- dedup decision itself is unchanged by this.
   last_skipped_at  TEXT,
+  -- DIVE-2272 (decision DIVE-2270). The PER-TEMPLATE overlap policy. NULL means
+  -- 'skip' -- every template that predates this column keeps today's behaviour
+  -- byte for byte, which is why this is a nullable add and not a NOT NULL
+  -- DEFAULT 'skip': a backfilled default and an unset value would then be
+  -- indistinguishable, and 'nobody has classified this template yet' is a state
+  -- the classification pass needs to be able to SEE.
+  --   skip  = an open instance suppresses the next slot (today's dedup).
+  --   spawn = fire anyway, UP TO overlap_bound open instances; past the bound,
+  --           skip AND stamp last_skipped_at, i.e. degrade to exactly the
+  --           now-legible skip behaviour rather than invent new alarm machinery.
+  -- WHY PER-TEMPLATE: skip-if-open is a claim about the VALUE of a pile-up, and
+  -- that value is class-dependent. For a fungible chore (disk reclaim, hygiene
+  -- sweep) three open instances are three copies of one job and dedup is right.
+  -- For a reading-of-the-present job (recap, version loop) Tuesday's instance
+  -- cannot be discharged by Wednesday's run, so three open instances mean nobody
+  -- has read the inbox in three days -- the pile-up IS the alarm the dedup
+  -- deletes. Only the template's author knows the class; the scheduler cannot
+  -- infer it.
+  on_overlap       TEXT,
+  -- The bound for on_overlap='spawn'. NULL means the built-in default (3).
+  -- A JUDGMENT CALL, NOT A MEASUREMENT: 3 open recaps is unmistakable to a human
+  -- and 300 is a different outage. Tunable per template precisely so the number
+  -- is never mistaken for something derived.
+  overlap_bound    INTEGER,
   -- DIVE-138 step 2. A materialized instance links back to the recurring
   -- template it was cloned from via from_template_id (NULL for templates and
   -- ordinary tasks); the materializer's skip-if-open dedup keys on it. NOT a FK
@@ -443,6 +501,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- DIVE-2403 ate 07-31..08-04. Both recovered cleanly downstream, which is exactly
   -- what kept the fault quiet.
   recurring_stall_pinged_at TEXT,
+  -- DIVE-3483: stranded_pinged_at throttles arm (a6) — the stranded-on-a-BUSY-seat
+  -- surface — to one ping per row (same shipped_flag_at pattern as the two above).
+  -- Its own column on purpose. Reusing handoff_stale_pinged_at would have shipped
+  -- this arm mostly dead, exactly as DIVE-2207 found when it was tempted to reuse
+  -- the same one: rows that already burned that stamp on a delivery would be
+  -- permanently silent here, and those are ordinary rows that can strand later.
+  -- Never cleared. A row is announced once in its life; the announcement says
+  -- "this is a lane problem", and repeating it at the same seat is precisely the
+  -- non-remedy the arm exists to point out.
+  stranded_pinged_at TEXT,
   -- DIVE-2853: recurring_stall_escalated_at throttles the SECOND rung — the one
   -- that changes hands — to once per instance. The first rung's notice goes to the
   -- row's assignee, i.e. to the party whose non-pickup IS the fault, so repeating it
@@ -453,6 +521,40 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- written reason so the template re-fires, and this column is what stops a
   -- reassignment from thrashing the row around the fleet tick after tick.
   recurring_stall_escalated_at TEXT,
+  -- DIVE-3218: nudge_escalated_at / nudge_parked_at throttle the two rungs of the
+  -- nudge-threshold ladder (heartbeat). They are stamped ONCE PER ROW, not per
+  -- wake: the ladder's job is to force a state change after N fruitless nudges,
+  -- and a rung that could re-fire every tick would escalate a row to urgent N
+  -- times over. Deliberately NOT cleared when the row is re-queued — the count
+  -- of sessions already burned on this row is a property of the row, not of its
+  -- current status, and re-arming the ladder on every requeue is how a reassign
+  -- turns into a thrash around the fleet (the DIVE-2853 lesson).
+  nudge_escalated_at TEXT,
+  -- DIVE-3218: the nudge COUNT at which rung 1 fired. Rung 2 keys on
+  -- nudge_escalated_n + N, never on 2*N recomputed from the current priority,
+  -- because rung 1's own escalation RAISES the band and a higher band has a
+  -- SMALLER N — so a row escalated at the high threshold of 16 is instantly past
+  -- an urgent 2N of 16 and both rungs fire on the same wake. Storing the count
+  -- makes rung 2 "one more full threshold of fruitless wakes AFTER we escalated",
+  -- which is what the ladder means and is immune to the band moving underneath it.
+  nudge_escalated_n INTEGER,
+  nudge_parked_at TEXT,
+  -- DIVE-2207: gate_answered_nudged_at throttles the POST-GATE-ANSWER nudge
+  -- (gap#2's second predicate) to once per row. It is a SEPARATE column from
+  -- handoff_stale_pinged_at on purpose, and reusing that one would have shipped
+  -- this fix dead: 30 rows fleet-wide had already burned handoff_stale_pinged_at
+  -- when this was written, INCLUDING DIVE-2146 (burned 2026-07-27 21:40), which is
+  -- the specimen the rail was written for. A throttle already spent by a different
+  -- rail is not a throttle, it is an exclusion.
+  -- WHY THE RAIL EXISTS: a delivered row blocked on a human gate is excluded from
+  -- the gap#2 sweep (DIVE-2196 — nagging there prescribes resolving the human's
+  -- gate by side effect). The instant that gate is ANSWERED the wait is back on the
+  -- verifier, but nothing re-arms: handoff_ack_at may already be stamped (any
+  -- verifier who ran `task start` before getting blocked stamped it), so the
+  -- original predicate can never fire again. Measured on the live board 2026-07-28:
+  -- 20 rows have entered that blind window, 17 graded within the hour, 1 took over
+  -- 24h. Low frequency, silent failure — which is the case for a rail, not against.
+  gate_answered_nudged_at TEXT,
   -- DIVE-891: risk-tiered gates (adopted design DIVE-861). tier is set when the
   -- gate is filed: 0 = auto-clear (rec applies immediately, digest line only),
   -- 1 = agent-clearable + 48h TTL auto-applies the recommendation, 2 = hard
@@ -566,7 +668,48 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- default" claim is never quietly false. NULL/0 for every task that got a real
   -- grader, opted out via --no-verify, or is trivial. Same integrity-invariant
   -- spirit as the council founder-excluded badge.
-  verify_unavailable      INTEGER
+  verify_unavailable      INTEGER,
+  -- DIVE-2730: the filer's EXPLICIT `--no-verify` at add time, set to 1 there and
+  -- NULL everywhere else. It exists because a decision and a default that produce
+  -- the same stored state ARE the same state: before this column, `--no-verify`
+  -- was a local shell var in `task add` that died with the process, so at
+  -- `task done` an explicit opt-out was byte-identical to a DIVE-969 auto-skipped
+  -- row (both verifier NULL, verify_unavailable NULL), so `task done` could not
+  -- NAME what it was overriding when DIVE-2719's UPGRADE arm re-attached a grader.
+  -- Distinct from verify_unavailable, which records that no distinct grader
+  -- EXISTED — this records that one was not WANTED.
+  -- IT IS A RECORD, NOT A CONTROL, and deliberately so: the upgrade still fires
+  -- on an opted-out row, because the flag is declared at FILE time and the blast
+  -- radius is measured at DELIVERY time, and a file-time sentence must not
+  -- pre-authorise closing a credentials diff nobody had written yet. What it buys
+  -- is that the override is stated instead of silent, and that the two NULLs stop
+  -- being one. Set only by `task add --no-verify`; cleared by
+  -- `task verifier <id> <agent>`, since an explicit attach supersedes the refusal.
+  verify_optout           INTEGER,
+  -- DIVE-3251: THE FIRST TIME REAL WORK STARTED ON THIS ROW, and the one clock in
+  -- this table that no nudge/reclaim path may touch. `started_at` is the CURRENT
+  -- claim's clock and the heartbeat ladder deliberately clears it on reclaim, "so
+  -- its age and the per-task nudge counter both restart cleanly"
+  -- (_hb_reclaim_to_todo, src/cmd_heartbeat.sh) — a real requirement, not a typo.
+  -- The defect was that one field was carrying BOTH meanings: resetting the age
+  -- also destroyed the only board-visible evidence that the work had ever
+  -- happened, so 58 rows fleet-wide read as never-started while carrying a
+  -- `task.started` ledger event (16 of them still open at filing time).
+  --
+  -- SO: TWO FIELDS. `started_at` = the resettable claim clock the ladder owns.
+  -- `first_started_at` = the durable record of first start, written once by
+  -- COALESCE at every start path (`task start` and the dispatcher claim) and
+  -- NEVER cleared by reclaim, handoff, or reassign. Read `started_at` to ask "is
+  -- a seat on this now"; read `first_started_at` to ask "did real work happen".
+  --
+  -- IT IS A LOWER BOUND ON AGE, NOT THE LAST START, for rows backfilled from the
+  -- ledger: the ledger's idem_key is constant per task (cmd_heartbeat.sh, the
+  -- task.started emit), so a reclaimed-and-reclaimed row recorded its FIRST claim
+  -- only. Going forward the reclaim emits its own `task.reclaimed` event, so
+  -- cycles become countable from the ledger for rows reclaimed after this ships.
+  -- Declared HERE as well as in _TASKS_ADDITIVE_COLUMNS, per the rule above: a
+  -- fresh store takes this CREATE and never runs the ALTER loop.
+  first_started_at        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_precedent ON tasks(need_type, ask_shape);
 CREATE INDEX IF NOT EXISTS idx_tasks_originated ON tasks(originated_by_objective);
@@ -584,6 +727,33 @@ CREATE TABLE IF NOT EXISTS agents_org (
   title       TEXT,
   updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- DIVE-3342: HUMANS as first-class records. agents_org above says who reports to
+-- whom; nothing said who the PEOPLE are. A person existed only as a numeric chat
+-- id inside one bot's access.json allowFrom, so gate routing could name an agent
+-- clearer but never a person, and which human a gate actually paged was decided
+-- by last-human-chat.json — whoever DM'd that bot most recently — fanning out to
+-- the whole allowlist when no pointer resolved. Rationale, the measured harm, and
+-- why ZERO rows must preserve the old delivery path exactly: src/cmd_human.sh.
+-- A row here is an IDENTITY, never a grant: a telegram_id is still only
+-- deliverable if the receiving bot's allowFrom contains it (enforced at the send
+-- site, where the bot is known). Keep these two definitions byte-identical to the
+-- copies in _tasks_db_migrate below (tests/schema_sync_unit.sh).
+CREATE TABLE IF NOT EXISTS humans (
+  id           TEXT PRIMARY KEY,
+  display_name TEXT,
+  telegram_id  TEXT,
+  buzz_npub    TEXT,
+  discord_id   TEXT,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS human_agents (
+  human_id TEXT NOT NULL REFERENCES humans(id) ON DELETE CASCADE,
+  agent    TEXT NOT NULL,
+  PRIMARY KEY (human_id, agent)
+);
+CREATE INDEX IF NOT EXISTS human_agents_agent_idx ON human_agents(agent);
 
 CREATE INDEX IF NOT EXISTS tasks_status_idx   ON tasks(status);
 CREATE INDEX IF NOT EXISTS tasks_assignee_idx ON tasks(assignee, status);
@@ -1197,6 +1367,15 @@ tasks_db_init() {
 # "<column> <type>"; existing rows backfill to NULL. Pure expand (no contract),
 # so old queries/rows remain readable after downgrade. project_key deliberately
 # omits REFERENCES here because sqlite rejects a non-NULL FK default on ADD.
+# DIVE-2272: the fleet-wide fallback bound for an on_overlap='spawn' template that
+# sets no overlap_bound of its own. A JUDGMENT CALL, NOT A MEASUREMENT — 3 open
+# recaps is unmistakable to a human and 300 is a different outage. Env-tunable and
+# per-template overridable precisely so the number is never read as derived.
+# Lives here, not in cmd_heartbeat.sh, so the materializer and `task ls --recurring`
+# read the SAME default (the DIVE-2055 no-disagreement rule for that table).
+TASKS_OVERLAP_BOUND_DEFAULT="${HEARTBEAT_OVERLAP_BOUND:-3}"
+[[ "$TASKS_OVERLAP_BOUND_DEFAULT" =~ ^[1-9][0-9]*$ ]] || TASKS_OVERLAP_BOUND_DEFAULT=3
+
 _TASKS_ADDITIVE_COLUMNS=(
   'result TEXT' 'need_type TEXT' 'ask TEXT' 'need_options TEXT' 'recommend TEXT'
   'need_answer TEXT' 'need_answered_at TEXT'
@@ -1210,6 +1389,9 @@ _TASKS_ADDITIVE_COLUMNS=(
   'iteration INTEGER' 'maker_agent TEXT' 'handoff_ack_at TEXT' 'task_budget TEXT'
   'handoff_delivered_at TEXT' 'handoff_stale_pinged_at TEXT' 'handoff_rejected_at TEXT'
   'recurring_stall_pinged_at TEXT' 'recurring_stall_escalated_at TEXT'
+  'stranded_pinged_at TEXT'
+  'gate_answered_nudged_at TEXT'
+  'nudge_escalated_at TEXT' 'nudge_escalated_n INTEGER' 'nudge_parked_at TEXT'
   'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT'
   'gate_filed_by TEXT'
   'secret_key TEXT' 'connector TEXT' 'secret_oob TEXT' 'human_nonce_hash TEXT'
@@ -1220,6 +1402,23 @@ _TASKS_ADDITIVE_COLUMNS=(
   'delivery_ref TEXT' 'delivered_at TEXT' 'delivery_ref_iteration INTEGER'
   'originated_by_objective INTEGER' 'originated_cycle INTEGER'
   'verify_unavailable INTEGER' 'last_skipped_at TEXT'
+  # DIVE-2730: the add-time `--no-verify`, persisted. Nullable — NULL is "the
+  # filer did not opt out", which is the truth for every pre-existing row, so the
+  # backfill is a no-op. See the CREATE TABLE comment for why an unpersisted
+  # refusal reads downstream as a default absence.
+  'verify_optout INTEGER'
+  # DIVE-3251: the durable first-start clock, split out of `started_at` so the
+  # reclaim ladder can keep restarting the age without destroying the evidence
+  # that work happened. Nullable — NULL means "this build never recorded it",
+  # which is a real third state and NOT a synonym for never-started; the
+  # migration below backfills it from the ledger where a start was recorded,
+  # and from started_at otherwise. See the CREATE TABLE comment.
+  'first_started_at TEXT'
+  # DIVE-2272: per-template overlap policy. Both NULLABLE on purpose -- NULL is
+  # 'skip' / 'the default bound', so the migration is a no-op for every existing
+  # template AND an unclassified template stays visibly unclassified. See the
+  # CREATE TABLE comment for why the pile-up's value is per-template.
+  'on_overlap TEXT' 'overlap_bound INTEGER'
   'human_evidence TEXT' 'derived_actor TEXT' 'floor_provenance TEXT'
   # DIVE-3171: the ROUTING axis's provenance, sibling to floor_provenance. See the
   # CREATE TABLE comment for the values and for why it is stored, not derived.
@@ -1231,8 +1430,15 @@ _TASKS_ADDITIVE_COLUMNS=(
   # purpose — the terminal-for-verifier predicate must not key on result TEXT,
   # which the MAKER's `task deliver --result=` also writes.
   'graded_at TEXT' 'graded_by TEXT'
+  # DIVE-3430: the VERDICT of that grade, and when the current verdict was recorded.
+  # See the CREATE TABLE comment for why these are bare-SET while graded_at is
+  # COALESCE'd, and why NULL must keep reading as a pass.
+  'graded_verdict TEXT' 'graded_verdict_at TEXT'
   # DIVE-2354: approve-to-send | confirm-after-send. See the CREATE TABLE comment.
   'gate_mode TEXT'
+  # DIVE-3342: humans.id of the person who may CLEAR this gate. See the CREATE
+  # TABLE comment — recorded at filing, never re-derived from bot traffic.
+  'human_owner TEXT'
 )
 
 # DIVE-3098 - TERMINAL FOR THE VERIFIER, as ONE SQL boolean expression.
@@ -1250,15 +1456,65 @@ _TASKS_ADDITIVE_COLUMNS=(
 #                              forged in prose.
 #   graded_by <> maker_agent - a self-verified close does not buy the exemption.
 #   delivery_ref             - a verdict with nothing to merge is not awaiting a merge.
+#   handoff_rejected_at      - DIVE-3428, below. A grade is not a LATCH.
+#   graded_verdict           - DIVE-3430, below. A grade is not a PASS.
 # status stays OPEN: terminal for the VERIFIER, non-terminal for the ROW.
 # NOT `readonly`: several harnesses and code paths source this lib twice, and a
 # readonly re-assignment errors on the second source — measured, it broke 8 arms of
 # tests/gate_route_delivery_unit.sh with a stderr line and nothing else. Every other
 # constant in this file (incl. _TASKS_SCHEMA_EPOCH) is a plain assignment for the
 # same reason; match the file.
+# DIVE-3428 — A GRADE IS NOT A LATCH, and until this conjunct existed the predicate
+# treated it as one: it asked "has a grade ever been recorded?" and never "is the
+# latest verdict still a pass?". Measured on DIVE-3315 — graded_at 2026-08-12 (quinn,
+# PASS), handoff_rejected_at 2026-08-16 (codex, FAIL) — the reject FOUR DAYS newer,
+# and both board branches still rendered `graded->merge:olivia`.
+#
+# NOT COSMETIC: the label is consumed as an INSTRUCTION. `_hb_loop_terminal_clause`
+# formats the same predicate into the /goal wrapper as "TERMINAL FOR THIS GOAL ...
+# Treat the goal as MET and stop", so a row with a live verifier FAIL and real
+# outstanding maker work told an agent to stop, and named the outstanding act as a
+# MERGE of a PR that must not be merged in its graded state.
+#
+# `<` AND NOT `<=`, WHICH THE ROW ASKED FOR — the tie is reachable and it is not a
+# rounding detail. graded_at is stamped by the `verify` else-branch, which is
+# `rc != 0 || no_done`, so a FAIL verify stamps it; a verifier who runs `task verify`
+# then `task reject` lands both stamps in the SAME second at datetime()'s one-second
+# resolution (the tie DIVE-2624 measured on this very column pair and solved with a
+# token instead of a clock). `<=` would hand that tie to the GRADE and reprint the
+# exact label this row exists to remove. The tie goes to the REJECT because the two
+# errors are not symmetric: a false `graded->merge` tells an agent to STOP on live
+# work, while a false plain status merely makes someone open the row.
+#
+# The OLDER-reject arm is still a real state and still renders graded->merge:
+# graded_at is COALESCE'd (first grade wins), so a reject that predates the
+# first-ever grade is a verifier who bounced and then graded a pass without a
+# re-delivery. handoff_rejected_at is a TOKEN spent (NULLed) by the next delivery,
+# so a live one means the maker has not answered the bounce yet.
+# DIVE-3430 — AND A GRADE IS NOT A PASS. DIVE-3428 closed the REJECT door; this is
+# the other one, and it needs no second actor at all. `graded_at` is stamped in
+# `cmd_task_verify`'s else-branch, and that else is the else of
+# `rc == 0 && ! no_done` — so a verifier who records a FAIL through `task verify` and
+# does NOT additionally `task reject` stamps graded_at, leaves handoff_rejected_at
+# NULL, and reproduces the DIVE-3315 render exactly with no token for the conjunct
+# above to see. Measured on a bound fixture before this line existed:
+#   task verify --cmd=false                                 -> graded_at set, reject NULL
+#   task verify --no-done --cmd=false --result="FAIL: ..."   -> graded_at set, reject NULL
+# both rendering graded->merge. Two doors, two tokens: handoff_rejected_at is the
+# `reject` verb's, graded_verdict is `verify`'s. `reject` deliberately does NOT write
+# graded_verdict — it has its own token, and writing both would make a bounce
+# unrecoverable by the pass-grade path DIVE-3428's older-reject arm depends on.
+#
+# NULL IS A PASS HERE, and that is the whole migration story. NULL means "graded
+# before this column existed", not "failed"; reading it as a fail would drop every
+# already-graded row off the board the moment this shipped — a silent regression on
+# live data, in the direction this predicate is least able to afford. See the CREATE
+# TABLE comment for why no backfill can do better than that.
 _TASKS_TFV_SQL="graded_at IS NOT NULL
        AND delivery_ref IS NOT NULL AND TRIM(delivery_ref) <> ''
        AND (maker_agent IS NULL OR graded_by IS NULL OR graded_by <> maker_agent)
+       AND (handoff_rejected_at IS NULL OR handoff_rejected_at < graded_at)
+       AND (graded_verdict IS NULL OR graded_verdict = 'pass')
        AND status NOT IN ('done','cancelled')"
 
 _TASKS_DB_GATE_COLUMNS=''
@@ -1413,6 +1669,52 @@ _tasks_db_migrate() {
     fi
   done
   _tasks_db_assert_required_columns
+
+  # DIVE-3251 — BACKFILL first_started_at. Runs AFTER the column loop above, on
+  # purpose: the sweep and the fix read the same ledger by the same predicate, so
+  # splitting them would run the sweep against a schema the fix is about to
+  # change. The sweep runs LAST.
+  #
+  # THE VALUE COMES FROM THE LEDGER, NEVER FROM now(). A `task start` re-run (or
+  # any datetime('now') here) would stamp today and mis-state the age a second
+  # time, in the same direction, while LOOKING repaired. MIN(ts) over this task's
+  # `task.started` events is the earliest recorded true start; started_at is used
+  # only where no ledger row exists. A row with neither is LEFT UNREPAIRED — an
+  # unrepaired NULL you can see beats a fabricated timestamp you cannot.
+  #
+  # STATUS IS NOT TOUCHED. `first_started_at` answers "did real work happen";
+  # `status` answers "is a seat on it now". The reclaim collapsed those two into
+  # one field and THAT IS THE DEFECT — repeating it here would assert a seat is
+  # working a row it may have genuinely dropped. It is also load-bearing for
+  # safety: the ladder's age query is filtered `status='in_progress'`, so an old
+  # timestamp on a `todo` row feeds nothing. Note this is ALSO why the backfill
+  # target is first_started_at and NOT started_at: `task start` COALESCEs
+  # started_at, so a backfilled old started_at would survive the next claim and
+  # the row would arrive at rule (c) instantly ancient — the repair would trigger
+  # the bug it repairs, on the exact rows it just repaired.
+  #
+  # Gated on a cheap EXISTS so it takes no write lock on the common path, and
+  # idempotent by construction (it only ever fills a NULL).
+  local _fsa_todo
+  _fsa_todo=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM tasks t
+      WHERE t.first_started_at IS NULL
+        AND (COALESCE(t.started_at,'') <> ''
+             OR EXISTS (SELECT 1 FROM lifecycle_events e
+                         WHERE e.task_id=t.id AND e.kind='task.started'))
+      LIMIT 1;" 2>/dev/null) || _fsa_todo=""
+  if [[ "$_fsa_todo" == "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+      "UPDATE tasks SET first_started_at = COALESCE(
+           (SELECT MIN(e.ts) FROM lifecycle_events e
+             WHERE e.task_id=tasks.id AND e.kind='task.started'),
+           NULLIF(started_at,''))
+        WHERE first_started_at IS NULL
+          AND (COALESCE(started_at,'') <> ''
+               OR EXISTS (SELECT 1 FROM lifecycle_events e
+                           WHERE e.task_id=tasks.id AND e.kind='task.started'));" \
+      >/dev/null 2>&1 || true
+  fi
 
   # OSS-11 precedent-lookup index (idempotent; harmless if the columns just
   # backfilled to NULL above — an all-NULL ask_shape simply never matches).
@@ -1918,6 +2220,38 @@ MIG
         "ALTER TABLE objectives ADD COLUMN run_mode TEXT NOT NULL DEFAULT 'live';" >/dev/null 2>&1 || true
     fi
   fi
+  # DIVE-3342 humans + human_agents for existing stores. Guarded on the table it
+  # creates (the DIVE-1922 lesson: nesting it under another table's absence check
+  # means it never runs on any live box and the feature is a silent no-op that
+  # looks exactly like "nobody has been added yet"). Two brand-new tables, never
+  # referenced by tasks/projects, so creating them cannot touch the queue — and
+  # they start EMPTY, which is deliberately load-bearing here: an empty registry
+  # is the signal that gate delivery keeps its pre-DIVE-3342 behaviour, so this
+  # migration changes NOTHING about how any existing box pages its human until
+  # someone runs `5dive human add`. Keep both definitions byte-identical to the
+  # copies in _tasks_schema above (tests/schema_sync_unit.sh).
+  local has_humans
+  has_humans=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='humans' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_humans" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" <<'MIG' >/dev/null 2>&1 || true
+CREATE TABLE IF NOT EXISTS humans (
+  id           TEXT PRIMARY KEY,
+  display_name TEXT,
+  telegram_id  TEXT,
+  buzz_npub    TEXT,
+  discord_id   TEXT,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS human_agents (
+  human_id TEXT NOT NULL REFERENCES humans(id) ON DELETE CASCADE,
+  agent    TEXT NOT NULL,
+  PRIMARY KEY (human_id, agent)
+);
+CREATE INDEX IF NOT EXISTS human_agents_agent_idx ON human_agents(agent);
+MIG
+  fi
   _tasks_db_stamp_schema_epoch
 }
 
@@ -1996,6 +2330,44 @@ resolve_task_id() {
   [[ -n "$found" ]] || fail "$E_NOT_FOUND" "no such task: $ref"
   RESOLVED_TASK_ID="$found"
   RESOLVED_TASK_IDENT=$(db "SELECT ident FROM tasks WHERE id=${found};")
+}
+
+# Resolve a task ref for a PARENT EDGE, refusing a bare number whose row carries
+# a different ident number. DIVE-3275. Lives beside resolve_task_id() because it
+# is a statement about that function's two number spaces, not about any one verb.
+#
+# resolve_task_id() branches on argument SHAPE: `^[0-9]+$` is the global row id,
+# `^[A-Za-z]+-[0-9]+$` is the ident. THE TWO SPACES HAVE DIVERGED — measured on
+# the live store 2026-08-12: DIVE-2895 is row id 3082, and row id 2895 is
+# DIVE-2708, a cancelled row from another month. So a bare number is a VALID id
+# naming the WRONG row, with no error: that is how DIVE-3273 was filed under
+# DIVE-2708, and `task add`'s own `--parent=<id>` help text is what made the bare
+# form look intended.
+#
+# Why this guard is stricter than the rest of the CLI's ref handling, rather than
+# resolve_task_id() itself being tightened: a wrong ref elsewhere shows you the
+# wrong row and you notice. A wrong PARENT is invisible (the edge renders on a
+# row nobody is looking at) and `parent_id INTEGER REFERENCES tasks(id) ON DELETE
+# CASCADE` silently arms the child's deletion with it. Tightening every caller of
+# resolve_task_id() would be a much larger behaviour change for cases that are
+# self-revealing.
+#
+# <role> names the argument in the refusal ("the parent", "the task to re-parent")
+# so a two-argument verb says WHICH one was wrong.
+_task_resolve_ref_strict() {
+  local ref="$1" role="$2"
+  resolve_task_id "$ref"
+  [[ "$ref" =~ ^[0-9]+$ ]] || return 0   # the ident form is the quiet path
+  local title; title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${RESOLVED_TASK_ID};")
+  local ident_number="${RESOLVED_TASK_IDENT##*-}"
+  if [[ "$ident_number" != "$ref" ]]; then
+    fail "$E_VALIDATION" "'$ref' as $role is the global row id, which resolves to ${RESOLVED_TASK_IDENT} (\"${title}\") — not to an ident numbered $ref. The two number spaces diverged; name the row you mean by IDENT: ${RESOLVED_TASK_IDENT} (or DIVE-${ref}, if that is what you meant)."
+  fi
+  # It agrees TODAY. That is a coincidence of this row's history, not a property
+  # of the argument form, so it still warns — and the ident form warns about
+  # nothing, which is what keeps this warning worth reading.
+  warn "$role was given as the bare number $ref, which resolved to ${RESOLVED_TASK_IDENT} (\"${title}\"). Prefer the ident form — a bare number is a global row id, not an ident."
+  return 0
 }
 
 # Resolve a known numeric row id to its display ident (DIVE-484). Used by call

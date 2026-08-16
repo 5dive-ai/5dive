@@ -478,6 +478,16 @@ JOURNALD
   chmod 755 "$BIN_DIR/5dive-refresh-plugins.sh"
   ok "5dive-refresh-plugins.sh → $BIN_DIR/5dive-refresh-plugins.sh"
 
+  # Fork-plugin staging (DIVE-3269) — the refresh helper above serves the CLAUDE
+  # lineage only; the codex/grok/agy/pi/opencode plugins load a staged copy under
+  # /usr/local/lib/5dive that nothing wrote until this script existed. It is
+  # fetched HERE, beside its caller, because a delivery mechanism that ships one
+  # box-half is the defect it fixes: refresh-plugins degrades to a WARN when this
+  # file is absent, so a missed install line would read as "no forks changed".
+  curl -fsSL "$REPO/5dive-stage-fork-plugins.sh" -o "$BIN_DIR/5dive-stage-fork-plugins.sh"
+  chmod 755 "$BIN_DIR/5dive-stage-fork-plugins.sh"
+  ok "5dive-stage-fork-plugins.sh → $BIN_DIR/5dive-stage-fork-plugins.sh"
+
   # Skills backfill — brings existing agents up to the current default skill
   # set (new defaults like openagent, DIVE-658). The daily update cron runs it
   # right after the plugin refresh, before agents restart.

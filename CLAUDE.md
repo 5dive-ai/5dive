@@ -176,4 +176,5 @@ To denylist a new identifier, add its hash (never the plaintext) — see the hea
 of `.github/pii-denylist.txt`.
 
 > Exception: the commit **author** email `markounik@gmail.com` is intentionally
-> public (required for the Vercel team check) and is out of scope.
+> public (it is the pinned commit-author identity — a readable authorship
+> trail, NOT a deploy gate; measured, DIVE-3113) and is out of scope.
