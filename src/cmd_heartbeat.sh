@@ -4095,9 +4095,16 @@ _hb_poller_liveness_sweep() {
 # tick instead of never. Single-threaded (the tick is one host-cron process), so
 # no claim-lock is needed; isolated by the caller (|| _hb_log) like every sweep.
 _hb_objective_reconcile() {
+  # DIVE-2512: a RETIRED objective is excluded. Reconcile pulls a late planner diff
+  # and re-drives validate -> gate/materialize, so a straggler cycle on an objective
+  # somebody retired would ORIGINATE TASKS for a loop that has been shut down — the
+  # one place the tombstone has to reach outside cmd_objective.sh, because retiring
+  # cannot un-file an in-flight cycle. Not 'status=active': a PAUSED objective's late
+  # diff still materializes, which is the pre-existing behaviour and is correct
+  # (paused is 'stopped for now', retired is 'decided').
   local rows; rows=$(db "SELECT oc.id||'|'||oc.objective_id||'|'||oc.cycle_no||'|'||COALESCE(oc.planner_task_id,'')||'|'||COALESCE(oc.planner_loop_id,'')||'|'||o.name||'|'||COALESCE(o.planner,'')
                          FROM objective_cycles oc JOIN objectives o ON o.id=oc.objective_id
-                         WHERE oc.outcome='awaiting_planner';" 2>/dev/null)
+                         WHERE oc.outcome='awaiting_planner' AND o.status <> 'retired';" 2>/dev/null)
   [[ -n "$rows" ]] || return 0
   local line
   while IFS='|' read -r row_id obj_id cyc tid lid oname planner; do
