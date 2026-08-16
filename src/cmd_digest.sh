@@ -202,6 +202,16 @@ cmd_digest() {
   _digest_run usage --json >"$tmpd/usage.json" 2>/dev/null || _digest_usage_unavailable >"$tmpd/usage.json"
   [ -s "$tmpd/usage.json" ] || _digest_usage_unavailable >"$tmpd/usage.json"
   _digest_run heartbeat ls >"$tmpd/hb.txt" 2>/dev/null || : >"$tmpd/hb.txt"
+  # DIVE-3501: seats whose ENTIRE runnable queue is tier-guard held. This is the
+  # ONLY surface for that state — the rows read `todo`, the unit reads `active`,
+  # and the guard's own trace is a stderr line in /var/log/5dive-heartbeat.log
+  # that nobody reads (7865 of them by 2026-08-16, while dev2 sat stranded for
+  # six days). The digest is the surface that comes TO a lead on a cadence rather
+  # than one they have to already suspect a problem to open. Breach-only: the
+  # source emits an empty `seats` when nothing is stranded and the block is
+  # omitted entirely. Stateless — see cmd_heartbeat_held; nothing here counts ticks.
+  _digest_run heartbeat held --json >"$tmpd/held.json" 2>/dev/null || echo '{"data":{"seats":[]}}' >"$tmpd/held.json"
+  [ -s "$tmpd/held.json" ] || echo '{"data":{"seats":[]}}' >"$tmpd/held.json"
   # DIVE-972: per-loop token burn (cost side of the loop control window). --all
   # so a loop that finished (done/escalated/killed) in the window still reports
   # its final burn, not just the currently-running set.
@@ -259,7 +269,7 @@ cmd_digest() {
 
   DIGEST_TASKS_F="$tmpd/tasks.json" DIGEST_USAGE_F="$tmpd/usage.json" DIGEST_HB_F="$tmpd/hb.txt" \
   DIGEST_LOOPS_F="$tmpd/loops.json" DIGEST_SUP_F="$tmpd/sup.json" DIGEST_OBJ_F="$tmpd/obj.json" \
-  DIGEST_UPDATE_F="$tmpd/update.json" \
+  DIGEST_UPDATE_F="$tmpd/update.json" DIGEST_HELD_F="$tmpd/held.json" \
   DIGEST_WINDOW="$window" DIGEST_JSON="$as_json" python3 - >"$tmpd/out.txt" <<'PY'
 import os, json, time, datetime as dt
 
@@ -442,6 +452,12 @@ for ln in hb.splitlines()[1:]:
     cols = ln.split()
     if len(cols) >= 4 and cols[1] == "on" and cols[3] == "no":
         stale.append(cols[0])
+
+# DIVE-3501: tier-guard stranded seats. Breach-only — an empty list means no seat
+# is stranded, and the rendered block is omitted rather than printing a reassuring
+# "0 stranded" line every day (a monitor with a daily all-clear stops being read).
+held_data = load("DIGEST_HELD_F", {"seats": []})
+held_seats = held_data.get("seats", []) if isinstance(held_data, dict) else []
 
 # DIVE-972: per-loop token burn. loops[].tokens is the live spend; a loop whose
 # spend has reached its ceiling was halted (advisory ceiling is now enforced).
@@ -663,7 +679,10 @@ if as_json:
         "health": {"stale": stale, "hot": [h["name"] for h in hot],
                    # DIVE-1937: `hot` is only a claim about what was READ. A
                    # consumer must not read an empty list as "nobody is hot".
-                   "hotCoverage": "complete" if usage_complete else "partial"},
+                   "hotCoverage": "complete" if usage_complete else "partial",
+                   # DIVE-3501: [] means measured-and-none, not unmeasured — the
+                   # predicate is a pure query over tasks + the registry.
+                   "tierHeldSeats": held_seats},
         "loops": {"total": loops_total, "capped": len(loops_capped), "byLoop": loops_burn},
         "stuck": {"mttuSec": mttu_sec, "episodes": len(in_window),
                   "openStuck": len(open_stuck), "byCause": mttu_by_cause},
@@ -818,6 +837,16 @@ else:
                    ". Until a caller that can write it runs, a frozen fleet reads here as silence.")
     if stale:
         out.append("\U0001F634 Heartbeat stale: " + ", ".join(stale))
+    # DIVE-3501: placed with the other as-of-now health readings and BEFORE the
+    # "Fleet healthy" line, for the same reason the freeze alarm is — that line
+    # is about heartbeats and rate limits and will happily say healthy while a
+    # seat has had zero runnable work for six days. The two have to read together.
+    for hs in held_seats:
+        ids = ", ".join(hs.get("idents") or []) or "no idents recorded"
+        out.append(f"\U0001F6D1 {hs.get('agent')} is STRANDED — all {hs.get('heldCount')} "
+                   f"runnable row(s) held by the tier guard, idle {hs.get('stalledHours')}h: {ids}. "
+                   f"Exit: 5dive task assign <id> <equal-or-higher-tier agent>, or "
+                   f"5dive heartbeat wake-task {hs.get('agent')} <task_id>.")
     if not hot and not stale:
         # "no rate-limit pressure" is a claim about every agent. It may only be
         # made when every agent was actually read (DIVE-1937).
