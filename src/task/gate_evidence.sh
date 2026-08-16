@@ -541,6 +541,37 @@ _gate_anon_gh() {
 # tell a DEAD call apart from a successful empty one — see the contract below.
 _GATE_GH_LAST_ERR=""
 
+# DIVE-3496 (iteration 2) — THE SUBSHELL SINK, and why a second variable is the
+# fix rather than more care.
+#
+# `_GATE_GH_LAST_ERR` is a plain global, so it only travels back to a caller that
+# runs the callee IN ITS OWN SHELL. The escalation below does not: it CAPTURES the
+# credential-free rails' stdout, `_esc_out=$(_gate_gh_nocred ...)`, which runs them
+# in a subshell, and every assignment they make dies with it. `_gate_gh` then
+# resets `_GATE_GH_LAST_ERR` to "" at entry, so the double-blind diagnostic
+# interpolated the EMPTY STRING and the reader got "...could not answer: " with the
+# half that says WHY the fallback failed silently dropped. Found by main in review
+# of #673, confirmed empirically by quinn by instrumenting the harness — and the
+# harness stayed 25/0 through it, because both of T4's arms match literals that
+# live in the assignment itself and survive any value of the interpolation.
+#
+# So the error travels back through a FILE the caller names. A caller that captures
+# stdout sets `_GATE_GH_NOCRED_ERRF` to a path and reads it back after; a caller
+# that does not (the no-token path, which runs `_gate_gh_nocred` in this shell)
+# leaves it empty and keeps using the variable exactly as before. Empty means "no
+# sink", never "no error" — the variable is still authoritative in-shell.
+_GATE_GH_NOCRED_ERRF=""
+
+# Publish the current `_GATE_GH_LAST_ERR` to a caller-named sink, if there is one.
+# Never fails: a diagnostic that can break the call it is describing is worse than
+# a missing diagnostic.
+_gate_gh_nocred_publish() {
+  local _sink="${1:-}"
+  [[ -n "$_sink" ]] || return 0
+  printf '%s' "$_GATE_GH_LAST_ERR" >"$_sink" 2>/dev/null || true
+  return 0
+}
+
 # DIVE-2705 — THE CONTRACT, and why it needed both halves.
 #
 # This used to end `|| true; return 0` on BOTH rails, and swallow stderr on both.
@@ -570,6 +601,9 @@ _GATE_GH_LAST_ERR=""
 _gate_gh_nocred() {
   local secs="${1:-0}"; shift
   local _rc=0 _errf
+  # DIVE-3496 it.2: read the sink ONCE, at entry, so a caller that captures our
+  # stdout still gets the diagnostic back across the subshell boundary.
+  local _sink="${_GATE_GH_NOCRED_ERRF:-}"
   _errf="${TMPDIR:-/tmp}/.5dive-gate-gh-nocred-err.$$"
   # No rail at all is NOT "the query ran and found nothing" — there was nothing
   # to run it with. Returning 0 here made an unusable bot rail count as a
@@ -582,11 +616,13 @@ _gate_gh_nocred() {
     local _anon_out=""
     if _anon_out=$(_gate_anon_gh "$secs" "$@"); then
       _GATE_GH_LAST_ERR=""
+      _gate_gh_nocred_publish "$_sink"
       rm -f "$_errf" 2>/dev/null || true
       printf '%s' "$_anon_out"
       return 0
     fi
     _GATE_GH_LAST_ERR="no gh rail: no token, the gate bot is not usable here, and the anonymous rail could not answer (private repo, or a query it does not serve)"
+    _gate_gh_nocred_publish "$_sink"
     rm -f "$_errf" 2>/dev/null || true
     printf ''
     return 1
@@ -594,6 +630,7 @@ _gate_gh_nocred() {
   [[ "$secs" == "0" ]] && secs=10
   printf '%s\0' "$@" | timeout "${secs}s" sudo -n "$_GATE_GH_DO" _gh_do 2>"$_errf" || _rc=$?
   [[ -s "$_errf" ]] && _GATE_GH_LAST_ERR="$(cat "$_errf" 2>/dev/null || printf '')"
+  _gate_gh_nocred_publish "$_sink"
   rm -f "$_errf" 2>/dev/null || true
   return "$_rc"
 }
@@ -619,6 +656,7 @@ _gate_gh() {
   local -a bound=()
   local _rc=0 _errf
   _GATE_GH_LAST_ERR=""
+  _GATE_GH_NOCRED_ERRF=""   # DIVE-3496 it.2: only the escalation below sets a sink
   _errf="${TMPDIR:-/tmp}/.5dive-gate-gh-err.$$"
   if [[ -n "$tok" ]]; then
     [[ "$secs" != "0" ]] && bound=(timeout "${secs}s")
@@ -666,15 +704,23 @@ _gate_gh() {
     # escalation's output cannot be appended to a partial one.
     if (( _rc != 0 )) && _gate_gh_blind_err "$_errf"; then
       local _blind; _blind="$(head -n1 "$_errf" 2>/dev/null || printf '')"
-      local _esc_out="" _esc_rc=0
+      local _esc_out="" _esc_rc=0 _esc_err="" _escerrf
+      # DIVE-3496 it.2: the capture below runs the callee in a SUBSHELL, so its
+      # `_GATE_GH_LAST_ERR` cannot travel back — name a sink file and read that.
+      _escerrf="${TMPDIR:-/tmp}/.5dive-gate-gh-esc-err.$$"
+      : >"$_escerrf" 2>/dev/null || true
+      _GATE_GH_NOCRED_ERRF="$_escerrf"
       _esc_out=$(_gate_gh_nocred "$secs" "$@") || _esc_rc=$?
+      _GATE_GH_NOCRED_ERRF=""
+      [[ -s "$_escerrf" ]] && _esc_err="$(cat "$_escerrf" 2>/dev/null || printf '')"
+      rm -f "$_escerrf" 2>/dev/null || true
       if (( _esc_rc == 0 )); then
         _GATE_GH_LAST_ERR=""
         rm -f "$_errf" 2>/dev/null || true
         printf '%s' "$_esc_out"
         return 0
       fi
-      _GATE_GH_LAST_ERR="the caller's own credential cannot see this repository (${_blind}); the credential-free rails were tried too and could not answer: ${_GATE_GH_LAST_ERR}"
+      _GATE_GH_LAST_ERR="the caller's own credential cannot see this repository (${_blind}); the credential-free rails were tried too and could not answer: ${_esc_err}"
       rm -f "$_errf" 2>/dev/null || true
       printf ''
       return "$_rc"

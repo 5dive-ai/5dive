@@ -5,6 +5,69 @@
 # Concatenated into the single-file bundle by build.sh, and sourced by
 # src/cmd_task.sh when the split tree is used (tests source src/cmd_task.sh).
 # Function definitions only — never execute this file directly.
+
+# DIVE-3496 (iteration 2) — THE DELIVERY-TIME TRIPWIRE. main2's original ask.
+#
+# WHAT IT BUYS. The merge gate reads the bound PR with the CLOSING seat's rail
+# selection, one verb later, in someone else's session, after the maker has moved
+# on. When that read comes back blind the gate cannot tell "cannot see" from "not
+# merged" — that ambiguity is correct and deliberate, it is what makes the gate
+# fail closed — but it means the VERIFIER pays the whole discovery cost, cold.
+# Measured: on DIVE-2192 main2 spent two failed closes, an
+# `/installation/repositories` enumeration, a `gh auth status` check and a wiki
+# compile to reach "I am permanently unable to close this row", then still needed
+# a round-trip to learn the designed exit existed
+# (community/wiki/a-grader-that-cannot-read-the-repo-cannot-close-the-row.md).
+# `task deliver --pr=` is the moment where that costs one read-only query instead.
+#
+# WHAT #673 CHANGED ABOUT ITS VALUE: less, but not zero. Now that `_gate_gh`
+# escalates to the credential-free rails, the population that trips this shrinks
+# to refs NO rail can see — a genuinely private third-party repo, a deleted PR, a
+# typo'd URL. Those still exist and still land on the verifier.
+#
+# IT ASSERTS READ REACH, NOT OWNERSHIP, and that is the easy thing to get wrong.
+# `_gate_our_owners`/`_gate_repo_slugs` is keyed on WHO OWNS the repo; `lodar/*`
+# is in that list and was unreadable from every verifier seat for months. The two
+# sets are unrelated and only the first predicts nothing about whether the close
+# will succeed. So the probe runs the gate's OWN resolution — `_gate_gh_token`,
+# then `_gate_gh` — against the ref that was just bound, and believes only that.
+#
+# WARN-ONLY, DELIBERATELY. A delivery must not be refused because GitHub was
+# briefly unreachable. That is the same fail-open/fail-closed question the gate
+# answers one verb later, and the gate is the right place to answer it: refusing
+# here would turn a transient network fault into a blocked handoff, on the one
+# verb whose entire job is to get finished work off the maker's desk. Every exit
+# from this function is 0.
+_task_deliver_reach_probe() {
+  local ident="$1" pr="$2"
+  # Escape hatch for harnesses and offline runs. Not a policy knob: the gate still
+  # does its own read at close, so silencing this cannot let anything through.
+  [[ "${FIVE_DELIVER_NO_REACH_PROBE:-0}" == "1" ]] && return 0
+  # The gate lives in gate_evidence.sh; in a tree where it was not sourced there
+  # is nothing to predict with, and guessing would be worse than staying quiet.
+  declare -F _gate_gh       >/dev/null 2>&1 || return 0
+  declare -F _gate_gh_token >/dev/null 2>&1 || return 0
+  local _tok=""
+  command -v gh >/dev/null 2>&1 && _tok=$(_gate_gh_token 2>/dev/null || printf '')
+  # THE SAME TRAP THIS ITERATION IS FIXING ONE LEVEL DOWN, so it is spelled out
+  # rather than avoided by luck: `_state=$(_gate_gh ...)` would run the gate in a
+  # SUBSHELL and the `_GATE_GH_LAST_ERR` it sets there would die with it, leaving
+  # the warning below with no reason attached. Capture through a file instead —
+  # the same technique the gate harnesses use, for the same reason.
+  local _state="" _probef
+  _probef="${TMPDIR:-/tmp}/.5dive-deliver-reach.$$"
+  _gate_gh "$_tok" 15 pr view "$pr" --json state -q '.state' >"$_probef" 2>/dev/null || true
+  _state="$(cat "$_probef" 2>/dev/null || printf '')"
+  rm -f "$_probef" 2>/dev/null || true
+  # A state — ANY state, including OPEN — means the credential can SEE the ref.
+  # This probe is not asking whether the PR merged; that is the gate's question at
+  # close and it would be wrong to answer it here, since a delivery is normally
+  # bound BEFORE the merge.
+  [[ -n "$_state" ]] && return 0
+  warn "$ident: the merge gate's own credential cannot READ the delivery ref you just bound (${pr}). The delivery stands — this is a warning, not a refusal — but at 'task done' this reads as an unresolved merge state, which is indistinguishable from 'not merged', and your verifier meets it cold.${_GATE_GH_LAST_ERR:+ Rail says: ${_GATE_GH_LAST_ERR}.} If it is still unreadable then, the designed exit is a proof that needs no GitHub: 5dive task verify ${ident} --cmd='git -C <repo> merge-base --is-ancestor <merge-sha> origin/main' (DIVE-3496)."
+  return 0
+}
+
 cmd_task_deliver() {
   tasks_db_init
   local task="" pr="" result="" want_result=0 result_src=""
@@ -76,6 +139,10 @@ cmd_task_deliver() {
   # demands, so recording it cannot weaken the gate — the stamp still only ever
   # equals an iteration at which a PR was actually named.
   db "UPDATE tasks SET delivery_ref=$(sqlq "$pr"), delivered_at=datetime('now'), delivery_ref_iteration=COALESCE(iteration,0) WHERE id=${id};"
+  # DIVE-3496 (iteration 2): the ref is now bound — assert the gate's credential
+  # can SEE it, here, rather than leaving the verifier to discover it at close.
+  # Runs AFTER the write on purpose: the delivery is not conditional on it.
+  _task_deliver_reach_probe "$ident" "$pr"
   local _vfier _asignee
   _vfier=$(db "SELECT COALESCE(verifier,'')  FROM tasks WHERE id=${id};")
   _asignee=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
