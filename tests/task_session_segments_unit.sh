@@ -340,6 +340,62 @@ r=$(new "$tZ"); rcZ="${r%%:*}"; fZ="${r#*:}"
   || bad_t "segmentless row did not read NOT-REACHED" "rc=$rcZ out=$fZ"
 
 # ============================================================================
+# ARM 5b — DIVE-3374. THE SHARED SECOND. Two rows worked in sequence in one
+# session, where row one's `done` and row two's `start` land in the SAME second,
+# and a turn lands on exactly that instant.
+#
+# This is the seam between the two predicates over the same interval. The overlap
+# detector is STRICT, so [b, b+500] and [b+500, b+1000] are legally sequential
+# and both must still measure (arm 5b-i). The clip therefore has to agree that
+# the boundary instant is in exactly ONE of them — with `<=` on both ends it was
+# in both, and the boundary turn was charged TWICE.
+#
+# Why the 21 arms above cannot see it: every one of them places its turns
+# strictly INSIDE a segment, which is what you write when the arms and the code
+# come from the same mental model. The boundary is the one timestamp nobody
+# chose. So this arm places one there on purpose, and grades the sum of the parts
+# against the corpus — the direction the error runs (it OVERSTATES) is exactly
+# the direction one addition can falsify.
+#
+# Compiled: community/wiki/two-inclusive-windows-that-touch-double-charge-the-shared-second.md
+# ============================================================================
+mkhome segB; dirB="$HDIR"
+SIDB="88888888-aaaa-4bbb-8ccc-888888888888"
+bb=$((now-30000))
+turn "$dirB/$SIDB.jsonl" $((bb+100)) 100         # strictly inside row one
+turn "$dirB/$SIDB.jsonl" $((bb+500)) 900         # ON THE SHARED SECOND
+turn "$dirB/$SIDB.jsonl" $((bb+700)) 300         # strictly inside row two
+turn "$dirB/decoy.jsonl" $((bb+200)) 5000        # the seat's other session
+SESSION_CORPUS=1300                               # 100+900+300 — all of THIS session
+tB1=$(mkrow segB "boundary row one, handed off")
+tB2=$(mkrow segB "boundary row two, claimed the same second")
+setwin "$tB1" "$SIDB" segB "$bb"        $((bb+500))
+setwin "$tB2" "$SIDB" segB $((bb+500))  $((bb+1000))
+r=$(new "$tB1"); rcB1="${r%%:*}"; fB1="${r#*:}"
+r=$(new "$tB2"); rcB2="${r%%:*}"; fB2="${r#*:}"
+# (i) touching is still SEQUENTIAL, not overlapping: if making the clip exclusive
+# had been done to the detector instead, these two would refuse here.
+[[ "$rcB1" == 0 && "$rcB2" == 0 ]] \
+  && ok_t "DIVE-3374: segments that TOUCH are still sequential (rc 0/0, not AMBIGUOUS)" \
+  || bad_t "touching segments stopped measuring" "rc=$rcB1/$rcB2 out=$fB1/$fB2 $(cat "$TMP/new.err")"
+# (ii) the boundary turn lands in the LATER segment and in nothing else.
+[[ "$fB1" == "100" && "$fB2" == "1200" ]] \
+  && ok_t "DIVE-3374: the boundary turn is charged ONCE, to the later segment (100 / 1200)" \
+  || bad_t "boundary turn mis-charged" "f1=$fB1 f2=$fB2 (expected 100/1200; 1000/1200 is the double-charge)"
+# (iii) THE ARITHMETIC. The parts must sum to the corpus, not to corpus+boundary.
+sumB=$(( ${fB1:-0} + ${fB2:-0} ))
+[[ "$sumB" == "$SESSION_CORPUS" ]] \
+  && ok_t "DIVE-3374: the two rows SUM to the session corpus ($sumB == $SESSION_CORPUS)" \
+  || bad_t "the parts oversum the whole — the shared second is billed twice" \
+           "sum=$sumB corpus=$SESSION_CORPUS oversum=$((sumB-SESSION_CORPUS))"
+# (iv) the control, so the arm is not vacuous: the shipped assignee-window reader
+# eats the decoy session AND double-charges the same boundary second.
+oB1=$(old "$tB1"); oB2=$(old "$tB2")
+[[ "$oB1" == "6000" && "$oB2" == "1200" && $((oB1+oB2)) -gt "$SESSION_CORPUS" ]] \
+  && ok_t "control: the assignee-window reader reads 6000/1200 on the same fixture (decoy + boundary)" \
+  || bad_t "boundary control did not reproduce — the fixture may be vacuous" "old=$oB1/$oB2"
+
+# ============================================================================
 # ARM 6 — the queue is untouched. The table is additive and nothing in the task
 # path may have started depending on it.
 # ============================================================================

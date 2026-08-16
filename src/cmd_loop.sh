@@ -318,7 +318,33 @@ for (sid, agent), ws in buckets.items():
                 tot = (int(u.get("input_tokens") or 0) + int(u.get("output_tokens") or 0)
                        + int(u.get("cache_creation_input_tokens") or 0))
                 for w in ws:
-                    if w["s"] <= ts <= w["e"]:
+                    # DIVE-3374: HALF-OPEN — inclusive start, EXCLUSIVE end. The
+                    # clip and the overlap detector above are one decision about
+                    # strictness made in two places, and they disagreed: the
+                    # detector is strict (`<`), so `[t0,t5]` and `[t5,t10]` are
+                    # legally SEQUENTIAL and both measure — while an inclusive
+                    # `<=` here put the instant t5 inside BOTH, so a turn landing
+                    # on it was charged to BOTH rows. Measured on a fixture:
+                    # corpus 1800, rows charged 1100 + 1700 = 2800.
+                    #
+                    # Not exotic: the boundary is written by `task done` on one
+                    # row followed by `task start` on the next — two consecutive
+                    # commands in one session, against second-granularity
+                    # `datetime('now')`. That is the ordinary handoff.
+                    #
+                    # Exactly ONE end moves, so touching segments PARTITION the
+                    # line instead of sharing a point, and the boundary instant
+                    # belongs to the LATER segment and to nothing else. The
+                    # detector must stay strict — making IT inclusive would turn
+                    # the ordinary sequential pair AMBIGUOUS instead.
+                    #
+                    # Two edges this deliberately accepts: an OPEN segment's end
+                    # is `now` (scan time), so a turn written in the very second
+                    # of the scan falls to the next scan rather than being lost;
+                    # and a zero-width segment (start == done inside one second)
+                    # now charges 0, which is the honest reading of a row that
+                    # existed for less than a second.
+                    if w["s"] <= ts < w["e"]:
                         total += tot; break
     if not read_any:
         bail("NOT-REACHED", 4, "transcript %s.jsonl exists but could not be opened (it is chmod 600 "
