@@ -58,10 +58,10 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   stale-digest:
-    # Read-only weekly digest (DIVE-1833): flags unmerged PRs >3d and branches
-    # with no activity >14d into the run summary. Never deletes/labels/closes,
-    # so it runs on every trigger (including the dry-run dispatch) and is not
-    # coupled to the merged-branch delete path.
+    # Read-only weekly digest (DIVE-1833): flags unmerged PRs >3d, and classifies
+    # every other branch by EVIDENCE that its work landed (DIVE-2394) rather than
+    # by age. Never deletes/labels/closes, so it runs on every trigger (including
+    # the dry-run dispatch) and is not coupled to the merged-branch delete path.
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -71,11 +71,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Flag stale PRs and dead branches
+      # DEAD_BRANCH_DAYS is deliberately NOT set here: branch age stopped being a
+      # classifier in DIVE-2394, and the script prints a line calling out anyone who
+      # still sets it rather than silently ignoring it.
+      - name: Flag stale PRs and classify branches by landing evidence
         env:
           GH_TOKEN: ${{ github.token }}
           STALE_PR_DAYS: '3'
-          DEAD_BRANCH_DAYS: '14'
         run: scripts/branch-hygiene.sh --report >> "$GITHUB_STEP_SUMMARY"
 
   stale-pull-requests:

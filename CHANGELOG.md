@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased — fix(branch-hygiene): the weekly digest classifies branches by EVIDENCE, not age (DIVE-2394)
+
+`--apply` was already safe: it deletes only on a closed PR whose head SHA equals the branch's
+current SHA, and age never entered that path. **The digest above it was the problem.** Its
+dead-branch section listed branches by `DEAD_BRANCH_DAYS`, which is the one axis measured to
+separate nothing — on 2026-07-30 an audit of 17 stale branches (DIVE-2389) found FOUR whose work
+existed nowhere else while every one of their tasks read `done`, and age did not distinguish them
+from the merged-and-tidy ones. A reader handed "dead branch, 40d" reaches for delete.
+
+- **Three arms of landing evidence, any one of which clears a branch:** a merged PR at this exact
+  head (the `--apply` predicate); containment in the default branch (`compare` status
+  `identical|behind`); or the branch's ident named in a commit **SUBJECT** on the default branch.
+- **Subject only, and that is the whole point.** `git log --grep=<IDENT>` reads the whole message
+  and matches later commits *citing* the defect — measured 9 hits for `DIVE-2067` while the guard
+  itself was absent from `main`. The false positive gets **stronger** the more important the
+  missing work was, because a good finding is cited more.
+- **None of the three is a FINDING, never a deletion**, printed under its own heading with the
+  `refs/rescued/<branch>` push that costs nothing when the objects are already canonical and
+  survives branch deletion permanently.
+- **A branch with no common ancestor is ORPHAN, not stale.** This repo's `status` branch is an
+  intentional orphan written daily by `5dive proof publish`; an ancestry-based sweep flagged it
+  every single week.
+- **The failure direction is signed:** an unreadable or truncated commit-subject corpus makes the
+  digest report MORE findings, never fewer. Nothing is attributed on the *absence* of a reading —
+  a branch whose evidence could not be fetched reads `UNKNOWN evidence-unavailable`.
+- **`DEAD_BRANCH_DAYS` is no longer read.** Setting it prints a line saying so rather than being
+  silently ignored; the weekly workflow no longer sets it. Branch age is still printed per branch,
+  as a fact, not as the classifier.
+- Still read-only, still uncoupled from the delete path, and it still emits no `DELETED` line —
+  the invariant `branch-hygiene-report.sh` greps for when it runs this same script against
+  `lodar/5dive-api` and `lodar/5dive-frontend`.
+
 ## Unreleased — fix(council): `authority.gate_clear_leads` can actually be set (DIVE-3493)
 
 The constitution validator and the authority reader accepted **disjoint** subsets of YAML, so the

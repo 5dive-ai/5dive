@@ -97,3 +97,147 @@ grep -q 'SUMMARY candidates=2 deleted=1' <<<"$apply_output"
 grep -q 'heads%2Fmerged-old' "$TMP/deletes.log"
 
 echo "branch_hygiene_unit: PASS"
+
+# --- DIVE-2394: --report classifies branches by EVIDENCE, never by age -----------------
+# The measurement this guards (DIVE-2389, 2026-07-30): of 17 stale branches, FOUR held work
+# that existed nowhere else while every one of their tasks read `done`. Age separated none of
+# them from the merged-and-tidy ones. The arms below are the four outcomes that matter plus
+# the two ways this can be wrong SILENTLY: attributing on a whole-message grep, and
+# attributing when the evidence source could not be read at all.
+RTMP=$(mktemp -d)
+trap 'rc=$?; rm -rf "${TMP:-}" "${RTMP:-}"; echo "HARNESS-RC=$rc"' EXIT
+
+cat >"$RTMP/gh" <<'RMOCK'
+#!/usr/bin/env bash
+set -uo pipefail
+args="$*"
+
+case "$args" in
+  "api repos/acme/demo --jq .default_branch")
+    echo main
+    ;;
+  *".protected]"*)
+    # the delete path's 3-field inventory; --report must never ask for it
+    echo "report asked for the delete-path inventory: $args" >&2
+    exit 98
+    ;;
+  *"branches?per_page=100"*)
+    printf '%s\n' \
+      $'main\tMAIN' \
+      $'open-live\tOPEN' \
+      $'merged-old\tMERGED' \
+      $'dive-3330-verify-merge-gate\tD3330' \
+      $'dive-2067-verify-over-closed\tD2067' \
+      $'salvage/untracked-test-harnesses-2026-07-26\tSALV' \
+      $'status\tSTATUS' \
+      $'contained-branch\tCONT'
+    ;;
+  *"pulls?state=open"*"@tsv"*)
+    : # no stale open PRs in this fixture
+    ;;
+  *"pulls?state=open"*)
+    echo open-live
+    ;;
+  *"commits?sha=main&since="*)
+    if [[ -n "${MOCK_SUBJECTS_FAIL:-}" ]]; then
+      echo "mock: subject corpus unreadable" >&2
+      exit 1
+    fi
+    case "$args" in
+      *'split("\n")[0]'*)
+        case "$args" in
+          *"page=1"*)
+            # SUBJECTS ONLY. DIVE-2067 is deliberately absent from every subject.
+            printf '%s\n' \
+              'DIVE-3330: verify the merge gate' \
+              'DIVE-2113: refuse task start on a closed row' \
+              'DIVE-2112: refuse task reject on a closed row'
+            ;;
+          *) : ;;
+        esac
+        ;;
+      *"commit.message"*)
+        # The whole-message form. If the script ever asks for THIS, it sees the
+        # bodies that CITE DIVE-2067 and attributes a branch whose work is absent
+        # -- the exact false positive measured on 2026-07-30. Reaching this arm
+        # turns the DIVE-2067 assertion below red, which is the point of it.
+        case "$args" in
+          *"page=1"*)
+            printf '%s\n' \
+              'DIVE-2113: refuse task start on a closed row -- same class as DIVE-2067' \
+              'DIVE-2112: refuse task reject on a closed row (see DIVE-2067)'
+            ;;
+          *) : ;;
+        esac
+        ;;
+    esac
+    ;;
+  "api repos/acme/demo/commits/"*" --jq .commit.committer.date")
+    echo 2026-07-01T00:00:00Z
+    ;;
+  *"compare/main...contained-branch"*)
+    echo behind
+    ;;
+  *"compare/main...status"*)
+    echo "mock: no common ancestor between main and status" >&2
+    exit 1
+    ;;
+  *"compare/main..."*)
+    echo diverged
+    ;;
+  *"-f head=acme:merged-old"*"-f state=closed"*|*"-f state=closed"*"-f head=acme:merged-old"*)
+    echo '[{"number":12,"merged_at":"2026-07-01T00:00:00Z","head":{"sha":"MERGED"}}]'
+    ;;
+  *"-f state=closed"*)
+    echo '[]'
+    ;;
+  *)
+    echo "unexpected gh invocation: $args" >&2
+    exit 99
+    ;;
+esac
+RMOCK
+chmod +x "$RTMP/gh"
+
+report_output=$(GH_BIN="$RTMP/gh" GITHUB_REPOSITORY=acme/demo DEAD_BRANCH_DAYS=14 \
+  "$ROOT/scripts/branch-hygiene.sh" --report)
+
+# The four classifications.
+grep -q 'LANDED merged-pr #12' <<<"$report_output"
+grep -q '`contained-branch` — LANDED contained-in-`main`' <<<"$report_output"
+grep -q '`dive-3330-verify-merge-gate` — LANDED subject-attribution DIVE-3330' <<<"$report_output"
+grep -q '`dive-2067-verify-over-closed` — \*\*FINDING\*\* unattributed (DIVE-2067)' <<<"$report_output"
+grep -q '`salvage/untracked-test-harnesses-2026-07-26` — \*\*FINDING\*\* no-ident' <<<"$report_output"
+grep -q '`status` — ORPHAN no-common-ancestor' <<<"$report_output"
+
+# A date in a branch name is not an ident: the salvage branch must not read as CX-2026 etc.
+! grep -q 'salvage/untracked-test-harnesses-2026-07-26.*unattributed' <<<"$report_output"
+
+# The findings section names the rescue, and age is no longer a section heading.
+grep -q 'refs/rescued/<branch>' <<<"$report_output"
+grep -q 'Branches that may be the only copy (evidence, not age)' <<<"$report_output"
+! grep -q 'Branches with no activity' <<<"$report_output"
+
+# Age is still printed as a fact about each branch.
+grep -q 'since last commit (2026-07-01)' <<<"$report_output"
+
+# DEAD_BRANCH_DAYS was set; the report must say it is not read rather than pretend.
+grep -q 'DEAD_BRANCH_DAYS=14 was set and is NOT read' <<<"$report_output"
+
+grep -q '2 finding(s), 3 with landing evidence, 1 orphan, 0 unknown' <<<"$report_output"
+
+# The read-only invariant the ops runner greps for (branch-hygiene-report.sh).
+! grep -q '^DELETED ' <<<"$report_output"
+
+# THE FAILURE DIRECTION. With the subject corpus unreadable, the branch that WAS
+# attributed by subject must stop being attributed -- never the other way round.
+fail_output=$(GH_BIN="$RTMP/gh" GITHUB_REPOSITORY=acme/demo MOCK_SUBJECTS_FAIL=1 \
+  "$ROOT/scripts/branch-hygiene.sh" --report)
+
+! grep -q 'LANDED subject-attribution' <<<"$fail_output"
+grep -q '`dive-3330-verify-merge-gate` — UNKNOWN evidence-unavailable (DIVE-3330)' <<<"$fail_output"
+grep -q '`dive-2067-verify-over-closed` — UNKNOWN evidence-unavailable (DIVE-2067)' <<<"$fail_output"
+grep -q 'Arm 3 did not run, and nothing was attributed on its absence' <<<"$fail_output"
+grep -q '1 finding(s), 2 with landing evidence, 1 orphan, 2 unknown' <<<"$fail_output"
+
+echo "branch_hygiene_unit: report-by-evidence PASS"
