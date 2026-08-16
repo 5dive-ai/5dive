@@ -241,5 +241,5 @@ else
   echo "FAIL: cmd_auth_status is NOT defined — every check above graded nothing"; fails=1
 fi
 
-(( fails )) && { echo "RESULT: FAIL"; exit 1; }
+(( fails == 0 )) || { echo "RESULT: FAIL"; exit 1; }
 echo "RESULT: PASS"
