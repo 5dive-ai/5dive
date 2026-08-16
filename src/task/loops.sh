@@ -14,6 +14,22 @@
 # that slipped through, e.g. a maker that kept re-routing without a clean reject).
 # Pairs with `5dive usage`, which attributes tokens/turns/cost to the same task
 # ids — so loops here + usage there give iterations AND cost per loop.
+#
+# DIVE-2489: the `maker` column renders a MEASURED maker and an INFERRED one
+# differently, because the difference is a governance claim. It used to be
+# `COALESCE(maker_agent, assignee)`, and after a maker→verifier handoff the
+# assignee IS the verifier — so a row that never stamped a maker rendered as
+# maker == verifier, byte-identical to a task whose maker really did grade their
+# own work. Measured on the live store 2026-08-16: 15 of 1184 verifier-carrying
+# rows read as self-graded through that fallback and ZERO of them had a recorded
+# maker_agent; 277 have no maker_agent at all. It fooled two agents in one day
+# and marketing nearly published "12 of 576 tasks were self-graded" off it.
+# Now: text prints the recorded maker, or `holder:<assignee>` when there is none
+# (the fallback is kept but MARKED, so inferred and measured are never the same
+# glyph), or `-` when the row has neither. JSON emits `maker: null` when it was
+# never stamped — the assignee is already carried separately as `holder`, so no
+# caller loses information. Same rule as the NOT-REACHED third state: a value you
+# did not measure must not render as one you did.
 #   --stuck            only the stuck loops
 #   --all              include closed loops (default: open only)
 #   --escalate-stuck   run `task escalate` on every stuck open loop (reuses the
@@ -81,7 +97,7 @@ cmd_task_loops() {
     if (( JSON_MODE )); then
       local tloops="[]" runs="[]"
       (( runs_only )) || tloops=$(dbfmt -json "SELECT ident, status,
-               COALESCE(maker_agent, assignee) AS maker, verifier,
+               maker_agent AS maker, verifier,
                COALESCE(iteration,0) AS iteration, max_iterations,
                COALESCE(assignee,'') AS holder,
                CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
@@ -106,7 +122,9 @@ cmd_task_loops() {
                  CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
                       THEN CASE WHEN handoff_ack_at IS NOT NULL THEN 'reviewing' ELSE 'delivered' END
                       ELSE '-' END AS handoff,
-                 COALESCE(maker_agent, COALESCE(assignee,'-')) AS maker,
+                 CASE WHEN maker_agent IS NOT NULL THEN maker_agent
+                      WHEN assignee IS NOT NULL THEN 'holder:'||assignee
+                      ELSE '-' END AS maker,
                  COALESCE(verifier,'-') AS verifier,
                  COALESCE(iteration,0)||'/'||COALESCE(CAST(max_iterations AS TEXT),'∞') AS iter,
                  CASE WHEN ${stuck_pred} THEN '⚠' ELSE '' END AS stuck,
