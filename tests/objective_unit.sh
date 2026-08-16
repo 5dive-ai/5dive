@@ -149,16 +149,23 @@ IFS="|" read -r r_at r_by r_why r_ref < <(db "SELECT COALESCE(retired_at,''), CO
   || bad_t "tombstone provenance" "at=$r_at by=$r_by why=$r_why ref=$r_ref"
 
 # the success message must NAME what survives (the old one said only "readings deleted")
-printf '%s' "$out" | jq -e '.data.retired==true and .data.cycles_kept>=1 and .data.readings_kept>=1 and .data.retired_ref=="DIVE-1928"' >/dev/null \
+# the claim and the store must AGREE — a message asserting "kept" while the rows
+# are gone is the exact failure mode the old "(readings deleted)" line had.
+printf '%s' "$out" | jq -e --argjson c "$kept_cyc" --argjson r "$kept_rd" \
+  '.data.retired==true and .data.cycles_kept==$c and .data.readings_kept==$r and $c>=1 and $r>=1 and .data.retired_ref=="DIVE-1928"' >/dev/null \
   && ok_t "rm result names the kept cycles + readings and the authorizing ref" \
   || bad_t "rm result payload" "out=$out"
 
 # ---- (12b) a retired objective does not tick ----
+# Asserts the row is STILL THERE as well as un-ticked: "no new readings" is also
+# true of an objective that was deleted, so without the survives= arm this passes
+# against the very hard-DELETE the task is about.
 before=$(db "SELECT COUNT(*) FROM objective_readings WHERE objective_id=$oid;")
 run cmd_objective_tick >/dev/null
 after=$(db "SELECT COUNT(*) FROM objective_readings WHERE objective_id=$oid;")
-[[ "$before" == "$after" ]] && ok_t "tick (all) skips a retired objective" \
-  || bad_t "retired still ticks" "before=$before after=$after"
+survives=$(db "SELECT COUNT(*) FROM objectives WHERE id=$oid;")
+[[ "$before" == "$after" && "$survives" == "1" ]] && ok_t "tick (all) skips a retired objective (which is still there)" \
+  || bad_t "retired still ticks" "before=$before after=$after survives=$survives"
 
 # ---- (12c) ls hides retired by default, --all shows it, and the count is surfaced ----
 out=$(run cmd_objective_ls); rc=$?
@@ -177,8 +184,15 @@ printf '%s' "$out" | jq -e '[.data.objectives[].name] | index("ratio") != null' 
 JSON_MODE=0
 db "UPDATE objectives SET status='retired';"
 txt=$(run cmd_objective_ls)
-grep -qi "retired" <<<"$txt" && ok_t "empty ls says 'retired', not 'no objectives yet'" \
-  || bad_t "empty-render honesty" "text=$txt"
+# Assert the EMPTY-LIST message specifically, and that the never-existed wording is
+# absent. A loose grep for "retired" passes on a broken filter too — the box render
+# has a `status` column, so the word appears in the very output this arm must reject.
+if grep -q "no live objectives" <<<"$txt" && grep -q "1 retired\|3 retired\|[0-9] retired" <<<"$txt" \
+   && ! grep -q "no objectives yet" <<<"$txt"; then
+  ok_t "empty ls says 'no live objectives — N retired', never 'no objectives yet'"
+else
+  bad_t "empty-render honesty" "text=$txt"
+fi
 db "UPDATE objectives SET status='active' WHERE name<>'ratio';"
 JSON_MODE=1
 
