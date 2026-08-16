@@ -192,6 +192,9 @@ Turn an outcome into a guarded task graph.
 `5dive loop spawn --role=researcher --agent=scout --prompt="Track competitor launches"`<br>
 Run bounded autonomous work in a persistent agent loop.
 
+`sudo 5dive council init --seats=alice:chair,bob,carol --threshold=majority --veto=human:you`<br>
+Seed the Council's genesis roster. A human does this once; the primary Council refuses to convene until it exists.
+
 `5dive council convene "Should we ship?" --mode=adversarial`<br>
 Convene an auditable adversarial review with multiple agents.
 
@@ -346,6 +349,7 @@ It is read-only and binds to loopback (there is no sign-in, so `--host` refuses 
 5dive company                            # stand up a self-steering company
 5dive goal add "<outcome>"                # outcome -> guarded task graph
 5dive loop spawn --role=<r> --agent=<a> --prompt="<work>"
+sudo 5dive council init --seats=<a:chair,b,c> --threshold=<spec> --veto=<principal>
 5dive council convene "<question>" --mode=adversarial
 5dive trace <task>                       # causal timeline from origin to verdict
 5dive memory search "<query>"             # durable knowledge with provenance

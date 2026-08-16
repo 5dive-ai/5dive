@@ -1311,6 +1311,113 @@ _apply_byo_openclaw() {
   fi
 }
 
+# ── DIVE-3442: push openclaw state INTO the seat, as root ───────────────────
+# Everything _apply_byo_openclaw writes lands under /home/claude/.openclaw (or
+# the profile dir) owned by claude. The seat was supposed to pick it up at every
+# launch: 5dive-agent-start has a seed block that copies auth-profiles.json and
+# agents.defaults.model into $HOME/.openclaw. On the BYO path it never fires.
+#
+# Measured on a live throwaway seat (openclaw + openrouter, --isolation=standard):
+# the seat's auth-profiles.json DID NOT EXIST and its openclaw.json carried
+# primary=null, while /home/claude's copy was correct on every field. Both arms of
+# the seed's guard fail:
+#   * the plain read — /home/claude/.openclaw is 0700 claude:claude, so a seat in
+#     group claude cannot even TRAVERSE it (and the credential itself is 0600);
+#   * the `sudo -n` fallback — a standard-isolation seat has no NOPASSWD sudo.
+# The seed's own DIVE-1900 comment says creds are "normalized 0640 g=claude under
+# group-traversable dirs". That is true of the PROFILE path only
+# (normalize_profile_seed_perms relaxes it at bind time) and of hermes' shared dir
+# (cmd_create chmods it 0775 + 0640 before enabling the unit). openclaw's DEFAULT
+# no-profile dir is normalized by nobody, so the fast path can never fire for a
+# BYO seat. Symptom: telegram works (the channel/gateway config is written
+# straight into the seat at create time and needs no credential) and every message
+# to the provider dies at auth.
+#
+# The tempting fix is to chmod the shared tree group-readable. REJECTED: that
+# makes the operator's real provider key readable by every seat in group claude,
+# which is the open question in DIVE-3305, and a bug fix must not pre-empt it.
+#
+# So push instead of pull. `agent create` and `agent auth set` both already run
+# as root, which is the one context that can read claude's private dir AND write
+# a 0600 file owned by the seat. Nothing here depends on the seat being able to
+# read anything of claude's, so it is correct at every isolation level.
+#
+# Copies (never moves) two things:
+#   1. auth-profiles.json  -> $HOME/.openclaw/agents/main/agent/, 0600, seat-owned
+#   2. agents.defaults.model AND models.providers, deep-merged into the seat's own
+#      openclaw.json. models.providers is in the set on purpose: the boot seed
+#      syncs only agents.defaults, so a provider baseUrl override (zai — see
+#      OPENCLAW_PROVIDER_URL) written by _apply_byo_openclaw reached the shared
+#      config and never the seat. Same class of bug, one line away.
+# Merge, not overwrite: the seat's openclaw.json already holds its channels,
+# gateway mode and gateway token by the time we run.
+#
+# Best-effort by contract (warn, never fail): the credential is on disk either
+# way, and the boot seed remains as the second chance. Returns 0 always.
+seed_openclaw_state_into_seat() { # <name> [profile]
+  local name="$1" profile="${2:-}"
+  local user="agent-${name}"
+  local home="${AGENT_HOME_ROOT:-/home}/${user}"
+  [[ -d "$home" ]] || return 0
+
+  local base="/home/claude"
+  if [[ -n "$profile" ]]; then
+    base="$(profile_type_dir "$profile" openclaw)" || return 0
+  fi
+  local src_auth="${base}/.openclaw/agents/main/agent/auth-profiles.json"
+  local src_cfg="${base}/.openclaw/openclaw.json"
+  local dst_dir="${home}/.openclaw/agents/main/agent"
+  local dst_cfg="${home}/.openclaw/openclaw.json"
+
+  [[ -s "$src_auth" || -s "$src_cfg" ]] || return 0
+  step "Seeding openclaw credential + model default into ${home}/.openclaw"
+
+  # -o/-g only work as root; fall back to a plain mkdir so the function stays
+  # runnable (and unit-gradable) unprivileged, where ownership is moot anyway.
+  install -d -m 700 -o "$user" -g "$user" \
+    "${home}/.openclaw" "${home}/.openclaw/agents" \
+    "${home}/.openclaw/agents/main" "$dst_dir" 2>/dev/null \
+    || mkdir -p "$dst_dir" 2>/dev/null \
+    || { warn "openclaw seed: could not create ${dst_dir} — the agent may boot UNAUTHENTICATED"; return 0; }
+
+  if [[ -s "$src_auth" ]]; then
+    local tmp
+    if tmp=$(mktemp -p "$dst_dir" .auth-profiles.XXXXXX 2>/dev/null) && cat "$src_auth" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+      chown "$user":"$user" "$tmp" 2>/dev/null || true
+      chmod 0600 "$tmp"
+      mv "$tmp" "${dst_dir}/auth-profiles.json"
+    else
+      rm -f "${tmp:-}" 2>/dev/null || true
+      warn "openclaw seed: could not copy $src_auth into $dst_dir — the agent will boot UNAUTHENTICATED"
+    fi
+  fi
+
+  if [[ -s "$src_cfg" ]]; then
+    local patch
+    patch=$(jq -c '
+      (.agents.defaults.model? // null) as $m
+      | (.models.providers? // null) as $p
+      | (if $m == null then {} else {agents: {defaults: {model: $m}}} end)
+        * (if $p == null then {} else {models: {providers: $p}} end)' \
+      "$src_cfg" 2>/dev/null) || patch=""
+    if [[ -n "$patch" && "$patch" != "{}" && "$patch" != "null" ]]; then
+      [[ -s "$dst_cfg" ]] || printf '{}\n' > "$dst_cfg"
+      local ctmp
+      if ctmp=$(mktemp -p "${home}/.openclaw" .openclaw.json.XXXXXX 2>/dev/null) \
+         && jq -s '.[0] * .[1]' "$dst_cfg" <(printf '%s' "$patch") > "$ctmp" 2>/dev/null \
+         && [[ -s "$ctmp" ]]; then
+        chown "$user":"$user" "$ctmp" 2>/dev/null || true
+        chmod 0600 "$ctmp"
+        mv "$ctmp" "$dst_cfg"
+      else
+        rm -f "${ctmp:-}" 2>/dev/null || true
+        warn "openclaw seed: could not merge model defaults into $dst_cfg — the agent may fall back to openclaw's built-in default model and 401"
+      fi
+    fi
+  fi
+  return 0
+}
+
 # ── DIVE-990: memory-as-onboarding ──────────────────────────────────────────
 # A new hire should boot knowing the company instead of cold-starting. When
 # `create --inherit-memory=<scope>` is passed we seed the new agent's own recall
@@ -1450,9 +1557,52 @@ selfcheck_cred_reached_agent() { # <name> <type> <profile> <byo_provider>
   local bc="${AGENT_HOME_ROOT:-/home}/${user}/.5dive-cred-seed-failed" why=""
   if [[ -s "$bc" ]]; then
     why=$(tr -d '\n' < "$bc" 2>/dev/null | cut -c1-400)
-    printf 'issue:credential did NOT reach the agent (it is UNAUTHED despite a completed login) — the boot seed recorded: %s. Re-seed as root: sudo 5dive agent restart %s\n' \
+    # DIVE-3455: the fixed half of this line must not name a fault the breadcrumb
+    # may not be describing. Two faults reach here now — the seat booted with NO
+    # credential, and the seat booted on a LOCAL one that could not be compared
+    # with the profile's (STALE, and no re-auth will replace it). "It is UNAUTHED"
+    # is false for the second and sends the operator looking for a dead seat that
+    # is in fact running. The recorded reason below distinguishes them; this half
+    # states only what is true of both.
+    printf 'issue:credential did NOT reach the agent (a completed login is not proof the seat received it) — the boot seed recorded: %s. Re-seed as root: sudo 5dive agent restart %s\n' \
       "$why" "$name"
     return 0
+  fi
+
+  # Witness 1b (DIVE-3442, openclaw only): grade the SEAT, not the source. Every
+  # other witness here asks whether the shared/profile credential is reachable;
+  # openclaw is the type where that question has been answered "yes" while the
+  # seat itself had nothing — the pull-side seed no-ops on a 0700 shared dir and
+  # a seat with no sudo. Witness 2 cannot see it either: on the BYO path with no
+  # --auth-profile it resolves src="" and returns without a word, which is why a
+  # measured-broken seat printed a clean create. Two things must be true on the
+  # seat and both are cheap to read: a non-empty auth-profiles.json, and a
+  # non-null agents.defaults.model.primary (a null primary sends openclaw to its
+  # built-in default, whose provider prefix picks a credential we never wrote —
+  # DIVE-3113/3130, and it 401s while looking configured).
+  if [[ "$type" == "openclaw" ]]; then
+    local _oc_home="${AGENT_HOME_ROOT:-/home}/${user}"
+    local _oc_auth="${_oc_home}/.openclaw/agents/main/agent/auth-profiles.json"
+    local _oc_cfg="${_oc_home}/.openclaw/openclaw.json"
+    if [[ ! -s "$_oc_auth" ]]; then
+      printf 'issue:openclaw credential never reached the seat (%s is missing/empty) — the agent boots UNAUTHENTICATED and every message 401s while the profile itself looks fine. Re-seed as root: sudo 5dive agent restart %s\n' \
+        "$_oc_auth" "$name"
+    else
+      local _oc_primary
+      # model is `{primary: …}` on every path we write, but openclaw also accepts
+      # a bare string there — indexing a string with .primary is a jq ERROR, not
+      # a null, so branch on the type instead of chaining `//`.
+      _oc_primary=$(jq -r '(.agents.defaults.model) as $m
+        | if ($m|type) == "object" then ($m.primary // "")
+          elif ($m|type) == "string" then $m
+          else "" end' "$_oc_cfg" 2>/dev/null) || _oc_primary=""
+      if [[ -z "$_oc_primary" ]]; then
+        printf 'issue:openclaw seat has a credential but NO model pin (agents.defaults.model.primary is null in %s) — openclaw falls back to its built-in default, whose provider prefix selects a credential that was never written, and returns 401 on every message. Re-seed as root: sudo 5dive agent restart %s\n' \
+          "$_oc_cfg" "$name"
+      else
+        printf 'ok:openclaw seat has its own credential and model pin (%s)\n' "$_oc_primary"
+      fi
+    fi
   fi
 
   # Witness 2: the source the seed reads from, probed as the agent. Catches
@@ -2203,6 +2353,16 @@ cmd_create() {
   if [[ "$type" == "hermes" && "$byo_provider" == "moonshot" ]]; then
     step "Seeding KIMI_API_KEY into ~/.hermes/.env for agent-${name}"
     seed_hermes_byo_env "$name" KIMI_API_KEY "$byo_api_key"
+  fi
+
+  # DIVE-3442: put openclaw's credential and model pin INSIDE the seat while we
+  # still have root. The boot-time pull in 5dive-agent-start cannot reach
+  # /home/claude/.openclaw (0700) from a standard-isolation seat, so without this
+  # a BYO seat boots with no auth-profiles.json and primary=null — telegram wired,
+  # every provider call 401. Runs after the channel install so the merge lands on
+  # top of the seat's channel/gateway config rather than under it.
+  if [[ "$type" == "openclaw" ]]; then
+    seed_openclaw_state_into_seat "$name" "$profile"
   fi
 
   if [[ -n "$telegram_token" ]]; then

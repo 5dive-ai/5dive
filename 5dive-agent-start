@@ -333,10 +333,20 @@ fi
 # diagnostics down with it. (That is not hypothetical: it is what the
 # block-extraction unit test caught the first time this was written.)
 cred_seed_breadcrumb_path() { printf '%s/.5dive-cred-seed-failed' "${HOME:-/tmp}"; }
-cred_seed_failed() { # <reason>
+# DIVE-3455: ONE implementation of the write. Four callers want the breadcrumb
+# with different prose — cred_seed_failed's `warn:` line and assert_cred_seeded's
+# two ERROR verdicts — and the first attempt at the second caller (DIVE-3442)
+# inlined its own copy of path+printf+chmod. That is precisely how the THIRD
+# caller shipped with no breadcrumb at all: a rule with two implementations is a
+# rule the next branch can be written without. The prose is the caller's; the
+# write never is.
+cred_seed_breadcrumb_write() { # <text>
   local _bc; _bc="$(cred_seed_breadcrumb_path)"
   printf '%s\n' "$1" > "$_bc" 2>/dev/null || true
   chmod 640 "$_bc" 2>/dev/null || true
+}
+cred_seed_failed() { # <reason>
+  cred_seed_breadcrumb_write "$1"
   echo "warn: $1" >&2
 }
 cred_seed_ok() { rm -f "$(cred_seed_breadcrumb_path)" 2>/dev/null || true; }
@@ -587,8 +597,28 @@ assert_cred_seeded() {
   fi
   if [[ -s "$local_path" ]]; then
     echo "ERROR: ${label} credential at ${shared} is NOT readable by $(id -un), so it could not be compared with the agent's own copy — the agent is running on a LOCAL token that may be STALE, and a re-auth will NOT reach it. Seeding/permission fault, not an expired token: run 'sudo 5dive agent restart <name>' as root to re-normalize perms." >&2
+    # DIVE-3455: this branch needs the breadcrumb for the SAME reason DIVE-3442's
+    # does — `agent list`'s health rail and selfcheck_cred_reached_agent both read
+    # the file and neither reads journald — and it is the worse of the two faults:
+    # the seat authenticates fine today on a token no future rotation can replace,
+    # so it looks healthy right up until the old key is revoked.
+    #
+    # The text names STALE and deliberately does NOT say UNAUTHENTICATED. These are
+    # different faults with different repairs (this one is "the seat is running,
+    # on the WRONG token"; the other is "the seat cannot start at all"), and
+    # cred_seed_why exists to keep exactly that distinction alive to the reader.
+    cred_seed_breadcrumb_write "${label} credential at ${shared} is NOT readable by $(id -un), so the agent's own copy could not be compared with it — the seat is running on a LOCAL token that may be STALE and a re-auth will NOT reach it (perms/seeding fault, not an expired token)"
   else
     echo "ERROR: ${label} credential EXISTS at ${shared} but is NOT readable by $(id -un) — the agent will boot UNAUTHENTICATED and fail token exchange with 'Malformed auth code'. This is a seeding/permission fault, NOT an expired token: run 'sudo 5dive agent restart <name>' as root to re-normalize perms." >&2
+    # DIVE-3442: ALSO leave the breadcrumb. Until now this verdict reached only
+    # the unit's journal, where nobody looks — and the seed block's own
+    # `cred_seed_failed` (which does write it) sits INSIDE the `if`, so the case
+    # where the EXISTENCE check is what failed never reaches it. That is exactly
+    # the openclaw BYO shape: seed skipped entirely, no breadcrumb, and
+    # `agent list`'s health rail + selfcheck_cred_reached_agent — both of which
+    # read the breadcrumb and neither of which reads journald — render the seat
+    # healthy while it cannot authenticate.
+    cred_seed_breadcrumb_write "${label} credential EXISTS at ${shared} but is NOT readable by $(id -un) — agent booted UNAUTHENTICATED (perms/seeding fault, not an expired token)"
   fi
   return 0
 }

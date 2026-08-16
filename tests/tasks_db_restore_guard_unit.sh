@@ -224,6 +224,29 @@ out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
 # one column merge with no textual conflict — the CREATE gains both lines — and the
 # count is then wrong by one with nothing in the diff to show it. DIVE-2848 landed
 # that way: 72 on both sides, 73 after the merge, and the only signal was this case.
+# DIVE-2207 landed the same way (86 -> 87): main added the DIVE-2853/3218 columns
+# while the branch added gate_answered_nudged_at, the rebase took both with no
+# textual conflict, and this literal was the only thing that noticed. 87 was READ
+# from this case's own failure detail on the merged tree, not derived by adding one.
+#
+# AND IT RE-ARMED ON THE SAME BRANCH (87 -> 88, 2026-08-16). DIVE-2207 sat open
+# behind a closed row for 11 days; by the time it was rebased for landing, main had
+# moved another 61 commits and added one more column, so the 87 this branch had
+# already measured-and-fixed once was stale AGAIN. The literal is not wrong once per
+# branch, it is wrong once per REBASE — re-read it on every base change, not only
+# when you are the one adding the column.
+#
+# READ IT LIKE THIS, because `bad` takes a detail argument and never prints it, so
+# "read it from the failure detail" is not followable as the harness stands:
+#   sed -i '41s/.*/bad() { FAIL=$((FAIL+1)); printf "  FAIL %s | %s\\n" "$1" "$2"; }/' <this file>
+# run, read `count=`, revert. 88 was obtained that way on base 83d130e, with
+# got==want in the same line (so the count was the ONLY thing failing).
+#
+# 88 -> 90 (DIVE-3430, base 37e7ef0): +graded_verdict, +graded_verdict_at. Read the
+# same way — a same-seat CONTROL worktree at origin/main scored 56/0 on this harness
+# while the branch scored 55/1, which is what separated "my two columns" from a
+# pre-existing tree red before the literal was touched at all. Do that control first:
+# editing this number to make a red go away is the one change that cannot fail loudly.
 fresh_tree
 out=$(tasks_db_init 2>&1); rc=$?
 required='delivered_at delivery_ref delivery_ref_iteration escalated_at escalated_by human_evidence park_reason parked_at'
@@ -232,8 +255,8 @@ actual=$(sqlite3 "$TASKS_DB" \
     WHERE name IN ('delivery_ref','delivered_at','delivery_ref_iteration','parked_at','park_reason','escalated_at','escalated_by','human_evidence')
     ORDER BY name;" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
 column_count=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM pragma_table_info('tasks');" 2>/dev/null)
-[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "87" ]] \
-  && ok "fresh schema: all 87 columns, including the eight former holes, are present" \
+[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "90" ]] \
+  && ok "fresh schema: all 90 columns, including the eight former holes, are present" \
   || bad "fresh schema: init returned a partial tasks table" "rc=$rc count=$column_count got=[$actual] want=[$required] out=$out"
 
 # --- Case 10 (DIVE-2197): migrate arm still rejects a failed ALTER ------------

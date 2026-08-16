@@ -8,7 +8,8 @@
 # Keep this list high-signal (zero false positives) — one hash per real value.
 #
 # OUT OF SCOPE (do NOT add): the commit author email markounik@gmail.com is
-# intentionally public for the Vercel team check.
+# intentionally public: it is the pinned commit-author identity, a readable
+# authorship trail and NOT a deploy gate (measured, DIVE-3113).
 #
 # Format: <sha256>  # <label, no PII>
 

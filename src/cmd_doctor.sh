@@ -576,6 +576,194 @@ doctor_build_caps() {
   return 0
 }
 
+# ── openclaw model-pin re-grade (DIVE-3457) ────────────────────────────────
+#
+# WHY THIS EXISTS. An OPENCLAW_PROVIDER_MODEL row is graded against
+# `openclaw models list --provider <native> --plain` AT THE MOMENT THE ROW IS
+# WRITTEN (that is the rule in the header; DIVE-3184 is a worked example of
+# following it). Nothing re-checks it afterwards. The installed openclaw then
+# upgrades underneath the row, and the already-written pin in a seat's
+# openclaw.json is never rewritten. So a pin that has stopped resolving is a
+# DATED OBSERVATION GONE STALE, not a bad write — and it is BYTE-IDENTICAL at
+# the file level to one that still resolves, dying at the same place with the
+# same 401 (community/wiki/an-unconfigured-model-authenticates-against-the-
+# wrong-provider.md: the error names auth and hides provider selection).
+#
+# WHY IT IS NOT IN THE DEFAULT SWEEP, and why it is not a create-time probe.
+# Each provider costs a full openclaw process: measured 5.8s for one
+# `--provider minimax --plain` on this host, so the seven catalog rows are ~40s.
+# The dashboard polls `doctor --json`, and `selfcheck_cred_reached_agent` re-runs
+# continuously on the agent-list health rail — paying 40s there buys nothing,
+# because the answer cannot change between runs on a fixed openclaw build
+# (dev2 + quinn, DIVE-3442). So this is its OWN opt-in category: it runs from
+# `doctor --category=models`, on a schedule or right after an openclaw upgrade,
+# and never from a bare `doctor`.
+#
+# WHY THE CONTROLS ARE PART OF THE CHECK AND NOT PART OF THE TEST. On the
+# version the rows were graded against, every row resolves — so an all-green run
+# proves only that the probe RETURNED. Two controls run first, every time, and
+# their failure SUPPRESSES the verdict rather than colouring it:
+#
+#   non-vacuity  the control provider's list must be non-empty. `models list`
+#                prints "No models found." at EXIT 0 for a provider it does not
+#                enumerate AND for a provider spelled wrong (DIVE-3184 measured
+#                those two byte-identical), so an openclaw that answers nothing
+#                for everything would otherwise report all seven pins STALE —
+#                the false ALARM, the mirror of the false green.
+#   discrimination  a sentinel id known ABSENT must MISS. openai carries no
+#                gpt-4 family at all on 2026.7.1-2 (20 ids, starting at gpt-5.3
+#                — DIVE-2631), while models.dev still lists gpt-4o as present,
+#                which is exactly why it is the sentinel: it is a live id
+#                somewhere else and absent HERE. If it hits, the matcher is
+#                looser than an exact id comparison and every green below is
+#                worthless.
+#
+# The oracle is one-sided in the other direction too, and this check inherits
+# that: a HIT is authoritative, a MISS on a provider whose whole list is empty
+# says nothing (DIVE-3130/3184 — zai, qwen and huggingface enumerate nothing and
+# are deliberately unpinned). A pin under an EMPTY list is therefore reported
+# `warn` NO-ORACLE, never `error` stale.
+
+OPENCLAW_PIN_CONTROL_PROVIDER="openai"
+OPENCLAW_PIN_CONTROL_ABSENT="openai/gpt-4o"
+
+# The node the openclaw shim is executed under. A VARIABLE and not a literal,
+# and that is a fix, not a refactor: with the path hardcoded, the runtime guard
+# below is a THIRD live seam the offline harness could not stub, so on any box
+# without openclaw installed the check emitted one warn and returned at its
+# first line. Every arm of tests/openclaw_pin_regrade_unit.sh then observed an
+# empty tree — including the two arms that assert a verdict is ABSENT, which
+# passed on that emptiness and reported the suppression working. An
+# absence-assertion arm passes on empty output; the seam it depends on has to
+# be injectable or the positive control cannot be written.
+OPENCLAW_PIN_NODE_BIN="${OPENCLAW_PIN_NODE_BIN:-/home/claude/.local/bin/node}"
+
+# openclaw_catalog_ids <native> — the provider's `--plain` id list on stdout.
+# rc 1 when the runtime is missing (caller must not read that as an empty
+# catalog). "No models found." is filtered out here rather than at the call
+# sites: it is prose on stdout at exit 0, and leaving it in makes an empty
+# catalog look like a one-id catalog.
+openclaw_catalog_ids() {
+  local native="$1"
+  local node="$OPENCLAW_PIN_NODE_BIN" bin="${TYPE_BIN[openclaw]:-}"
+  [[ -n "$bin" && -x "$node" && -x "$bin" ]] || return 1
+  sudo -u claude -H env HOME=/home/claude PATH=/home/claude/.local/bin:/usr/bin:/bin \
+    "$node" "$bin" models list --provider "$native" --plain 2>/dev/null \
+    | grep -vxF 'No models found.' | grep . || true
+}
+
+# openclaw_written_pins — every ALREADY-WRITTEN model pin on this box, one
+# `<path>\t<pin>` row per line. These are the rows the catalog table cannot
+# speak for: `_apply_byo_openclaw` validates at WRITE time and the write already
+# happened, DIVE-3442's push is a faithful copy of an already-graded value, and
+# the boot seed re-syncs whatever is there. Three shapes hold one:
+#   shared   /home/claude/.openclaw/openclaw.json
+#   profile  <auth-profiles>/<name>/openclaw/.openclaw/openclaw.json  (HOME redirect)
+#   seat     /home/agent-*/.openclaw/openclaw.json  (start-time sync target)
+openclaw_written_pins() {
+  local f pin
+  for f in /home/claude/.openclaw/openclaw.json \
+           "${AUTH_PROFILES_DIR}"/*/openclaw/.openclaw/openclaw.json \
+           /home/agent-*/.openclaw/openclaw.json; do
+    [[ -f "$f" ]] || continue
+    pin=$(jq -r '.agents.defaults.model.primary // empty' "$f" 2>/dev/null) || continue
+    [[ -n "$pin" ]] || continue
+    printf '%s\t%s\n' "$f" "$pin"
+  done
+}
+
+# doctor_check_openclaw_model_pins — re-grade catalog rows AND written pins
+# against the INSTALLED catalog. Adds its own checks via doctor_add.
+doctor_check_openclaw_model_pins() {
+  local bin="${TYPE_BIN[openclaw]:-}"
+  local node="$OPENCLAW_PIN_NODE_BIN"
+  if [[ -z "$bin" || ! -x "$node" || ! -x "$bin" ]]; then
+    doctor_add models openclaw-runtime warn \
+      "openclaw is not installed here, so no pin was graded — this is a NOT-MEASURED, not a clean bill of health (install: 5dive agent install openclaw --upgrade)"
+    return 0
+  fi
+
+  local version
+  version=$(sudo -u claude -H env HOME=/home/claude PATH=/home/claude/.local/bin:/usr/bin:/bin \
+    "$node" "$bin" --version 2>/dev/null | head -1)
+  [[ -n "$version" ]] || version="unknown"
+
+  # ── controls, before any verdict ────────────────────────────────────────
+  local ctl_ids ctl_n
+  ctl_ids=$(openclaw_catalog_ids "$OPENCLAW_PIN_CONTROL_PROVIDER")
+  ctl_n=$(grep -c . <<<"${ctl_ids}" 2>/dev/null || printf 0)
+  [[ -n "$ctl_ids" ]] || ctl_n=0
+  if (( ctl_n == 0 )); then
+    doctor_add models openclaw-pin-control error \
+      "non-vacuity control FAILED: '$OPENCLAW_PIN_CONTROL_PROVIDER' enumerates 0 ids on $version, so the probe cannot tell a stale pin from a silent catalog — NO pin was graded this run (a verdict here would have called every pin stale)"
+    return 0
+  fi
+  if grep -qxF "$OPENCLAW_PIN_CONTROL_ABSENT" <<<"$ctl_ids"; then
+    doctor_add models openclaw-pin-control error \
+      "discrimination control FAILED: sentinel '$OPENCLAW_PIN_CONTROL_ABSENT' is supposed to be ABSENT from '$OPENCLAW_PIN_CONTROL_PROVIDER' on this build and it MATCHED — the matcher is looser than an exact id comparison, so NO pin was graded this run"
+    return 0
+  fi
+  doctor_add models openclaw-pin-control ok \
+    "controls passed on $version: '$OPENCLAW_PIN_CONTROL_PROVIDER' enumerates $ctl_n ids (non-vacuity) and absent sentinel '$OPENCLAW_PIN_CONTROL_ABSENT' did not match (discrimination)"
+
+  # ── catalog rows ────────────────────────────────────────────────────────
+  # `rows` is counted in the loop rather than read as ${#OPENCLAW_PROVIDER_MODEL[@]}
+  # in the summary line. Not cosmetic: tests/local_array_unbound_default_unit.sh
+  # arm G resolves every such read against a creation earlier in the SAME
+  # function, so a file-scope `declare -A` in src/header.sh can never satisfy it
+  # and the read reds a guard that is green on main. Widening that guard to
+  # accept file-scope globals is a change to the guard's own non-vacuity and
+  # does not belong in this diff (DIVE-3457, quinn iteration 1).
+  local canonical native pin ids n stale=0 noracle=0 graded=0 rows=0
+  for canonical in $(printf '%s\n' "${!OPENCLAW_PROVIDER_MODEL[@]}" | sort); do
+    rows=$((rows + 1))
+    pin="${OPENCLAW_PROVIDER_MODEL[$canonical]}"
+    native="${OPENCLAW_PROVIDER_ID[$canonical]:-$canonical}"
+    ids=$(openclaw_catalog_ids "$native")
+    n=$(grep -c . <<<"${ids}" 2>/dev/null || printf 0)
+    [[ -n "$ids" ]] || n=0
+    if (( n == 0 )); then
+      noracle=$((noracle + 1))
+      doctor_add models "openclaw-row-${canonical}" warn \
+        "NO ORACLE: '$native' enumerates nothing on $version, so pin '$pin' is neither confirmed nor refuted — an unenumerated namespace is not a proof of unroutability (DIVE-3130/3184). Do not delete the row on this."
+    elif grep -qxF "$pin" <<<"$ids"; then
+      graded=$((graded + 1))
+      doctor_add models "openclaw-row-${canonical}" ok \
+        "pin '$pin' still resolves on $version ($n ids in '$native')"
+    else
+      stale=$((stale + 1))
+      doctor_add models "openclaw-row-${canonical}" error \
+        "STALE PIN: '$pin' is ABSENT from '$native' on $version ($n ids). Every new openclaw seat on provider '$canonical' will be created with an id this build cannot resolve, report AUTH ok, and 401. Re-grade and edit OPENCLAW_PROVIDER_MODEL[$canonical] in src/header.sh: openclaw models list --provider $native --plain"
+    fi
+  done
+
+  # ── already-written pins ────────────────────────────────────────────────
+  local line path wpin wnative wids wn wrote=0
+  while IFS=$'\t' read -r path wpin; do
+    [[ -n "$path" ]] || continue
+    wrote=$((wrote + 1))
+    wnative="${wpin%%/*}"
+    wids=$(openclaw_catalog_ids "$wnative")
+    wn=$(grep -c . <<<"${wids}" 2>/dev/null || printf 0)
+    [[ -n "$wids" ]] || wn=0
+    if (( wn == 0 )); then
+      doctor_add models "openclaw-written-${wrote}" warn \
+        "NO ORACLE for written pin '$wpin' in $path: provider '$wnative' enumerates nothing on $version"
+    elif grep -qxF "$wpin" <<<"$wids"; then
+      doctor_add models "openclaw-written-${wrote}" ok \
+        "written pin '$wpin' still resolves on $version ($path)"
+    else
+      doctor_add models "openclaw-written-${wrote}" error \
+        "STALE WRITTEN PIN: '$wpin' in $path is ABSENT from '$wnative' on $version ($wn ids). This seat is already on disk — nothing rewrites it, so it will 401 on every message while reporting AUTH ok. Repair: sudo -u claude -H env HOME=$(dirname "$(dirname "$path")") PATH=/home/claude/.local/bin:/usr/bin:/bin $node $bin config set agents.defaults.model.primary <graded-id>"
+    fi
+  done < <(openclaw_written_pins)
+
+  doctor_add models openclaw-pin-summary \
+    "$( (( stale > 0 )) && printf error || printf ok )" \
+    "graded ${graded}/${rows} catalog rows + ${wrote} written pin(s) against installed openclaw $version — ${stale} stale, ${noracle} no-oracle"
+  return 0
+}
+
 cmd_doctor() {
   require_root
   local filter="" want_fix=0 dry=0
@@ -606,12 +794,17 @@ cmd_doctor() {
     # `--category=policy` failed usage for every caller who read the error message
     # and did what it said. Pre-existing; fixed here because this change lands its
     # surface under that category and would otherwise be unreachable by filter.
-    ""|deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins|caps) ;;
-    *) fail "$E_USAGE" "unknown --category (deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins|caps)" ;;
+    ""|deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins|caps|models) ;;
+    *) fail "$E_USAGE" "unknown --category (deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins|caps|models)" ;;
   esac
 
   local run_deps=0 run_types=0 run_auth=0 run_creds=0 run_registry=0 run_shelld=0 run_channels=0 run_host=0 run_memory=0 run_policy=0
   local run_plugins=0 run_caps=0
+  # DIVE-3457: `models` is the ONE category a bare `doctor` does NOT run. It
+  # shells to openclaw once per provider (5.8s measured), and the dashboard
+  # polls `doctor --json`. Opt-in keeps the poll cheap; the schedule and the
+  # post-upgrade run ask for it by name.
+  local run_models=0
   [[ -z "$filter" || "$filter" == "deps"     ]] && run_deps=1
   [[ -z "$filter" || "$filter" == "types"    ]] && run_types=1
   [[ -z "$filter" || "$filter" == "auth"     ]] && run_auth=1
@@ -624,6 +817,7 @@ cmd_doctor() {
   [[ -z "$filter" || "$filter" == "policy"   ]] && run_policy=1
   [[ -z "$filter" || "$filter" == "plugins"  ]] && run_plugins=1
   [[ -z "$filter" || "$filter" == "caps"     ]] && run_caps=1
+  [[ "$filter" == "models" ]] && run_models=1
 
   # --- deps ---
   if (( run_deps )); then
@@ -1375,6 +1569,10 @@ cmd_doctor() {
   if (( run_caps )); then
     doctor_build_caps
     [[ -n "$DOCTOR_CAPS" ]] || DOCTOR_CAPS='{"seat":"unknown","sudoGrant":"unknown","runas":"unknown","github:read":{"state":"UNKNOWN","detail":"the capability probe itself failed to run — this is NOT a NO; nothing was measured"},"github:write":{"state":"NO","detail":"push identity is per-seat; the claude-uid borrow is RETIRED for the push class (DIVE-3017)."}}'
+  fi
+
+  if (( run_models )); then
+    doctor_check_openclaw_model_pins
   fi
 
   # --- summary + output ---

@@ -475,6 +475,17 @@ cmd_install() {
     local verb="installed" ujson=false
     [[ $upgrade -eq 1 ]] && ujson=true
     [[ $existed -eq 1 && $upgrade -eq 1 ]] && verb="upgraded"
+    # DIVE-3457: an openclaw UPGRADE is the one event that can invalidate an
+    # OPENCLAW_PROVIDER_MODEL row or an already-written seat pin without
+    # touching a byte of either. Both were graded against the catalog of the
+    # build that just got replaced, and nothing downstream re-reads them:
+    # `_apply_byo_openclaw` validates at write time and the write already
+    # happened. A pin that has stopped resolving is byte-identical to one that
+    # still does and dies on the same 401. Say so here, where the version
+    # actually moved — this is a NUDGE, not the check: the re-grade shells to
+    # openclaw once per provider (~36s) and is not run inline for that reason.
+    [[ "$type" == "openclaw" && $verb == "upgraded" ]] \
+      && step "openclaw version changed — model pins were graded against the OLD catalog and nothing re-reads them. Re-grade: sudo 5dive doctor --category=models"
     ok "$type $verb at $bin" \
        '{type:$t, bin:$b, installed:true, alreadyInstalled:false, upgraded:$u}' \
        --arg t "$type" --arg b "$bin" --argjson u "$ujson"
@@ -1342,6 +1353,18 @@ cmd_auth_set() {
     local _agent
     while IFS= read -r _agent; do
       [[ -n "$_agent" ]] || continue
+      # DIVE-3442: a rotated openclaw key reaches the seat only if something
+      # copies it in. The boot seed cannot — /home/claude/.openclaw is 0700 and a
+      # standard-isolation seat has no sudo — so the restart below would bounce
+      # the gateway onto the SAME stale credential and report success. We are
+      # root here (require_root above); push it in before the bounce.
+      # The affected list is selected by auth-profile, not by type, so a
+      # no-profile rotation sweeps in every unprofiled seat on the box — check
+      # the seat's OWN registered type before writing openclaw paths into it.
+      if [[ "$type" == "openclaw" ]] && declare -F seed_openclaw_state_into_seat >/dev/null 2>&1 \
+         && [[ "$(registry_read | jq -r --arg n "$_agent" '.agents[$n].type // ""')" == "openclaw" ]]; then
+        seed_openclaw_state_into_seat "$_agent" "$profile"
+      fi
       step "Restarting 5dive-agent@${_agent}.service"
       systemctl restart "5dive-agent@${_agent}.service" >&2 2>&1 \
         || warn "restart of agent '$_agent' failed — check journalctl -u 5dive-agent@${_agent}"

@@ -233,6 +233,28 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- ALTER loop, so array-only lands a store that fails the DIVE-2197 assertion.
   graded_at TEXT,
   graded_by TEXT,
+  -- DIVE-3430: WHAT the grade was. graded_at above records only THAT someone
+  -- graded, and it is stamped by `verify`'s else-branch, which is entered on a FAIL
+  -- exactly as readily as on a `--no-done` pass — so a FAIL rendered `graded->merge`
+  -- with no reject token anywhere for DIVE-3428's conjunct to catch.
+  --   graded_verdict     'pass'|'fail', the LATEST verdict, written with a bare SET.
+  --   graded_verdict_at  when THAT verdict was recorded.
+  -- The two write rules differ ON PURPOSE and the pair is why that is safe:
+  -- graded_at/graded_by are COALESCE'd (first grade wins, DIVE-2477's rule) because
+  -- they answer WHO FIRST GRADED THIS AND WHEN — provenance, which a re-grade must
+  -- not rewrite. graded_verdict answers IS THE LATEST VERDICT STILL A PASS, which a
+  -- re-grade must rewrite or a verifier could never clear their own earlier FAIL.
+  -- Those are different questions, so a shared write rule is wrong for one of them
+  -- either way; graded_verdict_at makes the resulting skew READABLE instead of a
+  -- trap, so no reader has to assume the verdict and graded_at describe one event.
+  -- NULL verdict = graded before this column existed. The predicate reads NULL as
+  -- 'pass' deliberately: that is the pre-DIVE-3430 behaviour, so the migration is a
+  -- pure ALTER with NO backfill and no already-graded row silently leaves the board.
+  -- A backfill could not do better — it cannot know a legacy row's verdict, and one
+  -- keyed on graded_at would have to re-run on every migrate pass and would then
+  -- resurrect exactly the FAILs this column exists to record.
+  graded_verdict TEXT,
+  graded_verdict_at TEXT,
   -- DIVE-2615: why this gate has this tier — axis=pinned|type-default|secret-type
   -- |ask|title|title-fallback|none, plus ;term=<t> where a term is what fired.
   -- Declared HERE as well as in _TASKS_ADDITIVE_COLUMNS: a fresh store takes this
@@ -507,6 +529,22 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- which is what the ladder means and is immune to the band moving underneath it.
   nudge_escalated_n INTEGER,
   nudge_parked_at TEXT,
+  -- DIVE-2207: gate_answered_nudged_at throttles the POST-GATE-ANSWER nudge
+  -- (gap#2's second predicate) to once per row. It is a SEPARATE column from
+  -- handoff_stale_pinged_at on purpose, and reusing that one would have shipped
+  -- this fix dead: 30 rows fleet-wide had already burned handoff_stale_pinged_at
+  -- when this was written, INCLUDING DIVE-2146 (burned 2026-07-27 21:40), which is
+  -- the specimen the rail was written for. A throttle already spent by a different
+  -- rail is not a throttle, it is an exclusion.
+  -- WHY THE RAIL EXISTS: a delivered row blocked on a human gate is excluded from
+  -- the gap#2 sweep (DIVE-2196 — nagging there prescribes resolving the human's
+  -- gate by side effect). The instant that gate is ANSWERED the wait is back on the
+  -- verifier, but nothing re-arms: handoff_ack_at may already be stamped (any
+  -- verifier who ran `task start` before getting blocked stamped it), so the
+  -- original predicate can never fire again. Measured on the live board 2026-07-28:
+  -- 20 rows have entered that blind window, 17 graded within the hour, 1 took over
+  -- 24h. Low frequency, silent failure — which is the case for a rail, not against.
+  gate_answered_nudged_at TEXT,
   -- DIVE-891: risk-tiered gates (adopted design DIVE-861). tier is set when the
   -- gate is filed: 0 = auto-clear (rec applies immediately, digest line only),
   -- 1 = agent-clearable + 48h TTL auto-applies the recommendation, 2 = hard
@@ -1341,6 +1379,7 @@ _TASKS_ADDITIVE_COLUMNS=(
   'iteration INTEGER' 'maker_agent TEXT' 'handoff_ack_at TEXT' 'task_budget TEXT'
   'handoff_delivered_at TEXT' 'handoff_stale_pinged_at TEXT' 'handoff_rejected_at TEXT'
   'recurring_stall_pinged_at TEXT' 'recurring_stall_escalated_at TEXT'
+  'gate_answered_nudged_at TEXT'
   'nudge_escalated_at TEXT' 'nudge_escalated_n INTEGER' 'nudge_parked_at TEXT'
   'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT'
   'gate_filed_by TEXT'
@@ -1380,6 +1419,10 @@ _TASKS_ADDITIVE_COLUMNS=(
   # purpose — the terminal-for-verifier predicate must not key on result TEXT,
   # which the MAKER's `task deliver --result=` also writes.
   'graded_at TEXT' 'graded_by TEXT'
+  # DIVE-3430: the VERDICT of that grade, and when the current verdict was recorded.
+  # See the CREATE TABLE comment for why these are bare-SET while graded_at is
+  # COALESCE'd, and why NULL must keep reading as a pass.
+  'graded_verdict TEXT' 'graded_verdict_at TEXT'
   # DIVE-2354: approve-to-send | confirm-after-send. See the CREATE TABLE comment.
   'gate_mode TEXT'
   # DIVE-3342: humans.id of the person who may CLEAR this gate. See the CREATE
@@ -1402,15 +1445,65 @@ _TASKS_ADDITIVE_COLUMNS=(
 #                              forged in prose.
 #   graded_by <> maker_agent - a self-verified close does not buy the exemption.
 #   delivery_ref             - a verdict with nothing to merge is not awaiting a merge.
+#   handoff_rejected_at      - DIVE-3428, below. A grade is not a LATCH.
+#   graded_verdict           - DIVE-3430, below. A grade is not a PASS.
 # status stays OPEN: terminal for the VERIFIER, non-terminal for the ROW.
 # NOT `readonly`: several harnesses and code paths source this lib twice, and a
 # readonly re-assignment errors on the second source — measured, it broke 8 arms of
 # tests/gate_route_delivery_unit.sh with a stderr line and nothing else. Every other
 # constant in this file (incl. _TASKS_SCHEMA_EPOCH) is a plain assignment for the
 # same reason; match the file.
+# DIVE-3428 — A GRADE IS NOT A LATCH, and until this conjunct existed the predicate
+# treated it as one: it asked "has a grade ever been recorded?" and never "is the
+# latest verdict still a pass?". Measured on DIVE-3315 — graded_at 2026-08-12 (quinn,
+# PASS), handoff_rejected_at 2026-08-16 (codex, FAIL) — the reject FOUR DAYS newer,
+# and both board branches still rendered `graded->merge:olivia`.
+#
+# NOT COSMETIC: the label is consumed as an INSTRUCTION. `_hb_loop_terminal_clause`
+# formats the same predicate into the /goal wrapper as "TERMINAL FOR THIS GOAL ...
+# Treat the goal as MET and stop", so a row with a live verifier FAIL and real
+# outstanding maker work told an agent to stop, and named the outstanding act as a
+# MERGE of a PR that must not be merged in its graded state.
+#
+# `<` AND NOT `<=`, WHICH THE ROW ASKED FOR — the tie is reachable and it is not a
+# rounding detail. graded_at is stamped by the `verify` else-branch, which is
+# `rc != 0 || no_done`, so a FAIL verify stamps it; a verifier who runs `task verify`
+# then `task reject` lands both stamps in the SAME second at datetime()'s one-second
+# resolution (the tie DIVE-2624 measured on this very column pair and solved with a
+# token instead of a clock). `<=` would hand that tie to the GRADE and reprint the
+# exact label this row exists to remove. The tie goes to the REJECT because the two
+# errors are not symmetric: a false `graded->merge` tells an agent to STOP on live
+# work, while a false plain status merely makes someone open the row.
+#
+# The OLDER-reject arm is still a real state and still renders graded->merge:
+# graded_at is COALESCE'd (first grade wins), so a reject that predates the
+# first-ever grade is a verifier who bounced and then graded a pass without a
+# re-delivery. handoff_rejected_at is a TOKEN spent (NULLed) by the next delivery,
+# so a live one means the maker has not answered the bounce yet.
+# DIVE-3430 — AND A GRADE IS NOT A PASS. DIVE-3428 closed the REJECT door; this is
+# the other one, and it needs no second actor at all. `graded_at` is stamped in
+# `cmd_task_verify`'s else-branch, and that else is the else of
+# `rc == 0 && ! no_done` — so a verifier who records a FAIL through `task verify` and
+# does NOT additionally `task reject` stamps graded_at, leaves handoff_rejected_at
+# NULL, and reproduces the DIVE-3315 render exactly with no token for the conjunct
+# above to see. Measured on a bound fixture before this line existed:
+#   task verify --cmd=false                                 -> graded_at set, reject NULL
+#   task verify --no-done --cmd=false --result="FAIL: ..."   -> graded_at set, reject NULL
+# both rendering graded->merge. Two doors, two tokens: handoff_rejected_at is the
+# `reject` verb's, graded_verdict is `verify`'s. `reject` deliberately does NOT write
+# graded_verdict — it has its own token, and writing both would make a bounce
+# unrecoverable by the pass-grade path DIVE-3428's older-reject arm depends on.
+#
+# NULL IS A PASS HERE, and that is the whole migration story. NULL means "graded
+# before this column existed", not "failed"; reading it as a fail would drop every
+# already-graded row off the board the moment this shipped — a silent regression on
+# live data, in the direction this predicate is least able to afford. See the CREATE
+# TABLE comment for why no backfill can do better than that.
 _TASKS_TFV_SQL="graded_at IS NOT NULL
        AND delivery_ref IS NOT NULL AND TRIM(delivery_ref) <> ''
        AND (maker_agent IS NULL OR graded_by IS NULL OR graded_by <> maker_agent)
+       AND (handoff_rejected_at IS NULL OR handoff_rejected_at < graded_at)
+       AND (graded_verdict IS NULL OR graded_verdict = 'pass')
        AND status NOT IN ('done','cancelled')"
 
 _TASKS_DB_GATE_COLUMNS=''

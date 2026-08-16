@@ -80,14 +80,54 @@ _rn_changelog_added() {
 # group) and its prose follows. A pure-headline cut renders as pure bullets.
 _rn_group() {
   # Stage 1 (sed): recognise the section heading and reduce it to a marker plus
-  # the subject. Kept in sed because the em/en-dash bracket is a multibyte match
-  # and this is the expression that has always handled it; awk then sees ASCII.
-  sed -E 's/^## +(Unreleased|v?[0-9][^ ]*) +[-—–]+ +(.*)$/@@ENTRY@@\2/; s/^## +Unreleased *$/@@ENTRY@@Changes/' \
-  | awk '
-    BEGIN { n = 0; pre = "" }
-    /^@@ENTRY@@/ { n++; subj[n] = substr($0, 10); body[n] = ""; next }
-    { if (n == 0) pre = pre $0 "\n"; else body[n] = body[n] $0 "\n" }
+  # the VERSION IT NAMES plus the subject. Kept in sed because the em/en-dash
+  # bracket is a multibyte match and this is the expression that has always
+  # handled it; awk then sees ASCII.
+  #
+  # DIVE-3435: THE VERSION TOKEN IS CARRIED THROUGH, and that is the fix. It used
+  # to be discarded here (`\2` only), which is why the filter below could not have
+  # existed. An EDIT to a historical heading — `## Unreleased — foo` rewritten to
+  # `## v0.19.2 — foo` on main — is a deleted line plus an added line, and to
+  # `git diff` an added line is an added line. v0.19.34 shipped ~50 such headings,
+  # every release back to 0.19.0, because three commits in its range restamped
+  # history (DIVE-3292, DIVE-3291, DIVE-3391). The range was right; the filter was
+  # missing.
+  sed -E 's/^## +(Unreleased|v?[0-9][^ ]*) +[-—–]+ +(.*)$/@@ENTRY@@\1@@\2/; s/^## +Unreleased *$/@@ENTRY@@Unreleased@@Changes/' \
+  | awk -v cutver="$version" '
+    # WHICH HEADINGS CAN BE CONTENT FOR THE VERSION BEING CUT, and why this is a
+    # rule rather than a heuristic. Main is NEVER stamped (DIVE-2247 removed this
+    # job push to a protected branch); the fold and the stamp happen only on the
+    # detached release commit, which IS the `to` end of the range. So exactly two
+    # heading forms can name this cut:
+    #   `## Unreleased`  — written on main and not yet stamped;
+    #   `## v<cutver>`   — stamped onto the release commit moments ago. NOT
+    #                      belt-and-braces: every section this cut ships reaches
+    #                      the diff in this form, so dropping it would empty the
+    #                      notes of the real release.
+    # Any OTHER version token is, by definition, a heading someone edited on main
+    # after that version already shipped. Drop the entry AND its accumulated body:
+    # the prose under a restamped heading is historical too, and that is where the
+    # bulk of v0.19.34 2696 added lines went.
+    function names_this_cut(v) {
+      return (v == "Unreleased" || v == cutver || v == "v" cutver)
+    }
+    BEGIN { n = 0; pre = ""; skipping = 0 }
+    /^@@ENTRY@@/ {
+      rest = substr($0, 10); p = index(rest, "@@")
+      ver = substr(rest, 1, p - 1); sj = substr(rest, p + 2)
+      if (!names_this_cut(ver)) { skipping = 1; next }
+      skipping = 0; n++; subj[n] = sj; body[n] = ""; next
+    }
+    # A dropped entry body must not fall through into `pre` either — `n` is still 0
+    # when the first heading in the range is a historical one, and without this the
+    # leak would simply move.
+    { if (skipping) next; if (n == 0) pre = pre $0 "\n"; else body[n] = body[n] $0 "\n" }
     END {
+      # KNOWN RESIDUAL (DIVE-3435, deliberate): `pre` — added lines that appear
+      # BEFORE any heading — is NOT version-filtered. It is the heading-less
+      # fragment path, so there is no version token to filter on, and narrowing it
+      # blind would drop real content. Same class of leak, narrower. Left as is on
+      # purpose; do not silently change it.
       if (pre ~ /[^ \t\n]/) printf "%s\n", pre
       title["feat"] = "Features"; title["fix"] = "Fixes"; title["other"] = "Other"
       order = "feat fix other"; ng = split(order, G, " ")
