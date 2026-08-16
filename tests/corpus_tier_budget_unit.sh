@@ -1533,6 +1533,90 @@ if len(summ) == 1:
     chk(not problems,
         'the EMITTED figure is graded: a job reads the un-sharded total out of the run output, can fail on its absence, never compares it to a budget, and both required checks require it (an if:-only arm survives a broken glob, a renamed step, an early return and a dropped upload — measured)',
         ' | '.join(problems))
+
+# 98 — THE SHARD COUNT IS A PINNED NUMBER, NOT A SENTENCE. Found by codex grading this
+# row's own PR: changing BOTH core matrices from [1, 2] to [1, 2, 3] passes 142/0. Every
+# arm above stays green because every one of them is about the shape of the split and not
+# its SIZE — 94 asks that a divisor be taken from the matrix length and is happier the
+# longer the matrix gets, 95/96/97 are about the total being printed and ungated, and 92/93
+# key on aggregator names that were deliberately built to survive a shard-count change
+# (`the contract with the merge gate is the aggregator's name, not the corpus's shape`).
+# So the one property nothing held was N.
+#
+# This job's own header says a third shard `is exactly as visible, and exactly as much a
+# policy decision, as raising the number would have been`. Measured, it was neither: the
+# mutation adds a full extra independently-capped job per environment — the same capacity a
+# forbidden TIER_BUDGET_CORE raise would buy — and arrives silently, on green.
+#
+# THAT IS THIS ROW'S OWN DEFECT ONE LEVEL OUT, and main's lead review predicted it in
+# advance (residual 4): `an assertion in a comment is not a control`. The row shipped an
+# honesty instrument, then a guard for the instrument (97), and the guard for the SIZE was
+# left as prose. Written down because the class keeps recurring, not because the fix is
+# clever: a rule that names itself a policy decision must be enforced by something that
+# reds, or the next reader satisfies it by editing one character.
+#
+#   community/wiki/an-assertion-in-a-comment-is-not-a-control.md
+#
+# WHAT THIS IS NOT. It is not a second budget and it does not touch one: TIER_BUDGET_CORE,
+# the calibration cap and the runner scaling factor are all untouched by this arm and by
+# this commit. It pins N, and N only.
+#
+# THE POLICY MECHANISM the exception rides on is this constant. The number is spelled ONCE
+# here, so raising it is a deliberate edit to a test file, in the diff, next to a message
+# that says what it costs — reviewable in the same way and at the same weight as raising
+# the cap, which is exactly the standing rule main set. A workflow-only change to [1, 2, 3]
+# now reds; a change that means it must come back as a gate and move this line too.
+#
+# FAIL CLOSED, because the interesting evasions are not `3`:
+#   * a computed matrix (`shard: ${{ fromJson(...) }}`) moves N out of this file and out of
+#     review entirely — a non-literal reds rather than being skipped as unparseable
+#   * `matrix: { include: [...] }` with three entries drops the `shard` key, so counting
+#     only jobs that HAVE the key would silently grade nothing — the count of sharded core
+#     corpus jobs is asserted too, at exactly one per environment
+#   * a third capacity job added ALONGSIDE the two (`core-pristine-3`) never touches a
+#     matrix at all, and is caught by that same count
+# `strategy.job-total` stays the runner's divisor throughout: arm 94 requires it and this
+# arm deliberately does not introduce a literal 2 into the workflow to satisfy itself. The
+# matrix stays the single source of N; this file is the single source of what N may BE.
+CORE_SHARDS = 2
+
+def matrix_of(job):
+    s = job.get('strategy')
+    return s.get('matrix') if isinstance(s, dict) else None
+
+core_jobs = [jn for jn, j in jobs.items()
+             if any('run-harnesses.sh' in r and '--tier=core' in r for r in runs(j))]
+# The confirm jobs are core invocations too, but their matrix is `include:` built at run
+# time from the shards that went over (one entry per over-budget shard, possibly none). N
+# is not declared there and must not be pinned there — the corpus jobs are the ones that
+# DECLARE the split, and they are the ones this arm is about.
+declared = {jn: matrix_of(jobs[jn]).get('shard')
+            for jn in core_jobs
+            if isinstance(matrix_of(jobs[jn]), dict) and 'shard' in matrix_of(jobs[jn])}
+
+want = list(range(1, CORE_SHARDS + 1))
+shard_problems = []
+if len(declared) != 2:
+    shard_problems.append(
+        'expected exactly 2 core corpus jobs declaring a literal shard matrix, one per '
+        'environment; found %d (%s) — a core job that does not declare its shards puts N '
+        'somewhere this arm cannot read it'
+        % (len(declared), ', '.join(sorted(declared)) or 'none'))
+for jn in sorted(declared):
+    v = declared[jn]
+    if not isinstance(v, list) or not all(isinstance(x, int) for x in v):
+        shard_problems.append(
+            '%s: shard matrix %r is not a literal list of integers — a computed matrix '
+            'sets the shard count outside this file, where no review sees it' % (jn, v))
+    elif v != want:
+        shard_problems.append(
+            '%s: shard matrix is %r, pinned at %r — each shard is another independently '
+            'capped job, so this is a capacity change of the same weight as raising '
+            'TIER_BUDGET_CORE and must come back as a gate (then move CORE_SHARDS here)'
+            % (jn, v, want))
+chk(not shard_problems,
+    'the core shard count is PINNED at %d per environment and the pin is parsed, not asserted in a comment (a third shard is a declared capacity raise: it must arrive as a policy decision that edits this line, not as one character in the workflow)' % CORE_SHARDS,
+    ' | '.join(shard_problems))
 PY
   )
 else bad "unit-tests.yml is readable from the harness (DIVE-3315 arms)" "no file at $_wf3315"; fi
