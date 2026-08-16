@@ -155,6 +155,12 @@ _HB_VERIFY_STALE_MIN="${HEARTBEAT_VERIFY_STALE_MIN:-60}"
 # outlived its own cadence and started suppressing the NEXT slot.
 _HB_RECURRING_STALL_HOURS="${HEARTBEAT_RECURRING_STALL_HOURS:-24}"
 [[ "$_HB_RECURRING_STALL_HOURS" =~ ^[0-9]+$ ]] || _HB_RECURRING_STALL_HOURS=24
+# DIVE-3483: how long a NON-recurring row may sit todo on a seat before arm (a6)
+# says so once. 24h is deliberately generous — a row untouched for a full day on a
+# live seat is not "busy today", and the two rows that forced this arm had sat 3
+# and 4 days. Tighten it and the arm starts announcing rows that are merely queued.
+_HB_STRANDED_HOURS="${HEARTBEAT_STRANDED_HOURS:-24}"
+[[ "$_HB_STRANDED_HOURS" =~ ^[0-9]+$ ]] || _HB_STRANDED_HOURS=24
 # DIVE-2853: how long AFTER that one-shot notice an instance may still sit
 # todo-and-never-started before the ladder CHANGES HANDS. Same default window as
 # the first rung, so a daily beat gets one full extra cadence with its original
@@ -3252,6 +3258,77 @@ _hb_stall_sweep() {
                  AND gate_answered_nudged_at IS NULL
                  AND parked_at IS NULL
                  AND need_answered_at <= datetime('now','-${_HB_VERIFY_STALE_MIN} minutes');")
+
+  # (a6) DIVE-3483 — A ROW STRANDED ON A **BUSY** SEAT.
+  #
+  # The gap this closes, measured on the live board 2026-08-16: idle-stranded was
+  # detected 4187 times in 7 days across 11 agents and acted on ZERO times, while
+  # (b) below — the only arm that actually sends — has fired ONCE in the board's
+  # history (task_prefs.stall_alerted_at = 2026-08-12). Detection without a
+  # consumer on one side, an alarm that cannot fire on the other.
+  #
+  # WHY NEITHER EXISTING RAIL SEES IT. Both take IDLENESS as a precondition, and
+  # the real shape is a LIVE seat holding a row it never chooses:
+  #   * cmd_supervisor.sh's `stalled` needs THAT SEAT to have no active work, so a
+  #     seat working its own charter classifies healthy and its stranded row is
+  #     invisible; and it is observe-only by design ("recorded, NEVER acted on").
+  #   * (b) needs the WHOLE FLEET idle (in_prog==0 AND running_loops==0). With 132
+  #     open rows that is essentially never true, so a row that is not moving stays
+  #     silent because OTHER agents are busy — which says nothing about this row.
+  # Both live instances were LANE problems, not priority problems: DIVE-3339 (the
+  # only defect between lodar and a two-way buzz conversation) sat 4 days
+  # never-started on a lane at its WIP cap, and DIVE-3330 (a close path that walks
+  # past the merge gate) sat 3 days dropped on a seat that was demonstrably alive.
+  # lodar found both by reading the board; no rail did.
+  #
+  # DELIBERATELY NOT A RECOVERY ACTION. This surfaces and names the lane; it never
+  # reassigns. Hands-changing is the (a3) ladder's job and it is scoped to recurring
+  # instances on purpose — auto-moving arbitrary work is a P2 action and this rail,
+  # like the supervisor, stays observe-and-report.
+  #
+  # THROTTLE IS THE WHOLE DESIGN. Naive surfacing here emits those 4187 pings, gets
+  # muted, and recreates the silent-monitoring defect DIVE-3460 exists to remove. So
+  # it is one ping per ROW (stranded_pinged_at, the shipped_flag_at pattern), never
+  # one per sweep. A row is announced once and then never again.
+  local srow sid sident sasg ssince stmpl sdays sbusy sload
+  while IFS= read -r srow; do
+    [[ -n "$srow" ]] || continue
+    IFS=$'\x1f' read -r sid sident sasg ssince <<<"$srow"
+    [[ -n "$sid" && -n "$sasg" ]] || continue
+    sdays=$(( ($(date -u +%s) - $(date -u -d "$ssince" +%s 2>/dev/null || date -u +%s)) / 86400 ))
+    # NAME THE LANE, so the reader can act in one step instead of re-investigating.
+    # What the seat IS doing is the evidence that it is alive and simply not choosing
+    # this row — the distinction the two blind rails above cannot draw.
+    sbusy=$(db "SELECT COALESCE(ident,'DIVE-'||id) FROM tasks
+                WHERE kind='standard' AND status='in_progress'
+                  AND assignee=$(sqlq "$sasg") ORDER BY id LIMIT 1;" 2>/dev/null || echo "")
+    sload=$(db "SELECT COUNT(*) FROM tasks
+                WHERE kind='standard' AND status='todo'
+                  AND assignee=$(sqlq "$sasg");" 2>/dev/null || echo "")
+    [[ "$sload" =~ ^[0-9]+$ ]] || sload=""
+    ( cmd_send "ops" --from="task-engine" \
+        --message="🧊 Stranded ${sdays}d: ${sident} has sat todo on '${sasg}' for ${sdays} day(s) without being started${sbusy:+, while that seat is ACTIVE on ${sbusy}}${sload:+ and holds ${sload} other todo row(s)} — so this is a LANE problem, not a priority problem, and re-pinging the same seat will not clear it (reassign, or cancel it if it is dead). Surfaced once per row and never again (DIVE-3483)." ) >/dev/null 2>&1 || true
+    db "UPDATE tasks SET stranded_pinged_at=datetime('now') WHERE id=${sid};"
+    _hb_log "[stranded] ${sident} todo ${sdays}d on ${sasg}${sbusy:+ (active on ${sbusy})} -> surfaced"
+  done < <(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id)||x'1f'||COALESCE(assignee,'')||x'1f'||COALESCE(first_started_at,created_at)
+               FROM tasks
+               WHERE kind='standard' AND status='todo' AND assignee IS NOT NULL
+                 AND stranded_pinged_at IS NULL
+                 -- a recurring instance is (a2)'s row, not this one — it has its own
+                 -- suppression story (skip-if-open eats the beat) and its own ladder.
+                 AND from_template_id IS NULL
+                 -- a delivery awaiting its verifier is gap#2's row above. Same
+                 -- reason (a2) is excluded: two rails announcing one row is how a
+                 -- monitor earns its mute.
+                 AND NOT (maker_agent IS NOT NULL AND verifier IS NOT NULL
+                          AND assignee=verifier AND handoff_ack_at IS NULL)
+                 -- waiting on a HUMAN is not stranded; the remedy is not the seat's.
+                 AND NOT (need_type IS NOT NULL AND need_answered_at IS NULL)
+                 AND parked_at IS NULL
+                 -- measured from the DROP for a row started once and abandoned, from
+                 -- creation otherwise. Deliberately not updated_at: any row touch
+                 -- bumps that, so it cannot answer 'how long has this not moved'.
+                 AND COALESCE(first_started_at,created_at) <= datetime('now','-${_HB_STRANDED_HOURS} hours');")
 
   # (b) GAP#3 core — fleet-idle-while-actionable-work-is-open, persisting.
   local in_prog running_loops stranded_todo open_gates parked_gates total_stranded
