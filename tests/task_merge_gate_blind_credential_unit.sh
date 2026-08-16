@@ -178,6 +178,31 @@ ok  "T4 both rails blind: rc is non-zero"      "$((rc != 0))" "1"
 ok  "T4 both rails blind: stdout is empty"     "$out" ""
 has "T4 names the caller's blindness"          "$_GATE_GH_LAST_ERR" "cannot see this repository"
 has "T4 names that the fallback was tried too" "$_GATE_GH_LAST_ERR" "credential-free rails were tried"
+# DIVE-3496 iteration 2 — THE ARM THAT WAS MISSING, and why the two above could
+# not stand in for it. Both match literals that live in the ASSIGNMENT ITSELF, so
+# they survive ANY value of the interpolated tail — including the empty string it
+# actually was. `_esc_out=$(_gate_gh_nocred ...)` runs the callee in a subshell,
+# `_gate_gh` resets `_GATE_GH_LAST_ERR` to "" at entry, and the reader got
+# "…could not answer: " with nothing after the colon: the half saying WHY the
+# fallback failed, silently dropped. Found by main in review of #673, confirmed
+# empirically by quinn against a 25/0 harness. This arm reads PAST the colon.
+has  "T4 the credential-free rail's OWN reason survives the subshell" \
+     "$_GATE_GH_LAST_ERR" "could not answer: gh: Not Found (HTTP 404)"
+# And the shape-independent form of the same assertion: whatever the wording, the
+# text after the colon must not be EMPTY. This is the arm that would have gone red
+# on #673 no matter how the tail was worded.
+ok   "T4 the tail after the colon is non-empty" \
+     "$([[ -n "${_GATE_GH_LAST_ERR##*could not answer: }" ]] && printf 1 || printf 0)" "1"
+
+# T4b: the OTHER double-blind shape — no bot rail at all under the escalation. The
+# legacy no-rail sentence must reach the reader through the same sink, so the two
+# double-blind causes stay distinguishable in the text a verifier is handed.
+reset_stubs; export GH_STUB_MODE=blind_repo BOT_STUB_AVAILABLE=0
+_gate_gh "ghs_pinned_to_the_org" 0 pr view https://github.com/lodar/5dive-api/pull/110 --json state -q .state >"$TMP/out"; rc=$?; out=$(cat "$TMP/out")
+ok  "T4b blind caller + no rail at all: rc is non-zero" "$((rc != 0))" "1"
+ok  "T4b stdout is empty"                               "$out" ""
+has "T4b still names the caller's blindness"            "$_GATE_GH_LAST_ERR" "cannot see this repository"
+has "T4b and carries the no-rail cause through the sink" "$_GATE_GH_LAST_ERR" "could not answer: no gh rail: no token"
 
 # ------------------------------------ T5: THE EXTRACTION DID NOT MOVE ANYTHING
 # No token at all is the path every credential-less verifier seat already takes.
