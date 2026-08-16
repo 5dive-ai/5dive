@@ -291,16 +291,70 @@ grade "F: compose mgrs/reports are mapfile-populated (=> NOT a live crash)" 2 "$
 # name never declared at all. This resolves EVERY `${#NAME[@]}` read in src/
 # against how NAME is created earlier in its own function.
 #
-# It is non-vacuous: on pristine origin/main it reports exactly ONE unresolved
-# read — cmd_agent_teambot.sh:1258 $wired, the reported live crash — and does
-# NOT report cmd_compose.sh, which is the whole-codebase confirmation that the
-# ticket's "two live sites" count was one too high.
+# FILE-SCOPE WIDENING (DIVE-3471). The original resolver looked ONLY between the
+# enclosing function's opening line and the read, so a file-scope
+# `declare -A NAME` in another sourced src file — e.g. OPENCLAW_PROVIDER_MODEL at
+# src/header.sh, and header.sh is always sourced first — could NEVER satisfy it.
+# `${#OPENCLAW_PROVIDER_MODEL[@]}` in src/cmd_doctor.sh red this arm with no
+# defect behind it (quinn, reviewing DIVE-3457 / PR #658). The resolver now also
+# accepts a file-scope creation in ANY sourced src file.
+#
+# "File-scope" is column 0 and outside a heredoc body. Column 0 is the whole
+# discriminator and it is deliberate: every function body line in this tree is
+# indented, so an unindented `declare`/`NAME=(` is a global by construction,
+# while an indented one inside a function must NOT whitelist the name for every
+# other function in the tree. Heredoc bodies are skipped because a generated
+# script embedded in one can contain a column-0 `declare -A X=(` that creates
+# nothing in THIS shell — whitelisting from it would silence a real defect.
+# `declare -f/-F/-p NAME` are QUERIES, not creations, and are excluded (this
+# tree has ten of them, all `declare -F fn >/dev/null || . …` source guards).
+#
+# NON-VACUITY, and it moved since this arm was written. On pristine origin/main
+# TODAY the reported set is EMPTY: the teambot `wired` instance this harness was
+# built around now carries its `=()` (DIVE-2104's own fix), so "unchanged over
+# pristine main" is empty-to-empty and proves nothing on its own. The control
+# that actually separates TAUGHT from SILENCED is therefore run against mutated
+# trees below (G3), not against main.
 # ---------------------------------------------------------------------------
-unresolved=$(python3 - <<'PY'
-import re, glob
+# One resolver, two modes, so the pre-change behaviour stays executable as the
+# control instead of being asserted in prose. argv: <repo-root> <mode>, where
+# mode `filescope` is the widened resolver and `nofilescope` is the original.
+cat >"$TMP/resolve.py" <<'PY'
+import re, glob, os, sys
+root, mode = sys.argv[1], sys.argv[2]
+os.chdir(root)
+files = sorted(glob.glob("src/*.sh") + glob.glob("src/lib/*.sh") + glob.glob("src/task/*.sh"))
+
+def file_scope_names(lines):
+    """Names created at column 0, outside heredoc bodies, in one file."""
+    names, hd = set(), None
+    for l in lines:
+        if hd is not None:
+            if l.strip() == hd: hd = None
+            continue
+        if l.lstrip().startswith('#'): continue   # BEFORE the heredoc scan: a comment
+        # that merely NAMES `<<EOF` (src/cmd_agent_runtime.sh:121 does) would open a
+        # heredoc that never closes and swallow the rest of the file. `<<<` is a
+        # here-STRING and opens nothing, hence the (?!<).
+        m = re.search(r'<<(?!<)-?\s*([\'"]?)([A-Za-z_][A-Za-z0-9_]*)\1', l)
+        if m: hd = m.group(2)
+        if l[:1].isspace(): continue
+        m = re.match(r'(?:declare|typeset)\s+((?:-[A-Za-z]+\s+)*)([A-Za-z_][A-Za-z0-9_]*)\b', l)
+        if m:
+            if not re.search(r'[fFp]', m.group(1)): names.add(m.group(2))
+            continue
+        m = re.match(r'([A-Za-z_][A-Za-z0-9_]*)=\(', l)
+        if m: names.add(m.group(1))
+    return names
+
+src = {f: open(f).readlines() for f in files}
+globals_ = set()
+if mode == "filescope":
+    for f in files: globals_ |= file_scope_names(src[f])
+
 out = []
-for f in sorted(glob.glob("src/*.sh") + glob.glob("src/lib/*.sh") + glob.glob("src/task/*.sh")):
-    lines = open(f).readlines()
+for f in files:
+    lines = src[f]
     fstart, cur = {}, 0
     for i, l in enumerate(lines):
         if re.match(r'^[_a-zA-Z][_a-zA-Z0-9]*\(\)\s*\{', l): cur = i
@@ -309,7 +363,14 @@ for f in sorted(glob.glob("src/*.sh") + glob.glob("src/lib/*.sh") + glob.glob("s
         if l.lstrip().startswith('#'): continue
         for m in re.finditer(r'\$\{#([A-Za-z_][A-Za-z0-9_]*)\[[@*]\]\}', l):
             var = m.group(1)
-            # only what executes BEFORE the read can have created it
+            # A `local NAME` earlier in this function SHADOWS the global and does
+            # NOT create it, so the file-scope whitelist must not apply — that is
+            # the same unbound crash this harness exists for, wearing a global's
+            # name. Graded by G3c.
+            shadowed = any(re.search(rf'\blocal\b[^\n]*\b{var}\b(?!=)', b)
+                           for b in lines[fstart[i]:i])
+            if var in globals_ and not shadowed: continue   # file-scope global in a sourced src file
+            # otherwise only what executes BEFORE the read can have created it
             created = any(
                 re.search(rf'\b(local|declare|typeset)\b[^\n]*\b{var}=', b)
                 or re.search(rf'\bmapfile\b[^\n]*\s{var}\b', b)          # assignment builtin
@@ -320,8 +381,96 @@ for f in sorted(glob.glob("src/*.sh") + glob.glob("src/lib/*.sh") + glob.glob("s
             if not created: out.append(f"{f}:{i+1} ${var}")
 print("\n".join(out))
 PY
-)
+ROOT=$(pwd)
+unresolved=$(python3 "$TMP/resolve.py" "$ROOT" filescope)
 grade "G: class guard — every \${#x[@]} read resolves to a created array" "" "$unresolved"
+
+# NO "old set == new set on the real tree" ARM LIVES HERE, deliberately. That
+# comparison is the GRADING artifact for the widening (run once, at review, and
+# recorded on DIVE-3471) — as a standing arm it would red the first time somebody
+# writes the legitimate file-scope read this change exists to permit, which is
+# the very false positive being removed. The standing controls are G2/G3 below:
+# they grade the two DIRECTIONS of the resolver against mutated trees, which is
+# what "taught, not silenced" actually means once main itself has no instance.
+
+# ---------------------------------------------------------------------------
+# G2/G3 — MUTATIONS, both directions, on a throwaway copy of src/. A green arm
+# is only the control; these are the evidence that the widening is a capability
+# and not a silencing.
+# ---------------------------------------------------------------------------
+mkdir -p "$TMP/mut" && cp -R "$SRC" "$TMP/mut/src"
+DOCTOR="$TMP/mut/src/cmd_doctor.sh"
+ANCHOR='  local canonical native pin ids n stale=0 noracle=0 graded=0 rows=0'
+grade "G2: mutation anchor still present in cmd_doctor.sh" \
+      "1" "$(grep -cFx "$ANCHOR" "$DOCTOR")"
+
+# G2 — the CAPABILITY. Restore the read DIVE-3457 shipped around: a length read
+# of OPENCLAW_PROVIDER_MODEL, declared -A at file scope in src/header.sh, inside
+# a cmd_doctor.sh function. The old resolver MUST report it (that is the false
+# positive this row exists to remove) and the widened one MUST NOT.
+python3 - "$DOCTOR" "$ANCHOR" <<'PY'
+import sys
+p, anchor = sys.argv[1], sys.argv[2]
+s = open(p).read()
+assert s.count(anchor + "\n") == 1
+open(p, "w").write(s.replace(anchor + "\n",
+    anchor + "\n  rows=${#OPENCLAW_PROVIDER_MODEL[@]}\n", 1))
+PY
+mut_old=$(python3 "$TMP/resolve.py" "$TMP/mut" nofilescope)
+mut_new=$(python3 "$TMP/resolve.py" "$TMP/mut" filescope)
+grade "G2: pre-change resolver REDS on the restored file-scope read (non-vacuity)" \
+      "yes" "$(grep -q 'cmd_doctor.sh:.* \$OPENCLAW_PROVIDER_MODEL$' <<<"$mut_old" && echo yes || echo no)"
+grade "G2: widened resolver RESOLVES the restored file-scope read" "" "$mut_new"
+
+# G3 — the DISCRIMINATION, and the real not-silenced control. Two mutations the
+# widened resolver must STILL report:
+#   (a) a length read of a name declared nowhere at all — the widening must not
+#       degrade into "any name in a global-looking read is fine";
+#   (b) teambot `wired` with its `=()` stripped back off — the original live
+#       crash. A widened arm that stops reporting THIS has been silenced.
+mkdir -p "$TMP/mut3" && cp -R "$SRC" "$TMP/mut3/src"
+python3 - "$TMP/mut3/src/cmd_doctor.sh" "$ANCHOR" <<'PY'
+import sys
+p, anchor = sys.argv[1], sys.argv[2]
+s = open(p).read()
+assert s.count(anchor + "\n") == 1
+open(p, "w").write(s.replace(anchor + "\n",
+    anchor + "\n  rows=${#OPENCLAW_NO_SUCH_TABLE[@]}\n", 1))
+PY
+TEAMBOT="$TMP/mut3/src/cmd_agent_teambot.sh"
+grade "G3: wired declaration still carries =() on the real tree (anchor)" \
+      "1" "$(grep -cE '^\s*local -a wired=\(\)$' "$TEAMBOT")"
+python3 - "$TEAMBOT" <<'PY'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+s2, n = re.subn(r'(?m)^(\s*local -a wired)=\(\)$', r'\1', s)
+assert n == 1
+open(p, "w").write(s2)
+PY
+mut3=$(python3 "$TMP/resolve.py" "$TMP/mut3" filescope)
+grade "G3a: widened resolver still REDS on a name declared nowhere" \
+      "yes" "$(grep -q 'cmd_doctor.sh:.* \$OPENCLAW_NO_SUCH_TABLE$' <<<"$mut3" && echo yes || echo no)"
+grade "G3b: widened resolver still REDS on teambot \$wired stripped of =()" \
+      "yes" "$(grep -q 'cmd_agent_teambot.sh:.* \$wired$' <<<"$mut3" && echo yes || echo no)"
+
+# G3c — SHADOWING. `local OPENCLAW_PROVIDER_MODEL` inside the function shadows
+# the file-scope declare and creates nothing, so the read is a live crash again
+# even though the name is on the whitelist. Without this the widening would be a
+# name-based amnesty rather than a scope-aware resolution.
+mkdir -p "$TMP/mut4" && cp -R "$SRC" "$TMP/mut4/src"
+python3 - "$TMP/mut4/src/cmd_doctor.sh" "$ANCHOR" <<'PY'
+import sys
+p, anchor = sys.argv[1], sys.argv[2]
+s = open(p).read()
+assert s.count(anchor + "\n") == 1
+open(p, "w").write(s.replace(anchor + "\n",
+    anchor + "\n  local OPENCLAW_PROVIDER_MODEL\n"
+             "  rows=${#OPENCLAW_PROVIDER_MODEL[@]}\n", 1))
+PY
+grade "G3c: a local shadowing a file-scope global is still REPORTED" \
+      "yes" "$(python3 "$TMP/resolve.py" "$TMP/mut4" filescope \
+                 | grep -q 'cmd_doctor.sh:.* \$OPENCLAW_PROVIDER_MODEL$' && echo yes || echo no)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL" >&2
 # Verdict LAST: a tally printf after this line would silently disarm the whole

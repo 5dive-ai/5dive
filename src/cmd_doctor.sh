@@ -708,12 +708,14 @@ doctor_check_openclaw_model_pins() {
 
   # ── catalog rows ────────────────────────────────────────────────────────
   # `rows` is counted in the loop rather than read as ${#OPENCLAW_PROVIDER_MODEL[@]}
-  # in the summary line. Not cosmetic: tests/local_array_unbound_default_unit.sh
-  # arm G resolves every such read against a creation earlier in the SAME
-  # function, so a file-scope `declare -A` in src/header.sh can never satisfy it
-  # and the read reds a guard that is green on main. Widening that guard to
-  # accept file-scope globals is a change to the guard's own non-vacuity and
-  # does not belong in this diff (DIVE-3457, quinn iteration 1).
+  # in the summary line. That was forced (DIVE-3457, quinn iteration 1): arm G of
+  # tests/local_array_unbound_default_unit.sh resolved every such read against a
+  # creation earlier in the SAME function, so a file-scope `declare -A` in
+  # src/header.sh could never satisfy it and the read red a guard with no defect
+  # behind it. DIVE-3471 taught the resolver to accept a file-scope creation in
+  # any sourced src file, so the read is no longer barred here — the loop count
+  # simply stays, because rewriting a shipped, working summary line to exercise
+  # the new capability buys nothing.
   local canonical native pin ids n stale=0 noracle=0 graded=0 rows=0
   for canonical in $(printf '%s\n' "${!OPENCLAW_PROVIDER_MODEL[@]}" | sort); do
     rows=$((rows + 1))
