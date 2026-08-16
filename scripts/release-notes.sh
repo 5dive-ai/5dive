@@ -56,6 +56,57 @@ _rn_changelog_added() {
     | sed -n 's/^+\([^+].*\)$/\1/p; s/^+$//p'
 }
 
+# _rn_heading_subjects — reduce every entry heading in a CHANGELOG text to its bare
+# SUBJECT, one per line, using the SAME expression _rn_group's stage 1 uses. Both
+# sides of the membership comparison below must be produced by one expression or a
+# whitespace difference silently reopens the leak.
+_rn_heading_subjects() {
+  sed -n -E 's/^## +(Unreleased|v?[0-9][^ ]*) +[-—–]+ +(.*)$/\2/p; s/^## +Unreleased *$/Changes/p'
+}
+
+# _rn_prior_subjects — the subjects CHANGELOG.md ALREADY carried at the START of the
+# range, written to a file for awk to read as a set.
+#
+# DIVE-3472: THIS IS THE HALF DIVE-3435 COULD NOT SEE. That fix filters on the
+# heading's VERSION TOKEN, which catches a heading someone restamped to some OTHER
+# version on main. It cannot catch the far more common case, because of an
+# interaction between two facts each of which is correct on its own:
+#
+#   * main's CHANGELOG.md is NEVER stamped and never cleared (DIVE-2247 removed this
+#     workflow's push to a protected branch), so a section that shipped in v0.19.30
+#     still reads `## Unreleased` on main today — forever;
+#   * stamp-changelog.sh runs on the detached release commit and rewrites EVERY
+#     `## Unreleased` heading to the version being cut, on the stated assumption
+#     that "at the release commit, pending is empty by construction".
+#
+# That assumption is false for exactly the sections main never cleared. So at the
+# `to` end, seven already-shipped sections read `## v0.19.36`, `names_this_cut()`
+# says yes to every one of them, and they render as new. Measured 2026-08-16:
+# main carried 7 stale `## Unreleased` headings and v0.19.36's page carried 9
+# entries — the 2 real ones plus all 7. It is a FIXED TAIL that reappears in every
+# cut (v0.19.33..v0.19.36 all shipped DIVE-3344) and grows by whatever the next cut
+# fails to clear.
+#
+# THE PREDICATE IS MEMBERSHIP, NOT SHAPE. An entry belongs to this cut iff its
+# subject was NOT already in CHANGELOG.md at the range's start. That is the footer's
+# own range restated as a set difference, and it is immune to the stamp by
+# construction: restamping changes the version token and never the subject.
+#
+# SECOND RESIDUAL, stated rather than discovered later: the key is the subject, so an
+# entry RE-FILED under a byte-identical headline is read as already-shipped and does
+# not render. Narrow by construction — the fold's own re-fold rule is byte-identity
+# on the whole fragment, so a re-file that changes only prose is the single case, and
+# it costs a headline on one page rather than a leak on every page. Change the key,
+# not the rule, if that ever matters.
+#
+# A `from` we cannot read gives an EMPTY set, which fails OPEN (nothing filtered)
+# exactly as it did before this change — the version filter still applies, and a
+# cut must not die over an unreadable changelog.
+_rn_prior_subjects() {
+  [[ -n "$from" ]] || return 0
+  git show "${from}:${changelog}" 2>/dev/null | _rn_heading_subjects
+}
+
 # _rn_group — turn the CHANGELOG's per-entry H2 sections into ONE grouped list.
 #
 # WHY (lodar, 2026-08-09, on the v0.19.9 page): "lets not wrap each release notes
@@ -79,6 +130,9 @@ _rn_changelog_added() {
 # becomes a bullet, an entry WITH prose keeps a heading (demoted to H4, inside its
 # group) and its prose follows. A pure-headline cut renders as pure bullets.
 _rn_group() {
+  local priorfile
+  priorfile="$(mktemp)"
+  _rn_prior_subjects > "$priorfile" 2>/dev/null || :
   # Stage 1 (sed): recognise the section heading and reduce it to a marker plus
   # the VERSION IT NAMES plus the subject. Kept in sed because the em/en-dash
   # bracket is a multibyte match and this is the expression that has always
@@ -93,7 +147,7 @@ _rn_group() {
   # history (DIVE-3292, DIVE-3291, DIVE-3391). The range was right; the filter was
   # missing.
   sed -E 's/^## +(Unreleased|v?[0-9][^ ]*) +[-—–]+ +(.*)$/@@ENTRY@@\1@@\2/; s/^## +Unreleased *$/@@ENTRY@@Unreleased@@Changes/' \
-  | awk -v cutver="$version" '
+  | awk -v cutver="$version" -v priorfile="$priorfile" '
     # WHICH HEADINGS CAN BE CONTENT FOR THE VERSION BEING CUT, and why this is a
     # rule rather than a heuristic. Main is NEVER stamped (DIVE-2247 removed this
     # job push to a protected branch); the fold and the stamp happen only on the
@@ -111,11 +165,18 @@ _rn_group() {
     function names_this_cut(v) {
       return (v == "Unreleased" || v == cutver || v == "v" cutver)
     }
-    BEGIN { n = 0; pre = ""; skipping = 0 }
+    # DIVE-3472: the subjects CHANGELOG.md already carried at the START of the
+    # range. An entry whose subject is in here did not arrive in this range,
+    # whatever version token the stamp has since written over its heading.
+    BEGIN {
+      n = 0; pre = ""; skipping = 0
+      if (priorfile != "") { while ((getline line < priorfile) > 0) prior[line] = 1
+                             close(priorfile) }
+    }
     /^@@ENTRY@@/ {
       rest = substr($0, 10); p = index(rest, "@@")
       ver = substr(rest, 1, p - 1); sj = substr(rest, p + 2)
-      if (!names_this_cut(ver)) { skipping = 1; next }
+      if (!names_this_cut(ver) || (sj in prior)) { skipping = 1; next }
       skipping = 0; n++; subj[n] = sj; body[n] = ""; next
     }
     # A dropped entry body must not fall through into `pre` either — `n` is still 0
@@ -123,11 +184,12 @@ _rn_group() {
     # leak would simply move.
     { if (skipping) next; if (n == 0) pre = pre $0 "\n"; else body[n] = body[n] $0 "\n" }
     END {
-      # KNOWN RESIDUAL (DIVE-3435, deliberate): `pre` — added lines that appear
-      # BEFORE any heading — is NOT version-filtered. It is the heading-less
-      # fragment path, so there is no version token to filter on, and narrowing it
-      # blind would drop real content. Same class of leak, narrower. Left as is on
-      # purpose; do not silently change it.
+      # KNOWN RESIDUAL (DIVE-3435, re-stated DIVE-3472, deliberate): `pre` — added
+      # lines that appear BEFORE any heading — is filtered by NEITHER rule. It is
+      # the heading-less fragment path, so there is no version token AND no entry
+      # subject to key on, and narrowing it blind would drop real content. Same
+      # class of leak, narrower still now that whole entries are filtered by
+      # membership. Left as is on purpose; do not silently change it.
       if (pre ~ /[^ \t\n]/) printf "%s\n", pre
       title["feat"] = "Features"; title["fix"] = "Fixes"; title["other"] = "Other"
       order = "feat fix other"; ng = split(order, G, " ")
@@ -164,6 +226,7 @@ _rn_group() {
       if (n > 0) printf "Full detail for every entry is in CHANGELOG.md at this tag.\n"
     }
   '
+  rm -f "$priorfile"
 }
 
 # _rn_commit_summary — the fallback. Conventional-commit types are grouped so the
