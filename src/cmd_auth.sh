@@ -389,17 +389,45 @@ cmd_auth_status() {
   local probe_flag="--no-probe"
   local t=""
   local profile=""
+  local agent=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --probe)         probe_flag="" ;;
       --no-probe)      probe_flag="--no-probe" ;;
       --type=*)        t="${1#--type=}" ;;
       --auth-profile=*) profile="${1#--auth-profile=}" ;;
+      --agent=*)       agent="${1#--agent=}" ;;
       -*)              fail "$E_USAGE" "unknown flag: $1" ;;
       *)               [[ -z "$t" ]] && t="$1" || fail "$E_USAGE" "extra arg: $1" ;;
     esac
     shift
   done
+
+  # DIVE-3104: --agent resolves the credential scope from the REGISTRY instead
+  # of asking the operator to know it. A bare --type query resolves the type's
+  # DEFAULT sentinel path (auth_creds_present with no profile), so it can only
+  # ever answer "is this type authed for the default profile" — it cannot see a
+  # per-AGENT credential gap by construction, and it returned `ok` for hermes /
+  # openclaw seats whose own profile-scoped credential was empty and which
+  # could not think (DIVE-3100). The per-agent path was reachable before this
+  # only via --auth-profile=<p>, which requires already knowing the profile
+  # name, i.e. exactly the fact an operator asking "is agent X authed" lacks.
+  if [[ -n "$agent" ]]; then
+    [[ -z "$profile" ]] || fail "$E_USAGE" "--agent and --auth-profile are mutually exclusive"
+    local _reg _atype
+    _reg=$(registry_read 2>/dev/null) || _reg=""
+    [[ -n "$_reg" ]] || fail "$E_NOT_FOUND" "agent registry unreadable as $(id -un) — re-run as root"
+    jq -e --arg n "$agent" '.agents | has($n)' <<<"$_reg" >/dev/null 2>&1 \
+      || fail "$E_NOT_FOUND" "unknown agent: $agent"
+    _atype=$(jq -r --arg n "$agent" '.agents[$n].type // empty' <<<"$_reg")
+    profile=$(jq -r --arg n "$agent" '.agents[$n].authProfile // empty' <<<"$_reg")
+    if [[ -n "$t" && -n "$_atype" && "$t" != "$_atype" ]]; then
+      fail "$E_USAGE" "agent '$agent' is type '$_atype', not '$t' — drop --type"
+    fi
+    [[ -n "$_atype" ]] && t="$_atype"
+    [[ -n "$t" ]] || fail "$E_NOT_FOUND" "agent '$agent' has no type recorded in the registry"
+  fi
+
   # DIVE-296: --auth-profile scopes the check to one profile, so it only makes
   # sense for a single type. Guard rather than silently checking the default.
   [[ -n "$profile" && -z "$t" ]] \
@@ -424,10 +452,54 @@ cmd_auth_status() {
     out+="\"$type\":\"$s\""
   done
   out+="}"
+
+  # DIVE-3104: say WHICH credential scope produced the answer, and — for a
+  # query that resolved the DEFAULT scope — name the registered agents this
+  # result provably does not cover. A green with no scope attached is the whole
+  # defect: it reads as "these agents are authed" when it means "the default
+  # profile is authed". Per the org rule that a figure without its scope is not
+  # a figure, the scope travels with the result rather than in the docs.
+  local scope_kind="default" scope_label="default profile"
+  if [[ -n "$agent" ]]; then
+    scope_kind="agent"
+    scope_label="agent ${agent} (profile: ${profile:-default})"
+  elif [[ -n "$profile" ]]; then
+    scope_kind="profile"
+    scope_label="profile ${profile}"
+  fi
+  # Agents of a queried type that are bound to a NON-default profile: their
+  # credential lives on a path this default-scope answer never opened.
+  local uncovered="[]"
+  if [[ "$scope_kind" == "default" ]]; then
+    local _reg2
+    _reg2=$(registry_read 2>/dev/null) || _reg2=""
+    if [[ -n "$_reg2" ]]; then
+      uncovered=$(jq -c --argjson types "$(printf '%s\n' "${types[@]}" | jq -R . | jq -sc .)" \
+        '[.agents // {} | to_entries[]
+          | select((.value.authProfile // "") != "")
+          | select(.value.type as $t | $types | index($t))
+          | {name: .key, type: .value.type, authProfile: .value.authProfile}]' \
+        <<<"$_reg2" 2>/dev/null) || uncovered="[]"
+    fi
+  fi
+
   if (( JSON_MODE )); then
-    echo "$out" | jq -c '{ok:true, data: .}'
+    echo "$out" | jq -c --arg k "$scope_kind" --arg l "$scope_label" \
+      --arg a "$agent" --arg p "$profile" --argjson u "$uncovered" \
+      '{ok:true, data: ., scope:{kind:$k, label:$l,
+                                 agent:(if $a == "" then null else $a end),
+                                 authProfile:(if $p == "" then null else $p end),
+                                 uncoveredAgents:$u}}'
   else
     echo "$out" | jq -r 'to_entries[] | "\(.key): \(.value)"' | sort
+    echo "scope: ${scope_label}" >&2
+    local _nu
+    _nu=$(jq -r 'length' <<<"$uncovered" 2>/dev/null || echo 0)
+    if (( _nu > 0 )); then
+      echo "NOT COVERED: ${_nu} agent(s) of this type read a profile-scoped credential this answer never opened —" >&2
+      jq -r '.[] | "  \(.name) (\(.type), profile: \(.authProfile)) — 5dive agent auth status --agent=\(.name)"' \
+        <<<"$uncovered" >&2
+    fi
   fi
 }
 
