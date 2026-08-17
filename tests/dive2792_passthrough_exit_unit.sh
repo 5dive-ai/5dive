@@ -17,6 +17,13 @@
 # (community/wiki/a-negative-arm-that-greps-for-failure-passes-on-any-failure.md).
 set -uo pipefail
 
+# DIVE-2692 corpus contract: ONE EXIT trap, registered before any early exit, so
+# the SKIP path below is covered too. bash keeps only the last trap per signal,
+# so the tmpdir cleanup is FOLDED in here rather than registered separately —
+# `TMP` is declared empty first because this trap outlives the mktemp by design.
+TMP=""
+trap 'rc=$?; [[ -n "$TMP" ]] && rm -rf "$TMP"; echo "HARNESS-RC=$rc"' EXIT
+
 # DIVE-2211: name the tree this harness grades. The absence of `2>/dev/null` is
 # deliberate — redirecting the source's stderr would swallow the helper's own
 # stderr line, which IS the payload.
@@ -36,7 +43,7 @@ if [[ ! -x "$BUNDLE" ]]; then
 fi
 
 BANNER='without reporting a reason'
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+TMP=$(mktemp -d)   # cleanup rides the single EXIT trap registered at the top
 mkdir -p "$TMP/stub" "$TMP/home"
 
 cat > "$TMP/stub/gh" <<'STUB'
@@ -226,6 +233,20 @@ check "$(jq -c '.data.lines' <<<"$sout" 2>/dev/null)" '["line-one","line-two"]' 
   "C9: a non-empty read reports exactly its lines, none invented"
 check "$(jq -r '.ok' <<<"$sout" 2>/dev/null)" "true" \
   "C10: the success envelope IS printed when the read succeeded"
+
+echo "== C12. --tmux takes the same helper, so it gets the same empty-read arm =="
+# `--tmux` was NOT named by the row and was not the defect — but the fix routes it
+# through the same _logs_lines_envelope, and it carried the `<<<"$capture"` shape
+# before this branch existed. Grade the class that was changed, not only the form
+# the row named. The capture goes through `sudo -u agent-<n> tmux`, which the sudo
+# stub above already intercepts; SUDO_STUB_LIST_RC=0 makes it a successful EMPTY
+# capture, which is exactly the case that used to invent a line.
+sout=$(jlogs SUDO_STUB_LIST_RC=0 --json agent logs probe --tmux 2>/dev/null); got=$?
+check "$got" "0" "C12: a successful tmux capture exits 0"
+check "$(jq -r '.data.source' <<<"$sout" 2>/dev/null)" "tmux" \
+  "C13: the envelope names tmux as the source (the tmux branch really ran)"
+check "$(jq -c '.data.lines' <<<"$sout" 2>/dev/null)" "[]" \
+  "C14: an empty tmux capture reports lines:[] (not [\"\"])"
 
 echo "== C11. control: the stub was actually consulted (C arms are not vacuous) =="
 # Without this, every C arm passes identically if the bundle never reached
