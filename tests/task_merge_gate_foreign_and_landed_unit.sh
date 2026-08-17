@@ -20,12 +20,19 @@
 # that only proves the new closes work would be green against a gate that accepts
 # everything. Asserted here: our own repo with an unmerged PR still REFUSES (A4), an
 # ancestor with NO attribution still REFUSES (B2, the DIVE-2101 vacuity shape), and
-# an UNREADABLE ancestry still REFUSES rather than accepting on an outage (B4).
+# an UNREADABLE attribution still REFUSES rather than accepting on an outage (B4).
+#
+# DIVE-3534 corrected arm 2's ACCEPTOR: attribution alone closes; ancestry of the PR
+# head is diagnostic. B1 modelled the landed commit AS the PR head, which is the one
+# arrangement "landed by another route" cannot have — on the canonical row (DIVE-3292)
+# head e2bad22 is NOT on main and fd945c2 is what landed, so the old conjunction
+# refused the exact shape it was written for. B1b/B1c cover the real shape.
 #
 # MUTATION GRADE (both must go red):
 #   * `_gate_foreign_delivery() { return 1; }`  -> A1/A2/A3 fail (foreign rows blocked again)
 #   * `_gate_foreign_delivery() { return 0; }`  -> A4 fails (our own repo stops being gated)
 #   * `_gate_branch_ident_on_main() { printf '1'; }` -> B2 fails (vacuous close accepted)
+#   * re-add the ancestry conjunct to arm 2's accept -> B1b/B1c fail (DIVE-3534)
 #   * drop the `_mg_foreign` result stamp      -> A1-record / B1-record fail (silent close)
 #
 # Isolation matches the sibling gate harnesses: source src/ into a throwaway
@@ -262,17 +269,54 @@ export GH_STUB_COMMITS_5dive_main="$(commits 'docs(changelog): correct four stal
 seed LND-1 "$OURS_PR"
 run_done LND-1 --result='landed as a direct commit'
 if [[ $RC -eq 0 && "$(statusof LND-1)" == "done" && "$(refusals LND-1)" == "0" ]]; then
-  ok_t 'a CLOSED-unmerged PR whose work is on main CLOSES on ancestry+attribution'
+  ok_t 'a CLOSED-unmerged PR whose work is on main CLOSES on attribution'
 else
   bad_t 'closed-but-landed must close' "rc=$RC status=$(statusof LND-1) refusals=$(refusals LND-1) out=$OUT"
 fi
 R=$(resultof LND-1)
-[[ "$R" == *"ancestry+attribution"* && "$R" == *"NOT on the pull request's merge flag"* ]] \
+[[ "$R" == *"ATTRIBUTION"* && "$R" == *"NOT on the pull request's merge flag"* ]] \
   && ok_t 'the record names WHICH evidence closed it, and which evidence did not' \
   || bad_t 'the close must say what accepted it' "result=$R"
 grep -q 'task.landed-without-merge' "$AUDIT_CALLS" \
   && ok_t 'and it is audited under its own name' \
   || bad_t 'expected a task.landed-without-merge audit row' "$(cat "$AUDIT_CALLS")"
+
+# ── B1b. DIVE-3534: THE REAL SHAPE — the PR head is NOT on main, and that is what
+# "landed by another route" MEANS. B1 above modelled the landed commit AS the PR
+# head, which is the one arrangement the canonical row cannot have: measured on
+# DIVE-3292, head e2bad22 is not an ancestor of main and fd945c2 is what landed.
+# The arm required BOTH ancestry-of-head and attribution, so it refused its own
+# canonical row and left it unclosable from any seat.
+#
+# MUTATION GRADE for this case: re-add the ancestry conjunct
+# (`[[ "$_cu_anc" == "1" && "$_cu_attr" == "1" ]]`) -> B1b fails.
+clear_fx; export GH_STUB_PR_https___github_com_5dive_ai_5dive_pull_629="CLOSED|"
+export GH_STUB_SHAS_https___github_com_5dive_ai_5dive_pull_629="e2bad22f6f62|"
+export GH_STUB_CMP_5dive_e2bad22f6f62="$NOT_ANCESTOR"
+export GH_STUB_COMMITS_5dive_main="$(commits 'docs(changelog): correct four stale release headings (LND-5)')"
+seed LND-5 "$OURS_PR"
+run_done LND-5 --result='landed as fd945c2, a different sha to the PR head'
+if [[ $RC -eq 0 && "$(statusof LND-5)" == "done" && "$(refusals LND-5)" == "0" ]]; then
+  ok_t 'DIVE-3534: an abandoned PR head NOT on main still closes when a commit on main names the ident'
+else
+  bad_t 'landed-by-another-route (different sha) must close' "rc=$RC status=$(statusof LND-5) refusals=$(refusals LND-5) out=$OUT"
+fi
+R=$(resultof LND-5)
+[[ "$R" == *"ATTRIBUTION"* && "$R" != *"ancestry+attribution"* ]] \
+  && ok_t 'and the record credits attribution alone, never an ancestry that did not hold' \
+  || bad_t 'record must not claim ancestry for a head that is not on main' "result=$R"
+
+# ── B1c. the branch is DELETED, so the head cannot be read at all — the routine
+# state for a closed PR. Ancestry is diagnostic now, so an unreadable head must not
+# be able to block an acceptance the attribution already earned.
+clear_fx; export GH_STUB_PR_https___github_com_5dive_ai_5dive_pull_629="CLOSED|"
+# no SHAS fixture => head unreadable; no CMP fixture => ancestry unreachable
+export GH_STUB_COMMITS_5dive_main="$(commits 'fix(task): land it directly (LND-6)')"
+seed LND-6 "$OURS_PR"
+run_done LND-6 --result='branch deleted, work on main'
+[[ $RC -eq 0 && "$(statusof LND-6)" == "done" ]] \
+  && ok_t 'an unreadable PR head does not block a close the attribution earned' \
+  || bad_t 'deleted-branch shape must close on attribution' "rc=$RC status=$(statusof LND-6) out=$OUT"
 
 # ── B2. NEGATIVE CONTROL: ancestor but NOTHING on main names the ident ─────────
 # DIVE-2101's vacuity shape: an EMPTY branch's tip IS on main, so ancestry alone
@@ -307,14 +351,16 @@ run_done LND-3 --result='not actually landed'
   || bad_t 'closed refusal must name a performable remedy' "out=$OUT"
 
 # ── B4. NEGATIVE CONTROL: an outage must not manufacture an acceptance ─────────
+# Attribution is the acceptor (DIVE-3534), so it is attribution's unreachability
+# that must decline here — the compare probe is diagnostic and cannot accept.
 clear_fx; export GH_STUB_PR_https___github_com_5dive_ai_5dive_pull_629="CLOSED|"
 export GH_STUB_SHAS_https___github_com_5dive_ai_5dive_pull_629="c0ffee03|"
 # no compare fixture => ancestry UNREACHABLE (empty), which is not "yes"
 seed LND-4 "$OURS_PR"
 run_done LND-4 --result='unknown'
 [[ $RC -ne 0 && "$(statusof LND-4)" == "in_progress" ]] \
-  && ok_t 'NEGATIVE CONTROL: unreachable ancestry REFUSES (empty is not yes)' \
-  || bad_t 'unreachable ancestry must refuse' "rc=$RC out=$OUT"
+  && ok_t 'NEGATIVE CONTROL: unreachable attribution REFUSES (empty is not yes)' \
+  || bad_t 'unreachable attribution must refuse' "rc=$RC out=$OUT"
 [[ "$OUT" == *"COULD NOT BE READ"* ]] \
   && ok_t 'and the refusal says unresolved, not ruled out' \
   || bad_t 'refusal must distinguish unread from absent' "out=$OUT"

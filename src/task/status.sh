@@ -1025,39 +1025,76 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
           #
           # The predicate is the one this gate already trusts everywhere else — is
           # the work on main — asked with the machinery DIVE-2101/2120 built:
-          #   * ancestry of the PR's head sha (compare/main...<sha>, ahead_by==0), and
-          #   * ATTRIBUTION, a commit on main whose SUBJECT names the ident.
-          # BOTH are required, and the second is not belt-and-braces: ancestry alone
-          # is trivially true for an EMPTY branch whose tip IS main's tip, which is
-          # DIVE-2101's vacuity shape — it would accept a row that delivered nothing.
+          # ATTRIBUTION, a commit ON MAIN whose SUBJECT names the ident.
           #
-          # Fail-safe direction: either probe returning EMPTY (no token, API down,
-          # deleted branch) DECLINES the acceptance and falls through to the refusal
-          # below exactly as if this arm did not exist. It can only ever ADD an
-          # acceptance on measured evidence, never manufacture a refusal.
-          local _cu_slug _cu_shas _cu_head _cu_anc="" _cu_attr=""
+          # DIVE-3534: THIS ARM USED TO REQUIRE THE PR HEAD'S ANCESTRY TOO, AND THAT
+          # REFUSED ITS OWN CANONICAL ROW. Measured by olivia on the bundle that
+          # carries this arm (0.19.39): DIVE-3292's PR 629 head is e2bad22, which is
+          # NOT an ancestor of main; what landed is fd945c2, a DIFFERENT commit. That
+          # is not an accident of one row — "landed by another route" MEANS the work
+          # came in as a different commit, so the abandoned PR tip is precisely the
+          # sha that is not on main. Requiring ancestry-of-the-PR-head AND attribution
+          # made the two operands mutually exclusive on the exact shape this arm was
+          # written for, and it left DIVE-3292 unclosable from any seat by any means —
+          # the precise condition DIVE-3458 was filed to remove.
+          #
+          # So attribution is the ONLY acceptor here, exactly as DIVE-2120/2184 already
+          # made it on the `Branch:` path below (see the long note at the _attr_slug
+          # search — "if you are changing acceptance, change attribution"). This arm had
+          # replicated the pre-DIVE-2120 shape that ticket exists to correct.
+          #
+          # THE DIVE-2101 VACUITY CONCERN IS ANSWERED BY THE SAME MOVE, not dropped:
+          # vacuity was a hazard of ANCESTRY (an EMPTY branch's tip IS main's tip, so
+          # ancestry is trivially true of it). Attribution is measured against main's
+          # commit SUBJECTS, and an empty branch contributes no commit naming the ident
+          # to main — so there is nothing to mistake for delivery. Vacuity is
+          # structurally impossible here rather than separately guarded.
+          #
+          # Ancestry survives as DIAGNOSTIC context in the messages only. It cannot
+          # accept anything on its own, and it can no longer BLOCK an acceptance —
+          # which also makes a deleted branch (routine on a closed PR, DIVE-2120) stop
+          # being fatal here: an unreadable head costs a diagnostic, not the close.
+          #
+          # Fail-safe direction is unchanged: attribution returning EMPTY (no token,
+          # API down) or `bound:<n>` (the scan hit its walk bound without exhausting
+          # main) DECLINES the acceptance and falls through to the refusal below
+          # exactly as if this arm did not exist. It can only ever ADD an acceptance on
+          # measured evidence, never manufacture a refusal.
+          local _cu_slug _cu_shas _cu_head="" _cu_anc="" _cu_attr="" _cu_diag=""
           _cu_slug=$(_gate_slug_from_url "$_dref")
           if [[ -n "$_cu_slug" ]]; then
+            _cu_attr=$(_gate_branch_ident_on_main "$_cu_slug" "" "$_ghtok" "$ident")
+            # Diagnostic only, and read AFTER the acceptor: a closed PR's branch is
+            # routinely deleted, so this is the probe most likely to answer nothing.
             _cu_shas=$(_gate_pr_shas "$_dref" "$_ghtok" "$_cu_slug")
             _cu_head="${_cu_shas%%|*}"
-            if [[ -n "$_cu_head" ]]; then
-              _cu_anc=$(_gate_branch_ancestry "$_cu_slug" "$_cu_head" "$_ghtok")
-              [[ "$_cu_anc" == "1" ]] && _cu_attr=$(_gate_branch_ident_on_main "$_cu_slug" "" "$_ghtok" "$ident")
-            fi
+            [[ -n "$_cu_head" ]] && _cu_anc=$(_gate_branch_ancestry "$_cu_slug" "$_cu_head" "$_ghtok")
           fi
-          if [[ "$_cu_anc" == "1" && "$_cu_attr" == "1" ]]; then
-            _task_store_audit_log "task.landed-without-merge" ok 0 -- "$ident" "ref=$_dref state=$_state head=$_cu_head slug=$_cu_slug"
-            warn "$ident: $_dref is NOT merged (state=$_state, measured) but its head ${_cu_head:0:12} IS an ancestor of ${FIVE_GATE_MAIN_BRANCH:-main} in $_cu_slug, and a commit on main names $ident in its SUBJECT — the work LANDED BY ANOTHER ROUTE (DIVE-3458). done=merged-to-main satisfied on ancestry+attribution, not on the PR's merge flag.$(_gate_merged_not_deployed "$_cu_slug")"
-            _mg_foreign="[delivery: $_dref is CLOSED/UNMERGED (state=$_state), and the work is nonetheless ON ${FIVE_GATE_MAIN_BRANCH:-main} in $_cu_slug — head ${_cu_head:0:12} is an ancestor and a commit subject on main names $ident. Closed on ancestry+attribution, NOT on the pull request's merge flag. (DIVE-3458)]"
+          # Rendered once, into a variable: a nested ${x:+ … ${y} … } inside the
+          # sentences below is a parse error, not a formatting preference.
+          [[ -n "$_cu_head" ]] \
+            && _cu_diag=" PR head ${_cu_head:0:12} ancestry=${_cu_anc:-unread} — DIAGNOSTIC ONLY, it neither accepts nor blocks (DIVE-3534)."
+          if [[ "$_cu_attr" == "1" ]]; then
+            _task_store_audit_log "task.landed-without-merge" ok 0 -- "$ident" "ref=$_dref state=$_state head=${_cu_head:-unread} ancestry=${_cu_anc:-unread} slug=$_cu_slug"
+            # Say what was MEASURED and claim no more. A subject scan cannot tell a
+            # direct commit from a squash that landed in some other PR, and — the
+            # DIVE-3534 case — the PR's own head is typically NOT on main here.
+            # Claiming ancestry in this sentence described a shape that cannot occur.
+            warn "$ident: $_dref is NOT merged (state=$_state, measured) but a commit on ${FIVE_GATE_MAIN_BRANCH:-main} in $_cu_slug names $ident in its SUBJECT — the work LANDED BY ANOTHER ROUTE (DIVE-3458/3534). done=merged-to-main satisfied on ATTRIBUTION, not on the PR's merge flag.$_cu_diag$(_gate_merged_not_deployed "$_cu_slug")"
+            _mg_foreign="[delivery: $_dref is CLOSED/UNMERGED (state=$_state), and the work is nonetheless ON ${FIVE_GATE_MAIN_BRANCH:-main} in $_cu_slug — a commit subject on main names $ident. Closed on ATTRIBUTION, NOT on the pull request's merge flag and NOT on the PR head's ancestry.$_cu_diag (DIVE-3458/3534)]"
           else
             # Name what was MEASURED and why, so the refusal cannot print advice the
             # reader is unable to follow. A CLOSED PR gets the remedy that exists.
+            # Keyed on ATTRIBUTION, because that is the operand that accepts; ancestry
+            # is appended as context and is never the stated reason.
             local _cu_why="" _cu_fix="merge it, then task done"
-            case "$_cu_anc" in
-              1) _cu_why=" Its head IS on main, but NO commit subject on main names $ident (attribution=${_cu_attr:-unread}), which is what an EMPTY branch looks like — ancestry alone would accept a row that delivered nothing (DIVE-2101)." ;;
-              0) _cu_why=" Its head is measurably NOT on main either, so the work has not landed by another route." ;;
-              *) _cu_why=" Whether its head is on main COULD NOT BE READ, so 'landed by another route' is unresolved here, not ruled out." ;;
+            case "$_cu_attr" in
+              0) _cu_why=" NO commit subject on main names $ident, so the work has not landed by another route either." ;;
+              bound:*) _cu_why=" No commit subject on main names $ident within the scan bound (${_cu_attr#bound:} COMMITS WALKED in $_cu_slug) — main's history was NOT exhausted, so this is unresolved, not ruled out; re-run, or raise FIVE_GATE_ANCESTRY_SCAN." ;;
+              *) _cu_why=" Whether any commit subject on main names $ident COULD NOT BE READ, so 'landed by another route' is unresolved here, not ruled out." ;;
             esac
+            [[ "$_cu_anc" == "1" ]] \
+              && _cu_why="$_cu_why Its head ${_cu_head:0:12} IS on main, which on its own is what an EMPTY branch looks like — ancestry alone would accept a row that delivered nothing (DIVE-2101), so it cannot close this."
             [[ "$_state" == "CLOSED" ]] \
               && _cu_fix="it is CLOSED, so it cannot be merged — if the work landed another way, land or cite a commit on main whose SUBJECT names $ident and re-run; if it landed in a different PR, re-point the binding (\`task deliver $ident --pr=<url>\`); if it never landed, this row is not done"
             policy_refuse "$E_CONFLICT" done-before-pr-merged DIVE-1830 "$ident" "$ident cannot close: $_dref is not merged to main (state=$_state, measured).$_cu_why — $_cu_fix"
