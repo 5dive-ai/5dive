@@ -3107,15 +3107,45 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
   # Sibling instance of the same defect, one subsystem over: DIVE-3265, where the
   # merge gate scraped a branch name out of the maker's result prose and then demanded
   # that phantom branch land.
-  local _row_ship=0
+  local _row_ship=0 _rowbind_src=""
   if [[ "$tier_floored" == "0" && ( "$type" == "decision" || "$type" == "approval" || "$type" == "manual" ) ]]; then
-    local _rowship_body _rowship_branch=""
+    local _rowship_body _rowship_branch="" _rowship_delivery=""
     _rowship_body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
     # Split rather than `[[ … ]] && v=$(f)`: an assignment's rc is its last command
     # substitution's, so the helper's non-zero on "no binding" would leak into the
     # compound (the DIVE-2751 shape). Absorbed here instead of argued about.
     _rowship_branch=$(_push_branch_from_body "$_rowship_body" 2>/dev/null) || _rowship_branch=""
-    [[ -n "$_rowship_branch" ]] && _row_ship=1
+    # DIVE-3228 / DIVE-3525 — THE SECOND BINDING, and this is the headline DIVE-3228
+    # shipped zero lines of.
+    #
+    # DIVE-3266 routes a gate on ROW STATE rather than on the ask's prose, but it reads
+    # exactly ONE binding: a `Branch:` line in the body. That is the binding `5dive push`
+    # requires, so it is present on every push-for-review row and absent on the OTHER
+    # half of the ship population — a row that reached a pull request through
+    # `task deliver --pr=`, which writes the `delivery_ref` COLUMN and never touches the
+    # body. An approval filed on such a row ("the PR is up, say go") has a reviewer that
+    # is plainly derivable and still fell through to the human, because no `Branch:` line
+    # was ever written and the ask missed `_GATE_ENG_SHIP_RX`. That is the class DIVE-3225
+    # was in when lodar was paged twice.
+    #
+    # WHY THIS AND NOT A TYPE DEFAULT. Iteration 1 of this ticket made the default the
+    # TYPE — every unfloored `approval` routed — and main's differential caught what that
+    # costs: it swallows the human ping for the rows that are unrouted BY ABSENCE. An
+    # unbound row, a prose-only mention of a branch, a plain tier-1 with nothing attached:
+    # nothing floors them, so no backstop fires, and DIVE-3266's B1/C6/E1 contract ("a row
+    # with nothing bound to it must still reach a person, with an explicit unrouted
+    # receipt naming the skipped lead and the binding remedy") broke. Both directions have
+    # to hold at once, and only a BINDING holds them: it is the fact that makes a reviewer
+    # derivable, and its ABSENCE is the fact that makes the gate the human's.
+    #
+    # `delivery_ref` is structured state written by one verb, never scraped from prose —
+    # the same property that made `Branch:` admissible here and a prose mention not
+    # (DIVE-3265, where a merge gate scraped a branch name out of result prose and then
+    # demanded that phantom branch land).
+    _rowship_delivery=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};")
+    if   [[ -n "$_rowship_branch"   ]]; then _row_ship=1; _rowbind_src=branch
+    elif [[ -n "$_rowship_delivery" ]]; then _row_ship=1; _rowbind_src=delivery-ref
+    fi
   fi
 
   local _routable=0
@@ -3190,45 +3220,20 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
   # override above (eng-ship / curation / internal-ops / access / verifier-route)
   # can cross it — the verifier-route being the one this ticket exists to stop.
   [[ "$_needs_human" == "1" ]] && _routable=0
-  # DIVE-3228 / DIVE-3525 — AN ORDINARY SHIP APPROVAL DEFAULTS TO A ROUTED REVIEWER.
-  #
-  # THE DEFECT, and it is a DEFAULT rather than a filer's carelessness. `_routable`
-  # above already says YES for an unfloored `approval` (the type arm, ~70 lines up).
-  # But `_routable` is only half the test: the cascade below ALSO demands one of the
-  # KIND flags or the `gate_builder_routing` pref, and that pref is OFF by default on
-  # this host. So an approval that misses `_eng_ship`'s regex is routable-and-unrouted:
-  # `routed_reviewer` stays NULL, and an empty `routed_reviewer` is the FIRST clause of
-  # cmd_task_inbox's human predicate — an unrouted gate IS a founder gate. Measured
-  # twice: DIVE-3224's own push gate ("open both PRs" lowercases to `prs`, and the
-  # member is `\bpr\b`), and DIVE-3225's ship, which sat behind a gate no seat held
-  # standing to clear while lodar was paged twice and pushed back both times.
-  #
-  # WHY A KIND AND NOT A WIDER REGEX. Every previous round of this widened
-  # `_GATE_ENG_SHIP_RX` by one synonym — each addition locally correct, the class
-  # untouched, and the next miss unpredictable by construction. The type is already
-  # the fact: CLAUDE.md says builders gate prod ships to Marcus and not to lodar, so
-  # the code encodes the policy the docs already state, and prose stops deciding who
-  # is woken.
-  #
-  # IT ROUTES NOBODY NEW. The target is `_gate_route_reviewer(filer)` — the SAME chart
-  # walk every other kind takes, and `route_provenance` stays `chart` because the chart
-  # is still what resolved the name. When the chart resolves nobody the gate falls
-  # through to the human exactly as today. So this moves gates from "unrouted" to
-  # "routed to the lead they always should have gone to", and adds no reachable seat.
-  #
-  # THE HUMAN-ONLY SET IS UNCHANGED, and every exclusion is inherited rather than
-  # restated (two copies of "is this the human's" are two things that can disagree):
-  #   * `secret` and `manual` are not this type. DIVE-3228 is explicit that `secret`
-  #     must not become agent-clearable, and a `manual` gate is one only a person can
-  #     physically perform.
-  #   * an EXPLICIT `--tier=2` zeroed `_routable` at the DIVE-1957 backstop above.
-  #   * `--needs=spend_authority` / `human_tap` zeroed it at the DIVE-2241 line
-  #     directly above — a declared human-class capability is the human path itself.
-  #   * a T2 category floor (money / destructive / secrets) never reaches `_routable=1`
-  #     in the first place: the type arm consults `_gate_floor_axis` for exactly that.
-  # Reading it off `_routable` is what makes those four inherited instead of copied.
-  local _approval_default=0
-  [[ "$type" == "approval" && "$_routable" == "1" ]] && _approval_default=1
+  # DIVE-3228 / DIVE-3525 — there is deliberately NO `_approval_default` kind here,
+  # and the deletion is the finding rather than an omission. Iteration 1 of this
+  # ticket added `[[ $type == approval && $_routable == 1 ]] && _approval_default=1`,
+  # which routes EVERY unfloored approval. It reddened two harnesses that are green on
+  # origin/main (gate_row_state_routing_unit B1/C6/E1, gate_floor_declared_discussion
+  # arm 7) for one reason: the four inherited exclusions above only cover rows that are
+  # FLOORED or PINNED, and the population that breaks is the rows unrouted BY ABSENCE —
+  # an unbound row, a prose-only branch mention, a plain tier-1. Nothing floors them, so
+  # no backstop fires, and a type default routes them and leaves the human ping EMPTY.
+  # The headline ships as the SECOND BINDING at the `_row_ship` block instead: a
+  # reviewer is defaulted where one is derivable from structured row state, and the
+  # absence of that state is what keeps the gate on the human path with DIVE-3266's
+  # explicit unrouted receipt. Both directions hold at once only if the binding, and
+  # not the type, is the input.
   # Record the declaration and what it did, at the moment it did it. DIVE-2093 will
   # PRINT the routing decision at file time; until it lands this row is the only
   # place a mis-declared gate is visible without diffing where it ended up.
@@ -3287,10 +3292,10 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
     # only the second one decides who is woken.
     # DIVE-3266: row-state ship routing bypasses the pref too — a branch binding is a
     # harder fact than any regex hit, so pref-gating it would re-open the exact hole.
-    # DIVE-3228/3525: `approval` is a routing kind in its own right — see the block
-    # at the `_approval_default` assignment above for why this is a kind and not
-    # another regex member, and for the four exclusions it inherits from `_routable`.
-    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_row_ship" == "1" || "$_curation" == "1" || "$_internal_ops" == "1" || "$_discusses_applied" == "1" || "$_verifier_route" == "1" || "$_floored_by_title" == "1" || "$_standing_route" == "1" || "$_approval_default" == "1" ]]; then
+    # DIVE-3228/3525: a bound `delivery_ref` is a second row-state binding under the
+    # SAME `_row_ship` kind — see the block at the `_rowship_delivery` read above for
+    # why the input is the binding and not the type.
+    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_row_ship" == "1" || "$_curation" == "1" || "$_internal_ops" == "1" || "$_discusses_applied" == "1" || "$_verifier_route" == "1" || "$_floored_by_title" == "1" || "$_standing_route" == "1" ]]; then
       # DIVE-1495: a verifier-route targets the task's verifier directly; every
       # other kind resolves the filer's lead via the org chart.
       local _reviewer
@@ -3346,20 +3351,17 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
         # eng ship, that is what the filer can act on and every existing receipt stays
         # byte-for-byte; `row-ship-state` is named only when the BINDING is the sole
         # reason this routed — i.e. exactly the case the prose classifier missed.
-        elif [[ "$_row_ship"         == "1" ]]; then _rtrigger="row-ship-state"
+        # DIVE-3228/3525: the trigger token stays `row-ship-state` and gains a SUFFIX
+        # naming which binding carried it. DIVE-3266's receipts keep matching on the
+        # stem, and the delivery-ref set — the one this ticket adds — stays countable
+        # apart from the branch set, which is how the next reader measures whether the
+        # second binding is carrying gates the first one missed.
+        elif [[ "$_row_ship"         == "1" ]]; then _rtrigger="row-ship-state:${_rowbind_src:-branch}"
         elif [[ "$_curation"         == "1" ]]; then _rtrigger="curation"
         elif [[ "$_internal_ops"     == "1" ]]; then _rtrigger="internal-ops"
         elif [[ "$_discusses_applied" == "1" ]]; then _rtrigger="declared-discussion"
         elif [[ "$_floored_by_title" == "1" ]]; then _rtrigger="floored-by-title"
         elif [[ "$_standing_route"   == "1" ]]; then _rtrigger="standing-lead"
-        # DIVE-3228/3525: LAST of the kinds and directly above the pref, for the same
-        # reason DIVE-3266 put row-ship-state below eng-ship. When any more specific
-        # kind applies, that is the one the filer can act on and every existing receipt
-        # stays byte-for-byte; `approval-default` is named only when the TYPE is the
-        # sole reason this routed — i.e. exactly the gate that used to reach lodar.
-        # Counting that set is the point: it is how the next reader measures whether
-        # this default is carrying gates the classifiers were missing.
-        elif [[ "$_approval_default" == "1" ]]; then _rtrigger="approval-default"
         else _rtrigger="gate_builder_routing=on"
         fi
         # DIVE-2093 iteration 3 (main2's blocker 1): the basis is `$_route_prov` ITSELF,

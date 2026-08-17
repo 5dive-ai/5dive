@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# DIVE-3228 / DIVE-3525 isolated unit harness for the APPROVAL ROUTING DEFAULT.
+# DIVE-3228 / DIVE-3525 isolated unit harness for the SECOND ROW-STATE BINDING.
 #
 # THE DEFECT. `_routable` already said YES for an unfloored `approval`, but that is
 # only half the test: the routing cascade ALSO demanded one of the KIND flags or the
@@ -9,8 +9,23 @@
 # predicate. An unrouted gate IS a founder gate. lodar, 2026-08-11, on being pinged
 # for DIVE-3225: "I still getting those".
 #
-# THE FIX. `approval` is a routing kind in its own right (`_approval_default`), so the
-# TYPE routes it to the filer's chart lead instead of the ask's prose deciding.
+# THE FIX, AND WHY IT IS NOT A TYPE DEFAULT. Iteration 1 of this ticket made the
+# default the TYPE — every unfloored `approval` routed. main's differential reddened
+# two harnesses that are green on origin/main (gate_row_state_routing_unit B1/C6/E1,
+# gate_floor_declared_discussion arm 7), and the reason is the useful half: the four
+# inherited exclusions only cover rows that are FLOORED or PINNED, while the rows that
+# break are unrouted BY ABSENCE — an unbound row, a prose-only branch mention, a plain
+# tier-1. Nothing floors them, so no backstop fires, and a type default routes them and
+# leaves the human ping EMPTY. "A floored gate must not become agent-routable" held;
+# "a row with nothing bound to it must still reach a person" did not.
+#
+# So the input is the BINDING, not the type. DIVE-3266 already routes on row state but
+# reads exactly ONE binding: a `Branch:` line in the body — the binding `5dive push`
+# requires, present on every push-for-review row and absent on the other half of the
+# ship population, the rows that reached a pull request through `task deliver --pr=`.
+# That verb writes the `delivery_ref` COLUMN and never touches the body. This harness
+# grades that second binding: a reviewer is defaulted where one is derivable from
+# structured row state, and the ABSENCE of that state keeps the gate on the human path.
 #
 # WHY EVERY POSITIVE ARM IS PAIRED WITH A CONTROL. "The approval routed to main" is
 # also what a build with `gate_builder_routing=on`, a widened eng-ship regex, or a
@@ -18,16 +33,15 @@
 #   * A0 asserts the plain ask does NOT hit the eng-ship classifier. Without it,
 #     case 1 would pass on a build where the fix does nothing and the regex grew.
 #   * A0b asserts the pref really is off in this store.
-#   * Case 0 is the UNCHANGED arm: the same plain ask as a `decision` stays unrouted,
-#     because decision routing is still pref-gated. A "route everything" regression
-#     passes every other case here and fails that one.
-#   * Case 1b reads the trigger out of the ok() line: `approval-default` and not
-#     `eng-ship`, so the arm names WHICH kind carried it rather than only that
-#     something did.
-# The remaining cases are the boundary, and all of them assert the gate does NOT
-# reach an agent: the four exclusions the fix inherits from `_routable`, plus the
-# two types (`secret`, `manual`) it deliberately does not cover, plus a filer the
-# chart cannot route at all.
+#   * Case 0 is THE ABSENCE CONTROL and the arm iteration 1 failed: the SAME plain ask
+#     on a row with NO binding stays unrouted and the human is pinged. A "route every
+#     approval" regression passes every other case here and fails that one.
+#   * Case 1b reads the trigger out of the ok() line: `row-ship-state:delivery-ref`,
+#     so the arm names WHICH binding carried it, and the delivery-ref set stays
+#     countable apart from DIVE-3266's branch set.
+# The remaining cases are the boundary. Every exclusion arm is filed on a row that IS
+# bound, so it grades the guard rather than the absence of a binding — an exclusion arm
+# on an unbound row would pass on a build with no fix at all.
 #
 # Isolation mirrors the sibling gate harnesses: source src/ libs, throwaway
 # STATE_DIR, FIVEDIVE_GATE_NOTIFY_LOG at a temp file so no prod telemetry is touched.
@@ -86,10 +100,20 @@ db "INSERT INTO agents_org(name,reports_to,role) VALUES('dev','main','builder');
 # defect is made of.
 PLAIN_ASK="the parser rewrite is finished and the numbers look right — say go"
 
-seed() { # <ident> [title]
-  db "INSERT INTO tasks(ident,title,status,created_by,assignee)
-      VALUES('$1',$(sqlq "${2:-a routine ticket}"),'todo','main','dev');"
+# seed <ident> [delivery_ref] — the ONLY difference between a bound and an unbound
+# row here is the `delivery_ref` COLUMN. Body and title are identical in both, so no
+# arm can route on prose by accident, and the `Branch:` binding DIVE-3266 already
+# reads is never written: this harness grades the SECOND binding in isolation.
+seed() { # <ident> [delivery_ref]
+  db "INSERT INTO tasks(ident,title,status,created_by,assignee,delivery_ref)
+      VALUES('$1',$(sqlq 'a routine ticket'),'todo','main','dev',$(sqlq "${2:-}"));"
 }
+PR_REF="https://github.com/5dive-ai/5dive/pull/695"
+# A gate is filed ON THE TASK ROW. `gate_filed_by` is stamped by cmd_task_need at the
+# moment the gate is written, so it is the one column that separates "this gate was
+# filed and not routed" from "this gate was REFUSED at filing and there is nothing to
+# look up". Case 5 leaned on the second without noticing (quinn, iteration 1).
+gate_written() { [[ -n "$(db "SELECT COALESCE(gate_filed_by,'') FROM tasks WHERE ident='$1';")" ]]; }
 reviewer_of() { db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='$1';"; }
 prov_of()     { db "SELECT COALESCE(route_provenance,'') FROM tasks WHERE ident='$1';"; }
 tier_of()     { db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='$1';"; }
@@ -111,37 +135,54 @@ _pref="$(_task_pref_get gate_builder_routing)"; _pref="${_pref:-off}"
   && ok_t "gate_builder_routing is off in this store (so no arm routes via the pref)" \
   || bad_t "gate_builder_routing is '$_pref'" "with the pref on, every gate routes and this harness proves nothing"
 
-# --- 0. UNCHANGED: an ordinary `decision` is still pref-gated and stays unrouted -
-# The regression detector for "the fix routed everything". A decision is already
-# agent-clearable by TYPE, so it was never the population that reached lodar.
+# --- 0. THE ABSENCE CONTROL — the arm iteration 1 failed ----------------------
+# Same plain ask, same type, same tier, same filer as case 1. The ONLY difference is
+# that nothing is bound to this row. DIVE-3266's contract says this gate is the
+# human's, and says so explicitly rather than silently. A build that defaults on the
+# TYPE passes every other case in this file and fails here.
 seed DIVE-9000
 actor_seam_as dev
-cmd_task_need DIVE-9000 --type=decision --ask="$PLAIN_ASK" --options="A|B" --recommend="A" --from=dev >/dev/null 2>&1
+OUT0=$(cmd_task_need DIVE-9000 --type=approval --ask="$PLAIN_ASK" --recommend="go" --from=dev 2>&1)
 [[ -z "$(reviewer_of DIVE-9000)" ]] \
-  && ok_t "an ordinary decision is UNCHANGED — still pref-gated, still unrouted" \
-  || bad_t "a decision routed to '$(reviewer_of DIVE-9000)'" "the fix is scoped to approval and widened past it"
+  && ok_t "an UNBOUND row does NOT route — absence of a binding is the human's gate" \
+  || bad_t "an unbound approval routed to '$(reviewer_of DIVE-9000)'" "the default is keyed on the TYPE, not the binding: $OUT0"
+[[ "$OUT0" == *"NOT ROUTED"* ]] \
+  && ok_t "and the unrouted receipt is still EXPLICIT (DIVE-3266's E1 contract holds)" \
+  || bad_t "the unrouted receipt is not explicit" "$OUT0"
 
-# --- 1. THE FIX: an ordinary approval routes to the filer's chart lead ----------
-seed DIVE-9001
+# 0b. An ordinary `decision` on an unbound row is likewise untouched — still
+# pref-gated. A decision is already agent-clearable by TYPE, so it was never the
+# population that reached lodar, and widening past it would be a second change.
+seed DIVE-9020
+actor_seam_as dev
+cmd_task_need DIVE-9020 --type=decision --ask="$PLAIN_ASK" --options="A|B" --recommend="A" --from=dev >/dev/null 2>&1
+[[ -z "$(reviewer_of DIVE-9020)" ]] \
+  && ok_t "an unbound decision is UNCHANGED — still pref-gated, still unrouted" \
+  || bad_t "an unbound decision routed to '$(reviewer_of DIVE-9020)'" "the fix widened past the binding"
+
+# --- 1. THE FIX: the SAME ask on a DELIVERY-BOUND row routes to the chart lead ---
+# One variable against case 0: this row carries a `delivery_ref`. No `Branch:` line is
+# written, so DIVE-3266's binding cannot be what carried it.
+seed DIVE-9001 "$PR_REF"
 actor_seam_as dev
 OUT1=$(cmd_task_need DIVE-9001 --type=approval --ask="$PLAIN_ASK" --recommend="go" --from=dev 2>&1)
 [[ "$(reviewer_of DIVE-9001)" == "main" ]] \
-  && ok_t "an ordinary approval routes to the filer's lead (main), not to the human" \
-  || bad_t "approval routed to '$(reviewer_of DIVE-9001)', expected main" "$OUT1"
+  && ok_t "a delivery-bound approval routes to the filer's lead (main), not to the human" \
+  || bad_t "a delivery-bound approval routed to '$(reviewer_of DIVE-9001)', expected main" "$OUT1"
 [[ "$(prov_of DIVE-9001)" == "chart" ]] \
   && ok_t "route_provenance is 'chart' — the org chart is still what resolved the NAME" \
   || bad_t "route_provenance is '$(prov_of DIVE-9001)', expected chart" "a new basis string would reach _gate_route_why's unknown arm"
 
 # --- 1b. the receipt NAMES the kind, so this set is countable -------------------
-[[ "$OUT1" == *"trigger=approval-default"* ]] \
-  && ok_t "the ok() line names trigger=approval-default (not eng-ship) — the type carried it" \
-  || bad_t "the ok() line does not name approval-default" "$OUT1"
+[[ "$OUT1" == *"trigger=row-ship-state:delivery-ref"* ]] \
+  && ok_t "the ok() line names trigger=row-ship-state:delivery-ref — WHICH binding carried it" \
+  || bad_t "the ok() line does not name the delivery-ref binding" "$OUT1"
 [[ "$OUT1" == *"routed to main"* ]] \
   && ok_t "the operator's receipt says 'routed to main' rather than 'needs a human'" \
   || bad_t "the receipt does not say routed to main" "$OUT1"
 
 # --- 2. UNCHANGED: an approval that DOES hit eng-ship still routes, as eng-ship --
-seed DIVE-9002
+seed DIVE-9002 "$PR_REF"
 actor_seam_as dev
 OUT2=$(cmd_task_need DIVE-9002 --type=approval --ask="approve the merge of the parser refactor" --recommend="yes" --from=dev 2>&1)
 [[ "$(reviewer_of DIVE-9002)" == "main" ]] \
@@ -154,7 +195,7 @@ OUT2=$(cmd_task_need DIVE-9002 --type=approval --ask="approve the merge of the p
 # --- 3..4. INHERITED EXCLUSION: a declared human-class capability (DIVE-2241) ----
 i=3
 for cap in human_tap spend_authority; do
-  ident="DIVE-90$i"; seed "$ident"
+  ident="DIVE-90$i"; seed "$ident" "$PR_REF"
   actor_seam_as dev
   OUTC=$(cmd_task_need "$ident" --type=approval --ask="$PLAIN_ASK" --recommend="go" --needs="$cap" --from=dev 2>&1)
   [[ -z "$(reviewer_of "$ident")" ]] \
@@ -164,15 +205,25 @@ for cap in human_tap spend_authority; do
 done
 
 # --- 5. INHERITED EXCLUSION: an EXPLICIT --tier=2 is the caller's hard contract --
-seed DIVE-9005
+seed DIVE-9005 "$PR_REF"
 actor_seam_as dev
-OUT5=$(cmd_task_need DIVE-9005 --type=approval --tier=2 --ask="$PLAIN_ASK" --recommend="go" --from=dev 2>&1)
+OUT5=$(cmd_task_need DIVE-9005 --type=approval --tier=2 --ask="$PLAIN_ASK" --recommend="go" \
+         --rubber-stamp-ok="the release window is the founder's call and no lead holds it" --from=dev 2>&1)
+# NON-VACUITY (quinn, iteration 1): a `--tier=2` approval carrying a `--recommend` and
+# no `--rubber-stamp-ok` can be REFUSED at filing by the DIVE-2848 tapback cap, and a
+# refused gate was never written — so `routed_reviewer` is empty for a reason that has
+# nothing to do with the backstop this arm claims to grade. Assert the gate EXISTS
+# first, and supply the audited escape so it is written whatever the store's tapback
+# history. Without this line the arm asserts an empty lookup on a row with no gate.
+gate_written DIVE-9005 \
+  && ok_t "the --tier=2 gate was actually FILED (so the next assert reads a real gate)" \
+  || bad_t "--tier=2 approval was refused at filing" "the unrouted assert below would be vacuous: $OUT5"
 [[ -z "$(reviewer_of DIVE-9005)" ]] \
   && ok_t "an explicit --tier=2 approval is NOT routed (DIVE-1957 backstop still wins)" \
   || bad_t "--tier=2 approval routed to '$(reviewer_of DIVE-9005)'" "$OUT5"
 
 # --- 6. INHERITED EXCLUSION: the T2 category floor (money) ----------------------
-seed DIVE-9006
+seed DIVE-9006 "$PR_REF"
 actor_seam_as dev
 OUT6=$(cmd_task_need DIVE-9006 --type=approval --ask="approve the \$5,000 invoice and pay it from the company card" --recommend="yes" --from=dev 2>&1)
 [[ "$(tier_of DIVE-9006)" == "2" ]] \
@@ -183,20 +234,37 @@ OUT6=$(cmd_task_need DIVE-9006 --type=approval --ask="approve the \$5,000 invoic
   || bad_t "a money-floored approval routed to '$(reviewer_of DIVE-9006)'" "$OUT6"
 
 # --- 7. OUT OF TYPE: `secret` must never become agent-clearable ------------------
-seed DIVE-9007
+seed DIVE-9007 "$PR_REF"
 actor_seam_as dev
 OUT7=$(cmd_task_need DIVE-9007 --type=secret --ask="paste the new API credential for the mailer" --from=dev 2>&1)
 [[ -z "$(reviewer_of DIVE-9007)" ]] \
   && ok_t "a secret gate is NOT routed (the fix is scoped to approval, and CLAUDE.md is explicit)" \
   || bad_t "a secret gate routed to '$(reviewer_of DIVE-9007)'" "$OUT7"
 
-# --- 8. OUT OF TYPE: `manual` is a thing only a person can physically do ---------
+# --- 8. TYPE PARITY: `manual` follows the BINDING, exactly as it already does ----
+# Measured on origin/main in a control worktree, 2026-08-17: a BRANCH-bound `manual`
+# gate already routes to the lead — DIVE-3266 put `manual` in the row-state type set
+# and shipped it. So the second binding must not carve `manual` out: doing that would
+# make the SAME gate route or not route depending on which of two structured bindings
+# the row happens to carry, which is the "two copies of one predicate that can
+# disagree" shape this whole ticket is trying to remove. The binding is the input.
+#
+# What must hold instead is the ABSENCE property, and that is what this grades: a
+# `manual` gate on a row with nothing bound stays the human's. `secret` (case 7) is
+# the type that is genuinely out — it is not in the row-state type set at all.
 seed DIVE-9008
 actor_seam_as dev
 OUT8=$(cmd_task_need DIVE-9008 --type=manual --ask="$PLAIN_ASK" --from=dev 2>&1)
 [[ -z "$(reviewer_of DIVE-9008)" ]] \
-  && ok_t "a manual gate is NOT routed by this default" \
-  || bad_t "a manual gate routed to '$(reviewer_of DIVE-9008)'" "$OUT8"
+  && ok_t "an UNBOUND manual gate is not routed — absence still keeps it human" \
+  || bad_t "an unbound manual gate routed to '$(reviewer_of DIVE-9008)'" "$OUT8"
+
+seed DIVE-9018 "$PR_REF"
+actor_seam_as dev
+OUT8B=$(cmd_task_need DIVE-9018 --type=manual --ask="$PLAIN_ASK" --from=dev 2>&1)
+[[ "$(reviewer_of DIVE-9018)" == "main" ]] \
+  && ok_t "a delivery-bound manual routes, at PARITY with the branch-bound one main already routes" \
+  || bad_t "a delivery-bound manual did not route" "the two bindings disagree about the same type: $OUT8B"
 
 # --- 9. NO NEW SEAT: a filer the chart cannot route still reaches the human ------
 # main is the root — `_gate_route_reviewer` skips any candidate equal to the filer,
@@ -204,7 +272,7 @@ OUT8=$(cmd_task_need DIVE-9008 --type=manual --ask="$PLAIN_ASK" --from=dev 2>&1)
 # walk, so it must add nobody here. (DIVE-3171's sealed standing-lead covers the
 # tier-1 slice of this case and is not in scope: no constitution is sealed in this
 # store, so the fallback declines and the gate is the human's, as designed.)
-seed DIVE-9009
+seed DIVE-9009 "$PR_REF"
 actor_seam_as main
 OUT9=$(cmd_task_need DIVE-9009 --type=approval --ask="$PLAIN_ASK" --recommend="go" --from=main 2>&1)
 [[ -z "$(reviewer_of DIVE-9009)" ]] \
