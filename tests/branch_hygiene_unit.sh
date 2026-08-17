@@ -142,6 +142,19 @@ if ( echo 'REFUTE-SELF-TEST' | refute 'self-test' 'REFUTE-SELF-TEST' ) 2>/dev/nu
   exit 1
 fi
 
+# THE MOCK'S OWN POSITIVE CONTROL (DIVE-2394 iteration 4). Nothing below can catch a
+# fixture that is wrong about WHICH STREAM an error arrives on -- a product that reads
+# the rc is correct under either mock, so the harness stays green while every assertion
+# above a stdout-blind capture goes vacuous. That is precisely how iteration 3 shipped a
+# fix that was unreachable in production. So assert the fixture's contract directly,
+# the way refute() self-tests: a simulated HTTP failure must put its BODY on STDOUT,
+# because that is what `gh api --jq` does. Re-measure before changing this:
+#   gh api repos/<owner>/<repo>/compare/main...no-such-branch --jq .status
+#   -> {"message":"Not Found",...,"status":"404"} on stdout, rc=1, --jq UNAPPLIED.
+mock_err=$("$TMP/gh" api "repos/acme/demo/git/ref/pull/22/head" --jq .object.sha 2>/dev/null) \
+  && { echo "mock: a simulated HTTP failure exited 0" >&2; exit 1; }
+grep -q '"status":"404"' <<<"$mock_err"
+
 dry_output=$(GH_BIN="$TMP/gh" GITHUB_REPOSITORY=acme/demo \
   BRANCH_HYGIENE_PRESERVE=merged-preserved \
   "$ROOT/scripts/branch-hygiene.sh" --dry-run)
@@ -378,6 +391,12 @@ case "$args" in
 esac
 RMOCK
 chmod +x "$RTMP/gh"
+
+# The report mock owes the same self-test as the delete-path mock above: an error body
+# on STDOUT, `--jq` unapplied, non-zero rc.
+rmock_err=$("$RTMP/gh" api "repos/acme/demo/compare/main...status" --jq .status 2>/dev/null) \
+  && { echo "report mock: a simulated HTTP failure exited 0" >&2; exit 1; }
+grep -q '"status":"404"' <<<"$rmock_err"
 
 : >"$RTMP/probe-ok.log"
 report_output=$(GH_BIN="$RTMP/gh" GITHUB_REPOSITORY=acme/demo DEAD_BRANCH_DAYS=14 \
