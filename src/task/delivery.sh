@@ -454,20 +454,41 @@ cmd_task_merge_unverified() {
     [[ -n "$cutoff" ]] || fail "$E_GENERIC" "task merge-unverified could not compute a cutoff from --since=$since (\`date -u -d\` unusable on this host) — re-run without --since rather than reading an unfiltered sweep as a filtered one."
   fi
 
-  # ident<TAB>ts<TAB>reason<TAB>seat, newest LAST so the dedupe below keeps the newest
-  # stamp per ident (a row re-closed after a reopen stamps twice).
-  local stamps
-  stamps=$(jq -rs --arg cut "$cutoff" '
-      .[] | select(.cmd == "task.merge-gate-unverified")
-      | select($cut == "" or (.ts >= $cut))
+  # THE LOG IS NOT SLURPABLE AND THAT IS NOT A BUG TO FIX HERE. `agent-audit.log` is
+  # world-APPENDABLE by every seat on the box, so concurrent appends interleave and it
+  # carries occasional truncated lines: measured 2026-08-17, `jq -s` over the live
+  # 10 MB log exits 5 and yields NOTHING — one malformed line 9 MB back would take the
+  # whole sweep with it, and under `set -euo pipefail` it took the whole CLI run.
+  # So: grep the ~200 candidate lines out first (cheap, and it bounds the blast radius
+  # of a bad line to itself), parse them ONE AT A TIME, and COUNT what did not parse.
+  # A skipped line is a stamp this sweep did not consider and it is disclosed below —
+  # silently dropping it would be the same "empty is not an answer" defect one layer on.
+  local cand cand_n=0
+  cand=$(grep -F '"task.merge-gate-unverified"' "$logf" 2>/dev/null || true)
+  [[ -n "$cand" ]] && cand_n=$(printf '%s\n' "$cand" | grep -c . || true)
+
+  # ident<TAB>ts<TAB>reason<TAB>seat. The --since cutoff and the newest-wins dedupe are
+  # done in awk, not jq, so `parsed` below counts PARSE failures only and is not
+  # confounded by rows the filter legitimately dropped.
+  local jqout parsed_n=0
+  jqout=$(printf '%s\n' "$cand" | jq -r '
+      select(.cmd == "task.merge-gate-unverified")
       | [ (.args[0] // ""),
           (.ts // ""),
-          ((.args[] | select(startswith("reason="))) // "reason=unrecorded"),
+          ([ .args[] | select(startswith("reason=")) ] | first // "reason=unrecorded"),
           (.user // "") ] | @tsv
-    ' "$logf" 2>/dev/null | awk -F'\t' '$1 ~ /^DIVE-[0-9]+$/ { r[$1]=$0 } END { for (k in r) print r[k] }' | sort -t$'\t' -k2,2r | head -n "$limit")
+    ' 2>/dev/null || true)
+  [[ -n "$jqout" ]] && parsed_n=$(printf '%s\n' "$jqout" | grep -c . || true)
+  local unparsed=$(( cand_n - parsed_n )); (( unparsed < 0 )) && unparsed=0
+
+  local stamps
+  stamps=$(printf '%s\n' "$jqout" \
+    | awk -F'\t' -v cut="$cutoff" '$1 ~ /^DIVE-[0-9]+$/ && (cut == "" || $2 >= cut) { r[$1]=$0 }
+                                   END { for (k in r) print r[k] }' \
+    | sort -t$'\t' -k2,2r | head -n "$limit" || true)
 
   local total_stamps=0
-  [[ -n "$stamps" ]] && total_stamps=$(printf '%s\n' "$stamps" | grep -c .)
+  [[ -n "$stamps" ]] && total_stamps=$(printf '%s\n' "$stamps" | grep -c . || true)
 
   local tok slugs; tok=$(_gate_gh_token); slugs=$(_gate_repo_slugs | paste -sd, -)
   _gate_gh_reachable "$tok" || fail "$E_GENERIC" "task merge-unverified cannot reach GitHub — $(_gate_tok_why); machine-account rail not permitted on this seat. It would report every stamped close as quiet by asking nothing. Check \`5dive gh whoami\` and \`5dive task merge-gate-selftest\`, then re-run"
@@ -532,15 +553,20 @@ cmd_task_merge_unverified() {
     (( findings > 0 )) && printf 'note: `OPEN-PR` = this row CLOSED while the merge-gate could not check it, and an open\n      pull request naming the ident exists RIGHT NOW. Triage these: either land the PR,\n      close it as abandoned, or record on the row why the close was correct anyway.\n'
     (( unconf > 0 )) && printf 'note: `unconfirmed` is NOT a clean row. %s of %s repos answered%s, so "no open PR" is a\n      statement about the repos that answered, never about the ones that did not\n      (DIVE-1935/1955). Re-run from a seat whose token reads them all.\n' "$repos_ok" "$repos_total" "${capped:+, and the 200-PR page was full in $capped}"
     [[ -n "$unscanned" ]] && warn "repos that did NOT answer: $unscanned"
+    (( unparsed > 0 )) && warn "$unparsed stamp line(s) in $logf did not parse and were NOT swept — the log is world-appendable and interleaves; those closes are unexamined, not clean."
   fi
-  ok "merge-unverified: $total_stamps stamped close(s) re-derived across $repos_ok/$repos_total repos — $findings still carry an OPEN PR ($clean clean, $unconf unconfirmed, $reopened reopened, $missing row-missing)" \
-     '{stamps:($n|tonumber), repos:($rp|split(",")), reposScanned:($ro|tonumber), reposTotal:($rt|tonumber), fullCoverage:($fc=="1"), unscanned:($us|split(", ")|map(select(.!=""))), pageCapped:($cp|split(", ")|map(select(.!=""))), findings:($f|tonumber), clean:($c|tonumber), unconfirmed:($u|tonumber), reopened:($re|tonumber), rowMissing:($m|tonumber), rows:($r|fromjson)}' \
+  ok "merge-unverified: $total_stamps stamped close(s) re-derived across $repos_ok/$repos_total repos — $findings still carry an OPEN PR ($clean clean, $unconf unconfirmed, $reopened reopened, $missing row-missing${unparsed:+; $unparsed unparseable log line(s) skipped})" \
+     '{stamps:($n|tonumber), repos:($rp|split(",")), reposScanned:($ro|tonumber), reposTotal:($rt|tonumber), fullCoverage:($fc=="1"), unscanned:($us|split(", ")|map(select(.!=""))), pageCapped:($cp|split(", ")|map(select(.!=""))), findings:($f|tonumber), clean:($c|tonumber), unconfirmed:($u|tonumber), reopened:($re|tonumber), rowMissing:($m|tonumber), unparsedLogLines:($ul|tonumber), rows:($r|fromjson)}' \
      --arg n "$total_stamps" --arg rp "$slugs" --arg ro "$repos_ok" --arg rt "$repos_total" --arg fc "$full_coverage" \
      --arg us "$unscanned" --arg cp "$capped" --arg f "$findings" --arg c "$clean" --arg u "$unconf" \
-     --arg re "$reopened" --arg m "$missing" --arg r "$payload"
+     --arg re "$reopened" --arg m "$missing" --arg ul "$unparsed" --arg r "$payload"
   # Exit status is the consumable signal — a stamp with no consumer is what this verb
   # exists to fix, so `merge-unverified && echo ok` must mean something to cron.
-  (( findings > 0 )) && return 1
+  # `mark_reported` first: a findings exit is a REPORTED verdict (the rows are right
+  # there above it), and without the flag the EXIT-trap backstop renders this verb's
+  # own headline result as "exited 1 without reporting a reason — this is a bug in the
+  # CLI", which tells a reader to file a bug instead of triaging the rows.
+  if (( findings > 0 )); then mark_reported; return 1; fi
   return 0
 }
 

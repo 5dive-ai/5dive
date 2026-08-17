@@ -228,5 +228,26 @@ grep -q "DIVE-9006" <<<"$out" \
   && ok_t "T8b control: without --since the same stamp IS swept" \
   || bad_t "T8b unfiltered sweep lost the row" "$out"
 
+# ── T9: a malformed line must not take the sweep with it, and must be DISCLOSED ──
+# Measured on the live log 2026-08-17: `jq -s` over /var/log/5dive/agent-audit.log
+# exits 5 and yields NOTHING. The log is world-appendable by every seat, so appends
+# interleave and truncated lines exist — one of them 9 MB back would otherwise silence
+# the entire sweep, and under the bundle's `set -euo pipefail` it killed the CLI run.
+: >"$AUDIT_LOG"; rm -f "$GH_STUB_DIR"/*
+mkrow DIVE-9007 done
+stamp DIVE-9007 "2026-08-14T06:00:00+00:00"
+printf '{"ts":"2026-08-14T06:30:00+00:00","cmd":"task.merge-gate-unverified","args":["DIVE-99\n' >>"$AUDIT_LOG"
+answers lodar/5dive-api
+prlist 5dive-ai/5dive 781 "DIVE-9007 still open" "dive-9007"
+out=$( (cmd_task_merge_unverified 2>&1) ); rc=$?
+if (( rc == 1 )) && grep -q "DIVE-9007" <<<"$out" && grep -q "#781" <<<"$out"; then
+  ok_t "T9 a truncated log line does not stop the sweep — the good stamps still resolve"
+else
+  bad_t "T9 one malformed line silenced the whole sweep" "rc=$rc: $out"
+fi
+grep -qi "did not parse" <<<"$out" \
+  && ok_t "T9b the skipped line is DISCLOSED, not silently dropped" \
+  || bad_t "T9b unparseable line was swallowed without a word" "$out"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
