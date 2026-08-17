@@ -1255,11 +1255,19 @@ cmd_deliver() {
   sudo -u "agent-${target}" tmux has-session -t "agent-${target}" 2>/dev/null \
     || fail "$E_NOT_RUNNING" "tmux session 'agent-${target}' not found (is the agent running?)"
 
-  # Sender + tier from the real sudo caller (agent-X -> X). A non-agent caller
+  # Sender + tier from the real caller (agent-X -> X). A non-agent caller
   # (direct root / human) records as "human"; tier is empty unless the sender is
-  # a registered agent. Mirrors auto_sender_from_sudo + the DIVE-1064 tier stamp.
-  local s="${SUDO_USER#agent-}" _caller=""
-  if [[ "${SUDO_USER:-}" == agent-* ]]; then _caller="$s"; else s="human"; fi
+  # a registered agent.
+  #
+  # DIVE-2538 item 1: this used to be `[[ "${SUDO_USER:-}" == agent-* ]]` — the
+  # DIVE-2371 prefix rule, deciding an agent-vs-HUMAN CLASS from an env var nothing
+  # verifies. It decides `_caller`, which is the key the a2a round cap counts
+  # against, so a forged `SUDO_USER=agent-X` spent X's round budget and recorded X
+  # as the sender. `actor_routing_agent` answers from the caller's own euid first
+  # and only consults SUDO_UID for a non-agent euid, where sudo has stamped it.
+  local _caller s
+  _caller=$(actor_routing_agent) || _caller=""
+  if [[ -n "$_caller" ]]; then s="$_caller"; else s="human"; fi
 
   # DIVE-3318: the round cap on the SCOPED path. This is the branch every
   # standard-isolation agent's `agent send` re-execs into, so a cap enforced only

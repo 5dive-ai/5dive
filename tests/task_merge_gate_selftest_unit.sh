@@ -73,16 +73,25 @@ chmod +x "$TMP/bin/gh"
 export PATH="$TMP/bin:$PATH"
 export GH_ARGS_LOG="$TMP/gh.args"; : >"$GH_ARGS_LOG"
 
-# --- stub id: the arm-4 branch is guarded on `id -un != claude`, and without
-# this the harness grades whoever runs it (DIVE-2484's measurement). -----------
-REAL_ID=$(command -v id)
-cat >"$TMP/bin/id" <<IDSTUB
-#!/usr/bin/env bash
-if [[ -n "\${ID_STUB_UN:-}" && "\$1" == "-un" ]]; then printf '%s\n' "\$ID_STUB_UN"; exit 0; fi
-exec "$REAL_ID" "\$@"
-IDSTUB
-chmod +x "$TMP/bin/id"
-export ID_STUB_UN="agent-fixture"
+# --- pin the caller identity: the arm-4 branch only fires for a NON-`claude`
+# caller, and without a pin the harness grades whoever runs it (DIVE-2484's
+# measurement — red under this repo's `sudo -u claude` local convention, green on a
+# CI runner with no `claude` account).
+#
+# DIVE-2538 item 5 sealed that predicate onto `actor_caller_unix_name` ($EUID
+# through a pure-bash passwd walk), so the PATH shim this file used to carry became
+# INERT rather than red — the silent class tests/identity_stub_guard_unit.sh exists
+# to catch. Pin the seams the derivation actually reads instead; they are functions,
+# so only something already inside this shell can set them. Applied after the
+# sources below, which would otherwise overwrite them.
+_pin_identity_seams() {
+  _gate_caller_uid()    { printf '%s' "${CALLER_UID_STUB:-990002}"; }
+  _gate_passwd_stream() {
+    printf '%s\n' "$(</etc/passwd)"
+    printf 'claude:x:990001:990001::/nonexistent:/bin/false\n'
+    printf 'agent-fixture:x:990002:990002::/nonexistent:/bin/false\n'
+  }
+}
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
@@ -92,6 +101,7 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+_pin_identity_seams
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 mkdir -p "$TASKS_DIR"; set +e
 
@@ -100,6 +110,13 @@ ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 tasks_db_init
 audit_log() { :; }
+
+# T0: the pin, asserted THROUGH the real resolver before anything leans on it. A
+# pin that yields '' or the host's own name makes every arm-4 assertion below read
+# correct for the wrong reason.
+{ [[ "$(actor_caller_unix_name)" == "agent-fixture" ]] && [[ "$(_gate_uid_to_agent "$(_gate_caller_uid)")" == "fixture" ]]; } \
+  && ok_t "T0 the caller-identity pin lands through the real resolver (non-claude, so arm 4 is live)" \
+  || bad_t "T0 identity pin" "name=[$(actor_caller_unix_name)] agent=[$(_gate_uid_to_agent "$(_gate_caller_uid)")]"
 
 CTRL="https://github.com/5dive-ai/5dive/pull/163"
 

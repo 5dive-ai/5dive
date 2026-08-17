@@ -113,7 +113,18 @@ _gate_gh_token() {
   # seat, and the two outcomes have different remedies — "claude has no gh login"
   # is a host fault, "you may not run sudo as claude" is this seat's sudoers. `-n`
   # made both silent, so they were indistinguishable; separate them here.
-  if command -v sudo >/dev/null 2>&1 && [[ "$(id -un 2>/dev/null)" != "claude" ]]; then
+  # DIVE-2538 item 5 (axis corrected by olivia: weaken-a-gate, NOT misattribution).
+  # This predicate does not decide "whether to re-exec under sudo" — it gates arm 4,
+  # the LAST token-resolution arm. When it is skipped the resolver falls through to
+  # `printf ''` and returns EMPTY, and the auto-detect merge gate below is fail-OPEN
+  # on an empty token. So a PATH shim echoing `claude` made a caller skip its own
+  # fallback, resolve no token, and take the open path — a gate weakened by a shim,
+  # from a seat whose real uid was never `claude`. $EUID via actor_caller_unix_name
+  # is not shimmable.
+  #
+  # (The fail-OPEN downstream is carried from the parent ticket's body and was NOT
+  # re-measured on this branch; it decides this item's severity, not its fix shape.)
+  if command -v sudo >/dev/null 2>&1 && [[ "$(actor_caller_unix_name)" != "claude" ]]; then
     # The classification reads sudo's OWN stderr rather than asking a second time
     # (`sudo -n -u claude true`). Deliberate: an extra probe changes the call
     # sequence three sibling harnesses assert on, and a diagnostic that alters the

@@ -101,25 +101,38 @@ SUDOSTUB
 chmod +x "$TMP/bin/sudo"
 : >"$TMP/sudo.calls"
 
-# --- stub id: DIVE-2484. The token resolver's last branch is guarded on
-# `id -un != claude` (it must not borrow a credential from the account it is
-# already running as). This harness stubbed `gh` and `sudo` but NOT `id`, so that
-# arm inherited the HOST's identity and graded the running user rather than the
-# code: red as `claude`, green as anyone else. Since this repo's own convention is
-# to run local tests via `sudo -u claude`, the conventional local run was the red
-# one, while CI — where no `claude` account exists — was permanently green. Same
-# tree, two verdicts, and neither was about the tree. Opt-in override so a test
-# CONSTRUCTS the identity its scenario needs; everything else passes through to
-# the real binary, which keeps the other arms reading the true host.
-REAL_ID=$(command -v id)
-cat >"$TMP/bin/id" <<IDSTUB
-#!/usr/bin/env bash
-if [[ -n "\${ID_STUB_UN:-}" && "\$*" == "-un" ]]; then
-  printf '%s\n' "\$ID_STUB_UN"; exit 0
-fi
-exec $REAL_ID "\$@"
-IDSTUB
-chmod +x "$TMP/bin/id"
+# --- pin the CALLER IDENTITY: DIVE-2484, re-seamed by DIVE-2538 item 5. --------
+# The token resolver's last branch is guarded on "the caller is not `claude`" (it
+# must not borrow a credential from the account it is already running as). This
+# harness stubbed `gh` and `sudo` but NOT the identity, so that arm inherited the
+# HOST's and graded the running user rather than the code: red as `claude`, green as
+# anyone else. DIVE-2484 fixed that with a PATH shim over `id -un`.
+#
+# DIVE-2538 item 5 sealed the predicate — it now reads `actor_caller_unix_name`,
+# i.e. $EUID through a pure-bash /etc/passwd walk, precisely so a PATH shim cannot
+# answer "who is calling?". That closes the forgery and the `id` shim in the same
+# move, which is the whole content of
+# community/wiki/sealing-an-identity-read-removes-the-seam-a-harness-drove-it-with.md:
+# the shim went QUIET rather than red, the `claude` arm below started grading the
+# runner again, and on CI (uid 0, no `claude` row) it self-borrowed and went RED.
+#
+# So drive it the way tests/identity_stub_guard_unit.sh's rule requires: pin the two
+# seams the derivation actually reads — `_gate_caller_uid` and `_gate_passwd_stream`,
+# both FUNCTIONS, reachable from inside this shell and from nowhere else — and assert
+# the pin lands THROUGH the real resolver before any arm leans on it. Both default to
+# the true host, so every other arm keeps reading the real caller.
+#
+# Placed AFTER the sources below, because `lib/actor.sh` would overwrite them.
+_pin_identity_seams() {
+  _gate_caller_uid() { printf '%s' "${CALLER_UID_STUB:-$EUID}"; }
+  # Real passwd first, synthetic rows appended: the uids are looked up by NUMBER, so
+  # the fixtures cannot collide with a host that does (or does not) have a `claude`.
+  _gate_passwd_stream() {
+    printf '%s\n' "$(</etc/passwd)"
+    printf 'claude:x:990001:990001::/nonexistent:/bin/false\n'
+    printf 'agent-fixture:x:990002:990002::/nonexistent:/bin/false\n'
+  }
+}
 
 export PATH="$TMP/bin:$PATH"
 export GH_ARGS_LOG="$TMP/gh.args"; : >"$GH_ARGS_LOG"
@@ -131,6 +144,7 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          cmd_task.sh; do
   source "$SRC/$f"
 done
+_pin_identity_seams
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 JSON_MODE=0
 mkdir -p "$TASKS_DIR"; set +e
@@ -291,6 +305,22 @@ GH_STUB_AUTH_TOKEN="" run_done LOUD-2 --result='no pr named'
   && ok_t "a missing gh token is named as the reason (the DIVE-1935 root cause)" \
   || bad_t "no-token reason must be named" "out=$OUT"
 
+# DIVE-2538 item 5's SEVERITY, measured here instead of carried. The item's whole
+# story is weaken-a-gate: the sealed predicate matters because a caller who resolves
+# NO token still gets through. Both prior passes on that row took the fail-OPEN
+# downstream from the parent's body without re-measuring it; this arm measures it, so
+# a future change that makes an empty token REFUSE (a defensible choice) reddens here
+# and gets decided on purpose rather than discovered.
+# Fail-open, but LOUD and AUDITED — that pairing is the finding, and each half is
+# asserted separately because a silent fail-open and a loud one are different bugs.
+if [[ $RC -eq 0 && "$(statusof LOUD-2)" == "done" ]] \
+   && [[ "$OUT" == *"UNVERIFIED"* ]] \
+   && grep -q "merge-gate-unverified.*reason=no-gh-token" "$AUDIT_CALLS"; then
+  ok_t "an unresolvable token is FAIL-OPEN (the close lands) but announced + audited as UNVERIFIED"
+else
+  bad_t "no-token close must be fail-open, loud and audited" "rc=$RC status=$(statusof LOUD-2) audit=$(cat "$AUDIT_CALLS")"
+fi
+
 # --- 7. the audited escape still works ---------------------------------------
 : >"$AUDIT_CALLS"
 seed ESC-1
@@ -308,11 +338,26 @@ fi
 # DIVE-2484: the two arms below are a DIFFERENTIAL PAIR. They hold every variable
 # equal and change only the caller's identity, because the identity is the whole
 # subject: the fallback must fire for an agent-* caller and must NOT fire for
-# `claude` itself. `ID_STUB_UN` is what makes each one construct its own
+# `claude` itself. `CALLER_UID_STUB` is what makes each one construct its own
 # precondition — before it existed this arm read the host's identity and its
 # verdict tracked whoever ran it.
+#
+# THE PIN IS ASSERTED FIRST, through the real resolver, and this arm is not
+# ceremony: it is the arm that would have caught DIVE-2538's own regression the
+# moment the predicate stopped reading `id`. A pin that yields the WRONG name (or
+# an empty one) makes the negative arm below pass for the wrong reason — "no borrow
+# happened" is also what a broken fixture produces.
+pin_a=$(CALLER_UID_STUB=990002 actor_caller_unix_name)
+pin_c=$(CALLER_UID_STUB=990001 actor_caller_unix_name)
+pin_g=$(_gate_uid_to_agent 990002)
+if [[ "$pin_a" == "agent-fixture" && "$pin_c" == "claude" && "$pin_g" == "fixture" ]]; then
+  ok_t "the caller-identity pin lands through the REAL resolver (both halves of the pair)"
+else
+  bad_t "identity pin must resolve through actor_caller_unix_name" "agent=[$pin_a] claude=[$pin_c] agentname=[$pin_g]"
+fi
+
 : >"$TMP/sudo.calls"
-got=$(ID_STUB_UN="agent-fixture" GH_TOKEN="" GITHUB_TOKEN="" SUDO_USER="" GH_STUB_AUTH_TOKEN="" \
+got=$(CALLER_UID_STUB=990002 GH_TOKEN="" GITHUB_TOKEN="" SUDO_USER="" GH_STUB_AUTH_TOKEN="" \
       SUDO_STUB_TOKEN="claude-token" _gate_gh_token)
 if [[ "$got" == "claude-token" ]] && grep -q -- "-u claude gh auth token" "$TMP/sudo.calls"; then
   ok_t "a non-root NON-claude caller resolves the gh token via claude (gate is live for agents)"
@@ -325,22 +370,30 @@ fi
 # as. Empty resolution is the CORRECT answer here — `claude`'s own credential is
 # the arm above this one's business (`gh auth token`, line ~1257), not this branch.
 # Liveness for the negative: the arm directly above differs from this one ONLY in
-# ID_STUB_UN and DOES record a sudo call, so a silent sudo.calls here is a real
+# CALLER_UID_STUB and DOES record a sudo call, so a silent sudo.calls here is a real
 # absence and not a dead stub.
 : >"$TMP/sudo.calls"
-got=$(ID_STUB_UN="claude" GH_TOKEN="" GITHUB_TOKEN="" SUDO_USER="" GH_STUB_AUTH_TOKEN="" \
+got=$(CALLER_UID_STUB=990001 GH_TOKEN="" GITHUB_TOKEN="" SUDO_USER="" GH_STUB_AUTH_TOKEN="" \
       SUDO_STUB_TOKEN="claude-token" _gate_gh_token)
-if [[ -z "$got" ]] && ! grep -q -- "-u claude gh auth token" "$TMP/sudo.calls"; then
-  ok_t "a caller who IS claude never borrows a token from itself"
+# The absence-of-a-sudo-call half is NOT self-sufficient on a 5dive host:
+# tests/lib/env_isolation.sh installs a REFUSING `sudo()` shell function whenever
+# /etc/environment carries FIVE_* knobs that PAM would restore (DIVE-3096), so "no
+# sudo call was recorded" is also what a guarded host produces for every caller. Read
+# the resolver's OWN trace as well — it names WHICH branch declined — so this arm
+# fails when the reason is anything but "we are already claude".
+why_claude=$(_gate_tok_why)
+if [[ -z "$got" ]] && ! grep -q -- "-u claude gh auth token" "$TMP/sudo.calls" \
+   && [[ "$why_claude" == *"[4 sudo -u claude] skipped"* ]]; then
+  ok_t "a caller who IS claude never borrows a token from itself (and the trace names that as the reason)"
 else
-  bad_t "claude caller must not self-borrow" "got=[$got] sudo=$(cat "$TMP/sudo.calls")"
+  bad_t "claude caller must not self-borrow" "got=[$got] sudo=$(cat "$TMP/sudo.calls") why=[$why_claude]"
 fi
 
 # ...and that refusal to self-borrow costs `claude` nothing, because its OWN login
 # resolves one branch earlier. This is the arm that proves the empty result above
 # is a scoped no-op rather than a broken resolver for the claude account.
 : >"$TMP/sudo.calls"
-got=$(ID_STUB_UN="claude" GH_TOKEN="" GITHUB_TOKEN="" SUDO_USER="" GH_STUB_AUTH_TOKEN="own-login-tok" \
+got=$(CALLER_UID_STUB=990001 GH_TOKEN="" GITHUB_TOKEN="" SUDO_USER="" GH_STUB_AUTH_TOKEN="own-login-tok" \
       SUDO_STUB_TOKEN="claude-token" _gate_gh_token)
 if [[ "$got" == "own-login-tok" ]] && ! grep -q -- "-u claude gh auth token" "$TMP/sudo.calls"; then
   ok_t "claude resolves via its OWN gh login, not the borrow branch"

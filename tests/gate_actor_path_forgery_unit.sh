@@ -202,6 +202,98 @@ _gate_caller_uid() { printf '%s' '4242'; }
   || no "unresolvable uid did not fall back to '?' (got '$(_gate_caller_user)')"
 eval "$_gate_caller_uid_saved"
 
+# --- DIVE-2538: the ROUTING resolver ------------------------------------------
+# `actor_routing_agent` decides which agent's Telegram bot a task notification
+# reaches (misroute axis) and which agent an a2a round is counted against. It
+# deliberately has a SUDO_UID branch that `_gate_authenticated_actor` does not, so
+# it needs its own arms: the branch must be UNREACHABLE from an agent seat (that is
+# what makes it safe) while still answering for the de-elevated relay.
+eval "$(sed -n '/^actor_routing_agent()/,/^}/p'    src/lib/actor.sh)"
+eval "$(sed -n '/^actor_caller_unix_name()/,/^}/p' src/lib/actor.sh)"
+for _f in actor_routing_agent actor_caller_unix_name; do
+  declare -F "$_f" >/dev/null || { printf 'NOT OK - %s did not load; the DIVE-2538 arms below would be vacuous\n' "$_f"; exit 1; }
+done
+
+# The pre-fix routing resolver, verbatim from _task_owner_channel before DIVE-2538.
+# Both of its arms are anchored below, because closing only one is the documented
+# trap on this row: patch the ELSE branch and a grep for ${USER:-$(id -un)} comes
+# back clean while the branch that actually decides is untouched.
+_old_routing() {
+  local name="" s
+  s=$(auto_sender_from_sudo_OLD)
+  if [[ -n "$s" ]]; then name="$s"
+  else local u="${USER:-$(id -un 2>/dev/null)}"; [[ "$u" == agent-* ]] && name="${u#agent-}"; fi
+  printf '%s' "$name"
+}
+auto_sender_from_sudo_OLD() {
+  local u="${SUDO_USER:-}"
+  [[ -n "$u" && "$u" == agent-* ]] || { echo ""; return; }
+  echo "${u#agent-}"
+}
+
+if [[ -n "$EXPECT" ]]; then
+  # 14. The DIVE-2518 forgery, needing NO privilege: an agent seat exporting a peer's
+  #     name. The euid arm must answer first and the environment must not be read.
+  got=$(SUDO_USER=agent-lodar SUDO_UID=4242 USER=agent-lodar PATH="$SHIM:$PATH" actor_routing_agent)
+  [[ "$got" == "$EXPECT" ]] \
+    && ok "routing: a forged SUDO_USER/SUDO_UID/USER + hostile PATH still routes to the real agent ($EXPECT)" \
+    || no "routing was moved to '$got' (expected '$EXPECT') — the misroute is NOT closed"
+
+  # 15. ANCHOR for arm 14 via the PRIMARY branch. This is the one both prior reviews
+  #     graded past.
+  old_primary=$(SUDO_USER=agent-lodar auto_sender_from_sudo_OLD)
+  [[ "$old_primary" == "lodar" ]] \
+    && ok "ANCHOR: the pre-fix PRIMARY branch (\$SUDO_USER + prefix) misroutes to 'lodar'" \
+    || no "ANCHOR FAILED — forged SUDO_USER did not move the old primary branch (got '$old_primary'); arm 14 is vacuous"
+
+  # 16. ANCHOR for arm 14 via the FALLBACK branch, reached only with SUDO_USER absent.
+  #     Two arms decided; two anchors. One anchor would license exactly the half-fix.
+  old_fallback=$(unset SUDO_USER; USER=agent-lodar _old_routing)
+  [[ "$old_fallback" == "lodar" ]] \
+    && ok "ANCHOR: the pre-fix FALLBACK branch (\${USER:-\$(id -un)}) misroutes to 'lodar'" \
+    || no "ANCHOR FAILED — forged \$USER did not move the old fallback (got '$old_fallback'); arm 14 is half-vacuous"
+
+  # 17. THE REGRESSION THE FIX EXISTS TO AVOID. `sudo -u claude` is this repo's
+  #     mandated smoke shape; the strict resolver goes EMPTY on it, and empty at a
+  #     routing site means "reaches nobody" — rendered as a SILENT skip by three
+  #     consumers and a hard E_AUTH_REQUIRED by /inbox --send. Modelled by forcing a
+  #     non-agent euid with sudo's own stamp present, which is what that relay looks
+  #     like from inside. Without this arm the fix is indistinguishable from the
+  #     migration that trades a forgery for a silent no-op.
+  _gate_caller_uid_saved=$(declare -f _gate_caller_uid)
+  _gate_caller_uid() { printf '%s' '0'; }        # euid resolves to a NON-agent (root)
+  relay=$(SUDO_UID="$REAL_UID" actor_routing_agent)
+  [[ "$relay" == "$EXPECT" ]] \
+    && ok "routing: a de-elevated relay (non-agent euid + sudo-stamped SUDO_UID) still reaches $EXPECT" \
+    || no "de-elevated relay resolved '$relay' (expected '$EXPECT') — the fix regressed the sudo -u shape"
+
+  # 18. And with no sudo stamp at all — the root heartbeat sweep — it must stay
+  #     EMPTY, because that caller is genuinely not an agent. Guards against
+  #     "fixed the relay by making the resolver answer something for everyone".
+  sweep=$(unset SUDO_UID; unset SUDO_USER; USER=root actor_routing_agent)
+  [[ -z "$sweep" ]] \
+    && ok "routing: the root sweep (no SUDO_UID) still resolves EMPTY, as its callers assume" \
+    || no "root sweep resolved '$sweep' — _task_owner_channel is no longer the structural no-op its callers rely on"
+  eval "$_gate_caller_uid_saved"
+else
+  skip "DIVE-2538 routing arms 14-18 — this runner is not an agent-* user (uid $REAL_UID, name '$REAL_NAME')"
+fi
+
+# 19. `actor_caller_unix_name` — the comparison/storage replacement for `id -un` at
+#     items 3, 4 and 5. Must name the real uid under a shim, and must return EMPTY
+#     (not `?`) for an unresolvable uid, because its callers feed it to `==`.
+name_shim=$(PATH="$SHIM:$PATH" actor_caller_unix_name)
+[[ "$name_shim" == "$REAL_NAME" ]] \
+  && ok "actor_caller_unix_name survives a hostile PATH and names the kernel identity ($REAL_NAME)" \
+  || no "actor_caller_unix_name forged: got '$name_shim', real '$REAL_NAME'"
+
+_gate_caller_uid_saved=$(declare -f _gate_caller_uid)
+_gate_caller_uid() { printf '%s' '4242'; }
+[[ -z "$(actor_caller_unix_name)" ]] \
+  && ok "actor_caller_unix_name returns EMPTY for an unresolvable uid (never '?', which would compare equal)" \
+  || no "actor_caller_unix_name returned '$(actor_caller_unix_name)' for uid 4242; a sentinel here can satisfy a == test"
+eval "$_gate_caller_uid_saved"
+
 printf '\ngate_actor_path_forgery_unit: %d passed, %d failed, %d skipped (runner %s, uid %s)\n' \
   "$PASS" "$FAIL" "$SKIP" "${REAL_NAME:-?}" "$REAL_UID"
 [ "$FAIL" -eq 0 ]

@@ -364,8 +364,13 @@ SNIP
 _proof_identity() {
   local as="${1:-}" gname="" gemail="" cname cemail
   _PROOF_ID_UNCHECKED=0
-  if [ -n "$as" ] && [ "$as" != "$(id -un 2>/dev/null)" ]; then
-    if [ "$(id -u)" = "0" ] && command -v runuser >/dev/null 2>&1; then
+  # DIVE-2538 item 4: `$as != $(id -un)` decides whether to read ANOTHER user's
+  # ~/.gitconfig through runuser, i.e. whether this check runs at all. A PATH shim
+  # making `id -un` echo "$as" collapsed it to the caller's own config and reported
+  # the answer as if it were the target's — a false green on exactly the
+  # configure-vs-02:00-publish split this function exists to catch.
+  if [ -n "$as" ] && [ "$as" != "$(actor_caller_unix_name)" ]; then
+    if _gate_is_root && command -v runuser >/dev/null 2>&1; then
       gname="$(runuser -u "$as" -- git config --global user.name 2>/dev/null || true)"
       gemail="$(runuser -u "$as" -- git config --global user.email 2>/dev/null || true)"
     else
@@ -387,7 +392,7 @@ _proof_identity() {
   # The source is named off the EMAIL — that is the field carrying the PII.
   if   [ -n "${ZH_GIT_EMAIL:-}" ]; then _PROOF_ID_SOURCE="env ZH_GIT_EMAIL"
   elif [ -n "$cemail" ];           then _PROOF_ID_SOURCE="proof.json identity"
-  elif [ -n "$gemail" ];           then _PROOF_ID_SOURCE="git config --global (${as:-$(id -un 2>/dev/null)})"
+  elif [ -n "$gemail" ];           then _PROOF_ID_SOURCE="git config --global (${as:-$(actor_caller_unix_name)})"
   else                                  _PROOF_ID_SOURCE=""
   fi
 }
@@ -540,7 +545,7 @@ _proof_build() {
   printf '%s' "$week_json" > "$work/week.json"
   summary="$(DAY_JSON_FILE="$work/day.json" WEEK_JSON_FILE="$work/week.json" TODAY="$today" \
     NOW_ISO="$now_iso" CLI_VERSION="$cli_version" \
-    PUB_HOST="$(_proof_host)" PUB_USER="$(id -un)" \
+    PUB_HOST="$(_proof_host)" PUB_USER="$(_gate_caller_user)" \
     METHODOLOGY_URL="$_PROOF_METHODOLOGY_URL" \
     WINDOW_DAYS="$win_days" \
     CORR_ROWS="$corr_rows" \
@@ -940,7 +945,11 @@ _proof_publish() {
   # unguarded and FATAL: a publish that cannot record that it ran must not
   # report success, because staleness monitoring reads exactly this field.
   if [ "$dry" -ne 1 ]; then
-    if ! _proof_pref_write --arg d "$(date -u +%F)" --arg h "$(_proof_host)" --arg u "$(id -un)" \
+    # DIVE-2538 item 6: `lastPublishedBy.user` is STORED and later read by staleness
+    # monitoring, so it is a record, not a message — the DIVE-2383 audit-sink
+    # argument applies verbatim. `?` (the _gate_caller_user fallback) is the right
+    # unknown marker for a stored field, so this one uses that rather than empty.
+    if ! _proof_pref_write --arg d "$(date -u +%F)" --arg h "$(_proof_host)" --arg u "$(_gate_caller_user)" \
            '.lastPublished=$d | .lastPublishedBy={host:$h,user:$u}'; then
       echo "proof publish: the push SUCCEEDED but the state write did not — \`proof status\` will keep reporting stale/never and the staleness alarm is blind. Reporting failure deliberately." >&2
       return "$E_GENERIC"

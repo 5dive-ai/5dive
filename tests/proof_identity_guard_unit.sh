@@ -49,6 +49,18 @@ export GIT_CONFIG_GLOBAL="$HOME/.gitconfig"
 unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
 unset ZH_GIT_NAME ZH_GIT_EMAIL
 
+# DIVE-2538: cmd_proof.sh now resolves the caller through the sealed derivation
+# (`actor_caller_unix_name`, `_gate_is_root`) instead of a PATH-resolved `id`, so
+# lib/actor.sh is a REAL dependency of this file and must be sourced, not stubbed —
+# a stub would make every arm below grade the stub. Sourced FIRST, in the bundle's
+# own order (build.sh puts src/lib/actor.sh ahead of every cmd_*.sh).
+# Without it the arms still "passed" while cmd_proof.sh printed
+# `actor_caller_unix_name: command not found` on stderr and the comparison silently
+# took the empty string — a harness passing on an unresolved dependency.
+# shellcheck disable=SC1091
+source src/lib/actor.sh
+declare -F actor_caller_unix_name >/dev/null && declare -F _gate_is_root >/dev/null \
+  || { printf 'NOT OK - lib/actor.sh sourced but the identity resolvers are absent; every arm below would grade an undefined command\n'; exit 1; }
 # shellcheck disable=SC1091
 source src/cmd_proof.sh
 
@@ -152,14 +164,45 @@ fi
 # The branch that matters in production (the cron user is rarely the caller)
 # cannot be exercised for real by a non-root runner, so drive it with stubbed
 # id/runuser rather than leave it asserted by nobody.
+# DIVE-2538 changed the seam this case drives, and that is the POINT of the change:
+# it used to stub `id` as a shell function, and `id` is exactly what a hostile PATH
+# could also supply. The branch now reads $EUID through `_gate_is_root` and the
+# caller's name through `actor_caller_unix_name`, neither of which a shim reaches —
+# so the stubs here are in-process function overrides, which require already being
+# inside this shell. Arm 8 below asserts the shim route is now dead.
 (
-  id() { case "${1:-}" in -u) echo 0 ;; -un) echo root ;; *) command id "$@" ;; esac; }
+  _gate_is_root() { return 0; }                        # was: id() { echo 0; }
+  actor_caller_unix_name() { printf 'root'; }
   runuser() { echo "cron-user@example.com"; }   # both name and email lookups
   _proof_identity "some-cron-user"
   [[ "$_PROOF_ID_EMAIL" == "cron-user@example.com" && "$_PROOF_ID_UNCHECKED" == "0" ]] || exit 1
   [[ "$_PROOF_ID_SOURCE" == *"some-cron-user"* ]] || exit 2
 ) && ok_t "as root, layer 3 resolves AS the cron user and names them in the source" \
   || bad_t "root cross-user resolution" "rc=$?"
+
+# --- Case 8 (DIVE-2538): a PATH-shimmed `id` no longer decides this branch ----
+# The defect: `[ "$as" != "$(id -un)" ]` gated whether the TARGET user's gitconfig
+# is read at all, and `id` resolves through the CALLER'S PATH (DIVE-2330). A shim
+# echoing "$as" collapsed the check onto the caller's OWN config and reported the
+# answer as the target's — a false green on the configure-vs-02:00-publish split
+# this function exists to catch. Anchored: the same shim IS shown to move `id -un`.
+_p8=$(mktemp -d "$TMP/shim.XXXXXX")
+printf '#!/bin/sh\nif [ "$1" = "-un" ]; then echo "some-cron-user"; else exec /usr/bin/id "$@"; fi\n' > "$_p8/id"
+chmod +x "$_p8/id"
+if [ "$(PATH="$_p8:$PATH" id -un)" != "some-cron-user" ]; then
+  bad_t "ANCHOR: the id shim does not move 'id -un'" "case 8 would be vacuous"
+else
+  (
+    export PATH="$_p8:$PATH"
+    runuser() { echo "SHOULD-NOT-BE-REACHED@example.com"; }
+    _proof_identity "some-cron-user"
+    # Unshimmed, the caller is NOT some-cron-user, so the cross-user branch is taken
+    # and (non-root, no runuser) the identity is reported UNCHECKED rather than
+    # silently answered from the caller's own config.
+    [[ "$_PROOF_ID_UNCHECKED" == "1" ]] || exit 1
+  ) && ok_t "a PATH-shimmed 'id -un' no longer collapses the cross-user check onto the caller (DIVE-2538 item 4)" \
+    || bad_t "id shim still decides the cross-user branch" "unchecked flag not set under the shim"
+fi
 
 # --- Case 8: `proof on --as-*` validation ------------------------------------
 ( _proof_onoff on --repo="https://github.com/acme/box.git" --as-email="not-an-email" ) 2>"$TMP/err2"

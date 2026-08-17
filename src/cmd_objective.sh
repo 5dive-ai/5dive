@@ -122,7 +122,13 @@ cmd_objective_add() {
   fi
   [[ -n "$_existing_status" ]] && fail "$E_CONFLICT" "objective '$name' already exists"
 
-  local by; by="$(auto_sender_from_sudo 2>/dev/null || true)"; [[ -n "$by" ]] || by="${USER:-unknown}"
+  # DIVE-2538 item 7: `created_by` is STORED as the acting agent. Both old arms were
+  # forgeable with no privilege — `auto_sender_from_sudo` is $SUDO_USER plus a prefix
+  # test, and the `${USER:-unknown}` fallback is a bare env var. This is an
+  # ATTRIBUTION site, so it takes the sealed derivation and its `cli` sentinel:
+  # empty degrades safely here (the row still exists and reads as unattributed),
+  # which is the split [[a-uid-first-derivation-cannot-see-through-sudo-u]] draws.
+  local by; by="$(actor_board_name 2>/dev/null || true)"; [[ -n "$by" ]] || by="unknown"
   db "INSERT INTO objectives
         (name, metric_cmd, target, direction, unit, review, planner, project_key,
          max_new_per_cycle, budget, public, run_mode, created_by)
@@ -530,7 +536,14 @@ cmd_objective_rm() {
   destroy it for real: 5dive objective rm \"$OBJECTIVE_NAME\" --purge --yes"
   fi
 
-  local by; by="$(auto_sender_from_sudo 2>/dev/null || true)"; [[ -n "$by" ]] || by="${USER:-unknown}"
+  # DIVE-2538 item 9, found by grepping the CLASS rather than the eight named sites:
+  # the identical construct as item 7 (`cmd_objective_add`), one function over, and the
+  # eight-item triage did not have it. `retired_by` is a STORED attribution field and
+  # it is the load-bearing one on this row — DIVE-2512 introduced the tombstone
+  # precisely so an authorized retirement is distinguishable from a wipe, and a
+  # `retired_by` any caller can forge with one env var is the field that distinction
+  # rests on. Same resolver and same safe-empty argument as item 7.
+  local by; by="$(actor_board_name 2>/dev/null || true)"; [[ -n "$by" ]] || by="unknown"
   db "UPDATE objectives
          SET status='retired',
              retired_at=datetime('now'),
