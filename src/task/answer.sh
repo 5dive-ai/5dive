@@ -1328,7 +1328,14 @@ cmd_task_answer() {
   # AFTER the write, never before — the settled state is the DB row, and a
   # Telegram edit is best-effort. Covers the human tap, a lead-clear, and a
   # dashboard/CLI answer, since all three land in this one function.
-  _task_gate_retire_buttons "$ident" "answered by ${answered_by}" || true
+  # DIVE-3228: a HUMAN answer leaves a receipt (the card is their record of what
+  # they approved and must survive); a lead:* / auto:* answer kills it, because
+  # they never acted and there is no record of theirs to preserve.
+  if [[ "$answered_by" == human:* ]]; then
+    _task_gate_card_apply "$ident" settle "answered by ${answered_by}" "$answered_by" || true
+  else
+    _task_gate_card_apply "$ident" die "answered by ${answered_by}" "$answered_by" || true
+  fi
 
   # INST-4: the gate CLEAR — the row that decides whether this task's timeline
   # reads "zero-human" or "a human authorized it", so it is worth more care than

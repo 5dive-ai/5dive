@@ -1610,7 +1610,7 @@ cmd_task_need() {
     # question is gone, so the button must go with it. A withdrawal is the path
     # most likely to leave a stale button standing, because unlike an answer
     # nothing about it ever reaches the human's chat.
-    _task_gate_retire_buttons "$ident" "withdrawn by ${w_name:-$w_kind}" || true
+    _task_gate_card_apply "$ident" die "withdrawn by ${w_name:-$w_kind}" || true
     local w_new; w_new=$(db "SELECT status FROM tasks WHERE id=${id};")
     ok "$ident gate withdrawn (${w_type}) — moot request cleared, no secret/grant recorded; task now ${w_new}" \
        '{ident:$id, withdrawn:true, was_type:$wt, status:$st}' \
@@ -2468,7 +2468,7 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
     warn "--rubber-stamp-ok changed nothing on this gate — the keystroke cap did not fire (type=${type}, tier=${tier}$( ((tier_floored)) && printf ', floored by category or declaration')). The declaration is still written to the row, so it stays readable; it just did not need to buy anything."
   fi
 
-  _task_gate_retire_buttons "$ident" "superseded by a re-filed gate" || true
+  _task_gate_card_apply "$ident" die "superseded by a re-filed gate" || true
 
   db "BEGIN IMMEDIATE;
       $(_gate_archive_and_clear_sql file "id=${id}")
@@ -3107,15 +3107,45 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
   # Sibling instance of the same defect, one subsystem over: DIVE-3265, where the
   # merge gate scraped a branch name out of the maker's result prose and then demanded
   # that phantom branch land.
-  local _row_ship=0
+  local _row_ship=0 _rowbind_src=""
   if [[ "$tier_floored" == "0" && ( "$type" == "decision" || "$type" == "approval" || "$type" == "manual" ) ]]; then
-    local _rowship_body _rowship_branch=""
+    local _rowship_body _rowship_branch="" _rowship_delivery=""
     _rowship_body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
     # Split rather than `[[ … ]] && v=$(f)`: an assignment's rc is its last command
     # substitution's, so the helper's non-zero on "no binding" would leak into the
     # compound (the DIVE-2751 shape). Absorbed here instead of argued about.
     _rowship_branch=$(_push_branch_from_body "$_rowship_body" 2>/dev/null) || _rowship_branch=""
-    [[ -n "$_rowship_branch" ]] && _row_ship=1
+    # DIVE-3228 / DIVE-3525 — THE SECOND BINDING, and this is the headline DIVE-3228
+    # shipped zero lines of.
+    #
+    # DIVE-3266 routes a gate on ROW STATE rather than on the ask's prose, but it reads
+    # exactly ONE binding: a `Branch:` line in the body. That is the binding `5dive push`
+    # requires, so it is present on every push-for-review row and absent on the OTHER
+    # half of the ship population — a row that reached a pull request through
+    # `task deliver --pr=`, which writes the `delivery_ref` COLUMN and never touches the
+    # body. An approval filed on such a row ("the PR is up, say go") has a reviewer that
+    # is plainly derivable and still fell through to the human, because no `Branch:` line
+    # was ever written and the ask missed `_GATE_ENG_SHIP_RX`. That is the class DIVE-3225
+    # was in when lodar was paged twice.
+    #
+    # WHY THIS AND NOT A TYPE DEFAULT. Iteration 1 of this ticket made the default the
+    # TYPE — every unfloored `approval` routed — and main's differential caught what that
+    # costs: it swallows the human ping for the rows that are unrouted BY ABSENCE. An
+    # unbound row, a prose-only mention of a branch, a plain tier-1 with nothing attached:
+    # nothing floors them, so no backstop fires, and DIVE-3266's B1/C6/E1 contract ("a row
+    # with nothing bound to it must still reach a person, with an explicit unrouted
+    # receipt naming the skipped lead and the binding remedy") broke. Both directions have
+    # to hold at once, and only a BINDING holds them: it is the fact that makes a reviewer
+    # derivable, and its ABSENCE is the fact that makes the gate the human's.
+    #
+    # `delivery_ref` is structured state written by one verb, never scraped from prose —
+    # the same property that made `Branch:` admissible here and a prose mention not
+    # (DIVE-3265, where a merge gate scraped a branch name out of result prose and then
+    # demanded that phantom branch land).
+    _rowship_delivery=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};")
+    if   [[ -n "$_rowship_branch"   ]]; then _row_ship=1; _rowbind_src=branch
+    elif [[ -n "$_rowship_delivery" ]]; then _row_ship=1; _rowbind_src=delivery-ref
+    fi
   fi
 
   local _routable=0
@@ -3190,6 +3220,20 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
   # override above (eng-ship / curation / internal-ops / access / verifier-route)
   # can cross it — the verifier-route being the one this ticket exists to stop.
   [[ "$_needs_human" == "1" ]] && _routable=0
+  # DIVE-3228 / DIVE-3525 — there is deliberately NO `_approval_default` kind here,
+  # and the deletion is the finding rather than an omission. Iteration 1 of this
+  # ticket added `[[ $type == approval && $_routable == 1 ]] && _approval_default=1`,
+  # which routes EVERY unfloored approval. It reddened two harnesses that are green on
+  # origin/main (gate_row_state_routing_unit B1/C6/E1, gate_floor_declared_discussion
+  # arm 7) for one reason: the four inherited exclusions above only cover rows that are
+  # FLOORED or PINNED, and the population that breaks is the rows unrouted BY ABSENCE —
+  # an unbound row, a prose-only branch mention, a plain tier-1. Nothing floors them, so
+  # no backstop fires, and a type default routes them and leaves the human ping EMPTY.
+  # The headline ships as the SECOND BINDING at the `_row_ship` block instead: a
+  # reviewer is defaulted where one is derivable from structured row state, and the
+  # absence of that state is what keeps the gate on the human path with DIVE-3266's
+  # explicit unrouted receipt. Both directions hold at once only if the binding, and
+  # not the type, is the input.
   # Record the declaration and what it did, at the moment it did it. DIVE-2093 will
   # PRINT the routing decision at file time; until it lands this row is the only
   # place a mis-declared gate is visible without diffing where it ended up.
@@ -3248,6 +3292,9 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
     # only the second one decides who is woken.
     # DIVE-3266: row-state ship routing bypasses the pref too — a branch binding is a
     # harder fact than any regex hit, so pref-gating it would re-open the exact hole.
+    # DIVE-3228/3525: a bound `delivery_ref` is a second row-state binding under the
+    # SAME `_row_ship` kind — see the block at the `_rowship_delivery` read above for
+    # why the input is the binding and not the type.
     if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_row_ship" == "1" || "$_curation" == "1" || "$_internal_ops" == "1" || "$_discusses_applied" == "1" || "$_verifier_route" == "1" || "$_floored_by_title" == "1" || "$_standing_route" == "1" ]]; then
       # DIVE-1495: a verifier-route targets the task's verifier directly; every
       # other kind resolves the filer's lead via the org chart.
@@ -3304,7 +3351,12 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
         # eng ship, that is what the filer can act on and every existing receipt stays
         # byte-for-byte; `row-ship-state` is named only when the BINDING is the sole
         # reason this routed — i.e. exactly the case the prose classifier missed.
-        elif [[ "$_row_ship"         == "1" ]]; then _rtrigger="row-ship-state"
+        # DIVE-3228/3525: the trigger token stays `row-ship-state` and gains a SUFFIX
+        # naming which binding carried it. DIVE-3266's receipts keep matching on the
+        # stem, and the delivery-ref set — the one this ticket adds — stays countable
+        # apart from the branch set, which is how the next reader measures whether the
+        # second binding is carrying gates the first one missed.
+        elif [[ "$_row_ship"         == "1" ]]; then _rtrigger="row-ship-state:${_rowbind_src:-branch}"
         elif [[ "$_curation"         == "1" ]]; then _rtrigger="curation"
         elif [[ "$_internal_ops"     == "1" ]]; then _rtrigger="internal-ops"
         elif [[ "$_discusses_applied" == "1" ]]; then _rtrigger="declared-discussion"
