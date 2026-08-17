@@ -239,6 +239,9 @@ case "$args" in
     exit 98
     ;;
   *"branches?per_page=100"*)
+    if [[ -n "${MOCK_BRANCHES_FAIL:-}" ]]; then
+      gh_http_error 403 "API rate limit exceeded"
+    fi
     printf '%s\n' \
       $'main\tMAIN' \
       $'open-live\tOPEN' \
@@ -255,11 +258,16 @@ case "$args" in
       $'dive-3494-pushed-past\tdddddddddddddddddddddddddddddddddddddddd' \
       $'salvage/preserved-2026-08-01\teeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
     ;;
-  *"pulls?state=open"*"@tsv"*)
-    : # no stale open PRs in this fixture
-    ;;
   *"pulls?state=open"*)
-    echo open-live
+    # ONE open PR, young enough never to be flagged stale (the dates are computed
+    # at run time so this stays true next year). Both the stale-PR section and the
+    # open-head exclusion read this same call now, so an unreadable list is a
+    # single state instead of two half-states.
+    if [[ -n "${MOCK_OPENPRS_FAIL:-}" ]]; then
+      gh_http_error 403 "API rate limit exceeded"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' 77 open-live \
+      "$(date -u -d '-1 day' +%Y-%m-%dT00:00:00Z)" "$(date -u +%Y-%m-%dT00:00:00Z)" 'an open PR'
     ;;
   *"commits?sha=main&since="*)
     if [[ -n "${MOCK_SUBJECTS_FAIL:-}" ]]; then
@@ -541,6 +549,35 @@ datesfail_output=$(GH_BIN="$RTMP/gh" GITHUB_REPOSITORY=acme/demo MOCK_DATES_FAIL
 grep -q 'age unreadable' <<<"$datesfail_output"
 grep -q '5 finding(s), 5 not the only copy (2 of those preserved by pull ref, not landed), 2 orphan, 0 unknown' <<<"$datesfail_output"
 refute 'a JSON error body was printed as an age' 'message.*Not Found\|rate limit' <<<"$datesfail_output"
+
+# THE LISTS THEMSELVES ARE EVIDENCE SOURCES (iteration 4). A `done < <(gh …)` process
+# substitution throws the exit status away, so an unreadable list became an EMPTY list and the
+# digest printed `0 finding(s) … 0 orphan, 0 unknown` and exited 0 -- the all-clear this row
+# exists to prevent, one level above the classifier. Measured before the fix by rate-limiting
+# the branch endpoint against the real script. A count is an all-clear only if the thing
+# counted was READ.
+brfail_output=$(GH_BIN="$RTMP/gh" GITHUB_REPOSITORY=acme/demo MOCK_BRANCHES_FAIL=1 \
+  "$ROOT/scripts/branch-hygiene.sh" --report)
+
+grep -q 'the branch list itself could not be read this run' <<<"$brfail_output"
+grep -q 'The branch list was UNREAD this run' <<<"$brfail_output"
+# Section-scoped, because `- none` is legitimate elsewhere in the digest and a multi-line
+# grep pattern is really two independent patterns.
+brfail_section=$(sed -n '/may be the only copy/,/^#### /p' <<<"$brfail_output")
+refute 'an unread branch list printed the empty-section all-clear' '^- none$' <<<"$brfail_section"
+
+# Same shape, other list: unreadable open PRs must not read as "no stale PRs", and nothing may
+# be excluded from the classifier on a list nobody could read.
+oprfail_output=$(GH_BIN="$RTMP/gh" GITHUB_REPOSITORY=acme/demo MOCK_OPENPRS_FAIL=1 \
+  "$ROOT/scripts/branch-hygiene.sh" --report)
+
+grep -q 'the open-PR list could not be read this run' <<<"$oprfail_output"
+grep -q 'The open-PR list was UNREAD this run' <<<"$oprfail_output"
+oprfail_section=$(sed -n '/Unmerged PRs open/,/^#### /p' <<<"$oprfail_output")
+refute 'an unread open-PR list printed the no-stale-PRs all-clear' '^- none$' <<<"$oprfail_section"
+# Over-report, never preserve: with no exclusion list, the open-PR branch is judged like any
+# other rather than being silently dropped from the section.
+grep -q '`open-live`' <<<"$oprfail_output"
 
 # And the probe is what discriminates: with compare readable, the intentional orphan is still
 # an orphan and is still NOT a finding. (Guards the probe being wired to a constant `true`.)

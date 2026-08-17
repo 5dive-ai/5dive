@@ -125,13 +125,30 @@ report_stale() {
   # shellcheck disable=SC2064
   trap "rm -rf -- '$rtmp'" EXIT
 
+  # THE LISTS THEMSELVES ARE EVIDENCE SOURCES, and a `done < <(gh …)` process
+  # substitution HIDES their exit status: an unreadable list silently becomes an
+  # EMPTY list, and every section below then prints "- none" — the all-clear this
+  # whole row exists to prevent, one level above the classifier. Measured
+  # (iteration 4): with the branch endpoint rate-limited, the digest printed
+  # `0 finding(s) … 0 orphan, 0 unknown` and exited 0. Fetch to a file, keep the
+  # rc, and make an unreadable list SAY so instead of reading as nothing-to-do.
+  local open_raw="$rtmp/open-prs" open_state=ok
+  if ! "$GH_BIN" api --paginate "repos/$repo/pulls?state=open&per_page=100" \
+    --jq '.[] | [.number, .head.ref, .created_at, .updated_at, .title] | @tsv' \
+    >"$open_raw" 2>/dev/null; then
+    open_state=unavailable
+    : >"$open_raw"
+  fi
+
   # Open PR heads are excluded from the dead-branch list: a branch with an open
-  # PR is already surfaced by the stale-PR section, so it is not "dead".
+  # PR is already surfaced by the stale-PR section, so it is not "dead". When the
+  # list could not be read, NOTHING is excluded — the branch is then judged on the
+  # evidence arms like any other, which over-reports rather than preserving.
   declare -A open_head=()
   open_head["$default_branch"]=1
-  while IFS= read -r ref; do
+  while IFS=$'\t' read -r _num ref _c _u _t; do
     [[ -n "$ref" ]] && open_head["$ref"]=1
-  done < <("$GH_BIN" api --paginate "repos/$repo/pulls?state=open&per_page=100" --jq '.[].head.ref')
+  done <"$open_raw"
 
   echo "### Branch hygiene digest"
   echo
@@ -144,14 +161,19 @@ report_stale() {
   while IFS=$'\t' read -r num ref created updated title; do
     [[ -n "$num" ]] || continue
     local created_epoch age_days
-    created_epoch=$(date -u -d "$created" +%s)
+    created_epoch=$(date -u -d "$created" +%s 2>/dev/null) || continue
     (( now - created_epoch >= pr_cutoff )) || continue
     age_days=$(( (now - created_epoch) / 86400 ))
     echo "- #${num} \`${ref}\` — ${age_days}d old (updated ${updated%%T*}) — ${title}"
     pr_flagged=$((pr_flagged + 1))
-  done < <("$GH_BIN" api --paginate "repos/$repo/pulls?state=open&per_page=100" \
-    --jq '.[] | [.number, .head.ref, .created_at, .updated_at, .title] | @tsv')
-  (( pr_flagged > 0 )) || echo "- none"
+  done <"$open_raw"
+  if [[ "$open_state" == unavailable ]]; then
+    echo "- **UNKNOWN — the open-PR list could not be read this run.** This section is empty"
+    echo "  because nothing was inspected, not because nothing was found. Re-run before acting"
+    echo "  on it, and note that no branch was excluded from the section below as open-PR either."
+  elif (( pr_flagged == 0 )); then
+    echo "- none"
+  fi
   echo
 
   # BRANCHES ARE CLASSIFIED BY EVIDENCE, NEVER BY AGE (DIVE-2394; measured on
@@ -204,6 +226,12 @@ report_stale() {
   # The oldest of those bounds the subject corpus below: work lands on the default
   # branch AFTER the branch's last commit, never before it.
   local inv="$rtmp/inventory" oldest="$now"
+  local raw="$rtmp/branches" inv_state=ok
+  if ! "$GH_BIN" api --paginate "repos/$repo/branches?per_page=100" \
+    --jq '.[] | [.name, .commit.sha] | @tsv' >"$raw" 2>/dev/null; then
+    inv_state=unavailable
+    : >"$raw"
+  fi
   : >"$inv"
   while IFS=$'\t' read -r branch sha; do
     [[ -n "$branch" ]] || continue
@@ -221,8 +249,7 @@ report_stale() {
       commit_epoch=0
     fi
     printf '%s\t%s\t%s\t%s\n' "$branch" "$sha" "$commit_date" "$commit_epoch" >>"$inv"
-  done < <("$GH_BIN" api --paginate "repos/$repo/branches?per_page=100" \
-    --jq '.[] | [.name, .commit.sha] | @tsv')
+  done <"$raw"
 
   # The subject corpus, fetched ONCE for the whole run and bounded by that date.
   # Paged by hand rather than with --paginate so the cap is visible: a corpus that
@@ -419,7 +446,14 @@ report_stale() {
   done <"$inv"
 
   echo "#### Branches that may be the only copy (evidence, not age)"
-  if (( br_findings > 0 )); then
+  if [[ "$inv_state" == unavailable ]]; then
+    # The one state where "0 findings" would be a LIE rather than an all-clear:
+    # no branch was judged at all. Say it here, where the reader looks, and again
+    # in the tally line below.
+    echo "- **UNKNOWN — the branch list itself could not be read this run.** Nothing was"
+    echo "  inspected, so nothing could be found; this is NOT an all-clear. Re-run before"
+    echo "  acting on this digest."
+  elif (( br_findings > 0 )); then
     cat "$f_out"
     echo
     echo "Rescue BEFORE any deletion. Zero byte cost when the objects are already in the canonical store, and the ref survives branch deletion permanently:"
@@ -466,7 +500,13 @@ report_stale() {
     echo
   fi
 
-  echo "_Flagged ${pr_flagged} stale PR(s). Branches: ${br_findings} finding(s), ${br_landed} not the only copy (${br_pullref} of those preserved by pull ref, not landed), ${br_orphan} orphan, ${br_unknown} unknown. This is a report only; nothing was deleted, labelled, or closed._"
+  # A count is only an all-clear if the thing being counted was READ. When a list
+  # could not be fetched the tally says UNREAD rather than zero, because "0
+  # finding(s)" is the exact sentence a reader acts on.
+  local unread=""
+  [[ "$inv_state" == unavailable ]] && unread=" **The branch list was UNREAD this run, so these branch counts are not a finding of zero.**"
+  [[ "$open_state" == unavailable ]] && unread="${unread} **The open-PR list was UNREAD this run.**"
+  echo "_Flagged ${pr_flagged} stale PR(s). Branches: ${br_findings} finding(s), ${br_landed} not the only copy (${br_pullref} of those preserved by pull ref, not landed), ${br_orphan} orphan, ${br_unknown} unknown.${unread} This is a report only; nothing was deleted, labelled, or closed._"
 }
 
 if [[ "$mode" == "report" ]]; then
