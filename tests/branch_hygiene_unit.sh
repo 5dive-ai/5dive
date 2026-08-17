@@ -74,6 +74,26 @@ esac
 MOCK
 chmod +x "$TMP/gh"
 
+# A bare `! grep -q ...` SKIPS errexit (shellcheck SC2251): if the forbidden
+# string IS present, the `!` inverts it to rc 1 and the harness sails on green.
+# Every negative assertion below is load-bearing -- one of them is the whole
+# "not armed under --apply" guarantee -- so they go through a helper that exits.
+refute() {
+  local why="$1" pattern="$2"
+  if grep -q "$pattern"; then
+    echo "REFUTED-ASSERTION FAILED: $why (found: $pattern)" >&2
+    exit 1
+  fi
+}
+
+# Positive control for the helper itself, because a negative assertion that
+# cannot fail is exactly the defect it exists to close: refute must EXIT on a
+# pattern that IS present. Run in a subshell so this harness survives it.
+if ( echo 'REFUTE-SELF-TEST' | refute 'self-test' 'REFUTE-SELF-TEST' ) 2>/dev/null; then
+  echo "refute() did not fail on a present pattern" >&2
+  exit 1
+fi
+
 dry_output=$(GH_BIN="$TMP/gh" GITHUB_REPOSITORY=acme/demo \
   BRANCH_HYGIENE_PRESERVE=merged-preserved \
   "$ROOT/scripts/branch-hygiene.sh" --dry-run)
@@ -130,6 +150,7 @@ case "$args" in
       $'dive-2067-verify-over-closed\tD2067' \
       $'salvage/untracked-test-harnesses-2026-07-26\tSALV' \
       $'status\tSTATUS' \
+      $'gh-pages\tGHPAGES' \
       $'contained-branch\tCONT'
     ;;
   *"pulls?state=open"*"@tsv"*)
@@ -194,8 +215,11 @@ case "$args" in
     fi
     echo behind
     ;;
-  *"compare/main...status"*)
-    echo "mock: no common ancestor between main and status" >&2
+  *"compare/main...status"*|*"compare/main...gh-pages"*)
+    # TWO intentional orphans, on purpose: one is not enough to tell "one probe
+    # per run" apart from "one probe per orphan branch", and iteration 2 signed
+    # the first while shipping the second.
+    echo "mock: no common ancestor with main" >&2
     exit 1
     ;;
   *"compare/main..."*)
@@ -219,8 +243,9 @@ esac
 RMOCK
 chmod +x "$RTMP/gh"
 
+: >"$RTMP/probe-ok.log"
 report_output=$(GH_BIN="$RTMP/gh" GITHUB_REPOSITORY=acme/demo DEAD_BRANCH_DAYS=14 \
-  "$ROOT/scripts/branch-hygiene.sh" --report)
+  MOCK_PROBE_LOG="$RTMP/probe-ok.log" "$ROOT/scripts/branch-hygiene.sh" --report)
 
 # The four classifications.
 grep -q 'LANDED merged-pr #12' <<<"$report_output"
@@ -229,14 +254,15 @@ grep -q '`dive-3330-verify-merge-gate` — LANDED subject-attribution DIVE-3330'
 grep -q '`dive-2067-verify-over-closed` — \*\*FINDING\*\* unattributed (DIVE-2067)' <<<"$report_output"
 grep -q '`salvage/untracked-test-harnesses-2026-07-26` — \*\*FINDING\*\* no-ident' <<<"$report_output"
 grep -q '`status` — ORPHAN no-common-ancestor with `main` (by design)' <<<"$report_output"
+grep -q '`gh-pages` — ORPHAN no-common-ancestor with `main` (by design)' <<<"$report_output"
 
 # A date in a branch name is not an ident: the salvage branch must not read as CX-2026 etc.
-! grep -q 'salvage/untracked-test-harnesses-2026-07-26.*unattributed' <<<"$report_output"
+refute 'a date in a branch name was read as an ident' 'salvage/untracked-test-harnesses-2026-07-26.*unattributed' <<<"$report_output"
 
 # The findings section names the rescue, and age is no longer a section heading.
 grep -q 'refs/rescued/<branch>' <<<"$report_output"
 grep -q 'Branches that may be the only copy (evidence, not age)' <<<"$report_output"
-! grep -q 'Branches with no activity' <<<"$report_output"
+refute 'the age-ranked heading came back' 'Branches with no activity' <<<"$report_output"
 
 # Age is still printed as a fact about each branch.
 grep -q 'since last commit (2026-07-01)' <<<"$report_output"
@@ -244,21 +270,27 @@ grep -q 'since last commit (2026-07-01)' <<<"$report_output"
 # DEAD_BRANCH_DAYS was set; the report must say it is not read rather than pretend.
 grep -q 'DEAD_BRANCH_DAYS=14 was set and is NOT read' <<<"$report_output"
 
-grep -q '2 finding(s), 3 with landing evidence, 1 orphan, 0 unknown' <<<"$report_output"
+grep -q '2 finding(s), 3 with landing evidence, 2 orphan, 0 unknown' <<<"$report_output"
+
+# THE PROBE'S COST, MEASURED IN BOTH DIRECTIONS (DIVE-2394 iteration 3). Iteration 2 signed
+# "one call per run" and shipped one call per ORPHAN BRANCH: only the `unavailable` verdict is
+# sticky. With compare READABLE the probe is re-asked on every empty compare, so two orphans
+# cost two calls -- and a fixture with one orphan cannot tell those two claims apart.
+[[ $(wc -l <"$RTMP/probe-ok.log") -eq 2 ]]
 
 # The read-only invariant the ops runner greps for (branch-hygiene-report.sh).
-! grep -q '^DELETED ' <<<"$report_output"
+refute '--report reached the delete path' '^DELETED ' <<<"$report_output"
 
 # THE FAILURE DIRECTION. With the subject corpus unreadable, the branch that WAS
 # attributed by subject must stop being attributed -- never the other way round.
 fail_output=$(GH_BIN="$RTMP/gh" GITHUB_REPOSITORY=acme/demo MOCK_SUBJECTS_FAIL=1 \
   "$ROOT/scripts/branch-hygiene.sh" --report)
 
-! grep -q 'LANDED subject-attribution' <<<"$fail_output"
+refute 'a branch was attributed while the subject corpus was unreadable' 'LANDED subject-attribution' <<<"$fail_output"
 grep -q '`dive-3330-verify-merge-gate` — UNKNOWN evidence-unavailable (DIVE-3330)' <<<"$fail_output"
 grep -q '`dive-2067-verify-over-closed` — UNKNOWN evidence-unavailable (DIVE-2067)' <<<"$fail_output"
 grep -q 'Arm 3 did not run, and nothing was attributed on its absence' <<<"$fail_output"
-grep -q '1 finding(s), 2 with landing evidence, 1 orphan, 2 unknown' <<<"$fail_output"
+grep -q '1 finding(s), 2 with landing evidence, 2 orphan, 2 unknown' <<<"$fail_output"
 
 # THE SAME FAILURE DIRECTION, OWED PER ARM (DIVE-2394 iteration 2). Arm 2's evidence source is
 # the `compare` endpoint, and `gh api` exits non-zero for a genuine no-common-ancestor 404 and
@@ -271,30 +303,34 @@ grep -q '1 finding(s), 2 with landing evidence, 1 orphan, 2 unknown' <<<"$fail_o
 cmpfail_output=$(GH_BIN="$RTMP/gh" GITHUB_REPOSITORY=acme/demo MOCK_COMPARE_FAIL=1 \
   MOCK_PROBE_LOG="$RTMP/probe.log" "$ROOT/scripts/branch-hygiene.sh" --report)
 
-# The probe is asked LAZILY and its `unavailable` verdict is STICKY: one call, not one per
-# branch. Cost is half of it; the other half is that a compare recovering mid-run must not
-# hand two branches in the same digest verdicts derived from different endpoint states.
+# STICKY in the `unavailable` direction, and this is the assertion that says so: six branches
+# reach arm 2 with an empty compare and the probe is asked ONCE. Paired with the two-call
+# readable-direction assertion above, the pair pins the actual rule -- sticky when unavailable,
+# re-asked while readable -- which neither measures alone. The point is not the call count: a
+# compare recovering mid-run must not hand two branches in the same digest verdicts derived
+# from different endpoint states.
 [[ $(wc -l <"$RTMP/probe.log") -eq 1 ]]
 
 # MORE findings, never fewer: the 2 baseline findings survive and the branches arm 2 can no
 # longer speak for join them, rather than being preserved out of sight.
 grep -q '`dive-2067-verify-over-closed` — \*\*FINDING\*\* unattributed (DIVE-2067)' <<<"$cmpfail_output"
 grep -q '`contained-branch` — \*\*FINDING\*\*' <<<"$cmpfail_output"
-! grep -q 'LANDED contained-in-' <<<"$cmpfail_output"
+refute 'a branch was attributed by arm 2 while compare was unreadable' 'LANDED contained-in-' <<<"$cmpfail_output"
 
 # An unreadable compare is NEVER reported as an orphan verdict: the two have opposite remedies.
-! grep -q 'ORPHAN' <<<"$cmpfail_output"
-grep -q 'compare` endpoint could not be read this run: arm 2 did not run for 5 branch(es)' <<<"$cmpfail_output"
+refute 'an unreadable compare was reported as an orphan' 'ORPHAN' <<<"$cmpfail_output"
+grep -q 'compare` endpoint could not be read this run: arm 2 did not run for 6 branch(es)' <<<"$cmpfail_output"
 
 # Arm 3 still runs and is still trusted -- one unreadable arm does not blind the others.
 grep -q '`dive-3330-verify-merge-gate` — LANDED subject-attribution DIVE-3330' <<<"$cmpfail_output"
 
-grep -q '4 finding(s), 2 with landing evidence, 0 orphan, 0 unknown' <<<"$cmpfail_output"
-! grep -q '^DELETED ' <<<"$cmpfail_output"
+grep -q '`gh-pages` — \*\*FINDING\*\*' <<<"$cmpfail_output"
+grep -q '5 finding(s), 2 with landing evidence, 0 orphan, 0 unknown' <<<"$cmpfail_output"
+refute '--report reached the delete path' '^DELETED ' <<<"$cmpfail_output"
 
 # And the probe is what discriminates: with compare readable, the intentional orphan is still
 # an orphan and is still NOT a finding. (Guards the probe being wired to a constant `true`.)
 grep -q '`status` — ORPHAN' <<<"$report_output"
-! grep -q 'arm 2 did not run' <<<"$report_output"
+refute 'the arm-2 footer appeared in a run where compare was READABLE' 'arm 2 did not run' <<<"$report_output"
 
 echo "branch_hygiene_unit: report-by-evidence PASS"

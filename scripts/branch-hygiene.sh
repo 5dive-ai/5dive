@@ -187,8 +187,12 @@ report_stale() {
   # Discriminate by asking the SAME endpoint a question whose answer is known:
   # <default>...<default> is `identical` whenever compare is readable at all.
   # Asked LAZILY, only when a compare comes back empty, so a run with no orphan
-  # branch pays nothing; and the `unavailable` verdict is sticky for the rest of
-  # the run, because that direction over-reports.
+  # branch pays nothing. It is NOT one call per run in general: while compare is
+  # readable the probe is re-asked on every empty compare, so the cost is one
+  # call per orphan branch (today, one — `status`). Only the `unavailable`
+  # verdict is sticky, because that direction over-reports and because two
+  # branches in one digest must not be graded against different endpoint
+  # states.
   local cmp_state=ok
   compare_endpoint_readable() {
     [[ "$cmp_state" == ok ]] || return 1
