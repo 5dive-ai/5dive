@@ -26,16 +26,21 @@
 # remaining steps rather than pretending. That is the whole lesson of the bug it
 # fixes — a channel that reports success while connected to nothing.
 
-# cmd_agent_buzz <enable|status> <name> [flags]
+# cmd_agent_buzz <enable|join|owner|status> <name> [flags]
+# `join` and `owner` are DIVE-3513 (src/cmd_agent_buzz_join.sh) — steps 5 and 6.
 cmd_agent_buzz() {
   local verb="${1:-}"
   case "$verb" in
     enable) shift; _buzz_enable "$@" ;;
+    join)   shift; _buzz_join "$@" ;;
+    owner)  shift; _buzz_owner "$@" ;;
     status) shift; _buzz_status "$@" ;;
     ""|-h|--help)
       fail "$E_USAGE" "usage: 5dive agent buzz enable <name> [--relay=<https://…>] [--channels=<csv>] [--poll-ms=<n>] [--buzz-path=<path>] [--rotate-key]
+       5dive agent buzz join <name> [--channels=<csv>] [--rotate-owner-key]
+       5dive agent buzz owner <name> [--envelope]
        5dive agent buzz status <name>" ;;
-    *) fail "$E_USAGE" "unknown buzz verb '$verb' (enable|status)" ;;
+    *) fail "$E_USAGE" "unknown buzz verb '$verb' (enable|join|owner|status)" ;;
   esac
 }
 
