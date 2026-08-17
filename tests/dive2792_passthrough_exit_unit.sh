@@ -90,15 +90,16 @@ check "$got" "0" "A5: a successful passthrough exits 0"
   && ok "A5: no failure narration on the happy path" \
   || bad "A5: narrated a failure that did not happen"
 
-echo "== A6. control: the banner is STILL REACHABLE (it was not disabled globally) =="
-# An unknown verb fails through fail(), not the backstop, so use the backstop's
-# own harness contract: a non-zero exit with nothing reported. `5dive` with no
-# args is E_USAGE and marks reported, so instead assert the string still EXISTS
-# in the shipped bundle — a banner deleted rather than narrowed would make every
-# arm above pass vacuously.
-grep -q "$BANNER" "$BUNDLE" \
-  && ok "A6: the generic banner text is still shipped (arms above are not vacuous)" \
-  || bad "A6: the banner was removed, so every no-banner arm above proves nothing"
+echo "== A6. control: the banner EMITTER is still shipped (arms above are not vacuous) =="
+# Scope, stated so it is not read as more than it is: this greps for the emitter's
+# own runtime template ($code, not the "exited N ..." spelling every comment in the
+# tree uses), so it catches the banner being DELETED — the mutation that would make
+# every no-banner arm above pass for free. It does NOT prove the backstop can still
+# FIRE; tests/silent_nonzero_exit_backstop_unit.sh owns that, including the liveness
+# pair, and this harness deliberately does not duplicate it.
+grep -qF 'exited $code without reporting a reason' "$BUNDLE" \
+  && ok "A6: the backstop's own emitter template is still in the bundle" \
+  || bad "A6: the emitter is gone, so every no-banner arm above proves nothing"
 
 echo "== B. 5dive bug --file spools locally when the gh route is down =="
 # gh present but failing — the exact case the verb is invoked from.
