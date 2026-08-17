@@ -471,8 +471,14 @@ cmd_task_merge_unverified() {
   # done in awk, not jq, so `parsed` below counts PARSE failures only and is not
   # confounded by rows the filter legitimately dropped.
   local jqout parsed_n=0
-  jqout=$(printf '%s\n' "$cand" | jq -r '
-      select(.cmd == "task.merge-gate-unverified")
+  # `jq -R` + `fromjson?` is the whole point and NOT a style choice: without -R a single
+  # streaming jq parses the concatenated stream, so ONE truncated line ABORTS the parser
+  # and every stamp AFTER it is silently dropped — the sweep then prints "0 still carry an
+  # OPEN PR" and exits 0 while an open PR sits right there. With -R each line is read as a
+  # raw string and `fromjson?` turns a bad line into `empty`, containing it to itself.
+  jqout=$(printf '%s\n' "$cand" | jq -R -r '
+      fromjson? // empty
+      | select(.cmd == "task.merge-gate-unverified")
       | [ (.args[0] // ""),
           (.ts // ""),
           ([ .args[] | select(startswith("reason=")) ] | first // "reason=unrecorded"),

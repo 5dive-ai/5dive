@@ -249,5 +249,27 @@ grep -qi "did not parse" <<<"$out" \
   && ok_t "T9b the skipped line is DISCLOSED, not silently dropped" \
   || bad_t "T9b unparseable line was swallowed without a word" "$out"
 
+# ── T9c: ORDERING. T9 alone is not enough and passing it is not evidence. ──────
+# A single streaming jq over the whole candidate set ABORTS on the first bad line and
+# drops every stamp AFTER it, so T9 with the bad line LAST goes green on exactly the
+# implementation this arm exists to forbid. Pin the bad line FIRST: the sweep must still
+# find the good stamp behind it, still exit 1, and still disclose the skip. Without this
+# arm the defect regresses invisibly (quinn, DIVE-3526 iteration 1).
+: >"$AUDIT_LOG"; rm -f "$GH_STUB_DIR"/*
+mkrow DIVE-9008 done
+printf '{"ts":"2026-08-14T06:30:00+00:00","cmd":"task.merge-gate-unverified","args":["DIVE-99\n' >>"$AUDIT_LOG"
+stamp DIVE-9008 "2026-08-14T07:00:00+00:00"
+answers lodar/5dive-api
+prlist 5dive-ai/5dive 782 "DIVE-9008 still open" "dive-9008"
+out=$( (cmd_task_merge_unverified 2>&1) ); rc=$?
+if (( rc == 1 )) && grep -q "DIVE-9008" <<<"$out" && grep -q "#782" <<<"$out"; then
+  ok_t "T9c a malformed line BEFORE the stamp does not swallow it (bad-line-first ordering)"
+else
+  bad_t "T9c a leading malformed line dropped every stamp behind it" "rc=$rc: $out"
+fi
+grep -qi "did not parse" <<<"$out" \
+  && ok_t "T9d the leading skipped line is DISCLOSED too" \
+  || bad_t "T9d leading unparseable line was swallowed without a word" "$out"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
