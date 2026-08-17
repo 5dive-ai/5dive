@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased — fix(self-update): skip an agent holding an in_progress row and bounce it at its next task boundary (DIVE-3173)
+
+DIVE-3172 made the nightly restart conditional on the agent payload actually moving, which takes a
+CLI-only night to zero restarts. This is the belt for the nights the payload genuinely moves: those
+are exactly the nights the restart still lands on whoever is mid-task, drops their session, and
+leaves no record distinguishable from an agent that simply went quiet (lodar, 2026-08-10: *"one
+concern - our nightly updates kills some active agents mid tasks"*).
+
+- **The predicate is the BOARD, not the pane.** Busy means the agent holds a row in `in_progress` —
+  a fact with a durable record that survives this process exiting, which a pane scrape does not. A
+  busy agent whose payload moved is now *deferred*: `self-update` writes a marker under
+  `${STATE_DIR}/pending-restart/<agent>` and reports it as `deferred` (a new, additive JSON field;
+  `restarted`/`skipped`/`failed` keep their exact prior meaning). A deferral is deliberately NOT
+  reported as a skip — the payload *did* move for these and the bounce is still owed.
+- **The boundary is OBSERVED, not hooked.** A row leaves `in_progress` from ~20 call sites
+  (`task done/cancel/park/reject/deliver`, the loop engine, the heartbeat reaper, the gate answer
+  path). Hooking them is a promise to hook the one added next, and *a deferral that never fires is a
+  worse bug than the restart it replaced*. So `_pending_restart_sweep` re-asks the board the same
+  question on every `heartbeat tick` and bounces the moment the answer flips to idle.
+- **Two callers, so the deferral never depends on one armed timer.** The tick observes the boundary;
+  the next `self-update` pays off anything it missed — including on a box whose heartbeat is off.
+- **Every uncertain reading defers.** An unreadable board is `unknown`, a third value that is never
+  folded into `idle`; a corrupt marker stamp reads as *marked now* rather than 0 (with 0, any unit
+  start would look later than the mark and silently cancel the owed restart); a non-idle pane at
+  firing time defers, because leaving the last task is not the same as being done talking about it.
+  The one exception is stated in the code: if the marker cannot be WRITTEN, the restart is taken now
+  — a bounce is loud and recoverable, an agent silently left on the old payload is neither.
+- **Cleared by observation, not by the firing path.** Any restart later than the mark (operator
+  bounce, crash restart, plugin `/restart`) already loaded the new payload and satisfies the marker,
+  so nothing is bounced twice. A stopped unit (auto-sleep) clears its marker too — it loads the new
+  payload on its next start by construction.
+- **The 24h ceiling is loud, not lethal.** A deferral still unfired after a day is logged on every
+  sweep and never forced: forcing is precisely the bug this removes, and a row held `in_progress`
+  for a day is an anomaly the heartbeat reaper owns.
+- `tests/self_update_busy_defer_unit.sh`: **28 passed, 0 failed**, running the shipped bytes
+  extracted verbatim between the block's fence markers. Includes the ticket's positive control as
+  three sweeps of one marker — parked mid-task is NOT restarted and keeps its marker; the row closes
+  and the SAME marker fires the bounce; the next sweep does not bounce it again.
+
 ## Unreleased — feat(task): `merge-unverified` reads back the closes the merge gate could not check (DIVE-3526)
 
 Since DIVE-1935 the mandatory auto-detect merge gate has said so when its repo scan cannot
