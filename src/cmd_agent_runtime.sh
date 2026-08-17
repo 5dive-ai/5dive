@@ -54,6 +54,29 @@ cmd_stop() {
      '{name:$n, action:"stop"}' --arg n "$name"
 }
 
+# Emit the {ok:true, …, lines:[…]} envelope for a BUFFERED read.
+#
+# DIVE-2792 iteration 2. The `lines:[]` half is not a formatting detail: a
+# here-string APPENDS a newline, so `<<<""` is ONE empty line to `jq -R … inputs`,
+# not zero input. A successful read that returned nothing — an agent whose unit
+# has not logged yet, the ordinary case — therefore reports `lines:[""]`, and a
+# consumer counting `lines | length` sees a phantom entry. The pipe this replaced
+# delivered zero bytes and reported `[]`.
+#
+# **Any pipe → capture rewrite changes the empty case**, so it needs its own arm;
+# `tests/dive2792_passthrough_exit_unit.sh` C7/C8 grade both sources here.
+# community/wiki/a-sweep-that-finds-a-second-defect-must-move-the-harness-to-it.md
+_logs_lines_envelope() {   # <name> <source> <captured-text>
+  local n="$1" src="$2" text="$3"
+  if [[ -n "$text" ]]; then
+    jq -Rn --arg n "$n" --arg s "$src" \
+      '{ok:true, data:{name:$n, source:$s, lines:[inputs]}}' <<<"$text"
+  else
+    jq -n --arg n "$n" --arg s "$src" \
+      '{ok:true, data:{name:$n, source:$s, lines:[]}}'
+  fi
+}
+
 # journalctl for the agent's unit, or a tmux scrollback capture with --tmux.
 # --follow streams until the caller hangs up; in the /agents/exec path the
 # shelld timeout caps this, so the dashboard should prefer the WS session for
@@ -86,8 +109,7 @@ cmd_logs() {
     capture=$(sudo -u "agent-${name}" tmux capture-pane -t "agent-${name}" -p -S "-${lines}" 2>/dev/null) \
       || fail "$E_NOT_RUNNING" "tmux session 'agent-${name}' not found (is the agent running?)"
     if (( JSON_MODE )); then
-      jq -Rn --arg n "$name" \
-        '{ok:true, data:{name:$n, source:"tmux", lines:[inputs]}}' <<<"$capture"
+      _logs_lines_envelope "$name" tmux "$capture"
     else
       printf '%s\n' "$capture"
     fi
@@ -125,8 +147,7 @@ cmd_logs() {
       # {ok:true} first and left no way to take it back.
       local jout=""
       jout=$(journalctl "${args[@]}") || jrc=$?
-      (( jrc == 0 )) && jq -Rn --arg n "$name" \
-        '{ok:true, data:{name:$n, source:"journal", lines:[inputs]}}' <<<"$jout"
+      (( jrc == 0 )) && _logs_lines_envelope "$name" journal "$jout"
     fi
   else
     journalctl "${args[@]}" || jrc=$?

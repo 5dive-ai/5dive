@@ -146,6 +146,91 @@ grep -q 'SUDO-STUB: -n /usr/local/bin/5dive _gh_do' "$SUDO_STUB_LOG" \
   && ok "B8: the bot-routed write went to the stub, not to GitHub" \
   || bad "B8: the write path was NOT severed — this harness may have filed a real issue"
 
+echo "== C. 5dive agent logs: the passthrough the SWEEP found, not the one the row named =="
+# WHY THIS BLOCK EXISTS (DIVE-2792 iteration 2, quinn). The first draft of this
+# harness graded `gh` (A) and the bug spool (B) — and `gh` was ALREADY correct
+# before this branch, via DIVE-3135's `_gh_child_exit`. So
+# `git checkout origin/main -- src/cmd_agent_runtime.sh && ./build.sh && bash <this>`
+# still printed 23 passed / 0 failed: reverting the ONE live defect the sweep
+# turned up cost zero arms. A row that says "fix X, and sweep for others" ships a
+# harness aimed at X; when the sweep moves the value, the harness has to move with
+# it. community/wiki/a-sweep-that-finds-a-second-defect-must-move-the-harness-to-it.md
+#
+# journalctl is called bare, so a PATH stub reaches it (unlike gh's class=write
+# route above, which re-enters through an absolute path as root — see B8).
+# STATE_DIR is redirected so `require_agent` resolves against a fixture registry
+# and no arm depends on which agents this host happens to have.
+cat > "$TMP/stub/journalctl" <<'STUB'
+#!/usr/bin/env bash
+printf 'JCTL-STUB-ARGV: %s\n' "$*" >&2
+[[ -n "${JCTL_OUT:-}" ]] && printf '%s\n' "$JCTL_OUT"
+[[ -n "${JCTL_ERR:-}" ]] && printf '%s\n' "$JCTL_ERR" >&2
+exit "${JCTL_RC:-0}"
+STUB
+chmod +x "$TMP/stub/journalctl"
+mkdir -p "$TMP/state"
+printf '{"agents":{"probe":{"type":"claude"}}}\n' > "$TMP/state/agents.json"
+# Leading NAME=VALUE args are the stub's knobs; everything from the first
+# non-assignment on is the bundle's argv. Passing both to `env` in one list would
+# make `env` treat the first CLI word as the program (rc=127) — which C11 exists
+# to catch, and did.
+jlogs() {
+  local envs=()
+  while [[ "${1:-}" == [A-Z_]*=* ]]; do envs+=("$1"); shift; done
+  PATH="$TMP/stub:$PATH" STATE_DIR="$TMP/state" env "${envs[@]}" "$BUNDLE" "$@"
+}
+
+for rc in 1 4; do
+  out=$(jlogs JCTL_RC=$rc JCTL_ERR="jctl-said-$rc" agent logs probe 2>&1); got=$?
+  check "$got" "$rc" "C-text-$rc: exit status is journalctl's own ($rc), not remapped"
+  [[ "$out" == *"jctl-said-$rc"* ]] \
+    && ok "C-text-$rc: journalctl's own message survives to the caller" \
+    || bad "C-text-$rc: journalctl's message was lost"
+  [[ "$out" != *"$BANNER"* ]] \
+    && ok "C-text-$rc: no internal-CLI-bug banner on a legitimate read failure" \
+    || bad "C-text-$rc: the banner fired on journalctl's own status"
+done
+
+echo "== C4. --json: same status, class:\"passthrough\", and NO {ok:true} on stdout =="
+# The --json half was the opposite lie from the text half: `journalctl | jq`
+# reported JQ's status, so a failed read exited with an ok:true envelope already
+# printed. Grade stdout ALONE — the narration on stderr is not the defect.
+sout=$(jlogs JCTL_RC=4 JCTL_ERR="jctl-said-4" --json agent logs probe 2>/dev/null); got=$?
+check "$got" "4" "C4: --json exit status is journalctl's own (4)"
+# PARSE it, do not grep it: the success envelope is jq's DEFAULT (pretty) output,
+# `"ok": true` with a space, while the error envelope is `jq -cn` compact. A
+# `*'"ok":true'*` match therefore reads FALSE on the very envelope it is meant to
+# forbid — this arm passed for the wrong reason until C10 exposed the spelling.
+[[ "$(jq -r '.ok' <<<"$sout" 2>/dev/null)" != "true" ]] \
+  && ok "C5: no {ok:true} envelope on stdout for a read that failed" \
+  || bad "C5: printed a success envelope for a failed read (the DIVE-2792 --json defect)"
+[[ "$sout" == *'"class":"passthrough"'* ]] \
+  && ok "C6: the error envelope names the failure as a passthrough, not a CLI fault" \
+  || bad "C6: no class:\"passthrough\" in the --json error envelope"
+
+echo "== C7. happy path: an EMPTY successful read is lines:[] — not one phantom line =="
+# A here-string appends a newline, so `<<<""` is one empty line to `jq -R … inputs`.
+# The pipe→capture rewrite that fixed C4/C5 introduced this; an agent that has not
+# logged yet is the ordinary case for it. Both sources take the same helper, so
+# both are graded — `--tmux` had the same shape before this branch touched it.
+sout=$(jlogs JCTL_RC=0 --json agent logs probe 2>/dev/null); got=$?
+check "$got" "0" "C7: a successful read exits 0"
+check "$(jq -c '.data.lines' <<<"$sout" 2>/dev/null)" "[]" \
+  "C8: empty successful read reports lines:[] (not [\"\"])"
+sout=$(jlogs JCTL_RC=0 JCTL_OUT=$'line-one\nline-two' --json agent logs probe 2>/dev/null)
+check "$(jq -c '.data.lines' <<<"$sout" 2>/dev/null)" '["line-one","line-two"]' \
+  "C9: a non-empty read reports exactly its lines, none invented"
+check "$(jq -r '.ok' <<<"$sout" 2>/dev/null)" "true" \
+  "C10: the success envelope IS printed when the read succeeded"
+
+echo "== C11. control: the stub was actually consulted (C arms are not vacuous) =="
+# Without this, every C arm passes identically if the bundle never reached
+# journalctl at all — the arm-that-greps-for-failure trap, one layer up.
+out=$(jlogs JCTL_RC=1 agent logs probe 2>&1)
+[[ "$out" == *"JCTL-STUB-ARGV: -u 5dive-agent@probe.service"* ]] \
+  && ok "C11: the resolved unit reached journalctl verbatim" \
+  || bad "C11: journalctl was never reached — the C arms grade nothing"
+
 echo
 printf 'DIVE-2792 passthrough-exit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
