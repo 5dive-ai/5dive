@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TIER: core — ~6s measured (dev3, control plane, 2026-08-05, `time bash tests/gate_evidence_form_unit.sh` -> rc 0): fits the 300s PR core.
+# TIER: core — 5.4s measured (agent-dev seat, this host, 2026-08-17, median of 3 `time bash tests/gate_evidence_form_unit.sh` -> rc 0): fits the 300s PR core. It got FASTER while gaining two arms (DIVE-2752): the same reading was 10.1s here before the gate-delivery log seam below was pointed at TMP, because the retirement pass on every answer was walking the live fleet log. The "~6s (dev3, control plane, 2026-08-05)" figure this replaces was a different box AND a different fence — quote the environment when you replace this number.
 # DIVE-2799 acceptance clause 3 — the gate-answer AUDIT ROW must NAME which
 # evidence form cleared the gate, so one grep separates the forms across history.
 #
@@ -105,6 +105,41 @@ _gate_proof_enforced() { return 0; }
 # Deterministic nonce so a "valid tap" can present the right --human-proof.
 KNOWN_NONCE="ffffffffffffffffffffffffffffffff"
 _human_nonce_mint() { printf '%s' "$KNOWN_NONCE"; }
+# DIVE-2752: the SUDO-UID evidence form, pinned — and pinned as a PRECONDITION of
+# every arm above, not only of EV8 below. Each exact-string arm here asserts the
+# sole form ('nonce', never 'nonce+sudo-uid'), which was true only because the
+# seat running the suite happens to be an agent; on a control-plane box or a
+# dashboard-exec shell the same bytes would read 'nonce+sudo-uid' and the arm
+# would grade the runner rather than the tree
+# (tests/test_that_needs_the_host_is_not_a_test — the sibling harness
+# gate_channel_session_t2_unit.sh took that lesson at its CS13).
+#
+# 1 = false = an agent-* caller contributes no sudo-uid evidence. BOTH helpers
+# follow the one switch because `_gate_human_principal` is the conjunction of
+# them (uid test AND cgroup test, DIVE-2371): stubbing only the uid reader leaves
+# the cgroup half reading the real host, and the pin silently stops being
+# differential. The READERS are stubbed; the accept/deny logic stays shipped bytes.
+#
+# DIVE-2752, found while adding EV8 and fixed here because it is this suite's
+# fence rather than a product defect: the gate-button retirement that runs on
+# EVERY answer resolves its targets from `/var/log/5dive/notify/gate-notify.log`
+# — a FLEET-WIDE absolute path, not STATE_DIR — and matches on IDENT. This
+# suite's fixture idents are `DIVE-1`, `DIVE-2`, … in a fresh TMP db, and those
+# collide with real rows on the live board, so the lookup returned the real
+# gate's chat and message ids (a human's DM) and `_task_gate_bot_token` resolved
+# a real bot token from an equally unfenced CONNECTORS_DIR. Nothing was edited
+# only because `_mirror_edit_markup` is absent from the source list above — an
+# accident of that list, not a fence: add the file holding it and this unit test
+# strips approve buttons off live messages in a human's chat. Point the seam at
+# TMP and stub the writer, so the containment is asserted rather than inherited.
+FIVEDIVE_GATE_NOTIFY_LOG="$TMP/gate-notify.log"; : >"$FIVEDIVE_GATE_NOTIFY_LOG"
+_mirror_edit_markup() { printf '%s' '{"ok":true}'; }
+_PIN_SUDO_HUMAN=1
+_gate_sudo_uid_nonagent() { return "$_PIN_SUDO_HUMAN"; }
+_gate_caller_cgroup() {
+  if [[ "$_PIN_SUDO_HUMAN" == "0" ]]; then printf '%s' '/system.slice/shelld.service'
+  else printf '%s' '/system.slice/system-5dive.slice/5dive-agent@dev.service'; fi
+}
 export FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"   # active store IS prod -> log allowed
 reset() { : >"$AUDIT_CALLS"; unset _TASK_STORE_AUDIT_FENCED; }
 
@@ -218,6 +253,56 @@ if [[ "$SAME" == "1" && "$DIFF" == "0" ]]; then
 else
   bad_t "EV5c filer_answered must separate the filer from another principal" \
         "same='$SAME' diff='$DIFF' filer='$FILER'"
+fi
+
+# ── EV8: the SUDO-UID half of the same defect, which EV0/EV6 do not reach ────
+# DIVE-2752. The recorder ORs two variables per form —
+# `(( ${_hp:-0} || ${_t2_hp:-0} ))` and `(( ${_su:-0} || ${_t2_su:-0} ))` — because
+# the tier-2 floor computes its own copy of each. EV0/EV6 above grade the FIRST
+# OR only: measured on d650adc, deleting `|| ${_t2_su:-0}` while leaving the nonce
+# half alone left all 44 arms in this file and gate_channel_session_t2_unit.sh
+# green. So half of the fix shipped unguarded, and the two halves are separate
+# defects rather than one — they are raised by different helpers on different
+# inputs, and nothing makes them fail together.
+#
+# THE SHAPE: a tier-2 DECISION gate cleared by a human ON THE BOX — a dashboard
+# exec or an interactive login, no tap, no nonce. `_su` is raised only inside the
+# approval/secret/manual/access block (answer.sh:832), which a `decision` gate
+# never enters, so `_t2_su` is the ONLY variable carrying that fact and dropping
+# it records `none` — a genuine human clear written down as an auto-answer, which
+# is the false negative this ticket was filed on.
+reset
+t8=$(addt --assignee=dev -- "fixture t2 decision gate, human on the box")
+cmd_task_need "$t8" --type=decision --options="A|B" --recommend="A" \
+  --ask="pick one" --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
+_PIN_SUDO_HUMAN=0
+cmd_task_answer "$t8" --value="A" --human >"$TMP/ev8.out" 2>"$TMP/ev8.err"
+_PIN_SUDO_HUMAN=1
+COL8=$(hev "$t8")
+if [[ "$COL8" == "sudo-uid" ]]; then
+  ok_t "EV8 a tier-2 DECISION gate cleared on the box records 'sudo-uid', not 'none'"
+else
+  bad_t "EV8 the sudo-uid form must reach the column on the tier-2 decision path" \
+        "got '$COL8' — 'none' is the DIVE-2752 defect: a human clear recorded as an auto-answer; out=$(cat "$TMP/ev8.out") err=$(cat "$TMP/ev8.err")"
+fi
+
+# The pin has to be DIFFERENTIAL or EV8 grades nothing: if a bare `--human` from
+# an agent caller also cleared this gate, EV8 would pass on code that never read
+# the sudo-uid at all. Same gate shape, pin left at the agent case — the tier-2
+# floor must REFUSE, and the refusal must leave no evidence recorded (an rc-only
+# arm stays green when the guarded write happens anyway).
+reset
+t9=$(addt --assignee=dev -- "fixture t2 decision gate, agent caller")
+cmd_task_need "$t9" --type=decision --options="A|B" --recommend="A" \
+  --ask="pick one" --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
+out9=$(cmd_task_answer "$t9" --value="A" --human 2>&1); rc9=$?
+COL9=$(hev "$t9")
+ANS9=$(db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE id=${t9};")
+if [[ $rc9 -ne 0 && -z "$ANS9" && ( -z "$COL9" || "$COL9" == "none" ) ]]; then
+  ok_t "EV8 ANCHOR: the same gate with an agent caller is REFUSED and records nothing (the pin is live)"
+else
+  bad_t "EV8 ANCHOR: a bare --human from an agent must not clear a tier-2 gate" \
+        "rc=$rc9 answered_at='$ANS9' col='$COL9' out=$out9"
 fi
 
 # ── EV7: the real fleet log must carry nothing THIS suite wrote ──────────────

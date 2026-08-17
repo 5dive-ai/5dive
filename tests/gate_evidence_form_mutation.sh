@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TIER: nightly — 20.0s measured on ubuntu-latest by the core/installed-host runner itself (run 31292045115, 2026-08-09; the tier report's own top-10 line). The earlier "~50s (dev3, control plane)" figure in this slot was not wrong, it was a different box — quote the environment when you replace this number. Demoted under the mutation-harness rule (DIVE-2867): a mutant-killing grader re-copies the source tree once per mutant, so its cost is arms x tree-copy by construction and does not shrink with tuning. Three of the six *_mutation.sh harnesses were already nightly; this makes the class uniform rather than picking files by size.
+# TIER: nightly — 55.8s measured on the agent-dev seat, this host, 2026-08-17, at 10 mutants (DIVE-2752 added M9/M10). The number this replaces, 20.0s, was ubuntu-latest measured by the core/installed-host runner itself at 8 mutants (run 31292045115, 2026-08-09; the tier report's own top-10 line) — that box runs this file ~2.5x faster than this one, so expect a CI reading nearer 25s than 56s and re-stamp this line from a CI report rather than from a seat. Quote the environment when you replace this number. Demoted under the mutation-harness rule (DIVE-2867): a mutant-killing grader re-copies the source tree once per mutant, so its cost is arms x tree-copy by construction and does not shrink with tuning. Three of the six *_mutation.sh harnesses were already nightly; this makes the class uniform rather than picking files by size.
 # DIVE-2799 mutation grader for tests/gate_evidence_form_unit.sh.
 #
 # WHY THIS FILE EXISTS. Most of the unit suite asserts a field is PRESENT and
@@ -107,6 +107,22 @@ grade "M4-separator-changed" "EV3b compound order/separator is load-bearing" \
 grade "M5-t2-decision-form-unrecorded" "EV0 liveness" \
   '    "$(( ${_hp:-0} || ${_t2_hp:-0} ))" "$(( ${_su:-0} || ${_t2_su:-0} ))" \' \
   '    "${_hp:-0}" "${_su:-0}" \'
+
+# ── M5 IS A COMPOUND MUTANT, AND HALF OF IT WAS GRADING NOTHING (DIVE-2752) ──
+# The line M5 reverts carries TWO independent ORs, one per evidence form, and M5
+# removes both at once. EV0 dies on the nonce half alone, so M5 reported a kill
+# while the sudo-uid half rode along uncovered: measured on d650adc, deleting
+# `|| ${_t2_su:-0}` BY ITSELF left all 44 arms in the unit suite and in
+# gate_channel_session_t2_unit.sh green. A mutant that removes N properties and
+# names one arm grades exactly one of them — the rest are asserted by proximity.
+# So the halves are split below, each against the arm that is specific to it.
+grade "M9-t2-sudo-uid-form-unrecorded" "EV8 the sudo-uid form must reach the column" \
+  '    "$(( ${_hp:-0} || ${_t2_hp:-0} ))" "$(( ${_su:-0} || ${_t2_su:-0} ))" \' \
+  '    "$(( ${_hp:-0} || ${_t2_hp:-0} ))" "${_su:-0}" \'
+
+grade "M10-t2-nonce-form-unrecorded" "EV6 sole-nonce must spell 'nonce' exactly" \
+  '    "$(( ${_hp:-0} || ${_t2_hp:-0} ))" "$(( ${_su:-0} || ${_t2_su:-0} ))" \' \
+  '    "${_hp:-0}" "$(( ${_su:-0} || ${_t2_su:-0} ))" \'
 
 # ── a missing filer must not be reported as a measured 0 ─────────────────────
 grade "M6-missing-filer-reads-zero" "EV5b a missing filer must not be reported" \
