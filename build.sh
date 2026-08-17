@@ -87,6 +87,7 @@ cat \
   src/cmd_agent_create.sh \
   src/cmd_agent_lifecycle.sh \
   src/cmd_agent_config.sh \
+  src/cmd_agent_buzz.sh \
   src/cmd_agent_telegram.sh \
   src/cmd_agent_teambot.sh \
   src/cmd_agent_pairing.sh \

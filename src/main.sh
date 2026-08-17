@@ -83,6 +83,12 @@ Agents:
                                                      # comma-separable; dashboard (claude-only, no token)
                                                      # enables web-dashboard chat — the one-tap Enable chat
                                                      # path. New claude creates include it by default.
+  5dive agent buzz enable <name> --relay=<https://…> # DIVE-3509: install the buzz plugin, mint the agent's
+                                                     # own nostr identity and write its config (0600).
+                                                     # --channels=<csv> --poll-ms=<n> --buzz-path=<path>
+                                                     # --rotate-key mints a NEW key (the handset must re-pair)
+  5dive agent buzz status <name>                     # is buzz actually wired? plugin/config/binary, not
+                                                     # the agent unit's liveness. rc 3 = declared, not usable
   5dive agent config <name> set workdir=<path>       # tmux cwd; "default" clears override
   5dive agent config <name> set auth-profile=<name>  # swap profile; "default" clears override
   5dive agent config <name> set model=<id>           # runtime model (claude/codex/grok/antigravity)
@@ -697,6 +703,17 @@ main() {
         pair)
           AUDIT_CMD="agent pair"; AUDIT_ARGS=("$@")
           with_registry_lock cmd_pair "$@" ;;
+        # DIVE-3509: buzz onboarding. `enable` mints a key and writes the
+        # agent's config (registry write via cmd_config, so take the lock);
+        # `status` is a read-only probe — no lock, no audit, same treatment as
+        # telegram-getme below.
+        buzz)
+          if [[ "${1:-}" == "status" ]]; then
+            cmd_agent_buzz "$@"
+          else
+            AUDIT_CMD="agent buzz"; AUDIT_ARGS=("$@")
+            with_registry_lock cmd_agent_buzz "$@"
+          fi ;;
         telegram-discover)
           # Read-only Telegram getUpdates poll — no registry mutation, no
           # state changes. Bot token would clutter the audit log if it were

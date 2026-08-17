@@ -2476,6 +2476,15 @@ cmd_create() {
       # connectord token from /etc/5dive/connectord.env itself.
       dashboard)
         install_channel_for_agent "$type" dashboard "$name" "" ;;
+      # DIVE-3509 buzz: the sixth wiring site, and the one that was missed.
+      # valid_channel accepted buzz, the registry recorded it, and
+      # 5dive-agent-start emitted --channels plugin:buzz@5dive-plugins — but
+      # with no arm here the plugin was NEVER FETCHED, so the flag named a
+      # plugin that did not exist on the box and the create still printed OK.
+      # `agent config set channels=…,buzz` had this install (DIVE-3333); only
+      # the create path did not.
+      buzz)
+        install_channel_for_agent "$type" buzz "$name" "" ;;
     esac
   done
 
@@ -2769,6 +2778,38 @@ cmd_create() {
       _hc_issues+=("$_ch is DEAF (allowlist empty) — pair it: 5dive agent pair $name --user-id=<$_idlabel>")
     fi
   done
+  # DIVE-3509 buzz: "poller up" above reads the AGENT's systemd unit, which is
+  # active whether or not the buzz channel has any of its three prerequisites.
+  # A create-time check that says "poller up" while the plugin it named was
+  # never fetched is worse than no check, because it is the thing an operator
+  # looks at. Assert the real predicate instead — plugin dir, config, binary —
+  # and name the one command that fixes it.
+  if channel_in_list buzz "$channels"; then
+    local _bz_home="/home/agent-${name}" _bz_gaps=() _bz_cfg _bz_path
+    _bz_cfg="${_bz_home}/.claude/channels/buzz/config.json"
+    if ! find "${_bz_home}/.claude/plugins/cache" -maxdepth 3 -type d -name buzz \
+         -print -quit 2>/dev/null | grep -q .; then
+      _bz_gaps+=("plugin not installed")
+    fi
+    if [[ ! -f "$_bz_cfg" ]]; then
+      _bz_gaps+=("no config.json")
+    elif ! jq -e '.relay_url and .private_key' "$_bz_cfg" >/dev/null 2>&1; then
+      _bz_gaps+=("config.json missing relay_url/private_key")
+    else
+      _bz_path=$(jq -r '.buzz_path // "buzz"' "$_bz_cfg" 2>/dev/null)
+      # An absolute buzz_path must exist; a bare name must resolve on PATH.
+      if [[ "$_bz_path" == /* ]]; then
+        [[ -x "$_bz_path" ]] || _bz_gaps+=("buzz binary missing at $_bz_path")
+      else
+        command -v "$_bz_path" >/dev/null 2>&1 || _bz_gaps+=("buzz binary '$_bz_path' not on PATH")
+      fi
+    fi
+    if (( ${#_bz_gaps[@]} == 0 )); then
+      _hc_ok+=("buzz configured")
+    else
+      _hc_issues+=("buzz is UNCONFIGURED ($(IFS=', '; echo "${_bz_gaps[*]}")) — the channel is enabled but connected to NOTHING. Finish it: sudo 5dive agent buzz enable $name --relay=<https://relay.example.com>")
+    fi
+  fi
   # reachability: telegram getMe (the token actually resolves a live bot).
   # bot_username is only populated above for an exact channels==telegram create,
   # so re-probe here when telegram is present in a multi-channel set.
