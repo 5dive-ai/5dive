@@ -49,6 +49,14 @@ from the merged-and-tidy ones. A reader handed "dead branch, 40d" reaches for de
   mocks now emit error bodies on stdout as `gh` does, **and assert that they do** — a product that
   reads the rc is correct under either mock, so nothing else in the harness can catch a fixture
   that regresses to the wrong stream.
+- **A count is an all-clear only if the thing counted was READ.** `done < <(gh api …)` throws the
+  exit status away, so an unreadable *list* silently became an *empty* list: measured against the
+  real script with the branch endpoint rate-limited, the digest printed `0 finding(s), 0 orphan,
+  0 unknown` and exited 0 — the same all-clear this row exists to prevent, one level above the
+  classifier. Both lists are now fetched with their rc kept, an unread list says so in its own
+  section **and** in the tally, and the open-PR list and the open-head exclusion read one call, so
+  an outage is a single state rather than two half-states. With no exclusion list, an open-PR
+  branch is judged like any other — over-report, never preserve.
 - **`DEAD_BRANCH_DAYS` is no longer read.** Setting it prints a line saying so rather than being
   silently ignored; the weekly workflow no longer sets it. Branch age is still printed per branch,
   as a fact, not as the classifier.
