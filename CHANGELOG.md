@@ -1,6 +1,382 @@
 # Changelog
 
-## Unreleased — fix(branch-hygiene): the weekly digest classifies branches by EVIDENCE, not age (DIVE-2394)
+## v0.19.40 — fix(agent): `--channels=buzz` installed nothing and still reported OK (DIVE-3509)
+
+Measured on a fresh customer-shaped box (2026-08-17): `5dive agent create x --channels=buzz`
+printed *"OK — agent 'x' (type=claude, channels=buzz,dashboard) is running"*, the registry recorded
+the channel, and `claude` was launched with `--channels plugin:buzz@5dive-plugins` — over a box
+whose plugin cache held only `dashboard/`, with no `~/.claude/channels/buzz/config.json` and no
+`buzz` binary anywhere on disk. **A channel that reports success while connected to nothing.**
+
+The cause is one missing `case` arm. `tests/buzz_channel_wiring_unit.sh` graded five wiring sites
+and all five were green the whole time; the sixth — `cmd_create`'s per-channel dispatch to
+`install_channel_for_agent` — had `telegram`, `discord` and `dashboard` arms and no `buzz` arm.
+`agent config set channels=…,buzz` had this install (DIVE-3333); only the create path did not.
+
+- **`cmd_create` now installs the buzz plugin**, the same call `dashboard` makes. The harness grades
+  the sixth site, with a control arm proving the pattern finds the `dashboard` site it is modelled on.
+- **The create self-check stops greening on it.** `(ok: poller up)` reads the *agent's* systemd unit,
+  which is active whether or not buzz has any of its prerequisites — the worst kind of check, because
+  it is the one an operator looks at. A buzz create now asserts the real predicate (plugin dir,
+  parseable config with `relay_url`+`private_key`, a `buzz_path` that actually resolves) and otherwise
+  reports `buzz is UNCONFIGURED (…)` with the command that finishes it.
+- **New: `5dive agent buzz enable <name> --relay=<https://…>`** — installs the plugin, resolves the
+  binary, mints the agent's own nostr identity (32 bytes of hex, exactly what `plugins/buzz/server.ts`
+  validates) and writes `~/.claude/channels/buzz/config.json` **0600, owned by the agent**. The key is
+  minted once and reused on re-runs (`--rotate-key` to force a new one — a silent rotation reads to a
+  paired handset as the agent having left the room). It **refuses to guess a relay**: passing one is
+  the whole point, and a wrong relay reproduces the defect being fixed. `--channels`, `--poll-ms`,
+  `--buzz-path` override the defaults.
+- **New: `5dive agent buzz status <name>`** — the real predicate as a read-only probe, `rc 3` when
+  the channel is declared but not usable, so the dashboard panel can branch on it without parsing prose.
+
+**The minted key travels on stdin, never on argv.** The first shape of the writer passed it as
+`env KEY=<hex> …`, which makes the secret an argv element of the `sudo` command — and
+`/proc/<pid>/cmdline` is world-readable, with no `hidepid` on our boxes, so every other agent user
+could read a freshly minted private key for the width of the write (`/proc/<pid>/environ` is 0400 and
+would have been fine; argv is not). The program now goes to `python3 -c`, the non-secret fields stay in
+the environment, and the key is piped. Graded behaviourally rather than by grep: the harness shadows
+`env` with a stub that records the argv actually handed to the process, asserts the key is absent from
+it, and keeps a positive control that the key still reached the config — no-leak is trivially true if
+the write never happened.
+
+**What this does NOT do, said out loud rather than left to be discovered:** it does not install a
+`buzz` binary (no customer box has ever had one — `enable` reports its absence instead of writing a
+`buzz_path` that points at nothing), it does not join or create channels on the relay, and it does not
+publish the new pubkey's profile or presence (DIVE-3507). Those are the last mile between "configured"
+and "a handset can talk to this agent", and naming them is the same discipline the bug above failed.
+
+## v0.19.40 — fix(task,heartbeat): bound the lifetime of agent-launched shells (DIVE-3503)
+
+Four seats could not take new work on 2026-08-16 because a shell the AGENT had
+written was still running long after the task that spawned it had closed; a human
+unstuck them by hand three separate times, and one of the shells' children had
+pinned a full core for six and a half hours.
+
+Two different triggers, one missing thing. Three seats polled
+`until ! pgrep -f 'timeout 300 bash tests/'` — `-f` matches the waiter's own
+argv, so the predicate can never go false (the live capture found four matches
+and not one of them was the job: two waiters matching themselves and each other,
+a diagnostic shell on another seat that was merely quoting the string, and the
+`pgrep` running the query). A fourth polled for a `== done ==` sentinel in an
+output file whose producer had been killed mid-run, so the marker could never be
+written. Nothing in this product bounded either: `task done|cancel|deliver` was a
+DB transition that touched no process, and the heartbeat's `reaped` counter
+counts cancelled rows.
+
+`task done|cancel|deliver` now reaps the seat's stale background shells by PID.
+The predicate was chosen against a `ps` sweep of all 18 seats and is narrow on
+purpose: an agent-written shell invoked with `-c`, descended from the seat's
+runtime, older than 15 minutes (`FIVEDIVE_REAP_MIN_AGE`). Nothing a seat
+legitimately runs long is in that class — the unit, tmux, the run loop, the
+runtime and the plugin MCP servers are all spared — and the caller's entire
+ancestor chain is exempt by construction, since `5dive task done` itself runs
+inside one of these shells. A deliberate long-running job opts out with
+`FIVEDIVE_KEEP_ALIVE=1 nohup ./long-build.sh &` — read from the process's
+environment, not only its command line, because a variable-assignment prefix is
+never part of argv and an opt-out nobody can actually reach is not an opt-out.
+`FIVEDIVE_REAP=0` disables the reaper entirely.
+
+The DIVE-1486 active-defer escalation is also honest now. Its remedy is to type a
+line into the pane, which a runtime blocked on a child that never exits cannot
+consume — and it then cleared its own counter, so the log read
+`#1 → #2 → escalation → #1 → #2 → escalation` for eleven hours on one seat and
+every episode looked handled. It now remembers the pane fingerprint it escalated
+on: a repeat escalation with that same fingerprint proves the typed nudge did not
+land, so it reaps the blocking child instead, and surfaces to the fleet
+coordinator when there is nothing reapable left to try.
+
+## v0.19.40 — feat(task): a sender-visible handoff receipt on the routing verbs (DIVE-3499)
+
+`task reject`, `task assign` and `task set-body` now print one line to the CALLER
+naming who owns the row, where it sits in that seat's queue, and when that seat
+next wakes:
+
+```
+OK — DIVE-3330 assigned to dev2
+handoff: dev2 now owns it · queue position: 2 of 5 · next wake: in ~12m
+```
+
+**Why.** Every "I routed you a row, please look at it" agent-to-agent ping is a
+missing capability wearing the shape of a message. Measured case: ops put a full
+triage on DIVE-3330's body, the row was already `todo` and already
+`assignee=dev2`, and ops pinged a human-shaped seat anyway — because nothing told
+the SENDER the handoff had landed. It could not tell "dev2 will pick this up"
+from "this vanished". That ping costs the recipient a full fresh-context reload
+of work they had closed out. The receipt answers the question instead of policing
+the channel.
+
+The position is the dispatcher's own selection (`_hb_pick_tasks`: priority, then
+critical-path depth, then id, dep-blocked rows excluded), not a `COUNT(*)`, so it
+is a prediction rather than a decoration — and the two cannot drift.
+
+**Additive only.** The receipt cannot refuse, cannot add an exit code, and cannot
+change a status. Every input may be missing — the picker, the board, the
+registry, or the helper itself — and the verb still exits 0 and still does its
+work; an unresolvable fact is named as unknown, never guessed. Human output only:
+JSON mode is byte-identical.
+
+## v0.19.40 — feat(task): a verifier merges what it graded, and a routed gate queues instead of interrupting (DIVE-3474)
+
+Two classes of agent-to-agent message wake the lead's accumulating window, and
+only one of them is a real ask. **The cost is the WAKE, not the message**: 222
+sends and 387 KB fleet-wide in 24h (measured 2026-08-12) is under 0.5% of fleet
+burn, while every inbound to a non-fresh seat (`main`, `marketing`) starts a turn
+that re-sends that seat's whole session window. Any fix aimed at message LENGTH is
+aimed at the wrong quantity.
+
+### Arm 1 — the ask was illegitimate, so it is gone
+
+quinn, twice in one day: *"my token is read-only so I cannot do it. Please merge
+#658"* — on rows she had already graded PASS, re-deriving the maker's counts,
+driving her own mutants and confirming every required check green at the graded
+head. agent-main then pressed a button. **No judgement is added by the second
+seat**; it holds a credential, not an opinion.
+
+`5dive task merge <ident>` lets a verifier merge the pull request bound to a row
+**it has itself graded PASS**, and nothing else. This is **not a merge grant** —
+the standing is the ROW, keyed on `graded_by = <this seat>` over
+`_TASKS_TFV_SQL`, the same graded-awaiting-merge predicate the board paints
+`graded->merge` from. Reusing that constant rather than re-typing it carries four
+conjuncts for free: writer-is-not-grader (DIVE-477), a live reject retires a grade
+(DIVE-3428), a grade is not a pass (DIVE-3430), and a verdict with no
+`delivery_ref` has nothing to merge.
+
+The sudo posture is `_task_answer`'s (DIVE-3160) and the grant is likewise
+**UNCONDITIONAL**, for that ticket's stated reason: the verb confers no authority
+of its own — it refuses on any row this seat did not grade — so gating it behind
+`--can-push` would recreate the split between standing and capability it exists to
+close, and would hand a grader the push capability the writer-is-not-grader rail
+says a grader must not hold. `_merge_do` runs as root, derives the caller from
+`SUDO_UID`, re-derives standing from the row, and reads the pull request from that
+row's own `delivery_ref` — **it accepts one ident and no flags**, so there is no
+argument through which a caller can name a different pull request.
+
+**The negative is asserted, and that is the point.** A merge performed by the
+machine account leaves no field at the GitHub end distinguishing a rightful one
+from a wrong one, so a seat REFUSED on a row it did not grade is the only place
+this boundary is observable. `tests/verifier_merge_standing_unit.sh` grades that
+refusal, the peer-graded case, the ungraded case, the self-graded case, the
+re-rejected case and the fail-verdict case, plus the source-level properties the
+sudo hop depends on.
+
+### Arm 2 — the ask is legitimate, so the DECISION stays and the INTERRUPT goes
+
+The obvious "fix" — auto-apply a gate when the lead would only have agreed with
+the filer — **is refuted by the board's own number**: of 121 answered gates, 54
+returned exactly the filer's recommendation, so auto-applying would have been
+wrong on the other 67. A gate that disagrees with its filer 55% of the time is
+doing real work.
+
+So a routed gate now **queues**. `_task_need_route_deliver` fires no `5dive agent
+send` at file time; the gate is filed, blocked, unanswered, still routed and still
+clearable by the same lead, and it is recorded on its own rail
+(`chat=queue:<reviewer>`) so queued rows stay separable from sent ones in the
+delivery dataset.
+
+`--urgent` is the filer's opt-out and is a **separate column** from `recommend`
+(`gate_urgent`), because "this cannot wait" and "I think the answer is X" are
+different claims and the 54-of-121 figure is what happens when the second is read
+as the first.
+
+**A queue that loses a decision is worse than the interrupt it replaced**, so
+discovery is built rather than assumed:
+
+* `5dive task queue [--for=<agent>] [--json]` — the routed-gate counterpart of
+  `task inbox`, through **one predicate that is called, never pasted** (the rule
+  `_task_human_gate_pred` states). It is a VERDICT surface: it answers "what may I
+  clear" with rows carrying ask, options, recommendation, filer, age, urgency and
+  the exact answer command, rather than exporting `routed_reviewer` and leaving a
+  consumer to rebuild the rule — the second copy that drifts.
+* the heartbeat wake nudge names the count, so the reviewer meets its queue on the
+  next natural wake it was already having. No extra wake is created.
+* the gate re-nag gets a **grace** (`FIVEDIVE_GATE_RENAG_ROUTED_GRACE_HOURS`,
+  default 2h) for routed non-urgent gates, so the interrupt does not simply move
+  15 minutes downstream. Every rung past the grace is unchanged — including the
+  fall-through to the paired human, which is what keeps a queued gate from
+  becoming a lost one. An UNROUTED gate is the human's and is not quieted at all.
+
+## v0.19.40 — fix(identity): the nine raw identity reads that still fed DECISIONS are closed (DIVE-2538)
+
+DIVE-2518 collapsed the *attribution* sites onto the sealed derivation and deliberately left the
+decision-feeding ones — rewriting the agent-create and proof paths would have been scope creep
+needing its own harnesses. This is that follow-up. Nine sites in six files (eight from the triage, plus one the triage did not have — see the last section), each classified by
+what its value **changes**, not by what it looks like.
+
+**Three were PATH-resolved `id`.** `id` resolves through the *caller's* PATH and every agent sets
+its own, which DIVE-2330 measured directly: a shim printing a peer's name made `id -un` return
+exactly that from a process whose real uid was 1004. The three now read `$EUID` — via
+`_gate_is_root` for the root test and the new `actor_caller_unix_name` for the name:
+
+- `cmd_agent_create.sh` `sudo_grant_lines` — `$user == $(id -un)` decided whether a `sudo -n -l`
+  reporting the **caller's** grants could be published as the answer for `$user`. Under a shim the
+  function returned the caller's own sudo grants labelled as a peer's: a wrong answer about who may
+  do what.
+- `cmd_proof.sh` `_proof_identity` — `$as != $(id -un)` gates whether the target user's
+  `~/.gitconfig` is read through `runuser` **at all**. A shim echoing `$as` collapsed the check onto
+  the caller's own config and reported the answer as the target's, which is a false green on
+  precisely the configure-vs-02:00-cron-publish split this function exists to catch.
+- `task/gate_evidence.sh` `_gate_gh_token` — the axis here is **weaken-a-gate**, not
+  misattribution. The predicate gates arm 4, the last token-resolution arm; skipped, the resolver
+  falls through to `printf ''` and returns EMPTY, and the auto-detect merge gate below is fail-OPEN
+  on an empty token. So a shim echoing `claude` made a caller skip its own fallback and take the
+  open path, from a seat whose real uid was never `claude`. (That downstream fail-OPEN is carried
+  from DIVE-2518's body and was **not** re-measured here; it decides this item's severity, not its
+  fix shape.)
+
+**Three were the DIVE-2371 prefix rule** — an `agent-*` test over an environment variable nothing
+verifies, deciding a *class*. They take a new resolver, `actor_routing_agent`:
+
+- `cmd_agent_runtime.sh` `cmd_deliver` — decided agent-vs-human and set `_caller`, the key the a2a
+  round cap counts against, so a forged `SUDO_USER=agent-X` spent X's round budget and recorded X
+  as the sender.
+- `cmd_agent_create.sh` `cmd_create` — same construct, lower stakes (a default skill), included
+  because a class-grep for the rule has to come back clean.
+- `task/notify.sh` `_task_owner_channel` — the return value goes straight to `_task_agent_channel`,
+  so it selects **which agent's Telegram bot** receives a task notification. The axis is misroute —
+  wrong recipient at the time, not a wrong name in a log afterwards.
+
+**Two are STORED fields** and take the attribution resolvers, which degrade safely to the existing
+`cli`/`?` sentinels: `cmd_proof.sh` `_proof_publish` (`lastPublishedBy.user`, read by staleness
+monitoring) and `cmd_objective.sh` `cmd_objective_add` (`objectives.created_by`).
+
+### Why the routing sites are not `_gate_authenticated_actor`
+
+The strict resolver consults `SUDO_UID` only behind `_gate_is_root`, which is correct for
+*authorization* and wrong for *routing*. `sudo -u claude` — this repo's mandated smoke shape —
+leaves EUID at claude's uid, so the strict resolver discards the `SUDO_UID` naming the real invoker
+and answers `claude`, which is in no registry, so the channel resolves to **nobody**. An empty
+answer is safe at an attribution site and unsafe at a routing one, where every consumer renders it
+as either a silent skip (`_task_close_notify`, the digest) or a hard `E_AUTH_REQUIRED`
+(`/inbox --send`). Sealing the site that way would have traded a forgery for a silent no-op.
+
+`actor_routing_agent` is ordered so the `SUDO_UID` branch is **unreachable from an agent seat**:
+the caller's own euid answers first and the environment is never read, so every `agent-*` seat is
+resolved from the kernel; only a non-agent euid falls through, and arriving there from an agent
+seat requires actually invoking sudo, which rewrites `SUDO_UID`/`SUDO_USER` with the real invoker.
+Measured on this host 2026-08-16: `SUDO_UID=999999 SUDO_USER=agent-olivia sudo -n -u claude env`
+prints `SUDO_UID=1007 SUDO_USER=agent-dev`. Signed residual: a non-agent, non-root uid could set
+`SUDO_UID` by hand and buy an agent's notification channel — and nothing else. No gate clears on
+this value, `actor_claim`/`actor_board_name` are untouched, and it is strictly narrower than the
+status quo, where any agent forged any peer with one env var.
+
+### `_task_owner_channel` closes the FUNCTION, not the line
+
+Both of its arms were forgeable. The **primary** one was `auto_sender_from_sudo`
+(`$SUDO_USER` + a prefix test); the `${USER:-$(id -un)}` fallback was the ELSE branch, reached only
+when `SUDO_USER` is absent or non-agent. Two consecutive reviews read the line the identifier
+pointed at and judged the function on it. Patching only the fallback would leave the deciding
+branch untouched **and** make a completeness grep for `${USER:-$(id -un)}` come back clean — the
+check certifying exactly the fix that misses.
+
+`tests/identity_decision_sites_unit.sh` is therefore keyed to the deciding **function**, not to the
+token: it extracts each function's body and demands no forgeable identity input survives anywhere
+in it (`auto_sender_from_sudo` is in the class, because a forgeable read hides behind a helper name
+containing no primitive at all). It carries a positive control per shape, including a **half-fix
+control** — fallback closed, forgeable primary left — which a token grep passes and this harness
+must catch. `tests/gate_actor_path_forgery_unit.sh` gains five runtime arms for the new resolvers,
+including the de-elevated-relay arm that distinguishes this fix from the migration that silently
+reaches nobody, and `tests/proof_identity_guard_unit.sh` gains an arm asserting a PATH-shimmed
+`id -un` no longer decides the cross-user branch.
+
+### Item 9, which the eight-item list did not have
+
+`cmd_objective_rm` carried the identical construct as item 7 one function over —
+`auto_sender_from_sudo` else `${USER:-unknown}`, stored as `objectives.retired_by`. It surfaced
+from grepping the **class** across `src/` rather than re-reading the list, and the list was already
+a reconciliation against a parent ticket's hand-named sites. It matters more than item 7 does:
+DIVE-2512 introduced the tombstone precisely so an authorized retirement is distinguishable from a
+wipe, and `retired_by` is the field that distinction rests on.
+
+So the harness gains the arm that outlives the row: every remaining `auto_sender_from_sudo` caller
+in `src/` must be inside a real-root guard or a named, reasoned not-a-defect (`_envelope_caller`,
+the DIVE-2182/2183 gap left open on purpose; `cmd_ask`'s JSON-summary label, whose real derivation
+is item 1). A new caller reds even if nobody re-triages. Mutation-graded: reverting the item-9 fix
+reddens both the item-9 arm and the class sweep.
+
+## v0.19.40 — fix(objective): `objective rm` tombstones instead of hard-DELETEing away the audited cycles + readings (DIVE-2512)
+
+`cmd_objective_rm` was one `DELETE FROM objectives`, and both `objective_cycles` and
+`objective_readings` carry `REFERENCES objectives(id) ON DELETE CASCADE` — so a single
+`objective rm` silently emptied all three tables. Measured on the one real invocation
+(`funnel-channel-acquisition`, retired 2026-07-25 on a tier-2 gate answer, DIVE-1928):
+**objectives 1→0, objective_cycles 4→0, objective_readings 221→0.** The success message said
+only `(readings deleted)`; it never named the cycles rows, which are the record of whether the
+loop ever worked.
+
+The second-order cost is the one that actually bit. Seven days later `objective ls` printed `[]`
+and that was filed as an incident (DIVE-2507, *"the objectives table is EMPTY … find out why"*).
+**An authorized retirement and a catastrophic table wipe rendered identically**, and separating
+them took an offsite-snapshot diff plus a board-history search. Note that the natural-looking
+fix — alarm on an empty objectives table — would have fired a FALSE alarm on this exact event.
+
+- **`objective rm` now RETIRES**: `status='retired'`, the row kept, every cycle and reading kept.
+  Four new columns (`retired_at/by/reason/ref`) make the row itself answer *who decided this, when,
+  why, and on whose authority* — `--reason=` and `--ref=<task ident>` stamp the last two.
+- **`objective ls` hides retired rows and says how many it hid** (`--all` shows them;
+  `retired_hidden` in JSON). This is the half that fixes the reader: with retirements kept, an
+  empty list means only-and-exactly "nothing was ever here" — which is the precondition for ever
+  alarming on an empty objectives table.
+- **Destruction is now explicit and honest**: `rm --purge --yes`, and its message names BOTH child
+  tables with their row counts. Without `--yes` it refuses and prints what would be lost.
+- A retired objective does not tick and cannot be re-planned; `resume` un-retires it and clears the
+  stamp; `pause` on a tombstone refuses rather than silently un-retiring it into "ongoing work";
+  and re-`add`ing a retired name says *which* conflict it is instead of a bare "already exists".
+- The digest's objectives block excludes retired rows, so a retirement stops reading as live work.
+
+The tombstone columns reach existing stores through `_tasks_db_migrate` as a pure expand, each
+column checked on its own so a store that took a partial expand converges on the next run.
+`tests/objective_tombstone_migration_unit.sh` covers that path specifically — `objective_unit.sh`
+runs on a fresh dir and therefore only ever exercises the canonical schema, which is exactly how a
+change like this ships green and then fails on every real box.
+
+Found by the pre-close self-audit and folded in: the heartbeat's `_hb_objective_reconcile` sweep
+re-drives a late planner diff through validate → gate/materialize, so a cycle left in flight when
+somebody retired the objective would have **originated tasks for a loop that has been shut down**.
+It now excludes retired objectives — and only retired, not `status='active'`: a *paused*
+objective's late diff still materializes, which is the pre-existing behaviour and is correct
+(paused is "stopped for now", retired is "decided"). Covered as a positive-control pair on one
+row — the identical straggler is proven to reconcile while the objective is live, and only then
+retired and re-run, so "it did not move" cannot be an inert fixture.
+
+## v0.19.40 — fix(agent): a read failure on an agent's env file no longer becomes a persisted `admin` tier (DIVE-2218)
+
+`AGENT_ISOLATION` is read out of `${STATE_DIR}/agents.d/<name>.env` at three call sites, all with
+the same `sed … 2>/dev/null | head -1` idiom and a silent default. At the `team-bot shared` wiring
+loop that default was `admin`, and the value was handed straight back to `write_agent_env`. A
+missing file, an unreadable one and a genuinely-admin agent all produced the same string, so a
+transient read failure did not merely mis-read the tier: it **manufactured the top tier and wrote
+it down**, at the exact field `5dive agent info` compares against the enforced sudoers grant and
+`agent skill` reads to pick an install strategy.
+
+`src/lib/agent_env.sh` ships `agent_env_isolation()`, which cannot return empty and cannot invent
+a tier — `no-name`, `no-env-file`, `env-unreadable`, `no-field`, `malformed-tier` are five distinct
+answers, none of them spelled like a value. It is deliberately **not** a reuse of DIVE-2213's
+`agent_tier()`: that resolver answers a question about the registry, and letting it stand in here
+would tell a caller the env file had been read when it had not. Because the env file and the
+registry are two independent sources of truth that nothing reconciles, `agent_isolation_2src()`
+composes them and **names a disagreement** instead of silently picking one.
+
+Polarity stays a property of the site (DIVE-2213), so the three sites answer differently on
+purpose:
+
+- **team-bot** refuses to rewrite an env file it could not read. Isolation was never the only
+  hole — `AGENT_WORKDIR` and `AGENT_AUTH_PROFILE` came out of the same failed read, and
+  `write_agent_env` omits them when empty, so the old path also blanked the agent's runtime config.
+  A readable file whose field is merely missing falls back to the registry's measured value, which
+  reconciles the two sources; if neither answers, it still refuses. `standard` would be a smaller
+  guess than `admin`, and a smaller guess persisted is the same defect.
+- **`agent skill add`** keeps degrading to the non-sandboxed install strategy — guessing the other
+  way would run a freshly-cloned repo's install as **root** for an agent that may not be sandboxed,
+  and a functional failure is the correct thing to degrade to. What changed is that the hole is no
+  longer named `admin`, the registry gets a chance to answer first, and the guess is announced.
+- **the pairing welcome** is unchanged in behaviour. Its `standard` fallback (DIVE-1571) was
+  already the model the other two were fixed to match.
+
+Fleet measurement taken with the fix: **18/18** live agent env files carry the field today, so
+this was a latent escalation rather than one already on disk.
+
+## v0.19.40 — fix(branch-hygiene): the weekly digest classifies branches by EVIDENCE, not age (DIVE-2394)
 
 `--apply` was already safe: it deletes only on a closed PR whose head SHA equals the branch's
 current SHA, and age never entered that path. **The digest above it was the problem.** Its
@@ -64,7 +440,7 @@ from the merged-and-tidy ones. A reader handed "dead branch, 40d" reaches for de
   the invariant `branch-hygiene-report.sh` greps for when it runs this same script against
   `lodar/5dive-api` and `lodar/5dive-frontend`.
 
-## Unreleased — fix(council): `authority.gate_clear_leads` can actually be set (DIVE-3493)
+## v0.19.40 — fix(council): `authority.gate_clear_leads` can actually be set (DIVE-3493)
 
 The constitution validator and the authority reader accepted **disjoint** subsets of YAML, so the
 key was unsettable through any path: `council amend` threw `use inline arrays in constitution v0`
@@ -90,7 +466,7 @@ worked example — so the template failed the validator shipping beside it.
   *"no motion could have succeeded"*, not *"nobody convened one"* — an instrument that measured its
   own writer.
 
-## Unreleased — feat(task): an inert push-for-review clears at filing, pinging nobody (DIVE-3481)
+## v0.19.40 — feat(task): an inert push-for-review clears at filing, pinging nobody (DIVE-3481)
 
 lodar, 2026-08-16, on a routine branch-push approval waking the org lead: *"why dev2 cannot do
 delegated push himself and burns your token for approval?"* An approval gate whose ask is an
@@ -124,7 +500,7 @@ permanent gate record and digest line intact, and **no ping to anyone**.
 - **`5dive task pfr-autoclear [on|off|status]`**, default **on**, restores the lead ping with no
   release.
 
-## Unreleased — fix(usage): the middle wildcard is a read too (DIVE-3419)
+## v0.19.40 — fix(usage): the middle wildcard is a read too (DIVE-3419)
 
 Both transcript readers in `cmd_usage.sh` used `projects/*/*.jsonl`. `usage_collect` was guarded at the
 **top** (`probe_readable` on `projects/`) and the **bottom** (per-file `except OSError`) of a *three*-level
@@ -154,7 +530,7 @@ true** — and every "⚠ N NOT checked — burn is unknown (not 0)" banner buil
   ANY-UID arm (`ELOOP`, which root cannot resolve either) so a uid-0 CI run cannot be a vacuous green, and
   over-fire controls. **9/14 pre-fix, 23/0 after.**
 
-## Unreleased — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
+## v0.19.40 — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
 
 Nothing validated these columns. The work-picker dispatches on `assignee`, so a row on a name that is
 not a registered agent was **structurally undispatchable** — not blocked, not parked, not flagged, and
@@ -178,7 +554,7 @@ never once a dispatch target) and corroborated here (5 open rows).
 - **`wip-cap-install`** read the same unvalidated column (it had minted `wip_cap:cli`, a lane ceiling
   for an agent that does not exist). It now skips unregistered lanes and **names the skip**.
 
-## Unreleased — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
+## v0.19.40 — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
 
 `5dive agent config <name> set channels=<current>,buzz` could not succeed on any seat that was not
 **created** with buzz. `cmd_config` dispatches `install_channel_for_agent` for telegram, discord and
@@ -211,7 +587,7 @@ arms grade the satisfier next to the gate, and drive `cmd_config` for real — w
 that the same call reaches the restart once the cache is staged, so the rollback arms cannot pass
 against a `cmd_config` that simply refuses everything.
 
-## Unreleased — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
+## v0.19.40 — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
 
 DIVE-2483's gate answer said the preservation notice lands on **stdout**. It lands on **stderr**,
 via the fleet's `warn()`. Six arms were written for that condition and all six were green, because
@@ -245,7 +621,7 @@ Still open and scoped out on purpose: `task reject` remains an unguarded writer 
 column (`src/cmd_task.sh:4235`). That is a design question about accumulating verifier feedback, not
 this gap.
 
-## Unreleased — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
+## v0.19.40 — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
 
 DIVE-3272 taught the supervisor BOARD to see a seat that is alive and closing nothing. The
 drill-down people actually type kept printing only liveness: `state: active / enabled` was
@@ -287,7 +663,7 @@ supervisor:  quota-exhausted / quota-exhausted — pane shows a model-capacity r
 - `agent list` is unchanged — it is the survey surface, and this is a per-agent drill-down
   (three sqlite reads), deliberately not an N-way fan-out.
 
-## Unreleased — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
+## v0.19.40 — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
 
 A gate reaches the filer's lead only if `_GATE_ENG_SHIP_RX` matches the ask or the row
 title. `gate_builder_routing` is OFF by default, so for an ordinary builder ship gate that
@@ -351,7 +727,7 @@ prose for identifiers.
   `gate_access_lead_clear`, `gate_internal_ops_floor`, `task_needs_human_parity`,
   `task_inbox_json_tier`, `push_unit`, `broker_surface`, + 15 more).
 
-## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
+## v0.19.40 — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
 
 DIVE-1935's first iteration was rejected, and for the right reason. It added a
 `sudo -n -u claude gh auth token` arm to `_gate_gh_token` justified by *"agents hold
