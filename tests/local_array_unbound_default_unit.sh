@@ -299,6 +299,11 @@ grade "F: compose mgrs/reports are mapfile-populated (=> NOT a live crash)" 2 "$
 # defect behind it (quinn, reviewing DIVE-3457 / PR #658). The resolver now also
 # accepts a file-scope creation in ANY sourced src file.
 #
+# A CREATION, not a declaration. The file-scope branch requires an assignment
+# (`declare -A NAME=(…)` / `NAME=(…)`) exactly as the function-scope test does;
+# a bare `declare -A NAME` is a declaration that leaves the name unbound under
+# `set -u`, so accepting it would silence a live crash. Graded by G3d.
+#
 # "File-scope" is column 0 and outside a heredoc body. Column 0 is the whole
 # discriminator and it is deliberate: every function body line in this tree is
 # indented, so an unindented `declare`/`NAME=(` is a global by construction,
@@ -339,7 +344,13 @@ def file_scope_names(lines):
         m = re.search(r'<<(?!<)-?\s*([\'"]?)([A-Za-z_][A-Za-z0-9_]*)\1', l)
         if m: hd = m.group(2)
         if l[:1].isspace(): continue
-        m = re.match(r'(?:declare|typeset)\s+((?:-[A-Za-z]+\s+)*)([A-Za-z_][A-Za-z0-9_]*)\b', l)
+        # An ASSIGNMENT is required, exactly as the function-scope `created` test
+        # below requires one. A BARE `declare -A NAME` creates nothing readable:
+        # `set -u; declare -A X; echo ${#X[@]}` is an unbound-variable crash, so
+        # whitelisting a bare declare would silence the very class this harness
+        # exists for. src/cmd_loop.sh:354 `declare -A _LOOP_SPEND_LAST` is that
+        # shape and is the only name the `=` drops from this tree. Graded by G3d.
+        m = re.match(r'(?:declare|typeset)\s+((?:-[A-Za-z]+\s+)*)([A-Za-z_][A-Za-z0-9_]*)=', l)
         if m:
             if not re.search(r'[fFp]', m.group(1)): names.add(m.group(2))
             continue
@@ -471,6 +482,27 @@ PY
 grade "G3c: a local shadowing a file-scope global is still REPORTED" \
       "yes" "$(python3 "$TMP/resolve.py" "$TMP/mut4" filescope \
                  | grep -q 'cmd_doctor.sh:.* \$OPENCLAW_PROVIDER_MODEL$' && echo yes || echo no)"
+
+# G3d — BARE DECLARE, and it is the one direction G3a/G3b/G3c cannot see: none
+# of them mutates a file-scope `declare -A NAME` with no assignment. That shape
+# creates NOTHING readable — `set -u; declare -A X; echo ${#X[@]}` exits 1 with
+# `X: unbound variable` — so a resolver that whitelists it silences a live crash
+# instead of teaching the scope rule. src/cmd_loop.sh:354 is the real instance
+# (`declare -A _LOOP_SPEND_LAST 2>/dev/null || true`, populated only at :360).
+mkdir -p "$TMP/mut5" && cp -R "$SRC" "$TMP/mut5/src"
+grade "G3d: the bare file-scope declare still exists in cmd_loop.sh (anchor)" \
+      "1" "$(grep -cE '^declare -A _LOOP_SPEND_LAST\b' "$TMP/mut5/src/cmd_loop.sh")"
+python3 - "$TMP/mut5/src/cmd_doctor.sh" "$ANCHOR" <<'PY'
+import sys
+p, anchor = sys.argv[1], sys.argv[2]
+s = open(p).read()
+assert s.count(anchor + "\n") == 1
+open(p, "w").write(s.replace(anchor + "\n",
+    anchor + "\n  rows=${#_LOOP_SPEND_LAST[@]}\n", 1))
+PY
+grade "G3d: a length read of a file-scope BARE declare is still REPORTED" \
+      "yes" "$(python3 "$TMP/resolve.py" "$TMP/mut5" filescope \
+                 | grep -q 'cmd_doctor.sh:.* \$_LOOP_SPEND_LAST$' && echo yes || echo no)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL" >&2
 # Verdict LAST: a tally printf after this line would silently disarm the whole
