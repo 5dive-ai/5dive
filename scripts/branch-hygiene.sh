@@ -208,8 +208,12 @@ report_stale() {
   while IFS=$'\t' read -r branch sha; do
     [[ -n "$branch" ]] || continue
     [[ -n "${open_head[$branch]:-}" ]] && continue
+    # `|| commit_date=""` for the same reason as the compare arms below: an HTTP
+    # error body arrives on STDOUT with `--jq` unapplied, and `|| true` would
+    # hand that JSON to `date -d`, which fails and kills the whole digest under
+    # `set -e`. Empty is the designed path — the branch prints "age unreadable".
     local commit_date commit_epoch
-    commit_date=$("$GH_BIN" api "repos/$repo/commits/$sha" --jq .commit.committer.date 2>/dev/null || true)
+    commit_date=$("$GH_BIN" api "repos/$repo/commits/$sha" --jq .commit.committer.date 2>/dev/null) || commit_date=""
     if [[ -n "$commit_date" ]]; then
       commit_epoch=$(date -u -d "$commit_date" +%s)
       if (( commit_epoch < oldest )); then oldest="$commit_epoch"; fi
@@ -262,13 +266,22 @@ report_stale() {
   # verdict is sticky, because that direction over-reports and because two
   # branches in one digest must not be graded against different endpoint
   # states.
+  #
+  # READ THE EXIT STATUS, NOT THE OUTPUT (iteration 4). `gh api` writes the HTTP
+  # ERROR BODY to STDOUT and does NOT apply `--jq` to it — measured against the
+  # live API: `--jq .status` on a 404 prints
+  # `{"message":"Not Found",...,"status":"404"}`, rc=1. So `|| true` captures a
+  # JSON blob, never the empty string, and `""` arms below become UNREACHABLE in
+  # production. `|| probe=""` is the fix at both call sites; here it survived by
+  # accident (an error body is also != `identical`), which is exactly why the
+  # class is swept rather than the one site that was caught.
   local cmp_state=ok
   compare_endpoint_readable() {
     [[ "$cmp_state" == ok ]] || return 1
     local probe
     probe=$("$GH_BIN" api \
       "repos/$repo/compare/$(urlencode "$default_branch")...$(urlencode "$default_branch")" \
-      --jq .status 2>/dev/null || true)
+      --jq .status 2>/dev/null) || probe=""
     [[ "$probe" == identical ]] && return 0
     cmp_state=unavailable
     return 1
@@ -291,9 +304,13 @@ report_stale() {
     # Fetched ONCE and reused by arms 1 and 4 -- they ask the same page of closed
     # PRs for opposite halves of it (merged_at set / merged_at null). Both arms
     # attribute only on a POSITIVE read: if this call fails, `closed_prs` is `[]`,
-    # neither arm fires, and the branch falls through toward FINDING.
+    # neither arm fires, and the branch falls through toward FINDING. That
+    # sentence was only true once the rc is read — with `|| true` a failed call
+    # leaves gh's HTTP error BODY here (stdout, `--jq` unapplied), which is
+    # non-empty, so the `[]` fallback never fired and both arms ran their jq
+    # against an error object instead.
     local closed_prs merged_pr
-    closed_prs=$(closed_prs_for "$branch" 2>/dev/null || true)
+    closed_prs=$(closed_prs_for "$branch" 2>/dev/null) || closed_prs=""
     [[ -n "$closed_prs" ]] || closed_prs='[]'
     merged_pr=$(jq -r --arg sha "$sha" '
           [.[] | select(.merged_at != null and .head.sha == $sha)]
@@ -311,10 +328,14 @@ report_stale() {
     # single week. Compare fails on it, which is the signal, not an error — but
     # ONLY once `compare_endpoint_readable` has separated that failure from a
     # compare nobody could read; see the probe above.
+    # `|| cmp_status=""`, NOT `|| true`: on any HTTP failure gh prints the error
+    # body on STDOUT with `--jq` unapplied, so `|| true` leaves JSON here, the
+    # `""` arm never fires, and the probe/tally/footer above are dead code in
+    # production while a stderr-failing mock keeps this file green.
     local cmp_status
     cmp_status=$("$GH_BIN" api \
       "repos/$repo/compare/$(urlencode "$default_branch")...$(urlencode "$branch")" \
-      --jq .status 2>/dev/null || true)
+      --jq .status 2>/dev/null) || cmp_status=""
     case "$cmp_status" in
       identical|behind)
         echo "- \`${branch}\` — LANDED contained-in-\`${default_branch}\` — ${age_note}" >>"$l_out"

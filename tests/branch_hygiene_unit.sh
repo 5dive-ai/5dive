@@ -21,6 +21,14 @@ set -euo pipefail
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 args="$*"
 
+# See the twin in the --report mock below: gh writes an HTTP error BODY to STDOUT
+# with `--jq` unapplied (DIVE-2394 iteration 4, measured against the live API).
+gh_http_error() { # <status> <message>
+  printf '{"message":"%s","documentation_url":"https://docs.github.com/rest","status":"%s"}' "$2" "$1"
+  echo "gh: $2 (HTTP $1)" >&2
+  exit 1
+}
+
 case "$args" in
   "api repos/acme/demo --jq .default_branch")
     echo main
@@ -87,8 +95,7 @@ case "$args" in
   # THE fail-closed arm: the pull ref does not resolve (deleted PR, fork head,
   # network). An absent ref must PRESERVE, never pass for want of a mismatch.
   "api repos/acme/demo/git/ref/pull/22/head --jq .object.sha")
-    echo "gh: Not Found (HTTP 404)" >&2
-    exit 1
+    gh_http_error 404 "Not Found"
     ;;
   "api repos/acme/demo/git/ref/pull/23/head --jq .object.sha")
     echo "unexpected pull-ref lookup for a non-identical head: $args" >&2
@@ -195,6 +202,20 @@ cat >"$RTMP/gh" <<'RMOCK'
 set -uo pipefail
 args="$*"
 
+# EVERY simulated HTTP failure goes through this, and it writes the error body to
+# STDOUT (DIVE-2394 iteration 4). That is what the real tool does: measured against
+# the live API, `gh api repos/5dive-ai/5dive/compare/main...no-such-branch --jq .status`
+# prints {"message":"Not Found",...,"status":"404"} on stdout with `--jq` UNAPPLIED,
+# rc=1. A mock that failed on stderr instead made every `cmd=$(... || true)` capture
+# read EMPTY -- so this file was green over a product in which the whole
+# empty-compare arm below was unreachable. A mock that is wrong about which STREAM
+# an error uses makes every assertion above it vacuous.
+gh_http_error() { # <status> <message>
+  printf '{"message":"%s","documentation_url":"https://docs.github.com/rest","status":"%s"}' "$2" "$1"
+  echo "gh: $2 (HTTP $1)" >&2
+  exit 1
+}
+
 case "$args" in
   "api repos/acme/demo --jq .default_branch")
     echo main
@@ -229,8 +250,7 @@ case "$args" in
     ;;
   *"commits?sha=main&since="*)
     if [[ -n "${MOCK_SUBJECTS_FAIL:-}" ]]; then
-      echo "mock: subject corpus unreadable" >&2
-      exit 1
+      gh_http_error 403 "API rate limit exceeded"
     fi
     case "$args" in
       *'split("\n")[0]'*)
@@ -271,15 +291,13 @@ case "$args" in
     # no-common-ancestor from a compare nobody could read.
     [[ -n "${MOCK_PROBE_LOG:-}" ]] && echo probe >>"$MOCK_PROBE_LOG"
     if [[ -n "${MOCK_COMPARE_FAIL:-}" ]]; then
-      echo "mock: compare rate-limited" >&2
-      exit 1
+      gh_http_error 403 "API rate limit exceeded"
     fi
     echo identical
     ;;
   *"compare/main...contained-branch"*)
     if [[ -n "${MOCK_COMPARE_FAIL:-}" ]]; then
-      echo "mock: compare rate-limited" >&2
-      exit 1
+      gh_http_error 403 "API rate limit exceeded"
     fi
     echo behind
     ;;
@@ -287,17 +305,22 @@ case "$args" in
     # TWO intentional orphans, on purpose: one is not enough to tell "one probe
     # per run" apart from "one probe per orphan branch", and iteration 2 signed
     # the first while shipping the second.
-    echo "mock: no common ancestor with main" >&2
-    exit 1
+    gh_http_error 404 "Not Found"
     ;;
   *"compare/main..."*)
     if [[ -n "${MOCK_COMPARE_FAIL:-}" ]]; then
-      echo "mock: compare rate-limited" >&2
-      exit 1
+      gh_http_error 403 "API rate limit exceeded"
     fi
     echo diverged
     ;;
-  *"-f head=acme:merged-old"*"-f state=closed"*|*"-f state=closed"*"-f head=acme:merged-old"*)
+  # The closed-PR page is the evidence source arms 1 and 4 SHARE, and it was the
+  # one with no failure-direction test of its own (iteration 4).
+  *"-f state=closed"*)
+    if [[ -n "${MOCK_PRS_FAIL:-}" ]]; then
+      gh_http_error 403 "API rate limit exceeded"
+    fi
+    case "$args" in
+  *"-f head=acme:merged-old"*|*"-f state=closed"*"-f head=acme:merged-old"*)
     echo '[{"number":12,"merged_at":"2026-07-01T00:00:00Z","head":{"sha":"MERGED"}}]'
     ;;
   # DIVE-3490 arm-4 fixtures. Every one of these PRs is closed UNMERGED, so arms
@@ -318,8 +341,10 @@ case "$args" in
   *"-f head=acme:salvage/preserved-2026-08-01"*)
     echo '[{"number":34,"merged_at":null,"head":{"sha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}}]'
     ;;
-  *"-f state=closed"*)
+  *)
     echo '[]'
+    ;;
+    esac
     ;;
   "api repos/acme/demo/git/ref/pull/30/head --jq .object.sha")
     echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -333,8 +358,7 @@ case "$args" in
     ;;
   # Fail-closed arm: the ref is gone. Must NOT discharge the finding.
   "api repos/acme/demo/git/ref/pull/32/head --jq .object.sha")
-    echo "gh: Not Found (HTTP 404)" >&2
-    exit 1
+    gh_http_error 404 "Not Found"
     ;;
   # The PR head is an older commit than the branch holds, so arm 4 must decide
   # `none` from the PR list alone and never ask for this ref.
@@ -470,6 +494,20 @@ grep -q '`dive-3330-verify-merge-gate` — LANDED subject-attribution DIVE-3330'
 grep -q '`gh-pages` — \*\*FINDING\*\*' <<<"$cmpfail_output"
 grep -q '8 finding(s), 4 not the only copy (2 of those preserved by pull ref, not landed), 0 orphan, 0 unknown' <<<"$cmpfail_output"
 refute '--report reached the delete path' '^DELETED ' <<<"$cmpfail_output"
+
+# THE FAILURE DIRECTION FOR THE THIRD EVIDENCE SOURCE (iteration 4). Arms 1 and 4 share one
+# read -- the closed-PR page -- and it was the only source left with no unreadable-direction
+# test, which is precisely the shape that hid the defect this iteration fixes. With that page
+# unreadable, both arms must go SILENT (nothing attributed, nothing preserved) and the branches
+# they spoke for must appear as findings, never vanish.
+prsfail_output=$(GH_BIN="$RTMP/gh" GITHUB_REPOSITORY=acme/demo MOCK_PRS_FAIL=1 \
+  "$ROOT/scripts/branch-hygiene.sh" --report)
+
+refute 'arm 1 attributed while the closed-PR page was unreadable' \
+  'LANDED merged-pr' <<<"$prsfail_output"
+refute 'arm 4 preserved a branch while the closed-PR page was unreadable' \
+  'PRESERVED pull-ref-identity' <<<"$prsfail_output"
+grep -q '8 finding(s), 2 not the only copy (0 of those preserved by pull ref, not landed), 2 orphan, 0 unknown' <<<"$prsfail_output"
 
 # And the probe is what discriminates: with compare readable, the intentional orphan is still
 # an orphan and is still NOT a finding. (Guards the probe being wired to a constant `true`.)
