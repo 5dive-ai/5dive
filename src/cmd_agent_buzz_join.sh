@@ -113,6 +113,49 @@ print('' if v is None else v)
 " 2>/dev/null
 }
 
+# Is <channel_id> present in a `channels list --member` payload?
+#
+# WHY NOT A SUBSTRING. This is the assertion that the AGENT is in the room, so
+# it has to be evidence. `[[ "$mine" == *"$cid"* ]]` over raw JSON is evidence
+# only when the id is long and random; a relay that numbers its channels makes
+# `cid=1` match almost any payload — the field name, a timestamp, another id —
+# and the arm silently becomes "the relay answered something". So: parse the
+# payload and match a channel_id FIELD exactly. The substring survives only as a
+# fallback for a payload we cannot parse at all (a schema change, or a
+# non-JSON listing), and then only for an id long enough that it is still
+# evidence. A short id with an unparseable payload is a MISS, not a pass.
+_BUZZ_MIN_SUBSTRING_ID=8
+_buzz_lists_channel_id() { # <cid> ; json on stdin
+  local cid="$1" body verdict
+  [[ -n "$cid" ]] || return 1
+  body=$(cat)
+  verdict=$(python3 -c "
+import json, sys
+want = sys.argv[1]
+try:
+    rows = json.loads(sys.stdin.read())
+except Exception:
+    print('UNPARSEABLE'); sys.exit(0)
+def ids(o):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if k in ('channel_id', 'channelId', 'id') and isinstance(v, (str, int)):
+                yield str(v)
+            else:
+                yield from ids(v)
+    elif isinstance(o, list):
+        for x in o:
+            yield from ids(x)
+print('HIT' if want in set(ids(rows)) else 'MISS')
+" "$cid" <<<"$body" 2>/dev/null) || verdict="UNPARSEABLE"
+  case "$verdict" in
+    HIT)  return 0 ;;
+    MISS) return 1 ;;
+  esac
+  (( ${#cid} >= _BUZZ_MIN_SUBSTRING_ID )) || return 1
+  [[ "$body" == *"$cid"* ]]
+}
+
 # channel_id for <name> in a \`channels list\` payload, or empty.
 _buzz_channel_id() { # <name> ; json on stdin
   python3 -c "
@@ -260,14 +303,19 @@ _buzz_join() {
     # THE ASSERTION. Not "the write was accepted" — the agent must come back as
     # a member of the channel, and so must the customer. This is the exact check
     # whose absence made DIVE-3331 look like a broken relay.
-    local members mine
+    local members mine cust_ok="no" agent_ok="no"
     members=$(_buzz_cli "$user" "$bin" "$relay" "$key" channels members --channel "$cid" 2>/dev/null) || members=""
     mine=$(_buzz_cli "$user" "$bin" "$relay" "$key" channels list --member --format json 2>/dev/null) || mine=""
-    if [[ "$members" == *"$owner_pub"* ]] && [[ "$mine" == *"$cid"* ]]; then
+    # The customer half stays a substring: 64 hex chars is evidence on its own,
+    # and it survives a rename of whatever field carries it. The agent half does
+    # NOT — see _buzz_lists_channel_id.
+    [[ "$members" == *"$owner_pub"* ]] && cust_ok="yes"
+    _buzz_lists_channel_id "$cid" <<<"$mine" && agent_ok="yes"
+    if [[ "$cust_ok" == "yes" && "$agent_ok" == "yes" ]]; then
       ok "channel '$ch' ($cid): agent is a member, customer key added"
       joined=$((joined + 1))
     else
-      warn "channel '$ch' ($cid): write accepted but the read-back does not show $( [[ "$members" == *"$owner_pub"* ]] || echo 'the customer as a member'; [[ "$mine" == *"$cid"* ]] || echo 'the agent in its own member list' )"
+      warn "channel '$ch' ($cid): write accepted but the read-back does not show $( [[ "$cust_ok" == "yes" ]] || echo 'the customer as a member'; [[ "$agent_ok" == "yes" ]] || echo 'the agent in its own member list' )"
       failed=$((failed + 1))
     fi
     IFS=','
