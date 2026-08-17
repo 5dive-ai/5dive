@@ -21,6 +21,14 @@ set -euo pipefail
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 args="$*"
 
+# See the twin in the --report mock below: gh writes an HTTP error BODY to STDOUT
+# with `--jq` unapplied (DIVE-2394 iteration 4, measured against the live API).
+gh_http_error() { # <status> <message>
+  printf '{"message":"%s","documentation_url":"https://docs.github.com/rest","status":"%s"}' "$2" "$1"
+  echo "gh: $2 (HTTP $1)" >&2
+  exit 1
+}
+
 case "$args" in
   "api repos/acme/demo --jq .default_branch")
     echo main
@@ -87,8 +95,7 @@ case "$args" in
   # THE fail-closed arm: the pull ref does not resolve (deleted PR, fork head,
   # network). An absent ref must PRESERVE, never pass for want of a mismatch.
   "api repos/acme/demo/git/ref/pull/22/head --jq .object.sha")
-    echo "gh: Not Found (HTTP 404)" >&2
-    exit 1
+    gh_http_error 404 "Not Found"
     ;;
   "api repos/acme/demo/git/ref/pull/23/head --jq .object.sha")
     echo "unexpected pull-ref lookup for a non-identical head: $args" >&2
@@ -118,7 +125,7 @@ chmod +x "$TMP/gh"
 # string IS present, the `!` inverts it to rc 1 and the harness sails on green.
 # Every negative assertion in this file is load-bearing -- one of them is the
 # whole "not armed under --apply" guarantee -- so they go through a helper that
-# exits. Positive-controlled: inverting any one of them fails the run.
+# exits, and the helper itself is positive-controlled just below.
 refute() {
   local why="$1" pattern="$2"
   if grep -q "$pattern"; then
@@ -126,6 +133,27 @@ refute() {
     exit 1
   fi
 }
+
+# Positive control for the helper itself, because a negative assertion that
+# cannot fail is exactly the defect it exists to close: refute must EXIT on a
+# pattern that IS present. Run in a subshell so this harness survives it.
+if ( echo 'REFUTE-SELF-TEST' | refute 'self-test' 'REFUTE-SELF-TEST' ) 2>/dev/null; then
+  echo "refute() did not fail on a present pattern" >&2
+  exit 1
+fi
+
+# THE MOCK'S OWN POSITIVE CONTROL (DIVE-2394 iteration 4). Nothing below can catch a
+# fixture that is wrong about WHICH STREAM an error arrives on -- a product that reads
+# the rc is correct under either mock, so the harness stays green while every assertion
+# above a stdout-blind capture goes vacuous. That is precisely how iteration 3 shipped a
+# fix that was unreachable in production. So assert the fixture's contract directly,
+# the way refute() self-tests: a simulated HTTP failure must put its BODY on STDOUT,
+# because that is what `gh api --jq` does. Re-measure before changing this:
+#   gh api repos/<owner>/<repo>/compare/main...no-such-branch --jq .status
+#   -> {"message":"Not Found",...,"status":"404"} on stdout, rc=1, --jq UNAPPLIED.
+mock_err=$("$TMP/gh" api "repos/acme/demo/git/ref/pull/22/head" --jq .object.sha 2>/dev/null) \
+  && { echo "mock: a simulated HTTP failure exited 0" >&2; exit 1; }
+grep -q '"status":"404"' <<<"$mock_err"
 
 dry_output=$(GH_BIN="$TMP/gh" GITHUB_REPOSITORY=acme/demo \
   BRANCH_HYGIENE_PRESERVE=merged-preserved \
@@ -187,6 +215,20 @@ cat >"$RTMP/gh" <<'RMOCK'
 set -uo pipefail
 args="$*"
 
+# EVERY simulated HTTP failure goes through this, and it writes the error body to
+# STDOUT (DIVE-2394 iteration 4). That is what the real tool does: measured against
+# the live API, `gh api repos/5dive-ai/5dive/compare/main...no-such-branch --jq .status`
+# prints {"message":"Not Found",...,"status":"404"} on stdout with `--jq` UNAPPLIED,
+# rc=1. A mock that failed on stderr instead made every `cmd=$(... || true)` capture
+# read EMPTY -- so this file was green over a product in which the whole
+# empty-compare arm below was unreachable. A mock that is wrong about which STREAM
+# an error uses makes every assertion above it vacuous.
+gh_http_error() { # <status> <message>
+  printf '{"message":"%s","documentation_url":"https://docs.github.com/rest","status":"%s"}' "$2" "$1"
+  echo "gh: $2 (HTTP $1)" >&2
+  exit 1
+}
+
 case "$args" in
   "api repos/acme/demo --jq .default_branch")
     echo main
@@ -197,6 +239,9 @@ case "$args" in
     exit 98
     ;;
   *"branches?per_page=100"*)
+    if [[ -n "${MOCK_BRANCHES_FAIL:-}" ]]; then
+      gh_http_error 403 "API rate limit exceeded"
+    fi
     printf '%s\n' \
       $'main\tMAIN' \
       $'open-live\tOPEN' \
@@ -205,6 +250,7 @@ case "$args" in
       $'dive-2067-verify-over-closed\tD2067' \
       $'salvage/untracked-test-harnesses-2026-07-26\tSALV' \
       $'status\tSTATUS' \
+      $'gh-pages\tGHPAGES' \
       $'contained-branch\tCONT' \
       $'dive-3491-superseded-ok\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
       $'dive-3492-superseded-moved\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
@@ -212,16 +258,20 @@ case "$args" in
       $'dive-3494-pushed-past\tdddddddddddddddddddddddddddddddddddddddd' \
       $'salvage/preserved-2026-08-01\teeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
     ;;
-  *"pulls?state=open"*"@tsv"*)
-    : # no stale open PRs in this fixture
-    ;;
   *"pulls?state=open"*)
-    echo open-live
+    # ONE open PR, young enough never to be flagged stale (the dates are computed
+    # at run time so this stays true next year). Both the stale-PR section and the
+    # open-head exclusion read this same call now, so an unreadable list is a
+    # single state instead of two half-states.
+    if [[ -n "${MOCK_OPENPRS_FAIL:-}" ]]; then
+      gh_http_error 403 "API rate limit exceeded"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' 77 open-live \
+      "$(date -u -d '-1 day' +%Y-%m-%dT00:00:00Z)" "$(date -u +%Y-%m-%dT00:00:00Z)" 'an open PR'
     ;;
   *"commits?sha=main&since="*)
     if [[ -n "${MOCK_SUBJECTS_FAIL:-}" ]]; then
-      echo "mock: subject corpus unreadable" >&2
-      exit 1
+      gh_http_error 403 "API rate limit exceeded"
     fi
     case "$args" in
       *'split("\n")[0]'*)
@@ -253,19 +303,48 @@ case "$args" in
     esac
     ;;
   "api repos/acme/demo/commits/"*" --jq .commit.committer.date")
+    if [[ -n "${MOCK_DATES_FAIL:-}" ]]; then
+      gh_http_error 403 "API rate limit exceeded"
+    fi
     echo 2026-07-01T00:00:00Z
     ;;
+  *"compare/main...main"*)
+    # Arm 2's availability probe: the question whose answer is known. It must be
+    # answerable exactly when the compare endpoint is readable, and fail with the
+    # rest of the endpoint when it is not -- that is what separates a genuine
+    # no-common-ancestor from a compare nobody could read.
+    [[ -n "${MOCK_PROBE_LOG:-}" ]] && echo probe >>"$MOCK_PROBE_LOG"
+    if [[ -n "${MOCK_COMPARE_FAIL:-}" ]]; then
+      gh_http_error 403 "API rate limit exceeded"
+    fi
+    echo identical
+    ;;
   *"compare/main...contained-branch"*)
+    if [[ -n "${MOCK_COMPARE_FAIL:-}" ]]; then
+      gh_http_error 403 "API rate limit exceeded"
+    fi
     echo behind
     ;;
-  *"compare/main...status"*)
-    echo "mock: no common ancestor between main and status" >&2
-    exit 1
+  *"compare/main...status"*|*"compare/main...gh-pages"*)
+    # TWO intentional orphans, on purpose: one is not enough to tell "one probe
+    # per run" apart from "one probe per orphan branch", and iteration 2 signed
+    # the first while shipping the second.
+    gh_http_error 404 "Not Found"
     ;;
   *"compare/main..."*)
+    if [[ -n "${MOCK_COMPARE_FAIL:-}" ]]; then
+      gh_http_error 403 "API rate limit exceeded"
+    fi
     echo diverged
     ;;
-  *"-f head=acme:merged-old"*"-f state=closed"*|*"-f state=closed"*"-f head=acme:merged-old"*)
+  # The closed-PR page is the evidence source arms 1 and 4 SHARE, and it was the
+  # one with no failure-direction test of its own (iteration 4).
+  *"-f state=closed"*)
+    if [[ -n "${MOCK_PRS_FAIL:-}" ]]; then
+      gh_http_error 403 "API rate limit exceeded"
+    fi
+    case "$args" in
+  *"-f head=acme:merged-old"*|*"-f state=closed"*"-f head=acme:merged-old"*)
     echo '[{"number":12,"merged_at":"2026-07-01T00:00:00Z","head":{"sha":"MERGED"}}]'
     ;;
   # DIVE-3490 arm-4 fixtures. Every one of these PRs is closed UNMERGED, so arms
@@ -286,8 +365,10 @@ case "$args" in
   *"-f head=acme:salvage/preserved-2026-08-01"*)
     echo '[{"number":34,"merged_at":null,"head":{"sha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}}]'
     ;;
-  *"-f state=closed"*)
+  *)
     echo '[]'
+    ;;
+    esac
     ;;
   "api repos/acme/demo/git/ref/pull/30/head --jq .object.sha")
     echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -301,8 +382,7 @@ case "$args" in
     ;;
   # Fail-closed arm: the ref is gone. Must NOT discharge the finding.
   "api repos/acme/demo/git/ref/pull/32/head --jq .object.sha")
-    echo "gh: Not Found (HTTP 404)" >&2
-    exit 1
+    gh_http_error 404 "Not Found"
     ;;
   # The PR head is an older commit than the branch holds, so arm 4 must decide
   # `none` from the PR list alone and never ask for this ref.
@@ -320,8 +400,15 @@ esac
 RMOCK
 chmod +x "$RTMP/gh"
 
+# The report mock owes the same self-test as the delete-path mock above: an error body
+# on STDOUT, `--jq` unapplied, non-zero rc.
+rmock_err=$("$RTMP/gh" api "repos/acme/demo/compare/main...status" --jq .status 2>/dev/null) \
+  && { echo "report mock: a simulated HTTP failure exited 0" >&2; exit 1; }
+grep -q '"status":"404"' <<<"$rmock_err"
+
+: >"$RTMP/probe-ok.log"
 report_output=$(GH_BIN="$RTMP/gh" GITHUB_REPOSITORY=acme/demo DEAD_BRANCH_DAYS=14 \
-  "$ROOT/scripts/branch-hygiene.sh" --report)
+  MOCK_PROBE_LOG="$RTMP/probe-ok.log" "$ROOT/scripts/branch-hygiene.sh" --report)
 
 # The four classifications.
 grep -q 'LANDED merged-pr #12' <<<"$report_output"
@@ -329,7 +416,8 @@ grep -q '`contained-branch` — LANDED contained-in-`main`' <<<"$report_output"
 grep -q '`dive-3330-verify-merge-gate` — LANDED subject-attribution DIVE-3330' <<<"$report_output"
 grep -q '`dive-2067-verify-over-closed` — \*\*FINDING\*\* unattributed (DIVE-2067)' <<<"$report_output"
 grep -q '`salvage/untracked-test-harnesses-2026-07-26` — \*\*FINDING\*\* no-ident' <<<"$report_output"
-grep -q '`status` — ORPHAN no-common-ancestor' <<<"$report_output"
+grep -q '`status` — ORPHAN no-common-ancestor with `main` (by design)' <<<"$report_output"
+grep -q '`gh-pages` — ORPHAN no-common-ancestor with `main` (by design)' <<<"$report_output"
 
 # ARM 4 (DIVE-3490). A closed-UNMERGED PR whose pull ref is byte-identical to the
 # branch head discharges the finding -- and says plainly that the work did not land.
@@ -371,7 +459,13 @@ grep -q 'since last commit (2026-07-01)' <<<"$report_output"
 # DEAD_BRANCH_DAYS was set; the report must say it is not read rather than pretend.
 grep -q 'DEAD_BRANCH_DAYS=14 was set and is NOT read' <<<"$report_output"
 
-grep -q '5 finding(s), 5 not the only copy (2 of those preserved by pull ref, not landed), 1 orphan, 0 unknown' <<<"$report_output"
+grep -q '5 finding(s), 5 not the only copy (2 of those preserved by pull ref, not landed), 2 orphan, 0 unknown' <<<"$report_output"
+
+# THE PROBE'S COST, MEASURED IN BOTH DIRECTIONS (DIVE-2394 iteration 3). Iteration 2 signed
+# "one call per run" and shipped one call per ORPHAN BRANCH: only the `unavailable` verdict is
+# sticky. With compare READABLE the probe is re-asked on every empty compare, so two orphans
+# cost two calls -- and a fixture with one orphan cannot tell those two claims apart.
+[[ $(wc -l <"$RTMP/probe-ok.log") -eq 2 ]]
 
 # The read-only invariant the ops runner greps for (branch-hygiene-report.sh).
 refute 'the report path deleted something' '^DELETED ' <<<"$report_output"
@@ -393,6 +487,101 @@ grep -q 'Arm 3 did not run, and nothing was attributed on its absence' <<<"$fail
 grep -q '`dive-3491-superseded-ok` — PRESERVED pull-ref-identity #30' <<<"$fail_output"
 grep -q '`salvage/preserved-2026-08-01` — PRESERVED pull-ref-identity #34' <<<"$fail_output"
 grep -q '`dive-3493-superseded-gone` — UNKNOWN evidence-unavailable (DIVE-3493)' <<<"$fail_output"
-grep -q '1 finding(s), 4 not the only copy (2 of those preserved by pull ref, not landed), 1 orphan, 5 unknown' <<<"$fail_output"
+grep -q '1 finding(s), 4 not the only copy (2 of those preserved by pull ref, not landed), 2 orphan, 5 unknown' <<<"$fail_output"
+
+# THE SAME FAILURE DIRECTION, OWED PER ARM (DIVE-2394 iteration 2). Arm 2's evidence source is
+# the `compare` endpoint, and `gh api` exits non-zero for a genuine no-common-ancestor 404 and
+# for a rate limit alike. Reading both as ORPHAN filed the branch under "preserved, not stale,
+# do not sweep" -- measured on this fixture before the fix: 2 findings became 0, and
+# `dive-2067-verify-over-closed` (the DIVE-2389 branch that held a live defect fix existing
+# nowhere else) disappeared out of the findings section. A digest reading "0 findings" is an
+# all-clear, and by the page this row compiled, the deletion reflex is formed by the digest.
+: >"$RTMP/probe.log"
+cmpfail_output=$(GH_BIN="$RTMP/gh" GITHUB_REPOSITORY=acme/demo MOCK_COMPARE_FAIL=1 \
+  MOCK_PROBE_LOG="$RTMP/probe.log" "$ROOT/scripts/branch-hygiene.sh" --report)
+
+# STICKY in the `unavailable` direction, and this is the assertion that says so: eleven branches
+# reach arm 2 with an empty compare and the probe is asked ONCE. Paired with the two-call
+# readable-direction assertion above, the pair pins the actual rule -- sticky when unavailable,
+# re-asked while readable -- which neither measures alone. The point is not the call count: a
+# compare recovering mid-run must not hand two branches in the same digest verdicts derived
+# from different endpoint states.
+[[ $(wc -l <"$RTMP/probe.log") -eq 1 ]]
+
+# MORE findings, never fewer: the 5 baseline findings survive and the branches arm 2 can no
+# longer speak for join them, rather than being preserved out of sight.
+grep -q '`dive-2067-verify-over-closed` — \*\*FINDING\*\* unattributed (DIVE-2067)' <<<"$cmpfail_output"
+grep -q '`contained-branch` — \*\*FINDING\*\*' <<<"$cmpfail_output"
+refute 'a branch was attributed by arm 2 while compare was unreadable' 'LANDED contained-in-' <<<"$cmpfail_output"
+
+# An unreadable compare is NEVER reported as an orphan verdict: the two have opposite remedies.
+refute 'an unreadable compare was reported as an orphan' 'ORPHAN' <<<"$cmpfail_output"
+grep -q 'compare` endpoint could not be read this run: arm 2 did not run for 11 branch(es)' <<<"$cmpfail_output"
+
+# Arm 3 still runs and is still trusted -- one unreadable arm does not blind the others.
+grep -q '`dive-3330-verify-merge-gate` — LANDED subject-attribution DIVE-3330' <<<"$cmpfail_output"
+
+grep -q '`gh-pages` — \*\*FINDING\*\*' <<<"$cmpfail_output"
+grep -q '8 finding(s), 4 not the only copy (2 of those preserved by pull ref, not landed), 0 orphan, 0 unknown' <<<"$cmpfail_output"
+refute '--report reached the delete path' '^DELETED ' <<<"$cmpfail_output"
+
+# THE FAILURE DIRECTION FOR THE THIRD EVIDENCE SOURCE (iteration 4). Arms 1 and 4 share one
+# read -- the closed-PR page -- and it was the only source left with no unreadable-direction
+# test, which is precisely the shape that hid the defect this iteration fixes. With that page
+# unreadable, both arms must go SILENT (nothing attributed, nothing preserved) and the branches
+# they spoke for must appear as findings, never vanish.
+prsfail_output=$(GH_BIN="$RTMP/gh" GITHUB_REPOSITORY=acme/demo MOCK_PRS_FAIL=1 \
+  "$ROOT/scripts/branch-hygiene.sh" --report)
+
+refute 'arm 1 attributed while the closed-PR page was unreadable' \
+  'LANDED merged-pr' <<<"$prsfail_output"
+refute 'arm 4 preserved a branch while the closed-PR page was unreadable' \
+  'PRESERVED pull-ref-identity' <<<"$prsfail_output"
+grep -q '8 finding(s), 2 not the only copy (0 of those preserved by pull ref, not landed), 2 orphan, 0 unknown' <<<"$prsfail_output"
+
+# THE FOURTH SOURCE: the per-branch commit date. It feeds no arm, only the age NOTE -- but an
+# error body captured here is fed to `date -d`, which fails and kills the whole digest under
+# `set -e`. Unreadable must degrade to "age unreadable" and the classification must be
+# untouched, because a report that dies is a report nobody reads.
+datesfail_output=$(GH_BIN="$RTMP/gh" GITHUB_REPOSITORY=acme/demo MOCK_DATES_FAIL=1 \
+  "$ROOT/scripts/branch-hygiene.sh" --report)
+
+grep -q 'age unreadable' <<<"$datesfail_output"
+grep -q '5 finding(s), 5 not the only copy (2 of those preserved by pull ref, not landed), 2 orphan, 0 unknown' <<<"$datesfail_output"
+refute 'a JSON error body was printed as an age' 'message.*Not Found\|rate limit' <<<"$datesfail_output"
+
+# THE LISTS THEMSELVES ARE EVIDENCE SOURCES (iteration 4). A `done < <(gh …)` process
+# substitution throws the exit status away, so an unreadable list became an EMPTY list and the
+# digest printed `0 finding(s) … 0 orphan, 0 unknown` and exited 0 -- the all-clear this row
+# exists to prevent, one level above the classifier. Measured before the fix by rate-limiting
+# the branch endpoint against the real script. A count is an all-clear only if the thing
+# counted was READ.
+brfail_output=$(GH_BIN="$RTMP/gh" GITHUB_REPOSITORY=acme/demo MOCK_BRANCHES_FAIL=1 \
+  "$ROOT/scripts/branch-hygiene.sh" --report)
+
+grep -q 'the branch list itself could not be read this run' <<<"$brfail_output"
+grep -q 'The branch list was UNREAD this run' <<<"$brfail_output"
+# Section-scoped, because `- none` is legitimate elsewhere in the digest and a multi-line
+# grep pattern is really two independent patterns.
+brfail_section=$(sed -n '/may be the only copy/,/^#### /p' <<<"$brfail_output")
+refute 'an unread branch list printed the empty-section all-clear' '^- none$' <<<"$brfail_section"
+
+# Same shape, other list: unreadable open PRs must not read as "no stale PRs", and nothing may
+# be excluded from the classifier on a list nobody could read.
+oprfail_output=$(GH_BIN="$RTMP/gh" GITHUB_REPOSITORY=acme/demo MOCK_OPENPRS_FAIL=1 \
+  "$ROOT/scripts/branch-hygiene.sh" --report)
+
+grep -q 'the open-PR list could not be read this run' <<<"$oprfail_output"
+grep -q 'The open-PR list was UNREAD this run' <<<"$oprfail_output"
+oprfail_section=$(sed -n '/Unmerged PRs open/,/^#### /p' <<<"$oprfail_output")
+refute 'an unread open-PR list printed the no-stale-PRs all-clear' '^- none$' <<<"$oprfail_section"
+# Over-report, never preserve: with no exclusion list, the open-PR branch is judged like any
+# other rather than being silently dropped from the section.
+grep -q '`open-live`' <<<"$oprfail_output"
+
+# And the probe is what discriminates: with compare readable, the intentional orphan is still
+# an orphan and is still NOT a finding. (Guards the probe being wired to a constant `true`.)
+grep -q '`status` — ORPHAN' <<<"$report_output"
+refute 'the arm-2 footer appeared in a run where compare was READABLE' 'arm 2 did not run' <<<"$report_output"
 
 echo "branch_hygiene_unit: report-by-evidence PASS"

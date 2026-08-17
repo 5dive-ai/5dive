@@ -22,9 +22,41 @@ from the merged-and-tidy ones. A reader handed "dead branch, 40d" reaches for de
 - **A branch with no common ancestor is ORPHAN, not stale.** This repo's `status` branch is an
   intentional orphan written daily by `5dive proof publish`; an ancestry-based sweep flagged it
   every single week.
-- **The failure direction is signed:** an unreadable or truncated commit-subject corpus makes the
-  digest report MORE findings, never fewer. Nothing is attributed on the *absence* of a reading —
-  a branch whose evidence could not be fetched reads `UNKNOWN evidence-unavailable`.
+- **The failure direction is signed, and it is owed PER ARM:** an unreadable or truncated evidence
+  source makes the digest report MORE findings, never fewer. Nothing is attributed on the *absence*
+  of a reading, and nothing is moved OUT of the findings section on one either. An unreadable
+  commit-subject corpus reads `UNKNOWN evidence-unavailable` and arm 3 is skipped.
+- **An unreadable `compare` is not an orphan.** `gh api` exits non-zero for a genuine
+  no-common-ancestor 404 and for a rate limit, a 5xx or a token-scope refusal alike, so an empty
+  compare status has two causes whose remedies are *opposite*: "by design, ignore this forever" and
+  "re-run, this told you nothing". Reading both as ORPHAN filed the branch under *preserved, not
+  stale, do not sweep* — on the report fixture with compare rate-limited, 2 findings became 0 and
+  the branch holding a live defect fix that existed nowhere else vanished from the findings
+  section, while the digest read as an all-clear. Arm 2 now asks the same endpoint a question whose
+  answer is known (`compare/<default>...<default>` is `identical` whenever it is readable at all),
+  lazily — only on an empty compare, so it costs one call per orphan branch while compare is
+  readable and exactly one for the whole run once it is not, since only the `unavailable` verdict
+  is sticky; when it cannot be read, the branch falls through to arm 3 rather than
+  being preserved out of sight, and a footer names the arm that did not run.
+- **Every capture of a `gh api` result now reads the EXIT STATUS, not the output.** `gh` writes an
+  HTTP error **body** to **stdout** and does not apply `--jq` to it — measured against the live API,
+  a 404 `compare` prints `{"message":"Not Found",...,"status":"404"}` with rc=1. So the familiar
+  `x=$(gh … || true)` captures JSON, never the empty string, and the whole empty-compare arm above
+  was **unreachable in production**; it was green only because the test double failed on *stderr*.
+  Fixed as a class, not as a site: the compare call, its availability probe, the per-branch commit
+  date (whose `date -d` would otherwise be handed JSON and kill the digest under `set -e`), and the
+  closed-PR page shared by arms 1 and 4 (whose documented `[]` fallback could never fire). Both
+  mocks now emit error bodies on stdout as `gh` does, **and assert that they do** — a product that
+  reads the rc is correct under either mock, so nothing else in the harness can catch a fixture
+  that regresses to the wrong stream.
+- **A count is an all-clear only if the thing counted was READ.** `done < <(gh api …)` throws the
+  exit status away, so an unreadable *list* silently became an *empty* list: measured against the
+  real script with the branch endpoint rate-limited, the digest printed `0 finding(s), 0 orphan,
+  0 unknown` and exited 0 — the same all-clear this row exists to prevent, one level above the
+  classifier. Both lists are now fetched with their rc kept, an unread list says so in its own
+  section **and** in the tally, and the open-PR list and the open-head exclusion read one call, so
+  an outage is a single state rather than two half-states. With no exclusion list, an open-PR
+  branch is judged like any other — over-report, never preserve.
 - **`DEAD_BRANCH_DAYS` is no longer read.** Setting it prints a line saying so rather than being
   silently ignored; the weekly workflow no longer sets it. Branch age is still printed per branch,
   as a fact, not as the classifier.

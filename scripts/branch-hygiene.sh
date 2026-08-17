@@ -125,13 +125,30 @@ report_stale() {
   # shellcheck disable=SC2064
   trap "rm -rf -- '$rtmp'" EXIT
 
+  # THE LISTS THEMSELVES ARE EVIDENCE SOURCES, and a `done < <(gh …)` process
+  # substitution HIDES their exit status: an unreadable list silently becomes an
+  # EMPTY list, and every section below then prints "- none" — the all-clear this
+  # whole row exists to prevent, one level above the classifier. Measured
+  # (iteration 4): with the branch endpoint rate-limited, the digest printed
+  # `0 finding(s) … 0 orphan, 0 unknown` and exited 0. Fetch to a file, keep the
+  # rc, and make an unreadable list SAY so instead of reading as nothing-to-do.
+  local open_raw="$rtmp/open-prs" open_state=ok
+  if ! "$GH_BIN" api --paginate "repos/$repo/pulls?state=open&per_page=100" \
+    --jq '.[] | [.number, .head.ref, .created_at, .updated_at, .title] | @tsv' \
+    >"$open_raw" 2>/dev/null; then
+    open_state=unavailable
+    : >"$open_raw"
+  fi
+
   # Open PR heads are excluded from the dead-branch list: a branch with an open
-  # PR is already surfaced by the stale-PR section, so it is not "dead".
+  # PR is already surfaced by the stale-PR section, so it is not "dead". When the
+  # list could not be read, NOTHING is excluded — the branch is then judged on the
+  # evidence arms like any other, which over-reports rather than preserving.
   declare -A open_head=()
   open_head["$default_branch"]=1
-  while IFS= read -r ref; do
+  while IFS=$'\t' read -r _num ref _c _u _t; do
     [[ -n "$ref" ]] && open_head["$ref"]=1
-  done < <("$GH_BIN" api --paginate "repos/$repo/pulls?state=open&per_page=100" --jq '.[].head.ref')
+  done <"$open_raw"
 
   echo "### Branch hygiene digest"
   echo
@@ -144,14 +161,19 @@ report_stale() {
   while IFS=$'\t' read -r num ref created updated title; do
     [[ -n "$num" ]] || continue
     local created_epoch age_days
-    created_epoch=$(date -u -d "$created" +%s)
+    created_epoch=$(date -u -d "$created" +%s 2>/dev/null) || continue
     (( now - created_epoch >= pr_cutoff )) || continue
     age_days=$(( (now - created_epoch) / 86400 ))
     echo "- #${num} \`${ref}\` — ${age_days}d old (updated ${updated%%T*}) — ${title}"
     pr_flagged=$((pr_flagged + 1))
-  done < <("$GH_BIN" api --paginate "repos/$repo/pulls?state=open&per_page=100" \
-    --jq '.[] | [.number, .head.ref, .created_at, .updated_at, .title] | @tsv')
-  (( pr_flagged > 0 )) || echo "- none"
+  done <"$open_raw"
+  if [[ "$open_state" == unavailable ]]; then
+    echo "- **UNKNOWN — the open-PR list could not be read this run.** This section is empty"
+    echo "  because nothing was inspected, not because nothing was found. Re-run before acting"
+    echo "  on it, and note that no branch was excluded from the section below as open-PR either."
+  elif (( pr_flagged == 0 )); then
+    echo "- none"
+  fi
   echo
 
   # BRANCHES ARE CLASSIFIED BY EVIDENCE, NEVER BY AGE (DIVE-2394; measured on
@@ -190,9 +212,13 @@ report_stale() {
   # None of the four -> FINDING. It may be the only copy. Report it; never delete it.
   # Age is still printed, as a fact about the branch. It is not the classifier.
   #
-  # THE FAILURE DIRECTION IS DELIBERATE: a missing or truncated evidence source
-  # makes this section report MORE findings, never fewer. Nothing is ever
-  # attributed on the ABSENCE of a reading.
+  # THE FAILURE DIRECTION IS DELIBERATE, AND IT IS OWED PER ARM: a missing or
+  # truncated evidence source makes this section report MORE findings, never
+  # fewer. Nothing is ever attributed on the ABSENCE of a reading — and nothing
+  # is moved OUT of the findings section on one either, which is the half arm 2
+  # got wrong first (DIVE-2394 iteration 2). Every arm below therefore has a
+  # distinct "could not read this" state, its own counter, and its own footer:
+  # a run that could not see an evidence source must say which one.
   local ident_prefixes="${BRANCH_HYGIENE_IDENT_PREFIXES:-DIVE|OSS|CNCL|INST|MOB|STEER|CX}"
   local max_subject_pages="${BRANCH_HYGIENE_SUBJECT_PAGES:-20}"
 
@@ -200,12 +226,22 @@ report_stale() {
   # The oldest of those bounds the subject corpus below: work lands on the default
   # branch AFTER the branch's last commit, never before it.
   local inv="$rtmp/inventory" oldest="$now"
+  local raw="$rtmp/branches" inv_state=ok
+  if ! "$GH_BIN" api --paginate "repos/$repo/branches?per_page=100" \
+    --jq '.[] | [.name, .commit.sha] | @tsv' >"$raw" 2>/dev/null; then
+    inv_state=unavailable
+    : >"$raw"
+  fi
   : >"$inv"
   while IFS=$'\t' read -r branch sha; do
     [[ -n "$branch" ]] || continue
     [[ -n "${open_head[$branch]:-}" ]] && continue
+    # `|| commit_date=""` for the same reason as the compare arms below: an HTTP
+    # error body arrives on STDOUT with `--jq` unapplied, and `|| true` would
+    # hand that JSON to `date -d`, which fails and kills the whole digest under
+    # `set -e`. Empty is the designed path — the branch prints "age unreadable".
     local commit_date commit_epoch
-    commit_date=$("$GH_BIN" api "repos/$repo/commits/$sha" --jq .commit.committer.date 2>/dev/null || true)
+    commit_date=$("$GH_BIN" api "repos/$repo/commits/$sha" --jq .commit.committer.date 2>/dev/null) || commit_date=""
     if [[ -n "$commit_date" ]]; then
       commit_epoch=$(date -u -d "$commit_date" +%s)
       if (( commit_epoch < oldest )); then oldest="$commit_epoch"; fi
@@ -213,8 +249,7 @@ report_stale() {
       commit_epoch=0
     fi
     printf '%s\t%s\t%s\t%s\n' "$branch" "$sha" "$commit_date" "$commit_epoch" >>"$inv"
-  done < <("$GH_BIN" api --paginate "repos/$repo/branches?per_page=100" \
-    --jq '.[] | [.name, .commit.sha] | @tsv')
+  done <"$raw"
 
   # The subject corpus, fetched ONCE for the whole run and bounded by that date.
   # Paged by hand rather than with --paginate so the cap is visible: a corpus that
@@ -237,8 +272,52 @@ report_stale() {
   done
   if [[ "$subj_state" == ok ]] && (( page > max_subject_pages )); then subj_state=truncated; fi
 
-  # Pass 2 — classify.
-  local br_findings=0 br_landed=0 br_orphan=0 br_unknown=0 br_pullref=0
+  # Arm 2's evidence-availability probe. `gh api` exits non-zero for a 404 (no
+  # common ancestor, which is a FACT about the branch) and for a rate limit, a
+  # 5xx or a token-scope refusal (which is the absence of a reading) alike, so
+  # an empty compare status has two causes whose remedies are OPPOSITE: "by
+  # design, ignore this forever" and "this told you nothing, re-run it". Reading
+  # both as ORPHAN files the branch under "preserved, not stale, do not sweep"
+  # and drops it out of the findings section — measured on the DIVE-2394 report
+  # mock with both compare arms rate-limited: 2 findings became 0, and
+  # `dive-2067-verify-over-closed` (the branch from the DIVE-2389 audit that
+  # held a live defect fix existing nowhere else) landed in the preserved
+  # bucket. A digest reading "0 findings" is an all-clear.
+  #
+  # Discriminate by asking the SAME endpoint a question whose answer is known:
+  # <default>...<default> is `identical` whenever compare is readable at all.
+  # Asked LAZILY, only when a compare comes back empty, so a run with no orphan
+  # branch pays nothing. It is NOT one call per run in general: while compare is
+  # readable the probe is re-asked on every empty compare, so the cost is one
+  # call per orphan branch (today, one — `status`). Only the `unavailable`
+  # verdict is sticky, because that direction over-reports and because two
+  # branches in one digest must not be graded against different endpoint
+  # states.
+  #
+  # READ THE EXIT STATUS, NOT THE OUTPUT (iteration 4). `gh api` writes the HTTP
+  # ERROR BODY to STDOUT and does NOT apply `--jq` to it — measured against the
+  # live API: `--jq .status` on a 404 prints
+  # `{"message":"Not Found",...,"status":"404"}`, rc=1. So `|| true` captures a
+  # JSON blob, never the empty string, and `""` arms below become UNREACHABLE in
+  # production. `|| probe=""` is the fix at both call sites; here it survived by
+  # accident (an error body is also != `identical`), which is exactly why the
+  # class is swept rather than the one site that was caught.
+  local cmp_state=ok
+  compare_endpoint_readable() {
+    [[ "$cmp_state" == ok ]] || return 1
+    local probe
+    probe=$("$GH_BIN" api \
+      "repos/$repo/compare/$(urlencode "$default_branch")...$(urlencode "$default_branch")" \
+      --jq .status 2>/dev/null) || probe=""
+    [[ "$probe" == identical ]] && return 0
+    cmp_state=unavailable
+    return 1
+  }
+
+  # Pass 2 — classify. `cmp_unavail` is a per-run tally, NOT a fifth bucket: the
+  # buckets below must still sum to the branch count, so a branch whose arm-2
+  # read failed is counted where the arms that DID run actually placed it.
+  local br_findings=0 br_landed=0 br_orphan=0 br_unknown=0 br_pullref=0 cmp_unavail=0
   local f_out="$rtmp/findings" l_out="$rtmp/landed" o_out="$rtmp/other"
   : >"$f_out"; : >"$l_out"; : >"$o_out"
 
@@ -252,9 +331,13 @@ report_stale() {
     # Fetched ONCE and reused by arms 1 and 4 -- they ask the same page of closed
     # PRs for opposite halves of it (merged_at set / merged_at null). Both arms
     # attribute only on a POSITIVE read: if this call fails, `closed_prs` is `[]`,
-    # neither arm fires, and the branch falls through toward FINDING.
+    # neither arm fires, and the branch falls through toward FINDING. That
+    # sentence was only true once the rc is read — with `|| true` a failed call
+    # leaves gh's HTTP error BODY here (stdout, `--jq` unapplied), which is
+    # non-empty, so the `[]` fallback never fired and both arms ran their jq
+    # against an error object instead.
     local closed_prs merged_pr
-    closed_prs=$(closed_prs_for "$branch" 2>/dev/null || true)
+    closed_prs=$(closed_prs_for "$branch" 2>/dev/null) || closed_prs=""
     [[ -n "$closed_prs" ]] || closed_prs='[]'
     merged_pr=$(jq -r --arg sha "$sha" '
           [.[] | select(.merged_at != null and .head.sha == $sha)]
@@ -269,11 +352,17 @@ report_stale() {
     # Arm 2, and the orphan detector with it. `status` on this repo is an
     # INTENTIONAL orphan with no common ancestor — the zero-human badge, written
     # daily by `5dive proof publish` — and an ancestry-based sweep flags it every
-    # single week. Compare fails on it, which is the signal, not an error.
+    # single week. Compare fails on it, which is the signal, not an error — but
+    # ONLY once `compare_endpoint_readable` has separated that failure from a
+    # compare nobody could read; see the probe above.
+    # `|| cmp_status=""`, NOT `|| true`: on any HTTP failure gh prints the error
+    # body on STDOUT with `--jq` unapplied, so `|| true` leaves JSON here, the
+    # `""` arm never fires, and the probe/tally/footer above are dead code in
+    # production while a stderr-failing mock keeps this file green.
     local cmp_status
     cmp_status=$("$GH_BIN" api \
       "repos/$repo/compare/$(urlencode "$default_branch")...$(urlencode "$branch")" \
-      --jq .status 2>/dev/null || true)
+      --jq .status 2>/dev/null) || cmp_status=""
     case "$cmp_status" in
       identical|behind)
         echo "- \`${branch}\` — LANDED contained-in-\`${default_branch}\` — ${age_note}" >>"$l_out"
@@ -281,9 +370,21 @@ report_stale() {
         continue
         ;;
       "")
-        echo "- \`${branch}\` — ORPHAN no-common-ancestor with \`${default_branch}\` (by design, or unreadable this run) — preserved, not stale, do not sweep — ${age_note}" >>"$o_out"
-        br_orphan=$((br_orphan + 1))
-        continue
+        # Empty has two causes. Ask the probe which one this is, and never let
+        # them share a detail string: one says "ignore this forever", the other
+        # says "re-run, this run told you nothing".
+        if compare_endpoint_readable; then
+          echo "- \`${branch}\` — ORPHAN no-common-ancestor with \`${default_branch}\` (by design) — preserved, not stale, do not sweep — ${age_note}" >>"$o_out"
+          br_orphan=$((br_orphan + 1))
+          continue
+        fi
+        # Arm 2 did not RUN for this branch, so it says nothing about it — and an
+        # arm that said nothing must not be able to move a branch OUT of the
+        # findings section. Fall through to arm 3 and let the branch be
+        # classified on the arms that did run. `status` then reports as a
+        # no-ident FINDING instead of ORPHAN, which over-reports; that is the
+        # signed direction, and the footer says which arm was missing.
+        cmp_unavail=$((cmp_unavail + 1))
         ;;
     esac
 
@@ -345,7 +446,14 @@ report_stale() {
   done <"$inv"
 
   echo "#### Branches that may be the only copy (evidence, not age)"
-  if (( br_findings > 0 )); then
+  if [[ "$inv_state" == unavailable ]]; then
+    # The one state where "0 findings" would be a LIE rather than an all-clear:
+    # no branch was judged at all. Say it here, where the reader looks, and again
+    # in the tally line below.
+    echo "- **UNKNOWN — the branch list itself could not be read this run.** Nothing was"
+    echo "  inspected, so nothing could be found; this is NOT an all-clear. Re-run before"
+    echo "  acting on this digest."
+  elif (( br_findings > 0 )); then
     cat "$f_out"
     echo
     echo "Rescue BEFORE any deletion. Zero byte cost when the objects are already in the canonical store, and the ref survives branch deletion permanently:"
@@ -371,6 +479,11 @@ report_stale() {
     echo
   fi
 
+  if [[ "$cmp_state" == unavailable ]]; then
+    echo "_The \`compare\` endpoint could not be read this run: arm 2 did not run for ${cmp_unavail} branch(es), and no branch was attributed OR filed as an orphan on its absence. A branch with no common ancestor is indistinguishable from an unreadable compare while this is true, so \`${default_branch}\`-orphans such as an intentional badge branch report as findings here. Re-run before acting on this section._"
+    echo
+  fi
+
   case "$subj_state" in
     truncated)
       echo "_Commit-subject corpus stopped at the ${max_subject_pages}-page cap (since ${since}); an attribution past that point was not seen, so this run over-reports findings rather than under-reporting them._"
@@ -387,7 +500,13 @@ report_stale() {
     echo
   fi
 
-  echo "_Flagged ${pr_flagged} stale PR(s). Branches: ${br_findings} finding(s), ${br_landed} not the only copy (${br_pullref} of those preserved by pull ref, not landed), ${br_orphan} orphan, ${br_unknown} unknown. This is a report only; nothing was deleted, labelled, or closed._"
+  # A count is only an all-clear if the thing being counted was READ. When a list
+  # could not be fetched the tally says UNREAD rather than zero, because "0
+  # finding(s)" is the exact sentence a reader acts on.
+  local unread=""
+  [[ "$inv_state" == unavailable ]] && unread=" **The branch list was UNREAD this run, so these branch counts are not a finding of zero.**"
+  [[ "$open_state" == unavailable ]] && unread="${unread} **The open-PR list was UNREAD this run.**"
+  echo "_Flagged ${pr_flagged} stale PR(s). Branches: ${br_findings} finding(s), ${br_landed} not the only copy (${br_pullref} of those preserved by pull ref, not landed), ${br_orphan} orphan, ${br_unknown} unknown.${unread} This is a report only; nothing was deleted, labelled, or closed._"
 }
 
 if [[ "$mode" == "report" ]]; then
