@@ -1111,35 +1111,49 @@ cmd_doctor() {
     fi
 
     local ms=/etc/claude-code/managed-settings.json
+    # DIVE-3537: human-readable rendering of the ONE canonical set, so the [ok]
+    # line names what it actually asserted instead of a hand-typed pair that can
+    # go stale the next time a channel ships.
+    local ms_want
+    ms_want=$(jq -r '[.[] | "\(.plugin)@\(.marketplace)"] | join(", ")' <<<"$FIVEDIVE_CHANNEL_PLUGINS_JSON" 2>/dev/null) \
+      || ms_want="the 5dive fork channels"
     # DIVE-1843: the DIVE-1816 fix reconciles this allowlist on install.sh rerun
     # only, so boxes provisioned before the dashboard channel shipped stayed
     # broken (dashboard-chat pings silently dropped) until a human reran
     # install.sh per box. These checks are now SELF-HEALING under --fix (and the
     # nightly selfupdate calls the same reconcile), so an existing box repairs
     # itself with no human action. reconcile_managed_settings ensures
-    # channelsEnabled:true + BOTH 5dive fork channels, never clobbering operator
+    # channelsEnabled:true + EVERY 5dive fork channel, never clobbering operator
     # or upstream entries; exit 0=changed, 3=already-current, 1=can't reconcile.
+    #
+    # DIVE-3537: the gate below is managed_settings_channels_ok, which sits next
+    # to that fixer and reads the same FIVEDIVE_CHANNEL_PLUGINS_JSON. It used to
+    # be an inline jq naming telegram+dashboard by hand, and it went stale the
+    # day buzz was added to the fixer — so this check printed [ok] on every box
+    # missing buzz and the self-heal never ran. Do not re-inline the list here.
     if [[ ! -f "$ms" ]]; then
       doctor_add channels managed-settings warn \
         "$ms missing — rerun install.sh, or expect channel-skipped errors" false false
-    elif jq -e '.channelsEnabled == true
-                and (.allowedChannelPlugins | any(.plugin == "telegram" and .marketplace == "5dive-plugins"))
-                and (.allowedChannelPlugins | any(.plugin == "dashboard" and .marketplace == "5dive-plugins"))' \
-              "$ms" >/dev/null 2>&1; then
-      doctor_add channels managed-settings ok "$ms has channelsEnabled + telegram/dashboard@5dive-plugins allowlisted"
+    elif managed_settings_channels_ok "$ms"; then
+      doctor_add channels managed-settings ok \
+        "$ms has channelsEnabled + every 5dive fork channel allowlisted ($ms_want)"
     else
       # Stale/incomplete allowlist: channelsEnabled off, or a 5dive fork channel
-      # (esp. dashboard) unlisted → Claude drops those inbound pings. Name the
-      # specific gap so the report is precise, then auto-heal under --fix.
-      local gap=""
+      # unlisted → Claude drops those inbound pings. Name the specific gap so the
+      # report is precise, then auto-heal under --fix.
+      local gap="" missing=""
       jq -e '.channelsEnabled == true' "$ms" >/dev/null 2>&1 \
         || gap="missing channelsEnabled:true (Claude Code 2.1.150+ requires it; allowlist otherwise inert)"
-      if [[ -z "$gap" ]]; then
-        jq -e '.allowedChannelPlugins | any(.plugin == "dashboard" and .marketplace == "5dive-plugins")' "$ms" >/dev/null 2>&1 \
-          || gap="doesn't list dashboard@5dive-plugins — dashboard-chat pings are dropped"
+      # DIVE-3537: the gap names whichever of FIVEDIVE_CHANNEL_PLUGINS_JSON is
+      # absent, derived — the old version asked about dashboard and telegram by
+      # hand and could not see a missing buzz at all, which is what let this
+      # check pass [ok] on boxes where the buzz channel was installed and deaf.
+      missing=$(managed_settings_channels_missing "$ms") || missing=""
+      if [[ -z "$gap" && -n "$missing" ]]; then
+        gap="doesn't list $missing — inbound pings on those channels are silently dropped"
       fi
       if [[ -z "$gap" ]]; then
-        gap="doesn't list telegram@5dive-plugins — local channel allowlist won't permit the fork"
+        gap="allowlist could not be read as expected — rerun install.sh"
       fi
       if (( DOCTOR_REPAIR )); then
         reconcile_managed_settings "$ms"

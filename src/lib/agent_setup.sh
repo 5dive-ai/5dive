@@ -1893,8 +1893,10 @@ install_channel_for_agent() {
 # shipped self-heals WITHOUT a human rerunning install.sh. This is the exact
 # idempotent merge install.sh performs — extracted so `doctor --fix` and the
 # nightly selfupdate can call it on every existing box. Ensures channelsEnabled
-# =true and that BOTH 5dive fork channels (telegram + dashboard) are present,
-# never clobbering operator additions or the upstream/official entries. On a
+# =true and that EVERY 5dive fork channel in FIVEDIVE_CHANNEL_PLUGINS_JSON is
+# present, never clobbering operator additions or the upstream/official entries.
+# (DIVE-3537: that list used to be typed out here AND again in the doctor check
+# that gates this call. They drifted on buzz. One constant now.) On a
 # team box the org's remote managed-settings override this local file, so the
 # merge is inert there; on a personal/self-hosted box this local file IS the
 # self-approve allowlist that gates inbound channel pings.
@@ -1908,16 +1910,18 @@ reconcile_managed_settings() {
   [[ -f "$msj" ]] || return 1
   command -v jq >/dev/null 2>&1 || return 1
   jq -e . "$msj" >/dev/null 2>&1 || return 1
+  # DIVE-3537: the set comes from FIVEDIVE_CHANNEL_PLUGINS_JSON (header.sh), the
+  # same constant the doctor CHECK asserts. These were two hand-kept literals and
+  # they drifted on buzz; do not re-type the list here.
+  [[ -n "${FIVEDIVE_CHANNEL_PLUGINS_JSON:-}" ]] || return 1
   local tmp
   tmp=$(mktemp) || return 1
-  if jq '
+  if jq --argjson need "$FIVEDIVE_CHANNEL_PLUGINS_JSON" '
         .channelsEnabled = true
       | .allowedChannelPlugins = ((.allowedChannelPlugins // []) as $have
-          | $have + ([{"plugin":"telegram","marketplace":"5dive-plugins"},
-                      {"plugin":"dashboard","marketplace":"5dive-plugins"},
-                      {"plugin":"buzz","marketplace":"5dive-plugins"}]
-              | map(select(. as $need
-                  | ($have | any(.plugin == $need.plugin and .marketplace == $need.marketplace)) | not))))
+          | $have + ($need
+              | map(select(. as $n
+                  | ($have | any(.plugin == $n.plugin and .marketplace == $n.marketplace)) | not))))
       ' "$msj" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
     if jq -e --slurpfile a "$tmp" '. == $a[0]' "$msj" >/dev/null 2>&1; then
       rm -f "$tmp"; return 3          # already current
@@ -1925,4 +1929,45 @@ reconcile_managed_settings() {
     install -m 644 "$tmp" "$msj"; rm -f "$tmp"; return 0
   fi
   rm -f "$tmp"; return 1
+}
+
+# DIVE-3537: the GATE for the fixer above, deliberately living beside it and
+# reading the SAME constant. `doctor --category=channels` used to inline its own
+# jq asserting telegram+dashboard by hand; when buzz was added to the fixer the
+# gate was not touched, so on every box provisioned before buzz the check printed
+# [ok], the fixer was never called, and `agent config <name> set channels=…,buzz`
+# produced an installed, running, deaf channel. A self-heal whose gate cannot
+# fire is the same as no self-heal — and it reports [ok] either way.
+#
+# Returns 0 when the file is fully current (channelsEnabled:true AND every entry
+# of FIVEDIVE_CHANNEL_PLUGINS_JSON present), 1 otherwise — including when the
+# file is missing/unreadable/not JSON or jq is absent, because "cannot prove it
+# is current" must route to the repair path, never to [ok].
+managed_settings_channels_ok() {
+  local msj="${1:-/etc/claude-code/managed-settings.json}"
+  [[ -f "$msj" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  [[ -n "${FIVEDIVE_CHANNEL_PLUGINS_JSON:-}" ]] || return 1
+  jq -e --argjson need "$FIVEDIVE_CHANNEL_PLUGINS_JSON" '
+        .channelsEnabled == true
+    and ((.allowedChannelPlugins // []) as $have
+         | $need | all(. as $n
+             | $have | any(.plugin == $n.plugin and .marketplace == $n.marketplace)))
+    ' "$msj" >/dev/null 2>&1
+}
+
+# The names the gate above is missing, "plugin@marketplace, …" on stdout (empty
+# when none are). Derived from the same constant so a newly shipped channel is
+# named in the doctor line without anyone editing a message string.
+managed_settings_channels_missing() {
+  local msj="${1:-/etc/claude-code/managed-settings.json}"
+  [[ -f "$msj" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  [[ -n "${FIVEDIVE_CHANNEL_PLUGINS_JSON:-}" ]] || return 1
+  jq -r --argjson need "$FIVEDIVE_CHANNEL_PLUGINS_JSON" '
+      (.allowedChannelPlugins // []) as $have
+      | [$need[] | select(. as $n
+          | ($have | any(.plugin == $n.plugin and .marketplace == $n.marketplace)) | not)
+        | "\(.plugin)@\(.marketplace)"] | join(", ")
+    ' "$msj" 2>/dev/null
 }

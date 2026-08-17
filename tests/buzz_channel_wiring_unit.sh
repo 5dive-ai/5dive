@@ -255,11 +255,21 @@ fi
 # --- 6. managed-settings reconcile allowlists buzz --------------------------
 # channelsEnabled gates inbound channel pings on a personal/self-hosted box; a
 # plugin absent from allowedChannelPlugins is installed, running, and ignored.
-if grep -qE '\{"plugin":"buzz","marketplace":"5dive-plugins"\}' "$AS"; then
-  ok_t "reconcile_managed_settings allowlists buzz@5dive-plugins"
+# DIVE-3537: the literal moved OUT of the fixer into one constant in header.sh
+# (the fixer and the doctor gate were two copies of it and drifted). Grade the
+# constant, which is what both now read.
+if grep -qE '\{"plugin":"buzz","marketplace":"5dive-plugins"\}' <<<"${FIVEDIVE_CHANNEL_PLUGINS_JSON:-}"; then
+  ok_t "FIVEDIVE_CHANNEL_PLUGINS_JSON allowlists buzz@5dive-plugins"
 else
-  bad_t "reconcile_managed_settings allowlists buzz@5dive-plugins" \
+  bad_t "FIVEDIVE_CHANNEL_PLUGINS_JSON allowlists buzz@5dive-plugins" \
         "existing boxes would never self-heal to allow the buzz channel"
+fi
+# ...and the fixer must actually READ that constant rather than carrying its own.
+if grep -q 'FIVEDIVE_CHANNEL_PLUGINS_JSON' "$AS"; then
+  ok_t "reconcile_managed_settings reads the shared constant"
+else
+  bad_t "reconcile_managed_settings reads the shared constant" \
+        "a second hand-kept list in $AS is exactly what drifted from the doctor gate"
 fi
 
 # Positive control on the reconcile jq itself: run it over a fixture that has
@@ -459,6 +469,121 @@ STUB
   else
     printf 'SKIP - _buzz_write_config run arms (need python3 + jq)\n'
   fi
+fi
+
+# --- 8. THE SEVENTH SITE: the GATE on the fixer (DIVE-3537) -----------------
+# Site 6 above proves reconcile_managed_settings MERGES buzz. It does not prove
+# the merge ever RUNS: `doctor --category=channels` decides that, and its check
+# was a second hand-typed literal asserting telegram+dashboard only. So on every
+# box provisioned before buzz shipped the check printed
+#   [ok] managed-settings: ... has channelsEnabled + telegram/dashboard@... allowlisted
+# the fixer was never called, and buzz was allowlisted on NO existing box —
+# every `agent config <name> set channels=…,buzz` produced an installed,
+# running, DEAF channel (measured on sure-redwood, 2026-08-17: the plugin's MCP
+# log printed "plugin buzz@5dive-plugins is not on your org's approved channels
+# list" while every 5dive-side surface read green).
+#
+# A self-heal whose gate cannot fire is the same as no self-heal, and it reports
+# [ok] either way. These arms grade the GATE and the FIXER against ONE constant,
+# so the next channel cannot repeat it.
+if command -v jq >/dev/null 2>&1; then
+  # shellcheck source=/dev/null
+  source "$AS" 2>/dev/null
+  MS=$(mktemp)
+
+  # 8a. THE REGRESSION ARM. This fixture is exactly a pre-buzz box: enabled, both
+  # older fork channels present, buzz absent. Before this fix the check read [ok].
+  cat >"$MS" <<'JSON'
+{"channelsEnabled":true,
+ "allowedChannelPlugins":[{"plugin":"telegram","marketplace":"5dive-plugins"},
+                          {"plugin":"dashboard","marketplace":"5dive-plugins"},
+                          {"plugin":"telegram","marketplace":"claude-plugins-official"}]}
+JSON
+  if managed_settings_channels_ok "$MS"; then
+    bad_t "gate REFUSES a pre-buzz allowlist (telegram+dashboard, no buzz)" \
+          "the gate reads [ok] on a box whose buzz channel is deaf — the fixer below it never runs"
+  else
+    ok_t "gate REFUSES a pre-buzz allowlist (telegram+dashboard, no buzz)"
+  fi
+  [[ "$(managed_settings_channels_missing "$MS")" == "buzz@5dive-plugins" ]] \
+    && ok_t "gate NAMES the missing channel (buzz@5dive-plugins)" \
+    || bad_t "gate NAMES the missing channel" "got '$(managed_settings_channels_missing "$MS")'"
+
+  # 8b. GATE AND FIXER AGREE — the property the two literals lost. Whatever the
+  # fixer writes must satisfy the gate; otherwise --fix loops or lies.
+  reconcile_managed_settings "$MS" >/dev/null 2>&1
+  if managed_settings_channels_ok "$MS"; then
+    ok_t "the fixer's own output satisfies the gate (one list, not two)"
+  else
+    bad_t "the fixer's own output satisfies the gate" \
+          "reconcile wrote $(jq -c '.allowedChannelPlugins' "$MS") and the gate still refuses it — the two lists have drifted again"
+  fi
+  [[ -z "$(managed_settings_channels_missing "$MS")" ]] \
+    && ok_t "nothing missing after the fixer ran" \
+    || bad_t "nothing missing after the fixer ran" "still missing: $(managed_settings_channels_missing "$MS")"
+
+  # 8c. NEGATIVE CONTROLS: the gate must not be a rubber stamp. It has to fail on
+  # channelsEnabled:false with a perfect list (the allowlist is inert without it),
+  # and on a complete-but-wrong marketplace.
+  jq '.channelsEnabled = false' "$MS" >"$MS.off" && mv "$MS.off" "$MS"
+  managed_settings_channels_ok "$MS" \
+    && bad_t "NEGATIVE: gate refuses channelsEnabled:false with a full list" \
+             "an allowlist is silently inert without channelsEnabled (CC 2.1.150+)" \
+    || ok_t "NEGATIVE: gate refuses channelsEnabled:false with a full list"
+  cat >"$MS" <<'JSON'
+{"channelsEnabled":true,
+ "allowedChannelPlugins":[{"plugin":"telegram","marketplace":"5dive-plugins"},
+                          {"plugin":"dashboard","marketplace":"5dive-plugins"},
+                          {"plugin":"buzz","marketplace":"claude-plugins-official"}]}
+JSON
+  managed_settings_channels_ok "$MS" \
+    && bad_t "NEGATIVE: gate refuses buzz on the WRONG marketplace" \
+             "buzz@claude-plugins-official is not our fork's plugin" \
+    || ok_t "NEGATIVE: gate refuses buzz on the WRONG marketplace"
+
+  # 8d. And it is not stuck refusing: a fully current file passes untouched.
+  jq '.allowedChannelPlugins[2].marketplace = "5dive-plugins"' "$MS" >"$MS.on" && mv "$MS.on" "$MS"
+  managed_settings_channels_ok "$MS" \
+    && ok_t "POSITIVE CONTROL: gate accepts a fully current file" \
+    || bad_t "POSITIVE CONTROL: gate accepts a fully current file" \
+             "every arm above would pass against a gate that always refuses"
+  rm -f "$MS"
+else
+  printf 'SKIP - managed-settings gate arms (no jq on PATH)\n'
+fi
+
+# 8e. The gate must not re-inline the list. This is the FORM the defect took —
+# a second literal in cmd_doctor.sh — so grep for the shape, not for buzz.
+if grep -nE 'marketplace *== *"5dive-plugins"' "$SRC/cmd_doctor.sh" >/dev/null 2>&1; then
+  bad_t "cmd_doctor.sh does not re-type the allowlist" \
+        "found a hand-written allowlist predicate in cmd_doctor.sh: $(grep -nE 'marketplace *== *"5dive-plugins"' "$SRC/cmd_doctor.sh" | head -2 | tr '\n' ' ') — it must call managed_settings_channels_ok"
+else
+  ok_t "cmd_doctor.sh does not re-type the allowlist (calls the shared gate)"
+fi
+if grep -q 'managed_settings_channels_ok' "$SRC/cmd_doctor.sh"; then
+  ok_t "cmd_doctor.sh calls managed_settings_channels_ok"
+else
+  bad_t "cmd_doctor.sh calls managed_settings_channels_ok" \
+        "the arm above passes trivially if the check was simply deleted"
+fi
+
+# 8f. install.sh is curl-piped and CANNOT source header.sh, so it keeps its own
+# copies: the first-install template and its own reconcile filter. That is two
+# more literals that can drift exactly the way these did — so diff them against
+# the one constant here rather than trusting a comment.
+if command -v jq >/dev/null 2>&1 && [[ -f install.sh ]]; then
+  while read -r want; do
+    p=${want%@*}; m=${want#*@}
+    n=$(grep -cE "\"plugin\": *\"$p\", *\"marketplace\": *\"$m\"|\"plugin\":\"$p\",\"marketplace\":\"$m\"" install.sh)
+    if [[ "${n:-0}" -ge 2 ]]; then
+      ok_t "install.sh lists $want in BOTH its template and its reconcile filter"
+    else
+      bad_t "install.sh lists $want in BOTH its template and its reconcile filter" \
+            "found $n occurrence(s); a fresh box (template) or a rerun (reconcile) would leave that channel deaf"
+    fi
+  done < <(jq -r '.[] | "\(.plugin)@\(.marketplace)"' <<<"$FIVEDIVE_CHANNEL_PLUGINS_JSON")
+else
+  printf 'SKIP - install.sh drift arms (no jq or no install.sh)\n'
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
