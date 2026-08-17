@@ -101,6 +101,7 @@ _task_usage() {
   loops [--stuck] [--escalate-stuck] [--all] [--runs] [--watch[=secs]] [--kill <loopId>]
   merge <id>                                    merge the PR on a row THIS seat graded PASS (DIVE-3474)
   merge-audit [--limit=N] [--json]              closed rows whose named PR never merged
+  merge-unverified [--limit=N] [--since=Nd]     re-derive closes the merge-gate could NOT check
   merge-gate-selftest [--pr=<url>] [--json]     can THIS seat's merge-gate actually query GitHub?
   gate-history <id>                             displaced gates + when they retired
   reclaim <id>|--all [--dry-run]                reclaim node_modules from closed worktrees
@@ -248,6 +249,7 @@ cmd_task() {
     deliver)         cmd_task_deliver "$@" ;;
     merge)           cmd_task_merge "$@" ;;         # DIVE-3474 verifier merges what IT graded
     merge-audit)     cmd_task_merge_audit "$@" ;;   # DIVE-1935 retrospective sweep
+    merge-unverified) cmd_task_merge_unverified "$@" ;;  # DIVE-3526 consume the unverified stamp
     merge-gate-selftest) cmd_task_merge_gate_selftest "$@" ;;  # DIVE-1935 instrument check
     verify)          cmd_task_verify "$@" ;;
     verifier)        cmd_task_verifier "$@" ;;

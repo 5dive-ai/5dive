@@ -383,6 +383,167 @@ cmd_task_merge_audit() {
      --arg n "$limit" --arg rp "$slugs" --arg f "$findings" --arg d "$deliv_n" --arg c "$cited_n" --arg u "$unver" --arg a "$amb" --arg r "$payload"
 }
 
+# `5dive task merge-unverified [--limit=N] [--since=<Nd|Nh>] [--json]` — DIVE-3526.
+#
+# THE STAMP HAD NO CONSUMER. DIVE-1935 taught the mandatory auto-detect gate to say
+# so when its repo scan could not complete: it warns, it writes a
+# `task.merge-gate-unverified` row to the audit log, and it lets the close proceed
+# (fail-open stays — DIVE-1830 refused fail-CLOSED for blast radius and that is
+# still the right refusal). All of that works and is firing: 196 stamped rows in
+# `agent-audit.log` on 2026-08-17, every recent one `reason=partial-repo-scan-7-of-11`.
+# The gap is one layer later — NOTHING EVER READ THEM BACK. DIVE-3300 closed
+# 2026-08-12 with exactly that stamp and nobody re-derived it for five days.
+# A record that is written and never read is a receipt, not a control.
+#
+# WHY `merge-audit` DOES NOT ALREADY COVER THIS, and it is not a limit you can raise.
+# That sweep is TEXT-DRIVEN: it pulls PR references out of a done row's own
+# delivery_ref/result/body and resolves them. The stamped population is precisely the
+# closes where the gate's own scan came up empty, and the auto-detect gate runs ONLY
+# when the row declared no binding at all — so the typical stamped row NAMES NO PR
+# ANYWHERE IN ITS TEXT and yields `merge-audit` exactly zero references to resolve.
+# DIVE-3300 is that shape: its result names a patch file and no pull request.
+# So this sweep is driven by the OTHER key — the ident the gate stamped — and
+# re-derives with the OTHER predicate: the gate's own open-PR-by-ident scan, run now.
+#
+# THE SCAN IS INVERTED ON PURPOSE. The gate asks one ident against every repo. Doing
+# that per stamped ident is repos x idents API calls (11 x 196 = 2156 here) and the
+# sweep would be unrunnable. Every ident asks the same question of the same repo, so
+# each repo's OPEN pull requests are listed ONCE and every ident is matched against
+# the result in memory: 11 calls, whatever the backlog. The MATCH is the gate's,
+# character for character — ident at word boundaries, case-insensitive, against
+# title and headRefName only, never the body (a "follow-up to DIVE-N" mention must
+# not raise a finding, DIVE-1835).
+#
+# AND IT REFUSES TO LAUNDER ITS OWN PARTIAL COVERAGE, which is the whole lesson of the
+# ticket it consumes. A repo whose listing fails is not a repo with no hits, and a
+# `--limit 200` page that comes back FULL may have more behind it. Either one makes a
+# quiet row `unconfirmed`, never `clean`, and the summary reports scanned-k-of-n. An
+# unreadable audit log is a hard failure, not "0 stamps found" — that inference is the
+# DIVE-1935 defect itself, rebuilt in the consumer.
+#
+# Read-only. It reports; it never reopens a row and never touches the gate.
+cmd_task_merge_unverified() {
+  tasks_db_init
+  local limit=500 since="" cutoff=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --limit=*) limit="${1#*=}"
+                 [[ "$limit" =~ ^[1-9][0-9]*$ ]] || fail "$E_VALIDATION" "--limit must be a positive integer" ;;
+      --since=*) since="${1#*=}"
+                 [[ "$since" =~ ^[1-9][0-9]*[dh]$ ]] || fail "$E_VALIDATION" "--since must look like 7d or 48h" ;;
+      --json)    JSON_MODE=1 ;;
+      -h|--help) printf 'usage: 5dive task merge-unverified [--limit=N] [--since=<Nd|Nh>] [--json]\n'; return 0 ;;
+      *)         fail "$E_USAGE" "unknown flag: $1" ;;
+    esac
+    shift
+  done
+  command -v jq >/dev/null 2>&1 || fail "$E_GENERIC" "task merge-unverified needs \`jq\` to read the audit log — install jq."
+  command -v gh >/dev/null 2>&1 || fail "$E_GENERIC" "task merge-unverified needs \`gh\` to re-derive PR state — install gh."
+
+  # The stamps live in the audit log, which is 640 root:claude. A caller who cannot
+  # READ it must not be told the backlog is empty: an unreadable log and a clean
+  # fleet are the same silence, and telling them apart is this verb's job.
+  local logf="${AUDIT_LOG:-/var/log/5dive/agent-audit.log}"
+  [[ -e "$logf" ]] || fail "$E_GENERIC" "task merge-unverified cannot find the audit log ($logf) — the stamps it consumes are written there; nothing was scanned. This is NOT an empty backlog."
+  [[ -r "$logf" ]] || fail "$E_GENERIC" "task merge-unverified cannot READ the audit log ($logf: $(stat -c '%A %U:%G' "$logf" 2>/dev/null || printf 'permissions unknown')) — it is 640 root:claude, so run this from a seat in group \`claude\`. An unreadable log reads exactly like a clean fleet; refusing rather than reporting 0 is the point."
+
+  if [[ -n "$since" ]]; then
+    local _n="${since%[dh]}" _u="${since: -1}"
+    cutoff=$(date -u -d "-${_n} ${_u/d/days}" +%Y-%m-%dT%H:%M:%S 2>/dev/null) || cutoff=""
+    [[ "$_u" == "h" ]] && cutoff=$(date -u -d "-${_n} hours" +%Y-%m-%dT%H:%M:%S 2>/dev/null)
+    [[ -n "$cutoff" ]] || fail "$E_GENERIC" "task merge-unverified could not compute a cutoff from --since=$since (\`date -u -d\` unusable on this host) — re-run without --since rather than reading an unfiltered sweep as a filtered one."
+  fi
+
+  # ident<TAB>ts<TAB>reason<TAB>seat, newest LAST so the dedupe below keeps the newest
+  # stamp per ident (a row re-closed after a reopen stamps twice).
+  local stamps
+  stamps=$(jq -rs --arg cut "$cutoff" '
+      .[] | select(.cmd == "task.merge-gate-unverified")
+      | select($cut == "" or (.ts >= $cut))
+      | [ (.args[0] // ""),
+          (.ts // ""),
+          ((.args[] | select(startswith("reason="))) // "reason=unrecorded"),
+          (.user // "") ] | @tsv
+    ' "$logf" 2>/dev/null | awk -F'\t' '$1 ~ /^DIVE-[0-9]+$/ { r[$1]=$0 } END { for (k in r) print r[k] }' | sort -t$'\t' -k2,2r | head -n "$limit")
+
+  local total_stamps=0
+  [[ -n "$stamps" ]] && total_stamps=$(printf '%s\n' "$stamps" | grep -c .)
+
+  local tok slugs; tok=$(_gate_gh_token); slugs=$(_gate_repo_slugs | paste -sd, -)
+  _gate_gh_reachable "$tok" || fail "$E_GENERIC" "task merge-unverified cannot reach GitHub — $(_gate_tok_why); machine-account rail not permitted on this seat. It would report every stamped close as quiet by asking nothing. Check \`5dive gh whoami\` and \`5dive task merge-gate-selftest\`, then re-run"
+
+  # ── one listing per repo, reused by every ident ──────────────────────────
+  local prs_f; prs_f=$(mktemp "${TMPDIR:-/tmp}/.5dive-mu-prs.XXXXXX")
+  local slug hits repos_total=0 repos_ok=0 unscanned="" capped=""
+  while IFS= read -r slug; do
+    [[ -n "$slug" ]] || continue
+    repos_total=$((repos_total+1))
+    if hits=$(_gate_gh "$tok" 20 pr list --repo "$slug" --state open --limit 200 \
+                --json number,headRefName,title \
+                -q '.[] | [(.number|tostring), (.title // ""), (.headRefName // "")] | @tsv' 2>/dev/null); then
+      repos_ok=$((repos_ok+1))
+      # A FULL page is not a complete answer. Say so rather than sweeping 201.
+      [[ $(printf '%s\n' "$hits" | grep -c .) -ge 200 ]] && capped="${capped:+$capped, }$slug"
+      while IFS= read -r line; do [[ -n "$line" ]] && printf '%s\t%s\n' "$slug" "$line" >>"$prs_f"; done <<<"$hits"
+    else
+      unscanned="${unscanned:+$unscanned, }$slug"
+    fi
+  done < <(_gate_repo_slugs)
+  local full_coverage=0
+  [[ $repos_ok -eq $repos_total && $repos_total -gt 0 && -z "$capped" ]] && full_coverage=1
+
+  local line tident tts treason tseat st verdict detail
+  local findings=0 clean=0 unconf=0 reopened=0 missing=0 json_rows=""
+  while IFS=$'\t' read -r tident tts treason tseat; do
+    [[ -n "$tident" ]] || continue
+    st=$(db "SELECT status FROM tasks WHERE ident='${tident}' LIMIT 1;")
+    detail=""
+    if [[ -z "$st" ]]; then
+      verdict="row-missing"; missing=$((missing+1))
+      detail="no such row in the task store"
+    elif [[ "$st" != "done" ]]; then
+      # The stamp recorded an unverified CLOSE. If the row is not closed now, that
+      # close was undone and there is nothing silent left to surface here.
+      verdict="reopened"; reopened=$((reopened+1)); detail="row is now '$st', not done"
+    else
+      # Neither the slug nor the PR number can contain "DIVE-<n>", so a whole-line
+      # match is the gate's title/headRefName predicate with no extra field surgery.
+      local hit h_slug h_num h_title
+      hit=$(grep -iE "(^|[^A-Za-z0-9])${tident}([^A-Za-z0-9]|$)" "$prs_f" 2>/dev/null | head -1 || true)
+      if [[ -n "$hit" ]]; then
+        IFS=$'\t' read -r h_slug h_num h_title _ <<<"$hit"
+        verdict="OPEN-PR"; findings=$((findings+1))
+        detail="$h_slug #$h_num still OPEN — \"$h_title\""
+      elif (( full_coverage )); then
+        verdict="clean"; clean=$((clean+1)); detail="no open PR names it in $repos_ok/$repos_total repos"
+      else
+        verdict="unconfirmed"; unconf=$((unconf+1))
+        detail="no open PR found, but only $repos_ok/$repos_total repos answered${capped:+ (page full in $capped)} — NOT clean"
+      fi
+    fi
+    json_rows+=$(jq -nc --arg t "$tident" --arg s "$tts" --arg r "${treason#reason=}" --arg u "$tseat" --arg v "$verdict" --arg d "$detail" \
+                   '{ident:$t,stampedAt:$s,reason:$r,seat:$u,verdict:$v,detail:$d}')$'\n'
+    [[ "${JSON_MODE:-0}" == "1" ]] || printf '%-12s %-20s %-11s %s\n' "$tident" "${tts%%+*}" "$verdict" "$detail"
+  done <<<"$stamps"
+  rm -f "$prs_f"
+
+  local payload; payload=$(printf '%s' "$json_rows" | jq -sc '.')
+  if [[ "${JSON_MODE:-0}" != "1" ]]; then
+    (( findings > 0 )) && printf 'note: `OPEN-PR` = this row CLOSED while the merge-gate could not check it, and an open\n      pull request naming the ident exists RIGHT NOW. Triage these: either land the PR,\n      close it as abandoned, or record on the row why the close was correct anyway.\n'
+    (( unconf > 0 )) && printf 'note: `unconfirmed` is NOT a clean row. %s of %s repos answered%s, so "no open PR" is a\n      statement about the repos that answered, never about the ones that did not\n      (DIVE-1935/1955). Re-run from a seat whose token reads them all.\n' "$repos_ok" "$repos_total" "${capped:+, and the 200-PR page was full in $capped}"
+    [[ -n "$unscanned" ]] && warn "repos that did NOT answer: $unscanned"
+  fi
+  ok "merge-unverified: $total_stamps stamped close(s) re-derived across $repos_ok/$repos_total repos — $findings still carry an OPEN PR ($clean clean, $unconf unconfirmed, $reopened reopened, $missing row-missing)" \
+     '{stamps:($n|tonumber), repos:($rp|split(",")), reposScanned:($ro|tonumber), reposTotal:($rt|tonumber), fullCoverage:($fc=="1"), unscanned:($us|split(", ")|map(select(.!=""))), pageCapped:($cp|split(", ")|map(select(.!=""))), findings:($f|tonumber), clean:($c|tonumber), unconfirmed:($u|tonumber), reopened:($re|tonumber), rowMissing:($m|tonumber), rows:($r|fromjson)}' \
+     --arg n "$total_stamps" --arg rp "$slugs" --arg ro "$repos_ok" --arg rt "$repos_total" --arg fc "$full_coverage" \
+     --arg us "$unscanned" --arg cp "$capped" --arg f "$findings" --arg c "$clean" --arg u "$unconf" \
+     --arg re "$reopened" --arg m "$missing" --arg r "$payload"
+  # Exit status is the consumable signal — a stamp with no consumer is what this verb
+  # exists to fix, so `merge-unverified && echo ok` must mean something to cron.
+  (( findings > 0 )) && return 1
+  return 0
+}
+
 # DIVE-477: hand a maker-completed task to its verifier instead of closing it.
 # Stash the original maker (first writer wins, so it survives re-routes) so a
 # verify FAIL can bounce straight back, bump the iteration counter, keep the

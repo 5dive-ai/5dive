@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased — feat(task): `merge-unverified` reads back the closes the merge gate could not check (DIVE-3526)
+
+Since DIVE-1935 the mandatory auto-detect merge gate has said so when its repo scan cannot
+complete: it warns, writes a `task.merge-gate-unverified` row to the audit log, and lets the close
+proceed (fail-open stays — DIVE-1830 refused fail-CLOSED for blast radius, and that is still the
+right refusal). All of that is firing — **196 stamped rows on 2026-08-17, every recent one
+`reason=partial-repo-scan-7-of-11`**. Nothing ever read them back, so DIVE-3300 closed
+2026-08-12 with the stamp and nobody re-derived it for five days. A record that is written and
+never read is a receipt, not a control.
+
+- **`5dive task merge-unverified [--limit=N] [--since=<Nd|Nh>] [--json]`** re-derives every stamped
+  ident's PR state now and surfaces the ones still carrying an OPEN pull request. Read-only: it
+  reports, it never reopens a row and it does not touch the gate.
+- **`merge-audit` could not have covered this, and it is not a limit you can raise.** That sweep is
+  text-driven — it resolves PR references found in a done row's own delivery_ref/result/body. The
+  auto-detect gate runs *only* when the row declared no binding at all, so the typical stamped row
+  names no PR anywhere in its text and yields `merge-audit` exactly zero references. DIVE-3300 is
+  that shape. This sweep is keyed on the stamped **ident** and re-runs the gate's own
+  open-PR-by-ident predicate instead.
+- **The scan is inverted, so the cost is per-repo and not per-ident.** Asking one ident of every
+  repo would be 11 x 196 calls here and the sweep would be unrunnable; each repo's open PRs are
+  listed once and every ident is matched in memory. The match is the gate's, character for
+  character: ident at word boundaries, case-insensitive, title and headRefName only — never the
+  body, so a "follow-up to DIVE-N" mention cannot raise a finding (DIVE-1835).
+- **It refuses to launder its own partial coverage**, which is the lesson of the ticket it consumes.
+  A repo whose listing fails is not a repo with no hits, and a full 200-PR page may have more behind
+  it; either one makes a quiet row `unconfirmed`, never `clean`, and the unanswered repos are named
+  rather than counted. **An unreadable audit log is a hard refusal, not "0 stamps"** — that
+  inference is the DIVE-1935 defect rebuilt in the consumer.
+- **Exit status is the consumable signal** (1 when any stamped close still has an open PR), because
+  a stamp with no consumer is the whole defect.
+
 ## Unreleased — fix(branch-hygiene): the weekly digest classifies branches by EVIDENCE, not age (DIVE-2394)
 
 `--apply` was already safe: it deletes only on a closed PR whose head SHA equals the branch's
