@@ -49,6 +49,52 @@
 # _bug_redact_argv (same sensitive-flag rule as audit_log, src/lib/audit.sh) and
 # _bug_secret_scan, which REFUSES to file text carrying a token-shaped string.
 
+# _bug_spool <title> <body> — DIVE-2792's second defect. `5dive bug --file` files
+# through `5dive gh issue create`, and the failure this verb is most often invoked
+# FROM is a broken/credential-less gh. A bug reporter whose only route out is the
+# route that is down cannot report the bug — and until now the report was simply
+# lost, because the payload existed only as terminal output on a non-interactive
+# agent's stdout.
+#
+# So an unfilable report is WRITTEN DOWN instead of dropped. Deliberately:
+#   * under the CALLER's own $XDG_STATE_HOME (never $STATE_DIR) — the spool must
+#     not need root or a registry, since "everything privileged is down" is the
+#     case it exists for;
+#   * 0700/0600 — the body carries --what/--argv, which are the caller's bytes
+#     and were never destined for anywhere but a repo they chose;
+#   * NEVER auto-sends, now or later. Nothing in the CLI reads this directory
+#     back and files it; the whole posture of this verb is that a human sees the
+#     bytes before they leave the box, and a spool that drains itself would be
+#     that posture's exact inverse.
+# Prints the path on success, nothing on failure — a spool that cannot be written
+# must not itself become a second unexplained error on an already-failing path.
+_bug_spool() {
+  local title="$1" body="$2"
+  local dir="${XDG_STATE_HOME:-$HOME/.local/state}/5dive/bug-spool"
+  mkdir -p "$dir" 2>/dev/null || return 1
+  chmod 700 "$dir" 2>/dev/null || true
+  local f="$dir/$(date -u +%Y%m%dT%H%M%SZ)-$$.md"
+  {
+    printf '# %s\n\n' "$title"
+    printf '%s\n' "$body"
+  } > "$f" 2>/dev/null || return 1
+  chmod 600 "$f" 2>/dev/null || true
+  printf '%s' "$f"
+}
+
+# _bug_unfiled <code> <title> <body> <why> — the one exit used by every path where the
+# report could not go out. Spools, then FAILS with the path and the by-hand route.
+# Still non-zero: `--file` did not file, and a caller that branches on status must
+# not read "spooled" as "filed".
+_bug_unfiled() {
+  local code="$1" title="$2" body="$3" why="$4" spooled=""
+  spooled=$(_bug_spool "$title" "$body") || spooled=""
+  if [[ -n "$spooled" ]]; then
+    fail "$code" "${why} — the report was NOT filed, but it is saved locally at ${spooled}. Nothing will send it for you: paste it at https://github.com/$(gh_org)/5dive/issues/new, or re-run '5dive bug --file' once the gh path works."
+  fi
+  fail "$code" "${why} — and the local spool could not be written either, so the payload printed above is the only copy."
+}
+
 _bug_usage() {
   local _org; _org=$(gh_org)
   cat >&2 <<EOF
@@ -72,6 +118,11 @@ Preview (default): builds the diagnostic payload and prints it. Files nothing.
                   against ${_org}/5dive (via '5dive gh issue create', so it
                   files as 5dive-bot when this account can write). A TTY also
                   gets an interactive y/N; nothing is ever filed by default.
+                  If that route is DOWN (no gh, no credential, GitHub refuses),
+                  the report is saved to
+                  \${XDG_STATE_HOME:-\$HOME/.local/state}/5dive/bug-spool/
+                  and the path is printed. Nothing ever drains that directory
+                  for you — it exists so an unfilable report is not lost.
 
 The payload is a fixed allowlist: version, OS, bash version, install method,
 the verb that failed, its exit code, selfcheck probe name+verdict pairs, and
@@ -316,12 +367,14 @@ cmd_bug() {
     esac
   fi
 
-  command -v gh >/dev/null 2>&1 \
-    || fail "$E_NOT_INSTALLED" "gh is not installed — file the payload printed above by hand at https://github.com/$(gh_org)/5dive/issues/new"
-
   local body title tmpf rc=0 issue_url=""
   body=$(_bug_body_markdown "$payload")
   title="[5dive bug] ${verb:-unknown} exited ${exit_code:-unknown}"
+
+  # Resolved AFTER the body is rendered, so the no-gh path has something to spool.
+  command -v gh >/dev/null 2>&1 \
+    || _bug_unfiled "$E_NOT_INSTALLED" "$title" "$body" "gh is not installed on this box"
+
   tmpf=$(mktemp) || fail "$E_GENERIC" "mktemp failed"
   printf '%s\n' "$body" > "$tmpf"
   # `if var=$(cmd)` (not `var=$(cmd); rc=$?`) — under set -e a failing command
@@ -336,6 +389,6 @@ cmd_bug() {
   if (( rc == 0 )); then
     ok "issue filed: $issue_url" '{filed:true, url:$u}' --arg u "$issue_url"
   else
-    fail "$E_GENERIC" "gh issue create failed (rc=$rc) — the payload printed above is everything this would have sent"
+    _bug_unfiled "$E_GENERIC" "$title" "$body" "gh issue create failed (rc=$rc)"
   fi
 }

@@ -54,6 +54,29 @@ cmd_stop() {
      '{name:$n, action:"stop"}' --arg n "$name"
 }
 
+# Emit the {ok:true, …, lines:[…]} envelope for a BUFFERED read.
+#
+# DIVE-2792 iteration 2. The `lines:[]` half is not a formatting detail: a
+# here-string APPENDS a newline, so `<<<""` is ONE empty line to `jq -R … inputs`,
+# not zero input. A successful read that returned nothing — an agent whose unit
+# has not logged yet, the ordinary case — therefore reports `lines:[""]`, and a
+# consumer counting `lines | length` sees a phantom entry. The pipe this replaced
+# delivered zero bytes and reported `[]`.
+#
+# **Any pipe → capture rewrite changes the empty case**, so it needs its own arm;
+# `tests/dive2792_passthrough_exit_unit.sh` C7/C8 grade both sources here.
+# community/wiki/a-sweep-that-finds-a-second-defect-must-move-the-harness-to-it.md
+_logs_lines_envelope() {   # <name> <source> <captured-text>
+  local n="$1" src="$2" text="$3"
+  if [[ -n "$text" ]]; then
+    jq -Rn --arg n "$n" --arg s "$src" \
+      '{ok:true, data:{name:$n, source:$s, lines:[inputs]}}' <<<"$text"
+  else
+    jq -n --arg n "$n" --arg s "$src" \
+      '{ok:true, data:{name:$n, source:$s, lines:[]}}'
+  fi
+}
+
 # journalctl for the agent's unit, or a tmux scrollback capture with --tmux.
 # --follow streams until the caller hangs up; in the /agents/exec path the
 # shelld timeout caps this, so the dashboard should prefer the WS session for
@@ -86,8 +109,7 @@ cmd_logs() {
     capture=$(sudo -u "agent-${name}" tmux capture-pane -t "agent-${name}" -p -S "-${lines}" 2>/dev/null) \
       || fail "$E_NOT_RUNNING" "tmux session 'agent-${name}' not found (is the agent running?)"
     if (( JSON_MODE )); then
-      jq -Rn --arg n "$name" \
-        '{ok:true, data:{name:$n, source:"tmux", lines:[inputs]}}' <<<"$capture"
+      _logs_lines_envelope "$name" tmux "$capture"
     else
       printf '%s\n' "$capture"
     fi
@@ -97,17 +119,48 @@ cmd_logs() {
   local args=(-u "5dive-agent@${name}.service" --no-pager -n "$lines")
   (( follow )) && args+=(-f)
 
+  # DIVE-2792, the second instance the case-block sweep turned up. `agent logs`
+  # is a PASSTHROUGH over journalctl exactly as `gh` is over gh, and it had both
+  # halves of the defect:
+  #
+  #   text mode  — journalctl was the last statement, so a legitimate non-zero
+  #                (no journal access, unit never existed) left the process with
+  #                that status and NOTHING had called mark_reported. The EXIT
+  #                backstop then overwrote journalctl's own message with "this is
+  #                a bug in the CLI ... its effect is UNKNOWN" — for a READ that
+  #                had already printed its reason.
+  #   JSON mode  — `journalctl | jq` reports JQ's status, so the same failure
+  #                exited 0 with an {ok:true} envelope holding zero lines. The
+  #                opposite lie, and the more expensive one.
+  #
+  # So: capture journalctl's own status through PIPESTATUS, say whose status it
+  # is, and claim the report so the generic banner stays for real CLI defects.
+  local jrc=0
   if (( JSON_MODE )); then
     if (( follow )); then
       # NDJSON stream; no envelope. Each line becomes one JSON object.
       journalctl "${args[@]}" | jq -Rc '{line: .}'
+      jrc=${PIPESTATUS[0]}
     else
-      journalctl "${args[@]}" \
-        | jq -Rn --arg n "$name" '{ok:true, data:{name:$n, source:"journal", lines:[inputs]}}'
+      # Buffered, not piped: the envelope is only correct if the read SUCCEEDED,
+      # so the status has to be known before anything is printed. Piping emitted
+      # {ok:true} first and left no way to take it back.
+      local jout=""
+      jout=$(journalctl "${args[@]}") || jrc=$?
+      (( jrc == 0 )) && _logs_lines_envelope "$name" journal "$jout"
     fi
   else
-    journalctl "${args[@]}"
+    journalctl "${args[@]}" || jrc=$?
   fi
+  (( jrc == 0 )) && return 0
+  mark_reported
+  echo "[5dive agent logs] journalctl exited ${jrc} — that is journalctl's OWN exit status, not a 5dive failure. Its message is above; 5dive resolved the unit and ran the read to completion." >&2
+  if (( JSON_MODE )); then
+    jq -cn --argjson c "$jrc" \
+      --arg m "journalctl exited ${jrc}. This is the wrapped journalctl's own exit status, passed through verbatim — 5dive did not itself fail. Read journalctl's stderr for the reason." \
+      '{ok:false, error:{code:$c, class:"passthrough", message:$m}}' 2>/dev/null || true
+  fi
+  return "$jrc"
 }
 
 # Sender-side group mirror for inter-agent traffic. Posts "@<receiver>\n<body>"
