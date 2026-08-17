@@ -17,6 +17,12 @@
 # (community/wiki/a-negative-arm-that-greps-for-failure-passes-on-any-failure.md).
 set -uo pipefail
 
+# DIVE-2211: name the tree this harness grades. The absence of `2>/dev/null` is
+# deliberate — redirecting the source's stderr would swallow the helper's own
+# stderr line, which IS the payload.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
+  || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUNDLE="$ROOT/5dive"
 PASS=0; FAIL=0
