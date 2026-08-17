@@ -250,6 +250,25 @@ declare -A TYPE_CHANNELS=(
   # the no-channel intent, per the DIVE-2076 note above this map.
   [devin]=0
 )
+# DIVE-3537: the SINGLE source of truth for the 5dive-fork channel plugins that
+# must appear in /etc/claude-code/managed-settings.json .allowedChannelPlugins.
+# Because ANY custom allowlist makes Claude Code ignore its default ledger, a
+# fork channel that is missing here is installed, running and IGNORED — the
+# session silently drops every inbound event for it.
+#
+# Why one constant and not a literal at each site: the doctor CHECK that decides
+# whether to call the fixer and the FIXER itself were two hand-maintained
+# literals, and they drifted the day buzz shipped — the fixer merged buzz, the
+# check asserted only telegram+dashboard, so the check read [ok] on every box
+# that lacked buzz and the fixer never ran. A self-heal whose gate cannot fire is
+# the same as no self-heal, and it reports [ok] either way. Anything that needs
+# this set (reconcile_managed_settings, `doctor --category=channels`) reads THIS
+# variable — never re-type the list.
+#
+# install.sh cannot source this (it is curl-piped and must work before jq is on
+# the box), so it keeps its own two copies — guarded against drift by
+# tests/buzz_channel_wiring_unit.sh, which diffs them against this constant.
+readonly FIVEDIVE_CHANNEL_PLUGINS_JSON='[{"plugin":"telegram","marketplace":"5dive-plugins"},{"plugin":"dashboard","marketplace":"5dive-plugins"},{"plugin":"buzz","marketplace":"5dive-plugins"}]'
 # Auth sentinel per type. Agent users run as agent-<name> (in group `claude`)
 # and cannot read /home/claude/.claude/settings.json (mode 0600), so for
 # claude-family types we check /etc/5dive/connectors/anthropic.env (0640

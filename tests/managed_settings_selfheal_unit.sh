@@ -41,6 +41,17 @@ HELPER="$(sed -n '/^reconcile_managed_settings() {/,/^}/p' src/lib/agent_setup.s
   || bad_t "helper missing" "sed extract empty"
 eval "$HELPER"
 
+# DIVE-3537: the helper no longer carries its own copy of the channel list — it
+# reads FIVEDIVE_CHANNEL_PLUGINS_JSON, the ONE constant the doctor gate also
+# reads (the two used to be separate literals and drifted the day buzz shipped).
+# Extract it the same narrow way, and FAIL if it cannot be found: an unset
+# constant makes reconcile return 1, which would read here as a broken helper.
+CONST="$(grep -m1 '^readonly FIVEDIVE_CHANNEL_PLUGINS_JSON=' src/header.sh)"
+[[ -n "$CONST" ]] \
+  && ok_t "FIVEDIVE_CHANNEL_PLUGINS_JSON present in src/header.sh" \
+  || bad_t "channel-plugin constant missing" "grep found no readonly FIVEDIVE_CHANNEL_PLUGINS_JSON= in src/header.sh"
+eval "$CONST"
+
 # ---- 1. heals the exact claude-leaf stale shape ------------------------------
 # channelsEnabled:false, dashboard@5dive-plugins ABSENT, plus an operator entry
 # and the upstream/official entries that must survive.
@@ -55,6 +66,13 @@ jq -e '.channelsEnabled == true' "$TMP/stale.json" >/dev/null \
   && ok_t "self-heal flips channelsEnabled -> true" || bad_t "channelsEnabled" "$(cat "$TMP/stale.json")"
 jq -e '.allowedChannelPlugins | any(.plugin=="dashboard" and .marketplace=="5dive-plugins")' "$TMP/stale.json" >/dev/null \
   && ok_t "self-heal adds dashboard@5dive-plugins (the dropped-ping fix)" || bad_t "dashboard added" "$(cat "$TMP/stale.json")"
+# DIVE-3537: every entry of the constant, not just the two this harness was
+# written for — that hand-listing is how the gate on this fixer went stale.
+while read -r p m; do
+  jq -e --arg p "$p" --arg m "$m" '.allowedChannelPlugins | any(.plugin==$p and .marketplace==$m)' "$TMP/stale.json" >/dev/null \
+    && ok_t "self-heal adds $p@$m" \
+    || bad_t "self-heal adds $p@$m" "$(cat "$TMP/stale.json")"
+done < <(jq -r '.[] | "\(.plugin) \(.marketplace)"' <<<"$FIVEDIVE_CHANNEL_PLUGINS_JSON")
 jq -e '.allowedChannelPlugins | any(.plugin=="myown" and .marketplace=="acme")' "$TMP/stale.json" >/dev/null \
   && ok_t "self-heal PRESERVES an operator's own channel entry" || bad_t "operator preserved" "$(cat "$TMP/stale.json")"
 jq -e '.allowedChannelPlugins | any(.plugin=="telegram" and .marketplace=="claude-plugins-official")' "$TMP/stale.json" >/dev/null \
