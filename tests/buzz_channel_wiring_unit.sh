@@ -414,6 +414,48 @@ if [[ -f "$BZ" ]]; then
       bad_t "_buzz_write_config writes parseable JSON" "no readable config at $W"
     fi
     rm -rf "$TD"
+
+    # --- the key must never become an ARGV element (ops, DIVE-3509 push gate) --
+    # The first shape passed it as `env KEY=<hex> …`. /proc/<pid>/cmdline is
+    # world-readable (no hidepid on our boxes), so every other agent user could
+    # read a freshly minted private key for the width of the write; environ is
+    # 0400 and would have been fine, argv is not.
+    #
+    # Graded BEHAVIOURALLY, not by grep: shadow `env` with a stub that records
+    # the argv it was handed and then execs the real one, so this asserts what
+    # the process actually receives rather than what the source appears to say.
+    TD=$(mktemp -d)
+    mkdir -p "$TD/bin"
+    cat >"$TD/bin/env" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >>"$ARGV_LOG"
+exec /usr/bin/env "$@"
+STUB
+    chmod +x "$TD/bin/env"
+    SECRET=$(printf 'b%.0s' {1..64})
+    ARGV_LOG="$TD/argv.txt"; : >"$ARGV_LOG"
+    ( export ARGV_LOG PATH="$TD/bin:$PATH"
+      _buzz_write_config "$(id -un)" "$TD/buzz" "https://relay.example.com" \
+        "$SECRET" general 15000 buzz >/dev/null 2>&1 )
+    if [[ -s "$ARGV_LOG" ]]; then
+      ok_t "CONTROL: the argv-recording stub actually fired"
+      if grep -q "$SECRET" "$ARGV_LOG"; then
+        bad_t "the private key never appears in argv" \
+              "the minted key is a command-line argument — readable from /proc/<pid>/cmdline by every user on the box"
+      else
+        ok_t "the private key never appears in argv (it travels on stdin)"
+      fi
+      # And the key really did arrive: a leak-free call that also wrote nothing
+      # would pass the arm above for the wrong reason.
+      [[ "$(jq -r '.private_key' "$TD/buzz/config.json" 2>/dev/null)" == "$SECRET" ]] \
+        && ok_t "POSITIVE CONTROL: the key still reached the config via stdin" \
+        || bad_t "POSITIVE CONTROL: the key still reached the config via stdin" \
+                 "no-leak is trivially true if the write never happened"
+    else
+      bad_t "CONTROL: the argv-recording stub actually fired" \
+            "nothing recorded — the arm below would pass without observing anything"
+    fi
+    rm -rf "$TD"
   else
     printf 'SKIP - _buzz_write_config run arms (need python3 + jq)\n'
   fi

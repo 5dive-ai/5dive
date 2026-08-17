@@ -63,29 +63,45 @@ _buzz_resolve_binary() {
 # harness passes its own name and the sudo hop is skipped. The shape here IS the
 # contract plugins/buzz/server.ts validates — five fields, private_key 64 hex —
 # so a drift on either side is a config the plugin silently refuses to load.
+#
+# THE KEY TRAVELS ON STDIN, NEVER ON ARGV (ops, on the DIVE-3509 push gate). The
+# first shape of this function passed it as `env KEY=<hex> …`, which makes the
+# secret an ARGV ELEMENT of the sudo command — and `/proc/<pid>/cmdline` is
+# world-readable, with no hidepid on our boxes (positive-controlled). Every other
+# agent user on the box could read a freshly minted private key for the width of
+# the write. `/proc/<pid>/environ` is 0400 and would have been fine; argv is not.
+# So: the program goes to `python3 -c` (not secret), the non-secret fields stay in
+# the environment, and the key is piped. Nothing that holds the key is ever a
+# command-line argument, on either side of the sudo hop.
 _buzz_write_config() { # <runas> <state_dir> <relay> <key> <channels-csv> <poll_ms> <buzz_path>
   local runas="$1" state="$2" relay="$3" key="$4" chans="$5" poll="$6" bin="$7"
   local -a pre=()
   [[ "$runas" != "$(id -un)" ]] && pre=(sudo -u "$runas")
-  "${pre[@]}" env STATE="$state" RELAY="$relay" KEY="$key" \
-      CHANS="$chans" POLL="$poll" BIN="$bin" python3 - <<'PY' >&2
-import json, os
-state = os.environ['STATE']
+  local prog='
+import json, os, sys
+key = sys.stdin.read().strip()
+if not key:
+    sys.exit("no private key on stdin")
+state = os.environ["STATE"]
 os.makedirs(state, mode=0o700, exist_ok=True)
-path = os.path.join(state, 'config.json')
+path = os.path.join(state, "config.json")
 cfg = {
-    "relay_url": os.environ['RELAY'],
-    "private_key": os.environ['KEY'],
-    "channels": [c.strip() for c in os.environ['CHANS'].split(',') if c.strip()],
-    "poll_ms": int(os.environ['POLL']),
-    "buzz_path": os.environ['BIN'],
+    "relay_url": os.environ["RELAY"],
+    "private_key": key,
+    "channels": [c.strip() for c in os.environ["CHANS"].split(",") if c.strip()],
+    "poll_ms": int(os.environ["POLL"]),
+    "buzz_path": os.environ["BIN"],
 }
 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-with os.fdopen(fd, 'w') as f:
+with os.fdopen(fd, "w") as f:
     json.dump(cfg, f, indent=2)
 os.chmod(path, 0o600)
 print("    wrote " + path)
-PY
+'
+  # `sudo -u` without a tty and with stdin piped is exactly the shape the rest of
+  # agent_setup.sh uses (bash -s <<EOF), so no new privilege assumption here.
+  printf '%s' "$key" | "${pre[@]}" env STATE="$state" RELAY="$relay" \
+      CHANS="$chans" POLL="$poll" BIN="$bin" python3 -c "$prog" >&2
 }
 
 _buzz_enable() {
