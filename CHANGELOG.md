@@ -34,7 +34,9 @@ from the merged-and-tidy ones. A reader handed "dead branch, 40d" reaches for de
   the branch holding a live defect fix that existed nowhere else vanished from the findings
   section, while the digest read as an all-clear. Arm 2 now asks the same endpoint a question whose
   answer is known (`compare/<default>...<default>` is `identical` whenever it is readable at all),
-  lazily and once per run; when it cannot be read, the branch falls through to arm 3 rather than
+  lazily — only on an empty compare, so it costs one call per orphan branch while compare is
+  readable and exactly one for the whole run once it is not, since only the `unavailable` verdict
+  is sticky; when it cannot be read, the branch falls through to arm 3 rather than
   being preserved out of sight, and a footer names the arm that did not run.
 - **`DEAD_BRANCH_DAYS` is no longer read.** Setting it prints a line saying so rather than being
   silently ignored; the weekly workflow no longer sets it. Branch age is still printed per branch,
