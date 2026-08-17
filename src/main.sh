@@ -543,8 +543,16 @@ main() {
       # admin=false everywhere, and a read has no actor field to attribute). The
       # decision is printed on every call. Credential-bearing → audited; the
       # token is read root-side in _gh_do and never lands in argv.
+      # DIVE-2792: `exit $?`, like every sibling passthrough arm above. Today the
+      # status still reaches the caller without it — this case is main()'s last
+      # statement and `main "$@"` is the script's — so the fix is not a live
+      # bug-fix but the removal of a load-bearing coincidence: the moment anyone
+      # appends a statement after `esac`, gh's exit status (4 = not logged in,
+      # 8 = checks pending, 1 = failing checks) is silently replaced by that
+      # statement's. A wrapper whose exit-code fidelity depends on where it sits
+      # in the file is one refactor away from lying again.
       AUDIT_CMD="gh"; AUDIT_ARGS=("$@")
-      cmd_gh "$@" ;;
+      cmd_gh "$@"; exit $? ;;
     _merge_do)
       # DIVE-3474 arm 1: hidden, privileged. Reachable ONLY via NOPASSWD sudo (the
       # UNCONDITIONAL render_standard_sudoers line — it confers no authority of its
