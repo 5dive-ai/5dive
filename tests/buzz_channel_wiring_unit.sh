@@ -300,5 +300,124 @@ else
   printf 'SKIP - reconcile jq arms (no jq on PATH)\n'
 fi
 
+# --- 7. THE SIXTH SITE: cmd_create actually INSTALLS the plugin (DIVE-3509) --
+# The header above said "adding a channel is FIVE edits". It is six, and the
+# sixth was missing for buzz from the day it shipped: `agent create
+# --channels=buzz` recorded the channel, launched claude with
+# `--channels plugin:buzz@5dive-plugins`, and NEVER FETCHED THE PLUGIN, because
+# cmd_create's per-channel case has no buzz arm. Measured on a fresh box
+# (sure-redwood, 2026-08-17): plugin cache held only dashboard/, no
+# config.json, no `buzz` binary — and the create printed OK.
+#
+# Sites 1-6 above all passed the whole time. That is the point of this arm: five
+# green wiring checks are exactly what a four-fifths-wired channel looks like.
+CC=$SRC/cmd_agent_create.sh
+if grep -qE 'install_channel_for_agent "\$type" buzz "\$name"' "$CC"; then
+  ok_t "cmd_create installs the buzz plugin (the sixth site)"
+else
+  bad_t "cmd_create installs the buzz plugin (the sixth site)" \
+        "no buzz arm in cmd_create's channel case in $CC — --channels=buzz would enable the channel and never fetch the plugin"
+fi
+# Negative control on the grep: the dashboard arm it is modelled on must be
+# found by the same pattern shape, or the assertion above is proving nothing
+# about how this file spells an install.
+grep -qE 'install_channel_for_agent "\$type" dashboard "\$name"' "$CC" \
+  && ok_t "CONTROL: the same pattern shape finds the dashboard arm" \
+  || bad_t "CONTROL: the same pattern shape finds the dashboard arm" \
+           "the pattern in the arm above cannot be trusted — it does not match a site known to exist"
+
+# --- 8. the create self-check has a REAL buzz predicate ---------------------
+# The same create printed `(ok: poller up …)` over a box with no buzz plugin at
+# all, because "poller up" reads the AGENT's systemd unit. A create-time check
+# that greens on the thing an operator would look at is worse than none.
+if grep -q 'buzz is UNCONFIGURED' "$CC"; then
+  ok_t "create self-check reports buzz UNCONFIGURED rather than 'poller up'"
+else
+  bad_t "create self-check reports buzz UNCONFIGURED rather than 'poller up'" \
+        "no buzz predicate in the self-check — a buzz create still self-reports healthy"
+fi
+
+# --- 9. the onboarding command exists and is BUNDLED ------------------------
+# A src/ file that build.sh does not concatenate is dead code that greps green.
+BZ=$SRC/cmd_agent_buzz.sh
+[[ -f "$BZ" ]] \
+  && ok_t "src/cmd_agent_buzz.sh exists" \
+  || bad_t "src/cmd_agent_buzz.sh exists" "the CLI half of buzz onboarding is missing"
+grep -qE '^\s*src/cmd_agent_buzz\.sh \\$' build.sh \
+  && ok_t "build.sh bundles src/cmd_agent_buzz.sh" \
+  || bad_t "build.sh bundles src/cmd_agent_buzz.sh" \
+           "the file is present but never concatenated — \`5dive agent buzz\` would be 'command not found' in the built bundle"
+grep -qE 'cmd_agent_buzz "\$@"' "$SRC/main.sh" \
+  && ok_t "main.sh dispatches \`agent buzz\`" \
+  || bad_t "main.sh dispatches \`agent buzz\`" "the verb is unreachable"
+
+# Behavioural arms on the enable path. No agent user, no network, no root: probe
+# the two refusals that must fire BEFORE anything is minted or written.
+if [[ -f "$BZ" ]]; then
+  # shellcheck source=/dev/null
+  source "$BZ" 2>/dev/null
+  out=$(cmd_agent_buzz enable 2>&1); rc=$?
+  [[ "$rc" != "0" && "$out" == *"usage: 5dive agent buzz enable"* ]] \
+    && ok_t "enable with no agent name refuses with usage" \
+    || bad_t "enable with no agent name refuses with usage" "rc=$rc out=$out"
+  out=$(cmd_agent_buzz frobnicate 2>&1); rc=$?
+  [[ "$rc" != "0" && "$out" == *"unknown buzz verb"* ]] \
+    && ok_t "an unknown buzz verb is refused by name" \
+    || bad_t "an unknown buzz verb is refused by name" "rc=$rc out=$out"
+  # The relay refusal is the load-bearing one: guessing a relay is how you get a
+  # channel that reports success and connects to nothing.
+  grep -q 'no relay chosen' "$BZ" \
+    && ok_t "enable refuses rather than guessing a relay URL" \
+    || bad_t "enable refuses rather than guessing a relay URL" \
+             "a defaulted relay reproduces the exact defect this row fixes"
+  # The key must be minted once, not on every run — a silent rotation reads to a
+  # paired handset as the agent having left the room.
+  grep -q 'rotate' "$BZ" && grep -q 'Reusing the existing buzz identity' "$BZ" \
+    && ok_t "enable reuses an existing identity unless --rotate-key" \
+    || bad_t "enable reuses an existing identity unless --rotate-key" \
+             "a re-run would rotate the key underneath a paired handset"
+  # 0600, owned by the agent: the private key is the agent's alone.
+  grep -q '0o600' "$BZ" \
+    && ok_t "the minted config is written 0600" \
+    || bad_t "the minted config is written 0600" "an agent's private key must not be group/world readable"
+
+  # The writer, RUN — not grepped. It is factored to take a runas user so this
+  # arm needs no agent user, no root and no relay: pass our own name, the sudo
+  # hop is skipped, and the file it produces is graded against the contract in
+  # plugins/buzz/server.ts (five fields; private_key must match /^[0-9a-f]{64}$/
+  # or the plugin refuses to derive a pubkey and the channel is silently dead).
+  if command -v python3 >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    TD=$(mktemp -d)
+    FAKE_KEY=$(printf 'a%.0s' {1..64})
+    _buzz_write_config "$(id -un)" "$TD/buzz" "https://relay.example.com" \
+      "$FAKE_KEY" "general, ops" 9000 /usr/local/bin/buzz >/dev/null 2>&1
+    W="$TD/buzz/config.json"
+    if [[ -f "$W" ]] && jq -e . "$W" >/dev/null 2>&1; then
+      ok_t "_buzz_write_config writes parseable JSON"
+      jq -e '.relay_url == "https://relay.example.com"
+             and (.private_key | test("^[0-9a-fA-F]{64}$"))
+             and .channels == ["general","ops"]
+             and .poll_ms == 9000
+             and .buzz_path == "/usr/local/bin/buzz"' "$W" >/dev/null 2>&1 \
+        && ok_t "the written config matches the plugin's five-field contract" \
+        || bad_t "the written config matches the plugin's five-field contract" "got: $(cat "$W")"
+      # poll_ms must be a NUMBER: server.ts does Number(cfg.poll_ms) on the env
+      # path but reads the file value straight, so a quoted "9000" is a config
+      # the plugin loads and mis-schedules.
+      [[ "$(jq -r '.poll_ms | type' "$W")" == "number" ]] \
+        && ok_t "poll_ms is written as a number, not a string" \
+        || bad_t "poll_ms is written as a number, not a string" "type=$(jq -r '.poll_ms | type' "$W")"
+      [[ "$(stat -c '%a' "$W")" == "600" ]] \
+        && ok_t "the written config is mode 600 on disk" \
+        || bad_t "the written config is mode 600 on disk" "mode=$(stat -c '%a' "$W")"
+    else
+      bad_t "_buzz_write_config writes parseable JSON" "no readable config at $W"
+    fi
+    rm -rf "$TD"
+  else
+    printf 'SKIP - _buzz_write_config run arms (need python3 + jq)\n'
+  fi
+fi
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
