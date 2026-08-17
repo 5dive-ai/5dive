@@ -4195,6 +4195,22 @@ cmd_heartbeat_tick() {
   # here must NEVER abort the wake loop (the heartbeat-never-woke bug class). No-op
   # unless at least one agent is opt-in wake_mode=cold.
   _hb_autosleep_sweep "$now" || _hb_log "[autosleep] pass errored (non-fatal)"
+  # DIVE-3173: fire any restart `self-update` deferred because the agent was
+  # holding an in_progress row. This tick is where the TASK BOUNDARY is observed
+  # — the sweep re-asks the board the question self-update asked and bounces the
+  # moment the answer flips to idle. Runs AFTER the autosleep pass so an agent
+  # that just went to sleep is seen as stopped (nothing to bounce, marker
+  # cleared) instead of being restarted awake. Same isolation contract as every
+  # other sweep: a failure here must NEVER abort the wake loop.
+  _pending_restart_sweep || _hb_log "[pending-restart] pass errored (non-fatal)"
+  # `${...:-0}` on every counter, and it is not defensive noise: ~10 harnesses
+  # drive this tick with only src/cmd_heartbeat.sh sourced, so the counters (which
+  # live with the sweep in src/cmd_selfupdate.sh) are UNSET there — and an unset
+  # read under `set -u` is fatal, which would abort the whole wake loop rather
+  # than skip a log line. Exactly the heartbeat-never-woke bug class this pass is
+  # isolated against, entering through the isolation's own summary.
+  (( ${_PR_FIRED:-0} || ${_PR_DEFERRED:-0} || ${_PR_CLEARED:-0} || ${_PR_FAILED:-0} )) \
+    && _hb_log "[pending-restart] pass done — ${_PR_FIRED:-0} bounced, ${_PR_DEFERRED:-0} still deferred (${_PR_OVERDUE:-0} overdue), ${_PR_CLEARED:-0} cleared, ${_PR_FAILED:-0} failed"
   # DIVE-2102: renew capability rows from the installed sudoers files. Without
   # this the 7d TTL expires every row and the registry converges on permanently
   # empty. Isolated like every other sweep — and note the failure direction is

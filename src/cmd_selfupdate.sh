@@ -238,6 +238,193 @@ _agent_payload_fingerprint() {
 }
 # <<< DIVE-3172 agent payload fingerprint
 
+# >>> DIVE-3173 deferred restart for a busy agent
+#     (tests/self_update_busy_defer_unit.sh extracts this block VERBATIM
+#      between these markers and runs the shipped bytes — keep them.)
+#
+# DIVE-3172 made the nightly restart CONDITIONAL on the payload actually moving,
+# which takes CLI-only nights to zero restarts. This block is the belt for the
+# nights when the payload genuinely moved and a bounce IS required: those are
+# exactly the nights the restart still lands on whoever is mid-task, drops their
+# session, and leaves no record distinguishable from an agent that went quiet
+# (lodar, 2026-08-10: "our nightly updates kills some active agents mid tasks").
+#
+# THE PREDICATE IS THE BOARD, NOT THE PANE. "Busy" here means the agent holds a
+# row in `in_progress` — a fact with a durable record that survives this process
+# exiting, which a pane scrape does not. The pane check is used, but only as a
+# second guard at FIRING time (below), never as the thing we remember.
+#
+# WHY A MARKER FILE AND NOT A CONDITIONAL. Something has to remember the owed
+# restart and fire it AFTER self-update has exited — a conditional can only skip.
+# The marker is that memory, and every later root pass (`heartbeat tick`, the
+# next `self-update`) sweeps it.
+#
+# WHY THE BOUNDARY IS OBSERVED AND NOT HOOKED. A row leaves `in_progress` from
+# ~20 different call sites (`task done/cancel/park/reject/deliver`, the loop
+# engine, the heartbeat reaper, the gate answer path). Hooking them is a promise
+# to hook the one that gets added next, and a deferral that never fires is a
+# WORSE bug than the restart it replaced. So the sweep asks the board the same
+# question self-update asked, on every tick, and fires the moment the answer
+# flips — the boundary is detected rather than intercepted.
+#
+# EVERY UNCERTAIN READING DEFERS. An unreadable board, an unreadable stamp, a
+# non-idle pane: all hold the restart. The failure that costs work is restarting
+# an agent we cannot see; the failure that costs a payload update is bounded by
+# the ceiling below and is LOUD.
+_pending_restart_dir() {
+  printf '%s\n' "${PENDING_RESTART_DIR:-${STATE_DIR:-/var/lib/5dive}/pending-restart}"
+}
+
+# How long a marker may sit unfired before every sweep says so out loud. It does
+# NOT force the restart when it expires — forcing is precisely the bug this row
+# exists to remove, and a row held `in_progress` for a day is an anomaly the
+# heartbeat's own reaper owns. The ceiling exists so "deferred forever" cannot be
+# silent, which is the only part of it we can honestly fix here.
+_PENDING_RESTART_MAX_DEFER_SECS=$((24 * 3600))
+
+# _agent_busy_state <name> -> busy | idle | unknown
+# `unknown` is a THIRD value on purpose and is never folded into `idle`: a board
+# we could not read must take the same branch as a board that said busy.
+_agent_busy_state() {
+  local name="${1:-}" n=""
+  [[ -n "$name" ]] || { printf 'unknown\n'; return 0; }
+  if ! declare -F db >/dev/null 2>&1 || ! declare -F sqlq >/dev/null 2>&1; then
+    printf 'unknown\n'; return 0
+  fi
+  n=$(db "SELECT COUNT(*) FROM tasks WHERE assignee=$(sqlq "$name") AND status='in_progress';" 2>/dev/null) || n=""
+  if [[ "$n" =~ ^[0-9]+$ ]]; then
+    if (( n > 0 )); then printf 'busy\n'; else printf 'idle\n'; fi
+  else
+    printf 'unknown\n'
+  fi
+  return 0
+}
+
+_pending_restart_mark() {
+  local name="${1:-}" reason="${2:-payload changed}" dir
+  [[ -n "$name" ]] || return 1
+  dir="$(_pending_restart_dir)"
+  mkdir -p "$dir" 2>/dev/null || return 1
+  printf 'marked_at=%s\nreason=%s\n' "$(date +%s)" "$reason" > "$dir/$name" 2>/dev/null || return 1
+  chmod 0644 "$dir/$name" 2>/dev/null || true
+  return 0
+}
+
+_pending_restart_clear()  { local n="${1:-}"; [[ -n "$n" ]] && rm -f "$(_pending_restart_dir)/$n" 2>/dev/null; return 0; }
+_pending_restart_reason() { local f; f="$(_pending_restart_dir)/${1:-}"; [[ -f "$f" ]] && sed -n 's/^reason=//p' "$f" 2>/dev/null | head -n1; return 0; }
+
+# Echo the marker's epoch. A marker whose stamp is CORRUPT reads as "marked now",
+# not as 0: with 0 any unit start looks later than the mark, the decision below
+# would read `already-bounced`, and the owed restart would be dropped silently.
+# Treating it as now can only cost one extra deferral cycle.
+_pending_restart_marked_at() {
+  local f v=""
+  f="$(_pending_restart_dir)/${1:-}"
+  [[ -f "$f" ]] || return 1
+  v=$(sed -n 's/^marked_at=\([0-9][0-9]*\)$/\1/p' "$f" 2>/dev/null | head -n1)
+  [[ "$v" =~ ^[0-9]+$ ]] || v=$(date +%s)
+  printf '%s\n' "$v"
+}
+
+# Seconds since the unit last entered `active`, or 0 when unreadable. 0 means
+# "no evidence of a restart", which keeps the marker owed.
+_unit_active_enter_epoch() {
+  local unit="${1:-}" ts=""
+  command -v systemctl >/dev/null 2>&1 || { printf '0\n'; return 0; }
+  ts=$(systemctl show "$unit" --property=ActiveEnterTimestamp --value 2>/dev/null) || ts=""
+  [[ -n "$ts" ]] || { printf '0\n'; return 0; }
+  date -d "$ts" +%s 2>/dev/null || printf '0\n'
+  return 0
+}
+
+# _pending_restart_decide <marked_at> <unit_started_at> <busy> <now> <max_defer>
+#   already-bounced | fire | defer | overdue
+#
+# CLEARED BY OBSERVATION, NOT BY THE FIRING PATH. The marker is satisfied by any
+# restart that happened after it was written — an operator bounce, a crash
+# restart, a plugin `/restart` — because all of them load the new payload. Firing
+# is not the only way the debt gets paid, and a marker that only its own firing
+# path could clear would bounce an agent a second time for a payload it already
+# has.
+_pending_restart_decide() {
+  local marked="${1:-0}" started="${2:-0}" busy="${3:-unknown}" now="${4:-0}" maxd="${5:-0}"
+  [[ "$marked"  =~ ^[0-9]+$ ]] || marked=0
+  [[ "$started" =~ ^[0-9]+$ ]] || started=0
+  [[ "$now"     =~ ^[0-9]+$ ]] || now=0
+  [[ "$maxd"    =~ ^[0-9]+$ ]] || maxd=0
+  if (( marked > 0 && started > marked )); then printf 'already-bounced\n'; return 0; fi
+  if [[ "$busy" == "idle" ]]; then printf 'fire\n'; return 0; fi
+  if (( maxd > 0 && marked > 0 && now - marked >= maxd )); then printf 'overdue\n'; return 0; fi
+  printf 'defer\n'
+  return 0
+}
+
+_pr_log() {
+  if declare -F _hb_log >/dev/null 2>&1; then _hb_log "$*"
+  else printf '%s [pending-restart] %s\n' "$(date -u +%FT%TZ)" "$*" >&2; fi
+}
+
+# The sweep. Root-only by what it does (systemctl restart); best-effort by
+# contract — a failure here must never abort its caller's pass. Counters are
+# globals so the caller can put them in its own summary.
+_PR_FIRED=0; _PR_DEFERRED=0; _PR_OVERDUE=0; _PR_CLEARED=0; _PR_FAILED=0
+_pending_restart_sweep() {
+  local dir f name marked started busy verdict now unit why
+  _PR_FIRED=0; _PR_DEFERRED=0; _PR_OVERDUE=0; _PR_CLEARED=0; _PR_FAILED=0
+  dir="$(_pending_restart_dir)"
+  [[ -d "$dir" ]] || return 0
+  now=$(date +%s)
+  for f in "$dir"/*; do
+    [[ -f "$f" ]] || continue
+    name="${f##*/}"
+    unit="5dive-agent@${name}.service"
+    marked="$(_pending_restart_marked_at "$name")" || continue
+    # A unit that is not running has nothing to bounce — it loads the new payload
+    # on its next start by construction, so the debt is already paid. Without
+    # this an auto-slept agent (DIVE-1858 stops the unit) would hold a marker
+    # forever and every sweep would count it as owed.
+    if command -v systemctl >/dev/null 2>&1 \
+       && ! systemctl is-active --quiet "$unit" 2>/dev/null; then
+      _pending_restart_clear "$name"; _PR_CLEARED=$((_PR_CLEARED + 1)); continue
+    fi
+    started="$(_unit_active_enter_epoch "$unit")"
+    busy="$(_agent_busy_state "$name")"
+    verdict="$(_pending_restart_decide "$marked" "$started" "$busy" "$now" "$_PENDING_RESTART_MAX_DEFER_SECS")"
+    case "$verdict" in
+      already-bounced)
+        _pending_restart_clear "$name"; _PR_CLEARED=$((_PR_CLEARED + 1)) ;;
+      fire)
+        # The board says the row is closed; this asks whether the SESSION is
+        # between turns. Leaving the last task is not the same as being done
+        # talking about it, and a bounce one second into the closing turn is the
+        # same lost work in a smaller window. Any non-idle answer (busy, pane
+        # unreadable, blocked on a prompt) defers to the next sweep — the marker
+        # survives, so nothing is lost by waiting.
+        if declare -F _hb_agent_idle >/dev/null 2>&1 && ! _hb_agent_idle "$name" 0.4; then
+          _PR_DEFERRED=$((_PR_DEFERRED + 1))
+          continue
+        fi
+        # Read the reason BEFORE the clear — the log line is the only place the
+        # deferral's cause survives, and clearing first would print an empty one.
+        why="$(_pending_restart_reason "$name")"
+        if systemctl restart "$unit" 2>/dev/null; then
+          _pending_restart_clear "$name"; _PR_FIRED=$((_PR_FIRED + 1))
+          _pr_log "[$name] task boundary reached — bouncing for the deferred payload update (${why:-payload changed})"
+        else
+          _PR_FAILED=$((_PR_FAILED + 1))
+          _pr_log "[$name] deferred restart failed (marker kept, will retry next sweep)"
+        fi ;;
+      overdue)
+        _PR_OVERDUE=$((_PR_OVERDUE + 1)); _PR_DEFERRED=$((_PR_DEFERRED + 1))
+        _pr_log "[$name] restart owed since $(( (now - marked) / 3600 ))h and the agent is STILL not idle — not forcing it; check whether its row is genuinely in flight" ;;
+      *)
+        _PR_DEFERRED=$((_PR_DEFERRED + 1)) ;;
+    esac
+  done
+  return 0
+}
+# <<< DIVE-3173 deferred restart for a busy agent
+
 cmd_self_update() {
   [[ $# -eq 0 ]] || fail "$E_USAGE" "self-update takes no arguments"
   command -v curl >/dev/null 2>&1 || fail "$E_NOT_FOUND" "curl is required for 5dive self-update"
@@ -250,6 +437,14 @@ cmd_self_update() {
   step "Fetching installer"
   curl -fsSL "https://raw.githubusercontent.com/$(gh_org)/5dive/main/install.sh" -o "$installer" \
     || fail "$E_GENERIC" "failed to fetch installer"
+
+  # DIVE-3173: pay off any restart still owed from a PREVIOUS run before taking
+  # this run's fingerprints. An agent that was busy last night and idle now gets
+  # its bounce here even on a box whose heartbeat tick is off — this pass and the
+  # tick are two callers of one sweep, so the deferral never depends on a single
+  # timer being armed.
+  _pending_restart_sweep || true
+  (( _PR_FIRED )) && step "fired ${_PR_FIRED} restart(s) deferred by an earlier run"
 
   # DIVE-3172: snapshot each running agent's in-memory payload BEFORE the
   # upgrade. It has to be taken here — after the upgrade there is nothing left
@@ -271,8 +466,8 @@ cmd_self_update() {
 
   # Restart only the agents whose payload actually moved. Best-effort per unit —
   # one failed restart shouldn't abort the rest.
-  local -a restarted=() failed=() skipped=()
-  local i after before atype why
+  local -a restarted=() failed=() skipped=() deferred=()
+  local i after before atype why busy
   for i in "${!units[@]}"; do
     name="${names[$i]}"; before="${befores[$i]}"
     after="$(_agent_payload_fingerprint "$(_agent_home "$name")")"
@@ -291,6 +486,23 @@ cmd_self_update() {
     why="payload changed"
     if [[ -n "$before" && -n "$after" && "$before" == "$after" ]]; then
       why="type '${atype:-unknown}' config not derivable — always restarts"
+    fi
+    # DIVE-3173: the payload moved and this agent is holding a row. Remember the
+    # restart instead of taking it — the sweep above fires it at the agent's next
+    # task boundary. `unknown` (board unreadable) defers too: not knowing is not
+    # the same as knowing it is free.
+    busy="$(_agent_busy_state "$name")"
+    if [[ "$busy" != "idle" ]]; then
+      if _pending_restart_mark "$name" "$why"; then
+        step "deferred $name ($why; holds an in_progress row — bounces at its next task boundary)"
+        deferred+=("$name")
+        continue
+      fi
+      # We could not write the marker, so nothing would remember this restart.
+      # Restart now: a bounce is loud and recoverable, an agent silently left on
+      # the old payload is neither. Stated because it is the one path where this
+      # change deliberately keeps the behaviour it exists to remove.
+      warn "could not record a deferred restart for '$name' — restarting now"
     fi
     if systemctl restart "${units[$i]}" 2>/dev/null; then
       step "restarted $name ($why)"
@@ -318,23 +530,28 @@ cmd_self_update() {
     fi
   fi
 
-  local r f s prose
+  local r f s d prose
   r=$(json_array "${restarted[@]}")
   f=$(json_array "${failed[@]}")
   s=$(json_array "${skipped[@]}")
+  d=$(json_array "${deferred[@]}")
   prose="self-update complete — ${#restarted[@]} agent(s) restarted"
   # Say the skip count out loud. "0 agents restarted" alone is emitted both by a
   # CLI-only night (the good case this change exists to produce) and by a box
   # with no agents running at all, and an operator reading the nightly log has to
   # be able to tell those apart.
   (( ${#skipped[@]} )) && prose+=", ${#skipped[@]} skipped (payload unchanged)"
+  # DIVE-3173: a deferral is not a skip and must not read as one — the payload
+  # DID move for these, the bounce is owed, and someone reading the nightly log
+  # has to be able to see that it is outstanding rather than decided against.
+  (( ${#deferred[@]} )) && prose+=", ${#deferred[@]} deferred (busy — bounce at next task boundary)"
   (( ${#failed[@]} )) && prose+=", ${#failed[@]} failed to restart"
   [[ "$listener_refreshed" == "true" ]] && prose+=", team-bot listener refreshed"
-  # `skipped` is ADDITIVE — `restarted`/`failed` keep their exact prior meaning,
-  # so every existing consumer reads the field it always did.
+  # `skipped` and `deferred` are ADDITIVE — `restarted`/`failed` keep their exact
+  # prior meaning, so every existing consumer reads the field it always did.
   ok "$prose" \
-     '{restarted:$r, restarted_count:($r|length), skipped:$s, skipped_count:($s|length), failed:$f, listener_refreshed:$lr}' \
-     --argjson r "$r" --argjson f "$f" --argjson s "$s" --argjson lr "$listener_refreshed"
+     '{restarted:$r, restarted_count:($r|length), skipped:$s, skipped_count:($s|length), deferred:$d, deferred_count:($d|length), failed:$f, listener_refreshed:$lr}' \
+     --argjson r "$r" --argjson f "$f" --argjson s "$s" --argjson d "$d" --argjson lr "$listener_refreshed"
 }
 
 # version_lt A B — true when semver A is strictly older than B (sort -V).
