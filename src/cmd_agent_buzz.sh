@@ -37,13 +37,15 @@ cmd_agent_buzz() {
     enable) shift; _buzz_enable "$@" ;;
     join)   shift; _buzz_join "$@" ;;
     owner)  shift; _buzz_owner "$@" ;;
+    pair)   shift; _buzz_pair "$@" ;;
     status) shift; _buzz_status "$@" ;;
     ""|-h|--help)
       fail "$E_USAGE" "usage: 5dive agent buzz enable <name> [--relay=<https://…>] [--channels=<csv>] [--poll-ms=<n>] [--buzz-path=<path>] [--rotate-key] [--no-join]
        5dive agent buzz join <name> [--channels=<csv>] [--rotate-owner-key]
        5dive agent buzz owner <name> [--envelope]
+       5dive agent buzz pair <name> [--timeout=<secs>]
        5dive agent buzz status <name>" ;;
-    *) fail "$E_USAGE" "unknown buzz verb '$verb' (enable|join|owner|status)" ;;
+    *) fail "$E_USAGE" "unknown buzz verb '$verb' (enable|join|owner|pair|status)" ;;
   esac
 }
 

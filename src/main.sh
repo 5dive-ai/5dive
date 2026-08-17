@@ -89,6 +89,8 @@ Agents:
                                                      # --rotate-key mints a NEW key (the handset must re-pair)
   5dive agent buzz status <name>                     # is buzz actually wired? plugin/config/binary, not
                                                      # the agent unit's liveness. rc 3 = declared, not usable
+  5dive agent buzz pair <name> [--timeout=<secs>]    # DIVE-3551: run the NIP-AB pairing session (QR + SAS);
+                                                     # emits BUZZ-PAIR-* marker lines the dashboard panel parses
   5dive agent config <name> set workdir=<path>       # tmux cwd; "default" clears override
   5dive agent config <name> set auth-profile=<name>  # swap profile; "default" clears override
   5dive agent config <name> set model=<id>           # runtime model (claude/codex/grok/antigravity)
