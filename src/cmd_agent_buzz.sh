@@ -15,27 +15,35 @@
 #   5. choose a relay + join channels              (DIVE-3140 A+C)
 #   6. publish profile + presence for the new key  (DIVE-3507)
 #
-# This command owns 2, 3 and 4, and writes the config that 5 and 6 read. It is
-# deliberately the thing the dashboard's "Connect Buzz" panel calls, so the OSS
-# path and the managed path cannot drift (the body of DIVE-3509 asks for exactly
-# that ordering: CLI first, panel on top).
+# This command owns 2, 3 and 4 directly, and DRIVES 5 and 6 by calling
+# `_buzz_join` (DIVE-3513, src/cmd_agent_buzz_join.sh) once the config is
+# written. It is deliberately the thing the dashboard's "Connect Buzz" panel
+# calls, so the OSS path and the managed path cannot drift (the body of DIVE-3509
+# asks for exactly that ordering: CLI first, panel on top).
 #
-# NOT DONE HERE, and named rather than silently missing: minting the identity is
-# not the same as PUBLISHING it, and neither is joining a channel. Both need the
-# relay to be reachable and the `buzz` binary to exist; `enable` reports them as
-# remaining steps rather than pretending. That is the whole lesson of the bug it
-# fixes — a channel that reports success while connected to nothing.
+# `enable` used to STOP after step 4 and print 5 and 6 as prose. That is five of
+# six wiring sites, which from the customer's side is indistinguishable from a
+# broken relay. It now returns 5-and-6's rc: 0 when the whole chain is wired, 3
+# when it is declared but not usable — the same predicate `status` returns, so a
+# caller (an operator, or the panel) branches on the exit code without parsing
+# prose. `--no-join` keeps the old stop-at-4 behaviour for a box whose relay is
+# not up yet, and says so out loud.
 
-# cmd_agent_buzz <enable|status> <name> [flags]
+# cmd_agent_buzz <enable|join|owner|status> <name> [flags]
+# `join` and `owner` are DIVE-3513 (src/cmd_agent_buzz_join.sh) — steps 5 and 6.
 cmd_agent_buzz() {
   local verb="${1:-}"
   case "$verb" in
     enable) shift; _buzz_enable "$@" ;;
+    join)   shift; _buzz_join "$@" ;;
+    owner)  shift; _buzz_owner "$@" ;;
     status) shift; _buzz_status "$@" ;;
     ""|-h|--help)
-      fail "$E_USAGE" "usage: 5dive agent buzz enable <name> [--relay=<https://…>] [--channels=<csv>] [--poll-ms=<n>] [--buzz-path=<path>] [--rotate-key]
+      fail "$E_USAGE" "usage: 5dive agent buzz enable <name> [--relay=<https://…>] [--channels=<csv>] [--poll-ms=<n>] [--buzz-path=<path>] [--rotate-key] [--no-join]
+       5dive agent buzz join <name> [--channels=<csv>] [--rotate-owner-key]
+       5dive agent buzz owner <name> [--envelope]
        5dive agent buzz status <name>" ;;
-    *) fail "$E_USAGE" "unknown buzz verb '$verb' (enable|status)" ;;
+    *) fail "$E_USAGE" "unknown buzz verb '$verb' (enable|join|owner|status)" ;;
   esac
 }
 
@@ -104,8 +112,37 @@ print("    wrote " + path)
       CHANS="$chans" POLL="$poll" BIN="$bin" python3 -c "$prog" >&2
 }
 
+# The last mile, as its own step so the BRANCH is gradeable without a relay.
+# `enable` used to stop after step 4 and print steps 5 and 6 as prose — five
+# wiring sites out of six, which is exactly what broken looks like from the
+# customer's side (community/wiki/a-channel-is-six-wiring-sites-and-five-green-
+# ones-is-what-broken-looks-like.md). `_buzz_join` is idempotent by construction,
+# so calling it from here is safe on every re-run.
+#
+# It runs in a SUBSHELL on purpose: `join` refuses with `fail`, which exits, and
+# enable has already done four steps whose result the operator needs to hear.
+_buzz_enable_last_mile() { # <name> <resolved_bin> <do_join>
+  local name="$1" resolved_bin="$2" do_join="$3" rc=0
+  if [[ "$do_join" != "true" ]]; then
+    warn "--no-join: channels NOT joined and no profile published. '$name' has an identity and a config and is not yet reachable from a handset. Finish with: sudo 5dive agent buzz join $name"
+    return 0
+  fi
+  if [[ -z "$resolved_bin" ]]; then
+    warn "Last mile SKIPPED — joining a channel IS a relay call and there is no \`buzz\` binary to make it with (DIVE-3512). Install one, then: sudo 5dive agent buzz join $name"
+    return 0
+  fi
+  step "Last mile: joining channel(s), adding the customer's key as a member, publishing profile + presence"
+  ( _buzz_join "$name" ) || rc=$?
+  if ((rc == 0)); then
+    ok "buzz is wired end to end for '$name' — pair a handset with: sudo 5dive agent buzz owner $name --envelope"
+  else
+    warn "buzz enabled for '$name' but the last mile did not fully wire (rc=$rc). A handset will land in a room the agent may not be in. Re-run: sudo 5dive agent buzz join $name"
+  fi
+  return "$rc"
+}
+
 _buzz_enable() {
-  local name="" relay="" chans="" poll_ms="" buzz_path="" rotate="false"
+  local name="" relay="" chans="" poll_ms="" buzz_path="" rotate="false" do_join="true"
   while (($#)); do
     case "$1" in
       --relay=*)      relay="${1#*=}" ;;
@@ -113,6 +150,7 @@ _buzz_enable() {
       --poll-ms=*)    poll_ms="${1#*=}" ;;
       --buzz-path=*)  buzz_path="${1#*=}" ;;
       --rotate-key)   rotate="true" ;;
+      --no-join)      do_join="false" ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *)  [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "unexpected argument: $1" ;;
     esac
@@ -200,13 +238,18 @@ _buzz_enable() {
   fi
 
   ok "buzz enabled for '$name' — identity minted, config written, plugin installed."
-  # Say the remaining steps out loud. The whole defect class here is a surface
-  # that reports success while the last mile is missing.
   if [[ -z "$resolved_bin" ]]; then
     warn "NOT READY: no \`buzz\` binary on this box (looked at the agent's PATH, /usr/local/bin/buzz, /opt/buzz/bin/buzz). The plugin will start and every relay call will fail until one is installed; re-run with --buzz-path=<path> once it is."
   fi
-  warn "Still to do before a handset can talk to '$name': join/create the channel(s) on $relay with this key as a MEMBER, and publish its profile + presence (DIVE-3507). Neither is done by this command."
+
+  # Steps 5 and 6 (DIVE-3513). Whatever it does or refuses to do, it SAYS —
+  # the defect class this arc exists to end is a surface reporting success while
+  # connected to nothing.
+  local last_mile_rc=0
+  _buzz_enable_last_mile "$name" "$resolved_bin" "$do_join" || last_mile_rc=$?
+
   warn "Restart to pick it up: sudo 5dive agent restart $name"
+  return "$last_mile_rc"
 }
 
 # Read-only. Exists so an operator (and the dashboard panel) can ask "is buzz
