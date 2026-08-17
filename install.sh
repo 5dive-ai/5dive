@@ -368,6 +368,120 @@ assert_version_monotonic() {
 }
 # <<< DIVE-2243 monotonicity guard
 
+# >>> DIVE-3554 buzz binary staging (extracted verbatim by tests/install_buzz_binaries_unit.sh)
+# The Connect Buzz panel (DIVE-3551) runs `5dive agent buzz pair`, which shells
+# out to `buzz-pair`; joining a channel shells out to `buzz`. Until this block
+# NOTHING on any box installed either one — the cli-v0.1.x releases on
+# <org>/buzz attach them, but no install/provision/update path downloaded them,
+# so the shipped panel dead-ended at the verb's "no buzz binary" refusal on every
+# box except the one where a human hand-placed the asset. This is that path.
+#
+# WHY HERE. Enumerated the writers of /usr/local/bin/buzz before adding one:
+# there were none. `git grep buzz` on 5dive-api's main is EMPTY (provisioning
+# never mentions it) and this repo's only pre-existing hits were the *claude
+# plugin* named "buzz" and the resolver in cmd_agent_buzz.sh that LOOKS for the
+# binary. refresh_managed_files() is the one layer that already owns
+# /usr/local/bin on a customer box and is reached by all three paths that must
+# be covered: the default install (fresh provision), `--upgrade`, and the
+# customer nightly (5dive-api/scripts/update.sh re-curls install.5dive.com,
+# which lands right back here). Adding a second writer elsewhere would have made
+# two.
+#
+# VERSION-PINNED TO A TAG, NOT "latest". A moving `latest` would hand every box
+# a different binary on any night the buzz repo publishes, with no review and no
+# way to say which build a box is running. Bump BUZZ_CLI_TAG and
+# BUZZ_SUMS_SHA256 together, in one commit, as a deliberate act.
+#
+# TWO-LEVEL INTEGRITY, and the second level is the load-bearing one. The release
+# ships SHA256SUMS next to the binaries, so verifying a binary against it catches
+# a corrupt download or a mangling mirror. It does NOT catch a swapped release
+# asset: a GitHub release asset is MUTABLE even on an immutable tag — someone
+# with write access can delete `buzz` and upload different bytes under the same
+# tag, and re-upload a matching SHA256SUMS with it, and every box would verify
+# green against the attacker's own manifest. So the manifest itself is pinned to
+# a constant in this file, which a release-side swap cannot reach. Verifying
+# against a manifest you downloaded from the same place as the payload is not a
+# check; it is a spell.
+BUZZ_CLI_TAG="${BUZZ_CLI_TAG:-cli-v0.1.1}"
+BUZZ_SUMS_SHA256="${BUZZ_SUMS_SHA256:-88bf8c798c42b78a094a77b1ab45b8759dc7c09908144377e9bed1e33bdbe47d}"
+
+# Install/refresh `buzz` and `buzz-pair` into $BIN_DIR from the pinned release.
+#
+# FAILS SOFT BY DESIGN, and the asymmetry is deliberate: it never installs bytes
+# it could not verify (a mismatch refuses and leaves the existing binary exactly
+# where it was), but it never aborts the run either. This function is on the
+# nightly path of every customer box; making the 5dive CLI update depend on
+# github.com/<org>/buzz/releases being reachable would let an outage in the relay
+# release brick every box's CLI update — strictly worse than a box that keeps the
+# buzz it has and says so. Returns 0 on every path; the caller must not gate on it.
+stage_buzz_binaries() {
+  local base tmp sums rc=0 arch
+  arch="$(uname -m 2>/dev/null || echo unknown)"
+  if [[ "$arch" != "x86_64" ]]; then
+    # The release attaches ONE build per binary and PROVENANCE.txt records it as
+    # `ELF 64-bit ... x86-64`. There is no arch matrix to select from yet, so on
+    # anything else we say so rather than installing a binary that cannot exec.
+    echo "warn: buzz binaries not staged — the $BUZZ_CLI_TAG release ships x86_64 builds only and this box is $arch. \`5dive agent buzz pair\` will keep refusing until a build for this architecture is published." >&2
+    return 0
+  fi
+  # BUZZ_REL_BASE is the seam the unit harness points at a file:// fixture, and
+  # the same valve an offline/mirrored install uses. Default is the pinned tag.
+  base="${BUZZ_REL_BASE:-https://github.com/$GH_ORG/buzz/releases/download/$BUZZ_CLI_TAG}"
+
+  tmp="$(mktemp -d)" || return 0
+  if ! curl -fsSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS" 2>/dev/null; then
+    echo "warn: could not fetch $base/SHA256SUMS — buzz binaries not refreshed this run; this box keeps whatever it already has (\`5dive agent buzz pair\` refuses outright if that is nothing)." >&2
+    rm -rf "$tmp"; return 0
+  fi
+  sums="$(sha256sum "$tmp/SHA256SUMS" | awk '{print $1}')"
+  if [[ "$sums" != "$BUZZ_SUMS_SHA256" ]]; then
+    # Do not soften this into "stale mirror". The manifest is fetched from an
+    # immutable TAG url, so the bytes behind it changed under a name that was
+    # supposed to be fixed. Refuse and touch nothing.
+    echo "warn: buzz SHA256SUMS for $BUZZ_CLI_TAG does not match the digest pinned in install.sh (want ${BUZZ_SUMS_SHA256:0:16}…, got ${sums:0:16}…) — refusing to install unverified relay binaries. Nothing was changed. The release assets behind this tag were replaced, or the source is not the release." >&2
+    rm -rf "$tmp"; return 0
+  fi
+
+  local bin want got dst bin_tmp
+  for bin in buzz buzz-pair; do
+    dst="$BIN_DIR/$bin"
+    want="$(awk -v b="$bin" '$2 == b || $2 == "*" b {print $1; exit}' "$tmp/SHA256SUMS")"
+    if [[ ! "$want" =~ ^[0-9a-f]{64}$ ]]; then
+      echo "warn: $BUZZ_CLI_TAG SHA256SUMS names no sha256 for '$bin' — not installed. \`5dive agent buzz pair\` needs buzz-pair; \`5dive agent buzz join\` needs buzz." >&2
+      rc=1; continue
+    fi
+    # Idempotence is what makes this cheap on the nightly: an unchanged box does
+    # one 147-byte manifest fetch and zero binary downloads. It also means a box
+    # a human hand-placed the RIGHT build on is a no-op, not a re-download.
+    if [[ -x "$dst" ]] && [[ "$(sha256sum "$dst" | awk '{print $1}')" == "$want" ]]; then
+      ok "$bin already at $BUZZ_CLI_TAG (sha256 verified)"
+      continue
+    fi
+    # Temp lives in BIN_DIR so the final mv is a same-fs atomic swap — a box that
+    # loses power mid-update has either the old binary or the new one, never a
+    # half-written file that execs into garbage. Same shape as the bundle swap.
+    bin_tmp="$(mktemp "${BIN_DIR}/.${bin}.XXXXXX")" || { rc=1; continue; }
+    if ! curl -fsSL "$base/$bin" -o "$bin_tmp" 2>/dev/null; then
+      rm -f "$bin_tmp"
+      echo "warn: failed to download $bin from $base — not refreshed; this box keeps the copy it has." >&2
+      rc=1; continue
+    fi
+    got="$(sha256sum "$bin_tmp" | awk '{print $1}')"
+    if [[ "$want" != "$got" ]]; then
+      rm -f "$bin_tmp"
+      echo "warn: $bin checksum mismatch (want ${want:0:16}…, got ${got:0:16}…) — refusing to install. The existing $dst was left untouched." >&2
+      rc=1; continue
+    fi
+    chmod 755 "$bin_tmp"
+    mv -f "$bin_tmp" "$dst"
+    ok "$bin → $dst ($BUZZ_CLI_TAG, sha256 verified)"
+  done
+  rm -rf "$tmp"
+  [[ $rc -eq 0 ]] || echo "warn: buzz staging finished with at least one binary not installed — the dashboard's Connect Buzz panel will dead-end on this box until it is." >&2
+  return 0
+}
+# <<< DIVE-3554 buzz binary staging
+
 # Refresh CLI binaries, systemd unit, hooks, and skills from $REPO. Shared by
 # the default install path and `--upgrade`. Never touches state, auth profiles,
 # the claude user, apt packages, nvm, or bun — so it's safe to rerun on a
@@ -424,6 +538,11 @@ refresh_managed_files() {
   chmod 755 "$_bundle_tmp"
   mv -f "$_bundle_tmp" "$BIN_DIR/5dive"
   ok "5dive → $BIN_DIR/5dive${_want:+ (sha256 verified)}"
+
+  # DIVE-3554: the relay binaries the shipped Connect Buzz panel shells out to.
+  # Fail-soft on purpose (see stage_buzz_binaries) — a buzz release outage must
+  # not stop the CLI update this function exists to perform.
+  stage_buzz_binaries
 
   # DIVE-544: per-customer standup digest. The cron runs HOURLY but `digest tick`
   # is gated on a per-box pref that defaults OFF — nothing is delivered until a
