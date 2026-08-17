@@ -165,7 +165,13 @@ require_sqlite() {
 # NOTE: projects/loop_runs/supervisor_events are ALSO defined inside gated
 # one-shot migration blocks in _tasks_db_migrate() below — edit both copies
 # together; tests/schema_sync_unit.sh fails CI if they diverge.
-_TASKS_SCHEMA_EPOCH='3251-1'   # DIVE-3251: +first_started_at
+# DIVE-3525: BUMP THIS WHENEVER YOU ADD A MIGRATION BLOCK BELOW. The epoch is the
+# skip gate (_tasks_db_needs_migrate) — a store already stamped with the current
+# value never enters _tasks_db_migrate again, so a new one-shot block added
+# WITHOUT a bump runs on fresh stores only. It ships green on every harness (they
+# all start from an empty dir and take the canonical schema) and reaches no
+# existing board, which is the one population it was written for.
+_TASKS_SCHEMA_EPOCH='3525-1'   # DIVE-3525: +gate_cards (was 3251-1: +first_started_at)
 _tasks_schema() {
   cat <<'SQL'
 PRAGMA journal_mode=WAL;

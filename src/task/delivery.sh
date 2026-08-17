@@ -681,7 +681,7 @@ cmd_task_reject() {
     # set — the gate now reads '(superseded ...)' with provenance auto:reject, so
     # a human tapping it would believe they authorized something an agent already
     # closed on their behalf.
-    _task_gate_retire_buttons "$ident" "superseded by auto:reject" || true
+    _task_gate_card_apply "$ident" die "superseded by auto:reject" || true
   fi
   # max_iterations reached -> stop bouncing, park it on a human to decide.
   # DIVE-2477 considered clearing done_at here too, by symmetry with the

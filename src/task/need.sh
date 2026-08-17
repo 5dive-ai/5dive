@@ -1610,7 +1610,7 @@ cmd_task_need() {
     # question is gone, so the button must go with it. A withdrawal is the path
     # most likely to leave a stale button standing, because unlike an answer
     # nothing about it ever reaches the human's chat.
-    _task_gate_retire_buttons "$ident" "withdrawn by ${w_name:-$w_kind}" || true
+    _task_gate_card_apply "$ident" die "withdrawn by ${w_name:-$w_kind}" || true
     local w_new; w_new=$(db "SELECT status FROM tasks WHERE id=${id};")
     ok "$ident gate withdrawn (${w_type}) — moot request cleared, no secret/grant recorded; task now ${w_new}" \
        '{ident:$id, withdrawn:true, was_type:$wt, status:$st}' \
@@ -2468,7 +2468,7 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
     warn "--rubber-stamp-ok changed nothing on this gate — the keystroke cap did not fire (type=${type}, tier=${tier}$( ((tier_floored)) && printf ', floored by category or declaration')). The declaration is still written to the row, so it stays readable; it just did not need to buy anything."
   fi
 
-  _task_gate_retire_buttons "$ident" "superseded by a re-filed gate" || true
+  _task_gate_card_apply "$ident" die "superseded by a re-filed gate" || true
 
   db "BEGIN IMMEDIATE;
       $(_gate_archive_and_clear_sql file "id=${id}")
@@ -3190,6 +3190,45 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
   # override above (eng-ship / curation / internal-ops / access / verifier-route)
   # can cross it — the verifier-route being the one this ticket exists to stop.
   [[ "$_needs_human" == "1" ]] && _routable=0
+  # DIVE-3228 / DIVE-3525 — AN ORDINARY SHIP APPROVAL DEFAULTS TO A ROUTED REVIEWER.
+  #
+  # THE DEFECT, and it is a DEFAULT rather than a filer's carelessness. `_routable`
+  # above already says YES for an unfloored `approval` (the type arm, ~70 lines up).
+  # But `_routable` is only half the test: the cascade below ALSO demands one of the
+  # KIND flags or the `gate_builder_routing` pref, and that pref is OFF by default on
+  # this host. So an approval that misses `_eng_ship`'s regex is routable-and-unrouted:
+  # `routed_reviewer` stays NULL, and an empty `routed_reviewer` is the FIRST clause of
+  # cmd_task_inbox's human predicate — an unrouted gate IS a founder gate. Measured
+  # twice: DIVE-3224's own push gate ("open both PRs" lowercases to `prs`, and the
+  # member is `\bpr\b`), and DIVE-3225's ship, which sat behind a gate no seat held
+  # standing to clear while lodar was paged twice and pushed back both times.
+  #
+  # WHY A KIND AND NOT A WIDER REGEX. Every previous round of this widened
+  # `_GATE_ENG_SHIP_RX` by one synonym — each addition locally correct, the class
+  # untouched, and the next miss unpredictable by construction. The type is already
+  # the fact: CLAUDE.md says builders gate prod ships to Marcus and not to lodar, so
+  # the code encodes the policy the docs already state, and prose stops deciding who
+  # is woken.
+  #
+  # IT ROUTES NOBODY NEW. The target is `_gate_route_reviewer(filer)` — the SAME chart
+  # walk every other kind takes, and `route_provenance` stays `chart` because the chart
+  # is still what resolved the name. When the chart resolves nobody the gate falls
+  # through to the human exactly as today. So this moves gates from "unrouted" to
+  # "routed to the lead they always should have gone to", and adds no reachable seat.
+  #
+  # THE HUMAN-ONLY SET IS UNCHANGED, and every exclusion is inherited rather than
+  # restated (two copies of "is this the human's" are two things that can disagree):
+  #   * `secret` and `manual` are not this type. DIVE-3228 is explicit that `secret`
+  #     must not become agent-clearable, and a `manual` gate is one only a person can
+  #     physically perform.
+  #   * an EXPLICIT `--tier=2` zeroed `_routable` at the DIVE-1957 backstop above.
+  #   * `--needs=spend_authority` / `human_tap` zeroed it at the DIVE-2241 line
+  #     directly above — a declared human-class capability is the human path itself.
+  #   * a T2 category floor (money / destructive / secrets) never reaches `_routable=1`
+  #     in the first place: the type arm consults `_gate_floor_axis` for exactly that.
+  # Reading it off `_routable` is what makes those four inherited instead of copied.
+  local _approval_default=0
+  [[ "$type" == "approval" && "$_routable" == "1" ]] && _approval_default=1
   # Record the declaration and what it did, at the moment it did it. DIVE-2093 will
   # PRINT the routing decision at file time; until it lands this row is the only
   # place a mis-declared gate is visible without diffing where it ended up.
@@ -3248,7 +3287,10 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
     # only the second one decides who is woken.
     # DIVE-3266: row-state ship routing bypasses the pref too — a branch binding is a
     # harder fact than any regex hit, so pref-gating it would re-open the exact hole.
-    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_row_ship" == "1" || "$_curation" == "1" || "$_internal_ops" == "1" || "$_discusses_applied" == "1" || "$_verifier_route" == "1" || "$_floored_by_title" == "1" || "$_standing_route" == "1" ]]; then
+    # DIVE-3228/3525: `approval` is a routing kind in its own right — see the block
+    # at the `_approval_default` assignment above for why this is a kind and not
+    # another regex member, and for the four exclusions it inherits from `_routable`.
+    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_row_ship" == "1" || "$_curation" == "1" || "$_internal_ops" == "1" || "$_discusses_applied" == "1" || "$_verifier_route" == "1" || "$_floored_by_title" == "1" || "$_standing_route" == "1" || "$_approval_default" == "1" ]]; then
       # DIVE-1495: a verifier-route targets the task's verifier directly; every
       # other kind resolves the filer's lead via the org chart.
       local _reviewer
@@ -3310,6 +3352,14 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
         elif [[ "$_discusses_applied" == "1" ]]; then _rtrigger="declared-discussion"
         elif [[ "$_floored_by_title" == "1" ]]; then _rtrigger="floored-by-title"
         elif [[ "$_standing_route"   == "1" ]]; then _rtrigger="standing-lead"
+        # DIVE-3228/3525: LAST of the kinds and directly above the pref, for the same
+        # reason DIVE-3266 put row-ship-state below eng-ship. When any more specific
+        # kind applies, that is the one the filer can act on and every existing receipt
+        # stays byte-for-byte; `approval-default` is named only when the TYPE is the
+        # sole reason this routed — i.e. exactly the gate that used to reach lodar.
+        # Counting that set is the point: it is how the next reader measures whether
+        # this default is carrying gates the classifiers were missing.
+        elif [[ "$_approval_default" == "1" ]]; then _rtrigger="approval-default"
         else _rtrigger="gate_builder_routing=on"
         fi
         # DIVE-2093 iteration 3 (main2's blocker 1): the basis is `$_route_prov` ITSELF,

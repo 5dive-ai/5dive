@@ -1803,7 +1803,7 @@ $_body"
   if [[ "$verb" == "done" || "$verb" == "cancel" ]]; then
     local _open_gate
     _open_gate=$(db "SELECT 1 FROM tasks WHERE id=${id} AND need_type IS NOT NULL AND need_answered_at IS NULL;" 2>/dev/null || echo "")
-    [[ -n "$_open_gate" ]] && { _task_gate_retire_buttons "$ident" "task ${verb} with the gate still open" || true; }
+    [[ -n "$_open_gate" ]] && { _task_gate_card_apply "$ident" die "task ${verb} with the gate still open" || true; }
   fi
   if (( notify )) && [[ "$verb" == "done" || "$verb" == "cancel" ]]; then
     local from_tmpl

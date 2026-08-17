@@ -944,7 +944,7 @@ cmd_task_park() {
       COMMIT;"
   # DIVE-2410: park clears the gate columns, so whatever button that gate put in a
   # human's chat now points at a question the task no longer holds.
-  _task_gate_retire_buttons "$tident" "parked" || true
+  _task_gate_card_apply "$tident" die "parked" || true
   # DIVE-2877: A PARK'S BLAST RADIUS EXCEEDS THE ROW IT IS APPLIED TO, and until
   # now nothing said so at the moment of the park. On an instance materialized
   # from a recurring template (from_template_id set) a park is not a delay of one
