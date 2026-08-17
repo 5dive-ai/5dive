@@ -197,13 +197,17 @@ echo "== C4. --json: same status, class:\"passthrough\", and NO {ok:true} on std
 # printed. Grade stdout ALONE — the narration on stderr is not the defect.
 sout=$(jlogs JCTL_RC=4 JCTL_ERR="jctl-said-4" --json agent logs probe 2>/dev/null); got=$?
 check "$got" "4" "C4: --json exit status is journalctl's own (4)"
-# PARSE it, do not grep it: the success envelope is jq's DEFAULT (pretty) output,
-# `"ok": true` with a space, while the error envelope is `jq -cn` compact. A
-# `*'"ok":true'*` match therefore reads FALSE on the very envelope it is meant to
-# forbid — this arm passed for the wrong reason until C10 exposed the spelling.
-[[ "$(jq -r '.ok' <<<"$sout" 2>/dev/null)" != "true" ]] \
-  && ok "C5: no {ok:true} envelope on stdout for a read that failed" \
-  || bad "C5: printed a success envelope for a failed read (the DIVE-2792 --json defect)"
+# SLURP it, do not grep it and do not read a bare `.ok`. Two traps, both of which
+# this arm fell into before it was measured against the reverted tree:
+#   - the success envelope is jq's DEFAULT (pretty) output, `"ok": true` WITH a
+#     space, while the error envelope is `jq -cn` compact — so a
+#     `*'"ok":true'*` match reads false on the very envelope it forbids;
+#   - on origin/main stdout carries BOTH objects (the premature `{ok:true}` and
+#     then the backstop's `{ok:false}`), so `jq -r '.ok'` yields "true\nfalse",
+#     which is != "true" and passes while the defect is present.
+# The claim is "no object in this stream says ok:true", so slurp and count.
+check "$(jq -s 'map(select(.ok == true)) | length' <<<"$sout" 2>/dev/null)" "0" \
+  "C5: no {ok:true} envelope anywhere on stdout for a read that failed"
 [[ "$sout" == *'"class":"passthrough"'* ]] \
   && ok "C6: the error envelope names the failure as a passthrough, not a CLI fault" \
   || bad "C6: no class:\"passthrough\" in the --json error envelope"
