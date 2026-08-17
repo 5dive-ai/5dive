@@ -79,6 +79,24 @@ _buzz_xonly_pubkey() { python3 -c "$_BUZZ_XONLY_PY"; }
 # ---------------------------------------------------------------------------
 # Run the buzz binary as the agent user.
 #
+# NO `--format json` ON ANY SUBCOMMAND, and this is load-bearing rather than a
+# style choice. `--format` is declared on buzz's top-level clap `Cli` struct
+# WITHOUT `global = true` (crates/buzz-cli/src/lib.rs:93-95 at cli-v0.1.0's
+# release commit 484f884), so it is only legal to the LEFT of the subcommand.
+# `buzz channels list --format json` is an ARGUMENT-PARSE ERROR — exit 1,
+# `{"error":"user_error","message":"unexpected argument '--format' found"}` on
+# stderr, nothing on stdout. Measured against /usr/local/bin/buzz, 2026-08-17.
+#
+# It fails CLOSED and SILENTLY: the listing comes back empty, so every configured
+# channel reads as absent, `create` fires on every run, the re-list is empty too,
+# and join reports "neither found nor created" against a perfectly healthy relay.
+# json is ALREADY the default output, so the correct fix is to omit the flag —
+# not to move it left. Do not add it back. (Found by quinn grading DIVE-3513
+# iteration 2; the harness could not see it because the fake `buzz` was a bash
+# case that ignored trailing flags, i.e. a SUPERSET of the real grammar. The
+# stub now exits 64 on leftover argv, and `tests/buzz_last_mile_unit.sh` grades
+# every outgoing invocation against the real parser when a binary is present.)
+#
 # THE KEY TRAVELS ON STDIN, NEVER ON ARGV — the same rule `_buzz_write_config`
 # is built around, for the same reason: `/proc/<pid>/cmdline` is world-readable
 # on our boxes and `sudo -u x env KEY=<hex> buzz …` makes the secret an argv
@@ -272,7 +290,7 @@ _buzz_join() {
 
   # --- step 5: join or create each channel, and add the customer -----------
   local listing joined=0 created=0 failed=0 ch cid
-  listing=$(_buzz_cli "$user" "$bin" "$relay" "$key" channels list --format json 2>/dev/null) || listing=""
+  listing=$(_buzz_cli "$user" "$bin" "$relay" "$key" channels list 2>/dev/null) || listing=""
   local IFS_SAVE="$IFS"
   IFS=','
   for ch in $chans; do
@@ -286,7 +304,7 @@ _buzz_join() {
         channels create --name "$ch" --type stream --visibility open >/dev/null 2>&1 || true
       # Re-list rather than parse the create output: the authority on whether a
       # channel exists is the relay, not the acknowledgement of the write.
-      listing=$(_buzz_cli "$user" "$bin" "$relay" "$key" channels list --format json 2>/dev/null) || listing=""
+      listing=$(_buzz_cli "$user" "$bin" "$relay" "$key" channels list 2>/dev/null) || listing=""
       cid=$(_buzz_channel_id "$ch" <<<"$listing")
       [[ -n "$cid" ]] && created=$((created + 1))
     fi
@@ -305,7 +323,7 @@ _buzz_join() {
     # whose absence made DIVE-3331 look like a broken relay.
     local members mine cust_ok="no" agent_ok="no"
     members=$(_buzz_cli "$user" "$bin" "$relay" "$key" channels members --channel "$cid" 2>/dev/null) || members=""
-    mine=$(_buzz_cli "$user" "$bin" "$relay" "$key" channels list --member --format json 2>/dev/null) || mine=""
+    mine=$(_buzz_cli "$user" "$bin" "$relay" "$key" channels list --member 2>/dev/null) || mine=""
     # The customer half stays a substring: 64 hex chars is evidence on its own,
     # and it survives a rename of whatever field carries it. The agent half does
     # NOT — see _buzz_lists_channel_id.

@@ -238,22 +238,33 @@ json_channels() { # <file of cids, or empty for all>
 grp="${1:-}"; shift || true
 verb="${1:-}"; shift || true
 # flags
-CH=""; NAME=""; PUB=""
+#
+# STRICTER THAN THE CALLER, ON PURPOSE. The first version of this stub ended its
+# flag loop with `*) shift ;;` — it silently swallowed anything it had not been
+# told to read, which makes it a SUPERSET of the real clap parser. A stub written
+# by the same hand as the caller then encodes that hand's belief about the
+# callee's ARGUMENT GRAMMAR, and no mutant can reach a belief the caller and the
+# stub share: `channels list --format json` is a parse error on the real binary
+# and the harness read 63/0 across it (quinn, DIVE-3513 iteration 2).
+#
+# So: an unrecognised argument is exit 64, the way clap exits non-zero on
+# `unexpected argument '--format' found`. `--member` is the one bare flag the
+# real parser accepts here and it is named explicitly rather than tolerated.
+CH=""; NAME=""; PUB=""; MEMBER=0
 while (($#)); do
   case "$1" in
     --channel) CH="$2"; shift 2 ;;
     --name)    NAME="$2"; shift 2 ;;
     --pubkey)  PUB="$2"; shift 2 ;;
-    *) shift ;;
+    --member)  MEMBER=1; shift ;;
+    --role|--type|--visibility|--about|--status) shift 2 ;;
+    *) printf 'error: unexpected argument %s found\n' "$1" >&2; exit 64 ;;
   esac
 done
 
 case "$grp:$verb" in
   channels:list)
-    if [[ "$*" == *--member* ]] || grep -q -- '--member' <<<"${BUZZ_LAST_ARGS:-}"; then :; fi
-    if [[ ",${BUZZ_STUB_LASTLIST:-}," == *,member,* ]]; then :; fi
-    # --member was consumed by the flag loop above; re-read it from the log line
-    if grep -q -- 'argv: channels list --member' <<<"$(tail -2 "$D/log")"; then
+    if ((MEMBER)); then
       if has unparseable_member_list; then
         while IFS=$'\t' read -r c n; do
           grep -qxF "$c" "$D/joined" && printf 'channel %s  %s  (member) 11 messages\n' "$c" "$n"
@@ -580,6 +591,105 @@ EN_RC=$?
 [[ "$EN_RC" -eq 3 ]] \
   && ok_t "8i control: a partial wire comes back out of ENABLE as rc 3" \
   || bad_t "8i control: a partial wire comes back out of enable as rc 3" "rc=$EN_RC — enable reported success over a room the customer is not in"
+
+# --- 8j. ARGV GRAMMAR: the stub is stricter than the caller ----------------
+# The defect this section exists for: `channels list --format json` is a parse
+# error on the real binary (`--format` is a top-level clap arg without
+# global=true, so it is only legal LEFT of the subcommand), and iteration 2 read
+# 63/0 straight across it — because the fake `buzz` was a bash case ending in
+# `*) shift ;;`, which accepts a SUPERSET of the real grammar. A stub more
+# permissive than the real parser cannot see an argv defect, and no mutant helps:
+# the caller and the stub shared the belief.
+#
+# The stub now exits 64 on an unrecognised argument. First, prove that FIRES —
+# an arm that only ever reads clean is not an arm.
+seed_agent "$STUB_BIN" "general"
+export BUZZ_STUB_MODE=normal
+BUZZ_PRIVATE_KEY=deadbeef BUZZ_RELAY_URL=https://relay.example.com "$STUB_BIN" channels list --format json >/dev/null 2>&1 \
+  && bad_t "8j control: the stub REJECTS an argument the real parser rejects" \
+           "the stub accepted --format json; it is a superset of the real grammar and cannot see an argv defect" \
+  || ok_t "8j control: the stub REJECTS an argument the real parser rejects"
+BUZZ_PRIVATE_KEY=deadbeef BUZZ_RELAY_URL=https://relay.example.com "$STUB_BIN" channels list >/dev/null 2>&1 \
+  && ok_t "8j control: and it still ACCEPTS the form the product actually sends" \
+  || bad_t "8j control: and it still ACCEPTS the form the product actually sends" \
+           "the strictness overshot; every join arm below is now vacuous"
+
+# With a strict stub, the defect is simply a failing join.
+seed_agent "$STUB_BIN" "general"
+run_join normal dev
+[[ "$JOIN_RC" -eq 0 ]] \
+  && ok_t "8j every invocation _buzz_join makes is accepted by a strict parser" \
+  || bad_t "8j every invocation _buzz_join makes is accepted by a strict parser" \
+           "rc=$JOIN_RC — an argument the real binary would reject: $JOIN_OUT"
+
+# The product must not carry the flag at all. json is ALREADY buzz's default
+# output, so the fix is omission, not relocation — an arm on the source because
+# a future maker adding it back is the whole failure mode.
+# Comment lines are excluded deliberately: the file carries a block explaining
+# why the flag must never come back, and grading the raw file text would make
+# that explanation itself the failure. The predicate is EXECUTABLE lines.
+grep -v '^[[:space:]]*#' "$JOINF" | grep -q -- '--format' \
+  && bad_t "8j no --format on any subcommand in the product" \
+           "--format is only legal LEFT of the subcommand; on a subcommand it is exit 1 user_error, the listing comes back empty, and join fails closed against a healthy relay" \
+  || ok_t "8j no --format on any subcommand in the product"
+
+# --- 8k. GRADED AGAINST THE REAL PARSER, when one is on this box -----------
+# The residual signature said "no relay was contacted, so the wire format is the
+# smoke's". That over-claimed: a parse error is decided BEFORE any socket opens,
+# so argv grammar is gradeable offline TODAY against the real binary. user_error
+# is grammar and ours; network_error is transport and the smoke's. Skipped, never
+# faked, when no binary is present.
+REAL_BUZZ=$(command -v buzz 2>/dev/null || true)
+[[ -z "$REAL_BUZZ" && -x /usr/local/bin/buzz ]] && REAL_BUZZ=/usr/local/bin/buzz
+if [[ -z "$REAL_BUZZ" ]]; then
+  printf 'skip - 8k no `buzz` binary on this box; argv grammar not graded against the real parser\n'
+else
+  # A UUID, because the relay's channel_id is one — a short id is rejected by the
+  # UUID parser as a user_error and would read as a grammar failure that is not.
+  REAL_UUID=550e8400-e29b-41d4-a716-446655440000
+  REAL_PK=f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9
+  # A relay that cannot resolve: grammar is decided first, so anything that gets
+  # as far as transport has parsed.
+  grammar_ok() { # <buzz args...>
+    local o
+    o=$(BUZZ_RELAY_URL=https://relay.invalid.example.com \
+        BUZZ_PRIVATE_KEY=$(printf '3%.0s' {1..63})7 \
+        "$REAL_BUZZ" "$@" 2>&1)
+    [[ "$o" != *'"user_error"'* ]]
+  }
+  # Every distinct invocation _buzz_join and _buzz_owner make.
+  while IFS='|' read -r label args; do
+    [[ -n "$label" ]] || continue
+    # shellcheck disable=SC2086
+    if grammar_ok $args; then
+      ok_t "8k real parser accepts: $label"
+    else
+      bad_t "8k real parser accepts: $label" \
+            "user_error from the real binary — this call fails before any socket opens"
+    fi
+  done <<REALGRAMMAR
+channels list|channels list
+channels list --member|channels list --member
+channels create|channels create --name general --type stream --visibility open
+channels join|channels join --channel $REAL_UUID
+channels add-member|channels add-member --channel $REAL_UUID --pubkey $REAL_PK --role owner
+channels members|channels members --channel $REAL_UUID
+users set-profile|users set-profile --name dev --about 5dive-agent-dev
+users get|users get
+REALGRAMMAR
+  # Control: the arm must be able to FAIL. The exact defect, against the real
+  # parser — if this passes, `grammar_ok` is not detecting anything.
+  grammar_ok channels list --format json \
+    && bad_t "8k control: the real parser REJECTS \`channels list --format json\`" \
+             "grammar_ok cannot detect a user_error; every 8k green above is meaningless" \
+    || ok_t "8k control: the real parser REJECTS \`channels list --format json\`"
+  # ...and the same flag LEFT of the subcommand parses, which is what makes it a
+  # placement defect rather than an unknown flag.
+  grammar_ok --format json channels list \
+    && ok_t "8k control: the same flag LEFT of the subcommand parses (placement, not spelling)" \
+    || bad_t "8k control: the same flag LEFT of the subcommand parses" \
+             "then --format is not a global at all and this diagnosis is wrong"
+fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
