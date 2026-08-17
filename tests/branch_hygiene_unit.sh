@@ -282,6 +282,9 @@ case "$args" in
     esac
     ;;
   "api repos/acme/demo/commits/"*" --jq .commit.committer.date")
+    if [[ -n "${MOCK_DATES_FAIL:-}" ]]; then
+      gh_http_error 403 "API rate limit exceeded"
+    fi
     echo 2026-07-01T00:00:00Z
     ;;
   *"compare/main...main"*)
@@ -508,6 +511,17 @@ refute 'arm 1 attributed while the closed-PR page was unreadable' \
 refute 'arm 4 preserved a branch while the closed-PR page was unreadable' \
   'PRESERVED pull-ref-identity' <<<"$prsfail_output"
 grep -q '8 finding(s), 2 not the only copy (0 of those preserved by pull ref, not landed), 2 orphan, 0 unknown' <<<"$prsfail_output"
+
+# THE FOURTH SOURCE: the per-branch commit date. It feeds no arm, only the age NOTE -- but an
+# error body captured here is fed to `date -d`, which fails and kills the whole digest under
+# `set -e`. Unreadable must degrade to "age unreadable" and the classification must be
+# untouched, because a report that dies is a report nobody reads.
+datesfail_output=$(GH_BIN="$RTMP/gh" GITHUB_REPOSITORY=acme/demo MOCK_DATES_FAIL=1 \
+  "$ROOT/scripts/branch-hygiene.sh" --report)
+
+grep -q 'age unreadable' <<<"$datesfail_output"
+grep -q '5 finding(s), 5 not the only copy (2 of those preserved by pull ref, not landed), 2 orphan, 0 unknown' <<<"$datesfail_output"
+refute 'a JSON error body was printed as an age' 'message.*Not Found\|rate limit' <<<"$datesfail_output"
 
 # And the probe is what discriminates: with compare readable, the intentional orphan is still
 # an orphan and is still NOT a finding. (Guards the probe being wired to a constant `true`.)
