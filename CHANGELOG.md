@@ -38,6 +38,17 @@ from the merged-and-tidy ones. A reader handed "dead branch, 40d" reaches for de
   readable and exactly one for the whole run once it is not, since only the `unavailable` verdict
   is sticky; when it cannot be read, the branch falls through to arm 3 rather than
   being preserved out of sight, and a footer names the arm that did not run.
+- **Every capture of a `gh api` result now reads the EXIT STATUS, not the output.** `gh` writes an
+  HTTP error **body** to **stdout** and does not apply `--jq` to it — measured against the live API,
+  a 404 `compare` prints `{"message":"Not Found",...,"status":"404"}` with rc=1. So the familiar
+  `x=$(gh … || true)` captures JSON, never the empty string, and the whole empty-compare arm above
+  was **unreachable in production**; it was green only because the test double failed on *stderr*.
+  Fixed as a class, not as a site: the compare call, its availability probe, the per-branch commit
+  date (whose `date -d` would otherwise be handed JSON and kill the digest under `set -e`), and the
+  closed-PR page shared by arms 1 and 4 (whose documented `[]` fallback could never fire). Both
+  mocks now emit error bodies on stdout as `gh` does, **and assert that they do** — a product that
+  reads the rc is correct under either mock, so nothing else in the harness can catch a fixture
+  that regresses to the wrong stream.
 - **`DEAD_BRANCH_DAYS` is no longer read.** Setting it prints a line saying so rather than being
   silently ignored; the weekly workflow no longer sets it. Branch age is still printed per branch,
   as a fact, not as the classifier.
