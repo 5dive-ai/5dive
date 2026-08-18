@@ -173,5 +173,6 @@ _buzz_pair() {
   else
     printf 'BUZZ-PAIR-RESULT: fail rc=%s (the line above this marker says why)\n' "$rc"
   fi
+  mark_reported  # DIVE-3558: by-design rc=3, and the BUZZ-PAIR-RESULT marker is the report
   return 3
 }

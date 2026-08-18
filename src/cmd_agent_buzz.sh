@@ -251,6 +251,12 @@ _buzz_enable() {
   _buzz_enable_last_mile "$name" "$resolved_bin" "$do_join" || last_mile_rc=$?
 
   warn "Restart to pick it up: sudo 5dive agent restart $name"
+  # DIVE-3558: `enable` returns the last mile's rc on the SAME predicate `status`
+  # returns 3 on, and `_buzz_enable_last_mile` has already warned with that rc and
+  # the re-run command. Claim the report so the backstop does not staple its
+  # "this is a bug in the CLI ... effect is UNKNOWN" block under a run that
+  # completed and said what it did.
+  if ((last_mile_rc != 0)); then mark_reported; fi
   return "$last_mile_rc"
 }
 
@@ -282,6 +288,28 @@ _buzz_status() {
   [[ "$conf" == "yes" ]] && printf 'relay_url:        %s\n' "$(jq -r '.relay_url' "$cfg" 2>/dev/null)"
   # Exit non-zero when it is declared but not usable, so a caller can branch on
   # it without parsing prose.
-  [[ "$chan_decl" == "yes" && ( "$plugin" == "no" || "$conf" == "no" || "$bin" == "no" ) ]] && return 3
+  #
+  # DIVE-3558. rc=3 is the DESIGNED "declared but not usable" value and the table
+  # above is its whole answer — but the EXIT backstop in lib/output.sh appends
+  # "exited 3 without reporting a reason. This is a bug in the CLI ... the command
+  # did NOT run to completion and its effect is UNKNOWN ... Please file it" to any
+  # non-zero exit that has not claimed its report. On the FIRST verb of the Connect
+  # Buzz path that turns the ordinary, expected "not wired yet" answer into a crash
+  # notice, and every correctly-wired-but-not-yet-ready seat reads as broken. It DID
+  # run to completion and its effect is exactly nothing.
+  #
+  # `mark_reported` is what claims the report (same fix pattern as DIVE-2890 /
+  # DIVE-2711 in cmd_council.sh and DIVE-3135 in cmd_gh.sh). Claiming it OBLIGES us
+  # to make one: three `no`s in a table are a reading exercise, so the missing
+  # pieces are named in prose and the fix command is printed.
+  if [[ "$chan_decl" == "yes" && ( "$plugin" == "no" || "$conf" == "no" || "$bin" == "no" ) ]]; then
+    local missing=""
+    [[ "$plugin" == "no" ]] && missing="the buzz plugin"
+    [[ "$conf" == "no" ]]   && missing="${missing:+${missing}, }a readable config (the agent's identity)"
+    [[ "$bin" == "no" ]]    && missing="${missing:+${missing}, }the \`buzz\` binary"
+    warn "NOT WIRED YET (rc=3, by design — this is the answer, not a crash): '$name' declares the buzz channel but is missing ${missing}. Wire it with: sudo 5dive agent buzz enable $name --relay=<https://relay.example.com>"
+    mark_reported
+    return 3
+  fi
   return 0
 }
