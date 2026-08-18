@@ -193,6 +193,14 @@ _buzz_lists_channel_id "1" <<<'channel 1  general  (member) 11 messages' \
 # smoke's job and it is signed for, not implied.
 # ===========================================================================
 STUB_ROOT=$(mktemp -d)
+
+# DIVE-3592: the OWNER identity is per SERVER now — `_buzz_owner_key` reads and
+# writes ${STATE_DIR}/buzz/owner.json and mirrors it per agent. The default
+# /var/lib/5dive is root-owned, so an unprivileged harness that exercises `join`
+# has to own a STATE_DIR of its own. Set AFTER the source on purpose: REGISTRY
+# and friends are computed from STATE_DIR at source time and the seams below
+# depend on those staying put; the owner path is read at CALL time.
+STATE_DIR="$STUB_ROOT/state"
 trap 'rc=$?; rm -rf "$STUB_ROOT"; echo "HARNESS-RC=$rc"' EXIT
 STUB_BIN="$STUB_ROOT/buzz"
 

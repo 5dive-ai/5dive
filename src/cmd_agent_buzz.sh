@@ -178,7 +178,7 @@ _buzz_enable_last_mile() { # <name> <resolved_bin> <do_join>
   step "Last mile: joining channel(s), adding the customer's key as a member, publishing profile + presence"
   ( _buzz_join "$name" ) || rc=$?
   if ((rc == 0)); then
-    ok "buzz is wired end to end for '$name' — pair a handset with: sudo 5dive agent buzz owner $name --envelope"
+    ok "buzz is wired end to end for '$name' — pair a handset with: sudo 5dive buzz pair (ONE QR for this server, DIVE-3592)"
   else
     warn "buzz enabled for '$name' but the last mile did not fully wire (rc=$rc). A handset will land in a room the agent may not be in. Re-run: sudo 5dive agent buzz join $name"
   fi

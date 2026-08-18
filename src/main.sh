@@ -100,6 +100,12 @@ Agents:
                                                      # the agent unit's liveness. rc 3 = declared, not usable
   5dive agent buzz pair <name> [--timeout=<secs>]    # DIVE-3551: run the NIP-AB pairing session (QR + SAS);
                                                      # emits BUZZ-PAIR-* marker lines the dashboard panel parses
+  5dive buzz pair [--timeout=<secs>] [--agent=<n>]   # DIVE-3592: ONE QR per SERVER — pairs the phone as the
+                                                     # OWNER of this box, wiring that identity into every buzz
+                                                     # agent's channels first. Prefer this over the per-agent
+                                                     # form; who talks in team chat is \`agent buzz enable\`.
+  5dive buzz owner [--envelope]                      # the box's handset identity (public half; --envelope is
+                                                     # the DIVE-3300 payload and carries a PRIVATE key)
   5dive agent config <name> set workdir=<path>       # tmux cwd; "default" clears override
   5dive agent config <name> set auth-profile=<name>  # swap profile; "default" clears override
   5dive agent config <name> set model=<id>           # runtime model (claude/codex/grok/antigravity)
@@ -743,9 +749,16 @@ main() {
         # log: a public key and a file PATH, never the body (see the verb's own
         # --message-file refusal to take prose in argv).
         buzz)
+          # DIVE-3592: `pair` is a LIVE SESSION (600s by default, waiting on a
+          # human with a phone). It writes no registry field of its own, and
+          # holding the fleet-wide registry lock for the width of a pairing
+          # session would stall every other seat's writes behind one customer
+          # scanning a QR. It joins `status`/`whois` on the lock-free side. The
+          # server-level `5dive buzz pair` takes the lock per join instead,
+          # around the wire-up only.
           if [[ "${1:-}" == "status" || "${1:-}" == "whois" ]]; then
             cmd_agent_buzz "$@"
-          elif [[ "${1:-}" == "inbound" ]]; then
+          elif [[ "${1:-}" == "inbound" || "${1:-}" == "pair" ]]; then
             AUDIT_CMD="agent buzz"; AUDIT_ARGS=("$@")
             cmd_agent_buzz "$@"
           else
@@ -935,6 +948,13 @@ main() {
       # more than the noise it costs.
       AUDIT_CMD="host"; AUDIT_ARGS=("$@")
       cmd_host "$@" ;;
+    buzz)
+      # DIVE-3592: pairing is per SERVER. Audited (it decides which handset
+      # holds the box owner identity) and NOT wrapped in the registry lock —
+      # `pair` blocks on a human with a phone, and its wire-up takes the lock
+      # per join instead.
+      AUDIT_CMD="buzz"; AUDIT_ARGS=("$@")
+      cmd_buzz "$@" ;;
     doctor)
       # Only audit when a mutating run is requested (--fix/--repair); read-only
       # runs (and --dry-run previews) would spam the log.
