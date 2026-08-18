@@ -103,7 +103,7 @@ Agents:
   5dive buzz pair [--timeout=<secs>] [--agent=<n>]   # DIVE-3592: ONE QR per SERVER — pairs the phone as the
                                                      # OWNER of this box, wiring that identity into every buzz
                                                      # agent's channels first. Prefer this over the per-agent
-                                                     # form; who talks in team chat is `agent buzz enable`.
+                                                     # form; who talks in team chat is \`agent buzz enable\`.
   5dive buzz owner [--envelope]                      # the box's handset identity (public half; --envelope is
                                                      # the DIVE-3300 payload and carries a PRIVATE key)
   5dive agent config <name> set workdir=<path>       # tmux cwd; "default" clears override

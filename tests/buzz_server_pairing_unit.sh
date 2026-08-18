@@ -71,7 +71,11 @@ else
 fi
 
 # --- harness seams -----------------------------------------------------------
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+TMP=$(mktemp -d)
+# DIVE-2692: ONE EXIT trap — bash has a single slot, so the tempdir cleanup folds
+# into the HARNESS-RC line rather than replacing it (a replaced trap prints no
+# marker, and a harness killed mid-run then reads exactly like a pass).
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 export STATE_DIR="$TMP/state"
 mkdir -p "$STATE_DIR"
 # Every sudo hop collapses onto this user: the harness owns the files it writes,

@@ -128,7 +128,10 @@ grep -q 'derived from the caller' <<<"$OUT" \
 # The seam: _buzz_whois is the single reader (DIVE-3572) and _buzz_bridge_a2a_send
 # is the rail. Both are replaced so the ROUTING is graded with no registry, no
 # pane and no sudo — the arms below are about the decision, not the plumbing.
-WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+WORK=$(mktemp -d)
+# DIVE-2692: fold the tempdir cleanup into the ONE EXIT trap — bash has a single
+# slot, and a plain `rm -rf` trap here REPLACES the HARNESS-RC line set above.
+trap 'rc=$?; rm -rf "${WORK:-}"; echo "HARNESS-RC=$rc"' EXIT
 BODY="$WORK/body"; printf 'ship it\n' > "$BODY"
 SENT_LOG="$WORK/sent"
 
