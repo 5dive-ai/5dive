@@ -84,11 +84,33 @@ case "$out" in
 esac
 
 # Negative control for 2: a config with NO cached* key must not read as warm.
-out=$(run_helper '{"hasCompletedOnboarding":true}' 6 0 0)
+#
+# The budget MUST sit strictly above every clamp in the helper (floor_s=10, and
+# the no-jq fixed slice of 15) or this arm grades nothing: at budget=6 the floor
+# clamps to 6, so a correctly-cold poll (3,6) and a wrongly-warm break-at-0 that
+# the floor pads to 6 BOTH print slept=6 and the arm cannot tell them apart.
+# Verified by mutation (DIVE-3568 iteration 2): at 21, cold prints slept=21 and
+# a predicate that matches any key prints slept=10. The escaped mutant is not
+# hypothetical — a predicate matching hasCompletedOnboarding (written within a
+# second of boot) collapses the whole wait to the bare floor, which is the one
+# thing this arm exists to prevent.
+out=$(run_helper '{"hasCompletedOnboarding":true}' 21 0 0)
 case "$out" in
-  "rc=0 restarts=1 slept=6"*) ok_t "NEGATIVE: an onboarding-only config is not 'warm' ($out)" ;;
+  "rc=0 restarts=1 slept=21"*) ok_t "NEGATIVE: an onboarding-only config is not 'warm' ($out)" ;;
   *) bad_t "NEGATIVE: an onboarding-only config is not 'warm'" \
-           "got '$out' — the warm predicate matched a non-cache key, so it would restart before the warm-up wrote anything" ;;
+           "got '$out' — expected slept=21 (polled the whole budget). slept=10 means the warm predicate matched a non-cache key and fell straight through to the floor, so we would restart before the warm-up wrote anything" ;;
+esac
+
+# Clamp arm. Arm 3 above must sit ABOVE every clamp to grade the predicate, so
+# it can no longer see the floor's own clamp (`floor_s > budget && floor_s=budget`);
+# this arm is the only thing holding it. Warm, so the poll returns at once and
+# what remains is purely the floor: clamped it sleeps the budget (4), unclamped
+# it sleeps the full 10 and overruns a caller that asked for less.
+out=$(run_helper '{"cachedGrowthBookFeatures":{"a":1}}' 4 0 0)
+case "$out" in
+  "rc=0 restarts=1 slept=4"*) ok_t "floor is clamped by a budget shorter than it ($out)" ;;
+  *) bad_t "floor is clamped by a budget shorter than it" \
+           "got '$out' — expected slept=4; slept=10 means the floor ignores the budget and a caller asking for a short wait gets the full one" ;;
 esac
 
 # --- 3. a failed restart is reported, not swallowed -------------------------
