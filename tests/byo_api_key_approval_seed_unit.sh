@@ -174,9 +174,55 @@ check "unwritable home: execution continues past the block" \
 check "unwritable home: warns" \
   "$(grep -c 'custom-API-key prompt may stall' "$H.err")" "1"
 
+# --- 7b. the block writes the file Claude Code will actually OPEN -----------
+# Re-derived from the 2.1.234 bundle's own resolver:
+#   hAy(): $HOME/.claude/.config.json if it exists, else
+#          ${CLAUDE_CONFIG_DIR || $HOME}/.claude${dat()}.json
+# Every miss here is a SILENT no-op — the seed logs success, the gate stays
+# armed, and nothing in the journal separates "wrote the wrong file" from
+# "never ran". These arms are the only thing that can see the difference.
+
+# 7b.1 an existing .config.json wins outright over the dotfile.
+H="$TMP/cfgjson"; mkdir -p "$H/.claude"
+printf '%s\n' "$PRESEED" > "$H/.claude/.config.json"
+printf '%s\n' "$PRESEED" > "$H/.claude.json"
+( set -uo pipefail; HOME="$H"; NAME=probe; TYPE=claude; ANTHROPIC_API_KEY="$KEY"; eval "$BLOCK" ) 2>/dev/null
+check "config.json precedence: .config.json carries the tail" \
+  "$(jq -r '.customApiKeyResponses.approved | join(",")' "$H/.claude/.config.json" 2>/dev/null)" "$T"
+check "config.json precedence: the dotfile is left untouched" \
+  "$(jq -r '.customApiKeyResponses // "absent"' "$H/.claude.json" 2>/dev/null)" "absent"
+
+# 7b.2 a non-prod OAuth environment suffixes the filename. Asserted per variant
+# rather than in a loop so a single broken branch names itself.
+for pair in "CLAUDE_CODE_CUSTOM_OAUTH_URL=https://oauth.example.com|-custom-oauth" \
+            "USE_LOCAL_OAUTH=1|-local-oauth" \
+            "USE_STAGING_OAUTH=1|-staging-oauth"; do
+  envset="${pair%%|*}"; sfx="${pair#*|}"
+  H="$TMP/oauth${sfx}"; mkdir -p "$H"
+  ( set -uo pipefail; HOME="$H"; NAME=probe; TYPE=claude; ANTHROPIC_API_KEY="$KEY"
+    export "${envset?}"; eval "$BLOCK" ) 2>/dev/null
+  check "oauth env ${envset%%=*}: seeds .claude${sfx}.json" \
+    "$(jq -r '.customApiKeyResponses.approved | join(",")' "$H/.claude${sfx}.json" 2>/dev/null)" "$T"
+  check "oauth env ${envset%%=*}: leaves the prod dotfile absent" \
+    "$([[ -e "$H/.claude.json" ]] && echo present || echo absent)" "absent"
+done
+
+# 7b.3 CLAUDE_CONFIG_DIR must NOT be honoured. profile.d exports it into every
+# login shell, but the launch string unsets it before exec'ing claude, so the
+# reader resolves against $HOME. A block that honoured it would write the one
+# file claude is guaranteed not to open — and would do it on EVERY 5dive box,
+# not an edge case. This arm is the tripwire on that unset.
+H="$TMP/ccd"; mkdir -p "$H" "$TMP/ccd-elsewhere"
+( set -uo pipefail; HOME="$H"; NAME=probe; TYPE=claude; ANTHROPIC_API_KEY="$KEY"
+  export CLAUDE_CONFIG_DIR="$TMP/ccd-elsewhere"; eval "$BLOCK" ) 2>/dev/null
+check "CLAUDE_CONFIG_DIR is ignored: \$HOME dotfile carries the tail" \
+  "$(jq -r '.customApiKeyResponses.approved | join(",")' "$H/.claude.json" 2>/dev/null)" "$T"
+check "CLAUDE_CONFIG_DIR is ignored: nothing written under it" \
+  "$(find "$TMP/ccd-elsewhere" -type f | wc -l)" "0"
+
 # --- 8. no temp-file litter --------------------------------------------------
 check "no .claude.json.XXXXXX temp files left behind" \
-  "$(find "$TMP" -name '.claude.json.*' | wc -l)" "0"
+  "$(find "$TMP" -name '.claude.json.*' -o -name '.config.json.*' | wc -l)" "0"
 
 if (( fail )); then echo "byo_api_key_approval_seed_unit: FAIL"; exit 1; fi
 echo "byo_api_key_approval_seed_unit: PASS"

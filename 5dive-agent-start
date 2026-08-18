@@ -1486,7 +1486,45 @@ fi
 # in BOTH lists. Best-effort throughout: a malformed or unwritable config must
 # never keep the agent from launching.
 if [[ "$TYPE" == "claude" && -n "${ANTHROPIC_API_KEY:-}" ]]; then
-  _cak_cfg="$HOME/.claude.json"
+  # Resolve the file Claude Code will actually OPEN, the way its own reader does,
+  # instead of hardcoding one path. Re-derived from the 2.1.234 native bundle
+  # (unchanged in shape from 2.1.222, but the path resolution was never mirrored):
+  #
+  #   function hAy(){ if (existsSync(join(In(), ".config.json"))) return join(In(), ".config.json");
+  #                   return join(process.env.CLAUDE_CONFIG_DIR || homedir(), `.claude${dat()}.json`) }
+  #   function dat(){ if (CLAUDE_CODE_CUSTOM_OAUTH_URL) return "-custom-oauth";
+  #                   switch (oauthEnv()) { case "local": return "-local-oauth";
+  #                                         case "staging": return "-staging-oauth";
+  #                                         case "prod": return "" } }
+  #
+  # Two ways the old hardcoded "$HOME/.claude.json" becomes a file nobody reads,
+  # and in BOTH the failure is a silent no-op — the seed reports success, the
+  # gate stays armed, and the journal cannot tell you which happened. That is the
+  # exact failure class this block exists to end, so mirror the reader:
+  #   1. an existing $HOME/.claude/.config.json wins outright over the dotfile;
+  #   2. a non-prod OAuth environment suffixes the filename.
+  #
+  # CLAUDE_CONFIG_DIR is DELIBERATELY NOT consulted. /etc/profile.d/5dive-shared-configs.sh
+  # exports it as /home/claude/.claude into every login shell and agents launch
+  # `bash --login`, but the launch string below `unset`s it before exec'ing claude
+  # — so the reader resolves against $HOME and honouring it here would write the
+  # one file claude is guaranteed not to open. That `unset` is now load-bearing
+  # for this seed, not only for the per-agent settings.json preseed; see the
+  # comment on it below before removing it.
+  if [[ -n "${CLAUDE_CODE_CUSTOM_OAUTH_URL:-}" ]]; then
+    _cak_sfx="-custom-oauth"
+  elif [[ -n "${USE_LOCAL_OAUTH:-}" ]]; then
+    _cak_sfx="-local-oauth"
+  elif [[ -n "${USE_STAGING_OAUTH:-}" ]]; then
+    _cak_sfx="-staging-oauth"
+  else
+    _cak_sfx=""
+  fi
+  if [[ -f "$HOME/.claude/.config.json" ]]; then
+    _cak_cfg="$HOME/.claude/.config.json"
+  else
+    _cak_cfg="$HOME/.claude${_cak_sfx}.json"
+  fi
   _cak_base='{}'
   if [[ -r "$_cak_cfg" ]] && jq -e 'type == "object"' "$_cak_cfg" >/dev/null 2>&1; then
     _cak_base=$(cat "$_cak_cfg")
@@ -1523,7 +1561,7 @@ if [[ "$TYPE" == "claude" && -n "${ANTHROPIC_API_KEY:-}" ]]; then
   else
     echo "[5dive] agent=${NAME} WARN: could not build the custom-API-key approval — prompt may stall this session" >&2
   fi
-  unset _cak_cfg _cak_base _cak_next _cak_tmp 2>/dev/null || :
+  unset _cak_cfg _cak_sfx _cak_base _cak_next _cak_tmp 2>/dev/null || :
 elif [[ "$TYPE" == "claude" ]]; then
   # The other silent path, and the one that is indistinguishable from "the fix
   # is not installed" when you are reading a journal from a box you cannot ssh
