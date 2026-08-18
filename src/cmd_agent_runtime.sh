@@ -2637,6 +2637,56 @@ cmd_clone() {
   cmd_create "${args[@]}"
 }
 
+# DIVE-3594: pull the reset time out of a rate-limit banner, or print nothing.
+# The scrape's old reset grab took ANY pane text containing "reset" (`/reset`,
+# "reset your password", a diff line) and, when even that missed, the caller
+# substituted the literal string "no reset time shown" — so the rate-limit
+# verdict was emitted whether or not anything supported it. Require a real
+# clock, date or duration token in the matched fragment:
+#   "resets at 9am" · "resets 3:00pm" · "resets in 2h 15m" · "resets 2026-08-18"
+# Anything else prints nothing, and `cmd_stats` then emits no health blob at
+# all. Deliberately conservative: a missed true rate-limit costs a banner the
+# operator can still see in the pane, a false one poisons every true banner.
+# DIVE-3594: the whole stall verdict, derived from a captured pane and nothing
+# else — pulled out of `cmd_stats` so it is gradeable without a box, a tmux
+# session or root. Prints the health JSON blob, or NOTHING when the pane gives
+# no honest verdict. "Nothing" is the important return: `cmd_stats` renders no
+# banner for it, and a banner is what a customer reads.
+stall_health_from_pane() {
+  local pane="$1" reset=""
+  [[ -n "$pane" ]] || return 0
+  if grep -qiE "session limit|usage limit|hit your (usage|session) limit|rate limit|/rate-limit-options" <<<"$pane"; then
+    reset=$(stall_reset_time "$pane")
+    [[ -n "$reset" ]] || return 0
+    jq -cn --arg d "$reset" '{cause:"rate_limited", detail:$d}'
+    return 0
+  fi
+  if grep -qiE "(sign ?in|log ?in|authenticate|re-?authenticate|enter your api key)" <<<"$pane"; then
+    jq -cn '{cause:"auth", detail:"sitting at a login screen — re-auth needed"}'
+  fi
+  return 0
+}
+
+# DIVE-3594: the reset time IS the rate-limit verdict's discriminator, not a
+# nice-to-have detail. The keyword alternation above matches furniture a
+# HEALTHY agent prints — a boot/restart pane listing `/rate-limit-options`
+# among its slash commands is the case lodar hit on /dashboard/agents — so a
+# keyword match with no parseable reset is a claim with its own evidence field
+# missing, and the old code filled that field with the literal string "no reset
+# time shown". Require a real clock, date or duration token in the matched
+# fragment:
+#   "resets at 9am" · "resets 3:00pm" · "resets in 2h 15m" · "resets 2026-08-18"
+# Anything else prints nothing and no health blob is emitted at all.
+# Deliberately conservative: a missed true rate-limit costs a banner the
+# operator can still see in the pane; a false one poisons every true banner.
+stall_reset_time() {
+  local pane="$1" frag=""
+  frag=$(grep -oiE "resets?[^|]*" <<<"$pane" | head -1 | tr -s ' ' | sed 's/[[:space:]]*$//') || frag=""
+  [[ -n "$frag" ]] || return 0
+  grep -qiE "[0-9]{1,2}:[0-9]{2}|[0-9]{1,2} ?[ap]m([^a-z]|$)|[0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]+ ?(s|m|h|d|sec|secs|second|seconds|min|mins|minute|minutes|hour|hours|day|days)([^a-z]|$)" <<<"$frag" || return 0
+  printf '%s' "$frag"
+}
+
 cmd_stats() {
   local name="" all=0 want_health=-1   # want_health: -1=unset (default by mode)
   while [[ $# -gt 0 ]]; do
@@ -2721,16 +2771,10 @@ cmd_stats() {
   # pane (e.g. not root). Only meaningful while active.
   local health="null"
   if (( want_health )) && [[ "$active" == "active" ]]; then
-    local pane
+    local pane blob
     pane=$(sudo -u "agent-${name}" tmux capture-pane -t "agent-${name}" -p -S -40 2>/dev/null | tail -c 4000 || true)
-    if [[ -n "$pane" ]]; then
-      if grep -qiE "session limit|usage limit|hit your (usage|session) limit|rate limit|/rate-limit-options" <<<"$pane"; then
-        local reset; reset=$(grep -oiE "resets?[^|]*" <<<"$pane" | head -1 | tr -s ' ' | sed 's/[[:space:]]*$//') || reset=""
-        health=$(jq -cn --arg d "${reset:-no reset time shown}" '{cause:"rate_limited", detail:$d}')
-      elif grep -qiE "(sign ?in|log ?in|authenticate|re-?authenticate|enter your api key)" <<<"$pane"; then
-        health=$(jq -cn '{cause:"auth", detail:"sitting at a login screen — re-auth needed"}')
-      fi
-    fi
+    blob=$(stall_health_from_pane "$pane")
+    if [[ -n "$blob" ]]; then health="$blob"; fi
   fi
 
   if (( JSON_MODE )); then
