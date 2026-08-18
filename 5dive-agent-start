@@ -1447,6 +1447,131 @@ if [[ "$TYPE" == "claude" && -n "${WORKDIR:-}" ]]; then
   unset _wtr_cfg _wtr_dir _wtr_root _wtr_base _wtr_next _wtr_tmp 2>/dev/null || :
 fi
 
+# DIVE-1591: pre-answer Claude Code's custom-API-key gate.
+#
+# A non-empty ANTHROPIC_API_KEY — every BYO-provider auth profile carries one,
+# and so does any profile set up by pasting a key — arms a first-boot prompt
+# that a normally-OAuth'd claude agent NEVER sees:
+#
+#     Detected a custom API key in your environment
+#     ANTHROPIC_API_KEY: sk-ant-...<tail>
+#         1. Yes
+#       > 2. No (recommended)          <-- default selection
+#
+# Nothing in 5dive answers it, so the session parks on that pane forever and
+# the agent is BORN ASLEEP: it never reaches a live session unattended, no
+# matter how correct its create-time wiring is. That is the whole of DIVE-1591
+# ("dashboard chat broken on claude agents with the openrouter provider,
+# --channels ignored"): the flag was always fine — AGENT_CHANNELS lands in the
+# registry and reaches the claude argv — but the channel plugin's connect races
+# the stalled window, fails, and is cached in ~/.claude/mcp-needs-auth-cache.json,
+# which Claude Code never retries (the DIVE-841 gotcha). Deleting that cache
+# does not help; the next boot re-writes it from the same stall.
+#
+# Answer it the way the interactive toggle does. Measured in the 2.1.222 bundle
+# on this host: the key is normalised by `e.trim().slice(-20)` and membership in
+# `.customApiKeyResponses.approved` gates BOTH the prompt AND the credential
+# lookup (`if (t && config.customApiKeyResponses?.approved?.includes(Jne(t)))
+# return {key:t, source:"ANTHROPIC_API_KEY"}`) — so seeding it is what makes the
+# key usable at all, not merely what silences a dialog.
+#
+# Runs on EVERY boot rather than once at create:
+#   - the tail is key-specific, so a rotated profile key re-approves itself
+#     instead of silently re-arming the prompt on the next restart;
+#   - it back-fills agents that were created before this fix without a recreate.
+# The .rejected removal is not belt-and-braces: the prompt's default selection
+# is "No (recommended)", so a single stray Enter into that pane (heartbeat
+# injector, poller wake, a trust-accepter aimed at a different dialog) pins the
+# agent off permanently — the first DIVE-1591 probe ended up with the same key
+# in BOTH lists. Best-effort throughout: a malformed or unwritable config must
+# never keep the agent from launching.
+if [[ "$TYPE" == "claude" && -n "${ANTHROPIC_API_KEY:-}" ]]; then
+  # Resolve the file Claude Code will actually OPEN, the way its own reader does,
+  # instead of hardcoding one path. Re-derived from the 2.1.234 native bundle
+  # (unchanged in shape from 2.1.222, but the path resolution was never mirrored):
+  #
+  #   function hAy(){ if (existsSync(join(In(), ".config.json"))) return join(In(), ".config.json");
+  #                   return join(process.env.CLAUDE_CONFIG_DIR || homedir(), `.claude${dat()}.json`) }
+  #   function dat(){ if (CLAUDE_CODE_CUSTOM_OAUTH_URL) return "-custom-oauth";
+  #                   switch (oauthEnv()) { case "local": return "-local-oauth";
+  #                                         case "staging": return "-staging-oauth";
+  #                                         case "prod": return "" } }
+  #
+  # Two ways the old hardcoded "$HOME/.claude.json" becomes a file nobody reads,
+  # and in BOTH the failure is a silent no-op — the seed reports success, the
+  # gate stays armed, and the journal cannot tell you which happened. That is the
+  # exact failure class this block exists to end, so mirror the reader:
+  #   1. an existing $HOME/.claude/.config.json wins outright over the dotfile;
+  #   2. a non-prod OAuth environment suffixes the filename.
+  #
+  # CLAUDE_CONFIG_DIR is DELIBERATELY NOT consulted. /etc/profile.d/5dive-shared-configs.sh
+  # exports it as /home/claude/.claude into every login shell and agents launch
+  # `bash --login`, but the launch string below `unset`s it before exec'ing claude
+  # — so the reader resolves against $HOME and honouring it here would write the
+  # one file claude is guaranteed not to open. That `unset` is now load-bearing
+  # for this seed, not only for the per-agent settings.json preseed; see the
+  # comment on it below before removing it.
+  if [[ -n "${CLAUDE_CODE_CUSTOM_OAUTH_URL:-}" ]]; then
+    _cak_sfx="-custom-oauth"
+  elif [[ -n "${USE_LOCAL_OAUTH:-}" ]]; then
+    _cak_sfx="-local-oauth"
+  elif [[ -n "${USE_STAGING_OAUTH:-}" ]]; then
+    _cak_sfx="-staging-oauth"
+  else
+    _cak_sfx=""
+  fi
+  if [[ -f "$HOME/.claude/.config.json" ]]; then
+    _cak_cfg="$HOME/.claude/.config.json"
+  else
+    _cak_cfg="$HOME/.claude${_cak_sfx}.json"
+  fi
+  _cak_base='{}'
+  if [[ -r "$_cak_cfg" ]] && jq -e 'type == "object"' "$_cak_cfg" >/dev/null 2>&1; then
+    _cak_base=$(cat "$_cak_cfg")
+  elif [[ -e "$_cak_cfg" ]]; then
+    echo "[5dive] agent=${NAME} WARN: ${_cak_cfg} unreadable or not a JSON object — seeding a fresh one" >&2
+  fi
+  # `.[-20:]` on a shorter string yields the whole string, matching slice(-20).
+  _cak_next=$(jq -c --arg k "${ANTHROPIC_API_KEY}" '
+      ($k | sub("^[[:space:]]+"; "") | sub("[[:space:]]+$"; "") | .[-20:]) as $tail
+      | .customApiKeyResponses = {
+          approved: ((((.customApiKeyResponses.approved // []) | map(select(. != $tail))) + [$tail])),
+          rejected: ((.customApiKeyResponses.rejected // []) | map(select(. != $tail)))
+        }
+    ' <<<"$_cak_base" 2>/dev/null) || _cak_next=""
+  if [[ -n "$_cak_next" ]]; then
+    if _cak_tmp=$(mktemp "${_cak_cfg}.XXXXXX" 2>/dev/null); then
+      if printf '%s\n' "$_cak_next" > "$_cak_tmp" 2>/dev/null \
+         && chmod 600 "$_cak_tmp" 2>/dev/null \
+         && mv "$_cak_tmp" "$_cak_cfg" 2>/dev/null; then
+        # Say so. A silent success and a block that never ran are the same
+        # journal, and that ambiguity cost a whole smoke cycle on 2026-08-05:
+        # the gate came back armed and nothing on the box could tell us whether
+        # the seed had been written, skipped for an empty key, or never reached.
+        # Only the last 6 chars of the tail — enough to correlate with the key
+        # in the prompt, never enough to be a credential.
+        echo "[5dive] agent=${NAME} seeded claude custom-API-key approval (…${ANTHROPIC_API_KEY: -6})" >&2
+      else
+        rm -f "$_cak_tmp" 2>/dev/null || :
+        echo "[5dive] agent=${NAME} WARN: could not write ${_cak_cfg} — custom-API-key prompt may stall this session" >&2
+      fi
+    else
+      echo "[5dive] agent=${NAME} WARN: could not stage a temp file next to ${_cak_cfg} — custom-API-key prompt may stall this session" >&2
+    fi
+  else
+    echo "[5dive] agent=${NAME} WARN: could not build the custom-API-key approval — prompt may stall this session" >&2
+  fi
+  unset _cak_cfg _cak_sfx _cak_base _cak_next _cak_tmp 2>/dev/null || :
+elif [[ "$TYPE" == "claude" ]]; then
+  # The other silent path, and the one that is indistinguishable from "the fix
+  # is not installed" when you are reading a journal from a box you cannot ssh
+  # into. An empty ANTHROPIC_API_KEY here is NORMAL for an OAuth'd agent — but
+  # if claude then shows the custom-API-key prompt anyway, this line is the
+  # proof that systemd handed claude a key the launcher never saw, which is a
+  # different bug from the seed failing.
+  echo "[5dive] agent=${NAME} no ANTHROPIC_API_KEY in the launcher env — custom-API-key seed not needed (skipped)" >&2
+fi
+
 CMD_STR=$(printf '%q ' "$BIN" "${ARGS[@]}")
 
 # Headless first-boot for openclaw with no channel. The old prelude ran the
