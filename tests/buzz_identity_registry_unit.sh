@@ -16,8 +16,10 @@
 #
 # Run: bash tests/buzz_identity_registry_unit.sh   (no root, no network, no relay.)
 #
-# TIER: core — 0.7s measured on the 5dive control plane (agent-dev seat, 2026-08-18,
-# slowest of 3: 0.66/0.74/0.68s). Stated, not defaulted: it is 0.23% of the 300s PR
+# TIER: core — 1.6s measured on the 5dive control plane (agent-dev seat, 2026-08-18,
+# slowest of 3: 1.25/1.58/1.44s, re-measured after section 16 added a real `_buzz_join`
+# run — openssl + four python3 starts are the whole delta). Stated, not defaulted: it is
+# 0.53% of the 300s PR
 # core budget, and it guards the precondition the whole buzz trust model rests on —
 # a writer and a reader that must agree, which is the one class a per-PR run catches
 # and a nightly one catches a day late. No demotion argued here, per
@@ -278,6 +280,75 @@ else
     && ok_t "derive -> record -> whois round-trips on the BIP-340 vector" \
     || bad_t "derive -> record -> whois round-trips on the BIP-340 vector" "rc=$rc out='$got'"
 fi
+
+# --- 16. the join CALL SITE is REACHED, not merely present (quinn, iter 1) ----
+# Section 4 greps the two call sites. A grep cannot tell a call that RUNS from a
+# call that survives an edit textually while sitting past a `return`, inside a
+# branch nothing takes, or after a `fail`. That failure mode reads green and ships
+# a seat that is wired to the relay and invisible to `whois` — the exact defect
+# this row exists to close. So drive the REAL `_buzz_join` with the fixture
+# technique tests/buzz_last_mile_unit.sh already uses (shadow the box, not the
+# function under test) and assert the recorder was CALLED, with the derived
+# public halves and in the right order.
+#
+# `_buzz_registry_record` is the one thing shadowed here: its own behaviour is
+# graded by arms 5-13 against a real registry file. What is unproven until now is
+# that `_buzz_join` reaches it at all.
+#
+# The whole section runs in a SUBSHELL so none of these shadows leak into the
+# arms above; it reports through a log file rather than through $PASS.
+REACH_DIR=$(mktemp -d); REACH_LOG="$REACH_DIR/record.log"
+(
+  set +e
+  BIN="$REACH_DIR/buzz"; printf '#!/usr/bin/env bash\nexit 64\n' >"$BIN"; chmod +x "$BIN"
+  STATE="$REACH_DIR/state"; mkdir -p "$STATE"
+  python3 - "$STATE/config.json" "$BIN" <<'PYCFG'
+import json, sys
+json.dump({"relay_url": "https://relay.example.com",
+           "private_key": "3" * 63 + "7",
+           "channel_names": ["general"], "channels": [],
+           "buzz_path": sys.argv[2]}, open(sys.argv[1], "w"), indent=2)
+PYCFG
+  # Shadow the box: `sudo -u X` becomes "run it as me", state is the temp dir,
+  # the registry is one fixture seat, and no binary exists except the one the
+  # config names (so a PATH accident cannot stand in for the real resolution).
+  sudo() { while (($#)); do case "$1" in -u) shift 2 ;; -H|-n) shift ;; *) break ;; esac; done; "$@"; }
+  ensure_state() { :; }
+  registry_read() { printf '%s' '{"agents":{"dev":{"type":"claude","channels":"buzz"}}}'; }
+  _buzz_state_dir() { printf '%s\n' "$STATE"; }
+  _buzz_resolve_binary() { return 1; }
+  _buzz_registry_record() { printf '%s %s %s\n' "$1" "$2" "$3" >>"$REACH_LOG"; }
+  # The stub binary exits 64 on every call, so the channel loop below the record
+  # gets nowhere and `_buzz_join` may `fail` (which exits) — irrelevant and on
+  # purpose: the record sits ABOVE that loop, so an arm that needed a working
+  # relay to observe it would be grading the relay.
+  ( _buzz_join dev ) >/dev/null 2>&1
+) >/dev/null 2>&1
+REACH=$(cat "$REACH_LOG" 2>/dev/null)
+# d = 0x3…37 for the agent key the fixture config carries; the owner key is minted
+# by `_buzz_owner_key` at run time, so its value is asserted as a shape (64 hex,
+# and NOT the agent's own key) rather than as a literal.
+AGENT_PUB=$(printf '%s' "$(printf '3%.0s' {1..63})7" | _buzz_xonly_pubkey 2>/dev/null)
+grep -qx "dev pubkey ${AGENT_PUB}" <<<"$REACH" \
+  && ok_t "join REACHES the writer with the seat's own derived pubkey (executed, not grepped)" \
+  || bad_t "join REACHES the writer with the seat's own derived pubkey (executed, not grepped)" \
+           "want 'dev pubkey $AGENT_PUB'; the recorder saw: ${REACH:-<nothing — the call site never ran>}"
+OWNER_LINE=$(grep '^dev owner_pubkey ' <<<"$REACH" | head -1)
+OWNER_PUB="${OWNER_LINE##* }"
+{ [[ "$OWNER_PUB" =~ ^[0-9a-fA-F]{64}$ ]] && [[ "$OWNER_PUB" != "$AGENT_PUB" ]]; } \
+  && ok_t "join REACHES the writer with the PAIRED HANDSET key, distinct from the agent's own" \
+  || bad_t "join REACHES the writer with the PAIRED HANDSET key, distinct from the agent's own" \
+           "owner_pubkey line was '${OWNER_LINE:-<absent>}' (agent pubkey is $AGENT_PUB)"
+# Not a style point: `pubkey` is the backfill for seats enabled before this row,
+# and it is written unconditionally BEFORE owner_pubkey. An edit that reorders
+# them past a `fail` would drop the backfill silently.
+[[ "$(grep -c . <<<"$REACH")" -eq 2 && "$(head -1 <<<"$REACH" | awk '{print $2}')" == "pubkey" ]] \
+  && ok_t "join records exactly the two public fields, own pubkey first" \
+  || bad_t "join records exactly the two public fields, own pubkey first" "recorder saw: ${REACH:-<nothing>}"
+grep -qE '"?(private_key|nsec)|3{20}' <<<"$REACH" \
+  && bad_t "no private material reaches the writer from join" "recorder saw: $REACH" \
+  || ok_t "no private material reaches the writer from join"
+rm -rf "$REACH_DIR"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
