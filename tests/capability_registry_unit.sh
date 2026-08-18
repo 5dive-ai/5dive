@@ -130,8 +130,11 @@ want "the fully-granted corner really emits every brokered verb" \
      '( p=$(render_standard_sudoers testuser 1 1); for s in $(broker_surfaces); do grep -qE "5dive $(broker_surface "$s" verb)\$" <<<"$p" || exit 1; done )'
 want "the ungranted corner emits NONE of them" \
      '( p=$(render_standard_sudoers testuser 0 0); for s in $(broker_surfaces); do grep -qE "5dive $(broker_surface "$s" verb)\$" <<<"$p" && exit 1; done; exit 0 )'
+# DIVE-3573: the SET, not the count. A bare number went stale the moment a fifth
+# unconditional grant landed (buzz_inbound) and said only "4 != 5" — it named
+# neither what appeared nor what vanished, which is the one thing this arm is for.
 want "unconditional grants are always declared" \
-     '[[ "$(_capability_names_for_standard 0 | wc -l)" -eq 4 ]]'
+     '[[ "$(_capability_names_for_standard 0 | sort | tr "\n" " ")" == "a2a_capture a2a_deliver audit_append buzz_inbound self_restart " ]]'
 want "an omitted can_deploy arg defaults to NOT granted (every pre-INST-5 caller)" \
      '[[ "$(render_standard_sudoers testuser 1)" == "$(render_standard_sudoers testuser 1 0)" ]] && ! grep -q "_deploy_do" <<<"$(render_standard_sudoers testuser 1)"'
 

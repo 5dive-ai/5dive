@@ -39,6 +39,9 @@ cmd_agent_buzz() {
     owner)  shift; _buzz_owner "$@" ;;
     pair)   shift; _buzz_pair "$@" ;;
     whois)  shift; _buzz_whois "$@" ;;
+    # DIVE-3573 — the bridge's inbound router. No target argument by design: it
+    # delivers to the CALLING seat's own pane (src/cmd_agent_buzz_bridge.sh).
+    inbound) shift; _buzz_inbound "$@" ;;
     status) shift; _buzz_status "$@" ;;
     ""|-h|--help)
       fail "$E_USAGE" "usage: 5dive agent buzz enable <name> [--relay=<https://…>] [--channels=<csv>] [--poll-ms=<n>] [--buzz-path=<path>] [--rotate-key] [--no-join]
@@ -46,8 +49,9 @@ cmd_agent_buzz() {
        5dive agent buzz owner <name> [--envelope]
        5dive agent buzz pair <name> [--timeout=<secs>]
        5dive agent buzz status <name>
-       5dive agent buzz whois <pubkey|npub1…> [--role]" ;;
-    *) fail "$E_USAGE" "unknown buzz verb '$verb' (enable|join|owner|pair|status|whois)" ;;
+       5dive agent buzz whois <pubkey|npub1…> [--role]
+       5dive agent buzz inbound --pubkey=<pubkey|npub1…> --message-file=<path> [--channel=<id>] [--event=<id>]" ;;
+    *) fail "$E_USAGE" "unknown buzz verb '$verb' (enable|join|owner|pair|status|whois|inbound)" ;;
   esac
 }
 

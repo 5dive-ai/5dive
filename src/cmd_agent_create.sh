@@ -208,8 +208,9 @@ SUDOERS
 #   root-all   `NOPASSWD: ALL` — any command. WIDER than today's `admin`.
 #   cli-root   the whole 5dive CLI as root — exactly what `admin` means today.
 #   cli-scoped only the named hidden subcommands render_standard_sudoers emits
-#              (`agent _deliver|_capture|_self_restart`, `_audit_append`, and
-#              `_push_do` under --can-push) — what `standard` means.
+#              (`agent _deliver|_capture|_self_restart|buzz inbound`,
+#              `_audit_append`, and `_push_do` under --can-push) — what
+#              `standard` means.
 #   none       no sudoers entries at all — what `sandboxed` means.
 #   custom     entries matching none of the above (hand-edited / drifted).
 #   unknown    not measurable from where this ran (see sudo_grant_lines).
@@ -459,6 +460,7 @@ classify_sudo_grant() {
         ALL)                                            has_all=1 ;;
         "/usr/local/bin/5dive"|"/usr/local/bin/5dive *") has_cli=1 ;;
         "/usr/local/bin/5dive agent _deliver"*|"/usr/local/bin/5dive agent _capture"*|\
+        "/usr/local/bin/5dive agent buzz inbound"*|\
         "/usr/local/bin/5dive agent _self_restart"*|"/usr/local/bin/5dive _audit_append"*|\
         "/usr/local/bin/5dive _push_do"*|\
         "/usr/local/bin/5dive _gh_do"*|\
@@ -569,6 +571,15 @@ render_standard_sudoers() {
 # Do not edit by hand; regenerated on agent create/provision.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _deliver *
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _capture *
+# DIVE-3573: the buzz bridge's inbound router. The buzz plugin runs AS this agent
+# and cannot inject into a pane, so the trust decision and the delivery both have
+# to happen root-side. This grant confers no authority over any OTHER seat: the
+# verb has NO target argument and derives the pane it drives from SUDO_USER, so
+# the only session this agent can drive with it is its own. It also re-derives the
+# sender from the PUBLIC KEY via the registry rather than believing an identity
+# the caller asserts, which is why a wildcard here is safe: the arguments it
+# accepts are a key, a file path and two ids, all validated in the verb.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent buzz inbound *
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _audit_append
 # DIVE-1813: let this agent restart its OWN service (so /model + /restart work).
 # EXACT path, NO args, NO wildcard — the target unit is derived from SUDO_USER
