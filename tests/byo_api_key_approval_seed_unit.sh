@@ -13,13 +13,18 @@
 # line, against a fake $HOME. Pure, no root, no network, no claude binary:
 #   bash tests/byo_api_key_approval_seed_unit.sh
 set -uo pipefail
+# DIVE-3247 corpus contract: HARNESS-RC must be echoed on EVERY exit path, and bash
+# keeps only the LAST trap per signal -- so the tempdir cleanup is FOLDED IN here
+# rather than left in a second EXIT trap, which would silently replace this one.
+# Placed before the grading-tree source and before mktemp so an exit from either is
+# still reported; "${TMP:-}" because TMP is not set yet at this point.
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
 START=5dive-agent-start
 TMP="$(mktemp -d /tmp/byo-apikey-seed-unit.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 fail=0
 check() { if [[ "$2" == "$3" ]]; then echo "ok: $1"; else echo "FAIL: $1 (want=$3 got=$2)"; fail=1; fi; }
@@ -224,5 +229,10 @@ check "CLAUDE_CONFIG_DIR is ignored: nothing written under it" \
 check "no .claude.json.XXXXXX temp files left behind" \
   "$(find "$TMP" -name '.claude.json.*' -o -name '.config.json.*' | wc -l)" "0"
 
-if (( fail )); then echo "byo_api_key_approval_seed_unit: FAIL"; exit 1; fi
-echo "byo_api_key_approval_seed_unit: PASS"
+echo
+if (( fail )); then echo "byo_api_key_approval_seed_unit: FAIL"; else echo "byo_api_key_approval_seed_unit: PASS"; fi
+# DIVE-2003/DIVE-2018: the LAST EXECUTABLE LINE must name the verdict variable, or
+# tests/meta/harness-verdict-probe.sh reports UNPROBEABLE and changed-harnesses fails.
+# The old tail exited from inside the `if` and ended on a bare `echo`, which names
+# nothing. Same shape as tests/workdir_trust_seed_unit.sh's tail.
+[[ "$fail" -eq 0 ]]
