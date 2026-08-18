@@ -361,6 +361,7 @@ _buzz_join() {
 
   if ((failed > 0)); then
     warn "buzz join for '$name': ${joined} channel(s) wired, ${failed} not. The customer's handset will not see the unwired ones."
+    mark_reported  # DIVE-3558: by-design rc=3, already reported on the line above
     return 3
   fi
   ok "buzz last mile done for '$name' — ${joined} channel(s) (${created} created), customer key ${owner_pub:0:16}… is a member, profile + presence published."
