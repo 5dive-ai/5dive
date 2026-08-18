@@ -96,6 +96,14 @@ printf '%s' "${NPUB%?}7" | _buzz_npub_to_hex >/dev/null 2>&1 \
 
 # --- fixture: a real registry in a scratch state dir ------------------------
 TMP=$(mktemp -d); trap 'rc=$?; rm -rf "$TMP"; echo "HARNESS-RC=$rc"' EXIT
+
+# DIVE-3592: the OWNER identity is per SERVER now — `_buzz_owner_key` reads and
+# writes ${STATE_DIR}/buzz/owner.json and mirrors it per agent. The default
+# /var/lib/5dive is root-owned, so an unprivileged harness that exercises `join`
+# has to own a STATE_DIR of its own. Set AFTER the source on purpose: REGISTRY
+# and friends are computed from STATE_DIR at source time and the seams below
+# depend on those staying put; the owner path is read at CALL time.
+STATE_DIR="$TMP/state"
 REGISTRY="$TMP/agents.json"
 REGISTRY_LOCK="$TMP/agents.lock"
 IN_REGISTRY_LOCK=1        # writer is called under the lock in production

@@ -254,30 +254,114 @@ print("    resolved channel ids written to " + path)
 ' >&2
 }
 
-# Mint (once) the customer's handset identity. Same one-key-per-agent rule the
-# agent's own identity follows: a re-run must not rotate a key a paired handset
-# already holds, or the customer silently loses the room.
-_buzz_owner_key() { # <name> <user> [rotate]
-  local name="$1" user="$2" rotate="${3:-false}" state file key=""
-  state=$(_buzz_state_dir "$name")
-  file="${state}/owner.json"
-  if [[ "$rotate" != "true" ]]; then
-    key=$(sudo -u "$user" python3 -c "
+# ---------------------------------------------------------------------------
+# THE OWNER IDENTITY IS PER SERVER, NOT PER AGENT (DIVE-3592).
+#
+# One phone, one QR, one identity. "Which agent should your phone pair with?"
+# was an artifact of this key being minted per agent, and it is the wrong
+# question: the handset belongs to the person who owns the BOX. The only
+# per-agent choice is whether an agent talks in team chat, and that one already
+# has its own verb (`agent buzz enable`).
+#
+# The key lives at ${STATE_DIR}/buzz/owner.json (root-owned, 0600) and is
+# MIRRORED into each buzz agent's state dir. The mirror is a COPY, never a
+# second identity: the pairing session runs as the agent user and `agent buzz
+# owner <name>` reads it there, so every existing reader keeps working and they
+# now all answer with the SAME key. A mirror that has drifted from the server
+# key is the bug this row exists to end, so the mirror is rewritten on every
+# call rather than only when missing.
+#
+# ADOPTION, not a fresh mint, when the server file is absent and an agent
+# already holds an owner key: a handset paired before this change holds THAT
+# nsec, and minting a new server key would evict it from every room while every
+# surface still reported success. Adoption is deterministic (registry order)
+# and says out loud whose key became the server's.
+# ---------------------------------------------------------------------------
+_buzz_server_owner_file() { printf '%s/buzz/owner.json\n' "$STATE_DIR"; }
+
+# Read `private_key` out of an owner.json AS <user> (the file is 0600 and
+# agent-owned; root passes -u for the mirrors it did not write). Prints the key
+# or nothing — never fails the caller, because "absent" is a normal answer here.
+_buzz_read_owner_key() { # <user> <file>
+  local out
+  out=$(sudo -u "$1" python3 -c "
 import json, sys
 try:
-    print(json.load(open(sys.argv[1])).get('private_key', ''))
+    print(json.load(open(sys.argv[1])).get('private_key', '') or '')
 except Exception:
     print('')
-" "$file" 2>/dev/null || echo "")
+" "$2" 2>/dev/null) || out=""
+  printf '%s' "${out//[$'\n\r\t ']/}"
+}
+
+# Every agent that has a buzz config, in registry order. The predicate is the
+# CONFIG, not the registry's channel list: a seat whose channels were declared
+# but never enabled has no relay and no key, and joining on its behalf would be
+# a relay call with nothing to make it with.
+_buzz_enabled_agents() {
+  local reg names n
+  reg=$(registry_read)
+  names=$(jq -r '(.agents // {}) | keys[]?' <<<"$reg" 2>/dev/null) || names=""
+  while IFS= read -r n; do
+    [[ -n "$n" ]] || continue
+    if sudo -u "agent-$n" test -f "$(_buzz_state_dir "$n")/config.json" 2>/dev/null; then
+      printf '%s\n' "$n"
+    fi
+  done <<<"$names"
+  return 0
+}
+
+# The server-level owner key: read it, else adopt an agent's, else mint one.
+# <rotate>=true forces a NEW key — which evicts every already-paired handset
+# from every room, so it is only reachable through an explicit flag.
+_buzz_server_owner_key() { # [rotate]
+  local rotate="${1:-false}" file key="" adopted="" a cand
+  file=$(_buzz_server_owner_file)
+  if [[ "$rotate" != "true" ]]; then
+    key=$(_buzz_read_owner_key "$(id -un)" "$file")
+    if [[ ! "$key" =~ ^[0-9a-fA-F]{64}$ ]]; then
+      while IFS= read -r a; do
+        [[ -n "$a" ]] || continue
+        cand=$(_buzz_read_owner_key "agent-$a" "$(_buzz_state_dir "$a")/owner.json")
+        if [[ "$cand" =~ ^[0-9a-fA-F]{64}$ ]]; then key="$cand"; adopted="$a"; break; fi
+      done < <(_buzz_enabled_agents)
+    fi
   fi
   if [[ ! "$key" =~ ^[0-9a-fA-F]{64}$ ]]; then
     key=$(openssl rand -hex 32 2>/dev/null) \
-      || { echo "openssl is required to mint the customer's pairing key" >&2; return 1; }
-    local pub
-    pub=$(printf '%s' "$key" | _buzz_xonly_pubkey) || return 1
-    # Written by the same stdin discipline as config.json — 0600, agent-owned,
-    # and the key is never an argv element.
-    printf '%s' "$key" | sudo -u "$user" env STATE="$state" PUB="$pub" python3 -c '
+      || { echo "openssl is required to mint the owner pairing key" >&2; return 1; }
+  fi
+  local pub
+  pub=$(printf '%s' "$key" | _buzz_xonly_pubkey) || return 1
+  # Root-owned, 0600, and the key is never an argv element — the same discipline
+  # config.json and the mirrors below are written with.
+  printf '%s' "$key" | env OWNER_FILE="$file" PUB="$pub" python3 -c '
+import json, os, sys
+key = sys.stdin.read().strip()
+path = os.environ["OWNER_FILE"]
+os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    json.dump({"private_key": key, "pubkey": os.environ["PUB"],
+               "role": "owner", "scope": "server",
+               "note": "the BOX OWNER handset identity (DIVE-3592) — one per server, transferred by the DIVE-3300 pairing envelope. Mirrored per agent; not any agent key."}, f, indent=2)
+os.chmod(path, 0o600)
+' >&2 || return 1
+  if [[ -n "$adopted" ]]; then
+    step "Owner identity adopted from agent '$adopted' (${pub:0:16}…) — a handset paired before DIVE-3592 holds this key, so it keeps its rooms."
+  fi
+  printf '%s\n' "$key"
+}
+
+# The customer's handset identity, as this agent sees it: the SERVER key,
+# mirrored into the agent's own state dir. Same signature as before, so every
+# caller (join, owner, pair) keeps working — they just all get one key now.
+_buzz_owner_key() { # <name> <user> [rotate]
+  local name="$1" user="$2" rotate="${3:-false}" state key pub
+  state=$(_buzz_state_dir "$name")
+  key=$(_buzz_server_owner_key "$rotate") || return 1
+  pub=$(printf '%s' "$key" | _buzz_xonly_pubkey) || return 1
+  printf '%s' "$key" | sudo -u "$user" env STATE="$state" PUB="$pub" python3 -c '
 import json, os, sys
 key = sys.stdin.read().strip()
 state = os.environ["STATE"]
@@ -286,11 +370,10 @@ path = os.path.join(state, "owner.json")
 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 with os.fdopen(fd, "w") as f:
     json.dump({"private_key": key, "pubkey": os.environ["PUB"],
-               "role": "owner",
-               "note": "the CUSTOMER handset identity — transferred by the DIVE-3300 pairing envelope. Not the agent key."}, f, indent=2)
+               "role": "owner", "scope": "server-mirror",
+               "note": "MIRROR of the server owner identity (DIVE-3592). One handset identity per BOX; edit /var/lib/5dive/buzz/owner.json, never this copy."}, f, indent=2)
 os.chmod(path, 0o600)
 ' >&2 || return 1
-  fi
   printf '%s\n' "$key"
 }
 
@@ -497,7 +580,10 @@ _buzz_join() {
   fi
   ok "buzz last mile done for '$name' — ${joined} channel(s) (${created} created), customer key ${owner_pub:0:16}… is a member, profile + presence published."
   ok "The poller picks the resolved ids up on restart: sudo 5dive agent restart $name"
-  ok "Pair a handset: the envelope is \`5dive agent buzz owner $name --envelope\` (relayUrl/pubkey/nsec, DIVE-3300)."
+  # DIVE-3592: the handset is the BOX owner's, so the pairing verb is the server
+  # one. Naming the per-agent form here is what taught the dashboard to ask which
+  # agent a phone belongs to.
+  ok "Pair a handset: sudo 5dive buzz pair — ONE QR for this server (the raw envelope is \`5dive buzz owner --envelope\`, relayUrl/pubkey/nsec, DIVE-3300)."
   return 0
 }
 
