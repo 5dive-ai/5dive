@@ -16,10 +16,10 @@
 #
 # Run: bash tests/buzz_identity_registry_unit.sh   (no root, no network, no relay.)
 #
-# TIER: core — 1.6s measured on the 5dive control plane (agent-dev seat, 2026-08-18,
-# slowest of 3: 1.25/1.58/1.44s, re-measured after section 16 added a real `_buzz_join`
-# run — openssl + four python3 starts are the whole delta). Stated, not defaulted: it is
-# 0.53% of the 300s PR
+# TIER: core — 1.8s measured on the 5dive control plane (agent-dev seat, 2026-08-18,
+# slowest of 3: 1.75/1.73/1.65s, re-measured after sections 16-17 added real `_buzz_join`
+# and `_buzz_enable` runs — openssl plus a handful of python3 starts are the whole delta).
+# Stated, not defaulted: it is 0.6% of the 300s PR
 # core budget, and it guards the precondition the whole buzz trust model rests on —
 # a writer and a reader that must agree, which is the one class a per-PR run catches
 # and a nightly one catches a day late. No demotion argued here, per
@@ -349,6 +349,45 @@ grep -qE '"?(private_key|nsec)|3{20}' <<<"$REACH" \
   && bad_t "no private material reaches the writer from join" "recorder saw: $REACH" \
   || ok_t "no private material reaches the writer from join"
 rm -rf "$REACH_DIR"
+
+# --- 17. the ENABLE call site is REACHED too, on the --no-join backfill path --
+# Same argument as 16, for the other writer — and on the path the row documents as
+# the relay-free backfill for seats enabled before this change, so a break here is
+# exactly "the fix does not reach the seats it was written for". `--no-join` keeps
+# the fixture to the shadows `enable` itself needs; the record sits above the last
+# mile either way. (The full enable->join chain is graded in buzz_last_mile_unit.)
+REACH2_DIR=$(mktemp -d); REACH2_LOG="$REACH2_DIR/record.log"
+(
+  set +e
+  BIN="$REACH2_DIR/buzz"; printf '#!/usr/bin/env bash\nexit 64\n' >"$BIN"; chmod +x "$BIN"
+  STATE="$REACH2_DIR/state"; mkdir -p "$STATE"
+  sudo() { while (($#)); do case "$1" in -u) shift 2 ;; -H|-n) shift ;; *) break ;; esac; done; "$@"; }
+  ensure_state() { :; }
+  registry_read() { printf '%s' '{"agents":{"dev":{"type":"claude","channels":"buzz"}}}'; }
+  _buzz_state_dir() { printf '%s\n' "$STATE"; }
+  _buzz_resolve_binary() { printf '%s\n' "$BIN"; }
+  install_channel_for_agent() { :; }
+  cmd_config() { :; }
+  id() { [[ "${1:-}" == "-u" && -n "${2:-}" ]] && return 0; command id "$@"; }
+  _buzz_registry_record() { printf '%s %s %s\n' "$1" "$2" "$3" >>"$REACH2_LOG"; }
+  ( _buzz_enable dev --relay=https://relay.example.com --channels=general \
+      --buzz-path="$BIN" --no-join ) >/dev/null 2>&1
+) >/dev/null 2>&1
+REACH2=$(cat "$REACH2_LOG" 2>/dev/null)
+# enable MINTS the key, so the value is unknown here — assert the shape and the
+# field, and that the seat it names is the one enable was asked about.
+EN_LINE=$(grep '^dev pubkey ' <<<"$REACH2" | head -1)
+EN_PUB="${EN_LINE##* }"
+[[ "$EN_PUB" =~ ^[0-9a-fA-F]{64}$ ]] \
+  && ok_t "enable REACHES the writer with a derived 64-hex pubkey (executed, not grepped)" \
+  || bad_t "enable REACHES the writer with a derived 64-hex pubkey (executed, not grepped)" \
+           "recorder saw: ${REACH2:-<nothing — the --no-join backfill path never records>}"
+# --no-join must NOT invent an owner: the handset key is decided by `join` and
+# nowhere else, and a placeholder there would map a stranger onto the owner slot.
+grep -q 'owner_pubkey' <<<"$REACH2" \
+  && bad_t "enable --no-join records no owner_pubkey (only join decides it)" "recorder saw: $REACH2" \
+  || ok_t "enable --no-join records no owner_pubkey (only join decides it)"
+rm -rf "$REACH2_DIR"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
