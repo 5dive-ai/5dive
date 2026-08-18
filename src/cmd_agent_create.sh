@@ -2733,6 +2733,23 @@ cmd_create() {
   # real file — manual host logins win. Best-effort; never fails the create.
   paperclip_seed_for_type "$type" "$profile" 2>/dev/null || true
 
+  # DIVE-3568: hand the customer a session whose channel flags are WARM. The
+  # first boot above is a warm-up; this restarts into the session they keep.
+  # Only claude takes a runtime --channels flag (see 5dive-agent-start's
+  # channel switch) — the poll-fork runtimes re-read their channel state from
+  # disk on every tick, so they have no cold-flag window to close and are
+  # skipped rather than paid for. See warm_channel_capability_restart().
+  local warm_restart="skipped"
+  if [[ "$type" == "claude" ]] && [[ -n "$channels" && "$channels" != "none" ]]; then
+    step "Restarting ${name} once so its channel flags are warm (DIVE-3568)"
+    if warm_channel_capability_restart "$name"; then
+      warm_restart="restarted"
+    else
+      warm_restart="failed"
+      warn "channel warm-up restart failed for '$name' — the agent is UP but its channels may be ignored for this session: sudo systemctl restart 5dive-agent@${name}.service"
+    fi
+  fi
+
   local effective_workdir="${workdir:-$DEFAULT_WORKDIR}"
   # autoPaired: telegram agent whose allowFrom was seeded at create (explicit
   # --telegram-allowed-users or the shared operator store), so it accepts the
@@ -2857,8 +2874,9 @@ cmd_create() {
     (( ${#_hc_ok[@]} > 0 )) && warn "  (ok: ${_hc_ok[*]})"
   fi
   ok "agent '$name' (type=$type, channels=$channels${profile:+, profile=$profile}) is running." \
-     '{name:$n, type:$t, channels:$c, workdir:$w, authProfile:$p, created:true, autoPaired:$ap, skills:{installed:$inst, failed:$fail}, teamBot:$tb}' \
+     '{name:$n, type:$t, channels:$c, workdir:$w, authProfile:$p, created:true, autoPaired:$ap, skills:{installed:$inst, failed:$fail}, teamBot:$tb, channelWarmRestart:$wr}' \
      --arg n "$name" --arg t "$type" --arg c "$channels" --arg w "$effective_workdir" --arg p "${profile:-}" \
+     --arg wr "$warm_restart" \
      --argjson ap "$auto_paired" \
      --argjson inst "$installed_skills_json" --argjson fail "$failed_skills_json" --arg tb "$team_bot_status"
 }
