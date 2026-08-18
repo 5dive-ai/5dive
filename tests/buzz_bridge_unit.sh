@@ -149,10 +149,10 @@ V=$(route_probe 0 "olivia agent" dev)
 grep -q 'route=a2a' <<<"$V" \
   && ok_t "6a a known teammate key routes to a2a" \
   || bad_t "6a a known teammate key routes to a2a" "$V"
-grep -q 'to=dev from=buzz:olivia' "$SENT_LOG" \
-  && ok_t "6a it is delivered to the CALLING seat, under from=buzz:<seat>" \
-  || bad_t "6a it is delivered to the CALLING seat, under from=buzz:<seat>" "$(cat "$SENT_LOG")"
-# from=buzz:<seat>, never a bare seat name: the message came from that seat's KEY
+grep -q 'to=dev from=buzz-olivia' "$SENT_LOG" \
+  && ok_t "6a it is delivered to the CALLING seat, under from=buzz-<seat>" \
+  || bad_t "6a it is delivered to the CALLING seat, under from=buzz-<seat>" "$(cat "$SENT_LOG")"
+# from=buzz-<seat>, never a bare seat name: the message came from that seat's KEY
 # relayed by this bridge, not from that seat's own a2a process, and per-message
 # signature verification is deferred. A reader must be able to tell those apart —
 # and a bare name would also collide with the registered-agent namespace the
@@ -357,15 +357,15 @@ real_probe() { # <extra-flags…>
 }
 : > "$SENT_LOG"
 V=$(real_probe --json)
-jq -e '.ok == true and .data.route == "a2a" and .data.seat == "olivia" and .data.from == "buzz:olivia"' <<<"$V" >/dev/null 2>&1 \
+jq -e '.ok == true and .data.route == "a2a" and .data.seat == "olivia" and .data.from == "buzz-olivia"' <<<"$V" >/dev/null 2>&1 \
   && ok_t "13 the real reader + the real registry route to a2a under --json" \
   || bad_t "13 the real reader + the real registry route to a2a under --json" "$V"
-grep -qx 'to=dev from=buzz:olivia' "$SENT_LOG" \
+grep -qx 'to=dev from=buzz-olivia' "$SENT_LOG" \
   && ok_t "13 ...and the rail is handed the calling seat and the relayed label" \
   || bad_t "13 ...and the rail is handed the calling seat and the relayed label" "$(cat "$SENT_LOG")"
 : > "$SENT_LOG"
 V=$(real_probe)
-[[ "$V" == "route=a2a reason=delivered seat=olivia from=buzz:olivia" ]] \
+[[ "$V" == "route=a2a reason=delivered seat=olivia from=buzz-olivia" ]] \
   && ok_t "13 the plain (non --json) verdict is unchanged by the JSON path" \
   || bad_t "13 the plain (non --json) verdict is unchanged by the JSON path" "$V"
 # NEGATIVE CONTROL on the same fixture: a different key on a registry that IS
@@ -380,6 +380,60 @@ V=$( (export STATE_DIR="$REG" REGISTRY="$REG/agents.json" SUDO_USER=agent-dev SU
   && ok_t "13 a different key on the SAME readable registry is a measured no-match" \
   || bad_t "13 a different key on the SAME readable registry is a measured no-match" "$V / $(cat "$SENT_LOG")"
 rm -rf "$REG"
+
+# --- 14. THE LABEL MUST BE SPELLABLE ON THE RAIL IT RIDES --------------------
+# The arm this harness was missing, and its absence is why 40/0 was green while
+# class (c) could not deliver on ANY host (quinn, iteration 1). Every arm above
+# replaces _buzz_bridge_a2a_send and asserts the composed label is the string we
+# expected; none of them asked whether the string is ACCEPTABLE to cmd_send, which
+# runs valid_sender_label on every --from unconditionally. So: run the composed
+# value through the REAL validator, and keep the old label as the negative control
+# so this arm is measuring the validator and not just re-asserting a constant.
+valid_sender_label "buzz-olivia" \
+  && ok_t "14 the composed provenance label passes the REAL valid_sender_label" \
+  || bad_t "14 the composed provenance label passes the REAL valid_sender_label" "buzz-olivia rejected"
+valid_sender_label "buzz:olivia" \
+  && bad_t "14 NEGATIVE CONTROL: a colon-separated label is rejected by that same validator" "buzz:olivia accepted — the validator is not measuring what this arm claims" \
+  || ok_t "14 NEGATIVE CONTROL: a colon-separated label is rejected by that same validator"
+
+# ...and end to end: take the label the ROUTER actually emitted and put THAT
+# through the validator. The two checks above grade a constant; this one grades
+# the composer, so a future edit to the prefix cannot pass arm 14 by accident.
+: > "$SENT_LOG"
+V=$(route_probe 0 "olivia agent" dev)
+EMITTED=$(sed -n 's/.*from=\([^ ]*\).*/\1/p' "$SENT_LOG" | head -1)
+[[ -n "$EMITTED" ]] && valid_sender_label "$EMITTED" \
+  && ok_t "14 the label the router EMITTED ($EMITTED) passes the rail's validator" \
+  || bad_t "14 the label the router EMITTED passes the rail's validator" "emitted='$EMITTED'"
+
+# A seat name long enough to push `buzz-<seat>` past the validator's 32 chars is
+# a MEASURED known teammate whose label cannot be spelled. It must not reach the
+# rail (a guaranteed refusal), and it must not vanish either: untrusted, with a
+# reason that names the cause rather than an opaque rail rc.
+: > "$SENT_LOG"
+LONGSEAT=$(printf 'o%.0s' $(seq 32))
+V=$(route_probe 0 "$LONGSEAT agent" dev)
+[[ "$V" == *"route=untrusted"* && "$V" == *"reason=label-unspellable"* ]] && [[ ! -s "$SENT_LOG" ]] \
+  && ok_t "14 an unspellable label fails closed to untrusted and never reaches the rail" \
+  || bad_t "14 an unspellable label fails closed to untrusted and never reaches the rail" "$V / $(cat "$SENT_LOG")"
+
+# --- 15. --from MUST SURVIVE THE PATH cmd_send PICKS ------------------------
+# cmd_send's scoped branch execs into `agent _deliver`, which carries no --from,
+# so a send that took it would arrive labelled as the SEAT ITSELF — the forgery
+# the prefix exists to prevent. Root never takes that branch and this verb is
+# root-only, so the exposure is latent; graded anyway, in both directions, so it
+# does not depend silently on the caller's privilege.
+( a2a_needs_scoped() { return 1; }; _buzz_bridge_rail_carries_from dev ) \
+  && ok_t "15 the rail is used when the direct path (which carries --from) is available" \
+  || bad_t "15 the rail is used when the direct path (which carries --from) is available" "predicate said no"
+( a2a_needs_scoped() { return 0; }; _buzz_bridge_rail_carries_from dev ) \
+  && bad_t "15 NEGATIVE: the scoped path (which DROPS --from) is refused" "predicate said yes" \
+  || ok_t "15 NEGATIVE: the scoped path (which DROPS --from) is refused"
+RC=0
+( _buzz_bridge_rail_carries_from() { return 1; }; _buzz_bridge_a2a_send dev buzz-olivia /dev/null ) || RC=$?
+[[ "$RC" -eq "$E_PERMISSION" ]] \
+  && ok_t "15 ...and the send refuses with E_PERMISSION rather than dropping the label" \
+  || bad_t "15 ...and the send refuses with E_PERMISSION rather than dropping the label" "rc=$RC"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

@@ -112,7 +112,7 @@ _buzz_mirror_outbound() {
 # It answers with a ROUTE, and the answer is the contract the plugin is written
 # against:
 #
-#   a2a       — delivered on the a2a rail as from=buzz:<seat>. The plugin must
+#   a2a       — delivered on the a2a rail as from=buzz-<seat>. The plugin must
 #               NOT also deliver it into the session; it is already there.
 #   owner     — this key is the paired owner of THIS seat. Nothing delivered
 #               here: the plugin delivers it as a channel event the way the
@@ -142,8 +142,25 @@ _buzz_mirror_outbound() {
 #
 # The absolute path is the same one the sudoers grant names, so this can never
 # resolve through a PATH the calling seat controls.
+# _buzz_bridge_rail_carries_from <target-seat>
+#
+# Does cmd_send's chosen path actually CARRY --from to the receiver? On one of its
+# two paths it does not: a caller that cannot `sudo -u agent-<target>` execs into
+# `agent _deliver`, which deliberately carries no --from/--reply-to plumbing, and
+# the relayed message would then arrive labelled as the SEAT ITSELF — the exact
+# forgery the `buzz-` prefix exists to prevent, printed with an exit 0 over it.
+#
+# `agent buzz inbound` is root-only and root never takes that branch, so this is
+# latent today. It is checked anyway, and as its own predicate so the harness can
+# drive it in both directions: a guard that holds only because of a caller's
+# current privilege is not a guard, it is a coincidence with good luck.
+_buzz_bridge_rail_carries_from() {
+  ! a2a_needs_scoped "$1"
+}
+
 _buzz_bridge_a2a_send() {
   local target="$1" from_label="$2" body_file="$3"
+  _buzz_bridge_rail_carries_from "$target" || return "$E_PERMISSION"
   _5DIVE_BUZZ_BRIDGE_INBOUND=1 \
     /usr/local/bin/5dive agent send "$target" --from="$from_label" --message-file="$body_file" \
     >/dev/null 2>&1
@@ -269,16 +286,41 @@ _buzz_inbound() {
   # not exist. So: a real `5dive agent send`, which writes a real `agent send`
   # row naming the target, on top of this verb's own row naming the key.
   #
-  # from=buzz:<seat>, NOT from=<seat>, and this is not a workaround for the
+  # from=buzz-<seat>, NOT from=<seat>, and this is not a workaround for the
   # peer-forgery guard — it is the truth. The message was authored by that seat's
   # KEY and relayed by this bridge; it did not come from that seat's own a2a
   # process, and per-message signature verification is deferred. A reader must be
   # able to tell those apart. The label also stays outside the registered-agent
   # namespace the guard defends, so the guard keeps its teeth for real forgeries.
-  local from_label="buzz:${seat}"
+  #
+  # A DASH, NOT A COLON, AND THAT IS THE WHOLE FEATURE. cmd_send validates every
+  # --from with valid_sender_label (^[a-z][a-z0-9-]{0,31}$) unconditionally, and a
+  # colon is not in that class — so `buzz:<seat>` bounced inside cmd_send on EVERY
+  # known-teammate inbound, on every host, and class (c) silently degraded to
+  # today's untrusted delivery plus a sudo round trip. The acceptance's a2a AUDIT
+  # RECORD could never have existed (quinn, iteration 1). `buzz-` is inside the
+  # class, still outside the registered-agent namespace, and if a seat named
+  # `buzz-<something>` is ever created the peer-forgery guard REFUSES the send —
+  # fail-closed, not a promotion.
+  local from_label="buzz-${seat}"
+
+  # AND WE ASK THE REAL VALIDATOR, not our confidence in the composition. That is
+  # the arm the 40/0 harness did not have: every class-(c) arm replaced the send
+  # and asserted the label was the string we expected, and nothing asserted that
+  # string was ACCEPTABLE to the rail. Composition is still not proof — `buzz-`
+  # plus a 32-char seat name is 37 chars and fails the same validator — so the
+  # check runs on the composed value, here, before anything is written.
+  #
+  # It fails CLOSED TO UNTRUSTED, not to refused and not to dropped: the message
+  # still reaches the session as channel data (today's behaviour), and the reason
+  # names the cause instead of surfacing as an opaque rail rc.
+  if ! valid_sender_label "$from_label"; then
+    _buzz_inbound_verdict untrusted label-unspellable "$seat" "$from_label"
+    return 0
+  fi
 
   # THE REPLY HINT, the buzz analogue of `send --reply-to-chat`. Without it the
-  # receiver reads `from=buzz:olivia` and answers `5dive agent send buzz:olivia`,
+  # receiver reads `from=buzz-olivia` and answers `5dive agent send buzz-olivia`,
   # which is not an agent — the teammate's question would arrive and the answer
   # would go nowhere. Written by ROOT into a root-owned file alongside the body;
   # the body itself is copied VERBATIM and is never parsed, rewritten or
