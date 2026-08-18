@@ -1971,3 +1971,63 @@ managed_settings_channels_missing() {
         | "\(.plugin)@\(.marketplace)"] | join(", ")
     ' "$msj" 2>/dev/null
 }
+
+# DIVE-3568: the session `agent create` hands the customer is DEAF to the
+# channels it was created with. Measured on a virgin box (jolly-birch,
+# 2026-08-18, CLI v0.19.41 / claude-code 2.1.234): the FIRST boot printed
+#
+#   --channels ignored ... Channels are not currently available
+#
+# and that session stayed deaf for its whole life, while after ONE restart the
+# same flag was honoured and the channel attached. It self-heals, which is
+# exactly why it survived to a customer walk — every second look is healthy,
+# and the only session that is ever cold is the one the customer is handed.
+#
+# The fix is the one treatment the box itself demonstrated: restart once. The
+# first boot is demoted to a WARM-UP whose only job is to let claude-code do
+# whatever first-boot state it does; the session the customer actually gets is
+# the second one. We deliberately do NOT pre-seed claude-code's capability /
+# feature cache — that file's shape is version-coupled to whatever claude-code
+# shipped that week, and DIVE-3564 already ate 13 days of unwatched releases
+# once.
+#
+# The WAIT is an optimisation, never the fix: we poll the seat's ~/.claude.json
+# for any `cached*` key (where 2.1.234 persists its feature/config reads) so the
+# restart lands after the warm-up wrote something, and we restart REGARDLESS
+# once the budget is spent. A claude-code release that renames or moves those
+# keys therefore costs latency here, not correctness.
+#
+# Args: <name> [budget-seconds] [config-path]. Returns 0 when the unit came
+# back active, 1 when the restart failed — callers WARN and keep the agent; an
+# agent on a cold flag is still an agent, and rolling back a create over it
+# would be strictly worse than the bug.
+warm_channel_capability_restart() {
+  local name="$1" budget="${2:-45}"
+  local cfg="${3:-/home/agent-${name}/.claude.json}"
+  local waited=0 step_s=3
+  # Floor: the cache key we watch for lands within ~3s of boot (measured on
+  # this host, 510 feature entries at t+3s), which is sooner than we trust the
+  # rest of the first boot to be done. Restarting THAT early risks handing over
+  # a session warmed by a run that never finished, so never restart before the
+  # floor even when the file goes warm immediately. Capped by the budget so a
+  # caller asking for a short wait still gets one.
+  local floor_s=10; (( floor_s > budget )) && floor_s=$budget
+  if command -v jq >/dev/null 2>&1; then
+    while (( waited < budget )); do
+      if [[ -s "$cfg" ]] \
+         && jq -e 'to_entries | map(select(.key | startswith("cached"))) | length > 0' \
+              "$cfg" >/dev/null 2>&1; then
+        break
+      fi
+      sleep "$step_s"; waited=$(( waited + step_s ))
+    done
+  else
+    # No jq: we cannot read the warm-up's progress, so spend a fixed slice of
+    # the budget and restart anyway. The restart is the fix; the read is not.
+    sleep $(( budget < 15 ? budget : 15 ))
+  fi
+  (( waited < floor_s )) && { sleep $(( floor_s - waited )); waited=$floor_s; }
+  systemctl restart "5dive-agent@${name}.service" >/dev/null 2>&1 || return 1
+  systemctl is-active --quiet "5dive-agent@${name}.service" 2>/dev/null || return 1
+  return 0
+}
