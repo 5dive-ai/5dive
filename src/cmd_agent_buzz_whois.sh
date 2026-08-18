@@ -249,7 +249,14 @@ _buzz_whois() {
   fi
 
   local n=0
-  if [[ -n "$hits" ]]; then n=$(printf '%s\n' "$hits" | grep -c .); fi
+  # `|| n=0` is REQUIRED, not cosmetic: whitespace-only $hits is non-empty, yet
+  # `grep -c .` prints 0 and exits 1 — under header.sh's `set -euo pipefail` that
+  # kills this function with nothing on stdout or stderr, the exact silent-death
+  # this command's rc split exists to prevent. scripts/unguarded-probe-scan.sh
+  # enforces it (DIVE-2604).
+  if [[ -n "$hits" ]]; then
+    n=$(printf '%s\n' "$hits" | grep -c .) || n=0
+  fi
   if (( n == 0 )); then
     # MEASURED absence: the registry was read, parsed, and holds no such key.
     # This is the ONLY code that means "stranger", and it is the input the
