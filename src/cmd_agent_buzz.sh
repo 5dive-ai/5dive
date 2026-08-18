@@ -38,14 +38,16 @@ cmd_agent_buzz() {
     join)   shift; _buzz_join "$@" ;;
     owner)  shift; _buzz_owner "$@" ;;
     pair)   shift; _buzz_pair "$@" ;;
+    whois)  shift; _buzz_whois "$@" ;;
     status) shift; _buzz_status "$@" ;;
     ""|-h|--help)
       fail "$E_USAGE" "usage: 5dive agent buzz enable <name> [--relay=<https://…>] [--channels=<csv>] [--poll-ms=<n>] [--buzz-path=<path>] [--rotate-key] [--no-join]
        5dive agent buzz join <name> [--channels=<csv>] [--rotate-owner-key]
        5dive agent buzz owner <name> [--envelope]
        5dive agent buzz pair <name> [--timeout=<secs>]
-       5dive agent buzz status <name>" ;;
-    *) fail "$E_USAGE" "unknown buzz verb '$verb' (enable|join|owner|pair|status)" ;;
+       5dive agent buzz status <name>
+       5dive agent buzz whois <pubkey|npub1…> [--role]" ;;
+    *) fail "$E_USAGE" "unknown buzz verb '$verb' (enable|join|owner|pair|status|whois)" ;;
   esac
 }
 
@@ -275,6 +277,28 @@ _buzz_enable() {
     cmd_config "$name" set "channels=$next"
   fi
 
+  # DIVE-3572. The registry is the ONLY place a pubkey can be mapped back to a
+  # seat: the private key is 0600 in the agent's own home and the plugin runs as
+  # the agent, so it can derive its own key and no one else's. Recorded here, at
+  # the moment the identity is decided, because `enable` is one of exactly two
+  # writers — a second source of truth is the DIVE-3565 defect, not a backup.
+  #
+  # PUBLIC HALF ONLY, derived locally from the key we already hold. Nothing about
+  # the private key is written, logged or passed on an argv.
+  #
+  # Best-effort by construction: buzz is enabled either way, and a failure here
+  # says so out loud rather than unwinding four completed steps. The consequence
+  # of the miss is precisely that `whois` answers "unknown" for this seat, which
+  # is the SAFE direction in the trust model (untrusted, not wrongly trusted).
+  local own_pub=""
+  own_pub=$(printf '%s' "$key" | _buzz_xonly_pubkey 2>/dev/null) || own_pub=""
+  if [[ -n "$own_pub" ]]; then
+    _buzz_registry_record "$name" pubkey "$own_pub" || \
+      warn "buzz identity for '$name' was NOT recorded in the registry — \`5dive agent buzz whois\` will report this seat's key as unknown until \`sudo 5dive agent buzz enable $name --no-join\` is re-run"
+  else
+    warn "could not derive '$name''s x-only pubkey from its own config — the registry keeps no identity for this seat and \`whois\` will call its key unknown"
+  fi
+
   ok "buzz enabled for '$name' — identity minted, config written, plugin installed."
   if [[ -z "$resolved_bin" ]]; then
     warn "NOT READY: no \`buzz\` binary on this box (looked at the agent's PATH, /usr/local/bin/buzz, /opt/buzz/bin/buzz). The plugin will start and every relay call will fail until one is installed; re-run with --buzz-path=<path> once it is."
@@ -335,6 +359,12 @@ _buzz_status() {
       warn "channels are named but not RESOLVED: the buzz poller watches channel ids, so '$name' will not receive a mention until they are. Resolve them with: sudo 5dive agent buzz join $name"
     fi
   fi
+  # DIVE-3572: the READ-BACK of what enable/join wrote. `whois` is answered from
+  # these two fields and nowhere else, so an operator asking "why does the bridge
+  # not know this teammate" needs to see them next to the config that produced
+  # them — a registry with no identity is invisible from every other surface.
+  printf 'registry pubkey:  %s\n' "$(jq -r --arg n "$name" '.agents[$n].buzz.pubkey // "(absent — whois will call this seat unknown)"' <<<"$reg")"
+  printf 'registry owner:   %s\n' "$(jq -r --arg n "$name" '.agents[$n].buzz.owner_pubkey // "(absent — the paired handset is not mapped)"' <<<"$reg")"
   # Exit non-zero when it is declared but not usable, so a caller can branch on
   # it without parsing prose.
   #

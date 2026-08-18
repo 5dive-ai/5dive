@@ -244,6 +244,8 @@ SITES=(
   "src/cmd_supervisor.sh:task"  "src/cmd_pack.sh:found"      "src/cmd_account.sh:base_url"
   "src/cmd_agent_telegram.sh:token" "src/cmd_cos.sh:atok"    "src/cmd_selfupdate.sh:start_line"
   "src/cmd_doctor.sh:last_event" "src/cmd_loop_pack.sh:ident" "src/cmd_agent_config.sh:token_for_install"
+  # DIVE-3572: whois counts its own jq hits with `grep -c .`, so it joins the class.
+  "src/cmd_agent_buzz_whois.sh:n"
 )
 cp -a "$ROOT/src" "$TMP/mut-src"
 for site in "${SITES[@]}"; do

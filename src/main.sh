@@ -87,6 +87,10 @@ Agents:
                                                      # own nostr identity and write its config (0600).
                                                      # --channels=<csv> --poll-ms=<n> --buzz-path=<path>
                                                      # --rotate-key mints a NEW key (the handset must re-pair)
+  5dive agent buzz whois <pubkey|npub1…> [--role]    # DIVE-3572: pubkey -> which seat, from the registry.
+                                                     # rc 0 name on stdout · 4 MEASURED unknown · 5 ambiguous
+                                                     # · 3 not a key · 1 registry unreadable (NOT measured).
+                                                     # Read-only, no root: the buzz plugin shells to it.
   5dive agent buzz status <name>                     # is buzz actually wired? plugin/config/binary, not
                                                      # the agent unit's liveness. rc 3 = declared, not usable
   5dive agent buzz pair <name> [--timeout=<secs>]    # DIVE-3551: run the NIP-AB pairing session (QR + SAS);
@@ -717,8 +721,15 @@ main() {
         # agent's config (registry write via cmd_config, so take the lock);
         # `status` is a read-only probe — no lock, no audit, same treatment as
         # telegram-getme below.
+        #
+        # DIVE-3572: `whois` joins `status` on the lock-free side, and that is a
+        # requirement rather than an optimisation. Its caller is the buzz plugin,
+        # which runs AS the agent user; with_registry_lock calls ensure_state,
+        # which is require_root, so routing it through the mutating arm would make
+        # the one lookup the trust model depends on unusable by the only process
+        # that needs it. It reads the group-readable registry and writes nothing.
         buzz)
-          if [[ "${1:-}" == "status" ]]; then
+          if [[ "${1:-}" == "status" || "${1:-}" == "whois" ]]; then
             cmd_agent_buzz "$@"
           else
             AUDIT_CMD="agent buzz"; AUDIT_ARGS=("$@")
