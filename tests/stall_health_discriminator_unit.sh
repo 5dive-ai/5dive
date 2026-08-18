@@ -121,4 +121,10 @@ else
   echo "FAIL: positive control — the scraper never fires, every 'none' above is vacuous"; fail=1
 fi
 
-if (( fail )); then echo "RESULT: FAIL"; exit 1; else echo "RESULT: PASS"; exit 0; fi
+if (( fail )); then echo "RESULT: FAIL"; else echo "RESULT: PASS"; fi
+# DIVE-2013 / harness-verdict-probe: the verdict must be the LAST executable
+# line and in a shape the probe can identify, else `unit-tests/changed-harnesses`
+# reports this file UNPROBEABLE and reds — the one PR arm that grades a newly
+# added harness. `exit $(( fail > 0 ))` is one of the four shapes it knows; an
+# `if ... exit 1 ... else exit 0 ... fi` verdict is none of them.
+exit $(( fail > 0 ))

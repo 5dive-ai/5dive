@@ -2637,16 +2637,6 @@ cmd_clone() {
   cmd_create "${args[@]}"
 }
 
-# DIVE-3594: pull the reset time out of a rate-limit banner, or print nothing.
-# The scrape's old reset grab took ANY pane text containing "reset" (`/reset`,
-# "reset your password", a diff line) and, when even that missed, the caller
-# substituted the literal string "no reset time shown" — so the rate-limit
-# verdict was emitted whether or not anything supported it. Require a real
-# clock, date or duration token in the matched fragment:
-#   "resets at 9am" · "resets 3:00pm" · "resets in 2h 15m" · "resets 2026-08-18"
-# Anything else prints nothing, and `cmd_stats` then emits no health blob at
-# all. Deliberately conservative: a missed true rate-limit costs a banner the
-# operator can still see in the pane, a false one poisons every true banner.
 # DIVE-3594: the whole stall verdict, derived from a captured pane and nothing
 # else — pulled out of `cmd_stats` so it is gradeable without a box, a tmux
 # session or root. Prints the health JSON blob, or NOTHING when the pane gives
