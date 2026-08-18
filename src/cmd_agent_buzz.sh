@@ -83,6 +83,25 @@ _buzz_resolve_binary() {
 # So: the program goes to `python3 -c` (not secret), the non-secret fields stay in
 # the environment, and the key is piped. Nothing that holds the key is ever a
 # command-line argument, on either side of the sudo hop.
+#
+# DIVE-3565 — THE WRITER MUST SPEAK THE READER'S LANGUAGE. This used to write
+# `channels: ["general"]` — a NAME. plugins/buzz/server.ts declares
+# `channels: string[] // channel UUIDs` and hands each entry straight to
+# `buzz messages get --channel <entry>`, which answers `invalid UUID: general`.
+# It fails on EVERY tick, to stderr, forever: no state.json, no watermark, no
+# delivery. A seat wired by every one of the six sites still never answered a
+# mention (measured on jolly-birch, DIVE-3559). So the config now carries BOTH:
+#
+#   channel_names  the human names — what `join` looks up and what an operator
+#                  typed. This is the field `--channels=` populates.
+#   channels       the RESOLVED channel ids, and nothing else, because that is
+#                  the only thing the reader can use. `enable` cannot resolve
+#                  them (resolution is a relay call); `join` does, and writes
+#                  them back via `_buzz_set_channel_ids`.
+#
+# Until join resolves them `channels` is EMPTY, which is the honest state: the
+# poller has nothing to watch and says nothing, instead of erroring every 15s
+# against a name it will never accept. `_buzz_status` prints the difference.
 _buzz_write_config() { # <runas> <state_dir> <relay> <key> <channels-csv> <poll_ms> <buzz_path>
   local runas="$1" state="$2" relay="$3" key="$4" chans="$5" poll="$6" bin="$7"
   local -a pre=()
@@ -95,10 +114,27 @@ if not key:
 state = os.environ["STATE"]
 os.makedirs(state, mode=0o700, exist_ok=True)
 path = os.path.join(state, "config.json")
+names = [c.strip() for c in os.environ["CHANS"].split(",") if c.strip()]
+# A re-run must not throw away ids `join` already resolved — that would take a
+# working seat back to silent, and enable calls join AFTER this write.  Carry
+# them over only when the NAME LIST is unchanged: a different set of names makes
+# the old ids the wrong answer, not a stale one.
+prev_ids = []
+try:
+    with open(path) as f:
+        old = json.load(f)
+    if [str(n) for n in (old.get("channel_names") or [])] == names:
+        prev_ids = [str(c) for c in (old.get("channels") or [])]
+except Exception:
+    prev_ids = []
 cfg = {
     "relay_url": os.environ["RELAY"],
     "private_key": key,
-    "channels": [c.strip() for c in os.environ["CHANS"].split(",") if c.strip()],
+    # Resolved channel ids ONLY — the reader (plugins/buzz/server.ts) passes
+    # these to `buzz messages get --channel`, which takes a UUID.  Empty until
+    # `join` resolves them.
+    "channels": prev_ids,
+    "channel_names": names,
     "poll_ms": int(os.environ["POLL"]),
     "buzz_path": os.environ["BIN"],
 }
@@ -286,6 +322,19 @@ _buzz_status() {
   printf 'config readable:  %s (%s)\n' "$conf" "$cfg"
   printf 'buzz binary:      %s%s\n' "$bin" "${bin_path:+ ($bin_path)}"
   [[ "$conf" == "yes" ]] && printf 'relay_url:        %s\n' "$(jq -r '.relay_url' "$cfg" 2>/dev/null)"
+  # DIVE-3565. The field the POLLER reads, named separately from the names an
+  # operator typed — a seat can be green on every other row here and still never
+  # deliver a mention because `channels` is empty or holds a name.
+  local ch_names="" ch_ids=""
+  if [[ "$conf" == "yes" ]]; then
+    ch_names=$(jq -r '(.channel_names // []) | join(",")' "$cfg" 2>/dev/null)
+    ch_ids=$(jq -r '(.channels // []) | join(",")' "$cfg" 2>/dev/null)
+    printf 'channel names:    %s\n' "${ch_names:-none}"
+    printf 'channel ids:      %s\n' "${ch_ids:-none (the poller has nothing to watch)}"
+    if [[ -z "$ch_ids" && -n "$ch_names" ]]; then
+      warn "channels are named but not RESOLVED: the buzz poller watches channel ids, so '$name' will not receive a mention until they are. Resolve them with: sudo 5dive agent buzz join $name"
+    fi
+  fi
   # Exit non-zero when it is declared but not usable, so a caller can branch on
   # it without parsing prose.
   #
