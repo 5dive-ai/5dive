@@ -361,6 +361,137 @@ tier_cal_diverge_pct() {
   printf '%s\n' "$(( (post - pre) * 100 / pre ))"
 }
 
+# ------------------------------------------------------------------ DIVE-3580
+# ATTRIBUTE A CONFIRMED BUDGET RED BEFORE IT BLOCKS A MERGE.
+#
+# WHAT FORCED THIS (PR #708, 2026-08-18, wiki: refute-a-budget-red-with-the-next-
+# green-run-of-the-same-corpus): a graded-PASS PR was red-blocked at 306s/300s,
+# CONFIRMED on a second runner per DIVE-2829 — and main's own next run of the SAME
+# 172-harness corpus read 232s (77%) and 200s (66%). The corpus was never over.
+# Two boxes agreeing is not independence when the whole fleet draws slow the same
+# hour, and the calibration probe read the slow box at 90% (fast) while the
+# harnesses drew 129% (slow) — measured anti-correlated, again (DIVE-2736).
+#
+# THE DISCRIMINATOR THE CONFIRM JOB DID NOT HAVE, derived by hand twice on #708
+# (quinn per-file from raw logs, olivia from the next main run) and mechanical
+# here: compare this run's PER-HARNESS vector against the last GREEN main run's,
+# over the COMMON file set. A lift spread evenly across UNRELATED harnesses is
+# the box; real corpus growth is CONCENTRATED in the files that grew (or lives in
+# files the baseline has never seen, which reprice as themselves).
+#
+# ONE-SIDED, like every override on this gate: the verdict below can only turn a
+# would-be exit 4 into exit 6 (no corpus finding), never a 6 into a 4 and never a
+# green into anything. No baseline, a thin common set, or any parse failure keeps
+# the red exactly as it stands today — relief is granted only on a POSITIVE
+# measurement against a NAMED green run.
+#
+# THE TWO RESIDUALS, NAMED (each is the other instrument's job):
+#   * UNIFORM REAL GROWTH — a shared helper that slows every harness reads as
+#     weather here. That event is exactly what the DIVE-3477 growth tripwire's
+#     windowed us/harness median exists to catch, out of band, against a FIXED
+#     reference this comparison deliberately is not.
+#   * SINGLE-FILE WEATHER — a network-priced file spiking on BOTH boxes reads as
+#     concentrated, i.e. corpus. Bounded by DIVE-2592: both runs already re-timed
+#     their top-3 and kept the min, so a spike must survive min-of-two twice
+#     before it can reach this verdict at all.
+#
+# THE THRESHOLDS, derived from the one fully-measured weather pair (#708 confirm
+# 308s vs main-green 232s, same 172 files) rather than picked: top-3 excess share
+# measured 17% there, while growth concentrated in <=3 files is >=~100% by
+# construction — 50 sits ~3x above the measured weather case and strictly below
+# any small-set growth. Common-set cover measured 100%; below 80 the comparison
+# is about a different corpus and refuses. Starting values, policy like the clamp
+# pair — refutable by the next measured case, in this file, with its evidence.
+TIER_ATTR_TOP_EXCESS_N=3
+TIER_ATTR_CONC_MAX_PCT=50
+TIER_ATTR_MIN_COMMON_COVER_PCT=80
+
+# tier_budget_attribution <effective_cap_ms> <red_report> <baseline_report>...
+#
+# Reports are run-harnesses.sh TSV bodies (ms<TAB>rc<TAB>path; '#' headers are
+# skipped). Baseline reports are merged, so passing every shard of the green run
+# makes shard drift irrelevant: files are joined by NAME, and the red shard's
+# files are looked up in the whole green corpus.
+#
+# Prints ONE line:
+#   verdict=<runner|corpus|unmeasurable> reason=<slug> lift_pct=N common=N \
+#     common_cover_pct=N repriced_s=N top_excess_share_pct=N new_files=N new_s=N
+# Exit 0 only on verdict=runner (a downgrade is admissible); 1 otherwise; 2 usage.
+# The three verdicts are spelled apart for the tier_cal_ref_admissible reason: a
+# caller that cannot tell "the corpus grew" from "I could not measure" will answer
+# the wrong one.
+tier_budget_attribution() {
+  local cap_ms="${1:?tier_budget_attribution <effective_cap_ms> <red_report> <baseline_report>...}"
+  local red="${2:?tier_budget_attribution <effective_cap_ms> <red_report> <baseline_report>...}"
+  shift 2
+  [[ "$cap_ms" =~ ^[0-9]+$ ]] || { printf 'tier_budget_attribution: cap_ms must be an integer of milliseconds, got %s\n' "$cap_ms" >&2; return 2; }
+  (( $# >= 1 )) || { printf 'tier_budget_attribution: at least one baseline report is required\n' >&2; return 2; }
+  [[ -r "$red" ]] || { printf 'verdict=unmeasurable reason=red-report-unreadable\n'; return 1; }
+  local b unreadable=0
+  for b in "$@"; do [[ -r "$b" ]] || unreadable=1; done
+  if (( unreadable )); then printf 'verdict=unmeasurable reason=baseline-unreadable\n'; return 1; fi
+  awk -F'\t' -v cap_ms="$cap_ms" -v red="$red" \
+      -v topn="$TIER_ATTR_TOP_EXCESS_N" -v conc_max="$TIER_ATTR_CONC_MAX_PCT" \
+      -v min_cover="$TIER_ATTR_MIN_COMMON_COVER_PCT" '
+    /^#/ { next }
+    NF >= 3 && $1 ~ /^[0-9]+$/ && $2 == "0" {
+      if (FILENAME == red) { redms[$3] = $1 } else { basems[$3] = $1 }
+    }
+    END {
+      done = 0
+      for (f in redms) {
+        red_total += redms[f]
+        if (f in basems) {
+          common++; src += redms[f]; sbc += basems[f]
+          ex = redms[f] - basems[f]
+          if (ex > 0) { excess[f] = ex; tex += ex }
+        } else { newf++; srn += redms[f] }
+      }
+      out = "lift_pct=%d common=%d common_cover_pct=%d repriced_s=%d top_excess_share_pct=%d new_files=%d new_s=%d\n"
+      if (red_total <= 0 || common == 0 || sbc <= 0) {
+        printf "verdict=unmeasurable reason=no-common-measurement " out, 0, common, 0, 0, 0, newf, srn/1000
+        exit 1
+      }
+      cover = src * 100 / red_total
+      lift = src * 100 / sbc
+      repriced = sbc + srn
+      # Top-N per-file excess share. asorti by value is gawk-only; ubuntu-latest
+      # ships mawk-compatible gawk but the control plane may not, so select the
+      # top N by scan — N is 3, the corpus is a few hundred, O(N*n) is nothing.
+      top = 0
+      for (k = 0; k < topn; k++) {
+        bestf = ""; best = 0
+        for (f in excess) if (!(f in used) && excess[f] > best) { best = excess[f]; bestf = f }
+        if (bestf == "") break
+        used[bestf] = 1; top += best
+      }
+      share = (tex > 0) ? top * 100 / tex : 0
+      # REPRICED BEFORE COVER, deliberately: new files lower the cover by existing,
+      # and a corpus that is over the cap even at baseline prices (common files at
+      # the green run cost, new files at their own) has grown whatever the cover
+      # says. Cover only gates the RELIEF verdict — a thin common set cannot
+      # support a uniformity claim, but it can still convict a repriced overage.
+      if (repriced > cap_ms) {
+        printf "verdict=corpus reason=over-at-baseline-prices " out, lift, common, cover, repriced/1000, share, newf, srn/1000
+        exit 1
+      }
+      if (cover < min_cover) {
+        printf "verdict=unmeasurable reason=thin-common-set " out, lift, common, cover, repriced/1000, share, newf, srn/1000
+        exit 1
+      }
+      if (tex <= 0) {
+        printf "verdict=unmeasurable reason=no-excess-to-attribute " out, lift, common, cover, repriced/1000, share, newf, srn/1000
+        exit 1
+      }
+      if (share >= conc_max) {
+        printf "verdict=corpus reason=concentrated-excess " out, lift, common, cover, repriced/1000, share, newf, srn/1000
+        exit 1
+      }
+      printf "verdict=runner reason=uniform-lift-fits-at-baseline-prices " out, lift, common, cover, repriced/1000, share, newf, srn/1000
+      exit 0
+    }' "$red" "$@"
+}
+
 # DIVE-2867: WHO IS ALLOWED TO MOVE TIER_CAL_BASELINE_US, AND ON WHAT EVIDENCE.
 #
 # The constant above has now been re-derived twice by argument (173000 -> 119000, then a
@@ -647,6 +778,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     clamp)  tier_cal_clamp_pct "${2:?clamp <raw_pct>}" ;;
     diverge) tier_cal_diverge_pct "${2:?diverge <pre_us> <post_us>}" "${3:?diverge <pre_us> <post_us>}" ;;
     refadmit) shift; tier_cal_ref_admissible "${1:?refadmit <candidate_us> <current_us> <concordant_sample>...}" "${2:?refadmit <candidate_us> <current_us> <concordant_sample>...}" "${@:3}" ;;
-    *) printf 'usage: tier.sh {list core|nightly|full [dir] | of <file> | reason <file> | claim <file> | budget core|full | scale <us> [baseline] | clamp <pct> | diverge <pre_us> <post_us> | refadmit <candidate_us> <current_us> <concordant_sample>...}\n' >&2; exit 2 ;;
+    attribute) shift; tier_budget_attribution "${1:?attribute <effective_cap_ms> <red_report> <baseline_report>...}" "${2:?attribute <effective_cap_ms> <red_report> <baseline_report>...}" "${@:3}" ;;
+    *) printf 'usage: tier.sh {list core|nightly|full [dir] | of <file> | reason <file> | claim <file> | budget core|full | scale <us> [baseline] | clamp <pct> | diverge <pre_us> <post_us> | refadmit <candidate_us> <current_us> <concordant_sample>... | attribute <effective_cap_ms> <red_report> <baseline_report>...}\n' >&2; exit 2 ;;
   esac
 fi

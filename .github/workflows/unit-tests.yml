@@ -536,14 +536,42 @@ jobs:
       # without bun, so every job that runs the corpus needs this step.
       - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
         uses: oven-sh/setup-bun@v2
+      # DIVE-3580: the second box's verdict is only independent of the first while the
+      # fleet's draw is — and on #708 it was not: both runners confirmed a red that
+      # main's own next run of the SAME corpus refuted at 77% of cap. So the confirm
+      # run is handed the last GREEN main run's per-harness reports, and an over-budget
+      # total it can pin on a UNIFORM lift across unrelated files resolves as exit 6
+      # with budget_attribution=runner — no corpus finding — instead of exit 4. Fetch
+      # failure disarms the relief and changes nothing else (the script says so).
+      - name: Fetch the last green main run's per-harness baseline (DIVE-3580)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/fetch-budget-baseline.sh pristine
       - name: Confirm the budget red on a SECOND runner (DIVE-2829)
         run: |
+          args=()
+          for f in baseline-reports/core-pristine-[0-9]*.txt; do
+            [ -r "$f" ] && args+=("--baseline-report=$f")
+          done
+          set +e
           bash scripts/run-harnesses.sh --tier=core \
             --shard=${{ matrix.shard }}/${{ matrix.shards }} \
             --label=pristine-confirm \
             --report=core-pristine-confirm-${{ matrix.shard }}.txt --cross-runner=required \
             --runner-id="${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-s${{ matrix.shard }}" \
-            --prior-over-runner="${{ matrix.prior }}"
+            --prior-over-runner="${{ matrix.prior }}" "${args[@]}"
+          rc=$?
+          set -e
+          # DIVE-3580: HAND OFF ONLY THE ATTRIBUTED 6 — the exact grep discipline the
+          # first-box jobs apply to the cross-runner 6, because exit 6 has three
+          # producers here (calibration undetermined, cross-runner — impossible on this
+          # job, and attribution) and only the attributed one has POSITIVE evidence
+          # that the red is the box. A calibration 6 keeps the red it always had.
+          if [ "$rc" = 6 ] && grep -q '^# budget_attribution=runner$' core-pristine-confirm-${{ matrix.shard }}.txt; then
+            echo "budget red ATTRIBUTED TO THE RUNNER against the last green main run — no corpus finding; not blocking (DIVE-3580)."
+            exit 0
+          fi
+          exit "$rc"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -579,14 +607,31 @@ jobs:
       # without bun, so every job that runs the corpus needs this step.
       - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
         uses: oven-sh/setup-bun@v2
+      # DIVE-3580: same baseline, same hand-off discipline — see the pristine confirm job.
+      - name: Fetch the last green main run's per-harness baseline (DIVE-3580)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/fetch-budget-baseline.sh installed
       - name: Confirm the budget red on a SECOND runner (DIVE-2829)
         run: |
+          args=()
+          for f in baseline-reports/core-installed-[0-9]*.txt; do
+            [ -r "$f" ] && args+=("--baseline-report=$f")
+          done
+          set +e
           bash scripts/run-harnesses.sh --tier=core \
             --shard=${{ matrix.shard }}/${{ matrix.shards }} \
             --label=installed-host-confirm \
             --report=core-installed-confirm-${{ matrix.shard }}.txt --cross-runner=required \
             --runner-id="${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-s${{ matrix.shard }}" \
-            --prior-over-runner="${{ matrix.prior }}"
+            --prior-over-runner="${{ matrix.prior }}" "${args[@]}"
+          rc=$?
+          set -e
+          if [ "$rc" = 6 ] && grep -q '^# budget_attribution=runner$' core-installed-confirm-${{ matrix.shard }}.txt; then
+            echo "budget red ATTRIBUTED TO THE RUNNER against the last green main run — no corpus finding; not blocking (DIVE-3580)."
+            exit 0
+          fi
+          exit "$rc"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

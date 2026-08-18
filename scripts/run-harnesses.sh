@@ -120,6 +120,16 @@ CROSS_RUNNER=off; RUNNER_ID=""; PRIOR_OVER_RUNNER=""
 # box. The three measurements that forced this are beside the drift print below; the
 # short version is that this axis makes DIVE-2829's exact mistake one axis over.
 DRIFT_FATAL=off
+# DIVE-3580. PER-HARNESS BASELINE REPORTS FROM A GREEN RUN, for attributing an
+# over-budget verdict before it stands. Like --cross-runner this IS policy the
+# workflow passes: whether a prior green run's reports are available is a property
+# of the caller's topology (CI can fetch the last green main run; a laptop has
+# nothing), not of the tier. One-sided in the same direction as everything else on
+# this gate: attribution can only turn a 4 into a 6, on a POSITIVE uniform-lift
+# measurement against these files — absent, unreadable or thin baselines leave the
+# red exactly as it stands. It is DATA, not a number: the thresholds it is judged
+# against live in tests/lib/tier.sh like every other policy constant.
+declare -a BASELINES=()
 for a in "$@"; do case "$a" in
   --tier=*)   TIER="${a#--tier=}" ;;
   # The seam that lets tests/corpus_tier_budget_unit.sh grade THIS script against a
@@ -195,13 +205,15 @@ for a in "$@"; do case "$a" in
   --drift-fatal=*) DRIFT_FATAL="${a#--drift-fatal=}" ;;
   --runner-id=*) RUNNER_ID="${a#--runner-id=}" ;;
   --prior-over-runner=*) PRIOR_OVER_RUNNER="${a#--prior-over-runner=}" ;;
+  # DIVE-3580: repeatable — pass every shard of the green run, merged by the join.
+  --baseline-report=*) BASELINES+=("${a#--baseline-report=}") ;;
   --top=*)    TOP="${a#--top=}" ;;
   *) printf 'unknown arg: %s\n' "$a" >&2; exit 2 ;;
 esac; done
 
 case "$TIER" in
   core|full) ;;
-  *) printf 'usage: run-harnesses.sh --tier=core|full [--budget=<seconds>] [--label=<env>] [--report=<file>] [--corpus-dir=<dir>] [--confirm-top=<n>] [--no-calibrate] [--cal-us=<us/iter>] [--cal-baseline-us=<us/iter>] [--cal-cli=<path>] [--no-cal-post] [--cal-post-us=<us/iter>] [--cross-runner=off|required] [--runner-id=<id>] [--prior-over-runner=<id>] [--drift-fatal=off|required]\n' >&2; exit 2 ;;
+  *) printf 'usage: run-harnesses.sh --tier=core|full [--budget=<seconds>] [--label=<env>] [--report=<file>] [--corpus-dir=<dir>] [--confirm-top=<n>] [--no-calibrate] [--cal-us=<us/iter>] [--cal-baseline-us=<us/iter>] [--cal-cli=<path>] [--no-cal-post] [--cal-post-us=<us/iter>] [--cross-runner=off|required] [--runner-id=<id>] [--prior-over-runner=<id>] [--drift-fatal=off|required] [--baseline-report=<file>]...\n' >&2; exit 2 ;;
 esac
 [[ "$CONFIRM_TOP" =~ ^[0-9]+$ ]] || { printf 'run-harnesses: --confirm-top must be a non-negative integer, got %s\n' "$CONFIRM_TOP" >&2; exit 2; }
 # DIVE-2829: an unrecognised MODE is usage, never a silent fall back to `off`. A typo
@@ -618,6 +630,37 @@ if (( BUDGET > 0 && total_ms > EFF_MS && ${#failed[@]} == 0 && CONFIRM_TOP > 0 )
   done
 fi
 
+# ---------------------------------------------------------------------------------
+# DIVE-3580: ATTRIBUTE AN OVER-BUDGET TOTAL BEFORE THE VERDICT STANDS.
+#
+# Runs ONLY when this run is otherwise headed for exit 4 (over the effective cap,
+# nothing failed, budget measurable) AND the caller supplied baseline reports from a
+# GREEN run. Verdict and thresholds live in tests/lib/tier.sh; what happens here is
+# mechanics: the in-memory per-harness vector goes to a temp TSV (the --report file
+# may not exist and is not owed one), and the verdict is carried to the report, the
+# over-budget print and the exit ladder. See the tier.sh block for the #708
+# measurement, the one-sidedness argument and the two named residuals.
+ATTR_VERDICT="off"; ATTR_DETAIL=""
+if (( BUDGET > 0 && undetermined == 0 && total_ms > EFF_MS && ${#failed[@]} == 0 && ${#BASELINES[@]} > 0 )); then
+  _attr_red="$(mktemp "${TMPDIR:-/tmp}/run-harnesses-attr.XXXXXX" 2>/dev/null)" || _attr_red=""
+  if [[ -n "$_attr_red" ]]; then
+    for i in "${!NAME[@]}"; do printf '%s\t%s\t%s\n' "${MS[$i]}" "${RC[$i]}" "${NAME[$i]}"; done > "$_attr_red"
+    if ATTR_DETAIL="$(tier_budget_attribution "$EFF_MS" "$_attr_red" "${BASELINES[@]}")"; then :; fi
+    rm -f "$_attr_red" 2>/dev/null || true
+    # The verdict word travels in the line itself; parse it back out rather than
+    # inferring it from the exit status, so a usage error (exit 2, empty line)
+    # reads as unmeasurable and not as anything stronger.
+    case "$ATTR_DETAIL" in
+      verdict=runner\ *)        ATTR_VERDICT="runner" ;;
+      verdict=corpus\ *)        ATTR_VERDICT="corpus" ;;
+      verdict=unmeasurable\ *)  ATTR_VERDICT="unmeasurable" ;;
+      *)                         ATTR_VERDICT="unmeasurable"; ATTR_DETAIL="verdict=unmeasurable reason=attribution-did-not-run" ;;
+    esac
+  else
+    ATTR_VERDICT="unmeasurable"; ATTR_DETAIL="verdict=unmeasurable reason=no-tempfile"
+  fi
+fi
+
 # DIVE-2555: GRADE EACH HEADER'S OWN NUMBER AGAINST THE CLOCK THAT JUST RAN IT.
 #
 # `# TIER: nightly — 14.3s measured` is the entire argument a reviewer gets that a
@@ -689,6 +732,13 @@ if [[ -n "$REPORT" ]]; then
     # whether this run was even allowed to exit 5, so a later reader does not have to date
     # the YAML to know what the number meant.
     printf '# header_drift_wrong=%d\n# drift_fatal_policy=%s\n' "$drift_wrong" "$DRIFT_FATAL"
+    # DIVE-3580: appended on the same append-never-substitute terms. budget_attribution
+    # is UNCONDITIONAL for the DIVE-3188 reason — `off` is a GRADED "not consulted"
+    # (no baseline, or nothing to attribute), and a missing field must keep meaning a
+    # pre-DIVE-3580 report rather than defaulting to anything. The confirm jobs key
+    # their pass/fail on this field plus the exit code, so it is load-bearing, not log.
+    printf '# budget_attribution=%s\n# budget_attribution_detail=%s\n' \
+      "$ATTR_VERDICT" "${ATTR_DETAIL:--}"
     for i in "${!NAME[@]}"; do printf '%s\t%s\t%s\n' "${MS[$i]}" "${RC[$i]}" "${NAME[$i]}"; done
   } > "$REPORT"
 fi
@@ -930,6 +980,30 @@ elif (( total_ms > EFF_MS )); then
     printf '    fd81f7b attempt 1  324s (108%%)  RED        fd81f7b attempt 2  291s (96%%)  green\n'
     printf 'Only if the SECOND runner is also over is the finding below about your corpus.\n'
   fi
+  # DIVE-3580: WHAT THE BASELINE COMPARISON SAYS, when one was available. Printed in
+  # all three arms so an unarmed run and a satisfied one cannot read the same — the
+  # DIVE-2829 lesson, one instrument over. The verdict's effect is applied at the
+  # exit ladder; this is the human-readable half.
+  if [[ "$ATTR_VERDICT" == "runner" ]]; then
+    printf '\nATTRIBUTED TO THE RUNNER (DIVE-3580) — THIS IS EXIT 6 (UNDETERMINED), NOT EXIT 4.\n'
+    printf 'Against the supplied green-run baseline, this corpus FITS the cap at baseline prices\n'
+    printf 'and the overage is a lift spread across unrelated harnesses, which is what a slow box\n'
+    printf 'does and what corpus growth does not (measured on #708: uniform 1.32x across 172\n'
+    printf 'files, refuted by the next green run of the same corpus at 77%% of cap):\n'
+    printf '    %s\n' "$ATTR_DETAIL"
+    printf 'A second box agreeing does not un-say this: both boxes drew from the same fleet in\n'
+    printf 'the same hour (DIVE-2829 confirmed the #708 red that main then refuted). No corpus\n'
+    printf 'finding is made; nothing here says your corpus is inside its cap either.\n'
+  elif [[ "$ATTR_VERDICT" == "corpus" ]]; then
+    printf '\nBASELINE ATTRIBUTION AGREES WITH THIS RED (DIVE-3580): against the supplied green-run\n'
+    printf 'baseline the overage is in the CORPUS — new files, or growth concentrated in the files\n'
+    printf 'that grew — not spread as runner weather. Exit 4 stands:\n'
+    printf '    %s\n' "$ATTR_DETAIL"
+  elif [[ "$ATTR_VERDICT" == "unmeasurable" ]]; then
+    printf '\nBASELINE ATTRIBUTION COULD NOT BE TAKEN (DIVE-3580): %s\n' "$ATTR_DETAIL"
+    printf 'The red stands exactly as it would have before this instrument existed — relief is\n'
+    printf 'granted only on a positive measurement, never on a missing one.\n'
+  fi
   # DIVE-2728: measured against the EFFECTIVE cap, so the covering set is the set that
   # actually gets this run inside the cap it was graded on. And the line above it says
   # so out loud, because "over by 22s" against an unstated cap is how a reader ends up
@@ -1094,6 +1168,11 @@ fi
 # ORDER — this is checked before `over`, so it can only ever turn a 4 into a 6; `over`
 # is still set, still printed, and still the thing a second box confirms.
 (( cross_unconfirmed == 0 )) || exit 6
+# DIVE-3580: an over-budget total the baseline comparison pins on the RUNNER resolves
+# in the same slot, for the same reason, and with the same one-sidedness: 4 -> 6 only,
+# decided on a positive measurement against a named green run. corpus and unmeasurable
+# fall through and keep their 4 — the gate is weakened for nothing it did not measure.
+if (( over == 1 )) && [[ "$ATTR_VERDICT" == "runner" ]]; then exit 6; fi
 (( over == 0 )) || exit 4
 # DIVE-3163: EXIT 5 IS NOW OPT-IN AND THE DEFAULT IS A WARNING. The gate this used to be
 # was a one-box assertion about a cause it cannot measure (the three samples are beside the

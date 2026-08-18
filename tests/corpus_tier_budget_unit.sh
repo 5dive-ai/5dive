@@ -693,6 +693,34 @@ if grep -rn -- '--confirm-top' .github/workflows/ >/dev/null 2>&1; then
   bad "no CI workflow passes --confirm-top" "$(grep -rn -- '--confirm-top' .github/workflows/)"
 else ok "no CI workflow passes --confirm-top"; fi
 
+# --- DIVE-3580: the baseline attribution's CI wiring, pinned HERE because this
+# harness is the one workflow-structure-guards runs UNCONDITIONALLY on every PR —
+# a workflow-only edit selects no tests/*.sh harness, so an arm living in
+# tests/budget_attribution_unit.sh would grade the removal of the fetch step
+# nightly, after the merge (the DIVE-3479 lesson, applied at introduction).
+_wf3580=.github/workflows/unit-tests.yml
+_bfetch="$(grep -c 'fetch-budget-baseline\.sh' "$_wf3580" || true)"
+if [[ "$_bfetch" == 2 ]]; then
+  ok "BOTH confirm jobs fetch the attribution baseline through the ONE shared script (DIVE-3580)"
+else bad "both confirm jobs fetch the attribution baseline through the one shared script" "count=$_bfetch (want 2)"; fi
+[[ -r .github/scripts/fetch-budget-baseline.sh ]] \
+  && ok "…and the shared script exists where the workflow points" \
+  || bad "…and the shared script exists where the workflow points" "no file at .github/scripts/fetch-budget-baseline.sh"
+# The hand-off grep discipline: exit 6 has more than one producer in a confirm job
+# (calibration undetermined, attribution), and only the ATTRIBUTED one — graded,
+# positive, in the report — may resolve the job green. Pin the exact grep, twice.
+_bhand="$(grep -cF "grep -q '^# budget_attribution=runner\$'" "$_wf3580" || true)"
+if [[ "$_bhand" == 2 ]]; then
+  ok "BOTH confirm jobs hand off ONLY the attributed 6 (the graded-field grep, exactly twice)"
+else bad "both confirm jobs hand off only the attributed 6" "count=$_bhand (want 2)"; fi
+# And the flag stays where a second box has already agreed: the two confirm
+# invocations, nowhere else — a first-box job passing it would grant relief no
+# second runner earned, one job earlier than DIVE-2829 allows.
+_bflag="$(grep -rh -- '--baseline-report=' .github/workflows/ | grep -vc '^[[:space:]]*#' || true)"
+if [[ "$_bflag" == 2 ]]; then
+  ok "no non-confirm CI invocation passes --baseline-report (2 sites, both confirm jobs)"
+else bad "no non-confirm CI invocation passes --baseline-report" "count=$_bflag (want 2)"; fi
+
 # --- DIVE-2667: the tier must run often enough to ATTRIBUTE a break ------------
 # The nightly was red on main for ~17h across ~12 commits because full-sweep ran
 # once a day and is not in the per-PR check set. Two properties are pinned here,
