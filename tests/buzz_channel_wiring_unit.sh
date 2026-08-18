@@ -394,8 +394,18 @@ if [[ -f "$BZ" ]]; then
   # The writer, RUN — not grepped. It is factored to take a runas user so this
   # arm needs no agent user, no root and no relay: pass our own name, the sudo
   # hop is skipped, and the file it produces is graded against the contract in
-  # plugins/buzz/server.ts (five fields; private_key must match /^[0-9a-f]{64}$/
-  # or the plugin refuses to derive a pubkey and the channel is silently dead).
+  # plugins/buzz/server.ts (private_key must match /^[0-9a-f]{64}$/ or the plugin
+  # refuses to derive a pubkey and the channel is silently dead).
+  #
+  # DIVE-3565 — THIS ARM USED TO ENSHRINE THE DEFECT. It asserted
+  # `.channels == ["general","ops"]` and called that "the five-field contract",
+  # while server.ts:38 declares `channels: string[] // channel UUIDs to watch`
+  # and hands each entry to `buzz messages get --channel`. So the arm was green
+  # on a config the reader answers `invalid UUID: general` to, every tick,
+  # forever. The contract is SIX fields now and the split is the whole point:
+  # `.channel_names` carries what the operator typed, `.channels` carries only
+  # ids the relay confirmed — empty until `buzz join` resolves them, because an
+  # empty watch list is honest and a name in it is a lie.
   if command -v python3 >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
     TD=$(mktemp -d)
     FAKE_KEY=$(printf 'a%.0s' {1..64})
@@ -406,11 +416,17 @@ if [[ -f "$BZ" ]]; then
       ok_t "_buzz_write_config writes parseable JSON"
       jq -e '.relay_url == "https://relay.example.com"
              and (.private_key | test("^[0-9a-fA-F]{64}$"))
-             and .channels == ["general","ops"]
+             and .channel_names == ["general","ops"]
+             and .channels == []
              and .poll_ms == 9000
              and .buzz_path == "/usr/local/bin/buzz"' "$W" >/dev/null 2>&1 \
-        && ok_t "the written config matches the plugin's five-field contract" \
-        || bad_t "the written config matches the plugin's five-field contract" "got: $(cat "$W")"
+        && ok_t "the written config matches the plugin's contract (names and ids are DIFFERENT fields)" \
+        || bad_t "the written config matches the plugin's contract (names and ids are DIFFERENT fields)" "got: $(cat "$W")"
+      # The mutation that put us here: a NAME in the field the poller reads.
+      jq -e '(.channels | map(select(. == "general" or . == "ops")) | length) == 0' "$W" >/dev/null 2>&1 \
+        && ok_t "no channel NAME ever lands in .channels (the field the poller reads as a UUID)" \
+        || bad_t "no channel NAME ever lands in .channels" \
+                 "server.ts polls each entry with \`messages get --channel\`; a name there is 'invalid UUID' on every tick, silently (DIVE-3565)"
       # poll_ms must be a NUMBER: server.ts does Number(cfg.poll_ms) on the env
       # path but reads the file value straight, so a quoted "9000" is a config
       # the plugin loads and mis-schedules.

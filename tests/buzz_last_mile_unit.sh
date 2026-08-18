@@ -691,5 +691,170 @@ REALGRAMMAR
              "then --format is not a global at all and this diagnosis is wrong"
 fi
 
+# ===========================================================================
+# 8m. DIVE-3565 — THE WRITER MUST SPEAK THE READER'S LANGUAGE.
+#
+# plugins/buzz/server.ts:38 declares `channels: string[] // channel UUIDs to
+# watch for mentions` and hands each entry to `buzz messages get --channel`.
+# `enable` wrote NAMES there, so a fully-wired seat answered `invalid UUID:
+# general` every tick, silently, forever (jolly-birch, DIVE-3559). These arms
+# grade the WRITER against that reader: after a join, the field the poller reads
+# must hold the ids the relay actually returned.
+# ===========================================================================
+cfg_json() { python3 -c "import json,sys;print(json.dumps(json.load(open('$AGENT_STATE/config.json'))))"; }
+cfg_field() { python3 -c "
+import json,sys
+d=json.load(open('$AGENT_STATE/config.json'))
+v=d.get(sys.argv[1])
+print(','.join(str(x) for x in v) if isinstance(v,list) else ('' if v is None else v))
+" "$1"; }
+# The id the STUB minted, read out of its own store — derived independently of
+# anything the CLI wrote, so the assertion is not comparing the code to itself.
+stub_cid() { awk -F'\t' -v n="$1" '$2==n{print $1}' "$BUZZ_STUB_DIR/channels"; }
+
+seed_agent "$STUB_BIN" "general"
+run_join normal dev
+REAL_CID=$(stub_cid general)
+[[ -n "$REAL_CID" ]] \
+  && ok_t "8m the stub minted a channel id for 'general' (fixture sanity)" \
+  || bad_t "8m the stub minted a channel id for 'general'" "no id in the stub store; every arm below is vacuous"
+[[ "$(cfg_field channels)" == "$REAL_CID" ]] \
+  && ok_t "8m join writes the RESOLVED channel id into config.json .channels" \
+  || bad_t "8m join writes the RESOLVED channel id into config.json .channels" \
+           "the poller reads .channels as UUIDs; it holds '$(cfg_field channels)' and the relay's id is '$REAL_CID' — every tick will be 'invalid UUID'"
+# The mutation this arm exists to catch: the pre-fix code left the NAME here,
+# i.e. .channels was literally equal to .channel_names. NOT a substring test —
+# a relay is free to build an id out of the name ("ch-general-9f3b…"), and that
+# id is a perfectly good UUID-shaped answer.
+{ [[ "$(cfg_field channels)" != "general" ]] && [[ "$(cfg_field channels)" != "$(cfg_field channel_names)" ]]; } \
+  && ok_t "8m .channels is no longer just the channel NAME" \
+  || bad_t "8m .channels is no longer just the channel NAME" ".channels == .channel_names == '$(cfg_field channels)' — nothing was resolved; this is the DIVE-3565 defect, unfixed"
+[[ "$(cfg_field channel_names)" == "general" ]] \
+  && ok_t "8m the human name is preserved in .channel_names" \
+  || bad_t "8m the human name is preserved in .channel_names" "got '$(cfg_field channel_names)' — join has no name to look up on a re-run"
+# Nothing else in the config may move: this file holds the agent's identity.
+[[ "$(cfg_field private_key)" == "$(printf '3%.0s' $(seq 63))7" ]] \
+  && ok_t "8m the writeback does not disturb private_key" \
+  || bad_t "8m the writeback does not disturb private_key" "identity changed under a config edit"
+{ [[ "$(cfg_field relay_url)" == "https://relay.example.com" ]] && [[ "$(cfg_field poll_ms)" == "15000" ]] \
+  && [[ "$(cfg_field buzz_path)" == "$STUB_BIN" ]]; } \
+  && ok_t "8m relay_url, poll_ms and buzz_path survive the writeback" \
+  || bad_t "8m relay_url, poll_ms and buzz_path survive the writeback" "$(cfg_json)"
+[[ "$(stat -c %a "$AGENT_STATE/config.json")" == "600" ]] \
+  && ok_t "8m config.json is still 0600 after the writeback" \
+  || bad_t "8m config.json is still 0600 after the writeback" "mode $(stat -c %a "$AGENT_STATE/config.json")"
+
+# --- 8n. the regression the fix could introduce ----------------------------
+# Now that .channels holds a uuid, a re-run must resolve it to ITSELF. If it
+# treated it as a name it would create a second channel literally named after
+# the uuid and the customer's room would silently fork.
+CREATES_BEFORE=$(grep -c 'argv: channels create' "$BUZZ_STUB_DIR/log")
+run_join normal dev
+[[ "$(grep -c 'argv: channels create' "$BUZZ_STUB_DIR/log")" == "$CREATES_BEFORE" ]] \
+  && ok_t "8n a re-run over an id-bearing config creates NOTHING" \
+  || bad_t "8n a re-run over an id-bearing config creates NOTHING" \
+           "the writeback made join non-idempotent: $(grep 'argv: channels create' "$BUZZ_STUB_DIR/log")"
+[[ "$JOIN_RC" -eq 0 && "$(cfg_field channels)" == "$REAL_CID" ]] \
+  && ok_t "8n the re-run is rc 0 and the id is unchanged" \
+  || bad_t "8n the re-run is rc 0 and the id is unchanged" "rc=$JOIN_RC ids=$(cfg_field channels)"
+# Control: the resolver must still find a channel by NAME, or 8n passes because
+# nothing resolves at all.
+[[ "$(_buzz_channel_ref_id general <<<"[{\"channel_id\":\"$REAL_CID\",\"name\":\"general\"}]")" == "$REAL_CID" ]] \
+  && ok_t "8n control: the resolver still resolves a NAME to its id" \
+  || bad_t "8n control: the resolver still resolves a NAME to its id" "name lookup broke; 8n is vacuous"
+[[ -z "$(_buzz_channel_ref_id nosuch <<<"[{\"channel_id\":\"$REAL_CID\",\"name\":\"general\"}]")" ]] \
+  && ok_t "8n control: an unknown token resolves to NOTHING (it does not echo itself)" \
+  || bad_t "8n control: an unknown token resolves to NOTHING" "the resolver returns its input, so every id 'resolves' and create never fires"
+
+# The arm above re-runs join over an id-BEARING config, but that config also
+# carries `channel_names`, and the new precedence reads names FIRST — so the id
+# never reaches the resolver and 8n is named for the ID path while measuring the
+# NAME path (quinn, iteration 1). This is the route that actually walks it:
+# `--channels=<uuid>` is an explicit id, `from_ids` stays false, and without the
+# id-to-itself branch the resolver returns nothing and join CREATES a channel
+# literally named after a uuid — the silent second room. Graded by the create
+# count in the stub's own log, not by anything the CLI reports.
+CREATES_BEFORE_ID=$(grep -c 'argv: channels create' "$BUZZ_STUB_DIR/log")
+run_join normal dev --channels="$REAL_CID"
+[[ "$(grep -c 'argv: channels create' "$BUZZ_STUB_DIR/log")" == "$CREATES_BEFORE_ID" ]] \
+  && ok_t "8n an explicit --channels=<uuid> resolves to ITSELF and creates NOTHING" \
+  || bad_t "8n an explicit --channels=<uuid> resolves to ITSELF and creates NOTHING" \
+           "join created a channel named after a uuid — the customer's room forked: $(grep 'argv: channels create' "$BUZZ_STUB_DIR/log" | tail -1)"
+
+# --- 8o. only a CONFIRMED membership is recorded ---------------------------
+# rc=3 is the accepted-but-not-readable case (DIVE-3507). Recording that id
+# would tell the poller to watch a room the agent is not in — success reported
+# while connected to nothing, one layer further down.
+# Seeded in the POST-fix shape (names in .channel_names, .channels empty) —
+# that is what `enable` now writes, and the question is whether a failed join
+# fills it in anyway.
+seed_agent "$STUB_BIN" "general"
+python3 -c "
+import json
+p='$AGENT_STATE/config.json'
+d=json.load(open(p)); d['channel_names']=d.pop('channels'); d['channels']=[]
+json.dump(d, open(p,'w'), indent=2)
+"
+run_join dropmember dev
+{ [[ "$JOIN_RC" -eq 3 ]] && [[ -z "$(cfg_field channels)" ]]; } \
+  && ok_t "8o an unconfirmed join records NO channel id" \
+  || bad_t "8o an unconfirmed join records NO channel id" "rc=$JOIN_RC ids='$(cfg_field channels)' — the poller would watch an unjoined room"
+# Control: the SAME seed with a relay that confirms DOES get an id written, or
+# the arm above passes because the writeback never fires at all.
+seed_agent "$STUB_BIN" "general"
+python3 -c "
+import json
+p='$AGENT_STATE/config.json'
+d=json.load(open(p)); d['channel_names']=d.pop('channels'); d['channels']=[]
+json.dump(d, open(p,'w'), indent=2)
+"
+run_join normal dev
+{ [[ "$JOIN_RC" -eq 0 ]] && [[ "$(cfg_field channels)" == "$(stub_cid general)" ]]; } \
+  && ok_t "8o control: a CONFIRMED join over the same seed does record the id" \
+  || bad_t "8o control: a CONFIRMED join over the same seed does record the id" "rc=$JOIN_RC ids='$(cfg_field channels)'; 8o is vacuous"
+
+# --- 8p. `enable` writes a config the reader can use, or an empty one ------
+# Not names-in-.channels. The honest state before resolution is EMPTY: the
+# poller watches nothing and says nothing, instead of erroring every 15s.
+seed_agent "$STUB_BIN" "general"
+rm -f "$AGENT_STATE/config.json"
+_buzz_write_config "$(id -un)" "$AGENT_STATE" "https://relay.example.com" "$(printf '3%.0s' $(seq 63))7" "general,ops" 15000 "$STUB_BIN" >/dev/null 2>&1
+{ [[ "$(cfg_field channel_names)" == "general,ops" ]] && [[ -z "$(cfg_field channels)" ]]; } \
+  && ok_t "8p enable writes names to .channel_names and leaves .channels EMPTY (never a name)" \
+  || bad_t "8p enable writes names to .channel_names and leaves .channels EMPTY" \
+           "names='$(cfg_field channel_names)' ids='$(cfg_field channels)' — a name in .channels is the DIVE-3565 defect"
+# ...and a re-run of enable must not throw away ids join already resolved, since
+# enable CALLS join and a re-enable is the ordinary repair command.
+_buzz_set_channel_ids "$(id -un)" "$AGENT_STATE/config.json" "id-1,id-2" "general,ops" >/dev/null 2>&1
+_buzz_write_config "$(id -un)" "$AGENT_STATE" "https://relay.example.com" "$(printf '3%.0s' $(seq 63))7" "general,ops" 15000 "$STUB_BIN" >/dev/null 2>&1
+[[ "$(cfg_field channels)" == "id-1,id-2" ]] \
+  && ok_t "8p re-running enable with the SAME names keeps the resolved ids" \
+  || bad_t "8p re-running enable with the SAME names keeps the resolved ids" \
+           "got '$(cfg_field channels)' — a re-enable would take a working seat back to silent"
+# Control: a DIFFERENT name list makes the old ids the wrong answer, not a stale
+# one, so they must be dropped.
+_buzz_write_config "$(id -un)" "$AGENT_STATE" "https://relay.example.com" "$(printf '3%.0s' $(seq 63))7" "alerts" 15000 "$STUB_BIN" >/dev/null 2>&1
+{ [[ -z "$(cfg_field channels)" ]] && [[ "$(cfg_field channel_names)" == "alerts" ]]; } \
+  && ok_t "8p control: changing the names DROPS the stale ids" \
+  || bad_t "8p control: changing the names DROPS the stale ids" "ids='$(cfg_field channels)' point at rooms that are no longer configured"
+
+# --- 8q. a legacy config (names in .channels, no .channel_names) still wires
+# Every already-provisioned seat looks like this. It must be REPAIRED by a plain
+# `join`, not refused — the key is the ABSENCE of the .channel_names key.
+seed_agent "$STUB_BIN" "general"   # seed_agent writes the legacy shape
+python3 -c "
+import json,sys
+d=json.load(open('$AGENT_STATE/config.json'))
+assert 'channel_names' not in d, 'fixture is not the legacy shape'
+assert d['channels'] == ['general'], d
+" && ok_t "8q fixture sanity: the seed IS the legacy name-in-.channels shape" \
+   || bad_t "8q fixture sanity: the seed IS the legacy shape" "the arm below proves nothing"
+run_join normal dev
+LEG_CID=$(stub_cid general)
+{ [[ "$JOIN_RC" -eq 0 ]] && [[ "$(cfg_field channels)" == "$LEG_CID" ]] && [[ "$(cfg_field channel_names)" == "general" ]]; } \
+  && ok_t "8q a legacy config is REPAIRED in place by one \`buzz join\`" \
+  || bad_t "8q a legacy config is REPAIRED in place by one \`buzz join\`" \
+           "rc=$JOIN_RC ids='$(cfg_field channels)' names='$(cfg_field channel_names)' — every existing seat stays silent"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
