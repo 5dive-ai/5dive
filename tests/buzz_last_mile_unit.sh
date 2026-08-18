@@ -766,6 +766,21 @@ run_join normal dev
   && ok_t "8n control: an unknown token resolves to NOTHING (it does not echo itself)" \
   || bad_t "8n control: an unknown token resolves to NOTHING" "the resolver returns its input, so every id 'resolves' and create never fires"
 
+# The arm above re-runs join over an id-BEARING config, but that config also
+# carries `channel_names`, and the new precedence reads names FIRST — so the id
+# never reaches the resolver and 8n is named for the ID path while measuring the
+# NAME path (quinn, iteration 1). This is the route that actually walks it:
+# `--channels=<uuid>` is an explicit id, `from_ids` stays false, and without the
+# id-to-itself branch the resolver returns nothing and join CREATES a channel
+# literally named after a uuid — the silent second room. Graded by the create
+# count in the stub's own log, not by anything the CLI reports.
+CREATES_BEFORE_ID=$(grep -c 'argv: channels create' "$BUZZ_STUB_DIR/log")
+run_join normal dev --channels="$REAL_CID"
+[[ "$(grep -c 'argv: channels create' "$BUZZ_STUB_DIR/log")" == "$CREATES_BEFORE_ID" ]] \
+  && ok_t "8n an explicit --channels=<uuid> resolves to ITSELF and creates NOTHING" \
+  || bad_t "8n an explicit --channels=<uuid> resolves to ITSELF and creates NOTHING" \
+           "join created a channel named after a uuid — the customer's room forked: $(grep 'argv: channels create' "$BUZZ_STUB_DIR/log" | tail -1)"
+
 # --- 8o. only a CONFIRMED membership is recorded ---------------------------
 # rc=3 is the accepted-but-not-readable case (DIVE-3507). Recording that id
 # would tell the poller to watch a room the agent is not in — success reported
