@@ -153,7 +153,11 @@ _capability_names_for_standard() {
   # shipping a branch for review and shipping to PRODUCTION are different
   # authorities, so they are different rows a router can ask about separately.
   local can_deploy="${2:-0}"
-  printf '%s\n' a2a_deliver a2a_capture audit_append self_restart
+  # DIVE-3573: buzz_inbound is UNCONDITIONAL for the same reason a2a_deliver is —
+  # the grant confers no authority of its own. `agent buzz inbound` has no target
+  # argument, drives only the calling seat's own pane, and re-derives the sender
+  # from the registry rather than from anything the caller says.
+  printf '%s\n' a2a_deliver a2a_capture audit_append self_restart buzz_inbound
   [[ "$can_push" == "1" ]] && printf '%s\n' delegated_push
   [[ "$can_deploy" == "1" ]] && printf '%s\n' delegated_deploy
   return 0

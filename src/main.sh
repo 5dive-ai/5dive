@@ -87,6 +87,11 @@ Agents:
                                                      # own nostr identity and write its config (0600).
                                                      # --channels=<csv> --poll-ms=<n> --buzz-path=<path>
                                                      # --rotate-key mints a NEW key (the handset must re-pair)
+  5dive agent buzz inbound --pubkey=<k> --message-file=<p>  # DIVE-3573: the bridge's inbound router. Classifies
+                                                     # the signing key and routes it: a known teammate's key
+                                                     # onto the a2a rail, the paired owner's like a human
+                                                     # message, anything else untrusted (unchanged). Delivers
+                                                     # to the CALLING seat only — no target argument.
   5dive agent buzz whois <pubkey|npub1…> [--role]    # DIVE-3572: pubkey -> which seat, from the registry.
                                                      # rc 0 name on stdout · 4 MEASURED unknown · 5 ambiguous
                                                      # · 3 not a key · 1 registry unreadable (NOT measured).
@@ -728,8 +733,20 @@ main() {
         # which is require_root, so routing it through the mutating arm would make
         # the one lookup the trust model depends on unusable by the only process
         # that needs it. It reads the group-readable registry and writes nothing.
+        #
+        # DIVE-3573: `inbound` is AUDITED (it is the bridge's trust decision, and
+        # a decision nobody can read afterwards is not a control) but takes NO
+        # registry lock. It reads the registry and writes nothing, and its tail is
+        # a real `agent send` that waits for a pane to be ready — holding the
+        # fleet-wide registry lock across a tmux readiness wait would stall every
+        # other seat's writes behind one inbound chat message. Its args are safe to
+        # log: a public key and a file PATH, never the body (see the verb's own
+        # --message-file refusal to take prose in argv).
         buzz)
           if [[ "${1:-}" == "status" || "${1:-}" == "whois" ]]; then
+            cmd_agent_buzz "$@"
+          elif [[ "${1:-}" == "inbound" ]]; then
+            AUDIT_CMD="agent buzz"; AUDIT_ARGS=("$@")
             cmd_agent_buzz "$@"
           else
             AUDIT_CMD="agent buzz"; AUDIT_ARGS=("$@")
