@@ -192,6 +192,68 @@ for r in rows:
 " "$1" 2>/dev/null
 }
 
+# DIVE-3565 — the same lookup, but a token that is ALREADY a channel_id
+# resolves to itself. `join` writes resolved ids back into config.json
+# `channels`, and `--channels=` is allowed to name one directly, so the lookup
+# has to close over its own output or the second run creates a channel LITERALLY
+# NAMED after a uuid. Name match first: a relay is free to reuse a string in
+# both fields and the name is what the operator meant.
+_buzz_channel_ref_id() { # <name-or-id> ; json on stdin
+  python3 -c "
+import json, sys
+want = sys.argv[1]
+try:
+    rows = json.load(sys.stdin)
+except Exception:
+    rows = []
+if not isinstance(rows, list):
+    rows = []
+for r in rows:
+    if isinstance(r, dict) and str(r.get('name', '')) == want:
+        print(str(r.get('channel_id', '') or ''))
+        break
+else:
+    for r in rows:
+        if isinstance(r, dict) and str(r.get('channel_id', '') or '') == want:
+            print(want)
+            break
+" "$1" 2>/dev/null
+}
+
+# Write the RESOLVED channel ids back into config.json.
+#
+# THIS IS THE FIX. Everything above already knew the ids; nothing ever told the
+# reader. Rewrites only `channels` and `channel_names` — relay_url, private_key,
+# poll_ms and buzz_path are read and written back untouched, so this can never
+# be the thing that loses an agent its identity. Same discipline as
+# `_buzz_write_config`: run AS the agent user, 0600, key never on argv (it is
+# not even read out here — the file is edited in place by the owner).
+_buzz_set_channel_ids() { # <runas> <cfg-path> <ids-csv> <names-csv>
+  local runas="$1" cfg="$2" ids="$3" names="$4"
+  local -a pre=()
+  [[ "$runas" != "$(id -un)" ]] && pre=(sudo -u "$runas")
+  "${pre[@]}" env CFG="$cfg" IDS="$ids" NAMES="$names" python3 -c '
+import json, os, sys
+path = os.environ["CFG"]
+with open(path) as f:
+    cfg = json.load(f)
+ids   = [c.strip() for c in os.environ["IDS"].split(",") if c.strip()]
+names = [c.strip() for c in os.environ["NAMES"].split(",") if c.strip()]
+if not ids:
+    sys.exit(0)                      # never blank a working config
+if cfg.get("channels") == ids and cfg.get("channel_names") == names:
+    sys.exit(0)                      # idempotent: no write, no mtime churn
+cfg["channels"] = ids                # what plugins/buzz/server.ts polls
+cfg["channel_names"] = names         # what a human and `join` work from
+fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    json.dump(cfg, f, indent=2)
+os.chmod(path + ".tmp", 0o600)
+os.replace(path + ".tmp", path)      # atomic: the poller may be reading it
+print("    resolved channel ids written to " + path)
+' >&2
+}
+
 # Mint (once) the customer's handset identity. Same one-key-per-agent rule the
 # agent's own identity follows: a re-run must not rotate a key a paired handset
 # already holds, or the customer silently loses the room.
@@ -268,7 +330,25 @@ _buzz_join() {
   key=$(_buzz_pick "d.get('private_key')" <<<"$raw")
   [[ -n "$relay" && "$key" =~ ^[0-9a-fA-F]{64}$ ]] \
     || fail "$E_VALIDATION" "buzz config for '$name' is missing relay_url or a 64-hex private_key"
-  [[ -n "$chans" ]] || chans=$(_buzz_pick "','.join(d.get('channels') or [])" <<<"$raw")
+  # DIVE-3565. `channel_names` is the operator's list and the thing a relay can
+  # look up; `channels` now holds resolved ids. Prefer the names — an id that a
+  # relay has forgotten (a rebuilt relay, a restored box) still resolves by name,
+  # and a name never resolves from an id. `from_ids` remembers when we had to
+  # fall back, because an unresolvable ID must NOT be created as a channel name.
+  #
+  # WHICH FIELD HOLDS NAMES depends on whether the config predates this fix, and
+  # guessing wrong is destructive in one direction: treating a legacy NAME as an
+  # id skips the create and reports a channel missing, while treating an ID as a
+  # name creates a second room named after a uuid. The tell is the KEY, not the
+  # value — `channel_names` is written by every post-DIVE-3565 `enable`, so its
+  # ABSENCE means `channels` still holds names.
+  local from_ids="false" has_names
+  has_names=$(_buzz_pick "'yes' if 'channel_names' in (d or {}) else ''" <<<"$raw")
+  [[ -n "$chans" ]] || chans=$(_buzz_pick "','.join(d.get('channel_names') or [])" <<<"$raw")
+  if [[ -z "$chans" ]]; then
+    chans=$(_buzz_pick "','.join(d.get('channels') or [])" <<<"$raw")
+    [[ -n "$chans" && "$has_names" == "yes" ]] && from_ids="true"
+  fi
   [[ -n "$chans" ]] || chans="general"
 
   # The binary, from the config first (that is the path the plugin will use) and
@@ -315,6 +395,7 @@ _buzz_join() {
 
   # --- step 5: join or create each channel, and add the customer -----------
   local listing joined=0 created=0 failed=0 ch cid
+  local resolved_ids="" resolved_names=""
   listing=$(_buzz_cli "$user" "$bin" "$relay" "$key" channels list 2>/dev/null) || listing=""
   local IFS_SAVE="$IFS"
   IFS=','
@@ -322,7 +403,15 @@ _buzz_join() {
     IFS="$IFS_SAVE"
     ch="${ch// /}"
     [[ -n "$ch" ]] || continue
-    cid=$(_buzz_channel_id "$ch" <<<"$listing")
+    cid=$(_buzz_channel_ref_id "$ch" <<<"$listing")
+    if [[ -z "$cid" && "$from_ids" == "true" ]]; then
+      # The token came from the resolved-id list, so it is an id, and creating a
+      # channel NAMED after it would be a silent second room nobody is in.
+      warn "channel id '$ch' is not on $relay — re-run with the name: sudo 5dive agent buzz join $name --channels=<name>"
+      failed=$((failed + 1))
+      IFS=','
+      continue
+    fi
     if [[ -z "$cid" ]]; then
       step "Creating channel '$ch' on $relay"
       _buzz_cli "$user" "$bin" "$relay" "$key" \
@@ -330,7 +419,7 @@ _buzz_join() {
       # Re-list rather than parse the create output: the authority on whether a
       # channel exists is the relay, not the acknowledgement of the write.
       listing=$(_buzz_cli "$user" "$bin" "$relay" "$key" channels list 2>/dev/null) || listing=""
-      cid=$(_buzz_channel_id "$ch" <<<"$listing")
+      cid=$(_buzz_channel_ref_id "$ch" <<<"$listing")
       [[ -n "$cid" ]] && created=$((created + 1))
     fi
     if [[ -z "$cid" ]]; then
@@ -357,6 +446,10 @@ _buzz_join() {
     if [[ "$cust_ok" == "yes" && "$agent_ok" == "yes" ]]; then
       ok "channel '$ch' ($cid): agent is a member, customer key added"
       joined=$((joined + 1))
+      # Only a channel whose membership READ BACK earns a place in the list the
+      # poller watches. A write we could not confirm is not a subscription.
+      resolved_ids="${resolved_ids:+${resolved_ids},}${cid}"
+      resolved_names="${resolved_names:+${resolved_names},}${ch}"
     else
       warn "channel '$ch' ($cid): write accepted but the read-back does not show $( [[ "$cust_ok" == "yes" ]] || echo 'the customer as a member'; [[ "$agent_ok" == "yes" ]] || echo 'the agent in its own member list' )"
       failed=$((failed + 1))
@@ -364,6 +457,19 @@ _buzz_join() {
     IFS=','
   done
   IFS="$IFS_SAVE"
+
+  # --- THE HANDOFF TO THE READER (DIVE-3565) -------------------------------
+  # Every site above wired the relay side. This is the one that wires the
+  # PLUGIN: without it config.json still says `channels: ["general"]`, the
+  # poller sends that name to `buzz messages get --channel`, and every tick dies
+  # on `invalid UUID: general` — a seat that is green everywhere and answers
+  # nothing. Grade the writer against the reader:
+  # plugins/buzz/server.ts:38 `channels: string[] // channel UUIDs to watch`.
+  if [[ -n "$resolved_ids" ]]; then
+    step "Recording resolved channel ids in the buzz config (the poller reads ids, not names)"
+    _buzz_set_channel_ids "$user" "$cfg" "$resolved_ids" "$resolved_names" \
+      || warn "could not record the resolved channel ids in $cfg — the poller will not watch anything until it can"
+  fi
 
   # --- step 6: profile + presence (DIVE-3507) ------------------------------
   # Without this the room fills with faceless agents that read as offline, which
@@ -390,6 +496,7 @@ _buzz_join() {
     return 3
   fi
   ok "buzz last mile done for '$name' — ${joined} channel(s) (${created} created), customer key ${owner_pub:0:16}… is a member, profile + presence published."
+  ok "The poller picks the resolved ids up on restart: sudo 5dive agent restart $name"
   ok "Pair a handset: the envelope is \`5dive agent buzz owner $name --envelope\` (relayUrl/pubkey/nsec, DIVE-3300)."
   return 0
 }
