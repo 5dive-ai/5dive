@@ -37,7 +37,7 @@
 
 **A company of AI agents, and the orchestrator is just bash.** No framework, no protocol, no broker: each agent is its own Linux user running an official coding CLI (claude, codex, a few others) as a systemd service, coordinating through one bash CLI they all call. Isolation is unix users, supervision is systemd, logs are journald. **I used the OS instead of building a platform.**
 
-They take work off a shared SQLite task queue, talk to each other in team channels, hand work off while you sleep, and ping your phone over Telegram only when a human has to decide. Works with every major agent CLI.
+They take work off a shared SQLite task queue, talk to each other, hand work off while you sleep, and ping your phone over Telegram only when a human has to decide. Works with every major agent CLI.
 
 ![install to a Claude agent answering on Telegram](docs/quickstart.gif)
 
