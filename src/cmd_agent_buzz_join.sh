@@ -288,6 +288,31 @@ _buzz_join() {
     || fail "$E_GENERIC" "could not derive the customer pubkey"
   step "Customer pairing key for '$name': ${owner_pub:0:16}… (${state}/owner.json, 0600)"
 
+  # DIVE-3572. `join` is the SECOND (and last) writer of buzz identity into the
+  # registry, and it records BOTH halves:
+  #
+  #  - owner_pubkey, because this is the only place the paired handset key is
+  #    decided. It is what separates trust class (b) — an inbound event signed by
+  #    the OWNER's handset, routed like a paired human — from class (c), a
+  #    teammate on the a2a rail. Without it the bridge cannot tell the customer
+  #    from a stranger.
+  #  - pubkey, unconditionally, because every seat enabled BEFORE this row has a
+  #    config and no registry identity. Re-running `join` is idempotent, so this
+  #    is the backfill path that needs no new verb (`enable --no-join` is the
+  #    relay-free equivalent for a box whose relay is down).
+  #
+  # Both are the PUBLIC halves, derived from keys already in hand.
+  local self_pub=""
+  self_pub=$(printf '%s' "$key" | _buzz_xonly_pubkey 2>/dev/null) || self_pub=""
+  # An `[[ … ]] && { … }` here would be a landmine: header.sh runs the bundle under
+  # `set -e`, so the whole list returning 1 on an empty derivation would abort the
+  # join mid-way. Spelled as an `if`, deliberately.
+  if [[ -n "$self_pub" ]]; then
+    _buzz_registry_record "$name" pubkey "$self_pub" || true
+  fi
+  _buzz_registry_record "$name" owner_pubkey "$owner_pub" || \
+    warn "the paired handset key for '$name' was NOT recorded in the registry — \`5dive agent buzz whois $owner_pub\` will call the OWNER a stranger"
+
   # --- step 5: join or create each channel, and add the customer -----------
   local listing joined=0 created=0 failed=0 ch cid
   listing=$(_buzz_cli "$user" "$bin" "$relay" "$key" channels list 2>/dev/null) || listing=""
