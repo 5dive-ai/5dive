@@ -131,6 +131,40 @@ print('' if v is None else v)
 " 2>/dev/null
 }
 
+# ---------------------------------------------------------------------------
+# Where is the plugin's publish-profile.sh for <agent user>?  (DIVE-3625)
+#
+# The tiered-art publisher lives in the buzz PLUGIN and is already on main; this
+# file only has to invoke it. Finding it is the whole difficulty, and the line
+# this replaces got it wrong in a way that could never announce itself:
+# `.../plugins/cache/5dive-plugins/plugins/buzz/publish-profile.sh` is not a
+# path that exists on any box. The cache is laid out
+# `<cache>/5dive-plugins/<plugin>/<version>/`, so the guard was false
+# everywhere and even the printed remedy was never printed. Measured on this
+# host 2026-08-19: `.../cache/5dive-plugins/buzz/0.1.0/`.
+#
+# So DISCOVER it the way cmd_doctor.sh:343 discovers the plugin dir, and take
+# the newest when a box is holding two versions. Tested via
+# BUZZ_PUBLISH_PROFILE, which is also the override an operator needs to point
+# this at a checkout.
+#
+# Empty stdout means "not there" — the caller must treat that as a state to
+# report, not a path to run.
+# ---------------------------------------------------------------------------
+_buzz_publish_profile_script() { # <agent user>
+  local user="$1" found=""
+  if [[ -n "${BUZZ_PUBLISH_PROFILE:-}" ]]; then
+    [[ -f "$BUZZ_PUBLISH_PROFILE" ]] && printf '%s' "$BUZZ_PUBLISH_PROFILE"
+    return 0
+  fi
+  # -f, not -x: the install copies the plugin tree and the exec bit is not ours
+  # to rely on — it is invoked as `bash <script>` for exactly that reason.
+  found=$(find "/home/${user}/.claude/plugins/cache" -maxdepth 4 -type f \
+              -name publish-profile.sh -printf '%T@ %p\n' 2>/dev/null \
+          | sort -rn | head -1 | cut -d' ' -f2-)
+  printf '%s' "$found"
+}
+
 # Is <channel_id> present in a `channels list --member` payload?
 #
 # WHY NOT A SUBSTRING. This is the assertion that the AGENT is in the room, so
@@ -568,9 +602,52 @@ _buzz_join() {
   else
     warn "profile write was not readable back — the room will show '$name' as a blank circle (DIVE-3507)"
   fi
-  # The plugin's avatar tiering already exists and is not reimplemented here.
-  if [[ -x "/home/${user}/.claude/plugins/cache/5dive-plugins/plugins/buzz/publish-profile.sh" ]]; then
-    step "Avatar: sudo /home/${user}/.claude/plugins/cache/5dive-plugins/plugins/buzz/publish-profile.sh $name"
+  # --- THE FACE (DIVE-3625) ------------------------------------------------
+  # The plugin's avatar tiering already exists and is not reimplemented here —
+  # it is INVOKED. Printing it left every agent with a pictureless kind:0 and a
+  # blank circle on the customer's handset (lodar's phone, shy-river, 2026-08-19).
+  #
+  # ORDERING IS THE TRAP, NOT THE CALL. kind:0 is a REPLACING event, so the
+  # pictureless `users set-profile` above ERASES `picture`. This must therefore
+  # be the LAST kind:0 write of the last mile, and nothing may be added below it
+  # that publishes a profile — a bare set-profile after this ships the identical
+  # bug with a green log. tests/buzz_last_mile_unit.sh arms 8i/8j grade the
+  # ORDER, not the presence of the call.
+  local pp=""
+  pp=$(_buzz_publish_profile_script "$user")
+  if [[ -n "$pp" ]]; then
+    step "Publishing '$name''s avatar (tiered art) via $pp"
+    local pp_out="" pp_rc=0
+    # The publisher calls a bare `buzz`; the last mile has already RESOLVED one
+    # (config buzz_path, then the search) and a box need not have it on PATH.
+    pp_out=$(PATH="$(dirname "$bin"):$PATH" bash "$pp" "$name" 2>&1) || pp_rc=$?
+    if ((pp_rc == 0)); then
+      ok "avatar published for '$name'"
+    else
+      warn "avatar publish for '$name' failed (rc=${pp_rc}): $(printf '%s' "$pp_out" | tail -2 | tr '\n' ' ')"
+    fi
+  else
+    # The remedy must be reachable FROM THIS STATE (community/wiki/a-gates-
+    # printed-remedy-must-be-reachable-from-the-state-it-fires-in.md): naming
+    # publish-profile.sh here would name a file that is not on the box. Re-running
+    # `join` is reachable, and it is idempotent.
+    warn "no publish-profile.sh in ${user}'s plugin cache — '$name' keeps a pictureless profile and the handset will render a blank circle. The buzz plugin install has not landed yet; re-run \`sudo 5dive agent buzz join $name\` once it has."
+  fi
+
+  # THE ACCEPTANCE, AND IT IS THE READ THAT FAILED. The bug's signature is
+  # `buzz users get --pubkey <k>` coming back with no `picture`; a green exit
+  # from the publisher is the instrument agreeing with itself. Asserted HERE,
+  # after everything step 6 does, so a future write that erases the picture is
+  # caught by the same line rather than by a customer.
+  local pic=""
+  if [[ -n "$self_pub" ]]; then
+    pic=$(_buzz_cli "$user" "$bin" "$relay" "$key" users get --pubkey "$self_pub" 2>/dev/null \
+          | _buzz_pick "(d[0] if isinstance(d, list) and d else (d or {})).get('picture')")
+  fi
+  if [[ -n "$pic" ]]; then
+    ok "'$name' has a face: picture reads back as $pic"
+  else
+    warn "'$name' has NO picture on $relay after the full last mile — the customer's handset renders a blank avatar (DIVE-3625). Check: buzz users get --pubkey ${self_pub:0:16}…"
   fi
 
   if ((failed > 0)); then
