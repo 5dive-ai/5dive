@@ -403,7 +403,7 @@ assert_version_monotonic() {
 # against a manifest you downloaded from the same place as the payload is not a
 # check; it is a spell.
 BUZZ_CLI_TAG="${BUZZ_CLI_TAG:-cli-v0.1.2}"
-BUZZ_SUMS_SHA256="${BUZZ_SUMS_SHA256:-88bf8c798c42b78a094a77b1ab45b8759dc7c09908144377e9bed1e33bdbe47d}"
+BUZZ_SUMS_SHA256="${BUZZ_SUMS_SHA256:-124425c0961df092622cd0225e90b453b885cbe83758e829d0399b02b5f02155}"
 
 # Install/refresh `buzz` and `buzz-pair` into $BIN_DIR from the pinned release.
 #
