@@ -402,7 +402,7 @@ assert_version_monotonic() {
 # a constant in this file, which a release-side swap cannot reach. Verifying
 # against a manifest you downloaded from the same place as the payload is not a
 # check; it is a spell.
-BUZZ_CLI_TAG="${BUZZ_CLI_TAG:-cli-v0.1.1}"
+BUZZ_CLI_TAG="${BUZZ_CLI_TAG:-cli-v0.1.2}"
 BUZZ_SUMS_SHA256="${BUZZ_SUMS_SHA256:-88bf8c798c42b78a094a77b1ab45b8759dc7c09908144377e9bed1e33bdbe47d}"
 
 # Install/refresh `buzz` and `buzz-pair` into $BIN_DIR from the pinned release.
