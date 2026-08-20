@@ -449,7 +449,14 @@ if [[ -n "$_gt_capture" && -r "$_gt_capture" ]]; then
   _gt_shas=$(sed -n 's/^grading tree: .* @ \([0-9a-f]\{7,\}\).*/\1/p' "$_gt_capture" | sort -u)
 fi
 rm -f "$_gt_capture" 2>/dev/null || true
-_gt_n=$(printf '%s' "$_gt_shas" | grep -c . 2>/dev/null || printf '0')
+# DIVE-3646: `grep -c .` on empty input PRINTS "0" and THEN exits 1, so a
+# `|| printf '0'` fallback ALSO runs and _gt_n becomes the two-line string "0\n0",
+# which kills the (( )) below with `syntax error in expression`. That stderr lands
+# inside captured harness output and makes failing assertions unreadable. `wc -l`
+# counts without an exit-status opinion; the leading `-n` test keeps the empty case
+# at 0 rather than wc's 1-for-a-lone-newline.
+_gt_n=0
+[[ -n "$_gt_shas" ]] && _gt_n=$(printf '%s\n' "$_gt_shas" | grep -c . || true)
 if (( _gt_n > 1 )); then
   printf '\n'
   printf 'run-harnesses: FAIL — THE TREE MOVED MID-RUN. %s distinct graded SHAs:\n' "$_gt_n"
