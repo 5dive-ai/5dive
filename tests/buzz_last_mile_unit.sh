@@ -258,13 +258,14 @@ verb="${1:-}"; shift || true
 # So: an unrecognised argument is exit 64, the way clap exits non-zero on
 # `unexpected argument '--format' found`. `--member` is the one bare flag the
 # real parser accepts here and it is named explicitly rather than tolerated.
-CH=""; NAME=""; PUB=""; MEMBER=0
+CH=""; NAME=""; PUB=""; MEMBER=0; AVATAR=""
 while (($#)); do
   case "$1" in
     --channel) CH="$2"; shift 2 ;;
     --name)    NAME="$2"; shift 2 ;;
     --pubkey)  PUB="$2"; shift 2 ;;
     --member)  MEMBER=1; shift ;;
+    --avatar)  AVATAR="$2"; shift 2 ;;
     --role|--type|--visibility|--about|--status) shift 2 ;;
     *) printf 'error: unexpected argument %s found\n' "$1" >&2; exit 64 ;;
   esac
@@ -306,11 +307,22 @@ case "$grp:$verb" in
     while read -r p; do ((first)) || printf ','; first=0; printf '{"pubkey":"%s"}' "$p"; done <"$D/members-$CH" 2>/dev/null
     printf ']\n'
     ;;
-  users:set-profile) printf '%s' "$NAME" >"$D/profile"; printf '{"accepted":true}\n' ;;
+  users:set-profile)
+    printf '%s' "$NAME" >"$D/profile"
+    # kind:0 IS A REPLACING EVENT (DIVE-3625). A set-profile that carries no
+    # --avatar does not leave the old picture standing — it erases it. Modelled
+    # unconditionally, because a stub that preserved the picture would make the
+    # ordering arms below pass against the very bug they exist to catch.
+    printf '%s' "$AVATAR" >"$D/picture"
+    printf '{"accepted":true}\n' ;;
   users:set-presence) touch "$D/presence"; printf '{"accepted":true}\n' ;;
   users:get)
     has noprofile && { printf '{}\n'; exit 0; }
-    printf '{"name":"%s"}\n' "$(cat "$D/profile" 2>/dev/null)"
+    # An ARRAY, which is what the real binary answers — publish-profile.sh reads
+    # `json.load(stdin)[0]`, so an object here would be a stub that is easier
+    # than the caller.
+    printf '[{"display_name":"%s","about":"","picture":"%s"}]\n' \
+      "$(cat "$D/profile" 2>/dev/null)" "$(cat "$D/picture" 2>/dev/null)"
     ;;
   *) exit 64 ;;
 esac
@@ -539,6 +551,130 @@ grep -q 'env: relay=https://relay.example.com keylen=64' <<<"$(stub_log)" \
 grep -q '^argv:.*3333333333' <<<"$(stub_log)" \
   && bad_t "8h no private key on the executed argv" "the key appeared in the stub's argv — /proc/<pid>/cmdline is world-readable here" \
   || ok_t "8h no private key on the executed argv"
+
+# ===========================================================================
+# 8t-8w. DIVE-3625 — the enable path must INVOKE publish-profile.sh, and the
+# invocation must be the LAST kind:0 write.
+#
+# The defect these grade is not "the call is missing". It is that the call was
+# PRINTED, behind a guard on a path that exists on no box, so the room filled
+# with faceless agents while every log said the last mile was green. The arms
+# therefore assert on the RUN (did the publisher execute, in what order) and on
+# the READ THAT FAILED (does `users get` come back with a picture) — never on
+# the source text, which is what made the original defect invisible.
+# ===========================================================================
+PP_STUB="$STUB_ROOT/publish-profile.sh"
+cat >"$PP_STUB" <<'PPS'
+#!/usr/bin/env bash
+# Fake publish-profile.sh. Stands in for the PLUGIN's tiered-art publisher: logs
+# that it ran, then publishes name+about+avatar in ONE kind:0 the way the real
+# one does. Calls a BARE `buzz` on purpose — the real script does, so this is
+# also the arm that grades the caller putting the resolved binary on PATH.
+set -u
+printf 'publish-profile: %s\n' "$*" >>"${BUZZ_STUB_DIR}/log"
+# The real script reads the SEAT's config (relay_url + private_key) and exports
+# them — `buzz` is invoked with the identity in the environment, never on argv.
+# Modelled here because it is what makes the bare `buzz` below resolvable at all.
+eval "$(python3 -c '
+import json, sys
+c = json.load(open(sys.argv[1]))
+print("export BUZZ_RELAY_URL=%s BUZZ_PRIVATE_KEY=%s" % (c["relay_url"], c["private_key"]))
+' "${BUZZ_STUB_SEAT_CFG:?}")"
+buzz users set-profile --name "${1:-seat}" --about "5dive agent ${1:-seat}" \
+  --avatar "https://example.com/avatar/${1:-seat}.png" >/dev/null || exit 1
+PPS
+chmod +x "$PP_STUB"
+
+# A publisher that runs and publishes NOTHING. The control for 8r: without it,
+# a read-back arm that can only ever pass is not evidence.
+PP_INERT="$STUB_ROOT/publish-profile-inert.sh"
+printf '#!/usr/bin/env bash\nprintf "publish-profile: %%s\\n" "$*" >>"${BUZZ_STUB_DIR}/log"\nexit 0\n' >"$PP_INERT"
+chmod +x "$PP_INERT"
+
+# publish-profile.sh resolves the seat's config ITSELF, with its own
+# `config_path()` (plugins/buzz/publish-profile.sh). If the two spellings ever
+# drift, the publisher SKIPS the seat — "no buzz config" — and the last mile
+# reports a green publish over an agent that was never touched.
+# Source text, not a call: section 8 SHADOWS _buzz_state_dir with a temp dir so
+# join can run unprivileged, so the live function is not reachable from here.
+grep -q "/home/agent-%s/.claude/channels/buzz" "$SRC/cmd_agent_buzz.sh" \
+  && ok_t "8t the CLI's buzz state dir is the path the plugin's publisher looks in" \
+  || bad_t "8t the CLI's buzz state dir is the path the plugin's publisher looks in" \
+           "the spelling moved; publish-profile.sh's own config_path() would skip the seat"
+
+# --- 8t. it is INVOKED, not printed ----------------------------------------
+seed_agent "$STUB_BIN" "general"
+export BUZZ_PUBLISH_PROFILE="$PP_STUB" BUZZ_STUB_SEAT_CFG="$AGENT_STATE/config.json"
+run_join normal dev
+[[ "$JOIN_RC" -eq 0 ]] \
+  && ok_t "8t join still returns 0 with the avatar publisher wired in" \
+  || bad_t "8t join still returns 0 with the avatar publisher wired in" "rc=$JOIN_RC; $JOIN_OUT"
+grep -q '^publish-profile: dev$' <<<"$(stub_log)" \
+  && ok_t "8t publish-profile.sh is EXECUTED with the agent name (DIVE-3625)" \
+  || bad_t "8t publish-profile.sh is EXECUTED with the agent name (DIVE-3625)" \
+           "the last mile printed the remedy instead of running it — this is the shipped defect: $(stub_log)"
+grep -q 'argv: users set-profile .*--avatar ' <<<"$(stub_log)" \
+  && ok_t "8t a kind:0 carrying --avatar reached the relay" \
+  || bad_t "8t a kind:0 carrying --avatar reached the relay" "$(stub_log)"
+
+# --- 8u. THE ORDER, which is the actual trap -------------------------------
+# kind:0 is replacing, so a pictureless set-profile AFTER the avatar publish
+# ships the identical bug with a green log. The assertion is positional: the
+# LAST set-profile the relay saw must be the one carrying --avatar.
+LAST_SETPROF=$(grep '^argv: users set-profile' "$BUZZ_STUB_DIR/log" | tail -1)
+[[ "$LAST_SETPROF" == *"--avatar "* ]] \
+  && ok_t "8u the LAST kind:0 write of the last mile is the avatar one" \
+  || bad_t "8u the LAST kind:0 write of the last mile is the avatar one" \
+           "a pictureless set-profile ran after the avatar publish and erased it: '$LAST_SETPROF'"
+# Control: the pictureless one really did run first, so the arm above is
+# ordering evidence and not just "only one set-profile exists".
+[[ "$(grep -c '^argv: users set-profile' "$BUZZ_STUB_DIR/log")" -ge 2 ]] \
+  && ok_t "8u control: both kind:0 writes happened, so the order is what was graded" \
+  || bad_t "8u control: both kind:0 writes happened" "only one set-profile in $(stub_log)"
+
+# --- 8v. THE READ THAT FAILED ----------------------------------------------
+# The row's acceptance, verbatim: `users get` returns a non-empty picture AFTER
+# the full path has run. Graded through the last mile's own report.
+grep -q "has a face: picture reads back as https://example.com/avatar/dev.png" <<<"$JOIN_OUT" \
+  && ok_t "8v the last mile READS the picture back and says so" \
+  || bad_t "8v the last mile READS the picture back and says so" "$JOIN_OUT"
+
+seed_agent "$STUB_BIN" "general"
+export BUZZ_PUBLISH_PROFILE="$PP_INERT"
+run_join normal dev
+grep -q "has NO picture on https://relay.example.com" <<<"$JOIN_OUT" \
+  && ok_t "8v control: a publisher that publishes nothing is REPORTED, not passed" \
+  || bad_t "8v control: a publisher that publishes nothing is REPORTED, not passed" \
+           "the read-back reported success against an empty picture: $JOIN_OUT"
+[[ "$JOIN_RC" -eq 0 ]] \
+  && ok_t "8v a faceless profile is reported without failing the join" \
+  || bad_t "8v a faceless profile is reported without failing the join" "rc=$JOIN_RC"
+
+# --- 8w. the cold box: the plugin is not there yet (DIVE-3620) -------------
+# The remedy printed here must be reachable FROM THIS STATE — naming
+# publish-profile.sh would name a file the box does not have.
+seed_agent "$STUB_BIN" "general"
+export BUZZ_PUBLISH_PROFILE="$STUB_ROOT/does-not-exist.sh"
+run_join normal dev
+[[ "$JOIN_RC" -eq 0 ]] \
+  && ok_t "8w a missing publisher does not break the last mile" \
+  || bad_t "8w a missing publisher does not break the last mile" "rc=$JOIN_RC; $JOIN_OUT"
+grep -q 'no publish-profile.sh in agent-dev' <<<"$JOIN_OUT" \
+  && ok_t "8w the absence is REPORTED (the handset would show a blank circle)" \
+  || bad_t "8w the absence is REPORTED" "$JOIN_OUT"
+grep -q 'sudo 5dive agent buzz join dev' <<<"$JOIN_OUT" \
+  && ok_t "8w the printed remedy is reachable from the state it fires in" \
+  || bad_t "8w the printed remedy is reachable from the state it fires in" \
+           "it names a command that cannot run on a box with no plugin cache: $JOIN_OUT"
+unset BUZZ_PUBLISH_PROFILE
+
+# The path the shipped code guarded on exists on no box — the cache is
+# <cache>/5dive-plugins/<plugin>/<version>/. A regression back to it is silent,
+# so it is named here.
+grep -v '^[[:space:]]*#' "$JOINF" | grep -q 'cache/5dive-plugins/plugins/buzz' \
+  && bad_t "8w the false hardcoded plugin path is gone" \
+           "the guard is back on a path no box has; it can only ever be false" \
+  || ok_t "8w the false hardcoded plugin path is gone"
 
 # --- 8i. FINDING 2: `enable` actually CALLS the last mile -------------------
 # The row's DONE MEANS is "ENABLING buzz for an agent JOINS the default channel
