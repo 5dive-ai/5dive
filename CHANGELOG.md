@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased — feat(memory): `5dive memory consolidate` — async transcript → memory atoms (DIVE-3628, DIVE-726 phase 1)
+
+A session window dies and everything it learned dies with it, because "compile before you close" is
+a HABIT and a habit is not a mechanism. The motivating case is on the record: the very
+TencentDB-Agent-Memory discussion that produced this row was itself lost to an uncompiled window.
+This is the memory-moat floor — an ASYNC pass that distils finished session transcripts into durable
+atoms in the owning agent's own store, so knowledge survives a window nobody remembered to compile.
+
+- **Three stages over the stores we already have.** L0 is the raw `~/.claude/projects/*/*.jsonl`
+  transcript, untouched. L1 is a bounded plain-text excerpt (tool payloads collapse to `[tool: X]` —
+  they are the bulk of a jsonl and almost never the durable part; over `--max-chars` it keeps the
+  head and the tail, because the opening says what the session was for and the close says what it
+  concluded). L3 is a markdown atom. **No database, no vector index, no CodeGraph** — the shape is
+  idea-derived from TencentDB-Agent-Memory (MIT), not ported.
+- **One write path.** Every atom goes through `_memory_add`, so the secret tripwire, the dedup
+  warning, the frontmatter shape and the `MEMORY.md` index line are the same ones a hand-compiled
+  memory gets. There is no second write path to audit. Atoms carry `--provenance` naming the session
+  and a structural `--evidence=run:<session>` back-ref.
+- **It cannot publish.** `consolidate` has no `--store` and no reachable wiki branch: an
+  auto-extractor that could write fleet-wide is the one shape this must not have (DIVE-481
+  deny-default). Publishing to the shared wiki stays a curated act.
+- **It never reads the LIVE session.** A transcript touched inside `--idle-min` (default 30m) is
+  skipped — without it the pass would distil the very session it is running in.
+- **Idempotent twice over.** A `.consolidated.tsv` ledger records each (session, byte count); and
+  even with the ledger lost, `add` refuses a slug that already exists. Bounded by `--max-sessions`
+  per pass, so the cron cost is flat whatever the backlog does. Single-flight via `flock`.
+- **A distiller that CANNOT ANSWER is a counted, loud failure — never "0 atoms".** Measured on this
+  box: an unauthed `claude --print` prints `Not logged in` and **exits 0**. Folded into the atom
+  count, a fleet-wide auth lapse would read as "the sessions were quiet" forever. It is now its own
+  outcome, and a failed distill is deliberately **not** ledgered, so a transient outage cannot
+  silently retire the backlog.
+- Nothing installs the cron entry; `memory --help` carries the line.
+
+Two defects worth naming because the harness alone would not have caught either:
+
+- `exec 201>"$lockf" 2>/dev/null` is **two permanent redirections** — the second kills stderr for
+  the rest of the pass, silently swallowing every tripwire refusal. Caught only because an arm
+  asserted the refusal was *reported*, not merely that no file was written.
+- `rows=$(cmd); rc=$?` **aborts under the bundle's `set -euo pipefail`** — errexit fires on the
+  assignment before `$?` is read. The test corpus runs `set +e` and is structurally blind to it; it
+  passed every arm and still killed the built bundle on the first distiller failure. `tests/
+  memory_consolidate_unit.sh` now re-runs the failure arms under the bundle's own shell options.
+
+Tests: `tests/memory_consolidate_unit.sh`, 53 assertions, offline by construction (the distiller is
+an injected seam). Four mutants — the live-session skip, the dry-run ledger guard, the ledger skip,
+and the errexit fix — each red exactly the arm meant to catch it.
+
 ## Unreleased — fix(self-update): skip an agent holding an in_progress row and bounce it at its next task boundary (DIVE-3173)
 
 DIVE-3172 made the nightly restart conditional on the agent payload actually moving, which takes a
