@@ -13,7 +13,8 @@
 # RELIEVE a red (4 -> 6), so the arms that matter most are the ones proving a missing,
 # thin or disagreeing baseline leaves exit 4 exactly where it stands today.
 #
-# Core tier on purpose: ~7s, dominated by five 8-file fixture-corpus runs, and it
+# Core tier on purpose: ~7s, dominated by five 13-file fixture-corpus runs (DIVE-3646
+# reshaped that corpus without changing its wall clock), and it
 # guards the verdict logic of the gate every PR is graded by.
 set -uo pipefail
 
@@ -90,10 +91,69 @@ attr notanumber "$TMP/red-uniform.txt" "$TMP/base.txt"
 want "a non-integer cap is USAGE (exit 2), not a verdict" "2" "$RC"
 
 # --- 8-12: the runner wiring, end to end --------------------------------------
-mk() { printf '#!/usr/bin/env bash\nsleep 0.15\nexit 0\n' > "$CORPUS/$1"; }
-for i in 1 2 3 4 5 6 7 8; do mk "h$i.sh"; done
-for i in 1 2 3 4 5 6 7 8; do printf '100\t0\t%s/h%d.sh\n' "$CORPUS" "$i"; done > "$TMP/cb-uniform.txt"
-for i in 1 2 3 4 5 6 7 8; do printf '160\t0\t%s/h%d.sh\n' "$CORPUS" "$i"; done > "$TMP/cb-heavy.txt"
+# THESE ARMS MEASURE WALL CLOCK, SO THE FIXTURE HAS TO SURVIVE A COLD RUNNER.
+# DIVE-3646: on main@31031d1 the FIRST harness in this corpus read 284ms against
+# 153ms for the other seven — the cold page cache and first process spawn that only
+# the first one pays. DIVE-3580 read that correctly as CONCENTRATION
+# (top_excess_share_pct=52 against the 50 threshold), so the arm below demanded
+# `runner` and got `corpus`; test-installed-host is in branch protection, so this
+# froze every merge and every release cut on the repo for ~4h.
+#
+# The fixture was wrong, not the attributor, and the fix belongs here — NOT in
+# TIER_ATTR_CONC_MAX_PCT. Widening the concentration threshold to make this arm pass
+# would blind the gate to real single-file growth: widening a safety control to
+# unblock the change it would unblock.
+#
+# Two structural changes, neither of them a retuned magic number:
+#
+#   1. h00-warmup.sh runs FIRST (tier_list globs, so the corpus is in sorted order)
+#      and is priced in the baseline at WARMUP_BASE_MS — far above anything it can
+#      actually cost. Its excess is therefore NEGATIVE BY CONSTRUCTION, and the
+#      attributor only sums excess > 0, so the warm-up file cannot enter the
+#      concentration term at all. The first-harness cost now lands on a harness that
+#      is structurally incapable of carrying a verdict.
+#
+#   2. MEAS_N measured harnesses instead of eight, at a shorter sleep so the run
+#      costs the same wall clock as before. Top-3-of-12 is 25% at perfect uniformity
+#      where top-3-of-8 was 37.5%, so a straggler among the MEASURED files now needs
+#      roughly 6x the uniform per-file excess (~0.4s) to reach the 50 threshold,
+#      against the ~0.11s that was enough before.
+#
+# AND THE OVER/UNDER-CAP DECISION IS NOT TIMING-COUPLED AT ALL, by construction:
+# the sleeps alone sum to MEAS_N*MEAS_SLEEP = 1.2s against a 1s cap, so the corpus is
+# over on any runner at any speed, and the baseline prices are CONSTANTS summing to
+# less than the cap, so "fits at baseline prices" is arithmetic rather than weather.
+# The guard below asserts exactly that, so that retuning these constants into
+# incoherence fails as itself instead of as a mystery verdict.
+CAP_MS=1000                  # --budget=1, with calibration off
+MEAS_N=12; MEAS_SLEEP=0.1    # 12 x 0.1s = 1.2s of sleep alone, over CAP_MS
+WARMUP_SLEEP=0.02
+WARMUP_BASE_MS=500           # >> any plausible first-harness warm-up: excess < 0
+UNIFORM_BASE_MS=35           # green-run price: 500 + 12*35 = 920ms, fits CAP_MS
+HEAVY_BASE_MS=60             # agrees the corpus is over: 500 + 12*60 = 1220ms
+
+mkharness() { printf '#!/usr/bin/env bash\nsleep %s\nexit 0\n' "$2" > "$CORPUS/$1"; }
+mkharness h00-warmup.sh "$WARMUP_SLEEP"
+for (( i = 1; i <= MEAS_N; i++ )); do mkharness "$(printf 'h%02d.sh' "$i")" "$MEAS_SLEEP"; done
+
+mkbaseline() { # <file> <ms-per-measured-file>
+  { printf '%s\t0\t%s/h00-warmup.sh\n' "$WARMUP_BASE_MS" "$CORPUS"
+    for (( i = 1; i <= MEAS_N; i++ )); do printf '%s\t0\t%s/h%02d.sh\n' "$2" "$CORPUS" "$i"; done
+  } > "$1"
+}
+mkbaseline "$TMP/cb-uniform.txt" "$UNIFORM_BASE_MS"
+mkbaseline "$TMP/cb-heavy.txt" "$HEAVY_BASE_MS"
+
+# The three arithmetic invariants the arms below rest on. None involves a clock.
+sleep_ms=$(awk -v n="$MEAS_N" -v s="$MEAS_SLEEP" 'BEGIN{printf "%d", n*s*1000}')
+uni_ms=$(( WARMUP_BASE_MS + MEAS_N * UNIFORM_BASE_MS ))
+hvy_ms=$(( WARMUP_BASE_MS + MEAS_N * HEAVY_BASE_MS ))
+if (( sleep_ms > CAP_MS && uni_ms < CAP_MS && hvy_ms > CAP_MS )); then
+  ok "the fixture's own prices are coherent: sleeps ${sleep_ms}ms > cap ${CAP_MS}ms > uniform baseline ${uni_ms}ms"
+else
+  bad "the fixture's own prices are coherent" \
+    "need sleeps > cap > uniform-baseline and heavy-baseline > cap; got ${sleep_ms}/${CAP_MS}/${uni_ms}/${hvy_ms}"
+fi
 
 run() { OUT="$(bash "$RUNNER" --no-calibrate --corpus-dir="$CORPUS" --tier=core --confirm-top=0 "$@" 2>&1)"; RC=$?; }
 
@@ -115,10 +175,10 @@ run --budget=60 --label=t --report="$TMP/r-green.txt" --baseline-report="$TMP/cb
 want "a green run with a baseline supplied stays green — attribution touches only a would-be 4" "0" "$RC"
 has  "…and its report reads off" "$(cat "$TMP/r-green.txt")" "# budget_attribution=off"
 
-printf '#!/usr/bin/env bash\nexit 1\n' > "$CORPUS/h9.sh"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$CORPUS/h99-fail.sh"
 run --budget=1 --label=t --report="$TMP/r-fail.txt" --baseline-report="$TMP/cb-uniform.txt"
 want "a FAILING harness still dominates: exit 1, never a weather downgrade over a red test" "1" "$RC"
-rm -f "$CORPUS/h9.sh"
+rm -f "$CORPUS/h99-fail.sh"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1
