@@ -8,6 +8,27 @@ TencentDB-Agent-Memory discussion that produced this row was itself lost to an u
 This is the memory-moat floor — an ASYNC pass that distils finished session transcripts into durable
 atoms in the owning agent's own store, so knowledge survives a window nobody remembered to compile.
 
+- **IT IS SCHEDULED — nothing to install.** The pass hangs off `5dive heartbeat tick`, the one
+  recurring root job every box already has, as a new `_hb_memory_consolidate_sweep` under the same
+  non-fatal isolation contract as every other sweep. A customer box gets consolidation with ZERO
+  extra setup: no systemd timer, no per-seat crontab line, nothing that can be half-installed. Each
+  pass runs **as the seat's own user**, so atoms land in that agent's own 0600 store and burn that
+  agent's own quota. Off with `MEMORY_CONSOLIDATE=off`; retune with `MEMORY_CONSOLIDATE_EVERY_MIN`.
+- **The measured cost, stated rather than implied.** One session, default `claude --print`
+  distiller, one ~300KB transcript at `--max-chars=20000`, 2026-08-20: **$0.244 cold-cache, $0.081
+  warm, ~35s, ~2.5k output tokens.** The schedule bounds that to one session per seat per pass and
+  one pass per seat per 6h => **<=4 model calls/seat/day**, and a seat with no NEW finished
+  transcript costs **$0** — the ledger short-circuits before the distiller is ever invoked, so the
+  bill tracks real sessions, not wall-clock. Note for anyone budgeting a sub-model call: $0.150 of
+  that $0.244 is the coding-agent harness's own system prompt, not our work — the lever is a leaner
+  `--distiller`, not a shorter excerpt.
+- **The instruction surfaces now describe the POST-pipeline workflow.** The knowledge-task nudge
+  injected into every knowledge-shaped wake, the `MEMORY.md` seeded into every new seat by
+  `agent create`, the shipped per-seat `CLAUDE.md` template, and the filing-cap guidance all state
+  the new division of labor explicitly: **the pipeline lifts what is lying in the transcript; you
+  still hand-compile JUDGEMENT** — a decision and its reason, a cause, a wiki page — because that is
+  a claim you are making, not a fact in the log. None of them tells agents to stop compiling, and
+  all of them note the pipeline deliberately cannot publish to a shared store.
 - **Three stages over the stores we already have.** L0 is the raw `~/.claude/projects/*/*.jsonl`
   transcript, untouched. L1 is a bounded plain-text excerpt (tool payloads collapse to `[tool: X]` —
   they are the bulk of a jsonl and almost never the durable part; over `--max-chars` it keeps the

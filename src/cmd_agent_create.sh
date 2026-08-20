@@ -1612,6 +1612,13 @@ _rebuild_inherited_index() {
     echo
     echo "Seeded from shared team knowledge so this agent starts warm. Search with \`5dive memory search \"<query>\"\`; add your own facts with \`5dive memory add\`."
     echo
+    echo "This index grows on its own: \`5dive memory consolidate\` distils your FINISHED"
+    echo "session transcripts into atoms here, scheduled for you, never touching the live"
+    echo "session, and never leaving this box. You still hand-compile JUDGEMENT-shaped"
+    echo "knowledge (a decision and its reason, a cause, a wiki page) — the pipeline can"
+    echo "only lift what is stated in the transcript, and it cannot publish to a shared"
+    echo "store at all."
+    echo
     for f in "$dir"/*.md; do
       [[ -e "$f" ]] || continue
       [[ "$(basename "$f")" == "MEMORY.md" ]] && continue

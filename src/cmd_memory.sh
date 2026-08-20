@@ -81,8 +81,17 @@ _memory_usage() {
       Writes to YOUR OWN store only. There is deliberately no --store: an
       auto-extractor must not be able to publish to the shared wiki (DIVE-481
       deny-default). Publishing stays a curated act.
-      Cron it (nothing installs this for you):
-        */30 * * * * /usr/local/bin/5dive memory consolidate >>~/.5dive-consolidate.log 2>&1
+      SCHEDULED FOR YOU — you do not have to wire this up. The heartbeat tick
+      (the one root cron every box already has) runs ONE bounded pass per seat
+      every 6h, as that seat's own user. Off: MEMORY_CONSOLIDATE=off. Retune:
+      MEMORY_CONSOLIDATE_EVERY_MIN. Run it by hand any time; it is idempotent.
+      COST — it spends YOUR model quota, so the number is stated, not implied.
+      Measured 2026-08-20, default `claude --print` distiller, one ~300KB
+      transcript at --max-chars=20000: $0.244 cold-cache, $0.081 warm, ~35s,
+      ~2.5k output tokens. The scheduled cadence bounds that to <=4 calls per
+      seat per day, and a seat with no NEW finished transcript costs $0 (the
+      ledger short-circuits before the distiller is ever invoked). Lower it
+      further with --max-chars, or point --distiller at a cheaper model.
 
   5dive memory doctor [--roots=a,b] [--agent=<name>] [--code-root=<dir>] [--json]
       Hygiene pass over the memory store(s): index drift (MEMORY.md vs files on

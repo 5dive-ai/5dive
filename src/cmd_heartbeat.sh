@@ -314,6 +314,12 @@ _hb_wake_budget_inc() {
 #     DIVE-1434 poller-liveness canary (olivia condition 2), so a slept agent with
 #     a later trigger is always woken by a subsequent tick.
 _HB_SLEEP_AFTER_MIN="${HEARTBEAT_SLEEP_AFTER_MIN:-15}"   # idle minutes before a cold agent sleeps
+# DIVE-3628 memory-consolidation cadence. 6h => <=4 distiller calls/seat/day; see
+# _hb_memory_consolidate_sweep for the measured per-call cost this bounds.
+_HB_CONSOLIDATE_EVERY_MIN="${MEMORY_CONSOLIDATE_EVERY_MIN:-360}"
+# A distiller call measured ~35s; 300s is generous headroom without letting a
+# wedged model call sit on the tick.
+_HB_CONSOLIDATE_TIMEOUT_S="${MEMORY_CONSOLIDATE_TIMEOUT_S:-300}"
 [[ "$_HB_SLEEP_AFTER_MIN" =~ ^[0-9]+$ ]] || _HB_SLEEP_AFTER_MIN=15
 
 # Per-agent idle-before-sleep threshold (minutes); falls back to the global default.
@@ -2269,7 +2275,7 @@ _hb_wake() {
   if [[ -n "$task_text" ]]; then
     recall=$(_hb_recall_cite "$name" "$task_text" 3) || recall=""
     if _hb_is_knowledge_task "$task_text"; then
-      compile_hint=" This task looks knowledge-shaped: before you close it, COMPILE the durable, non-obvious findings to the team wiki per the karpathy method (compile-knowledge skill, or '5dive memory add --store=wiki' + an index line) — compiling is part of done, not a separate chore."
+      compile_hint=" This task looks knowledge-shaped. Note the division of labor since DIVE-3628: an async pass ('5dive memory consolidate', run for you by the heartbeat) already distils your FINISHED transcripts into memory atoms, so you do NOT have to hand-copy facts out of this session to keep them. What it cannot do is JUDGEMENT-shaped knowledge — a wiki page, a decision record, a gap analysis, the CAUSE behind a finding — because that is a claim you are making, not a fact lying in the transcript. So: still COMPILE those to the team wiki per the karpathy method (compile-knowledge skill, or '5dive memory add --store=wiki' + an index line) before you close — compiling is part of done, not a separate chore. The pipeline never publishes to the shared wiki; only you can."
     fi
   fi
   [[ -n "$recall" ]] && nudge="${nudge} Relevant memory to check first (verify before relying; re-search with '5dive memory search'): ${recall}."
@@ -4170,6 +4176,76 @@ _hb_capability_reverify_sweep() {
   return 0
 }
 
+# DIVE-3628 — THE SCHEDULER for `5dive memory consolidate`. A verb nobody runs is
+# not an async pipeline: the acceptance is "a fresh box user's agent loses a
+# session and a later session knows what it learned, with NO manual step", and
+# that is only true if something fires it. This is that something.
+#
+# Why here and not a systemd timer or a crontab line: the tick is the ONE
+# recurring root job every 5dive box already has (`5dive init` wires it; nothing
+# else is installed per-seat), so hanging the pass off it means a customer box
+# gets consolidation with zero extra setup — no new unit, no new install step, no
+# per-seat cron to forget. A timer would be a second thing to install and a
+# second thing to be missing.
+#
+# COST IS THE REAL CONSTRAINT and it is bounded here, not in the verb. Measured
+# 2026-08-20 on this box with the default `claude --print` distiller: $0.244 per
+# session cold-cache, $0.081 warm. So the pass is capped at ONE session per seat
+# per run and one run per seat per _HB_CONSOLIDATE_EVERY_MIN (6h) => <=4 model
+# calls/seat/day, ~$0.32-$0.98/seat/day WORST case, and far less in practice
+# because a seat with no new finished transcript makes NO model call at all (the
+# ledger short-circuits before the distiller). Turn it off with
+# MEMORY_CONSOLIDATE=off; retune with MEMORY_CONSOLIDATE_EVERY_MIN.
+#
+# It runs AS THE SEAT'S OWN USER. That is not tidiness: atoms must land in that
+# agent's own 0600 store and burn that agent's own quota, and running as root
+# would write root-owned files into a user's memory dir and silently break the
+# next `memory add`.
+#
+# Same isolation contract as every other sweep — a failure here must NEVER abort
+# the wake loop.
+_hb_memory_consolidate_sweep() {
+  local now="$1"
+  _HB_CONS_RAN=0; _HB_CONS_SKIPPED=0; _HB_CONS_FAILED=0
+  [[ "${MEMORY_CONSOLIDATE:-on}" == "off" ]] && return 0
+  local every="${MEMORY_CONSOLIDATE_EVERY_MIN:-${_HB_CONSOLIDATE_EVERY_MIN}}"
+  [[ "$every" =~ ^[0-9]+$ ]] && (( every > 0 )) || every="$_HB_CONSOLIDATE_EVERY_MIN"
+  local stampdir="${STATE_DIR:-/var/lib/5dive}/memory-consolidate"
+  mkdir -p "$stampdir" 2>/dev/null || return 0
+  local reg name user stamp last
+  reg=$(registry_read) || return 0
+  for name in $(jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null); do
+    # Resolve the seat's unix user the same way the memory store does.
+    user="agent-$name"
+    id -u "$user" >/dev/null 2>&1 || user="$name"
+    id -u "$user" >/dev/null 2>&1 || continue
+    stamp="$stampdir/${name}.stamp"
+    last=$(cat "$stamp" 2>/dev/null) || last=0
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    if (( now - last < every * 60 )); then
+      _HB_CONS_SKIPPED=$((_HB_CONS_SKIPPED + 1)); continue
+    fi
+    # Stamp BEFORE the run, not after. A distiller call can take ~35s and the
+    # tick fires every 5 minutes: stamping after would let a slow or wedged pass
+    # be re-entered by the next tick and multiply the cost by however many ticks
+    # it outlives. The verb also holds its own flock, but that turns a cost bug
+    # into a lock-contention error rather than preventing it — the cadence has to
+    # be enforced by the clock. A crashed pass just waits one cadence; nothing is
+    # lost, because a session with no ledger row is retried forever by design.
+    printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
+    if timeout "${_HB_CONSOLIDATE_TIMEOUT_S}" sudo -n -u "$user" -H \
+         "${SELF_BIN:-/usr/local/bin/5dive}" memory consolidate --max-sessions=1 \
+         >/dev/null 2>&1; then
+      _HB_CONS_RAN=$((_HB_CONS_RAN + 1))
+    else
+      # Non-fatal and COUNTED, never silent: a fleet-wide auth lapse or a missing
+      # sudo grant has to show up as failures in the log, not as a quiet box.
+      _HB_CONS_FAILED=$((_HB_CONS_FAILED + 1))
+    fi
+  done
+  return 0
+}
+
 cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
@@ -4241,6 +4317,13 @@ cmd_heartbeat_tick() {
   # DIVE-972: enforce per-loop token ceilings for async (non --wait) loops. Same
   # isolation contract — a failure here must never abort the wake loop.
   _hb_loop_ceiling_sweep || _hb_log "[loop-ceiling] pass errored (non-fatal)"
+  # DIVE-3628: async transcript -> memory-atom consolidation, one bounded pass
+  # per seat per cadence. Runs LAST — it is the only sweep that spends model
+  # tokens, so nothing that keeps the fleet moving may ever queue behind it.
+  # Same isolation contract as every other sweep.
+  _hb_memory_consolidate_sweep "$now" || _hb_log "[memory-consolidate] pass errored (non-fatal)"
+  (( ${_HB_CONS_RAN:-0} || ${_HB_CONS_FAILED:-0} )) \
+    && _hb_log "[memory-consolidate] ${_HB_CONS_RAN:-0} seat(s) distilled, ${_HB_CONS_FAILED:-0} failed, ${_HB_CONS_SKIPPED:-0} not due" || true
   # DIVE-3343: there is NO per-TASK budget sweep here any more, and its absence
   # is deliberate — see the block above _hb_loop_ceiling_sweep's neighbours in
   # this file for why the figure it enforced could not be attributed to a row.
