@@ -375,7 +375,8 @@ An internal-machinery finding gets its own ident ONLY if it has ALREADY blocked 
 REFUSED TITLE (recorded in policy_refusals, not lost): ${title}
 This is a budget on NEW ROWS, not on noticing things. Put it where it already has context:
   · a finding on work you are doing  →  append it to the BODY of the row you found it on
-  · durable, reusable knowledge      →  community/wiki/ (see the compile-knowledge skill)
+  · durable, reusable knowledge      →  community/wiki/ (see the compile-knowledge skill; a
+    plain fact from this session needs no row and no page — 'memory consolidate' already lifts it)
   · someone must ACT and it is serious →  --priority=high (high and urgent are never capped)
 There is no bypass flag. If it is serious enough to need one, it is serious enough to be high."
       fi
