@@ -127,8 +127,29 @@ out=$( ( export ACP_RUN_DIR="$WORK/notadir/mine" ACP_BUN_BIN="$WORK/fake-bun" HO
          cmd_acp ) 2>&1 >/dev/null ) || rc=$?
 want "$([[ $rc -ne 0 && ! -e "$WORK/h4/.cache/5dive/acp-server.ts" ]] && echo true)" \
   "an explicit ACP_RUN_DIR does NOT silently fall back to \$HOME (rc=$rc)"
-want "$(grep -q 'notadir/mine' <<<"$out" && ! grep -q 'h4' <<<"$out" && echo true)" \
+# DIVE-3635: the negative half greps the FULL fallback path, not the bare word
+# `h4`. $WORK is an mktemp -d, and on main@035db79 mktemp handed out
+# /tmp/tmp.ohGKxeBWh4 — whose random suffix ENDS IN h4 — so the bare pattern
+# matched the temp root that every candidate path is printed under, this arm went
+# red on a correct message, and `test-installed-host` (a required context) froze
+# every merge and release cut on the repo. A ~0.2% chance per run of a false red
+# on a required check is not a rare event at this repo's run rate.
+want "$(grep -q 'notadir/mine' <<<"$out" && ! grep -qF -- "$WORK/h4" <<<"$out" && echo true)" \
   "that failure names the directory the caller chose, and only it: ${out:0:80}"
+
+# (d-control) The two ways that predicate can be wrong, graded directly so the
+# anchoring cannot silently rot back to a substring: a temp root that CONTAINS
+# the fallback's basename must still pass, and a message that really does name
+# the $HOME fallback must still fail.
+_acp_d_pred() { # $1=work-root $2=message
+  grep -q 'notadir/mine' <<<"$2" && ! grep -qF -- "$1/h4" <<<"$2" && echo true
+}
+want "$(_acp_d_pred '/tmp/tmp.ohGKxeBWh4' \
+  'error: could not stage the ACP server in any of: /tmp/tmp.ohGKxeBWh4/notadir/mine')" \
+  "d-control: a temp root whose own name ends in h4 does NOT trip the negative (the DIVE-3635 red)"
+want "$([[ -z $(_acp_d_pred '/tmp/tmp.ohGKxeBWh4' \
+  'error: could not stage the ACP server in any of: /tmp/tmp.ohGKxeBWh4/notadir/mine /tmp/tmp.ohGKxeBWh4/h4/.cache/5dive') ]] && echo true)" \
+  "d-control: a message that DOES name the \$HOME fallback still fails the arm — the anchoring did not defang it"
 
 # (e) Nowhere to stage at all: fail naming the override, not a dead pipe.
 rc=0
