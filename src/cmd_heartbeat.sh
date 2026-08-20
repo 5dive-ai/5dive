@@ -3602,27 +3602,60 @@ _hb_stall_sweep() {
   # muted, and recreates the silent-monitoring defect DIVE-3460 exists to remove. So
   # it is one ping per ROW (stranded_pinged_at, the shipped_flag_at pattern), never
   # one per sweep. A row is announced once and then never again.
-  local srow sid sident sasg ssince stmpl sdays sbusy sload
+  local srow sid sident sasg ssince sstarted stmpl sdays sbusy sload sphase slane
   while IFS= read -r srow; do
     [[ -n "$srow" ]] || continue
-    IFS=$'\x1f' read -r sid sident sasg ssince <<<"$srow"
+    IFS=$'\x1f' read -r sid sident sasg ssince sstarted <<<"$srow"
     [[ -n "$sid" && -n "$sasg" ]] || continue
     sdays=$(( ($(date -u +%s) - $(date -u -d "$ssince" +%s 2>/dev/null || date -u +%s)) / 86400 ))
+    # DIVE-3483 deliberately selects a row STARTED ONCE AND DROPPED as well as one
+    # never touched (arm E9), and dates it from the DROP — so a single fixed
+    # "without being started" is FALSE for half the population it announces.
+    # Measured 2026-08-19 over every firing in the board's history: 4 of the 6
+    # post-backfill pings were on rows that had already been started, one of them 5
+    # days before its own "never started" sentence. This is DIVE-2207's defect one
+    # field over — a sentence broader than its predicate is read wrong by everyone
+    # who has not read the query — and it fails expensively, because "untouched" is
+    # the one claim that makes a reader reach for cancel.
+    if [[ -n "$sstarted" ]]; then
+      sphase="was started ${sstarted%% *} and has not moved since"
+    else
+      sphase="has sat todo for ${sdays} day(s) without ever being started"
+    fi
     # NAME THE LANE, so the reader can act in one step instead of re-investigating.
     # What the seat IS doing is the evidence that it is alive and simply not choosing
     # this row — the distinction the two blind rails above cannot draw.
     sbusy=$(db "SELECT COALESCE(ident,'DIVE-'||id) FROM tasks
                 WHERE kind='standard' AND status='in_progress'
                   AND assignee=$(sqlq "$sasg") ORDER BY id LIMIT 1;" 2>/dev/null || echo "")
+    # id<>sid, and 0 must render as ABSENT not as "0". The stranded row is ITSELF
+    # todo, so an unfiltered COUNT() returns 1 on a seat holding nothing else and
+    # the sentence then calls it "1 OTHER todo row" — the alarm citing the row as
+    # evidence of its own lane congestion. Measured on DIVE-3375 (olivia,
+    # 2026-08-19 00:00:08Z): every other row she held was blocked, this count was
+    # the stranded row itself, and it was the ONLY support offered for the verdict
+    # below. Separately, "$sload" is a STRING, so the old ${sload:+...} expanded on
+    # "0" too and could print "holds 0 other todo row(s)" as lane evidence.
     sload=$(db "SELECT COUNT(*) FROM tasks
                 WHERE kind='standard' AND status='todo'
+                  AND id<>${sid}
                   AND assignee=$(sqlq "$sasg");" 2>/dev/null || echo "")
-    [[ "$sload" =~ ^[0-9]+$ ]] || sload=""
+    [[ "$sload" =~ ^[0-9]+$ ]] && (( sload > 0 )) || sload=""
+    # WITHHOLD THE VERDICT WHEN NEITHER SIGNAL IS PRESENT. sbusy and sload are the
+    # only measurements behind "LANE problem, not a priority problem"; with both
+    # empty the clause is a guess, and an alarm that names a cause it did not
+    # measure spends its reader's trust on exactly the firings where it guessed
+    # wrong. It still reports the symptom, which is the part it does measure.
+    if [[ -n "$sbusy" || -n "$sload" ]]; then
+      slane="so this is a LANE problem, not a priority problem, and re-pinging the same seat will not clear it"
+    else
+      slane="that seat holds nothing else and is not visibly busy, so READ THE ROW before treating this as a lane problem"
+    fi
     ( cmd_send "ops" --from="task-engine" \
-        --message="🧊 Stranded ${sdays}d: ${sident} has sat todo on '${sasg}' for ${sdays} day(s) without being started${sbusy:+, while that seat is ACTIVE on ${sbusy}}${sload:+ and holds ${sload} other todo row(s)} — so this is a LANE problem, not a priority problem, and re-pinging the same seat will not clear it (reassign, or cancel it if it is dead). Surfaced once per row and never again (DIVE-3483)." ) >/dev/null 2>&1 || true
+        --message="🧊 Stranded ${sdays}d: ${sident} ${sphase} on '${sasg}'${sbusy:+, while that seat is ACTIVE on ${sbusy}}${sload:+ and holds ${sload} other todo row(s)} — ${slane} (reassign; cancel it if it is dead; or, if it is waiting on a date or an event, give that wait its verb — \`5dive task park --wake=\` — because a wait written only in the body leaves the row in the rotation and lands here). Surfaced once per row and never again (DIVE-3483)." ) >/dev/null 2>&1 || true
     db "UPDATE tasks SET stranded_pinged_at=datetime('now') WHERE id=${sid};"
     _hb_log "[stranded] ${sident} todo ${sdays}d on ${sasg}${sbusy:+ (active on ${sbusy})} -> surfaced"
-  done < <(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id)||x'1f'||COALESCE(assignee,'')||x'1f'||COALESCE(first_started_at,created_at)
+  done < <(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id)||x'1f'||COALESCE(assignee,'')||x'1f'||COALESCE(first_started_at,created_at)||x'1f'||COALESCE(first_started_at,'')
                FROM tasks
                WHERE kind='standard' AND status='todo' AND assignee IS NOT NULL
                  AND stranded_pinged_at IS NULL

@@ -641,5 +641,112 @@ _hb_stall_sweep >/dev/null 2>&1
   && ok_t "E10 the DROP clock governs, not created_at (a 9-day-old row touched an hour ago is silent)" \
   || bad_t "E10 stale created_at drove the alert" "$(cat "$SEND_LOG")"
 
+# =============================================================================
+# E11-E14 (ops, 2026-08-19) — THE ALARM'S SENTENCE MUST NOT ASSERT MORE THAN ITS
+# QUERY MEASURED. Precision audit over every firing in the board's history: 6
+# post-backfill pings, 0 of them the shape the arm exists to detect. Three
+# separate over-claims, each graded below with a POSITIVE CONTROL, because
+# "the clause is gone" and "the clause is conditional" pass identically
+# otherwise and only one of them is the fix.
+# =============================================================================
+strandtxt() { grep $'^ops\t.*Stranded' "$SEND_LOG" | head -1; }
+
+# --- E11: SELF-COUNT. The stranded row is itself todo, so an unfiltered COUNT()
+#     on the seat returns 1 and the sentence called it "1 OTHER todo row" — the
+#     alarm offering the row as evidence of its own lane congestion. Measured on
+#     DIVE-3375 (olivia): it was the ONLY support the verdict had.
+reset_all
+m=$(addt --assignee=dev -- "stranded, and the seat's only todo")
+mbusy=$(addt --assignee=dev -- "seat is busy")
+db "UPDATE tasks SET status='in_progress' WHERE id=${mbusy};"
+db "UPDATE tasks SET created_at=datetime('now','-${_HB_STRANDED_HOURS} hours','-1 hour') WHERE id=${m};"
+: >"$SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+[[ "$(strandmsg)" -ge 1 ]] && ! grep -q 'other todo row' <<<"$(strandtxt)" \
+  && ok_t "E11 a seat whose ONLY todo row is the stranded one claims no OTHER load" \
+  || bad_t "E11 the row was counted as its own lane evidence" "$(strandtxt)"
+
+# --- E11b: POSITIVE CONTROL for E11. Real other load must still be reported, or
+#     E11 would pass just as well against a deleted clause.
+reset_all
+n=$(addt --assignee=dev -- "stranded row")
+nbusy=$(addt --assignee=dev -- "seat is busy")
+nother=$(addt --assignee=dev -- "genuine second todo on the same seat")
+db "UPDATE tasks SET status='in_progress' WHERE id=${nbusy};"
+db "UPDATE tasks SET created_at=datetime('now','-${_HB_STRANDED_HOURS} hours','-1 hour') WHERE id=${n};"
+: >"$SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+grep -q 'holds 1 other todo row' <<<"$(strandtxt)" \
+  && ok_t "E11b POSITIVE CONTROL: genuine other load is still counted, and counted correctly" \
+  || bad_t "E11b real lane load went unreported" "$(strandtxt)"
+
+# --- E12: "WITHOUT BEING STARTED" IS FALSE FOR HALF THE POPULATION. E9 selects a
+#     started-then-dropped row on purpose and dates it from the DROP, so the fixed
+#     sentence contradicted the arm's own predicate. 4 of the 6 post-backfill
+#     firings hit rows already started — one 5 days before its "never started"
+#     ping. It fails expensively: "untouched" is what makes a reader reach for
+#     cancel. (DIVE-2207, one field over.)
+reset_all
+o=$(addt --assignee=codex -- "started once, dropped, never resumed")
+obusy=$(addt --assignee=codex -- "codex is busy elsewhere")
+db "UPDATE tasks SET status='in_progress' WHERE id=${obusy};"
+db "UPDATE tasks SET created_at=datetime('now','-9 days'),
+                     first_started_at=datetime('now','-${_HB_STRANDED_HOURS} hours','-1 hour'),
+                     started_at=NULL WHERE id=${o};"
+: >"$SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+[[ "$(strandmsg)" -ge 1 ]] && ! grep -q 'without ever being started' <<<"$(strandtxt)" \
+  && grep -q 'was started' <<<"$(strandtxt)" \
+  && ok_t "E12 a DROPPED row is described as started-and-not-moved, not as never-started" \
+  || bad_t "E12 a started row was announced as never started" "$(strandtxt)"
+
+# --- E12b: POSITIVE CONTROL for E12 — the genuinely untouched row must still say so.
+reset_all
+q=$(addt --assignee=codex -- "never touched at all")
+qbusy=$(addt --assignee=codex -- "codex is busy elsewhere")
+db "UPDATE tasks SET status='in_progress' WHERE id=${qbusy};"
+db "UPDATE tasks SET created_at=datetime('now','-${_HB_STRANDED_HOURS} hours','-1 hour'),
+                     first_started_at=NULL WHERE id=${q};"
+: >"$SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+grep -q 'without ever being started' <<<"$(strandtxt)" \
+  && ok_t "E12b POSITIVE CONTROL: a never-started row is still called never-started" \
+  || bad_t "E12b never-started row mis-described" "$(strandtxt)"
+
+# --- E13: WITHHOLD A VERDICT THAT WAS NOT MEASURED. sbusy and sload are the only
+#     evidence behind "LANE problem, not a priority problem". With both empty the
+#     clause is a guess — and it was the clause that prescribed reassign-or-cancel
+#     on DIVE-3375, a row that started 17s later exactly as its body said it would.
+reset_all
+r=$(addt --assignee=quinn -- "stranded on a seat with no other load and nothing in flight")
+db "UPDATE tasks SET created_at=datetime('now','-${_HB_STRANDED_HOURS} hours','-1 hour') WHERE id=${r};"
+: >"$SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+[[ "$(strandmsg)" -ge 1 ]] && ! grep -q 'LANE problem, not a priority problem' <<<"$(strandtxt)" \
+  && grep -q 'READ THE ROW' <<<"$(strandtxt)" \
+  && ok_t "E13 with neither lane signal present the verdict is withheld, not asserted" \
+  || bad_t "E13 asserted a lane cause it did not measure" "$(strandtxt)"
+
+# --- E13b: POSITIVE CONTROL for E13 — with real evidence the verdict still fires.
+#     E2 covers the busy-seat half; this covers load-without-an-in-progress-row.
+reset_all
+u=$(addt --assignee=quinn -- "stranded row")
+uother=$(addt --assignee=quinn -- "genuine second todo, seat has nothing in flight")
+db "UPDATE tasks SET created_at=datetime('now','-${_HB_STRANDED_HOURS} hours','-1 hour') WHERE id=${u};"
+: >"$SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+grep -q 'LANE problem, not a priority problem' <<<"$(strandtxt)" \
+  && ok_t "E13b POSITIVE CONTROL: measured load alone still earns the lane verdict" \
+  || bad_t "E13b withheld a verdict it had evidence for" "$(strandtxt)"
+
+# --- E14: the remedy list offers the THIRD branch. Both original branches are
+#     wrong for a row waiting on a date or an event, in opposite directions:
+#     reassign re-strands it on the next seat, cancel destroys live work. Measured
+#     three times in two days (DIVE-3429 started 9s after its ping, DIVE-3375 17s,
+#     DIVE-2037 was event-blocked) — every one a wait written only in the body.
+grep -q 'task park --wake=' <<<"$(strandtxt)" \
+  && ok_t "E14 the remedy names the park verb, so a body-only wait has a structured fix" \
+  || bad_t "E14 remedy still offers only reassign-or-cancel" "$(strandtxt)"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
