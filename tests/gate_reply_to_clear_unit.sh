@@ -144,6 +144,50 @@ _task_gate_high_stakes "$(rid DIVE-9009)" \
   && bad_t "H9 an AGENT capability (delegated_push) is not high-stakes" "delegated_push must fall through untouched" \
   || ok_t "H9 an AGENT capability (delegated_push) is not high-stakes"
 
+# ==================== A: THE ASK LINE (DIVE-3661) =============================
+# quinn's iteration-1 mutant proof: replacing _task_gate_ask_line's body with the
+# pre-fix `printf '%s' "${1:0:180}"` survived 138 arms green, because no arm
+# named the new function. These arms are the kill. The budget is WORDS (the
+# spec's unit), not characters — see
+# community/wiki/a-char-budget-is-not-a-word-budget-render-the-real-corpus.md.
+
+# A1 a long unpunctuated ask cuts at exactly 15 words + ellipsis, never mid-word.
+_a="alpha bravo charlie delta echo foxtrot golf hotel india juliett kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee"
+_want="alpha bravo charlie delta echo foxtrot golf hotel india juliett kilo lima mike november oscar…"
+_got=$(_task_gate_ask_line "$_a")
+[[ "$_got" == "$_want" ]] \
+  && ok_t "A1 _task_gate_ask_line cuts an unpunctuated ask at 15 words + ellipsis (kills the substr mutant)" \
+  || bad_t "A1 _task_gate_ask_line cuts an unpunctuated ask at 15 words + ellipsis (kills the substr mutant)" "got: $_got"
+
+# A2 a question that IS the first sentence survives whole, no ellipsis.
+_a="Can you recreate a box so the fixed relay installer gets its one as-shipped run? tonic-drake was purged and never came back and this trailer pushes the total far past every budget the renderer knows about"
+_got=$(_task_gate_ask_line "$_a")
+[[ "$_got" == "Can you recreate a box so the fixed relay installer gets its one as-shipped run?" ]] \
+  && ok_t "A2 a leading question is kept whole and the trailer is dropped" \
+  || bad_t "A2 a leading question is kept whole and the trailer is dropped" "got: $_got"
+
+# A3 a short ask is returned byte-identical (no ellipsis, no reflow).
+_a="Approve the spend?"
+[[ "$(_task_gate_ask_line "$_a")" == "$_a" ]] \
+  && ok_t "A3 a short ask passes through byte-identical" \
+  || bad_t "A3 a short ask passes through byte-identical" "got: $(_task_gate_ask_line "$_a")"
+
+# A4 an abbreviation is not a sentence end (the latent class quinn's corpus
+# audit named: 0 of 400 live asks trip it, so only an arm keeps it dead).
+_a="Invite our build account to the Apple dev team, e.g. via App Store Connect, then pick a store name for the listing before the next build goes out tonight"
+_got=$(_task_gate_ask_line "$_a")
+[[ "$_got" == "Invite our build account to the Apple dev team, e.g. via App Store Connect, then…" ]] \
+  && ok_t "A4 'e.g.' does not end the sentence — the cut is the word budget, not the abbreviation" \
+  || bad_t "A4 'e.g.' does not end the sentence — the cut is the word budget, not the abbreviation" "got: $_got"
+
+# A5 a sentence finishing between WORD_MAX and SOFT_MAX is kept whole — kills a
+# mutant that applies the 15-word cut before scanning for the sentence end.
+_a="one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen? and then a very long trailer that keeps going well past any budget"
+_got=$(_task_gate_ask_line "$_a")
+[[ "$_got" == "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen?" ]] \
+  && ok_t "A5 a 16-word sentence is finished, not chopped at 15 (soft budget)" \
+  || bad_t "A5 a 16-word sentence is finished, not chopped at 15 (soft budget)" "got: $_got"
+
 # ==================== C: THE COPY NAMES THE EXACT STRING =====================
 
 # The 5th argument is the markup the CALLER computed. It is passed, never
