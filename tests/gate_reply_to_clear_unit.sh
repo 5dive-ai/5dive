@@ -388,6 +388,43 @@ else
   bad_t "I7 the batch RE-NAG alert carries the same recovery prompt, beside a real tap button" "markup='$_bk' text: ${_bt:0:400}"
 fi
 
+# I10/I11 THE RECOMMENDED LINE ON THE BATCH SITE. I8/I9 drive
+# _task_need_notify_deliver, so reverting src/task/inbox.sh's predicate to
+# unconditional survived the whole suite (quinn measured it on iteration 3's
+# PASS — the exact mutant that kills I8 at the notify site left this one green
+# at 38/0). The /inbox batch render is the surface the acceptance criterion
+# names, so it gets its own arms, both directions, through the real
+# _task_inbox_send (I7's scaffolding):
+# community/wiki/a-regression-arm-must-land-on-the-render-path-the-acceptance-names.md
+seed_gate DIVE-9011 approval spend_authority "" "merge it"
+: >"$_INBOX_TXT"; : >"$_INBOX_KB"
+(
+  require_root() { :; }
+  _task_send_owner() { printf '%s' "$1" >"$_INBOX_TXT"; printf '%s' "${2:-}" >"$_INBOX_KB"; return 0; }
+  FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"
+  _task_inbox_send "" "ident='DIVE-9003'" "ORDER BY created_at"
+) >/dev/null 2>&1
+_bt=$(cat "$_INBOX_TXT" 2>/dev/null); _bk=$(cat "$_INBOX_KB" 2>/dev/null)
+if [[ "$_bt" != *"✅ Recommended:"* && "$_bk" == *"⭐"* ]]; then
+  ok_t "I10 the BATCH render of a decision gate carries the recommendation on the ⭐ button only"
+else
+  bad_t "I10 the BATCH render of a decision gate carries the recommendation on the ⭐ button only" "markup='$_bk' text: ${_bt:0:300}"
+fi
+
+: >"$_INBOX_TXT"; : >"$_INBOX_KB"
+(
+  require_root() { :; }
+  _task_send_owner() { printf '%s' "$1" >"$_INBOX_TXT"; printf '%s' "${2:-}" >"$_INBOX_KB"; return 0; }
+  FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"
+  _task_inbox_send "" "ident='DIVE-9011'" "ORDER BY created_at"
+) >/dev/null 2>&1
+_bt=$(cat "$_INBOX_TXT" 2>/dev/null); _bk=$(cat "$_INBOX_KB" 2>/dev/null)
+if [[ "$_bt" == *"✅ Recommended: merge it"* && "$_bk" != *"merge it"* ]]; then
+  ok_t "I11 the BATCH render of an approval gate KEEPS the Recommended line (verb buttons carry none)"
+else
+  bad_t "I11 the BATCH render of an approval gate KEEPS the Recommended line (verb buttons carry none)" "markup='$_bk' text: ${_bt:0:300}"
+fi
+
 # I8/I9 THE RECOMMENDED LINE, one arm per direction (DIVE-3661 iteration 3).
 # The suppression predicate is the markup string itself, so the two gate types
 # MUST diverge: a decision's ⭐ first button carries the recommended value
