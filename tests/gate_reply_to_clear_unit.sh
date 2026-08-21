@@ -388,6 +388,30 @@ else
   bad_t "I7 the batch RE-NAG alert carries the same recovery prompt, beside a real tap button" "markup='$_bk' text: ${_bt:0:400}"
 fi
 
+# I8/I9 THE RECOMMENDED LINE, one arm per direction (DIVE-3661 iteration 3).
+# The suppression predicate is the markup string itself, so the two gate types
+# MUST diverge: a decision's ⭐ first button carries the recommended value
+# verbatim (line suppressed — it was the same words twice), while an approval's
+# buttons are generic verbs (line kept — it is the recommendation's only copy).
+# One-direction coverage is how iteration 2 shipped the duplicate: see
+# community/wiki/a-duplication-predicate-must-ask-what-the-other-surface-actually-says.md
+eval "_task_owner_channel() { TASK_CH_TOKEN=stub; TASK_CH_ACCESS=/dev/null; TASK_CH_TYPE=claude; TASK_CH_AGENT=t; return 0; }"
+CAPTURED=""; CAPTURED_KB=""
+_task_need_notify_deliver DIVE-9003 decision "pick the migration path" "A|B" "B" "" "" "" >/dev/null 2>&1
+if [[ "$CAPTURED" != *"✅ Recommended:"* && "$CAPTURED_KB" == *"⭐ B"* ]]; then
+  ok_t "I8 a decision gate renders the recommended value ONCE — on the ⭐ button, no prose duplicate"
+else
+  bad_t "I8 a decision gate renders the recommended value ONCE — on the ⭐ button, no prose duplicate" "markup='$CAPTURED_KB' text: ${CAPTURED:0:300}"
+fi
+
+CAPTURED=""; CAPTURED_KB=""
+_task_need_notify_deliver DIVE-9001 approval "approve the spend" "" "looks right — merge both" "" "" "" >/dev/null 2>&1
+if [[ "$CAPTURED" == *"✅ Recommended: looks right — merge both"* && "$CAPTURED_KB" != *"looks right"* ]]; then
+  ok_t "I9 an approval gate KEEPS the Recommended line — generic buttons carry no recommendation"
+else
+  bad_t "I9 an approval gate KEEPS the Recommended line — generic buttons carry no recommendation" "markup='$CAPTURED_KB' text: ${CAPTURED:0:300}"
+fi
+
 # A prompt on a channel whose plugin has no inbound handler is a dead affordance
 # the human only discovers AFTER typing. This allowlist is NARROWER than the tap
 # buttons' (claude|codex|grok|antigravity) because the DIVE-2818 inbound handler

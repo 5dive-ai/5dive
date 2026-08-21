@@ -345,7 +345,11 @@ _task_inbox_send() {
     # was a verbatim duplicate of what the human can already see and tap.
     _hs=""; _task_gate_high_stakes "$id" && _hs=1
     gate_text="$([[ -n "$_hs" ]] && printf '🔐' || printf '🗂') [${ident}] ${ntype} — $(_task_gate_ask_line "$ask") /task_${id}"
-    [[ -n "$recommend" ]] && gate_text+=$'\n'"✅ Recommended: ${recommend}"
+    # DIVE-3661 iteration 3: only when the recommendation is not already readable
+    # off a button (decision's ⭐ first button carries it verbatim; approval/secret
+    # buttons are generic verbs, so there this line is the only copy). Predicate =
+    # the markup actually produced, same rule as the single-gate site.
+    [[ -n "$recommend" && "$markup" != *"$recommend"* ]] && gate_text+=$'\n'"✅ Recommended: ${recommend}"
     [[ -n "$options" && -z "$markup" ]] && gate_text+=$'\n'"Options: ${options}"
     # DIVE-2818: the high-stakes reply-to-clear prompt reaches the BATCH re-send
     # too. DIVE-1490's rule applies unchanged — the initial alert and every re-nag

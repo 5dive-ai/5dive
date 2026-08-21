@@ -2138,6 +2138,14 @@ _task_need_notify_deliver() {
   # chat message IS the record the human answers from. Read from the ROW, not from a
   # parameter (DIVE-2090, same reason the secret branch below does): the batch
   # re-send calls this with whatever it happens to be holding.
+  # DIVE-3661 iteration 3: the buttons are computed FIRST so every prose line
+  # below can key on what they actually say (never a re-derivation that drifts —
+  # community/wiki/a-duplication-predicate-must-ask-what-the-other-surface-actually-says.md).
+  # Contract comments for this builder live above _task_gate_reply_markup and at
+  # the DIVE-117/118 block further down.
+  local reply_markup
+  reply_markup=$(_task_gate_reply_markup "$numid" "$need_type" "$options" "$recommend" "$human_nonce" "$TASK_CH_TYPE")
+
   local _gmode
   _gmode=$(db "SELECT COALESCE(gate_mode,'') FROM tasks WHERE id=${numid};" 2>/dev/null || echo "")
   local text="🙋 [${ident}] needs you"
@@ -2150,10 +2158,22 @@ _task_need_notify_deliver() {
   # the manager's own gate and there is no way to tell whose ask it is.
   [[ -n "${TASK_NOTIFY_ESCALATED_FROM:-}" ]] \
     && text+=$'\n'"↑ filed by ${TASK_NOTIFY_ESCALATED_FROM} (no channel of its own) — escalated to you"
-  [[ -n "$recommend" ]] && text+=$'\n\n'"✅ Recommended: ${recommend}"
-  # OSS-11 (DIVE-976): cite the precedent that sourced the recommendation so the
-  # human sees WHY this choice is advised and can catch a wrong recall.
-  [[ -n "$precedent_cite" ]] && text+=$'\n'"↩︎ ${precedent_cite}"
+  # DIVE-3661 iteration 3: print the line ONLY when the recommendation is not
+  # already readable off a button. A DECISION gate's ⭐ first button carries the
+  # recommended value verbatim (the line was the same words twice, one apart);
+  # an APPROVAL/SECRET gate's buttons are generic verbs, so here the line is the
+  # recommendation's ONLY copy. Predicate = the markup string itself. A recommend
+  # whose text JSON-escapes differently (embedded quotes) misses the substring
+  # and prints anyway — that direction fails safe (duplicate, never lost).
+  if [[ -n "$recommend" && "$reply_markup" != *"$recommend"* ]]; then
+    text+=$'\n\n'"✅ Recommended: ${recommend}"
+    # OSS-11 (DIVE-976): cite the precedent that sourced the recommendation so the
+    # human sees WHY this choice is advised and can catch a wrong recall. Rides
+    # the Recommended line: a ⭐ button carries the choice, but a citation line
+    # floating with no visible recommendation above it reads unanchored; the full
+    # precedent stays one tap away in /task detail.
+    [[ -n "$precedent_cite" ]] && text+=$'\n'"↩︎ ${precedent_cite}"
+  fi
   # DIVE-390: append a bare, tappable /task_<id> link inline at the end of the
   # description sentence, before the options (Mark 2026-06-15). Telegram
   # auto-linkifies bare /commands, so tapping it fires the plugin's
@@ -2221,8 +2241,9 @@ _task_need_notify_deliver() {
   # DIVE-1490: the initial alert and every re-nag share this exact renderer, so
   # option indexing, recommendation ordering, nonce handling, and the plugin
   # allowlist cannot drift between first delivery and subsequent reminders.
-  local reply_markup
-  reply_markup=$(_task_gate_reply_markup "$numid" "$need_type" "$options" "$recommend" "$human_nonce" "$TASK_CH_TYPE")
+  # (The computation itself moved ABOVE the text composition in DIVE-3661
+  # iteration 3, so the Recommended line's suppression predicate can read the
+  # markup this call actually produced; this comment stays with the contract.)
 
   # DIVE-3661: the numbered Options list prints ONLY when no keyboard landed —
   # beside buttons it was a verbatim duplicate of what the human can already tap
