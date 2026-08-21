@@ -1621,6 +1621,17 @@ cmd_task_need() {
   valid_need_type "$type" || fail "$E_VALIDATION" "bad --type '$type' (decision|secret|approval|manual|access)"
   [[ -n "$ask" ]] || fail "$E_USAGE" "--ask is required (what does the human need to provide?)"
 
+  # DIVE-3661 (lodar): a gate message renders ONE line of ask — the first
+  # sentence, budgeted so a human gets it in ~3 seconds. Warn (never refuse) the
+  # filer whose first sentence overflows that budget: everything past the cut
+  # reaches nobody until the /task detail is opened, so the fix is a shorter
+  # first sentence with the mechanism moved to the body. Advisory by design —
+  # a refusal here would bounce urgent gates over prose.
+  local _ask_first="${ask%%. *}"
+  if (( ${#_ask_first} > 180 )); then
+    warn "the ask's first sentence is ${#_ask_first} chars; the gate message shows ~180 before the cut. Lead with the decision in one short sentence — detail belongs in the task body."
+  fi
+
   # DIVE-2089: --discusses is a DECISION-only appeal. approval / manual / secret /
   # access declare an ACTION by construction, so "I'm only discussing it" is not a
   # coherent claim on them — refuse rather than accept-and-ignore, so a filer can

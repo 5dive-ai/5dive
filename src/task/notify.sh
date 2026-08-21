@@ -1626,13 +1626,35 @@ _task_gate_reply_cta() { # <ident> <need_type> <options> <recommend> <has_tap>
     *) return 0 ;;
   esac
   [[ -n "$_ex" ]] || return 0
-  _out="🔐 High-stakes gate (spend, secrets or irreversible)."$'\n'
-  _out+="Tap a button on this message to answer. That is the expected path, and a tap is never rejected."$'\n\n'
-  _out+="Recovery only, if the button is stale, already used, or the tap rail is down: reply in this chat with exactly"$'\n'
-  _out+="    ${_id} ${_ex}"
+  # DIVE-3661 (lodar, 2026-08-21): the five-paragraph tap/recovery/attestation
+  # block is gone — founders stopped reading the messages it rode on. The button
+  # is the affordance; what survives is the one fallback a human needs when a
+  # re-nagged button has gone stale (DIVE-2818's case), on its own line so a
+  # copied reply carries exactly `<ident> <value>`. Attestation mechanics belong
+  # to the RECORD, not the chat; the 3600s reply ceiling is unchanged and still
+  # graded by tests/gate_reply_to_clear_unit.sh R4.
+  _out="🔐 High-stakes — if the button fails, reply:"$'\n'"    ${_id} ${_ex}"
   [[ -n "$_alt" ]] && _out+=$'\n'"(or:  ${_id} ${_alt})"
-  _out+=$'\n\n'"A typed reply is attested by Telegram, so the record can show a human answered rather than the agent that asked. A reply stays citable for 1 hour."
   printf '%s' "$_out"
+}
+
+# DIVE-3661: the ONE-LINE ask for a gate message. The filer's first sentence when
+# it fits the budget, else a word-boundary cut with a real ellipsis — never the
+# raw substr() chop that ended messages mid-word ("…has no row for it, s /task_N").
+_task_gate_ask_line() { # <ask>
+  local a="${1:-}" max=180 s cut sep first=""
+  # Most gate asks are QUESTIONS — split on the earliest sentence end of any kind.
+  for sep in '. ' '? ' '! '; do
+    s="${a%%"$sep"*}"
+    if [[ "$s" != "$a" ]]; then
+      s+="${sep% }"
+      [[ -z "$first" || ${#s} -lt ${#first} ]] && first="$s"
+    fi
+  done
+  if [[ -n "$first" && ${#first} -le $max ]]; then printf '%s' "$first"; return 0; fi
+  if (( ${#a} <= max )); then printf '%s' "$a"; return 0; fi
+  cut="${a:0:max}"; cut="${cut% *}"
+  printf '%s…' "$cut"
 }
 
 _task_gate_reply_markup() { # <row_id> <type> <options> <recommend> <nonce> <channel_type> [label]
