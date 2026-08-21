@@ -1626,13 +1626,48 @@ _task_gate_reply_cta() { # <ident> <need_type> <options> <recommend> <has_tap>
     *) return 0 ;;
   esac
   [[ -n "$_ex" ]] || return 0
-  _out="🔐 High-stakes gate (spend, secrets or irreversible)."$'\n'
-  _out+="Tap a button on this message to answer. That is the expected path, and a tap is never rejected."$'\n\n'
-  _out+="Recovery only, if the button is stale, already used, or the tap rail is down: reply in this chat with exactly"$'\n'
-  _out+="    ${_id} ${_ex}"
+  # DIVE-3661 (lodar, 2026-08-21): the five-paragraph tap/recovery/attestation
+  # block is gone — founders stopped reading the messages it rode on. The button
+  # is the affordance; what survives is the one fallback a human needs when a
+  # re-nagged button has gone stale (DIVE-2818's case), on its own line so a
+  # copied reply carries exactly `<ident> <value>`. Attestation mechanics belong
+  # to the RECORD, not the chat; the 3600s reply ceiling is unchanged and still
+  # graded by tests/gate_reply_to_clear_unit.sh R4.
+  _out="🔐 High-stakes — if the button fails, reply:"$'\n'"    ${_id} ${_ex}"
   [[ -n "$_alt" ]] && _out+=$'\n'"(or:  ${_id} ${_alt})"
-  _out+=$'\n\n'"A typed reply is attested by Telegram, so the record can show a human answered rather than the agent that asked. A reply stays citable for 1 hour."
   printf '%s' "$_out"
+}
+
+# DIVE-3661: the ONE-LINE ask for a gate message. The spec's budget is WORDS
+# ("~15 words, 3-second read"), so the budget here is words — iteration 1 spent
+# it in characters (180 ≈ 30 words) and quinn's corpus render showed 51% of the
+# live board's asks still over spec while every hand-picked fixture passed:
+# community/wiki/a-char-budget-is-not-a-word-budget-render-the-real-corpus.md.
+# Rules: stop at the first sentence end inside the budget (tokens ending . ? !,
+# with e.g./i.e./etc./vs. exempt so an abbreviation is not a sentence end);
+# otherwise cut at WORD_MAX words with a real ellipsis. A sentence that runs a
+# couple of words past the target is kept whole (SOFT_MAX) — "…gets its one
+# as-shipped run?" at 16 words reads better finished than chopped at 15.
+_task_gate_ask_line() { # <ask>
+  local a="${1:-}" WORD_MAX=15 SOFT_MAX=18 n=0 w end=0
+  # shellcheck disable=SC2086
+  set -- $a
+  (( $# <= SOFT_MAX )) && { printf '%s' "$a"; return 0; }
+  # Pass 1: the earliest sentence end within SOFT_MAX (so a sentence finishing a
+  # couple of words past WORD_MAX is kept whole rather than chopped mid-question).
+  for w in "$@"; do
+    n=$((n+1)); (( n > SOFT_MAX )) && break
+    case "$w" in
+      e.g.|i.e.|etc.|vs.|cf.) : ;;                    # abbreviation, not a sentence end
+      *\?|*\!|*.) end=$n; break ;;
+    esac
+  done
+  # Pass 2: emit — a found sentence whole, else WORD_MAX words + ellipsis.
+  if (( end > 0 )); then
+    printf '%s' "${*:1:end}"
+  else
+    printf '%s…' "${*:1:WORD_MAX}"
+  fi
 }
 
 _task_gate_reply_markup() { # <row_id> <type> <options> <recommend> <nonce> <channel_type> [label]
@@ -2090,12 +2125,12 @@ _task_need_notify_deliver() {
   # number, which diverges from the row id once a non-default project consumes
   # global ids (DIVE-484/DIVE-561), and for a non-DIVE prefix wouldn't strip at
   # all — either way the tap would resolve the WRONG row (DIVE-561).
-  # One message. Blank lines separate the header / ask / options so a long ask
-  # doesn't render as an unreadable wall on mobile. No footer: tap buttons cover
-  # decision/approval, and button-less gates (secret/manual) still surface on
-  # the dashboard "Needs you" card — a redirect line is just noise in chat.
-  # Options are listed one per line (numbered to match the tap buttons) so long
-  # labels stay readable even when Telegram crops the button text.
+  # One message. Blank lines separate the header / ask / options so the message
+  # stays scannable on mobile. No footer: tap buttons cover decision/approval,
+  # and button-less gates (secret/manual) still surface on the dashboard
+  # "Needs you" card — a redirect line is just noise in chat. The numbered
+  # Options list survives only on button-less channels (DIVE-3661; see the
+  # guarded block below the markup computation).
   # DIVE-148: lead with the agent's recommendation (✅ Recommended: <X>) before
   # the ask, so the human sees the advised choice first instead of hunting for
   # it. Applies to decision + approval gates; NULL/empty recommend = no line.
@@ -2103,6 +2138,14 @@ _task_need_notify_deliver() {
   # chat message IS the record the human answers from. Read from the ROW, not from a
   # parameter (DIVE-2090, same reason the secret branch below does): the batch
   # re-send calls this with whatever it happens to be holding.
+  # DIVE-3661 iteration 3: the buttons are computed FIRST so every prose line
+  # below can key on what they actually say (never a re-derivation that drifts —
+  # community/wiki/a-duplication-predicate-must-ask-what-the-other-surface-actually-says.md).
+  # Contract comments for this builder live above _task_gate_reply_markup and at
+  # the DIVE-117/118 block further down.
+  local reply_markup
+  reply_markup=$(_task_gate_reply_markup "$numid" "$need_type" "$options" "$recommend" "$human_nonce" "$TASK_CH_TYPE")
+
   local _gmode
   _gmode=$(db "SELECT COALESCE(gate_mode,'') FROM tasks WHERE id=${numid};" 2>/dev/null || echo "")
   local text="🙋 [${ident}] needs you"
@@ -2115,26 +2158,32 @@ _task_need_notify_deliver() {
   # the manager's own gate and there is no way to tell whose ask it is.
   [[ -n "${TASK_NOTIFY_ESCALATED_FROM:-}" ]] \
     && text+=$'\n'"↑ filed by ${TASK_NOTIFY_ESCALATED_FROM} (no channel of its own) — escalated to you"
-  [[ -n "$recommend" ]] && text+=$'\n\n'"✅ Recommended: ${recommend}"
-  # OSS-11 (DIVE-976): cite the precedent that sourced the recommendation so the
-  # human sees WHY this choice is advised and can catch a wrong recall.
-  [[ -n "$precedent_cite" ]] && text+=$'\n'"↩︎ ${precedent_cite}"
+  # DIVE-3661 iteration 3: print the line ONLY when the recommendation is not
+  # already readable off a button. A DECISION gate's ⭐ first button carries the
+  # recommended value verbatim (the line was the same words twice, one apart);
+  # an APPROVAL/SECRET gate's buttons are generic verbs, so here the line is the
+  # recommendation's ONLY copy. Predicate = the markup string itself. A recommend
+  # whose text JSON-escapes differently (embedded quotes) misses the substring
+  # and prints anyway — that direction fails safe (duplicate, never lost).
+  if [[ -n "$recommend" && "$reply_markup" != *"$recommend"* ]]; then
+    text+=$'\n\n'"✅ Recommended: ${recommend}"
+    # OSS-11 (DIVE-976): cite the precedent that sourced the recommendation so the
+    # human sees WHY this choice is advised and can catch a wrong recall. Rides
+    # the Recommended line: a ⭐ button carries the choice, but a citation line
+    # floating with no visible recommendation above it reads unanchored; the full
+    # precedent stays one tap away in /task detail.
+    [[ -n "$precedent_cite" ]] && text+=$'\n'"↩︎ ${precedent_cite}"
+  fi
   # DIVE-390: append a bare, tappable /task_<id> link inline at the end of the
   # description sentence, before the options (Mark 2026-06-15). Telegram
   # auto-linkifies bare /commands, so tapping it fires the plugin's
   # ^/task_(\d+)$ handler -> `5dive task show <id>` (the full detail card). No
   # "details" label, numeric id only. A plain-text host shows an inert link.
-  text+=$'\n\n'"${ask} /task_${numid}"
-  if [[ "$need_type" == "decision" && -n "$options" ]]; then
-    local opts_list
-    # ⭐-mark the recommended option in the numbered list (numbering stays the
-    # original option order so it still maps to need_options on the dashboard).
-    opts_list=$(printf '%s' "$options" | jq -Rr --arg r "$recommend" '
-      ($r | gsub("^\\s+|\\s+$"; "")) as $rr
-      | [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ]
-      | to_entries | map("  \(.key + 1). \(.value)\(if .value == $rr and ($rr|length)>0 then " ⭐" else "" end)") | join("\n")' 2>/dev/null) || opts_list=""
-    [[ -n "$opts_list" ]] && text+=$'\n\n'"Options:"$'\n'"${opts_list}"
-  fi
+  # DIVE-3661: the FIRST delivery is the message a founder actually reads — the
+  # /inbox batch is only the re-send — so the one-line ask applies here too
+  # (quinn's iteration-1 grade caught this path still emitting the full ask).
+  # The full ask stays one tap away behind /task_<id>.
+  text+=$'\n\n'"$(_task_gate_ask_line "$ask") /task_${numid}"
 
   # DIVE-356: secret/manual gates used to carry NO instruction on how to clear
   # them — the core of Mark's "a needs-you that needs no obvious action is
@@ -2192,8 +2241,25 @@ _task_need_notify_deliver() {
   # DIVE-1490: the initial alert and every re-nag share this exact renderer, so
   # option indexing, recommendation ordering, nonce handling, and the plugin
   # allowlist cannot drift between first delivery and subsequent reminders.
-  local reply_markup
-  reply_markup=$(_task_gate_reply_markup "$numid" "$need_type" "$options" "$recommend" "$human_nonce" "$TASK_CH_TYPE")
+  # (The computation itself moved ABOVE the text composition in DIVE-3661
+  # iteration 3, so the Recommended line's suppression predicate can read the
+  # markup this call actually produced; this comment stays with the contract.)
+
+  # DIVE-3661: the numbered Options list prints ONLY when no keyboard landed —
+  # beside buttons it was a verbatim duplicate of what the human can already tap
+  # (same rule as the /inbox batch site). ⭐ marks the recommended option, and
+  # numbering stays the original option order so it still maps to need_options
+  # on the dashboard. Moved below the markup computation so the predicate is the
+  # markup this call actually produced, not a re-derivation that could drift
+  # (the DIVE-2824 rule).
+  if [[ -z "$reply_markup" && "$need_type" == "decision" && -n "$options" ]]; then
+    local opts_list
+    opts_list=$(printf '%s' "$options" | jq -Rr --arg r "$recommend" '
+      ($r | gsub("^\\s+|\\s+$"; "")) as $rr
+      | [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ]
+      | to_entries | map("  \(.key + 1). \(.value)\(if .value == $rr and ($rr|length)>0 then " ⭐" else "" end)") | join("\n")' 2>/dev/null) || opts_list=""
+    [[ -n "$opts_list" ]] && text+=$'\n\n'"Options:"$'\n'"${opts_list}"
+  fi
 
   # DIVE-2818: the reply-to-clear prompt, on HIGH-STAKES gates only.
   #

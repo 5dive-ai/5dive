@@ -323,23 +323,34 @@ _task_inbox_send() {
   # be N buzzes. The first message pings, every one after it is SILENT
   # (FIVEDIVE_NOTIFY_SILENT -> disable_notification), so the human gets one ping
   # and a readable stack.
-  local id ident prio ntype options recommend gtier ask nonce="" markup=""
+  local id ident prio ntype options recommend gtier ask nonce="" markup="" _hs=""
   local gate_text sent=0 failed=0 first_sent=0 all_ids="" all_mids="" _mint_n=0
   local _prev_silent="${FIVEDIVE_NOTIFY_SILENT:-}"
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
     IFS=$'\x1f' read -r id ident prio ntype options recommend gtier ask <<<"$row"
     [[ -n "$id" && -n "$ident" ]] || continue
-    gate_text="🗂 Gate waiting on you:"$'\n\n'"[${ident}] ${ntype}, ${prio} — ${ask} /task_${id}"
-    [[ -n "$recommend" ]] && gate_text+=$'\n'"✅ Recommended: ${recommend}"
-    [[ -n "$options" ]]   && gate_text+=$'\n'"Options: ${options}"
-    gate_text+=$'\n\n'"Tap a button, open the /task link, or answer from the dashboard."
     # DIVE-2356: hard-human TYPE **or** tier>=2. Unchanged by the split.
     nonce=""; _mint_n=0
     case "$ntype" in approval|secret|manual) _mint_n=1 ;; esac
     [[ "${gtier:-}" =~ ^[0-9]+$ ]] && (( gtier >= 2 )) && _mint_n=1
     (( _mint_n )) && nonce=$(_human_nonce_mint)
     markup=$(_task_gate_reply_markup "$id" "$ntype" "$options" "$recommend" "$nonce" "$TASK_CH_TYPE" "$ident")
+    # DIVE-3661 (lodar, 2026-08-21): a gate message must be readable in ~3
+    # seconds — one line of ask, buttons as the affordance, nothing else. The
+    # tap/recovery/attestation prose is gone (the compact fallback rides only
+    # high-stakes gates via _task_gate_reply_cta below); priority is dropped
+    # (nearly every human gate is `high`, so the word carried no signal); the
+    # Options line prints only when NO keyboard landed, because with buttons it
+    # was a verbatim duplicate of what the human can already see and tap.
+    _hs=""; _task_gate_high_stakes "$id" && _hs=1
+    gate_text="$([[ -n "$_hs" ]] && printf '🔐' || printf '🗂') [${ident}] ${ntype} — $(_task_gate_ask_line "$ask") /task_${id}"
+    # DIVE-3661 iteration 3: only when the recommendation is not already readable
+    # off a button (decision's ⭐ first button carries it verbatim; approval/secret
+    # buttons are generic verbs, so there this line is the only copy). Predicate =
+    # the markup actually produced, same rule as the single-gate site.
+    [[ -n "$recommend" && "$markup" != *"$recommend"* ]] && gate_text+=$'\n'"✅ Recommended: ${recommend}"
+    [[ -n "$options" && -z "$markup" ]] && gate_text+=$'\n'"Options: ${options}"
     # DIVE-2818: the high-stakes reply-to-clear prompt reaches the BATCH re-send
     # too. DIVE-1490's rule applies unchanged — the initial alert and every re-nag
     # share one renderer so the affordance cannot drift between first delivery and
@@ -350,7 +361,7 @@ _task_inbox_send() {
     # iteration 3): since the tap-primary re-scope the copy speaks about the
     # button and is withheld where there is none. Same reorder as the single-gate
     # site, and for the same reason — independent statements, one renderer.
-    if [[ "$TASK_CH_TYPE" == "claude" ]] && _task_gate_high_stakes "$id"; then
+    if [[ "$TASK_CH_TYPE" == "claude" && -n "$_hs" ]]; then
       local _batch_cta; _batch_cta=$(_task_gate_reply_cta "$ident" "$ntype" "$options" "$recommend" "$markup")
       [[ -n "$_batch_cta" ]] && gate_text+=$'\n\n'"$_batch_cta"
     fi
