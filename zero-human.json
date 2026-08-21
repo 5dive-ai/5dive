@@ -1,21 +1,21 @@
 {
-  "generatedAtUtc": "2026-08-20T02:00:23Z",
-  "date": "2026-08-20",
+  "generatedAtUtc": "2026-08-21T02:00:25Z",
+  "date": "2026-08-21",
   "week": {
-    "shipped": 1635,
-    "humanAsks": 166
+    "shipped": 1592,
+    "humanAsks": 158
   },
   "day": {
-    "shipped": 23,
+    "shipped": 21,
     "humanAsks": 0
   },
   "cumulative": {
-    "daysPublished": 41,
-    "shipped": 2117,
+    "daysPublished": 42,
+    "shipped": 2138,
     "humanAsks": 237,
     "since": "2026-07-11"
   },
-  "cliVersion": "0.20.1",
+  "cliVersion": "0.21.1",
   "source": "5dive digest --json [--30d]",
   "methodology": "https://github.com/5dive-ai/5dive/blob/main/docs/zero-human.md",
   "window": {
@@ -27,25 +27,25 @@
   },
   "corroborators": {
     "verifierFirstPassRate": {
-      "value": "72.3%",
+      "value": "72.0%",
       "window": "30d",
-      "firstPass": 685,
-      "graded": 947,
-      "shippedStandardTasks": 1627,
-      "coveragePct": 58.2,
+      "firstPass": 672,
+      "graded": 933,
+      "shippedStandardTasks": 1582,
+      "coveragePct": 59.0,
       "basis": "live tasks.db query: status='done' AND kind='standard' AND done_at within the last 30 calendar days from datetime('now') \u2014 a DIFFERENT instrument from this datapoint's own week.shipped above (a frozen sum of the last 30 PUBLISHED daily datapoints, DIVE-1552, which can span more than 30 calendar days while publishing is paused). Do not read the two as the same number.",
-      "iterationNullGraded": 33,
-      "iterationNullBiasPctPtsMax": 3.5,
+      "iterationNullGraded": 32,
+      "iterationNullBiasPctPtsMax": 3.4,
       "note": "rows with a NULL iteration count as first-pass, biasing this rate UP by at most iterationNullBiasPctPtsMax"
     },
     "policyBlockedAttempts": {
-      "value": 1218,
+      "value": 1236,
       "window": "30d",
       "instrumentedSites": 39,
       "firedSites": 36,
       "firedSitesLifetime": 36,
       "ledgerSince": "2026-07-25 12:04:55",
-      "ledgerAgeDays": 25.6,
+      "ledgerAgeDays": 26.6,
       "note": "a site that never fires is not evidence of compliance \u2014 3 of 39 instrumented sites have never fired lifetime; no baseline exists yet while the ledger is young (see ledgerAgeDays)"
     }
   },
