@@ -164,6 +164,72 @@ echo "== missing ledger fails OPEN, not closed =="
 rm -f "$A2A_ROUND_LEDGER"
 check "no ledger counts zero" "$(a2a_round_count main dev2 DIVE-3318)" "0"
 
+echo "== DIVE-3658: a prune must not cut the scoped seats out of the ledger =="
+# The customer report (teal-fox, 2026-08-21): the ledger held eight rows and all
+# eight were from the one seat on that box with root sudo. `a2a_round_prune`
+# rewrote the file with `mv`, a rename gives the surviving file the TEMP's mode,
+# and 0660 root:claude became 0644 — so every scoped seat's append failed from
+# then on, best-effort, silently. These arms grade the FILE the prune leaves
+# behind, because that file is the whole mechanism: a passing count assertion
+# says nothing about who will be allowed to write the next row.
+_now="$(printf '%(%s)T' -1)"
+A2A_ROUND_LEDGER="$TMP/rounds.tsv"
+printf 'main\tdev2\tDIVE-3658\t1\nmain\tdev2\tDIVE-3658\t%s\n' "$_now" > "$A2A_ROUND_LEDGER"
+chmod 0660 "$A2A_ROUND_LEDGER"
+_ino_before="$(stat -c %i "$A2A_ROUND_LEDGER")"
+a2a_round_prune
+check "the prune still drops the aged row"            "$(wc -l < "$A2A_ROUND_LEDGER")" "1"
+check "and keeps the live one"                        "$(a2a_round_count main dev2 DIVE-3658)" "1"
+check "the ledger is STILL group-writable after it"   "$(stat -c %a "$A2A_ROUND_LEDGER")" "660"
+check "the prune wrote through the same inode"        "$(stat -c %i "$A2A_ROUND_LEDGER")" "$_ino_before"
+_stray="$(find "$TMP" -maxdepth 1 -name 'rounds.tsv.*' | wc -l)"
+check "no temp is left beside the ledger"             "$_stray" "0"
+
+# The second half, and it is a different failure: the temp was created BESIDE the
+# ledger, in a directory (`/var/lib/5dive`, drwxr-s--- root:claude) that no
+# scoped seat can write. The prune therefore never ran from one at all. Root
+# ignores mode bits, so this arm can only be graded from a non-root seat — it
+# announces the skip rather than passing vacuously.
+echo "== the prune runs from a seat that cannot write the ledger's DIRECTORY =="
+if [ "$(id -u)" = "0" ]; then
+  printf '  SKIP running as root: mode bits do not constrain root, so this arm cannot fail here\n'
+else
+  _rod="$TMP/rodir"; mkdir -p "$_rod"
+  A2A_ROUND_LEDGER="$_rod/rounds.tsv"
+  printf 'main\tdev2\tDIVE-3658\t1\nmain\tdev2\tDIVE-3658\t%s\n' "$_now" > "$A2A_ROUND_LEDGER"
+  chmod 0660 "$A2A_ROUND_LEDGER"; chmod 0555 "$_rod"
+  a2a_round_prune
+  check "the aged row is pruned with the directory read-only" "$(wc -l < "$A2A_ROUND_LEDGER")" "1"
+  chmod 0755 "$_rod"
+fi
+
+# And the tell the customer actually saw: a raw `Permission denied` printed above
+# `OK — sent to agent 'x'`. `printf ... >> "$F" 2>/dev/null` sets up its
+# redirections left to right, so the shell reports a failed `>>` on a stderr that
+# is still the terminal.
+echo "== an unrecordable round is silent, not a permission error at the sender =="
+if [ "$(id -u)" = "0" ]; then
+  printf '  SKIP running as root: the append cannot be made to fail here\n'
+else
+  _nod="$TMP/nowrite"; mkdir -p "$_nod"; chmod 0555 "$_nod"
+  A2A_ROUND_LEDGER="$_nod/rounds.tsv"
+  _err="$(a2a_record_round main dev2 DIVE-3658 2>&1 >/dev/null)"
+  check "an unwritable ledger prints nothing to stderr" "${_err:-quiet}" "quiet"
+  check "and the round is simply not recorded"          "$(a2a_round_count main dev2 DIVE-3658)" "0"
+  chmod 0755 "$_nod"
+fi
+
+# A fresh box: the first send must not leave behind a file only its own seat can
+# append to. Graded under an explicit 0022 umask — the default that produced the
+# 0644 in the report. This one passes on the pre-fix code too (the post-append
+# chmod reached it); it is here so the create path cannot regress under the fix.
+echo "== the ledger is created group-writable, whatever the creating seat's umask =="
+A2A_ROUND_LEDGER="$TMP/fresh.tsv"
+rm -f "$A2A_ROUND_LEDGER"
+( umask 0022; a2a_record_round main dev2 DIVE-3658 )
+check "a freshly created ledger is group-writable" "$(stat -c %a "$A2A_ROUND_LEDGER")" "660"
+A2A_ROUND_LEDGER="$TMP/rounds.tsv"
+
 echo "== the guard is actually wired into BOTH delivery paths =="
 rt="$ROOT/src/cmd_agent_runtime.sh"
 n="$(grep -c 'a2a_round_guard' "$rt")"
