@@ -349,6 +349,63 @@ else
   ok_t "no private key reaches argv on the DM call site"
 fi
 
-rm -rf "$D1" "$D2" "$D3"
+# --- 8. the `dms list` FAST PATH is graded, not merely advertised ------------
+# The fixture has always been able to serve `dms list` (DMS_LIST_WORKS=1) and
+# until now NO ARM SWITCHED IT ON, so the fast path in `_buzz_dm_id_for` was a
+# branch the harness claimed to cover and never entered. It shipped broken:
+# `<<<"\$body"` inside double quotes fed python3 the four literal characters
+# $body, json.load raised, rows=[] — and every call fell through to the
+# channels-list authority, which is why 12 arms stayed green over a dead branch.
+#
+# To grade the fast path it has to be the ONLY path that can answer, so this arm
+# runs DMS_LIST_WORKS=1 WITH STUB_HIDE_DMS=1: the relay serves the DM on
+# `dms list` and hides it from `channels list`, so a dedupe that fires here
+# fired on `dms list` and nothing else. With the escape defect present the
+# second join reopens the thread and this arm goes red.
+D4=$(mktemp -d)
+drive_join "$D4" DMS_LIST_WORKS=1 STUB_HIDE_DMS=1 >/dev/null
+(
+  set +e
+  export CALLS="$D4/calls2.log" RELAY_STATE="$D4/relay.json" DMS_LIST_WORKS=1 STUB_HIDE_DMS=1
+  : >"$CALLS"
+  sudo() { while (($#)); do case "$1" in -u) shift 2 ;; -H|-n) shift ;; *) break ;; esac; done; "$@"; }
+  ensure_state() { :; }
+  registry_read() { printf '%s' '{"agents":{"dev":{"type":"claude","channels":"buzz"}}}'; }
+  _buzz_state_dir() { printf '%s\n' "$D4/state"; }
+  _buzz_server_owner_file() { printf '%s/owner-server.json\n' "$D4"; }
+  _buzz_resolve_binary() { return 1; }
+  _buzz_registry_record() { :; }
+  _buzz_publish_profile_script() { printf ''; }
+  _buzz_cli() {
+    local bin="$2" relay="$3" key="$4"; shift 4
+    local pub; pub=$(printf '%s' "$key" | _buzz_xonly_pubkey 2>/dev/null)
+    printf '%s' "$key" | env BUZZ_RELAY_URL="$relay" STUB_SELF="$pub" bash -c '
+      IFS= read -r k || true
+      export BUZZ_PRIVATE_KEY="$k"; b="$1"; shift; exec "$b" "$@"
+    ' _ "$bin" "$@"
+  }
+  ( _buzz_join dev ) >"$D4/join2.out" 2>&1
+) >/dev/null 2>&1
+LOG4=$(cat "$D4/calls2.log" 2>/dev/null)
+DMS4=$(python3 -c "
+import json,sys
+d=json.load(open('$D4/relay.json'))
+print(len([c for c in d['channels'].values() if c.get('dm')]))" 2>/dev/null)
+# positive control on the fixture itself: the fast path was actually asked, and
+# the relay actually answered it non-empty. Without this, a dedupe that fired
+# for some other reason (or a stub that never served the row) reads identically.
+DMSLIST_ANSWER=$(RELAY_STATE="$D4/relay.json" CALLS=/dev/null DMS_LIST_WORKS=1 \
+                 BUZZ_PRIVATE_KEY=x STUB_SELF=x "$D4/buzz" dms list 2>/dev/null)
+grep -q 'dms list' <<<"$LOG4" \
+  && [[ "$DMSLIST_ANSWER" == *'"dm-1"'* ]] \
+  && ok_t "control: the fixture's dms-list capability is switched ON and answers a row" \
+  || bad_t "control: the fixture's dms-list capability is switched ON and answers a row" \
+           "asked=$(grep -c 'dms list' <<<"$LOG4"); answer=${DMSLIST_ANSWER:-<empty>} — arm 8 below would be vacuous"
+[[ "$DMS4" == "1" ]] && ! grep -q 'dms open' <<<"$LOG4" \
+  && ok_t "the dedupe fires on 'dms list' ALONE when channels-list cannot see the DM (the fast path is live, not dead code)" \
+  || bad_t "the dedupe fires on 'dms list' ALONE when channels-list cannot see the DM (the fast path is live, not dead code)" \
+           "relay holds ${DMS4:-?} DM threads and the second join $(grep -q 'dms open' <<<"$LOG4" && echo 'DID' || echo 'did not') call 'dms open' — the fast path parsed nothing"
+
+rm -rf "$D1" "$D2" "$D3" "$D4"
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

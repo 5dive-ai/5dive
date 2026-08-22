@@ -469,7 +469,7 @@ for r in rows if isinstance(rows, list) else []:
     if want in json.dumps(r):
         print(str(r.get('dm_id') or r.get('channel_id') or r.get('id') or ''))
         break
-" <<<"\$body" 2>/dev/null) || found=""
+" <<<"$body" 2>/dev/null) || found=""
     [[ -n "$found" ]] && { printf '%s\n' "$found"; return 0; }
   fi
 
