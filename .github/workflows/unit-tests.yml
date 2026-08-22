@@ -314,6 +314,39 @@ jobs:
         run: |
           bash tests/meta/harness-verdict-probe.sh \
             --only='${{ steps.changed.outputs.names }}' --label=changed
+      # DIVE-3679: and the probe's INJECTION POINT must be at top level. This is the
+      # static complement to the step above, and it is deliberately NOT the guard
+      # DIVE-3678 proposed. That one would have red-ed a touched harness reported
+      # `not-reached` "in every environment this lane can offer" — and this lane offers
+      # ONE `ubuntu-latest` runner, so the quantifier collapses to "not-reached in one
+      # pristine run". That is exactly the DIVE-2039 false accusation, aimed at every
+      # harness whose verdict is legitimately reachable only on an installed host. The
+      # union consumes SEVEN reports across two real environments for precisely that
+      # reason; a single lane cannot make a cross-environment claim, and adding an
+      # installed-host job here would make N=2 against a union of 7 and only move the
+      # boundary.
+      #
+      # What IS decidable in one environment is the static property: `head -n $((n-1))
+      # | bash -n` — bash's own parser saying whether the position the probe injects
+      # into is a complete program. It accuses nobody for skipping.
+      #
+      # WARN-ONLY, on this row's own instruction, until the two negative-control arms
+      # have been READ on DIVE-3679 rather than merely run by its author. To enforce,
+      # add `--enforce` to the line below and nothing else; the guard already exits 1
+      # on a violation under that flag, and it exits 1 REGARDLESS of the flag if its
+      # own selector resolves to nothing (a check reporting clean on what it never
+      # looked at is the hole, not the finding).
+      #
+      # Measured before shipping, on origin/main at 07a4345: 444 harnesses, 441 top
+      # level, 0 violations, 3 with neither probe family (exactly the probe's
+      # ALLOW_UNPROBEABLE list). Controls: buzz_preseed_dm_live.sh at 07a4345^ reds;
+      # the same harness at 07a4345 — live-only, skips in every pristine lane — is
+      # green.
+      - name: The probe's injection point must be at TOP LEVEL (static, DIVE-3679)
+        if: steps.changed.outputs.names != ''
+        run: |
+          bash tests/meta/harness-verdict-toplevel.sh \
+            --only='${{ steps.changed.outputs.names }}' --label=changed
 
   # DIVE-2525: this job used to open with the harness-verdict PROBE (DIVE-2013),
   # which runs the whole corpus a SECOND time — the single most expensive thing on

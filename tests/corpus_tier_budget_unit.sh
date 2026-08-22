@@ -427,8 +427,20 @@ mkdir -p "$FAKE/tests/meta"
 # without it each run would probe the other stub too, and the kill counts these
 # arms assert are counts over the whole run.
 FAKE_PROBE="$FAKE/tests/meta/$(basename "$PROBE")"
+# DIVE-3679: the probe now SOURCES tests/lib/harness-verdict-detect.sh (one verdict
+# detector, shared with the static top-level guard, so the two instruments cannot
+# disagree about which line is the verdict). It resolves that path relative to its own
+# location, which in this fake corpus is $FAKE — so the fake tree has to carry the
+# dependency too. Symlinked like the probe itself, and folded into the SAME seam
+# variable: a missing lib must report the seam as broken, not fail five arms with a
+# `source: no such file` that reads like a defect in the thing they grade.
+PROBE_LIB="tests/lib/harness-verdict-detect.sh"
+mkdir -p "$FAKE/tests/lib"
 SEAM=0
-[[ -r "$PROBE" ]] && ln -s "$PWD/$PROBE" "$FAKE_PROBE" 2>/dev/null && SEAM=1
+[[ -r "$PROBE" && -r "$PROBE_LIB" ]] \
+  && ln -s "$PWD/$PROBE" "$FAKE_PROBE" 2>/dev/null \
+  && ln -s "$PWD/$PROBE_LIB" "$FAKE/$PROBE_LIB" 2>/dev/null \
+  && SEAM=1
 CSTUB=hang_before_verdict.sh
 if (( SEAM )); then
   # Hangs on its CLEAN run, before any verdict, in every environment — the kill is

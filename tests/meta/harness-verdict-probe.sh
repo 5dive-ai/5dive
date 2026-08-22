@@ -114,80 +114,13 @@ WIRED=(); UNWIRED=(); UNPROBEABLE=(); ALREADY_RED=(); ALLOWED=(); NOT_REACHED=()
 # KILL is not evidence that the harness's exit status is wired to anything).
 TIMED_OUT=()
 
-# Extract the verdict variable from a harness's last executable line.
-# Prints "<var>\t<lineno>" or nothing. Handles the shapes olivia's census found:
-# [[ "$V" -eq N ]] / [[ $V -eq N ]] / [ "$V" -eq N ] / (( V == N )) /
-# [[ "$V" == "N" ]] / exit $V.
-# TWO harness families need TWO mutations, and conflating them is how this probe
-# produced three FALSE POSITIVES on its first run (byo_model_create, codex_bin_
-# resolution, openclaw_runtime — all `set -euo pipefail` with bare `[[ ]]`
-# assertions). Their exit status IS wired; the probe had grabbed a STRING operand
-# out of the last `[[ ]]` and "incremented" it, which proves nothing. Ground truth:
-# breaking a real assertion in byo_model_create by hand exits 1.
-#
-#   COUNTER family  — a numeric counter initialised to a number AND incremented,
-#                     consumed by a final verdict expression. Mutation: bump it.
-#   ABORT family    — `set -e` with assertions that exit on failure and no counter.
-#                     Mutation: inject a bare `false`, which set -e must turn into
-#                     a non-zero exit. (Wrong for the counter family, where a bare
-#                     `false` changes no counter and the harness correctly exits 0
-#                     — which is exactly the false positive, inverted.)
-#
-# Picking the wrong mutation gives a confident wrong answer, which is the defect
-# class this check exists to find. So the counter test is STRICT and `false` is
-# only used when no counter exists AND `set -e` is in force.
-counter_verdict() {   # -> "<var>\t<lineno>\t<last|not-last>"
-  local f="$1" n line var="" last_exec=""
-  last_exec=$(grep -nvE '^[[:space:]]*(#|$)' "$f" | tail -1 | cut -d: -f1)
-  while read -r n; do
-    line=$(sed -n "${n}p" "$f")
-    # An INVERTED verdict (-ne / !=) is SATISFIED by incrementing — refuse to guess.
-    [[ "$line" =~ (-ne|\!=)[[:space:]] ]] && continue
-    var=""
-    # Regexes live in VARIABLES: an unquoted `)` or `[^)]` inside [[ =~ ]] is a
-    # bash syntax error, not a regex. `exit $(( FAIL > 0 ))` is matched first —
-    # the bare `exit $VAR` form below would miss it entirely.
-    # Anchored right after `$((` — a greedy `.*` here backtracks to the shortest
-    # suffix and captures 'L' out of 'FAIL', which is a silently WRONG variable
-    # rather than no match. Same trap as everything else tonight: the broken form
-    # succeeds at something.
-    local re_arith='exit[[:space:]]+\$\(\([[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*[><=!]'
-    local re_exit='exit[[:space:]]+\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?'
-    local re_dbl='\(\([[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=='
-    local re_test='\[\[?[[:space:]]+"?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?"?[[:space:]]+(-eq|==)'
-    if   [[ "$line" =~ $re_arith ]]; then var="${BASH_REMATCH[1]}"
-    elif [[ "$line" =~ $re_exit  ]]; then var="${BASH_REMATCH[1]}"
-    elif [[ "$line" =~ $re_dbl   ]]; then var="${BASH_REMATCH[1]}"
-    elif [[ "$line" =~ $re_test  ]]; then var="${BASH_REMATCH[1]}"
-    fi
-    [[ -n "$var" ]] || continue
-    # STRICT, and this is the line that separates a real verdict from the STRING
-    # operand that produced three false positives: every assignment to the
-    # variable must be a NUMERIC LITERAL or an arithmetic expression over itself.
-    # A counter (`FAIL=0` … `FAIL=$((FAIL+1))`) and a flag (`fail=0` … `fail=1`)
-    # both qualify; `setup_src=$(cat …)` does not, because incrementing a captured
-    # string proves nothing about whether the exit status is wired.
-    # Assignments must be matched in STATEMENT POSITION. Matching the bare
-    # substring `VAR=` also hits `echo "... FAIL=$FAIL"`, which is text inside a
-    # string, not an assignment — that false hit made 12 correctly-wired harnesses
-    # look UNPROBEABLE, a regression I introduced while fixing five others and did
-    # not see because I re-tested only the five.
-    local asn="(^[[:space:]]*(local[[:space:]]+)?|[;&|][[:space:]]*)${var}="
-    grep -qE "${asn}[0-9]+([[:space:]]|;|\)|$)" "$f" || continue
-    # Every statement-position assignment must be a numeric literal or arithmetic
-    # over the variable itself. A counter (FAIL=0 … FAIL=$((FAIL+1))) and a flag
-    # (fail=0 … fail=1) both qualify; `setup_src=$(cat …)` does not — incrementing
-    # a captured string proves nothing about whether the exit status is wired, and
-    # that is what produced three false UNWIRED verdicts on the first run.
-    if grep -oE "${asn}[^[:space:];]*" "$f" \
-       | grep -qvE "${var}=([0-9]+|\\\$\(\(.*${var}.*\)\))$"; then
-      continue
-    fi
-    printf '%s\t%s\t%s\n' "$var" "$n" "$([[ "$n" == "$last_exec" ]] && echo last || echo not-last)"
-    return 0
-  done < <(grep -nvE '^[[:space:]]*(#|$)' "$f" | tail -12 | cut -d: -f1 | tac)
-  return 1
-}
+# DIVE-3679: `counter_verdict` moved to tests/lib/harness-verdict-detect.sh, verbatim
+# and with every comment, so this probe and the STATIC guard
+# (tests/meta/harness-verdict-toplevel.sh) name the same line as the verdict. The
+# static guard's entire claim is about the line THIS file would mutate, so two
+# copies of the detector would be two detectors the first time one was edited.
+# shellcheck source=tests/lib/harness-verdict-detect.sh
+source tests/lib/harness-verdict-detect.sh
 
 CORPUS_N=0; for t in tests/*.sh; do [[ -e "$t" ]] && CORPUS_N=$(( CORPUS_N + 1 )); done
 only_set=" ${ONLY//,/ } "
