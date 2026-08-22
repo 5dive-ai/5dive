@@ -1134,6 +1134,77 @@ _sup_act_exec() {  # <name> <verb> <cause>
   esac
 }
 
+# ── DIVE-3667: fleet rollup — count EVERY class, not a hand-picked five ──────
+#
+# The tick's rollup used to enumerate healthy/slow/stuck/drift/verify-challenge
+# by hand. `stalled` was in none of them, so the one class that means ACTIONABLE
+# WORK IS STRANDED ON A SEAT THAT IS NOT WORKING IT had zero unattended surface:
+# not counted, not printed, not in the heartbeat row's signals, and — unlike
+# no-output and quota-exhausted — not on the alert path either. The board
+# (_sup_render_board / _sup_summary_line) printed it correctly the whole time;
+# only the cron form, the one that runs with nobody watching, dropped it.
+#
+# Measured 2026-08-22 (DIVE-3665): supervisor_events held six consecutive
+# observe/stalled/idle-stranded rows for one seat holding a delivered, unstarted
+# high-priority row, while supervisor-tick.log printed
+#   "17 agents — 16 healthy / 0 slow / 0 drift / 0 stuck"
+# every 10 minutes. The ONLY symptom was a total that did not add up, which
+# reads as a rounding artifact rather than as stranded work.
+#
+# These three helpers are deliberately pure and separately callable: the
+# counting is a `group_by` over whatever classes the classifier actually
+# emitted, and `unclassified` is what keeps a class added AFTER this commit from
+# disappearing the same way. Adding a class no longer requires editing the
+# rollup — it requires nothing.
+
+# _sup_rollup_counts <snap-json>
+# Emits ten tab-separated counts, in this fixed order:
+#   healthy slow stuck drift verify-challenge stalled no-output update-pending
+#   quota-exhausted unclassified
+# `unclassified` is total minus the nine named — it is the invariant that makes
+# the printed buckets sum to the agent count, and the alarm for a new class.
+_sup_rollup_counts() {
+  local snap="${1:-[]}"
+  jq -r '
+    (length) as $total
+    | ([.[].classification] | group_by(.) | map({key:.[0],value:length}) | from_entries) as $c
+    | [ ($c.healthy // 0), ($c.slow // 0), ($c.stuck // 0), ($c.drift // 0),
+        ($c["verify-challenge"] // 0), ($c.stalled // 0), ($c["no-output"] // 0),
+        ($c["update-pending"] // 0), ($c["quota-exhausted"] // 0) ]
+    | . + [ ($total - add) ] | @tsv' <<<"$snap"
+}
+
+# _sup_fleet_class <the ten counts, in _sup_rollup_counts order>
+# The `(fleet)` heartbeat row's verdict. It takes ALL ten deliberately, so the
+# classes it does NOT count are an explicit, testable choice rather than an
+# argument someone forgot to pass:
+#   healthy        — the baseline
+#   drift          — a /goal pointing at the wrong row; "recorded, NEVER acted on"
+#   update-pending — "an update signal, NOT a wedged agent"; a fleet-wide publish
+#                    would otherwise paint every box degraded for a night
+# Everything else means WORK IS NOT MOVING, and that is what degraded means here.
+_sup_fleet_class() {  # <healthy> <slow> <stuck> <drift> <vchal> <stalled> <nooutput> <updpend> <quota> <other>
+  local slow="${2:-0}" stuck="${3:-0}" vchal="${5:-0}" stalled="${6:-0}"
+  local nooutput="${7:-0}" quota="${9:-0}" other="${10:-0}"
+  (( slow + stuck + vchal + stalled + nooutput + quota + other > 0 )) \
+    && { printf 'degraded'; return; }
+  printf 'healthy'
+}
+
+# _sup_rollup_extra <stalled> <nooutput> <updpend> <quota> <other>
+# Suffix appended to the tick's log line. The four original buckets keep their
+# exact position ahead of this so anything already parsing the line still
+# parses; these appear only when non-zero, so a clean fleet's line does not grow.
+_sup_rollup_extra() {
+  local out=""
+  (( ${1:-0} > 0 )) && out+=" / ${1} stalled"
+  (( ${2:-0} > 0 )) && out+=" / ${2} no-output"
+  (( ${3:-0} > 0 )) && out+=" / ${3} update-pending"
+  (( ${4:-0} > 0 )) && out+=" / ${4} quota-exhausted"
+  (( ${5:-0} > 0 )) && out+=" / ⚠ ${5} unclassified"
+  printf '%s' "$out"
+}
+
 cmd_supervisor_tick() {
   require_root "supervisor --tick"
   if [[ ! -f "$_SUP_ENABLED_FLAG" ]]; then
@@ -1277,13 +1348,14 @@ cmd_supervisor_tick() {
     esac
   done < <(jq -c '.[]' <<<"$snap")
 
-  local total healthy slow stuck drift vchal
+  # DIVE-3667: the rollup counts EVERY class the classifier emitted, via
+  # _sup_rollup_counts. See the comment on that helper for what the hand-picked
+  # five cost. `other` (unclassified) is the invariant that keeps this true for
+  # a class added after this commit.
+  local total healthy slow stuck drift vchal stalled nooutput updpend quota other
   total=$(jq 'length' <<<"$snap")
-  healthy=$(jq '[.[] | select(.classification == "healthy")] | length' <<<"$snap")
-  slow=$(jq  '[.[] | select(.classification == "slow")]    | length' <<<"$snap")
-  stuck=$(jq '[.[] | select(.classification == "stuck")]   | length' <<<"$snap")
-  drift=$(jq '[.[] | select(.classification == "drift")]   | length' <<<"$snap")
-  vchal=$(jq '[.[] | select(.classification == "verify-challenge")] | length' <<<"$snap")
+  read -r healthy slow stuck drift vchal stalled nooutput updpend quota other \
+    <<<"$(_sup_rollup_counts "$snap")"
 
   # DIVE-975: one 'heartbeat' row per tick — the observation DENOMINATOR. The
   # transition/observe rows above are sporadic by nature (a clean fleet writes
@@ -1291,11 +1363,25 @@ cmd_supervisor_tick() {
   # no window to measure a false-positive RATE against. This additive summary
   # row makes the table grow on every cron tick and records the fleet snapshot;
   # reviewers filter it out by event='heartbeat'. agent='(fleet)' is a sentinel.
-  local fleet_class="healthy"
-  (( slow + stuck + vchal > 0 )) && fleet_class="degraded"
+  #
+  # DIVE-3667: every bucket goes in `signals`, including the ones that do not
+  # move fleet_class. This row is the denominator, so a reader must be able to
+  # recompute ANY definition of degraded from it — the previous JSON omitted
+  # verifyChallenge, which DROVE fleet_class, so the row could not explain its
+  # own verdict.
+  local fleet_class sig
+  fleet_class=$(_sup_fleet_class "$healthy" "$slow" "$stuck" "$drift" "$vchal" \
+                                 "$stalled" "$nooutput" "$updpend" "$quota" "$other")
+  sig=$(jq -nc \
+          --argjson t "$total" --argjson h "$healthy" --argjson sl "$slow" \
+          --argjson dr "$drift" --argjson st "$stuck" --argjson sa "$stalled" \
+          --argjson vc "$vchal" --argjson no "$nooutput" --argjson up "$updpend" \
+          --argjson qe "$quota" --argjson ot "$other" --argjson ev "$events" \
+          '{total:$t, healthy:$h, slow:$sl, drift:$dr, stuck:$st, stalled:$sa,
+            verifyChallenge:$vc, noOutput:$no, updatePending:$up,
+            quotaExhausted:$qe, unclassified:$ot, anomalyRows:$ev}')
   db "INSERT INTO supervisor_events (agent, event, classification, signals)
-      VALUES ('(fleet)', 'heartbeat', $(sqlq "$fleet_class"),
-              $(sqlq "{\"total\":${total},\"healthy\":${healthy},\"slow\":${slow},\"drift\":${drift},\"stuck\":${stuck},\"anomalyRows\":${events}}"));" \
+      VALUES ('(fleet)', 'heartbeat', $(sqlq "$fleet_class"), $(sqlq "$sig"));" \
     2>/dev/null && events=$((events + 1)) || warn "supervisor: heartbeat insert failed"
 
   local act_note=""
@@ -1304,9 +1390,15 @@ cmd_supervisor_tick() {
   fi
   local vchal_note=""
   (( vchal > 0 )) && vchal_note=" · ⚠ ${vchal} verify-challenge (${alerted} alerted)"
-  ok "supervisor tick: ${total} agents — ${healthy} healthy / ${slow} slow / ${drift} drift / ${stuck} stuck · ${events} audit row(s)${act_note}${vchal_note}" \
-     '{enabled:true, agents:($t|tonumber), healthy:($h|tonumber), slow:($sl|tonumber), drift:($dr|tonumber), stuck:($st|tonumber), verifyChallenge:($vc|tonumber), alerted:($al|tonumber), auditRows:($e|tonumber), actionsEnabled:($ae == "true"), acted:($ac|tonumber), planned:($pl|tonumber), escalated:($es|tonumber)}' \
+  # DIVE-3667: the four original buckets keep their exact position so anything
+  # already parsing this line still parses; the rest appear only when non-zero,
+  # so a clean fleet's line does not grow.
+  local extra
+  extra=$(_sup_rollup_extra "$stalled" "$nooutput" "$updpend" "$quota" "$other")
+  ok "supervisor tick: ${total} agents — ${healthy} healthy / ${slow} slow / ${drift} drift / ${stuck} stuck${extra} · ${events} audit row(s)${act_note}${vchal_note}" \
+     '{enabled:true, agents:($t|tonumber), healthy:($h|tonumber), slow:($sl|tonumber), drift:($dr|tonumber), stuck:($st|tonumber), stalled:($sa|tonumber), noOutput:($no|tonumber), updatePending:($up|tonumber), quotaExhausted:($qe|tonumber), unclassified:($ot|tonumber), verifyChallenge:($vc|tonumber), alerted:($al|tonumber), auditRows:($e|tonumber), actionsEnabled:($ae == "true"), acted:($ac|tonumber), planned:($pl|tonumber), escalated:($es|tonumber)}' \
      --arg t "$total" --arg h "$healthy" --arg sl "$slow" --arg dr "$drift" --arg st "$stuck" --arg e "$events" \
+     --arg sa "$stalled" --arg no "$nooutput" --arg up "$updpend" --arg qe "$quota" --arg ot "$other" \
      --arg vc "$vchal" --arg al "$alerted" \
      --arg ae "$actions_on" --arg ac "$acted" --arg pl "$planned" --arg es "$escalated"
 }
