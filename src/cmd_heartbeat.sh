@@ -2597,12 +2597,76 @@ _hb_gate_ttl_sweep() {
 # Deliberately keyed on `routed_reviewer`: an unrouted gate is the HUMAN's, its
 # holder has no wake this queue is visible at, and nothing here may quiet it.
 _HB_GATE_RENAG_GRACE_HOURS="${FIVEDIVE_GATE_RENAG_ROUTED_GRACE_HOURS:-2}"
+# DIVE-3674 — THE GRACE IS CONDITIONED ON THE WAKE IT DEFERS TO. Everything above
+# is right about a BUSY reviewer and says nothing about an idle one: the queue
+# count that carries a routed gate rides on `_hb_wake`, and `_hb_wake` is only
+# reached for a seat that has a row to be woken AGAINST (:4600, `no todo — stay
+# idle`). A reviewer with nothing runnable therefore has no next natural wake, the
+# premise fails, and the grace stops being a deferral and becomes two hours of
+# plain silence — longest in wall-clock terms exactly when the whole fleet is
+# idle, which is the case where no other seat could have taken the gate either.
+# Measured instance (DIVE-3670/3667): a gate routed to dev2 at ~00:30Z sat
+# unanswered across 19 consecutive `[dev2] no todo — stay idle` ticks. dev2 was
+# CORRECTLY idle by every liveness signal; nothing was broken, the bet simply had
+# no wake to pay out on.
+#
+# So the escape is NARROW BY MEASUREMENT, not by taste. Of 294 routed tier-1
+# non-urgent gates in the 30 days to 2026-08-22, 279 were answered INSIDE the 2h
+# window and 252 of those within FIFTEEN MINUTES: on a fleet with work, the
+# natural wake arrives promptly and the grace costs nothing. Shortening it
+# generally would reinstate the interrupt DIVE-3474 removed for the 95% case to
+# fix the 5%. This conjunct fires ONLY where the wake provably is not coming.
+# (The counting query is in DIVE-3674's body; the 30d window slides, so re-deriving
+# it later moves these by ones, not by orders. `gate_delivery_log` — the source the
+# row asked for — does not exist; `tasks` + `gate_history` are what carry it.)
+#
+# And the grace was not what delivered the measured instance either. `gate_history`
+# for DIVE-3667: the gate filed 00:23:12 sat 104 minutes and was WITHDRAWN unanswered
+# at 02:07:53; the re-file at 02:07:55 was answered at 02:08:15 — and the audit trail
+# names the carrier, an out-of-band `agent _deliver` from the filer at 02:07:59
+# (`path=file-time`, 805 bytes). Not `--urgent` (the row is gate_urgent=0), not this
+# sweep, and not the seat's next natural wake, which did not arrive until 02:10:06.
+# A person noticing was the mechanism. That is the thing this conjunct replaces.
+#
+#   provably: the reviewer is a known agent (`agents_org`) with NO runnable todo
+#             and NO in_progress row. The todo half mirrors `_hb_pick_tasks`
+#             exactly — same `kind='standard'`, same open-blocker NOT EXISTS — so
+#             "runnable" here means what the picker means by it and cannot drift
+#             from it silently. A todo behind an OPEN blocker is skipped by the
+#             picker, so it is not a wake.
+#             The in_progress carve-out is a NO-CLOBBER rule, not a claim that a
+#             mid-turn seat will meet the gate: it may finish its turn with an
+#             empty queue and go straight to `no todo — stay idle`. The residual
+#             is BOUNDED and it is stated rather than hidden — the conjunct is
+#             re-evaluated every sweep, so the tick after that row leaves
+#             in_progress the seat reads as wakeless and the gate goes out. What
+#             the carve-out buys is that we never type into a live turn; what it
+#             costs is one turn's worth of delay, against the 2h it removes.
+#   tier < 2: the carrier this un-quiets is `_hb_gate_renag_agent_rail`, the
+#             in-band agent rail. A tier-2 gate re-nags a PAIRED HUMAN, whose
+#             attention was never a function of the seat's queue, so the premise
+#             this conjunct repairs was never load-bearing there. Widening the
+#             human lane is a different change and this is not it.
+#
+# The failure direction stays loud: if the rail cannot reach the seat the sweep
+# hands the row straight to the paired human, unchanged.
+_HB_GATE_RENAG_NO_NATURAL_WAKE="CAST(COALESCE(NULLIF(tier,''),'2') AS INTEGER) < 2
+        AND EXISTS (SELECT 1 FROM agents_org o WHERE o.name = tasks.routed_reviewer)
+        AND NOT EXISTS (SELECT 1 FROM tasks w
+                         WHERE w.assignee = tasks.routed_reviewer AND w.kind = 'standard'
+                           AND ( w.status = 'in_progress'
+                                 OR ( w.status = 'todo'
+                                      AND NOT EXISTS (SELECT 1 FROM task_deps dd
+                                                        JOIN tasks b ON b.id = dd.blocked_by
+                                                       WHERE dd.task_id = w.id
+                                                         AND b.status NOT IN ('done','cancelled')) ) ))"
 _HB_GATE_RENAG_WHERE="need_type IS NOT NULL AND need_answered_at IS NULL
   AND status NOT IN ('done','cancelled') AND COALESCE(tier,2) != 0
   AND ( COALESCE(routed_reviewer,'') = ''
         OR COALESCE(gate_urgent,0) = 1
         OR COALESCE(need_asked_at,updated_at,created_at)
-             <= datetime('now','-${_HB_GATE_RENAG_GRACE_HOURS} hours') )
+             <= datetime('now','-${_HB_GATE_RENAG_GRACE_HOURS} hours')
+        OR ( ${_HB_GATE_RENAG_NO_NATURAL_WAKE} ) )
   AND (COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-1 hour')
        OR (gate_pinged_at IS NULL
            AND COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-15 minutes')))
