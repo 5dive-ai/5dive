@@ -411,6 +411,112 @@ os.chmod(path, 0o600)
   printf '%s\n' "$key"
 }
 
+# ---------------------------------------------------------------------------
+# DIVE-3665 — PRESEED THE CUSTOMER'S DM THREAD.
+#
+# lodar, off his first customer walk: "we need to preseed dms for all agents
+# that are in buzz. so user dont have to click plus and search." Today the
+# handset opens on the team room and an empty DM list, and every agent costs a
+# plus-and-search against a pubkey the customer does not know.
+#
+# WHY THIS LIVES IN `join` AND NOWHERE ELSE. The row asks for two moments — at
+# pair time, and when an agent is enabled while a phone is already paired — and
+# both are the SAME call: `5dive buzz pair` runs `_buzz_join` once per
+# buzz-enabled agent (cmd_buzz.sh, the wire loop that exists because a non-member
+# handset sees nothing), and `agent buzz enable` runs it at the end of the last
+# mile. One site covers both, and there is no third path that mints a handset.
+#
+# WHY THE OWNER OPENS IT, not the agent. The thread has to be in the HANDSET's
+# conversation list, and the only view we can assert that from is the owner
+# key's own. Opening from the agent side and hoping the other member sees it is
+# the accepted-but-unservable shape this whole arc keeps re-finding.
+#
+# WHY THE DEDUPE IS NOT `dms list`. Measured live on sure-redwood with two real
+# keys (community/wiki/dms-list-returns-empty-so-a-dm-poller-has-nothing-to-
+# discover.md): a DM that exists, whose members BOTH read back, and which either
+# key can open by uuid, is absent from `dms list` — the relay answers []. So
+# `dms list` is asked first (it is the cheap answer if the relay ever starts
+# serving it) and the authority is `channels list --member`, where the DM does
+# show up. A dedupe built on the empty verb alone would reopen the thread on
+# every pair and every enable, and the customer's list would fill with identical
+# rows — which is a worse first-open than the empty one this row is fixing.
+#
+# WHY KNOWN IDS ARE EXCLUDED. A DM is recognised by shape — exactly two members,
+# the owner and this agent — and a team channel with one agent in it has that
+# same shape. The named channels this join just resolved are passed in and
+# skipped, so `general` on a one-agent box cannot be mistaken for the DM and
+# suppress the seed forever.
+# ---------------------------------------------------------------------------
+_buzz_dm_id_for() { # <runas> <bin> <relay> <owner_key> <owner_pub> <agent_pub> <known-ids-csv>
+  local user="$1" bin="$2" relay="$3" okey="$4" opub="$5" apub="$6" known=",${7},"
+  local body found=""
+
+  # 1. the cheap answer, if the relay ever serves it.
+  body=$(_buzz_cli "$user" "$bin" "$relay" "$okey" dms list 2>/dev/null) || body=""
+  if [[ -n "$body" ]]; then
+    found=$(APUB="$apub" python3 -c "
+import json, os, sys
+want = os.environ['APUB']
+try:
+    rows = json.load(sys.stdin)
+except Exception:
+    rows = []
+if isinstance(rows, dict):
+    rows = rows.get('dms') or rows.get('conversations') or []
+for r in rows if isinstance(rows, list) else []:
+    if not isinstance(r, dict):
+        continue
+    if want in json.dumps(r):
+        print(str(r.get('dm_id') or r.get('channel_id') or r.get('id') or ''))
+        break
+" <<<"$body" 2>/dev/null) || found=""
+    [[ -n "$found" ]] && { printf '%s\n' "$found"; return 0; }
+  fi
+
+  # 2. the authority: the owner's own room list, by membership shape.
+  local mine cid members
+  mine=$(_buzz_cli "$user" "$bin" "$relay" "$okey" channels list --member 2>/dev/null) || mine=""
+  [[ -n "$mine" ]] || return 1
+  while IFS= read -r cid; do
+    [[ -n "$cid" ]] || continue
+    [[ "$known" == *",${cid},"* ]] && continue
+    members=$(_buzz_cli "$user" "$bin" "$relay" "$okey" channels members --channel "$cid" 2>/dev/null) || members=""
+    [[ "$members" == *"$apub"* && "$members" == *"$opub"* ]] || continue
+    # exactly two occupants, or it is a room that happens to hold both of them
+    local n
+    n=$(_buzz_pick "len([x for x in (d if isinstance(d, list) else (d or {}).get('members') or []) if x])" <<<"$members")
+    [[ "$n" == "2" ]] || continue
+    printf '%s\n' "$cid"
+    return 0
+  done < <(_buzz_pick "'\n'.join(str(r.get('channel_id') or r.get('id') or '') for r in (d if isinstance(d, list) else []) if isinstance(r, dict))" <<<"$mine")
+  return 1
+}
+
+_buzz_preseed_dm() { # <runas> <bin> <relay> <owner_key> <owner_pub> <agent_pub> <name> <known-ids-csv>
+  local user="$1" bin="$2" relay="$3" okey="$4" opub="$5" apub="$6" name="$7" known="$8"
+  if [[ ! "$apub" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    warn "no derived pubkey for '$name' — the customer's DM thread cannot be preseeded and the handset will need plus-and-search for this agent (DIVE-3665)"
+    return 1
+  fi
+  local existing=""
+  existing=$(_buzz_dm_id_for "$user" "$bin" "$relay" "$okey" "$opub" "$apub" "$known") || existing=""
+  if [[ -n "$existing" ]]; then
+    ok "DM thread with '$name' is already in the handset's list ($existing) — not opening a second one"
+    return 0
+  fi
+  step "Preseeding the customer's DM thread with '$name' (so the handset opens on it instead of plus-and-search)"
+  _buzz_cli "$user" "$bin" "$relay" "$okey" dms open --pubkey "$apub" >/dev/null 2>&1 || true
+  # THE ASSERTION, and it is the owner's own view — the only one the customer has.
+  local seeded=""
+  seeded=$(_buzz_dm_id_for "$user" "$bin" "$relay" "$okey" "$opub" "$apub" "$known") || seeded=""
+  if [[ -n "$seeded" ]]; then
+    ok "DM thread with '$name' ($seeded) reads back in the OWNER's own room list — zero taps to message this agent"
+    return 0
+  fi
+  warn "the DM with '$name' was opened but the owner's own listing does not show it — the handset will NOT see the thread and the customer is back to plus-and-search (DIVE-3665). This is a relay that accepted a write it cannot serve, not a local error."
+  return 1
+}
+
 # cmd: 5dive agent buzz join <name> [--channels=csv] [--rotate-owner-key]
 #
 # Idempotent by construction: a channel that exists is joined rather than
@@ -587,6 +693,13 @@ _buzz_join() {
     _buzz_set_channel_ids "$user" "$cfg" "$resolved_ids" "$resolved_names" \
       || warn "could not record the resolved channel ids in $cfg — the poller will not watch anything until it can"
   fi
+
+  # --- step 7: the customer's DM thread (DIVE-3665) ------------------------
+  # Above step 6 on purpose, twice over: a box where one channel failed still
+  # earns its DM (the loop above returns 3 at the very end, not here), and the
+  # avatar publish at the bottom of step 6 must stay the LAST kind:0 write of
+  # the last mile (tests/buzz_last_mile_unit.sh arms 8i/8j grade that order).
+  _buzz_preseed_dm "$user" "$bin" "$relay" "$owner_key" "$owner_pub" "$self_pub" "$name" "$resolved_ids" || true
 
   # --- step 6: profile + presence (DIVE-3507) ------------------------------
   # Without this the room fills with faceless agents that read as offline, which
