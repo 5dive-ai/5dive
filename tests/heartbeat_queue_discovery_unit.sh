@@ -122,7 +122,31 @@ mk_gate() { # <ident> <routed_reviewer> <tier> <asked_modifier> <urgent> <answer
       SELECT last_insert_rowid();"
 }
 
-reset_db() { db "DELETE FROM tasks;"; : >"$INJECTED"; : >"$SEND_LOG"; : >"$AGENT_SEND_LOG"; }
+# DIVE-3674 helpers. The grace now reads the REVIEWER's own queue, so "what work
+# does main have" stopped being scenery and became an input: every arm below that
+# asserts the grace HOLDS has to stand up a wake for it to defer to, or it is
+# asserting the new conjunct instead of the old one.
+mk_task_for() { # <agent> <status> -> row id
+  db "INSERT INTO tasks (title, body, priority, assignee, created_by, kind, status)
+      VALUES ('reviewer work', '', 'medium', $(sqlq "$1"), 'main', 'standard', $(sqlq "$2"));
+      SELECT last_insert_rowid();"
+}
+# A todo behind an OPEN blocker. `_hb_pick_tasks` skips it, so the seat is never
+# woken against it — it looks like work on the board and is not a wake.
+mk_blocked_task_for() { # <agent> -> row id
+  local t b
+  t=$(mk_task_for "$1" todo)
+  # The blocker is assigned to a DIFFERENT seat on purpose: parked on the
+  # reviewer it would itself be a runnable todo, and the arm would then be
+  # measuring that row instead of the blocked one.
+  b=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, kind, status)
+          VALUES ('blocker', '', 'medium', 'dev', 'main', 'standard', 'todo');
+          SELECT last_insert_rowid();")
+  db "INSERT INTO task_deps (task_id, blocked_by) VALUES (${t}, ${b});"
+  printf '%s' "$t"
+}
+
+reset_db() { db "DELETE FROM task_deps; DELETE FROM tasks;"; : >"$INJECTED"; : >"$SEND_LOG"; : >"$AGENT_SEND_LOG"; }
 
 # Last line of injected wake text; the nudge is a single line by construction.
 last_nudge() { tail -1 "$INJECTED" 2>/dev/null; }
@@ -217,7 +241,11 @@ n="$(last_nudge)"
 
 # 2a. A routed non-urgent gate YOUNGER than the grace is NOT selected. This is
 #     the whole point: the natural wake gets first refusal.
+#     DIVE-3674: the todo is REQUIRED, not decoration. The grace is granted
+#     because main has a runnable row and will therefore be woken; without it
+#     there is no wake for the sweep to defer to and 2g is the arm that applies.
 reset_db
+mk_task_for main todo >/dev/null
 mk_gate DIVE-G1 main 1 '-30 minutes' 0 0 >/dev/null
 [[ "$(nsel)" == "0" ]] \
   && ok_t "grace: routed non-urgent gate at 30m is NOT re-nagged (< 2h grace)" \
@@ -252,6 +280,7 @@ mk_gate DIVE-G4 '' 1 '-30 minutes' 0 0 >/dev/null
 # 2e. The grace window is CONFIGURABLE and the env var is the knob named in the
 #     source. Pinned so the 2h default cannot be silently hard-coded.
 reset_db
+mk_task_for main todo >/dev/null   # DIVE-3674: keep the 2h grace the only thing under test here
 mk_gate DIVE-G5 main 1 '-30 minutes' 0 0 >/dev/null
 sel_override=$(
   FIVEDIVE_GATE_RENAG_ROUTED_GRACE_HOURS=0 bash -c '
@@ -273,6 +302,7 @@ sel_override=$(
 #     grace does. The WHERE arms above could both be true while the sweep still
 #     pinged through some other path.
 reset_db
+mk_task_for main todo >/dev/null   # DIVE-3674: the wake the grace defers to
 mk_gate DIVE-G6 main 1 '-30 minutes' 0 0 >/dev/null
 _hb_gate_renag_sweep >/dev/null 2>&1
 young_sends=$(( $(grep -c . "$SEND_LOG") + $(grep -c . "$AGENT_SEND_LOG") ))
@@ -284,6 +314,90 @@ old_sends=$(( $(grep -c . "$SEND_LOG") + $(grep -c . "$AGENT_SEND_LOG") ))
   && ok_t "grace: real sweep sends nothing inside the grace and does send past it" \
   || bad_t "grace: real sweep behaviour does not match the WHERE" \
            "young=$young_sends old=$old_sends"
+
+# =============================================================================
+# PART 2b — DIVE-3674: the grace is CONDITIONED on the wake it defers to
+# =============================================================================
+# The defect these arms pin is not a broken signal. Every liveness reading on the
+# stranded seat was CORRECT — it really had no work, it really was idle, the sweep
+# really was silent by design. So an arm shaped "assert the seat is healthy"
+# proves nothing here; what has to be asserted is that a seat with 0 runnable
+# rows and a routed gate is NOT granted a grace whose whole premise is a wake it
+# will not get.
+
+# 2g. THE DEFECT. Same row as 2a, same age, same tier, same urgency — the ONLY
+#     difference is that the reviewer's queue is empty, so `_hb_wake` is never
+#     reached for it and the natural wake never comes. It must be selected.
+reset_db
+mk_gate DIVE-G8 main 1 '-30 minutes' 0 0 >/dev/null
+[[ "$(nsel)" == "1" ]] \
+  && ok_t "no-wake: a routed gate on a 0-todo reviewer is NOT granted the grace" \
+  || bad_t "no-wake: 0-todo reviewer still got the 2h grace — the strand is unfixed" "selected=$(nsel)"
+
+# 2h. A reviewer that is MID-TURN has a wake. `in_progress` is the busy-guard's
+#     own condition, and typing at that seat is the clobber the no-clobber guard
+#     exists to prevent — so the grace must still hold.
+reset_db
+mk_task_for main in_progress >/dev/null
+mk_gate DIVE-G9 main 1 '-30 minutes' 0 0 >/dev/null
+[[ "$(nsel)" == "0" ]] \
+  && ok_t "no-wake: an in_progress reviewer keeps the grace (mid-turn, do not clobber)" \
+  || bad_t "no-wake: the sweep un-quieted a reviewer that is mid-turn" "selected=$(nsel)"
+
+# 2i. A todo behind an OPEN blocker is NOT a wake — `_hb_pick_tasks` skips it and
+#     the seat logs `no todo — stay idle` all the same. Counting rows instead of
+#     RUNNABLE rows would read this seat as busy and re-strand the gate, which is
+#     the same proxy-for-the-artifact mistake in a new place.
+reset_db
+mk_blocked_task_for main >/dev/null
+mk_gate DIVE-G10 main 1 '-30 minutes' 0 0 >/dev/null
+[[ "$(nsel)" == "1" ]] \
+  && ok_t "no-wake: a todo held behind an OPEN blocker does not count as a wake" \
+  || bad_t "no-wake: a blocked todo was read as a natural wake" "selected=$(nsel)"
+
+# 2j. Same row once the blocker CLOSES: the todo becomes runnable, the wake is
+#     real again, the grace returns. The negative control for 2i — without it,
+#     2i would also pass if the conjunct ignored task_deps entirely and simply
+#     never granted the grace.
+reset_db
+bt=$(mk_blocked_task_for main)
+db "UPDATE tasks SET status='done' WHERE id IN (SELECT blocked_by FROM task_deps WHERE task_id=${bt});"
+mk_gate DIVE-G11 main 1 '-30 minutes' 0 0 >/dev/null
+[[ "$(nsel)" == "0" ]] \
+  && ok_t "no-wake: the grace RETURNS once the blocker closes (control for 2i)" \
+  || bad_t "no-wake: a runnable todo was still read as no wake" "selected=$(nsel)"
+
+# 2k. TIER 2 IS OUT OF SCOPE and that is deliberate. A tier-2 re-nag reaches a
+#     paired HUMAN, whose attention was never a function of the seat's queue, so
+#     the premise this conjunct repairs was never load-bearing there. Un-quieting
+#     the human lane would be a widening nobody asked for.
+reset_db
+mk_gate DIVE-G12 main 2 '-30 minutes' 0 0 >/dev/null
+[[ "$(nsel)" == "0" ]] \
+  && ok_t "no-wake: a TIER-2 routed gate keeps the grace (human lane untouched)" \
+  || bad_t "no-wake: the conjunct widened the human re-nag lane" "selected=$(nsel)"
+
+# 2l. An UNKNOWN reviewer is not PROVABLY wakeless — it is unmeasured. A name
+#     absent from `agents_org` has no queue we can read, and asserting "no wake"
+#     from a failed lookup is the could-not-measure-reads-as-measured shape.
+#     Keep the grace; the 2h rung still fires.
+reset_db
+mk_gate DIVE-G13 ghost 1 '-30 minutes' 0 0 >/dev/null
+[[ "$(nsel)" == "0" ]] \
+  && ok_t "no-wake: an unknown reviewer keeps the grace (unmeasured is not proven-idle)" \
+  || bad_t "no-wake: an unreadable queue was read as an empty one" "selected=$(nsel)"
+
+# 2m. END-TO-END through the real sweep. The WHERE arms could all be right while
+#     the sweep still delivered nowhere: what makes this a fix rather than a
+#     re-labelling is that the row leaves on the AGENT rail (`cmd_send` into the
+#     reviewer's pane), which is the wake the seat was missing — not a human push.
+reset_db
+mk_gate DIVE-G14 main 1 '-30 minutes' 0 0 >/dev/null
+_hb_gate_renag_sweep >/dev/null 2>&1
+[[ "$(grep -c . "$AGENT_SEND_LOG")" -ge 1 && "$(grep -c . "$SEND_LOG")" == "0" ]] \
+  && ok_t "no-wake: the real sweep wakes the idle reviewer over the AGENT rail, no human push" \
+  || bad_t "no-wake: real sweep did not deliver on the agent rail" \
+           "agent=$(grep -c . "$AGENT_SEND_LOG") human=$(grep -c . "$SEND_LOG")"
 
 # =============================================================================
 # PART 3 — DELETION MUTANTS. quinn's iteration-3 reject was precisely that both
@@ -333,6 +447,21 @@ if [[ -z "${_HB_QD_MUTANT:-}" ]]; then
   run_mutant "renag grace conjunct neutered" \
     "s|AND ( COALESCE(routed_reviewer,'') = ''|AND ( 1=1 OR COALESCE(routed_reviewer,'') = ''|" \
     "grace: young routed gate was re-nagged anyway"
+
+  # Mutant 3 — DIVE-3674. Neuter the no-natural-wake conjunct back to the
+  # pre-3674 behaviour (grace granted unconditionally). Targets the OR-arm rather
+  # than the helper string so a mutant that merely renames the variable does not
+  # read as a kill.
+  run_mutant "renag no-natural-wake conjunct neutered" \
+    "s|        OR ( \${_HB_GATE_RENAG_NO_NATURAL_WAKE} ) )|        OR ( 1=0 ) )|" \
+    "no-wake: 0-todo reviewer still got the 2h grace"
+
+  # Mutant 4 — count ROWS instead of RUNNABLE rows: drop the open-blocker test.
+  # This is the plausible-looking simplification, and 2i is the only arm that
+  # separates it from the real thing.
+  run_mutant "no-natural-wake ignores open blockers" \
+    "s|AND b.status NOT IN ('done','cancelled')|AND 1=0|" \
+    "no-wake: a blocked todo was read as a natural wake"
 
   unset _HB_QD_MUTANT
 fi
