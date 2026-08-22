@@ -50,6 +50,14 @@
 # WARN-ONLY IS THE DEFAULT and `--enforce` is opt-in, per this row: the guard must
 # not fail anything until both negative-control arms are on the row.
 set -uo pipefail
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+# Three-state: if the helper is unreachable (a staged copy that did not carry
+# tests/lib/), the log says NO TREE WAS NAMED rather than falling silent, and a
+# `set -e` harness is not killed by a failed source.
+# NOTE the absence of `2>/dev/null`. Redirecting the source's stderr would also
+# swallow the helper's own stderr line, which IS the payload.
+. "$(dirname "${BASH_SOURCE[0]}")/../lib/grading_tree.sh" \
+  || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 2
 # shellcheck source=tests/lib/harness-verdict-detect.sh
 source tests/lib/harness-verdict-detect.sh
