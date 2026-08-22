@@ -284,7 +284,7 @@ t "call site: the tick's log line appends _sup_rollup_extra" \
 # whole function body for "k:" passes on either one alone — the first cut of
 # this arm did exactly that and survived a mutant that emptied the heartbeat.
 SIGPROG="$(awk '/sig=\$\(jq -nc/,/anomalyRows/' <<<"$TICKBODY")"
-OKLINE="$(grep -F 'supervisor tick: ${total} agents' <<<"$TICKBODY")"
+OKLINE="$(grep -F 'supervisor tick: ${total} agents' <<<"$TICKBODY")" || OKLINE=""
 for k in stalled noOutput updatePending quotaExhausted unclassified verifyChallenge; do
   t "call site: heartbeat signals carry ${k}" \
     "yes" "$(grep -qF "${k}:\$" <<<"$SIGPROG" && echo yes || echo no)"
