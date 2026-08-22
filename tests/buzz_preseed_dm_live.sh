@@ -49,9 +49,32 @@ set +e
 # ---------------------------------------------------------------------------
 # PRE-FLIGHT. Both of these are the difference between "measured" and "assumed".
 # ---------------------------------------------------------------------------
+# DIVE-3675: THE VERDICT LINE MUST BE REACHED IN AN ENVIRONMENT THAT HAS NEITHER.
+# Each pre-flight skip below used to call summary and exit the process. That is a correct
+# verdict for a reader and an invisible one for tests/meta/harness-verdict-probe.sh: the
+# probe injects its mutation immediately before the FINAL verdict line and requires the
+# harness to report it, so a harness that leaves earlier reports `not-reached`. No CI
+# runner has a `buzz` binary or a reachable relay, so EVERY lane took the binary-missing
+# exit, the union read NEVER PROBED across all seven environments, and
+# harness-verdict-union went red — which is what refused the v0.21.3 cut on 2026-08-22
+# and pinned the fleet at v0.21.2.
+#
+# So the pre-flight skips `return` out of this function instead of leaving the process,
+# and the file ends with exactly ONE terminal `summary`. Reached in every environment,
+# mutable by the probe, and the skip still renders as a skip: PASS/FAIL/SKIP are globals,
+# summary() is unchanged, and a relay-less run prints the same SKIP lines and the same
+# tally it printed before. The exit STATUS is unchanged too, in both directions: summary
+# ends in `[[ "$FAIL" -eq 0 ]]`, so a skip-only run still exits 0 and the fixture failure
+# still exits 1 — it now does so from the bottom of the file rather than from the middle.
+#
+# NOT an ALLOW_UNPROBEABLE entry: that list means "no identifiable verdict variable", and
+# this harness has one. NOT a SLOW_HARNESSES entry either — it is not killed by the
+# timeout, it leaves early. Naming it in either place would have put a false reason on
+# the record for a harness that is neither unprobeable nor slow.
+live_arms() {
 if [[ -z "$BIN" || ! -x "$BIN" ]]; then
   skip_t "live arms need a real buzz binary" "no executable buzz on PATH (set BUZZ_LIVE_BIN)"
-  summary; exit $?
+  return
 fi
 
 CALLS=$(mktemp)
@@ -69,7 +92,7 @@ AGENT_SK=$(python3 -c "print('%064x' % ((int('$SEED')*40503 + 0x22b2) % (2**256-
 OWNER_PUB=$(printf '%s' "$OWNER_SK" | _buzz_xonly_pubkey 2>/dev/null)
 AGENT_PUB=$(printf '%s' "$AGENT_SK" | _buzz_xonly_pubkey 2>/dev/null)
 [[ "$OWNER_PUB" =~ ^[0-9a-f]{64}$ && "$AGENT_PUB" =~ ^[0-9a-f]{64}$ ]] \
-  || { bad_t "fixture: two real keypairs derive" "owner='$OWNER_PUB' agent='$AGENT_PUB'"; summary; exit $?; }
+  || { bad_t "fixture: two real keypairs derive" "owner='$OWNER_PUB' agent='$AGENT_PUB'"; return; }
 
 REACH=$(_buzz_cli q "$BIN" "$RELAY" "$OWNER_SK" channels list 2>&1)
 if [[ "$REACH" == *'"network_error"'* || -z "$REACH" ]]; then
@@ -77,7 +100,7 @@ if [[ "$REACH" == *'"network_error"'* || -z "$REACH" ]]; then
   skip_t "the seed round-trips against a real relay" "no relay"
   skip_t "a second preseed leaves exactly ONE thread on a real relay" "no relay"
   skip_t "the dms-list fast path is exercised against the real relay" "no relay"
-  summary; exit $?
+  return
 fi
 
 # NEGATIVE CONTROL, and it runs BEFORE the positive arms on purpose: an empty answer
@@ -191,6 +214,23 @@ print(' '.join(str(r.get('channel_id') or r.get('id')) for r in rows if r.get('n
     || bad_t "the two threads are addressed to two different agents" \
              "agent1_found=$SEEN1 agent2_found=$SEEN2 over ids [$IDS] — a duplicate thread for one agent reads the same as per-agent coverage by count alone"
 fi
+}
 
-rm -f "$CALLS"
+live_arms
+# CALLS is only assigned once the binary pre-flight passes, and `set -u` is in force.
+rm -f "${CALLS:-}"
 summary
+# …and the verdict is spelled HERE, at top level, as the last executable line of the
+# file. summary() already ends in the same expression, but harness-verdict-probe.sh
+# scans BACKWARDS for the last verdict-SHAPED line and stops at the first one it can
+# mutate — which, before this line existed, was the `(( SEEN1 == 1 && SEEN2 == 1 ))`
+# assertion inside the last live-only arm. SEEN1 is a real flag with numeric
+# assignments, so the probe accepted it and injected there: deep inside the branch
+# that needs a relay, i.e. somewhere no CI runner ever reaches. That is why this
+# harness read `not-reached` in all seven environments rather than UNPROBEABLE, and
+# why the union called it NEVER PROBED.
+#
+# So: an unambiguous, always-reached verdict on FAIL, after the last arm and outside
+# every branch. The probe injects `FAIL=$((FAIL+1))` above it and the harness must
+# exit non-zero — which is the claim the union needs and could not previously obtain.
+[[ "$FAIL" -eq 0 ]]
