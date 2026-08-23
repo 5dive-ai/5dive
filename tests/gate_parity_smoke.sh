@@ -76,6 +76,7 @@ matrix=(
   "SLA escalation (unanswered gate walks the org chart) | heartbeat gate-escalate | tests/heartbeat_gate_escalate_unit.sh"
   "secret credential-drop fallback | task need --type=secret / secret write | tests/secret_drop_unit.sh"
   "autonomy report | digest --7d autonomy block | tests/digest_autonomy_unit.sh"
+  "track-record promotion (ROADMAP #22) | task need auto:record / task track-record | tests/gate_track_record_unit.sh"
 )
 for row in "${matrix[@]}"; do
   feat="${row%% |*}"
