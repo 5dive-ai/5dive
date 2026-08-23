@@ -407,7 +407,7 @@ PY
 _spend_scan_task_sessions() {
   TASK_DB="${TASKS_DB:-${STATE_DIR}/tasks/tasks.db}" \
     SESS_KIDS="$1" python3 - <<'PY'
-import os, json, glob, time, sqlite3, datetime as dt, pwd, sys
+import os, json, errno, time, sqlite3, datetime as dt, pwd, sys
 now = int(time.time())
 def bail(word, rc, why):
     print(word); sys.stderr.write("task-sessions: %s (%s)\n" % (word, why)); raise SystemExit(rc)
@@ -474,17 +474,90 @@ def home_of(name):
     if name in _HOME_OVR: return _HOME_OVR[name]   # test hook; unset in production
     try: return pwd.getpwnam("agent-"+name).pw_dir
     except KeyError: return "/home/agent-"+name
+# DIVE-3692: the transcripts of ONE session, by explicit enumeration. Two levels:
+#
+#     projects/<proj>/<sid>.jsonl                     the parent transcript
+#     projects/<proj>/<sid>/subagents/*.jsonl         the sidechain turns
+#
+# This reader used `glob.glob(projects/*/<sid>.jsonl)` — one level — and so it
+# never saw a subagent's turns. Claude Code does NOT write sidechain turns into
+# the parent session's `.jsonl`; the design note this reader was built on
+# asserted it does, and that is measured FALSE on two seats. They go to a sibling
+# DIRECTORY named by the session id, while every turn inside still carries the
+# PARENT's sessionId — so the attribution was always right here and only the
+# PATH was out of range. Measured on the fixture: corpus 10500, figure 1000.
+#
+# DIVE-3468 fixed exactly this for `_spend_scan_task_ids` above and this reader
+# was left behind — same tree, same metric, the other reader. A defect measured
+# on a tree LAYOUT applies to every reader of that layout.
+# (community/wiki/subagent-turns-live-in-a-sibling-directory-the-transcript-glob-never-reaches.md)
+#
+# AND NOT WITH A SECOND GLOB, which is only half the fix: glob SWALLOWS every
+# OSError in a wildcard level and yields nothing for that entry, so a chmod 000
+# `subagents/` would go back to being a smaller correct-looking integer — this
+# row's own defect, rebuilt one level deeper by the change meant to remove it.
+# So: one level at a time, where an unread level is a REASON and not a shorter
+# list. That also closes the MIDDLE level, which the old glob's own `*` wildcard
+# was swallowing: an unreadable PROJECT dir was already dropping out silently.
+#
+# ENOENT (a session rolling over mid-scan; a session that simply never fanned
+# out) and ENOTDIR (a regular file where a dir would be) stay SILENT, because
+# both mean "nothing unread here" — over-firing on them would make every row
+# that never used a subagent read NOT-REACHED, disabling the guard just as
+# thoroughly as understating does. Anything else — EACCES, ELOOP, EIO — is a
+# read we could not perform and comes back as the reason.
+#
+# `subagents` is named LITERALLY rather than swept with `<sid>/*/`: `tool-results/`
+# is its sibling in the same session dir, is present on every readable seat, and
+# is not transcript turns. A `*/*` sweep would swallow it everywhere.
+def session_paths(home, sid):
+    """-> (paths, reason). reason is not None => this session was not fully read."""
+    projects = os.path.join(home, ".claude", "projects")
+    out = []
+    try:
+        entries = sorted(os.listdir(projects))
+    except OSError as e:
+        if e.errno == errno.ENOENT: return [], None   # never ran: absence, not blindness
+        return [], "transcript dir %s unreadable: %s" % (projects, e.strerror or e.errno)
+    for d in entries:
+        sub = os.path.join(projects, d)
+        try:
+            names = sorted(os.listdir(sub))
+        except OSError as e:
+            if e.errno in (errno.ENOENT, errno.ENOTDIR): continue
+            return [], "project dir %s unreadable: %s" % (sub, e.strerror or e.errno)
+        if (sid + ".jsonl") in names:
+            out.append(os.path.join(sub, sid + ".jsonl"))
+        if sid in names:
+            subag = os.path.join(sub, sid, "subagents")
+            try:
+                sa = sorted(os.listdir(subag))
+            except OSError as e:
+                if e.errno in (errno.ENOENT, errno.ENOTDIR): continue
+                return [], "subagent dir %s unreadable: %s" % (subag, e.strerror or e.errno)
+            out.extend(os.path.join(subag, n) for n in sa if n.endswith(".jsonl"))
+    return out, None
 buckets = {}
 for g in segs: buckets.setdefault((g["sid"], g["agent"]), []).append(g)
 total = 0
 for (sid, agent), ws in buckets.items():
-    paths = glob.glob(os.path.join(home_of(agent), ".claude", "projects", "*", sid + ".jsonl"))
+    paths, why = session_paths(home_of(agent), sid)
+    if why is not None:
+        bail("NOT-REACHED", 4, "%s: %s" % (agent, why))
     if not paths:
         bail("NOT-REACHED", 4, "no transcript named %s.jsonl under %s's home" % (sid, agent))
     read_any = False
     for path in paths:
         try: f = open(path, "r", errors="ignore")
-        except OSError: continue
+        except OSError as e:
+            # ENOENT = the file vanished between the enumeration and the open (a
+            # session rolling over): a real absence. Anything else is a file we
+            # LOCATED and could not read, and the old `continue` swallowed it as
+            # long as some OTHER file in the set opened — the same fail-open at
+            # file granularity, and now reachable, because the set has more than
+            # one file in it whenever a row fanned out.
+            if e.errno == errno.ENOENT: continue
+            bail("NOT-REACHED", 4, "transcript %s unreadable: %s" % (path, e.strerror or e.errno))
         read_any = True
         with f:
             for line in f:
