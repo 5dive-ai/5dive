@@ -79,6 +79,55 @@ cmd_task_pfr_autoclear() {
   esac
 }
 
+# DIVE-3694 (ROADMAP #22) — the track-record view and its kill switch.
+# `5dive task track-record [status] [<seat>]` reports what the engine reads: the
+# seat's rate, over how many, and WHAT WOULD REVOKE IT (row scope item 4 — the
+# record must be legible to the seat itself, not only to the gate). Default seat
+# is the caller. `on|off` is the policy write; default ON, because this one is
+# the deliverable rather than an experiment (mirrors `task pfr-autoclear`, not
+# `task precedent`). `off` restores the pre-DIVE-3694 tier-1 routing byte for
+# byte and needs no release to take effect.
+cmd_task_track_record() {
+  tasks_db_init
+  local sub="${1:-status}"
+  case "$sub" in
+    on)
+      _task_pref_set track_record on
+      _task_store_audit_log "task track-record" "on" 0 -- "pref=track_record" || true
+      ok "track-record auto-clear: ON — a tier-1 decision gate from a seat at or above ${_GATE_RECORD_RATE}% over its last ${_GATE_RECORD_MIN}+ answered tier-1 decisions, with the last ${_GATE_RECORD_STREAK} clean, applies its own recommendation and pings nobody (provenance auto:record)" \
+         '{pref:"track_record", value:"on"}'
+      ;;
+    off)
+      _task_pref_set track_record off
+      _task_store_audit_log "task track-record" "off" 0 -- "pref=track_record" || true
+      ok "track-record auto-clear: OFF — every tier-1 decision gate routes as it did before DIVE-3694" \
+         '{pref:"track_record", value:"off"}'
+      ;;
+    status|"")
+      local seat="${2:-}"
+      [[ -n "$seat" ]] || seat=$(task_actor "" 2>/dev/null || printf '')
+      local v; v=$(_task_pref_get track_record 2>/dev/null || printf ''); v="${v:-on}"
+      local c t s pct line
+      read -r c t s <<<"$(_gate_record_stats "$seat")"
+      pct=$(( t > 0 ? (100 * c) / t : 0 ))
+      line=$(_gate_record_line "$seat")
+      local prom=false; _gate_record_promoted "$seat" && prom=true
+      ok "track-record auto-clear: ${v} · ${seat:-<unknown seat>}: ${line}" \
+         '{pref:"track_record", value:$v, seat:$s, concordant:($c|tonumber), total:($t|tonumber),
+           rate:($p|tonumber), streak_clean:($k=="1"), promoted:$pr,
+           threshold:{min_count:($mn|tonumber), min_rate:($mr|tonumber), streak:($st|tonumber), window:($w|tonumber)},
+           summary:$l}' \
+         --arg v "$v" --arg s "$seat" --arg c "$c" --arg t "$t" --arg p "$pct" \
+         --arg k "$s" --argjson pr "$prom" --arg l "$line" \
+         --arg mn "$_GATE_RECORD_MIN" --arg mr "$_GATE_RECORD_RATE" \
+         --arg st "$_GATE_RECORD_STREAK" --arg w "$_GATE_RECORD_WINDOW"
+      ;;
+    *)
+      fail "$E_USAGE" "usage: 5dive task track-record [on|off|status [<seat>]]"
+      ;;
+  esac
+}
+
 # DIVE-1145: ship-gating routing policy switch. `5dive task routing [on|off]`
 # (bare / `status` reports state). When ON, a NON-lead agent's decision gate
 # (tier < 2) routes to the org lead first (see cmd_task_need) instead of pinging
@@ -1372,6 +1421,144 @@ _gate_tapback_stats() {
   printf '%s' "$out"
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DIVE-3694 (ROADMAP #22) — AUTONOMY EARNED BY A MEASURED PER-FILER TRACK RECORD
+#
+# The claim: "when the asker has been right N times running, stop asking". It is
+# the successor to ROADMAP #20 (DIVE-3693 / `task precedent` above), which was
+# demoted because its mechanism keyed on the QUESTION repeating and the questions
+# do not repeat — 322 distinct decision ask_shapes over 333 answered decision
+# gates, so the strictest honest seed rule fires 0 of 204 tier-1 decision gates.
+# Wiki: community/wiki/precedent-needs-a-repeat-rate-not-an-acceptance-rate.md.
+#
+# What DOES transfer is a property of the RECOMMENDATION, not of the question:
+# over the 204 answered tier-1 decision gates carrying a --recommend that the
+# store holds (union of `tasks` + `gate_history`, 2026-07-21..2026-08-23),
+# **178 = 87.3%** came back as the answerer returning the filer's own
+# recommendation. So this keys on the FILER'S TRACK RECORD.
+#
+# THE POPULATION CORRECTION, and it is load-bearing — measure it before you read
+# the release note. Of those 204 tier-1 decision gates, **only 11 were answered
+# by a human at all**; 193 were answered by a ROUTED AGENT LEAD (DIVE-1145
+# builder-gate routing sends a tier<2 decision to the org lead first). Split:
+# agent-answered 169/193 = 87.6%, human-answered 9/11 = 81.8%. So promotion here
+# removes a LEAD ROUND-TRIP in ~19 of every 20 cases, not a human tap. That is
+# still the numerator of `1 - asks/shipped` and still real — an inbound a2a costs
+# the recipient a full context reload (projects/5dive/CLAUDE.md) — but the
+# feature must not be described as "stop asking the human". It is not.
+#
+# ATTRIBUTION IS DELIBERATELY NARROW. `gate_history` carries no filer column, so
+# a history row can only be attributed through its task's CURRENT
+# `tasks.gate_filed_by` — which is the wrong seat whenever a gate was re-filed by
+# someone else. An autonomy grant handed to a seat on ANOTHER seat's record is
+# the exact failure this feature cannot have, so the record reads `tasks` ONLY,
+# where the filer is stamped on the row that carries the answer. Measured cost of
+# that choice, by replay: union attribution would fire 33/204, tasks-only fires
+# 15/204. We take the smaller number.
+#
+# THE RATE IS COMPUTED STARTS-WITH, NEVER `=`. Answers are routinely the
+# recommendation plus commentary (`merge — ALREADY DONE`, `ship — verified in
+# source`), and equality undercounts the same population by ~11-19 points
+# (139/203 = 68.5% vs 177/203 = 87.2%). A threshold set against the equality
+# number would be set against a wrong number.
+#
+# DEMOTION IS THE LOAD-BEARING HALF. Promotion needs THREE things at once and
+# loses on any one of them: rate over the window, a minimum COUNT, and a clean
+# recent streak. The streak is what makes a reversal bite IMMEDIATELY — one
+# answer that does not return the recommendation lands at the head of the window
+# and the streak test fails on the very next gate, without waiting for the
+# windowed rate to drift. It stays failed until the seat has _GATE_RECORD_STREAK
+# fresh concordant answers again.
+#
+# An OVERTURN of an auto-applied gate is covered by the same query and needs no
+# second mechanism: this path never mints a human nonce and never claims a human
+# answered, so if a human or lead later answers that row, `need_answered_by`
+# becomes their stamp, the row enters the window like any other, and a
+# non-concordant overturn breaks the streak exactly as a fresh reversal does.
+#
+# ABSENCE OF A RECORD IS NEVER A GOOD RECORD. The count floor is checked before
+# the rate, and an unknown/empty filer returns "0 0 0" — a new seat is
+# un-promoted by construction, and every error path in the read below FAILS
+# CLOSED to that same value (the opposite posture from `_gate_tapback_stats`,
+# which fails OPEN because a measurement that cannot run must not become a block;
+# here a measurement that cannot run must not become a GRANT).
+_GATE_RECORD_WINDOW=20   # the seat's own last M answered tier-1 decision gates
+_GATE_RECORD_MIN=10      # below this there is no record, whatever the rate says
+_GATE_RECORD_RATE=85     # percent of the window that returned the recommendation
+_GATE_RECORD_STREAK=3    # most-recent answers that must ALL be concordant
+
+# _gate_record_stats <filer> -> "<concordant> <total> <streak_ok>"
+# Window: that seat's last _GATE_RECORD_WINDOW answered tier-1 `decision` gates
+# that carried a --recommend, newest first. `streak_ok` is 1 when the newest
+# _GATE_RECORD_STREAK of them are all concordant (and there are at least that
+# many). Prints "0 0 0" on any error or unknown seat — fail CLOSED.
+_gate_record_stats() {
+  local who="${1:-}" out=""
+  [[ -n "$who" ]] || { printf '0 0 0'; return 0; }
+  out=$(db "SELECT COALESCE(SUM(c),0)||' '||COUNT(*)||' '||
+        CASE WHEN COUNT(*) >= ${_GATE_RECORD_STREAK}
+              AND COALESCE(SUM(CASE WHEN rn <= ${_GATE_RECORD_STREAK} THEN c ELSE 0 END),0)
+                  = ${_GATE_RECORD_STREAK}
+             THEN 1 ELSE 0 END
+      FROM (
+        SELECT CASE WHEN lower(trim(need_answer))
+                         LIKE lower(trim(recommend)) || '%' THEN 1 ELSE 0 END AS c,
+               ROW_NUMBER() OVER (
+                 ORDER BY COALESCE(need_answered_at, need_asked_at, updated_at) DESC) AS rn
+        FROM tasks
+        WHERE gate_filed_by=$(sqlq "$who")
+          AND need_type='decision'
+          AND COALESCE(tier,2)=1
+          AND recommend IS NOT NULL AND trim(recommend) <> ''
+          AND need_answer IS NOT NULL AND trim(need_answer) <> ''
+          AND COALESCE(need_answered_by,'') NOT LIKE 'auto:%'
+        ORDER BY COALESCE(need_answered_at, need_asked_at, updated_at) DESC
+        LIMIT ${_GATE_RECORD_WINDOW});" 2>/dev/null) || out=""
+  [[ "$out" =~ ^[0-9]+\ [0-9]+\ [01]$ ]] || out='0 0 0'
+  printf '%s' "$out"
+}
+
+# _gate_record_promoted <filer> -> rc 0 when this seat is above threshold.
+# THE THREE TESTS ARE A CONJUNCTION and the order is the argument: count first
+# (no record beats a good rate over two gates), then the windowed rate, then the
+# recent streak. Any one failing leaves the gate on the normal routing path,
+# which is exactly today's behaviour.
+_gate_record_promoted() {
+  local c t s
+  read -r c t s <<<"$(_gate_record_stats "${1:-}")"
+  [[ "$t" =~ ^[0-9]+$ && "$c" =~ ^[0-9]+$ ]] || return 1
+  (( t >= _GATE_RECORD_MIN )) || return 1
+  (( t > 0 && (100 * c) / t >= _GATE_RECORD_RATE )) || return 1
+  [[ "$s" == "1" ]] || return 1
+  return 0
+}
+
+# _gate_record_line <filer> -> the one-line legibility string (scope item 4:
+# what my rate is, over how many, and what would revoke it). Shared by the
+# `task track-record` view and the auto-clear's own success message, so the two
+# cannot drift into describing different thresholds.
+_gate_record_line() {
+  local c t s pct
+  read -r c t s <<<"$(_gate_record_stats "${1:-}")"
+  if (( t == 0 )); then
+    printf 'no record yet (0 answered tier-1 decision gates with a recommendation) — un-promoted; a new seat always pings. Needs %d, at >=%d%%, with the last %d clean.' \
+      "$_GATE_RECORD_MIN" "$_GATE_RECORD_RATE" "$_GATE_RECORD_STREAK"
+    return 0
+  fi
+  pct=$(( (100 * c) / t ))
+  if _gate_record_promoted "${1:-}"; then
+    printf 'PROMOTED — %d/%d = %d%% of the last %d answered tier-1 decision gates returned this seat'"'"'s recommendation, last %d clean. Revoked by: ONE answer that does not return the recommendation (breaks the streak immediately), or the rate falling under %d%%, or the count under %d.' \
+      "$c" "$t" "$pct" "$t" "$_GATE_RECORD_STREAK" "$_GATE_RECORD_RATE" "$_GATE_RECORD_MIN"
+  else
+    local why=""
+    (( t >= _GATE_RECORD_MIN )) || why="count ${t} < ${_GATE_RECORD_MIN}"
+    if (( pct < _GATE_RECORD_RATE )); then why="${why:+${why}; }rate ${pct}% < ${_GATE_RECORD_RATE}%"; fi
+    [[ "$s" == "1" ]] || why="${why:+${why}; }last ${_GATE_RECORD_STREAK} not all concordant (a reversal demotes on the next gate)"
+    printf 'not promoted — %d/%d = %d%%; %s. Tier-1 decision gates from this seat route normally.' \
+      "$c" "$t" "$pct" "$why"
+  fi
+}
+
 cmd_task_need() {
   tasks_db_init
   local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw="" discusses="" needs="" oob="" rubber_stamp="" gate_mode=""
@@ -2460,7 +2647,7 @@ cmd_task_need() {
         "tapbacks=${_rs_taps}/${_rs_tot}" "reason=tier-2 with a recommendation and no declared capability" || true
       fail "$E_VALIDATION" "$ident: refusing this --tier=2 ${type} gate. You wrote --recommend=\"${recommend}\", which means you have already decided — what is left is asking a person to agree, and that is reassurance, not a gate. (Measured 2026-07-16..08-07: 96 of 107 judgment gates carrying a recommendation came back as the human tapping that same value. Only 7 gates in 346 were floored by category; the rest of tier 2 was typed by hand.) A tier is a CAPABILITY, not a difficulty. Your exits:
   --tier=0    apply \"${recommend}\" NOW. No ping, and still a permanent gate record plus a digest line. This is the exit you want on a decision you have already made — it was used 0 times in the 346 gates measured, which is a discoverability failure, not a missing feature.
-  --tier=1    route to your lead, or to this task's verifier if it carries a loop — except a push-for-review ask, which goes to the LEAD even on a loop, because the verifier cannot read the diff until it is pushed (DIVE-3117); the 48h TTL applies your recommendation if nobody answers, on a decision (NOT on approval/manual/access/secret, which the sweep excludes — DIVE-2235). Use it when you want a second pair of eyes, not a person's authority. DIVE-3481: an --type=approval ask that is an INERT branch push, on a row whose 'Branch:' binding names a non-protected ref, clears at filing instead and pings nobody (\`5dive task pfr-autoclear off\` restores the ping).
+  --tier=1    route to your lead, or to this task's verifier if it carries a loop — except a push-for-review ask, which goes to the LEAD even on a loop, because the verifier cannot read the diff until it is pushed (DIVE-3117); the 48h TTL applies your recommendation if nobody answers, on a decision (NOT on approval/manual/access/secret, which the sweep excludes — DIVE-2235). Use it when you want a second pair of eyes, not a person's authority. DIVE-3694: if YOUR OWN recent tier-1 decisions have been coming back as your recommendation (run \`5dive task track-record\` to see your rate, your count, and what would revoke it), this gate applies itself and pings nobody — one answer against you revokes that. DIVE-3481: an --type=approval ask that is an INERT branch push, on a row whose 'Branch:' binding names a non-protected ref, clears at filing instead and pings nobody (\`5dive task pfr-autoclear off\` restores the ping).
   --needs=human_tap|spend_authority|secret_provision    DECLARE the human-held capability this ask consumes (a person's call on brand/strategy, money, or a credential only a human can issue). Tier 2 by declaration, never refused here.
   --rubber-stamp-ok=\"<why a person must answer this despite your recommendation>\"    the audited exception. Recorded on the gate row and readable afterwards.
 If you cannot name the capability, this is a decision you find uncomfortable, not a human gate."
@@ -2889,6 +3076,88 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
           fi
         fi
       fi
+    fi
+  fi
+
+  # DIVE-3694 (ROADMAP #22) — PROMOTION ON A MEASURED TRACK RECORD.
+  #
+  # Placed HERE, after the tier-0 return, after the T2 floor, after the OSS-21
+  # precedent block and after the main gate write, for the same reason the
+  # precedent block is: it can only ever act on a gate that has ALREADY resolved
+  # to tier 1 by every rule that already existed. Nothing above changes.
+  #
+  # WHAT IS REFUSED, and these are refusals not deferrals (row scope):
+  #   * `approval`, `secret`, `manual` — human BY TYPE. `_gate_human_class` is
+  #     asserted directly rather than inferred from the tier, and the type is
+  #     pinned to `decision` on top of it. A track record is not a CAPABILITY: no
+  #     volume of prior yeses hands an agent a browser tap or spend authority
+  #     (the DIVE-2248 shape).
+  #   * every tier-2 gate — `tier==1` plus `tier_arg != 2` (an explicit
+  #     --tier=2 is the filer's hard-human contract, DIVE-1957) plus
+  #     `tier_floored == 0` (the money/destructive/public-comms subject floor).
+  #     Tier-2 means *an agent cannot*, not *an agent is unsure*.
+  #   * a DECLARED --needs=<capability> (DIVE-2241) — the honest hard gate.
+  #   * question-similarity matching. That is #20, measured to reach ~0, parked
+  #     on DIVE-3693. There is deliberately NO ask_shape read anywhere in this
+  #     block, and there must never be one: this row must not quietly re-acquire
+  #     the mechanism it was opened to replace.
+  #
+  # PROVENANCE IS MINTED, NOT SIDESTEPPED (DIVE-2004): 'auto:record', a value of
+  # its own, never confused with a human's tap (`human:*`), a lead's (`lead:*`),
+  # the TTL's (`auto:ttl`), tier-0's (`auto:t0`) or the push-for-review
+  # auto-clear's (`auto:pfr`). It is not `human:%`, so a loop approval can never
+  # be advanced through it (_task_loop_advance requires human:*), and
+  # `_gate_record_stats` excludes `auto:%` from its own window so an auto-apply
+  # can never feed the record that produced it.
+  #
+  # THE CITATION RIDES THE GATE. The record that licensed the clear is written to
+  # the audit row, the ledger detail and the success line, so a wrong auto-clear
+  # is findable by exactly the query that would have prevented it.
+  #
+  # REVERSIBLE WITHOUT A RELEASE: pref `track_record`, default ON — like
+  # `pfr_autoclear` and unlike `precedent_autoclear`, because this one IS the
+  # deliverable rather than an experiment. `5dive task track-record off` restores
+  # the pre-DIVE-3694 routing byte-for-byte.
+  local _tr_pref; _tr_pref=$(_task_pref_get track_record 2>/dev/null || printf '')
+  if [[ "${_tr_pref:-on}" != "off" && "$type" == "decision" && "$tier" == "1" \
+        && "$tier_floored" == "0" && "$tier_arg" != "2" && "$_needs_human" != "1" \
+        && "$gate_mode" != "confirm-after-send" && -n "$recommend_arg" ]] \
+     && ! _gate_human_class "$type" && _gate_record_promoted "$actor"; then
+    # The recommendation must still be ON THE MENU the filer published. A
+    # promoted seat is trusted about its own judgement, not licensed to apply an
+    # answer its own --options do not offer; an off-menu apply falls through to
+    # the normal route instead.
+    local _tr_ok=1
+    if [[ -n "$options" ]]; then
+      _tr_ok=$(printf '%s' "$options" | jq -Rr --arg r "$recommend_arg" '
+        [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ]
+        | (($r | gsub("^\\s+|\\s+$"; "")) as $rr | any(.[]; . == $rr)) | if . then "1" else "0" end' 2>/dev/null) || _tr_ok=0
+      [[ "$_tr_ok" == "1" ]] || _tr_ok=0
+    fi
+    if [[ "$_tr_ok" == "1" ]]; then
+      local _tr_c _tr_t _tr_s _tr_pct _tr_ts
+      read -r _tr_c _tr_t _tr_s <<<"$(_gate_record_stats "$actor")"
+      _tr_pct=$(( _tr_t > 0 ? (100 * _tr_c) / _tr_t : 0 ))
+      _tr_ts=$(date -u '+%Y-%m-%d %H:%M:%S')
+      db "UPDATE tasks SET need_answer=$(sqlq "$recommend_arg"), need_answered_at=$(sqlq "$_tr_ts"),
+            need_answered_by='auto:record', need_answered_uid=0
+          WHERE id=${id};
+          UPDATE tasks SET status='todo'
+            WHERE id=${id} AND status='blocked'
+              AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
+      # DIVE-2054: an auto-clear applied from task-store data — fenced on store
+      # identity, same primitive as the tier-0, TTL and pfr auto-clears.
+      _task_store_audit_log "task need record-auto" "ok" 0 -- \
+        "task=$ident" "type=$type" "filer=$actor" "applied=$recommend_arg" \
+        "record=${_tr_c}/${_tr_t}" "rate=${_tr_pct}" || true
+      ledger_emit gate.autocleared ident="$ident" task_id="$id" actor="$actor" \
+        policy="record:${type}" \
+        detail="tier-1 decision auto-applied on ${actor}'s track record (${_tr_c}/${_tr_t} = ${_tr_pct}%, last ${_GATE_RECORD_STREAK} clean) — applied: ${recommend_arg}" || true
+      ok "$ident tier-1 decision auto-cleared on your track record — applied: $recommend_arg (record: ${_tr_c}/${_tr_t} = ${_tr_pct}% of your last ${_tr_t} answered tier-1 decision gates returned your recommendation, last ${_GATE_RECORD_STREAK} clean; nobody was pinged, provenance auto:record). ONE answer against your recommendation revokes this. 5dive task track-record off restores the ping." \
+         '{id:($i|tonumber), ident:$id, tier:1, need_type:$ty, auto_applied:$rc, need_answered_by:"auto:record", record_concordant:($c|tonumber), record_total:($t|tonumber), record_rate:($p|tonumber)}' \
+         --arg i "$id" --arg id "$ident" --arg ty "$type" --arg rc "$recommend_arg" \
+         --arg c "$_tr_c" --arg t "$_tr_t" --arg p "$_tr_pct"
+      return
     fi
   fi
 
