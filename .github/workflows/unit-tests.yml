@@ -37,11 +37,49 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  # DIVE-3315: TWO INDEPENDENTLY-CAPPED SHARDS, not a bigger number. lodar's 300s
+  # stands; the core corpus does not fit under it any more. Measured on main
+  # 2026-08-11/12: 313s pristine against a 312s effective cap, with ~6% runner spread
+  # and the mutation-harness lever exhausted at ~7s available against ~13s needed
+  # (olivia's by-construction census, DIVE-3313). A cap breached by 1s on the draw of a
+  # runner presents as a flaky test and is not one.
+  #
+  # The cap is PER JOB (tests/lib/tier.sh), so two shards of ~157s each sit near 52% of
+  # the SAME 300s — the constraint is not relaxed, the corpus is split. Raising 300 to
+  # fit today's number would green the instrument instead of the thing it measures, and
+  # is explicitly out of scope on this row's parents.
+  #
+  # `${{ strategy.job-total }}` rather than a literal 2, for the reason full-sweep.yml
+  # gives: the shard count is the matrix length, spelled once, so adding a shard cannot
+  # leave the runner splitting the corpus a different number of ways than the matrix
+  # runs it. AGGREGATE capacity is now 2 x 300s and N is fixed here — adding a third
+  # shard is exactly as visible, and exactly as much a policy decision, as raising the
+  # number would have been.
+  #
+  # AND THE UN-SHARDED TOTAL IS STILL PRINTED, by `core-budget-report` below: sharding
+  # is the obvious way to lose the number this whole scheme exists to surface. Two jobs
+  # reporting 157s read as comfortable while the corpus still costs 313s. Per-shard is
+  # what the budget ENFORCES; the un-sharded total is what the trend is READ from, and
+  # it is deliberately wired to no failure — an enforced sum would put the corpus right
+  # back at 313 > 300 on day one and the split would have fixed nothing.
+  #
+  # WHY THIS JOB IS NO LONGER CALLED `test`. `test` is a REQUIRED status check on main
+  # (branch protection: test, test-installed-host, test-confirm,
+  # test-installed-host-confirm). A matrix job reports as `test (1)` / `test (2)`, so
+  # the context `test` would never report again and every PR would wait forever on a
+  # check that cannot arrive. So the required names survive as thin AGGREGATOR jobs that
+  # assert their shards' results, and the sharded work sits under new names. That also
+  # means a future shard-count change needs no branch-protection edit — the contract
+  # with the merge gate is the aggregator's name, not the corpus's shape.
+  # tests/corpus_tier_budget_unit.sh pins the four names against a rename.
+  core-pristine:
     runs-on: ubuntu-latest
-    outputs:
-      needs_confirm: ${{ steps.core.outputs.needs_confirm }}
-      runner_id: ${{ steps.core.outputs.runner_id }}
+    strategy:
+      # fail-fast: false — one shard over its cap must not cancel the other. The
+      # un-sharded total is re-summed from the shards' reports, and a cancelled shard
+      # is a hole in exactly the number this row exists to keep legible.
+      fail-fast: false
+      matrix: { shard: [1, 2] }
     steps:
       # DIVE-2229: fetch-depth is load-bearing, not hygiene. actions/checkout@v4
       # defaults to depth 1, and the harnesses below anchor "what this code did
@@ -91,34 +129,48 @@ jobs:
       # a second box does, and on GitHub-hosted runners every job is its own
       # ephemeral VM, so `needs:` + a fresh job IS a second box. One-sided: this can
       # only turn a 4 into a 6, never a green into a red.
-      - name: Run core harnesses (budgeted)
+      - name: Run core harnesses (budgeted, shard ${{ matrix.shard }})
         id: core
         run: |
-          rid="${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          echo "runner_id=$rid" >> "$GITHUB_OUTPUT"
+          # The runner id names a BOX. Both shards run under the same ${GITHUB_JOB}, so
+          # the shard index is part of the id or the two ids collide and a shard could
+          # "confirm" itself — the DIVE-2829 comparison is an equality test on this
+          # string and nothing else.
+          rid="${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-s${{ matrix.shard }}"
           set +e
-          bash scripts/run-harnesses.sh --tier=core --label=pristine \
-            --report=core-pristine.txt --cross-runner=required --runner-id="$rid"
+          bash scripts/run-harnesses.sh --tier=core \
+            --shard=${{ matrix.shard }}/${{ strategy.job-total }} \
+            --label=pristine --report=core-pristine-${{ matrix.shard }}.txt \
+            --cross-runner=required --runner-id="$rid"
           rc=$?
           set -e
           # HAND OFF ONLY THE CROSS-RUNNER 6, never the calibration one. Exit 6 has two
           # producers and they are not the same event: `undetermined=0` in the report
           # with rc 6 is this row's gate, and anything else keeps the red it always had.
-          if [ "$rc" = 6 ] && grep -q '^# undetermined=0' core-pristine.txt \
-             && ! grep -q '^# cross_runner_state=confirmed' core-pristine.txt; then
-            echo "needs_confirm=1" >> "$GITHUB_OUTPUT"
-            exit 0
+          #
+          # DIVE-3315: the hand-off travels as a FILE, not as a job output. Matrix legs
+          # share one `outputs` map and the last leg to finish wins it, so shard 2
+          # finishing green would silently erase shard 1's "I went over" — a budget red
+          # dropped by the machinery built to stop exactly that. `core-confirm-plan`
+          # reads these verdicts back and fails closed on a missing one.
+          nc=0
+          if [ "$rc" = 6 ] && grep -q '^# undetermined=0' core-pristine-${{ matrix.shard }}.txt \
+             && ! grep -q '^# cross_runner_state=confirmed' core-pristine-${{ matrix.shard }}.txt; then
+            nc=1
           fi
+          printf 'shard=%s\nshards=%s\nneeds_confirm=%s\nrunner_id=%s\n' \
+            '${{ matrix.shard }}' '${{ strategy.job-total }}' "$nc" "$rid" \
+            > core-verdict-pristine-${{ matrix.shard }}.txt
+          if [ "$nc" = 1 ]; then exit 0; fi
           exit "$rc"
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: core-pristine, path: core-pristine.txt, if-no-files-found: warn }
-      # DIVE-3017: the bun step above is a DECLARATION and a succeeding declaration
-      # was already shown not to imply a graded harness. This reads the outcome back
-      # out of the report just written: rc=0 AND seconds-scale, which together are
-      # satisfied only by the ACP stdio scenarios having actually run.
-      - name: The ACP server must have been GRADED (pristine)
-        run: bash tests/meta/harness-graded-union.sh --harness=acp_stdio_unit.sh --min-ms=1000 core-pristine.txt
+        with:
+          name: "core-pristine-${{ matrix.shard }}"
+          path: |
+            core-pristine-${{ matrix.shard }}.txt
+            core-verdict-pristine-${{ matrix.shard }}.txt
+          if-no-files-found: warn
 
   # DIVE-1919: the bare runner above is a PRISTINE box — no /var/lib/5dive, no
   # installed plugins. That is NOT the environment any agent actually runs the
@@ -144,6 +196,34 @@ jobs:
   # the core jobs never ran, so there is no clean-green baseline in this workflow to
   # assume. The probe does its own clean run for the few files named, which is what
   # makes that flag unnecessary rather than merely omitted.
+  # DIVE-3479: THE GUARD RUNS ON THE PATH IT GUARDS.
+  #
+  # `tests/corpus_tier_budget_unit.sh` carries the DIVE-3315 arms that grade THIS FILE's
+  # structure — the required check names, the aggregators' fail-closed shape, the un-sharded
+  # total being emitted and graded, and the pinned core shard count. It is `TIER: nightly`,
+  # and `changed-harnesses` below selects harnesses by the diff's `tests/*.sh`. So a
+  # WORKFLOW-ONLY edit — exactly the shape of the `[1, 2] -> [1, 2, 3]` capacity change those
+  # arms exist to stop — ran none of them on any PR job, and reached CI only on the nightly
+  # union, within a day, after the merge.
+  #
+  # Not promoted out of `nightly` to fix that: 41.4s (run 30988600395) inside the core tier
+  # would spend 14% of one shard's 300s cap grading the cap, in the tier DIVE-2525/3315 are
+  # shrinking. Here it is 41.4s on a parallel runner, off the ~300s critical path, and zero
+  # against TIER_BUDGET_CORE.
+  #
+  # UNCONDITIONAL on purpose: a `paths:` filter would make this `skipped` on most PRs, and the
+  # aggregators below fail closed on anything that is not `success`. The arm that keeps this
+  # job wired (99, in the harness itself) asserts it carries no `if:` for that reason.
+  workflow-structure-guards:
+    runs-on: ubuntu-latest
+    # The harness reads files and parses YAML; it builds nothing and runs no corpus. Measured
+    # 67s on the shared control-plane box, 41.4s on a CI runner.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Grade this workflow's own structure (DIVE-3315 arms, DIVE-3479 arm 99)
+        run: bash tests/corpus_tier_budget_unit.sh
+
   changed-harnesses:
     runs-on: ubuntu-latest
     # This job's cost is set by the DIFF, not by the corpus, so it has no budget of
@@ -234,6 +314,39 @@ jobs:
         run: |
           bash tests/meta/harness-verdict-probe.sh \
             --only='${{ steps.changed.outputs.names }}' --label=changed
+      # DIVE-3679: and the probe's INJECTION POINT must be at top level. This is the
+      # static complement to the step above, and it is deliberately NOT the guard
+      # DIVE-3678 proposed. That one would have red-ed a touched harness reported
+      # `not-reached` "in every environment this lane can offer" — and this lane offers
+      # ONE `ubuntu-latest` runner, so the quantifier collapses to "not-reached in one
+      # pristine run". That is exactly the DIVE-2039 false accusation, aimed at every
+      # harness whose verdict is legitimately reachable only on an installed host. The
+      # union consumes SEVEN reports across two real environments for precisely that
+      # reason; a single lane cannot make a cross-environment claim, and adding an
+      # installed-host job here would make N=2 against a union of 7 and only move the
+      # boundary.
+      #
+      # What IS decidable in one environment is the static property: `head -n $((n-1))
+      # | bash -n` — bash's own parser saying whether the position the probe injects
+      # into is a complete program. It accuses nobody for skipping.
+      #
+      # WARN-ONLY, on this row's own instruction, until the two negative-control arms
+      # have been READ on DIVE-3679 rather than merely run by its author. To enforce,
+      # add `--enforce` to the line below and nothing else; the guard already exits 1
+      # on a violation under that flag, and it exits 1 REGARDLESS of the flag if its
+      # own selector resolves to nothing (a check reporting clean on what it never
+      # looked at is the hole, not the finding).
+      #
+      # Measured before shipping, on origin/main at 07a4345: 444 harnesses, 441 top
+      # level, 0 violations, 3 with neither probe family (exactly the probe's
+      # ALLOW_UNPROBEABLE list). Controls: buzz_preseed_dm_live.sh at 07a4345^ reds;
+      # the same harness at 07a4345 — live-only, skips in every pristine lane — is
+      # green.
+      - name: The probe's injection point must be at TOP LEVEL (static, DIVE-3679)
+        if: steps.changed.outputs.names != ''
+        run: |
+          bash tests/meta/harness-verdict-toplevel.sh \
+            --only='${{ steps.changed.outputs.names }}' --label=changed
 
   # DIVE-2525: this job used to open with the harness-verdict PROBE (DIVE-2013),
   # which runs the whole corpus a SECOND time — the single most expensive thing on
@@ -276,11 +389,18 @@ jobs:
         if: always()
         with: { name: selfcheck-pristine, path: selfcheck-pristine.txt, if-no-files-found: error }
 
-  test-installed-host:
+  # DIVE-3315: sharded on the same terms as `core-pristine` — see the comment there.
+  # This environment is the slower of the two (real sudo, seeded host state) and it is
+  # the one whose 313s reading forced this row, so it gets the same two independently
+  # capped jobs and the same 300s per job. The rails prover that used to live at the
+  # bottom of this job moved to `rails-installed-host`: it is not the corpus, it would
+  # have run once per shard for no gain, and two shards uploading one artifact name is
+  # a hard error in upload-artifact@v4.
+  core-installed-host:
     runs-on: ubuntu-latest
-    outputs:
-      needs_confirm: ${{ steps.core.outputs.needs_confirm }}
-      runner_id: ${{ steps.core.outputs.runner_id }}
+    strategy:
+      fail-fast: false
+      matrix: { shard: [1, 2] }
     steps:
       # DIVE-2229: full history — pinned baselines must resolve here too.
       - uses: actions/checkout@v4
@@ -318,28 +438,52 @@ jobs:
         uses: oven-sh/setup-bun@v2
       # DIVE-2829: see the pristine job. This is the job the 2026-08-05 pair was
       # measured on, and the one whose red froze release-cut.yml.
-      - name: Run core harnesses (installed host, budgeted)
+      - name: Run core harnesses (installed host, budgeted, shard ${{ matrix.shard }})
         id: core
         run: |
-          rid="${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          echo "runner_id=$rid" >> "$GITHUB_OUTPUT"
+          rid="${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-s${{ matrix.shard }}"
           set +e
-          bash scripts/run-harnesses.sh --tier=core --label=installed-host \
-            --report=core-installed.txt --cross-runner=required --runner-id="$rid"
+          bash scripts/run-harnesses.sh --tier=core \
+            --shard=${{ matrix.shard }}/${{ strategy.job-total }} \
+            --label=installed-host --report=core-installed-${{ matrix.shard }}.txt \
+            --cross-runner=required --runner-id="$rid"
           rc=$?
           set -e
-          if [ "$rc" = 6 ] && grep -q '^# undetermined=0' core-installed.txt \
-             && ! grep -q '^# cross_runner_state=confirmed' core-installed.txt; then
-            echo "needs_confirm=1" >> "$GITHUB_OUTPUT"
-            exit 0
+          # DIVE-3315: verdict as a FILE, never a matrix job output — see the pristine
+          # job for why a shared outputs map drops one shard's budget red on the floor.
+          nc=0
+          if [ "$rc" = 6 ] && grep -q '^# undetermined=0' core-installed-${{ matrix.shard }}.txt \
+             && ! grep -q '^# cross_runner_state=confirmed' core-installed-${{ matrix.shard }}.txt; then
+            nc=1
           fi
+          printf 'shard=%s\nshards=%s\nneeds_confirm=%s\nrunner_id=%s\n' \
+            '${{ matrix.shard }}' '${{ strategy.job-total }}' "$nc" "$rid" \
+            > core-verdict-installed-${{ matrix.shard }}.txt
+          if [ "$nc" = 1 ]; then exit 0; fi
           exit "$rc"
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: core-installed, path: core-installed.txt, if-no-files-found: warn }
-      # DIVE-3017: same outcome assertion as the pristine job — see the comment there.
-      - name: The ACP server must have been GRADED (installed host)
-        run: bash tests/meta/harness-graded-union.sh --harness=acp_stdio_unit.sh --min-ms=1000 core-installed.txt
+        with:
+          name: "core-installed-${{ matrix.shard }}"
+          path: |
+            core-installed-${{ matrix.shard }}.txt
+            core-verdict-installed-${{ matrix.shard }}.txt
+          if-no-files-found: warn
+  # DIVE-3315: the rails prover, lifted OUT of the (now sharded) corpus job unchanged.
+  # It grades the shipped rails, not the corpus, so it has nothing to do with the budget
+  # and every reason not to run twice. It stays inside what the merge gate covers: the
+  # `test-installed-host` aggregator requires THIS job green as well as both shards, so
+  # moving these steps did not shrink the required check that used to contain them.
+  rails-installed-host:
+    runs-on: ubuntu-latest
+    steps:
+      # DIVE-2229: full history — pinned baselines must resolve here too.
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      # DIVE-2829: the same seeding script the corpus jobs use, for the same reason —
+      # two copies of a setup block are two environments as soon as one is edited.
+      - name: Simulate a box with 5dive installed
+        run: bash .github/scripts/simulate-installed-host.sh
       # DIVE-2039: TWICE, and that is the point. DIVE-1989 stayed invisible for as
       # long as the audit log was measured from one side — the same command wrote 0
       # rows as an agent and 1 row under sudo. `audit-root` is honestly NOT-REACHED
@@ -372,7 +516,7 @@ jobs:
   # exactly, which is why it is closed here on day one instead of after it bites.
   selfcheck-union:
     runs-on: ubuntu-latest
-    needs: [rails-pristine, test-installed-host]
+    needs: [rails-pristine, rails-installed-host]
     steps:
       # DIVE-2229: full history — pinned baselines must resolve here too.
       - uses: actions/checkout@v4
@@ -399,10 +543,22 @@ jobs:
   # --prior-over-runner, and the run exits 4 with the corpus finding restored. Inside
   # the cap here and the first sample was the runner, which is what happened on
   # 828c1ea: 416s then 245s, and only the 416s was ever acted on.
-  test-confirm:
-    needs: test
-    if: needs.test.outputs.needs_confirm == '1'
+  core-pristine-confirm:
+    needs: core-confirm-plan
+    # A shard confirms a shard. The plan job emits one entry per over-budget shard,
+    # carrying that shard's index, the divisor it was split by, and the runner id that
+    # went over — so the second box measures THE SAME SUBSET the first one did. An
+    # empty list means no shard went over and this job does not exist for that run.
+    # The plan's RESULT is tested as well as its output. A plan that failed closed on a
+    # missing verdict emits no output at all, and an empty string is not '[]' — without
+    # this, the reason no confirmation ran would surface as an empty-matrix YAML error
+    # instead of the refusal the plan job printed.
+    if: needs['core-confirm-plan'].result == 'success' && needs['core-confirm-plan'].outputs.pristine != '[]'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs['core-confirm-plan'].outputs.pristine) }}
     steps:
       # DIVE-2229: full history — pinned baselines must resolve here too.
       - uses: actions/checkout@v4
@@ -413,24 +569,65 @@ jobs:
       # without bun, so every job that runs the corpus needs this step.
       - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
         uses: oven-sh/setup-bun@v2
+      # DIVE-3580: the second box's verdict is only independent of the first while the
+      # fleet's draw is — and on #708 it was not: both runners confirmed a red that
+      # main's own next run of the SAME corpus refuted at 77% of cap. So the confirm
+      # run is handed the last GREEN main run's per-harness reports, and an over-budget
+      # total it can pin on a UNIFORM lift across unrelated files resolves as exit 6
+      # with budget_attribution=runner — no corpus finding — instead of exit 4. Fetch
+      # failure disarms the relief and changes nothing else (the script says so).
+      - name: Fetch the last green main run's per-harness baseline (DIVE-3580)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/fetch-budget-baseline.sh pristine
       - name: Confirm the budget red on a SECOND runner (DIVE-2829)
         run: |
-          bash scripts/run-harnesses.sh --tier=core --label=pristine-confirm \
-            --report=core-pristine-confirm.txt --cross-runner=required \
-            --runner-id="${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
-            --prior-over-runner="${{ needs.test.outputs.runner_id }}"
+          args=()
+          for f in baseline-reports/core-pristine-[0-9]*.txt; do
+            [ -r "$f" ] && args+=("--baseline-report=$f")
+          done
+          set +e
+          bash scripts/run-harnesses.sh --tier=core \
+            --shard=${{ matrix.shard }}/${{ matrix.shards }} \
+            --label=pristine-confirm \
+            --report=core-pristine-confirm-${{ matrix.shard }}.txt --cross-runner=required \
+            --runner-id="${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-s${{ matrix.shard }}" \
+            --prior-over-runner="${{ matrix.prior }}" "${args[@]}"
+          rc=$?
+          set -e
+          # DIVE-3580: HAND OFF ONLY THE ATTRIBUTED 6 — the exact grep discipline the
+          # first-box jobs apply to the cross-runner 6, because exit 6 has three
+          # producers here (calibration undetermined, cross-runner — impossible on this
+          # job, and attribution) and only the attributed one has POSITIVE evidence
+          # that the red is the box. A calibration 6 keeps the red it always had.
+          if [ "$rc" = 6 ] && grep -q '^# budget_attribution=runner$' core-pristine-confirm-${{ matrix.shard }}.txt; then
+            echo "budget red ATTRIBUTED TO THE RUNNER against the last green main run — no corpus finding; not blocking (DIVE-3580)."
+            exit 0
+          fi
+          exit "$rc"
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: core-pristine-confirm, path: core-pristine-confirm.txt, if-no-files-found: warn }
+        with:
+          name: "core-pristine-confirm-${{ matrix.shard }}"
+          path: "core-pristine-confirm-${{ matrix.shard }}.txt"
+          if-no-files-found: warn
 
   # DIVE-2829: the same second box for the installed-host tier. It seeds the
   # environment from the SAME script the first job used, which is the whole reason
   # that script exists — a confirmation taken in a different environment confirms a
   # different question.
-  test-installed-host-confirm:
-    needs: test-installed-host
-    if: needs.test-installed-host.outputs.needs_confirm == '1'
+  core-installed-host-confirm:
+    needs: core-confirm-plan
+    # The plan's RESULT is tested as well as its output. A plan that failed closed on a
+    # missing verdict emits no output at all, and an empty string is not '[]' — without
+    # this, the reason no confirmation ran would surface as an empty-matrix YAML error
+    # instead of the refusal the plan job printed.
+    if: needs['core-confirm-plan'].result == 'success' && needs['core-confirm-plan'].outputs.installed != '[]'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs['core-confirm-plan'].outputs.installed) }}
     steps:
       # DIVE-2229: full history — pinned baselines must resolve here too.
       - uses: actions/checkout@v4
@@ -443,12 +640,512 @@ jobs:
       # without bun, so every job that runs the corpus needs this step.
       - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
         uses: oven-sh/setup-bun@v2
+      # DIVE-3580: same baseline, same hand-off discipline — see the pristine confirm job.
+      - name: Fetch the last green main run's per-harness baseline (DIVE-3580)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/fetch-budget-baseline.sh installed
       - name: Confirm the budget red on a SECOND runner (DIVE-2829)
         run: |
-          bash scripts/run-harnesses.sh --tier=core --label=installed-host-confirm \
-            --report=core-installed-confirm.txt --cross-runner=required \
-            --runner-id="${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
-            --prior-over-runner="${{ needs.test-installed-host.outputs.runner_id }}"
+          args=()
+          for f in baseline-reports/core-installed-[0-9]*.txt; do
+            [ -r "$f" ] && args+=("--baseline-report=$f")
+          done
+          set +e
+          bash scripts/run-harnesses.sh --tier=core \
+            --shard=${{ matrix.shard }}/${{ matrix.shards }} \
+            --label=installed-host-confirm \
+            --report=core-installed-confirm-${{ matrix.shard }}.txt --cross-runner=required \
+            --runner-id="${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-s${{ matrix.shard }}" \
+            --prior-over-runner="${{ matrix.prior }}" "${args[@]}"
+          rc=$?
+          set -e
+          if [ "$rc" = 6 ] && grep -q '^# budget_attribution=runner$' core-installed-confirm-${{ matrix.shard }}.txt; then
+            echo "budget red ATTRIBUTED TO THE RUNNER against the last green main run — no corpus finding; not blocking (DIVE-3580)."
+            exit 0
+          fi
+          exit "$rc"
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: core-installed-confirm, path: core-installed-confirm.txt, if-no-files-found: warn }
+        with:
+          name: "core-installed-confirm-${{ matrix.shard }}"
+          path: "core-installed-confirm-${{ matrix.shard }}.txt"
+          if-no-files-found: warn
+
+  # DIVE-3315: WHICH SHARD, IF ANY, NEEDS A SECOND BOX — decided from the verdict files
+  # the shards uploaded, because a matrix cannot hand this up any other way. Matrix legs
+  # share one `outputs` map and the last leg to finish wins it, so the obvious version of
+  # the DIVE-2829 rail loses shard 1's over-budget verdict whenever shard 2 finishes
+  # green: a budget red silently downgraded by the machinery built to stop that exact
+  # thing. Reading it back out of the artifact of record cannot be raced.
+  #
+  # IT FAILS CLOSED. A verdict file that is missing is not a shard that came in under its
+  # cap — it is a shard nobody has a reading for, and "nobody said they went over" must
+  # not resolve to "nobody went over". That refusal is the whole reason this job exists
+  # rather than the confirm jobs each grepping for their own marker.
+  core-confirm-plan:
+    runs-on: ubuntu-latest
+    needs: [core-pristine, core-installed-host]
+    # if: always() — a shard that reds on a FAILING harness (rc 1) still wrote a verdict,
+    # and the confirm rail has to be decided for the other shard regardless.
+    if: always()
+    outputs:
+      pristine: ${{ steps.plan.outputs.pristine }}
+      installed: ${{ steps.plan.outputs.installed }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { pattern: 'core-*', merge-multiple: true }
+      - name: Which shards went over their cap on their FIRST box?
+        id: plan
+        run: |
+          set -euo pipefail
+          plan() {   # <env> -> "<env>=[{shard,shards,prior}...]" into $GITHUB_OUTPUT
+            local env="$1" n i f rid joined="" ; local -a entries=()
+            # THE DIVISOR COMES FROM THE RUNNER'S OWN VERDICT, not from a second copy of
+            # the matrix length written here. A divisor spelled twice is a divisor that
+            # drifts, and this one decides which subset the confirming box measures — a
+            # confirmation of a different subset confirms a different question.
+            n="$(sed -n 's/^shards=//p' core-verdict-"$env"-*.txt 2>/dev/null | sort -rn | head -1 || true)"
+            if [[ -z "$n" ]]; then
+              printf 'core-confirm-plan: BLOCKED — not one %s shard left a verdict file. "Nobody reported going over" is not "nobody went over".\n' "$env" >&2
+              return 1
+            fi
+            for (( i = 1; i <= n; i++ )); do
+              f="core-verdict-$env-$i.txt"
+              if [[ ! -r "$f" ]]; then
+                printf 'core-confirm-plan: BLOCKED — %s is missing. A shard with no reading is not a shard inside its cap.\n' "$f" >&2
+                return 1
+              fi
+              if grep -qx 'needs_confirm=1' "$f"; then
+                rid="$(sed -n 's/^runner_id=//p' "$f" | head -1)"
+                entries+=("{\"shard\":$i,\"shards\":$n,\"prior\":\"$rid\"}")
+              fi
+            done
+            if (( ${#entries[@]} > 0 )); then joined="$(IFS=,; printf '%s' "${entries[*]}")"; fi
+            printf '%s=[%s]\n' "$env" "$joined" >> "$GITHUB_OUTPUT"
+            printf '%s (of %s shards): [%s]\n' "$env" "$n" "$joined"
+          }
+          plan pristine
+          plan installed
+
+  # DIVE-3017, one level out: the ACP grade is now a UNION OVER THE SHARDS, because
+  # acp_stdio_unit.sh lands in exactly one of them and the other shard's report cannot
+  # contain it. Per-shard, the assertion would red the shard that does not own the file —
+  # so the invariant moves to where the whole environment's rows are visible, exactly as
+  # full-sweep.yml does it.
+  #
+  # THE REPORTS ARE NAMED, NOT GLOBBED, and one job per environment: a shard that died
+  # has to red this rather than quietly reduce the union it is checked against, and a
+  # pass in one environment must not cover for the other going ungraded. A third shard
+  # added without extending this list reds it too (the file it owns would be absent from
+  # the union) — the fail-closed direction.
+  acp-graded-pristine:
+    runs-on: ubuntu-latest
+    needs: core-pristine
+    steps:
+      # DIVE-2229: full history, like every other checkout in this file.
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/download-artifact@v4
+        with: { pattern: 'core-pristine-*', merge-multiple: true }
+      - name: The ACP server must have been GRADED (pristine)
+        run: |
+          bash tests/meta/harness-graded-union.sh --harness=acp_stdio_unit.sh --min-ms=1000 \
+            core-pristine-1.txt core-pristine-2.txt
+
+  acp-graded-installed:
+    runs-on: ubuntu-latest
+    needs: core-installed-host
+    steps:
+      # DIVE-2229: full history, like every other checkout in this file.
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/download-artifact@v4
+        with: { pattern: 'core-installed-*', merge-multiple: true }
+      - name: The ACP server must have been GRADED (installed host)
+        run: |
+          bash tests/meta/harness-graded-union.sh --harness=acp_stdio_unit.sh --min-ms=1000 \
+            core-installed-1.txt core-installed-2.txt
+
+  # DIVE-3315: THE FOUR REQUIRED CHECKS, kept by NAME. `test`, `test-installed-host`,
+  # `test-confirm` and `test-installed-host-confirm` are required status checks on main.
+  # A matrix job reports as `test (1)` / `test (2)`, so sharding under the old names would
+  # leave the required context unable to ever report and every PR waiting on a check that
+  # cannot arrive. These four jobs keep the names and assert the sharded work instead, so
+  # the merge gate's contract is a NAME and not the corpus's shape — a future shard-count
+  # change needs no branch-protection edit.
+  #
+  # `if: always()` plus an EXPLICIT result comparison, never a bare `needs:`. A job whose
+  # dependency failed is SKIPPED, and GitHub treats a skipped required check as satisfied
+  # — so the obvious one-line version of these jobs passes the merge gate in precisely the
+  # case where the corpus went red. Anything that is not `success` fails here, `skipped`
+  # and `cancelled` included.
+  test:
+    # core-total-produced is in here on purpose, and it is why this check waits on the
+    # installed-host shards too: the honesty instrument being ALIVE is part of what the merge
+    # gate covers, and a job nothing requires is a job that can go red for a week.
+    needs: [core-pristine, acp-graded-pristine, core-total-produced, workflow-structure-guards]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Both pristine shards, the ACP grade over their union, and the workflow's own structure must be green
+        run: |
+          rc=0
+          for d in "core-pristine=${{ needs['core-pristine'].result }}" \
+                   "acp-graded-pristine=${{ needs['acp-graded-pristine'].result }}" \
+                   "core-total-produced=${{ needs['core-total-produced'].result }}" \
+                   "workflow-structure-guards=${{ needs['workflow-structure-guards'].result }}"; do
+            printf '%s\n' "$d"
+            [ "${d#*=}" = success ] || rc=1
+          done
+          exit "$rc"
+
+  test-installed-host:
+    needs: [core-installed-host, rails-installed-host, acp-graded-installed, core-total-produced, workflow-structure-guards]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      # rails-installed-host is in here because those steps USED to be in the job this
+      # check is named after. Dropping it would have shrunk the required check silently,
+      # which is the same defect as sharding it away.
+      - name: Both installed-host shards, the rails prover and the ACP grade must be green
+        run: |
+          rc=0
+          for d in "core-installed-host=${{ needs['core-installed-host'].result }}" \
+                   "rails-installed-host=${{ needs['rails-installed-host'].result }}" \
+                   "acp-graded-installed=${{ needs['acp-graded-installed'].result }}" \
+                   "core-total-produced=${{ needs['core-total-produced'].result }}" \
+                   "workflow-structure-guards=${{ needs['workflow-structure-guards'].result }}"; do
+            printf '%s\n' "$d"
+            [ "${d#*=}" = success ] || rc=1
+          done
+          exit "$rc"
+
+  test-confirm:
+    needs: [core-confirm-plan, core-pristine-confirm]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: A second box's verdict, or a plan that proved none was needed
+        run: |
+          plan='${{ needs['core-confirm-plan'].result }}'
+          conf='${{ needs['core-pristine-confirm'].result }}'
+          printf 'core-confirm-plan=%s core-pristine-confirm=%s\n' "$plan" "$conf"
+          # The plan job is the thing that fails closed on a shard with no reading, so
+          # `skipped` here must not read as "no confirmation was needed".
+          [ "$plan" = success ] || exit 1
+          # `skipped` is the good case and the common one: no shard went over its cap, so
+          # no second box was spawned. Anything else is a confirmation that did not confirm.
+          case "$conf" in success|skipped) exit 0 ;; *) exit 1 ;; esac
+
+  test-installed-host-confirm:
+    needs: [core-confirm-plan, core-installed-host-confirm]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: A second box's verdict, or a plan that proved none was needed
+        run: |
+          plan='${{ needs['core-confirm-plan'].result }}'
+          conf='${{ needs['core-installed-host-confirm'].result }}'
+          printf 'core-confirm-plan=%s core-installed-host-confirm=%s\n' "$plan" "$conf"
+          [ "$plan" = success ] || exit 1
+          case "$conf" in success|skipped) exit 0 ;; *) exit 1 ;; esac
+
+  # DIVE-3315: THE UN-SHARDED TOTAL, PRINTED EVERY RUN AND WIRED TO NOTHING.
+  #
+  # This is the honesty condition of the split, and it is the half that is easy to
+  # implement backwards. Two shards reporting 157s each read as comfortable while the
+  # corpus still costs 313s: sharding is the obvious way to lose the number the whole
+  # tier scheme exists to surface. Per-shard is what the budget ENFORCES; the re-summed
+  # total is what the TREND is read from, and it belongs on the page either way.
+  #
+  # AND IT MUST NOT GATE. If the sum were held to the 300s per-job cap the corpus would
+  # read 313 > 300 on day one and the split would have fixed nothing — the number is an
+  # instrument, not a second budget. So this job exits 0 on every path, deliberately, and
+  # is required by nothing. The figure that does gate is per-shard, in the shards.
+  #
+  # DIVE-2592's legible form, not a raw ratio: the total in units of the POLICY DIAL, as
+  # the MINIMUM number of shards this corpus now needs. When that reaches the configured
+  # count, adding one is the decision on the table and it is exactly as visible as raising
+  # the ceiling would have been.
+  #
+  # if: always() — the run worth summarising most is the one that went over.
+  core-budget-report:
+    runs-on: ubuntu-latest
+    needs: [core-pristine, core-installed-host]
+    if: always()
+    steps:
+      # DIVE-3477: this job now needs the repo, because the growth metric's reference
+      # constant lives in tests/lib/tier.sh beside the tier definition -- a reference
+      # spelled here would be moved by a one-line edit in a file nobody reviews as the
+      # policy change it is, which is the rule --budget and --cal-us already follow.
+      # CHECKOUT FIRST: the artifacts below are downloaded into the working directory.
+      # fetch-depth: 0 like every other checkout in this file -- DIVE-2229's rule is
+      # whole-file, and `tests/baseline_pin_unit.sh` grades it per STEP, so a depth-1
+      # checkout here reds that harness whether or not this job resolves a pinned commit.
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/download-artifact@v4
+        with: { pattern: 'core-*', merge-multiple: true }
+      - name: Re-sum the shards and print the UN-SHARDED core total
+        run: |
+          # DIVE-3477: the growth reference, from beside the tier definition.
+          . tests/lib/tier.sh
+          total_row() {   # <label> <glob>
+            # DIVE-3315 (quinn, grading this row's own PR): the table is for a HUMAN and
+            # cannot be graded. This function also emits ONE machine-readable line per
+            # environment into an artifact, which is the object `core-total-produced` grades:
+            #
+            #   unsharded_total_s <environment> <total_s> <harnesses> <shards_reporting>
+            #
+            # Emitted from the same variables the table is printed from, so a table that
+            # reads empty cannot leave the line looking healthy.
+            local label="$1" pat="$2" n=0 s=0 b=0 shards=0 f need=0 draws=""
+            for f in $pat; do
+              [[ -r "$f" ]] || continue
+              shards=$(( shards + 1 ))
+              n=$(( n + $(sed -n 's/^# harnesses=//p' "$f" | head -1) ))
+              s=$(( s + $(sed -n 's/^# wall_clock_s=//p' "$f" | head -1) ))
+              b=$(sed -n 's/^# budget_s=//p' "$f" | head -1)
+              # DIVE-3477: the UNCLAMPED draw, which is the one that says what box this
+              # shard ran on. cal_scale_pct_applied has already been floored at 100 by
+              # policy, so it cannot describe a fast runner and is the wrong field here.
+              draws="${draws:+$draws,}$(sed -n 's/^# cal_scale_pct=//p' "$f" | head -1)"
+            done
+            # A missing shard is not a smaller corpus. Say the count, so a total assembled
+            # from one of two shards cannot read as a corpus that got faster.
+            (( ${b:-0} > 0 )) && need=$(( (s + b - 1) / b ))
+            printf '| %s | %d | %d | %ds | %ds per shard | %d |\n' \
+              "$label" "$shards" "$n" "$s" "${b:-0}" "$need"
+            printf 'unsharded_total_s %s %d %d %d\n' "$label" "$s" "$n" "$shards" \
+              >> core-unsharded-total.txt
+            # DIVE-3477, HALF ONE -- THE DRAWS, BESIDE THE TOTAL. Under sharding each
+            # shard runs on its own independently-calibrated runner, so the total above
+            # is a sum of wall-clock measured on as many different-speed boxes as there
+            # are shards. It is not a quantity observed on any single box, and there is
+            # no single draw you could divide it by afterwards to recover one. Measured
+            # on run 31940232740, four shards of one run: 89 / 122 / 122 / 98.
+            #
+            # Emitting the draws does not repair that and is not claimed to: it makes the
+            # total's provenance READABLE, which is the least a number nobody can trend
+            # owes the next person who trends it anyway. The figure that IS comparable
+            # across runs is the one below.
+            #
+            # A SEPARATE LINE, not extra fields on unsharded_total_s: the presence check
+            # next door binds that line with `read -r _ _ total n shards`, so an appended
+            # field would land in `shards` and turn a grader red for a reason that has
+            # nothing to do with the corpus.
+            printf 'unsharded_draws_pct %s %s\n' "$label" "${draws:-none}" \
+              >> core-unsharded-total.txt
+            # DIVE-3477, HALF TWO -- THE CORPUS-GROWTH TRIPWIRE, which is the condition
+            # main's ruling attached to the shard landing: sharding restores headroom,
+            # and restored headroom is exactly how corpus growth becomes invisible again.
+            #
+            # Raw microseconds per harness against a FIXED reference. Shard-count
+            # independent because it divides by the harness COUNT; clamp-independent
+            # because it reads no calibration field; comparable across runs because the
+            # reference does not move when capacity does. The rationale for each of those
+            # three, and the reference's environment and date, are in tests/lib/tier.sh.
+            #
+            # EMITTED, NEVER ENFORCED, on exactly the terms the total above already has:
+            # this job exits 0 on every path and nothing in CI keys off the VALUE.
+            # Whether a WINDOW of these has cleared the reference is decided out of band
+            # by scripts/core-growth-tripwire.sh, because per-run draw spans 74-141% and
+            # a per-run threshold would false-fire on the runner alone. Firing files a
+            # row; it does not red a build and it adds no required check.
+            local u=0 ref=0 pct=0
+            (( n > 0 )) && u="$(tier_core_us_per_harness "$s" "$n")"
+            if ref="$(tier_core_us_per_harness_ref "$label")"; then
+              pct="$(tier_core_growth_pct_of_ref "$u" "$label")"
+            fi
+            printf 'core_us_per_harness %s %d %d %d ref=%d pct_of_ref=%d\n' \
+              "$label" "$u" "$n" "$shards" "$ref" "$pct" \
+              >> core-unsharded-total.txt
+          }
+          : > core-unsharded-total.txt
+          {
+            echo "## Core tier wall-clock (DIVE-3315: two capped shards, one un-sharded total)"
+            echo
+            echo "| environment | shards reporting | harnesses | UN-SHARDED total | budget | shards NEEDED |"
+            echo "|---|---:|---:|---:|---:|---:|"
+            total_row pristine 'core-pristine-[0-9]*.txt'
+            total_row installed-host 'core-installed-[0-9]*.txt'
+            echo
+            echo "Per-shard (this is what the budget is enforced on):"
+            echo '```'
+            for f in core-pristine-[0-9]*.txt core-installed-[0-9]*.txt; do
+              [[ -r "$f" ]] || continue
+              printf '%-28s %4ss / %ss  (%s%%)\n' "$(sed -n 's/^# label=//p' "$f" | head -1)" \
+                "$(sed -n 's/^# wall_clock_s=//p' "$f" | head -1)" \
+                "$(sed -n 's/^# budget_s=//p' "$f" | head -1)" \
+                "$(sed -n 's/^# pct_of_budget=//p' "$f" | head -1)"
+            done
+            echo '```'
+            echo
+            echo "Slowest 15 harnesses across the pristine shards — the merge/retire shortlist:"
+            echo '```'
+            if compgen -G 'core-pristine-[0-9]*.txt' >/dev/null; then
+              grep -hv '^#' core-pristine-[0-9]*.txt | sort -rn | head -15 \
+                | awk -F'\t' '{printf "%7.1fs  %s\n", $1/1000, $3}'
+            else
+              echo "(no reports — no pristine shard finished)"
+            fi
+            echo '```'
+            echo
+            echo "Corpus growth (DIVE-3477) -- raw us/harness against a FIXED reference, and the draws the total above is a sum over:"
+            echo '```'
+            grep '^core_us_per_harness ' core-unsharded-total.txt || echo "(no growth figure produced)"
+            grep '^unsharded_draws_pct ' core-unsharded-total.txt || echo "(no draws produced)"
+            echo '```'
+            echo
+            echo "A single run cannot say the corpus grew: per-run us/harness moves ~20% on runner draw alone. scripts/core-growth-tripwire.sh reads a WINDOW of these and is what decides whether the tripwire has fired."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          echo
+          echo "machine-readable (this is the object core-total-produced grades):"
+          cat core-unsharded-total.txt
+          # THIS JOB IS WIRED TO NOTHING, on purpose. See the comment above it: a total that
+          # can red is a second budget, and this one would red on day one. Whether the figure
+          # was PRODUCED is a different question from whether it PASSES, and it is graded next
+          # door — `core-total-produced` reds on an absence, never on a value.
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: core-unsharded-total
+          path: core-unsharded-total.txt
+          # warn, not error: a missing file must not red THIS job (it exits 0 on every path
+          # by design). The absence is graded by core-total-produced, which is the job whose
+          # whole purpose is to fail on it.
+          if-no-files-found: warn
+
+  # DIVE-3315 — GRADE THE ARTIFACT, NOT THE YAML. Folded into this row rather than filed as a
+  # follow-up: a separate row is exactly how the guard ships without the thing it guards.
+  #
+  # WHY THIS EXISTS AT ALL, and it is the third instance of one object error on this row.
+  # Arm 95 in tests/corpus_tier_budget_unit.sh pinned the total-printing job by parsing the
+  # workflow — which grades its EXISTENCE, so a one-line `if: false` on it stayed green at
+  # 140/0 (quinn, measured). The obvious repair — assert the job's `if:` is `always()` — is
+  # the SAME error one level out: it grades DECLARED liveness. Measured too: leave `if:
+  # always()` untouched, point `total_row`'s glob at a pattern that matches nothing, and the
+  # `if:` whitelist still reads 141/0 while the run emits an empty table.
+  #
+  # What a parsed workflow cannot see: a renamed or deleted step inside the job, an early
+  # return before the printf, a glob that matches nothing, a download that failed under
+  # continue-on-error, or the job never running because something upstream of it did not.
+  # Those are five causes with one symptom — the figure is absent — so the check has to be
+  # on the SYMPTOM, in the run's own output, which is the same object `changed-harnesses`
+  # grades: what executed, not what was configured.
+  #
+  # PRODUCED, NEVER PASSING. This job must not compare the figure to anything: 331s pristine
+  # and 320s installed-host against a 300s PER-JOB cap would red on day one, which is the
+  # second budget this whole row exists to refuse. It asks one question — was the number
+  # emitted — and `tests/corpus_tier_budget_unit.sh` arm 96 holds that open by refusing any
+  # dependent of the printing job that mentions a budget.
+  #
+  # AND IT IS INSIDE THE MERGE GATE: both required-name aggregators list it, so a change that
+  # turns the instrument off cannot merge. That is not gating on the number; it is gating on
+  # the number existing.
+  core-total-produced:
+    runs-on: ubuntu-latest
+    needs: [core-pristine, core-installed-host, core-budget-report]
+    if: always()
+    steps:
+      - uses: actions/download-artifact@v4
+        # continue-on-error: a MISSING artifact is the defect this job exists to catch, so it
+        # must reach the grading step rather than dying in the download.
+        continue-on-error: true
+        with: { pattern: core-unsharded-total, merge-multiple: true }
+      - name: The un-sharded total must have been EMITTED — whatever the cause of an absence
+        env:
+          PRISTINE_RESULT: ${{ needs['core-pristine'].result }}
+          INSTALLED_RESULT: ${{ needs['core-installed-host'].result }}
+        run: |
+          f=core-unsharded-total.txt
+          rc=0
+          grade() {   # <environment> <that environment's shard-job result>
+            local env="$1" res="$2" line total n shards
+            # A red shard already blocks this run, and its total is legitimately partial.
+            # Manufacturing a second red here would add no information and would train people
+            # to read this job as noise — which is how a real absence gets waved through.
+            if [ "$res" != success ]; then
+              printf '%s: NOT GRADED — its shards did not all succeed (%s), so an absent total is explained by a red that already blocks this run.\n' "$env" "$res"
+              return 0
+            fi
+            if [ ! -r "$f" ]; then
+              printf '%s: FAIL — shards were GREEN and no total artifact exists at all. The figure was not produced: the printing job was disabled, never ran, or its upload was dropped.\n' "$env"
+              return 1
+            fi
+            line="$(grep -E "^unsharded_total_s[[:space:]]+${env}[[:space:]]" "$f" | head -1)"
+            if [ -z "$line" ]; then
+              printf '%s: FAIL — the artifact exists but carries no un-sharded figure for this environment.\n' "$env"
+              return 1
+            fi
+            read -r _ _ total n shards <<<"$line"
+            # An EMPTY table is the shape a broken glob produces, and 0s over 0 harnesses from
+            # 0 shards reads as a produced total unless something says otherwise.
+            if ! [ "${total:-0}" -gt 0 ] 2>/dev/null || ! [ "${n:-0}" -gt 0 ] 2>/dev/null \
+               || ! [ "${shards:-0}" -gt 0 ] 2>/dev/null; then
+              printf '%s: FAIL — a figure is present but it is not a measurement: total=%s harnesses=%s shards=%s.\n' \
+                "$env" "$total" "$n" "$shards"
+              return 1
+            fi
+            # DIVE-3477: and the GROWTH figure, on the same terms. Its production is
+            # graded here rather than in a new job because a new job would be a new
+            # required context, and main's ruling authorised a metric, not a gate. This
+            # check is already inside the merge gate via both aggregators, so grading the
+            # figure's EXISTENCE here is what stops the instrument being deleted in one
+            # line -- the failure arm 97 in tests/corpus_tier_budget_unit.sh was written
+            # for, now applied to the number that replaced the one it was written about.
+            gline="$(grep -E "^core_us_per_harness[[:space:]]+${env}[[:space:]]" "$f" | head -1)"
+            if [ -z "$gline" ]; then
+              printf '%s: FAIL — the un-sharded total is present but the GROWTH figure is not. Sharding restored headroom, and this is the number that stays comparable across runs once it has; its presence is the condition the shard landed under.\n' "$env"
+              return 1
+            fi
+            read -r _ _ us gn gshards _ <<<"$gline"
+            if ! [ "${us:-0}" -gt 0 ] 2>/dev/null || ! [ "${gn:-0}" -gt 0 ] 2>/dev/null; then
+              printf '%s: FAIL — a growth figure is present but it is not a measurement: us_per_harness=%s harnesses=%s shards=%s.\n' \
+                "$env" "$us" "$gn" "$gshards"
+              return 1
+            fi
+            printf '%s: PRODUCED — %ss over %s harnesses from %s shards, and %s us per harness (both values deliberately not graded here).\n' \
+              "$env" "$total" "$n" "$shards" "$us"
+          }
+          # POSITIVE CONTROL, ON EVERY RUN, BEFORE THE REAL GRADE — DIVE-3317's keeper: a
+          # monitor that breaks LOUD gets fixed, one that breaks SILENT does not, and a check
+          # that cannot fire launders an absence as "checked". This one is a guard on an
+          # honesty instrument, so it owes proof that it can still fail. It drives the SAME
+          # grade() over fixtures whose verdict is known, in a throwaway directory.
+          #
+          # BOTH DIRECTIONS. Only-can-fail would be satisfied by a check that fails on
+          # everything, which gets muted within a week and is then worse than absent.
+          selftest() {
+            local d rc=0
+            d="$(mktemp -d)" || return 1
+            (
+              cd "$d" || exit 1
+              f=core-unsharded-total.txt
+              if grade pristine success >/dev/null 2>&1; then
+                echo "SELFTEST FAIL: no artifact at all graded as PRODUCED"; exit 1; fi
+              printf 'unsharded_total_s pristine 0 0 0\n' > "$f"
+              if grade pristine success >/dev/null 2>&1; then
+                echo "SELFTEST FAIL: an empty table (0s over 0 harnesses) graded as PRODUCED"; exit 1; fi
+              printf 'unsharded_total_s pristine 307 297 2\n' > "$f"
+              # DIVE-3477: a total with no growth figure beside it is the shape a deleted
+              # or renamed emission produces, and it is the one the shard landed against.
+              if grade pristine success >/dev/null 2>&1; then
+                echo "SELFTEST FAIL: a total with no growth figure beside it graded as PRODUCED"; exit 1; fi
+              printf 'core_us_per_harness pristine 1033670 297 2 ref=1000000 pct_of_ref=103\n' >> "$f"
+              if ! grade pristine success >/dev/null 2>&1; then
+                echo "SELFTEST FAIL: a real figure did NOT grade as produced — this check reds every run and will be muted"; exit 1; fi
+            ) || rc=1
+            rm -rf "$d"
+            return "$rc"
+          }
+          if ! selftest; then
+            echo "core-total-produced: BLOCKED — this check cannot demonstrate that it still fails on an absent or empty figure, so its green would mean nothing. Refusing to report one."
+            exit 1
+          fi
+          echo "selftest: reds on an absent figure, reds on an empty table, reds on a total with no growth figure beside it, passes a real one."
+          grade pristine "$PRISTINE_RESULT" || rc=1
+          grade installed-host "$INSTALLED_RESULT" || rc=1
+          exit "$rc"

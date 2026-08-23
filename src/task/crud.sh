@@ -121,7 +121,7 @@ cmd_task_add() {
   # implied on purpose — see _hb_task_budget_sweep's header for why --customer
   # and priority were both rejected as implicit carve-outs.
   [[ -z "$task_budget" || "$task_budget" =~ ^[1-9][0-9]*$ || "$task_budget" =~ ^\$[0-9]+(\.[0-9]+)?$ || "$task_budget" == "none" ]] \
-    || fail "$E_VALIDATION" "--task-budget must be a token count (e.g. 50000), a dollar cost (e.g. \$1.50), or 'none' to exempt this row from the enforced default"
+    || fail "$E_VALIDATION" "--task-budget must be a token count (e.g. 50000), a dollar cost (e.g. \$1.50), or 'none'. NOTE: advisory only since DIVE-3343 — nothing enforces it"
   # DIVE-1697: --branch seeds the delegated-push 'Branch: <name>' binding into the
   # body up front (same line set-branch writes/upserts later).
   if [[ -n "$branch" ]]; then
@@ -197,15 +197,42 @@ cmd_task_add() {
   # TOKEN (role:<r> / charter:<kw> / @name). Route tokens through the org chart;
   # a literal name is trusted verbatim (explicit --assignee always wins). A token
   # with no UNIQUE holder is a hard, EXPLAINABLE error — never a silent misroute.
+  local role_pick_note=""
   if [[ -n "$assignee" ]]; then
     case "$assignee" in
       role:*|charter:*|@*)
-        local _resolved; _resolved=$(_org_resolve_assignee "$assignee")
+        local _resolved _token="$assignee"; _resolved=$(_org_resolve_assignee "$assignee")
+        # DIVE-3366: a role with TWO holders is not an unanswerable question — it
+        # is the one the board most needs answered, and answering it with a
+        # refusal is what sends every row to the seat the filer remembers. Runs
+        # ONLY on the empty (previously fatal) path, so a token that already
+        # resolved is untouched. The verifier seat is excluded from the
+        # candidates, which is how a loop row gets a build lane that is not its
+        # own grader instead of the refusal below.
+        if [[ -z "$_resolved" && "$_token" == role:* ]] \
+           && _task_role_least_loaded "${_token#role:}" "$verifier"; then
+          _resolved="$_TASK_ROLE_PICK"
+          # Recorded on the row, not only warned at the prompt: the counts that
+          # made this choice have moved by the time anyone audits it.
+          role_pick_note="ROUTED BY LOAD (DIVE-3366): --assignee=${_token} -> ${_resolved}${verifier:+ (verifier '${verifier}' excluded from the candidates)}. Open-row counts at filing: ${_TASK_ROLE_PICK_BASIS}."
+          warn "$role_pick_note"
+        fi
         [[ -n "$_resolved" ]] || fail "$E_NOT_FOUND" "--assignee='$assignee' has no unique holder in the org chart — name an agent, or fix the role: 5dive org set"
         assignee="$_resolved"
         ;;
     esac
   fi
+  # DIVE-3344: and now that the token is resolved, the name has to NAME SOMETHING.
+  # "a literal name is trusted verbatim" above was the whole defect: the picker
+  # dispatches on this column, so a typo'd lane is a row that is never picked and
+  # never says why. Checked on the EXPLICIT input only — the DIVE-333 default
+  # below is derived from the project lead / org coordinator, and refusing an add
+  # because the CHART is stale would punish the filer for someone else's data.
+  # `task orphans` is what surfaces that case. See _task_require_lane (routing.sh)
+  # for why `cli` is refused here and accepted two lines down.
+  _task_require_lane "$assignee" "--assignee"
+  _task_require_lane "$verifier" "--verifier"
+  _task_require_principal "$from" "--from"
   # fresh: per-task clean-session pref (DIVE-138). Recurring templates default to
   # fresh=1 (clean each run — Mark's decision for the community/marketing jobs)
   # and carry it onto every materialized instance; an explicit --fresh/--no-fresh
@@ -348,7 +375,8 @@ An internal-machinery finding gets its own ident ONLY if it has ALREADY blocked 
 REFUSED TITLE (recorded in policy_refusals, not lost): ${title}
 This is a budget on NEW ROWS, not on noticing things. Put it where it already has context:
   · a finding on work you are doing  →  append it to the BODY of the row you found it on
-  · durable, reusable knowledge      →  community/wiki/ (see the compile-knowledge skill)
+  · durable, reusable knowledge      →  community/wiki/ (see the compile-knowledge skill; a
+    plain fact from this session needs no row and no page — 'memory consolidate' already lifts it)
   · someone must ACT and it is serious →  --priority=high (high and urgent are never capped)
 There is no bypass flag. If it is serious enough to need one, it is serious enough to be high."
       fi
@@ -428,6 +456,18 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
     body="${body:+$body
 
 }FILING-CAP EXCEPTION (already blocked shipped work): ${already_blocked}"
+  fi
+  # DIVE-3366 acceptance 1: "its choice is recorded so it can be audited". Same
+  # reason as the cap exception directly above — a router whose choice leaves no
+  # trace cannot be audited, and this one is worse than the cap: the INPUT that
+  # decided it (each seat's open-row count) is a moving number, so by the time
+  # anyone asks why this lane got the row, the counts that answer no longer exist
+  # anywhere. Recorded on the row, not only in the warn line at the prompt, which
+  # the filer's terminal is the only witness to.
+  if [[ -n "$role_pick_note" ]]; then
+    body="${body:+$body
+
+}${role_pick_note}"
   fi
   # DIVE-969: verifier-by-default posture. For a NON-TRIVIAL standard task where
   # the creator neither wired the loop themselves (--accept/--verify/--verifier)
@@ -553,7 +593,7 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
 
 cmd_task_ls() {
   tasks_db_init
-  local status="" assignee="" mine=0 all=0 from="" recurring=0 project=""
+  local status="" assignee="" mine=0 all=0 from="" recurring=0 project="" no_body=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --status=*)   status="${1#*=}" ;;
@@ -563,6 +603,14 @@ cmd_task_ls() {
       --all)        all=1 ;;
       --recurring)  recurring=1 ;;
       --from=*)     from="${1#*=}" ;;
+      # DIVE-3388: the JSON contract is read by agents, not humans, and `ls`
+      # SELECTs every row's full body+result — a single `task ls --json` on a
+      # 179-task board dumps hundreds of KB into the caller's context before any
+      # filtering is possible. Bodies are opt-in-cost here: `--no-body` strips
+      # body+result from every emitted row. The strip is a jq post-pass (not SQL
+      # column surgery) so the SELECT and its MAX_ARG_STRLEN stdin-feed stay
+      # untouched, and the only behaviour change is what reaches the caller.
+      --no-body)    no_body=1 ;;
       -*)           fail "$E_USAGE" "unknown flag: $1" ;;
       *)            fail "$E_USAGE" "unexpected arg: $1" ;;
     esac
@@ -652,7 +700,11 @@ cmd_task_ls() {
     # Feed rows via stdin, not --argjson: a big board (179+ tasks w/ bodies)
     # blows past MAX_ARG_STRLEN (128K per argv string) -> execve E2BIG
     # ("Argument list too long"). stdin has no such cap. (DIVE-222)
-    printf '%s' "$rows" | jq -c '{ok:true, data:{tasks:.}}'
+    if (( no_body )); then
+      printf '%s' "$rows" | jq -c '{ok:true, data:{tasks:(map(del(.body, .result)))}}'
+    else
+      printf '%s' "$rows" | jq -c '{ok:true, data:{tasks:.}}'
+    fi
   elif (( recurring )); then
     # DIVE-2237: last_fired alone cannot distinguish SUPPRESSED from BROKEN.
     # last_skipped names the last tick the materializer found this template due
@@ -699,13 +751,34 @@ cmd_task_ls() {
                   ELSE status END AS status,
              priority, COALESCE(assignee,'-') AS assignee, title FROM tasks WHERE ${where} ${order};"
     fi
+    # DIVE-3366 acceptance 3: the skew belongs ON THE BOARD, under the queue,
+    # because that is where the routing decision is actually made — a number in a
+    # digest nobody reads at filing time is why lodar had to raise this by hand
+    # three times in one day. Suppressed under --assignee/--mine: a single-lane
+    # view is not a routing view, and a note about two other seats there is noise.
+    # Human path only; the --json branch returns above and its consumers must not
+    # find a new advisory in their payload.
+    [[ -n "$assignee" ]] || _task_role_skew_note
   fi
 }
 
 cmd_task_show() {
   tasks_db_init
-  [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task show <id|DIVE-N>"
-  resolve_task_id "$1"; local id="$RESOLVED_TASK_ID"
+  # DIVE-3388: --no-body strips the (often multi-KB) body+result from both the
+  # JSON and text renderings, for callers that want the row's state/gates without
+  # pulling the full text into context. Same opt-in-cost rule as `task ls`.
+  local no_body=0
+  local -a pos=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-body) no_body=1 ;;
+      -*)        fail "$E_USAGE" "unknown flag: $1" ;;
+      *)         pos+=("$1") ;;
+    esac
+    shift
+  done
+  [[ ${#pos[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task show <id|DIVE-N> [--no-body]"
+  resolve_task_id "${pos[0]}"; local id="$RESOLVED_TASK_ID"
   if (( JSON_MODE )); then
     local task subs deps previous_gates
     # DIVE-3340 iter2 (main2): export the VERDICTS here too. `SELECT *` returns
@@ -727,9 +800,15 @@ cmd_task_show() {
     previous_gates=$(_gate_history_summary_json "$id")
     [[ -n "$subs" ]] || subs="[]"
     [[ -n "$deps" ]] || deps="[]"
-    jq -cn --argjson t "$task" --argjson s "$subs" --argjson b "$deps" \
-      --argjson g "$previous_gates" \
-      '{ok:true, data:{task:($t[0]), subtasks:$s, blocked_by:$b, previous_gates:$g}}'
+    if (( no_body )); then
+      jq -cn --argjson t "$task" --argjson s "$subs" --argjson b "$deps" \
+        --argjson g "$previous_gates" \
+        '{ok:true, data:{task:($t[0] | del(.body, .result)), subtasks:$s, blocked_by:$b, previous_gates:$g}}'
+    else
+      jq -cn --argjson t "$task" --argjson s "$subs" --argjson b "$deps" \
+        --argjson g "$previous_gates" \
+        '{ok:true, data:{task:($t[0]), subtasks:$s, blocked_by:$b, previous_gates:$g}}'
+    fi
   else
     # DIVE-2316: delivery_ref is an enforcement input, so omission here made a
     # missing binding indistinguishable from a presenter that never read it.
@@ -738,7 +817,11 @@ cmd_task_show() {
     # of the split is that a reader can tell "reclaimed after real work" from
     # "never started" FROM THE BOARD ALONE. A fix that records the first start but
     # does not surface it here does not satisfy that.
-    dbfmt -line "SELECT ident, title, status, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, body, result FROM tasks WHERE id=${id};"
+    if (( no_body )); then
+      dbfmt -line "SELECT ident, title, status, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref FROM tasks WHERE id=${id};"
+    else
+      dbfmt -line "SELECT ident, title, status, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, body, result FROM tasks WHERE id=${id};"
+    fi
     # DIVE-1064: surface the creator's isolation tier (read-time from the
     # registry, no schema change) so a reader/agent can down-trust a task filed
     # by a lower-privilege peer.
@@ -956,6 +1039,10 @@ cmd_task_assign() {
   [[ $# -ge 2 ]] || fail "$E_USAGE" "usage: 5dive task assign <id|DIVE-N> <agent>"
   resolve_task_id "$1"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   local who="$2"
+  # DIVE-3344: the raw reassignment verb, and the one that can move a live row
+  # onto a lane that does not exist. Refused BEFORE the write — an orphaned row is
+  # not recoverable by the machine, because nothing ever looks at it again.
+  _task_require_lane "$who" "<agent>"
   # DIVE-3097: refuse landing the ASSIGNEE onto this row's own VERIFIER — the
   # identical end state `task verifier` already refuses from the other
   # direction (DIVE-474: "'X' is <ident>'s own assignee — a maker can't grade
@@ -1002,6 +1089,15 @@ cmd_task_assign() {
                         THEN datetime('now') ELSE started_at END
       WHERE id=${id};"
   ok "$ident assigned to $who" '{id:($i|tonumber), ident:$id, assignee:$a}' --arg i "$id" --arg id "$ident" --arg a "$who"
+  # DIVE-3499: sender-visible receipt — owner, queue position, next wake. Cannot
+  # fail; see src/lib/routing_receipt.sh.
+  # The `|| true` and the stderr drop are the additive-only contract AT THE CALL
+  # SITE, not belt-and-braces: a tree that sources a SUBSET of src/ — which is
+  # what most harnesses do — has no routing_receipt, and bash turns that into
+  # rc=127 on a verb that had already succeeded. Measured on
+  # tests/task_reject_trace_unit.sh before this line existed. The wrapper's own
+  # containment cannot cover the case where the wrapper is what is missing.
+  routing_receipt "$ident" "$who" "now owns it" 2>/dev/null || true
 }
 
 # DIVE-1880: attach the maker→verifier rail to an ALREADY-FILED task. `--verifier`
@@ -1033,6 +1129,10 @@ cmd_task_verifier() {
     || fail "$E_USAGE" "usage: 5dive task verifier <id|DIVE-N> <agent> [--accept=<criteria>] [--max-iters=<n>]"
   [[ -z "$max_iters" || "$max_iters" =~ ^[1-9][0-9]*$ ]] \
     || fail "$E_VALIDATION" "--max-iters must be a positive integer"
+  # DIVE-3344: a verifier is a DISPATCH TARGET too — delivering writes
+  # assignee=<verifier> — so a typo'd grader orphans the row at handoff, one step
+  # further from anyone noticing than a typo'd assignee does.
+  _task_require_lane "$who" "<agent>"
   resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   local st kind title asignee cur_accept cur_vfier maker delivered
   st=$(db "SELECT status FROM tasks WHERE id=${id};")

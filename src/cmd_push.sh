@@ -151,6 +151,55 @@ _push_fetch_why() {
   esac
 }
 
+# _push_range_base <repo-path> <repo-url> <branch> — the ONE range-bound resolver
+# every fail-closed pre-push scan shares (author: DIVE-2161; content/PII:
+# DIVE-2268). Extracted rather than copied on purpose: the bound is the part that
+# was WRONG in 2161, and a second scan resolving its own bound is a second thing
+# to keep in step. Callers own the wording of their own refusals; this owns only
+# "what range is this push, and how well do we know it".
+#
+# Sets, and sets ALL of them on every path so a stale value from a previous call
+# can never be read as this call's answer:
+#   _PUSH_RB_KIND  fresh    — a FRESH fetch of the target's main bounded it
+#                  unrelated— fetch succeeded, NO common ancestor: the whole
+#                             branch really is new to that repo (measured)
+#                  cached   — no fetch; bounded by a cached remote-tracking ref,
+#                             which MAY BE STALE
+#                  none     — no bound at all. Not a measurement; callers refuse.
+#   _PUSH_RB_BASE  merge-base sha (empty for unrelated/none)
+#   _PUSH_RB_CREF  the cached ref used (kind=cached only)
+#   _PUSH_RB_WHY   short named cause of the failed fetch (kind=cached|none)
+_push_range_base() {
+  local repopath="$1" repourl="$2" branch="$3"
+  local -a G=(git -C "$repopath" -c "safe.directory=$repopath")
+  local fetch_err="" fetch_ok=0 base="" cref
+  _PUSH_RB_KIND=none; _PUSH_RB_BASE=""; _PUSH_RB_CREF=""; _PUSH_RB_WHY=""
+  # A fresh fetch is the only authoritative bound. Keep its stderr — WHY it failed
+  # is the diagnosis, and throwing it away is what left the tool with nothing to
+  # say but a fabricated list. GIT_TERMINAL_PROMPT=0 so a credential-less caller
+  # ERRORS with a readable reason instead of blocking on a username prompt.
+  if fetch_err=$(GIT_TERMINAL_PROMPT=0 "${G[@]}" fetch --quiet "$repourl" main 2>&1) \
+     && "${G[@]}" rev-parse --verify --quiet FETCH_HEAD >/dev/null 2>&1; then
+    fetch_ok=1
+    base=$("${G[@]}" merge-base FETCH_HEAD "refs/heads/${branch}" 2>/dev/null) || base=""
+  fi
+  if [[ $fetch_ok -eq 1 && -n "$base" ]]; then
+    _PUSH_RB_KIND=fresh; _PUSH_RB_BASE="$base"; return 0
+  fi
+  if [[ $fetch_ok -eq 1 ]]; then
+    _PUSH_RB_KIND=unrelated; return 0
+  fi
+  _PUSH_RB_WHY=$(_push_fetch_why "$fetch_err")
+  for cref in refs/remotes/origin/main refs/remotes/origin/master; do
+    "${G[@]}" rev-parse --verify --quiet "$cref" >/dev/null 2>&1 || continue
+    base=$("${G[@]}" merge-base "$cref" "refs/heads/${branch}" 2>/dev/null) || base=""
+    if [[ -n "$base" ]]; then
+      _PUSH_RB_KIND=cached; _PUSH_RB_BASE="$base"; _PUSH_RB_CREF="$cref"; return 0
+    fi
+  done
+  return 0
+}
+
 # _push_author_scan <repo-path> <repo-url> <branch> <author> [repo-source] [mode] — fail-closed author
 # scan. If <author> is EMPTY, the deployment configured no committer, so there is
 # NO restriction and the scan is a no-op (DIVE-1461 config-only behavior). When
@@ -183,21 +232,16 @@ _push_author_scan() {
   _PUSH_AUTHOR_SCAN_BOUND=unavailable
   [[ -n "$author" ]] || { _PUSH_AUTHOR_SCAN_BOUND=nocheck; return 0; }  # unset committer -> no author restriction
   local -a G=(git -C "$repopath" -c "safe.directory=$repopath")
-  local base="" rangespec="" offenders scope="" fetch_err="" fetch_ok=0
-  # A fresh fetch is the only authoritative bound. Keep its stderr — WHY it failed
-  # is the diagnosis, and throwing it away is what left the tool with nothing to
-  # say but a fabricated list. GIT_TERMINAL_PROMPT=0 so a credential-less caller
-  # ERRORS with a readable reason instead of blocking on a username prompt.
-  if fetch_err=$(GIT_TERMINAL_PROMPT=0 "${G[@]}" fetch --quiet "$repourl" main 2>&1) \
-     && "${G[@]}" rev-parse --verify --quiet FETCH_HEAD >/dev/null 2>&1; then
-    fetch_ok=1
-    base=$("${G[@]}" merge-base FETCH_HEAD "refs/heads/${branch}" 2>/dev/null) || base=""
-  fi
-  if [[ $fetch_ok -eq 1 && -n "$base" ]]; then
+  local base="" rangespec="" offenders scope="" cref="" why=""
+  # DIVE-2268: the fetch/merge-base ladder moved VERBATIM to _push_range_base so
+  # the content scan bounds itself the same way. Every string below is unchanged.
+  _push_range_base "$repopath" "$repourl" "$branch"
+  base="$_PUSH_RB_BASE"; cref="$_PUSH_RB_CREF"; why="$_PUSH_RB_WHY"
+  if [[ "$_PUSH_RB_KIND" == fresh ]]; then
     _PUSH_AUTHOR_SCAN_BOUND=fresh
     rangespec="${base}..refs/heads/${branch}"
     scope="the commits on '${branch}' not already on that repo's main"
-  elif [[ $fetch_ok -eq 1 ]]; then
+  elif [[ "$_PUSH_RB_KIND" == unrelated ]]; then
     # MEASURED, not assumed: main was fetched and shares no ancestor with this
     # branch, so every commit reachable from it really is new to that repo. This
     # is the one case where the whole branch is the honest range.
@@ -208,13 +252,7 @@ _push_author_scan() {
     # No fresh bound. Degrade to a CACHED remote-tracking main if the tree has
     # one, and say out loud that the bound may be stale; otherwise the bound is
     # simply unavailable and there is nothing honest to grade.
-    local cref why; why=$(_push_fetch_why "$fetch_err")
-    for cref in refs/remotes/origin/main refs/remotes/origin/master; do
-      "${G[@]}" rev-parse --verify --quiet "$cref" >/dev/null 2>&1 || continue
-      base=$("${G[@]}" merge-base "$cref" "refs/heads/${branch}" 2>/dev/null) || base=""
-      [[ -n "$base" ]] && break
-    done
-    if [[ -n "$base" ]]; then
+    if [[ "$_PUSH_RB_KIND" == cached ]]; then
       _PUSH_AUTHOR_SCAN_BOUND=cached
       rangespec="${base}..refs/heads/${branch}"
       scope="the commits on '${branch}' not already on the CACHED ${cref} — that bound MAY BE STALE, because a fresh fetch was not possible (${why})"
@@ -249,6 +287,167 @@ _push_author_scan() {
     fi
     fail "$E_VALIDATION" \
       "author check FAILED against ${against} — scanned ${scope}. The commit(s) above are not authored '${author}' (the configured GITHUB_APP_COMMIT_AUTHOR). If you do not recognise them, check the TARGET REPO first: a push aimed at the wrong repository lists that repository's unrelated history here. Otherwise re-author (git rebase --exec 'git commit --amend --author=\"${author}\" --no-edit') before pushing; your git host's author gate would reject them.${seeded_hint}"
+  fi
+}
+
+# _push_pii_payload — locate the content scanner AND its denylist, as a PAIR.
+# Sets _PUSH_PII_SCAN / _PUSH_PII_DENY and returns 0, or returns 1 with both
+# empty. A scanner without its denylist is not half a scanner: pii-scan.sh exits
+# 2 ("denylist not found") and that is UNDETERMINED, not clean — so they are
+# resolved together and a home missing either one is skipped, not half-used.
+#
+# WHY THESE HOMES, and why NOT scripts/pii-scan-range.sh (DIVE-2268): the pushed
+# work tree is an ARBITRARY repo (api, app, a customer's), so nothing repo-local
+# can be relied on. What every installed box does have is the guard home
+# install.sh stages (/usr/local/share/5dive/pii-guard — pii-scan.sh + the
+# denylist, DIVE-2803). pii-scan-range.sh is NOT staged there, so calling it
+# would make every push on every already-installed host refuse until the next
+# install run. The range walk it does is small; the payload it needs is not.
+_push_pii_payload() {
+  local home
+  _PUSH_PII_SCAN=""; _PUSH_PII_DENY=""
+  # An explicit PII_SCAN wins (this is how the harness plants a stub scanner).
+  if [[ -n "${PII_SCAN:-}" && -f "${PII_SCAN}" ]]; then
+    local d="${PII_DENYLIST:-$(dirname "$PII_SCAN")/../.github/pii-denylist.txt}"
+    [[ -f "$d" ]] || d="$(dirname "$PII_SCAN")/pii-denylist.txt"
+    if [[ -f "$d" ]]; then _PUSH_PII_SCAN="$PII_SCAN"; _PUSH_PII_DENY="$d"; return 0; fi
+  fi
+  # PII_GUARD_HOME is EXCLUSIVE when set — the same meaning it has in
+  # scripts/install-pii-push-guard.sh, and the property that makes "no payload"
+  # reachable in a harness on a box that does have the shared home installed.
+  local -a homes=()
+  if [[ -n "${PII_GUARD_HOME:-}" ]]; then
+    homes=("$PII_GUARD_HOME")
+  else
+    homes=(/usr/local/share/5dive/pii-guard \
+           "${XDG_DATA_HOME:-${HOME:-/nonexistent}/.local/share}/5dive/pii-guard")
+  fi
+  for home in "${homes[@]}"; do
+    [[ -n "$home" && -f "$home/pii-scan.sh" && -f "$home/pii-denylist.txt" ]] || continue
+    _PUSH_PII_SCAN="$home/pii-scan.sh"; _PUSH_PII_DENY="$home/pii-denylist.txt"; return 0
+  done
+  # An EXCLUSIVE override that is empty is a deliberate "no payload", not a cue to
+  # fall through to the host's — falling through would make the override untestable
+  # and, worse, silently scan with a payload the caller did not choose.
+  if [[ -n "${PII_GUARD_HOME:-}" ]]; then return 1; fi
+  # The staged CLI source tree install.sh leaves behind, in the repo's own layout.
+  local src=/usr/local/lib/5dive/pii-guard-src
+  if [[ -f "$src/scripts/pii-scan.sh" && -f "$src/.github/pii-denylist.txt" ]]; then
+    _PUSH_PII_SCAN="$src/scripts/pii-scan.sh"; _PUSH_PII_DENY="$src/.github/pii-denylist.txt"; return 0
+  fi
+  return 1
+}
+
+# _push_pii_scan <repo-path> <repo-url> <branch> [mode] — DIVE-2268. Fail-closed
+# CONTENT scan of what this push actually adds: the commit messages of the range
+# AND the ADDED LINES of its diff, fed to the denylist scanner. Refuses on a hit.
+#
+# WHY IT EXISTS: measured on DIVE-2267 — pii-guard.yml's PUSH branch scans
+# `git log -1 --format=%B` and NO content, and the repo-tracked pre-push hook is
+# per-checkout and absent from a fresh clone by git's deliberate design
+# (DIVE-2255). So the delegated rail — the path most agent pushes actually take —
+# ran no content scan at all. This is that scan, at the last moment before the
+# bytes leave the box.
+#
+# FAIL CLOSED, which is the whole point (DIVE-2264, where "skip" was read as
+# "pass" on the release path). There is NO input for which this reports clean
+# without having scanned content. Scanner or denylist missing, range unbounded,
+# git unable to produce the messages or the diff, scanner exiting anything but
+# 0/1 — every one of them REFUSES and names the reason. A `git diff` with no
+# added lines is an EMPTY scan, not a failed one, so the verdict comes from the
+# scanner and never from grep's exit status (a deletion-only push stays green).
+#
+# NOT A HISTORY SCAN (DIVE-1997/2114): only the range being pushed. A permanently
+# red guard detects nothing.
+#
+# <mode>, same split as the author scan:
+#   authoritative (default) — root's `_push_do`. Cannot bound the range: REFUSE.
+#   preflight — the agent's advisory pass, which by design holds no GitHub
+#     credential, so an unbounded range is NORMAL here: warn and defer. A MISSING
+#     PAYLOAD is not deferred in either mode — root will not find it either.
+# Sets _PUSH_PII_SCAN_BOUND to fresh|unrelated|cached|unavailable.
+_push_pii_scan() {
+  local repopath="$1" repourl="$2" branch="$3" mode="${4:-authoritative}"
+  local -a G=(git -C "$repopath" -c "safe.directory=$repopath")
+  _PUSH_PII_SCAN_BOUND=unavailable
+
+  if ! _push_pii_payload; then
+    fail "$E_GENERIC" "PII content scan COULD NOT RUN — no scanner payload on this host (looked for pii-scan.sh + pii-denylist.txt in \$PII_GUARD_HOME, /usr/local/share/5dive/pii-guard, the per-user guard home, and /usr/local/lib/5dive/pii-guard-src). A push that cannot be scanned is NOT a clean push, so it is refused rather than reported green (DIVE-2268/2264). Re-run the installer, or 'scripts/install-pii-push-guard.sh --sync' from a 5dive-cli checkout, to stage it"
+  fi
+
+  local base="" rangespec="" diffbase="" scope=""
+  _push_range_base "$repopath" "$repourl" "$branch"
+  base="$_PUSH_RB_BASE"
+  case "$_PUSH_RB_KIND" in
+    fresh)
+      _PUSH_PII_SCAN_BOUND=fresh
+      rangespec="${base}..refs/heads/${branch}"; diffbase="$base"
+      scope="what '${branch}' adds to that repo's main" ;;
+    unrelated)
+      # Measured, not assumed: a fresh fetch succeeded and shares no ancestor, so
+      # every byte on this branch is new to that repo. Diff against the EMPTY
+      # TREE, which is the honest base for "all of it is added".
+      _PUSH_PII_SCAN_BOUND=unrelated
+      rangespec="refs/heads/${branch}"
+      diffbase=$("${G[@]}" hash-object -t tree /dev/null 2>/dev/null) || diffbase=""
+      scope="EVERY commit reachable from '${branch}' — a FRESH fetch of that repo's main shares NO common ancestor with it" ;;
+    cached)
+      _PUSH_PII_SCAN_BOUND=cached
+      rangespec="${base}..refs/heads/${branch}"; diffbase="$base"
+      scope="what '${branch}' adds over the CACHED ${_PUSH_RB_CREF} — that bound MAY BE STALE (${_PUSH_RB_WHY})"
+      warn "PII content scan: could not fetch ${repourl} (${_PUSH_RB_WHY}) — bounding the scan with the cached ${_PUSH_RB_CREF} instead. A stale bound widens the range (more scanned) or narrows it (less scanned); only a fresh fetch bounds it authoritatively. (DIVE-2268)" ;;
+    *)
+      local diag="the PII content scan could not determine WHICH commits '${branch}' adds to $(_push_repo_slug "$repourl") — fetching that repo's main failed (${_PUSH_RB_WHY}) and this work tree has no cached refs/remotes/origin/main to fall back on. Without a bound there is no set of ADDED lines to scan, and scanning the branch's entire history would re-report accepted-of-record history as new exposure (DIVE-1997/2114)."
+      [[ "$mode" == preflight ]] && { warn "PII content scan SKIPPED here — ${diag} It is re-run authoritatively inside the push as root, which fetches with the App credential. (DIVE-2268)"; return 0; }
+      fail "$E_GENERIC" "PII content scan COULD NOT RUN — ${diag} This is NOT a pass. Give this tree a fetchable origin/main and retry" ;;
+  esac
+  if [[ -z "$diffbase" ]]; then
+    fail "$E_GENERIC" "PII content scan COULD NOT RUN — no diff base for ${rangespec} (git could not name the empty tree). This is NOT a pass (DIVE-2268)"
+  fi
+
+  # Run the scanner over stdin and translate its exit code. Anything we do not
+  # recognise (2 = missing denylist, or any future code) is UNDETERMINED, never
+  # clean — the caller must not have to guess which non-zero means "found" and
+  # which means "could not look". Scanner stderr is passed THROUGH: it prints the
+  # sha256 of the hit, never the plaintext.
+  local hit=0 s
+  local msgs diff_out added
+  if ! msgs=$("${G[@]}" log --format='%B' "$rangespec" 2>&1); then
+    fail "$E_GENERIC" "PII content scan COULD NOT RUN — git could not read the commit messages for ${rangespec} (${msgs}). This is NOT a pass (DIVE-2268)"
+  fi
+  # An EMPTY RANGE is not a clean push, it is a scan that saw nothing. The body of
+  # DIVE-2268 names it explicitly alongside "script missing" and "base rev
+  # unresolvable", and for the same reason: the three of them are the ways this
+  # can report green having looked at zero bytes. A push whose range holds no
+  # commits is also a push with nothing to send, so refusing costs nothing real.
+  if [[ -z "${msgs//[[:space:]]/}" ]] \
+     && [[ -z "$("${G[@]}" rev-list --max-count=1 "$rangespec" 2>/dev/null)" ]]; then
+    fail "$E_GENERIC" "PII content scan COULD NOT RUN — the range ${rangespec} is EMPTY: it contains no commits, so no content was scanned. An empty scan is not a clean scan (DIVE-2268/2264). If '${branch}' really has nothing to push, there is nothing to gate; if it should have commits, the range bound is wrong"
+  fi
+  s=0; printf '%s\n' "$msgs" | PII_DENYLIST="$_PUSH_PII_DENY" bash "$_PUSH_PII_SCAN" >/dev/null || s=$?
+  case "$s" in
+    0) ;;
+    1) hit=1 ;;
+    *) fail "$E_GENERIC" "PII content scan UNDETERMINED — the scanner exited ${s} on the commit messages of ${rangespec}, so it did not complete a scan. This is NOT a pass (DIVE-2268)" ;;
+  esac
+
+  if ! diff_out=$("${G[@]}" diff "${diffbase}..refs/heads/${branch}" 2>&1); then
+    fail "$E_GENERIC" "PII content scan COULD NOT RUN — git could not produce the diff for ${diffbase}..refs/heads/${branch} (${diff_out}). This is NOT a pass (DIVE-2268)"
+  fi
+  # grep exits 1 on a range with no added lines at all (a pure deletion). That is
+  # an EMPTY scan, not a failed one — with pipefail set, letting grep's status
+  # through here would turn every deletion-only push red.
+  added="$(printf '%s\n' "$diff_out" | grep -E '^\+' | grep -vE '^\+\+\+' | sed 's/^+//')" || true
+  s=0; printf '%s\n' "$added" | PII_DENYLIST="$_PUSH_PII_DENY" bash "$_PUSH_PII_SCAN" >/dev/null || s=$?
+  case "$s" in
+    0) ;;
+    1) hit=1 ;;
+    *) fail "$E_GENERIC" "PII content scan UNDETERMINED — the scanner exited ${s} on the added lines of ${rangespec}, so it did not complete a scan. This is NOT a pass (DIVE-2268)" ;;
+  esac
+
+  if [[ $hit -eq 1 ]]; then
+    fail "$E_VALIDATION" \
+      "PII content scan REFUSED this push — a denylisted identifier is in ${scope} (the sha256 of each hit is above; the plaintext is deliberately never printed). Never put a real user id, email or phone number in a public artifact: use the reserved placeholders (telegram id 1234567890, an @example.com address, 192.0.2.x). Rewrite the offending commit(s) or line(s) and push again. This is the delegated rail's content gate (DIVE-2268) — it is not bypassable with --no-verify, because it is not a git hook"
   fi
 }
 
@@ -442,6 +641,13 @@ cmd_push() {
   # reason; root's authoritative pass refuses instead of guessing.
   _push_author_scan "$repopath" "$repo" "$branch" "$author" "$repo_src" preflight
 
+  # --- PII CONTENT SCAN pre-flight (re-verified authoritatively in _push_do).
+  # DIVE-2268: the delegated rail ran NO content scan; CI's push path reads the
+  # head commit MESSAGE only, and the repo-tracked hook is absent from a fresh
+  # clone. Same preflight/authoritative split as the author scan, and the same
+  # reason for it: an unbounded range is normal for a credential-less agent here.
+  _push_pii_scan "$repopath" "$repo" "$branch" preflight
+
   local slug sha; slug=$(_push_repo_slug "$repo")
   sha=$(git rev-parse --short "refs/heads/${branch}")
   # DIVE-2161: the reported state must name the bound the verdict rests on. A flat
@@ -457,6 +663,15 @@ cmd_push() {
       *)           author_state="ok (${author})" ;;
     esac
   fi
+  # DIVE-2268: same rule for the content scan — a flat "ok" over a scan that was
+  # skipped, or bounded by a possibly-stale cached ref, is could-not-measure
+  # rendered as measured.
+  local pii_state
+  case "${_PUSH_PII_SCAN_BOUND:-}" in
+    unavailable) pii_state="NOT RUN here — range bound unavailable; enforced at push time" ;;
+    cached)      pii_state="clean against a CACHED bound, may be stale" ;;
+    *)           pii_state="clean" ;;
+  esac
 
   if [[ $dry -eq 1 ]]; then
     # DIVE-1970: the dry-run names WHERE the target came from, not just what it
@@ -478,10 +693,10 @@ cmd_push() {
     # generalised, in the reader's head, to the check most likely to stop the write.
     # Same shape as `author_state` above (DIVE-2161): name the bound the verdict rests on.
     local sig_state; sig_state=$(broker_gate_sig_note push)
-    ok "dry-run: would push ${branch}@${sha} to ${slug}${pr_preview} — target from ${repo_src} (gate cleared, ${sig_state}, author ${author_state})" \
-       "$(jq -n --arg t "$ident" --arg b "$branch" --arg s "$sha" --arg r "$slug" --arg a "$author_state" --arg rs "$repo_src" \
+    ok "dry-run: would push ${branch}@${sha} to ${slug}${pr_preview} — target from ${repo_src} (gate cleared, ${sig_state}, author ${author_state}, PII content scan ${pii_state})" \
+       "$(jq -n --arg t "$ident" --arg b "$branch" --arg s "$sha" --arg r "$slug" --arg a "$author_state" --arg rs "$repo_src" --arg pii "$pii_state" \
              --argjson op "$open_pr" --arg pb "$pr_base_preview" --arg gs "${BROKER_GATE_SIG_STATE:-unknown}" \
-             '{task:$t,branch:$b,sha:$s,repo:$r,repoSource:$rs,dryRun:true,gate:"cleared",gateSignature:$gs,author:$a,openPr:($op==1),prBase:$pb}')"
+             '{task:$t,branch:$b,sha:$s,repo:$r,repoSource:$rs,dryRun:true,gate:"cleared",gateSignature:$gs,author:$a,piiContentScan:$pii,openPr:($op==1),prBase:$pb}')"
     return 0
   fi
 
@@ -702,6 +917,11 @@ cmd_push_do() {
   # decides. If it cannot bound the range it REFUSES and names what is missing;
   # it never substitutes the whole history and grades against it.
   _push_author_scan "$repopath" "$repourl" "$branch" "$author" "the caller's resolved target" authoritative
+
+  # Authoritative CONTENT scan (DIVE-2268). Last moment before the bytes leave the
+  # box, and the pass that actually decides: no bound here REFUSES rather than
+  # reporting a push it never looked at as clean.
+  _push_pii_scan "$repopath" "$repourl" "$branch" authoritative
 
   # Build a short-lived App JWT (iat -60s for clock skew, exp +9min < 10min max).
   local now iat exp header payload unsigned sig jwt

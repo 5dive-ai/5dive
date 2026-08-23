@@ -74,9 +74,12 @@ cat \
   src/lib/broker.sh \
   src/lib/disk.sh \
   src/lib/audit.sh \
+  src/lib/reap.sh \
   src/lib/registry.sh \
+  src/lib/agent_env.sh \
   src/lib/tasks_db.sh \
   src/lib/actor.sh \
+  src/lib/routing_receipt.sh \
   src/lib/a2a_rounds.sh \
   src/cmd_auth.sh \
   src/cmd_account.sh \
@@ -84,6 +87,12 @@ cat \
   src/cmd_agent_create.sh \
   src/cmd_agent_lifecycle.sh \
   src/cmd_agent_config.sh \
+  src/cmd_agent_buzz.sh \
+  src/cmd_agent_buzz_join.sh \
+  src/cmd_agent_buzz_whois.sh \
+  src/cmd_agent_buzz_pair.sh \
+  src/cmd_buzz.sh \
+  src/cmd_agent_buzz_bridge.sh \
   src/cmd_agent_telegram.sh \
   src/cmd_agent_teambot.sh \
   src/cmd_agent_pairing.sh \

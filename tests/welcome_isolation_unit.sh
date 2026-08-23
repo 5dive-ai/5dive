@@ -21,7 +21,11 @@ SRC=src
 TMP=$(mktemp -d /tmp/welcome-iso.XXXXXX)
 
 # shellcheck disable=SC1090
-for f in header.sh lib/error_codes.sh lib/output.sh cmd_agent_pairing.sh; do
+# lib/agent_env.sh joined this list with DIVE-2218: the isolation read moved out of
+# the call site into agent_env_isolation(). An UNSOURCED resolver is not a syntax
+# error in bash — it is `command not found`, an empty `iso`, and the fail-safe arms
+# below staying green while every admin arm goes red. That asymmetry is the tell.
+for f in header.sh lib/error_codes.sh lib/output.sh lib/agent_env.sh cmd_agent_pairing.sh; do
   source "$SRC/$f"
 done
 set +e

@@ -54,16 +54,27 @@ _task_agent_channel() {
   return 1
 }
 
+# DIVE-2538 item 8. The return value is passed straight to `_task_agent_channel`, so
+# it selects WHICH AGENT'S TELEGRAM BOT receives a task notification: the axis is
+# MISROUTE — wrong recipient at the time, not a wrong name in a log after the fact.
+#
+# Both pre-fix arms were forgeable and BOTH had to go. The primary arm was
+# `auto_sender_from_sudo` ($SUDO_USER + an `agent-*` prefix test, validation.sh) and
+# the `${USER:-$(id -un)}` fallback was the ELSE branch — reached only when SUDO_USER
+# is absent or non-agent, i.e. the UNCOMMON case. Two reviews in a row graded the
+# fallback and judged the FUNCTION on it. Recorded because it is the trap here:
+# patching only the fallback leaves the deciding branch untouched AND makes a
+# completeness grep for `${USER:-$(id -un)}` come back clean, so the check certifies
+# the miss. The completeness key for this site is "no forgeable input reaches
+# _task_agent_channel", which is read off the branches — not off the token.
+#
+# `actor_routing_agent` rather than the strict `_gate_authenticated_actor`: this is a
+# routing site, empty means "reaches nobody", and the strict resolver goes empty on
+# `sudo -u claude` — the relay shape this repo's own smoke tests mandate. See its
+# comment in lib/actor.sh for why its SUDO_UID branch is corroborated and why an
+# agent can never reach it.
 _task_owner_channel() {
-  local name="" s
-  s=$(auto_sender_from_sudo)
-  if [[ -n "$s" ]]; then
-    name="$s"
-  else
-    local u="${USER:-$(id -un 2>/dev/null)}"
-    [[ "$u" == agent-* ]] && name="${u#agent-}"
-  fi
-  _task_agent_channel "$name"
+  _task_agent_channel "$(actor_routing_agent)"
 }
 
 # DIVE-1927: is <name> PAIRED AT ALL — independent of whether THIS uid may read
@@ -561,6 +572,15 @@ _task_gate_delivery_log() { # <ok|error> <task_ids> <chat> <message_id> <detail>
   if [[ "${TASK_GATE_ESCALATING:-}" == "1" ]]; then _path="privileged-resend"
   elif [[ "${TASK_GATE_RENAG:-}" == "1" ]]; then _path="renag"
   fi
+  # DIVE-3228: the MODEL, not just the log. A confirmed human send IS a card in
+  # someone's chat, so record it as one here — file-time, re-nag and
+  # privileged-resend all reach this function, which is what makes "one card per
+  # gate however it was delivered" true rather than aspirational. Best-effort by
+  # construction (every write inside is `|| true`): a gate is settled by its task
+  # row, and the card ledger must never be able to fail a delivery.
+  if [[ "$result" == "ok" ]]; then
+    _task_gate_card_record "$idents" "${chat:-}" "${message_id:-}" "$_via" || true
+  fi
   local line
   line=$(printf 'gate-delivery result=%s tasks=%s chat=%s message_id=%s via=%s path=%s detail=%q' \
     "$result" "$idents" "${chat:-none}" "${message_id:-none}" "$_via" "$_path" "${detail:-none}")
@@ -763,7 +783,212 @@ _task_gate_deliveries() { # <ident>
 # harness can exercise this end to end while being physically unable to reach
 # Telegram (_mirror_edit_markup enforces that itself). An opt-in-only fence is
 # the mistake DIVE-1968 removed; this is store identity first, as there.
-_task_gate_retire_buttons() { # <ident> <why>
+# ---- DIVE-3228: the card as a modelled object -------------------------------
+#
+# Everything below replaces "parse gate-notify.log back with awk and hope the
+# message is still what we think it is". The log stays as the pre-table FALLBACK
+# (see _task_gate_card_apply's tail) and for telemetry; it is no longer the model.
+
+# Mint a card, or record that a second message displaced the live one. Called from
+# _task_gate_delivery_log on every CONFIRMED human send, so file-time, re-nag and
+# privileged-resend all land here — one card per gate however it was delivered.
+#
+# WHY IT SUPERSEDES RATHER THAN REFUSING. The partial unique index allows exactly
+# one live card per (task, chat). If a second send happens anyway, the truth is
+# that a second message really is in that chat, and a model that refuses the
+# INSERT would be tidier than reality — the failure mode this whole ticket is
+# about. So the old row is marked superseded and the new one inserted: the index
+# invariant holds, the chat is described accurately, and the digest's buzz count
+# (mints in the window) correctly counts the second buzz as the cost it was.
+_task_gate_card_record() { # <idents-csv> <chat> <message_id> <via>
+  local idents="$1" chat="$2" mid="$3" via="${4:-}"
+  # Same four exclusions the log-based reader applied, for the same reasons: an
+  # agent inbox is not a Telegram chat, and a receipt with no message id is not a
+  # message. A missing `via` is fatal here and not merely untidy — without it no
+  # later edit can resolve a token, which is an orphan by construction.
+  [[ -n "$chat" && "$chat" != "none" && "$chat" != agent:* ]] || return 0
+  [[ -n "$mid" && "$mid" != "none" && "$mid" != "0" ]] || return 0
+  [[ -n "$via" && "$via" != "none" ]] || return 0
+  # `tasks=` is a COMMA LIST — the re-nag batches several gates into one message,
+  # and each of them gets its own card row for the same (chat, message_id).
+  # Split ONCE with IFS scoped to the `read`, rather than juggling a global IFS
+  # around the loop: `for` expands its list before the first iteration, so any
+  # IFS change inside the body is dead code that reads like it matters.
+  local -a _idents=()
+  IFS=',' read -r -a _idents <<<"$idents"
+  local ident tid shape epoch
+  for ident in "${_idents[@]}"; do
+    [[ -n "$ident" && "$ident" != "unknown" ]] || continue
+    tid=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null) || tid=""
+    [[ -n "$tid" ]] || continue
+    shape=$(db "SELECT COALESCE(ask_shape,'') FROM tasks WHERE id=${tid} LIMIT 1;" 2>/dev/null) || shape=""
+    epoch=$(db "SELECT COALESCE(MAX(gate_epoch),0)+1 FROM gate_cards WHERE task_id=${tid};" 2>/dev/null) || epoch=1
+    [[ -n "$epoch" ]] || epoch=1
+    db "UPDATE gate_cards SET state='superseded', updated_at=datetime('now')
+         WHERE task_id=${tid} AND chat_id=$(sqlq "$chat") AND state='live';" >/dev/null 2>&1 || true
+    db "INSERT INTO gate_cards (task_id, ident, gate_epoch, ask_shape, chat_id, message_id, via, state)
+        VALUES (${tid}, $(sqlq "$ident"), ${epoch}, $(sqlq "$shape"), $(sqlq "$chat"), $(sqlq "$mid"), $(sqlq "$via"), 'live');" \
+      >/dev/null 2>&1 || true
+  done
+  return 0
+}
+
+# DIVE-3525: the abandoned cut also carried `_task_gate_card_live_same_ask`, a
+# "does a live card already carry this same ask_shape" reader whose own comment
+# said "the re-file path asks this before sending anything". Nothing called it,
+# there or here. `ask_shape` is still RECORDED on every card (that is the column
+# such a reader would need, and recording it costs one column), but the function
+# is not re-cut: a helper whose comment names a caller that does not exist reads
+# as a shipped suppression rule to the next person and is not one.
+
+# The text a card carries once it stops tracking its row. Two shapes, and the
+# difference is whether a HUMAN decided something.
+#
+# A RECEIPT (main's ruling ii, DIVE-3228): past tense, timestamped, decision
+# named. A struck card that keeps present-tense phrasing reads as a live view of
+# a row it has stopped following — the same class of lie as the phantom card this
+# ticket removes, just quieter. So it must say it is a receipt.
+_task_gate_card_text() { # <ident> <kind: receipt|closed> <why> [answered_by]
+  local ident="$1" kind="$2" why="${3:-}" by="${4:-}"
+  local nt ans at row
+  row=$(db "SELECT COALESCE(need_type,'')||x'1f'||COALESCE(need_answer,'')||x'1f'||COALESCE(need_answered_at,'')
+             FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null) || row=""
+  IFS=$'\x1f' read -r nt ans at <<<"$row"
+  if [[ "$kind" == "receipt" ]]; then
+    # human:y00212 -> y00212. The prefix is provenance for the record, not a name
+    # to show the person who tapped the button.
+    local who="${by#human:}"
+    printf '\xe2\x9c\x85 [%s] %s answered' "$ident" "${nt:-gate}"
+    [[ -n "$ans" ]] && printf ' \xe2\x80\x94 %s' "$ans"
+    [[ -n "$who" ]] && printf ' by %s' "$who"
+    [[ -n "$at" ]] && printf ' at %sZ' "$at"
+    printf '\n\nThis is a receipt. It no longer tracks the task.'
+    return 0
+  fi
+  printf '\xe2\x9b\x94 [%s] this gate is closed' "$ident"
+  [[ -n "$why" ]] && printf ' (%s)' "$why"
+  printf '.\n\nNothing here is live and no action is needed.'
+}
+
+# Drive every live card for a task to its end state.
+#
+#   die      the ask went moot with no human decision — withdrawn, superseded,
+#            parked, auto:reject, done/cancel over an open gate. Nobody decided
+#            anything, so the card is pure noise: DELETE it.
+#   settle   a human answered. The card is THEIR record and must survive: strike
+#            it into a receipt, never delete. A lead:* answer is NOT a human
+#            answer and takes `die` — they never acted, so there is no record of
+#            theirs to keep.
+#
+# WHAT COUNTS AS RETIRED. The old code called a not-modified edit `ok` because
+# the keyboard was already gone — true, and beside the point once the CARD is
+# what we are retiring. Classification now tracks the state reachable from the
+# human's phone: a row is `ok` only when the card is provably gone or provably
+# struck, and ANY outcome that can leave a live-LOOKING card is an error row AND
+# a warn. Already-deleted and already-struck stay ok on purpose — they are the end
+# state reached, and DIVE-2272 alone ran three retire passes over one message, so
+# calling a repeat pass a failure would manufacture alarms for the fixed case.
+_task_gate_card_apply() { # <ident> <mode: die|settle> <why> [answered_by]
+  local ident="$1" mode="$2" why="${3:-gate closed}" by="${4:-}"
+  local _dry=0
+  [[ -n "${FIVEDIVE_NOTIFY_DRYRUN:-}" && "${FIVEDIVE_NOTIFY_DRYRUN}" != "0" ]] && _dry=1
+  if ! _task_human_send_allowed && (( ! _dry )); then
+    return 0
+  fi
+  local tid; tid=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null) || tid=""
+  local rows="" known=0
+  if [[ -n "$tid" ]]; then
+    known=$(db "SELECT COUNT(*) FROM gate_cards WHERE task_id=${tid};" 2>/dev/null) || known=0
+    known="${known:-0}"
+    rows=$(db "SELECT id||x'09'||chat_id||x'09'||message_id||x'09'||via
+                 FROM gate_cards WHERE task_id=${tid} AND state='live';" 2>/dev/null)
+  fi
+  if [[ -z "$rows" ]]; then
+    # THE FALLBACK IS KEYED ON "MODELLED AT ALL", NOT ON "HAS A LIVE CARD" — and
+    # the difference is not academic. Six call sites can retire the same gate, so
+    # the second one along finds every card already dead; keying the fallback on
+    # liveness sent it to the log-based path, which happily re-edited a message we
+    # had just deleted. Measured by the park arm of gate_button_retire_unit
+    # (park runs after the answer has already retired the card). A modelled gate
+    # with no live card has nothing to retire — that IS the end state.
+    if (( known == 0 )); then
+      # PRE-TABLE FALLBACK. A gate delivered before gate_cards existed has no row,
+      # and its message_id lives only in the log. Keep the old behaviour for
+      # exactly that window rather than leaving those cards unretirable; it ages out.
+      _task_gate_retire_buttons_legacy "$ident" "$why"
+    fi
+    return 0
+  fi
+  local cid chat mid via token resp ok desc result detail newstate text
+  while IFS=$'\t' read -r cid chat mid via; do
+    [[ -n "$cid" && -n "$chat" && -n "$mid" ]] || continue
+    token=$(_task_gate_bot_token "$via")
+    if [[ -z "$token" ]]; then
+      # The delivering agent was torn down, so NOBODY can edit this card. That is
+      # an orphan, and it is reported — a live-looking phantom nobody names is the
+      # defect this ticket exists to remove.
+      db "UPDATE gate_cards SET state='orphaned', updated_at=datetime('now'),
+           last_error='no bot token for delivering agent ${via}' WHERE id=${cid};" >/dev/null 2>&1 || true
+      _task_store_audit_log "gate card retire" "error" 1 -- \
+        "task=$ident" "chat=$chat" "message_id=$mid" "via=${via:-none}" "mode=$mode" \
+        "detail=no bot token for the delivering agent; card ORPHANED and still live in that chat" || true
+      warn "$ident: the agent that delivered message $mid in chat $chat is gone, so its gate card cannot be edited by anyone — it is still showing there."
+      continue
+    fi
+    result=error; detail=""; newstate=""
+    if [[ "$mode" == "die" ]]; then
+      resp=$(_mirror_delete_message "$token" "$chat" "$mid") || resp="${resp:-}"
+      ok=$(jq -r '.ok // false' <<<"$resp" 2>/dev/null) || ok=false
+      desc=$(jq -r '.description // empty' <<<"$resp" 2>/dev/null) || desc=""
+      if [[ "$ok" == "true" ]]; then
+        result=ok; detail="card deleted"; newstate="deleted"
+      elif [[ "$desc" == *"message to delete not found"* ]]; then
+        result=ok; detail="card already gone"; newstate="gone"
+      else
+        # Telegram refuses a delete past 48h and in some chat types. Fall back to a
+        # visible strike so the end state stays reachable, and name the reason so
+        # the fallback is diagnosable rather than mysterious.
+        detail="delete refused (${desc:-unknown})"
+      fi
+    fi
+    if [[ "$result" != "ok" ]]; then
+      if [[ "$mode" == "settle" ]]; then
+        text=$(_task_gate_card_text "$ident" receipt "$why" "$by")
+      else
+        text=$(_task_gate_card_text "$ident" closed "$why")
+      fi
+      resp=$(_mirror_edit_text "$token" "$chat" "$mid" "$text") || resp="${resp:-}"
+      ok=$(jq -r '.ok // false' <<<"$resp" 2>/dev/null) || ok=false
+      desc=$(jq -r '.description // empty' <<<"$resp" 2>/dev/null) || desc=""
+      if [[ "$ok" == "true" ]]; then
+        result=ok; detail="${detail:+${detail}; }card struck"; newstate="struck"
+      elif [[ "$desc" == *"not modified"* ]]; then
+        result=ok; detail="${detail:+${detail}; }card already struck"; newstate="struck"
+      elif [[ "$desc" == *"message to edit not found"* ]]; then
+        # Deleted out of band — they cleared their chat. The end state, and the
+        # next state change on an open gate mints a fresh card.
+        result=ok; detail="${detail:+${detail}; }card already gone"; newstate="gone"
+      else
+        result=error; detail="${detail:+${detail}; }strike FAILED (${desc:-unknown})"; newstate=""
+      fi
+    fi
+    if [[ -n "$newstate" ]]; then
+      db "UPDATE gate_cards SET state=$(sqlq "$newstate"), updated_at=datetime('now'), last_error=NULL
+           WHERE id=${cid};" >/dev/null 2>&1 || true
+    else
+      db "UPDATE gate_cards SET updated_at=datetime('now'), last_error=$(sqlq "$detail")
+           WHERE id=${cid};" >/dev/null 2>&1 || true
+    fi
+    _task_store_audit_log "gate card retire" "$result" \
+      "$([[ "$result" == "ok" ]] && echo 0 || echo 1)" -- \
+      "task=$ident" "chat=$chat" "message_id=$mid" "via=${via:-none}" \
+      "mode=$mode" "why=$why" "detail=${detail:-unconfirmed Bot API call}" || true
+    [[ "$result" == "ok" ]] || warn "$ident: could not retire the gate card on message $mid in chat $chat (${detail}) — it may still read as a live gate there."
+  done <<<"$rows"
+  return 0
+}
+
+_task_gate_retire_buttons_legacy() { # <ident> <why>
   local ident="$1" why="${2:-gate closed}"
   local _dry=0
   [[ -n "${FIVEDIVE_NOTIFY_DRYRUN:-}" && "${FIVEDIVE_NOTIFY_DRYRUN}" != "0" ]] && _dry=1
@@ -1401,13 +1626,48 @@ _task_gate_reply_cta() { # <ident> <need_type> <options> <recommend> <has_tap>
     *) return 0 ;;
   esac
   [[ -n "$_ex" ]] || return 0
-  _out="🔐 High-stakes gate (spend, secrets or irreversible)."$'\n'
-  _out+="Tap a button on this message to answer. That is the expected path, and a tap is never rejected."$'\n\n'
-  _out+="Recovery only, if the button is stale, already used, or the tap rail is down: reply in this chat with exactly"$'\n'
-  _out+="    ${_id} ${_ex}"
+  # DIVE-3661 (lodar, 2026-08-21): the five-paragraph tap/recovery/attestation
+  # block is gone — founders stopped reading the messages it rode on. The button
+  # is the affordance; what survives is the one fallback a human needs when a
+  # re-nagged button has gone stale (DIVE-2818's case), on its own line so a
+  # copied reply carries exactly `<ident> <value>`. Attestation mechanics belong
+  # to the RECORD, not the chat; the 3600s reply ceiling is unchanged and still
+  # graded by tests/gate_reply_to_clear_unit.sh R4.
+  _out="🔐 High-stakes — if the button fails, reply:"$'\n'"    ${_id} ${_ex}"
   [[ -n "$_alt" ]] && _out+=$'\n'"(or:  ${_id} ${_alt})"
-  _out+=$'\n\n'"A typed reply is attested by Telegram, so the record can show a human answered rather than the agent that asked. A reply stays citable for 1 hour."
   printf '%s' "$_out"
+}
+
+# DIVE-3661: the ONE-LINE ask for a gate message. The spec's budget is WORDS
+# ("~15 words, 3-second read"), so the budget here is words — iteration 1 spent
+# it in characters (180 ≈ 30 words) and quinn's corpus render showed 51% of the
+# live board's asks still over spec while every hand-picked fixture passed:
+# community/wiki/a-char-budget-is-not-a-word-budget-render-the-real-corpus.md.
+# Rules: stop at the first sentence end inside the budget (tokens ending . ? !,
+# with e.g./i.e./etc./vs. exempt so an abbreviation is not a sentence end);
+# otherwise cut at WORD_MAX words with a real ellipsis. A sentence that runs a
+# couple of words past the target is kept whole (SOFT_MAX) — "…gets its one
+# as-shipped run?" at 16 words reads better finished than chopped at 15.
+_task_gate_ask_line() { # <ask>
+  local a="${1:-}" WORD_MAX=15 SOFT_MAX=18 n=0 w end=0
+  # shellcheck disable=SC2086
+  set -- $a
+  (( $# <= SOFT_MAX )) && { printf '%s' "$a"; return 0; }
+  # Pass 1: the earliest sentence end within SOFT_MAX (so a sentence finishing a
+  # couple of words past WORD_MAX is kept whole rather than chopped mid-question).
+  for w in "$@"; do
+    n=$((n+1)); (( n > SOFT_MAX )) && break
+    case "$w" in
+      e.g.|i.e.|etc.|vs.|cf.) : ;;                    # abbreviation, not a sentence end
+      *\?|*\!|*.) end=$n; break ;;
+    esac
+  done
+  # Pass 2: emit — a found sentence whole, else WORD_MAX words + ellipsis.
+  if (( end > 0 )); then
+    printf '%s' "${*:1:end}"
+  else
+    printf '%s…' "${*:1:WORD_MAX}"
+  fi
 }
 
 _task_gate_reply_markup() { # <row_id> <type> <options> <recommend> <nonce> <channel_type> [label]
@@ -1627,6 +1887,42 @@ _task_need_route_deliver() {
   local role="${TASK_GATE_ROUTE_ROLE:-review}"
   TASK_GATE_ROUTE_STATE="failed"
   [[ -n "$reviewer" ]] || return 3
+
+  # ── DIVE-3474 arm 2 — THE GATE QUEUES; IT DOES NOT INTERRUPT ────────────────
+  #
+  # THE COST IS THE WAKE, NOT THE MESSAGE. Measured 2026-08-12: 222 a2a sends,
+  # 387 KB fleet-wide in 24h — under 0.5% of fleet burn. Length is not the
+  # quantity to attack. What is expensive is that every inbound to a NON-FRESH
+  # seat (main, marketing) starts a turn that re-sends that seat's whole
+  # accumulated window, and `5dive agent send` below is exactly that event.
+  #
+  # AND THE GATE ITSELF STAYS. The obvious "fix" — auto-apply when the lead would
+  # only have agreed with the filer — is refuted by the board's own number: of
+  # 121 answered gates, 54 returned exactly the filer's recommendation, so
+  # auto-applying would have been WRONG on the other 67. A gate that disagrees
+  # with its filer 55% of the time is doing real work. Same decision, same
+  # record, same clearer: only the INTERRUPT is removed.
+  #
+  # So the default is to leave the gate where the reviewer will find it on its
+  # next natural wake (`5dive task queue`, and the wake preamble that names it)
+  # rather than to manufacture a wake for it. `--urgent` is the filer's explicit
+  # opt-out, and it is a SEPARATE FIELD from --recommend on purpose: "I think this
+  # cannot wait" and "I think the answer is X" are different claims, and the
+  # measured 54/121 is precisely what happens when the second is read as the first.
+  #
+  # WHY THIS IS NOT A LOST DECISION, which is the failure mode a queue invites:
+  # the row is already blocked + pending, so it is on the board, in the digest, in
+  # `task queue --for=<reviewer>`, and the heartbeat gate re-nag still escalates an
+  # unanswered routed gate — over the agent rail first and to the paired human
+  # after _HB_GATE_AGENT_RAIL_HOURS. Nothing here shortens that ladder; it only
+  # declines to fire the FIRST rung at file time.
+  if [[ "${TASK_GATE_ROUTE_URGENT:-0}" != "1" ]]; then
+    TASK_GATE_ROUTE_STATE="queued"
+    _task_gate_delivery_log ok "$ident" "queue:${reviewer}" "" \
+      "lead-route gate QUEUED for ${reviewer} (${role}) — no a2a send, no wake (DIVE-3474); answerable from the queue at their next turn"
+    TASK_GATE_DELIVERY_ROWS=$(( ${TASK_GATE_DELIVERY_ROWS:-0} + 1 ))
+    return 0
+  fi
   # The ident, not the row id: _task_gate_delivery_log resolves numeric ids with a
   # DB read, and the detached child must not touch the store the parent is writing.
   local msg="🧭 [${ident}] routed to you for ${role} (${need_type} gate). ${ask}"
@@ -1733,8 +2029,8 @@ _task_need_notify_deliver() {
   # the filer, so everything below must key off the gate row's own filer.
   local _self; _self="${TASK_GATE_FILER:-}"; [[ -n "$_self" ]] || _self=$(task_actor "")
   # DIVE-1968: try the FILER'S OWN channel BY NAME before anything else.
-  # `_task_owner_channel` resolves the CALLER (auto_sender_from_sudo -> $SUDO_USER,
-  # else $USER, and only when either is agent-*), never the gate's filer. So it is
+  # `_task_owner_channel` resolves the CALLER (DIVE-2538: `actor_routing_agent` —
+  # the caller's own euid, else a sudo-stamped SUDO_UID), never the gate's filer. So it is
   # a structural no-op in precisely the two contexts that matter — the root re-nag
   # sweep and the privileged re-send, where the name resolves EMPTY and
   # `_task_agent_channel ""` returns 1 immediately — and when a PEER agent drives
@@ -1829,12 +2125,12 @@ _task_need_notify_deliver() {
   # number, which diverges from the row id once a non-default project consumes
   # global ids (DIVE-484/DIVE-561), and for a non-DIVE prefix wouldn't strip at
   # all — either way the tap would resolve the WRONG row (DIVE-561).
-  # One message. Blank lines separate the header / ask / options so a long ask
-  # doesn't render as an unreadable wall on mobile. No footer: tap buttons cover
-  # decision/approval, and button-less gates (secret/manual) still surface on
-  # the dashboard "Needs you" card — a redirect line is just noise in chat.
-  # Options are listed one per line (numbered to match the tap buttons) so long
-  # labels stay readable even when Telegram crops the button text.
+  # One message. Blank lines separate the header / ask / options so the message
+  # stays scannable on mobile. No footer: tap buttons cover decision/approval,
+  # and button-less gates (secret/manual) still surface on the dashboard
+  # "Needs you" card — a redirect line is just noise in chat. The numbered
+  # Options list survives only on button-less channels (DIVE-3661; see the
+  # guarded block below the markup computation).
   # DIVE-148: lead with the agent's recommendation (✅ Recommended: <X>) before
   # the ask, so the human sees the advised choice first instead of hunting for
   # it. Applies to decision + approval gates; NULL/empty recommend = no line.
@@ -1842,6 +2138,14 @@ _task_need_notify_deliver() {
   # chat message IS the record the human answers from. Read from the ROW, not from a
   # parameter (DIVE-2090, same reason the secret branch below does): the batch
   # re-send calls this with whatever it happens to be holding.
+  # DIVE-3661 iteration 3: the buttons are computed FIRST so every prose line
+  # below can key on what they actually say (never a re-derivation that drifts —
+  # community/wiki/a-duplication-predicate-must-ask-what-the-other-surface-actually-says.md).
+  # Contract comments for this builder live above _task_gate_reply_markup and at
+  # the DIVE-117/118 block further down.
+  local reply_markup
+  reply_markup=$(_task_gate_reply_markup "$numid" "$need_type" "$options" "$recommend" "$human_nonce" "$TASK_CH_TYPE")
+
   local _gmode
   _gmode=$(db "SELECT COALESCE(gate_mode,'') FROM tasks WHERE id=${numid};" 2>/dev/null || echo "")
   local text="🙋 [${ident}] needs you"
@@ -1854,26 +2158,32 @@ _task_need_notify_deliver() {
   # the manager's own gate and there is no way to tell whose ask it is.
   [[ -n "${TASK_NOTIFY_ESCALATED_FROM:-}" ]] \
     && text+=$'\n'"↑ filed by ${TASK_NOTIFY_ESCALATED_FROM} (no channel of its own) — escalated to you"
-  [[ -n "$recommend" ]] && text+=$'\n\n'"✅ Recommended: ${recommend}"
-  # OSS-11 (DIVE-976): cite the precedent that sourced the recommendation so the
-  # human sees WHY this choice is advised and can catch a wrong recall.
-  [[ -n "$precedent_cite" ]] && text+=$'\n'"↩︎ ${precedent_cite}"
+  # DIVE-3661 iteration 3: print the line ONLY when the recommendation is not
+  # already readable off a button. A DECISION gate's ⭐ first button carries the
+  # recommended value verbatim (the line was the same words twice, one apart);
+  # an APPROVAL/SECRET gate's buttons are generic verbs, so here the line is the
+  # recommendation's ONLY copy. Predicate = the markup string itself. A recommend
+  # whose text JSON-escapes differently (embedded quotes) misses the substring
+  # and prints anyway — that direction fails safe (duplicate, never lost).
+  if [[ -n "$recommend" && "$reply_markup" != *"$recommend"* ]]; then
+    text+=$'\n\n'"✅ Recommended: ${recommend}"
+    # OSS-11 (DIVE-976): cite the precedent that sourced the recommendation so the
+    # human sees WHY this choice is advised and can catch a wrong recall. Rides
+    # the Recommended line: a ⭐ button carries the choice, but a citation line
+    # floating with no visible recommendation above it reads unanchored; the full
+    # precedent stays one tap away in /task detail.
+    [[ -n "$precedent_cite" ]] && text+=$'\n'"↩︎ ${precedent_cite}"
+  fi
   # DIVE-390: append a bare, tappable /task_<id> link inline at the end of the
   # description sentence, before the options (Mark 2026-06-15). Telegram
   # auto-linkifies bare /commands, so tapping it fires the plugin's
   # ^/task_(\d+)$ handler -> `5dive task show <id>` (the full detail card). No
   # "details" label, numeric id only. A plain-text host shows an inert link.
-  text+=$'\n\n'"${ask} /task_${numid}"
-  if [[ "$need_type" == "decision" && -n "$options" ]]; then
-    local opts_list
-    # ⭐-mark the recommended option in the numbered list (numbering stays the
-    # original option order so it still maps to need_options on the dashboard).
-    opts_list=$(printf '%s' "$options" | jq -Rr --arg r "$recommend" '
-      ($r | gsub("^\\s+|\\s+$"; "")) as $rr
-      | [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ]
-      | to_entries | map("  \(.key + 1). \(.value)\(if .value == $rr and ($rr|length)>0 then " ⭐" else "" end)") | join("\n")' 2>/dev/null) || opts_list=""
-    [[ -n "$opts_list" ]] && text+=$'\n\n'"Options:"$'\n'"${opts_list}"
-  fi
+  # DIVE-3661: the FIRST delivery is the message a founder actually reads — the
+  # /inbox batch is only the re-send — so the one-line ask applies here too
+  # (quinn's iteration-1 grade caught this path still emitting the full ask).
+  # The full ask stays one tap away behind /task_<id>.
+  text+=$'\n\n'"$(_task_gate_ask_line "$ask") /task_${numid}"
 
   # DIVE-356: secret/manual gates used to carry NO instruction on how to clear
   # them — the core of Mark's "a needs-you that needs no obvious action is
@@ -1931,8 +2241,25 @@ _task_need_notify_deliver() {
   # DIVE-1490: the initial alert and every re-nag share this exact renderer, so
   # option indexing, recommendation ordering, nonce handling, and the plugin
   # allowlist cannot drift between first delivery and subsequent reminders.
-  local reply_markup
-  reply_markup=$(_task_gate_reply_markup "$numid" "$need_type" "$options" "$recommend" "$human_nonce" "$TASK_CH_TYPE")
+  # (The computation itself moved ABOVE the text composition in DIVE-3661
+  # iteration 3, so the Recommended line's suppression predicate can read the
+  # markup this call actually produced; this comment stays with the contract.)
+
+  # DIVE-3661: the numbered Options list prints ONLY when no keyboard landed —
+  # beside buttons it was a verbatim duplicate of what the human can already tap
+  # (same rule as the /inbox batch site). ⭐ marks the recommended option, and
+  # numbering stays the original option order so it still maps to need_options
+  # on the dashboard. Moved below the markup computation so the predicate is the
+  # markup this call actually produced, not a re-derivation that could drift
+  # (the DIVE-2824 rule).
+  if [[ -z "$reply_markup" && "$need_type" == "decision" && -n "$options" ]]; then
+    local opts_list
+    opts_list=$(printf '%s' "$options" | jq -Rr --arg r "$recommend" '
+      ($r | gsub("^\\s+|\\s+$"; "")) as $rr
+      | [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ]
+      | to_entries | map("  \(.key + 1). \(.value)\(if .value == $rr and ($rr|length)>0 then " ⭐" else "" end)") | join("\n")' 2>/dev/null) || opts_list=""
+    [[ -n "$opts_list" ]] && text+=$'\n\n'"Options:"$'\n'"${opts_list}"
+  fi
 
   # DIVE-2818: the reply-to-clear prompt, on HIGH-STAKES gates only.
   #

@@ -177,6 +177,148 @@ printf '{"type":"user","timestamp":"%s","message":{"content":"A session-scoped S
 t "drift: freshly-armed goal -> empty (grace)" \
   "" "$(_sup_goal_drift claude "$GH" gdrift "$NOW_R" "$NOW_R")"
 
+# ── DIVE-3667: fleet rollup counts every class ──────────────────────────────
+# The defect these arms pin: the tick enumerated five classes by hand, so
+# `stalled` — actionable work stranded on a seat not working it — was absent
+# from the counters, the log line and the heartbeat row's signals, while the
+# board printed it correctly. Measured 2026-08-22: six consecutive
+# observe/stalled/idle-stranded rows in supervisor_events under a log line
+# reading "17 agents — 16 healthy / 0 slow / 0 drift / 0 stuck". The only
+# symptom was a total that did not add up, which is why arm 3 asserts the SUM
+# and not just the presence of the word.
+_snap() {  # <class>:<n> ... -> a snapshot array of that shape
+  local out="[]" c n i
+  for spec in "$@"; do
+    c="${spec%%:*}"; n="${spec##*:}"
+    for (( i = 0; i < n; i++ )); do
+      out=$(jq -c --arg c "$c" '. + [{classification:$c}]' <<<"$out")
+    done
+  done
+  printf '%s' "$out"
+}
+
+# 1. clean fleet — every bucket zero, nothing degraded, line does not grow
+CLEAN=$(_snap healthy:17)
+t "rollup: clean fleet counts 17 healthy, 0 unclassified" \
+  "17	0	0	0	0	0	0	0	0	0" "$(_sup_rollup_counts "$CLEAN")"
+read -r H SL ST DR VC SA NO UP QE OT <<<"$(_sup_rollup_counts "$CLEAN")"
+t "rollup: clean fleet is healthy" \
+  "healthy" "$(_sup_fleet_class $H $SL $ST $DR $VC $SA $NO $UP $QE $OT)"
+t "rollup: clean fleet adds no suffix (line must not grow)" \
+  "" "$(_sup_rollup_extra 0 0 0 0 0)"
+
+# 2/3. THE MEASURED SHAPE — 17 seats, one stalled. Before this fix the line read
+# "17 agents — 16 healthy / 0 slow / 0 drift / 0 stuck" and the seat was unnamed.
+STRANDED=$(_snap healthy:16 stalled:1)
+read -r H SL ST DR VC SA NO UP QE OT <<<"$(_sup_rollup_counts "$STRANDED")"
+t "rollup: the stalled seat is COUNTED" "1" "$SA"
+t "rollup: the stalled seat is NAMED in the line" \
+  " / 1 stalled" "$(_sup_rollup_extra "$SA" "$NO" "$UP" "$QE" "$OT")"
+t "rollup: a stranded fleet is degraded, not healthy" \
+  "degraded" "$(_sup_fleet_class $H $SL $ST $DR $VC $SA $NO $UP $QE $OT)"
+# The invariant. Its violation ("16 of 17") was the ONLY visible symptom, so it
+# is the assertion that would have failed before the fix.
+t "rollup: printed buckets sum to the agent count" \
+  "17" "$(( H + SL + ST + DR + VC + SA + NO + UP + QE + OT ))"
+
+# 4. a class added AFTER this commit must not vanish the same way
+NEWCLS=$(_snap healthy:2 wedged-in-2027:1)
+read -r H SL ST DR VC SA NO UP QE OT <<<"$(_sup_rollup_counts "$NEWCLS")"
+t "rollup: an unknown class lands in unclassified, not nowhere" "1" "$OT"
+t "rollup: an unknown class still degrades the fleet" \
+  "degraded" "$(_sup_fleet_class $H $SL $ST $DR $VC $SA $NO $UP $QE $OT)"
+t "rollup: an unknown class is flagged in the line" \
+  " / ⚠ 1 unclassified" "$(_sup_rollup_extra "$SA" "$NO" "$UP" "$QE" "$OT")"
+
+# 5. The DELIBERATE exclusions. _sup_fleet_class takes all ten counts precisely
+# so these are a testable choice and not an argument someone forgot to pass.
+# Mutant caught: folding update-pending into the degraded sum paints every box
+# degraded the night of a publish; folding in drift does the same on a /goal
+# that nothing ever acts on.
+UPD=$(_snap healthy:9 update-pending:8)
+read -r H SL ST DR VC SA NO UP QE OT <<<"$(_sup_rollup_counts "$UPD")"
+t "rollup: update-pending is counted" "8" "$UP"
+t "rollup: a fleet that is only update-pending stays HEALTHY" \
+  "healthy" "$(_sup_fleet_class $H $SL $ST $DR $VC $SA $NO $UP $QE $OT)"
+t "rollup: update-pending is still named in the line" \
+  " / 8 update-pending" "$(_sup_rollup_extra $SA $NO $UP $QE $OT)"
+DRF=$(_snap healthy:4 drift:2)
+read -r H SL ST DR VC SA NO UP QE OT <<<"$(_sup_rollup_counts "$DRF")"
+t "rollup: a fleet that is only drift stays HEALTHY" \
+  "healthy" "$(_sup_fleet_class $H $SL $ST $DR $VC $SA $NO $UP $QE $OT)"
+
+# 6. the other work-is-not-moving classes DO degrade (mutant: dropping any one
+# from the sum leaves an alerting class reported as a healthy fleet)
+for cls in slow stuck verify-challenge no-output quota-exhausted stalled; do
+  read -r H SL ST DR VC SA NO UP QE OT <<<"$(_sup_rollup_counts "$(_snap healthy:3 "${cls}:1")")"
+  t "rollup: ${cls} alone degrades the fleet" \
+    "degraded" "$(_sup_fleet_class $H $SL $ST $DR $VC $SA $NO $UP $QE $OT)"
+done
+
+# 7. empty fleet must not crash or report a negative unclassified
+t "rollup: empty snapshot is all zeros" \
+  "0	0	0	0	0	0	0	0	0	0" "$(_sup_rollup_counts '[]')"
+
+# 8. multiple non-zero buckets keep a stable, readable order
+t "rollup: suffix order is stalled, no-output, update-pending, quota, unclassified" \
+  " / 1 stalled / 2 no-output / 3 update-pending / 4 quota-exhausted / ⚠ 5 unclassified" \
+  "$(_sup_rollup_extra 1 2 3 4 5)"
+
+# 9. CALL SITES. The helpers being correct is not the tick USING them — the
+# classic "control enforced on one path, absent on the parallel one". The board
+# and the tick are exactly that pair, and the tick is the half that had the
+# defect. `declare -f` reads the PARSED function body, so this survives comment
+# and whitespace drift in the file in a way grep would not.
+TICKBODY="$(declare -f cmd_supervisor_tick)"
+t "call site: the tick counts via _sup_rollup_counts" \
+  "yes" "$(grep -qF '_sup_rollup_counts' <<<"$TICKBODY" && echo yes || echo no)"
+t "call site: the tick's heartbeat verdict comes from _sup_fleet_class" \
+  "yes" "$(grep -qF '_sup_fleet_class' <<<"$TICKBODY" && echo yes || echo no)"
+t "call site: the tick's log line appends _sup_rollup_extra" \
+  "yes" "$(grep -qF '_sup_rollup_extra' <<<"$TICKBODY" && echo yes || echo no)"
+# The heartbeat row is the DENOMINATOR (DIVE-975). Before this change its JSON
+# omitted verifyChallenge — which DROVE fleet_class — so the row could not
+# explain its own verdict, and no later query could recover a stalled rate.
+# The two JSONs are checked SEPARATELY and by their distinct jq syntax
+# (`k:$var` in the heartbeat, `k:($var|tonumber)` in the ok line). Grepping the
+# whole function body for "k:" passes on either one alone — the first cut of
+# this arm did exactly that and survived a mutant that emptied the heartbeat.
+SIGPROG="$(awk '/sig=\$\(jq -nc/,/anomalyRows/' <<<"$TICKBODY")"
+OKLINE="$(grep -F 'supervisor tick: ${total} agents' <<<"$TICKBODY")" || OKLINE=""
+for k in stalled noOutput updatePending quotaExhausted unclassified verifyChallenge; do
+  t "call site: heartbeat signals carry ${k}" \
+    "yes" "$(grep -qF "${k}:\$" <<<"$SIGPROG" && echo yes || echo no)"
+  t "call site: the tick's --json carries ${k}" \
+    "yes" "$(grep -qF "${k}:(\$" <<<"$OKLINE" && echo yes || echo no)"
+done
+
+# 10. set -e. This harness runs `set -uo pipefail` WITHOUT -e; the shipped CLI
+# runs `set -euo pipefail` (src/header.sh). A helper built from
+# `(( n > 0 )) && out+=...` returns non-zero on the all-zero path, so the clean-
+# fleet case is exactly the one an -e-less harness cannot see — and a clean
+# fleet is the common case, i.e. the tick would abort every night but the bad
+# one. Run the real thing under -e in a subshell.
+# It has to be a FRESH `bash -c`, not `$( set -e; ... ) || fallback`. In the
+# latter the whole substitution is the left arm of an AND-OR list, which
+# SUPPRESSES -e inside it — so the obvious spelling of this arm passes against
+# a helper that does abort. Measured while writing it: the mutant that returns
+# the failed (( )) survived the $( ) form and is caught by this one.
+SETE_OUT=$(bash -c '
+  set -euo pipefail
+  STATE_DIR=$(mktemp -d); JSON_MODE=0
+  cd "'"$PWD"'"
+  for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
+           lib/state.sh lib/audit.sh lib/registry.sh lib/tasks_db.sh cmd_supervisor.sh; do
+    . "src/$f"
+  done
+  fc=$(_sup_fleet_class 17 0 0 0 0 0 0 0 0 0)
+  ex=$(_sup_rollup_extra 0 0 0 0 0)
+  read -r h _ <<<"$(_sup_rollup_counts "[{\"classification\":\"healthy\"},{\"classification\":\"healthy\"}]")"
+  printf "%s|%s|%s" "$fc" "$ex" "$h"
+' 2>/dev/null) || SETE_OUT="ABORTED-UNDER-SET-E"
+t "set -e: the clean-fleet path does not abort the tick" \
+  "healthy||2" "$SETE_OUT"
+
 echo
 echo "supervisor_unit: ${PASS} passed, ${FAIL} failed"
 (( FAIL == 0 ))

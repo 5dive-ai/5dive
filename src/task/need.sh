@@ -45,6 +45,40 @@ cmd_task_precedent() {
   esac
 }
 
+# DIVE-3481: the kill switch for the inert push-for-review auto-clear. Default ON,
+# unlike `task precedent` above — this one IS the deliverable rather than an
+# experiment, and the whole point is that a routine branch push stops waking the lead.
+# `off` restores the tier-1 lead ping byte-for-byte and needs no release to take
+# effect. Read-only `status` needs no privilege; on/off is a policy write.
+cmd_task_pfr_autoclear() {
+  tasks_db_init
+  local sub="${1:-status}"
+  case "$sub" in
+    status|"")
+      local v; v=$(_task_pref_get pfr_autoclear); v="${v:-on}"
+      ok "inert push-for-review auto-clear: ${v}" \
+         '{pref:"pfr_autoclear", value:$v}' --arg v "$v"
+      ;;
+    on|enable)
+      _task_pref_set pfr_autoclear on
+      # DIVE-2054: a fleet-wide pref toggle keyed off the active store — fenced.
+      _task_store_audit_log "task pfr-autoclear" "on" 0 -- "pref=pfr_autoclear" || true
+      ok "inert push-for-review auto-clear: ON — an approval gate whose ask is an inert branch push, on a row with a non-protected Branch: binding, clears at filing with provenance auto:pfr and pings nobody" \
+         '{pref:"pfr_autoclear", value:"on"}'
+      ;;
+    off|disable)
+      _task_pref_set pfr_autoclear off
+      # DIVE-2054: same as the "on" branch above — fenced.
+      _task_store_audit_log "task pfr-autoclear" "off" 0 -- "pref=pfr_autoclear" || true
+      ok "inert push-for-review auto-clear: OFF — every push-for-review gate routes to the lead again" \
+         '{pref:"pfr_autoclear", value:"off"}'
+      ;;
+    *)
+      fail "$E_USAGE" "usage: 5dive task pfr-autoclear [on|off|status]"
+      ;;
+  esac
+}
+
 # DIVE-1145: ship-gating routing policy switch. `5dive task routing [on|off]`
 # (bare / `status` reports state). When ON, a NON-lead agent's decision gate
 # (tier < 2) routes to the org lead first (see cmd_task_need) instead of pinging
@@ -295,6 +329,19 @@ _gate_push_for_review_hit() {
     [[ "$requested" =~ $_GATE_PUSH_NOT_INERT_RX ]] && return 1
   fi
   return 0
+}
+
+# DIVE-3481 — 0 iff <1> names a PROTECTED ref, i.e. one an inert push-for-review may
+# never target. Superset of the `main|master|HEAD` list `5dive push` itself refuses,
+# deliberately: this predicate decides whether a HUMAN IS SKIPPED, so it fails closed
+# wider than the executor's own refusal rather than exactly at it. Case-insensitive —
+# a binding is prose a person typed, and `Main` is the same ref as `main`.
+_gate_pfr_protected_ref() {
+  case "$(printf '%s' "${1-}" | tr '[:upper:]' '[:lower:]')" in
+    main|master|head|trunk|prod|production|release|staging|develop|dev) return 0 ;;
+    release/*|prod/*|production/*|hotfix/*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # 0 iff $1 (already lowercased, punctuation trimmed) has the shape of a git ref.
@@ -1329,6 +1376,7 @@ cmd_task_need() {
   tasks_db_init
   local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw="" discusses="" needs="" oob="" rubber_stamp="" gate_mode=""
   local gate_owner=""   # DIVE-3342
+  local urgent=0        # DIVE-3474 arm 2
   # DIVE-2627: which flag supplied each prose value (see _read_prose_file).
   local ask_src="" recommend_src=""
   local -a positional=()
@@ -1356,6 +1404,13 @@ cmd_task_need() {
       # now moot (e.g. a secret gate for fixtures never needed). This is NOT a
       # grant — it never records a secret/approval as provided — so it is safe for
       # the gate's filer or an org lead to run without a human tap. See branch below.
+      # DIVE-3474 arm 2: the filer's explicit "this cannot wait". A SEPARATE FIELD
+      # from --recommend, and the separation is the whole point — of 121 answered
+      # gates, 54 returned exactly the filer's recommendation, so a recommendation
+      # is evidence about the ANSWER and never about the CLOCK. Without this flag a
+      # routed gate is QUEUED for the reviewer's next natural wake instead of
+      # waking their window; with it, the file-time a2a ping fires as it did before.
+      --urgent)      urgent=1 ;;
       --withdraw)    withdraw=1 ;;
       # DIVE-931 secure credential drop: name WHERE a secret gate's value lands.
       # Both together enable the burnable drop link in the gate message.
@@ -1555,7 +1610,7 @@ cmd_task_need() {
     # question is gone, so the button must go with it. A withdrawal is the path
     # most likely to leave a stale button standing, because unlike an answer
     # nothing about it ever reaches the human's chat.
-    _task_gate_retire_buttons "$ident" "withdrawn by ${w_name:-$w_kind}" || true
+    _task_gate_card_apply "$ident" die "withdrawn by ${w_name:-$w_kind}" || true
     local w_new; w_new=$(db "SELECT status FROM tasks WHERE id=${id};")
     ok "$ident gate withdrawn (${w_type}) — moot request cleared, no secret/grant recorded; task now ${w_new}" \
        '{ident:$id, withdrawn:true, was_type:$wt, status:$st}' \
@@ -1565,6 +1620,20 @@ cmd_task_need() {
 
   valid_need_type "$type" || fail "$E_VALIDATION" "bad --type '$type' (decision|secret|approval|manual|access)"
   [[ -n "$ask" ]] || fail "$E_USAGE" "--ask is required (what does the human need to provide?)"
+
+  # DIVE-3661 (lodar): a gate message renders ONE line of ask — the first
+  # sentence, budgeted at ~15 WORDS so a human gets it in ~3 seconds. Warn
+  # (never refuse) the filer whose ask will be cut: everything past the cut
+  # reaches nobody until the /task detail is opened, so the fix is a shorter
+  # first sentence with the mechanism moved to the body. Advisory by design —
+  # a refusal here would bounce urgent gates over prose. The renderer itself is
+  # the predicate (an ellipsis means it truncated), so this cannot drift from
+  # what actually renders.
+  if type _task_gate_ask_line >/dev/null 2>&1; then
+    local _ask_render; _ask_render=$(_task_gate_ask_line "$ask")
+    [[ "$_ask_render" == *… ]] \
+      && warn "the ask overflows the gate message's ~15-word budget and will render cut: \"${_ask_render}\" — lead with the decision in one short sentence; detail belongs in the task body."
+  fi
 
   # DIVE-2089: --discusses is a DECISION-only appeal. approval / manual / secret /
   # access declare an ACTION by construction, so "I'm only discussing it" is not a
@@ -2391,7 +2460,7 @@ cmd_task_need() {
         "tapbacks=${_rs_taps}/${_rs_tot}" "reason=tier-2 with a recommendation and no declared capability" || true
       fail "$E_VALIDATION" "$ident: refusing this --tier=2 ${type} gate. You wrote --recommend=\"${recommend}\", which means you have already decided — what is left is asking a person to agree, and that is reassurance, not a gate. (Measured 2026-07-16..08-07: 96 of 107 judgment gates carrying a recommendation came back as the human tapping that same value. Only 7 gates in 346 were floored by category; the rest of tier 2 was typed by hand.) A tier is a CAPABILITY, not a difficulty. Your exits:
   --tier=0    apply \"${recommend}\" NOW. No ping, and still a permanent gate record plus a digest line. This is the exit you want on a decision you have already made — it was used 0 times in the 346 gates measured, which is a discoverability failure, not a missing feature.
-  --tier=1    route to your lead, or to this task's verifier if it carries a loop — except a push-for-review ask, which goes to the LEAD even on a loop, because the verifier cannot read the diff until it is pushed (DIVE-3117); the 48h TTL applies your recommendation if nobody answers. Use it when you want a second pair of eyes, not a person's authority.
+  --tier=1    route to your lead, or to this task's verifier if it carries a loop — except a push-for-review ask, which goes to the LEAD even on a loop, because the verifier cannot read the diff until it is pushed (DIVE-3117); the 48h TTL applies your recommendation if nobody answers, on a decision (NOT on approval/manual/access/secret, which the sweep excludes — DIVE-2235). Use it when you want a second pair of eyes, not a person's authority. DIVE-3481: an --type=approval ask that is an INERT branch push, on a row whose 'Branch:' binding names a non-protected ref, clears at filing instead and pings nobody (\`5dive task pfr-autoclear off\` restores the ping).
   --needs=human_tap|spend_authority|secret_provision    DECLARE the human-held capability this ask consumes (a person's call on brand/strategy, money, or a credential only a human can issue). Tier 2 by declaration, never refused here.
   --rubber-stamp-ok=\"<why a person must answer this despite your recommendation>\"    the audited exception. Recorded on the gate row and readable afterwards.
 If you cannot name the capability, this is a decision you find uncomfortable, not a human gate."
@@ -2413,7 +2482,7 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
     warn "--rubber-stamp-ok changed nothing on this gate — the keystroke cap did not fire (type=${type}, tier=${tier}$( ((tier_floored)) && printf ', floored by category or declaration')). The declaration is still written to the row, so it stays readable; it just did not need to buy anything."
   fi
 
-  _task_gate_retire_buttons "$ident" "superseded by a re-filed gate" || true
+  _task_gate_card_apply "$ident" die "superseded by a re-filed gate" || true
 
   db "BEGIN IMMEDIATE;
       $(_gate_archive_and_clear_sql file "id=${id}")
@@ -2566,6 +2635,132 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
        '{id:($i|tonumber), ident:$id, tier:0, auto_applied:$rc, need_type:$ty}' \
        --arg i "$id" --arg id "$ident" --arg rc "$recommend" --arg ty "$type"
     return
+  fi
+
+  # DIVE-3481 — THE INERT PUSH-FOR-REVIEW CLEARS AT FILING. NOBODY IS PINGED.
+  #
+  # lodar, 2026-08-16, on DIVE-3474's approval ping to main: "why dev2 cannot do
+  # delegated push himself and burns your token for approval?" Every inert
+  # push-for-review costs one lead clear, and a clear on a NON-FRESH seat re-sends that
+  # seat's whole session window — the most expensive event that can happen to it.
+  #
+  # THE MEASUREMENT THAT LICENSES THIS IS CLASS-SPECIFIC, not the fleet number. Over
+  # the whole gate_history (528 gates carrying an ask), 166 classify INERT under
+  # `_gate_push_for_review_hit`. Of those, 110 were answered; 101 carried a
+  # recommendation, and ALL 101 came back applying it. Zero disagreements, ever.
+  # Contrast the fleet-wide figure DIVE-3474 arm 2 correctly refused to auto-apply on:
+  # 54 of 121. A gate that disagrees with its filer 55% of the time is doing real work;
+  # this subclass has never once disagreed across 101 answers.
+  #
+  # THE FILING ROW'S PREMISE WAS WRONG, AND THE CORRECTION MAKES THE CASE STRONGER.
+  # It was filed as "the 48h TTL grants this anyway, so the ping buys latency only".
+  # It does not: `_hb_gate_ttl_sweep` excludes `need_type IN
+  # ('approval','secret','manual','access')` (DIVE-2235), and 143 of the 166 are
+  # type=approval — the type a push gate MUST take (DIVE-3088), and the only family
+  # `lead:` provenance is mintable on (DIVE-2004). An unanswered push gate therefore
+  # does not auto-apply at 48h or ever; it sits open, and 45 of the 166 still do. The
+  # lead clear is LOAD-BEARING today, so this is a NEW grant rather than a TTL dropped
+  # to zero, and it is written narrower for exactly that reason.
+  #
+  # WHY THIS IS NOT DIVE-3474 ARM 2 ("do not auto-apply a routed gate"). That arm is
+  # about the general judgment gate and its 54-of-121 is the reason. This is ONE
+  # classified subclass with its own 101-of-101, whose ask is FAILED CLOSED by the
+  # shared `_gate_push_for_review_hit` predicate — the same one DIVE-2629's tier floor
+  # and DIVE-3117's routing floor use, so a third axis cannot end up disagreeing with
+  # them about what an inert push is. An ask naming a merge/deploy/land-to-main is not
+  # inert and never reaches here.
+  #
+  # EVERY GUARD, AND WHY EACH IS THE NARROW FORM:
+  #   1. type == approval ONLY. Not decision (a decision auto-clear could not authorize
+  #      a push anyway — broker_gate_check wants a routed reviewer plus a corroborating
+  #      uid), not manual/access, never secret. approval is where the measured
+  #      population lives and the only type this can produce a usable clear on.
+  #   2. tier==1, tier_floored==0, tier_arg!=2. The T2 category floor (money, secrets,
+  #      destructive, public comms) is resolved ABOVE and wins — DIVE-1555/1698's
+  #      true-human floor is untouched — and an explicitly pinned --tier=2 still stands.
+  #   3. _needs_human==0. A DECLARED capability (DIVE-2241) is the honest hard gate and
+  #      outranks any classification made off the ask's shape.
+  #   4. gate_mode != confirm-after-send. The same refusal tier-0 already makes above:
+  #      ratifying an action already taken, with nobody involved, records no decision.
+  #   5. A --recommend THE FILER TYPED (`recommend_arg`, not `recommend`). By this point
+  #      `recommend` may have been PREFILLED from a precedent (OSS-11/20/21) that nobody
+  #      wrote, and auto-applying a machine's prefill through a second auto-clear is two
+  #      automated decisions stacked with no author between them. Same variable and the
+  #      same reason as DIVE-2848's cap. Caught by this ticket's own harness: the
+  #      no-recommend arm auto-cleared on a prefill inherited from an earlier fixture.
+  #   6. ROW STATE, NOT PROSE (DIVE-3266): the row must carry a `Branch:` binding, read
+  #      through the SAME `_push_branch_from_body` that `5dive push` acts on, and that
+  #      branch must not be a protected ref. This is the adopted design's
+  #      "non-protected ref" arm, and it is checkable at filing where the REPO is not:
+  #      no row carries a repo binding, `5dive push` resolves the repo from the work
+  #      tree at act time and its App token is installation-scoped, so "a repo we own"
+  #      is enforced DOWNSTREAM by the executor and is deliberately not re-derived here.
+  #      Stated rather than quietly dropped.
+  #   7. The closure MUST SIGN — see below.
+  #
+  # THE SIGNATURE IS THE WHOLE DESIGN, AND A FAILURE TO MINT IT MUST NOT DEGRADE INTO A
+  # CLEARED GATE. `broker_gate_check` refuses an unsigned closure outright, so a gate
+  # self-cleared without one is a push refused later, on someone else's round-trip,
+  # with the lead who could have cleared it already skipped — STRICTLY WORSE than
+  # today's ping. So the signature is minted FIRST and an empty one falls straight
+  # through to the normal routing below, i.e. exactly today's behaviour. A cli-scoped
+  # seat with no `5dive gate-proof sign` sudo keeps its lead clear rather than losing
+  # it. Same mint the DIVE-756 answer path uses (root in-process, else the root-only
+  # verb over sudo), because two ways to sign a closure are two things that can drift.
+  #
+  # PROVENANCE IS MINTED, NOT SIDESTEPPED (DIVE-2004): `auto:pfr`, a value of its own,
+  # so this auto-clear stays COUNTABLE and is never confused with a lead's tap
+  # (`lead:*`), a human's (`human:*`), the TTL's (`auto:ttl`) or tier-0's (`auto:t0`).
+  # broker.sh authorizes it for approval gates ONLY, and the closure signature — taken
+  # over need_answered_by and verified by the ROOT executor at push time — is what
+  # makes a raw-DB forge of the string fail, the same argument DIVE-1555 made for
+  # `lead:*`. uid 0, like the TTL sweep: no human was involved and none is claimed.
+  #
+  # REVERSIBLE WITHOUT A RELEASE: pref `pfr_autoclear`, default ON (this is the
+  # deliverable, not an experiment); set it `off` and the lead ping returns unchanged.
+  local _pfr_pref; _pfr_pref=$(_task_pref_get pfr_autoclear 2>/dev/null || printf '')
+  if [[ "${_pfr_pref:-on}" != "off" && "$type" == "approval" && "$tier" == "1" \
+        && "$tier_floored" == "0" && "$tier_arg" != "2" && "$_needs_human" != "1" \
+        && "$gate_mode" != "confirm-after-send" && -n "$recommend_arg" ]] \
+     && _gate_push_for_review_hit "$ask"; then
+    local _pfr_body _pfr_branch=""
+    _pfr_body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
+    # Split from the test, not `[[ … ]] && v=$(f)`: an assignment's rc is its last
+    # command substitution's, so the helper's non-zero on "no binding" would leak into
+    # the compound (the DIVE-2751 shape, absorbed here the same way DIVE-3266 does).
+    _pfr_branch=$(_push_branch_from_body "$_pfr_body" 2>/dev/null) || _pfr_branch=""
+    if [[ -n "$_pfr_branch" ]] && ! _gate_pfr_protected_ref "$_pfr_branch"; then
+      local _pfr_ts; _pfr_ts=$(date -u '+%Y-%m-%d %H:%M:%S')
+      local _pfr_sig=""
+      if [[ $EUID -eq 0 ]]; then
+        _gate_proof_ensure_key 2>/dev/null || true
+        _pfr_sig=$(_gate_closure_sign "$id" "$type" "$recommend_arg" "auto:pfr" "$_pfr_ts" "0" 2>/dev/null || printf '')
+      else
+        _pfr_sig=$(_gate_closure_payload "$id" "$type" "$recommend_arg" "auto:pfr" "$_pfr_ts" "0" \
+                     | sudo -n 5dive gate-proof sign 2>/dev/null || printf '')
+      fi
+      if [[ -n "$_pfr_sig" ]]; then
+        db "UPDATE tasks SET need_answer=$(sqlq "$recommend_arg"), need_answered_at=$(sqlq "$_pfr_ts"),
+              need_answered_by='auto:pfr', need_answered_uid=0, need_answer_sig=$(sqlq "$_pfr_sig")
+            WHERE id=${id};
+            UPDATE tasks SET status='todo'
+              WHERE id=${id} AND status='blocked'
+                AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
+        # DIVE-2054: an auto-clear applied from task-store data — fenced on store
+        # identity, same primitive as the tier-0 and TTL auto-clears.
+        _task_store_audit_log "task need pfr-auto" "ok" 0 -- \
+          "task=$ident" "type=$type" "branch=$_pfr_branch" "applied=$recommend_arg" || true
+        ledger_emit gate.autocleared ident="$ident" task_id="$id" actor="$actor" \
+          policy="pfr:${type}" detail="inert push-for-review auto-cleared at filing (branch ${_pfr_branch}) — applied: ${recommend_arg}" || true
+        ok "$ident inert push-for-review auto-cleared at filing — applied: $recommend_arg (branch $_pfr_branch; nobody was pinged, provenance auto:pfr, closure signed). 5dive task pfr-autoclear off restores the lead ping." \
+           '{id:($i|tonumber), ident:$id, tier:1, auto_applied:$rc, need_type:$ty, need_answered_by:"auto:pfr", branch:$br}' \
+           --arg i "$id" --arg id "$ident" --arg rc "$recommend_arg" --arg ty "$type" --arg br "$_pfr_branch"
+        return
+      fi
+      # Unsignable: say so once and fall through to the normal route. Silence here
+      # would read as "the auto-clear is off" and send the next reader to the pref.
+      warn "inert push-for-review auto-clear skipped for ${ident}: this seat could not mint a signed gate closure (no root, and no passwordless sudo for \`5dive gate-proof sign\`), and an unsigned clear would be REFUSED by the push executor later. Routing this gate normally instead."
+    fi
   fi
 
   # OSS-21: tier-1 precedent auto-clear (behind pref precedent_autoclear, default
@@ -2926,15 +3121,45 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
   # Sibling instance of the same defect, one subsystem over: DIVE-3265, where the
   # merge gate scraped a branch name out of the maker's result prose and then demanded
   # that phantom branch land.
-  local _row_ship=0
+  local _row_ship=0 _rowbind_src=""
   if [[ "$tier_floored" == "0" && ( "$type" == "decision" || "$type" == "approval" || "$type" == "manual" ) ]]; then
-    local _rowship_body _rowship_branch=""
+    local _rowship_body _rowship_branch="" _rowship_delivery=""
     _rowship_body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
     # Split rather than `[[ … ]] && v=$(f)`: an assignment's rc is its last command
     # substitution's, so the helper's non-zero on "no binding" would leak into the
     # compound (the DIVE-2751 shape). Absorbed here instead of argued about.
     _rowship_branch=$(_push_branch_from_body "$_rowship_body" 2>/dev/null) || _rowship_branch=""
-    [[ -n "$_rowship_branch" ]] && _row_ship=1
+    # DIVE-3228 / DIVE-3525 — THE SECOND BINDING, and this is the headline DIVE-3228
+    # shipped zero lines of.
+    #
+    # DIVE-3266 routes a gate on ROW STATE rather than on the ask's prose, but it reads
+    # exactly ONE binding: a `Branch:` line in the body. That is the binding `5dive push`
+    # requires, so it is present on every push-for-review row and absent on the OTHER
+    # half of the ship population — a row that reached a pull request through
+    # `task deliver --pr=`, which writes the `delivery_ref` COLUMN and never touches the
+    # body. An approval filed on such a row ("the PR is up, say go") has a reviewer that
+    # is plainly derivable and still fell through to the human, because no `Branch:` line
+    # was ever written and the ask missed `_GATE_ENG_SHIP_RX`. That is the class DIVE-3225
+    # was in when lodar was paged twice.
+    #
+    # WHY THIS AND NOT A TYPE DEFAULT. Iteration 1 of this ticket made the default the
+    # TYPE — every unfloored `approval` routed — and main's differential caught what that
+    # costs: it swallows the human ping for the rows that are unrouted BY ABSENCE. An
+    # unbound row, a prose-only mention of a branch, a plain tier-1 with nothing attached:
+    # nothing floors them, so no backstop fires, and DIVE-3266's B1/C6/E1 contract ("a row
+    # with nothing bound to it must still reach a person, with an explicit unrouted
+    # receipt naming the skipped lead and the binding remedy") broke. Both directions have
+    # to hold at once, and only a BINDING holds them: it is the fact that makes a reviewer
+    # derivable, and its ABSENCE is the fact that makes the gate the human's.
+    #
+    # `delivery_ref` is structured state written by one verb, never scraped from prose —
+    # the same property that made `Branch:` admissible here and a prose mention not
+    # (DIVE-3265, where a merge gate scraped a branch name out of result prose and then
+    # demanded that phantom branch land).
+    _rowship_delivery=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};")
+    if   [[ -n "$_rowship_branch"   ]]; then _row_ship=1; _rowbind_src=branch
+    elif [[ -n "$_rowship_delivery" ]]; then _row_ship=1; _rowbind_src=delivery-ref
+    fi
   fi
 
   local _routable=0
@@ -3009,6 +3234,20 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
   # override above (eng-ship / curation / internal-ops / access / verifier-route)
   # can cross it — the verifier-route being the one this ticket exists to stop.
   [[ "$_needs_human" == "1" ]] && _routable=0
+  # DIVE-3228 / DIVE-3525 — there is deliberately NO `_approval_default` kind here,
+  # and the deletion is the finding rather than an omission. Iteration 1 of this
+  # ticket added `[[ $type == approval && $_routable == 1 ]] && _approval_default=1`,
+  # which routes EVERY unfloored approval. It reddened two harnesses that are green on
+  # origin/main (gate_row_state_routing_unit B1/C6/E1, gate_floor_declared_discussion
+  # arm 7) for one reason: the four inherited exclusions above only cover rows that are
+  # FLOORED or PINNED, and the population that breaks is the rows unrouted BY ABSENCE —
+  # an unbound row, a prose-only branch mention, a plain tier-1. Nothing floors them, so
+  # no backstop fires, and a type default routes them and leaves the human ping EMPTY.
+  # The headline ships as the SECOND BINDING at the `_row_ship` block instead: a
+  # reviewer is defaulted where one is derivable from structured row state, and the
+  # absence of that state is what keeps the gate on the human path with DIVE-3266's
+  # explicit unrouted receipt. Both directions hold at once only if the binding, and
+  # not the type, is the input.
   # Record the declaration and what it did, at the moment it did it. DIVE-2093 will
   # PRINT the routing decision at file time; until it lands this row is the only
   # place a mis-declared gate is visible without diffing where it ended up.
@@ -3067,6 +3306,9 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
     # only the second one decides who is woken.
     # DIVE-3266: row-state ship routing bypasses the pref too — a branch binding is a
     # harder fact than any regex hit, so pref-gating it would re-open the exact hole.
+    # DIVE-3228/3525: a bound `delivery_ref` is a second row-state binding under the
+    # SAME `_row_ship` kind — see the block at the `_rowship_delivery` read above for
+    # why the input is the binding and not the type.
     if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_row_ship" == "1" || "$_curation" == "1" || "$_internal_ops" == "1" || "$_discusses_applied" == "1" || "$_verifier_route" == "1" || "$_floored_by_title" == "1" || "$_standing_route" == "1" ]]; then
       # DIVE-1495: a verifier-route targets the task's verifier directly; every
       # other kind resolves the filer's lead via the org chart.
@@ -3123,7 +3365,12 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
         # eng ship, that is what the filer can act on and every existing receipt stays
         # byte-for-byte; `row-ship-state` is named only when the BINDING is the sole
         # reason this routed — i.e. exactly the case the prose classifier missed.
-        elif [[ "$_row_ship"         == "1" ]]; then _rtrigger="row-ship-state"
+        # DIVE-3228/3525: the trigger token stays `row-ship-state` and gains a SUFFIX
+        # naming which binding carried it. DIVE-3266's receipts keep matching on the
+        # stem, and the delivery-ref set — the one this ticket adds — stays countable
+        # apart from the branch set, which is how the next reader measures whether the
+        # second binding is carrying gates the first one missed.
+        elif [[ "$_row_ship"         == "1" ]]; then _rtrigger="row-ship-state:${_rowbind_src:-branch}"
         elif [[ "$_curation"         == "1" ]]; then _rtrigger="curation"
         elif [[ "$_internal_ops"     == "1" ]]; then _rtrigger="internal-ops"
         elif [[ "$_discusses_applied" == "1" ]]; then _rtrigger="declared-discussion"
@@ -3189,7 +3436,12 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
         # path sets it: under `sudo -u agent-X` the ambient identity is the
         # invoker, not the filer.
         local _nrc=0
+        # DIVE-3474: persisted BEFORE the deliverer runs, so the queue view and the
+        # heartbeat rails read the same fact the send decision was made on rather
+        # than re-deriving an urgency nobody recorded.
+        db "UPDATE tasks SET gate_urgent=${urgent} WHERE id=${id};" 2>/dev/null || true
         TASK_GATE_FILER="$actor" TASK_GATE_ROUTE_TO="$_reviewer" TASK_GATE_ROUTE_ROLE="$_rrole" \
+        TASK_GATE_ROUTE_URGENT="$urgent" \
         TASK_GATE_FLOORED_BY="$([[ "$_floored_by_title" == "1" ]] && printf 'title' || printf '')" \
           task_need_notify "$ident" "$type" "$ask" "$options" "$recommend" || _nrc=$?
         # Never print a bare "routed to X" on an unobserved send again. The claim
@@ -3210,6 +3462,7 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
           "reviewer=$_reviewer" "filer=$actor" "delivery=$_rstate" || true
         case "$_rstate" in
           delivered) ;;
+          queued)    _rnote=" [QUEUED, not pinged — ${_reviewer}'s window was NOT woken for this (DIVE-3474). The gate is filed, blocked and answerable now; they pick it up from '5dive task queue' on their next turn, and the heartbeat re-nag escalates it if nobody does. File with --urgent if it genuinely cannot wait for that.]" ;;
           inflight)  _rnote=" [handoff dispatched — delivery not yet confirmed; the gate-delivery row lands when the send completes]" ;;
           *)         _rnote=" [HANDOFF NOT DELIVERED — ${_reviewer} was NOT pinged${TASK_NOTIFY_FAIL_REASON:+ (${TASK_NOTIFY_FAIL_REASON})}; the gate stands, the re-nag escalates it (<=15 min), and it is answerable now with: 5dive task answer ${ident}]" ;;
         esac

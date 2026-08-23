@@ -35,7 +35,7 @@ usage_collect() {
   local since="$1" db
   db="${TASKS_DB:-${STATE_DIR}/tasks/tasks.db}"
   REGISTRY="$REGISTRY" TASK_DB="$db" USAGE_SINCE="$since" python3 - <<'PY'
-import os, sys, json, glob, time, re, sqlite3, errno, datetime as dt
+import os, sys, json, time, re, sqlite3, errno, datetime as dt   # no glob: DIVE-3419
 
 since = int(os.environ["USAGE_SINCE"])
 now   = int(time.time())
@@ -155,6 +155,96 @@ def probe_readable(home, projects):
         return False, "home unreadable: %s" % (e.strerror or e.errno)
     return True, None              # home readable, no transcript dir: idle
 
+# DIVE-3419 — probe_readable() above covers `projects/`, and the per-file
+# `except OSError` below covers each `*.jsonl`. Those are the TOP and the BOTTOM
+# of a THREE-level path. The middle `*` of `projects/*/*.jsonl` is a directory
+# listing too, and `glob.glob()` performs it by SWALLOWING every OSError and
+# yielding nothing for that entry — so a project subdir this uid cannot read
+# dropped out of the agent's total with no exception, no reason, and the agent
+# still counted as READ with `coverage.complete` true. Milder than DIVE-3417's
+# clobber (nothing here persists over durable state) but the same defect: every
+# surface built on that flag — `usage.sh`'s "cannot read" and "⚠ N NOT checked —
+# burn is unknown (not 0)" banners — stays quiet on a number short of the truth,
+# and `5dive usage` is what a human reads when deciding whether a seat is
+# burning.
+#
+# The generalisable rule, and why one more probe could not fix it: a guard at the
+# top and the bottom of a path does not cover a glob's MIDDLE wildcards. Every
+# wildcard is a directory read that can fail, glob cannot report what it skipped,
+# so the level is enumerated explicitly here with os.listdir, which may raise.
+# Same shape as `list_sessions()` in cmd_loop.sh (DIVE-3417); the VERDICT differs
+# and that divergence is the point — there an unread level is NOT-REACHED (rc 2,
+# no number at all, because _loop_refresh_spend would persist a short one); here
+# it moves the agent into `coverage.unreadable`, which is exactly where an
+# unreadable FILE already puts it.
+def list_sessions(projects):
+    """-> (paths, reason). reason is not None => this agent was not fully read.
+
+    Enumerates `projects/*/*.jsonl` one level at a time. Two skips are kept
+    deliberately, because both mean "there is nothing unread here" rather than
+    "we failed to read it", and both match what the glob did:
+      * ENOENT  — the entry vanished between the listing and the read (sessions
+                  and their dirs roll over under a live agent).
+      * ENOTDIR — a regular FILE sitting directly in projects/. It cannot
+                  contain <it>/*.jsonl, so no transcript is being missed.
+    Anything else (EACCES on a 700 subdir, ELOOP on a self-referential symlink,
+    EIO) is a read we could not perform, and is reported.
+
+    One deliberate WIDENING over glob.glob: glob hides dot-prefixed names at
+    both levels. A dot-prefixed session file is still burn, and silently not
+    counting it is the very shape this function exists to refuse.
+    """
+    out = []
+    try:
+        entries = sorted(os.listdir(projects))
+    except OSError as e:
+        # ENOENT here is the state probe_readable JUST classified as genuinely
+        # idle: a readable home with no transcript dir yet. Flagging it would
+        # over-fire on every agent that has never run, which corrupts coverage
+        # as thoroughly as the fail-open did, in the other direction.
+        if e.errno == errno.ENOENT:
+            return [], None
+        return [], "transcript dir %s became unreadable mid-scan: %s" % (projects, e.strerror or e.errno)
+    for d in entries:
+        sub = os.path.join(projects, d)
+        try:
+            names = sorted(os.listdir(sub))
+        except OSError as e:
+            if e.errno in (errno.ENOENT, errno.ENOTDIR):
+                continue
+            return [], "project dir %s unreadable: %s" % (sub, e.strerror or e.errno)
+        out.extend(os.path.join(sub, n) for n in names if n.endswith(".jsonl"))
+        # DIVE-3468: a subagent's turns are NOT in the session file. Claude Code
+        # writes sidechain turns to a sibling DIRECTORY,
+        # projects/<proj>/<sid>/subagents/*.jsonl, so a two-level enumeration
+        # stops one level short of them — while every turn in there carries the
+        # PARENT's sessionId, so the attribution was always right and only the
+        # path was out of range. Measured excluded: ~9% of one agent-quinn
+        # session (62 turns / 294,684 tokens).
+        #
+        # This is the SAME failure this function exists to refuse, one level
+        # deeper: no error, no reason, just a smaller correct-looking integer
+        # inside coverage.complete=true — under-counting exactly the agents that
+        # fan work out to subagents, i.e. the expensive ones.
+        #
+        # ENOENT (a session with no subagents) and ENOTDIR (`n` is the .jsonl
+        # file itself, not a dir) are real absences and stay silent, exactly as
+        # above. Anything else is a read we could not perform and is reported —
+        # a swallowed EACCES here would rebuild the DIVE-3419 blind spot.
+        #
+        # Only `<sid>/subagents/` is descended into. The `tool-results/` sibling
+        # in the same tree is not transcript turns; a `*/*` sweep would take it.
+        for n in names:
+            subag = os.path.join(sub, n, "subagents")
+            try:
+                sa_names = sorted(os.listdir(subag))
+            except OSError as e:
+                if e.errno in (errno.ENOENT, errno.ENOTDIR):
+                    continue
+                return [], "subagent dir %s unreadable: %s" % (subag, e.strerror or e.errno)
+            out.extend(os.path.join(subag, m) for m in sa_names if m.endswith(".jsonl"))
+    return out, None
+
 # --- scan transcripts: per agent per model token sums + per-turn timeline ---
 # turns[name] = list of (epoch, out_tokens, total_tokens) for task attribution.
 agent_rows = []
@@ -180,8 +270,14 @@ for name, meta in agents.items():
     turns = []
     pins = set()
     denied = None
-    pat = os.path.join(projects, "*", "*.jsonl")
-    for path in glob.glob(pat):
+    # DIVE-3419: a middle level we could not read makes this agent a blind spot,
+    # not a low scorer. Same destination as an unreadable home or file — never a
+    # silent short total sitting inside coverage.complete=true.
+    sessions, why = list_sessions(projects)
+    if why is not None:
+        unreadable.append({"name": name, "reason": why})
+        continue
+    for path in sessions:
         try:
             if os.path.getmtime(path) < since:   # whole file predates window
                 continue
@@ -1034,7 +1130,7 @@ cmd_cost() {
 activity_collect() {
   local agent="$1" since="$2" tstart="$3" tend="$4"
   A_AGENT="$agent" A_SINCE="$since" A_TSTART="$tstart" A_TEND="$tend" python3 - <<'PY'
-import os, json, glob, time, pwd, datetime as dt
+import os, json, time, pwd, errno, sys, datetime as dt   # no glob: DIVE-3419
 
 agent = os.environ["A_AGENT"]
 since = int(os.environ["A_SINCE"])
@@ -1055,10 +1151,19 @@ def to_epoch(s):
     except Exception:
         return None
 
-try:
-    home = pwd.getpwnam("agent-" + agent).pw_dir
-except KeyError:
-    home = "/home/agent-" + agent
+# DIVE-3419 acceptance 4 — the guessed `/home/agent-<name>` fallback is gone,
+# for the reason DIVE-3345 deleted it from the sibling spend scanner: a name with
+# no account on this host has no transcript root, and inventing a path that then
+# reads empty does not produce an empty activity trail, it produces an UNREAD one
+# and renders it as "this agent did nothing".
+_root = os.environ.get("A_HOME_ROOT") or ""      # test seam; unset in production
+if _root:
+    home = os.path.join(_root, "agent-" + agent)
+else:
+    try:
+        home = pwd.getpwnam("agent-" + agent).pw_dir
+    except KeyError:
+        sys.exit("activity: no agent-%s account on this host — transcript root unresolvable" % agent)
 
 files = {}      # mutated path -> {"edits":n, "last":ts}
 reads = {}      # read path -> count
@@ -1069,16 +1174,79 @@ tot = out = 0
 lo = since if tstart is None else max(since, tstart)
 hi = now   if tend   is None else tend
 
-pat = os.path.join(home, ".claude", "projects", "*", "*.jsonl")
-for path in glob.glob(pat):
+# DIVE-3419 acceptance 4, the DECISION and its reason, recorded here because the
+# next reader will otherwise re-derive it: an activity log DOES owe a readability
+# contract, but a REPORTING one, not the fail-closed NOT-REACHED contract its
+# spend-scanning sibling owes. `_spend_scan_task_ids` must emit NO number when it
+# is blind, because its caller PERSISTS what it returns over durable state and a
+# short total silently becomes the record. Nothing consumes this trail that way —
+# it is read by one human, about one agent, next to the trail itself. Refusing to
+# render 40 commands because one project dir is mode 000 would destroy the whole
+# surface to protect a token count that `5dive usage` reports properly anyway.
+# So: emit the trail, and NAME what is missing from it. `partial` is non-empty
+# exactly when this trail is short of the truth, and cmd_activity prints it above
+# the numbers. What is refused is the old behaviour — a bare `continue` at every
+# level, which made "unreadable" and "did nothing" the same rendering.
+partial = []
+
+def list_sessions(projects):
+    """-> paths, appending a named reason to `partial` for each unread level.
+
+    Same enumeration as usage_collect's (DIVE-3417/3419): os.listdir per level,
+    because glob.glob() swallows the middle wildcard's OSError and cannot report
+    what it skipped. ENOENT (rolled over mid-scan) and ENOTDIR (a regular file in
+    projects/, which cannot hold <it>/*.jsonl) are real absences and stay silent.
+    Dot-prefixed names are included, which glob hid at both levels.
+    """
+    out = []
+    try:
+        entries = sorted(os.listdir(projects))
+    except OSError as e:
+        # ENOENT = this agent has never run. Genuinely empty, not unread.
+        if e.errno != errno.ENOENT:
+            partial.append("transcript dir %s unreadable: %s" % (projects, e.strerror or e.errno))
+        return out
+    for d in entries:
+        sub = os.path.join(projects, d)
+        try:
+            names = sorted(os.listdir(sub))
+        except OSError as e:
+            if e.errno not in (errno.ENOENT, errno.ENOTDIR):
+                partial.append("project dir %s unreadable: %s" % (sub, e.strerror or e.errno))
+            continue
+        out.extend(os.path.join(sub, n) for n in names if n.endswith(".jsonl"))
+        # DIVE-3468: subagent turns live one level deeper, in
+        # <sid>/subagents/*.jsonl, and carry the PARENT's sessionId — so this
+        # trail was silently short of the truth for exactly the sessions that
+        # fanned work out. Same enumeration discipline as the level above:
+        # ENOENT/ENOTDIR are real absences, anything else is NAMED in `partial`
+        # rather than swallowed, which is the whole contract of this function.
+        # Only <sid>/subagents/ is descended into — tool-results/ beside it is
+        # not transcript turns.
+        for n in names:
+            subag = os.path.join(sub, n, "subagents")
+            try:
+                sa_names = sorted(os.listdir(subag))
+            except OSError as e:
+                if e.errno not in (errno.ENOENT, errno.ENOTDIR):
+                    partial.append("subagent dir %s unreadable: %s" % (subag, e.strerror or e.errno))
+                continue
+            out.extend(os.path.join(subag, m) for m in sa_names if m.endswith(".jsonl"))
+    return out
+
+for path in list_sessions(os.path.join(home, ".claude", "projects")):
     try:
         if os.path.getmtime(path) < lo:  # whole file predates window
             continue
-    except OSError:
+    except OSError as e:
+        if e.errno != errno.ENOENT:      # vanished mid-scan is fine; denied is not
+            partial.append("transcript %s unreadable: %s" % (path, e.strerror or e.errno))
         continue
     try:
         f = open(path, "r", errors="ignore")
-    except OSError:
+    except OSError as e:
+        if e.errno != errno.ENOENT:
+            partial.append("transcript %s unreadable: %s" % (path, e.strerror or e.errno))
         continue
     pending_cold = []   # DIVE-1026: skill fires in THIS session awaiting a follow-on tool
     with f:
@@ -1146,6 +1314,7 @@ print(json.dumps({
     "window": {"since": lo, "now": hi},
     "files": file_rows, "reads": read_rows, "commands": commands, "skills": skill_rows,
     "counts": counts, "tokens": {"total": tot, "output": out},
+    "partial": partial,          # DIVE-3419: non-empty => this trail is SHORT
 }))
 PY
 }
@@ -1201,6 +1370,13 @@ cmd_activity() {
   local label; [[ "$win_flag" == "7d" ]] && label="last 7d" || label="last 24h"
   [[ -n "$task" ]] && label="$twin_label"
   echo "ACTIVITY — ${agent}  (${label})"
+  # DIVE-3419: an unread level rides WITH the numbers it shortened, above them,
+  # so the trail can never be mistaken for a complete one.
+  local _pn; _pn=$(jq -r '(.partial // [])|length' <<<"$data")
+  if [[ "$_pn" =~ ^[0-9]+$ && "$_pn" -gt 0 ]]; then
+    printf '  ⚠ PARTIAL — %s level(s) could not be read; the counts below are SHORT of the truth, not low:\n' "$_pn"
+    jq -r '(.partial // [])[] | "      " + .' <<<"$data"
+  fi
   jq -r "$USAGE_JQ_HELPERS"'
     ((.counts.edit + .counts.write + .counts.multiedit + .counts.notebook)) as $ops |
     "  files touched: " + ((.files|length)|tostring) + " (" + ($ops|tostring) + " edits)"

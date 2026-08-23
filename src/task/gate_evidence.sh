@@ -113,7 +113,18 @@ _gate_gh_token() {
   # seat, and the two outcomes have different remedies — "claude has no gh login"
   # is a host fault, "you may not run sudo as claude" is this seat's sudoers. `-n`
   # made both silent, so they were indistinguishable; separate them here.
-  if command -v sudo >/dev/null 2>&1 && [[ "$(id -un 2>/dev/null)" != "claude" ]]; then
+  # DIVE-2538 item 5 (axis corrected by olivia: weaken-a-gate, NOT misattribution).
+  # This predicate does not decide "whether to re-exec under sudo" — it gates arm 4,
+  # the LAST token-resolution arm. When it is skipped the resolver falls through to
+  # `printf ''` and returns EMPTY, and the auto-detect merge gate below is fail-OPEN
+  # on an empty token. So a PATH shim echoing `claude` made a caller skip its own
+  # fallback, resolve no token, and take the open path — a gate weakened by a shim,
+  # from a seat whose real uid was never `claude`. $EUID via actor_caller_unix_name
+  # is not shimmable.
+  #
+  # (The fail-OPEN downstream is carried from the parent ticket's body and was NOT
+  # re-measured on this branch; it decides this item's severity, not its fix shape.)
+  if command -v sudo >/dev/null 2>&1 && [[ "$(actor_caller_unix_name)" != "claude" ]]; then
     # The classification reads sudo's OWN stderr rather than asking a second time
     # (`sudo -n -u claude true`). Deliberate: an extra probe changes the call
     # sequence three sibling harnesses assert on, and a diagnostic that alters the
@@ -246,7 +257,7 @@ _gate_refuse_no_rail() {
   # one that structurally can never resolve, and that ambiguity is what let an inert
   # gate stay invisible for a fleet-wide census.
   local _tokwhy; _tokwhy="$(_gate_tok_why)"
-  policy_refuse "$E_CONFLICT" done-merge-gate-no-credential DIVE-2318 "$ident" "$ident cannot close: the merge gate COULD NOT CHECK whether ${subject} landed — no gh credential resolved in this caller's environment, the machine-account rail is unreachable, AND the credential-free rail could not answer either (DIVE-2770: an unauthenticated read of a public repo). No query ran at all. ${_why} This says NOTHING about the merge; do not read it as 'not merged'. WHICH OF TWO CAUSES THIS IS decides what you should do, and the gate cannot tell them apart from here. (a) BY FAULT: a builder that should hold the \`_gh_do\` grant is missing it — a provisioning problem with a name. Check it with \`5dive gh whoami\`; if the bot line is UNRESOLVED and you are a builder, that is the thing to fix (\`agent create --can-push\`), or re-run with a token (\`GH_TOKEN=\$(sudo -u claude gh auth token) 5dive task done $ident ...\`). (b) BY DESIGN: on a VERIFIER seat an UNRESOLVED bot line is the CORRECT state — \`_gh_do\` is the can-push grant a grader must not hold, so no credential is coming, and handing the close to agent-main is not open to you either when the DIVE-477 writer-is-not-grader rail names YOU as the verifier of record. In case (b) the authorised terminal move is \`5dive task verify $ident --cmd=<script>\`, where the script'\''s EXIT STATUS proves the merge rather than asserting it — e.g. \`git fetch -q origin main && git merge-base --is-ancestor <merge-sha> origin/main && git grep -q <a-symbol-the-PR-added> origin/main -- <path>\`. That answers this gate'\''s question by another instrument instead of bypassing it, and it is squash-proof where a sha comparison is not. \`--force-merge-gate\` does NOT reach this refusal: it escapes a gate that RAN and disagreed, never one that asked nothing. Copy your verdict into the BODY before you close (\`task set-body --append\`) — \`task verify\` OVERWRITES result, and a closed body is frozen. \`task merge-audit --limit=1\` reports the same missing credential. WHERE IT ACTUALLY STOPPED (DIVE-1935) — ${_tokwhy}; machine-account rail: $(_gate_gh_bot_ok && printf 'available' || printf 'not permitted on this seat'). Re-run that resolution on its own, graded against a known-merged PR, with \`5dive task merge-gate-selftest\`."
+  policy_refuse "$E_CONFLICT" done-merge-gate-no-credential DIVE-2318 "$ident" "$ident cannot close: the merge gate COULD NOT CHECK whether ${subject} landed — no gh credential resolved in this caller's environment, the machine-account rail is unreachable, AND the credential-free rail could not answer either (DIVE-2770: an unauthenticated read of a public repo). No query ran at all. ${_why} This says NOTHING about the merge; do not read it as 'not merged'. WHICH OF TWO CAUSES THIS IS decides what you should do, and the gate cannot tell them apart from here. (a) BY FAULT: a builder that should hold the \`_gh_do\` grant is missing it — a provisioning problem with a name. Check it with \`5dive gh whoami\`; if the bot line is UNRESOLVED and you are a builder, that is the thing to fix (\`agent create --can-push\`), or re-run with a token (\`GH_TOKEN=\$(sudo -u claude gh auth token) 5dive task done $ident ...\`). (b) BY DESIGN: on a VERIFIER seat an UNRESOLVED bot line is the CORRECT state — \`_gh_do\` is the can-push grant a grader must not hold, so no credential is coming. Record machine evidence without claiming the merge by running \`5dive task verify $ident --no-done --cmd=<script>\` — e.g. \`git fetch -q origin main && git merge-base --is-ancestor <merge-sha> origin/main && git grep -q <a-symbol-the-PR-added> origin/main -- <path>\`, whose EXIT STATUS proves the merge rather than asserting it, and which is squash-proof where a sha comparison is not. That is terminal for the verifier and leaves the row visibly at graded->merge; the merge owner must later close through \`task done\`, whose gate answers this question. \`--force-merge-gate\` does NOT reach this refusal: it escapes a gate that RAN and disagreed, never one that asked nothing. \`task merge-audit --limit=1\` reports the same missing credential. WHERE IT ACTUALLY STOPPED (DIVE-1935) — ${_tokwhy}; machine-account rail: $(_gate_gh_bot_ok && printf 'available' || printf 'not permitted on this seat'). Re-run that resolution on its own, graded against a known-merged PR, with \`5dive task merge-gate-selftest\`."
 }
 
 # DIVE-2770: THE ANONYMOUS RAIL — the gate's own question has a credential-free
@@ -541,6 +552,37 @@ _gate_anon_gh() {
 # tell a DEAD call apart from a successful empty one — see the contract below.
 _GATE_GH_LAST_ERR=""
 
+# DIVE-3496 (iteration 2) — THE SUBSHELL SINK, and why a second variable is the
+# fix rather than more care.
+#
+# `_GATE_GH_LAST_ERR` is a plain global, so it only travels back to a caller that
+# runs the callee IN ITS OWN SHELL. The escalation below does not: it CAPTURES the
+# credential-free rails' stdout, `_esc_out=$(_gate_gh_nocred ...)`, which runs them
+# in a subshell, and every assignment they make dies with it. `_gate_gh` then
+# resets `_GATE_GH_LAST_ERR` to "" at entry, so the double-blind diagnostic
+# interpolated the EMPTY STRING and the reader got "...could not answer: " with the
+# half that says WHY the fallback failed silently dropped. Found by main in review
+# of #673, confirmed empirically by quinn by instrumenting the harness — and the
+# harness stayed 25/0 through it, because both of T4's arms match literals that
+# live in the assignment itself and survive any value of the interpolation.
+#
+# So the error travels back through a FILE the caller names. A caller that captures
+# stdout sets `_GATE_GH_NOCRED_ERRF` to a path and reads it back after; a caller
+# that does not (the no-token path, which runs `_gate_gh_nocred` in this shell)
+# leaves it empty and keeps using the variable exactly as before. Empty means "no
+# sink", never "no error" — the variable is still authoritative in-shell.
+_GATE_GH_NOCRED_ERRF=""
+
+# Publish the current `_GATE_GH_LAST_ERR` to a caller-named sink, if there is one.
+# Never fails: a diagnostic that can break the call it is describing is worse than
+# a missing diagnostic.
+_gate_gh_nocred_publish() {
+  local _sink="${1:-}"
+  [[ -n "$_sink" ]] || return 0
+  printf '%s' "$_GATE_GH_LAST_ERR" >"$_sink" 2>/dev/null || true
+  return 0
+}
+
 # DIVE-2705 — THE CONTRACT, and why it needed both halves.
 #
 # This used to end `|| true; return 0` on BOTH rails, and swallow stderr on both.
@@ -563,38 +605,141 @@ _GATE_GH_LAST_ERR=""
 # cannot see is an ordinary, expected condition on a multi-repo close, and
 # spraying gh's error text on every gate would be noise that trains readers to
 # ignore it (the alarm-fatigue shape DIVE-2711 names).
+# DIVE-3496: the CREDENTIAL-FREE rails, lifted out of _gate_gh so both the
+# no-token path and the blind-token escalation below reach them by the same code.
+# Behaviour on the no-token path is unchanged — this is an extraction, not a
+# rewrite; the escalation is the only new caller.
+_gate_gh_nocred() {
+  local secs="${1:-0}"; shift
+  local _rc=0 _errf
+  # DIVE-3496 it.2: read the sink ONCE, at entry, so a caller that captures our
+  # stdout still gets the diagnostic back across the subshell boundary.
+  local _sink="${_GATE_GH_NOCRED_ERRF:-}"
+  _errf="${TMPDIR:-/tmp}/.5dive-gate-gh-nocred-err.$$"
+  # No rail at all is NOT "the query ran and found nothing" — there was nothing
+  # to run it with. Returning 0 here made an unusable bot rail count as a
+  # completed scan, which is the same laundering as a failed listing.
+  if ! _gate_gh_bot_ok; then
+    # DIVE-2770: LAST rail, and only reached when the caller holds nothing.
+    # An unauthenticated read of a public repo answers "did this land" without
+    # any grant at all; on a private repo it declines and we fall through to
+    # the same no-rail state as before.
+    local _anon_out=""
+    if _anon_out=$(_gate_anon_gh "$secs" "$@"); then
+      _GATE_GH_LAST_ERR=""
+      _gate_gh_nocred_publish "$_sink"
+      rm -f "$_errf" 2>/dev/null || true
+      printf '%s' "$_anon_out"
+      return 0
+    fi
+    _GATE_GH_LAST_ERR="no gh rail: no token, the gate bot is not usable here, and the anonymous rail could not answer (private repo, or a query it does not serve)"
+    _gate_gh_nocred_publish "$_sink"
+    rm -f "$_errf" 2>/dev/null || true
+    printf ''
+    return 1
+  fi
+  [[ "$secs" == "0" ]] && secs=10
+  printf '%s\0' "$@" | timeout "${secs}s" sudo -n "$_GATE_GH_DO" _gh_do 2>"$_errf" || _rc=$?
+  [[ -s "$_errf" ]] && _GATE_GH_LAST_ERR="$(cat "$_errf" 2>/dev/null || printf '')"
+  _gate_gh_nocred_publish "$_sink"
+  rm -f "$_errf" 2>/dev/null || true
+  return "$_rc"
+}
+
+# DIVE-3496: does this stderr say THE CREDENTIAL CANNOT SEE THE REPOSITORY, as
+# opposed to any other failure? Kept deliberately narrow. GitHub does not
+# distinguish "private and invisible to you" from "does not exist" — both are the
+# same 404 / GraphQL resolution failure — and that is fine here, because the only
+# thing this predicate authorises is ASKING A SECOND RAIL. A repo that truly does
+# not exist fails on the second rail too and lands in the same unresolved state.
+#
+# "Could not resolve to a PullRequest" is deliberately NOT matched: that is a
+# credential which CAN see the repo answering about a PR number, and re-asking a
+# narrower rail cannot improve it.
+_gate_gh_blind_err() {
+  local f="${1:-}"
+  [[ -s "$f" ]] || return 1
+  grep -qiE 'could not resolve to a repository|not found \(http 404\)|http 404|resource not accessible by integration' "$f" 2>/dev/null
+}
+
 _gate_gh() {
   local tok="${1:-}" secs="${2:-0}"; shift 2
   local -a bound=()
   local _rc=0 _errf
   _GATE_GH_LAST_ERR=""
+  _GATE_GH_NOCRED_ERRF=""   # DIVE-3496 it.2: only the escalation below sets a sink
   _errf="${TMPDIR:-/tmp}/.5dive-gate-gh-err.$$"
   if [[ -n "$tok" ]]; then
     [[ "$secs" != "0" ]] && bound=(timeout "${secs}s")
     GH_TOKEN="$tok" "${bound[@]}" gh "$@" 2>"$_errf" || _rc=$?
-  else
-    # No rail at all is NOT "the query ran and found nothing" — there was nothing
-    # to run it with. Returning 0 here made an unusable bot rail count as a
-    # completed scan, which is the same laundering as a failed listing.
-    if ! _gate_gh_bot_ok; then
-      # DIVE-2770: LAST rail, and only reached when the caller holds nothing.
-      # An unauthenticated read of a public repo answers "did this land" without
-      # any grant at all; on a private repo it declines and we fall through to
-      # the same no-rail state as before.
-      local _anon_out=""
-      if _anon_out=$(_gate_anon_gh "$secs" "$@"); then
+    # DIVE-3496: A RESOLVED TOKEN IS NOT A RAIL THAT CAN SEE THE REPO, and until
+    # now the first was silently read as the second.
+    #
+    # _gate_gh_token returns the FIRST credential it can resolve and every rail
+    # below that point is then unreachable — the bot rail and the anonymous rail
+    # are in the `else` arm, i.e. they are tried only when the caller holds
+    # NOTHING. A caller holding a token that is blind to the target repo
+    # therefore forecloses two rails that would have answered, and the gate
+    # renders the result as an unresolved merge state.
+    #
+    # Measured 2026-08-16 on this host, which is what makes this concrete rather
+    # than defensive. Verifier seats are provisioned with `gh` authenticated as a
+    # GitHub App INSTALLATION token (`ghs_`) minted against the single pinned
+    # installation — the 5dive-ai org, 21 repos. Arm 3 of _gate_gh_token ("our
+    # own gh login") resolves it and it wins:
+    #   agent-main2's token -> lodar/5dive-api : GraphQL: Could not resolve to a
+    #                                            Repository (the merge gate's UNKNOWN)
+    #   agent-main2's token -> 5dive-ai/5dive  : answers normally
+    #   the BOT rail (_gh_do, the 5dive-bot PAT) -> lodar/5dive-api : answers,
+    #                                            "mergedAt" and all
+    # So the answer was one rail away the whole time and nothing could reach it.
+    # DIVE-2192 was merged, deployed and green, and could not be closed from
+    # either seat (community/wiki/a-grader-that-cannot-read-the-repo-cannot-close-the-row.md).
+    #
+    # WHY THIS CANNOT WEAKEN THE GATE, on the DIVE-2605 argument:
+    #  * it fires ONLY on a non-zero exit whose stderr says "cannot see this
+    #    repository" — never on a call that ran and answered, so no close that
+    #    passes or refuses today changes path, and no green close spends an extra
+    #    request (tests/task_merge_gate_anon_rail_unit.sh T9 pins that count);
+    #  * the escalation rails are read-only by construction — `_gh_do` re-derives
+    #    its routing class as root and refuses a write, and the anonymous rail has
+    #    no credential to write with;
+    #  * if the escalation also fails we return the ORIGINAL non-zero status and
+    #    empty stdout, which is byte-for-byte the state the caller sees today. The
+    #    gate's fail-closed reading of an empty answer is untouched.
+    # It can only ever convert an UNANSWERED query into an answered one.
+    #
+    # Streaming (not capturing) the primary call is deliberate: it keeps every
+    # existing path identical. `gh ... --json` emits its payload only after a
+    # successful request, so a failed primary call has printed nothing and the
+    # escalation's output cannot be appended to a partial one.
+    if (( _rc != 0 )) && _gate_gh_blind_err "$_errf"; then
+      local _blind; _blind="$(head -n1 "$_errf" 2>/dev/null || printf '')"
+      local _esc_out="" _esc_rc=0 _esc_err="" _escerrf
+      # DIVE-3496 it.2: the capture below runs the callee in a SUBSHELL, so its
+      # `_GATE_GH_LAST_ERR` cannot travel back — name a sink file and read that.
+      _escerrf="${TMPDIR:-/tmp}/.5dive-gate-gh-esc-err.$$"
+      : >"$_escerrf" 2>/dev/null || true
+      _GATE_GH_NOCRED_ERRF="$_escerrf"
+      _esc_out=$(_gate_gh_nocred "$secs" "$@") || _esc_rc=$?
+      _GATE_GH_NOCRED_ERRF=""
+      [[ -s "$_escerrf" ]] && _esc_err="$(cat "$_escerrf" 2>/dev/null || printf '')"
+      rm -f "$_escerrf" 2>/dev/null || true
+      if (( _esc_rc == 0 )); then
         _GATE_GH_LAST_ERR=""
         rm -f "$_errf" 2>/dev/null || true
-        printf '%s' "$_anon_out"
+        printf '%s' "$_esc_out"
         return 0
       fi
-      _GATE_GH_LAST_ERR="no gh rail: no token, the gate bot is not usable here, and the anonymous rail could not answer (private repo, or a query it does not serve)"
+      _GATE_GH_LAST_ERR="the caller's own credential cannot see this repository (${_blind}); the credential-free rails were tried too and could not answer: ${_esc_err}"
       rm -f "$_errf" 2>/dev/null || true
       printf ''
-      return 1
+      return "$_rc"
     fi
-    [[ "$secs" == "0" ]] && secs=10
-    printf '%s\0' "$@" | timeout "${secs}s" sudo -n "$_GATE_GH_DO" _gh_do 2>"$_errf" || _rc=$?
+  else
+    _gate_gh_nocred "$secs" "$@" || _rc=$?
+    rm -f "$_errf" 2>/dev/null || true
+    return "$_rc"
   fi
   [[ -s "$_errf" ]] && _GATE_GH_LAST_ERR="$(cat "$_errf" 2>/dev/null || printf '')"
   rm -f "$_errf" 2>/dev/null || true
@@ -1082,6 +1227,48 @@ _gate_repo_slugs() {
     raw="$raw lodar/5dive-blog lodar/5dive-mobile"
   fi
   printf '%s' "$raw" | tr ',' ' ' | tr -s '[:space:]' '\n' | awk 'NF && !seen[$0]++'
+}
+
+# ── DIVE-3458: a delivery into a repo we do not own ────────────────────────
+# The merge gate refuses `task done` until the bound PR is merged. That is right
+# for our own repos, where merging is OUR action and "delivered but not landed"
+# is the failure it exists to catch (DIVE-2096, DIVE-2656). It is WRONG for a
+# submission into someone else's repository: merging is a third party's decision
+# on their timeline, and NO WORK WE DO can satisfy the gate. Six rows were in that
+# class on 2026-08-16 (awesome-list submissions), two already blocked on it.
+#
+# Holding those rows open is not the conservative option, it is the corrosive one:
+# an open row is supposed to mean WE OWE WORK, and a population of rows open
+# because a stranger has not clicked anything destroys that meaning for every
+# other row on the board. The rows themselves already say so — DIVE-3439's
+# acceptance is verbatim "DONE = the PR/submission URL on this row."
+#
+# THE TEST IS THE HOST AND OWNER OF THE BOUND REF, never the title or a keyword.
+# A title-keyword test is what bound PR #649 to DIVE-3419 and cost two refused
+# closes. Owners come from _gate_repo_slugs, so the FIVE_GATE_REPOS seam keeps
+# working and there is no second list to drift.
+#
+# FAIL CLOSED on anything unparseable: a ref that yields no owner/repo, or is not
+# a github.com ref at all, is NOT foreign and keeps the full gate. The expensive
+# mistake here is exempting one of our own deliveries, not gating a foreign one.
+_gate_our_owners() {
+  _gate_repo_slugs | awk -F/ 'NF==2 && $1 != "" { print tolower($1) }' | awk '!seen[$0]++'
+}
+
+# _gate_foreign_delivery <delivery-ref> — rc 0 when the ref names a repository
+# whose OWNER is not one of ours. rc 1 otherwise (including "cannot tell").
+_gate_foreign_delivery() {
+  local ref="$1" slug owner o
+  [[ "$ref" =~ ^https?://github\.com/ || "$ref" =~ ^git@github\.com: ]] || return 1
+  slug=$(_gate_slug_from_url "$ref") || slug=""
+  [[ -n "$slug" && "$slug" == */* ]] || return 1
+  owner="${slug%%/*}"; owner="${owner,,}"
+  [[ -n "$owner" ]] || return 1
+  while read -r o; do
+    [[ -n "$o" ]] || continue
+    [[ "$o" == "$owner" ]] && return 1
+  done < <(_gate_our_owners)
+  return 0
 }
 
 # _gate_slug_from_url <text> — OWNER/REPO out of the first github URL in <text>, or
@@ -1669,4 +1856,3 @@ _gate_branch_ident_on_main() {
   # Stopped counting; did not run out. Report what was WALKED, not what was asked for.
   printf 'bound:%s' "$walked"
 }
-

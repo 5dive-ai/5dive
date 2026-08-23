@@ -208,8 +208,9 @@ SUDOERS
 #   root-all   `NOPASSWD: ALL` — any command. WIDER than today's `admin`.
 #   cli-root   the whole 5dive CLI as root — exactly what `admin` means today.
 #   cli-scoped only the named hidden subcommands render_standard_sudoers emits
-#              (`agent _deliver|_capture|_self_restart`, `_audit_append`, and
-#              `_push_do` under --can-push) — what `standard` means.
+#              (`agent _deliver|_capture|_self_restart|buzz inbound`,
+#              `_audit_append`, and `_push_do` under --can-push) — what
+#              `standard` means.
 #   none       no sudoers entries at all — what `sandboxed` means.
 #   custom     entries matching none of the above (hand-edited / drifted).
 #   unknown    not measurable from where this ran (see sudo_grant_lines).
@@ -247,9 +248,18 @@ sudo_grant_lines() {
     # root may list any user; a non-root caller may list only itself, and that
     # answer is authoritative for it (this is the `sudo -n -l` an agent is told
     # to run on itself). -n so a policy needing a password never blocks `info`.
-    if [[ "$(id -u)" == "0" ]]; then
+    # DIVE-2538 item 3: both predicates were PATH-resolved `id` calls, and both
+    # decide. `id -u == 0` picks the "may list any user" branch; `$user == $(id -un)`
+    # decides whether `sudo -n -l` (which reports the CALLER's grants) may be
+    # published as the answer for $user. A shim printing a peer's name made this
+    # function return the caller's OWN sudo grants labelled as that peer's — a
+    # wrong answer about who may do what. Both now read $EUID (a bash builtin, so
+    # unshimmable) — the root test through `_gate_is_root`, which is the codebase's
+    # existing spelling of it and keeps the branch stubbable from a harness without
+    # being reachable from a PATH shim.
+    if _gate_is_root; then
       if out=$(sudo -n -l -U "$user" 2>/dev/null); then printf '%s\n' "$out"; return 0; fi
-    elif [[ "$user" == "$(id -un)" ]]; then
+    elif [[ "$user" == "$(actor_caller_unix_name)" ]]; then
       if out=$(sudo -n -l 2>/dev/null); then printf '%s\n' "$out"; return 0; fi
     fi
   fi
@@ -450,10 +460,12 @@ classify_sudo_grant() {
         ALL)                                            has_all=1 ;;
         "/usr/local/bin/5dive"|"/usr/local/bin/5dive *") has_cli=1 ;;
         "/usr/local/bin/5dive agent _deliver"*|"/usr/local/bin/5dive agent _capture"*|\
+        "/usr/local/bin/5dive agent buzz inbound"*|\
         "/usr/local/bin/5dive agent _self_restart"*|"/usr/local/bin/5dive _audit_append"*|\
         "/usr/local/bin/5dive _push_do"*|\
         "/usr/local/bin/5dive _gh_do"*|\
-        "/usr/local/bin/5dive _task_answer"*)            has_a2a=1 ;;
+        "/usr/local/bin/5dive _task_answer"*|\
+        "/usr/local/bin/5dive _merge_do"*)              has_a2a=1 ;;
         *)                                              has_other=1 ;;
       esac
     done
@@ -559,6 +571,15 @@ render_standard_sudoers() {
 # Do not edit by hand; regenerated on agent create/provision.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _deliver *
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _capture *
+# DIVE-3573: the buzz bridge's inbound router. The buzz plugin runs AS this agent
+# and cannot inject into a pane, so the trust decision and the delivery both have
+# to happen root-side. This grant confers no authority over any OTHER seat: the
+# verb has NO target argument and derives the pane it drives from SUDO_USER, so
+# the only session this agent can drive with it is its own. It also re-derives the
+# sender from the PUBLIC KEY via the registry rather than believing an identity
+# the caller asserts, which is why a wildcard here is safe: the arguments it
+# accepts are a key, a file path and two ids, all validated in the verb.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent buzz inbound *
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _audit_append
 # DIVE-1813: let this agent restart its OWN service (so /model + /restart work).
 # EXACT path, NO args, NO wildcard — the target unit is derived from SUDO_USER
@@ -577,6 +598,20 @@ ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _self_restart
 # between standing and capability that it exists to close. It cannot stamp a
 # human answer: every human-evidence form is refused inside the primitive.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _task_answer
+# DIVE-3474: let a VERIFIER merge the pull request on a row IT ITSELF graded PASS.
+# EXACT path, NO args, NO wildcard: one task ident travels over stdin, the caller
+# is derived from SUDO_UID inside _merge_do, and the merge standing is re-derived
+# there from the row as root over the same graded-awaiting-merge predicate the
+# board paints. The pull request comes from that row, never from the caller.
+# UNCONDITIONAL for the _task_answer reason and NOT alongside the push grant: this
+# verb confers no authority of its own - it refuses on any row this seat did not
+# grade - so gating it behind can-push would recreate the split between standing
+# and capability it exists to close, and would hand a grader the push capability
+# the writer-is-not-grader rail says a grader must not hold.
+# NOTE FOR THE NEXT EDITOR: this heredoc is UNQUOTED, so a backtick or a dollar
+# sign in a COMMENT is executed and its output lands in the sudoers file. Keep
+# this block free of both.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _merge_do
 SUDOERS
   if [[ "$can_push" == "1" ]]; then
     cat <<SUDOERS
@@ -1205,29 +1240,36 @@ _apply_byo_openclaw() {
 
   local openclaw_bin="${TYPE_BIN[openclaw]}"
   local openclaw_node="/home/claude/.local/bin/node"
-  if [[ -n "$openclaw_base_url" || -n "$model" ]]; then
-    # The npm launcher uses `#!/usr/bin/env node`. Do not rely on sudo/systemd's
-    # PATH to resolve that shebang during fresh create: invoke the stable Node
-    # link installed alongside OpenClaw explicitly. Keep ~/.local/bin on PATH
-    # for any subprocess OpenClaw starts while writing the config.
-    #
-    # Install-on-demand rather than an immediate refusal, because the two
-    # preconditions are NOT the same check: `agent create`'s install gate tests
-    # ${TYPE_BIN[openclaw]}, while the write below also needs the node link the
-    # same recipe creates. A box where those two disagree (a dangling node link
-    # after an nvm prune, or `agent auth set` on an openclaw-less box — that path
-    # has no install gate at all) passes the gate and fails here.
-    if [[ ! -x "$openclaw_node" || ! -x "$openclaw_bin" ]] \
-       && declare -F cmd_install >/dev/null 2>&1; then
-      step "openclaw runtime incomplete — installing before writing any credential"
-      local _prev_json="${JSON_MODE:-0}"
-      JSON_MODE=0
-      cmd_install openclaw >&2 || true
-      JSON_MODE="$_prev_json"
-    fi
-    [[ -x "$openclaw_node" ]] \
-      || fail "$E_NOT_INSTALLED" "node runtime missing for openclaw (run: 5dive agent install openclaw --upgrade)"
+  # DIVE-3489: UNCONDITIONAL now. This block used to be gated on
+  # `[[ -n "$openclaw_base_url" || -n "$model" ]]` because the runtime was only
+  # needed for the openclaw.json writes — the credential itself was a jq
+  # heredoc that needed no openclaw at all. It is not any more: the key write
+  # below goes through openclaw's own CLI, so the runtime is a precondition of
+  # EVERY openclaw BYO apply, not just the ones that also pin a model.
+  #
+  # The npm launcher uses `#!/usr/bin/env node`. Do not rely on sudo/systemd's
+  # PATH to resolve that shebang during fresh create: invoke the stable Node
+  # link installed alongside OpenClaw explicitly. Keep ~/.local/bin on PATH
+  # for any subprocess OpenClaw starts while writing the config.
+  #
+  # Install-on-demand rather than an immediate refusal, because the two
+  # preconditions are NOT the same check: `agent create`'s install gate tests
+  # ${TYPE_BIN[openclaw]}, while the write below also needs the node link the
+  # same recipe creates. A box where those two disagree (a dangling node link
+  # after an nvm prune, or `agent auth set` on an openclaw-less box — that path
+  # has no install gate at all) passes the gate and fails here.
+  if [[ ! -x "$openclaw_node" || ! -x "$openclaw_bin" ]] \
+     && declare -F cmd_install >/dev/null 2>&1; then
+    step "openclaw runtime incomplete — installing before writing any credential"
+    local _prev_json="${JSON_MODE:-0}"
+    JSON_MODE=0
+    cmd_install openclaw >&2 || true
+    JSON_MODE="$_prev_json"
   fi
+  [[ -x "$openclaw_node" ]] \
+    || fail "$E_NOT_INSTALLED" "node runtime missing for openclaw (run: 5dive agent install openclaw --upgrade)"
+  [[ -e "$openclaw_bin" ]] \
+    || fail "$E_NOT_INSTALLED" "openclaw missing (run: 5dive agent install openclaw --upgrade)"
   # ── end DIVE-3113 preconditions; writes start here ─────────────────────────
 
   if [[ -n "$profile" ]]; then
@@ -1241,19 +1283,64 @@ _apply_byo_openclaw() {
     "${base}/.openclaw/agents/main" \
     "$oc_dir"
 
+  # ── DIVE-3489: write through openclaw's own CLI, never the store ───────────
+  # This used to hand-write `{version:1, profiles:{…}}` into auth-profiles.json.
+  # openclaw moved its per-agent auth into a sqlite store and does not read that
+  # file at all — not even as a migration source. Measured on 2026-08-16 against
+  # openclaw 2026.7.1-2, in a throwaway HOME, both directions:
+  #
+  #   * NEGATIVE: a byte-valid auth-profiles.json with the correct provider id
+  #     and profile id present on disk ->
+  #       Auth state store: ~/.openclaw/agents/main/agent/openclaw-agent.sqlite
+  #       Profiles: (none)
+  #   * POSITIVE: the command below, same HOME ->
+  #       Auth profile: openrouter:manual (openrouter/api_key)
+  #     and openclaw-agent.sqlite appears (110592 bytes, +-wal/-shm).
+  #
+  # So every openclaw BYO create since that migration shipped a credential the
+  # runtime never consulted: the seat reported AUTH ok (our sentinel was the
+  # file we had just written) and failed at first use with ProviderAuthError.
+  #
+  # Do NOT "fix" this by teaching us to write sqlite. The store format is
+  # openclaw's, it has now moved once, and cmd_auth.sh:488 already records that
+  # an openclaw upgrade invalidates assumptions graded against the old shape.
+  # Hand-writing a second private format buys the same debt again.
+  #
+  # The CLI also does a half a file write cannot: it REGISTERS the profile in
+  # openclaw.json under `auth.profiles.<id> = {provider, mode}`. The key stays
+  # in the sqlite; the registration is what makes it selectable.
+  #
+  # Flag placement is load-bearing: `--agent` belongs to the `models auth`
+  # PARENT, not to `paste-api-key` (on the subcommand it errors with
+  # `OpenClaw does not recognize option "--agent"`). `--profile-id` defaults to
+  # `<provider>:manual`, which is the exact id the old jq write constructed, so
+  # this is behaviour-preserving for anything reading the profile id.
+  #
+  # Key travels on STDIN, never in argv — argv is world-readable in /proc.
   local profile_id="${native}:manual"
-  local auth_file="${oc_dir}/auth-profiles.json"
-  step "Writing openclaw BYO auth-profiles.json for '$canonical' (native id: $native)"
-  local tmp
-  tmp=$(mktemp -p "$oc_dir" .auth-profiles.XXXXXX) \
-    || fail "$E_GENERIC" "mktemp failed in $oc_dir"
-  jq -cn --arg pid "$profile_id" --arg p "$native" --arg k "$api_key" \
-    '{version:1, profiles:{($pid):{type:"api_key", provider:$p, key:$k}}}' \
-    > "$tmp" \
-    || { rm -f "$tmp"; fail "$E_GENERIC" "failed to write $auth_file"; }
-  chown claude:claude "$tmp"
-  chmod 0600 "$tmp"
-  mv "$tmp" "$auth_file"
+  step "Writing openclaw BYO credential for '$canonical' via openclaw models auth (native id: $native, profile: $profile_id)"
+  printf '%s\n' "$api_key" \
+    | sudo -u claude -H env \
+        HOME="$base" \
+        PATH="/home/claude/.local/bin:/usr/bin:/bin" \
+        "$openclaw_node" "$openclaw_bin" \
+        models auth --agent main paste-api-key \
+        --provider "$native" --profile-id "$profile_id" >&2 \
+    || fail "$E_GENERIC" "openclaw models auth paste-api-key failed for provider '$native' (HOME=$base). No credential was written; re-run once the openclaw runtime is healthy."
+
+  # Grade our own write rather than trusting the exit code: openclaw is the only
+  # thing that can say whether the store took, and asking it costs one process.
+  # This is the check whose absence let the old path report success for months.
+  local _oc_seen
+  _oc_seen=$(sudo -u claude -H env \
+      HOME="$base" \
+      PATH="/home/claude/.local/bin:/usr/bin:/bin" \
+      "$openclaw_node" "$openclaw_bin" \
+      models auth --agent main list 2>/dev/null) || _oc_seen=""
+  grep -qF "$profile_id" <<<"$_oc_seen" \
+    || fail "$E_GENERIC" "openclaw accepted the key write but does not list profile '$profile_id' back (HOME=$base). Do not treat this seat as authenticated — it is the DIVE-3489 shape: a credential in a store the runtime does not read."
+
+  local auth_store="${oc_dir}/openclaw-agent.sqlite"
 
   # Any openclaw.json write (provider base_url pin and/or default model) goes
   # through the same stable-node invocation — resolved in the precondition block
@@ -1298,7 +1385,7 @@ _apply_byo_openclaw() {
         PATH="/home/claude/.local/bin:/usr/bin:/bin" \
         "$openclaw_node" "$openclaw_bin" \
         config set agents.defaults.model.primary "$model" >&2 \
-        || fail "$E_GENERIC" "openclaw model pin failed (agents.defaults.model.primary=$model). The key IS written to ${auth_file}, so this profile now holds a credential with no model — openclaw would fall back to its built-in default, whose provider is not '$native', and 401. Repair with: sudo -u claude -H env HOME=$base PATH=/home/claude/.local/bin:/usr/bin:/bin $openclaw_node $openclaw_bin config set agents.defaults.model.primary $model"
+        || fail "$E_GENERIC" "openclaw model pin failed (agents.defaults.model.primary=$model). The key IS written to ${auth_store}, so this profile now holds a credential with no model — openclaw would fall back to its built-in default, whose provider is not '$native', and 401. Repair with: sudo -u claude -H env HOME=$base PATH=/home/claude/.local/bin:/usr/bin:/bin $openclaw_node $openclaw_bin config set agents.defaults.model.primary $model"
     fi
   fi
 
@@ -1309,6 +1396,163 @@ _apply_byo_openclaw() {
   if [[ "$canonical" == "zai" ]]; then
     step "z.ai note: GLM coding models need your GLM Coding-Plan key; a prepaid API key may fail auth here"
   fi
+}
+
+# ── DIVE-3442: push openclaw state INTO the seat, as root ───────────────────
+# Everything _apply_byo_openclaw writes lands under /home/claude/.openclaw (or
+# the profile dir) owned by claude. The seat was supposed to pick it up at every
+# launch: 5dive-agent-start has a seed block that copies auth-profiles.json and
+# agents.defaults.model into $HOME/.openclaw. On the BYO path it never fires.
+#
+# Measured on a live throwaway seat (openclaw + openrouter, --isolation=standard):
+# the seat's auth-profiles.json DID NOT EXIST and its openclaw.json carried
+# primary=null, while /home/claude's copy was correct on every field. Both arms of
+# the seed's guard fail:
+#   * the plain read — /home/claude/.openclaw is 0700 claude:claude, so a seat in
+#     group claude cannot even TRAVERSE it (and the credential itself is 0600);
+#   * the `sudo -n` fallback — a standard-isolation seat has no NOPASSWD sudo.
+# The seed's own DIVE-1900 comment says creds are "normalized 0640 g=claude under
+# group-traversable dirs". That is true of the PROFILE path only
+# (normalize_profile_seed_perms relaxes it at bind time) and of hermes' shared dir
+# (cmd_create chmods it 0775 + 0640 before enabling the unit). openclaw's DEFAULT
+# no-profile dir is normalized by nobody, so the fast path can never fire for a
+# BYO seat. Symptom: telegram works (the channel/gateway config is written
+# straight into the seat at create time and needs no credential) and every message
+# to the provider dies at auth.
+#
+# The tempting fix is to chmod the shared tree group-readable. REJECTED: that
+# makes the operator's real provider key readable by every seat in group claude,
+# which is the open question in DIVE-3305, and a bug fix must not pre-empt it.
+#
+# So push instead of pull. `agent create` and `agent auth set` both already run
+# as root, which is the one context that can read claude's private dir AND write
+# a 0600 file owned by the seat. Nothing here depends on the seat being able to
+# read anything of claude's, so it is correct at every isolation level.
+#
+# Copies (never moves) two things:
+#   1. the AUTH STORE openclaw-agent.sqlite (with its -wal/-shm siblings) ->
+#      $HOME/.openclaw/agents/main/agent/, 0600, seat-owned.
+#      DIVE-3489: this was auth-profiles.json. openclaw moved per-agent auth into
+#      a sqlite store and does not read the JSON at all, so copying it pushed an
+#      inert file into the seat and the seat still booted UNAUTHENTICATED — the
+#      same defect as the write side, one hop later. Legacy auth-profiles.json is
+#      still carried when present so a profile written by an older CLI is not
+#      silently dropped; it is additive, and it is not what authenticates.
+#   2. agents.defaults.model, models.providers AND auth.profiles, deep-merged
+#      into the seat's own openclaw.json. models.providers is in the set on
+#      purpose: the boot seed syncs only agents.defaults, so a provider baseUrl
+#      override (zai — see OPENCLAW_PROVIDER_URL) written by _apply_byo_openclaw
+#      reached the shared config and never the seat. auth.profiles joins it for
+#      DIVE-3489: `models auth paste-api-key` writes the key to the sqlite and
+#      the REGISTRATION (`{provider, mode}`, no key) to openclaw.json. Both
+#      halves have to land or the store holds a credential nothing selects.
+# Merge, not overwrite: the seat's openclaw.json already holds its channels,
+# gateway mode and gateway token by the time we run.
+#
+# WAL safety on the sqlite copy: every writer we have is openclaw's own one-shot
+# CLI, which has exited by the time either caller reaches here, so there is no
+# live writer to tear a page. The -wal/-shm siblings are copied with it rather
+# than assumed checkpointed — the measured post-write state had a 0-byte -wal and
+# a 32K -shm, so the set is what is known good, not the .sqlite alone.
+#
+# Best-effort by contract (warn, never fail): the credential is on disk either
+# way, and the boot seed remains as the second chance. Returns 0 always.
+seed_openclaw_state_into_seat() { # <name> [profile]
+  local name="$1" profile="${2:-}"
+  local user="agent-${name}"
+  local home="${AGENT_HOME_ROOT:-/home}/${user}"
+  [[ -d "$home" ]] || return 0
+
+  local base="/home/claude"
+  if [[ -n "$profile" ]]; then
+    base="$(profile_type_dir "$profile" openclaw)" || return 0
+  fi
+  local src_store="${base}/.openclaw/agents/main/agent/openclaw-agent.sqlite"
+  local src_auth="${base}/.openclaw/agents/main/agent/auth-profiles.json"
+  local src_cfg="${base}/.openclaw/openclaw.json"
+  local dst_dir="${home}/.openclaw/agents/main/agent"
+  local dst_cfg="${home}/.openclaw/openclaw.json"
+
+  [[ -s "$src_store" || -s "$src_auth" || -s "$src_cfg" ]] || return 0
+  step "Seeding openclaw credential + model default into ${home}/.openclaw"
+
+  # -o/-g only work as root; fall back to a plain mkdir so the function stays
+  # runnable (and unit-gradable) unprivileged, where ownership is moot anyway.
+  install -d -m 700 -o "$user" -g "$user" \
+    "${home}/.openclaw" "${home}/.openclaw/agents" \
+    "${home}/.openclaw/agents/main" "$dst_dir" 2>/dev/null \
+    || mkdir -p "$dst_dir" 2>/dev/null \
+    || { warn "openclaw seed: could not create ${dst_dir} — the agent may boot UNAUTHENTICATED"; return 0; }
+
+  # DIVE-3489: the auth STORE first — this is the one that authenticates.
+  # openclaw-agent.sqlite plus whichever of its -wal/-shm siblings exist; each
+  # lands atomically via a temp in the destination dir so a failed copy cannot
+  # leave a half-written store where a whole one used to be.
+  if [[ -s "$src_store" ]]; then
+    local _sf _base _tmp _copied=1
+    for _sf in "$src_store" "${src_store}-wal" "${src_store}-shm"; do
+      [[ -e "$_sf" ]] || continue
+      _base=$(basename "$_sf")
+      if _tmp=$(mktemp -p "$dst_dir" ".${_base}.XXXXXX" 2>/dev/null) \
+         && cat "$_sf" > "$_tmp" 2>/dev/null; then
+        chown "$user":"$user" "$_tmp" 2>/dev/null || true
+        chmod 0600 "$_tmp"
+        mv "$_tmp" "${dst_dir}/${_base}"
+      else
+        rm -f "${_tmp:-}" 2>/dev/null || true
+        _copied=0
+      fi
+    done
+    (( _copied )) \
+      || warn "openclaw seed: could not copy the auth store $src_store into $dst_dir — the agent will boot UNAUTHENTICATED and every message will fail with ProviderAuthError"
+  fi
+
+  # Legacy JSON, additive: still carried when a pre-DIVE-3489 profile has one, so
+  # a downgrade or an older third-party reader is not left with nothing. It is
+  # NOT what authenticates — do not treat its presence as a credential witness.
+  if [[ -s "$src_auth" ]]; then
+    local tmp
+    if tmp=$(mktemp -p "$dst_dir" .auth-profiles.XXXXXX 2>/dev/null) && cat "$src_auth" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+      chown "$user":"$user" "$tmp" 2>/dev/null || true
+      chmod 0600 "$tmp"
+      mv "$tmp" "${dst_dir}/auth-profiles.json"
+    else
+      rm -f "${tmp:-}" 2>/dev/null || true
+      warn "openclaw seed: could not copy legacy $src_auth into $dst_dir (the auth store above is what authenticates)"
+    fi
+  fi
+
+  if [[ -s "$src_cfg" ]]; then
+    local patch
+    # DIVE-3489: auth.profiles joins the set. `models auth paste-api-key` splits
+    # its write — the KEY into openclaw-agent.sqlite, the REGISTRATION
+    # (`auth.profiles.<id> = {provider, mode}`, no key) into openclaw.json. The
+    # store copied above is inert without the registration, so seeding one and
+    # not the other reproduces this row's defect with the halves swapped.
+    patch=$(jq -c '
+      (.agents.defaults.model? // null) as $m
+      | (.models.providers? // null) as $p
+      | (.auth.profiles? // null) as $a
+      | (if $m == null then {} else {agents: {defaults: {model: $m}}} end)
+        * (if $p == null then {} else {models: {providers: $p}} end)
+        * (if $a == null then {} else {auth: {profiles: $a}} end)' \
+      "$src_cfg" 2>/dev/null) || patch=""
+    if [[ -n "$patch" && "$patch" != "{}" && "$patch" != "null" ]]; then
+      [[ -s "$dst_cfg" ]] || printf '{}\n' > "$dst_cfg"
+      local ctmp
+      if ctmp=$(mktemp -p "${home}/.openclaw" .openclaw.json.XXXXXX 2>/dev/null) \
+         && jq -s '.[0] * .[1]' "$dst_cfg" <(printf '%s' "$patch") > "$ctmp" 2>/dev/null \
+         && [[ -s "$ctmp" ]]; then
+        chown "$user":"$user" "$ctmp" 2>/dev/null || true
+        chmod 0600 "$ctmp"
+        mv "$ctmp" "$dst_cfg"
+      else
+        rm -f "${ctmp:-}" 2>/dev/null || true
+        warn "openclaw seed: could not merge model defaults into $dst_cfg — the agent may fall back to openclaw's built-in default model and 401"
+      fi
+    fi
+  fi
+  return 0
 }
 
 # ── DIVE-990: memory-as-onboarding ──────────────────────────────────────────
@@ -1367,6 +1611,13 @@ _rebuild_inherited_index() {
     echo "# Memory Index (inherited at hire — DIVE-990)"
     echo
     echo "Seeded from shared team knowledge so this agent starts warm. Search with \`5dive memory search \"<query>\"\`; add your own facts with \`5dive memory add\`."
+    echo
+    echo "This index grows on its own: \`5dive memory consolidate\` distils your FINISHED"
+    echo "session transcripts into atoms here, scheduled for you, never touching the live"
+    echo "session, and never leaving this box. You still hand-compile JUDGEMENT-shaped"
+    echo "knowledge (a decision and its reason, a cause, a wiki page) — the pipeline can"
+    echo "only lift what is stated in the transcript, and it cannot publish to a shared"
+    echo "store at all."
     echo
     for f in "$dir"/*.md; do
       [[ -e "$f" ]] || continue
@@ -1450,9 +1701,58 @@ selfcheck_cred_reached_agent() { # <name> <type> <profile> <byo_provider>
   local bc="${AGENT_HOME_ROOT:-/home}/${user}/.5dive-cred-seed-failed" why=""
   if [[ -s "$bc" ]]; then
     why=$(tr -d '\n' < "$bc" 2>/dev/null | cut -c1-400)
-    printf 'issue:credential did NOT reach the agent (it is UNAUTHED despite a completed login) — the boot seed recorded: %s. Re-seed as root: sudo 5dive agent restart %s\n' \
+    # DIVE-3455: the fixed half of this line must not name a fault the breadcrumb
+    # may not be describing. Two faults reach here now — the seat booted with NO
+    # credential, and the seat booted on a LOCAL one that could not be compared
+    # with the profile's (STALE, and no re-auth will replace it). "It is UNAUTHED"
+    # is false for the second and sends the operator looking for a dead seat that
+    # is in fact running. The recorded reason below distinguishes them; this half
+    # states only what is true of both.
+    printf 'issue:credential did NOT reach the agent (a completed login is not proof the seat received it) — the boot seed recorded: %s. Re-seed as root: sudo 5dive agent restart %s\n' \
       "$why" "$name"
     return 0
+  fi
+
+  # Witness 1b (DIVE-3442, openclaw only): grade the SEAT, not the source. Every
+  # other witness here asks whether the shared/profile credential is reachable;
+  # openclaw is the type where that question has been answered "yes" while the
+  # seat itself had nothing — the pull-side seed no-ops on a 0700 shared dir and
+  # a seat with no sudo. Witness 2 cannot see it either: on the BYO path with no
+  # --auth-profile it resolves src="" and returns without a word, which is why a
+  # measured-broken seat printed a clean create. Two things must be true on the
+  # seat and both are cheap to read: a non-empty auth STORE, and a
+  # non-null agents.defaults.model.primary (a null primary sends openclaw to its
+  # built-in default, whose provider prefix picks a credential we never wrote —
+  # DIVE-3113/3130, and it 401s while looking configured).
+  #
+  # DIVE-3489: the credential witness is openclaw-agent.sqlite, NOT
+  # auth-profiles.json. Reading the JSON here is what made a dead credential
+  # print as a healthy seat: the witness confirmed our own write into a file the
+  # runtime does not read, which is the same fail-open shape the row was filed
+  # for. A witness must read the store the RUNTIME reads.
+  if [[ "$type" == "openclaw" ]]; then
+    local _oc_home="${AGENT_HOME_ROOT:-/home}/${user}"
+    local _oc_auth="${_oc_home}/.openclaw/agents/main/agent/openclaw-agent.sqlite"
+    local _oc_cfg="${_oc_home}/.openclaw/openclaw.json"
+    if [[ ! -s "$_oc_auth" ]]; then
+      printf 'issue:openclaw credential never reached the seat (%s is missing/empty) — the agent boots UNAUTHENTICATED and every message fails with ProviderAuthError while the profile itself looks fine. Re-seed as root: sudo 5dive agent restart %s\n' \
+        "$_oc_auth" "$name"
+    else
+      local _oc_primary
+      # model is `{primary: …}` on every path we write, but openclaw also accepts
+      # a bare string there — indexing a string with .primary is a jq ERROR, not
+      # a null, so branch on the type instead of chaining `//`.
+      _oc_primary=$(jq -r '(.agents.defaults.model) as $m
+        | if ($m|type) == "object" then ($m.primary // "")
+          elif ($m|type) == "string" then $m
+          else "" end' "$_oc_cfg" 2>/dev/null) || _oc_primary=""
+      if [[ -z "$_oc_primary" ]]; then
+        printf 'issue:openclaw seat has a credential but NO model pin (agents.defaults.model.primary is null in %s) — openclaw falls back to its built-in default, whose provider prefix selects a credential that was never written, and returns 401 on every message. Re-seed as root: sudo 5dive agent restart %s\n' \
+          "$_oc_cfg" "$name"
+      else
+        printf 'ok:openclaw seat has its own credential and model pin (%s)\n' "$_oc_primary"
+      fi
+    fi
   fi
 
   # Witness 2: the source the seed reads from, probed as the agent. Catches
@@ -1880,7 +2180,11 @@ cmd_create() {
       IFS=',' read -r -a skills_specs <<<"$skills_arg"
     fi
   else
-    if [[ "${SUDO_USER:-}" == agent-* ]]; then
+    # DIVE-2538 item 2: was `[[ "${SUDO_USER:-}" == agent-* ]]`. Same prefix rule as
+    # item 1 — an env var deciding a class. Lower stakes than the a2a counter (it
+    # only decides a default skill), but it is the same construct and it is what a
+    # class-grep for the rule must come back clean on.
+    if [[ -n "$(actor_routing_agent)" ]]; then
       skills_specs=("5dive-cli")
     fi
   fi
@@ -2190,6 +2494,15 @@ cmd_create() {
       # connectord token from /etc/5dive/connectord.env itself.
       dashboard)
         install_channel_for_agent "$type" dashboard "$name" "" ;;
+      # DIVE-3509 buzz: the sixth wiring site, and the one that was missed.
+      # valid_channel accepted buzz, the registry recorded it, and
+      # 5dive-agent-start emitted --channels plugin:buzz@5dive-plugins — but
+      # with no arm here the plugin was NEVER FETCHED, so the flag named a
+      # plugin that did not exist on the box and the create still printed OK.
+      # `agent config set channels=…,buzz` had this install (DIVE-3333); only
+      # the create path did not.
+      buzz)
+        install_channel_for_agent "$type" buzz "$name" "" ;;
     esac
   done
 
@@ -2203,6 +2516,16 @@ cmd_create() {
   if [[ "$type" == "hermes" && "$byo_provider" == "moonshot" ]]; then
     step "Seeding KIMI_API_KEY into ~/.hermes/.env for agent-${name}"
     seed_hermes_byo_env "$name" KIMI_API_KEY "$byo_api_key"
+  fi
+
+  # DIVE-3442: put openclaw's credential and model pin INSIDE the seat while we
+  # still have root. The boot-time pull in 5dive-agent-start cannot reach
+  # /home/claude/.openclaw (0700) from a standard-isolation seat, so without this
+  # a BYO seat boots with no auth-profiles.json and primary=null — telegram wired,
+  # every provider call 401. Runs after the channel install so the merge lands on
+  # top of the seat's channel/gateway config rather than under it.
+  if [[ "$type" == "openclaw" ]]; then
+    seed_openclaw_state_into_seat "$name" "$profile"
   fi
 
   if [[ -n "$telegram_token" ]]; then
@@ -2428,6 +2751,23 @@ cmd_create() {
   # real file — manual host logins win. Best-effort; never fails the create.
   paperclip_seed_for_type "$type" "$profile" 2>/dev/null || true
 
+  # DIVE-3568: hand the customer a session whose channel flags are WARM. The
+  # first boot above is a warm-up; this restarts into the session they keep.
+  # Only claude takes a runtime --channels flag (see 5dive-agent-start's
+  # channel switch) — the poll-fork runtimes re-read their channel state from
+  # disk on every tick, so they have no cold-flag window to close and are
+  # skipped rather than paid for. See warm_channel_capability_restart().
+  local warm_restart="skipped"
+  if [[ "$type" == "claude" ]] && [[ -n "$channels" && "$channels" != "none" ]]; then
+    step "Restarting ${name} once so its channel flags are warm (DIVE-3568)"
+    if warm_channel_capability_restart "$name"; then
+      warm_restart="restarted"
+    else
+      warm_restart="failed"
+      warn "channel warm-up restart failed for '$name' — the agent is UP but its channels may be ignored for this session: sudo systemctl restart 5dive-agent@${name}.service"
+    fi
+  fi
+
   local effective_workdir="${workdir:-$DEFAULT_WORKDIR}"
   # autoPaired: telegram agent whose allowFrom was seeded at create (explicit
   # --telegram-allowed-users or the shared operator store), so it accepts the
@@ -2473,6 +2813,38 @@ cmd_create() {
       _hc_issues+=("$_ch is DEAF (allowlist empty) — pair it: 5dive agent pair $name --user-id=<$_idlabel>")
     fi
   done
+  # DIVE-3509 buzz: "poller up" above reads the AGENT's systemd unit, which is
+  # active whether or not the buzz channel has any of its three prerequisites.
+  # A create-time check that says "poller up" while the plugin it named was
+  # never fetched is worse than no check, because it is the thing an operator
+  # looks at. Assert the real predicate instead — plugin dir, config, binary —
+  # and name the one command that fixes it.
+  if channel_in_list buzz "$channels"; then
+    local _bz_home="/home/agent-${name}" _bz_gaps=() _bz_cfg _bz_path
+    _bz_cfg="${_bz_home}/.claude/channels/buzz/config.json"
+    if ! find "${_bz_home}/.claude/plugins/cache" -maxdepth 3 -type d -name buzz \
+         -print -quit 2>/dev/null | grep -q .; then
+      _bz_gaps+=("plugin not installed")
+    fi
+    if [[ ! -f "$_bz_cfg" ]]; then
+      _bz_gaps+=("no config.json")
+    elif ! jq -e '.relay_url and .private_key' "$_bz_cfg" >/dev/null 2>&1; then
+      _bz_gaps+=("config.json missing relay_url/private_key")
+    else
+      _bz_path=$(jq -r '.buzz_path // "buzz"' "$_bz_cfg" 2>/dev/null)
+      # An absolute buzz_path must exist; a bare name must resolve on PATH.
+      if [[ "$_bz_path" == /* ]]; then
+        [[ -x "$_bz_path" ]] || _bz_gaps+=("buzz binary missing at $_bz_path")
+      else
+        command -v "$_bz_path" >/dev/null 2>&1 || _bz_gaps+=("buzz binary '$_bz_path' not on PATH")
+      fi
+    fi
+    if (( ${#_bz_gaps[@]} == 0 )); then
+      _hc_ok+=("buzz configured")
+    else
+      _hc_issues+=("buzz is UNCONFIGURED ($(IFS=', '; echo "${_bz_gaps[*]}")) — the channel is enabled but connected to NOTHING. Finish it: sudo 5dive agent buzz enable $name --relay=<https://relay.example.com>")
+    fi
+  fi
   # reachability: telegram getMe (the token actually resolves a live bot).
   # bot_username is only populated above for an exact channels==telegram create,
   # so re-probe here when telegram is present in a multi-channel set.
@@ -2520,8 +2892,9 @@ cmd_create() {
     (( ${#_hc_ok[@]} > 0 )) && warn "  (ok: ${_hc_ok[*]})"
   fi
   ok "agent '$name' (type=$type, channels=$channels${profile:+, profile=$profile}) is running." \
-     '{name:$n, type:$t, channels:$c, workdir:$w, authProfile:$p, created:true, autoPaired:$ap, skills:{installed:$inst, failed:$fail}, teamBot:$tb}' \
+     '{name:$n, type:$t, channels:$c, workdir:$w, authProfile:$p, created:true, autoPaired:$ap, skills:{installed:$inst, failed:$fail}, teamBot:$tb, channelWarmRestart:$wr}' \
      --arg n "$name" --arg t "$type" --arg c "$channels" --arg w "$effective_workdir" --arg p "${profile:-}" \
+     --arg wr "$warm_restart" \
      --argjson ap "$auto_paired" \
      --argjson inst "$installed_skills_json" --argjson fail "$failed_skills_json" --arg tb "$team_bot_status"
 }

@@ -155,6 +155,12 @@ _HB_VERIFY_STALE_MIN="${HEARTBEAT_VERIFY_STALE_MIN:-60}"
 # outlived its own cadence and started suppressing the NEXT slot.
 _HB_RECURRING_STALL_HOURS="${HEARTBEAT_RECURRING_STALL_HOURS:-24}"
 [[ "$_HB_RECURRING_STALL_HOURS" =~ ^[0-9]+$ ]] || _HB_RECURRING_STALL_HOURS=24
+# DIVE-3483: how long a NON-recurring row may sit todo on a seat before arm (a6)
+# says so once. 24h is deliberately generous — a row untouched for a full day on a
+# live seat is not "busy today", and the two rows that forced this arm had sat 3
+# and 4 days. Tighten it and the arm starts announcing rows that are merely queued.
+_HB_STRANDED_HOURS="${HEARTBEAT_STRANDED_HOURS:-24}"
+[[ "$_HB_STRANDED_HOURS" =~ ^[0-9]+$ ]] || _HB_STRANDED_HOURS=24
 # DIVE-2853: how long AFTER that one-shot notice an instance may still sit
 # todo-and-never-started before the ladder CHANGES HANDS. Same default window as
 # the first rung, so a daily beat gets one full extra cadence with its original
@@ -308,6 +314,12 @@ _hb_wake_budget_inc() {
 #     DIVE-1434 poller-liveness canary (olivia condition 2), so a slept agent with
 #     a later trigger is always woken by a subsequent tick.
 _HB_SLEEP_AFTER_MIN="${HEARTBEAT_SLEEP_AFTER_MIN:-15}"   # idle minutes before a cold agent sleeps
+# DIVE-3628 memory-consolidation cadence. 6h => <=4 distiller calls/seat/day; see
+# _hb_memory_consolidate_sweep for the measured per-call cost this bounds.
+_HB_CONSOLIDATE_EVERY_MIN="${MEMORY_CONSOLIDATE_EVERY_MIN:-360}"
+# A distiller call measured ~35s; 300s is generous headroom without letting a
+# wedged model call sit on the tick.
+_HB_CONSOLIDATE_TIMEOUT_S="${MEMORY_CONSOLIDATE_TIMEOUT_S:-300}"
 [[ "$_HB_SLEEP_AFTER_MIN" =~ ^[0-9]+$ ]] || _HB_SLEEP_AFTER_MIN=15
 
 # Per-agent idle-before-sleep threshold (minutes); falls back to the global default.
@@ -394,6 +406,13 @@ _hb_usage() {
   5dive heartbeat off <name>              # stop waking the agent (keeps its settings)
   5dive heartbeat ls                      # show enrolled agents + next-wake + queued count
   5dive heartbeat tick                    # cron driver: wake every due agent that has work
+  5dive heartbeat wake-task <agent> <task_id> [<ident>]
+                                          # root: drive ONE agent onto ONE task now, bypassing the
+                                          # cadence. The manual exit from a tier-guard hold, and
+                                          # what \`loop\` uses to start a just-spawned row.
+  5dive heartbeat held [--json] [--stalled-hours=<h>]
+                                          # seats whose ENTIRE runnable queue is tier-guard held
+                                          # (breach-only: prints nothing when no seat is stranded)
   5dive heartbeat wake-mode <name> [always_on|cold] [--cap=<n>] [--sleep-after=<min>]
                                           # opt-in reactive wake mode + wake-budget + auto-sleep.
                                           # no args after <name> => show current mode/budget/sleep/cost.
@@ -428,6 +447,7 @@ cmd_heartbeat() {
     ls|list|status)  cmd_heartbeat_ls "$@" ;;
     tick)            cmd_heartbeat_tick "$@" ;;
     wake-task)       cmd_heartbeat_wake_task "$@" ;;
+    held)            cmd_heartbeat_held "$@" ;;
     wake-mode)       cmd_heartbeat_wake_mode "$@" ;;
     -h|--help|help)  _hb_usage ;;
     *) fail "$E_USAGE" "unknown heartbeat command: $sub (try: 5dive heartbeat --help)" ;;
@@ -594,6 +614,102 @@ _hb_wake_mode_write() {
   shown_slp=$(_hb_sleep_after_min "$name" "$reg")
   ok "wake mode for '$name' set to '$mode' (cap ${shown_cap}/day; sleeps after ${shown_slp}m idle; cost/wake ${_HB_WAKE_COST_EST})" \
      '{name:$n, mode:$m, capPerDay:$c, sleepAfterMin:($s|tonumber)}' --arg n "$name" --arg m "$mode" --arg c "$shown_cap" --arg s "$shown_slp"
+}
+
+# --- DIVE-3501: the all-held seat, made observable off the log -----------------
+#
+# THE FAILURE THIS SURFACES. The tier guard holding a row is CORRECT (DIVE-1065).
+# What was wrong is that a seat whose ENTIRE runnable queue is held has no
+# observable difference from a healthy idle seat: the rows read `todo`, the unit
+# reads `active`, quota is fine, and the only trace is a `_hb_log` line on stderr
+# that lands in /var/log/5dive-heartbeat.log — 7865 of them by 2026-08-16, read by
+# nobody. dev2 sat with 5 runnable high rows, all held, every 5 minutes for six
+# days while every liveness signal said it was fine.
+#
+# WHY THIS PREDICATE IS STATELESS, and why that is the point. It threads NO
+# consecutive-tick counter through the tick. It is a pure query over `tasks` +
+# the registry: a seat with >= 1 runnable todo, where EVERY one would be held
+# (rank(created_by) < rank(assignee), both MEASURED, creator != assignee), and
+# whose last wake is >= --stalled-hours old. So it is exactly reproducible from
+# the DB at any later time, it survives a heartbeat restart, and each clause is
+# independently mutation-gradable — break the rank comparison, or weaken the
+# "every" quantifier to "any", and the test goes red on each separately. A tick
+# counter would be gradable only by simulating ticks.
+#
+# RUNNABLE means what the PICKER means by it, so this is `_hb_pick_tasks` at a
+# wide limit rather than a second hand-written todo query — a re-implementation
+# would drift from the dep-aware ordering the guard actually sees.
+#
+# BREACH-ONLY (DIVE-3460): silent when no seat is stranded. A monitor that prints
+# a reassuring line every day is a monitor nobody reads
+# (community/wiki/a-monitor-with-no-reader-is-not-a-monitor.md).
+_HB_HELD_STALL_HOURS=${_HB_HELD_STALL_HOURS:-6}
+# Wide enough to cover any real queue; still bounded so a pathological board
+# cannot make this scan unboundedly.
+_HB_HELD_SCAN=${_HB_HELD_SCAN:-500}
+
+cmd_heartbeat_held() {
+  local as_json="${JSON_MODE:-0}" hours="$_HB_HELD_STALL_HOURS"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) as_json=1 ;;
+      --stalled-hours=*) hours="${1#*=}" ;;
+      -h|--help) echo "usage: 5dive heartbeat held [--json] [--stalled-hours=<h>]"; return 0 ;;
+      *) fail "$E_USAGE" "heartbeat held: unknown arg: $1" ;;
+    esac
+    shift
+  done
+  [[ "$hours" =~ ^[0-9]+$ ]] || fail "$E_USAGE" "heartbeat held: --stalled-hours must be a whole number of hours"
+  local reg now; reg=$(registry_read); now=$(date +%s)
+  local rows="[]" name
+  for name in $(jq -r '.agents | to_entries[] | .key' <<<"$reg" 2>/dev/null); do
+    local ids id cand=0 held=0 idents="" _cby _ctier _atier _cr _ar
+    ids=$(_hb_pick_tasks "$name" "$_HB_HELD_SCAN")
+    [[ -n "$ids" ]] || continue
+    _atier=$(agent_tier "$name")
+    while read -r id; do
+      [[ -n "$id" ]] || continue
+      cand=$((cand + 1))
+      _cby=$(db "SELECT COALESCE(created_by,'') FROM tasks WHERE id=${id};" 2>/dev/null || echo "")
+      # Same three clauses as the guard, in the same order. A row that is NOT
+      # held is enough to clear the seat — the whole point of the predicate is
+      # the universal quantifier.
+      [[ -n "$_cby" && "$_cby" != "$name" ]] || continue
+      _ctier=$(agent_tier "$_cby")
+      if tier_unmeasured "$_ctier" || tier_unmeasured "$_atier"; then
+        # The DIVE-2213 unmeasured hold is also a hold; count it.
+        held=$((held + 1))
+        idents+="${idents:+ }$(db "SELECT COALESCE(ident,'') FROM tasks WHERE id=${id};" 2>/dev/null || echo "")"
+        continue
+      fi
+      _cr=$(_hb_tier_rank "$_ctier"); _ar=$(_hb_tier_rank "$_atier")
+      if (( _cr > 0 && _ar > 0 && _cr < _ar )); then
+        held=$((held + 1))
+        idents+="${idents:+ }$(db "SELECT COALESCE(ident,'') FROM tasks WHERE id=${id};" 2>/dev/null || echo "")"
+      fi
+    done <<<"$ids"
+    (( cand > 0 && held == cand )) || continue
+    local lastRun stalledSec
+    lastRun=$(jq -r --arg n "$name" '.agents[$n].heartbeat.lastRunAt // 0' <<<"$reg")
+    [[ "$lastRun" =~ ^[0-9]+$ ]] || lastRun=0
+    stalledSec=$(( now - lastRun ))
+    (( stalledSec >= hours * 3600 )) || continue
+    rows=$(jq -c --arg n "$name" --arg t "$_atier" --argjson h "$held" \
+                 --argjson s "$stalledSec" --arg ids "$idents" \
+      '. + [{agent:$n, tier:$t, heldCount:$h, stalledSec:$s,
+             stalledHours:(($s/3600)|floor), idents:($ids|split(" ")|map(select(length>0)))}]' <<<"$rows")
+  done
+  if [ "$as_json" = 1 ]; then
+    # stdin, not --argjson for the row array (DIVE-222).
+    printf '%s' "$rows" | jq -c --argjson h "$hours" \
+      '{ok:true, data:{stalledHours:$h, seats:., count:(.|length)}}'
+    return 0
+  fi
+  # Breach-only: no seats => no output at all.
+  [[ "$(jq -r 'length' <<<"$rows")" != "0" ]] || return 0
+  printf 'tier-guard stranded seats (entire runnable queue held, idle >= %sh):\n' "$hours"
+  jq -r '.[] | "  \(.agent) (\(.tier)) — \(.heldCount) held, idle \(.stalledHours)h: \(.idents|join(", "))"' <<<"$rows"
+  printf 'exits: 5dive task assign <id> <equal-or-higher-tier agent>, or 5dive heartbeat wake-task <agent> <task_id>\n'
 }
 
 cmd_heartbeat_ls() {
@@ -1051,10 +1167,30 @@ _hb_mark_active_defer() {
   else
     n=1
   fi
+  # DIVE-3503: MERGE, do not replace. This ran every deferred tick and a bare
+  # `= {fp,n}` would drop .escFp — the record of what the last force-nudge was
+  # aimed at — one tick after the escalation wrote it, so the repeat-detection
+  # below could never see a match and the honest-escalation path would be dead
+  # code that always read "fresh episode".
   reg=$(echo "$reg" | jq --arg n "$name" --arg fp "$fp" --argjson c "$n" '
-    .agents[$n].heartbeat.activeDefer = {fp:$fp, n:$c}')
+    .agents[$n].heartbeat.activeDefer = ((.agents[$n].heartbeat.activeDefer // {}) + {fp:$fp, n:$c})')
   echo "$reg" | registry_write
   printf '%s' "$n"
+}
+
+# DIVE-3503 — record the pane fingerprint an active-defer escalation FIRED ON.
+# Survives _hb_clear_active_defer's counter reset on purpose: the counter is the
+# episode's nudge budget, this is the evidence of what the last remedy was aimed
+# at. Equality on the next escalation means the seat never completed a turn in
+# between, which is the only available proof that the typed nudge did not land.
+# Must run under with_registry_lock, like its siblings.
+_hb_mark_escalation_fp() {
+  local name="$1" fp="$2"
+  [[ -n "$fp" ]] || return 0
+  local reg; reg=$(registry_read)
+  reg=$(echo "$reg" | jq --arg n "$name" --arg fp "$fp" '
+    .agents[$n].heartbeat.activeDefer = ((.agents[$n].heartbeat.activeDefer // {}) + {escFp:$fp})')
+  echo "$reg" | registry_write
 }
 
 # DIVE-1486 — clear an agent's active-defer counter once it's no longer being
@@ -1078,7 +1214,14 @@ _hb_clear_active_defer() {
 # so the pane really is parked on a dialog, not mid-turn text.
 _hb_pane_is_usage_limit() {
   local pane="$1"
-  grep -qiE 'hit your (monthly[ -]?spend|usage|5[ -]?hour) limit|usage limit reached|reached your .* limit|limit reached' <<<"$pane" || return 1
+  # DIVE-3465 widened the HEADER alternation to the weekly/daily variants. It was
+  # written when the only walls in evidence were "monthly spend" and "5-hour", so
+  # a seat parked on "You've hit your weekly limit" (rolling) or "your weekly
+  # spend limit" (a ceiling) matched NOTHING here: the DIVE-1666 self-heal never
+  # fired on it and the classifier below never got to see it. The two-signature
+  # discipline is unchanged, so this does not widen the false-match surface -- a
+  # header line on its own still does not match (asserted in both harnesses).
+  grep -qiE 'hit your ((monthly|weekly|daily)([ -]?spend)?|usage|5[ -]?hour) limit|usage limit reached|reached your .* limit|limit reached' <<<"$pane" || return 1
   grep -qiE 'upgrade your plan|wait for .*limit to reset|limit will reset|resets? (at|in) ' <<<"$pane" || return 1
   return 0
 }
@@ -1089,9 +1232,156 @@ _hb_pane_is_usage_limit() {
 # a real prompt and keep deferring, never restart on a missing signal).
 _hb_usage_limit_frozen() {
   local name="$1" pane
-  pane=$(sudo -u "agent-${name}" tmux capture-pane -p -t "agent-${name}" 2>/dev/null) || return 1
+  pane=$(_hb_pane_capture "$name") || return 1
   [[ -n "$pane" ]] || return 1
   _hb_pane_is_usage_limit "$pane"
+}
+
+# DIVE-3465 — the one place the seat's live screen is read. Split out of
+# _hb_usage_limit_frozen (identical behaviour) so the wall CLASSIFIER below can
+# read the same pane without a second capture, and so a harness can stub one
+# function instead of shelling out to tmux. Empty output and a failed capture
+# are both "no reading" — callers must treat that as COULD-NOT-DETERMINE, never
+# as evidence of health.
+_hb_pane_capture() {
+  local name="$1"
+  sudo -u "agent-${name}" tmux capture-pane -p -t "agent-${name}" 2>/dev/null
+}
+
+# --- DIVE-3465: a retryable rate limit and a hard spend cap are two states -----
+# _hb_pane_is_usage_limit above answers ONE question — "is this session parked on
+# a wall dialog" — and it matches BOTH variants on purpose ("tolerant of CC copy
+# drift across the monthly-spend and 5-hour variants"). That tolerance is exactly
+# the collapse this row exists to undo, because the two walls need OPPOSITE
+# responses:
+#
+#   rate limit (rolling 5h / 7d window)  RETRYABLE. The window rolls back on its
+#       own, so press-continue / restart-and-retry is the correct answer and is
+#       what DIVE-1666/DIVE-1677 built.
+#   spend cap (monthly / weekly ceiling, credit balance)  NOT retryable until a
+#       human raises the ceiling or billing resets. Every dispatch into it is a
+#       whole session that cannot produce work: ~20 of 50 analysed sessions
+#       produced nothing, DIVE-3384 was re-attempted across 15+ sessions and
+#       still read `todo`, and the answer to the wall was ~30-40 `continue`s.
+#
+# _hb_wall_class is PURE — no tmux, no registry, no clock — so the discrimination
+# that the whole fix hangs off is unit-testable on transcript text.
+#
+# THREE outcomes, not two. A pane that IS a wall but matches neither
+# discriminator returns `undetermined` and says so. Folding "I could not tell"
+# into either verdict is the class this repo keeps re-learning
+# (tests/lib/grading_tree.sh, DIVE-2274, DIVE-3450's clamp) — and here it would
+# fold specifically toward "retry", which is the defect itself.
+#
+# ORDER IS LOAD-BEARING: the monthly-spend dialog ALSO offers "Stop and wait for
+# limit to reset", so if the reset-time arm were tested first every hard cap
+# would read as retryable. The HEADER is the discriminator, not the action line.
+_hb_wall_class() {
+  local pane="$1"
+  _hb_pane_is_usage_limit "$pane" || { printf 'none'; return 1; }
+  if grep -qiE 'hit your (monthly|weekly|daily)[ -]?spend limit|spend limit (reached|exceeded)|credit balance is too low|insufficient_quota|purchase more credits' <<<"$pane"; then
+    printf 'spend-cap'; return 0
+  fi
+  if grep -qiE '(5[ -]?hour|five[ -]?hour|usage|weekly|session) limit' <<<"$pane" \
+     && grep -qiE 'resets? (at|in) |limit will reset|try again (at|in|after)|wait for .*limit to reset' <<<"$pane"; then
+    printf 'rate-limit'; return 0
+  fi
+  printf 'undetermined'; return 0
+}
+
+# DIVE-3465 — how often a HELD seat may be PROBED to see whether the cap lifted.
+# Read this carefully: the interval decides WHEN WE LOOK. It does NOT decide when
+# the hold ends. The hold is released only by an observation — a transacting peer
+# on the same account, or the wall gone from the seat's own screen — never by
+# elapsed time, so a cap that outlasts the interval keeps holding
+# (feedback_a_pause_without_a_wake_row_outlives_its_reason). Env-overridable.
+_HB_SPEND_CAP_PROBE_MIN="${HEARTBEAT_SPEND_CAP_PROBE_MIN:-20}"
+[[ "$_HB_SPEND_CAP_PROBE_MIN" =~ ^[0-9]+$ ]] || _HB_SPEND_CAP_PROBE_MIN=20
+
+# DIVE-3465 — record that this seat is behind a hard spend cap, and echo the
+# running observation count. `at` is the FIRST observation (never overwritten, so
+# the log can say how long the seat has been held); `lastSeenAt` is this one.
+# Deliberately NOT folded into _hb_clear_active_defer's del list: that clear
+# fires on any wake/recovery bookkeeping, and releasing a billing hold as a side
+# effect of a counter reset is a release with no measurement behind it.
+# Must run under with_registry_lock, like _hb_mark_usage_heal.
+_hb_mark_spend_cap() {
+  local name="$1" now="$2" reg n at
+  reg=$(registry_read)
+  n=$(jq -r --arg n "$name" '.agents[$n].heartbeat.spendCap.n // 0' <<<"$reg")
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0; n=$(( n + 1 ))
+  at=$(jq -r --arg n "$name" '.agents[$n].heartbeat.spendCap.at // 0' <<<"$reg")
+  [[ "$at" =~ ^[0-9]+$ ]] && (( at > 0 )) || at="$now"
+  reg=$(jq --arg n "$name" --argjson at "$at" --argjson seen "$now" --argjson c "$n" '
+    .agents[$n].heartbeat.spendCap = {
+      at: $at, lastSeenAt: $seen, n: $c,
+      probedAt: (.agents[$n].heartbeat.spendCap.probedAt // 0)
+    }' <<<"$reg")
+  echo "$reg" | registry_write
+  printf '%s' "$n"
+}
+
+# DIVE-3465 — epoch of the FIRST spend-cap observation for this seat (0 = no
+# hold). This is the dispatch gate: non-zero means no row may be handed to it.
+_hb_spend_cap_at() {
+  local name="$1" reg; reg=$(registry_read)
+  jq -r --arg n "$name" '.agents[$n].heartbeat.spendCap.at // 0' <<<"$reg" 2>/dev/null || echo 0
+}
+
+# DIVE-3465 — epoch of the last release PROBE (0 = never probed).
+_hb_spend_cap_probed() {
+  local name="$1" reg; reg=$(registry_read)
+  jq -r --arg n "$name" '.agents[$n].heartbeat.spendCap.probedAt // 0' <<<"$reg" 2>/dev/null || echo 0
+}
+
+# DIVE-3465 — stamp a release probe. Must run under with_registry_lock.
+_hb_mark_spend_cap_probe() {
+  local name="$1" now="$2" reg; reg=$(registry_read)
+  reg=$(jq --arg n "$name" --argjson at "$now" '
+    if (.agents[$n].heartbeat.spendCap? // null) != null
+    then .agents[$n].heartbeat.spendCap.probedAt = $at else . end' <<<"$reg")
+  echo "$reg" | registry_write
+}
+
+# DIVE-3465 — drop the hold. Only _hb_spend_cap_lifted's verdict may call this.
+# Must run under with_registry_lock.
+_hb_clear_spend_cap() {
+  local name="$1" reg; reg=$(registry_read)
+  reg=$(echo "$reg" | jq --arg n "$name" '
+    if .agents[$n].heartbeat then .agents[$n].heartbeat |= del(.spendCap) else . end')
+  echo "$reg" | registry_write
+}
+
+# DIVE-3465 — has the cap actually LIFTED? Three-state, and the third state is
+# the point: 0 = lifted (proven by a live observation), 1 = still capped, 2 =
+# COULD-NOT-DETERMINE. An unreadable seat is 2, and 2 holds — "I could not look"
+# is not headroom.
+#
+# Two independent LIVE proofs, in cost order:
+#   (a) a sibling on the same authProfile is transacting RIGHT NOW. A spend cap
+#       is billed on the ACCOUNT, so a peer taking turns proves the account can
+#       still spend. Free, and it needs no probe.
+#   (b) the wall is gone from this seat's own screen. The dialog is a live
+#       artifact that does not self-clear, so its ABSENCE is a present-tense
+#       reading, unlike the supervisor's `quota-exhausted` pane verdict — which
+#       carries no tense and self-matches the investigator, and which this
+#       function deliberately does not consult (see the row body's TRAP).
+#
+# RESIDUAL, stated rather than left to be discovered: a seat restarted by the
+# probe below that then sits idle shows a clean pane without having asked the
+# API for anything, so (b) can read "lifted" one probe early. The cost of that
+# is ONE dispatched session, after which the wall re-arms the hold — bounded,
+# and the failure this replaces was one dispatched session per tick, forever.
+_hb_spend_cap_lifted() {
+  local name="$1" acct="$2" reg="$3" pane cls=""
+  if _hb_account_has_headroom "$name" "$acct" "$reg"; then return 0; fi
+  pane=$(_hb_pane_capture "$name") || return 2
+  [[ -n "$pane" ]] || return 2
+  cls=$(_hb_wall_class "$pane") || cls="none"
+  case "$cls" in
+    none) return 0 ;;
+    *)    return 1 ;;
+  esac
 }
 
 # DIVE-1666 — does this agent's auth account have PROVEN headroom right now? The
@@ -1985,11 +2275,24 @@ _hb_wake() {
   if [[ -n "$task_text" ]]; then
     recall=$(_hb_recall_cite "$name" "$task_text" 3) || recall=""
     if _hb_is_knowledge_task "$task_text"; then
-      compile_hint=" This task looks knowledge-shaped: before you close it, COMPILE the durable, non-obvious findings to the team wiki per the karpathy method (compile-knowledge skill, or '5dive memory add --store=wiki' + an index line) — compiling is part of done, not a separate chore."
+      compile_hint=" This task looks knowledge-shaped. Note the division of labor since DIVE-3628: an async pass ('5dive memory consolidate', run for you by the heartbeat) already distils your FINISHED transcripts into memory atoms, so you do NOT have to hand-copy facts out of this session to keep them. What it cannot do is JUDGEMENT-shaped knowledge — a wiki page, a decision record, a gap analysis, the CAUSE behind a finding — because that is a claim you are making, not a fact lying in the transcript. So: still COMPILE those to the team wiki per the karpathy method (compile-knowledge skill, or '5dive memory add --store=wiki' + an index line) before you close — compiling is part of done, not a separate chore. The pipeline never publishes to the shared wiki; only you can."
     fi
   fi
   [[ -n "$recall" ]] && nudge="${nudge} Relevant memory to check first (verify before relying; re-search with '5dive memory search'): ${recall}."
   [[ -n "$compile_hint" ]] && nudge="${nudge}${compile_hint}"
+
+  # DIVE-3474 arm 2 — THE QUEUE IS DISCOVERED HERE. Removing the file-time a2a
+  # ping is only safe if the reviewer meets the gate on its next natural wake, so
+  # the wake itself carries the count. Without this line the change trades an
+  # interrupt for a lost decision, which is the one outcome the ticket forbids.
+  # Count-only and appended to a nudge that is already being sent: it costs no
+  # extra wake, and it names the verb rather than the rows, so a seat with a long
+  # queue does not get a wall of asks pasted into an unrelated goal.
+  local _gq=0
+  _gq=$(db "SELECT COUNT(*) FROM tasks WHERE $(_task_agent_gate_pred "$name");" 2>/dev/null) || _gq=0
+  if [[ "${_gq:-0}" =~ ^[0-9]+$ ]] && (( _gq > 0 )); then
+    nudge="${nudge} Separately: ${_gq} gate(s) are ROUTED TO YOU and waiting — they were filed WITHOUT interrupting you (DIVE-3474). Read them with '5dive task queue' and answer each with '5dive task answer <ident> --value=\"<choice>\"' before you finish this turn; the filer's recommendation is shown but is NOT the answer (measured: 54 of 121 answered gates returned it, so the majority did not)."
+  fi
 
   _hb_send_line "$name" "$nudge" || { _hb_log "[$name] nudge send failed"; return 1; }
   return 0
@@ -2283,8 +2586,87 @@ _hb_gate_ttl_sweep() {
 # dropping the gate. T2 uses the filing agent's paired-human channel; T1 routes
 # through the existing org-lead resolver. One message/keyboard is built per
 # resolved recipient, regardless of how many gates are due.
+# DIVE-3474 arm 2 — THE GRACE. Arm 2 stops the FILE-TIME ping, and without this
+# conjunct the interrupt simply moves fifteen minutes downstream: this sweep would
+# fire the first re-nag over the agent rail before the reviewer has had a natural
+# wake to find the gate in its queue. So a routed, NON-URGENT gate gets a grace
+# window in which only the natural wake may deliver it. `--urgent` (gate_urgent=1)
+# skips the grace entirely and re-nags on the old 15-minute clock, and every
+# escalation rung past the grace is UNCHANGED — including the fall-through to the
+# paired human, which is what keeps a queued gate from becoming a lost one.
+# Deliberately keyed on `routed_reviewer`: an unrouted gate is the HUMAN's, its
+# holder has no wake this queue is visible at, and nothing here may quiet it.
+_HB_GATE_RENAG_GRACE_HOURS="${FIVEDIVE_GATE_RENAG_ROUTED_GRACE_HOURS:-2}"
+# DIVE-3674 — THE GRACE IS CONDITIONED ON THE WAKE IT DEFERS TO. Everything above
+# is right about a BUSY reviewer and says nothing about an idle one: the queue
+# count that carries a routed gate rides on `_hb_wake`, and `_hb_wake` is only
+# reached for a seat that has a row to be woken AGAINST (:4600, `no todo — stay
+# idle`). A reviewer with nothing runnable therefore has no next natural wake, the
+# premise fails, and the grace stops being a deferral and becomes two hours of
+# plain silence — longest in wall-clock terms exactly when the whole fleet is
+# idle, which is the case where no other seat could have taken the gate either.
+# Measured instance (DIVE-3670/3667): a gate routed to dev2 at ~00:30Z sat
+# unanswered across 19 consecutive `[dev2] no todo — stay idle` ticks. dev2 was
+# CORRECTLY idle by every liveness signal; nothing was broken, the bet simply had
+# no wake to pay out on.
+#
+# So the escape is NARROW BY MEASUREMENT, not by taste. Of 294 routed tier-1
+# non-urgent gates in the 30 days to 2026-08-22, 279 were answered INSIDE the 2h
+# window and 252 of those within FIFTEEN MINUTES: on a fleet with work, the
+# natural wake arrives promptly and the grace costs nothing. Shortening it
+# generally would reinstate the interrupt DIVE-3474 removed for the 95% case to
+# fix the 5%. This conjunct fires ONLY where the wake provably is not coming.
+# (The counting query is in DIVE-3674's body; the 30d window slides, so re-deriving
+# it later moves these by ones, not by orders. `gate_delivery_log` — the source the
+# row asked for — does not exist; `tasks` + `gate_history` are what carry it.)
+#
+# And the grace was not what delivered the measured instance either. `gate_history`
+# for DIVE-3667: the gate filed 00:23:12 sat 104 minutes and was WITHDRAWN unanswered
+# at 02:07:53; the re-file at 02:07:55 was answered at 02:08:15 — and the audit trail
+# names the carrier, an out-of-band `agent _deliver` from the filer at 02:07:59
+# (`path=file-time`, 805 bytes). Not `--urgent` (the row is gate_urgent=0), not this
+# sweep, and not the seat's next natural wake, which did not arrive until 02:10:06.
+# A person noticing was the mechanism. That is the thing this conjunct replaces.
+#
+#   provably: the reviewer is a known agent (`agents_org`) with NO runnable todo
+#             and NO in_progress row. The todo half mirrors `_hb_pick_tasks`
+#             exactly — same `kind='standard'`, same open-blocker NOT EXISTS — so
+#             "runnable" here means what the picker means by it and cannot drift
+#             from it silently. A todo behind an OPEN blocker is skipped by the
+#             picker, so it is not a wake.
+#             The in_progress carve-out is a NO-CLOBBER rule, not a claim that a
+#             mid-turn seat will meet the gate: it may finish its turn with an
+#             empty queue and go straight to `no todo — stay idle`. The residual
+#             is BOUNDED and it is stated rather than hidden — the conjunct is
+#             re-evaluated every sweep, so the tick after that row leaves
+#             in_progress the seat reads as wakeless and the gate goes out. What
+#             the carve-out buys is that we never type into a live turn; what it
+#             costs is one turn's worth of delay, against the 2h it removes.
+#   tier < 2: the carrier this un-quiets is `_hb_gate_renag_agent_rail`, the
+#             in-band agent rail. A tier-2 gate re-nags a PAIRED HUMAN, whose
+#             attention was never a function of the seat's queue, so the premise
+#             this conjunct repairs was never load-bearing there. Widening the
+#             human lane is a different change and this is not it.
+#
+# The failure direction stays loud: if the rail cannot reach the seat the sweep
+# hands the row straight to the paired human, unchanged.
+_HB_GATE_RENAG_NO_NATURAL_WAKE="CAST(COALESCE(NULLIF(tier,''),'2') AS INTEGER) < 2
+        AND EXISTS (SELECT 1 FROM agents_org o WHERE o.name = tasks.routed_reviewer)
+        AND NOT EXISTS (SELECT 1 FROM tasks w
+                         WHERE w.assignee = tasks.routed_reviewer AND w.kind = 'standard'
+                           AND ( w.status = 'in_progress'
+                                 OR ( w.status = 'todo'
+                                      AND NOT EXISTS (SELECT 1 FROM task_deps dd
+                                                        JOIN tasks b ON b.id = dd.blocked_by
+                                                       WHERE dd.task_id = w.id
+                                                         AND b.status NOT IN ('done','cancelled')) ) ))"
 _HB_GATE_RENAG_WHERE="need_type IS NOT NULL AND need_answered_at IS NULL
   AND status NOT IN ('done','cancelled') AND COALESCE(tier,2) != 0
+  AND ( COALESCE(routed_reviewer,'') = ''
+        OR COALESCE(gate_urgent,0) = 1
+        OR COALESCE(need_asked_at,updated_at,created_at)
+             <= datetime('now','-${_HB_GATE_RENAG_GRACE_HOURS} hours')
+        OR ( ${_HB_GATE_RENAG_NO_NATURAL_WAKE} ) )
   AND (COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-1 hour')
        OR (gate_pinged_at IS NULL
            AND COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-15 minutes')))
@@ -2604,7 +2986,7 @@ _hb_blocked_sweep() {
           --message="▶️ Unblocked: ${dident} — all blockers done, now on your queue." ) >/dev/null 2>&1 || true
     done
     _hb_log "[blocked-sweep] auto-recovered: ${idlist}"
-    ( cmd_send "main" --from="task-engine" \
+    ( cmd_send "ops" --from="task-engine" \
         --message="🔧 Auto-recovered ${#rec[@]} stale-blocked task(s) whose blockers were all done: ${idlist}" ) >/dev/null 2>&1 || true
   fi
 
@@ -2619,7 +3001,7 @@ _hb_blocked_sweep() {
     last=$(db "SELECT value FROM task_prefs WHERE key='blocked_sweep_pinged_at';" 2>/dev/null)
     cutoff=$(date -u -d '24 hours ago' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
     if [[ -z "$last" || ( -n "$cutoff" && "$last" < "$cutoff" ) ]]; then
-      ( cmd_send "main" --from="task-engine" \
+      ( cmd_send "ops" --from="task-engine" \
           --message="⚠️ Blocked with no live reason (no open dependency, no human gate, no park) — likely manually blocked + forgotten. Unblock (5dive task unblock <id>) or cancel if dead: ${orphan}" ) >/dev/null 2>&1 || true
       db "INSERT INTO task_prefs (key,value) VALUES ('blocked_sweep_pinged_at', datetime('now'))
           ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
@@ -2962,7 +3344,7 @@ _hb_stall_sweep() {
     vmins=$(( ($(date -u +%s) - $(date -u -d "$vdelivered" +%s 2>/dev/null || date -u +%s)) / 60 ))
     ( cmd_send "$vfier" --from="task-engine" \
         --message="📥 ${vident} was delivered to you for review ${vmins}m ago and is still unacknowledged — run \`5dive task start ${vident}\` then \`task done\`/\`task reject\` so it doesn't rot in your queue." ) >/dev/null 2>&1 || true
-    ( cmd_send "main" --from="task-engine" \
+    ( cmd_send "ops" --from="task-engine" \
         --message="📥 Delivered-awaiting-verifier: ${vident} handed to '${vfier}' ${vmins}m ago, still unacknowledged — surfaced so it never sits invisible (DIVE-1416 gap#2)." ) >/dev/null 2>&1 || true
     db "UPDATE tasks SET handoff_stale_pinged_at=datetime('now') WHERE id=${vid};"
     _hb_log "[stall-sweep] ${vident} delivered->${vfier} unacked ${vmins}m -> surfaced"
@@ -3034,7 +3416,7 @@ _hb_stall_sweep() {
     rbusy=$(db "SELECT COALESCE(ident,'DIVE-'||id) FROM tasks
                 WHERE kind='standard' AND status='in_progress'
                   AND assignee=$(sqlq "${rasg:-}") ORDER BY id LIMIT 1;" 2>/dev/null || echo "")
-    ( cmd_send "main" --from="task-engine" \
+    ( cmd_send "ops" --from="task-engine" \
         --message="⏳ Recurring beat stalled: ${rident} (from template ${rtmpl}) has sat todo and never-started for ${rhours}h, assignee '${rasg:-unassigned}'${rbusy:+ — who is OCCUPIED on ${rbusy}, so this notice may be undeliverable-in-effect (a goal-fenced assignee cannot take a second row)} — ${rsupp_main}. If it is still unstarted in ${_HB_RECURRING_ESCALATE_HOURS}h the ladder reassigns or cancels it (DIVE-2853)." ) >/dev/null 2>&1 || true
     db "UPDATE tasks SET recurring_stall_pinged_at=datetime('now') WHERE id=${rid};"
     _hb_log "[recurring-stall] ${rident} never-started ${rhours}h (template ${rtmpl}) -> surfaced"
@@ -3135,7 +3517,7 @@ _hb_stall_sweep() {
         ( cmd_send "$easg" --from="task-engine" \
             --message="🔁 ${eident} has been moved OFF you to '${etarget}' — it was never started ${ehours}h after being flagged, and ${esupp}. Nothing for you to do; if you were about to start it, say so to ${etarget} rather than both starting it." ) >/dev/null 2>&1 || true
       fi
-      ( cmd_send "main" --from="task-engine" \
+      ( cmd_send "ops" --from="task-engine" \
           --message="🔁 Recurring-stall ESCALATED: ${eident} (template ${etmpl}) reassigned '${easg:-unassigned}' -> '${etarget}' after ${ehours}h unstarted past its flag — a re-ping to the original assignee cannot clear a goal-fenced one, so the ladder changes hands (DIVE-2853)." ) >/dev/null 2>&1 || true
       ledger_emit "task.recurring_stall_escalated" ident="$eident" task_id="$eid" \
         actor="task-engine" authority="heartbeat" \
@@ -3150,7 +3532,7 @@ _hb_stall_sweep() {
       if [[ -n "$easg" ]]; then
         ( cmd_send "$easg" --from="task-engine" --message="$emsg If you still want this instance, the next materialization is yours to start on time — or reply to say the row should not be assigned to you." ) >/dev/null 2>&1 || true
       fi
-      ( cmd_send "main" --from="task-engine" --message="$emsg No free agent existed at escalation time, so reassignment had nowhere to go (DIVE-2853)." ) >/dev/null 2>&1 || true
+      ( cmd_send "ops" --from="task-engine" --message="$emsg No free agent existed at escalation time, so reassignment had nowhere to go (DIVE-2853)." ) >/dev/null 2>&1 || true
       ledger_emit "task.recurring_stall_escalated" ident="$eident" task_id="$eid" \
         actor="task-engine" authority="heartbeat" \
         detail="auto-cancelled after ${ehours}h never-started, no free agent (template ${etmpl})" || true
@@ -3166,8 +3548,199 @@ _hb_stall_sweep() {
                  AND t.parked_at IS NULL
                  AND t.recurring_stall_pinged_at <= datetime('now','-${_HB_RECURRING_ESCALATE_HOURS} hours');")
 
+  # (a4) DIVE-2207 — gap#2's SECOND predicate: a delivery whose blocking gate has
+  # since been ANSWERED.
+  #
+  # WHY (a) ABOVE CANNOT SEE THIS, which is the whole reason it needs its own
+  # predicate rather than a widened one. (a) carries `handoff_ack_at IS NULL`, and
+  # DIVE-2196 correctly excludes gate-blocked rows from it. But the ack has more
+  # than one writer: any verifier who ran `task start` and THEN hit the blocker has
+  # already stamped it. So the moment the human answers and the wait comes back to
+  # the verifier, (a) is permanently blind to that row — not throttled, structurally
+  # excluded. Measured on the live board 2026-07-28: the clean population (gate
+  # answered at or after handoff_delivered_at) is 20 rows; 17 were graded inside the
+  # hour, 2 took 1-6h, one took over 24h. It bites rarely and silently, which is the
+  # case for a rail and not against one.
+  #
+  # WHY NOT CLEAR/REFRESH handoff_ack_at INSTEAD (shape (a) of DIVE-2206, rejected):
+  # un-stamping erases a record of something that DID happen — the verifier reviewed
+  # and escalated. DIVE-2196 existed because the record lied by omission; clearing
+  # makes it lie in the other direction, and on a row whose ack was earned by a
+  # genuine `task start` it re-arms (a)'s "still unacknowledged" message against a
+  # verifier who demonstrably acknowledged. That false nudge IS the DIVE-2196 defect.
+  #
+  # THE MESSAGE IS DIFFERENT ON PURPOSE. (a) says "still unacknowledged", which is
+  # false here — the verifier acted. Per
+  # community/wiki/on-a-maker-verifier-task-the-ack-is-the-close.md a nudge that
+  # names a verb authors an instruction, so this one may only exist POST-answer:
+  # while the gate is open, "close it" is a disguised policy answer on a question
+  # the human has not decided. After the answer it is safe, and it is the point.
+  #
+  # THROTTLE: its own column. handoff_stale_pinged_at is already burned on 30 rows
+  # fleet-wide including the live specimen this was written for (DIVE-2146) —
+  # reusing it ships the fix dead on arrival for exactly its target population.
+  #
+  # `parked_at IS NULL` is one clause BEYOND the DIVE-2207 spec (olivia's constraint
+  # 2), added deliberately and mirroring the (a2) rail directly above: a parked row
+  # was set aside on purpose and nudging it is noise. Measured when added: 22 parked
+  # rows live fleet-wide, 0 of them inside this window.
+  #
+  # WHERE THE SAFETY COMES FROM, AND IT IS NOT IN THIS PREDICATE (olivia, DIVE-2207
+  # ruling). The clause is only ever a DEFERRAL rather than a permanent exclusion
+  # because `cmd_task_park` MANDATES --wake and refuses without it (E_USAGE,
+  # DIVE-1357: "a park with no revisit date is the block graveyard"), so every
+  # parked row carries its own clock back. That is a structural guarantee, not a
+  # property of today's board — the 22/0 measurement above says this moves no count
+  # TODAY, which is a different and much weaker claim.
+  # SAFE ONLY WHILE THAT MANDATE HOLDS. A new park path that does not require a
+  # wake, or a direct `parked_at` write via sqlite, bypasses it and silently
+  # converts this deferral into a permanent exclusion — and nothing in THIS file
+  # would say so. The bypass is not hypothetical: an unaudited direct UPDATE on the
+  # tasks table is how a title got corrected on 2026-08-04.
+  local grow gid gident gfier ganswered gmins
+  while IFS= read -r grow; do
+    [[ -n "$grow" ]] || continue
+    IFS=$'\x1f' read -r gid gident gfier ganswered <<<"$grow"
+    [[ -n "$gid" && -n "$gfier" ]] || continue
+    gmins=$(( ($(date -u +%s) - $(date -u -d "$ganswered" +%s 2>/dev/null || date -u +%s)) / 60 ))
+    ( cmd_send "$gfier" --from="task-engine" \
+        --message="✅ ${gident}: the human gate that was blocking it was ANSWERED ${gmins}m ago, so grading is genuinely yours again — nothing is waiting on a person. Pick it back up: \`5dive task start ${gident}\` then \`task done\`/\`task reject\` (DIVE-2207)." ) >/dev/null 2>&1 || true
+    ( cmd_send "ops" --from="task-engine" \
+        --message="✅ Answered-gate delivery: ${gident} is back on verifier '${gfier}' — its gate was answered ${gmins}m ago and the row had left gap#2's view, so it is surfaced here rather than sitting invisible (DIVE-2207)." ) >/dev/null 2>&1 || true
+    db "UPDATE tasks SET gate_answered_nudged_at=datetime('now') WHERE id=${gid};"
+    _hb_log "[stall-sweep] ${gident} gate answered ${gmins}m ago, back on ${gfier} -> surfaced"
+  done < <(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id)||x'1f'||verifier||x'1f'||need_answered_at
+               FROM tasks
+               WHERE verifier IS NOT NULL AND maker_agent IS NOT NULL
+                 AND assignee=verifier AND status NOT IN ('done','cancelled')
+                 AND handoff_delivered_at IS NOT NULL
+                 -- NB NO BACKTICKS IN THIS COMMENT. It sits inside a double-quoted
+                 -- bash string, so a backtick pair is COMMAND SUBSTITUTION, not prose
+                 -- quoting: as first written this block ran 'need_answered_at IS NOT
+                 -- NULL' and 'NULL <= datetime(...)' as shell commands and went red on
+                 -- shellcheck SC1036/SC1088, the paren in datetime() being the fatal
+                 -- part. bash -n does NOT catch it (the pairs balance) and neither did
+                 -- the unit arms, which still passed.
+                 -- 'need_answered_at IS NOT NULL' is SUBSUMED by the comparison at
+                 -- the bottom and is kept only to state the intent (post-answer
+                 -- only) where a reader looks first. Proven, not assumed: in SQLite
+                 -- a NULL <= datetime comparison yields NULL, not true, so an open gate is
+                 -- already excluded by the window clause. Deleting this line reds
+                 -- NOTHING — it is the one clause here that no mutation can grade,
+                 -- so do not read arm A8 as evidence that it works. A8 grades the
+                 -- BEHAVIOUR (an open gate is never nudged); the window clause is
+                 -- what guards it.
+                 AND need_type IS NOT NULL AND need_answered_at IS NOT NULL
+                 AND gate_answered_nudged_at IS NULL
+                 AND parked_at IS NULL
+                 AND need_answered_at <= datetime('now','-${_HB_VERIFY_STALE_MIN} minutes');")
+
+  # (a6) DIVE-3483 — A ROW STRANDED ON A **BUSY** SEAT.
+  #
+  # The gap this closes, measured on the live board 2026-08-16: idle-stranded was
+  # detected 4187 times in 7 days across 11 agents and acted on ZERO times, while
+  # (b) below — the only arm that actually sends — has fired ONCE in the board's
+  # history (task_prefs.stall_alerted_at = 2026-08-12). Detection without a
+  # consumer on one side, an alarm that cannot fire on the other.
+  #
+  # WHY NEITHER EXISTING RAIL SEES IT. Both take IDLENESS as a precondition, and
+  # the real shape is a LIVE seat holding a row it never chooses:
+  #   * cmd_supervisor.sh's `stalled` needs THAT SEAT to have no active work, so a
+  #     seat working its own charter classifies healthy and its stranded row is
+  #     invisible; and it is observe-only by design ("recorded, NEVER acted on").
+  #   * (b) needs the WHOLE FLEET idle (in_prog==0 AND running_loops==0). With 132
+  #     open rows that is essentially never true, so a row that is not moving stays
+  #     silent because OTHER agents are busy — which says nothing about this row.
+  # Both live instances were LANE problems, not priority problems: DIVE-3339 (the
+  # only defect between lodar and a two-way buzz conversation) sat 4 days
+  # never-started on a lane at its WIP cap, and DIVE-3330 (a close path that walks
+  # past the merge gate) sat 3 days dropped on a seat that was demonstrably alive.
+  # lodar found both by reading the board; no rail did.
+  #
+  # DELIBERATELY NOT A RECOVERY ACTION. This surfaces and names the lane; it never
+  # reassigns. Hands-changing is the (a3) ladder's job and it is scoped to recurring
+  # instances on purpose — auto-moving arbitrary work is a P2 action and this rail,
+  # like the supervisor, stays observe-and-report.
+  #
+  # THROTTLE IS THE WHOLE DESIGN. Naive surfacing here emits those 4187 pings, gets
+  # muted, and recreates the silent-monitoring defect DIVE-3460 exists to remove. So
+  # it is one ping per ROW (stranded_pinged_at, the shipped_flag_at pattern), never
+  # one per sweep. A row is announced once and then never again.
+  local srow sid sident sasg ssince sstarted stmpl sdays sbusy sload sphase slane
+  while IFS= read -r srow; do
+    [[ -n "$srow" ]] || continue
+    IFS=$'\x1f' read -r sid sident sasg ssince sstarted <<<"$srow"
+    [[ -n "$sid" && -n "$sasg" ]] || continue
+    sdays=$(( ($(date -u +%s) - $(date -u -d "$ssince" +%s 2>/dev/null || date -u +%s)) / 86400 ))
+    # DIVE-3483 deliberately selects a row STARTED ONCE AND DROPPED as well as one
+    # never touched (arm E9), and dates it from the DROP — so a single fixed
+    # "without being started" is FALSE for half the population it announces.
+    # Measured 2026-08-19 over every firing in the board's history: 4 of the 6
+    # post-backfill pings were on rows that had already been started, one of them 5
+    # days before its own "never started" sentence. This is DIVE-2207's defect one
+    # field over — a sentence broader than its predicate is read wrong by everyone
+    # who has not read the query — and it fails expensively, because "untouched" is
+    # the one claim that makes a reader reach for cancel.
+    if [[ -n "$sstarted" ]]; then
+      sphase="was started ${sstarted%% *} and has not moved since"
+    else
+      sphase="has sat todo for ${sdays} day(s) without ever being started"
+    fi
+    # NAME THE LANE, so the reader can act in one step instead of re-investigating.
+    # What the seat IS doing is the evidence that it is alive and simply not choosing
+    # this row — the distinction the two blind rails above cannot draw.
+    sbusy=$(db "SELECT COALESCE(ident,'DIVE-'||id) FROM tasks
+                WHERE kind='standard' AND status='in_progress'
+                  AND assignee=$(sqlq "$sasg") ORDER BY id LIMIT 1;" 2>/dev/null || echo "")
+    # id<>sid, and 0 must render as ABSENT not as "0". The stranded row is ITSELF
+    # todo, so an unfiltered COUNT() returns 1 on a seat holding nothing else and
+    # the sentence then calls it "1 OTHER todo row" — the alarm citing the row as
+    # evidence of its own lane congestion. Measured on DIVE-3375 (olivia,
+    # 2026-08-19 00:00:08Z): every other row she held was blocked, this count was
+    # the stranded row itself, and it was the ONLY support offered for the verdict
+    # below. Separately, "$sload" is a STRING, so the old ${sload:+...} expanded on
+    # "0" too and could print "holds 0 other todo row(s)" as lane evidence.
+    sload=$(db "SELECT COUNT(*) FROM tasks
+                WHERE kind='standard' AND status='todo'
+                  AND id<>${sid}
+                  AND assignee=$(sqlq "$sasg");" 2>/dev/null || echo "")
+    [[ "$sload" =~ ^[0-9]+$ ]] && (( sload > 0 )) || sload=""
+    # WITHHOLD THE VERDICT WHEN NEITHER SIGNAL IS PRESENT. sbusy and sload are the
+    # only measurements behind "LANE problem, not a priority problem"; with both
+    # empty the clause is a guess, and an alarm that names a cause it did not
+    # measure spends its reader's trust on exactly the firings where it guessed
+    # wrong. It still reports the symptom, which is the part it does measure.
+    if [[ -n "$sbusy" || -n "$sload" ]]; then
+      slane="so this is a LANE problem, not a priority problem, and re-pinging the same seat will not clear it"
+    else
+      slane="that seat holds nothing else and is not visibly busy, so READ THE ROW before treating this as a lane problem"
+    fi
+    ( cmd_send "ops" --from="task-engine" \
+        --message="🧊 Stranded ${sdays}d: ${sident} ${sphase} on '${sasg}'${sbusy:+, while that seat is ACTIVE on ${sbusy}}${sload:+ and holds ${sload} other todo row(s)} — ${slane} (reassign; cancel it if it is dead; or, if it is waiting on a date or an event, give that wait its verb — \`5dive task park --wake=\` — because a wait written only in the body leaves the row in the rotation and lands here). Surfaced once per row and never again (DIVE-3483)." ) >/dev/null 2>&1 || true
+    db "UPDATE tasks SET stranded_pinged_at=datetime('now') WHERE id=${sid};"
+    _hb_log "[stranded] ${sident} todo ${sdays}d on ${sasg}${sbusy:+ (active on ${sbusy})} -> surfaced"
+  done < <(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id)||x'1f'||COALESCE(assignee,'')||x'1f'||COALESCE(first_started_at,created_at)||x'1f'||COALESCE(first_started_at,'')
+               FROM tasks
+               WHERE kind='standard' AND status='todo' AND assignee IS NOT NULL
+                 AND stranded_pinged_at IS NULL
+                 -- a recurring instance is (a2)'s row, not this one — it has its own
+                 -- suppression story (skip-if-open eats the beat) and its own ladder.
+                 AND from_template_id IS NULL
+                 -- a delivery awaiting its verifier is gap#2's row above. Same
+                 -- reason (a2) is excluded: two rails announcing one row is how a
+                 -- monitor earns its mute.
+                 AND NOT (maker_agent IS NOT NULL AND verifier IS NOT NULL
+                          AND assignee=verifier AND handoff_ack_at IS NULL)
+                 -- waiting on a HUMAN is not stranded; the remedy is not the seat's.
+                 AND NOT (need_type IS NOT NULL AND need_answered_at IS NULL)
+                 AND parked_at IS NULL
+                 -- measured from the DROP for a row started once and abandoned, from
+                 -- creation otherwise. Deliberately not updated_at: any row touch
+                 -- bumps that, so it cannot answer 'how long has this not moved'.
+                 AND COALESCE(first_started_at,created_at) <= datetime('now','-${_HB_STRANDED_HOURS} hours');")
+
   # (b) GAP#3 core — fleet-idle-while-actionable-work-is-open, persisting.
-  local in_prog running_loops stranded_todo open_gates total_stranded
+  local in_prog running_loops stranded_todo open_gates parked_gates total_stranded
   in_prog=$(db "SELECT COUNT(*) FROM tasks WHERE status='in_progress' AND kind='standard';" 2>/dev/null || echo 0)
   running_loops=$(db "SELECT COUNT(*) FROM loop_runs WHERE status='running';" 2>/dev/null || echo 0)
   [[ "$in_prog" =~ ^[0-9]+$ ]] || in_prog=0
@@ -3180,6 +3753,24 @@ _hb_stall_sweep() {
     # gap#2 above already surfaces it on its own clock. Counting it here inflated the
     # stranded number with work that was moving (three such rows at the 2026-07-26
     # alert). Same predicate as the gap#2 query, so the two cannot disagree.
+    # DIVE-2207 — THE LABELS BELOW ARE LOAD-BEARING; both were renamed after a
+    # reader acted on the wrong one. A count whose NAME is broader than its
+    # PREDICATE cannot be read correctly by anyone who has not read the query, and
+    # it fails in the expensive direction: it under-reports, so it reads as "nothing
+    # is pending" exactly when something is. Two instances were live in one message:
+    #   * open_gates rendered as "open gate(s)" — a SUPERSET label (open ⊃
+    #     fleet-actionable), so it over-promised. main read "0 open gate(s)" against
+    #     12 genuinely open gates and reported the query as broken; the query was
+    #     right. Now "fleet-actionable gate(s)".
+    #   * stranded_todo rendered as "unclaimed todo" — worse, a DISJOINT label. The
+    #     predicate REQUIRES assignee IS NOT NULL, and todo/standard rows with no
+    #     assignee measured ZERO on the live board, so the word pointed at the empty
+    #     set and always would: no reader chasing genuinely unowned work could ever
+    #     find it here. Now "assigned-but-unstarted". (It also excludes 21 recurring
+    #     rows by kind and 2 awaiting-grade rows — both deliberate, DIVE-2693 and
+    #     DIVE-2122 own those shapes.)
+    # The rule, if you add an aggregate here: name it after its predicate, not after
+    # the concept the predicate approximates.
     stranded_todo=$(db "SELECT COUNT(*) FROM tasks
                         WHERE status='todo' AND kind='standard'
                           AND assignee IS NOT NULL AND assignee != ''
@@ -3200,8 +3791,20 @@ _hb_stall_sweep() {
                        AND status NOT IN ('done','cancelled')
                        AND (COALESCE(tier,2) <= 1
                             OR (need_asked_at IS NULL AND gate_pinged_at IS NULL));" 2>/dev/null || echo 0)
+    # DIVE-2207: the PARKED count — context, never alarm input. Deliberately NOT
+    # folded into total_stranded below: these are the rows open_gates excludes on
+    # purpose, and adding them back is the alert-fatigue regression the comment
+    # above exists to prevent. It is rendered so a reader can tell "the fleet has
+    # stopped" from "the fleet is waiting on a human", which is the distinction the
+    # alert could not previously express in either direction.
+    parked_gates=$(db "SELECT COUNT(*) FROM tasks
+                       WHERE need_type IS NOT NULL AND need_answered_at IS NULL
+                         AND status NOT IN ('done','cancelled')
+                         AND COALESCE(tier,2) >= 2
+                         AND (need_asked_at IS NOT NULL OR gate_pinged_at IS NOT NULL);" 2>/dev/null || echo 0)
     [[ "$stranded_todo" =~ ^[0-9]+$ ]] || stranded_todo=0
     [[ "$open_gates"    =~ ^[0-9]+$ ]] || open_gates=0
+    [[ "$parked_gates"  =~ ^[0-9]+$ ]] || parked_gates=0
     total_stranded=$(( stranded_todo + open_gates ))
   fi
 
@@ -3263,8 +3866,8 @@ _hb_stall_sweep() {
             _hdr="❓ possible fleet-stall (UNPROVEN)"
             _tail="The session probe could not measure every agent, so this is a QUESTION, not a finding — is the fleet actually stalled? Check \`5dive task ls\` / \`5dive task inbox\`"
           fi
-          ( cmd_send "main" --from="task-engine" \
-              --message="${_hdr}: ${total_stranded} stranded actionable item(s) (${stranded_todo} unclaimed todo, ${open_gates} open gate(s)) idle $((since_secs / 60))m+ with 0 in_progress and 0 running loops — and ${_act_detail}. ${_tail} (DIVE-1416 gap#3, session probe DIVE-2122, claim/probe honesty DIVE-2244)." ) >/dev/null 2>&1 || true
+          ( cmd_send "ops" --from="task-engine" \
+              --message="${_hdr}: ${total_stranded} stranded actionable item(s) (${stranded_todo} assigned-but-unstarted, ${open_gates} fleet-actionable gate(s)) idle $((since_secs / 60))m+ with 0 in_progress and 0 running loops, ${parked_gates} parked on the human (context, not counted) — and ${_act_detail}. ${_tail} (DIVE-1416 gap#3, session probe DIVE-2122, claim/probe honesty DIVE-2244, labels DIVE-2207)." ) >/dev/null 2>&1 || true
           db "INSERT INTO task_prefs (key,value) VALUES ('stall_alerted_at', datetime('now'))
               ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
           _hb_log "[stall-sweep] fleet-idle $((since_secs / 60))m with ${total_stranded} stranded item(s), ${_act_detail} -> sent '${_hdr}' to main"
@@ -3302,7 +3905,7 @@ _hb_stall_sweep() {
       last_alert=$(db "SELECT value FROM task_prefs WHERE key='pinger_canary_alerted_at';" 2>/dev/null)
       cutoff=$(date -u -d '6 hours ago' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
       if [[ -z "$last_alert" || ( -n "$cutoff" && "$last_alert" < "$cutoff" ) ]]; then
-        ( cmd_send "main" --from="task-engine" \
+        ( cmd_send "ops" --from="task-engine" \
             --message="🚨 pinger-liveness canary tripped: ${eligible} human gate(s) are past their reminder window (72h+ unanswered, unpinged 7d+) but gate_pinged_at hasn't advanced fleet-wide in over an hour — the gate-ping batch looks dead (DIVE-1434 regression class). Check /var/log/5dive-heartbeat.log for batch errors." ) >/dev/null 2>&1 || true
         db "INSERT INTO task_prefs (key,value) VALUES ('pinger_canary_alerted_at', datetime('now'))
             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
@@ -3393,231 +3996,65 @@ _hb_loop_ceiling_sweep() {
   return 0
 }
 
-# ── DIVE-2794: the per-TASK token budget, made HARD ───────────────────────────
+# ── DIVE-3343: the per-TASK token budget is NOT enforced, and cannot be ───────
 #
-# WHY A THIRD GUARD, when two already exist. The other two cannot see the burn
-# lodar keeps raising:
-#   - the per-AGENT cost budget (guard 1) is rolling-24h across everything a
-#     seat does, and its hard stop is opt-in because killing a whole agent over
-#     one row is disproportionate;
-#   - the per-LOOP ceiling (guard 2) is already hard (DIVE-972 + OSS-24) but
-#     only sees work that IS a loop.
-# The measured worst rows were neither. DIVE-2814 was 27% of one fleet day and
-# had no loop; DIVE-3045 burned 19.1M in 24h on a LOW-priority row blocked on a
-# credential nobody was provisioning. A per-loop ceiling would have capped
-# neither. `task_budget` is the field that would have — and it was stored,
-# validated and DISPLAYED but never read by anything. This sweep reads it.
+# `_hb_task_budget_sweep` lived here from DIVE-2794 to DIVE-3343 and is gone.
+# Its enforcement is removed, not relocated, not softened. This block is the
+# decision record, because the field it read (`task_budget`) is still stored,
+# validated and displayed, and the next reader WILL be tempted to wire a
+# consequence back to it.
 #
-# WHY A NUMBER AND NOT BETTER JUDGEMENT. DIVE-2814 was reasoning toward a
-# customer box we are forbidden to SSH into, so it had no inspectable object and
-# therefore no natural stopping condition. It was unbounded BY CONSTRUCTION, not
-# by carelessness, and no amount of care caps an open-ended loop.
+# WHY IT IS GONE, and it is not "the number was badly chosen". The number could
+# not be MEASURED. `_spend_scan_task_ids` keys its window by ASSIGNEE and sums
+# every transcript under that agent's home inside [started_at, done_at or now].
+# Nothing in the scan filters by task, because THERE IS NO PER-TASK TOKEN SIGNAL
+# IN A TRANSCRIPT TO FILTER ON. So the charge was "everything this agent spent
+# on anything while the row happened to be open":
 #
-# WHY IT PARKS AND DOES NOT KILL. Park = blocked + parked_at + park_reason, the
-# same shape as `task park`, and the heartbeat work-picker (_hb_pick_tasks) only
-# dispatches status='todo' — so a parked row is STRUCTURALLY excluded from the
-# next round and the spend stops, while the work itself is intact and one
-# `task unpark` away. Same proportionality call as OSS-24: halt the ROW, never
-# the agent, which would take down that seat's unrelated work.
+#   * it grew with the row's WALL-CLOCK AGE and was independent of any work done
+#     on it — an idle row parked for existing;
+#   * the sweep was called once per task id, so two rows open on one agent were
+#     EACH billed that agent's full spend. The double-billing was structural.
 #
-# WHY THE GATE IS TIER-1 AND NOT TIER-0. Decided by main 2026-08-10 after being
-# argued both ways, and the losing option is written down because it is the one
-# a future reader will want to re-pick. A tier-0 gate APPLIES its own
-# recommendation immediately: the row would write a note explaining why it is
-# continuing, and then continue. But a row with no natural stopping condition
-# will always self-grant — that is the definition of the failure being capped —
-# so tier-0 turns the cap into a speed bump with a receipt, which is the fourth
-# detection-shaped control on a board whose whole complaint is that every burn
-# control we ship is detection. Tier-1 is lead-clearable, so it is still never a
-# human tap in lodar's DM. The tier is a PREF (`task_budget_gate_tier`), so
-# dropping to tier-0 is a settings change and not a code change.
+# DIVE-3341 removed the built-in 5M default, which removed the POPULATION the
+# bad measurement was applied to (an unbudgeted row is never evaluated). It did
+# not fix the arithmetic, and a row with an EXPLICIT budget was still graded by
+# it. This row finishes that: no row is graded by it, because the grade was
+# never about the row.
 #
-# THE ASK CARRIES THE FACTS THAT DECIDE IT. A gate reading "DIVE-XXXX hit 5M,
-# continue?" is unanswerable and becomes a rubber stamp inside a day; one
-# reading "5M on a LOW row, running 19h" answers itself. So priority, age and
-# the real spend ride in the ask.
+# WHAT WAS REJECTED, written down because it is the attractive wrong answer:
+# splitting an agent's spend across its open rows. That INVENTS attribution
+# rather than measuring it, and an invented number with a park wired to it is
+# the same failure wearing a better disguise. Renaming the guard to what it
+# actually measured (per-agent spend since the row opened) was also rejected:
+# the honest name does not make the consequence proportionate — that figure
+# still cannot justify halting a row's live work.
 #
-# THE INCIDENT CARVE-OUT, stated explicitly because discovering it at 3am on a
-# box that is down is the failure that gets this whole thing reverted:
-# **there is no implicit exemption, and that is deliberate.** `--customer` was
-# the obvious candidate and CANNOT be used: it is an add-time classifier bypass
-# that is never persisted (no column), so nothing at sweep time can read it.
-# Priority was rejected too — making `urgent` exempt just moves every runaway
-# row to urgent. The escape is explicit and per-row: `--task-budget=none`,
-# settable mid-incident on an existing row with `task set-budget <id> none`,
-# which is the part that makes it usable at 3am rather than only at filing time.
-# The fleet-wide kill switch is `task_budget_enforce=off`.
+# WHAT IS LOST, stated plainly rather than left for a future incident to find:
+# the two rows that motivated DIVE-2794 (DIVE-2814, 27% of one fleet day;
+# DIVE-3045, 19.1M in 24h on a LOW row blocked on a credential) are once again
+# seen by NO hard control. The per-AGENT cost guard (rolling 24h, whole seat)
+# and the per-LOOP ceiling (loop-scoped) both still hold and both still measure
+# something real, but neither is row-scoped. Restoring a row-scoped control
+# requires emitting a real per-task token signal FIRST and reinstating a budget
+# on top of it — a project on its own merits, not a bugfix.
 #
-# THE ASK IS ALSO READ BY A KEYWORD CLASSIFIER, AND THAT DECIDES ITS WORDING.
-# Found by arm one firing correctly: the FIRST live trip (DIVE-2057, 2026-08-10,
-# ~40 min after the tag) parked and gated exactly as designed, and then landed in
-# the paired human's DM at tier 2. The tier defaulted to 1 correctly; the T2
-# CATEGORY FLOOR overrode it, because the ask said "tokens" and `token` is on
-# `_GATE_T2_FLOOR_RX` — it almost always means an API credential, and here it is a
-# unit of measure. The classifier cannot tell those apart, so EVERY budget trip
-# was being classified as a secrets gate and routed to a person. That is precisely
-# the outcome this arm was designed against: a budget guard that pages a human on
-# every trip converts a burn problem into a gate-spam problem and is switched off
-# inside a week.
+# WHAT STAYS, and why it is not dead weight: `--task-budget=`, `task set-budget`
+# and `task_budget_default` still accept and store a value, and both surfaces
+# now SAY that it is advisory. Removing the flags would break callers' scripts
+# for no safety gain; leaving them silent would let an operator believe they had
+# a guard they do not have.
 #
-# Two things therefore ride on the ask's WORDING, and both are load-bearing:
+# `_spend_scan_task_ids` (src/cmd_loop.sh) is NOT removed — the per-LOOP ceiling
+# still uses it, and there the claim is different: a loop's child tasks are the
+# work that loop dispatched, inside that loop's own window. That is a weaker
+# claim than per-task attribution, not the same one.
 #
-#   1. THE UNIT. `_hb_tok_scale` emits "21.0M" / "60k" — identical information to
-#      a human, and nothing at all to the credential classifier. Do NOT "improve"
-#      this back to a bare token count with the word `tokens`; the exact figures
-#      are preserved in `park_reason`, which no classifier reads.
-#   2. THE TITLE IS NOT QUOTED IN. DIVE-2224 answer A made the floor's subject the
-#      ASK, precisely so a ticket's DESCRIPTION could not be read as a REQUEST.
-#      Quoting `"${title}"` into the ask silently undid that here: a routine budget
-#      trip on a row titled "delete the stale rows" floored on `delete`. Measured —
-#      with the unit fixed but the title still quoted, the floor still fires.
-#
-# NOT fixed by widening `_GATE_T2_FLOOR_RX`: `token` belongs on that list for every
-# other gate, and weakening a safety control to unblock the thing it flags is the
-# DIVE-3175 anti-pattern. Reworded at source instead, so the gate is never
-# mis-filed rather than corrected afterwards (`--discusses`, DIVE-2089, is the
-# sanctioned appeal but only fires once the floor already has — file at 2, appeal
-# down; never reaching the human at all is better).
-#
-# A COMMENT IS NOT THE GUARD. tests/task_budget_enforce_unit.sh runs the real
-# `_gate_tier2_floor_hit` over the ask this sweep actually emits, with a
-# floor-word row title as the non-vacuous arm, so restoring either mistake goes
-# red instead of silently restoring the page-the-human behaviour.
-#
-# THERE IS NO BUILT-IN DEFAULT BUDGET, AND THAT IS THE WHOLE OF DIVE-3341.
-# Decided by lodar 2026-08-12 ("i think 5m cap shouldn't be default flag") after
-# a `claude-luca` audit on customer box 5dive-teal-fox-cx43: an enforced
-# `_TASK_BUDGET_BUILTIN=5000000` parked 9 customer rows and 6 of ours, 2 urgent
-# each side. The arithmetic underneath is worse than a badly-chosen number:
-# `_spend_scan_task_ids` keys its window by ASSIGNEE and sums every transcript
-# under that agent's home inside `[started_at, now]`. **Nothing in the scan
-# filters by task — there is no per-task token signal in a transcript to filter
-# on.** So the charge is what the assignee spent on EVERYTHING while the row sat
-# open: it grows with the row's WALL-CLOCK AGE and is independent of any work
-# done on it, and two rows open on one agent are each billed that agent's full
-# spend. An old row therefore parks for existing.
-#
-# The measurement defect is real and is tracked separately. This constant is a
-# distinct and larger fault, because it applied that number to rows NOBODY OPTED
-# IN: an empty `task_budget` fell through to `eff="$dflt"`, so every row on every
-# box was enforced against a constant no operator ever typed, and `enforce`
-# defaults ON when the pref is unset. **A row with no budget is now not evaluated
-# at all — not scanned, not charged, not parkable.** That is deliberately a
-# stronger statement than "not parked": computing an unattributable number and
-# then declining to act on it still burns the scan and still invites a later
-# reader to wire a consequence to it.
-#
-# What stays, because both are a budget somebody TYPED:
-#   * `--task-budget=<n>` / `task set-budget` — explicit, per row.
-#   * `task_budget_default` in `task_prefs` — explicit, per host.
-# Absent both, the sweep has no opinion about the row. Do NOT restore a fallback
-# constant here; `tests/task_budget_enforce_unit.sh` arm 0 fails on the mere
-# EXISTENCE of `_TASK_BUDGET_BUILTIN`, and its behavioural arm proves the
-# untouched row with a fixture that breaches 5M — so a re-added default goes red
-# rather than silently re-arming every box.
-#
-# SEQUENCING, which decides whether this reaches anyone: customer boxes install
-# the newest TAG, not `main` HEAD, so this is inert until a release cut. Until
-# then the per-host levers are the only mitigation (`task_budget_enforce=off`,
-# or `task set-budget <id> none` per row).
-#
-# Token count -> a short human scale that carries no floor term. Rounds to one
-# decimal at M, to the nearest k below that, and leaves counts under 1000 bare.
-_hb_tok_scale() {
-  local n="${1:-0}"
-  [[ "$n" =~ ^[0-9]+$ ]] || { printf '%s' "$n"; return 0; }
-  if (( n >= 1000000 )); then
-    local t=$(( (n + 50000) / 100000 ))
-    printf '%d.%dM' $(( t / 10 )) $(( t % 10 ))
-  elif (( n >= 1000 )); then
-    printf '%dk' $(( (n + 500) / 1000 ))
-  else
-    printf '%d' "$n"
-  fi
-}
-_hb_task_budget_sweep() {
-  local enforce dflt tier
-  enforce=$(db "SELECT value FROM task_prefs WHERE key='task_budget_enforce';" 2>/dev/null || echo "")
-  [[ "${enforce:-on}" == "off" ]] && return 0
-  dflt=$(db "SELECT value FROM task_prefs WHERE key='task_budget_default';" 2>/dev/null || echo "")
-  # An unset/malformed pref is NO default, not a built-in one (DIVE-3341). A
-  # malformed value folds into the same branch on purpose: it is an operator who
-  # meant to set a cap and mistyped it, and inventing a number for them is how a
-  # cap nobody chose gets enforced again.
-  [[ "$dflt" =~ ^[1-9][0-9]*$ ]] || dflt=""
-  tier=$(db "SELECT value FROM task_prefs WHERE key='task_budget_gate_tier';" 2>/dev/null || echo "")
-  [[ "$tier" =~ ^[0-2]$ ]] || tier=1
-
-  local row tid tident title prio budget started eff spent age
-  while IFS= read -r row; do
-    [[ -n "$row" ]] || continue
-    IFS=$'\x1f' read -r tid tident title prio budget started <<<"$row"
-    [[ "$tid" =~ ^[0-9]+$ ]] || continue
-    # Effective budget. Three non-numeric cases are SKIPS, not zeroes:
-    #   'none'  -> the explicit per-row carve-out above
-    #   '$...'  -> the cost variant, which belongs to the per-agent cost guard;
-    #              silently reading it as tokens would compare dollars to tokens
-    #   ''      -> no budget on the row: the host pref applies IF an operator set
-    #              one, and otherwise this row is not evaluated at all. The
-    #              `continue` is above the scan on purpose — an unasked-for row
-    #              is never charged a number, not charged one and forgiven.
-    case "$budget" in
-      none|NONE) continue ;;
-      \$*)       continue ;;
-      "")        [[ -n "$dflt" ]] || continue; eff="$dflt" ;;
-      *)         [[ "$budget" =~ ^[1-9][0-9]*$ ]] || continue; eff="$budget" ;;
-    esac
-    # DIVE-2304's rule, which this guard inherits by construction rather than by
-    # remembering: a spend that could not be READ is NOT-REACHED, never 0. A
-    # failed read here must never park a row — parking on an unreadable number
-    # is the same fail-open in the opposite direction, and it would halt live
-    # work over a transient python error.
-    spent=$(_spend_scan_task_ids "[${tid}]" 0 2>/dev/null) || {
-      _hb_log "[task-budget] ${tident} spend NOT-REACHED — budget NOT verified this tick (row untouched)"
-      continue
-    }
-    [[ "$spent" =~ ^[0-9]+$ ]] || {
-      _hb_log "[task-budget] ${tident} spend NOT-REACHED (non-numeric '${spent}') — budget NOT verified this tick"
-      continue
-    }
-    (( spent >= eff )) || continue
-
-    age=$(db "SELECT CAST((julianday('now')-julianday($(sqlq "$started")))*24 AS INT);" 2>/dev/null || echo "")
-    local _park_pred="id=${tid} AND status IN ('todo','in_progress') AND parked_at IS NULL"
-    # park_reason must state the metric TRUTHFULLY (DIVE-3341 acceptance 4). The
-    # old wording — "before it could spend more" — asserted the row was spending
-    # this. It was not: the figure is the ASSIGNEE'S whole agent-wide total for
-    # the window, and on an idle row it is the age of the row wearing the costume
-    # of its work. No classifier reads park_reason, so the caveat rides here in
-    # full and the ask carries a shorter form of it.
-    local _reason="reached its token budget (~${spent}/${eff} tok) — parked by the heartbeat. THE FIGURE IS NOT THIS ROW'S OWN: it is everything its assignee used between started_at and now, because no per-task token signal exists to attribute against (DIVE-3341). Treat it as an upper bound, never as this row's cost."
-    db "BEGIN IMMEDIATE;
-        $(_gate_archive_and_clear_sql task-budget "$_park_pred")
-        UPDATE tasks
-          SET status='blocked', parked_at=datetime('now'),
-              park_reason=$(sqlq "$_reason"),
-              need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL, gate_mode=NULL
-        WHERE ${_park_pred};
-        COMMIT;"
-    # Trip rate from day one, so the tier-1-vs-tier-0 call is re-decided on a
-    # number instead of on irritation. If this counter climbs fast the pref is
-    # the answer, but only a measured rate can say so.
-    db "INSERT INTO task_prefs (key,value) VALUES ('task_budget_trips','1')
-        ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INT)+1 AS TEXT), updated_at=datetime('now');" 2>/dev/null || true
-    # The title rides in the operator LOG, which no classifier reads, rather than
-    # in the ask — see the wording note above.
-    _hb_log "[task-budget] ${tident} breached budget (~${spent}/${eff} tok, ${prio}, ~${age:-?}h) — parked + gated: ${title}"
-    # The gate goes on the row AFTER the park, because the park clears the gate
-    # columns and would otherwise wipe the gate it just filed.
-    ( cmd_task_need "$tid" --type=decision --tier="$tier" \
-        --options="park|continue" --recommend="park" \
-        --ask="${tident} is parked: ~$(_hb_tok_scale "$spent") against the $(_hb_tok_scale "$eff") budget someone set for it, on a ${prio}-priority row running ~${age:-?}h. That figure is everything its assignee used in the window, not this row alone, so read it as a ceiling. Continue with a raised budget, or leave it parked?" ) >/dev/null 2>&1 || true
-  done < <(db "SELECT id||x'1f'||COALESCE(ident,'')||x'1f'||COALESCE(REPLACE(title,x'1f',' '),'')||x'1f'||COALESCE(priority,'')||x'1f'||COALESCE(task_budget,'')||x'1f'||COALESCE(started_at,'')
-               FROM tasks
-               WHERE status IN ('todo','in_progress') AND kind='standard'
-                 AND parked_at IS NULL AND started_at IS NOT NULL;" 2>/dev/null)
-  return 0
-}
+# tests/task_budget_enforce_unit.sh is the guard on this decision: it asserts
+# the sweep is absent, that an explicit budget is never even SCANNED, and that
+# two rows on one agent are not double-billed — each with a control that RUNS
+# the removed comparison, so restoring enforcement goes red instead of quietly
+# re-arming every box.
 
 # DIVE-1019: run the per-agent token-budget engine once per tick. Idempotent —
 # alerts/hard-stops are deduped inside cmd_usage_budget_check, which also
@@ -3761,9 +4198,16 @@ _hb_poller_liveness_sweep() {
 # tick instead of never. Single-threaded (the tick is one host-cron process), so
 # no claim-lock is needed; isolated by the caller (|| _hb_log) like every sweep.
 _hb_objective_reconcile() {
+  # DIVE-2512: a RETIRED objective is excluded. Reconcile pulls a late planner diff
+  # and re-drives validate -> gate/materialize, so a straggler cycle on an objective
+  # somebody retired would ORIGINATE TASKS for a loop that has been shut down — the
+  # one place the tombstone has to reach outside cmd_objective.sh, because retiring
+  # cannot un-file an in-flight cycle. Not 'status=active': a PAUSED objective's late
+  # diff still materializes, which is the pre-existing behaviour and is correct
+  # (paused is 'stopped for now', retired is 'decided').
   local rows; rows=$(db "SELECT oc.id||'|'||oc.objective_id||'|'||oc.cycle_no||'|'||COALESCE(oc.planner_task_id,'')||'|'||COALESCE(oc.planner_loop_id,'')||'|'||o.name||'|'||COALESCE(o.planner,'')
                          FROM objective_cycles oc JOIN objectives o ON o.id=oc.objective_id
-                         WHERE oc.outcome='awaiting_planner';" 2>/dev/null)
+                         WHERE oc.outcome='awaiting_planner' AND o.status <> 'retired';" 2>/dev/null)
   [[ -n "$rows" ]] || return 0
   local line
   while IFS='|' read -r row_id obj_id cyc tid lid oname planner; do
@@ -3829,11 +4273,81 @@ _hb_capability_reverify_sweep() {
   return 0
 }
 
+# DIVE-3628 — THE SCHEDULER for `5dive memory consolidate`. A verb nobody runs is
+# not an async pipeline: the acceptance is "a fresh box user's agent loses a
+# session and a later session knows what it learned, with NO manual step", and
+# that is only true if something fires it. This is that something.
+#
+# Why here and not a systemd timer or a crontab line: the tick is the ONE
+# recurring root job every 5dive box already has (`5dive init` wires it; nothing
+# else is installed per-seat), so hanging the pass off it means a customer box
+# gets consolidation with zero extra setup — no new unit, no new install step, no
+# per-seat cron to forget. A timer would be a second thing to install and a
+# second thing to be missing.
+#
+# COST IS THE REAL CONSTRAINT and it is bounded here, not in the verb. Measured
+# 2026-08-20 on this box with the default `claude --print` distiller: $0.244 per
+# session cold-cache, $0.081 warm. So the pass is capped at ONE session per seat
+# per run and one run per seat per _HB_CONSOLIDATE_EVERY_MIN (6h) => <=4 model
+# calls/seat/day, ~$0.32-$0.98/seat/day WORST case, and far less in practice
+# because a seat with no new finished transcript makes NO model call at all (the
+# ledger short-circuits before the distiller). Turn it off with
+# MEMORY_CONSOLIDATE=off; retune with MEMORY_CONSOLIDATE_EVERY_MIN.
+#
+# It runs AS THE SEAT'S OWN USER. That is not tidiness: atoms must land in that
+# agent's own 0600 store and burn that agent's own quota, and running as root
+# would write root-owned files into a user's memory dir and silently break the
+# next `memory add`.
+#
+# Same isolation contract as every other sweep — a failure here must NEVER abort
+# the wake loop.
+_hb_memory_consolidate_sweep() {
+  local now="$1"
+  _HB_CONS_RAN=0; _HB_CONS_SKIPPED=0; _HB_CONS_FAILED=0
+  [[ "${MEMORY_CONSOLIDATE:-on}" == "off" ]] && return 0
+  local every="${MEMORY_CONSOLIDATE_EVERY_MIN:-${_HB_CONSOLIDATE_EVERY_MIN}}"
+  [[ "$every" =~ ^[0-9]+$ ]] && (( every > 0 )) || every="$_HB_CONSOLIDATE_EVERY_MIN"
+  local stampdir="${STATE_DIR:-/var/lib/5dive}/memory-consolidate"
+  mkdir -p "$stampdir" 2>/dev/null || return 0
+  local reg name user stamp last
+  reg=$(registry_read) || return 0
+  for name in $(jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null); do
+    # Resolve the seat's unix user the same way the memory store does.
+    user="agent-$name"
+    id -u "$user" >/dev/null 2>&1 || user="$name"
+    id -u "$user" >/dev/null 2>&1 || continue
+    stamp="$stampdir/${name}.stamp"
+    last=$(cat "$stamp" 2>/dev/null) || last=0
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    if (( now - last < every * 60 )); then
+      _HB_CONS_SKIPPED=$((_HB_CONS_SKIPPED + 1)); continue
+    fi
+    # Stamp BEFORE the run, not after. A distiller call can take ~35s and the
+    # tick fires every 5 minutes: stamping after would let a slow or wedged pass
+    # be re-entered by the next tick and multiply the cost by however many ticks
+    # it outlives. The verb also holds its own flock, but that turns a cost bug
+    # into a lock-contention error rather than preventing it — the cadence has to
+    # be enforced by the clock. A crashed pass just waits one cadence; nothing is
+    # lost, because a session with no ledger row is retried forever by design.
+    printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
+    if timeout "${_HB_CONSOLIDATE_TIMEOUT_S}" sudo -n -u "$user" -H \
+         "${SELF_BIN:-/usr/local/bin/5dive}" memory consolidate --max-sessions=1 \
+         >/dev/null 2>&1; then
+      _HB_CONS_RAN=$((_HB_CONS_RAN + 1))
+    else
+      # Non-fatal and COUNTED, never silent: a fleet-wide auth lapse or a missing
+      # sudo grant has to show up as failures in the log, not as a quiet box.
+      _HB_CONS_FAILED=$((_HB_CONS_FAILED + 1))
+    fi
+  done
+  return 0
+}
+
 cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
   local reg now; reg=$(registry_read); now=$(date +%s)
-  local checked=0 woke=0 reaped=0 reclaimed=0 starved=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0 sk_spread=0 sk_active=0 sk_budget=0 sk_held=0
+  local checked=0 woke=0 reaped=0 reclaimed=0 starved=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0 sk_spread=0 sk_active=0 sk_budget=0 sk_held=0 sk_capped=0
   local today; today=$(date +%F)   # DIVE-1858 wake-budget day key (YYYY-MM-DD)
   # DIVE-138: materialize due recurring templates FIRST so a freshly-cloned todo
   # is eligible for the wake loop below this same tick. Isolated — a failure here
@@ -3854,6 +4368,22 @@ cmd_heartbeat_tick() {
   # here must NEVER abort the wake loop (the heartbeat-never-woke bug class). No-op
   # unless at least one agent is opt-in wake_mode=cold.
   _hb_autosleep_sweep "$now" || _hb_log "[autosleep] pass errored (non-fatal)"
+  # DIVE-3173: fire any restart `self-update` deferred because the agent was
+  # holding an in_progress row. This tick is where the TASK BOUNDARY is observed
+  # — the sweep re-asks the board the question self-update asked and bounces the
+  # moment the answer flips to idle. Runs AFTER the autosleep pass so an agent
+  # that just went to sleep is seen as stopped (nothing to bounce, marker
+  # cleared) instead of being restarted awake. Same isolation contract as every
+  # other sweep: a failure here must NEVER abort the wake loop.
+  _pending_restart_sweep || _hb_log "[pending-restart] pass errored (non-fatal)"
+  # `${...:-0}` on every counter, and it is not defensive noise: ~10 harnesses
+  # drive this tick with only src/cmd_heartbeat.sh sourced, so the counters (which
+  # live with the sweep in src/cmd_selfupdate.sh) are UNSET there — and an unset
+  # read under `set -u` is fatal, which would abort the whole wake loop rather
+  # than skip a log line. Exactly the heartbeat-never-woke bug class this pass is
+  # isolated against, entering through the isolation's own summary.
+  (( ${_PR_FIRED:-0} || ${_PR_DEFERRED:-0} || ${_PR_CLEARED:-0} || ${_PR_FAILED:-0} )) \
+    && _hb_log "[pending-restart] pass done — ${_PR_FIRED:-0} bounced, ${_PR_DEFERRED:-0} still deferred (${_PR_OVERDUE:-0} overdue), ${_PR_CLEARED:-0} cleared, ${_PR_FAILED:-0} failed"
   # DIVE-2102: renew capability rows from the installed sudoers files. Without
   # this the 7d TTL expires every row and the registry converges on permanently
   # empty. Isolated like every other sweep — and note the failure direction is
@@ -3884,10 +4414,16 @@ cmd_heartbeat_tick() {
   # DIVE-972: enforce per-loop token ceilings for async (non --wait) loops. Same
   # isolation contract — a failure here must never abort the wake loop.
   _hb_loop_ceiling_sweep || _hb_log "[loop-ceiling] pass errored (non-fatal)"
-  # DIVE-2794: enforce per-TASK token budgets (default 5M). The loop ceiling
-  # above only sees work that IS a loop; the two worst measured rows were not.
-  # Same isolation contract — a failure here must never abort the wake loop.
-  _hb_task_budget_sweep || _hb_log "[task-budget] pass errored (non-fatal)"
+  # DIVE-3628: async transcript -> memory-atom consolidation, one bounded pass
+  # per seat per cadence. Runs LAST — it is the only sweep that spends model
+  # tokens, so nothing that keeps the fleet moving may ever queue behind it.
+  # Same isolation contract as every other sweep.
+  _hb_memory_consolidate_sweep "$now" || _hb_log "[memory-consolidate] pass errored (non-fatal)"
+  (( ${_HB_CONS_RAN:-0} || ${_HB_CONS_FAILED:-0} )) \
+    && _hb_log "[memory-consolidate] ${_HB_CONS_RAN:-0} seat(s) distilled, ${_HB_CONS_FAILED:-0} failed, ${_HB_CONS_SKIPPED:-0} not due" || true
+  # DIVE-3343: there is NO per-TASK budget sweep here any more, and its absence
+  # is deliberate — see the block above _hb_loop_ceiling_sweep's neighbours in
+  # this file for why the figure it enforced could not be attributed to a row.
   # DIVE-1019: per-agent token budget guardrails — alert the owner at the soft
   # cap and (only if hard-stop is opted in) turn an agent off at the ceiling, and
   # refresh the state cache `watch` reads. Same isolation contract as above.
@@ -3951,6 +4487,58 @@ cmd_heartbeat_tick() {
     if [[ "${inprog:-0}" != "0" ]]; then
       sk_busy=$((sk_busy + 1)); _hb_log "[$name] busy — $inprog in_progress, skip"; continue
     fi
+
+    # --- DIVE-3465 hard-cap dispatch hold --------------------------------------
+    # THE STOP, and it is placed HERE deliberately: above the task pick, so a
+    # held seat never claims a row at all. A row nudged into a capped seat is
+    # claimed, produces nothing, and is reclaimed to `todo` — which is how
+    # DIVE-3384 consumed 15+ sessions while still reading untouched. A row left
+    # `todo` with a reason in the log is strictly better than that.
+    #
+    # The hold is armed further down (the rc==3 classifier) and released ONLY by
+    # a live measurement. Three outcomes, all of them logged — including the one
+    # that says nothing could be measured.
+    local _cap_at=0
+    _cap_at=$(_hb_spend_cap_at "$name" 2>/dev/null || echo 0)
+    [[ "$_cap_at" =~ ^[0-9]+$ ]] || _cap_at=0
+    if (( _cap_at > 0 )); then
+      local _cap_acct _cap_held_m _lift_rc=0 _cap_probed=0
+      _cap_acct=$(jq -r --arg n "$name" '.agents[$n].authProfile // ("@self:" + $n)' <<<"$reg")
+      _cap_held_m=$(( (now - _cap_at) / 60 ))
+      _hb_spend_cap_lifted "$name" "$_cap_acct" "$reg" || _lift_rc=$?
+      case "$_lift_rc" in
+        0)
+          with_registry_lock _hb_clear_spend_cap "$name" >/dev/null 2>&1 || true
+          _hb_log "[$name] spend-cap hold RELEASED after ${_cap_held_m}m — measured, not waited out: account '${_cap_acct}' is transacting or the wall is gone from the seat's screen; dispatching again (DIVE-3465)"
+          ;;
+        2)
+          sk_capped=$((sk_capped + 1))
+          _hb_log "[$name] spend-cap hold KEPT (${_cap_held_m}m) — quota state COULD-NOT-DETERMINE: seat pane unreadable and no transacting peer on '${_cap_acct}'. An unreadable probe is not headroom (DIVE-3465)"
+          continue
+          ;;
+        *)
+          # Still capped. Probe on the interval — the interval says when to LOOK,
+          # the pane read above says when the hold ENDS. The probe restarts the
+          # seat (fresh:true → no context lost) so the stale dialog cannot outlive
+          # the cap that raised it; it dispatches nothing.
+          _cap_probed=$(_hb_spend_cap_probed "$name" 2>/dev/null || echo 0)
+          [[ "$_cap_probed" =~ ^[0-9]+$ ]] || _cap_probed=0
+          if (( now - _cap_probed >= _HB_SPEND_CAP_PROBE_MIN * 60 )); then
+            with_registry_lock _hb_mark_spend_cap_probe "$name" "$now" >/dev/null 2>&1 || true
+            if systemctl restart "5dive-agent@${name}.service" 2>/dev/null; then
+              _hb_log "[$name] spend-cap hold (${_cap_held_m}m) — release PROBE fired (restart, no row dispatched); next tick re-reads the seat's screen (DIVE-3465)"
+            else
+              _hb_log "[$name] spend-cap hold (${_cap_held_m}m) — release probe restart FAILED (systemctl); hold stands, retry next window (DIVE-3465)"
+            fi
+          else
+            _hb_log "[$name] spend-cap hold (${_cap_held_m}m) — account '${_cap_acct}' still refusing; next probe in $(( (_cap_probed + _HB_SPEND_CAP_PROBE_MIN * 60 - now + 59) / 60 ))m, no row dispatched (DIVE-3465)"
+          fi
+          sk_capped=$((sk_capped + 1))
+          continue
+          ;;
+      esac
+    fi
+
     # Wake the agent against ONE concrete todo — the /goal condition needs a
     # concrete DIVE-N to evaluate reliably — but consider the queue IN ORDER
     # until one is actually runnable.
@@ -4029,10 +4617,37 @@ cmd_heartbeat_tick() {
       fi
       # Only measured values reach the ranking. `unknown:unregistered` ranks 0
       # via the catch-all, which is the human/external fall-through above.
+      #
+      # DIVE-3506 — NARROWED from "any rank gap" to "the creator is SANDBOXED".
+      # The old predicate was `_cr < _ar`, which holds standard->admin as well as
+      # sandboxed->admin. Measured 2026-08-16: the fleet is 12 admin + 5 standard
+      # and **zero sandboxed**, so in practice the guard fired on exactly one
+      # shape — a standard-tier VERIFIER filing a follow-up onto an admin-tier
+      # MAKER — which is the maker/verifier loop working, not an escalation. Cost
+      # of that misfire, measured: dev2 held 5 runnable `high` todos every 5
+      # minutes for SIX DAYS (2026-08-10T22:40Z onward, 7865 log lines), reading
+      # active/enabled/quota-ok the whole time, and dev3 the same on 1-2 rows.
+      #
+      # What DIVE-1065 was actually built to stop is privilege-escalation-by-
+      # queue: an agent that is CONFINED enqueueing work onto an unconfined one
+      # so the heartbeat runs it for them. That is the sandboxed tier and only
+      # the sandboxed tier — `standard` is where our verifiers live and they are
+      # not an untrusted population. Narrowing to `sandboxed` keeps the whole
+      # protection against the case the ticket describes and removes the case it
+      # never meant to describe.
+      #
+      # NOTE this is deliberately still a TIER test and not an org-chart test:
+      # `agent_tier` reads the registry's `isolation`, so re-parenting an agent
+      # does not move this line, and it must not — confinement is the property
+      # being reasoned about, not seniority.
+      #
+      # (lodar's call, 2026-08-16: "i think we should strip this rule completely
+      # - it ruins our backlog queue", then "agreed on sandboxed tier logic" when
+      # shown that sandboxed->admin is a real vector with no live instances.)
       local _cr _ar
       _cr=$(_hb_tier_rank "$_ctier"); _ar=$(_hb_tier_rank "$_atier")
-      if (( _cr > 0 && _ar > 0 && _cr < _ar )); then
-        _hb_log "[$name] task ${task_ident} created by lower-tier ${_cby}(${_ctier}) < assignee(${_atier}) — holding, not auto-running; considering the next candidate"
+      if [[ "$_ctier" == "sandboxed" ]] && (( _cr > 0 && _ar > 0 && _cr < _ar )); then
+        _hb_log "[$name] task ${task_ident} created by SANDBOXED ${_cby}(${_ctier}) < assignee(${_atier}) — holding, not auto-running (DIVE-1065/3504); considering the next candidate. Exits: reassign to a sandboxed-or-lower seat (5dive task assign), drive it once by hand (5dive heartbeat wake-task ${name} ${task_id} ${task_ident}), or re-file it from an unconfined seat."
         continue
       fi
     fi
@@ -4052,10 +4667,25 @@ cmd_heartbeat_tick() {
       # if _cand_n hit _HB_PICK_SCAN there may be runnable rows we never reached,
       # which is a different (and much louder) situation than "the queue is held".
       sk_held=$((sk_held + _cand_n))
+      # DIVE-3501: BOTH branches must name an exit, and every verb named here
+      # must EXIST. The scan-cap branch used to advise a `task` subcommand that
+      # is not a verb — it appeared nowhere in the CLI except in that one
+      # sentence, so an operator who followed the guard's own advice got an
+      # unknown-subcommand error. The all-held branch — the one that actually
+      # strands a seat forever — named no remedy at all. Both now name the two
+      # exits that are real: re-route the row so creator >= assignee
+      # (`task assign`), or drive it manually once (`heartbeat wake-task`,
+      # dispatched at :436 and now documented in --help).
+      #
+      # The advice is DUPLICATED rather than hoisted into a variable on purpose:
+      # tests/heartbeat_hold_remedy_and_stranded_seat_unit.sh asserts, against
+      # the verb list `--help` prints AT RUNTIME, that no LOG STRING in this file
+      # names a verb the CLI does not have. A hoisted string would sit on a line
+      # the scan cannot see is a log line, and the guard would go quietly blind.
       if (( _cand_n >= _HB_PICK_SCAN )); then
-        _hb_log "[$name] tier guard held all ${_cand_n} candidate(s) SCANNED — scan cap _HB_PICK_SCAN=${_HB_PICK_SCAN} reached, runnable rows past it were NOT examined; authorize a held task (5dive task authorize) or fix the creator/assignee tiers"
+        _hb_log "[$name] tier guard held all ${_cand_n} candidate(s) SCANNED — scan cap _HB_PICK_SCAN=${_HB_PICK_SCAN} reached, runnable rows past it were NOT examined; exits: 5dive task assign <id> <equal-or-higher-tier agent>, or 5dive heartbeat wake-task ${name} <task_id> to run one now"
       else
-        _hb_log "[$name] tier guard held all ${_cand_n} runnable todo(s) — stay idle"
+        _hb_log "[$name] tier guard held all ${_cand_n} runnable todo(s) — stay idle; this seat has NO runnable work until something changes; exits: 5dive task assign <id> <equal-or-higher-tier agent>, or 5dive heartbeat wake-task ${name} <task_id> to run one now"
       fi
       continue
     fi
@@ -4120,6 +4750,39 @@ cmd_heartbeat_tick() {
       # only surface to the human when NO account headroom is provable (a real
       # capacity/billing call, not a stuck dialog).
       if _hb_usage_limit_frozen "$name"; then
+        # DIVE-3465 — CLASSIFY the wall before choosing a response. Everything
+        # below this point (press-continue, restart-to-test-the-window, the heal
+        # throttle) is a RETRY, and retrying is only correct against the rolling
+        # 5h/7d window. Against a monthly/weekly spend ceiling a restart cannot
+        # help by construction, and each one buys another dispatched session that
+        # produces nothing. So a spend cap arms the dispatch hold and stops here.
+        local _pane="" _wcls="undetermined"
+        _pane=$(_hb_pane_capture "$name") || _pane=""
+        if [[ -n "$_pane" ]]; then _wcls=$(_hb_wall_class "$_pane") || _wcls="none"; fi
+        if [[ "$_wcls" == "spend-cap" ]]; then
+          local _cn; _cn=$(with_registry_lock _hb_mark_spend_cap "$name" "$now")
+          sk_capped=$((sk_capped + 1))
+          _hb_log "[$name] HARD SPEND CAP on account '${acct}' (observation #${_cn:-?}) — NOT retryable: no restart, no press-continue, and no row will be dispatched to this seat until a live reading says the account can spend again (DIVE-3465)"
+          # Surface once per throttle window. This is a capacity/billing fact, so
+          # it goes to the fleet coordinator, not to the paired chat.
+          local sc_key="spend_cap_alert_${name}" sc_last sc_cut
+          sc_last=$(db "SELECT value FROM task_prefs WHERE key='${sc_key}';" 2>/dev/null)
+          sc_cut=$(date -u -d '6 hours ago' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
+          if [[ -z "$sc_last" || ( -n "$sc_cut" && "$sc_last" < "$sc_cut" ) ]]; then
+            ( cmd_send "main" --from="task-engine" \
+                --message="🔴 Spend cap, not a rate limit: agent '${name}' (account '${acct}') is refusing every request with a SPEND-limit wall, which does not reset on its own the way the 5-hour window does. The task engine has STOPPED handing rows to that seat and will re-check by measurement — nothing is queued behind a retry loop. Raising or resetting the ceiling is a billing call for lodar. (DIVE-3465)" ) >/dev/null 2>&1 || true
+            db "INSERT INTO task_prefs (key,value) VALUES ('${sc_key}', datetime('now'))
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');" 2>/dev/null || true
+          fi
+          continue
+        fi
+        if [[ "$_wcls" != "rate-limit" ]]; then
+          # EMIT THE NEGATIVE. The pane is a wall — the matcher above proved that
+          # — but nothing in it discriminates the two states. That is a third
+          # outcome, not a quiet vote for "retryable", so it is logged as such
+          # before the retry path runs on it.
+          _hb_log "[$name] WARN: parked on a wall dialog but its class is COULD-NOT-DETERMINE (read '${_wcls}') — neither a proven spend cap nor a proven rate limit; falling through to the DIVE-1666 retry path and saying so rather than silently assuming headroom (DIVE-3465)"
+        fi
         local heal_last heal_gap headroom=1
         _hb_account_has_headroom "$name" "$acct" "$reg" && headroom=0
         # DIVE-1677: headroom is PROVEN (a healthy peer on the pooled account), so
@@ -4201,8 +4864,43 @@ cmd_heartbeat_tick() {
       defer_fp=$(_hb_pane_fingerprint "$name")
       defer_n=$(with_registry_lock _hb_mark_active_defer "$name" "$defer_fp")
       if [[ "${defer_n:-0}" =~ ^[0-9]+$ ]] && (( defer_n >= _HB_ACTIVE_DEFER_ESCALATE )); then
+        # DIVE-3503 — MAKE THE ESCALATION HONEST. The force-nudge below types a
+        # line into the pane, which a runtime blocked on a child that never exits
+        # cannot consume; the clear then wiped the counter, so the log read
+        # `#1 → #2 → escalation → #1 → #2 → escalation` for eleven hours on dev2
+        # and every episode looked HANDLED. 176 escalations all-time, and the
+        # counter can never reach a number anyone would alarm on.
+        #
+        # So: remember the pane fingerprint we escalated ON. If we escalate again
+        # with that SAME fingerprint, the seat has not completed a turn since —
+        # the typed nudge is PROVEN useless on this seat, in this state, and
+        # repeating it is the thing that hid the stall. Reach for a real lever
+        # (reap the blocking child, by PID, src/lib/reap.sh) and say so loudly.
+        # NOT a higher threshold: the counter was never too low, it was zeroed by
+        # a remedy that did nothing.
+        local prev_esc_fp
+        prev_esc_fp=$(registry_read | jq -r --arg n "$name" '.agents[$n].heartbeat.activeDefer.escFp // ""' 2>/dev/null)
+        if [[ -n "$defer_fp" && "$defer_fp" == "$prev_esc_fp" ]]; then
+          local reaped=0
+          if declare -F _reap_stale_shells >/dev/null 2>&1; then
+            reaped=$(_reap_stale_shells "$name" --reason="active-defer escalation repeated on an unchanged pane" || echo 0)
+          fi
+          _hb_log "[$name] active-defer escalation REPEATED on an unchanged pane — the typed nudge did not land last time, so it will not land now (DIVE-3503). Reaped ${reaped:-0} stale agent shell(s) by PID; escalating."
+          if [[ "${reaped:-0}" =~ ^[0-9]+$ ]] && (( reaped == 0 )); then
+            # Nothing reapable and still not advancing: this is past what the
+            # heartbeat can fix by itself. Surface it rather than resetting.
+            ( cmd_send "main" --from="task-engine" \
+                --message="🟠 Seat '${name}' has been stranded across ${defer_n} deferred heartbeat ticks with an UNCHANGED pane, through a repeat force-nudge, and has no reapable stale shell — the nudge is proven not to land and the seat cannot take ${task_ident}. Needs a look (DIVE-3503/DIVE-1486)." ) >/dev/null 2>&1 || true
+          fi
+        fi
         _hb_log "[$name] active-defer escalation — pane unchanged ${defer_n} ticks (>=${_HB_ACTIVE_DEFER_ESCALATE}) with ${task_ident} todo waiting → idle-stranded, force-nudging (DIVE-1486)"
+        # Clear the COUNTER (the episode's nudge budget) but keep the fingerprint
+        # we escalated on, so the next escalation can tell "same wedged pane" from
+        # "a fresh episode". _hb_mark_active_defer rewrites .fp on every tick and
+        # leaves .escFp alone; _hb_clear_active_defer drops both once the seat
+        # actually wakes, which is the only event that proves the pane moved.
         with_registry_lock _hb_clear_active_defer "$name" >/dev/null 2>&1 || true
+        with_registry_lock _hb_mark_escalation_fp "$name" "$defer_fp" >/dev/null 2>&1 || true
         # deliberately no `continue` — fall through to the wake below.
       else
         sk_active=$((sk_active + 1)); _hb_log "[$name] active (mid-turn/conversation) — defer nudge this tick (active-defer #${defer_n})"; continue
@@ -4269,8 +4967,8 @@ cmd_heartbeat_tick() {
                   | sort_by(.value.heartbeat.lastRunAt // 0)
                   | .[].key' <<<"$reg")
 
-  ok "heartbeat tick: woke ${woke} / slept ${_HB_SLEPT} / reclaimed ${reclaimed} / reaped ${reaped} / starved ${starved} / tier-held ${sk_held} / spread-deferred ${sk_spread} / active-deferred ${sk_active} / budget-skipped ${sk_budget} / checked ${checked}" \
+  ok "heartbeat tick: woke ${woke} / slept ${_HB_SLEPT} / reclaimed ${reclaimed} / reaped ${reaped} / starved ${starved} / tier-held ${sk_held} / spread-deferred ${sk_spread} / active-deferred ${sk_active} / budget-skipped ${sk_budget} / spend-capped ${sk_capped} / checked ${checked}" \
      '{checked:($c|tonumber), woke:($w|tonumber), slept:($sl|tonumber), sleepArmed:($sa|tonumber), reclaimed:($rc|tonumber), reaped:($r|tonumber), starved:($st|tonumber),
-       skipped:{notDue:($nd|tonumber), busy:($b|tonumber), noWork:($nw|tonumber), spread:($sp|tonumber), active:($ac|tonumber), budget:($bu|tonumber), failed:($sf|tonumber), tierHeld:($th|tonumber)}}' \
-     --arg c "$checked" --arg w "$woke" --arg sl "$_HB_SLEPT" --arg sa "$_HB_SLEEP_ARMED" --arg rc "$reclaimed" --arg r "$reaped" --arg st "$starved" --arg nd "$sk_notdue" --arg b "$sk_busy" --arg nw "$sk_nowork" --arg sp "$sk_spread" --arg ac "$sk_active" --arg bu "$sk_budget" --arg sf "$sk_fail" --arg th "$sk_held"
+       skipped:{notDue:($nd|tonumber), busy:($b|tonumber), noWork:($nw|tonumber), spread:($sp|tonumber), active:($ac|tonumber), budget:($bu|tonumber), failed:($sf|tonumber), tierHeld:($th|tonumber), spendCapped:($sc|tonumber)}}' \
+     --arg c "$checked" --arg w "$woke" --arg sl "$_HB_SLEPT" --arg sa "$_HB_SLEEP_ARMED" --arg rc "$reclaimed" --arg r "$reaped" --arg st "$starved" --arg nd "$sk_notdue" --arg b "$sk_busy" --arg nw "$sk_nowork" --arg sp "$sk_spread" --arg ac "$sk_active" --arg bu "$sk_budget" --arg sf "$sk_fail" --arg th "$sk_held" --arg sc "$sk_capped"
 }

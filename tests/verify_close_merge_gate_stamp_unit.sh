@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# DIVE-2938: `task verify` closes a row without ever running the DIVE-1830 merge gate.
+# DIVE-3330: `task verify --cmd=true` must not close a row past the merge gate.
 #
 # The gate lives in _task_status_cmd (done/cancel); cmd_task_verify flips with a raw
 # UPDATE in a different function, so a row can reach status=done with its delivery
@@ -7,13 +7,12 @@
 # receipts: DIVE-2743 (closed on a unit test run in a local worktree; its test file is
 # absent from main) and DIVE-2645 (graded "at worktree tip c2baa6b", PR still open).
 #
-# This harness grades the LEGIBILITY fix, not a gate: a verify-close on a row that
-# carries a binding the merge gate WOULD have checked must stamp the result saying it
-# was not checked, and a row with no binding must NOT be stamped.
+# A passing command proves only what the command checked. When a row carries a
+# delivery binding, verify records the structural grade and holds the row open for
+# the merge owner; `task done` remains the only close path that answers ancestry.
 #
-# The negative arms are the load-bearing ones. A stamp that fires on everything is
-# noise people learn to skip, and a stamp that fires on --no-done or on FAIL would be
-# claiming a close that did not happen.
+# The unbound control must still auto-close, so a mutation that merely disables every
+# verify close cannot make this harness green.
 set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
@@ -67,7 +66,7 @@ PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
-STAMP='merge-gate NOT EVALUATED'
+HOLD='merge-gate hold (DIVE-3330)'
 
 # add <title> [body]  -> echoes the ident
 mk() {
@@ -76,33 +75,49 @@ mk() {
   printf '%s' "$out" | grep -oE 'DIVE-[0-9]+|[A-Z]+-[0-9]+' | head -1
 }
 res_of() { "$CLI" task show "$1" 2>/dev/null | sed -n '/result =/,$p'; }
+field_of() { sqlite3 "$TASKS_DB" "SELECT COALESCE($2,'') FROM tasks WHERE ident='$1';"; }
 
-# --- A: a row binding a BRANCH in prose -> stamped -------------------------
-A=$(mk "stamp arm A" "Branch: IDENT-some-feature-branch")
+# --- A: a row binding a BRANCH in prose -> grade recorded, row stays open --
+A=$(mk "hold arm A" "Branch: IDENT-some-feature-branch")
 if [[ -n "$A" ]]; then
   # The DIVE-2577 rule anchors on the row's OWN ident, so the body must name it.
   "$CLI" task set-body "$A" "Branch: ${A,,}-some-feature-branch" >/dev/null 2>&1
-  "$CLI" task verify "$A" --cmd=true >/dev/null 2>&1
-  if res_of "$A" | grep -q "$STAMP"; then
-    ok_t "A: branch-in-prose binding -> verify close IS stamped"
-  else
-    bad_t "A: branch-in-prose binding -> verify close IS stamped" \
-          "no stamp; the DIVE-2577 discovery rule did not fire on '${A,,}-some-feature-branch'"
-  fi
+  A_OUT=$("$CLI" task verify "$A" --cmd=true 2>&1); A_RC=$?
+  # The other half of the message pair graded at arm C: a HELD row must say the
+  # merge is still owed and must NOT also claim it was marked done.
+  { grep -q 'merge still owed' <<<"$A_OUT" && ! grep -q 'marked done' <<<"$A_OUT"; } \
+    && ok_t "A: the held row says ONLY 'merge still owed' — never also 'marked done'" \
+    || bad_t "A: the held row's MESSAGE is exclusive" "expected 'merge still owed' without 'marked done'; got: $A_OUT"
+  [[ "$A_RC" -eq 0 ]] \
+    && ok_t "A: passing verify still exits 0 while holding the close" \
+    || bad_t "A: passing verify still exits 0" "rc=$A_RC"
+  [[ "$(field_of "$A" status)" != "done" ]] \
+    && ok_t "A RED: --cmd=true cannot close a branch-bound row" \
+    || bad_t "A RED: --cmd=true cannot close a branch-bound row" "status=done — raw UPDATE bypass survived"
+  [[ -n "$(field_of "$A" graded_at)" ]] \
+    && ok_t "A: held verify stamps the structural grade" \
+    || bad_t "A: held verify stamps the structural grade" "graded_at is empty"
+  res_of "$A" | grep -q "$HOLD" \
+    && ok_t "A: result names the merge hold" \
+    || bad_t "A: result names the merge hold" "hold marker absent"
   res_of "$A" | grep -q "${A,,}-some-feature-branch" \
-    && ok_t "A: the stamp NAMES the binding it did not check" \
+    && ok_t "A: the hold names the binding it did not check" \
     || bad_t "A: the stamp NAMES the binding it did not check" "binding absent from result"
 else
   bad_t "A: fixture row could not be created" "task add failed"
 fi
 
-# --- B: a row binding a PR in prose -> stamped -----------------------------
-B=$(mk "stamp arm B" "Delivered as PR #4242 and graded green.")
+# --- B: delivery_ref -> the DIVE-3315 terminal render ----------------------
+B=$(mk "hold arm B" "Delivered and awaiting verifier grade.")
 if [[ -n "$B" ]]; then
+  sqlite3 "$TASKS_DB" "UPDATE tasks SET delivery_ref='https://github.com/example/repo/pull/4242', maker_agent='fixturemaker', verifier='main', assignee='main' WHERE ident='$B';"
   "$CLI" task verify "$B" --cmd=true >/dev/null 2>&1
-  res_of "$B" | grep -q "$STAMP" \
-    && ok_t "B: PR-in-prose binding -> verify close IS stamped" \
-    || bad_t "B: PR-in-prose binding -> verify close IS stamped"
+  [[ "$(field_of "$B" status)" != "done" && -n "$(field_of "$B" graded_at)" ]] \
+    && ok_t "B RED: delivery_ref row is graded but remains open" \
+    || bad_t "B RED: delivery_ref row is graded but remains open" "status=$(field_of "$B" status), graded_at=$(field_of "$B" graded_at)"
+  "$CLI" task ls --all 2>/dev/null | grep -F "$B" | grep -q 'graded->merge:fixturemaker' \
+    && ok_t "B: held row renders graded->merge and names the merge owner" \
+    || bad_t "B: held row renders graded->merge and names the merge owner" "render missing"
 else
   bad_t "B: fixture row could not be created"
 fi
@@ -124,10 +139,20 @@ fi
 # fail when the verb never ran is not coverage.
 C=$(mk "stamp arm C" "A research row. No branch, no PR, nothing to land.")
 if [[ -n "$C" ]]; then
-  "$CLI" task verify "$C" --cmd=true >/dev/null 2>&1; C_RC=$?
-  res_of "$C" | grep -q "$STAMP" \
-    && bad_t "C NEGATIVE: no binding -> must NOT be stamped" "stamped a row with nothing to merge" \
-    || ok_t "C NEGATIVE: no binding -> not stamped"
+  C_OUT=$("$CLI" task verify "$C" --cmd=true 2>&1); C_RC=$?
+  # DIVE-3330 iteration 2 (main): grade the OPERATOR-FACING MESSAGE, not only the
+  # state. The three success messages shipped as a bare `A && B || C && D || E`
+  # chain, which bash groups left-to-right, so the 'merge still owed' branch ran
+  # unconditionally after the flipped branch succeeded — the unbound control closed
+  # correctly and then told the operator a merge was owed on a row that binds
+  # nothing. Every state arm here stayed green through it, because none of them
+  # read stderr. This arm is what makes a mutation of those three lines red.
+  { grep -q 'marked done' <<<"$C_OUT" && ! grep -q 'merge still owed' <<<"$C_OUT"; } \
+    && ok_t "C: the unbound control says ONLY 'marked done' — no false merge-owed claim" \
+    || bad_t "C: the unbound control's MESSAGE is exclusive" "expected 'marked done' without 'merge still owed'; got: $C_OUT"
+  res_of "$C" | grep -q "$HOLD" \
+    && bad_t "C NEGATIVE: no binding -> must NOT be held" "held a row with nothing to merge" \
+    || ok_t "C NEGATIVE: no binding -> no merge hold"
   [[ "$C_RC" -eq 0 ]] \
     && ok_t "C: the close SUCCEEDED (rc=0) — DIVE-3265, the arm above is not green by crash" \
     || bad_t "C: the close SUCCEEDED (rc=0)" "rc=$C_RC — an unguarded probe assignment killed the verb; the stamp arm above passed for the wrong reason"
@@ -147,10 +172,10 @@ F=$(mk "stamp arm F" "placeholder")
 if [[ -n "$F" ]]; then
   "$CLI" task set-body "$F" "Delivered: community/designs/${F,,}-svc-account-split.md" >/dev/null 2>&1
   "$CLI" task verify "$F" --cmd=true >/dev/null 2>&1; F_RC=$?
-  res_of "$F" | grep -q "$STAMP" \
+  res_of "$F" | grep -q "$HOLD" \
     && bad_t "F NEGATIVE: an .md artifact must NOT read as a branch binding" \
-             "stamped a non-repo deliverable; one file over, this same rule REFUSES the close outright (DIVE-3264)" \
-    || ok_t "F NEGATIVE: a design-doc deliverable is not stamped as an unchecked branch"
+             "held a non-repo deliverable; one file over, this same rule REFUSES the close outright (DIVE-3264)" \
+    || ok_t "F NEGATIVE: a design-doc deliverable is not merge-held"
   [[ "$F_RC" -eq 0 && "$("$CLI" task show "$F" 2>/dev/null | grep -m1 'status' | tr -d ' ')" == "status=done" ]] \
     && ok_t "F: the design-doc row closes clean (rc=0, done)" \
     || bad_t "F: the design-doc row closes clean" "rc=$F_RC"
@@ -163,18 +188,18 @@ fi
 # there with the same shape; this site shipped later (DIVE-2938) and reintroduced
 # it. Both callers of the extractor are guarded now — pin both, or the next new
 # call site repeats it a third time.
-grep -qE '_mg_branches=\$\(_gate_branch_refs_from_text .*\) \|\| _mg_branches=' "$ROOT/src/cmd_task.sh" "$ROOT"/src/task/*.sh \
-  && ok_t "G: the verify-stamp call site GUARDS the probe assignment (DIVE-3265)" \
-  || bad_t "G: verify-stamp call site guarded" "unguarded \$( ) — under set -e + pipefail a body naming no branch kills 'task verify' with empty stdout AND empty stderr"
+grep -qE 'branches=\$\(_gate_branch_refs_from_text .*\) \|\| branches=' "$ROOT/src/cmd_task.sh" "$ROOT"/src/task/*.sh \
+  && ok_t "G: the verify-hold helper GUARDS the probe assignment (DIVE-3265)" \
+  || bad_t "G: verify-hold helper guarded" "unguarded \$( ) — under set -e + pipefail a body naming no branch kills task verify"
 
 # --- D: NEGATIVE — --no-done does not close, so it must not stamp ----------
 D=$(mk "stamp arm D" "placeholder")
 if [[ -n "$D" ]]; then
   "$CLI" task set-body "$D" "Branch: ${D,,}-unlanded" >/dev/null 2>&1
   "$CLI" task verify "$D" --no-done --cmd=true >/dev/null 2>&1
-  res_of "$D" | grep -q "$STAMP" \
-    && bad_t "D NEGATIVE: --no-done must NOT stamp" "stamped a row that was never closed" \
-    || ok_t "D NEGATIVE: --no-done records without stamping (no close happened)"
+  res_of "$D" | grep -q "$HOLD" \
+    && bad_t "D NEGATIVE: explicit --no-done must not claim an automatic hold" "unexpected hold marker" \
+    || ok_t "D NEGATIVE: explicit --no-done records without automatic-hold prose"
   [[ "$("$CLI" task show "$D" 2>/dev/null | grep -m1 'status' | tr -d ' ')" == "status=done" ]] \
     && bad_t "D: --no-done must leave status unflipped" "row went done" \
     || ok_t "D: --no-done left status unflipped (control for arm D)"
@@ -188,9 +213,9 @@ if [[ -n "$E" ]]; then
   "$CLI" task set-body "$E" "Branch: ${E,,}-unlanded" >/dev/null 2>&1
   "$CLI" task verify "$E" --cmd=false >/dev/null 2>&1
   "$CLI" task verify "$E" --cmd=false >/dev/null 2>&1; E_RC=$?
-  res_of "$E" | grep -q "$STAMP" \
-    && bad_t "E NEGATIVE: a FAIL must NOT stamp" "stamped on a failing verify" \
-    || ok_t "E NEGATIVE: a failing verify records the FAIL without stamping"
+  res_of "$E" | grep -q "$HOLD" \
+    && bad_t "E NEGATIVE: a FAIL must NOT claim a merge hold" "hold marker on a failing verify" \
+    || ok_t "E NEGATIVE: a failing verify records the FAIL without hold prose"
   # DIVE-3265 (Marcus's merge condition): ASSERT THE EXIT STATUS, NOT THE MESSAGE.
   # A verb that fails while returning 0 is the nastier half of this ticket's class —
   # every caller reading `$?` (a script, a loop, a cron) sees success and carries on.

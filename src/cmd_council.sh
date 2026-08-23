@@ -589,7 +589,8 @@ comms:
 #   edit. Example:
 #     authority:
 #       eng_approval_lead: main
-#   gate_clear_leads: [<agent>, ...] — the agents allowed to CLEAR an approval/manual/access
+#   gate_clear_leads: — a BLOCK list (one "  - <agent>" per line, as in the example below;
+#   the inline [a, b] form is refused) of the agents allowed to CLEAR an approval/manual/access
 #   gate that was ROUTED to them (DIVE-2233). The org chart still decides who a gate is routed
 #   TO — that is a notification. This list decides who may clear one, so re-parenting the chart
 #   moves the ping and never the authority. EMPTY = nobody may lead-clear and every routed gate
@@ -642,7 +643,14 @@ function yamlScalar(raw) {
   if (s.startsWith("'") && s.endsWith("'")) return s.slice(1, -1).replace(/''/g, "'")
   if (s.startsWith('[') && s.endsWith(']')) {
     const inner = s.slice(1, -1).trim()
-    return inner ? inner.split(',').map(x => yamlScalar(x.trim())) : []
+    const arr = inner ? inner.split(',').map(x => yamlScalar(x.trim())) : []
+    // DIVE-3493 — remember that this array came from a FLOW sequence. Only
+    // `authority.gate_clear_leads` cares (the node-free reader in src/task/need.sh reads a
+    // block sequence and refuses a flow one on purpose), but the provenance has to be
+    // recorded here because it is gone by the time the normalizer sees a plain array.
+    // Non-enumerable so it never reaches JSON output, a digest, or a canonical record.
+    Object.defineProperty(arr, 'yamlFlow', { value: true })
+    return arr
   }
   if (/^(true|false)$/i.test(s)) return s.toLowerCase() === 'true'
   if (/^-?[0-9]+(?:\.[0-9]+)?$/.test(s)) return Number(s)
@@ -661,9 +669,16 @@ function stripYamlComment(line) {
   return line
 }
 
-// Deliberately small pure-YAML parser: mappings + scalar/inline-array
-// values are the whole enforced v0 schema. Unsupported list/object syntax fails
-// closed to defaults rather than being partially interpreted.
+// Deliberately small pure-YAML parser: mappings + scalar/flow-array values plus a BLOCK
+// SEQUENCE of plain scalars are the whole enforced v0 schema. Unsupported list/object
+// syntax fails closed to defaults rather than being partially interpreted.
+//
+// DIVE-3493 — the block sequence is here because the node-free authority reader in
+// src/task/need.sh reads exactly that shape (and refuses a flow one on purpose, so it
+// never grants authority from a syntax it only half-supports). Until this landed the two
+// accepted DISJOINT subsets of YAML — this parser threw on `- name` while the reader threw
+// away `[a, b]` — so `authority.gate_clear_leads` could not be set through any path, and
+// the shipped template's own worked example failed the validator shipping beside it.
 export function parseConstitutionFrontmatter(text) {
   const lines = String(text || '').replace(/\r\n/g, '\n').split('\n')
   const root = {}
@@ -675,18 +690,38 @@ export function parseConstitutionFrontmatter(text) {
     if (indent % 2) throw new Error('constitution YAML indentation must use two spaces')
     const line = stripYamlComment(original.trim())
     if (!line) continue
-    if (line.startsWith('- ')) throw new Error('use inline arrays in constitution v0')
+    if (line === '-' || line.startsWith('- ')) {
+      // A sequence entry belongs to the nearest enclosing key. Pop only frames INDENTED
+      // DEEPER than this entry: YAML lets a block sequence sit at its key's own indent
+      // (`gate_clear_leads:` / `- main` both at 2) as well as one level in, and the
+      // reader accepts both, so refusing either would re-open the same asymmetry.
+      while (stack.length > 1 && stack[stack.length - 1].indent > indent) stack.pop()
+      const frame = stack[stack.length - 1]
+      if (!frame.owner) throw new Error('a block sequence must be the value of a key')
+      if (!Array.isArray(frame.value)) {
+        if (Object.keys(frame.value).length) throw new Error(`constitution key '${frame.key}' holds a mapping and a block sequence`)
+        frame.value = frame.owner[frame.key] = []
+      }
+      const entry = line === '-' ? '' : line.slice(2).trim()
+      if (!entry) throw new Error(`empty entry in the block sequence under '${frame.key}'`)
+      if (/^([A-Za-z_][A-Za-z0-9_-]*):(\s|$)/.test(entry)) throw new Error(`block sequence entries must be plain scalars, not mappings (under '${frame.key}')`)
+      const val = yamlScalar(entry)
+      if (val !== null && typeof val === 'object') throw new Error(`block sequence entries must be plain scalars (under '${frame.key}')`)
+      frame.value.push(val)
+      continue
+    }
     const m = line.match(/^([A-Za-z_][A-Za-z0-9_-]*):(?:\s+(.*))?$/)
     if (!m) throw new Error(`unsupported constitution YAML: ${line}`)
     while (stack.length > 1 && stack[stack.length - 1].indent >= indent) stack.pop()
     const parent = stack[stack.length - 1]
+    if (Array.isArray(parent.value)) throw new Error(`constitution key '${parent.key}' holds a block sequence and cannot also hold keys`)
     if (indent > parent.indent + 2) throw new Error('constitution YAML skipped an indentation level')
     const key = m[1]
     if (['__proto__', 'prototype', 'constructor'].includes(key)) throw new Error('unsafe constitution key')
     if (Object.hasOwn(parent.value, key)) throw new Error(`duplicate constitution key: ${key}`)
     if (m[2] == null || m[2] === '') {
       parent.value[key] = {}
-      stack.push({ indent, value: parent.value[key] })
+      stack.push({ indent, value: parent.value[key], owner: parent.value, key })
     } else {
       parent.value[key] = yamlScalar(m[2])
     }
@@ -788,7 +823,7 @@ export function normalizeConstitution(raw = {}) {
   const unknownVeto = Object.keys(veto).filter(k => !['principal', 'principals', 'hold_secs', 'posthoc_secs'].includes(k))
   if (unknownVeto.length) throw new Error(`unknown veto field(s): ${unknownVeto.join(', ')}`)
   if (veto.principal != null && typeof veto.principal !== 'string') throw new Error('veto.principal must be a string')
-  if (veto.principals != null && (!Array.isArray(veto.principals) || veto.principals.some(x => typeof x !== 'string'))) throw new Error('veto.principals must be an inline string array')
+  if (veto.principals != null && (!Array.isArray(veto.principals) || veto.principals.some(x => typeof x !== 'string'))) throw new Error('veto.principals must be a list of strings')
   if (veto.principal && veto.principals) throw new Error('use veto.principal or veto.principals, not both')
   const principals = Array.isArray(veto.principals) ? veto.principals : (veto.principal ? [veto.principal] : [])
   const seconds = (v, fallback, field) => {
@@ -839,6 +874,16 @@ export function normalizeConstitution(raw = {}) {
   // sudo-writes itself into a builder's `reports_to` still receives the ping and still cannot
   // clear, because the name it just gave itself is not in these sealed bytes.
   if (authority.gate_clear_leads != null && !Array.isArray(authority.gate_clear_leads)) throw new Error('authority.gate_clear_leads must be a list of agent names')
+  // DIVE-3493 — and it must be a BLOCK sequence, because bash is what enforces it. The
+  // node-free reader refuses a flow sequence deliberately, so a document that NAMES holders
+  // inline validates, seals, and then denies every name it lists — emitting an audit reason
+  // (`no-gate-clear-leads-key`) indistinguishable from "never sealed". Refusing the shape
+  // here is what keeps the sealed bytes and the enforced authority the same document.
+  // An EMPTY `[]` is exempt on purpose: it grants nobody under either reader, it is the
+  // documented safe default, and reddening it would fail a doc that is already correct.
+  if (Array.isArray(authority.gate_clear_leads) && authority.gate_clear_leads.yamlFlow && authority.gate_clear_leads.length) {
+    throw new Error('authority.gate_clear_leads must be written as a block sequence (one "  - name" per line), not inline [a, b] — the enforcing reader does not accept the inline form and would deny every name listed')
+  }
   const gateClearLeads = (authority.gate_clear_leads || []).map(v => {
     if (typeof v !== 'string') throw new Error('authority.gate_clear_leads entries must be strings')
     return v.trim()
@@ -3291,11 +3336,22 @@ function serializeConstitutionScalar(v) {
   if (Array.isArray(v)) return '[' + v.map(serializeConstitutionScalar).join(', ') + ']'
   return `'${String(v).replace(/'/g, "''")}'`
 }
+// DIVE-3493 — a non-empty list is re-emitted as a BLOCK sequence, never inline. This verb
+// re-serializes the WHOLE document (it only ever CHANGES hard_gates/ship/comms, but it
+// rewrites every key it read), so an inline emitter here would silently convert a sealed
+// `authority.gate_clear_leads` into the one shape the enforcing reader in src/task/need.sh
+// treats as absent — revoking the allowlist as a side effect of a guardrail edit, and now
+// also failing this verb's own re-validation. Empty stays `[]`: block form cannot say it.
+function serializeConstitutionList(k, v, pad) {
+  if (!v.length) return `${pad}${k}: []\n`
+  return `${pad}${k}:\n` + v.map(x => `${pad}  - ${serializeConstitutionScalar(x)}\n`).join('')
+}
 function serializeConstitutionNode(obj, indent) {
   const pad = ' '.repeat(indent)
   let out = ''
   for (const [k, v] of Object.entries(obj)) {
-    if (v && typeof v === 'object' && !Array.isArray(v)) {
+    if (Array.isArray(v)) out += serializeConstitutionList(k, v, pad)
+    else if (v && typeof v === 'object') {
       const inner = serializeConstitutionNode(v, indent + 2)
       out += inner ? `${pad}${k}:\n${inner}` : `${pad}${k}:\n`
     } else out += `${pad}${k}: ${serializeConstitutionScalar(v)}\n`
@@ -3312,7 +3368,8 @@ function serializeConstitution(raw) {
     + '# is the sealed digest: after this file is sealed, enforcement fails CLOSED on any drift from it.\n'
   for (const k of keys) {
     const v = raw[k]
-    if (v && typeof v === 'object' && !Array.isArray(v)) {
+    if (Array.isArray(v)) out += serializeConstitutionList(k, v, '')
+    else if (v && typeof v === 'object') {
       const inner = serializeConstitutionNode(v, 2)
       out += inner ? `${k}:\n${inner}` : `${k}:\n`
     } else out += `${k}: ${serializeConstitutionScalar(v)}\n`

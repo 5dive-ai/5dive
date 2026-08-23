@@ -97,7 +97,9 @@ account_types_authed_arr() {
 # truth, so reading `keys | first` makes the dashboard badge lie when
 # a user adds a second credential (codex stays first, badge stays
 # codex, even after model.provider flips to openrouter). openclaw:
-# first profile's provider from auth-profiles.json. pi: no marker of its
+# first profile's provider from openclaw.json's auth.profiles (DIVE-3489 — the
+# key itself lives in openclaw-agent.sqlite; the registration is the readable
+# half, and auth-profiles.json is inert). pi: no marker of its
 # own, so reverse-map the present *_API_KEY var in the resolved env back to
 # a provider id via PI_PROVIDER_VAR (DIVE-1821). Everything else just gets a
 # signedInAt mtime so the tile can at least show *when* the user signed in.
@@ -145,16 +147,30 @@ account_signin_detail() {
       fi
       ;;
     openclaw)
-      auth_path="${profile_dir}/openclaw/.openclaw/agents/main/agent/auth-profiles.json"
-      [[ -s "$auth_path" ]] || { echo "{}"; return; }
-      provider=$(jq -c '
-        (.profiles // {}) | [.[]?.provider?] | map(select(.!=null)) | first // null
-      ' "$auth_path" 2>/dev/null) || provider=null
-      credentials=$(jq -c '
-        (.profiles // {}) | [.[]?.provider?] | map(select(.!=null)) | unique
-      ' "$auth_path" 2>/dev/null) || credentials='[]'
-      local mtime
-      mtime=$(date -u -r "$auth_path" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+      # DIVE-3489: openclaw's per-agent auth moved into openclaw-agent.sqlite,
+      # so auth-profiles.json is inert and reading providers out of it made this
+      # tile report on a file the runtime never consults — on a seat created by
+      # the fixed path the JSON does not exist at all and the tile went empty.
+      # The provider list is read from openclaw.json's `auth.profiles` instead:
+      # `models auth paste-api-key` registers `{provider, mode}` there (no key),
+      # which is exactly the metadata this readout wants and the one half that is
+      # plain JSON. The sqlite is used only as the sign-in TIMESTAMP — it is the
+      # file a real auth touches — with the config as the fallback.
+      local oc_root="${profile_dir}/openclaw/.openclaw"
+      local oc_cfg="${oc_root}/openclaw.json"
+      auth_path="${oc_root}/agents/main/agent/openclaw-agent.sqlite"
+      [[ -s "$auth_path" || -s "$oc_cfg" ]] || { echo "{}"; return; }
+      if [[ -s "$oc_cfg" ]]; then
+        provider=$(jq -c '
+          (.auth.profiles // {}) | [.[]?.provider?] | map(select(.!=null)) | first // null
+        ' "$oc_cfg" 2>/dev/null) || provider=null
+        credentials=$(jq -c '
+          (.auth.profiles // {}) | [.[]?.provider?] | map(select(.!=null)) | unique
+        ' "$oc_cfg" 2>/dev/null) || credentials='[]'
+      fi
+      local mtime mtime_src="$auth_path"
+      [[ -s "$mtime_src" ]] || mtime_src="$oc_cfg"
+      mtime=$(date -u -r "$mtime_src" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
       [[ -n "$mtime" ]] && signed_at=$(jq -cn --arg s "$mtime" '$s')
       ;;
     claude)

@@ -102,9 +102,19 @@ suppress_last()  { grep 'verifier-route suppressed' "$SUPPRESS_LOG" 2>/dev/null 
 ROUTE_FILE="$TMP/route.log"
 5dive() { if [[ "${1:-}" == "agent" && "${2:-}" == "send" ]]; then printf '%s\n' "${3:-}" >>"$ROUTE_FILE"; fi; return 0; }
 export -f 5dive 2>/dev/null || true
-route_reset() { : >"$ROUTE_FILE"; HUMAN_PINGED=0; }
-route_sent()  { local i n; for i in $(seq 1 10); do [[ -s "$ROUTE_FILE" ]] && break; sleep 0.05; done; n=$(grep -c . "$ROUTE_FILE" 2>/dev/null); echo "${n:-0}"; }
-route_last()  { local i; for i in $(seq 1 10); do [[ -s "$ROUTE_FILE" ]] && break; sleep 0.05; done; tail -n1 "$ROUTE_FILE" 2>/dev/null; }
+# DIVE-3474 arm 2: a routed gate no longer WAKES the reviewer — by default it is
+# QUEUED for them. What this harness grades is unchanged (WHICH SEAT a gate was
+# handed to, and whether it was handed to an agent at all), so the observer moves
+# off the send stub and onto the gate-delivery row, which names the seat on either
+# rail (`chat=agent:<who>` when it pinged, `chat=queue:<who>` when it queued). The
+# send stub stays live so an unexpected wake still shows up in $ROUTE_FILE.
+NOTIFY_LOG="$TMP/gate-notify.log"; : >"$NOTIFY_LOG"
+export FIVEDIVE_GATE_NOTIFY_LOG="$NOTIFY_LOG"
+_handoffs()   { local i; for i in $(seq 1 20); do grep -qE 'chat=(queue|agent):' "$NOTIFY_LOG" 2>/dev/null && break; sleep 0.05; done
+                grep -oE 'chat=(queue|agent):[^ ]+' "$NOTIFY_LOG" 2>/dev/null | sed 's/.*://'; }
+route_reset() { : >"$ROUTE_FILE"; : >"$NOTIFY_LOG"; HUMAN_PINGED=0; }
+route_sent()  { local n; n=$(_handoffs | grep -c .); echo "${n:-0}"; }
+route_last()  { _handoffs | tail -n1; }
 
 # Org chart: main is the lone root/coordinator; dev reports to main.
 db "INSERT INTO agents_org(name,reports_to,role) VALUES('main',NULL,'coordinator');"

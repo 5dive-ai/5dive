@@ -139,7 +139,7 @@ _loop_eff_ceiling() {
 _spend_scan_task_ids() {
   REGISTRY="$REGISTRY" TASK_DB="${TASKS_DB:-${STATE_DIR}/tasks/tasks.db}" \
     LOOP_KIDS="$1" LOOP_SINCE="${2:-0}" python3 - <<'PY'
-import os, json, time, sqlite3, datetime as dt, pwd, errno, sys   # no glob: DIVE-3417
+import os, json, glob, time, sqlite3, datetime as dt, pwd, errno, sys
 # DIVE-3345: reasons collect here and are reported ONCE, at the end, by finish().
 # Accumulating rather than exiting on the first one is deliberate: with several
 # agents in the window the operator wants every blind spot named, not the first.
@@ -229,53 +229,27 @@ def probe_readable(home, projects):
             return False, "home %s not readable by this uid (needs root)" % home
         return False, "home %s unreadable: %s" % (home, e.strerror or e.errno)
     return True, None          # home readable, no transcript dir yet: genuinely idle
-# DIVE-3417 — probe_readable() above covers `projects/`, and the per-file
-# `except OSError` below covers each `*.jsonl`. Between them sat a THIRD read
-# that nothing covered: the middle `*` of `projects/*/*.jsonl` is a directory
-# listing too, and `glob.glob()` performs it by SWALLOWING every OSError and
-# yielding nothing for that entry. So a project subdir this uid cannot read
-# dropped out of the sum with no exception, no stderr, and rc 0 — a well-formed
-# number that is a FRACTION of the truth. That is the same CLOBBER shape
-# DIVE-3345 exists to kill (_loop_refresh_spend accepts rc 0 + numeric and
-# PERSISTS it over the accumulated tokens_spent), not the milder blind-guard
-# shape, and it is MORE reachable on a normalised host, not less: the
-# /etc/cron.d/5dive-agent-home-traversal stopgap (DIVE-3294) makes the UPPER
-# path traversable every 20m, manufacturing exactly the readable-projects/-over-
-# unreadable-subdir state rather than preventing it.
+
+# DIVE-3468: enumerate the transcript set one level at a time, so an unread level
+# is a REASON rather than a silently shorter list. Two levels are collected:
 #
-# The generalisable rule, and why this could not be fixed by adding one more
-# probe: a guard at the TOP and the BOTTOM of a path does not cover a glob's
-# MIDDLE wildcards. Every wildcard is a directory read that can fail, and glob
-# cannot report what it skipped — so the level is enumerated explicitly here,
-# with os.listdir, which is allowed to raise.
+#     projects/<proj>/<sid>.jsonl                     the parent transcript
+#     projects/<proj>/<sid>/subagents/*.jsonl         the sidechain turns
+#
+# ENOENT (a session rolling over mid-scan, or a session with no subagents) and
+# ENOTDIR (a regular file where a dir would be — including `<sid>.jsonl` itself
+# when probed for a subagents/ child) are real absences and stay silent, because
+# both mean "nothing unread here". Anything else — EACCES on a 700 dir, ELOOP,
+# EIO — is a read we could not perform and is returned as the reason.
 def list_sessions(projects):
-    """-> (paths, reason). reason is not None => NOT-REACHED, paths meaningless.
-
-    Enumerates `projects/*/*.jsonl` one level at a time. Two skips are kept
-    deliberately, because both mean "there is nothing unread here" rather than
-    "we failed to read it", and both match what the glob did:
-      * ENOENT  — the entry vanished between the listing and the read (sessions
-                  and their dirs roll over under a live agent).
-      * ENOTDIR — a regular FILE sitting directly in projects/. It cannot
-                  contain <it>/*.jsonl, so no transcript is being missed.
-    Anything else (EACCES on a 700 subdir, ELOOP on a self-referential symlink,
-    EIO) is a read we could not perform, and is reported.
-
-    One deliberate WIDENING over glob.glob: glob hides entries whose name starts
-    with a dot, at both levels. A dot-prefixed session file is still spend, and
-    silently not counting it is the very shape this function exists to refuse.
-    """
+    """-> (paths, reason). reason is not None => this agent was not fully read."""
     out = []
     try:
         entries = sorted(os.listdir(projects))
     except OSError as e:
-        # ENOENT here is the state probe_readable JUST classified as genuinely
-        # idle: a readable home that has no transcript dir yet. NOT-REACHING it
-        # would over-fire on every agent that has never run, which disables the
-        # ceiling as thoroughly as the fail-open does. Anything else is a race
-        # against the probe above — still an unread level, not an empty one.
-        if e.errno == errno.ENOENT: return [], None
-        return [], "transcript dir %s became unreadable mid-scan: %s" % (projects, e.strerror or e.errno)
+        if e.errno == errno.ENOENT:
+            return [], None    # never run: genuinely empty, not unread
+        return [], "transcript dir %s unreadable: %s" % (projects, e.strerror or e.errno)
     for d in entries:
         sub = os.path.join(projects, d)
         try:
@@ -284,6 +258,14 @@ def list_sessions(projects):
             if e.errno in (errno.ENOENT, errno.ENOTDIR): continue
             return [], "project dir %s unreadable: %s" % (sub, e.strerror or e.errno)
         out.extend(os.path.join(sub, n) for n in names if n.endswith(".jsonl"))
+        for n in names:
+            subag = os.path.join(sub, n, "subagents")
+            try:
+                sa_names = sorted(os.listdir(subag))
+            except OSError as e:
+                if e.errno in (errno.ENOENT, errno.ENOTDIR): continue
+                return [], "subagent dir %s unreadable: %s" % (subag, e.strerror or e.errno)
+            out.extend(os.path.join(subag, m) for m in sa_names if m.endswith(".jsonl"))
     return out, None
 total = 0
 for name, ws in wins.items():
@@ -308,6 +290,49 @@ for name, ws in wins.items():
         not_reached("%s: %s" % (name, why)); continue
     lo = min(w["start"] for w in ws)
     blind = False
+    # DIVE-3468: TWO globs, because a subagent's turns are not in the session
+    # file. Claude Code writes sidechain turns to a sibling DIRECTORY,
+    # projects/<proj>/<sid>/subagents/*.jsonl, which the one-level glob cannot
+    # reach — while every turn in it carries the PARENT's sessionId, so the
+    # attribution was always correct and only the path was out of range. The
+    # design note this reader was built on asserted the opposite ("sidechain
+    # turns land in the parent .jsonl, so a session-scoped sum picks them up for
+    # free"); it is false, measured on two seats.
+    #
+    # It fails in the worst available direction: no error, no NOT-REACHED, just a
+    # smaller correct-looking integer, under-charging exactly the rows that fan
+    # work out to subagents — i.e. the expensive ones. Nothing inside the numbers
+    # falsifies it.
+    #
+    # Measured: agent-quinn, 62 sidechain turns / 294,684 tokens (~9% of that
+    # session) excluded; agent-dev3, 4 files / 434 turns / 1,059,608 tokens.
+    # No double-count: the uuid sets of the parent and the subagent files are
+    # DISJOINT on all four dev3 pairs, so adding the second glob adds turns
+    # rather than re-counting them.
+    #
+    # The tool-results/ sibling in the same tree is NOT transcript turns and is
+    # deliberately not enumerated — it is on all 9 readable seats, so a `*/*`
+    # sweep here would have swept it in everywhere.
+    #
+    # AND NOT WITH glob.glob(). Reaching the files with a second glob is only
+    # half the fix: glob SWALLOWS every OSError in a wildcard level and yields
+    # nothing for that entry, so an unreadable subagents/ dir would go back to
+    # being a silently smaller correct-looking integer — this row's own defect,
+    # rebuilt one level deeper, by the change meant to remove it. (Caught by
+    # `spend_scan_not_reached_unit.sh`'s unreadable-subagents arm, which reds on
+    # the two-glob version.)
+    #
+    # So enumerate explicitly, same discipline as usage_collect's list_sessions
+    # (DIVE-3417/3419). This also closes the PRE-EXISTING hole at the middle
+    # level: `projects/*/*.jsonl`'s own middle wildcard was glob-swallowed here
+    # too, so an unreadable PROJECT dir was already dropping out of this total
+    # silently. probe_readable() covers the top and the per-file `except OSError`
+    # below covers the bottom; nothing covered the middle.
+    #
+    # Verdict is NOT-REACHED, not a warning, because this reader's caller
+    # (_loop_refresh_spend) PERSISTS what it returns over durable state — a short
+    # total silently becomes the record. That is the DIVE-3419 split: the same
+    # unread level is a reporting `partial` in cmd_activity and a hard rc 2 here.
     sessions, why = list_sessions(projects)
     if why is not None:
         not_reached("%s: %s" % (name, why)); continue
@@ -339,6 +364,174 @@ for name, ws in wins.items():
     if blind: continue          # do not fold a knowingly-partial agent into the total
     total += sum(w["tok"] for w in ws)
 finish(total)
+PY
+}
+
+# _spend_scan_task_sessions <task_ids_json> — DIVE-3349. The per-task reader that
+# sits ALONGSIDE _spend_scan_task_ids above and answers a DIFFERENT question.
+#
+# That one keys on ASSIGNEE and globs every transcript under the seat's home
+# inside the row's [started_at, done_at or now] window. A transcript line carries
+# a timestamp and a usage block and NOTHING that names a task, so what it produces
+# is the seat's whole spend for the WIDTH of the window — and the width is the
+# row's wall-clock age. An OPEN, IDLE row therefore outscores an actively worked
+# one, and two rows open on one seat are EACH billed the seat's full spend (they
+# do not sum to the day; they each approach it). That is what DIVE-3343 removed
+# the per-task budget over. Both halves compiled:
+#   community/wiki/per-task-token-attribution-the-session-id-is-the-signal.md
+#   community/wiki/a-task-attributed-token-figure-measures-the-rows-age-not-its-work.md
+#
+# This reader sums ONLY the transcripts NAMED by that row's session segments,
+# clipped to each segment's own window. Contract — and every arm gets its OWN
+# exit code, because a caller that maps any of them onto 0 rebuilds the DIVE-2304
+# fail-open where "unreadable" and "idle" became the same observation:
+#
+#   rc 0 -> a real integer on stdout
+#   rc 3 -> the word AMBIGUOUS. Two segments on ONE session overlap in time
+#           across DIFFERENT rows. A refusal is the honest output and a SPLIT is
+#           not: apportioning a seat's spend across its open rows is the invention
+#           DIVE-3343 died of, wearing a better disguise (DIVE-3348 §1).
+#   rc 4 -> the word NOT-REACHED. No segments at all; a segment whose session_id
+#           is NULL (an invocation with no session — cron, a human shell, a
+#           non-claude seat); or a named transcript that could not be found/read.
+#
+# NOT-REACHED on a PARTIALLY-named row is deliberate and it is the conservative
+# call. Summing the named segments and quietly dropping the NULL ones returns a
+# number that is real, smaller than the truth, and indistinguishable from a
+# complete answer — and a figure that understates while LOOKING measured is worse
+# than no figure, because only the second one can ever be caught.
+#
+# Says nothing on stdout but the one token; the CAUSE goes to stderr, unswallowed,
+# for the reason written above _spend_scan_task_ids: a `2>/dev/null` on that call
+# is what hid the broken ceiling for its whole life. Do not add one here.
+_spend_scan_task_sessions() {
+  TASK_DB="${TASKS_DB:-${STATE_DIR}/tasks/tasks.db}" \
+    SESS_KIDS="$1" python3 - <<'PY'
+import os, json, glob, time, sqlite3, datetime as dt, pwd, sys
+now = int(time.time())
+def bail(word, rc, why):
+    print(word); sys.stderr.write("task-sessions: %s (%s)\n" % (word, why)); raise SystemExit(rc)
+try:    kids = [int(x) for x in json.loads(os.environ.get("SESS_KIDS") or "[]")]
+except Exception: kids = []
+if not kids: bail("NOT-REACHED", 4, "no task ids given")
+def to_epoch(s):
+    if not s: return None
+    s = s.strip()
+    try:
+        if s.endswith("Z"): s = s[:-1] + "+00:00"
+        d = dt.datetime.fromisoformat(s.replace(" ", "T", 1) if " " in s and "T" not in s else s)
+        if d.tzinfo is None: d = d.replace(tzinfo=dt.timezone.utc)
+        return int(d.timestamp())
+    except Exception: return None
+try:
+    con = sqlite3.connect(os.environ["TASK_DB"]); con.row_factory = sqlite3.Row
+    q = ("SELECT task_id,session_id,agent,started_at,ended_at FROM task_sessions "
+         "WHERE task_id IN (%s)" % ",".join("?"*len(kids)))
+    mine = con.execute(q, kids).fetchall()
+except Exception as e:
+    bail("NOT-REACHED", 4, "segment store unreadable: %s" % e)
+if not mine: bail("NOT-REACHED", 4, "no session segments recorded for %s" % kids)
+segs = []
+for r in mine:
+    st = to_epoch(r["started_at"])
+    if st is None: bail("NOT-REACHED", 4, "segment on task %s has an unparseable started_at" % r["task_id"])
+    if not (r["session_id"] or "").strip():
+        bail("NOT-REACHED", 4, "task %s has a segment with NO session id (claimed outside a "
+                               "session); refusing the assignee-window fallback" % r["task_id"])
+    if not (r["agent"] or "").strip():
+        bail("NOT-REACHED", 4, "segment on task %s names no seat, so its transcript has no home to open" % r["task_id"])
+    segs.append({"tid": r["task_id"], "sid": r["session_id"].strip(),
+                 "agent": r["agent"].strip(), "s": st, "e": to_epoch(r["ended_at"]) or now})
+# --- overlap => AMBIGUOUS. Read the WHOLE table for these session ids, not just
+# the requested rows: the row that overlaps mine is usually NOT the one asked about.
+sids = sorted({g["sid"] for g in segs})
+try:
+    q = ("SELECT task_id,session_id,started_at,ended_at FROM task_sessions "
+         "WHERE session_id IN (%s)" % ",".join("?"*len(sids)))
+    allsegs = con.execute(q, sids).fetchall()
+except Exception:
+    allsegs = mine
+by = {}
+for r in allsegs:
+    st = to_epoch(r["started_at"])
+    if st is None: continue
+    by.setdefault(r["session_id"], []).append((st, to_epoch(r["ended_at"]) or now, r["task_id"]))
+for sid, lst in by.items():
+    lst.sort()
+    for i in range(len(lst)):
+        for j in range(i+1, len(lst)):
+            if lst[j][2] == lst[i][2]: continue          # same row, sequential re-claims
+            # strict: a segment that ends exactly as the next begins does NOT overlap,
+            # which is the ordinary two-rows-in-sequence case and must stay measurable.
+            if lst[i][0] < lst[j][1] and lst[j][0] < lst[i][1]:
+                bail("AMBIGUOUS", 3, "session %s has interleaved segments for tasks %s and %s — "
+                                     "a split would be an invention" % (sid, lst[i][2], lst[j][2]))
+try: con.close()
+except Exception: pass
+try:    _HOME_OVR = json.loads(os.environ.get("LOOP_HOME_OVERRIDE_JSON") or "{}")
+except Exception: _HOME_OVR = {}
+def home_of(name):
+    if name in _HOME_OVR: return _HOME_OVR[name]   # test hook; unset in production
+    try: return pwd.getpwnam("agent-"+name).pw_dir
+    except KeyError: return "/home/agent-"+name
+buckets = {}
+for g in segs: buckets.setdefault((g["sid"], g["agent"]), []).append(g)
+total = 0
+for (sid, agent), ws in buckets.items():
+    paths = glob.glob(os.path.join(home_of(agent), ".claude", "projects", "*", sid + ".jsonl"))
+    if not paths:
+        bail("NOT-REACHED", 4, "no transcript named %s.jsonl under %s's home" % (sid, agent))
+    read_any = False
+    for path in paths:
+        try: f = open(path, "r", errors="ignore")
+        except OSError: continue
+        read_any = True
+        with f:
+            for line in f:
+                if '"usage"' not in line or '"assistant"' not in line: continue
+                try: o = json.loads(line)
+                except Exception: continue
+                if o.get("type") != "assistant": continue
+                ts = to_epoch(o.get("timestamp"))
+                if ts is None: continue
+                u = (o.get("message") or {}).get("usage") or {}
+                # Same limit-moving metric as `5dive usage` and as the scan above:
+                # input + output + cache-WRITE, cache-read excluded.
+                tot = (int(u.get("input_tokens") or 0) + int(u.get("output_tokens") or 0)
+                       + int(u.get("cache_creation_input_tokens") or 0))
+                for w in ws:
+                    # DIVE-3374: HALF-OPEN — inclusive start, EXCLUSIVE end. The
+                    # clip and the overlap detector above are one decision about
+                    # strictness made in two places, and they disagreed: the
+                    # detector is strict (`<`), so `[t0,t5]` and `[t5,t10]` are
+                    # legally SEQUENTIAL and both measure — while an inclusive
+                    # `<=` here put the instant t5 inside BOTH, so a turn landing
+                    # on it was charged to BOTH rows. Measured on a fixture:
+                    # corpus 1800, rows charged 1100 + 1700 = 2800.
+                    #
+                    # Not exotic: the boundary is written by `task done` on one
+                    # row followed by `task start` on the next — two consecutive
+                    # commands in one session, against second-granularity
+                    # `datetime('now')`. That is the ordinary handoff.
+                    #
+                    # Exactly ONE end moves, so touching segments PARTITION the
+                    # line instead of sharing a point, and the boundary instant
+                    # belongs to the LATER segment and to nothing else. The
+                    # detector must stay strict — making IT inclusive would turn
+                    # the ordinary sequential pair AMBIGUOUS instead.
+                    #
+                    # Two edges this deliberately accepts: an OPEN segment's end
+                    # is `now` (scan time), so a turn written in the very second
+                    # of the scan falls to the next scan rather than being lost;
+                    # and a zero-width segment (start == done inside one second)
+                    # now charges 0, which is the honest reading of a row that
+                    # existed for less than a second.
+                    if w["s"] <= ts < w["e"]:
+                        total += tot; break
+    if not read_any:
+        bail("NOT-REACHED", 4, "transcript %s.jsonl exists but could not be opened (it is chmod 600 "
+                               "under %s's home; the scan must run as that seat)" % (sid, agent))
+print(int(total))
 PY
 }
 

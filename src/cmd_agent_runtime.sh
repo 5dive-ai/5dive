@@ -54,6 +54,29 @@ cmd_stop() {
      '{name:$n, action:"stop"}' --arg n "$name"
 }
 
+# Emit the {ok:true, …, lines:[…]} envelope for a BUFFERED read.
+#
+# DIVE-2792 iteration 2. The `lines:[]` half is not a formatting detail: a
+# here-string APPENDS a newline, so `<<<""` is ONE empty line to `jq -R … inputs`,
+# not zero input. A successful read that returned nothing — an agent whose unit
+# has not logged yet, the ordinary case — therefore reports `lines:[""]`, and a
+# consumer counting `lines | length` sees a phantom entry. The pipe this replaced
+# delivered zero bytes and reported `[]`.
+#
+# **Any pipe → capture rewrite changes the empty case**, so it needs its own arm;
+# `tests/dive2792_passthrough_exit_unit.sh` C7/C8 grade both sources here.
+# community/wiki/a-sweep-that-finds-a-second-defect-must-move-the-harness-to-it.md
+_logs_lines_envelope() {   # <name> <source> <captured-text>
+  local n="$1" src="$2" text="$3"
+  if [[ -n "$text" ]]; then
+    jq -Rn --arg n "$n" --arg s "$src" \
+      '{ok:true, data:{name:$n, source:$s, lines:[inputs]}}' <<<"$text"
+  else
+    jq -n --arg n "$n" --arg s "$src" \
+      '{ok:true, data:{name:$n, source:$s, lines:[]}}'
+  fi
+}
+
 # journalctl for the agent's unit, or a tmux scrollback capture with --tmux.
 # --follow streams until the caller hangs up; in the /agents/exec path the
 # shelld timeout caps this, so the dashboard should prefer the WS session for
@@ -86,8 +109,7 @@ cmd_logs() {
     capture=$(sudo -u "agent-${name}" tmux capture-pane -t "agent-${name}" -p -S "-${lines}" 2>/dev/null) \
       || fail "$E_NOT_RUNNING" "tmux session 'agent-${name}' not found (is the agent running?)"
     if (( JSON_MODE )); then
-      jq -Rn --arg n "$name" \
-        '{ok:true, data:{name:$n, source:"tmux", lines:[inputs]}}' <<<"$capture"
+      _logs_lines_envelope "$name" tmux "$capture"
     else
       printf '%s\n' "$capture"
     fi
@@ -97,17 +119,48 @@ cmd_logs() {
   local args=(-u "5dive-agent@${name}.service" --no-pager -n "$lines")
   (( follow )) && args+=(-f)
 
+  # DIVE-2792, the second instance the case-block sweep turned up. `agent logs`
+  # is a PASSTHROUGH over journalctl exactly as `gh` is over gh, and it had both
+  # halves of the defect:
+  #
+  #   text mode  — journalctl was the last statement, so a legitimate non-zero
+  #                (no journal access, unit never existed) left the process with
+  #                that status and NOTHING had called mark_reported. The EXIT
+  #                backstop then overwrote journalctl's own message with "this is
+  #                a bug in the CLI ... its effect is UNKNOWN" — for a READ that
+  #                had already printed its reason.
+  #   JSON mode  — `journalctl | jq` reports JQ's status, so the same failure
+  #                exited 0 with an {ok:true} envelope holding zero lines. The
+  #                opposite lie, and the more expensive one.
+  #
+  # So: capture journalctl's own status through PIPESTATUS, say whose status it
+  # is, and claim the report so the generic banner stays for real CLI defects.
+  local jrc=0
   if (( JSON_MODE )); then
     if (( follow )); then
       # NDJSON stream; no envelope. Each line becomes one JSON object.
       journalctl "${args[@]}" | jq -Rc '{line: .}'
+      jrc=${PIPESTATUS[0]}
     else
-      journalctl "${args[@]}" \
-        | jq -Rn --arg n "$name" '{ok:true, data:{name:$n, source:"journal", lines:[inputs]}}'
+      # Buffered, not piped: the envelope is only correct if the read SUCCEEDED,
+      # so the status has to be known before anything is printed. Piping emitted
+      # {ok:true} first and left no way to take it back.
+      local jout=""
+      jout=$(journalctl "${args[@]}") || jrc=$?
+      (( jrc == 0 )) && _logs_lines_envelope "$name" journal "$jout"
     fi
   else
-    journalctl "${args[@]}"
+    journalctl "${args[@]}" || jrc=$?
   fi
+  (( jrc == 0 )) && return 0
+  mark_reported
+  echo "[5dive agent logs] journalctl exited ${jrc} — that is journalctl's OWN exit status, not a 5dive failure. Its message is above; 5dive resolved the unit and ran the read to completion." >&2
+  if (( JSON_MODE )); then
+    jq -cn --argjson c "$jrc" \
+      --arg m "journalctl exited ${jrc}. This is the wrapped journalctl's own exit status, passed through verbatim — 5dive did not itself fail. Read journalctl's stderr for the reason." \
+      '{ok:false, error:{code:$c, class:"passthrough", message:$m}}' 2>/dev/null || true
+  fi
+  return "$jrc"
 }
 
 # Sender-side group mirror for inter-agent traffic. Posts "@<receiver>\n<body>"
@@ -438,6 +491,64 @@ _mirror_edit_markup() { # <token> <chat> <message_id> [reply_markup]
   [[ -n "$reply_markup" ]] && args+=(--data-urlencode "reply_markup=${reply_markup}")
   curl -s --connect-timeout 5 --max-time 10 -X POST \
     "https://api.telegram.org/bot${token}/editMessageReplyMarkup" "${args[@]}" 2>/dev/null
+}
+
+# DIVE-3228 — delete a card outright. Same dry-run guard as the two edits beside
+# it, for the same DIVE-1500 reason: a fixture harness that can delete a real
+# message can destroy a real conversation, which is strictly worse than editing
+# one.
+#
+# Telegram lets a bot delete its OWN message for 48h. Past that, and in a few chat
+# types, it refuses — the caller falls back to a visible strike rather than
+# treating the refusal as done. Two refusals are the DESIRED end state reached
+# without us and callers must read them as success, not breakage:
+# "message to delete not found" (already gone, incl. a repeat retire pass — DIVE-2272
+# alone ran three over one message) and an already-deleted id.
+_mirror_delete_message() { # <token> <chat> <message_id>
+  local token="$1" chat="$2" mid="$3"
+  if [[ -n "${FIVEDIVE_NOTIFY_DRYRUN:-}" && "${FIVEDIVE_NOTIFY_DRYRUN}" != "0" ]]; then
+    local dry_line
+    dry_line=$(printf 'notify-dryrun delete_message chat=%s message_id=%s' "$chat" "$mid")
+    if [[ -n "${FIVEDIVE_NOTIFY_DRYRUN_LOG:-}" ]]; then
+      printf '%s\n' "$dry_line" >>"$FIVEDIVE_NOTIFY_DRYRUN_LOG" 2>/dev/null || true
+    fi
+    printf '%s\n' "$dry_line" >&2 || true
+    printf '%s' '{"ok":true,"dry_run":true}'
+    return 0
+  fi
+  curl -s --connect-timeout 5 --max-time 10 -X POST \
+    "https://api.telegram.org/bot${token}/deleteMessage" \
+    --data-urlencode "chat_id=${chat}" --data-urlencode "message_id=${mid}" 2>/dev/null
+}
+
+# DIVE-3228 — rewrite a card's TEXT. Two callers, both needing the text to change
+# and not just the keyboard:
+#   * the live card tracking its row (state changed, same underlying ask), and
+#   * the strike, when a human answered or when Telegram refused the delete.
+# reply_markup is OMITTED on purpose: editMessageText without it drops the inline
+# keyboard in the same call, so a struck card cannot keep a tappable button.
+#
+# "message is not modified" means the text we are writing is already there. That
+# is the end state, but it is NOT free of meaning to the caller — see the DIVE-3228
+# classification in _task_gate_card_apply, which reports anything that could leave
+# a live-LOOKING card and only calls a row ok when the card is provably settled.
+_mirror_edit_text() { # <token> <chat> <message_id> <text>
+  local token="$1" chat="$2" mid="$3" text="$4"
+  if [[ -n "${FIVEDIVE_NOTIFY_DRYRUN:-}" && "${FIVEDIVE_NOTIFY_DRYRUN}" != "0" ]]; then
+    local dry_line
+    dry_line=$(printf 'notify-dryrun edit_text chat=%s message_id=%s bytes=%s' \
+      "$chat" "$mid" "${#text}")
+    if [[ -n "${FIVEDIVE_NOTIFY_DRYRUN_LOG:-}" ]]; then
+      printf '%s\n' "$dry_line" >>"$FIVEDIVE_NOTIFY_DRYRUN_LOG" 2>/dev/null || true
+    fi
+    printf '%s\n' "$dry_line" >&2 || true
+    printf '%s' '{"ok":true,"dry_run":true}'
+    return 0
+  fi
+  curl -s --connect-timeout 5 --max-time 10 -X POST \
+    "https://api.telegram.org/bot${token}/editMessageText" \
+    --data-urlencode "chat_id=${chat}" --data-urlencode "message_id=${mid}" \
+    --data-urlencode "text=${text}" 2>/dev/null
 }
 
 # Rename a migrated group's key (old→new) in access.json, preserving the policy
@@ -1255,11 +1366,19 @@ cmd_deliver() {
   sudo -u "agent-${target}" tmux has-session -t "agent-${target}" 2>/dev/null \
     || fail "$E_NOT_RUNNING" "tmux session 'agent-${target}' not found (is the agent running?)"
 
-  # Sender + tier from the real sudo caller (agent-X -> X). A non-agent caller
+  # Sender + tier from the real caller (agent-X -> X). A non-agent caller
   # (direct root / human) records as "human"; tier is empty unless the sender is
-  # a registered agent. Mirrors auto_sender_from_sudo + the DIVE-1064 tier stamp.
-  local s="${SUDO_USER#agent-}" _caller=""
-  if [[ "${SUDO_USER:-}" == agent-* ]]; then _caller="$s"; else s="human"; fi
+  # a registered agent.
+  #
+  # DIVE-2538 item 1: this used to be `[[ "${SUDO_USER:-}" == agent-* ]]` — the
+  # DIVE-2371 prefix rule, deciding an agent-vs-HUMAN CLASS from an env var nothing
+  # verifies. It decides `_caller`, which is the key the a2a round cap counts
+  # against, so a forged `SUDO_USER=agent-X` spent X's round budget and recorded X
+  # as the sender. `actor_routing_agent` answers from the caller's own euid first
+  # and only consults SUDO_UID for a non-agent euid, where sudo has stamped it.
+  local _caller s
+  _caller=$(actor_routing_agent) || _caller=""
+  if [[ -n "$_caller" ]]; then s="$_caller"; else s="human"; fi
 
   # DIVE-3318: the round cap on the SCOPED path. This is the branch every
   # standard-isolation agent's `agent send` re-execs into, so a cap enforced only
@@ -1324,6 +1443,21 @@ cmd_deliver() {
     _delivered=0
     _reason="$(_agent_submit_unconfirmed_reason)"
   fi
+  # DIVE-3573 (a): mirror the outbound into the sender's buzz channel.
+  #
+  # AND YES, THIS IS ONE SITE MORE THAN THE TELEGRAM MIRROR HAS — deliberately,
+  # and it is the difference worth reading. mirror_interagent_outbound is called
+  # from cmd_send and cmd_ask only, and cmd_send EXECS into this primitive for
+  # every scoped-sudo caller, so its mirror is unreachable for exactly the
+  # population that reaches a2a through `_deliver`: standard-isolation agents,
+  # which on an OSS box is most of the fleet. Matching that gap byte for byte
+  # would have shipped the row's headline feature invisible for those seats.
+  # The Telegram side of it is a real defect and NOT fixed here — a change to a
+  # live notification rail belongs in its own row, not smuggled into a buzz one.
+  # Placed before the receipt and unconditional on `_delivered` in the same way
+  # cmd_send's is: the mirror describes what was SENT, and it returns 0 on every
+  # path, so it can never change this primitive's rc.
+  _buzz_mirror_outbound "$target" "$message"
   if (( _delivered )); then
     # Byte-for-byte rc=0 compatibility: this is the pre-DIVE-2362 receipt.
     ok "delivered to agent '$target'." \
@@ -2038,6 +2172,12 @@ cmd_send() {
   # Mirror the outbound into the sender's group chat (best-effort). Gated on a
   # real envelope: a raw/anonymous send has no sender identity to mirror under.
   (( raw )) || mirror_interagent_outbound "$name" "$message"
+  # DIVE-3573 (a): the same outbound, mirrored into the sender's buzz channel.
+  # Gated on the SAME (!raw) condition and for the same stated reason — a raw
+  # send has no sender identity to mirror under. Best-effort: _buzz_mirror_outbound
+  # returns 0 on every path, so a relay outage can never fail a send that already
+  # reached the pane.
+  (( raw )) || _buzz_mirror_outbound "$name" "$message"
 
   # DIVE-2385: `woken` distinguishes "delivered to a live agent" from "started the
   # agent in order to deliver". A scheduled caller that logs this line can tell,
@@ -2080,6 +2220,11 @@ cmd_ask() {
   local name="" message="" from="" from_set=0
   local reply_to_chat="" reply_to_msg=""
   local timeout=120 idle=5 poll=2 buf_lines=2000 allow_unfenced=0
+  # DIVE-3388 arm 2: how long to give the injected question to ECHO into the pane
+  # before declaring a delivery failure. A delivery that never lands buys nothing by
+  # waiting the full --timeout (measured: 180s waits, two of three were delivery
+  # failures), so this grace bounds it. 0 disables the fast-fail.
+  local deliver_grace=30
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -2092,6 +2237,7 @@ cmd_ask() {
       --allow-unfenced)   allow_unfenced=1 ;;
       --poll-secs=*)      poll="${1#--poll-secs=}" ;;
       --buffer-lines=*)   buf_lines="${1#--buffer-lines=}" ;;
+      --deliver-secs=*)   deliver_grace="${1#--deliver-secs=}" ;;
       --)                 shift; positional+=("$@"); break ;;
       -*)                 fail "$E_USAGE" "unknown flag: $1" ;;
       *)                  positional+=("$1") ;;
@@ -2102,7 +2248,7 @@ cmd_ask() {
     name="${positional[0]}"
     positional=("${positional[@]:1}")
   fi
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent ask <name> <text...> [--from=<sender>] [--reply-to-chat=<id> [--reply-to-msg=<id>]] [--timeout=120] [--idle-secs=5] [--poll-secs=2] [--allow-unfenced]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent ask <name> <text...> [--from=<sender>] [--reply-to-chat=<id> [--reply-to-msg=<id>]] [--timeout=120] [--idle-secs=5] [--poll-secs=2] [--deliver-secs=30] [--allow-unfenced]"
   # DIVE-1901: --allow-unfenced re-enables pane scraping, which is the path that
   # has fabricated every bad reply this ticket has caught. It exists for a seat
   # that genuinely cannot follow the reply-format instruction — never for a
@@ -2119,8 +2265,8 @@ cmd_ask() {
     message="${positional[*]}"
   fi
   [[ -n "$message" ]] || fail "$E_USAGE" "message is empty"
-  for n in "$timeout" "$idle" "$poll" "$buf_lines"; do
-    [[ "$n" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "timeout/idle/poll/buffer-lines must be positive integers"
+  for n in "$timeout" "$idle" "$poll" "$buf_lines" "$deliver_grace"; do
+    [[ "$n" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "timeout/idle/poll/buffer-lines/deliver-secs must be non-negative integers"
   done
   (( poll >= 1 )) || fail "$E_VALIDATION" "--poll-secs must be >= 1"
 
@@ -2292,6 +2438,10 @@ cmd_ask() {
   # Mirror the outbound into the sender's group chat (best-effort). Unprivileged
   # (runs as the caller), so it's safe on both paths.
   mirror_interagent_outbound "$name" "$message"
+  # DIVE-3573 (a): `ask` mirrors into buzz too. An a2a conversation that is only
+  # half visible in the room is worse than one that is not there at all — the
+  # answer would appear with no question above it.
+  _buzz_mirror_outbound "$name" "$message"
 
   local start now last_change reply="" prev_slice="" capture slice
   start=$(date +%s)
@@ -2350,6 +2500,19 @@ cmd_ask() {
     if [[ "$slice" != "$prev_slice" ]]; then
       last_change=$now
       prev_slice="$slice"
+    fi
+
+    # DIVE-3388 arm 2: FAST-FAIL a delivery failure instead of burning the full
+    # --timeout. On the DIRECT path the injected question echoes its `id=<msg_id>`
+    # marker into the pane the moment it lands; if the marker has not appeared by
+    # deliver_grace, the seat never received it and the rest of the wait buys
+    # nothing. Today this only surfaces as a bare timeout at the deadline (measured
+    # by lodar 2026-08-14: three 180s waits, two of them delivery failures). The
+    # SCOPED path is exempt: _capture returns only the post-marker reply window, so
+    # the question marker is not observable there. deliver_grace=0 disables this.
+    if (( ! use_scoped )) && (( deliver_grace > 0 )) && (( now - start >= deliver_grace )) \
+       && ! grep -qF "id=${msg_id}" "$acc_file" 2>/dev/null; then
+      fail "$E_TIMEOUT" "delivery failure: the injected question never appeared in agent '$name''s pane within ${deliver_grace}s (msg_id=${msg_id}) — the seat did not receive it, so waiting the full ${timeout}s would buy nothing. Check the agent is up and at an input prompt (5dive agent info ${name}), then retry. (--deliver-secs=0 disables this fast-fail)"
     fi
 
     if (( now - start >= timeout )); then
@@ -2474,6 +2637,46 @@ cmd_clone() {
   cmd_create "${args[@]}"
 }
 
+# DIVE-3594: the whole stall verdict, derived from a captured pane and nothing
+# else — pulled out of `cmd_stats` so it is gradeable without a box, a tmux
+# session or root. Prints the health JSON blob, or NOTHING when the pane gives
+# no honest verdict. "Nothing" is the important return: `cmd_stats` renders no
+# banner for it, and a banner is what a customer reads.
+stall_health_from_pane() {
+  local pane="$1" reset=""
+  [[ -n "$pane" ]] || return 0
+  if grep -qiE "session limit|usage limit|hit your (usage|session) limit|rate limit|/rate-limit-options" <<<"$pane"; then
+    reset=$(stall_reset_time "$pane")
+    [[ -n "$reset" ]] || return 0
+    jq -cn --arg d "$reset" '{cause:"rate_limited", detail:$d}'
+    return 0
+  fi
+  if grep -qiE "(sign ?in|log ?in|authenticate|re-?authenticate|enter your api key)" <<<"$pane"; then
+    jq -cn '{cause:"auth", detail:"sitting at a login screen — re-auth needed"}'
+  fi
+  return 0
+}
+
+# DIVE-3594: the reset time IS the rate-limit verdict's discriminator, not a
+# nice-to-have detail. The keyword alternation above matches furniture a
+# HEALTHY agent prints — a boot/restart pane listing `/rate-limit-options`
+# among its slash commands is the case lodar hit on /dashboard/agents — so a
+# keyword match with no parseable reset is a claim with its own evidence field
+# missing, and the old code filled that field with the literal string "no reset
+# time shown". Require a real clock, date or duration token in the matched
+# fragment:
+#   "resets at 9am" · "resets 3:00pm" · "resets in 2h 15m" · "resets 2026-08-18"
+# Anything else prints nothing and no health blob is emitted at all.
+# Deliberately conservative: a missed true rate-limit costs a banner the
+# operator can still see in the pane; a false one poisons every true banner.
+stall_reset_time() {
+  local pane="$1" frag=""
+  frag=$(grep -oiE "resets?[^|]*" <<<"$pane" | head -1 | tr -s ' ' | sed 's/[[:space:]]*$//') || frag=""
+  [[ -n "$frag" ]] || return 0
+  grep -qiE "[0-9]{1,2}:[0-9]{2}|[0-9]{1,2} ?[ap]m([^a-z]|$)|[0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]+ ?(s|m|h|d|sec|secs|second|seconds|min|mins|minute|minutes|hour|hours|day|days)([^a-z]|$)" <<<"$frag" || return 0
+  printf '%s' "$frag"
+}
+
 cmd_stats() {
   local name="" all=0 want_health=-1   # want_health: -1=unset (default by mode)
   while [[ $# -gt 0 ]]; do
@@ -2558,16 +2761,10 @@ cmd_stats() {
   # pane (e.g. not root). Only meaningful while active.
   local health="null"
   if (( want_health )) && [[ "$active" == "active" ]]; then
-    local pane
+    local pane blob
     pane=$(sudo -u "agent-${name}" tmux capture-pane -t "agent-${name}" -p -S -40 2>/dev/null | tail -c 4000 || true)
-    if [[ -n "$pane" ]]; then
-      if grep -qiE "session limit|usage limit|hit your (usage|session) limit|rate limit|/rate-limit-options" <<<"$pane"; then
-        local reset; reset=$(grep -oiE "resets?[^|]*" <<<"$pane" | head -1 | tr -s ' ' | sed 's/[[:space:]]*$//') || reset=""
-        health=$(jq -cn --arg d "${reset:-no reset time shown}" '{cause:"rate_limited", detail:$d}')
-      elif grep -qiE "(sign ?in|log ?in|authenticate|re-?authenticate|enter your api key)" <<<"$pane"; then
-        health=$(jq -cn '{cause:"auth", detail:"sitting at a login screen — re-auth needed"}')
-      fi
-    fi
+    blob=$(stall_health_from_pane "$pane")
+    if [[ -n "$blob" ]]; then health="$blob"; fi
   fi
 
   if (( JSON_MODE )); then

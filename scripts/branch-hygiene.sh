@@ -3,6 +3,13 @@
 #
 # This intentionally asks the GitHub API for PR merge state. Git ancestry is not
 # sufficient because this repository normally squash-merges pull requests.
+#
+# A second predicate (DIVE-3490, `superseded_identity`) reaches branches whose PR
+# was closed UNMERGED, on proof of content identity with the permanent
+# `refs/pull/N/head`. In --report it is the FOURTH ARM of the evidence classifier
+# (DIVE-2394), the one that discharges a finding. On the delete path it is
+# REPORT/DRY-RUN ONLY and deliberately not armed under --apply -- see the comment
+# on the function and at its call sites.
 
 set -euo pipefail
 
@@ -38,27 +45,110 @@ urlencode() {
   jq -rn --arg value "$1" '$value | @uri'
 }
 
+# DIVE-3490: a branch whose PR was closed UNMERGED can never become a delete
+# candidate below, because that predicate requires `merged_at != null`. Three
+# such branches sat on this repo, each with a maintainer comment naming the
+# replacement PR, each unreachable by the automation forever.
+#
+# The safe widening is NOT "closed as superseded". That is a human judgement
+# written on a PR, and a predicate keyed on it is really keyed on
+# `closed && !merged` -- which also matches abandoned-but-WANTED work. This is
+# CONTENT IDENTITY instead: the branch head must be byte-identical to
+# `refs/pull/N/head` for its own closed PR, and that ref must RESOLVE. GitHub
+# retains pull refs permanently, so a branch passing this test can only ever be
+# a commit GitHub is already preserving; restoring it is one
+# `git push origin <sha>:refs/heads/<name>` and needs no backup we maintain.
+# Safe by construction rather than by trusting a close reason (main, 2026-08-16).
+#
+# FAIL CLOSED, and this is the whole hazard: an unresolvable pull ref (network
+# blip, deleted PR, fork head) must be PRESERVE, never a mismatch-free pass.
+# All three negative states are named by the caller, because "unresolved" reads
+# exactly like "nothing to do" when it is silent.
+#
+# Echoes: <state>\t<pr_number>\t<pullref_sha>, state = match|mismatch|unresolved|none
+superseded_identity() {
+  local sha="$1" closed_prs="$2"
+  local pr_number pullref_sha rc=0
+
+  # Closed, unmerged, and its head is THIS exact sha. Latest such PR wins, so a
+  # recycled branch name resolves against its own PR rather than an older one.
+  pr_number=$(jq -r --arg sha "$sha" '
+    [.[] | select(.merged_at == null and .head.sha == $sha)]
+    | sort_by(.number) | last
+    | if . == null then empty else .number end
+  ' <<<"$closed_prs")
+
+  if [[ -z "$pr_number" ]]; then
+    printf 'none\t\t\n'
+    return 0
+  fi
+
+  pullref_sha=$("$GH_BIN" api "repos/$repo/git/ref/pull/$pr_number/head" \
+    --jq .object.sha 2>/dev/null) || rc=$?
+  if (( rc != 0 )) || [[ ! "$pullref_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    printf 'unresolved\t%s\t%s\n' "$pr_number" "${pullref_sha:-<none>}"
+    return 0
+  fi
+  if [[ "$pullref_sha" != "$sha" ]]; then
+    printf 'mismatch\t%s\t%s\n' "$pr_number" "$pullref_sha"
+    return 0
+  fi
+  printf 'match\t%s\t%s\n' "$pr_number" "$pullref_sha"
+}
+
+closed_prs_for() {
+  "$GH_BIN" api --method GET "repos/$repo/pulls" \
+    -f state=closed -f "head=$owner:$1" -f per_page=100
+}
+
 # --report is a read-only digest pass: it FLAGS (never deletes/labels/closes)
-# unmerged PRs older than STALE_PR_DAYS and branches with no commit activity for
-# DEAD_BRANCH_DAYS, emitting Markdown on stdout for the weekly workflow to append
-# to its run summary. Kept separate from the delete path so hygiene-flagging is
-# never coupled to branch deletion (DIVE-1833, scope-2 of DIVE-1830).
+# unmerged PRs older than STALE_PR_DAYS, and classifies every other branch BY
+# EVIDENCE that its work landed. Markdown on stdout for the weekly workflow to
+# append to its run summary. Kept separate from the delete path so
+# hygiene-flagging is never coupled to branch deletion (DIVE-1833, scope-2 of
+# DIVE-1830).
+#
+# Age is the right axis for an OPEN PR — that section is about attention. It is
+# the WRONG axis for a branch, and DIVE-2394 replaced it there; see the block
+# above the classifier below for the measurement that forced it.
 report_stale() {
   local pr_days="${STALE_PR_DAYS:-3}"
-  local br_days="${DEAD_BRANCH_DAYS:-14}"
-  local now pr_cutoff br_cutoff default_branch
+  local now pr_cutoff default_branch
   now=$(date -u +%s)
   pr_cutoff=$((pr_days * 86400))
-  br_cutoff=$((br_days * 86400))
   default_branch=$("$GH_BIN" api "repos/$repo" --jq .default_branch)
 
+  local rtmp
+  rtmp=$(mktemp -d) || { echo "branch-hygiene: mktemp failed" >&2; return 1; }
+  # Expanded NOW, not at exit: $rtmp is function-local and would be unbound in the
+  # trap body under `set -u`, which turns a clean report into a rc=1.
+  # shellcheck disable=SC2064
+  trap "rm -rf -- '$rtmp'" EXIT
+
+  # THE LISTS THEMSELVES ARE EVIDENCE SOURCES, and a `done < <(gh …)` process
+  # substitution HIDES their exit status: an unreadable list silently becomes an
+  # EMPTY list, and every section below then prints "- none" — the all-clear this
+  # whole row exists to prevent, one level above the classifier. Measured
+  # (iteration 4): with the branch endpoint rate-limited, the digest printed
+  # `0 finding(s) … 0 orphan, 0 unknown` and exited 0. Fetch to a file, keep the
+  # rc, and make an unreadable list SAY so instead of reading as nothing-to-do.
+  local open_raw="$rtmp/open-prs" open_state=ok
+  if ! "$GH_BIN" api --paginate "repos/$repo/pulls?state=open&per_page=100" \
+    --jq '.[] | [.number, .head.ref, .created_at, .updated_at, .title] | @tsv' \
+    >"$open_raw" 2>/dev/null; then
+    open_state=unavailable
+    : >"$open_raw"
+  fi
+
   # Open PR heads are excluded from the dead-branch list: a branch with an open
-  # PR is already surfaced by the stale-PR section, so it is not "dead".
+  # PR is already surfaced by the stale-PR section, so it is not "dead". When the
+  # list could not be read, NOTHING is excluded — the branch is then judged on the
+  # evidence arms like any other, which over-reports rather than preserving.
   declare -A open_head=()
   open_head["$default_branch"]=1
-  while IFS= read -r ref; do
+  while IFS=$'\t' read -r _num ref _c _u _t; do
     [[ -n "$ref" ]] && open_head["$ref"]=1
-  done < <("$GH_BIN" api --paginate "repos/$repo/pulls?state=open&per_page=100" --jq '.[].head.ref')
+  done <"$open_raw"
 
   echo "### Branch hygiene digest"
   echo
@@ -71,37 +161,352 @@ report_stale() {
   while IFS=$'\t' read -r num ref created updated title; do
     [[ -n "$num" ]] || continue
     local created_epoch age_days
-    created_epoch=$(date -u -d "$created" +%s)
+    created_epoch=$(date -u -d "$created" +%s 2>/dev/null) || continue
     (( now - created_epoch >= pr_cutoff )) || continue
     age_days=$(( (now - created_epoch) / 86400 ))
     echo "- #${num} \`${ref}\` — ${age_days}d old (updated ${updated%%T*}) — ${title}"
     pr_flagged=$((pr_flagged + 1))
-  done < <("$GH_BIN" api --paginate "repos/$repo/pulls?state=open&per_page=100" \
-    --jq '.[] | [.number, .head.ref, .created_at, .updated_at, .title] | @tsv')
-  (( pr_flagged > 0 )) || echo "- none"
+  done <"$open_raw"
+  if [[ "$open_state" == unavailable ]]; then
+    echo "- **UNKNOWN — the open-PR list could not be read this run.** This section is empty"
+    echo "  because nothing was inspected, not because nothing was found. Re-run before acting"
+    echo "  on it, and note that no branch was excluded from the section below as open-PR either."
+  elif (( pr_flagged == 0 )); then
+    echo "- none"
+  fi
   echo
 
-  # Dead branches: no commit activity for the threshold, excluding the default
-  # branch and any branch with an open PR. Read-only; nothing is deleted here.
-  local br_flagged=0
-  echo "#### Branches with no activity >${br_days}d"
+  # BRANCHES ARE CLASSIFIED BY EVIDENCE, NEVER BY AGE (DIVE-2394; measured on
+  # DIVE-2389, 5dive-ai/5dive, 2026-07-30).
+  #
+  # An audit of 17 stale branches found FOUR whose work existed NOWHERE ELSE while
+  # every one of their tasks read `done` on the board — including a council fix
+  # graded PASS and never merged, and a guard whose absence was a live defect.
+  # Age separated none of them from the merged-and-tidy ones, and neither does
+  # ancestry: under squash-merge a landed branch is never an ancestor of the
+  # default branch, so `ahead_by` is non-zero for merged and unmerged alike
+  # (`dive-2072-hook-staleness` read ahead=5 with its PR merged). A digest sorted
+  # by age hands the reader the wrong axis, and the reflex answer to "dead branch,
+  # 40d" is delete. See community/wiki/a-stale-branch-pile-can-be-the-only-copy.md.
+  #
+  # Four arms, ANY ONE of which means this branch is NOT the only copy of its work
+  # (arms 1-3: it landed; arm 4: GitHub preserves this exact commit regardless):
+  #   1. merged-pr  — a closed PR whose head SHA equals the branch's current SHA.
+  #                   The same predicate the --apply path deletes on.
+  #   2. contained  — the branch is an ancestor of the default branch (compare
+  #                   status identical|behind). Rare under squash-merge; cheap to ask.
+  #   3. subject    — the branch's ident appears in a commit SUBJECT on the default
+  #                   branch. SUBJECT ONLY, and this is the whole trap: `git log
+  #                   --grep=<IDENT>` reads the WHOLE message and matches other
+  #                   commits CITING the defect — measured 9 hits for DIVE-2067
+  #                   while the guard itself was absent from main, all nine of them
+  #                   later guards' comments. The false positive gets STRONGER the
+  #                   more important the missing work was, because a good finding is
+  #                   cited more.
+  #   4. pull-ref   — the head is byte-identical to `refs/pull/N/head` of its own
+  #                   CLOSED-UNMERGED PR (DIVE-3490). Not a landing claim: the work
+  #                   never merged. GitHub retains pull refs permanently, so the
+  #                   commit survives the branch's deletion and this discharges the
+  #                   finding all the same. See `superseded_identity` above.
+  #
+  # None of the four -> FINDING. It may be the only copy. Report it; never delete it.
+  # Age is still printed, as a fact about the branch. It is not the classifier.
+  #
+  # THE FAILURE DIRECTION IS DELIBERATE, AND IT IS OWED PER ARM: a missing or
+  # truncated evidence source makes this section report MORE findings, never
+  # fewer. Nothing is ever attributed on the ABSENCE of a reading — and nothing
+  # is moved OUT of the findings section on one either, which is the half arm 2
+  # got wrong first (DIVE-2394 iteration 2). Every arm below therefore has a
+  # distinct "could not read this" state, its own counter, and its own footer:
+  # a run that could not see an evidence source must say which one.
+  local ident_prefixes="${BRANCH_HYGIENE_IDENT_PREFIXES:-DIVE|OSS|CNCL|INST|MOB|STEER|CX}"
+  local max_subject_pages="${BRANCH_HYGIENE_SUBJECT_PAGES:-20}"
+
+  # Pass 1 — inventory the branches this section judges, with last-commit dates.
+  # The oldest of those bounds the subject corpus below: work lands on the default
+  # branch AFTER the branch's last commit, never before it.
+  local inv="$rtmp/inventory" oldest="$now"
+  local raw="$rtmp/branches" inv_state=ok
+  if ! "$GH_BIN" api --paginate "repos/$repo/branches?per_page=100" \
+    --jq '.[] | [.name, .commit.sha] | @tsv' >"$raw" 2>/dev/null; then
+    inv_state=unavailable
+    : >"$raw"
+  fi
+  : >"$inv"
   while IFS=$'\t' read -r branch sha; do
     [[ -n "$branch" ]] || continue
     [[ -n "${open_head[$branch]:-}" ]] && continue
-    local commit_date commit_epoch age_days
-    commit_date=$("$GH_BIN" api "repos/$repo/commits/$sha" --jq .commit.committer.date 2>/dev/null || true)
-    [[ -n "$commit_date" ]] || continue
-    commit_epoch=$(date -u -d "$commit_date" +%s)
-    (( now - commit_epoch >= br_cutoff )) || continue
-    age_days=$(( (now - commit_epoch) / 86400 ))
-    echo "- \`${branch}\` — ${age_days}d since last commit (${commit_date%%T*})"
-    br_flagged=$((br_flagged + 1))
-  done < <("$GH_BIN" api --paginate "repos/$repo/branches?per_page=100" \
-    --jq '.[] | [.name, .commit.sha] | @tsv')
-  (( br_flagged > 0 )) || echo "- none"
+    # `|| commit_date=""` for the same reason as the compare arms below: an HTTP
+    # error body arrives on STDOUT with `--jq` unapplied, and `|| true` would
+    # hand that JSON to `date -d`, which fails and kills the whole digest under
+    # `set -e`. Empty is the designed path — the branch prints "age unreadable".
+    local commit_date commit_epoch
+    commit_date=$("$GH_BIN" api "repos/$repo/commits/$sha" --jq .commit.committer.date 2>/dev/null) || commit_date=""
+    if [[ -n "$commit_date" ]]; then
+      commit_epoch=$(date -u -d "$commit_date" +%s)
+      if (( commit_epoch < oldest )); then oldest="$commit_epoch"; fi
+    else
+      commit_epoch=0
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$branch" "$sha" "$commit_date" "$commit_epoch" >>"$inv"
+  done <"$raw"
+
+  # The subject corpus, fetched ONCE for the whole run and bounded by that date.
+  # Paged by hand rather than with --paginate so the cap is visible: a corpus that
+  # stops early must SAY so, because "the ident is not in here" then means "not in
+  # the part I read".
+  local subj="$rtmp/subjects" subj_state=ok since page=1 got
+  since=$(date -u -d "@$(( oldest - 86400 ))" +%Y-%m-%dT%H:%M:%SZ)
+  : >"$subj"
+  while (( page <= max_subject_pages )); do
+    if ! got=$("$GH_BIN" api \
+      "repos/$repo/commits?sha=$(urlencode "$default_branch")&since=$since&per_page=100&page=$page" \
+      --jq '.[] | .commit.message | split("\n")[0]' 2>/dev/null); then
+      subj_state=unavailable
+      break
+    fi
+    [[ -n "$got" ]] || break
+    printf '%s\n' "$got" >>"$subj"
+    if (( $(printf '%s\n' "$got" | wc -l) < 100 )); then break; fi
+    page=$((page + 1))
+  done
+  if [[ "$subj_state" == ok ]] && (( page > max_subject_pages )); then subj_state=truncated; fi
+
+  # Arm 2's evidence-availability probe. `gh api` exits non-zero for a 404 (no
+  # common ancestor, which is a FACT about the branch) and for a rate limit, a
+  # 5xx or a token-scope refusal (which is the absence of a reading) alike, so
+  # an empty compare status has two causes whose remedies are OPPOSITE: "by
+  # design, ignore this forever" and "this told you nothing, re-run it". Reading
+  # both as ORPHAN files the branch under "preserved, not stale, do not sweep"
+  # and drops it out of the findings section — measured on the DIVE-2394 report
+  # mock with both compare arms rate-limited: 2 findings became 0, and
+  # `dive-2067-verify-over-closed` (the branch from the DIVE-2389 audit that
+  # held a live defect fix existing nowhere else) landed in the preserved
+  # bucket. A digest reading "0 findings" is an all-clear.
+  #
+  # Discriminate by asking the SAME endpoint a question whose answer is known:
+  # <default>...<default> is `identical` whenever compare is readable at all.
+  # Asked LAZILY, only when a compare comes back empty, so a run with no orphan
+  # branch pays nothing. It is NOT one call per run in general: while compare is
+  # readable the probe is re-asked on every empty compare, so the cost is one
+  # call per orphan branch (today, one — `status`). Only the `unavailable`
+  # verdict is sticky, because that direction over-reports and because two
+  # branches in one digest must not be graded against different endpoint
+  # states.
+  #
+  # READ THE EXIT STATUS, NOT THE OUTPUT (iteration 4). `gh api` writes the HTTP
+  # ERROR BODY to STDOUT and does NOT apply `--jq` to it — measured against the
+  # live API: `--jq .status` on a 404 prints
+  # `{"message":"Not Found",...,"status":"404"}`, rc=1. So `|| true` captures a
+  # JSON blob, never the empty string, and `""` arms below become UNREACHABLE in
+  # production. `|| probe=""` is the fix at both call sites; here it survived by
+  # accident (an error body is also != `identical`), which is exactly why the
+  # class is swept rather than the one site that was caught.
+  local cmp_state=ok
+  compare_endpoint_readable() {
+    [[ "$cmp_state" == ok ]] || return 1
+    local probe
+    probe=$("$GH_BIN" api \
+      "repos/$repo/compare/$(urlencode "$default_branch")...$(urlencode "$default_branch")" \
+      --jq .status 2>/dev/null) || probe=""
+    [[ "$probe" == identical ]] && return 0
+    cmp_state=unavailable
+    return 1
+  }
+
+  # Pass 2 — classify. `cmp_unavail` is a per-run tally, NOT a fifth bucket: the
+  # buckets below must still sum to the branch count, so a branch whose arm-2
+  # read failed is counted where the arms that DID run actually placed it.
+  local br_findings=0 br_landed=0 br_orphan=0 br_unknown=0 br_pullref=0 cmp_unavail=0
+  local f_out="$rtmp/findings" l_out="$rtmp/landed" o_out="$rtmp/other"
+  : >"$f_out"; : >"$l_out"; : >"$o_out"
+
+  while IFS=$'\t' read -r branch sha commit_date commit_epoch; do
+    [[ -n "$branch" ]] || continue
+    local age_note="age unreadable"
+    if (( commit_epoch > 0 )); then
+      age_note="$(( (now - commit_epoch) / 86400 ))d since last commit (${commit_date%%T*})"
+    fi
+
+    # Fetched ONCE and reused by arms 1 and 4 -- they ask the same page of closed
+    # PRs for opposite halves of it (merged_at set / merged_at null). Both arms
+    # attribute only on a POSITIVE read: if this call fails, `closed_prs` is `[]`,
+    # neither arm fires, and the branch falls through toward FINDING. That
+    # sentence was only true once the rc is read — with `|| true` a failed call
+    # leaves gh's HTTP error BODY here (stdout, `--jq` unapplied), which is
+    # non-empty, so the `[]` fallback never fired and both arms ran their jq
+    # against an error object instead.
+    local closed_prs merged_pr
+    closed_prs=$(closed_prs_for "$branch" 2>/dev/null) || closed_prs=""
+    [[ -n "$closed_prs" ]] || closed_prs='[]'
+    merged_pr=$(jq -r --arg sha "$sha" '
+          [.[] | select(.merged_at != null and .head.sha == $sha)]
+          | sort_by(.merged_at) | last
+          | if . == null then "" else "#\(.number)" end' <<<"$closed_prs" 2>/dev/null || true)
+    if [[ -n "$merged_pr" ]]; then
+      echo "- \`${branch}\` — LANDED merged-pr ${merged_pr} — ${age_note}" >>"$l_out"
+      br_landed=$((br_landed + 1))
+      continue
+    fi
+
+    # Arm 2, and the orphan detector with it. `status` on this repo is an
+    # INTENTIONAL orphan with no common ancestor — the zero-human badge, written
+    # daily by `5dive proof publish` — and an ancestry-based sweep flags it every
+    # single week. Compare fails on it, which is the signal, not an error — but
+    # ONLY once `compare_endpoint_readable` has separated that failure from a
+    # compare nobody could read; see the probe above.
+    # `|| cmp_status=""`, NOT `|| true`: on any HTTP failure gh prints the error
+    # body on STDOUT with `--jq` unapplied, so `|| true` leaves JSON here, the
+    # `""` arm never fires, and the probe/tally/footer above are dead code in
+    # production while a stderr-failing mock keeps this file green.
+    local cmp_status
+    cmp_status=$("$GH_BIN" api \
+      "repos/$repo/compare/$(urlencode "$default_branch")...$(urlencode "$branch")" \
+      --jq .status 2>/dev/null) || cmp_status=""
+    case "$cmp_status" in
+      identical|behind)
+        echo "- \`${branch}\` — LANDED contained-in-\`${default_branch}\` — ${age_note}" >>"$l_out"
+        br_landed=$((br_landed + 1))
+        continue
+        ;;
+      "")
+        # Empty has two causes. Ask the probe which one this is, and never let
+        # them share a detail string: one says "ignore this forever", the other
+        # says "re-run, this run told you nothing".
+        if compare_endpoint_readable; then
+          echo "- \`${branch}\` — ORPHAN no-common-ancestor with \`${default_branch}\` (by design) — preserved, not stale, do not sweep — ${age_note}" >>"$o_out"
+          br_orphan=$((br_orphan + 1))
+          continue
+        fi
+        # Arm 2 did not RUN for this branch, so it says nothing about it — and an
+        # arm that said nothing must not be able to move a branch OUT of the
+        # findings section. Fall through to arm 3 and let the branch be
+        # classified on the arms that did run. `status` then reports as a
+        # no-ident FINDING instead of ORPHAN, which over-reports; that is the
+        # signed direction, and the footer says which arm was missing.
+        cmp_unavail=$((cmp_unavail + 1))
+        ;;
+    esac
+
+    # ARM 4 (DIVE-3490) — content identity with the branch's own closed-unmerged
+    # pull ref. It sits HERE, after the two cheap positive arms and BEFORE the
+    # ident/subject arm, for three reasons:
+    #   - arms 1 and 2 are strictly stronger claims (the work is on the default
+    #     branch); asking the pull ref for a branch they already discharged is a
+    #     wasted API call and a wrong label.
+    #   - it does not need an ident and does not read the subject corpus, so it
+    #     still discharges a branch whose name carries no ident and still works on
+    #     a run where arm 3's corpus is unavailable.
+    #   - it is the arm that discharges a FINDING, which is the only reason it
+    #     exists: without it, all three of this repo's closed-unmerged branches
+    #     read "may be the only copy" forever, and the reader learns to ignore
+    #     the section.
+    #
+    # The claim it makes is DIFFERENT from arms 1-3 and is labelled differently:
+    # the work did NOT land, GitHub is simply preserving this exact commit
+    # permanently, so deleting the branch destroys nothing. Same failure
+    # direction as the rest of the classifier: mismatch, unresolved and none all
+    # fall through to the arms below and end at FINDING. Nothing is discharged
+    # on the ABSENCE of a reading.
+    local ident_state ident_pr ident_pullref
+    IFS=$'\t' read -r ident_state ident_pr ident_pullref \
+      < <(superseded_identity "$sha" "$closed_prs")
+    if [[ "$ident_state" == match ]]; then
+      echo "- \`${branch}\` — PRESERVED pull-ref-identity #${ident_pr} — head is byte-identical to \`refs/pull/${ident_pr}/head\` of its own closed-unmerged PR, a ref GitHub retains permanently; the work did not land, but deleting this branch destroys nothing (restore: \`git push origin ${sha}:refs/heads/${branch}\`) — ${age_note}" >>"$l_out"
+      br_landed=$((br_landed + 1))
+      br_pullref=$((br_pullref + 1))
+      continue
+    fi
+
+    local ident
+    ident=$(grep -oiE "(${ident_prefixes})[-_]?[0-9]+" <<<"$branch" | head -1 \
+      | tr '[:lower:]' '[:upper:]' \
+      | sed -E "s/^(${ident_prefixes})[-_]?([0-9]+)\$/\\1-\\2/" || true)
+
+    if [[ -z "$ident" ]]; then
+      echo "- \`${branch}\` — **FINDING** no-ident — the name carries no task ident, so no attribution is possible from it at all; read its contents before any deletion — ${age_note}" >>"$f_out"
+      br_findings=$((br_findings + 1))
+      continue
+    fi
+
+    if [[ "$subj_state" == unavailable ]]; then
+      echo "- \`${branch}\` — UNKNOWN evidence-unavailable (${ident}) — the commit-subject corpus could not be read this run, so arm 3 did not run; NOT attributed — ${age_note}" >>"$o_out"
+      br_unknown=$((br_unknown + 1))
+      continue
+    fi
+
+    if grep -qiF -- "$ident" "$subj"; then
+      echo "- \`${branch}\` — LANDED subject-attribution ${ident} — ${age_note}" >>"$l_out"
+      br_landed=$((br_landed + 1))
+      continue
+    fi
+
+    echo "- \`${branch}\` — **FINDING** unattributed (${ident}) — no merged PR at this head, not contained in \`${default_branch}\`, and ${ident} appears in no commit SUBJECT there. This branch may be the only copy of its work — ${age_note}" >>"$f_out"
+    br_findings=$((br_findings + 1))
+  done <"$inv"
+
+  echo "#### Branches that may be the only copy (evidence, not age)"
+  if [[ "$inv_state" == unavailable ]]; then
+    # The one state where "0 findings" would be a LIE rather than an all-clear:
+    # no branch was judged at all. Say it here, where the reader looks, and again
+    # in the tally line below.
+    echo "- **UNKNOWN — the branch list itself could not be read this run.** Nothing was"
+    echo "  inspected, so nothing could be found; this is NOT an all-clear. Re-run before"
+    echo "  acting on this digest."
+  elif (( br_findings > 0 )); then
+    cat "$f_out"
+    echo
+    echo "Rescue BEFORE any deletion. Zero byte cost when the objects are already in the canonical store, and the ref survives branch deletion permanently:"
+    echo
+    echo '```'
+    echo "git push https://github.com/${repo}.git refs/remotes/origin/<branch>:refs/rescued/<branch>"
+    echo '```'
+  else
+    echo "- none"
+  fi
   echo
 
-  echo "_Flagged ${pr_flagged} stale PR(s) and ${br_flagged} dead branch(es). This is a report only; nothing was deleted, labelled, or closed._"
+  # Not "work landed" alone any more: arm 4 puts branches here whose work did NOT
+  # land but whose exact head GitHub preserves. Both mean the same thing to the
+  # reader -- this branch is not the only copy -- and each line says which it is.
+  echo "#### Branches that are not the only copy (landed, or preserved by GitHub)"
+  if (( br_landed > 0 )); then cat "$l_out"; else echo "- none"; fi
+  echo
+
+  if (( br_orphan > 0 || br_unknown > 0 )); then
+    echo "#### Neither — preserved, and not counted as findings"
+    cat "$o_out"
+    echo
+  fi
+
+  if [[ "$cmp_state" == unavailable ]]; then
+    echo "_The \`compare\` endpoint could not be read this run: arm 2 did not run for ${cmp_unavail} branch(es), and no branch was attributed OR filed as an orphan on its absence. A branch with no common ancestor is indistinguishable from an unreadable compare while this is true, so \`${default_branch}\`-orphans such as an intentional badge branch report as findings here. Re-run before acting on this section._"
+    echo
+  fi
+
+  case "$subj_state" in
+    truncated)
+      echo "_Commit-subject corpus stopped at the ${max_subject_pages}-page cap (since ${since}); an attribution past that point was not seen, so this run over-reports findings rather than under-reporting them._"
+      echo
+      ;;
+    unavailable)
+      echo "_The commit-subject corpus could not be read this run. Arm 3 did not run, and nothing was attributed on its absence._"
+      echo
+      ;;
+  esac
+
+  if [[ -n "${DEAD_BRANCH_DAYS:-}" ]]; then
+    echo "_DEAD_BRANCH_DAYS=${DEAD_BRANCH_DAYS} was set and is NOT read: branch age stopped being a classifier in DIVE-2394. It is printed per branch as a fact, nothing more._"
+    echo
+  fi
+
+  # A count is only an all-clear if the thing being counted was READ. When a list
+  # could not be fetched the tally says UNREAD rather than zero, because "0
+  # finding(s)" is the exact sentence a reader acts on.
+  local unread=""
+  [[ "$inv_state" == unavailable ]] && unread=" **The branch list was UNREAD this run, so these branch counts are not a finding of zero.**"
+  [[ "$open_state" == unavailable ]] && unread="${unread} **The open-PR list was UNREAD this run.**"
+  echo "_Flagged ${pr_flagged} stale PR(s). Branches: ${br_findings} finding(s), ${br_landed} not the only copy (${br_pullref} of those preserved by pull ref, not landed), ${br_orphan} orphan, ${br_unknown} unknown.${unread} This is a report only; nothing was deleted, labelled, or closed._"
 }
 
 if [[ "$mode" == "report" ]]; then
@@ -145,8 +550,7 @@ while IFS=$'\t' read -r branch sha protected; do
 
   # Requiring the PR head SHA to equal the branch's current SHA prevents an old
   # merged PR from deleting a later branch that reused the same name.
-  closed_prs=$("$GH_BIN" api --method GET "repos/$repo/pulls" \
-    -f state=closed -f "head=$owner:$branch" -f per_page=100)
+  closed_prs=$(closed_prs_for "$branch")
   merge_row=$(jq -r --arg sha "$sha" '
     [.[] | select(.merged_at != null and .head.sha == $sha)]
     | sort_by(.merged_at) | last
@@ -154,8 +558,38 @@ while IFS=$'\t' read -r branch sha protected; do
   ' <<<"$closed_prs")
 
   if [[ -z "$merge_row" ]]; then
-    echo "PRESERVE no-exact-merged-pr branch=$branch sha=$sha"
-    ((skipped_count += 1))
+    # No merged PR at this head. Before preserving, ask the identity predicate
+    # (DIVE-3490) -- but NEVER under --apply. The weekly schedule runs --apply
+    # unattended (branch-hygiene.yml: `if: github.event_name == 'schedule'`),
+    # and this predicate's authorisation was explicitly conditioned on its first
+    # live output being a list a human reads. Arming it therefore needs a
+    # deliberate change to that workflow, not a merge of this file.
+    ident_state=""
+    IFS=$'\t' read -r ident_state ident_pr ident_pullref \
+      < <(superseded_identity "$sha" "$closed_prs")
+    case "$ident_state" in
+      match)
+        if [[ "$mode" == "apply" ]]; then
+          echo "PRESERVE superseded-identity-not-armed branch=$branch sha=$sha pr=#$ident_pr"
+          ((skipped_count += 1))
+        else
+          echo "DELETE-CANDIDATE branch=$branch sha=$sha pr=#$ident_pr via=pullref-identity pullref=$ident_pullref"
+          ((candidate_count += 1))
+        fi
+        ;;
+      mismatch)
+        echo "PRESERVE superseded-identity-mismatch branch=$branch sha=$sha pr=#$ident_pr pullref=$ident_pullref"
+        ((skipped_count += 1))
+        ;;
+      unresolved)
+        echo "PRESERVE superseded-identity-unresolved branch=$branch sha=$sha pr=#$ident_pr"
+        ((skipped_count += 1))
+        ;;
+      *)
+        echo "PRESERVE no-exact-merged-pr branch=$branch sha=$sha"
+        ((skipped_count += 1))
+        ;;
+    esac
     continue
   fi
 

@@ -74,6 +74,22 @@ export -f 5dive 2>/dev/null || true
 route_reset() { : >"$ROUTE_FILE"; }
 route_sent()  { local i; for i in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$ROUTE_FILE" ]] && break; sleep 0.05; done; grep -c . "$ROUTE_FILE" 2>/dev/null || echo 0; }
 route_last()  { tail -n1 "$ROUTE_FILE" 2>/dev/null; }
+# DIVE-3474 changed HOW a routed gate reaches the lead, not WHETHER it does: a
+# non-urgent routed gate is QUEUED (no `agent send`, no window re-send) and the
+# lead meets it on its next natural wake. The arms below assert the gate reached
+# `main`, and that property is unchanged — so the check gains the queue as a
+# second way of being reached rather than being relaxed. It calls the REAL queue
+# predicate (`_task_agent_gate_pred`, the one `5dive task queue` and the heartbeat
+# nudge both use), so a row queued where nobody looks still fails here. The
+# NEGATIVE arms below gain the same term for the opposite reason: with the send
+# rail silent, `! -s "$ROUTE_FILE"` alone would now pass vacuously.
+queued_for() { # <ident> <agent> -> 1 if `5dive task queue --for=<agent>` would list it
+  local n; n=$(db "SELECT COUNT(*) FROM tasks WHERE ident='$1' AND $(_task_agent_gate_pred "$2");" 2>/dev/null)
+  [[ "${n:-0}" != "0" ]] && echo 1 || echo 0
+}
+reached() { # <ident> <agent> -> 1 if sent to <agent> OR queued for <agent>
+  [[ "$(route_last)" == "$2" || "$(queued_for "$1" "$2")" == "1" ]] && echo 1 || echo 0
+}
 
 # Org chart: main is the lone root (coordinator); dev reports to main.
 db "INSERT INTO agents_org(name,reports_to,role) VALUES('main',NULL,'coordinator');"
@@ -99,7 +115,7 @@ seed DIVE-2; HUMAN_PINGED=0; route_reset
 actor_seam_as dev; cmd_task_need DIVE-2 --type=decision --ask="ship A or B?" --options="A|B" --recommend="A" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "0" ]] && ok_t "route on: builder decision does NOT ping human" || bad_t "route suppresses human" "HUMAN_PINGED=$HUMAN_PINGED"
 [[ "$(statusof DIVE-2)" == "blocked" && "$(answered DIVE-2)" == "open" ]] && ok_t "routed gate stays blocked+open for lead" || bad_t "routed gate blocked+open" "status=$(statusof DIVE-2) ans=$(answered DIVE-2)"
-R2=$(route_sent); [[ "$R2" == "1" && "$(route_last)" == "main" ]] && ok_t "routed send hit lead (main), stubbed — no live network" || bad_t "routed send → main via stub" "sent=$R2 last='$(route_last)'"
+[[ "$(reached DIVE-2 main)" == "1" ]] && ok_t "routed decision reached lead (main) — sent, or queued for its next wake" || bad_t "routed decision → main" "sent=$(route_sent) last='$(route_last)' queued=$(queued_for DIVE-2 main)"
 
 # --- pref ON: gate filed BY the lead escalates to human ----------------------
 seed DIVE-3; HUMAN_PINGED=0
@@ -115,7 +131,7 @@ actor_seam_as dev; cmd_task_need DIVE-4 --type=approval --ask="approve the prod 
 [[ "$HUMAN_PINGED" == "0" ]] && ok_t "route on: builder approval does NOT ping human (DIVE-1182)" || bad_t "approval routed not human" "HUMAN_PINGED=$HUMAN_PINGED"
 [[ "$(statusof DIVE-4)" == "blocked" && "$(answered DIVE-4)" == "open" ]] && ok_t "routed approval stays blocked+open for lead" || bad_t "routed approval blocked+open" "status=$(statusof DIVE-4) ans=$(answered DIVE-4)"
 [[ "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-4';")" == "main" ]] && ok_t "routed approval persists routed_reviewer=main" || bad_t "routed_reviewer=main" "got '$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-4';")'"
-R4=$(route_sent); [[ "$R4" == "1" && "$(route_last)" == "main" ]] && ok_t "routed approval send hit lead (main)" || bad_t "approval send → main" "sent=$R4 last='$(route_last)'"
+[[ "$(reached DIVE-4 main)" == "1" ]] && ok_t "routed approval reached lead (main) — sent, or queued for its next wake" || bad_t "routed approval → main" "sent=$(route_sent) last='$(route_last)' queued=$(queued_for DIVE-4 main)"
 
 # --- DIVE-1182: the designated lead can CLEAR a routed approval gate ----------
 # cmd_task_answer's approval human-only floor grants agent-<routed_reviewer> an
@@ -303,7 +319,7 @@ actor_seam_as dev; cmd_task_need DIVE-46 --type=approval --ask="approve the publ
 seed DIVE-5; HUMAN_PINGED=0; route_reset
 actor_seam_as dev; cmd_task_need DIVE-5 --type=decision --ask="approve the \$5000 ad spend budget?" --options="yes|no" --recommend="no" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "route on: T2-floored decision (money) → human" || bad_t "T2 floor → human" "HUMAN_PINGED=$HUMAN_PINGED"
-[[ ! -s "$ROUTE_FILE" ]] && ok_t "T2-floored decision: no lead route fired" || bad_t "T2 floor no route" "sent=$(route_last)"
+[[ ! -s "$ROUTE_FILE" && "$(queued_for DIVE-5 main)" == "0" ]] && ok_t "T2-floored decision: no lead route fired AND not queued for the lead" || bad_t "T2 floor no route" "sent=$(route_last) queued=$(queued_for DIVE-5 main)"
 
 # --- pref ON: EXPLICIT --tier=2 decision (no floor keyword) is NOT routed ----
 # Guards the hard-human contract: 2 = never auto-applies, always pings. Before
@@ -311,7 +327,7 @@ actor_seam_as dev; cmd_task_need DIVE-5 --type=decision --ask="approve the \$500
 seed DIVE-6; HUMAN_PINGED=0; route_reset
 actor_seam_as dev; cmd_task_need DIVE-6 --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --ask="pick the launch date?" --options="mon|tue" --recommend="mon" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "route on: explicit --tier=2 decision → human (not routed)" || bad_t "explicit T2 decision → human" "HUMAN_PINGED=$HUMAN_PINGED"
-[[ ! -s "$ROUTE_FILE" ]] && ok_t "explicit --tier=2 decision: no lead route fired" || bad_t "explicit T2 no route" "sent=$(route_last)"
+[[ ! -s "$ROUTE_FILE" && "$(queued_for DIVE-6 main)" == "0" ]] && ok_t "explicit --tier=2 decision: no lead route fired AND not queued for the lead" || bad_t "explicit T2 no route" "sent=$(route_last) queued=$(queued_for DIVE-6 main)"
 
 # --- DIVE-1145 (iter-4): the `task routing` toggle sets/reads the pref --------
 # Subshell each call so a `fail` (usage) exit can't abort the harness; the pref

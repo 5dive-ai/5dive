@@ -136,6 +136,24 @@ JSON
     # The stub is the whole point: it stages NO plugin cache dir, so the gate
     # must refuse — exactly what a marketplace fetch failure looks like.
     install_channel_for_agent() { :; }
+    # DIVE-3450 gear 0: and BECAUSE the stub above guarantees the cache dir never
+    # appears, cmd_config's gate loop (src/cmd_agent_config.sh:399) is guaranteed
+    # to run to its full bound — 15 x `sleep 1`. That is 15.13s of this harness's
+    # 15.20s, and not one of the four assertions below runs during it; they all
+    # land AFTER the wait. A negative-path arm drives a timeout ON PURPOSE, so the
+    # bound stops being a worst case and becomes a fixed invoice paid on every CI
+    # run forever — the tell was this file's local:CI runtime ratio of 1.01 while
+    # every other harness in the tier's top 14 sat at 1.44-1.84 (compute scales
+    # with the machine, a sleep does not).
+    #
+    # Record the polls instead of serving them. The loop still runs its full 15
+    # iterations, still exits with the dir absent, and still refuses — every
+    # assertion below grades exactly the state it graded before. What is gone is
+    # only the dead air, and the count is now ASSERTED rather than merely endured,
+    # so a gate that stopped polling (or lost its bound) is caught here instead of
+    # being invisible. See
+    # community/wiki/a-test-that-stubs-out-what-it-waits-for-pays-the-full-timeout-every-run.md
+    sleep() { printf 'GATE_SLEEP\n'; }
     write_channel_secret() { :; }
     teardown_telegram_wiring() { :; }
     ensure_hermes_gateway() { :; }
@@ -170,6 +188,17 @@ JSON
     && ok_t "the refusal message tells the operator the change was rolled back" \
     || bad_t "the refusal message tells the operator the change was rolled back" \
              "got: $(grep FAILMSG "$RB_TMP/out" | head -1)"
+  # DIVE-3450 gear 0: the polls the stub above recorded instead of serving. Two
+  # things are graded that nothing graded while this was real wall-clock: the gate
+  # DOES absorb an in-flight stager rather than refusing on first look, and its
+  # wait is BOUNDED. Asserting a range, not the constant, so retuning the bound is
+  # not a test edit — an UNBOUNDED loop is the failure this catches, and it would
+  # previously have hung CI rather than failed it.
+  rb_polls=$(grep -c '^GATE_SLEEP$' "$RB_TMP/out")
+  (( rb_polls >= 1 && rb_polls <= 60 )) \
+    && ok_t "the staging gate polls for the cache dir and its wait is BOUNDED ($rb_polls polls)" \
+    || bad_t "the staging gate polls for the cache dir and its wait is BOUNDED" \
+             "$rb_polls polls — 0 means the gate refused without absorbing an in-flight stager; >60 means the bound is gone and CI pays it every run"
   # POSITIVE CONTROL on the harness itself: with a stub that DOES stage the
   # cache dir the same call must reach the restart, not the rollback. Without
   # this arm every assertion above would still pass against a cmd_config that
@@ -226,11 +255,21 @@ fi
 # --- 6. managed-settings reconcile allowlists buzz --------------------------
 # channelsEnabled gates inbound channel pings on a personal/self-hosted box; a
 # plugin absent from allowedChannelPlugins is installed, running, and ignored.
-if grep -qE '\{"plugin":"buzz","marketplace":"5dive-plugins"\}' "$AS"; then
-  ok_t "reconcile_managed_settings allowlists buzz@5dive-plugins"
+# DIVE-3537: the literal moved OUT of the fixer into one constant in header.sh
+# (the fixer and the doctor gate were two copies of it and drifted). Grade the
+# constant, which is what both now read.
+if grep -qE '\{"plugin":"buzz","marketplace":"5dive-plugins"\}' <<<"${FIVEDIVE_CHANNEL_PLUGINS_JSON:-}"; then
+  ok_t "FIVEDIVE_CHANNEL_PLUGINS_JSON allowlists buzz@5dive-plugins"
 else
-  bad_t "reconcile_managed_settings allowlists buzz@5dive-plugins" \
+  bad_t "FIVEDIVE_CHANNEL_PLUGINS_JSON allowlists buzz@5dive-plugins" \
         "existing boxes would never self-heal to allow the buzz channel"
+fi
+# ...and the fixer must actually READ that constant rather than carrying its own.
+if grep -q 'FIVEDIVE_CHANNEL_PLUGINS_JSON' "$AS"; then
+  ok_t "reconcile_managed_settings reads the shared constant"
+else
+  bad_t "reconcile_managed_settings reads the shared constant" \
+        "a second hand-kept list in $AS is exactly what drifted from the doctor gate"
 fi
 
 # Positive control on the reconcile jq itself: run it over a fixture that has
@@ -269,6 +308,298 @@ JSON
   rm -f "$FIX"
 else
   printf 'SKIP - reconcile jq arms (no jq on PATH)\n'
+fi
+
+# --- 7. THE SIXTH SITE: cmd_create actually INSTALLS the plugin (DIVE-3509) --
+# The header above said "adding a channel is FIVE edits". It is six, and the
+# sixth was missing for buzz from the day it shipped: `agent create
+# --channels=buzz` recorded the channel, launched claude with
+# `--channels plugin:buzz@5dive-plugins`, and NEVER FETCHED THE PLUGIN, because
+# cmd_create's per-channel case has no buzz arm. Measured on a fresh box
+# (sure-redwood, 2026-08-17): plugin cache held only dashboard/, no
+# config.json, no `buzz` binary — and the create printed OK.
+#
+# Sites 1-6 above all passed the whole time. That is the point of this arm: five
+# green wiring checks are exactly what a four-fifths-wired channel looks like.
+CC=$SRC/cmd_agent_create.sh
+if grep -qE 'install_channel_for_agent "\$type" buzz "\$name"' "$CC"; then
+  ok_t "cmd_create installs the buzz plugin (the sixth site)"
+else
+  bad_t "cmd_create installs the buzz plugin (the sixth site)" \
+        "no buzz arm in cmd_create's channel case in $CC — --channels=buzz would enable the channel and never fetch the plugin"
+fi
+# Negative control on the grep: the dashboard arm it is modelled on must be
+# found by the same pattern shape, or the assertion above is proving nothing
+# about how this file spells an install.
+grep -qE 'install_channel_for_agent "\$type" dashboard "\$name"' "$CC" \
+  && ok_t "CONTROL: the same pattern shape finds the dashboard arm" \
+  || bad_t "CONTROL: the same pattern shape finds the dashboard arm" \
+           "the pattern in the arm above cannot be trusted — it does not match a site known to exist"
+
+# --- 8. the create self-check has a REAL buzz predicate ---------------------
+# The same create printed `(ok: poller up …)` over a box with no buzz plugin at
+# all, because "poller up" reads the AGENT's systemd unit. A create-time check
+# that greens on the thing an operator would look at is worse than none.
+if grep -q 'buzz is UNCONFIGURED' "$CC"; then
+  ok_t "create self-check reports buzz UNCONFIGURED rather than 'poller up'"
+else
+  bad_t "create self-check reports buzz UNCONFIGURED rather than 'poller up'" \
+        "no buzz predicate in the self-check — a buzz create still self-reports healthy"
+fi
+
+# --- 9. the onboarding command exists and is BUNDLED ------------------------
+# A src/ file that build.sh does not concatenate is dead code that greps green.
+BZ=$SRC/cmd_agent_buzz.sh
+[[ -f "$BZ" ]] \
+  && ok_t "src/cmd_agent_buzz.sh exists" \
+  || bad_t "src/cmd_agent_buzz.sh exists" "the CLI half of buzz onboarding is missing"
+grep -qE '^\s*src/cmd_agent_buzz\.sh \\$' build.sh \
+  && ok_t "build.sh bundles src/cmd_agent_buzz.sh" \
+  || bad_t "build.sh bundles src/cmd_agent_buzz.sh" \
+           "the file is present but never concatenated — \`5dive agent buzz\` would be 'command not found' in the built bundle"
+grep -qE 'cmd_agent_buzz "\$@"' "$SRC/main.sh" \
+  && ok_t "main.sh dispatches \`agent buzz\`" \
+  || bad_t "main.sh dispatches \`agent buzz\`" "the verb is unreachable"
+
+# Behavioural arms on the enable path. No agent user, no network, no root: probe
+# the two refusals that must fire BEFORE anything is minted or written.
+if [[ -f "$BZ" ]]; then
+  # shellcheck source=/dev/null
+  source "$BZ" 2>/dev/null
+  out=$(cmd_agent_buzz enable 2>&1); rc=$?
+  [[ "$rc" != "0" && "$out" == *"usage: 5dive agent buzz enable"* ]] \
+    && ok_t "enable with no agent name refuses with usage" \
+    || bad_t "enable with no agent name refuses with usage" "rc=$rc out=$out"
+  out=$(cmd_agent_buzz frobnicate 2>&1); rc=$?
+  [[ "$rc" != "0" && "$out" == *"unknown buzz verb"* ]] \
+    && ok_t "an unknown buzz verb is refused by name" \
+    || bad_t "an unknown buzz verb is refused by name" "rc=$rc out=$out"
+  # The relay refusal is the load-bearing one: guessing a relay is how you get a
+  # channel that reports success and connects to nothing.
+  grep -q 'no relay chosen' "$BZ" \
+    && ok_t "enable refuses rather than guessing a relay URL" \
+    || bad_t "enable refuses rather than guessing a relay URL" \
+             "a defaulted relay reproduces the exact defect this row fixes"
+  # The key must be minted once, not on every run — a silent rotation reads to a
+  # paired handset as the agent having left the room.
+  grep -q 'rotate' "$BZ" && grep -q 'Reusing the existing buzz identity' "$BZ" \
+    && ok_t "enable reuses an existing identity unless --rotate-key" \
+    || bad_t "enable reuses an existing identity unless --rotate-key" \
+             "a re-run would rotate the key underneath a paired handset"
+  # 0600, owned by the agent: the private key is the agent's alone.
+  grep -q '0o600' "$BZ" \
+    && ok_t "the minted config is written 0600" \
+    || bad_t "the minted config is written 0600" "an agent's private key must not be group/world readable"
+
+  # The writer, RUN — not grepped. It is factored to take a runas user so this
+  # arm needs no agent user, no root and no relay: pass our own name, the sudo
+  # hop is skipped, and the file it produces is graded against the contract in
+  # plugins/buzz/server.ts (private_key must match /^[0-9a-f]{64}$/ or the plugin
+  # refuses to derive a pubkey and the channel is silently dead).
+  #
+  # DIVE-3565 — THIS ARM USED TO ENSHRINE THE DEFECT. It asserted
+  # `.channels == ["general","ops"]` and called that "the five-field contract",
+  # while server.ts:38 declares `channels: string[] // channel UUIDs to watch`
+  # and hands each entry to `buzz messages get --channel`. So the arm was green
+  # on a config the reader answers `invalid UUID: general` to, every tick,
+  # forever. The contract is SIX fields now and the split is the whole point:
+  # `.channel_names` carries what the operator typed, `.channels` carries only
+  # ids the relay confirmed — empty until `buzz join` resolves them, because an
+  # empty watch list is honest and a name in it is a lie.
+  if command -v python3 >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    TD=$(mktemp -d)
+    FAKE_KEY=$(printf 'a%.0s' {1..64})
+    _buzz_write_config "$(id -un)" "$TD/buzz" "https://relay.example.com" \
+      "$FAKE_KEY" "general, ops" 9000 /usr/local/bin/buzz >/dev/null 2>&1
+    W="$TD/buzz/config.json"
+    if [[ -f "$W" ]] && jq -e . "$W" >/dev/null 2>&1; then
+      ok_t "_buzz_write_config writes parseable JSON"
+      jq -e '.relay_url == "https://relay.example.com"
+             and (.private_key | test("^[0-9a-fA-F]{64}$"))
+             and .channel_names == ["general","ops"]
+             and .channels == []
+             and .poll_ms == 9000
+             and .buzz_path == "/usr/local/bin/buzz"' "$W" >/dev/null 2>&1 \
+        && ok_t "the written config matches the plugin's contract (names and ids are DIFFERENT fields)" \
+        || bad_t "the written config matches the plugin's contract (names and ids are DIFFERENT fields)" "got: $(cat "$W")"
+      # The mutation that put us here: a NAME in the field the poller reads.
+      jq -e '(.channels | map(select(. == "general" or . == "ops")) | length) == 0' "$W" >/dev/null 2>&1 \
+        && ok_t "no channel NAME ever lands in .channels (the field the poller reads as a UUID)" \
+        || bad_t "no channel NAME ever lands in .channels" \
+                 "server.ts polls each entry with \`messages get --channel\`; a name there is 'invalid UUID' on every tick, silently (DIVE-3565)"
+      # poll_ms must be a NUMBER: server.ts does Number(cfg.poll_ms) on the env
+      # path but reads the file value straight, so a quoted "9000" is a config
+      # the plugin loads and mis-schedules.
+      [[ "$(jq -r '.poll_ms | type' "$W")" == "number" ]] \
+        && ok_t "poll_ms is written as a number, not a string" \
+        || bad_t "poll_ms is written as a number, not a string" "type=$(jq -r '.poll_ms | type' "$W")"
+      [[ "$(stat -c '%a' "$W")" == "600" ]] \
+        && ok_t "the written config is mode 600 on disk" \
+        || bad_t "the written config is mode 600 on disk" "mode=$(stat -c '%a' "$W")"
+    else
+      bad_t "_buzz_write_config writes parseable JSON" "no readable config at $W"
+    fi
+    rm -rf "$TD"
+
+    # --- the key must never become an ARGV element (ops, DIVE-3509 push gate) --
+    # The first shape passed it as `env KEY=<hex> …`. /proc/<pid>/cmdline is
+    # world-readable (no hidepid on our boxes), so every other agent user could
+    # read a freshly minted private key for the width of the write; environ is
+    # 0400 and would have been fine, argv is not.
+    #
+    # Graded BEHAVIOURALLY, not by grep: shadow `env` with a stub that records
+    # the argv it was handed and then execs the real one, so this asserts what
+    # the process actually receives rather than what the source appears to say.
+    TD=$(mktemp -d)
+    mkdir -p "$TD/bin"
+    cat >"$TD/bin/env" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >>"$ARGV_LOG"
+exec /usr/bin/env "$@"
+STUB
+    chmod +x "$TD/bin/env"
+    SECRET=$(printf 'b%.0s' {1..64})
+    ARGV_LOG="$TD/argv.txt"; : >"$ARGV_LOG"
+    ( export ARGV_LOG PATH="$TD/bin:$PATH"
+      _buzz_write_config "$(id -un)" "$TD/buzz" "https://relay.example.com" \
+        "$SECRET" general 15000 buzz >/dev/null 2>&1 )
+    if [[ -s "$ARGV_LOG" ]]; then
+      ok_t "CONTROL: the argv-recording stub actually fired"
+      if grep -q "$SECRET" "$ARGV_LOG"; then
+        bad_t "the private key never appears in argv" \
+              "the minted key is a command-line argument — readable from /proc/<pid>/cmdline by every user on the box"
+      else
+        ok_t "the private key never appears in argv (it travels on stdin)"
+      fi
+      # And the key really did arrive: a leak-free call that also wrote nothing
+      # would pass the arm above for the wrong reason.
+      [[ "$(jq -r '.private_key' "$TD/buzz/config.json" 2>/dev/null)" == "$SECRET" ]] \
+        && ok_t "POSITIVE CONTROL: the key still reached the config via stdin" \
+        || bad_t "POSITIVE CONTROL: the key still reached the config via stdin" \
+                 "no-leak is trivially true if the write never happened"
+    else
+      bad_t "CONTROL: the argv-recording stub actually fired" \
+            "nothing recorded — the arm below would pass without observing anything"
+    fi
+    rm -rf "$TD"
+  else
+    printf 'SKIP - _buzz_write_config run arms (need python3 + jq)\n'
+  fi
+fi
+
+# --- 8. THE SEVENTH SITE: the GATE on the fixer (DIVE-3537) -----------------
+# Site 6 above proves reconcile_managed_settings MERGES buzz. It does not prove
+# the merge ever RUNS: `doctor --category=channels` decides that, and its check
+# was a second hand-typed literal asserting telegram+dashboard only. So on every
+# box provisioned before buzz shipped the check printed
+#   [ok] managed-settings: ... has channelsEnabled + telegram/dashboard@... allowlisted
+# the fixer was never called, and buzz was allowlisted on NO existing box —
+# every `agent config <name> set channels=…,buzz` produced an installed,
+# running, DEAF channel (measured on sure-redwood, 2026-08-17: the plugin's MCP
+# log printed "plugin buzz@5dive-plugins is not on your org's approved channels
+# list" while every 5dive-side surface read green).
+#
+# A self-heal whose gate cannot fire is the same as no self-heal, and it reports
+# [ok] either way. These arms grade the GATE and the FIXER against ONE constant,
+# so the next channel cannot repeat it.
+if command -v jq >/dev/null 2>&1; then
+  # shellcheck source=/dev/null
+  source "$AS" 2>/dev/null
+  MS=$(mktemp)
+
+  # 8a. THE REGRESSION ARM. This fixture is exactly a pre-buzz box: enabled, both
+  # older fork channels present, buzz absent. Before this fix the check read [ok].
+  cat >"$MS" <<'JSON'
+{"channelsEnabled":true,
+ "allowedChannelPlugins":[{"plugin":"telegram","marketplace":"5dive-plugins"},
+                          {"plugin":"dashboard","marketplace":"5dive-plugins"},
+                          {"plugin":"telegram","marketplace":"claude-plugins-official"}]}
+JSON
+  if managed_settings_channels_ok "$MS"; then
+    bad_t "gate REFUSES a pre-buzz allowlist (telegram+dashboard, no buzz)" \
+          "the gate reads [ok] on a box whose buzz channel is deaf — the fixer below it never runs"
+  else
+    ok_t "gate REFUSES a pre-buzz allowlist (telegram+dashboard, no buzz)"
+  fi
+  [[ "$(managed_settings_channels_missing "$MS")" == "buzz@5dive-plugins" ]] \
+    && ok_t "gate NAMES the missing channel (buzz@5dive-plugins)" \
+    || bad_t "gate NAMES the missing channel" "got '$(managed_settings_channels_missing "$MS")'"
+
+  # 8b. GATE AND FIXER AGREE — the property the two literals lost. Whatever the
+  # fixer writes must satisfy the gate; otherwise --fix loops or lies.
+  reconcile_managed_settings "$MS" >/dev/null 2>&1
+  if managed_settings_channels_ok "$MS"; then
+    ok_t "the fixer's own output satisfies the gate (one list, not two)"
+  else
+    bad_t "the fixer's own output satisfies the gate" \
+          "reconcile wrote $(jq -c '.allowedChannelPlugins' "$MS") and the gate still refuses it — the two lists have drifted again"
+  fi
+  [[ -z "$(managed_settings_channels_missing "$MS")" ]] \
+    && ok_t "nothing missing after the fixer ran" \
+    || bad_t "nothing missing after the fixer ran" "still missing: $(managed_settings_channels_missing "$MS")"
+
+  # 8c. NEGATIVE CONTROLS: the gate must not be a rubber stamp. It has to fail on
+  # channelsEnabled:false with a perfect list (the allowlist is inert without it),
+  # and on a complete-but-wrong marketplace.
+  jq '.channelsEnabled = false' "$MS" >"$MS.off" && mv "$MS.off" "$MS"
+  managed_settings_channels_ok "$MS" \
+    && bad_t "NEGATIVE: gate refuses channelsEnabled:false with a full list" \
+             "an allowlist is silently inert without channelsEnabled (CC 2.1.150+)" \
+    || ok_t "NEGATIVE: gate refuses channelsEnabled:false with a full list"
+  cat >"$MS" <<'JSON'
+{"channelsEnabled":true,
+ "allowedChannelPlugins":[{"plugin":"telegram","marketplace":"5dive-plugins"},
+                          {"plugin":"dashboard","marketplace":"5dive-plugins"},
+                          {"plugin":"buzz","marketplace":"claude-plugins-official"}]}
+JSON
+  managed_settings_channels_ok "$MS" \
+    && bad_t "NEGATIVE: gate refuses buzz on the WRONG marketplace" \
+             "buzz@claude-plugins-official is not our fork's plugin" \
+    || ok_t "NEGATIVE: gate refuses buzz on the WRONG marketplace"
+
+  # 8d. And it is not stuck refusing: a fully current file passes untouched.
+  jq '.allowedChannelPlugins[2].marketplace = "5dive-plugins"' "$MS" >"$MS.on" && mv "$MS.on" "$MS"
+  managed_settings_channels_ok "$MS" \
+    && ok_t "POSITIVE CONTROL: gate accepts a fully current file" \
+    || bad_t "POSITIVE CONTROL: gate accepts a fully current file" \
+             "every arm above would pass against a gate that always refuses"
+  rm -f "$MS"
+else
+  printf 'SKIP - managed-settings gate arms (no jq on PATH)\n'
+fi
+
+# 8e. The gate must not re-inline the list. This is the FORM the defect took —
+# a second literal in cmd_doctor.sh — so grep for the shape, not for buzz.
+if grep -nE 'marketplace *== *"5dive-plugins"' "$SRC/cmd_doctor.sh" >/dev/null 2>&1; then
+  bad_t "cmd_doctor.sh does not re-type the allowlist" \
+        "found a hand-written allowlist predicate in cmd_doctor.sh: $(grep -nE 'marketplace *== *"5dive-plugins"' "$SRC/cmd_doctor.sh" | head -2 | tr '\n' ' ') — it must call managed_settings_channels_ok"
+else
+  ok_t "cmd_doctor.sh does not re-type the allowlist (calls the shared gate)"
+fi
+if grep -q 'managed_settings_channels_ok' "$SRC/cmd_doctor.sh"; then
+  ok_t "cmd_doctor.sh calls managed_settings_channels_ok"
+else
+  bad_t "cmd_doctor.sh calls managed_settings_channels_ok" \
+        "the arm above passes trivially if the check was simply deleted"
+fi
+
+# 8f. install.sh is curl-piped and CANNOT source header.sh, so it keeps its own
+# copies: the first-install template and its own reconcile filter. That is two
+# more literals that can drift exactly the way these did — so diff them against
+# the one constant here rather than trusting a comment.
+if command -v jq >/dev/null 2>&1 && [[ -f install.sh ]]; then
+  while read -r want; do
+    p=${want%@*}; m=${want#*@}
+    n=$(grep -cE "\"plugin\": *\"$p\", *\"marketplace\": *\"$m\"|\"plugin\":\"$p\",\"marketplace\":\"$m\"" install.sh)
+    if [[ "${n:-0}" -ge 2 ]]; then
+      ok_t "install.sh lists $want in BOTH its template and its reconcile filter"
+    else
+      bad_t "install.sh lists $want in BOTH its template and its reconcile filter" \
+            "found $n occurrence(s); a fresh box (template) or a rerun (reconcile) would leave that channel deaf"
+    fi
+  done < <(jq -r '.[] | "\(.plugin)@\(.marketplace)"' <<<"$FIVEDIVE_CHANNEL_PLUGINS_JSON")
+else
+  printf 'SKIP - install.sh drift arms (no jq or no install.sh)\n'
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

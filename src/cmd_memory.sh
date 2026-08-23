@@ -59,6 +59,40 @@ _memory_usage() {
       Write-time dedup: `add` WARNS (never refuses) when the body overlaps an
       existing memory in the same store — silence it with --no-dedup.
 
+  5dive memory consolidate [--max-sessions=N] [--idle-min=M] [--max-chars=C]
+                           [--distiller=<cmd>] [--dry-run] [--force]
+      ASYNC transcript -> memory atoms (DIVE-726 phase 1). Distils your own
+      FINISHED session transcripts into durable atoms (facts, preferences,
+      constraints, events) written into your own store through the same
+      `memory add` path — so knowledge outlives a window nobody remembered to
+      compile. Built for cron, not for a live session:
+        --max-sessions  transcripts per pass (default 3) — bounds the cost
+        --idle-min      never touch a transcript written inside N minutes
+                        (default 30). This is what keeps it off the LIVE session.
+        --max-chars     excerpt cap per transcript (default 20000)
+        --distiller     command reading the excerpt on stdin, returning
+                        {"atoms":[...]} (default: headless `claude --print`;
+                        env FIVEDIVE_MEMORY_DISTILLER also sets it)
+        --dry-run       print the atoms, write nothing, leave the ledger alone
+        --force         re-distil a transcript the ledger already records
+      Idempotent: a ledger (.consolidated.tsv beside the store) records each
+      (session, byte count), and `add` refuses a slug that already exists — so a
+      re-run is a no-op even if the ledger is lost.
+      Writes to YOUR OWN store only. There is deliberately no --store: an
+      auto-extractor must not be able to publish to the shared wiki (DIVE-481
+      deny-default). Publishing stays a curated act.
+      SCHEDULED FOR YOU — you do not have to wire this up. The heartbeat tick
+      (the one root cron every box already has) runs ONE bounded pass per seat
+      every 6h, as that seat's own user. Off: MEMORY_CONSOLIDATE=off. Retune:
+      MEMORY_CONSOLIDATE_EVERY_MIN. Run it by hand any time; it is idempotent.
+      COST — it spends YOUR model quota, so the number is stated, not implied.
+      Measured 2026-08-20, default `claude --print` distiller, one ~300KB
+      transcript at --max-chars=20000: $0.244 cold-cache, $0.081 warm, ~35s,
+      ~2.5k output tokens. The scheduled cadence bounds that to <=4 calls per
+      seat per day, and a seat with no NEW finished transcript costs $0 (the
+      ledger short-circuits before the distiller is ever invoked). Lower it
+      further with --max-chars, or point --distiller at a cheaper model.
+
   5dive memory doctor [--roots=a,b] [--agent=<name>] [--code-root=<dir>] [--json]
       Hygiene pass over the memory store(s): index drift (MEMORY.md vs files on
       disk), dangling [[wiki-links]], stale source refs (file:line no longer in
@@ -840,12 +874,354 @@ _memory_doctor() {
 }
 
 # cmd_memory — dispatch for the `memory` subcommand tree.
+# ---- async transcript → atom consolidation (DIVE-3628, DIVE-726 phase 1) ----
+#
+# THE FAILURE THIS EXISTS FOR: a session window dies and everything it learned
+# dies with it, because "compile before you close" is a HABIT and habits are not
+# a mechanism. The motivating case is recorded in the wiki: the very discussion
+# that produced this row was itself lost to an uncompiled window
+# ([[tencentdb-agent-memory-vs-5dive-gap-analysis]]).
+#
+# SHAPE (their L0→L1→L3, ours): L0 is the raw jsonl transcript, already on disk
+# and untouched. L1 is a bounded EXCERPT of it. L3 is a durable markdown atom in
+# the agent's own store. The lift is idea-derived, not code-derived — no port.
+#
+# WHY IT IS ASYNC AND NOT A HOOK: a hook runs inside the dying session and pays
+# for itself in that session's context. This pass runs from cron, out of band,
+# against transcripts nobody is writing to — so the distillation cost never
+# lands on a live window, and a session that dies ABRUPTLY (the actual failure)
+# is still consolidated, because nothing is asked of it at death.
+#
+# SCOPE GUARDS HELD (DIVE-3628 body):
+#   - reuses the existing stores. No database, no vector index, no CodeGraph.
+#   - every write goes through _memory_add, so the secret tripwire, the dedup
+#     warning, the frontmatter shape and the MEMORY.md index line are the SAME
+#     ones a hand-compiled memory gets. There is no second write path to audit.
+#   - deny-default sharing (DIVE-481): consolidate has NO --store flag and can
+#     only ever write `mine`. Publishing to the shared wiki stays a deliberate,
+#     curated act. An auto-extractor that could publish fleet-wide is the one
+#     shape this must not have.
+#
+# The three things that make it safe to leave running unattended:
+#   1. It never reads the LIVE session. A transcript touched inside --idle-min
+#      is skipped. The pass itself runs in a session that is writing a
+#      transcript; without this it would distill its own thinking.
+#   2. It is idempotent. The ledger records (session, bytes); a re-run over an
+#      unchanged transcript does no work and writes nothing. Belt and braces:
+#      _memory_add refuses an existing slug without --force, so even a ledger
+#      loss cannot duplicate an atom — it re-derives the same slug and conflicts.
+#   3. It is bounded. --max-sessions per pass and --max-chars per transcript, so
+#      the cron cost is flat whatever the store or the backlog does.
+#
+# THE DISTILLER IS A SEAM (--distiller). Default is a headless `claude -p`. The
+# harness injects a stub, which is what makes the unit test genuinely offline
+# rather than offline-looking: the module under test sends no live message, not
+# merely the test file.
+
+_MEM_CONSOLIDATE_PROMPT='You are distilling one finished agent session transcript into durable memory atoms.
+
+Return ONLY a JSON object: {"atoms":[...]}. No prose, no code fence.
+
+Each atom: {"type","name","description","body","confidence"}
+  type        one of: reference | user | feedback | project
+                reference = a durable FACT about the system or the world
+                user      = a PREFERENCE or trait of the human you work for
+                feedback  = a CONSTRAINT or correction on how work should be done
+                project   = an EVENT or ongoing commitment not derivable from the repo
+  name        kebab-case slug, <= 64 chars, specific enough to be unique
+  description one line; this is what recall ranks on, so make it searchable
+  body        2-6 sentences, self-contained. For feedback and project, follow the
+              fact with a "**Why:**" line and a "**How to apply:**" line.
+  confidence  high | medium | low
+
+RULES
+- Only DURABLE and NON-OBVIOUS facts. Nothing the repo, the git history or the
+  task board already records. Nothing that only mattered inside this session.
+- Absent anything durable, return {"atoms":[]}. An empty answer is a correct
+  answer and is much better than filler.
+- Convert relative dates ("yesterday", "last week") to absolute ones.
+- Never include a token, key, password or credential value. Reference where a
+  secret LIVES, never what it is.
+- At most 5 atoms.'
+
+# _memory_consolidate_excerpt <jsonl> <max-chars>
+# L0 → L1: a bounded plain-text excerpt of one transcript. Tool payloads are the
+# bulk of a jsonl and almost never the durable part, so they collapse to a name;
+# what survives is what a person said and what the agent concluded.
+_memory_consolidate_excerpt() {
+  python3 - "$1" "$2" <<'PYEOF'
+import json, sys
+path, cap = sys.argv[1], int(sys.argv[2])
+out = []
+try:
+    fh = open(path, encoding="utf-8", errors="replace")
+except OSError:
+    sys.exit(0)
+with fh:
+    for line in fh:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("type") not in ("user", "assistant"):
+            continue
+        msg = rec.get("message") or {}
+        content = msg.get("content")
+        if isinstance(content, str):
+            parts = [content]
+        elif isinstance(content, list):
+            parts = []
+            for blk in content:
+                if not isinstance(blk, dict):
+                    continue
+                if blk.get("type") == "text":
+                    parts.append(blk.get("text", ""))
+                elif blk.get("type") == "tool_use":
+                    parts.append("[tool: %s]" % blk.get("name", "?"))
+                elif blk.get("type") == "tool_result":
+                    parts.append("[tool result]")
+        else:
+            continue
+        txt = "\n".join(p for p in parts if p and p.strip())
+        if not txt.strip():
+            continue
+        out.append("%s: %s" % (rec.get("type"), txt.strip()))
+text = "\n\n".join(out)
+# Over the cap, keep the HEAD and the TAIL. The opening carries what the session
+# was for and the close carries what it concluded; the middle is the tool churn.
+if len(text) > cap:
+    half = cap // 2
+    text = text[:half] + "\n\n[... transcript middle elided ...]\n\n" + text[-half:]
+sys.stdout.write(text)
+PYEOF
+}
+
+# _memory_consolidate_parse — validate the distiller's JSON, emit one
+# TSV row per ACCEPTED atom (type, name, description, confidence, body-b64).
+# Anything malformed is dropped with a warning on stderr rather than written: a
+# distiller is a model, so the parse layer is a validation boundary, not a
+# formality. base64 keeps a multi-line body inside one row.
+#
+# EXIT 3 = the distiller produced nothing parseable (crashed, was not logged in,
+# answered in prose). That is NOT the same event as a session with nothing
+# durable in it, and collapsing the two is the whole succeeding-in-appearance
+# trap: an unauthed `claude --print` prints "Not logged in" and EXITS 0, so a
+# fleet-wide auth lapse would read as "the sessions were quiet" forever. Measured
+# on this box 2026-08-20.
+_memory_consolidate_parse() {
+  # The payload arrives as a FILE, not on stdin: `python3 - <<PY` already spends
+  # stdin on the program text, so a parser that read sys.stdin would silently
+  # see the python source and drop every atom. It fails as "found nothing",
+  # which is exactly the shape a working pass over a quiet session has.
+  python3 - "$1" <<'PYEOF'
+import base64, json, re, sys
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read().strip()
+# Tolerate a fenced block or leading prose — cheaper than failing a whole pass.
+m = re.search(r'\{.*\}', raw, re.S)
+if not m:
+    sys.stderr.write("consolidate: distiller returned no JSON object\n")
+    sys.exit(3)
+try:
+    doc = json.loads(m.group(0))
+except ValueError as e:
+    sys.stderr.write("consolidate: distiller JSON did not parse (%s)\n" % e)
+    sys.exit(3)
+atoms = doc.get("atoms")
+if not isinstance(atoms, list):
+    sys.stderr.write("consolidate: distiller JSON has no atoms[] array\n")
+    sys.exit(3)
+TYPES = {"reference", "user", "feedback", "project"}
+CONF = {"high", "medium", "low"}
+for a in atoms[:5]:
+    if not isinstance(a, dict):
+        continue
+    t = str(a.get("type", "")).strip()
+    n = str(a.get("name", "")).strip()
+    d = " ".join(str(a.get("description", "")).split())
+    b = str(a.get("body", "")).strip()
+    c = str(a.get("confidence", "")).strip() or "medium"
+    if t not in TYPES:
+        sys.stderr.write("consolidate: dropped atom with bad type %r\n" % t); continue
+    if not re.match(r'^[a-z0-9][a-z0-9-]{0,63}$', n):
+        sys.stderr.write("consolidate: dropped atom with bad slug %r\n" % n); continue
+    if not d or not b:
+        sys.stderr.write("consolidate: dropped atom %r with empty description/body\n" % n); continue
+    if c not in CONF:
+        c = "medium"
+    print("\t".join([t, n, d, c, base64.b64encode(b.encode()).decode()]))
+PYEOF
+}
+
+_memory_consolidate() {
+  local max_sessions=3 idle_min=30 max_chars=20000 distiller="" dry=0 force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --max-sessions=*) max_sessions="${1#*=}" ;;
+      --idle-min=*)     idle_min="${1#*=}" ;;
+      --max-chars=*)    max_chars="${1#*=}" ;;
+      --distiller=*)    distiller="${1#*=}" ;;
+      --dry-run)        dry=1 ;;
+      --force)          force=1 ;;
+      -h|--help)        _memory_usage; return 0 ;;
+      *)                fail "$E_USAGE" "memory consolidate: unknown arg: $1" ;;
+    esac
+    shift
+  done
+  printf '%s' "$max_sessions" | grep -qE '^[0-9]+$' || fail "$E_VALIDATION" "--max-sessions must be a number"
+  printf '%s' "$idle_min"     | grep -qE '^[0-9]+$' || fail "$E_VALIDATION" "--idle-min must be a number (minutes)"
+  printf '%s' "$max_chars"    | grep -qE '^[0-9]+$' || fail "$E_VALIDATION" "--max-chars must be a number"
+  [ "$max_chars" -ge 500 ] || fail "$E_VALIDATION" "--max-chars below 500 leaves nothing to distill"
+
+  # Own store only. Same resolution rule as `memory add` so both verbs agree on
+  # which dir "mine" means; never invent a store the harness did not bootstrap.
+  local dir="" d
+  for d in "$HOME"/.claude/projects/*/memory; do
+    [ -d "$d" ] || continue
+    [ -z "$dir" ] && dir="$d"
+    [ -f "$d/MEMORY.md" ] && { dir="$d"; break; }
+  done
+  [ -n "$dir" ] || fail "$E_NOT_FOUND" "no memory store found under ~/.claude/projects/*/memory"
+
+  local ledger="$dir/.consolidated.tsv"
+  [ -f "$ledger" ] || : > "$ledger"
+
+  # Single-flight. Cron can fire a second pass while the first is still inside a
+  # distiller call; two passes over the same transcript would race the ledger and
+  # double-write. Non-blocking: the second pass declines rather than queues.
+  local lockf="$dir/.consolidate.lock"
+  # BRACES MATTER: `exec 201>f 2>/dev/null` is TWO permanent redirections, and the
+  # second one kills stderr for the whole rest of the pass — every tripwire
+  # refusal and dedup warning would vanish and the run would read as "found
+  # nothing". Grouping scopes the 2>/dev/null to the open attempt alone.
+  { exec 201>"$lockf"; } 2>/dev/null || true
+  if command -v flock >/dev/null 2>&1; then
+    flock -n 201 || fail "$E_CONFLICT" "another consolidate pass holds $lockf — declining rather than racing it"
+  fi
+
+  if [ -z "$distiller" ]; then
+    distiller="${FIVEDIVE_MEMORY_DISTILLER:-}"
+  fi
+  if [ -z "$distiller" ]; then
+    command -v claude >/dev/null 2>&1 || [ -x /home/claude/.local/bin/claude ] \
+      || fail "$E_NOT_FOUND" "no distiller: pass --distiller=<cmd> or install the claude CLI"
+    local _cl; _cl=$(command -v claude 2>/dev/null || echo /home/claude/.local/bin/claude)
+    distiller="$_cl --print"
+  fi
+
+  local considered=0 processed=0 written=0 refused=0 dupes=0 skipped_live=0 skipped_done=0
+  local distill_failed=0
+  local -a written_files=()
+  local now; now=$(date +%s)
+  local t
+  # Newest first: the most recent dead session is the one whose loss hurts most.
+  while IFS= read -r t; do
+    [ -f "$t" ] || continue
+    [ "$processed" -ge "$max_sessions" ] && break
+    considered=$((considered+1))
+    local sid; sid=$(basename "$t" .jsonl)
+    local mt; mt=$(stat -c %Y "$t" 2>/dev/null || echo 0)
+    local bytes; bytes=$(stat -c %s "$t" 2>/dev/null || echo 0)
+    # (1) never the live session — including the one this pass is running in.
+    if [ $(( (now - mt) / 60 )) -lt "$idle_min" ]; then
+      skipped_live=$((skipped_live+1)); continue
+    fi
+    # (2) idempotence — same session at the same byte count is already distilled.
+    if [ "$force" -ne 1 ] && grep -qF "$(printf '%s\t%s\t' "$sid" "$bytes")" "$ledger" 2>/dev/null; then
+      skipped_done=$((skipped_done+1)); continue
+    fi
+    local excerpt; excerpt=$(_memory_consolidate_excerpt "$t" "$max_chars") || excerpt=""
+    if [ -z "$(printf '%s' "$excerpt" | tr -d '[:space:]')" ]; then
+      skipped_done=$((skipped_done+1)); continue
+    fi
+    processed=$((processed+1))
+    local rawf; rawf=$(mktemp "${TMPDIR:-/tmp}/5dive-mem-distill.XXXXXX") || continue
+    printf '%s\n\n---- TRANSCRIPT ----\n%s\n' "$_MEM_CONSOLIDATE_PROMPT" "$excerpt" \
+      | eval "$distiller" > "$rawf" 2>/dev/null || :
+    # `x=$(cmd); rc=$?` ABORTS under the bundle's `set -euo pipefail` — errexit
+    # fires on the assignment before $? is ever read. The harness runs `set +e`
+    # (corpus convention) and so is structurally blind to this; measured against
+    # the built bundle 2026-08-20. `|| rc=$?` is the form that survives both.
+    local rows prc=0
+    rows=$(_memory_consolidate_parse "$rawf") || prc=$?
+    rm -f "$rawf"
+    if [ "$prc" -eq 3 ]; then
+      # No ledger row on a distiller failure. Stamping one would retire the
+      # transcript permanently on a transient auth blip — the backlog would be
+      # silently consumed by an outage and never re-tried.
+      distill_failed=$((distill_failed+1))
+      continue
+    fi
+    local n_written=0 n_refused=0 n_dupe=0
+    while IFS=$'\t' read -r a_type a_name a_desc a_conf a_body64; do
+      [ -n "${a_name:-}" ] || continue
+      local a_body; a_body=$(printf '%s' "$a_body64" | base64 -d 2>/dev/null) || continue
+      if [ "$dry" -eq 1 ]; then
+        echo "  would write: [$a_type] $a_name — $a_desc"
+        n_written=$((n_written+1)); continue
+      fi
+      # The ONE write path. No --store: consolidate cannot publish (DIVE-481).
+      local addout addrc=0
+      addout=$(printf '%s\n' "$a_body" | ( _memory_add \
+          --name="$a_name" --type="$a_type" --description="$a_desc" \
+          --confidence="$a_conf" \
+          --provenance="distilled from session $sid ($(date -u +%F))" \
+          --evidence="run:$sid" ) 2>&1) || addrc=$?
+      if [ "$addrc" -eq 0 ]; then
+        n_written=$((n_written+1))
+        written_files+=("$dir/${a_type}_$(printf '%s' "$a_name" | tr '-' '_').md")
+        echo "  ✓ [$a_type] $a_name"
+      elif printf '%s' "$addout" | grep -q 'already exists'; then
+        n_dupe=$((n_dupe+1))
+      else
+        # A refusal is a RESULT, not an error to swallow: the secret tripwire
+        # firing on a distilled atom is exactly the case we want counted and
+        # visible, and it must never look like "nothing was found".
+        n_refused=$((n_refused+1))
+        echo "  ✗ refused [$a_type] $a_name — $(printf '%s' "$addout" | tail -1)" >&2
+      fi
+    done <<< "$rows"
+    written=$((written+n_written)); refused=$((refused+n_refused)); dupes=$((dupes+n_dupe))
+    # Ledger last, and only on a real pass: a dry run must leave the backlog
+    # exactly as it found it, or the first real pass silently skips everything.
+    if [ "$dry" -eq 0 ]; then
+      printf '%s\t%s\t%s\t%s\t%s\n' "$sid" "$bytes" "$(date -u +%FT%TZ)" "$n_written" "$n_refused" >> "$ledger"
+    fi
+  done < <(ls -1t "$HOME"/.claude/projects/*/*.jsonl 2>/dev/null)
+
+  if (( JSON_MODE )); then
+    jq -nc --argjson considered "$considered" --argjson processed "$processed" \
+       --argjson written "$written" --argjson refused "$refused" --argjson dupes "$dupes" \
+       --argjson live "$skipped_live" --argjson done "$skipped_done" \
+       --argjson dfail "$distill_failed" \
+       --arg store "$dir" --arg ledger "$ledger" --argjson dry "$([ "$dry" -eq 1 ] && echo true || echo false)" \
+      '{ok:true, data:{store:$store, ledger:$ledger, dry_run:$dry, considered:$considered,
+        processed:$processed, atoms_written:$written, atoms_refused:$refused,
+        atoms_duplicate:$dupes, skipped_live:$live, skipped_consolidated:$done,
+        distiller_failed:$dfail}}'
+  else
+    echo "consolidate: $processed session(s) distilled → $written atom(s) into $dir"
+    echo "  skipped: $skipped_live live (touched < ${idle_min}m ago) · $skipped_done already consolidated · $dupes duplicate atom(s)"
+    # Trailing `[ x ] && echo` is the last command of the function under errexit
+    # when the test is false — it would return 1 and abort the caller. `|| :`.
+    [ "$refused" -gt 0 ] && echo "  refused: $refused atom(s) — see stderr (tripwire/validation)" >&2 || :
+    # Loud, and never folded into "0 atoms": a distiller that cannot answer is a
+    # different event from a session with nothing worth keeping.
+    [ "$distill_failed" -gt 0 ] && echo "  DISTILLER FAILED on $distill_failed session(s) — not ledgered, will retry next pass (is the CLI logged in?)" >&2 || :
+    [ "$dry" -eq 1 ] && echo "  (dry run — nothing written, ledger untouched)" || :
+  fi
+  return 0
+}
+
 cmd_memory() {
   local sub="${1:-}"; shift 2>/dev/null || true
   case "$sub" in
     search)      _memory_search "$@" ;;
     add|compile) _memory_add "$@" ;;
     doctor|hygiene) _memory_doctor "$@" ;;
+    consolidate|distill) _memory_consolidate "$@" ;;
     ""|-h|--help) _memory_usage ;;
     *)           _memory_usage; fail "$E_USAGE" "memory: unknown subcommand: $sub" ;;
   esac

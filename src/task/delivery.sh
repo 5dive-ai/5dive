@@ -5,6 +5,69 @@
 # Concatenated into the single-file bundle by build.sh, and sourced by
 # src/cmd_task.sh when the split tree is used (tests source src/cmd_task.sh).
 # Function definitions only — never execute this file directly.
+
+# DIVE-3496 (iteration 2) — THE DELIVERY-TIME TRIPWIRE. main2's original ask.
+#
+# WHAT IT BUYS. The merge gate reads the bound PR with the CLOSING seat's rail
+# selection, one verb later, in someone else's session, after the maker has moved
+# on. When that read comes back blind the gate cannot tell "cannot see" from "not
+# merged" — that ambiguity is correct and deliberate, it is what makes the gate
+# fail closed — but it means the VERIFIER pays the whole discovery cost, cold.
+# Measured: on DIVE-2192 main2 spent two failed closes, an
+# `/installation/repositories` enumeration, a `gh auth status` check and a wiki
+# compile to reach "I am permanently unable to close this row", then still needed
+# a round-trip to learn the designed exit existed
+# (community/wiki/a-grader-that-cannot-read-the-repo-cannot-close-the-row.md).
+# `task deliver --pr=` is the moment where that costs one read-only query instead.
+#
+# WHAT #673 CHANGED ABOUT ITS VALUE: less, but not zero. Now that `_gate_gh`
+# escalates to the credential-free rails, the population that trips this shrinks
+# to refs NO rail can see — a genuinely private third-party repo, a deleted PR, a
+# typo'd URL. Those still exist and still land on the verifier.
+#
+# IT ASSERTS READ REACH, NOT OWNERSHIP, and that is the easy thing to get wrong.
+# `_gate_our_owners`/`_gate_repo_slugs` is keyed on WHO OWNS the repo; `lodar/*`
+# is in that list and was unreadable from every verifier seat for months. The two
+# sets are unrelated and only the first predicts nothing about whether the close
+# will succeed. So the probe runs the gate's OWN resolution — `_gate_gh_token`,
+# then `_gate_gh` — against the ref that was just bound, and believes only that.
+#
+# WARN-ONLY, DELIBERATELY. A delivery must not be refused because GitHub was
+# briefly unreachable. That is the same fail-open/fail-closed question the gate
+# answers one verb later, and the gate is the right place to answer it: refusing
+# here would turn a transient network fault into a blocked handoff, on the one
+# verb whose entire job is to get finished work off the maker's desk. Every exit
+# from this function is 0.
+_task_deliver_reach_probe() {
+  local ident="$1" pr="$2"
+  # Escape hatch for harnesses and offline runs. Not a policy knob: the gate still
+  # does its own read at close, so silencing this cannot let anything through.
+  [[ "${FIVE_DELIVER_NO_REACH_PROBE:-0}" == "1" ]] && return 0
+  # The gate lives in gate_evidence.sh; in a tree where it was not sourced there
+  # is nothing to predict with, and guessing would be worse than staying quiet.
+  declare -F _gate_gh       >/dev/null 2>&1 || return 0
+  declare -F _gate_gh_token >/dev/null 2>&1 || return 0
+  local _tok=""
+  command -v gh >/dev/null 2>&1 && _tok=$(_gate_gh_token 2>/dev/null || printf '')
+  # THE SAME TRAP THIS ITERATION IS FIXING ONE LEVEL DOWN, so it is spelled out
+  # rather than avoided by luck: `_state=$(_gate_gh ...)` would run the gate in a
+  # SUBSHELL and the `_GATE_GH_LAST_ERR` it sets there would die with it, leaving
+  # the warning below with no reason attached. Capture through a file instead —
+  # the same technique the gate harnesses use, for the same reason.
+  local _state="" _probef
+  _probef="${TMPDIR:-/tmp}/.5dive-deliver-reach.$$"
+  _gate_gh "$_tok" 15 pr view "$pr" --json state -q '.state' >"$_probef" 2>/dev/null || true
+  _state="$(cat "$_probef" 2>/dev/null || printf '')"
+  rm -f "$_probef" 2>/dev/null || true
+  # A state — ANY state, including OPEN — means the credential can SEE the ref.
+  # This probe is not asking whether the PR merged; that is the gate's question at
+  # close and it would be wrong to answer it here, since a delivery is normally
+  # bound BEFORE the merge.
+  [[ -n "$_state" ]] && return 0
+  warn "$ident: the merge gate's own credential cannot READ the delivery ref you just bound (${pr}). The delivery stands — this is a warning, not a refusal — but at 'task done' this reads as an unresolved merge state, which is indistinguishable from 'not merged', and your verifier meets it cold.${_GATE_GH_LAST_ERR:+ Rail says: ${_GATE_GH_LAST_ERR}.} If it is still unreadable then, the designed exit is a proof that needs no GitHub: 5dive task verify ${ident} --cmd='git -C <repo> merge-base --is-ancestor <merge-sha> origin/main' (DIVE-3496)."
+  return 0
+}
+
 cmd_task_deliver() {
   tasks_db_init
   local task="" pr="" result="" want_result=0 result_src=""
@@ -76,6 +139,10 @@ cmd_task_deliver() {
   # demands, so recording it cannot weaken the gate — the stamp still only ever
   # equals an iteration at which a PR was actually named.
   db "UPDATE tasks SET delivery_ref=$(sqlq "$pr"), delivered_at=datetime('now'), delivery_ref_iteration=COALESCE(iteration,0) WHERE id=${id};"
+  # DIVE-3496 (iteration 2): the ref is now bound — assert the gate's credential
+  # can SEE it, here, rather than leaving the verifier to discover it at close.
+  # Runs AFTER the write on purpose: the delivery is not conditional on it.
+  _task_deliver_reach_probe "$ident" "$pr"
   local _vfier _asignee
   _vfier=$(db "SELECT COALESCE(verifier,'')  FROM tasks WHERE id=${id};")
   _asignee=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
@@ -316,6 +383,199 @@ cmd_task_merge_audit() {
      --arg n "$limit" --arg rp "$slugs" --arg f "$findings" --arg d "$deliv_n" --arg c "$cited_n" --arg u "$unver" --arg a "$amb" --arg r "$payload"
 }
 
+# `5dive task merge-unverified [--limit=N] [--since=<Nd|Nh>] [--json]` — DIVE-3526.
+#
+# THE STAMP HAD NO CONSUMER. DIVE-1935 taught the mandatory auto-detect gate to say
+# so when its repo scan could not complete: it warns, it writes a
+# `task.merge-gate-unverified` row to the audit log, and it lets the close proceed
+# (fail-open stays — DIVE-1830 refused fail-CLOSED for blast radius and that is
+# still the right refusal). All of that works and is firing: 196 stamped rows in
+# `agent-audit.log` on 2026-08-17, every recent one `reason=partial-repo-scan-7-of-11`.
+# The gap is one layer later — NOTHING EVER READ THEM BACK. DIVE-3300 closed
+# 2026-08-12 with exactly that stamp and nobody re-derived it for five days.
+# A record that is written and never read is a receipt, not a control.
+#
+# WHY `merge-audit` DOES NOT ALREADY COVER THIS, and it is not a limit you can raise.
+# That sweep is TEXT-DRIVEN: it pulls PR references out of a done row's own
+# delivery_ref/result/body and resolves them. The stamped population is precisely the
+# closes where the gate's own scan came up empty, and the auto-detect gate runs ONLY
+# when the row declared no binding at all — so the typical stamped row NAMES NO PR
+# ANYWHERE IN ITS TEXT and yields `merge-audit` exactly zero references to resolve.
+# DIVE-3300 is that shape: its result names a patch file and no pull request.
+# So this sweep is driven by the OTHER key — the ident the gate stamped — and
+# re-derives with the OTHER predicate: the gate's own open-PR-by-ident scan, run now.
+#
+# THE SCAN IS INVERTED ON PURPOSE. The gate asks one ident against every repo. Doing
+# that per stamped ident is repos x idents API calls (11 x 196 = 2156 here) and the
+# sweep would be unrunnable. Every ident asks the same question of the same repo, so
+# each repo's OPEN pull requests are listed ONCE and every ident is matched against
+# the result in memory: 11 calls, whatever the backlog. The MATCH is the gate's,
+# character for character — ident at word boundaries, case-insensitive, against
+# title and headRefName only, never the body (a "follow-up to DIVE-N" mention must
+# not raise a finding, DIVE-1835).
+#
+# AND IT REFUSES TO LAUNDER ITS OWN PARTIAL COVERAGE, which is the whole lesson of the
+# ticket it consumes. A repo whose listing fails is not a repo with no hits, and a
+# `--limit 200` page that comes back FULL may have more behind it. Either one makes a
+# quiet row `unconfirmed`, never `clean`, and the summary reports scanned-k-of-n. An
+# unreadable audit log is a hard failure, not "0 stamps found" — that inference is the
+# DIVE-1935 defect itself, rebuilt in the consumer.
+#
+# Read-only. It reports; it never reopens a row and never touches the gate.
+cmd_task_merge_unverified() {
+  tasks_db_init
+  local limit=500 since="" cutoff=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --limit=*) limit="${1#*=}"
+                 [[ "$limit" =~ ^[1-9][0-9]*$ ]] || fail "$E_VALIDATION" "--limit must be a positive integer" ;;
+      --since=*) since="${1#*=}"
+                 [[ "$since" =~ ^[1-9][0-9]*[dh]$ ]] || fail "$E_VALIDATION" "--since must look like 7d or 48h" ;;
+      --json)    JSON_MODE=1 ;;
+      -h|--help) printf 'usage: 5dive task merge-unverified [--limit=N] [--since=<Nd|Nh>] [--json]\n'; return 0 ;;
+      *)         fail "$E_USAGE" "unknown flag: $1" ;;
+    esac
+    shift
+  done
+  command -v jq >/dev/null 2>&1 || fail "$E_GENERIC" "task merge-unverified needs \`jq\` to read the audit log — install jq."
+  command -v gh >/dev/null 2>&1 || fail "$E_GENERIC" "task merge-unverified needs \`gh\` to re-derive PR state — install gh."
+
+  # The stamps live in the audit log, which is 640 root:claude. A caller who cannot
+  # READ it must not be told the backlog is empty: an unreadable log and a clean
+  # fleet are the same silence, and telling them apart is this verb's job.
+  local logf="${AUDIT_LOG:-/var/log/5dive/agent-audit.log}"
+  [[ -e "$logf" ]] || fail "$E_GENERIC" "task merge-unverified cannot find the audit log ($logf) — the stamps it consumes are written there; nothing was scanned. This is NOT an empty backlog."
+  [[ -r "$logf" ]] || fail "$E_GENERIC" "task merge-unverified cannot READ the audit log ($logf: $(stat -c '%A %U:%G' "$logf" 2>/dev/null || printf 'permissions unknown')) — it is 640 root:claude, so run this from a seat in group \`claude\`. An unreadable log reads exactly like a clean fleet; refusing rather than reporting 0 is the point."
+
+  if [[ -n "$since" ]]; then
+    local _n="${since%[dh]}" _u="${since: -1}"
+    cutoff=$(date -u -d "-${_n} ${_u/d/days}" +%Y-%m-%dT%H:%M:%S 2>/dev/null) || cutoff=""
+    [[ "$_u" == "h" ]] && cutoff=$(date -u -d "-${_n} hours" +%Y-%m-%dT%H:%M:%S 2>/dev/null)
+    [[ -n "$cutoff" ]] || fail "$E_GENERIC" "task merge-unverified could not compute a cutoff from --since=$since (\`date -u -d\` unusable on this host) — re-run without --since rather than reading an unfiltered sweep as a filtered one."
+  fi
+
+  # THE LOG IS NOT SLURPABLE AND THAT IS NOT A BUG TO FIX HERE. `agent-audit.log` is
+  # world-APPENDABLE by every seat on the box, so concurrent appends interleave and it
+  # carries occasional truncated lines: measured 2026-08-17, `jq -s` over the live
+  # 10 MB log exits 5 and yields NOTHING — one malformed line 9 MB back would take the
+  # whole sweep with it, and under `set -euo pipefail` it took the whole CLI run.
+  # So: grep the ~200 candidate lines out first (cheap, and it bounds the blast radius
+  # of a bad line to itself), parse them ONE AT A TIME, and COUNT what did not parse.
+  # A skipped line is a stamp this sweep did not consider and it is disclosed below —
+  # silently dropping it would be the same "empty is not an answer" defect one layer on.
+  local cand cand_n=0
+  cand=$(grep -F '"task.merge-gate-unverified"' "$logf" 2>/dev/null || true)
+  [[ -n "$cand" ]] && cand_n=$(printf '%s\n' "$cand" | grep -c . || true)
+
+  # ident<TAB>ts<TAB>reason<TAB>seat. The --since cutoff and the newest-wins dedupe are
+  # done in awk, not jq, so `parsed` below counts PARSE failures only and is not
+  # confounded by rows the filter legitimately dropped.
+  local jqout parsed_n=0
+  # `jq -R` + `fromjson?` is the whole point and NOT a style choice: without -R a single
+  # streaming jq parses the concatenated stream, so ONE truncated line ABORTS the parser
+  # and every stamp AFTER it is silently dropped — the sweep then prints "0 still carry an
+  # OPEN PR" and exits 0 while an open PR sits right there. With -R each line is read as a
+  # raw string and `fromjson?` turns a bad line into `empty`, containing it to itself.
+  jqout=$(printf '%s\n' "$cand" | jq -R -r '
+      fromjson? // empty
+      | select(.cmd == "task.merge-gate-unverified")
+      | [ (.args[0] // ""),
+          (.ts // ""),
+          ([ .args[] | select(startswith("reason=")) ] | first // "reason=unrecorded"),
+          (.user // "") ] | @tsv
+    ' 2>/dev/null || true)
+  [[ -n "$jqout" ]] && parsed_n=$(printf '%s\n' "$jqout" | grep -c . || true)
+  local unparsed=$(( cand_n - parsed_n )); (( unparsed < 0 )) && unparsed=0
+
+  local stamps
+  stamps=$(printf '%s\n' "$jqout" \
+    | awk -F'\t' -v cut="$cutoff" '$1 ~ /^DIVE-[0-9]+$/ && (cut == "" || $2 >= cut) { r[$1]=$0 }
+                                   END { for (k in r) print r[k] }' \
+    | sort -t$'\t' -k2,2r | head -n "$limit" || true)
+
+  local total_stamps=0
+  [[ -n "$stamps" ]] && total_stamps=$(printf '%s\n' "$stamps" | grep -c . || true)
+
+  local tok slugs; tok=$(_gate_gh_token); slugs=$(_gate_repo_slugs | paste -sd, -)
+  _gate_gh_reachable "$tok" || fail "$E_GENERIC" "task merge-unverified cannot reach GitHub — $(_gate_tok_why); machine-account rail not permitted on this seat. It would report every stamped close as quiet by asking nothing. Check \`5dive gh whoami\` and \`5dive task merge-gate-selftest\`, then re-run"
+
+  # ── one listing per repo, reused by every ident ──────────────────────────
+  local prs_f; prs_f=$(mktemp "${TMPDIR:-/tmp}/.5dive-mu-prs.XXXXXX")
+  local slug hits repos_total=0 repos_ok=0 unscanned="" capped=""
+  while IFS= read -r slug; do
+    [[ -n "$slug" ]] || continue
+    repos_total=$((repos_total+1))
+    if hits=$(_gate_gh "$tok" 20 pr list --repo "$slug" --state open --limit 200 \
+                --json number,headRefName,title \
+                -q '.[] | [(.number|tostring), (.title // ""), (.headRefName // "")] | @tsv' 2>/dev/null); then
+      repos_ok=$((repos_ok+1))
+      # A FULL page is not a complete answer. Say so rather than sweeping 201.
+      [[ $(printf '%s\n' "$hits" | grep -c .) -ge 200 ]] && capped="${capped:+$capped, }$slug"
+      while IFS= read -r line; do [[ -n "$line" ]] && printf '%s\t%s\n' "$slug" "$line" >>"$prs_f"; done <<<"$hits"
+    else
+      unscanned="${unscanned:+$unscanned, }$slug"
+    fi
+  done < <(_gate_repo_slugs)
+  local full_coverage=0
+  [[ $repos_ok -eq $repos_total && $repos_total -gt 0 && -z "$capped" ]] && full_coverage=1
+
+  local line tident tts treason tseat st verdict detail
+  local findings=0 clean=0 unconf=0 reopened=0 missing=0 json_rows=""
+  while IFS=$'\t' read -r tident tts treason tseat; do
+    [[ -n "$tident" ]] || continue
+    st=$(db "SELECT status FROM tasks WHERE ident='${tident}' LIMIT 1;")
+    detail=""
+    if [[ -z "$st" ]]; then
+      verdict="row-missing"; missing=$((missing+1))
+      detail="no such row in the task store"
+    elif [[ "$st" != "done" ]]; then
+      # The stamp recorded an unverified CLOSE. If the row is not closed now, that
+      # close was undone and there is nothing silent left to surface here.
+      verdict="reopened"; reopened=$((reopened+1)); detail="row is now '$st', not done"
+    else
+      # Neither the slug nor the PR number can contain "DIVE-<n>", so a whole-line
+      # match is the gate's title/headRefName predicate with no extra field surgery.
+      local hit h_slug h_num h_title
+      hit=$(grep -iE "(^|[^A-Za-z0-9])${tident}([^A-Za-z0-9]|$)" "$prs_f" 2>/dev/null | head -1 || true)
+      if [[ -n "$hit" ]]; then
+        IFS=$'\t' read -r h_slug h_num h_title _ <<<"$hit"
+        verdict="OPEN-PR"; findings=$((findings+1))
+        detail="$h_slug #$h_num still OPEN — \"$h_title\""
+      elif (( full_coverage )); then
+        verdict="clean"; clean=$((clean+1)); detail="no open PR names it in $repos_ok/$repos_total repos"
+      else
+        verdict="unconfirmed"; unconf=$((unconf+1))
+        detail="no open PR found, but only $repos_ok/$repos_total repos answered${capped:+ (page full in $capped)} — NOT clean"
+      fi
+    fi
+    json_rows+=$(jq -nc --arg t "$tident" --arg s "$tts" --arg r "${treason#reason=}" --arg u "$tseat" --arg v "$verdict" --arg d "$detail" \
+                   '{ident:$t,stampedAt:$s,reason:$r,seat:$u,verdict:$v,detail:$d}')$'\n'
+    [[ "${JSON_MODE:-0}" == "1" ]] || printf '%-12s %-20s %-11s %s\n' "$tident" "${tts%%+*}" "$verdict" "$detail"
+  done <<<"$stamps"
+  rm -f "$prs_f"
+
+  local payload; payload=$(printf '%s' "$json_rows" | jq -sc '.')
+  if [[ "${JSON_MODE:-0}" != "1" ]]; then
+    (( findings > 0 )) && printf 'note: `OPEN-PR` = this row CLOSED while the merge-gate could not check it, and an open\n      pull request naming the ident exists RIGHT NOW. Triage these: either land the PR,\n      close it as abandoned, or record on the row why the close was correct anyway.\n'
+    (( unconf > 0 )) && printf 'note: `unconfirmed` is NOT a clean row. %s of %s repos answered%s, so "no open PR" is a\n      statement about the repos that answered, never about the ones that did not\n      (DIVE-1935/1955). Re-run from a seat whose token reads them all.\n' "$repos_ok" "$repos_total" "${capped:+, and the 200-PR page was full in $capped}"
+    [[ -n "$unscanned" ]] && warn "repos that did NOT answer: $unscanned"
+    (( unparsed > 0 )) && warn "$unparsed stamp line(s) in $logf did not parse and were NOT swept — the log is world-appendable and interleaves; those closes are unexamined, not clean."
+  fi
+  ok "merge-unverified: $total_stamps stamped close(s) re-derived across $repos_ok/$repos_total repos — $findings still carry an OPEN PR ($clean clean, $unconf unconfirmed, $reopened reopened, $missing row-missing${unparsed:+; $unparsed unparseable log line(s) skipped})" \
+     '{stamps:($n|tonumber), repos:($rp|split(",")), reposScanned:($ro|tonumber), reposTotal:($rt|tonumber), fullCoverage:($fc=="1"), unscanned:($us|split(", ")|map(select(.!=""))), pageCapped:($cp|split(", ")|map(select(.!=""))), findings:($f|tonumber), clean:($c|tonumber), unconfirmed:($u|tonumber), reopened:($re|tonumber), rowMissing:($m|tonumber), unparsedLogLines:($ul|tonumber), rows:($r|fromjson)}' \
+     --arg n "$total_stamps" --arg rp "$slugs" --arg ro "$repos_ok" --arg rt "$repos_total" --arg fc "$full_coverage" \
+     --arg us "$unscanned" --arg cp "$capped" --arg f "$findings" --arg c "$clean" --arg u "$unconf" \
+     --arg re "$reopened" --arg m "$missing" --arg ul "$unparsed" --arg r "$payload"
+  # Exit status is the consumable signal — a stamp with no consumer is what this verb
+  # exists to fix, so `merge-unverified && echo ok` must mean something to cron.
+  # `mark_reported` first: a findings exit is a REPORTED verdict (the rows are right
+  # there above it), and without the flag the EXIT-trap backstop renders this verb's
+  # own headline result as "exited 1 without reporting a reason — this is a bug in the
+  # CLI", which tells a reader to file a bug instead of triaging the rows.
+  if (( findings > 0 )); then mark_reported; return 1; fi
+  return 0
+}
+
 # DIVE-477: hand a maker-completed task to its verifier instead of closing it.
 # Stash the original maker (first writer wins, so it survives re-routes) so a
 # verify FAIL can bounce straight back, bump the iteration counter, keep the
@@ -392,6 +652,14 @@ _task_route_to_verifier() {
             started_at=NULL, handoff_ack_at=NULL,
             handoff_delivered_at=datetime('now'), handoff_stale_pinged_at=NULL${set_result}${set_binding_iter}
       WHERE id=${id};"
+  # DIVE-3349: close the session segment. This is the ONE status transition that
+  # returns BEFORE `_task_status_cmd`'s funnel, so the hook there cannot see it —
+  # and a delivered row is not being worked (it is sitting in the verifier's
+  # queue), so a segment left open here would keep charging this row for every
+  # later turn of a session that has moved on. `task deliver` with NO distinct
+  # verifier deliberately does NOT reach this line: it leaves the row in_progress
+  # and the maker is still working, so its segment stays open.
+  _task_session_close "$id"
   local iter; iter=$(db "SELECT iteration FROM tasks WHERE id=${id};")
   local iter_note=""
   [[ "$iter" == "$prev_iter" ]] && iter_note=" — re-delivery of the same pass, not rework"
@@ -410,6 +678,11 @@ _task_route_to_verifier() {
   # verifier rail exists to prevent, asserted by our own evidence base.
   ledger_emit task.delivered ident="$ident" task_id="$id" actor="$(task_actor "")" \
     out="${result:-}" detail="delivered to verifier ${vfier} (iteration ${iter}${iter_note}; awaiting ACK)"
+  # DIVE-3503 — `task deliver` is a terminal boundary for the MAKER even though
+  # the row stays open, so it reaps like done/cancel. Same predicate, same
+  # protections; see src/lib/reap.sh.
+  declare -F _reap_at_task_boundary >/dev/null 2>&1 && _reap_at_task_boundary "deliver" "$ident" || true
+
   ok "$ident ready for review — delivered to verifier '$vfier' (iteration ${iter}${iter_note}; awaiting ACK)" \
      '{id:($i|tonumber), ident:$id, status:"todo", routedTo:$v, role:"verifier", handoff:"delivered", acknowledged:false, iteration:($n|tonumber)}' \
      --arg i "$id" --arg id "$ident" --arg v "$vfier" --arg n "$iter"
@@ -601,7 +874,7 @@ cmd_task_reject() {
     # set — the gate now reads '(superseded ...)' with provenance auto:reject, so
     # a human tapping it would believe they authorized something an agent already
     # closed on their behalf.
-    _task_gate_retire_buttons "$ident" "superseded by auto:reject" || true
+    _task_gate_card_apply "$ident" die "superseded by auto:reject" || true
   fi
   # max_iterations reached -> stop bouncing, park it on a human to decide.
   # DIVE-2477 considered clearing done_at here too, by symmetry with the
@@ -683,5 +956,186 @@ cmd_task_reject() {
   ok "$ident rejected — bounced back to maker '$maker' (iteration $iter${maxi:+/$maxi})" \
      '{id:($i|tonumber), ident:$id, status:"todo", bouncedTo:$m, role:"maker", iteration:($n|tonumber)}' \
      --arg i "$id" --arg id "$ident" --arg m "$maker" --arg n "$iter"
+  # DIVE-3499: the sender-visible receipt. A verifier who has just bounced a row
+  # cannot otherwise tell "the maker will pick this up" from "this vanished", and
+  # closes the gap by pinging them — which costs the maker a full reload of a PR
+  # they had closed out. Cannot fail; see src/lib/routing_receipt.sh.
+  # The `|| true` and the stderr drop are the additive-only contract AT THE CALL
+  # SITE, not belt-and-braces: a tree that sources a SUBSET of src/ — which is
+  # what most harnesses do — has no routing_receipt, and bash turns that into
+  # rc=127 on a verb that had already succeeded. Measured on
+  # tests/task_reject_trace_unit.sh before this line existed. The wrapper's own
+  # containment cannot cover the case where the wrapper is what is missing.
+  routing_receipt "$ident" "$maker" "now owns it (bounced back)" 2>/dev/null || true
 }
 
+
+# ── DIVE-3474 arm 1 — `task merge`: a verifier merges what IT graded ──────────
+#
+# THE DEFECT, measured on this board 2026-08-16: quinn graded DIVE-3457 and
+# DIVE-3450 PASS — re-derived the maker's counts, drove her own mutants, confirmed
+# every required check green at the graded head — and then filed, twice, "my token
+# is read-only so I cannot do it. Please merge #658". agent-main pressed a button.
+#
+# NO JUDGEMENT IS ADDED BY THE SECOND SEAT. Nothing about the merge decision is
+# re-derived there; the second seat holds a credential, not an opinion. It is a
+# token-permission artifact wearing the shape of an approval, and every one of
+# those asks wakes a NON-FRESH window (main), which is the most expensive event
+# this fleet has. Removing an ILLEGITIMATE ask is autonomy, not unsupervised
+# action — lodar's 2026-08-03 test on the strict reading.
+#
+# WHAT THIS IS NOT: a merge grant. The standing is the row, not the seat. It is
+# keyed on `graded_by = <this seat>` over the SAME predicate the board already
+# uses to paint "graded->merge" (`_TASKS_TFV_SQL`), so a verifier can merge
+# exactly the pull request it has itself passed and NOTHING else — not a peer's
+# row, not a row it merely assigned, not one whose grade a later reject retired.
+#
+# WHY `_TASKS_TFV_SQL` AND NOT A FRESH PREDICATE. That constant is the single
+# source for the graded-awaiting-merge rule and carries four conjuncts this rail
+# would otherwise have to re-type: writer!=grader (DIVE-477), a live reject
+# retires a grade (DIVE-3428), a grade is not a pass (DIVE-3430), and a verdict
+# with no delivery_ref has nothing to merge. Re-typing it is how the board and
+# the rail drift, and a drift HERE is a merge nobody authorised. Same rule the
+# constant's own comment states: written once, interpolated, never retyped.
+#
+# THE SUDO POSTURE IS `_task_answer`'s (DIVE-3160), deliberately, because the
+# shape is identical: the grant confers NO authority of its own — it refuses
+# unless the row already names this seat as the grader — so gating it behind a
+# capability flag would recreate the exact split between standing and capability
+# that both tickets exist to close. Hence UNCONDITIONAL in render_standard_sudoers,
+# alongside `_task_answer` and not alongside `_push_do`.
+#
+#   1. EUID 0 or refuse — reachable only through the exact-path NOPASSWD grant.
+#   2. WHO comes from SUDO_UID under sudo's env_reset, never argv, never --from.
+#   3. STANDING re-derived AS ROOT FROM THE ROW. The caller passes an ident and
+#      nothing else; the PR URL comes from `delivery_ref` in the store, never from
+#      the caller, so a caller cannot name a pull request the row does not.
+#   4. The merge goes out as the machine account (`_GH_BOT_ENV`), the same
+#      credential and the same attribution rule as every other agent write
+#      (DIVE-2232/2448).
+#
+# _task_merge_standing_sql <actor> — the WHERE that decides this rail, as one
+# string, so the verb and the root executor grade the identical rule. PURE: no
+# I/O, no root, unit-testable without a box.
+_task_merge_standing_sql() {
+  printf '%s' "${_TASKS_TFV_SQL} AND graded_by = $(sqlq "${1:-}")"
+}
+
+# cmd_task_merge — the caller half. Resolves nothing security-relevant itself:
+# every check below is re-run authoritatively inside the root executor, and these
+# exist only so a refusal arrives with its reason instead of as a sudo exit code.
+cmd_task_merge() {
+  local ident="" json=0 a
+  for a in "$@"; do
+    case "$a" in
+      --json) json=1 ;;
+      -h|--help)
+        printf 'usage: 5dive task merge <ident> [--json]\n\n  Merge the pull request bound to a row THIS SEAT graded PASS.\n  Refused on any row this seat did not itself grade (DIVE-3474).\n'
+        return 0 ;;
+      --*) fail "$E_VALIDATION" "task merge: unknown flag '$a' — usage: 5dive task merge <ident> [--json]" ;;
+      *) [[ -z "$ident" ]] && ident="$a" ;;
+    esac
+  done
+  [[ -n "$ident" ]] || fail "$E_VALIDATION" "task merge needs a task ident — usage: 5dive task merge <ident>"
+  (( json )) && JSON_MODE=1
+  tasks_db_init
+
+  local actor; task_actor_claim ""; actor="$ACTOR_BOARD"
+  _task_merge_preflight "$ident" "$actor"   # names the refusal; never authorises
+
+  local rc=0 out=""
+  out=$(printf '%s\0' "$ident" | sudo -n /usr/local/bin/5dive _merge_do 2>&1) || rc=$?
+  if (( rc != 0 )) && ! sudo -n -l /usr/local/bin/5dive _merge_do >/dev/null 2>&1; then
+    fail "$E_PERMISSION" "$ident: this seat holds no _merge_do grant, so NOTHING RAN — the merge was not attempted and was not refused on standing. A seat provisioned before DIVE-3474 does not carry the grant until it is re-provisioned (5dive agent provision <seat>). Until then the merge stays with a seat that holds one."
+  fi
+  [[ -n "$out" ]] && printf '%s\n' "$out" >&2
+  (( rc == 0 )) || { mark_reported; return "$rc"; }
+  ok "$ident merged — the pull request this seat graded PASS is on the target branch; no second seat was asked" \
+     '{ident:$id, merged:true, actor:$ac}' --arg id "$ident" --arg ac "$actor"
+}
+
+# _task_merge_preflight <ident> <actor> — the caller-side refusal texts. Split out
+# so the harness can grade each refusal by NAME rather than by exit code, and so
+# the negative case (a row this seat did NOT grade) has a message a reader can act
+# on instead of a bare permission error.
+_task_merge_preflight() {
+  local ident="$1" actor="$2" row
+  row=$(db "SELECT COALESCE(graded_by,'')||x'1f'||COALESCE(graded_verdict,'')||x'1f'||COALESCE(delivery_ref,'')||x'1f'||COALESCE(handoff_rejected_at,'')||x'1f'||COALESCE(graded_at,'')||x'1f'||status
+            FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null || printf '')
+  [[ -n "$row" ]] || fail "$E_VALIDATION" "no task ${ident}."
+  local gb gv dr hr ga st rest
+  gb="${row%%$'\x1f'*}";   rest="${row#*$'\x1f'}"
+  gv="${rest%%$'\x1f'*}";  rest="${rest#*$'\x1f'}"
+  dr="${rest%%$'\x1f'*}";  rest="${rest#*$'\x1f'}"
+  hr="${rest%%$'\x1f'*}";  rest="${rest#*$'\x1f'}"
+  ga="${rest%%$'\x1f'*}";  st="${rest#*$'\x1f'}"
+
+  [[ -n "$ga" ]] \
+    || fail "$E_CONFLICT" "${ident} carries NO grade (graded_at is NULL), so there is nothing for this rail to act on. This verb merges what a verifier has already passed; it is not a way to merge something first and grade it after. Grade it: 5dive task verify ${ident} --cmd=<acceptance test>"
+  # THE NEGATIVE, asserted by name. Without this arm the grant is unbounded in the
+  # one direction nobody would notice: a verifier merging a row someone ELSE graded
+  # is indistinguishable, at the GitHub end, from a legitimate merge.
+  [[ "$gb" == "$actor" ]] \
+    || fail "$E_AUTH_REQUIRED" "${ident} was graded by '${gb:-<nobody>}', not by '${actor}' — REFUSED. This rail removes one ask only: the verifier asking a second seat to press the button on a pull request IT ITSELF passed. It is not a merge capability, so it does not extend to a row this seat did not grade. If '${gb:-the grader}' should merge it, that seat runs this verb; otherwise it stays a normal merge."
+  [[ -n "$dr" ]] \
+    || fail "$E_CONFLICT" "${ident} is graded but carries no delivery_ref, so no pull request is bound to it and there is nothing to merge. Bind it: 5dive task deliver ${ident} --pr=<url>."
+  [[ -z "$gv" || "$gv" == "pass" ]] \
+    || fail "$E_CONFLICT" "${ident}'s recorded verdict is '${gv}', not a pass (DIVE-3430) — a grade is not a pass, and this rail merges only what was passed."
+  [[ -z "$hr" || ( -n "$ga" && ! "$hr" > "$ga" ) ]] \
+    || fail "$E_CONFLICT" "${ident} was REJECTED at ${hr}, after the grade at ${ga} (DIVE-3428: a grade is not a latch) — the maker has not answered that bounce, so the graded head is not the head to merge."
+  case "$st" in
+    done|cancelled) fail "$E_CONFLICT" "${ident} is ${st} — a terminal row is not a merge queue." ;;
+  esac
+}
+
+# cmd_task_merge_do — ROOT-ONLY (`_merge_do`). Re-derives everything: the caller
+# from SUDO_UID, the standing from the row, and the pull request from the row's
+# own delivery_ref. Accepts an IDENT and nothing else, so there is no argument
+# through which a caller can name a different pull request or a different grader.
+cmd_task_merge_do() {
+  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "_merge_do is a privileged internal primitive (reachable only through the exact-path NOPASSWD grant)."
+  local -a args=(); local a
+  while IFS= read -r -d '' a; do args+=("$a"); done
+  (( ${#args[@]} == 1 )) || fail "$E_VALIDATION" "_merge_do takes exactly one task ident on stdin and no flags — got ${#args[@]} argument(s). The pull request is read from the row, never from the caller."
+  local ident="${args[0]}"
+  [[ "$ident" == --* ]] && fail "$E_VALIDATION" "_merge_do takes a task ident, not a flag ('${ident}')."
+
+  local _ruid="${SUDO_UID:-}"
+  [[ "$_ruid" =~ ^[0-9]+$ ]] \
+    || fail "$E_AUTH_REQUIRED" "_merge_do: no SUDO_UID — reach this primitive through sudo from an agent seat, never as root directly (a root caller has no grading seat to attribute the merge to)."
+  [[ "$_ruid" != "0" ]] \
+    || fail "$E_AUTH_REQUIRED" "_merge_do: SUDO_UID is root, which is not an agent seat."
+  local actor; actor=$(_gate_uid_to_agent "$_ruid")
+  [[ -n "$actor" ]] \
+    || fail "$E_AUTH_REQUIRED" "_merge_do: uid ${_ruid} owns no agent-* passwd row, so this merge has no attributable grader."
+
+  tasks_db_init
+  # STANDING + SUBJECT in ONE query over the shared predicate: a row that does not
+  # match is refused, and the delivery_ref of a row that does match is the only
+  # pull request this call can reach.
+  local pr
+  pr=$(db "SELECT delivery_ref FROM tasks WHERE ident=$(sqlq "$ident") AND $(_task_merge_standing_sql "$actor") LIMIT 1;" 2>/dev/null || printf '')
+  [[ -n "$pr" ]] \
+    || fail "$E_AUTH_REQUIRED" "_merge_do: ${actor} holds no merge standing on ${ident} — the row must be graded PASS BY ${actor}, still carry the delivery_ref that grade was recorded against, and not have been rejected since. Re-derived here as root from the row; the caller's view of it is not consulted. \`5dive task show ${ident}\` prints the fields this predicate reads."
+
+  [[ -r "$_GH_BOT_ENV" ]] \
+    || fail "$E_GENERIC" "machine-account credential missing ($_GH_BOT_ENV) — 5dive secret write ${_GH_BOT_KEY} --connector=github-bot"
+  local tok
+  # shellcheck disable=SC1090
+  tok=$(set -a; . "$_GH_BOT_ENV"; set +a; printf '%s' "${GH_BOT_TOKEN:-}")
+  [[ -n "$tok" ]] || fail "$E_GENERIC" "$_GH_BOT_ENV exists but carries no ${_GH_BOT_KEY}."
+
+  local rc=0
+  GH_TOKEN="$tok" GITHUB_TOKEN="" gh pr merge "$pr" --squash || rc=$?
+  if (( rc != 0 )); then
+    mark_reported
+    printf '_merge_do: `gh pr merge %s --squash` exited %s as the machine account. That is GitHub'"'"'s answer, not a standing refusal — %s DOES hold merge standing on %s here. A required check that is red or still running, a protected branch the machine account cannot merge, and a conflict all land on this line; read gh'"'"'s message above.\n' \
+      "$pr" "$rc" "$actor" "$ident" >&2
+    return "$rc"
+  fi
+  # Audited as the GRADER's act, not root's: the whole point of the rail is that
+  # the seat that graded is the seat that merged.
+  _task_store_audit_log "task merge" "ok" 0 -- "task=$ident" "pr=$pr" "grader=$actor" "actor=$actor" 2>/dev/null || true
+  printf '%s merged by %s (the seat that graded it) as the machine account.\n' "$pr" "$actor" >&2
+  return 0
+}

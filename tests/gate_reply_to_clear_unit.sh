@@ -30,11 +30,12 @@
 #   C1-C5  the COPY names the exact string to send. Condition 5 of
 #          `_gate_channel_session_ok` needs BOTH the ident AND the answer value,
 #          so copy that says "reply to confirm" produces a refusal.
-#   C6-C8  the RE-SCOPE (olivia on DIVE-2818, 2026-08-06; see the note below).
-#          C6 pins the ORDER — tap sentence before the reply string — because the
-#          defect being fixed was never a missing sentence, it was which sentence
-#          led. C7 pins the recovery FRAMING and the absence of the superlative
-#          that made typing "strongest". C8 is the withheld-button case.
+#   C6-C8  the COPY SHRINK (DIVE-3661, lodar 2026-08-21, superseding the
+#          DIVE-2818/2824 order-and-framing arms: with the tap-instruction
+#          sentence deleted outright there is no order left to grade). C6 pins
+#          the ABSENCE of tap prose — the button is the affordance; C7 pins the
+#          button-failure framing and the absence of the attestation paragraph
+#          and the old superlative. C8 is the withheld-button case, unchanged.
 #   R1-R4  THE ROUND TRIP, and it is the arm that matters. The string our DM tells
 #          the human to send is fed to the REAL `_gate_channel_session_ok` with
 #          only the Bot API stubbed. This grades the copy against the function
@@ -44,9 +45,9 @@
 #   I1-I6  the WIRING. The helpers being correct proves nothing about whether the
 #          composed alert carries them, and a suite that grades only its own new
 #          functions would pass with the call sites never added. I5 re-grades the
-#          order on the composed text, because the call sites are where the two
-#          halves (button and copy about the button) could be assembled the wrong
-#          way round; I6 grades the withheld-button suppression end to end.
+#          DIVE-3661 shrink on the composed text, because the call sites are
+#          where per-type boilerplate could reintroduce what the helper deleted;
+#          I6 grades the withheld-button suppression end to end.
 #
 # THE RE-SCOPE, and why the copy reads the way it does (olivia on the parent
 # DIVE-2818, 2026-08-06, after lodar ruled live: "asking user to type is not good
@@ -143,6 +144,50 @@ _task_gate_high_stakes "$(rid DIVE-9009)" \
   && bad_t "H9 an AGENT capability (delegated_push) is not high-stakes" "delegated_push must fall through untouched" \
   || ok_t "H9 an AGENT capability (delegated_push) is not high-stakes"
 
+# ==================== A: THE ASK LINE (DIVE-3661) =============================
+# quinn's iteration-1 mutant proof: replacing _task_gate_ask_line's body with the
+# pre-fix `printf '%s' "${1:0:180}"` survived 138 arms green, because no arm
+# named the new function. These arms are the kill. The budget is WORDS (the
+# spec's unit), not characters — see
+# community/wiki/a-char-budget-is-not-a-word-budget-render-the-real-corpus.md.
+
+# A1 a long unpunctuated ask cuts at exactly 15 words + ellipsis, never mid-word.
+_a="alpha bravo charlie delta echo foxtrot golf hotel india juliett kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee"
+_want="alpha bravo charlie delta echo foxtrot golf hotel india juliett kilo lima mike november oscar…"
+_got=$(_task_gate_ask_line "$_a")
+[[ "$_got" == "$_want" ]] \
+  && ok_t "A1 _task_gate_ask_line cuts an unpunctuated ask at 15 words + ellipsis (kills the substr mutant)" \
+  || bad_t "A1 _task_gate_ask_line cuts an unpunctuated ask at 15 words + ellipsis (kills the substr mutant)" "got: $_got"
+
+# A2 a question that IS the first sentence survives whole, no ellipsis.
+_a="Can you recreate a box so the fixed relay installer gets its one as-shipped run? tonic-drake was purged and never came back and this trailer pushes the total far past every budget the renderer knows about"
+_got=$(_task_gate_ask_line "$_a")
+[[ "$_got" == "Can you recreate a box so the fixed relay installer gets its one as-shipped run?" ]] \
+  && ok_t "A2 a leading question is kept whole and the trailer is dropped" \
+  || bad_t "A2 a leading question is kept whole and the trailer is dropped" "got: $_got"
+
+# A3 a short ask is returned byte-identical (no ellipsis, no reflow).
+_a="Approve the spend?"
+[[ "$(_task_gate_ask_line "$_a")" == "$_a" ]] \
+  && ok_t "A3 a short ask passes through byte-identical" \
+  || bad_t "A3 a short ask passes through byte-identical" "got: $(_task_gate_ask_line "$_a")"
+
+# A4 an abbreviation is not a sentence end (the latent class quinn's corpus
+# audit named: 0 of 400 live asks trip it, so only an arm keeps it dead).
+_a="Invite our build account to the Apple dev team, e.g. via App Store Connect, then pick a store name for the listing before the next build goes out tonight"
+_got=$(_task_gate_ask_line "$_a")
+[[ "$_got" == "Invite our build account to the Apple dev team, e.g. via App Store Connect, then…" ]] \
+  && ok_t "A4 'e.g.' does not end the sentence — the cut is the word budget, not the abbreviation" \
+  || bad_t "A4 'e.g.' does not end the sentence — the cut is the word budget, not the abbreviation" "got: $_got"
+
+# A5 a sentence finishing between WORD_MAX and SOFT_MAX is kept whole — kills a
+# mutant that applies the 15-word cut before scanning for the sentence end.
+_a="one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen? and then a very long trailer that keeps going well past any budget"
+_got=$(_task_gate_ask_line "$_a")
+[[ "$_got" == "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen?" ]] \
+  && ok_t "A5 a 16-word sentence is finished, not chopped at 15 (soft budget)" \
+  || bad_t "A5 a 16-word sentence is finished, not chopped at 15 (soft budget)" "got: $_got"
+
 # ==================== C: THE COPY NAMES THE EXACT STRING =====================
 
 # The 5th argument is the markup the CALLER computed. It is passed, never
@@ -178,30 +223,28 @@ txt=$(_task_gate_reply_cta DIVE-9006 decision "A|B" "" "$KB")
   && ok_t "C5 a decision CTA with no recommendation falls back to the first option" \
   || bad_t "C5 a decision CTA with no recommendation falls back to the first option" "text: $txt"
 
-# C6 THE ORDER. Every C arm above passes just as well on the pre-re-scope copy
-# that led with "Strongest clear: REPLY ..." — presence was never the defect.
-# What lodar rejected was the typed string being the FIRST thing asked for, so
-# the assertion has to be positional: the tap sentence must sit ahead of the
-# string. Measured by offset (the prefix before each needle), not by eyeballing
-# a rendered blob, so a future edit that merely appends a tap line at the bottom
-# does not pass.
+# C6 NO TAP PROSE. DIVE-3661 (lodar) deleted the tap-instruction sentence
+# outright — the button IS the affordance, so prose about it is boilerplate.
+# The old positional arm (tap sentence before reply string, DIVE-2824) is
+# subsumed: with no tap sentence there is no order to get wrong, and the
+# negative needle here is exactly what reds on a revert to either old copy.
 txt=$(_task_gate_reply_cta DIVE-9001 approval "" "" "$KB")
-_pre_tap="${txt%%Tap a button*}"; _pre_str="${txt%%DIVE-9001 approved*}"
-if [[ "$txt" == *"Tap a button"* && ${#_pre_tap} -lt ${#_pre_str} ]]; then
-  ok_t "C6 the CTA asks for the TAP before it prints the reply string (tap primary)"
+if [[ "$txt" != *"Tap a button"* && "$txt" != *"expected path"* ]]; then
+  ok_t "C6 the CTA carries no tap-instruction prose — the button itself is the affordance (DIVE-3661)"
 else
-  bad_t "C6 the CTA asks for the TAP before it prints the reply string (tap primary)" "text: $txt"
+  bad_t "C6 the CTA carries no tap-instruction prose — the button itself is the affordance (DIVE-3661)" "text: $txt"
 fi
 
-# C7 THE FRAMING. Ordering alone still allows "tap, or equally just reply" — the
-# reply must read as the path for when the tap is unavailable. The negative half
-# pins the superlative that made typing the recommended act; it is the exact word
-# the withdrawn copy used, so a revert reds here and not only at C6.
+# C7 THE FRAMING. The reply must read as the path for when the button FAILS —
+# never a peer of the tap, never the "Strongest clear" the twice-withdrawn copy
+# offered. Also pins the DIVE-3661 shrink: the attestation/citable paragraph is
+# record-keeping prose and must not ride the chat message.
 txt=$(_task_gate_reply_cta DIVE-9003 decision "A|B" "B" "$KB")
-if [[ "$txt" == *"Recovery only"* && "$txt" == *"stale"* && "$txt" != *"Strongest"* ]]; then
-  ok_t "C7 the reply string is framed as RECOVERY, and the 'strongest clear' framing is gone"
+if [[ "$txt" == *"if the button fails"* && "$txt" != *"Strongest"* \
+      && "$txt" != *"attested"* && "$txt" != *"citable"* ]]; then
+  ok_t "C7 the reply string is framed as button-failure fallback, with no attestation prose (DIVE-3661)"
 else
-  bad_t "C7 the reply string is framed as RECOVERY, and the 'strongest clear' framing is gone" "text: $txt"
+  bad_t "C7 the reply string is framed as button-failure fallback, with no attestation prose (DIVE-3661)" "text: $txt"
 fi
 
 # C8 THE WITHHELD BUTTON. DIVE-2411 withholds the ✅ Provided tap on a secret gate
@@ -273,7 +316,7 @@ _task_owner_channel() { TASK_CH_TOKEN=stub; TASK_CH_ACCESS=/dev/null; TASK_CH_TY
 
 CAPTURED=""
 _task_need_notify_deliver DIVE-9001 approval "approve the spend" "" "" "" "" "" >/dev/null 2>&1
-if [[ "$CAPTURED" == *"High-stakes gate"* && "$CAPTURED" == *"DIVE-9001 approved"* ]]; then
+if [[ "$CAPTURED" == *"High-stakes"* && "$CAPTURED" == *"DIVE-9001 approved"* ]]; then
   ok_t "I1 a high-stakes gate's ALERT TEXT carries the reply-to-clear prompt"
 else
   bad_t "I1 a high-stakes gate's ALERT TEXT carries the reply-to-clear prompt" "text: ${CAPTURED:0:400}"
@@ -285,16 +328,14 @@ fi
   && ok_t "I2 the tap button survives alongside the prompt (the tap is the primary path)" \
   || bad_t "I2 the tap button survives alongside the prompt (the tap is the primary path)" "markup: $CAPTURED_KB"
 
-# I5 the ORDER on the COMPOSED alert, not just inside the helper. The call site is
-# where the flip can be undone without touching the copy at all — the prompt is
-# appended to a `text` that already carries the per-type instruction, so grading
-# only `_task_gate_reply_cta` would pass on an alert that reads reply-first.
+# I5 the COMPOSED alert, not just the helper (DIVE-3661 re-scope of the old
+# positional arm): the call site is where boilerplate can sneak back without
+# touching the helper, so the absence has to be graded on the assembled text.
 # Reuses the I1 capture, so it costs no second delivery.
-_pre_tap="${CAPTURED%%Tap a button*}"; _pre_str="${CAPTURED%%DIVE-9001 approved*}"
-if [[ "$CAPTURED" == *"Tap a button"* && ${#_pre_tap} -lt ${#_pre_str} ]]; then
-  ok_t "I5 the composed ALERT TEXT asks for the tap before the reply string"
+if [[ "$CAPTURED" != *"Tap a button"* && "$CAPTURED" == *"if the button fails"* ]]; then
+  ok_t "I5 the composed ALERT TEXT carries the compact fallback and no tap-instruction prose"
 else
-  bad_t "I5 the composed ALERT TEXT asks for the tap before the reply string" "text: ${CAPTURED:0:400}"
+  bad_t "I5 the composed ALERT TEXT carries the compact fallback and no tap-instruction prose" "text: ${CAPTURED:0:400}"
 fi
 
 # I6 the withheld button, END TO END: DIVE-9002 is a secret gate with no
@@ -305,7 +346,7 @@ fi
 # call site actually hands it the markup rather than a placeholder.
 CAPTURED=""; CAPTURED_KB=""
 _task_need_notify_deliver DIVE-9002 secret "hand over the credential" "" "" "" "" "" >/dev/null 2>&1
-if [[ -z "$CAPTURED_KB" && "$CAPTURED" != *"High-stakes gate"* ]]; then
+if [[ -z "$CAPTURED_KB" && "$CAPTURED" != *"High-stakes"* ]]; then
   ok_t "I6 a button-less secret gate's alert carries NO reply prompt (DIVE-2411 end to end)"
 else
   bad_t "I6 a button-less secret gate's alert carries NO reply prompt (DIVE-2411 end to end)" "markup='$CAPTURED_KB' text: ${CAPTURED:0:400}"
@@ -313,7 +354,7 @@ fi
 
 CAPTURED=""
 _task_need_notify_deliver DIVE-9005 approval "approve the routine thing" "" "" "" "" "" >/dev/null 2>&1
-[[ "$CAPTURED" != *"High-stakes gate"* ]] \
+[[ "$CAPTURED" != *"High-stakes"* ]] \
   && ok_t "I3 a routine tier-2 approval gate's alert does NOT carry the prompt (lodar's scope)" \
   || bad_t "I3 a routine tier-2 approval gate's alert does NOT carry the prompt (lodar's scope)" "text: ${CAPTURED:0:400}"
 
@@ -340,11 +381,72 @@ _INBOX_TXT="$TMP/inbox.txt"; _INBOX_KB="$TMP/inbox.kb"
   _task_inbox_send "" "ident='DIVE-9001'" "ORDER BY created_at"
 ) >/dev/null 2>&1
 _bt=$(cat "$_INBOX_TXT" 2>/dev/null); _bk=$(cat "$_INBOX_KB" 2>/dev/null)
-if [[ "$_bt" == *"High-stakes gate"* && "$_bt" == *"DIVE-9001 approved"* \
-      && "$_bt" == *"Recovery only"* && "$_bt" != *"Strongest"* && "$_bk" == *'"tna:'* ]]; then
+if [[ "$_bt" == *"High-stakes"* && "$_bt" == *"DIVE-9001 approved"* \
+      && "$_bt" == *"if the button fails"* && "$_bt" != *"Strongest"* && "$_bk" == *'"tna:'* ]]; then
   ok_t "I7 the batch RE-NAG alert carries the same recovery prompt, beside a real tap button"
 else
   bad_t "I7 the batch RE-NAG alert carries the same recovery prompt, beside a real tap button" "markup='$_bk' text: ${_bt:0:400}"
+fi
+
+# I10/I11 THE RECOMMENDED LINE ON THE BATCH SITE. I8/I9 drive
+# _task_need_notify_deliver, so reverting src/task/inbox.sh's predicate to
+# unconditional survived the whole suite (quinn measured it on iteration 3's
+# PASS — the exact mutant that kills I8 at the notify site left this one green
+# at 38/0). The /inbox batch render is the surface the acceptance criterion
+# names, so it gets its own arms, both directions, through the real
+# _task_inbox_send (I7's scaffolding):
+# community/wiki/a-regression-arm-must-land-on-the-render-path-the-acceptance-names.md
+seed_gate DIVE-9011 approval spend_authority "" "merge it"
+: >"$_INBOX_TXT"; : >"$_INBOX_KB"
+(
+  require_root() { :; }
+  _task_send_owner() { printf '%s' "$1" >"$_INBOX_TXT"; printf '%s' "${2:-}" >"$_INBOX_KB"; return 0; }
+  FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"
+  _task_inbox_send "" "ident='DIVE-9003'" "ORDER BY created_at"
+) >/dev/null 2>&1
+_bt=$(cat "$_INBOX_TXT" 2>/dev/null); _bk=$(cat "$_INBOX_KB" 2>/dev/null)
+if [[ "$_bt" != *"✅ Recommended:"* && "$_bk" == *"⭐"* ]]; then
+  ok_t "I10 the BATCH render of a decision gate carries the recommendation on the ⭐ button only"
+else
+  bad_t "I10 the BATCH render of a decision gate carries the recommendation on the ⭐ button only" "markup='$_bk' text: ${_bt:0:300}"
+fi
+
+: >"$_INBOX_TXT"; : >"$_INBOX_KB"
+(
+  require_root() { :; }
+  _task_send_owner() { printf '%s' "$1" >"$_INBOX_TXT"; printf '%s' "${2:-}" >"$_INBOX_KB"; return 0; }
+  FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"
+  _task_inbox_send "" "ident='DIVE-9011'" "ORDER BY created_at"
+) >/dev/null 2>&1
+_bt=$(cat "$_INBOX_TXT" 2>/dev/null); _bk=$(cat "$_INBOX_KB" 2>/dev/null)
+if [[ "$_bt" == *"✅ Recommended: merge it"* && "$_bk" != *"merge it"* ]]; then
+  ok_t "I11 the BATCH render of an approval gate KEEPS the Recommended line (verb buttons carry none)"
+else
+  bad_t "I11 the BATCH render of an approval gate KEEPS the Recommended line (verb buttons carry none)" "markup='$_bk' text: ${_bt:0:300}"
+fi
+
+# I8/I9 THE RECOMMENDED LINE, one arm per direction (DIVE-3661 iteration 3).
+# The suppression predicate is the markup string itself, so the two gate types
+# MUST diverge: a decision's ⭐ first button carries the recommended value
+# verbatim (line suppressed — it was the same words twice), while an approval's
+# buttons are generic verbs (line kept — it is the recommendation's only copy).
+# One-direction coverage is how iteration 2 shipped the duplicate: see
+# community/wiki/a-duplication-predicate-must-ask-what-the-other-surface-actually-says.md
+eval "_task_owner_channel() { TASK_CH_TOKEN=stub; TASK_CH_ACCESS=/dev/null; TASK_CH_TYPE=claude; TASK_CH_AGENT=t; return 0; }"
+CAPTURED=""; CAPTURED_KB=""
+_task_need_notify_deliver DIVE-9003 decision "pick the migration path" "A|B" "B" "" "" "" >/dev/null 2>&1
+if [[ "$CAPTURED" != *"✅ Recommended:"* && "$CAPTURED_KB" == *"⭐ B"* ]]; then
+  ok_t "I8 a decision gate renders the recommended value ONCE — on the ⭐ button, no prose duplicate"
+else
+  bad_t "I8 a decision gate renders the recommended value ONCE — on the ⭐ button, no prose duplicate" "markup='$CAPTURED_KB' text: ${CAPTURED:0:300}"
+fi
+
+CAPTURED=""; CAPTURED_KB=""
+_task_need_notify_deliver DIVE-9001 approval "approve the spend" "" "looks right — merge both" "" "" "" >/dev/null 2>&1
+if [[ "$CAPTURED" == *"✅ Recommended: looks right — merge both"* && "$CAPTURED_KB" != *"looks right"* ]]; then
+  ok_t "I9 an approval gate KEEPS the Recommended line — generic buttons carry no recommendation"
+else
+  bad_t "I9 an approval gate KEEPS the Recommended line — generic buttons carry no recommendation" "markup='$CAPTURED_KB' text: ${CAPTURED:0:300}"
 fi
 
 # A prompt on a channel whose plugin has no inbound handler is a dead affordance
@@ -359,7 +461,7 @@ for _ct in codex grok antigravity opencode; do
   eval "_task_owner_channel() { TASK_CH_TOKEN=stub; TASK_CH_ACCESS=/dev/null; TASK_CH_TYPE=$_ct; TASK_CH_AGENT=t; return 0; }"
   CAPTURED=""
   _task_need_notify_deliver DIVE-9001 approval "approve the spend" "" "" "" "" "" >/dev/null 2>&1
-  [[ "$CAPTURED" != *"High-stakes gate"* ]] \
+  [[ "$CAPTURED" != *"High-stakes"* ]] \
     && ok_t "I4 no prompt on channel type '$_ct' (tap handler yes, inbound handler no)" \
     || bad_t "I4 no prompt on channel type '$_ct' (tap handler yes, inbound handler no)" "text: ${CAPTURED:0:400}"
 done

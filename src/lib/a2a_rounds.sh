@@ -176,11 +176,27 @@ a2a_record_round() {
   printf -v now '%(%s)T' -1
   local dir; dir="$(dirname "$A2A_ROUND_LEDGER")"
   [[ -d "$dir" ]] || mkdir -p "$dir" 2>/dev/null || return 0
-  # Best-effort, like audit_log: a send is not failed by a bookkeeping write.
-  printf '%s\t%s\t%s\t%s\n' "$from" "$to" "$topic" "$now" \
-    >> "$A2A_ROUND_LEDGER" 2>/dev/null || return 0
+  # DIVE-3658: give the ledger its group-write mode IN THE ACT OF CREATING IT.
+  # The repair below runs before the append rather than after it, but that
+  # ordering is NOT the fix and must not be read as one: a scoped seat cannot
+  # chmod a root-owned file either. What it buys is the first write on a fresh
+  # box — a file created under the default umask is 0644, and then only the
+  # creating seat can ever append to it.
+  if [[ ! -e "$A2A_ROUND_LEDGER" ]]; then
+    ( umask 0117; : >> "$A2A_ROUND_LEDGER" ) 2>/dev/null || true
+  fi
   chmod 0660 "$A2A_ROUND_LEDGER" 2>/dev/null || true
   chgrp claude "$A2A_ROUND_LEDGER" 2>/dev/null || true
+  # Best-effort, like audit_log: a send is not failed by a bookkeeping write.
+  #
+  # DIVE-3658: the redirection is grouped, and that is load-bearing. In
+  # `printf ... >> "$F" 2>/dev/null` the redirections are set up LEFT TO RIGHT,
+  # so when `>>` fails the shell reports it on a stderr that is still the
+  # terminal — which is how a raw `5dive: line NNNN: ...: Permission denied`
+  # printed above `OK -- sent to agent 'x'` on every scoped send. Redirecting
+  # the enclosing group puts /dev/null in place BEFORE the append is attempted.
+  { printf '%s\t%s\t%s\t%s\n' "$from" "$to" "$topic" "$now" \
+      >> "$A2A_ROUND_LEDGER"; } 2>/dev/null || return 0
 }
 
 # Drop ledger lines older than the window, so the file does not grow without
@@ -190,10 +206,22 @@ a2a_round_prune() {
   printf -v now '%(%s)T' -1
   cutoff=$(( now - A2A_ROUND_WINDOW_SECS ))
   [[ -w "$A2A_ROUND_LEDGER" ]] || return 0
-  tmp="${A2A_ROUND_LEDGER}.$$"
-  awk -F'\t' -v c="$cutoff" '$4 ~ /^[0-9]+$/ && $4 >= c' \
-    "$A2A_ROUND_LEDGER" > "$tmp" 2>/dev/null \
-    && mv "$tmp" "$A2A_ROUND_LEDGER" 2>/dev/null
+  # DIVE-3658, half one: the temp goes where the CALLER can write, not beside a
+  # root-owned ledger. `${STATE_DIR}` is drwxr-s--- root:claude, so
+  # `${LEDGER}.$$` is a file no scoped seat can create -- the prune had never
+  # once run from one.
+  tmp="$(mktemp 2>/dev/null)" || return 0
+  # DIVE-3658, half two: WRITE BACK THROUGH THE EXISTING INODE. `mv` is a
+  # rename, so the surviving file carries the TEMP's mode and owner: every prune
+  # from a root-capable seat turned 0660 root:claude back into 0644 and cut
+  # every scoped seat out of the ledger until the next root send -- silently,
+  # because the append is best-effort and a quiet ledger reads as no traffic.
+  # A mode is not durable state on a path that REPLACES the file; either the
+  # writer re-establishes it every time, or it does not replace the file.
+  if awk -F'\t' -v c="$cutoff" '$4 ~ /^[0-9]+$/ && $4 >= c' \
+       "$A2A_ROUND_LEDGER" > "$tmp" 2>/dev/null; then
+    { cat "$tmp" > "$A2A_ROUND_LEDGER"; } 2>/dev/null || true
+  fi
   rm -f "$tmp" 2>/dev/null || true
 }
 

@@ -175,6 +175,129 @@ TIER_CAL_MIN_ITERS=5
 TIER_CAL_MAX_ITERS=20000
 TIER_CAL_SAMPLES=2
 
+# ------------------------------------------------------------------ DIVE-3477
+# THE CORPUS-GROWTH TRIPWIRE. Raw microseconds per harness, against a FIXED
+# reference. It is NOT a second budget, it is wired to no failure, and nothing
+# in CI keys off its VALUE — scripts/core-growth-tripwire.sh decides when it has
+# fired, and firing files a row.
+#
+# WHY IT EXISTS. #622 shards the core tier, which restores headroom, and restored
+# headroom is precisely how corpus growth becomes invisible again: two jobs
+# reporting 157s read as comfortable while the corpus still costs 313s. main's
+# ruling clearing that merge made this its condition -- "raw
+# microseconds-per-harness against a FIXED reference, emitted per run,
+# independent of shard count and of the calibration clamp. If that number climbs
+# we find out on the run it climbs, not in a fortnight when the new headroom is
+# gone too."
+#
+# EACH PROPERTY IS TRACEABLE TO A FAILURE THIS THREAD MEASURED:
+#
+#   PER HARNESS, NOT PER RUN. Raw wall-clock moves when the corpus GROWS, which
+#   is the event this exists to catch. Dividing by the harness COUNT is also what
+#   makes the figure indifferent to how the corpus was split: two shards or
+#   three, sum(wall) over sum(harnesses) is the same quantity.
+#
+#   NOT wall/draw. Dividing a corpus by its run's calibration probe ASSUMES the
+#   probe explains the corpus -- the exact proposition DIVE-2736's cross-run
+#   instrument exists to TEST, and which that instrument marked DISCORDANT on the
+#   very run the arithmetic was applied to. Measured (DIVE-3476): wall/draw said
+#   305s/280s, "on the line, both sides"; normalising per HARNESS against a
+#   window said 340s/353s -- both over, and a SIGN FLIP on the leg carrying the
+#   conclusion. community/wiki/
+#   normalising-a-corpus-by-its-own-calibration-probe-assumes-the-thing-on-trial.md
+#
+#   NOT MULTIPLIED BY cal_scale_pct, and never compared to a clamped cap. The
+#   clamp is the mechanism that made growth invisible; a metric that inherits it
+#   inherits the defect. tier_core_us_per_harness below reads no calibration
+#   field at all, which is a property tests/corpus_tier_budget_unit.sh asserts
+#   rather than a promise made here.
+#
+# THE REFERENCE, WITH ITS ENVIRONMENT AND ITS DATE, because a figure with no
+# environment cannot be refuted by the next reader (DIVE-2555):
+#
+#   ENVIRONMENT   GitHub-hosted `ubuntu-latest`, `unit-tests` on main, core tier.
+#   DATE          2026-08-16.
+#   METHOD        median microseconds-per-harness over the 15 most recent main
+#                 `unit-tests` runs, 05:06Z-09:31Z, read with
+#                 scripts/tier-cal-window.sh (main2, DIVE-3476).
+#   CORROBORATION dev3 re-measured independently over the 6 most recent
+#                 un-sharded main runs (07:05Z-09:31Z, 309-311 harnesses):
+#                 pristine 1069454, installed-host 1129031 -- 2.3% and 0.4% BELOW
+#                 the constants below. Two windows of different widths, same
+#                 order of magnitude and the same ranking between the legs.
+#
+# IT STARTS AT PARITY ON PURPOSE. That is the whole reason it can exist while
+# TIER_BUDGET_CORE cannot be raised: a reference set at today's cost does not red
+# on day one. The first sharded run on main (31941359141) reads 980707 pristine
+# and 1106109 installed-host -- 89% and 97% of these. Under, both legs, run one.
+#
+# WHY THE TWO LEGS GET TWO CONSTANTS. installed-host runs ~6% dearer per harness
+# than pristine in every window measured. One shared constant would start one leg
+# off parity, which is the single property that makes this metric shippable.
+TIER_CORE_US_PER_HARNESS_REF_PRISTINE=1094155
+TIER_CORE_US_PER_HARNESS_REF_INSTALLED=1133986
+
+# HOW FAR OVER THE REFERENCE A WINDOW MEDIAN MUST SIT BEFORE IT HAS FIRED.
+#
+# "WE FIND OUT ON THE RUN IT CLIMBS" IS THE RIGHT INTENT AND A SINGLE RAW RUN
+# CANNOT DELIVER IT. Measured, per-run raw microseconds-per-harness on main, the
+# 6 un-sharded runs of 2026-08-16 07:05Z-09:31Z:
+#
+#     pristine         935483 .. 1148867      (median 1069454)
+#     installed-host   883495 .. 1151612      (median 1129031)
+#
+# That is a +-10% / -22%..+2% spread over three hours in which the corpus moved
+# by TWO harnesses. It is runner draw: the same six runs drew 94-125%, and
+# main2's 137-point census over five days spans 74-141%. A per-run threshold
+# against a fixed reference would therefore false-fire on draw alone, constantly
+# -- and an alarm that cries wolf is muted, which is how the signal is lost a
+# SECOND way.
+#
+# So emission and firing are split and must not be collapsed: the raw figure is
+# EMITTED every run, unadjusted, exactly as the ruling specified, and the FIRING
+# decision is taken on the MEDIAN of a window, which is what survives that
+# spread. 110 sits above the full observed per-run spread, so a window median
+# that clears it is not a draw.
+TIER_CORE_GROWTH_FIRE_PCT=110
+# A median needs an interior; below this a window is its own endpoints. Same
+# fail-closed call scripts/tier-cal-window.sh makes at --min-runs=3, set one
+# wider because this reads ONE figure per run rather than a paired sign test.
+TIER_CORE_GROWTH_MIN_RUNS=5
+
+# tier_core_us_per_harness <summed_wall_clock_s> <summed_harnesses>
+#
+# The whole metric, in one line of integer arithmetic, SUMMED across every shard
+# of ONE environment. Reads no calibration field, by construction and not by
+# discipline.
+tier_core_us_per_harness() {
+  local s="${1:?tier_core_us_per_harness <wall_clock_s> <harnesses>}" n="${2:?}"
+  (( n > 0 )) || return 2
+  printf '%d\n' $(( s * 1000000 / n ))
+}
+
+# tier_core_us_per_harness_ref <environment>
+#
+# The constant is spelled ONCE, above, and every reader comes through here --
+# the same rule --budget and --cal-us already follow, and for the same reason: a
+# reference spelled in the caller is moved by a one-line edit in a file nobody
+# reviews as the policy change it is.
+tier_core_us_per_harness_ref() {
+  case "${1:?tier_core_us_per_harness_ref <environment>}" in
+    pristine)       printf '%d\n' "$TIER_CORE_US_PER_HARNESS_REF_PRISTINE" ;;
+    installed-host) printf '%d\n' "$TIER_CORE_US_PER_HARNESS_REF_INSTALLED" ;;
+    *) return 2 ;;
+  esac
+}
+
+# tier_core_growth_pct_of_ref <us_per_harness> <environment>
+tier_core_growth_pct_of_ref() {
+  local u="${1:?tier_core_growth_pct_of_ref <us_per_harness> <environment>}" r
+  r="$(tier_core_us_per_harness_ref "${2:?}")" || return 2
+  (( r > 0 )) || return 2
+  printf '%d\n' $(( u * 100 / r ))
+}
+
+
 # DIVE-2710 §2.5: TIER_CAL_BASELINE_US is a measurement with no environment attached,
 # which is exactly the thing nobody ever re-reads. The runner measures it every run, so
 # grading it is free: past this drift the run says RE-BASELINE rather than absorbing the
@@ -236,6 +359,137 @@ tier_cal_diverge_pct() {
     printf 'tier_cal_diverge_pct: pre must be > 0, got %s\n' "$pre" >&2; return 2
   fi
   printf '%s\n' "$(( (post - pre) * 100 / pre ))"
+}
+
+# ------------------------------------------------------------------ DIVE-3580
+# ATTRIBUTE A CONFIRMED BUDGET RED BEFORE IT BLOCKS A MERGE.
+#
+# WHAT FORCED THIS (PR #708, 2026-08-18, wiki: refute-a-budget-red-with-the-next-
+# green-run-of-the-same-corpus): a graded-PASS PR was red-blocked at 306s/300s,
+# CONFIRMED on a second runner per DIVE-2829 — and main's own next run of the SAME
+# 172-harness corpus read 232s (77%) and 200s (66%). The corpus was never over.
+# Two boxes agreeing is not independence when the whole fleet draws slow the same
+# hour, and the calibration probe read the slow box at 90% (fast) while the
+# harnesses drew 129% (slow) — measured anti-correlated, again (DIVE-2736).
+#
+# THE DISCRIMINATOR THE CONFIRM JOB DID NOT HAVE, derived by hand twice on #708
+# (quinn per-file from raw logs, olivia from the next main run) and mechanical
+# here: compare this run's PER-HARNESS vector against the last GREEN main run's,
+# over the COMMON file set. A lift spread evenly across UNRELATED harnesses is
+# the box; real corpus growth is CONCENTRATED in the files that grew (or lives in
+# files the baseline has never seen, which reprice as themselves).
+#
+# ONE-SIDED, like every override on this gate: the verdict below can only turn a
+# would-be exit 4 into exit 6 (no corpus finding), never a 6 into a 4 and never a
+# green into anything. No baseline, a thin common set, or any parse failure keeps
+# the red exactly as it stands today — relief is granted only on a POSITIVE
+# measurement against a NAMED green run.
+#
+# THE TWO RESIDUALS, NAMED (each is the other instrument's job):
+#   * UNIFORM REAL GROWTH — a shared helper that slows every harness reads as
+#     weather here. That event is exactly what the DIVE-3477 growth tripwire's
+#     windowed us/harness median exists to catch, out of band, against a FIXED
+#     reference this comparison deliberately is not.
+#   * SINGLE-FILE WEATHER — a network-priced file spiking on BOTH boxes reads as
+#     concentrated, i.e. corpus. Bounded by DIVE-2592: both runs already re-timed
+#     their top-3 and kept the min, so a spike must survive min-of-two twice
+#     before it can reach this verdict at all.
+#
+# THE THRESHOLDS, derived from the one fully-measured weather pair (#708 confirm
+# 308s vs main-green 232s, same 172 files) rather than picked: top-3 excess share
+# measured 17% there, while growth concentrated in <=3 files is >=~100% by
+# construction — 50 sits ~3x above the measured weather case and strictly below
+# any small-set growth. Common-set cover measured 100%; below 80 the comparison
+# is about a different corpus and refuses. Starting values, policy like the clamp
+# pair — refutable by the next measured case, in this file, with its evidence.
+TIER_ATTR_TOP_EXCESS_N=3
+TIER_ATTR_CONC_MAX_PCT=50
+TIER_ATTR_MIN_COMMON_COVER_PCT=80
+
+# tier_budget_attribution <effective_cap_ms> <red_report> <baseline_report>...
+#
+# Reports are run-harnesses.sh TSV bodies (ms<TAB>rc<TAB>path; '#' headers are
+# skipped). Baseline reports are merged, so passing every shard of the green run
+# makes shard drift irrelevant: files are joined by NAME, and the red shard's
+# files are looked up in the whole green corpus.
+#
+# Prints ONE line:
+#   verdict=<runner|corpus|unmeasurable> reason=<slug> lift_pct=N common=N \
+#     common_cover_pct=N repriced_s=N top_excess_share_pct=N new_files=N new_s=N
+# Exit 0 only on verdict=runner (a downgrade is admissible); 1 otherwise; 2 usage.
+# The three verdicts are spelled apart for the tier_cal_ref_admissible reason: a
+# caller that cannot tell "the corpus grew" from "I could not measure" will answer
+# the wrong one.
+tier_budget_attribution() {
+  local cap_ms="${1:?tier_budget_attribution <effective_cap_ms> <red_report> <baseline_report>...}"
+  local red="${2:?tier_budget_attribution <effective_cap_ms> <red_report> <baseline_report>...}"
+  shift 2
+  [[ "$cap_ms" =~ ^[0-9]+$ ]] || { printf 'tier_budget_attribution: cap_ms must be an integer of milliseconds, got %s\n' "$cap_ms" >&2; return 2; }
+  (( $# >= 1 )) || { printf 'tier_budget_attribution: at least one baseline report is required\n' >&2; return 2; }
+  [[ -r "$red" ]] || { printf 'verdict=unmeasurable reason=red-report-unreadable\n'; return 1; }
+  local b unreadable=0
+  for b in "$@"; do [[ -r "$b" ]] || unreadable=1; done
+  if (( unreadable )); then printf 'verdict=unmeasurable reason=baseline-unreadable\n'; return 1; fi
+  awk -F'\t' -v cap_ms="$cap_ms" -v red="$red" \
+      -v topn="$TIER_ATTR_TOP_EXCESS_N" -v conc_max="$TIER_ATTR_CONC_MAX_PCT" \
+      -v min_cover="$TIER_ATTR_MIN_COMMON_COVER_PCT" '
+    /^#/ { next }
+    NF >= 3 && $1 ~ /^[0-9]+$/ && $2 == "0" {
+      if (FILENAME == red) { redms[$3] = $1 } else { basems[$3] = $1 }
+    }
+    END {
+      done = 0
+      for (f in redms) {
+        red_total += redms[f]
+        if (f in basems) {
+          common++; src += redms[f]; sbc += basems[f]
+          ex = redms[f] - basems[f]
+          if (ex > 0) { excess[f] = ex; tex += ex }
+        } else { newf++; srn += redms[f] }
+      }
+      out = "lift_pct=%d common=%d common_cover_pct=%d repriced_s=%d top_excess_share_pct=%d new_files=%d new_s=%d\n"
+      if (red_total <= 0 || common == 0 || sbc <= 0) {
+        printf "verdict=unmeasurable reason=no-common-measurement " out, 0, common, 0, 0, 0, newf, srn/1000
+        exit 1
+      }
+      cover = src * 100 / red_total
+      lift = src * 100 / sbc
+      repriced = sbc + srn
+      # Top-N per-file excess share. asorti by value is gawk-only; ubuntu-latest
+      # ships mawk-compatible gawk but the control plane may not, so select the
+      # top N by scan — N is 3, the corpus is a few hundred, O(N*n) is nothing.
+      top = 0
+      for (k = 0; k < topn; k++) {
+        bestf = ""; best = 0
+        for (f in excess) if (!(f in used) && excess[f] > best) { best = excess[f]; bestf = f }
+        if (bestf == "") break
+        used[bestf] = 1; top += best
+      }
+      share = (tex > 0) ? top * 100 / tex : 0
+      # REPRICED BEFORE COVER, deliberately: new files lower the cover by existing,
+      # and a corpus that is over the cap even at baseline prices (common files at
+      # the green run cost, new files at their own) has grown whatever the cover
+      # says. Cover only gates the RELIEF verdict — a thin common set cannot
+      # support a uniformity claim, but it can still convict a repriced overage.
+      if (repriced > cap_ms) {
+        printf "verdict=corpus reason=over-at-baseline-prices " out, lift, common, cover, repriced/1000, share, newf, srn/1000
+        exit 1
+      }
+      if (cover < min_cover) {
+        printf "verdict=unmeasurable reason=thin-common-set " out, lift, common, cover, repriced/1000, share, newf, srn/1000
+        exit 1
+      }
+      if (tex <= 0) {
+        printf "verdict=unmeasurable reason=no-excess-to-attribute " out, lift, common, cover, repriced/1000, share, newf, srn/1000
+        exit 1
+      }
+      if (share >= conc_max) {
+        printf "verdict=corpus reason=concentrated-excess " out, lift, common, cover, repriced/1000, share, newf, srn/1000
+        exit 1
+      }
+      printf "verdict=runner reason=uniform-lift-fits-at-baseline-prices " out, lift, common, cover, repriced/1000, share, newf, srn/1000
+      exit 0
+    }' "$red" "$@"
 }
 
 # DIVE-2867: WHO IS ALLOWED TO MOVE TIER_CAL_BASELINE_US, AND ON WHAT EVIDENCE.
@@ -524,6 +778,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     clamp)  tier_cal_clamp_pct "${2:?clamp <raw_pct>}" ;;
     diverge) tier_cal_diverge_pct "${2:?diverge <pre_us> <post_us>}" "${3:?diverge <pre_us> <post_us>}" ;;
     refadmit) shift; tier_cal_ref_admissible "${1:?refadmit <candidate_us> <current_us> <concordant_sample>...}" "${2:?refadmit <candidate_us> <current_us> <concordant_sample>...}" "${@:3}" ;;
-    *) printf 'usage: tier.sh {list core|nightly|full [dir] | of <file> | reason <file> | claim <file> | budget core|full | scale <us> [baseline] | clamp <pct> | diverge <pre_us> <post_us> | refadmit <candidate_us> <current_us> <concordant_sample>...}\n' >&2; exit 2 ;;
+    attribute) shift; tier_budget_attribution "${1:?attribute <effective_cap_ms> <red_report> <baseline_report>...}" "${2:?attribute <effective_cap_ms> <red_report> <baseline_report>...}" "${@:3}" ;;
+    *) printf 'usage: tier.sh {list core|nightly|full [dir] | of <file> | reason <file> | claim <file> | budget core|full | scale <us> [baseline] | clamp <pct> | diverge <pre_us> <post_us> | refadmit <candidate_us> <current_us> <concordant_sample>... | attribute <effective_cap_ms> <red_report> <baseline_report>...}\n' >&2; exit 2 ;;
   esac
 fi

@@ -63,6 +63,41 @@ if ! declare -F five_self_bundle >/dev/null 2>&1; then
   [[ -r "$_five_self_lib" ]] && source "$_five_self_lib"
   unset _five_self_lib
 fi
+# DIVE-3228 — THE BUZZ COUNT, and why the badge beside it could not see this.
+#
+# `asked you N×` is built from need_answered_by LIKE 'human:%', i.e. gates the
+# human ANSWERED. His phone counts MESSAGES. On 2026-08-11 those were 6 and 19.
+# Worse than the arithmetic: a withdrawn gate is archived to gate_history and its
+# need_* fields are cleared OFF the tasks row, and this digest reads tasks rows —
+# so withdrawal DELETES the evidence from the metric's input AFTER the buzz has
+# been sent. 21 of that day's 36 filings were invisible to the badge by
+# construction. That is why a month of burn-control passes read a number trending
+# fine and moved on, and it is the argument for reading gate_cards instead: a
+# card row survives the withdrawal that erases the gate.
+#
+# A MINT IS EXACTLY ONE BUZZ — editing a Telegram message does not push — so the
+# count is mints in the window, not cards, not deliveries.
+#
+# UNKNOWABLE MUST NOT READ AS ZERO. A store predating gate_cards answers the
+# query with an error, and "no table" and "no buzzes" are the same absent-vs-
+# forbidden distinction this rail has been burned by before. It returns nothing
+# and the badge says `unknown`.
+_digest_buzz_count() { # <window-seconds> -> "<count>|<partial 0|1>" on stdout
+  tasks_db_init 2>/dev/null || return 1
+  local n first partial=0
+  n=$(db "SELECT COUNT(*) FROM gate_cards WHERE minted_at >= datetime('now','-${1} seconds');" 2>/dev/null) || return 1
+  [[ -n "$n" ]] || return 1
+  # A window reaching back before the table existed under-reports, and an
+  # under-report presented as a total is the defect being fixed. Say partial.
+  first=$(db "SELECT COALESCE(MIN(minted_at),'') FROM gate_cards;" 2>/dev/null) || first=""
+  if [[ -z "$first" ]]; then partial=1
+  else
+    partial=$(db "SELECT CASE WHEN $(sqlq "$first") > datetime('now','-${1} seconds') THEN 1 ELSE 0 END;" 2>/dev/null) || partial=0
+    partial="${partial:-0}"
+  fi
+  printf '%s|%s' "$n" "$partial"
+}
+
 _digest_pref_file() { echo "${STATE_DIR}/digest.json"; }
 _digest_pref_enabled() {
   local f; f="$(_digest_pref_file)"
@@ -202,6 +237,16 @@ cmd_digest() {
   _digest_run usage --json >"$tmpd/usage.json" 2>/dev/null || _digest_usage_unavailable >"$tmpd/usage.json"
   [ -s "$tmpd/usage.json" ] || _digest_usage_unavailable >"$tmpd/usage.json"
   _digest_run heartbeat ls >"$tmpd/hb.txt" 2>/dev/null || : >"$tmpd/hb.txt"
+  # DIVE-3501: seats whose ENTIRE runnable queue is tier-guard held. This is the
+  # ONLY surface for that state — the rows read `todo`, the unit reads `active`,
+  # and the guard's own trace is a stderr line in /var/log/5dive-heartbeat.log
+  # that nobody reads (7865 of them by 2026-08-16, while dev2 sat stranded for
+  # six days). The digest is the surface that comes TO a lead on a cadence rather
+  # than one they have to already suspect a problem to open. Breach-only: the
+  # source emits an empty `seats` when nothing is stranded and the block is
+  # omitted entirely. Stateless — see cmd_heartbeat_held; nothing here counts ticks.
+  _digest_run heartbeat held --json >"$tmpd/held.json" 2>/dev/null || echo '{"data":{"seats":[]}}' >"$tmpd/held.json"
+  [ -s "$tmpd/held.json" ] || echo '{"data":{"seats":[]}}' >"$tmpd/held.json"
   # DIVE-972: per-loop token burn (cost side of the loop control window). --all
   # so a loop that finished (done/escalated/killed) in the window still reports
   # its final burn, not just the currently-running set.
@@ -235,7 +280,7 @@ cmd_digest() {
                       (SELECT value FROM objective_readings r WHERE r.objective_id=o.id AND r.value IS NOT NULL ORDER BY r.id DESC LIMIT 1) AS current,
                       (SELECT value FROM objective_readings r WHERE r.objective_id=o.id AND r.value IS NOT NULL AND r.ts < datetime('now', $(sqlq "$_obj_wstart")) ORDER BY r.id DESC LIMIT 1) AS baseline,
                       (SELECT COUNT(*) FROM tasks t WHERE o.project_key IS NOT NULL AND t.project_key=o.project_key AND t.kind='standard' AND t.status NOT IN ('done','cancelled')) AS inflight
-               FROM objectives o ORDER BY o.created_at;" >"$tmpd/obj.json" 2>/dev/null || echo '[]' >"$tmpd/obj.json"
+               FROM objectives o WHERE o.status <> 'retired' ORDER BY o.created_at;" >"$tmpd/obj.json" 2>/dev/null || echo '[]' >"$tmpd/obj.json"
   [ -s "$tmpd/obj.json" ] || echo '[]' >"$tmpd/obj.json"
 
   # DIVE-2306: the fleet-freeze / ahead reading. DIVE-2287 built an alarm that
@@ -257,9 +302,16 @@ cmd_digest() {
   else timeout 25 bash "$0" update --check --json >"$tmpd/update.json" 2>/dev/null || echo '{}' >"$tmpd/update.json"; fi
   [ -s "$tmpd/update.json" ] || echo '{}' >"$tmpd/update.json"
 
+  if _bz=$(_digest_buzz_count "$window"); then
+    printf '{"buzzes":%s,"partial":%s}\n' "${_bz%%|*}" "${_bz##*|}" >"$tmpd/buzz.json"
+  else
+    printf '{"buzzes":null,"partial":1}\n' >"$tmpd/buzz.json"
+  fi
+
   DIGEST_TASKS_F="$tmpd/tasks.json" DIGEST_USAGE_F="$tmpd/usage.json" DIGEST_HB_F="$tmpd/hb.txt" \
   DIGEST_LOOPS_F="$tmpd/loops.json" DIGEST_SUP_F="$tmpd/sup.json" DIGEST_OBJ_F="$tmpd/obj.json" \
-  DIGEST_UPDATE_F="$tmpd/update.json" \
+  DIGEST_UPDATE_F="$tmpd/update.json" DIGEST_HELD_F="$tmpd/held.json" \
+  DIGEST_BUZZ_F="$tmpd/buzz.json" \
   DIGEST_WINDOW="$window" DIGEST_JSON="$as_json" python3 - >"$tmpd/out.txt" <<'PY'
 import os, json, time, datetime as dt
 
@@ -275,6 +327,10 @@ def load(env, default):
         return d.get("data", d) if isinstance(d, dict) else d
     except Exception:
         return default
+
+buzz_data = load("DIGEST_BUZZ_F", {"buzzes": None, "partial": 1})
+buzzes = buzz_data.get("buzzes") if isinstance(buzz_data, dict) else None
+buzz_partial = bool(buzz_data.get("partial")) if isinstance(buzz_data, dict) else True
 
 tasks_data = load("DIGEST_TASKS_F", {"tasks": []})
 usage_data = load("DIGEST_USAGE_F", {"agents": [], "tasks": []})
@@ -442,6 +498,12 @@ for ln in hb.splitlines()[1:]:
     cols = ln.split()
     if len(cols) >= 4 and cols[1] == "on" and cols[3] == "no":
         stale.append(cols[0])
+
+# DIVE-3501: tier-guard stranded seats. Breach-only — an empty list means no seat
+# is stranded, and the rendered block is omitted rather than printing a reassuring
+# "0 stranded" line every day (a monitor with a daily all-clear stops being read).
+held_data = load("DIGEST_HELD_F", {"seats": []})
+held_seats = held_data.get("seats", []) if isinstance(held_data, dict) else []
 
 # DIVE-972: per-loop token burn. loops[].tokens is the live spend; a loop whose
 # spend has reached its ceiling was halted (advisory ceiling is now enforced).
@@ -663,7 +725,10 @@ if as_json:
         "health": {"stale": stale, "hot": [h["name"] for h in hot],
                    # DIVE-1937: `hot` is only a claim about what was READ. A
                    # consumer must not read an empty list as "nobody is hot".
-                   "hotCoverage": "complete" if usage_complete else "partial"},
+                   "hotCoverage": "complete" if usage_complete else "partial",
+                   # DIVE-3501: [] means measured-and-none, not unmeasured — the
+                   # predicate is a pure query over tasks + the registry.
+                   "tierHeldSeats": held_seats},
         "loops": {"total": loops_total, "capped": len(loops_capped), "byLoop": loops_burn},
         "stuck": {"mttuSec": mttu_sec, "episodes": len(in_window),
                   "openStuck": len(open_stuck), "byCause": mttu_by_cause},
@@ -688,8 +753,21 @@ else:
         return f" ({arrow}{abs(d)} vs {prev} prior {window_label}{partial})"
     _up = ("currently waiting on you" if autonomy["currentlyBlocked"]
            else f"ran {autonomy['uptimeDays']}d without needing you")
+    # DIVE-3228: TWO numbers, each labelled as what it actually measures. The old
+    # single "asked you N×" was the answered count wearing the asked count's name,
+    # and it is why 19 buzzes read as 6 for a month. Keeping only the answered
+    # number preserves that exact blindness, so both ship — a gate legitimately
+    # asked and a phone needlessly buzzed are different facts.
+    if isinstance(buzzes, int):
+        _bz = f" · buzzed your phone {buzzes}×" + ("*" if buzz_partial else "")
+    else:
+        # No gate_cards table (a store predating DIVE-3228). Unknown is not zero.
+        _bz = " · buzzed your phone: unknown"
     out.append(f"\U0001F9BE Autonomy — {_up} · shipped {len(done_l)}{_trend(len(done_l), prev_ship)}"
-               f" · asked you {len(ht_l)}×{_trend(len(ht_l), prev_ask)}")
+               f"{_bz}"
+               f" · you answered {len(ht_l)}×{_trend(len(ht_l), prev_ask)}")
+    if isinstance(buzzes, int) and buzz_partial:
+        out.append("   *buzz count covers only the span since gate cards were modelled")
     if objectives:
         out.append("")
         out.append(f"\U0001F9ED Objectives ({len(objectives)})")
@@ -818,6 +896,16 @@ else:
                    ". Until a caller that can write it runs, a frozen fleet reads here as silence.")
     if stale:
         out.append("\U0001F634 Heartbeat stale: " + ", ".join(stale))
+    # DIVE-3501: placed with the other as-of-now health readings and BEFORE the
+    # "Fleet healthy" line, for the same reason the freeze alarm is — that line
+    # is about heartbeats and rate limits and will happily say healthy while a
+    # seat has had zero runnable work for six days. The two have to read together.
+    for hs in held_seats:
+        ids = ", ".join(hs.get("idents") or []) or "no idents recorded"
+        out.append(f"\U0001F6D1 {hs.get('agent')} is STRANDED — all {hs.get('heldCount')} "
+                   f"runnable row(s) held by the tier guard, idle {hs.get('stalledHours')}h: {ids}. "
+                   f"Exit: 5dive task assign <id> <equal-or-higher-tier agent>, or "
+                   f"5dive heartbeat wake-task {hs.get('agent')} <task_id>.")
     if not hot and not stale:
         # "no rate-limit pressure" is a claim about every agent. It may only be
         # made when every agent was actually read (DIVE-1937).

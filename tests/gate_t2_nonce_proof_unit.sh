@@ -259,23 +259,32 @@ cb0=$(printf '%s' "$mk0" | jq -r '.inline_keyboard[0][0].callback_data')
   || bad_t "S12d no-nonce unchanged" "cb0='$cb0'"
 
 # --------------------------------------------------------------------------------------
-# S12e THE FENCE (DIVE-2233). S12b above grades a literal TRANSCRIBED from one plugin. A
-#      copy cannot detect the case that actually bites: a FORK whose regex differs. It
-#      does. telegram / -codex / -grok / -agy / -qwen carry the optional nonce group, but
-#      telegram-opencode and telegram-pi still use the pre-DIVE-916 `/^tna:(\d+):(.+)$/`,
-#      whose group 2 is GREEDY — it swallows ":<nonce>" into the token, and a decision
-#      then resolves `opts[Number("0:<nonce>")]` = opts[NaN] = undefined = 'invalid'. The
-#      tap is silently dropped. (Those two forks are already broken TODAY for approval /
-#      secret / manual, which have carried the suffix since DIVE-916; this change would
-#      extend it to `decision`, the last type still working there. No agent is currently
-#      exposed — `5dive agent list` shows the only opencode agent with CHANNELS=none and
-#      no pi agents — so the harm is prospective, not live.)
+# S12e THE FENCE (DIVE-2233; laggard set drained by DIVE-2374, fence shrunk by DIVE-2269).
+#      S12b above grades a literal TRANSCRIBED from one plugin. A copy cannot detect the
+#      case that actually bites: a FORK whose regex differs. Two did. telegram-opencode
+#      and telegram-pi carried the pre-DIVE-916 `/^tna:(\d+):(.+)$/`, whose group 2 is
+#      GREEDY — it swallows ":<nonce>" into the token, and a decision then resolves
+#      `opts[Number("0:<nonce>")]` = opts[NaN] = undefined = 'invalid'. The tap is
+#      silently dropped: no error, no ack, the gate stays open. approval/secret/manual
+#      have carried the suffix since DIVE-916, so those had been failing on those two
+#      forks for as long as the nonce existed.
 #
-#      So this arm enumerates the real ARTIFACTS instead of trusting the transcription,
-#      and pins the laggards as a KNOWN set. A new fork going greedy reds here; a laggard
-#      being FIXED also reds, which is the nudge to shrink the list. The plugins tree is
-#      not present on a bare CI checkout, so its absence SKIPS LOUDLY — a silent skip
-#      would make this fence indistinguishable from a fence that passed.
+#      DIVE-2374 brought both forks to the tolerant regex AND replaced the plugins-side
+#      parity test's hand-written fork list with a GLOB over plugins/*/tna.ts, so a new
+#      fork is enrolled by existing rather than by being named. This arm is the CLI-side
+#      half: it enumerates the real ARTIFACTS instead of trusting a transcription, and
+#      now pins the laggard set as EMPTY. Any fork going greedy — including a NEW fork
+#      copied from a stale ancestor — reds here. Do not "update the list" to make this
+#      green: the list is meant to stay empty, and a red is a fork that drops human taps.
+#
+#      READ THE CANONICAL REF, NOT THE WORKING TREE. This fence sat green for two weeks
+#      after DIVE-2374 landed because the only plugins tree on this host is a SHARED
+#      checkout that sits on a feature branch: it still had the greedy pair on disk while
+#      origin/main did not, so the fence's own subject was a revision nobody ships. When
+#      the located tree is a git checkout with an origin/main, grade origin/main; fall
+#      back to the working tree only when it is not, and SAY which was graded either way.
+#      The plugins tree is not present on a bare CI checkout, so its absence SKIPS LOUDLY
+#      — a silent skip would make this fence indistinguishable from a fence that passed.
 PLUG=""
 for _p in /home/claude/projects/5dive/5dive-plugins/plugins \
           "$HOME/.claude/plugins/marketplaces/5dive-plugins/plugins"; do
@@ -284,31 +293,56 @@ done
 if [[ -z "$PLUG" ]]; then
   printf 'SKIP - S12e fork-regex fence: no 5dive-plugins tree reachable (NOT a pass)\n'
 else
+  _root=$(git -C "$PLUG" rev-parse --show-toplevel 2>/dev/null || true)
+  _ref=""
+  [[ -n "$_root" ]] && git -C "$_root" rev-parse --verify -q origin/main >/dev/null 2>&1 && _ref="origin/main"
+
+  # name<TAB>regex-line pairs, from whichever source we resolved.
+  _pairs=""
+  if [[ -n "$_ref" ]]; then
+    while read -r _p; do
+      [[ -n "$_p" ]] || continue
+      _re=$(git -C "$_root" show "$_ref:$_p" 2>/dev/null | grep -h 'export const TNA_RE')
+      [[ -n "$_re" ]] || continue
+      _pairs+="$(basename "$(dirname "$_p")")	$_re"$'\n'
+    done <<< "$(git -C "$_root" ls-tree -r --name-only "$_ref" 2>/dev/null \
+                | grep -E '(^|/)telegram[^/]*/tna\.ts$' || true)"
+  else
+    for _f in "$PLUG"/telegram*/tna.ts; do
+      [[ -f "$_f" ]] || continue
+      _re=$(grep -h 'export const TNA_RE' "$_f" 2>/dev/null)
+      [[ -n "$_re" ]] || continue
+      _pairs+="$(basename "$(dirname "$_f")")	$_re"$'\n'
+    done
+  fi
+  printf 'note - S12e graded %s of %s\n' "${_ref:-the WORKING TREE (no origin/main)}" "${_root:-$PLUG}"
+
   _greedy=""; _tolerant=""
-  for _f in "$PLUG"/telegram*/tna.ts; do
-    [[ -f "$_f" ]] || continue
-    _re=$(grep -h 'export const TNA_RE' "$_f" 2>/dev/null)
-    [[ -n "$_re" ]] || continue
-    if [[ "$_re" == *'[0-9a-f]{32}'* ]]; then _tolerant+=" $(basename "$(dirname "$_f")")"
-    else                                      _greedy+=" $(basename "$(dirname "$_f")")"; fi
-  done
-  # Non-vacuity: the scan must actually have found forks, or "no greedy forks" is a lie.
-  [[ -n "$_tolerant" ]] \
-    && ok_t "S12e precond: the fork scan reached real tna.ts artifacts ($(echo $_tolerant | wc -w) nonce-tolerant)" \
-    || bad_t "S12e scan found nothing" "PLUG=$PLUG"
-  [[ "$(echo $_greedy | tr ' ' '\n' | sort | tr '\n' ' ')" == "telegram-opencode telegram-pi " ]] \
-    && ok_t "S12e the greedy-token forks are EXACTLY the two known laggards (opencode, pi)" \
-    || bad_t "S12e laggard set changed" "greedy='$_greedy' — a new fork drifted, or one was fixed; update the list"
-  # And the emitted value must satisfy every TOLERANT fork's OWN regex, read from disk.
+  while IFS=$'\t' read -r _n _re; do
+    [[ -n "$_n" ]] || continue
+    if [[ "$_re" == *'[0-9a-f]{32}'* ]]; then _tolerant+=" $_n"; else _greedy+=" $_n"; fi
+  done <<< "$_pairs"
+
+  # Non-vacuity: the scan must have found the BASE plus real forks, or "no greedy forks"
+  # is a lie told by an empty loop. Naming `telegram` is the floor, not the enrollment
+  # mechanism — the plugins-side harness (test/tna-harness.test.ts) owns per-fork
+  # enrollment by glob, so a fork added there does not need a line added here.
+  [[ " $_tolerant " == *" telegram "* && "$(echo $_tolerant | wc -w)" -ge 5 ]] \
+    && ok_t "S12e precond: the scan reached the base + real forks ($(echo $_tolerant | wc -w) nonce-tolerant)" \
+    || bad_t "S12e scan found nothing usable" "tolerant='$_tolerant' src='${_ref:-worktree}' PLUG=$PLUG"
+  [[ -z "${_greedy// /}" ]] \
+    && ok_t "S12e NO fork carries the pre-DIVE-916 greedy token regex (laggard set empty since DIVE-2374)" \
+    || bad_t "S12e a fork carries the greedy regex" "greedy='$_greedy' — those forks SILENTLY DROP approval/secret/manual taps; fix tna.ts, do not widen this fence"
+  # And the emitted value must satisfy every TOLERANT fork's OWN regex, read from the ref.
   _bad=""
-  for _f in "$PLUG"/telegram*/tna.ts; do
-    [[ -f "$_f" ]] || continue
-    _re=$(grep -h 'export const TNA_RE' "$_f" 2>/dev/null); [[ "$_re" == *'[0-9a-f]{32}'* ]] || continue
+  while IFS=$'\t' read -r _n _re; do
+    [[ -n "$_n" ]] || continue
+    [[ "$_re" == *'[0-9a-f]{32}'* ]] || continue
     node -e 'const m=process.argv[1].match(/\/(\^.*\$)\//);if(!m)process.exit(2);process.exit(new RegExp(m[1]).test(process.argv[2])?0:1)' \
-      "$_re" "$cb" 2>/dev/null || _bad+=" $(basename "$(dirname "$_f")")"
-  done
+      "$_re" "$cb" 2>/dev/null || _bad+=" $_n"
+  done <<< "$_pairs"
   [[ -z "$_bad" ]] \
-    && ok_t "S12e the emitted callback satisfies each tolerant fork's OWN on-disk regex" \
+    && ok_t "S12e the emitted callback satisfies each tolerant fork's OWN regex" \
     || bad_t "S12e a tolerant fork rejects our callback" "rejected by:$_bad cb='$cb'"
 fi
 

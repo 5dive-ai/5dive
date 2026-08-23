@@ -148,6 +148,11 @@ _task_status_cmd() {
   # Same rule we shipped in DIVE-1869 — a check that could not reach its answer must
   # not render as one. Blocking nothing is fine; blessing by silence is not.
   local _mg_unverified=""
+  # DIVE-3458: the foreign-delivery record. Separate from _mg_unverified on
+  # purpose — UNVERIFIED means "we could not check"; this means "we checked, and
+  # the merge is not ours to make". Collapsing them would put a scare-mark on a
+  # close that is exactly as complete as it will ever be.
+  local _mg_foreign=""
   # ...and whether the gate had ANY subject to verify in the first place. See
   # _gate_text_names_a_ref: an unverified reason only earns a mark on the record when
   # something was actually pending verification.
@@ -608,7 +613,7 @@ _task_status_cmd() {
       if [[ -n "$_maker" && "$_actor" != "$_vfier" && "$_actor" != "cli" \
             && "$_st" != "done" && "$_st" != "cancelled" ]]; then
         policy_refuse "$E_CONFLICT" done-over-delivered-loop DIVE-2007 "$ident" \
-          "$ident is DELIVERED to verifier '${_vfier}' (iteration ${_iter}, maker '${_maker}') and has NOT been graded — a 'task done' from '${_actor}' would close it ungraded, which is the maker grading its own work (writer != grader, DIVE-477). Only '${_vfier}' can close it. To CORRECT the result text do NOT re-run done: send the correction to '${_vfier}' (5dive agent send ${_vfier} \"...\") and let them fold it in. Real exits: '5dive task reject $ident --feedback=...' (verifier bounces it back), '5dive task verify $ident --cmd=\"<acceptance test>\"' (evidence-backed close), or '5dive task cancel $ident --result=...' (abandon)."
+          "$ident is DELIVERED to verifier '${_vfier}' (iteration ${_iter}, maker '${_maker}') and has NOT been graded — a 'task done' from '${_actor}' would close it ungraded, which is the maker grading its own work (writer != grader, DIVE-477). Only '${_vfier}' can grade it. To CORRECT the result text do NOT re-run done: send the correction to '${_vfier}' (5dive agent send ${_vfier} \"...\") and let them fold it in. Real exits: '5dive task reject $ident --feedback=...' (verifier bounces it back), '5dive task verify $ident --no-done --cmd=\"<acceptance test>\"' (record machine evidence and hold at graded->merge), or '5dive task cancel $ident --result=...' (abandon)."
       fi
     fi
   fi
@@ -904,7 +909,46 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
       if ! _gate_gh_reachable "$_ghtok"; then
         _gate_refuse_no_rail "$ident" "${_dref:-branch '$_branch'}"
       fi
-      if [[ -n "$_dref" ]]; then
+      # DIVE-3458: THE DELIVERY IS A SUBMISSION INTO A REPO WE DO NOT OWN.
+      #
+      # The gate below asks "did it merge to main", and for a repo whose merge
+      # button belongs to a stranger that question can never be answered by any
+      # work we do. `--force-merge-gate` discharges it per row and is the wrong
+      # instrument at this frequency: reaching for an override six times in a
+      # fortnight for a legitimate, intended, REPEATING shape says the gate is
+      # missing a case, and it records as "someone bypassed a safety check",
+      # which is the wrong audit trail for the normal path of an approved
+      # campaign.
+      #
+      # WHAT IS NOT DROPPED — and this is the half that matters. The gate's value
+      # here was never the refusal, it is the RECORD. Losing the sentence is how
+      # "we submitted it" quietly becomes "we're listed there" in a later report.
+      # So this arm still MEASURES the PR's state and writes it into the result:
+      # what was submitted, where, whether it is merged, and whose decision that
+      # is. A close on this arm asserts the SUBMISSION, never the acceptance.
+      #
+      # Deliberately NOT exempted from the gh-reachability guard above: recording
+      # "not merged" without reading it would be the assertion this arm exists to
+      # avoid making.
+      if [[ -n "$_dref" ]] && _gate_foreign_delivery "$_dref"; then
+        local _fslug _fowner _fstate _fwhat
+        _fslug=$(_gate_slug_from_url "$_dref")
+        _fowner="${_fslug%%/*}"
+        _fstate=$(_gate_gh "$_ghtok" 0 pr view "$_dref" --json state -q '.state' 2>/dev/null || echo "")
+        # Same DIVE-2720 normalisation as the owned path: gh renders a missing
+        # .state as the four-character string 'null', and a successful query that
+        # answered nothing is the same epistemic state as one that never ran.
+        [[ "$_fstate" == "null" ]] && _fstate=""
+        case "$_fstate" in
+          MERGED) _fwhat="MERGED — ${_fowner} accepted it" ;;
+          OPEN)   _fwhat="OPEN (not merged) — awaiting ${_fowner}, who alone can merge it" ;;
+          CLOSED) _fwhat="CLOSED WITHOUT MERGE by ${_fowner} — the submission was declined or superseded" ;;
+          *)      _fwhat="state NOT READ (the query did not answer) — this is 'not checked', not 'not merged'" ;;
+        esac
+        _task_store_audit_log "task.foreign-delivery" ok 0 -- "$ident" "foreign_repo=$_fslug ref=$_dref state=${_fstate:-unread}"
+        warn "$ident: delivery $_dref is a submission into $_fslug, a repository we do not own — the merged-to-main gate does not apply (DIVE-3458). MEASURED: $_fwhat. This close asserts the SUBMISSION was made; it does NOT assert that $_fowner accepted it."
+        _mg_foreign="[delivery: $_dref submitted to $_fslug, a repository outside our control. MEASURED at close: ${_fwhat}. Merging is ${_fowner}'s decision, not ours — this close records the SUBMISSION and asserts nothing about its acceptance. (DIVE-3458)]"
+      elif [[ -n "$_dref" ]]; then
         # DIVE-1955: a delivery_ref that is a full pull URL carries its own repo and
         # `gh pr view <url>` needs no --repo. A BARE delivery_ref (`#6`, `6`) does
         # not identify a pull request at all, and this is the fail-CLOSED declared
@@ -966,7 +1010,95 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
           policy_refuse "$E_CONFLICT" done-pr-state-unresolved DIVE-2318 "$ident" "$ident cannot close: gh could not read $_dref, so the merge is UNKNOWN, not absent — check by hand (gh pr view $_dref --json state,mergedAt) and re-run, or task cancel to abandon."
         fi
         if [[ "$_state" != "MERGED" || -z "$_merged" || "$_merged" == "null" ]]; then
-          policy_refuse "$E_CONFLICT" done-before-pr-merged DIVE-1830 "$ident" "$ident cannot close: $_dref is not merged to main (state=$_state, measured) — merge it, then task done"
+          # DIVE-3458 ARM 2: THE PR IS NOT MERGED AND THE WORK IS ON MAIN ANYWAY.
+          #
+          # Measured on DIVE-3292: delivery_ref pull/629 CLOSED, merged=null, while
+          # fd945c2 ("docs(changelog): … (DIVE-3292)") is an ancestor of origin/main.
+          # The change LANDED — as a direct commit, with the PR closed rather than
+          # merged. This gate read only the PR's merge flag, so it could not tell
+          # "delivered by another route" from "never delivered", and the remedy it
+          # printed was IMPOSSIBLE TO PERFORM: you cannot merge a closed PR whose
+          # content is already in main. `--force-merge-gate` does not reach here
+          # either (main2's source read: the flag escapes gates that RAN AND
+          # DISAGREED, never this binding check), so the row was unclosable from any
+          # seat by any means.
+          #
+          # The predicate is the one this gate already trusts everywhere else — is
+          # the work on main — asked with the machinery DIVE-2101/2120 built:
+          # ATTRIBUTION, a commit ON MAIN whose SUBJECT names the ident.
+          #
+          # DIVE-3534: THIS ARM USED TO REQUIRE THE PR HEAD'S ANCESTRY TOO, AND THAT
+          # REFUSED ITS OWN CANONICAL ROW. Measured by olivia on the bundle that
+          # carries this arm (0.19.39): DIVE-3292's PR 629 head is e2bad22, which is
+          # NOT an ancestor of main; what landed is fd945c2, a DIFFERENT commit. That
+          # is not an accident of one row — "landed by another route" MEANS the work
+          # came in as a different commit, so the abandoned PR tip is precisely the
+          # sha that is not on main. Requiring ancestry-of-the-PR-head AND attribution
+          # made the two operands mutually exclusive on the exact shape this arm was
+          # written for, and it left DIVE-3292 unclosable from any seat by any means —
+          # the precise condition DIVE-3458 was filed to remove.
+          #
+          # So attribution is the ONLY acceptor here, exactly as DIVE-2120/2184 already
+          # made it on the `Branch:` path below (see the long note at the _attr_slug
+          # search — "if you are changing acceptance, change attribution"). This arm had
+          # replicated the pre-DIVE-2120 shape that ticket exists to correct.
+          #
+          # THE DIVE-2101 VACUITY CONCERN IS ANSWERED BY THE SAME MOVE, not dropped:
+          # vacuity was a hazard of ANCESTRY (an EMPTY branch's tip IS main's tip, so
+          # ancestry is trivially true of it). Attribution is measured against main's
+          # commit SUBJECTS, and an empty branch contributes no commit naming the ident
+          # to main — so there is nothing to mistake for delivery. Vacuity is
+          # structurally impossible here rather than separately guarded.
+          #
+          # Ancestry survives as DIAGNOSTIC context in the messages only. It cannot
+          # accept anything on its own, and it can no longer BLOCK an acceptance —
+          # which also makes a deleted branch (routine on a closed PR, DIVE-2120) stop
+          # being fatal here: an unreadable head costs a diagnostic, not the close.
+          #
+          # Fail-safe direction is unchanged: attribution returning EMPTY (no token,
+          # API down) or `bound:<n>` (the scan hit its walk bound without exhausting
+          # main) DECLINES the acceptance and falls through to the refusal below
+          # exactly as if this arm did not exist. It can only ever ADD an acceptance on
+          # measured evidence, never manufacture a refusal.
+          local _cu_slug _cu_shas _cu_head="" _cu_anc="" _cu_attr="" _cu_diag=""
+          _cu_slug=$(_gate_slug_from_url "$_dref")
+          if [[ -n "$_cu_slug" ]]; then
+            _cu_attr=$(_gate_branch_ident_on_main "$_cu_slug" "" "$_ghtok" "$ident")
+            # Diagnostic only, and read AFTER the acceptor: a closed PR's branch is
+            # routinely deleted, so this is the probe most likely to answer nothing.
+            _cu_shas=$(_gate_pr_shas "$_dref" "$_ghtok" "$_cu_slug")
+            _cu_head="${_cu_shas%%|*}"
+            [[ -n "$_cu_head" ]] && _cu_anc=$(_gate_branch_ancestry "$_cu_slug" "$_cu_head" "$_ghtok")
+          fi
+          # Rendered once, into a variable: a nested ${x:+ … ${y} … } inside the
+          # sentences below is a parse error, not a formatting preference.
+          [[ -n "$_cu_head" ]] \
+            && _cu_diag=" PR head ${_cu_head:0:12} ancestry=${_cu_anc:-unread} — DIAGNOSTIC ONLY, it neither accepts nor blocks (DIVE-3534)."
+          if [[ "$_cu_attr" == "1" ]]; then
+            _task_store_audit_log "task.landed-without-merge" ok 0 -- "$ident" "ref=$_dref state=$_state head=${_cu_head:-unread} ancestry=${_cu_anc:-unread} slug=$_cu_slug"
+            # Say what was MEASURED and claim no more. A subject scan cannot tell a
+            # direct commit from a squash that landed in some other PR, and — the
+            # DIVE-3534 case — the PR's own head is typically NOT on main here.
+            # Claiming ancestry in this sentence described a shape that cannot occur.
+            warn "$ident: $_dref is NOT merged (state=$_state, measured) but a commit on ${FIVE_GATE_MAIN_BRANCH:-main} in $_cu_slug names $ident in its SUBJECT — the work LANDED BY ANOTHER ROUTE (DIVE-3458/3534). done=merged-to-main satisfied on ATTRIBUTION, not on the PR's merge flag.$_cu_diag$(_gate_merged_not_deployed "$_cu_slug")"
+            _mg_foreign="[delivery: $_dref is CLOSED/UNMERGED (state=$_state), and the work is nonetheless ON ${FIVE_GATE_MAIN_BRANCH:-main} in $_cu_slug — a commit subject on main names $ident. Closed on ATTRIBUTION, NOT on the pull request's merge flag and NOT on the PR head's ancestry.$_cu_diag (DIVE-3458/3534)]"
+          else
+            # Name what was MEASURED and why, so the refusal cannot print advice the
+            # reader is unable to follow. A CLOSED PR gets the remedy that exists.
+            # Keyed on ATTRIBUTION, because that is the operand that accepts; ancestry
+            # is appended as context and is never the stated reason.
+            local _cu_why="" _cu_fix="merge it, then task done"
+            case "$_cu_attr" in
+              0) _cu_why=" NO commit subject on main names $ident, so the work has not landed by another route either." ;;
+              bound:*) _cu_why=" No commit subject on main names $ident within the scan bound (${_cu_attr#bound:} COMMITS WALKED in $_cu_slug) — main's history was NOT exhausted, so this is unresolved, not ruled out; re-run, or raise FIVE_GATE_ANCESTRY_SCAN." ;;
+              *) _cu_why=" Whether any commit subject on main names $ident COULD NOT BE READ, so 'landed by another route' is unresolved here, not ruled out." ;;
+            esac
+            [[ "$_cu_anc" == "1" ]] \
+              && _cu_why="$_cu_why Its head ${_cu_head:0:12} IS on main, which on its own is what an EMPTY branch looks like — ancestry alone would accept a row that delivered nothing (DIVE-2101), so it cannot close this."
+            [[ "$_state" == "CLOSED" ]] \
+              && _cu_fix="it is CLOSED, so it cannot be merged — if the work landed another way, land or cite a commit on main whose SUBJECT names $ident and re-run; if it landed in a different PR, re-point the binding (\`task deliver $ident --pr=<url>\`); if it never landed, this row is not done"
+            policy_refuse "$E_CONFLICT" done-before-pr-merged DIVE-1830 "$ident" "$ident cannot close: $_dref is not merged to main (state=$_state, measured).$_cu_why — $_cu_fix"
+          fi
         fi
         # DIVE-2656: MERGED is not the same as MERGED-WHAT-THE-VERIFIER-GRADED.
         #
@@ -1613,6 +1745,19 @@ $_body"
   # looking — not solved by making this marker louder.
   # Appended, never substituted, so the maker's own text is untouched; and only on a
   # real `done` (a cancel was never gated, so it has nothing to disclaim).
+  # DIVE-3458: ride the foreign-delivery record on the result, for the same reason
+  # the UNVERIFIED marker rides it — stderr scrolls away and the audit row is a
+  # different artifact than the one anyone reads. Appended, never substituted, and
+  # only on a real `done`. It goes FIRST so the two markers cannot interleave into
+  # one sentence if a close somehow earns both.
+  if [[ -n "$_mg_foreign" && "$verb" == "done" ]]; then
+    local _fg_base="$result"
+    (( want_result )) || _fg_base=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
+    result="${_fg_base}${_fg_base:+
+
+}${_mg_foreign}"
+    want_result=1
+  fi
   if [[ -n "$_mg_unverified" && $_mg_had_subject -eq 1 && "$verb" == "done" ]]; then
     local _mg_base="$result"
     (( want_result )) || _mg_base=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
@@ -1626,6 +1771,17 @@ $_body"
     set_result=", result=$(sqlq_or_null "$result")"
   fi
   db "UPDATE tasks SET status=$(sqlq "$newstatus")${extra}${set_result} WHERE id=${id};"
+  # DIVE-3349: the SESSION SEGMENT, written from the one funnel every status verb
+  # crosses and immediately after the status write it describes — the same reason
+  # the audit row and the ledger row below sit here rather than in each verb: a
+  # fourth status verb added later cannot ship without its segment. Design, and
+  # why an absent session id is NULL rather than a fallback: src/lib/tasks_db.sh.
+  # Best-effort by construction; a bookkeeping insert must not fail a close that
+  # has already committed on the line above.
+  case "$newstatus" in
+    in_progress)             _task_session_open  "$id" ;;
+    done|cancelled|blocked)  _task_session_close "$id" ;;
+  esac
   [[ -n "$handoff_ack" ]] && handoff_ack_at=$(db "SELECT handoff_ack_at FROM tasks WHERE id=${id};")
   # DIVE-552: if this close finished a LOOP STEP, advance the relay — free the
   # next step (a freed agent step the heartbeat wakes; a freed gate fires its
@@ -1684,7 +1840,7 @@ $_body"
   if [[ "$verb" == "done" || "$verb" == "cancel" ]]; then
     local _open_gate
     _open_gate=$(db "SELECT 1 FROM tasks WHERE id=${id} AND need_type IS NOT NULL AND need_answered_at IS NULL;" 2>/dev/null || echo "")
-    [[ -n "$_open_gate" ]] && { _task_gate_retire_buttons "$ident" "task ${verb} with the gate still open" || true; }
+    [[ -n "$_open_gate" ]] && { _task_gate_card_apply "$ident" die "task ${verb} with the gate still open" || true; }
   fi
   if (( notify )) && [[ "$verb" == "done" || "$verb" == "cancel" ]]; then
     local from_tmpl
@@ -1748,6 +1904,17 @@ $_body"
   # is only shared if every site actually takes it.
   ledger_emit "$_lk" ident="$ident" task_id="$id" actor="$(task_actor)" out="$result" \
     detail="$verb${handoff_ack:+ → verifier ${handoff_ack}}"
+
+  # DIVE-3503 — the task boundary is the natural lifetime bound for anything the
+  # agent launched for this task, and until now NOTHING happened here: four seats
+  # were wedged in one day by shells that outlived the row, and a human unstuck
+  # them by hand three separate times. Reaps only agent-written `bash -c` shells
+  # older than the grace age, never the caller's own ancestors and never the
+  # seat's machinery — see src/lib/reap.sh for the measured predicate. Runs AFTER
+  # every write above, so a reaper fault can never cost the status transition.
+  case "$verb" in
+    done|cancel) declare -F _reap_at_task_boundary >/dev/null 2>&1 && _reap_at_task_boundary "$verb" "$ident" || true ;;
+  esac
 
   local ok_msg="$ident $verb"
   [[ -n "$handoff_ack" ]] && ok_msg+=" — verifier ACK: reviewing"
@@ -1908,4 +2075,3 @@ _task_merge_owner() {
   who=$(db "SELECT COALESCE(NULLIF(maker_agent,''), COALESCE(assignee,'?')) FROM tasks WHERE id=${id};" 2>/dev/null)
   printf '%s' "${who:-?}"
 }
-

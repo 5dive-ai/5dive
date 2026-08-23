@@ -109,10 +109,16 @@ rows_for() { local i; for i in $(seq 1 60); do grep -c "tasks=$1 " "$NOTIFY_LOG"
              grep "tasks=$1 " "$NOTIFY_LOG" 2>/dev/null; }
 reset_log() { : >"$NOTIFY_LOG"; : >"$ROUTE_FILE"; : >"$AUDIT_LOG_FILE"; }
 
+# DIVE-3474 arm 2 — EVERY CASE BELOW THAT EXERCISES THE SEND NOW PASSES --urgent.
+# The a2a ping is no longer what filing a routed gate DOES; it is what --urgent
+# buys. The assertions themselves are unchanged and still grade the send rail
+# (DIVE-2011's whole dataset), because the rail still exists and still has to be
+# observable when it fires. Case 7 below grades the new DEFAULT.
+
 # --- 1. a routed gate now records a delivery verdict at all -------------------
 # The headline defect: zero rows for the entire routed population.
 reset_log; seed DIVE-7; HUMAN_PINGED=0; SEND_RC=0; JSON_MODE=0
-OUT7=$(cmd_task_need DIVE-7 --type=decision --ask="ship A or B?" --options="A|B" --recommend="A" --from=dev 2>"$TMP/e7")
+OUT7=$(cmd_task_need DIVE-7 --urgent --type=decision --ask="ship A or B?" --options="A|B" --recommend="A" --from=dev 2>"$TMP/e7")
 R7=$(rows_for DIVE-7)
 [[ -n "$R7" ]] && ok_t "routed gate writes a gate-delivery row (was ZERO rows for the whole rail)" \
   || bad_t "routed gate writes a delivery row" "log: $(cat "$NOTIFY_LOG")"
@@ -134,7 +140,7 @@ grep -q 'delivery=delivered' <<<"$(audit_route)" && ok_t "audit row carries deli
 # This is the case that could not previously exist: the stub returns non-zero and
 # the old code printed "routed to main" regardless.
 reset_log; seed DIVE-8; HUMAN_PINGED=0; SEND_RC=7; JSON_MODE=0
-OUT8=$(cmd_task_need DIVE-8 --type=decision --ask="ship A or B?" --options="A|B" --recommend="A" --from=dev 2>"$TMP/e8")
+OUT8=$(cmd_task_need DIVE-8 --urgent --type=decision --ask="ship A or B?" --options="A|B" --recommend="A" --from=dev 2>"$TMP/e8")
 R8=$(rows_for DIVE-8)
 grep -q 'result=error' <<<"$R8" && ok_t "failed routed send records result=error" || bad_t "failed send error row" "row: $R8"
 grep -q 'rc=7' <<<"$R8" && ok_t "error row carries the send's ACTUAL exit status (rc=7)" || bad_t "error row names rc" "row: $R8"
@@ -163,13 +169,13 @@ grep -qE 'lead-route error' <<<"$_A8" && ok_t "audit result is error, NOT the ol
 
 # --- 3. the JSON envelope tells a machine reader the same thing ---------------
 reset_log; seed DIVE-9; SEND_RC=7; JSON_MODE=1
-J9=$(cmd_task_need DIVE-9 --type=decision --ask="ship?" --from=dev 2>/dev/null)
+J9=$(cmd_task_need DIVE-9 --urgent --type=decision --ask="ship?" --from=dev 2>/dev/null)
 [[ "$(jq -r '.data.delivery' <<<"$J9" 2>/dev/null)" == "failed" ]] && ok_t "JSON: delivery=failed on a failed routed send" \
   || bad_t "JSON delivery=failed" "json: $J9"
 [[ "$(jq -r '.data.notified' <<<"$J9" 2>/dev/null)" == "false" ]] && ok_t "JSON: notified=false on a failed routed send" \
   || bad_t "JSON notified=false" "json: $J9"
 reset_log; seed DIVE-10; SEND_RC=0
-J10=$(cmd_task_need DIVE-10 --type=decision --ask="ship?" --from=dev 2>/dev/null)
+J10=$(cmd_task_need DIVE-10 --urgent --type=decision --ask="ship?" --from=dev 2>/dev/null)
 [[ "$(jq -r '.data.delivery' <<<"$J10" 2>/dev/null)" == "delivered" && "$(jq -r '.data.notified' <<<"$J10" 2>/dev/null)" == "true" ]] \
   && ok_t "JSON: delivery=delivered + notified=true on a confirmed routed send" || bad_t "JSON delivered" "json: $J10"
 JSON_MODE=0
@@ -187,7 +193,7 @@ _NC_RC=0
 # succeeded and this case silently exercised a different branch. `hash -r` drops
 # any cached lookup for the same reason.
 mkdir -p "$TMP/emptybin"
-( unset -f 5dive; PATH="$TMP/emptybin"; hash -r; TASK_GATE_ROUTE_TO=main TASK_GATE_ROUTE_ROLE="lead review" \
+( unset -f 5dive; PATH="$TMP/emptybin"; hash -r; TASK_GATE_ROUTE_TO=main TASK_GATE_ROUTE_ROLE="lead review" TASK_GATE_ROUTE_URGENT=1 \
     _task_need_route_deliver DIVE-11 decision "ship?" "" "" ) >"$TMP/o11" 2>"$TMP/e11" || _NC_RC=$?
 eval "$_saved_5dive"
 R11=$(grep 'tasks=DIVE-11 ' "$NOTIFY_LOG")
@@ -236,6 +242,64 @@ _H13=$(grep 'tasks=DIVE-13 ' "$NOTIFY_LOG")
   || bad_t "human rail row is not routed" "row: $_H13"
 [[ -z "${TASK_GATE_ROUTE_TO:-}" ]] && ok_t "TASK_GATE_ROUTE_TO does not leak past the routed call" \
   || bad_t "route global scoped" "TASK_GATE_ROUTE_TO=${TASK_GATE_ROUTE_TO:-}"
+
+# --- 7. DIVE-3474 arm 2: the DEFAULT is a QUEUE, not an interrupt ------------
+# The ticket's acceptance, both halves: a routed gate produces ZERO `agent send`
+# to the lead, and is STILL answerable and STILL recorded. The second half is the
+# one that matters — a queue that loses the decision is worse than the interrupt
+# it replaced — so every conjunct of "still a gate" is asserted here and not
+# assumed from the fact that the first half passed.
+reset_log; seed DIVE-14; HUMAN_PINGED=0; SEND_RC=0; JSON_MODE=0
+actor_seam_as dev   # file as the BUILDER, so the gate routes up to the lead
+OUT14=$(cmd_task_need DIVE-14 --type=decision --ask="ship A or B?" --options="A|B" --recommend="A" --from=dev 2>"$TMP/e14")
+# THE HEADLINE: nothing was sent. $ROUTE_FILE is written by the `5dive agent send`
+# stub, so a non-empty file is a wake this ticket exists to remove.
+[[ ! -s "$ROUTE_FILE" ]] && ok_t "arm 2: a routed gate fires ZERO agent send — the lead's window is not woken" \
+  || bad_t "arm 2: no agent send at file time" "route: $(cat "$ROUTE_FILE")"
+[[ "$HUMAN_PINGED" == "0" ]] && ok_t "arm 2: and it does not fall through to the human either" \
+  || bad_t "arm 2 no human ping" "HUMAN_PINGED=$HUMAN_PINGED"
+R14=$(rows_for DIVE-14)
+grep -q 'chat=queue:main' <<<"$R14" && ok_t "arm 2: the delivery row names the QUEUE rail, so queued rows are separable from sent ones" \
+  || bad_t "arm 2 queue row" "row: $R14"
+grep -q 'result=ok' <<<"$R14" && ok_t "arm 2: queuing is a SUCCESS verdict, not a silent gap in the delivery dataset" \
+  || bad_t "arm 2 queue row ok" "row: $R14"
+# STILL A GATE. Filed, blocked, unanswered, routed, and clearable by the lead.
+[[ "$(db "SELECT status FROM tasks WHERE ident='DIVE-14';")" == "blocked" ]] \
+  && ok_t "arm 2: the row is still BLOCKED (the gate was not weakened into a note)" || bad_t "arm 2 blocked" ""
+[[ -z "$(db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE ident='DIVE-14';")" ]] \
+  && ok_t "arm 2: still UNANSWERED — nothing was auto-applied (54 of 121 is the reason)" || bad_t "arm 2 unanswered" ""
+[[ "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-14';")" == "main" ]] \
+  && ok_t "arm 2: routed_reviewer persists, so the lead still holds the clearance" || bad_t "arm 2 routed_reviewer" ""
+[[ "$(db "SELECT COALESCE(recommend,'') FROM tasks WHERE ident='DIVE-14';")" == "A" ]] \
+  && ok_t "arm 2: the recommendation is preserved and is NOT the answer" || bad_t "arm 2 recommend kept" ""
+# DISCOVERABLE. The acceptance names this explicitly: assert the gate is findable
+# at the lead's next wake, or the change trades an interrupt for a lost decision.
+Q14=$(cmd_task_queue --for=main --json 2>/dev/null)
+G14=$(jq -c '.data.gates[] | select(.ident=="DIVE-14")' <<<"$Q14" 2>/dev/null)
+[[ -n "$G14" ]] \
+  && ok_t "arm 2: DISCOVERABLE — the gate shows in the reviewer's queue" || bad_t "arm 2 queue view" "json: $Q14"
+# And it hands over the whole decision, not a pointer to it: a view that withholds
+# a field makes its consumer go and rebuild the rule.
+for _f in ask recommend options answer_cmd filed_by; do
+  [[ "$(jq -r ".${_f} // empty" <<<"$G14" 2>/dev/null)" != "" ]] \
+    && ok_t "arm 2: the queue carries '${_f}' — the reviewer decides from the view, not from a re-derivation" \
+    || bad_t "arm 2 queue field ${_f}" "json: $Q14"
+done
+[[ "$(jq -r '.urgent' <<<"$G14" 2>/dev/null)" == "false" ]] \
+  && ok_t "arm 2: urgency is its OWN field and is false here — a recommendation is not a clock" \
+  || bad_t "arm 2 urgent field" "json: $Q14"
+grep -qi 'QUEUED' <<<"$OUT14" && ok_t "arm 2: the filer is TOLD it queued rather than pinged" \
+  || bad_t "arm 2 filer told" "out: $OUT14"
+# THE NEGATIVE for the queue view: a peer's gate is not in MY queue.
+[[ "$(jq -r '.data.count' <<<"$(cmd_task_queue --for=dev --json 2>/dev/null)" 2>/dev/null)" == "0" ]] \
+  && ok_t "arm 2 NEGATIVE: the gate is NOT in a seat it was not routed to" || bad_t "arm 2 queue negative" ""
+# --urgent is a SEPARATE axis from --recommend: a recommendation alone must not
+# buy a ping. DIVE-14 above carried --recommend=A and sent nothing, which is the
+# assertion; this pins the stored field so a later reader cannot conflate them.
+[[ "$(db "SELECT COALESCE(gate_urgent,0) FROM tasks WHERE ident='DIVE-14';")" == "0" ]] \
+  && ok_t "arm 2: --recommend alone does NOT set gate_urgent" || bad_t "arm 2 urgency separate" ""
+[[ "$(db "SELECT COALESCE(gate_urgent,0) FROM tasks WHERE ident='DIVE-7';")" == "1" ]] \
+  && ok_t "arm 2: --urgent persists gate_urgent=1 (the re-nag grace reads it)" || bad_t "arm 2 urgent persisted" ""
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

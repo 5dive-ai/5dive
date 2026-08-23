@@ -93,9 +93,10 @@ broker_surface() {
 # broker_gate_check <surface> <id> <ident> [require-signature] — the ONE
 # cleared-gate predicate, formerly _push_gate_check (DIVE-1376/1460/1496). The
 # task must carry an answered, non-rejected gate cleared by either a proven
-# human OR the gate's designated routed reviewer. A bare agent answer and every
-# auto-clear provenance are deliberately excluded: neither authorizes a
-# privileged write. The friendly agent-side preflight checks the persisted
+# human OR the gate's designated routed reviewer. A bare agent answer is deliberately
+# excluded, and so is every auto-clear provenance EXCEPT the one DIVE-3481 delegates by
+# name (`auto:pfr` on an approval gate — see the arm below for the whole grant): none
+# of the others authorizes a privileged write. The friendly agent-side preflight checks the persisted
 # provenance; the root-only executor passes require-signature=1 and also
 # verifies the root-HMAC closure, so raw DB edits cannot forge authorization.
 broker_gate_check() {
@@ -116,11 +117,67 @@ broker_gate_check() {
   guid=$(db "SELECT COALESCE(need_answered_uid,'')    FROM tasks WHERE id=${id};")
   gsig=$(db "SELECT COALESCE(need_answer_sig,'')      FROM tasks WHERE id=${id};")
   reviewer=$(db "SELECT COALESCE(routed_reviewer,'')  FROM tasks WHERE id=${id};")
+  # DIVE-3577: `tasks` alone is the WRONG table to key this precondition on.
+  # A gate lives on the row only until something RETIRES it, and retirement
+  # (_gate_archive_and_clear_sql) moves it to gate_history and nulls all six
+  # provenance columns. `task park` retires an ANSWERED gate that way — and
+  # parking is exactly what a row does while it waits for the delegated push it
+  # just got approved for. So the approval is destroyed by the ordinary
+  # lifecycle, and this predicate then reports "no gate", i.e. it renders
+  # "cleared and then archived" and "never asked" as the same observation
+  # (measured on DIVE-3560: gate_history holds `approve` / `lead:ops` /
+  # retired_by=park, and the live row reads gateless).
+  #
+  # So: when the live row carries NO current gate, fall back to the most recent
+  # RESOLVED gate in gate_history. Every check below is then applied to that
+  # record unchanged — the reject scan, the provenance arms and, under
+  # require_sig, the signed closure. That last one is why this is safe to read
+  # from an archive at all: _gate_closure_sign is keyed on (task id, type,
+  # answer, answered_by, answered_at, uid), all six of which gate_history
+  # preserves verbatim, so an archived answer verifies exactly as it did when it
+  # was live and a hand-edited history row still fails.
+  #
+  # DELIBERATELY the most recent one, not "any approval anywhere in the
+  # history": digging past a later rejection to find an older approval would let
+  # a retired `no` be out-voted by a stale `yes`. One row, the newest resolved
+  # one, then the same verdict reading as always.
+  #
+  # NOT applied when a current gate exists but is still OPEN: an unanswered
+  # question on the row is a live question, and an archived approval does not
+  # answer it. That case keeps refusing (with a pointer, below).
+  local gate_src="current" retired_by="" retired_at=""
+  if [[ -z "$gtype" && -z "$gansweredat" ]]; then
+    local hid
+    hid=$(db "SELECT id FROM gate_history
+               WHERE task_id=${id}
+                 AND need_answered_at IS NOT NULL AND need_answered_at<>''
+               ORDER BY id DESC LIMIT 1;")
+    if [[ -n "$hid" ]]; then
+      gate_src="archived"
+      gtype=$(db      "SELECT COALESCE(need_type,'')          FROM gate_history WHERE id=${hid};")
+      gansweredat=$(db "SELECT COALESCE(need_answered_at,'')  FROM gate_history WHERE id=${hid};")
+      ganswer=$(db    "SELECT COALESCE(need_answer,'')        FROM gate_history WHERE id=${hid};")
+      gby=$(db        "SELECT COALESCE(need_answered_by,'')   FROM gate_history WHERE id=${hid};")
+      guid=$(db       "SELECT COALESCE(need_answered_uid,'')  FROM gate_history WHERE id=${hid};")
+      gsig=$(db       "SELECT COALESCE(need_answer_sig,'')    FROM gate_history WHERE id=${hid};")
+      retired_by=$(db "SELECT COALESCE(retired_by,'')         FROM gate_history WHERE id=${hid};")
+      retired_at=$(db "SELECT COALESCE(retired_at,'')         FROM gate_history WHERE id=${hid};")
+    fi
+  fi
+  local from_note=""
+  [[ "$gate_src" == "archived" ]] &&     from_note=" [read from the gate archived by '${retired_by:-unknown}'${retired_at:+ at ${retired_at}} — the live row carries no gate]"
   if [[ -z "$gtype" ]]; then
     fail "$E_VALIDATION" "no gate on ${ident} — file a ${noun}-for-review gate first: 5dive task need ${ident} --type=approval --ask='${ask}' (files tier-1 to the org lead, who can clear it)"
   fi
   if [[ -z "$gansweredat" ]]; then
-    fail "$E_VALIDATION" "gate on ${ident} is OPEN (unanswered ${gtype}) — ${noun} refused until it clears (5dive task answer ${ident} ...)."
+    # An archived resolution cannot answer a question that is still being asked,
+    # but the reader deserves to know it is there — otherwise a re-file over an
+    # approval reads as "you never got approved" (DIVE-3577).
+    local prior_hint=""
+    if [[ "$(db "SELECT COUNT(*) FROM gate_history WHERE task_id=${id} AND need_answered_at IS NOT NULL AND need_answered_at<>'';")" != "0" ]]; then
+      prior_hint=" This row DOES carry an earlier resolved gate in its archive (5dive task gate-history ${ident}), but a NEWER gate is open and supersedes it."
+    fi
+    fail "$E_VALIDATION" "gate on ${ident} is OPEN (unanswered ${gtype}) — ${noun} refused until it clears (5dive task answer ${ident} ...).${prior_hint}"
   fi
   # DIVE-2614: the verdict word is read off the FIRST NON-BLANK LINE, as a
   # whole word (`\b`). Either half of the old check alone still misreads real
@@ -153,7 +210,7 @@ broker_gate_check() {
   # this list is maintained by hand, not enforced by the pattern.
   if printf '%s' "$gverdict" | grep -qiE '^\s*(no|reject|rejected|deny|denied|block|blocked)\b'; then
     audit_log "${surface} gate" error "$E_VALIDATION" -- "ident=${ident}" "line=${gverdict}"
-    fail "$E_VALIDATION" "gate on ${ident} was REJECTED ('${ganswer}') — ${noun} refused."
+    fail "$E_VALIDATION" "gate on ${ident} was REJECTED ('${ganswer}') — ${noun} refused.${from_note}"
   fi
   [[ "$gby" == human:* ]] && authorized=1
   # DIVE-1555: accept ANY lead-clear provenance (`lead:*`), not only one whose
@@ -178,6 +235,28 @@ broker_gate_check() {
   # signature check. (The exact-match line is kept as belt-and-braces.)
   [[ "$gby" == lead:* ]] && authorized=1
   [[ -n "$reviewer" && "$gby" == "lead:${reviewer}" ]] && authorized=1
+  # DIVE-3481: the ONE auto-clear provenance this predicate accepts, and the sentence
+  # above ("every auto-clear provenance is deliberately excluded") is now scoped to
+  # this exception rather than absolute. `auto:pfr` is stamped ONLY by cmd_task_need's
+  # inert push-for-review path, which fires solely on `type=approval` at tier 1 with
+  # the T2 category floor un-fired, no declared capability, a non-empty recommendation,
+  # and a `Branch:` binding on the row that is not a protected ref — the ask itself
+  # having passed `_gate_push_for_review_hit`, which fails closed on any prod-touching
+  # verb. Measured: 101 of 101 answered gates in that class applied the filer's
+  # recommendation, which is why this class and no other is delegated.
+  #
+  # EXACT MATCH AND TYPE-BOUND, not a `auto:pfr*` glob and not provenance alone. The
+  # push surface is the whole point of the grant, so a `manual`/`access`/`decision` row
+  # carrying this string is not authorized by it — that would be a provenance minted
+  # for one authority spent on another.
+  #
+  # Why the string is not the security boundary: `need_answered_by` is inside the
+  # SIGNED closure, the root executor passes require_sig=1 and re-verifies it, and the
+  # HMAC key is 0400 root:root — so a raw-DB write of `auto:pfr` fails
+  # `_gate_closure_verify` exactly as a forged `lead:X` does (DIVE-1555's argument,
+  # unchanged). The minting path refuses to clear at all when it cannot sign, so an
+  # unsigned `auto:pfr` row is not a state this system produces.
+  [[ "$gby" == "auto:pfr" && "$gtype" == "approval" ]] && authorized=1
   # DIVE-2004: a `decision` gate cleared by its own designated reviewer could never
   # authorize an action, because `lead:` is minted ONLY for approval|manual|access —
   # so the refusal accused the reviewer who had in fact cleared it. The predicate
@@ -203,7 +282,7 @@ broker_gate_check() {
     else
       detail=" — required 'human:*' or 'lead:*'; found '${gby:-unknown}', and this gate has no routed reviewer to attribute a decision answer to."
     fi
-    fail "$E_VALIDATION" "gate on ${ident} was not cleared by an authority delegated ${noun} accepts${detail}"
+    fail "$E_VALIDATION" "gate on ${ident} was not cleared by an authority delegated ${noun} accepts${detail}${from_note}"
   fi
   # DIVE-2801: THREE closure states, not two, and the preflight can tell them apart.
   #
@@ -233,7 +312,7 @@ broker_gate_check() {
   BROKER_GATE_SIG_STATE="unverified"
   if [[ "$require_sig" == "1" ]]; then
     if ! _gate_closure_verify "$id" "$gtype" "$ganswer" "$gby" "$gansweredat" "$guid" "$gsig"; then
-      fail "$E_VALIDATION" "gate on ${ident} has no valid signed closure — delegated ${noun} refused"
+      fail "$E_VALIDATION" "gate on ${ident} has no valid signed closure — delegated ${noun} refused${from_note}"
     fi
     BROKER_GATE_SIG_STATE="verified"
   elif [[ -z "$gsig" ]]; then

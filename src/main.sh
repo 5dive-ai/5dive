@@ -83,6 +83,29 @@ Agents:
                                                      # comma-separable; dashboard (claude-only, no token)
                                                      # enables web-dashboard chat — the one-tap Enable chat
                                                      # path. New claude creates include it by default.
+  5dive agent buzz enable <name> --relay=<https://…> # DIVE-3509: install the buzz plugin, mint the agent's
+                                                     # own nostr identity and write its config (0600).
+                                                     # --channels=<csv> --poll-ms=<n> --buzz-path=<path>
+                                                     # --rotate-key mints a NEW key (the handset must re-pair)
+  5dive agent buzz inbound --pubkey=<k> --message-file=<p>  # DIVE-3573: the bridge's inbound router. Classifies
+                                                     # the signing key and routes it: a known teammate's key
+                                                     # onto the a2a rail, the paired owner's like a human
+                                                     # message, anything else untrusted (unchanged). Delivers
+                                                     # to the CALLING seat only — no target argument.
+  5dive agent buzz whois <pubkey|npub1…> [--role]    # DIVE-3572: pubkey -> which seat, from the registry.
+                                                     # rc 0 name on stdout · 4 MEASURED unknown · 5 ambiguous
+                                                     # · 3 not a key · 1 registry unreadable (NOT measured).
+                                                     # Read-only, no root: the buzz plugin shells to it.
+  5dive agent buzz status <name>                     # is buzz actually wired? plugin/config/binary, not
+                                                     # the agent unit's liveness. rc 3 = declared, not usable
+  5dive agent buzz pair <name> [--timeout=<secs>]    # DIVE-3551: run the NIP-AB pairing session (QR + SAS);
+                                                     # emits BUZZ-PAIR-* marker lines the dashboard panel parses
+  5dive buzz pair [--timeout=<secs>] [--agent=<n>]   # DIVE-3592: ONE QR per SERVER — pairs the phone as the
+                                                     # OWNER of this box, wiring that identity into every buzz
+                                                     # agent's channels first. Prefer this over the per-agent
+                                                     # form; who talks in team chat is \`agent buzz enable\`.
+  5dive buzz owner [--envelope]                      # the box's handset identity (public half; --envelope is
+                                                     # the DIVE-3300 payload and carries a PRIVATE key)
   5dive agent config <name> set workdir=<path>       # tmux cwd; "default" clears override
   5dive agent config <name> set auth-profile=<name>  # swap profile; "default" clears override
   5dive agent config <name> set model=<id>           # runtime model (claude/codex/grok/antigravity)
@@ -193,6 +216,9 @@ Accounts (a named auth profile — group sign-ins so multiple agents share one l
 
 Auth (lower-level; the dashboard uses these — prefer 'account' for human-driven flows):
   5dive agent auth status [--probe] [--type=<type>]    # real --print probe reveals stale creds
+  5dive agent auth status --agent=<name> [--probe]     # THIS agent's own credential (DIVE-3104:
+                                                       # a bare --type answer is the DEFAULT profile
+                                                       # and cannot see a per-agent gap)
   5dive agent auth login <type>                        # interactive TTY (hands off this process)
   5dive agent auth set <type> --api-key=<key|-> [--auth-profile=<name>] [--provider=<id>]
                               [--base-url=<url>] [--model=<slug>]
@@ -227,7 +253,9 @@ Projects (ident namespaces for the queue; default 'dive' = DIVE-N):
   5dive loop spawn --role=<r> --agent=<a> --prompt="…" [--ceiling=<tok>] [--wait[=<sec>]]  # orchestration (JSON in/out)
   5dive goal add "<outcome>" [--dry-run] [--max-tasks=N] [--yes]   # outcome -> validated, guardrailed task graph
   5dive objective add "<name>" --metric-cmd="<cmd>" --target=<n> [--direction=up|down] [--unit=%] [--public]  # standing goal bound to a read-only metric
-  5dive objective ls | show <name> | tick [<name>] | pause <name> | resume <name> [--force] | rm <name>  # resume preflights the planner role
+  5dive objective ls [--all] | show <name> | tick [<name>] | pause <name> | resume <name> [--force]  # resume preflights the planner role
+  5dive objective rm <name> [--reason="<why>"] [--ref=<task>]      # RETIRES (tombstone): keeps the audited cycles + readings, hidden from ls
+  5dive objective rm <name> --purge --yes                          # the destructive one: deletes the cycles + readings too
   5dive objective replan <name> [--max-new-per-cycle=N] [--no-progress-limit=N] [--dry-run] [--yes] [--force] [--from-gate=<id>]  # re-plan cycle: preflight -> metric -> guardrailed diff -> gate -> apply; explicit stops (/)
 
 Org chart (who reports to whom):
@@ -375,7 +403,7 @@ Health:
     or an editor). Needs root for the mutating and journal/cron verbs — an admin
     agent reaches them through its existing \`/usr/local/bin/5dive *\` grant.
 
-  5dive doctor [--fix] [--dry-run] [--caps] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins|caps]
+  5dive doctor [--fix] [--dry-run] [--caps] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins|caps|models]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
     probes, stale shadow-credential heal (creds), registry integrity, channel
     health (allowlist + dead inbound telegram poller), host safety (needrestart
@@ -532,8 +560,27 @@ main() {
       # admin=false everywhere, and a read has no actor field to attribute). The
       # decision is printed on every call. Credential-bearing → audited; the
       # token is read root-side in _gh_do and never lands in argv.
+      # DIVE-2792: `exit $?`, like every sibling passthrough arm above. Today the
+      # status still reaches the caller without it — this case is main()'s last
+      # statement and `main "$@"` is the script's — so the fix is not a live
+      # bug-fix but the removal of a load-bearing coincidence: the moment anyone
+      # appends a statement after `esac`, gh's exit status (4 = not logged in,
+      # 8 = checks pending, 1 = failing checks) is silently replaced by that
+      # statement's. A wrapper whose exit-code fidelity depends on where it sits
+      # in the file is one refactor away from lying again.
       AUDIT_CMD="gh"; AUDIT_ARGS=("$@")
-      cmd_gh "$@" ;;
+      cmd_gh "$@"; exit $? ;;
+    _merge_do)
+      # DIVE-3474 arm 1: hidden, privileged. Reachable ONLY via NOPASSWD sudo (the
+      # UNCONDITIONAL render_standard_sudoers line — it confers no authority of its
+      # own, exactly like _task_answer). Reads ONE task ident on STDIN and nothing
+      # else, re-derives the caller from SUDO_UID and its merge standing from the
+      # ROW as root (graded_by = this seat, over the shared graded-awaiting-merge
+      # predicate), and merges the pull request the ROW names — never one the
+      # caller does. Not audited here; the parent `task merge` verb is, and the
+      # primitive writes its own store-audit row naming the grader.
+      cmd_task_merge_do
+      exit $? ;;
     _gh_do)
       # DIVE-2448: hidden, privileged. Reachable ONLY via NOPASSWD sudo. Reads the
       # gh argv NUL-separated on STDIN (never argv, so the grant stays exact-path
@@ -681,6 +728,43 @@ main() {
         pair)
           AUDIT_CMD="agent pair"; AUDIT_ARGS=("$@")
           with_registry_lock cmd_pair "$@" ;;
+        # DIVE-3509: buzz onboarding. `enable` mints a key and writes the
+        # agent's config (registry write via cmd_config, so take the lock);
+        # `status` is a read-only probe — no lock, no audit, same treatment as
+        # telegram-getme below.
+        #
+        # DIVE-3572: `whois` joins `status` on the lock-free side, and that is a
+        # requirement rather than an optimisation. Its caller is the buzz plugin,
+        # which runs AS the agent user; with_registry_lock calls ensure_state,
+        # which is require_root, so routing it through the mutating arm would make
+        # the one lookup the trust model depends on unusable by the only process
+        # that needs it. It reads the group-readable registry and writes nothing.
+        #
+        # DIVE-3573: `inbound` is AUDITED (it is the bridge's trust decision, and
+        # a decision nobody can read afterwards is not a control) but takes NO
+        # registry lock. It reads the registry and writes nothing, and its tail is
+        # a real `agent send` that waits for a pane to be ready — holding the
+        # fleet-wide registry lock across a tmux readiness wait would stall every
+        # other seat's writes behind one inbound chat message. Its args are safe to
+        # log: a public key and a file PATH, never the body (see the verb's own
+        # --message-file refusal to take prose in argv).
+        buzz)
+          # DIVE-3592: `pair` is a LIVE SESSION (600s by default, waiting on a
+          # human with a phone). It writes no registry field of its own, and
+          # holding the fleet-wide registry lock for the width of a pairing
+          # session would stall every other seat's writes behind one customer
+          # scanning a QR. It joins `status`/`whois` on the lock-free side. The
+          # server-level `5dive buzz pair` takes the lock per join instead,
+          # around the wire-up only.
+          if [[ "${1:-}" == "status" || "${1:-}" == "whois" ]]; then
+            cmd_agent_buzz "$@"
+          elif [[ "${1:-}" == "inbound" || "${1:-}" == "pair" ]]; then
+            AUDIT_CMD="agent buzz"; AUDIT_ARGS=("$@")
+            cmd_agent_buzz "$@"
+          else
+            AUDIT_CMD="agent buzz"; AUDIT_ARGS=("$@")
+            with_registry_lock cmd_agent_buzz "$@"
+          fi ;;
         telegram-discover)
           # Read-only Telegram getUpdates poll — no registry mutation, no
           # state changes. Bot token would clutter the audit log if it were
@@ -864,6 +948,13 @@ main() {
       # more than the noise it costs.
       AUDIT_CMD="host"; AUDIT_ARGS=("$@")
       cmd_host "$@" ;;
+    buzz)
+      # DIVE-3592: pairing is per SERVER. Audited (it decides which handset
+      # holds the box owner identity) and NOT wrapped in the registry lock —
+      # `pair` blocks on a human with a phone, and its wire-up takes the lock
+      # per join instead.
+      AUDIT_CMD="buzz"; AUDIT_ARGS=("$@")
+      cmd_buzz "$@" ;;
     doctor)
       # Only audit when a mutating run is requested (--fix/--repair); read-only
       # runs (and --dry-run previews) would spam the log.

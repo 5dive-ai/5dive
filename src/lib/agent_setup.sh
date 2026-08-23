@@ -1893,8 +1893,10 @@ install_channel_for_agent() {
 # shipped self-heals WITHOUT a human rerunning install.sh. This is the exact
 # idempotent merge install.sh performs — extracted so `doctor --fix` and the
 # nightly selfupdate can call it on every existing box. Ensures channelsEnabled
-# =true and that BOTH 5dive fork channels (telegram + dashboard) are present,
-# never clobbering operator additions or the upstream/official entries. On a
+# =true and that EVERY 5dive fork channel in FIVEDIVE_CHANNEL_PLUGINS_JSON is
+# present, never clobbering operator additions or the upstream/official entries.
+# (DIVE-3537: that list used to be typed out here AND again in the doctor check
+# that gates this call. They drifted on buzz. One constant now.) On a
 # team box the org's remote managed-settings override this local file, so the
 # merge is inert there; on a personal/self-hosted box this local file IS the
 # self-approve allowlist that gates inbound channel pings.
@@ -1908,16 +1910,18 @@ reconcile_managed_settings() {
   [[ -f "$msj" ]] || return 1
   command -v jq >/dev/null 2>&1 || return 1
   jq -e . "$msj" >/dev/null 2>&1 || return 1
+  # DIVE-3537: the set comes from FIVEDIVE_CHANNEL_PLUGINS_JSON (header.sh), the
+  # same constant the doctor CHECK asserts. These were two hand-kept literals and
+  # they drifted on buzz; do not re-type the list here.
+  [[ -n "${FIVEDIVE_CHANNEL_PLUGINS_JSON:-}" ]] || return 1
   local tmp
   tmp=$(mktemp) || return 1
-  if jq '
+  if jq --argjson need "$FIVEDIVE_CHANNEL_PLUGINS_JSON" '
         .channelsEnabled = true
       | .allowedChannelPlugins = ((.allowedChannelPlugins // []) as $have
-          | $have + ([{"plugin":"telegram","marketplace":"5dive-plugins"},
-                      {"plugin":"dashboard","marketplace":"5dive-plugins"},
-                      {"plugin":"buzz","marketplace":"5dive-plugins"}]
-              | map(select(. as $need
-                  | ($have | any(.plugin == $need.plugin and .marketplace == $need.marketplace)) | not))))
+          | $have + ($need
+              | map(select(. as $n
+                  | ($have | any(.plugin == $n.plugin and .marketplace == $n.marketplace)) | not))))
       ' "$msj" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
     if jq -e --slurpfile a "$tmp" '. == $a[0]' "$msj" >/dev/null 2>&1; then
       rm -f "$tmp"; return 3          # already current
@@ -1925,4 +1929,105 @@ reconcile_managed_settings() {
     install -m 644 "$tmp" "$msj"; rm -f "$tmp"; return 0
   fi
   rm -f "$tmp"; return 1
+}
+
+# DIVE-3537: the GATE for the fixer above, deliberately living beside it and
+# reading the SAME constant. `doctor --category=channels` used to inline its own
+# jq asserting telegram+dashboard by hand; when buzz was added to the fixer the
+# gate was not touched, so on every box provisioned before buzz the check printed
+# [ok], the fixer was never called, and `agent config <name> set channels=…,buzz`
+# produced an installed, running, deaf channel. A self-heal whose gate cannot
+# fire is the same as no self-heal — and it reports [ok] either way.
+#
+# Returns 0 when the file is fully current (channelsEnabled:true AND every entry
+# of FIVEDIVE_CHANNEL_PLUGINS_JSON present), 1 otherwise — including when the
+# file is missing/unreadable/not JSON or jq is absent, because "cannot prove it
+# is current" must route to the repair path, never to [ok].
+managed_settings_channels_ok() {
+  local msj="${1:-/etc/claude-code/managed-settings.json}"
+  [[ -f "$msj" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  [[ -n "${FIVEDIVE_CHANNEL_PLUGINS_JSON:-}" ]] || return 1
+  jq -e --argjson need "$FIVEDIVE_CHANNEL_PLUGINS_JSON" '
+        .channelsEnabled == true
+    and ((.allowedChannelPlugins // []) as $have
+         | $need | all(. as $n
+             | $have | any(.plugin == $n.plugin and .marketplace == $n.marketplace)))
+    ' "$msj" >/dev/null 2>&1
+}
+
+# The names the gate above is missing, "plugin@marketplace, …" on stdout (empty
+# when none are). Derived from the same constant so a newly shipped channel is
+# named in the doctor line without anyone editing a message string.
+managed_settings_channels_missing() {
+  local msj="${1:-/etc/claude-code/managed-settings.json}"
+  [[ -f "$msj" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  [[ -n "${FIVEDIVE_CHANNEL_PLUGINS_JSON:-}" ]] || return 1
+  jq -r --argjson need "$FIVEDIVE_CHANNEL_PLUGINS_JSON" '
+      (.allowedChannelPlugins // []) as $have
+      | [$need[] | select(. as $n
+          | ($have | any(.plugin == $n.plugin and .marketplace == $n.marketplace)) | not)
+        | "\(.plugin)@\(.marketplace)"] | join(", ")
+    ' "$msj" 2>/dev/null
+}
+
+# DIVE-3568: the session `agent create` hands the customer is DEAF to the
+# channels it was created with. Measured on a virgin box (jolly-birch,
+# 2026-08-18, CLI v0.19.41 / claude-code 2.1.234): the FIRST boot printed
+#
+#   --channels ignored ... Channels are not currently available
+#
+# and that session stayed deaf for its whole life, while after ONE restart the
+# same flag was honoured and the channel attached. It self-heals, which is
+# exactly why it survived to a customer walk — every second look is healthy,
+# and the only session that is ever cold is the one the customer is handed.
+#
+# The fix is the one treatment the box itself demonstrated: restart once. The
+# first boot is demoted to a WARM-UP whose only job is to let claude-code do
+# whatever first-boot state it does; the session the customer actually gets is
+# the second one. We deliberately do NOT pre-seed claude-code's capability /
+# feature cache — that file's shape is version-coupled to whatever claude-code
+# shipped that week, and DIVE-3564 already ate 13 days of unwatched releases
+# once.
+#
+# The WAIT is an optimisation, never the fix: we poll the seat's ~/.claude.json
+# for any `cached*` key (where 2.1.234 persists its feature/config reads) so the
+# restart lands after the warm-up wrote something, and we restart REGARDLESS
+# once the budget is spent. A claude-code release that renames or moves those
+# keys therefore costs latency here, not correctness.
+#
+# Args: <name> [budget-seconds] [config-path]. Returns 0 when the unit came
+# back active, 1 when the restart failed — callers WARN and keep the agent; an
+# agent on a cold flag is still an agent, and rolling back a create over it
+# would be strictly worse than the bug.
+warm_channel_capability_restart() {
+  local name="$1" budget="${2:-45}"
+  local cfg="${3:-/home/agent-${name}/.claude.json}"
+  local waited=0 step_s=3
+  # Floor: the cache key we watch for lands within ~3s of boot (measured on
+  # this host, 510 feature entries at t+3s), which is sooner than we trust the
+  # rest of the first boot to be done. Restarting THAT early risks handing over
+  # a session warmed by a run that never finished, so never restart before the
+  # floor even when the file goes warm immediately. Capped by the budget so a
+  # caller asking for a short wait still gets one.
+  local floor_s=10; (( floor_s > budget )) && floor_s=$budget
+  if command -v jq >/dev/null 2>&1; then
+    while (( waited < budget )); do
+      if [[ -s "$cfg" ]] \
+         && jq -e 'to_entries | map(select(.key | startswith("cached"))) | length > 0' \
+              "$cfg" >/dev/null 2>&1; then
+        break
+      fi
+      sleep "$step_s"; waited=$(( waited + step_s ))
+    done
+  else
+    # No jq: we cannot read the warm-up's progress, so spend a fixed slice of
+    # the budget and restart anyway. The restart is the fix; the read is not.
+    sleep $(( budget < 15 ? budget : 15 ))
+  fi
+  (( waited < floor_s )) && { sleep $(( floor_s - waited )); waited=$floor_s; }
+  systemctl restart "5dive-agent@${name}.service" >/dev/null 2>&1 || return 1
+  systemctl is-active --quiet "5dive-agent@${name}.service" 2>/dev/null || return 1
+  return 0
 }

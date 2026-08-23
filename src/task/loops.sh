@@ -14,6 +14,22 @@
 # that slipped through, e.g. a maker that kept re-routing without a clean reject).
 # Pairs with `5dive usage`, which attributes tokens/turns/cost to the same task
 # ids — so loops here + usage there give iterations AND cost per loop.
+#
+# DIVE-2489: the `maker` column renders a MEASURED maker and an INFERRED one
+# differently, because the difference is a governance claim. It used to be
+# `COALESCE(maker_agent, assignee)`, and after a maker→verifier handoff the
+# assignee IS the verifier — so a row that never stamped a maker rendered as
+# maker == verifier, byte-identical to a task whose maker really did grade their
+# own work. Measured on the live store 2026-08-16: 15 of 1184 verifier-carrying
+# rows read as self-graded through that fallback and ZERO of them had a recorded
+# maker_agent; 277 have no maker_agent at all. It fooled two agents in one day
+# and marketing nearly published "12 of 576 tasks were self-graded" off it.
+# Now: text prints the recorded maker, or `holder:<assignee>` when there is none
+# (the fallback is kept but MARKED, so inferred and measured are never the same
+# glyph), or `-` when the row has neither. JSON emits `maker: null` when it was
+# never stamped — the assignee is already carried separately as `holder`, so no
+# caller loses information. Same rule as the NOT-REACHED third state: a value you
+# did not measure must not render as one you did.
 #   --stuck            only the stuck loops
 #   --all              include closed loops (default: open only)
 #   --escalate-stuck   run `task escalate` on every stuck open loop (reuses the
@@ -81,7 +97,7 @@ cmd_task_loops() {
     if (( JSON_MODE )); then
       local tloops="[]" runs="[]"
       (( runs_only )) || tloops=$(dbfmt -json "SELECT ident, status,
-               COALESCE(maker_agent, assignee) AS maker, verifier,
+               maker_agent AS maker, verifier,
                COALESCE(iteration,0) AS iteration, max_iterations,
                COALESCE(assignee,'') AS holder,
                CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
@@ -106,7 +122,9 @@ cmd_task_loops() {
                  CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
                       THEN CASE WHEN handoff_ack_at IS NOT NULL THEN 'reviewing' ELSE 'delivered' END
                       ELSE '-' END AS handoff,
-                 COALESCE(maker_agent, COALESCE(assignee,'-')) AS maker,
+                 CASE WHEN maker_agent IS NOT NULL THEN maker_agent
+                      WHEN assignee IS NOT NULL THEN 'holder:'||assignee
+                      ELSE '-' END AS maker,
                  COALESCE(verifier,'-') AS verifier,
                  COALESCE(iteration,0)||'/'||COALESCE(CAST(max_iterations AS TEXT),'∞') AS iter,
                  CASE WHEN ${stuck_pred} THEN '⚠' ELSE '' END AS stuck,
@@ -420,10 +438,35 @@ cmd_task_loop() {
   esac
 }
 
+# DIVE-3330: return the binding that makes a verify PASS a grade, not proof that
+# the work reached main. This deliberately reuses the merge gate's PR and branch
+# discovery helpers. It does not attempt a second ancestry check: a credentialless
+# verifier can finish its own job by recording the grade, while `task done` remains
+# the one close path that answers the merge question.
+_task_verify_merge_binding() {
+  local id="$1" ident="$2" body dref branches=""
+  dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};")
+  body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
+  if [[ -n "$dref" ]]; then
+    printf 'delivery_ref %s' "$dref"
+  elif _gate_text_names_a_ref "$body"; then
+    printf 'a PR named in the body'
+  else
+    branches=$(_gate_branch_refs_from_text "$body" "$ident" 2>/dev/null | head -3 | paste -sd, -) || branches=""
+    # Explicit `return 0`: a trailing `[[ -n ... ]] && printf` supplies this
+    # function's exit status, so an empty $branches (no binding — the common,
+    # correct case) would make the helper return 1 to every caller.
+    if [[ -n "$branches" ]]; then
+      printf 'branch(es) named in the body: %s' "$branches"
+    fi
+  fi
+  return 0
+}
+
 # DIVE-475: deterministic verify-runner — proven-done, not claimed-done. Run a
-# command; its EXIT CODE is the real stop condition. On pass (exit 0) flip the
-# task to done with the command + output tail captured in result; on fail leave
-# status untouched (just record the failing attempt). The verb itself exits 0 on
+# command; its EXIT CODE is the real stop condition. On pass (exit 0), an unbound
+# task flips to done; a task carrying a merge binding records a structural grade
+# and stays open for `task done` (DIVE-3330). On fail leave status untouched. The verb exits 0 on
 # pass / 1 on fail so it can BE a stop condition (heartbeat /goal, scripts) — the
 # maker no longer grades itself by asserting status=done (writer != verifier).
 # --no-done (alias --check) runs the check and records it WITHOUT flipping.
@@ -461,7 +504,7 @@ cmd_task_verify() {
   # DIVE-1830 merge gate this verb already bypasses (DIVE-2938) is exactly what would
   # otherwise be riding on it. So --result requires --no-done and says so.
   if (( have_prose )) && (( ! no_done )); then
-    fail "$E_USAGE" "--result records a verifier's prose verdict WITHOUT closing, so it requires --no-done (alias --check). A prose PASS asserts the work is good; it is not evidence the work MERGED, and \`task verify\`'s close does not run the DIVE-1830 merge gate (DIVE-2938). To record the grade: 5dive task verify $task --no-done --result=\"<verdict>\". To close on evidence, pass a --cmd whose EXIT STATUS proves what you are claiming."
+    fail "$E_USAGE" "--result records a verifier's prose verdict WITHOUT closing, so it requires --no-done (alias --check). A prose PASS asserts the work is good; it is not evidence the work MERGED. To record the grade: 5dive task verify $task --no-done --result=\"<verdict>\". A passing --cmd also records a grade rather than closing whenever the row carries a delivery binding (DIVE-3330); the merge owner then closes through task done after the binding reaches main."
   fi
   if (( have_prose )) && [[ -z "${prose//[[:space:]]/}" ]]; then
     fail "$E_VALIDATION" "--result was given an EMPTY value. A zero-length verdict is indistinguishable from one that was never written (DIVE-2483), so it is refused rather than stored."
@@ -531,9 +574,8 @@ cmd_task_verify() {
   # board. That path is not an accident either: the DIVE-2318 merge-gate refuses a
   # `task done` with no gh credential and suggests handing the close to an agent
   # that holds one, DIVE-477 forbids that, and the refusal at :2707 then NAMES
-  # `task verify --cmd=` among its exits — so a no-gh verifier is ROUTED here by
-  # construction. The verb that a whole class of agents is funnelled into is the
-  # last one that should be the unguarded one.
+  # `task verify --cmd=` among its exits. DIVE-3330 corrects that refusal and holds
+  # bound rows open, but this result-preservation rail remains independently needed.
   #
   # Deliberately scoped to the NOT-done cell: the closed cell already has
   # DIVE-2067's own refusal and its "superseded result (DIVE-2067, preserved)"
@@ -552,6 +594,22 @@ cmd_task_verify() {
   if [[ "$_v_guard_st" != "done" && "$_v_guard_st" != "cancelled" ]]; then
     _task_guard_result_over_closed "$id" "$ident" verify "$result_txt" 0 0 verify-result-over-open
     result_txt="$_TASK_GUARDED_RESULT"
+  fi
+
+  # DIVE-3330: the old raw UPDATE below bypassed the DIVE-1830 ancestry gate.
+  # DIVE-2832 and DIVE-3098 now provide the rail DIVE-2938 was waiting for: keep
+  # a passing, bound row open and stamp the structural grade. This is terminal
+  # for the credentialless verifier and renders graded->merge when delivery_ref
+  # is present; the merge owner closes later through the gated `task done` path.
+  local merge_hold=0 merge_binding=""
+  if (( rc == 0 )) && (( ! no_done )) \
+      && [[ "$_v_guard_st" != "done" && "$_v_guard_st" != "cancelled" ]]; then
+    merge_binding=$(_task_verify_merge_binding "$id" "$ident") || merge_binding=""
+    if [[ -n "$merge_binding" ]]; then
+      no_done=1
+      merge_hold=1
+      result_txt="⏸ merge-gate hold (DIVE-3330) — verify evidence recorded, but this row binds ${merge_binding}; the command's exit status does not by itself prove that binding reached main. Row remains open for the merge owner to close through \`task done\`."$'\n'"${result_txt}"
+    fi
   fi
 
   local flipped=0 self_verified_close=0
@@ -574,10 +632,10 @@ cmd_task_verify() {
       policy_refuse "$E_CONFLICT" verify-close-over-open-gate DIVE-2196 "$ident" \
         "$ident has a pending '${_vg_t}' gate awaiting a human — the verify verdict is RECORDED, but the auto-close is refused: closing here would drop the human's question out of every open-gate view without anyone answering it, which is DIVE-555's bypass reached by a different verb. Exits: let them answer it ('5dive task answer $ident --value=...'), withdraw it if your result makes it moot ('5dive task need $ident --withdraw'), or re-run with --no-done to record evidence without closing."
     fi
-    # DIVE-2015: a maker is deliberately ALLOWED to rescue a stalled delivered
-    # loop with `task verify --cmd=...`; refusing it would remove the only
-    # zero-human exit when the assigned verifier never runs. Permitted must not
-    # mean invisible, though. When the kernel-authenticated caller is the recorded
+    # DIVE-2015: on an unbound delivered loop, a maker is deliberately ALLOWED to
+    # rescue a stalled verifier with `task verify --cmd=...`. A bound delivery has
+    # already been diverted to graded->merge by DIVE-3330 above. When the
+    # kernel-authenticated caller is the recorded
     # maker and the still-live row is held by its verifier, stamp the durable task
     # result, emit a separately classifiable audit event, and warn on stderr. The
     # mark names every fact a later reader needs to weigh the close: maker,
@@ -616,10 +674,8 @@ cmd_task_verify() {
     # follow-up split — was silently discarded. It survived only because the verifier had
     # also compiled it to the wiki.
     #
-    # Note this path is a SANCTIONED escape: the DIVE-2007 refusal message names
-    # `task verify --cmd` as a real exit for a maker whose delivery was refused. So the fix
-    # must NOT close that door — it blocks only the case where there is nothing to escape
-    # FROM, i.e. the task is already done and the closer is not the recorded verifier.
+    # This path also protects already-done rows independent of whether current
+    # guidance advertises verify as a closing escape: a repeat must not clobber ACK.
     #
     # RE-LAND NOTE (main, DIVE-2389): this compares `task_actor`, a PROVENANCE string the
     # caller can set, and not the kernel-authenticated identity DIVE-2330 introduced after
@@ -645,67 +701,6 @@ cmd_task_verify() {
     if [[ "$_v_st" == 'done' ]]; then
       _v_prev=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
       [[ -n "$_v_prev" ]] && result_txt="${result_txt}"$'\n'"--- superseded result (DIVE-2067, preserved) ---"$'\n'"${_v_prev}"
-    fi
-    # DIVE-2938: THIS CLOSE DOES NOT RUN THE MERGE GATE, AND UNTIL NOW IT DID NOT SAY SO.
-    #
-    # The DIVE-1830 merge gate lives in `_task_status_cmd` (the done/cancel verbs). This
-    # flip is a raw UPDATE in a different function, so a row can reach status=done with
-    # its delivery unmerged and nothing anywhere records that the question was never
-    # asked. Measured: DIVE-2743 closed on `verify --cmd` running a unit test inside a
-    # LOCAL WORKTREE and its test file is absent from main today; DIVE-2645 was graded
-    # "at worktree tip c2baa6b" with its PR still open.
-    #
-    # This is NOT the gate. Gating here would re-create the deadlock DIVE-2318 routes
-    # OUT of — its no-credential refusal names `task verify --cmd` as the authorised
-    # terminal move for a verifier who holds no gh, so refusing here without a working
-    # `--no-done` (still unreachable for a read-grader per DIVE-2832) would strand
-    # exactly the seat the exit was built for. That build waits on DIVE-2832.
-    #
-    # What ships instead is LEGIBILITY: when the row carries a binding the merge gate
-    # WOULD have checked, say on the record that it was not checked. Two properties
-    # earn it. (1) The reader of a done row currently cannot distinguish "merged and
-    # graded" from "graded on a branch" — both render as a green result. (2) It is the
-    # only way to FIND the class: `task merge-audit` scans for PR *numbers*, so a row
-    # binding a bare `Branch:` line — which is what both receipts did — is structurally
-    # invisible to it. A fixed token in the result field is greppable where the audit is
-    # blind.
-    #
-    # Deliberately scoped to rows that HAVE a binding. A row with nothing to merge has
-    # no question to leave unanswered, and stamping it would be noise that trains people
-    # to skip the line — the failure mode of every warning that fires too often.
-    local _mg_body _mg_dref _mg_bind=""
-    _mg_dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};")
-    _mg_body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
-    if [[ -n "$_mg_dref" ]]; then
-      _mg_bind="delivery_ref ${_mg_dref}"
-    elif _gate_text_names_a_ref "$_mg_body"; then
-      _mg_bind="a PR named in the body"
-    else
-      # DIVE-2577's own discovery rule, reused rather than re-spelt: a branch the row's
-      # prose names, anchored on the "<ident>-" prefix. Reusing it is the point — if the
-      # gate's idea of a binding changes, this stamp must change with it or it will go
-      # quiet on exactly the rows the gate started catching.
-      # DIVE-3265: AN EMPTY BRANCH SET IS AN ANSWER, NOT A FAILURE — `|| _mg_branches=""`
-      # is load-bearing and its absence killed the verb outright. The extractor is a
-      # PROBE that legitimately finds nothing (most rows name no branch). Its pipeline
-      # ends in `grep`, which exits 1 on no-match; `pipefail` promotes that out of the
-      # function and through `head | paste`, and a bare `var=$(...)` under `set -euo
-      # pipefail` (src/header.sh) then kills the whole run. Measured on DIVE-3264 with
-      # the CLI's own suggested trace, last lines before exit:
-      #     ++ paste -sd, - / + _mg_branches= / + on_exit_audit / + local code=1
-      # That is why the two verbs behaved DIFFERENTLY on one row: `task done` found a
-      # (bogus) branch, so extraction succeeded and it refused cleanly, while `task
-      # verify --cmd` found none and CRASHED before any error path could print.
-      # DIVE-2603 fixed exactly this at the sibling call site ~2000 lines up; this site
-      # shipped later (DIVE-2938) and re-introduced it. Grepped the class, not the form:
-      # these two are the only callers of the extractor and both are guarded now, and
-      # tests/verify_close_merge_gate_stamp_unit.sh arm C pins THIS one from both ends.
-      local _mg_branches
-      _mg_branches=$(_gate_branch_refs_from_text "$_mg_body" "$ident" 2>/dev/null | head -3 | paste -sd, -) || _mg_branches=""
-      [[ -n "$_mg_branches" ]] && _mg_bind="branch(es) named in the body: ${_mg_branches}"
-    fi
-    if [[ -n "$_mg_bind" ]]; then
-      result_txt="⚠ merge-gate NOT EVALUATED (DIVE-2938) — closed via \`task verify\`, which does not run the DIVE-1830 gate. This row binds ${_mg_bind}; whether it reached main was NOT checked by this close. Confirm with a positive existence test on the canonical ref (e.g. \`git cat-file -e origin/main:<a file the change created>\`) before relying on it."$'\n'"${result_txt}"
     fi
     # DIVE-2477: the THIRD close writer. DIVE-2067 taught this lesson one column
     # over — when you guard one verb, ask which OTHERS write the field. A
@@ -737,9 +732,31 @@ cmd_task_verify() {
     # up. graded_by is the ACTOR, so terminal_for_verifier can additionally require
     # grader != maker and a self-verified close cannot buy the exemption.
     # COALESCE: first grade wins, same rule as done_at (DIVE-2477).
+    #
+    # DIVE-3430: and stamp WHAT the verdict was. graded_at alone records only THAT
+    # someone graded, so a FAIL recorded here rendered `graded->merge` — the
+    # DIVE-3315 instruction, with no reject token for DIVE-3428's conjunct to catch.
+    #
+    # DERIVED FROM $rc, NEVER FROM WHICH BRANCH THIS IS. This else is entered on
+    # `rc != 0` (a FAIL, any flags) AND on `--no-done` with `rc == 0` (a PASS
+    # recorded without closing). Calling it "the FAIL branch" and hardcoding 'fail'
+    # would record every --no-done PASS as a failure and drop correctly-delivered
+    # rows out of graded->merge — the exact INVERSE of the bug being fixed, and the
+    # `--cmd=false` probe on the row would not have caught it because it exercises
+    # both cases with rc != 0.
+    #
+    # BARE SET, NOT COALESCE, and this asymmetry with the two lines above is
+    # deliberate — see the CREATE TABLE comment. graded_at/graded_by are provenance
+    # (who first graded, when) and must not be rewritten by a re-grade; the verdict
+    # is a CURRENT STATE and must be, or a verifier could never clear their own
+    # earlier FAIL and a legitimately re-graded row would be permanently unmergeable.
+    # graded_verdict_at carries the current verdict's own clock so the skew from a
+    # frozen graded_at is readable rather than silent.
     db "UPDATE tasks SET result=$(sqlq "$result_txt"),
            graded_at=COALESCE(graded_at, datetime('now')),
-           graded_by=COALESCE(graded_by, $(sqlq "$(task_actor "")"))
+           graded_by=COALESCE(graded_by, $(sqlq "$(task_actor "")")),
+           graded_verdict=$( (( rc == 0 )) && printf "'pass'" || printf "'fail'" ),
+           graded_verdict_at=datetime('now')
         WHERE id=${id};"
   fi
 
@@ -747,12 +764,23 @@ cmd_task_verify() {
     printf '%s' "$result_txt" | jq -R -s \
       --arg i "$id" --arg id "$ident" --arg v "$verdict" --argjson rc "$rc" \
       --argjson flipped "$([[ $flipped -eq 1 ]] && echo true || echo false)" \
-      '{ok:true, data:{id:($i|tonumber), ident:$id, verdict:$v, exit:$rc, flippedToDone:$flipped, output:.}}'
+      --argjson held "$([[ $merge_hold -eq 1 ]] && echo true || echo false)" \
+      '{ok:true, data:{id:($i|tonumber), ident:$id, verdict:$v, exit:$rc, flippedToDone:$flipped, mergeHeld:$held, output:.}}'
   else
     printf '%s\n' "$result_txt" >&2
     if (( rc == 0 )); then
-      (( flipped )) && ok "$ident verify PASS — marked done" \
-                    || ok "$ident verify PASS (status unchanged, --no-done)"
+      # Three EXCLUSIVE branches. A bare `A && B || C && D || E` chain cannot
+      # express that: bash groups it left-to-right, so with flipped=1 the first
+      # ok() returns 0, the `||` short-circuits past the merge_hold test, and the
+      # 'merge still owed' message runs unconditionally — telling the operator a
+      # merge is owed on the unbound row that binds nothing (main, iteration 1).
+      if (( flipped )); then
+        ok "$ident verify PASS — marked done"
+      elif (( merge_hold )); then
+        ok "$ident verify PASS — graded; merge still owed"
+      else
+        ok "$ident verify PASS (status unchanged, --no-done)"
+      fi
     else
       warn "$ident verify FAIL (exit $rc) — status unchanged"
     fi
@@ -916,7 +944,7 @@ cmd_task_park() {
       COMMIT;"
   # DIVE-2410: park clears the gate columns, so whatever button that gate put in a
   # human's chat now points at a question the task no longer holds.
-  _task_gate_retire_buttons "$tident" "parked" || true
+  _task_gate_card_apply "$tident" die "parked" || true
   # DIVE-2877: A PARK'S BLAST RADIUS EXCEEDS THE ROW IT IS APPLIED TO, and until
   # now nothing said so at the moment of the park. On an instance materialized
   # from a recurring template (from_template_id set) a park is not a delay of one
@@ -1008,4 +1036,3 @@ cmd_task_unpark() {
       WHERE id=${tid} AND status NOT IN ('done','cancelled');"
   ok "$tident unparked" '{task:($t|tonumber), task_ident:$ti}' --arg t "$tid" --arg ti "$tident"
 }
-
