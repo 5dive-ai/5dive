@@ -95,6 +95,20 @@ mk_decoy() {
   printf '{"type":"assistant","timestamp":"%s","message":{"usage":{"input_tokens":900000,"output_tokens":900000,"cache_creation_input_tokens":900000}}}\n' \
     "$ts" > "$1/.claude/projects/proj/session/tool-results/blob.jsonl"
 }
+# DIVE-3417: the same seed, but split across TWO project subdirs — the level the
+# middle `*` of projects/*/*.jsonl reads. Both readable must sum 2*EXPECT; one
+# unreadable must NOT-REACH, and specifically must never return the well-formed
+# HALF that glob.glob() produced by swallowing the failed listing.
+mk_home2() {  # mk_home2 <name> -> echoes the home, one in-window turn per subdir
+  local n="$1"; local h="$TMP/home-$n"; local ts d
+  ts=$(date -u -d "@$((start+10))" +%FT%TZ)
+  for d in good locked; do
+    mkdir -p "$h/.claude/projects/$d"
+    printf '{"type":"assistant","timestamp":"%s","message":{"usage":{"input_tokens":10000,"output_tokens":5000,"cache_creation_input_tokens":15000,"cache_read_input_tokens":999999}}}\n' \
+      "$ts" > "$h/.claude/projects/$d/session.jsonl"
+  done
+  printf '%s' "$h"
+}
 mk_task() {   # mk_task <ident> <assignee> -> echoes the row id
   db "INSERT INTO tasks (ident,title,status,assignee,kind,started_at,created_at,updated_at)
       VALUES ('$1','spend fixture','in_progress','$2','standard',
@@ -130,6 +144,8 @@ mk_decoy "$H_FAN"
 # cache_read_input_tokens (42) is excluded by the same metric as the parent's,
 # so an exact match here also holds the metric, not just the file set.
 EXPECT_FAN=51000
+H_SUB=$(mk_home2 subdiragent)   # DIVE-3417: two project subdirs, one made 000 below
+H_LOOP=$(mk_home2 loopdiragent) # DIVE-3417: one subdir swapped for a symlink loop
 
 REGISTRY="$TMP/registry.json"
 cat > "$REGISTRY" <<'JSON'
@@ -137,7 +153,8 @@ cat > "$REGISTRY" <<'JSON'
            "fileagent":{"type":"claude"},"idleagent":{"type":"claude"},
            "emptyagent":{"type":"claude"},"goneagent":{"type":"claude"},
            "noaccountagent":{"type":"claude"},"botagent":{"type":"codex"},
-           "fanoutagent":{"type":"claude"}}}
+           "fanoutagent":{"type":"claude"},
+           "subdiragent":{"type":"claude"},"loopdiragent":{"type":"claude"}}}
 JSON
 export REGISTRY LOOP_HOME_OVERRIDE_JSON
 # `noaccountagent` is deliberately ABSENT from the override map: it exercises the
@@ -146,7 +163,8 @@ export REGISTRY LOOP_HOME_OVERRIDE_JSON
 LOOP_HOME_OVERRIDE_JSON=$(cat <<JSON
 {"okagent":"$H_OK","denyagent":"$H_DENY","fileagent":"$H_FILE",
  "idleagent":"$H_IDLE","emptyagent":"$H_EMPTY","goneagent":"$H_GONE","botagent":"$H_BOT",
- "fanoutagent":"$H_FAN"}
+ "fanoutagent":"$H_FAN",
+ "subdiragent":"$H_SUB","loopdiragent":"$H_LOOP"}
 JSON
 )
 
@@ -160,6 +178,8 @@ T_UNRG=$(mk_task SS-7 notinregistry)
 T_NOAC=$(mk_task SS-8 noaccountagent)
 T_BOT=$(mk_task  SS-9 botagent)
 T_FAN=$(mk_task SS-11 fanoutagent)
+T_SUB=$(mk_task  SS-12 subdiragent)
+T_LOOP=$(mk_task SS-13 loopdiragent)
 
 # ===================== ANCHOR: the scanner can reach a number =================
 # Runs FIRST and on the same code path as every arm below. If this is red, every
@@ -231,6 +251,76 @@ else
     && ok_t "…and the same file healed sums $OUT" \
     || bad_t "healed file" "rc=$RC out='$OUT' err=$ERR"
 fi
+
+# ====== DIVE-3417: the MIDDLE wildcard — a partial total, not a zero =========
+# The level between the two guards above. `probe_readable` covers `projects/`;
+# the per-file `except OSError` covers each `*.jsonl`; the `*` BETWEEN them was
+# read by glob.glob(), which skips a directory it cannot list WITHOUT raising.
+# So this failure never produced a 0 to be caught — it produced HALF of a real
+# total, rc 0, which _loop_refresh_spend accepts as a successful read and
+# PERSISTS over the accumulated tokens_spent. A smaller lie in the format the
+# guard trusts. Every arm here is paired with the same fixture healed, and the
+# sick assertion is specifically that the HALF (=$EXPECT) is never returned.
+SUB_BOTH=$((EXPECT*2))
+# ANCHOR for this fixture: both subdirs readable must sum BOTH, not one.
+scan "$T_SUB"
+[[ "$RC" == "0" && "$OUT" == "$SUB_BOTH" ]] \
+  && ok_t "ANCHOR two readable project subdirs sum BOTH ($OUT) — the middle level is traversed" \
+  || bad_t "ANCHOR two-subdir" "rc=$RC out='$OUT' err=$ERR — every middle-level arm below is vacuous while this is red"
+
+# ANY-UID: a self-referential symlink where a project dir belongs. listdir raises
+# ELOOP for root too, so this arm grades the middle level on a uid-0 runner —
+# the same reason fac4aea put an ENOTDIR arm on the level above (quinn: "a green
+# that skipped the point is not a grade"). glob.glob() swallows it identically.
+rm -rf "$H_LOOP/.claude/projects/locked"
+ln -s locked "$H_LOOP/.claude/projects/locked"
+scan "$T_LOOP"
+nr_t "ANY-UID: unreadable project SUBDIR (ELOOP, defeats root too)" 'project dir .* unreadable'
+[[ "$OUT" != "$EXPECT" ]] \
+  && ok_t "ANY-UID: and it is not the well-formed HALF ($EXPECT) that glob produced" \
+  || bad_t "PARTIAL" "out='$OUT' — half the truth, rc $RC: the clobber shape DIVE-3345 exists to kill"
+# PAIRED HEAL: a real dir with a real transcript back in place -> the full sum.
+rm -f "$H_LOOP/.claude/projects/locked"
+mkdir -p "$H_LOOP/.claude/projects/locked"
+cp "$H_LOOP/.claude/projects/good/session.jsonl" "$H_LOOP/.claude/projects/locked/session.jsonl"
+scan "$T_LOOP"
+[[ "$RC" == "0" && "$OUT" == "$SUB_BOTH" ]] \
+  && ok_t "…and the same subdir healed sums $OUT — the NOT-REACHED was blindness, not emptiness" \
+  || bad_t "healed subdir (ELOOP)" "rc=$RC out='$OUT' err=$ERR"
+
+# The PRODUCTION shape, and the row's own fixture: readable projects/ over a 000
+# project subdir. EACCES is only expressible unprivileged (root lists a 000 dir
+# regardless), so this is SKIPPED rather than faked — the ANY-UID arm above is
+# what keeps a root run from being a vacuous green. Reachability here is HIGHER
+# on a normalised host, not lower: /etc/cron.d/5dive-agent-home-traversal
+# (DIVE-3294) makes the UPPER path traversable every 20m, manufacturing exactly
+# this readable-parent-over-unreadable-child state rather than preventing it.
+if [[ "$(id -u)" -eq 0 ]]; then
+  printf 'skip - EACCES middle-level arm not runnable as root (a uid that can read everything cannot see this defect)\n'
+else
+  chmod 000 "$H_SUB/.claude/projects/locked"
+  scan "$T_SUB"
+  nr_t "unreadable project SUBDIR under a readable projects/ (EACCES)" 'project dir .* unreadable'
+  [[ "$OUT" != "$EXPECT" ]] \
+    && ok_t "…and never the HALF ($EXPECT): a partial reported as a total is the same fail-open" \
+    || bad_t "PARTIAL" "rc=$RC out='$OUT' — exactly the rc=0 out=$EXPECT ops measured on fac4aea"
+  chmod 755 "$H_SUB/.claude/projects/locked"
+  scan "$T_SUB"
+  [[ "$RC" == "0" && "$OUT" == "$SUB_BOTH" ]] \
+    && ok_t "…and the same subdir healed sums $OUT — blindness, not emptiness" \
+    || bad_t "healed subdir (EACCES)" "rc=$RC out='$OUT' err=$ERR"
+fi
+
+# The two skips list_sessions() keeps deliberately, because both mean "nothing
+# unread here" rather than "we failed to read it" — and both are what the glob
+# did. If either over-fires, a live agent rolling a session over NOT-REACHES.
+ln -s /nonexistent-3417 "$H_SUB/.claude/projects/dangling"   # ENOENT
+: > "$H_SUB/.claude/projects/stray-file"                     # ENOTDIR, cannot hold */*.jsonl
+scan "$T_SUB"
+[[ "$RC" == "0" && "$OUT" == "$SUB_BOTH" ]] \
+  && ok_t "a dangling symlink and a stray FILE in projects/ are skipped, not NOT-REACHED (still $OUT)" \
+  || bad_t "middle-level over-fired" "rc=$RC out='$OUT' err=$ERR — a rolling session must not wedge the scan"
+rm -f "$H_SUB/.claude/projects/dangling" "$H_SUB/.claude/projects/stray-file"
 
 # ================== STATE 3: readable and genuinely empty -> 0 ===============
 # The ONLY legitimate zero. If these go red the fix has over-fired and every idle
