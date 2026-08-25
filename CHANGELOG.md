@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased — fix(memory): consolidate reports what it PRODUCED, and the sweep can now authenticate (DIVE-3711)
+
+`5dive memory consolidate` had produced atoms **once across the entire fleet** while
+`/var/log/5dive-heartbeat.log` reported `13 seat(s) distilled, 4 failed, 0 not due` every six hours
+for four days — roughly 220 claimed successes against one real one. Both statements were true: the
+verb exited 0 when the distiller failed and wrote nothing, and the sweep counted exit codes under a
+label that says "distilled".
+
+- **The counter now reports the artifact.** `_hb_memory_consolidate_sweep` invokes the verb with
+  `--json` and grades `atoms_written` / `processed` / `distiller_failed` instead of `rc`. The tick
+  summary leads with the atom count — the only number in the line that can be zero when the pipeline
+  is dead — and the old two-bucket split becomes four: distilled, **distiller-failed** (the third
+  bucket the quiet failure had nowhere to land in), could-not-run, and nothing-to-distil. A seat with
+  an empty backlog is no longer counted as having distilled anything.
+- **A wholly-failed pass exits non-zero.** If every distillation the pass attempted failed, it
+  produced nothing and now exits `E_AUTH_REQUIRED` (6), with `ok:false` in `--json`. A *partial*
+  failure still exits 0 — real work landed, and the failure stays loud on stderr — so a healthy
+  backlog is never permanently red.
+- **The distiller can actually log in now.** `sudo -H` resets the environment, so the seat's
+  `CLAUDE_CODE_OAUTH_TOKEN` — which is how these seats are authenticated; they hold no on-disk
+  credential under their own `HOME` — never reached the CLI, and every call came back
+  `Not logged in · Please run /login`. The sweep now sources the seat's own
+  `agents.d/<name>-auth.env` **inside the child** (group-readable by that seat) rather than passing
+  the token as an argument, which would put it in `ps`. Measured paired on this host, same instant,
+  same transcript set: without it `distiller_failed:1`, with it `distiller_failed:0`.
+
+Two rules fall out, and they are the durable part:
+**a success counter must be able to produce the negative for the thing it names** — ask of any
+metric what it would print if the work silently did nothing, and if the answer is "the same number",
+it is a liveness check wearing a productivity label; and **hand-written artifacts next to a pipeline
+are not evidence the pipeline ran** — a populated output directory reads exactly like a working
+extractor, and only the ledger tells them apart.
+
 ## Unreleased — feat(memory): `5dive memory consolidate` — async transcript → memory atoms (DIVE-3628, DIVE-726 phase 1)
 
 A session window dies and everything it learned dies with it, because "compile before you close" is

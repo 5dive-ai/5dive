@@ -182,12 +182,56 @@ grep -q '^iiii-9999' "$LEDGER" && ok "CONTROL: an honest empty answer retires th
 ERR=$(run --distiller="$EMPTY" --max-sessions=1 --force 2>&1 >/dev/null)
 printf '%s' "$ERR" | grep -q 'DISTILLER FAILED' && bad "CONTROL: an empty answer is not reported as a failure" || ok "CONTROL: an empty answer is not reported as a failure"
 
+echo "── DIVE-3711: a pass that wrote NOTHING because the distiller failed exits non-zero ──"
+# The exit code is what the heartbeat's failure bucket is built on, so rc 0 on a
+# pass that produced nothing is what let ~220 claimed successes stand against one
+# real atom fleet-wide. A pass whose every attempted distillation failed is a
+# failed pass.
+mk_transcript "$PROJ/kkkk-3711.jsonl" "a session the distiller cannot handle" "Ok."
+touch -d '3 hours ago' "$PROJ/kkkk-3711.jsonl"
+run --distiller="$NOAUTH" --max-sessions=1 >/dev/null 2>&1
+check "a wholly-failed pass exits E_AUTH_REQUIRED" "$?" "6"
+# CONTROL 1 — the code is about PRODUCING NOTHING, not about the verb being
+# touchy: a pass with nothing left to distil is still a success.
+run --distiller="$EMPTY" --max-sessions=1 >/dev/null 2>&1
+check "CONTROL: a pass that legitimately finds nothing still exits 0" "$?" "0"
+# CONTROL 2 — a PARTIAL failure keeps rc 0. Real work landed; the failure stays
+# loud on stderr and in the JSON. Without this arm the rule reads "any failure
+# reds the pass", which would make a healthy backlog permanently red.
+mk_transcript "$PROJ/llll-3711.jsonl" "a session the distiller can handle" "Ok."
+touch -d '3 hours ago' "$PROJ/llll-3711.jsonl"
+OUT=$(run --distiller="$GOOD" --max-sessions=9 --force 2>&1); RC=$?
+check "CONTROL: a pass that wrote at least one atom exits 0" "$RC" "0"
+# JSON: ok mirrors the exit code, so a machine reader and a shell reader cannot
+# disagree about whether the pass worked.
+JOUT=$(JSON_MODE=1 run --distiller="$NOAUTH" --max-sessions=1 --force 2>/dev/null)
+check "JSON ok:false on a wholly-failed pass" "$(jq -r '.ok' <<<"$JOUT" 2>/dev/null)" "false"
+check "and the atom count it reports is zero" "$(jq -r '.data.atoms_written' <<<"$JOUT" 2>/dev/null)" "0"
+check "and the distiller failure is machine-readable" "$(jq -r '.data.distiller_failed' <<<"$JOUT" 2>/dev/null)" "1"
+# NOT an "exactly one envelope" arm here: this harness SOURCES the function, so
+# it never runs under the CLI's EXIT trap and would print one envelope whether
+# the fix were present or not — a green that proves nothing. The double-envelope
+# behaviour was measured against the BUILT bundle (`./5dive memory consolidate
+# --distiller=false --dry-run --json` printed 2 objects before this fix, 1
+# after). What IS assertable from here is the mechanism: only `fail` and
+# `policy_refuse` claim the reason on their own, and this path uses neither.
+grep -q 'mark_reported' <<< "$(declare -f _memory_consolidate)" \
+  && ok "the intentional non-zero exit claims its reason (mark_reported)" \
+  || bad "an intentional non-zero exit without mark_reported — the trap will overprint it"
+JOUT=$(JSON_MODE=1 run --distiller="$GOOD" --max-sessions=1 --force 2>/dev/null)
+check "CONTROL: JSON ok:true when atoms were written" "$(jq -r '.ok' <<<"$JOUT" 2>/dev/null)" "true"
+
 echo "── a distiller that returns prose is a quiet no-op, not a crash ──"
 mk_transcript "$PROJ/gggg-7777.jsonl" "a seventh session" "Ok."
 touch -d '3 hours ago' "$PROJ/gggg-7777.jsonl"
 BEFORE=$(ls "$STORE" | wc -l)
 run --distiller="$GARBAGE" --max-sessions=1 >/dev/null 2>&1
-check "garbage distiller exits 0" "$?" "0"
+# DIVE-3711: "not a crash" now means a CONTROLLED non-zero, not zero. A distiller
+# that answers unusably has always been counted in distill_failed and printed as
+# DISTILLER FAILED on stderr — only the exit code disagreed, and the exit code is
+# the one the heartbeat reads. The no-op half of the arm (nothing written, no
+# ledger row) is unchanged and asserted below.
+check "garbage distiller exits with the controlled failure code" "$?" "6"
 check "garbage distiller wrote nothing" "$(ls "$STORE" | wc -l)" "$BEFORE"
 
 echo "── bounded: --max-sessions caps the pass ──"
@@ -215,9 +259,12 @@ errexit_run() { ( set -euo pipefail; _memory_consolidate "$@" ) ; }
 mk_transcript "$PROJ/jjjj-1010.jsonl" "an errexit arm session" "Ok."
 touch -d '3 hours ago' "$PROJ/jjjj-1010.jsonl"
 errexit_run --distiller="$NOAUTH" --max-sessions=1 >/dev/null 2>&1
-check "distiller failure survives errexit" "$?" "0"
+# DIVE-3711: a wholly-failed pass now exits E_AUTH_REQUIRED, NOT 0. The arm's
+# intent is unchanged — it asserts a CONTROLLED exit, not an errexit abort
+# mid-function — so it asserts the controlled code rather than zero.
+check "distiller failure survives errexit with a controlled code" "$?" "6"
 errexit_run --distiller="$GARBAGE" --max-sessions=1 --force >/dev/null 2>&1
-check "unparseable output survives errexit" "$?" "0"
+check "unparseable output survives errexit (controlled code, no abort)" "$?" "6"
 errexit_run --distiller="$SECRET" --max-sessions=1 --force >/dev/null 2>&1
 check "a tripwire refusal survives errexit" "$?" "0"
 errexit_run --distiller="$EMPTY" --max-sessions=1 --force >/dev/null 2>&1

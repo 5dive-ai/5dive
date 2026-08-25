@@ -65,11 +65,20 @@ registry_read() { printf '%s' "${REG:-{\"agents\":{}\}}"; }
 # "green" arm could be green because sudo refused.
 timeout() { shift; "$@"; }
 sudo()    { local u=""; while [ $# -gt 0 ]; do case "$1" in -u) u="$2"; shift 2;; -n|-H) shift;; *) break;; esac; done
-            printf '%s\t%s\n' "$u" "$*" >> "$CALLS"; return "${STUB_RC:-0}"; }
+            printf '%s\t%s\n' "$u" "$*" >> "$CALLS"
+            # DIVE-3711: the stub must be able to SPEAK, because the sweep now
+            # grades what the verb printed rather than how it exited. A recorder
+            # that only returns an rc could not express the defect this row is
+            # about (rc 0, nothing written).
+            printf '%s' "${STUB_OUT:-}"; return "${STUB_RC:-0}"; }
 id()      { case "${2:-}" in agent-alice|agent-bob) return 0;; *) return 1;; esac; }
 
 REG='{"agents":{"alice":{},"bob":{}}}'
-reset() { rm -rf "$STATE_DIR" "$CALLS"; : > "$CALLS"; STUB_RC=0; unset MEMORY_CONSOLIDATE MEMORY_CONSOLIDATE_EVERY_MIN; }
+# Default: a healthy pass that actually produced something. Every arm that is
+# not about failure inherits this, so "green" means "the sweep saw atoms".
+_STUB_OK='{"ok":true,"data":{"atoms_written":2,"processed":1,"distiller_failed":0}}'
+reset() { rm -rf "$STATE_DIR" "$CALLS"; : > "$CALLS"; STUB_RC=0; STUB_OUT="$_STUB_OK"; unset MEMORY_CONSOLIDATE MEMORY_CONSOLIDATE_EVERY_MIN; }
+STUB_OUT="$_STUB_OK"; STUB_RC=0
 ncalls() { wc -l < "$CALLS" | tr -d ' '; }
 NOW=1000000000
 
@@ -111,13 +120,98 @@ check "and leaves no stamp behind to skew the next run"         "$(ls "$STATE_DI
 
 echo "== stamp BEFORE the run, so a wedged pass cannot be re-entered =="
 reset
-STUB_RC=1
+STUB_RC=1; STUB_OUT=""
 _hb_memory_consolidate_sweep "$NOW"
 check "a FAILING pass is counted, not swallowed"                "$_HB_CONS_FAILED" "2"
 check "and still stamped (a failure must not re-run every 5m)"  "$(ls "$STATE_DIR/memory-consolidate" 2>/dev/null | wc -l | tr -d ' ')" "2"
-STUB_RC=0
+STUB_RC=0; STUB_OUT="$_STUB_OK"
 _hb_memory_consolidate_sweep "$NOW"
 check "so the very next tick invokes nothing"                   "$(ncalls)" "2"
+
+echo "== DIVE-3711: the success bucket must be able to produce a negative =="
+# THE regression arm for this row. A pass that exits ZERO having written nothing
+# — because the distiller could not answer — must not land in the bucket the log
+# calls "distilled". rc 0 is deliberately kept here: if this arm passes only
+# because the verb now also exits non-zero, the sweep is still counting attempts.
+reset
+STUB_OUT='{"ok":false,"data":{"atoms_written":0,"processed":1,"distiller_failed":1}}'
+STUB_RC=0
+_hb_memory_consolidate_sweep "$NOW"
+check "a zero-atom distiller failure is NOT counted as distilled" "$_HB_CONS_RAN"    "0"
+check "it lands in its own third bucket"                          "$_HB_CONS_DFAIL"  "2"
+check "and contributes no atoms to the headline number"           "$_HB_CONS_ATOMS"  "0"
+check "and is not conflated with could-not-invoke"                "$_HB_CONS_FAILED" "0"
+reset
+STUB_OUT='{"ok":false,"data":{"atoms_written":0,"processed":1,"distiller_failed":1}}'
+STUB_RC=6
+_hb_memory_consolidate_sweep "$NOW"
+check "same verdict when the verb ALSO exits non-zero"            "$_HB_CONS_DFAIL"  "2"
+
+echo "== NEGATIVE CONTROL: a producing pass is still counted =="
+# Without this, "not counted as distilled" is satisfied by a sweep that counts
+# nothing at all.
+reset
+STUB_OUT='{"ok":true,"data":{"atoms_written":3,"processed":1,"distiller_failed":0}}'
+_hb_memory_consolidate_sweep "$NOW"
+check "a pass that wrote atoms IS counted distilled"              "$_HB_CONS_RAN"    "2"
+check "and its atoms are summed across seats"                     "$_HB_CONS_ATOMS"  "6"
+check "with both failure buckets empty"                           "$((_HB_CONS_DFAIL + _HB_CONS_FAILED))" "0"
+
+echo "== 'ran, nothing to distil' is not 'distilled' =="
+reset
+STUB_OUT='{"ok":true,"data":{"atoms_written":0,"processed":0,"distiller_failed":0}}'
+_hb_memory_consolidate_sweep "$NOW"
+check "an empty backlog does not inflate the distilled count"     "$_HB_CONS_RAN"    "0"
+check "it is its own bucket"                                      "$_HB_CONS_IDLE"   "2"
+check "and it is NOT a failure either"                            "$((_HB_CONS_DFAIL + _HB_CONS_FAILED))" "0"
+
+echo "== TWO envelopes on the stream still grade as one result =="
+# On a non-zero exit the CLI's EXIT-trap backstop appends its own
+# {"ok":false,"error":{...}} after the real result. A naive `jq -r .data.x` over
+# both prints "0\nnull", fails the numeric test, and files every distiller
+# failure under could-not-run — this row's defect, moved one bucket left.
+reset
+STUB_OUT='{"ok":false,"data":{"atoms_written":0,"processed":1,"distiller_failed":1}}
+{"ok":false,"error":{"code":6,"class":"generic","message":"exited 6 without reporting a reason"}}'
+STUB_RC=6
+_hb_memory_consolidate_sweep "$NOW"
+check "a trailing error envelope does not hide the real result" "$_HB_CONS_DFAIL"  "2"
+check "and it is not misfiled as could-not-run"                 "$_HB_CONS_FAILED" "0"
+
+echo "== unparseable output is a failure, never a silent success =="
+reset
+STUB_OUT='not json'; STUB_RC=0
+_hb_memory_consolidate_sweep "$NOW"
+check "garbage on stdout with rc 0 counts as could-not-run"       "$_HB_CONS_FAILED" "2"
+check "and never as distilled"                                    "$_HB_CONS_RAN"    "0"
+
+echo "== the seat's own auth env reaches the distiller =="
+# `sudo -H` resets the environment, so the seat's CLAUDE_CODE_OAUTH_TOKEN never
+# reached the CLI and every call answered "Not logged in" — the cause behind the
+# zero atoms. Asserted on the invocation, which is all this harness can see.
+reset
+_hb_memory_consolidate_sweep "$NOW"
+grep -q 'alice-auth.env' "$CALLS" \
+  && ok "the invocation carries the SEAT's own auth env path" \
+  || bad "the invocation does not reference <seat>-auth.env — sudo -H drops the token"
+grep -q -- '--json' "$CALLS" \
+  && ok "the pass is invoked with --json (the counter reads output, not rc)" \
+  || bad "the pass is not invoked with --json"
+case "$(cat "$CALLS")" in
+  *CLAUDE_CODE_OAUTH_TOKEN*) bad "the token is passed as an ARGUMENT — visible in ps to every user" ;;
+  *) ok "and no secret is placed on the command line" ;;
+esac
+
+echo "== the log line reports the ARTIFACT, not the attempt =="
+LOGLINE=$(grep -n 'memory-consolidate\]' "$SRC/cmd_heartbeat.sh" | grep _hb_log)
+case "$LOGLINE" in
+  *_HB_CONS_ATOMS*) ok "the tick summary names the atom count" ;;
+  *) bad "the tick summary still reports only attempt counts" ;;
+esac
+case "$LOGLINE" in
+  *_HB_CONS_DFAIL*) ok "and surfaces the distiller-failed bucket" ;;
+  *) bad "the distiller-failed bucket never reaches the log" ;;
+esac
 
 echo "== a seat with no unix user is skipped, not run as root =="
 reset

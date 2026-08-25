@@ -4304,6 +4304,13 @@ _hb_capability_reverify_sweep() {
 _hb_memory_consolidate_sweep() {
   local now="$1"
   _HB_CONS_RAN=0; _HB_CONS_SKIPPED=0; _HB_CONS_FAILED=0
+  # DIVE-3711 buckets. RAN used to mean "invoked without erroring" while being
+  # LOGGED as "distilled" — so a seat whose distiller failed and wrote nothing
+  # landed in the success bucket, which is the one place a silent failure is
+  # invisible. ATOMS is the artifact count (the thing the label names), DFAIL is
+  # the third bucket that quiet failure now has to land in, and IDLE separates
+  # "ran, nothing to distil" from "ran and produced".
+  _HB_CONS_ATOMS=0; _HB_CONS_DFAIL=0; _HB_CONS_IDLE=0
   [[ "${MEMORY_CONSOLIDATE:-on}" == "off" ]] && return 0
   local every="${MEMORY_CONSOLIDATE_EVERY_MIN:-${_HB_CONSOLIDATE_EVERY_MIN}}"
   [[ "$every" =~ ^[0-9]+$ ]] && (( every > 0 )) || every="$_HB_CONSOLIDATE_EVERY_MIN"
@@ -4330,14 +4337,50 @@ _hb_memory_consolidate_sweep() {
     # be enforced by the clock. A crashed pass just waits one cadence; nothing is
     # lost, because a session with no ledger row is retried forever by design.
     printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
-    if timeout "${_HB_CONSOLIDATE_TIMEOUT_S}" sudo -n -u "$user" -H \
-         "${SELF_BIN:-/usr/local/bin/5dive}" memory consolidate --max-sessions=1 \
-         >/dev/null 2>&1; then
+    # Run the verb as the seat and READ WHAT IT PRODUCED (--json), never its exit
+    # code alone. Counting invocations under a label that says "distilled" is the
+    # DIVE-3711 defect itself: a success counter must be able to produce the
+    # negative for the thing it names, and this one could not.
+    #
+    # The child sources the seat's OWN auth env first. `sudo -H` resets the
+    # environment, so CLAUDE_CODE_OAUTH_TOKEN — which is how these seats are
+    # authenticated; they hold no on-disk credential under their own HOME — never
+    # reached the distiller, and every call came back "Not logged in · Please run
+    # /login". Sourced INSIDE the child (the file is group-readable by the seat)
+    # rather than passed as an argument, which would put the token in `ps`.
+    local authenv="${ENV_DIR:-${STATE_DIR:-/var/lib/5dive}/agents.d}/${name}-auth.env"
+    local out=""
+    # One line, deliberately: a multi-line -c payload carries newlines into every
+    # log, `ps` line and test recorder that echoes the argv back.
+    out=$(timeout "${_HB_CONSOLIDATE_TIMEOUT_S}" sudo -n -u "$user" -H bash -c \
+         'set -a; [ -r "$1" ] && . "$1"; set +a; exec "$2" memory consolidate --max-sessions=1 --json' \
+         _ "$authenv" "${SELF_BIN:-/usr/local/bin/5dive}" 2>/dev/null) || out="${out:-}"
+    local n_atoms n_proc n_dfail
+    # `--slurp` and take the FIRST object that carries the field, because the
+    # stream can hold TWO envelopes: on a non-zero exit the CLI's EXIT-trap
+    # backstop appends its own `{"ok":false,"error":{...}}` after the result. A
+    # bare `jq -r '.data.atoms_written'` over both prints "0\nnull", which fails
+    # the numeric test below and would file every distiller failure under
+    # could-not-run — re-creating this row's defect one bucket to the left.
+    local jf='def pick($k): [.[] | .data? | select(type=="object") | .[$k] | select(. != null)] | first // empty;'
+    n_atoms=$(jq -s -r "$jf pick(\"atoms_written\")"    <<<"$out" 2>/dev/null) || n_atoms=""
+    n_proc=$(jq  -s -r "$jf pick(\"processed\")"        <<<"$out" 2>/dev/null) || n_proc=""
+    n_dfail=$(jq -s -r "$jf pick(\"distiller_failed\")" <<<"$out" 2>/dev/null) || n_dfail=""
+    if [[ ! "$n_atoms" =~ ^[0-9]+$ ]]; then
+      # Nothing parseable came back: no sudo grant, a timeout, or the verb died.
+      # Non-fatal and COUNTED, never silent — a fleet-wide auth lapse or a missing
+      # sudo grant has to show up as failures in the log, not as a quiet box.
+      _HB_CONS_FAILED=$((_HB_CONS_FAILED + 1)); continue
+    fi
+    [[ "$n_dfail" =~ ^[0-9]+$ ]] || n_dfail=0
+    [[ "$n_proc"  =~ ^[0-9]+$ ]] || n_proc=0
+    _HB_CONS_ATOMS=$((_HB_CONS_ATOMS + n_atoms))
+    if (( n_dfail > 0 )); then
+      _HB_CONS_DFAIL=$((_HB_CONS_DFAIL + 1))
+    elif (( n_proc > 0 )); then
       _HB_CONS_RAN=$((_HB_CONS_RAN + 1))
     else
-      # Non-fatal and COUNTED, never silent: a fleet-wide auth lapse or a missing
-      # sudo grant has to show up as failures in the log, not as a quiet box.
-      _HB_CONS_FAILED=$((_HB_CONS_FAILED + 1))
+      _HB_CONS_IDLE=$((_HB_CONS_IDLE + 1))
     fi
   done
   return 0
@@ -4419,8 +4462,10 @@ cmd_heartbeat_tick() {
   # tokens, so nothing that keeps the fleet moving may ever queue behind it.
   # Same isolation contract as every other sweep.
   _hb_memory_consolidate_sweep "$now" || _hb_log "[memory-consolidate] pass errored (non-fatal)"
-  (( ${_HB_CONS_RAN:-0} || ${_HB_CONS_FAILED:-0} )) \
-    && _hb_log "[memory-consolidate] ${_HB_CONS_RAN:-0} seat(s) distilled, ${_HB_CONS_FAILED:-0} failed, ${_HB_CONS_SKIPPED:-0} not due" || true
+  # DIVE-3711: the atom count leads, because it is the only number here that can
+  # be zero when the pipeline is dead. Every other field is an attempt count.
+  (( ${_HB_CONS_RAN:-0} || ${_HB_CONS_FAILED:-0} || ${_HB_CONS_DFAIL:-0} || ${_HB_CONS_IDLE:-0} )) \
+    && _hb_log "[memory-consolidate] ${_HB_CONS_ATOMS:-0} atom(s) from ${_HB_CONS_RAN:-0} seat(s), ${_HB_CONS_DFAIL:-0} distiller-failed, ${_HB_CONS_FAILED:-0} could not run, ${_HB_CONS_IDLE:-0} nothing to distil, ${_HB_CONS_SKIPPED:-0} not due" || true
   # DIVE-3343: there is NO per-TASK budget sweep here any more, and its absence
   # is deliberate — see the block above _hb_loop_ceiling_sweep's neighbours in
   # this file for why the figure it enforced could not be attributed to a row.
