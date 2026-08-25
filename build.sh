@@ -72,6 +72,7 @@ cat \
   src/lib/env_overrides.sh \
   src/lib/capability.sh \
   src/lib/broker.sh \
+  src/lib/durable.sh \
   src/lib/disk.sh \
   src/lib/audit.sh \
   src/lib/reap.sh \
