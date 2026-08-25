@@ -171,7 +171,7 @@ require_sqlite() {
 # WITHOUT a bump runs on fresh stores only. It ships green on every harness (they
 # all start from an empty dir and take the canonical schema) and reaches no
 # existing board, which is the one population it was written for.
-_TASKS_SCHEMA_EPOCH='3525-1'   # DIVE-3525: +gate_cards (was 3251-1: +first_started_at)
+_TASKS_SCHEMA_EPOCH='INST8-1'  # INST-8: +action_leases (was 3525-1: +gate_cards)
 _tasks_schema() {
   cat <<'SQL'
 PRAGMA journal_mode=WAL;
