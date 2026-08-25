@@ -155,7 +155,7 @@ cmd_deploy() {
 # parent `deploy` verb is).
 cmd_deploy_do() {
   [[ "$(id -u)" -eq 0 ]] || fail "$E_PERMISSION" "_deploy_do is root-only"
-  require_loaded deploy broker_gate_check broker_bind_target broker_task_target broker_connector_read
+  require_loaded deploy broker_gate_check broker_bind_target broker_task_target broker_connector_read durable_claim durable_settle
   local ident proj ref env
   IFS= read -r ident || true
   IFS= read -r proj  || true
@@ -202,6 +202,34 @@ cmd_deploy_do() {
   [[ "$link_type" == "github" && -n "$link_org" && -n "$link_repo" ]] \
     || fail "$E_GENERIC" "Vercel project '${proj}' has no linked GitHub repo — delegated deploy will not choose one for it"
 
+  # --- durable action lease (INST-8). Deploy is the first brokered surface that
+  # declares itself irreversible (broker_surface deploy irrev). The claim goes
+  # HERE, immediately above the POST, and the placement is the whole design: every
+  # refusal this verb can raise — gate, binding, validation, credential, project
+  # link — is now ABOVE the claim. Nothing between the claim and the side effect
+  # can exit without settling, so an ordinary refusal (a missing Vercel token, an
+  # unlinked project) cannot leave a held lease behind to wedge the surface for a
+  # full TTL. The earlier draft claimed before the credential read so a replay
+  # would never decrypt a token; that bought one avoided read and paid for it with
+  # four wedge paths, which is the wrong trade for a verb an agent retries.
+  #
+  # The key is derived from the ACTION (task + project@ref + env), never from the
+  # attempt, so a crashed agent's retry computes the same key and is told the
+  # deploy already happened instead of firing a second one.
+  local drc=0
+  durable_claim deploy "$ident" "${proj}@${ref}" "$env" || drc=$?
+  case $drc in
+    0) : ;;   # ours; fall through and deploy
+    3) ok "already deployed ${proj}@${ref} → ${env}${DURABLE_OUTCOME_REF:+ ($DURABLE_OUTCOME_REF)} — this exact action was already performed under this task, so it was NOT fired again (INST-8)" \
+          "$(jq -n --arg t "$ident" --arg p "$proj" --arg r "$ref" --arg e "$env" \
+                   --arg d "$DURABLE_OUTCOME_REF" --arg k "$DURABLE_KEY" \
+                   --arg repo "${link_org}/${link_repo}" \
+                '{task:$t,project:$p,ref:$r,env:$e,deploymentId:$d,repo:$repo,deployed:false,replayed:true,idempotencyKey:$k}')"
+       return 0 ;;
+    4) fail "$E_GENERIC" "another attempt at deploying ${proj}@${ref} → ${env} is in flight (lease held by ${DURABLE_HOLDER:-unknown}); refusing to fire a second deploy. Retry once it settles or its lease expires (INST-8)." ;;
+    *) fail "$E_GENERIC" "could not establish a durable action lease for ${proj}@${ref} — refusing to deploy (INST-8)." ;;
+  esac
+
   # --- the ONE action.
   local body out rc=0
   body=$(jq -cn --arg n "$proj" --arg t "$env" --arg o "$link_org" --arg r "$link_repo" \
@@ -214,12 +242,31 @@ cmd_deploy_do() {
         -H "Content-Type: application/json" \
         -d "$body" "${_DEPLOY_API}/v13/deployments${q}") || rc=$?
   tok=""   # discard
-  [[ $rc -eq 0 ]] || fail "$E_GENERIC" "Vercel deployment request failed for ${proj}@${ref} (${env})."
+  # A REQUEST-level failure did not deploy, so the lease is settled `failed` and
+  # the action stays retryable. Settled BEFORE the fail() so the refusal path
+  # cannot leave a held lease behind to wedge the next attempt for a full TTL.
+  if [[ $rc -ne 0 ]]; then
+    durable_settle "$DURABLE_KEY" failed "curl rc=${rc}" || true
+    fail "$E_GENERIC" "Vercel deployment request failed for ${proj}@${ref} (${env})."
+  fi
 
   local did durl
   did=$( jq -r '.id  // empty' <<<"$out")
   durl=$(jq -r '.url // empty' <<<"$out")
-  [[ -n "$did" ]] || fail "$E_GENERIC" "Vercel accepted the request but returned no deployment id."
+  # No id means Vercel took the request and we cannot name what it created. That
+  # is NOT a failure we may retry — a retry would be the double-deploy this whole
+  # file exists to prevent — so the lease is settled DONE with the ambiguity
+  # written into the receipt, and a compensation note is left for the human who
+  # will have to look.
+  if [[ -z "$did" ]]; then
+    durable_settle "$DURABLE_KEY" done "accepted-without-id" || true
+    durable_compensation "$DURABLE_KEY" "Vercel accepted a deployment of ${proj}@${ref} (${env}) but returned no id; check the Vercel dashboard for an unnamed deployment before deploying again" || true
+    fail "$E_GENERIC" "Vercel accepted the request but returned no deployment id."
+  fi
+  # The receipt IS the replay answer: a later attempt returns this id instead of
+  # firing again, so settling without it would leave a lease that can say "already
+  # happened" but never "here is what happened".
+  durable_settle "$DURABLE_KEY" done "$did"
   ok "deployed ${proj}@${ref} → ${env} (${did}${durl:+, https://$durl}) — delegated, gate cleared, repo ${link_org}/${link_repo} from the project's own link" \
      "$(jq -n --arg t "$ident" --arg p "$proj" --arg r "$ref" --arg e "$env" \
               --arg d "$did" --arg u "$durl" --arg repo "${link_org}/${link_repo}" \

@@ -77,6 +77,13 @@ broker_surface() {
     # just omits the repair sentence rather than naming a command that does not
     # exist. Any surface added here must answer this field.
     push.fixcmd)   printf '5dive task set-branch' ;;
+    # INST-8: is this surface IRREVERSIBLE? Only irreversible surfaces take a
+    # durable action lease (lib/durable.sh) — a lease on a reversible action buys
+    # nothing and costs a wedge. Push is reversible by another push; a production
+    # deploy is not undone by redeploying, it is only followed by another deploy.
+    # Every surface must answer, so surface N+1 cannot arrive undeclared.
+    push.irrev)    printf '0' ;;
+    deploy.irrev)  printf '1' ;;
     deploy.fixcmd) printf '' ;;
     deploy.noun)   printf 'deploy' ;;
     deploy.Noun)   printf 'Deploy' ;;

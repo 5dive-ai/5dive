@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased — feat(durable): an irreversible action fires ONCE, even when the agent crashes mid-flight (INST-8)
+
+INST-4 made the *record* of an action idempotent (`lifecycle_events` has a UNIQUE index on
+`idem_key`). INST-5 bounded *who* may act and *what* they may act on. Neither could answer the
+question a crashed agent asks on restart: **did my deploy already happen?** The ledger row is written
+after the fact, so a process that dies between firing the side effect and recording it leaves a trail
+claiming nothing happened — and a cleared gate is a standing permission, so re-running the executor
+fires again. `5dive deploy` was therefore double-firable by a retry, and the surfaces INST-8 names
+next (email / pay / publish) would have been double-send, double-pay, double-publish.
+
+- **`lib/durable.sh` — one lease per ACTION, not per attempt.** `durable_claim` returns three answers
+  the caller must branch on: *claimed* (act), *replay* (it already happened — here is the original
+  receipt, do not act), *in flight* (another live attempt holds it — refuse). The action's identity is
+  a digest of what it does (task + target + payload) with no pid, timestamp or nonce in it, so retry
+  #4 computes the same key as attempt #1. The claim itself is `INSERT OR IGNORE` against
+  `UNIQUE(idem_key)` with `SELECT changes()` read back over the same connection — exactly one racer
+  sees `1`, with no advisory lock and no read-then-write window.
+- **A lease write REFUSES where a ledger write swallows.** `ledger_emit` is best-effort by design
+  ("a ledger write cannot fail the action it describes"); a lease is the inverse, because if we cannot
+  record the claim we do not know whether the action already happened, and the safe reading of
+  *unknown* for an irreversible action is **do not act**. The harness grades that inversion with
+  `ledger_emit` as its live control on the same broken store.
+- **`5dive deploy` (the executor) now claims immediately above the Vercel POST** — below every refusal
+  the verb can raise, so a missing token or an unlinked project cannot leave a held lease wedging the
+  surface for a TTL — and settles `done` with the deployment id as the receipt, or `failed` before it
+  refuses. A request that Vercel accepts without returning an id settles `done` (a retry there would
+  be the double-deploy) and records a compensation note for the human who has to look.
+- **Compensation is recorded, never executed.** An automatic undo is a second irreversible action
+  fired by the same crashed process that could not finish the first one. What we owe is that the undo
+  instruction is not lost.
+- **Scope is declared, not assumed.** `broker_surface <s> irrev` — deploy `1`, push `0` (a push is
+  undone by another push; a production deploy is not). Every surface must answer, so surface N+1
+  cannot arrive undeclared.
+- **`action_leases` is gated on ITS OWN absence.** Every live store already carries
+  `lifecycle_events`, so a shared migration gate would have created the table on fresh DBs only and
+  left every existing box with a `durable_claim` that refuses (DIVE-2512).
+- Known residual, named rather than hidden: one cleared gate authorizes ONE action on one target, so a
+  legitimate second deploy of the same `project@ref` under the same task reads as a replay and returns
+  the first receipt. The way to act twice is a second task row — a bypass flag a crashed agent could
+  also reach would give the guarantee away. And reclaiming an EXPIRED lease is the one path where a
+  double-fire is still reachable, if the original attempt was slow rather than dead; the TTL (300s vs
+  the action's 60s worst case) is that bet, and the harness grades it against `cmd_deploy.sh`'s own
+  curl timeouts rather than against the literal.
+- `tests/durable_action_unit.sh` — 48 arms, including the mutation arm (drop `UNIQUE(idem_key)` and
+  the double-claim refusal must go red), the inversion arm with its live control, and a realistic
+  pre-INST-8 store fixture for the migration.
+
 ## Unreleased — fix(memory): consolidate reports what it PRODUCED, and the sweep can now authenticate (DIVE-3711)
 
 `5dive memory consolidate` had produced atoms **once across the entire fleet** while

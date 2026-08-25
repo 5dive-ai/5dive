@@ -1242,6 +1242,24 @@ CREATE TABLE IF NOT EXISTS lifecycle_events (
 CREATE UNIQUE INDEX IF NOT EXISTS lifecycle_events_idem_idx ON lifecycle_events(idem_key);
 CREATE INDEX IF NOT EXISTS lifecycle_events_ident_idx ON lifecycle_events(ident, id);
 CREATE INDEX IF NOT EXISTS lifecycle_events_ts_idx ON lifecycle_events(ts, kind);
+CREATE TABLE IF NOT EXISTS action_leases (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  idem_key     TEXT NOT NULL,
+  surface      TEXT NOT NULL,
+  ident        TEXT,
+  target       TEXT NOT NULL,
+  state        TEXT NOT NULL DEFAULT 'held',
+  holder       TEXT NOT NULL,
+  actor        TEXT NOT NULL,
+  attempts     INTEGER NOT NULL DEFAULT 1,
+  acquired_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  expires_at   TEXT NOT NULL,
+  settled_at   TEXT,
+  outcome_ref  TEXT,
+  compensation TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS action_leases_idem_idx ON action_leases(idem_key);
+CREATE INDEX IF NOT EXISTS action_leases_state_idx ON action_leases(state, expires_at);
 SQL
 }
 
@@ -2358,6 +2376,39 @@ CREATE TABLE IF NOT EXISTS lifecycle_events (
 CREATE UNIQUE INDEX IF NOT EXISTS lifecycle_events_idem_idx ON lifecycle_events(idem_key);
 CREATE INDEX IF NOT EXISTS lifecycle_events_ident_idx ON lifecycle_events(ident, id);
 CREATE INDEX IF NOT EXISTS lifecycle_events_ts_idx ON lifecycle_events(ts, kind);
+MIG
+  fi
+
+  # INST-8 action_leases — additive, gated on ITS OWN absence, NOT on
+  # lifecycle_events'. Every live store already carries lifecycle_events (INST-4
+  # shipped), so folding this into that block would have created the table on
+  # fresh DBs only and left every existing box with a durable_claim that refuses
+  # (DIVE-2512: a fresh-DB harness never exercises this function at all).
+  # Keep this CREATE body byte-identical to the copy in _tasks_schema above
+  # (tests/schema_sync_unit.sh).
+  local has_leases
+  has_leases=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='action_leases' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_leases" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" <<'MIG' >/dev/null 2>&1 || true
+CREATE TABLE IF NOT EXISTS action_leases (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  idem_key     TEXT NOT NULL,
+  surface      TEXT NOT NULL,
+  ident        TEXT,
+  target       TEXT NOT NULL,
+  state        TEXT NOT NULL DEFAULT 'held',
+  holder       TEXT NOT NULL,
+  actor        TEXT NOT NULL,
+  attempts     INTEGER NOT NULL DEFAULT 1,
+  acquired_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  expires_at   TEXT NOT NULL,
+  settled_at   TEXT,
+  outcome_ref  TEXT,
+  compensation TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS action_leases_idem_idx ON action_leases(idem_key);
+CREATE INDEX IF NOT EXISTS action_leases_state_idx ON action_leases(state, expires_at);
 MIG
   fi
 
