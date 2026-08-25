@@ -75,8 +75,29 @@ want "the fixture really is a pre-INST-8 store (lifecycle_events yes, action_lea
      '[[ "$(sqlite3 "$LIVE" "SELECT count(*) FROM sqlite_master WHERE name IN ('"'"'lifecycle_events'"'"','"'"'action_leases'"'"');")" == 1 ]]'
 want "a store that ALREADY has lifecycle_events still gains action_leases" \
      '( TASKS_DIR="$LIVE_DIR"; TASKS_DB="$LIVE"; _tasks_db_migrate >/dev/null 2>&1; [[ "$(sqlite3 "$LIVE" "SELECT 1 FROM sqlite_master WHERE type='"'"'table'"'"' AND name='"'"'action_leases'"'"';")" == 1 ]] )'
-want "and the reclaimed store can then actually take a lease" \
-     '[[ "$( ( TASKS_DIR="$LIVE_DIR"; TASKS_DB="$LIVE"; durable_claim deploy INST-8 live@main prod >/dev/null 2>&1; printf %s $? ) )" == 0 ]]'
+# THE ARM THAT WAS MISSING, and its absence shipped a dead migration to every box.
+# The arm above calls _tasks_db_migrate DIRECTLY, and nothing on a live box does:
+# tasks_db_init consults the DIVE-2808 skip gate first, and a store already
+# stamped with the current $_TASKS_SCHEMA_EPOCH never enters the migration again.
+# So a one-shot block added without an epoch bump is green in every fresh-DB
+# harness (they start empty and take the canonical schema) and reaches no existing
+# board — exactly what INST-8 did, caught only by driving a copy of the real
+# 2311-task board. Drive the PUBLIC entry point, on a store that is already
+# stamped, and stamp it with the epoch VARIABLE so this arm survives future bumps.
+STAMPED_DIR="$TMP/stamped"; STAMPED="$STAMPED_DIR/tasks.db"; mkdir -p "$STAMPED_DIR"
+( TASKS_DIR="$STAMPED_DIR"; TASKS_DB="$STAMPED"; tasks_db_init >/dev/null 2>&1 )
+sqlite3 "$STAMPED" "DROP TABLE action_leases;" 2>/dev/null
+sqlite3 "$STAMPED" "INSERT INTO task_prefs(key,value,updated_at) VALUES ('schema_epoch','3525-1',datetime('now'))
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value;" 2>/dev/null
+want "the fixture carries a STALE epoch stamp — a real box's shape the day this lands" \
+     '[[ "$(sqlite3 "$STAMPED" "SELECT value FROM task_prefs WHERE key='"'"'schema_epoch'"'"';")" != "$_TASKS_SCHEMA_EPOCH" ]]'
+want "tasks_db_init — the entry point a live box uses — creates action_leases on it" \
+     '( TASKS_DIR="$STAMPED_DIR"; TASKS_DB="$STAMPED"; tasks_db_init >/dev/null 2>&1; [[ "$(sqlite3 "$STAMPED" "SELECT 1 FROM sqlite_master WHERE type='"'"'table'"'"' AND name='"'"'action_leases'"'"';")" == 1 ]] )'
+# And the bump itself, pinned. This is the arm that catches a future author adding
+# a one-shot block and forgetting the epoch, or a rebase quietly restoring the old
+# constant: the epoch must no longer be the value every live board is stamped with.
+want "the schema epoch was BUMPED off the value live boards carry (the skip-gate fix)" \
+     '[[ "$_TASKS_SCHEMA_EPOCH" != "3525-1" ]]'
 
 echo
 echo "-- 2. the key is the ACTION's identity, not the attempt's"
