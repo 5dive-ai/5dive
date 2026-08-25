@@ -57,6 +57,17 @@ _HB_CONSOLIDATE_TIMEOUT_S=300
 STATE_DIR="$TMP/state"
 SELF_BIN="$TMP/fake-5dive"
 CALLS="$TMP/calls.log"
+# The far end of the sudo payload. It records whether the seat's token actually
+# ARRIVED in its environment — the half of the fix an argv grep cannot see — and
+# then speaks the JSON the sweep grades.
+export TOKEN_SEEN="$TMP/token-seen"
+cat > "$SELF_BIN" <<'BINEOF'
+#!/usr/bin/env bash
+printf '%s\n' "${CLAUDE_CODE_OAUTH_TOKEN:-<absent>}" >> "$TOKEN_SEEN"
+printf '%s' "${STUB_OUT:-}"
+exit "${STUB_RC:-0}"
+BINEOF
+chmod +x "$SELF_BIN"
 
 _hb_log() { :; }
 registry_read() { printf '%s' "${REG:-{\"agents\":{}\}}"; }
@@ -64,21 +75,26 @@ registry_read() { printf '%s' "${REG:-{\"agents\":{}\}}"; }
 # sweep shells out through, so both are replaced by recorders — otherwise a
 # "green" arm could be green because sudo refused.
 timeout() { shift; "$@"; }
+# DIVE-3711 iteration 2 (quinn): the recorder now RUNS the payload it recorded.
+# The previous version returned STUB_OUT itself, so `bash -c '<payload>' _ <authenv>
+# <selfbin>` was never executed — and deleting the whole auth fix out of the
+# payload survived 52/52, because the authenv path stayed on the command line as
+# a now-unused positional. A grep over an argv proves a string was PASSED, never
+# that it was USED. So: strip sudo's own flags, record the argv as before, then
+# exec the real `bash -c`. STUB_OUT/STUB_RC are exported and spoken by $SELF_BIN
+# at the far end, which is where the CLI would be.
 sudo()    { local u=""; while [ $# -gt 0 ]; do case "$1" in -u) u="$2"; shift 2;; -n|-H) shift;; *) break;; esac; done
             printf '%s\t%s\n' "$u" "$*" >> "$CALLS"
-            # DIVE-3711: the stub must be able to SPEAK, because the sweep now
-            # grades what the verb printed rather than how it exited. A recorder
-            # that only returns an rc could not express the defect this row is
-            # about (rc 0, nothing written).
-            printf '%s' "${STUB_OUT:-}"; return "${STUB_RC:-0}"; }
+            "$@"; }
 id()      { case "${2:-}" in agent-alice|agent-bob) return 0;; *) return 1;; esac; }
 
 REG='{"agents":{"alice":{},"bob":{}}}'
 # Default: a healthy pass that actually produced something. Every arm that is
 # not about failure inherits this, so "green" means "the sweep saw atoms".
 _STUB_OK='{"ok":true,"data":{"atoms_written":2,"processed":1,"distiller_failed":0}}'
-reset() { rm -rf "$STATE_DIR" "$CALLS"; : > "$CALLS"; STUB_RC=0; STUB_OUT="$_STUB_OK"; unset MEMORY_CONSOLIDATE MEMORY_CONSOLIDATE_EVERY_MIN; }
+reset() { rm -rf "$STATE_DIR" "$CALLS"; : > "$CALLS"; : > "$TOKEN_SEEN"; STUB_RC=0; STUB_OUT="$_STUB_OK"; unset MEMORY_CONSOLIDATE MEMORY_CONSOLIDATE_EVERY_MIN; }
 STUB_OUT="$_STUB_OK"; STUB_RC=0
+export STUB_OUT STUB_RC   # spoken by $SELF_BIN, which is a real child process now
 ncalls() { wc -l < "$CALLS" | tr -d ' '; }
 NOW=1000000000
 
@@ -188,9 +204,25 @@ check "and never as distilled"                                    "$_HB_CONS_RAN
 echo "== the seat's own auth env reaches the distiller =="
 # `sudo -H` resets the environment, so the seat's CLAUDE_CODE_OAUTH_TOKEN never
 # reached the CLI and every call answered "Not logged in" — the cause behind the
-# zero atoms. Asserted on the invocation, which is all this harness can see.
+# zero atoms. This is the half of the fix that makes atoms appear at all, so it
+# is asserted on ARRIVAL, not on the argv: only `alice` gets an auth file, and
+# the distiller has to come out of the payload holding her token.
+#
+# Reserved-fake value only (CLAUDE.md) — the shape is irrelevant, the arrival is
+# the claim.
 reset
+AUTH_FIXTURE='not-a-real-token-1234567890'
+mkdir -p "$STATE_DIR/agents.d"
+printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$AUTH_FIXTURE" > "$STATE_DIR/agents.d/alice-auth.env"
 _hb_memory_consolidate_sweep "$NOW"
+check "the seat's own token ARRIVES in the distiller's environment" \
+  "$(grep -c -F -- "$AUTH_FIXTURE" "$TOKEN_SEEN")" "1"
+# CONTROL, and it is what makes the line above mean anything: `bob` has no auth
+# file, and his call must come out with NOTHING. Without it the arm is equally
+# green if the token merely leaked from this harness's own environment into every
+# child, which is the one way it could pass with the sourcing deleted.
+check "CONTROL: the seat with no auth file gets no token at all" \
+  "$(grep -c -F -- '<absent>' "$TOKEN_SEEN")" "1"
 grep -q 'alice-auth.env' "$CALLS" \
   && ok "the invocation carries the SEAT's own auth env path" \
   || bad "the invocation does not reference <seat>-auth.env — sudo -H drops the token"

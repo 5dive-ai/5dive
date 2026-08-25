@@ -1165,7 +1165,7 @@ _memory_consolidate() {
       [ -n "${a_name:-}" ] || continue
       local a_body; a_body=$(printf '%s' "$a_body64" | base64 -d 2>/dev/null) || continue
       if [ "$dry" -eq 1 ]; then
-        echo "  would write: [$a_type] $a_name — $a_desc"
+        (( JSON_MODE )) || echo "  would write: [$a_type] $a_name — $a_desc"
         n_written=$((n_written+1)); continue
       fi
       # The ONE write path. No --store: consolidate cannot publish (DIVE-481).
@@ -1178,7 +1178,13 @@ _memory_consolidate() {
       if [ "$addrc" -eq 0 ]; then
         n_written=$((n_written+1))
         written_files+=("$dir/${a_type}_$(printf '%s' "$a_name" | tr '-' '_').md")
-        echo "  ✓ [$a_type] $a_name"
+        # DIVE-3711: NOT in --json. This is the one line only a PRODUCING pass
+        # prints, so leaving it on stdout means the envelope is unparseable
+        # exactly when atoms were written — `jq -s` over "  ✓ …" + {…} errors,
+        # the sweep reads no atom count, and a seat that worked is filed under
+        # could-not-run with zero atoms. That is this row's defect wearing the
+        # fix's clothes: the headline number stays zero for the working case.
+        (( JSON_MODE )) || echo "  ✓ [$a_type] $a_name"
       elif printf '%s' "$addout" | grep -q 'already exists'; then
         n_dupe=$((n_dupe+1))
       else

@@ -26,6 +26,13 @@ label that says "distilled".
   the token as an argument, which would put it in `ps`. Measured paired on this host, same instant,
   same transcript set: without it `distiller_failed:1`, with it `distiller_failed:0`.
 
+- **`--json` prints the envelope and nothing else.** The per-atom `✓ [type] name` progress line
+  went to stdout unconditionally, so in `--json` the stream was that line *followed by* the object —
+  and only a pass that actually WROTE something printed it. `jq` over that errors, the sweep reads no
+  atom count, and a seat that worked would have been filed under could-not-run with zero atoms: this
+  same defect, surviving inside its own fix, visible only once the pipeline was healthy. The line is
+  now suppressed in `--json` and unchanged for a human reader.
+
 Two rules fall out, and they are the durable part:
 **a success counter must be able to produce the negative for the thing it names** — ask of any
 metric what it would print if the work silently did nothing, and if the answer is "the same number",
