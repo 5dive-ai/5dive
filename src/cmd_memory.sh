@@ -75,6 +75,12 @@ _memory_usage() {
                         env FIVEDIVE_MEMORY_DISTILLER also sets it)
         --dry-run       print the atoms, write nothing, leave the ledger alone
         --force         re-distil a transcript the ledger already records
+      EXIT CODE IS THE ARTIFACT, NOT THE ATTEMPT (DIVE-3711): a pass whose every
+      attempted distillation FAILED wrote nothing and exits 6 (auth required —
+      the usual cause is a CLI that is not logged in for this user). A partial
+      failure, or a pass that legitimately found nothing durable, still exits 0.
+      In --json, `ok` mirrors that. Read the atom count, never the exit code, if
+      what you want to know is whether anything was produced.
       Idempotent: a ledger (.consolidated.tsv beside the store) records each
       (session, byte count), and `add` refuses a slug that already exists — so a
       re-run is a no-op even if the ledger is lost.
@@ -1159,7 +1165,7 @@ _memory_consolidate() {
       [ -n "${a_name:-}" ] || continue
       local a_body; a_body=$(printf '%s' "$a_body64" | base64 -d 2>/dev/null) || continue
       if [ "$dry" -eq 1 ]; then
-        echo "  would write: [$a_type] $a_name — $a_desc"
+        (( JSON_MODE )) || echo "  would write: [$a_type] $a_name — $a_desc"
         n_written=$((n_written+1)); continue
       fi
       # The ONE write path. No --store: consolidate cannot publish (DIVE-481).
@@ -1172,7 +1178,13 @@ _memory_consolidate() {
       if [ "$addrc" -eq 0 ]; then
         n_written=$((n_written+1))
         written_files+=("$dir/${a_type}_$(printf '%s' "$a_name" | tr '-' '_').md")
-        echo "  ✓ [$a_type] $a_name"
+        # DIVE-3711: NOT in --json. This is the one line only a PRODUCING pass
+        # prints, so leaving it on stdout means the envelope is unparseable
+        # exactly when atoms were written — `jq -s` over "  ✓ …" + {…} errors,
+        # the sweep reads no atom count, and a seat that worked is filed under
+        # could-not-run with zero atoms. That is this row's defect wearing the
+        # fix's clothes: the headline number stays zero for the working case.
+        (( JSON_MODE )) || echo "  ✓ [$a_type] $a_name"
       elif printf '%s' "$addout" | grep -q 'already exists'; then
         n_dupe=$((n_dupe+1))
       else
@@ -1191,13 +1203,27 @@ _memory_consolidate() {
     fi
   done < <(ls -1t "$HOME"/.claude/projects/*/*.jsonl 2>/dev/null)
 
+  # DIVE-3711: a pass in which EVERY attempted distillation failed wrote nothing,
+  # and must not exit 0. The old contract — rc 0 whatever happened — is exactly
+  # what let the heartbeat log "13 seat(s) distilled" every 6h for four days
+  # while the fleet-wide ledger held ONE row: the sweep incremented its success
+  # counter on rc, and rc could not tell "wrote atoms" from "the CLI is not
+  # logged in". A PARTIAL failure still exits 0 (real work landed) and stays loud
+  # on stderr and in the JSON — only a wholly-failed pass is a failed pass, and
+  # a pass with nothing to distil (processed=0) is not a failure at all.
+  local pass_rc=0
+  if [ "$distill_failed" -gt 0 ] && [ "$distill_failed" -ge "$processed" ]; then
+    pass_rc=$E_AUTH_REQUIRED
+  fi
+
   if (( JSON_MODE )); then
     jq -nc --argjson considered "$considered" --argjson processed "$processed" \
        --argjson written "$written" --argjson refused "$refused" --argjson dupes "$dupes" \
        --argjson live "$skipped_live" --argjson done "$skipped_done" \
        --argjson dfail "$distill_failed" \
+       --argjson ok "$([ "$pass_rc" -eq 0 ] && echo true || echo false)" \
        --arg store "$dir" --arg ledger "$ledger" --argjson dry "$([ "$dry" -eq 1 ] && echo true || echo false)" \
-      '{ok:true, data:{store:$store, ledger:$ledger, dry_run:$dry, considered:$considered,
+      '{ok:$ok, data:{store:$store, ledger:$ledger, dry_run:$dry, considered:$considered,
         processed:$processed, atoms_written:$written, atoms_refused:$refused,
         atoms_duplicate:$dupes, skipped_live:$live, skipped_consolidated:$done,
         distiller_failed:$dfail}}'
@@ -1212,7 +1238,14 @@ _memory_consolidate() {
     [ "$distill_failed" -gt 0 ] && echo "  DISTILLER FAILED on $distill_failed session(s) — not ledgered, will retry next pass (is the CLI logged in?)" >&2 || :
     [ "$dry" -eq 1 ] && echo "  (dry run — nothing written, ledger untouched)" || :
   fi
-  return 0
+  # An INTENTIONAL non-zero exit has to claim the reason, or the EXIT-trap
+  # backstop overprints a second envelope ("exited 6 without reporting a reason —
+  # this is a bug in the CLI") after the real one. Only `fail`/`policy_refuse`
+  # set that flag on their own, and this path uses neither: the pass reported
+  # itself, fully, in the block above. Measured against the BUILT bundle — the
+  # corpus harness sources the function directly and never sees the trap.
+  [ "$pass_rc" -eq 0 ] || mark_reported
+  return "$pass_rc"
 }
 
 cmd_memory() {
