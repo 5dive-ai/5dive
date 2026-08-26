@@ -588,7 +588,9 @@ install_channel_plugin_for_agent() {
   local user="agent-${name}"
   id -u "$user" &>/dev/null || fail "$E_GENERIC" "agent user missing: $user"
 
-  # Runtime precheck: the plugin is started with `bun server.ts`, so without
+  # Runtime precheck: the plugin is started by `bun` under whatever entry point
+  # its own `start` script names (`start.ts` since DIVE-3752 on the claude
+  # lineage, `server.ts` on the telegram-<x> variants), so without
   # bun on the agent user's PATH the service would spin up, crash, and be
   # restarted by systemd — visible only in journalctl. Fail fast with a
   # message the frontend can show instead. Mirror 5dive-agent-start.sh by
