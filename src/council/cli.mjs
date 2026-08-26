@@ -36,13 +36,38 @@ const out = (obj) => { process.stdout.write(JSON.stringify(obj) + '\n') }
 // Built-ins are read-only defaults; the persisted file extends/overrides them and
 // is the only thing `bench add|rm` mutate. Resolution is fail-closed on a miss.
 const BUILTINS = { ...E.STANDING_COUNCILS, council: { ...E.DEFAULT_COUNCIL } }
-function loadRegistry(p) {
+// DIVE-3729: a read that fails OPEN into a lookup that fails CLOSED names the WRONG fault.
+// `catch { return {} }` collapsed "the file is not there" and "I was not allowed to read it" into
+// the same empty registry. resolveBench() then missed and told the operator `unknown bench: <name>`
+// — every word of it true, every word pointing away from an EACCES on benches.json. Worse, a name
+// that IS in BUILTINS does not miss at all: it silently resolved to the genesis default, so a
+// quorum-carried, hash-chained, sealed motion was voided by a file mode for five weeks with no
+// error on any path. A missing store and an unreadable one are different facts and only one of
+// them is normal, so only ENOENT stays soft.
+function loadRegistry(p, what = 'bench registry') {
   if (!p) return {}
-  try { return JSON.parse(fs.readFileSync(p, 'utf-8')) } catch { return {} }
+  let raw
+  try {
+    raw = fs.readFileSync(p, 'utf-8')
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return {}   // never written yet — the ordinary empty case
+    die(`cannot read the ${what} ${p}: ${(e && (e.code || e.message)) || 'unknown error'} — this is a READ FAILURE, not an empty ${what} (check its owner/mode; it must be readable by unprivileged seats)`)
+  }
+  if (!raw.trim()) return {}                  // zero-length file: same fact as absent
+  try {
+    return JSON.parse(raw)
+  } catch (e) {
+    die(`${what} ${p} is not valid JSON (${e.message}) — refusing to run as if it were empty`)
+  }
 }
 function saveRegistry(p, reg) {
   if (!p) die('bench mutation needs --registry=<path>')
-  fs.writeFileSync(p, JSON.stringify(reg, null, 2) + '\n')
+  // DIVE-3729: `mode` applies only when the file is CREATED (and is still masked by the umask), so
+  // this cannot downgrade an existing registry — it stops a first write under a tight umask from
+  // leaving the store root-only, which is the same lockout the shell-side rewrite caused.
+  const existed = fs.existsSync(p)
+  fs.writeFileSync(p, JSON.stringify(reg, null, 2) + '\n', { mode: 0o644 })
+  if (!existed) { try { fs.chmodSync(p, 0o644) } catch { /* best effort; the write itself succeeded */ } }
 }
 function resolveBench(name, reg) {
   // persisted wins over a same-named built-in (lets the council re-seat a standing bench).
@@ -958,7 +983,7 @@ function renderQuestion(tmpl, { date, context }) {
 function cmdSchedule() {
   const action = positionals[0] || 'ls'
   const storePath = flag('schedules')
-  const store = loadRegistry(storePath)   // {name: entry}
+  const store = loadRegistry(storePath, 'schedule store')   // {name: entry}
   const isName = (n) => /^[a-z0-9][a-z0-9_-]{0,63}$/i.test(n)
   if (action === 'ls') {
     const names = Object.keys(store).sort()

@@ -2282,13 +2282,38 @@ const out = (obj) => { process.stdout.write(JSON.stringify(obj) + '\n') }
 // Built-ins are read-only defaults; the persisted file extends/overrides them and
 // is the only thing `bench add|rm` mutate. Resolution is fail-closed on a miss.
 const BUILTINS = { ...E.STANDING_COUNCILS, council: { ...E.DEFAULT_COUNCIL } }
-function loadRegistry(p) {
+// DIVE-3729: a read that fails OPEN into a lookup that fails CLOSED names the WRONG fault.
+// `catch { return {} }` collapsed "the file is not there" and "I was not allowed to read it" into
+// the same empty registry. resolveBench() then missed and told the operator `unknown bench: <name>`
+// — every word of it true, every word pointing away from an EACCES on benches.json. Worse, a name
+// that IS in BUILTINS does not miss at all: it silently resolved to the genesis default, so a
+// quorum-carried, hash-chained, sealed motion was voided by a file mode for five weeks with no
+// error on any path. A missing store and an unreadable one are different facts and only one of
+// them is normal, so only ENOENT stays soft.
+function loadRegistry(p, what = 'bench registry') {
   if (!p) return {}
-  try { return JSON.parse(fs.readFileSync(p, 'utf-8')) } catch { return {} }
+  let raw
+  try {
+    raw = fs.readFileSync(p, 'utf-8')
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return {}   // never written yet — the ordinary empty case
+    die(`cannot read the ${what} ${p}: ${(e && (e.code || e.message)) || 'unknown error'} — this is a READ FAILURE, not an empty ${what} (check its owner/mode; it must be readable by unprivileged seats)`)
+  }
+  if (!raw.trim()) return {}                  // zero-length file: same fact as absent
+  try {
+    return JSON.parse(raw)
+  } catch (e) {
+    die(`${what} ${p} is not valid JSON (${e.message}) — refusing to run as if it were empty`)
+  }
 }
 function saveRegistry(p, reg) {
   if (!p) die('bench mutation needs --registry=<path>')
-  fs.writeFileSync(p, JSON.stringify(reg, null, 2) + '\n')
+  // DIVE-3729: `mode` applies only when the file is CREATED (and is still masked by the umask), so
+  // this cannot downgrade an existing registry — it stops a first write under a tight umask from
+  // leaving the store root-only, which is the same lockout the shell-side rewrite caused.
+  const existed = fs.existsSync(p)
+  fs.writeFileSync(p, JSON.stringify(reg, null, 2) + '\n', { mode: 0o644 })
+  if (!existed) { try { fs.chmodSync(p, 0o644) } catch { /* best effort; the write itself succeeded */ } }
 }
 function resolveBench(name, reg) {
   // persisted wins over a same-named built-in (lets the council re-seat a standing bench).
@@ -3204,7 +3229,7 @@ function renderQuestion(tmpl, { date, context }) {
 function cmdSchedule() {
   const action = positionals[0] || 'ls'
   const storePath = flag('schedules')
-  const store = loadRegistry(storePath)   // {name: entry}
+  const store = loadRegistry(storePath, 'schedule store')   // {name: entry}
   const isName = (n) => /^[a-z0-9][a-z0-9_-]{0,63}$/i.test(n)
   if (action === 'ls') {
     const names = Object.keys(store).sort()
@@ -4119,6 +4144,36 @@ _council_veto_offer_eligible() {
   [[ -n "$sj" ]] || return 2
   printf '%s' "$sj"
   return 0
+}
+
+# DIVE-3729 (secondary): `convene --help` needs a target that costs nothing to reach — it must not
+# depend on the roster, the registry, or a resolved subject. Text only, stderr (same channel and
+# same exit-0 contract as `_council_help`).
+_council_convene_usage() {
+  cat >&2 <<'COUNCIL_CONVENE_HELP'
+5dive council convene "<question>" [flags]
+
+  --subject=<ident|one line>   REQUIRED on the primary council: what this convene decides.
+                               The founder-veto offer is minted on this bench and an offer that
+                               cannot name what it vetoes is not a governance record, so a
+                               subject-less primary convene is refused before anything seals.
+                               Ad-hoc panels (--seats=) and alternate benches (--bench=) do not
+                               need one.
+  --seats=a,b,c                Convene an AD-HOC panel instead of the standing council.
+  --bench=<name>               Convene a standing bench from the registry (`council bench ls`).
+  --mode=quick|deliberate|adversarial
+  --class=<decisionClass>      Override the auto-derived decision class.
+  --threshold=<majority|all|N|a/b>
+  --timeout=120 --idle-secs=5 --poll-secs=2
+  --standalone                 Use the single-key modelCall seam instead of dispatching to seats.
+  --json                       Machine-readable envelope (stdout only).
+
+  Dispatches the question to the real seated agents over the `5dive agent ask` rail; the first
+  round is blind. A seat that times out or omits its COUNCIL-VOTE line is a recorded ABSTAIN.
+  Emits a deterministic tally plus a tamper-evident, root-signed receipt.
+
+  See `5dive council --help` for the rest of the surface.
+COUNCIL_CONVENE_HELP
 }
 
 # DIVE-2257 iteration 2 — a primary-council convene with NO subject must FAIL LOUDLY, at convene
@@ -5137,8 +5192,32 @@ _council_motion() {
     >> "$COUNCIL_LINEAGE"
   # Persist the new roster into the motion-governed council bench (only now the seal succeeded).
   bench_seats="$(printf '%s' "$apply" | jq -c '.benchSeats')"
-  local tmpreg; tmpreg="$(mktemp)"
-  jq --argjson seats "$bench_seats" '(.council.seats)=$seats | (.council.genesis)=true' "$COUNCIL_REGISTRY" > "$tmpreg" 2>/dev/null && mv "$tmpreg" "$COUNCIL_REGISTRY" || rm -f "$tmpreg"
+  # DIVE-3729: `mv` replaces the destination INODE, so the rewritten registry inherits the TEMP
+  # file's mode/owner — a bare `mktemp` is 0600 root:root, and this line therefore locked every
+  # non-root seat out of benches.json the moment the first motion carried. It was invisible because
+  # the reader failed OPEN (empty registry) into a lookup that fails CLOSED, so a carried motion was
+  # voided with no error on any path. Two corrections, both required:
+  #   1. stage the temp NEXT TO the registry — in $TMPDIR the `mv` is a cross-filesystem copy, not
+  #      the atomic rename this pattern is chosen for;
+  #   2. carry the destination's owner+mode onto the replacement (same shape as cmd_proof.sh's
+  #      writer, and the chown CNCL-29/DIVE-2102 had to add back to the capability store).
+  # A persist that cannot happen is now SAID OUT LOUD: the motion is already sealed into the chain
+  # at this point, so silence here is exactly the failure this row was filed about.
+  local tmpreg=""
+  tmpreg="$(mktemp "${COUNCIL_REGISTRY}.XXXXXX" 2>/dev/null)" || tmpreg=""
+  if [[ -z "$tmpreg" ]]; then
+    warn "motion sealed into the chain but the bench registry rewrite could not be staged beside ${COUNCIL_REGISTRY} — the new roster is NOT persisted; re-run under sudo or fix ${COUNCIL_DIR} permissions"
+  else
+    chown --reference="$COUNCIL_REGISTRY" "$tmpreg" 2>/dev/null || chown root:claude "$tmpreg" 2>/dev/null || true
+    chmod --reference="$COUNCIL_REGISTRY" "$tmpreg" 2>/dev/null || chmod 0644 "$tmpreg" 2>/dev/null || true
+    if jq --argjson seats "$bench_seats" '(.council.seats)=$seats | (.council.genesis)=true' "$COUNCIL_REGISTRY" > "$tmpreg" 2>/dev/null \
+       && mv "$tmpreg" "$COUNCIL_REGISTRY"; then
+      :
+    else
+      rm -f "$tmpreg" 2>/dev/null || true
+      warn "motion sealed into the chain but ${COUNCIL_REGISTRY} could not be rewritten — the new roster is NOT persisted; council roster will keep showing the old bench until it is"
+    fi
+  fi
 
   if (( JSON_MODE )); then
     printf '%s' "$apply" | jq --arg d "$digest" --arg r "$receipt_digest" '{ok:true,data:{motion:.class,carried:true,subject:(.record.motion.subject),seats:.seats,sealedDigest:$d,receiptDigest:$r,seq:.record.seq}}'
@@ -5551,6 +5630,18 @@ cmd_council() {
   fi
 
   # convene ------------------------------------------------------------------
+  # DIVE-3729 (secondary): help BEFORE any argument policy. The DIVE-2257 subject check below
+  # refuses a subject-less primary convene with exit 2 — and it ran ahead of help dispatch, so
+  # `5dive council convene --help` answered the refusal instead of the question. An operator whose
+  # FIRST move is to look up the flags got an error about the thing they were trying to look up,
+  # which is how the standup wrapper's missing --subject stayed unexplained for 35 days.
+  local _cv_h
+  for _cv_h in "$@"; do
+    case "$_cv_h" in
+      -h|--help) _council_convene_usage; return 0 ;;
+    esac
+  done
+
   local stamped; stamped="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   local genesis_exists=0; [[ -f "$COUNCIL_GENESIS" ]] && genesis_exists=1
 
