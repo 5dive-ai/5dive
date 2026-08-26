@@ -2282,13 +2282,77 @@ const out = (obj) => { process.stdout.write(JSON.stringify(obj) + '\n') }
 // Built-ins are read-only defaults; the persisted file extends/overrides them and
 // is the only thing `bench add|rm` mutate. Resolution is fail-closed on a miss.
 const BUILTINS = { ...E.STANDING_COUNCILS, council: { ...E.DEFAULT_COUNCIL } }
-function loadRegistry(p) {
+// DIVE-3729: a read that fails OPEN into a lookup that fails CLOSED names the WRONG fault.
+// `catch { return {} }` collapsed "the file is not there" and "I was not allowed to read it" into
+// the same empty registry. resolveBench() then missed and told the operator `unknown bench: <name>`
+// — every word of it true, every word pointing away from an EACCES on benches.json. Worse, a name
+// that IS in BUILTINS does not miss at all: it silently resolved to the genesis default, so a
+// quorum-carried, hash-chained, sealed motion was voided by a file mode for five weeks with no
+// error on any path. A missing store and an unreadable one are different facts and only one of
+// them is normal, so only ENOENT stays soft.
+// DIVE-3729 iteration 2 (ops hold on #734): failing CLOSED on EACCES was right about the FACT and
+// wrong about the BLAST RADIUS. The population that has an unreadable registry is exactly the
+// legacy root-0600 fleet this fix exists to repair, so a hard `die` there converted a silent
+// wrong-bench into `exit 2` on the working path — it took `council convene` DOWN on every host it
+// was meant to save. The rule that survives both: a read failure must never be SILENT, but it must
+// only be FATAL where continuing would destroy something. So —
+//   1. try to REPAIR the mode we find (works when we are root or own it — which covers the
+//      sudo-driven scheduled convene, i.e. the fleet's own self-heal); re-read and carry on.
+//   2. where repair is impossible and the caller only READS, DEGRADE: return the empty registry the
+//      old code returned, but hand the caller a loud, structured reason it must surface. Nothing is
+//      lost that was not already lost; the difference from the original bug is that it is now SAID.
+//   3. where the caller MUTATES (init, bench add/rm, schedule add/rm), stay FATAL — a
+//      read-modify-write over a registry we could not read would delete every entry in it. That is
+//      the one place the exit-2 is worth more than the convenience.
+// `registryDegraded` is module-level so the command can put it on its OWN output envelope: it must
+// not ride stderr, because `--json` callers capture 2>&1 and a stray line breaks their jq (the same
+// constraint the receiptDropped field is built around).
+let registryDegraded = null
+const registryDegradedNote = () => registryDegraded || undefined
+function loadRegistry(p, what = 'bench registry', { soft = false } = {}) {
   if (!p) return {}
-  try { return JSON.parse(fs.readFileSync(p, 'utf-8')) } catch { return {} }
+  const read = () => fs.readFileSync(p, 'utf-8')
+  let raw
+  try {
+    raw = read()
+  } catch (e) {
+    const code = (e && e.code) || 'unknown error'
+    if (code === 'ENOENT') return {}   // never written yet — the ordinary empty case
+    if (code === 'EACCES' || code === 'EPERM') {
+      // Repair, then re-read. chmod throws EPERM unless we are root or the owner, so this is
+      // self-limiting: it can only ever widen a file this process was already entitled to change.
+      let repaired = false
+      try { fs.chmodSync(p, 0o644); raw = read(); repaired = true } catch { /* not ours to fix */ }
+      if (repaired) {
+        process.stderr.write(`council: repaired the ${what} ${p} — it was unreadable by unprivileged seats (mode reset to 0644); this is the DIVE-3729 lockout and it is now fixed on this host\n`)
+        return parse(raw)
+      }
+      const why = `cannot read the ${what} ${p}: ${code} — this is a READ FAILURE, not an empty ${what}. Every custom/re-seated bench in it is INVISIBLE to this run, so a bench that was carried by a motion may silently resolve to its built-in default. Fix the mode (sudo chown root:${'$'}(id -gn) ${p} && sudo chmod 0644 ${p}) or re-run under sudo, which repairs it automatically.`
+      if (soft) { registryDegraded = why; return {} }
+      die(why)
+    }
+    die(`cannot read the ${what} ${p}: ${code} — this is a READ FAILURE, not an empty ${what} (check its owner/mode; it must be readable by unprivileged seats)`)
+  }
+  return parse(raw)
+
+  function parse(text) {
+    if (!text.trim()) return {}                  // zero-length file: same fact as absent
+    try {
+      return JSON.parse(text)
+    } catch (e) {
+      die(`${what} ${p} is not valid JSON (${e.message}) — refusing to run as if it were empty`)
+    }
+  }
 }
+
 function saveRegistry(p, reg) {
   if (!p) die('bench mutation needs --registry=<path>')
-  fs.writeFileSync(p, JSON.stringify(reg, null, 2) + '\n')
+  // DIVE-3729: `mode` applies only when the file is CREATED (and is still masked by the umask), so
+  // this cannot downgrade an existing registry — it stops a first write under a tight umask from
+  // leaving the store root-only, which is the same lockout the shell-side rewrite caused.
+  const existed = fs.existsSync(p)
+  fs.writeFileSync(p, JSON.stringify(reg, null, 2) + '\n', { mode: 0o644 })
+  if (!existed) { try { fs.chmodSync(p, 0o644) } catch { /* best effort; the write itself succeeded */ } }
 }
 function resolveBench(name, reg) {
   // persisted wins over a same-named built-in (lets the council re-seat a standing bench).
@@ -2947,7 +3011,9 @@ async function cmdConvene() {
   const question = positionals[0]
   if (!question) die('convene needs a question: 5dive council convene "<q>" --seats=a,b,c')
   const registryPath = flag('registry')
-  const reg = loadRegistry(registryPath)
+  // DIVE-3729 it.2: SOFT — a convene that can still reach a verdict must still reach it. The
+  // degradation is reported on the envelope below, never swallowed.
+  const reg = loadRegistry(registryPath, 'bench registry', { soft: true })
   const cp = flag('constitution-path')
   const constitution = E.loadConstitution(cp === true || cp == null ? '' : String(cp))
   if (!constitution.valid) process.stderr.write(`council: invalid constitution.yaml; using built-in defaults (${constitution.error})\n`)
@@ -3134,23 +3200,36 @@ async function cmdConvene() {
     precedents: result.verdict && result.verdict.precedents ? result.verdict.precedents : undefined,
     precedentCitation: result.verdict && result.verdict.precedentCitation ? result.verdict.precedentCitation : undefined,
     receipt: result.receipt,   // { canonical, seal, verify } — bash seals canonical
+    // DIVE-3729 it.2: the read DEGRADED rather than exiting 2, so the one thing that must not
+    // happen is this convene looking clean. bash lifts this onto every channel it has.
+    benchRegistryUnreadable: registryDegradedNote(),
   })
 }
 
 function cmdBench() {
   const action = positionals[0] || 'ls'
   const registryPath = flag('registry')
-  const reg = loadRegistry(registryPath)
+  // DIVE-3729 it.2: `ls`/`show` only READ, so they degrade and say so; `add`/`rm` do a
+  // read-modify-write and MUST stay fatal — saving over a registry we could not read would drop
+  // every custom bench in it, which is a worse version of the bug this row is about.
+  const readOnly = action === 'ls' || action === 'show'
+  const reg = loadRegistry(registryPath, 'bench registry', { soft: readOnly })
   if (action === 'ls') {
     const names = [...new Set([...Object.keys(BUILTINS), ...Object.keys(reg)])].sort()
-    out({ benches: names.map(n => ({ name: n, builtin: n in BUILTINS, custom: n in reg })) })
+    out({ benches: names.map(n => ({ name: n, builtin: n in BUILTINS, custom: n in reg })), benchRegistryUnreadable: registryDegradedNote() })
     return
   }
   if (action === 'show') {
     const name = positionals[1]; if (!name) die('bench show needs a name')
     const b = resolveBench(name, reg)
-    if (!b) die(`unknown bench: ${name} (fail-closed)`, 3)
-    out({ name: b.name, description: b.description, mode: b.mode, seats: b.seats, builtin: name in BUILTINS, custom: name in reg })
+    // DIVE-3729 it.2: `show` is the surface an operator uses to ANSWER "who is on this bench", so a
+    // degraded read here is the original bug in miniature — a built-in resolves, prints a clean
+    // roster, and the carried-motion overlay that would have changed it is simply not there. If it
+    // could not be read, that fact ships with the answer.
+    if (!b) die(registryDegraded
+      ? `unknown bench: ${name} — but ${registryDegraded}`
+      : `unknown bench: ${name} (fail-closed)`, 3)
+    out({ name: b.name, description: b.description, mode: b.mode, seats: b.seats, builtin: name in BUILTINS, custom: name in reg, benchRegistryUnreadable: registryDegradedNote() })
     return
   }
   // CNCL-8: the primary council is special in EXACTLY one way — its membership changes ONLY
@@ -3204,11 +3283,12 @@ function renderQuestion(tmpl, { date, context }) {
 function cmdSchedule() {
   const action = positionals[0] || 'ls'
   const storePath = flag('schedules')
-  const store = loadRegistry(storePath)   // {name: entry}
+  // DIVE-3729 it.2: same split as bench — `ls` reads, everything else writes the store back.
+  const store = loadRegistry(storePath, 'schedule store', { soft: (positionals[0] || 'ls') === 'ls' })   // {name: entry}
   const isName = (n) => /^[a-z0-9][a-z0-9_-]{0,63}$/i.test(n)
   if (action === 'ls') {
     const names = Object.keys(store).sort()
-    out({ schedules: names.map(n => ({ name: n, cron: store[n].cron, bench: store[n].bench || 'council', mode: store[n].mode || 'quick' })) })
+    out({ schedules: names.map(n => ({ name: n, cron: store[n].cron, bench: store[n].bench || 'council', mode: store[n].mode || 'quick' })), scheduleStoreUnreadable: registryDegradedNote() })
     return
   }
   if (action === 'show') {
@@ -4121,6 +4201,36 @@ _council_veto_offer_eligible() {
   return 0
 }
 
+# DIVE-3729 (secondary): `convene --help` needs a target that costs nothing to reach — it must not
+# depend on the roster, the registry, or a resolved subject. Text only, stderr (same channel and
+# same exit-0 contract as `_council_help`).
+_council_convene_usage() {
+  cat >&2 <<'COUNCIL_CONVENE_HELP'
+5dive council convene "<question>" [flags]
+
+  --subject=<ident|one line>   REQUIRED on the primary council: what this convene decides.
+                               The founder-veto offer is minted on this bench and an offer that
+                               cannot name what it vetoes is not a governance record, so a
+                               subject-less primary convene is refused before anything seals.
+                               Ad-hoc panels (--seats=) and alternate benches (--bench=) do not
+                               need one.
+  --seats=a,b,c                Convene an AD-HOC panel instead of the standing council.
+  --bench=<name>               Convene a standing bench from the registry (`council bench ls`).
+  --mode=quick|deliberate|adversarial
+  --class=<decisionClass>      Override the auto-derived decision class.
+  --threshold=<majority|all|N|a/b>
+  --timeout=120 --idle-secs=5 --poll-secs=2
+  --standalone                 Use the single-key modelCall seam instead of dispatching to seats.
+  --json                       Machine-readable envelope (stdout only).
+
+  Dispatches the question to the real seated agents over the `5dive agent ask` rail; the first
+  round is blind. A seat that times out or omits its COUNCIL-VOTE line is a recorded ABSTAIN.
+  Emits a deterministic tally plus a tamper-evident, root-signed receipt.
+
+  See `5dive council --help` for the rest of the surface.
+COUNCIL_CONVENE_HELP
+}
+
 # DIVE-2257 iteration 2 — a primary-council convene with NO subject must FAIL LOUDLY, at convene
 # time, before anything seals. Iteration 1 refused only the OFFER (rc 2 -> record the omission and
 # convene anyway): the convene still succeeded, the receipt still sealed, and the founder veto
@@ -4145,6 +4255,46 @@ _council_veto_offer_omitted() {
   mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
   line="$(jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg why "$why" \
     '{ts:$ts, reason:$why, kind:"veto-offer-omitted"}' 2>/dev/null)" || line=""
+  if [[ -n "$line" && -w "$COUNCIL_DIR" ]]; then
+    printf '%s\n' "$line" >> "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+    chmod 0600 "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+    [[ "$(id -u)" -eq 0 ]] && chown root:root "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# DIVE-3729 (third gap, found by the filer while verifying this row): the receipt write and the
+# founder-veto ping share ONE `[[ -w "$COUNCIL_RECEIPTS" ]]` guard with no else, so an unprivileged
+# scheduled convene skipped BOTH in silence — it sealed a digest, wrote no receipt, contributed no
+# case-law to CNCL-19's precedent pool, and never once offered the veto. Same disease as the
+# registry above: a control that declines to act must be auditable, and this one was not observable
+# on ANY path. It stays non-fatal (the convene has already run and sealed by the time we get here;
+# aborting would neither un-run it nor make the veto exist) but it is no longer SILENT.
+#
+# The durable sink is best-effort by necessity — ${COUNCIL_DIR} is not group-writable either, so the
+# very caller this fires for usually cannot write the audit row. That is WHY the stderr warn and the
+# envelope field carry it: the one channel a non-root cron caller always has is its own log.
+_council_receipt_drop_audit() {
+  local why="${1:-}" line=""
+  line="$(jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg why "$why" --arg u "$(id -un 2>/dev/null)" \
+    '{ts:$ts, reason:$why, by:$u, kind:"receipt-dropped"}' 2>/dev/null)" || line=""
+  if [[ -n "$line" && -w "$COUNCIL_DIR" ]]; then
+    printf '%s\n' "$line" >> "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+    chmod 0600 "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+    [[ "$(id -u)" -eq 0 ]] && chown root:root "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# DIVE-3729 it.2: the bench registry was unreadable and the convene proceeded on built-ins anyway
+# (ops hold on #734 — exit 2 here took the tool down on the very fleet it repairs). Proceeding is
+# the right call, but it must leave a durable trace: this is the row that lets someone find out
+# WHY a convene ran with the genesis bench weeks later, which is the exact forensic that took five
+# weeks the first time.
+_council_registry_degraded_audit() {
+  local why="${1:-}" line=""
+  line="$(jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg why "$why" --arg u "$(id -un 2>/dev/null)" \
+    '{ts:$ts, reason:$why, by:$u, kind:"bench-registry-unreadable"}' 2>/dev/null)" || line=""
   if [[ -n "$line" && -w "$COUNCIL_DIR" ]]; then
     printf '%s\n' "$line" >> "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
     chmod 0600 "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
@@ -5137,8 +5287,32 @@ _council_motion() {
     >> "$COUNCIL_LINEAGE"
   # Persist the new roster into the motion-governed council bench (only now the seal succeeded).
   bench_seats="$(printf '%s' "$apply" | jq -c '.benchSeats')"
-  local tmpreg; tmpreg="$(mktemp)"
-  jq --argjson seats "$bench_seats" '(.council.seats)=$seats | (.council.genesis)=true' "$COUNCIL_REGISTRY" > "$tmpreg" 2>/dev/null && mv "$tmpreg" "$COUNCIL_REGISTRY" || rm -f "$tmpreg"
+  # DIVE-3729: `mv` replaces the destination INODE, so the rewritten registry inherits the TEMP
+  # file's mode/owner — a bare `mktemp` is 0600 root:root, and this line therefore locked every
+  # non-root seat out of benches.json the moment the first motion carried. It was invisible because
+  # the reader failed OPEN (empty registry) into a lookup that fails CLOSED, so a carried motion was
+  # voided with no error on any path. Two corrections, both required:
+  #   1. stage the temp NEXT TO the registry — in $TMPDIR the `mv` is a cross-filesystem copy, not
+  #      the atomic rename this pattern is chosen for;
+  #   2. carry the destination's owner+mode onto the replacement (same shape as cmd_proof.sh's
+  #      writer, and the chown CNCL-29/DIVE-2102 had to add back to the capability store).
+  # A persist that cannot happen is now SAID OUT LOUD: the motion is already sealed into the chain
+  # at this point, so silence here is exactly the failure this row was filed about.
+  local tmpreg=""
+  tmpreg="$(mktemp "${COUNCIL_REGISTRY}.XXXXXX" 2>/dev/null)" || tmpreg=""
+  if [[ -z "$tmpreg" ]]; then
+    warn "motion sealed into the chain but the bench registry rewrite could not be staged beside ${COUNCIL_REGISTRY} — the new roster is NOT persisted; re-run under sudo or fix ${COUNCIL_DIR} permissions"
+  else
+    chown --reference="$COUNCIL_REGISTRY" "$tmpreg" 2>/dev/null || chown root:claude "$tmpreg" 2>/dev/null || true
+    chmod --reference="$COUNCIL_REGISTRY" "$tmpreg" 2>/dev/null || chmod 0644 "$tmpreg" 2>/dev/null || true
+    if jq --argjson seats "$bench_seats" '(.council.seats)=$seats | (.council.genesis)=true' "$COUNCIL_REGISTRY" > "$tmpreg" 2>/dev/null \
+       && mv "$tmpreg" "$COUNCIL_REGISTRY"; then
+      :
+    else
+      rm -f "$tmpreg" 2>/dev/null || true
+      warn "motion sealed into the chain but ${COUNCIL_REGISTRY} could not be rewritten — the new roster is NOT persisted; council roster will keep showing the old bench until it is"
+    fi
+  fi
 
   if (( JSON_MODE )); then
     printf '%s' "$apply" | jq --arg d "$digest" --arg r "$receipt_digest" '{ok:true,data:{motion:.class,carried:true,subject:(.record.motion.subject),seats:.seats,sealedDigest:$d,receiptDigest:$r,seq:.record.seq}}'
@@ -5551,6 +5725,18 @@ cmd_council() {
   fi
 
   # convene ------------------------------------------------------------------
+  # DIVE-3729 (secondary): help BEFORE any argument policy. The DIVE-2257 subject check below
+  # refuses a subject-less primary convene with exit 2 — and it ran ahead of help dispatch, so
+  # `5dive council convene --help` answered the refusal instead of the question. An operator whose
+  # FIRST move is to look up the flags got an error about the thing they were trying to look up,
+  # which is how the standup wrapper's missing --subject stayed unexplained for 35 days.
+  local _cv_h
+  for _cv_h in "$@"; do
+    case "$_cv_h" in
+      -h|--help) _council_convene_usage; return 0 ;;
+    esac
+  done
+
   local stamped; stamped="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   local genesis_exists=0; [[ -f "$COUNCIL_GENESIS" ]] && genesis_exists=1
 
@@ -5648,6 +5834,7 @@ cmd_council() {
   # node short-circuits to an escalate verdict (fail-closed — a bad drift-check also escalates).
   local drift_flag=""
   _council_constitution_drift "$dir" >/dev/null 2>&1 || drift_flag="--constitution-drift=1"
+  local _cv_receipt_dropped="" _cv_registry_degraded=""
 
   # CNCL-19: build the case-law precedent pool from the SEALED convene receipt log and hand it to
   # the engine. The engine deterministically selects the top-k relevant priors, injects them as
@@ -5691,6 +5878,15 @@ cmd_council() {
   fi
   rm -f "$_refusal" 2>/dev/null || true
 
+  # DIVE-3729 it.2: the registry read DEGRADED (unreadable, unrepairable from this euid) and the
+  # convene ran on built-ins. Say it on every channel this caller has — warn (non-JSON), a durable
+  # audit row, and the envelope field below (--json callers capture 2>&1, so stderr cannot carry it).
+  _cv_registry_degraded="$(printf '%s' "$raw" | jq -r '.benchRegistryUnreadable // empty' 2>/dev/null)" || _cv_registry_degraded=""
+  if [[ -n "$_cv_registry_degraded" ]]; then
+    _council_registry_degraded_audit "$_cv_registry_degraded" || true
+    (( JSON_MODE )) || warn "$_cv_registry_degraded"
+  fi
+
   # Seal the receipt canonical at the root HMAC rail — a standalone engine has no
   # key, so the seal (via gate-proof) is what makes the verdict tamper-evident. The
   # founder veto + dissent already ride INSIDE the signed bytes (canonicalTranscript).
@@ -5726,6 +5922,12 @@ cmd_council() {
     fi
     if [[ -n "$digest" ]]; then
       mkdir -p "$COUNCIL_RECEIPTS" 2>/dev/null || true
+      if [[ ! -w "$COUNCIL_RECEIPTS" ]]; then
+        # DIVE-3729 third gap: say it, on every channel this caller has.
+        _cv_receipt_dropped="the convene sealed digest ${digest:0:16}… but ${COUNCIL_RECEIPTS} is not writable by $(id -un 2>/dev/null) — NO receipt was written (so this convene is invisible to CNCL-19 case-law) and the founder veto was NOT offered. Grant the one cron user write on that directory (setfacl -m u:<user>:rwx) or run the convene under sudo; do NOT chmod g+w, that opens the sealed audit trail to every seat."
+        _council_receipt_drop_audit "$_cv_receipt_dropped" || true
+        (( JSON_MODE )) || warn "$_cv_receipt_dropped"
+      fi
       if [[ -w "$COUNCIL_RECEIPTS" ]]; then
         # Offline-test capture ONLY: when MOCK is on AND a sink path is provided, drop the raw nonce
         # so the bash e2e can present it at exercise. Double-gated on COUNCIL_MOCK (never set in a
@@ -5797,7 +5999,10 @@ cmd_council() {
   fi
 
   if (( JSON_MODE )); then
-    printf '%s' "$raw" | jq --arg d "$digest" '{ok:true, data: (. + {sealedDigest: $d})}'
+    # DIVE-3729: a dropped receipt cannot ride stderr here (callers capture 2>&1 into this envelope
+    # — see the NB on the veto-omission above), so it rides the envelope itself.
+    printf '%s' "$raw" | jq --arg d "$digest" --arg rd "$_cv_receipt_dropped" \
+      '{ok:true, data: (. + {sealedDigest: $d} + (if ($rd|length)>0 then {receiptDropped: $rd} else {} end))}'
   else
     local council q disp rec tally conf dissent brief
     council="$(printf '%s' "$raw" | jq -r '.council')"
@@ -5809,12 +6014,21 @@ cmd_council() {
     dissent="$(printf '%s' "$raw" | jq -r '.verdict.dissent // "none"')"
     brief="$(printf '%s' "$raw" | jq -r '.verdict.brief // empty')"
     echo "council:      $council"
+    # DIVE-3729 it.2: the line an operator scans must not read as authoritative when the persisted
+    # bench could not be read — that misreading IS the original bug, one layer up.
+    [[ -n "$_cv_registry_degraded" ]] && echo "              (BUILT-IN FALLBACK — the persisted bench registry was unreadable; see the warning above)"
     echo "question:     $q"
     echo "disposition:  $disp  (recommendation=$rec, tally=$tally, confidence=$conf)"
     [[ -n "$dissent" && "$dissent" != "none" ]] && echo "dissent:      $dissent"
     [[ -n "$brief" ]] && echo "brief:        $brief"
     if [[ -n "$digest" ]]; then
-      echo "receipt:      sealed (${digest:0:16}…)"
+      if [[ -n "$_cv_receipt_dropped" ]]; then
+        # DIVE-3729: "sealed" was true of the DIGEST and read as true of the RECEIPT — the one
+        # line an operator scans, saying the opposite of what happened.
+        echo "receipt:      sealed (${digest:0:16}…) but NOT STORED — see the warning above"
+      else
+        echo "receipt:      sealed (${digest:0:16}…)"
+      fi
     else
       echo "receipt:      unsealed (no gate-proof key / not root — run via sudo to seal)"
     fi

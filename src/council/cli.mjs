@@ -36,13 +36,77 @@ const out = (obj) => { process.stdout.write(JSON.stringify(obj) + '\n') }
 // Built-ins are read-only defaults; the persisted file extends/overrides them and
 // is the only thing `bench add|rm` mutate. Resolution is fail-closed on a miss.
 const BUILTINS = { ...E.STANDING_COUNCILS, council: { ...E.DEFAULT_COUNCIL } }
-function loadRegistry(p) {
+// DIVE-3729: a read that fails OPEN into a lookup that fails CLOSED names the WRONG fault.
+// `catch { return {} }` collapsed "the file is not there" and "I was not allowed to read it" into
+// the same empty registry. resolveBench() then missed and told the operator `unknown bench: <name>`
+// — every word of it true, every word pointing away from an EACCES on benches.json. Worse, a name
+// that IS in BUILTINS does not miss at all: it silently resolved to the genesis default, so a
+// quorum-carried, hash-chained, sealed motion was voided by a file mode for five weeks with no
+// error on any path. A missing store and an unreadable one are different facts and only one of
+// them is normal, so only ENOENT stays soft.
+// DIVE-3729 iteration 2 (ops hold on #734): failing CLOSED on EACCES was right about the FACT and
+// wrong about the BLAST RADIUS. The population that has an unreadable registry is exactly the
+// legacy root-0600 fleet this fix exists to repair, so a hard `die` there converted a silent
+// wrong-bench into `exit 2` on the working path — it took `council convene` DOWN on every host it
+// was meant to save. The rule that survives both: a read failure must never be SILENT, but it must
+// only be FATAL where continuing would destroy something. So —
+//   1. try to REPAIR the mode we find (works when we are root or own it — which covers the
+//      sudo-driven scheduled convene, i.e. the fleet's own self-heal); re-read and carry on.
+//   2. where repair is impossible and the caller only READS, DEGRADE: return the empty registry the
+//      old code returned, but hand the caller a loud, structured reason it must surface. Nothing is
+//      lost that was not already lost; the difference from the original bug is that it is now SAID.
+//   3. where the caller MUTATES (init, bench add/rm, schedule add/rm), stay FATAL — a
+//      read-modify-write over a registry we could not read would delete every entry in it. That is
+//      the one place the exit-2 is worth more than the convenience.
+// `registryDegraded` is module-level so the command can put it on its OWN output envelope: it must
+// not ride stderr, because `--json` callers capture 2>&1 and a stray line breaks their jq (the same
+// constraint the receiptDropped field is built around).
+let registryDegraded = null
+const registryDegradedNote = () => registryDegraded || undefined
+function loadRegistry(p, what = 'bench registry', { soft = false } = {}) {
   if (!p) return {}
-  try { return JSON.parse(fs.readFileSync(p, 'utf-8')) } catch { return {} }
+  const read = () => fs.readFileSync(p, 'utf-8')
+  let raw
+  try {
+    raw = read()
+  } catch (e) {
+    const code = (e && e.code) || 'unknown error'
+    if (code === 'ENOENT') return {}   // never written yet — the ordinary empty case
+    if (code === 'EACCES' || code === 'EPERM') {
+      // Repair, then re-read. chmod throws EPERM unless we are root or the owner, so this is
+      // self-limiting: it can only ever widen a file this process was already entitled to change.
+      let repaired = false
+      try { fs.chmodSync(p, 0o644); raw = read(); repaired = true } catch { /* not ours to fix */ }
+      if (repaired) {
+        process.stderr.write(`council: repaired the ${what} ${p} — it was unreadable by unprivileged seats (mode reset to 0644); this is the DIVE-3729 lockout and it is now fixed on this host\n`)
+        return parse(raw)
+      }
+      const why = `cannot read the ${what} ${p}: ${code} — this is a READ FAILURE, not an empty ${what}. Every custom/re-seated bench in it is INVISIBLE to this run, so a bench that was carried by a motion may silently resolve to its built-in default. Fix the mode (sudo chown root:${'$'}(id -gn) ${p} && sudo chmod 0644 ${p}) or re-run under sudo, which repairs it automatically.`
+      if (soft) { registryDegraded = why; return {} }
+      die(why)
+    }
+    die(`cannot read the ${what} ${p}: ${code} — this is a READ FAILURE, not an empty ${what} (check its owner/mode; it must be readable by unprivileged seats)`)
+  }
+  return parse(raw)
+
+  function parse(text) {
+    if (!text.trim()) return {}                  // zero-length file: same fact as absent
+    try {
+      return JSON.parse(text)
+    } catch (e) {
+      die(`${what} ${p} is not valid JSON (${e.message}) — refusing to run as if it were empty`)
+    }
+  }
 }
+
 function saveRegistry(p, reg) {
   if (!p) die('bench mutation needs --registry=<path>')
-  fs.writeFileSync(p, JSON.stringify(reg, null, 2) + '\n')
+  // DIVE-3729: `mode` applies only when the file is CREATED (and is still masked by the umask), so
+  // this cannot downgrade an existing registry — it stops a first write under a tight umask from
+  // leaving the store root-only, which is the same lockout the shell-side rewrite caused.
+  const existed = fs.existsSync(p)
+  fs.writeFileSync(p, JSON.stringify(reg, null, 2) + '\n', { mode: 0o644 })
+  if (!existed) { try { fs.chmodSync(p, 0o644) } catch { /* best effort; the write itself succeeded */ } }
 }
 function resolveBench(name, reg) {
   // persisted wins over a same-named built-in (lets the council re-seat a standing bench).
@@ -701,7 +765,9 @@ async function cmdConvene() {
   const question = positionals[0]
   if (!question) die('convene needs a question: 5dive council convene "<q>" --seats=a,b,c')
   const registryPath = flag('registry')
-  const reg = loadRegistry(registryPath)
+  // DIVE-3729 it.2: SOFT — a convene that can still reach a verdict must still reach it. The
+  // degradation is reported on the envelope below, never swallowed.
+  const reg = loadRegistry(registryPath, 'bench registry', { soft: true })
   const cp = flag('constitution-path')
   const constitution = E.loadConstitution(cp === true || cp == null ? '' : String(cp))
   if (!constitution.valid) process.stderr.write(`council: invalid constitution.yaml; using built-in defaults (${constitution.error})\n`)
@@ -888,23 +954,36 @@ async function cmdConvene() {
     precedents: result.verdict && result.verdict.precedents ? result.verdict.precedents : undefined,
     precedentCitation: result.verdict && result.verdict.precedentCitation ? result.verdict.precedentCitation : undefined,
     receipt: result.receipt,   // { canonical, seal, verify } — bash seals canonical
+    // DIVE-3729 it.2: the read DEGRADED rather than exiting 2, so the one thing that must not
+    // happen is this convene looking clean. bash lifts this onto every channel it has.
+    benchRegistryUnreadable: registryDegradedNote(),
   })
 }
 
 function cmdBench() {
   const action = positionals[0] || 'ls'
   const registryPath = flag('registry')
-  const reg = loadRegistry(registryPath)
+  // DIVE-3729 it.2: `ls`/`show` only READ, so they degrade and say so; `add`/`rm` do a
+  // read-modify-write and MUST stay fatal — saving over a registry we could not read would drop
+  // every custom bench in it, which is a worse version of the bug this row is about.
+  const readOnly = action === 'ls' || action === 'show'
+  const reg = loadRegistry(registryPath, 'bench registry', { soft: readOnly })
   if (action === 'ls') {
     const names = [...new Set([...Object.keys(BUILTINS), ...Object.keys(reg)])].sort()
-    out({ benches: names.map(n => ({ name: n, builtin: n in BUILTINS, custom: n in reg })) })
+    out({ benches: names.map(n => ({ name: n, builtin: n in BUILTINS, custom: n in reg })), benchRegistryUnreadable: registryDegradedNote() })
     return
   }
   if (action === 'show') {
     const name = positionals[1]; if (!name) die('bench show needs a name')
     const b = resolveBench(name, reg)
-    if (!b) die(`unknown bench: ${name} (fail-closed)`, 3)
-    out({ name: b.name, description: b.description, mode: b.mode, seats: b.seats, builtin: name in BUILTINS, custom: name in reg })
+    // DIVE-3729 it.2: `show` is the surface an operator uses to ANSWER "who is on this bench", so a
+    // degraded read here is the original bug in miniature — a built-in resolves, prints a clean
+    // roster, and the carried-motion overlay that would have changed it is simply not there. If it
+    // could not be read, that fact ships with the answer.
+    if (!b) die(registryDegraded
+      ? `unknown bench: ${name} — but ${registryDegraded}`
+      : `unknown bench: ${name} (fail-closed)`, 3)
+    out({ name: b.name, description: b.description, mode: b.mode, seats: b.seats, builtin: name in BUILTINS, custom: name in reg, benchRegistryUnreadable: registryDegradedNote() })
     return
   }
   // CNCL-8: the primary council is special in EXACTLY one way — its membership changes ONLY
@@ -958,11 +1037,12 @@ function renderQuestion(tmpl, { date, context }) {
 function cmdSchedule() {
   const action = positionals[0] || 'ls'
   const storePath = flag('schedules')
-  const store = loadRegistry(storePath)   // {name: entry}
+  // DIVE-3729 it.2: same split as bench — `ls` reads, everything else writes the store back.
+  const store = loadRegistry(storePath, 'schedule store', { soft: (positionals[0] || 'ls') === 'ls' })   // {name: entry}
   const isName = (n) => /^[a-z0-9][a-z0-9_-]{0,63}$/i.test(n)
   if (action === 'ls') {
     const names = Object.keys(store).sort()
-    out({ schedules: names.map(n => ({ name: n, cron: store[n].cron, bench: store[n].bench || 'council', mode: store[n].mode || 'quick' })) })
+    out({ schedules: names.map(n => ({ name: n, cron: store[n].cron, bench: store[n].bench || 'council', mode: store[n].mode || 'quick' })), scheduleStoreUnreadable: registryDegradedNote() })
     return
   }
   if (action === 'show') {

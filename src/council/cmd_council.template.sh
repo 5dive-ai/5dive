@@ -425,6 +425,36 @@ _council_veto_offer_eligible() {
   return 0
 }
 
+# DIVE-3729 (secondary): `convene --help` needs a target that costs nothing to reach — it must not
+# depend on the roster, the registry, or a resolved subject. Text only, stderr (same channel and
+# same exit-0 contract as `_council_help`).
+_council_convene_usage() {
+  cat >&2 <<'COUNCIL_CONVENE_HELP'
+5dive council convene "<question>" [flags]
+
+  --subject=<ident|one line>   REQUIRED on the primary council: what this convene decides.
+                               The founder-veto offer is minted on this bench and an offer that
+                               cannot name what it vetoes is not a governance record, so a
+                               subject-less primary convene is refused before anything seals.
+                               Ad-hoc panels (--seats=) and alternate benches (--bench=) do not
+                               need one.
+  --seats=a,b,c                Convene an AD-HOC panel instead of the standing council.
+  --bench=<name>               Convene a standing bench from the registry (`council bench ls`).
+  --mode=quick|deliberate|adversarial
+  --class=<decisionClass>      Override the auto-derived decision class.
+  --threshold=<majority|all|N|a/b>
+  --timeout=120 --idle-secs=5 --poll-secs=2
+  --standalone                 Use the single-key modelCall seam instead of dispatching to seats.
+  --json                       Machine-readable envelope (stdout only).
+
+  Dispatches the question to the real seated agents over the `5dive agent ask` rail; the first
+  round is blind. A seat that times out or omits its COUNCIL-VOTE line is a recorded ABSTAIN.
+  Emits a deterministic tally plus a tamper-evident, root-signed receipt.
+
+  See `5dive council --help` for the rest of the surface.
+COUNCIL_CONVENE_HELP
+}
+
 # DIVE-2257 iteration 2 — a primary-council convene with NO subject must FAIL LOUDLY, at convene
 # time, before anything seals. Iteration 1 refused only the OFFER (rc 2 -> record the omission and
 # convene anyway): the convene still succeeded, the receipt still sealed, and the founder veto
@@ -449,6 +479,46 @@ _council_veto_offer_omitted() {
   mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
   line="$(jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg why "$why" \
     '{ts:$ts, reason:$why, kind:"veto-offer-omitted"}' 2>/dev/null)" || line=""
+  if [[ -n "$line" && -w "$COUNCIL_DIR" ]]; then
+    printf '%s\n' "$line" >> "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+    chmod 0600 "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+    [[ "$(id -u)" -eq 0 ]] && chown root:root "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# DIVE-3729 (third gap, found by the filer while verifying this row): the receipt write and the
+# founder-veto ping share ONE `[[ -w "$COUNCIL_RECEIPTS" ]]` guard with no else, so an unprivileged
+# scheduled convene skipped BOTH in silence — it sealed a digest, wrote no receipt, contributed no
+# case-law to CNCL-19's precedent pool, and never once offered the veto. Same disease as the
+# registry above: a control that declines to act must be auditable, and this one was not observable
+# on ANY path. It stays non-fatal (the convene has already run and sealed by the time we get here;
+# aborting would neither un-run it nor make the veto exist) but it is no longer SILENT.
+#
+# The durable sink is best-effort by necessity — ${COUNCIL_DIR} is not group-writable either, so the
+# very caller this fires for usually cannot write the audit row. That is WHY the stderr warn and the
+# envelope field carry it: the one channel a non-root cron caller always has is its own log.
+_council_receipt_drop_audit() {
+  local why="${1:-}" line=""
+  line="$(jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg why "$why" --arg u "$(id -un 2>/dev/null)" \
+    '{ts:$ts, reason:$why, by:$u, kind:"receipt-dropped"}' 2>/dev/null)" || line=""
+  if [[ -n "$line" && -w "$COUNCIL_DIR" ]]; then
+    printf '%s\n' "$line" >> "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+    chmod 0600 "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+    [[ "$(id -u)" -eq 0 ]] && chown root:root "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# DIVE-3729 it.2: the bench registry was unreadable and the convene proceeded on built-ins anyway
+# (ops hold on #734 — exit 2 here took the tool down on the very fleet it repairs). Proceeding is
+# the right call, but it must leave a durable trace: this is the row that lets someone find out
+# WHY a convene ran with the genesis bench weeks later, which is the exact forensic that took five
+# weeks the first time.
+_council_registry_degraded_audit() {
+  local why="${1:-}" line=""
+  line="$(jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg why "$why" --arg u "$(id -un 2>/dev/null)" \
+    '{ts:$ts, reason:$why, by:$u, kind:"bench-registry-unreadable"}' 2>/dev/null)" || line=""
   if [[ -n "$line" && -w "$COUNCIL_DIR" ]]; then
     printf '%s\n' "$line" >> "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
     chmod 0600 "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
@@ -1441,8 +1511,32 @@ _council_motion() {
     >> "$COUNCIL_LINEAGE"
   # Persist the new roster into the motion-governed council bench (only now the seal succeeded).
   bench_seats="$(printf '%s' "$apply" | jq -c '.benchSeats')"
-  local tmpreg; tmpreg="$(mktemp)"
-  jq --argjson seats "$bench_seats" '(.council.seats)=$seats | (.council.genesis)=true' "$COUNCIL_REGISTRY" > "$tmpreg" 2>/dev/null && mv "$tmpreg" "$COUNCIL_REGISTRY" || rm -f "$tmpreg"
+  # DIVE-3729: `mv` replaces the destination INODE, so the rewritten registry inherits the TEMP
+  # file's mode/owner — a bare `mktemp` is 0600 root:root, and this line therefore locked every
+  # non-root seat out of benches.json the moment the first motion carried. It was invisible because
+  # the reader failed OPEN (empty registry) into a lookup that fails CLOSED, so a carried motion was
+  # voided with no error on any path. Two corrections, both required:
+  #   1. stage the temp NEXT TO the registry — in $TMPDIR the `mv` is a cross-filesystem copy, not
+  #      the atomic rename this pattern is chosen for;
+  #   2. carry the destination's owner+mode onto the replacement (same shape as cmd_proof.sh's
+  #      writer, and the chown CNCL-29/DIVE-2102 had to add back to the capability store).
+  # A persist that cannot happen is now SAID OUT LOUD: the motion is already sealed into the chain
+  # at this point, so silence here is exactly the failure this row was filed about.
+  local tmpreg=""
+  tmpreg="$(mktemp "${COUNCIL_REGISTRY}.XXXXXX" 2>/dev/null)" || tmpreg=""
+  if [[ -z "$tmpreg" ]]; then
+    warn "motion sealed into the chain but the bench registry rewrite could not be staged beside ${COUNCIL_REGISTRY} — the new roster is NOT persisted; re-run under sudo or fix ${COUNCIL_DIR} permissions"
+  else
+    chown --reference="$COUNCIL_REGISTRY" "$tmpreg" 2>/dev/null || chown root:claude "$tmpreg" 2>/dev/null || true
+    chmod --reference="$COUNCIL_REGISTRY" "$tmpreg" 2>/dev/null || chmod 0644 "$tmpreg" 2>/dev/null || true
+    if jq --argjson seats "$bench_seats" '(.council.seats)=$seats | (.council.genesis)=true' "$COUNCIL_REGISTRY" > "$tmpreg" 2>/dev/null \
+       && mv "$tmpreg" "$COUNCIL_REGISTRY"; then
+      :
+    else
+      rm -f "$tmpreg" 2>/dev/null || true
+      warn "motion sealed into the chain but ${COUNCIL_REGISTRY} could not be rewritten — the new roster is NOT persisted; council roster will keep showing the old bench until it is"
+    fi
+  fi
 
   if (( JSON_MODE )); then
     printf '%s' "$apply" | jq --arg d "$digest" --arg r "$receipt_digest" '{ok:true,data:{motion:.class,carried:true,subject:(.record.motion.subject),seats:.seats,sealedDigest:$d,receiptDigest:$r,seq:.record.seq}}'
@@ -1855,6 +1949,18 @@ cmd_council() {
   fi
 
   # convene ------------------------------------------------------------------
+  # DIVE-3729 (secondary): help BEFORE any argument policy. The DIVE-2257 subject check below
+  # refuses a subject-less primary convene with exit 2 — and it ran ahead of help dispatch, so
+  # `5dive council convene --help` answered the refusal instead of the question. An operator whose
+  # FIRST move is to look up the flags got an error about the thing they were trying to look up,
+  # which is how the standup wrapper's missing --subject stayed unexplained for 35 days.
+  local _cv_h
+  for _cv_h in "$@"; do
+    case "$_cv_h" in
+      -h|--help) _council_convene_usage; return 0 ;;
+    esac
+  done
+
   local stamped; stamped="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   local genesis_exists=0; [[ -f "$COUNCIL_GENESIS" ]] && genesis_exists=1
 
@@ -1952,6 +2058,7 @@ cmd_council() {
   # node short-circuits to an escalate verdict (fail-closed — a bad drift-check also escalates).
   local drift_flag=""
   _council_constitution_drift "$dir" >/dev/null 2>&1 || drift_flag="--constitution-drift=1"
+  local _cv_receipt_dropped="" _cv_registry_degraded=""
 
   # CNCL-19: build the case-law precedent pool from the SEALED convene receipt log and hand it to
   # the engine. The engine deterministically selects the top-k relevant priors, injects them as
@@ -1995,6 +2102,15 @@ cmd_council() {
   fi
   rm -f "$_refusal" 2>/dev/null || true
 
+  # DIVE-3729 it.2: the registry read DEGRADED (unreadable, unrepairable from this euid) and the
+  # convene ran on built-ins. Say it on every channel this caller has — warn (non-JSON), a durable
+  # audit row, and the envelope field below (--json callers capture 2>&1, so stderr cannot carry it).
+  _cv_registry_degraded="$(printf '%s' "$raw" | jq -r '.benchRegistryUnreadable // empty' 2>/dev/null)" || _cv_registry_degraded=""
+  if [[ -n "$_cv_registry_degraded" ]]; then
+    _council_registry_degraded_audit "$_cv_registry_degraded" || true
+    (( JSON_MODE )) || warn "$_cv_registry_degraded"
+  fi
+
   # Seal the receipt canonical at the root HMAC rail — a standalone engine has no
   # key, so the seal (via gate-proof) is what makes the verdict tamper-evident. The
   # founder veto + dissent already ride INSIDE the signed bytes (canonicalTranscript).
@@ -2030,6 +2146,12 @@ cmd_council() {
     fi
     if [[ -n "$digest" ]]; then
       mkdir -p "$COUNCIL_RECEIPTS" 2>/dev/null || true
+      if [[ ! -w "$COUNCIL_RECEIPTS" ]]; then
+        # DIVE-3729 third gap: say it, on every channel this caller has.
+        _cv_receipt_dropped="the convene sealed digest ${digest:0:16}… but ${COUNCIL_RECEIPTS} is not writable by $(id -un 2>/dev/null) — NO receipt was written (so this convene is invisible to CNCL-19 case-law) and the founder veto was NOT offered. Grant the one cron user write on that directory (setfacl -m u:<user>:rwx) or run the convene under sudo; do NOT chmod g+w, that opens the sealed audit trail to every seat."
+        _council_receipt_drop_audit "$_cv_receipt_dropped" || true
+        (( JSON_MODE )) || warn "$_cv_receipt_dropped"
+      fi
       if [[ -w "$COUNCIL_RECEIPTS" ]]; then
         # Offline-test capture ONLY: when MOCK is on AND a sink path is provided, drop the raw nonce
         # so the bash e2e can present it at exercise. Double-gated on COUNCIL_MOCK (never set in a
@@ -2101,7 +2223,10 @@ cmd_council() {
   fi
 
   if (( JSON_MODE )); then
-    printf '%s' "$raw" | jq --arg d "$digest" '{ok:true, data: (. + {sealedDigest: $d})}'
+    # DIVE-3729: a dropped receipt cannot ride stderr here (callers capture 2>&1 into this envelope
+    # — see the NB on the veto-omission above), so it rides the envelope itself.
+    printf '%s' "$raw" | jq --arg d "$digest" --arg rd "$_cv_receipt_dropped" \
+      '{ok:true, data: (. + {sealedDigest: $d} + (if ($rd|length)>0 then {receiptDropped: $rd} else {} end))}'
   else
     local council q disp rec tally conf dissent brief
     council="$(printf '%s' "$raw" | jq -r '.council')"
@@ -2113,12 +2238,21 @@ cmd_council() {
     dissent="$(printf '%s' "$raw" | jq -r '.verdict.dissent // "none"')"
     brief="$(printf '%s' "$raw" | jq -r '.verdict.brief // empty')"
     echo "council:      $council"
+    # DIVE-3729 it.2: the line an operator scans must not read as authoritative when the persisted
+    # bench could not be read — that misreading IS the original bug, one layer up.
+    [[ -n "$_cv_registry_degraded" ]] && echo "              (BUILT-IN FALLBACK — the persisted bench registry was unreadable; see the warning above)"
     echo "question:     $q"
     echo "disposition:  $disp  (recommendation=$rec, tally=$tally, confidence=$conf)"
     [[ -n "$dissent" && "$dissent" != "none" ]] && echo "dissent:      $dissent"
     [[ -n "$brief" ]] && echo "brief:        $brief"
     if [[ -n "$digest" ]]; then
-      echo "receipt:      sealed (${digest:0:16}…)"
+      if [[ -n "$_cv_receipt_dropped" ]]; then
+        # DIVE-3729: "sealed" was true of the DIGEST and read as true of the RECEIPT — the one
+        # line an operator scans, saying the opposite of what happened.
+        echo "receipt:      sealed (${digest:0:16}…) but NOT STORED — see the warning above"
+      else
+        echo "receipt:      sealed (${digest:0:16}…)"
+      fi
     else
       echo "receipt:      unsealed (no gate-proof key / not root — run via sudo to seal)"
     fi
