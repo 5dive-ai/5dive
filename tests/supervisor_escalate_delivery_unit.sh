@@ -113,8 +113,24 @@ t "plan layer: drift is not an escalation either" \
   "defer goal-drift" "$(_sup_act_plan claude goal-drift 0 0 0 false)"
 # and the positive control for that pair — the instrument CAN show the positive,
 # otherwise the two defers above prove nothing.
-t "poller-dead DOES reach the escalate verb (positive control)" \
-  "escalate rung-4-needed" "$(_sup_act_plan claude poller-dead 0 0 0 false)"
+#
+# DIVE-3753 gave poller-dead a rung-4 RESTART, so the verb it reaches now depends
+# on whether the ladder is armed. Both of its escalating states are controlled
+# here, because both are what the tick arm below actually drives:
+#   - dormant ($_SUP_ACTIONS_FLAG absent, which is this harness's tick fixture) —
+#     the pre-3753 human path is kept verbatim rather than downgraded to a silent
+#     'planned' row;
+#   - armed but rate-limited — the seat a restart did not fix, which is precisely
+#     the one that must reach a person.
+t "poller-dead reaches escalate when the ladder is DORMANT (positive control)" \
+  "escalate rung-4-dormant" "$(_sup_act_plan claude poller-dead 0 0 0 false 0 false)"
+t "poller-dead reaches escalate when the restart budget is SPENT" \
+  "escalate restart-rate-limited" "$(_sup_act_plan claude poller-dead 0 0 0 false 1 true)"
+# ...and the negative of that pair: armed with budget free, it acts instead of
+# paging. Without this, the two arms above are equally satisfied by an
+# escalate-always plan layer, which is the shape DIVE-3753 exists to remove.
+t "armed + budget free -> the rung acts, it does not page a human" \
+  "restart" "$(_sup_act_plan claude poller-dead 0 0 0 false 0 true)"
 
 # ── the WIRING, driven not inspected ─────────────────────────────────────────
 # quinn, iteration 1: deleting the whole `esc_via=$(_sup_escalate_deliver …)`
@@ -133,8 +149,15 @@ t "poller-dead DOES reach the escalate verb (positive control)" \
 # Root, network, channel state and a real fleet are all stubbed out; what is
 # REAL is cmd_supervisor_tick's own body, _sup_escalate_deliver,
 # _sup_escalate_couriers, _sup_act_plan, and the sqlite write/read.
-tick_arm() {  # <snapshot-json> -> "ESC=<signals-json>|SENT=<csv>"
-  SNAP="$1" REPO="$PWD" bash -c '
+# DIVE-3753 extends it with two optional inputs and two extra output fields, so
+# the SAME real-tick arm covers the new rung: ARMED touches the actions flag (the
+# tick then EXECUTES rungs instead of recording 'planned'), and SEED is SQL run
+# against the fixture DB before the tick, which is how a spent restart budget is
+# staged. `cmd_restart` is stubbed to record the seat and nothing else — this
+# harness must never touch a real unit, and what is under test is that the tick
+# ROUTES to it, not what systemd does next.
+tick_arm() {  # <snapshot-json> [armed] [seed-sql] -> "ESC=<json>|SENT=<csv>|ACT=<json>|RESTARTED=<csv>"
+  SNAP="$1" ARMED="${2:-}" SEED="${3:-}" REPO="$PWD" bash -c '
     set -euo pipefail
     TMP=$(mktemp -d)
     export STATE_DIR="$TMP/state" TASKS_DIR="$TMP/tasks" TASKS_DB="$TMP/tasks/tasks.db"
@@ -146,17 +169,32 @@ tick_arm() {  # <snapshot-json> -> "ESC=<signals-json>|SENT=<csv>"
       . "src/$f"
     done
     _SUP_ENABLED_FLAG="$TMP/enabled"; : >"$_SUP_ENABLED_FLAG"
+    # `if`, not `[[ … ]] && …`: this subshell runs under the shipped `set -e`, so
+    # a false one-liner IS an exit — and it exits before a single arm runs, which
+    # reads as an empty result rather than as an error.
+    _SUP_ACTIONS_FLAG="$TMP/actions"
+    if [[ -n "$ARMED" ]]; then : >"$_SUP_ACTIONS_FLAG"; fi
     require_root()      { :; }                       # the tick is root-only in prod
     _sup_cli_check()    { :; }                        # no network
     _sup_snapshot()     { printf "%s" "$SNAP"; }      # the fixture fleet
     registry_read()     { printf "%s" "{\"agents\":{}}"; }
     _task_agent_channel() { return 1; }               # no telegram anywhere
-    : >"$TMP/sent"
+    : >"$TMP/sent"; : >"$TMP/restarted"
     cmd_send() { printf "%s\n" "$1" >>"$TMP/sent"; return 0; }
+    cmd_restart() { printf "%s\n" "$1" >>"$TMP/restarted"; return 0; }
+    # The seed writes BEFORE the tick, so it has to create the schema itself —
+    # nothing else has touched this fixture DB yet. Both calls are subshelled:
+    # `db` reaches `fail`, and `fail` EXITS, which `|| true` cannot catch.
+    if [[ -n "$SEED" ]]; then
+      ( tasks_db_init ) >/dev/null 2>&1 || true
+      ( db "$SEED" )    >/dev/null 2>&1 || true
+    fi
     cmd_supervisor_tick >/dev/null 2>&1 || { printf "TICK-RC=%s|" "$?"; }
-    printf "ESC=%s|SENT=%s" \
+    printf "ESC=%s|SENT=%s|ACT=%s|RESTARTED=%s" \
       "$(db "SELECT COALESCE(GROUP_CONCAT(signals), \"\") FROM supervisor_events WHERE event=$(sqlq escalate);")" \
-      "$(paste -sd, <"$TMP/sent")"
+      "$(paste -sd, <"$TMP/sent")" \
+      "$(db "SELECT COALESCE(GROUP_CONCAT(signals), \"\") FROM supervisor_events WHERE event=$(sqlq action);")" \
+      "$(paste -sd, <"$TMP/restarted")"
   '   # stderr deliberately NOT swallowed: the arm already fails closed (an abort
       # yields an empty receipt, which reds), but a red with no reason costs the
       # next reader a repro. The tick's own warns are silenced at its call above.
@@ -169,8 +207,16 @@ _WELL_SNAP='[{"name":"main","type":"claude","classification":"healthy"},
                  {"name":"ops","type":"claude","classification":"healthy"},
                  {"name":"quinn","type":"claude","classification":"healthy"}]'
 
+# One field out of the arm's "K=v|K=v|..." line. The old inline ${x##*SENT=} broke
+# the moment a field was appended after SENT — a silently-wrong extraction that
+# would have read as a passing assertion, so it is a function now.
+fld() { # <out> <key>
+  local rest="${1#*"$2"=}"
+  printf '%s' "${rest%%|*}"
+}
+
 sick_out=$(tick_arm "$_SICK_SNAP")
-sick_esc="${sick_out%%|SENT=*}"; sick_esc="${sick_esc#*ESC=}"
+sick_esc="$(fld "$sick_out" ESC)"
 # The receipt reaching signals.delivered is the whole chain in one assertion:
 # the tick reached the escalate branch, derived stuck/all from ITS OWN snapshot,
 # called the deliverer, and wrote what came back rather than only its intent.
@@ -179,16 +225,44 @@ t "tick: the audit row carries the delivery RECEIPT, not just the intent" \
 # ...and the courier is a seat that is NOT the sick one. Asserted on the send
 # itself, not on the receipt, so a receipt that lies about where it went reds.
 t "tick: the escalation was actually handed to a courier" \
-  "ops" "${sick_out##*SENT=}"
+  "ops" "$(fld "$sick_out" SENT)"
 
 # THE ACCEPTANCE CRITERION'S negative control, at the layer it names: same tick,
 # same arm, every poller alive -> no escalate row and NOTHING sent. Paired with
 # the arm above it discriminates "delivery is wired" from "delivery fires always".
 well_out=$(tick_arm "$_WELL_SNAP")
-well_esc="${well_out%%|SENT=*}"; well_esc="${well_esc#*ESC=}"
+well_esc="$(fld "$well_out" ESC)"
 t "negative control: a healthy fleet writes no escalate row" "" "$well_esc"
 t "negative control: a healthy fleet sends nothing" \
-  "" "${well_out##*SENT=}"
+  "" "$(fld "$well_out" SENT)"
+
+# ── DIVE-3753: the same real tick, ARMED — rung 4 end to end ─────────────────
+# The arms above run dormant, which is why they still see an escalation. Armed,
+# the identical poller-dead snapshot must take the ACTION instead: cmd_restart
+# called for the sick seat, an 'action' row recording rung=restart, and NO page
+# to a human — an auto-recovery that also pings a person is how an escalation
+# channel gets muted.
+armed_out=$(tick_arm "$_SICK_SNAP" armed)
+t "armed tick: the sick seat was actually restarted" "main" "$(fld "$armed_out" RESTARTED)"
+t "armed tick: it is audited as an ACT, at rung restart" "restart" \
+  "$(jq -r '.rung // "NO-RUNG"' <<<"$(fld "$armed_out" ACT)" 2>/dev/null || echo NO-ACTION-ROW)"
+t "armed tick: the act records its result" "ok" \
+  "$(jq -r '.result // "NO-RESULT"' <<<"$(fld "$armed_out" ACT)" 2>/dev/null || echo NO-ACTION-ROW)"
+t "armed tick: a successful auto-restart pages nobody" "" "$(fld "$armed_out" SENT)"
+t "armed tick: and writes no escalate row" "" "$(fld "$armed_out" ESC)"
+
+# ...and the seat a restart did NOT fix. Same snapshot, same armed tick, but the
+# seat already spent its budget in-window: no second restart, and the human path
+# takes over. This is the pair that proves the limiter both ALLOWS and REFUSES —
+# a limiter only ever seen refusing is indistinguishable from one that refuses
+# always, which would reproduce the outage the rung exists to end.
+_SPENT="INSERT INTO supervisor_events (agent, event, classification, cause, signals)
+        VALUES ('main','action','stuck','poller-dead','{\"rung\":\"restart\",\"attempt\":1,\"result\":\"ok\"}');"
+limited_out=$(tick_arm "$_SICK_SNAP" armed "$_SPENT")
+t "rate-limited tick: no second restart inside the window" "" "$(fld "$limited_out" RESTARTED)"
+t "rate-limited tick: it escalates instead, naming the limiter" "restart-rate-limited" \
+  "$(jq -r '.reason // "NO-REASON"' <<<"$(fld "$limited_out" ESC)" 2>/dev/null || echo NO-ESCALATE-ROW)"
+t "rate-limited tick: and the escalation reaches a courier" "ops" "$(fld "$limited_out" SENT)"
 
 # ── the human-facing text ────────────────────────────────────────────────────
 txt=$(_sup_escalate_text main poller-dead rung-4-needed quinn)

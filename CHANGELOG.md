@@ -1,5 +1,61 @@
 # Changelog
 
+## Unreleased — feat(supervisor): rung 4 — a poller-dead seat is restarted, once per 6h (DIVE-3753)
+
+On 2026-08-26 the supervisor printed `ESCALATE <seat> (poller-dead: rung-4-needed)` for `marketing`,
+`main`, `dev` and `olivia`. The detection was correct, it fired on time — and **nothing served rung 4**,
+because the ladder's verb set was `nudge|resume|rotate|escalate|defer` and no rung existed to send
+`poller-dead` to. So a correct detection produced no action for 2h33m while 9 human gates sat pending,
+including on the coordinator seat: the company's entire human-in-the-loop path was dark and the
+supervisor knew.
+
+- **`restart` is a real rung now, and it is CAUSE-indexed, not attempt-indexed.** `poller-dead` goes
+  straight to it. Walking rungs 1-3 first would spend an hour of backoff on three actions that cannot
+  work — nudge and resume inject a line into the seat's pane *through the channel that is dead*, which
+  is the classification itself. It executes through the same contained path as the others
+  (`_sup_act_exec`, subshell-wrapped like `rotate`, because `cmd_restart` reaches `fail` and `fail`
+  EXITS — called bare, one seat with a missing unit would abort the tick for every later agent and the
+  fleet heartbeat row would never be written).
+- **Rate-limited: at most one restart per seat per 6h** (`SUPERVISOR_RESTART_MAX` /
+  `SUPERVISOR_RESTART_WINDOW_H`), counted per seat off the same audit trail every other rung uses — no
+  new state file. One, not three, because the remedy is measured at **nine seconds** (DIVE-3748: two
+  seats, launcher=0/server=0 before, 1/1 at t+9s), so a restart that works is visible long before the
+  next 10-minute tick. A *second* restart inside the window is never the cure for the first having
+  worked; it is the signature of a seat that restarting does not fix.
+- **The limiter's refusal ESCALATES, it does not defer.** A deferral is silent, and this is precisely
+  the seat that cannot carry a report about its own unreachability — so "restarting did not fix it"
+  leaves the ladder and reaches a person through the DIVE-3727 courier rail.
+- **A DORMANT ladder still escalates poller-dead** (`escalate rung-4-dormant`). Every other rung
+  degrades to a silent `planned` row while `$_SUP_ACTIONS_FLAG` is unset; if this one did the same, the
+  change would have REMOVED the only thing serving the cause today — the courier-delivered page — and
+  given back nothing until the flag is set. That is decided in the pure planner, so it is assertable
+  without a fleet.
+- **The two counters are separate.** `_sup_act_history` now excludes restart rows: nudge/resume/rotate
+  pick their rung by attempt COUNT and restart picks it by CAUSE, so a shared counter would silently
+  move the next `no-progress` on that seat from nudge to resume because of an action taken for an
+  unrelated cause. Graded both ways round.
+- **A restart is audited as an ACT** (`event='action'`, `rung='restart'`), like the rungs below it, and
+  it writes no escalate row. An auto-recovery that also pages a person is how an escalation channel
+  gets muted; the human path for this cause is the limiter's refusal, not the restart.
+
+**And the alarm stops contradicting the ladder.** `_hb_poller_liveness_sweep`'s remedy still said
+*"do NOT blanket-restart: a restart deletes the beacon and re-arms this alarm"* — true of the BEACON
+(`shutdown()` unlinks it), false of the POLLER, and the two were conflated into standing advice that
+turned the only working remedy into a prohibition. Recency-of-restart correlates with the broken state
+because the failure happens *at* channel start; the correlate points at the moment of the defect, not
+at its cause. The remedy now names the process-table check (`pgrep -u agent-<name> -f 'bun server.ts'`
+— the beacon collapses *never started* / *dependency failure* / *genuinely dead* into one string and
+cannot tell a human which they have), says the supervisor restarts the seat itself at rung 4 and how
+often, and keeps the half of DIVE-2384 that was right: scoped to the ONE named seat, confirm before
+acting, never a fleet-wide restart.
+
+Graded: `supervisor_unit` (101), `supervisor_escalate_delivery_unit` (35, incl. an ARMED real-tick arm
+that drives `cmd_supervisor_tick` end to end and reads the restart, the action row and the silence back
+out of sqlite), `poller_liveness_unit` (41), `supervisor_classify_unit` (37),
+`agent_info_supervisor_unit` (88). Every new arm was mutation-checked: dropping the rung, the executor
+case, the tick dispatch entry, the counter exclusion, the limiter and the retired remedy text each red
+exactly the arms that claim them.
+
 ## Unreleased — feat(durable): an irreversible action fires ONCE, even when the agent crashes mid-flight (INST-8)
 
 INST-4 made the *record* of an action idempotent (`lifecycle_events` has a UNIQUE index on

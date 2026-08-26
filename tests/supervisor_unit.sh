@@ -119,6 +119,126 @@ t "history counts in-window action rows only (not planned/observe/old/other-agen
 read -r ATT _ <<<"$(_sup_act_history unit-none)"
 t "history for unseen agent is zero" "0" "$ATT"
 
+# --- DIVE-3753: rung 4 — poller-dead restart, and its rate limiter ---------
+#
+# BOTH STATES, deliberately. A limiter exercised only in its refusing state is
+# indistinguishable from one that refuses always — and a refuse-always limiter
+# reproduces exactly the outage this rung exists to end (a correct poller-dead
+# detection that produces no action). So: it must ALLOW the first restart and
+# REFUSE the second inside the window, and each half must fail on its own.
+t "poller-dead with budget free -> restart (rung 4, not escalate)" \
+  "restart" "$(_sup_act_plan claude poller-dead 0 0 $NOW false 0)"
+t "poller-dead with budget SPENT -> escalate, naming the limiter" \
+  "escalate restart-rate-limited" "$(_sup_act_plan claude poller-dead 0 0 $NOW false 1)"
+t "poller-dead over budget still escalates (>= not ==)" \
+  "escalate restart-rate-limited" "$(_sup_act_plan claude poller-dead 0 0 $NOW false 7)"
+
+# Runtime-agnostic, like every other rung (OSS-23): a seat is a systemd unit
+# whatever runtime it hosts, so restart must not be claude-only.
+t "poller-dead restarts a codex seat too" \
+  "restart" "$(_sup_act_plan codex poller-dead 0 0 $NOW false 0)"
+t "poller-dead restarts an opencode seat too" \
+  "restart" "$(_sup_act_plan opencode poller-dead 0 0 $NOW true 0)"
+
+# The rung is CAUSE-indexed: a seat that already burned attempts on the 1-3
+# ladder for some other cause must still get its restart, and rotation state
+# must not gate it. Both were live ways to make the rung unreachable.
+t "poller-dead ignores the 1-3 attempt count" \
+  "restart" "$(_sup_act_plan claude poller-dead 3 0 $NOW false 0)"
+t "poller-dead ignores the ladder backoff gap" \
+  "restart" "$(_sup_act_plan claude poller-dead 1 $((NOW - 5)) $NOW false 0)"
+
+# Blast radius: rung 4 is for poller-dead ONLY. Every other rung-4+ cause must
+# still escalate — a restart verb that leaked onto service-dead/tmux-dead would
+# turn one added remedy into a fleet-wide restart authority.
+t "service-dead does NOT get the restart rung" \
+  "escalate rung-4-needed" "$(_sup_act_plan claude service-dead 0 0 $NOW false 0)"
+t "tmux-dead does NOT get the restart rung" \
+  "escalate rung-4-needed" "$(_sup_act_plan claude tmux-dead 0 0 $NOW false 0)"
+
+# Back-compat: the 7th arg is optional and its absence means "nothing spent".
+# Every pre-DIVE-3753 6-arg caller in this file relies on that.
+t "6-arg call (no restart count) defaults to budget free" \
+  "restart" "$(_sup_act_plan claude poller-dead 0 0 $NOW false)"
+t "non-numeric restart count is treated as 0, not as unlimited-spent" \
+  "restart" "$(_sup_act_plan claude poller-dead 0 0 $NOW false "")"
+
+# The DORMANT ladder must NOT lose the human path. Before this row, poller-dead
+# escalated — and an escalation is courier-delivered to a person (DIVE-3727).
+# Every other rung degrades to a silent 'planned' row while actions are off; if
+# poller-dead did the same, this change would REMOVE the only thing serving the
+# cause and give back nothing until the flag is set.
+t "dormant ladder still escalates poller-dead (the pre-3753 human path)" \
+  "escalate rung-4-dormant" "$(_sup_act_plan claude poller-dead 0 0 $NOW false 0 false)"
+t "dormant beats the limiter: budget spent still escalates, not silently" \
+  "escalate rung-4-dormant" "$(_sup_act_plan claude poller-dead 0 0 $NOW false 9 false)"
+t "armed ladder (explicit true) restarts" \
+  "restart" "$(_sup_act_plan claude poller-dead 0 0 $NOW false 0 true)"
+t "8th arg defaults to armed, so 7-arg callers are unchanged" \
+  "restart" "$(_sup_act_plan claude poller-dead 0 0 $NOW false 0)"
+# Dormancy is poller-dead's business only — it must not leak onto the 1-3 ladder,
+# whose dormant handling is the dispatch's 'planned' row, not a plan-layer verb.
+t "dormancy does not change the 1-3 ladder's verb" \
+  "nudge" "$(_sup_act_plan claude no-progress 0 0 $NOW false 0 false)"
+
+# --- DIVE-3753: _sup_restart_history — the limiter's numerator --------------
+t "restart history for an untouched seat is 0" "0" "$(_sup_restart_history unit-r)"
+db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
+    VALUES ('unit-r', 'action', 'stuck', 'poller-dead', '{\"rung\":\"restart\",\"attempt\":1,\"result\":\"ok\"}');"
+t "an executed restart counts against the budget" "1" "$(_sup_restart_history unit-r)"
+# ...and with it counted, the plan flips. This is the pair that proves the
+# limiter is wired to the trail, not just to a literal in the test above.
+t "seat with a restart on the trail now escalates" \
+  "escalate restart-rate-limited" \
+  "$(_sup_act_plan claude poller-dead 0 0 $NOW false "$(_sup_restart_history unit-r)")"
+
+# A DORMANT tick must not spend the budget: 'planned' is a record of what the
+# ladder WOULD do. If planned rows counted, flipping actions on would find every
+# poller-dead seat already rate-limited and the rung would never fire once.
+db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
+    VALUES ('unit-p', 'planned', 'stuck', 'poller-dead', '{\"rung\":\"restart\",\"dormant\":true}');"
+t "a PLANNED restart does not spend the budget" "0" "$(_sup_restart_history unit-p)"
+# Out-of-window and other-seat rows are excluded, same as _sup_act_history.
+db "INSERT INTO supervisor_events (agent, event, classification, cause, signals, ts)
+    VALUES ('unit-w', 'action', 'stuck', 'poller-dead', '{\"rung\":\"restart\"}', datetime('now', '-9 hours'));"
+t "a restart older than the window has aged out" "0" "$(_sup_restart_history unit-w)"
+t "another seat's restart does not spend this seat's budget" "0" "$(_sup_restart_history unit-q)"
+# Other rungs are not restarts.
+db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
+    VALUES ('unit-n', 'action', 'stuck', 'no-progress', '{\"rung\":\"nudge\"}');"
+t "a nudge is not counted as a restart" "0" "$(_sup_restart_history unit-n)"
+
+# --- DIVE-3753: the two counters must not contaminate each other ------------
+# unit-r has ONE action row and it is a restart. If _sup_act_history counted it,
+# the next no-progress on that seat would silently skip nudge and open at
+# resume — an attempt-indexed ladder paced by a cause-indexed rung's traffic.
+read -r RATT _ <<<"$(_sup_act_history unit-r)"
+t "a restart row does not raise the 1-3 attempt count" "0" "$RATT"
+t "so the seat's next no-progress still opens at nudge" \
+  "nudge" "$(_sup_act_plan claude no-progress "$RATT" 0 $NOW false)"
+# ...and the converse: unit-n's nudge (asserted 0 restarts above) leaves the
+# restart budget free, so a poller-dead on that seat still gets its rung 4.
+read -r NATT _ <<<"$(_sup_act_history unit-n)"
+t "a nudge DOES raise the 1-3 attempt count (control for the arm above)" "1" "$NATT"
+
+# --- DIVE-3753: the restart verb is dispatchable and contained --------------
+# _sup_act_exec's `*)` default returns 1 for an unknown verb, so a rung the
+# planner emits but the executor does not know would be recorded as an action
+# that "failed" every single tick — green ladder, zero restarts. Assert the
+# planner's verb is one the executor actually has a case for.
+t "executor has a case for every verb the planner can emit" "yes" \
+  "$(awk '/^_sup_act_exec\(\) \{/,/^\}/' "$SRC/cmd_supervisor.sh" \
+     | grep -qE '^[[:space:]]*restart\)' && printf yes || printf no)"
+# And it is subshell-wrapped: cmd_restart reaches `fail`, which EXITS. Called
+# bare, one seat with a missing unit would abort the tick for every later agent.
+t "the restart case is subshell-contained (a fail() cannot abort the tick)" "yes" \
+  "$(awk '/^_sup_act_exec\(\) \{/,/^\}/' "$SRC/cmd_supervisor.sh" \
+     | grep -A1 -E '^[[:space:]]*restart\)' | grep -qE '^\s*\( *cmd_restart ' && printf yes || printf no)"
+# The tick must route it too — a verb the planner emits and the dispatch `case`
+# does not list falls through to nothing: silently no action, no audit row.
+t "the tick's action dispatch lists restart" "yes" \
+  "$(grep -qE '^[[:space:]]*nudge\|resume\|rotate\|restart\)' "$SRC/cmd_supervisor.sh" && printf yes || printf no)"
+
 # --- DIVE-971: goal-drift never reaches a ladder rung -----------------------
 t "goal-drift defers (class=drift, never a stuck action)" \
   "defer goal-drift" "$(_sup_act_plan claude goal-drift 0 0 $NOW true)"
