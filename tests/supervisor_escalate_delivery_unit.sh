@@ -157,7 +157,9 @@ tick_arm() {  # <snapshot-json> -> "ESC=<signals-json>|SENT=<csv>"
     printf "ESC=%s|SENT=%s" \
       "$(db "SELECT COALESCE(GROUP_CONCAT(signals), \"\") FROM supervisor_events WHERE event=$(sqlq escalate);")" \
       "$(paste -sd, <"$TMP/sent")"
-  ' 2>/dev/null
+  '   # stderr deliberately NOT swallowed: the arm already fails closed (an abort
+      # yields an empty receipt, which reds), but a red with no reason costs the
+      # next reader a repro. The tick's own warns are silenced at its call above.
 }
 
 _SICK_SNAP='[{"name":"main","type":"claude","classification":"stuck","cause":"poller-dead"},
