@@ -69,22 +69,72 @@ else
   if cat "$REG" >/dev/null 2>&1; then
     echo "SKIP-ARM A: this euid can still read a 0000 file (acl/cap?) — arm cannot fire."
   else
+    # DIVE-3729 iteration 2 (ops hold on #734). The harness OWNS this file, so a 0000 mode is one
+    # the process can fix — and it now does: the read REPAIRS the mode and carries on. That is the
+    # outcome the fleet actually needs (the scheduled convene runs under sudo, so it self-heals the
+    # legacy root-0600 registry on first run) and it is strictly better than either the original
+    # fail-open OR iteration 1's fail-closed: the custom bench comes BACK, rather than being
+    # silently skipped or turned into exit 2.
     BAD_LS="$(STATE_DIR="$STATE" "$FIVE" council bench ls 2>&1 || true)"
     case "$BAD_LS" in
-      *"READ FAILURE"*) chk "unreadable registry is a READ FAILURE on bench ls" y y ;;
-      *)                chk "unreadable registry is a READ FAILURE on bench ls" y n; echo "  got: $BAD_LS" ;;
+      *"repaired the bench registry"*) chk "an unreadable registry we OWN is repaired, loudly" y y ;;
+      *)                               chk "an unreadable registry we OWN is repaired, loudly" y n; echo "  got: $BAD_LS" ;;
     esac
     case "$BAD_LS" in
-      *"unknown bench"*) chk "unreadable registry does NOT name the wrong fault" y n ;;
-      *)                 chk "unreadable registry does NOT name the wrong fault" y y ;;
+      *strategy*) chk "the repair restores the custom bench, not just the mode" y y ;;
+      *)          chk "the repair restores the custom bench, not just the mode" y n; echo "  got: $BAD_LS" ;;
     esac
-    # THE SILENT HALF: a BUILT-IN name must not quietly resolve to the genesis default while the
-    # persisted overlay (which may hold a carried motion's roster) is unreadable.
-    BAD_SHOW="$(STATE_DIR="$STATE" "$FIVE" council bench show council 2>&1 || true)"
-    case "$BAD_SHOW" in
-      *"READ FAILURE"*) chk "a built-in name does not silently fall back past an unreadable overlay" y y ;;
-      *)                chk "a built-in name does not silently fall back past an unreadable overlay" y n; echo "  got: $BAD_SHOW" ;;
+    case "$BAD_LS" in
+      *"unknown bench"*) chk "the repair path does NOT name the wrong fault" y n ;;
+      *)                 chk "the repair path does NOT name the wrong fault" y y ;;
     esac
+    MODE_AFTER="$(stat -c '%a' "$REG" 2>/dev/null || echo '?')"
+    case "$MODE_AFTER" in
+      644) chk "the repair actually persisted 0644 to disk" y y ;;
+      *)   chk "the repair actually persisted 0644 to disk" y n; echo "  got mode: $MODE_AFTER" ;;
+    esac
+
+    # ---- THE UNREPAIRABLE HALF: EACCES this euid genuinely cannot fix -----------------------
+    # A 0000 file we own is repairable, so it cannot reach the degrade branch. A 0000 PARENT is:
+    # traversal fails, so both the read AND the chmod return EACCES, with no root and no sudo (which
+    # tests/lib/env_isolation.sh shadows anyway, DIVE-3096 — a sudo probe here measures the harness).
+    # This is the shape CI's full-installed-host job has for real: a root-0600 registry under a
+    # non-root runner. That job is what iteration 1 turned red, and this arm is its stand-in.
+    LOCK="$STATE/locked"; mkdir -p "$LOCK"; cp "$REG" "$LOCK/benches.json"; chmod 0000 "$LOCK"
+    if cat "$LOCK/benches.json" >/dev/null 2>&1; then
+      echo "SKIP-ARM A2: this euid can still traverse a 0000 dir — the unrepairable arm cannot fire."
+    else
+      # Driven at cli.mjs because --registry is the only way to aim the read at a path the shell
+      # wrapper cannot name (it derives COUNCIL_REGISTRY from COUNCIL_DIR unconditionally).
+      DEG="$(node "$ROOT/src/council/cli.mjs" bench ls --registry="$LOCK/benches.json" 2>&1 || true)"
+      DEG_RC=0; node "$ROOT/src/council/cli.mjs" bench ls --registry="$LOCK/benches.json" >/dev/null 2>&1 || DEG_RC=$?
+      case "$DEG_RC" in
+        0) chk "an UNREPAIRABLE registry degrades instead of exiting 2 (the ops hold)" y y ;;
+        *) chk "an UNREPAIRABLE registry degrades instead of exiting 2 (the ops hold)" y n; echo "  got rc: $DEG_RC" ;;
+      esac
+      case "$DEG" in
+        *benchRegistryUnreadable*) chk "the degrade rides the ENVELOPE (--json callers capture 2>&1)" y y ;;
+        *)                         chk "the degrade rides the ENVELOPE (--json callers capture 2>&1)" y n; echo "  got: $DEG" ;;
+      esac
+      case "$DEG" in
+        *"READ FAILURE"*) chk "the degrade still names the read failure, not an empty registry" y y ;;
+        *)                chk "the degrade still names the read failure, not an empty registry" y n; echo "  got: $DEG" ;;
+      esac
+      # The whole point of degrading rather than dying: the built-ins still resolve, so a convene
+      # that can proceed still proceeds.
+      case "$DEG" in
+        *council*) chk "built-ins still resolve while degraded (the working path still works)" y y ;;
+        *)         chk "built-ins still resolve while degraded (the working path still works)" y n ;;
+      esac
+      # ...but a MUTATION must stay fatal: a read-modify-write over a registry we could not read
+      # would delete every custom bench in it.
+      ADD_RC=0; node "$ROOT/src/council/cli.mjs" bench add panel2 --seats=a,b --registry="$LOCK/benches.json" >/dev/null 2>&1 || ADD_RC=$?
+      case "$ADD_RC" in
+        0) chk "a MUTATION over an unreadable registry is still refused" y n; echo "  bench add succeeded over an unreadable store" ;;
+        *) chk "a MUTATION over an unreadable registry is still refused" y y ;;
+      esac
+      chmod 0755 "$LOCK"
+    fi
   fi
   chmod 0644 "$REG"
 fi

@@ -510,6 +510,23 @@ _council_receipt_drop_audit() {
   return 0
 }
 
+# DIVE-3729 it.2: the bench registry was unreadable and the convene proceeded on built-ins anyway
+# (ops hold on #734 — exit 2 here took the tool down on the very fleet it repairs). Proceeding is
+# the right call, but it must leave a durable trace: this is the row that lets someone find out
+# WHY a convene ran with the genesis bench weeks later, which is the exact forensic that took five
+# weeks the first time.
+_council_registry_degraded_audit() {
+  local why="${1:-}" line=""
+  line="$(jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg why "$why" --arg u "$(id -un 2>/dev/null)" \
+    '{ts:$ts, reason:$why, by:$u, kind:"bench-registry-unreadable"}' 2>/dev/null)" || line=""
+  if [[ -n "$line" && -w "$COUNCIL_DIR" ]]; then
+    printf '%s\n' "$line" >> "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+    chmod 0600 "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+    [[ "$(id -u)" -eq 0 ]] && chown root:root "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+  fi
+  return 0
+}
+
 _council_veto_ping() {
   local resolved="$1" digest="$2" execute_after="$3" nonce="$4" motion="${5:-}" tally="${6:-}" dissent="${7:-}" subject="${8:-}"
   mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
@@ -2041,7 +2058,7 @@ cmd_council() {
   # node short-circuits to an escalate verdict (fail-closed — a bad drift-check also escalates).
   local drift_flag=""
   _council_constitution_drift "$dir" >/dev/null 2>&1 || drift_flag="--constitution-drift=1"
-  local _cv_receipt_dropped=""
+  local _cv_receipt_dropped="" _cv_registry_degraded=""
 
   # CNCL-19: build the case-law precedent pool from the SEALED convene receipt log and hand it to
   # the engine. The engine deterministically selects the top-k relevant priors, injects them as
@@ -2084,6 +2101,15 @@ cmd_council() {
     return $_rc
   fi
   rm -f "$_refusal" 2>/dev/null || true
+
+  # DIVE-3729 it.2: the registry read DEGRADED (unreadable, unrepairable from this euid) and the
+  # convene ran on built-ins. Say it on every channel this caller has — warn (non-JSON), a durable
+  # audit row, and the envelope field below (--json callers capture 2>&1, so stderr cannot carry it).
+  _cv_registry_degraded="$(printf '%s' "$raw" | jq -r '.benchRegistryUnreadable // empty' 2>/dev/null)" || _cv_registry_degraded=""
+  if [[ -n "$_cv_registry_degraded" ]]; then
+    _council_registry_degraded_audit "$_cv_registry_degraded" || true
+    (( JSON_MODE )) || warn "$_cv_registry_degraded"
+  fi
 
   # Seal the receipt canonical at the root HMAC rail — a standalone engine has no
   # key, so the seal (via gate-proof) is what makes the verdict tamper-evident. The
@@ -2212,6 +2238,9 @@ cmd_council() {
     dissent="$(printf '%s' "$raw" | jq -r '.verdict.dissent // "none"')"
     brief="$(printf '%s' "$raw" | jq -r '.verdict.brief // empty')"
     echo "council:      $council"
+    # DIVE-3729 it.2: the line an operator scans must not read as authoritative when the persisted
+    # bench could not be read — that misreading IS the original bug, one layer up.
+    [[ -n "$_cv_registry_degraded" ]] && echo "              (BUILT-IN FALLBACK — the persisted bench registry was unreadable; see the warning above)"
     echo "question:     $q"
     echo "disposition:  $disp  (recommendation=$rec, tally=$tally, confidence=$conf)"
     [[ -n "$dissent" && "$dissent" != "none" ]] && echo "dissent:      $dissent"
