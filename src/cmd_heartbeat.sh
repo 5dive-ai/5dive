@@ -2857,18 +2857,59 @@ _hb_gate_renag_sweep() {
   [[ "${FIVEDIVE_GATE_RENAG:-1}" != "0" ]] || return 0
   local owner ids
 
-  # T2/legacy hard-human gates: one batch per filing agent's bot. Different bots
-  # cannot be collapsed into one Telegram request, so this is the smallest real
-  # push cardinality while preserving channel ownership.
-  while IFS= read -r owner; do
-    [[ -n "$owner" ]] || continue
+  # T2/legacy hard-human gates. DIVE-3742: ONE SENDER, not one per filer.
+  #
+  # This loop used to partition by the FILING agent and push each partition down
+  # that agent's own bot, on the reasoning that different bots cannot be collapsed
+  # into one Telegram request. True, and it answers the wrong question: the
+  # cardinality that matters is not requests-per-bot, it is MESSAGES THE HUMAN
+  # RECEIVES. The recipient is the same person either way, so partitioning by
+  # filer buys him nothing and costs him one notification per filing agent —
+  # measured 2026-08-26 with 8 open tier-2 gates, 5 filed by main and 2 by
+  # olivia, which is exactly the two DMs lodar reported ("I have automated Gate
+  # reminder - unanswered gates (paired human) from you and Olivia. maybe keep
+  # only one.").
+  #
+  # Which bot is the RIGHT one is already answered elsewhere in the product: the
+  # resolved org coordinator is the seat that fronts the pinned needs-you banner
+  # (DIVE-1568/333), so the re-nag now rides the same bot the banner does and the
+  # human has one gate surface instead of N.
+  #
+  # Channel ownership is not lost by this: _hb_gate_renag_batch still partitions
+  # per HUMAN owner (DIVE-3342) before rendering, and every row keeps its own
+  # /task_<id> link and answer button, so a collapsed batch is the same rows in
+  # one message rather than fewer rows.
+  #
+  # FAIL OPEN, NEVER QUIET. An unresolvable coordinator ('' — no agent tagged
+  # coordinator and more than one org root) is precisely the state that killed the
+  # needs-you banner fleet-wide in DIVE-2031, and a gate re-nag is a worse thing to
+  # lose than a pin. So an empty or unpaired coordinator falls straight back to the
+  # historical per-filer fan-out: the human gets duplicates again, which is the old
+  # behaviour and is loud, rather than silence, which is not.
+  local _renag_coord=""
+  _renag_coord=$(_task_resolve_coordinator 2>/dev/null || true)
+  if [[ -n "$_renag_coord" ]] && _task_agent_channel "$_renag_coord"; then
     ids=$(db "SELECT id FROM tasks WHERE ${_HB_GATE_RENAG_WHERE}
               AND COALESCE(tier,2)=2
-              AND COALESCE(NULLIF(created_by,''),assignee,'')=$(sqlq "$owner")
               ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;" | paste -sd, -)
-    [[ -n "$ids" ]] && _hb_gate_renag_batch "$owner" "$ids" "paired human"
-  done < <(db "SELECT DISTINCT COALESCE(NULLIF(created_by,''),assignee,'') FROM tasks
-               WHERE ${_HB_GATE_RENAG_WHERE} AND COALESCE(tier,2)=2;")
+    if [[ -n "$ids" ]]; then
+      _hb_log "[gate-renag] T2 collapsed onto coordinator ${_renag_coord}; rows=${ids} (DIVE-3742)"
+      _hb_gate_renag_batch "$_renag_coord" "$ids" "paired human"
+    fi
+  else
+    [[ -n "$_renag_coord" ]] \
+      && _hb_log "[gate-renag] coordinator ${_renag_coord} has no paired channel; T2 falls back to per-filer fan-out (DIVE-3742)" \
+      || _hb_log "[gate-renag] no coordinator resolved; T2 falls back to per-filer fan-out (DIVE-3742/2031)"
+    while IFS= read -r owner; do
+      [[ -n "$owner" ]] || continue
+      ids=$(db "SELECT id FROM tasks WHERE ${_HB_GATE_RENAG_WHERE}
+                AND COALESCE(tier,2)=2
+                AND COALESCE(NULLIF(created_by,''),assignee,'')=$(sqlq "$owner")
+                ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;" | paste -sd, -)
+      [[ -n "$ids" ]] && _hb_gate_renag_batch "$owner" "$ids" "paired human"
+    done < <(db "SELECT DISTINCT COALESCE(NULLIF(created_by,''),assignee,'') FROM tasks
+                 WHERE ${_HB_GATE_RENAG_WHERE} AND COALESCE(tier,2)=2;")
+  fi
 
   # T1 gates: group by the existing routed reviewer / org-lead resolution. A
   # lead's own T1 gate uses the coordinator/root channel instead of escalating

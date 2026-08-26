@@ -276,5 +276,42 @@ _hb_gate_renag_sweep
   || bad_t "anchor: the agent rail leaked into the T2 floor (DIVE-2587)" \
            "agent=$(nagent) human=$(nsends)"
 
+# DIVE-3742 — ONE SENDER for the paired human. Two tier-2 gates filed by two
+# different agents used to be pushed down two different bots, so the human's
+# phone buzzed once per FILING AGENT for the same backlog ("Gate reminder -
+# unanswered gates (paired human) from you and Olivia", lodar 2026-08-26). The
+# rows are unchanged; only the cardinality of the push is. Asserts BOTH halves —
+# one send, and the channel it took is the coordinator's, not a filer's — because
+# "one send" alone is also what a silently-dropped partition looks like.
+reset
+s1=$(mk_gate DIVE-23 2 approval '-2 hours' '-119 minutes' '' approved '')
+s2=$(mk_gate DIVE-24 2 decision '-2 hours' '-119 minutes' 'A|B' A '')
+db "UPDATE tasks SET created_by='olivia' WHERE id=${s1};
+    UPDATE tasks SET created_by='dev' WHERE id=${s2};"
+_hb_gate_renag_sweep
+[[ "$(nsends)" == "1" && "$(tail -1 "$CHANNEL_LOG")" == "main" \
+   && "$(pinged "$s1")" == "SET" && "$(pinged "$s2")" == "SET" ]] \
+  && ok_t "DIVE-3742: two filers' T2 gates re-nag ONCE, on the coordinator's channel" \
+  || bad_t "DIVE-3742: T2 re-nag still fans out per filing agent" \
+           "sends=$(nsends) channels=$(tr '\n' ',' <"$CHANNEL_LOG") a=$(pinged "$s1") b=$(pinged "$s2")"
+
+# FAIL OPEN, NEVER QUIET. An unresolvable coordinator is the DIVE-2031 state that
+# killed the needs-you banner fleet-wide; a re-nag is a worse thing to lose than a
+# pin, so it must degrade to the OLD duplicate fan-out rather than to silence.
+# Both rows must still be delivered and stamped.
+reset
+f1=$(mk_gate DIVE-25 2 approval '-2 hours' '-119 minutes' '' approved '')
+f2=$(mk_gate DIVE-26 2 approval '-2 hours' '-119 minutes' '' approved '')
+db "UPDATE tasks SET created_by='olivia' WHERE id=${f1};
+    UPDATE tasks SET created_by='dev' WHERE id=${f2};"
+_orig_coord=$(declare -f _task_resolve_coordinator)
+_task_resolve_coordinator() { printf ''; }
+_hb_gate_renag_sweep
+eval "$_orig_coord"
+[[ "$(nsends)" == "2" && "$(pinged "$f1")" == "SET" && "$(pinged "$f2")" == "SET" ]] \
+  && ok_t "DIVE-3742: no coordinator -> falls back to per-filer fan-out, drops nothing" \
+  || bad_t "DIVE-3742: unresolvable coordinator silenced the re-nag" \
+           "sends=$(nsends) a=$(pinged "$f1") b=$(pinged "$f2")"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
