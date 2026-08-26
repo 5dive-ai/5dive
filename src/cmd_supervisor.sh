@@ -1112,6 +1112,130 @@ _sup_act_plan() {  # <type> <cause> <attempts> <last_epoch> <now> <rotation_enab
   esac
 }
 
+# ── DIVE-3727: escalation DELIVERY — a path that does not traverse the sick seat ──
+#
+# DIVE-3726 measured the entire defect. The poller-dead classification for `main`
+# was CORRECT, it fired, it wrote its audit row and its warn line — and it reached
+# nobody, because the only channel that would have carried it to a human was
+# `main`'s own dead Telegram. A seat cannot escalate its own unreachability
+# through itself. Detection was never the gap; delivery was.
+#
+# So an escalation picks a COURIER: an enabled agent that is (a) NOT the sick seat
+# and (b) not itself classified stuck in this same tick — routing a report about a
+# dead seat through a second dead seat reproduces the bug one hop over. The
+# candidate order comes from the tick's own snapshot, so no registry re-read and no
+# org-chart walk can disagree with what was just classified.
+#
+# Two rails, tried in order, because they fail INDEPENDENTLY — that independence is
+# the finding behind
+# community/wiki/a-green-agent-can-still-be-unreachable-probe-the-poller-lock.md:
+#
+#   1. telegram — `_task_send_owner` under the COURIER's channel. Outbound
+#      sendMessage and inbound getUpdates are separate halves of the Bot API, so a
+#      courier reaches the paired human directly with no agent in the loop and no
+#      dependence on the sick seat's poller. This is the rail that puts it in front
+#      of a human within the tick.
+#   2. a2a — `agent send` to the courier. Slower (a human sees it when the courier
+#      relays) and it needs no channel state at all, which is exactly why it is the
+#      fallback: the a2a rail was up throughout the DIVE-3726 outage, and that is
+#      how DIVE-3726 was worked at all.
+#
+# `_task_send_owner`'s own fail-closed chokepoint (`_task_human_send_allowed`)
+# still applies and is deliberately not bypassed: a fixture/e2e task DB must not
+# reach a paired human just because the sender is the supervisor.
+#
+# Set SUPERVISOR_ESCALATE_DELIVER=0 to classify and audit exactly as before with
+# no send — the knob a dry run or a fixture tick uses. It is NOT a way to silence a
+# noisy escalation; the escalate row is already deduped to one per
+# _SUP_ACT_WINDOW_H window, so delivery inherits that ceiling.
+_SUP_ESC_DELIVER="${SUPERVISOR_ESCALATE_DELIVER:-1}"
+[[ "$_SUP_ESC_DELIVER" =~ ^[01]$ ]] || _SUP_ESC_DELIVER=1
+
+# Pure selection, no side effects — the whole point of factoring it out is that the
+# "never through the sick seat" property is assertable without a fleet, a channel,
+# or a network (same reason _sup_act_plan is pure).
+# <sick> <stuck-csv> <all-csv> -> courier names, one per line, in preference order.
+_sup_escalate_couriers() {
+  local sick="$1" stuck="$2" all="$3" n
+  local -a cand=()
+  IFS=',' read -r -a cand <<<"$all"
+  local -A seen=()
+  for n in "${cand[@]}"; do
+    [[ -n "$n" ]] || continue
+    # The two exclusions this function exists for. Both are unconditional: there is
+    # no "no other seat available, send it through the sick one anyway" fallback,
+    # because that fallback IS the bug. Zero couriers must surface as zero couriers.
+    [[ "$n" == "$sick" ]] && continue
+    [[ ",${stuck}," == *",${n},"* ]] && continue
+    [[ -n "${seen[$n]:-}" ]] && continue
+    seen["$n"]=1
+    printf '%s\n' "$n"
+  done
+}
+
+# Pure: the text a human reads. Written for someone who is not at a terminal and
+# does not know what a poller is — it names the seat, what is wrong, WHY the report
+# arrived from a different bot than usual (otherwise it reads as a misroute), and
+# the one command that re-checks it.
+_sup_escalate_text() { # <sick> <cause> <reason> <courier>
+  local sick="$1" cause="$2" reason="$3" courier="$4"
+  printf '%s' "🚨 Agent '${sick}' is stuck and needs a person — ${cause} (${reason}).
+
+You are getting this from '${courier}''s bot, not ${sick}'s, on purpose: ${sick} cannot be trusted to carry a report about itself being unreachable.
+
+Re-check it:  5dive agent telegram-discover --agent=${sick} --poll-secs=8 --json
+(a 409 \"terminated by other getUpdates request\" means it is actually ALIVE — read the message, not the exit code)
+
+Full log: /var/log/5dive/supervisor-tick.log"
+}
+
+# One telegram attempt through <courier>. Returns 0 only on a CONFIRMED Bot API
+# send (TASK_SEND_DELIVERED), never on "we tried" — an unconfirmed send is the
+# silent-failure shape this row exists to remove, so it must fall through to a2a.
+_sup_escalate_tg() { # <courier> <text>
+  local courier="$1" text="$2"
+  # Split-tree guard: tests source cmd_supervisor.sh alone, where the task notify
+  # functions do not exist. Absent rail = this rail declines, not an error.
+  declare -F _task_agent_channel >/dev/null 2>&1 || return 1
+  declare -F _task_send_owner    >/dev/null 2>&1 || return 1
+  _task_agent_channel "$courier" || return 1
+  TASK_SEND_DELIVERED=0
+  _task_send_owner "$text" "" "" || true
+  [[ "${TASK_SEND_DELIVERED:-0}" == "1" ]]
+}
+
+# One a2a attempt through <courier>.
+_sup_escalate_a2a() { # <courier> <text>
+  local courier="$1" text="$2"
+  declare -F cmd_send >/dev/null 2>&1 || return 1
+  ( cmd_send "$courier" --message="$text" ) >/dev/null 2>&1
+}
+
+# Deliver one escalation. Echoes the delivery receipt ("telegram:<courier>",
+# "a2a:<courier>", "none:<why>") on stdout so the caller can put it in the audit
+# row's signals — the receipt is what makes "did this reach anyone?" answerable
+# from the board later instead of only from a log line nobody reads.
+# Never fails the tick: every rail is best-effort and one bad seat cannot abort.
+_sup_escalate_deliver() { # <sick> <cause> <reason> <stuck-csv> <all-csv>
+  local sick="$1" cause="$2" reason="$3" stuck="$4" all="$5"
+  if [[ "$_SUP_ESC_DELIVER" != "1" ]]; then printf 'none:disabled'; return 0; fi
+  local courier tried=0
+  while IFS= read -r courier; do
+    [[ -n "$courier" ]] || continue
+    tried=$((tried + 1))
+    local text; text=$(_sup_escalate_text "$sick" "$cause" "$reason" "$courier")
+    if _sup_escalate_tg "$courier" "$text"; then printf 'telegram:%s' "$courier"; return 0; fi
+    if _sup_escalate_a2a "$courier" "$text"; then printf 'a2a:%s' "$courier"; return 0; fi
+  done < <(_sup_escalate_couriers "$sick" "$stuck" "$all")
+  # Distinguish the two zero-delivery causes. "no courier" means every other seat
+  # was stuck too (a fleet-wide event, and the operator needs to know that is what
+  # they are looking at); "all rails failed" means couriers existed and none of
+  # them could carry it. Collapsing those into one message is how DIVE-1968 lost 28
+  # rows under 840 fixture ones.
+  if (( tried == 0 )); then printf 'none:no-courier'; else printf 'none:all-rails-failed'; fi
+  return 0
+}
+
 # Execute one rung. Returns nonzero, never exits — one bad agent can't abort
 # the tick (rotation's fail() is contained in a subshell). Every rung is
 # runtime-agnostic (OSS-23): the `agent-<name>` tmux session + registry are the
@@ -1315,12 +1439,28 @@ cmd_supervisor_tick() {
                   WHERE agent=$(sqlq "$name") AND event='escalate'
                     AND ts >= datetime('now', '-${_SUP_ACT_WINDOW_H} hours');" 2>/dev/null || echo 0)
         (( esc > 0 )) && continue
+        # DIVE-3727: DELIVER before recording, so the audit row carries the receipt
+        # rather than only the intent. Ordering matters: a row written first and a
+        # send that then fails is indistinguishable on the board from a send that
+        # worked, which is the exact ambiguity DIVE-3726 was diagnosed through.
+        # Candidates come from THIS tick's snapshot, so "who else is stuck" is the
+        # same judgement that produced this escalation.
+        local esc_stuck esc_all esc_via
+        esc_stuck=$(jq -r '[.[] | select(.classification == "stuck") | .name] | join(",")' <<<"$snap" 2>/dev/null) || esc_stuck=""
+        esc_all=$(jq -r '[.[] | .name] | join(",")' <<<"$snap" 2>/dev/null) || esc_all=""
+        esc_via=$(_sup_escalate_deliver "$name" "$cause" "$reason" "$esc_stuck" "$esc_all")
         db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
             VALUES ($(sqlq "$name"), 'escalate', 'stuck', $(sqlq_or_null "$cause"),
-                    $(sqlq "{\"reason\":\"${reason}\",\"attempts\":${attempts}}"));" 2>/dev/null \
+                    $(sqlq "{\"reason\":\"${reason}\",\"attempts\":${attempts},\"delivered\":\"${esc_via}\"}"));" 2>/dev/null \
           && { escalated=$((escalated + 1)); events=$((events + 1)); } \
           || warn "supervisor: escalate insert failed for $name"
-        warn "supervisor: ESCALATE $name ($cause: $reason) — needs rung-4+/human"
+        # The log line now states WHERE it went. "needs a human" with no delivery
+        # receipt is what three days of dead backups looked like.
+        if [[ "$esc_via" == none:* ]]; then
+          warn "supervisor: ESCALATE $name ($cause: $reason) — needs rung-4+/human — NOT DELIVERED (${esc_via#none:})"
+        else
+          warn "supervisor: ESCALATE $name ($cause: $reason) — needs rung-4+/human — delivered via ${esc_via}"
+        fi
         ;;
       nudge|resume|rotate)
         if [[ "$actions_on" == "true" ]]; then
