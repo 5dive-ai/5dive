@@ -139,6 +139,30 @@ else
   chmod 0644 "$REG"
 fi
 
+# --- A3. BUNDLE GUARD: the convene caller really wires all three channels -----------------------
+# The degrade is only worth anything if the CONVENE surfaces it, and a live convene needs a seeded
+# genesis + a gate-proof seal (root), so it is not drivable here — same limit arm D names. What IS
+# drivable is a guard on the SHIPPED bundle that the three channels exist on the convene path.
+# Each string below was checked ABSENT at origin/main before being trusted: a substring that is not
+# unique to this change goes green on the control and is a false guard, not a weak one.
+# Hand-verified transcript of the live triple-channel run is in DIVE-3729's body.
+BUNDLE="$ROOT/src/cmd_council.sh"
+# NB 'repaired the ${what}' is the TEMPLATE-LITERAL form as it sits in the embedded cli.mjs — the
+# rendered string ('repaired the bench registry') exists only at runtime and never appears in the
+# bundle, so grepping for it is a guard that can never pass. Caught by this arm on its first run.
+for s in 'benchRegistryUnreadable' 'bench-registry-unreadable' 'BUILT-IN FALLBACK' 'repaired the ${what}'; do
+  if grep -qF "$s" "$BUNDLE"; then chk "shipped bundle carries the degrade channel: $s" y y
+  else chk "shipped bundle carries the degrade channel: $s" y n; fi
+done
+# ...and that it is the CONVENE path wiring them, not just the reader: the audit call and the
+# non-JSON warn must both sit in the convene function's body.
+if grep -qF '_council_registry_degraded_audit "$_cv_registry_degraded"' "$BUNDLE" \
+   && grep -qF '(( JSON_MODE )) || warn "$_cv_registry_degraded"' "$BUNDLE"; then
+  chk "the convene path fires the audit row AND the non-JSON warn" y y
+else
+  chk "the convene path fires the audit row AND the non-JSON warn" y n
+fi
+
 # ------------------------------------------------------------- B. JS WRITER
 STATE_DIR="$STATE" "$FIVE" council bench add panel --seats=a,b >/dev/null 2>&1 \
   && chk "bench add on an existing registry succeeds" y y \
