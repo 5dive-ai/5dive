@@ -36,7 +36,7 @@ set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
-trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT
+trap 'rc=$?; rm -rf "${WORK:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path; folds in the tempdir cleanup below so a second `trap ... EXIT` cannot silently replace this one. `rc=$?` is FIRST — any cleanup ahead of it overwrites the status this line exists to report.
 cd "$(dirname "$0")/.."
 SRC=src
 AS="$SRC/lib/agent_setup.sh"
@@ -47,10 +47,10 @@ bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
 command -v python3 >/dev/null 2>&1 || {
   printf 'FAIL - python3 missing; the patch under test IS python3 and cannot be graded without it\n'
-  echo "HARNESS-RC=1"; exit 1
+  exit 1
 }
 
-WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT INT TERM
+WORK=$(mktemp -d)   # removed by the single EXIT trap above; do NOT add a second one.
 
 # --- LIVENESS FIRST --------------------------------------------------------
 # Every arm below runs an extracted block. If the extraction returns nothing,
@@ -63,10 +63,23 @@ if [[ -n "$PATCHPY" ]] && grep -q 'scripts' <<<"$PATCHPY" && grep -q 'bun' <<<"$
 else
   bad_t "LIVENESS: PATCHPY heredoc extracted from $AS" \
         "extraction empty or unrecognisable — every arm below would grade nothing. Did the heredoc get renamed or reindented?"
-  printf '%d passed, %d failed\n' "$PASS" "$FAIL"; echo "HARNESS-RC=1"; exit 1
+  printf '%d passed, %d failed\n' "$PASS" "$FAIL"; exit 1
 fi
 
-# run_patch <start-script>  ->  echoes the resulting start script, sets OUT to stdout
+# run_patch <start-script>  ->  echoes the resulting start script; the patch's OWN
+# stdout lands in the file $PATCH_OUT, readable with patch_said().
+#
+# A FILE and not a variable, deliberately: nearly every arm calls run_patch as
+# `$(run_patch ...)`, so anything it ASSIGNS dies with that command substitution.
+# A failure message that reads such a variable is not a diagnostic — under the
+# `set -u` above it is an unbound-variable ABORT that takes the remaining arms,
+# the summary line and the whole verdict with it. This harness shipped exactly
+# that in its first iteration: with the defect reinstated it printed one ok line
+# and a bash error instead of naming the defect it exists to name.
+PATCH_OUT="$WORK/last-patch-stdout"
+: >"$PATCH_OUT"
+patch_said() { tr '\n' ' ' <"$PATCH_OUT"; }
+
 run_patch() {
   local start="$1" dir
   dir=$(mktemp -d "$WORK/case.XXXXXX")
@@ -75,7 +88,7 @@ import json, os
 json.dump({"name": "fixture", "scripts": {"start": os.environ["START"]}},
           open(os.path.join(os.environ["DIR"], "package.json"), "w"))
 MK
-  OUT=$( cd "$dir" && python3 <<<"$PATCHPY" 2>&1 )
+  ( cd "$dir" && python3 <<<"$PATCHPY" ) >"$PATCH_OUT" 2>&1
   python3 - "$dir/package.json" <<'RD'
 import json, sys
 print(json.load(open(sys.argv[1]))["scripts"]["start"])
@@ -86,7 +99,7 @@ expect() { # expect <label> <start-in> <start-out-expected>
   local label="$1" in="$2" want="$3" got
   got=$(run_patch "$in")
   if [[ "$got" == "$want" ]]; then ok_t "$label"
-  else bad_t "$label" "start was '$in' -> got '$got', expected '$want' (patch said: $OUT)"; fi
+  else bad_t "$label" "start was '$in' -> got '$got', expected '$want' (patch said: $(patch_said))"; fi
 }
 
 # --- 1. THE DEFECT: the launcher DIVE-3752 shipped must survive the patch ----
@@ -115,7 +128,8 @@ expect "&&-gated install in front of the launcher -> the launcher" \
 # unconditionally would pass every arm above.
 expect "NEGATIVE: a clean 'bun server.ts' is left alone" 'bun server.ts' 'bun server.ts'
 expect "NEGATIVE: a clean 'bun start.ts' is left alone"  'bun start.ts'  'bun start.ts'
-OUT_CLEAN=$(run_patch 'bun server.ts' >/dev/null; printf '%s' "$OUT")
+run_patch 'bun server.ts' >/dev/null
+OUT_CLEAN=$(patch_said)
 if [[ "$OUT_CLEAN" == *"already clean"* ]]; then
   ok_t "NEGATIVE: a clean script is REPORTED as untouched, not silently rewritten"
 else
@@ -146,10 +160,10 @@ fi
 expect "install-only start script is left as-is (no guessed entry point)" \
        'bun install --no-summary' 'bun install --no-summary'
 run_patch 'bun install --no-summary' >/dev/null
-if [[ "$OUT" == *"WARNING"* ]]; then
+if [[ "$(patch_said)" == *"WARNING"* ]]; then
   ok_t "install-only start script is reported LOUDLY, not passed over in silence"
 else
-  bad_t "install-only start script is reported LOUDLY" "patch printed: $OUT"
+  bad_t "install-only start script is reported LOUDLY" "patch printed: $(patch_said)"
 fi
 
 # --- 8. POSITIVE CONTROL: the retired implementation must FAIL arm 1 --------
@@ -191,11 +205,41 @@ fi
 # CODE ONLY — the comment block above the patch quotes the retired line on
 # purpose, to say what was wrong with it. Grading the comment would make the
 # explanation unwritable.
-if grep -vE '^[[:space:]]*#' "$AS" | grep -qE '\["scripts"\]\["start"\] = "bun server\.ts"'; then
+# NOT A PIPELINE, deliberately. `grep -vE ... | grep -q ...` exits on the FIRST
+# match and SIGPIPEs the upstream grep, and under the `set -o pipefail` above the
+# pipeline then reports 141 — the else branch — on the very input that should
+# fire it. It is timing-dependent (a short file can drain before the reader
+# leaves, and reads 0), so the arm was not reliably wrong, it was reliably
+# UNTRUSTWORTHY. Measured: this arm stayed green with the retired assignment
+# reinstated in $AS.
+PIN_RE='\["scripts"\]\["start"\] = "bun server\.ts"'
+CODE_ONLY=$(grep -vE '^[[:space:]]*#' "$AS")
+if grep -qE "$PIN_RE" <<<"$CODE_ONLY"; then
   bad_t "the hardcoded 'bun server.ts' assignment is gone from $AS" \
         "the patch pins the entry point again — DIVE-3752's launcher is deleted on every seat the CLI installs"
 else
   ok_t "the hardcoded 'bun server.ts' assignment is gone from $AS"
+fi
+
+# --- 10. POSITIVE CONTROL for arm 9: the grep above must be able to MATCH ----
+# Arm 9 asserts an ABSENCE, and an absence arm that cannot see its target is
+# green forever. Feed it the retired line and require a hit — this is the arm
+# that would have caught the SIGPIPE defect above the moment it was written.
+if grep -qE "$PIN_RE" <<<'    d["scripts"]["start"] = "bun server.ts"'; then
+  ok_t "POSITIVE CONTROL: arm 9's pattern matches the retired assignment (the absence arm can fire)"
+else
+  bad_t "POSITIVE CONTROL: arm 9's pattern matches the retired assignment" \
+        "the pattern does not match the very line it forbids — arm 9 is green for free"
+fi
+
+# --- 11. NEGATIVE CONTROL for arm 9: it must NOT grade the comment ----------
+# The header block quotes the retired line to explain what was wrong with it.
+# Without the comment filter, the explanation becomes unwritable.
+if grep -qE "$PIN_RE" <<<'# script — `d["scripts"]["start"] = "bun server.ts"` — which is a second,'; then
+  ok_t "NEGATIVE CONTROL: the comment filter is load-bearing (the quoted line WOULD match unfiltered)"
+else
+  bad_t "NEGATIVE CONTROL: the comment filter is load-bearing" \
+        "the quoted line no longer matches at all, so arm 9's filter is grading nothing — re-check the pattern"
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
