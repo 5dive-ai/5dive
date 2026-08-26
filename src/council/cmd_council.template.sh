@@ -487,6 +487,29 @@ _council_veto_offer_omitted() {
   return 0
 }
 
+# DIVE-3729 (third gap, found by the filer while verifying this row): the receipt write and the
+# founder-veto ping share ONE `[[ -w "$COUNCIL_RECEIPTS" ]]` guard with no else, so an unprivileged
+# scheduled convene skipped BOTH in silence — it sealed a digest, wrote no receipt, contributed no
+# case-law to CNCL-19's precedent pool, and never once offered the veto. Same disease as the
+# registry above: a control that declines to act must be auditable, and this one was not observable
+# on ANY path. It stays non-fatal (the convene has already run and sealed by the time we get here;
+# aborting would neither un-run it nor make the veto exist) but it is no longer SILENT.
+#
+# The durable sink is best-effort by necessity — ${COUNCIL_DIR} is not group-writable either, so the
+# very caller this fires for usually cannot write the audit row. That is WHY the stderr warn and the
+# envelope field carry it: the one channel a non-root cron caller always has is its own log.
+_council_receipt_drop_audit() {
+  local why="${1:-}" line=""
+  line="$(jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg why "$why" --arg u "$(id -un 2>/dev/null)" \
+    '{ts:$ts, reason:$why, by:$u, kind:"receipt-dropped"}' 2>/dev/null)" || line=""
+  if [[ -n "$line" && -w "$COUNCIL_DIR" ]]; then
+    printf '%s\n' "$line" >> "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+    chmod 0600 "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+    [[ "$(id -u)" -eq 0 ]] && chown root:root "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+  fi
+  return 0
+}
+
 _council_veto_ping() {
   local resolved="$1" digest="$2" execute_after="$3" nonce="$4" motion="${5:-}" tally="${6:-}" dissent="${7:-}" subject="${8:-}"
   mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
@@ -2018,6 +2041,7 @@ cmd_council() {
   # node short-circuits to an escalate verdict (fail-closed — a bad drift-check also escalates).
   local drift_flag=""
   _council_constitution_drift "$dir" >/dev/null 2>&1 || drift_flag="--constitution-drift=1"
+  local _cv_receipt_dropped=""
 
   # CNCL-19: build the case-law precedent pool from the SEALED convene receipt log and hand it to
   # the engine. The engine deterministically selects the top-k relevant priors, injects them as
@@ -2096,6 +2120,12 @@ cmd_council() {
     fi
     if [[ -n "$digest" ]]; then
       mkdir -p "$COUNCIL_RECEIPTS" 2>/dev/null || true
+      if [[ ! -w "$COUNCIL_RECEIPTS" ]]; then
+        # DIVE-3729 third gap: say it, on every channel this caller has.
+        _cv_receipt_dropped="the convene sealed digest ${digest:0:16}… but ${COUNCIL_RECEIPTS} is not writable by $(id -un 2>/dev/null) — NO receipt was written (so this convene is invisible to CNCL-19 case-law) and the founder veto was NOT offered. Grant the one cron user write on that directory (setfacl -m u:<user>:rwx) or run the convene under sudo; do NOT chmod g+w, that opens the sealed audit trail to every seat."
+        _council_receipt_drop_audit "$_cv_receipt_dropped" || true
+        (( JSON_MODE )) || warn "$_cv_receipt_dropped"
+      fi
       if [[ -w "$COUNCIL_RECEIPTS" ]]; then
         # Offline-test capture ONLY: when MOCK is on AND a sink path is provided, drop the raw nonce
         # so the bash e2e can present it at exercise. Double-gated on COUNCIL_MOCK (never set in a
@@ -2167,7 +2197,10 @@ cmd_council() {
   fi
 
   if (( JSON_MODE )); then
-    printf '%s' "$raw" | jq --arg d "$digest" '{ok:true, data: (. + {sealedDigest: $d})}'
+    # DIVE-3729: a dropped receipt cannot ride stderr here (callers capture 2>&1 into this envelope
+    # — see the NB on the veto-omission above), so it rides the envelope itself.
+    printf '%s' "$raw" | jq --arg d "$digest" --arg rd "$_cv_receipt_dropped" \
+      '{ok:true, data: (. + {sealedDigest: $d} + (if ($rd|length)>0 then {receiptDropped: $rd} else {} end))}'
   else
     local council q disp rec tally conf dissent brief
     council="$(printf '%s' "$raw" | jq -r '.council')"
@@ -2184,7 +2217,13 @@ cmd_council() {
     [[ -n "$dissent" && "$dissent" != "none" ]] && echo "dissent:      $dissent"
     [[ -n "$brief" ]] && echo "brief:        $brief"
     if [[ -n "$digest" ]]; then
-      echo "receipt:      sealed (${digest:0:16}…)"
+      if [[ -n "$_cv_receipt_dropped" ]]; then
+        # DIVE-3729: "sealed" was true of the DIGEST and read as true of the RECEIPT — the one
+        # line an operator scans, saying the opposite of what happened.
+        echo "receipt:      sealed (${digest:0:16}…) but NOT STORED — see the warning above"
+      else
+        echo "receipt:      sealed (${digest:0:16}…)"
+      fi
     else
       echo "receipt:      unsealed (no gate-proof key / not root — run via sudo to seal)"
     fi

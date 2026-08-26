@@ -14,6 +14,10 @@
 #      Needs a non-root euid — root reads a 0000 file, so the arm cannot fire as root and SKIPs.
 #   B. JS WRITER (real surface): `bench add` must not leave the registry root-only, and must not
 #      downgrade the mode of a registry that already exists.
+#   D. RECEIPT/VETO DROP (real convene, end to end): the third gap the filer appended to this row —
+#      the receipt write and the founder-veto ping share ONE `-w` guard with no else, so an
+#      unprivileged scheduled convene sealed a digest, stored no receipt and never offered the veto,
+#      silently. Needs a reachable seal (`sudo -n 5dive gate-proof sign`); SKIPs by name without one.
 #   C. SHELL WRITER (property + negative control): the motion rewrite itself needs root AND a
 #      gate-proof seal, so it is NOT driven here. What IS driven is the staged-replace pattern the
 #      fix installs, against the pre-fix `mktemp`+`mv` form as the negative control — plus a guard
@@ -128,6 +132,82 @@ NEW_TMP="$(mktemp "${DEST}.XXXXXX")"
 chmod --reference="$DEST" "$NEW_TMP" 2>/dev/null || chmod 0644 "$NEW_TMP"
 printf '{"a":2}\n' > "$NEW_TMP"; mv "$NEW_TMP" "$DEST"
 chk "the staged-replace form KEEPS the destination mode" "644" "$(stat -c '%a' "$DEST")"
+
+# ----------------------------------------------- D. RECEIPT/VETO DROP (real convene, end to end)
+# D0 — STATIC, always runs: the shipped bundle must carry the else-arm. This is what keeps arm D
+# from being worth nothing in the (normal) case where D1 cannot seal. It is a bundle guard, so it
+# grades the product. Each string is checked to be ABSENT at origin/main: "is not writable by" was
+# the obvious phrase and it matches three unrelated sites (proof, wiki, version-record), so it went
+# green on the control — a substring that is not unique to the change is a false green, not a guard.
+# grades the product; it is NOT a substitute for D1, which is the only arm that proves the branch
+# actually fires on a real convene.
+grep -q 'NO receipt was written' "$FIVE" \
+  && chk "the shipped bundle carries a reason for a dropped receipt" y y \
+  || chk "the shipped bundle carries a reason for a dropped receipt" y n
+grep -q 'the founder veto was NOT offered' "$FIVE" \
+  && chk "the shipped bundle names the veto that did not happen" y y \
+  || chk "the shipped bundle names the veto that did not happen" y n
+grep -q 'receiptDropped' "$FIVE" \
+  && chk "the shipped bundle carries the drop in the --json envelope" y y \
+  || chk "the shipped bundle carries the drop in the --json envelope" y n
+
+# D1 — the live arm. Reaching the guard needs a SEALED digest, and a seal needs root or
+# `sudo 5dive gate-proof sign`. NOTE the skip reason is measured, not assumed: on this corpus
+# `sudo` is a REFUSING SHELL FUNCTION installed by tests/lib/env_isolation.sh (via grading_tree.sh,
+# DIVE-3096) — the grant may be perfectly present on the host and the arm still cannot use it.
+# Reporting that as "no passwordless sudo" would be a false negative about the HOST, so the two
+# causes are distinguished here. Deliberately NOT worked around: `command sudo` would defeat the
+# isolation control on purpose, which is not a thing a harness gets to do to itself.
+_d_skip=""
+if [[ "$(id -u)" -ne 0 ]]; then
+  if [[ "$(type -t sudo 2>/dev/null)" == "function" ]]; then
+    _d_skip="this harness's own env isolation (tests/lib/env_isolation.sh, DIVE-3096) refuses sudo — the HOST grant is untested by this, not absent"
+  elif ! printf 'probe\n' | sudo -n 5dive gate-proof sign >/dev/null 2>&1; then
+    _d_skip="no reachable gate-proof seal on this host (not root, no passwordless \`sudo 5dive gate-proof sign\`)"
+  fi
+fi
+if [[ -n "$_d_skip" ]]; then
+  echo "SKIP-ARM D1 (live convene): $_d_skip — verified BY HAND instead; see DIVE-3729's body for the transcript."
+else
+  D="$TMP/drop"; mkdir -p "$D/council/receipts"
+  chmod 0555 "$D/council/receipts"
+  DTXT="$(COUNCIL_MOCK=1 STATE_DIR="$D" "$FIVE" council convene "ship it?" --seats=a,b,c --mode=quick 2>&1 || true)"
+  case "$DTXT" in
+    *"is not writable by"*) chk "an unstorable receipt WARNS instead of skipping in silence" y y ;;
+    *)                      chk "an unstorable receipt WARNS instead of skipping in silence" y n; echo "  got: $DTXT" ;;
+  esac
+  case "$DTXT" in
+    *"the founder veto was NOT offered"*) chk "the warning names the veto that did not happen" y y ;;
+    *)                                    chk "the warning names the veto that did not happen" y n ;;
+  esac
+  case "$DTXT" in
+    *"sealed ("*"but NOT STORED"*) chk "the receipt line does not claim a receipt that was not stored" y y ;;
+    *)                             chk "the receipt line does not claim a receipt that was not stored" y n; echo "  got: $(printf '%s' "$DTXT" | grep receipt:)" ;;
+  esac
+  # The file's own NB: --json callers capture 2>&1, so the warn must NOT ride stderr in JSON mode —
+  # it rides the envelope. Both halves are asserted, because either alone is passable while broken.
+  DJ="$(COUNCIL_MOCK=1 STATE_DIR="$D" "$FIVE" council convene "ship it?" --seats=a,b,c --mode=quick --json 2>&1 || true)"
+  if printf '%s' "$DJ" | jq -e '.ok' >/dev/null 2>&1; then
+    chk "a --json convene envelope survives 2>&1 with a dropped receipt" y y
+  else
+    chk "a --json convene envelope survives 2>&1 with a dropped receipt" y n; echo "  got: $DJ"
+  fi
+  if printf '%s' "$DJ" | jq -e '(.data.receiptDropped // "") | length > 0' >/dev/null 2>&1; then
+    chk "the dropped receipt is carried IN the json envelope" y y
+  else
+    chk "the dropped receipt is carried IN the json envelope" y n
+  fi
+  # POSITIVE CONTROL: with the directory writable, no warning and a receipt on disk.
+  chmod 0755 "$D/council/receipts"
+  OTXT="$(COUNCIL_MOCK=1 STATE_DIR="$D" "$FIVE" council convene "ship it?" --seats=a,b,c --mode=quick 2>&1 || true)"
+  case "$OTXT" in
+    *"is not writable by"*) chk "control: a writable receipts dir does NOT warn" y n ;;
+    *)                      chk "control: a writable receipts dir does NOT warn" y y ;;
+  esac
+  RC=$(find "$D/council/receipts" -name '*.json' 2>/dev/null | wc -l)
+  if [[ "$RC" -ge 1 ]]; then chk "control: a writable receipts dir stores the receipt" y y
+  else chk "control: a writable receipts dir stores the receipt" y n; fi
+fi
 
 echo "PASS=$P FAIL=$F"
 [ "$F" -eq 0 ] || exit 1
