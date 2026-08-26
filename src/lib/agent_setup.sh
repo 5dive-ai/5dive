@@ -690,18 +690,47 @@ cd "$PLUGIN_DIR"
 # tail keeps output bounded; pipefail above carries npm's real exit code.
 timeout 60 npm install --omit=dev --ignore-scripts --no-audit --no-fund 2>&1 | tail -5
 
+# DIVE-3754: TAKE THE INSTALL OFF THE START PATH — DO NOT DECIDE WHAT LAUNCHES.
+# `npm install --omit=dev` ran two lines up, so at channel-start time a second
+# dependency install buys nothing and can only lose: when the plugin joins it
+# with `&&` it eats the poller silently and the seat is deaf until a human
+# notices (DIVE-3748 measured that at 2h33m across three seats, coordinator
+# included, with 9 human gates pending).
+#
+# Until this row that stripping was written as an ASSIGNMENT of the whole
+# script — `d["scripts"]["start"] = "bun server.ts"` — which is a second,
+# unannounced decision: it also pins the ENTRY POINT. DIVE-3752 shipped
+# `bun install --no-summary; bun start.ts`, a launcher whose only job is to
+# record which of the three failure states a dead channel is in, and this
+# patch threw that launcher away on every seat the CLI installs. The record
+# built for the outage ran nowhere the CLI had been. So: drop the install
+# SEGMENT and keep whatever the plugin launches, verbatim.
+#
+# Segments are rejoined with `;`, never `&&`: a non-short-circuiting separator
+# is the property this patch exists to guarantee, and it is what 5dive-plugins
+# itself now ships (DIVE-3752). Measured under the launcher's own shell
+# (`bun run --shell=bun`): `false && echo X` exits 1 and prints nothing;
+# `false; echo X` prints and exits 0.
 python3 <<'PATCHPY'
-import json
+import json, re
 with open("package.json") as f:
     d = json.load(f)
 start = d.get("scripts", {}).get("start", "")
-if "bun install" in start:
-    d["scripts"]["start"] = "bun server.ts"
+segs = [s.strip() for s in re.split(r"&&|\|\||;", start) if s.strip()]
+kept = [s for s in segs if not re.match(r"^bun\s+install\b", s)]
+if len(kept) == len(segs):
+    print("    Start script already clean: " + start)
+elif not kept:
+    # A start script that is ONLY a dependency install has no entry point to
+    # preserve. Rewriting it to a guessed one is how this defect happened;
+    # leave it and say so, loudly enough to be found in the install log.
+    print("    WARNING: start script is only a dependency install (" + start
+          + ") — left as-is; nothing to launch")
+else:
+    d["scripts"]["start"] = "; ".join(kept)
     with open("package.json", "w") as f:
         json.dump(d, f, indent=2)
-    print("    Patched start script: removed bun install")
-else:
-    print("    Start script already clean: " + start)
+    print("    Patched start script: removed bun install -> " + d["scripts"]["start"])
 PATCHPY
 AGENT_PLUGIN_INSTALL
   then

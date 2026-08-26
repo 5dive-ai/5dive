@@ -4238,12 +4238,19 @@ _hb_poller_liveness_sweep() {
     # And the CONFIRM step changes with it: the beacon collapses three
     # distinguishable states into one string (never started / dependency failure
     # / genuinely dead), so bot.pid + bot.heartbeat cannot tell a human which
-    # one they have. The process table can, and `bun server.ts` is the only
-    # clean count — the launcher's argv also matches plugin HOOKS.
+    # one they have. The process table can — but ONLY if the pattern names both
+    # entry points. DIVE-3752 put a recording launcher in front of the poller,
+    # so a seat on 5dive-plugins >= that release runs `bun start.ts` and a seat
+    # on an older cache (and every telegram-<x> variant) still runs
+    # `bun server.ts`; a remedy pinned to one of them reads ZERO on half the
+    # fleet and tells the human to restart a seat that is fine. `bun
+    # (start|server)\.ts` is the clean count — the launcher's own argv is
+    # `bun run --cwd .../telegram/<ver> ... start`, which also matches plugin
+    # HOOKS, so it is not usable here.
     #
     # DIVE-818 / DIVE-1434 are provenance refs from code comments, NOT board
     # rows — say so, or the reader looks them up and hits "no such task".
-    ( cmd_send "$coord" --message="🔴 Telegram poller DEAD on: ${dead[*]}. Gate-ping tap buttons still SEND but the human's TAP won't land (getUpdates slot not held) — those gates can't be cleared from the phone. CONFIRM BEFORE ACTING, one seat at a time — do not blanket-restart the fleet. Count the poller for the named agent: pgrep -u agent-<name> -f 'bun server.ts' (the beacon alone cannot separate 'never started' from 'genuinely dead'; the process table can). Zero —> restart THAT ONE agent (5dive agent restart <name>); a poller should appear within ~10s, measured at 9. The supervisor restarts a poller-dead seat on its own at rung 4, at most once per seat per 6h — if the seat is still dead after that, the budget is spent and it needs you. (Canary provenance — code refs, not board rows: DIVE-1434 canary, DIVE-818 single-getUpdates-slot incident, DIVE-2384 restart grace, DIVE-3748 the three-state measurement, DIVE-3753 the rung-4 restart. Re-pings hourly until healthy.)" ) >/dev/null 2>&1 || true
+    ( cmd_send "$coord" --message="🔴 Telegram poller DEAD on: ${dead[*]}. Gate-ping tap buttons still SEND but the human's TAP won't land (getUpdates slot not held) — those gates can't be cleared from the phone. CONFIRM BEFORE ACTING, one seat at a time — do not blanket-restart the fleet. Count the poller for the named agent: pgrep -u agent-<name> -f 'bun (start|server)\.ts' (BOTH names — the plugin's launcher is start.ts since DIVE-3752, older caches and the non-claude variants still run server.ts; the beacon alone cannot separate 'never started' from 'genuinely dead'; the process table can). Zero —> restart THAT ONE agent (5dive agent restart <name>); a poller should appear within ~10s, measured at 9. The supervisor restarts a poller-dead seat on its own at rung 4, at most once per seat per 6h — if the seat is still dead after that, the budget is spent and it needs you. (Canary provenance — code refs, not board rows: DIVE-1434 canary, DIVE-818 single-getUpdates-slot incident, DIVE-2384 restart grace, DIVE-3748 the three-state measurement, DIVE-3753 the rung-4 restart. Re-pings hourly until healthy.)" ) >/dev/null 2>&1 || true
   fi
   return 0
 }

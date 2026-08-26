@@ -184,7 +184,11 @@ mut_check "mutation B: restart race still silent" "OK" "$(dead_or_ok "$(run_mut 
 #   - retired: bot.pid + bot.heartbeat as the confirm step. The beacon collapses
 #     three distinguishable states into one string (never started / dependency
 #     failure / genuinely dead), so it cannot tell a human which one they have.
-#     The process table can, and `bun server.ts` is the only clean count.
+#     The process table can, and `bun (start|server)\.ts` is the only clean
+#     count — DIVE-3754: `start.ts` is the recording launcher DIVE-3752 put in
+#     front of the poller, `server.ts` is what an older plugin cache and every
+#     telegram-<x> variant still run. A remedy naming one of them reads ZERO on
+#     the other half of the fleet.
 #
 # The alarm must now agree with the supervisor ladder, which restarts a
 # poller-dead seat at rung 4 (DIVE-3753). Two texts prescribing opposite actions
@@ -214,7 +218,20 @@ check "remedy: no unconditional restart instruction" "no" "$(has 'Fix: restart t
 #     the PROCESS TABLE, because the beacon cannot separate the three states it
 #     reports identically.
 check "remedy: names a confirm-first check" "yes" "$(has 'CONFIRM BEFORE ACTING' "$REMEDY")"
-check "remedy: confirmation is the process table" "yes" "$(has "pgrep -u agent-<name> -f 'bun server.ts'" "$REMEDY")"
+check "remedy: confirmation is the process table" "yes" \
+  "$(has "pgrep -u agent-<name> -f 'bun (start|server)\\.ts'" "$REMEDY")"
+
+# 38a (DIVE-3754). DIRECTIONAL, like 37 and 38b: the SINGLE-name pattern must be
+#     gone. Arm 38 above already proves the pgrep line is in the haystack, so
+#     this negative is not vacuous. Either single name is wrong on half the
+#     fleet — `bun server.ts` reads zero on a seat carrying DIVE-3752's
+#     launcher, `bun start.ts` reads zero on an older plugin cache and on all
+#     five telegram-<x> variants — and a confirm step that reads zero on a
+#     healthy seat tells the human to restart it.
+check "remedy: the single-name server.ts pattern is retired" "no" \
+  "$(has "-f 'bun server.ts'" "$REMEDY")"
+check "remedy: the single-name start.ts pattern is not its replacement" "no" \
+  "$(has "-f 'bun start.ts'" "$REMEDY")"
 
 # 38b (DIVE-3753). The RETIRED rationale must be gone. It is false about the
 #     poller and it contradicts the ladder's rung 4, and while it stands a reader
