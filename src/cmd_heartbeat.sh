@@ -4218,14 +4218,32 @@ _hb_poller_liveness_sweep() {
   : > "$flag" 2>/dev/null || true
   local coord; coord=$(_task_resolve_coordinator 2>/dev/null)
   if [[ -n "$coord" ]]; then
-    # The remedy must NOT say "restart the agent(s)" (DIVE-2384): a restart is the
-    # action that CREATES this condition — shutdown() unlinks the beacon — so
-    # anyone who believed the alarm and followed it re-armed it within seconds and
-    # wiped every agent's running context on each pass. Confirm first, restart the
-    # ONE agent only if the poller process is genuinely gone. DIVE-818 / DIVE-1434
-    # are provenance refs from code comments, NOT board rows — say so, or the
-    # reader looks them up and hits "no such task".
-    ( cmd_send "$coord" --message="🔴 Telegram poller DEAD on: ${dead[*]}. Gate-ping tap buttons still SEND but the human's TAP won't land (getUpdates slot not held) — those gates can't be cleared from the phone. CONFIRM BEFORE ACTING — do NOT blanket-restart: a restart deletes the beacon and re-arms this alarm. Check the named agent's channel dir: is bot.pid's process alive, and is bot.heartbeat's mtime advancing? Only if the poller is genuinely gone, restart THAT ONE agent (systemctl restart 5dive-agent@<name>.service). (Canary provenance — code refs, not board rows: DIVE-1434 canary, DIVE-818 single-getUpdates-slot incident, DIVE-2384 restart grace. Re-pings hourly until healthy.)" ) >/dev/null 2>&1 || true
+    # DIVE-3753 retires DIVE-2384's prohibition and REPLACES it, in the same
+    # change that gave the supervisor ladder a restart rung — the alarm and the
+    # ladder must not prescribe opposite things about the same seat.
+    #
+    # What DIVE-2384 got right and keeps: scope it to the ONE named seat and
+    # confirm before acting. A plural remedy on a fleet-wide alarm is a
+    # fleet-wide action, and that was the 17:00:05 fire that named six agents.
+    #
+    # What is RETIRED: "do NOT blanket-restart: a restart deletes the beacon and
+    # re-arms this alarm". True of the BEACON (shutdown() unlinks it), false of
+    # the POLLER, and the two were conflated into standing advice that turned
+    # the only working remedy into a prohibition. Measured 2026-08-26 on two
+    # seats (DIVE-3748): launcher=0/server=0 before, 1/1 nine seconds after
+    # `5dive agent restart`. Recency-of-restart correlates with the broken state
+    # because the failure happens AT channel start — the correlate points at the
+    # moment of the defect, not at its cause.
+    #
+    # And the CONFIRM step changes with it: the beacon collapses three
+    # distinguishable states into one string (never started / dependency failure
+    # / genuinely dead), so bot.pid + bot.heartbeat cannot tell a human which
+    # one they have. The process table can, and `bun server.ts` is the only
+    # clean count — the launcher's argv also matches plugin HOOKS.
+    #
+    # DIVE-818 / DIVE-1434 are provenance refs from code comments, NOT board
+    # rows — say so, or the reader looks them up and hits "no such task".
+    ( cmd_send "$coord" --message="🔴 Telegram poller DEAD on: ${dead[*]}. Gate-ping tap buttons still SEND but the human's TAP won't land (getUpdates slot not held) — those gates can't be cleared from the phone. CONFIRM BEFORE ACTING, one seat at a time — do not blanket-restart the fleet. Count the poller for the named agent: pgrep -u agent-<name> -f 'bun server.ts' (the beacon alone cannot separate 'never started' from 'genuinely dead'; the process table can). Zero —> restart THAT ONE agent (5dive agent restart <name>); a poller should appear within ~10s, measured at 9. The supervisor restarts a poller-dead seat on its own at rung 4, at most once per seat per 6h — if the seat is still dead after that, the budget is spent and it needs you. (Canary provenance — code refs, not board rows: DIVE-1434 canary, DIVE-818 single-getUpdates-slot incident, DIVE-2384 restart grace, DIVE-3748 the three-state measurement, DIVE-3753 the rung-4 restart. Re-pings hourly until healthy.)" ) >/dev/null 2>&1 || true
   fi
   return 0
 }

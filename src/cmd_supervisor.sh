@@ -4,10 +4,12 @@
 # The unifying layer ON TOP of heartbeat/rotation/auto-resume/loops (design:
 # docs/fleet-supervisor-design.md). Per agent it runs DETECT -> CLASSIFY and
 # surfaces the result on a board; the cron-callable `--tick` additionally
-# APPENDS to the supervisor_events audit table. P1 takes ZERO recovery
+# APPENDS to the supervisor_events audit table. P1 took ZERO recovery
 # actions — no restarts, no nudges, no mutations beyond that audit table —
-# so the stuck/slow classifier can be validated against real fleet behavior
-# with no risk before P2 turns the recovery ladder on.
+# so the stuck/slow classifier could be validated against real fleet behavior
+# with no risk before P2 turned the recovery ladder on. P2's ladder is
+# nudge -> resume -> rotate -> restart (rung 4, poller-dead only, rate-limited:
+# DIVE-3753), all of it gated on $_SUP_ACTIONS_FLAG.
 #
 # Signals (all read-only; cheap ones implemented, flaky ones stubbed):
 #   service   systemctl is-active on 5dive-agent@<name> (claude-session.service
@@ -99,6 +101,27 @@ _SUP_ACT_BASE_MIN="${SUPERVISOR_ACT_BASE_MIN:-20}"
 [[ "$_SUP_ACT_BASE_MIN" =~ ^[0-9]+$ ]] || _SUP_ACT_BASE_MIN=20
 _SUP_ACT_WINDOW_H=6
 _SUP_ACT_MAX_ATTEMPTS=3
+# ── DIVE-3753: rung 4 — poller-dead RESTART, rate-limited ────────────────────
+# THE WINDOW, WRITTEN DOWN: at most _SUP_RESTART_MAX restarts of one seat per
+# _SUP_RESTART_WINDOW_H hours. Default 1 per 6h, keyed per seat, counted off the
+# same audit trail as every other rung (no extra state file).
+#
+# Why 1 and not 3: the remedy is measured at NINE SECONDS
+# (community/wiki/no-beacon-has-three-states-and-only-the-process-table-separates-them.md
+# — two seats, launcher=0 server=0 before, 1/1 at t+9s). A restart that works is
+# visible before the next 10-minute tick, so a SECOND restart inside the window
+# is never the cure for the first one having worked; it is the signature of a
+# seat that restarting does not fix. That seat needs a human, and the limiter's
+# refusal is what routes it to one — the refusing branch ESCALATES (courier
+# delivery, DIVE-3727), it does not silently do nothing.
+#
+# Cost of a wrong restart is one seat's session window; cost of NOT restarting
+# was measured on 2026-08-26 as the whole company's human-in-the-loop path dark
+# for 2h33m with 9 gates pending, on a correct detection nothing served.
+_SUP_RESTART_WINDOW_H="${SUPERVISOR_RESTART_WINDOW_H:-6}"
+[[ "$_SUP_RESTART_WINDOW_H" =~ ^[0-9]+$ ]] || _SUP_RESTART_WINDOW_H=6
+_SUP_RESTART_MAX="${SUPERVISOR_RESTART_MAX:-1}"
+[[ "$_SUP_RESTART_MAX" =~ ^[0-9]+$ ]] || _SUP_RESTART_MAX=1
 
 # DIVE-1127 (ToS-hedge A2): ID/age-verification tripwire. Per the Jul-11 hedge
 # memo (anthropic-tos-hedge-decision-jul11, D4 trigger 1), the biometric/ID lever
@@ -1048,10 +1071,18 @@ _sup_watch() {
 # previous classification is derived from the agent's latest event row —
 # healthy when it has none — so the tick needs no extra state file.
 # ── P2 (DIVE-857): recovery ladder — ACT + ESCALATE (design §5–6) ───────────
-# Auto-act is narrow along ONE axis: causes where the session is alive but wedged
-# (no-progress, loop-stuck). Everything else stuck needs rung 4+ (restart/
-# reprovision = P3/manual), so it ESCALATES: one audit row per window, zero
-# mutations. Rungs, in order: nudge -> resume -> rotate.
+# Auto-act was narrow along ONE axis: causes where the session is alive but
+# wedged (no-progress, loop-stuck). Everything else stuck ESCALATES: one audit
+# row per window, zero mutations. Rungs 1-3, in order: nudge -> resume -> rotate.
+#
+# DIVE-3753 adds rung 4 for ONE cause: poller-dead -> restart, rate-limited to
+# _SUP_RESTART_MAX per seat per _SUP_RESTART_WINDOW_H. Reprovision stays manual
+# and every other rung-4+ cause still escalates. The gap it closes was measured
+# on 2026-08-26: `ESCALATE <seat> (poller-dead: rung-4-needed)` fired correctly
+# for four seats and NOTHING SERVED IT, so a correct detection produced no
+# action for 2h33m while 9 human gates sat pending — including on the
+# coordinator seat, i.e. the fleet's human-in-the-loop path was dark and the
+# supervisor knew.
 #
 # OSS-23 (self-heal every runtime): the ladder is RUNTIME-AGNOSTIC — codex, grok,
 # opencode, and antigravity get the same nudge/resume/rotate as claude, not just
@@ -1068,30 +1099,92 @@ _sup_watch() {
 # attempts + last-action epoch for an agent inside the rolling window, straight
 # from the audit trail (no extra state file — same principle as the tick's
 # transition detection). Echoes "attempts lastEpoch" (lastEpoch=0 when none).
+#
+# DIVE-3753: rung-4 restart rows are EXCLUDED. The two ladders are indexed
+# differently — nudge/resume/rotate pick their rung by ATTEMPT COUNT, restart
+# picks it by CAUSE — so counting a restart as an attempt would silently move
+# the next no-progress on that seat from nudge to resume (and, at three, retire
+# the ladder to escalate) because of an action taken for an unrelated cause.
+# Sharing one counter between a count-indexed ladder and a cause-indexed rung
+# makes each one's pacing depend on the other's traffic.
+_SUP_ACT_NOT_RESTART="AND (signals IS NULL OR signals NOT LIKE '%\"rung\":\"restart\"%')"
 _sup_act_history() {
   local name="$1" n last
   n=$(db "SELECT COUNT(*) FROM supervisor_events
           WHERE agent=$(sqlq "$name") AND event='action'
+            ${_SUP_ACT_NOT_RESTART}
             AND ts >= datetime('now', '-${_SUP_ACT_WINDOW_H} hours');" 2>/dev/null || echo 0)
   last=$(db "SELECT COALESCE(strftime('%s', MAX(ts)), 0) FROM supervisor_events
              WHERE agent=$(sqlq "$name") AND event='action'
+               ${_SUP_ACT_NOT_RESTART}
                AND ts >= datetime('now', '-${_SUP_ACT_WINDOW_H} hours');" 2>/dev/null || echo 0)
   echo "${n:-0} ${last:-0}"
 }
 
+# DIVE-3753: the rung-4 limiter's numerator — restarts of THIS seat inside
+# _SUP_RESTART_WINDOW_H. Counts only rows the ladder actually EXECUTED
+# (event='action'), never 'planned': a dormant tick must not spend the seat's
+# restart budget on a restart it did not perform, or turning actions on would
+# find every seat already rate-limited. Echoes a bare integer.
+_sup_restart_history() {
+  local name="$1" n
+  n=$(db "SELECT COUNT(*) FROM supervisor_events
+          WHERE agent=$(sqlq "$name") AND event='action'
+            AND signals LIKE '%\"rung\":\"restart\"%'
+            AND ts >= datetime('now', '-${_SUP_RESTART_WINDOW_H} hours');" 2>/dev/null || echo 0)
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  echo "$n"
+}
+
 # Pure decision, no side effects: echoes "verb [reason]" where verb is one of
-# nudge|resume|rotate|escalate|defer. Attempt N picks rung N+1; the gap before
-# the next action is base * 2^attempts; ladder exhausted / unreachable rung
-# => escalate.
-_sup_act_plan() {  # <type> <cause> <attempts> <last_epoch> <now> <rotation_enabled>
+# nudge|resume|rotate|restart|escalate|defer. Attempt N picks rung N+1; the gap
+# before the next action is base * 2^attempts; ladder exhausted / unreachable
+# rung => escalate.
+#
+# DIVE-3753: `restart` is rung 4 and it is CAUSE-indexed, not attempt-indexed —
+# poller-dead does not respond to a nudge (there is no live channel to nudge
+# through; that is the whole classification), so walking rungs 1-3 first would
+# spend an hour of backoff on three actions that cannot work. It goes straight
+# to restart, once, and the rate limit is what bounds it. The 7th parameter is
+# the per-seat restart count already spent in _SUP_RESTART_WINDOW_H; it is
+# OPTIONAL so every existing 6-arg caller keeps its exact meaning (0 spent).
+#
+# The 8th parameter is whether the ladder is ARMED ($_SUP_ACTIONS_FLAG). It is
+# here rather than at the dispatch because of a regression this rung would
+# otherwise ship: while actions are dormant every other rung degrades to a
+# harmless 'planned' row, but poller-dead's PREVIOUS behaviour was `escalate
+# rung-4-needed`, which is a COURIER-DELIVERED page to a human (DIVE-3727).
+# Silently downgrading that to a planned row would take away the only thing
+# serving this cause today and give back nothing until the flag is set — the
+# opposite of the row. So a dormant ladder still escalates, and the reason
+# string says the restart is the action it was holding.
+_sup_act_plan() {  # <type> <cause> <attempts> <last_epoch> <now> <rotation_enabled> [restarts_in_window] [actions_enabled]
   # $1 (type) is retained for signature/caller stability but no longer branches:
   # OSS-23 made the ladder runtime-agnostic (see block comment above). rung-4+
-  # causes still escalate for every runtime via the case below (restart is P3);
-  # rotate self-gates on rot regardless of type.
+  # causes still escalate for every runtime via the case below; rotate
+  # self-gates on rot regardless of type. So does restart: a seat is a systemd
+  # unit whatever runtime it hosts.
   # shellcheck disable=SC2034
-  local type="$1" cause="$2" attempts="$3" last="$4" now="$5" rot="$6"
+  local type="$1" cause="$2" attempts="$3" last="$4" now="$5" rot="$6" restarts="${7:-0}"
+  local acts="${8:-true}"
+  [[ "$restarts" =~ ^[0-9]+$ ]] || restarts=0
   case "$cause" in
     no-progress|loop-stuck) : ;;
+    # DIVE-3753 rung 4. The limiter's REFUSING branch escalates rather than
+    # deferring: a deferral is silent and this is the seat that cannot report
+    # its own unreachability, so "restarting did not fix it" has to leave the
+    # ladder and reach a person (escalate carries DIVE-3727 courier delivery).
+    poller-dead)
+      if [[ "$acts" != "true" ]]; then
+        # Dormant: keep the pre-DIVE-3753 human path exactly as it was, and name
+        # the rung being held so the audit row still records what WOULD fire.
+        echo "escalate rung-4-dormant"
+      elif (( restarts >= _SUP_RESTART_MAX )); then
+        echo "escalate restart-rate-limited"
+      else
+        echo "restart"
+      fi
+      return ;;
     # DIVE-974: stale-cli is update-pending, not stuck — it never reaches this
     # loop (gated on class=="stuck") but guard here too so no rung, including
     # escalate, can EVER fire on a stale-cli-only classification.
@@ -1254,6 +1347,14 @@ _sup_act_exec() {  # <name> <verb> <cause>
       _hb_send_line "$name" "continue" ;;
     rotate)
       ( with_registry_lock cmd_agent_rotation_rotate "$name" ) >/dev/null 2>&1 ;;
+    # DIVE-3753 rung 4. SUBSHELL, for the same reason rotate is one: cmd_restart
+    # reaches `fail`/`require_agent`, and `fail` EXITS. Called bare, one seat
+    # whose unit no longer exists would abort the whole tick — every later agent
+    # in the loop goes unclassified and the fleet heartbeat row is never
+    # written. In a subshell that same exit is a nonzero return, which the
+    # caller already records as result:"failed".
+    restart)
+      ( cmd_restart "$name" ) >/dev/null 2>&1 ;;
     *) return 1 ;;
   esac
 }
@@ -1415,7 +1516,8 @@ cmd_supervisor_tick() {
   # ── P2 (DIVE-857): ACT + ESCALATE — pre-cleared by lodar 2026-07-02, gated on
   # $_SUP_ACTIONS_FLAG until the audit week (started 2026-07-02) is clean.
   # Dormant mode writes 'planned' rows: the Jul 9 review reads exactly what the
-  # ladder WOULD have done all week. restart stays P3; reprovision manual.
+  # ladder WOULD have done all week. reprovision stays manual; restart is rung 4
+  # since DIVE-3753 and rides this same dormancy flag.
   local actions_on="false" acted=0 planned=0 escalated=0 now_s
   [[ -f "$_SUP_ACTIONS_FLAG" ]] && actions_on="true"
   now_s=$(date +%s)
@@ -1429,7 +1531,10 @@ cmd_supervisor_tick() {
     atype=$(jq -r '.type' <<<"$row")
     rot=$(jq -r --arg n "$name" '.agents[$n].rotation.enabled // false' <<<"$reg_now")
     read -r attempts last <<<"$(_sup_act_history "$name")"
-    plan=$(_sup_act_plan "$atype" "$cause" "$attempts" "$last" "$now_s" "$rot")
+    # DIVE-3753: the rung-4 limiter reads its own counter (restart rows only),
+    # so it is not perturbed by, and does not perturb, the 1-3 attempt count.
+    local restarts; restarts=$(_sup_restart_history "$name")
+    plan=$(_sup_act_plan "$atype" "$cause" "$attempts" "$last" "$now_s" "$rot" "$restarts" "$actions_on")
     read -r verb reason <<<"$plan"
     case "$verb" in
       defer|"") continue ;;
@@ -1462,7 +1567,16 @@ cmd_supervisor_tick() {
           warn "supervisor: ESCALATE $name ($cause: $reason) — needs rung-4+/human — delivered via ${esc_via}"
         fi
         ;;
-      nudge|resume|rotate)
+      nudge|resume|rotate|restart)
+        # DIVE-3753: restart joins this branch deliberately — it is audited as
+        # an ACT (event='action', rung='restart'), exactly like the rungs below
+        # it, and it obeys the same _SUP_ACTIONS_FLAG dormancy. It does NOT
+        # also write an escalate row: an action that was TAKEN and a condition
+        # that needs a human are two different rows, and emitting both would
+        # make every successful auto-recovery ping a person — which is the
+        # noise that gets an escalation channel muted. The human path for
+        # poller-dead is the limiter's refusal (escalate restart-rate-limited),
+        # not the restart itself.
         if [[ "$actions_on" == "true" ]]; then
           local rc=0 res="ok"
           _sup_act_exec "$name" "$verb" "$cause" || { rc=$?; res="failed"; }

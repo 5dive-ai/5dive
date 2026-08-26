@@ -166,12 +166,34 @@ mut_check "mutation B: real death goes RED (undetected)" "OK" "$(dead_or_ok "$(r
 mut_check "mutation B: restart race still silent" "OK" "$(dead_or_ok "$(run_mut "$MUT_B" claude 0 "$NOW" 1 "$THRESH" 1 6)")"
 
 # ---------------------------------------------------------------------------
-# REMEDY TEXT (DIVE-2384, second defect). The alarm's prescribed remedy was
-# "Fix: restart the agent(s)" — the exact action that CREATES this condition,
-# because shutdown() unlinks the beacon. Anyone who believed the alarm re-armed it
-# within seconds and wiped every agent's running context per pass. That text is
-# prose inside a cmd_send string: nothing else in this repo asserts it, so it can
-# silently regress to the loop. These arms are its only guard.
+# REMEDY TEXT (DIVE-2384, second defect; REVISED by DIVE-3753). The alarm's
+# prescribed remedy was "Fix: restart the agent(s)" — unconditional and PLURAL
+# on a fleet-wide alarm, which is a fleet-wide restart. That half is still the
+# defect and arms 37/39 still guard it.
+#
+# What DIVE-3753 changes is the RATIONALE and the confirm step, because DIVE-2384
+# reasoned from the beacon and got the poller wrong:
+#
+#   - retired: "a restart deletes the beacon and re-arms this alarm". True of the
+#     beacon (shutdown() unlinks it), false of the poller. Measured 2026-08-26 on
+#     two seats: launcher=0/server=0 before, 1/1 nine seconds after a restart.
+#     Recency-of-restart correlates with the broken state because the failure
+#     happens AT channel start — the correlate points at the moment of the defect,
+#     not at its cause, and reading it as causal made the only working remedy a
+#     prohibition.
+#   - retired: bot.pid + bot.heartbeat as the confirm step. The beacon collapses
+#     three distinguishable states into one string (never started / dependency
+#     failure / genuinely dead), so it cannot tell a human which one they have.
+#     The process table can, and `bun server.ts` is the only clean count.
+#
+# The alarm must now agree with the supervisor ladder, which restarts a
+# poller-dead seat at rung 4 (DIVE-3753). Two texts prescribing opposite actions
+# for the same seat is the state this pairing exists to prevent, so these arms
+# are DIRECTIONAL: they assert the retired claims are ABSENT and the new ones
+# present, and mutation D restores the retired rationale and requires a red.
+#
+# That text is prose inside a cmd_send string: nothing else in this repo asserts
+# it, so it can silently regress. These arms are its only guard.
 #
 # LIVENESS FIRST. The arms below are mostly NEGATIVE ("must not say X"), and a
 # negative assertion over an empty haystack passes for free — a renamed function,
@@ -187,10 +209,28 @@ check "remedy: alarm string extracted" "yes" "$(has 'Gate-ping tap buttons still
 # 37. The self-perpetuating remedy is GONE. This is the defect.
 check "remedy: no unconditional restart instruction" "no" "$(has 'Fix: restart the agent(s)' "$REMEDY")"
 
-# 38. And it is replaced by a non-destructive confirmation step, not just deleted —
-#     an alarm with no remedy at all is a different failure, not a fix.
-check "remedy: names a confirm-first check" "yes" "$(has 'is bot.pid' "$REMEDY")"
-check "remedy: confirmation is observable"  "yes" "$(has "bot.heartbeat's mtime advancing" "$REMEDY")"
+# 38. And it is replaced by a confirmation step, not just deleted — an alarm with
+#     no remedy at all is a different failure, not a fix. DIVE-3753: the check is
+#     the PROCESS TABLE, because the beacon cannot separate the three states it
+#     reports identically.
+check "remedy: names a confirm-first check" "yes" "$(has 'CONFIRM BEFORE ACTING' "$REMEDY")"
+check "remedy: confirmation is the process table" "yes" "$(has "pgrep -u agent-<name> -f 'bun server.ts'" "$REMEDY")"
+
+# 38b (DIVE-3753). The RETIRED rationale must be gone. It is false about the
+#     poller and it contradicts the ladder's rung 4, and while it stands a reader
+#     who follows the alarm undoes what the supervisor just did.
+check "remedy: the false beacon rationale is retired" "no" \
+  "$(has 'a restart deletes the beacon and re-arms this alarm' "$REMEDY")"
+check "remedy: the beacon is no longer offered as the discriminator" "no" \
+  "$(has 'is bot.pid' "$REMEDY")"
+
+# 38c (DIVE-3753). And the alarm must SAY the ladder acts on its own, or a human
+#     reading it cannot tell an un-restarted seat from one whose budget is spent —
+#     the difference between "wait" and "this one needs you".
+check "remedy: names the automatic rung-4 restart" "yes" \
+  "$(has 'The supervisor restarts a poller-dead seat on its own at rung 4' "$REMEDY")"
+check "remedy: names the rate-limit window" "yes" \
+  "$(has 'once per seat per 6h' "$REMEDY")"
 
 # 39. Scoped to the ONE named subject. A plural remedy on a fleet-wide alarm is a
 #     fleet-wide action — the 17:00:05 fire named all six agents in one line.
@@ -211,6 +251,19 @@ mut_check "mutation C: unconditional-restart arm goes RED" "yes" \
 # ...and C must leave the liveness arm alone, or it is not targeted.
 mut_check "mutation C: liveness arm unaffected" "yes" \
   "$(has 'Gate-ping tap buttons still SEND' "$MUT_C")"
+
+# Mutation D (DIVE-3753) — restore the RETIRED rationale and require arm 38b to
+# go RED. Arms 38b are absences, and an absence over the wrong haystack passes
+# for free; C only proves the extraction is live for the arm-37 string. Without
+# D, the retired-rationale arms are unfalsifiable.
+MUT_D=${REMEDY/CONFIRM BEFORE ACTING/do NOT blanket-restart: a restart deletes the beacon and re-arms this alarm. CONFIRM BEFORE ACTING}
+mut_check "mutation D landed (retired rationale restored)" "changed" \
+  "$([[ "$MUT_D" != "$REMEDY" ]] && printf changed || printf UNCHANGED)"
+mut_check "mutation D: retired-rationale arm goes RED" "yes" \
+  "$(has 'a restart deletes the beacon and re-arms this alarm' "$MUT_D")"
+# ...and D must leave the rung-4 arm alone, or it is not targeted.
+mut_check "mutation D: rung-4 arm unaffected" "yes" \
+  "$(has 'The supervisor restarts a poller-dead seat on its own at rung 4' "$MUT_D")"
 
 if (( MUT_FAIL )); then
   printf '\nMUTATION ARM FAILED — the green above is NOT evidence.\n'
