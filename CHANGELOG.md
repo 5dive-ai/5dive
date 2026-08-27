@@ -1,6 +1,143 @@
 # Changelog
 
-## Unreleased — feat(supervisor): rung 4 — a poller-dead seat is restarted, once per 6h (DIVE-3753)
+## v0.23.0 — fix(agent-setup): the plugin-install patch no longer picks the launcher (DIVE-3754)
+
+`install_channel_plugin_for_agent` rewrites an installed plugin's `start` script to take a
+`bun install` off the channel-start path. That is right and it stays: `npm install --omit=dev` has
+already run in the plugin dir, and when the plugin joins the install with `&&` a failed install eats
+the poller silently — DIVE-3748 measured that at **2h33m across three seats, the coordinator among
+them, with 9 human gates pending**.
+
+It was written as an assignment of the WHOLE script — `d["scripts"]["start"] = "bun server.ts"` —
+which is a second, unannounced decision: it pins the ENTRY POINT too. DIVE-3752 then shipped
+`bun install --no-summary; bun start.ts`, a launcher whose only job is to record WHICH of three
+indistinguishable failures a dead channel had, and this patch deleted it on every seat the CLI
+installs. The diagnostic built for that outage ran nowhere the CLI had been, and nothing said so:
+the install log printed `Patched start script: removed bun install` either way.
+
+Measured on this control plane, agent-dev's own cache — `telegram/0.5.47/` (CLI-installed) reads
+`bun server.ts`; `telegram/0.5.48/` (daily `5dive-refresh-plugins.sh`, which does not re-apply the
+patch) reads the upstream `bun install --no-summary && bun server.ts` untouched.
+
+The patch now drops the install SEGMENT and keeps whatever the plugin launches, verbatim; surviving
+steps are rejoined with `;`, never `&&`, because a non-short-circuiting separator is the property
+the patch exists to guarantee. A start script that is only an install has no entry point to
+preserve, so it is left alone with a WARNING rather than given a guessed one.
+
+And the poller-dead alarm's confirm step moves with it: `pgrep -u agent-<name> -f 'bun
+(start|server)\.ts'`. Either single name reads ZERO on half the fleet — `server.ts` on a seat
+carrying DIVE-3752's launcher, `start.ts` on an older plugin cache and on all five `telegram-<x>`
+variants — and a confirm step that reads zero on a healthy seat tells the human to restart it.
+
+## v0.23.0 — fix(heartbeat): the paired-human gate re-nag has ONE sender, not one per filer (DIVE-3742)
+
+lodar, 2026-08-26 03:03: *"I have automated Gate reminder - unanswered gates (paired human) from you
+and Olivia. maybe keep only one."* He was getting the same gate backlog pushed at him twice.
+
+`_hb_gate_renag_sweep`'s tier-2 lane partitioned the open gates by the **filing agent** and pushed
+each partition down that agent's own bot. The comment defending it was true and answered the wrong
+question — *"different bots cannot be collapsed into one Telegram request"* is about requests per
+bot, and the quantity the human experiences is **messages received**. The recipient is the same
+person in every partition, so partitioning by filer bought him nothing and cost him one notification
+per filing agent.
+
+Measured on the live board 2026-08-26 04:0xZ: 8 open gates, all tier-2, `created_by` = main×5,
+olivia×2, lodar×1 — exactly the two DMs he reported. Reproduced in the unit harness on the
+pre-change tree as `sends=2 channels=olivia,dev`.
+
+The re-nag now rides the **resolved org coordinator's** channel — the same seat that already fronts
+the pinned needs-you banner (DIVE-1568/333) — so the human has one gate surface instead of N. Every
+row keeps its own `/task_<id>` link and answer button, and `_hb_gate_renag_batch` still partitions
+per HUMAN owner first (DIVE-3342), so this is the same rows in one message, never fewer rows.
+
+**It fails open.** An unresolvable coordinator (`''` — nobody tagged coordinator and more than one
+org root) is precisely the state that killed the needs-you banner fleet-wide in DIVE-2031, and a gate
+re-nag is a worse thing to lose than a pin. That case falls straight back to the historical per-filer
+fan-out: the human gets duplicates again, which is loud, rather than silence, which is not. Both
+directions are pinned by arms in `tests/heartbeat_gate_renag_unit.sh`.
+
+## v0.23.0 — fix(council): a bench registry rewrite no longer locks every seat out of its own roster (DIVE-3729)
+
+`5dive council promote|demote|expel` persists the carried roster by rewriting
+`benches.json` through `mktemp` + `mv`. `mv` replaces the destination *inode*, so
+the registry inherited the temp file's `0600 root:root` instead of its own
+`0644 root:claude` — every non-root seat was locked out from the moment the first
+motion carried, and in `$TMPDIR` the `mv` was a cross-filesystem copy rather than
+the atomic rename the pattern is chosen for.
+
+Nothing said so. `loadRegistry()` swallowed the EACCES and returned an empty
+registry; `resolveBench()` then failed closed, so the operator was told
+`unknown bench: strategy (fail-closed — see 'council bench ls')` — true in every
+word and pointing away from the fault, with `bench ls` reading through the same
+swallow and confirming the lie. **The silent half was worse:** a name that IS a
+built-in never missed, so every unprivileged `council convene` quietly ran the
+genesis five. On this host a quorum-carried, hash-chained, sealed promotion
+(lineage seq=1, 2026-07-21) was voided by a file mode for five weeks, and the
+weekly strategy convene died five consecutive Mondays with the wrong error.
+
+- **The rewrite stages beside the registry and carries the destination's owner and
+  mode onto the replacement** (`chown/chmod --reference`, the same shape
+  `cmd_proof.sh` already uses and the chown DIVE-2102 had to add back to the
+  capability store). A persist that cannot happen now warns instead of vanishing —
+  the motion is already sealed into the chain at that point, so silence there was
+  the whole defect.
+- **`loadRegistry()` no longer fails open — it repairs, or degrades loudly, and only
+  refuses where continuing would destroy something.** Only `ENOENT` (and a
+  zero-length file) stays a silently empty registry. On `EACCES`/`EPERM` the read
+  first tries to *repair* the mode: `chmod` throws unless you are root or the owner,
+  so the attempt is self-limiting, and because the scheduled convene runs under
+  `sudo` a legacy `0600` host heals itself on first run. Where repair is impossible
+  the read **degrades** — the caller gets the same empty overlay as before plus a
+  structured reason it is obliged to surface (`benchRegistryUnreadable` on the
+  envelope, a `warn`, and a durable audit row). The mutating paths (`bench add|rm`,
+  `init`, `schedule add|rm`) stay hard failures, because a read-modify-write over a
+  registry you could not read deletes every entry in it. Malformed JSON is always a
+  refusal. A missing store and an unreadable one are different facts and only one of
+  them is normal — but saying so must not cost you the command.
+
+  The first cut of this fix simply `die`d on `EACCES`, and that was wrong in a way
+  worth recording: **the hosts that have an unreadable registry are precisely the
+  legacy `0600` fleet this change exists to repair**, so a hard refusal took
+  `council convene` down on every box it was written to save (10 CI arms red, each
+  quoting the new check's own error string). Measured on a full state fixture:
+  registry readable → the convene seats **6** (the carried motion's roster);
+  unreadable and unrepairable → the convene **succeeds** on the genesis **5** and
+  reports the degradation. The 6-vs-5 *is* the voided motion — now announced rather
+  than silent, which was the point of the row, without taking the fleet down.
+- **`saveRegistry()` creates the registry world-readable**, so a first write under
+  a tight umask cannot reproduce the lockout from the other side.
+- **`5dive council convene --help` is reachable again.** The DIVE-2257 subject
+  check ran ahead of help dispatch, so the operator's first move — looking up the
+  flags — returned an error about the thing they were looking up. That is how the
+  standup wrapper's missing `--subject` stayed unexplained for 35 days.
+
+Swept the rest of the repo for the same shape: every other `mktemp` + `mv` onto a
+path other users read already sets owner and mode on the temp before the rename.
+This was the last unfixed instance.
+
+### The same guard, one level over: a scheduled convene that stored nothing
+
+Found by the filer while verifying the above, and fixed here rather than filed apart. The receipt
+write and the founder-veto ping share ONE `[[ -w "$COUNCIL_RECEIPTS" ]]` guard with **no else**, and
+`receipts/` is `drwxr-sr-x root:claude` — group `claude` has r-x, not w. Every convene run by the
+unprivileged cron user therefore sealed a digest, wrote no receipt, contributed nothing to CNCL-19's
+case-law pool, and **never once offered the founder veto** — with no message on any path. Production
+evidence: `standup.log` 2026-07-21T01:20:01Z reached a verdict with a non-empty digest, and no file
+under `receipts/` contains it.
+
+The drop is now said out loud on every channel that caller has: a `warn` naming the directory, the
+euid, both consequences and the *narrow* remedy (an ACL for the one cron user — **not** `chmod g+w`,
+which would open the sealed audit trail to all 17 seats); a durable `receipt-dropped` audit row; and
+a `receiptDropped` field in the `--json` envelope, because `--json` callers capture `2>&1` and a
+stderr warn would corrupt the envelope they parse. The `receipt: sealed (…)` summary line no longer
+claims a receipt that was not stored.
+
+It is deliberately **not** fatal. The convene has already run and sealed by the time this guard is
+reached, so aborting would neither un-run it nor make the veto exist. **Residual, unfixed:** the veto
+still is not offered on a scheduled convene. That needs the host-side ACL, which is sequenced behind
+an open question with lodar about whether the daily standup survives at all.
+
+## v0.23.0 — feat(supervisor): rung 4 — a poller-dead seat is restarted, once per 6h (DIVE-3753)
 
 On 2026-08-26 the supervisor printed `ESCALATE <seat> (poller-dead: rung-4-needed)` for `marketing`,
 `main`, `dev` and `olivia`. The detection was correct, it fired on time — and **nothing served rung 4**,
@@ -56,7 +193,7 @@ out of sqlite), `poller_liveness_unit` (41), `supervisor_classify_unit` (37),
 case, the tick dispatch entry, the counter exclusion, the limiter and the retired remedy text each red
 exactly the arms that claim them.
 
-## Unreleased — feat(durable): an irreversible action fires ONCE, even when the agent crashes mid-flight (INST-8)
+## v0.23.0 — feat(durable): an irreversible action fires ONCE, even when the agent crashes mid-flight (INST-8)
 
 INST-4 made the *record* of an action idempotent (`lifecycle_events` has a UNIQUE index on
 `idem_key`). INST-5 bounded *who* may act and *what* they may act on. Neither could answer the
@@ -103,7 +240,7 @@ next (email / pay / publish) would have been double-send, double-pay, double-pub
   the double-claim refusal must go red), the inversion arm with its live control, and a realistic
   pre-INST-8 store fixture for the migration.
 
-## Unreleased — fix(memory): consolidate reports what it PRODUCED, and the sweep can now authenticate (DIVE-3711)
+## v0.23.0 — fix(memory): consolidate reports what it PRODUCED, and the sweep can now authenticate (DIVE-3711)
 
 `5dive memory consolidate` had produced atoms **once across the entire fleet** while
 `/var/log/5dive-heartbeat.log` reported `13 seat(s) distilled, 4 failed, 0 not due` every six hours
@@ -143,7 +280,7 @@ it is a liveness check wearing a productivity label; and **hand-written artifact
 are not evidence the pipeline ran** — a populated output directory reads exactly like a working
 extractor, and only the ledger tells them apart.
 
-## Unreleased — feat(memory): `5dive memory consolidate` — async transcript → memory atoms (DIVE-3628, DIVE-726 phase 1)
+## v0.23.0 — feat(memory): `5dive memory consolidate` — async transcript → memory atoms (DIVE-3628, DIVE-726 phase 1)
 
 A session window dies and everything it learned dies with it, because "compile before you close" is
 a HABIT and a habit is not a mechanism. The motivating case is on the record: the very
@@ -211,7 +348,7 @@ Tests: `tests/memory_consolidate_unit.sh`, 53 assertions, offline by constructio
 an injected seam). Four mutants — the live-session skip, the dry-run ledger guard, the ledger skip,
 and the errexit fix — each red exactly the arm meant to catch it.
 
-## Unreleased — fix(self-update): skip an agent holding an in_progress row and bounce it at its next task boundary (DIVE-3173)
+## v0.23.0 — fix(self-update): skip an agent holding an in_progress row and bounce it at its next task boundary (DIVE-3173)
 
 DIVE-3172 made the nightly restart conditional on the agent payload actually moving, which takes a
 CLI-only night to zero restarts. This is the belt for the nights the payload genuinely moves: those
@@ -250,7 +387,7 @@ concern - our nightly updates kills some active agents mid tasks"*).
   three sweeps of one marker — parked mid-task is NOT restarted and keeps its marker; the row closes
   and the SAME marker fires the bounce; the next sweep does not bounce it again.
 
-## Unreleased — feat(task): `merge-unverified` reads back the closes the merge gate could not check (DIVE-3526)
+## v0.23.0 — feat(task): `merge-unverified` reads back the closes the merge gate could not check (DIVE-3526)
 
 Since DIVE-1935 the mandatory auto-detect merge gate has said so when its repo scan cannot
 complete: it warns, writes a `task.merge-gate-unverified` row to the audit log, and lets the close
@@ -282,7 +419,7 @@ never read is a receipt, not a control.
 - **Exit status is the consumable signal** (1 when any stamped close still has an open PR), because
   a stamp with no consumer is the whole defect.
 
-## Unreleased — fix(branch-hygiene): the weekly digest classifies branches by EVIDENCE, not age (DIVE-2394)
+## v0.23.0 — fix(branch-hygiene): the weekly digest classifies branches by EVIDENCE, not age (DIVE-2394)
 
 `--apply` was already safe: it deletes only on a closed PR whose head SHA equals the branch's
 current SHA, and age never entered that path. **The digest above it was the problem.** Its
@@ -346,7 +483,7 @@ from the merged-and-tidy ones. A reader handed "dead branch, 40d" reaches for de
   the invariant `branch-hygiene-report.sh` greps for when it runs this same script against
   `lodar/5dive-api` and `lodar/5dive-frontend`.
 
-## Unreleased — fix(council): `authority.gate_clear_leads` can actually be set (DIVE-3493)
+## v0.23.0 — fix(council): `authority.gate_clear_leads` can actually be set (DIVE-3493)
 
 The constitution validator and the authority reader accepted **disjoint** subsets of YAML, so the
 key was unsettable through any path: `council amend` threw `use inline arrays in constitution v0`
@@ -372,7 +509,7 @@ worked example — so the template failed the validator shipping beside it.
   *"no motion could have succeeded"*, not *"nobody convened one"* — an instrument that measured its
   own writer.
 
-## Unreleased — feat(task): an inert push-for-review clears at filing, pinging nobody (DIVE-3481)
+## v0.23.0 — feat(task): an inert push-for-review clears at filing, pinging nobody (DIVE-3481)
 
 lodar, 2026-08-16, on a routine branch-push approval waking the org lead: *"why dev2 cannot do
 delegated push himself and burns your token for approval?"* An approval gate whose ask is an
@@ -406,7 +543,7 @@ permanent gate record and digest line intact, and **no ping to anyone**.
 - **`5dive task pfr-autoclear [on|off|status]`**, default **on**, restores the lead ping with no
   release.
 
-## Unreleased — fix(usage): the middle wildcard is a read too (DIVE-3419)
+## v0.23.0 — fix(usage): the middle wildcard is a read too (DIVE-3419)
 
 Both transcript readers in `cmd_usage.sh` used `projects/*/*.jsonl`. `usage_collect` was guarded at the
 **top** (`probe_readable` on `projects/`) and the **bottom** (per-file `except OSError`) of a *three*-level
@@ -436,7 +573,7 @@ true** — and every "⚠ N NOT checked — burn is unknown (not 0)" banner buil
   ANY-UID arm (`ELOOP`, which root cannot resolve either) so a uid-0 CI run cannot be a vacuous green, and
   over-fire controls. **9/14 pre-fix, 23/0 after.**
 
-## Unreleased — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
+## v0.23.0 — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
 
 Nothing validated these columns. The work-picker dispatches on `assignee`, so a row on a name that is
 not a registered agent was **structurally undispatchable** — not blocked, not parked, not flagged, and
@@ -460,7 +597,7 @@ never once a dispatch target) and corroborated here (5 open rows).
 - **`wip-cap-install`** read the same unvalidated column (it had minted `wip_cap:cli`, a lane ceiling
   for an agent that does not exist). It now skips unregistered lanes and **names the skip**.
 
-## Unreleased — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
+## v0.23.0 — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
 
 `5dive agent config <name> set channels=<current>,buzz` could not succeed on any seat that was not
 **created** with buzz. `cmd_config` dispatches `install_channel_for_agent` for telegram, discord and
@@ -493,7 +630,7 @@ arms grade the satisfier next to the gate, and drive `cmd_config` for real — w
 that the same call reaches the restart once the cache is staged, so the rollback arms cannot pass
 against a `cmd_config` that simply refuses everything.
 
-## Unreleased — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
+## v0.23.0 — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
 
 DIVE-2483's gate answer said the preservation notice lands on **stdout**. It lands on **stderr**,
 via the fleet's `warn()`. Six arms were written for that condition and all six were green, because
@@ -527,7 +664,7 @@ Still open and scoped out on purpose: `task reject` remains an unguarded writer 
 column (`src/cmd_task.sh:4235`). That is a design question about accumulating verifier feedback, not
 this gap.
 
-## Unreleased — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
+## v0.23.0 — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
 
 DIVE-3272 taught the supervisor BOARD to see a seat that is alive and closing nothing. The
 drill-down people actually type kept printing only liveness: `state: active / enabled` was
@@ -569,7 +706,7 @@ supervisor:  quota-exhausted / quota-exhausted — pane shows a model-capacity r
 - `agent list` is unchanged — it is the survey surface, and this is a per-agent drill-down
   (three sqlite reads), deliberately not an N-way fan-out.
 
-## Unreleased — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
+## v0.23.0 — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
 
 A gate reaches the filer's lead only if `_GATE_ENG_SHIP_RX` matches the ask or the row
 title. `gate_builder_routing` is OFF by default, so for an ordinary builder ship gate that
@@ -633,7 +770,7 @@ prose for identifiers.
   `gate_access_lead_clear`, `gate_internal_ops_floor`, `task_needs_human_parity`,
   `task_inbox_json_tier`, `push_unit`, `broker_surface`, + 15 more).
 
-## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
+## v0.23.0 — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
 
 DIVE-1935's first iteration was rejected, and for the right reason. It added a
 `sudo -n -u claude gh auth token` arm to `_gate_gh_token` justified by *"agents hold
