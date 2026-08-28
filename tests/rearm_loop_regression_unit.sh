@@ -6,8 +6,12 @@
 #   BEHAVIOURAL — drive the real coldstart_kick_submit against a scripted tmux
 #     stub and assert on what it SENT and what it RECORDED. A submit-verifier
 #     that always returned 0 would pass any assertion about the return code of
-#     the happy path alone, so every arm below pins the KEYSTROKE COUNTS too:
-#     the defect being fixed is invisible in the exit status.
+#     the happy path alone, so every arm below pins the KEYSTROKE COUNTS and the
+#     CAPTURE COUNT too: the defect being fixed is invisible in the exit status.
+#     The FAIL_CAPTURE_AT knob is SWEPT across all four capture call sites, not
+#     pointed at one — a FAIL_AT=<index> injector with a single arm grades a
+#     single call site, and here the sites fail differently (a before-capture
+#     fails safe, an after-capture fails SILENT). See 4d..4d4.
 #   STATIC — the DIVE-1180 recursive-loop ban, ported to this repo.
 #     test/rearm-loop-regression.test.ts in 5dive-ai/5dive-plugins bans the same
 #     three patterns, but it reads `plugins/<fork>/` and CANNOT see this repo.
@@ -161,6 +165,11 @@ run_case() { # <name> <panes-file> <fail_capture_at|0> <fail_type|0>
 }
 count(){ local n; n="$(grep -c "^$2$" "$TD/$1/sent" 2>/dev/null)"; printf %s "${n:-0}"; }
 bc_of(){ cat "$TD/$1/.5dive-coldstart-kick-failed" 2>/dev/null || true; }
+# How many times capture-pane was called. Every arm pins this: a FAIL_CAPTURE_AT
+# knob only grades the call sites that EXIST when the arm is written, so a third
+# capture added later would sit ungraded behind the same index sweep. Pinning the
+# count makes adding one red until its own arm is written.
+caps(){ cat "$TD/$1/n" 2>/dev/null || printf 0; }
 
 # 4a. Enter lands on the first try: pane changes across the submit.
 printf 'composer: kick text\nturn started\n' > "$TD/p-ok"
@@ -169,6 +178,7 @@ is "4a landed submit returns 0"        "$r"                 "RC=0"
 is "4a typed the prompt once"          "$(count ok TYPE)"   "1"
 is "4a sent exactly one Enter"         "$(count ok ENTER)"  "1"
 is "4a leaves no breadcrumb"           "$(bc_of ok)"        ""
+is "4a captured the pane twice"        "$(caps ok)"         "2"
 
 # 4b. Enter NEVER lands: pane byte-identical across every submit. This is the
 # defect. Pre-fix it returned success and recorded nothing.
@@ -182,6 +192,7 @@ if grep -q 'NOT listening' <<<"$(bc_of wedged)"; then
 else no "4b breadcrumb names the real state (got '$(bc_of wedged)')"; fi
 if grep -q 'not accepting input' "$TD/wedged/err"; then ok "4b warns on stderr"
 else no "4b warns on stderr"; fi
+is "4b captured the pane four times"   "$(caps wedged)"         "4"
 
 # 4c. First Enter dropped, second lands — the case the retry exists for.
 printf 'composer: kick text\ncomposer: kick text\ncomposer: kick text\nturn started\n' > "$TD/p-retry"
@@ -190,14 +201,58 @@ is "4c retry that lands returns 0"     "$r"                    "RC=0"
 is "4c sent two Enters"                "$(count retry ENTER)"  "2"
 is "4c still typed the prompt ONCE"    "$(count retry TYPE)"   "1"
 is "4c leaves no breadcrumb"           "$(bc_of retry)"        ""
+is "4c captured the pane four times"   "$(caps retry)"         "4"
 
-# 4d. Unreadable pane must NOT read as a landed submit (DIVE-2159's lesson on
-# this same script: could-not-measure rendered as measured-and-fine).
+# 4d..4d4. Unreadable pane must NOT read as a landed submit (DIVE-2159's lesson
+# on this same script: could-not-measure rendered as measured-and-fine).
+#
+# SWEEP THE INDEX, do not grade one call site. There are FOUR capture calls in a
+# full run — before/after of the first submit, before/after of the retry — and
+# they do NOT fail the same way. A failed BEFORE capture fails safe: the compare
+# never runs. A failed AFTER capture is the silent one, because the empty result
+# compares UNEQUAL to a non-empty before and so reads as "the pane changed", i.e.
+# as a landed submit. FAIL_CAPTURE_AT=1 alone (the original arm) graded only a
+# safe-failing site, and a mutant deleting `|| return 1` from the after-capture
+# survived it green. The after positions (2 and 4) are also the more likely ones
+# in the field: the pane can vanish mid-turn.
 printf 'composer: kick text\nturn started\nturn started\nturn started\n' > "$TD/p-blind"
 r="$(run_case blind "$TD/p-blind" 1 0)"
-is "4d unreadable pane returns 1"      "$r"                    "RC=1"
+is "4d capture 1 (submit before) unreadable returns 1"  "$r"              "RC=1"
 if [[ -n "$(bc_of blind)" ]]; then ok "4d unreadable pane is recorded"
 else no "4d unreadable pane is recorded"; fi
+is "4d sent no Enter for the failed submit"  "$(count blind ENTER)"  "1"
+is "4d captured the pane three times"        "$(caps blind)"         "3"
+
+# 4d2. AFTER capture of the FIRST submit is unreadable. The retry then sees a
+# byte-identical pane, so the whole call must still report failure. Deleting
+# `|| return 1` from the after-capture makes this arm return RC=0.
+printf 'composer: kick text\nUNREAD\ncomposer: kick text\ncomposer: kick text\n' > "$TD/p-blind2"
+r="$(run_case blind2 "$TD/p-blind2" 2 0)"
+is "4d2 capture 2 (submit after) unreadable returns 1"  "$r"             "RC=1"
+if [[ -n "$(bc_of blind2)" ]]; then ok "4d2 unreadable after-capture is recorded"
+else no "4d2 unreadable after-capture is recorded"; fi
+is "4d2 retried the Enter"                   "$(count blind2 ENTER)" "2"
+is "4d2 did NOT retype the prompt"           "$(count blind2 TYPE)"  "1"
+is "4d2 captured the pane four times"        "$(caps blind2)"        "4"
+
+# 4d3. BEFORE capture of the RETRY is unreadable: fails safe, no second Enter.
+printf 'composer: kick text\ncomposer: kick text\nUNREAD\nx\n' > "$TD/p-blind3"
+r="$(run_case blind3 "$TD/p-blind3" 3 0)"
+is "4d3 capture 3 (retry before) unreadable returns 1"  "$r"             "RC=1"
+if [[ -n "$(bc_of blind3)" ]]; then ok "4d3 unreadable retry-before is recorded"
+else no "4d3 unreadable retry-before is recorded"; fi
+is "4d3 sent no Enter for the failed retry"  "$(count blind3 ENTER)" "1"
+is "4d3 captured the pane three times"       "$(caps blind3)"        "3"
+
+# 4d4. AFTER capture of the RETRY is unreadable — the last chance to report the
+# truth, and the second position the surviving mutant flipped to green.
+printf 'composer: kick text\ncomposer: kick text\ncomposer: kick text\nUNREAD\n' > "$TD/p-blind4"
+r="$(run_case blind4 "$TD/p-blind4" 4 0)"
+is "4d4 capture 4 (retry after) unreadable returns 1"   "$r"             "RC=1"
+if [[ -n "$(bc_of blind4)" ]]; then ok "4d4 unreadable retry-after is recorded"
+else no "4d4 unreadable retry-after is recorded"; fi
+is "4d4 retried the Enter"                   "$(count blind4 ENTER)" "2"
+is "4d4 captured the pane four times"        "$(caps blind4)"        "4"
 
 # 4e. The type itself fails: no Enter should be sent at all.
 printf 'x\nx\nx\nx\n' > "$TD/p-notype"
@@ -206,6 +261,7 @@ is "4e failed type returns 1"          "$r"                     "RC=1"
 is "4e sends no Enter after a failed type" "$(count notype ENTER)" "0"
 if [[ -n "$(bc_of notype)" ]]; then ok "4e failed type is recorded"
 else no "4e failed type is recorded"; fi
+is "4e captures nothing after a failed type" "$(caps notype)"        "0"
 
 # 4f. Recovery clears a stale breadcrumb, so a healed boot stops reporting.
 mkdir -p "$TD/healed"; printf 'stale\n' > "$TD/healed/.5dive-coldstart-kick-failed"
