@@ -11,7 +11,8 @@
 #     The FAIL_CAPTURE_AT knob is SWEPT across all four capture call sites, not
 #     pointed at one — a FAIL_AT=<index> injector with a single arm grades a
 #     single call site, and here the sites fail differently (a before-capture
-#     fails safe, an after-capture fails SILENT). See 4d..4d4.
+#     fails safe, an after-capture fails SILENT). See 4d..4d4, and 4g/4h for the
+#     same sweep over the other injectable site, the Enter send.
 #   STATIC — the DIVE-1180 recursive-loop ban, ported to this repo.
 #     test/rearm-loop-regression.test.ts in 5dive-ai/5dive-plugins bans the same
 #     three patterns, but it reads `plugins/<fork>/` and CANNOT see this repo.
@@ -132,16 +133,16 @@ TD="$(mktemp -d)"; trap 'rc=$?; rm -rf "$TD"; echo "HARNESS-RC=$rc"' EXIT
 
 # scenario runner: PANES is a newline-separated script of capture-pane outputs,
 # consumed one per call. FAIL_CAPTURE_AT / FAIL_TYPE inject rc 1.
-run_case() { # <name> <panes-file> <fail_capture_at|0> <fail_type|0>
+run_case() { # <name> <panes-file> <fail_capture_at|0> <fail_type|0> [fail_enter_at|0]
   local box="$TD/$1"; mkdir -p "$box"
-  PANE_SCRIPT="$2" FAIL_CAPTURE_AT="$3" FAIL_TYPE="$4" BOX="$box" \
+  PANE_SCRIPT="$2" FAIL_CAPTURE_AT="$3" FAIL_TYPE="$4" FAIL_ENTER_AT="${5:-0}" BOX="$box" \
   bash -c '
     set -uo pipefail
     HOME="$BOX"; export HOME
     # The capture runs inside $( ), i.e. a SUBSHELL, so the call counter cannot
     # live in a variable — it would reset on every capture and every pane would
     # read line 1, i.e. every submit would look unobserved. File-backed.
-    printf 0 > "$BOX/n"
+    printf 0 > "$BOX/n"; printf 0 > "$BOX/e"
     sleep(){ :; }
     tmux(){
       local n
@@ -155,7 +156,13 @@ run_case() { # <name> <panes-file> <fail_capture_at|0> <fail_type|0>
           [[ "$FAIL_TYPE" == 1 ]] && return 1
           return 0 ;;
         *" Enter "*|*" Enter")
-          printf "ENTER\n" >> "$BOX/sent"; return 0 ;;
+          # Counted OUTSIDE a subshell here, but file-backed like the capture
+          # counter so both knobs index the same way and neither can silently
+          # reset if a call site later moves inside a $( ).
+          printf "ENTER\n" >> "$BOX/sent"
+          n=$(( $(cat "$BOX/e") + 1 )); printf %s "$n" > "$BOX/e"
+          [[ "$FAIL_ENTER_AT" != 0 && "$n" == "$FAIL_ENTER_AT" ]] && return 1
+          return 0 ;;
       esac
       return 0
     }
@@ -253,6 +260,34 @@ if [[ -n "$(bc_of blind4)" ]]; then ok "4d4 unreadable retry-after is recorded"
 else no "4d4 unreadable retry-after is recorded"; fi
 is "4d4 retried the Enter"                   "$(count blind4 ENTER)" "2"
 is "4d4 captured the pane four times"        "$(caps blind4)"        "4"
+
+# 4g/4h. The SAME sweep for the other injectable call site: the Enter send.
+# `send-keys ... Enter || return 1` is a second guard on the same path, and it
+# was ungraded — the stub never failed an Enter, so deleting its `|| return 1`
+# survived the suite green. A failed Enter that is not returned on falls through
+# to the after-capture, and any pane redraw from an UNRELATED source then reads
+# as a landed submit. The capture-count pins below are what catch it: a returned
+# -on failure never reaches the after-capture, so the counts differ.
+#
+# 4g. The FIRST Enter send fails. Pane lines 1/2 deliberately DIFFER, so a
+# fall-through would report the submit landed on a keystroke never delivered.
+printf 'composer: kick text\nturn started\nturn started\nx\n' > "$TD/p-noent1"
+r="$(run_case noent1 "$TD/p-noent1" 0 0 1)"
+is "4g failed first Enter returns 1"         "$r"                     "RC=1"
+is "4g attempted two Enters"                 "$(count noent1 ENTER)"  "2"
+is "4g did NOT retype the prompt"            "$(count noent1 TYPE)"   "1"
+is "4g skipped the after-capture it never earned" "$(caps noent1)"    "3"
+if [[ -n "$(bc_of noent1)" ]]; then ok "4g failed first Enter is recorded"
+else no "4g failed first Enter is recorded"; fi
+
+# 4h. The RETRY's Enter send fails — the last send on the path.
+printf 'composer: kick text\ncomposer: kick text\ncomposer: kick text\nturn started\n' > "$TD/p-noent2"
+r="$(run_case noent2 "$TD/p-noent2" 0 0 2)"
+is "4h failed retry Enter returns 1"         "$r"                     "RC=1"
+is "4h attempted two Enters"                 "$(count noent2 ENTER)"  "2"
+is "4h skipped the after-capture it never earned" "$(caps noent2)"    "3"
+if [[ -n "$(bc_of noent2)" ]]; then ok "4h failed retry Enter is recorded"
+else no "4h failed retry Enter is recorded"; fi
 
 # 4e. The type itself fails: no Enter should be sent at all.
 printf 'x\nx\nx\nx\n' > "$TD/p-notype"
