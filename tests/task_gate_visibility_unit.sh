@@ -24,7 +24,16 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 : "${FIVEDIVE_TEST:=1}"; export FIVEDIVE_TEST
 CLI="${CLI:-./5dive}"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
-export TASKS_DB="$TMP/tasks.db"
+# TASKS_DIR, not just TASKS_DB. `tasks_db_init` guards on the DIRECTORY and, as a
+# non-root caller, REFUSES to create it ("tasks store not initialised"). Setting
+# only TASKS_DB leaves TASKS_DIR defaulted to /var/lib/5dive/tasks — which exists
+# on a 5dive host and does not exist in CI, so the harness is green locally and red
+# on the runner off the same tree. Same shape the sibling task harnesses avoid by
+# exporting all three and creating the dir themselves.
+export STATE_DIR="$TMP"
+export TASKS_DIR="$TMP/tasks"
+export TASKS_DB="$TASKS_DIR/tasks.db"
+mkdir -p "$TASKS_DIR"
 fails=0
 ok()   { printf 'ok   - %s\n' "$1"; }
 bad()  { printf 'FAIL - %s\n' "$1"; fails=$((fails+1)); }
