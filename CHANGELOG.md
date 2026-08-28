@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased — feat(liveness): `5dive liveness` — a seat is alive only against an artifact it WROTE (DIVE-3778)
+
+The **v0.23 headline capability**. The theme was ratified 2026-08-26 as "Liveness you cannot fake"
+(DIVE-3738); v0.23.0 shipped its substrate — courier-routed alarms (DIVE-3727) and the rung-4
+poller-dead restart (DIVE-3753) — and the detection primitive itself had no row until DIVE-3778.
+
+Every liveness read the fleet had answers a different question than the one asked: *is something
+present?* A unit is active, a `pgrep` matches, a tmux session exists, a pane holds the word
+`Rate-limited`, a `lastRunAt` column holds a value. All of them read **green** through the incidents
+the theme is named from — DIVE-3726/DIVE-3748 (a dead telegram poller behind every signal but the
+process table), DIVE-3723 (a seat at a login screen holding the only startable row on the board),
+DIVE-3711 (`memory consolidate` exiting 0 having written nothing), and the carrier main added at
+ratification: a seat that held four rows for three days on an expired quota while every liveness
+signal read healthy.
+
+- **`5dive liveness` derives the verdict from an EFFECT, never from presence.** A seat is `alive`
+  only against a timestamped artifact **it wrote**, and the output NAMES that artifact so the
+  operator can check the verdict by hand: `dev  alive  ledger: task.created @ 2026-08-28 01:17:02`.
+  Three sources, all seat-attributed and dated — the board (`started_at`/`done_at` on rows assigned
+  to it), the durable-action ledger (`lifecycle_events.actor`, INST-8), and the tamper-evident audit
+  log (whose rows are re-stamped server-side, so a seat cannot backdate its own).
+- **`updated_at` is deliberately not a source.** A third party editing the row bumps it, so
+  accepting it would let someone else's edit certify a dead seat — presence-by-proxy, one layer down.
+- **NOT-REACHED is a distinct third verdict and never folds into either neighbour** (the v0.16
+  "Fails loud" lineage). A probe that could not RUN tells you nothing: it must not read `alive` —
+  one unreadable store would otherwise certify the whole fleet in a single pass — and it must not
+  read `no-effect` either, because accusing a working seat because OUR probe broke is how an alarm
+  stops being read. `no-effect` is claimed only after a complete, successful, empty read.
+- **Positive evidence outranks a broken probe.** One readable source with a fresh artifact is proof
+  of life whatever the others did; the degradation is still recorded in `degraded[]` rather than
+  suppressing the effect.
+- **An unreadable ROSTER is itself a not-reached.** `registry_read()` collapses "no registry" onto
+  "no agents", which makes an all-green pass over zero seats the cheapest false green available — so
+  the checked read is used and the roster's own failure costs the exit code.
+- **Exit codes are the verdict:** 0 every seat alive, 4 some seat has no effect, 3 some seat was not
+  measured, 2 usage. Read-only, no root, no process table.
+
+Measured on this fleet at 02:14Z on a 180m window: **7 alive, 11 no-effect, 0 not-reached across 18
+seats** — eleven seats that had written nothing in three hours while every presence signal read green.
+
+Guard: `tests/liveness_effect_derived_unit.sh` (42 arms, 2.1s, core tier). Three mutations run in
+both directions — the third state folded UP into `alive`, folded DOWN into `no-effect`, and the
+freshness window removed — each asserted to have applied and to turn a *named* arm red while leaving
+the others green, so no arm's green is the fixture's doing.
+
 ## Unreleased — feat(supervisor): rung 4 — a poller-dead seat is restarted, once per 6h (DIVE-3753)
 
 On 2026-08-26 the supervisor printed `ESCALATE <seat> (poller-dead: rung-4-needed)` for `marketing`,
