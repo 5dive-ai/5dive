@@ -14,12 +14,18 @@ fixes**: each finding names the verb that clears it and runs none of them.
   open gate — the negation of DIVE-1357's block anchor, reachable on rows that predate it); `stale-edge`
   (blocked, and every blocker is closed); `wake-passed` (parked with a wake time already in the past);
   `park-no-wake` (parked with no wake time at all — a hold that never revisits). Plus `dead-lane`: the
-  assignee is not on the roster, **or is on it and the heartbeat tick will never wake it**.
+  assignee is not on the roster, **or is on it and nothing will ever wake it** — no `heartbeat.enabled`,
+  or `desiredState: "stopped"`, which the wake loop *does* iterate and then fails on every tick, forever.
 - **`dead-lane` is strictly wider than `orphans`, and that is the point.** The roster is the union of
   `agents.json` and the `agents_org` chart, but the wake loop iterates only
   `.agents | map(select(.value.heartbeat.enabled == true))`. A seat with no heartbeat key is registered,
   is never woken, and `orphans` calls it healthy. Measured on the host at ship time: 4 of 17 registered
   agents carry no heartbeat key, and `orphans` reported 1 undispatchable row where `doctor` reported 2.
+  An operator-stopped seat is reported, not treated as a registry error: the honest line is "these rows
+  are parked on a seat you turned off".
+- **No flags.** The first cut carried a `--quiet` that suppressed the census, and the census is the answer
+  to the question the row was filed on — a flag that hides it reproduces the 42h. An unknown flag is
+  refused rather than accepted and ignored.
 - **The remedy line is the payload, not decoration.** The filing symptom was `5dive task unblock DIVE-3614`
   printing `OK — DIVE-3614 unblocked` over a row that did not move: `unblock` drops **edges**, and the row
   was **parked**, which has none. So a success message and no state change, silent in both directions. Each

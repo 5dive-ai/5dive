@@ -13,7 +13,10 @@
 #   T2  stale-edge   blocked, every blocker closed                   -> found
 #   T3  wake-passed  parked, wake_at in the past                     -> found
 #   T4  park-no-wake parked, wake_at NULL                            -> found
-#   T5  dead-lane    assignee registered but heartbeat.enabled false -> found
+#   T5  dead-lane    assignee registered, heartbeat absent               -> found
+#   T5b dead-lane    assignee registered + heartbeat ON but desiredState=stopped -> found
+#                    (the OTHER half: the wake loop DOES iterate it and the wake
+#                     then fails every tick, forever — same outcome for the row)
 #   T6  NEGATIVES    a live gate, a live edge, a future park, a todo -> NOT found
 #   T7  the remedy line for a park says unpark and warns off unblock (the filed
 #       symptom: `unblock` on a parked row reports success and changes nothing)
@@ -54,7 +57,8 @@ mk_registry() {
   cat > "$TMP/agents.json" <<'JSON'
 {"agents":{
   "live":  {"type":"claude","heartbeat":{"enabled":true}},
-  "zombie":{"type":"claude"}
+  "zombie":{"type":"claude"},
+  "stopped":{"type":"claude","heartbeat":{"enabled":true},"desiredState":"stopped"}
 }}
 JSON
 }
@@ -94,6 +98,7 @@ t_nowake=$(addt --assignee=live -- "parked with no wake at all")
 db "UPDATE tasks SET wake_at=NULL WHERE id=${t_nowake};"
 
 t_dead=$(addt --assignee=zombie -- "assigned to a seat nothing wakes")
+t_stopped=$(addt --assignee=stopped -- "assigned to a seat the operator turned off")
 
 # negatives
 t_gate=$(addt --assignee=live -- "waiting on a human")
@@ -115,7 +120,7 @@ out=$(doctor)
 
 # ---- T1..T5: each class is found, with its OWN label -------------------------
 for pair in "$t_noanchor:no-anchor" "$t_stale:stale-edge" "$t_wakepast:wake-passed" \
-            "$t_nowake:park-no-wake" "$t_dead:dead-lane"; do
+            "$t_nowake:park-no-wake" "$t_dead:dead-lane" "$t_stopped:dead-lane"; do
   id="${pair%%:*}"; want="${pair##*:}"; i=$(ident "$id"); got=$(reason_of "$out" "$i")
   [[ "$got" == "$want" ]] \
     && ok_t "${want}: ${i} classified ${want}" \
@@ -136,8 +141,8 @@ done
 
 # ---- count is exactly the five --------------------------------------------
 nf=$(printf '%s' "$out" | jq -r '.data.findings')
-[[ "$nf" == "5" ]] && ok_t "findings count is exactly the 5 planted rows" \
-                   || bad_t "findings count" "wanted 5, got '${nf}' (rows: $(printf '%s' "$out" | jq -rc '[.data.rows[]?|{ident,reason}]'))"
+[[ "$nf" == "6" ]] && ok_t "findings count is exactly the 6 planted rows" \
+                   || bad_t "findings count" "wanted 6, got '${nf}' (rows: $(printf '%s' "$out" | jq -rc '[.data.rows[]?|{ident,reason}]'))"
 
 # ---- census counts the rest, and names what clears them ---------------------
 disp=$(printf '%s' "$out" | jq -r '.data.census.dispatchable')
@@ -189,6 +194,14 @@ grep -qi "lane check SKIPPED" "$TMP/err" \
   && ok_t "and SAYS the lane check was skipped rather than reporting every lane healthy" \
   || bad_t "skip is named" "$(cat "$TMP/err")"
 mv "$TMP/agents.json.away" "$TMP/agents.json"; reroster
+
+# ---- T10: an unknown flag is REFUSED, not accepted and ignored ---------------
+# The first cut carried a --quiet that was parsed and then had no effect. A flag
+# the verb accepts and does not honour is worse than one it rejects.
+( cmd_task_doctor --quiet ) >/dev/null 2>"$TMP/flag.err"; frc=$?
+{ [[ $frc -ne 0 ]] && grep -qi "unknown flag" "$TMP/flag.err"; } \
+  && ok_t "an unknown flag is refused rather than accepted and ignored" \
+  || bad_t "flag handling" "rc=$frc :: $(cat "$TMP/flag.err")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

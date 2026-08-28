@@ -34,10 +34,10 @@ _task_usage() {
                                                 is NOT the ident number
   orphans [--all]                               rows whose assignee/verifier/creator is not a
                                                 registered agent (undispatchable, DIVE-3344)
-  doctor [--quiet]                              every open row nothing will dispatch, and WHY —
+  doctor                                        every open row nothing will dispatch, and WHY —
                                                 no revisit anchor, a stale blocker edge, a park
-                                                past its wake or with none, or a seat the
-                                                heartbeat never wakes. Reports, never fixes; each
+                                                past its wake or with none, or a seat nothing
+                                                wakes. Reports, never fixes; each
                                                 finding names the verb that clears it (DIVE-3784)
   wip-cap-install [--relane=<lane>]             snapshot each lane's actionable count as its
                                                 frozen WIP ceiling (deliberate, once)

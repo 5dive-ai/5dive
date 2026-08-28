@@ -46,6 +46,14 @@
 # Measured 2026-08-28 on this host: 4 of 17 registered agents carry no heartbeat
 # key at all, and one of them held an open row.
 #
+# THE SECOND HALF: `desiredState`. An operator-stopped seat (`desiredState:
+# "stopped"`) IS iterated by the wake loop and the wake then FAILS — the tick logs
+# "wake failed — will retry next tick" and moves on, forever. That is a different
+# mechanism from the heartbeat key and the same outcome for the row, so it is the
+# same finding. It is deliberately NOT treated as a registry error: an operator
+# stopped that seat on purpose, and the honest report is "these rows are parked on
+# a seat you turned off", not "your registry is broken".
+#
 # Returns 2 (NOT 1) when the registry could not be read, so the caller can tell
 # "this seat is dead" from "I could not find out" and degrade instead of
 # reporting every lane as dead — the failure direction `orphans` refuses over.
@@ -54,9 +62,12 @@ _task_doctor_lane_wakeable() {
   [[ -n "$name" ]] || return 2
   reg="${STATE_DIR:-/var/lib/5dive}/agents.json"
   [[ -r "$reg" ]] || return 2
-  v=$(jq -r --arg n "$name" '.agents[$n].heartbeat.enabled // false' "$reg" 2>/dev/null) || return 2
+  # ONE jq read for both facts: an agent absent from the file yields "false|running",
+  # which is correctly not wakeable and needs no separate existence probe.
+  v=$(jq -r --arg n "$name" '((.agents[$n].heartbeat.enabled // false)|tostring) + "|" + (.agents[$n].desiredState // "running")' "$reg" 2>/dev/null) || return 2
   [[ -n "$v" ]] || return 2
-  [[ "$v" == "true" ]]
+  [[ "${v%%|*}" == "true" ]] || return 1
+  [[ "${v##*|}" != "stopped" ]]
 }
 
 # The four classes, as SQL predicates over open standard rows. Kept as one
@@ -121,19 +132,21 @@ _task_doctor_explain() {
     stale-edge)   printf '%s' "blocked by rows that are ALL closed — a stale edge the cascade missed. -> 5dive task unblock <id>" ;;
     wake-passed)  printf '%s' "parked, and its wake time has already passed — the heartbeat TTL pass should have unparked it. -> 5dive task unpark <id>  (NOT unblock: unblock only drops edges, and a park has none, so it reports success and changes nothing)" ;;
     park-no-wake) printf '%s' "parked with NO wake time — it will never revisit itself. -> 5dive task unpark <id>, or re-park with a --wake" ;;
-    dead-lane)    printf '%s' "assigned to a seat the heartbeat never wakes — nothing will pick it up. -> 5dive task assign <id> <agent>   (roster: 5dive agent list)" ;;
+    dead-lane)    printf '%s' "assigned to a seat nothing wakes (no heartbeat, or operator-stopped) — nothing will pick it up. -> 5dive task assign <id> <agent>   (roster: 5dive agent list)" ;;
     *)            printf '%s' "undispatchable" ;;
   esac
 }
 
 cmd_task_doctor() {
   tasks_db_init
-  local json_rows="" quiet=""
+  # NO FLAGS, deliberately. The first cut carried a --quiet that suppressed the
+  # census, and the census is the answer to the question the row was filed on
+  # ("31 open, 1 dispatchable") — a flag that hides it is a flag that reproduces
+  # the 42h. It was also accepted and then ignored, which is worse than absent.
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --quiet) quiet=1 ;;   # findings only: skip the census when the board is healthy
-      -*) fail "$E_USAGE" "unknown flag: $1 (usage: 5dive task doctor [--quiet])" ;;
-      *)  fail "$E_USAGE" "unexpected argument '$1' (usage: 5dive task doctor [--quiet])" ;;
+      -*) fail "$E_USAGE" "unknown flag: $1 (usage: 5dive task doctor)" ;;
+      *)  fail "$E_USAGE" "unexpected argument '$1' (usage: 5dive task doctor)" ;;
     esac
     shift
   done
@@ -223,7 +236,7 @@ cmd_task_doctor() {
   [[ -z "$lane_note" ]] || warn "$lane_note"
 
   if [[ "${n:-0}" == "0" ]]; then
-    ok "no undispatchable rows — every open row has a live revisit anchor and a wakeable assignee${quiet:+}
+    ok "no undispatchable rows — every open row has a live revisit anchor and a wakeable assignee
   ${census_line}" "$payload" "${jargs[@]}"
     return 0
   fi
