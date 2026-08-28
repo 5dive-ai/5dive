@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased — feat(task): `5dive task doctor` — every open row nothing will dispatch, and why (DIVE-3784)
+
+On 2026-08-28 05:00Z the board read **31 open rows** and `5dive-ai/5dive` main had not moved in **~42h**
+(`5816e7a` / `v0.23.0`, since 2026-08-26 10:23Z). Of the 31: 30 `blocked`, exactly **1 `todo`**. A reader
+of `task ls` sees a busy fleet; the dispatcher sees an idle one, and nothing said which was true.
+
+`task orphans` (DIVE-3344) already answered ONE of the four ways a row goes undispatchable — the name in
+`assignee` is not a registered agent. `doctor` is that idea widened to the rest, and it **reports, never
+fixes**: each finding names the verb that clears it and runs none of them.
+
+- **Four classes, four different predicates.** `no-anchor` (blocked with no dependency edge, no park, no
+  open gate — the negation of DIVE-1357's block anchor, reachable on rows that predate it); `stale-edge`
+  (blocked, and every blocker is closed); `wake-passed` (parked with a wake time already in the past);
+  `park-no-wake` (parked with no wake time at all — a hold that never revisits). Plus `dead-lane`: the
+  assignee is not on the roster, **or is on it and the heartbeat tick will never wake it**.
+- **`dead-lane` is strictly wider than `orphans`, and that is the point.** The roster is the union of
+  `agents.json` and the `agents_org` chart, but the wake loop iterates only
+  `.agents | map(select(.value.heartbeat.enabled == true))`. A seat with no heartbeat key is registered,
+  is never woken, and `orphans` calls it healthy. Measured on the host at ship time: 4 of 17 registered
+  agents carry no heartbeat key, and `orphans` reported 1 undispatchable row where `doctor` reported 2.
+- **The remedy line is the payload, not decoration.** The filing symptom was `5dive task unblock DIVE-3614`
+  printing `OK — DIVE-3614 unblocked` over a row that did not move: `unblock` drops **edges**, and the row
+  was **parked**, which has none. So a success message and no state change, silent in both directions. Each
+  class names its own verb, and the park classes say explicitly why `unblock` no-ops there.
+- **It degrades where `orphans` refuses.** `orphans` refuses outright with no readable roster — correctly,
+  since every name would then look orphaned. Three of `doctor`'s four classes are pure board SQL, so an
+  unreadable registry drops only the lane check, names the skip, and still reports the rest.
+- **A census on every run**, findings or not: open / dispatchable now / in progress / parked (with the next
+  wake) / awaiting a human gate / behind a live blocker. A clean run that printed only "no findings" over a
+  board 30-deep in holds would reproduce the 42h it was filed on.
+
+Complements the heartbeat's `_hb_blocked_sweep` (DIVE-1355) rather than replacing it: that pings `ops` over
+a2a at most once per 24h and covers two of these four classes. A throttled push to one seat's inbox is a
+different job from an operator looking at a stalled board now.
+
 ## Unreleased — feat(supervisor): rung 4 — a poller-dead seat is restarted, once per 6h (DIVE-3753)
 
 On 2026-08-26 the supervisor printed `ESCALATE <seat> (poller-dead: rung-4-needed)` for `marketing`,
