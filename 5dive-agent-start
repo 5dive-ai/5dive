@@ -1772,10 +1772,14 @@ coldstart_kick_submit() { # <session> <label>
   return 1
 }
 
-# grok cold-start kickoff (telegram only). Unlike codex (whose MCP server boots
-# with the process), grok lazy-loads its telegram MCP server only once a chat
-# session starts — until then it sits at the home-screen launcher (New worktree
-# / Resume session / Quit) and never receives Telegram messages. On the nightly
+# grok cold-start kickoff (telegram only). grok lazy-loads its telegram MCP server
+# only once a chat session starts — until then it sits at the home-screen launcher
+# (New worktree / Resume session / Quit) and never receives Telegram messages.
+# (This comment used to open by contrasting grok with codex, on the reasoning that
+# codex's MCP server boots with the process. It does — and that never made codex
+# reachable, because the listen loop needs the MODEL to call wait_for_message. That
+# sentence is why codex went 2h40m deaf on a customer box; codex has its own kick
+# below. DIVE-3792.) On the nightly
 # unit restart this left grok dead until a human typed into it. So we mirror the
 # codex trust-accepter above: watch the pane during the boot window, and once the
 # launcher is showing, type a one-line kickoff to start a session. That loads the
@@ -1823,9 +1827,9 @@ fi
 
 # codex cold-start kickoff (telegram only). DIVE-3792.
 #
-# codex was the ONE fork with no cold-start kick, and the comment on grok's
-# branch above says why: "Unlike codex (whose MCP server boots with the
-# process)". That is true and it is not sufficient. Booting the MCP server is
+# codex was the ONE fork with no cold-start kick, and grok's comment above USED to
+# say why: codex's MCP server boots with the process, so it needs no kick. The
+# first half is true and the second does not follow. Booting the MCP server is
 # not the same as the MODEL calling the tool — the listen loop only exists once
 # codex issues wait_for_message, and on a cold start nothing prompts it to. agy
 # is the same class and already has a kick for exactly this reason ("agy's

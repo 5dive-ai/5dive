@@ -79,7 +79,14 @@ echo "== 2. STATIC POSITIVE: the corrected instruction is present =="
 if grep -qF 'END YOUR TURN' "$START"; then ok "cold-start kick says END YOUR TURN"
 else no "cold-start kick says END YOUR TURN"; fi
 
-echo "== 3. STRUCTURAL: both kick blocks submit through the verifier =="
+# The reasoning error is the bug. codex was excluded from the kick because a comment
+# asserted its MCP server booting with the process made it reachable; it does not, and
+# a revert of that comment is a revert of the fix's rationale. DIVE-3792.
+if grep -qF 'Unlike codex (whose MCP server boots' "$START"; then
+  no "no comment still claims codex needs no kick because its MCP server boots"
+else ok "no comment still claims codex needs no kick because its MCP server boots"; fi
+
+echo "== 3. STRUCTURAL: all three kick blocks submit through the verifier =="
 # The verified send is worthless if a call site still fires Enter itself. Read
 # the three kick blocks only, so an unrelated Enter elsewhere in the script (the
 # claude resume prompt, the codex trust-accepter) is not miscounted.
@@ -90,6 +97,17 @@ echo "== 3. STRUCTURAL: both kick blocks submit through the verifier =="
 # each block must carry ITS OWN ready marker, or a copy-pasted grok marker in the
 # codex block would pass this arm while never matching a real codex pane.
 declare -A _READY=( [grok]='Resume session' [antigravity]='for shortcuts' [codex]='>_ OpenAI Codex (v' )
+# A block's GUARDS are graded per block too, because they are per block. DIVE-3792
+# iteration 1 shipped codex's two guards UNGRADED: deleting either left the harness
+# at 75/0, so a refactor could drop one silently and re-open the double-submit and
+# type-into-the-dialog paths the row was filed to close. One `<regex>|<what it is>`
+# per line; a block with no required guards declares none and this loop skips it.
+declare -A _MUST=(
+  [grok]=""
+  [antigravity]=""
+  [codex]="grep -q .wait_for_message.;[[:space:]]*then[[:space:]]*break|does not type when the pane already shows wait_for_message (the plugin's inbound kick won the race)
+grep -q .Hooks need review.;[[:space:]]*then[[:space:]]*continue|does not type while the first-run Hooks-need-review dialog is up"
+)
 for _blk in grok antigravity codex; do
   _pat='^if \[\[ "\$TYPE" == "'"${_blk}"'" && "\$CHANNELS" == "telegram" \]\]; then$'
   _hits="$(grep -cE "$_pat" "$START")"
@@ -107,6 +125,11 @@ for _blk in grok antigravity codex; do
   if grep -qE 'send-keys[^|]*Enter' <<<"$_body"; then
     no "$_blk kick fires no bare Enter of its own"
   else ok "$_blk kick fires no bare Enter of its own"; fi
+  while IFS='|' read -r _gpat _gdesc; do
+    [[ -n "$_gpat" ]] || continue
+    if grep -qE "$_gpat" <<<"$_body"; then ok "$_blk kick $_gdesc"
+    else no "$_blk kick $_gdesc"; fi
+  done <<<"${_MUST[$_blk]}"
 done
 # One text, one definition — the duplicate is how the banned phrasing survived in
 # both blocks.
