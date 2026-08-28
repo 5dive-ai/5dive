@@ -594,6 +594,7 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
 cmd_task_ls() {
   tasks_db_init
   local status="" assignee="" mine=0 all=0 from="" recurring=0 project="" no_body=0
+  local gated=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --status=*)   status="${1#*=}" ;;
@@ -602,6 +603,17 @@ cmd_task_ls() {
       --mine)       mine=1 ;;
       --all)        all=1 ;;
       --recurring)  recurring=1 ;;
+      # DIVE-3785: filter the board to rows that are holding a gate. THE SCOPE
+      # QUESTION, decided here rather than left to the reader: `task inbox` lists
+      # gates awaiting a HUMAN, and a marker on `ls` is most useful when it also
+      # marks rows parked on an agent seat — two surfaces disagreeing about which
+      # rows are "gated" would be worse than one. So `--gated` is the SUPERSET
+      # (any live gate), `--gated=human` is EXACTLY the inbox predicate, and
+      # `--gated=agent` is the complement. All three are built from the same two
+      # single-source helpers `inbox` itself calls, so agreement is structural and
+      # not a thing anyone has to keep true.
+      --gated)      gated="any" ;;
+      --gated=*)    gated="${1#*=}" ;;
       --from=*)     from="${1#*=}" ;;
       # DIVE-3388: the JSON contract is read by agents, not humans, and `ls`
       # SELECTs every row's full body+result — a single `task ls --json` on a
@@ -645,6 +657,28 @@ cmd_task_ls() {
   [[ -n "$assignee" ]] && where+=" AND assignee=$(sqlq "$assignee")"
   # DIVE-484: scope to one project by key (case-insensitive).
   [[ -n "$project" ]] && where+=" AND project_key=$(sqlq "${project,,}")"
+  # DIVE-3267/DIVE-3785: ONE evaluation of the gate rule, at function scope, used
+  # by the --gated filter, the human gate column and the --json booleans alike.
+  # Declared here rather than inside the JSON branch (where it used to live)
+  # because the human branch now needs it too, and a second copy in that branch
+  # is precisely the failure the helpers' contract exists to prevent.
+  local _gate_open _gate_human
+  _gate_open=$(_task_gate_open_pred); _gate_human=$(_task_human_gate_pred)
+  if [[ -n "$gated" ]]; then
+    (( recurring )) && fail "$E_USAGE" "--gated does not apply to --recurring (a template holds no gate; its INSTANCES do)"
+    case "$gated" in
+      any)   where+=" AND ( ${_gate_open} )" ;;
+      human) where+=" AND ( ${_gate_open} ) AND ( ${_gate_human} )" ;;
+      agent) where+=" AND ( ${_gate_open} ) AND NOT ( ${_gate_human} )" ;;
+      *)     fail "$E_VALIDATION" "bad --gated value '$gated' (any|human|agent; bare --gated means any)" ;;
+    esac
+    # A gate on a done/cancelled row is not live by the predicate above, so the
+    # default open-queue filter is not what makes this correct — but --status=done
+    # plus --gated would otherwise read as a supported combination that always
+    # returns nothing. Say so instead of returning a silent empty board.
+    [[ "$status" == "done" || "$status" == "cancelled" ]] && \
+      fail "$E_USAGE" "--gated and --status=$status are mutually exclusive: closing a row retires its gate, so no closed row has a live one (try '5dive task gate-history <id>')"
+  fi
   if (( JSON_MODE )); then
     local rows
     # DIVE-3267: `needs_human` is the CLI's own verdict — "this gate is waiting on a
@@ -654,8 +688,6 @@ cmd_task_ls() {
     # NOT a second call to `task inbox --json`: two calls are two snapshots with a
     # window between them, and a gate answered in that window lands a row in neither
     # section or in both. One query, one evaluation, one truth.
-    local _gate_open _gate_human
-    _gate_open=$(_task_gate_open_pred); _gate_human=$(_task_human_gate_pred)
     # DIVE-583: emit project_key natively so the dashboard keys off a real field
     # (join name/prefix/lead from `project ls`) instead of deriving project from
     # the ident prefix client-side (fragile; couples to naming + the id≠ident bug).
@@ -730,6 +762,12 @@ cmd_task_ls() {
     # no pointer?"  Show the column whenever closed rows were requested, and
     # render the missing value explicitly instead of turning it into another
     # invisible blank.  The default open queue stays compact.
+    # DIVE-3785: the gate column, ALWAYS present on the human board (`-` is a
+    # real value). Conditional columns were considered and rejected — a listing
+    # whose shape changes with its data is the same class of defect as the
+    # gate-history key set fixed in this row: the reader cannot tell "no gated
+    # rows" from "this view does not report gates".
+    local _gate_cell; _gate_cell=$(_task_gate_cell_sql)
     if [[ "$status" == "done" || $all -eq 1 ]]; then
       # DIVE-3098: the audit view renders graded-and-waiting the same way as the
       # compact one. Two branches, one predicate — if only the default view knew,
@@ -739,6 +777,7 @@ cmd_task_ls() {
              CASE WHEN ${_TASKS_TFV_SQL}
                   THEN 'graded->merge:'||COALESCE(NULLIF(maker_agent,''), COALESCE(assignee,'?'))
                   ELSE status END AS status,
+             ${_gate_cell} AS gate,
              priority, COALESCE(assignee,'-') AS assignee, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, title FROM tasks WHERE ${where} ${order};"
     else
       # DIVE-3098: a graded-and-waiting row must not read as todo/blocked/in_progress
@@ -749,6 +788,7 @@ cmd_task_ls() {
              CASE WHEN ${_TASKS_TFV_SQL}
                   THEN 'graded->merge:'||COALESCE(NULLIF(maker_agent,''), COALESCE(assignee,'?'))
                   ELSE status END AS status,
+             ${_gate_cell} AS gate,
              priority, COALESCE(assignee,'-') AS assignee, title FROM tasks WHERE ${where} ${order};"
     fi
     # DIVE-3366 acceptance 3: the skew belongs ON THE BOARD, under the queue,
@@ -791,9 +831,15 @@ cmd_task_show() {
     # same query as the row, so the two surfaces cannot disagree.
     local _gate_open _gate_human
     _gate_open=$(_task_gate_open_pred); _gate_human=$(_task_human_gate_pred)
+    # DIVE-3785: `gate` carries the states the two booleans cannot — an answered
+    # gate, and an answered gate whose CARD was retired by park (which clears the
+    # live need_* columns, so a machine reader sees a row that looks ungated and
+    # gate_live=0 is a true but useless answer). One string, same helper the human
+    # header uses, so the two renders cannot diverge.
     task=$(dbfmt -json "SELECT *,
              CASE WHEN ${_gate_open} THEN 1 ELSE 0 END AS gate_live,
-             CASE WHEN ${_gate_open} AND ( ${_gate_human} ) THEN 1 ELSE 0 END AS needs_human
+             CASE WHEN ${_gate_open} AND ( ${_gate_human} ) THEN 1 ELSE 0 END AS needs_human,
+             $(_task_gate_header_sql) AS gate
            FROM tasks WHERE id=${id};")
     subs=$(dbfmt -json "SELECT id,ident,title,status FROM tasks WHERE parent_id=${id} ORDER BY id;")
     deps=$(dbfmt -json "SELECT t.id,t.ident,t.title,t.status FROM task_deps d JOIN tasks t ON t.id=d.blocked_by WHERE d.task_id=${id} ORDER BY t.id;")
@@ -810,6 +856,17 @@ cmd_task_show() {
         '{ok:true, data:{task:($t[0]), subtasks:$s, blocked_by:$b, previous_gates:$g}}'
     fi
   else
+    # DIVE-3785: gate state sits IMMEDIATELY AFTER `status`, because `status`
+    # alone cannot answer the question the board is most often asked — "what is
+    # waiting on a person". `blocked` is printed identically whether a human owes
+    # an answer, an agent seat owes one, or nothing is owed at all, and the only
+    # place that distinction lived was the `human gate:` block at the TAIL of this
+    # record, below the body. Two costly misreads came out of that in one week,
+    # one in each direction (see _task_gate_header_sql). The tail block still
+    # carries the full ask; this line is what makes it unmissable, and it is the
+    # ONLY place an answered-then-parked gate is visible at all, since park clears
+    # the live columns and the tail block then renders nothing.
+    local _gate_hdr; _gate_hdr=$(_task_gate_header_sql)
     # DIVE-2316: delivery_ref is an enforcement input, so omission here made a
     # missing binding indistinguishable from a presenter that never read it.
     # Keep the field present in both states; "absent" is the observable value.
@@ -818,9 +875,9 @@ cmd_task_show() {
     # "never started" FROM THE BOARD ALONE. A fix that records the first start but
     # does not surface it here does not satisfy that.
     if (( no_body )); then
-      dbfmt -line "SELECT ident, title, status, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref FROM tasks WHERE id=${id};"
+      dbfmt -line "SELECT ident, title, status, ${_gate_hdr} AS gate, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref FROM tasks WHERE id=${id};"
     else
-      dbfmt -line "SELECT ident, title, status, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, body, result FROM tasks WHERE id=${id};"
+      dbfmt -line "SELECT ident, title, status, ${_gate_hdr} AS gate, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, body, result FROM tasks WHERE id=${id};"
     fi
     # DIVE-1064: surface the creator's isolation tier (read-time from the
     # registry, no schema change) so a reader/agent can down-trust a task filed
@@ -1011,6 +1068,30 @@ cmd_task_gate_history() {
           retired_by, retired_at
         FROM gate_history WHERE task_id=${id} ORDER BY id;")
     [[ -n "$rows" ]] || rows="[]"
+    # DIVE-3785: A STABLE KEY SET, and it is a correctness fix, not tidiness.
+    # dbfmt's -json path drops null-valued keys fleet-wide (DIVE-1610) on the
+    # premise that "a missing key reads back as null, so keys stay stable". That
+    # holds for `.need_answer`; it does NOT hold for the key SET, which is how a
+    # reader tells a field that is absent from a field that is empty. Here the
+    # shape varies with the DATA: an unanswered gate omits need_answer /
+    # need_answered_at / need_answered_by entirely, so a parser asking for the
+    # wrong key and a parser asking the right key about a never-answered gate get
+    # the identical `None`. That cost a real accusation on 2026-08-28 — nine gates
+    # were read as never-answered and a verifier was told its authorisation was
+    # fabricated. It was signed; the reader's key was wrong.
+    #
+    # Two changes. (1) Every answer field is present-and-null. (2) `answered` is
+    # an explicit boolean, so the question "was this gate ever answered" has an
+    # answer that does not depend on the caller guessing a column name. The
+    # defaults are merged UNDER the row, so a real value always wins. Scoped to
+    # this projection deliberately: reversing DIVE-1610 globally would re-inflate
+    # every heartbeat and objective tick, which is a different trade.
+    rows=$(printf '%s' "$rows" | jq -c 'map({
+        id:null, ident:null, need_type:null, ask:null, need_options:null,
+        recommend:null, tier:null, need_asked_at:null, gate_mode:null,
+        need_answer:null, need_answered_at:null, need_answered_by:null,
+        need_answered_uid:null, answer_attested:null, retired_by:null, retired_at:null
+      } + . | . + {answered: (.need_answered_at != null)})')
     jq -cn --arg id "$ident" --argjson s "$summary" --argjson rows "$rows" \
       '{ok:true, data:{ident:$id, summary:$s, gates:$rows}}'
     return
