@@ -13,6 +13,10 @@
 #     single call site, and here the sites fail differently (a before-capture
 #     fails safe, an after-capture fails SILENT). See 4d..4d4, and 4g/4h for the
 #     same sweep over the other injectable site, the Enter send.
+#     Sections 5a/5b do the same for the OTHER reported fault, the kick that is
+#     never TYPED (DIVE-3793), and 5c/5d/5e drive the three real BLOCK LOOPS —
+#     because a warn that exists in a function but is never reached from the loop
+#     is the silent failure with extra steps. 5f is the false-alarm control.
 #   STATIC — the DIVE-1180 recursive-loop ban, ported to this repo.
 #     test/rearm-loop-regression.test.ts in 5dive-ai/5dive-plugins bans the same
 #     three patterns, but it reads `plugins/<fork>/` and CANNOT see this repo.
@@ -102,10 +106,25 @@ declare -A _READY=( [grok]='Resume session' [antigravity]='for shortcuts' [codex
 # at 75/0, so a refactor could drop one silently and re-open the double-submit and
 # type-into-the-dialog paths the row was filed to close. One `<regex>|<what it is>`
 # per line; a block with no required guards declares none and this loop skips it.
+#
+# DIVE-3793 added a third required guard to EVERY block: loop exhaustion must be
+# REPORTED, not fallen through. Three lines per block, because three separate
+# mutants live here — delete the warn call and the exhausted window goes silent
+# again; delete the kicked marker and every HEALTHY boot cries wolf; delete the
+# pane marker and an unreadable pane is reported as an absent marker, sending the
+# reader to look at a fork that was probably fine.
+_EXHAUST="coldstart_kick_never_typed|reports the exhausted window instead of falling through it
+_kick_state=kicked|records that the kick WAS typed, so a landed kick does not also warn
+_kick_state=pane|separates an unreadable pane from an absent marker"
 declare -A _MUST=(
-  [grok]=""
-  [antigravity]=""
-  [codex]="grep -q .wait_for_message.;[[:space:]]*then[[:space:]]*break|does not type when the pane already shows wait_for_message (the plugin's inbound kick won the race)
+  [grok]="$_EXHAUST"
+  [antigravity]="$_EXHAUST"
+  # The wait_for_message guard's `then` now records the already-listening state
+  # before it breaks, so this pattern must not pin `break` to the next token —
+  # it would red on the very change that made the state reachable.
+  [codex]="$_EXHAUST
+grep -q .wait_for_message.;[[:space:]]*then.*break|does not type when the pane already shows wait_for_message (the plugin's inbound kick won the race)
+_kick_state=listening|treats an already-listening pane as a success, not as a never-typed fault
 grep -q .Hooks need review.;[[:space:]]*then[[:space:]]*continue|does not type while the first-run Hooks-need-review dialog is up"
 )
 for _blk in grok antigravity codex; do
@@ -147,11 +166,13 @@ harness() {
     sed -n '/^_coldstart_capture_pane()/,/^}/p'                                "$START"
     sed -n '/^_coldstart_submit_once()/,/^}/p'                                 "$START"
     sed -n '/^coldstart_kick_submit()/,/^}/p'                                  "$START"
+    sed -n '/^coldstart_kick_never_typed()/,/^}/p'                             "$START"
   } | sed 's#/usr/bin/tmux#tmux#g'
 }
 _loaded="$(harness)"
 for _fn in coldstart_kick_submit _coldstart_submit_once _coldstart_capture_pane \
-           coldstart_kick_breadcrumb_path coldstart_kick_ok; do
+           coldstart_kick_breadcrumb_path coldstart_kick_ok \
+           coldstart_kick_never_typed; do
   grep -q "^${_fn}()" <<<"$_loaded" || no "harness extracted $_fn"
 done
 grep -q 'COLDSTART_KICK_TEXT=' <<<"$_loaded" || no "harness extracted COLDSTART_KICK_TEXT"
@@ -331,6 +352,142 @@ printf 'composer: kick text\nturn started\n' > "$TD/p-healed"
 r="$(run_case healed "$TD/p-healed" 0 0)"
 is "4f healed boot returns 0"          "$r"              "RC=0"
 is "4f healed boot clears the breadcrumb" "$(bc_of healed)" ""
+
+echo "== 5. BEHAVIOURAL: the exhausted window reports itself (DIVE-3793) =="
+# 5a/5b grade the reporter. 5c..5f grade the WIRING, by running the real block
+# loops — the fault being fixed is a code path nobody reached, so a test that
+# only calls the function directly would pass on a source where no block calls it.
+
+# 5a. Marker never appeared.
+NT="$TD/nt-marker"; mkdir -p "$NT"
+( set -uo pipefail; HOME="$NT"; export HOME
+  eval "$_loaded"; coldstart_kick_never_typed grok marker; echo "RC=$?" ) >"$NT/out" 2>"$NT/err"
+is "5a never-typed returns 1"          "$(cat "$NT/out")"  "RC=1"
+if grep -q 'NEVER APPEARED' "$NT/.5dive-coldstart-kick-failed"; then
+  ok "5a breadcrumb says the marker never appeared"
+else no "5a breadcrumb says the marker never appeared (got '$(cat "$NT/.5dive-coldstart-kick-failed" 2>/dev/null)')"; fi
+if grep -q 'NOT listening on Telegram' "$NT/.5dive-coldstart-kick-failed"; then
+  ok "5a breadcrumb names the real state"
+else no "5a breadcrumb names the real state"; fi
+if grep -q 'NEVER TYPED' "$NT/err"; then ok "5a warns on stderr"
+else no "5a warns on stderr (got '$(cat "$NT/err")')"; fi
+# THE DISTINCTNESS ARM. Both faults park the agent, and a reader holding one
+# breadcrumb must be able to tell which fault produced it. Assert it in BOTH
+# directions against 4b's real submit-failure breadcrumb: a copy-pasted message
+# would satisfy one direction and fail the other.
+if grep -q 'NEVER OBSERVED' "$NT/.5dive-coldstart-kick-failed"; then
+  no "5a never-typed text is distinct from the submit-failure text"
+elif grep -q 'NEVER TYPED' <<<"$(bc_of wedged)"; then
+  no "5a submit-failure text is distinct from the never-typed text"
+else ok "5a the two faults are worded apart in both directions"; fi
+
+# 5b. Pane unreadable — a DIFFERENT fault from an absent marker, and the message
+# must not claim the marker was missing when we never got to look.
+NP="$TD/nt-pane"; mkdir -p "$NP"
+( set -uo pipefail; HOME="$NP"; export HOME
+  eval "$_loaded"; coldstart_kick_never_typed codex pane; echo "RC=$?" ) >"$NP/out" 2>"$NP/err"
+is "5b unreadable pane returns 1"      "$(cat "$NP/out")"  "RC=1"
+if grep -q 'could not READ' "$NP/.5dive-coldstart-kick-failed"; then
+  ok "5b breadcrumb names the unreadable pane"
+else no "5b breadcrumb names the unreadable pane (got '$(cat "$NP/.5dive-coldstart-kick-failed" 2>/dev/null)')"; fi
+if grep -q 'NEVER APPEARED' "$NP/.5dive-coldstart-kick-failed"; then
+  no "5b does NOT claim the marker was absent when the capture failed"
+else ok "5b does NOT claim the marker was absent when the capture failed"; fi
+
+# ── the block loops, for real ───────────────────────────────────────────────
+# Extract a kick block by its UNIQUE `if` line (same locator section 3 asserts
+# unique) and run it with the tmux/sleep stubs. The block backgrounds its own
+# subshell, so `wait` is what makes the assertion possible at all.
+block_of() { # <blk>
+  local _pat='^if \[\[ "\$TYPE" == "'"$1"'" && "\$CHANNELS" == "telegram" \]\]; then$' _ln
+  _ln="$(grep -nE "$_pat" "$START" | cut -d: -f1)"
+  [[ -n "$_ln" ]] || { echo "echo BLOCK-NOT-FOUND >&2; exit 9"; return; }
+  sed -n "${_ln},\$p" "$START" | awk 'NR>1 && /^fi$/{print;exit}{print}' \
+    | sed 's#/usr/bin/tmux#tmux#g'
+}
+run_block() { # <name> <blk> <panes-file> <fail_capture_at|0>
+  local box="$TD/blk-$1"; mkdir -p "$box"
+  PANE_SCRIPT="$3" FAIL_CAPTURE_AT="$4" BOX="$box" _BTYPE="$2" \
+  bash -c '
+    set -uo pipefail
+    HOME="$BOX"; export HOME
+    TYPE="$_BTYPE"; CHANNELS=telegram; SESSION=agent-x
+    printf 0 > "$BOX/n"; printf 0 > "$BOX/e"
+    sleep(){ :; }
+    tmux(){
+      local n
+      case " $* " in
+        *" capture-pane "*)
+          n=$(( $(cat "$BOX/n") + 1 )); printf %s "$n" > "$BOX/n"
+          [[ "$FAIL_CAPTURE_AT" != 0 && "$n" == "$FAIL_CAPTURE_AT" ]] && return 1
+          sed -n "${n}p" "$PANE_SCRIPT"; return 0 ;;
+        *" -l "*) printf "TYPE\n" >> "$BOX/sent"; return 0 ;;
+        *" Enter "*|*" Enter") printf "ENTER\n" >> "$BOX/sent"; return 0 ;;
+      esac
+      return 0
+    }
+    '"$_loaded"'
+    '"$(block_of "$2")"'
+    wait
+  ' 2>"$box/err"
+}
+berr(){ cat "$TD/blk-$1/err" 2>/dev/null || true; }
+bbc(){ cat "$TD/blk-$1/.5dive-coldstart-kick-failed" 2>/dev/null || true; }
+bsent(){ local n; n="$(grep -c "^$2$" "$TD/blk-$1/sent" 2>/dev/null)"; printf %s "${n:-0}"; }
+
+# 5c. THE DEFECT, per block: the ready marker never shows for the whole window.
+# Pre-fix every one of these arms is silent — empty stderr, no breadcrumb.
+printf 'booting, no marker here\n' > "$TD/p-nomarker"
+for _blk in grok antigravity codex; do
+  run_block "ex-$_blk" "$_blk" "$TD/p-nomarker" 0
+  if grep -q 'NEVER TYPED' <<<"$(berr "ex-$_blk")"; then
+    ok "5c $_blk exhausted window warns on stderr"
+  else no "5c $_blk exhausted window warns on stderr (got '$(berr "ex-$_blk")')"; fi
+  if grep -q 'NEVER APPEARED' <<<"$(bbc "ex-$_blk")"; then
+    ok "5c $_blk exhausted window leaves a breadcrumb naming the absent marker"
+  else no "5c $_blk exhausted window leaves a breadcrumb naming the absent marker (got '$(bbc "ex-$_blk")')"; fi
+  is "5c $_blk typed nothing"  "$(bsent "ex-$_blk" TYPE)"  "0"
+done
+
+# 5d. Capture fails on the first poll: the loop breaks MID-window and lands in
+# the same arm. It must report the blindness, NOT an absent marker.
+for _blk in grok antigravity codex; do
+  run_block "cap-$_blk" "$_blk" "$TD/p-nomarker" 1
+  if grep -q 'could not READ' <<<"$(bbc "cap-$_blk")"; then
+    ok "5d $_blk unreadable pane is reported as unreadable"
+  else no "5d $_blk unreadable pane is reported as unreadable (got '$(bbc "cap-$_blk")')"; fi
+  if grep -q 'NEVER APPEARED' <<<"$(bbc "cap-$_blk")"; then
+    no "5d $_blk does not blame the marker for a failed capture"
+  else ok "5d $_blk does not blame the marker for a failed capture"; fi
+done
+
+# 5e. FALSE-ALARM CONTROL, per block: the marker DOES show and the submit lands.
+# The kick must fire and NOTHING must claim it was never typed. A `case` whose
+# healthy arm was dropped reds here and only here.
+# One pane per capture call, so each fork's ready markers must share ONE line —
+# codex needs the splash AND the composer caret in the same pane, and on a real
+# box they are two rows of the same capture.
+printf 'Resume session\ncomposer\nturn started\n'                    > "$TD/p-ok-grok"
+printf '? for shortcuts\ncomposer\nturn started\n'                   > "$TD/p-ok-antigravity"
+printf '>_ OpenAI Codex (v0.150.1) ›\ncomposer\nturn started\n' > "$TD/p-ok-codex"
+for _blk in grok antigravity codex; do
+  run_block "ok-$_blk" "$_blk" "$TD/p-ok-$_blk" 0
+  is "5e $_blk healthy boot types the kick once" "$(bsent "ok-$_blk" TYPE)" "1"
+  if grep -q 'NEVER TYPED' <<<"$(berr "ok-$_blk")"; then
+    no "5e $_blk healthy boot does NOT warn never-typed"
+  else ok "5e $_blk healthy boot does NOT warn never-typed"; fi
+  is "5e $_blk healthy boot leaves no breadcrumb" "$(bbc "ok-$_blk")" ""
+done
+
+# 5f. codex only: the plugin's inbound kick already armed the listen loop. That
+# is a success reached by a DIFFERENT break, and it must not report a fault.
+printf 'wait_for_message\n' > "$TD/p-listening"
+run_block listening codex "$TD/p-listening" 0
+is "5f codex already-listening pane types nothing" "$(bsent listening TYPE)" "0"
+if grep -q 'NEVER TYPED' <<<"$(berr listening)"; then
+  no "5f codex already-listening pane does NOT warn never-typed"
+else ok "5f codex already-listening pane does NOT warn never-typed"; fi
+is "5f codex already-listening pane leaves no breadcrumb" "$(bbc listening)" ""
 
 printf '\n%s: pass=%d fail=%d\n' "$(basename "$0")" "$pass" "$fail"
 [[ "$fail" == 0 ]]

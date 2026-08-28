@@ -1772,6 +1772,36 @@ coldstart_kick_submit() { # <session> <label>
   return 1
 }
 
+# The OTHER half of the same invisible failure: the kick that is never TYPED at
+# all. Each block below polls a bounded window for its fork's ready marker and
+# single-fires. Before DIVE-3793 the window RUNNING OUT was silent — no warn, no
+# breadcrumb, no journal line — the exact shape of the outage DIVE-3792 was filed
+# for: parked at a prompt, deaf on Telegram, every health signal green.
+#
+# Worded APART from the submit-failure text above ON PURPOSE. "Typed but never
+# sent" is a wedged TUI that swallowed an Enter; "never typed at all" is a fork
+# that never reached its ready state — most often an unauthenticated login screen
+# or a boot slower than the window. Different faults, different next steps, and
+# whoever is holding one of these breadcrumbs must be able to tell which they
+# have. The two never share a phrase.
+coldstart_kick_never_typed() { # <label> <why: marker|pane>
+  local _label="$1" _why="$2" _bc _detail
+  case "$_why" in
+    # The capture-pane failure path `break`s out MID-window, so it lands in this
+    # same arm — but the marker was not ABSENT, we were BLIND. Saying "never
+    # appeared" there would send the reader to look at a fork that may well have
+    # been ready. DIVE-2159's lesson on this script, one layer up.
+    pane) _detail='could not READ the session pane, so the ready marker was never checked' ;;
+    *)    _detail='the ready marker NEVER APPEARED inside the boot window' ;;
+  esac
+  _bc="$(coldstart_kick_breadcrumb_path)"
+  printf '%s cold-start kick: NEVER TYPED — %s. Nothing reached the agent, so it is NOT listening on Telegram\n' \
+    "$_label" "$_detail" > "$_bc" 2>/dev/null || true
+  chmod 640 "$_bc" 2>/dev/null || true
+  echo "warn: ${_label} cold-start kick: NEVER TYPED — ${_detail}; the agent is NOT listening on Telegram (breadcrumb: $_bc)" >&2
+  return 1
+}
+
 # grok cold-start kickoff (telegram only). grok lazy-loads its telegram MCP server
 # only once a chat session starts — until then it sits at the home-screen launcher
 # (New worktree / Resume session / Quit) and never receives Telegram messages.
@@ -1791,14 +1821,23 @@ coldstart_kick_submit() { # <session> <label>
 # fire Enter blind under a comment noting this TUI drops folded Enters.
 if [[ "$TYPE" == "grok" && "$CHANNELS" == "telegram" ]]; then
   (
+    # Loop exhaustion is a REPORTED outcome, not a fall-through (DIVE-3793).
+    _kick_state=marker
     for _ in $(seq 1 24); do
       sleep 2
-      _pane="$(/usr/bin/tmux capture-pane -t "$SESSION" -p -S -40 2>/dev/null)" || break
+      _pane="$(/usr/bin/tmux capture-pane -t "$SESSION" -p -S -40 2>/dev/null)" || { _kick_state=pane; break; }
       if printf '%s' "$_pane" | grep -q 'Resume session'; then
+        _kick_state=kicked
         coldstart_kick_submit "$SESSION" grok || true
         break
       fi
     done
+    # kicked  -> coldstart_kick_submit already reported its own result.
+    # anything else -> nothing was ever typed and nobody has said so yet.
+    case "$_kick_state" in
+      kicked|listening) ;;
+      *) coldstart_kick_never_typed grok "$_kick_state" || true ;;
+    esac
   ) &
 fi
 
@@ -1814,14 +1853,23 @@ fi
 # verified send as grok above (DIVE-3791).
 if [[ "$TYPE" == "antigravity" && "$CHANNELS" == "telegram" ]]; then
   (
+    # Loop exhaustion is a REPORTED outcome, not a fall-through (DIVE-3793).
+    _kick_state=marker
     for _ in $(seq 1 30); do
       sleep 2
-      _pane="$(/usr/bin/tmux capture-pane -t "$SESSION" -p -S -40 2>/dev/null)" || break
+      _pane="$(/usr/bin/tmux capture-pane -t "$SESSION" -p -S -40 2>/dev/null)" || { _kick_state=pane; break; }
       if printf '%s' "$_pane" | grep -q 'for shortcuts'; then
+        _kick_state=kicked
         coldstart_kick_submit "$SESSION" antigravity || true
         break
       fi
     done
+    # kicked  -> coldstart_kick_submit already reported its own result.
+    # anything else -> nothing was ever typed and nobody has said so yet.
+    case "$_kick_state" in
+      kicked|listening) ;;
+      *) coldstart_kick_never_typed antigravity "$_kick_state" || true ;;
+    esac
   ) &
 fi
 
@@ -1862,17 +1910,28 @@ fi
 # (DIVE-3791) — never the text, which would concatenate onto a stranded line.
 if [[ "$TYPE" == "codex" && "$CHANNELS" == "telegram" ]]; then
   (
+    # Loop exhaustion is a REPORTED outcome, not a fall-through (DIVE-3793).
+    _kick_state=marker
     for _ in $(seq 1 30); do
       sleep 2
-      _pane="$(/usr/bin/tmux capture-pane -t "$SESSION" -p -S -40 2>/dev/null)" || break
-      if printf '%s' "$_pane" | grep -q 'wait_for_message'; then break; fi
+      _pane="$(/usr/bin/tmux capture-pane -t "$SESSION" -p -S -40 2>/dev/null)" || { _kick_state=pane; break; }
+      # Already listening: the plugin's inbound kick won the race. A SUCCESS,
+      # so it must not fall into the never-typed arm below.
+      if printf '%s' "$_pane" | grep -q 'wait_for_message'; then _kick_state=listening; break; fi
       if printf '%s' "$_pane" | grep -q 'Hooks need review'; then continue; fi
       if printf '%s' "$_pane" | grep -q '>_ OpenAI Codex (v' \
          && printf '%s' "$_pane" | grep -q '›'; then
+        _kick_state=kicked
         coldstart_kick_submit "$SESSION" codex || true
         break
       fi
     done
+    # kicked  -> coldstart_kick_submit already reported its own result.
+    # anything else -> nothing was ever typed and nobody has said so yet.
+    case "$_kick_state" in
+      kicked|listening) ;;
+      *) coldstart_kick_never_typed codex "$_kick_state" || true ;;
+    esac
   ) &
 fi
 
