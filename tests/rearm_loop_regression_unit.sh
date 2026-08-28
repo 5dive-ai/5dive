@@ -81,12 +81,16 @@ else no "cold-start kick says END YOUR TURN"; fi
 
 echo "== 3. STRUCTURAL: both kick blocks submit through the verifier =="
 # The verified send is worthless if a call site still fires Enter itself. Read
-# the two kick blocks only, so an unrelated Enter elsewhere in the script (the
+# the three kick blocks only, so an unrelated Enter elsewhere in the script (the
 # claude resume prompt, the codex trust-accepter) is not miscounted.
 # The `if` line is matched WHOLE and asserted UNIQUE. An earlier draft matched a
 # prefix and `head -1` silently graded the grok AUTH block 1100 lines up, which
 # has no kick in it and passed every arm below vacuously.
-for _blk in grok antigravity; do
+# DIVE-3792 added codex, so the marker can no longer be a shared alternation:
+# each block must carry ITS OWN ready marker, or a copy-pasted grok marker in the
+# codex block would pass this arm while never matching a real codex pane.
+declare -A _READY=( [grok]='Resume session' [antigravity]='for shortcuts' [codex]='>_ OpenAI Codex (v' )
+for _blk in grok antigravity codex; do
   _pat='^if \[\[ "\$TYPE" == "'"${_blk}"'" && "\$CHANNELS" == "telegram" \]\]; then$'
   _hits="$(grep -cE "$_pat" "$START")"
   if [[ "$_hits" != 1 ]]; then
@@ -95,9 +99,9 @@ for _blk in grok antigravity; do
   fi
   _ln="$(grep -nE "$_pat" "$START" | cut -d: -f1)"
   _body="$(sed -n "${_ln},\$p" "$START" | awk 'NR>1 && /^fi$/{print;exit}{print}')"
-  if grep -q 'for shortcuts\|Resume session' <<<"$_body"; then
-    ok "$_blk kick block body carries its ready marker"
-  else no "$_blk kick block body carries its ready marker"; fi
+  if grep -qF "${_READY[$_blk]}" <<<"$_body"; then
+    ok "$_blk kick block body carries its own ready marker"
+  else no "$_blk kick block body carries its own ready marker (want '${_READY[$_blk]}')"; fi
   if grep -q 'coldstart_kick_submit' <<<"$_body"; then ok "$_blk kick calls coldstart_kick_submit"
   else no "$_blk kick calls coldstart_kick_submit"; fi
   if grep -qE 'send-keys[^|]*Enter' <<<"$_body"; then
