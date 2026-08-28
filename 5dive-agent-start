@@ -1686,6 +1686,92 @@ if [[ "$TYPE" == "codex" && "$CHANNELS" == "telegram" ]] \
   ) &
 fi
 
+# ── Cold-start kick: type into a fresh TUI, then OBSERVE the submit ─────────
+# DIVE-3791 — the 5dive-cli half of DIVE-3786. Both cold-start kicks below used
+# the same unverified two-step the plugins re-arm used before PR #46: `send-keys
+# -l` the text, sleep, fire Enter, discard the result — directly under a comment
+# saying the TUI "occasionally drops a folded Enter". If that Enter goes nowhere
+# the agent sits at a prompt it never left, nothing is listening on Telegram, and
+# the boot reports success. That is the customer end state, reached by the cold
+# door instead of the re-arm door.
+#
+# A landed Enter clears the composer and starts a turn, so the pane MUST change.
+# Byte-identical panes before and after mean the keystroke went nowhere.
+#
+# Two DELIBERATE differences from the plugins fix, both narrower on purpose:
+#
+#   * NO C-u. That side clears the composer first because its kick REPEATS, so a
+#     stranded line gets concatenated onto. A cold-start composer is empty by
+#     construction (this fires once, on the first ready pane), so a clear buys
+#     nothing — and C-u is verified against the codex TUI ONLY. grok and
+#     antigravity are unverified in both repos, so adding an unverified keystroke
+#     to the one path that does not need it trades a real defect for a new one.
+#
+#   * THE RETRY RE-SENDS ENTER, NEVER THE TEXT. If the first Enter was dropped
+#     the prompt is still in the composer; retyping would concatenate onto it,
+#     which is exactly the append half of DIVE-3786 — the recovery path adopting
+#     the delivery path's defect. With no C-u available here, submit-only is the
+#     only retry that cannot make things worse.
+#
+# The flag is a FILE, not process state: there is no long-lived server on this
+# side, the boot subshell exits. Same shape as ~/.5dive-cred-seed-failed above.
+COLDSTART_KICK_TYPE_SETTLE=1
+COLDSTART_KICK_SUBMIT_SETTLE=2
+# ONE definition of the kick text. It was duplicated verbatim in the two blocks
+# below, which is how the DIVE-1180 phrasing survived in both (see the guard note
+# further down) — a string with two copies is a string one edit leaves behind.
+#
+# Phrasing per DIVE-1180: on a timeout the model must END ITS TURN, because the
+# server wakes it when a real inbound is queued. The text this replaced carried
+# both of the recursive-loop instructions DIVE-1180 removed for making the MODEL
+# self-loop and burn a turn per empty poll, 24/7 — see the exact patterns in
+# tests/rearm_loop_regression_unit.sh, which now bans them on this side too.
+# THEY ARE NOT QUOTED HERE ON PURPOSE: a static ban reds on its own explanatory
+# comment, and the next reader then "fixes" the comment or widens the ban.
+COLDSTART_KICK_TEXT='Start your Telegram listen loop: call wait_for_message now to receive any waiting message, then reply. After handling any queued messages, if wait_for_message returns <telegram timeout=true/>, END YOUR TURN — the server re-arms you when the next message arrives. This is an automated start; do not send a Telegram reply about it.'
+
+coldstart_kick_breadcrumb_path() { printf '%s/.5dive-coldstart-kick-failed' "${HOME:-/tmp}"; }
+coldstart_kick_ok() { rm -f "$(coldstart_kick_breadcrumb_path)" 2>/dev/null || true; }
+
+_coldstart_capture_pane() { # <session>
+  /usr/bin/tmux capture-pane -t "$1" -p -S -40 2>/dev/null
+}
+
+# Send Enter as its own call and report whether it was OBSERVED to land.
+#   rc 0  the pane CHANGED across the keystroke
+#   rc 1  byte-identical panes, a failed send, or a pane we could not read
+# Unreadable is deliberately rc 1. On this same script DIVE-2159 was exactly this
+# bug in the other direction: a failed capture reached the predicate as an empty
+# string and could-not-measure rendered as measured-and-fine. The signal is the
+# RETURN CODE, never the emptiness of the output.
+_coldstart_submit_once() { # <session>
+  local _s="$1" _before _after
+  _before="$(_coldstart_capture_pane "$_s")" || return 1
+  /usr/bin/tmux send-keys -t "$_s" Enter || return 1
+  sleep "$COLDSTART_KICK_SUBMIT_SETTLE"
+  _after="$(_coldstart_capture_pane "$_s")" || return 1
+  [[ "$_after" != "$_before" ]]
+}
+
+# Type the kick, verify the submit, retry the Enter once, then RECORD the state.
+coldstart_kick_submit() { # <session> <label>
+  local _s="$1" _label="$2" _bc
+  if ! /usr/bin/tmux send-keys -t "$_s" -l -- "$COLDSTART_KICK_TEXT"; then
+    echo "warn: ${_label} cold-start kick: could not type the prompt" >&2
+  else
+    sleep "$COLDSTART_KICK_TYPE_SETTLE"
+    _coldstart_submit_once "$_s" && { coldstart_kick_ok; return 0; }
+    echo "warn: ${_label} cold-start kick: submit not observed, re-sending Enter once" >&2
+    _coldstart_submit_once "$_s" && { coldstart_kick_ok; return 0; }
+  fi
+  _bc="$(coldstart_kick_breadcrumb_path)"
+  printf '%s cold-start kick: prompt typed, submit NEVER OBSERVED — the agent is parked at its input prompt and is NOT listening on Telegram\n' \
+    "$_label" > "$_bc" 2>/dev/null || true
+  chmod 640 "$_bc" 2>/dev/null || true
+  echo "warn: ${_label} cold-start kick: submit still not observed — the agent is not accepting input (breadcrumb: $_bc)" >&2
+  return 1
+}
+
 # grok cold-start kickoff (telegram only). Unlike codex (whose MCP server boots
 # with the process), grok lazy-loads its telegram MCP server only once a chat
 # session starts — until then it sits at the home-screen launcher (New worktree
@@ -1695,19 +1781,17 @@ fi
 # launcher is showing, type a one-line kickoff to start a session. That loads the
 # telegram-grok MCP server, whose in-process re-arm watchdog then owns the
 # wait_for_message loop. 'Resume session' is launcher-only (never appears in
-# in-session chrome), so it's a safe marker. Two-step send (literal text, then
-# Enter) because the TUI occasionally drops a folded Enter. Single-fire (break on
-# first match) — the server-side watchdog handles every subsequent re-arm.
+# in-session chrome), so it's a safe marker. Single-fire (break on first match)
+# — the server-side watchdog handles every subsequent re-arm. The send is
+# coldstart_kick_submit, which VERIFIES its own Enter (DIVE-3791); it used to
+# fire Enter blind under a comment noting this TUI drops folded Enters.
 if [[ "$TYPE" == "grok" && "$CHANNELS" == "telegram" ]]; then
   (
-    _kick='Resume your Telegram listen loop: call wait_for_message now and keep looping (on each message reply, then call wait_for_message again; on timeout call it again immediately). This is an automated re-arm; do not send a Telegram reply about it.'
     for _ in $(seq 1 24); do
       sleep 2
       _pane="$(/usr/bin/tmux capture-pane -t "$SESSION" -p -S -40 2>/dev/null)" || break
       if printf '%s' "$_pane" | grep -q 'Resume session'; then
-        /usr/bin/tmux send-keys -t "$SESSION" -l "$_kick"
-        sleep 1
-        /usr/bin/tmux send-keys -t "$SESSION" Enter
+        coldstart_kick_submit "$SESSION" grok || true
         break
       fi
     done
@@ -1722,17 +1806,15 @@ fi
 # the chat UI, so the ready marker is the chat footer "? for shortcuts" rather
 # than a launcher entry. If agy is unauthenticated the pane shows the login menu
 # instead and this never matches, so we won't type a kick into the login prompt.
-# Single-fire; the server-side watchdog owns every subsequent re-arm.
+# Single-fire; the server-side watchdog owns every subsequent re-arm. Same
+# verified send as grok above (DIVE-3791).
 if [[ "$TYPE" == "antigravity" && "$CHANNELS" == "telegram" ]]; then
   (
-    _kick='Resume your Telegram listen loop: call wait_for_message now and keep looping (on each message reply, then call wait_for_message again; on timeout call it again immediately). This is an automated re-arm; do not send a Telegram reply about it.'
     for _ in $(seq 1 30); do
       sleep 2
       _pane="$(/usr/bin/tmux capture-pane -t "$SESSION" -p -S -40 2>/dev/null)" || break
       if printf '%s' "$_pane" | grep -q 'for shortcuts'; then
-        /usr/bin/tmux send-keys -t "$SESSION" -l "$_kick"
-        sleep 1
-        /usr/bin/tmux send-keys -t "$SESSION" Enter
+        coldstart_kick_submit "$SESSION" antigravity || true
         break
       fi
     done
