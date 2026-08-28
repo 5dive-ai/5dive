@@ -1772,10 +1772,14 @@ coldstart_kick_submit() { # <session> <label>
   return 1
 }
 
-# grok cold-start kickoff (telegram only). Unlike codex (whose MCP server boots
-# with the process), grok lazy-loads its telegram MCP server only once a chat
-# session starts — until then it sits at the home-screen launcher (New worktree
-# / Resume session / Quit) and never receives Telegram messages. On the nightly
+# grok cold-start kickoff (telegram only). grok lazy-loads its telegram MCP server
+# only once a chat session starts — until then it sits at the home-screen launcher
+# (New worktree / Resume session / Quit) and never receives Telegram messages.
+# (This comment used to open by contrasting grok with codex, on the reasoning that
+# codex's MCP server boots with the process. It does — and that never made codex
+# reachable, because the listen loop needs the MODEL to call wait_for_message. That
+# sentence is why codex went 2h40m deaf on a customer box; codex has its own kick
+# below. DIVE-3792.) On the nightly
 # unit restart this left grok dead until a human typed into it. So we mirror the
 # codex trust-accepter above: watch the pane during the boot window, and once the
 # launcher is showing, type a one-line kickoff to start a session. That loads the
@@ -1815,6 +1819,57 @@ if [[ "$TYPE" == "antigravity" && "$CHANNELS" == "telegram" ]]; then
       _pane="$(/usr/bin/tmux capture-pane -t "$SESSION" -p -S -40 2>/dev/null)" || break
       if printf '%s' "$_pane" | grep -q 'for shortcuts'; then
         coldstart_kick_submit "$SESSION" antigravity || true
+        break
+      fi
+    done
+  ) &
+fi
+
+# codex cold-start kickoff (telegram only). DIVE-3792.
+#
+# codex was the ONE fork with no cold-start kick, and grok's comment above USED to
+# say why: codex's MCP server boots with the process, so it needs no kick. The
+# first half is true and the second does not follow. Booting the MCP server is
+# not the same as the MODEL calling the tool — the listen loop only exists once
+# codex issues wait_for_message, and on a cold start nothing prompts it to. agy
+# is the same class and already has a kick for exactly this reason ("agy's
+# telegram MCP server is wired, but agy won't call wait_for_message until it's
+# prompted"); codex was left out on a distinction that does not hold.
+#
+# Measured on a CUSTOMER box 2026-08-28: after a restart the pane carried the
+# startup splash and nothing else for 2h40m, every health signal read green, and
+# inbound Telegram found no listener — the bridge raised "not responding — cause
+# unknown" instead of delivering. Typing this same text in by hand armed it
+# immediately. The plugin's SERVER-SIDE kick (which fires on an inbound message)
+# is not a substitute: it is what closes this window normally, so when it does
+# not land the window never closes and the agent is deaf until a human types.
+#
+# Three guards, because this types into a live TUI:
+#   * SKIP IF ALREADY LISTENING. If the plugin's inbound kick beat us to it the
+#     pane already shows wait_for_message; kicking again would queue a second
+#     re-arm behind the first. Break, do not fire.
+#   * NEVER TYPE INTO THE HOOKS DIALOG. The first-run "Hooks need review" prompt
+#     is owned by the accepter above and answered with Down+Enter; a kick landing
+#     there would answer the dialog with prose. `continue`, not `break` — the
+#     dialog is transient and we still want to kick once it clears.
+#   * READY MEANS SPLASH + COMPOSER. The splash line is the one marker stable
+#     across codex versions (the composer PLACEHOLDER is not: v0.150.1 renders
+#     "Ask Codex to do anything", v0.146.0 "Implement {feature}", so keying on
+#     it would silently no-op on half the fleet).
+#
+# Single-fire; the server-side watchdog owns every subsequent re-arm. Send is
+# coldstart_kick_submit, which verifies its own Enter and retries the ENTER only
+# (DIVE-3791) — never the text, which would concatenate onto a stranded line.
+if [[ "$TYPE" == "codex" && "$CHANNELS" == "telegram" ]]; then
+  (
+    for _ in $(seq 1 30); do
+      sleep 2
+      _pane="$(/usr/bin/tmux capture-pane -t "$SESSION" -p -S -40 2>/dev/null)" || break
+      if printf '%s' "$_pane" | grep -q 'wait_for_message'; then break; fi
+      if printf '%s' "$_pane" | grep -q 'Hooks need review'; then continue; fi
+      if printf '%s' "$_pane" | grep -q '>_ OpenAI Codex (v' \
+         && printf '%s' "$_pane" | grep -q '›'; then
+        coldstart_kick_submit "$SESSION" codex || true
         break
       fi
     done
