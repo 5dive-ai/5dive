@@ -34,6 +34,11 @@ _task_usage() {
                                                 is NOT the ident number
   orphans [--all]                               rows whose assignee/verifier/creator is not a
                                                 registered agent (undispatchable, DIVE-3344)
+  doctor                                        every open row nothing will dispatch, and WHY —
+                                                no revisit anchor, a stale blocker edge, a park
+                                                past its wake or with none, or a seat nothing
+                                                wakes. Reports, never fixes; each
+                                                finding names the verb that clears it (DIVE-3784)
   wip-cap-install [--relane=<lane>]             snapshot each lane's actionable count as its
                                                 frozen WIP ceiling (deliberate, once)
   set-budget <id> <tokens|\$cost|none>           record an ADVISORY per-row token budget. Nothing enforces it
@@ -244,6 +249,7 @@ cmd_task() {
     set-overlap)     cmd_task_set_overlap "$@" ;;
     wip-cap-install) cmd_task_wip_cap_install "$@" ;;
     orphans)         cmd_task_orphans "$@" ;;       # DIVE-3344 undispatchable rows
+    doctor)          cmd_task_doctor "$@" ;;        # DIVE-3784 every undispatchable class
     start)           cmd_task_start "$@" ;;
     done|close)      cmd_task_done "$@" ;;
     deliver)         cmd_task_deliver "$@" ;;
@@ -569,7 +575,7 @@ cmd_task_orphans() {
   local n; n=$(printf '%s' "$rows" | jq 'length')
   local scope_label; scope_label=$([[ -n "$all" ]] && echo all || echo open)
   if [[ "${n:-0}" == "0" ]]; then
-    ok "no orphaned rows — every assignee, verifier and creator on the ${scope_label} board names a registered agent" \
+    ok "no orphaned rows — every assignee, verifier and creator on the ${scope_label} board names a registered agent (a real NAME is not the same as a dispatchable row: 5dive task doctor)" \
        '{orphans:0, scope:$s}' --arg s "$scope_label"
     return 0
   fi
@@ -594,7 +600,8 @@ cmd_task_orphans() {
     out+="  ${ident}  [${st}]  ${marks}"$'\n'"        $(printf '%s' "$line" | jq -r '.title // ""')"$'\n'
   done < <(printf '%s' "$rows" | jq -c '.[]')
   warn "${n} row(s) name something that is not a registered agent — an undispatchable row is never picked and never says so:
-${out}Re-point with: 5dive task assign <ident> <agent>   ·   roster: 5dive agent list"
+${out}Re-point with: 5dive task assign <ident> <agent>   ·   roster: 5dive agent list
+A bad NAME is one of four ways a row goes undispatchable — for the other three (no revisit anchor, a stale blocker edge, a park past its wake): 5dive task doctor"
   ok "" '{orphans:($n|tonumber), scope:$s, rows:$rows}' \
     --arg n "$n" --arg s "$scope_label" --argjson rows "$rows"
 }

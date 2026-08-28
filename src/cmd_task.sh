@@ -32,4 +32,5 @@ declare -F cmd_task_precedent >/dev/null 2>&1 || . "$_task_src_dir/task/need.sh"
 declare -F _task_agent_channel >/dev/null 2>&1 || . "$_task_src_dir/task/notify.sh"
 declare -F cmd_task_coordinator >/dev/null 2>&1 || . "$_task_src_dir/task/inbox.sh"
 declare -F _loop_answer_is_bounce >/dev/null 2>&1 || . "$_task_src_dir/task/answer.sh"
+declare -F cmd_task_doctor >/dev/null 2>&1 || . "$_task_src_dir/task/doctor.sh"
 unset _task_src_dir

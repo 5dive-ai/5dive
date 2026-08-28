@@ -118,6 +118,7 @@ cat \
   src/task/notify.sh \
   src/task/inbox.sh \
   src/task/answer.sh \
+  src/task/doctor.sh \
   src/cmd_task.sh \
   src/cmd_trace.sh \
   src/cmd_org.sh \
