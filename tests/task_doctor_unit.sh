@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# TIER: nightly — ~7s measured (DIVE-3784): the core tier is already at its cap, and this
-# harness builds a 9-row scratch board plus a registry fixture; it belongs in the sweep.
+# TIER: nightly — ~9s measured (DIVE-3784): the core tier is already at its cap, and this
+# harness builds a 13-row scratch board plus a registry fixture; it belongs in the sweep.
 # DIVE-3784 isolated unit harness for `5dive task doctor` — the verb that
 # enumerates every open row nothing will dispatch, and says WHY.
 #
@@ -18,8 +18,9 @@
 #                    (the OTHER half: the wake loop DOES iterate it and the wake
 #                     then fails every tick, forever — same outcome for the row)
 #   T6  NEGATIVES    a live gate, a live edge, a future park, a todo -> NOT found
-#   T7  the remedy line for a park says unpark and warns off unblock (the filed
+#   T7  the remedy SLOT for a park holds `unpark` and NOT `unblock` (the filed
 #       symptom: `unblock` on a parked row reports success and changes nothing)
+#   T7c the census prints on the FINDINGS path, not only on a clean board
 #   T8  a clean board reports zero and still prints the census
 #   T9  an unreadable registry DEGRADES (the roster-free classes still report)
 #       instead of refusing the way `orphans` does
@@ -109,6 +110,16 @@ t_gate=$(addt --assignee=live -- "waiting on a human")
 # what this negative arm measures. (Found by this harness on its first run, which
 # flagged the gate row dead-lane.)
 db "UPDATE tasks SET assignee='live' WHERE id=${t_gate};"
+# An ANSWERED gate. The census must count OPEN gates only: on the live board most
+# gates are already answered, so a census reading `need_type IS NOT NULL` would
+# report the whole gate HISTORY as a live hold. Without this row planted, that
+# loosening is invisible — the fixture would carry no answered gate to miscount.
+# (quinn, iteration 1.) An answered gate leaves the row dispatchable again, with
+# need_type still recorded, so this is also a negative: it is not a finding.
+t_gatedone=$(addt --assignee=live -- "a gate that was already answered")
+( cmd_task_need "$t_gatedone" --type=decision --ask="pick one" --options="A|B" --recommend="A" ) >/dev/null 2>&1
+db "UPDATE tasks SET need_answered_at=datetime('now'), status='todo', assignee='live' WHERE id=${t_gatedone};"
+
 t_livedep=$(addt --assignee=live -- "behind a blocker that is still open")
 t_openblocker=$(addt --assignee=live -- "still open blocker")
 ( cmd_task_block "$t_livedep" --by="$t_openblocker" ) >/dev/null 2>&1
@@ -129,14 +140,15 @@ done
 
 # ---- T6: the negatives are NOT findings -------------------------------------
 neg_bad=""
-for pair in "$t_gate:live human gate" "$t_livedep:live blocker edge" \
+for pair in "$t_gate:live human gate" "$t_gatedone:an ANSWERED gate" \
+            "$t_livedep:live blocker edge" \
             "$t_futurepark:park with a future wake" "$t_todo:plain todo" \
             "$t_openblocker:the open blocker itself"; do
   id="${pair%%:*}"; what="${pair##*:}"; i=$(ident "$id"); got=$(reason_of "$out" "$i")
   [[ -z "$got" ]] || neg_bad+="${i} (${what}) -> ${got}; "
 done
 [[ -z "$neg_bad" ]] \
-  && ok_t "a live gate / live edge / future park / plain todo are NOT reported undispatchable" \
+  && ok_t "a live gate / an answered gate / live edge / future park / plain todo are NOT reported undispatchable" \
   || bad_t "false positives" "$neg_bad"
 
 # ---- count is exactly the five --------------------------------------------
@@ -148,17 +160,46 @@ nf=$(printf '%s' "$out" | jq -r '.data.findings')
 disp=$(printf '%s' "$out" | jq -r '.data.census.dispatchable')
 gated=$(printf '%s' "$out" | jq -r '.data.census.gated')
 parked=$(printf '%s' "$out" | jq -r '.data.census.parked')
+# gated MUST be exactly 1 and not 2: two gates are planted, one live and one
+# answered, and only the live one is a hold. `>= 1` here would accept the
+# `need_type IS NOT NULL` loosening.
 { [[ "$gated" == "1" ]] && [[ "$parked" == "1" ]] && [[ "$disp" -ge 1 ]]; } \
-  && ok_t "census separates dispatchable (${disp}) from gated (${gated}) and future-parked (${parked})" \
-  || bad_t "census" "dispatchable=$disp gated=$gated parked=$parked"
+  && ok_t "census separates dispatchable (${disp}) from gated (${gated}, the ANSWERED gate excluded) and future-parked (${parked})" \
+  || bad_t "census" "dispatchable=$disp gated=$gated parked=$parked (gated must be 1: the answered gate is not a hold)"
 
-# ---- T7: the park remedy names unpark AND warns off unblock -----------------
+# ---- T7: the park remedy SLOT holds unpark, and NOT unblock -----------------
 # This is the filed symptom, not a wording preference: `unblock` drops EDGES, a
 # park has none, so it prints "OK — unblocked" over a row that did not move.
-park_line=$(grep -A3 -F "$(ident "$t_wakepast")" "$TMP/err" | grep -i "unpark")
-{ [[ -n "$park_line" ]] && grep -qi "unblock only drops edges\|NOT unblock" <<<"$park_line"; } \
-  && ok_t "a parked finding tells the operator to unpark and says why unblock silently no-ops" \
-  || bad_t "park remedy text" "$(grep -A3 -F "$(ident "$t_wakepast")" "$TMP/err")"
+#
+# ANCHOR THE SLOT, NOT THE PRESENCE (quinn, iteration 1). The first cut of this
+# arm grepped the line for the word "unpark" and for the prose "unblock only
+# drops edges" — and BOTH survive the exact inversion that ships the filed
+# defect, because "-> 5dive task unblock <id>  (NOT unpark: unblock only drops
+# edges, ...)" still contains "unpark" (inside "NOT unpark") and keeps the prose
+# untouched. The two phrasings share ALL of the vocabulary; only the verb in the
+# slot after "-> " differs. So assert what occupies the slot, and assert the
+# wrong verb does not.
+park_line=$(grep -A3 -F "$(ident "$t_wakepast")" "$TMP/err" | grep -F -- '-> 5dive task ')
+{ [[ -n "$park_line" ]] \
+    && grep -qF -- '-> 5dive task unpark <id>' <<<"$park_line" \
+    && ! grep -qF -- '-> 5dive task unblock' <<<"$park_line" \
+    && grep -qi "unblock only drops edges" <<<"$park_line"; } \
+  && ok_t "the park remedy SLOT holds 'unpark' and not 'unblock', and says why unblock silently no-ops" \
+  || bad_t "park remedy slot" "$(grep -A3 -F "$(ident "$t_wakepast")" "$TMP/err")"
+
+# ---- T7c: the census prints on the FINDINGS path, not only on a clean board --
+# (quinn, iteration 1): the clean-board arm read the census out of the JSON
+# payload, so deleting ${census_line} from the findings-path warn survived every
+# arm. The census is the answer to the question the row was filed on ("31 open,
+# 1 dispatchable"); a run that lists findings and drops it reproduces the 42h.
+# Assert the rendered TEXT, with the payload's own numbers, so the two cannot
+# drift apart either.
+cens_open=$(printf '%s' "$out" | jq -r '.data.census.open')
+cens_disp=$(printf '%s' "$out" | jq -r '.data.census.dispatchable')
+{ grep -qF -- "open ${cens_open}: ${cens_disp} dispatchable now," "$TMP/err" \
+    && grep -qF -- "awaiting a human gate" "$TMP/err"; } \
+  && ok_t "the findings run prints the census text too (open ${cens_open}, ${cens_disp} dispatchable now)" \
+  || bad_t "census absent from the findings path" "$(cat "$TMP/err")"
 
 # ---- T7b: it REPORTS, it does not FIX ---------------------------------------
 still=$(db "SELECT status FROM tasks WHERE id=${t_noanchor};")
