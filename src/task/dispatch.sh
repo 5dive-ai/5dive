@@ -22,6 +22,11 @@ _task_usage() {
       [--verifier=<agent>] [--max-iters=<n>] [--no-verify] [--task-budget=<tokens|\$cost>]
       [--customer] [--already-blocked=<what it blocked>]   escapes for the internal-filing cap
   ls [--status=] [--assignee=] [--mine] [--all] [--recurring]   open rows, priority-ordered
+  ls --gated[=human|agent]                      only rows holding a live gate. The 'gate' column is
+                                                on EVERY ls: HUMAN:<type> a person owes an answer,
+                                                <seat>:<type> an agent does, answered:<retire> the
+                                                answer survives only in gate-history, '-' nothing.
+                                                --gated=human is exactly the inbox set.
   show <id|DIVE-N>                              full detail + subtasks + blockers
   assign <id> <agent>                           reassign
   verifier <id> <agent> [--accept=] [--max-iters=]   attach or re-point the verifier rail
@@ -100,7 +105,8 @@ _task_usage() {
       [--relay-agent=<name>]     a button tap: WHO tapped, and whose bot carried it
   clear-recs --channel-proof=<chat_id> [--only=<id>]     apply pending recommendations
   queue [--for=<agent>] [--json]                gates ROUTED TO YOU, filed without waking you
-  inbox [--send [--channel-proof=<chat>]]       human-gated rows; --send DMs the owner
+  inbox [--send [--channel-proof=<chat>]]       every unanswered human gate IN THE FLEET (already
+                                                fleet-wide; --fleet accepted as a no-op); --send DMs the owner
   coordinator [--json]                          the agent fronting the needs-you banner
 
   loops [--stuck] [--escalate-stuck] [--all] [--runs] [--watch[=secs]] [--kill <loopId>]

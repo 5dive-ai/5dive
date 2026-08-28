@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased — feat(task): gate state on the surfaces people READ — `ls` column, `show` header, `--gated` (DIVE-3785)
+
+`task show` printed a row's gate at the TAIL of the record, below the body; `task ls` printed nothing at
+all. So the board could not answer the one question a fleet with a paired human is most often asked —
+*what is waiting on a person* — and the two ways of getting it wrong both cost real time in one week:
+
+- **Pending read as absent.** 2026-08-28 04:30Z: a `grep -A3` window over `task show` sat above the
+  `answer: — pending` line, so ten pending human gates read as zero and the founder was told "none of it
+  is waiting on you". A too-short window and a genuine absence produce byte-identical output.
+- **Answered read as nothing at all.** `park` archives the gate and CLEARS the live `need_*` columns, so
+  a gate answered and then parked makes `task show` render **no gate block whatsoever** — the signed tap
+  survives only in `gate_history`. Measured on the host at ship time: **8 open rows** are in that state.
+  DIVE-3447 has read gateless since a human approved it on 2026-08-16; DIVE-3594 was re-parked for 7 days
+  five minutes after its approval landed.
+
+- **`task ls` carries a `gate` column, always** (`-` is a value, not a blank): `HUMAN:<type>` a person
+  owes an answer, `<seat>:<type>` an agent seat does, `answered` / `answered:<retire-verb>` an answer
+  exists — the last of which is the only place an answered-then-parked gate is visible on the board.
+- **`task show` prints `gate = …` immediately after `status`**, spelled out: who is holding it, since
+  when, or the answer with its attribution AND the retirement that hid it, plus the `gate-history`
+  command that recovers the full record. A superseding unanswered withdrawal does not silently erase an
+  earlier signed answer — the header names both.
+- **`task ls --gated[=human|agent]`.** `--gated=human` is EXACTLY the `task inbox` set, by construction:
+  both call the same two single-source predicates rather than restating the rule (the DIVE-3224/3267
+  contract). `=agent` is its complement and equals the count `inbox` already withholds; `any` is the sum.
+  Asserted non-vacuously in `tests/task_gate_visibility_unit.sh`.
+- **`gate-history --json` emits a STABLE KEY SET.** `dbfmt` strips null keys fleet-wide (DIVE-1610) on
+  the premise that a missing key reads back as null. True for a value; false for the key SET, which is
+  how a reader tells absent from empty — an unanswered gate omitted `need_answer` entirely, so a parser
+  asking the WRONG key and one asking the right key about a never-answered gate got the identical `None`.
+  Measured on `origin/main`: two gates on one row returned key counts `[10, 7]` in the same array. That
+  cost an accusation — nine gates were read as never-answered and a verifier was told its authorisation
+  was fabricated; it was signed. Answer fields are now present-and-null, plus an explicit `answered`
+  boolean. Scoped to this projection: reversing DIVE-1610 globally would re-inflate every heartbeat tick.
+- **`task inbox --fleet` is accepted as a no-op** (absorbing cancelled OSS-36). `inbox` has been
+  fleet-wide by DEFAULT since DIVE-3224, so the flag OSS-36 specified was never built and anyone reaching
+  for it got `unknown flag: --fleet` — a hard error where the view they wanted was already on screen.
+
 ## Unreleased — feat(task): `5dive task doctor` — every open row nothing will dispatch, and why (DIVE-3784)
 
 On 2026-08-28 05:00Z the board read **31 open rows** and `5dive-ai/5dive` main had not moved in **~42h**

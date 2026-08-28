@@ -64,6 +64,112 @@ _task_human_gate_pred() {
               AND COALESCE(needs_capability,'') = '' )"
 }
 
+# ── DIVE-3785 — the SAME verdict, rendered where people actually look ────────
+#
+# The two predicates above answer "is a gate live, and is a human the one holding
+# it". Until this row they were reachable only from `task inbox` and the two
+# --json projections — i.e. from everywhere EXCEPT the two surfaces a person
+# reads. That cost a wrong answer to the founder: `task show` prints the gate
+# block at the TAIL, several lines below its `human gate:` header, so a grep
+# window that was one line too short read every pending gate as ABSENT and main
+# reported "zero pending human gates" when there were ten (2026-08-28 04:30Z).
+# A too-short window and a genuine absence produce byte-identical output.
+#
+# It also fails in the OPPOSITE direction, and that one is not a grep bug at all:
+# **park archives the gate and CLEARS the live columns**, so a gate ANSWERED and
+# then parked leaves `task show` printing no gate block whatsoever — the signed
+# human tap survives only in `gate_history`, and the row renders exactly like one
+# that was never gated. Measured on this host 2026-08-28: 8 open rows are in that
+# state, DIVE-3447 among them (a human approved it 2026-08-16 and the row has
+# read gateless ever since). main re-parked DIVE-3594 for 7 days off that render,
+# 5 minutes after its approval landed.
+#
+# So these renderers carry BOTH directions — pending AND answered — because a
+# header that only proves a gate EXISTS reproduces the second miss. They are
+# built from the two predicates above by CALL, never by paste (the contract that
+# block states), so `ls`, `show` and `inbox` cannot disagree about which rows are
+# gated. The archive fallback below is deliberately the LAST retired gate rather
+# than the last ANSWERED one: claiming an answer that a later withdrawal
+# superseded would be the same false-confidence failure pointing the other way.
+# But "not the current answer" is not "no answer ever" either — so when the last
+# retirement is unanswered and an EARLIER one was signed, the header says so and
+# names `gate-history`. Silently dropping the earlier tap is the very loss this
+# renderer exists to stop, and it does not stop being a loss because a newer,
+# withdrawn gate happens to sit on top of it.
+
+# The id of this row's most recently retired gate (NULL if it never had one).
+# Correlated on `tasks.id`, so every call site must select FROM tasks.
+_task_gate_archive_last_sql() {
+  printf '%s' "(SELECT h.id FROM gate_history h WHERE h.task_id=tasks.id ORDER BY h.id DESC LIMIT 1)"
+}
+
+# A stored answer, safe to print: secrets never render, and a paragraph-length
+# answer (DIVE-2571's is 600+ chars) is clipped so it cannot swallow the line it
+# is a field of. $1 = need_type expr, $2 = need_answer expr.
+_task_gate_answer_disp_sql() {
+  printf '%s' "CASE WHEN ($1)='secret' THEN '(provided — loaded out-of-band)'
+                    WHEN COALESCE($2,'')='' THEN '(answered, no text recorded)'
+                    WHEN length($2) > 60 THEN substr($2,1,60)||'…'
+                    ELSE $2 END"
+}
+
+# COMPACT cell for `task ls` — one column, always present. A row waiting on a
+# person must not look like a row that is merely blocked, which is the only
+# reason this column exists; `-` is a real value, not a blank.
+_task_gate_cell_sql() {
+  local open human last
+  open=$(_task_gate_open_pred); human=$(_task_human_gate_pred)
+  last=$(_task_gate_archive_last_sql)
+  printf '%s' "CASE
+      WHEN ${open} AND ( ${human} ) THEN 'HUMAN:'||need_type
+      WHEN ${open} THEN COALESCE(NULLIF(routed_reviewer,''),'unrouted')||':'||need_type
+      WHEN need_type IS NOT NULL AND need_answered_at IS NOT NULL THEN 'answered'
+      WHEN (SELECT h.need_answered_at FROM gate_history h WHERE h.id=${last}) IS NOT NULL
+           THEN 'answered:'||COALESCE((SELECT h.retired_by FROM gate_history h WHERE h.id=${last}),'retired')
+      ELSE '-' END"
+}
+
+# VERBOSE cell for the `task show` HEADER, printed next to `status`. Same five
+# states as the compact cell, spelled out, and it names the command that recovers
+# an archived answer instead of leaving the reader to know `gate-history` exists.
+_task_gate_header_sql() {
+  local open human last live_ans arch_ans
+  open=$(_task_gate_open_pred); human=$(_task_human_gate_pred)
+  last=$(_task_gate_archive_last_sql)
+  live_ans=$(_task_gate_answer_disp_sql "need_type" "need_answer")
+  arch_ans=$(_task_gate_answer_disp_sql \
+    "(SELECT h.need_type FROM gate_history h WHERE h.id=${last})" \
+    "(SELECT h.need_answer FROM gate_history h WHERE h.id=${last})")
+  printf '%s' "CASE
+      WHEN ${open} AND ( ${human} ) THEN
+        'PENDING — awaiting a HUMAN ('||need_type||
+        CASE WHEN tier IS NOT NULL THEN ', tier '||tier ELSE '' END||
+        CASE WHEN need_asked_at IS NOT NULL THEN ', asked '||need_asked_at ELSE '' END||
+        ') — the ask is in the ''human gate:'' block below'
+      WHEN ${open} THEN
+        'PENDING — routed to '||COALESCE(NULLIF(routed_reviewer,''),'(unrouted)')||' ('||need_type||
+        CASE WHEN need_asked_at IS NOT NULL THEN ', asked '||need_asked_at ELSE '' END||
+        ') — the ask is in the ''human gate:'' block below'
+      WHEN need_type IS NOT NULL AND need_answered_at IS NOT NULL THEN
+        'ANSWERED '||${live_ans}||' ('||COALESCE(need_answered_by,'unattributed')||', '||need_answered_at||')'
+      WHEN (SELECT h.need_answered_at FROM gate_history h WHERE h.id=${last}) IS NOT NULL THEN
+        'ANSWERED '||${arch_ans}||' ('||
+        COALESCE((SELECT h.need_answered_by FROM gate_history h WHERE h.id=${last}),'unattributed')||', '||
+        (SELECT h.need_answered_at FROM gate_history h WHERE h.id=${last})||
+        ') — CARD RETIRED by '||COALESCE((SELECT h.retired_by FROM gate_history h WHERE h.id=${last}),'?')||' at '||
+        COALESCE((SELECT h.retired_at FROM gate_history h WHERE h.id=${last}),'?')||
+        '; the live row carries no gate. Full record: 5dive task gate-history '||ident
+      WHEN ${last} IS NOT NULL THEN
+        'none live — last gate retired UNANSWERED by '||
+        COALESCE((SELECT h.retired_by FROM gate_history h WHERE h.id=${last}),'?')||' at '||
+        COALESCE((SELECT h.retired_at FROM gate_history h WHERE h.id=${last}),'?')||
+        CASE WHEN (SELECT COUNT(*) FROM gate_history h WHERE h.task_id=tasks.id AND h.need_answered_at IS NOT NULL) > 0
+             THEN ' — but '||(SELECT COUNT(*) FROM gate_history h WHERE h.task_id=tasks.id AND h.need_answered_at IS NOT NULL)||
+                  ' EARLIER gate(s) on this row WERE answered: 5dive task gate-history '||ident
+             ELSE '' END
+      ELSE 'none' END"
+}
+
 # ── DIVE-3474 arm 2 — the ROUTED-GATE QUEUE ──────────────────────────────────
 #
 # The counterpart of the human `inbox`, and it exists because arm 2 stops the
@@ -155,6 +261,15 @@ cmd_task_inbox() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --send)            send=1 ;;
+      # DIVE-3785 (absorbing cancelled OSS-36): `inbox` has been fleet-wide by
+      # DEFAULT since DIVE-3224 — run from any seat it returns every unanswered
+      # gate in the fleet, with an `owner` column, not the caller's own. So the
+      # flag OSS-36 specified was never built, and anyone reaching for it from
+      # that row, from older docs or from habit got `unknown flag: --fleet` — a
+      # hard error where the view they asked for was already the one in front of
+      # them. Accepted as an explicit no-op rather than silently: the listing it
+      # produces IS the fleet listing.
+      --fleet)           : ;;
       --channel-proof=*) channel_proof="${1#*=}" ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *)  fail "$E_USAGE" "unexpected arg: $1 (inbox takes no positional args)" ;;
@@ -261,7 +376,7 @@ cmd_task_inbox() {
       dbfmt -box "SELECT ident, priority, need_type, COALESCE(assignee,'-') AS owner, COALESCE(recommend,'-') AS recommend, COALESCE((SELECT ident FROM tasks p WHERE p.id=tasks.precedent_ref),'-') AS precedent, ask FROM tasks WHERE ${where} ${order};"
     fi
     if (( routed_n > 0 )); then
-      echo "(${routed_n} more open gate(s) routed to an agent seat — not yours to answer: 5dive task ls --status=blocked)"
+      echo "(${routed_n} more open gate(s) routed to an agent seat — not yours to answer: 5dive task ls --gated=agent)"
     fi
   fi
 }

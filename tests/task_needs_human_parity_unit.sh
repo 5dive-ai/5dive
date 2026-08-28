@@ -167,11 +167,20 @@ n_disj=$(cat "$SRC/cmd_task.sh" "$SRC"/task/*.sh | grep -c "^  printf '%s' \"( C
 # `show`, not `ls`, so the verdict was unreachable from the one surface that most
 # needed it and the plugin rebuilt the rule from raw inputs instead — dropping the
 # status clause and telling a human that 19 closed rows were waiting on their answer.
+#
+# DIVE-3785 took it from three to FIVE, and this arm went red exactly as designed —
+# updated deliberately, second time. The two new callers are the HUMAN renderers:
+# _task_gate_cell_sql (the `task ls` gate column) and _task_gate_header_sql (the
+# `task show` header line). They are the same class of fix as the DIVE-3340 site
+# above and for the same reason: until this row, the verdict was computable only
+# from the two --json projections, so the surfaces an actual person reads could not
+# state it — which is how main reported "zero pending human gates" to the founder
+# when there were ten.
 n_call=$(cat "$SRC/cmd_task.sh" "$SRC"/task/*.sh | grep -c '\$(_task_human_gate_pred)')
 n_def=$(cat "$SRC/cmd_task.sh" "$SRC"/task/*.sh | grep -c '^_task_human_gate_pred() {')
-[[ "$n_call" == "3" && "$n_def" == "1" ]] \
-  && ok_t "S2 one definition, exactly three call sites (the inbox view, the ls projection, the show projection)" \
-  || bad_t "S2 call sites" "definitions=$n_def calls=$n_call — expected 1 and 3"
+[[ "$n_call" == "5" && "$n_def" == "1" ]] \
+  && ok_t "S2 one definition, exactly five call sites (inbox view, ls + show projections, ls gate column, show gate header)" \
+  || bad_t "S2 call sites" "definitions=$n_def calls=$n_call — expected 1 and 5"
 # S3 covers BOTH projections. Counting call sites proves the helper is CALLED; only
 # this proves its value is what the SQL actually reads. The show arm is not optional
 # decoration: a third caller that resolved the helpers and then restated the rule
