@@ -23,7 +23,11 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 : "${FIVEDIVE_TEST:=1}"; export FIVEDIVE_TEST
 CLI="${CLI:-./5dive}"
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+TMP=$(mktemp -d)
+# DIVE-2692 corpus contract (tests/harness_rc_corpus_contract_unit.sh): the
+# HARNESS-RC echo and the tempdir cleanup share ONE trap — bash keeps only the
+# last registration per signal, and `$?` must be captured BEFORE any cleanup runs.
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 # TASKS_DIR, not just TASKS_DB. `tasks_db_init` guards on the DIRECTORY and, as a
 # non-root caller, REFUSES to create it ("tasks store not initialised"). Setting
 # only TASKS_DB leaves TASKS_DIR defaulted to /var/lib/5dive/tasks — which exists
@@ -122,7 +126,12 @@ $CLI task inbox --fleet >/dev/null 2>&1 && ok "inbox accepts --fleet as a no-op"
 # Anchored on the DEFINITION line, matching tests/task_needs_human_parity_unit.sh:
 # a bare substring grep also matches the unrelated routed-gate-queue query below
 # it, which is a second USE of routed_reviewer, not a second copy of the rule.
-n=$(cat src/cmd_task.sh src/task/*.sh | grep -c "^  printf '%s' \"( COALESCE(routed_reviewer,'') = ''")
+# `|| n=0` and not a bare assignment: under `set -e` a `grep -c` that matches
+# NOTHING exits 1 and kills the harness before the assertion below can speak, so
+# a pasted-away predicate would read as an infrastructure crash instead of the
+# failure it is. 0 is the post-condition the check actually reads.
+# (tests/unguarded_probe_substitution_unit.sh grades this class corpus-wide.)
+n=$(cat src/cmd_task.sh src/task/*.sh | grep -c "^  printf '%s' \"( COALESCE(routed_reviewer,'') = ''") || n=0
 [[ "$n" == "1" ]] && ok "the human-gate disjunction still appears exactly once" \
   || bad "the human-gate disjunction appears $n times — a second copy was pasted"
 
