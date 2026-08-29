@@ -136,6 +136,7 @@ cat \
   src/cmd_crew.sh \
   src/cmd_heartbeat.sh \
   src/cmd_supervisor.sh \
+  src/cmd_liveness.sh \
   src/cmd_fleet.sh \
   src/cmd_usage.sh \
   src/cmd_digest.sh \

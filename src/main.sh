@@ -282,6 +282,12 @@ Heartbeat (wake an agent only when it has queued tasks, one per tick):
   5dive heartbeat tick                                      # cron driver (root); wakes due agents that have work
   # full surface: 5dive heartbeat --help
 
+Liveness (effect-derived — a seat is alive only against an artifact it WROTE, DIVE-3778):
+  5dive liveness                                     # per-seat verdict: alive / no-effect / NOT-REACHED
+  5dive liveness --agent=<name> [--window=<min>]     # one seat; default window 60m
+  5dive liveness --json                              # records incl. the artifact that dated each seat
+  # NOT-REACHED (a probe could not run) is never rendered as healthy. See --help.
+
 Supervisor (observe-only fleet health — detect + classify, ZERO auto-actions):
   5dive supervisor                                   # per-agent board: state, classification, cause, activity
   5dive supervisor --watch[=secs]                    # live repaint (default 5s; q quits)
@@ -1064,6 +1070,13 @@ main() {
       # — tick fires every few minutes and would flood the log; the wakes it
       # triggers are visible via each agent's own transcript.
       cmd_heartbeat "$@" ;;
+    liveness)
+      # DIVE-3778 v0.23 headline: effect-derived liveness. Read-only, no root, no
+      # process table — a seat is alive only against a timestamped artifact it
+      # WROTE, and `not-reached` is a third verdict that never folds into green.
+      # No audit wrapper: pure reporting, and it is called at cron frequency by
+      # anything watching the fleet.
+      cmd_liveness "$@" ;;
     supervisor)
       # DIVE-724 P1: observe-only fleet supervisor. Board/--watch are read-only;
       # --tick appends rows to the supervisor_events table (tasks.db) and takes
