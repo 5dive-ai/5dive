@@ -22,6 +22,11 @@ _task_usage() {
       [--verifier=<agent>] [--max-iters=<n>] [--no-verify] [--task-budget=<tokens|\$cost>]
       [--customer] [--already-blocked=<what it blocked>]   escapes for the internal-filing cap
   ls [--status=] [--assignee=] [--mine] [--all] [--recurring]   open rows, priority-ordered
+  ls --gated[=human|agent]                      only rows holding a live gate. The 'gate' column is
+                                                on EVERY ls: HUMAN:<type> a person owes an answer,
+                                                <seat>:<type> an agent does, answered:<retire> the
+                                                answer survives only in gate-history, '-' nothing.
+                                                --gated=human is exactly the inbox set.
   show <id|DIVE-N>                              full detail + subtasks + blockers
   assign <id> <agent>                           reassign
   verifier <id> <agent> [--accept=] [--max-iters=]   attach or re-point the verifier rail
@@ -34,6 +39,11 @@ _task_usage() {
                                                 is NOT the ident number
   orphans [--all]                               rows whose assignee/verifier/creator is not a
                                                 registered agent (undispatchable, DIVE-3344)
+  doctor                                        every open row nothing will dispatch, and WHY —
+                                                no revisit anchor, a stale blocker edge, a park
+                                                past its wake or with none, or a seat nothing
+                                                wakes. Reports, never fixes; each
+                                                finding names the verb that clears it (DIVE-3784)
   wip-cap-install [--relane=<lane>]             snapshot each lane's actionable count as its
                                                 frozen WIP ceiling (deliberate, once)
   set-budget <id> <tokens|\$cost|none>           record an ADVISORY per-row token budget. Nothing enforces it
@@ -95,7 +105,8 @@ _task_usage() {
       [--relay-agent=<name>]     a button tap: WHO tapped, and whose bot carried it
   clear-recs --channel-proof=<chat_id> [--only=<id>]     apply pending recommendations
   queue [--for=<agent>] [--json]                gates ROUTED TO YOU, filed without waking you
-  inbox [--send [--channel-proof=<chat>]]       human-gated rows; --send DMs the owner
+  inbox [--send [--channel-proof=<chat>]]       every unanswered human gate IN THE FLEET (already
+                                                fleet-wide; --fleet accepted as a no-op); --send DMs the owner
   coordinator [--json]                          the agent fronting the needs-you banner
 
   loops [--stuck] [--escalate-stuck] [--all] [--runs] [--watch[=secs]] [--kill <loopId>]
@@ -244,6 +255,7 @@ cmd_task() {
     set-overlap)     cmd_task_set_overlap "$@" ;;
     wip-cap-install) cmd_task_wip_cap_install "$@" ;;
     orphans)         cmd_task_orphans "$@" ;;       # DIVE-3344 undispatchable rows
+    doctor)          cmd_task_doctor "$@" ;;        # DIVE-3784 every undispatchable class
     start)           cmd_task_start "$@" ;;
     done|close)      cmd_task_done "$@" ;;
     deliver)         cmd_task_deliver "$@" ;;
@@ -569,7 +581,7 @@ cmd_task_orphans() {
   local n; n=$(printf '%s' "$rows" | jq 'length')
   local scope_label; scope_label=$([[ -n "$all" ]] && echo all || echo open)
   if [[ "${n:-0}" == "0" ]]; then
-    ok "no orphaned rows — every assignee, verifier and creator on the ${scope_label} board names a registered agent" \
+    ok "no orphaned rows — every assignee, verifier and creator on the ${scope_label} board names a registered agent (a real NAME is not the same as a dispatchable row: 5dive task doctor)" \
        '{orphans:0, scope:$s}' --arg s "$scope_label"
     return 0
   fi
@@ -594,7 +606,8 @@ cmd_task_orphans() {
     out+="  ${ident}  [${st}]  ${marks}"$'\n'"        $(printf '%s' "$line" | jq -r '.title // ""')"$'\n'
   done < <(printf '%s' "$rows" | jq -c '.[]')
   warn "${n} row(s) name something that is not a registered agent — an undispatchable row is never picked and never says so:
-${out}Re-point with: 5dive task assign <ident> <agent>   ·   roster: 5dive agent list"
+${out}Re-point with: 5dive task assign <ident> <agent>   ·   roster: 5dive agent list
+A bad NAME is one of four ways a row goes undispatchable — for the other three (no revisit anchor, a stale blocker edge, a park past its wake): 5dive task doctor"
   ok "" '{orphans:($n|tonumber), scope:$s, rows:$rows}' \
     --arg n "$n" --arg s "$scope_label" --argjson rows "$rows"
 }

@@ -1,5 +1,84 @@
 # Changelog
 
+## Unreleased — feat(task): gate state on the surfaces people READ — `ls` column, `show` header, `--gated` (DIVE-3785)
+
+`task show` printed a row's gate at the TAIL of the record, below the body; `task ls` printed nothing at
+all. So the board could not answer the one question a fleet with a paired human is most often asked —
+*what is waiting on a person* — and the two ways of getting it wrong both cost real time in one week:
+
+- **Pending read as absent.** 2026-08-28 04:30Z: a `grep -A3` window over `task show` sat above the
+  `answer: — pending` line, so ten pending human gates read as zero and the founder was told "none of it
+  is waiting on you". A too-short window and a genuine absence produce byte-identical output.
+- **Answered read as nothing at all.** `park` archives the gate and CLEARS the live `need_*` columns, so
+  a gate answered and then parked makes `task show` render **no gate block whatsoever** — the signed tap
+  survives only in `gate_history`. Measured on the host at ship time: **8 open rows** are in that state.
+  DIVE-3447 has read gateless since a human approved it on 2026-08-16; DIVE-3594 was re-parked for 7 days
+  five minutes after its approval landed.
+
+- **`task ls` carries a `gate` column, always** (`-` is a value, not a blank): `HUMAN:<type>` a person
+  owes an answer, `<seat>:<type>` an agent seat does, `answered` / `answered:<retire-verb>` an answer
+  exists — the last of which is the only place an answered-then-parked gate is visible on the board.
+- **`task show` prints `gate = …` immediately after `status`**, spelled out: who is holding it, since
+  when, or the answer with its attribution AND the retirement that hid it, plus the `gate-history`
+  command that recovers the full record. A superseding unanswered withdrawal does not silently erase an
+  earlier signed answer — the header names both.
+- **`task ls --gated[=human|agent]`.** `--gated=human` is EXACTLY the `task inbox` set, by construction:
+  both call the same two single-source predicates rather than restating the rule (the DIVE-3224/3267
+  contract). `=agent` is its complement and equals the count `inbox` already withholds; `any` is the sum.
+  Asserted non-vacuously in `tests/task_gate_visibility_unit.sh`.
+- **`gate-history --json` emits a STABLE KEY SET.** `dbfmt` strips null keys fleet-wide (DIVE-1610) on
+  the premise that a missing key reads back as null. True for a value; false for the key SET, which is
+  how a reader tells absent from empty — an unanswered gate omitted `need_answer` entirely, so a parser
+  asking the WRONG key and one asking the right key about a never-answered gate got the identical `None`.
+  Measured on `origin/main`: two gates on one row returned key counts `[10, 7]` in the same array. That
+  cost an accusation — nine gates were read as never-answered and a verifier was told its authorisation
+  was fabricated; it was signed. Answer fields are now present-and-null, plus an explicit `answered`
+  boolean. Scoped to this projection: reversing DIVE-1610 globally would re-inflate every heartbeat tick.
+- **`task inbox --fleet` is accepted as a no-op** (absorbing cancelled OSS-36). `inbox` has been
+  fleet-wide by DEFAULT since DIVE-3224, so the flag OSS-36 specified was never built and anyone reaching
+  for it got `unknown flag: --fleet` — a hard error where the view they wanted was already on screen.
+
+## Unreleased — feat(task): `5dive task doctor` — every open row nothing will dispatch, and why (DIVE-3784)
+
+On 2026-08-28 05:00Z the board read **31 open rows** and `5dive-ai/5dive` main had not moved in **~42h**
+(`5816e7a` / `v0.23.0`, since 2026-08-26 10:23Z). Of the 31: 30 `blocked`, exactly **1 `todo`**. A reader
+of `task ls` sees a busy fleet; the dispatcher sees an idle one, and nothing said which was true.
+
+`task orphans` (DIVE-3344) already answered ONE of the four ways a row goes undispatchable — the name in
+`assignee` is not a registered agent. `doctor` is that idea widened to the rest, and it **reports, never
+fixes**: each finding names the verb that clears it and runs none of them.
+
+- **Four classes, four different predicates.** `no-anchor` (blocked with no dependency edge, no park, no
+  open gate — the negation of DIVE-1357's block anchor, reachable on rows that predate it); `stale-edge`
+  (blocked, and every blocker is closed); `wake-passed` (parked with a wake time already in the past);
+  `park-no-wake` (parked with no wake time at all — a hold that never revisits). Plus `dead-lane`: the
+  assignee is not on the roster, **or is on it and nothing will ever wake it** — no `heartbeat.enabled`,
+  or `desiredState: "stopped"`, which the wake loop *does* iterate and then fails on every tick, forever.
+- **`dead-lane` is strictly wider than `orphans`, and that is the point.** The roster is the union of
+  `agents.json` and the `agents_org` chart, but the wake loop iterates only
+  `.agents | map(select(.value.heartbeat.enabled == true))`. A seat with no heartbeat key is registered,
+  is never woken, and `orphans` calls it healthy. Measured on the host at ship time: 4 of 17 registered
+  agents carry no heartbeat key, and `orphans` reported 1 undispatchable row where `doctor` reported 2.
+  An operator-stopped seat is reported, not treated as a registry error: the honest line is "these rows
+  are parked on a seat you turned off".
+- **No flags.** The first cut carried a `--quiet` that suppressed the census, and the census is the answer
+  to the question the row was filed on — a flag that hides it reproduces the 42h. An unknown flag is
+  refused rather than accepted and ignored.
+- **The remedy line is the payload, not decoration.** The filing symptom was `5dive task unblock DIVE-3614`
+  printing `OK — DIVE-3614 unblocked` over a row that did not move: `unblock` drops **edges**, and the row
+  was **parked**, which has none. So a success message and no state change, silent in both directions. Each
+  class names its own verb, and the park classes say explicitly why `unblock` no-ops there.
+- **It degrades where `orphans` refuses.** `orphans` refuses outright with no readable roster — correctly,
+  since every name would then look orphaned. Three of `doctor`'s four classes are pure board SQL, so an
+  unreadable registry drops only the lane check, names the skip, and still reports the rest.
+- **A census on every run**, findings or not: open / dispatchable now / in progress / parked (with the next
+  wake) / awaiting a human gate / behind a live blocker. A clean run that printed only "no findings" over a
+  board 30-deep in holds would reproduce the 42h it was filed on.
+
+Complements the heartbeat's `_hb_blocked_sweep` (DIVE-1355) rather than replacing it: that pings `ops` over
+a2a at most once per 24h and covers two of these four classes. A throttled push to one seat's inbox is a
+different job from an operator looking at a stalled board now.
+
 ## Unreleased — feat(liveness): `5dive liveness` — a seat is alive only against an artifact it WROTE (DIVE-3778)
 
 The **v0.23 headline capability**. The theme was ratified 2026-08-26 as "Liveness you cannot fake"
