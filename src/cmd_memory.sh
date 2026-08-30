@@ -834,14 +834,21 @@ for store in stores:
         except OSError:
             idx = ""
         indexed = {os.path.basename(t) for t in MDLINK_RE.findall(idx)}
+        # DIVE-3821: a ROUTER deliberately does not name every atom — that is the
+        # whole point of it, and the unindexed-file warn would fire once per atom
+        # (613 of them on the store this was measured against), burying every real
+        # finding under the fix. A dead LINK is still drift and still an error:
+        # the router names few files, but the ones it does name must exist.
+        is_router = "5dive memory router" in idx
         for t in sorted(indexed):
             if t not in INDEX_NAMES and not os.path.isfile(os.path.join(store, t)):
                 add(sname, t, "index-drift", "error",
                     f"{index_file} links '{t}' but the file is missing")
-        for f in mem_files:
-            if f not in indexed:
-                add(sname, f, "index-drift", "warn",
-                    f"on disk but not listed in {index_file} (won't load into context)")
+        if not is_router:
+            for f in mem_files:
+                if f not in indexed:
+                    add(sname, f, "index-drift", "warn",
+                        f"on disk but not listed in {index_file} (won't load into context)")
 
     # --- dangling links + stale refs ---
     for f, (name, mtype, body, words) in docs.items():
