@@ -9,6 +9,12 @@
 # Everything runs against synthetic stores in a tempdir — no root, no network,
 # no real agent store touched.
 # Run: bash tests/memory_two_stage_recall_unit.sh
+#
+# TIER: nightly — 1.8s measured, and ~1.5s of that is the 300-atom scale fixture
+# that proves the router is bounded by its BUDGET and not by the atom count.
+# That control is the assertion the row turns on, so it is not droppable, and
+# the core tier is already at the cost its budget can carry — a new 1.8s guard
+# there buys nothing the full sweep does not also buy a few hours later.
 set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
