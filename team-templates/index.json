@@ -7,7 +7,7 @@
     {
       "slug": "5dive-team",
       "name": "5dive (AI-run company)",
-      "description": "The org that actually builds 5dive \u2014 CEO, CTO, DevOps, an engineer and a verifier, plus a CMO with community and creative. Our real chart, not an invented one.",
+      "description": "The company that builds 5dive, exported from our own org chart: CEO, CTO, DevOps, an engineer and a verifier, plus a CMO with community and creative.",
       "size": 8,
       "roster": [
         { "key": "olivia", "role": "CEO", "model": "opus", "reports_to": null },

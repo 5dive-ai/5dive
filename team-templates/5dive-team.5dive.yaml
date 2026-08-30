@@ -16,7 +16,7 @@ version: "2"
 
 team:
   name: "5dive (AI-run company)"
-  description: "The org that builds 5dive: CEO, CTO, DevOps, an engineer and a verifier, plus a CMO with community and creative"
+  description: "The company that builds 5dive, exported from our own org chart: CEO, CTO, DevOps, an engineer and a verifier, plus a CMO with community and creative"
   slug: 5dive-team
 
 defaults:
