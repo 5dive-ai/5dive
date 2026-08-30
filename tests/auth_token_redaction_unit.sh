@@ -93,6 +93,38 @@ else
   bad_t "case 3: token split across reads is masked, neither half leaks" "$out"
 fi
 
+# --- case 3b: the read boundary lands EXACTLY on the 13-byte marker -----------
+# The boundary case 3 cannot reach. It splits at n=20, INSIDE the token body, so
+# the buffer ends mid-match and the filter takes the "token match runs to end of
+# buffer" branch. At n=13 the buffer ends with the complete marker and NO body
+# char, so the token regex (which needs >=1 body char) does not match at all and
+# the partial-prefix loop is the only thing holding the tail back. A loop capped
+# at len(PREFIX)-1 never tests k=13, flushes the bare marker, and then writes the
+# body out unredacted on the next read: the whole credential in the clear.
+n=13
+out=$( { printf 'token: %s' "${FAKE:0:n}"; sleep 0.3; printf '%s\n' "${FAKE:n}"; } | _redact_oauth_stream )
+if [[ "$out" != *"$FAKE"* ]]; then
+  ok_t "case 3b: split exactly on the 13-byte marker boundary is masked"
+else
+  bad_t "case 3b: split exactly on the 13-byte marker boundary is masked" "$out"
+fi
+
+# --- case 3c: EVERY split point, not just the ones we thought of ---------------
+# Cases 3 and 3b each pin one offset; the defect they were written for was found
+# at an offset nobody had picked. A read boundary is not ours to choose — the pty
+# decides — so the property is "no split point leaks", and the arm sweeps all of
+# them rather than sampling.
+leaks=""
+for ((n=1; n<${#FAKE}; n++)); do
+  out=$( { printf 'token: %s' "${FAKE:0:n}"; sleep 0.05; printf '%s\n' "${FAKE:n}"; } | _redact_oauth_stream )
+  [[ "$out" == *"$FAKE"* ]] && leaks="$leaks $n"
+done
+if [[ -z "$leaks" ]]; then
+  ok_t "case 3c: sweep of all $(( ${#FAKE} - 1 )) split points — none leaks the token"
+else
+  bad_t "case 3c: sweep of all split points — none leaks the token" "leaked at n:$leaks"
+fi
+
 # --- case 4: end-to-end through script(1), the exact shape cmd_auth_login uses --
 # The log keeps the raw token (extract_claude_token has to read it); the piped
 # stream — the operator's terminal — must not.

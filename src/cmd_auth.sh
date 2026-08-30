@@ -1999,7 +1999,13 @@ while True:
     buf += chunk
     # Hold back a tail that is still ambiguous: either a token match that runs
     # to the end of the buffer (more token chars may follow in the next read),
-    # or a partial prefix of the token marker itself.
+    # or a prefix of the token marker itself. The prefix loop must start at
+    # len(PREFIX), NOT len(PREFIX) - 1: a read boundary landing exactly on the
+    # complete 13-byte marker leaves no token match (the regex needs >=1 body
+    # char), so a loop capped at 12 finds nothing, flushes the bare marker, and
+    # then flushes the body unredacted on the next read — the whole token in the
+    # clear. Covered by the n=13 arm and the full n=1..len(token) sweep in
+    # tests/auth_token_redaction_unit.sh.
     hold = len(buf)
     last = None
     for last in TOKEN.finditer(buf):
@@ -2007,7 +2013,7 @@ while True:
     if last is not None and last.end() == len(buf):
         hold = last.start()
     else:
-        for k in range(min(len(PREFIX) - 1, len(buf)), 0, -1):
+        for k in range(min(len(PREFIX), len(buf)), 0, -1):
             if buf[len(buf) - k:] == PREFIX[:k]:
                 hold = len(buf) - k
                 break
