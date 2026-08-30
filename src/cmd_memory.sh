@@ -827,6 +827,7 @@ for store in stores:
         evid[f] = evidence_of(text)
 
     # --- index drift ---
+    ROUTER_MARK = "<!-- router:generated -->"
     if index_file:
         try:
             with open(os.path.join(store, index_file), encoding="utf-8", errors="replace") as fh:
@@ -839,7 +840,15 @@ for store in stores:
         # (613 of them on the store this was measured against), burying every real
         # finding under the fix. A dead LINK is still drift and still an error:
         # the router names few files, but the ones it does name must exist.
-        is_router = "5dive memory router" in idx
+        #
+        # The exemption is keyed on a marker only the GENERATOR emits, never on
+        # prose in the file it exempts: an earlier cut matched the string
+        # "5dive memory router", which the router's own instructions tell agents
+        # to paste — so a genuinely flat index that merely MENTIONED the verb
+        # disarmed this check for its whole store, silently. That is the same
+        # silent-absence failure this row removes, relocated into the instrument
+        # that watches for it (quinn, iteration 1).
+        is_router = ROUTER_MARK in idx
         for t in sorted(indexed):
             if t not in INDEX_NAMES and not os.path.isfile(os.path.join(store, t)):
                 add(sname, t, "index-drift", "error",
@@ -1558,11 +1567,18 @@ function topics(list, k) {
   for (const a of list) for (const t of new Set(tokenize(`${a.slug} ${a.desc}`))) c.set(t, (c.get(t) ?? 0) + 1);
   return [...c.entries()].filter(([, n]) => n >= 2).sort((a, b) => b[1] - a[1]).slice(0, k).map(([t, n]) => `${t}·${n}`);
 }
-const AGENT = path.basename(path.dirname(path.dirname(path.dirname(ROOT)))).replace(/^agent-/, "") || "this seat";
+// ROOT is <home>/.claude/projects/<slug>/memory — four levels up is the home
+// directory, and the seat name is its basename. Three levels reached `.claude`
+// and every regenerated router was titled "(.claude)".
+const AGENT = path.basename(path.dirname(path.dirname(path.dirname(path.dirname(ROOT))))).replace(/^agent-/, "") || "this seat";
 
 function build(kTopics, nRecent) {
   const L = [];
   L.push(`# Memory router (${AGENT}) — ${atoms.length} atoms`);
+  // Structural marker. `memory doctor` keys its unindexed-file exemption on THIS
+  // and on nothing else, so the exemption cannot be handed to a flat index by
+  // quoting the router's own documentation. Do not remove it by hand.
+  L.push("<!-- router:generated -->");
   L.push("");
   L.push("**This file is not the map. It is the router.** Enumerating every atom here is what");
   L.push("made the old index outgrow the load limit — past it the loader drops the TAIL with no");
