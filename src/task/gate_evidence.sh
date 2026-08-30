@@ -246,6 +246,48 @@ _gate_gh_credentialed() {
 # -failed-check.md). Latent for a one-line producer like this, per quinn, and not the
 # bug being fixed — but there is no reason to re-introduce the shape while rewriting
 # the line.
+# DIVE-3823 — THE RECORDED-EVIDENCE RAIL. Three rails above ask GitHub; this one
+# reads a proof that was already RUN, and it exists because a verifier seat on a
+# private repo holds none of the three by design.
+#
+# THE DEADLOCK, measured on DIVE-3808 (fix merged at 2033057e, row unclosable):
+# DIVE-477 permits only the verifier of record to close a live delivered loop, and
+# the merge gate requires the closer to be able to READ the delivery PR. On
+# `agent-vesper` — no GH_TOKEN, no non-root SUDO_USER, no `_gh_do` grant (that is
+# the can-push grant a grader must not hold), anonymous rail 404 on a private repo —
+# both rails are correct and they enclose each other. The one seat allowed to close
+# is the one seat unable to. `--force-merge-gate` does NOT reach it: that flag
+# escapes a gate that RAN and disagreed, never one that asked nothing.
+#
+# WHAT THIS ACCEPTS, and why it is not a hole:
+#   * The refusal below ALREADY tells that seat to run `task verify --no-done
+#     --cmd=<ancestry/grep script>` "whose EXIT STATUS proves the merge". This is
+#     the gate finally reading its own recommended exit instead of printing it.
+#   * Only `--merge-proof` stamps these columns, and only when a command actually
+#     RAN and EXITED 0. It is structural, never keyed on result TEXT — the maker's
+#     `task deliver --result=` writes that column, so a text predicate would be
+#     satisfiable by typing the right words (DIVE-3098's rule, one column over).
+#   * It is consulted ONLY where no rail could ask at all. A caller holding a token
+#     or the bot grant takes the API path exactly as today; this can never
+#     substitute for an answer the gate could have gotten.
+#   * The proof binds to the delivery_ref it was run against. A re-pointed binding
+#     makes it inert rather than carrying it silently onto a different PR.
+#
+# WHAT IT DOES NOT CLAIM. The caller chose the command, so this is an ATTESTATION
+# by a named seat with the command text on the row and an audit line — strictly
+# stronger than the assertion `--force-merge-gate` records elsewhere, and weaker
+# than an API query. That is the honest ordering, and it is why the close warns
+# loudly and says whose proof it is rather than passing silently.
+#
+# Pure string logic on values the caller reads: no db, no network, so it is
+# testable on its own and cannot fail open through an unavailable query.
+# 0 when <proof_at> is set AND <proof_ref> is exactly the row's CURRENT <dref>.
+_gate_merge_proof_ok() { # <proof_at> <proof_ref> <dref>
+  local proof_at="${1:-}" proof_ref="${2:-}" dref="${3:-}"
+  [[ -n "$proof_at" && -n "$proof_ref" && -n "$dref" ]] || return 1
+  [[ "$proof_ref" == "$dref" ]]
+}
+
 _gate_refuse_no_rail() {
   local ident="$1" subject="$2"
   # DIVE-2770: name WHICH way the credential-free rail failed. Rate-limited clears
@@ -257,7 +299,7 @@ _gate_refuse_no_rail() {
   # one that structurally can never resolve, and that ambiguity is what let an inert
   # gate stay invisible for a fleet-wide census.
   local _tokwhy; _tokwhy="$(_gate_tok_why)"
-  policy_refuse "$E_CONFLICT" done-merge-gate-no-credential DIVE-2318 "$ident" "$ident cannot close: the merge gate COULD NOT CHECK whether ${subject} landed — no gh credential resolved in this caller's environment, the machine-account rail is unreachable, AND the credential-free rail could not answer either (DIVE-2770: an unauthenticated read of a public repo). No query ran at all. ${_why} This says NOTHING about the merge; do not read it as 'not merged'. WHICH OF TWO CAUSES THIS IS decides what you should do, and the gate cannot tell them apart from here. (a) BY FAULT: a builder that should hold the \`_gh_do\` grant is missing it — a provisioning problem with a name. Check it with \`5dive gh whoami\`; if the bot line is UNRESOLVED and you are a builder, that is the thing to fix (\`agent create --can-push\`), or re-run with a token (\`GH_TOKEN=\$(sudo -u claude gh auth token) 5dive task done $ident ...\`). (b) BY DESIGN: on a VERIFIER seat an UNRESOLVED bot line is the CORRECT state — \`_gh_do\` is the can-push grant a grader must not hold, so no credential is coming. Record machine evidence without claiming the merge by running \`5dive task verify $ident --no-done --cmd=<script>\` — e.g. \`git fetch -q origin main && git merge-base --is-ancestor <merge-sha> origin/main && git grep -q <a-symbol-the-PR-added> origin/main -- <path>\`, whose EXIT STATUS proves the merge rather than asserting it, and which is squash-proof where a sha comparison is not. That is terminal for the verifier and leaves the row visibly at graded->merge; the merge owner must later close through \`task done\`, whose gate answers this question. \`--force-merge-gate\` does NOT reach this refusal: it escapes a gate that RAN and disagreed, never one that asked nothing. \`task merge-audit --limit=1\` reports the same missing credential. WHERE IT ACTUALLY STOPPED (DIVE-1935) — ${_tokwhy}; machine-account rail: $(_gate_gh_bot_ok && printf 'available' || printf 'not permitted on this seat'). Re-run that resolution on its own, graded against a known-merged PR, with \`5dive task merge-gate-selftest\`."
+  policy_refuse "$E_CONFLICT" done-merge-gate-no-credential DIVE-2318 "$ident" "$ident cannot close: the merge gate COULD NOT CHECK whether ${subject} landed — no gh credential resolved in this caller's environment, the machine-account rail is unreachable, AND the credential-free rail could not answer either (DIVE-2770: an unauthenticated read of a public repo). No query ran at all. ${_why} This says NOTHING about the merge; do not read it as 'not merged'. WHICH OF TWO CAUSES THIS IS decides what you should do, and the gate cannot tell them apart from here. (a) BY FAULT: a builder that should hold the \`_gh_do\` grant is missing it — a provisioning problem with a name. Check it with \`5dive gh whoami\`; if the bot line is UNRESOLVED and you are a builder, that is the thing to fix (\`agent create --can-push\`), or re-run with a token (\`GH_TOKEN=\$(sudo -u claude gh auth token) 5dive task done $ident ...\`). (b) BY DESIGN: on a VERIFIER seat an UNRESOLVED bot line is the CORRECT state — \`_gh_do\` is the can-push grant a grader must not hold, so no credential is coming. Record machine evidence without claiming the merge by running \`5dive task verify $ident --no-done --cmd=<script>\` — e.g. \`git fetch -q origin main && git merge-base --is-ancestor <merge-sha> origin/main && git grep -q <a-symbol-the-PR-added> origin/main -- <path>\`, whose EXIT STATUS proves the merge rather than asserting it, and which is squash-proof where a sha comparison is not. That is terminal for the verifier and leaves the row visibly at graded->merge; the merge owner must later close through \`task done\`, whose gate answers this question. DIVE-3823: add \`--merge-proof\` to that same command and the exit status is RECORDED against this row's delivery binding — a later \`task done\` from this seat then closes on the recorded proof instead of a query it can never run, warning loudly and naming who proved it. It stops counting the moment the binding is re-pointed. \`--force-merge-gate\` does NOT reach this refusal: it escapes a gate that RAN and disagreed, never one that asked nothing. \`task merge-audit --limit=1\` reports the same missing credential. WHERE IT ACTUALLY STOPPED (DIVE-1935) — ${_tokwhy}; machine-account rail: $(_gate_gh_bot_ok && printf 'available' || printf 'not permitted on this seat'). Re-run that resolution on its own, graded against a known-merged PR, with \`5dive task merge-gate-selftest\`."
 }
 
 # DIVE-2770: THE ANONYMOUS RAIL — the gate's own question has a credential-free

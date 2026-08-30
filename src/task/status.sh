@@ -862,7 +862,39 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
           "$ident cannot close: its delivery binding ${_dref} was recorded at loop iteration ${_bind_iter}, and the loop is now at ${_cur_iter}. The work bounced back to the maker and was re-delivered after that PR was bound, so closing here would grade a PR that does not contain the re-delivered work (DIVE-2057 is the clean instance of that). Re-point the binding to the PR carrying the CURRENT iteration — \`task deliver $ident --pr=https://github.com/<owner>/<repo>/pull/N\` — then \`task done\`."
       fi
     fi
-    if [[ -n "$_dref" || -n "$_branch" ]]; then
+    # DIVE-3823: THE RECORDED-EVIDENCE RAIL, read BEFORE the gate interrogates
+    # GitHub — because on the seat this rescues there is no GitHub to interrogate.
+    #
+    # DIVE-477 lets only the verifier close a live delivered loop; this gate wants
+    # the closer to READ the delivery PR. On a verifier seat over a PRIVATE repo
+    # neither is negotiable and neither is wrong, so the row was closable by NO
+    # seat (DIVE-3808: fix merged at 2033057e, stuck). See _gate_merge_proof_ok for
+    # the full argument and the limits of what a proof claims.
+    #
+    # SCOPED TO THE CALLER THAT HOLDS NOTHING. A caller with a token or the `_gh_do`
+    # grant takes the API path exactly as before — a recorded proof must never
+    # substitute for an answer the gate could have gotten, or every credentialed
+    # close silently starts trusting an attestation instead of a measurement. The
+    # db read is first only because it is free; the credential test is what decides.
+    local _mg_proof_at="" _mg_proof_ref="" _mg_proof_by="" _mg_proof_cmd="" _mg_proof_ok=0
+    if [[ -n "$_dref" ]]; then
+      IFS=$'\x1f' read -r _mg_proof_at _mg_proof_ref _mg_proof_by _mg_proof_cmd <<<"$(
+        db "SELECT COALESCE(merge_proof_at,'')||x'1f'||COALESCE(merge_proof_ref,'')||x'1f'||
+                   COALESCE(merge_proof_by,'')||x'1f'||COALESCE(merge_proof_cmd,'')
+            FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null || printf '')"
+      if _gate_merge_proof_ok "$_mg_proof_at" "$_mg_proof_ref" "$_dref" \
+         && ! _gate_gh_credentialed "$(_gate_gh_token)"; then
+        _mg_proof_ok=1
+      fi
+    fi
+    if [[ -n "$_dref" ]] && (( _mg_proof_ok )); then
+      # A declared delivery is still something that was verified — just not by a
+      # query. Setting this keeps the DIVE-1830 accounting honest either way.
+      _mg_had_subject=1
+      _task_store_audit_log "task.merge-proof-close" ok 0 -- \
+        "$ident" "ref=$_mg_proof_ref" "proved_by=$_mg_proof_by" "at=$_mg_proof_at" "cmd=$_mg_proof_cmd"
+      warn "$ident: the merge gate could not ASK anything (this seat holds no gh credential and the anonymous rail cannot see a private repo), so it is closing on RECORDED MACHINE EVIDENCE instead (DIVE-3823, audited): '$_mg_proof_by' ran \`$_mg_proof_cmd\` against $_mg_proof_ref at $_mg_proof_at and it exited 0. That is an attestation by a named seat, not an API answer — if the two ever disagree, the API is right."
+    elif [[ -n "$_dref" || -n "$_branch" ]]; then
       _mg_had_subject=1     # a declared delivery IS something to verify
       if ! command -v gh >/dev/null 2>&1; then
         fail "$E_GENERIC" "$ident declared delivered work (${_dref:-branch $_branch}) but gh is unavailable to confirm the merge — install gh"
