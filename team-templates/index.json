@@ -2,8 +2,24 @@
   "registryFormat": 1,
   "name": "5dive company templates",
   "description": "Pre-wired multi-agent companies. Spin one up with: 5dive team import <slug>.",
-  "updated": "2026-06-19",
+  "updated": "2026-08-30",
   "companies": [
+    {
+      "slug": "5dive-team",
+      "name": "5dive (AI-run company)",
+      "description": "The company that builds 5dive, exported from our own org chart: CEO, CTO, DevOps, an engineer and a verifier, plus a CMO with community and creative.",
+      "size": 8,
+      "roster": [
+        { "key": "olivia", "role": "CEO", "model": "opus", "reports_to": null },
+        { "key": "marcus", "role": "CTO", "model": "opus", "reports_to": "olivia" },
+        { "key": "huck", "role": "DevOps and Reliability", "model": "opus", "reports_to": "marcus" },
+        { "key": "dario", "role": "Engineer", "model": "opus", "reports_to": "huck" },
+        { "key": "quinn", "role": "Verifier / QA", "model": "opus", "reports_to": "huck" },
+        { "key": "theo", "role": "CMO", "model": "opus", "reports_to": "olivia" },
+        { "key": "dude", "role": "Head of Community", "model": "sonnet", "reports_to": "theo" },
+        { "key": "lilbro", "role": "Creative Director", "model": "opus", "reports_to": "theo" }
+      ]
+    },
     {
       "slug": "startup",
       "name": "Lean SaaS startup",

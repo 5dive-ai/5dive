@@ -22,8 +22,10 @@ accounts later to avoid the shared-account burst rate-limit.
 
 | File | Team | Roles |
 | --- | --- | --- |
+| `5dive-team.5dive.yaml` | 5dive (AI-run company) | CEO, CTO, DevOps, Engineer, Verifier, CMO, Community, Creative |
 | `startup.5dive.yaml` | Lean SaaS startup | CEO, CMO, DevOps, Competitor Researcher, Creative |
 | `content-studio.5dive.yaml` | Content studio | Editor-in-Chief, Writer, SEO, Designer, Distributor |
+| `eng-studio.5dive.yaml` | Eng Studio | CEO, Eng Manager, Designer, Release Manager, Doc Engineer, QA |
 
 ## Schema
 

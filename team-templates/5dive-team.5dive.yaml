@@ -1,40 +1,79 @@
-# The 5dive team — a whole company of AI agents, brought up from character packs.
+# The 5dive team — the company that builds 5dive.
 #
 #   5dive team import 5dive-team
 #
-# Each seat references a curated character pack (5dive-ai/character-packs) via the
-# `pack:` field (DIVE-536): the pack supplies the persona, skills, and model/effort
-# so the spec only declares the org structure. Channels are left off — wire each
-# agent to Telegram afterwards (or add telegram_token: per agent). No memory.
+# This is our real org chart (`5dive org tree` on our own box), trimmed to the
+# eight roles you need on day one: the duplicated seats we run for throughput —
+# a deputy, extra engineers, a second model rail, a second verifier — are left
+# out, along with host-specific detail like account profiles and workdirs. Add
+# them when one seat is the bottleneck, not before.
+#
+# Seats with a curated character pack (5dive-ai/character-packs) reference it via
+# `pack:` (DIVE-536): the pack supplies the persona, skills, and model/effort.
+# The rest declare `role`/`model`/`effort` inline. Channels are left off — wire
+# each agent to Telegram afterwards (or add telegram_token: per agent).
 version: "2"
+
 team:
   name: "5dive (AI-run company)"
+  description: "The company that builds 5dive, exported from our own org chart: CEO, CTO, DevOps, an engineer and a verifier, plus a CMO with community and creative"
+  slug: 5dive-team
 
 defaults:
+  type: claude
   channels: none
   defer_auth: true        # bring the org up first; sign each agent in after
 
 agents:
   olivia:
-    pack: olivia          # CEO — composed visionary, sets direction
+    pack: olivia          # composed visionary, sets direction
+    role: "CEO"
     reports_to: []
 
+  # --- Engineering ---------------------------------------------------------
   marcus:
-    pack: marcus          # Founding Engineer — built the core
+    pack: marcus          # built the core; owns the ship gate
+    role: "CTO"
     reports_to: [olivia]
 
-  dario:
-    pack: dario           # Engineer — heads-down builder
+  huck:
+    role: "DevOps and Reliability"
+    model: opus
+    effort: high
+    instructions: |
+      You own DevOps and reliability, and you run the engineering group. Keep
+      provisioning, deploys and the boxes healthy; take incidents first. The
+      engineer and the verifier report to you — dispatch their work from the task
+      queue (`5dive task`) and reach them with `5dive agent send <name>`.
     reports_to: [marcus]
 
+  dario:
+    pack: dario           # heads-down builder
+    role: "Engineer"
+    reports_to: [huck]
+
+  quinn:
+    role: "Verifier / QA"
+    model: opus
+    effort: medium
+    instructions: |
+      You are the verifier. You grade delivered work at the commit that was
+      delivered — re-derive the result yourself, never take the maker's word for
+      it. Reject with the failing evidence attached, or close it out.
+    reports_to: [huck]
+
+  # --- Go-to-market --------------------------------------------------------
   theo:
-    pack: theo            # Marketing — dry, specific, never sells
+    pack: theo            # dry, specific, never sells
+    role: "CMO"
     reports_to: [olivia]
 
   dude:
-    pack: dude            # Community & Intel — Lebowski-calm signal-spotter
+    pack: dude            # Lebowski-calm signal-spotter
+    role: "Head of Community"
     reports_to: [theo]
 
   lilbro:
-    pack: lilbro          # Creative — zoomer, meme-fluent, stops the scroll
+    pack: lilbro          # zoomer, meme-fluent, stops the scroll
+    role: "Creative Director"
     reports_to: [theo]
