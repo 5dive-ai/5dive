@@ -13,10 +13,11 @@ source src/header.sh
 # shellcheck source=/dev/null
 source src/cmd_account.sh
 
-PASS=0 FAIL=0
+PASS=0
+FAIL=0
 t() {
-  if [[ "$2" == "$3" ]]; then PASS=$((PASS + 1)); else
-    FAIL=$((FAIL + 1)); printf 'FAIL: %s — expected %s, got %s\n' "$1" "$2" "$3"
+  if [[ "$2" == "$3" ]]; then PASS=$((PASS+1)); else
+    FAIL=$((FAIL+1)); printf 'FAIL: %s — expected %s, got %s\n' "$1" "$2" "$3"
   fi
 }
 rc_of() { if "$@"; then printf '0'; else printf '%s' "$?"; fi; }
