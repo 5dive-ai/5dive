@@ -136,6 +136,16 @@ t "DIVE-3272 regex: dev3's real 429 line matches" "MATCH" \
   "$( [[ -n "$(q '● API Error: Request rejected (429) · Your token-plan 1-week quota has been exhausted.')" ]] && echo MATCH || echo MISS )"
 t "DIVE-3272 regex: the spend-limit phrasing matches" "MATCH" \
   "$( [[ -n "$(q "You've hit your monthly spend limit. Opus 5 5h: 0% 1w: 100%")" ]] && echo MATCH || echo MISS )"
+t "DIVE-3822 regex: 5h=0 with 7d=100 is weekly-exhausted" "MATCH" \
+  "$( [[ -n "$(q 'Opus 5 5h: 0% 7d: 100%')" ]] && echo MATCH || echo MISS )"
+t "DIVE-3822 regex: missing 5h with 7d=100 is still weekly-exhausted" "MATCH" \
+  "$( [[ -n "$(q 'Opus 5 7d: 100%')" ]] && echo MATCH || echo MISS )"
+t "DIVE-3822 regex: 1w spelling at 100 is weekly-exhausted" "MATCH" \
+  "$( [[ -n "$(q 'Opus 5 5h: 0% 1w: 100%')" ]] && echo MATCH || echo MISS )"
+t "DIVE-3822 regex: a healthy 7d counter does NOT exhaust the seat" "MISS" \
+  "$( [[ -n "$(q 'Opus 5 7d: 28%')" ]] && echo MATCH || echo MISS )"
+t "DIVE-3822 regex: a healthy 1w counter does NOT exhaust the seat" "MISS" \
+  "$( [[ -n "$(q 'Opus 5 5h: 18% 1w: 34%')" ]] && echo MATCH || echo MISS )"
 t "DIVE-3272 regex: insufficient_quota matches" "MATCH" \
   "$( [[ -n "$(q 'openai error: insufficient_quota')" ]] && echo MATCH || echo MISS )"
 # Negative controls with a NON-ZERO expected value: these are the false
