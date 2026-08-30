@@ -156,8 +156,18 @@ t "armed + budget free -> the rung acts, it does not page a human" \
 # staged. `cmd_restart` is stubbed to record the seat and nothing else — this
 # harness must never touch a real unit, and what is under test is that the tick
 # ROUTES to it, not what systemd does next.
-tick_arm() {  # <snapshot-json> [armed] [seed-sql] -> "ESC=<json>|SENT=<csv>|ACT=<json>|RESTARTED=<csv>"
-  SNAP="$1" ARMED="${2:-}" SEED="${3:-}" REPO="$PWD" bash -c '
+#
+# DIVE-3822 adds REGISTRY, ROTATE_RESULT and TICKS. The rotate implementation is
+# replaced at its destructive boundary, but `_sup_quota_rotate` and the REAL
+# tick remain in the path. Recording argv proves the tick asks the production
+# selector for `--require-live-headroom`; running two ticks against one DB proves
+# the no-target alert is deduped by behavior, not merely by a helper predicate.
+tick_arm() {  # <snapshot-json> [armed] [seed-sql] [registry-json] [rotated|no-target|failed] [ticks]
+  local fixture_registry="${4:-}"
+  [[ -n "$fixture_registry" ]] || fixture_registry='{"agents":{}}'
+  SNAP="$1" ARMED="${2:-}" SEED="${3:-}" \
+    FIXTURE_REGISTRY="$fixture_registry" ROTATE_RESULT="${5:-no-target}" TICKS="${6:-1}" \
+    REPO="$PWD" bash -c '
     set -euo pipefail
     TMP=$(mktemp -d)
     export STATE_DIR="$TMP/state" TASKS_DIR="$TMP/tasks" TASKS_DB="$TMP/tasks/tasks.db"
@@ -177,11 +187,21 @@ tick_arm() {  # <snapshot-json> [armed] [seed-sql] -> "ESC=<json>|SENT=<csv>|ACT
     require_root()      { :; }                       # the tick is root-only in prod
     _sup_cli_check()    { :; }                        # no network
     _sup_snapshot()     { printf "%s" "$SNAP"; }      # the fixture fleet
-    registry_read()     { printf "%s" "{\"agents\":{}}"; }
+    registry_read()     { printf "%s" "$FIXTURE_REGISTRY"; }
     _task_agent_channel() { return 1; }               # no telegram anywhere
-    : >"$TMP/sent"; : >"$TMP/restarted"
+    : >"$TMP/sent"; : >"$TMP/restarted"; : >"$TMP/rotated"; : >"$TMP/capacity-alerts"
     cmd_send() { printf "%s\n" "$1" >>"$TMP/sent"; return 0; }
     cmd_restart() { printf "%s\n" "$1" >>"$TMP/restarted"; return 0; }
+    with_registry_lock() { "$@"; }
+    cmd_agent_rotation_rotate() {
+      printf "%s\n" "$*" >>"$TMP/rotated"
+      case "$ROTATE_RESULT" in
+        rotated)   printf "%s\n" "{\"ok\":true,\"data\":{\"rotated\":true}}" ;;
+        no-target) printf "%s\n" "{\"ok\":true,\"data\":{\"rotated\":false}}" ;;
+        *)         return 1 ;;
+      esac
+    }
+    _sup_capacity_alert() { printf "%s:%s\n" "$1" "$2" >>"$TMP/capacity-alerts"; }
     # The seed writes BEFORE the tick, so it has to create the schema itself —
     # nothing else has touched this fixture DB yet. Both calls are subshelled:
     # `db` reaches `fail`, and `fail` EXITS, which `|| true` cannot catch.
@@ -189,12 +209,20 @@ tick_arm() {  # <snapshot-json> [armed] [seed-sql] -> "ESC=<json>|SENT=<csv>|ACT
       ( tasks_db_init ) >/dev/null 2>&1 || true
       ( db "$SEED" )    >/dev/null 2>&1 || true
     fi
-    cmd_supervisor_tick >/dev/null 2>&1 || { printf "TICK-RC=%s|" "$?"; }
-    printf "ESC=%s|SENT=%s|ACT=%s|RESTARTED=%s" \
+    tick_n=0
+    while (( tick_n < TICKS )); do
+      cmd_supervisor_tick >/dev/null 2>&1 || { printf "TICK-RC=%s|" "$?"; }
+      tick_n=$((tick_n + 1))
+    done
+    printf "ESC=%s|SENT=%s|ACT=%s|RESTARTED=%s|ROTATED=%s|ALERTS=%s|ALERT_ROWS=%s|NUDGE_ROWS=%s" \
       "$(db "SELECT COALESCE(GROUP_CONCAT(signals), \"\") FROM supervisor_events WHERE event=$(sqlq escalate);")" \
       "$(paste -sd, <"$TMP/sent")" \
       "$(db "SELECT COALESCE(GROUP_CONCAT(signals), \"\") FROM supervisor_events WHERE event=$(sqlq action);")" \
-      "$(paste -sd, <"$TMP/restarted")"
+      "$(paste -sd, <"$TMP/restarted")" \
+      "$(paste -sd, <"$TMP/rotated")" \
+      "$(paste -sd, <"$TMP/capacity-alerts")" \
+      "$(db "SELECT COUNT(*) FROM supervisor_events WHERE event=$(sqlq alert) AND classification=$(sqlq quota-exhausted);")" \
+      "$(db "SELECT COUNT(*) FROM supervisor_events WHERE event=$(sqlq action) AND signals LIKE $(sqlq %\\\"rung\\\":\\\"nudge\\\"%);")"
   '   # stderr deliberately NOT swallowed: the arm already fails closed (an abort
       # yields an empty receipt, which reds), but a red with no reason costs the
       # next reader a repro. The tick's own warns are silenced at its call above.
@@ -263,6 +291,30 @@ t "rate-limited tick: no second restart inside the window" "" "$(fld "$limited_o
 t "rate-limited tick: it escalates instead, naming the limiter" "restart-rate-limited" \
   "$(jq -r '.reason // "NO-REASON"' <<<"$(fld "$limited_out" ESC)" 2>/dev/null || echo NO-ESCALATE-ROW)"
 t "rate-limited tick: and the escalation reaches a courier" "ops" "$(fld "$limited_out" SENT)"
+
+# ── DIVE-3822: weekly exhaustion, real tick wiring ───────────────────────────
+_QUOTA_SNAP='[{"name":"ops","type":"claude","classification":"quota-exhausted","cause":"quota-exhausted","detail":"Opus 5 5h: 0% 7d: 100%"},
+                 {"name":"quinn","type":"claude","classification":"healthy"}]'
+_QUOTA_REG='{"agents":{"ops":{"rotation":{"enabled":true}}}}'
+
+quota_rotated_out=$(tick_arm "$_QUOTA_SNAP" armed "" "$_QUOTA_REG" rotated)
+t "quota tick: invokes rotation through the measured-headroom fence" \
+  "ops --require-live-headroom" "$(fld "$quota_rotated_out" ROTATED)"
+t "quota tick: an eligible target records the rotate action" "rotate" \
+  "$(jq -r '.rung // "NO-RUNG"' <<<"$(fld "$quota_rotated_out" ACT)" 2>/dev/null || echo NO-ACTION-ROW)"
+t "quota tick: successful rotation is quiet" "" "$(fld "$quota_rotated_out" ALERTS)"
+t "quota tick: successful rotation never reaches the nudge ladder" "0" \
+  "$(fld "$quota_rotated_out" NUDGE_ROWS)"
+
+quota_no_target_out=$(tick_arm "$_QUOTA_SNAP" armed "" "$_QUOTA_REG" no-target 2)
+t "quota tick: no measured target still uses the headroom-fenced selector" \
+  "ops --require-live-headroom,ops --require-live-headroom" "$(fld "$quota_no_target_out" ROTATED)"
+t "quota tick: no measured target emits one capacity alert across two ticks" \
+  "ops:quota-exhausted" "$(fld "$quota_no_target_out" ALERTS)"
+t "quota tick: the dedup ledger contains exactly one alert row" "1" \
+  "$(fld "$quota_no_target_out" ALERT_ROWS)"
+t "quota tick: no measured target never falls into the nudge ladder" "0" \
+  "$(fld "$quota_no_target_out" NUDGE_ROWS)"
 
 # ── the human-facing text ────────────────────────────────────────────────────
 txt=$(_sup_escalate_text main poller-dead rung-4-needed quinn)
