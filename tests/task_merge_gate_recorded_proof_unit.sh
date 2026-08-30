@@ -29,6 +29,18 @@
 #       nothing for the evidence to be ABOUT
 #   T8  the close is LOUD and AUDITED: it names who proved it, with what, and when
 #
+# MUTATION GRADE — RUN against this worktree's src/, not predicted (2026-08-30;
+# each mutant from 37/0 clean, and the arm names are the ones that ACTUALLY went red):
+#   * gate never consults the proof (`(( _mg_proof_ok ))` -> `(( 0 ))`)  -> 30/7:
+#     both T1 close arms and four of T8. T1b/T2/T3/T5/T6/T7 stay GREEN, and that is
+#     the point of writing them — they grade the NARROWNESS, so a fix that does
+#     nothing must not be able to buy their greens.
+#   * `_gate_merge_proof_ok` drops the ref-equality test               -> 33/4: T0's
+#     different-ref arm and all three T3 arms. A four-arm kill on one predicate line.
+#   * a FAILING proof is recorded anyway (`rc == 0` -> always)         -> 34/3: all
+#     of T5. That is the direction arm: without it the flag would record evidence
+#     that the delivery did NOT land as evidence that it did.
+#
 # Isolation matches the sibling gate harnesses (task_merge_gate_anon_rail_unit.sh):
 # src/ sourced into a throwaway STATE_DIR — the live tasks.db is NEVER touched — and
 # gh/sudo/curl are stubbed on PATH, so this file makes no network call and needs no
