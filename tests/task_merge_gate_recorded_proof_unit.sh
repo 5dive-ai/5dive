@@ -45,6 +45,11 @@
 # src/ sourced into a throwaway STATE_DIR — the live tasks.db is NEVER touched — and
 # gh/sudo/curl are stubbed on PATH, so this file makes no network call and needs no
 # root.
+# TIER: nightly — 4.9s measured on the 5dive dev host (slowest of three consecutive
+# runs: 4.9/4.5/4.9s): does not fit the 300s PR core, and its closest sibling
+# task_merge_gate_deploy_note_unit.sh was demoted at 5.8s for the same reason. The
+# cost is real `task done` closes at ~0.5s each. A PR that touches this file still
+# runs it — the changed-harnesses job ignores tier.
 # Run: bash tests/task_merge_gate_recorded_proof_unit.sh
 set -uo pipefail
 
