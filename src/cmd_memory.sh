@@ -33,6 +33,34 @@ _memory_usage() {
                · wiki: shared wiki only
       --agent  search ANOTHER agent's store (per-user 0600 — root only; the
                shared path for cross-agent knowledge is the wiki)
+      --index  TWO-STAGE RECALL (DIVE-3821). Print one INDEX ROW per file —
+               slug + the one-line description + score, no bodies — then fetch
+               only what you chose with `memory get`. Measured on a real
+               633-atom store, same query: 8 rows = 459 tok against 8 snippets
+               = 1008 tok. --limit defaults to 25 here — the point of stage 1
+               is to see enough candidates to choose between, and 25 rows
+               (1401 tok) still beat 8 snippets on candidates per token.
+
+  5dive memory get <slug> [<slug>...] [--max-tokens=T] [--roots=a,b]
+                          [--store=all|mine|wiki] [--agent=<name>]
+      Stage 2: print the FULL bodies of the named atoms, over the same roots
+      `search` ranks. Slugs are the ones `search --index` printed (- and _ are
+      interchangeable); an unknown slug names its near neighbours instead of
+      just refusing. Exits 4 only when NOTHING resolved — a partial fetch is a
+      fetch. Idea credit: claude-mem (Apache-2.0) search → get_observations.
+
+  5dive memory router [--root=<dir>] [--agent=<name>] [--budget=BYTES]
+                      [--recent=N] [--write]
+      Rebuild MEMORY.md as a small ROUTER instead of a flat enumeration of
+      every atom. A flat index grows with the store and, past the ~24 KB load
+      limit, the loader drops its TAIL with no error — the oldest facts stop
+      existing silently. The router carries the recall protocol, a typed topic
+      map with counts, and the newest N atoms by slug; everything else stays on
+      disk and is reached through `search --index` + `get`. NOTHING is deleted.
+      Dry-run by default. --write backs the old index up to
+      MEMORY.md.pre-router-<stamp> first. A block between
+      `<!-- router:keep-start -->` / `<!-- router:keep-end -->` is carried over
+      verbatim — the generator never owns your hand-written standing lines.
 
   5dive memory add --name=<kebab-slug> --description="<one-liner>"
                    [--type=user|feedback|project|reference] [--store=mine|wiki]
@@ -147,32 +175,17 @@ _memory_default_roots() {
   fi
 }
 
-_memory_search() {
-  local query="" limit=8 maxtok=1500 roots="" store="all" agent=""
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --limit=*)      limit="${1#*=}" ;;
-      --max-tokens=*) maxtok="${1#*=}" ;;
-      --roots=*)      roots="${1#*=}" ;;
-      --store=*)      store="${1#*=}" ;;
-      --agent=*)      agent="${1#*=}" ;;
-      -h|--help)      _memory_usage; return 0 ;;
-      --*)            fail "$E_USAGE" "memory search: unknown flag: $1" ;;
-      *)              [ -z "$query" ] && query="$1" || query="$query $1" ;;
-    esac
-    shift
-  done
-  [ -n "$query" ] || { _memory_usage; fail "$E_USAGE" "memory search: a query is required"; }
-  require_node "memory search"
-  case "$store" in all|mine|wiki) : ;; *) fail "$E_VALIDATION" "bad --store '$store' (all | mine | wiki)" ;; esac
-  if [ -n "$roots" ] && { [ "$store" != "all" ] || [ -n "$agent" ]; }; then
-    fail "$E_USAGE" "--roots overrides scoping — don't combine it with --store/--agent"
-  fi
-  # Scoping (DIVE-897): resolve roots from --store/--agent unless --roots wins.
-  # --agent reads another agent's per-user store — 0600, so root only; the
-  # sanctioned cross-agent path is the shared wiki (agents PUBLISH there via
-  # `memory add --store=wiki`; private stores stay private, deny-by-default per
-  # the DIVE-481 distillation-gate posture).
+# Scoping (DIVE-897): resolve roots from --store/--agent unless --roots wins.
+# --agent reads another agent's per-user store — 0600, so root only; the
+# sanctioned cross-agent path is the shared wiki (agents PUBLISH there via
+# `memory add --store=wiki`; private stores stay private, deny-by-default per
+# the DIVE-481 distillation-gate posture).
+# DIVE-3821: lifted out of `search` verbatim so `get` and `router` resolve the
+# SAME roots — a fetch that could not see what the index row came from is not a
+# second stage, it is a second store.
+# $1=store  $2=agent  $3=explicit --roots (wins when non-empty)
+_memory_resolve_roots() {
+  local store="$1" agent="$2" roots="$3"
   if [ -z "$roots" ]; then
     local own="" wiki=""
     if [ -n "$agent" ]; then
@@ -188,6 +201,41 @@ _memory_search() {
     if [ -n "$own" ] && [ -n "$wiki" ]; then roots="$own,$wiki"; else roots="${own}${wiki}"; fi
   fi
   [ -n "$roots" ] || fail "$E_NOT_FOUND" "no memory stores found (looked in ~/.claude/projects/*/memory); pass --roots="
+  echo "$roots"
+}
+
+_memory_search() {
+  # DIVE-3821: two-stage recall. --index returns INDEX ROWS (slug + the
+  # one-line description + score), one per FILE, with no bodies — the cheap
+  # first stage. `memory get <slug>...` is the second stage and fetches the
+  # full bodies for the handful of slugs that were actually chosen.
+  local query="" limit=8 limit_set=0 maxtok=1500 roots="" store="all" agent="" index=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --limit=*)      limit="${1#*=}"; limit_set=1 ;;
+      --index)        index=1 ;;
+      --index=*)      case "${1#*=}" in 1|true|yes) index=1 ;; 0|false|no) index=0 ;; *) fail "$E_VALIDATION" "--index takes no value (or 1|0)" ;; esac ;;
+      --max-tokens=*) maxtok="${1#*=}" ;;
+      --roots=*)      roots="${1#*=}" ;;
+      --store=*)      store="${1#*=}" ;;
+      --agent=*)      agent="${1#*=}" ;;
+      -h|--help)      _memory_usage; return 0 ;;
+      --*)            fail "$E_USAGE" "memory search: unknown flag: $1" ;;
+      *)              [ -z "$query" ] && query="$1" || query="$query $1" ;;
+    esac
+    shift
+  done
+  [ -n "$query" ] || { _memory_usage; fail "$E_USAGE" "memory search: a query is required"; }
+  # An index row costs ~30 tokens against ~130 for a snippet, so the first
+  # stage can afford to be WIDER: the whole point is to see enough candidates
+  # to choose between them. Only the defaults move; an explicit --limit wins.
+  if [ "$index" -eq 1 ] && [ "$limit_set" -eq 0 ]; then limit=25; fi
+  require_node "memory search"
+  case "$store" in all|mine|wiki) : ;; *) fail "$E_VALIDATION" "bad --store '$store' (all | mine | wiki)" ;; esac
+  if [ -n "$roots" ] && { [ "$store" != "all" ] || [ -n "$agent" ]; }; then
+    fail "$E_USAGE" "--roots overrides scoping — don't combine it with --store/--agent"
+  fi
+  roots="$(_memory_resolve_roots "$store" "$agent" "$roots")"
 
   local js; js="$(mktemp -t 5dive-memsearch.XXXXXX.mjs)" || fail "$E_GENERIC" "mktemp failed"
   # shellcheck disable=SC2064
@@ -204,6 +252,7 @@ const opt = (k, d) => { const h = argv.find((a) => a.startsWith(`--${k}=`)); ret
 const LIMIT = Number(opt("limit", 8));
 const MAX_TOKENS = Number(opt("max-tokens", 1500));
 const ROOTS = String(opt("roots", "")).split(",").filter(Boolean);
+const INDEX = String(opt("index", "0")) === "1";   // DIVE-3821 stage 1: rows, not bodies
 const TODAY = new Date().toISOString().slice(0, 10);   // DIVE-1024: expiry compare
 const estTokens = (s) => Math.ceil(s.length / 4);
 const STOP = new Set("a an and are as at be but by for from has have if in into is it its of on or that the their then there these this to was were will with you your our we".split(" "));
@@ -279,8 +328,59 @@ const scored = docs.map((d, i) => {
   return { ...d, score: score * lc.mult, flags: lc.flags };
 }).filter((d) => d.score > 0).sort((a, b) => b.score - a.score);
 const home = process.env.HOME || "";
+// DIVE-3821: the description is what stage 1 shows, so carry it per-file. The
+// chunker folds it into chunk 0's text; re-read it here rather than parse the
+// snippet back out.
+function describe(file) {
+  let text; try { text = fs.readFileSync(file, "utf-8"); } catch { return ""; }
+  const fm = /^---\n([\s\S]*?)\n---\n?/.exec(text);
+  if (fm) {
+    const d = /^description:\s*["']?(.+?)["']?\s*$/m.exec(fm[1]);
+    if (d) return d[1].replace(/^>\s*/, "").trim();
+  }
+  // No frontmatter (the wiki has such pages): first non-heading prose line.
+  for (const l of text.split("\n")) {
+    const t = l.trim();
+    if (!t || t.startsWith("#") || t.startsWith("---") || t.startsWith("|")) continue;
+    return t;
+  }
+  return "";
+}
+function slugOf(d) { return (d.m && d.m.name) || path.basename(d.file).replace(/\.md$/, ""); }
 const rel = (f) => f.replace(`${home}/.claude/projects/`, "").replace(/^-home[^/]*\/memory\//, "memory/").replace(`${home}/projects/5dive/`, "").replace("/home/claude/projects/5dive/", "");
 let used = 0, shown = 0;
+if (INDEX) {
+  // Stage 1: one row per FILE (best-scoring chunk wins), no bodies. Ranking is
+  // the same BM25 + lifecycle demotion — only the RENDERING changes, so a row
+  // and its body can never disagree about which fact ranked where.
+  const best = new Map();
+  for (const d of scored) {
+    const k = d.file;
+    const prev = best.get(k);
+    if (!prev || d.score > prev.score) best.set(k, d);
+  }
+  const rows = [...best.values()].sort((a, b) => b.score - a.score);
+  console.log(`\n🔎 "${query}"  —  ${rows.length} file(s) across ${N} chunks (BM25 index rows, ≤${MAX_TOKENS} tok)\n`);
+  for (const d of rows) {
+    if (shown >= LIMIT) break;
+    const slug = slugOf(d);
+    let desc = describe(d.file);
+    if (desc.length > 160) desc = desc.slice(0, 160) + " …";
+    const flags = d.flags && d.flags.length ? "  [" + d.flags.join(" · ") + "]" : "";
+    // The full path is NOT printed: it is ~20 tokens of the ~40 a row costs and
+    // it is recoverable from the slug through `memory get`. What a chooser
+    // actually needs from it is which STORE the fact came from — a wiki page is
+    // shared, an own atom is private — so the row keeps that and drops the rest.
+    const src = /community\/wiki\//.test(d.file) ? "wiki" : "mine";
+    const line = `[${d.score.toFixed(2)}] ${slug}  ·${src}${flags}\n      ${desc || "(no description)"}`;
+    const cost = estTokens(line);
+    if (used + cost > MAX_TOKENS && shown > 0) break;
+    used += cost; shown++;
+    console.log(line);
+  }
+  console.log(`\n— ${shown}/${rows.length} rows, ~${used} tokens. Fetch the ones you want:\n    5dive memory get <slug> [<slug>...]\n`);
+  process.exit(0);
+}
 console.log(`\n🔎 "${query}"  —  ${scored.length} hits across ${N} chunks / ${new Set(docs.map((d) => d.file)).size} files (BM25, ≤${MAX_TOKENS} tok)\n`);
 for (const d of scored) {
   if (shown >= LIMIT) break;
@@ -294,7 +394,7 @@ for (const d of scored) {
 }
 console.log(`— shown ${shown}/${scored.length} hits, ~${used} tokens —`);
 MEMJS
-  node "$js" "$query" --limit="$limit" --max-tokens="$maxtok" --roots="$roots"
+  node "$js" "$query" --limit="$limit" --max-tokens="$maxtok" --roots="$roots" --index="$index"
 }
 
 # memory add — the write/compile path (DIVE-897, DIVE-726 Phase 1b).
@@ -1248,10 +1348,290 @@ _memory_consolidate() {
   return "$pass_rc"
 }
 
+# memory get — DIVE-3821 stage 2: fetch full bodies for the slugs stage 1 named.
+#
+# The always-loaded index does not scale (main: 634 atoms, 40,991 bytes against a
+# 24.4 KB load limit — the tail is silently dropped). claude-mem (Apache-2.0)
+# solves the same problem by never loading a flat index: `search` returns rows,
+# `get_observations(ids)` fetches only what was chosen. Same idea, our store —
+# no new dependency, the ranking and the lifecycle envelope are unchanged.
+_memory_get() {
+  local slugs=() maxtok=8000 roots="" store="all" agent=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --max-tokens=*) maxtok="${1#*=}" ;;
+      --roots=*)      roots="${1#*=}" ;;
+      --store=*)      store="${1#*=}" ;;
+      --agent=*)      agent="${1#*=}" ;;
+      -h|--help)      _memory_usage; return 0 ;;
+      --*)            fail "$E_USAGE" "memory get: unknown flag: $1" ;;
+      *)              slugs+=("$1") ;;
+    esac
+    shift
+  done
+  [ "${#slugs[@]}" -gt 0 ] || { _memory_usage; fail "$E_USAGE" "memory get: at least one slug is required (get them from \`memory search --index\`)"; }
+  require_node "memory get"
+  case "$store" in all|mine|wiki) : ;; *) fail "$E_VALIDATION" "bad --store '$store' (all | mine | wiki)" ;; esac
+  if [ -n "$roots" ] && { [ "$store" != "all" ] || [ -n "$agent" ]; }; then
+    fail "$E_USAGE" "--roots overrides scoping — don't combine it with --store/--agent"
+  fi
+  roots="$(_memory_resolve_roots "$store" "$agent" "$roots")"
+
+  local js; js="$(mktemp -t 5dive-memget.XXXXXX.mjs)" || fail "$E_GENERIC" "mktemp failed"
+  # shellcheck disable=SC2064
+  trap "rm -f '$js'" RETURN
+  cat > "$js" <<'MEMGETJS'
+// DIVE-3821 — fetch-by-slug over the same roots `memory search` ranks.
+import fs from "node:fs";
+import path from "node:path";
+const argv = process.argv.slice(2);
+const opt = (k, d) => { const h = argv.find((a) => a.startsWith(`--${k}=`)); return h ? h.slice(k.length + 3) : d; };
+const wanted = argv.filter((a) => !a.startsWith("--"));
+const MAX_TOKENS = Number(opt("max-tokens", 8000));
+const ROOTS = String(opt("roots", "")).split(",").filter(Boolean);
+const estTokens = (s) => Math.ceil(s.length / 4);
+function mdFiles(root) {
+  const out = [];
+  const walk = (d) => {
+    let ents; try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of ents) { const full = path.join(d, e.name); if (e.isDirectory()) walk(full); else if (e.isFile() && e.name.endsWith(".md")) out.push(full); }
+  };
+  walk(root); return out;
+}
+// Slug normalisation: a row prints the frontmatter `name` when there is one and
+// the basename otherwise, and the two differ by - vs _ often enough that an
+// exact-match-only fetch would refuse slugs it had just printed.
+const norm = (s) => String(s).toLowerCase().replace(/\.md$/, "").replace(/[^a-z0-9]+/g, "");
+const byKey = new Map();   // normalised key -> file (first writer wins; both keys registered)
+const files = [];
+for (const root of ROOTS) for (const f of mdFiles(root)) files.push(f);
+for (const f of files) {
+  let text = ""; try { text = fs.readFileSync(f, "utf-8"); } catch { continue; }
+  const fm = /^---\n([\s\S]*?)\n---\n?/.exec(text);
+  const keys = [path.basename(f).replace(/\.md$/, "")];
+  if (fm) {
+    const n = /^\s*name:\s*["']?(.+?)["']?\s*$/m.exec(fm[1]);
+    if (n) keys.push(n[1].trim());
+  }
+  for (const k of keys) { const nk = norm(k); if (nk && !byKey.has(nk)) byKey.set(nk, f); }
+}
+let used = 0, found = 0;
+const missing = [];
+for (const w of wanted) {
+  const f = byKey.get(norm(w));
+  if (!f) { missing.push(w); continue; }
+  let body = ""; try { body = fs.readFileSync(f, "utf-8"); } catch { missing.push(w); continue; }
+  const home = process.env.HOME || "";
+  const rel = f.replace(`${home}/.claude/projects/`, "").replace(`${home}/projects/5dive/`, "").replace("/home/claude/projects/5dive/", "");
+  let cost = estTokens(body);
+  let note = "";
+  if (used + cost > MAX_TOKENS) {
+    const room = Math.max(0, MAX_TOKENS - used) * 4;
+    if (room < 400) { console.log(`\n══ ${w} ══  (SKIPPED — token ceiling ${MAX_TOKENS} reached; re-run with fewer slugs or --max-tokens=)`); continue; }
+    body = body.slice(0, room);
+    note = `\n… TRUNCATED at the ${MAX_TOKENS}-token ceiling — raise --max-tokens= or fetch this slug alone.`;
+    cost = estTokens(body);
+  }
+  used += cost; found++;
+  console.log(`\n══ ${w}  ›  ${rel} ══\n`);
+  console.log(body.trimEnd() + note);
+}
+if (missing.length) {
+  // A miss names near neighbours: the usual cause is a slug typed from memory
+  // rather than copied off a row, and a bare "not found" sends the caller back
+  // to a full search it already paid for.
+  const all = [...byKey.keys()];
+  for (const m of missing) {
+    const nm = norm(m);
+    const near = all.filter((k) => k.includes(nm.slice(0, Math.max(4, Math.floor(nm.length / 2)))) || nm.includes(k)).slice(0, 5);
+    console.error(`memory get: no atom for '${m}'${near.length ? ` — did you mean: ${near.join(", ")}` : ""}`);
+  }
+}
+console.log(`\n— fetched ${found}/${wanted.length} slug(s), ~${used} tokens —`);
+// Every slug missing is a failed fetch; a partial fetch still delivered work.
+process.exit(found === 0 ? 4 : 0);
+MEMGETJS
+  node "$js" "${slugs[@]}" --max-tokens="$maxtok" --roots="$roots"
+}
+
+# memory router — DIVE-3821: rebuild an always-loaded MEMORY.md as a ROUTER.
+#
+# The flat index is a treadmill: every atom added grows the file every session
+# loads, and past the limit the loader drops the TAIL silently — so the oldest
+# facts stop existing without a single error line. The fix is to stop
+# enumerating. The router carries the recall protocol, a typed topic map, and
+# the newest atoms; the other N-hundred stay on disk, unchanged, reachable
+# through `memory search --index` + `memory get`. NOTHING is deleted.
+_memory_router() {
+  local root="" agent="" budget=20000 recent=20 write=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --root=*)    root="${1#*=}" ;;
+      --agent=*)   agent="${1#*=}" ;;
+      --budget=*)  budget="${1#*=}" ;;
+      --recent=*)  recent="${1#*=}" ;;
+      --write)     write=1 ;;
+      -h|--help)   _memory_usage; return 0 ;;
+      *)           fail "$E_USAGE" "memory router: unknown argument: $1" ;;
+    esac
+    shift
+  done
+  require_node "memory router"
+  if [ -z "$root" ]; then
+    # Own (or --agent's) primary store = the one with the most atoms.
+    local cand best="" bestn=-1 n
+    local IFS=,
+    for cand in $(_memory_own_roots "$agent"); do
+      n=$(find "$cand" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l)
+      if [ "$n" -gt "$bestn" ]; then bestn="$n"; best="$cand"; fi
+    done
+    unset IFS
+    root="$best"
+  fi
+  [ -n "$root" ] && [ -d "$root" ] || fail "$E_NOT_FOUND" "no memory store found${agent:+ for agent '$agent'} — pass --root=<dir>"
+  [ -w "$root" ] || [ "$write" -eq 0 ] || fail "$E_PERMISSION" "can't write $root/MEMORY.md (per-user 0600 — run as that agent, or as root)"
+
+  local js; js="$(mktemp -t 5dive-memrouter.XXXXXX.mjs)" || fail "$E_GENERIC" "mktemp failed"
+  # shellcheck disable=SC2064
+  trap "rm -f '$js'" RETURN
+  cat > "$js" <<'MEMROUTERJS'
+// DIVE-3821 — generate a bounded router in place of a flat, truncating index.
+import fs from "node:fs";
+import path from "node:path";
+const argv = process.argv.slice(2);
+const opt = (k, d) => { const h = argv.find((a) => a.startsWith(`--${k}=`)); return h ? h.slice(k.length + 3) : d; };
+const ROOT = opt("root", "");
+const BUDGET = Number(opt("budget", 20000));
+const RECENT = Number(opt("recent", 20));
+const WRITE = String(opt("write", "0")) === "1";
+const INDEX = path.join(ROOT, "MEMORY.md");
+
+const STOP = new Set("a an and are as at be but by for from has have if in into is it its of on or that the than then there these this to was were will with you your our we not no never only own one two md the its it's about after against all also any because been before being both can cannot did do does doing done down during each few first for further had having here how i if into itself just more most must my nor now off once other out over own same should so some such take that's their them themselves they this those through too under until up very what when where which while who whom why will would".split(/\s+/));
+const tokenize = (s) => String(s).toLowerCase().replace(/`[^`]*`/g, " ").replace(/[^a-z0-9]+/g, " ").split(" ").filter((t) => t.length > 2 && !STOP.has(t) && !/^\d+$/.test(t));
+
+let entries;
+try { entries = fs.readdirSync(ROOT, { withFileTypes: true }); } catch (e) { console.error(`memory router: cannot read ${ROOT}`); process.exit(5); }
+const atoms = [];
+for (const e of entries) {
+  if (!e.isFile() || !e.name.endsWith(".md")) continue;
+  if (e.name === "MEMORY.md") continue;
+  const full = path.join(ROOT, e.name);
+  let text = "", st;
+  try { text = fs.readFileSync(full, "utf-8"); st = fs.statSync(full); } catch { continue; }
+  const fm = /^---\n([\s\S]*?)\n---\n?/.exec(text);
+  const field = (k) => { if (!fm) return ""; const m = new RegExp(`^\\s*${k}:\\s*["']?(.+?)["']?\\s*$`, "m").exec(fm[1]); return m ? m[1].trim() : ""; };
+  let desc = field("description").replace(/^>\s*/, "");
+  if (!desc) {
+    for (const l of text.replace(fm ? fm[0] : "", "").split("\n")) {
+      const t = l.trim();
+      if (!t || t.startsWith("#") || t.startsWith("|") || t.startsWith("-")) continue;
+      desc = t; break;
+    }
+  }
+  let type = field("type") || (fm ? (/^\s*metadata:/m.test(fm[1]) && /type:\s*(\w+)/m.exec(fm[1]) || [])[1] : "") || "";
+  if (!type) { const p = e.name.split("_")[0]; type = ["user", "feedback", "project", "reference"].includes(p) ? p : "other"; }
+  atoms.push({ slug: field("name") || e.name.replace(/\.md$/, ""), file: e.name, desc, type, mtime: st.mtimeMs, bytes: st.size });
+}
+atoms.sort((a, b) => b.mtime - a.mtime);
+
+// Carry a hand-written block over verbatim. Direction, standing orders, the one
+// or two lines an agent wants in EVERY context — a generated router that eats
+// those is a regression, so the generator never owns them.
+const KEEP_RE = /<!--\s*router:keep-start\s*-->([\s\S]*?)<!--\s*router:keep-end\s*-->/;
+let keep = "";
+let oldBytes = 0;
+try { const cur = fs.readFileSync(INDEX, "utf-8"); oldBytes = Buffer.byteLength(cur); const m = KEEP_RE.exec(cur); if (m) keep = m[1].trim(); } catch {}
+
+const byType = new Map();
+for (const a of atoms) { if (!byType.has(a.type)) byType.set(a.type, []); byType.get(a.type).push(a); }
+const typeOrder = [...byType.keys()].sort((x, y) => byType.get(y).length - byType.get(x).length);
+
+function topics(list, k) {
+  const c = new Map();
+  for (const a of list) for (const t of new Set(tokenize(`${a.slug} ${a.desc}`))) c.set(t, (c.get(t) ?? 0) + 1);
+  return [...c.entries()].filter(([, n]) => n >= 2).sort((a, b) => b[1] - a[1]).slice(0, k).map(([t, n]) => `${t}·${n}`);
+}
+const AGENT = path.basename(path.dirname(path.dirname(path.dirname(ROOT)))).replace(/^agent-/, "") || "this seat";
+
+function build(kTopics, nRecent) {
+  const L = [];
+  L.push(`# Memory router (${AGENT}) — ${atoms.length} atoms`);
+  L.push("");
+  L.push("**This file is not the map. It is the router.** Enumerating every atom here is what");
+  L.push("made the old index outgrow the load limit — past it the loader drops the TAIL with no");
+  L.push("error, so the oldest facts stop existing silently. Nothing was deleted to shrink this:");
+  L.push(`all ${atoms.length} atoms are on disk in this directory, reachable in two stages.`);
+  L.push("");
+  L.push("```");
+  L.push('5dive memory search --index "<topic>"      # stage 1: slug + one line + score');
+  L.push("5dive memory get <slug> [<slug>...]        # stage 2: full bodies, only what you chose");
+  L.push("```");
+  L.push("");
+  L.push("**An empty stage-1 result is evidence of absence; a short router is not.** Search before");
+  L.push("you conclude a fact is not here, and search with the words the FACT would use, not the");
+  L.push("words your task uses.");
+  if (keep) { L.push(""); L.push("<!-- router:keep-start -->"); L.push(keep); L.push("<!-- router:keep-end -->"); }
+  L.push("");
+  L.push("## What is in the store");
+  L.push("");
+  for (const t of typeOrder) {
+    const list = byType.get(t);
+    const tt = topics(list, kTopics);
+    L.push(`- **${t}** — ${list.length} atoms${tt.length ? ` · ${tt.join(", ")}` : ""}`);
+  }
+  if (nRecent > 0) {
+    L.push("");
+    L.push(`## Newest ${Math.min(nRecent, atoms.length)} atoms`);
+    L.push("");
+    L.push("(The only atoms named by slug here. Everything older is found by searching.)");
+    L.push("");
+    for (const a of atoms.slice(0, nRecent)) {
+      let d = a.desc || "";
+      if (d.length > 100) d = d.slice(0, 100) + " …";
+      L.push(`- \`${a.slug}\`${d ? ` — ${d}` : ""}`);
+    }
+  }
+  L.push("");
+  L.push(`_Generated by \`5dive memory router\` on ${new Date().toISOString().slice(0, 10)} (DIVE-3821). Re-run it after a \`memory consolidate\` pass; hand edits belong between the router:keep markers._`);
+  L.push("");
+  return L.join("\n");
+}
+
+// Fit to budget by shrinking what is cheapest to lose first: the recent list,
+// then the topic keywords. The preamble is the protocol — it never shrinks,
+// because a router that cannot say how to fetch is worse than no router.
+let out = "", kT = 14, nR = RECENT;
+for (;;) {
+  out = build(kT, nR);
+  if (Buffer.byteLength(out) <= BUDGET) break;
+  if (nR > 0) { nR = Math.max(0, nR - 5); continue; }
+  if (kT > 3) { kT -= 3; continue; }
+  break;   // preamble + one line per type is the floor; report it honestly below.
+}
+const newBytes = Buffer.byteLength(out);
+if (WRITE) {
+  const stamp = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
+  const bak = `${INDEX}.pre-router-${stamp}`;
+  try { if (fs.existsSync(INDEX)) fs.copyFileSync(INDEX, bak); } catch (e) { console.error(`memory router: backup failed (${e.message}) — refusing to overwrite`); process.exit(5); }
+  fs.writeFileSync(INDEX, out);
+  console.log(`memory router: wrote ${INDEX}`);
+  console.log(`  ${atoms.length} atoms indexed · ${oldBytes} B → ${newBytes} B (budget ${BUDGET}) · ${nR} named, ${atoms.length - nR} reachable by search only`);
+  if (oldBytes) console.log(`  previous index kept at ${bak}`);
+  if (newBytes > BUDGET) console.error(`  WARNING: ${newBytes} B still over the ${BUDGET} B budget with the recent list and keywords at their floor`);
+} else {
+  console.log(out);
+  console.error(`\n— dry run: ${atoms.length} atoms · ${oldBytes} B → ${newBytes} B (budget ${BUDGET}). Pass --write to replace MEMORY.md (the old one is backed up).`);
+}
+MEMROUTERJS
+  node "$js" --root="$root" --budget="$budget" --recent="$recent" --write="$write"
+}
+
 cmd_memory() {
   local sub="${1:-}"; shift 2>/dev/null || true
   case "$sub" in
     search)      _memory_search "$@" ;;
+    get|fetch)   _memory_get "$@" ;;
+    router)      _memory_router "$@" ;;
     add|compile) _memory_add "$@" ;;
     doctor|hygiene) _memory_doctor "$@" ;;
     consolidate|distill) _memory_consolidate "$@" ;;
