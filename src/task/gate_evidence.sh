@@ -288,6 +288,37 @@ _gate_merge_proof_ok() { # <proof_at> <proof_ref> <dref>
   [[ "$proof_ref" == "$dref" ]]
 }
 
+# _gate_pr_state_answerable <dref> — 0 when SOME rail available to this caller can
+# actually answer "what state is this PR in", asked about THIS pull request.
+#
+# DIVE-3823 iteration 2, and this is the whole correction. Iteration 1 scoped the
+# recorded-evidence rail on `! _gate_gh_credentialed` — what the caller HOLDS — and
+# quinn measured the hole that opens: the ANONYMOUS rail needs no credential, so on a
+# PUBLIC repo an uncredentialed caller IS answerable, and a recorded proof pre-empted
+# a query that would have refused. Measured on an OPEN public PR: `task done` returned
+# 0 with curl called ZERO times. That is the inverse of this rail's own invariant.
+#
+# `_gate_gh_reachable` is not the predicate either, in the other direction: it is true
+# whenever curl and jq merely EXIST, which is every seat, so scoping on it would make
+# this rail dead code on the exact private-repo row it was written for. Neither "holds
+# a credential" nor "has a transport" is the question. The question is whether an
+# ANSWER is obtainable for this ref, and the only honest way to know is to ask.
+#
+# So it asks, with the same call the gate makes downstream, and it costs a request
+# only on the narrow path that reaches it (uncredentialed AND a proof already stamped
+# against the current binding). A 404 on a private repo — the DIVE-3808 shape — is
+# rc 1 here and cheap. An answer of any kind is rc 0 and the proof is never consulted.
+_gate_pr_state_answerable() { # <dref>
+  local dref="${1:-}" st=""
+  [[ "$dref" =~ ^https?:// ]] || return 1
+  # Empty token deliberately: this is only ever called when _gate_gh_credentialed is
+  # false, so there is no token to pass and the bot rail is not permitted — asking
+  # with an empty one routes to the credential-free rail, which is the rail in
+  # question. `null` is a successful query that answered nothing (DIVE-2720).
+  st=$(_gate_gh "" 0 pr view "$dref" --json state,mergedAt -q '.state' 2>/dev/null || printf '')
+  [[ -n "$st" && "$st" != "null" ]]
+}
+
 _gate_refuse_no_rail() {
   local ident="$1" subject="$2"
   # DIVE-2770: name WHICH way the credential-free rail failed. Rate-limited clears

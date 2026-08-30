@@ -28,6 +28,18 @@
 #   T7  `--merge-proof` on a row with no delivery binding is refused — there is
 #       nothing for the evidence to be ABOUT
 #   T8  the close is LOUD and AUDITED: it names who proved it, with what, and when
+#   T9  ITERATION 2, and the arm the first iteration could not have: with the
+#       ANONYMOUS rail LIVE over a PUBLIC unmerged PR the gate refuses on the API
+#       ANSWER, and it went and asked for it. Iteration 1 scoped the rail on what the
+#       caller HOLDS (`! _gate_gh_credentialed`), and the anon rail holds nothing
+#       either — so a recorded proof pre-empted a query that would have answered.
+#       quinn measured it: an OPEN public PR closed on `--cmd=true`, curl called ZERO
+#       times. Every arm above runs under FIVE_GATE_NO_ANON=1, which is exactly why
+#       none of them saw it.
+#   T9b the same live rail over a PRIVATE repo (404) still closes on the proof —
+#       the other direction, and the reason the predicate ASKS rather than testing
+#       `_gate_gh_reachable`: that is true wherever curl and jq merely exist, i.e.
+#       on every seat, so it would make this rail dead code on DIVE-3808 itself.
 #
 # MUTATION GRADE — RUN against this worktree's src/, not predicted (2026-08-30;
 # each mutant from 37/0 clean, and the arm names are the ones that ACTUALLY went red):
@@ -41,12 +53,25 @@
 #     of T5. That is the direction arm: without it the flag would record evidence
 #     that the delivery did NOT land as evidence that it did.
 #
+# ITERATION 2 MUTANTS — also RUN, each from 49/0 clean (2026-08-30):
+#   * the predicate reverts to iteration 1 (`! _gate_gh_credentialed` alone)
+#                                                                     -> 42/7: all
+#     five T9 arms plus two of T9b. This is the graded reject reproduced as a test.
+#   * the predicate becomes quinn's literal suggestion, `! _gate_gh_reachable`
+#                                                                     -> 47/2: both
+#     T9b close arms. Written down because it is the fix that LOOKS right: it closes
+#     T9, and it silently kills the feature on the private-repo row the ticket is
+#     about, since reachability is true wherever curl exists.
+#   * gate never consults the proof (`(( _mg_proof_ok ))` -> `(( 0 ))`) -> 39/10:
+#     T1, T8 and T9b. T9 stays GREEN under it — it grades the narrowness.
+#
 # Isolation matches the sibling gate harnesses (task_merge_gate_anon_rail_unit.sh):
 # src/ sourced into a throwaway STATE_DIR — the live tasks.db is NEVER touched — and
 # gh/sudo/curl are stubbed on PATH, so this file makes no network call and needs no
 # root.
-# TIER: nightly — 4.9s measured on the 5dive dev host (slowest of three consecutive
-# runs: 4.9/4.5/4.9s): does not fit the 300s PR core, and its closest sibling
+# TIER: nightly — 6.7s measured on the 5dive dev host at iteration 2 (three
+# consecutive runs: 6.66/6.40/6.66s; it was 4.9s at 12 fewer arms): does not fit the
+# 300s PR core, and its closest sibling
 # task_merge_gate_deploy_note_unit.sh was demoted at 5.8s for the same reason. The
 # cost is real `task done` closes at ~0.5s each. A PR that touches this file still
 # runs it — the changed-harnesses job ignores tier.
@@ -94,13 +119,42 @@ exit 1
 STUB
 chmod +x "$TMP/bin/gh"
 
-# --- stub curl: the anon rail's only transport. FIVE_GATE_NO_ANON=1 already disables
-# it; this exists so a regression that re-enables it cannot reach the network.
-printf '#!/usr/bin/env bash\nexit 1\n' >"$TMP/bin/curl"
+# --- stub curl: the anon rail's only transport, and the ONLY thing that can reach
+# api.github.com from any arm in this file. OFF by default (rc 1) so T0-T8 keep
+# grading the seat they were written for; CURL_STUB_ON=1 turns it into a serving
+# transport for T9, which needs the anon rail LIVE. It answers exactly one path
+# (`repos/<slug>/pulls/<num>` for CURL_STUB_PR) and 404s everything else, because a
+# stub that serves every URL would let an unrelated probe below the gate look
+# answered and quietly re-open the fail-open this arm exists to close.
+cat >"$TMP/bin/curl" <<'CURL'
+#!/usr/bin/env bash
+[[ "${CURL_STUB_ON:-0}" == "1" ]] || exit 1
+out=""; hdr=""; url=""; a=("$@"); i=0
+while [[ $i -lt ${#a[@]} ]]; do
+  case "${a[$i]}" in
+    -o) out="${a[$((i+1))]}"; i=$((i+2)) ;;
+    -D) hdr="${a[$((i+1))]}"; i=$((i+2)) ;;
+    -H|-w) i=$((i+2)) ;;
+    -*) i=$((i+1)) ;;
+    *)  url="${a[$i]}"; i=$((i+1)) ;;
+  esac
+done
+printf '%s\n' "$url" >>"${CURL_ARGS_LOG:-/dev/null}"
+code=404; body=''
+if [[ -n "${CURL_STUB_PR:-}" && "$url" == *"${CURL_STUB_PR}" ]]; then
+  code=200; body="${CURL_STUB_BODY:-}"
+fi
+[[ -n "$out" ]] && printf '%s' "$body" >"$out"
+[[ -n "$hdr" ]] && printf 'HTTP/2 %s\n' "$code" >"$hdr"
+printf '%s' "$code"
+[[ "$code" == 200 ]] || exit 0
+exit 0
+CURL
 chmod +x "$TMP/bin/curl"
 
 export PATH="$TMP/bin:$PATH"
 export GH_ARGS_LOG="$TMP/gh.args"; : >"$GH_ARGS_LOG"
+export CURL_ARGS_LOG="$TMP/curl.args"; : >"$CURL_ARGS_LOG"
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
@@ -140,7 +194,8 @@ run_verify(){ VOUT=$(cmd_task_verify "$@" 2>&1); VRC=$?; }
 
 # The verifier seat: no token anywhere, no runas, no bot grant.
 no_rail()   { unset GH_TOKEN GITHUB_TOKEN GH_STUB_STATE GH_STUB_MERGED
-              export SUDO_USER=""; export GH_STUB_AUTH_TOKEN=""; : >"$GH_ARGS_LOG"; }
+              export SUDO_USER=""; export GH_STUB_AUTH_TOKEN=""
+              : >"$GH_ARGS_LOG"; : >"$CURL_ARGS_LOG"; }
 a_token()   { unset GH_TOKEN GITHUB_TOKEN; export SUDO_USER=""
               export GH_STUB_AUTH_TOKEN="tok-3823"; : >"$GH_ARGS_LOG"; }
 
@@ -259,11 +314,62 @@ seed H-1; bind_pr H-1 "$PRIVATE_PR"
 FIVE_ACTOR=vesper run_verify H-1 --no-done --merge-proof --cmd='printf ancestor'
 run_done H-1 --result='landed'
 chk "T8 the close succeeds"                    "$RC" "0"
-sub "T8 it says it could not ASK"              "$OUT" "could not ASK anything"
+sub "T8 it says it could not get an answer"    "$OUT" "could not GET AN ANSWER"
+sub "T8 and names WHY no rail answered"       "$OUT" "No credential-free rail was available"
 sub "T8 it names the recorded evidence"        "$OUT" "RECORDED MACHINE EVIDENCE"
 sub "T8 it quotes the command that was run"    "$OUT" "printf ancestor"
 sub "T8 it names the binding proved"           "$OUT" "$PRIVATE_PR"
 sub "T8 and does not oversell the attestation" "$OUT" "not an API answer"
+
+# ---------------------------------------------------------------------------
+# T9 — THE ITERATION-1 FAIL-OPEN, GRADED WITH THE ANONYMOUS RAIL LIVE. Every arm
+# above runs under FIVE_GATE_NO_ANON=1 with curl stubbed to exit 1, i.e. in a world
+# where the credential-free rail structurally cannot answer — so none of them can
+# see the hole quinn measured: the anon rail needs NO credential, so an
+# uncredentialed caller over a PUBLIC repo IS answerable, and iteration 1's
+# `! _gate_gh_credentialed` scoping let a recorded proof pre-empt a query that
+# would have refused. Measured then: an OPEN public PR closed on `--cmd=true` with
+# curl called ZERO times.
+#
+# Here the rail is LIVE over a PUBLIC, UNMERGED PR. The gate must refuse on the API
+# ANSWER, and it must have gone and ASKED for it.
+# ---------------------------------------------------------------------------
+PUBLIC_PR='https://github.com/5dive-ai/5dive/pull/999'
+export CURL_STUB_ON=1 CURL_STUB_PR='repos/5dive-ai/5dive/pulls/999'
+export CURL_STUB_BODY='{"number":999,"state":"open","merged":false,"merged_at":null,"title":"t","head":{"ref":"dive-3823-merge-proof","sha":"0c9a0d5b"},"merge_commit_sha":"","html_url":"'"$PUBLIC_PR"'"}'
+FIVE_GATE_NO_ANON=0
+no_rail
+seed I-1; bind_pr I-1 "$PUBLIC_PR"
+run_verify I-1 --no-done --merge-proof --cmd='true'
+chk "T9 the proof is recorded (the flag is not what is under test)" "$VRC" "0"
+sub "T9 and it is stamped against the public binding" "$(proofof I-1)" "|$PUBLIC_PR|"
+: >"$CURL_ARGS_LOG"
+run_done I-1 --result='landed'
+chk "T9 an UNMERGED public PR is not closed by a proof" "$((RC != 0))" "1"
+chk "T9 and the row stays open"                        "$(statusof I-1)" "in_progress"
+nsub "T9 the proof did not close it"                   "$OUT" "RECORDED MACHINE EVIDENCE"
+sub "T9 the refusal quotes the MEASURED state"         "$OUT" "state=OPEN"
+sub "T9 and the rail was actually asked"               "$(cat "$CURL_ARGS_LOG")" "pulls/999"
+
+# ---------------------------------------------------------------------------
+# T9b — THE SAME LIVE RAIL, A PRIVATE REPO. The other direction of T9, and the
+# reason the predicate ASKS instead of testing `_gate_gh_reachable`: curl and jq
+# EXIST here (the rail is live), so a reachability test would be true and would
+# make this rail dead code on the very row it was written for. The rail answers
+# 404 for a repo it cannot see, and the recorded proof is then the only evidence
+# there is — which is DIVE-3808 exactly.
+# ---------------------------------------------------------------------------
+no_rail
+seed J-1; bind_pr J-1 "$PRIVATE_PR"
+run_verify J-1 --no-done --merge-proof --cmd='true'
+: >"$CURL_ARGS_LOG"
+run_done J-1 --result='landed at 2033057e'
+chk "T9b a private PR the live rail 404s still closes on the proof" "$RC" "0"
+chk "T9b and the row is done"                    "$(statusof J-1)" "done"
+sub "T9b the rail was asked before trusting it"  "$(cat "$CURL_ARGS_LOG")" "pulls/12"
+sub "T9b and the close names the 404 it got"     "$OUT" "404"
+unset CURL_STUB_ON CURL_STUB_PR CURL_STUB_BODY
+export FIVE_GATE_NO_ANON=1
 
 printf '\n%s\n' "---- $PASS passed, $FAIL failed ----"
 [[ $FAIL -eq 0 ]]

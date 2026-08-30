@@ -871,11 +871,21 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
     # seat (DIVE-3808: fix merged at 2033057e, stuck). See _gate_merge_proof_ok for
     # the full argument and the limits of what a proof claims.
     #
-    # SCOPED TO THE CALLER THAT HOLDS NOTHING. A caller with a token or the `_gh_do`
-    # grant takes the API path exactly as before — a recorded proof must never
-    # substitute for an answer the gate could have gotten, or every credentialed
-    # close silently starts trusting an attestation instead of a measurement. The
-    # db read is first only because it is free; the credential test is what decides.
+    # SCOPED TO THE CALLER THAT CANNOT GET AN ANSWER — not to the caller that holds
+    # no credential. A recorded proof must never substitute for an answer the gate
+    # could have gotten, or every close silently starts trusting an attestation
+    # instead of a measurement. Iteration 1 spelled that as `! _gate_gh_credentialed`
+    # and quinn measured the gap: the ANONYMOUS rail holds no credential either, so
+    # on a PUBLIC repo an uncredentialed caller can still be answered, and the proof
+    # pre-empted a query that would have refused an OPEN PR (curl called zero times).
+    # The predicate is now `_gate_pr_state_answerable` — it ASKS, and the proof is
+    # read only when nothing could answer about this ref. See that function for why
+    # `_gate_gh_reachable` is wrong in the other direction (true wherever curl merely
+    # exists, i.e. everywhere, which would make this rail dead code).
+    #
+    # ORDER IS DELIBERATE AND CHEAP-FIRST: the db read, then the free credential test,
+    # then the one request. A credentialed caller and an unproved row both stop before
+    # any query, so no close that passes today spends anything extra.
     local _mg_proof_at="" _mg_proof_ref="" _mg_proof_by="" _mg_proof_cmd="" _mg_proof_ok=0
     if [[ -n "$_dref" ]]; then
       IFS=$'\x1f' read -r _mg_proof_at _mg_proof_ref _mg_proof_by _mg_proof_cmd <<<"$(
@@ -883,7 +893,8 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
                    COALESCE(merge_proof_by,'')||x'1f'||COALESCE(merge_proof_cmd,'')
             FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null || printf '')"
       if _gate_merge_proof_ok "$_mg_proof_at" "$_mg_proof_ref" "$_dref" \
-         && ! _gate_gh_credentialed "$(_gate_gh_token)"; then
+         && ! _gate_gh_credentialed "$(_gate_gh_token)" \
+         && ! _gate_pr_state_answerable "$_dref"; then
         _mg_proof_ok=1
       fi
     fi
@@ -893,7 +904,15 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
       _mg_had_subject=1
       _task_store_audit_log "task.merge-proof-close" ok 0 -- \
         "$ident" "ref=$_mg_proof_ref" "proved_by=$_mg_proof_by" "at=$_mg_proof_at" "cmd=$_mg_proof_cmd"
-      warn "$ident: the merge gate could not ASK anything (this seat holds no gh credential and the anonymous rail cannot see a private repo), so it is closing on RECORDED MACHINE EVIDENCE instead (DIVE-3823, audited): '$_mg_proof_by' ran \`$_mg_proof_cmd\` against $_mg_proof_ref at $_mg_proof_at and it exited 0. That is an attestation by a named seat, not an API answer — if the two ever disagree, the API is right."
+      # Say WHY no rail could answer, MEASURED rather than assumed: the predicate
+      # above ASKED, and `_gate_anon_why` names what came back (404/private, a rate
+      # limit, a network failure, or no transport at all). Iteration 1 asserted "the
+      # anonymous rail cannot see a private repo" without asking, and quinn measured
+      # it saying that about a PUBLIC repo it had never queried — a false sentence in
+      # the one message whose whole job is to say what is known and how.
+      local _mg_why; _mg_why="$(_gate_anon_why)"
+      [[ -n "$_mg_why" ]] || _mg_why="No credential-free rail was available to ask with on this host either."
+      warn "$ident: the merge gate could not GET AN ANSWER about $_dref — this seat holds no gh credential of its own, and the credential-free rail WAS asked and could not answer. ${_mg_why} So it is closing on RECORDED MACHINE EVIDENCE instead (DIVE-3823, audited): '$_mg_proof_by' ran \`$_mg_proof_cmd\` against $_mg_proof_ref at $_mg_proof_at and it exited 0. That is an attestation by a named seat, not an API answer — if the two ever disagree, the API is right."
     elif [[ -n "$_dref" || -n "$_branch" ]]; then
       _mg_had_subject=1     # a declared delivery IS something to verify
       if ! command -v gh >/dev/null 2>&1; then
