@@ -569,6 +569,21 @@ cmd_install() {
   else
     step "Installing $type (as user 'claude')"
   fi
+  # DIVE-3811: guarantee ~/.local/bin is on the service account's login PATH
+  # BEFORE the recipe runs. Every recipe here installs into ~/.local/bin, and an
+  # installer that cannot see it there prints PATH advice naming a ~/.bashrc that
+  # does not belong to the person reading it (upstream's Claude Code installer
+  # does exactly this, twice, in the middle of `5dive init`). install.sh writes
+  # the same block on a fresh box; this covers hosts installed before it did.
+  # Idempotent — the grep is the guard, same shape as install.sh's nvm block.
+  if ! sudo -u claude grep -q '\.local/bin' /home/claude/.bash_profile 2>/dev/null; then
+    sudo -u claude bash -c 'cat >> /home/claude/.bash_profile <<'"'"'LOCALBIN'"'"'
+
+# 5dive: agent runtimes (claude, devin, codex, pi, ...) install into ~/.local/bin
+export PATH="$HOME/.local/bin:$PATH"
+LOCALBIN
+' || true
+  fi
   # -i loads claude's login env (nvm, XDG redirects, etc.)
   sudo -u claude -i bash -lc "${prelude}${recipe}" >&2
   # DIVE-901: some installers finish async or drop the binary via a late
@@ -1591,7 +1606,24 @@ cmd_auth_login() {
       require_root
       local log rc=0
       log=$(sudo -u claude mktemp /tmp/5dive-claude-login.XXXXXX.log)
-      sudo -u claude -i env $extra_env script -fq -c "$bin setup-token" "$log" || rc=$?
+      # DIVE-3811: the pty output is piped through _redact_oauth_stream so the
+      # printed token never reaches the operator's terminal (or anything
+      # recording it). Two consequences of the pipe, both handled here:
+      #   * `script` takes the child pty's window size from its own stdout, and
+      #     a pipe has none — the child would get 0x0 and render its prompt into
+      #     a zero-column terminal. `stty` inside the -c payload sets the pty to
+      #     the real terminal's dimensions before setup-token starts.
+      #   * `set -euo pipefail` is on. `|| rc=$?` is what keeps a cancelled
+      #     login from killing the shell (as before the pipe), and under
+      #     pipefail the status it catches is `script`'s whenever the filter
+      #     itself succeeded — which is the only case where rc is read.
+      local cols rows
+      cols=$(tput cols 2>/dev/null || echo 100); rows=$(tput lines 2>/dev/null || echo 30)
+      [[ "$cols" =~ ^[1-9][0-9]*$ ]] || cols=100
+      [[ "$rows" =~ ^[1-9][0-9]*$ ]] || rows=30
+      sudo -u claude -i env $extra_env \
+        script -fq -c "stty cols $cols rows $rows >/dev/null 2>&1; $bin setup-token" "$log" \
+        | _redact_oauth_stream || rc=$?
       local tok=""
       tok=$(extract_claude_token "$log" 2>/dev/null || true)
       # Token transited through this file — shred so it doesn't linger.
@@ -1928,6 +1960,71 @@ m = re.search(rb'https://claude\.com/[A-Za-z0-9._~:/?#=&%+_-]{20,600}', clean)
 if m:
     print(m.group(0).decode('utf-8', 'replace'))
 PY
+}
+
+# DIVE-3811 — MASK THE 1-YEAR OAUTH TOKEN IN THE STREAM WE CONTROL.
+#
+# `claude setup-token` prints the long-lived credential in the clear
+# ("Your OAuth token (valid for 1 year): sk-ant-oat01-…"). Upstream's rationale
+# for showing it is "you won't be able to see it again" — that rationale is not
+# ours: we capture it below and persist it to anthropic.env / the auth profile,
+# so the echo buys the operator nothing they do not already have. What it does
+# buy is a working 1-year credential in terminal scrollback, in any asciinema /
+# `script` wrapper around the wizard, and in any agent capture of the session.
+#
+# So the pty stream is piped through this filter before it reaches the operator's
+# terminal. `script`'s own log file (shredded a few lines below) still holds the
+# raw bytes, because extract_claude_token has to read them.
+#
+# Why a byte-stream filter and not `sed -u`: this is an INTERACTIVE session. The
+# user has to read a URL and paste a callback code back, and setup-token writes
+# its prompt with NO trailing newline. A line-oriented filter would hold that
+# prompt in its buffer forever and the login would appear to hang. This one
+# writes every byte through immediately and holds back only the shortest tail
+# that could still grow into a token.
+_redact_oauth_stream() {
+  python3 -u -c '
+import re, sys
+
+PREFIX = b"sk-ant-oat01-"
+TOKEN  = re.compile(rb"sk-ant-oat01-[A-Za-z0-9_-]+")
+MASK   = b"sk-ant-oat01-<hidden by 5dive \xe2\x80\x94 already stored for you>"
+
+inp, out = sys.stdin.buffer, sys.stdout.buffer
+buf = b""
+while True:
+    chunk = inp.read1(4096)
+    if not chunk:
+        break
+    buf += chunk
+    # Hold back a tail that is still ambiguous: either a token match that runs
+    # to the end of the buffer (more token chars may follow in the next read),
+    # or a prefix of the token marker itself. The prefix loop must start at
+    # len(PREFIX), NOT len(PREFIX) - 1: a read boundary landing exactly on the
+    # complete 13-byte marker leaves no token match (the regex needs >=1 body
+    # char), so a loop capped at 12 finds nothing, flushes the bare marker, and
+    # then flushes the body unredacted on the next read — the whole token in the
+    # clear. Covered by the n=13 arm and the full n=1..len(token) sweep in
+    # tests/auth_token_redaction_unit.sh.
+    hold = len(buf)
+    last = None
+    for last in TOKEN.finditer(buf):
+        pass
+    if last is not None and last.end() == len(buf):
+        hold = last.start()
+    else:
+        for k in range(min(len(PREFIX), len(buf)), 0, -1):
+            if buf[len(buf) - k:] == PREFIX[:k]:
+                hold = len(buf) - k
+                break
+    if hold:
+        out.write(TOKEN.sub(MASK, buf[:hold]))
+        out.flush()
+        buf = buf[hold:]
+if buf:
+    out.write(TOKEN.sub(MASK, buf))
+out.flush()
+' 2>/dev/null
 }
 
 # Pull the long-lived OAuth token out of the login log after the user has

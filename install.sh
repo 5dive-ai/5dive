@@ -1281,6 +1281,42 @@ if ! id -u claude >/dev/null 2>&1; then
   ok "user 'claude' created"
 fi
 
+# DIVE-3811: a clean install used to end its own doctor run on a red
+# `host/audit-drop-dir: /var/log/5dive/notify is missing`. The tree is otherwise
+# built lazily by audit_init, which only runs behind ensure_state — so on a box
+# where nothing root-side has touched the state tree yet, the doctor at the end
+# of `5dive init` is the FIRST thing to look, and it correctly reports a gap the
+# installer left. Create it here, where the `claude` group has just been
+# guaranteed to exist, so the shape audit_init promises is true from minute one.
+# Modes are audit_init's, verbatim: the parent stays 2750 so the tamper-evident
+# audit log is never group-writable, and only the purpose-built notify/ subdir is
+# 2770 (setgid + group write) so an agent-context drop marker can be written.
+mkdir -p /var/log/5dive/notify
+chown root:claude /var/log/5dive /var/log/5dive/notify
+chmod 2750 /var/log/5dive
+chmod 2770 /var/log/5dive/notify
+ok "audit log tree ready (/var/log/5dive, notify/ 2770)"
+
+# DIVE-3811: put ~/.local/bin on the `claude` service account's login PATH
+# BEFORE any runtime installer runs there. Upstream's Claude Code installer
+# checks the live PATH and, not finding it, prints a two-line
+# "run: echo 'export PATH=...' >> ~/.bashrc && source ~/.bashrc" advisory —
+# twice — into the middle of `5dive init`. That advice is unactionable for the
+# person reading it: the runtime lives under this service account, not the
+# operator's home, so the ~/.bashrc it names is not theirs, and the wizard
+# proceeds correctly either way. Making the statement FALSE removes the warning
+# at its source instead of filtering upstream's wording, and it is independently
+# correct: `sudo -u claude -i` shells are how this CLI reaches every runtime bin.
+if ! sudo -u claude grep -q '\.local/bin' /home/claude/.bash_profile 2>/dev/null; then
+  sudo -u claude bash -c 'cat >> /home/claude/.bash_profile <<'"'"'LOCALBIN'"'"'
+
+# 5dive: agent runtimes (claude, devin, codex, pi, ...) install into ~/.local/bin
+export PATH="$HOME/.local/bin:$PATH"
+LOCALBIN
+'
+  ok "~/.local/bin on claude's login PATH"
+fi
+
 # nvm + node (needed for codex agent type)
 say "Installing nvm + Node.js"
 if [[ ! -f /home/claude/.nvm/nvm.sh ]]; then
