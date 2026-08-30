@@ -428,6 +428,20 @@ account_has_live_headroom() {
   ' <<<"$rl" >/dev/null 2>&1
 }
 
+# rotation_live_headroom_candidates <json-array> — preserve candidate order but
+# keep only profiles with a fresh, measured capacity verdict. Split out so the
+# DIVE-3822 destination fence is testable without mutating a real registry.
+rotation_live_headroom_candidates() {
+  local candidates="$1" measured="[]" cand
+  while IFS= read -r cand; do
+    [[ -n "$cand" ]] || continue
+    if account_has_live_headroom "$cand"; then
+      measured=$(jq -cn --argjson acc "$measured" --arg a "$cand" '$acc + [$a]')
+    fi
+  done < <(jq -r '.[]' <<<"$candidates")
+  printf '%s' "$measured"
+}
+
 # `account usage` — per-account snapshot of Anthropic 5h / 7d limit usage,
 # backing the dashboard Switch-account modal dots and Telegram /account +
 # /usage. For each account we read the FRESHEST statusline cache across its
@@ -822,13 +836,14 @@ rotation_eligible_accounts() {
 cmd_agent_rotation_rotate() {
   local name="${1:-}"; shift || true
   [[ -n "$name" ]] \
-    || fail "$E_USAGE" "usage: 5dive agent rotation rotate <agent> [--cooldown-current=<epoch>]"
+    || fail "$E_USAGE" "usage: 5dive agent rotation rotate <agent> [--cooldown-current=<epoch>] [--require-live-headroom]"
   require_root
   ensure_state
-  local cooldown_current="" a
+  local cooldown_current="" require_live_headroom=0 a
   for a in "$@"; do
     case "$a" in
       --cooldown-current=*) cooldown_current="${a#--cooldown-current=}" ;;
+      --require-live-headroom) require_live_headroom=1 ;;
       *) fail "$E_USAGE" "unknown flag: $a" ;;
     esac
   done
@@ -870,6 +885,14 @@ cmd_agent_rotation_rotate() {
   # string, which then crashes Tier-1's `--argjson c ""` with "invalid JSON text".
   # That abort left the agent parked on the just-cooled account = no rotation.
   candidates=$(jq -cn --arg cur "$current" --argjson acc "$pool" '[ $acc[] | select(. != $cur) ]')
+
+  # DIVE-3822: supervisor-triggered quota recovery must not infer that a
+  # destination is healthy merely because its cooldown expired. Retain only
+  # profiles for which another live seat currently renders low usage. The flag
+  # is opt-in so manual/StopFailure rotations keep their existing tiers.
+  if (( require_live_headroom )); then
+    candidates=$(rotation_live_headroom_candidates "$candidates")
+  fi
 
   # Tier 1 — a candidate that isn't cooling. The common case; preference order wins.
   target=$(jq -rn --argjson now "$now" --argjson c "$candidates" --argjson cd "$cd" \

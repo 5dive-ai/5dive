@@ -229,6 +229,28 @@ t "a nudge DOES raise the 1-3 attempt count (control for the arm above)" "1" "$N
 t "executor has a case for every verb the planner can emit" "yes" \
   "$(awk '/^_sup_act_exec\(\) \{/,/^\}/' "$SRC/cmd_supervisor.sh" \
      | grep -qE '^[[:space:]]*restart\)' && printf yes || printf no)"
+
+# DIVE-3822: quota recovery must preserve the rotate command's three states.
+# A no-target result is not an execution failure, but it is the branch that
+# triggers the deduped human capacity alert in cmd_supervisor_tick.
+ORIG_WITH_REGISTRY_LOCK=$(declare -f with_registry_lock)
+ORIG_ROTATE=$(declare -f cmd_agent_rotation_rotate || true)
+with_registry_lock() { "$@"; }
+cmd_agent_rotation_rotate() {
+  [[ "${2:-}" == "--require-live-headroom" ]] || { printf 'missing-live-headroom-flag\n'; return 0; }
+  printf '%s\n' "${QUOTA_ROTATE_FIXTURE}"
+}
+QUOTA_ROTATE_FIXTURE='{"ok":true,"data":{"rotated":true,"from":"full","to":"roomy"}}'
+if _sup_quota_rotate unit-q; then QR=0; else QR=$?; fi
+t "quota recovery: measured target returns rotated" "0" "$QR"
+QUOTA_ROTATE_FIXTURE='{"ok":true,"data":{"rotated":false,"from":"full","to":null,"reason":"no eligible account"}}'
+if _sup_quota_rotate unit-q; then QR=0; else QR=$?; fi
+t "quota recovery: no measured target is distinct" "1" "$QR"
+QUOTA_ROTATE_FIXTURE='not-json'
+if _sup_quota_rotate unit-q; then QR=0; else QR=$?; fi
+t "quota recovery: malformed/failed rotate is distinct" "2" "$QR"
+eval "$ORIG_WITH_REGISTRY_LOCK"
+if [[ -n "$ORIG_ROTATE" ]]; then eval "$ORIG_ROTATE"; else unset -f cmd_agent_rotation_rotate; fi
 # And it is subshell-wrapped: cmd_restart reaches `fail`, which EXITS. Called
 # bare, one seat with a missing unit would abort the tick for every later agent.
 t "the restart case is subshell-contained (a fail() cannot abort the tick)" "yes" \

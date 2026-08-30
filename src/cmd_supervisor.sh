@@ -80,6 +80,8 @@ _SUP_QUOTA_PANE_LINES="${SUPERVISOR_QUOTA_PANE_LINES:-40}"
 [[ "$_SUP_QUOTA_PANE_LINES" =~ ^[0-9]+$ ]] || _SUP_QUOTA_PANE_LINES=40
 _SUP_QUOTA_PAT="${SUPERVISOR_QUOTA_PAT:-}"
 [[ -n "$_SUP_QUOTA_PAT" ]] || _SUP_QUOTA_PAT='(api[[:space:]]+error|request[[:space:]]+rejected)[^|]{0,60}429|quota[[:space:]]+(has[[:space:]]+been[[:space:]]+)?exhausted|exhausted[[:space:]]+your[[:space:]]+(token|weekly|monthly)|hit[[:space:]]+your[[:space:]]+(monthly|weekly|daily)[[:space:]]+spend[[:space:]]+limit|usage[[:space:]]+limit[[:space:]]+reached|insufficient_quota|credit[[:space:]]+balance[[:space:]]+is[[:space:]]+too[[:space:]]+low'
+_SUP_WEEKLY_QUOTA_PAT="${SUPERVISOR_WEEKLY_QUOTA_PAT:-}"
+[[ -n "$_SUP_WEEKLY_QUOTA_PAT" ]] || _SUP_WEEKLY_QUOTA_PAT='(^|[[:space:]])(7d|1w):[[:space:]]*100%([^0-9]|$)'
 # Ignore a missing poller right after a service start — the plugin's bun server
 # takes a moment to boot, and a false poller-dead there would flag every
 # freshly-restarted agent.
@@ -222,7 +224,7 @@ _sup_verify_challenge() {  # <type> <user> <sess> <svc_running>
 # _sup_quota_pane for the same reason _sup_verify_match is: the false-positive-
 # critical regex has to be unit-testable without a live tmux.
 _sup_quota_match() {  # <pane-text-on-stdin>
-  grep -iE "$_SUP_QUOTA_PAT" 2>/dev/null | head -1 \
+  grep -iE "${_SUP_QUOTA_PAT}|${_SUP_WEEKLY_QUOTA_PAT}" 2>/dev/null | head -1 \
     | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-160
 }
 
@@ -1359,6 +1361,25 @@ _sup_act_exec() {  # <name> <verb> <cause>
   esac
 }
 
+# DIVE-3822: a quota-exhausted seat is recoverable when another configured
+# profile has live headroom. Keep the machine-readable rotate result so the
+# caller can distinguish a completed profile flip from the normal, successful
+# "no eligible target" result. The latter must alert a person once rather than
+# falling back into the stalled-seat nudge ladder.
+_sup_quota_rotate() {  # <name>; 0=rotated, 1=no measured target, 2=failed
+  local name="$1" out
+  if ! out=$(JSON_MODE=1 with_registry_lock cmd_agent_rotation_rotate "$name" --require-live-headroom 2>/dev/null); then
+    return 2
+  fi
+  if jq -e '.ok == true and .data.rotated == true' <<<"$out" >/dev/null 2>&1; then
+    return 0
+  fi
+  if jq -e '.ok == true and .data.rotated == false' <<<"$out" >/dev/null 2>&1; then
+    return 1
+  fi
+  return 2
+}
+
 # ── DIVE-3667: fleet rollup — count EVERY class, not a hand-picked five ──────
 #
 # The tick's rollup used to enumerate healthy/slow/stuck/drift/verify-challenge
@@ -1469,6 +1490,11 @@ cmd_supervisor_tick() {
     fi
   done < <(jq -c '.[]' <<<"$snap")
 
+  local actions_on="false" acted=0 planned=0 escalated=0 now_s
+  [[ -f "$_SUP_ACTIONS_FLAG" ]] && actions_on="true"
+  now_s=$(date +%s)
+  local reg_now; reg_now=$(registry_read)
+
   # ── DIVE-1127: ID/age-verification tripwire — SAME-DAY alert (not the P2 ladder).
   # A verification challenge is not "wedged compute" you nudge/resume/rotate out of;
   # it is an account-state event whose only response is a human/runbook flip. So it
@@ -1477,11 +1503,10 @@ cmd_supervisor_tick() {
   local alerted=0
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
-    # DIVE-3272: the same always-live, deduped alert path now carries the two
-    # capacity classes. They belong here and NOT on the P2 ladder for the same
-    # reason the verify challenge does: a nudge/resume/rotate cannot fix a seat
-    # that has no model capacity, and rotating work onto it is what queued 20
-    # rows behind dev3 in the first place.
+    # DIVE-3272: the same always-live, deduped alert path carries the capacity
+    # classes. DIVE-3822 adds one narrow recovery before quota-exhausted reaches
+    # that alert: rotation to a destination with measured live headroom. It
+    # never enters the stalled-seat nudge/resume ladder.
     local cls; cls=$(jq -r '.classification' <<<"$row")
     case "$cls" in verify-challenge|no-output|quota-exhausted) ;; *) continue ;; esac
     name=$(jq -r '.name' <<<"$row")
@@ -1491,6 +1516,39 @@ cmd_supervisor_tick() {
       quota-exhausted)  excerpt=$(jq -r '.detail // ""' <<<"$row");                  cause_s="quota-exhausted" ;;
       *)                excerpt=$(jq -r '.detail // ""' <<<"$row");                  cause_s="no-output" ;;
     esac
+
+    # DIVE-3822: quota exhaustion is the one capacity class with an automatic
+    # remedy. It bypasses the stalled-seat nudge ladder and asks the existing
+    # rotation selector for a destination whose live pane shows headroom. A
+    # successful flip is quiet; no measured destination (or a failed rotate)
+    # falls through to the same 24h-deduped human alert as before.
+    if [[ "$cls" == "quota-exhausted" && "$actions_on" == "true" ]]; then
+      local quota_rot qrc=0
+      quota_rot=$(jq -r --arg n "$name" '.agents[$n].rotation.enabled // false' <<<"$reg_now")
+      if [[ "$quota_rot" == "true" ]]; then
+        if _sup_quota_rotate "$name"; then
+          if db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
+                 VALUES ($(sqlq "$name"), 'action', 'quota-exhausted', 'quota-exhausted',
+                         $(sqlq "{\"rung\":\"rotate\",\"result\":\"ok\",\"measuredTarget\":true}"));" 2>/dev/null; then
+            acted=$((acted + 1)); events=$((events + 1))
+          else
+            warn "supervisor: quota rotation insert failed for $name"
+          fi
+          continue
+        else
+          qrc=$?
+          if (( qrc == 1 )); then
+            excerpt="${excerpt}; no measured-eligible rotation target"
+          else
+            excerpt="${excerpt}; measured-target rotation failed"
+          fi
+        fi
+      else
+        excerpt="${excerpt}; rotation is disabled"
+      fi
+    elif [[ "$cls" == "quota-exhausted" ]]; then
+      excerpt="${excerpt}; automatic actions are disabled"
+    fi
     local prev_alert
     # Dedup is scoped BY CLASS (DIVE-3272): a seat can be both quota-walled and
     # output-dry, and an unscoped window would let whichever fired first
@@ -1518,10 +1576,6 @@ cmd_supervisor_tick() {
   # Dormant mode writes 'planned' rows: the Jul 9 review reads exactly what the
   # ladder WOULD have done all week. reprovision stays manual; restart is rung 4
   # since DIVE-3753 and rides this same dormancy flag.
-  local actions_on="false" acted=0 planned=0 escalated=0 now_s
-  [[ -f "$_SUP_ACTIONS_FLAG" ]] && actions_on="true"
-  now_s=$(date +%s)
-  local reg_now; reg_now=$(registry_read)
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
     class=$(jq -r '.classification' <<<"$row")
