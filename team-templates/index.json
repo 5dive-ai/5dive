@@ -12,9 +12,9 @@
       "roster": [
         { "key": "olivia", "role": "CEO", "model": "opus", "reports_to": null },
         { "key": "marcus", "role": "CTO", "model": "opus", "reports_to": "olivia" },
-        { "key": "huck", "role": "DevOps and Reliability", "model": "opus", "reports_to": "marcus" },
-        { "key": "dario", "role": "Engineer", "model": "opus", "reports_to": "huck" },
-        { "key": "quinn", "role": "Verifier / QA", "model": "opus", "reports_to": "huck" },
+        { "key": "anton", "role": "DevOps and Reliability", "model": "opus", "reports_to": "marcus" },
+        { "key": "dario", "role": "Engineer", "model": "opus", "reports_to": "anton" },
+        { "key": "vesper", "role": "Verifier / QA", "model": "opus", "reports_to": "anton" },
         { "key": "theo", "role": "CMO", "model": "opus", "reports_to": "olivia" },
         { "key": "dude", "role": "Head of Community", "model": "sonnet", "reports_to": "theo" },
         { "key": "lilbro", "role": "Creative Director", "model": "opus", "reports_to": "theo" }

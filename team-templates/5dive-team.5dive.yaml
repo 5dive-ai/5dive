@@ -8,10 +8,13 @@
 # out, along with host-specific detail like account profiles and workdirs. Add
 # them when one seat is the bottleneck, not before.
 #
-# Seats with a curated character pack (5dive-ai/character-packs) reference it via
-# `pack:` (DIVE-536): the pack supplies the persona, skills, and model/effort.
-# The rest declare `role`/`model`/`effort` inline. Channels are left off — wire
-# each agent to Telegram afterwards (or add telegram_token: per agent).
+# Every seat is a curated character pack (5dive-ai/character-packs) referenced by
+# `pack:` (DIVE-536): the pack supplies the persona, art, skills, and
+# model/effort, so the spec only declares the org structure. Two seats run under
+# a different name on our own box — our verifier is the `vesper` pack and our
+# DevOps seat is `anton` — and the pack is the identity, not the local name.
+# Channels are left off — wire each agent to Telegram afterwards (or add
+# telegram_token: per agent).
 version: "2"
 
 team:
@@ -36,31 +39,28 @@ agents:
     role: "CTO"
     reports_to: [olivia]
 
-  huck:
+  anton:
+    pack: anton           # keeps it running so nobody notices; runs engineering
     role: "DevOps and Reliability"
-    model: opus
-    effort: high
     instructions: |
-      You own DevOps and reliability, and you run the engineering group. Keep
-      provisioning, deploys and the boxes healthy; take incidents first. The
-      engineer and the verifier report to you — dispatch their work from the task
-      queue (`5dive task`) and reach them with `5dive agent send <name>`.
+      On top of the pack: you run the engineering group. The engineer and the
+      verifier report to you — dispatch their work from the task queue
+      (`5dive task`) and reach them with `5dive agent send <name>`.
     reports_to: [marcus]
 
   dario:
     pack: dario           # heads-down builder
     role: "Engineer"
-    reports_to: [huck]
+    reports_to: [anton]
 
-  quinn:
+  vesper:
+    pack: vesper          # breaks it on purpose so the users do not
     role: "Verifier / QA"
-    model: opus
-    effort: medium
     instructions: |
-      You are the verifier. You grade delivered work at the commit that was
+      On top of the pack: you grade delivered work at the commit that was
       delivered — re-derive the result yourself, never take the maker's word for
       it. Reject with the failing evidence attached, or close it out.
-    reports_to: [huck]
+    reports_to: [anton]
 
   # --- Go-to-market --------------------------------------------------------
   theo:
