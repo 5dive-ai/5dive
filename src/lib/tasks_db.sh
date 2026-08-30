@@ -261,6 +261,33 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- resurrect exactly the FAILs this column exists to record.
   graded_verdict TEXT,
   graded_verdict_at TEXT,
+  -- DIVE-3823: RECORDED MERGE EVIDENCE. The merge gate has three ways to ASK
+  -- GitHub (caller token, the root-only `_gh_do` bot rail, the anonymous rail) and
+  -- a verifier seat on a PRIVATE repo holds none of them: `_gh_do` is the can-push
+  -- grant a grader must not hold, and the anonymous rail 404s. DIVE-477 says only
+  -- that verifier may close; the gate says the closer must be able to read the PR.
+  -- Both are correct and they enclose each other, so the row was closable by NO
+  -- seat (measured on DIVE-3808: merged at 2033057e, unclosable).
+  --
+  -- The exit the gate's OWN refusal already recommends is `task verify --no-done
+  -- --cmd=<script>` whose EXIT STATUS proves the merge. Nothing read it. These
+  -- columns are that reading, stamped STRUCTURALLY for the same reason graded_at
+  -- is: a predicate that keyed on result TEXT would be satisfiable by typing the
+  -- right words, and `task deliver --result=` (the MAKER's verb) writes that column.
+  --   merge_proof_at   when the proving command was RUN (never backdated)
+  --   merge_proof_by   the actor who ran it
+  --   merge_proof_ref  the delivery_ref it was run AGAINST -- the gate accepts only
+  --                    when this still equals the row's CURRENT binding, so a
+  --                    re-pointed delivery invalidates the proof rather than
+  --                    silently carrying it onto a different PR.
+  --   merge_proof_cmd  the command text, so a later reader can re-derive it.
+  -- BARE SET, not COALESCE, and for graded_verdict's reason: this is CURRENT STATE
+  -- about a specific binding, not provenance of a first event. A row re-pointed and
+  -- re-proved must overwrite, or the second proof could never replace the first.
+  merge_proof_at TEXT,
+  merge_proof_by TEXT,
+  merge_proof_ref TEXT,
+  merge_proof_cmd TEXT,
   -- DIVE-2615: why this gate has this tier — axis=pinned|type-default|secret-type
   -- |ask|title|title-fallback|none, plus ;term=<t> where a term is what fired.
   -- Declared HERE as well as in _TASKS_ADDITIVE_COLUMNS: a fresh store takes this
@@ -1569,6 +1596,11 @@ _TASKS_ADDITIVE_COLUMNS=(
   # See the CREATE TABLE comment for why these are bare-SET while graded_at is
   # COALESCE'd, and why NULL must keep reading as a pass.
   'graded_verdict TEXT' 'graded_verdict_at TEXT'
+  # DIVE-3823: recorded merge evidence the credential-less verifier's close can
+  # consult. See the CREATE TABLE comment for why it is structural and why
+  # merge_proof_ref must match the CURRENT binding.
+  'merge_proof_at TEXT' 'merge_proof_by TEXT'
+  'merge_proof_ref TEXT' 'merge_proof_cmd TEXT'
   # DIVE-2354: approve-to-send | confirm-after-send. See the CREATE TABLE comment.
   'gate_mode TEXT'
   # DIVE-3342: humans.id of the person who may CLEAR this gate. See the CREATE

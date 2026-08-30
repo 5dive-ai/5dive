@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased — fix(task): a merged row that NO seat could close — the merge gate now reads the proof it already asks for (DIVE-3823)
+
+Two rails, each correct, that intersect on a seat which can satisfy neither:
+
+- **Only the verifier may close a live delivered loop** (DIVE-477 / DIVE-2007). Purely actor-based.
+- **The closer must be able to READ the delivery PR**, or the merge gate fails closed — correctly, because
+  an unreadable PR and an unmerged one are indistinguishable.
+
+On a **private** repo a verifier seat holds none of the gate's three rails: no `GH_TOKEN`, no non-root
+`SUDO_USER`, no `_gh_do` grant (that is the can-push grant a grader must not hold, so its absence there is
+the CORRECT state, not a provisioning fault), and the anonymous rail 404s. The one seat allowed to close is
+the one seat unable to. `--force-merge-gate` does not reach it: that flag escapes a gate that RAN and
+disagreed, never one that asked nothing. Measured on **DIVE-3808** — fix written, graded PASS, merged, live
+on `origin/main` at `2033057e`, and the row closable by nobody.
+
+The gate's own refusal already prints the exit: run `task verify --no-done --cmd=<script>` "whose EXIT
+STATUS proves the merge". Nothing read it.
+
+- **`task verify … --merge-proof`** stamps that run against the row's CURRENT delivery binding —
+  `merge_proof_at/by/ref/cmd`, four new additive columns. Only on a command that actually RAN and exited
+  **0**; a failing proof records nothing and says why. Structural, never keyed on result TEXT (the maker's
+  `task deliver --result=` writes that column, so a text predicate would be satisfiable by typing the right
+  words — DIVE-3098's rule, one column over).
+- **`task done` consults it ONLY where no rail could ask at all.** A caller holding a token or the bot grant
+  takes the API path exactly as before; a recorded proof can never substitute for an answer the gate could
+  have gotten.
+- **A re-pointed binding makes the proof inert.** The gate accepts only while `merge_proof_ref` still equals
+  the row's live `delivery_ref`, so a proof cannot silently carry onto a different PR.
+- **It is an attestation, and it says so.** The caller chose the command, so the close WARNS loudly, names
+  who proved it and with what, and writes a `task.merge-proof-close` audit row. Stronger than the assertion
+  `--force-merge-gate` records elsewhere; weaker than an API query. If the two ever disagree, the API is right.
+
+Not touched: only-the-verifier-closes stays exactly as it is.
+
 ## Unreleased — feat(task): gate state on the surfaces people READ — `ls` column, `show` header, `--gated` (DIVE-3785)
 
 `task show` printed a row's gate at the TAIL of the record, below the body; `task ls` printed nothing at

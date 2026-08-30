@@ -58,7 +58,7 @@ _task_usage() {
                                                 verifiers: put \`graded-sha: <sha>\` in the result;
                                                 --no-graded-sha is the audited escape
   deliver <id> --pr=<url> [--result=|--result-file=<path>]   record the delivery PR, hand to the verifier
-  verify <id> [--cmd=] [--result=|--result-file=<path>] [--no-done] [--timeout=]
+  verify <id> [--cmd=] [--result=|--result-file=<path>] [--no-done] [--merge-proof] [--timeout=]
                                                 run the check; exit 0 = pass
   reject <id> [--feedback=<what to fix>]        verifier FAIL: bounce back to the maker
   cancel <id> [--result=<text>]                 -> cancelled

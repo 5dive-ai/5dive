@@ -472,11 +472,24 @@ _task_verify_merge_binding() {
 # --no-done (alias --check) runs the check and records it WITHOUT flipping.
 cmd_task_verify() {
   tasks_db_init
-  local task="" cmd="" no_done=0 timeout_s="" prose="" have_prose=0 prose_src=""
+  local task="" cmd="" no_done=0 timeout_s="" prose="" have_prose=0 prose_src="" merge_proof=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --cmd=*)      cmd="${1#*=}" ;;
       --no-done|--check) no_done=1 ;;
+      # DIVE-3823: RECORD THIS COMMAND AS MERGE EVIDENCE the close gate may read.
+      # The merge gate's own no-credential refusal already tells a verifier seat to
+      # run `verify --no-done --cmd=<ancestry/grep script>` "whose EXIT STATUS proves
+      # the merge" — and then nothing read it, so the row it rescued was closable by
+      # nobody (DIVE-3808, merged and stuck). This flag is that reading: it stamps
+      # the run structurally against the row's CURRENT delivery binding.
+      #
+      # Deliberately OPT-IN and not inferred from the command text. Most --cmd runs
+      # are acceptance tests, not merge proofs; accepting every passing verify as
+      # merge evidence would fail the gate OPEN on every graded row, which is the
+      # inverse of the bug. The flag is the caller SAYING which one this is, and it
+      # is recorded with the command text and the actor so the claim is readable.
+      --merge-proof) merge_proof=1 ;;
       # DIVE-2832: the verifier's own words. Every other writer of this column is
       # either the MAKER's verb (deliver) or machine output, so a verifier who
       # graded by READING had no way to put a prose PASS on an OPEN row at all.
@@ -495,7 +508,7 @@ cmd_task_verify() {
     shift
   done
   [[ -n "$task" ]] \
-    || fail "$E_USAGE" "usage: 5dive task verify <id|DIVE-N> [--cmd=\"<command>\"] [--result=\"<prose verdict>\"|--result-file=<path>] [--no-done] [--timeout=<seconds>]"
+    || fail "$E_USAGE" "usage: 5dive task verify <id|DIVE-N> [--cmd=\"<command>\"] [--result=\"<prose verdict>\"|--result-file=<path>] [--no-done] [--merge-proof] [--timeout=<seconds>]"
   [[ -z "$timeout_s" || "$timeout_s" =~ ^[1-9][0-9]*$ ]] \
     || fail "$E_VALIDATION" "--timeout must be a positive integer (seconds)"
   resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
@@ -525,6 +538,15 @@ cmd_task_verify() {
         || fail "$E_USAGE" "no --cmd given and task has no stored verify_command (set one: 5dive task add … --verify=\"<cmd>\"). If you graded by READING rather than by running something, record it as prose instead: 5dive task verify $task --no-done --result=\"<your verdict>\" (DIVE-2832)."
       ran_cmd=0
     fi
+  fi
+
+  # DIVE-3823: what --merge-proof requires, refused BEFORE the command runs so a
+  # caller is never told "it passed but was not recorded" after paying for the run.
+  local mp_dref=""
+  if (( merge_proof )); then
+    (( ran_cmd )) || fail "$E_USAGE" "--merge-proof records the EXIT STATUS of a command as evidence that the delivery landed, so there must be a command to run: pass --cmd=\"<script>\" (e.g. 'git fetch -q origin main && git merge-base --is-ancestor <merge-sha> origin/main && git grep -q <a-symbol-the-PR-added> origin/main -- <path>'). A prose verdict asserts a merge rather than proving one, which is the distinction this flag exists to keep (DIVE-2832)."
+    mp_dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};")
+    [[ -n "$mp_dref" ]] || fail "$E_USAGE" "$ident binds NO delivery ref, so there is nothing for --merge-proof to be evidence ABOUT. The proof is recorded against a specific binding and the close gate accepts it only while that binding is still the row's current one. Bind it first: 5dive task deliver $ident --pr=https://github.com/<owner>/<repo>/pull/N"
   fi
 
   # Run it. Combined stdout+stderr. The `if` wrapper captures the exit code
@@ -758,6 +780,30 @@ cmd_task_verify() {
            graded_verdict=$( (( rc == 0 )) && printf "'pass'" || printf "'fail'" ),
            graded_verdict_at=datetime('now')
         WHERE id=${id};"
+  fi
+
+  # DIVE-3823: stamp the proof. AFTER the verdict write above, and only on a PASS —
+  # a FAILING command is evidence the delivery did NOT land, and recording it as a
+  # proof would hand the gate the opposite of what it asked for.
+  #
+  # BARE SET, not COALESCE (graded_verdict's rule, not graded_at's): this is CURRENT
+  # STATE about one binding. A row re-pointed to a different PR and re-proved must
+  # overwrite, or the second proof could never replace the first — and the gate's
+  # equality test against the live delivery_ref is what makes a stale proof inert
+  # rather than dangerous.
+  if (( merge_proof )); then
+    if (( rc == 0 )); then
+      db "UPDATE tasks SET merge_proof_at=datetime('now'),
+             merge_proof_by=$(sqlq "$(task_actor "")"),
+             merge_proof_ref=$(sqlq "$mp_dref"),
+             merge_proof_cmd=$(sqlq "$cmd")
+          WHERE id=${id};"
+      _task_store_audit_log "task.merge-proof" ok 0 -- \
+        "$ident" "ref=$mp_dref" "by=$(task_actor "")" "cmd=$cmd"
+      warn "$ident: merge proof RECORDED against ${mp_dref} by $(task_actor "") — \`task done\` may now close this row from a seat that holds no gh credential (DIVE-3823, audited). Re-point the binding and this proof stops counting."
+    else
+      warn "$ident: --merge-proof was given but the command FAILED (exit ${rc}) — nothing recorded. A failing proof is evidence the delivery did not land, not evidence that it did."
+    fi
   fi
 
   if (( JSON_MODE )); then
