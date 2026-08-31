@@ -162,10 +162,18 @@ t "armed + budget free -> the rung acts, it does not page a human" \
 # tick remain in the path. Recording argv proves the tick asks the production
 # selector for `--require-live-headroom`; running two ticks against one DB proves
 # the no-target alert is deduped by behavior, not merely by a helper predicate.
-tick_arm() {  # <snapshot-json> [armed] [seed-sql] [registry-json] [rotated|no-target|failed] [ticks]
+tick_arm() {  # <snapshot-json> [armed] [seed-sql] [registry-json] [rotated|no-target|failed] [ticks] [poller-after-restart]
   local fixture_registry="${4:-}"
   [[ -n "$fixture_registry" ]] || fixture_registry='{"agents":{}}'
-  SNAP="$1" ARMED="${2:-}" SEED="${3:-}" \
+  # DIVE-3856: what the post-restart poller probe SEES, as a fixture. Default 1
+  # (the poller came back), which is what every pre-existing arm here assumes.
+  # It has to be injected: rung 4 now re-probes after its own restart, and the
+  # probe is a `pgrep` against the REAL process table. Left unstubbed this
+  # harness reads whatever this host happens to be running — it passed locally
+  # only because seats named in the fixture have live pollers, and CI, which has
+  # none, went red on three arms. A fixture that is realistic in its DATA is
+  # still not hermetic if one of its probes reaches outside the fixture.
+  SNAP="$1" ARMED="${2:-}" SEED="${3:-}" POLLER_AFTER="${7:-1}" \
     FIXTURE_REGISTRY="$fixture_registry" ROTATE_RESULT="${5:-no-target}" TICKS="${6:-1}" \
     REPO="$PWD" bash -c '
     set -euo pipefail
@@ -192,6 +200,11 @@ tick_arm() {  # <snapshot-json> [armed] [seed-sql] [registry-json] [rotated|no-t
     : >"$TMP/sent"; : >"$TMP/restarted"; : >"$TMP/rotated"; : >"$TMP/capacity-alerts"
     cmd_send() { printf "%s\n" "$1" >>"$TMP/sent"; return 0; }
     cmd_restart() { printf "%s\n" "$1" >>"$TMP/restarted"; return 0; }
+    # DIVE-3856: rung 4 re-probes the poller after its own restart. Both stubs
+    # keep that hermetic — the count comes from the fixture, and the poll does
+    # not spend real seconds waiting for a process that will never exist.
+    _sup_true_poller_count() { printf "%s\n" "$POLLER_AFTER"; }
+    sleep() { :; }
     with_registry_lock() { "$@"; }
     cmd_agent_rotation_rotate() {
       printf "%s\n" "$*" >>"$TMP/rotated"
@@ -283,6 +296,34 @@ t "armed tick: the act records its result" "ok" \
   "$(jq -r '.result // "NO-RESULT"' <<<"$(fld "$armed_out" ACT)" 2>/dev/null || echo NO-ACTION-ROW)"
 t "armed tick: a successful auto-restart pages nobody" "" "$(fld "$armed_out" SENT)"
 t "armed tick: and writes no escalate row" "" "$(fld "$armed_out" ESC)"
+# DIVE-3856: the three arms above now depend on the poller having come BACK, and
+# say so — the fixture supplies that reading rather than the host process table.
+
+# ── DIVE-3856: the restart that RAN and did not work ─────────────────────────
+# The defect this pair grades, measured on `main` 2026-08-31: rung 4 restarted a
+# poller-dead seat, recorded result:"ok" from cmd_restart EXIT CODE, and the seat
+# stayed deaf for another fifteen minutes. The failure surfaced only on the NEXT
+# tick, as reason `restart-rate-limited` — a true sentence that names the limiter
+# as the reason a human is needed, when the reason is that the remedy did not
+# work. So: same snapshot, same armed tick, same successful cmd_restart, and the
+# ONLY difference is that the poller did not come back.
+deaf_out=$(tick_arm "$_SICK_SNAP" armed "" "" "" "" 0)
+t "3856: the restart still RAN (this is not the limiter refusing)" "main" "$(fld "$deaf_out" RESTARTED)"
+t "3856: a restart whose poller did not return is NOT recorded ok" "restart-ran-poller-still-dead" \
+  "$(jq -r '.result // "NO-RESULT"' <<<"$(fld "$deaf_out" ACT)" 2>/dev/null || echo NO-ACTION-ROW)"
+t "3856: and it escalates on THIS tick, naming the remedy — not ten minutes later, naming the limiter" \
+  "restart-ran-poller-still-dead" \
+  "$(jq -r '.reason // "NO-REASON"' <<<"$(fld "$deaf_out" ESC)" 2>/dev/null || echo NO-ESCALATE-ROW)"
+t "3856: the same-tick escalation reaches a courier (a page nobody receives is not a page)" "ops" \
+  "$(fld "$deaf_out" SENT)"
+# The third outcome must not page anyone: a type whose poller has no argv-stable
+# shape reads `unverified`, and escalating that would alert every healthy seat of
+# that type. n/a is what _sup_true_poller_count returns for such a type.
+unv_out=$(tick_arm "$_SICK_SNAP" armed "" "" "" "" "n/a")
+t "3856: an UNVERIFIABLE seat is recorded as such, never as ok" "restart-ran-poller-unverified" \
+  "$(jq -r '.result // "NO-RESULT"' <<<"$(fld "$unv_out" ACT)" 2>/dev/null || echo NO-ACTION-ROW)"
+t "3856: and it pages nobody (it is 'I could not tell', not 'it is broken')" "" "$(fld "$unv_out" SENT)"
+t "3856: …and writes no escalate row" "" "$(fld "$unv_out" ESC)"
 
 # ...and the seat a restart did NOT fix. Same snapshot, same armed tick, but the
 # seat already spent its budget in-window: no second restart, and the human path
