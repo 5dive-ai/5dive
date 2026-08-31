@@ -24,7 +24,9 @@ auth_creds_present() {
   [[ "$sentinel" == *:* ]] && key="${sentinel##*:}"
   # Profile-scoped: swap the default credential path for the profile's. The
   # jq key (for OAuth json sentinels) is unchanged.
-  if [[ -n "$profile" ]]; then
+  # DIVE-3834: openclaw resolves through the layout ladder even with no profile
+  # (the default-home seat is on the same upstream release as the scoped ones).
+  if [[ -n "$profile" || "$type" == openclaw ]]; then
     local ppath
     ppath=$(profile_type_auth_path "$profile" "$type") || ppath=""
     [[ -n "$ppath" ]] && path="$ppath"
@@ -682,6 +684,54 @@ profile_type_env() {
   esac
 }
 
+# _openclaw_cred_path <state_root> — echo the path, under a HOME-redirected
+# openclaw state root, that PROVES this seat carries an openclaw credential.
+# Nothing on stdout + rc 1 when no rung proves one.
+#
+# DIVE-3834: upstream openclaw 2026.8.1 moved the credential store. The
+# DIVE-3489 path (agents/main/agent/openclaw-agent.sqlite) is still CREATED on
+# 2026.8.1 and stays EMPTY, so a single hardcoded path reported every
+# correctly-authenticated BYO seat as `needs_login` and told the customer to run
+# a login that cannot help. We install openclaw UNPINNED, so this landed on
+# every new provision overnight with no change on our side.
+#
+# The ladder is ordered oldest-layout-first so a box on the pre-2026.8.1 layout
+# keeps its exact previous answer, and each rung is a POSITIVE assertion that a
+# credential exists — never "the file the app happens to create is there".
+# That distinction is the whole defect: the empty directory is what made this
+# fail silently instead of loudly.
+#
+# Deliberately NOT a rung: ~/.openclaw/state/openclaw.sqlite. That is the app's
+# own store on 2026.8.1 and it is created lazily by openclaw itself, so a
+# non-empty test on it cannot tell "authenticated" from "openclaw has run once".
+# Admitting it would make this function unable to fire on the ABSENT case —
+# the DIVE-3130 shape (a guard guarded by its own subject). See
+# community/wiki/an-unconfigured-model-authenticates-against-the-wrong-provider.md.
+_openclaw_cred_path() {
+  local root="$1" p
+  # Rung 1 — layouts up to 2026.7.x: the per-agent auth store (DIVE-3489).
+  p="${root}/.openclaw/agents/main/agent/openclaw-agent.sqlite"
+  [[ -s "$p" ]] && { echo "$p"; return 0; }
+  # Rung 2 — 2026.8.1+: auth profiles live in the top-level config under
+  # .auth.profiles (measured on box 62.238.11.92, openclaw 2026.8.1 ea80657:
+  # auth.profiles."google:manual".provider / .mode after a BYO key write).
+  # Gated on the PROFILE MAP being non-empty, not on the file existing —
+  # openclaw.json is written at config time by seats that never authenticated.
+  p="${root}/.openclaw/openclaw.json"
+  if [[ -s "$p" ]] && jq -e '(.auth.profiles // {}) | length > 0' "$p" >/dev/null 2>&1; then
+    echo "$p"; return 0
+  fi
+  return 1
+}
+
+# _openclaw_state_root <path> — the HOME-redirect root implied by an openclaw
+# credential path (everything left of the trailing `/.openclaw/...`).
+_openclaw_state_root() {
+  local p="$1"
+  [[ "$p" == */.openclaw/* ]] || return 1
+  echo "${p%%/.openclaw/*}"
+}
+
 # profile_type_auth_path <profile> <type> — absolute path to the credential
 # sentinel for (profile, type). Empty profile returns TYPE_AUTH's shared
 # default; non-empty returns the per-profile path corresponding to the
@@ -689,7 +739,17 @@ profile_type_env() {
 profile_type_auth_path() {
   local profile="$1" type="$2"
   if [[ -z "$profile" ]]; then
-    echo "${TYPE_AUTH[$type]:-}"
+    local _def="${TYPE_AUTH[$type]:-}"
+    # DIVE-3834: the default-home openclaw seat needs the same layout ladder the
+    # profile-scoped one gets; TYPE_AUTH can only name one path and 2026.8.1
+    # writes a different one. Resolve, and fall back to the constant unchanged.
+    if [[ "$type" == openclaw && -n "$_def" ]]; then
+      local _root _hit
+      if _root=$(_openclaw_state_root "$_def"); then
+        _hit=$(_openclaw_cred_path "$_root") && { echo "$_hit"; return; }
+      fi
+    fi
+    echo "$_def"
     return
   fi
   local dir="${AUTH_PROFILES_DIR}/${profile}/${type}"
@@ -702,7 +762,14 @@ profile_type_auth_path() {
     # sqlite store. This path feeds mtime-based sign-in detection, so pointing it
     # at the JSON watched a file that a successful auth no longer touches — the
     # poll would sit forever on a profile that had in fact authenticated.
-    openclaw)    echo "${dir}/.openclaw/agents/main/agent/openclaw-agent.sqlite" ;;
+    # DIVE-3834: 2026.8.1 moved the store. Return whichever rung PROVES a
+    # credential; with none proven, keep returning the DIVE-3489 path so the
+    # mtime baseline in cmd_auth_poll and the "provably absent" branch in
+    # agent_auth_health behave exactly as they did before this change.
+    openclaw)
+      local _oc
+      _oc=$(_openclaw_cred_path "$dir") && { echo "$_oc"; return; }
+      echo "${dir}/.openclaw/agents/main/agent/openclaw-agent.sqlite" ;;
     antigravity) echo "${dir}/.gemini/antigravity-cli/antigravity-oauth-token" ;;
     grok)        echo "${dir}/.grok/auth.json" ;;
     # claude detection in cmd_auth_poll is log-grep-based, not file-mtime —
@@ -809,7 +876,7 @@ agent_auth_health() {
   # Sentinels are "<path>" or "<path>:<key>"; only the path half is needed here
   # (auth_creds_present owns the key half).
   local path="${sentinel%%:*}"
-  if [[ -n "$profile" ]]; then
+  if [[ -n "$profile" || "$type" == openclaw ]]; then   # DIVE-3834: see auth_creds_present
     local ppath
     ppath=$(profile_type_auth_path "$profile" "$type" 2>/dev/null) || ppath=""
     [[ -n "$ppath" ]] && path="$ppath"
