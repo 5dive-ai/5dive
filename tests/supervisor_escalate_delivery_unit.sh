@@ -196,8 +196,13 @@ tick_arm() {  # <snapshot-json> [armed] [seed-sql] [registry-json] [rotated|no-t
     cmd_agent_rotation_rotate() {
       printf "%s\n" "$*" >>"$TMP/rotated"
       case "$ROTATE_RESULT" in
-        rotated)   printf "%s\n" "{\"ok\":true,\"data\":{\"rotated\":true}}" ;;
-        no-target) printf "%s\n" "{\"ok\":true,\"data\":{\"rotated\":false}}" ;;
+        # DIVE-3856: the rotate envelope now names the bounce it SCHEDULED and
+        # the poller check it OWES. Pinned here so this stub stays a model of the
+        # verb as it ships rather than of an older one. (No apostrophes in this
+        # comment on purpose: the whole block lives inside a single-quoted
+        # `bash -c` string, and one would end it.)
+        rotated)   printf "%s\n" "{\"ok\":true,\"data\":{\"rotated\":true,\"channelBounceScheduled\":true,\"channelVerified\":false}}" ;;
+        no-target) printf "%s\n" "{\"ok\":true,\"data\":{\"rotated\":false,\"channelBounceScheduled\":false,\"channelVerified\":null}}" ;;
         *)         return 1 ;;
       esac
     }

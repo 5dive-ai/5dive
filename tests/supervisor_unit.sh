@@ -240,10 +240,14 @@ cmd_agent_rotation_rotate() {
   [[ "${2:-}" == "--require-live-headroom" ]] || { printf 'missing-live-headroom-flag\n'; return 0; }
   printf '%s\n' "${QUOTA_ROTATE_FIXTURE}"
 }
-QUOTA_ROTATE_FIXTURE='{"ok":true,"data":{"rotated":true,"from":"full","to":"roomy"}}'
+# DIVE-3856: the fixture carries rotate's REAL envelope. _sup_quota_rotate only
+# reads .ok/.data.rotated, so the new keys change nothing here — which is the
+# point of pinning them: a fixture that omits what the verb now emits stops
+# being evidence about the verb the moment anything downstream reads them.
+QUOTA_ROTATE_FIXTURE='{"ok":true,"data":{"rotated":true,"from":"full","to":"roomy","channelBounceScheduled":true,"channelVerified":false}}'
 if _sup_quota_rotate unit-q; then QR=0; else QR=$?; fi
 t "quota recovery: measured target returns rotated" "0" "$QR"
-QUOTA_ROTATE_FIXTURE='{"ok":true,"data":{"rotated":false,"from":"full","to":null,"reason":"no eligible account"}}'
+QUOTA_ROTATE_FIXTURE='{"ok":true,"data":{"rotated":false,"from":"full","to":null,"reason":"no eligible account","channelBounceScheduled":false,"channelVerified":null}}'
 if _sup_quota_rotate unit-q; then QR=0; else QR=$?; fi
 t "quota recovery: no measured target is distinct" "1" "$QR"
 QUOTA_ROTATE_FIXTURE='not-json'
@@ -460,6 +464,135 @@ SETE_OUT=$(bash -c '
 ' 2>/dev/null) || SETE_OUT="ABORTED-UNDER-SET-E"
 t "set -e: the clean-fleet path does not abort the tick" \
   "healthy||2" "$SETE_OUT"
+
+# ── DIVE-3856: rung 4 verifies its own remedy ────────────────────────────────
+# THE DEFECT this grades: on 2026-08-31 rung 4 restarted a poller-dead `main`
+# and recorded result:"ok" from cmd_restart's EXIT CODE. The seat was still
+# deaf; the seat's lifecycle.log shows no launcher line at all for that restart,
+# and the supervisor discovered it ten minutes later, whereupon the rate limiter
+# refused a second restart and escalated `restart-rate-limited` — a true
+# sentence that names the LIMITER as the reason a human is needed, when the
+# reason is that the remedy did not work.
+#
+# The arms fail in OPPOSITE directions and both are graded:
+#   FALSE GREEN — scoring ok for a poller nobody counted (the original bug), or
+#                 counting the LAUNCHER and calling a still-deaf seat cured.
+#   FALSE RED   — probing before the poller can exist (~9s) and escalating a
+#                 healthy seat, or escalating a seat whose type we cannot probe.
+
+# --- the predicate: the POLLER, not the launcher -----------------------------
+# Measured on this host 2026-08-31 (plugin 0.5.49): a claude seat runs BOTH
+#   `bun run --cwd …/5dive-plugins/telegram/0.5.49 … start`  (the launcher)
+#   `bun start.ts`                                            (the poller)
+# and only the first matches the classifier's _SUP_POLLER_PAT. A verification
+# probe that inherited that pattern would grade the launcher it just started.
+tp() { ( PGREP_OUT="$1"; pgrep() { [[ -n "$PGREP_OUT" ]] && printf '%s\n' $PGREP_OUT; }
+         getent() { return 0; }
+         _sup_true_poller_count "${2:-unit-p}" "${3:-claude}" ); }
+_PAT_C="${_SUP_TRUE_POLLER_PAT[claude]}"
+t "3856 predicate: matches the bare poller argv (\`bun start.ts\`, plugin >= 0.5.49)" "yes" \
+  "$(printf '%s\n' 'bun start.ts' | grep -qE "$_PAT_C" && printf yes || printf no)"
+t "3856 predicate: matches the OLDER argv (\`bun server.ts\`) — a start.ts-only pattern reads zero on healthy seats" "yes" \
+  "$(printf '%s\n' 'bun server.ts' | grep -qE "$_PAT_C" && printf yes || printf no)"
+t "3856 predicate: matches the path-qualified telegram-<x> variant" "yes" \
+  "$(printf '%s\n' 'bun /home/agent-x/.claude/plugins/cache/telegram-codex/0.4.0/server.ts' | grep -qE "$_PAT_C" && printf yes || printf no)"
+t "3856 predicate: does NOT match the LAUNCHER (the whole point — it is state 2 blindness)" "no" \
+  "$(printf '%s\n' 'bun run --cwd /home/agent-x/.claude/plugins/cache/5dive-plugins/telegram/0.5.49 --shell=bun --silent start' \
+     | grep -qE "$_PAT_C" && printf yes || printf no)"
+t "3856 predicate: is NOT the classifier's pattern (that one matches the launcher and misses the poller)" "differ" \
+  "$( [[ "${_SUP_TRUE_POLLER_PAT[claude]}" == "${_SUP_POLLER_PAT[claude]}" ]] && printf same || printf differ )"
+t "3856 count: one poller process counts as one" "1" "$(tp '4242')"
+t "3856 count: the probe's OWN pid is excluded (pgrep -f matches our command line)" "0" "$(tp "$$")"
+t "3856 count: no poller is a real zero, not unknown" "0" "$(tp '')"
+t "3856 count: a type with no argv-stable poller is n/a, never zero (opencode is \`bun run … start\`)" "n/a" "$(tp '4242' unit-p opencode)"
+t "3856 count: opencode is absent from the table ON PURPOSE" "absent" \
+  "$( [[ -n "${_SUP_TRUE_POLLER_PAT[opencode]:-}" ]] && printf present || printf absent )"
+# `sudo pgrep -u agent-<n>` FAILS OPEN on a 5dive-only sudo grant: "a password is
+# required" exits like a real zero, so every seat would read dead and be
+# escalated. Plain pgrep needs no sudo — the process table is world-readable.
+# Graded on CODE, not on the comments that explain the absence (this file and
+# cmd_supervisor.sh both name `sudo pgrep` in prose precisely to forbid it).
+_CODE_3856=$(awk '/^_sup_true_poller_count\(\) \{/,/^\}/' "$SRC/cmd_supervisor.sh" | grep -v '^[[:space:]]*#') || _CODE_3856=""
+# LIVENESS FIRST. Both arms below assert an ABSENCE, and an empty extraction
+# (a renamed function, a comment-stripping pipe that matched nothing) satisfies
+# an absence vacuously. Grade that the extraction actually found the probe
+# before grading what it does not contain.
+t "3856: the code extracted for the absence arms is real (they are not vacuous)" "yes" \
+  "$( [[ -n "$_CODE_3856" ]] && grep -q 'pgrep' <<<"$_CODE_3856" && printf yes || printf no )"
+t "3856: the verification probe never goes through sudo (a denied sudo exits like a real zero)" "no" \
+  "$(grep -q 'sudo' <<<"$_CODE_3856" && printf yes || printf no)"
+t "3856: it does not read \`agent info\`'s CACHED supervisor verdict" "no" \
+  "$(grep -q 'agent info' <<<"$_CODE_3856" && printf yes || printf no)"
+
+# --- the wait is a POLL, not a sleep -----------------------------------------
+# A poller appears ~9s after the bounce. A probe taken the instant cmd_restart
+# returns reads ZERO on a perfectly healthy seat — a false RED whose remedy
+# would be another restart.
+# The stub's call counter lives in a FILE, not a variable: _sup_restart_verify
+# reads the probe through a command substitution, which is a subshell, so an
+# in-variable counter resets on every call and every probe returns the first
+# reading — the "appears late" arm would be unfalsifiable.
+rv() { ( _COUNTS="$1"; _CTR="$TMP/rv.$$"; printf '0' >"$_CTR"
+         _sup_true_poller_count() {
+           local i; i=$(( $(cat "$_CTR") + 1 )); printf '%s' "$i" >"$_CTR"
+           printf '%s\n' "$(cut -d, -f"$i" <<<"$_COUNTS")"
+         }
+         sleep() { :; }
+         _sup_restart_verify "${2:-unit-p}" "${3:-claude}" "${4:-5}" ); }
+t "3856 verify: a poller already back reads ok on the first probe" "ok" "$(rv '1')"
+t "3856 verify: a poller that appears LATE still reads ok — the wait is a poll, not one shot" "ok" "$(rv '0,0,0,1')"
+t "3856 verify: still zero at the deadline is still-dead (the 08-31 case)" "still-dead" "$(rv '0,0,0,0,0,0,0')"
+t "3856 verify: an unprobeable type is UNVERIFIED — a third outcome, never folded into ok or dead" "unverified" "$(rv 'n/a')"
+t "3856 verify: a garbage reading is unverified, never ok" "unverified" "$(rv 'banana')"
+# The budget is a real ceiling, and it is per seat inside a 10-minute tick.
+t "3856 verify: the budget is configurable and defaults to a bounded number of seconds" "yes" \
+  "$( [[ "$_SUP_RESTART_VERIFY_SEC" =~ ^[0-9]+$ ]] && (( _SUP_RESTART_VERIFY_SEC > 0 && _SUP_RESTART_VERIFY_SEC <= 120 )) && printf yes || printf no )"
+
+# --- the wiring: result strings + same-tick escalation ------------------------
+# Without these the arms above grade dead code.
+_ACT_BLOCK="$(awk '/nudge\|resume\|rotate\|restart\)/,/^      esac/' "$SRC/cmd_supervisor.sh")"
+t "3856 wiring: the action branch calls the verifier" "yes" \
+  "$(grep -q '_sup_restart_verify "\$name" "\$atype"' <<<"$_ACT_BLOCK" && printf yes || printf no)"
+t "3856 wiring: ONLY the poller-dead restart is verified (a nudge succeeds by being delivered)" "yes" \
+  "$(grep -qE '"\$verb" == "restart" && .*"\$cause" == "poller-dead"' <<<"$_ACT_BLOCK" && printf yes || printf no)"
+t "3856 wiring: a still-dead poller is recorded as such, not as ok" "yes" \
+  "$(grep -q 'res="restart-ran-poller-still-dead"' <<<"$_ACT_BLOCK" && printf yes || printf no)"
+t "3856 wiring: an unverifiable seat gets its own result string, not ok" "yes" \
+  "$(grep -q 'res="restart-ran-poller-unverified"' <<<"$_ACT_BLOCK" && printf yes || printf no)"
+t "3856 wiring: a still-dead poller escalates ON THIS TICK (not 10 minutes later, as restart-rate-limited)" "yes" \
+  "$(grep -A3 'if \[\[ "\$res" == "restart-ran-poller-still-dead" \]\]' <<<"$_ACT_BLOCK" \
+     | grep -q 'event=.escalate.\|SELECT COUNT' && printf yes || printf no)"
+t "3856 wiring: UNVERIFIED does not escalate (it would page a person for every healthy unprobeable seat)" "no" \
+  "$(grep -q 'restart-ran-poller-unverified" \]\]' <<<"$_ACT_BLOCK" && printf yes || printf no)"
+t "3856 wiring: the same-tick escalation carries a courier receipt, like every other escalate row" "yes" \
+  "$(grep -q '_sup_escalate_deliver "\$name" "\$cause" "\$v_reason"' <<<"$_ACT_BLOCK" && printf yes || printf no)"
+# DO NOT raise the limiter to paper over a failing remedy: a restart that works
+# is visible in ~9s, so a second inside the window is the signature of a seat
+# restart does not fix. This arm is what stops a future "just allow 2".
+t "3856: the rung-4 limiter is UNTOUCHED — max stays 1 per seat" "1" "$_SUP_RESTART_MAX"
+t "3856: the limiter window is UNTOUCHED — 6h" "6" "$_SUP_RESTART_WINDOW_H"
+# `warm_channel_capability_restart()` verifies `systemctl is-active` — the UNIT,
+# not the poller — which is the exact state this outage lives in. Reusing it
+# relocates the false green. Graded on code, not on the prose forbidding it.
+t "3856: the unit-only warm-up helper is NOT reused" "no" \
+  "$(grep -v '^[[:space:]]*#' "$SRC/cmd_supervisor.sh" | grep -q 'warm_channel_capability_restart' && printf yes || printf no)"
+# And the retracted design stays retracted: this row must not add a second
+# detector in the self-update sweep (quinn rejected iteration 1 for that).
+t "3856: no channel detector was added to _pending_restart_sweep (the retracted design)" "no" \
+  "$(grep -q '_channel_check' "$SRC/cmd_selfupdate.sh" && printf yes || printf no)"
+
+# --- site 1: rotate's envelope stops over-claiming ---------------------------
+_ROT="$(awk '/^cmd_agent_rotation_rotate\(\) \{/,/^\}/' "$SRC/cmd_account.sh")"
+t "3856 rotate: the envelope names the bounce as SCHEDULED" "yes" \
+  "$(grep -q 'channelBounceScheduled:\$cbs' <<<"$_ROT" && printf yes || printf no)"
+t "3856 rotate: the envelope carries channelVerified" "yes" \
+  "$(grep -q 'channelVerified:\$cv' <<<"$_ROT" && printf yes || printf no)"
+t "3856 rotate: a seat with no chat channel reports null, not false (else every headless rotation looks broken)" "yes" \
+  "$(grep -q 'channel_verified=null' <<<"$_ROT" && printf yes || printf no)"
+t "3856 rotate: the HUMAN line names the poller check as OWED (the JSON is not the only reader)" "yes" \
+  "$(grep -q 'human+=.*poller check OWED' <<<"$_ROT" && grep -q 'ok "\$human"' <<<"$_ROT" && printf yes || printf no)"
+t "3856 rotate: it does not claim to have verified anything — no channelVerified:true anywhere" "no" \
+  "$(grep -q 'channelVerified.*true\|channel_verified=true' <<<"$_ROT" && printf yes || printf no)"
 
 echo
 echo "supervisor_unit: ${PASS} passed, ${FAIL} failed"
