@@ -125,6 +125,119 @@ _SUP_RESTART_WINDOW_H="${SUPERVISOR_RESTART_WINDOW_H:-6}"
 _SUP_RESTART_MAX="${SUPERVISOR_RESTART_MAX:-1}"
 [[ "$_SUP_RESTART_MAX" =~ ^[0-9]+$ ]] || _SUP_RESTART_MAX=1
 
+# ── DIVE-3856: RUNG 4 VERIFIES ITS OWN REMEDY ────────────────────────────────
+# THE DEFECT, measured on `main` 2026-08-31 (supervisor_events + the seat's
+# channels/telegram/lifecycle.log): at 12:30:15 rung 4 restarted a poller-dead
+# seat and recorded {"rung":"restart","result":"ok"} — and `result` was
+# cmd_restart's EXIT CODE, not the poller's return. The seat was still deaf. The
+# lifecycle log has NO launcher line at all between 12:21:28 and 12:45:23, so
+# neither that restart nor a hand-run `agent restart` at 12:33:31 spawned a
+# channel launcher. Two restarts, both scored ok, both no-ops. The supervisor
+# then discovered at 12:40 what was answerable at 12:30:24, and called the
+# interval a success.
+#
+# WHY THE SUPERVISOR IS THE PLACE THIS CAN BE FIXED, and rotate is not: the
+# rotation verb's bounce is a `systemd-run --on-active=1` transient unit that
+# fires ~1s AFTER the CLI process exits, deliberately (an immediate restart
+# SIGTERMs the caller's own sudo subprocess, and rotation is often invoked from
+# inside the rotating seat's own bot). A verb cannot attest to an event
+# scheduled after its own death — see
+# community/wiki/a-deferred-restart-cannot-be-verified-by-the-verb-that-defers-it.md.
+# The supervisor has no such problem: it fires the restart itself and it is
+# still running afterwards. It just never looked.
+#
+# THE WAIT IS A POLL, NOT A SLEEP. A poller appears ~9s after the bounce, so a
+# probe taken the instant `cmd_restart` returns reads ZERO on a perfectly
+# healthy seat — a FALSE RED whose remedy would be another restart. We poll
+# once a second and return the moment the poller is back, so the common case
+# costs ~9s of one tick and only a genuinely dead seat pays the ceiling. The
+# ceiling is per SEAT and this runs inside a 10-minute tick: even the pathological
+# fleet-wide case (every seat poller-dead) is bounded by the rung-4 limiter,
+# which allows one restart per seat per 6h.
+_SUP_RESTART_VERIFY_SEC="${SUPERVISOR_RESTART_VERIFY_SEC:-30}"
+[[ "$_SUP_RESTART_VERIFY_SEC" =~ ^[0-9]+$ ]] || _SUP_RESTART_VERIFY_SEC=30
+
+# WHY A SECOND PREDICATE AND NOT `_SUP_POLLER_PAT`. Measured on this host
+# 2026-08-31 (plugin 0.5.49): a claude seat's telegram bridge is TWO processes.
+#
+#   bun run --cwd ~/.claude/plugins/cache/5dive-plugins/telegram/0.5.49 … start
+#       argv contains the plugin dir -> _SUP_POLLER_PAT matches it   THE LAUNCHER
+#   /usr/local/bin/bun start.ts
+#       argv is two tokens with no path -> _SUP_POLLER_PAT misses it  THE POLLER
+#
+#   seat        _SUP_POLLER_PAT count      actual `bun start.ts` count
+#   don                1                            2   <- orphaned poller, board reads healthy
+#   main               1                            1
+#
+# So the classifier's pattern is stable across the server.ts->start.ts rename
+# precisely BECAUSE it never matched the poller. It is correct for state 1
+# (launcher and poller both gone — the 08-31 outage) and BLIND to state 2
+# (launcher alive, poller dead or duplicated). Inheriting it for the
+# post-restart probe would grade the launcher we just started and call a still-
+# deaf seat cured, which is this row's defect wearing a different hat.
+#
+# So this predicate names the POLLER, and names BOTH argv shapes: DIVE-3752 put
+# the recording launcher in front of `start.ts`, while an older plugin cache and
+# the telegram-<x> MCP variants still run `server.ts` (the variants
+# path-qualified, hence the optional segment). A server.ts-only predicate reads
+# ZERO on five verifiably healthy seats.
+#
+# `opencode` is ABSENT ON PURPOSE: its relay is `bun run --cwd <plugin> … start`,
+# which carries no `.ts` at all, so any pattern here would read zero on a healthy
+# seat. A type absent from this table verifies as `unverified` — which never
+# claims ok and never claims dead. Same false-negative bias the classifier uses.
+#
+# NOT re-walked (measured, DIVE-3854/3855): `pgrep -f` MATCHES YOUR OWN COMMAND
+# LINE, so our pid and our parent's are dropped explicitly; `sudo pgrep -u
+# agent-<n>` FAILS OPEN on a 5dive-only sudo grant ("a password is required"
+# exits like a real zero) so plain pgrep is used — the process table is
+# world-readable; `5dive agent info`'s verdict is CACHED and cannot be a check.
+declare -A _SUP_TRUE_POLLER_PAT=(
+  [claude]='bun ([^ ]*/)?(start|server)\.ts'
+  [codex]='bun ([^ ]*/)?(start|server)\.ts'
+  [grok]='bun ([^ ]*/)?(start|server)\.ts'
+  [antigravity]='bun ([^ ]*/)?(start|server)\.ts'
+)
+
+# _sup_true_poller_count <name> <type> -> integer | n/a
+# n/a means "not answerable here", never "zero".
+_sup_true_poller_count() {
+  local name="${1:-}" type="${2:-claude}" pat user pids p n=0
+  pat="${_SUP_TRUE_POLLER_PAT[$type]:-}"
+  [[ -n "$pat" ]] || { printf 'n/a\n'; return 0; }
+  command -v pgrep >/dev/null 2>&1 || { printf 'n/a\n'; return 0; }
+  user="agent-${name}"
+  getent passwd "$user" >/dev/null 2>&1 || user="$name"
+  pids=$(pgrep -u "$user" -f "$pat" 2>/dev/null) || pids=""
+  for p in $pids; do
+    [[ "$p" == "$$" || "$p" == "${PPID:-}" ]] && continue
+    n=$((n + 1))
+  done
+  printf '%s\n' "$n"
+}
+
+# _sup_restart_verify <name> <type> [deadline-secs] -> ok | still-dead | unverified
+#
+# Polls for the seat's POLLER (not its launcher) and returns the moment it is
+# back. `unverified` is a THIRD outcome and is never folded into either of the
+# other two: a type we cannot probe must not be scored ok (that is the defect)
+# and must not be scored still-dead (that would escalate every healthy opencode
+# seat). Callers record it verbatim.
+_sup_restart_verify() {
+  local name="${1:-}" type="${2:-claude}" budget="${3:-$_SUP_RESTART_VERIFY_SEC}" n waited=0
+  [[ "$budget" =~ ^[0-9]+$ ]] || budget="$_SUP_RESTART_VERIFY_SEC"
+  while :; do
+    n="$(_sup_true_poller_count "$name" "$type")"
+    [[ "$n" == "n/a" ]] && { printf 'unverified\n'; return 0; }
+    [[ "$n" =~ ^[0-9]+$ ]] || { printf 'unverified\n'; return 0; }
+    (( n > 0 )) && { printf 'ok\n'; return 0; }
+    (( waited >= budget )) && break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  printf 'still-dead\n'
+}
+
 # DIVE-1127 (ToS-hedge A2): ID/age-verification tripwire. Per the Jul-11 hedge
 # memo (anthropic-tos-hedge-decision-jul11, D4 trigger 1), the biometric/ID lever
 # in Anthropic's Jul-8 privacy policy is the plausible enforcement path against
@@ -1634,11 +1747,65 @@ cmd_supervisor_tick() {
         if [[ "$actions_on" == "true" ]]; then
           local rc=0 res="ok"
           _sup_act_exec "$name" "$verb" "$cause" || { rc=$?; res="failed"; }
+          # DIVE-3856: rung 4 VERIFIES ITS OWN REMEDY. `res` above is
+          # cmd_restart's exit code and nothing more; on 2026-08-31 that scored
+          # `ok` for a restart that spawned no channel launcher at all and left
+          # the seat deaf for another fifteen minutes. Only the poller-dead
+          # restart is verified, because it is the only rung whose success is a
+          # PROCESS we can count: a nudge or a resume succeeds by being
+          # delivered, and re-probing them would be re-litigating the agent's
+          # reply, not the action.
+          local verified=""
+          if [[ "$verb" == "restart" && "$cause" == "poller-dead" && "$res" == "ok" ]]; then
+            verified="$(_sup_restart_verify "$name" "$atype")"
+            case "$verified" in
+              ok)          res="ok" ;;
+              still-dead)  res="restart-ran-poller-still-dead" ;;
+              *)           res="restart-ran-poller-unverified" ;;
+            esac
+          fi
           db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
               VALUES ($(sqlq "$name"), 'action', 'stuck', $(sqlq_or_null "$cause"),
                       $(sqlq "{\"rung\":\"${verb}\",\"attempt\":$((attempts + 1)),\"result\":\"${res}\"}"));" 2>/dev/null \
             && { acted=$((acted + 1)); events=$((events + 1)); } \
             || warn "supervisor: action insert failed for $name"
+          # ESCALATE ON THIS TICK, not the next one. The old path discovered a
+          # failed restart ten minutes later, at which point the rung-4 limiter
+          # refuses a second restart and escalates `restart-rate-limited` — a
+          # true statement that names the LIMITER as the reason a human is
+          # needed, when the reason is that the remedy did not work. We now know
+          # that at t+~9s, so we say it at t+~9s and we say what it was. The
+          # limiter itself is untouched: a restart that works is visible in
+          # seconds, so a second one inside the window is still the signature of
+          # a seat restart does not fix.
+          #
+          # `unverified` deliberately does NOT escalate. It is the "I could not
+          # tell" outcome, and paging a person on it would make every healthy
+          # seat of an unprobeable type an alert — which is how an escalation
+          # channel gets muted.
+          if [[ "$res" == "restart-ran-poller-still-dead" ]]; then
+            local vesc
+            vesc=$(db "SELECT COUNT(*) FROM supervisor_events
+                       WHERE agent=$(sqlq "$name") AND event='escalate'
+                         AND ts >= datetime('now', '-${_SUP_ACT_WINDOW_H} hours');" 2>/dev/null || echo 0)
+            [[ "$vesc" =~ ^[0-9]+$ ]] || vesc=0
+            if (( vesc == 0 )); then
+              local v_stuck v_all v_via v_reason="restart-ran-poller-still-dead"
+              v_stuck=$(jq -r '[.[] | select(.classification == "stuck") | .name] | join(",")' <<<"$snap" 2>/dev/null) || v_stuck=""
+              v_all=$(jq -r '[.[] | .name] | join(",")' <<<"$snap" 2>/dev/null) || v_all=""
+              v_via=$(_sup_escalate_deliver "$name" "$cause" "$v_reason" "$v_stuck" "$v_all")
+              db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
+                  VALUES ($(sqlq "$name"), 'escalate', 'stuck', $(sqlq_or_null "$cause"),
+                          $(sqlq "{\"reason\":\"${v_reason}\",\"attempts\":${attempts},\"delivered\":\"${v_via}\"}"));" 2>/dev/null \
+                && { escalated=$((escalated + 1)); events=$((events + 1)); } \
+                || warn "supervisor: escalate insert failed for $name"
+              if [[ "$v_via" == none:* ]]; then
+                warn "supervisor: ESCALATE $name ($cause: $v_reason) — the rung-4 restart ran and the poller did NOT come back — NOT DELIVERED (${v_via#none:})"
+              else
+                warn "supervisor: ESCALATE $name ($cause: $v_reason) — the rung-4 restart ran and the poller did NOT come back — delivered via ${v_via}"
+              fi
+            fi
+          fi
         else
           # One planned row per agent per window — evidence, not spam.
           local pln

@@ -955,10 +955,39 @@ cmd_agent_rotation_rotate() {
   # surfaced for observability (3 + coolingTarget=true means we rotated to a
   # still-cooling-but-sooner account; the resume waits on its reset).
   cmd_config "$name" set "auth-profile=${target}" >/dev/null
-  ok "rotated '$name': ${current:--} -> ${target}" \
-     '{rotated:true, from:$f, to:$t, tier:$tier, coolingTarget:$ct}' \
+
+  # DIVE-3856: STOP OVER-CLAIMING. What this verb knows is that it re-pointed
+  # the profile and that `cmd_config` SCHEDULED a bounce — `systemd-run
+  # --on-active=1`, a transient unit that fires ~1s after this process exits,
+  # deliberately, because a synchronous restart would SIGTERM our own sudo
+  # subprocess (and rotation is frequently invoked from inside the rotating
+  # seat's own bot, i.e. from the process the restart kills). What it CANNOT
+  # know is whether the chat channel came back: the poller that would answer is
+  # spawned by a restart that has not happened yet. On 2026-08-31 the seat that
+  # gates prod ships went deaf on telegram for twenty minutes while this verb
+  # returned a bare `ok` (DIVE-3855). The verb cannot be fixed into observing
+  # that — the supervisor's rung 4 is what runs on the far side of the bounce
+  # and it now verifies its own remedy (src/cmd_supervisor.sh, same row). What
+  # the verb owes is an honest envelope.
+  #
+  # channelVerified is null (not false) for a seat with no chat channel: there
+  # is nothing to verify, and a hard false would read as a defect on every
+  # rotation of every headless seat.
+  local chans has_chat=0 channel_verified=null channel_bounce=false
+  chans=$(jq -r --arg n "$name" '.agents[$n].channels // "none"' <<<"$reg" 2>/dev/null) || chans="none"
+  case ",${chans}," in
+    *,telegram,*|*,discord,*) has_chat=1; channel_verified=false; channel_bounce=true ;;
+  esac
+  local human="rotated '$name': ${current:--} -> ${target}"
+  if (( has_chat )); then
+    human+=" — channel bounce SCHEDULED (deferred ~1s), poller check OWED (channels=${chans}); NOT verified by this command"
+  fi
+  ok "$human" \
+     '{rotated:true, from:$f, to:$t, tier:$tier, coolingTarget:$ct,
+       channelBounceScheduled:$cbs, channelVerified:$cv}' \
      --arg f "$current" --arg t "$target" --argjson tier "$tier" \
-     --argjson ct "$( ((cooling_target)) && echo true || echo false )"
+     --argjson ct "$( ((cooling_target)) && echo true || echo false )" \
+     --argjson cbs "$channel_bounce" --argjson cv "$channel_verified"
 }
 
 cmd_agent_rotation_cooldown() {
