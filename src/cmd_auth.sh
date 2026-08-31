@@ -684,8 +684,11 @@ profile_type_env() {
   esac
 }
 
-# _openclaw_cred_path <state_root> — echo the path, under a HOME-redirected
-# openclaw state root, that PROVES this seat carries an openclaw credential.
+# _openclaw_cred_path <state_root> [legacy_sentinel] — echo the path, under a
+# HOME-redirected openclaw state root, that PROVES this seat carries an
+# openclaw credential. The optional legacy sentinel is needed for the default
+# home: its configured TYPE_AUTH path is authoritative, while profile-scoped
+# homes use the DIVE-3489 sqlite sentinel.
 # Nothing on stdout + rc 1 when no rung proves one.
 #
 # DIVE-3834: upstream openclaw 2026.8.1 moved the credential store. The
@@ -710,7 +713,7 @@ profile_type_env() {
 _openclaw_cred_path() {
   local root="$1" p
   # Rung 1 — layouts up to 2026.7.x: the per-agent auth store (DIVE-3489).
-  p="${root}/.openclaw/agents/main/agent/openclaw-agent.sqlite"
+  p="${2:-${root}/.openclaw/agents/main/agent/openclaw-agent.sqlite}"
   [[ -s "$p" ]] && { echo "$p"; return 0; }
   # Rung 2 — 2026.8.1+: auth profiles live in the top-level config under
   # .auth.profiles (measured on box 62.238.11.92, openclaw 2026.8.1 ea80657:
@@ -746,7 +749,7 @@ profile_type_auth_path() {
     if [[ "$type" == openclaw && -n "$_def" ]]; then
       local _root _hit
       if _root=$(_openclaw_state_root "$_def"); then
-        _hit=$(_openclaw_cred_path "$_root") && { echo "$_hit"; return; }
+        _hit=$(_openclaw_cred_path "$_root" "$_def") && { echo "$_hit"; return; }
       fi
     fi
     echo "$_def"

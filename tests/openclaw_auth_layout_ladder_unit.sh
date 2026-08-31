@@ -11,16 +11,22 @@
 #
 # What is graded here is the reported auth STATE, never the existence of any
 # particular file — keying the assertion to a path is exactly what let this
-# defect ride a full upstream release invisibly. Four arms, in both directions:
-#   1. 2026.8.1 layout, credential written  -> ok            (the regression)
-#   2. pre-2026.8.1 layout, credential      -> ok            (fallback intact)
-#   3. 2026.8.1 layout, NO credential       -> needs_login   (the ABSENT case:
+# defect ride a full upstream release invisibly. The arms cover both the
+# shipped default home (profile='') and named-profile HOME redirects:
+#   1. default home, 2026.8.1 credential / no credential -> ok / needs_login,
+#      plus an expired blob proving health reads the resolved credential path
+#   2. default home with the older JSON sentinel and a lazily-created sqlite
+#      only -> needs_login (the configured legacy sentinel stays authoritative)
+#   3. named profile, 2026.8.1 credential -> ok (the reported regression)
+#   4. named profile, pre-2026.8.1 credential -> ok (fallback intact)
+#   5. named profile, 2026.8.1, NO credential -> needs_login (the ABSENT case:
 #      openclaw.json exists and the old dir exists-but-empty, i.e. everything
 #      the tree-shape looks-right test would pass. DIVE-3130's lesson is that a
 #      guard which cannot fire on absence is not a guard.)
-#   4. the app's own lazily-created store alone -> needs_login (it is created by
+#   6. the app's own lazily-created store alone -> needs_login (it is created by
 #      openclaw having RUN, not by having AUTHENTICATED, so it must not be
 #      admitted as a credential rung).
+#   7. an empty .auth.profiles map -> needs_login.
 # Pure, no root, no network:
 #   bash tests/openclaw_auth_layout_ladder_unit.sh
 set -uo pipefail
@@ -43,8 +49,11 @@ AUTH_PROFILES_DIR="$TMP/auth-profiles"
 CONNECTORS_DIR="$TMP/connectors"
 mkdir -p "$CONNECTORS_DIR" "$AUTH_PROFILES_DIR"
 
+default_root="$TMP/home/claude"
 declare -A TYPE_AUTH=(
-  [openclaw]="$TMP/home/claude/.openclaw/agents/main/agent/openclaw-agent.sqlite"
+  # Same relative path as the shipped TYPE_AUTH constant; rooted in TMP so the
+  # unit never reads or writes the real operator home.
+  [openclaw]="$default_root/.openclaw/agents/main/agent/openclaw-agent.sqlite"
 )
 declare -A TYPE_API_FILE=()
 is_known_type() { case "$1" in openclaw) return 0;; *) return 1;; esac; }
@@ -63,7 +72,41 @@ bad()  { printf 'FAIL - %s\n' "$1"; fails=$((fails+1)); }
 # state_of <profile> — the STATE half of agent_auth_health for an openclaw seat.
 state_of() { agent_auth_health openclaw "$1" | cut -d'|' -f1; }
 
-# --- arm 1: openclaw 2026.8.1 layout with a real BYO credential --------------
+# --- arm 1: default-home 2026.8.1 state, with and without a BYO credential ---
+mkdir -p "$default_root/.openclaw/agents/main/agent"
+: > "$default_root/.openclaw/agents/main/agent/openclaw-agent.sqlite"
+cat > "$default_root/.openclaw/openclaw.json" <<'JSON'
+{"auth":{"profiles":{"google:manual":{"provider":"google","mode":"api_key"}}}}
+JSON
+s=$(state_of "")
+[[ "$s" == ok ]] && ok "default home, 2026.8.1 + credential: state=ok" \
+                 || bad "default home, 2026.8.1 + credential: state=$s, want ok"
+echo '{"auth":{"profiles":{}}}' > "$default_root/.openclaw/openclaw.json"
+s=$(state_of "")
+[[ "$s" == needs_login ]] && ok "default home, 2026.8.1 without credential: state=needs_login" \
+                          || bad "default home, 2026.8.1 without credential: state=$s, want needs_login"
+cat > "$default_root/.openclaw/openclaw.json" <<'JSON'
+{"auth":{"profiles":{"oauth:test":{"provider":"openai","mode":"oauth"}}},
+ "expiresAt":1}
+JSON
+s=$(state_of "")
+[[ "$s" == expired ]] && ok "default home ladder feeds credential blob health: state=expired" \
+                      || bad "default home ladder feeds credential blob health: state=$s, want expired"
+
+# --- arm 2: a non-configured legacy default must ignore another sqlite ------
+# The pre-DIVE-3489 default sentinel was auth-profiles.json. A different sqlite
+# appearing beside it must not silently become proof of auth for that layout.
+legacy_root="$TMP/legacy-home/claude"
+TYPE_AUTH[openclaw]="$legacy_root/.openclaw/agents/main/agent/auth-profiles.json"
+mkdir -p "$legacy_root/.openclaw/agents/main/agent"
+printf 'SQLite format 3\0' > "$legacy_root/.openclaw/agents/main/agent/openclaw-agent.sqlite"
+echo '{"auth":{"profiles":{}}}' > "$legacy_root/.openclaw/openclaw.json"
+s=$(state_of "")
+[[ "$s" == needs_login ]] && ok "legacy default + unrelated sqlite: state=needs_login" \
+                          || bad "legacy default + unrelated sqlite: state=$s, want needs_login"
+TYPE_AUTH[openclaw]="$default_root/.openclaw/agents/main/agent/openclaw-agent.sqlite"
+
+# --- arm 3: named-profile 2026.8.1 with a real BYO credential ---------------
 p=new-authed
 root="$AUTH_PROFILES_DIR/$p/openclaw"
 mkdir -p "$root/.openclaw/agents/main/agent" "$root/.openclaw/state"
@@ -80,7 +123,7 @@ s=$(state_of "$p")
 [[ "$s" == ok ]] && ok "2026.8.1 + credential: state=ok" \
                  || bad "2026.8.1 + credential: state=$s, want ok"
 
-# --- arm 2: pre-2026.8.1 layout still passes (fallback intact) ---------------
+# --- arm 4: named-profile pre-2026.8.1 fallback remains intact ---------------
 p=old-authed
 root="$AUTH_PROFILES_DIR/$p/openclaw"
 mkdir -p "$root/.openclaw/agents/main/agent"
@@ -91,7 +134,7 @@ s=$(state_of "$p")
 [[ "$s" == ok ]] && ok "pre-2026.8.1 layout: state=ok" \
                  || bad "pre-2026.8.1 layout: state=$s, want ok"
 
-# --- arm 3: the ABSENT case on 2026.8.1 must still fire ----------------------
+# --- arm 5: named-profile ABSENT case on 2026.8.1 must still fire ------------
 p=new-unauthed
 root="$AUTH_PROFILES_DIR/$p/openclaw"
 mkdir -p "$root/.openclaw/agents/main/agent"
@@ -105,7 +148,7 @@ s=$(state_of "$p")
 [[ "$s" == needs_login ]] && ok "2026.8.1 without credential: state=needs_login" \
                           || bad "2026.8.1 without credential: state=$s, want needs_login"
 
-# --- arm 4: openclaw's own lazily-created store is not a credential ----------
+# --- arm 6: openclaw's own lazily-created store is not a credential ----------
 p=new-ran-only
 root="$AUTH_PROFILES_DIR/$p/openclaw"
 mkdir -p "$root/.openclaw/agents/main/agent" "$root/.openclaw/state"
@@ -113,8 +156,11 @@ printf 'SQLite format 3\0' > "$root/.openclaw/state/openclaw.sqlite"
 if auth_creds_present openclaw "$p"; then
   bad "app store only: reported PRESENT — 'openclaw has run' is not 'openclaw is authed'"
 else ok "app store only: auth_creds_present says absent"; fi
+s=$(state_of "$p")
+[[ "$s" == needs_login ]] && ok "app store only: state=needs_login" \
+                          || bad "app store only: state=$s, want needs_login"
 
-# --- arm 5: an empty auth.profiles map is not a credential -------------------
+# --- arm 7: an empty auth.profiles map is not a credential -------------------
 p=new-empty-map
 root="$AUTH_PROFILES_DIR/$p/openclaw"
 mkdir -p "$root/.openclaw/agents/main/agent"
@@ -122,6 +168,13 @@ echo '{"auth":{"profiles":{}}}' > "$root/.openclaw/openclaw.json"
 if auth_creds_present openclaw "$p"; then
   bad "empty auth.profiles: reported PRESENT — gated on the file, not the map"
 else ok "empty auth.profiles: auth_creds_present says absent"; fi
+s=$(state_of "$p")
+[[ "$s" == needs_login ]] && ok "empty auth.profiles: state=needs_login" \
+                          || bad "empty auth.profiles: state=$s, want needs_login"
 
-if (( fails )); then printf '\nFAIL: %d assertion(s)\n' "$fails"; exit 1; fi
-printf '\nPASS: openclaw auth layout ladder\n'
+if (( fails )); then
+  printf '\nFAIL: %d assertion(s)\n' "$fails"
+else
+  printf '\nPASS: openclaw auth layout ladder\n'
+fi
+(( fails == 0 ))
