@@ -39,11 +39,16 @@ _task_usage() {
                                                 is NOT the ident number
   orphans [--all]                               rows whose assignee/verifier/creator is not a
                                                 registered agent (undispatchable, DIVE-3344)
-  doctor                                        every open row nothing will dispatch, and WHY —
-                                                no revisit anchor, a stale blocker edge, a park
+  doctor [--fix <id> [--to=<agent>]           every open row nothing will dispatch, and WHY —
+         [--dry-run]]                           no revisit anchor, a stale blocker edge, a park
                                                 past its wake or with none, or a seat nothing
-                                                wakes. Reports, never fixes; each
-                                                finding names the verb that clears it (DIVE-3784)
+                                                wakes. A bare run reports and changes nothing;
+                                                each finding names the verb that clears it
+                                                (DIVE-3784). --fix runs that verb for ONE named
+                                                row, re-deriving the finding first — there is no
+                                                --all. A dead lane needs --to=<agent>, and the
+                                                destination must itself be a seat something wakes
+                                                (DIVE-3826)
   wip-cap-install [--relane=<lane>]             snapshot each lane's actionable count as its
                                                 frozen WIP ceiling (deliberate, once)
   set-budget <id> <tokens|\$cost|none>           record an ADVISORY per-row token budget. Nothing enforces it

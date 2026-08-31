@@ -18,11 +18,15 @@
 # the roster-free classes ALWAYS and degrades only the lane class. `orphans` is
 # kept and is still the verb with the did-you-mean hints.
 #
-# REPORT, NEVER FIX. Mass-clearing a board is its own failure mode: the DIVE-1355
-# heartbeat sweep auto-recovers exactly one class (every blocker closed) because
-# the edges themselves prove it safe, and deliberately only SURFACES the rest. A
-# pull-side command inherits that split — every finding here names the verb the
-# operator should run, and runs none of them.
+# REPORT BY DEFAULT; FIX ONE NAMED ROW ON REQUEST (DIVE-3826). Mass-clearing a
+# board is its own failure mode: the DIVE-1355 heartbeat sweep auto-recovers
+# exactly one class (every blocker closed) because the edges themselves prove it
+# safe, and deliberately only SURFACES the rest. A bare `task doctor` inherits
+# that split exactly — it names the verb per finding and runs none of them.
+# `--fix <id>` runs that one verb for that ONE row, re-deriving the finding
+# first. What is NOT inherited is the retyping: the rail worth keeping is "one
+# row is one decision", not "the operator must be the clipboard". There is no
+# --all and there must never be one. See the --fix block below.
 #
 # WHY A PULL COMMAND WHEN THE HEARTBEAT ALREADY SWEEPS. `_hb_blocked_sweep` pings
 # `ops` at most once per 24h over a2a. That is a push to one seat's inbox, it is
@@ -137,19 +141,199 @@ _task_doctor_explain() {
   esac
 }
 
+# ============================ --fix (DIVE-3826) ==============================
+#
+# THE HOLE THIS CLOSES. `doctor` computes, per row, the exact verb that clears
+# it — and then makes the operator retype it. That is fine for one row and is
+# the whole job for twenty, which is the shape the board was actually in when
+# DIVE-3784 was filed. So the remediation becomes executable, and the rail that
+# made "report only" the right first cut is kept by NARROWING it, not by
+# dropping it:
+#
+#   REPORT IS STILL THE DEFAULT. A bare `task doctor` mutates nothing, exactly
+#   as before. `--fix` is opt-in and it takes ONE NAMED ROW. There is no --all,
+#   and there must never be one: "mass-clearing a board is its own failure mode"
+#   is not a limitation of the first cut, it is the finding. Twenty rows is
+#   twenty decisions; this makes each one one command instead of two.
+#
+#   THE FINDING IS RE-DERIVED AT FIX TIME, never read from the report the
+#   operator is looking at. A printed report is a claim about a board that has
+#   kept moving — the heartbeat tick unparks and the cascade unblocks while you
+#   read it. Fixing off the render would apply a remedy to a row that already
+#   healed, and `unpark` on a healthy row silently drops park state. So `--fix`
+#   classifies the row again itself and REFUSES if it is not a finding now,
+#   naming what the row actually is.
+#
+#   IT APPLIES THE VERB THE TABLE PRINTS, by CALLING that verb. Each class maps
+#   to the command in its own `-> ` slot in _task_doctor_explain and runs it
+#   through the real `cmd_task_*` function, so the semantics cannot drift from
+#   the ones the report promised — the filed symptom was precisely a remedy that
+#   did not match the state (`unblock` over a park, "OK" over a row that did not
+#   move). The parenthetical ALTERNATIVES in that table ("or cancel it if it is
+#   dead", "or re-park with a --wake") are operator judgement and are NOT
+#   automated: one is destructive and the other needs a date only a person has.
+#
+# WHY DEAD-LANE IS THE ONE THAT NEEDED A FLAG. Four of the five remedies are
+# total functions of the row — `unblock`/`unpark` need no argument. `assign`
+# needs a destination, and there is no honest way to derive one: created_by is
+# frequently the seat that is dead, and picking "any live agent" would route
+# real work by coin flip. So `--to=` is required for that class, and the target
+# is checked with the SAME wakeability test that produced the finding — moving a
+# row from one seat nothing wakes to another is the defect, performed by the
+# tool that reports it.
+
+# _task_doctor_row_reason <task-id> — classify ONE row.
+#
+# IT WRITES GLOBALS AND ECHOES NOTHING, deliberately. The obvious shape here is
+# to echo the class and let the caller take it with `$(...)` — and that shape
+# silently loses the second output. A command substitution is a SUBSHELL, so the
+# lane note assigned inside it never reaches the caller, which then reads it
+# under `set -u` and dies. Two return values means two globals.
+#
+#   _TASK_DOCTOR_ROW_REASON     the class, or "" when the row is not a finding
+#   _TASK_DOCTOR_FIX_LANE_NOTE  set when the lane half could not be DECIDED, so
+#                               the caller says "I could not find out" rather
+#                               than "healthy" — the same failure direction
+#                               _task_doctor_lane_wakeable's rc=2 exists for.
+#
+# PRECEDENCE MATCHES THE REPORT: the board classes win over dead-lane, because
+# the report keeps a row's first classification and a row can be both. If the
+# two disagreed, `--fix <ident>` would apply a remedy for a class the operator
+# never saw printed next to that ident.
+_TASK_DOCTOR_ROW_REASON=""
+_TASK_DOCTOR_FIX_LANE_NOTE=""
+_task_doctor_row_reason() {
+  local id="${1:-}" r asg rc
+  _TASK_DOCTOR_ROW_REASON=""
+  _TASK_DOCTOR_FIX_LANE_NOTE=""
+  [[ -n "$id" ]] || return 0
+  r=$(db "SELECT COALESCE(reason,'') FROM ($(_task_doctor_board_sql)) WHERE ident=(SELECT ident FROM tasks WHERE id=${id});" 2>/dev/null || true)
+  if [[ -n "$r" ]]; then _TASK_DOCTOR_ROW_REASON="$r"; return 0; fi
+  asg=$(db "SELECT COALESCE(assignee,'') FROM tasks
+              WHERE id=${id} AND kind='standard' AND status IN ('todo','in_progress','blocked');" 2>/dev/null || true)
+  [[ -n "$asg" ]] || return 0
+  _task_doctor_lane_wakeable "$asg" && rc=0 || rc=$?
+  case "$rc" in
+    1) _TASK_DOCTOR_ROW_REASON="dead-lane" ;;
+    2) _TASK_DOCTOR_FIX_LANE_NOTE="the agent registry (${STATE_DIR:-/var/lib/5dive}/agents.json) could not be read, so whether '${asg}' is a lane anything wakes is UNKNOWN, not healthy" ;;
+  esac
+  return 0
+}
+
+# _task_doctor_fix <ident-or-id> <--to value> <dry-run 0|1>
+_task_doctor_fix() {
+  local target="${1:-}" to="${2:-}" dry="${3:-0}"
+  resolve_task_id "$target"
+  local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  local st asg kind park_reason
+  st=$(db "SELECT status FROM tasks WHERE id=${id};")
+  kind=$(db "SELECT COALESCE(kind,'') FROM tasks WHERE id=${id};")
+  asg=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
+
+  _task_doctor_row_reason "$id"
+  local reason="$_TASK_DOCTOR_ROW_REASON"
+  if [[ -z "$reason" ]]; then
+    local why="it is not one of the classes doctor reports"
+    [[ "$kind" == "standard" ]] || why="it is a '${kind}' row, and doctor only classifies standard rows"
+    case "$st" in done|cancelled) why="it is already ${st}" ;; esac
+    [[ -z "$_TASK_DOCTOR_FIX_LANE_NOTE" ]] || why="$_TASK_DOCTOR_FIX_LANE_NOTE"
+    fail "$E_VALIDATION" "${ident} is not an undispatchable row right now — ${why} (status=${st}${asg:+, assignee=${asg}}). --fix applies only the remedy doctor computes for a CURRENT finding, and it re-derives that finding rather than trusting a printed report: run '5dive task doctor' for the live list."
+  fi
+
+  # The command for this class, as the report's own `-> ` slot names it.
+  local -a apply=(); local shown=""
+  case "$reason" in
+    no-anchor|stale-edge)
+      [[ -z "$to" ]] || fail "$E_USAGE" "--to is only meaningful for a dead-lane row; ${ident} is '${reason}', whose remedy is '5dive task unblock ${ident}' and takes no destination (re-point the lane separately with '5dive task assign')."
+      apply=(cmd_task_unblock "$ident"); shown="5dive task unblock ${ident}" ;;
+    wake-passed|park-no-wake)
+      [[ -z "$to" ]] || fail "$E_USAGE" "--to is only meaningful for a dead-lane row; ${ident} is '${reason}', whose remedy is '5dive task unpark ${ident}' and takes no destination (re-point the lane separately with '5dive task assign')."
+      park_reason=$(db "SELECT COALESCE(park_reason,'') FROM tasks WHERE id=${id};" 2>/dev/null || true)
+      apply=(cmd_task_unpark "$ident"); shown="5dive task unpark ${ident}" ;;
+    dead-lane)
+      [[ -n "$to" ]] || fail "$E_USAGE" "${ident} is assigned to a lane nothing wakes ('${asg}'), and re-routing needs a destination this command cannot invent — the row's creator is often the dead seat itself. Name one: 5dive task doctor --fix ${ident} --to=<agent>   (roster: 5dive agent list)"
+      # The destination gets the SAME test that produced the finding. Without
+      # this, the verb that reports dead lanes is also the fastest way to make
+      # one, and the row reads as repaired.
+      local trc; _task_doctor_lane_wakeable "$to" && trc=0 || trc=$?
+      if [[ "$trc" == "2" ]]; then
+        fail "$E_GENERIC" "cannot verify --to='${to}': ${STATE_DIR:-/var/lib/5dive}/agents.json could not be read, so this command cannot tell a live seat from another dead one — and moving the row blind is the failure it is meant to repair. Fix the registry first: 5dive doctor"
+      elif [[ "$trc" != "0" ]]; then
+        fail "$E_VALIDATION" "--to='${to}' is itself a lane nothing wakes (no heartbeat enabled, or the seat is operator-stopped) — ${ident} would be exactly as undispatchable at the new address. Pick a live seat: 5dive agent list"
+      fi
+      apply=(cmd_task_assign "$ident" "$to"); shown="5dive task assign ${ident} ${to}" ;;
+    *)
+      fail "$E_GENERIC" "no automatic remedy for class '${reason}' on ${ident} — $(_task_doctor_explain "$reason")" ;;
+  esac
+
+  local detail; detail=$(_task_doctor_explain "$reason")
+  if [[ "$dry" == "1" ]]; then
+    warn "DRY RUN — nothing was changed.
+  ${ident}  [${st}${asg:+ · }${asg}]  ${reason}
+        ${detail}
+  would run: ${shown}${park_reason:+
+  and would DROP the park reason: ${park_reason}}"
+    ok "" '{fix:{ident:$i, reason:$r, command:$c, applied:false, dryRun:true}}' \
+       --arg i "$ident" --arg r "$reason" --arg c "$shown"
+    return 0
+  fi
+
+  # Run the real verb, in a subshell, with its own stdout captured: in JSON mode
+  # each cmd_task_* prints its own envelope and two envelopes on one stdout is
+  # not parseable output. On failure the sibling's envelope and message are the
+  # honest answer, so they are re-emitted rather than swallowed — `fail` exits
+  # the process, and inside the subshell that exit is the rc we read here.
+  local errf; errf=$(mktemp "${TMPDIR:-/tmp}/task-doctor-fix.XXXXXX")
+  local subout rc
+  subout=$( ( "${apply[@]}" ) 2>"$errf" ) && rc=0 || rc=$?
+  if [[ "$rc" != "0" ]]; then
+    cat "$errf" >&2; rm -f "$errf"
+    [[ -z "$subout" ]] || printf '%s\n' "$subout"
+    mark_reported
+    exit "$rc"
+  fi
+  rm -f "$errf"
+
+  warn "${ident} was '${reason}' — applied: ${shown}${park_reason:+
+  park reason dropped: ${park_reason}}
+Re-read the board with '5dive task doctor'; one row was changed and nothing else."
+  ok "${ident}: ${reason} — ran ${shown}" \
+     '{fix:{ident:$i, reason:$r, command:$c, applied:true, dryRun:false}}' \
+     --arg i "$ident" --arg r "$reason" --arg c "$shown"
+}
+
 cmd_task_doctor() {
   tasks_db_init
-  # NO FLAGS, deliberately. The first cut carried a --quiet that suppressed the
-  # census, and the census is the answer to the question the row was filed on
-  # ("31 open, 1 dispatchable") — a flag that hides it is a flag that reproduces
-  # the 42h. It was also accepted and then ignored, which is worse than absent.
+  # NO FLAG HIDES THE REPORT, deliberately. The first cut carried a --quiet that
+  # suppressed the census, and the census is the answer to the question the row
+  # was filed on ("31 open, 1 dispatchable") — a flag that hides it is a flag
+  # that reproduces the 42h. It was also accepted and then ignored, which is
+  # worse than absent, and that is still the bar every flag here is held to:
+  # --to and --dry-run are REFUSED without --fix rather than parsed into
+  # nothing (DIVE-3826).
+  local fix_target="" fix_to="" fix_dry=0 have_fix=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -*) fail "$E_USAGE" "unknown flag: $1 (usage: 5dive task doctor)" ;;
-      *)  fail "$E_USAGE" "unexpected argument '$1' (usage: 5dive task doctor)" ;;
+      --fix=*)   have_fix=1; fix_target="${1#*=}" ;;
+      --fix)     have_fix=1
+                 [[ $# -ge 2 && "$2" != -* ]] \
+                   || fail "$E_USAGE" "--fix needs the row to repair: 5dive task doctor --fix <id|DIVE-N> [--to=<agent>] [--dry-run]  (there is no --fix-all: one row is one decision)"
+                 fix_target="$2"; shift ;;
+      --to=*)    fix_to="${1#*=}" ;;
+      --dry-run) fix_dry=1 ;;
+      -*) fail "$E_USAGE" "unknown flag: $1 (usage: 5dive task doctor [--fix <id|DIVE-N> [--to=<agent>] [--dry-run]])" ;;
+      *)  fail "$E_USAGE" "unexpected argument '$1' (usage: 5dive task doctor [--fix <id|DIVE-N> [--to=<agent>] [--dry-run]])" ;;
     esac
     shift
   done
+  if [[ "$have_fix" == "0" ]]; then
+    [[ -z "$fix_to" ]] || fail "$E_USAGE" "--to only applies with --fix: 5dive task doctor --fix <id|DIVE-N> --to=<agent>"
+    [[ "$fix_dry" == "0" ]] || fail "$E_USAGE" "--dry-run only applies with --fix — a bare 'doctor' already changes nothing"
+  else
+    [[ -n "$fix_target" ]] || fail "$E_USAGE" "--fix needs the row to repair: 5dive task doctor --fix <id|DIVE-N> [--to=<agent>] [--dry-run]"
+    _task_doctor_fix "$fix_target" "$fix_to" "$fix_dry"
+    return $?
+  fi
 
   # ---- pass 1: the three roster-free classes -------------------------------
   # dbfmt -json prints NOTHING for an empty result set (DIVE-1610), not "[]".
@@ -262,6 +446,7 @@ cmd_task_doctor() {
 
   warn "${n} open row(s) nothing will dispatch — each is counted as work in flight and none of them is:
 ${out}${census_line}
-Nothing above was changed: mass-clearing a board is its own failure mode. Run the named verb per row."
+Nothing above was changed: mass-clearing a board is its own failure mode. Run the named verb per row,
+or have this command run it for ONE row: 5dive task doctor --fix <ident> [--to=<agent> for a dead lane] [--dry-run]"
   ok "" "$payload" "${jargs[@]}"
 }
