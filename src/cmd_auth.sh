@@ -606,11 +606,30 @@ LOCALBIN
     # still does and dies on the same 401. Say so here, where the version
     # actually moved — this is a NUDGE, not the check: the re-grade shells to
     # openclaw once per provider (~36s) and is not run inline for that reason.
+    # DIVE-3834, scope item 3 — the RECORD half. We install openclaw UNPINNED
+    # from upstream, so an upstream release changes what lands on every new
+    # provision overnight with no change on our side. That is how 2026.8.1
+    # arrived: the credential store moved, our probe kept reading the old path,
+    # and the only signal the next morning was two red smoke arms — the version
+    # that caused it was nowhere in any record we keep. Reading it HERE, where
+    # the install just happened, is what turns the next silent bump into a diff
+    # instead of a morning of triage, and it covers antigravity and grok too:
+    # they are the same HOME-redirect shape and the same class of change.
+    # Best-effort and capped at 5s by resolve_cli_version, so a runtime that
+    # will not answer --version degrades to an empty string and never fails an
+    # install that otherwise succeeded.
+    #
+    # PINNING is the other half of item 3 and is deliberately NOT taken here:
+    # pinning means owning the upgrade cadence for every runtime we ship, which
+    # is a product decision. It is raised on the row, not decided in this diff.
+    local _inst_ver=""
+    _inst_ver=$(resolve_cli_version "$type" 2>/dev/null) || _inst_ver=""
     [[ "$type" == "openclaw" && $verb == "upgraded" ]] \
-      && step "openclaw version changed — model pins were graded against the OLD catalog and nothing re-reads them. Re-grade: sudo 5dive doctor --category=models"
+      && step "openclaw version changed${_inst_ver:+ (now: $_inst_ver)} — model pins were graded against the OLD catalog and nothing re-reads them. Re-grade: sudo 5dive doctor --category=models"
+    [[ -n "$_inst_ver" ]] && step "$type $verb, installed version: $_inst_ver"
     ok "$type $verb at $bin" \
-       '{type:$t, bin:$b, installed:true, alreadyInstalled:false, upgraded:$u}' \
-       --arg t "$type" --arg b "$bin" --argjson u "$ujson"
+       '{type:$t, bin:$b, installed:true, alreadyInstalled:false, upgraded:$u, version:$v}' \
+       --arg t "$type" --arg b "$bin" --argjson u "$ujson" --arg v "$_inst_ver"
   else
     fail "$E_GENERIC" "$type install reported success but $bin still missing — investigate manually"
   fi
@@ -710,6 +729,32 @@ profile_type_env() {
 # Admitting it would make this function unable to fire on the ABSENT case —
 # the DIVE-3130 shape (a guard guarded by its own subject). See
 # community/wiki/an-unconfigured-model-authenticates-against-the-wrong-provider.md.
+#
+# SCOPE ITEM 2 — why this is a path ladder and not a call to openclaw's own auth
+# verb, answered rather than left implicit. The verb exists and we already use
+# it: `openclaw models auth --agent main list` grades the WRITE at
+# cmd_agent_create.sh (a key that openclaw does not list back is refused there).
+# It is not usable as this READ-BACK probe, for four reasons, only the last of
+# which is about our access:
+#   1. COST AND CALLER. auth_creds_present / agent_auth_health are the per-seat
+#      survey behind `agent list`, `auth status` and `agent info` — called in a
+#      loop over every seat. Each verb call is a node process spawn. This repo
+#      has already priced that and refused it inline: cmd_doctor's openclaw pin
+#      re-grade shells to openclaw once per provider at ~36s and is deliberately
+#      NOT run inline for exactly that reason.
+#   2. IT MUST RETURN A PATH, not a verdict. profile_type_auth_path's answer
+#      feeds cmd_auth_poll's MTIME BASELINE for sign-in detection (DIVE-3489).
+#      A verb returns text; swapping the path for a verb deletes the baseline
+#      and the poll can never observe a login.
+#   3. PRIVILEGE. The survey runs from unprivileged seats; reaching another
+#      seat's HOME needs `sudo -u claude -H env HOME=…`, which most seats do not
+#      hold — the reason resolve_cli_version carries a denial back-off at all.
+#   4. UNVERIFIED CONTRACT. Whether 2026.8.1's `models auth ... list` output
+#      shape is stable enough to parse as a verdict was NOT measured: that needs
+#      a box, and the box this row was measured on has self-purged. Claiming it
+#      works would be the thing this row punishes.
+# So the ladder is the fallback item 2 asks for when the verb is not usable, and
+# this comment is the "say so in the row" half of that instruction.
 _openclaw_cred_path() {
   local root="$1" p
   # Rung 1 — layouts up to 2026.7.x: the per-agent auth store (DIVE-3489).

@@ -27,6 +27,15 @@
 #      openclaw having RUN, not by having AUTHENTICATED, so it must not be
 #      admitted as a credential rung).
 #   7. an empty .auth.profiles map -> needs_login.
+#   8. the CREATE-path witness (selfcheck_cred_reached_agent, witness 1b) on a
+#      2026.8.1-shaped seat -> the "ok:" line, NOT the false
+#      "credential never reached the seat" issue; on a pre-2026.8.1 seat -> ok;
+#      with no credential at all -> the issue still fires. This was the third
+#      reader of the store and the one left hardcoded: a customer provisioning
+#      today was told to re-seed a seat that is fine.
+#   9. the `agent info` unpinned-model warning resolves the default-home seat
+#      through the ladder (structural — see the arm for why an end-to-end
+#      `agent info` is not gradable in a pure unit).
 # Pure, no root, no network:
 #   bash tests/openclaw_auth_layout_ladder_unit.sh
 set -uo pipefail
@@ -40,7 +49,7 @@ TMP="$(mktemp -d /tmp/openclaw-auth-ladder-unit.XXXXXX)"
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
-         lib/agent_setup.sh lib/state.sh; do
+         lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
@@ -171,6 +180,80 @@ else ok "empty auth.profiles: auth_creds_present says absent"; fi
 s=$(state_of "$p")
 [[ "$s" == needs_login ]] && ok "empty auth.profiles: state=needs_login" \
                           || bad "empty auth.profiles: state=$s, want needs_login"
+
+# --- arm 8: the CREATE-path witness (selfcheck_cred_reached_agent) ----------
+#
+# DIVE-3834, second iteration. The ladder was wired into auth_creds_present and
+# agent_auth_health, and there is a THIRD reader: witness 1b in
+# selfcheck_cred_reached_agent hardcoded the pre-2026.8.1 sqlite and tested it
+# with -s. On a 2026.8.1 seat whose credential is present and correct that
+# prints `issue:openclaw credential never reached the seat ... Re-seed as root`
+# — the same defect and the same wrong instruction this row was filed for, on
+# the path a customer provisioning TODAY actually walks. Graded on the emitted
+# verdict, never on a path.
+#
+# `cred_readable_by_agent` is the agent-uid seam; a pure unit cannot shell to
+# `sudo -u`, and a harness that did would grade the runner's sudo policy rather
+# than this code (the reasoning is spelled out in
+# tests/selfcheck_cred_reached_unit.sh).
+# shellcheck source=/dev/null
+source "$SRC/cmd_agent_create.sh"
+set +e   # header.sh enables `set -e`; these arms assert on values, not exits
+cred_readable_by_agent() { return 0; }
+export AGENT_HOME_ROOT="$TMP/agent-homes"
+
+# oc_seat <name> — build a seat home and echo its .openclaw root.
+oc_seat() { local n="$1"; mkdir -p "$AGENT_HOME_ROOT/agent-$n/.openclaw/agents/main/agent"; echo "$AGENT_HOME_ROOT/agent-$n/.openclaw"; }
+
+FALSE_ISSUE='issue:openclaw credential never reached the seat'
+SEAT_OK='ok:openclaw seat has its own credential and model pin'
+
+# 8a — 2026.8.1 shape: old dir created-and-EMPTY, credential + model pin in
+# openclaw.json. This is the reproduction of the reported defect on the create
+# path; before the ladder was wired in here it printed FALSE_ISSUE.
+oc=$(oc_seat new81)
+cat > "$oc/openclaw.json" <<'JSON'
+{"auth":{"profiles":{"google:manual":{"provider":"google","mode":"api_key"}}},
+ "agents":{"defaults":{"model":{"primary":"google/gemini-2.5-pro"}}}}
+JSON
+out=$(selfcheck_cred_reached_agent new81 openclaw "" "" 2>/dev/null)
+[[ "$out" != *"$FALSE_ISSUE"* ]]   && ok "create witness, 2026.8.1 + credential: no false 'never reached the seat'"   || bad "create witness, 2026.8.1 + credential: printed the false issue — the create path still reads the old store"
+[[ "$out" == *"$SEAT_OK"* ]]   && ok "create witness, 2026.8.1 + credential: reports the seat ok"   || bad "create witness, 2026.8.1 + credential: no ok line, got: $out"
+
+# 8b — pre-2026.8.1 shape: the fallback must be unchanged.
+oc=$(oc_seat old81)
+printf 'SQLite format 3\0' > "$oc/agents/main/agent/openclaw-agent.sqlite"
+echo '{"agents":{"defaults":{"model":{"primary":"google/gemini-2.5-pro"}}}}' > "$oc/openclaw.json"
+out=$(selfcheck_cred_reached_agent old81 openclaw "" "" 2>/dev/null)
+[[ "$out" == *"$SEAT_OK"* ]]   && ok "create witness, pre-2026.8.1 + credential: reports the seat ok"   || bad "create witness, pre-2026.8.1 + credential: regressed, got: $out"
+
+# 8c — the ABSENT case must STILL fire. This is the arm that stops the fix from
+# being "make the witness stop complaining": a seat with openclaw.json present
+# (config written) and no auth profile ever created is unauthenticated, and the
+# tree-shape looks right. DIVE-3130.
+oc=$(oc_seat none81)
+echo '{"auth":{"profiles":{}},"agents":{"defaults":{"model":{"primary":"google/gemini-2.5-pro"}}}}' > "$oc/openclaw.json"
+out=$(selfcheck_cred_reached_agent none81 openclaw "" "" 2>/dev/null)
+[[ "$out" == *"$FALSE_ISSUE"* ]]   && ok "create witness, 2026.8.1 without credential: the issue still fires"   || bad "create witness, 2026.8.1 without credential: silent — the witness can no longer fire on absence, got: $out"
+
+# --- arm 9: `agent info`'s unpinned-model warning ----------------------------
+#
+# cmd_agent.sh resolved the DEFAULT-HOME openclaw seat straight from
+# TYPE_AUTH[openclaw] and tested it with -s, so on 2026.8.1 (constant present,
+# EMPTY) the DIVE-3112 unpinned-model warning was silently suppressed on exactly
+# the seats that need it — a seat running on openclaw's built-in default, whose
+# provider prefix selects a credential we never wrote, and 401s while looking
+# configured. Lower stakes than arm 8 (a missing warning, not a wrong
+# instruction) and the same class.
+#
+# Declared limitation, deliberately not papered over: this arm is STRUCTURAL.
+# Grading it behaviourally means running cmd_agent_info, which reads systemd
+# unit state, the on-disk registry and the enforced sudo grant — none of which
+# a pure unit can supply, and stubbing all three would grade the stubs. The
+# behaviour of the resolver it now calls IS graded, on real fixtures, by arm 1.
+blk=$(sed -n '/DIVE-3113: for openclaw, an absent model is not a neutral/,/oc_unpinned=1/p' "$SRC/cmd_agent.sh")
+[[ -n "$blk" ]]   && ok "agent info: the unpinned-model block was located"   || bad "agent info: could not locate the unpinned-model block — this arm graded nothing"
+[[ "$blk" == *'profile_type_auth_path "" openclaw'* ]]   && ok "agent info: default-home seat resolves through the layout ladder"   || bad "agent info: default-home seat still reads TYPE_AUTH directly — suppressed on 2026.8.1"
 
 if (( fails )); then
   printf '\nFAIL: %d assertion(s)\n' "$fails"

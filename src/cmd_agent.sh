@@ -663,6 +663,15 @@ cmd_info() {
     if [[ -n "$_oc_prof" ]]; then
       _oc_auth=$(profile_type_auth_path "$_oc_prof" openclaw 2>/dev/null) || _oc_auth=""
     fi
+    # DIVE-3834: the default-home seat needs the same layout ladder the
+    # profile-scoped one gets. TYPE_AUTH names the pre-2026.8.1 sqlite, which
+    # 2026.8.1 creates and leaves empty, so `-s` read false and this warning —
+    # the whole of DIVE-3112 — was silently suppressed on exactly the seats that
+    # need it. profile_type_auth_path '' openclaw returns the proven rung, or
+    # the constant unchanged when no rung proves a credential.
+    if [[ -z "$_oc_auth" ]]; then
+      _oc_auth=$(profile_type_auth_path "" openclaw 2>/dev/null) || _oc_auth=""
+    fi
     [[ -n "$_oc_auth" ]] || _oc_auth="${TYPE_AUTH[openclaw]}"
     [[ -s "$_oc_auth" ]] && oc_unpinned=1
   fi
