@@ -582,17 +582,24 @@ t "3856: no channel detector was added to _pending_restart_sweep (the retracted 
   "$(grep -q '_channel_check' "$SRC/cmd_selfupdate.sh" && printf yes || printf no)"
 
 # --- site 1: rotate's envelope stops over-claiming ---------------------------
-_ROT="$(awk '/^cmd_agent_rotation_rotate\(\) \{/,/^\}/' "$SRC/cmd_account.sh")"
-t "3856 rotate: the envelope names the bounce as SCHEDULED" "yes" \
-  "$(grep -q 'channelBounceScheduled:\$cbs' <<<"$_ROT" && printf yes || printf no)"
-t "3856 rotate: the envelope carries channelVerified" "yes" \
-  "$(grep -q 'channelVerified:\$cv' <<<"$_ROT" && printf yes || printf no)"
-t "3856 rotate: a seat with no chat channel reports null, not false (else every headless rotation looks broken)" "yes" \
-  "$(grep -q 'channel_verified=null' <<<"$_ROT" && printf yes || printf no)"
-t "3856 rotate: the HUMAN line names the poller check as OWED (the JSON is not the only reader)" "yes" \
-  "$(grep -q 'human+=.*poller check OWED' <<<"$_ROT" && grep -q 'ok "\$human"' <<<"$_ROT" && printf yes || printf no)"
-t "3856 rotate: it does not claim to have verified anything — no channelVerified:true anywhere" "no" \
-  "$(grep -q 'channelVerified.*true\|channel_verified=true' <<<"$_ROT" && printf yes || printf no)"
+# GRADED BY EXECUTION, IN tests/account_rotation_headroom_unit.sh — that harness
+# already sources src/cmd_account.sh, so it can CALL the verb and assert on the
+# JSON values it emits. Iteration 1 graded site 1 here instead, by grepping an
+# awk-extracted copy of the function body. Measured (quinn's grade): widening
+# the has_chat case to `*)` makes every headless seat rotate with
+# channelVerified:false and "poller check OWED" — the exact false signal the
+# code comment forbids — and all five grep arms stayed GREEN, because a grep of
+# the source certifies that a line EXISTS, not that the verb emits anything.
+# That is this row's own over-claim, committed by its own tests. Do not
+# re-add positive grep arms here; extend the behavioural pair over there.
+#
+# What survives as a grep is an ABSENCE over the whole file, which is a text
+# property and not a claim about a value: no site in the account module may
+# ever hard-code the verified flag true. It is a cheap belt over the
+# behavioural arms, not a substitute for them.
+t "3856 rotate: nothing in the account module hard-codes channelVerified true" "no" \
+  "$(grep -v '^[[:space:]]*#' "$SRC/cmd_account.sh" \
+     | grep -q 'channel_verified=true\|channelVerified:[[:space:]]*true' && printf yes || printf no)"
 
 echo
 echo "supervisor_unit: ${PASS} passed, ${FAIL} failed"
