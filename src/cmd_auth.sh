@@ -24,7 +24,9 @@ auth_creds_present() {
   [[ "$sentinel" == *:* ]] && key="${sentinel##*:}"
   # Profile-scoped: swap the default credential path for the profile's. The
   # jq key (for OAuth json sentinels) is unchanged.
-  if [[ -n "$profile" ]]; then
+  # DIVE-3834: openclaw resolves through the layout ladder even with no profile
+  # (the default-home seat is on the same upstream release as the scoped ones).
+  if [[ -n "$profile" || "$type" == openclaw ]]; then
     local ppath
     ppath=$(profile_type_auth_path "$profile" "$type") || ppath=""
     [[ -n "$ppath" ]] && path="$ppath"
@@ -604,11 +606,30 @@ LOCALBIN
     # still does and dies on the same 401. Say so here, where the version
     # actually moved — this is a NUDGE, not the check: the re-grade shells to
     # openclaw once per provider (~36s) and is not run inline for that reason.
+    # DIVE-3834, scope item 3 — the RECORD half. We install openclaw UNPINNED
+    # from upstream, so an upstream release changes what lands on every new
+    # provision overnight with no change on our side. That is how 2026.8.1
+    # arrived: the credential store moved, our probe kept reading the old path,
+    # and the only signal the next morning was two red smoke arms — the version
+    # that caused it was nowhere in any record we keep. Reading it HERE, where
+    # the install just happened, is what turns the next silent bump into a diff
+    # instead of a morning of triage, and it covers antigravity and grok too:
+    # they are the same HOME-redirect shape and the same class of change.
+    # Best-effort and capped at 5s by resolve_cli_version, so a runtime that
+    # will not answer --version degrades to an empty string and never fails an
+    # install that otherwise succeeded.
+    #
+    # PINNING is the other half of item 3 and is deliberately NOT taken here:
+    # pinning means owning the upgrade cadence for every runtime we ship, which
+    # is a product decision. It is raised on the row, not decided in this diff.
+    local _inst_ver=""
+    _inst_ver=$(resolve_cli_version "$type" 2>/dev/null) || _inst_ver=""
     [[ "$type" == "openclaw" && $verb == "upgraded" ]] \
-      && step "openclaw version changed — model pins were graded against the OLD catalog and nothing re-reads them. Re-grade: sudo 5dive doctor --category=models"
+      && step "openclaw version changed${_inst_ver:+ (now: $_inst_ver)} — model pins were graded against the OLD catalog and nothing re-reads them. Re-grade: sudo 5dive doctor --category=models"
+    [[ -n "$_inst_ver" ]] && step "$type $verb, installed version: $_inst_ver"
     ok "$type $verb at $bin" \
-       '{type:$t, bin:$b, installed:true, alreadyInstalled:false, upgraded:$u}' \
-       --arg t "$type" --arg b "$bin" --argjson u "$ujson"
+       '{type:$t, bin:$b, installed:true, alreadyInstalled:false, upgraded:$u, version:$v}' \
+       --arg t "$type" --arg b "$bin" --argjson u "$ujson" --arg v "$_inst_ver"
   else
     fail "$E_GENERIC" "$type install reported success but $bin still missing — investigate manually"
   fi
@@ -682,6 +703,83 @@ profile_type_env() {
   esac
 }
 
+# _openclaw_cred_path <state_root> [legacy_sentinel] — echo the path, under a
+# HOME-redirected openclaw state root, that PROVES this seat carries an
+# openclaw credential. The optional legacy sentinel is needed for the default
+# home: its configured TYPE_AUTH path is authoritative, while profile-scoped
+# homes use the DIVE-3489 sqlite sentinel.
+# Nothing on stdout + rc 1 when no rung proves one.
+#
+# DIVE-3834: upstream openclaw 2026.8.1 moved the credential store. The
+# DIVE-3489 path (agents/main/agent/openclaw-agent.sqlite) is still CREATED on
+# 2026.8.1 and stays EMPTY, so a single hardcoded path reported every
+# correctly-authenticated BYO seat as `needs_login` and told the customer to run
+# a login that cannot help. We install openclaw UNPINNED, so this landed on
+# every new provision overnight with no change on our side.
+#
+# The ladder is ordered oldest-layout-first so a box on the pre-2026.8.1 layout
+# keeps its exact previous answer, and each rung is a POSITIVE assertion that a
+# credential exists — never "the file the app happens to create is there".
+# That distinction is the whole defect: the empty directory is what made this
+# fail silently instead of loudly.
+#
+# Deliberately NOT a rung: ~/.openclaw/state/openclaw.sqlite. That is the app's
+# own store on 2026.8.1 and it is created lazily by openclaw itself, so a
+# non-empty test on it cannot tell "authenticated" from "openclaw has run once".
+# Admitting it would make this function unable to fire on the ABSENT case —
+# the DIVE-3130 shape (a guard guarded by its own subject). See
+# community/wiki/an-unconfigured-model-authenticates-against-the-wrong-provider.md.
+#
+# SCOPE ITEM 2 — why this is a path ladder and not a call to openclaw's own auth
+# verb, answered rather than left implicit. The verb exists and we already use
+# it: `openclaw models auth --agent main list` grades the WRITE at
+# cmd_agent_create.sh (a key that openclaw does not list back is refused there).
+# It is not usable as this READ-BACK probe, for four reasons, only the last of
+# which is about our access:
+#   1. COST AND CALLER. auth_creds_present / agent_auth_health are the per-seat
+#      survey behind `agent list`, `auth status` and `agent info` — called in a
+#      loop over every seat. Each verb call is a node process spawn. This repo
+#      has already priced that and refused it inline: cmd_doctor's openclaw pin
+#      re-grade shells to openclaw once per provider at ~36s and is deliberately
+#      NOT run inline for exactly that reason.
+#   2. IT MUST RETURN A PATH, not a verdict. profile_type_auth_path's answer
+#      feeds cmd_auth_poll's MTIME BASELINE for sign-in detection (DIVE-3489).
+#      A verb returns text; swapping the path for a verb deletes the baseline
+#      and the poll can never observe a login.
+#   3. PRIVILEGE. The survey runs from unprivileged seats; reaching another
+#      seat's HOME needs `sudo -u claude -H env HOME=…`, which most seats do not
+#      hold — the reason resolve_cli_version carries a denial back-off at all.
+#   4. UNVERIFIED CONTRACT. Whether 2026.8.1's `models auth ... list` output
+#      shape is stable enough to parse as a verdict was NOT measured: that needs
+#      a box, and the box this row was measured on has self-purged. Claiming it
+#      works would be the thing this row punishes.
+# So the ladder is the fallback item 2 asks for when the verb is not usable, and
+# this comment is the "say so in the row" half of that instruction.
+_openclaw_cred_path() {
+  local root="$1" p
+  # Rung 1 — layouts up to 2026.7.x: the per-agent auth store (DIVE-3489).
+  p="${2:-${root}/.openclaw/agents/main/agent/openclaw-agent.sqlite}"
+  [[ -s "$p" ]] && { echo "$p"; return 0; }
+  # Rung 2 — 2026.8.1+: auth profiles live in the top-level config under
+  # .auth.profiles (measured on box 62.238.11.92, openclaw 2026.8.1 ea80657:
+  # auth.profiles."google:manual".provider / .mode after a BYO key write).
+  # Gated on the PROFILE MAP being non-empty, not on the file existing —
+  # openclaw.json is written at config time by seats that never authenticated.
+  p="${root}/.openclaw/openclaw.json"
+  if [[ -s "$p" ]] && jq -e '(.auth.profiles // {}) | length > 0' "$p" >/dev/null 2>&1; then
+    echo "$p"; return 0
+  fi
+  return 1
+}
+
+# _openclaw_state_root <path> — the HOME-redirect root implied by an openclaw
+# credential path (everything left of the trailing `/.openclaw/...`).
+_openclaw_state_root() {
+  local p="$1"
+  [[ "$p" == */.openclaw/* ]] || return 1
+  echo "${p%%/.openclaw/*}"
+}
+
 # profile_type_auth_path <profile> <type> — absolute path to the credential
 # sentinel for (profile, type). Empty profile returns TYPE_AUTH's shared
 # default; non-empty returns the per-profile path corresponding to the
@@ -689,7 +787,17 @@ profile_type_env() {
 profile_type_auth_path() {
   local profile="$1" type="$2"
   if [[ -z "$profile" ]]; then
-    echo "${TYPE_AUTH[$type]:-}"
+    local _def="${TYPE_AUTH[$type]:-}"
+    # DIVE-3834: the default-home openclaw seat needs the same layout ladder the
+    # profile-scoped one gets; TYPE_AUTH can only name one path and 2026.8.1
+    # writes a different one. Resolve, and fall back to the constant unchanged.
+    if [[ "$type" == openclaw && -n "$_def" ]]; then
+      local _root _hit
+      if _root=$(_openclaw_state_root "$_def"); then
+        _hit=$(_openclaw_cred_path "$_root" "$_def") && { echo "$_hit"; return; }
+      fi
+    fi
+    echo "$_def"
     return
   fi
   local dir="${AUTH_PROFILES_DIR}/${profile}/${type}"
@@ -702,7 +810,14 @@ profile_type_auth_path() {
     # sqlite store. This path feeds mtime-based sign-in detection, so pointing it
     # at the JSON watched a file that a successful auth no longer touches — the
     # poll would sit forever on a profile that had in fact authenticated.
-    openclaw)    echo "${dir}/.openclaw/agents/main/agent/openclaw-agent.sqlite" ;;
+    # DIVE-3834: 2026.8.1 moved the store. Return whichever rung PROVES a
+    # credential; with none proven, keep returning the DIVE-3489 path so the
+    # mtime baseline in cmd_auth_poll and the "provably absent" branch in
+    # agent_auth_health behave exactly as they did before this change.
+    openclaw)
+      local _oc
+      _oc=$(_openclaw_cred_path "$dir") && { echo "$_oc"; return; }
+      echo "${dir}/.openclaw/agents/main/agent/openclaw-agent.sqlite" ;;
     antigravity) echo "${dir}/.gemini/antigravity-cli/antigravity-oauth-token" ;;
     grok)        echo "${dir}/.grok/auth.json" ;;
     # claude detection in cmd_auth_poll is log-grep-based, not file-mtime —
@@ -809,7 +924,7 @@ agent_auth_health() {
   # Sentinels are "<path>" or "<path>:<key>"; only the path half is needed here
   # (auth_creds_present owns the key half).
   local path="${sentinel%%:*}"
-  if [[ -n "$profile" ]]; then
+  if [[ -n "$profile" || "$type" == openclaw ]]; then   # DIVE-3834: see auth_creds_present
     local ppath
     ppath=$(profile_type_auth_path "$profile" "$type" 2>/dev/null) || ppath=""
     [[ -n "$ppath" ]] && path="$ppath"

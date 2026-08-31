@@ -1732,7 +1732,17 @@ selfcheck_cred_reached_agent() { # <name> <type> <profile> <byo_provider>
   # for. A witness must read the store the RUNTIME reads.
   if [[ "$type" == "openclaw" ]]; then
     local _oc_home="${AGENT_HOME_ROOT:-/home}/${user}"
-    local _oc_auth="${_oc_home}/.openclaw/agents/main/agent/openclaw-agent.sqlite"
+    # DIVE-3834: this witness is the THIRD reader of openclaw's credential store
+    # and it was the one left hardcoded. On 2026.8.1 the sqlite below is created
+    # and stays EMPTY, so a seat whose credential is present and correct printed
+    # `issue:openclaw credential never reached the seat` and told the customer to
+    # re-seed a seat that is fine — the same wrong instruction, on the create
+    # path, that this row was filed for. Resolve through the layout ladder and
+    # keep the DIVE-3489 constant as the no-rung fallback, so a pre-2026.8.1 box
+    # and a genuinely unauthenticated seat both behave exactly as before.
+    local _oc_auth
+    _oc_auth=$(_openclaw_cred_path "$_oc_home") \
+      || _oc_auth="${_oc_home}/.openclaw/agents/main/agent/openclaw-agent.sqlite"
     local _oc_cfg="${_oc_home}/.openclaw/openclaw.json"
     if [[ ! -s "$_oc_auth" ]]; then
       printf 'issue:openclaw credential never reached the seat (%s is missing/empty) — the agent boots UNAUTHENTICATED and every message fails with ProviderAuthError while the profile itself looks fine. Re-seed as root: sudo 5dive agent restart %s\n' \
