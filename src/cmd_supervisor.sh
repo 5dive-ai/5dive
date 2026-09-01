@@ -341,6 +341,70 @@ _sup_quota_match() {  # <pane-text-on-stdin>
     | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-160
 }
 
+# DIVE-3880: the pane KEEPS RENDERING a lapsed refusal, so the signature alone
+# cannot say whether the seat is still frozen — and the discriminator is already
+# inside the string being parsed. The harness prints its own resume deadline
+# ("continuing automatically at 2:10pm"); compared against now that is three
+# states, not two:
+#
+#   live     deadline in the FUTURE  -> the refusal is in force, the seat IS frozen
+#   lapsed   deadline in the PAST    -> scrollback; the seat has already resumed
+#   unknown  no deadline in the text, or one this cannot parse
+#
+# UNKNOWN abstains — it is NEVER resolved to either of the other two. That is
+# DIVE-3778's third-state rule, and it is load-bearing in BOTH directions here:
+# most quota phrasings carry no deadline at all (`credit balance is too low`,
+# `insufficient_quota`, a weekly `7d: 100%`) and those are real, indefinite
+# freezes. So an abstention leaves the pre-3880 classification exactly as it
+# was and only refuses to claim a live deadline; it is not a clear.
+#
+# Pure: `now` is an ARGUMENT, never `date +%s` read internally, so every arm is
+# assertable at a fixed clock. Echoes "<state>\x1f<deadline-epoch|>".
+#
+# Which of three candidate days: the NEAREST to `now` (yesterday / today /
+# tomorrow at that time-of-day). A pane line is undated, so a bare `12:30am`
+# read at 23:55 means tomorrow and a bare `11pm` read at 00:05 means yesterday
+# — anchoring on today alone gets one of those backwards whichever way you pick.
+# RESIDUAL, stated because it cannot be fixed from this surface: a refusal still
+# on screen more than ~12h later reads as the same time-of-day TODAY, so it can
+# read `live` when it lapsed a day ago. Bounded by the pane window
+# (_SUP_QUOTA_PANE_LINES) at the tick, and by _SUP_INFO_TICK_STALE on the `info`
+# side; a dated deadline in the text would remove it and no runtime prints one.
+_sup_quota_deadline() {  # <text> [now_epoch]
+  local text="$1" now="${2:-}"
+  [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
+  local re='[Cc]ontinuing[[:space:]]+automatically[[:space:]]+at[[:space:]]+([0-9]{1,2})(:([0-9]{2}))?[[:space:]]*([AaPp])?\.?[Mm]?\.?'
+  if [[ ! "$text" =~ $re ]]; then printf 'unknown\x1f\n'; return 0; fi
+  local hh="${BASH_REMATCH[1]}" mm="${BASH_REMATCH[3]:-00}" ap="${BASH_REMATCH[4]:-}"
+  hh=$((10#$hh)); mm=$((10#$mm))
+  case "${ap,,}" in
+    a) (( hh >= 1 && hh <= 12 )) || { printf 'unknown\x1f\n'; return 0; }
+       if (( hh == 12 )); then hh=0; fi ;;
+    p) (( hh >= 1 && hh <= 12 )) || { printf 'unknown\x1f\n'; return 0; }
+       if (( hh != 12 )); then hh=$(( hh + 12 )); fi ;;
+    # No meridiem: only an unambiguous 24h hour is parseable. A bare "at 9:30"
+    # is 9:30 OR 21:30 and guessing either way invents the answer, so it takes
+    # the third state rather than a coin flip.
+    *) (( hh >= 13 && hh <= 23 )) || { printf 'unknown\x1f\n'; return 0; } ;;
+  esac
+  (( mm >= 0 && mm <= 59 )) || { printf 'unknown\x1f\n'; return 0; }
+  local day base best="" bestd=-1 d
+  day=$(date -d "@${now}" +%Y-%m-%d 2>/dev/null) || { printf 'unknown\x1f\n'; return 0; }
+  base=$(date -d "${day} $(printf '%02d:%02d' "$hh" "$mm")" +%s 2>/dev/null)     || { printf 'unknown\x1f\n'; return 0; }
+  for d in $(( base - 86400 )) "$base" $(( base + 86400 )); do
+    local dist=$(( d > now ? d - now : now - d ))
+    if (( bestd < 0 || dist < bestd )); then bestd="$dist"; best="$d"; fi
+  done
+  if (( best > now )); then printf 'live\x1f%s\n' "$best"
+  else printf 'lapsed\x1f%s\n' "$best"; fi
+}
+
+# DIVE-3880: "2:10pm" / "14:10" for a reader, from the epoch above.
+_sup_quota_deadline_hm() {  # <epoch>
+  [[ "${1:-}" =~ ^[0-9]+$ ]] || { printf '?'; return 0; }
+  date -d "@$1" +%H:%M 2>/dev/null || printf '?'
+}
+
 # DIVE-3272: does this agent's live pane show a capacity refusal? Root-only (the
 # sudo tmux hop) and running-service-only; anything else returns empty
 # (false-negative bias, like every other probe here). Deliberately NOT
@@ -429,6 +493,9 @@ _SUP_INFO_TICK_TOL=120   # seconds. Per-agent rows are written BEFORE the fleet
 # Pure render of the `agent info` supervisor overlay — NO I/O, so a test can
 # assert every branch without a store, a tick or a tmux (same factoring as
 # _sup_classify / _sup_act_plan). Echoes one compact JSON object.
+# DIVE-3880 reads a clock through _sup_quota_deadline, which takes `now` as an
+# ARGUMENT (never `date +%s` internally) — so every deadline arm is still
+# assertable at a fixed epoch and the renderer stays deterministic in its args.
 # args: armed(true/false) tick_epoch row_epoch now
 #       rec_class rec_cause rec_detail open_rows days_since_close(-1 = never)
 #       store_readable(true/false)
@@ -502,6 +569,28 @@ _sup_info_status() {
   fi
   [[ -n "$cls" ]] || cls="unobserved"
 
+  # --- DIVE-3880: the inherited quota class carries its OWN expiry ------------
+  # This is the measured defect. The tick reads the pane; `info` reads the tick.
+  # Between the two, the refusal's own resume deadline can pass — and a pane
+  # goes on rendering a lapsed refusal, so the recorded reading was true when
+  # written and is false now. Recency-vs-the-tick cannot catch it (the row IS
+  # current: ops was flagged at 14:17 off a 14:10 expiry, mid-command). The
+  # discriminator is in the detail string already being carried, and it is
+  # re-evaluated HERE, at print time, against this call's `now` — the same
+  # reason the output half is recomputed here instead of inherited.
+  local qdl_state="" qdl_epoch=""
+  if [[ "$cls" == "quota-exhausted" ]]; then
+    IFS=$'\x1f' read -r qdl_state qdl_epoch <<<"$(_sup_quota_deadline "$detail" "$now")"
+    if [[ "$qdl_state" == "lapsed" ]]; then
+      # NOT a clear and NOT the alarm: a third value. The seat resumed at the
+      # deadline the refusal itself printed, so this class must stop instructing
+      # anyone to reassign a queue — but the reading is still shown, because
+      # "we read a refusal" and "it still holds" are different facts.
+      cls="quota-lapsed"; cause="deadline-passed"
+      detail="the pane refusal this rests on EXPIRED at $(_sup_quota_deadline_hm "$qdl_epoch") — it is scrollback, not a live wall, and the seat has resumed since: ${detail}"
+    fi
+  fi
+
   # --- the escalation: what the state line may NOT omit -----------------------
   # Only the "up and reachable but not transacting" classes. A `stuck` seat is
   # already visible in `state:` itself (the unit is down); these three are the
@@ -521,6 +610,12 @@ _sup_info_status() {
     no-output) state_note="⚠ NOT TRANSACTING (no-output: ${note})" ;;
     *)         state_note="⚠ NOT TRANSACTING (${cls}${detail:+: ${detail}})" ;;
   esac
+  # DIVE-3880: when the alarm was dropped for a lapsed deadline, say so on the
+  # SAME line that would otherwise have carried it. A silently-downgraded alarm
+  # and a seat that was never flagged must not print identically — that is the
+  # same absence-reads-as-health shape this overlay exists to remove.
+  [[ "$cls" == "quota-lapsed" ]] \
+    && state_note="${state_note} · the pane's quota refusal LAPSED at $(_sup_quota_deadline_hm "$qdl_epoch") (stale scrollback — NOT a not-transacting reading)"
 
   local age_s=$(( now > row && row > 0 ? now - row : -1 ))
   local tick_age_s=$(( now > tick && tick > 0 ? now - tick : -1 ))
@@ -542,6 +637,7 @@ _sup_info_status() {
   jq -cn \
     --arg cls "$cls" --arg cause "$cause" --arg detail "$detail" \
     --arg output "$output" --arg note "$note" --arg verdict "$verdict" \
+    --arg qdl "$qdl_state" \
     --arg stateNote "$state_note" --arg supLine "$sup_line" \
     --argjson armed "$armed" --argjson current "$current" --argjson store "$store" \
     --argjson transacting "$transacting" \
@@ -561,6 +657,11 @@ _sup_info_status() {
        thresholdDays: $thresh,
        # INHERITED from the trail — only as fresh as the tick that wrote it.
        classification: $cls,
+       # DIVE-3880: live / lapsed / unknown, re-derived at print time from the
+       # deadline the refusal itself printed. null when the inherited class is
+       # not a quota reading at all. `unknown` is an ABSTENTION — it is never
+       # read as either of the other two.
+       quotaDeadline: (if $qdl == "" then null else $qdl end),
        cause: (if $cause == "" then null else $cause end),
        detail: (if $detail == "" then null else $detail end),
        observedAgeSec: (if $age < 0 then null else $age end),
@@ -848,11 +949,20 @@ _sup_cli_check() {
 # args: desired svc_running(0/1) active sess tmux_state poller loop_stuck
 #       has_work(0/1) act_age cli_stale(true/false/unknown) goal_drift_task
 #       verify_excerpt stranded open_rows no_output_days quota_excerpt
+#       quota_deadline(live/lapsed/unknown, DIVE-3880)
 _sup_classify() {
   local desired="$1" svc_running="$2" active="$3" sess="$4" tmux_state="$5" poller="$6" \
         loop_stuck="$7" has_work="$8" act_age="$9" cli_stale="${10}" goal_drift_task="${11}" \
         verify_excerpt="${12}" stranded="${13:-0}" \
-        open_rows="${14:-0}" no_output_days="${15:--1}" quota_excerpt="${16:-}"
+        open_rows="${14:-0}" no_output_days="${15:--1}" quota_excerpt="${16:-}" \
+        quota_deadline="${17:-unknown}"
+  # DIVE-3880: the policy lives HERE, in the pure decision, not at the pane
+  # probe — the probe owes a distinguishable signal, the classifier owes the
+  # verdict (community/wiki/a-fail-open-underneath-a-fail-closed-path-feeds-it-a-lie-in-the-format-it-trusts.md).
+  # `lapsed` is the only state that disarms the branch; `unknown` must leave it
+  # exactly as DIVE-3272 shipped it, or every deadline-free refusal (credit
+  # balance, insufficient_quota, weekly 100%) stops being seen at all.
+  case "$quota_deadline" in live|lapsed|unknown) ;; *) quota_deadline="unknown" ;; esac
   local class="healthy" cause="" detail=""
   # DIVE-1127: the verification-challenge tripwire wins FIRST — it is the highest
   # priority signal (same-day alert obligation) and, when present, explains any
@@ -875,13 +985,20 @@ _sup_classify() {
     class="stuck"; cause="tmux-dead"; detail="unit active but tmux session '${sess}' gone"
   elif [[ "$poller" == "dead" ]]; then
     class="stuck"; cause="poller-dead"; detail="telegram poller process not running"
-  elif [[ -n "$quota_excerpt" ]]; then
+  elif [[ -n "$quota_excerpt" && "$quota_deadline" != "lapsed" ]]; then
     # DIVE-3272: placed ABOVE loop-stuck / no-progress on purpose — a capacity
     # wall EXPLAINS both of those, and the response is different in kind (a
     # profile flip or a quota reset, not a nudge/resume). Below the dead-signal
     # branches because a down unit is the more specific reading.
     class="quota-exhausted"; cause="quota-exhausted"
     detail="pane shows a model-capacity refusal: ${quota_excerpt}"
+    # DIVE-3880: never a bare class again — the reader is told which of the
+    # three deadline states this rests on, so an abstention cannot be read as a
+    # confirmed live refusal.
+    case "$quota_deadline" in
+      live)    detail="${detail} [resume deadline still in the FUTURE — the refusal is live]" ;;
+      unknown) detail="${detail} [the refusal names no resume deadline this can parse — UNKNOWN whether it is still in force, NOT confirmed live]" ;;
+    esac
   elif (( loop_stuck > 0 )); then
     class="stuck"; cause="loop-stuck"; detail="${loop_stuck} running loop(s) self-flagged stuck"
   elif (( has_work )) && (( act_age >= 0 )) && (( act_age >= _SUP_T_STUCK_MIN * 60 )); then
@@ -1007,6 +1124,17 @@ _sup_agent_record() {
 
   # --- signal: model-capacity refusal in the live pane (DIVE-3272) ---
   local quota_excerpt; quota_excerpt=$(_sup_quota_pane "$user" "$sess" "$svc_running")
+  # DIVE-3880: a pane renders a refusal long after it lapses (measured: ops was
+  # flagged at 14:17 off a refusal that expired at 14:10, mid-command). The
+  # expiry is inside the excerpt itself — read it, and hand the STATE to the
+  # classifier rather than deciding here. The excerpt stays in `signals`
+  # whatever the state says: "we read this" and "it still holds" are different
+  # facts and the operator wants both.
+  local quota_deadline="unknown"
+  if [[ -n "$quota_excerpt" ]]; then
+    quota_deadline=$(_sup_quota_deadline "$quota_excerpt" "$now" | cut -f1 -d$'\x1f')
+    [[ -n "$quota_deadline" ]] || quota_deadline="unknown"
+  fi
 
   # --- signal: OUTPUT (DIVE-3272) — open rows held, and days since this seat
   # last closed anything. The pair is the detector: either number alone is
@@ -1032,7 +1160,7 @@ _sup_agent_record() {
   crow=$(_sup_classify "$desired" "$svc_running" "$active" "$sess" "$tmux_state" "$poller" \
                         "$loop_stuck" "$has_work" "$act_age" "$_SUP_CLI_STALE" "$goal_drift_task" \
                         "$verify_excerpt" "$stranded" \
-                        "$open_rows" "$no_output_days" "$quota_excerpt")
+                        "$open_rows" "$no_output_days" "$quota_excerpt" "$quota_deadline")
   IFS=$'\x1f' read -r class cause detail <<<"$crow"
 
   jq -cn \
@@ -1045,6 +1173,7 @@ _sup_agent_record() {
     --arg goalDrift "$goal_drift_task" \
     --arg verifyExcerpt "$verify_excerpt" \
     --arg quotaExcerpt "$quota_excerpt" \
+    --arg quotaDeadline "$quota_deadline" \
     --argjson openRows "$open_rows" --argjson noOutputDays "$no_output_days" \
     --arg class "$class" --arg cause "$cause" --arg detail "$detail" \
     '{name:$name, type:$type, channels:$channels, unit:$unit,
@@ -1056,7 +1185,10 @@ _sup_agent_record() {
                verifyChallenge:(if $verifyExcerpt == "" then null else $verifyExcerpt end),
                openRows:$openRows,
                daysSinceLastClose:(if $noOutputDays < 0 then null else $noOutputDays end),
-               quotaSignature:(if $quotaExcerpt == "" then null else $quotaExcerpt end)},
+               quotaSignature:(if $quotaExcerpt == "" then null else $quotaExcerpt end),
+               # DIVE-3880: live / lapsed / unknown for the signature above.
+               # null only when there is no signature to qualify.
+               quotaDeadline:(if $quotaExcerpt == "" then null else $quotaDeadline end)},
       classification:$class,
       cause:(if $cause == "" then null else $cause end),
       detail:$detail}'
