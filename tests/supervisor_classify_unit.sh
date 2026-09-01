@@ -270,6 +270,55 @@ t "DIVE-3880 it.2: one live line alone still classifies (quinn, the filing case)
 t "DIVE-3880 it.2: a pane with no signature at all still returns empty" "MISS" \
   "$( [[ -n "$(qm 'nothing here'$'\n''nor here')" ]] && echo MATCH || echo MISS )"
 
+# --- DIVE-3880 it.3: the NO-MATCH path must not kill the caller --------------
+#     quinn's rejection of it.2: making the selection an ASSIGNMENT
+#     (`matches=$(grep … | sed | cut)`) created an unguarded probe substitution.
+#     Under `set -euo pipefail` a no-match grep makes the pipeline rc=1, so
+#     `_sup_quota_match` DIED on a clean pane — the overwhelmingly common one —
+#     and `_sup_quota_pane` returned 1 on its healthy path. Today the single
+#     production call site is `quota_excerpt=$(…)`, which masks it, so the arms
+#     above all stayed green: the defect is invisible to a VERDICT arm and only
+#     shows in the caller's control flow.
+#     scripts/unguarded-probe-scan.sh names the site and
+#     tests/unguarded_probe_substitution_unit.sh reds on it, but both grade the
+#     TEXT; neither states the runtime consequence. And this harness runs
+#     `set -uo pipefail` WITHOUT `-e`, so a bare call here cannot fire the bug
+#     at all — the arm has to RE-ENTER the firing environment or it grades a
+#     shell the defect is unreachable from.
+#     TRAP, and the reason the first draft of these four arms was VACUOUS (they
+#     were green with the guard deleted): bash suppresses `-e` for any command
+#     in an `&&`/`||`/`!` list, and that suppression PROPAGATES INTO A SUBSHELL,
+#     so `( set -euo pipefail; … ) || echo DIED` cannot fire — the `set -e` is
+#     overridden by the context the subshell was invoked from. The sentinel has
+#     to be read out of the subshell's STDOUT inside a plain command
+#     substitution instead, where an absent sentinel is the death.
+bare() {  # <pane-text> -> sentinel iff the statement AFTER a bare call runs
+  local out
+  out=$( ( set -euo pipefail
+      printf '%s\n' "$1" | _sup_quota_match "$QN" >/dev/null
+      echo SURVIVED ) 2>/dev/null )
+  printf '%s\n' "${out:-DIED}"
+}
+t "DIVE-3880 it.3: a bare call on a CLEAN pane does not kill a set -e caller" "SURVIVED" \
+  "$(bare 'Read(src/cmd_supervisor.sh)')"
+t "DIVE-3880 it.3: nor does it on a pane that DOES match (path already taken)" "SURVIVED" \
+  "$(bare "$LIVE_LINE")"
+# The layer above: _sup_quota_pane's last command IS the pipe into
+# _sup_quota_match, so a clean pane made the whole healthy path return 1.
+pane_rc() {  # <pane-text> -> sentinel iff _sup_quota_pane returns 0
+  local out
+  out=$( ( set -euo pipefail
+      FIXTURE="$1"
+      _sup_quota_pane_capture() { printf '%s\n' "$FIXTURE"; }
+      _sup_quota_pane u s 1 "$QN" >/dev/null
+      echo SURVIVED ) 2>/dev/null )
+  printf '%s\n' "${out:-DIED}"
+}
+t "DIVE-3880 it.3: _sup_quota_pane returns 0 on a clean pane (healthy path)" "SURVIVED" \
+  "$(pane_rc 'Read(src/cmd_supervisor.sh)')"
+t "DIVE-3880 it.3: and still 0 when the pane holds a live wall" "SURVIVED" \
+  "$(pane_rc "$LIVE_LINE")"
+
 # --- DIVE-3880: THE WIRING, driven through _sup_agent_record ------------------
 #     A pure-classifier arm grades the BRANCH and not the READ
 #     (community/wiki/a-detectors-tests-can-grade-the-branch-and-not-the-read.md):

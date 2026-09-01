@@ -370,7 +370,7 @@ _sup_quota_match() {  # <pane-text-on-stdin> [now_epoch]
   [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
   local matches
   matches=$(grep -iE "${_SUP_QUOTA_PAT}|${_SUP_WEEKLY_QUOTA_PAT}" 2>/dev/null \
-    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-160)
+    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-160) || matches=""
   [[ -n "$matches" ]] || return 0
   local line st ep last="" live="" live_ep=-1
   while IFS= read -r line; do
