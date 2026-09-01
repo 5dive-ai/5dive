@@ -128,5 +128,53 @@ refuses_with '--memory must be' \
   "an unknown --memory mode refuses rather than falling through to a mode" \
   -- ceo --memory=bogus --audience=self
 
+# ---- 4. DIVE-3877: the pack is LABELLED with the mode it was packed in ------
+# A raw pack that declares includes.memory="distilled" is indistinguishable on
+# the wire from a publishable one — --json says distilled, the manifest says
+# distilled, and import re-reports it. So the thing to grade is the SEALED
+# BYTES, not a string in the source: drive the real seal path with only the
+# agent-home reads stubbed, then read the label back out of the tarball export
+# actually wrote. Mutation-checked: restoring the hardcoded mem_inc="distilled"
+# turns arm 4a red and leaves the 4b control green.
+_pack_agent_config() { printf '{"type":"claude"}\n'; }
+_pack_skill_refs()   { printf '[]\n'; }
+_agent_to_persona()  { return 1; }
+
+seal_label() { # <mode> -> echoes manifest includes.memory ('' if nothing sealed)
+  local mode="$1" out="$TMP/sealed-$1.tar.gz" x="$TMP/x-$1"
+  cmd_export ceo --memory="$mode" --audience=self --approve-memory="$MEM" -o "$out" \
+    >"$TMP/seal-$1.out" 2>&1
+  mkdir -p "$x"
+  tar -xzf "$out" -C "$x" 2>/dev/null || return 1
+  jq -r '.includes.memory' "$x/manifest.json" 2>/dev/null
+}
+
+lab=$(seal_label raw)
+if [[ "$lab" == "raw" ]]; then
+  ok_t "a raw pack declares includes.memory=\"raw\" (not 'distilled')"
+else
+  bad_t "a raw pack declares includes.memory=\"raw\" (not 'distilled')" \
+        "manifest says '${lab:-<no pack written>}'; $(tail -2 "$TMP/seal-raw.out" | tr '\n' ' ')"
+fi
+
+# The CONTROL. Without it this arm would pass on a build that had simply
+# renamed every pack 'raw'.
+lab=$(seal_label distilled)
+if [[ "$lab" == "distilled" ]]; then
+  ok_t "control: a distilled pack is still labelled distilled"
+else
+  bad_t "control: a distilled pack is still labelled distilled" \
+        "manifest says '${lab:-<no pack written>}'; $(tail -2 "$TMP/seal-distilled.out" | tr '\n' ' ')"
+fi
+
+# The operator-facing line is the other half of the same lie: "exported ...
+# (with distilled persona memory)" over a verbatim private backup.
+if grep -qi 'RAW persona memory' "$TMP/seal-raw.out"; then
+  ok_t "the raw export's success line says RAW, and says it is self-only"
+else
+  bad_t "the raw export's success line says RAW, and says it is self-only" \
+        "got: $(grep -i exported "$TMP/seal-raw.out" | head -1)"
+fi
+
 printf '\n%s\n' "----- pack_raw_memory_unit: PASS=$PASS FAIL=$FAIL -----"
 [[ $FAIL -eq 0 ]]
