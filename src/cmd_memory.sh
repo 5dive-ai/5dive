@@ -66,7 +66,8 @@ _memory_usage() {
                    [--type=user|feedback|project|reference] [--store=mine|wiki]
                    [--tags=a,b] [--valid-to=YYYY-MM-DD] [--supersedes=<slug>]
                    [--confidence=high|medium|low] [--provenance="<source>"]
-                   [--evidence=<kind>:<ref>]... [--no-dedup] [--force]  (body on stdin)
+                   [--evidence=<kind>:<ref>]... [--check='<cmd>' | --no-check="<why>"]
+                   [--no-dedup] [--force]  (body on stdin)
       Compile a durable memory: writes a frontmatter markdown file into your
       own store (default) or the shared team wiki (--store=wiki, the publish
       path other agents can search), stamps provenance (who/when), appends the
@@ -84,6 +85,23 @@ _memory_usage() {
         sha:<gitsha>  url:<https://...>  run:<id>
       It sits BESIDE --provenance (free text), which is unchanged. A memory
       with no evidence is not flagged, demoted, or degraded.
+      CHECKABILITY (DIVE-3885) is a SEPARATE, AUTHORED field — deliberately not
+      built on --evidence. Measured 2026-09-01 over 2,651 fleet atoms: 596 carry
+      evidence, but 595 of those are `run:<session id>`, stamped by the
+      consolidate pipeline. TWELVE hand-authored refs exist fleet-wide. A field
+      the pipeline can fill converges to whatever the pipeline fills in, so
+      `check:` is one the pipeline CANNOT fill and `add` will not let it skip
+      silently:
+        --check='<cmd>'   a read-only shell command whose EXIT CODE re-derives
+                          this fact. 0 = still true. It is run unattended by
+                          `memory check`, so it is refused if it writes, escapes
+                          (sudo/rm/curl|sh), or is trivially green (`true`, `:`,
+                          a bare echo) — a check that cannot go red is not one.
+        --no-check="<why>" the recorded opt-out. Not free: the reason is written
+                          to frontmatter as `no_check:`, so an unchecked fact is
+                          COUNTABLE rather than merely absent.
+      WRITE-TIME ENFORCEMENT: --type=reference (a fact about the world, the
+      class that rots) requires one of the two. Every other type is unchanged.
       Write-time dedup: `add` WARNS (never refuses) when the body overlaps an
       existing memory in the same store — silence it with --no-dedup.
 
@@ -126,6 +144,22 @@ _memory_usage() {
       seat per day, and a seat with no NEW finished transcript costs $0 (the
       ledger short-circuits before the distiller is ever invoked). Lower it
       further with --max-chars, or point --distiller at a cheaper model.
+
+  5dive memory check [--roots=a,b] [--store=all|mine|wiki] [--agent=<name>]
+                     [--slug=<slug>]... [--timeout=SEC] [--write] [--json]
+      Run every atom's authored `check:` command and report which facts no
+      longer re-derive. Dry-run by default; --write stamps the frontmatter with
+      `check_status`, `checked_at` and `check_rc`.
+        exit 0  every check that RAN came back green
+        exit 1  at least one fact went `stale` (its check ran and went red)
+      A red check means THE FACT IS WRONG **OR THE CHECKER IS** — so `stale` is
+      a flag for a human/agent to adjudicate, never a verdict. Recall demotes a
+      stale fact and says so; it is never hidden, and NOTHING here deletes a
+      memory. A checker that could not RUN (timeout, command not found) is
+      `unknown`, NOT stale — an instrument failure and a false fact are the same
+      shape from the outside, and folding them together is how a janitor starts
+      deleting true facts. Checks run read-only, with a timeout (default 20s),
+      one at a time, under your own uid.
 
   5dive memory doctor [--roots=a,b] [--agent=<name>] [--code-root=<dir>] [--json]
       Hygiene pass over the memory store(s): index drift (MEMORY.md vs files on
@@ -272,7 +306,7 @@ function chunk(file) {
   const fm = /^---\n([\s\S]*?)\n---\n?/.exec(text);
   let front = "";
   // DIVE-1024 lifecycle envelope, parsed once per file and carried on each chunk.
-  let meta = { name: path.basename(file).replace(/\.md$/, ""), validTo: "", confidence: "", supersedes: "" };
+  let meta = { name: path.basename(file).replace(/\.md$/, ""), validTo: "", confidence: "", supersedes: "", checkStatus: "", checkedAt: "" };
   if (fm) {
     const desc = /^description:\s*["']?(.+?)["']?\s*$/m.exec(fm[1]); if (desc) front = desc[1].replace(/^>\s*/, "").trim();
     meta = {
@@ -280,6 +314,8 @@ function chunk(file) {
       validTo: fmField(fm[1], "valid_to"),
       confidence: fmField(fm[1], "confidence").toLowerCase(),
       supersedes: fmField(fm[1], "supersedes"),
+      checkStatus: fmField(fm[1], "check_status").toLowerCase(),
+      checkedAt: fmField(fm[1], "checked_at"),
     };
     text = text.slice(fm[0].length);
   }
@@ -307,6 +343,12 @@ function lifecycle(m) {
   if (m.validTo && m.validTo < TODAY) { mult *= 0.3; flags.push(`⚠ expired ${m.validTo}`); }
   if (superseded.has(m.name)) { mult *= 0.2; flags.push("⤴ superseded"); }
   const cm = CONF_MULT[m.confidence] ?? 1; if (cm < 1) { mult *= cm; flags.push(`confidence:${m.confidence}`); }
+  // DIVE-3885: a fact whose authored check went RED. Demoted and flagged, never
+  // hidden and never deleted — the check may be the thing that broke, not the
+  // fact. `unknown` (the checker could not run) is flagged at full rank: an
+  // instrument failure is not evidence about the claim.
+  if (m.checkStatus === "stale") { mult *= 0.4; flags.push(`⚠ check red${m.checkedAt ? ` ${m.checkedAt}` : ""}`); }
+  else if (m.checkStatus === "unknown") { flags.push("? check did not run"); }
   return { mult, flags };
 }
 if (!query) { console.error('usage: memory search "<query>"'); process.exit(2); }
@@ -476,9 +518,49 @@ DEDUPPY
   return 0
 }
 
+# _memory_check_validate <cmd> — DIVE-3885. A `check:` is executed UNATTENDED by
+# `memory check`, and its whole value is that it can go RED. Two refusals:
+#
+#  1. NOT READ-ONLY. The nightly pass runs these with the store owner's uid. A
+#     check that writes, deletes, escalates or pipes the network into a shell is
+#     a scheduled command with a memory file for a trigger.
+#  2. TRIVIALLY GREEN. `--check=true` satisfies the enforcement and re-derives
+#     nothing — the exact degeneracy that made `evidence:` 99% autostamp. An
+#     enforcement with a free-and-silent way to satisfy it enforces nothing.
+_memory_check_validate() {
+  local c="$1"
+  [ -n "$(printf '%s' "$c" | tr -d '[:space:]')" ] \
+    || fail "$E_VALIDATION" "--check is empty — it must be a command whose exit code re-derives the fact"
+  # 1. read-only
+  if printf '%s' "$c" | grep -qE '(^|[;&|[:space:]])(sudo|rm|rmdir|mv|dd|mkfs|shutdown|reboot|kill|pkill|truncate|chmod|chown|tee)([[:space:]]|$)'; then
+    fail "$E_VALIDATION" "--check must be READ-ONLY — it is run unattended by \`memory check\` (refused: writes/escalates)"
+  fi
+  # Redirection: silencing is fine, writing a file is not. Strip the shapes that
+  # produce no file (>/dev/null, >/dev/stderr, 2>&1) and refuse whatever `>` is
+  # left — that one has a path on the end of it.
+  local _redir; _redir="$(printf '%s' "$c" | sed -E 's/[0-9]?>>?[[:space:]]*\/dev\/(null|stdout|stderr)//g; s/[0-9]?>>?&[0-9-]//g')"
+  if printf '%s' "$_redir" | grep -q '>'; then
+    fail "$E_VALIDATION" "--check must be READ-ONLY — redirecting to a file is a write (>/dev/null 2>&1 is allowed if you only meant to silence it)"
+  fi
+  if printf '%s' "$c" | grep -qE '(curl|wget)[^|]*\|[[:space:]]*(ba)?sh'; then
+    fail "$E_VALIDATION" "--check must be READ-ONLY — piping a download into a shell is not a check"
+  fi
+  if printf '%s' "$c" | grep -qE '5dive[[:space:]]+(task|agent|memory)[[:space:]]+(done|add|cancel|start|send|kill|rm|reject|deliver)'; then
+    fail "$E_VALIDATION" "--check must be READ-ONLY — it must not drive the board or the fleet"
+  fi
+  # 2. cannot go red
+  local t; t="$(printf '%s' "$c" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+  case "$t" in
+    true|:|"exit 0"|true*\;*|echo*|printf*|cat*|"pwd"|"date"|"whoami"|"hostname")
+      fail "$E_VALIDATION" "--check '$t' can never go red — a check that cannot fail is not a check (it is the degeneracy that made \`evidence:\` 99% autostamp)" ;;
+  esac
+  return 0
+}
+
 _memory_add() {
   local name="" type="" desc="" store="mine" tags="" force=0 no_dedup=0
   local valid_to="" supersedes="" confidence="" provenance=""
+  local check="" no_check="" check_set=0 no_check_set=0
   local evidence=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -492,6 +574,8 @@ _memory_add() {
       --confidence=*)  confidence="${1#*=}" ;;
       --provenance=*)  provenance="${1#*=}" ;;
       --evidence=*)    evidence+=("${1#*=}") ;;
+      --check=*)       check="${1#*=}"; check_set=1 ;;
+      --no-check=*)    no_check="${1#*=}"; no_check_set=1 ;;
       --no-dedup)      no_dedup=1 ;;
       --force)         force=1 ;;
       -h|--help)       _memory_usage; return 0 ;;
@@ -532,6 +616,31 @@ _memory_add() {
           || fail "$E_VALIDATION" "--evidence url: wants an http(s) URL, got: ${_ev#url:}" ;;
     esac
   done
+  # DIVE-3885 checkability. A NEW authored field, deliberately not layered on
+  # --evidence: 595 of the 596 evidence blocks fleet-wide are the pipeline's
+  # `run:` autostamp, so anything built on that substrate starts from 12 rows.
+  # The lesson the census yields — a memory field with no WRITE-TIME
+  # enforcement converges to whatever the autostamp fills in, however well it is
+  # documented — is why this one refuses instead of merely offering.
+  if [ "$check_set" -eq 1 ] && [ "$no_check_set" -eq 1 ]; then
+    fail "$E_USAGE" "--check and --no-check are mutually exclusive — a fact either has a way to re-derive itself or a recorded reason it does not"
+  fi
+  [ "$check_set" -eq 1 ] && _memory_check_validate "$check"
+  if [ "$no_check_set" -eq 1 ]; then
+    # The opt-out is RECORDED, not free. A bare --no-check would be a second
+    # budget nobody watches; a reason in frontmatter makes the unchecked fact
+    # countable, which is the only reason the enforcement survives contact.
+    [ "${#no_check}" -ge 8 ] \
+      || fail "$E_VALIDATION" "--no-check needs a real reason (>= 8 chars) — it is written to frontmatter and counted"
+  fi
+  # ENFORCEMENT, scoped to the class of fact that rots: `reference` is a claim
+  # about the world outside this store (a path, a flag, a service, a limit), and
+  # it is the class a stale-check pass exists for. user/feedback/project facts
+  # and wiki pages are unchanged — widening this would just farm --no-check.
+  if [ "$store" = "mine" ] && [ "$type" = "reference" ] && [ "$check_set" -eq 0 ] && [ "$no_check_set" -eq 0 ]; then
+    fail "$E_USAGE" "a --type=reference fact needs --check='<cmd whose exit code re-derives it>', or --no-check=\"<why it cannot have one>\" to record the gap (DIVE-3885)"
+  fi
+
   [ -t 0 ] && fail "$E_USAGE" "memory add reads the body on stdin — pipe or heredoc it"
   local body; body=$(cat)
   [ -n "$(printf '%s' "$body" | tr -d '[:space:]')" ] || fail "$E_USAGE" "empty body on stdin — nothing to remember"
@@ -593,6 +702,8 @@ _memory_add() {
       [ -n "$confidence" ] && printf 'confidence: %s\n' "$confidence"
       [ -n "$valid_to" ]   && printf 'valid_to: %s\n' "$valid_to"
       [ -n "$supersedes" ] && printf 'supersedes: %s\n' "$supersedes"
+      [ -n "$check" ]      && printf 'check: "%s"\n' "$(printf '%s' "$check" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+      [ -n "$no_check" ]   && printf 'no_check: "%s"\n' "$(printf '%s' "$no_check" | sed 's/\\/\\\\/g; s/"/\\"/g')"
       [ -n "$provenance" ] && printf 'provenance: "%s"\n' "$(printf '%s' "$provenance" | sed 's/"/\\"/g')"
       _memory_emit_evidence "" ${evidence+"${evidence[@]}"}
       printf 'updated: %s\ncompiled_by: %s\n---\n\n%s\n' "$today" "$who" "$body"
@@ -604,6 +715,8 @@ _memory_add() {
       [ -n "$confidence" ] && printf '  confidence: %s\n' "$confidence"
       [ -n "$valid_to" ]   && printf '  valid_to: %s\n' "$valid_to"
       [ -n "$supersedes" ] && printf '  supersedes: %s\n' "$supersedes"
+      [ -n "$check" ]      && printf '  check: "%s"\n' "$(printf '%s' "$check" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+      [ -n "$no_check" ]   && printf '  no_check: "%s"\n' "$(printf '%s' "$no_check" | sed 's/\\/\\\\/g; s/"/\\"/g')"
       [ -n "$provenance" ] && printf '  provenance: "%s"\n' "$(printf '%s' "$provenance" | sed 's/"/\\"/g')"
       _memory_emit_evidence "  " ${evidence+"${evidence[@]}"}
       printf -- '---\n\n%s\n' "$body"
@@ -623,6 +736,177 @@ _memory_add() {
     [ "$store" = "wiki" ] && echo "  published to the shared wiki — fleet-searchable via: 5dive memory search --store=wiki"
   fi
   return 0
+}
+
+# ---- memory check (DIVE-3885) ----------------------------------------------
+#
+# Item 3 of the DIVE-3882 janitor plan: a `check:` whose EXIT CODE re-derives
+# the fact, plus a pass that flips `check_status: stale`.
+#
+# THE ROW'S GUARDRAIL, kept mechanical: a red check means the fact is wrong OR
+# the checker is. So this pass flips a FLAG and prints a digest. It never edits
+# a body, never deletes a file, and there is no --delete to add later. Recall
+# demotes a stale fact and says why; it still surfaces.
+#
+# And the second half of that guardrail, which is easier to get wrong: a checker
+# that could not RUN is `unknown`, not `stale`. A missing binary, a box without
+# the tool, a 20s timeout — those are instrument failures, and folding an
+# instrument failure into "the fact is false" is exactly how an automated
+# janitor starts retiring true facts.
+_memory_check() {
+  local roots="" store="all" agent="" timeout_s=20 write=0
+  local slugs=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --roots=*)   roots="${1#*=}" ;;
+      --store=*)   store="${1#*=}" ;;
+      --agent=*)   agent="${1#*=}" ;;
+      --slug=*)    slugs+=("${1#*=}") ;;
+      --timeout=*) timeout_s="${1#*=}" ;;
+      --write)     write=1 ;;
+      --json)      JSON_MODE=1 ;;
+      -h|--help)   _memory_usage; return 0 ;;
+      *)           fail "$E_USAGE" "memory check: unknown argument: $1" ;;
+    esac
+    shift
+  done
+  case "$store" in all|mine|wiki) : ;; *) fail "$E_VALIDATION" "bad --store '$store' (all | mine | wiki)" ;; esac
+  printf '%s' "$timeout_s" | grep -qE '^[0-9]+$' || fail "$E_VALIDATION" "--timeout must be whole seconds"
+  [ "$timeout_s" -gt 0 ] || fail "$E_VALIDATION" "--timeout must be > 0"
+  command -v python3 >/dev/null 2>&1 || fail "$E_GENERIC" "memory check needs python3"
+  local resolved; resolved=$(_memory_resolve_roots "$store" "$agent" "$roots")
+  [ -n "$resolved" ] || fail "$E_NOT_FOUND" "no memory roots to check (--roots/--store/--agent narrowed everything away)"
+
+  local out rc=0
+  out=$(FIVEDIVE_MC_TIMEOUT="$timeout_s" FIVEDIVE_MC_WRITE="$write" \
+        FIVEDIVE_MC_SLUGS="$(printf '%s\n' ${slugs+"${slugs[@]}"})" \
+        python3 - "$resolved" <<'MCPY'
+import json, os, re, subprocess, sys, datetime
+
+roots = [r for r in sys.argv[1].split(",") if r]
+timeout = int(os.environ.get("FIVEDIVE_MC_TIMEOUT", "20"))
+write = os.environ.get("FIVEDIVE_MC_WRITE") == "1"
+want = {s.strip().replace("_", "-") for s in os.environ.get("FIVEDIVE_MC_SLUGS", "").split("\n") if s.strip()}
+today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+FM = re.compile(r"\A---\n(.*?)\n---\n", re.S)
+
+def fm_field(front, key):
+    # Both layouts: top-level (wiki) and nested two-space under `metadata:` (own
+    # store). A quoted value may carry escaped quotes — a check IS shell text.
+    m = re.search(r'^[ \t]*%s:[ \t]*(.*?)[ \t]*$' % re.escape(key), front, re.M)
+    if not m:
+        return ""
+    v = m.group(1)
+    if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+        v = v[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    return v
+
+def files():
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, names in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for n in sorted(names):
+                if n.endswith(".md") and n not in ("MEMORY.md", "index.md"):
+                    yield os.path.join(dirpath, n)
+
+results = []
+for path in files():
+    try:
+        text = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        continue
+    m = FM.match(text)
+    if not m:
+        continue
+    front = m.group(1)
+    cmd = fm_field(front, "check")
+    if not cmd:
+        continue
+    slug = fm_field(front, "name") or fm_field(front, "title") or os.path.basename(path)[:-3]
+    if want and slug.replace("_", "-") not in want:
+        continue
+    # Read-only by construction at write time; still run with no stdin, in the
+    # store's dir, so a relative path in a check means something stable.
+    status, rc, detail = "unknown", None, ""
+    try:
+        proc = subprocess.run(["bash", "-c", cmd], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              timeout=timeout, cwd=os.path.dirname(path) or ".")
+        rc = proc.returncode
+        tail = proc.stdout.decode("utf-8", "replace").strip().splitlines()
+        detail = tail[-1][:200] if tail else ""
+        if rc == 0:
+            status = "fresh"
+        elif rc == 127:
+            # The checker itself is missing. That is an instrument failure and
+            # says nothing about the fact.
+            status, detail = "unknown", detail or "command not found"
+        else:
+            status = "stale"
+    except subprocess.TimeoutExpired:
+        status, detail = "unknown", "timed out after %ds" % timeout
+    except OSError as e:
+        status, detail = "unknown", str(e)
+
+    if write:
+        nested = re.search(r'^\s+check:', front, re.M) is not None
+        ind = "  " if nested else ""
+        new_front = front
+        for key, val in (("check_status", status), ("checked_at", today),
+                         ("check_rc", "" if rc is None else str(rc))):
+            line = "%s%s: %s" % (ind, key, val)
+            pat = re.compile(r'^[ \t]*%s:.*$' % re.escape(key), re.M)
+            if pat.search(new_front):
+                new_front = pat.sub(lambda _m, l=line: l, new_front, count=1)
+            else:
+                # Immediately after the `check:` line it belongs to, so the
+                # stamp travels with the field even in the nested layout.
+                ck = re.search(r'^[ \t]*check:.*$', new_front, re.M)
+                at = ck.end()
+                new_front = new_front[:at] + "\n" + line + new_front[at:]
+        try:
+            open(path, "w", encoding="utf-8").write("---\n" + new_front + "\n---\n" + text[m.end():])
+        except OSError as e:
+            detail = (detail + " | ").strip() + "could not stamp: %s" % e
+    results.append({"slug": slug, "file": path, "status": status,
+                    "rc": rc, "cmd": cmd, "detail": detail})
+
+print(json.dumps(results))
+MCPY
+) || fail "$E_GENERIC" "memory check: the pass failed to run"
+
+  local n_total n_fresh n_stale n_unknown
+  n_total=$(printf '%s' "$out" | jq 'length')
+  n_fresh=$(printf '%s' "$out" | jq '[.[]|select(.status=="fresh")]|length')
+  n_stale=$(printf '%s' "$out" | jq '[.[]|select(.status=="stale")]|length')
+  n_unknown=$(printf '%s' "$out" | jq '[.[]|select(.status=="unknown")]|length')
+
+  if (( JSON_MODE )); then
+    printf '%s' "$out" | jq -c --argjson w "$write" \
+      '{ok:true, data:{written:($w==1), total:length, fresh:[.[]|select(.status=="fresh")]|length,
+        stale:[.[]|select(.status=="stale")]|length, unknown:[.[]|select(.status=="unknown")]|length,
+        results:.}}'
+  else
+    if [ "$n_total" -eq 0 ]; then
+      echo "memory check: no atom in these roots carries a check: — nothing to re-derive"
+      echo "  authored checks are written at compile time: 5dive memory add --check='<cmd>'"
+      return 0
+    fi
+    printf '%s' "$out" | jq -r '.[] | (if .status=="fresh" then "✓ fresh   " elif .status=="stale" then "✗ STALE   " else "? unknown " end) + .slug + (if .detail=="" then "" else "  — " + .detail end)'
+    echo
+    echo "memory check: $n_total checked · $n_fresh fresh · $n_stale stale · $n_unknown unknown$([ "$write" -eq 1 ] && echo " (stamped)" || echo " (dry-run — --write to stamp)")"
+    [ "$n_stale" -gt 0 ] && echo "  a STALE fact may be wrong, or its CHECK may be. Adjudicate it — nothing here deletes a memory."
+    [ "$n_unknown" -gt 0 ] && echo "  UNKNOWN = the checker could not run. That is an instrument failure, not evidence about the fact."
+  fi
+  # A stale fact is a RESULT, not a crash. Without mark_reported the EXIT
+  # backstop in lib/output.sh prints "exited 1 without reporting a reason … this
+  # is a bug in the CLI" over a digest that already said exactly what happened —
+  # and a nightly cron would read that banner instead of the finding.
+  if [ "$n_stale" -gt 0 ]; then rc=1; mark_reported; fi
+  return "$rc"
 }
 
 # ---- memory hygiene (DIVE-991) ---------------------------------------------
@@ -1290,7 +1574,8 @@ _memory_consolidate() {
           --name="$a_name" --type="$a_type" --description="$a_desc" \
           --confidence="$a_conf" \
           --provenance="distilled from session $sid ($(date -u +%F))" \
-          --evidence="run:$sid" ) 2>&1) || addrc=$?
+          --evidence="run:$sid" \
+          --no-check="auto-distilled by memory consolidate — no author present to write a check (DIVE-3885)" ) 2>&1) || addrc=$?
       if [ "$addrc" -eq 0 ]; then
         n_written=$((n_written+1))
         written_files+=("$dir/${a_type}_$(printf '%s' "$a_name" | tr '-' '_').md")
@@ -1656,6 +1941,7 @@ cmd_memory() {
     get|fetch)   _memory_get "$@" ;;
     router)      _memory_router "$@" ;;
     add|compile) _memory_add "$@" ;;
+    check)       _memory_check "$@" ;;
     doctor|hygiene) _memory_doctor "$@" ;;
     consolidate|distill) _memory_consolidate "$@" ;;
     ""|-h|--help) _memory_usage ;;

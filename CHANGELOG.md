@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased — feat(memory): `check:` — a checkable fact says how to re-check itself, and `add` will not let it skip (DIVE-3885)
+
+Item 3 of the memory-janitor plan is a `check:` whose exit code re-derives a fact, plus a pass that
+flips it stale. It looked buildable on the existing `--evidence=<kind>:<ref>`: `cmd:` *is* a check,
+`file:` *is* a `test -f`. The fleet census on 2026-09-01 (2,651 atoms, 9 stores) says otherwise —
+596 atoms carry an evidence block, and **595 of them are `run:<session id>`, stamped automatically
+by the consolidate pipeline. Twelve hand-authored refs exist fleet-wide.** The same shape shows in
+the lifecycle envelope: `confidence:` (fillable by the pipeline) has heavy adoption; `valid_to:` is
+at **zero** and `supersedes:` at ~zero, because both need an author to know something at write time.
+
+**The rule that yields: a memory field with no write-time enforcement converges to whatever the
+autostamp fills in, however well it is documented.** So checkability is a NEW authored field, and
+`memory add` enforces it where the fact is written rather than merely offering it.
+
+- **`memory add --check='<cmd>'`** — a read-only shell command whose EXIT CODE re-derives the fact.
+- **`--no-check="<why>"`** — the opt-out, and it is *recorded*: the reason lands in frontmatter as
+  `no_check:`, so an unchecked fact is countable rather than merely absent. A bare or stub reason is
+  refused. `memory consolidate` passes it explicitly, so the pipeline's inability to author a check
+  is visible in the store instead of silently becoming the norm.
+- **`--type=reference` requires one of the two.** That is the class of fact that rots — a claim
+  about the world outside the store. Every other type, and the wiki store, is unchanged.
+- **Two refusals keep the field from degenerating.** A check that cannot go red (`true`, `:`, a bare
+  `echo`) is refused — an enforcement satisfiable by `--check=true` is the `evidence:` degeneracy
+  rebuilt. A check that is not read-only (writes, `sudo`, `rm`, `curl | sh`, driving the board, a
+  redirect to a file) is refused — the pass runs these unattended. `>/dev/null 2>&1` stays legal.
+- **`5dive memory check [--write]`** — runs every authored check, dry-run by default. Green is
+  `fresh`; red is `stale`; and **a checker that could not RUN (timeout, command not found) is
+  `unknown`, not stale** — an instrument failure and a false fact look identical from the outside,
+  and folding them together is how an automated janitor starts retiring true facts.
+- **Nothing here deletes.** A red check means the fact is wrong OR the checker is, so `stale` is a
+  flag for a person to adjudicate. Recall demotes a stale atom 0.4x and prints `⚠ check red <date>`;
+  it still surfaces. There is no `--delete`, and no LLM holds that key.
+
+`tests/memory_check_field_unit.sh` (54 assertions) is mostly negative controls, including a live
+arm through the built binary — that arm is what caught the stale exit code being printed as
+"this is a bug in the CLI" by the `lib/output.sh` backstop, which would have buried the digest a
+nightly pass exists to produce.
+
 ## Unreleased — fix(supervisor): a lapsed refusal is scrollback, not a wall — `agent info` reads the expiry it was already quoting (DIVE-3880)
 
 `agent info` printed **⚠ NOT TRANSACTING (quota-exhausted)** about a seat that was executing the very
