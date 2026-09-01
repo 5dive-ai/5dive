@@ -37,6 +37,12 @@ ok()   { PASS=$((PASS+1)); echo "  ok   — $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "  FAIL — $1"; }
 check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (want '$3', got '$2')"; fi; }
 
+# DIVE-3885: `--type=reference` now requires a checkability decision at write
+# time (--check=<cmd> or a recorded --no-check=<why>). These fixtures exercise
+# evidence + dedup, not checkability, so they take the RECORDED opt-out — which
+# is itself the point of that field: an unchecked fact is countable, not absent.
+NC=(--no-check='DIVE-3106 evidence/dedup fixture — no real-world fact to re-derive')
+
 # Isolated fake agent home so `--store=mine` resolves here and nothing touches
 # the real store. _memory_add picks the dir that already has a MEMORY.md.
 STORE="$TMP/home/.claude/projects/proj/memory"
@@ -51,7 +57,7 @@ instance declines to dispatch instead of claiming queued rows and firing real
 customer hetzner builds against the production database.'
 
 echo "── evidence back-refs (own store) ──"
-printf '%s\n' "$BODY_A" | add --name=ev-one --type=reference \
+printf '%s\n' "$BODY_A" | add --name=ev-one --type=reference "${NC[@]}" \
   --description="advisory lock on the provision queue" \
   --evidence=file:src/cmd_memory.sh:586 --evidence=task:DIVE-3106 \
   --evidence="cmd:5dive task show DIVE-3106" >/dev/null 2>&1
@@ -66,27 +72,27 @@ check "all three refs, in order" "$(grep -c '^    - "' "$F")" "3"
 
 echo "── --evidence validation refuses a ref that could not be walked ──"
 for badref in "notakind:x" "file:" "task:dive-3106" "task:DIVE" "sha:zzzz" "url:ftp://x/y" "bare-string"; do
-  printf '%s\n' "$BODY_A" | add --name=ev-bad --type=reference --description=d \
+  printf '%s\n' "$BODY_A" | add --name=ev-bad --type=reference "${NC[@]}" --description=d \
     --evidence="$badref" >/dev/null 2>&1
   [ "$?" -ne 0 ] && ok "refused --evidence=$badref" || bad "refused --evidence=$badref"
 done
 [ -f "$STORE/reference_ev_bad.md" ] && bad "refusal wrote no file" || ok "refusal wrote no file"
 for goodref in "file:a/b.ts" "task:DIVE-1" "sha:40fdcbf" "url:https://x/y" "run:abc123" "cmd:echo hi"; do
-  printf '%s\n' "$BODY_A" | add --name=ev-ok --type=reference --description=d \
+  printf '%s\n' "$BODY_A" | add --name=ev-ok --type=reference "${NC[@]}" --description=d \
     --evidence="$goodref" --force --no-dedup >/dev/null 2>&1
   [ "$?" -eq 0 ] && ok "accepted --evidence=$goodref" || bad "accepted --evidence=$goodref"
 done
 
 echo "── ADDITIVE: no --evidence ⇒ no evidence key at all (negative control) ──"
 printf 'A wholly unrelated fact about caddy reverse proxy ports and shelld.\n' \
-  | add --name=ev-none --type=reference --description="nothing cited here" >/dev/null 2>&1
+  | add --name=ev-none --type=reference "${NC[@]}" --description="nothing cited here" >/dev/null 2>&1
 grep -qE '^ *evidence:' "$STORE/reference_ev_none.md" \
   && bad "absent --evidence leaves NO evidence key" || ok "absent --evidence leaves NO evidence key"
 grep -q '^  provenance:' "$STORE/reference_ev_none.md" \
   && bad "no provenance key when unset" || ok "no provenance key when unset"
 
 echo "── --provenance is untouched and coexists with --evidence ──"
-printf '%s\n' "$BODY_A" | add --name=ev-both --type=reference --description=d \
+printf '%s\n' "$BODY_A" | add --name=ev-both --type=reference "${NC[@]}" --description=d \
   --provenance="measured by main 2026-08-09" --evidence=task:DIVE-3106 \
   --no-dedup >/dev/null 2>&1
 grep -q '^  provenance: "measured by main 2026-08-09"$' "$STORE/reference_ev_both.md" \
@@ -96,7 +102,7 @@ grep -q '^    - "task:DIVE-3106"$' "$STORE/reference_ev_both.md" \
 
 echo "── write-time dedup: WARNS, and still writes (advisory, never refuses) ──"
 ERR="$TMP/err.txt"
-printf '%s\n' "$BODY_A" | add --name=ev-dup --type=reference \
+printf '%s\n' "$BODY_A" | add --name=ev-dup --type=reference "${NC[@]}" \
   --description="a near copy of ev-one" >/dev/null 2>"$ERR"
 check "near-duplicate add still exits 0" "$?" "0"
 [ -f "$STORE/reference_ev_dup.md" ] && ok "near-duplicate STILL WRITTEN" || bad "near-duplicate STILL WRITTEN"
@@ -106,22 +112,22 @@ grep -q 'reference_ev_one.md' "$ERR" && ok "names the overlapping file" || bad "
 echo "── dedup negative control: a distinct body warns about nothing ──"
 printf 'Caddy terminates tls on 443 and shelld owns the ssh recovery path for a
 locked out box; unrelated vocabulary throughout this particular sentence.\n' \
-  | add --name=ev-distinct --type=reference --description=d >/dev/null 2>"$ERR"
+  | add --name=ev-distinct --type=reference "${NC[@]}" --description=d >/dev/null 2>"$ERR"
 grep -q 'near-duplicate' "$ERR" && bad "no warning on a distinct body" || ok "no warning on a distinct body"
 
 echo "── --no-dedup silences the warning ──"
-printf '%s\n' "$BODY_A" | add --name=ev-dup2 --type=reference --description=d \
+printf '%s\n' "$BODY_A" | add --name=ev-dup2 --type=reference "${NC[@]}" --description=d \
   --no-dedup >/dev/null 2>"$ERR"
 grep -q 'near-duplicate' "$ERR" && bad "--no-dedup silences" || ok "--no-dedup silences"
 
 echo "── --force update-in-place must not match ITSELF ──"
-printf '%s\n' "$BODY_A" | add --name=ev-one --type=reference --description=d \
+printf '%s\n' "$BODY_A" | add --name=ev-one --type=reference "${NC[@]}" --description=d \
   --force >/dev/null 2>"$ERR"
 grep -q 'reference_ev_one.md' "$ERR" && bad "self not reported as its own dup" || ok "self not reported as its own dup"
 
 echo "── REGRESSION: the secret tripwire still refuses, --force does not bypass ──"
 printf 'the token is sk-abcdefghijklmnop and it is live\n' \
-  | add --name=ev-secret --type=reference --description=d --force >/dev/null 2>&1
+  | add --name=ev-secret --type=reference "${NC[@]}" --description=d --force >/dev/null 2>&1
 [ "$?" -ne 0 ] && ok "tripwire still refuses (with --force)" || bad "tripwire still refuses (with --force)"
 
 echo "── wiki store: evidence is TOP-LEVEL, not nested ──"
