@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased — fix(supervisor): a lapsed refusal is scrollback, not a wall — `agent info` reads the expiry it was already quoting (DIVE-3880)
+
+`agent info` printed **⚠ NOT TRANSACTING (quota-exhausted)** about a seat that was executing the very
+command that read the flag. Measured 2026-09-01 14:17Z on `ops`: the pane refusal it quoted said
+*"continuing automatically at 2:10pm"* — **it was 14:17, the wall had lifted at 14:10.** Same tick, same
+predicate, `quinn` at *"3pm"*: genuinely frozen, 43 minutes still to run. One string, two right answers,
+and the line does not merely report — it instructs (*"reassign or park the queue"*), so a false positive
+moves live work off a healthy seat.
+
+The discriminator was **already inside the string being parsed**. No new probe, no new emission:
+
+- **deadline in the FUTURE** → the refusal is live; classify and warn exactly as before.
+- **deadline in the PAST** → stale scrollback; the seat resumed. No verdict, so the reassign-the-queue
+  WARNING does not fire — but the line still SAYS an alarm was dropped and names the expiry, because a
+  silently-downgraded alarm and a seat that was never flagged must not print identically.
+- **no parseable deadline** → **UNKNOWN, an abstention.** DIVE-3272's classification stands untouched:
+  `credit balance is too low`, `insufficient_quota`, a weekly `7d: 100%` carry no time at all and are real,
+  indefinite freezes. Unknown never resolves to either of the other two, in either direction.
+
+Applied at both readers, because they go stale independently: the tick (a lapsed excerpt no longer
+classifies, so no board row, no fleet-health alert, no DIVE-3822 profile rotation on a seat that already
+came back) and `agent info` itself, which re-derives the state at PRINT time against its own clock — the
+recorded row is genuinely current, so recency-vs-the-tick cannot catch this. The signature we read stays on
+the row whatever the deadline says: "we read a refusal" and "it still holds" are different facts.
+
+Undated pane lines resolve to the NEAREST of yesterday/today/tomorrow at that time-of-day, so `12:30am` read
+at 23:55 is tomorrow and `11pm` read at 00:05 is yesterday. Residual, stated rather than hidden: a refusal
+still on screen more than ~12h later reads as the same time-of-day today.
+
 ## Unreleased — fix(task): a merged row that NO seat could close — the merge gate now reads the proof it already asks for (DIVE-3823)
 
 Two rails, each correct, that intersect on a seat which can satisfy neither:
