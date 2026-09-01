@@ -294,5 +294,106 @@ TASKS_DB="$TMPD/does-not-exist.db"
 t   "join: unreadable store degrades to unmeasured through the I/O half" \
     "unmeasured" "$(f .output "$(sup_info_for_agent seatx)")"
 
+# --- 13. DIVE-3880: THE MEASURED FALSE POSITIVE ------------------------------
+#     2026-09-01 14:17Z, `5dive agent info ops`, run FROM agent-ops mid-turn:
+#
+#       state: active / enabled · ⚠ NOT TRANSACTING (quota-exhausted: pane shows
+#              a model-capacity refusal: ● Usage limit reached · continuing
+#              automatically at 2:10pm · esc or type)
+#
+#     It was 14:17 and the refusal it quotes expired at 14:10. The row is
+#     CURRENT — §4's staleness check cannot see this, because the reading was
+#     true when the tick wrote it and a pane goes on rendering a lapsed refusal
+#     after the seat resumes. The discriminator is inside the string being
+#     quoted, so it is re-derived here against THIS call's `now`.
+#
+#     The consumer is what makes a false positive expensive: cmd_agent.sh keys
+#     its "reassign or park the queue" WARNING off `.verdict`, so a stale scrape
+#     moves live work off a healthy seat.
+QNOW=$(date -d '2026-09-01 14:17:00' +%s)
+qd() {  # <deadline-phrase>  -> a CURRENT quota row carrying that refusal
+  s true $((QNOW-60)) $((QNOW-61)) "$QNOW" quota-exhausted quota-exhausted \
+    "pane shows a model-capacity refusal: ● Usage limit reached · $1 · esc or type" 2 0
+}
+LAPSED=$(qd 'continuing automatically at 2:10pm')
+t   "3880 lapsed: NO verdict — the WARNING that reassigns a queue must not fire" \
+    "null" "$(f '.verdict|tostring' "$LAPSED")"
+t   "3880 lapsed: the class is a THIRD value, not healthy and not the alarm" \
+    "quota-lapsed" "$(f .classification "$LAPSED")"
+t   "3880 lapsed: quotaDeadline names which state this rests on" "lapsed" \
+    "$(f .quotaDeadline "$LAPSED")"
+tnc "3880 lapsed: the state line does not claim NOT TRANSACTING" \
+    "NOT TRANSACTING" "$(f .stateNote "$LAPSED")"
+tc  "3880 lapsed: but it SAYS an alarm was dropped, and why" "LAPSED at" \
+    "$(f .stateNote "$LAPSED")"
+tc  "3880 lapsed: the reading itself is still shown, not deleted" \
+    "Usage limit reached" "$(f .line "$LAPSED")"
+t   "3880 lapsed: the row is genuinely CURRENT — §4's check cannot catch this" \
+    "true" "$(f '.fromCurrentTick|tostring' "$LAPSED")"
+t   "3880 lapsed: the measured output half is untouched by the downgrade" "ok" \
+    "$(f .output "$LAPSED")"
+
+# quinn, same tick, same predicate, 43 minutes still to run: genuinely frozen.
+LIVE=$(qd 'continuing automatically at 3pm')
+t   "3880 live: the verdict stands — this seat IS walled" "quota-exhausted" \
+    "$(f .verdict "$LIVE")"
+t   "3880 live: quotaDeadline=live" "live" "$(f .quotaDeadline "$LIVE")"
+tc  "3880 live: state line still NOT TRANSACTING" "NOT TRANSACTING (quota-exhausted" \
+    "$(f .stateNote "$LIVE")"
+
+# The abstention. A refusal with no parseable deadline must NOT be cleared —
+# `credit balance is too low` / `insufficient_quota` / a weekly 100% are real,
+# indefinite freezes and carry no time at all. UNKNOWN is not a third verdict
+# here, it is a refusal to answer the deadline question: DIVE-3272's reading
+# stands exactly as it did, and nothing claims the refusal is confirmed live.
+UNK=$(s true $((QNOW-60)) $((QNOW-61)) "$QNOW" quota-exhausted quota-exhausted \
+        "pane shows a model-capacity refusal: credit balance is too low" 2 0)
+t   "3880 unknown: verdict PRESERVED — an abstention is not a clear" \
+    "quota-exhausted" "$(f .verdict "$UNK")"
+t   "3880 unknown: and it is labelled unknown, never live" "unknown" \
+    "$(f .quotaDeadline "$UNK")"
+t   "3880 unknown: classification unchanged from DIVE-3272" "quota-exhausted" \
+    "$(f .classification "$UNK")"
+
+# DIVE-3880 it.2, the info side of quinn's rejection. `info` re-derives from the
+# ONE excerpt the tick recorded, so its answer is only as good as which line the
+# tick picked. With `_sup_quota_match` fixed to prefer a still-future deadline
+# over the oldest match, the excerpt a two-refusal window hands `info` is the
+# LIVE one — and the drill-down keeps the alarm instead of clearing it off the
+# lapsed scrollback above it. (This arm asserts the CONSUMER of that choice; the
+# choice itself is graded in supervisor_classify_unit.sh.)
+TWO=$(qd 'continuing automatically at 3pm')
+t   "3880 it.2 info: the live line inherited from a two-refusal window still flags" \
+    "quota-exhausted" "$(f .verdict "$TWO")"
+# And the residual, stated as an arm rather than only in prose: once that same
+# 3pm wall passes, the drill-down clears — correctly, because the seat resumed.
+AFTER=$(s true $((QNOW+3000)) $((QNOW+2999)) $((QNOW+3060)) quota-exhausted quota-exhausted \
+          "pane shows a model-capacity refusal: ● Usage limit reached · continuing automatically at 3pm" 2 0)
+t   "3880 it.2 info: past its own deadline the same excerpt re-derives lapsed" \
+    "quota-lapsed" "$(f .classification "$AFTER")"
+
+# A NON-quota class must not grow a deadline field at all.
+t   "3880: quotaDeadline is null when the class is not a quota reading" "null" \
+    "$(f '.quotaDeadline|tostring' "$DRY")"
+
+# Day rollover through the real renderer, not just the parser: an undated pane
+# line read at 23:55 naming 12:30am is TOMORROW, and the seat is still walled.
+RNOW=$(date -d '2026-09-01 23:55:00' +%s)
+ROLL=$(s true $((RNOW-60)) $((RNOW-61)) "$RNOW" \
+         quota-exhausted quota-exhausted \
+         "pane shows a model-capacity refusal: ● Usage limit reached · continuing automatically at 12:30am" 2 0)
+t   "3880 rollover: a past-midnight deadline read at 23:55 is still LIVE" \
+    "quota-exhausted" "$(f .verdict "$ROLL")"
+
+# The lapse must NOT swallow the measured half's own alarm: a lapsed refusal on
+# a seat that is ALSO 4 days dry still reports no-output, because that half is
+# measured here and owes nothing to the pane.
+LAPSED_DRY=$(s true $((QNOW-60)) $((QNOW-61)) "$QNOW" quota-exhausted quota-exhausted \
+               "pane shows a model-capacity refusal: continuing automatically at 2:10pm" 20 4)
+t   "3880: a lapsed quota row on a DRY seat still reports the measured drought" \
+    "no-output" "$(f .verdict "$LAPSED_DRY")"
+t   "3880: and the dropped quota alarm is still named on the same line" "quota-lapsed" \
+    "$(f .classification "$LAPSED_DRY")"
+
 echo "-- $PASS passed, $FAIL failed --"
 (( FAIL == 0 ))

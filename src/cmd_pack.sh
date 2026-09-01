@@ -2592,6 +2592,30 @@ cmd_import() {
   fi
 
   # Optional template/ bootstrap → a FRESH project dir only (never overlay).
+  # DIVE-3881: resolve the workdir the agent ACTUALLY has, not the one the pack
+  # remembered. A manifest's `config.workdir` is null for every agent that was
+  # never given an explicit --workdir — i.e. every agent on DEFAULT_WORKDIR,
+  # which is the normal way agents are created. So `$workdir` is empty on the
+  # COMMON path, and the memory seeding below is guarded on it: a pack carrying
+  # 50 distilled facts seeded none and the import still returned success (lodar,
+  # dashboard export->import, 2026-09-01).
+  #
+  # The registry is the right source and this is the right MOMENT to read it:
+  # cmd_create has already run, so the agent's workdir is a fact rather than a
+  # guess, and it stays correct even if DEFAULT_WORKDIR later moves. Same read as
+  # the clone path in cmd_agent_runtime.sh. The `// $d` fallback covers the
+  # ordinary case where create recorded no explicit workdir at all.
+  local eff_workdir="$workdir"
+  if [[ -z "$eff_workdir" ]]; then
+    eff_workdir=$(jq -r --arg n "$as" --arg d "$DEFAULT_WORKDIR" \
+      '.agents[$n].workdir // $d' <<<"$(registry_read)" 2>/dev/null) || eff_workdir=""
+    [[ -n "$eff_workdir" && "$eff_workdir" != "null" ]] || eff_workdir="$DEFAULT_WORKDIR"
+  fi
+
+  # Deliberately still on $workdir, not $eff_workdir: an overlay WRITES files, and
+  # pointing it at a resolved default would let a pack lay a template into a shared
+  # projects dir nobody asked it to touch. Seeding memory into the new agent's own
+  # config dir has no such reach. Widening this is its own decision, not this fix.
   local templated="none"
   if [[ -d "$stage/template" && -n "$workdir" ]]; then
     if [[ ! -e "$workdir" ]]; then
@@ -2604,27 +2628,47 @@ cmd_import() {
   fi
 
   # Seed distilled persona memory into the new agent's project memory dir. Memory
-  # is keyed by project slug (the encoded workdir), so we can only place it when a
-  # workdir is known; otherwise report it skipped rather than drop it somewhere
-  # the agent won't read.
+  # is keyed by project slug (the encoded workdir), which is why this needs a
+  # workdir at all — see the DIVE-3881 resolution above for why the manifest's own
+  # value is not one on the common path.
   local mem_seeded="none"
   if [[ "$mem_inc" != "false" && -d "$stage/memory" ]]; then
-    if [[ -n "$workdir" ]]; then
-      local slug mdir
-      slug=$(printf '%s' "$workdir" | sed 's#/#-#g')
+    if [[ -n "$eff_workdir" ]]; then
+      local slug mdir packed landed
+      slug=$(printf '%s' "$eff_workdir" | sed 's#/#-#g')
       mdir="$cdir/projects/${slug}/memory"
+      packed=$(find "$stage/memory" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l)
       install -d -o "agent-${as}" -g "agent-${as}" "$mdir" 2>/dev/null || true
       cp "$stage"/memory/*.md "$mdir/" 2>/dev/null || true
       chown -R "agent-${as}:agent-${as}" "$cdir/projects" 2>/dev/null || true
-      mem_seeded="$mdir"
+      landed=$(find "$mdir" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l)
+      # DIVE-3881 (fix B): COUNT what landed instead of assuming the cp worked.
+      # Every write above is `|| true`, so before this the reported path was an
+      # intention, not an outcome — the one string a reader would use to decide
+      # the memory arrived was true even when nothing was written.
+      if (( landed > 0 )); then
+        mem_seeded="$mdir ($landed of $packed facts)"
+      else
+        mem_seeded="FAILED (0 of $packed facts reached $mdir)"
+      fi
       # DIVE-2568: on a claude seat the store IS the loading mechanism; elsewhere
       # it is only the searchable one, and the inline above is what puts the facts
       # in front of the model. Say which happened rather than leaving the reader
       # to infer it from the type.
-      [[ "$mem_effect" == "none" && "$type" == "claude" ]] && mem_effect="auto-loaded from $mdir"
+      [[ "$mem_effect" == "none" && "$type" == "claude" && $landed -gt 0 ]] && mem_effect="auto-loaded from $mdir"
     else
       mem_seeded="skipped (no workdir to resolve the memory slug)"
     fi
+  fi
+
+  # DIVE-3881 (fix B): a pack that CARRIES memory and seeds none must not read as
+  # a plain success. The workdir-null bug survived to a customer because the skip
+  # had no voice: it appeared only inside the ok line's parenthetical and in the
+  # --json `memorySeeded` field, and the API lifts neither. A warn is on stderr,
+  # is not the success sentence, and is what a caller relaying output will show.
+  if [[ "$mem_inc" != "false" && -d "$stage/memory" ]] \
+     && [[ "$mem_seeded" == skipped* || "$mem_seeded" == FAILED* ]]; then
+    warn "this pack carries memory and NONE of it was seeded — $mem_seeded. The agent imported, but the facts you exported are not on it; re-run the import with an explicit --workdir=<path>, or copy the pack's memory/*.md into that agent's project memory dir by hand."
   fi
 
   # Re-add skills best-effort. Config packs record refs, not bodies, so skills not
