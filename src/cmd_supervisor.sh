@@ -332,13 +332,56 @@ _sup_verify_challenge() {  # <type> <user> <sess> <svc_running>
   printf '%s\n' "$pane" | _sup_verify_match
 }
 
-# DIVE-3272: pure signature match, no I/O — echoes the first pane line that looks
-# like a model-capacity/quota refusal, empty otherwise. Split out from
+# DIVE-3272: pure signature match, no I/O — echoes ONE pane line that looks like
+# a model-capacity/quota refusal, empty otherwise. Split out from
 # _sup_quota_pane for the same reason _sup_verify_match is: the false-positive-
 # critical regex has to be unit-testable without a live tmux.
-_sup_quota_match() {  # <pane-text-on-stdin>
-  grep -iE "${_SUP_QUOTA_PAT}|${_SUP_WEEKLY_QUOTA_PAT}" 2>/dev/null | head -1 \
-    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-160
+#
+# DIVE-3880 it.2: WHICH matching line is returned is now load-bearing, so the
+# selection is part of this function rather than a `head -1`. Before 3880 any
+# match meant the same thing (alarm) and picking the first was cosmetic; once a
+# `lapsed` deadline DISARMS the alarm, choosing the oldest line lets a seat that
+# hit the wall, resumed, and hit it AGAIN inside one pane window report healthy
+# while genuinely frozen — the excerpt, not the state machine, carrying the
+# false negative. Quota-pressured seats are the only population this detector
+# has, so two refusals in a 40-line window is the expected shape.
+#
+# The window is a SEQUENCE, and it is aggregated, not sampled:
+#
+#   1. Any match whose deadline is still in the FUTURE wins outright (the
+#      latest such deadline). A future expiry printed by the harness itself is
+#      unarguable proof the wall is still in force, wherever in the window it
+#      sits — so the window can only lapse when EVERY timed match has lapsed.
+#   2. Otherwise the LAST match wins — the newest refusal, which supersedes the
+#      scrollback above it. Its own state (lapsed, or unknown when it carries no
+#      parseable deadline) is the window's state.
+#
+# Why the newest and not "any unknown pins the alarm": an untimed signature
+# (a transient `API Error ... 429`, an older `credit balance is too low`) also
+# keeps rendering forever, so treating one anywhere in the window as an
+# indefinite freeze re-opens the exact stale-scrollback false positive DIVE-3880
+# exists to close. A seat that IS indefinitely frozen re-emits — the pane is
+# live evidence and the tick re-reads it — so its newest line says so.
+#
+# `now` is an ARGUMENT (never read internally) so every arm is assertable at a
+# fixed clock, same contract as _sup_quota_deadline, which this calls.
+_sup_quota_match() {  # <pane-text-on-stdin> [now_epoch]
+  local now="${1:-}"
+  [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
+  local matches
+  matches=$(grep -iE "${_SUP_QUOTA_PAT}|${_SUP_WEEKLY_QUOTA_PAT}" 2>/dev/null \
+    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-160)
+  [[ -n "$matches" ]] || return 0
+  local line st ep last="" live="" live_ep=-1
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    last="$line"
+    IFS=$'\x1f' read -r st ep <<<"$(_sup_quota_deadline "$line" "$now")"
+    if [[ "$st" == "live" && "$ep" =~ ^[0-9]+$ ]] && (( ep > live_ep )); then
+      live_ep="$ep"; live="$line"
+    fi
+  done <<<"$matches"
+  printf '%s\n' "${live:-$last}"
 }
 
 # DIVE-3880: the pane KEEPS RENDERING a lapsed refusal, so the signature alone
@@ -360,6 +403,13 @@ _sup_quota_match() {  # <pane-text-on-stdin>
 #
 # Pure: `now` is an ARGUMENT, never `date +%s` read internally, so every arm is
 # assertable at a fixed clock. Echoes "<state>\x1f<deadline-epoch|>".
+#
+# INVARIANT (DIVE-3880 it.2): the input is ONE pane line — the single excerpt
+# _sup_quota_match selected, or the single one `info` inherited from the trail.
+# Aggregating a WINDOW of several refusals is that function's job, deliberately
+# not this one's: this parses, it does not choose. So the first-match-wins read
+# below is over one refusal, and the "which of several lines" question — the one
+# it.1 got wrong — is answered exactly once, upstream.
 #
 # Which of three candidate days: the NEAREST to `now` (yesterday / today /
 # tomorrow at that time-of-day). A pane line is undated, so a bare `12:30am`
@@ -410,13 +460,26 @@ _sup_quota_deadline_hm() {  # <epoch>
 # (false-negative bias, like every other probe here). Deliberately NOT
 # claude-only — the incident seat was a qwen profile, and a quota wall is the one
 # failure every runtime shares.
-_sup_quota_pane() {  # <user> <sess> <svc_running>
+# The root tmux hop, split out from _sup_quota_pane (DIVE-3880 it.2) so the
+# forwarding below is reachable from a unit test. Everything ungradable lives
+# here — the EUID gate, the sudo, the capture — and it is the ONE thing a test
+# stubs; before the split a stub had to replace _sup_quota_pane whole, which
+# took the `now` argument out of the graded path with it (measured: dropping
+# `"$now"` from the call below survived every arm).
+_sup_quota_pane_capture() {  # <user> <sess> <svc_running>
   local user="$1" sess="$2" svc_running="$3"
   (( svc_running )) && [[ $EUID -eq 0 ]] || return 0
-  local pane
-  pane=$(sudo -n -u "$user" tmux capture-pane -p -t "$sess" -S "-${_SUP_QUOTA_PANE_LINES}" 2>/dev/null) || return 0
+  sudo -n -u "$user" tmux capture-pane -p -t "$sess" -S "-${_SUP_QUOTA_PANE_LINES}" 2>/dev/null || return 0
+}
+
+_sup_quota_pane() {  # <user> <sess> <svc_running> [now_epoch]
+  local pane=""
+  pane=$(_sup_quota_pane_capture "$1" "$2" "$3") || return 0
   [[ -n "$pane" ]] || return 0
-  printf '%s\n' "$pane" | _sup_quota_match
+  # DIVE-3880 it.2: `now` is forwarded because the SELECTION among several
+  # matching lines is clock-dependent (a still-future deadline outranks the
+  # newest line). Same tick clock the classifier is handed, never a second read.
+  printf '%s\n' "$pane" | _sup_quota_match "${4:-}"
 }
 
 # DIVE-3272: the OUTPUT signal — the one thing no probe above measures, read from
@@ -1123,7 +1186,7 @@ _sup_agent_record() {
   local verify_excerpt; verify_excerpt=$(_sup_verify_challenge "$type" "$user" "$sess" "$svc_running")
 
   # --- signal: model-capacity refusal in the live pane (DIVE-3272) ---
-  local quota_excerpt; quota_excerpt=$(_sup_quota_pane "$user" "$sess" "$svc_running")
+  local quota_excerpt; quota_excerpt=$(_sup_quota_pane "$user" "$sess" "$svc_running" "$now")
   # DIVE-3880: a pane renders a refusal long after it lapses (measured: ops was
   # flagged at 14:17 off a refusal that expired at 14:10, mid-command). The
   # expiry is inside the excerpt itself — read it, and hand the STATE to the

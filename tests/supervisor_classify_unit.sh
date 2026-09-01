@@ -214,6 +214,62 @@ tc "DIVE-3880: a live classification SAYS the deadline is still future" "the ref
 tc "DIVE-3880: an abstaining classification says UNKNOWN, not confirmed" "UNKNOWN whether it is still in force" \
   "$(dt "" 1 active s unknown n/a 0 1 -1 false "" "" 0 0 -1 "429 quota exhausted" unknown)"
 
+# --- DIVE-3880 it.2: WHICH matching line the window reports ------------------
+#     quinn's rejection of it.1: `_sup_quota_match` ended in `head -1`, so the
+#     excerpt was the OLDEST match in the 40-line window. Pre-3880 that was
+#     cosmetic (any match -> alarm); once `lapsed` DISARMS the alarm it is
+#     load-bearing, and a seat that hit the wall, resumed, and hit it again
+#     inside one window reported healthy while genuinely frozen — the false
+#     negative arriving through the excerpt selection rather than the state
+#     machine. Quota-pressured seats are the only population this detector has,
+#     so a second refusal in one window is the expected shape, not an exotic
+#     one. Before it.2 NO arm fed _sup_quota_match more than one matching line.
+qm() { printf '%s\n' "$1" | _sup_quota_match "${2:-$QN}"; }
+qs() { _sup_quota_deadline "$(qm "$1" "${2:-$QN}")" "${2:-$QN}" | cut -f1 -d $'\x1f'; }
+
+LAPSED_LINE='● Usage limit reached · continuing automatically at 2:10pm · esc or type'
+LIVE_LINE='● Usage limit reached · continuing automatically at 3pm'
+UNTIMED_LINE='● API Error: Request rejected (429) · quota has been exhausted'
+
+# quinn's measured pane, verbatim shape: a lapsed line ABOVE a live one.
+t "DIVE-3880 it.2: a lapsed line above a LIVE one does not lapse the window" "live" \
+  "$(qs "$LAPSED_LINE"$'\n'"$LIVE_LINE")"
+t "DIVE-3880 it.2: and the excerpt reported is the live line, not the oldest" "MATCH" \
+  "$( [[ "$(qm "$LAPSED_LINE"$'\n'"$LIVE_LINE")" == *"at 3pm"* ]] && echo MATCH || echo MISS )"
+# The other order too: a still-future deadline wins wherever it sits, so the
+# window can only lapse when EVERY timed match has lapsed.
+t "DIVE-3880 it.2: a live line above a lapsed one is still live" "live" \
+  "$(qs "$LIVE_LINE"$'\n'"$LAPSED_LINE")"
+# Two live walls: the LATEST deadline is the one the seat is actually waiting on.
+t "DIVE-3880 it.2: with two live walls the LATEST deadline is reported" "MATCH" \
+  "$( [[ "$(qm '● Usage limit reached · continuing automatically at 3pm'$'\n''● Usage limit reached · continuing automatically at 4pm')" == *"at 4pm"* ]] && echo MATCH || echo MISS )"
+# All lapsed -> the window lapses (the fix DIVE-3880 shipped, still true with
+# more than one line in the window).
+t "DIVE-3880 it.2: every match lapsed -> the window lapses" "lapsed" \
+  "$(qs '● Usage limit reached · continuing automatically at 1pm'$'\n'"$LAPSED_LINE")"
+# An UNTIMED signature is not evidence of a lapse and not evidence of a wall —
+# it is the newest line that decides, in both directions.
+t "DIVE-3880 it.2: an untimed refusal BELOW a lapsed one keeps the alarm" "unknown" \
+  "$(qs "$LAPSED_LINE"$'\n'"$UNTIMED_LINE")"
+t "DIVE-3880 it.2: a STALE untimed refusal above a lapsed one does not pin it" "lapsed" \
+  "$(qs "$UNTIMED_LINE"$'\n'"$LAPSED_LINE")"
+t "DIVE-3880 it.2: an untimed refusal below a LIVE one still keeps the alarm" "live" \
+  "$(qs "$LIVE_LINE"$'\n'"$UNTIMED_LINE")"
+# Non-matching pane chatter between the two refusals must not change any of it.
+t "DIVE-3880 it.2: interleaved non-matching lines do not shift the selection" "live" \
+  "$(qs "$LAPSED_LINE"$'\n''● Read(src/cmd_supervisor.sh)'$'\n''  ⎿ 40 lines'$'\n'"$LIVE_LINE")"
+# The excerpt is TRIMMED and clamped whichever line wins — the selection rewrite
+# must not quietly drop that (it feeds a rendered operator line).
+t "DIVE-3880 it.2: the selected line is trimmed, not raw pane padding" "MATCH" \
+  "$( [[ "$(qm '   '"$LIVE_LINE"'     ')" == '●'* ]] && echo MATCH || echo MISS )"
+# Single-line behaviour is unchanged — the pre-it.2 contract.
+t "DIVE-3880 it.2: one lapsed line alone still lapses (ops, the filing case)" "lapsed" \
+  "$(qs "$LAPSED_LINE")"
+t "DIVE-3880 it.2: one live line alone still classifies (quinn, the filing case)" "live" \
+  "$(qs "$LIVE_LINE")"
+t "DIVE-3880 it.2: a pane with no signature at all still returns empty" "MISS" \
+  "$( [[ -n "$(qm 'nothing here'$'\n''nor here')" ]] && echo MATCH || echo MISS )"
+
 # --- DIVE-3880: THE WIRING, driven through _sup_agent_record ------------------
 #     A pure-classifier arm grades the BRANCH and not the READ
 #     (community/wiki/a-detectors-tests-can-grade-the-branch-and-not-the-read.md):
@@ -224,11 +280,20 @@ tc "DIVE-3880: an abstaining classification says UNKNOWN, not confirmed" "UNKNOW
 #     stubbed pane, the deadline state is derived inside the function, and only
 #     the emitted JSON is asserted.
 rec() {  # <pane-line> <now>
-  local pane="$1" rnow="$2"
+  # NOT named `pane`: bash locals are DYNAMICALLY scoped, so the real
+  # _sup_quota_pane's own `local pane` shadows this one at the moment the
+  # stubbed capture reads it (measured: `pane: unbound variable` under set -u).
+  local fixture_pane="$1" rnow="$2"
   (
     systemctl() { printf 'ActiveState=active\nSubState=running\nActiveEnterTimestamp=n/a\n'; }
     db() { echo 0; }
-    _sup_quota_pane() { printf '%s\n' "$pane" | _sup_quota_match; }
+    # DIVE-3880 it.2: stub only the ROOT TMUX HOP, never _sup_quota_pane
+    # itself. Replacing the whole function (what it.1 did) also replaced its
+    # `now` forwarding, so deleting `"$now"` from the real call site survived
+    # every arm in this file — a wiring hole of exactly the kind the section
+    # below exists to close. With just the capture stubbed, the real
+    # _sup_quota_pane runs and that argument is graded.
+    _sup_quota_pane_capture() { printf '%s\n' "$fixture_pane"; }
     _sup_verify_challenge() { :; }
     _sup_activity_epoch() { :; }
     _sup_goal_drift() { :; }
@@ -256,6 +321,39 @@ t "DIVE-3880 wiring: abstention is recorded as unknown, never as live" "unknown"
 CLEAN_REC=$(rec 'nothing interesting on this pane at all' "$QN")
 t "DIVE-3880 wiring: no signature at all leaves the field null, not unknown" "null" \
   "$(jq -r '.signals.quotaDeadline' <<<"$CLEAN_REC")"
+
+TWO_REC=$(rec '● Usage limit reached · continuing automatically at 2:10pm · esc or type
+● Usage limit reached · continuing automatically at 3pm' "$QN")
+t "DIVE-3880 it.2 wiring: lapsed-above-live reaches the board as a CLASS" \
+  "quota-exhausted" "$(jq -r '.classification' <<<"$TWO_REC")"
+t "DIVE-3880 it.2 wiring: and the recorded state is live, not lapsed" "live" \
+  "$(jq -r '.signals.quotaDeadline' <<<"$TWO_REC")"
+t "DIVE-3880 it.2 wiring: the recorded signature is the LIVE line (what info re-derives)" \
+  "MATCH" "$( [[ "$(jq -r '.signals.quotaSignature' <<<"$TWO_REC")" == *"at 3pm"* ]] && echo MATCH || echo MISS )"
+# The CLOCK HAND-OFF, graded directly. An arm that only compares verdicts
+# cannot see `_sup_quota_pane` dropping the `now` it was handed whenever the
+# wall clock happens to select the same line as the fixture clock — measured:
+# deleting `"$now"` from that call survived every verdict arm in this file at
+# 15:17 wall against a 14:17 fixture. So this asserts the DATA FLOW instead:
+# stub the far end of the chain and read back which clock reached it.
+t "DIVE-3880 it.2 wiring: _sup_quota_pane hands the TICK clock down to the selection" \
+  "$QN" "$(
+    _sup_quota_pane_capture() { printf '%s\n' "$LIVE_LINE"; }
+    _sup_quota_deadline() { printf 'seen=%s\n' "${2:-MISSING}" >&2; printf 'unknown\x1f\n'; }
+    _sup_quota_pane u s 1 "$QN" 2>&1 >/dev/null | sed -n 's/^seen=//p' | head -1
+  )"
+# And the selection order that the wall clock DID mask: live above lapsed.
+UPSIDE_REC=$(rec '● Usage limit reached · continuing automatically at 3pm
+● Usage limit reached · continuing automatically at 2:10pm · esc or type' "$QN")
+t "DIVE-3880 it.2 wiring: a live line ABOVE a lapsed one still reaches the board" \
+  "quota-exhausted" "$(jq -r '.classification' <<<"$UPSIDE_REC")"
+t "DIVE-3880 it.2 wiring: and it is the live line that was recorded" "MATCH" \
+  "$( [[ "$(jq -r '.signals.quotaSignature' <<<"$UPSIDE_REC")" == *"at 3pm"* ]] && echo MATCH || echo MISS )"
+
+TWO_LAPSED_REC=$(rec '● Usage limit reached · continuing automatically at 1pm
+● Usage limit reached · continuing automatically at 2:10pm · esc or type' "$QN")
+t "DIVE-3880 it.2 wiring: two lapsed refusals still disarm" "healthy" \
+  "$(jq -r '.classification' <<<"$TWO_LAPSED_REC")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

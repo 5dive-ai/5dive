@@ -355,6 +355,23 @@ t   "3880 unknown: and it is labelled unknown, never live" "unknown" \
 t   "3880 unknown: classification unchanged from DIVE-3272" "quota-exhausted" \
     "$(f .classification "$UNK")"
 
+# DIVE-3880 it.2, the info side of quinn's rejection. `info` re-derives from the
+# ONE excerpt the tick recorded, so its answer is only as good as which line the
+# tick picked. With `_sup_quota_match` fixed to prefer a still-future deadline
+# over the oldest match, the excerpt a two-refusal window hands `info` is the
+# LIVE one — and the drill-down keeps the alarm instead of clearing it off the
+# lapsed scrollback above it. (This arm asserts the CONSUMER of that choice; the
+# choice itself is graded in supervisor_classify_unit.sh.)
+TWO=$(qd 'continuing automatically at 3pm')
+t   "3880 it.2 info: the live line inherited from a two-refusal window still flags" \
+    "quota-exhausted" "$(f .verdict "$TWO")"
+# And the residual, stated as an arm rather than only in prose: once that same
+# 3pm wall passes, the drill-down clears — correctly, because the seat resumed.
+AFTER=$(s true $((QNOW+3000)) $((QNOW+2999)) $((QNOW+3060)) quota-exhausted quota-exhausted \
+          "pane shows a model-capacity refusal: ● Usage limit reached · continuing automatically at 3pm" 2 0)
+t   "3880 it.2 info: past its own deadline the same excerpt re-derives lapsed" \
+    "quota-lapsed" "$(f .classification "$AFTER")"
+
 # A NON-quota class must not grow a deadline field at all.
 t   "3880: quotaDeadline is null when the class is not a quota reading" "null" \
     "$(f '.quotaDeadline|tostring' "$DRY")"
