@@ -1675,7 +1675,9 @@ _pack_inline_memory_into_doc() {   # _pack_inline_memory_into_doc <stage> <type>
   local stage="${1:-}" type="${2:-}" mem_inc="${3:-}"
   local doc="$stage/CLAUDE.md"
   [[ -f "$doc" ]] || return 1
-  [[ "$type" != "claude" && "$mem_inc" == "distilled" ]] || return 1
+  # DIVE-3877: any memory mode that actually staged files inlines. Keying this
+  # on "distilled" made a raw restore onto a non-claude seat silently load nothing.
+  [[ "$type" != "claude" && "$mem_inc" != "false" ]] || return 1
   [[ -d "$stage/memory" ]] || return 1
   find "$stage/memory" -maxdepth 1 -name '*.md' 2>/dev/null | grep -q . || return 1
   local inl="$doc.inline.$$" n
@@ -1683,13 +1685,13 @@ _pack_inline_memory_into_doc() {   # _pack_inline_memory_into_doc <stage> <type>
   if { cat "$doc"; printf '\n'; _agents_md_render_memory "$stage"; } > "$inl" 2>/dev/null \
      && [[ -s "$inl" ]]; then
     mv "$inl" "$doc"
-    step "Inlined $n distilled memory fact(s) into the persona doc — a '$type' seat does not auto-load 5dive's memory store"
+    step "Inlined $n $mem_inc memory fact(s) into the persona doc — a '$type' seat does not auto-load 5dive's memory store"
     return 0
   fi
   rm -f "$inl"
   # NEVER a silent failure: the facts are still seeded and searchable, but this
   # harness will not load them, and that difference is the whole point of the row.
-  warn "could not inline distilled memory into the persona doc for this '$type' seat — the facts are still seeded and reachable via '5dive memory search', but this harness will not load them automatically"
+  warn "could not inline $mem_inc memory into the persona doc for this '$type' seat — the facts are still seeded and reachable via '5dive memory search', but this harness will not load them automatically"
   return 1
 }
 
@@ -2025,7 +2027,13 @@ cmd_export() {
   if [[ -n "$mem_src" ]]; then
     mkdir -p "$stage/memory"
     cp "$mem_src"/*.md "$stage/memory/" 2>/dev/null || true
-    mem_inc="distilled"
+    # DIVE-3877: the LABEL is the mode that was actually staged. Hardcoding
+    # "distilled" here shipped every raw pack describing itself as the
+    # publishable kind — in the manifest, in --json, and in the success line —
+    # so nothing on the wire distinguished a verbatim private backup from a
+    # shareable pack. The refusal is a property of the bytes; the label has to
+    # be one too, because the label is all a later reader has.
+    mem_inc="$memory_mode"
   fi
 
   # Emit a conforming OpenAgent persona.yaml (DIVE-656) so the pack is spec-valid
@@ -2140,10 +2148,14 @@ cmd_export() {
   rm -rf "$stage"
   [[ -n "$mem_tmp" ]] && rm -rf "$mem_tmp"
 
-  if [[ "$mem_inc" == "distilled" ]]; then
+  if [[ "$mem_inc" == "raw" ]]; then
+    ok "exported '$name' (with RAW persona memory — self-only backup, do not publish) -> $out" \
+       '{name:$n, pack:$o, withMemory:true, memory:$m, skills:$s}' \
+       --arg n "$name" --arg o "$out" --arg m "$mem_inc" --argjson s "$skills"
+  elif [[ "$mem_inc" == "distilled" ]]; then
     ok "exported '$name' (with distilled persona memory) -> $out" \
-       '{name:$n, pack:$o, withMemory:true, memory:"distilled", skills:$s}' \
-       --arg n "$name" --arg o "$out" --argjson s "$skills"
+       '{name:$n, pack:$o, withMemory:true, memory:$m, skills:$s}' \
+       --arg n "$name" --arg o "$out" --arg m "$mem_inc" --argjson s "$skills"
   else
     ok "exported '$name' (config pack, no memory) -> $out" \
        '{name:$n, pack:$o, withMemory:false, skills:$s}' \
@@ -2262,12 +2274,17 @@ cmd_import() {
   (( pf <= PACK_FORMAT_VERSION )) \
     || { rm -rf "$stage"; fail "$E_VALIDATION" "pack format v$pf is newer than this CLI supports (v$PACK_FORMAT_VERSION) — upgrade 5dive"; }
 
-  # Memory mode: false (config pack) or "distilled" (DIVE-472 — human-approved
-  # knowledge facts under memory/, seeded after create). Reject anything else.
+  # Memory mode: false (config pack), "distilled" (DIVE-472 — human-approved
+  # knowledge facts under memory/, seeded after create) or "raw" (DIVE-3877 — a
+  # verbatim self-only backup being restored). Reject anything else.
   local mem_inc; mem_inc=$(jq -r '.includes.memory // false' "$stage/manifest.json")
-  if [[ "$mem_inc" != "false" && "$mem_inc" != "distilled" ]]; then
+  if [[ "$mem_inc" != "false" && "$mem_inc" != "distilled" && "$mem_inc" != "raw" ]]; then
     rm -rf "$stage"; fail "$E_VALIDATION" "pack declares unsupported memory mode '$mem_inc'"
   fi
+  # DIVE-3877: raw became nameable on the wire in the same change that made it
+  # importable. Say what it is at the moment it lands, because the person doing
+  # the import is not always the person the private facts are about.
+  [[ "$mem_inc" == "raw" ]] && warn "this pack carries RAW memory — the source agent's facts verbatim, including its private 'user'/'feedback' notes about a specific person. That is a restore of someone's own backup, not a shareable pack: import it only if that person is you."
 
   # DIVE-840: a deploy-time persona may bundle its private ed25519 signing key
   # under the sanctioned ext namespace so an imported agent can OWN its identity
@@ -2591,7 +2608,7 @@ cmd_import() {
   # workdir is known; otherwise report it skipped rather than drop it somewhere
   # the agent won't read.
   local mem_seeded="none"
-  if [[ "$mem_inc" == "distilled" && -d "$stage/memory" ]]; then
+  if [[ "$mem_inc" != "false" && -d "$stage/memory" ]]; then
     if [[ -n "$workdir" ]]; then
       local slug mdir
       slug=$(printf '%s' "$workdir" | sed 's#/#-#g')
@@ -2682,7 +2699,7 @@ cmd_import() {
   added_j=$(printf '%s\n'   "${added[@]+"${added[@]}"}"   | jq -R . | jq -cs 'map(select(. != ""))')
   skipped_j=$(printf '%s\n' "${skipped[@]+"${skipped[@]}"}" | jq -R . | jq -cs 'map(select(. != ""))')
   local mem_note="no memory"
-  [[ "$mem_inc" == "distilled" ]] && mem_note="distilled memory -> $mem_seeded ($mem_effect)"
+  [[ "$mem_inc" != "false" ]] && mem_note="$mem_inc memory -> $mem_seeded ($mem_effect)"
   local hooks_note="none"
   if (( disc_hooks > 0 )) || [[ "$disc_hooks_nonempty" == "true" || "$disc_plugin_hooks" == "true" ]]; then
     local _pn=""; [[ "$disc_plugin_hooks" == "true" ]] && _pn="+plugin"
