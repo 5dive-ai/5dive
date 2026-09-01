@@ -1426,6 +1426,36 @@ _pack_memory_dir() {
 # (export:false / private:true / share:false) on any fact. Regenerates a clean
 # MEMORY.md index from what survived; the source MEMORY.md is never copied (it
 # indexes private facts too). Echoes "<kept> <excluded>" counts.
+# DIVE-3872 — THE RAW MODE. lodar, 2026-09-01: "some users just want raw memory.
+# but warn them."
+#
+# This is the deliberate complement to _pack_scope_memory, NOT a hole in it. It
+# copies the memory dir verbatim — every type, MEMORY.md included, no opt-out
+# honoured — because the thing being asked for is a BACKUP of an agent, and a
+# backup that silently drops 4 files in 6 is not one. Read the three properties
+# that keep it honest, because they are the whole design:
+#
+#   1. SELF-ONLY, enforced in cmd_export. `--memory=raw --audience=publish`
+#      REFUSES. A distilled pack is a publishable artefact; a raw one never is,
+#      and that is a property of the bytes, not of the operator's intent.
+#   2. THE TRIPWIRE STILL RUNS — it just WARNS instead of refusing (that is the
+#      "but warn them"). The person gets told, by file and line, which facts
+#      look like they carry a credential, and then gets their backup.
+#   3. It counts what it took, so the warning can be specific rather than
+#      atmospheric.
+#
+# Returns "<kept> <0>" to match _pack_scope_memory's contract; nothing is ever
+# excluded here, and the second field exists so callers stay uniform.
+_pack_raw_memory() {
+  local memdir="$1" outdir="$2" kept=0 f base
+  mkdir -p "$outdir"
+  while IFS= read -r f; do
+    base=$(basename "$f")
+    cp "$f" "$outdir/$base"; kept=$((kept+1))
+  done < <(find "$memdir" -maxdepth 1 -name '*.md' 2>/dev/null | sort)
+  printf '%s %s\n' "$kept" 0
+}
+
 _pack_scope_memory() {
   local memdir="$1" outdir="$2" kept=0 excluded=0 f base type optout
   mkdir -p "$outdir"
@@ -1812,9 +1842,12 @@ _agents_md_to_pack() {
 cmd_export() {
   require_root
   local name="" with_memory=0 out="" approve_memory="" format="pack" audience="publish"
+  # DIVE-3872: distilled (deny-by-default knowledge) or raw (verbatim backup).
+  local memory_mode="distilled"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --with-memory)      with_memory=1 ;;
+      --memory=*)         memory_mode="${1#--memory=}"; with_memory=1 ;;
       --approve-memory=*) approve_memory="${1#--approve-memory=}"; with_memory=1 ;;
       --audience=*)       audience="${1#--audience=}" ;;
       --out=*)            out="${1#--out=}" ;;
@@ -1826,7 +1859,18 @@ cmd_export() {
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent export <name> [--format=pack|agents-md] [--with-memory] [--approve-memory=<dir>] [--audience=publish|self] [-o <path>]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent export <name> [--format=pack|agents-md] [--with-memory] [--memory=distilled|raw] [--approve-memory=<dir>] [--audience=publish|self] [-o <path>]"
+  case "$memory_mode" in
+    distilled|raw) ;;
+    *) fail "$E_USAGE" "--memory must be 'distilled' (default, {reference,project} knowledge only) or 'raw' (verbatim backup, --audience=self only)" ;;
+  esac
+  # RAW IS SELF-ONLY, and this is a refusal rather than a warning on purpose: a
+  # raw pack carries private {user,feedback} facts about a specific human and
+  # whatever their agent wrote down. "Published" is not a thing it can safely be,
+  # regardless of who is asking, so the audience is checked before any bytes move.
+  if [[ "$memory_mode" == "raw" && "$audience" != "self" ]]; then
+    fail "$E_USAGE" "--memory=raw is a personal backup and cannot be published: re-run with --audience=self (a distilled pack is the publishable one)"
+  fi
   case "$format" in
     pack|agents-md) ;;
     *) fail "$E_USAGE" "unknown --format '$format' (known: pack, agents-md)" ;;
@@ -1858,13 +1902,30 @@ cmd_export() {
       local draft="/home/agent-${name}/.claude/pack-staging/memory-draft"
       rm -rf "$draft"; mkdir -p "$draft"
       local counts kept excluded
-      counts=$(_pack_scope_memory "$memdir" "$draft")
+      if [[ "$memory_mode" == "raw" ]]; then
+        counts=$(_pack_raw_memory "$memdir" "$draft")
+      else
+        counts=$(_pack_scope_memory "$memdir" "$draft")
+      fi
       kept="${counts%% *}"; excluded="${counts##* }"
       if (( kept == 0 )); then
         rm -rf "$draft"
+        if [[ "$memory_mode" == "raw" ]]; then
+          fail "$E_GENERIC" "agent '$name' has no memory files to export. Nothing written."
+        fi
         fail "$E_GENERIC" "nothing shareable: 0 reference/project knowledge facts ($excluded private or opted-out). Only metadata.type 'reference' or 'project' facts are eligible — 'user' and 'feedback' are never exported. Nothing written."
       fi
-      if ! _pack_secret_tripwire "$draft"; then
+      # RAW WARNS, DISTILLED REFUSES (lodar, 2026-09-01: "but warn them"). The
+      # scan is identical; only the consequence differs, because a distilled
+      # pack is publishable and a raw one is the operator's own backup that they
+      # have asked for by name. Warning without naming the files would be
+      # atmospheric, so the tripwire's own file:line output is what they see.
+      if [[ "$memory_mode" == "raw" ]]; then
+        if ! _pack_secret_tripwire "$draft"; then
+          warn "RAW EXPORT: the lines above look like credentials, and they WILL be in this file. It is a personal backup — do not publish it, do not paste it, and rotate anything real that appears there."
+        fi
+        warn "RAW EXPORT: this carries the agent's memory verbatim — including its private notes about you ('user'/'feedback' facts) and any fact tagged private, none of which a distilled pack contains."
+      elif ! _pack_secret_tripwire "$draft"; then
         rm -rf "$draft"
         # DIVE-2679: name the ONE wrong turn this refusal invites. The reporter's next
         # move was --audience=self, because the usage text presents it as the escape
@@ -1896,10 +1957,21 @@ cmd_export() {
         || fail "$E_VALIDATION" "--approve-memory has no .md facts: $approve_memory"
       mem_tmp=$(mktemp -d)
       local scounts skept sexcl
-      scounts=$(_pack_scope_memory "$approve_memory" "$mem_tmp")
+      # The type-gate is re-enforced on seal for DISTILLED no matter what dir is
+      # passed. For RAW the whole point is that it is not, so it copies verbatim
+      # — the protection there is the audience refusal above, which already
+      # guaranteed this pack cannot be a published one.
+      if [[ "$memory_mode" == "raw" ]]; then
+        scounts=$(_pack_raw_memory "$approve_memory" "$mem_tmp")
+      else
+        scounts=$(_pack_scope_memory "$approve_memory" "$mem_tmp")
+      fi
       skept="${scounts%% *}"; sexcl="${scounts##* }"
       (( skept > 0 )) || { rm -rf "$mem_tmp"; fail "$E_GENERIC" "approved dir has 0 shareable knowledge facts after scoping ($sexcl excluded). Nothing sealed."; }
-      if ! _pack_secret_tripwire "$mem_tmp"; then
+      if [[ "$memory_mode" == "raw" ]]; then
+        _pack_secret_tripwire "$mem_tmp" \
+          || warn "RAW EXPORT: sealing anyway — the credential-shaped lines above are going into the pack."
+      elif ! _pack_secret_tripwire "$mem_tmp"; then
         rm -rf "$mem_tmp"
         fail "$E_GENERIC" "approved memory tripped the secret tripwire (file:line: rule above) — refusing to seal. Remove the credential from that fact, or tag it 'private: true', then retry. --audience=self does NOT bypass this (it only skips the operational-detail leak-check)."
       fi
