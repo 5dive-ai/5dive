@@ -97,6 +97,10 @@ _memory_usage() {
                           `memory check`, so it is refused if it writes, escapes
                           (sudo/rm/curl|sh), or is trivially green (`true`, `:`,
                           a bare echo) — a check that cannot go red is not one.
+                          It is also refused if it is NOT A COMMAND: the shell
+                          must parse it, and a bare head word must resolve here.
+                          `--check=` reads like a description field; a sentence
+                          in it makes the pass accuse a true fact (DIVE-3909).
         --no-check="<why>" the recorded opt-out. Not free: the reason is written
                           to frontmatter as `no_check:`, so an unchecked fact is
                           COUNTABLE rather than merely absent.
@@ -146,17 +150,19 @@ _memory_usage() {
       further with --max-chars, or point --distiller at a cheaper model.
 
   5dive memory check [--roots=a,b] [--store=all|mine|wiki] [--agent=<name>]
-                     [--slug=<slug>]... [--timeout=SEC] [--write] [--json]
+                     [--slug=<slug>]... [--timeout=SEC] [--dry-run] [--json]
       Run every atom's authored `check:` command and report which facts no
-      longer re-derive. Dry-run by default; --write stamps the frontmatter with
-      `check_status`, `checked_at` and `check_rc`.
+      longer re-derive. It STAMPS `check_status`, `checked_at` and `check_rc`
+      into the frontmatter — that is the point of the pass, and it is what makes
+      the flag two-way: a fact whose check goes green again is stamped `fresh`
+      and stops being demoted. `--dry-run` looks without touching anything.
         exit 0  every check that RAN came back green
         exit 1  at least one fact went `stale` (its check ran and went red)
       A red check means THE FACT IS WRONG **OR THE CHECKER IS** — so `stale` is
       a flag for a human/agent to adjudicate, never a verdict. Recall demotes a
       stale fact and says so; it is never hidden, and NOTHING here deletes a
-      memory. A checker that could not RUN (timeout, command not found) is
-      `unknown`, NOT stale — an instrument failure and a false fact are the same
+      memory. A checker that could not RUN (timeout, command not found, not
+      executable, or shell text the parser rejects) is `unknown`, NOT stale — an instrument failure and a false fact are the same
       shape from the outside, and folding them together is how a janitor starts
       deleting true facts. Checks run read-only, with a timeout (default 20s),
       one at a time, under your own uid.
@@ -531,6 +537,22 @@ _memory_check_validate() {
   local c="$1"
   [ -n "$(printf '%s' "$c" | tr -d '[:space:]')" ] \
     || fail "$E_VALIDATION" "--check is empty — it must be a command whose exit code re-derives the fact"
+  # 0. IS IT A COMMAND AT ALL — DIVE-3909. `--check=` reads like a description
+  # field and an author will write one; the atom that forced this row carried
+  # English prose and every refusal below let it through. `bash -c` then died on
+  # the syntax error with rc 2, and 2 is neither 127 nor a timeout, so the pass
+  # called a TRUE fact stale for a defect in the SENTENCE. DIVE-3885's own rule
+  # is that enforcement belongs where the fact is WRITTEN, so it belongs here.
+  if ! bash -n -c "$c" 2>/dev/null; then
+    fail "$E_VALIDATION" "--check is not a runnable command — the shell cannot parse it. A check is shell text whose EXIT CODE re-derives the fact, not a description of how to re-derive it (use --no-check=\"<why>\" to record the gap)"
+  fi
+  # A check that PARSES but names a command absent from this box is NOT refused
+  # here: DIVE-3885 deliberately treats "the checker could not run" as a real,
+  # expected state (`unknown` at full rank), and a wiki atom travels to seats
+  # that do not hold the tool. So prose that happens to parse — `the file still
+  # exists` — is caught at run time as `unknown`, never as `stale`. That is the
+  # honest outcome; the damage this row is about is a TRUE fact demoted 0.4x,
+  # and the parse refusal plus the unknown net close that completely.
   # 1. read-only
   if printf '%s' "$c" | grep -qE '(^|[;&|[:space:]])(sudo|rm|rmdir|mv|dd|mkfs|shutdown|reboot|kill|pkill|truncate|chmod|chown|tee)([[:space:]]|$)'; then
     fail "$E_VALIDATION" "--check must be READ-ONLY — it is run unattended by \`memory check\` (refused: writes/escalates)"
@@ -754,7 +776,11 @@ _memory_add() {
 # instrument failure into "the fact is false" is exactly how an automated
 # janitor starts retiring true facts.
 _memory_check() {
-  local roots="" store="all" agent="" timeout_s=20 write=0
+  # DIVE-3909: `write` DEFAULTS ON. Going stale was automatic and coming back
+  # was manual, so a fact whose check went green again wore the stale flag — and
+  # its 0.4x recall demotion — indefinitely, because nobody remembers `--write`.
+  # Stamping is what this pass is FOR; `--dry-run` looks without touching.
+  local roots="" store="all" agent="" timeout_s=20 write=1
   local slugs=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -763,7 +789,8 @@ _memory_check() {
       --agent=*)   agent="${1#*=}" ;;
       --slug=*)    slugs+=("${1#*=}") ;;
       --timeout=*) timeout_s="${1#*=}" ;;
-      --write)     write=1 ;;
+      --write)     write=1 ;;   # the default now; still accepted
+      --dry-run)   write=0 ;;
       --json)      JSON_MODE=1 ;;
       -h|--help)   _memory_usage; return 0 ;;
       *)           fail "$E_USAGE" "memory check: unknown argument: $1" ;;
@@ -831,7 +858,18 @@ for path in files():
     # Read-only by construction at write time; still run with no stdin, in the
     # store's dir, so a relative path in a check means something stable.
     status, rc, detail = "unknown", None, ""
-    try:
+    # DIVE-3909. A checker the shell cannot PARSE never ran, so it is `unknown` —
+    # the same net DIVE-3885 built for 127 and the timeout. Keying on the exit
+    # code cannot do this: a malformed check dies with rc 2, and so does
+    # `grep -q pat missing-file`, a perfectly good check going honestly red
+    # (both measured). PARSEABILITY is the discriminator; the exit code is not.
+    parse = subprocess.run(["bash", "-n", "-c", cmd], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if parse.returncode != 0:
+        perr = parse.stderr.decode("utf-8", "replace").strip().splitlines()
+        detail = "not a runnable command: " + (perr[-1][:160] if perr else "shell parse error")
+    else:
+      try:
         proc = subprocess.run(["bash", "-c", cmd], stdin=subprocess.DEVNULL,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               timeout=timeout, cwd=os.path.dirname(path) or ".")
@@ -840,15 +878,16 @@ for path in files():
         detail = tail[-1][:200] if tail else ""
         if rc == 0:
             status = "fresh"
-        elif rc == 127:
-            # The checker itself is missing. That is an instrument failure and
-            # says nothing about the fact.
-            status, detail = "unknown", detail or "command not found"
+        elif rc in (126, 127):
+            # The checker itself is missing, or is not executable. That is an
+            # instrument failure and says nothing about the fact.
+            status = "unknown"
+            detail = detail or ("command not found" if rc == 127 else "not executable")
         else:
             status = "stale"
-    except subprocess.TimeoutExpired:
+      except subprocess.TimeoutExpired:
         status, detail = "unknown", "timed out after %ds" % timeout
-    except OSError as e:
+      except OSError as e:
         status, detail = "unknown", str(e)
 
     if write:
@@ -897,7 +936,7 @@ MCPY
     fi
     printf '%s' "$out" | jq -r '.[] | (if .status=="fresh" then "✓ fresh   " elif .status=="stale" then "✗ STALE   " else "? unknown " end) + .slug + (if .detail=="" then "" else "  — " + .detail end)'
     echo
-    echo "memory check: $n_total checked · $n_fresh fresh · $n_stale stale · $n_unknown unknown$([ "$write" -eq 1 ] && echo " (stamped)" || echo " (dry-run — --write to stamp)")"
+    echo "memory check: $n_total checked · $n_fresh fresh · $n_stale stale · $n_unknown unknown$([ "$write" -eq 1 ] && echo " (stamped)" || echo " (dry-run — nothing stamped)")"
     [ "$n_stale" -gt 0 ] && echo "  a STALE fact may be wrong, or its CHECK may be. Adjudicate it — nothing here deletes a memory."
     [ "$n_unknown" -gt 0 ] && echo "  UNKNOWN = the checker could not run. That is an instrument failure, not evidence about the fact."
   fi

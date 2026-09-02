@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased — fix(memory): the exit code cannot tell a broken checker from a false fact (DIVE-3909)
+
+DIVE-3885 shipped the right rule — *a checker that could not RUN is `unknown`, never `stale`,
+because a broken instrument must not accuse a true fact* — and encoded it as a list of EXIT CODES
+(`127`, plus the timeout). Running the shipped pass over the real shared wiki on 2026-09-02 found
+the rule failing on 1 of the 3 authored checks fleet-wide: an atom carrying English prose in
+`check:` made `bash` die on the syntax error with **rc 2**, which is neither 127 nor a timeout, so a
+TRUE fact was demoted 0.4x in recall for a defect in the SENTENCE.
+
+The obvious widening — *126/127/2 are instrument failures* — is wrong, and measurably so:
+`grep -q needle missing-file`, a perfectly good check going honestly red, **also exits 2**. The two
+cases that must be classified oppositely share an exit code. **Parseability is the discriminator:**
+`bash -n -c "$cmd"` now runs before `bash -c "$cmd"`, and a checker the shell cannot parse is
+`unknown` with a digest line saying so. `126` (not executable) joins `127`.
+
+- **Refused at write time**, which is where DIVE-3885 said enforcement belongs: `memory add
+  --check=` rejects a string the shell cannot parse. Measured first, since the row left it open —
+  `add` did NOT refuse it; all four existing refusals ask what the command *does*, none asked
+  whether it *was* one. A check that parses but names a command absent from this box is
+  deliberately still accepted: that is DIVE-3885's supported `unknown` (a wiki atom travels to
+  seats without the tool), and refusing it breaks that row's own harness arm.
+- **`memory check` now STAMPS by default; `--dry-run` looks without touching.** Going stale was
+  automatic and coming back was manual, so a fact whose check went green again wore its stale flag
+  — and its 0.4x demotion — indefinitely. One had:
+  `a-field-the-pipeline-can-fill-converges-to-its-autostamp` was stamped stale on 2026-09-01 only
+  because 5dive-cli had not cut a release yet, and its check returns 0 today. `--write` still
+  accepted.
+- Both live atoms repaired in the shared wiki; the pass now reads `3 fresh - 0 stale - 1 unknown`.
+- 3 new harness sections (74/74 green), including the **negative control that decides the design**:
+  an rc=2 check that PARSES must stay `stale`.
+
 ## Unreleased — feat(memory): `check:` — a checkable fact says how to re-check itself, and `add` will not let it skip (DIVE-3885)
 
 Item 3 of the memory-janitor plan is a `check:` whose exit code re-derives a fact, plus a pass that

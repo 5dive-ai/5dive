@@ -125,20 +125,21 @@ printf '%s\n' "$BODY" | add --name=broken --type=reference --description=d \
 printf '%s\n' "$BODY" | add --name=nocheck2 --type=reference --description=d \
   --no-check="this atom has no way to re-derive itself" >/dev/null 2>&1
 
-OUT=$(mcheck --slug=green --slug=red --slug=broken 2>&1); MRC=$?
+OUT=$(mcheck --slug=green --slug=red --slug=broken --dry-run 2>&1); MRC=$?
 check "pass exits 1 when a fact went stale" "$MRC" "1"
 printf '%s' "$OUT" | grep -q '✓ fresh   green'  && ok "green check reads fresh" || bad "green check reads fresh — $OUT"
 printf '%s' "$OUT" | grep -q '✗ STALE   red'    && ok "red check reads STALE"  || bad "red check reads STALE — $OUT"
 printf '%s' "$OUT" | grep -q '? unknown broken' && ok "a checker that could not RUN is unknown, NOT stale" || bad "missing binary is unknown — $OUT"
 printf '%s' "$OUT" | grep -q 'may be wrong, or its CHECK may be' && ok "digest states the row's guardrail" || bad "digest states the guardrail"
 
-echo "── 7. dry-run is the default; --write stamps; nothing is deleted ──"
+echo "── 7. --dry-run touches nothing; the pass STAMPS by default; nothing is deleted ──"
 grep -q 'check_status' "$STORE/reference_red.md" && bad "dry-run stamped nothing" || ok "dry-run stamped nothing"
 BEFORE=$(wc -c < "$STORE/reference_red.md")
-mcheck --slug=green --slug=red --slug=broken --write >/dev/null 2>&1
-grep -q '^  check_status: stale$' "$STORE/reference_red.md" && ok "--write stamps check_status: stale" || bad "--write stamps stale"
-grep -q '^  check_status: fresh$' "$STORE/reference_green.md" && ok "--write stamps check_status: fresh" || bad "--write stamps fresh"
-grep -q '^  check_status: unknown$' "$STORE/reference_broken.md" && ok "--write stamps check_status: unknown" || bad "--write stamps unknown"
+# DIVE-3909: no flag — stamping is the default. `--write` is still accepted.
+mcheck --slug=green --slug=red --slug=broken >/dev/null 2>&1
+grep -q '^  check_status: stale$' "$STORE/reference_red.md" && ok "the pass stamps check_status: stale" || bad "the pass stamps stale"
+grep -q '^  check_status: fresh$' "$STORE/reference_green.md" && ok "the pass stamps check_status: fresh" || bad "the pass stamps fresh"
+grep -q '^  check_status: unknown$' "$STORE/reference_broken.md" && ok "the pass stamps check_status: unknown" || bad "the pass stamps unknown"
 grep -q '^  checked_at: [0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$' "$STORE/reference_red.md" && ok "checked_at stamped" || bad "checked_at stamped"
 grep -q '^  check_rc: 1$' "$STORE/reference_red.md" && ok "check_rc records the exit code" || bad "check_rc records the exit code"
 for f in reference_red reference_green reference_broken reference_nocheck2; do
@@ -149,8 +150,8 @@ grep -qF "nginx config is the thing that decides it" "$STORE/reference_red.md" &
 
 echo "── 8. re-running is idempotent (the stamp is replaced, not duplicated) ──"
 mcheck --slug=red --write >/dev/null 2>&1
-check "one check_status line after two --write passes" "$(grep -c 'check_status:' "$STORE/reference_red.md")" "1"
-check "one checked_at line after two --write passes" "$(grep -c 'checked_at:' "$STORE/reference_red.md")" "1"
+check "one check_status line after two stamping passes" "$(grep -c 'check_status:' "$STORE/reference_red.md")" "1"
+check "one checked_at line after two stamping passes" "$(grep -c 'checked_at:' "$STORE/reference_red.md")" "1"
 
 echo "── 9. a store with no checks is a clean exit 0, not an error ──"
 EMPTY="$TMP/empty"; mkdir -p "$EMPTY"
@@ -185,6 +186,62 @@ if [ -x ./5dive ]; then
 else
   echo "  skip — ./5dive not built (run build.sh to exercise the live arm)"
 fi
+
+echo '── 12. DIVE-3909: a MALFORMED checker is `unknown`, never `stale` ──' 
+# The motivating atom carried English prose in check:. bash died on the syntax
+# error with rc 2 — neither 127 nor a timeout — so it landed in the STALE bucket
+# and demoted a TRUE fact 0.4x for a defect in the SENTENCE.
+PROSE="in a 5dive-frontend checkout at or past PR #142: npm test -- the arms in src/x.test.ts"
+MAL="$TMP/malformed"; mkdir -p "$MAL"
+printf -- '---\ntitle: prose-check\ncheck: "%s"\n---\n\nbody\n' "$PROSE" > "$MAL/prose.md"
+J=$( ( JSON_MODE=1 _memory_check --roots="$MAL" --dry-run ) 2>/dev/null )
+check "malformed checker is unknown, not stale" "$(printf '%s' "$J" | jq -r '.data.results[0].status')" "unknown"
+printf '%s' "$J" | jq -r '.data.results[0].detail' | grep -q 'not a runnable command' \
+  && ok "digest says it did not run" || bad "digest says it did not run"
+
+# THE NEGATIVE CONTROL, and it is the one that matters: rc 2 is NOT the
+# discriminator. `grep -q pat missing-file` also exits 2 and is an honest RED.
+# Keying on the exit code would have swallowed this one into `unknown`.
+printf -- '---\ntitle: honest-red\ncheck: "grep -q needle %s/no-such-file"\n---\n\nbody\n' "$MAL" > "$MAL/red.md"
+J2=$( ( JSON_MODE=1 _memory_check --roots="$MAL" --slug=honest-red --dry-run ) 2>/dev/null )
+check "an rc=2 check that PARSES is still STALE" "$(printf '%s' "$J2" | jq -r '.data.results[0].status')" "stale"
+check "  ...and its rc really was 2" "$(printf '%s' "$J2" | jq -r '.data.results[0].rc')" "2"
+
+echo '── 13. DIVE-3909: `add` REFUSES a check the shell cannot parse ──' 
+OUT=$(add --name=prose-a --type=reference --description="d" --check="$PROSE" <<<"$BODY" 2>&1); RC=$?
+check "prose that does not parse is refused" "$([ "$RC" -ne 0 ] && echo refused || echo ACCEPTED)" "refused"
+printf '%s' "$OUT" | grep -q 'not a runnable command' && ok "refusal names the cause" || bad "refusal names the cause — $OUT"
+[ -f "$STORE/reference_prose_a.md" ] && bad "nothing was written" || ok "nothing was written"
+
+# THE RESIDUAL, asserted rather than left implicit: prose that happens to PARSE
+# is NOT refused at write time. Refusing it would forbid DIVE-3885's deliberate
+# shape (a wiki atom whose tool lives on another seat). It is caught at run time
+# as `unknown` — honest, at full recall rank, never an accusation.
+printf -- '---\ntitle: parses-not-a-command\ncheck: "the file still exists in the repo"\n---\n\nbody\n' > "$MAL/parses.md"
+J3=$( ( JSON_MODE=1 _memory_check --roots="$MAL" --slug=parses-not-a-command --dry-run ) 2>/dev/null )
+check "prose that PARSES lands unknown, not stale" "$(printf '%s' "$J3" | jq -r '.data.results[0].status')" "unknown"
+
+for good in "grep -q needle /etc/passwd" "test -f /etc/passwd" "[ -f /etc/passwd ]" \
+            "if grep -q root /etc/passwd; then exit 0; else exit 1; fi" "./x.sh" "FOO=1 grep -q x /etc/passwd"; do
+  ( _memory_check_validate "$good" ) >/dev/null 2>&1 \
+    && ok "still accepts: $good" || bad "REGRESSION — refused a real check: $good"
+done
+
+echo '── 14. DIVE-3909: the stamp is TWO-WAY — a fact that goes green is repaired ──'
+FLIP="$TMP/flip"; mkdir -p "$FLIP"
+printf -- '---\ntitle: flipper\ncheck: "test -f %s/sentinel"\n---\n\nbody\n' "$FLIP" > "$FLIP/flip.md"
+( _memory_check --roots="$FLIP" ) >/dev/null 2>&1
+check "red first: stamped stale" "$(grep -c '^check_status: stale' "$FLIP/flip.md")" "1"
+touch "$FLIP/sentinel"
+# NO --write: stamping is the default now (DIVE-3909). Before this change the
+# fact stayed flagged forever because nobody remembers the flag.
+( _memory_check --roots="$FLIP" ) >/dev/null 2>&1
+check "goes green: re-stamped fresh" "$(grep -c '^check_status: fresh' "$FLIP/flip.md")" "1"
+check "no stale line left behind" "$(grep -c '^check_status: stale' "$FLIP/flip.md")" "0"
+check "check_rc re-stamped too" "$(grep -c '^check_rc: 0' "$FLIP/flip.md")" "1"
+rm -f "$FLIP/sentinel"
+( _memory_check --roots="$FLIP" --dry-run ) >/dev/null 2>&1
+check "--dry-run touches nothing" "$(grep -c '^check_status: fresh' "$FLIP/flip.md")" "1"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
