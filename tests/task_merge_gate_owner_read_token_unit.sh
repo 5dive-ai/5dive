@@ -60,6 +60,7 @@ if [[ "$1" == "auth" && "$2" == "token" ]]; then
   printf '%s\n' "${GH_STUB_AUTH_TOKEN:-}"; [[ -n "${GH_STUB_AUTH_TOKEN:-}" ]] || exit 1; exit 0
 fi
 printf '%s\n' "${GH_TOKEN:-<none>}" >>"$TOK_LOG"
+printf '%s\n' "${GH_TOKEN:-<none>}" >>"$TOK_ALL"
 if [[ -n "${GH_STUB_GOOD_TOKEN:-}" && "${GH_TOKEN:-}" == "${GH_STUB_GOOD_TOKEN}" ]]; then
   printf '%s\n' "${GH_STUB_ANSWER:-MERGED}"; exit 0
 fi
@@ -69,6 +70,9 @@ STUB
 chmod +x "$TMP/bin/gh"
 export PATH="$TMP/bin:$PATH"
 export TOK_LOG="$TMP/tokens.log"; : >"$TOK_LOG"
+# Never truncated: TOK_LOG is reset per arm, and the question "did a REAL credential ever
+# reach gh in this run" is about the whole run, not the last arm.
+export TOK_ALL="$TMP/tokens.all"; : >"$TOK_ALL"
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
@@ -78,6 +82,16 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   source "$SRC/$f"
 done
 JSON_MODE=0
+
+# DIVE-3888 it.2: `export HOME=` below does NOT by itself keep this harness out of the
+# real seat's `~/.config/5dive/gh-read-tokens.env` — `_gate_read_tokens_file` has a second
+# arm that walks getent/passwd to the CALLING account's home regardless of $HOME. On a
+# verifier seat that file is live (root cron, every 30 min), so iteration 1 read it and
+# handed a real minted token to the stub gh. Sourced AFTER src/ so the override wins.
+# shellcheck source=/dev/null
+. "$(dirname "${BASH_SOURCE[0]}")/lib/isolate_read_tokens.sh"
+isolate_read_tokens "$TMP/bin"
+
 set +e
 
 PASS=0; FAIL=0
@@ -100,6 +114,14 @@ GH_READ_TOKEN_5DIVE_AI=tok-5dive-ai
 GH_READ_TOKEN_LODAR=tok-lodar
 ENV
 chmod 600 "$HOME/.config/5dive/gh-read-tokens.env"
+
+# ---------------------------------------------------------------------------
+# T0 — THE SANDBOX IS REAL. Graded, not assumed: iteration 1 was 29/29 on a runner and
+# 28/1 on the verifier seat, and the difference was invisible from inside the harness.
+# ---------------------------------------------------------------------------
+chk "T0 the getent stub is the one on PATH (positive control)" "$(read_tokens_stub_control)" "STUBBED"
+chk "T0 no tokens file leaks in from the real seat's home"     "$(read_tokens_isolated_probe)" ""
+chk "T0 and the sandbox file IS the one that resolves"         "$(_gate_read_tokens_file)" "$HOME/.config/5dive/gh-read-tokens.env"
 
 # ---------------------------------------------------------------------------
 # T1 — the owner parse. Two forms, and empty for everything else.
@@ -181,6 +203,15 @@ chk "T6 an unanswerable query still fails"     "$((RC != 0))" "1"
 chk "T6 and returns empty, not a verdict"      "$OUT" ""
 sub "T6 the reason names the blind credential" "$_GATE_GH_LAST_ERR" "cannot see this repository"
 sub "T6 and names the owner arm it tried"      "$_GATE_GH_LAST_ERR" "owner-scoped read token"
+
+# ---------------------------------------------------------------------------
+# T7 — NOTHING REAL WAS EVER SPENT. Every token handed to gh across this entire run must
+# be one this file wrote. Iteration 1 leaked the seat's live `gh-read-tokens.env` into the
+# sandbox and sent a freshly minted GitHub token to a stub — an unnoticed real credential
+# in a test fixture, and the reason the T0 arms above exist.
+# ---------------------------------------------------------------------------
+UNEXPECTED="$(grep -vxE 'ghs_blind|ghs_works|tok-lodar|tok-5dive-ai|<none>' "$TOK_ALL" | sort -u | tr '\n' ' ')"
+chk "T7 every token gh saw was written by this harness" "$UNEXPECTED" ""
 
 printf '\n%s\n' "---- $PASS passed, $FAIL failed ----"
 [[ $FAIL -eq 0 ]]

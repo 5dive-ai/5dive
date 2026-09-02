@@ -100,6 +100,7 @@ chmod +x "$TMP/bin/sudo"
 cat >"$TMP/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 printf 'ARGS=%s\n' "$*" >>"$GH_ARGS_LOG"
+printf '%s\n' "${GH_TOKEN:-<none>}" >>"$TOK_ALL"
 if [[ "$1" == "auth" && "$2" == "token" ]]; then
   printf '%s\n' "${GH_STUB_AUTH_TOKEN:-}"; [[ -n "${GH_STUB_AUTH_TOKEN:-}" ]] || exit 1; exit 0
 fi
@@ -165,9 +166,15 @@ chmod +x "$TMP/bin/curl"
 # DIVE-3888: point HOME at the sandbox. `_gate_gh`'s owner-scoped read-token arm reads
 # `$HOME/.config/5dive/gh-read-tokens.env`, and a runner whose real home happens to hold
 # one would give the blind-token arms below a rail they are written to be without.
+# it.2: THIS LINE ALONE DID NOT DO THAT — see the isolate_read_tokens call after the
+# source loop. `_gate_read_tokens_file`'s second arm ignores $HOME by design, so on a
+# verifier seat (the only place that file exists) the blind-token arms had the rail
+# anyway; T10a passed only because the gh stub is blind to every token it is handed.
 export HOME="$TMP/home"; mkdir -p "$HOME"
 export PATH="$TMP/bin:$PATH"
 export GH_ARGS_LOG="$TMP/gh.args"; : >"$GH_ARGS_LOG"
+# Never truncated — "did a REAL credential ever reach gh" is a whole-run question. See T11.
+export TOK_ALL="$TMP/tokens.all"; : >"$TOK_ALL"
 export CURL_ARGS_LOG="$TMP/curl.args"; : >"$CURL_ARGS_LOG"
 
 # shellcheck disable=SC1090
@@ -180,6 +187,13 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
 done
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 JSON_MODE=0
+
+# DIVE-3888 it.2: neutralise the passwd-walking arm of `_gate_read_tokens_file` too.
+# Sourced AFTER src/ so the `actor_caller_unix_name` override wins.
+# shellcheck source=/dev/null
+. "$(dirname "${BASH_SOURCE[0]}")/lib/isolate_read_tokens.sh"
+isolate_read_tokens "$TMP/bin"
+
 mkdir -p "$TASKS_DIR"; set +e
 
 PASS=0; FAIL=0
@@ -193,6 +207,15 @@ tasks_db_init
 _tasks_db_migrate
 task_need_notify() { :; }
 audit_log() { :; }
+
+# ---------------------------------------------------------------------------
+# T0i — THE SANDBOX IS REAL, graded rather than assumed. Every blind-credential arm
+# below (T10a especially) is only about a blind rail if no OTHER rail is reachable;
+# iteration 1 left the real seat's live tokens file reachable and nobody could see it.
+# ---------------------------------------------------------------------------
+chk "T0i the getent stub is the one on PATH (positive control)" "$(read_tokens_stub_control)" "STUBBED"
+chk "T0i no tokens file leaks in from the real seat's home"     "$(read_tokens_isolated_probe)" ""
+chk "T0i and the pinned HOME holds none either"                 "$(_gate_read_tokens_file)" ""
 
 PRIVATE_PR='https://github.com/lodar/5dive-frontend/pull/12'
 OTHER_PR='https://github.com/lodar/5dive-frontend/pull/13'
@@ -458,6 +481,17 @@ chk "T10c and the row stays open"               "$(statusof K-3)" "in_progress"
 nsub "T10c the proof was never consulted"       "$OUT" "RECORDED MACHINE EVIDENCE"
 sub "T10c the refusal quotes the token's answer" "$OUT" "state=OPEN"
 unset GH_STUB_BLIND GH_STUB_STATE
+
+# ---------------------------------------------------------------------------
+# T11 — NOTHING REAL WAS EVER SPENT, and here the leak actually bit. This harness pins
+# HOME at a sandbox that holds NO tokens file, so arm 1 of `_gate_read_tokens_file` always
+# misses and arm 2 — the passwd walk — is reached on every blind-credential arm. On a
+# verifier seat that arm resolved the LIVE file, and T10a's "blind rail" was handed a real
+# minted GitHub token. It passed only because the stub gh is blind to every token it sees.
+# Every token gh was given across this run must be one this file wrote.
+# ---------------------------------------------------------------------------
+UNEXPECTED="$(grep -vxE 'tok-3823|ghs_blind-3888|<none>' "$TOK_ALL" | sort -u | tr '\n' ' ')"
+chk "T11 every token gh saw was written by this harness" "$UNEXPECTED" ""
 
 printf '\n%s\n' "---- $PASS passed, $FAIL failed ----"
 [[ $FAIL -eq 0 ]]

@@ -106,6 +106,21 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
 done
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 JSON_MODE=0
+
+# DIVE-3888 it.2: this harness grades the BLIND path, so it must be certain the seat
+# running it has no OTHER rail. `_gate_read_tokens_file` walks getent/passwd to the
+# caller's real home whatever $HOME says, and on a verifier seat root cron keeps a live
+# `gh-read-tokens.env` there — measured: 31/0 on agent-dev, 30/1 on agent-quinn, T7's
+# call budget, because the owner-scoped arm found a real token and spent a second call.
+# Sourced AFTER src/ so the `actor_caller_unix_name` override wins.
+# BOTH arms: the passwd walk is stubbed out, and $HOME is pinned at an empty sandbox —
+# on a verifier seat the real $HOME holds the file too, so stubbing getent alone leaves
+# arm 1 live and T7 still reds (measured).
+# shellcheck source=/dev/null
+. "$(dirname "${BASH_SOURCE[0]}")/lib/isolate_read_tokens.sh"
+isolate_read_tokens "$TMP/bin"
+export HOME="$TMP/home"; mkdir -p "$HOME"
+
 mkdir -p "$TASKS_DIR"; set +e
 
 # `_GATE_GH_DO` is a readonly path constant and `_gate_gh_bot_ok` probes it with
@@ -221,6 +236,13 @@ _gate_gh "" 0 pr view https://github.com/5dive-ai/5dive/pull/1 --json state -q .
 ok  "T6 no rail at all: rc is 1"       "$rc"  "1"
 ok  "T6 no rail at all: stdout empty"  "$out" ""
 has "T6 keeps the legacy sentence"     "$_GATE_GH_LAST_ERR" "no gh rail: no token, the gate bot is not usable here"
+
+# ------------------------------------------------------------------ T0i: SANDBOX
+# Graded, not assumed: every arm below is only about a blind rail if no other rail is
+# reachable, and the one that leaked in was invisible from inside the harness.
+ok "T0i the getent stub is the one on PATH (positive control)" "$(read_tokens_stub_control)" "STUBBED"
+ok "T0i no tokens file leaks in from the real seat's home"     "$(read_tokens_isolated_probe)" ""
+ok "T0i and the pinned HOME holds none either"                 "$(_gate_read_tokens_file)" ""
 
 # ------------------------------------------------------------------ T7: BUDGET
 # The escalation costs exactly ONE extra call, and only on the blind path.
