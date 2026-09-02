@@ -162,6 +162,10 @@ exit 0
 CURL
 chmod +x "$TMP/bin/curl"
 
+# DIVE-3888: point HOME at the sandbox. `_gate_gh`'s owner-scoped read-token arm reads
+# `$HOME/.config/5dive/gh-read-tokens.env`, and a runner whose real home happens to hold
+# one would give the blind-token arms below a rail they are written to be without.
+export HOME="$TMP/home"; mkdir -p "$HOME"
 export PATH="$TMP/bin:$PATH"
 export GH_ARGS_LOG="$TMP/gh.args"; : >"$GH_ARGS_LOG"
 export CURL_ARGS_LOG="$TMP/curl.args"; : >"$CURL_ARGS_LOG"
