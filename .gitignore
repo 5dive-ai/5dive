@@ -50,3 +50,7 @@ tests/.probe-*
 # open PR on every merge. install.sh fetches it from the tag's tree.
 /5dive
 /5dive.sha256
+
+# DIVE-3911: python package build output
+python/dist/
+python/src/*.egg-info/
