@@ -288,8 +288,8 @@ _gate_merge_proof_ok() { # <proof_at> <proof_ref> <dref>
   [[ "$proof_ref" == "$dref" ]]
 }
 
-# _gate_pr_state_answerable <dref> — 0 when SOME rail available to this caller can
-# actually answer "what state is this PR in", asked about THIS pull request.
+# _gate_pr_state_answerable <dref> [tok] — 0 when SOME rail available to this caller
+# can actually answer "what state is this PR in", asked about THIS pull request.
 #
 # DIVE-3823 iteration 2, and this is the whole correction. Iteration 1 scoped the
 # recorded-evidence rail on `! _gate_gh_credentialed` — what the caller HOLDS — and
@@ -308,14 +308,26 @@ _gate_merge_proof_ok() { # <proof_at> <proof_ref> <dref>
 # only on the narrow path that reaches it (uncredentialed AND a proof already stamped
 # against the current binding). A 404 on a private repo — the DIVE-3808 shape — is
 # rc 1 here and cheap. An answer of any kind is rc 0 and the proof is never consulted.
-_gate_pr_state_answerable() { # <dref>
-  local dref="${1:-}" st=""
+#
+# DIVE-3888: IT NOW TAKES THE CALLER'S TOKEN, because the caller may hold one and
+# still be blind. Iteration 2 passed an empty token on the reasoning quoted below —
+# "this is only ever called when _gate_gh_credentialed is false, so there is no
+# token to pass". That premise died with the `! _gate_gh_credentialed` clause at the
+# call site (see src/task/status.sh, DIVE-3888): the rail is now reached by a caller
+# that DOES hold a token, and asking with an empty one would skip the caller's own
+# credential and the DIVE-3496 escalation behind it — i.e. it would under-answer and
+# consult a recorded proof while a live rail could have said MERGED. Passing the
+# token restores the invariant this predicate exists to hold: the proof is read only
+# when NOTHING could answer. Empty `tok` behaves exactly as before.
+_gate_pr_state_answerable() { # <dref> [tok]
+  local dref="${1:-}" tok="${2:-}" st=""
   [[ "$dref" =~ ^https?:// ]] || return 1
-  # Empty token deliberately: this is only ever called when _gate_gh_credentialed is
-  # false, so there is no token to pass and the bot rail is not permitted — asking
-  # with an empty one routes to the credential-free rail, which is the rail in
+  # `_gate_gh` with a token runs the caller's credential first and, on a stderr that
+  # says "cannot see this repository", escalates to the bot rail and then the
+  # credential-free rail (DIVE-3496). With an empty token it routes straight to those
+  # two. Either way this asks with everything the caller can reach, which is the
   # question. `null` is a successful query that answered nothing (DIVE-2720).
-  st=$(_gate_gh "" 0 pr view "$dref" --json state,mergedAt -q '.state' 2>/dev/null || printf '')
+  st=$(_gate_gh "$tok" 0 pr view "$dref" --json state,mergedAt -q '.state' 2>/dev/null || printf '')
   [[ -n "$st" && "$st" != "null" ]]
 }
 
@@ -729,6 +741,88 @@ _gate_gh_nocred() {
 # "Could not resolve to a PullRequest" is deliberately NOT matched: that is a
 # credential which CAN see the repo answering about a PR number, and re-asking a
 # narrower rail cannot improve it.
+# DIVE-3888: THE SEAT'S OWNER-SCOPED READ TOKENS — the answer was already ON the seat,
+# in a file the gate never opened.
+#
+# `/usr/local/sbin/verifier-gh-read-token.sh` (cron, every 30 min) mints ONE read-only
+# App installation token PER INSTALLATION and writes them all to
+# `~/.config/5dive/gh-read-tokens.env` as `GH_READ_TOKEN_<OWNER>`. But `gh` reads ONE
+# token per host, so only the 5dive-ai one is written into `hosts.yml` — and that is
+# the only one `_gate_gh_token` arm 3 (`gh auth token`) can ever see. The lodar token
+# sat beside it, live, unused, for as long as both have existed.
+#
+# Measured 2026-09-02 from agent-quinn's own uid:
+#   GH_READ_TOKEN_5DIVE_AI -> repos/lodar/5dive-api : 404          (what the gate saw)
+#   GH_READ_TOKEN_LODAR    -> repos/lodar/5dive-api : lodar/5dive-api
+#   GH_READ_TOKEN_LODAR    -> pr view 140 --repo lodar/5dive-api :
+#                             {"number":140,"state":"MERGED","mergedAt":"2026-09-02T00:17:37Z"}
+#   GH_READ_TOKEN_LODAR    -> PATCH .../pulls/140  : 403 Resource not accessible
+#
+# So this is not a new grant and not a widening. The credential already exists, is
+# already minted for this seat by root, is already scoped `contents:read metadata:read
+# pull_requests:read` (the 403 above is the positive control, not an assumption), and
+# already expires in an hour. The only change is that the gate now looks in the file
+# the minting script writes.
+#
+# WHY IT IS SAFE TO PREFER IT ON THE BLIND PATH. It is consulted ONLY from the
+# DIVE-3496 escalation — a call that already failed with "cannot see this repository" —
+# so no query that answers today changes path. It is chosen BY OWNER, matching the
+# repo the query names, so it can never be pointed at a repo it was not minted for.
+# The file is root-written, mode 600, owned by the seat, so another seat cannot plant
+# one. And it is read-only by construction, which is the property the bot rail does
+# NOT have (`_gh_do` refuses only admin-class ops, so `pr merge` routes through it) —
+# this arm is the read rail a grader may hold, which the bot rail never was.
+
+# _gate_read_tokens_file — the seat's own gh-read-tokens.env, or empty.
+# $HOME is wrong under `sudo 5dive task done` (it is root's), and the tokens belong to
+# the CALLING seat, so fall back to that account's home. Both are checked because the
+# ordinary path — an agent closing its own row, no sudo — is the first one.
+_gate_read_tokens_file() {
+  local f
+  for f in "${HOME:-}/.config/5dive/gh-read-tokens.env" \
+           "$(getent passwd "$(actor_caller_unix_name 2>/dev/null || printf '')" 2>/dev/null | cut -d: -f6)/.config/5dive/gh-read-tokens.env"; do
+    [[ "$f" == /* && -r "$f" ]] || continue
+    printf '%s' "$f"; return 0
+  done
+  printf ''
+}
+
+# _gate_owner_read_token <owner> — the read-only token minted for THAT owner's
+# installation, or empty. Owner is uppercased with `-` -> `_`, which is the exact
+# transform the minting script uses (`5dive-ai` -> GH_READ_TOKEN_5DIVE_AI).
+_gate_owner_read_token() { # <owner>
+  local owner="${1:-}" f var val
+  [[ "$owner" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  f="$(_gate_read_tokens_file)"; [[ -n "$f" ]] || return 1
+  var="GH_READ_TOKEN_$(printf '%s' "$owner" | tr 'a-z-' 'A-Z_')"
+  # Sourced in a SUBSHELL so none of the file's names leak into the gate's own
+  # environment — a token in the ambient env would be picked up by arm 1 of
+  # _gate_gh_token on some later call and silently change a resolution nobody asked
+  # to change.
+  val=$(set -a; . "$f" >/dev/null 2>&1; set +a; printf '%s' "${!var:-}")
+  [[ -n "$val" ]] || return 1
+  printf '%s' "$val"
+}
+
+# _gate_owner_from_args — which repo OWNER does this gh call name? Two forms only,
+# the two the gate itself emits: a full pull URL, and `--repo <owner>/<name>` (or
+# `--repo=<owner>/<name>`). Anything else yields empty and the escalation proceeds
+# exactly as before — an unrecognised call must not be answered by a guess.
+_gate_owner_from_args() {
+  local a prev="" 
+  for a in "$@"; do
+    case "$a" in
+      https://github.com/*/*|http://github.com/*/*)
+        a="${a#*github.com/}"; printf '%s' "${a%%/*}"; return 0 ;;
+      --repo=*)
+        a="${a#--repo=}"; printf '%s' "${a%%/*}"; return 0 ;;
+    esac
+    if [[ "$prev" == "--repo" && "$a" == */* ]]; then printf '%s' "${a%%/*}"; return 0; fi
+    prev="$a"
+  done
+  printf ''
+}
+
 _gate_gh_blind_err() {
   local f="${1:-}"
   [[ -s "$f" ]] || return 1
@@ -788,6 +882,24 @@ _gate_gh() {
     # escalation's output cannot be appended to a partial one.
     if (( _rc != 0 )) && _gate_gh_blind_err "$_errf"; then
       local _blind; _blind="$(head -n1 "$_errf" 2>/dev/null || printf '')"
+      # DIVE-3888: BEFORE the credential-free rails, try the read-only token this seat
+      # already holds for the OWNER this query names. Same escalation contract as the
+      # rails below it — reached only from a call that failed blind, returns the
+      # original status and empty stdout if it also fails, so it can only convert an
+      # unanswered query into an answered one.
+      local _own _otok _oout="" _orc=0
+      _own="$(_gate_owner_from_args "$@")"
+      if [[ -n "$_own" ]] && _otok="$(_gate_owner_read_token "$_own")" && [[ "$_otok" != "$tok" ]]; then
+        local -a _obound=(); [[ "$secs" != "0" ]] && _obound=(timeout "${secs}s")
+        _oout=$(GH_TOKEN="$_otok" "${_obound[@]}" gh "$@" 2>/dev/null) || _orc=$?
+        if (( _orc == 0 )) && [[ -n "$_oout" ]]; then
+          _GATE_GH_LAST_ERR=""
+          _gate_tok_note "[5 owner read token GH_READ_TOKEN_${_own^^}] RESOLVED and ANSWERED (DIVE-3888)"
+          rm -f "$_errf" 2>/dev/null || true
+          printf '%s' "$_oout"
+          return 0
+        fi
+      fi
       local _esc_out="" _esc_rc=0 _esc_err="" _escerrf
       # DIVE-3496 it.2: the capture below runs the callee in a SUBSHELL, so its
       # `_GATE_GH_LAST_ERR` cannot travel back — name a sink file and read that.
@@ -804,7 +916,7 @@ _gate_gh() {
         printf '%s' "$_esc_out"
         return 0
       fi
-      _GATE_GH_LAST_ERR="the caller's own credential cannot see this repository (${_blind}); the credential-free rails were tried too and could not answer: ${_esc_err}"
+      _GATE_GH_LAST_ERR="the caller's own credential cannot see this repository (${_blind}); the seat's owner-scoped read token for '${_own:-?}' ${_own:+was ${_otok:+tried and could not answer}${_otok:-not present on this seat}}, and the credential-free rails were tried too and could not answer: ${_esc_err}"
       rm -f "$_errf" 2>/dev/null || true
       printf ''
       return "$_rc"

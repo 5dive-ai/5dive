@@ -892,9 +892,47 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
         db "SELECT COALESCE(merge_proof_at,'')||x'1f'||COALESCE(merge_proof_ref,'')||x'1f'||
                    COALESCE(merge_proof_by,'')||x'1f'||COALESCE(merge_proof_cmd,'')
             FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null || printf '')"
+      # DIVE-3888: THE `! _gate_gh_credentialed` CLAUSE IS GONE, and it was the bug.
+      #
+      # It asked what the caller HOLDS. A verifier seat here holds a GitHub App
+      # INSTALLATION token (`ghs_`) minted against the single pinned installation
+      # (the 5dive-ai org), so for a PERSONAL-account repo — lodar/5dive-api — the
+      # token is live and blind: measured 2026-09-02 from agent-quinn's own uid,
+      # `gh api rate_limit` answers 5100 while `gh api repos/lodar/5dive-api` is a
+      # 404. `_gate_gh_credentialed` is therefore TRUE, this rail was skipped, and
+      # the close fell through to the DIVE-2318 `done-pr-state-unresolved` refusal
+      # whose printed remedy ("check by hand and re-run") can never succeed on that
+      # seat because the blindness is permanent, not transient.
+      #
+      # The consequence is the inversion DIVE-3888 was filed on: a seat holding a
+      # WRONG-SCOPE token was strictly worse off than a seat holding NO token, which
+      # reaches this rail and closes on recorded evidence. Holding a credential
+      # disabled the fallback for not holding one.
+      #
+      # DIVE-3496's escalation does not rescue it either. That fix is real and it is
+      # installed (0.25.3) — `_gate_gh` retries the bot rail and then the anonymous
+      # rail when the caller's own stderr says it cannot see the repository — but on
+      # quinn BOTH escalation rails are gone: `5dive task merge-gate-selftest` run as
+      # agent-quinn prints "machine-account rail: not permitted on this seat" (its
+      # sudoers is a five-command allowlist with no `_gh_do`, which is correct —
+      # `_gh_do` refuses only admin-class ops, so it permits `pr merge` and is a
+      # can-push grant a grader must not hold), and the anonymous rail cannot read a
+      # private repo. So no rail can answer, which is exactly the state this rail
+      # exists for.
+      #
+      # `_gate_pr_state_answerable` is now the WHOLE credential predicate, and it is
+      # the honest one: it ASKS, with the caller's own token, so the proof is read
+      # only when nothing could answer. A caller whose token works still queries,
+      # gets a state, and never reaches the proof — no close that passes today
+      # changes path, and none of them can be turned into a merge by a stamp.
+      #
+      # COST, since the cheap-first ordering is what the clause also bought: the db
+      # read and `_gate_merge_proof_ok` still run FIRST, so this asks only on rows
+      # that ALREADY carry a proof stamped against the current binding. On those
+      # rows the same query runs a few lines below anyway; on every other row —
+      # which is nearly all of them — nothing extra is spent.
       if _gate_merge_proof_ok "$_mg_proof_at" "$_mg_proof_ref" "$_dref" \
-         && ! _gate_gh_credentialed "$(_gate_gh_token)" \
-         && ! _gate_pr_state_answerable "$_dref"; then
+         && ! _gate_pr_state_answerable "$_dref" "$(_gate_gh_token)"; then
         _mg_proof_ok=1
       fi
     fi
@@ -912,7 +950,12 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
       # the one message whose whole job is to say what is known and how.
       local _mg_why; _mg_why="$(_gate_anon_why)"
       [[ -n "$_mg_why" ]] || _mg_why="No credential-free rail was available to ask with on this host either."
-      warn "$ident: the merge gate could not GET AN ANSWER about $_dref — this seat holds no gh credential of its own, and the credential-free rail WAS asked and could not answer. ${_mg_why} So it is closing on RECORDED MACHINE EVIDENCE instead (DIVE-3823, audited): '$_mg_proof_by' ran \`$_mg_proof_cmd\` against $_mg_proof_ref at $_mg_proof_at and it exited 0. That is an attestation by a named seat, not an API answer — if the two ever disagree, the API is right."
+      # DIVE-3888: the sentence used to assert "this seat holds no gh credential of
+      # its own". That is now false on the seat this rail most often rescues — a
+      # blind-but-live installation token — and a message whose whole job is to say
+      # what is known must not assert something it did not measure. So it names what
+      # WAS measured: every rail this caller can reach was asked and none answered.
+      warn "$ident: the merge gate could not GET AN ANSWER about $_dref — every rail this seat can reach (its own gh credential if it holds one, the machine-account rail, and the credential-free rail) WAS asked about this pull request and none of them answered. ${_mg_why} So it is closing on RECORDED MACHINE EVIDENCE instead (DIVE-3823, audited): '$_mg_proof_by' ran \`$_mg_proof_cmd\` against $_mg_proof_ref at $_mg_proof_at and it exited 0. That is an attestation by a named seat, not an API answer — if the two ever disagree, the API is right."
     elif [[ -n "$_dref" || -n "$_branch" ]]; then
       _mg_had_subject=1     # a declared delivery IS something to verify
       if ! command -v gh >/dev/null 2>&1; then
