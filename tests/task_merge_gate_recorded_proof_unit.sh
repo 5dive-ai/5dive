@@ -111,6 +111,16 @@ while [[ $i -lt ${#a[@]} ]]; do
   esac
 done
 if [[ "$1" == "pr" && "$2" == "view" ]]; then
+  # DIVE-3888: a LIVE credential that cannot see the repository. This is not the
+  # same as "no credential" and not the same as a bare failure: gh exits non-zero
+  # and says so on STDERR, which is the string _gate_gh_blind_err keys the
+  # DIVE-3496 escalation on. Reproduced verbatim from agent-quinn's own uid,
+  # 2026-09-02, against lodar/5dive-api.
+  if [[ "${GH_STUB_BLIND:-0}" == "1" ]]; then
+    printf 'GraphQL: Could not resolve to a Repository with the name %s. (repository)\n' \
+      "'lodar/5dive-frontend'" >&2
+    exit 1
+  fi
   [[ -n "${GH_STUB_STATE:-}" ]] || exit 1
   printf '%s' "{\"state\":\"${GH_STUB_STATE}\",\"mergedAt\":${GH_STUB_MERGED:-null},\"statusCheckRollup\":[],\"headRefOid\":\"${GH_STUB_HEAD:-}\",\"mergeCommit\":null}" \
     | jq -r "$expr" 2>/dev/null; exit 0
@@ -198,6 +208,15 @@ no_rail()   { unset GH_TOKEN GITHUB_TOKEN GH_STUB_STATE GH_STUB_MERGED
               : >"$GH_ARGS_LOG"; : >"$CURL_ARGS_LOG"; }
 a_token()   { unset GH_TOKEN GITHUB_TOKEN; export SUDO_USER=""
               export GH_STUB_AUTH_TOKEN="tok-3823"; : >"$GH_ARGS_LOG"; }
+# DIVE-3888 — THE SEAT THIS TICKET IS ABOUT. A verifier holding a GitHub App
+# installation token that is LIVE (arm 3 of _gate_gh_token resolves it) and BLIND to
+# the target repo. sudo is stubbed rc 1 above, so the machine-account rail is not
+# permitted — which is the real agent-quinn, whose sudoers is a five-command
+# allowlist with no `_gh_do`.
+blind_tok() { unset GH_TOKEN GITHUB_TOKEN GH_STUB_STATE GH_STUB_MERGED
+              export SUDO_USER=""; export GH_STUB_AUTH_TOKEN="ghs_blind-3888"
+              export GH_STUB_BLIND=1
+              : >"$GH_ARGS_LOG"; : >"$CURL_ARGS_LOG"; }
 
 # ---------------------------------------------------------------------------
 # T0 — THE PREDICATE, on its own. Pure string logic: no db, no network, so it
@@ -370,6 +389,71 @@ sub "T9b the rail was asked before trusting it"  "$(cat "$CURL_ARGS_LOG")" "pull
 sub "T9b and the close names the 404 it got"     "$OUT" "404"
 unset CURL_STUB_ON CURL_STUB_PR CURL_STUB_BODY
 export FIVE_GATE_NO_ANON=1
+
+# ---------------------------------------------------------------------------
+# T10 — DIVE-3888: A LIVE TOKEN THAT CANNOT SEE THE REPO. Every arm above models
+# the caller's credential as present-and-working or absent. The seat that filed
+# this ticket is neither: agent-quinn's `gh` is authenticated as a GitHub App
+# INSTALLATION token minted against the single pinned installation (the 5dive-ai
+# org), so against a PERSONAL-account repo it is live and blind — measured
+# 2026-09-02 from that uid, `gh api rate_limit` answers 5100 while
+# `gh api repos/lodar/5dive-api` is a 404.
+#
+# Pre-fix, `_gate_merge_proof_ok && ! _gate_gh_credentialed && ! answerable` read
+# that token as a credential, skipped the recorded-proof rail, and refused with
+# `done-pr-state-unresolved` — whose printed remedy ("check by hand and re-run")
+# can never succeed, because the blindness is permanent. So holding a WRONG-SCOPE
+# token was strictly worse than holding none, which reaches this rail (T8/T9b).
+# T10a is that defect; it goes red if the credential clause comes back.
+#
+# Restoring the clause reds T10a. Deleting the answerable check instead — the fix
+# that looks right — reds T10c. Both halves are graded.
+# ---------------------------------------------------------------------------
+blind_tok
+seed K-1; bind_pr K-1 "$PRIVATE_PR"
+run_verify K-1 --no-done --merge-proof --cmd='printf blind-ancestor'
+chk "T10a the proof is recorded on the blind-token seat" "$VRC" "0"
+run_done K-1 --result='landed at feb7b12c'
+chk "T10a a blind LIVE token still closes on the proof" "$RC" "0"
+chk "T10a and the row is done"                          "$(statusof K-1)" "done"
+sub "T10a it closes on the recorded evidence"           "$OUT" "RECORDED MACHINE EVIDENCE"
+sub "T10a the token WAS asked before trusting the proof" "$(cat "$GH_ARGS_LOG")" "pull/12"
+nsub "T10a it does not claim the seat holds no credential" "$OUT" "holds no gh credential"
+
+# T10b — THE NARROWNESS, over the escalation. Same blind token, but the
+# credential-free rail is LIVE and the PR is public and OPEN. `_gate_gh` escalates
+# past the blind token (DIVE-3496) to a rail that ANSWERS, so the proof must not be
+# consulted and the refusal must quote the measured state.
+export CURL_STUB_ON=1 CURL_STUB_PR='repos/5dive-ai/5dive/pulls/998'
+PUBLIC_OPEN='https://github.com/5dive-ai/5dive/pull/998'
+export CURL_STUB_BODY='{"number":998,"state":"open","merged":false,"merged_at":null,"title":"t","head":{"ref":"b","sha":"0c9a0d5b"},"merge_commit_sha":"","html_url":"'"$PUBLIC_OPEN"'"}'
+FIVE_GATE_NO_ANON=0
+blind_tok
+seed K-2; bind_pr K-2 "$PUBLIC_OPEN"
+run_verify K-2 --no-done --merge-proof --cmd='true'
+: >"$CURL_ARGS_LOG"
+run_done K-2 --result='landed'
+chk "T10b an OPEN PR an escalation rail CAN read is not closed by a proof" "$((RC != 0))" "1"
+chk "T10b and the row stays open"               "$(statusof K-2)" "in_progress"
+nsub "T10b the proof did not close it"          "$OUT" "RECORDED MACHINE EVIDENCE"
+sub "T10b the refusal quotes the MEASURED state" "$OUT" "state=OPEN"
+sub "T10b and the escalation rail was asked"    "$(cat "$CURL_ARGS_LOG")" "pulls/998"
+unset CURL_STUB_ON CURL_STUB_PR CURL_STUB_BODY
+export FIVE_GATE_NO_ANON=1
+
+# T10c — A WORKING TOKEN IS UNCHANGED. The credential clause also bought
+# cheap-first ordering; `_gate_pr_state_answerable` now carries that weight alone.
+# A caller whose own token answers must still query, get a state, and never reach
+# the proof — no close that passes or refuses today changes path.
+a_token; export GH_STUB_BLIND=0 GH_STUB_STATE=OPEN; unset GH_STUB_MERGED
+seed K-3; bind_pr K-3 "$PRIVATE_PR"
+run_verify K-3 --no-done --merge-proof --cmd='true'
+run_done K-3 --result='landed'
+chk "T10c a working token is not overridden by a proof" "$((RC != 0))" "1"
+chk "T10c and the row stays open"               "$(statusof K-3)" "in_progress"
+nsub "T10c the proof was never consulted"       "$OUT" "RECORDED MACHINE EVIDENCE"
+sub "T10c the refusal quotes the token's answer" "$OUT" "state=OPEN"
+unset GH_STUB_BLIND GH_STUB_STATE
 
 printf '\n%s\n' "---- $PASS passed, $FAIL failed ----"
 [[ $FAIL -eq 0 ]]

@@ -288,8 +288,8 @@ _gate_merge_proof_ok() { # <proof_at> <proof_ref> <dref>
   [[ "$proof_ref" == "$dref" ]]
 }
 
-# _gate_pr_state_answerable <dref> — 0 when SOME rail available to this caller can
-# actually answer "what state is this PR in", asked about THIS pull request.
+# _gate_pr_state_answerable <dref> [tok] — 0 when SOME rail available to this caller
+# can actually answer "what state is this PR in", asked about THIS pull request.
 #
 # DIVE-3823 iteration 2, and this is the whole correction. Iteration 1 scoped the
 # recorded-evidence rail on `! _gate_gh_credentialed` — what the caller HOLDS — and
@@ -308,14 +308,26 @@ _gate_merge_proof_ok() { # <proof_at> <proof_ref> <dref>
 # only on the narrow path that reaches it (uncredentialed AND a proof already stamped
 # against the current binding). A 404 on a private repo — the DIVE-3808 shape — is
 # rc 1 here and cheap. An answer of any kind is rc 0 and the proof is never consulted.
-_gate_pr_state_answerable() { # <dref>
-  local dref="${1:-}" st=""
+#
+# DIVE-3888: IT NOW TAKES THE CALLER'S TOKEN, because the caller may hold one and
+# still be blind. Iteration 2 passed an empty token on the reasoning quoted below —
+# "this is only ever called when _gate_gh_credentialed is false, so there is no
+# token to pass". That premise died with the `! _gate_gh_credentialed` clause at the
+# call site (see src/task/status.sh, DIVE-3888): the rail is now reached by a caller
+# that DOES hold a token, and asking with an empty one would skip the caller's own
+# credential and the DIVE-3496 escalation behind it — i.e. it would under-answer and
+# consult a recorded proof while a live rail could have said MERGED. Passing the
+# token restores the invariant this predicate exists to hold: the proof is read only
+# when NOTHING could answer. Empty `tok` behaves exactly as before.
+_gate_pr_state_answerable() { # <dref> [tok]
+  local dref="${1:-}" tok="${2:-}" st=""
   [[ "$dref" =~ ^https?:// ]] || return 1
-  # Empty token deliberately: this is only ever called when _gate_gh_credentialed is
-  # false, so there is no token to pass and the bot rail is not permitted — asking
-  # with an empty one routes to the credential-free rail, which is the rail in
+  # `_gate_gh` with a token runs the caller's credential first and, on a stderr that
+  # says "cannot see this repository", escalates to the bot rail and then the
+  # credential-free rail (DIVE-3496). With an empty token it routes straight to those
+  # two. Either way this asks with everything the caller can reach, which is the
   # question. `null` is a successful query that answered nothing (DIVE-2720).
-  st=$(_gate_gh "" 0 pr view "$dref" --json state,mergedAt -q '.state' 2>/dev/null || printf '')
+  st=$(_gate_gh "$tok" 0 pr view "$dref" --json state,mergedAt -q '.state' 2>/dev/null || printf '')
   [[ -n "$st" && "$st" != "null" ]]
 }
 
