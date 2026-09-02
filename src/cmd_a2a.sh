@@ -66,8 +66,38 @@
 # on it. Asking for more than retention sets `source.windowExceedsRetention`
 # and says so in text mode. Silently answering a question the data cannot
 # support is the same class as the collapse above.
+#
+# ...AND THE WINDOW IS RANGE-CHECKED BEFORE IT IS MULTIPLIED (quinn, iteration 1).
+# A shape-and-sign check is not a range check: `--window=9223372036854775807`
+# passed `^[0-9]+$`, and `hours * 3600` then overflowed int64 to -3600, putting
+# the cutoff in the FUTURE and dropping every row. The sting was that
+# `windowExceedsRetention` is derived from the ALREADY-OVERFLOWED seconds, so it
+# reported false — the caveat built to catch a mislabelled window certified the
+# widest possible request as within retention, and text mode printed no note.
+# State `read`, ok true, rc 0, rounds 0: the quiet-ledger collapse arriving
+# through the front door, on the one field a UI behind /shell/exec is most
+# likely to pass through unvalidated. A guard derived from an overflowed
+# quantity inherits the overflow, so the bound is on the INPUT.
+# (community/wiki/an-overflowing-window-multiplier-is-a-silent-zero.md)
+#
+# `nextSendWarns` IS A CLAIM ABOUT THE WRITER, SO IT IS COUNTED IN THE WRITER'S
+# WINDOW (quinn, iteration 1). `a2a_round_guard` decides via `a2a_round_count`,
+# which counts over A2A_ROUND_WINDOW_SECS no matter who is asking. Re-deriving
+# the field as `rounds >= cap` over the CALLER's `--window` reuses the
+# COMPARISON but not the COUNTING WINDOW — same cap, same operator, different
+# population — and at any window below retention it is a FALSE CLEAR: a pair the
+# guard will warn on reports nextSendWarns:false, unflagged, because
+# windowExceedsRetention only guards the other direction. A floor consumer then
+# under-reports exactly the hot pairs the cap exists to surface. So the pair
+# rows carry `guardWindowRounds` counted over retention, `nextSendWarns` is
+# derived from THAT, and `summary.pairsOverCapOutsideWindow` names the hot pairs
+# that fall outside the requested window entirely rather than dropping them
+# silently. (community/wiki/a-reused-threshold-over-a-re-derived-population.md)
 
 _A2A_WINDOW_HOURS_DEFAULT=24
+# Ten years. Wide enough that no honest question is refused, far enough below
+# the int64 ceiling that `hours * 3600` cannot wrap. See the header.
+_A2A_WINDOW_HOURS_MAX=87600
 
 _a2a_usage() {
   cat <<USAGE
@@ -75,7 +105,7 @@ _a2a_usage() {
 
   5dive a2a rounds                          # who has been talking to whom, per seat
   5dive a2a rounds --json                   # machine-readable; this is what the floor projects
-  5dive a2a rounds --window=<hours>         # default ${_A2A_WINDOW_HOURS_DEFAULT}h (= the ledger's own retention)
+  5dive a2a rounds --window=<hours>         # default ${_A2A_WINDOW_HOURS_DEFAULT}h (= the ledger's own retention), max ${_A2A_WINDOW_HOURS_MAX}
   5dive a2a rounds --agent=<seat>           # one seat's partners and topics
   5dive a2a rounds --topic=<ident>          # one topic (a task ident, or 'pair' for identless chat)
 
@@ -91,6 +121,10 @@ Source state is one of three and the third is not a pass:
   read        the ledger was read; zero rows means zero traffic
   absent      no ledger on this box yet; zero rows is a real answer
   unreadable  present and unreadable by this uid. UNKNOWN, exits 3, never green.
+
+'nextSendWarns' is counted over the ledger's own retention window, NOT over
+--window: it is a claim about what a2a_round_guard will do on the next send, and
+the guard never looks at your window. 'guardWindowRounds' is that count.
 USAGE
 }
 
@@ -116,15 +150,25 @@ cmd_a2a_rounds() {
       *) fail "$E_USAGE" "unknown argument '$a'. See 5dive a2a --help." ;;
     esac
   done
-  [[ "$window_hours" =~ ^[0-9]+$ ]] && (( window_hours > 0 )) \
-    || fail "$E_USAGE" "--window takes a positive whole number of hours, got '${window_hours}'."
+  # Bound the DIGIT COUNT first: `$(( ))` on a 20-digit literal already wraps, so
+  # any numeric comparison written after the arithmetic is comparing the damage.
+  # 7 digits keeps hours*3600 six orders of magnitude below the int64 ceiling,
+  # and 10# keeps a leading zero from being read as octal.
+  [[ "$window_hours" =~ ^[0-9]{1,7}$ ]] && (( 10#$window_hours > 0 )) \
+    || fail "$E_USAGE" "--window takes a positive whole number of hours, capped at ${_A2A_WINDOW_HOURS_MAX}, got '${window_hours}'."
+  (( 10#$window_hours <= _A2A_WINDOW_HOURS_MAX )) \
+    || fail "$E_USAGE" "--window takes a positive whole number of hours, capped at ${_A2A_WINDOW_HOURS_MAX}, got '${window_hours}'. The ledger is pruned to $(( A2A_ROUND_WINDOW_SECS / 3600 ))h on write, so anything past the cap is a label rather than history."
+  window_hours=$(( 10#$window_hours ))
 
   local ledger="$A2A_ROUND_LEDGER"
-  local now w cutoff ret
+  local now w cutoff ret guard_cutoff
   now=$(date +%s)
   w=$(( window_hours * 3600 ))
   cutoff=$(( now - w ))
   ret="$A2A_ROUND_WINDOW_SECS"
+  # The writer's own window. a2a_round_count uses exactly this and nothing else,
+  # so this is the population nextSendWarns has to be counted over.
+  guard_cutoff=$(( now - ret ))
 
   # The three states, resolved BEFORE any read, so `absent` and `unreadable` are
   # distinguished by the filesystem rather than by an empty result.
@@ -151,13 +195,16 @@ cmd_a2a_rounds() {
   # counted on a separate stream rather than discarded: see the header.
   local rows="" malformed=0
   if [[ "$state" == "read" ]]; then
-    rows=$(awk -F'\t' -v c="$cutoff" -v only="$only" -v top="$topic_only" '
+    # A row is emitted if it is in EITHER window, tagged with which. Neither
+    # population is a subset of the other in general: --window below retention
+    # makes the guard window wider, --window above it makes the report wider.
+    rows=$(awk -F'\t' -v c="$cutoff" -v g="$guard_cutoff" -v only="$only" -v top="$topic_only" '
       NF == 0 { next }
       NF != 4 || $4 !~ /^[0-9]+$/ || $1 == "" || $2 == "" || $3 == "" { bad++; next }
-      $4 < c { next }
+      $4 < c && $4 < g { next }
       only != "" && $1 != only && $2 != only { next }
       top  != "" && $3 != top { next }
-      { printf "%s\t%s\t%s\t%s\n", $1, $2, $3, $4 }
+      { printf "%s\t%s\t%s\t%s\t%d\t%d\n", $1, $2, $3, $4, ($4 >= c), ($4 >= g) }
       END { printf "\037%d\n", bad+0 }
     ' "$ledger" 2>/dev/null) || {
       # An awk that could not run is not an empty ledger. Same third state.
@@ -184,23 +231,54 @@ cmd_a2a_rounds() {
     def rows: [ inputs
                 | select(length > 0)
                 | split("\t")
-                | select(length == 4)
-                | {from: .[0], to: .[1], topic: .[2], ts: (.[3] | tonumber)} ];
-    ( if $state == "read" then rows else [] end ) as $r
+                | select(length == 6)
+                | {from: .[0], to: .[1], topic: .[2], ts: (.[3] | tonumber),
+                   inWindow: (.[4] == "1"), inGuard: (.[5] == "1")} ];
+    ( if $state == "read" then rows else [] end ) as $all
+    # $r is the REPORT population (--window). $guardPairs is the WRITER
+    # population (retention), which is the only one a2a_round_count ever reads.
+    | [ $all[] | select(.inWindow) ] as $r
+    | ( [ $all[] | select(.inGuard) ]
+        | group_by([.from, .to, .topic])
+        | map({from: .[0].from, to: .[0].to, topic: .[0].topic, n: length}) ) as $guardPairs
     # The seat list is the union of both endpoints, so a seat that only RECEIVED
     # in the window is still a row in the recap. Narrowed to the requested seat
     # when --agent is given, rather than also listing its partners at top level.
-    | ( if $only != "" then [$only]
+    # On `unreadable` it is EMPTY even under --agent: a sent:0/received:0 row for
+    # a seat on a read that never happened is a fabricated record, and `absent`
+    # is the state where a zero is a real answer, not this one.
+    | ( if $state == "unreadable" then []
+        elif $only != "" then [$only]
         else ([ $r[].from ] + [ $r[].to ] | unique) end ) as $seats
     | [ $r | group_by([.from, .to, .topic])[]
-            | {from: .[0].from, to: .[0].to, topic: .[0].topic,
-               rounds: length,
-               lastAt: ([.[].ts] | max),
-               # a2a_round_guard counts BEFORE it records, so a pair sitting at
-               # exactly the cap is one where the NEXT send warns. Same predicate
-               # a2a_rounds_report uses; named for what it predicts.
-               nextSendWarns: (length >= $cap)} ]
+            | . as $g
+            # Look the pair up in the guard population by its three keys rather
+            # than joining on a packed string — a topic may legally contain the
+            # separator, and a key collision here would be a silent miscount.
+            | ( [ $guardPairs[]
+                  | select(.from == $g[0].from and .to == $g[0].to
+                           and .topic == $g[0].topic) ]
+                | (.[0].n // 0) ) as $gn
+            | {from: $g[0].from, to: $g[0].to, topic: $g[0].topic,
+               rounds: ($g | length),
+               lastAt: ([ $g[].ts ] | max),
+               # a2a_round_guard counts BEFORE it records, over its OWN window,
+               # so a pair sitting at exactly the cap there is one whose NEXT
+               # send warns, whatever window this report was asked for.
+               guardWindowRounds: $gn,
+               nextSendWarns: ($gn >= $cap)} ]
       | sort_by(-.rounds, .from, .to, .topic) as $pairs
+    # A pair can be at the cap in the writer window and have NO rounds in the
+    # requested one. It is not in $pairs and must not therefore read as cool:
+    # count it out loud instead.
+    | ( [ $guardPairs[]
+          | select(.n >= $cap)
+          | . as $gp
+          | select( ( $pairs
+                      | map(select(.from == $gp.from and .to == $gp.to
+                                   and .topic == $gp.topic))
+                      | length ) == 0 ) ]
+        | length ) as $hotOutside
     # ONE pass per seat. An earlier shape grouped partners with `... as $p`
     # inside the object constructor, which jq rejects — group_by feeding map is
     # the form that composes, and it keeps topics on the same pass instead of
@@ -246,7 +324,8 @@ cmd_a2a_rounds() {
                    seats: ($seatRecords | length),
                    pairs: ($pairs | length),
                    topics: ([ $r[].topic ] | unique | length),
-                   pairsOverCap: ([ $pairs[] | select(.nextSendWarns) ] | length)},
+                   pairsOverCap: ([ $pairs[] | select(.nextSendWarns) ] | length),
+                   pairsOverCapOutsideWindow: $hotOutside},
          seats: $seatRecords,
          pairs: $pairs}}
   ') || fail "$E_GENERIC" "could not assemble the a2a rounds payload from ${ledger}."
@@ -304,10 +383,11 @@ _a2a_rounds_text() {
     local hot
     hot=$(jq -r '.data.summary.pairsOverCap' <<<"$payload")
     if [[ "$hot" != "0" ]]; then
-      printf '\nat or over the cap of %s (the next send in that direction warns):\n' \
-        "$(jq -r '.data.roundCap' <<<"$payload")"
+      printf '\nat or over the cap of %s in the ledger'"'"'s own %sh window (the next send in that direction warns):\n' \
+        "$(jq -r '.data.roundCap' <<<"$payload")" \
+        "$(( $(jq -r '.data.source.retentionSec' <<<"$payload") / 3600 ))"
       jq -r '.data.pairs[] | select(.nextSendWarns)
-             | "  • \(.from) -> \(.to) on \(.topic): \(.rounds) rounds"' <<<"$payload"
+             | "  • \(.from) -> \(.to) on \(.topic): \(.guardWindowRounds) rounds (\(.rounds) in the window asked for)"' <<<"$payload"
     fi
     printf '\n%s rounds, %s seats, %s directed pairs, %s topics\n' \
       "$rounds" \
@@ -320,10 +400,11 @@ _a2a_rounds_text() {
   return 0
 }
 
-# The two ways this output can be quietly wrong: a window wider than the ledger's
-# own retention, and a row that could not be parsed. Both are printed rather than
-# only carried in the JSON, and both print on EVERY exit path — a mislabelled
-# window is mislabelled whether or not the file was readable.
+# The three ways this output can be quietly wrong: a window wider than the
+# ledger's own retention, a row that could not be parsed, and a pair the guard
+# will warn on that has nothing inside the window asked for. All three are
+# printed rather than only carried in the JSON, and all print on EVERY exit path
+# — a mislabelled window is mislabelled whether or not the file was readable.
 _a2a_rounds_caveats() {
   local payload="$1" hours="$2"
   if [[ "$(jq -r '.data.source.windowExceedsRetention' <<<"$payload")" == "true" ]]; then
@@ -333,5 +414,10 @@ _a2a_rounds_caveats() {
   fi
   local mal; mal=$(jq -r '.data.source.malformedRows' <<<"$payload")
   [[ "$mal" != "0" ]] && printf 'NOTE: %s malformed ledger row(s) skipped — the counts above are a floor, not a total.\n' "$mal"
+  # A hot pair with nothing inside the requested window is invisible in the table
+  # above. Saying nothing here is the same false-clear the field itself had.
+  local outside; outside=$(jq -r '.data.summary.pairsOverCapOutsideWindow' <<<"$payload")
+  [[ "$outside" != "0" ]] && printf 'NOTE: %s pair(s) are at or over the cap in the ledger'"'"'s %sh window but have no rounds inside the %sh asked for — widen --window to see them.\n' \
+    "$outside" "$(( $(jq -r '.data.source.retentionSec' <<<"$payload") / 3600 ))" "$hours"
   return 0
 }

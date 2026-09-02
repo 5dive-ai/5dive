@@ -166,6 +166,84 @@ check "bare 'a2a' prints its own usage" \
 check "the verb is advertised in the top-level usage" \
   "$(case "$help_top" in *'5dive a2a rounds'*) echo yes ;; *) echo no ;; esac)" "yes"
 
+echo "== nextSendWarns is counted in the WRITER's window, not the caller's (iteration 2) =="
+# quinn's exact repro. a2a_round_guard decides via a2a_round_count, which counts
+# over A2A_ROUND_WINDOW_SECS no matter who is asking. Re-deriving the field over
+# --window reuses the COMPARISON but not the COUNTING WINDOW, and at any window
+# below retention that is a FALSE CLEAR on exactly the pairs the cap exists to
+# surface. Every cap arm above runs at the DEFAULT window, where the two
+# populations coincide by construction — which is why 40/40 did not see it.
+G="$TMP/guardwin.tsv"
+{
+  printf 'main\tquinn\tDIVE-1\t%s\n' $((NOW-36000))   # 10h old: guard yes, --window=1 no
+  printf 'main\tquinn\tDIVE-1\t%s\n' $((NOW-60))      # 1min old: both
+} > "$G"
+g_def="$(j "$G")"; g_1h="$(j "$G" --window=1)"
+check "at the default window the pair is at cap" \
+  "$(jq -r '.data.pairs[]|select(.from=="main").nextSendWarns' <<<"$g_def")" "true"
+check "one round is inside the 1h window" \
+  "$(jq -r '.data.summary.rounds' <<<"$g_1h")" "1"
+check "the narrow window still warns (this was false before the fix)" \
+  "$(jq -r '.data.pairs[]|select(.from=="main").nextSendWarns' <<<"$g_1h")" "true"
+check "pairsOverCap survives the narrow window" \
+  "$(jq -r '.data.summary.pairsOverCap' <<<"$g_1h")" "1"
+check "the two counts are reported separately, not conflated" \
+  "$(jq -r '.data.pairs[]|select(.from=="main")|"\(.rounds)/\(.guardWindowRounds)"' <<<"$g_1h")" "1/2"
+# The other direction: a pair inside a WIDE window but outside the guard window
+# must NOT warn — the guard will not see those rows either.
+check "a round older than retention does not warn under a wide window" \
+  "$(jq -r '.data.pairs[]|select(.topic=="DIVE-9").nextSendWarns' <<<"$(j "$L" --window=168)")" "false"
+
+echo "== a hot pair with nothing inside the window is COUNTED, not dropped =="
+H="$TMP/hotoutside.tsv"
+{
+  printf 'main\tquinn\tDIVE-7\t%s\n' $((NOW-36000))
+  printf 'main\tquinn\tDIVE-7\t%s\n' $((NOW-39600))
+} > "$H"
+h_1h="$(j "$H" --window=1)"
+check "no pairs inside the 1h window"  "$(jq -r '.data.pairs|length' <<<"$h_1h")" "0"
+check "but the hot pair is counted out loud" \
+  "$(jq -r '.data.summary.pairsOverCapOutsideWindow' <<<"$h_1h")" "1"
+check "text mode says so"  "$(run "$H" --window=1 2>/dev/null | grep -c 'widen --window')" "1"
+check "at the default window it is a normal hot pair, not an outside one" \
+  "$(jq -r '"\(.data.summary.pairsOverCap)/\(.data.summary.pairsOverCapOutsideWindow)"' <<<"$(j "$H")")" "1/0"
+
+echo "== --window is range-checked BEFORE it is multiplied (iteration 2) =="
+# hours*3600 wraps int64 at the top of the range, putting the cutoff in the
+# FUTURE so the awk filter drops every row — and windowExceedsRetention, derived
+# from the already-overflowed seconds, then reports false. State read, ok true,
+# rc 0, rounds 0, no note: the quiet-ledger collapse through the front door. A
+# guard computed from an overflowed quantity inherits the overflow, so the bound
+# has to be on the INPUT.
+# 18446744073709551716 and ...638400 are the sharp ones: they wrap to 100 and to
+# 86784, both POSITIVE and both under the cap, so a range check written after the
+# arithmetic accepts them and silently answers a different question than the one
+# asked. The digit-count bound is what refuses them, and it has to come first.
+for w in 9223372036854775807 99999999999999999999 2562047788015215 87601 \
+         18446744073709551716 18446744073709638400; do
+  check "--window=$w refused" \
+    "$(A2A_ROUND_LEDGER="$L" "$BIN" a2a rounds --window="$w" 2>&1 >/dev/null | grep -c 'capped at')" "1"
+  check "--window=$w does not render an idle fleet" \
+    "$(A2A_ROUND_LEDGER="$L" "$BIN" a2a rounds --json --window="$w" 2>/dev/null | jq -r '.data.summary.rounds // "refused"')" "refused"
+done
+check "the largest accepted window still reads"  "$(jq -r '.data.summary.rounds' <<<"$(j "$L" --window=87600)")" "5"
+check "and is still flagged as past retention"   "$(jq -r '.data.source.windowExceedsRetention' <<<"$(j "$L" --window=87600)")" "true"
+check "windowSec never goes negative at the ceiling" \
+  "$(jq -r '.data.windowSec > 0' <<<"$(j "$L" --window=87600)")" "true"
+check "a leading zero is decimal, not octal" \
+  "$(jq -r '.data.windowSec' <<<"$(j "$L" --window=024)")" "86400"
+
+echo "== an unmeasured read fabricates no seat row, even under --agent =="
+if [ -r "$U" ]; then
+  printf '  SKIP unreadable+--agent arm (running as root)\n'
+else
+  check "unreadable + --agent emits no seats[] record" \
+    "$(jq -r '.data.seats|length' <<<"$(j "$U" --agent=main 2>/dev/null)")" "0"
+  # `absent` is the state where a zero IS the answer, so it keeps its row.
+  check "absent + --agent still reports the seat it was asked about" \
+    "$(jq -r '.data.seats|length' <<<"$(j "$TMP/never-written.tsv" --agent=main)")" "1"
+fi
+
 echo
 printf 'a2a rounds json: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
