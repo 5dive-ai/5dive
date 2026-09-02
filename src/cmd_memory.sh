@@ -97,10 +97,12 @@ _memory_usage() {
                           `memory check`, so it is refused if it writes, escapes
                           (sudo/rm/curl|sh), or is trivially green (`true`, `:`,
                           a bare echo) — a check that cannot go red is not one.
-                          It is also refused if it is NOT A COMMAND: the shell
-                          must parse it, and a bare head word must resolve here.
-                          `--check=` reads like a description field; a sentence
-                          in it makes the pass accuse a true fact (DIVE-3909).
+                          It is also refused if THE SHELL CANNOT PARSE IT:
+                          `--check=` reads like a description field, and a
+                          sentence in it made the pass accuse a true fact
+                          (DIVE-3909). A check that parses but names a command
+                          absent from this box is still accepted — that is the
+                          `unknown` the pass exists to report.
         --no-check="<why>" the recorded opt-out. Not free: the reason is written
                           to frontmatter as `no_check:`, so an unchecked fact is
                           COUNTABLE rather than merely absent.
