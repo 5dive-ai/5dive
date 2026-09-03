@@ -68,6 +68,17 @@ PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
+# FIXTURE SEAT NAMES ARE NEVER REAL SEAT NAMES. `_run_role` compares the row's
+# `verifier`/`maker_agent` against the SEAT EXECUTING THE SUITE, so a fixture
+# that writes a real board name is red on exactly that one seat and green on
+# every other — `--verifier=quinn` here was 43/43 for dev and 42/43 for quinn.
+#
+# MUTATION TESTING CANNOT SEE THIS CLASS: a mutant is graded on one seat too, so
+# mutation grades the ASSERTION while only a SECOND SEAT grades the FIXTURE.
+# Section 0 below closes that by making the collision gradable from one seat.
+FIX_MAKER=fixture-maker-noseat
+FIX_VERIFIER=fixture-verifier-noseat
+
 addt() { ( JSON_MODE=1 cmd_task_add "$@" ) 2>/dev/null | jq -r '.data.id'; }
 rfld() { db "SELECT COALESCE($2,'NULL') FROM runs WHERE id=$(sqlq "$1");"; }
 runs_of() { db "SELECT COUNT(*) FROM runs WHERE task_id=$1;"; }
@@ -89,10 +100,28 @@ _task_human_send_allowed() { return 0; }
 # best-effort by design and must degrade to an empty cursor, never to an error.
 _run_journal_cursor()  { printf ''; }
 
+# Resolved AFTER the boundary stubs above, so the seat is read under exactly the
+# conditions every arm below runs under.
+SEAT=$(_run_seat)
+
+# ---------------------------------------------------------------------------
+# 0. THIS SUITE IS SEAT-INDEPENDENT. Every fixture agent name must be a name no
+#    seat holds, so the result is the same on dev, on quinn and on CI. The one
+#    deliberate exception is the verifier-role arm below, which uses $SEAT
+#    precisely because it is grading that the RUNNING seat resolves.
+# ---------------------------------------------------------------------------
+_collide=""
+for _n in "$FIX_MAKER" "$FIX_VERIFIER" someseat crashseat someoneelse nobody-ever-ran; do
+  [[ -n "$SEAT" && "$_n" == "$SEAT" ]] && _collide="$_n"
+done
+[[ -z "$_collide" ]] \
+  && ok_t "no fixture agent name is the running seat (same result on every seat)" \
+  || bad_t "a fixture agent name IS the running seat" "seat=[$SEAT] name=[$_collide]"
+
 # ---------------------------------------------------------------------------
 # 1. A claim OPENS a run; a second claim in the same activation REUSES it.
 # ---------------------------------------------------------------------------
-id1=$(addt "alpha" --assignee=dev)
+id1=$(addt "alpha" --assignee="$FIX_MAKER")
 ( cmd_task_start "$id1" --no-preflight ) >/dev/null 2>&1
 r1=$(open_of "$id1")
 [[ -n "$r1" ]] && ok_t "claim opens a run" || bad_t "claim opened no run"
@@ -134,7 +163,7 @@ rd=$(run_open "$id2" "DIVE-y" "heartbeat dispatch" "" "someseat")
   || bad_t "done closed wrong" "status=[$(rfld "$r1" status)] outcome=[$(rfld "$r1" outcome)]"
 [[ "$(rfld "$r1" ended_at)" != "NULL" ]] && ok_t "done stamps ended_at" || bad_t "ended_at not stamped"
 
-id3=$(addt "gamma" --assignee=dev --verifier=quinn)
+id3=$(addt "gamma" --assignee="$FIX_MAKER" --verifier="$FIX_VERIFIER")
 ( cmd_task_start "$id3" --no-preflight ) >/dev/null 2>&1
 r3=$(open_of "$id3")
 ( cmd_task_done "$id3" --result="for review" ) >/dev/null 2>&1
@@ -149,7 +178,6 @@ r3=$(open_of "$id3")
 # reason role is stored is that "verifier rejection rate" has to be separable
 # from "maker failure rate". An arm that only ever sees `maker` passes
 # identically against a resolver hardcoded to return it (caught by mutation).
-SEAT=$(_run_seat)
 id3v=$(addt "gamma-verify" --assignee="$SEAT")
 db "UPDATE tasks SET verifier=$(sqlq "$SEAT"), maker_agent='someoneelse' WHERE id=$id3v;"
 r3v=$(run_open "$id3v" "DIVE-gv" "verifier claim")
@@ -170,7 +198,7 @@ snap2=$(db "SELECT status||'|'||COALESCE(outcome,'')||'|'||COALESCE(ended_at,'')
   && ok_t "closing an already-closed run is a NO-OP (the first boundary wins)" \
   || bad_t "a second close rewrote a terminal run" "first=[$snap] second=[$snap2]"
 
-id4=$(addt "delta" --assignee=dev)
+id4=$(addt "delta" --assignee="$FIX_MAKER")
 ( cmd_task_start "$id4" --no-preflight ) >/dev/null 2>&1
 r4=$(open_of "$id4")
 ( cmd_task_cancel "$id4" --result="not needed" ) >/dev/null 2>&1
@@ -183,7 +211,7 @@ r4=$(open_of "$id4")
 # funnel, so a hook placed only in the funnel closes neither — which is exactly
 # what a mutation sweep caught: the funnel's `blocked` arm survived every mutant
 # because nothing reachable ever entered it.
-id5=$(addt "epsilon" --assignee=dev)
+id5=$(addt "epsilon" --assignee="$FIX_MAKER")
 ( cmd_task_start "$id5" --no-preflight ) >/dev/null 2>&1
 r5=$(open_of "$id5")
 ( cmd_task_park "$id5" --reason="waiting on upstream" --wake="+7d" ) >/dev/null 2>&1
@@ -194,8 +222,8 @@ r5=$(open_of "$id5")
   && ok_t "park -> parked, NOT failed (a deliberate hold is neither success nor failure)" \
   || bad_t "park closed wrong" "status=[$(rfld "$r5" status)] outcome=[$(rfld "$r5" outcome)]"
 
-id5b=$(addt "epsilon-blocker" --assignee=dev)
-id5c=$(addt "epsilon-blocked" --assignee=dev)
+id5b=$(addt "epsilon-blocker" --assignee="$FIX_MAKER")
+id5c=$(addt "epsilon-blocked" --assignee="$FIX_MAKER")
 ( cmd_task_start "$id5c" --no-preflight ) >/dev/null 2>&1
 r5c=$(open_of "$id5c")
 ( cmd_task_block "$id5c" --by="$id5b" ) >/dev/null 2>&1
@@ -242,7 +270,7 @@ after=$(db "SELECT id||'|'||status||'|'||COALESCE(outcome,'')||'|'||COALESCE(end
 # ---------------------------------------------------------------------------
 # 7. human_touch: a tier-1/2 gate sets it; a TIER-0 gate does not.
 # ---------------------------------------------------------------------------
-id7=$(addt "eta" --assignee=dev)
+id7=$(addt "eta" --assignee="$FIX_MAKER")
 ( cmd_task_start "$id7" --no-preflight ) >/dev/null 2>&1
 r7=$(open_of "$id7")
 ( cmd_task_need "$id7" --type=decision --ask="pick" --options="A|B" --recommend="A" \
@@ -250,7 +278,7 @@ r7=$(open_of "$id7")
 [[ "$(rfld "$r7" human_touch)" == "1" ]] \
   && ok_t "a tier-2 gate marks the run human-touched" \
   || bad_t "tier-2 gate did not mark human_touch" "got=[$(rfld "$r7" human_touch)]"
-id8=$(addt "theta" --assignee=dev)
+id8=$(addt "theta" --assignee="$FIX_MAKER")
 ( cmd_task_start "$id8" --no-preflight ) >/dev/null 2>&1
 r8=$(open_of "$id8")
 ( cmd_task_need "$id8" --type=decision --ask="pick" --options="A|B" --recommend="A" --tier=0 ) >/dev/null 2>&1
