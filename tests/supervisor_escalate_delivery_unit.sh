@@ -197,7 +197,7 @@ tick_arm() {  # <snapshot-json> [armed] [seed-sql] [registry-json] [rotated|no-t
     _sup_snapshot()     { printf "%s" "$SNAP"; }      # the fixture fleet
     registry_read()     { printf "%s" "$FIXTURE_REGISTRY"; }
     _task_agent_channel() { return 1; }               # no telegram anywhere
-    : >"$TMP/sent"; : >"$TMP/restarted"; : >"$TMP/rotated"; : >"$TMP/capacity-alerts"
+    : >"$TMP/sent"; : >"$TMP/restarted"; : >"$TMP/rotated"; : >"$TMP/capacity-alerts"; : >"$TMP/capacity-human"
     cmd_send() { printf "%s\n" "$1" >>"$TMP/sent"; return 0; }
     cmd_restart() { printf "%s\n" "$1" >>"$TMP/restarted"; return 0; }
     # DIVE-3856: rung 4 re-probes the poller after its own restart. Both stubs
@@ -219,7 +219,10 @@ tick_arm() {  # <snapshot-json> [armed] [seed-sql] [registry-json] [rotated|no-t
         *)         return 1 ;;
       esac
     }
-    _sup_capacity_alert() { printf "%s:%s\n" "$1" "$2" >>"$TMP/capacity-alerts"; }
+    # DIVE-3940: capture the 4th arg (notify_human) into its own field so an arm
+    # can grade the classification->human-leg wiring. name:class stays in
+    # capacity-alerts unchanged; the human decision lands in capacity-human.
+    _sup_capacity_alert() { printf "%s:%s\n" "$1" "$2" >>"$TMP/capacity-alerts"; printf "%s:%s\n" "$1" "${4:-true}" >>"$TMP/capacity-human"; }
     # The seed writes BEFORE the tick, so it has to create the schema itself —
     # nothing else has touched this fixture DB yet. Both calls are subshelled:
     # `db` reaches `fail`, and `fail` EXITS, which `|| true` cannot catch.
@@ -232,7 +235,7 @@ tick_arm() {  # <snapshot-json> [armed] [seed-sql] [registry-json] [rotated|no-t
       cmd_supervisor_tick >/dev/null 2>&1 || { printf "TICK-RC=%s|" "$?"; }
       tick_n=$((tick_n + 1))
     done
-    printf "ESC=%s|SENT=%s|ACT=%s|RESTARTED=%s|ROTATED=%s|ALERTS=%s|ALERT_ROWS=%s|NUDGE_ROWS=%s" \
+    printf "ESC=%s|SENT=%s|ACT=%s|RESTARTED=%s|ROTATED=%s|ALERTS=%s|ALERT_ROWS=%s|NUDGE_ROWS=%s|HUMAN=%s" \
       "$(db "SELECT COALESCE(GROUP_CONCAT(signals), \"\") FROM supervisor_events WHERE event=$(sqlq escalate);")" \
       "$(paste -sd, <"$TMP/sent")" \
       "$(db "SELECT COALESCE(GROUP_CONCAT(signals), \"\") FROM supervisor_events WHERE event=$(sqlq action);")" \
@@ -240,7 +243,8 @@ tick_arm() {  # <snapshot-json> [armed] [seed-sql] [registry-json] [rotated|no-t
       "$(paste -sd, <"$TMP/rotated")" \
       "$(paste -sd, <"$TMP/capacity-alerts")" \
       "$(db "SELECT COUNT(*) FROM supervisor_events WHERE event=$(sqlq alert) AND classification=$(sqlq quota-exhausted);")" \
-      "$(db "SELECT COUNT(*) FROM supervisor_events WHERE event=$(sqlq action) AND signals LIKE $(sqlq %\\\"rung\\\":\\\"nudge\\\"%);")"
+      "$(db "SELECT COUNT(*) FROM supervisor_events WHERE event=$(sqlq action) AND signals LIKE $(sqlq %\\\"rung\\\":\\\"nudge\\\"%);")" \
+      "$(paste -sd, <"$TMP/capacity-human")"
   '   # stderr deliberately NOT swallowed: the arm already fails closed (an abort
       # yields an empty receipt, which reds), but a red with no reason costs the
       # next reader a repro. The tick's own warns are silenced at its call above.
@@ -415,6 +419,62 @@ t "text carries the re-check command" \
 # the human re-runs the probe and reads ALIVE as broken.
 t "text warns that a 409 means ALIVE" \
   "yes" "$([[ "$txt" == *"409"* ]] && echo yes || echo no)"
+
+# ── DIVE-3940: the self-healing quota wall mutes ONLY the human leg ──────────
+# lodar 2026-09-03: the [FLEET-HEALTH quota-exhausted] pings are noise when the
+# wall self-heals — a shared profile's 5h window with a resume deadline still in
+# the future (quotaDeadline=live). The machine leg (main triages, DIVE-3272 cover)
+# and the audited row must stay; only lodar's phone goes quiet, and only for the
+# CONFIRMED-benign case.
+
+# (a) the pure decision, graded in isolation — no I/O, so the wiring is exact.
+t "notify_human: live-deadline quota wall is the one mute" \
+  "false" "$(_sup_capacity_notify_human quota-exhausted live)"
+t "notify_human: unknown-deadline (possible hard wall) keeps the human" \
+  "true" "$(_sup_capacity_notify_human quota-exhausted unknown)"
+t "notify_human: a non-quota class is never muted by a live deadline" \
+  "true" "$(_sup_capacity_notify_human no-output live)"
+t "notify_human: quota-exhausted with no deadline defaults to loud" \
+  "true" "$(_sup_capacity_notify_human quota-exhausted "")"
+
+# (b) the guard inside the real _sup_capacity_alert. Both legs are observed: the
+# machine leg (5dive agent send main) must fire UNCONDITIONALLY; the human leg
+# obeys notify_human. `5dive` is a leading-digit function name, which bash allows.
+MACHINE_FIRED=0; HUMAN_FIRED=0
+5dive() { MACHINE_FIRED=1; return 0; }
+_task_agent_channel() { return 0; }
+_task_send_owner() { HUMAN_FIRED=1; return 0; }
+
+MACHINE_FIRED=0; HUMAN_FIRED=0; _sup_capacity_alert ops quota-exhausted "d" true
+t "capacity_alert: notify_human=true fires the human leg"  "1" "$HUMAN_FIRED"
+t "capacity_alert: the machine leg fires regardless (true)" "1" "$MACHINE_FIRED"
+
+MACHINE_FIRED=0; HUMAN_FIRED=0; _sup_capacity_alert ops quota-exhausted "d" false
+t "capacity_alert: notify_human=false MUTES the human leg"  "0" "$HUMAN_FIRED"
+t "capacity_alert: the machine leg still fires when muted"  "1" "$MACHINE_FIRED"
+
+MACHINE_FIRED=0; HUMAN_FIRED=0; _sup_capacity_alert ops quota-exhausted "d"
+t "capacity_alert: default (no 4th arg) preserves the old loud behavior" "1" "$HUMAN_FIRED"
+unset -f 5dive
+
+# (c) end-to-end through the real tick: classification -> deadline -> human leg.
+# Unarmed, so quota-exhausted skips the rotation remedy and reaches the alert.
+_SELFHEAL_SNAP='[{"name":"ops","type":"claude","classification":"quota-exhausted","cause":"quota-exhausted","detail":"pane refusal [resume deadline still in the FUTURE — the refusal is live]","signals":{"quotaDeadline":"live"}}]'
+selfheal_out=$(tick_arm "$_SELFHEAL_SNAP")
+t "3940 tick: a self-healing wall still records the capacity alert" \
+  "ops:quota-exhausted" "$(fld "$selfheal_out" ALERTS)"
+t "3940 tick: a self-healing wall still writes the audited alert row" \
+  "1" "$(fld "$selfheal_out" ALERT_ROWS)"
+t "3940 tick: a self-healing wall MUTES the human leg" \
+  "ops:false" "$(fld "$selfheal_out" HUMAN)"
+
+_HARDWALL_SNAP='[{"name":"ops","type":"claude","classification":"quota-exhausted","cause":"quota-exhausted","detail":"pane refusal [names no resume deadline]","signals":{"quotaDeadline":"unknown"}}]'
+t "3940 tick: an unknown-deadline wall keeps the human leg" \
+  "ops:true" "$(fld "$(tick_arm "$_HARDWALL_SNAP")" HUMAN)"
+
+_NOOUT_SNAP='[{"name":"ops","type":"claude","classification":"no-output","cause":"no-output","detail":"3 open row(s), nothing closed in 5d"}]'
+t "3940 tick: a no-output stall is unaffected — human leg still fires" \
+  "ops:true" "$(fld "$(tick_arm "$_NOOUT_SNAP")" HUMAN)"
 
 echo "PASS=$PASS FAIL=$FAIL"
 (( FAIL == 0 ))

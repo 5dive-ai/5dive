@@ -841,8 +841,8 @@ sup_info_for_agent() {  # <name>
 # shape as _sup_verify_alert — both legs best-effort, because one wedged channel
 # must never abort the tick for the rest of the fleet — and the caller owns the
 # dedup window.
-_sup_capacity_alert() {  # <name> <class> <detail>
-  local name="$1" class="$2" detail="$3"
+_sup_capacity_alert() {  # <name> <class> <detail> [notify_human=true]
+  local name="$1" class="$2" detail="$3" notify_human="${4:-true}"
   local msg="[FLEET-HEALTH ${class}] agent '${name}' is UP and REACHABLE but NOT TRANSACTING: ${detail}. Every liveness signal (unit / tmux / poller / registry label) reads healthy — that agreement is the DIVE-3272 defect, not evidence against this alert. Check the seat's model capacity (auth-profile, quota reset) and reassign or park whatever is queued behind it."
   # DIVE-3318: a one-way machine notice nobody replies to is not a round — see
   # a2a_round_guard. NOT a sender exemption; never set this by hand.
@@ -851,9 +851,29 @@ _sup_capacity_alert() {  # <name> <class> <detail>
   # lodar is a human — reached through main's paired channel, same route the
   # verify tripwire uses. Best-effort: a miss still leaves the agent-send leg
   # and the audited alert row.
-  if _task_agent_channel main; then
+  #
+  # DIVE-3940: the human leg is SUPPRESSIBLE. A self-healing quota wall (a shared
+  # profile's 5h window, resume deadline still in the future — quotaDeadline=live)
+  # needs no human ping: the correct response is to let the reset arrive, and on a
+  # shared profile the per-seat alert fans out one ping per seat. The machine leg
+  # above and the audited row are UNCONDITIONAL, so main still triages it and the
+  # DIVE-3272 blind-spot cover is unchanged — only lodar's phone goes quiet for the
+  # confirmed-benign case. The caller sets notify_human=false; every other class
+  # (and quotaDeadline=unknown, a possible hard wall) keeps the human leg.
+  if [[ "$notify_human" == "true" ]] && _task_agent_channel main; then
     _task_send_owner "$msg" >/dev/null 2>&1 || true
   fi
+}
+
+# DIVE-3940: should a capacity alert's HUMAN leg fire? Pure decision, no I/O, so
+# the wiring from classification to the leg is unit-gradeable. The single mute is
+# a confirmed self-healing quota wall — class quota-exhausted with a resume
+# deadline still in the future (quotaDeadline=live). Every other class, and every
+# other deadline state (unknown may be a hard wall; lapsed never reaches here),
+# keeps the human ping. See _sup_capacity_alert for why live is benign noise.
+_sup_capacity_notify_human() {  # <class> <quotaDeadline> -> true|false
+  [[ "$1" == "quota-exhausted" && "$2" == "live" ]] && { printf 'false'; return; }
+  printf 'true'
 }
 
 # DIVE-1127: fire the same-day alert for a tripped account. Both legs are
@@ -1962,10 +1982,16 @@ cmd_supervisor_tick() {
                        AND ts >= datetime('now', '-${_SUP_ALERT_WINDOW_H} hours');" 2>/dev/null || echo 0)
     [[ "$prev_alert" =~ ^[0-9]+$ ]] || prev_alert=0
     (( prev_alert > 0 )) && continue
+    # DIVE-3940: a confirmed self-healing quota wall mutes the human leg only —
+    # the machine leg + audited row still fire (main triages; DIVE-3272 cover
+    # unchanged). The quotaDeadline read is guarded so non-quota rows spend no jq.
+    local qdl="unknown"
+    [[ "$cls" == "quota-exhausted" ]] && qdl=$(jq -r '.signals.quotaDeadline // "unknown"' <<<"$row")
+    local notify_human; notify_human=$(_sup_capacity_notify_human "$cls" "$qdl")
     if [[ "$cls" == "verify-challenge" ]]; then
       _sup_verify_alert "$name" "$excerpt"
     else
-      _sup_capacity_alert "$name" "$cls" "$excerpt"
+      _sup_capacity_alert "$name" "$cls" "$excerpt" "$notify_human"
     fi
     db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
         VALUES ($(sqlq "$name"), 'alert', $(sqlq "$cls"), $(sqlq "$cause_s"), $(sqlq "$row"));" 2>/dev/null \
