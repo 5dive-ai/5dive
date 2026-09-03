@@ -24,6 +24,8 @@ _trigger_usage() {
   5dive trigger deliveries <name> [--limit=50]
   sudo 5dive trigger rotate <name> --secret-from-stdin
   sudo 5dive trigger enable|disable <name>
+  sudo 5dive trigger receive <name> --payload-file=<path> \
+    --signature=sha256=<hex> --event=<type> [--delivery-id=<id>]
   sudo 5dive trigger replay <delivery-id>
   sudo 5dive trigger test <name> --payload=<file>
   sudo 5dive trigger serve [--listen=127.0.0.1:8740] [--once]
@@ -108,7 +110,7 @@ cmd_trigger() {
     test)         cmd_trigger_test "$@" ;;
     serve)        cmd_trigger_serve "$@" ;;
     -h|--help|help) _trigger_usage ;;
-    *) fail "$E_USAGE" "unknown trigger command: $sub (add|ls|show|deliveries|rotate|enable|disable|replay|test|serve)" ;;
+    *) fail "$E_USAGE" "unknown trigger command: $sub (add|ls|show|deliveries|rotate|enable|disable|receive|replay|test|serve)" ;;
   esac
 }
 
@@ -603,7 +605,7 @@ Normalized metadata: ${normalized}
 Event delivery record: ${delivery_id}
 ${marker}"
     add_err="${TRIGGER_STATE_DIR}/add-${delivery_id}.err"
-    if ! add_out=$(JSON_MODE=1 cmd_task_add --materialized --from=cron --assignee="$target" --body="$body" -- "$final_title" 2>"$add_err"); then
+    if ! add_out=$(JSON_MODE=1 cmd_task_add --materialized --from=trigger --assignee="$target" --body="$body" -- "$final_title" 2>"$add_err"); then
       local why; why=$(tr '\n' ' ' < "$add_err" | cut -c1-500)
       _trigger_finish "$delivery_id" "$kind" valid failed "task creation failed: $why" "$normalized" "$actual_event" ""
       rm -f "$add_err"
@@ -772,7 +774,9 @@ class Handler(BaseHTTPRequestHandler):
             try: outcome = json.loads(body).get("data",{}).get("outcome")
             except Exception: outcome = None
             return self.send_json(200 if outcome == "duplicate" else 202, body)
-        code = {3:400,4:404,5:409,6:401}.get(proc.returncode,500)
+        if proc.returncode in (4, 6):
+            return self.send_json(404, b'{"ok":false,"error":"not found"}')
+        code = {3:400,5:409}.get(proc.returncode,500)
         return self.send_json(code, body)
     def method_not_allowed(self):
         return self.send_json(405, b'{"ok":false,"error":"method not allowed"}')

@@ -56,6 +56,7 @@ SIG="$(sign "$TMP/github.json")"
 TASK="$(jq -r '.data.task' "$TMP/first.json")"
 chk "valid GitHub delivery accepted" accepted "$(jq -r '.data.outcome' "$TMP/first.json")"
 chk "one task materialized" 1 "$(sq 'SELECT COUNT(*) FROM tasks;')"
+chk "trigger-created task has an honest principal" trigger "$(sq "SELECT created_by FROM tasks WHERE ident='$TASK';")"
 chk "task link recorded" "$TASK" "$(sq "SELECT t.ident FROM event_deliveries d JOIN tasks t ON t.id=d.task_id WHERE d.source_delivery_id='gh-1';")"
 chk "raw authenticated payload stored 0600" 600 "$(stat -c %a "$STATE_DIR/triggers/payloads/1.json")"
 
@@ -183,6 +184,40 @@ PY
 wait "$SRV_PID"; SRV_PID=""
 chk "HTTP receiver returns accepted" 202 "$(head -1 "$TMP/http.status")"
 chk "HTTP receiver materialized a task" accepted "$(tail -n +2 "$TMP/http.status" | jq -r '.data.outcome')"
+
+# A caller without a valid signature must not be able to enumerate configured
+# trigger slugs. Both a missing slug and a registered slug with a bad signature
+# return the same status and generic body at the HTTP boundary.
+"$FIVE" trigger serve --listen="127.0.0.1:$PORT" >"$TMP/server-enum.out" 2>"$TMP/server-enum.err" &
+SRV_PID=$!
+python3 - "$PORT" "$TMP/github.json" <<'PY' > "$TMP/http-enum.json"
+import json, sys, time, urllib.error, urllib.request
+port, path = sys.argv[1:]
+raw = open(path, "rb").read()
+results = []
+for _ in range(40):
+    try:
+        urllib.request.urlopen("http://127.0.0.1:%s/healthz" % port, timeout=1).read()
+        break
+    except Exception:
+        time.sleep(.05)
+for name in ("missing", "issues"):
+    req = urllib.request.Request("http://127.0.0.1:%s/hooks/%s" % (port, name), data=raw, method="POST",
+        headers={"Content-Type":"application/json", "X-Hub-Signature-256":"sha256=bad",
+                 "X-GitHub-Delivery":"gh-enum-"+name, "X-GitHub-Event":"issues"})
+    try:
+        with urllib.request.urlopen(req, timeout=3) as response:
+            results.append({"status": response.status, "body": response.read().decode()})
+    except urllib.error.HTTPError as error:
+        results.append({"status": error.code, "body": error.read().decode()})
+print(json.dumps(results))
+PY
+kill "$SRV_PID" 2>/dev/null || true
+wait "$SRV_PID" 2>/dev/null || true
+SRV_PID=""
+chk "unknown trigger is hidden behind not found" 404 "$(jq -r '.[0].status' "$TMP/http-enum.json")"
+chk "bad signature does not reveal registered trigger" 404 "$(jq -r '.[1].status' "$TMP/http-enum.json")"
+chk "enumeration responses are indistinguishable" "$(jq -r '.[0].body' "$TMP/http-enum.json")" "$(jq -r '.[1].body' "$TMP/http-enum.json")"
 
 UI="$("$FIVE" ui --data)"
 chk "dashboard lists trigger" 1 "$(jq -r '[.data.triggers[]|select(.name=="issues")]|length' <<<"$UI")"
