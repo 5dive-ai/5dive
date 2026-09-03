@@ -171,7 +171,7 @@ require_sqlite() {
 # WITHOUT a bump runs on fresh stores only. It ships green on every harness (they
 # all start from an empty dir and take the canonical schema) and reaches no
 # existing board, which is the one population it was written for.
-_TASKS_SCHEMA_EPOCH='INST8-1'  # INST-8: +action_leases (was 3525-1: +gate_cards)
+_TASKS_SCHEMA_EPOCH='3932-1'  # DIVE-3932: +runs/run_events/run_usage (was INST8-1: +action_leases)
 _tasks_schema() {
   cat <<'SQL'
 PRAGMA journal_mode=WAL;
@@ -1287,6 +1287,101 @@ CREATE TABLE IF NOT EXISTS action_leases (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS action_leases_idem_idx ON action_leases(idem_key);
 CREATE INDEX IF NOT EXISTS action_leases_state_idx ON action_leases(state, expires_at);
+
+-- DIVE-3932 (Proposal 2, v1) — RUNS: one durable attempt by one agent to advance
+-- one task. The operational unit BENEATH the task, and deliberately NOT a
+-- replacement for `5dive trace`: trace stays the causal narrative across an
+-- ident's whole life, runs answer the narrower question nothing could answer
+-- before — "what exactly happened during this ONE activation of this agent?".
+-- The join key between a task (hours/days, several agents, retries) and a
+-- journal stream (one unit, many tasks).
+--
+-- A resumed attempt opens a NEW row linked by retry_of/parent_run_id rather than
+-- rewriting the previous one, so failure and recovery stay visible; `attempt` is
+-- the 1-based ordinal within (task_id, agent).
+--
+-- journal_unit + journal_cursor_start/end record a WINDOW, never log content:
+-- `run logs` re-opens the interval out of journald. Copying journald into sqlite
+-- would turn the board into a log warehouse, which is an explicit non-goal.
+--
+-- Fully additive — nothing in tasks/projects references these three tables, so a
+-- store that never writes a run behaves exactly as before.
+-- Defined identically inside _tasks_db_migrate for pre-existing stores; keep the
+-- two copies byte-identical (tests/schema_sync_unit.sh).
+CREATE TABLE IF NOT EXISTS runs (
+  id                   TEXT PRIMARY KEY,
+  task_id              INTEGER,
+  ident                TEXT,
+  agent                TEXT,
+  role                 TEXT,
+  attempt              INTEGER NOT NULL DEFAULT 1,
+  parent_run_id        TEXT,
+  retry_of             TEXT,
+  trigger_delivery_id  TEXT,
+  wake_reason          TEXT,
+  runtime_type         TEXT,
+  model                TEXT,
+  session_id           TEXT,
+  journal_unit         TEXT,
+  journal_cursor_start TEXT,
+  journal_cursor_end   TEXT,
+  started_at           TEXT NOT NULL DEFAULT (datetime('now')),
+  ended_at             TEXT,
+  status               TEXT NOT NULL DEFAULT 'running',
+  outcome              TEXT,
+  exit_code            INTEGER,
+  error_class          TEXT,
+  error_summary        TEXT,
+  verifier_run_id      TEXT,
+  human_touch          INTEGER NOT NULL DEFAULT 0,
+  created_at           TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS runs_task_idx    ON runs(task_id, started_at);
+CREATE INDEX IF NOT EXISTS runs_agent_idx   ON runs(agent, started_at);
+CREATE INDEX IF NOT EXISTS runs_status_idx  ON runs(status, started_at);
+CREATE INDEX IF NOT EXISTS runs_retry_idx   ON runs(retry_of);
+CREATE INDEX IF NOT EXISTS runs_session_idx ON runs(session_id);
+
+-- Append-only operational milestones inside one run (run.started, task.claimed,
+-- task.handoff, gate.opened, verifier.rejected, process.exited, run.completed…).
+-- data_json is a small structured payload, never a prompt or a gate answer:
+-- lifecycle_events is the ledger that hashes payloads, this is the run's own
+-- timeline and its writers pass only values they are willing to render.
+-- Defined identically inside _tasks_db_migrate — keep byte-identical.
+CREATE TABLE IF NOT EXISTS run_events (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id    TEXT NOT NULL,
+  ts        TEXT NOT NULL DEFAULT (datetime('now')),
+  kind      TEXT NOT NULL,
+  actor     TEXT,
+  data_json TEXT
+);
+CREATE INDEX IF NOT EXISTS run_events_run_idx  ON run_events(run_id, id);
+CREATE INDEX IF NOT EXISTS run_events_kind_idx ON run_events(kind, ts);
+
+-- Usage data with PROVENANCE ON EVERY DATUM, which is the whole point of a
+-- separate table: 5dive runs heterogeneous runtimes (subscription CLIs, API-key
+-- runtimes, third-party providers) and per-call token/cost data is not always
+-- available or comparable. source = runtime|provider|account|inferred,
+-- quality = exact|estimated|unavailable, scope = run|session|account. A metric
+-- nobody can observe is stored quality='unavailable' and RENDERED as unavailable
+-- — never silently estimated, and never a fabricated per-run dollar figure for a
+-- flat-rate subscription (an explicit non-goal of the proposal).
+-- Key-value shaped so a new provider metric needs no schema churn.
+-- Defined identically inside _tasks_db_migrate — keep byte-identical.
+CREATE TABLE IF NOT EXISTS run_usage (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id        TEXT NOT NULL,
+  metric        TEXT NOT NULL,
+  value         REAL,
+  unit          TEXT,
+  source        TEXT NOT NULL,
+  quality       TEXT NOT NULL,
+  scope         TEXT NOT NULL,
+  observed_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  metadata_json TEXT
+);
+CREATE INDEX IF NOT EXISTS run_usage_run_idx ON run_usage(run_id, metric);
 SQL
 }
 
@@ -2441,6 +2536,77 @@ CREATE TABLE IF NOT EXISTS action_leases (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS action_leases_idem_idx ON action_leases(idem_key);
 CREATE INDEX IF NOT EXISTS action_leases_state_idx ON action_leases(state, expires_at);
+MIG
+  fi
+
+  # DIVE-3932 runs/run_events/run_usage — additive, gated on the RUNS table's own
+  # absence and creating all three together (they ship as one unit; no live store
+  # carries any of them). Keep these CREATE bodies byte-identical to the copies in
+  # _tasks_schema above (tests/schema_sync_unit.sh). Every live board reaches these
+  # tables through HERE and not through the canonical schema — DIVE-2512: a
+  # fresh-DB harness never exercises this function at all, so a table added to
+  # _tasks_schema alone exists on harnesses and on no real box.
+  local has_runs
+  has_runs=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_runs" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" <<'MIG' >/dev/null 2>&1 || true
+CREATE TABLE IF NOT EXISTS runs (
+  id                   TEXT PRIMARY KEY,
+  task_id              INTEGER,
+  ident                TEXT,
+  agent                TEXT,
+  role                 TEXT,
+  attempt              INTEGER NOT NULL DEFAULT 1,
+  parent_run_id        TEXT,
+  retry_of             TEXT,
+  trigger_delivery_id  TEXT,
+  wake_reason          TEXT,
+  runtime_type         TEXT,
+  model                TEXT,
+  session_id           TEXT,
+  journal_unit         TEXT,
+  journal_cursor_start TEXT,
+  journal_cursor_end   TEXT,
+  started_at           TEXT NOT NULL DEFAULT (datetime('now')),
+  ended_at             TEXT,
+  status               TEXT NOT NULL DEFAULT 'running',
+  outcome              TEXT,
+  exit_code            INTEGER,
+  error_class          TEXT,
+  error_summary        TEXT,
+  verifier_run_id      TEXT,
+  human_touch          INTEGER NOT NULL DEFAULT 0,
+  created_at           TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS runs_task_idx    ON runs(task_id, started_at);
+CREATE INDEX IF NOT EXISTS runs_agent_idx   ON runs(agent, started_at);
+CREATE INDEX IF NOT EXISTS runs_status_idx  ON runs(status, started_at);
+CREATE INDEX IF NOT EXISTS runs_retry_idx   ON runs(retry_of);
+CREATE INDEX IF NOT EXISTS runs_session_idx ON runs(session_id);
+CREATE TABLE IF NOT EXISTS run_events (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id    TEXT NOT NULL,
+  ts        TEXT NOT NULL DEFAULT (datetime('now')),
+  kind      TEXT NOT NULL,
+  actor     TEXT,
+  data_json TEXT
+);
+CREATE INDEX IF NOT EXISTS run_events_run_idx  ON run_events(run_id, id);
+CREATE INDEX IF NOT EXISTS run_events_kind_idx ON run_events(kind, ts);
+CREATE TABLE IF NOT EXISTS run_usage (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id        TEXT NOT NULL,
+  metric        TEXT NOT NULL,
+  value         REAL,
+  unit          TEXT,
+  source        TEXT NOT NULL,
+  quality       TEXT NOT NULL,
+  scope         TEXT NOT NULL,
+  observed_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  metadata_json TEXT
+);
+CREATE INDEX IF NOT EXISTS run_usage_run_idx ON run_usage(run_id, metric);
 MIG
   fi
 

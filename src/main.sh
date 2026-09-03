@@ -311,6 +311,7 @@ Usage (per-agent / per-task token burn — subscription tokens, no dollars):
   5dive usage budget ls | clear <agent>              # hard-stop is OFF by default (warn-only); check runs on the heartbeat
 
 Trace (causal timeline for one task, goal → ship —):
+  5dive run ls|show|events|logs|retry|metrics        # execution attempts beneath tasks (DIVE-3932); one run = one agent's one attempt
   5dive trace <id|DIVE-N> [--json] [--no-audit]      # read-only: origin (goal/parent/objective/loop) + lifecycle + gate provenance + verdict
 
 Memory (queryable team memory — read-path,):
@@ -1153,6 +1154,11 @@ main() {
       # publish/status are read-mostly; on/off manage a root cron + pref, tick is
       # the root cron driver. No registry mutation/lock, no audit (like digest).
       cmd_proof "$@" ;;
+    run|runs)
+      # DIVE-3932: execution attempts beneath tasks. Read-mostly over the same
+      # group-writable store as tasks (`run retry` only ever APPENDS an attempt);
+      # no root, no registry lock, no audit line — same posture as trace/usage.
+      cmd_run "$@" ;;
     trace)
       # INST-1: causal timeline for one task (goal → ship). Read-only view over
       # existing data — task transition columns + project/parent/objective/loop

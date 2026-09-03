@@ -169,6 +169,24 @@ cmd_trace() {
     [[ -n "$_created" && "$_created" < "$ledger_started" ]] && ledger_predates=1
   fi
 
+  # ---- DIVE-3932: the ATTEMPTS beneath this task -------------------------
+  # Runs are anchors here, not a second timeline. `trace` answers "why does this
+  # work exist and what happened to it"; each anchor is the entry point into
+  # "what happened during THAT one activation", which is a question trace was
+  # never able to answer and deliberately still does not try to — it names the
+  # run and hands the reader `5dive run show`. The two stay explicitly separate
+  # (the proposal's hard rule: runs must not replace trace).
+  # Best-effort: a store that predates the runs tables must still trace.
+  local runs_json='[]'
+  runs_json=$(dbfmt -json "
+    SELECT id, COALESCE(agent,'-') AS agent, COALESCE(role,'-') AS role, attempt,
+           status, COALESCE(outcome,'') AS outcome, started_at,
+           COALESCE(ended_at,'') AS ended_at, COALESCE(retry_of,'') AS retry_of,
+           human_touch,
+           COALESCE(CAST((julianday(ended_at)-julianday(started_at))*86400 AS INTEGER),-1) AS duration_s
+      FROM runs WHERE task_id=${id} ORDER BY started_at, id;" 2>/dev/null) || runs_json='[]'
+  [[ -n "$runs_json" ]] || runs_json='[]'
+
   # ---- audit-log references (best-effort, read-only) ---------------------
   # The tamper-evident agent-audit log (640 root:claude) records mutating verbs
   # with their real caller. Lines mentioning this ident are extra provenance —
@@ -209,6 +227,7 @@ cmd_trace() {
       --argjson audit_drops "$audit_drops" \
       --argjson ledger "$ledger_json" --arg ledger_started "$ledger_started" \
       --argjson ledger_predates "$ledger_predates" \
+      --argjson runs "$runs_json" \
       --arg ancestors "$ancestors" \
       '{ok:true, data:{
          ident:$ident, title:$title, status:$status, assignee:$assignee,
@@ -230,6 +249,7 @@ cmd_trace() {
                      elif $ledger_predates==1 then "partial — task predates the ledger"
                      else "full — task began after the ledger started" end)
          },
+         runs:$runs,
          audit_refs:$audit,
          audit_drops:$audit_drops
        }}'
@@ -275,6 +295,19 @@ cmd_trace() {
   else
     echo "  (no rows — the task began after the ledger started ${ledger_started},"
     echo "   so this genuinely records no lifecycle events yet.)"
+  fi
+  echo
+  echo "attempts (runs — 5dive run show <id> for one activation's detail):"
+  if [[ "$(printf '%s' "$runs_json" | jq 'length')" -gt 0 ]]; then
+    printf '%s' "$runs_json" | jq -r '.[] |
+      "  \(.id)  \(.agent | (. + "            ")[0:12])  \(.role | (. + "        ")[0:8])  " +
+      "attempt \(.attempt)  \(.status)\(if .outcome != "" then " / " + .outcome else "" end)" +
+      (if .duration_s >= 0 then "  \(.duration_s)s" else "  (open)" end) +
+      (if .retry_of != "" then "  retry of \(.retry_of)" else "" end) +
+      (if .human_touch == 1 then "  [human touch]" else "" end)'
+  else
+    echo "  (none recorded — this task ran before runs existed, or was never claimed"
+    echo "   through a path that opens one. Absence here is not evidence of no work.)"
   fi
   echo
   if [[ "$(printf '%s' "$audit_json" | jq 'length')" -gt 0 ]]; then

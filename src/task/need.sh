@@ -2801,6 +2801,19 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
   ledger_emit gate.filed ident="$ident" task_id="$id" actor="$actor" \
     policy="tier${tier}:${type}" in="$ask" \
     detail="${type} gate filed at tier ${tier}${recommend:+ (recommend: ${recommend})}"
+  # DIVE-3932: the gate on the filer's own run. `human_touch` is set for tier 1
+  # and 2 ONLY — a tier-0 gate is a permanent record that applies the filer's own
+  # recommendation with NO ping, so counting it as a human touch would report a
+  # person was involved in work no person ever saw, and "human touches per
+  # shipped task" is the metric the zero-human thesis is graded on. The run is
+  # NOT closed here: filing a gate does not by itself park the row (a tier-0
+  # applies and continues), and the funnel's `blocked` arm closes the ones that
+  # genuinely park.
+  _run_event_for_task "$id" gate.opened \
+    "{\"type\":$(_run_json_str "$type"),\"tier\":$(_run_json_str "$tier")}" || true
+  if [[ "$tier" != "0" ]]; then
+    run_touch_human "$(run_current "$id")"
+  fi
 
   # DIVE-891 tier 0: apply the recommendation right now — the gate exists only
   # as a signed-off record in the log/digest, never as a ping. Provenance is

@@ -1876,6 +1876,23 @@ $_body"
     in_progress)             _task_session_open  "$id" ;;
     done|cancelled|blocked)  _task_session_close "$id" ;;
   esac
+  # DIVE-3932: the RUN boundary, written from the same funnel and for the same
+  # reason as the segment above — a fourth status verb added later cannot ship
+  # without opening/closing its attempt. Every writer is best-effort and returns
+  # 0 (src/lib/runs.sh), so the status write that already committed on the line
+  # above can never be undone by a bookkeeping fault.
+  #
+  # `blocked` closes the run PARKED, not failed: a row that blocked on a human
+  # gate has not failed, and scoring it as a failure would make the reliability
+  # metrics read worse exactly when the fleet did the correct thing. `cancelled`
+  # closes ABANDONED for the mirror-image reason — the attempt genuinely did not
+  # reach its boundary, and calling that "completed" would inflate success rate.
+  case "$newstatus" in
+    in_progress) run_open "$id" "$ident" "${FIVEDIVE_WAKE_REASON:-task claimed}" >/dev/null 2>&1 || true ;;
+    done)        _run_close_for_task "$id" completed "$([[ -n "$handoff_ack" ]] && printf verifier_review || printf task_done)" || true ;;
+    cancelled)   _run_close_for_task "$id" abandoned task_cancelled || true ;;
+    blocked)     _run_close_for_task "$id" parked    task_blocked   || true ;;
+  esac
   [[ -n "$handoff_ack" ]] && handoff_ack_at=$(db "SELECT handoff_ack_at FROM tasks WHERE id=${id};")
   # DIVE-552: if this close finished a LOOP STEP, advance the relay — free the
   # next step (a freed agent step the heartbeat wakes; a freed gate fires its
