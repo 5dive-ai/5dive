@@ -625,6 +625,37 @@ _task_verify_excluded() {
   return 1
 }
 
+# DIVE-3939: a grader is a DISPATCH TARGET — `task done` writes
+# assignee=<verifier> — so the candidate chain must apply the SAME wakeability
+# test the assignee lane already gets. Before this, the chain filtered on three
+# things (non-empty, != assignee, not excluded) and never asked whether anything
+# wakes the seat it landed on, which is
+# community/wiki/a-control-enforced-on-one-path-is-absent-on-the-parallel-one.md
+# instance 6: two COLUMNS of one rail, guarded on one. The unguarded column
+# fails LATER — at handoff, after the maker has spent the work — so the row
+# looks healthy for its whole life and dies at delivery. Six measured strands
+# across four dates before this landed.
+#
+# ONE predicate, not a second copy: `_task_doctor_lane_wakeable`
+# (src/task/doctor.sh) is the function `task doctor` reports off, so the picker
+# and the report cannot drift into disagreeing about which seats are alive —
+# which was itself half the filed defect (doctor printed "wakeable assignee" OK
+# over a row the board digest called undispatchable).
+#
+# FAILURE DIRECTION IS DELIBERATE. That predicate returns 2 for "I could not
+# find out" (registry unreadable), and 2 is treated as ACCEPTABLE here, not as
+# dead. An unreadable agents.json must not silently strip the grading rail off
+# every row the board files while it is missing; UNKNOWN degrades to the status
+# quo, the same direction `_human_registry_active` takes. Only a DECIDED
+# not-wakeable (rc 1) skips a candidate.
+_task_verify_unwakeable() {
+  local _n="$1" _rc
+  [[ -n "$_n" ]] || return 1
+  declare -F _task_doctor_lane_wakeable >/dev/null 2>&1 || return 1
+  _task_doctor_lane_wakeable "$_n" && _rc=0 || _rc=$?
+  [[ "$_rc" == "1" ]]
+}
+
 _task_default_verifier() {
   local _assignee="$1" _proj_lead="$2" c=""
   local -a cands=(
@@ -636,10 +667,16 @@ _task_default_verifier() {
     "$(_task_resolve_deputy "$_assignee")"
   )
   for c in "${cands[@]}"; do
-    if [[ -n "$c" && "$c" != "$_assignee" ]] && ! _task_verify_excluded "$c"; then
+    if [[ -n "$c" && "$c" != "$_assignee" ]] \
+       && ! _task_verify_excluded "$c" && ! _task_verify_unwakeable "$c"; then
       printf '%s' "$c"; return
     fi
   done
+  # Falls through to EMPTY when the whole chain is unwakeable, on purpose. The
+  # caller's existing INST-2 `verifyUnavailable` path then labels the row
+  # honestly ("no independent verifier available"). It must NOT fall back to the
+  # assignee: that recreates the DIVE-3366 maker==grader skew, i.e. a row that
+  # reads as graded and was reviewed by the person who wrote it.
 }
 
 # DIVE-1145: ship-gating routing. Resolve WHO a builder's gate should route to

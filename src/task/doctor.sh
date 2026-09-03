@@ -137,6 +137,7 @@ _task_doctor_explain() {
     wake-passed)  printf '%s' "parked, and its wake time has already passed — the heartbeat TTL pass should have unparked it. -> 5dive task unpark <id>  (NOT unblock: unblock only drops edges, and a park has none, so it reports success and changes nothing)" ;;
     park-no-wake) printf '%s' "parked with NO wake time — it will never revisit itself. -> 5dive task unpark <id>, or re-park with a --wake" ;;
     dead-lane)    printf '%s' "assigned to a seat nothing wakes (no heartbeat, or operator-stopped) — nothing will pick it up. -> 5dive task assign <id> <agent>   (roster: 5dive agent list)" ;;
+    dead-verifier) printf '%s' "GRADER nothing wakes: this row dispatches fine and STRANDS AT HANDOFF, not now — \`task done\` writes assignee=<verifier>, so the maker spends the whole task first and the delivery goes to a seat no tick will ever iterate. -> 5dive task verifier <id> <agent>   (roster: 5dive agent list)" ;;
     *)            printf '%s' "undispatchable" ;;
   esac
 }
@@ -214,8 +215,19 @@ _task_doctor_row_reason() {
   [[ -n "$asg" ]] || return 0
   _task_doctor_lane_wakeable "$asg" && rc=0 || rc=$?
   case "$rc" in
-    1) _TASK_DOCTOR_ROW_REASON="dead-lane" ;;
-    2) _TASK_DOCTOR_FIX_LANE_NOTE="the agent registry (${STATE_DIR:-/var/lib/5dive}/agents.json) could not be read, so whether '${asg}' is a lane anything wakes is UNKNOWN, not healthy" ;;
+    1) _TASK_DOCTOR_ROW_REASON="dead-lane"; return 0 ;;
+    2) _TASK_DOCTOR_FIX_LANE_NOTE="the agent registry (${STATE_DIR:-/var/lib/5dive}/agents.json) could not be read, so whether '${asg}' is a lane anything wakes is UNKNOWN, not healthy"
+       return 0 ;;
+  esac
+  # DIVE-3939: the grader column, checked SECOND so precedence matches the
+  # report (a row that is both is printed dead-lane, and `--fix <ident>` must
+  # apply the remedy the operator saw next to that ident).
+  local vf; vf=$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${id};" 2>/dev/null || true)
+  [[ -n "$vf" ]] || return 0
+  _task_doctor_lane_wakeable "$vf" && rc=0 || rc=$?
+  case "$rc" in
+    1) _TASK_DOCTOR_ROW_REASON="dead-verifier" ;;
+    2) _TASK_DOCTOR_FIX_LANE_NOTE="the agent registry (${STATE_DIR:-/var/lib/5dive}/agents.json) could not be read, so whether '${vf}' is a grader anything wakes is UNKNOWN, not healthy" ;;
   esac
   return 0
 }
@@ -244,10 +256,10 @@ _task_doctor_fix() {
   local -a apply=(); local shown=""
   case "$reason" in
     no-anchor|stale-edge)
-      [[ -z "$to" ]] || fail "$E_USAGE" "--to is only meaningful for a dead-lane row; ${ident} is '${reason}', whose remedy is '5dive task unblock ${ident}' and takes no destination (re-point the lane separately with '5dive task assign')."
+      [[ -z "$to" ]] || fail "$E_USAGE" "--to is only meaningful for a dead-lane or dead-verifier row; ${ident} is '${reason}', whose remedy is '5dive task unblock ${ident}' and takes no destination (re-point the lane separately with '5dive task assign')."
       apply=(cmd_task_unblock "$ident"); shown="5dive task unblock ${ident}" ;;
     wake-passed|park-no-wake)
-      [[ -z "$to" ]] || fail "$E_USAGE" "--to is only meaningful for a dead-lane row; ${ident} is '${reason}', whose remedy is '5dive task unpark ${ident}' and takes no destination (re-point the lane separately with '5dive task assign')."
+      [[ -z "$to" ]] || fail "$E_USAGE" "--to is only meaningful for a dead-lane or dead-verifier row; ${ident} is '${reason}', whose remedy is '5dive task unpark ${ident}' and takes no destination (re-point the lane separately with '5dive task assign')."
       park_reason=$(db "SELECT COALESCE(park_reason,'') FROM tasks WHERE id=${id};" 2>/dev/null || true)
       apply=(cmd_task_unpark "$ident"); shown="5dive task unpark ${ident}" ;;
     dead-lane)
@@ -262,6 +274,19 @@ _task_doctor_fix() {
         fail "$E_VALIDATION" "--to='${to}' is itself a lane nothing wakes (no heartbeat enabled, or the seat is operator-stopped) — ${ident} would be exactly as undispatchable at the new address. Pick a live seat: 5dive agent list"
       fi
       apply=(cmd_task_assign "$ident" "$to"); shown="5dive task assign ${ident} ${to}" ;;
+    dead-verifier)
+      local vf; vf=$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${id};")
+      [[ -n "$to" ]] || fail "$E_USAGE" "${ident} is graded by a seat nothing wakes ('${vf}'), so it will strand AT HANDOFF — and re-routing the grader needs a destination this command cannot invent (picking 'any live agent' would hand a review out by coin flip, and falling back to the assignee makes the maker its own grader). Name one: 5dive task doctor --fix ${ident} --to=<agent>   (roster: 5dive agent list)"
+      # SAME test that produced the finding, for the same reason as dead-lane:
+      # otherwise the verb that reports dead graders is the fastest way to make
+      # one, and the row reads as repaired.
+      local vrc; _task_doctor_lane_wakeable "$to" && vrc=0 || vrc=$?
+      if [[ "$vrc" == "2" ]]; then
+        fail "$E_GENERIC" "cannot verify --to='${to}': ${STATE_DIR:-/var/lib/5dive}/agents.json could not be read, so this command cannot tell a live seat from another dead one — and re-pointing the grader blind is the failure it is meant to repair. Fix the registry first: 5dive doctor"
+      elif [[ "$vrc" != "0" ]]; then
+        fail "$E_VALIDATION" "--to='${to}' is itself a seat nothing wakes (no heartbeat enabled, or the seat is operator-stopped) — ${ident} would strand at handoff exactly as it does now. Pick a live seat: 5dive agent list"
+      fi
+      apply=(cmd_task_verifier "$ident" "$to"); shown="5dive task verifier ${ident} ${to}" ;;
     *)
       fail "$E_GENERIC" "no automatic remedy for class '${reason}' on ${ident} — $(_task_doctor_explain "$reason")" ;;
   esac
@@ -356,36 +381,63 @@ cmd_task_doctor() {
     # verb either way: the name is not on the roster at all (what `orphans`
     # reports, repeated here so one command is one answer), or it is on the
     # roster and the heartbeat tick will never iterate it.
-    local lane seen="" bad_lanes=""
-    while IFS= read -r lane; do
-      [[ -n "$lane" ]] || continue
-      case " $seen " in *" $lane "*) continue ;; esac
-      seen+=" $lane"
-      # `&& rc=0 || rc=$?`, never `; rc=$?`: under the bundle's `set -euo
-      # pipefail` an assignment taking a non-zero substitution kills the verb
-      # before the next line, which is how `orphans` once died mid-listing.
-      local rc; _task_doctor_lane_wakeable "$lane" && rc=0 || rc=$?
-      if [[ "$rc" == "2" ]]; then
-        [[ -n "$lane_note" ]] || lane_note="heartbeat check SKIPPED for some lanes — ${STATE_DIR:-/var/lib/5dive}/agents.json could not be read"
-        continue
-      fi
-      [[ "$rc" == "0" ]] && continue
-      bad_lanes+="${bad_lanes:+,}$(sqlq "$lane")"
-    done < <(db "SELECT DISTINCT assignee FROM tasks
-                  WHERE kind='standard' AND status IN ('todo','in_progress','blocked')
-                    AND assignee IS NOT NULL AND assignee!='';" 2>/dev/null || true)
-    if [[ -n "$bad_lanes" ]]; then
-      local lrows; lrows=$(dbfmt -json "SELECT ident, status, COALESCE(assignee,'') AS assignee,
-              'dead-lane' AS reason, '' AS wake_at, NULL AS blockers, substr(title,1,58) AS title
+    # DIVE-3939: the scan runs over BOTH columns of the dispatch rail. It used to
+    # read `assignee` only, and said so in its own clean line — while the same
+    # predicate was never applied to `verifier`, which delivery WRITES INTO
+    # assignee at `task done`. So a row with a dead grader passed this check for
+    # its whole life and stranded at handoff, with the maker's work already
+    # spent. Same predicate, same sub-cases, one loop, two columns: a second copy
+    # of the rule is how the picker and the report came to disagree in the first
+    # place.
+    local bad_lanes="" bad_graders=""
+    _scan_column() {  # <sql for DISTINCT names> <out-var name>
+      local _sql="$1" _out="$2" name seen="" bad="" rc
+      while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        case " $seen " in *" $name "*) continue ;; esac
+        seen+=" $name"
+        # `&& rc=0 || rc=$?`, never `; rc=$?`: under the bundle's `set -euo
+        # pipefail` an assignment taking a non-zero substitution kills the verb
+        # before the next line, which is how `orphans` once died mid-listing.
+        _task_doctor_lane_wakeable "$name" && rc=0 || rc=$?
+        if [[ "$rc" == "2" ]]; then
+          [[ -n "$lane_note" ]] || lane_note="heartbeat check SKIPPED for some lanes — ${STATE_DIR:-/var/lib/5dive}/agents.json could not be read"
+          continue
+        fi
+        [[ "$rc" == "0" ]] && continue
+        bad+="${bad:+,}$(sqlq "$name")"
+      done < <(db "$_sql" 2>/dev/null || true)
+      printf -v "$_out" '%s' "$bad"
+    }
+    _scan_column "SELECT DISTINCT assignee FROM tasks
+                    WHERE kind='standard' AND status IN ('todo','in_progress','blocked')
+                      AND assignee IS NOT NULL AND assignee!='';" bad_lanes
+    _scan_column "SELECT DISTINCT verifier FROM tasks
+                    WHERE kind='standard' AND status IN ('todo','in_progress','blocked')
+                      AND verifier IS NOT NULL AND verifier!='';" bad_graders
+    _merge_rows() {  # <sql> — append rows not already classified
+      local _rows; _rows=$(dbfmt -json "$1")
+      [[ -n "$_rows" ]] || _rows='[]'
+      # A row can be BOTH (parked AND on a dead lane, or a dead lane AND a dead
+      # grader). Keep the first classification so a finding is counted once; the
+      # column at fault is still named in its own line below.
+      findings=$(jq -c -n --argjson a "$findings" --argjson b "$_rows" \
+        '$a + [ $b[] | select( . as $r | ($a | map(.ident) | index($r.ident)) == null ) ]')
+    }
+    [[ -z "$bad_lanes" ]] || _merge_rows "SELECT ident, status, COALESCE(assignee,'') AS assignee,
+              'dead-lane' AS reason, '' AS wake_at, NULL AS blockers, substr(title,1,58) AS title,
+              COALESCE(verifier,'') AS grader
          FROM tasks
         WHERE kind='standard' AND status IN ('todo','in_progress','blocked')
-          AND assignee IN (${bad_lanes}) ORDER BY id;")
-      [[ -n "$lrows" ]] || lrows='[]'
-      # A row can be BOTH (parked AND on a dead lane). Keep the first classification
-      # so a finding is counted once; the lane is still named in its own line below.
-      findings=$(jq -c -n --argjson a "$findings" --argjson b "$lrows" \
-        '$a + [ $b[] | select( . as $r | ($a | map(.ident) | index($r.ident)) == null ) ]')
-    fi
+          AND assignee IN (${bad_lanes}) ORDER BY id;"
+    # ORDER MATTERS: dead-lane wins over dead-verifier on a row that is both,
+    # because that row is stranded NOW and the grader problem is one step later.
+    [[ -z "$bad_graders" ]] || _merge_rows "SELECT ident, status, COALESCE(assignee,'') AS assignee,
+              'dead-verifier' AS reason, '' AS wake_at, NULL AS blockers, substr(title,1,58) AS title,
+              COALESCE(verifier,'') AS grader
+         FROM tasks
+        WHERE kind='standard' AND status IN ('todo','in_progress','blocked')
+          AND verifier IN (${bad_graders}) ORDER BY id;"
   fi
 
   local n; n=$(printf '%s' "$findings" | jq 'length')
@@ -420,14 +472,14 @@ cmd_task_doctor() {
   [[ -z "$lane_note" ]] || warn "$lane_note"
 
   if [[ "${n:-0}" == "0" ]]; then
-    ok "no undispatchable rows — every open row has a live revisit anchor and a wakeable assignee
+    ok "no undispatchable rows — every open row has a live revisit anchor, a wakeable assignee and a wakeable verifier
   ${census_line}" "$payload" "${jargs[@]}"
     return 0
   fi
 
   # Read the JSON back rather than raw `db` output: the default `|` separator
   # would split any title containing one.
-  local out="" line ident st asg reason wake blockers title
+  local out="" line ident st asg reason wake blockers title grader
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     ident=$(printf '%s' "$line"   | jq -r '.ident')
@@ -437,9 +489,11 @@ cmd_task_doctor() {
     wake=$(printf '%s' "$line"    | jq -r '.wake_at // ""')
     blockers=$(printf '%s' "$line"| jq -r '.blockers // ""')
     title=$(printf '%s' "$line"   | jq -r '.title // ""')
+    grader=$(printf '%s' "$line"  | jq -r '.grader // ""')
     out+="  ${ident}  [${st}${asg:+ · }${asg}]  ${reason}"$'\n'
     out+="        ${title}"$'\n'
     out+="        $(_task_doctor_explain "$reason")"$'\n'
+    [[ "$reason" == "dead-verifier" && -n "$grader" ]] && out+="        verifier: ${grader}  (nothing wakes it; the row itself is dispatchable)"$'\n'
     [[ -n "$wake"     ]] && out+="        wake_at: ${wake}Z"$'\n'
     [[ -n "$blockers" ]] && out+="        blockers: ${blockers}"$'\n'
   done < <(printf '%s' "$findings" | jq -c '.[]')
@@ -447,6 +501,6 @@ cmd_task_doctor() {
   warn "${n} open row(s) nothing will dispatch — each is counted as work in flight and none of them is:
 ${out}${census_line}
 Nothing above was changed: mass-clearing a board is its own failure mode. Run the named verb per row,
-or have this command run it for ONE row: 5dive task doctor --fix <ident> [--to=<agent> for a dead lane] [--dry-run]"
+or have this command run it for ONE row: 5dive task doctor --fix <ident> [--to=<agent> for a dead lane or dead grader] [--dry-run]"
   ok "" "$payload" "${jargs[@]}"
 }
