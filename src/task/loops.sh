@@ -880,6 +880,10 @@ cmd_task_block() {
   [[ "$tid" != "$bid" ]] || fail "$E_VALIDATION" "a task can't block itself"
   db "INSERT OR IGNORE INTO task_deps (task_id, blocked_by) VALUES (${tid}, ${bid});
       UPDATE tasks SET status='blocked' WHERE id=${tid} AND status NOT IN ('done','cancelled');"
+  # DIVE-3932: same end boundary as a park, reached by the dependency-edge door.
+  # `task block --by` also writes status directly rather than through the status
+  # funnel, so the funnel's `blocked` arm never sees it.
+  _run_close_for_task "$tid" parked task_blocked || true
   ok "$tident blocked by $bident" '{task:($t|tonumber), task_ident:$ti, blocked_by:($b|tonumber), blocked_by_ident:$bi}' --arg t "$tid" --arg ti "$tident" --arg b "$bid" --arg bi "$bident"
 }
 
@@ -988,6 +992,14 @@ cmd_task_park() {
             gate_mode=NULL
       WHERE id=${tid} AND status NOT IN ('done','cancelled');
       COMMIT;"
+  # DIVE-3932: a park is an END BOUNDARY for the attempt — the row stops moving
+  # and nobody is working it. Hooked HERE and not only in the status funnel
+  # because park writes `status='blocked'` with its own UPDATE and never crosses
+  # that funnel; a run left open by this path would sit in `run metrics` as
+  # "stuck (>6h, no close)" forever, reporting a wedged fleet where the fleet
+  # correctly deferred work. PARKED, never failed: a deliberate hold is neither a
+  # success nor a failure and must be scored as neither.
+  _run_close_for_task "$tid" parked task_parked || true
   # DIVE-2410: park clears the gate columns, so whatever button that gate put in a
   # human's chat now points at a question the task no longer holds.
   _task_gate_card_apply "$tident" die "parked" || true

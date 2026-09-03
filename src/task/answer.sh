@@ -1354,6 +1354,12 @@ cmd_task_answer() {
   ledger_emit gate.answered ident="$ident" task_id="$id" actor="${_lg_prov:-unknown}" \
     policy="tier${gtier}:${nt}" out="$_vfs" \
     detail="${nt} gate cleared by ${_lg_prov:-<unrecorded>}$([[ "$_lg_prov" == human:* ]] && echo ' (human touchpoint)')"
+  # DIVE-3932: gate.closed on whatever run is open for the row. The answer is
+  # not stored (it can be a credential — see the hashing note above); only the
+  # fact and the answerer's PROVENANCE CLASS are, which is what a run timeline
+  # needs to show "this attempt waited on a person here".
+  _run_event_for_task "$id" gate.closed \
+    "{\"type\":$(_run_json_str "$nt"),\"by\":$(_run_json_str "${_lg_prov%%:*}")}" || true
 
   # DIVE-2412 acceptance: WHICH evidence form cleared this gate must be
   # recoverable FROM THE ROW, not only from a log line that can rotate or diverge

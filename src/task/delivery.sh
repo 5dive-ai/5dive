@@ -660,6 +660,14 @@ _task_route_to_verifier() {
   # verifier deliberately does NOT reach this line: it leaves the row in_progress
   # and the maker is still working, so its segment stays open.
   _task_session_close "$id"
+  # DIVE-3932: and the RUN, for the identical reason — this fork returns before
+  # the status funnel's run hook. `handed_to_verifier` is the maker's end
+  # boundary and it is a COMPLETED run, not an open one: the attempt reached a
+  # durable boundary and the next thing that happens to this row is a different
+  # agent's attempt. Ordered next to the segment close so the two receipts for
+  # one boundary cannot drift apart.
+  _run_event_for_task "$id" task.handoff "{\"verifier\":$(_run_json_str "$vfier")}" || true
+  _run_close_for_task "$id" completed handed_to_verifier || true
   local iter; iter=$(db "SELECT iteration FROM tasks WHERE id=${id};")
   local iter_note=""
   [[ "$iter" == "$prev_iter" ]] && iter_note=" — re-delivery of the same pass, not rework"
@@ -716,6 +724,16 @@ _task_reject_emit_event() {
   ledger_emit task.rejected ident="$ident" task_id="$id" actor="$actor" \
     out="$prev" \
     detail="rejected by ${actor} at iteration ${iter}${maxi:+/$maxi}, ${disposition}; prior_result=${prior}"
+  # DIVE-3932: the verdict lands on the VERIFIER's own open run, and closes it —
+  # producing a verdict is the verifier's end boundary. The maker's run for this
+  # iteration was already closed `handed_to_verifier`; it is deliberately NOT
+  # reopened or rewritten, because the rejection is a fact about a later attempt
+  # by a different agent, and rewriting the maker's terminal record is exactly the
+  # silent-overwrite the retry lineage exists to avoid. The maker's next pass gets
+  # its own run, linked by parent_run_id.
+  _run_event_for_task "$id" verifier.rejected \
+    "{\"iteration\":$(_run_json_str "$iter"),\"disposition\":$(_run_json_str "$disposition")}" || true
+  _run_close_for_task "$id" completed verifier_rejected || true
 }
 
 cmd_task_reject() {

@@ -201,6 +201,9 @@ Convene an auditable adversarial review with multiple agents.
 `5dive trace DIVE-42`<br>
 Inspect a task's complete causal timeline from origin to verdict.
 
+`5dive run ls --status=abandoned --since=24h`<br>
+Every attempt has a receipt. A run is one agent's one attempt at one task — who ran, why they woke, what happened, what it cost where that is actually measurable, and how it recovered. `5dive run metrics` turns those into success rate, first-attempt success, verifier rejection rate and human touches. `trace` still tells the story; runs are the unit beneath it.
+
 `5dive watch`<br>
 Watch the whole team in real time.
 
@@ -369,6 +372,7 @@ It is read-only and binds to loopback (there is no sign-in, so `--host` refuses 
 sudo 5dive council init --seats=<a:chair,b,c> --threshold=<spec> --veto=<principal>
 5dive council convene "<question>" --mode=adversarial
 5dive trace <task>                       # causal timeline from origin to verdict
+5dive run ls|show|events|logs|retry|metrics  # execution attempts beneath tasks
 5dive memory search "<query>"             # durable knowledge with provenance
 5dive acp                                # connect from Zed, Buzz, or another ACP client
 

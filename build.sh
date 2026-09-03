@@ -79,6 +79,7 @@ cat \
   src/lib/registry.sh \
   src/lib/agent_env.sh \
   src/lib/tasks_db.sh \
+  src/lib/runs.sh \
   src/lib/actor.sh \
   src/lib/routing_receipt.sh \
   src/lib/a2a_rounds.sh \
@@ -122,6 +123,7 @@ cat \
   src/cmd_task.sh \
   src/cmd_trigger.sh \
   src/cmd_trace.sh \
+  src/cmd_run.sh \
   src/cmd_org.sh \
   src/cmd_human.sh \
   src/cmd_ui.sh \

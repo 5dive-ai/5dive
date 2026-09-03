@@ -1842,6 +1842,17 @@ _hb_claim_task() {
   ledger_emit "task.started" ident="$(_hb_ident "$id")" task_id="$id" \
     actor="$name" authority="dispatcher" \
     detail="heartbeat claim (DIVE-2244)" || true
+  # DIVE-3932: THE RUN BEGINS HERE, not at the seat's `task start`. The dispatcher
+  # claim IS the activation — the comment above records that the dispatcher moved
+  # 94 rows while the verb fired 13 times, so anchoring the attempt to the verb
+  # would leave the great majority of real attempts with no run at all, which is
+  # the same instrumentation drift that ticket is about. The seat's own `task
+  # start` finds this run open for its agent and REUSES it (run_open is idempotent
+  # per task+agent+open run), so one activation stays one attempt.
+  #
+  # The 5th arg is the seat the row was claimed FOR: the run belongs to that agent,
+  # not to the root dispatcher process executing this line.
+  run_open "$id" "$(_hb_ident "$id")" "heartbeat dispatch" "" "$name" >/dev/null 2>&1 || true
   return 0
 }
 
@@ -1890,6 +1901,15 @@ _hb_reclaim_to_todo() {
     actor="$name" authority="dispatcher" \
     idem="task.reclaimed|${id}|${now_stamp}" \
     detail="reclaim -> todo (DIVE-3251); why=${why}; cleared started_at=${prev_started:-<empty>}" || true
+  # DIVE-3932 acceptance: A CRASH MUST LEAVE A FAILED RUN, NOT NO RUN. This sweep
+  # is where an attempt that died without reaching any boundary is finally
+  # observed — the process is gone, so nothing on the seat's side can close its
+  # own run. Status `abandoned`, never `failed`: we know the attempt stopped, we
+  # do NOT know that it errored, and error_class carries the sweep's own reason
+  # (orphan-by-restart, stall, ceiling) rather than a fault we did not witness.
+  # Scoped to the reclaimed seat's run, so a row another agent is legitimately
+  # working is untouched.
+  _run_close_for_task "$id" abandoned reclaimed_to_todo "$name" "$why" || true
   _hb_log "[$name] reclaimed $(_hb_ident "$id") -> todo ($why)"
 }
 
