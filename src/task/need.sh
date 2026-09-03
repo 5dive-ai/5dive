@@ -2812,7 +2812,7 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
   _run_event_for_task "$id" gate.opened \
     "{\"type\":$(_run_json_str "$type"),\"tier\":$(_run_json_str "$tier")}" || true
   if [[ "$tier" != "0" ]]; then
-    run_touch_human "$(run_current "$id")"
+    run_touch_human "$(run_current "$id")" || true
   fi
 
   # DIVE-891 tier 0: apply the recommendation right now — the gate exists only
