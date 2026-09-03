@@ -330,13 +330,55 @@ t "3856: …and writes no escalate row" "" "$(fld "$unv_out" ESC)"
 # takes over. This is the pair that proves the limiter both ALLOWS and REFUSES —
 # a limiter only ever seen refusing is indistinguishable from one that refuses
 # always, which would reproduce the outage the rung exists to end.
+#
+# DIVE-3915 corrects this fixture's ROW to match its own prose. It seeded
+# `result:"ok"` and called it "the seat a restart did NOT fix" — which was
+# coherent only while `ok` meant cmd_restart's exit code and said nothing about
+# the poller. DIVE-3856 gave the trail a real reading, and DIVE-3915 makes the
+# ceiling count it: an unhealed restart is what refuses a second one.
 _SPENT="INSERT INTO supervisor_events (agent, event, classification, cause, signals)
-        VALUES ('main','action','stuck','poller-dead','{\"rung\":\"restart\",\"attempt\":1,\"result\":\"ok\"}');"
+        VALUES ('main','action','stuck','poller-dead','{\"rung\":\"restart\",\"attempt\":1,\"result\":\"restart-ran-poller-still-dead\"}');"
 limited_out=$(tick_arm "$_SICK_SNAP" armed "$_SPENT")
 t "rate-limited tick: no second restart inside the window" "" "$(fld "$limited_out" RESTARTED)"
 t "rate-limited tick: it escalates instead, naming the limiter" "restart-rate-limited" \
   "$(jq -r '.reason // "NO-REASON"' <<<"$(fld "$limited_out" ESC)" 2>/dev/null || echo NO-ESCALATE-ROW)"
 t "rate-limited tick: and the escalation reaches a courier" "ops" "$(fld "$limited_out" SENT)"
+
+# ── DIVE-3915: a recovery that WORKED does not spend the next episode's cure ──
+# THE MEASURED OUTAGE, 2026-09-03. `main` and `olivia` both went deaf on telegram
+# within two minutes, same lifecycle signature. The supervisor classified `main`
+# correctly and could not act: `ESCALATE main (poller-dead: rung-4-needed)` then
+# `(poller-dead: restart-rate-limited)`. The budget had been spent hours earlier
+# by an UNRELATED episode whose restart had worked. The cure, once a human ran
+# it, took 2.4 seconds — 00:47:25 restart, 00:47:27.841 `boot ok`.
+#
+# Same snapshot, same armed tick, and the ONLY difference from the pair above is
+# that the prior restart's recorded result is `ok`: DIVE-3856's probe saw the
+# poller return. The rung must fire.
+_HEALED="INSERT INTO supervisor_events (agent, event, classification, cause, signals)
+         VALUES ('main','action','stuck','poller-dead','{\"rung\":\"restart\",\"attempt\":1,\"result\":\"ok\"}');"
+healed_out=$(tick_arm "$_SICK_SNAP" armed "$_HEALED")
+t "3915: a prior restart that HEALED the poller does not refuse the next one" "main" \
+  "$(fld "$healed_out" RESTARTED)"
+t "3915: and no restart-rate-limited escalation is written" "" \
+  "$(jq -r '.reason // ""' <<<"$(fld "$healed_out" ESC)" 2>/dev/null || echo "")"
+t "3915: so nobody is paged for a seat the supervisor just cured" "" "$(fld "$healed_out" SENT)"
+
+# THE FLAP BOUND, at the tick. Three healed restarts in the window: nothing is
+# unhealed, so the ceiling above never fires — and without a second bound this
+# seat restarts forever and never reaches a person. It escalates under its own
+# reason, because "the remedy keeps being needed" sends a human somewhere else
+# than "the remedy keeps failing".
+_FLAP=""
+for _i in 1 2 3; do
+  _FLAP+="INSERT INTO supervisor_events (agent, event, classification, cause, signals)
+          VALUES ('main','action','stuck','poller-dead','{\"rung\":\"restart\",\"attempt\":1,\"result\":\"ok\"}');"
+done
+flap_out=$(tick_arm "$_SICK_SNAP" armed "$_FLAP")
+t "3915 flap: the fourth restart in the window is refused" "" "$(fld "$flap_out" RESTARTED)"
+t "3915 flap: and it escalates under its OWN reason, not the limiter's" "restart-flapping" \
+  "$(jq -r '.reason // "NO-REASON"' <<<"$(fld "$flap_out" ESC)" 2>/dev/null || echo NO-ESCALATE-ROW)"
+t "3915 flap: which reaches a courier, like every other escalation" "ops" "$(fld "$flap_out" SENT)"
 
 # ── DIVE-3822: weekly exhaustion, real tick wiring ───────────────────────────
 _QUOTA_SNAP='[{"name":"ops","type":"claude","classification":"quota-exhausted","cause":"quota-exhausted","detail":"Opus 5 5h: 0% 7d: 100%"},
