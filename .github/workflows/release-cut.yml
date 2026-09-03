@@ -374,9 +374,48 @@ jobs:
                 runs=$(awk -F'\t' -v jn="$_self_name" '$1 != jn' <<<"$runs")
               fi
             fi
+            # DIVE-3941: A CANCELLED ATTEMPT IS NOT A VERDICT, AND IT OUTLIVES THE ONE
+            # THAT REPLACED IT. GitHub keeps every attempt on the sha, so a name can carry
+            # BOTH a `cancelled` row and the completed row that actually graded it. DIVE-3314
+            # already established the premise ("cancelled means the verdict was deliberately
+            # never produced") but only handled the verdict arriving on a DESCENDANT sha.
+            # It can also arrive on THIS one: full-sweep's concurrency group is keyed on the
+            # ref, not the sha, so a scheduled sweep and the push sweep for the SAME commit
+            # collide, the scheduled one cancels the push one, and then completes — green, on
+            # the identical tree. Measured 2026-09-03 on 8e0b51cc: 8 `cancelled`
+            # harness-verdict rows from run 33730331293, and 8 same-named `success` rows from
+            # run 33731575722 that cancelled it. `_retarget_tip` finds nothing (main never
+            # moved), so the refusal is PERMANENT — the DIVE-2466 self-latching poison one
+            # door over, on a row no later run can ever clear.
+            #
+            # THE RULE: a `cancelled` row whose NAME also has a COMPLETED, non-`cancelled` row
+            # on this sha is superseded — that other row is the verdict for that name. Drop it.
+            # This CANNOT turn a failure green: a `failure` row is itself completed and
+            # non-cancelled, so it survives the filter and stays in `bad`. And it cannot
+            # invent a verdict: with no completed sibling the cancelled row is left exactly as
+            # red as it is today, which is what every pre-existing arm asserts.
+            # Placed AFTER the sibling drop on purpose — a release-cut's own corpse must never
+            # be the row that supersedes anything.
+            _superseded=$(awk -F'\t' '
+              NR==FNR { if ($2 == "completed" && $3 != "cancelled") v[$1]=1; next }
+              ($2 == "completed" && $3 == "cancelled" && ($1 in v))
+            ' <(printf '%s\n' "$runs") <(printf '%s\n' "$runs"))
+            if [[ -n "$_superseded" ]]; then
+              echo "dropping $(printf '%s\n' "$_superseded" | grep -c .) cancelled attempt(s) superseded by a completed row of the same name on ${sha:0:12} (DIVE-3941):"
+              printf '%s\n' "$_superseded" | cut -f1-3 | sed 's/^/  superseded: /'
+              runs=$(awk -F'\t' '
+                NR==FNR { if ($2 == "completed" && $3 != "cancelled") v[$1]=1; next }
+                { if ($2 == "completed" && $3 == "cancelled" && ($1 in v)) next; print }
+              ' <(printf '%s\n' "$runs") <(printf '%s\n' "$runs"))
+            fi
             total=$(printf '%s' "$runs" | grep -c . || true)
             incomplete=$(awk -F'\t' '$2 != "completed"' <<<"$runs")
             bad=$(awk -F'\t' '$3 != "success" && $3 != "skipped" && $3 != "neutral"' <<<"$runs" | awk -F'\t' '$2 == "completed"')
+            # DIVE-3941: split the reds by KIND here, above the ladder, because two branches
+            # now ask the question. `cancelled` is an absent verdict (DIVE-3314); everything
+            # else in `bad` is a real one.
+            _uncancelled=$(awk -F'\t' '$3 != "cancelled"' <<<"$bad")
+            _ncancelled=$(awk -F'\t' '$3 == "cancelled"' <<<"$bad" | grep -c . || true)
 
             echo "CI on ${sha:0:12}: ${total} check-run(s) (excluding every run of this workflow) [look ${_look}]"
             printf '%s\n' "$runs" | cut -f1-3 | sed 's/^/  /'
@@ -405,6 +444,35 @@ jobs:
             if [[ -n "$bad" && -n "${GITHUB_RUN_ID:-}" && -z "$_self_name" ]]; then
               echo "CI shows red on ${sha:0:12}, but our OWN check-run row is not visible yet, so sibling release-cut rows could not be dropped — NOT acting on an unattributable red; re-looking (DIVE-2466) [look ${_look}]"
               printf '%s\n' "$bad" | sed 's/^/  deferred: /'
+            # DIVE-3941 — A CANCELLED-ONLY RED ON AN UNSETTLED BOARD IS DEFERRED, NOT REFUSED.
+            #
+            # "RED still refuses IMMEDIATELY and is never waited out" (DIVE-2466) is correct
+            # for a VERDICT. `cancelled` is not one — DIVE-3314's whole argument is that it is
+            # the deliberate absence of a verdict — so refusing on it instantly, while a run is
+            # still producing verdicts for this very sha, throws away the poll that exists for
+            # exactly this. Measured 2026-09-03: the cut started 08:17:43Z and read 8 cancelled
+            # rows beside `full-pristine (3) in_progress`; the sweep producing the real rows
+            # completed success at 08:36:29Z, 18m35s later, inside the 45-min ceiling. The cut
+            # refused in 11s and main stayed uncut with nothing wrong with main.
+            #
+            # THE NARROWNESS IS THE SAFETY ARGUMENT, and it is the same three conditions the
+            # retarget uses, with the settled test INVERTED:
+            #   * `-z "$_uncancelled"` — ONE genuine failure/timed_out beside the cancellations
+            #     and we fall through to the branch below and refuse now, unchanged. Only an
+            #     all-cancelled red is deferrable.
+            #   * a POSITIVE cancellation count — "every red is cancelled" is vacuously true of an
+            #     empty set (DIVE-2867), so assert the positive where the decision is made.
+            #   * `-n "$incomplete"` — there must actually be something still running. A
+            #     SETTLED all-cancelled board is the retarget's case, not this one, and it
+            #     still refuses on look 1 when main has not moved.
+            # NOTHING HERE CAN PUBLISH. This branch only declines to exit; `bad` is still
+            # non-empty, so the `-z "$bad"` green test below cannot break out, and the deadline
+            # refuses fail-closed with the unchanged `CI still IN FLIGHT` message. The most it
+            # can cost is the poll budget that was already bought and bounded.
+            elif [[ -n "$bad" && -z "$_uncancelled" ]] && (( _ncancelled > 0 )) && [[ -n "$incomplete" ]]; then
+              echo "every red on ${sha:0:12} is 'cancelled' — an absent verdict, not a bad one — and ${_ncancelled} of them sit beside a board that is STILL IN FLIGHT, so a verdict for this sha is being produced right now. Not refusing on a non-verdict; re-looking (DIVE-3941) [look ${_look}]"
+              printf '%s\n' "$bad"        | cut -f1-3 | sed 's/^/  not-a-verdict: /'
+              printf '%s\n' "$incomplete" | cut -f1-3 | sed 's/^/  awaiting: /'
             elif [[ -n "$bad" ]]; then
               # DIVE-3314 SUPERSESSION RETARGET — the one red that is not a verdict.
               #
@@ -460,8 +528,6 @@ jobs:
               #                       not walk further; an unfinished verdict is one that is coming.
               #   all-cancelled again, and main moved AGAIN -> at most one more hop, then refuse.
               # So the only walk is condition-1-and-2 twice, and the deadline bounds even that.
-              _uncancelled=$(awk -F'\t' '$3 != "cancelled"' <<<"$bad")
-              _ncancelled=$(awk -F'\t' '$3 == "cancelled"' <<<"$bad" | grep -c . || true)
               _newtip=""
               if [[ -z "$_uncancelled" ]] && (( _ncancelled > 0 )) && [[ -z "$incomplete" ]] && (( _retargets < _RETARGET_MAX )); then
                 _newtip=$(_retarget_tip "$sha")

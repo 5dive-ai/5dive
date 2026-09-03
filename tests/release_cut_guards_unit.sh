@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# TIER: nightly — 42.8s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
+# TIER: nightly — 63.6s measured (DIVE-3941, 2026-09-03): does not fit the 300s PR core; the
+# nightly sweep runs it. Was 42.8s (DIVE-2525); the same box measured 50.8s for the pre-DIVE-3941
+# tree in the same session, so ~8s of the rise is the box and ~13s is this ticket's three new
+# deadline arms, which can only be graded by letting a poll budget actually expire.
 # DIVE-2144 — grade the two guards in .github/workflows/release-cut.yml.
 #
 # SHAPE, and it is deliberate (same as tests/install_pin_sha_unit.sh): this extracts
@@ -352,8 +355,15 @@ ok "descendant == the incumbent's cut_from -> exit 0, publish nothing" \
 # retargeted twice while work on the sha being abandoned was still running, which is exactly the
 # impatient-hop main named. The retarget now requires a SETTLED board, so this refuses instead.
 CANCELLED_PLUS_QUEUED=$(printf 'harness-verdict-union\tcompleted\tcancelled\nharness-verdict-slow\tqueued\tpending')
-ok "a QUEUED row beside cancellations -> REFUSES, never retargets" \
-   "$(POLL_BUDGET=3 retarget_run "$NEWTIP" "$CANCELLED_PLUS_QUEUED")" "RED retargets=0"
+# DIVE-3941 CHANGED THE VERDICT STRING HERE AND NOT THE PROPERTY. Both halves of what
+# this arm was bought to pin still hold: it does NOT retarget (retargets=0), and it does
+# NOT publish (`retarget_run` only ever reports IN-FLIGHT on rc != 0, i.e. a refusal).
+# What changed is WHICH refusal: an all-cancelled red beside a live board is now waited
+# out to the deadline instead of refused on look 1, because `cancelled` is an absent
+# verdict and the queued row is the thing producing the real one. The impatient hop this
+# arm was written against is still impossible.
+ok "a QUEUED row beside cancellations -> REFUSES at the deadline, never retargets" \
+   "$(POLL_BUDGET=3 retarget_run "$NEWTIP" "$CANCELLED_PLUS_QUEUED")" "IN-FLIGHT retargets=0"
 ok "...and the same board with the queued row FINISHED does retarget (the control)" \
    "$(retarget_run "$NEWTIP" "$(printf 'harness-verdict-union\tcompleted\tcancelled\nharness-verdict-slow\tcompleted\tsuccess')" "$GREENB")" "GREEN retargets=1"
 ok "the settled-board precondition is in the workflow" \
@@ -368,7 +378,64 @@ ok "a descendant that never settles -> refuses at the deadline, no second hop" \
 # conclusion, which must refuse rather than retarget.
 ok "a red row with a BLANK conclusion -> RED, never retargets on nothing" \
    "$(retarget_run "$NEWTIP" "$(printf 'ghost\tcompleted\t')" "$GREENB")" "RED retargets=0"
-ok "the positive cancellation count is in the workflow" "$(grep -c '_ncancelled > 0' "$WF")" "1"
+# DIVE-3941: TWO branches now consume the positive count -- the retarget (settled board)
+# and the deferral (unsettled board). The number is the point: if a third consumer appears
+# without an arm, or one of these two loses its count and goes vacuous-true on an empty
+# set, this moves.
+ok "the positive cancellation count is in the workflow, once per consumer" \
+   "$(grep -c '(( _ncancelled > 0 ))' "$WF")" "2"
+
+
+echo "== DIVE-3941: a cancellation SUPERSEDED on the same sha is not a red, and a cancelled-only red on a LIVE board is waited out =="
+# MEASURED 2026-09-03, run 33732579500. full-sweep's concurrency group is keyed on the REF,
+# not the sha, so the daily scheduled sweep and the `push: main` sweep for the SAME commit
+# collide: the scheduled one cancelled the push one (8 `harness-verdict-*` rows) and then
+# completed SUCCESS on the identical tree 19 minutes later. The cut read the 8 corpses,
+# found no descendant to retarget to (main never moved), and refused in 11s. That refusal
+# is PERMANENT — nothing can ever clear a cancelled row from a sha's board — so main's tip
+# was latched uncuttable while main was green. Two independent fixes, graded separately.
+#
+# (A) SUPERSESSION. Settled boards only, so `verdict()`'s single look is the right driver
+# and no retarget stub is needed (its absence refuses, which every arm below relies on).
+SUP_GREEN=$(printf 'harness-verdict-slow\tcompleted\tcancelled\nharness-verdict-slow\tcompleted\tsuccess\ntest\tcompleted\tsuccess')
+ok "cancelled + a same-name SUCCESS on the same sha -> GREEN (the 09-03 board)" \
+   "$(verdict "$SUP_GREEN")" "GREEN"
+# THE ARM THAT MAKES (A) SAFE. A `failure` is itself completed and non-cancelled, so it
+# supersedes the cancellation and then stays in `bad` on its own account. Supersession can
+# narrow WHICH rows are red; it can never make a real red green.
+ok "cancelled + a same-name FAILURE -> RED, never green" \
+   "$(verdict "$(printf 'harness-verdict-slow\tcompleted\tcancelled\nharness-verdict-slow\tcompleted\tfailure')")" "RED"
+# NAME-SCOPED. A completed row under a DIFFERENT name says nothing about this one.
+ok "cancelled + a success under a DIFFERENT name -> RED" \
+   "$(verdict "$(printf 'harness-verdict-slow\tcompleted\tcancelled\ntest\tcompleted\tsuccess')")" "RED"
+# THE CONTROL, and it is the pre-DIVE-3941 behaviour verbatim: with no completed sibling
+# the cancellation is left exactly as red as it was.
+ok "cancelled with NO sibling row -> RED, unchanged" \
+   "$(verdict "$(printf 'harness-verdict-slow\tcompleted\tcancelled\ntest\tcompleted\tsuccess\nscan\tcompleted\tsuccess')")" "RED"
+ok "cancelled + a same-name SKIPPED -> GREEN (skipped is already a verdict here)" \
+   "$(verdict "$(printf 'shard\tcompleted\tcancelled\nshard\tcompleted\tskipped\ntest\tcompleted\tsuccess')")" "GREEN"
+# ONLY A COMPLETED ROW SUPERSEDES. A re-run of the same name still IN FLIGHT is not a
+# verdict either, so the board is unsettled and (B) waits rather than publishing.
+ok "cancelled + the same name still in_progress -> not superseded, waits, then refuses" \
+   "$(POLL_BUDGET=3 retarget_run "" "$(printf 'shard\tcompleted\tcancelled\nshard\tin_progress\tpending')")" "IN-FLIGHT retargets=0"
+#
+# (B) DEFERRAL. The 09-03 replay: look 1 is what the cut actually read at 08:17:54Z (the
+# cancellations beside a sweep still running), look 2 is the same board after that sweep
+# finished at 08:36:29Z. The fix is that look 2 is ever reached.
+D3941_L1=$(printf 'harness-verdict-slow\tcompleted\tcancelled\nharness-verdict-union\tcompleted\tcancelled\nfull-pristine (3)\tin_progress\tpending\ntest\tcompleted\tsuccess')
+D3941_L2=$(printf 'harness-verdict-slow\tcompleted\tcancelled\nharness-verdict-union\tcompleted\tcancelled\nharness-verdict-slow\tcompleted\tsuccess\nharness-verdict-union\tcompleted\tsuccess\nfull-pristine (3)\tcompleted\tsuccess\ntest\tcompleted\tsuccess')
+ok "the 2026-09-03 board: cancelled beside a live sweep -> polls, then GREEN, no retarget" \
+   "$(retarget_run "" "$D3941_L1" "$D3941_L2")" "GREEN retargets=0"
+# THE NARROWNESS. One genuine failure beside the cancellations and the deferral is not
+# entered at all: refuse now, on look 1, exactly as before.
+ok "a genuine failure beside cancelled+in-flight -> RED immediately, never deferred" \
+   "$(retarget_run "" "$(printf 'harness-verdict-slow\tcompleted\tcancelled\nfull-shard-3\tcompleted\tfailure\nfull-pristine (3)\tin_progress\tpending')" "$D3941_L2")" "RED retargets=0"
+# FAIL-CLOSED. A board that never settles refuses at the deadline; nothing publishes.
+ok "cancelled + a board that never settles -> refuses at the deadline" \
+   "$(POLL_BUDGET=3 retarget_run "" "$D3941_L1")" "IN-FLIGHT retargets=0"
+# ...and the deferral must not eat the SETTLED all-cancelled case, which is the retarget's.
+ok "a SETTLED all-cancelled board with no descendant still refuses on look 1" \
+   "$(retarget_run "" "$CANCELLED" "$GREENB")" "RED retargets=0"
 
 # A deferred red must never fall through the green test. Before DIVE-3314 the only thing
 # stopping that was our own in_progress row keeping `incomplete` non-empty — a property of
@@ -460,6 +527,29 @@ if m=$(mutate 's|if \[\[ -n "$bad" && -n "${GITHUB_RUN_ID:-}" && -z "$_self_name
   GUARD="$GUARD_SAVE"
 else
   vacuous "drop the unattributable-red deferral"
+fi
+
+# (a5) DIVE-3941: remove the SUPERSESSION filter — the 2026-09-03 latch must return.
+# Without this arm the filter is unpinned, and what comes back is not a red build: it is a
+# sha that can never be cut again, which no board row can see.
+if m=$(mutate 's|if \[\[ -n "$_superseded" \]\]; then|if false; then|' GUARD); then
+  GUARD_SAVE="$GUARD"; GUARD="$m"
+  ok "MUTANT drop the supersession filter: the 09-03 board latches red again" \
+     "$(verdict "$SUP_GREEN")" "RED"
+  GUARD="$GUARD_SAVE"
+else
+  vacuous "drop the supersession filter"
+fi
+# (a6) DIVE-3941: remove the CANCELLED-ONLY DEFERRAL. The board still goes green on look 2;
+# the mutant is that look 2 is never reached, which is precisely how the 08:17Z run refused
+# in 11 seconds while the verdict it wanted was 19 minutes out.
+if m=$(mutate 's|elif \[\[ -n "$bad" && -z "$_uncancelled" \]\]|elif [[ -z "$bad" ]]|' GUARD); then
+  GUARD_SAVE="$GUARD"; GUARD="$m"
+  ok "MUTANT drop the cancelled-only deferral: the 09-03 replay refuses on look 1" \
+     "$(retarget_run "" "$D3941_L1" "$D3941_L2")" "RED retargets=0"
+  GUARD="$GUARD_SAVE"
+else
+  vacuous "drop the cancelled-only deferral"
 fi
 
 if m=$(mutate 's/runs=\$(_ci_fetch_runs)$/:/' GUARD); then
