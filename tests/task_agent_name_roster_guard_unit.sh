@@ -141,10 +141,14 @@ out=$(cmd_task_add "T5 council creator" --from=council 2>&1); rc=$?
 [[ "$rc" == "0" ]] \
   && ok_t "T5b --from=council accepted (relay principal, no lane)" \
   || bad_t "T5b council creator" "rc=$rc :: $out"
+out=$(cmd_task_add "T5 trigger creator" --from=trigger 2>&1); rc=$?
+[[ "$rc" == "0" ]] \
+  && ok_t "T5c --from=trigger accepted (signed event ingress principal, no lane)" \
+  || bad_t "T5c trigger creator" "rc=$rc :: $out"
 out=$(cmd_task_add "T5 junk creator" --from=notdevx 2>&1); rc=$?
 [[ "$rc" == "$E_VALIDATION" ]] \
-  && ok_t "T5c a creator that is neither lane nor sentinel is still refused" \
-  || bad_t "T5c junk creator" "rc=$rc :: $out"
+  && ok_t "T5d a creator that is neither lane nor sentinel is still refused" \
+  || bad_t "T5d junk creator" "rc=$rc :: $out"
 
 # T6 — --verifier is a dispatch target too (delivering writes assignee=verifier).
 out=$(cmd_task_add "T6 verifier drift" --assignee=dev --verifier=agent-quinn 2>&1); rc=$?
