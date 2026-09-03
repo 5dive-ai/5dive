@@ -271,7 +271,10 @@ t "3915: the window is still 6h" "6" "$_SUP_RESTART_WINDOW_H"
 # guards against is a pure argument-order error, which is a text property: if
 # `unhealed` and `restarts` were swapped here, every healed restart would spend
 # the ceiling again and this change would be a no-op that looks shipped.
-_PLAN_CALL="$(grep -n 'plan=$(_sup_act_plan' "$SRC/cmd_supervisor.sh")"
+# DIVE-2604 rail: this probe is ALLOWED to find nothing (a rename would empty it),
+# and the rail scans tests/ too — so the substitution is guarded, and the arm below
+# then fails on the empty string instead of killing the harness.
+_PLAN_CALL="$(grep -n 'plan=$(_sup_act_plan' "$SRC/cmd_supervisor.sh")" || _PLAN_CALL=""
 t "3915 wiring: the dispatch passes unhealed as \$7 and the total as \$9" "yes" \
   "$(grep -q '"\$rot" "\$unhealed" "\$actions_on" "\$restarts"' <<<"$_PLAN_CALL" && printf yes || printf no)"
 
