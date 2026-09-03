@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# DIVE-2655 e2e — `5dive ui`, the free single-host web UI, on the BUILT binary.
+# DIVE-2655/DIVE-3931 e2e — the free single-host read-only UI on the BUILT binary.
 #
-# WHAT THIS GRADES, and why each arm exists. The subject is three read-only views
+# WHAT THIS GRADES, and why each arm exists. The subject is local read-only views
 # over the local board, so the ways it can be broken are (a) the data says
 # something the CLI's own verbs do not, (b) the surface grows a write or a
 # second host, and (c) the page needs the network to render. One arm each:
@@ -125,7 +125,7 @@ D="$("$FIVE" ui --data 2>"$TMP/data.err")"
 chk "1 ok envelope"        "true"          "$(jq -r '.ok' <<<"$D")"
 chk "1 scope single-host"  "single-host"   "$(jq -r '.data.scope' <<<"$D")"
 chk "1 key set is whole (no fleet surface)" \
-    "flows gates generated_at host org queue scope stats store" \
+    "deliveries flows gates generated_at host org queue scope stats store triggers" \
     "$(jq -r '.data|keys|sort|join(" ")' <<<"$D")"
 
 # --- 2. org chart ------------------------------------------------------------
@@ -178,6 +178,7 @@ chk "7 no absolute URL anywhere" "0" "$(grep -cE 'https?://' "$TMP/page.html" ||
 chk "7 org view present"     "1"  "$(grep -c 'id="view-org"' "$TMP/page.html" || true)"
 chk "7 queue view present"   "1"  "$(grep -c 'id="view-queue"' "$TMP/page.html" || true)"
 chk "7 gates view present"   "1"  "$(grep -c 'id="view-gates"' "$TMP/page.html" || true)"
+chk "7 triggers view present" "1" "$(grep -c 'id="view-triggers"' "$TMP/page.html" || true)"
 
 # --- 8-11. the live surface --------------------------------------------------
 PORT="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"

@@ -171,7 +171,66 @@ require_sqlite() {
 # WITHOUT a bump runs on fresh stores only. It ships green on every harness (they
 # all start from an empty dir and take the canonical schema) and reaches no
 # existing board, which is the one population it was written for.
-_TASKS_SCHEMA_EPOCH='INST8-1'  # INST-8: +action_leases (was 3525-1: +gate_cards)
+_TASKS_SCHEMA_EPOCH='3931-1'  # DIVE-3931: +event trigger ingress tables
+
+# DIVE-3931: Event -> Task ingress lives in the task store because ingress ends
+# at the queue. One SQL emitter serves fresh stores and migrations so the two
+# populations cannot acquire different trigger schemas.
+_tasks_trigger_schema_sql() {
+  cat <<'SQL'
+CREATE TABLE IF NOT EXISTS event_triggers (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  name              TEXT NOT NULL UNIQUE,
+  source            TEXT NOT NULL CHECK(source IN ('github','webhook')),
+  event_pattern     TEXT NOT NULL,
+  source_scope      TEXT,
+  filter_json       TEXT NOT NULL DEFAULT '{}',
+  target            TEXT NOT NULL,
+  task_title        TEXT,
+  enabled           INTEGER NOT NULL DEFAULT 1,
+  max_pending       INTEGER NOT NULL DEFAULT 50,
+  on_overflow       TEXT NOT NULL DEFAULT 'park' CHECK(on_overflow IN ('park','fail')),
+  max_payload_bytes INTEGER NOT NULL DEFAULT 1048576,
+  secret_ref        TEXT NOT NULL,
+  created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS event_deliveries (
+  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+  trigger_id         INTEGER NOT NULL REFERENCES event_triggers(id),
+  source_delivery_id TEXT NOT NULL,
+  event_header       TEXT,
+  event_type         TEXT,
+  received_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  signature_status   TEXT NOT NULL,
+  signature          TEXT,
+  dedupe_key         TEXT NOT NULL,
+  materialization_key TEXT NOT NULL UNIQUE,
+  payload_path       TEXT,
+  payload_sha256     TEXT,
+  normalized_json    TEXT,
+  outcome            TEXT NOT NULL,
+  task_id            INTEGER REFERENCES tasks(id),
+  error              TEXT,
+  replay_count       INTEGER NOT NULL DEFAULT 0,
+  last_replayed_at   TEXT,
+  UNIQUE(trigger_id, source_delivery_id),
+  UNIQUE(trigger_id, dedupe_key)
+);
+CREATE INDEX IF NOT EXISTS event_deliveries_trigger_idx ON event_deliveries(trigger_id, id DESC);
+CREATE INDEX IF NOT EXISTS event_deliveries_task_idx ON event_deliveries(task_id);
+CREATE TABLE IF NOT EXISTS event_delivery_attempts (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  delivery_id      INTEGER NOT NULL REFERENCES event_deliveries(id),
+  attempt_kind     TEXT NOT NULL CHECK(attempt_kind IN ('receive','replay')),
+  attempted_at     TEXT NOT NULL DEFAULT (datetime('now')),
+  signature_status TEXT NOT NULL,
+  outcome          TEXT NOT NULL,
+  error            TEXT
+);
+CREATE INDEX IF NOT EXISTS event_delivery_attempts_delivery_idx ON event_delivery_attempts(delivery_id, id);
+SQL
+}
 _tasks_schema() {
   cat <<'SQL'
 PRAGMA journal_mode=WAL;
@@ -1288,6 +1347,7 @@ CREATE TABLE IF NOT EXISTS action_leases (
 CREATE UNIQUE INDEX IF NOT EXISTS action_leases_idem_idx ON action_leases(idem_key);
 CREATE INDEX IF NOT EXISTS action_leases_state_idx ON action_leases(state, expires_at);
 SQL
+  _tasks_trigger_schema_sql
 }
 
 # -------- DIVE-1479: silent-recreate trap guard --------
@@ -2537,6 +2597,10 @@ CREATE TABLE IF NOT EXISTS human_agents (
 CREATE INDEX IF NOT EXISTS human_agents_agent_idx ON human_agents(agent);
 MIG
   fi
+  # DIVE-3931: additive Event -> Task ingress tables. This is the exact SQL
+  # emitted for a fresh store above; IF NOT EXISTS makes the common path inert.
+  _tasks_trigger_schema_sql | sqlite3 -cmd ".timeout 5000" "$TASKS_DB" >/dev/null \
+    || fail "$E_GENERIC" "failed to migrate trigger tables in $TASKS_DB"
   _tasks_db_stamp_schema_epoch
 }
 

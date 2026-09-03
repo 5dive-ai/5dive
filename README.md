@@ -205,7 +205,10 @@ Inspect a task's complete causal timeline from origin to verdict.
 Watch the whole team in real time.
 
 `5dive ui`<br>
-Open local browser views for the org chart, task queue, and human gates.
+Open local browser views for the org chart, task queue, human gates, and signed trigger deliveries.
+
+`5dive trigger`<br>
+Turn signed GitHub or generic webhook events into ordinary tasks.
 
 `5dive memory search "release checklist"`<br>
 Search the team's durable memory with provenance.
@@ -286,6 +289,19 @@ When an agent hits something only a human can decide, it parks the task on you:
 
 That arrives on your Telegram as tap-to-answer buttons. Tap one, and the owning agent is unblocked and resumes. `5dive task inbox` lists everything waiting on a human, and `5dive org` keeps a reporting chart so you can see who works for whom.
 
+External systems can file the same ordinary rows through authenticated triggers:
+
+```sh
+openssl rand -hex 32 | sudo 5dive trigger add github \
+  --name=github-issues --event=issues.labeled --repo=acme/app \
+  --where='label.name == "5dive"' --role=engineering --secret-from-stdin
+sudo 5dive trigger serve --listen=127.0.0.1:8740
+```
+
+Put HTTPS in front of the loopback receiver. It verifies HMAC before parsing,
+deduplicates sender delivery IDs, applies backpressure, and stops at the task
+queue rather than starting an agent directly. See [signed event triggers](docs/triggers.md).
+
 ### Accounts (shared auth profiles)
 
 One sign-in, many agents:
@@ -328,11 +344,12 @@ The CLI serves its own web UI. No install, no build step, no account:
 5dive ui                 # http://127.0.0.1:8735
 ```
 
-Three views over the box you are on:
+Four views over the box you are on:
 
 - **Org chart** who reports to whom, what each agent is holding, and every live handoff on the board: who gave the work, who holds it, who grades it. The headline counts how many of those handoffs ran agent to agent with no human in the path.
 - **Queue** every open row with its assignee, its verifier, and where a maker-to-verifier handoff has got to.
 - **Gates** what is parked on a person, at which tier, with the asking agent's recommended answer.
+- **Triggers** configured GitHub/generic rules plus delivery outcomes and links from accepted deliveries to their tasks.
 
 It is read-only and binds to loopback (there is no sign-in, so `--host` refuses a routable address unless you set `FIVE_UI_ALLOW_REMOTE=1`). Anything that changes state has a CLI verb. `5dive ui --data` prints the same JSON the views render, so you can pipe it somewhere else.
 
@@ -356,9 +373,10 @@ sudo 5dive council init --seats=<a:chair,b,c> --threshold=<spec> --veto=<princip
 5dive acp                                # connect from Zed, Buzz, or another ACP client
 
 5dive task      add / ls / assign / start / done / need / inbox / answer
+5dive trigger   add / ls / show / deliveries / replay / serve
 5dive heartbeat on / off / ls / tick     # wake agents that have queued work
 5dive org       set / tree               # who reports to whom
-5dive ui                                 # the three views in a browser (below)
+5dive ui                                 # local org/queue/gates/triggers views
 
 5dive account   add / login / list / show / usage / rename / remove
 5dive auth      set / login / status     # lower-level; account is the human path

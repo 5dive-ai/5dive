@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# `5dive ui` — the free single-host web UI (DIVE-2655): three read-only views
-# (org chart, queue, gates) served by the CLI itself.
+# `5dive ui` — the free single-host web UI (DIVE-2655): read-only views over
+# org, queue, gates, and DIVE-3931's signed trigger delivery history.
 #
 # WHY THIS IS IN THE OSS BUNDLE AT ALL. Withholding a screen only creates upgrade
 # pressure while the alternative to paying is NOTHING, and since 2026-07-29 it is
@@ -38,7 +38,7 @@ readonly FIVE_UI_DEFAULT_PORT=8735
 
 _ui_usage() {
   cat <<'USAGE'
-5dive ui: the local web UI (org chart, queue, gates). One host, read-only, no sign-in.
+5dive ui: the local web UI (org chart, queue, gates, triggers). One host, read-only, no sign-in.
 
   5dive ui                        # serve on http://127.0.0.1:8735 (Ctrl-C to stop)
   5dive ui --port=9000            # pick the port
@@ -100,7 +100,7 @@ cmd_ui() {
   _ui_html > "$tmp/index.html"
   _ui_server_py > "$tmp/server.py"
 
-  step "5dive ui on http://${host}:${port} (org chart, queue, gates: read-only, this host only)"
+  step "5dive ui on http://${host}:${port} (org, queue, gates, triggers: read-only, this host only)"
   local args=("$tmp/server.py" "$host" "$port" "$tmp/index.html" "$self") rc=0
   (( once )) && args+=("--once")
   # The server runs in the BACKGROUND and we wait on it, so a signal reaches it.
@@ -127,7 +127,7 @@ cmd_ui() {
 }
 
 # ---------------------------------------------------------------------------
-# The data. One query set, three views, all of it local.
+# The data. One query set, all local views, all of it on this host.
 #
 # Every field here already exists on the board — the UI derives nothing the CLI
 # does not already print, so a view can never tell a different story than
@@ -141,7 +141,7 @@ cmd_ui() {
 _ui_state_json() {
   # A box with no task store yet is a REAL state, not an error: `sudo 5dive task
   # init` is root-only, and refusing here would mean a fresh install cannot open
-  # the UI at all. So it serves the three views with a named empty board rather
+  # the UI at all. So it serves the views with a named empty board rather
   # than an unnamed one — `store: "absent"` is the difference between "nothing is
   # queued" and "there is nowhere to queue anything", which an empty array alone
   # cannot say.
@@ -149,9 +149,10 @@ _ui_state_json() {
     jq -n --arg host "$(hostname 2>/dev/null || echo localhost)" \
           --arg now "$(date -u '+%Y-%m-%d %H:%M:%SZ')" \
       '{ok: true, data: {scope: "single-host", store: "absent", host: $host, generated_at: $now,
-        org: [], queue: [], gates: [], flows: [],
+        org: [], queue: [], gates: [], flows: [], triggers: [], deliveries: [],
         stats: {agents: 0, open: 0, gates: 0, delegated: 0, agent_to_agent: 0,
-                human_touch: 0, awaiting_verify: 0, in_review: 0}}}'
+                human_touch: 0, awaiting_verify: 0, in_review: 0,
+                triggers: 0, trigger_deliveries: 0}}}'
     return 0
   fi
   tasks_db_init
@@ -176,6 +177,22 @@ _ui_state_json() {
          ORDER BY COALESCE(tier,1) DESC, created_at;" > "$dir/gates.json"
   [[ -s "$dir/gates.json" ]] || printf '[]' > "$dir/gates.json"
 
+  dbfmt -json "SELECT g.id,g.name,g.source,g.event_pattern AS event,g.source_scope AS repo,
+           g.filter_json AS filters,g.target,g.enabled,g.max_pending,g.on_overflow,g.max_payload_bytes,
+           COUNT(d.id) AS deliveries,
+           SUM(CASE WHEN d.outcome='accepted' THEN 1 ELSE 0 END) AS accepted,
+           SUM(CASE WHEN d.outcome IN ('failed','invalid_signature') THEN 1 ELSE 0 END) AS failed,
+           MAX(d.received_at) AS last_delivery_at
+         FROM event_triggers g LEFT JOIN event_deliveries d ON d.trigger_id=g.id
+         GROUP BY g.id ORDER BY g.name;" > "$dir/triggers.json"
+  [[ -s "$dir/triggers.json" ]] || printf '[]' > "$dir/triggers.json"
+
+  dbfmt -json "SELECT d.id,g.name AS trigger,g.source,d.event_type,d.received_at,d.signature_status,
+           d.outcome,t.ident AS task,d.error,d.replay_count
+         FROM event_deliveries d JOIN event_triggers g ON g.id=d.trigger_id
+         LEFT JOIN tasks t ON t.id=d.task_id ORDER BY d.id DESC LIMIT 100;" > "$dir/deliveries.json"
+  [[ -s "$dir/deliveries.json" ]] || printf '[]' > "$dir/deliveries.json"
+
   # flows: who handed work to whom, on THIS board, right now.
   #
   # This is the view the org layer exists to make legible, so it is derived from
@@ -190,11 +207,15 @@ _ui_state_json() {
     --slurpfile org "$dir/org.json" \
     --slurpfile queue "$dir/queue.json" \
     --slurpfile gates "$dir/gates.json" \
+    --slurpfile triggers "$dir/triggers.json" \
+    --slurpfile deliveries "$dir/deliveries.json" \
     --arg host "$(hostname 2>/dev/null || echo localhost)" \
     --arg now "$(date -u '+%Y-%m-%d %H:%M:%SZ')" '
     ($org[0] // []) as $org
     | ($queue[0] // []) as $queue
     | ($gates[0] // []) as $gates
+    | ($triggers[0] // []) as $triggers
+    | ($deliveries[0] // []) as $deliveries
     | ([$org[].name]) as $agents
     | ($agents | map({(.): true}) | add // {}) as $isAgent
     | ([ $queue[]
@@ -214,6 +235,8 @@ _ui_state_json() {
         org: $org,
         queue: $queue,
         gates: $gates,
+        triggers: $triggers,
+        deliveries: $deliveries,
         flows: $flows,
         stats: {
           agents: ($agents | length),
@@ -223,7 +246,9 @@ _ui_state_json() {
           agent_to_agent: ([$flows[] | select(.human == false)] | length),
           human_touch: ([$flows[] | select(.human)] | length),
           awaiting_verify: ([$queue[] | select(.handoff_state == "delivered")] | length),
-          in_review: ([$queue[] | select(.handoff_state == "reviewing")] | length)
+          in_review: ([$queue[] | select(.handoff_state == "reviewing")] | length),
+          triggers: ($triggers | length),
+          trigger_deliveries: ($deliveries | length)
         }
       }}') || rc=$?
   rm -rf "$dir"
@@ -282,6 +307,8 @@ _ui_html() {
   nav button:hover { color: var(--ink); background: var(--panel-2); }
   nav button[aria-selected="true"] { color: var(--ink); background: var(--panel-2); border-color: var(--line); }
   nav button .n { color: var(--faint); font-size: 12px; margin-left: 6px; }
+  a { color: var(--cool); text-decoration: none; }
+  a:hover { text-decoration: underline; }
   main { max-width: 1120px; margin: 0 auto; padding: 22px 20px 64px; }
   h2 { font-size: 15px; margin: 0 0 4px; }
   .sub { color: var(--dim); font-size: 13px; margin: 0 0 16px; }
@@ -350,13 +377,14 @@ _ui_html() {
     <button id="tab-org"   aria-selected="true"  data-view="org">Org chart<span class="n" id="n-org"></span></button>
     <button id="tab-queue" aria-selected="false" data-view="queue">Queue<span class="n" id="n-queue"></span></button>
     <button id="tab-gates" aria-selected="false" data-view="gates">Gates<span class="n" id="n-gates"></span></button>
+    <button id="tab-triggers" aria-selected="false" data-view="triggers">Triggers<span class="n" id="n-triggers"></span></button>
   </nav>
 </header>
 
 <main>
   <div class="card lede" id="no-store" hidden>
     <div class="big">There is no task store on this host yet</div>
-    <p>The three views are empty because nothing has been created, not because the board is clear. Run <code class="mono">sudo 5dive task init</code> (or create your first agent) and reload.</p>
+    <p>The views are empty because nothing has been created, not because the board is clear. Run <code class="mono">sudo 5dive task init</code> (or create your first agent) and reload.</p>
   </div>
   <section id="view-org">
     <div class="card lede">
@@ -386,6 +414,25 @@ _ui_html() {
     <h2>Blocked on a human</h2>
     <p class="sub">These are the asks the fleet could not answer for itself. Everything else moved without one.</p>
     <div id="gates-body"></div>
+  </section>
+
+  <section id="view-triggers" hidden>
+    <h2>Signed event triggers</h2>
+    <p class="sub">Authenticated external events materialize ordinary queue rows. Delivery history links each accepted event to its task.</p>
+    <div class="card scroll">
+      <table>
+        <thead><tr><th>Name</th><th>Source · event</th><th>Scope / filters</th><th>Target</th><th>State</th><th>Accepted</th></tr></thead>
+        <tbody id="trigger-body"></tbody>
+      </table>
+    </div>
+    <h2 style="margin-top:26px">Recent deliveries</h2>
+    <p class="sub">Invalid, ignored, duplicate, parked, failed, and accepted attempts remain visible.</p>
+    <div class="card scroll">
+      <table>
+        <thead><tr><th>ID</th><th>Trigger</th><th>Event</th><th>Received</th><th>Outcome</th><th>Task</th></tr></thead>
+        <tbody id="delivery-body"></tbody>
+      </table>
+    </div>
   </section>
 </main>
 
@@ -587,9 +634,58 @@ _ui_html() {
     });
   }
 
+  // ---- triggers ------------------------------------------------------------
+  function renderTriggers() {
+    var tb = $("trigger-body");
+    tb.textContent = "";
+    var triggers = state.triggers || [];
+    if (!triggers.length) {
+      var et = el("tr"), etd = el("td", "empty", "No signed triggers configured on this host.");
+      etd.colSpan = 6; et.appendChild(etd); tb.appendChild(et);
+    }
+    triggers.forEach(function (t) {
+      var tr = el("tr");
+      tr.appendChild(el("td", "ident mono", t.name || ""));
+      tr.appendChild(el("td", null, (t.source || "") + " · " + (t.event || "")));
+      var scope = (t.repo || "any scope");
+      if (t.filters && t.filters !== "{}") scope += " · " + t.filters;
+      tr.appendChild(el("td", "mono", scope));
+      tr.appendChild(el("td", "who mono", t.target || "-"));
+      var status = el("td"); status.appendChild(chip(t.enabled ? "active" : "disabled", t.enabled ? "on" : "warn")); tr.appendChild(status);
+      tr.appendChild(el("td", "who", String(t.accepted || 0) + " / " + String(t.deliveries || 0)));
+      tb.appendChild(tr);
+    });
+
+    var db = $("delivery-body");
+    db.textContent = "";
+    var deliveries = state.deliveries || [];
+    if (!deliveries.length) {
+      var ed = el("tr"), edd = el("td", "empty", "No deliveries received yet.");
+      edd.colSpan = 6; ed.appendChild(edd); db.appendChild(ed);
+    }
+    deliveries.forEach(function (d) {
+      var tr = el("tr");
+      tr.appendChild(el("td", "ident mono", String(d.id || "")));
+      tr.appendChild(el("td", "mono", d.trigger || ""));
+      tr.appendChild(el("td", null, d.event_type || "-"));
+      tr.appendChild(el("td", "mono", d.received_at || ""));
+      var outcome = el("td");
+      outcome.appendChild(chip(d.outcome || "", d.outcome === "accepted" ? "on" : (d.outcome === "invalid_signature" || d.outcome === "failed") ? "hot" : "warn"));
+      tr.appendChild(outcome);
+      var task = el("td", "ident mono");
+      if (d.task) {
+        var link = el("a", null, d.task); link.href = "#queue";
+        link.addEventListener("click", function () { show("queue"); });
+        task.appendChild(link);
+      } else task.textContent = "-";
+      tr.appendChild(task);
+      db.appendChild(tr);
+    });
+  }
+
   // ---- shell ---------------------------------------------------------------
   function show(view) {
-    ["org", "queue", "gates"].forEach(function (v) {
+    ["org", "queue", "gates", "triggers"].forEach(function (v) {
       $("view-" + v).hidden = (v !== view);
       $("tab-" + v).setAttribute("aria-selected", String(v === view));
     });
@@ -605,7 +701,8 @@ _ui_html() {
     $("n-org").textContent = (state.stats && state.stats.agents) || 0;
     $("n-queue").textContent = (state.stats && state.stats.open) || 0;
     $("n-gates").textContent = (state.stats && state.stats.gates) || 0;
-    renderLede(); renderTree(); renderFlows(); renderQueue(); renderGates();
+    $("n-triggers").textContent = (state.stats && state.stats.triggers) || 0;
+    renderLede(); renderTree(); renderFlows(); renderQueue(); renderGates(); renderTriggers();
   }
 
   function load() {
@@ -620,10 +717,10 @@ _ui_html() {
       });
   }
 
-  ["org", "queue", "gates"].forEach(function (v) {
+  ["org", "queue", "gates", "triggers"].forEach(function (v) {
     $("tab-" + v).addEventListener("click", function () { show(v); });
   });
-  show(["org", "queue", "gates"].indexOf(location.hash.slice(1)) >= 0 ? location.hash.slice(1) : "org");
+  show(["org", "queue", "gates", "triggers"].indexOf(location.hash.slice(1)) >= 0 ? location.hash.slice(1) : "org");
   load();
   setInterval(load, 15000);
 })();

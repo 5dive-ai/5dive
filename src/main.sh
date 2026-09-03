@@ -246,6 +246,13 @@ Tasks (shared queue, sqlite — any agent, no sudo):
   5dive task block <id|PREFIX-N> --by=<id|PREFIX-N>
   # full surface: 5dive task --help
 
+Triggers (signed external event -> ordinary task):
+  sudo 5dive trigger add github --name=<n> --event=issues.labeled --repo=owner/repo --assignee=<agent> --secret-from-stdin
+  sudo 5dive trigger add webhook --name=<n> --event=<type> --role=<role> --secret-from-stdin
+  5dive trigger ls | show <name> | deliveries <name>
+  sudo 5dive trigger serve [--listen=127.0.0.1:8740]
+  sudo 5dive trigger replay <delivery-id>
+
 Projects (ident namespaces for the queue; default 'dive' = DIVE-N):
   5dive project add <key> --prefix=FROG [--name=] [--goal=] [--folder=] [--lead-agent=<agent>]
   5dive project ls | show <key>
@@ -270,8 +277,8 @@ Human accounts (who may CLEAR a gate — one identity, all transports):
   5dive human ls | show <id> | owner <agent> | recipient <ident> | rm <id>
   # With NO human accounts, gate delivery is unchanged. full surface: 5dive human --help
 
-Web UI for this host (org chart, queue, gates):
-  5dive ui [--port=8735] [--host=127.0.0.1]          # open the three views in a browser. Read-only, no sign-in.
+Web UI for this host (org chart, queue, gates, triggers):
+  5dive ui [--port=8735] [--host=127.0.0.1]          # open the local views in a browser. Read-only, no sign-in.
   5dive ui --data | --html                           # the JSON the views render / the page itself
   # full surface: 5dive ui --help
 
@@ -1016,6 +1023,15 @@ main() {
       # no audit — these are high-frequency, low-risk ops any agent runs. SQLite
       # serializes its own writes (busy_timeout) so with_registry_lock isn't needed.
       cmd_task "$@" ;;
+    trigger|triggers)
+      # DIVE-3931: ingress authenticates and records an event, then ends at the
+      # ordinary task queue. Receive/replay attempts are audited in tasks.db;
+      # only low-volume configuration changes use the host audit log as well.
+      case "${1:-ls}" in
+        add|rotate|enable|disable)
+          AUDIT_CMD="trigger ${1:-}"; AUDIT_ARGS=("$@") ;;
+      esac
+      cmd_trigger "$@" ;;
     gate-proof)
       # DIVE-519: mint a human-origin proof token for an approval/secret gate (or
       # toggle enforcement). Root-only (reads the 0400 key); audits its own mint.
@@ -1037,7 +1053,7 @@ main() {
       # trusted input to gate delivery). No lock: plain sqlite writes, like org.
       cmd_human "$@" ;;
     ui)
-      # DIVE-2655: the free single-host web UI (org chart / queue / gates).
+      # DIVE-2655/DIVE-3931: the free single-host UI (org/queue/gates/triggers).
       # Reads the same group-writable store as tasks + org; GET/HEAD only, no
       # root, no lock, no write path. Loopback bind unless the caller opts out.
       cmd_ui "$@" ;;
