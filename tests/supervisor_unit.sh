@@ -186,11 +186,97 @@ t "restart history for an untouched seat is 0" "0" "$(_sup_restart_history unit-
 db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
     VALUES ('unit-r', 'action', 'stuck', 'poller-dead', '{\"rung\":\"restart\",\"attempt\":1,\"result\":\"ok\"}');"
 t "an executed restart counts against the budget" "1" "$(_sup_restart_history unit-r)"
-# ...and with it counted, the plan flips. This is the pair that proves the
-# limiter is wired to the trail, not just to a literal in the test above.
-t "seat with a restart on the trail now escalates" \
+# DIVE-3915: that row's `result` is "ok" — DIVE-3856's probe SAW the poller come
+# back — so it is a HEALED restart. It still counts toward the flap bound (the
+# total above) and it no longer counts toward the ceiling that means "restarting
+# does not fix this seat". Before this change the two were the same number, and a
+# recovery that worked spent the allowance for the next, unrelated episode: that
+# is exactly how `main` sat deaf for 8 minutes on 2026-09-03 behind a cure that
+# took 2.4 seconds.
+t "3915: a HEALED restart does not count against the unhealed ceiling" "0" \
+  "$(_sup_restart_unhealed_history unit-r)"
+t "3915: so the seat is still allowed the restart its next episode needs" \
+  "restart" \
+  "$(_sup_act_plan claude poller-dead 0 0 $NOW false "$(_sup_restart_unhealed_history unit-r)" true "$(_sup_restart_history unit-r)")"
+# ...and the pair that proves the limiter is still wired to the trail: an
+# UNHEALED restart (DIVE-3856 probed and the poller was still dead) flips it.
+db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
+    VALUES ('unit-rd', 'action', 'stuck', 'poller-dead', '{\"rung\":\"restart\",\"attempt\":1,\"result\":\"restart-ran-poller-still-dead\"}');"
+t "3915: a restart that left the poller dead DOES count as unhealed" "1" \
+  "$(_sup_restart_unhealed_history unit-rd)"
+t "seat with an UNHEALED restart on the trail escalates" \
   "escalate restart-rate-limited" \
-  "$(_sup_act_plan claude poller-dead 0 0 $NOW false "$(_sup_restart_history unit-r)")"
+  "$(_sup_act_plan claude poller-dead 0 0 $NOW false "$(_sup_restart_unhealed_history unit-rd)" true "$(_sup_restart_history unit-rd)")"
+# The unprobeable-type outcome. `opencode` is absent from the verify predicate on
+# purpose, so EVERY restart of such a seat records `unverified` — and it must
+# count as unhealed, or this whole change would widen the ceiling precisely where
+# there is no probe to justify widening it.
+db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
+    VALUES ('unit-ru', 'action', 'stuck', 'poller-dead', '{\"rung\":\"restart\",\"attempt\":1,\"result\":\"restart-ran-poller-unverified\"}');"
+t "3915: an UNVERIFIED restart counts as unhealed (no probe, no widening)" "1" \
+  "$(_sup_restart_unhealed_history unit-ru)"
+t "3915: and an unprobeable seat's ceiling behaves exactly as it did before" \
+  "escalate restart-rate-limited" \
+  "$(_sup_act_plan claude poller-dead 0 0 $NOW false "$(_sup_restart_unhealed_history unit-ru)" true "$(_sup_restart_history unit-ru)")"
+# A restart where cmd_restart itself returned non-zero never reaches the probe;
+# `res` is "failed" and that is unhealed too.
+db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
+    VALUES ('unit-rf', 'action', 'stuck', 'poller-dead', '{\"rung\":\"restart\",\"attempt\":1,\"result\":\"failed\"}');"
+t "3915: a restart whose verb failed counts as unhealed" "1" \
+  "$(_sup_restart_unhealed_history unit-rf)"
+# THE FLAP BOUND. Three healed restarts in the window: nothing is unhealed, so
+# the ceiling above never fires — and without a second bound this seat would
+# restart forever and never reach a person. It escalates under its own reason,
+# because "the remedy keeps being needed" is a different sentence to a human than
+# "the remedy keeps failing".
+for _i in 1 2 3; do
+  db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
+      VALUES ('unit-flap', 'action', 'stuck', 'poller-dead', '{\"rung\":\"restart\",\"attempt\":1,\"result\":\"ok\"}');"
+done
+t "3915 flap: three healed restarts leave the unhealed ceiling untouched" "0" \
+  "$(_sup_restart_unhealed_history unit-flap)"
+t "3915 flap: but they hit the total bound, and it escalates under its OWN reason" \
+  "escalate restart-flapping" \
+  "$(_sup_act_plan claude poller-dead 0 0 $NOW false "$(_sup_restart_unhealed_history unit-flap)" true "$(_sup_restart_history unit-flap)")"
+t "3915 flap: two healed restarts are still under the bound" \
+  "restart" "$(_sup_act_plan claude poller-dead 0 0 $NOW false 0 true 2)"
+# The unhealed ceiling wins when BOTH are hit — it is the more specific
+# statement, and the reason string a human has been reading for two months.
+t "3915: unhealed takes precedence over flapping when both ceilings are hit" \
+  "escalate restart-rate-limited" "$(_sup_act_plan claude poller-dead 0 0 $NOW false 1 true 9)"
+# BACKWARD COMPATIBILITY OF THE SIGNATURE. Every pre-3915 caller passes 8 args
+# or fewer; $9 then defaults to $7, so total==unhealed and the unhealed refusal
+# is the one that fires — the exact previous behaviour, arm by arm.
+t "3915: an 8-arg caller at the ceiling behaves exactly as before" \
+  "escalate restart-rate-limited" "$(_sup_act_plan claude poller-dead 0 0 $NOW false 1 true)"
+t "3915: a 7-arg caller at the ceiling behaves exactly as before" \
+  "escalate restart-rate-limited" "$(_sup_act_plan claude poller-dead 0 0 $NOW false 1)"
+t "3915: a 6-arg caller (no restarts spent) still gets the restart" \
+  "restart" "$(_sup_act_plan claude poller-dead 0 0 $NOW false)"
+# A nonsensical total (below the unhealed count) is clamped up rather than
+# trusted: the two numerators come from the same trail, so total < unhealed is
+# impossible in production and a caller bug must not read as extra budget.
+t "3915: a total below the unhealed count is clamped, not trusted" \
+  "escalate restart-rate-limited" "$(_sup_act_plan claude poller-dead 0 0 $NOW false 2 true 0)"
+# The dormant branch still wins over BOTH ceilings — a dormant ladder's job is
+# to keep the pre-DIVE-3753 human path exactly as it was.
+t "3915: dormancy still precedes both ceilings" \
+  "escalate rung-4-dormant" "$(_sup_act_plan claude poller-dead 0 0 $NOW false 5 false 9)"
+# And the DIVE-3856 arm this must not violate: the UNHEALED ceiling is still 1.
+t "3915: the unhealed ceiling is still 1 — this change did not raise it" "1" "$_SUP_RESTART_MAX"
+t "3915: the flap bound defaults to 3" "3" "$_SUP_RESTART_TOTAL_MAX"
+t "3915: the window is still 6h" "6" "$_SUP_RESTART_WINDOW_H"
+# The dispatch must read BOTH counters and pass them in the right slots. A grep
+# is weak evidence (see the note at the foot of this file) but the miswiring it
+# guards against is a pure argument-order error, which is a text property: if
+# `unhealed` and `restarts` were swapped here, every healed restart would spend
+# the ceiling again and this change would be a no-op that looks shipped.
+# DIVE-2604 rail: this probe is ALLOWED to find nothing (a rename would empty it),
+# and the rail scans tests/ too — so the substitution is guarded, and the arm below
+# then fails on the empty string instead of killing the harness.
+_PLAN_CALL="$(grep -n 'plan=$(_sup_act_plan' "$SRC/cmd_supervisor.sh")" || _PLAN_CALL=""
+t "3915 wiring: the dispatch passes unhealed as \$7 and the total as \$9" "yes" \
+  "$(grep -q '"\$rot" "\$unhealed" "\$actions_on" "\$restarts"' <<<"$_PLAN_CALL" && printf yes || printf no)"
 
 # A DORMANT tick must not spend the budget: 'planned' is a record of what the
 # ladder WOULD do. If planned rows counted, flipping actions on would find every

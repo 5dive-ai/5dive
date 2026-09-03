@@ -9,7 +9,9 @@
 # so the stuck/slow classifier could be validated against real fleet behavior
 # with no risk before P2 turned the recovery ladder on. P2's ladder is
 # nudge -> resume -> rotate -> restart (rung 4, poller-dead only, rate-limited:
-# DIVE-3753), all of it gated on $_SUP_ACTIONS_FLAG.
+# DIVE-3753; the rate limit counts restarts that did NOT heal the poller, plus a
+# separate flap bound on all of them, DIVE-3915), all of it gated on
+# $_SUP_ACTIONS_FLAG.
 #
 # Signals (all read-only; cheap ones implemented, flaky ones stubbed):
 #   service   systemctl is-active on 5dive-agent@<name> (claude-session.service
@@ -124,6 +126,56 @@ _SUP_RESTART_WINDOW_H="${SUPERVISOR_RESTART_WINDOW_H:-6}"
 [[ "$_SUP_RESTART_WINDOW_H" =~ ^[0-9]+$ ]] || _SUP_RESTART_WINDOW_H=6
 _SUP_RESTART_MAX="${SUPERVISOR_RESTART_MAX:-1}"
 [[ "$_SUP_RESTART_MAX" =~ ^[0-9]+$ ]] || _SUP_RESTART_MAX=1
+
+# ── DIVE-3915: THE CEILING COUNTS RESTARTS THAT DID NOT WORK ─────────────────
+# Measured 2026-09-03. `main` and `olivia` both went deaf on telegram inside two
+# minutes of each other, both with the same lifecycle signature (a `start` with
+# no `boot ok`, the surviving poller SIGHUP'd ~8 min later, silence after). The
+# cure on `main` was a plain restart and it took 2.4 SECONDS:
+#
+#   00:47:25  agent restart      00:47:27.489  launcher      00:47:27.841  boot ok
+#
+# The supervisor had classified it and could not act:
+#
+#   ESCALATE main (poller-dead: rung-4-needed)
+#   ESCALATE main (poller-dead: restart-rate-limited)
+#
+# The budget was already spent — by an EARLIER, UNRELATED episode on the same
+# seat, hours before, whose restart had WORKED. So the seat sat deaf not because
+# the failure was hard but because a successful recovery had consumed the
+# allowance for the next one.
+#
+# WHY THIS IS NOT "JUST ALLOW 2", the thing DIVE-3856 wrote an arm to forbid.
+# Read the ceiling's own rationale above: *"a restart that works is visible
+# before the next 10-minute tick, so a SECOND restart inside the window is never
+# the cure for the first one having worked; it is the signature of a seat that
+# restarting does not fix."* That sentence is entirely about a restart that DID
+# NOT WORK. It was implemented as a count of restarts ATTEMPTED because, when it
+# was written, the two were indistinguishable — `result` was cmd_restart's exit
+# code and said `ok` either way. DIVE-3856 removed that excuse: the trail now
+# records `ok` / `restart-ran-poller-still-dead` / `restart-ran-poller-unverified`
+# from an actual poller probe. So the numerator can finally be what the comment
+# always claimed: restarts that ran and left the seat deaf.
+#
+#   _SUP_RESTART_MAX      unhealed restarts per seat per window   (1 — UNCHANGED)
+#   _SUP_RESTART_TOTAL_MAX  restarts of ANY outcome per window    (3 — the flap bound)
+#
+# `unverified` COUNTS AS UNHEALED, deliberately. It is the "I could not tell"
+# outcome, and for a type absent from _SUP_POLLER_VERIFY_PAT (opencode) it is the
+# only outcome there is — so on every unprobeable seat this ceiling keeps
+# behaving exactly as it did before this change. A widening that rests on a probe
+# must not widen where the probe is silent.
+#
+# THE TOTAL CEILING IS WHAT KEEPS THIS BOUNDED. Without it, a seat whose poller
+# dies every ten minutes and is cured every time would restart forever and never
+# reach a person: each restart verifies ok, so it never accrues an unhealed row.
+# That seat is broken in a way a restart is only papering over, and 3 per 6h is
+# the number at which we say so out loud (`escalate restart-flapping`) — a
+# distinct reason string from `restart-rate-limited`, because "the remedy keeps
+# failing" and "the remedy keeps being needed" send a human to different places.
+_SUP_RESTART_TOTAL_MAX="${SUPERVISOR_RESTART_TOTAL_MAX:-3}"
+[[ "$_SUP_RESTART_TOTAL_MAX" =~ ^[0-9]+$ ]] || _SUP_RESTART_TOTAL_MAX=3
+(( _SUP_RESTART_TOTAL_MAX >= _SUP_RESTART_MAX )) || _SUP_RESTART_TOTAL_MAX="$_SUP_RESTART_MAX"
 
 # ── DIVE-3856: RUNG 4 VERIFIES ITS OWN REMEDY ────────────────────────────────
 # THE DEFECT, measured on `main` 2026-08-31 (supervisor_events + the seat's
@@ -1386,7 +1438,10 @@ _sup_watch() {
 # row per window, zero mutations. Rungs 1-3, in order: nudge -> resume -> rotate.
 #
 # DIVE-3753 adds rung 4 for ONE cause: poller-dead -> restart, rate-limited to
-# _SUP_RESTART_MAX per seat per _SUP_RESTART_WINDOW_H. Reprovision stays manual
+# _SUP_RESTART_MAX UNHEALED restarts per seat per _SUP_RESTART_WINDOW_H, and
+# _SUP_RESTART_TOTAL_MAX restarts of any outcome in the same window (DIVE-3915 —
+# a successful recovery no longer spends the allowance for the next, unrelated
+# episode; see the ceiling's block comment). Reprovision stays manual
 # and every other rung-4+ cause still escalates. The gap it closes was measured
 # on 2026-08-26: `ESCALATE <seat> (poller-dead: rung-4-needed)` fired correctly
 # for four seats and NOTHING SERVED IT, so a correct detection produced no
@@ -1446,6 +1501,28 @@ _sup_restart_history() {
   echo "$n"
 }
 
+# DIVE-3915: the UNHEALED numerator — restarts of this seat inside the window
+# that ran and did NOT bring the poller back. Same population as
+# _sup_restart_history minus the rows DIVE-3856 verified, i.e. minus
+# '"result":"ok"'. Everything else counts: 'failed' (cmd_restart itself
+# returned non-zero), 'restart-ran-poller-still-dead' (probed, still deaf) and
+# 'restart-ran-poller-unverified' (no probe for this type — see the block
+# comment; this is what keeps an unprobeable seat's ceiling exactly where it
+# was). Rows written BEFORE DIVE-3856 shipped also carry '"result":"ok"' from
+# the old exit-code semantics and are therefore treated as healed; they are at
+# most one window old by the time this runs and mis-reading them costs one
+# extra restart, never a missed escalation. Echoes a bare integer.
+_sup_restart_unhealed_history() {
+  local name="$1" n
+  n=$(db "SELECT COUNT(*) FROM supervisor_events
+          WHERE agent=$(sqlq "$name") AND event='action'
+            AND signals LIKE '%\"rung\":\"restart\"%'
+            AND signals NOT LIKE '%\"result\":\"ok\"%'
+            AND ts >= datetime('now', '-${_SUP_RESTART_WINDOW_H} hours');" 2>/dev/null || echo 0)
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  echo "$n"
+}
+
 # Pure decision, no side effects: echoes "verb [reason]" where verb is one of
 # nudge|resume|rotate|restart|escalate|defer. Attempt N picks rung N+1; the gap
 # before the next action is base * 2^attempts; ladder exhausted / unreachable
@@ -1468,7 +1545,7 @@ _sup_restart_history() {
 # serving this cause today and give back nothing until the flag is set — the
 # opposite of the row. So a dormant ladder still escalates, and the reason
 # string says the restart is the action it was holding.
-_sup_act_plan() {  # <type> <cause> <attempts> <last_epoch> <now> <rotation_enabled> [restarts_in_window] [actions_enabled]
+_sup_act_plan() {  # <type> <cause> <attempts> <last_epoch> <now> <rotation_enabled> [unhealed_restarts] [actions_enabled] [total_restarts]
   # $1 (type) is retained for signature/caller stability but no longer branches:
   # OSS-23 made the ladder runtime-agnostic (see block comment above). rung-4+
   # causes still escalate for every runtime via the case below; rotate
@@ -1477,7 +1554,17 @@ _sup_act_plan() {  # <type> <cause> <attempts> <last_epoch> <now> <rotation_enab
   # shellcheck disable=SC2034
   local type="$1" cause="$2" attempts="$3" last="$4" now="$5" rot="$6" restarts="${7:-0}"
   local acts="${8:-true}"
+  # DIVE-3915: $7 is now the UNHEALED restart count — restarts that ran and left
+  # the poller dead — which is what _SUP_RESTART_MAX's written rationale was
+  # always about. $9 is the TOTAL restart count in the window and is bounded
+  # separately by _SUP_RESTART_TOTAL_MAX. It is OPTIONAL and defaults to $7, so
+  # an 8-arg caller (and every existing test) keeps its exact previous meaning:
+  # with total==unhealed, a seat at the unhealed ceiling is also at or under the
+  # total ceiling, and the unhealed refusal is the one that fires.
+  local total="${9:-$restarts}"
   [[ "$restarts" =~ ^[0-9]+$ ]] || restarts=0
+  [[ "$total" =~ ^[0-9]+$ ]] || total=0
+  (( total >= restarts )) || total="$restarts"
   case "$cause" in
     no-progress|loop-stuck) : ;;
     # DIVE-3753 rung 4. The limiter's REFUSING branch escalates rather than
@@ -1490,7 +1577,15 @@ _sup_act_plan() {  # <type> <cause> <attempts> <last_epoch> <now> <rotation_enab
         # the rung being held so the audit row still records what WOULD fire.
         echo "escalate rung-4-dormant"
       elif (( restarts >= _SUP_RESTART_MAX )); then
+        # The remedy has already been tried inside the window and did not work
+        # (or could not be verified). Unchanged reason string — a human reading
+        # the trail for the last two months has learned what it means.
         echo "escalate restart-rate-limited"
+      elif (( total >= _SUP_RESTART_TOTAL_MAX )); then
+        # DIVE-3915: every restart in the window WORKED and the seat keeps
+        # coming back for another. That is a different sentence to a human than
+        # "restarting does not fix it", so it gets its own reason.
+        echo "escalate restart-flapping"
       else
         echo "restart"
       fi
@@ -1895,8 +1990,15 @@ cmd_supervisor_tick() {
     read -r attempts last <<<"$(_sup_act_history "$name")"
     # DIVE-3753: the rung-4 limiter reads its own counter (restart rows only),
     # so it is not perturbed by, and does not perturb, the 1-3 attempt count.
-    local restarts; restarts=$(_sup_restart_history "$name")
-    plan=$(_sup_act_plan "$atype" "$cause" "$attempts" "$last" "$now_s" "$rot" "$restarts" "$actions_on")
+    # DIVE-3915: TWO numerators, because a restart that worked and a restart that
+    # did not are different evidence. `unhealed` is the ceiling that means "the
+    # remedy is not working, get a person"; `restarts` (all outcomes) is the flap
+    # bound that means "the remedy keeps being needed, get a person". Both are
+    # read off the same audit trail, still with no extra state file.
+    local restarts unhealed
+    restarts=$(_sup_restart_history "$name")
+    unhealed=$(_sup_restart_unhealed_history "$name")
+    plan=$(_sup_act_plan "$atype" "$cause" "$attempts" "$last" "$now_s" "$rot" "$unhealed" "$actions_on" "$restarts")
     read -r verb reason <<<"$plan"
     case "$verb" in
       defer|"") continue ;;

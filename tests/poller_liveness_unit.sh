@@ -246,8 +246,15 @@ check "remedy: the beacon is no longer offered as the discriminator" "no" \
 #     the difference between "wait" and "this one needs you".
 check "remedy: names the automatic rung-4 restart" "yes" \
   "$(has 'The supervisor restarts a poller-dead seat on its own at rung 4' "$REMEDY")"
-check "remedy: names the rate-limit window" "yes" \
-  "$(has 'once per seat per 6h' "$REMEDY")"
+#     DIVE-3915 split that budget in two, so the window is now named twice and the
+#     old single sentence is gone. Both halves are asserted: a reader who is told
+#     only the flap bound cannot tell a spent allowance from a seat nobody tried.
+check "remedy: names the unhealed budget and its window" "yes" \
+  "$(has '1 per seat per 6h' "$REMEDY")"
+check "remedy: names the flap bound on restarts of any outcome" "yes" \
+  "$(has '3 per 6h' "$REMEDY")"
+check "remedy: says a recovery that worked does not spend the allowance" "yes" \
+  "$(has 'no longer spends the allowance' "$REMEDY")"
 
 # 39. Scoped to the ONE named subject. A plural remedy on a fleet-wide alarm is a
 #     fleet-wide action — the 17:00:05 fire named all six agents in one line.
