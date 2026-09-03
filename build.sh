@@ -120,6 +120,7 @@ cat \
   src/task/answer.sh \
   src/task/doctor.sh \
   src/cmd_task.sh \
+  src/cmd_trigger.sh \
   src/cmd_trace.sh \
   src/cmd_org.sh \
   src/cmd_human.sh \

@@ -1165,7 +1165,9 @@ _task_role_skew_note() {
 # Non-agent principals that legitimately own a `created_by` and NEVER an
 # assignee — nothing wakes them. Measured on this board 2026-08-12: cli 25,
 # council 97, lodar 4, editor 4, proof 2 (`5dive proof` files with --from=proof).
-_TASK_PRINCIPAL_SENTINELS="cli council telegram dashboard lodar editor proof cron"
+# `trigger` marks tasks materialized by signed Event-to-Task ingress; keeping it
+# distinct from `cron` makes each external delivery's provenance queryable.
+_TASK_PRINCIPAL_SENTINELS="cli council telegram dashboard lodar editor proof cron trigger"
 
 _TASK_ROSTER=""; _TASK_ROSTER_STATE=""
 
@@ -1326,4 +1328,3 @@ _task_roster_sql_notin() {
   done <<<"$roster"
   printf '%s' "$out"
 }
-
