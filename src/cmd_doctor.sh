@@ -766,6 +766,41 @@ doctor_check_openclaw_model_pins() {
   return 0
 }
 
+# doctor_seat_claude_pid <agent-name> <user> — echo the PID of the seat's
+# persistent claude session, or nothing. Prints ONE pid on stdout; never fails
+# the caller (all pipelines end `|| true` for `set -euo pipefail`).
+#
+# DIVE-3958. The two callers below used to pick it as the longest-`etimes`
+# `pgrep -u "$user" -f 'claude'` match. Two independent defects made that select
+# a process the --repair restart can never reach:
+#   1. `-f` matches the full ARGV, and this box's install root is /home/claude/,
+#      so ANY long-lived process a seat owns whose path passes through that dir
+#      (a discord bot, a stray helper) matches "claude" without being a claude
+#      runtime. On agent-marketing it deterministically picked a 46-day-old
+#      welcome_bot.py — older than the real session, so it won the etimes tiebreak.
+#   2. pgrep is per-UID but `--repair` restarts a per-UNIT service. The evidence
+#      set (UID) is strictly larger than what the remedy can change (unit), so
+#      every process in the difference is a PERMANENT false positive: the plugin-
+#      version check reads the decoy's ancient start, warns "stale", restarts a
+#      unit that cannot contain the decoy, and loops forever.
+# Fix both at once: scope to the seat's systemd unit (cgroup membership, which
+# `systemctl restart` also keys on) AND match the EXECUTABLE (`comm=claude`), not
+# a string a `.claude/` path component can satisfy. Within the unit's cgroup the
+# telegram poller's cwd still contains `.claude`, so an argv match would re-pick
+# it — comm does not.
+doctor_seat_claude_pid() {
+  local name="$1" user="$2" cg procs base="${DOCTOR_CGROUP_BASE:-/sys/fs/cgroup}"
+  cg=$(systemctl show -p ControlGroup --value "5dive-agent@${name}.service" 2>/dev/null || true)
+  [[ -n "$cg" && -r "${base}${cg}/cgroup.procs" ]] || return 0
+  # Longest-running claude EXECUTABLE among the unit's own processes = the
+  # persistent session, not a transient hook subprocess.
+  procs=$(while read -r p; do
+            [[ "$(ps -o comm= -p "$p" 2>/dev/null)" == "claude" ]] || continue
+            printf '%s %s\n' "$(ps -o etimes= -p "$p" 2>/dev/null | tr -d ' ')" "$p"
+          done < "${base}${cg}/cgroup.procs" | sort -rn | awk 'NR==1{print $2}' || true)
+  printf '%s' "$procs"
+}
+
 cmd_doctor() {
   require_root
   local filter="" want_fix=0 dry=0
@@ -1223,13 +1258,10 @@ cmd_doctor() {
         local svc="5dive-agent@${name}.service"
         if [[ "$(systemctl is-active "$svc" 2>/dev/null)" == "active" ]]; then
           local cpid2 etimes2
-          # `|| true` on each: a bare `x=$(pipeline)` assignment inherits the
-          # pipeline's status, and under `set -euo pipefail` a non-zero one (pgrep
-          # no-match, ps bad-pid) would abort the whole doctor run before the
-          # envelope prints. Keep them non-fatal.
-          cpid2=$(pgrep -u "$user" -f 'claude' 2>/dev/null \
-                  | while read -r p; do echo "$(ps -o etimes= -p "$p" 2>/dev/null | tr -d ' ') $p"; done \
-                  | sort -rn | awk 'NR==1{print $2}' || true)
+          # DIVE-3958: unit-scoped, executable-matched pick of the seat's claude
+          # session (see doctor_seat_claude_pid). Previously a per-UID `pgrep -f
+          # claude`, which selected any /home/claude/-path process the seat owned.
+          cpid2=$(doctor_seat_claude_pid "$name" "$user")
           etimes2=$(ps -o etimes= -p "${cpid2:-0}" 2>/dev/null | tr -d ' ' || true)
           if [[ "$etimes2" =~ ^[0-9]+$ ]] && (( etimes2 > 90 )); then
             # The poller is `bun run --cwd .../plugins/cache/5dive-plugins/telegram/<ver>
@@ -1281,26 +1313,15 @@ cmd_doctor() {
           local ondisk_ver plug_mtime cpid
           ondisk_ver=$(jq -r '.plugins["telegram@5dive-plugins"][0].version // empty' "$manifest_f" 2>/dev/null)
           plug_mtime=$(stat -c %Y "$manifest_f" 2>/dev/null || echo 0)
-          # Oldest (longest-running) claude process for this user = the
-          # persistent session, not a transient hook subprocess. Pick max
-          # elapsed-time among matches.
-          #
-          # DIVE-2041: `|| true` — this is the UNGUARDED TWIN of the identical
-          # pipeline ~30 lines below, whose comment already spells out why it is
-          # needed: a bare `x=$(pipeline)` inherits the pipeline's status, and
-          # under `set -euo pipefail` pgrep's no-match exit 1 aborts the ENTIRE
-          # doctor run before the envelope prints. One registered agent with no
-          # live claude process is enough, so it fires on any box with an idle
-          # agent. Measured on the control plane 2026-08-09 against the INSTALLED
-          # release and an origin/main build alike: `5dive doctor
-          # --category=channels` exits 1 with no JSON and no summary, so the
-          # dashboard's periodic `doctor --json` gets nothing for the category.
-          # Fixed here rather than filed because this change's own surface lands
-          # in this category and would otherwise be unreachable — the same
-          # reasoning the DIVE-2327 --category=policy fix used in this function.
-          cpid=$(pgrep -u "$user" -f 'claude' 2>/dev/null \
-                 | while read -r p; do echo "$(ps -o etimes= -p "$p" 2>/dev/null | tr -d ' ') $p"; done \
-                 | sort -rn | awk 'NR==1{print $2}' || true)
+          # DIVE-3958: the persistent claude session, scoped to the seat's unit
+          # and matched by executable (see doctor_seat_claude_pid). The prior
+          # per-UID `pgrep -f claude` picked any /home/claude/-path process the
+          # seat owned; on agent-marketing that was a 46-day-old discord bot, so
+          # this check warned "stale plugin" on a healthy seat and --repair
+          # restarted it forever (the decoy lived in a different unit the restart
+          # could not touch). Empty when the session can't be located -> the
+          # guard below skips the check rather than false-warning.
+          cpid=$(doctor_seat_claude_pid "$name" "$user")
           if [[ -n "$cpid" && -n "$ondisk_ver" ]]; then
             local etimes start_epoch now_epoch
             etimes=$(ps -o etimes= -p "$cpid" 2>/dev/null | tr -d ' ')
