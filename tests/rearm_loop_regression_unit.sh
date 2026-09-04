@@ -125,10 +125,21 @@ declare -A _MUST=(
   [codex]="$_EXHAUST
 grep -q .wait_for_message.;[[:space:]]*then.*break|does not type when the pane already shows wait_for_message (the plugin's inbound kick won the race)
 _kick_state=listening|treats an already-listening pane as a success, not as a never-typed fault
-grep -q .Hooks need review.;[[:space:]]*then[[:space:]]*continue|does not type while the first-run Hooks-need-review dialog is up"
+grep -q .Hooks need review.;[[:space:]]*then[[:space:]]*continue|does not type while the first-run Hooks-need-review dialog is up
+BIN.*CODEX_REAL_BIN|only the direct Codex TUI gets a cold-start kick (the app-server dispatcher owns its own input loop)"
 )
+kick_block_pattern() { # <type>
+  case "$1" in
+    codex)
+      printf '%s\n' '^if \[\[ "\$TYPE" == "codex" && "\$CHANNELS" == "telegram" && "\$BIN" == "\$CODEX_REAL_BIN" \]\]; then$'
+      ;;
+    *)
+      printf '%s\n' '^if \[\[ "\$TYPE" == "'"$1"'" && "\$CHANNELS" == "telegram" \]\]; then$'
+      ;;
+  esac
+}
 for _blk in grok antigravity codex; do
-  _pat='^if \[\[ "\$TYPE" == "'"${_blk}"'" && "\$CHANNELS" == "telegram" \]\]; then$'
+  _pat="$(kick_block_pattern "$_blk")"
   _hits="$(grep -cE "$_pat" "$START")"
   if [[ "$_hits" != 1 ]]; then
     no "$_blk kick block is uniquely locatable (matched $_hits lines — reworded condition?)"
@@ -399,19 +410,22 @@ else ok "5b does NOT claim the marker was absent when the capture failed"; fi
 # unique) and run it with the tmux/sleep stubs. The block backgrounds its own
 # subshell, so `wait` is what makes the assertion possible at all.
 block_of() { # <blk>
-  local _pat='^if \[\[ "\$TYPE" == "'"$1"'" && "\$CHANNELS" == "telegram" \]\]; then$' _ln
+  local _pat _ln
+  _pat="$(kick_block_pattern "$1")"
   _ln="$(grep -nE "$_pat" "$START" | cut -d: -f1)"
   [[ -n "$_ln" ]] || { echo "echo BLOCK-NOT-FOUND >&2; exit 9"; return; }
   sed -n "${_ln},\$p" "$START" | awk 'NR>1 && /^fi$/{print;exit}{print}' \
     | sed 's#/usr/bin/tmux#tmux#g'
 }
-run_block() { # <name> <blk> <panes-file> <fail_capture_at|0>
+run_block() { # <name> <blk> <panes-file> <fail_capture_at|0> [direct|dispatcher]
   local box="$TD/blk-$1"; mkdir -p "$box"
-  PANE_SCRIPT="$3" FAIL_CAPTURE_AT="$4" BOX="$box" _BTYPE="$2" \
+  PANE_SCRIPT="$3" FAIL_CAPTURE_AT="$4" BOX="$box" _BTYPE="$2" _RUNMODE="${5:-direct}" \
   bash -c '
     set -uo pipefail
     HOME="$BOX"; export HOME
     TYPE="$_BTYPE"; CHANNELS=telegram; SESSION=agent-x
+    CODEX_REAL_BIN=/usr/bin/codex
+    if [[ "$_RUNMODE" == dispatcher ]]; then BIN=/usr/bin/bun; else BIN="$CODEX_REAL_BIN"; fi
     printf 0 > "$BOX/n"; printf 0 > "$BOX/e"
     sleep(){ :; }
     tmux(){
@@ -488,6 +502,17 @@ if grep -q 'NEVER TYPED' <<<"$(berr listening)"; then
   no "5f codex already-listening pane does NOT warn never-typed"
 else ok "5f codex already-listening pane does NOT warn never-typed"; fi
 is "5f codex already-listening pane leaves no breadcrumb" "$(bbc listening)" ""
+
+# 5g. DIVE-3961: channel-backed Codex now runs the app-server dispatcher rather
+# than the interactive TUI. It owns inbound delivery itself, so typing the TUI
+# listen-loop kick into the dispatcher's log pane would be both useless and a
+# false success. The BIN identity guard is the behavioral discriminator.
+run_block dispatcher codex "$TD/p-ok-codex" 0 dispatcher
+is "5g codex dispatcher types no TUI kick" "$(bsent dispatcher TYPE)" "0"
+if grep -q 'NEVER TYPED' <<<"$(berr dispatcher)"; then
+  no "5g codex dispatcher does not report a skipped TUI kick as failure"
+else ok "5g codex dispatcher does not report a skipped TUI kick as failure"; fi
+is "5g codex dispatcher leaves no kick breadcrumb" "$(bbc dispatcher)" ""
 
 printf '\n%s: pass=%d fail=%d\n' "$(basename "$0")" "$pass" "$fail"
 [[ "$fail" == 0 ]]
