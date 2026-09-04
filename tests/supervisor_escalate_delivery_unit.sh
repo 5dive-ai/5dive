@@ -476,5 +476,128 @@ _NOOUT_SNAP='[{"name":"ops","type":"claude","classification":"no-output","cause"
 t "3940 tick: a no-output stall is unaffected — human leg still fires" \
   "ops:true" "$(fld "$(tick_arm "$_NOOUT_SNAP")" HUMAN)"
 
+# ── DIVE-3970: the OTHER self-healing shapes, and the escape from the mute ───
+# Every string below is a real refusal, copied off supervisor_events
+# 2026-08-31..09-04 — the population that produced one DM per walled seat. All
+# of them parse to quotaDeadline=unknown, which DIVE-3940 keeps LOUD.
+#
+# The clock is pinned: _sup_quota_selfheal takes `now` as an argument precisely
+# so `resets 11:30am` is assertable as live-or-lapsed without waiting for a time
+# of day. 2026-09-04 09:30 is the clock dev's real refusal was read at.
+_SH_NOW=$(date -d '2026-09-04 09:30:00' +%s)
+sh() { _sup_quota_selfheal "$1" "$_SH_NOW" | tr $'\x1f' ' '; }
+
+t "selfheal: the DIVE-3880 phrasing still reads as a live clock" \
+  "clock" "$(sh '● Usage limit reached · continuing automatically at 11:30am · esc or' | cut -d' ' -f1)"
+t "selfheal: 'your session limit resets 11:30am' (dev, the DM that prompted this)" \
+  "clock" "$(sh "⎿  You've hit your monthly spend limit · your session limit resets 11:30am" | cut -d' ' -f1)"
+t "selfheal: a clock line carries its resume epoch, not just its kind" \
+  "$(date -d '2026-09-04 11:30:00' +%s)" "$(sh "your session limit resets 11:30am" | cut -d' ' -f2)"
+t "selfheal: a weekly window meter at the wall (community, 5h: 0% 1w: 100%)" \
+  "week" "$(sh 'Sonnet 5 5h: 0% 1w: 100%' | cut -d' ' -f1)"
+t "selfheal: 5h: 30% 1w: 100% is walled on the WEEK, not the 5h window" \
+  "week" "$(sh 'Sonnet 5 5h: 30% 1w: 100%' | cut -d' ' -f1)"
+t "selfheal: a 5h meter at the wall takes the short horizon" \
+  "soon" "$(sh 'Sonnet 5 5h: 100% 1w: 40%' | cut -d' ' -f1)"
+t "selfheal: 'continuing shortly' resumes by itself and says no clock" \
+  "soon" "$(sh '● Usage limit reached · continuing shortly · esc to cancel' | cut -d' ' -f1)"
+
+# THE HARD-WALL SAFETY, in the same function. These must NOT be recognised —
+# DIVE-3880's rule that a deadline-free refusal is an indefinite freeze is
+# unchanged for every shape 3970 did not name.
+t "selfheal: meters below the wall are not a self-healing signal at all" \
+  "no" "$(sh 'Sonnet 5 5h: 30% 1w: 40%' | cut -d' ' -f1)"
+t "selfheal: 'credit balance is too low' stays a hard wall" \
+  "no" "$(sh 'credit balance is too low' | cut -d' ' -f1)"
+t "selfheal: a bare 429 stays a hard wall" \
+  "no" "$(sh 'API Error: 429 insufficient_quota' | cut -d' ' -f1)"
+t "selfheal: an empty signature is never self-healing" "no" "$(sh '' | cut -d' ' -f1)"
+# A promised reset that has already PASSED, with the wall still on screen, is
+# the hard wall — so a lapsed clock short-circuits to `no` and never falls
+# through to a meter on the same line.
+t "selfheal: a LAPSED resume clock is not self-healing (it promised and failed)" \
+  "no" "$(sh '● Usage limit reached · continuing automatically at 9am · esc or type to' | cut -d' ' -f1)"
+t "selfheal: a lapsed clock does not fall through to a 100% meter" \
+  "no" "$(sh 'continuing automatically at 9am · Sonnet 5 5h: 0% 1w: 100%' | cut -d' ' -f1)"
+
+# The widened human-leg decision, and its escape.
+t "notify_human: a recognised self-healing shape mutes on an unknown deadline" \
+  "false" "$(_sup_capacity_notify_human quota-exhausted unknown week)"
+t "notify_human: an unrecognised shape still keeps the human (hard wall)" \
+  "true" "$(_sup_capacity_notify_human quota-exhausted unknown no)"
+t "notify_human: persistence overrides the mute" \
+  "true" "$(_sup_capacity_notify_human quota-exhausted unknown week true)"
+t "notify_human: persistence overrides the DIVE-3940 live-deadline mute too" \
+  "true" "$(_sup_capacity_notify_human quota-exhausted live no true)"
+t "notify_human: a non-quota class is never muted by a self-healing kind" \
+  "true" "$(_sup_capacity_notify_human no-output unknown week)"
+
+# The horizons. Relative to the FIRST alert for the shapes that name no clock;
+# the clock itself when one was named.
+t "escalate_after: a named clock escalates at that clock" \
+  "1000" "$(_sup_quota_escalate_after clock 1000 500)"
+t "escalate_after: a 5h-window shape escalates 6h after the first alert" \
+  "$(( 21600 ))" "$(_sup_quota_escalate_after soon "" 0)"
+t "escalate_after: a weekly shape escalates 12h after the first alert" \
+  "$(( 43200 ))" "$(_sup_quota_escalate_after week "" 0)"
+# BOTH horizons must be shorter than the 24h dedup window, or the escalation is
+# unreachable: the window rolls, the next tick files a fresh MUTED alert, and no
+# second alert ever exists to carry the human leg. This is the arm that fails if
+# someone tunes a horizon past the window.
+t "escalate_after: every horizon fires INSIDE the dedup window it escapes" \
+  "yes" "$([[ $_SUP_SELFHEAL_SOON_H -lt $_SUP_ALERT_WINDOW_H && $_SUP_SELFHEAL_WEEK_H -lt $_SUP_ALERT_WINDOW_H ]] && echo yes || echo no)"
+t "escalate_after: a live-deadline mute with no stored signature still escalates" \
+  "$(( 21600 ))" "$(_sup_quota_escalate_after no "" 0)"
+
+# ── the same real tick: classification -> signature -> human leg ─────────────
+# The signature is what the tick reads now (signals.quotaSignature), so these
+# arms grade the WIRING, not just the classifier.
+_sh_snap() {  # <signature>
+  printf '[{"name":"ops","type":"claude","classification":"quota-exhausted","cause":"quota-exhausted","detail":"pane shows a model-capacity refusal: %s","signals":{"quotaDeadline":"unknown","quotaSignature":"%s"}}]' "$1" "$1"
+}
+_METER_SIG='Sonnet 5 5h: 100% 1w: 40%'
+meter_out=$(tick_arm "$(_sh_snap "$_METER_SIG")")
+t "3970 tick: a window-meter wall MUTES the human leg" \
+  "ops:false" "$(fld "$meter_out" HUMAN)"
+t "3970 tick: ...and still writes the audited alert row" "1" "$(fld "$meter_out" ALERT_ROWS)"
+t "3970 tick: ...and still fires the machine leg to main" \
+  "ops:quota-exhausted" "$(fld "$meter_out" ALERTS)"
+t "3970 tick: an unrecognised refusal still pings the human" \
+  "ops:true" "$(fld "$(tick_arm "$(_sh_snap 'credit balance is too low')")" HUMAN)"
+
+# PERSISTENCE, end to end. The seed is the first alert of the window, carrying
+# the same self-healing signature, aged past its horizon (6h for a 5h meter).
+# The tick must let ONE more alert through, with the human leg back on.
+_sh_seed() {  # <hours-ago> [rows]
+  local sig; sig=$(printf '{"signals":{"quotaDeadline":"unknown","quotaSignature":"%s"}}' "$_METER_SIG")
+  printf "INSERT INTO supervisor_events (agent, event, classification, cause, signals, ts) VALUES ('ops','alert','quota-exhausted','quota-exhausted','%s', datetime('now','-%s hours'));" "$sig" "$1"
+}
+persist_out=$(tick_arm "$(_sh_snap "$_METER_SIG")" "" "$(_sh_seed 7)")
+t "3970 tick: a wall still up past its horizon takes the human leg BACK" \
+  "ops:true" "$(fld "$persist_out" HUMAN)"
+t "3970 tick: the escalation is an ordinary alert row (seed + one escalation)" \
+  "2" "$(fld "$persist_out" ALERT_ROWS)"
+
+# The negative control at the same layer: identical seed, still inside the
+# horizon -> the dedup window holds and NOTHING is sent to anyone.
+fresh_out=$(tick_arm "$(_sh_snap "$_METER_SIG")" "" "$(_sh_seed 1)")
+t "3970 tick: inside the horizon the dedup window still suppresses everything" \
+  "" "$(fld "$fresh_out" HUMAN)"
+t "3970 tick: ...and writes no second alert row" "1" "$(fld "$fresh_out" ALERT_ROWS)"
+
+# Exactly once per window: with the escalation already on the ledger (2 rows),
+# a third tick past the horizon must add nothing — otherwise the escape from
+# the mute becomes a 10-minute alarm.
+twice_out=$(tick_arm "$(_sh_snap "$_METER_SIG")" "" "$(_sh_seed 7)$(_sh_seed 6)")
+t "3970 tick: the escalation fires exactly once per dedup window" \
+  "" "$(fld "$twice_out" HUMAN)"
+t "3970 tick: ...and adds no third alert row" "2" "$(fld "$twice_out" ALERT_ROWS)"
+
+# A seat whose FIRST alert was already loud must not be re-pinged by the
+# persistence path — it would double a ping the human already has.
+loud_seed=$(printf "INSERT INTO supervisor_events (agent, event, classification, cause, signals, ts) VALUES ('ops','alert','quota-exhausted','quota-exhausted','%s', datetime('now','-7 hours'));" '{"signals":{"quotaDeadline":"unknown","quotaSignature":"credit balance is too low"}}')
+t "3970 tick: a first alert that was LOUD is not escalated a second time" \
+  "" "$(fld "$(tick_arm "$(_sh_snap "$_METER_SIG")" "" "$loud_seed")" HUMAN)"
+
 echo "PASS=$PASS FAIL=$FAIL"
 (( FAIL == 0 ))
