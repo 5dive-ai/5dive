@@ -2228,30 +2228,55 @@ cmd_supervisor_tick() {
     # is re-derived from rows the tick already writes — the row shape is
     # unchanged (an acceptance criterion) and a stored `humanNotified` boolean
     # would be a second source of truth for a decision this file computes.
-    local persisted="false" ep_ts="" ep_due=""
-    if [[ "$cls" == "quota-exhausted" && "$qkind" != "no" ]]; then
+    #
+    # ITERATION 3 (codex): the branch is entered for EVERY quota wall, not only
+    # one that still reads self-healing NOW. The shape that proved it: a wall
+    # muted on "session limit resets 11:30am" is read again at 12:30 — the
+    # clock has lapsed, so the CURRENT reading is `no`, and gating entry on it
+    # skipped straight to the dedup `continue`. The mute therefore expired into
+    # silence rather than into a ping, which is precisely the hole part 2
+    # exists to close. What the expiry is owed to is the promise the EPISODE
+    # made, so the episode's own reading — taken at the episode's own clock,
+    # where that clock was still live — is what sets it, and the current
+    # reading only decides whether the wall is still self-healing.
+    local persisted="false" ep_ts="" ep_due="" ep_muted="false"
+    if [[ "$cls" == "quota-exhausted" ]]; then
       local ep_row ep_qdl ep_sig ep_kind_raw ep_kep ep_kind ep_kep_use
       IFS=$'\x1f' read -r ep_ts ep_row <<<"$(_sup_quota_episode_first "$name" "$cls")"
       if [[ "$ep_ts" =~ ^[0-9]+$ ]]; then
         ep_qdl=$(jq -r '.signals.quotaDeadline // "unknown"' <<<"$ep_row" 2>/dev/null || echo unknown)
         ep_sig=$(jq -r '.signals.quotaSignature // ""'       <<<"$ep_row" 2>/dev/null || echo "")
+        # AT ep_ts, NOT AT now: this asks what that alert was told when it chose
+        # to stay quiet. A clock it named has since lapsed by construction (that
+        # is what an expiry IS), and re-reading it at `now` answers `no` and
+        # erases the very deadline the mute is being held to.
         IFS=$'\x1f' read -r ep_kind_raw ep_kep <<<"$(_sup_quota_selfheal "$ep_sig" "$ep_ts")"
-        # An episode that OPENED on an unrecognised refusal already pinged the
-        # human at ep_ts; it still gets a horizon (so a wall that later reads
-        # self-healing is not silent forever), taken from what the wall reads
-        # NOW, but it may not use the escape below — that would double a ping
-        # the human already holds.
+        # Was that first alert actually muted? Re-derived from its own stored
+        # signals — the row shape is unchanged (an acceptance criterion) — and
+        # it is the single gate on the escape below: an episode that OPENED
+        # loud already put this wall in front of the human, so escalating it
+        # would double a ping they already hold.
+        [[ "$(_sup_capacity_notify_human "$cls" "$ep_qdl" "$ep_kind_raw")" == "false" ]] && ep_muted="true"
+        # An episode that opened on an unrecognised refusal still gets a horizon
+        # (so a wall that only LATER reads self-healing is not silent forever),
+        # taken from what the wall reads now; it just may not use the escape.
         ep_kind="$ep_kind_raw"; ep_kep_use="$ep_kep"
         if [[ "$ep_kind" == "no" ]]; then ep_kind="$qkind"; ep_kep_use=""; fi
-        ep_due=$(_sup_quota_escalate_after "$ep_kind" "$ep_kep_use" "$ep_ts")
-        [[ "$ep_due" =~ ^[0-9]+$ ]] && (( now_s >= ep_due )) && persisted="true"
+        # No mute anywhere — neither then nor now — means there is nothing to
+        # expire, and a horizon computed anyway would turn an ordinary loud
+        # wall into a second alert. (Without this the widened entry above would
+        # regress exactly that.)
+        if [[ "$ep_muted" == "true" || "$qkind" != "no" ]]; then
+          ep_due=$(_sup_quota_escalate_after "$ep_kind" "$ep_kep_use" "$ep_ts")
+          [[ "$ep_due" =~ ^[0-9]+$ ]] && (( now_s >= ep_due )) && persisted="true"
+        fi
       fi
       if (( prev_alert > 0 )); then
         # Deduped by the window, but the mute may have expired MID-window (a
         # named clock, or a 5h meter, both shorter than 24h). Let exactly ONE
         # extra alert through, then never again for this episode.
         [[ "$persisted" == "true" ]] || continue
-        [[ "$(_sup_capacity_notify_human "$cls" "$ep_qdl" "$ep_kind_raw")" == "false" ]] || continue
+        [[ "$ep_muted" == "true" ]] || continue
         # Exactly-once, re-derived: any alert already filed at or after the
         # escalation point IS the escalation — every alert from ep_due onward
         # carries the human leg by construction.

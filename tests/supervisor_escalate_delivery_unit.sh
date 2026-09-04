@@ -197,7 +197,7 @@ tick_arm() {  # <snapshot-json> [armed] [seed-sql] [registry-json] [rotated|no-t
     _sup_snapshot()     { printf "%s" "$SNAP"; }      # the fixture fleet
     registry_read()     { printf "%s" "$FIXTURE_REGISTRY"; }
     _task_agent_channel() { return 1; }               # no telegram anywhere
-    : >"$TMP/sent"; : >"$TMP/restarted"; : >"$TMP/rotated"; : >"$TMP/capacity-alerts"; : >"$TMP/capacity-human"
+    : >"$TMP/sent"; : >"$TMP/restarted"; : >"$TMP/rotated"; : >"$TMP/capacity-alerts"; : >"$TMP/capacity-human"; : >"$TMP/capacity-excerpt"
     cmd_send() { printf "%s\n" "$1" >>"$TMP/sent"; return 0; }
     cmd_restart() { printf "%s\n" "$1" >>"$TMP/restarted"; return 0; }
     # DIVE-3856: rung 4 re-probes the poller after its own restart. Both stubs
@@ -222,7 +222,11 @@ tick_arm() {  # <snapshot-json> [armed] [seed-sql] [registry-json] [rotated|no-t
     # DIVE-3940: capture the 4th arg (notify_human) into its own field so an arm
     # can grade the classification->human-leg wiring. name:class stays in
     # capacity-alerts unchanged; the human decision lands in capacity-human.
-    _sup_capacity_alert() { printf "%s:%s\n" "$1" "$2" >>"$TMP/capacity-alerts"; printf "%s:%s\n" "$1" "${4:-true}" >>"$TMP/capacity-human"; }
+    # DIVE-3970 it.3: the EXCERPT is captured too. The persistence annotation
+    # ("the self-healing mute has EXPIRED") is the only observable difference
+    # between "there was a mute and it expired" and "this wall was always loud",
+    # so without it the guard that tells those apart has no arm that can red.
+    _sup_capacity_alert() { printf "%s:%s\n" "$1" "$2" >>"$TMP/capacity-alerts"; printf "%s:%s\n" "$1" "${4:-true}" >>"$TMP/capacity-human"; printf "%s\n" "${3:-}" >>"$TMP/capacity-excerpt"; }
     # The seed writes BEFORE the tick, so it has to create the schema itself —
     # nothing else has touched this fixture DB yet. Both calls are subshelled:
     # `db` reaches `fail`, and `fail` EXITS, which `|| true` cannot catch.
@@ -235,7 +239,7 @@ tick_arm() {  # <snapshot-json> [armed] [seed-sql] [registry-json] [rotated|no-t
       cmd_supervisor_tick >/dev/null 2>&1 || { printf "TICK-RC=%s|" "$?"; }
       tick_n=$((tick_n + 1))
     done
-    printf "ESC=%s|SENT=%s|ACT=%s|RESTARTED=%s|ROTATED=%s|ALERTS=%s|ALERT_ROWS=%s|NUDGE_ROWS=%s|HUMAN=%s" \
+    printf "ESC=%s|SENT=%s|ACT=%s|RESTARTED=%s|ROTATED=%s|ALERTS=%s|ALERT_ROWS=%s|NUDGE_ROWS=%s|HUMAN=%s|EXCERPT=%s" \
       "$(db "SELECT COALESCE(GROUP_CONCAT(signals), \"\") FROM supervisor_events WHERE event=$(sqlq escalate);")" \
       "$(paste -sd, <"$TMP/sent")" \
       "$(db "SELECT COALESCE(GROUP_CONCAT(signals), \"\") FROM supervisor_events WHERE event=$(sqlq action);")" \
@@ -244,7 +248,8 @@ tick_arm() {  # <snapshot-json> [armed] [seed-sql] [registry-json] [rotated|no-t
       "$(paste -sd, <"$TMP/capacity-alerts")" \
       "$(db "SELECT COUNT(*) FROM supervisor_events WHERE event=$(sqlq alert) AND classification=$(sqlq quota-exhausted);")" \
       "$(db "SELECT COUNT(*) FROM supervisor_events WHERE event=$(sqlq action) AND signals LIKE $(sqlq %\\\"rung\\\":\\\"nudge\\\"%);")" \
-      "$(paste -sd, <"$TMP/capacity-human")"
+      "$(paste -sd, <"$TMP/capacity-human")" \
+      "$(paste -sd, <"$TMP/capacity-excerpt" | tr "|" "/")"
   '   # stderr deliberately NOT swallowed: the arm already fails closed (an abort
       # yields an empty receipt, which reds), but a red with no reason costs the
       # next reader a repro. The tick's own warns are silenced at its call above.
@@ -646,6 +651,94 @@ t "3970/wk: past the weekly reset and still walled, the human leg comes back" \
 # rule the 200h row would be read as this wall's start and escalate immediately.
 t "3970/wk: a recovered-then-rewalled seat starts a NEW mute, not an expired one" \
   "ops:false" "$(fld "$(tick_arm "$(_sh_snap "$_WEEK_SIG")" "" "$(_wk_seed 200)$(_wk_seed 30)")" HUMAN)"
+
+# ── ITERATION 3 (codex): THE CLOCK TRANSITION ────────────────────────────────
+# The rejection: "a named reset-clock wall does not re-enable lodar's human leg
+# when that clock passes inside the 24h dedup window. In the real tick the
+# current signature becomes qkind=no once lapsed, so the persistence branch is
+# skipped and dedup continues."
+#
+# This is the ONE shape where the mute's expiry and the loss of recognition are
+# the SAME event: a clock lapses, and lapsing is both "the promise came due" and
+# "this no longer reads self-healing". Reading the episode at `now` therefore
+# erases the deadline it is being held to, and the fix is to read the episode's
+# stored signature AT THE EPISODE'S OWN ts. That property is graded twice below:
+# once pure (the two readings of one string disagree, and which one is used
+# decides the outcome) and once end-to-end through the real tick.
+#
+# The clocks are computed from the real wall clock because the tick's `now` is
+# the real one; they are wall-clock times of day, so the nearest-day parser
+# places both on the correct side of `now` at both instants, including across
+# midnight (a 23:30 read at 00:30 is nearest YESTERDAY, i.e. 1h ago).
+_CLK_PAST=$(date -d '-1 hour' +'%-I:%M%P')     # lapsed 1h ago, live 2h ago
+_CLK_FUTURE=$(date -d '+1 hour' +'%-I:%M%P')   # still 1h away
+_clk_sig() { printf "⎿  You've hit your monthly spend limit · your session limit resets %s" "$1"; }
+# The apostrophe in the real refusal ("You've hit your monthly spend limit") is
+# a SQL string terminator, and a seed that fails to insert leaves the arm
+# looking like a FIRST sighting — which is a green negative control for the
+# wrong reason. Doubled here; sqlite stores the single character.
+_clk_seed() {  # <signature> <hours-ago>
+  local sig; sig=$(printf '{"signals":{"quotaDeadline":"unknown","quotaSignature":"%s"}}' "$1")
+  sig=${sig//\'/\'\'}
+  printf "INSERT INTO supervisor_events (agent, event, classification, cause, signals, ts) VALUES ('ops','alert','quota-exhausted','quota-exhausted','%s', datetime('now','-%s hours'));" "$sig" "$2"
+}
+_ep2=$(date -d '-2 hours' +%s)
+# (a) pure: the SAME stored string reads two different ways at the two instants,
+#     and only the episode's own instant preserves the deadline.
+t "3970/clk: the episode's clock was LIVE when that alert chose to stay quiet" \
+  "clock" "$(_sup_quota_selfheal "$(_clk_sig "$_CLK_PAST")" "$_ep2" | cut -d$'\x1f' -f1)"
+t "3970/clk: ...and reads as NOT self-healing now that it has passed" \
+  "no" "$(_sup_quota_selfheal "$(_clk_sig "$_CLK_PAST")" "$(date +%s)" | cut -d$'\x1f' -f1)"
+t "3970/clk: the preserved reading carries the clock the expiry is owed to" \
+  "yes" "$([[ "$(_sup_quota_selfheal "$(_clk_sig "$_CLK_PAST")" "$_ep2" | cut -d$'\x1f' -f2)" =~ ^[0-9]+$ ]] && echo yes || echo no)"
+
+# (b) POSITIVE, end to end: alert 2h ago muted on a clock that has since passed,
+#     still inside the 24h dedup window. lodar must hear about it now.
+clk_out=$(tick_arm "$(_sh_snap "$(_clk_sig "$_CLK_PAST")")" "" "$(_clk_seed "$(_clk_sig "$_CLK_PAST")" 2)")
+t "3970/clk: a muted clock wall takes the human leg back when its clock passes" \
+  "ops:true" "$(fld "$clk_out" HUMAN)"
+t "3970/clk: ...as one ordinary escalation row (seed + one)" "2" "$(fld "$clk_out" ALERT_ROWS)"
+
+# (c) NEGATIVE at the same layer: identical shape, clock still in the FUTURE ->
+#     the mute holds and nothing is sent or filed. Without this the positive is
+#     equally satisfied by "a lapsed-clock wall always alerts".
+clk_live_out=$(tick_arm "$(_sh_snap "$(_clk_sig "$_CLK_FUTURE")")" "" "$(_clk_seed "$(_clk_sig "$_CLK_FUTURE")" 2)")
+t "3970/clk: before the clock passes the mute holds — nothing sent" \
+  "" "$(fld "$clk_live_out" HUMAN)"
+t "3970/clk: ...and no escalation row is filed" "1" "$(fld "$clk_live_out" ALERT_ROWS)"
+
+# (d) exactly-once survives the transition: the escalation is already on the
+#     ledger (a row dated after the clock), so a later tick adds nothing.
+clk_twice_out=$(tick_arm "$(_sh_snap "$(_clk_sig "$_CLK_PAST")")" "" "$(_clk_seed "$(_clk_sig "$_CLK_PAST")" 2)$(_clk_seed "$(_clk_sig "$_CLK_PAST")" 0)")
+t "3970/clk: the clock escalation still fires exactly once" \
+  "" "$(fld "$clk_twice_out" HUMAN)"
+t "3970/clk: ...and adds no third row" "2" "$(fld "$clk_twice_out" ALERT_ROWS)"
+
+# (e) THE COST OF THE WIDENED ENTRY, graded where it is actually observable.
+#     Widening the branch to every quota wall means an episode that was never
+#     muted now reaches the horizon arithmetic. "a first alert that was LOUD is
+#     not escalated a second time" (above) already pins the in-window half via
+#     the was-the-episode-muted gate — and it pins it so completely that a
+#     second arm on the same shape would be vacuous
+#     (community/wiki/two-redundant-guards-hide-a-vacuous-arm.md). The half only
+#     the horizon guard holds is the ANNOTATION: at a ROLLED window this wall
+#     alerts either way, and the difference is whether it is stamped as an
+#     expired mute. It was never muted, so stamping it tells main and lodar that
+#     a mute they were never given has run out.
+clk_loud_rolled=$(tick_arm "$(_sh_snap "$(_clk_sig "$_CLK_PAST")")" "" "$(_clk_seed 'credit balance is too low' 30)")
+t "3970/clk: a never-muted wall in a rolled window still reaches the human" \
+  "ops:true" "$(fld "$clk_loud_rolled" HUMAN)"
+t "3970/clk: ...and is NOT stamped as an expired mute it never had" \
+  "no" "$(case "$(fld "$clk_loud_rolled" EXCERPT)" in *"mute has EXPIRED"*) echo yes ;; *) echo no ;; esac)"
+# ...and the positive control for that instrument: the arm CAN see the stamp,
+# so the negative above is a measurement and not a broken matcher.
+t "3970/clk: the stamp IS present when a real mute expired" \
+  "yes" "$(case "$(fld "$clk_out" EXCERPT)" in *"mute has EXPIRED"*) echo yes ;; *) echo no ;; esac)"
+
+# (f) the FIRST sighting of a lapsed-clock wall is loud on its own merits (no
+#     episode to preserve) — the hard-wall safety, unchanged by any of the above.
+t "3970/clk: a lapsed-clock wall with no history is loud on first sighting" \
+  "ops:true" "$(fld "$(tick_arm "$(_sh_snap "$(_clk_sig "$_CLK_PAST")")")" HUMAN)"
 
 echo "PASS=$PASS FAIL=$FAIL"
 (( FAIL == 0 ))
