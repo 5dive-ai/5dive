@@ -15,6 +15,7 @@
 #
 # Run: bash tests/doctor_seat_claude_pid_unit.sh
 set -uo pipefail
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: single EXIT trap folds tempdir cleanup into the rc echo so the two EXIT traps do not clobber each other (corpus contract: tests/harness_rc_corpus_contract_unit.sh)
 # DIVE-2211/DIVE-3074: name the tree this harness grades. No 2>/dev/null — the
 # helper's stderr line IS the payload (see tests/lib/grading_tree.sh).
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
@@ -26,7 +27,7 @@ SRC=src
 # deps a full source would drag in).
 eval "$(awk '/^doctor_seat_claude_pid\(\) \{/,/^\}/' "$SRC/cmd_doctor.sh")"
 
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+TMP=$(mktemp -d)
 PASS=0; FAIL=0
 check() { # desc expected actual
   if [[ "$2" == "$3" ]]; then PASS=$((PASS+1)); echo "PASS: $1";
