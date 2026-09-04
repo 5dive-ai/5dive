@@ -197,7 +197,7 @@ tick_arm() {  # <snapshot-json> [armed] [seed-sql] [registry-json] [rotated|no-t
     _sup_snapshot()     { printf "%s" "$SNAP"; }      # the fixture fleet
     registry_read()     { printf "%s" "$FIXTURE_REGISTRY"; }
     _task_agent_channel() { return 1; }               # no telegram anywhere
-    : >"$TMP/sent"; : >"$TMP/restarted"; : >"$TMP/rotated"; : >"$TMP/capacity-alerts"; : >"$TMP/capacity-human"
+    : >"$TMP/sent"; : >"$TMP/restarted"; : >"$TMP/rotated"; : >"$TMP/capacity-alerts"; : >"$TMP/capacity-human"; : >"$TMP/capacity-excerpt"
     cmd_send() { printf "%s\n" "$1" >>"$TMP/sent"; return 0; }
     cmd_restart() { printf "%s\n" "$1" >>"$TMP/restarted"; return 0; }
     # DIVE-3856: rung 4 re-probes the poller after its own restart. Both stubs
@@ -222,7 +222,11 @@ tick_arm() {  # <snapshot-json> [armed] [seed-sql] [registry-json] [rotated|no-t
     # DIVE-3940: capture the 4th arg (notify_human) into its own field so an arm
     # can grade the classification->human-leg wiring. name:class stays in
     # capacity-alerts unchanged; the human decision lands in capacity-human.
-    _sup_capacity_alert() { printf "%s:%s\n" "$1" "$2" >>"$TMP/capacity-alerts"; printf "%s:%s\n" "$1" "${4:-true}" >>"$TMP/capacity-human"; }
+    # DIVE-3970 it.3: the EXCERPT is captured too. The persistence annotation
+    # ("the self-healing mute has EXPIRED") is the only observable difference
+    # between "there was a mute and it expired" and "this wall was always loud",
+    # so without it the guard that tells those apart has no arm that can red.
+    _sup_capacity_alert() { printf "%s:%s\n" "$1" "$2" >>"$TMP/capacity-alerts"; printf "%s:%s\n" "$1" "${4:-true}" >>"$TMP/capacity-human"; printf "%s\n" "${3:-}" >>"$TMP/capacity-excerpt"; }
     # The seed writes BEFORE the tick, so it has to create the schema itself —
     # nothing else has touched this fixture DB yet. Both calls are subshelled:
     # `db` reaches `fail`, and `fail` EXITS, which `|| true` cannot catch.
@@ -235,7 +239,7 @@ tick_arm() {  # <snapshot-json> [armed] [seed-sql] [registry-json] [rotated|no-t
       cmd_supervisor_tick >/dev/null 2>&1 || { printf "TICK-RC=%s|" "$?"; }
       tick_n=$((tick_n + 1))
     done
-    printf "ESC=%s|SENT=%s|ACT=%s|RESTARTED=%s|ROTATED=%s|ALERTS=%s|ALERT_ROWS=%s|NUDGE_ROWS=%s|HUMAN=%s" \
+    printf "ESC=%s|SENT=%s|ACT=%s|RESTARTED=%s|ROTATED=%s|ALERTS=%s|ALERT_ROWS=%s|NUDGE_ROWS=%s|HUMAN=%s|EXCERPT=%s" \
       "$(db "SELECT COALESCE(GROUP_CONCAT(signals), \"\") FROM supervisor_events WHERE event=$(sqlq escalate);")" \
       "$(paste -sd, <"$TMP/sent")" \
       "$(db "SELECT COALESCE(GROUP_CONCAT(signals), \"\") FROM supervisor_events WHERE event=$(sqlq action);")" \
@@ -244,7 +248,8 @@ tick_arm() {  # <snapshot-json> [armed] [seed-sql] [registry-json] [rotated|no-t
       "$(paste -sd, <"$TMP/capacity-alerts")" \
       "$(db "SELECT COUNT(*) FROM supervisor_events WHERE event=$(sqlq alert) AND classification=$(sqlq quota-exhausted);")" \
       "$(db "SELECT COUNT(*) FROM supervisor_events WHERE event=$(sqlq action) AND signals LIKE $(sqlq %\\\"rung\\\":\\\"nudge\\\"%);")" \
-      "$(paste -sd, <"$TMP/capacity-human")"
+      "$(paste -sd, <"$TMP/capacity-human")" \
+      "$(paste -sd, <"$TMP/capacity-excerpt" | tr "|" "/")"
   '   # stderr deliberately NOT swallowed: the arm already fails closed (an abort
       # yields an empty receipt, which reds), but a red with no reason costs the
       # next reader a repro. The tick's own warns are silenced at its call above.
@@ -475,6 +480,269 @@ t "3940 tick: an unknown-deadline wall keeps the human leg" \
 _NOOUT_SNAP='[{"name":"ops","type":"claude","classification":"no-output","cause":"no-output","detail":"3 open row(s), nothing closed in 5d"}]'
 t "3940 tick: a no-output stall is unaffected — human leg still fires" \
   "ops:true" "$(fld "$(tick_arm "$_NOOUT_SNAP")" HUMAN)"
+
+# ── DIVE-3970: the OTHER self-healing shapes, and the escape from the mute ───
+# Every string below is a real refusal, copied off supervisor_events
+# 2026-08-31..09-04 — the population that produced one DM per walled seat. All
+# of them parse to quotaDeadline=unknown, which DIVE-3940 keeps LOUD.
+#
+# The clock is pinned: _sup_quota_selfheal takes `now` as an argument precisely
+# so `resets 11:30am` is assertable as live-or-lapsed without waiting for a time
+# of day. 2026-09-04 09:30 is the clock dev's real refusal was read at.
+_SH_NOW=$(date -d '2026-09-04 09:30:00' +%s)
+sh() { _sup_quota_selfheal "$1" "$_SH_NOW" | tr $'\x1f' ' '; }
+
+t "selfheal: the DIVE-3880 phrasing still reads as a live clock" \
+  "clock" "$(sh '● Usage limit reached · continuing automatically at 11:30am · esc or' | cut -d' ' -f1)"
+t "selfheal: 'your session limit resets 11:30am' (dev, the DM that prompted this)" \
+  "clock" "$(sh "⎿  You've hit your monthly spend limit · your session limit resets 11:30am" | cut -d' ' -f1)"
+t "selfheal: a clock line carries its resume epoch, not just its kind" \
+  "$(date -d '2026-09-04 11:30:00' +%s)" "$(sh "your session limit resets 11:30am" | cut -d' ' -f2)"
+t "selfheal: a WEEKLY reset clock takes the week horizon, not the nearest-day clock" \
+  "week" "$(sh "⎿  You've hit your monthly spend limit · your weekly limit resets 1am (UTC)" | cut -d' ' -f1)"
+t "selfheal: ...and the session-scoped clock on the same shape is still a clock" \
+  "clock" "$(sh "⎿  You've hit your monthly spend limit · your session limit resets 11:30am" | cut -d' ' -f1)"
+t "selfheal: a weekly window meter at the wall (community, 5h: 0% 1w: 100%)" \
+  "week" "$(sh 'Sonnet 5 5h: 0% 1w: 100%' | cut -d' ' -f1)"
+t "selfheal: 5h: 30% 1w: 100% is walled on the WEEK, not the 5h window" \
+  "week" "$(sh 'Sonnet 5 5h: 30% 1w: 100%' | cut -d' ' -f1)"
+t "selfheal: a 5h meter at the wall takes the short horizon" \
+  "soon" "$(sh 'Sonnet 5 5h: 100% 1w: 40%' | cut -d' ' -f1)"
+t "selfheal: 'continuing shortly' resumes by itself and says no clock" \
+  "soon" "$(sh '● Usage limit reached · continuing shortly · esc to cancel' | cut -d' ' -f1)"
+
+# THE HARD-WALL SAFETY, in the same function. These must NOT be recognised —
+# DIVE-3880's rule that a deadline-free refusal is an indefinite freeze is
+# unchanged for every shape 3970 did not name.
+t "selfheal: meters below the wall are not a self-healing signal at all" \
+  "no" "$(sh 'Sonnet 5 5h: 30% 1w: 40%' | cut -d' ' -f1)"
+t "selfheal: 'credit balance is too low' stays a hard wall" \
+  "no" "$(sh 'credit balance is too low' | cut -d' ' -f1)"
+t "selfheal: a bare 429 stays a hard wall" \
+  "no" "$(sh 'API Error: 429 insufficient_quota' | cut -d' ' -f1)"
+t "selfheal: an empty signature is never self-healing" "no" "$(sh '' | cut -d' ' -f1)"
+# A promised reset that has already PASSED, with the wall still on screen, is
+# the hard wall — so a lapsed clock short-circuits to `no` and never falls
+# through to a meter on the same line.
+t "selfheal: a LAPSED resume clock is not self-healing (it promised and failed)" \
+  "no" "$(sh '● Usage limit reached · continuing automatically at 9am · esc or type to' | cut -d' ' -f1)"
+t "selfheal: a lapsed clock does not fall through to a 100% meter" \
+  "no" "$(sh 'continuing automatically at 9am · Sonnet 5 5h: 0% 1w: 100%' | cut -d' ' -f1)"
+
+# The widened human-leg decision, and its escape.
+t "notify_human: a recognised self-healing shape mutes on an unknown deadline" \
+  "false" "$(_sup_capacity_notify_human quota-exhausted unknown week)"
+t "notify_human: an unrecognised shape still keeps the human (hard wall)" \
+  "true" "$(_sup_capacity_notify_human quota-exhausted unknown no)"
+t "notify_human: persistence overrides the mute" \
+  "true" "$(_sup_capacity_notify_human quota-exhausted unknown week true)"
+t "notify_human: persistence overrides the DIVE-3940 live-deadline mute too" \
+  "true" "$(_sup_capacity_notify_human quota-exhausted live no true)"
+t "notify_human: a non-quota class is never muted by a self-healing kind" \
+  "true" "$(_sup_capacity_notify_human no-output unknown week)"
+
+# The horizons. Relative to the FIRST alert for the shapes that name no clock;
+# the clock itself when one was named.
+t "escalate_after: a named clock escalates at that clock" \
+  "1000" "$(_sup_quota_escalate_after clock 1000 500)"
+t "escalate_after: a 5h-window shape escalates 6h after the first alert" \
+  "$(( 21600 ))" "$(_sup_quota_escalate_after soon "" 0)"
+t "escalate_after: a weekly shape escalates a conservative 7 days after the first alert" \
+  "$(( 604800 ))" "$(_sup_quota_escalate_after week "" 0)"
+# ITERATION 2 (codex): the weekly horizon must be at least the weekly reset it
+# is waiting for, and a weekly reset is up to 7 days out — so it deliberately
+# OUTLIVES the 24h dedup window. That is only reachable because persistence is
+# measured from the wall EPISODE and not from the window (see
+# _sup_quota_episode_first); iteration 1 measured it from the window, which
+# forced 12h and took lodar's phone back six days before the reset. This arm is
+# the inverse of the one it replaces: if someone re-scopes persistence to the
+# window, the horizon has to come back below 24h and this reds.
+t "escalate_after: the weekly horizon reaches PAST the dedup window it survives" \
+  "yes" "$([[ $_SUP_SELFHEAL_WEEK_H -ge $_SUP_ALERT_WINDOW_H && $_SUP_SELFHEAL_WEEK_H -ge 168 ]] && echo yes || echo no)"
+t "escalate_after: the short horizon still fits inside one window (mid-window escape)" \
+  "yes" "$([[ $_SUP_SELFHEAL_SOON_H -lt $_SUP_ALERT_WINDOW_H ]] && echo yes || echo no)"
+t "escalate_after: a live-deadline mute with no stored signature still escalates" \
+  "$(( 21600 ))" "$(_sup_quota_escalate_after no "" 0)"
+
+# ── the same real tick: classification -> signature -> human leg ─────────────
+# The signature is what the tick reads now (signals.quotaSignature), so these
+# arms grade the WIRING, not just the classifier.
+_sh_snap() {  # <signature>
+  printf '[{"name":"ops","type":"claude","classification":"quota-exhausted","cause":"quota-exhausted","detail":"pane shows a model-capacity refusal: %s","signals":{"quotaDeadline":"unknown","quotaSignature":"%s"}}]' "$1" "$1"
+}
+_METER_SIG='Sonnet 5 5h: 100% 1w: 40%'
+meter_out=$(tick_arm "$(_sh_snap "$_METER_SIG")")
+t "3970 tick: a window-meter wall MUTES the human leg" \
+  "ops:false" "$(fld "$meter_out" HUMAN)"
+t "3970 tick: ...and still writes the audited alert row" "1" "$(fld "$meter_out" ALERT_ROWS)"
+t "3970 tick: ...and still fires the machine leg to main" \
+  "ops:quota-exhausted" "$(fld "$meter_out" ALERTS)"
+t "3970 tick: an unrecognised refusal still pings the human" \
+  "ops:true" "$(fld "$(tick_arm "$(_sh_snap 'credit balance is too low')")" HUMAN)"
+
+# PERSISTENCE, end to end. The seed is the first alert of the window, carrying
+# the same self-healing signature, aged past its horizon (6h for a 5h meter).
+# The tick must let ONE more alert through, with the human leg back on.
+_sh_seed() {  # <hours-ago> [rows]
+  local sig; sig=$(printf '{"signals":{"quotaDeadline":"unknown","quotaSignature":"%s"}}' "$_METER_SIG")
+  printf "INSERT INTO supervisor_events (agent, event, classification, cause, signals, ts) VALUES ('ops','alert','quota-exhausted','quota-exhausted','%s', datetime('now','-%s hours'));" "$sig" "$1"
+}
+persist_out=$(tick_arm "$(_sh_snap "$_METER_SIG")" "" "$(_sh_seed 7)")
+t "3970 tick: a wall still up past its horizon takes the human leg BACK" \
+  "ops:true" "$(fld "$persist_out" HUMAN)"
+t "3970 tick: the escalation is an ordinary alert row (seed + one escalation)" \
+  "2" "$(fld "$persist_out" ALERT_ROWS)"
+
+# The negative control at the same layer: identical seed, still inside the
+# horizon -> the dedup window holds and NOTHING is sent to anyone.
+fresh_out=$(tick_arm "$(_sh_snap "$_METER_SIG")" "" "$(_sh_seed 1)")
+t "3970 tick: inside the horizon the dedup window still suppresses everything" \
+  "" "$(fld "$fresh_out" HUMAN)"
+t "3970 tick: ...and writes no second alert row" "1" "$(fld "$fresh_out" ALERT_ROWS)"
+
+# Exactly once per window: with the escalation already on the ledger (2 rows),
+# a third tick past the horizon must add nothing — otherwise the escape from
+# the mute becomes a 10-minute alarm.
+# (the second row is dated AFTER the horizon the first one set — that row IS
+# the escalation, which is what makes it exactly-once rather than a 10-min alarm)
+twice_out=$(tick_arm "$(_sh_snap "$_METER_SIG")" "" "$(_sh_seed 7)$(_sh_seed 0)")
+t "3970 tick: the escalation fires exactly once per dedup window" \
+  "" "$(fld "$twice_out" HUMAN)"
+t "3970 tick: ...and adds no third alert row" "2" "$(fld "$twice_out" ALERT_ROWS)"
+
+# A seat whose FIRST alert was already loud must not be re-pinged by the
+# persistence path — it would double a ping the human already has.
+loud_seed=$(printf "INSERT INTO supervisor_events (agent, event, classification, cause, signals, ts) VALUES ('ops','alert','quota-exhausted','quota-exhausted','%s', datetime('now','-7 hours'));" '{"signals":{"quotaDeadline":"unknown","quotaSignature":"credit balance is too low"}}')
+t "3970 tick: a first alert that was LOUD is not escalated a second time" \
+  "" "$(fld "$(tick_arm "$(_sh_snap "$_METER_SIG")" "" "$loud_seed")" HUMAN)"
+
+# ── ITERATION 2 (codex): the WEEKLY wall, end to end, across dedup windows ──
+# The rejection: "a weekly 100% meter is muted initially but re-enables lodar's
+# DM after 12h, even though the expected weekly reset may be up to 7 days away."
+# These four arms are the acceptance criterion — muted until the reset it is
+# waiting on, loud after — and the first two RED under any window-scoped
+# persistence, because a window-scoped horizon cannot exceed 24h.
+_WEEK_SIG='Sonnet 5 5h: 0% 1w: 100%'
+_wk_seed() {  # <hours-ago>
+  local sig; sig=$(printf '{"signals":{"quotaDeadline":"unknown","quotaSignature":"%s"}}' "$_WEEK_SIG")
+  printf "INSERT INTO supervisor_events (agent, event, classification, cause, signals, ts) VALUES ('ops','alert','quota-exhausted','quota-exhausted','%s', datetime('now','-%s hours'));" "$sig" "$1"
+}
+# NEGATIVE CONTROL AT 12h (the exact hour iteration 1 escalated at): inside the
+# dedup window, 13h past the first alert, weekly reset still days away -> the
+# mute holds and NOTHING reaches anyone.
+week_12_out=$(tick_arm "$(_sh_snap "$_WEEK_SIG")" "" "$(_wk_seed 13)")
+t "3970/wk: 13h in, a weekly wall is still muted (iteration 1 pinged here)" \
+  "" "$(fld "$week_12_out" HUMAN)"
+t "3970/wk: ...and files no escalation row" "1" "$(fld "$week_12_out" ALERT_ROWS)"
+# THE CARRY ACROSS WINDOWS: the dedup window has rolled (last alert 30h ago), so
+# this tick files a FRESH alert — which must still be MUTED. Iteration 1 could
+# not express this: every rolled window restarted its own horizon.
+week_carry_out=$(tick_arm "$(_sh_snap "$_WEEK_SIG")" "" "$(_wk_seed 30)")
+t "3970/wk: a new dedup window files a fresh alert that is STILL muted" \
+  "ops:false" "$(fld "$week_carry_out" HUMAN)"
+# POSITIVE, ONLY POST-RESET: an unbroken chain one window apart reaching back
+# past 7 days. The episode start is 170h ago, the conservative weekly reset has
+# passed, the seat is still walled -> lodar hears about it.
+_wk_chain="$(_wk_seed 170)$(_wk_seed 146)$(_wk_seed 122)$(_wk_seed 98)$(_wk_seed 74)$(_wk_seed 50)$(_wk_seed 26)"
+t "3970/wk: past the weekly reset and still walled, the human leg comes back" \
+  "ops:true" "$(fld "$(tick_arm "$(_sh_snap "$_WEEK_SIG")" "" "$_wk_chain")" HUMAN)"
+# A GAP IS A NEW WALL: the seat recovered between the 200h alert and the 30h
+# one, so the episode starts at 30h and the mute starts over. Without the gap
+# rule the 200h row would be read as this wall's start and escalate immediately.
+t "3970/wk: a recovered-then-rewalled seat starts a NEW mute, not an expired one" \
+  "ops:false" "$(fld "$(tick_arm "$(_sh_snap "$_WEEK_SIG")" "" "$(_wk_seed 200)$(_wk_seed 30)")" HUMAN)"
+
+# ── ITERATION 3 (codex): THE CLOCK TRANSITION ────────────────────────────────
+# The rejection: "a named reset-clock wall does not re-enable lodar's human leg
+# when that clock passes inside the 24h dedup window. In the real tick the
+# current signature becomes qkind=no once lapsed, so the persistence branch is
+# skipped and dedup continues."
+#
+# This is the ONE shape where the mute's expiry and the loss of recognition are
+# the SAME event: a clock lapses, and lapsing is both "the promise came due" and
+# "this no longer reads self-healing". Reading the episode at `now` therefore
+# erases the deadline it is being held to, and the fix is to read the episode's
+# stored signature AT THE EPISODE'S OWN ts. That property is graded twice below:
+# once pure (the two readings of one string disagree, and which one is used
+# decides the outcome) and once end-to-end through the real tick.
+#
+# The clocks are computed from the real wall clock because the tick's `now` is
+# the real one; they are wall-clock times of day, so the nearest-day parser
+# places both on the correct side of `now` at both instants, including across
+# midnight (a 23:30 read at 00:30 is nearest YESTERDAY, i.e. 1h ago).
+# CAVEAT, and arm (a) is its tripwire: on a DST-observing box the twice-yearly
+# shift makes "-1 hour" of wall clock not one hour of elapsed time. CI and this
+# host are Etc/UTC, and arm (a) asserts the two readings directly, so that hour
+# reds there with a legible message instead of surfacing as a mystery in (b).
+_CLK_PAST=$(date -d '-1 hour' +'%-I:%M%P')     # lapsed 1h ago, live 2h ago
+_CLK_FUTURE=$(date -d '+1 hour' +'%-I:%M%P')   # still 1h away
+_clk_sig() { printf "⎿  You've hit your monthly spend limit · your session limit resets %s" "$1"; }
+# The apostrophe in the real refusal ("You've hit your monthly spend limit") is
+# a SQL string terminator, and a seed that fails to insert leaves the arm
+# looking like a FIRST sighting — which is a green negative control for the
+# wrong reason. Doubled here; sqlite stores the single character.
+_clk_seed() {  # <signature> <hours-ago>
+  local sig; sig=$(printf '{"signals":{"quotaDeadline":"unknown","quotaSignature":"%s"}}' "$1")
+  sig=${sig//\'/\'\'}
+  printf "INSERT INTO supervisor_events (agent, event, classification, cause, signals, ts) VALUES ('ops','alert','quota-exhausted','quota-exhausted','%s', datetime('now','-%s hours'));" "$sig" "$2"
+}
+_ep2=$(date -d '-2 hours' +%s)
+# (a) pure: the SAME stored string reads two different ways at the two instants,
+#     and only the episode's own instant preserves the deadline.
+t "3970/clk: the episode's clock was LIVE when that alert chose to stay quiet" \
+  "clock" "$(_sup_quota_selfheal "$(_clk_sig "$_CLK_PAST")" "$_ep2" | cut -d$'\x1f' -f1)"
+t "3970/clk: ...and reads as NOT self-healing now that it has passed" \
+  "no" "$(_sup_quota_selfheal "$(_clk_sig "$_CLK_PAST")" "$(date +%s)" | cut -d$'\x1f' -f1)"
+t "3970/clk: the preserved reading carries the clock the expiry is owed to" \
+  "yes" "$([[ "$(_sup_quota_selfheal "$(_clk_sig "$_CLK_PAST")" "$_ep2" | cut -d$'\x1f' -f2)" =~ ^[0-9]+$ ]] && echo yes || echo no)"
+
+# (b) POSITIVE, end to end: alert 2h ago muted on a clock that has since passed,
+#     still inside the 24h dedup window. lodar must hear about it now.
+clk_out=$(tick_arm "$(_sh_snap "$(_clk_sig "$_CLK_PAST")")" "" "$(_clk_seed "$(_clk_sig "$_CLK_PAST")" 2)")
+t "3970/clk: a muted clock wall takes the human leg back when its clock passes" \
+  "ops:true" "$(fld "$clk_out" HUMAN)"
+t "3970/clk: ...as one ordinary escalation row (seed + one)" "2" "$(fld "$clk_out" ALERT_ROWS)"
+
+# (c) NEGATIVE at the same layer: identical shape, clock still in the FUTURE ->
+#     the mute holds and nothing is sent or filed. Without this the positive is
+#     equally satisfied by "a lapsed-clock wall always alerts".
+clk_live_out=$(tick_arm "$(_sh_snap "$(_clk_sig "$_CLK_FUTURE")")" "" "$(_clk_seed "$(_clk_sig "$_CLK_FUTURE")" 2)")
+t "3970/clk: before the clock passes the mute holds — nothing sent" \
+  "" "$(fld "$clk_live_out" HUMAN)"
+t "3970/clk: ...and no escalation row is filed" "1" "$(fld "$clk_live_out" ALERT_ROWS)"
+
+# (d) exactly-once survives the transition: the escalation is already on the
+#     ledger (a row dated after the clock), so a later tick adds nothing.
+clk_twice_out=$(tick_arm "$(_sh_snap "$(_clk_sig "$_CLK_PAST")")" "" "$(_clk_seed "$(_clk_sig "$_CLK_PAST")" 2)$(_clk_seed "$(_clk_sig "$_CLK_PAST")" 0)")
+t "3970/clk: the clock escalation still fires exactly once" \
+  "" "$(fld "$clk_twice_out" HUMAN)"
+t "3970/clk: ...and adds no third row" "2" "$(fld "$clk_twice_out" ALERT_ROWS)"
+
+# (e) THE COST OF THE WIDENED ENTRY, graded where it is actually observable.
+#     Widening the branch to every quota wall means an episode that was never
+#     muted now reaches the horizon arithmetic. "a first alert that was LOUD is
+#     not escalated a second time" (above) already pins the in-window half via
+#     the was-the-episode-muted gate — and it pins it so completely that a
+#     second arm on the same shape would be vacuous
+#     (community/wiki/two-redundant-guards-hide-a-vacuous-arm.md). The half only
+#     the horizon guard holds is the ANNOTATION: at a ROLLED window this wall
+#     alerts either way, and the difference is whether it is stamped as an
+#     expired mute. It was never muted, so stamping it tells main and lodar that
+#     a mute they were never given has run out.
+clk_loud_rolled=$(tick_arm "$(_sh_snap "$(_clk_sig "$_CLK_PAST")")" "" "$(_clk_seed 'credit balance is too low' 30)")
+t "3970/clk: a never-muted wall in a rolled window still reaches the human" \
+  "ops:true" "$(fld "$clk_loud_rolled" HUMAN)"
+t "3970/clk: ...and is NOT stamped as an expired mute it never had" \
+  "no" "$(case "$(fld "$clk_loud_rolled" EXCERPT)" in *"mute has EXPIRED"*) echo yes ;; *) echo no ;; esac)"
+# ...and the positive control for that instrument: the arm CAN see the stamp,
+# so the negative above is a measurement and not a broken matcher.
+t "3970/clk: the stamp IS present when a real mute expired" \
+  "yes" "$(case "$(fld "$clk_out" EXCERPT)" in *"mute has EXPIRED"*) echo yes ;; *) echo no ;; esac)"
+
+# (f) the FIRST sighting of a lapsed-clock wall is loud on its own merits (no
+#     episode to preserve) — the hard-wall safety, unchanged by any of the above.
+t "3970/clk: a lapsed-clock wall with no history is loud on first sighting" \
+  "ops:true" "$(fld "$(tick_arm "$(_sh_snap "$(_clk_sig "$_CLK_PAST")")")" HUMAN)"
 
 echo "PASS=$PASS FAIL=$FAIL"
 (( FAIL == 0 ))
