@@ -493,6 +493,10 @@ t "selfheal: 'your session limit resets 11:30am' (dev, the DM that prompted this
   "clock" "$(sh "⎿  You've hit your monthly spend limit · your session limit resets 11:30am" | cut -d' ' -f1)"
 t "selfheal: a clock line carries its resume epoch, not just its kind" \
   "$(date -d '2026-09-04 11:30:00' +%s)" "$(sh "your session limit resets 11:30am" | cut -d' ' -f2)"
+t "selfheal: a WEEKLY reset clock takes the week horizon, not the nearest-day clock" \
+  "week" "$(sh "⎿  You've hit your monthly spend limit · your weekly limit resets 1am (UTC)" | cut -d' ' -f1)"
+t "selfheal: ...and the session-scoped clock on the same shape is still a clock" \
+  "clock" "$(sh "⎿  You've hit your monthly spend limit · your session limit resets 11:30am" | cut -d' ' -f1)"
 t "selfheal: a weekly window meter at the wall (community, 5h: 0% 1w: 100%)" \
   "week" "$(sh 'Sonnet 5 5h: 0% 1w: 100%' | cut -d' ' -f1)"
 t "selfheal: 5h: 30% 1w: 100% is walled on the WEEK, not the 5h window" \
@@ -538,14 +542,20 @@ t "escalate_after: a named clock escalates at that clock" \
   "1000" "$(_sup_quota_escalate_after clock 1000 500)"
 t "escalate_after: a 5h-window shape escalates 6h after the first alert" \
   "$(( 21600 ))" "$(_sup_quota_escalate_after soon "" 0)"
-t "escalate_after: a weekly shape escalates 12h after the first alert" \
-  "$(( 43200 ))" "$(_sup_quota_escalate_after week "" 0)"
-# BOTH horizons must be shorter than the 24h dedup window, or the escalation is
-# unreachable: the window rolls, the next tick files a fresh MUTED alert, and no
-# second alert ever exists to carry the human leg. This is the arm that fails if
-# someone tunes a horizon past the window.
-t "escalate_after: every horizon fires INSIDE the dedup window it escapes" \
-  "yes" "$([[ $_SUP_SELFHEAL_SOON_H -lt $_SUP_ALERT_WINDOW_H && $_SUP_SELFHEAL_WEEK_H -lt $_SUP_ALERT_WINDOW_H ]] && echo yes || echo no)"
+t "escalate_after: a weekly shape escalates a conservative 7 days after the first alert" \
+  "$(( 604800 ))" "$(_sup_quota_escalate_after week "" 0)"
+# ITERATION 2 (codex): the weekly horizon must be at least the weekly reset it
+# is waiting for, and a weekly reset is up to 7 days out — so it deliberately
+# OUTLIVES the 24h dedup window. That is only reachable because persistence is
+# measured from the wall EPISODE and not from the window (see
+# _sup_quota_episode_first); iteration 1 measured it from the window, which
+# forced 12h and took lodar's phone back six days before the reset. This arm is
+# the inverse of the one it replaces: if someone re-scopes persistence to the
+# window, the horizon has to come back below 24h and this reds.
+t "escalate_after: the weekly horizon reaches PAST the dedup window it survives" \
+  "yes" "$([[ $_SUP_SELFHEAL_WEEK_H -ge $_SUP_ALERT_WINDOW_H && $_SUP_SELFHEAL_WEEK_H -ge 168 ]] && echo yes || echo no)"
+t "escalate_after: the short horizon still fits inside one window (mid-window escape)" \
+  "yes" "$([[ $_SUP_SELFHEAL_SOON_H -lt $_SUP_ALERT_WINDOW_H ]] && echo yes || echo no)"
 t "escalate_after: a live-deadline mute with no stored signature still escalates" \
   "$(( 21600 ))" "$(_sup_quota_escalate_after no "" 0)"
 
@@ -588,7 +598,9 @@ t "3970 tick: ...and writes no second alert row" "1" "$(fld "$fresh_out" ALERT_R
 # Exactly once per window: with the escalation already on the ledger (2 rows),
 # a third tick past the horizon must add nothing — otherwise the escape from
 # the mute becomes a 10-minute alarm.
-twice_out=$(tick_arm "$(_sh_snap "$_METER_SIG")" "" "$(_sh_seed 7)$(_sh_seed 6)")
+# (the second row is dated AFTER the horizon the first one set — that row IS
+# the escalation, which is what makes it exactly-once rather than a 10-min alarm)
+twice_out=$(tick_arm "$(_sh_snap "$_METER_SIG")" "" "$(_sh_seed 7)$(_sh_seed 0)")
 t "3970 tick: the escalation fires exactly once per dedup window" \
   "" "$(fld "$twice_out" HUMAN)"
 t "3970 tick: ...and adds no third alert row" "2" "$(fld "$twice_out" ALERT_ROWS)"
@@ -598,6 +610,42 @@ t "3970 tick: ...and adds no third alert row" "2" "$(fld "$twice_out" ALERT_ROWS
 loud_seed=$(printf "INSERT INTO supervisor_events (agent, event, classification, cause, signals, ts) VALUES ('ops','alert','quota-exhausted','quota-exhausted','%s', datetime('now','-7 hours'));" '{"signals":{"quotaDeadline":"unknown","quotaSignature":"credit balance is too low"}}')
 t "3970 tick: a first alert that was LOUD is not escalated a second time" \
   "" "$(fld "$(tick_arm "$(_sh_snap "$_METER_SIG")" "" "$loud_seed")" HUMAN)"
+
+# ── ITERATION 2 (codex): the WEEKLY wall, end to end, across dedup windows ──
+# The rejection: "a weekly 100% meter is muted initially but re-enables lodar's
+# DM after 12h, even though the expected weekly reset may be up to 7 days away."
+# These four arms are the acceptance criterion — muted until the reset it is
+# waiting on, loud after — and the first two RED under any window-scoped
+# persistence, because a window-scoped horizon cannot exceed 24h.
+_WEEK_SIG='Sonnet 5 5h: 0% 1w: 100%'
+_wk_seed() {  # <hours-ago>
+  local sig; sig=$(printf '{"signals":{"quotaDeadline":"unknown","quotaSignature":"%s"}}' "$_WEEK_SIG")
+  printf "INSERT INTO supervisor_events (agent, event, classification, cause, signals, ts) VALUES ('ops','alert','quota-exhausted','quota-exhausted','%s', datetime('now','-%s hours'));" "$sig" "$1"
+}
+# NEGATIVE CONTROL AT 12h (the exact hour iteration 1 escalated at): inside the
+# dedup window, 13h past the first alert, weekly reset still days away -> the
+# mute holds and NOTHING reaches anyone.
+week_12_out=$(tick_arm "$(_sh_snap "$_WEEK_SIG")" "" "$(_wk_seed 13)")
+t "3970/wk: 13h in, a weekly wall is still muted (iteration 1 pinged here)" \
+  "" "$(fld "$week_12_out" HUMAN)"
+t "3970/wk: ...and files no escalation row" "1" "$(fld "$week_12_out" ALERT_ROWS)"
+# THE CARRY ACROSS WINDOWS: the dedup window has rolled (last alert 30h ago), so
+# this tick files a FRESH alert — which must still be MUTED. Iteration 1 could
+# not express this: every rolled window restarted its own horizon.
+week_carry_out=$(tick_arm "$(_sh_snap "$_WEEK_SIG")" "" "$(_wk_seed 30)")
+t "3970/wk: a new dedup window files a fresh alert that is STILL muted" \
+  "ops:false" "$(fld "$week_carry_out" HUMAN)"
+# POSITIVE, ONLY POST-RESET: an unbroken chain one window apart reaching back
+# past 7 days. The episode start is 170h ago, the conservative weekly reset has
+# passed, the seat is still walled -> lodar hears about it.
+_wk_chain="$(_wk_seed 170)$(_wk_seed 146)$(_wk_seed 122)$(_wk_seed 98)$(_wk_seed 74)$(_wk_seed 50)$(_wk_seed 26)"
+t "3970/wk: past the weekly reset and still walled, the human leg comes back" \
+  "ops:true" "$(fld "$(tick_arm "$(_sh_snap "$_WEEK_SIG")" "" "$_wk_chain")" HUMAN)"
+# A GAP IS A NEW WALL: the seat recovered between the 200h alert and the 30h
+# one, so the episode starts at 30h and the mute starts over. Without the gap
+# rule the 200h row would be read as this wall's start and escalate immediately.
+t "3970/wk: a recovered-then-rewalled seat starts a NEW mute, not an expired one" \
+  "ops:false" "$(fld "$(tick_arm "$(_sh_snap "$_WEEK_SIG")" "" "$(_wk_seed 200)$(_wk_seed 30)")" HUMAN)"
 
 echo "PASS=$PASS FAIL=$FAIL"
 (( FAIL == 0 ))

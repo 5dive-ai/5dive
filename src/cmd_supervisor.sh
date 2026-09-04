@@ -567,22 +567,46 @@ _SUP_SELFHEAL_5H_PAT="${SUPERVISOR_SELFHEAL_5H_PAT:-}"
 [[ -n "$_SUP_SELFHEAL_5H_PAT" ]] || _SUP_SELFHEAL_5H_PAT='(^|[^0-9A-Za-z_])5h:[[:space:]]*100%'
 _SUP_SELFHEAL_WEEK_PAT="${SUPERVISOR_SELFHEAL_WEEK_PAT:-}"
 [[ -n "$_SUP_SELFHEAL_WEEK_PAT" ]] || _SUP_SELFHEAL_WEEK_PAT='(^|[^0-9A-Za-z_])(7d|1w):[[:space:]]*100%'
+# A reset clock QUALIFIED BY THE WEEK -- "your weekly limit resets 1am (UTC)",
+# a real refusal from this fleet. The clock parser below is a nearest-DAY one
+# (DIVE-3880): it can only ever place "1am" today or tomorrow, so on a WEEKLY
+# limit its answer is an artefact, not a promise -- read at 09:30 it says the
+# reset was 8.5h ago and the seat is a hard wall, which is how this exact string
+# kept pinging a phone. A weekly reset is up to 7 days out and nothing in the
+# text says which day, so this shape takes the conservative WEEK horizon and the
+# clock is deliberately not consulted.
+_SUP_SELFHEAL_WEEKCLOCK_PAT="${SUPERVISOR_SELFHEAL_WEEKCLOCK_PAT:-}"
+[[ -n "$_SUP_SELFHEAL_WEEKCLOCK_PAT" ]] || _SUP_SELFHEAL_WEEKCLOCK_PAT='[Ww]eek(ly)?[[:space:]][^%]{0,24}[Rr]esets?'
 # THE PERSISTENCE HORIZONS — how long a self-healing wall is allowed to stay
 # walled before it stops being benign and lodar hears about it (part 2 of the
 # row: a mute with no escalation turns a real hard wall into silence). A shape
 # that named a clock escalates at THAT clock; the shapes that name none get a
-# horizon, and both horizons are deliberately SHORTER than _SUP_ALERT_WINDOW_H
-# (24h) — the escalation has to fire INSIDE the dedup window it is suppressed
-# by, or the window rolls, the next tick files a fresh muted alert, and the
-# escalation is unreachable forever. 6h covers a 5-hour window plus a tick.
-# 12h on the weekly one is NOT the weekly reset (that can be 7 days out): it is
-# the point at which a seat still walled is a rotation/spend decision a human
-# owns, which is exactly the DIVE-3272 incident (dev3, four days on an expired
-# 1-week quota, found by a human eyeballing queue depth).
+# horizon measured from the start of the wall EPISODE. 6h covers a 5-hour
+# window plus a tick. The weekly one is 7 DAYS, because that is the acceptance
+# criterion — "lodar is pinged only after its expected reset passes" — and a
+# weekly window whose meter reads 100% went to 100% at most 7 days ago, so 168h
+# from the first sighting is the earliest bound that cannot fire BEFORE the
+# reset it is waiting on. It is deliberately LONGER than _SUP_ALERT_WINDOW_H:
+# see _sup_quota_episode_first for why a horizon may now outlive the dedup
+# window, which the first cut of this change could not do.
+#
+# What covers the gap in the meantime is the MACHINE leg: main still gets an
+# alert + an audited row every window for the whole 7 days, which is the
+# DIVE-3272 cover (dev3, four days on an expired 1-week quota, found by a human
+# eyeballing queue depth) and is untouched here. Only the phone waits.
 _SUP_SELFHEAL_SOON_H="${SUPERVISOR_SELFHEAL_SOON_H:-6}"
 [[ "$_SUP_SELFHEAL_SOON_H" =~ ^[0-9]+$ ]] || _SUP_SELFHEAL_SOON_H=6
-_SUP_SELFHEAL_WEEK_H="${SUPERVISOR_SELFHEAL_WEEK_H:-12}"
-[[ "$_SUP_SELFHEAL_WEEK_H" =~ ^[0-9]+$ ]] || _SUP_SELFHEAL_WEEK_H=12
+_SUP_SELFHEAL_WEEK_H="${SUPERVISOR_SELFHEAL_WEEK_H:-168}"
+[[ "$_SUP_SELFHEAL_WEEK_H" =~ ^[0-9]+$ ]] || _SUP_SELFHEAL_WEEK_H=168
+# How far apart two alerts may be and still be the SAME wall. The tick files at
+# most one alert per class per _SUP_ALERT_WINDOW_H, so an unbroken wall leaves a
+# chain roughly one window apart; a wider gap means the seat came back in
+# between and the next wall is a NEW episode whose mute starts over. 1.5 windows
+# absorbs tick jitter without swallowing a real recovery.
+_SUP_EPISODE_GAP_H="${SUPERVISOR_EPISODE_GAP_H:-36}"
+[[ "$_SUP_EPISODE_GAP_H" =~ ^[0-9]+$ ]] || _SUP_EPISODE_GAP_H=36
+_SUP_EPISODE_LOOKBACK_D="${SUPERVISOR_EPISODE_LOOKBACK_D:-30}"
+[[ "$_SUP_EPISODE_LOOKBACK_D" =~ ^[0-9]+$ ]] || _SUP_EPISODE_LOOKBACK_D=30
 
 # Pure: `now` is an ARGUMENT, never read internally. Echoes
 # "<kind>\x1f<resume_epoch|>" where kind is
@@ -604,6 +628,11 @@ _sup_quota_selfheal() {  # <text> [now_epoch] -> "<kind>\x1f<resume_epoch|>"
     live)   printf 'clock\x1f%s\n' "$ep"; return 0 ;;
     lapsed) printf 'no\x1f\n';            return 0 ;;
   esac
+  # (a2) a reset clock qualified by the WEEK, before any clock arithmetic runs:
+  #      the parser is nearest-DAY and a weekly reset is not a daily one, so its
+  #      answer here is an artefact in BOTH directions (a false `lapsed` that
+  #      pings, a false `live` that escalates ~6 days early). Conservative week.
+  [[ "$text" =~ $_SUP_SELFHEAL_WEEKCLOCK_PAT ]] && { printf 'week\x1f\n'; return 0; }
   # (b) "... limit resets 11:30am" / "resets at 1am (UTC)".
   if [[ "$text" =~ $_SUP_SELFHEAL_RESET_PAT ]]; then
     IFS=$'\x1f' read -r st ep <<<"$(_sup_clock_state "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]:-00}" "${BASH_REMATCH[5]:-}" "$now")"
@@ -623,6 +652,9 @@ _sup_quota_selfheal() {  # <text> [now_epoch] -> "<kind>\x1f<resume_epoch|>"
 }
 
 # DIVE-3970: when does a MUTED self-healing wall become a human's problem? Pure.
+# `first` is the first alert of the wall EPISODE (see _sup_quota_episode_first),
+# never the first alert of the current dedup window — a horizon measured from
+# the window restarts every 24h and can never be longer than one.
 # Called only about an alert whose human leg was actually muted, so an
 # unrecognised kind here is the DIVE-3940 live-deadline mute (a 5h-window shape
 # whose signature the audited row did not keep) and takes the soon horizon as
@@ -633,6 +665,44 @@ _sup_quota_escalate_after() {  # <kind> <resume_epoch|""> <first_alert_epoch> ->
   if [[ "$kind" == "clock" && "$ep" =~ ^[0-9]+$ ]]; then printf '%s' "$ep"; return 0; fi
   if [[ "$kind" == "week" ]]; then printf '%s' $(( first + _SUP_SELFHEAL_WEEK_H * 3600 )); return 0; fi
   printf '%s' $(( first + _SUP_SELFHEAL_SOON_H * 3600 ))
+}
+
+# DIVE-3970 (iteration 2): the first alert of the unbroken run of alerts this
+# wall belongs to — the EPISODE — and that alert's stored signals.
+# Echoes "<epoch>\x1f<signals-json>", both empty when the seat has no prior
+# alert of this class (i.e. the wall starting now IS the episode).
+#
+# WHY AN EPISODE AND NOT THE DEDUP WINDOW. Iteration 1 measured persistence from
+# the first alert of the CURRENT _SUP_ALERT_WINDOW_H window, which forced every
+# horizon to be shorter than that window: once the window rolls, the next tick
+# files a fresh alert that is again the first of ITS window, so a horizon of 24h
+# or more could never be reached. That constraint is what capped the weekly
+# horizon at 12h — and 12h is not the weekly reset, which can be 7 days out, so
+# a benign weekly wall took the phone back six days early (codex, iteration 1).
+# Reading the whole chain instead removes the constraint: the episode start does
+# not move when a window rolls, so the mute is CARRIED ACROSS windows and a
+# horizon may be as long as the reset it is actually waiting for.
+#
+# The chain is broken by a gap wider than _SUP_EPISODE_GAP_H, which is a seat
+# that recovered and walled again — a new wall, a new mute, deliberately. Errs
+# toward the LOUD side: a gap misread as continuous expires the mute early.
+_sup_quota_episode_first() {  # <agent> <class> -> "<epoch>\x1f<signals-json>"
+  local name="${1:-}" cls="${2:-}" rows prev="" first_ts="" first_row="" ts row
+  rows=$(db "SELECT CAST(strftime('%s', ts) AS INTEGER) || char(31) ||
+                    REPLACE(COALESCE(signals, ''), char(10), ' ')
+             FROM supervisor_events
+             WHERE agent=$(sqlq "$name") AND event='alert'
+               AND classification=$(sqlq "$cls")
+               AND ts >= datetime('now', '-${_SUP_EPISODE_LOOKBACK_D} days')
+             ORDER BY id DESC;" 2>/dev/null || echo "")
+  [[ -n "$rows" ]] || { printf '\x1f\n'; return 0; }
+  # Newest first, walking BACK in time; `prev` is the newer neighbour.
+  while IFS=$'\x1f' read -r ts row; do
+    [[ "$ts" =~ ^[0-9]+$ ]] || continue
+    if [[ -n "$prev" ]] && (( prev - ts > _SUP_EPISODE_GAP_H * 3600 )); then break; fi
+    first_ts="$ts"; first_row="$row"; prev="$ts"
+  done <<<"$rows"
+  printf '%s\x1f%s\n' "$first_ts" "$first_row"
 }
 
 # DIVE-3272: does this agent's live pane show a capacity refusal? Root-only (the
@@ -2149,31 +2219,56 @@ cmd_supervisor_tick() {
     # signals at its own ts, not recorded: the row shape is unchanged (an
     # acceptance criterion), and a stored boolean would be a second source of
     # truth for a decision this file already computes.
-    local persisted="false"
-    if (( prev_alert > 0 )); then
-      [[ "$cls" == "quota-exhausted" && "$qkind" != "no" ]] || continue
-      # Exactly-once: after the escalation this window holds 2 alert rows.
-      (( prev_alert == 1 )) || continue
-      local first_pair first_ts first_row prev_qdl prev_sig prev_kind prev_kep due
-      first_pair=$(db "SELECT CAST(strftime('%s', ts) AS INTEGER) || char(31) || COALESCE(signals, '')
-                       FROM supervisor_events
+    # DIVE-3970 part 2: the mute is only SAFE if it expires — a wall that never
+    # resets must eventually reach the human it was hidden from. The expiry is
+    # measured from the start of this wall EPISODE (the unbroken chain of alerts
+    # this one belongs to), NOT from the current dedup window: a window-scoped
+    # horizon restarts every 24h, so it can never be longer than one window, and
+    # the weekly reset it has to wait for is up to 7 days out. Everything below
+    # is re-derived from rows the tick already writes — the row shape is
+    # unchanged (an acceptance criterion) and a stored `humanNotified` boolean
+    # would be a second source of truth for a decision this file computes.
+    local persisted="false" ep_ts="" ep_due=""
+    if [[ "$cls" == "quota-exhausted" && "$qkind" != "no" ]]; then
+      local ep_row ep_qdl ep_sig ep_kind_raw ep_kep ep_kind ep_kep_use
+      IFS=$'\x1f' read -r ep_ts ep_row <<<"$(_sup_quota_episode_first "$name" "$cls")"
+      if [[ "$ep_ts" =~ ^[0-9]+$ ]]; then
+        ep_qdl=$(jq -r '.signals.quotaDeadline // "unknown"' <<<"$ep_row" 2>/dev/null || echo unknown)
+        ep_sig=$(jq -r '.signals.quotaSignature // ""'       <<<"$ep_row" 2>/dev/null || echo "")
+        IFS=$'\x1f' read -r ep_kind_raw ep_kep <<<"$(_sup_quota_selfheal "$ep_sig" "$ep_ts")"
+        # An episode that OPENED on an unrecognised refusal already pinged the
+        # human at ep_ts; it still gets a horizon (so a wall that later reads
+        # self-healing is not silent forever), taken from what the wall reads
+        # NOW, but it may not use the escape below — that would double a ping
+        # the human already holds.
+        ep_kind="$ep_kind_raw"; ep_kep_use="$ep_kep"
+        if [[ "$ep_kind" == "no" ]]; then ep_kind="$qkind"; ep_kep_use=""; fi
+        ep_due=$(_sup_quota_escalate_after "$ep_kind" "$ep_kep_use" "$ep_ts")
+        [[ "$ep_due" =~ ^[0-9]+$ ]] && (( now_s >= ep_due )) && persisted="true"
+      fi
+      if (( prev_alert > 0 )); then
+        # Deduped by the window, but the mute may have expired MID-window (a
+        # named clock, or a 5h meter, both shorter than 24h). Let exactly ONE
+        # extra alert through, then never again for this episode.
+        [[ "$persisted" == "true" ]] || continue
+        [[ "$(_sup_capacity_notify_human "$cls" "$ep_qdl" "$ep_kind_raw")" == "false" ]] || continue
+        # Exactly-once, re-derived: any alert already filed at or after the
+        # escalation point IS the escalation — every alert from ep_due onward
+        # carries the human leg by construction.
+        local post_due
+        post_due=$(db "SELECT COUNT(*) FROM supervisor_events
                        WHERE agent=$(sqlq "$name") AND event='alert'
                          AND classification=$(sqlq "$cls")
-                         AND ts >= datetime('now', '-${_SUP_ALERT_WINDOW_H} hours')
-                       ORDER BY id LIMIT 1;" 2>/dev/null || echo "")
-      IFS=$'\x1f' read -r first_ts first_row <<<"$first_pair"
-      [[ "$first_ts" =~ ^[0-9]+$ ]] || continue
-      prev_qdl=$(jq -r '.signals.quotaDeadline // "unknown"' <<<"$first_row" 2>/dev/null || echo unknown)
-      prev_sig=$(jq -r '.signals.quotaSignature // ""'       <<<"$first_row" 2>/dev/null || echo "")
-      IFS=$'\x1f' read -r prev_kind prev_kep <<<"$(_sup_quota_selfheal "$prev_sig" "$first_ts")"
-      [[ "$(_sup_capacity_notify_human "$cls" "$prev_qdl" "$prev_kind")" == "false" ]] || continue
-      due=$(_sup_quota_escalate_after "$prev_kind" "$prev_kep" "$first_ts")
-      [[ "$due" =~ ^[0-9]+$ ]] && (( now_s >= due )) || continue
-      persisted="true"
+                         AND ts >= datetime($ep_due, 'unixepoch');" 2>/dev/null || echo 1)
+        [[ "$post_due" =~ ^[0-9]+$ ]] || post_due=1
+        (( post_due == 0 )) || continue
+      fi
+    elif (( prev_alert > 0 )); then
+      continue
     fi
     if [[ "$persisted" == "true" ]]; then
       # Say WHY the human is being reached for a wall it was told to ignore.
-      excerpt="${excerpt}; STILL WALLED past the reset the refusal at $(_sup_quota_deadline_hm "$first_ts") was promising — the self-healing mute has EXPIRED and this is now a hard wall (rotate the profile, or authorise the spend)"
+      excerpt="${excerpt}; STILL WALLED $(( (now_s - ep_ts) / 3600 ))h after the first alert of this wall and past the reset it was promising — the self-healing mute has EXPIRED and this is now a hard wall (rotate the profile, or authorise the spend)"
     fi
     local notify_human; notify_human=$(_sup_capacity_notify_human "$cls" "$qdl" "$qkind" "$persisted")
     if [[ "$cls" == "verify-challenge" ]]; then
