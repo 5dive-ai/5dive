@@ -670,6 +670,10 @@ t "3970/wk: a recovered-then-rewalled seat starts a NEW mute, not an expired one
 # the real one; they are wall-clock times of day, so the nearest-day parser
 # places both on the correct side of `now` at both instants, including across
 # midnight (a 23:30 read at 00:30 is nearest YESTERDAY, i.e. 1h ago).
+# CAVEAT, and arm (a) is its tripwire: on a DST-observing box the twice-yearly
+# shift makes "-1 hour" of wall clock not one hour of elapsed time. CI and this
+# host are Etc/UTC, and arm (a) asserts the two readings directly, so that hour
+# reds there with a legible message instead of surfacing as a mystery in (b).
 _CLK_PAST=$(date -d '-1 hour' +'%-I:%M%P')     # lapsed 1h ago, live 2h ago
 _CLK_FUTURE=$(date -d '+1 hour' +'%-I:%M%P')   # still 1h away
 _clk_sig() { printf "⎿  You've hit your monthly spend limit · your session limit resets %s" "$1"; }
