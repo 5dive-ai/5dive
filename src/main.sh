@@ -80,7 +80,7 @@ Agents:
                                                      # home is quarantined to /home/.5dive-reaped/ (root 0700);
                                                      # --purge-home deletes it instead (irreversible)
   5dive agent config <name> set channels=<none|telegram|discord|dashboard|buzz[,ch...]>
-                                                     # comma-separable; dashboard (claude-only, no token)
+                                                     # comma-separable; dashboard (claude/codex, no token)
                                                      # enables web-dashboard chat — the one-tap Enable chat
                                                      # path. New claude creates include it by default.
   5dive agent buzz enable <name> --relay=<https://…> # DIVE-3509: install the buzz plugin, mint the agent's

@@ -3,8 +3,8 @@ cmd_config() {
   #   keys:
   #     channels                  (none|telegram|discord|dashboard|buzz, comma-
   #                                separable — "telegram,dashboard" runs both;
-  #                                dashboard and buzz are claude-only and
-  #                                token-free)
+  #                                dashboard is token-free for claude/codex;
+  #                                buzz is claude-only and token-free)
   #     model                     (model id for the agent's CLI — claude/codex/
   #                                grok/antigravity; written into the type's
   #                                runtime config, applied on the deferred restart)
@@ -77,8 +77,8 @@ cmd_config() {
         if [[ "$v" != "none" ]] && [[ "${TYPE_CHANNELS[$type]:-0}" != "1" ]]; then
           fail "$E_VALIDATION" "type '$type' does not support channels"
         fi
-        if [[ "$type" != "claude" ]] && channel_in_list dashboard "$v"; then
-          fail "$E_VALIDATION" "channels=dashboard is claude-only (agent '$name' is type $type)"
+        if [[ "$type" != "claude" && "$type" != "codex" ]] && channel_in_list dashboard "$v"; then
+          fail "$E_VALIDATION" "channels=dashboard requires type=claude or codex (agent '$name' is type $type)"
         fi
         # DIVE-3333: same claude-only rule for buzz (agent_setup.sh refuses it
         # in install_channel_for_agent, and 5dive-agent-start refuses it again).
@@ -472,4 +472,3 @@ cmd_types() {
     jq -r '.[] | "\(.name) bin=\(.bin) installed=\(if .installed then "ok" else "missing" end) channels=\(if .channels then "yes" else "no" end)"' <<<"$arr" | sort
   fi
 }
-

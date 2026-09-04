@@ -2063,10 +2063,10 @@ cmd_create() {
       && channel_in_list discord "$channels"; then
     fail "$E_VALIDATION" "type '$type' supports --channels=telegram only (no discord build)"
   fi
-  # dashboard chat is a native-push claude plugin only (poll-fork runtimes
-  # have no dashboard variant yet) — fail before any state is written.
-  if [[ "$type" != "claude" ]] && channel_in_list dashboard "$channels"; then
-    fail "$E_VALIDATION" "channels=dashboard is claude-only (got type=$type)"
+  # Dashboard has native-push support in Claude and an app-server dispatcher
+  # adapter in Codex. Other runtimes still have no dashboard transport.
+  if [[ "$type" != "claude" && "$type" != "codex" ]] && channel_in_list dashboard "$channels"; then
+    fail "$E_VALIDATION" "channels=dashboard requires type=claude or codex (got type=$type)"
   fi
 
   # DIVE-906: secrets via stdin, never argv. The "-" sentinel on --api-key,
