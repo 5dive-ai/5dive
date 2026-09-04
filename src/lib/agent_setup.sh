@@ -1039,23 +1039,22 @@ codex_plugin_dir() {
   return 1
 }
 
-# Configure the telegram channel for a codex agent. Codex has no plugin
+# Configure a dispatcher-backed channel for a codex agent. Codex has no plugin
 # marketplace, so unlike claude there's nothing to install per-agent — a single
-# shared plugin checkout serves every codex agent (server.ts resolves its state
-# dir from the agent's own $HOME via homedir(), so per-agent isolation is
-# automatic). Here we just (1) write the bot token into the agent's
-# ~/.codex/channels/telegram/.env (the path the MCP server + pair.ts read) and
-# (2) seed access.json so the bot answers the operator on the first DM. The MCP
-# server + lifecycle hooks are wired into config.toml at boot by
-# 5dive-agent-start, which also launches codex with --dangerously-bypass-hook-trust.
+# shared plugin checkout serves every codex agent. Here we prepare the channel's
+# per-agent state: Telegram gets its token and access policy; dashboard gets the
+# runtime-neutral inbox path used by shelld. At boot 5dive-agent-start launches
+# the dispatcher, which owns app-server and the selected adapter processes.
 install_channel_for_codex_agent() {
   local plugin="$1" name="$2" token="$3" allowed_users="${4:-}"
   local user="agent-${name}"
   id -u "$user" &>/dev/null || fail "$E_GENERIC" "agent user missing: $user"
-  [[ "$plugin" == "telegram" ]] \
-    || fail "$E_VALIDATION" "codex channel plugin unsupported: $plugin (telegram only)"
-  [[ -n "$token" ]] || fail "$E_VALIDATION" "codex telegram channel requires a bot token"
-  if [[ -n "$allowed_users" ]]; then
+  [[ "$plugin" == "telegram" || "$plugin" == "dashboard" ]] \
+    || fail "$E_VALIDATION" "codex channel plugin unsupported: $plugin (telegram and dashboard only)"
+  if [[ "$plugin" == "telegram" && -z "$token" ]]; then
+    fail "$E_VALIDATION" "codex telegram channel requires a bot token"
+  fi
+  if [[ "$plugin" == "telegram" && -n "$allowed_users" ]]; then
     valid_telegram_chat_id_list "$allowed_users" \
       || fail "$E_VALIDATION" "invalid allowed_users (comma-separated numeric ids)"
   fi
@@ -1074,6 +1073,13 @@ install_channel_for_codex_agent() {
       "bun unavailable for $user (required by telegram-codex) and automatic install failed. Check network access to bun.sh, or install bun to /usr/local/bin manually, then retry."
   fi
 
+  if [[ "$plugin" == "dashboard" ]]; then
+    # shelld/control-plane delivery uses the historical runtime-neutral path.
+    # The Codex dashboard adapter drains it directly, including after downtime.
+    step "Preparing dashboard inbox for $user"
+    sudo -u "$user" -H bash -c \
+      'mkdir -p "$HOME/.claude/channels/dashboard/agent-inbox" "$HOME/.claude/channels/dashboard/collect-now"; chmod 700 "$HOME/.claude" "$HOME/.claude/channels" "$HOME/.claude/channels/dashboard" "$HOME/.claude/channels/dashboard/agent-inbox" "$HOME/.claude/channels/dashboard/collect-now" 2>/dev/null || true'
+  else
   # Write the bot token into ~/.codex/channels/telegram/.env. Strip-then-append
   # the TELEGRAM_BOT_TOKEN line so a rotated token doesn't leave a stale value;
   # tmpfile + mv so a crash mid-write can't blank the file.
@@ -1111,6 +1117,7 @@ CODEX_ENV
     sudo -u "$user" mkdir -p "/home/${user}/.agents/skills/notify-user"
     sudo -u "$user" cp "$AGENT_SKILLS_DIR/notify-user/SKILL.md" \
       "/home/${user}/.agents/skills/notify-user/SKILL.md"
+  fi
   fi
 
   # Default skills, best-effort: match preseed_claude_agent + the grok
@@ -1895,10 +1902,10 @@ PI_EXT
 # routes) — kept as positional so the call site stays uniform.
 install_channel_for_agent() {
   local type="$1" plugin="$2" name="$3" token="$4" home_channel="${5:-}" allowed_users="${6:-}"
-  # DIVE-841: the dashboard channel is a native-push claude plugin only — the
-  # poll-fork runtimes (codex/grok/agy/opencode) have no dashboard variant yet.
-  if [[ "$plugin" == "dashboard" && "$type" != "claude" ]]; then
-    fail "$E_VALIDATION" "channels=dashboard is claude-only (agent '$name' is type $type)"
+  # Dashboard has native-push support in Claude and a dispatcher adapter in
+  # Codex. Other runtimes still have no dashboard transport.
+  if [[ "$plugin" == "dashboard" && "$type" != "claude" && "$type" != "codex" ]]; then
+    fail "$E_VALIDATION" "channels=dashboard requires type=claude or codex (agent '$name' is type $type)"
   fi
   # DIVE-2895: same for buzz — it is a claude channel plugin (MCP notification
   # inbound), and the poll-fork runtimes have no Buzz variant. Refuse here so

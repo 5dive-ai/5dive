@@ -107,6 +107,11 @@ resolve_codex() {
   newest_node24_bin codex
 }
 
+codex_dispatcher_enabled() {
+  local channels=",${1:-},"
+  [[ "$channels" == *,telegram,* || "$channels" == *,dashboard,* ]]
+}
+
 
 # openclaw splits "the agent that runs and answers chat messages"
 # (`openclaw gateway run`) from "the local TUI for talking to that
@@ -119,6 +124,7 @@ resolve_codex() {
 # via valid_channel automatically routes to the gateway without
 # requiring a parallel update here.
 OPENCLAW_PATH_OVERRIDE=""
+CODEX_REAL_BIN=""
 case "$TYPE" in
   claude)   BIN="/home/claude/.local/bin/claude"; ARGS=(--dangerously-skip-permissions) ;;
   # --respect-workspace-trust false: devin's workspace-trust dialog blocks
@@ -141,9 +147,24 @@ case "$TYPE" in
       *)       ARGS=(gateway run) ;;
     esac ;;
   codex)
-    BIN="$(resolve_codex)" \
+    CODEX_REAL_BIN="$(resolve_codex)" \
       || { echo "codex not found (looked in /home/claude/.local/bin/codex and /home/claude/.nvm/versions/node/v24.*/bin/codex) — run: 5dive agent install codex --upgrade" >&2; exit 3; }
-    ARGS=() ;;
+    if codex_dispatcher_enabled "$CHANNELS"; then
+      CODEX_PLUGIN_DIR=""
+      for _c in "${TELEGRAM_CODEX_PLUGIN_DIR:-}" \
+                /usr/local/lib/5dive/telegram-codex \
+                /home/claude/projects/5dive/5dive-plugins/plugins/telegram-codex; do
+        [[ -n "$_c" && -f "$_c/dispatcher.ts" ]] && { CODEX_PLUGIN_DIR="$_c"; break; }
+      done
+      [[ -n "$CODEX_PLUGIN_DIR" ]] \
+        || { echo "telegram-codex dispatcher not found (set TELEGRAM_CODEX_PLUGIN_DIR or deploy it)" >&2; exit 3; }
+      BIN="$(resolve_bun)" \
+        || { echo "bun not found (looked in /usr/local/bin, ~claude/.bun/bin, ~claude/.local/bin, PATH) — install bun or run '5dive doctor --repair'" >&2; exit 3; }
+      ARGS=(run --cwd "$CODEX_PLUGIN_DIR" --shell=bun --silent start)
+    else
+      BIN="$CODEX_REAL_BIN"
+      ARGS=()
+    fi ;;
   opencode)
     # opencode's telegram bridge is a STANDALONE RELAY (telegram-opencode/
     # server.ts) — a THIRD run-model distinct from claude (--channels flag) and
@@ -258,7 +279,8 @@ case "$CH" in
   dashboard)
     case "$TYPE" in
       claude) ARGS+=(--channels "plugin:dashboard@5dive-plugins") ;;
-      *) echo "channels=dashboard is claude-only (got type=$TYPE)" >&2; exit 2 ;;
+      codex) : ;; # app-server dispatcher selected in the type dispatch
+      *) echo "channels=dashboard requires type=claude or codex (got type=$TYPE)" >&2; exit 2 ;;
     esac ;;
   # DIVE-2895 Buzz (Nostr) channel — claude-only, same shape as dashboard. The
   # plugin polls the relay itself and reads its keypair + watched channel UUIDs
@@ -512,7 +534,7 @@ TOML
   # agent's own ~/.codex/channels/telegram state via homedir(), so one copy
   # serves every codex agent. Resolver kept in sync with codex_plugin_dir() in
   # src/lib/agent_setup.sh.
-  if [[ "$CHANNELS" == "telegram" ]] \
+  if [[ "$CHANNELS" == "telegram" && "$BIN" == "$CODEX_REAL_BIN" ]] \
      && ! grep -q '^\[mcp_servers\.telegram\]' "$AGENT_CODEX_HOME/config.toml" 2>/dev/null; then
     CODEX_PLUGIN_DIR=""
     for _c in "${TELEGRAM_CODEX_PLUGIN_DIR:-}" \
@@ -565,6 +587,9 @@ TOML
     fi
   fi
   CODEX_OVERRIDE="export CODEX_HOME=$(printf %q "$AGENT_CODEX_HOME"); "
+  if codex_dispatcher_enabled "$CHANNELS"; then
+    CODEX_OVERRIDE+="export CODEX_BIN=$(printf %q "$CODEX_REAL_BIN") CODEX_DISPATCHER_CHANNELS=$(printf %q "$CHANNELS") CODEX_DISPATCHER_WORKDIR=$(printf %q "$WORKDIR"); "
+  fi
 fi
 
 # DIVE-1900: post-seed assertion, shared by the credential seed blocks below.
@@ -1670,7 +1695,7 @@ fi
 # Backgrounded so it never delays the session-watch below; bounded to the boot
 # window. Runs once per systemd start (codex respawns inside the tmux loop read
 # the persisted trust, so they never re-prompt).
-if [[ "$TYPE" == "codex" && "$CHANNELS" == "telegram" ]] \
+if [[ "$TYPE" == "codex" && "$CHANNELS" == "telegram" && "$BIN" == "$CODEX_REAL_BIN" ]] \
    && ! grep -q '^\[hooks\.state\]' "$AGENT_CODEX_HOME/config.toml" 2>/dev/null; then
   (
     for _ in $(seq 1 24); do
@@ -1908,7 +1933,7 @@ fi
 # Single-fire; the server-side watchdog owns every subsequent re-arm. Send is
 # coldstart_kick_submit, which verifies its own Enter and retries the ENTER only
 # (DIVE-3791) — never the text, which would concatenate onto a stranded line.
-if [[ "$TYPE" == "codex" && "$CHANNELS" == "telegram" ]]; then
+if [[ "$TYPE" == "codex" && "$CHANNELS" == "telegram" && "$BIN" == "$CODEX_REAL_BIN" ]]; then
   (
     # Loop exhaustion is a REPORTED outcome, not a fall-through (DIVE-3793).
     _kick_state=marker
