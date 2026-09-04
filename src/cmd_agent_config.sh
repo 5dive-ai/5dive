@@ -3,8 +3,8 @@ cmd_config() {
   #   keys:
   #     channels                  (none|telegram|discord|dashboard|buzz, comma-
   #                                separable — "telegram,dashboard" runs both;
-  #                                dashboard and buzz are claude-only and
-  #                                token-free)
+  #                                dashboard is token-free for claude/codex;
+  #                                buzz is claude-only and token-free)
   #     model                     (model id for the agent's CLI — claude/codex/
   #                                grok/antigravity; written into the type's
   #                                runtime config, applied on the deferred restart)

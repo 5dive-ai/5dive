@@ -42,6 +42,10 @@ if grep -q 'channels=dashboard is claude-only' \
     "$ROOT/src/cmd_agent_create.sh" "$ROOT/src/cmd_agent_config.sh" "$ROOT/src/lib/agent_setup.sh" "$START"; then
   fail "a Claude-only dashboard rejection remains in a managed path"
 fi
+if grep -qi 'dashboard.*claude-only' \
+    "$START" "$ROOT/src/main.sh" "$ROOT/src/cmd_agent_config.sh"; then
+  fail "CLI help still describes dashboard as Claude-only"
+fi
 
 bash -n "$START" "$ROOT/install.sh" "$ROOT/src/cmd_agent_create.sh" \
   "$ROOT/src/cmd_agent_config.sh" "$ROOT/src/lib/agent_setup.sh"

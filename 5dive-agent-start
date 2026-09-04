@@ -274,8 +274,8 @@ case "$CH" in
     case "$TYPE" in
       claude) ARGS+=(--channels plugin:discord@claude-plugins-official) ;;
     esac ;;
-  # DIVE-841 native dashboard chat — claude-only (native-push channel plugin;
-  # poll-fork runtimes have no equivalent yet). Always our marketplace.
+  # DIVE-841 dashboard chat — Claude uses the native-push channel plugin;
+  # Codex uses the app-server dispatcher. Always our marketplace.
   dashboard)
     case "$TYPE" in
       claude) ARGS+=(--channels "plugin:dashboard@5dive-plugins") ;;
