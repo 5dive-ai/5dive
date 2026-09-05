@@ -437,8 +437,8 @@ t "notify_human: live-deadline quota wall is the one mute" \
   "false" "$(_sup_capacity_notify_human quota-exhausted live)"
 t "notify_human: unknown-deadline (possible hard wall) keeps the human" \
   "true" "$(_sup_capacity_notify_human quota-exhausted unknown)"
-t "notify_human: a non-quota class is never muted by a live deadline" \
-  "true" "$(_sup_capacity_notify_human no-output live)"
+t "notify_human: no-output is muted regardless of deadline (DIVE-3982)" \
+  "false" "$(_sup_capacity_notify_human no-output live)"
 t "notify_human: quota-exhausted with no deadline defaults to loud" \
   "true" "$(_sup_capacity_notify_human quota-exhausted "")"
 
@@ -478,8 +478,10 @@ t "3940 tick: an unknown-deadline wall keeps the human leg" \
   "ops:true" "$(fld "$(tick_arm "$_HARDWALL_SNAP")" HUMAN)"
 
 _NOOUT_SNAP='[{"name":"ops","type":"claude","classification":"no-output","cause":"no-output","detail":"3 open row(s), nothing closed in 5d"}]'
-t "3940 tick: a no-output stall is unaffected — human leg still fires" \
-  "ops:true" "$(fld "$(tick_arm "$_NOOUT_SNAP")" HUMAN)"
+t "3982 tick: a no-output stall MUTES the human leg" \
+  "ops:false" "$(fld "$(tick_arm "$_NOOUT_SNAP")" HUMAN)"
+t "3982 tick: a no-output stall still fires the machine leg (main triages every one)" \
+  "ops:no-output" "$(fld "$(tick_arm "$_NOOUT_SNAP")" ALERTS)"
 
 # ── DIVE-3970: the OTHER self-healing shapes, and the escape from the mute ───
 # Every string below is a real refusal, copied off supervisor_events
@@ -538,8 +540,12 @@ t "notify_human: persistence overrides the mute" \
   "true" "$(_sup_capacity_notify_human quota-exhausted unknown week true)"
 t "notify_human: persistence overrides the DIVE-3940 live-deadline mute too" \
   "true" "$(_sup_capacity_notify_human quota-exhausted live no true)"
-t "notify_human: a non-quota class is never muted by a self-healing kind" \
-  "true" "$(_sup_capacity_notify_human no-output unknown week)"
+t "notify_human: no-output is muted even with a self-healing kind (DIVE-3982)" \
+  "false" "$(_sup_capacity_notify_human no-output unknown week)"
+# The deliberate difference from quota: persistence escalates a quota wall (asserted
+# above) but NEVER un-mutes no-output — its long duration is the benign idle case.
+t "notify_human: persistence does NOT un-mute no-output (DIVE-3982)" \
+  "false" "$(_sup_capacity_notify_human no-output unknown no true)"
 
 # The horizons. Relative to the FIRST alert for the shapes that name no clock;
 # the clock itself when one was named.

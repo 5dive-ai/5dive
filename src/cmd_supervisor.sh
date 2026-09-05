@@ -1081,6 +1081,15 @@ _sup_capacity_alert() {  # <name> <class> <detail> [notify_human=true]
 # DIVE-3940's decision.
 _sup_capacity_notify_human() {  # <class> <quotaDeadline> [selfheal_kind] [persisted] -> true|false
   local class="${1:-}" qdl="${2:-}" kind="${3:-no}" persisted="${4:-false}"
+  # DIVE-3982: no-output mutes the human leg UNCONDITIONALLY — ahead of the
+  # persistence escape, unlike quota. Its remedy ("reassign or park") is
+  # main/ops triage, never lodar's, and a long duration is the benign idle case
+  # (an empty queue closes nothing), not an incident like a quota wall past its
+  # reset. The machine leg in _sup_capacity_alert stays unconditional, so main
+  # still triages every one and escalates to a human in plain language if one is
+  # actually stuck. This is the deliberate difference from quota, which DOES
+  # escalate on persistence below.
+  [[ "$class" == "no-output" ]] && { printf 'false'; return; }
   # Persistence wins over every mute: this is the hard wall the mute exists to
   # not hide.
   [[ "$persisted" == "true" ]] && { printf 'true'; return; }
