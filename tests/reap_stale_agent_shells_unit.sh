@@ -143,7 +143,16 @@ if [[ -n "$ZF" ]]; then
   disown "$holder" 2>/dev/null || true
 fi
 
-WEDGE='until [ -f /nonexistent/5dive-never ]; do sleep 1; done'
+# Unique sentinel embedded in the decoy's OWN command, so the poll below can tell
+# the STAGED argv (post-execve) apart from the PARENT harness argv the kernel
+# shows during the fork-before-exec window. `nohup bash -c "$WEDGE"` reads back
+# the parent's argv (`bash tests/reap_stale_agent_shells_unit.sh`) between fork()
+# and execve() — that is NON-EMPTY, so the old "poll until non-empty" broke too
+# early and graded the parent's argv, not the decoy's (DIVE-3986, main's it.2
+# finding). `: <token>` is a no-op that leaves the wedge's behaviour identical
+# while placing the token in the decoy's argv and nowhere in the parent's.
+STAGE_TOKEN='DIVE3986_STAGED_ARGV'
+WEDGE=": $STAGE_TOKEN; until [ -f /nonexistent/5dive-never ]; do sleep 1; done"
 if [[ ! -r /proc/self/cmdline ]]; then
   bad "STAGING: /proc is not readable — the environ opt-out cannot be graded on this host"
 else
@@ -158,12 +167,27 @@ else
   nohup bash -c "$WEDGE" >/dev/null 2>&1 &
   B=$!
   disown "$A" "$B" 2>/dev/null || true   # else the EXIT kill prints "Killed" job notices
-  sleep 0.3
+  # Wait for the kernel to populate /proc/<pid>/cmdline for the freshly exec'd
+  # decoys. Right after fork+exec the argv can read back EMPTY, and an empty
+  # cmdline is "I could not read the process yet", NOT "the token is absent from
+  # it" — reading it too early (a fixed sleep that lost the race) is what let
+  # iteration 2's three dependent arms grade an UNSTAGED process and pass
+  # vacuously (DIVE-3986). And "non-empty" is NOT enough: in the fork-before-exec
+  # window the argv reads back as the PARENT harness argv (non-empty), so poll
+  # until both argvs carry the decoy's own sentinel token, bounded ~5s.
+  A_CMD=""; B_CMD=""
+  for _try in $(seq 1 50); do
+    kill -0 "$A" 2>/dev/null && kill -0 "$B" 2>/dev/null || break
+    A_CMD=$(tr '\0' ' ' <"/proc/$A/cmdline" 2>/dev/null); A_CMD="${A_CMD% }"
+    B_CMD=$(tr '\0' ' ' <"/proc/$B/cmdline" 2>/dev/null); B_CMD="${B_CMD% }"
+    [[ "$A_CMD" == *"$STAGE_TOKEN"* && "$B_CMD" == *"$STAGE_TOKEN"* ]] && break
+    sleep 0.1
+  done
   if ! kill -0 "$A" 2>/dev/null || ! kill -0 "$B" 2>/dev/null; then
     bad "STAGING: could not stage the decoys (A=$A B=$B) — the arms below cannot be graded"
+  elif [[ "$A_CMD" != *"$STAGE_TOKEN"* || "$B_CMD" != *"$STAGE_TOKEN"* ]]; then
+    bad "STAGING: staged argv never reached the decoy after ~5s (A_CMD='$A_CMD' B_CMD='$B_CMD') — /proc/<pid>/cmdline was EMPTY or still the parent harness argv (fork-before-exec); refusing to grade the opt-out arms on an unstaged process (DIVE-3986)"
   else
-    A_CMD=$(tr '\0' ' ' <"/proc/$A/cmdline"); A_CMD="${A_CMD% }"
-    B_CMD=$(tr '\0' ' ' <"/proc/$B/cmdline"); B_CMD="${B_CMD% }"
 
     # The fact iteration 2's fixture got wrong, asserted directly.
     if [[ "$A_CMD" == *KEEP_ALIVE* ]]; then
