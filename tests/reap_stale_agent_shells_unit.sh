@@ -158,12 +158,25 @@ else
   nohup bash -c "$WEDGE" >/dev/null 2>&1 &
   B=$!
   disown "$A" "$B" 2>/dev/null || true   # else the EXIT kill prints "Killed" job notices
-  sleep 0.3
+  # Wait for the kernel to populate /proc/<pid>/cmdline for the freshly exec'd
+  # decoys. Right after fork+exec the argv can read back EMPTY, and an empty
+  # cmdline is "I could not read the process yet", NOT "the token is absent from
+  # it" — reading it too early (a fixed sleep that lost the race) is what let
+  # iteration 2's three dependent arms grade an UNSTAGED process and pass
+  # vacuously (DIVE-3986). Poll until both argvs read non-empty, bounded ~5s.
+  A_CMD=""; B_CMD=""
+  for _try in $(seq 1 50); do
+    kill -0 "$A" 2>/dev/null && kill -0 "$B" 2>/dev/null || break
+    A_CMD=$(tr '\0' ' ' <"/proc/$A/cmdline" 2>/dev/null); A_CMD="${A_CMD% }"
+    B_CMD=$(tr '\0' ' ' <"/proc/$B/cmdline" 2>/dev/null); B_CMD="${B_CMD% }"
+    [[ -n "$A_CMD" && -n "$B_CMD" ]] && break
+    sleep 0.1
+  done
   if ! kill -0 "$A" 2>/dev/null || ! kill -0 "$B" 2>/dev/null; then
     bad "STAGING: could not stage the decoys (A=$A B=$B) — the arms below cannot be graded"
+  elif [[ -z "$A_CMD" || -z "$B_CMD" ]]; then
+    bad "STAGING: staged argv read back EMPTY after ~5s (A_CMD='$A_CMD' B_CMD='$B_CMD') — /proc/<pid>/cmdline not populated; refusing to grade the opt-out arms on an unstaged process (DIVE-3986)"
   else
-    A_CMD=$(tr '\0' ' ' <"/proc/$A/cmdline"); A_CMD="${A_CMD% }"
-    B_CMD=$(tr '\0' ' ' <"/proc/$B/cmdline"); B_CMD="${B_CMD% }"
 
     # The fact iteration 2's fixture got wrong, asserted directly.
     if [[ "$A_CMD" == *KEEP_ALIVE* ]]; then
