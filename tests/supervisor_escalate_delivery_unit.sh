@@ -437,8 +437,8 @@ t "notify_human: live-deadline quota wall is the one mute" \
   "false" "$(_sup_capacity_notify_human quota-exhausted live)"
 t "notify_human: unknown-deadline (possible hard wall) keeps the human" \
   "true" "$(_sup_capacity_notify_human quota-exhausted unknown)"
-t "notify_human: a non-quota class is never muted by a live deadline" \
-  "true" "$(_sup_capacity_notify_human no-output live)"
+t "notify_human: DIVE-3982 no-output is muted regardless of deadline (not human-actionable)" \
+  "false" "$(_sup_capacity_notify_human no-output live)"
 t "notify_human: quota-exhausted with no deadline defaults to loud" \
   "true" "$(_sup_capacity_notify_human quota-exhausted "")"
 
@@ -478,8 +478,11 @@ t "3940 tick: an unknown-deadline wall keeps the human leg" \
   "ops:true" "$(fld "$(tick_arm "$_HARDWALL_SNAP")" HUMAN)"
 
 _NOOUT_SNAP='[{"name":"ops","type":"claude","classification":"no-output","cause":"no-output","detail":"3 open row(s), nothing closed in 5d"}]'
-t "3940 tick: a no-output stall is unaffected — human leg still fires" \
-  "ops:true" "$(fld "$(tick_arm "$_NOOUT_SNAP")" HUMAN)"
+_noout_out=$(tick_arm "$_NOOUT_SNAP")
+t "3982 tick: a no-output stall MUTES the human leg" \
+  "ops:false" "$(fld "$_noout_out" HUMAN)"
+t "3982 tick: no-output still records the capacity alert (machine leg intact, only the human leg is muted)" \
+  "ops:no-output" "$(fld "$_noout_out" ALERTS)"
 
 # ── DIVE-3970: the OTHER self-healing shapes, and the escape from the mute ───
 # Every string below is a real refusal, copied off supervisor_events
@@ -538,8 +541,10 @@ t "notify_human: persistence overrides the mute" \
   "true" "$(_sup_capacity_notify_human quota-exhausted unknown week true)"
 t "notify_human: persistence overrides the DIVE-3940 live-deadline mute too" \
   "true" "$(_sup_capacity_notify_human quota-exhausted live no true)"
-t "notify_human: a non-quota class is never muted by a self-healing kind" \
-  "true" "$(_sup_capacity_notify_human no-output unknown week)"
+t "notify_human: DIVE-3982 no-output is muted even on a recognised self-healing kind" \
+  "false" "$(_sup_capacity_notify_human no-output unknown week)"
+t "notify_human: DIVE-3982 no-output stays muted even when persisted (its duration is not an incident)" \
+  "false" "$(_sup_capacity_notify_human no-output unknown no true)"
 
 # The horizons. Relative to the FIRST alert for the shapes that name no clock;
 # the clock itself when one was named.

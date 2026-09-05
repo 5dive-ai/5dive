@@ -1081,6 +1081,17 @@ _sup_capacity_alert() {  # <name> <class> <detail> [notify_human=true]
 # DIVE-3940's decision.
 _sup_capacity_notify_human() {  # <class> <quotaDeadline> [selfheal_kind] [persisted] -> true|false
   local class="${1:-}" qdl="${2:-}" kind="${3:-no}" persisted="${4:-false}"
+  # DIVE-3982: no-output ("N open row(s), nothing closed in Nd") is never a human
+  # ping — the other half of the FLEET-HEALTH family DIVE-3970 muted. Its remedy is
+  # "reassign or park", which is main/ops triage, NOT lodar's, and it is the
+  # byte-identical false positive an idle on-demand seat produces (an empty queue
+  # closes nothing; a-stalled-signal-is-true-and-names-no-cause). Unlike a quota
+  # wall past its reset, its long duration is not itself an incident, so it is muted
+  # UNCONDITIONALLY — ahead of the persistence escape below. The machine leg in
+  # _sup_capacity_alert stays unconditional, so main still triages every one and the
+  # DIVE-3272 cover is unchanged; a genuinely stuck seat is escalated by main in
+  # plain language, not by re-arming this raw template.
+  [[ "$class" == "no-output" ]] && { printf 'false'; return; }
   # Persistence wins over every mute: this is the hard wall the mute exists to
   # not hide.
   [[ "$persisted" == "true" ]] && { printf 'true'; return; }
