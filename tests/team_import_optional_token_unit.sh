@@ -234,6 +234,89 @@ grep -q 'tg_token" == "-"' "$SRC" \
   && ok_t 'T9 team import accepts --telegram-token=- so the secret rides stdin, not argv' \
   || bad_t 'T9 no stdin form — a dashboard import would log the token in shelld audit + /proc cmdline' ''
 
+# --- T10 THE MERGE SEAM: --telegram-token and --type on ONE `team import` -----
+# DIVE-3994 (this row) and DIVE-3998 (#775, merged to main while #774 sat open)
+# both landed flag parsing and usage text in the same few lines of cmd_team, so
+# main and this branch conflicted there and the resolution is NEW code. These
+# arms grade the union: a resolution that kept only one side's flag, or only
+# one side's help text, passes every arm above and every arm in
+# tests/team_import_type_override_unit.sh — each suite only ever names its own
+# flag. Nothing else in the corpus drives both at once.
+if [[ -x "$ROOT/5dive" ]]; then
+  HLP="$("$ROOT/5dive" team import --help 2>&1)"
+
+  grep -q -- '--telegram-token=<tok>' <<<"$HLP" \
+    && ok_t 'T10a `team import --help` documents --telegram-token after the DIVE-3998 merge' \
+    || bad_t 'T10a the merge dropped this row half of the usage text' "$HLP"
+
+  grep -q -- '--type=<harness>' <<<"$HLP" \
+    && ok_t 'T10b and it still documents --type — the union kept DIVE-3998 too' \
+    || bad_t 'T10b the merge dropped the DIVE-3998 half of the usage text' "$HLP"
+
+  # The usage heredoc is UNQUOTED on purpose (DIVE-3998 interpolates
+  # ${!TYPE_BIN[*]} into it), so every backtick in it is a command
+  # substitution. This row's text described the stdin form as `-`, which the
+  # shell ran: help printed "-: command not found" and swallowed the flag value
+  # it was documenting. Invisible until DIVE-3998 made `team import --help`
+  # reachable at all — before that the flag loop answered "unknown flag".
+  grep -qi 'command not found\|No such file' <<<"$HLP" \
+    && bad_t 'T10c the usage heredoc is executing part of its own text' "$HLP" \
+    || ok_t 'T10c the unquoted usage heredoc renders as text — nothing in it is executed'
+
+  grep -q "'-' reads it from stdin" <<<"$HLP" \
+    && ok_t 'T10d and the stdin form survives into the rendered help, not eaten by the shell' \
+    || bad_t 'T10d the documented value of --telegram-token is missing from the output' "$HLP"
+else
+  bad_t 'T10 SKIPPED-AS-FAIL: ./5dive is not built, so the help arms proved nothing' \
+        'run ./build.sh first — an unbuilt tree silently skips these and fakes a green'
+fi
+
+# --- T11 both flags on one invocation, behaviourally -------------------------
+# Same recorder shape as the type-override suite: swap the child `5dive` for a
+# logger so nothing is provisioned, then assert the roster came up on the
+# requested harness AND that the lead's token arrived from stdin.
+cat > "$TMP/two.yaml" <<'YAML'
+version: "2"
+defaults:
+  type: claude
+agents:
+  lead: {role: "Lead", channels: telegram, telegram_token: "${TEAM_TG_TOKEN}"}
+  hand: {role: "Hand", channels: none}
+YAML
+cat > "$TMP/fake5dive" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$REC"
+exit 0
+SH
+chmod +x "$TMP/fake5dive"
+_compose_self() { printf '%s' "$TMP/fake5dive"; }
+ensure_state()  { :; }
+registry_read() { printf '%s' '{"agents":{}}'; }
+
+# cmd_team/cmd_compose_up need the rest of the CLI's shared helpers, which the
+# built binary has by concatenation and a sourced fragment does not.
+# shellcheck source=/dev/null
+for _f in lib/error_codes.sh lib/output.sh header.sh lib/validation.sh; do
+  . "$ROOT/src/$_f" >/dev/null 2>&1 || true
+done
+set +e   # the sourced CLI turns errexit on; arms here end on a false test
+
+export REC="$TMP/rec-both.log"; : > "$REC"
+printf '%s\n' '111:FAKE-BOT-TOKEN' \
+  | cmd_team import "$TMP/two.yaml" --type=codex --telegram-token=- >"$TMP/both.out" 2>&1
+
+[[ "$(grep -c 'agent create .*--type=codex' "$REC")" == 2 ]] \
+  && ok_t 'T11a both flags together: the roster is created on the requested harness' \
+  || bad_t 'T11a --type was lost when --telegram-token was also passed' "rec=[$(cat "$REC")] out=[$(tail -3 "$TMP/both.out")]"
+
+grep -q '111:FAKE-BOT-TOKEN' "$REC" \
+  && ok_t 'T11b and the stdin token reached the lead, so neither flag ate the other' \
+  || bad_t 'T11b --telegram-token was lost when --type was also passed' "$(cat "$REC")"
+
+grep -q 'hand.*111:FAKE-BOT-TOKEN' "$REC" \
+  && bad_t 'T11c the company token leaked onto a non-lead role' "$(cat "$REC")" \
+  || ok_t 'T11c NEGATIVE CONTROL the token went to the lead only — still one channel per company'
+
 echo "-----"
 echo "team_import_optional_token_unit: $pass passed, $fail failed"
 rc=0; [[ $fail -eq 0 ]] || rc=1
