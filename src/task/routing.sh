@@ -656,22 +656,150 @@ _task_verify_unwakeable() {
   [[ "$_rc" == "1" ]]
 }
 
+# DIVE-3995 (iteration 2): does this chart NAME a dedicated QA rail AT ALL?
+#
+# This is the arming question for the org-root deferral, and it is deliberately
+# NOT "did _task_resolve_qa hand us a usable seat". Iteration 1 armed on the
+# latter and shipped a guard that could never fire: _task_resolve_qa already
+# guarantees its answer is distinct from the maker and not excluded, so whenever
+# a usable QA seat existed it won at its own rung and the root was never a
+# candidate — the deferral, and the last-resort re-offer under it, executed zero
+# times against the whole live chart (measured by ops on the reject).
+#
+# The states where the root ACTUALLY receives a code row are exactly the ones
+# where _task_resolve_qa returns nothing while the chart still has a QA rail:
+# the QA seat is asleep (DIVE-3939 wakeability), or IS the maker, or is
+# excluded, or is ambiguous. In every one of those the answer to "should the CEO
+# grade this code" is still no. So the deferral must arm on the EXISTENCE of a
+# QA rail, not on a successful pick from it.
+#
+# The body's carve-out is preserved exactly as written and no wider: an org with
+# NO QA seat named anywhere keeps the root as its grader. An org that named one
+# and cannot reach it today falls through to `verifyUnavailable`, which the body
+# calls the designed honest outcome — a row labelled "no independent verifier
+# available" is recoverable; a code row silently graded by the CEO is the defect.
+#
+# Uses the WIDE role||title predicate on purpose. _task_resolve_qa's two-pass
+# narrowing exists to pick ONE seat unambiguously; this function only asks
+# whether the rail exists, so a QA seat marked in the title alone still counts,
+# and so do two of them. The root itself is excluded: a chart whose only
+# QA-marked seat IS the root has no dedicated rail to defer to.
+_task_org_has_qa_seat() {
+  local _root="${1:-}" _pred _hit
+  _pred="$(_task_qa_kw_clause "COALESCE(role,'')||' '||COALESCE(title,'')")"
+  _hit=$(db "SELECT 1 FROM agents_org WHERE ${_pred} AND name <> $(sqlq "$_root") LIMIT 1;" 2>/dev/null)
+  [[ -n "$_hit" ]]
+}
+
+# DIVE-3995: WHICH LANE is this row in? Content/GTM rows are the CEO-appropriate
+# grading set (lodar, 2026-09-06: "maybe just marketing verification for olivia.
+# idk how olivia can verify code"), so the org-root deferral below must not fire
+# on them. Structural, never a hardcoded name: walk UP from the assignee and ask
+# whether anyone in that management line is marked as a marketing/content seat.
+# Leading-space-anchored keyword scan, the same convention as _task_resolve_qa
+# and _task_resolve_deputy (so " brand" matches but "firebrand" does not).
+# The walk carries the same cycle guard _human_owner_of_agent uses — the chart is
+# agent-writable, so a reports_to loop is reachable and must not hang the picker.
+_task_verify_content_lane() {
+  local cur="${1:-}" seen="" depth=0 hit=""
+  local _pred="( lower(' '||COALESCE(role,'')||' '||COALESCE(title,'')) LIKE '% marketing%'
+              OR lower(' '||COALESCE(role,'')||' '||COALESCE(title,'')) LIKE '% growth%'
+              OR lower(' '||COALESCE(role,'')||' '||COALESCE(title,'')) LIKE '% brand%'
+              OR lower(' '||COALESCE(role,'')||' '||COALESCE(title,'')) LIKE '% content%'
+              OR lower(' '||COALESCE(role,'')||' '||COALESCE(title,'')) LIKE '% creative%'
+              OR lower(' '||COALESCE(role,'')||' '||COALESCE(title,'')) LIKE '% communit%'
+              OR lower(' '||COALESCE(role,'')||' '||COALESCE(title,'')) LIKE '% social%' )"
+  while [[ -n "$cur" ]] && (( depth < 8 )); do
+    case ",$seen," in *",$cur,"*) return 1 ;; esac
+    seen="${seen:+$seen,}$cur"
+    hit=$(db "SELECT 1 FROM agents_org WHERE name=$(sqlq "$cur") AND ${_pred} LIMIT 1;" 2>/dev/null)
+    [[ -n "$hit" ]] && return 0
+    cur=$(db "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$cur") LIMIT 1;" 2>/dev/null)
+    depth=$(( depth + 1 ))
+  done
+  return 1
+}
+
 _task_default_verifier() {
   local _assignee="$1" _proj_lead="$2" c=""
+  # DIVE-3995: resolve the QA seat and the org root ONCE, up front, because both
+  # now feed a decision taken BEFORE the loop as well as sitting in it.
+  # _task_resolve_qa also WARNS on ambiguity, so calling it twice would print the
+  # skip notice twice for one pick.
+  local _qa _root
+  _qa="$(_task_resolve_qa "$_assignee")" || _qa=""
+  _root="$(_task_resolve_org_root)"
+  # DIVE-3995: THE ORG ROOT IS THE CEO SEAT, and it was reachable as a GENERAL
+  # code-grading fallback. The row this fixes was filed against the `org_root`
+  # rung (rung 5) — and patching that rung alone would have changed NOTHING,
+  # because on the measured chart the root is reached at rung 3: with no
+  # role='coordinator' and no " coordinator" marker anywhere,
+  # _task_resolve_coordinator falls back to "the lone chart root" and returns the
+  # CEO, two rungs early. `reports_to` is a THIRD door onto the same seat for
+  # everyone who reports to the root directly (here: main, marketing, don).
+  # So the deferral is keyed on the NAME, not on the rung — every door onto the
+  # root is covered by one predicate, which is the only shape that cannot be
+  # walked around by a chart edit.
+  #
+  # DEFERRED, NEVER DELETED. In a small customer org the root may be the only
+  # plausible grader, and this function is documented to fall through to EMPTY
+  # (`verifyUnavailable`) rather than to the assignee — deleting the root would
+  # silently strip the rail off every row in a one-lead org. It is re-offered
+  # below, after the whole chain has declined, so it stays the LAST resort
+  # instead of an early one.
+  #
+  # Two conditions gate the deferral, and both must hold:
+  #   * the chart NAMES a dedicated QA rail distinct from the root
+  #     (_task_org_has_qa_seat — see the note on that function for why this is
+  #     existence and not a successful pick; arming on the pick is what made
+  #     iteration 1 unreachable); and
+  #   * the row is not in the content/GTM lane, which is the grading set the CEO
+  #     seat is explicitly being GIVEN.
+  #
+  # The deferral is only the NEGATIVE half of the ask ("keep the CEO seat out of
+  # code grading"). The POSITIVE half — "maybe just marketing verification for
+  # olivia" — needs the root PREFERRED on the content lane, not merely
+  # un-deferred: the QA rung is rung 1, so on a content row it fires before the
+  # root is ever reached and the row lands on a QA seat instead. Measured as a
+  # red arm (A4/A5b) on the first cut of this change, which is why the lane is
+  # read ONCE into a variable and used in both directions below.
+  local _content_lane="" _defer_root=""
+  _task_verify_content_lane "$_assignee" && _content_lane=1
+  if [[ -n "$_root" && -z "$_content_lane" ]] && _task_org_has_qa_seat "$_root"; then
+    _defer_root=1
+  fi
+  # On the content lane the root goes to the FRONT of the chain. It is prepended
+  # rather than special-cased so it still passes every filter the loop applies
+  # (distinct from the assignee, not excluded, wakeable) — a content row whose
+  # root is the maker itself, or is unwakeable, falls through to the ordinary
+  # chain instead of losing its grader.
+  local _lane_first=""
+  [[ -n "$_content_lane" ]] && _lane_first="$_root"
   local -a cands=(
-    "$(_task_resolve_qa "$_assignee")"
+    "$_lane_first"
+    "$_qa"
     "$_proj_lead"
     "$(_task_resolve_coordinator)"
     "$(db "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$_assignee") LIMIT 1;")"
-    "$(_task_resolve_org_root)"
+    "$_root"
     "$(_task_resolve_deputy "$_assignee")"
   )
   for c in "${cands[@]}"; do
-    if [[ -n "$c" && "$c" != "$_assignee" ]] \
-       && ! _task_verify_excluded "$c" && ! _task_verify_unwakeable "$c"; then
+    [[ -n "$c" && "$c" != "$_assignee" ]] || continue
+    [[ -n "$_defer_root" && "$c" == "$_root" ]] && continue
+    if ! _task_verify_excluded "$c" && ! _task_verify_unwakeable "$c"; then
       printf '%s' "$c"; return
     fi
   done
+  # DIVE-3995 (iteration 2): there is NO last-resort re-offer of the deferred
+  # root, and its absence is the change. An org with no QA rail never arms the
+  # deferral, so the root is an ordinary candidate at its own rung and that
+  # one-lead case is untouched. An org that HAS a QA rail it cannot reach today
+  # ends here, at EMPTY — deliberately, per the row body: falling through to
+  # `verifyUnavailable` is the designed honest outcome, not a harm to route
+  # around, and re-offering the root would hand the CEO seat exactly the code row
+  # this change exists to keep off it. Iteration 1 shipped that re-offer and it
+  # fired zero times besides.
   # Falls through to EMPTY when the whole chain is unwakeable, on purpose. The
   # caller's existing INST-2 `verifyUnavailable` path then labels the row
   # honestly ("no independent verifier available"). It must NOT fall back to the
