@@ -446,7 +446,11 @@ _gate_redact_branch_refs() {
 # the price-CHANGE verbs (raise/lower/increase/discount/hike) as well as the
 # spend verbs the ticket named, because "should we raise prices on the pro plan"
 # names no currency figure and is exactly the brand/commercial call that must
-# still reach a person.
+# still reach a person — and, from the same audit, the COMMERCIAL OBJECTS a price
+# is set against (plan / tier / seat / sku / contract / customer / enterprise /
+# vendor / margin / deal), because "approve the new plan price" and "sign off on
+# the enterprise price" name no verb and no figure either. What DIVE-4000's texts
+# name instead is a model, a board, a catalog and a join — a datum, not a deal.
 #
 # FIELD-SCOPED, NOT PROXIMITY-SCOPED. The obvious shape is "a signal NEAR the
 # term", and a bounded window is the one thing this file has been burned by twice
@@ -454,7 +458,7 @@ _gate_redact_branch_refs() {
 # whole-field test needs no window arithmetic, cannot match across a seam
 # (_gate_floor_axis already evaluates ask and title separately), and floors
 # STRICTLY MORE than any window over the same list would.
-_GATE_PRICE_SPEND_SIGNAL_RX='\$[0-9]|€[0-9]|£[0-9]|[0-9] ?(usd|eur|gbp|dollar|euro|cent)|pay|paid|buy|bought|purchas|charg|bill|invoic|spend|spent|refund|subscri|budget|revenue|monetiz|checkout|quote|discount|upgrade|downgrade|rais|lower|increas|decreas|hike|cost|tariff|fee'
+_GATE_PRICE_SPEND_SIGNAL_RX='\$[0-9]|€[0-9]|£[0-9]|[0-9] ?(usd|eur|gbp|dollar|euro|cent)|pay|paid|buy|bought|purchas|charg|bill|invoic|spend|spent|refund|subscri|budget|revenue|monetiz|checkout|quote|discount|upgrade|downgrade|rais|lower|increas|decreas|hike|cost|tariff|fee|plan|tier|seat|sku|deal|margin|vendor|supplier|contract|customer|enterprise'
 # _gate_redact_bare_price <lowercased text>: blank out `price`/`pricing` when the
 # field carries no spend signal. Same shape as DIVE-2629's branch-ref redaction —
 # the transform is on the TEXT at the match site, never on $floor_rx, because the

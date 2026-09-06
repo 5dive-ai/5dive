@@ -84,6 +84,8 @@ clean_t "T1 our own pricing surface: a render bug on the pricing table does not 
   "the pricing table renders a stale value for one row"
 clean_t "T1 'prices' inflection is covered by the same redaction" \
   "the board shows no prices for three models"
+clean_t "T1 a null price COLUMN is a datum, not a deal" \
+  "the price column on the models board is null for three rows"
 
 # --- T2: EVERY OTHER MONEY TERM STILL FIRES BARE. This is the arm that fails
 #     against the tempting wrong fix (delete `price` from the floor, or make the
@@ -110,6 +112,14 @@ floor_t "T3 a purchase near a price floors"               "buy the add-on, the p
 floor_t "T3 an upgrade near a price floors"               "upgrade our plan at the listed price"
 floor_t "T3 'what should we charge' floors (on charge, independently)" \
   "what price should we charge for the pro plan"
+# T3b: the COMMERCIAL OBJECT arm. These name no money verb and no currency
+# figure — "approve the new plan price" is an approval of a commercial number and
+# must still reach a person. Found by asking what a real spend ask can say using
+# ONLY the bare noun; the answer is that it names what the price is FOR.
+floor_t "T3b 'approve the new plan price' floors"        "approve the new plan price"
+floor_t "T3b 'sign off on the enterprise price' floors"  "sign off on the enterprise price"
+floor_t "T3b a price against a pro tier floors"          "approve the price for the pro tier"
+floor_t "T3b a price on a customer contract floors"      "approve the price on the customer contract"
 
 # --- T4: THE REPORTING HELPER TRACKS THE MATCHER. _gate_tier2_floor_term must
 #     never name a term the floor no longer matches (the DIVE-2629 invariant),
