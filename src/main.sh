@@ -31,6 +31,8 @@ Compose (declarative agents via 5dive.yaml):
   5dive team import <slug|path> [--auth-profile=]    # provision a whole company template in one call
   5dive team ls                                      # list bundled team templates
   # Default file: 5dive.yaml or 5dive.yml in cwd.
+  # --type=<harness> on up / ps / team import puts the WHOLE roster on one harness
+  # (every bundled template says claude). Omit it and nothing changes.
   # Schema (v1) — see 'agents' map keys: type, channels, telegram_token,
   # discord_token, workdir, skills, no_skills, defer_auth, isolation,
   # auth_profile, provider, api_key. Strings expand "\${ENV_VAR}" from the

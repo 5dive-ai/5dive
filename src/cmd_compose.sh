@@ -209,9 +209,17 @@ _compose_create_args() {
 # model/effort; here we only thread the runtime wiring (channels/auth/workdir).
 # Echoed one arg per line for mapfile-slurp, same contract as _compose_create_args.
 _compose_import_args() {
-  local spec="$1" name="$2" pack="$3" spec_dir="$4"
+  local spec="$1" name="$2" pack="$3" spec_dir="$4" type_override="${5:-}"
   printf '%s\n' "$pack"
   printf '%s\n' "--as=${name}"
+  # DIVE-3998: a pack normally supplies its own harness, so `type:` is NOT
+  # forwarded here — that is today's behaviour and it stays. `--type=` on
+  # `up`/`team import` is the one exception: an explicit roster-wide override
+  # must reach the pack path too, or `--type=codex` would create the plain
+  # agents as codex and the pack agents as whatever the pack was packed as.
+  if [[ -n "$type_override" ]]; then
+    printf '%s\n' "--type=${type_override}"
+  fi
   local channels tg_token dc_token profile workdir
   channels=$(jq -r '.channels       // empty' <<<"$spec")
   tg_token=$(jq -r '.telegram_token // empty' <<<"$spec")
@@ -349,28 +357,87 @@ _compose_wire_role() {
   done
 }
 
+# DIVE-3998: apply a roster-wide harness override to an already-parsed spec.
+#
+# Every bundled team template hard-sets `defaults.type: claude`, which made a
+# company import Claude-Code-only even though `agent create` has long accepted
+# every harness in TYPE_BIN (codex, opencode, openclaw, hermes, grok, pi, devin,
+# antigravity — read the map, do not re-inline the list). This rewrites the PARSED
+# spec rather than each call site, so every downstream reader (create argv,
+# _compose_wire_role's persona target, the ps view) sees one consistent type.
+#
+# It also drops Claude-only pins when the target is not claude. The templates
+# carry `model: opus|sonnet` + `effort:`, which are Claude aliases: `agent
+# config set effort=` REFUSES on a non-claude type (loud, harmless), but
+# `model=` is accepted for codex/grok/antigravity and only charset-validated —
+# so a resolved `claude-opus-5` would be written into a codex seat's runtime
+# config and the agent would be quietly broken. Dropping the pin lets the
+# target harness use its own default. A non-Claude model string (a full id, a
+# `vendor/model` BYO string) is NOT a Claude alias and passes through.
+_compose_apply_type_override() {
+  local spec="$1" t="$2"
+  jq --arg t "$t" '
+    .defaults = ((.defaults // {}) + {type: $t})
+    | .agents |= with_entries(
+        .value.type = $t
+        | if $t == "claude" then .
+          else
+            (if ((.value.model // "") | test("^(opus|sonnet|fable|haiku)$|^claude-"))
+             then .value |= del(.model) else . end)
+            | .value |= del(.effort)
+          end
+      )
+  ' <<<"$spec"
+}
+
+# Names of the agents _compose_apply_type_override would strip a Claude-only
+# model/effort pin from, comma-joined. Reported to the user: a silently dropped
+# pin is the same class of defect as a silently kept one.
+_compose_type_override_pins() {
+  local spec="$1" t="$2"
+  [[ "$t" == "claude" ]] && { printf ''; return 0; }
+  jq -r '[ .agents | to_entries[]
+           | select(((.value.model // "") | test("^(opus|sonnet|fable|haiku)$|^claude-"))
+                    or ((.value.effort // "") | tostring | length > 0))
+           | .key ] | join(", ")' <<<"$spec"
+}
+
 # Re-exec self via bash so we work whether the script was installed (+x) or
 # invoked from a source checkout (no +x).
 _compose_self() { realpath "${BASH_SOURCE[0]}"; }
 
 cmd_compose_up() {
-  local file=""
+  local file="" type_override=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -f|--file)    file="$2"; shift ;;
       --file=*)     file="${1#--file=}" ;;
+      --type=*)     type_override="${1#--type=}" ;;
+      --type)       type_override="$2"; shift ;;
       -h|--help)
         cat >&2 <<HELP
-usage: 5dive up [-f file]
+usage: 5dive up [-f file] [--type=<harness>]
   Bring up agents declared in 5dive.yaml. Idempotent — existing agents are
   left alone, missing ones are created and started.
   Default file: 5dive.yaml or 5dive.yml in the current directory.
+
+  --type=<harness>  Create the WHOLE roster on this harness, overriding the
+                    spec's type:/defaults.type:. Known: ${!TYPE_BIN[*]}.
+                    Claude-only model/effort pins are dropped when the target
+                    is not claude. Omit the flag and nothing changes.
 HELP
         return 0 ;;
       *) fail "$E_USAGE" "unknown flag: $1" ;;
     esac
     shift
   done
+  # DIVE-3998: reject an unknown harness HERE — before the spec is read and
+  # before ensure_state touches anything. Left to `agent create`, a typo'd
+  # --type fails once per agent, midway through a partly-provisioned roster.
+  if [[ -n "$type_override" ]]; then
+    is_known_type "$type_override" \
+      || fail "$E_NOT_FOUND" "unknown --type: $type_override (known: ${!TYPE_BIN[*]})"
+  fi
   if [[ -z "$file" ]]; then
     file=$(_compose_default_file) \
       || fail "$E_NOT_FOUND" "no 5dive.yaml or 5dive.yml in $(pwd) — pass -f <file>"
@@ -380,6 +447,16 @@ HELP
 
   local spec spec_dir self
   spec=$(_compose_parse "$file") || fail "$E_VALIDATION" "spec parse failed"
+  if [[ -n "$type_override" ]]; then
+    local _pins
+    _pins=$(_compose_type_override_pins "$spec" "$type_override")
+    spec=$(_compose_apply_type_override "$spec" "$type_override") \
+      || fail "$E_VALIDATION" "could not apply --type=$type_override to the spec"
+    step "harness override: creating the whole roster as '$type_override'"
+    if [[ -n "$_pins" ]]; then
+      warn "dropped Claude-only model/effort pins (not valid on '$type_override'): $_pins — the harness default applies; set one later with: 5dive agent config <name> set model=<id>"
+    fi
+  fi
   spec_dir=$(realpath "$(dirname "$file")")
   self=$(_compose_self)
 
@@ -426,7 +503,7 @@ HELP
       # persona+skills+model/effort); wiring below still applies org/goals/overrides.
       verb=import
       step "[$name] importing character pack '$pack_slug'"
-      mapfile -t args < <(_compose_import_args "$agent_spec" "$name" "$pack_slug" "$spec_dir")
+      mapfile -t args < <(_compose_import_args "$agent_spec" "$name" "$pack_slug" "$spec_dir" "$type_override")
       bash "$self" agent import "${args[@]}" || brought_up=0
     else
       step "[$name] creating"
@@ -665,6 +742,24 @@ _team_templates_dir() {
 # 5dive team import <slug|path> — resolve a curated/bundled template (or a path)
 # and bring the whole org up via the existing compose engine. A thin, honest
 # wrapper over `up`: the heavy lifting (idempotent create + v2 wiring) is shared.
+# DIVE-3998: the usage text was inline in the subcommand switch, so it was
+# reachable as `5dive team --help` but NOT as `5dive team import --help` —
+# there the flag loop hit `-*)` and answered "unknown flag: --help". Naming the
+# text lets the import loop print the same thing, which matters now that the
+# flag it documents (--type) lives on `team import`.
+_team_usage() {
+  cat >&2 <<HELP
+usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
+       5dive team ls
+  Provision a whole company-structure template in one call (wraps 5dive up).
+  <slug> resolves to a bundled template; a path is used as-is.
+
+  --type=<harness>  Create the whole roster on this harness instead of the
+                    template's own (every bundled template says claude).
+                    Known: ${!TYPE_BIN[*]}.
+HELP
+}
+
 cmd_team() {
   local sub="${1:-}"; shift || true
   case "$sub" in
@@ -680,21 +775,21 @@ cmd_team() {
       done
       return 0 ;;
     -h|--help|"" )
-      cat >&2 <<HELP
-usage: 5dive team import <slug|path> [--auth-profile=<name>]
-       5dive team ls
-  Provision a whole company-structure template in one call (wraps 5dive up).
-  <slug> resolves to a bundled template; a path is used as-is.
-HELP
+      _team_usage
       return 0 ;;
     *) fail "$E_USAGE" "unknown team subcommand: $sub (try: import, ls)" ;;
   esac
 
-  local ref="" profile=""
+  local ref="" profile="" type_override=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --auth-profile=*) profile="${1#--auth-profile=}" ;;
       --auth-profile)   profile="$2"; shift ;;
+      # DIVE-3998: forwarded verbatim to `up`, which owns the validation and
+      # the override itself. This wrapper stays thin on purpose.
+      --type=*)         type_override="${1#--type=}" ;;
+      --type)           type_override="$2"; shift ;;
+      -h|--help)        _team_usage; return 0 ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *)  [[ -z "$ref" ]] && ref="$1" || fail "$E_USAGE" "extra arg: $1" ;;
     esac
@@ -716,25 +811,48 @@ HELP
   # --auth-profile overrides the template's ${TEAM_AUTH_PROFILE} default.
   [[ -n "$profile" ]] && export TEAM_AUTH_PROFILE="$profile"
   step "importing team from $file"
-  cmd_compose_up -f "$file"
+  local -a _up_args=(-f "$file")
+  [[ -n "$type_override" ]] && _up_args+=("--type=$type_override")
+  cmd_compose_up "${_up_args[@]}"
 }
 
 cmd_compose_ps() {
-  local file=""
+  local file="" type_override=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -f|--file)    file="$2"; shift ;;
       --file=*)     file="${1#--file=}" ;;
+      --type=*)     type_override="${1#--type=}" ;;
+      --type)       type_override="$2"; shift ;;
       -h|--help)
+        # NO BACKTICKS AND NO $(...) IN THIS HEREDOC. The delimiter is unquoted
+        # on purpose (the sibling helps interpolate ${!TYPE_BIN[*]}), so a
+        # backtick is a command substitution: `up --type=<harness>` got RUN, and
+        # `<harness>` inside it is a redirection — bash printed a syntax error
+        # above the usage text and swallowed the phrase. shellcheck SC1073
+        # caught it; it is a runtime defect, not a lint.
         cat >&2 <<HELP
-usage: 5dive ps [-f file]
+usage: 5dive ps [-f file] [--type=<harness>]
   Show status of agents declared in 5dive.yaml.
+
+  --type=<harness>  Read the spec the way 'up --type=<harness>' would. Pass the
+                    same flag you brought the roster up with, or the 'type'
+                    column reports the spec's own harness for agents created on
+                    another one.
 HELP
         return 0 ;;
       *) fail "$E_USAGE" "unknown flag: $1" ;;
     esac
     shift
   done
+  # DIVE-3998: `ps` reports the DECLARED type straight out of the spec. Without
+  # this the column contradicts a roster brought up with `up --type=` — it would
+  # say claude for agents that are codex, which is drift reported where there is
+  # none. Same guard as `up`: an unknown harness is a usage error, not a column.
+  if [[ -n "$type_override" ]]; then
+    is_known_type "$type_override" \
+      || fail "$E_NOT_FOUND" "unknown --type: $type_override (known: ${!TYPE_BIN[*]})"
+  fi
   if [[ -z "$file" ]]; then
     file=$(_compose_default_file) \
       || fail "$E_NOT_FOUND" "no 5dive.yaml or 5dive.yml in $(pwd) — pass -f <file>"
@@ -744,6 +862,10 @@ HELP
 
   local spec
   spec=$(_compose_parse "$file") || fail "$E_VALIDATION" "spec parse failed"
+  if [[ -n "$type_override" ]]; then
+    spec=$(_compose_apply_type_override "$spec" "$type_override") \
+      || fail "$E_VALIDATION" "could not apply --type=$type_override to the spec"
+  fi
   local reg
   reg=$(registry_read)
 

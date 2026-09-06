@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased — feat(team): `--type=<harness>` — a company import is no longer Claude-Code-only (DIVE-3998)
+
+All four bundled team templates hard-set `defaults.type: claude`, so `5dive team import
+content-studio` could only ever produce Claude Code seats — even though `agent create` has
+long accepted every harness in `TYPE_BIN` and per-agent `type:` was already read with a
+`// "claude"` fallback. The capability was there; nothing exposed it to an import.
+
+`--type=<harness>` on `5dive team import` and `5dive up` now overrides the harness for the
+**whole roster**. Absent the flag, behaviour is unchanged.
+
+- **The whole roster, or it is worse than nothing.** The override rewrites the PARSED spec,
+  not each call site, so every downstream reader agrees: the create argv, the persona target
+  `_compose_wire_role` picks, the `ps` view. It overrides an agent's own `type:` too — keying
+  it on `defaults` alone would silently spare exactly those agents and hand back a
+  half-migrated company.
+- **Including the character-pack path.** `agent import <pack>` takes its harness from the
+  pack and still does; an explicit roster-wide override is the one thing that reaches it.
+  Without that, `--type=codex` gives you plain agents on codex and pack agents on whatever
+  they were packed as.
+- **Claude-only pins are dropped, and named.** The templates carry `model: opus|sonnet` and
+  `effort:`. `agent config set effort=` refuses on a non-claude type (loud, harmless), but
+  `model=` is *accepted* for codex/grok/antigravity and only charset-validated — so a
+  surviving alias would write a resolved `claude-opus-5` into a codex seat's runtime config
+  and hand you five quietly broken agents under a green summary. Claude aliases and
+  `claude-*` ids are dropped when the target is not claude, the affected agents are printed,
+  and a real codex / `vendor/model` BYO string passes through untouched.
+- **An unknown harness is rejected before anything is provisioned.** Left to `agent create`,
+  a typo fails once per agent, halfway through a partly-created roster.
+- **`5dive ps` takes the same flag**, because it reports the DECLARED type straight out of the
+  spec: without it the one command whose job is to compare declared against real would say
+  claude for a roster brought up as codex — drift reported where there is none.
+- `5dive team import --help` now prints usage instead of `unknown flag: --help` — the flag it
+  documents lives on that command, so the help had to be reachable from it.
+
+`tests/team_import_type_override_unit.sh` (30 arms) drives the transform, both argv builders,
+`cmd_compose_ps`, and — through a recorder swapped in at `_compose_self` — `cmd_compose_up`
+and `cmd_team` themselves, each with a no-flag negative control. The wiring arms are not decoration: a
+mutation that parses `--type` and never applies it survived every transform-level arm.
+
 ## Unreleased — fix(memory): the exit code cannot tell a broken checker from a false fact (DIVE-3909)
 
 DIVE-3885 shipped the right rule — *a checker that could not RUN is `unknown`, never `stale`,
