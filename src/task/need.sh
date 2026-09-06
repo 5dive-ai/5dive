@@ -421,6 +421,52 @@ _gate_redact_branch_refs() {
   printf '%s' "$out"
 }
 
+# DIVE-4001: THE SPEND SIGNAL that lets the bare noun `price|pricing` floor.
+#
+# THE DEFECT. The floor is a bare case-insensitive substring match over ask and
+# title, so `price` cannot tell "approve this spend" from "a price is missing
+# from our public pricing board". We SHIP a pricing product — /models and
+# /tokenmaxxing exist to display prices — so every row about our own surface
+# floored by TITLE, which a filer cannot word around without mistitling their own
+# ticket. Measured 2026-09-06: DIVE-4000 ("a model on the public models board
+# shows no price at all; this fills it in", an inert push-for-review approval)
+# floored to tier 2 and reached the paired human, who could not delegate it.
+#
+# THE FIX IS A CONTEXT REQUIREMENT, NOT A REMOVAL. `price|pricing` stays in the
+# floor. It simply stops firing on a field that carries NO spend signal at all —
+# no currency figure, no money verb, no price-change verb. Every other money term
+# (`\$[0-9]`, `billing`, `invoice`, `charge`, `payment`, `subscription`, `spend`,
+# `refund`) keeps firing BARE and is untouched by this, so the classes DIVE-891
+# named still floor on their own words.
+#
+# THE SIGNAL LIST IS DELIBERATELY OVER-INCLUSIVE, and that is the SAFE direction:
+# it can only ever RE-ENABLE the floor, never fire on its own. A term wrongly in
+# it costs a false positive (one appeal, see below); a term wrongly missing costs
+# a false negative on the money class, which has the least escape. So it carries
+# the price-CHANGE verbs (raise/lower/increase/discount/hike) as well as the
+# spend verbs the ticket named, because "should we raise prices on the pro plan"
+# names no currency figure and is exactly the brand/commercial call that must
+# still reach a person.
+#
+# FIELD-SCOPED, NOT PROXIMITY-SCOPED. The obvious shape is "a signal NEAR the
+# term", and a bounded window is the one thing this file has been burned by twice
+# (DIVE-1481's 20-char co-reference window; DIVE-2224's cross-seam join). A
+# whole-field test needs no window arithmetic, cannot match across a seam
+# (_gate_floor_axis already evaluates ask and title separately), and floors
+# STRICTLY MORE than any window over the same list would.
+_GATE_PRICE_SPEND_SIGNAL_RX='\$[0-9]|€[0-9]|£[0-9]|[0-9] ?(usd|eur|gbp|dollar|euro|cent)|pay|paid|buy|bought|purchas|charg|bill|invoic|spend|spent|refund|subscri|budget|revenue|monetiz|checkout|quote|discount|upgrade|downgrade|rais|lower|increas|decreas|hike|cost|tariff|fee'
+# _gate_redact_bare_price <lowercased text>: blank out `price`/`pricing` when the
+# field carries no spend signal. Same shape as DIVE-2629's branch-ref redaction —
+# the transform is on the TEXT at the match site, never on $floor_rx, because the
+# regex is POLICY DATA a sealed constitution may have replaced wholesale
+# (DIVE-1695/2301). Replaces with a SPACE, not the empty string: deleting the run
+# would butt its neighbours together and could mint a term present in neither.
+_gate_redact_bare_price() {
+  local text="${1-}"
+  [[ "$text" =~ (^|[^[:alnum:]_])(pricing|price) ]] || { printf '%s' "$text"; return 0; }
+  [[ "$text" =~ $_GATE_PRICE_SPEND_SIGNAL_RX ]] && { printf '%s' "$text"; return 0; }
+  printf '%s' "$text" | sed -E 's/(pricing|price)/ /g'
+}
 _GATE_T2_FLOOR_RX='spend|billing|invoice|charge|payment|refund|subscription|price|pricing|\$[0-9]|€[0-9]|publish|public post|announce|launch post|press|customer email|email customers|newsletter|blast|secret|credential|api key|token|password|delete|destroy|teardown|wipe|purge|drop[^.]{0,20}table|truncate|irreversible|revoke|dns|domain transfer'
 _gate_tier2_floor_hit() {
   local text floor_rx="$_GATE_T2_FLOOR_RX" loaded_rx="" constitution_path="" ere_rc=0
@@ -495,6 +541,13 @@ _gate_tier2_floor_hit() {
   # rest of the ask is read exactly as before. Full rationale at the RX above.
   if _gate_push_for_review_hit "$text"; then
     text=$(_gate_redact_branch_refs "$text")
+  fi
+  # DIVE-4001: the bare-noun price context requirement. Applied ONLY when the
+  # SHIPPED default floor is the policy in force — an org whose sealed
+  # constitution names `price` as a hard class gets its own term enforced
+  # verbatim, unqualified. Full rationale at _GATE_PRICE_SPEND_SIGNAL_RX.
+  if [[ "$floor_rx" == "$_GATE_T2_FLOOR_RX" ]]; then
+    text=$(_gate_redact_bare_price "$text")
   fi
   [[ "$text" =~ (^|[^[:alnum:]_])($floor_rx) ]]
 }
@@ -1224,7 +1277,20 @@ _gate_internal_residual() {
 # category without any action being requested — secrets/credentials handling
 # (2089's reported case), the content-publish-later terms DIVE-1381 already
 # treats as over-firing, and the recoverable-destructive verbs DIVE-1480 does.
-_GATE_FLOOR_APPEALABLE_RX='secret|credential|api key|token|password|publish|public post|announce|launch post|delete|destroy|wipe|purge'
+#
+# DIVE-4001 adds `price|pricing`, moved OFF the non-appealable half. That
+# asymmetry was backwards for us specifically: a `token` floor could be appealed
+# and a `price` floor never could, while /models and /tokenmaxxing are pricing
+# PRODUCTS, so every design discussion of our own surface floored permanently.
+# This lowers nothing — the floor still fires, the gate still exists, it still
+# needs clearing; it restores the appeal path `token` and `secret` already have.
+# The money class is NOT carved out with it: `spend|billing|invoice|charge|
+# payment|refund|subscription|\$[0-9]|€[0-9]` all stay non-appealable and all
+# still fire bare, so an ask that actually moves money is refused an appeal on
+# its own words. Companion change at _GATE_PRICE_SPEND_SIGNAL_RX makes the bare
+# noun require a spend signal before it fires at all — the two are independent:
+# this one makes a price false positive RECOVERABLE, that one makes it rarer.
+_GATE_FLOOR_APPEALABLE_RX='secret|credential|api key|token|password|publish|public post|announce|launch post|delete|destroy|wipe|purge|pricing|price'
 # NON-APPEALABLE (everything else in the floor, stated positively so a future
 # edit to the floor regex cannot silently widen what an appeal reaches): money,
 # real outbound comms, and irreversible infra/access. Never carved out.
@@ -1242,7 +1308,7 @@ _GATE_FLOOR_APPEALABLE_RX='secret|credential|api key|token|password|publish|publ
 # may be a substring of a NON-APPEALABLE one, or stripping the former would erase
 # the latter and hand an appeal to a class that has none. Asserted in
 # tests/gate_floor_word_boundary_unit.sh rather than left to review.
-_GATE_FLOOR_NONAPPEALABLE_RX='spend|billing|invoice|charge|payment|refund|subscription|price|pricing|\$[0-9]|€[0-9]|press|customer email|email customers|newsletter|blast|teardown|drop[^.]{0,20}table|truncate|irreversible|revoke|dns|domain transfer'
+_GATE_FLOOR_NONAPPEALABLE_RX='spend|billing|invoice|charge|payment|refund|subscription|\$[0-9]|€[0-9]|press|customer email|email customers|newsletter|blast|teardown|drop[^.]{0,20}table|truncate|irreversible|revoke|dns|domain transfer'
 # _gate_floor_appeal_residual <text>: lower-case <text> and remove ONLY the
 # appealable terms. The caller re-tests the full floor against the result; if it
 # still fires, a non-appealable class is present and the appeal is refused.
@@ -1288,6 +1354,11 @@ _gate_tier2_floor_term() {
   # which is the drift the paragraph above forbids.
   if _gate_push_for_review_hit "$text"; then
     text=$(_gate_redact_branch_refs "$text")
+  fi
+  # DIVE-4001: mirrored for the same reason the branch redaction is — this helper
+  # must never report a term the floor itself no longer matches.
+  if [[ "$rx" == "$_GATE_T2_FLOOR_RX" ]]; then
+    text=$(_gate_redact_bare_price "$text")
   fi
   [[ "$text" =~ (^|[^[:alnum:]_])($rx) ]] && printf '%s' "${BASH_REMATCH[2]}"
 }
