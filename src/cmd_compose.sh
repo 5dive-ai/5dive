@@ -825,13 +825,20 @@ cmd_compose_ps() {
       --type=*)     type_override="${1#--type=}" ;;
       --type)       type_override="$2"; shift ;;
       -h|--help)
+        # NO BACKTICKS AND NO $(...) IN THIS HEREDOC. The delimiter is unquoted
+        # on purpose (the sibling helps interpolate ${!TYPE_BIN[*]}), so a
+        # backtick is a command substitution: `up --type=<harness>` got RUN, and
+        # `<harness>` inside it is a redirection — bash printed a syntax error
+        # above the usage text and swallowed the phrase. shellcheck SC1073
+        # caught it; it is a runtime defect, not a lint.
         cat >&2 <<HELP
 usage: 5dive ps [-f file] [--type=<harness>]
   Show status of agents declared in 5dive.yaml.
 
-  --type=<harness>  Read the spec as `up --type=<harness>` would. Pass the same
-                    flag you brought the roster up with, or the 'type' column
-                    reports the spec's harness for agents created on another.
+  --type=<harness>  Read the spec the way 'up --type=<harness>' would. Pass the
+                    same flag you brought the roster up with, or the 'type'
+                    column reports the spec's own harness for agents created on
+                    another one.
 HELP
         return 0 ;;
       *) fail "$E_USAGE" "unknown flag: $1" ;;

@@ -291,5 +291,28 @@ else
 fi
 JSON_MODE=0
 
+# --- T13 every help that carries the flag RENDERS ----------------------------
+# These heredocs use an UNQUOTED delimiter so ${!TYPE_BIN[*]} interpolates. That
+# also makes a backtick a command substitution: the first `ps --help` shipped
+# `up --type=<harness>` in prose, bash ran it, `<harness>` parsed as a
+# redirection, and the help printed a syntax error and swallowed the phrase.
+# shellcheck SC1073 caught it in CI; nothing in T0-T12 did, because none of them
+# had ever asked a help text to render. Driven through the built CLI.
+if [[ -x "$ROOT/5dive" ]]; then
+  for _cmd in "up" "ps" "team import"; do
+    # shellcheck disable=SC2086
+    _h="$("$ROOT/5dive" $_cmd --help 2>&1)"
+    if grep -qiE 'syntax error|command substitution|unexpected token' <<<"$_h"; then
+      bad_t "T13 '5dive $_cmd --help' renders without a shell error" "$_h"
+    elif grep -q -- '--type=<harness>' <<<"$_h"; then
+      ok_t "T13 '5dive $_cmd --help' renders cleanly and documents --type"
+    else
+      bad_t "T13 '5dive $_cmd --help' does not mention --type" "$_h"
+    fi
+  done
+else
+  bad_t 'T13 SKIPPED-AS-FAIL: ./5dive is not built' 'run ./build.sh first'
+fi
+
 printf '\n%s\n' "team_import_type_override_unit: pass=$PASS fail=$FAIL"
 (( FAIL == 0 ))
