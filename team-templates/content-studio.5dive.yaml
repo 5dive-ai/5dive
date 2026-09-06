@@ -2,9 +2,13 @@
 # Import:  5dive team import content-studio --auth-profile=<account>
 # Or:      5dive up -f content-studio.5dive.yaml
 #
-# Per-role telegram bot tokens come from the env (${...}); set them before import.
 # One shared account by default; split across accounts later to avoid the
 # shared-account burst rate-limit (see reference_false_rotation_shared_account_burst).
+# ONE optional channel for the whole company (DIVE-3994). The LEAD role carries
+# the customer-facing Telegram bot; everyone else is created channel-less and is
+# reached from the dashboard or over `5dive agent send`. `${TEAM_TG_TOKEN}` is
+# OPTIONAL: leave it unset and the lead comes up channel-less too — the import
+# still succeeds, which is what makes one-tap import from the dashboard possible.
 version: "2"
 
 team:
@@ -14,16 +18,17 @@ team:
 
 defaults:
   type: claude
-  channels: telegram
+  channels: none
   isolation: standard
   auth_profile: "${TEAM_AUTH_PROFILE}"
 
 agents:
   editor:
     role: "Editor-in-Chief"
+    channels: telegram
+    telegram_token: "${TEAM_TG_TOKEN}"
     model: opus
     effort: high
-    telegram_token: "${EDITOR_TG_TOKEN}"
     skills: [5dive-cli]
     instructions: |
       You are the Editor-in-Chief. You own the editorial calendar, quality bar, and
@@ -37,7 +42,6 @@ agents:
     role: "Writer"
     model: sonnet
     effort: high
-    telegram_token: "${WRITER_TG_TOKEN}"
     reports_to: editor
     skills: [5dive-cli, deep-research]
     instructions: |
@@ -51,7 +55,6 @@ agents:
     role: "SEO"
     model: sonnet
     effort: medium
-    telegram_token: "${SEO_TG_TOKEN}"
     reports_to: editor
     skills: [5dive-cli, deep-research]
     instructions: |
@@ -65,7 +68,6 @@ agents:
     role: "Designer"
     model: sonnet
     effort: medium
-    telegram_token: "${DESIGNER_TG_TOKEN}"
     reports_to: editor
     skills: [5dive-cli]
     instructions: |
@@ -78,7 +80,6 @@ agents:
     role: "Distributor"
     model: sonnet
     effort: medium
-    telegram_token: "${DISTRIBUTOR_TG_TOKEN}"
     reports_to: editor
     skills: [5dive-cli]
     instructions: |

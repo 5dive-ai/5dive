@@ -28,7 +28,10 @@
 #
 # Env vars: any "${VAR}" in a string value is expanded from the process env.
 # Missing/empty vars fail loudly so a misconfigured shell can't silently
-# create agents with literal "${...}" strings as bot tokens.
+# create agents with literal "${...}" strings as bot tokens — EXCEPT in the
+# optional credential fields telegram_token/discord_token, where an unset var
+# drops the field and lands the agent channel-less (DIVE-3994). See the
+# expansion block in _compose_parse for why.
 
 # Default file: 5dive.yaml then 5dive.yml in cwd. Returns non-zero if neither.
 _compose_default_file() {
@@ -120,20 +123,68 @@ for n in names:
     if colour[n] == WHITE:
         visit(n, [])
 
+# ---- env expansion (DIVE-3994) -------------------------------------------
+# Any "${VAR}" in a string value is expanded from the process env, and an unset
+# one is a HARD error — a misconfigured shell must not create an agent whose bot
+# token is the literal string "${...}".
+#
+# ONE class of field is exempt: the OPTIONAL credential fields below. A bot
+# token is the one value a browser-driven `team import` cannot supply (there is
+# no shell to export it in), and dying on the first unset one is what made the
+# whole roster unreachable from the dashboard. There, an unset var drops the
+# FIELD, and drops that agent's `channels` to `none` when the dropped token was
+# the one wiring that channel — so the agent is created CHANNEL-LESS rather than
+# half-wired with a channel it has no credential for. The rule is keyed on the
+# FIELD, never on a var name, so it holds for any spec, not just our templates.
 env_re = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
-def expand(v):
+OPTIONAL_CRED_FIELDS = {"telegram_token": "telegram", "discord_token": "discord"}
+
+class _UnsetVar(Exception):
+    def __init__(self, var): self.var = var
+
+def expand(v, optional=False):
     if isinstance(v, str):
         def sub(m):
             k = m.group(1)
             if k not in os.environ or os.environ[k] == "":
+                if optional:
+                    raise _UnsetVar(k)
                 print(f"error: env var '{k}' referenced in spec is unset", file=sys.stderr)
                 sys.exit(3)
             return os.environ[k]
         return env_re.sub(sub, v)
-    if isinstance(v, dict): return {k: expand(x) for k, x in v.items()}
-    if isinstance(v, list): return [expand(x) for x in v]
+    if isinstance(v, dict): return {k: expand(x, optional) for k, x in v.items()}
+    if isinstance(v, list): return [expand(x, optional) for x in v]
     return v
-print(json.dumps(expand(data)))
+
+def drop_unset_creds(spec, name, dropped):
+    """Expand only the optional credential fields; drop what is unset."""
+    if not isinstance(spec, dict): return
+    for field, chan in OPTIONAL_CRED_FIELDS.items():
+        if field not in spec: continue
+        try:
+            spec[field] = expand(spec[field], optional=True)
+        except _UnsetVar as u:
+            del spec[field]
+            if str(spec.get("channels") or "").strip().lower() == chan:
+                spec["channels"] = "none"
+                if name is not None:
+                    dropped.append({"agent": name, "channel": chan, "var": u.var})
+
+dropped = []
+for _name, _m in data["agents"].items():
+    drop_unset_creds(_m, _name, dropped)
+# `defaults:` was merged into every agent above, but it is ALSO carried through
+# verbatim for `5dive export`, so its own raw "${...}" would still hard-fail the
+# whole-document walk below. Same rule; there is no agent to name.
+drop_unset_creds(data.get("defaults"), None, dropped)
+
+out = expand(data)
+# Consumed by cmd_compose_up to print ONE summary line. Emitted as data rather
+# than printed here because _compose_parse is also called by `ps` and `export`,
+# where a warning about a channel nobody is creating is noise.
+out["channels_dropped"] = dropped
+print(json.dumps(out))
 PY
 }
 
@@ -354,17 +405,24 @@ _compose_wire_role() {
 _compose_self() { realpath "${BASH_SOURCE[0]}"; }
 
 cmd_compose_up() {
-  local file=""
+  local file="" type_override=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -f|--file)    file="$2"; shift ;;
       --file=*)     file="${1#--file=}" ;;
+      # DIVE-3994: one harness for the whole roster, overriding whatever the
+      # spec declares. The spec's own `type:` stays the declared default, so
+      # omitting this flag is byte-identical to the previous behaviour.
+      --type)       type_override="$2"; shift ;;
+      --type=*)     type_override="${1#--type=}" ;;
       -h|--help)
         cat >&2 <<HELP
-usage: 5dive up [-f file]
+usage: 5dive up [-f file] [--type=<harness>]
   Bring up agents declared in 5dive.yaml. Idempotent — existing agents are
   left alone, missing ones are created and started.
   Default file: 5dive.yaml or 5dive.yml in the current directory.
+  --type=<harness>  run the WHOLE roster on this runtime (${!TYPE_BIN[*]}),
+                    overriding the spec's own type:.
 HELP
         return 0 ;;
       *) fail "$E_USAGE" "unknown flag: $1" ;;
@@ -382,6 +440,16 @@ HELP
   spec=$(_compose_parse "$file") || fail "$E_VALIDATION" "spec parse failed"
   spec_dir=$(realpath "$(dirname "$file")")
   self=$(_compose_self)
+
+  # DIVE-3994: validate the override HERE, before a single agent is created —
+  # `agent create` would reject it too, but only after the first N roles are
+  # already up, which is a half-imported company.
+  if [[ -n "$type_override" ]]; then
+    is_known_type "$type_override" \
+      || fail "$E_VALIDATION" "unknown harness type: $type_override (known: ${!TYPE_BIN[*]})"
+    spec=$(jq -c --arg t "$type_override" '.agents |= with_entries(.value.type = $t)' <<<"$spec") \
+      || fail "$E_GENERIC" "could not apply --type=$type_override"
+  fi
 
   local reg
   reg=$(registry_read)
@@ -495,12 +563,23 @@ HELP
   done
   # <<< DIVE-2347 degraded-skill derivation
 
+  # DIVE-3994: the roles whose optional bot token was unset, as reported by the
+  # parser. Restricted to agents this run actually brought up — a re-run over an
+  # already-imported company must not re-announce a channel it did not touch.
+  local _no_channel_names="" _cand
+  for _cand in $(jq -r '(.channels_dropped // [])[].agent' <<<"$spec" 2>/dev/null); do
+    for _n in "${_brought_up_names[@]+"${_brought_up_names[@]}"}"; do
+      [[ "$_n" == "$_cand" ]] && { _no_channel_names+="${_no_channel_names:+ }$_cand"; break; }
+    done
+  done
+
   if (( JSON_MODE )); then
-    ok "" '{file:$f, created:($c|tonumber), started:($s|tonumber), skipped:($k|tonumber), errors:($e|tonumber), asleep:$a, skills_failed:($sf|tonumber), degraded:$d}' \
+    ok "" '{file:$f, created:($c|tonumber), started:($s|tonumber), skipped:($k|tonumber), errors:($e|tonumber), asleep:$a, skills_failed:($sf|tonumber), degraded:$d, no_channel:$nc}' \
       --arg f "$file" --arg c "$created" --arg s "$started" --arg k "$skipped" --arg e "$errors" \
       --argjson a "$(printf '%s\n' "${_asleep[@]+"${_asleep[@]}"}" | jq -R . | jq -sc 'map(select(length>0))')" \
       --arg sf "${#_degraded[@]}" \
-      --argjson d "$(printf '%s\n' "${_degraded[@]+"${_degraded[@]}"}" | jq -R 'select(length>0) | split(" ") | {agent:.[0], skill:.[1]}' | jq -sc .)"
+      --argjson d "$(printf '%s\n' "${_degraded[@]+"${_degraded[@]}"}" | jq -R 'select(length>0) | split(" ") | {agent:.[0], skill:.[1]}' | jq -sc .)" \
+      --argjson nc "$(printf '%s\n' $_no_channel_names | jq -R . | jq -sc 'map(select(length>0))')"
   else
     echo "OK — applied $file: created=$created started=$started skipped=$skipped errors=$errors asleep=${#_asleep[@]} skills_failed=${#_degraded[@]}"
     if (( ${#_asleep[@]} > 0 )); then
@@ -518,6 +597,16 @@ HELP
         echo "     sudo 5dive agent skill ${_n%% *} add --skill=${_n##* }"
       done
       echo "   (if a skill is missing from its source repo, the spec is wrong — not your box)"
+    fi
+    # DIVE-3994: ONE line for the agents that came up without a channel because
+    # their optional bot token was not set, and the exact command to add one.
+    # Same "say it last" reason as the two blocks above.
+    if [[ -n "$_no_channel_names" ]]; then
+      echo ""
+      echo "── agent(s) created WITHOUT a channel (no bot token was set): $_no_channel_names"
+      for _n in $_no_channel_names; do
+        echo "     sudo 5dive agent config $_n set telegram.token=<bot-token> && sudo 5dive agent config $_n set channels=telegram"
+      done
     fi
   fi
   (( errors == 0 )) || return "$E_GENERIC"
@@ -665,6 +754,18 @@ _team_templates_dir() {
 # 5dive team import <slug|path> — resolve a curated/bundled template (or a path)
 # and bring the whole org up via the existing compose engine. A thin, honest
 # wrapper over `up`: the heavy lifting (idempotent create + v2 wiring) is shared.
+#
+# DIVE-3994 — this verb is now reachable from the DASHBOARD (the API exec
+# allowlist gates `team` to exactly `import`), so it must work with no shell
+# behind it:
+#   * no env var is required — an unset optional bot token lands the role
+#     channel-less instead of killing the import (see _compose_parse),
+#   * --telegram-token= supplies the ONE optional company channel (the lead's)
+#     without the caller exporting anything. `-` reads it from stdin, which is
+#     the form the browser path is forced to use so a bot token never enters
+#     argv (and thus never reaches shelld's audit log or /proc/<pid>/cmdline) —
+#     same rule as `agent cos set --token=-` and `--api-key=-`,
+#   * --type= picks the harness for the whole roster.
 cmd_team() {
   local sub="${1:-}"; shift || true
   case "$sub" in
@@ -681,20 +782,31 @@ cmd_team() {
       return 0 ;;
     -h|--help|"" )
       cat >&2 <<HELP
-usage: 5dive team import <slug|path> [--auth-profile=<name>]
+usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
+                                   [--telegram-token=<bot-token>|-]
        5dive team ls
   Provision a whole company-structure template in one call (wraps 5dive up).
   <slug> resolves to a bundled template; a path is used as-is.
+  --type=<harness>          run the whole roster on one runtime (default: the
+                            template's own, which is claude).
+  --telegram-token=<tok>    optional bot token for the company LEAD, the single
+                            point of contact with you. `-` reads it from stdin.
+                            Omit it and the whole company comes up channel-less
+                            — that is a supported path, not an error.
 HELP
       return 0 ;;
     *) fail "$E_USAGE" "unknown team subcommand: $sub (try: import, ls)" ;;
   esac
 
-  local ref="" profile=""
+  local ref="" profile="" type_override="" tg_token="" tg_token_set=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --auth-profile=*) profile="${1#--auth-profile=}" ;;
       --auth-profile)   profile="$2"; shift ;;
+      --type=*)         type_override="${1#--type=}" ;;
+      --type)           type_override="$2"; shift ;;
+      --telegram-token=*) tg_token="${1#--telegram-token=}"; tg_token_set=1 ;;
+      --telegram-token)   tg_token="$2"; tg_token_set=1; shift ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *)  [[ -z "$ref" ]] && ref="$1" || fail "$E_USAGE" "extra arg: $1" ;;
     esac
@@ -715,8 +827,22 @@ HELP
 
   # --auth-profile overrides the template's ${TEAM_AUTH_PROFILE} default.
   [[ -n "$profile" ]] && export TEAM_AUTH_PROFILE="$profile"
+
+  # The lead's optional channel. Curated templates read it as ${TEAM_TG_TOKEN}
+  # — ONE token for the whole company (a customer talks to the lead; the rest of
+  # the roster is reachable in the dashboard and via `5dive agent send`).
+  # `-` = read from stdin so the secret never enters argv.
+  if (( tg_token_set )); then
+    if [[ "$tg_token" == "-" ]]; then
+      IFS= read -r tg_token || true
+    fi
+    [[ -n "$tg_token" ]] && export TEAM_TG_TOKEN="$tg_token"
+  fi
+
   step "importing team from $file"
-  cmd_compose_up -f "$file"
+  local -a upargs=(-f "$file")
+  [[ -n "$type_override" ]] && upargs+=("--type=$type_override")
+  cmd_compose_up "${upargs[@]}"
 }
 
 cmd_compose_ps() {
