@@ -656,6 +656,41 @@ _task_verify_unwakeable() {
   [[ "$_rc" == "1" ]]
 }
 
+# DIVE-3995 (iteration 2): does this chart NAME a dedicated QA rail AT ALL?
+#
+# This is the arming question for the org-root deferral, and it is deliberately
+# NOT "did _task_resolve_qa hand us a usable seat". Iteration 1 armed on the
+# latter and shipped a guard that could never fire: _task_resolve_qa already
+# guarantees its answer is distinct from the maker and not excluded, so whenever
+# a usable QA seat existed it won at its own rung and the root was never a
+# candidate — the deferral, and the last-resort re-offer under it, executed zero
+# times against the whole live chart (measured by ops on the reject).
+#
+# The states where the root ACTUALLY receives a code row are exactly the ones
+# where _task_resolve_qa returns nothing while the chart still has a QA rail:
+# the QA seat is asleep (DIVE-3939 wakeability), or IS the maker, or is
+# excluded, or is ambiguous. In every one of those the answer to "should the CEO
+# grade this code" is still no. So the deferral must arm on the EXISTENCE of a
+# QA rail, not on a successful pick from it.
+#
+# The body's carve-out is preserved exactly as written and no wider: an org with
+# NO QA seat named anywhere keeps the root as its grader. An org that named one
+# and cannot reach it today falls through to `verifyUnavailable`, which the body
+# calls the designed honest outcome — a row labelled "no independent verifier
+# available" is recoverable; a code row silently graded by the CEO is the defect.
+#
+# Uses the WIDE role||title predicate on purpose. _task_resolve_qa's two-pass
+# narrowing exists to pick ONE seat unambiguously; this function only asks
+# whether the rail exists, so a QA seat marked in the title alone still counts,
+# and so do two of them. The root itself is excluded: a chart whose only
+# QA-marked seat IS the root has no dedicated rail to defer to.
+_task_org_has_qa_seat() {
+  local _root="${1:-}" _pred _hit
+  _pred="$(_task_qa_kw_clause "COALESCE(role,'')||' '||COALESCE(title,'')")"
+  _hit=$(db "SELECT 1 FROM agents_org WHERE ${_pred} AND name <> $(sqlq "$_root") LIMIT 1;" 2>/dev/null)
+  [[ -n "$_hit" ]]
+}
+
 # DIVE-3995: WHICH LANE is this row in? Content/GTM rows are the CEO-appropriate
 # grading set (lodar, 2026-09-06: "maybe just marketing verification for olivia.
 # idk how olivia can verify code"), so the org-root deferral below must not fire
@@ -714,9 +749,10 @@ _task_default_verifier() {
   # instead of an early one.
   #
   # Two conditions gate the deferral, and both must hold:
-  #   * a dedicated QA seat is actually reachable (named, distinct from the root,
-  #     and wakeable) — "route code to the QA seats" is only an improvement when
-  #     there ARE QA seats; and
+  #   * the chart NAMES a dedicated QA rail distinct from the root
+  #     (_task_org_has_qa_seat — see the note on that function for why this is
+  #     existence and not a successful pick; arming on the pick is what made
+  #     iteration 1 unreachable); and
   #   * the row is not in the content/GTM lane, which is the grading set the CEO
   #     seat is explicitly being GIVEN.
   #
@@ -729,9 +765,7 @@ _task_default_verifier() {
   # read ONCE into a variable and used in both directions below.
   local _content_lane="" _defer_root=""
   _task_verify_content_lane "$_assignee" && _content_lane=1
-  if [[ -n "$_root" && -n "$_qa" && "$_qa" != "$_root" ]] \
-     && ! _task_verify_unwakeable "$_qa" \
-     && [[ -z "$_content_lane" ]]; then
+  if [[ -n "$_root" && -z "$_content_lane" ]] && _task_org_has_qa_seat "$_root"; then
     _defer_root=1
   fi
   # On the content lane the root goes to the FRONT of the chain. It is prepended
@@ -757,14 +791,15 @@ _task_default_verifier() {
       printf '%s' "$c"; return
     fi
   done
-  # DIVE-3995: the deferred root, re-offered as the last resort. This is the
-  # negative-control arm — an org with NO QA seat never sets _defer_root at all
-  # and so never reaches here; an org that HAS one but whose whole chain is
-  # unwakeable still gets a grader rather than `verifyUnavailable`.
-  if [[ -n "$_defer_root" && "$_root" != "$_assignee" ]] \
-     && ! _task_verify_excluded "$_root" && ! _task_verify_unwakeable "$_root"; then
-    printf '%s' "$_root"; return
-  fi
+  # DIVE-3995 (iteration 2): there is NO last-resort re-offer of the deferred
+  # root, and its absence is the change. An org with no QA rail never arms the
+  # deferral, so the root is an ordinary candidate at its own rung and that
+  # one-lead case is untouched. An org that HAS a QA rail it cannot reach today
+  # ends here, at EMPTY — deliberately, per the row body: falling through to
+  # `verifyUnavailable` is the designed honest outcome, not a harm to route
+  # around, and re-offering the root would hand the CEO seat exactly the code row
+  # this change exists to keep off it. Iteration 1 shipped that re-offer and it
+  # fired zero times besides.
   # Falls through to EMPTY when the whole chain is unwakeable, on purpose. The
   # caller's existing INST-2 `verifyUnavailable` path then labels the row
   # honestly ("no independent verifier available"). It must NOT fall back to the

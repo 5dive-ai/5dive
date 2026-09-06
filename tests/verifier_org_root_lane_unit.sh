@@ -31,9 +31,13 @@
 #   A4  a content/GTM row DOES get the root — that is the grading set the CEO
 #       seat is being given, not a leak
 #   A5  the content-lane test is TRANSITIVE (a seat two levels under marketing)
-#   A6  a QA seat that is UNWAKEABLE does not arm the deferral — the root stays
-#       available rather than the row losing its grader
-#   A7  a reports_to CYCLE in the lane walk terminates (the chart is
+#   B1  a QA seat that is asleep does NOT hand the code row to the root (the
+#       state iteration 1 asserted as intended and ops rejected)
+#   B2  ...and when the rest of the chain is asleep too the picker ends EMPTY
+#       (verifyUnavailable), never at the root
+#   B3  the QA seat being the MAKER does not hand the row to the root either
+#   B4  nor does the QA seat being EXCLUDED
+#   B5  ...while a CONTENT row with the same asleep QA seat still gets the root
 #       agent-writable) and does not hang the picker
 #   A8  the picker NEVER returns the assignee, on every arm above
 #
@@ -188,22 +192,84 @@ _task_verify_content_lane coder \
   && bad_t "A5c: the lane test says an engineering seat is content" "coder read as content lane — A1/A4 cannot both be meaningful" \
   || ok_t "A5c: an engineering seat does NOT read as the content lane (the discriminator discriminates)"
 
-# ---- A6: an UNWAKEABLE QA seat must not arm the deferral --------------------
-# "a QA seat exists" is not the condition — "a QA seat we can actually hand to"
-# is. A registered-but-never-woken QA seat would otherwise defer the root and
-# leave the row with a grader nothing wakes, or none at all.
+# ---- B1..B5: THE STATES WHERE THE ROOT ACTUALLY GETS A CODE ROW -------------
+# These are the arms iteration 1 did not have, and their absence is what ops
+# rejected: neutering the deferral alone left that suite at 12/12 green, because
+# every arm it did have was decided at the QA rung, which behaves identically
+# with and without the change. Each arm below reaches the root's rung with the
+# QA rung declining, which is the only way the CEO seat ever sees a code row —
+# and each one is RED against unmodified origin/main routing.sh.
+
+# ---- B1: the QA seat is registered but never woken --------------------------
 db "DELETE FROM agents_org WHERE name='grader';"
 org_seed sleepyqa --role="Verifier / QA" --reports-to=sre
 _task_doctor_lane_wakeable sleepyqa; rc_sleepy=$?
 [[ "$rc_sleepy" == "1" ]] \
-  && ok_t "A6 CONTROL: the fixture really does make the QA seat unwakeable (rc 1)" \
-  || bad_t "A6 CONTROL: fixture wakeability" "sleepyqa rc=$rc_sleepy (want 1)"
+  && ok_t "B1 CONTROL: the fixture really does make the QA seat unwakeable (rc 1)" \
+  || bad_t "B1 CONTROL: fixture wakeability" "sleepyqa rc=$rc_sleepy (want 1)"
 got=$(_task_default_verifier coder "" 2>/dev/null)
-if [[ -n "$got" && "$got" != "sleepyqa" ]]; then
-  ok_t "A6: an UNWAKEABLE QA seat does not arm the deferral — the row still gets a live grader rather than a dead one or none"
+if [[ -n "$got" && "$got" != "$root" && "$got" != coder ]]; then
+  ok_t "B1: with the QA seat ASLEEP an engineering row still does not land on the root — it takes a live grader further down the chain ('$got')"
 else
-  bad_t "A6: unwakeable QA seat armed the deferral" "picked '${got:-<empty>}'"
+  bad_t "B1: an asleep QA seat handed the code row to the root" "picked '${got:-<empty>}' (root='$root'; the chart conflating 'no QA seat' with 'the QA seat is asleep' is the rejected shape)"
 fi
+
+# ---- B2: ...and the chain below it is asleep too -> EMPTY, not the root ------
+# The org NAMED a QA rail and cannot reach any of it. `verifyUnavailable` is the
+# designed outcome here; the root is not a consolation prize. The manager and
+# the deputy rung (which resolves to cto on this chart) are put to sleep too, so
+# the chain genuinely runs out — otherwise this arm grades the deputy rung, not
+# the root's absence from the tail.
+cat > "$STATE_DIR/agents.json" <<'JSON'
+{"agents":{
+  "ceo":     {"type":"claude","heartbeat":{"enabled":true}},
+  "coder":   {"type":"claude","heartbeat":{"enabled":true}},
+  "cmo":     {"type":"claude","heartbeat":{"enabled":true}},
+  "writer":  {"type":"claude","heartbeat":{"enabled":true}},
+  "artist":  {"type":"claude","heartbeat":{"enabled":true}},
+  "cto":     {"type":"claude"},
+  "sre":     {"type":"claude"},
+  "sleepyqa":{"type":"claude"}
+}}
+JSON
+reroster
+got=$(_task_default_verifier coder "" 2>/dev/null)
+if [[ -z "$got" ]]; then
+  ok_t "B2: a named-but-unreachable QA rail ends at EMPTY (verifyUnavailable), not at the root — the honest label, not a code row on the CEO seat"
+else
+  bad_t "B2: the picker fell back to a grader instead of verifyUnavailable" "picked '$got' (root='$root'; want EMPTY)"
+fi
+mk_registry
+build_chart
+
+# ---- B3: the QA seat IS the maker -------------------------------------------
+# _task_resolve_qa excludes the maker by SQL, so a row filed by the only QA seat
+# reaches the root's rung with no QA candidate at all.
+got=$(_task_default_verifier grader "" 2>/dev/null)
+if [[ -n "$got" && "$got" != "$root" && "$got" != grader ]]; then
+  ok_t "B3: a row made BY the QA seat is not graded by the root either ('$got')"
+else
+  bad_t "B3: the QA seat's own row landed on the root" "picked '${got:-<empty>}' (root='$root')"
+fi
+
+# ---- B4: the QA seat is EXCLUDED --------------------------------------------
+# The documented data lever must not read as "then give it to the CEO".
+FIVE_VERIFY_EXCLUDE=grader
+got=$(_task_default_verifier coder "" 2>/dev/null)
+unset FIVE_VERIFY_EXCLUDE
+if [[ -n "$got" && "$got" != "$root" && "$got" != coder ]]; then
+  ok_t "B4: excluding the QA seat does not promote the root onto code rows ('$got')"
+else
+  bad_t "B4: excluding the QA seat handed the row to the root" "picked '${got:-<empty>}' (root='$root')"
+fi
+
+# ---- B5: the widened arming did NOT steal the content lane ------------------
+db "DELETE FROM agents_org WHERE name='grader';"
+org_seed sleepyqa --role="Verifier / QA" --reports-to=sre
+got=$(_task_default_verifier writer "" 2>/dev/null)
+[[ "$got" == "$root" ]] \
+  && ok_t "B5: a CONTENT row with the same asleep QA seat still routes to the root — the deferral widened without touching the lane the CEO seat is given" \
+  || bad_t "B5: content lane lost the root once the arming widened" "picked '${got:-<empty>}' (want root='$root')"
 build_chart
 
 # ---- A7: a reports_to cycle terminates --------------------------------------
