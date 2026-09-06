@@ -458,6 +458,16 @@ _gate_redact_branch_refs() {
 # whole-field test needs no window arithmetic, cannot match across a seam
 # (_gate_floor_axis already evaluates ask and title separately), and floors
 # STRICTLY MORE than any window over the same list would.
+#
+# RESIDUAL, named so the next reader does not rediscover it as a surprise (dev3,
+# DIVE-4001 iteration 1): a genuinely spend-shaped ask worded with the BARE noun
+# and none of the signals above goes clean — "sign off on the new price", "set
+# the price for the launch", "should we accept their price?". That is exactly the
+# trade this row's correction specified (a spend signal in the field, not the bare
+# noun), and it is bounded by the companion change: `price` is now APPEALABLE, not
+# lowered — the floor still fires on every listed signal, and a missed one lands a
+# tier-1 gate at a routed seat rather than nothing at all. Widen the list here if a
+# real spend is ever measured slipping; do not widen it on a hypothetical.
 _GATE_PRICE_SPEND_SIGNAL_RX='\$[0-9]|€[0-9]|£[0-9]|[0-9] ?(usd|eur|gbp|dollar|euro|cent)|pay|paid|buy|bought|purchas|charg|bill|invoic|spend|spent|refund|subscri|budget|revenue|monetiz|checkout|quote|discount|upgrade|downgrade|rais|lower|increas|decreas|hike|cost|tariff|fee|plan|tier|seat|sku|deal|margin|vendor|supplier|contract|customer|enterprise'
 # _gate_redact_bare_price <lowercased text>: blank out `price`/`pricing` when the
 # field carries no spend signal. Same shape as DIVE-2629's branch-ref redaction —
