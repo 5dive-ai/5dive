@@ -158,20 +158,76 @@ leftover=$(grep -l '_TG_TOKEN' "$TPL"/*.5dive.yaml 2>/dev/null | xargs -r grep -
   && ok_t 'T7 no template references a per-role *_TG_TOKEN — one optional var for a whole company' \
   || bad_t 'T7 a per-role token var survives, so that template still needs five bots' "$leftover"
 
-# --- T8 --type applies to the WHOLE roster (source-level, see header) --------
-# cmd_compose_up creates agents, so the override is graded by running its jq
-# expression, which is the whole of the behaviour.
-expr_out=$(jq -c --arg t codex '.agents |= with_entries(.value.type = $t)' <<<"$out3" 2>/dev/null \
-  | jq -r '[.agents[].type] | unique | join(",")')
-[[ "$expr_out" == "codex" ]] \
-  && ok_t 'T8a the --type override rewrites every role, not the first one' \
-  || bad_t 'T8a --type left a mixed roster' "types=$expr_out"
-grep -q 'is_known_type "$type_override"' "$SRC" \
-  && ok_t 'T8b --type is validated BEFORE any agent is created (a half-imported company is worse than a refusal)' \
-  || bad_t 'T8b an unknown harness would be discovered by the first failing create' ''
-[[ "$(jq -r '[.agents[].type] | unique | join(",")' <<<"$out3")" == "claude" ]] \
-  && ok_t 'T8c NEGATIVE CONTROL with no --type every role is still claude, as the template declares' \
-  || bad_t 'T8c the declared default moved' ''
+# --- T8 `channels` is a comma LIST, and only the dropped channel comes out ----
+# The review defect (quinn, iteration 1): `channels` was matched as a single
+# value, so `telegram,dashboard` with an unset token kept BOTH channels and the
+# report stayed empty — an agent created with a channel it has no credential
+# for, silently. `agent create` takes `--channels=<a,b,...>`, and `team import`
+# takes a PATH as well as a slug, so a customer's own multi-channel spec reaches
+# this. Our four bundled templates are all single-valued, which is exactly why
+# T1-T7 above cannot fail on it.
+cat > "$TMP/multi.yaml" <<'YML'
+version: "2"
+agents:
+  both:
+    type: claude
+    channels: "telegram,dashboard"
+    telegram_token: "${UNSET_ONE}"
+  everything:
+    type: claude
+    channels: "telegram, discord ,dashboard"
+    telegram_token: "${UNSET_TWO}"
+    discord_token: "${UNSET_THREE}"
+  onlybad:
+    type: claude
+    channels: "telegram,discord"
+    telegram_token: "${UNSET_FOUR}"
+    discord_token: "${UNSET_FIVE}"
+  untouched:
+    type: claude
+    channels: "dashboard,buzz"
+    telegram_token: "${UNSET_SIX}"
+  casey:
+    type: claude
+    channels: "Telegram,dashboard"
+    telegram_token: "${UNSET_SEVEN}"
+YML
+out8=$(parse "$TMP/multi.yaml"); rc8=$?
+if (( rc8 == 0 )); then
+  b_c=$(jq -r '.agents.both.channels' <<<"$out8")
+  b_t=$(jq -r '.agents.both.telegram_token // "ABSENT"' <<<"$out8")
+  [[ "$b_c" == "dashboard" && "$b_t" == "ABSENT" ]] \
+    && ok_t 'T8a telegram is removed from "telegram,dashboard" and dashboard is KEPT — not left half-wired, not flattened to none' \
+    || bad_t 'T8a a multi-channel agent kept a channel it has no credential for (or lost one it did not need to)' "channels=$b_c token=$b_t"
+
+  b_rep=$(jq -r '[.channels_dropped[]? | select(.agent=="both" and .channel=="telegram" and .var=="UNSET_ONE")] | length' <<<"$out8")
+  [[ "$b_rep" == "1" ]] \
+    && ok_t 'T8b the multi-channel drop is REPORTED, so the summary line names it — the half-wiring was silent before' \
+    || bad_t 'T8b nothing was appended to channels_dropped, so no summary line ever mentions it' "entries=$b_rep"
+
+  e_c=$(jq -r '.agents.everything.channels' <<<"$out8")
+  e_rep=$(jq -r '[.channels_dropped[]? | select(.agent=="everything")] | length' <<<"$out8")
+  [[ "$e_c" == "dashboard" && "$e_rep" == "2" ]] \
+    && ok_t 'T8c TWO unset optional creds remove exactly their own two channels (whitespace tolerated) and report twice' \
+    || bad_t 'T8c the second dropped token did not take its channel out of the list' "channels=$e_c entries=$e_rep"
+
+  o_c=$(jq -r '.agents.onlybad.channels' <<<"$out8")
+  [[ "$o_c" == "none" ]] \
+    && ok_t 'T8d a list that empties out becomes "none", never the empty string agent create would reject' \
+    || bad_t 'T8d an emptied channels list is not the literal none' "channels=$o_c"
+
+  u_c=$(jq -r '.agents.untouched.channels' <<<"$out8")
+  u_rep=$(jq -r '[.channels_dropped[]? | select(.agent=="untouched")] | length' <<<"$out8")
+  [[ "$u_c" == "dashboard,buzz" && "$u_rep" == "0" ]] \
+    && ok_t 'T8e NEGATIVE CONTROL an agent whose list never named that channel keeps it verbatim and is not reported' \
+    || bad_t 'T8e an unrelated channel list was rewritten, or a non-drop was reported' "channels=$u_c entries=$u_rep"
+  c_c=$(jq -r '.agents.casey.channels' <<<"$out8")
+  [[ "$c_c" == "dashboard" ]] \
+    && ok_t 'T8f the match is case-insensitive, as the single-value match it replaced already was — "Telegram" is still telegram' \
+    || bad_t 'T8f a differently-cased channel name survived with no token' "channels=$c_c"
+else
+  bad_t 'T8 a multi-channel spec with unset optional creds failed to parse' "rc=$rc8 $(head -2 "$TMP/err")"
+fi
 
 # --- T9 the browser path never puts a bot token in argv ----------------------
 grep -q 'tg_token" == "-"' "$SRC" \

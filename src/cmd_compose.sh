@@ -157,6 +157,24 @@ def expand(v, optional=False):
     if isinstance(v, list): return [expand(x, optional) for x in v]
     return v
 
+def drop_channel(spec, chan):
+    """Remove ONE channel from `channels`, which is a comma LIST.
+
+    `channels` is passed straight through to `agent create --channels=`, which
+    accepts `<none|telegram|discord|dashboard|buzz[,ch...]>`. Matching it as a
+    single value left `telegram,dashboard` untouched when the telegram token was
+    dropped — the agent was created with a channel it has no credential for,
+    which is the exact half-wired state this change exists to prevent, and it
+    was silent because nothing was appended to the report either. Returns True
+    when this agent actually had that channel, so only a real drop is reported.
+    """
+    parts = [c.strip() for c in str(spec.get("channels") or "").split(",")]
+    parts = [c for c in parts if c]
+    kept = [c for c in parts if c.lower() != chan]
+    if len(kept) == len(parts): return False
+    spec["channels"] = ",".join(kept) if kept else "none"
+    return True
+
 def drop_unset_creds(spec, name, dropped):
     """Expand only the optional credential fields; drop what is unset."""
     if not isinstance(spec, dict): return
@@ -166,10 +184,8 @@ def drop_unset_creds(spec, name, dropped):
             spec[field] = expand(spec[field], optional=True)
         except _UnsetVar as u:
             del spec[field]
-            if str(spec.get("channels") or "").strip().lower() == chan:
-                spec["channels"] = "none"
-                if name is not None:
-                    dropped.append({"agent": name, "channel": chan, "var": u.var})
+            if drop_channel(spec, chan) and name is not None:
+                dropped.append({"agent": name, "channel": chan, "var": u.var})
 
 dropped = []
 for _name, _m in data["agents"].items():
@@ -405,24 +421,17 @@ _compose_wire_role() {
 _compose_self() { realpath "${BASH_SOURCE[0]}"; }
 
 cmd_compose_up() {
-  local file="" type_override=""
+  local file=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -f|--file)    file="$2"; shift ;;
       --file=*)     file="${1#--file=}" ;;
-      # DIVE-3994: one harness for the whole roster, overriding whatever the
-      # spec declares. The spec's own `type:` stays the declared default, so
-      # omitting this flag is byte-identical to the previous behaviour.
-      --type)       type_override="$2"; shift ;;
-      --type=*)     type_override="${1#--type=}" ;;
       -h|--help)
         cat >&2 <<HELP
-usage: 5dive up [-f file] [--type=<harness>]
+usage: 5dive up [-f file]
   Bring up agents declared in 5dive.yaml. Idempotent — existing agents are
   left alone, missing ones are created and started.
   Default file: 5dive.yaml or 5dive.yml in the current directory.
-  --type=<harness>  run the WHOLE roster on this runtime (${!TYPE_BIN[*]}),
-                    overriding the spec's own type:.
 HELP
         return 0 ;;
       *) fail "$E_USAGE" "unknown flag: $1" ;;
@@ -440,16 +449,6 @@ HELP
   spec=$(_compose_parse "$file") || fail "$E_VALIDATION" "spec parse failed"
   spec_dir=$(realpath "$(dirname "$file")")
   self=$(_compose_self)
-
-  # DIVE-3994: validate the override HERE, before a single agent is created —
-  # `agent create` would reject it too, but only after the first N roles are
-  # already up, which is a half-imported company.
-  if [[ -n "$type_override" ]]; then
-    is_known_type "$type_override" \
-      || fail "$E_VALIDATION" "unknown harness type: $type_override (known: ${!TYPE_BIN[*]})"
-    spec=$(jq -c --arg t "$type_override" '.agents |= with_entries(.value.type = $t)' <<<"$spec") \
-      || fail "$E_GENERIC" "could not apply --type=$type_override"
-  fi
 
   local reg
   reg=$(registry_read)
@@ -764,8 +763,7 @@ _team_templates_dir() {
 #     without the caller exporting anything. `-` reads it from stdin, which is
 #     the form the browser path is forced to use so a bot token never enters
 #     argv (and thus never reaches shelld's audit log or /proc/<pid>/cmdline) —
-#     same rule as `agent cos set --token=-` and `--api-key=-`,
-#   * --type= picks the harness for the whole roster.
+#     same rule as `agent cos set --token=-` and `--api-key=-`.
 cmd_team() {
   local sub="${1:-}"; shift || true
   case "$sub" in
@@ -782,13 +780,11 @@ cmd_team() {
       return 0 ;;
     -h|--help|"" )
       cat >&2 <<HELP
-usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
+usage: 5dive team import <slug|path> [--auth-profile=<name>]
                                    [--telegram-token=<bot-token>|-]
        5dive team ls
   Provision a whole company-structure template in one call (wraps 5dive up).
   <slug> resolves to a bundled template; a path is used as-is.
-  --type=<harness>          run the whole roster on one runtime (default: the
-                            template's own, which is claude).
   --telegram-token=<tok>    optional bot token for the company LEAD, the single
                             point of contact with you. `-` reads it from stdin.
                             Omit it and the whole company comes up channel-less
@@ -798,13 +794,11 @@ HELP
     *) fail "$E_USAGE" "unknown team subcommand: $sub (try: import, ls)" ;;
   esac
 
-  local ref="" profile="" type_override="" tg_token="" tg_token_set=0
+  local ref="" profile="" tg_token="" tg_token_set=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --auth-profile=*) profile="${1#--auth-profile=}" ;;
       --auth-profile)   profile="$2"; shift ;;
-      --type=*)         type_override="${1#--type=}" ;;
-      --type)           type_override="$2"; shift ;;
       --telegram-token=*) tg_token="${1#--telegram-token=}"; tg_token_set=1 ;;
       --telegram-token)   tg_token="$2"; tg_token_set=1; shift ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
@@ -840,9 +834,7 @@ HELP
   fi
 
   step "importing team from $file"
-  local -a upargs=(-f "$file")
-  [[ -n "$type_override" ]] && upargs+=("--type=$type_override")
-  cmd_compose_up "${upargs[@]}"
+  cmd_compose_up -f "$file"
 }
 
 cmd_compose_ps() {
