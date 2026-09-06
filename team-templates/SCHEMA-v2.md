@@ -61,8 +61,12 @@ agents:
 
 ## New CLI surface
 - `5dive up -f team.yaml` — unchanged entry point; parser learns v2 keys.
-- `5dive team import <slug|path> [--prefix=<p>] [--auth-profile=<name>]` — resolve a
-  bundled/registry template, optional name-prefix to run multiple orgs on one host, run `up`.
+- `5dive team import <slug|path> [--prefix=<p>] [--auth-profile=<name>] [--type=<harness>]` —
+  resolve a bundled/registry template, optional name-prefix to run multiple orgs on one host,
+  run `up`. `--type=` (DIVE-3998) overrides `defaults.type` and every per-agent `type:` for the
+  whole roster, and is validated against the box's known harnesses before anything is
+  provisioned. Claude-only `model`/`effort` pins are dropped (and reported) when the target
+  harness is not claude.
 - `5dive export [-o team.yaml]` — NEW. Dump the live fleet (from the registry + each
   agent's config/instructions/reports) back to a v2 spec, so a running org can be saved,
   versioned, and forked into a template. Closes the "exportable" round-trip.
