@@ -817,21 +817,35 @@ cmd_team() {
 }
 
 cmd_compose_ps() {
-  local file=""
+  local file="" type_override=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -f|--file)    file="$2"; shift ;;
       --file=*)     file="${1#--file=}" ;;
+      --type=*)     type_override="${1#--type=}" ;;
+      --type)       type_override="$2"; shift ;;
       -h|--help)
         cat >&2 <<HELP
-usage: 5dive ps [-f file]
+usage: 5dive ps [-f file] [--type=<harness>]
   Show status of agents declared in 5dive.yaml.
+
+  --type=<harness>  Read the spec as `up --type=<harness>` would. Pass the same
+                    flag you brought the roster up with, or the 'type' column
+                    reports the spec's harness for agents created on another.
 HELP
         return 0 ;;
       *) fail "$E_USAGE" "unknown flag: $1" ;;
     esac
     shift
   done
+  # DIVE-3998: `ps` reports the DECLARED type straight out of the spec. Without
+  # this the column contradicts a roster brought up with `up --type=` — it would
+  # say claude for agents that are codex, which is drift reported where there is
+  # none. Same guard as `up`: an unknown harness is a usage error, not a column.
+  if [[ -n "$type_override" ]]; then
+    is_known_type "$type_override" \
+      || fail "$E_NOT_FOUND" "unknown --type: $type_override (known: ${!TYPE_BIN[*]})"
+  fi
   if [[ -z "$file" ]]; then
     file=$(_compose_default_file) \
       || fail "$E_NOT_FOUND" "no 5dive.yaml or 5dive.yml in $(pwd) — pass -f <file>"
@@ -841,6 +855,10 @@ HELP
 
   local spec
   spec=$(_compose_parse "$file") || fail "$E_VALIDATION" "spec parse failed"
+  if [[ -n "$type_override" ]]; then
+    spec=$(_compose_apply_type_override "$spec" "$type_override") \
+      || fail "$E_VALIDATION" "could not apply --type=$type_override to the spec"
+  fi
   local reg
   reg=$(registry_read)
 

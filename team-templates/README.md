@@ -37,6 +37,9 @@ knowing before you use it:
   claude, and the agents they were dropped from are named in the output. Set a
   model afterwards with `5dive agent config <name> set model=<id>`.
 
+Pass the same flag to `5dive ps -f <spec> --type=<harness>` — it reports the harness the spec
+declares, so without it the status view would call a codex roster "claude".
+
 Omit the flag and behaviour is exactly as before.
 
 ## Templates

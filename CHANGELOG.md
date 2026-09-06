@@ -28,12 +28,15 @@ long accepted every harness in `TYPE_BIN` and per-agent `type:` was already read
   and a real codex / `vendor/model` BYO string passes through untouched.
 - **An unknown harness is rejected before anything is provisioned.** Left to `agent create`,
   a typo fails once per agent, halfway through a partly-created roster.
+- **`5dive ps` takes the same flag**, because it reports the DECLARED type straight out of the
+  spec: without it the one command whose job is to compare declared against real would say
+  claude for a roster brought up as codex — drift reported where there is none.
 - `5dive team import --help` now prints usage instead of `unknown flag: --help` — the flag it
   documents lives on that command, so the help had to be reachable from it.
 
-`tests/team_import_type_override_unit.sh` (27 arms) drives the transform, both argv builders,
-and — through a recorder swapped in at `_compose_self` — `cmd_compose_up` and `cmd_team`
-themselves, each with a no-flag negative control. The wiring arms are not decoration: a
+`tests/team_import_type_override_unit.sh` (30 arms) drives the transform, both argv builders,
+`cmd_compose_ps`, and — through a recorder swapped in at `_compose_self` — `cmd_compose_up`
+and `cmd_team` themselves, each with a no-flag negative control. The wiring arms are not decoration: a
 mutation that parses `--type` and never applies it survived every transform-level arm.
 
 ## Unreleased — fix(memory): the exit code cannot tell a broken checker from a false fact (DIVE-3909)

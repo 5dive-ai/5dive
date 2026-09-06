@@ -269,5 +269,27 @@ else
   bad_t 'T11c team import accepted an unknown harness' "$OUT"
 fi
 
+# --- T12 `ps` reads the spec the same way, or it invents drift -----------------
+# `ps` reports the DECLARED type straight out of the spec. Left alone it would
+# say claude for a roster brought up as codex — drift reported where there is
+# none, on the one command whose whole job is to compare declared against real.
+ensure_state_ro() { :; }
+JSON_MODE=1
+PS_OVR="$(cmd_compose_ps -f "$TMP/two.yaml" --type=codex 2>/dev/null)"
+PS_BASE="$(cmd_compose_ps -f "$TMP/two.yaml" 2>/dev/null)"
+eq_t 'T12 ps --type=codex reports the roster as codex' \
+     'codex codex' \
+     "$(jq -r '[.. | objects | select(has("name") and has("type")) | .type] | join(" ")' <<<"$PS_OVR" 2>/dev/null)"
+eq_t 'T12b NEGATIVE CONTROL: ps with no flag still reports the spec (claude)' \
+     'claude claude' \
+     "$(jq -r '[.. | objects | select(has("name") and has("type")) | .type] | join(" ")' <<<"$PS_BASE" 2>/dev/null)"
+OUT="$( (cmd_compose_ps -f "$TMP/two.yaml" --type=definitely-not-a-harness) 2>&1 )"
+if grep -qi 'unknown --type' <<<"$OUT"; then
+  ok_t 'T12c ps rejects an unknown harness through the same guard as up'
+else
+  bad_t 'T12c ps accepted an unknown harness' "$OUT"
+fi
+JSON_MODE=0
+
 printf '\n%s\n' "team_import_type_override_unit: pass=$PASS fail=$FAIL"
 (( FAIL == 0 ))
