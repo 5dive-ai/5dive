@@ -25,6 +25,15 @@
 #       pack:           <slug>             # import a character pack instead of a
 #                                          # bare create — supplies persona+skills
 #                                          # +model/effort (5dive agent import)
+#       loops:                             # DIVE-4022 — recurring work this role owns
+#         - id: weekly-brief               #   stable key (a-z0-9-), the reconcile key
+#           title: "Ship the weekly brief" #   the recurring task's title
+#           cron: "0 9 * * 1"              #   5-field cron cadence
+#           prompt: |                      #   optional brief, folded into the body
+#             ...
+#           ceiling: 200000                #   optional advisory tokens/run
+#         - pack: ci-analyst               #   OR a marketplace loop pack, installed
+#           cron: "0 */4 * * *"            #   via `5dive loop install` (cron optional)
 #
 # Env vars: any "${VAR}" in a string value is expanded from the process env.
 # Missing/empty vars fail loudly so a misconfigured shell can't silently
@@ -73,6 +82,9 @@ KNOWN = {
     "type","channels","telegram_token","discord_token","workdir","skills",
     "no_skills","defer_auth","isolation","auth_profile","provider","api_key","base_url",
     "role","instructions","instructions_file","model","effort","reports_to","goals",
+    "loops", # DIVE-4022: recurring work this role owns. Same object `5dive loop
+             # install` creates (a kind='recurring' task template), declared from
+             # the spec instead of fetched from the marketplace registry.
     "pack",  # DIVE-536: import a character pack (5dive agent import <slug>) instead
              # of a bare create — the pack supplies persona+skills+model/effort.
 }
@@ -122,6 +134,63 @@ def visit(n, stack):
 for n in names:
     if colour[n] == WHITE:
         visit(n, [])
+
+# ---- loops: validation (DIVE-4022) ---------------------------------------
+# A `loops:` entry declares recurring work the role OWNS. Ownership is per-agent
+# because that is how `5dive loop install --onto=<agent>` already models it — no
+# second ownership model is introduced here.
+#
+# Two forms, and exactly one of them per entry:
+#   pack:  <slug>        -> installed via `5dive loop install <slug> --onto=<name>`,
+#                           which owns the registry fetch, the skill attach and the
+#                           recurring job. cron/ceiling optional overrides.
+#   id+title+cron        -> a recurring task template created directly, i.e. the
+#                           SAME object the pack path ends up creating.
+# Validated here (fail loudly at parse) rather than at provision time, because a
+# typo'd cadence discovered halfway through a roster leaves a half-provisioned
+# company — the same reason --type is validated before ensure_state.
+loop_id_re = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+def cron_ok(expr):
+    f = str(expr).split()
+    return len(f) == 5 and all(re.fullmatch(r"[0-9*,/-]+", x) for x in f)
+
+for name, m in merged.items():
+    loops = m.get("loops")
+    if loops is None or loops == "":
+        m.pop("loops", None)
+        continue
+    if not isinstance(loops, list):
+        print(f"error: agent '{name}': 'loops:' must be a list", file=sys.stderr); sys.exit(3)
+    seen = set()
+    for i, L in enumerate(loops):
+        where = f"agent '{name}' loop #{i+1}"
+        if not isinstance(L, dict):
+            print(f"error: {where}: each loop must be a map", file=sys.stderr); sys.exit(3)
+        for k in L:
+            if k not in ("id", "title", "cron", "prompt", "ceiling", "pack"):
+                print(f"warning: {where}: unknown loop key '{k}' (ignored)", file=sys.stderr)
+        pack, lid = L.get("pack"), L.get("id")
+        if pack and (L.get("title") or L.get("prompt")):
+            print(f"error: {where}: 'pack:' supplies its own job title and prompt — remove title/prompt", file=sys.stderr); sys.exit(3)
+        key = pack or lid
+        if not key:
+            print(f"error: {where}: needs either 'pack: <slug>' or 'id: <key>' + 'title:' + 'cron:'", file=sys.stderr); sys.exit(3)
+        if not loop_id_re.match(str(key)):
+            print(f"error: {where}: bad {'pack' if pack else 'id'} '{key}' (a-z 0-9 - only)", file=sys.stderr); sys.exit(3)
+        if key in seen:
+            print(f"error: {where}: duplicate loop key '{key}' on this agent", file=sys.stderr); sys.exit(3)
+        seen.add(key)
+        if not pack:
+            if not L.get("title"):
+                print(f"error: {where}: an inline loop needs 'title:'", file=sys.stderr); sys.exit(3)
+            if not L.get("cron"):
+                print(f"error: {where}: an inline loop needs 'cron:' (5-field, e.g. \"0 9 * * 1\")", file=sys.stderr); sys.exit(3)
+        # A pack carries its own cadence, so cron is optional there; when either
+        # form DOES name one it must be a real 5-field expression.
+        if L.get("cron") is not None and not cron_ok(L["cron"]):
+            print(f"error: {where}: bad cron '{L['cron']}' (need 5 fields of [0-9*,/-], e.g. \"0 9 * * 1\")", file=sys.stderr); sys.exit(3)
+        if L.get("ceiling") is not None and not re.fullmatch(r"[1-9][0-9]*", str(L["ceiling"])):
+            print(f"error: {where}: ceiling must be a positive integer (tokens)", file=sys.stderr); sys.exit(3)
 
 # ---- env expansion (DIVE-3994) -------------------------------------------
 # Any "${VAR}" in a string value is expanded from the process env, and an unset
@@ -424,6 +493,123 @@ _compose_wire_role() {
   done
 }
 
+# -------- DIVE-4022: declared loops --------
+#
+# `team import` provisioned a ROSTER, not a working company: agents, roles and
+# reporting lines came up with nothing recurring on the board, so an imported
+# team sat idle until someone hand-created the work. `loops:` closes that.
+#
+# It is NOT a second loop format. A loop here ends as the same object
+# `5dive loop install` produces — a kind='recurring' task template owned by one
+# agent, which the step-2 materializer clones on schedule. The `pack:` form does
+# not even reimplement that: it shells out to `loop install`, which owns the
+# registry fetch and the skill attach.
+#
+# The marker below is the RECONCILE KEY. `up` is declarative and re-runnable, so
+# a second import must find its own loops rather than add a second copy of each.
+
+# Body marker for one declared loop. Mirrors cmd_loop_pack's
+# "installed loop: <slug> (5dive marketplace)" so both are greppable the same way.
+_compose_loop_marker() { printf 'declared loop: %s (5dive.yaml)' "$1"; }
+
+# Does <agent> already own this loop? Matched on the marker OR the exact title.
+#
+# Title is the second key on purpose. The marker alone would be enough for loops
+# THIS code created, but `5dive export` also dumps recurring work that was created
+# by hand or by `loop install` — those carry no declared-loop marker, and matching
+# the marker alone would re-create every one of them on the next `up`. That is the
+# accumulation this reconcile exists to prevent, arriving through the export path
+# instead of the re-import one. Scoped to kind='recurring' + this assignee, so it
+# can only ever see the template rows this agent owns.
+_compose_loop_present() {
+  local agent="$1" key="$2" title="$3"
+  local marker pack_marker title_clause="" n
+  marker=$(_compose_loop_marker "$key")
+  pack_marker="installed loop: ${key} (5dive marketplace)"
+  # Built as its own variable rather than an inline $( … ) inside the SQL string:
+  # an empty title makes that substitution exit non-zero, and a conditional whose
+  # failure is invisible inside a query argument is exactly the shape that hides
+  # a broken guard.
+  [[ -n "$title" ]] && title_clause=" OR title=$(sqlq "$title")"
+  n=$(db "SELECT COUNT(*) FROM tasks
+          WHERE kind='recurring' AND assignee=$(sqlq "$agent")
+            AND ( body LIKE '%'||$(sqlq "$marker")||'%'
+               OR body LIKE '%'||$(sqlq "$pack_marker")||'%'${title_clause} );" 2>/dev/null | head -1)
+  [[ "${n:-0}" =~ ^[0-9]+$ ]] || return 1
+  (( n > 0 ))
+}
+
+# Create the loops declared on ONE agent that are not already there.
+#
+# Emits, on stdout: zero or more "RETRY <command>" lines, then one
+# "COUNTS <created> <existing> <errors>" line. Retries travel through stdout
+# rather than a shared array because the caller consumes this function through a
+# process substitution, i.e. a SUBSHELL — an array appended to in here would be
+# discarded on return, and the end-of-run block would print an empty list beside a
+# non-zero error count. That is the DIVE-2341 defect exactly (a real failure with
+# nothing said about it last), reintroduced by a scoping mistake.
+#
+# Every write is shelled out through the public verb so a failure is contained the
+# same way _compose_wire_role's are: a loop that will not install must not undo a
+# roster that came up.
+_compose_apply_loops() {
+  local spec="$1" name="$2" self="$3"
+  local created=0 existing=0 errors=0 loops
+  loops=$(jq -c --arg n "$name" '(.agents[$n].loops // [])[]' <<<"$spec" 2>/dev/null || true)
+  [[ -n "$loops" ]] || { printf 'COUNTS 0 0 0\n'; return 0; }
+
+  local L pack lid title cron prompt ceiling key
+  while IFS= read -r L; do
+    [[ -n "$L" ]] || continue
+    pack=$(jq    -r '.pack    // empty' <<<"$L")
+    lid=$(jq     -r '.id      // empty' <<<"$L")
+    title=$(jq   -r '.title   // empty' <<<"$L")
+    cron=$(jq    -r '.cron    // empty' <<<"$L")
+    prompt=$(jq  -r '.prompt  // empty' <<<"$L")
+    ceiling=$(jq -r '.ceiling // empty' <<<"$L")
+    key="${pack:-$lid}"
+
+    if _compose_loop_present "$name" "$key" "$title"; then
+      step "[$name] loop '$key' already present — leaving it alone"
+      ((existing++)) || true
+      continue
+    fi
+
+    if [[ -n "$pack" ]]; then
+      # Marketplace pack: `loop install` owns the registry fetch, the skill
+      # attach and the recurring job. Nothing about a pack is re-derived here.
+      local -a largs=(loop install "$pack" "--onto=$name")
+      [[ -n "$cron"    ]] && largs+=("--cron=$cron")
+      [[ -n "$ceiling" ]] && largs+=("--ceiling=$ceiling")
+      step "[$name] installing loop pack '$pack'"
+      if bash "$self" "${largs[@]}" >/dev/null 2>&1; then
+        ((created++)) || true
+      else
+        warn "[$name] loop pack '$pack' failed to install"
+        printf 'RETRY sudo 5dive loop install %s --onto=%s\n' "$pack" "$name"
+        ((errors++)) || true
+      fi
+      continue
+    fi
+
+    # Inline loop -> the same recurring template `loop install` ends up writing.
+    local body="${prompt}"
+    [[ -n "$body" ]] && body+=$'\n\n'
+    body+="— $(_compose_loop_marker "$lid") runs on '${cron}'."
+    [[ -n "$ceiling" ]] && body+=" advisory budget: ${ceiling} tokens/run (bound hard with: 5dive usage budget $name)."
+    step "[$name] creating loop '$lid' on '$cron'"
+    if bash "$self" task add --materialized "--body=$body" "--recurring=$cron" \
+         "--assignee=$name" --project=dive -- "$title" >/dev/null 2>&1; then
+      ((created++)) || true
+    else
+      warn "[$name] loop '$lid' failed to register — no recurring row was created for '$title' on '$cron'"
+      printf "RETRY sudo 5dive up -f %s   # re-run; only the missing loop '%s' for %s is created\n" "${_COMPOSE_SPEC_FILE:-<spec>}" "$lid" "$name"
+      ((errors++)) || true
+    fi
+  done <<<"$loops"
+  printf 'COUNTS %s %s %s\n' "$created" "$existing" "$errors"
+}
+
 # DIVE-3998: apply a roster-wide harness override to an already-parsed spec.
 #
 # Every bundled team template hard-sets `defaults.type: claude`, which made a
@@ -526,6 +712,9 @@ HELP
   fi
   spec_dir=$(realpath "$(dirname "$file")")
   self=$(_compose_self)
+  # DIVE-4022: named here so a loop that fails to register can print the exact
+  # re-run, not a `<spec>` placeholder the user has to translate.
+  local _COMPOSE_SPEC_FILE="$file"
 
   local reg
   reg=$(registry_read)
@@ -589,6 +778,50 @@ HELP
     fi
   done
 
+  # DIVE-4022 — declared loops, in a SECOND pass over the whole roster.
+  #
+  # Deliberately NOT folded into the create branch above, where _compose_wire_role
+  # sits. Wiring runs on create only, which is right for a persona file that must
+  # not double-append; it is wrong for loops. A user who adds a `loops:` block to a
+  # company they already imported and re-runs `up` would get nothing — the roster
+  # exists, so every agent takes the "already exists" branch and the new loops are
+  # never seen. Reconciling over EVERY declared agent instead is what makes the key
+  # declarative, and it is safe because _compose_loop_present makes the create
+  # idempotent rather than the code path doing it.
+  #
+  # Ordering matters twice: after the create loop, because a loop needs its owner
+  # to exist; before the summary, because the counts belong on the summary line.
+  local loops_created=0 loops_existing=0 loops_errors=0
+  local _lc _le _lerr _line _
+  local -a _COMPOSE_LOOP_RETRY=()
+  if [[ "$(jq -r '[.agents[] | (.loops // []) | length] | add // 0' <<<"$spec" 2>/dev/null || echo 0)" != "0" ]]; then
+    tasks_db_init 2>/dev/null || true
+    # Re-read: `reg` above is the PRE-run registry, so every agent this run just
+    # created would read as absent and its loops would be skipped.
+    local _reg_after; _reg_after=$(registry_read 2>/dev/null || echo '{}')
+    for name in "${names[@]}"; do
+      valid_name "$name" || continue
+      # An agent that is not on the box owns nothing — a loop assigned to a name
+      # that failed to create is a recurring row nobody will ever run.
+      [[ "$(jq --arg n "$name" '.agents[$n] != null' <<<"$_reg_after")" == "true" ]] || continue
+      while IFS= read -r _line; do
+        case "$_line" in
+          "COUNTS "*)
+            read -r _ _lc _le _lerr <<<"$_line"
+            loops_created=$((loops_created + _lc))
+            loops_existing=$((loops_existing + _le))
+            loops_errors=$((loops_errors + _lerr)) ;;
+          "RETRY "*) _COMPOSE_LOOP_RETRY+=("${_line#RETRY }") ;;
+        esac
+      done < <(_compose_apply_loops "$spec" "$name" "$self")
+    done
+  fi
+  # A loop that would not install must NOT fail the import — same rule, and the
+  # same reason, as DIVE-3994's unset bot token and DIVE-2347's failed skill: the
+  # roster is up and useful, and a marketplace fetch needs the network, which the
+  # one-tap dashboard import cannot assume. It is reported last instead, with the
+  # exact command, and it stays out of `errors`.
+
   # DIVE-2341 — SAY IT LAST, OR IT WAS NOT SAID.
   #
   # `agent create` already emits a correct self-check warning per agent ("no heartbeat
@@ -650,14 +883,16 @@ HELP
   done
 
   if (( JSON_MODE )); then
-    ok "" '{file:$f, created:($c|tonumber), started:($s|tonumber), skipped:($k|tonumber), errors:($e|tonumber), asleep:$a, skills_failed:($sf|tonumber), degraded:$d, no_channel:$nc}' \
+    ok "" '{file:$f, created:($c|tonumber), started:($s|tonumber), skipped:($k|tonumber), errors:($e|tonumber), asleep:$a, skills_failed:($sf|tonumber), degraded:$d, no_channel:$nc, loops:{created:($lc|tonumber), existing:($le|tonumber), errors:($lerr|tonumber), retry:$lr}}' \
       --arg f "$file" --arg c "$created" --arg s "$started" --arg k "$skipped" --arg e "$errors" \
       --argjson a "$(printf '%s\n' "${_asleep[@]+"${_asleep[@]}"}" | jq -R . | jq -sc 'map(select(length>0))')" \
       --arg sf "${#_degraded[@]}" \
       --argjson d "$(printf '%s\n' "${_degraded[@]+"${_degraded[@]}"}" | jq -R 'select(length>0) | split(" ") | {agent:.[0], skill:.[1]}' | jq -sc .)" \
-      --argjson nc "$(printf '%s\n' $_no_channel_names | jq -R . | jq -sc 'map(select(length>0))')"
+      --argjson nc "$(printf '%s\n' $_no_channel_names | jq -R . | jq -sc 'map(select(length>0))')" \
+      --arg lc "$loops_created" --arg le "$loops_existing" --arg lerr "$loops_errors" \
+      --argjson lr "$(printf '%s\n' "${_COMPOSE_LOOP_RETRY[@]+"${_COMPOSE_LOOP_RETRY[@]}"}" | jq -R . | jq -sc 'map(select(length>0))')"
   else
-    echo "OK — applied $file: created=$created started=$started skipped=$skipped errors=$errors asleep=${#_asleep[@]} skills_failed=${#_degraded[@]}"
+    echo "OK — applied $file: created=$created started=$started skipped=$skipped errors=$errors asleep=${#_asleep[@]} skills_failed=${#_degraded[@]} loops=${loops_created}(+${loops_existing} already there)"
     if (( ${#_asleep[@]} > 0 )); then
       echo ""
       echo "── ${#_asleep[@]} agent(s) are ASLEEP — created, but they will not self-act on board work:"
@@ -682,6 +917,18 @@ HELP
       echo "── agent(s) created WITHOUT a channel (no bot token was set): $_no_channel_names"
       for _n in $_no_channel_names; do
         echo "     sudo 5dive agent config $_n set telegram.token=<bot-token> && sudo 5dive agent config $_n set channels=telegram"
+      done
+    fi
+    # DIVE-4022 — same "say it last" rule for a loop that did not install. It is
+    # kept OUT of `errors` (the roster is up and working), so this block is the
+    # only place a user learns the company came up with less recurring work than
+    # the spec declared.
+    if (( ${#_COMPOSE_LOOP_RETRY[@]} > 0 )); then
+      echo ""
+      echo "── ${#_COMPOSE_LOOP_RETRY[@]} declared loop(s) did NOT install — those roles have less recurring work than the spec says:"
+      local _r
+      for _r in "${_COMPOSE_LOOP_RETRY[@]}"; do
+        echo "     $_r"
       done
     fi
   fi
@@ -714,6 +961,7 @@ HELP
   local spec self
   spec=$(_compose_parse "$file") || fail "$E_VALIDATION" "spec parse failed"
   self=$(_compose_self)
+  tasks_db_init 2>/dev/null || true   # DIVE-4022: declared loops live in the task store
 
   local reg
   reg=$(registry_read)
@@ -730,6 +978,14 @@ HELP
       continue
     fi
     step "[$name] removing"
+    # DIVE-4022: drop this agent's DECLARED loops before the seat goes. `agent rm`
+    # deletes the registry entry and the org row but NOT recurring templates, so a
+    # torn-down company would leave its templates behind, still materializing a new
+    # instance every slot for an assignee that no longer exists. Scoped hard: only
+    # kind='recurring' rows for THIS assignee that carry a declared-loop marker for
+    # an id this spec names — a hand-created recurring row, or one this spec never
+    # declared, is not ours to delete.
+    _compose_down_loops "$spec" "$name"
     if bash "$self" agent rm "$name" >/dev/null 2>&1; then
       ((removed++)) || true
     else
@@ -771,6 +1027,7 @@ HELP
     shift
   done
   ensure_state_ro   # read-only: fleet export must work for non-root agents
+  tasks_db_init 2>/dev/null || true   # DIVE-4022: loops are read from the task store
   local reg
   reg=$(registry_read)
 
@@ -787,12 +1044,13 @@ HELP
     effort=$(resolve_agent_effort "$type" "$name")
     role=$(db "SELECT COALESCE(role,'')       FROM agents_org WHERE name=$(sqlq "$name");" 2>/dev/null | head -1)
     mgr=$(db  "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$name");" 2>/dev/null | head -1)
+    local loops; loops=$(_compose_export_loops "$name")
     # Assemble one agent object, dropping empty fields.
     local obj
     obj=$(jq -n \
       --arg type "$type" --arg channels "$channels" --arg workdir "$workdir" \
       --arg profile "$profile" --arg model "$model" --arg effort "$effort" \
-      --arg role "$role" --arg mgr "$mgr" '
+      --arg role "$role" --arg mgr "$mgr" --argjson loops "${loops:-[]}" '
       {type:$type}
       | (if $channels != "" then .channels = $channels else . end)
       | (if $workdir  != "" then .workdir  = $workdir  else . end)
@@ -800,7 +1058,8 @@ HELP
       | (if $model    != "" then .model    = $model    else . end)
       | (if $effort   != "" then .effort   = $effort   else . end)
       | (if $role     != "" then .role     = $role     else . end)
-      | (if $mgr      != "" then .reports_to = $mgr    else . end)')
+      | (if $mgr      != "" then .reports_to = $mgr    else . end)
+      | (if ($loops | length) > 0 then .loops = $loops else . end)')
     agents=$(jq -c --arg n "$name" --argjson o "$obj" '. + {($n): $o}' <<<"$agents")
   done
 
@@ -815,6 +1074,77 @@ HELP
   else
     printf '%s' "$yaml"
   fi
+}
+
+# DIVE-4022 — remove the recurring templates `up` created for ONE agent.
+#
+# Deletes the TEMPLATE rows only, exactly as `loop uninstall` does; already
+# materialized instances are separate rows and are left for their owner. A pack
+# loop is removed through `loop uninstall`, so the pack path has one implementation
+# on the way out as well as on the way in.
+_compose_down_loops() {
+  local spec="$1" name="$2" self
+  self=$(_compose_self)
+  local L pack lid marker ids
+  while IFS= read -r L; do
+    [[ -n "$L" ]] || continue
+    pack=$(jq -r '.pack // empty' <<<"$L")
+    lid=$(jq  -r '.id   // empty' <<<"$L")
+    if [[ -n "$pack" ]]; then
+      bash "$self" loop uninstall "$pack" "--from=$name" >/dev/null 2>&1 \
+        || warn "[$name] could not uninstall loop pack '$pack' (remove by hand: sudo 5dive loop uninstall $pack --from=$name)"
+      continue
+    fi
+    [[ -n "$lid" ]] || continue
+    marker=$(_compose_loop_marker "$lid")
+    ids=$(db "SELECT id FROM tasks
+              WHERE kind='recurring' AND assignee=$(sqlq "$name")
+                AND body LIKE '%'||$(sqlq "$marker")||'%';" 2>/dev/null || true)
+    [[ -n "$ids" ]] || continue
+    local idlist; idlist=$(printf '%s,' $ids); idlist="${idlist%,}"
+    db "DELETE FROM tasks WHERE id IN (${idlist}) AND kind='recurring';" >/dev/null 2>&1 \
+      || warn "[$name] could not delete recurring template(s) for loop '$lid'"
+    step "[$name] removed declared loop '$lid'"
+  done < <(jq -c --arg n "$name" '(.agents[$n].loops // [])[]' <<<"$spec" 2>/dev/null || true)
+}
+
+# DIVE-4022 — the export half of the round-trip.
+#
+# `5dive export` dumps the fleet so a running org can be forked into a template.
+# With loops declared but not exported, the dump would claim a company that has
+# recurring work as one that has none — export would silently lie about the fleet
+# it dumped, and a re-import would rebuild the idle roster this row exists to end.
+#
+# Read from the tasks table (the thing that DEFINES a loop) rather than from any
+# spec file, so hand-made and `loop install`-made recurring work round-trips too.
+# Shaped in SQL as JSON: the default sqlite3 list output is pipe-separated, and a
+# task title or body may legitimately contain a pipe or a newline.
+#
+#   body carries "installed loop: <slug> (5dive marketplace)"  -> pack: <slug>
+#   body carries "declared loop: <id> (5dive.yaml)"            -> id: <id>
+#   neither                                                    -> id derived from
+#     the title, so a hand-created recurring row still exports as a real loop.
+#     The derivation is stable, and _compose_loop_present also matches on TITLE,
+#     so re-importing this dump onto the same fleet finds the row and does not
+#     duplicate it.
+_compose_export_loops() {
+  local agent="$1" rows
+  rows=$(db "SELECT COALESCE(json_group_array(json_object(
+                'title', title, 'body', COALESCE(body,''), 'cron', COALESCE(schedule,''))), '[]')
+             FROM tasks
+             WHERE kind='recurring' AND assignee=$(sqlq "$agent");" 2>/dev/null | head -1)
+  [[ -n "$rows" ]] || { printf '[]'; return 0; }
+  jq -c '
+    def slugify: ascii_downcase | gsub("[^a-z0-9]+"; "-") | gsub("^-+|-+$"; "") | .[0:64];
+    map(
+      ([.body | scan("installed loop: ([a-z0-9-]+) \\(5dive marketplace\\)")] | first | first) as $pack
+      | ([.body | scan("declared loop: ([a-z0-9-]+) \\(5dive\\.yaml\\)")] | first | first) as $decl
+      | if $pack != null
+        then {pack: $pack} + (if .cron != "" then {cron: .cron} else {} end)
+        else {id: ($decl // (.title | slugify)), title: .title}
+             + (if .cron != "" then {cron: .cron} else {} end)
+        end
+    )' <<<"$rows" 2>/dev/null || printf '[]'
 }
 
 # Where curated team templates live. Installed alongside the other shared

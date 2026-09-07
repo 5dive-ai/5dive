@@ -46,6 +46,18 @@ agents:
       with `5dive task need` (recommendation first).
     goals:
       - "Set this week's top 3 product priorities and assign owners."
+    # DIVE-4022 — `goals:` seeds a backlog ONCE, on first import; `loops:` is the
+    # recurring work that keeps the company running after that backlog is done.
+    # Without it an imported team is a roster that sits idle.
+    loops:
+      - id: weekly-priorities
+        title: "Re-set this week's top 3 product priorities"
+        cron: "0 9 * * 1"
+        prompt: |
+          Review what shipped last week and what is open on the board
+          (`5dive task ls`). Pick the three things that matter most this week,
+          assign each an owner, and tell the founder the list in one message.
+          Park anything only a human can decide with `5dive task need`.
 
   eng_manager:
     role: "Eng Manager"
@@ -61,6 +73,15 @@ agents:
       board honest, and escalate only real decisions up to the CEO.
     goals:
       - "Break the current priority into tasks with owners + acceptance criteria."
+    loops:
+      - id: daily-board-sweep
+        title: "Sweep the board: unblock, re-assign, escalate"
+        cron: "0 8 * * 1-5"
+        prompt: |
+          Walk the open rows (`5dive task ls`). Unblock what is stuck, re-assign
+          what is on the wrong seat, and escalate real decisions to the CEO.
+          Anything with no owner and no acceptance criteria is not a row yet —
+          fix it or close it.
 
   designer:
     role: "Designer"
