@@ -53,6 +53,15 @@ extract_block() { # <type>
   ' "$START"
 }
 
+extract_last_block() { # <type> — for types with more than one top-level block
+  awk -v marker="if [[ \"\$TYPE\" == \"$1\" ]]; then" '
+    $0 == marker { on=1; block="" }
+    on { block = block $0 ORS }
+    on && $0 == "fi" { last=block; on=0 }
+    END { printf "%s", last }
+  ' "$START"
+}
+
 # The blocks call helper functions defined once above them — pull the real
 # definitions in too so a block still runs standalone.
 #
@@ -123,6 +132,31 @@ check "agy: token seeded with sudo unavailable" \
       "$( [[ -s "$LOCAL_AGY" ]] && cat "$LOCAL_AGY" )" "ya29.valid-agy-token"
 check "agy: no false alarm on a successful seed" \
       "$(grep -c 'ERROR: antigravity credential EXISTS' <<<"$out")" "0"
+
+# ---------- claude degraded-start verdict ----------
+# The Claude block reads a fixed system path, so intercept only that one grep
+# and leave every ordinary grep in this harness delegated to the real binary.
+# This drives the shipped block twice: first without a credential (writes the
+# breadcrumb), then with one (must clear it). Deleting cred_seed_ok from the
+# successful arm therefore leaves a concrete stale-red failure.
+CLAUDE_BLOCK="$(extract_last_block claude)"
+[[ -n "$CLAUDE_BLOCK" ]] || { echo "FAIL: could not extract claude block"; exit 1; }
+assert_no_missing_fn "claude block" "$CLAUDE_BLOCK"
+REAL_GREP=$(command -v grep)
+printf '#!/usr/bin/env bash\ncase " $* " in *" /etc/5dive/connectors/anthropic.env "*) [[ "${MOCK_CLAUDE_CRED:-0}" == 1 ]]; exit;; esac\nexec "%s" "$@"\n' "$REAL_GREP" > "$TMP/bin/grep"
+chmod +x "$TMP/bin/grep"
+CLAUDE_HOME="$TMP/home-claude"; mkdir -p "$CLAUDE_HOME"
+CLAUDE_BC="$CLAUDE_HOME/.5dive-cred-seed-failed"
+run_block "$CLAUDE_BLOCK" TYPE=claude NAME=test-claude PROFILE= HOME="$CLAUDE_HOME" \
+  PROFILE_STATE_DIR="$TMP/profile-claude" WORKDIR="$TMP" CLAUDE_AUTH_WAIT_SECS=0 \
+  MOCK_CLAUDE_CRED=0 >/dev/null
+check "claude: absent credential persists degraded-start breadcrumb" \
+      "$( [[ -s "$CLAUDE_BC" ]] && echo yes )" yes
+run_block "$CLAUDE_BLOCK" TYPE=claude NAME=test-claude PROFILE= HOME="$CLAUDE_HOME" \
+  PROFILE_STATE_DIR="$TMP/profile-claude" WORKDIR="$TMP" CLAUDE_AUTH_WAIT_SECS=0 \
+  MOCK_CLAUDE_CRED=1 >/dev/null
+check "claude: successful credential observation clears stale breadcrumb" \
+      "$( [[ -e "$CLAUDE_BC" ]] && echo yes )" ""
 
 # Re-seed on a NEWER profile token (the re-auth path) — this is what `agent
 # restart` is documented to do and what silently never happened.

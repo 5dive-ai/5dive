@@ -450,6 +450,21 @@ cmd_tui() {
   reg=$(registry_read)
   jq -e --arg n "$name" '.agents[$n] != null' <<<"$reg" >/dev/null \
     || fail "$E_NOT_FOUND" "no agent named '$name'"
+  local type channels
+  type=$(jq -r --arg n "$name" '.agents[$n].type // ""' <<<"$reg")
+  channels=$(jq -r --arg n "$name" '.agents[$n].channels // "none"' <<<"$reg")
+  # DIVE-4032: a channel-enabled Codex seat runs the app-server dispatcher as
+  # its tmux process. Attaching to it shows transport logs, not an interactive
+  # coding agent, so the old promise ("attach ... to the agent") made a healthy
+  # dispatcher look like a broken Codex TUI. Refuse the false view and name the
+  # useful observable instead.
+  if [[ "$type" == "codex" ]]; then
+    case ",${channels}," in
+      *,telegram,*|*,dashboard,*)
+        fail "$E_CONFLICT" "agent '$name' has no interactive Codex TUI: its tmux session is the ${channels} dispatcher. View transport logs with '5dive agent tail $name'; inspect Codex work in /home/agent-${name}/.codex/sessions."
+        ;;
+    esac
+  fi
   exec sudo -u "agent-${name}" tmux attach -t "agent-${name}"
 }
 

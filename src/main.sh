@@ -159,7 +159,7 @@ Agents:
                                                      # getChat for @handle via the agent's bot token; returns
                                                      # {id,isBot,displayName} so the dashboard can add bots by
                                                      # handle instead of numeric id.
-  5dive agent <name> tui                             # attach your terminal to the agent's tmux session
+  5dive agent <name> tui                             # attach to an interactive agent tmux session (dispatcher-only seats explain the alternative)
   5dive agent logs <name> [--follow] [--lines=N] [--tmux]
   5dive agent send <name> <text...>|--message=<text>|--message-file=<path>
                                     [--from=<sender>] [--raw] [--wake]
