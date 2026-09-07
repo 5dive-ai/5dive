@@ -637,7 +637,13 @@ _market_usage() {
   5dive market --rarity=<tier>          # filter by tier (mythical|legendary|epic|rare)
   5dive market --seasoned               # only packs that ship pre-trained memory
   5dive market show <slug>              # preview a persona: tier, model, skills, card, DID
+  5dive market --kind=plugin [<kw>]     # browse PLUGINS instead of agents (see: 5dive plugin)
   --json                                # machine-readable (dashboard/agent feed)
+
+  Aliases, so the verb answers to whatever you reach for:
+    ls | list | browse                  # the default, an explicit no-op
+    search | find <keyword>             # same as passing the keyword bare
+    show | info | preview <slug>        # the single-persona view
 
   Then: 5dive hire <role> --from-market --dry-run   (preview a real hire, provisions nothing)
         5dive agent inspect <slug>                  (full install-time disclosure, incl. which harnesses it lands on)
@@ -679,7 +685,18 @@ cmd_market() {
     case "$_mk_a" in
       --kind=plugin|--kind=plugins) cmd_market_plugins "$@"; return ;;
       --kind=agent|--kind=agents|--kind=persona|--kind=personas) : ;;
-      --kind=*) fail "$E_USAGE" "unknown --kind (agent|plugin)" ;;
+      # Worded WITHOUT a pipe-separated list on purpose, and this is a real
+      # constraint rather than a style choice. usage_enumeration_completeness_unit
+      # associates any `$E_USAGE` string containing `|` and "unknown"/"usage:"
+      # within six lines ABOVE a `case` with THAT case's arms — a good heuristic,
+      # since a usage string that close to a dispatcher is nearly always its
+      # enumeration. Here it would be wrong: this line enumerates values of ONE
+      # FLAG, not the sibling subcommands of `case "$sub"` below, so it was
+      # reported as `case $sub MISSING=show|info|preview,…`. Spelling the choices
+      # out in words fixes the mis-association AND is better copy — it names the
+      # value the user actually typed. The subcommand aliases are documented in
+      # _market_usage above, where they belong.
+      --kind=*) fail "$E_USAGE" "--kind must be 'agent' or 'plugin' (got: ${_mk_a#--kind=})" ;;
     esac
   done
   local sub="${1:-ls}"

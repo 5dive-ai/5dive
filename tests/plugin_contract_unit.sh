@@ -421,5 +421,72 @@ else
     "yes" "$([[ -d "$probe2/plugins" ]] && echo yes || echo no)"
 fi
 
+# =============================================================================
+# T12 — arms that can SEE a death under errexit
+# =============================================================================
+# quinn's iteration-2 reject, and it is the structural finding, not the three
+# symptoms: this harness does `set +e` at line ~48 so that `fail` does not kill
+# it while grading refusals — which is correct, and which ALSO switches off the
+# only rail that makes an unguarded command substitution fatal. So 86 green arms
+# could not have seen `plugin rollback` dying on its own probe. Grading refusals
+# and grading deaths need two different shells, and this block is the second one.
+#
+# `( set -euo pipefail; … )` as a PLAIN command, never as an operand of ||/&&/if:
+# the errexit exemption for an operand propagates INTO the subshell and would
+# make the death unreachable — the trap in
+# [[the-set-e-exemption-propagates-into-a-subshell-so-a-does-it-die-arm-is-vacuous]].
+# T12a below is the positive control that this shell really can kill.
+run_e() {
+  local o="$TMP/.eo" e="$TMP/.ee"
+  ( set -euo pipefail; "$@" ) >"$o" 2>"$e"; RC=$?
+  OUT=$(cat "$o"); ERR=$(cat "$e")
+  return 0
+}
+_probe_dies() { local x; x=$(printf 'a\n' | grep -F zzz); echo "SURVIVED"; }
+run_e _probe_dies
+t "T12a positive control: this shell CAN kill an unguarded probe (if it cannot, every arm below is vacuous)" \
+  "yes" "$([[ "$RC" != 0 && -z "$OUT" && -z "$ERR" ]] && echo yes || echo no)"
+
+# The real one. `rollback` with exactly ONE version on disk is not an edge case —
+# it is every install that has never been upgraded, i.e. the first thing a user
+# reaches for after their first upgrade goes wrong.
+run cmd_plugin_add micy@fixture --yes   # single version, never upgraded
+run_e cmd_plugin_rollback micy@fixture
+t  "T12b rollback with one version REFUSES (it does not die on its own probe)" "$E_NOT_FOUND" "$RC"
+t  "T12c ...and it said something — a silent non-zero is the defect, not the exit code" "yes" \
+   "$([[ -n "$ERR" ]] && echo yes || echo no)"
+tc "T12d ...naming the state the user is actually in" "no other version" "$ERR"
+
+# A function whose last command is a conditional supplies its exit status; under
+# errexit that takes the CALLER down with no message. Run against a FRESH store,
+# because on a second call `_plugin_register_bundled` returns early and the line
+# in question never executes — an arm that re-uses the bootstrapped store grades
+# the early return, not the bug.
+#
+# HONEST SCOPE, because it matters for who owns this class: this arm proves the
+# bootstrap SUCCEEDS end to end on a fresh tree. It does NOT prove the shape is
+# absent — the defect is that a false conditional would SUPPLY the status, and
+# on the happy path the conditional is true either way. The guard that actually
+# catches the shape is the corpus-level static one,
+# tests/task_show_exit_code_unit.sh, which named `cmd_plugin.sh:338` before I
+# did. Duplicating its scanner here would be a second copy to drift; what this
+# file adds is the runtime half it cannot see.
+( STATE_DIR="$TMP/bootstrap-fresh"; run_e _plugin_ensure_store; printf '%s' "$RC" > "$TMP/.bootrc" )
+t "T12e the bootstrap returns success on a FRESH store, so its callers survive errexit" \
+  "0" "$(cat "$TMP/.bootrc" 2>/dev/null)"
+t "T12e2 ...and it really did register the bundled marketplace (the arm is not grading an early return)" "true" \
+  "$(jq -r '.["5dive"].bundled // false' "$TMP/bootstrap-fresh/plugins/marketplaces.json" 2>/dev/null)"
+
+# quinn measured this on a FRESH box: the built-in hint never fired, because it
+# sat behind the trust gate, which sits behind manifest resolution, which needs
+# the marketplace the user has not added. The whole value of the hint is for
+# someone who has set nothing up, so grade it with nothing set up.
+FRESH="$TMP/fresh"; ( STATE_DIR="$FRESH" run cmd_plugin_add telegram --yes ) >/dev/null 2>&1
+( STATE_DIR="$FRESH"; run cmd_plugin_add telegram --yes; printf '%s' "$ERR" > "$TMP/.fresh_err" )
+fresh_err=$(cat "$TMP/.fresh_err" 2>/dev/null)
+tc "T12f on a store with NO marketplace added, 'plugin add telegram' still points at the per-agent path" \
+   "--channels=telegram" "$fresh_err"
+tn "T12g ...instead of the setup error the user cannot act on" "in any registered marketplace" "$fresh_err"
+
 printf 'plugin_contract_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

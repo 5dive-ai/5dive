@@ -338,6 +338,13 @@ _plugin_register_bundled() {
   jq --arg s "$src" --arg t "$(date -u +%FT%TZ)" \
      '.["5dive"] = {source:$s, kind:"local", ref:"", added_at:$t, bundled:true}' \
      "$(_plugin_mkt_json)" > "$tmp" && mv "$tmp" "$(_plugin_mkt_json)"
+  # Explicit, because this function's last command is a CONDITIONAL and would
+  # otherwise supply its exit status: every caller is `_plugin_ensure_store`,
+  # which runs under errexit, so a failed jq here would take the whole verb down
+  # with no message rather than leaving the bundled marketplace unregistered.
+  # Registering the bundle is best-effort by design — every early `return 0`
+  # above says so — and the last line must agree with them.
+  return 0
 }
 
 _plugin_ensure_store() {
@@ -610,6 +617,17 @@ cmd_plugin_add() {
   [[ -n "$ref" ]] || fail "$E_USAGE" "usage: 5dive plugin add <plugin>[@<marketplace>] [--yes]"
   _plugin_ensure_store
 
+  # BEFORE resolution, deliberately. quinn measured that on a fresh box this hint
+  # never fired: `plugin add telegram` died at "no plugin telegram in any
+  # registered marketplace" because the builtin branch sat behind the trust gate,
+  # which sits behind manifest resolution, which needs the marketplace the user
+  # has not added. The whole value of the hint is for the person who has NOT set
+  # anything up, so it has to run before anything that needs setup.
+  local _bare="${ref%@*}"
+  if [[ "$ref" != *@* ]] && _plugin_is_builtin_channel "$_bare"; then
+    fail "$E_USAGE" "'$_bare' is one of 5dive's built-in channel plugins — it is installed per AGENT, not per box, so 'plugin add' is not the path. Use: 5dive agent create <name> --channels=$_bare  (or, for an existing agent, 5dive agent config <name> --channels=$_bare). It predates the plugin contract and carries no 5dive manifest block, which is why it would otherwise read as unreviewed."
+  fi
+
   local plugin mkt
   _plugin_split_ref "$ref"; plugin="$_PL_PLUGIN"; mkt="$_PL_MKT"
   local srcdir; srcdir=$(_plugin_source_dir "$mkt" "$plugin") \
@@ -876,7 +894,17 @@ cmd_plugin_rollback() {
 
   local base="$(_plugin_cache_dir)/$mkt/$plugin"
   if [[ -z "$want" ]]; then
-    want=$(ls "$base" 2>/dev/null | grep -vFx "$cur" | sort -V | tail -1)
+    # `|| want=""` is load-bearing, not defensive noise. With exactly ONE version
+    # on disk `grep -vFx "$cur"` matches nothing and exits 1; under header.sh's
+    # `set -euo pipefail` the ASSIGNMENT then kills the process on this line and
+    # the friendly refusal below is unreachable code — `plugin rollback` exited 1
+    # with nothing on stdout or stderr. One version on disk is not an edge case:
+    # it is the state of every install that has never been upgraded, so this is
+    # the FIRST thing a user does after their first upgrade goes wrong.
+    # `|| want=""` and not `|| true`: the empty value states the post-condition
+    # the line below actually reads (DIVE-2566/2603/2604,
+    # scripts/unguarded-probe-scan.sh).
+    want=$(ls "$base" 2>/dev/null | grep -vFx "$cur" | sort -V | tail -1) || want=""
     [[ -n "$want" ]] || fail "$E_NOT_FOUND" "no other version of $key is on disk (only $cur)"
   fi
   [[ -d "$base/$want" ]] || fail "$E_NOT_FOUND" "version '$want' of $key is not on disk (have: $(ls "$base" 2>/dev/null | tr '\n' ' '))"
