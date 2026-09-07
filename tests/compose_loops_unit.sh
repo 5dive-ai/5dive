@@ -221,6 +221,28 @@ else
   bad_t 'T8 a failed loop install is silent — the user would never learn the company came up short' "out=$out6"
 fi
 
+# A child that reads stdin would eat the rest of the here-string the loop list is
+# fed on, and the remaining loops would vanish with no error at all. Graded with a
+# stub that drains stdin: without the </dev/null redirects, the second loop is
+# never seen.
+sqlite3 "$DB" "DELETE FROM tasks;"
+cat > "$TMP/greedy.sh" <<'GREEDY'
+#!/usr/bin/env bash
+cat >/dev/null            # drain whatever stdin we were handed
+exec "${STUB_REAL:?}" "$@"
+GREEDY
+chmod +x "$TMP/greedy.sh"
+out7=$( set -uo pipefail
+        db() { sqlite3 "$DB" "$1"; }
+        sqlq() { printf "'%s'" "${1//\'/\'\'}"; }
+        step() { :; }; warn() { :; }
+        . "$TMP/loops.sh"
+        STUB_DB="$DB" STUB_LOG="$TMP/stub.log" STUB_REAL="$TMP/self.sh" \
+          _compose_apply_loops "$SPEC" a "$TMP/greedy.sh" )
+[[ "$out7" == *"COUNTS 2 0 0"* ]] \
+  && ok_t 'T8b a child that drains stdin cannot swallow the remaining loops' \
+  || bad_t 'T8b a stdin-reading child ate the loop list — loops vanish with no error' "out=$out7"
+
 # ---------------------------------------------------------------------------
 # EXPORT ARM — export must not claim a company with recurring work has none.
 # ---------------------------------------------------------------------------

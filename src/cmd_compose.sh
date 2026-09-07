@@ -582,7 +582,11 @@ _compose_apply_loops() {
       [[ -n "$cron"    ]] && largs+=("--cron=$cron")
       [[ -n "$ceiling" ]] && largs+=("--ceiling=$ceiling")
       step "[$name] installing loop pack '$pack'"
-      if bash "$self" "${largs[@]}" >/dev/null 2>&1; then
+      # </dev/null: the loop list is fed to this while via a here-string, and a
+      # child that reads stdin would swallow the remaining loops — they would
+      # vanish with no error, which is the silent half-provisioning this pass
+      # exists to prevent.
+      if bash "$self" "${largs[@]}" </dev/null >/dev/null 2>&1; then
         ((created++)) || true
       else
         warn "[$name] loop pack '$pack' failed to install"
@@ -599,7 +603,7 @@ _compose_apply_loops() {
     [[ -n "$ceiling" ]] && body+=" advisory budget: ${ceiling} tokens/run (bound hard with: 5dive usage budget $name)."
     step "[$name] creating loop '$lid' on '$cron'"
     if bash "$self" task add --materialized "--body=$body" "--recurring=$cron" \
-         "--assignee=$name" --project=dive -- "$title" >/dev/null 2>&1; then
+         "--assignee=$name" --project=dive -- "$title" </dev/null >/dev/null 2>&1; then
       ((created++)) || true
     else
       warn "[$name] loop '$lid' failed to register — no recurring row was created for '$title' on '$cron'"
@@ -1091,7 +1095,7 @@ _compose_down_loops() {
     pack=$(jq -r '.pack // empty' <<<"$L")
     lid=$(jq  -r '.id   // empty' <<<"$L")
     if [[ -n "$pack" ]]; then
-      bash "$self" loop uninstall "$pack" "--from=$name" >/dev/null 2>&1 \
+      bash "$self" loop uninstall "$pack" "--from=$name" </dev/null >/dev/null 2>&1 \
         || warn "[$name] could not uninstall loop pack '$pack' (remove by hand: sudo 5dive loop uninstall $pack --from=$name)"
       continue
     fi
