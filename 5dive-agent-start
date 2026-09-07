@@ -1659,6 +1659,47 @@ fi
 INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${STAGE_GUARD}${OPENCLAW_PATH_OVERRIDE}${CODEX_OVERRIDE}${OPENCODE_OVERRIDE}${PI_OVERRIDE}${PRELUDE}${LOOP}"
 [[ -n "$PROFILE" ]] && echo "[5dive] agent=${NAME} using auth-profile=${PROFILE}" >&2
 
+# DIVE-4036: DECLARE how dispatched work reaches this agent, then launch.
+#
+# PR #770 moved WHAT RUNS IN THE PANE for a codex seat with a channel (the
+# app-server dispatcher, not the codex CLI) without moving WHERE WORK IS POSTED
+# (`tmux send-keys` into that pane, src/cmd_agent_runtime.sh). Keystrokes landed
+# in the dispatcher's stdin and were discarded: the model never saw the task, the
+# board still said in_progress, and every fleet view stayed green. Two days of a
+# seat producing nothing, on every box with a codex+dashboard seat.
+#
+# The durable fix is NOT a second copy of `codex_dispatcher_enabled` on the
+# delivery side — that is the same two-places-must-agree shape, one layer over.
+# The boot path has ALREADY evaluated the predicate by the time it gets here, so
+# it writes the ANSWER down and the delivery path READS it. One evaluation, not
+# two, so they cannot drift.
+#
+# Read back with `sudo -u agent-<name> cat` (the same privilege every send site
+# already uses for tmux), so no permission is widened: mode 600 under the agent's
+# own home. The file names a MODE only — the delivery path DERIVES the inbox
+# directory under /home/agent-<name> rather than trusting a path out of a file the
+# agent itself can write, because `agent _deliver` reads it as root.
+write_delivery_declaration() {
+  local mode="pane"
+  if [[ "$TYPE" == "codex" ]] && codex_dispatcher_enabled "$CHANNELS"; then
+    mode="dispatcher-inbox"
+  fi
+  local dir="$HOME/.5dive" f="$dir/delivery.env" tmp
+  mkdir -p "$dir" 2>/dev/null || { echo "warn: cannot create $dir — delivery mode undeclared" >&2; return 0; }
+  tmp="${f}.tmp.$$"
+  {
+    printf '# written by 5dive-agent-start; regenerated on every boot (DIVE-4036)\n'
+    printf 'AGENT_DELIVERY=%s\n' "$mode"
+    printf 'AGENT_DELIVERY_TYPE=%s\n' "$TYPE"
+    printf 'AGENT_DELIVERY_CHANNELS=%s\n' "$CHANNELS"
+    printf 'AGENT_DELIVERY_DECLARED_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } >"$tmp" 2>/dev/null || { echo "warn: cannot write $f — delivery mode undeclared" >&2; rm -f "$tmp" 2>/dev/null; return 0; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$f" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 0; }
+  echo "[5dive] agent=${NAME} delivery=${mode}" >&2
+}
+write_delivery_declaration
+
 /usr/bin/tmux new-session -d -s "$SESSION" -c "$WORKDIR" \
   "bash --login -c $(printf %q "$INNER")"
 

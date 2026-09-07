@@ -902,9 +902,165 @@ _agent_credential_refusal_msg() {
 # idle (turn actually started) via _hb_agent_idle, re-sending a few times before
 # giving up. (Enter and C-m are byte-identical `\r` to tmux, so the earlier
 # manual-C-m workaround was really the settle+confirm, not a different key.)
+# --- DIVE-4036: delivery is not always a pane -------------------------------
+#
+# PR #770 gave a codex seat with `telegram` or `dashboard` in its channels a NEW
+# pane process — the app-server dispatcher (`bun run --cwd .../telegram-codex
+# start`) — while every send site here kept typing into that pane. `send-keys`
+# then writes into the dispatcher's stdin, which discards it. The model never
+# sees the message, tmux reports success, and nothing anywhere reports a problem:
+# `agent list` said active, `agent info` said transacting, the board said
+# in_progress, and the seat had been deaf for ~2.2 days (DIVE-4036, found because
+# a human noticed a task had not moved).
+#
+# THE SEAM. The dispatcher already watches a file inbox and drains it on a
+# `watch` plus a 15s poll (telegram-codex/dispatcher.ts: `startInbox`). A message
+# is one JSON file `{id, text, route:{source, chat_id}}`; `source: "agent"` is an
+# accepted source whose replies are deliberately NOT published to any channel
+# (dispatcher.ts `publish` returns early for it), which is exactly right for an
+# inter-agent or heartbeat send — a peer's message must not surface in the
+# customer's Telegram thread.
+#
+# WHY THIS IS A RECEIPT AND THE PANE PATH IS NOT. `ingest()` unlinks the file
+# once `submit()` resolves, so the file DISAPPEARING is positive evidence the
+# dispatcher accepted the message and started or queued a turn. That is a
+# stronger delivery proof than anything the pane path can offer — there we infer
+# submission from a TUI placeholder clearing, or from an idle-state probe.
+#
+# WHY THE MODE IS READ AND NOT RE-DERIVED. `codex_dispatcher_enabled` in
+# 5dive-agent-start already chose the pane process. Re-implementing that
+# predicate here would recreate the exact defect one layer up — two places that
+# must agree about the same seat, with nothing forcing them to. So the boot path
+# writes its answer to ~agent-<name>/.5dive/delivery.env and this reads it.
+# tests/codex_dispatch_delivery_unit.sh pins both halves.
+
+# Directory the dispatcher drains for agent-<name>, or empty if this seat takes
+# the pane path. DERIVED, never read out of the declaration file: `agent
+# _deliver` runs as root under a scoped sudoers grant, and a path taken from a
+# file the agent itself can write would let it choose where root writes. The
+# declaration carries a MODE keyword and nothing else; the agent forging that
+# keyword can only redirect its OWN inbound into its own home, which is the
+# capability it already has.
+_agent_delivery_inbox() {
+  local name="$1" mode=""
+  mode="$(_agent_delivery_mode "$name")"
+  [[ "$mode" == "dispatcher-inbox" ]] || return 1
+  printf '%s\n' "/home/agent-${name}/.codex/channels/dispatcher/inbox"
+}
+
+# `pane` | `dispatcher-inbox`. Prefers the boot declaration. FALLBACK, and it is
+# a compatibility path only: a box whose 5dive-agent-start predates DIVE-4036
+# (or an agent started before this upgrade) has no declaration, and reading that
+# absence as "pane" is precisely the silent deafness this fixes. So when the file
+# is missing we evaluate the predicate against the SAME input agent-start reads —
+# /var/lib/5dive/agents.d/<name>.env — and the parity of the two copies is a
+# graded arm, not a hope.
+_agent_delivery_mode() {
+  local name="$1" raw="" mode="" type="" channels=""
+  raw="$(sudo -u "agent-${name}" cat "/home/agent-${name}/.5dive/delivery.env" 2>/dev/null || true)"
+  if [[ -n "$raw" ]]; then
+    mode="$(printf '%s\n' "$raw" | sed -n 's/^AGENT_DELIVERY=\([a-z-]\{1,32\}\)$/\1/p' | head -1)"
+    case "$mode" in
+      pane|dispatcher-inbox) printf '%s\n' "$mode"; return 0 ;;
+    esac
+  fi
+  # No declaration: re-derive from the per-agent systemd env file.
+  local envf="${ENV_DIR:-/var/lib/5dive/agents.d}/${name}.env"
+  [[ -r "$envf" ]] || { printf 'pane\n'; return 0; }
+  # Strip a surrounding pair of single or double quotes; systemd env files allow
+  # either and agent-start gets them removed for free by `source`.
+  type="$(sed -n 's/^AGENT_TYPE=//p' "$envf" | tail -1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/")"
+  channels="$(sed -n 's/^AGENT_CHANNELS=//p' "$envf" | tail -1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/")"
+  if [[ "$type" == "codex" ]] && _codex_dispatcher_enabled "${channels:-none}"; then
+    printf 'dispatcher-inbox\n'
+  else
+    printf 'pane\n'
+  fi
+}
+
+# VERBATIM copy of codex_dispatcher_enabled() in 5dive-agent-start. The two are
+# asserted byte-identical by tests/codex_dispatch_delivery_unit.sh; a copy that
+# only a comment asks you to keep in sync is how DIVE-4036 happened.
+_codex_dispatcher_enabled() {
+  local channels=",${1:-},"
+  [[ "$channels" == *,telegram,* || "$channels" == *,dashboard,* ]]
+}
+
+# A pure-TUI control line has no meaning to the dispatcher: it owns one
+# app-server thread and every inbox message is a user turn, so "/clear" would
+# arrive as the literal text "/clear" and burn a turn without resetting
+# anything. Submitting it is worse than skipping it — it puts a stray user
+# message in the customer's thread. RESIDUAL, named rather than papered over:
+# a fresh wake on a dispatcher seat is NOT fresh, because thread reset needs a
+# control verb the inbox schema does not have yet (follow-up on DIVE-4036).
+_agent_dispatch_is_tui_control() {
+  case "${1//[[:space:]]/}" in
+    /clear|/goalclear|/compact) return 0 ;;
+  esac
+  return 1
+}
+
+# Post one message into the dispatcher inbox and CONFIRM it was drained.
+# rc 0 = the dispatcher consumed it (file unlinked). rc 1 = written but still
+# sitting there — same "maybe unsubmitted" meaning the pane path's rc 1 carries.
+# rc 2 = could not write it at all.
+#
+# jq builds the JSON: the payload is arbitrary agent-authored text and must
+# never reach a printf format string or a shell word. Nothing here execs it.
+_agent_dispatch_inbox_send() {
+  local name="$1" payload="$2" inbox="$3"
+  local id json tmp dst waited
+  id="5dive-$(date +%s%N)-$$-${RANDOM}"
+  json="$(jq -cn --arg id "$id" --arg text "$payload" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{id:$id, text:$text, route:{source:"agent", chat_id:"5dive-cli"}, received_at:$at}')" || return 2
+  # Dot-prefixed while partial: ingest() ignores anything not ending in .json,
+  # and the rename into place is atomic within the directory, so the dispatcher
+  # can never read a half-written message.
+  tmp="${inbox}/.${id}.json.part"
+  dst="${inbox}/${id}.json"
+  sudo -u "agent-${name}" mkdir -p "$inbox" 2>/dev/null || return 2
+  printf '%s\n' "$json" | sudo -u "agent-${name}" tee "$tmp" >/dev/null 2>&1 || return 2
+  sudo -u "agent-${name}" mv -f "$tmp" "$dst" 2>/dev/null || {
+    sudo -u "agent-${name}" rm -f "$tmp" 2>/dev/null || true
+    return 2
+  }
+  # Drained == accepted. The dispatcher unlinks on submit; a turn already running
+  # from another route makes this 'queued', which also unlinks promptly. The bound
+  # is a variable so the harness can grade the undrained branch without spending
+  # the real window on it — the DEFAULTS are what ships.
+  local tries="${FIVE_DISPATCH_CONFIRM_TRIES:-60}" nap="${FIVE_DISPATCH_CONFIRM_SLEEP:-0.25}"
+  for waited in $(seq 1 "$tries"); do
+    sudo -u "agent-${name}" test -e "$dst" 2>/dev/null || return 0
+    sleep "$nap"
+  done
+  return 1
+}
+
+_agent_dispatch_unconfirmed_reason() {
+  printf '%s\n' 'message is sitting undrained in the codex dispatcher inbox after 15s — the dispatcher is up but not accepting turns (DIVE-4036)'
+}
+
+_agent_dispatch_write_failed_reason() {
+  printf '%s\n' 'could not write to the codex dispatcher inbox — the seat declares dispatcher delivery but its inbox is unwritable (DIVE-4036)'
+}
+
 inject_and_submit() {
   local name="$1" payload="$2" tries=0 pane
   local user="agent-${name}"   # separate stmt: ${name} in the same line aborts under set -u (silent msg drop)
+  # DIVE-4036: route BEFORE the pane guard, because on a dispatcher seat there is
+  # no chat pane to guard. _agent_pane_safe_to_type exists to stop a payload being
+  # typed into an API-key field (DIVE-2137); writing a JSON message file into the
+  # dispatcher's inbox cannot reach a login prompt, so the hazard it protects
+  # against is structurally absent here rather than being waived.
+  local _inbox _drc=0
+  if _inbox="$(_agent_delivery_inbox "$name")"; then
+    if _agent_dispatch_is_tui_control "$payload"; then
+      step "skipping TUI control line '${payload}' — agent '${name}' takes work through the codex dispatcher, which has no thread-reset verb yet (DIVE-4036)"
+      return 0
+    fi
+    _agent_dispatch_inbox_send "$name" "$payload" "$_inbox" || _drc=$?
+    return "$_drc"
+  fi
   # DIVE-2137: the ONE choke point every typed send funnels through (cmd_send,
   # cmd_ask, _deliver). The guard lives here rather than at the three call sites
   # for the same reason the readiness marker set was collapsed into one predicate
@@ -946,6 +1102,14 @@ inject_and_submit() {
 # public receipts: `send` and the scoped `_deliver` path must not disagree about
 # why their success boolean is false (DIVE-2362).
 _agent_submit_unconfirmed_reason() {
+  # DIVE-4036: the same non-zero rc now has two possible causes, and a receipt
+  # that names the pane on a seat with no chat pane sends the operator to look at
+  # the wrong thing. Callers pass the agent name where they have it.
+  local name="${1:-}"
+  if [[ -n "$name" ]] && _agent_delivery_inbox "$name" >/dev/null 2>&1; then
+    if [[ "${2:-1}" == "2" ]]; then _agent_dispatch_write_failed_reason; else _agent_dispatch_unconfirmed_reason; fi
+    return 0
+  fi
   printf '%s\n' 'pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)'
 }
 
@@ -1432,7 +1596,10 @@ cmd_deliver() {
   # Same boot-race guard as cmd_send, then deliver by REUSING the literal-inject
   # primitive. The message is passed to send-keys with `-l --` (literal) and is
   # never interpreted as a command.
-  if ! wait_agent_input_ready "$target"; then
+  # DIVE-4036: a dispatcher seat never renders a chat prompt, so this probe can
+  # only burn its full budget and then say "best-effort" about a path that is not
+  # best-effort at all — the inbox write carries its own drained/undrained receipt.
+  if ! _agent_delivery_inbox "$target" >/dev/null 2>&1 && ! wait_agent_input_ready "$target"; then
     step "agent '$target' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
   fi
   local _rc=0 _delivered=1 _reason="" _summary=""
@@ -1441,7 +1608,7 @@ cmd_deliver() {
     fail "$E_AUTH_REQUIRED" "$(_agent_credential_refusal_msg "$target")"
   elif (( _rc != 0 )); then
     _delivered=0
-    _reason="$(_agent_submit_unconfirmed_reason)"
+    _reason="$(_agent_submit_unconfirmed_reason "$target" "$_rc")"
   fi
   # DIVE-3573 (a): mirror the outbound into the sender's buzz channel.
   #
@@ -2166,7 +2333,7 @@ cmd_send() {
     fail "$E_AUTH_REQUIRED" "$(_agent_credential_refusal_msg "$name")"
   elif (( _rc != 0 )); then
     _sent=0
-    _reason="$(_agent_submit_unconfirmed_reason)"
+    _reason="$(_agent_submit_unconfirmed_reason "$name" "$_rc")"
   fi
 
   # Mirror the outbound into the sender's group chat (best-effort). Gated on a
@@ -2391,7 +2558,7 @@ cmd_ask() {
       || fail "$E_GENERIC" "scoped delivery to '$name' returned no usable receipt"
     if [[ "$(jq -r '.data.delivered' <<<"$_dout")" == false ]]; then
       local _reason; _reason=$(jq -r '.data.reason // empty' <<<"$_dout")
-      [[ -n "$_reason" ]] || _reason="$(_agent_submit_unconfirmed_reason)"
+      [[ -n "$_reason" ]] || _reason="$(_agent_submit_unconfirmed_reason "$name")"
       _agent_ask_unconfirmed "$name" "$sender" "$msg_id" "$_reason"
       return 0
     fi
@@ -2421,7 +2588,7 @@ cmd_ask() {
     local payload="${header} ${ask_message}"
     # Same boot-race guard as cmd_send: wait for the input prompt before sending
     # so a freshly-(re)started target doesn't silently drop the question.
-    if ! wait_agent_input_ready "$name"; then
+    if ! _agent_delivery_inbox "$name" >/dev/null 2>&1 && ! wait_agent_input_ready "$name"; then
       step "agent '$name' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
     fi
     local _rc=0
@@ -2429,7 +2596,7 @@ cmd_ask() {
     if (( _rc == 3 )); then
       fail "$E_AUTH_REQUIRED" "$(_agent_credential_refusal_msg "$name")"
     elif (( _rc != 0 )); then
-      local _reason; _reason="$(_agent_submit_unconfirmed_reason)"
+      local _reason; _reason="$(_agent_submit_unconfirmed_reason "$name" "$_rc")"
       _agent_ask_unconfirmed "$name" "$sender" "$msg_id" "$_reason"
       return 0
     fi
