@@ -83,6 +83,8 @@ _plugin_usage() {
   5dive plugin add <plugin>[@<marketplace>] [--yes]
   5dive plugin remove <plugin>[@<marketplace>]
   5dive plugin upgrade <plugin>[@<marketplace>]
+  5dive plugin enable|disable <plugin>[@<marketplace>]    # a flag flip; the code stays on disk
+  5dive plugin rollback <plugin>[@<marketplace>] [<version>]
 
   5dive plugin marketplace add <source> [--as=<name>]
   5dive plugin marketplace list [--json]
@@ -801,6 +803,62 @@ cmd_plugin_upgrade() {
      '{plugin:$k, from:$f, to:$t, changed:true}' --arg k "$key" --arg f "$cur" --arg t "$new"
 }
 
+# §3: "Enable/disable is a config FLAG, not a re-copy."
+#
+# This exists because `plugin list` renders an ENABLED column, and a column that
+# can only ever say "yes" is a claim the product cannot honour — a reader takes it
+# to mean the state is controllable and it is not. Either the verb exists or the
+# column should not.
+#
+# Disable removes the POINTER and clears the flag; the version-keyed dir stays
+# untouched, so re-enabling is a flip and not a re-fetch from a marketplace that
+# may since have moved on — the same property that makes `rollback` cheap. This is
+# also the honest answer to "I want this off NOW": it needs no network, no
+# marketplace and no consent screen, because nothing new is being installed.
+_plugin_set_enabled() {
+  local ref="$1" want="$2"     # want = true|false
+  _plugin_ensure_store
+  local j; j=$(cat "$(_plugin_installed_json)")
+  local key; _plugin_resolve_installed_key "$ref" "$j"; key="$_PL_KEY"
+
+  local cur; cur=$(jq -r --arg k "$key" '.[$k].enabled' <<<"$j")
+  if [[ "$cur" == "$want" ]]; then
+    ok "$key is already $([[ "$want" == true ]] && echo enabled || echo disabled)" \
+       '{plugin:$k, enabled:($e=="true"), changed:false}' --arg k "$key" --arg e "$want"
+    return 0
+  fi
+
+  local plugin mkt version
+  plugin=$(jq -r --arg k "$key" '.[$k].plugin' <<<"$j")
+  mkt=$(jq -r --arg k "$key" '.[$k].marketplace' <<<"$j")
+  version=$(jq -r --arg k "$key" '.[$k].version' <<<"$j")
+
+  if [[ "$want" == true ]]; then
+    local dest="$(_plugin_cache_dir)/$mkt/$plugin/$version"
+    # The recorded version must still be ON DISK. If it is not, re-enabling would
+    # write a dangling pointer and `list` would then claim enabled for a plugin
+    # with no code behind it — a worse state than disabled.
+    [[ -d "$dest" ]] \
+      || fail "$E_NOT_FOUND" "$key records version $version but that version is not on disk — reinstall it: 5dive plugin add $key"
+    ln -sfn "$dest" "$(_plugin_enabled_dir)/$key"
+  else
+    rm -f "$(_plugin_enabled_dir)/$key"
+  fi
+
+  local tmp; tmp=$(mktemp)
+  jq --arg k "$key" --argjson e "$want" '.[$k].enabled = $e' <<<"$j" > "$tmp" \
+    && mv "$tmp" "$(_plugin_installed_json)"
+  if [[ "$want" == true ]]; then
+    ok "$key enabled ($version)" '{plugin:$k, enabled:true, changed:true}' --arg k "$key"
+  else
+    ok "$key disabled — its code is still on disk at version $version, so 'plugin enable $key' is a flip, not a reinstall" \
+       '{plugin:$k, enabled:false, changed:true}' --arg k "$key"
+  fi
+}
+
+cmd_plugin_enable()  { [[ -n "${1:-}" ]] || fail "$E_USAGE" "usage: 5dive plugin enable <plugin>[@<marketplace>]";  _plugin_set_enabled "$1" true; }
+cmd_plugin_disable() { [[ -n "${1:-}" ]] || fail "$E_USAGE" "usage: 5dive plugin disable <plugin>[@<marketplace>]"; _plugin_set_enabled "$1" false; }
+
 # Rollback is the other half of §4's "install alongside, then flip". Without it
 # the old version dir left on disk is dead weight rather than a safety net, and
 # the reason the cache is version-keyed at all disappears.
@@ -823,7 +881,12 @@ cmd_plugin_rollback() {
   fi
   [[ -d "$base/$want" ]] || fail "$E_NOT_FOUND" "version '$want' of $key is not on disk (have: $(ls "$base" 2>/dev/null | tr '\n' ' '))"
 
-  ln -sfn "$base/$want" "$(_plugin_enabled_dir)/$key"
+  # A DISABLED plugin stays disabled through a rollback. Writing the pointer
+  # unconditionally would turn "roll back to the version that worked" into
+  # "...and switch it back on", which is a second decision the user did not make.
+  if [[ "$(jq -r --arg k "$key" '.[$k].enabled' <<<"$j")" == "true" ]]; then
+    ln -sfn "$base/$want" "$(_plugin_enabled_dir)/$key"
+  fi
   local tmp; tmp=$(mktemp)
   jq --arg k "$key" --arg v "$want" '.[$k].version = $v' <<<"$j" > "$tmp" && mv "$tmp" "$(_plugin_installed_json)"
   ok "$key rolled back $cur -> $want" '{plugin:$k, from:$f, to:$t}' --arg k "$key" --arg f "$cur" --arg t "$want"
@@ -838,6 +901,8 @@ cmd_plugin() {
     ls|list)         cmd_plugin_list "$@" ;;
     rm|remove|uninstall) cmd_plugin_remove "$@" ;;
     upgrade|update)  cmd_plugin_upgrade "$@" ;;
+    enable)          cmd_plugin_enable "$@" ;;
+    disable)         cmd_plugin_disable "$@" ;;
     rollback)        cmd_plugin_rollback "$@" ;;
     *) fail "$E_USAGE" "unknown: 5dive plugin $sub (see: 5dive plugin --help)" ;;
   esac

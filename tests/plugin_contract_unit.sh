@@ -254,6 +254,46 @@ t "T6b ...the pointer"        "no"   "$([[ -e "$(_plugin_enabled_dir)/good@fixtu
 t "T6c ...and the record"     "null" "$(jq -c '.["good@fixture"] // "null"' "$(_plugin_installed_json)" | tr -d '"')"
 
 # =============================================================================
+# §3 — enable/disable is a FLAG FLIP, not a re-copy
+# =============================================================================
+# `plugin list` renders an ENABLED column. A column that can only ever say "yes"
+# is a claim the product cannot honour, so either the verb exists or the column
+# should not. These arms are what keep those two in step.
+run cmd_plugin_add aliased@fixture --yes   # already installed; ensures a subject
+run cmd_plugin_disable aliased@fixture
+t "T11a disable clears the flag"     "false" "$(jq -r '.["aliased@fixture"].enabled' "$(_plugin_installed_json)")"
+t "T11b ...and drops the pointer"    "no"    "$([[ -e "$(_plugin_enabled_dir)/aliased@fixture" ]] && echo yes || echo no)"
+t "T11c ...but leaves the CODE on disk, which is what makes re-enabling a flip and not a re-fetch" "yes" \
+  "$([[ -d "$(_plugin_cache_dir)/fixture/aliased/1.0.0" ]] && echo yes || echo no)"
+run cmd_plugin_disable aliased@fixture
+tc "T11d disabling twice is a no-op that says so" "already disabled" "$OUT$ERR"
+run cmd_plugin_enable aliased@fixture
+t "T11e enable restores the pointer"  "yes"  "$([[ -L "$(_plugin_enabled_dir)/aliased@fixture" ]] && echo yes || echo no)"
+t "T11f ...and the flag"              "true" "$(jq -r '.["aliased@fixture"].enabled' "$(_plugin_installed_json)")"
+
+# Re-enabling must not write a DANGLING pointer: `list` would then say enabled for
+# a plugin with no code behind it, which is a worse state than disabled.
+run cmd_plugin_disable codexed@fixture
+rm -rf "$(_plugin_cache_dir)/fixture/codexed/1.0.0"
+run cmd_plugin_enable codexed@fixture
+t  "T11g enabling a version that is no longer on disk is refused" "$E_NOT_FOUND" "$RC"
+t  "T11h ...and no dangling pointer was written" "no" \
+   "$([[ -e "$(_plugin_enabled_dir)/codexed@fixture" ]] && echo yes || echo no)"
+
+# A rollback must not silently switch a disabled plugin back on — that is a second
+# decision the user did not make.
+run cmd_plugin_add good@fixture --yes
+jq '.version="1.2.0"' "$MKT/good/.claude-plugin/plugin.json" > "$TMP/x" && mv "$TMP/x" "$MKT/good/.claude-plugin/plugin.json"
+run _plugin_mkt_upgrade fixture
+run cmd_plugin_upgrade good@fixture
+run cmd_plugin_disable good@fixture
+run cmd_plugin_rollback good@fixture
+t "T11i rollback moves the recorded version even while disabled" "1.1.0" \
+  "$(jq -r '.["good@fixture"].version' "$(_plugin_installed_json)")"
+t "T11j ...and does NOT re-enable it behind the user's back" "no" \
+  "$([[ -e "$(_plugin_enabled_dir)/good@fixture" ]] && echo yes || echo no)"
+
+# =============================================================================
 # marketplaces
 # =============================================================================
 run _plugin_mkt_remove fixture
