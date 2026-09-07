@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "voice",
-      "description": "Talk to your agent by voice. The reference implementation of the 5dive plugin contract — a channel-capability plugin, the shape every later channel plugin copies.",
+      "description": "Speak with your agent and hear it talk back — local speech-to-text and text-to-speech. The reference implementation of the 5dive plugin contract: a channel-capability plugin, the shape every later channel plugin copies.",
       "category": "channel",
       "source": "./voice",
       "homepage": "https://github.com/5dive-ai/5dive/tree/main/plugins/voice"

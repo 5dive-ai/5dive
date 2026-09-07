@@ -1,7 +1,7 @@
 {
   "name": "voice",
   "version": "1.0.0",
-  "description": "Talk to your agent by voice.",
+  "description": "Speak with your agent and hear it talk back — speech-to-text and text-to-speech on your own box.",
   "author": {
     "name": "5dive",
     "email": "support@5dive.com",
@@ -9,10 +9,16 @@
   },
   "homepage": "https://github.com/5dive-ai/5dive/tree/main/plugins/voice",
   "license": "MIT",
-  "keywords": ["voice", "channel", "audio"],
+  "keywords": [
+    "voice",
+    "channel",
+    "audio"
+  ],
   "fivedive": {
     "contract": "1",
-    "capabilities": ["channel"],
+    "capabilities": [
+      "channel"
+    ],
     "verbs": [
       {
         "name": "voice",
@@ -20,11 +26,18 @@
         "installs": "channel"
       }
     ],
-    "grants": ["audio-io", "telegram-token"],
+    "grants": [
+      "audio-io",
+      "telegram-token"
+    ],
     "trust": {
       "publisher": "5dive",
       "did": "did:key:5dive",
       "review": "official"
+    },
+    "setup": {
+      "hint": "voice needs a host-level engine that 5dive will not install behind your back: ffmpeg, faster-whisper and edge-tts, plus a warm transcription service on port 8765.",
+      "command": "sudo 5dive-setup-voice"
     }
   }
 }

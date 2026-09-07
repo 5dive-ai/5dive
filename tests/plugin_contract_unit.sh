@@ -309,5 +309,34 @@ run cmd_market --kind=banana; t "T8d an unknown --kind is refused rather than si
 run cmd_market --help
 t 'T8e plain market --help still works (control: --kind did not break the persona front door)' "0" "$RC"
 
+# =============================================================================
+# fivedive.setup — PRINTED, never executed (proposed §6 addendum)
+# =============================================================================
+# T9c is the arm that matters and it is a negative control: the command in the
+# manifest writes a sentinel file, so if `plugin add` ever executes it instead of
+# printing it, the file exists and this arm reds. Without that arm the feature is
+# indistinguishable from a post-install hook, which is arbitrary code execution
+# chosen by the publisher — the door contract §5 keeps shut.
+SENTINEL="$TMP/EXECUTED"
+mkplugin setupy "$(manifest setupy 1.0.0 official '["channel"]' '[]' \
+  "$(jq -cn --arg s "$SENTINEL" '{setup:{hint:"needs a host engine", command:("touch " + $s)}}')")"
+mkindex
+run _plugin_mkt_upgrade fixture
+run cmd_plugin_add setupy@fixture --yes
+t  "T9a a plugin declaring a setup step installs"            "0" "$RC"
+tc "T9b ...and its hint is shown to the user"                "needs a host engine" "$OUT$ERR"
+tc "T9b2 ...along with the command, marked as theirs to run" "5dive does not run this for you" "$OUT$ERR"
+t  "T9c ...and the command was PRINTED, NOT EXECUTED (the whole design in one arm)" "no" \
+   "$([[ -e "$SENTINEL" ]] && echo yes || echo no)"
+
+# The bundled voice plugin is the live instance of that, so grade the real file
+# rather than only the fixture: if someone later drops the setup block from
+# voice, or points it at something other than the host installer, this reds.
+VOICE="$(_plugin_source_dir 5dive voice)/.claude-plugin/plugin.json"
+t "T9d voice names the real host installer, not a placeholder" "sudo 5dive-setup-voice" \
+  "$(jq -r '.fivedive.setup.command' "$VOICE")"
+t "T9e voice asks for audio, which is what makes its consent screen honest" "true" \
+  "$(jq -r '[.fivedive.grants[]] | index("audio-io") != null' "$VOICE")"
+
 printf 'plugin_contract_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

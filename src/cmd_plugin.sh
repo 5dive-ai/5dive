@@ -675,6 +675,28 @@ cmd_plugin_add() {
     echo "  Note: $plugin declares no 5dive capabilities, so it registers no surfaces." >&2
     echo "  It is installed and inert (contract §2)." >&2
   fi
+
+  # `fivedive.setup` — a PROPOSED addendum to contract §6, and the whole of its
+  # design is in one word: PRINTED. Some plugins need a host-level step the
+  # installer must not take for them (voice pulls ffmpeg, a python venv and a
+  # systemd unit). Without this the user is left at "installed — now what?", which
+  # is the same dead end `plugin` exists to remove, one step later.
+  #
+  # It is NOT a post-install hook and must never become one. Executing a string
+  # from a manifest at install time is arbitrary code execution chosen by the
+  # publisher, which is precisely the door contract §5 keeps shut and lodar
+  # deferred on 2026-09-07 — and it would be worse than the door, because it
+  # would run BEFORE the user had seen what they installed. So we print it and
+  # the human runs it. T9c asserts that we do not run it.
+  local setup_hint setup_cmd
+  setup_hint=$(jq -r '.fivedive.setup.hint // ""' <<<"$j")
+  setup_cmd=$(jq -r '.fivedive.setup.command // ""' <<<"$j")
+  if [[ -n "$setup_hint" || -n "$setup_cmd" ]]; then
+    echo >&2
+    [[ -n "$setup_hint" ]] && echo "  $setup_hint" >&2
+    [[ -n "$setup_cmd"  ]] && echo "  Run it yourself when you are ready:  $setup_cmd" >&2
+    echo "  (5dive does not run this for you — read it first; it is the publisher's text.)" >&2
+  fi
   ok "$key $version installed${caps:+ — registers: $caps}" \
      '{plugin:$p, marketplace:$m, version:$v, review:$r, capabilities:$c, changed:true}' \
      --arg p "$plugin" --arg m "$mkt" --arg v "$version" --arg r "$review" \
@@ -712,6 +734,12 @@ cmd_plugin_remove() {
   # this plugin ever installed, the pointer, and the config stanza. A plugin that
   # leaves a version behind leaves code on the box that the user believes they
   # removed, which is the whole point of the clause.
+  # Both come from a key that was just verified to exist in installed.json, so
+  # neither can be empty — asserted anyway, because the next line is an `rm -rf`
+  # and "cannot be empty" is exactly the reasoning that precedes deleting a cache
+  # root. Cheap here, unrecoverable if wrong.
+  [[ -n "$plugin" && -n "$mkt" && "$plugin" != "null" && "$mkt" != "null" ]] \
+    || fail "$E_GENERIC" "refusing to remove: '$key' has no plugin/marketplace recorded"
   rm -f  "$(_plugin_enabled_dir)/$key"
   rm -rf "$(_plugin_cache_dir)/$mkt/$plugin"
   local tmp; tmp=$(mktemp)
