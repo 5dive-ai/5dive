@@ -172,19 +172,19 @@ rec() { # rec <state> <evidence>
     sudo:{measured:true,grant:"g",scope:"s",runas:"r",extraEntries:false,diverges:false},
     supervisor:{stateNote:"n",note:"o",line:"l",verdict:null}, createdAt:"t"}'
 }
-out=$(rec refused "Channels are not currently available" | jq -r "$render")
+out=$(rec refused "Channels are not currently available" | jq -r --arg authLine "ok" "$render")
 tc "5.1 the channels line says DECLARED"      "— DECLARED (registry)" "$out"
 tc "5.2 a refused seat prints bound: NO"      "bound:       NO — REFUSED at runtime" "$out"
 tc "5.3 with the banner beside it"            "Channels are not currently available" "$out"
 tc "5.4 and warns that other lines look fine" "WARNING: this agent DECLARES channels" "$out"
 tc "5.5 and names where the gate is"          "inside the coding-CLI binary" "$out"
 
-out=$(rec unknown "" | jq -r "$render")
+out=$(rec unknown "" | jq -r --arg authLine "ok" "$render")
 tc  "5.6 an unprobed seat prints bound: unknown" "bound:       unknown" "$out"
 tnc "5.7 and never the word REFUSED"             "REFUSED" "$out"
 tnc "5.8 and raises no warning"                  "WARNING: this agent DECLARES" "$out"
 
-out=$(rec "n/a" "" | jq -r "$render")
+out=$(rec "n/a" "" | jq -r --arg authLine "ok" "$render")
 tnc "5.9 a channel-less seat gets no bound: line" "bound:" "$out"
 tnc "5.10 and no DECLARED suffix"                 "DECLARED (registry)" "$out"
 
