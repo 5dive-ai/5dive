@@ -239,6 +239,18 @@ want='[{"pack":"ci-analyst","cron":"0 */4 * * *"},{"id":"weekly-brief","title":"
   && ok_t 'T9 export dumps a pack loop as pack:, a declared loop by its id, and a hand-made one by a derived id' \
   || bad_t 'T9 export does not round-trip loops — a saved fleet would claim it has no recurring work' "got=$exp"
 
+# A title long enough to hit the 64-char cap must not export an id ending in a
+# hyphen — measured on the live fleet, where several recurring titles do.
+sqlite3 "$DB" "INSERT INTO tasks (kind,assignee,title,body,schedule) VALUES
+  ('recurring','b','Recurring: smart GitHub discovery of new OSS integration targets everywhere','','0 9 * * 1');"
+lid=$( set -uo pipefail
+       db() { sqlite3 "$DB" "$1"; }
+       sqlq() { printf "'%s'" "${1//\'/\'\'}"; }
+       . "$TMP/loops.sh"; _compose_export_loops b | jq -r '.[0].id' )
+[[ ${#lid} -le 64 && "$lid" != *- ]] \
+  && ok_t "T9d a long title exports a capped id with no trailing hyphen (got '$lid')" \
+  || bad_t 'T9d the derived id is malformed at the length cap' "id=$lid len=${#lid}"
+
 # The derived id must be the one the reconcile then matches on, or the round-trip
 # is a doubling machine: export -> re-import -> two of everything.
 [[ "$(jq -r '.[2].title' <<<"$exp")" == "$(sqlite3 "$DB" "SELECT title FROM tasks WHERE title LIKE 'Hand Made%';")" ]] \

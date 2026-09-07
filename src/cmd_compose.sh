@@ -1135,7 +1135,7 @@ _compose_export_loops() {
              WHERE kind='recurring' AND assignee=$(sqlq "$agent");" 2>/dev/null | head -1)
   [[ -n "$rows" ]] || { printf '[]'; return 0; }
   jq -c '
-    def slugify: ascii_downcase | gsub("[^a-z0-9]+"; "-") | gsub("^-+|-+$"; "") | .[0:64];
+    def slugify: ascii_downcase | gsub("[^a-z0-9]+"; "-") | gsub("^-+|-+$"; "") | .[0:64] | sub("-+$"; "");
     map(
       ([.body | scan("installed loop: ([a-z0-9-]+) \\(5dive marketplace\\)")] | first | first) as $pack
       | ([.body | scan("declared loop: ([a-z0-9-]+) \\(5dive\\.yaml\\)")] | first | first) as $decl
