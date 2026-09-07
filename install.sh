@@ -938,11 +938,21 @@ JOURNALD
   #
   # Enumerated per file for the same reason team-templates is: $REPO is a flat
   # fetch URL with no directory listing. Add a line per new bundled plugin file.
-  mkdir -p "$LIB_DIR/plugins/.claude-plugin" "$LIB_DIR/plugins/voice/.claude-plugin"
+  #
+  # DIVE-4035 — MODE IS PART OF THE STAGE, not a detail. A plugin verb resolves
+  # to <plugin>/bin/<verb> and 5dive refuses to dispatch a file that is not
+  # executable, so a blanket `chmod 644` here would stage a voice that installs
+  # and then cannot run — the exact silent-inertness DIVE-4035 removed,
+  # reintroduced by the installer. Anything under a plugin's bin/ is staged 755.
+  mkdir -p "$LIB_DIR/plugins/.claude-plugin" "$LIB_DIR/plugins/voice/.claude-plugin" \
+           "$LIB_DIR/plugins/voice/bin"
   _plug_ok=1
-  for _pf in .claude-plugin/marketplace.json voice/.claude-plugin/plugin.json voice/README.md; do
+  for _pf in .claude-plugin/marketplace.json voice/.claude-plugin/plugin.json voice/README.md voice/bin/voice; do
     if curl -fsSL "$REPO/plugins/$_pf" -o "$LIB_DIR/plugins/$_pf"; then
-      chmod 644 "$LIB_DIR/plugins/$_pf"
+      case "$_pf" in
+        */bin/*) chmod 755 "$LIB_DIR/plugins/$_pf" ;;
+        *)       chmod 644 "$LIB_DIR/plugins/$_pf" ;;
+      esac
     else
       _plug_ok=0
       echo "warn: failed to stage bundled plugin file $_pf — '5dive plugin add voice' won't resolve until the next refresh" >&2

@@ -7,7 +7,8 @@ every other plugin:
 5dive market --kind=plugin        # see what exists
 5dive plugin add voice            # read who published it and what it is handed, then agree
 sudo 5dive-setup-voice            # the host-level engine — you run this, not us (see below)
-5dive plugin list                 # voice 1.0.0  official  channel
+5dive plugin list                 # voice 1.0.0  official  channel,verb
+5dive voice                       # the verb the plugin registers
 ```
 
 ## What the voice runtime actually is
@@ -57,11 +58,20 @@ written — it is here because "installed — now what?" is the same dead end th
 }
 ```
 
-- **`capabilities: ["channel"]`** is the whole point. Contract §2: *an undeclared
-  surface is inert.* The installer registers what this array names and nothing
-  else. If voice later ships an MCP server without adding `"mcp"` here, that
-  server is not registered — and `plugin add` says so out loud rather than
-  dropping it silently.
+- **`capabilities: ["channel", "verb"]`** is the whole point. Contract §2: *an
+  undeclared surface is inert.* The installer registers what this array names and
+  nothing else. If voice later ships an MCP server without adding `"mcp"` here,
+  that server is not registered — and `plugin add` says so out loud rather than
+  dropping it silently. `verb` arrived in DIVE-4035; before it, this manifest
+  named a verb without declaring the capability, so `5dive voice` did not exist
+  — correct under §2, and silent about it, which is the half the amendment fixed.
+- **`bin/voice`** is where the verb resolves, and 5dive picked that path, not the
+  manifest. The manifest names `voice`; it never says what to run. A command line
+  out of `plugin.json` would be arbitrary code chosen by the publisher — the same
+  door `setup` is printed rather than executed to keep shut. `5dive voice` runs
+  `bin/voice` with your argv as a vector, and it can only ever be reached after
+  every builtin 5dive command has already had its chance, so a plugin cannot take
+  `5dive task` from you.
 - **`grants`** is the consent list, not documentation. `plugin add` prints it
   back in plain English ("your microphone and speakers") and will not install
   until you agree. A plugin that asks for nothing gets nothing beyond its own

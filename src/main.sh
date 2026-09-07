@@ -1288,7 +1288,27 @@ main() {
       # trap can fire (DIVE-2797), so the row is written inside cmd_acp instead.
       cmd_acp "$@" ;;
     -h|--help|help) usage ;;
-    *) fail "$E_USAGE" "unknown command: $top" ;;
+    *)
+      # DIVE-4035 — contract §2's live half, and the ONLY place a plugin verb is
+      # reachable. Sitting last is the whole guarantee: every builtin above has
+      # already matched, so an installed plugin cannot shadow one no matter what
+      # its manifest says. It is also the cost argument — a registry read here is
+      # paid only by a command that was about to die anyway, never by the
+      # heartbeat's `task ls`.
+      #
+      # _plugin_dispatch_verb EXECS when a plugin claims $top, so control does
+      # not come back. It returns non-zero, silently, only when nothing claims
+      # it — and then this reads exactly as it did before the row.
+      # The `if !` is load-bearing under header.sh's errexit: a bare call
+      # returning 1 would exit the CLI right here with a silent 1 instead of
+      # reaching fail(), so the "no plugin claims it" path would print nothing at
+      # all. Attaching the condition also exempts the function's body from
+      # errexit — deliberate, because every refusal inside it goes through
+      # fail(), which exits on its own, and every other non-zero (no jq, no
+      # store, unreadable json) is meant to fall through to "unknown command".
+      if ! _plugin_dispatch_verb "$top" "$@"; then
+        fail "$E_USAGE" "unknown command: $top"
+      fi ;;
   esac
 }
 
