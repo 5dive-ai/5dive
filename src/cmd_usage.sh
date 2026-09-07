@@ -3,11 +3,10 @@
 # WHY this exists: our agents (and our customers') run on the Claude
 # *subscription*, not the metered API. The only ceiling that matters is the
 # 5h / 7d rate limit (the thing that hit "30% in a day"), and the only
-# ground-truth signal for who burned it is each agent's Claude Code session
-# transcript — every assistant turn logs message.usage (input / output / cache
-# tokens) + message.model + a timestamp. We sum those locally, attribute turns
-# to tasks by matching turn timestamps against the task queue's started/done
-# windows, and surface top agents + top tasks at a glance.
+# ground-truth signal for who burned it is each agent's local session transcript.
+# Claude Code logs per-turn usage; Codex logs cumulative usage snapshots. We
+# normalize both into input / output / cache-write / cache-read classes and
+# surface top agents + top tasks at a glance.
 #
 # DELIBERATELY NO DOLLARS. Subscription inference has no per-token price for the
 # user, so a "$" column would be fiction. We speak in tokens + share-of-limit.
@@ -24,7 +23,7 @@ usage_window_secs() {
   esac
 }
 
-# usage_collect <since_epoch> — emit one JSON object aggregating every claude
+# usage_collect <since_epoch> — emit one JSON object aggregating every supported
 # agent's token usage in the window, joined to the task queue. Shape:
 #   {window:{since,now}, agents:[{name,account,models:{<model>:{in,out,cc,cr,turns}},
 #            total,output,sevenDayPct,fiveHourPct}],
@@ -56,13 +55,15 @@ def to_epoch(s):
     except Exception:
         return None
 
-# --- registry: claude agents only (others have no Anthropic transcripts) ---
+# Transcript layout is selected from the registered agent type. Never infer a
+# provider from which directories happen to exist: stale state from a previous
+# install must not change which collector owns a seat (DIVE-4034).
 try:
     reg = json.load(open(registry))
 except Exception:
     reg = {"agents": {}}
 agents = {n: a for n, a in reg.get("agents", {}).items()
-          if a.get("type", "claude") == "claude"}
+          if a.get("type", "claude") in ("claude", "codex")}
 
 # DIVE-2069: is this the PRODUCTION store? Computed once, from the registry we were
 # handed — no env var a harness has to remember to set. See the fence below.
@@ -245,6 +246,46 @@ def list_sessions(projects):
             out.extend(os.path.join(subag, m) for m in sa_names if m.endswith(".jsonl"))
     return out, None
 
+def list_codex_sessions(sessions_root):
+    """Enumerate `.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` without glob.
+
+    Every wildcard level is listed explicitly so an unreadable year/month/day
+    cannot silently become zero usage. ENOENT means the live tree changed during
+    the scan; ENOTDIR means a non-directory occupied a date level and is skipped
+    only below the root, where it cannot contain a rollout.
+    """
+    out = []
+    try:
+        years = sorted(os.listdir(sessions_root))
+    except OSError as e:
+        if e.errno == errno.ENOENT:
+            return [], None
+        return [], "transcript dir %s became unreadable mid-scan: %s" % (sessions_root, e.strerror or e.errno)
+    level = [(sessions_root, y) for y in years]
+    for depth, label in ((1, "year"), (2, "month"), (3, "day")):
+        next_level = []
+        for parent, name in level:
+            path = os.path.join(parent, name)
+            try:
+                names = sorted(os.listdir(path))
+            except OSError as e:
+                if e.errno in (errno.ENOENT, errno.ENOTDIR):
+                    continue
+                return [], "codex %s dir %s unreadable: %s" % (label, path, e.strerror or e.errno)
+            if depth == 3:
+                out.extend(os.path.join(path, n) for n in names
+                           if n.startswith("rollout-") and n.endswith(".jsonl"))
+            else:
+                next_level.extend((path, n) for n in names)
+        level = next_level
+    return out, None
+
+def nonnegative_int(value):
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
 # --- scan transcripts: per agent per model token sums + per-turn timeline ---
 # turns[name] = list of (epoch, out_tokens, total_tokens) for task attribution.
 agent_rows = []
@@ -261,8 +302,11 @@ turns_by_agent = {}
 goal_pins = {}
 for name, meta in agents.items():
     home = home_of(name)
-    projects = os.path.join(home, ".claude", "projects")
-    readable, why = probe_readable(home, projects)
+    agent_type = meta.get("type", "claude")
+    transcript_root = (os.path.join(home, ".codex", "sessions")
+                       if agent_type == "codex"
+                       else os.path.join(home, ".claude", "projects"))
+    readable, why = probe_readable(home, transcript_root)
     if not readable:
         unreadable.append({"name": name, "reason": why})
         continue
@@ -273,10 +317,13 @@ for name, meta in agents.items():
     # DIVE-3419: a middle level we could not read makes this agent a blind spot,
     # not a low scorer. Same destination as an unreadable home or file — never a
     # silent short total sitting inside coverage.complete=true.
-    sessions, why = list_sessions(projects)
+    sessions, why = (list_codex_sessions(transcript_root) if agent_type == "codex"
+                     else list_sessions(transcript_root))
     if why is not None:
         unreadable.append({"name": name, "reason": why})
         continue
+    five = seven = None
+    newest_codex_rate_limit_ts = -1
     for path in sessions:
         try:
             if os.path.getmtime(path) < since:   # whole file predates window
@@ -291,6 +338,72 @@ for name, meta in agents.items():
             if e.errno != errno.ENOENT:
                 denied = denied or "some transcript files unreadable: %s" % (e.strerror or e.errno)
             continue
+        if agent_type == "codex":
+            # Codex's total_token_usage is cumulative within ONE rollout. Sum
+            # only the final valid snapshot from each file; summing snapshots
+            # multiplies the same tokens on every turn. A rollout whose final
+            # snapshot predates the requested window contributes nothing.
+            last_usage = None
+            last_ts = None
+            last_rate_limits = None
+            token_events = 0
+            with f:
+                for line in f:
+                    if '"token_count"' not in line:
+                        continue
+                    try:
+                        o = json.loads(line)
+                    except Exception:
+                        continue
+                    payload = o.get("payload") or {}
+                    info = payload.get("info") or {}
+                    usage = info.get("total_token_usage")
+                    ts = to_epoch(o.get("timestamp"))
+                    if (o.get("type") != "event_msg" or
+                            payload.get("type") != "token_count" or
+                            not isinstance(usage, dict) or ts is None):
+                        continue
+                    last_usage = usage
+                    last_ts = ts
+                    last_rate_limits = payload.get("rate_limits") or {}
+                    token_events += 1
+            if last_usage is None or last_ts < since:
+                continue
+
+            raw_input = nonnegative_int(last_usage.get("input_tokens"))
+            cr = nonnegative_int(last_usage.get("cached_input_tokens"))
+            cc = nonnegative_int(last_usage.get("cache_write_input_tokens"))
+            ot = nonnegative_int(last_usage.get("output_tokens"))
+            # Codex reports cached/cache-write tokens as subsets of input_tokens,
+            # unlike Claude's disjoint usage fields. Split them before feeding
+            # the shared classes so the headline still excludes cache reads.
+            i = max(0, raw_input - cr - cc)
+            # DIVE-4037 x DIVE-4034 — THE WEIGHT, STATED: these four classes are
+            # the same dict `quota = in+out+cc+cr` sums, so the line above is
+            # also the decision to count a CODEX cache read at 1.0x. That is
+            # DELIBERATE, not an accident of two branches meeting: Codex is the
+            # ONE provider where the weight is measured rather than assumed
+            # (DIVE-4028, n=1 — an 18-minute task moved 14,016,606 tokens,
+            # 98.2% of them cache reads, and the vendor's own gauge took 9% of
+            # the weekly pool for it; at a 0.1x weight that pool would have to
+            # be ~14M tokens, which it is not). So on Codex 1.0x is the
+            # best-supported weight we have; on Claude it is an unmeasured
+            # upper bound. Both are named by provider in the payload's
+            # `basis.quota.providerWeights` — never inferred from the sum.
+            m = models.setdefault("codex", {"in":0,"out":0,"cc":0,"cr":0,"turns":0})
+            m["in"] += i; m["out"] += ot; m["cc"] += cc; m["cr"] += cr
+            m["turns"] += token_events
+
+            if last_ts > newest_codex_rate_limit_ts:
+                newest_codex_rate_limit_ts = last_ts
+                primary = (last_rate_limits.get("primary") or {}).get("used_percent")
+                secondary = (last_rate_limits.get("secondary") or {}).get("used_percent")
+                five, seven = primary, secondary
+            # Session-cumulative totals cannot be truthfully assigned to one
+            # task window. Keep them in the agent row rather than manufacturing
+            # a task attribution at the rollout's final timestamp.
+            continue
+
         with f:
             for line in f:
                 # Match ONLY the heartbeat's fixed nudge phrasing (cmd_heartbeat.sh:
@@ -368,16 +481,17 @@ for name, meta in agents.items():
     quota  = sum(m["in"]+m["out"]+m["cc"]+m["cr"] for m in models.values())
     output = sum(m["out"] for m in models.values())
     cread  = sum(m["cr"] for m in models.values())
-    # freshest rate-limit % from the statusline cache (the live 5h/7d numbers).
-    five = seven = None
-    cache = os.path.join(home, ".claude", "statusline-last.json")
-    try:
-        sc = json.load(open(cache))
-        rl = sc.get("rate_limits") or {}
-        five  = (rl.get("five_hour") or {}).get("used_percentage")
-        seven = (rl.get("seven_day") or {}).get("used_percentage")
-    except Exception:
-        pass
+    # Claude's freshest percentages live in its statusline cache. Codex's were
+    # taken from the newest included token_count snapshot above.
+    if agent_type == "claude":
+        cache = os.path.join(home, ".claude", "statusline-last.json")
+        try:
+            sc = json.load(open(cache))
+            rl = sc.get("rate_limits") or {}
+            five  = (rl.get("five_hour") or {}).get("used_percentage")
+            seven = (rl.get("seven_day") or {}).get("used_percentage")
+        except Exception:
+            pass
     agent_rows.append({
         "name": name, "account": meta.get("authProfile"),
         "models": models, "total": total, "quota": quota,
@@ -501,7 +615,32 @@ print(json.dumps({
                   "use": "capacity and alerting / what runs out",
                   "caveat": "unweighted token sum; per-provider cache-read "
                             "weighting is measured only on OpenAI/Codex (n=1, "
-                            "DIVE-4028), so treat as an upper bound"},
+                            "DIVE-4028), so treat as an upper bound",
+                  # DIVE-4037: the weight is DECLARED per provider rather than
+                  # left implicit in an unweighted sum. Both providers are
+                  # summed at 1.0x, but for different reasons and with
+                  # different standing, and a consumer must be able to tell
+                  # which figure rests on a measurement.
+                  "providerWeights": {
+                      "codex": {"cacheRead": 1.0, "basis": "measured",
+                                "evidence": "DIVE-4028, n=1: 14,016,606 tokens "
+                                            "(98.2% cache reads) = 9% of a "
+                                            "weekly pool"},
+                      "claude": {"cacheRead": 1.0, "basis": "assumed",
+                                 "evidence": "no first-party gauge-vs-token "
+                                             "measurement; 1.0x is an upper "
+                                             "bound, not a vendor statement"},
+                  },
+                  # Codex rollouts log CUMULATIVE per-session snapshots, not
+                  # per-turn events, so a Codex seat's tokens are truthfully
+                  # assignable to an agent but NOT to a task window. They are
+                  # in `agents[].quota` and in NO `tasks[]` row — so summing
+                  # tasks[].quota is not fleet plan burn on a mixed fleet.
+                  "taskAttribution": {
+                      "claude": "per-turn, attributed",
+                      "codex": "agent-row only — cumulative rollout snapshots "
+                               "cannot be assigned to a task window",
+                  }},
     },
     "agents": agent_rows, "tasks": tasks, "untracked": untracked,
     # DIVE-1929: what this read COVERED, so a consumer can tell a company-wide
@@ -551,6 +690,14 @@ USAGE_JQ_HELPERS='
   def qta:   if (.quota == null) then null else .quota end;
   def qtaN:  if (.quota == null) then (.total // 0) else .quota end;
   def qcell: if . == null then "?" else htok end;
+  # DIVE-4037 (verifier residual, quinn): the same absence rule has to hold on
+  # BOTH surfaces that render a quota cell, and it did not — TOP AGENTS went
+  # through `qcell` while TOP TASKS open-coded the null test, so restoring
+  # `.quota // .total` at the TOP TASKS site left the suite green. A rule
+  # written twice is a rule held once. `qcellu` is `qcell` for a cell that also
+  # carries the DIVE-2312 unverified qualifier; both surfaces now reach the
+  # guard through `qta`, so there is one place to mutate and one place to test.
+  def qcellu($unv): if . == null then "?" else qtok($unv) end;
 '
 
 # cmd_usage — entry point. Dispatches budget subcommand, else renders the board
@@ -647,9 +794,18 @@ usage_coverage_note() {
 # replace one confident wrong number with two unlabelled ones, so the key ships
 # on the same screen as the table — not in `--help`, which nobody reads while
 # looking at a burn figure.
+# It takes the payload so the per-provider weight line can name only the
+# providers actually in this window (DIVE-4037 verifier round: the merge with
+# DIVE-4034 started counting Codex cache reads at 1.0x, and a weight nobody
+# stated is a weight nobody can check).
 usage_basis_legend() {
+  local data="${1:-}"
   printf '  %s\n' "API-EQ = input+output+cache-write (what this would have cost on the API — use for value ranking)"
   printf '  %s\n' "QUOTA  = API-EQ + cache-read (what a flat-rate plan meters — use for capacity; this is the number that runs out)"
+  [[ -n "$data" ]] || return 0
+  if [[ "$(jq -r '[.agents[]?.models? // {} | keys[]] | any(. == "codex")' <<<"$data" 2>/dev/null)" == "true" ]]; then
+    printf '  %s\n' "QUOTA counts a cache read at 1.0x on BOTH providers: measured on Codex (DIVE-4028, n=1), ASSUMED on Claude — so Claude rows are an upper bound. Codex tokens are agent-row only, never per-task."
+  fi
 }
 
 # usage_render_board — top agents + top tasks, sorted by tokens descending.
@@ -687,7 +843,7 @@ usage_render_board() {
   jq -r "$USAGE_JQ_HELPERS"'
     # per-account QUOTA totals → each agent gets a share of its account 7d limit.
     (reduce .agents[] as $a ({}; .[$a.account // "-"] += ($a | qtaN))) as $acct
-    | if (.agents | length) == 0 then "  (no claude-agent transcripts in window)"
+    | if (.agents | length) == 0 then "  (no supported-agent transcripts in window)"
       else
       (["AGENT","MODEL","OUTPUT","API-EQ","QUOTA","7D%","SHARE"] | @tsv),
       (.agents | sort_by(-(. | qtaN))[] |
@@ -699,7 +855,7 @@ usage_render_board() {
           pct(.sevenDayPct), (if $share==null then "-" else (($share|floor|tostring)+"%") end)
         ] | @tsv)
       end' <<<"$data" | column -t -s $'\t' | sed 's/^/  /'
-  usage_basis_legend
+  usage_basis_legend "$data"
 
   echo
   # DIVE-4037: TOP TASKS stays ordered by API-EQ, the opposite call from TOP
@@ -719,7 +875,7 @@ usage_render_board() {
         [ (.ident + (if $unv then " ⚠" else "" end)), .assignee,
           (if (.iteration // 0) > 0 then (.iteration|tostring) else "-" end),
           (.output|qtok($unv)), (.total|qtok($unv)),
-          (if .quota == null then "?" else (.quota|qtok($unv)) end),
+          ((. | qta) | qcellu($unv)),
           (.title | if length > 38 then .[:37] + "…" else . end) ] | @tsv)
     end' <<<"$data" | column -t -s $'\t' | sed 's/^/  /'
 
@@ -768,7 +924,7 @@ usage_render_agent() {
   if [[ -z "$row" ]]; then
     [[ -n "$blind" ]] && fail "$E_PERMISSION" \
       "cannot read '$agent' transcripts: $(jq -r '.reason // "unreadable"' <<<"$blind") — this is NOT 'no usage', it is no visibility (try: sudo 5dive usage $agent)"
-    fail "$E_GENERIC" "no usage for agent '$agent' in window (or not a claude agent)"
+    fail "$E_GENERIC" "no usage for agent '$agent' in window (or unsupported agent type)"
   fi
   if (( JSON_MODE )); then
     # `partial` rides WITH the numbers: a consumer that reads .data.usage.total
@@ -1284,7 +1440,7 @@ cmd_cost() {
   [[ -n "$cov_note" ]] && { printf '%s\n' "$cov_note"; echo; }
   echo "COST — $label  (subscription tokens; no \$ — agents run on the plan)"
   jq -r "$USAGE_JQ_HELPERS"'
-    if (.|length)==0 then "  (no claude-agent transcripts in window)"
+    if (.|length)==0 then "  (no supported-agent transcripts in window)"
     else
       (["","AGENT","API-EQ","QUOTA","BASIS","SOFT","CEILING","HARD-STOP","STATE"]|@tsv),
       (.[] |
@@ -1307,7 +1463,7 @@ cmd_cost() {
            elif .state=="ok"   then "ok"
            else "no budget" end) ]|@tsv)
     end' <<<"$rows" | column -t -s $'\t' | sed 's/^/  /'
-  usage_basis_legend
+  usage_basis_legend "$data"
   # DIVE-4037: the specific unsafe combination, called out by name rather than
   # left for the reader to spot in the BASIS column — a threshold being
   # enforced against API-EQ while the plan is being consumed at QUOTA rate. The

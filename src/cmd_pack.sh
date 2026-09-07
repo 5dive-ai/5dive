@@ -637,7 +637,13 @@ _market_usage() {
   5dive market --rarity=<tier>          # filter by tier (mythical|legendary|epic|rare)
   5dive market --seasoned               # only packs that ship pre-trained memory
   5dive market show <slug>              # preview a persona: tier, model, skills, card, DID
+  5dive market --kind=plugin [<kw>]     # browse PLUGINS instead of agents (see: 5dive plugin)
   --json                                # machine-readable (dashboard/agent feed)
+
+  Aliases, so the verb answers to whatever you reach for:
+    ls | list | browse                  # the default, an explicit no-op
+    search | find <keyword>             # same as passing the keyword bare
+    show | info | preview <slug>        # the single-persona view
 
   Then: 5dive hire <role> --from-market --dry-run   (preview a real hire, provisions nothing)
         5dive agent inspect <slug>                  (full install-time disclosure, incl. which harnesses it lands on)
@@ -668,6 +674,31 @@ _MARKET_JQ='
 '
 
 cmd_market() {
+  # DIVE-4020 §7.2: DISCOVERY folds into `market` rather than minting a fourth
+  # silo. We already ship `market` for personas and `--with-skills` for skills;
+  # a parallel `plugin list` for discovery would mean a user asking "what can I
+  # add?" must already know whether the thing they want is a plugin, a skill, a
+  # connector or a persona. `plugin` owns the LIFECYCLE (add/remove/upgrade,
+  # which have no home today); `market` stays the one front door.
+  local _mk_a
+  for _mk_a in "$@"; do
+    case "$_mk_a" in
+      --kind=plugin|--kind=plugins) cmd_market_plugins "$@"; return ;;
+      --kind=agent|--kind=agents|--kind=persona|--kind=personas) : ;;
+      # Worded WITHOUT a pipe-separated list on purpose, and this is a real
+      # constraint rather than a style choice. usage_enumeration_completeness_unit
+      # associates any `$E_USAGE` string containing `|` and "unknown"/"usage:"
+      # within six lines ABOVE a `case` with THAT case's arms — a good heuristic,
+      # since a usage string that close to a dispatcher is nearly always its
+      # enumeration. Here it would be wrong: this line enumerates values of ONE
+      # FLAG, not the sibling subcommands of `case "$sub"` below, so it was
+      # reported as `case $sub MISSING=show|info|preview,…`. Spelling the choices
+      # out in words fixes the mis-association AND is better copy — it names the
+      # value the user actually typed. The subcommand aliases are documented in
+      # _market_usage above, where they belong.
+      --kind=*) fail "$E_USAGE" "--kind must be 'agent' or 'plugin' (got: ${_mk_a#--kind=})" ;;
+    esac
+  done
   local sub="${1:-ls}"
   case "$sub" in
     -h|--help)          _market_usage; return 0 ;;
@@ -683,6 +714,7 @@ cmd_market() {
       --rarity=*)           rarity="${a#--rarity=}" ;;
       --tier=*)             rarity="${a#--tier=}" ;;
       --seasoned|--memory)  seasoned=1 ;;
+      --kind=*)             : ;;   # already dispatched above; agent is the default
       --*)                  fail "$E_USAGE" "unknown flag: $a (see: 5dive market --help)" ;;
       *)                    [[ -z "$kw" ]] && kw="$a" || kw="$kw $a" ;;
     esac
@@ -2767,4 +2799,111 @@ cmd_import() {
      --arg ct "$can_think" --arg tf "$think_fix" \
      --arg n "$as" --arg t "$type" --arg pa "$persona_at" --argjson lands "$lands_j" --argjson nap "$cross_dropped" \
      --arg mem "$mem_inc" --arg ms "$mem_seeded" --arg me "$mem_effect" --argjson a "$added_j" --argjson s "$skipped_j" --arg tpl "$templated" --arg av "$avatar_note" --arg ri "$reported" --arg hk "$hooks_note" --argjson disc "$disclosure"
+}
+
+
+# `5dive market --kind=plugin` (DIVE-4020 §7.2) — the discovery half of the
+# plugin contract. Read-only and root-free by design: it curls the published
+# marketplace index the same way `market` curls the character-pack index, so a
+# customer can see what exists before deciding to install anything.
+#
+# It deliberately does NOT read the installed store. That store lives under
+# STATE_DIR (root-owned, 0700 class) and reading it would make browsing a
+# root-only act — a discovery surface that needs sudo is not a discovery
+# surface. `5dive plugin list` is the authority on what is installed.
+_plugin_market_base() { echo "https://raw.githubusercontent.com/$(gh_org)/5dive-plugins/main"; }
+
+cmd_market_plugins() {
+  local kw="" a
+  for a in "$@"; do
+    case "$a" in
+      --kind=*) : ;;
+      ls|list|browse|search|find) : ;;
+      --*) fail "$E_USAGE" "unknown flag: $a (see: 5dive plugin --help)" ;;
+      *)   [[ -z "$kw" ]] && kw="$a" || kw="$kw $a" ;;
+    esac
+  done
+
+  # TWO sources, and listing both is the point rather than a nicety.
+  #
+  #   1. The BUNDLED marketplace that ships with the CLI (plugins/, world-readable
+  #      at /usr/local/lib/5dive/plugins). It needs no network and no root, and it
+  #      is the only one whose plugins `plugin add <name>` resolves with no setup.
+  #   2. The PUBLISHED 5dive-plugins marketplace, over the network.
+  #
+  # Showing only (2) — which is what this did first — produces a discovery
+  # surface that disagrees with the installer: the user reads `telegram`, runs
+  # `plugin add telegram`, and is told no marketplace has it. So every row
+  # carries the marketplace it came from, and the footer names the one command
+  # that makes the remote ones installable.
+  local rows="[]" bundled remote_ok=0
+  if bundled=$(_plugin_bundled_dir 2>/dev/null) && [[ -f "$bundled/.claude-plugin/marketplace.json" ]]; then
+    local bname; bname=$(jq -r '.name // "5dive"' "$bundled/.claude-plugin/marketplace.json")
+    rows=$(jq -c --arg m "$bname" --argjson r "$rows" \
+      '[.plugins[]? | {name, description:(.description//""), category:(.category//"-"), marketplace:$m, ready:true}] + $r' \
+      "$bundled/.claude-plugin/marketplace.json")
+  fi
+
+  local base idx
+  base=$(_plugin_market_base)
+  if idx=$(curl -fsSL --max-time 15 "${base}/.claude-plugin/marketplace.json" 2>/dev/null) \
+     && jq -e '.plugins' >/dev/null 2>&1 <<<"$idx"; then
+    remote_ok=1
+    local rname; rname=$(jq -r '.name // "5dive-plugins"' <<<"$idx")
+    rows=$(jq -c --arg m "$rname" --argjson r "$rows" \
+      '$r + [.plugins[]? | {name, description:(.description//""), category:(.category//"-"), marketplace:$m, ready:false}]' \
+      <<<"$idx")
+  fi
+
+  # A box with no internet still has the bundled marketplace, so an unreachable
+  # remote degrades to a shorter list rather than to an error. It only fails when
+  # there is genuinely nothing to show.
+  local total; total=$(jq 'length' <<<"$rows")
+  (( total > 0 )) || fail "$E_GENERIC" "no plugins to show — the bundled marketplace is missing and ${base} is unreachable"
+  (( remote_ok )) || warn "could not reach ${base} — showing bundled plugins only"
+
+  local filtered
+  filtered=$(jq -c --arg kw "$(printf '%s' "$kw" | tr '[:upper:]' '[:lower:]')" '
+    def L(x): (x // "" | ascii_downcase);
+    map(select($kw=="" or (L(.name)|contains($kw)) or (L(.description)|contains($kw)) or (L(.category)|contains($kw))))
+  ' <<<"$rows")
+
+  local n; n=$(jq 'length' <<<"$filtered")
+  if (( JSON_MODE )); then
+    ok "" '{count:$n, remoteReachable:($r==1), plugins:$p}' \
+       --argjson n "$n" --argjson r "$remote_ok" --argjson p "$filtered"
+    return
+  fi
+  if (( n == 0 )); then
+    echo "No plugins match${kw:+ \"$kw\"}."
+    echo "Browse all: 5dive market --kind=plugin"
+    return
+  fi
+
+  echo "PLUGINS  ($n)"
+  echo
+  # The review TIER is a property of each plugin's own manifest (contract §5),
+  # never of the index that lists it — a publisher must not be able to award
+  # themselves a tier in the same file that advertises them. So this table does
+  # not carry a tier column at all: `plugin add` reads the manifest and shows the
+  # real one on the consent screen, which is the moment it matters.
+  { printf 'NAME\tFROM\tINSTALL NOW\tWHAT IT ADDS\n'
+    jq -r '.[] | [ .name, .marketplace, (if .ready then "yes" else "add source" end),
+                   ((.description // "") | split(". ")[0] | .[0:70]) ] | @tsv' <<<"$filtered"
+  } | column -t -s $'\t' | sed 's/^/  /'
+  echo
+  echo "  install:  5dive plugin add <name>"
+  local _notready; _notready=$(jq '[.[] | select(.ready|not)] | length' <<<"$filtered")
+  (( _notready > 0 )) && \
+    echo "  the rows marked 'add source' need their marketplace first:  5dive plugin marketplace add $(gh_org)/5dive-plugins"
+  # Truthful about the two install paths that currently coexist. telegram,
+  # dashboard and buzz predate the plugin contract: they are wired per AGENT by
+  # `agent create --channels=`, not per box by `plugin add`, and `plugin add`
+  # says so rather than installing a second copy under a second mechanism.
+  local _builtin; _builtin=$(jq -r --argjson c "$FIVEDIVE_CHANNEL_PLUGINS_JSON" \
+    '[.[] | . as $x | select([$c[].plugin] | index($x.name)) | $x.name] | join(", ")' <<<"$filtered")
+  [[ -n "$_builtin" ]] && \
+    echo "  $_builtin ship with 5dive and attach to ONE agent, not the box:  5dive agent create <name> --channels=<channel>"
+  echo "  Installing a plugin installs code that runs with your agent's access —"
+  echo "  'plugin add' shows you who published it and what it is handed first."
 }

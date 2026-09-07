@@ -125,6 +125,8 @@ OK=$(s   true $((NOW-60)) $((NOW-4000)) $NOW healthy "" "" 5 0)
 IDLE=$(s true $((NOW-60)) $((NOW-4000)) $NOW healthy "" "" 0 9)
 NEW=$(s  true $((NOW-60)) 0             $NOW ""      "" "" 3 -1)
 t   "busy seat: output=ok"        "ok"      "$(f .output "$OK")"
+t   "busy seat: historical close is labelled recent output, not transacting" \
+    "output recent (last close 0d ago)" "$(f .stateNote "$OK")"
 t   "empty queue: output=idle"    "idle"    "$(f .output "$IDLE")"
 t   "never closed: output=unknown" "unknown" "$(f .output "$NEW")"
 t   "never closed: transacting=null, never false" "null" "$(f '.transacting|tostring' "$NEW")"

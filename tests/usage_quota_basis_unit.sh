@@ -32,6 +32,17 @@
 #   mkdir -p /tmp/pre4037 && git show origin/main:src/cmd_usage.sh > /tmp/pre4037/cmd_usage.sh
 #   USAGE_SRC_DIR=/tmp/pre4037 bash tests/usage_quota_basis_unit.sh   # must FAIL
 #
+#   Re-measured after merging origin/main past DIVE-4034 (#784), with PART C
+#   added: 7 passed / 29 failed against origin/main (was 6/20 pre-merge). The 7
+#   are the must-not-regress half — `total` still excludes cache-read,
+#   cache-read still visible in the agent view, `cost` exits 0, no silent 40x
+#   trip on a basis-absent budget, the board still sorts a quota-less payload,
+#   an absent quota still falls back to the cost floor, and the all-claude
+#   window still makes no codex weight claim. Everything the row ADDS fails, as
+#   it must. `--basis=bogus` is NOT among the 7: pre-row `budget set` rejects
+#   the unknown flag with a different message, so that arm fails on the control
+#   rather than passing vacuously.
+#
 #   bash tests/usage_quota_basis_unit.sh
 set -uo pipefail
 
@@ -269,6 +280,118 @@ cmd_usage_budget_check --dry-run >/dev/null 2>&1
   || bad_t "absent quota became a confident 0 — the check reports 'ok' for a figure it never had" \
            "$(jq -c '.agents.cachey' "$USAGE_BUDGET_STATE_FILE")"
 DATA="$DATA_SAVE"
+
+# ============================================================================
+# PART C — the VERIFIER RESIDUAL (quinn, 2026-09-07) and the DIVE-4034 MERGE.
+#
+# C1-C2 close the coverage hole quinn found by mutation: the absence guard was
+# held on TOP AGENTS and open-coded on TOP TASKS, so restoring `.quota //
+# .total` at the TOP TASKS site left this suite 26/26 GREEN. Both surfaces now
+# reach the guard through one named jq function; these arms mutate-kill it.
+#
+# C3-C6 drive `cmd_usage_budget set`, which had NO test at all — commenting out
+# the new-budgets-default-to-quota line left the suite green. It is root-gated,
+# so the only way a non-root seat covers it is here, with require_root stubbed.
+#
+# C7-C9 are the DIVE-4034 merge. #784 feeds Codex into the same class dict
+# `quota` sums, so the trees joining silently started counting Codex cache reads
+# at 1.0x. That weight is now DECLARED per provider instead of being an
+# accident of a clean merge, and these arms assert the declaration exists, says
+# which provider is measured and which assumed, and reaches the screen.
+# ============================================================================
+
+# --- C1. TOP TASKS: an absent quota renders '?', same rule as TOP AGENTS -----
+OUT="$(usage_render_board "$DATA_OLD" 24h '{}' 2>&1)"
+TT="$(sed -n '/TOP TASKS/,$p' <<<"$OUT")"
+grep -qE 'DIVE-9001 +cachey +- +50 +400 +\?' <<<"$TT" \
+  && ok_t "TOP TASKS: an ABSENT quota renders '?' too — the guard is held on BOTH surfaces" \
+  || bad_t "TOP TASKS prints the cost figure under a QUOTA header (quinn's mutant: .quota // .total)" "$TT"
+
+# --- C2. and the guard did not eat the DIVE-2312 unverified qualifier --------
+# qcellu must still be qtok, not htok: an unverified quota figure has to carry
+# the word with it, or lifting the cell loses the caveat.
+DATA_UNV="$(jq -c '(.tasks |= map(.dispatched = false))' <<<"$DATA")"
+TT="$(usage_render_board "$DATA_UNV" 24h '{}' 2>&1 | sed -n '/TOP TASKS/,$p')"
+grep -qF '(unverified)' <<<"$TT" && grep -qF '~400k(unverified)' <<<"$TT" \
+  && ok_t "TOP TASKS: the quota cell keeps the DIVE-2312 unverified qualifier" \
+  || bad_t "the shared guard dropped qtok — an unverified plan figure now renders liftable" "$TT"
+
+# --- C3. `budget set` on a NEW agent defaults to the QUOTA basis -------------
+# The whole alert path exists to predict a wall; a new budget that cannot is a
+# budget filed against the wrong number on day one.
+BUDGETS='{}'; rm -f "$TMP/saved.json"
+OUT="$(cmd_usage_budget set newbie --daily=1000 2>&1)"; RC=$?
+[[ $RC -eq 0 && "$(jq -r '.newbie.basis' "$TMP/saved.json")" == "quota" ]] \
+  && ok_t "budget set: a NEW budget defaults to quota (it can predict a wall)" \
+  || bad_t "a new budget was filed on the cost basis" "rc=$RC $(cat "$TMP/saved.json" 2>/dev/null) $OUT"
+
+# --- C4. an UPDATE preserves the stored basis — never a silent re-base -------
+BUDGETS='{"keeper":{"soft":1000,"hard":null,"hardStop":false,"notified":{},"stopped":false,"basis":"cost"}}'
+rm -f "$TMP/saved.json"
+cmd_usage_budget set keeper --daily=2000 >/dev/null 2>&1
+[[ "$(jq -r '.keeper.basis' "$TMP/saved.json")" == "cost" \
+   && "$(jq -r '.keeper.soft' "$TMP/saved.json")" == "2000" ]] \
+  && ok_t "budget set: an UPDATE keeps the stored basis (no silent 40x re-base)" \
+  || bad_t "editing a threshold silently moved its basis" "$(cat "$TMP/saved.json" 2>/dev/null)"
+
+# --- C5. a LEGACY bare-int entry is an existing budget, so it stays cost -----
+BUDGETS='{"legacy":5000}'; rm -f "$TMP/saved.json"
+cmd_usage_budget set legacy --ceiling=9000 >/dev/null 2>&1
+[[ "$(jq -r '.legacy.basis' "$TMP/saved.json")" == "cost" ]] \
+  && ok_t "budget set: a legacy bare-int budget normalizes to cost, not quota" \
+  || bad_t "a legacy threshold was re-based by an unrelated edit" "$(cat "$TMP/saved.json" 2>/dev/null)"
+
+# --- C6. and an unknown basis is refused by NAME, not silently accepted ------
+BUDGETS='{}'
+OUT="$(cmd_usage_budget set newbie --basis=bogus 2>&1)"; RC=$?
+[[ $RC -eq "$E_USAGE" ]] && has "$OUT" "--basis must be" \
+  && ok_t "budget set: --basis=bogus fails E_USAGE and names the two valid bases" \
+  || bad_t "an unknown basis was accepted (or failed with the wrong code)" "rc=$RC $OUT"
+
+# --- C7. THE MERGE: the per-provider cache-read weight is DECLARED -----------
+# Both providers are summed at 1.0x, and that is fine — but only one of them is
+# MEASURED (DIVE-4028, Codex, n=1). A consumer must be able to tell which
+# figure rests on a measurement and which on an upper bound, and it must not
+# have to read a source comment to find out.
+PW="$(jq -c '.basis.quota.providerWeights' <<<"$OUT_U")"
+[[ "$(jq -r '.codex.basis' <<<"$PW")" == "measured" \
+   && "$(jq -r '.claude.basis' <<<"$PW")" == "assumed" \
+   && "$(jq -r '.codex.cacheRead' <<<"$PW")" == "1.0" \
+   && "$(jq -r '.claude.cacheRead' <<<"$PW")" == "1.0" ]] \
+  && ok_t "collector: cache-read weight declared PER PROVIDER — codex measured, claude assumed" \
+  || bad_t "the merge with DIVE-4034 left Codex's 1.0x weight unstated" "$PW"
+
+# --- C8. a CODEX seat lands in the agent row and in NO task row -------------
+# quinn's check (a). #784 aggregates CUMULATIVE per-rollout snapshots, so those
+# tokens cannot be assigned to a task window and the collector deliberately
+# does not try. That is correct, and it means `sum(tasks[].quota)` is NOT fleet
+# plan burn on a mixed fleet — so the payload has to SAY so.
+CXD="$R/agent-cx/.codex/sessions/$(date -u -d @"$NOW" +%Y/%m/%d)"
+mkdir -p "$CXD"
+printf '%s\n' "{\"type\":\"event_msg\",\"timestamp\":\"$TS\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":40000,\"cached_input_tokens\":39600,\"cache_write_input_tokens\":250,\"output_tokens\":50}},\"rate_limits\":{\"primary\":{\"used_percent\":5},\"secondary\":{\"used_percent\":80}}}}" \
+  > "$CXD/rollout-test.jsonl"
+printf '{"agents":{"cx":{"type":"codex"}}}' > "$TMP/reg-cx.json"
+OUT_CX="$(REGISTRY="$TMP/reg-cx.json" TASK_DB="$DB" USAGE_SINCE="$((NOW-3600))" \
+          USAGE_HOME_ROOT="$R" python3 "$TMP/collect.py" 2>/dev/null)"
+# in = 40000 - 39600 - 250 = 150; cost = 150+50+250 = 450; quota = +39600 = 40050
+[[ "$(jq -r '.agents[0].quota' <<<"$OUT_CX")" == "40050" \
+   && "$(jq -r '.agents[0].total' <<<"$OUT_CX")" == "450" \
+   && "$(jq -r '.tasks | length' <<<"$OUT_CX")" == "0" \
+   && "$(jq -r '.basis.quota.taskAttribution.codex' <<<"$OUT_CX")" == *"agent-row only"* ]] \
+  && ok_t "collector: a CODEX seat's quota is on the agent row, in NO task row, and the payload says so" \
+  || bad_t "codex quota is wrong, or leaked into task attribution, or the gap is undeclared" \
+           "$(jq -c '{a:.agents[0]|{total,quota},t:(.tasks|length),d:.basis.quota.taskAttribution}' <<<"$OUT_CX")"
+
+# --- C9. and the weight REACHES THE SCREEN, only when a codex seat is present -
+DATA_CX="$(jq -c '(.agents[0].models.codex = .agents[0].models.m)' <<<"$DATA")"
+OUT="$(usage_render_board "$DATA_CX" 24h '{}' 2>&1)"
+has "$OUT" "1.0x on BOTH providers" \
+  && ok_t "board: with a codex seat present, the legend names the 1.0x weight and which half is measured" \
+  || bad_t "the merge's weighting decision never reaches the reader" "$OUT"
+OUT="$(usage_render_board "$DATA" 24h '{}' 2>&1)"
+! has "$OUT" "1.0x on BOTH providers" \
+  && ok_t "board: an all-claude window does NOT claim a codex measurement it has no seat for" \
+  || bad_t "the codex weight line prints with no codex seat in the window" "$OUT"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

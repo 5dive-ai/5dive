@@ -915,7 +915,10 @@ _sup_info_status() {
   local state_note sup_line
   case "$verdict" in
     "") case "$output" in
-          ok)         state_note="transacting (last close ${days}d ago)" ;;
+          # A historical close is evidence of recent output, not proof of what
+          # the seat is doing now. DIVE-4032 observed this line claim
+          # "transacting" after 2.2 days with no runtime sessions at all.
+          ok)         state_note="output recent (last close ${days}d ago)" ;;
           idle)       state_note="idle — no open rows (last close ${days}d ago)" ;;
           unmeasured) state_note="output UNMEASURED — task store unreadable from here" ;;
           *)          state_note="output unknown — ${note}" ;;

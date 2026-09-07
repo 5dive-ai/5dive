@@ -106,6 +106,16 @@ mkdir -p "$AUTH_PROFILES_DIR/envtok/claude"
 mk "$AUTH_PROFILES_DIR/blank/combined.env" ''
 mkdir -p "$AUTH_PROFILES_DIR/blank/claude"
 
+# (g2) configuration is not authentication. This is the DIVE-4032 false green:
+#      ANTHROPIC_BASE_URL alone cannot authenticate a request.
+mk "$AUTH_PROFILES_DIR/baseonly/combined.env" 'ANTHROPIC_BASE_URL=https://example.invalid'
+mkdir -p "$AUTH_PROFILES_DIR/baseonly/claude"
+
+# (g3) Keep the third credential spelling accepted by the launcher as a
+#      positive control: the fix rejects non-credentials, not profile envs.
+mk "$AUTH_PROFILES_DIR/authtok/combined.env" 'ANTHROPIC_AUTH_TOKEN=real-credential-shape'
+mkdir -p "$AUTH_PROFILES_DIR/authtok/claude"
+
 # (h) UNREADABLE: credential file exists but neither it nor its parent can be
 #     read. Must be `unknown` — absence of evidence, not evidence of absence.
 mk "$AUTH_PROFILES_DIR/opaque/grok/.grok/auth.json" '{"access_token":"t"}'
@@ -119,6 +129,9 @@ check "expired JWT + refresh_token -> ok"               "$(state codex codexp)" 
 check "expired JWT, no refresh_token -> expired"        "$(state codex codexd)" expired
 check "claude profile env-token, no creds file -> ok"   "$(state claude envtok)" ok
 check "claude profile with empty env -> needs_login"    "$(state claude blank)" needs_login
+check "claude config-only env -> needs_login (not false ok)" \
+  "$(state claude baseonly)" needs_login
+check "claude ANTHROPIC_AUTH_TOKEN -> ok"               "$(state claude authtok)" ok
 check "auth-optional type (no sentinel) -> ok"          "$(state opencode '')"  ok
 
 # `unknown` is only meaningful when the process cannot already read everything.
