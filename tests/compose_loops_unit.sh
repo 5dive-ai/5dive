@@ -370,6 +370,23 @@ rt2=$(_roundtrip rt 2>/dev/null)
   && ok_t 'T19c the derived ids are stable across exports of an unchanged board' \
   || bad_t 'T19c the derived id churns between runs — every re-export would look like a change' ''
 
+# THREE titles colliding at the cap. Two are survivable with any constant
+# suffix; the third is what forces the suffix to be DERIVED FROM THE TITLE. Found
+# by mutation: replacing the digest with a constant left T18/T19/T19b/T19c all
+# green, because with two rows a constant suffix is still unique.
+sqlite3 "$DB" "DELETE FROM tasks;"
+sqlite3 "$DB" "INSERT INTO tasks (kind,assignee,title,body,schedule) VALUES
+  ('recurring','rt','Recurring smart GitHub discovery of new OSS integration targets alpha','','0 9 * * 1'),
+  ('recurring','rt','Recurring smart GitHub discovery of new OSS integration targets beta','','0 9 * * 2'),
+  ('recurring','rt','Recurring smart GitHub discovery of new OSS integration targets gamma','','0 9 * * 3');"
+rt_out=$(_roundtrip rt 2>/dev/null); rt_rc=$?
+if (( rt_rc == 0 )) && jq -e '.agents.rt.loops | length == 3 and ((map(.id) | unique | length) == 3)' <<<"$rt_out" >/dev/null 2>&1; then
+  ok_t 'T19d THREE titles colliding at the id cap all survive with distinct ids — the suffix is derived from the title, not a constant'
+else
+  bad_t 'T19d a third colliding title was dropped or duplicated — the collision suffix does not distinguish titles' \
+        "rc=$rt_rc n=$(jq -r '.agents.rt.loops|length' <<<"$rt_out" 2>/dev/null)"
+fi
+
 # A pack row keeps cron OPTIONAL (the pack carries its own cadence), so the
 # cadence-less DROP above must not have been implemented as "drop every row with
 # no schedule" — that would silently delete installed marketplace loops.

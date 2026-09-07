@@ -140,6 +140,25 @@ a saved fleet does not silently claim to have no recurring work. A pack-installe
 loop exports as `pack: <slug>`; anything else exports as an inline loop, with `id`
 taken from the marker or derived from the title.
 
+The export must survive its own parser — the parse is **whole-document**, so one
+unrepresentable row refuses the ENTIRE company, and it does so at the user's `up`,
+not at the `export` that wrote it. Three board shapes are reconciled here:
+
+- **A recurring row with an empty schedule is not exported as a loop.** It can
+  never fire (the materializer's cron match needs 5 fields), so it is a template
+  that does nothing, and emitting it as a cron-less inline loop is invalid. It is
+  skipped and REPORTED on stderr. Widening the parser to accept a cadence-less
+  inline loop was the rejected alternative: it would let `up` create dead
+  templates by design, which is the idle roster this key exists to end. A `pack:`
+  row keeps cron optional — the pack carries its own cadence.
+- **A title with no `[a-z0-9]` at all** — any non-Latin script, or symbols only —
+  slugifies to the empty string. It falls back to `loop-<digest>` over the full
+  title.
+- **Two titles agreeing on their first 64 slug characters** derive the same id.
+  The later one takes a digest suffix, applied in list order so the output is
+  stable; the loop is renamed, never dropped. The digest is over the FULL title,
+  so a third colliding title is distinguished too.
+
 ### Teardown
 `5dive down` deletes the TEMPLATE rows for the loops the spec declares, before the
 seat is removed — `agent rm` does not, so without this a torn-down company leaves
