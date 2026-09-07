@@ -19,6 +19,7 @@ extract_fn() {
 }
 eval "$(extract_fn _agent_startup_credential_health)"
 eval "$(extract_fn _agent_operational_state)"
+eval "$(extract_fn _agent_auth_display)"
 
 PASS=0; FAIL=0
 is() {
@@ -53,6 +54,15 @@ is "a close two days ago is recent output, not current activity" \
   "$(_agent_operational_state active ok clear '{"verdict":null,"output":"ok","daysSinceClose":2}')" unverified
 is "same-day output can support active" \
   "$(_agent_operational_state active ok clear '{"verdict":null,"output":"ok","daysSinceClose":0}')" active
+
+PAST_AUTH="$(_agent_auth_display ok 1 true)"
+has "past access-token expiry names the refreshable credential" \
+  "$PAST_AUTH" "refreshable credential"
+has "past access-token expiry explains why auth remains ok" \
+  "$PAST_AUTH" "not a login failure"
+is "unrefreshable future expiry keeps the ordinary rendering" \
+  "$(_agent_auth_display ok 4102444800 false)" \
+  "ok · expires 2100-01-01T00:00:00Z"
 
 # Drive cmd_tui's real dispatcher refusal. The interactive negative controls use
 # a fake sudo binary so exec reaches the attach branch without touching tmux.
@@ -90,10 +100,15 @@ if grep -q '"state:       \\(.operationalState)' src/cmd_agent.sh; then
 else
   echo 'FAIL: info does not lead with operationalState'; FAIL=$((FAIL+1))
 fi
-if grep -q '5dive agent auth status' src/cmd_agent.sh; then
+if grep -F 'AUTH unknown =' src/cmd_agent.sh | grep -Fq '(5dive agent auth status)'; then
   PASS=$((PASS+1))
 else
-  echo 'FAIL: stale nonexistent auth-status hint remains'; FAIL=$((FAIL+1))
+  echo 'FAIL: agent-list legend still points at the nonexistent auth-status command'; FAIL=$((FAIL+1))
+fi
+if grep -Fq '"auth:        \($authLine)"' src/cmd_agent.sh; then
+  PASS=$((PASS+1))
+else
+  echo 'FAIL: info human render does not consume the disambiguated auth line'; FAIL=$((FAIL+1))
 fi
 if grep -q 'cred_seed_failed "claude credential absent' 5dive-agent-start \
    && grep -q 'supply a credential and restart' 5dive-agent-start \

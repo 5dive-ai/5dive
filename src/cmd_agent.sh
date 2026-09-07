@@ -52,6 +52,25 @@ _agent_operational_state() { # <active> <auth-state> <startup-state> [supervisor
   esac
 }
 
+# Human rendering for the auth measurement. A refreshable OAuth credential can
+# legitimately carry an access-token expiry in the past: the runtime exchanges
+# its refresh token on demand. Printing that date beside a bare `ok` recreates
+# the false-signal shape this command is meant to remove, so explain the
+# otherwise-disconfirming date on the same line.
+_agent_auth_display() { # <state> <expiry-epoch|-> <refreshable>
+  local state="${1:-unknown}" exp="${2:--}" refreshable="${3:-false}" iso=""
+  if [[ "$exp" =~ ^[0-9]+$ ]]; then
+    iso=$(date -u -d "@$exp" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || printf '%s' "$exp")
+    if [[ "$refreshable" == "true" ]] && (( exp < $(date +%s) )); then
+      printf '%s · access token expired %s · refreshable credential (not a login failure)\n' "$state" "$iso"
+    else
+      printf '%s · expires %s\n' "$state" "$iso"
+    fi
+  else
+    printf '%s\n' "$state"
+  fi
+}
+
 cmd_list() {
   # DIVE-1074: rootless read (mirrors account list / DIVE-1035). `agent list` is
   # pure-read, and a standard-isolation agent (group claude, so it can read the
@@ -779,7 +798,7 @@ cmd_info() {
   # and hid the exact condition an operator was drilling into. Use the same
   # credential instrument as `agent list`, plus the persisted boot verdict, and
   # let either one veto liveness in the primary operational state.
-  local _info_prof _ha _ha_state _ha_exp _ha_refresh _hs _hs_state _hs_reason _op_state
+  local _info_prof _ha _ha_state _ha_exp _ha_refresh _hs _hs_state _hs_reason _op_state _auth_line
   _info_prof=$(jq -r --arg n "$name" '.agents[$n].authProfile // ""' <<<"$reg")
   _ha=$(agent_auth_health "$type" "$_info_prof" || true)
   [[ -n "$_ha" ]] || _ha='unknown|-|false'
@@ -791,6 +810,7 @@ cmd_info() {
   _hs_state="${_hs%%|*}"
   _hs_reason="${_hs#*|}"
   _op_state=$(_agent_operational_state "${active:-unknown}" "$_ha_state" "$_hs_state" "$sup")
+  _auth_line=$(_agent_auth_display "$_ha_state" "$_ha_exp" "$_ha_refresh")
 
   local obj
   obj=$(jq -c \
@@ -814,6 +834,7 @@ cmd_info() {
     --arg cbEvidence "$_cb_evidence" \
     --arg haState "$_ha_state" --arg haExp "$_ha_exp" --arg haRefresh "$_ha_refresh" \
     --arg hsState "$_hs_state" --arg hsReason "$_hs_reason" --arg opState "$_op_state" \
+    --arg authLine "$_auth_line" \
     '.agents[$n] as $a | {
       name: $n,
       type: $a.type,
@@ -892,7 +913,7 @@ cmd_info() {
   if (( JSON_MODE )); then
     jq -cn --argjson d "$obj" '{ok:true, data:$d}'
   else
-    jq -r '
+    jq -r --arg authLine "$_auth_line" '
       "name:        \(.name)",
       "type:        \(.type)",
       "cli:         \(.cliName) \(.cliVersion // "unknown")",
@@ -905,7 +926,7 @@ cmd_info() {
         "bound:       \(if .channelsBinding.state == "refused" then "NO — REFUSED at runtime" else "unknown — \(.channelsBinding.detail // "not probeable from here")" end)\(if .channelsBinding.evidence then "\n             ↳ \(.channelsBinding.evidence)" else "" end)"
        end),
       "profile:     \(.authProfile // "-")",
-      "auth:        \(.health.auth.state)\(if .health.auth.expiresAt then " · expires \(.health.auth.expiresAt)" else "" end)",
+      "auth:        \($authLine)",
       "startup:     \(.health.startup.state)\(if .health.startup.reason then " — \(.health.startup.reason)" else "" end)",
       "workdir:     \(.workdir)",
       "isolation:   \(.isolation) (label\(if .isolationLabelled then "" else ", defaulted — unset in registry" end))",
