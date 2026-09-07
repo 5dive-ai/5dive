@@ -338,5 +338,48 @@ t "T9d voice names the real host installer, not a placeholder" "sudo 5dive-setup
 t "T9e voice asks for audio, which is what makes its consent screen honest" "true" \
   "$(jq -r '[.fivedive.grants[]] | index("audio-io") != null' "$VOICE")"
 
+# =============================================================================
+# T10 — install.sh's staging list vs what plugins/ actually contains
+# =============================================================================
+# $REPO is a flat fetch URL with no directory listing, so install.sh must
+# ENUMERATE every bundled plugin file by hand — the same constraint the
+# team-templates block carries, and the same drift hazard: add
+# plugins/voice/hooks.json, forget the install.sh line, and every box gets a
+# marketplace that lists voice and then cannot resolve part of it.
+#
+# This is a set comparison against the real directory, not a grep for a line, so
+# it reds on the file that was ADDED rather than only on the line that was
+# removed — which is the direction the drift actually goes.
+staged=$(sed -n 's|.*for _pf in \(.*\); do.*|\1|p' install.sh | tr ' ' '\n' | sort)
+onDisk=$(cd plugins && find . -type f | sed 's|^\./||' | sort)
+t "T10a install.sh stages exactly the files plugins/ contains (add a file, add its line)" \
+  "$onDisk" "$staged"
+t "T10b ...and the list is non-empty, so T10a cannot pass by comparing two blanks" "yes" \
+  "$([[ -n "$staged" ]] && echo yes || echo no)"
+# A half-staged marketplace is worse than an absent one: the index lists voice and
+# the resolver then fails on its manifest, which reads as broken rather than
+# missing. So the partial must be REMOVED.
+#
+# This arm EXTRACTS that branch and RUNS it, rather than grepping for the
+# `rm -rf` line. A grep would have passed on `: # rm -rf "$LIB_DIR/plugins"` —
+# measured: mutant M14 commented the line out and the substring arm stayed green,
+# which is the "a grep reds on its own explanatory comment" trap from DIVE-3754
+# pointing the other way. Running the branch cannot be fooled by a comment.
+plug_fail_branch=$(awk '/# >>> bundled-plugins partial guard/,/# <<< bundled-plugins partial guard/' install.sh)
+if [[ -z "$plug_fail_branch" ]]; then
+  FAIL=$((FAIL+1)); printf 'FAIL: T10c-extract could not find the partial-download branch in install.sh\n'
+else
+  PASS=$((PASS+1))
+  probe="$TMP/libdir"; mkdir -p "$probe/plugins/voice"
+  ( LIB_DIR="$probe"; _plug_ok=0; ok() { :; }; eval "$plug_fail_branch" ) >/dev/null 2>&1
+  t "T10c a partial download is REMOVED, not left half-staged (branch executed, not grepped)" \
+    "no" "$([[ -d "$probe/plugins" ]] && echo yes || echo no)"
+  # Negative control: the same branch must NOT delete a COMPLETE staging.
+  probe2="$TMP/libdir2"; mkdir -p "$probe2/plugins/voice"
+  ( LIB_DIR="$probe2"; _plug_ok=1; ok() { :; }; eval "$plug_fail_branch" ) >/dev/null 2>&1
+  t "T10d ...and a complete staging survives it (control: T10c is not passing by deleting always)" \
+    "yes" "$([[ -d "$probe2/plugins" ]] && echo yes || echo no)"
+fi
+
 printf 'plugin_contract_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

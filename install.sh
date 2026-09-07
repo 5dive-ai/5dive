@@ -951,12 +951,17 @@ JOURNALD
   # A HALF-staged marketplace is worse than none: the index would list voice and
   # the resolver would then fail to find its manifest, which reads as a broken
   # install rather than a missing one. Drop it and say so.
+  # >>> bundled-plugins partial guard (extracted and EXECUTED by
+  # tests/plugin_contract_unit.sh T10c/T10d — the markers are the anchor so the
+  # condition below is inside the graded text rather than being the anchor
+  # itself; a test that anchors on the line it wants to grade cannot grade it).
   if [[ "$_plug_ok" != 1 ]]; then
     rm -rf "$LIB_DIR/plugins"
     echo "warn: bundled plugin marketplace not staged (partial download removed) — 5dive plugin marketplace list will show nothing bundled" >&2
   else
     ok "bundled plugins (voice)"
   fi
+  # <<< bundled-plugins partial guard
 
   # /etc/claude-code/managed-settings.json — channel-plugin allowlist.
   # Claude reads a default Anthropic-blessed ledger when this file is
