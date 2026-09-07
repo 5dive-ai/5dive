@@ -51,6 +51,7 @@ sed -n '/^_compose_loop_marker()/,/^}/p'  "$SRC" >  "$TMP/loops.sh"
 sed -n '/^_compose_loop_present()/,/^}/p' "$SRC" >> "$TMP/loops.sh"
 sed -n '/^_compose_apply_loops()/,/^}/p'  "$SRC" >> "$TMP/loops.sh"
 sed -n '/^_compose_export_loops()/,/^}/p' "$SRC" >> "$TMP/loops.sh"
+sed -n '/^_compose_down_loops()/,/^}/p'   "$SRC" >> "$TMP/loops.sh"
 bash -n "$TMP/parse.sh" && bash -n "$TMP/loops.sh" \
   && ok_t 'T0b both extracted units parse — the extraction anchors still hold' \
   || bad_t 'T0b extraction produced unparseable bash — the anchors moved; every arm below is vacuous' ''
@@ -146,11 +147,17 @@ if [[ "$verb" == task ]]; then
   # the harness reads as a product failure.
   q() { printf '%s' "${1//\'/\'\'}"; }
   sqlite3 "$DB" "INSERT INTO tasks (kind,assignee,title,body,schedule) VALUES ('recurring','$(q "$assignee")','$(q "$title")','$(q "$body")','$(q "$cron")');"
-elif [[ "$verb" == loop ]]; then
+elif [[ "$verb" == loop && "$2" == install ]]; then
   # `loop install <slug> --onto=<agent>` — the marker is cmd_loop_pack's own.
   slug="$3"; onto=""
   for a in "$@"; do [[ "$a" == --onto=* ]] && onto="${a#--onto=}"; done
   sqlite3 "$DB" "INSERT INTO tasks (kind,assignee,title,body,schedule) VALUES ('recurring','$onto','$slug job','— installed loop: $slug (5dive marketplace).','0 */4 * * *');"
+elif [[ "$verb" == loop && "$2" == uninstall ]]; then
+  # `loop uninstall <slug> --from=<agent>` — the real verb drops the TEMPLATE row
+  # it installed and nothing else. Scoped on the marker for exactly that reason.
+  slug="$3"; frm=""
+  for a in "$@"; do [[ "$a" == --from=* ]] && frm="${a#--from=}"; done
+  sqlite3 "$DB" "DELETE FROM tasks WHERE kind='recurring' AND assignee='$frm' AND body LIKE '%installed loop: $slug (5dive marketplace)%';"
 fi
 exit 0
 STUB
@@ -167,7 +174,19 @@ apply() {
     STUB_DB="$DB" STUB_LOG="$TMP/stub.log" STUB_FAIL="${2:-0}" \
       _compose_apply_loops "$1" a "$TMP/self.sh" )
 }
+# Same, for any assignee — the cross-agent scoping arm needs a second seat.
+apply_as() {
+  ( set -uo pipefail
+    db()   { sqlite3 "$DB" "$1"; }
+    sqlq() { printf "'%s'" "${1//\'/\'\'}"; }
+    step() { :; }
+    warn() { :; }
+    . "$TMP/loops.sh"
+    STUB_DB="$DB" STUB_LOG="$TMP/stub.log" STUB_FAIL=0 \
+      _compose_apply_loops "$2" "$1" "$TMP/self.sh" )
+}
 rowcount() { sqlite3 "$DB" "SELECT COUNT(*) FROM tasks WHERE kind='recurring' AND assignee='a';"; }
+rowcount_of() { sqlite3 "$DB" "SELECT COUNT(*) FROM tasks WHERE kind='recurring' AND assignee='$1';"; }
 
 SPEC=$(jq -nc '{agents:{a:{loops:[
   {id:"weekly-brief", title:"Weekly brief", cron:"0 9 * * 1", prompt:"do it"},
@@ -242,6 +261,113 @@ out7=$( set -uo pipefail
 [[ "$out7" == *"COUNTS 2 0 0"* ]] \
   && ok_t 'T8b a child that drains stdin cannot swallow the remaining loops' \
   || bad_t 'T8b a stdin-reading child ate the loop list — loops vanish with no error' "out=$out7"
+
+# ---------------------------------------------------------------------------
+# SCOPING + TEARDOWN ARMS (DIVE-4022 iteration 3).
+#
+# Added because two of quinn's mutants SURVIVED a 41/41 run: deleting the
+# assignee clause from _compose_loop_present, and deleting the entire
+# _compose_down_loops call from cmd_compose_down. Both are real code paths with
+# no arm over them; a green suite that cannot see a deletion is not grading it.
+# ---------------------------------------------------------------------------
+
+# The title arm added in iteration 1 is a CROSS-AGENT match unless the query is
+# scoped to the assignee. Unscoped, agent b's declared loop reads as "already
+# present" because agent a happens to own a row with the same title — so b comes
+# up with nothing running and no error is printed anywhere. That is the idle
+# roster this row exists to end, arriving through the fix for it.
+sqlite3 "$DB" "DELETE FROM tasks;"
+sqlite3 "$DB" "INSERT INTO tasks (kind,assignee,title,body,schedule) VALUES ('recurring','a','Standup digest','no marker here','0 9 * * 1-5');"
+SPEC_B=$(jq -nc '{agents:{b:{loops:[{id:"standup-digest", title:"Standup digest", cron:"0 9 * * 1-5"}]}}}')
+out8=$(apply_as b "$SPEC_B"); cb=$(rowcount_of b); ca=$(rowcount_of a)
+[[ "$out8" == *"COUNTS 1 0 0"* && "$cb" == 1 && "$ca" == 1 ]] \
+  && ok_t 'T22 the same title on ANOTHER agent does not false-clear — b gets its own loop, a keeps its one row' \
+  || bad_t 'T22 the presence check is NOT scoped to the assignee — agent b was left idle because agent a owns a row with that title' \
+           "out=$out8 rows_b=$cb rows_a=$ca"
+
+# ...and the marker is cross-agent too, so scope it on the same arm shape: a's
+# DECLARED loop must not satisfy b's identical declaration.
+sqlite3 "$DB" "DELETE FROM tasks;"
+apply_as a "$(jq -nc '{agents:{a:{loops:[{id:"shared-id", title:"A title", cron:"0 9 * * 1"}]}}}')" >/dev/null
+out8b=$(apply_as b "$(jq -nc '{agents:{b:{loops:[{id:"shared-id", title:"B title", cron:"0 9 * * 1"}]}}}')")
+[[ "$out8b" == *"COUNTS 1 0 0"* && "$(rowcount_of b)" == 1 ]] \
+  && ok_t 'T22b the MARKER is scoped to the assignee too — two agents may declare the same loop id' \
+  || bad_t 'T22b agent a'"'"'s declared loop satisfied agent b'"'"'s declaration — b is idle' "out=$out8b"
+
+# A STORE ERROR MUST ANSWER 'ABSENT', and it must say so. Both directions are
+# wrong on an unreadable store; this one is wrong loudly (the create attempt hits
+# the same broken store and is counted as an error with a retry line), where
+# 'present' would print "already present" over a company that came up idle.
+# Graded by breaking db() itself, which is the only way to reach the branch.
+out9=$( { set -uo pipefail
+          db() { return 1; }
+          sqlq() { printf "'%s'" "${1//\'/\'\'}"; }
+          step() { :; }
+          warn() { printf 'WARN %s\n' "$*" >&2; }
+          . "$TMP/loops.sh"
+          _compose_loop_present a some-id 'Some title' ; printf 'rc=%s\n' "$?"
+        } 2>"$TMP/warn.txt" )
+if [[ "$out9" == *"rc=1"* ]] && grep -qi 'ABSENT' "$TMP/warn.txt"; then
+  ok_t 'T22c a store error answers ABSENT and WARNS — the failure is loud, not a silent "already present"'
+else
+  bad_t 'T22c an unreadable store does not answer a stated direction — the guard inherits it from a default expansion' \
+        "out=$out9 warn=$(cat "$TMP/warn.txt")"
+fi
+
+# TEARDOWN. `_compose_down_loops` is the one function in this diff that DELETEs a
+# user's recurring work, and quinn removed its entire call site with the suite
+# still green. It must remove exactly the rows this spec DECLARED: a hand-made
+# recurring row for the same agent, and a declared row for an id this spec does
+# not name, are not ours to delete.
+down() {
+  ( set -uo pipefail
+    db()   { sqlite3 "$DB" "$1"; }
+    sqlq() { printf "'%s'" "${1//\'/\'\'}"; }
+    step() { :; }
+    warn() { :; }
+    _compose_self() { printf '%s' "$TMP/self.sh"; }
+    . "$TMP/loops.sh"
+    STUB_DB="$DB" STUB_LOG="$TMP/stub.log" \
+      _compose_down_loops "$2" "$1" )
+}
+
+sqlite3 "$DB" "DELETE FROM tasks;"
+sqlite3 "$DB" "INSERT INTO tasks (kind,assignee,title,body,schedule) VALUES
+  ('recurring','a','Declared row','— declared loop: weekly-brief (5dive.yaml) runs on ...','0 9 * * 1'),
+  ('recurring','a','Hand made row','no marker here','0 2 * * *'),
+  ('recurring','a','Someone elses declared row','— declared loop: not-in-spec (5dive.yaml) runs on ...','0 3 * * *'),
+  ('recurring','b','Declared row','— declared loop: weekly-brief (5dive.yaml) runs on ...','0 9 * * 1'),
+  ('todo','a','A materialized instance','— declared loop: weekly-brief (5dive.yaml) runs on ...','');"
+down a "$(jq -nc '{agents:{a:{loops:[{id:"weekly-brief", title:"Declared row", cron:"0 9 * * 1"}]}}}')" >/dev/null 2>&1
+left=$(sqlite3 "$DB" "SELECT assignee||'/'||kind||'/'||title FROM tasks ORDER BY 1;" | tr '\n' ',')
+[[ "$left" == "a/recurring/Hand made row,a/recurring/Someone elses declared row,a/todo/A materialized instance,b/recurring/Declared row," ]] \
+  && ok_t 'T23 down removes EXACTLY the declared template it created — hand-made, undeclared, other-agent and materialized rows all survive' \
+  || bad_t 'T23 down deleted work it did not create, or failed to delete its own template' "left=$left"
+
+# The pack half of teardown goes through `loop uninstall`, so the pack path has
+# one implementation on the way out as well as on the way in.
+sqlite3 "$DB" "DELETE FROM tasks;"
+sqlite3 "$DB" "INSERT INTO tasks (kind,assignee,title,body,schedule) VALUES
+  ('recurring','a','ci-analyst job','— installed loop: ci-analyst (5dive marketplace).','0 */4 * * *'),
+  ('recurring','a','Hand made row','no marker here','0 2 * * *');"
+: > "$TMP/stub.log"
+down a "$(jq -nc '{agents:{a:{loops:[{pack:"ci-analyst"}]}}}')" >/dev/null 2>&1
+left2=$(sqlite3 "$DB" "SELECT title FROM tasks ORDER BY 1;" | tr '\n' ',')
+if [[ "$left2" == "Hand made row," ]] && grep -q 'loop uninstall ci-analyst --from=a' "$TMP/stub.log"; then
+  ok_t 'T23b a declared PACK is torn down through `loop uninstall`, and the hand-made row beside it survives'
+else
+  bad_t 'T23b the pack teardown does not go through `loop uninstall`, or it ate a row it did not install' \
+        "left=$left2 log=$(cat "$TMP/stub.log")"
+fi
+
+# And the call site itself — T23/T23b grade the function, this grades that
+# cmd_compose_down still calls it. Deleting the call left the whole suite green.
+if grep -q '_compose_down_loops "\$spec" "\$name"' "$SRC" \
+   && awk '/^cmd_compose_down\(\)/{f=1} f&&/_compose_down_loops/{print NR; exit}' "$SRC" | grep -q .; then
+  ok_t 'T23c cmd_compose_down actually calls the loop teardown — a torn-down company leaves no templates materializing for a seat that is gone'
+else
+  bad_t 'T23c the teardown is never called from `down` — templates outlive the agents they were created for' ''
+fi
 
 # ---------------------------------------------------------------------------
 # EXPORT ARM — export must not claim a company with recurring work has none.

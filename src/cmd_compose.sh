@@ -535,7 +535,20 @@ _compose_loop_present() {
           WHERE kind='recurring' AND assignee=$(sqlq "$agent")
             AND ( body LIKE '%'||$(sqlq "$marker")||'%'
                OR body LIKE '%'||$(sqlq "$pack_marker")||'%'${title_clause} );" 2>/dev/null | head -1)
-  [[ "${n:-0}" =~ ^[0-9]+$ ]] || return 1
+  # A STORE ERROR ANSWERS 'ABSENT', DELIBERATELY. Both directions are wrong when
+  # the db is unreadable; this one is wrong LOUDLY. Answering 'present' would skip
+  # the create and print "already present" — a company that comes up idle while the
+  # summary says every loop is there, which is the exact silent failure this row
+  # exists to end. Answering 'absent' sends the caller to `task add`, which reaches
+  # the SAME broken store, fails, and is counted as an error with a runnable retry
+  # line. The cost of being wrong this way is a duplicate row on a store that is
+  # readable-but-lying; the cost of the other is an idle roster reported as healthy.
+  # Written out rather than inherited from ${n:-0} defaulting to 0: a guard whose
+  # direction is a side effect of a default expansion is not a decision.
+  if [[ -z "$n" || ! "$n" =~ ^[0-9]+$ ]]; then
+    warn "[$agent] could not read the task store while checking loop '$key' — assuming ABSENT"
+    return 1
+  fi
   (( n > 0 ))
 }
 
