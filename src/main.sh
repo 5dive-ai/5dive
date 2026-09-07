@@ -316,8 +316,12 @@ Usage (per-agent / per-task token burn — subscription tokens, no dollars):
   5dive usage <agent> [--7d]                         # one agent: per-model + per-task breakdown
   5dive cost [--7d]                                  # budget-focused: per-agent 24h burn vs soft/ceiling + state
   5dive activity <agent> [--7d] [--task=DIVE-N]      # what the agent actually did: files touched, commands run, cost
-  5dive usage budget set <agent> --daily=<tok> [--ceiling=<tok>] [--hard-stop]  # soft warn + optional hard-stop ceiling
+  5dive usage budget set <agent> --daily=<tok> [--ceiling=<tok>] [--hard-stop] [--basis=quota|cost]
   5dive usage budget ls | clear <agent>              # hard-stop is OFF by default (warn-only); check runs on the heartbeat
+  # TWO token bases, and they differ ~40x on agentic traffic (DIVE-4037):
+  #   API-EQ = input+output+cache-write        — what it would have cost on the API; use for value ranking
+  #   QUOTA  = API-EQ + cache-read             — what a flat-rate plan meters; use for capacity. THIS is what runs out.
+  # New budgets default to --basis=quota; budgets set before DIVE-4037 stay on cost until you move them.
 
 Trace (causal timeline for one task, goal → ship —):
   5dive run ls|show|events|logs|retry|metrics        # execution attempts beneath tasks (DIVE-3932); one run = one agent's one attempt
