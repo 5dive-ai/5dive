@@ -162,7 +162,44 @@ TIER_CAL_SCALE_MAX_PCT=150
 # from the box you happen to be on — that is exactly how 173000 got here, and the
 # failure mode is silent (every CI probe then reads fast, the floor clamps, and the
 # relative budget quietly stops existing while still printing a ratio).
-TIER_CAL_BASELINE_US=119000
+#
+# DIVE-4064, 2026-09-07: 119000 -> 172120, AND THE SAME NUMBER WAS RIGHT THE WHOLE TIME.
+# The failure it caused is the MIRROR of the 173000 one described above, so the paragraph
+# above stands unedited and this one is the other half of it. 173000 was too HIGH, every
+# probe read fast, and the lower clamp silently made the mechanism a no-op. 119000 became
+# too LOW: `ubuntu-latest` drifted until probes read 151-153% of it, past the 150% UPPER
+# clamp, so runs exited 6 UNDETERMINED having never graded the corpus. A reference
+# attached to an environment that MOVED fails at whichever clamp it drifts into; the
+# direction is the only thing that changes, and the low side is louder because it reds.
+#
+# DERIVED BY THE PRESCRIBED INSTRUMENT, WHICH IS THE POINT. DIVE-2867 says a hand-copied
+# handful of readings is how 173000 and the proposed 116584 both got here, and it is how
+# I nearly re-did it: I had eight readings scraped off failing jobs and they would have
+# put this at ~178000. Do not accept that; it is the third re-derivation by argument.
+# This value is the MEDIAN OF THE 46 CONCORDANT READINGS in a harvested 78-report window
+# (18 `unit-tests` pull_request runs, 2026-09-06..07, tier-cal-harvest.sh into
+# tier-cal-window.sh). Median of ALL concordant readings, deliberately: the window is
+# mildly bimodal again (a fast tail from 101305, the working mode from ~169000) and
+# splitting it would need an exclusion argued first, which is the estimator this file
+# already refused — "an outlier you have to argue away before you can compute is an
+# outlier your estimator is too fragile to see". n=46, median 172120, max 182924.
+#
+# CHECKED against the clamp, which is the only claim that matters: at 172120 every one of
+# the 46 concordant readings lands INSIDE 100-150% (worst 182924 -> 106%; the fast tail
+# floors at 100% as designed), so zero of them would exit 6. Against 119000 the four
+# shards that blocked PR #786 read 151-153%.
+#
+# ADMISSIBLE per DIVE-2867's own check: `tier.sh refadmit 172120 119000 <46 samples>`
+# returns `admit raise`. Note refadmit does NOT choose the value — raising is the
+# one-sided safe direction so it admits any raise; the median above is what selects it.
+#
+# THE INSTRUMENT WAS BLIND WHEN I STARTED. tier-cal-harvest.sh could not match a SHARDED
+# budget label (`core/installed-host-s2`) because its regex was `[a-z]+/[a-z-]+`, which
+# excludes digits, and it reported that as `(no budget block)` — the same words as a run
+# with genuinely no data. 22 runs harvested 0 reports while every one of them held the
+# lines. Fixed in the same change; without it this constant cannot be re-derived the way
+# DIVE-2867 requires, by anyone, which is why it had not been.
+TIER_CAL_BASELINE_US=172120
 
 # How long ONE sample of the probe should run. This is the PRECISION knob from note 1:
 # the probe's own relative error must sit well under the headroom being protected (9%

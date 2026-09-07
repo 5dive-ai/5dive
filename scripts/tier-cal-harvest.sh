@@ -121,10 +121,19 @@ parse_log() {
     blk="$(awk -F'\t' -v j="$job" '$1==j' "$log" | grep -a 'harness-budget\|runner; applied\|and .*% of the EFFECTIVE cap')"
 
     # "harness-budget[core/pristine]: 254 harnesses, 283s wall-clock, budget 300s (94% of budget)"
-    local totals; totals="$(printf '%s\n' "$blk" | grep -aoE 'harness-budget\[[a-z]+/[a-z-]+\]: [0-9]+ harnesses, [0-9]+s wall-clock, budget [0-9]+s \([0-9]+% of budget\)' | tail -1)"
+    #
+    # DIVE-4064: the label character class MUST admit digits. Real labels are SHARDED —
+    # "core/installed-host-s2", "core/pristine-s1" — and the original `[a-z-]+` cannot
+    # match them, so this harvested exactly NOTHING from every sharded run while
+    # reporting it as "(no budget block)", which is the same string a run with genuinely
+    # no budget data produces. Measured: 22 runs -> 0 reports, every one of them holding
+    # the lines; one character class later the same runs yield 4 reports each. That is
+    # why DIVE-2867's "the excuse is removed" was not true in practice and the reference
+    # had never been re-derived by this path.
+    local totals; totals="$(printf '%s\n' "$blk" | grep -aoE 'harness-budget\[[a-z]+/[a-z0-9-]+\]: [0-9]+ harnesses, [0-9]+s wall-clock, budget [0-9]+s \([0-9]+% of budget\)' | tail -1)"
     [[ -n "$totals" ]] || continue
     tier="$(printf '%s' "$totals"  | sed -E 's/^harness-budget\[([a-z]+)\/.*/\1/')"
-    label="$(printf '%s' "$totals" | sed -E 's/^harness-budget\[[a-z]+\/([a-z-]+)\].*/\1/')"
+    label="$(printf '%s' "$totals" | sed -E 's/^harness-budget\[[a-z]+\/([a-z0-9-]+)\].*/\1/')"
     harn="$(printf '%s' "$totals"  | sed -E 's/.*: ([0-9]+) harnesses.*/\1/')"
     wall="$(printf '%s' "$totals"  | sed -E 's/.*, ([0-9]+)s wall-clock.*/\1/')"
     budget="$(printf '%s' "$totals" | sed -E 's/.*budget ([0-9]+)s \(.*/\1/')"
