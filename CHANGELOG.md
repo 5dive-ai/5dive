@@ -1,5 +1,62 @@
 # Changelog
 
+## Unreleased — feat(team): `loops:` — a company import brings recurring work, not just a roster (DIVE-4022)
+
+`5dive team import <slug>` provisioned a **roster**, not a working company. Agents, roles and
+reporting lines came up with nothing recurring on the board, so an imported team sat idle
+until someone hand-created the work. `cmd_compose.sh` had zero loop handling, no schema v2
+key carried one, and none of the four bundled templates declared one.
+
+A new per-agent `loops:` key closes it. Absent the key, behaviour is unchanged.
+
+```yaml
+agents:
+  ceo:
+    loops:
+      - id: weekly-priorities
+        title: "Re-set this week's top 3"
+        cron: "0 9 * * 1"
+        prompt: "Review the board, pick three, assign owners."
+      - pack: ci-analyst        # a marketplace loop, installed via `5dive loop install`
+```
+
+- **Not a second loop format.** A loop declared here ends as exactly what `5dive loop install`
+  produces — a `kind='recurring'` task template owned by one agent, cloned into a normal todo
+  by the materializer on its cadence. Ownership is per-agent because that is how
+  `loop install --onto=<agent>` already models it. The `pack:` form does not reimplement any
+  of it: it shells out to `loop install`, which keeps the registry fetch and the skill attach
+  in one place.
+- **Idempotency was the trap.** `up` is declarative and re-runnable, so the loop pass
+  reconciles over the **whole declared roster on every run** — not only over agents created
+  this run, or adding `loops:` to a company you already imported would silently do nothing.
+  A loop counts as present when the agent already owns a recurring row carrying its marker
+  **or its exact title**. The title arm is what stops an exported fleet — whose hand-made and
+  `loop install`-made rows carry no declared marker — from doubling on re-import.
+- **A loop that will not install does not fail the import**, and stays out of `errors`. The
+  roster is up and useful, and a marketplace fetch needs the network the one-tap dashboard
+  import cannot assume. It is restated **after** the summary with the exact retry command —
+  same rule, and the same reason, as DIVE-2347's failed skill and DIVE-3994's unset bot token.
+- **`5dive export` round-trips them.** Each agent's recurring templates are dumped back into a
+  `loops:` block; without that, a saved fleet would claim to have no recurring work and a
+  re-import would rebuild the idle roster this change exists to end. A pack-installed loop
+  exports as `pack: <slug>`; anything else exports inline, with `id` from the marker or
+  derived from the title.
+- **`5dive down` removes what it declared.** `agent rm` deletes the registry entry and the org
+  row but not recurring templates, so a torn-down company used to leave templates
+  materializing work for an assignee that no longer exists. Template rows only; already
+  materialized instances belong to their owner.
+- **`eng-studio` gains two real loops**, so the path ships exercised by default rather than
+  waiting on a future template. Purely additive — unknown keys warn rather than fail, so no
+  existing spec breaks and an older CLI reading a newer template warns and continues.
+- Validation is at PARSE, before anything is provisioned: an unparseable cadence discovered
+  mid-provision leaves a half-built company, the same reason `--type` is checked before
+  `ensure_state`.
+
+`tests/compose_loops_unit.sh` — 31 arms, ~2s, core tier. The reconcile and export arms are
+functional against a real sqlite task store with a stub CLI, not source greps; eleven mutants
+(kill the reconcile, drop the title arm, fold loop errors into `errors`, move the pass above
+the creates, strip the template's loops, …) were each run alone and each went red.
+
 ## Unreleased — feat(team): `--type=<harness>` — a company import is no longer Claude-Code-only (DIVE-3998)
 
 All four bundled team templates hard-set `defaults.type: claude`, so `5dive team import
