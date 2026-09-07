@@ -259,6 +259,17 @@ else
         "create=$_create_ln loops=$_wire_ln summary=$_sum_ln"
 fi
 
+# T9c: exporting a loops[] is worthless if cmd_compose_export never asks for it.
+# The functional T9 above grades the SHAPER in isolation; this grades the WIRING,
+# which is the half a refactor actually drops.
+_exp_fn=$(sed -n '/^cmd_compose_export()/,/^}/p' "$SRC")
+if grep -q '_compose_export_loops "\$name"' <<<"$_exp_fn" \
+   && grep -q 'if (\$loops | length) > 0 then .loops = \$loops' <<<"$_exp_fn"; then
+  ok_t 'T9c cmd_compose_export actually calls the shaper and puts loops on the agent object'
+else
+  bad_t 'T9c export never wires the loops in — a saved fleet still claims it has no recurring work' ''
+fi
+
 # The pass must iterate the DECLARED roster, not only what this run created.
 # Folded into the create branch, adding loops: to an existing company is a no-op.
 if sed -n "$((_wire_ln-25)),${_wire_ln}p" "$SRC" | grep -q 'for name in "\${names\[@\]}"'; then
