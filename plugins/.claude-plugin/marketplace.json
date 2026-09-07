@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "5dive",
+  "description": "Plugins bundled with the 5dive CLI itself. Registered automatically, resolvable with no network — the reference marketplace for the 5dive plugin contract.",
+  "owner": {
+    "name": "5dive",
+    "email": "support@5dive.com"
+  },
+  "plugins": [
+    {
+      "name": "voice",
+      "description": "Speak with your agent and hear it talk back — local speech-to-text and text-to-speech. The reference implementation of the 5dive plugin contract: a channel-capability plugin, the shape every later channel plugin copies.",
+      "category": "channel",
+      "source": "./voice",
+      "homepage": "https://github.com/5dive-ai/5dive/tree/main/plugins/voice"
+    }
+  ]
+}
