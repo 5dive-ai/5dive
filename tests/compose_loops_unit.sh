@@ -280,6 +280,146 @@ lid=$( set -uo pipefail
   || bad_t 'T9b the exported title does not match the row — a re-import would create a second copy' ''
 
 # ---------------------------------------------------------------------------
+# ROUND-TRIP ARMS (DIVE-4022 iteration 2) — export | THE REAL PARSER.
+#
+# WHY THESE EXIST. Iteration 1 had five export arms and all five read the
+# export's OUTPUT. None fed it back in. Fed to the real `_compose_parse`, the
+# live board refused the WHOLE document three ways — and because the parse is
+# whole-document, one bad row makes the entire company unimportable, at the
+# user's `up`, not at the `export` that wrote it. An artefact whose only job is
+# to be re-imported is not graded until the importer has eaten it.
+#
+# The fixture below is seeded from the shapes the LIVE board actually holds, not
+# from the fields the author was thinking about: a cadence-less recurring row
+# (main's objective-replan driver), a title with no Latin characters at all, and
+# a pair of titles that agree on their first 64 slug characters (the live fleet
+# already has many ids sitting exactly at that cap). The iteration-1 fixture
+# carried schedules and Latin titles only, which is why it stayed green.
+#
+# The assembly step here mirrors cmd_compose_export's; T9c is the arm that grades
+# the real wiring calls it.
+# ---------------------------------------------------------------------------
+_shape() { ( set -uo pipefail
+             db() { sqlite3 "$DB" "$1"; }
+             sqlq() { printf "'%s'" "${1//\'/\'\'}"; }
+             warn() { printf 'warn: %s\n' "$*" >&2; }
+             . "$TMP/loops.sh"; _compose_export_loops "$1" ) }
+
+# Assemble a v2 doc the way export does, then run the REAL parser over it.
+_roundtrip() {  # $1 = agent name whose loops to wrap
+  local loops; loops=$(_shape "$1")   # stderr is the report channel; do NOT swallow it
+  jq -n --arg n "$1" --argjson l "${loops:-[]}" \
+     '{version:"2", agents:{($n): ({type:"claude"} + (if ($l|length)>0 then {loops:$l} else {} end))}}' \
+  | python3 -c 'import sys,yaml,json; print(yaml.safe_dump(json.load(sys.stdin), sort_keys=False, allow_unicode=True))' \
+  > "$TMP/rt.yaml" || return 9
+  TEAM_AUTH_PROFILE=x parse "$TMP/rt.yaml"
+}
+
+sqlite3 "$DB" "DELETE FROM tasks;"
+sqlite3 "$DB" "INSERT INTO tasks (kind,assignee,title,body,schedule) VALUES
+  ('recurring','rt','Daily objective replan driver — funnel-channel-acquisition','nothing',''),
+  ('recurring','rt','Weekly brief','b — declared loop: weekly-brief (5dive.yaml).','0 9 * * 1');"
+rt_out=$(_roundtrip rt 2>"$TMP/rt.err"); rt_rc=$?
+if (( rt_rc == 0 )) && jq -e '[.agents.rt.loops[]] | length == 1 and (.[0].id == "weekly-brief")' <<<"$rt_out" >/dev/null 2>&1; then
+  ok_t 'T17 a cadence-less recurring row is dropped from the export instead of refusing the whole document at re-import'
+else
+  bad_t 'T17 export emitted a loop the real parser rejects — one dead board row makes the entire company unimportable' \
+        "rc=$rt_rc err=$(tr '\n' ' ' < "$TMP/rt.err" | head -c 200)"
+fi
+grep -q 'has no cadence' "$TMP/rt.err" \
+  && ok_t 'T17b the dropped row is REPORTED, not silently swallowed — export does not lie about what it left out' \
+  || bad_t 'T17b a row was dropped from the export with no warning — the dump silently under-reports the fleet' \
+           "err=$(tr '\n' ' ' < "$TMP/rt.err" | head -c 200)"
+
+# A title with no [a-z0-9] at all slugifies to "", and `id: ""` fails the
+# parser's "needs either pack: or id:". Any non-Latin script reaches this.
+sqlite3 "$DB" "DELETE FROM tasks;"
+sqlite3 "$DB" "INSERT INTO tasks (kind,assignee,title,body,schedule) VALUES
+  ('recurring','rt','每日简报','nothing','0 9 * * *');"
+rt_out=$(_roundtrip rt 2>"$TMP/rt.err"); rt_rc=$?
+if (( rt_rc == 0 )) && jq -e '.agents.rt.loops | length == 1 and (.[0].id | test("^[a-z0-9][a-z0-9-]{0,63}$"))' <<<"$rt_out" >/dev/null 2>&1; then
+  ok_t "T18 a title that slugifies to nothing still exports a parseable id (got '$(jq -r '.agents.rt.loops[0].id' <<<"$rt_out" 2>/dev/null)')"
+else
+  bad_t 'T18 a non-Latin title exported id:"" — the parser refuses the whole company' \
+        "rc=$rt_rc err=$(tr '\n' ' ' < "$TMP/rt.err" | head -c 200)"
+fi
+
+# Two titles agreeing on their first 64 slug characters derive the SAME id, and
+# the parser answers "duplicate loop key" for the whole document.
+sqlite3 "$DB" "DELETE FROM tasks;"
+sqlite3 "$DB" "INSERT INTO tasks (kind,assignee,title,body,schedule) VALUES
+  ('recurring','rt','Recurring smart GitHub discovery of new OSS integration targets alpha','','0 9 * * 1'),
+  ('recurring','rt','Recurring smart GitHub discovery of new OSS integration targets beta','','0 9 * * 2');"
+rt_out=$(_roundtrip rt 2>"$TMP/rt.err"); rt_rc=$?
+if (( rt_rc == 0 )) && jq -e '.agents.rt.loops | length == 2 and ((map(.id) | unique | length) == 2)' <<<"$rt_out" >/dev/null 2>&1; then
+  ok_t 'T19 two titles colliding at the 64-char id cap export as two DISTINCT ids, and both survive the parser'
+else
+  bad_t 'T19 a title collision at the id cap exported a duplicate key — the parser refuses the whole company' \
+        "rc=$rt_rc err=$(tr '\n' ' ' < "$TMP/rt.err" | head -c 200)"
+fi
+# ...and both rows must still be there. Deduping by DROPPING one would pass a
+# uniqueness check while silently losing a loop.
+if jq -e '[.agents.rt.loops[].title] | (index("Recurring smart GitHub discovery of new OSS integration targets alpha") != null) and (index("Recurring smart GitHub discovery of new OSS integration targets beta") != null)' <<<"$rt_out" >/dev/null 2>&1; then
+  ok_t 'T19b the collision is resolved by suffixing, not by dropping a loop'
+else
+  bad_t 'T19b a colliding loop was silently dropped instead of renamed — the export loses recurring work' "out=$rt_out"
+fi
+# The suffix must be stable: exporting an unchanged board twice must not churn ids.
+rt2=$(_roundtrip rt 2>/dev/null)
+[[ "$(jq -cS '.agents.rt.loops' <<<"$rt_out")" == "$(jq -cS '.agents.rt.loops' <<<"$rt2")" ]] \
+  && ok_t 'T19c the derived ids are stable across exports of an unchanged board' \
+  || bad_t 'T19c the derived id churns between runs — every re-export would look like a change' ''
+
+# A pack row keeps cron OPTIONAL (the pack carries its own cadence), so the
+# cadence-less DROP above must not have been implemented as "drop every row with
+# no schedule" — that would silently delete installed marketplace loops.
+sqlite3 "$DB" "DELETE FROM tasks;"
+sqlite3 "$DB" "INSERT INTO tasks (kind,assignee,title,body,schedule) VALUES
+  ('recurring','rt','CI triage','x — installed loop: ci-analyst (5dive marketplace).','');"
+rt_out=$(_roundtrip rt 2>/dev/null); rt_rc=$?
+if (( rt_rc == 0 )) && jq -e '.agents.rt.loops | length == 1 and (.[0].pack == "ci-analyst")' <<<"$rt_out" >/dev/null 2>&1; then
+  ok_t 'T20 a cadence-less PACK row still exports (the pack owns its cadence) and still parses'
+else
+  bad_t 'T20 the cadence-less drop also ate an installed marketplace loop' "rc=$rt_rc out=$rt_out"
+fi
+
+# ---- the same round-trip against the LIVE task store, when it is readable ----
+# The fixture above is chosen from live shapes, but a fixture only ever contains
+# what its author thought of — which is exactly how iteration 1 stayed green. This
+# arm re-runs the shaper over the REAL board and feeds the result to the REAL
+# parser. It SKIPS rather than fails where the store is unreadable (CI), so it is
+# a bonus signal, never the harness's load-bearing evidence.
+_live_db=""
+# NOTE: /var/lib/5dive/tasks.db EXISTS on this host and holds no `tasks` table —
+# a decoy that would make this probe fail open (readable, zero rows, SKIP that
+# reads as "no live board"). The candidate must be confirmed by the TABLE, not
+# by the filename.
+for _c in "${TASKS_DB:-}" /var/lib/5dive/tasks/tasks.db /var/lib/5dive/state/tasks.db "$HOME/.5dive/tasks.db"; do
+  [[ -n "$_c" && -r "$_c" ]] || continue
+  sqlite3 "$_c" "SELECT 1 FROM tasks LIMIT 1;" >/dev/null 2>&1 && { _live_db="$_c"; break; }
+done
+if [[ -z "$_live_db" ]]; then
+  printf 'SKIP - T21 live task store not readable from this seat; round-trip graded on the fixture only\n'
+else
+  _live_bad=0; _live_agents=0; _live_loops=0
+  _fixture_db="$DB"; DB="$_live_db"
+  while IFS= read -r _a; do
+    [[ -n "$_a" ]] || continue
+    _live_agents=$((_live_agents+1))
+    rt_out=$(_roundtrip "$_a" 2>/dev/null) || { _live_bad=$((_live_bad+1)); echo "   live parse failed for agent: $_a"; continue; }
+    _live_loops=$((_live_loops + $(jq -r '(.agents[].loops // []) | length' <<<"$rt_out" 2>/dev/null || echo 0)))
+  done < <(sqlite3 "$_live_db" "SELECT DISTINCT assignee FROM tasks WHERE kind='recurring' AND assignee IS NOT NULL AND assignee<>'';" 2>/dev/null)
+  DB="$_fixture_db"
+  if (( _live_agents == 0 )); then
+    printf 'SKIP - T21 the live store holds no recurring rows; nothing to round-trip\n'
+  elif (( _live_bad == 0 )); then
+    ok_t "T21 every loop the LIVE board exports is accepted by the real parser ($_live_loops loop(s) across $_live_agents agent(s))"
+  else
+    bad_t "T21 the LIVE board exports $_live_bad agent(s) whose loops the real parser refuses" ''
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # WIRING ARMS — source-level, and labelled. These live inside cmd_compose_up,
 # which creates agents; a harness cannot run it without provisioning host users.
 # ---------------------------------------------------------------------------

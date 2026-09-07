@@ -1138,17 +1138,88 @@ _compose_export_loops() {
              FROM tasks
              WHERE kind='recurring' AND assignee=$(sqlq "$agent");" 2>/dev/null | head -1)
   [[ -n "$rows" ]] || { printf '[]'; return 0; }
-  jq -c '
+  # DIVE-4022 iteration 2 — the shaper and the PARSER are two halves of one
+  # contract, and every measurement in iteration 1 read only this half's output.
+  # Fed back through `5dive ps`, the live board refused the whole document three
+  # ways. Each is fixed HERE, in the shaper, because a re-import must not be the
+  # place a user discovers that their export was unusable:
+  #
+  #  (1) A `kind='recurring'` row with an EMPTY schedule is not a loop. The
+  #      materializer's `_cron_matches` needs 5 fields and returns 1 on zero, so
+  #      such a row can never fire — it is a template that does nothing. Exporting
+  #      it as an inline loop emitted a cron-less loop the parser rejects, and the
+  #      parse is WHOLE-DOCUMENT, so one dead row refused the entire company. It
+  #      is SKIPPED and REPORTED rather than exported. The alternative — teaching
+  #      the parser to accept a cadence-less inline loop — was rejected: it would
+  #      let `5dive up` create dead templates BY DESIGN, which is the opposite of
+  #      the "roster that sits idle" this row exists to end. (The pack form keeps
+  #      cron optional: a pack carries its own cadence and `loop install` sets it.)
+  #  (2) A title carrying no [a-z0-9] at all — any non-Latin script, or symbols
+  #      only — slugifies to the empty string, and `id: ""` fails the parser's
+  #      "needs either pack: or id:". Such a title falls back to a stable digest.
+  #  (3) Two titles agreeing on their first 64 slug characters derive the SAME id
+  #      and the parser answers "duplicate loop key". The live fleet already has
+  #      many ids sitting exactly at that cap. A collision takes a digest suffix,
+  #      applied in list order so the output is deterministic.
+  #
+  # The digest is a djb2 over the FULL title, so it distinguishes titles that the
+  # cap made identical and is stable across exports of an unchanged board.
+  local env
+  env=$(jq -c '
+    def h: explode | reduce .[] as $c (5381; (. * 33 + $c) % 4294967296) | tostring;
     def slugify: ascii_downcase | gsub("[^a-z0-9]+"; "-") | gsub("^-+|-+$"; "") | .[0:64] | sub("-+$"; "");
-    map(
+    # Shape each row, tagging the ones that cannot be represented at all.
+    [ .[] |
       ([.body | scan("installed loop: ([a-z0-9-]+) \\(5dive marketplace\\)")] | first | first) as $pack
       | ([.body | scan("declared loop: ([a-z0-9-]+) \\(5dive\\.yaml\\)")] | first | first) as $decl
       | if $pack != null
-        then {pack: $pack} + (if .cron != "" then {cron: .cron} else {} end)
-        else {id: ($decl // (.title | slugify)), title: .title}
-             + (if .cron != "" then {cron: .cron} else {} end)
-        end
-    )' <<<"$rows" 2>/dev/null || printf '[]'
+        then {kind:"pack", out: ({pack: $pack} + (if .cron != "" then {cron: .cron} else {} end))}
+        elif .cron == ""
+        then {kind:"skip", title: .title}
+        else ((.title | slugify) as $slug
+              | (if $decl != null then $decl
+                 elif $slug == "" then "loop-" + (.title | h)
+                 else $slug end) as $id
+              | {kind:"inline", declared: ($decl != null), id: $id, title: .title,
+                 out: {id: $id, title: .title, cron: .cron}})
+        end ]
+    # Second pass: de-duplicate derived ids in list order. A key already claimed
+    # by an earlier entry takes a digest suffix, trimmed so the id stays inside
+    # the parsers 64-character limit.
+    | reduce .[] as $e ({seen: {}, loops: [], skipped: [], dupes: []};
+        if $e.kind == "skip" then .skipped += [$e.title]
+        elif $e.kind == "pack" then
+          (if .seen[$e.out.pack] then .dupes += [$e.out.pack]
+           else .seen[$e.out.pack] = true | .loops += [$e.out] end)
+        else
+          (if .seen[$e.id] | not then .seen[$e.id] = true | .loops += [$e.out]
+           else (($e.title | h) as $d
+                 | (($e.id[0:(63 - ($d | length))]) + "-" + $d) as $alt
+                 | if .seen[$alt] then .dupes += [$e.title]
+                   else .seen[$alt] = true | .loops += [$e.out + {id: $alt}] end)
+           end)
+        end)
+    | {loops: .loops, skipped: .skipped, dupes: .dupes}' <<<"$rows" 2>/dev/null) || env=""
+  [[ -n "$env" ]] || { printf '[]'; return 0; }
+  local skipped
+  skipped=$(jq -r '.skipped[]' <<<"$env" 2>/dev/null || true)
+  if [[ -n "$skipped" ]]; then
+    local t
+    while IFS= read -r t; do
+      [[ -n "$t" ]] || continue
+      warn "[$agent] recurring row '$t' has no cadence — it can never fire, so it is not exported as a loop"
+    done <<<"$skipped"
+  fi
+  local dupes
+  dupes=$(jq -r '.dupes[]' <<<"$env" 2>/dev/null || true)
+  if [[ -n "$dupes" ]]; then
+    local d
+    while IFS= read -r d; do
+      [[ -n "$d" ]] || continue
+      warn "[$agent] a second recurring row indistinguishable from '$d' is not exported (same key and same title)"
+    done <<<"$dupes"
+  fi
+  jq -c '.loops' <<<"$env"
 }
 
 # Where curated team templates live. Installed alongside the other shared
