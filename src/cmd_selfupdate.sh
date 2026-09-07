@@ -364,13 +364,60 @@ _pr_log() {
   else printf '%s [pending-restart] %s\n' "$(date -u +%FT%TZ)" "$*" >&2; fi
 }
 
+# >>> DIVE-4033 an operator-parked agent stays parked
+#     (tests/self_update_parked_agent_unit.sh extracts this block VERBATIM
+#      between these markers and runs the shipped bytes — keep them.)
+#
+# It lives INSIDE the DIVE-3173 fence on purpose: `_pending_restart_sweep` calls
+# it, and that sweep is graded by extracting the DIVE-3173 block and running it.
+# A helper defined outside would be absent from those extracted bytes, so the
+# harness would grade a sweep whose parked branch silently could not fire —
+# a test of something the box never runs.
+#
+# `desiredState: stopped` is the operator's recorded intent (`5dive agent stop`
+# writes it). Every other consumer honours it — the supervisor, the heartbeat,
+# `agent send --wake`, the objective preflight — and the update restart sweep was
+# the one path that never asked. DIVE-4033: a customer-facing sales bot parked
+# when its project closed was restarted by the 0.26.0 sweep and then ran for
+# weeks reported as `active / disabled`. An agent coming back from a park on its
+# own is a consent problem, not a wasted seat, which is why this is not a tidy-up.
+#
+# ABSENT IS NOT STOPPED (DIVE-2318, and the `// "running"` default every other
+# reader already uses). An agent never start/stop'd through the CLI carries no
+# field at all — the common case — so it restarts, byte for byte as today.
+#
+# AN UNREADABLE REGISTRY RESTARTS TOO, and that direction is deliberate. The two
+# failures are not symmetric: a wrong skip leaves the fleet silently frozen on the
+# old payload (DIVE-3173 calls it NEVER FIRES, and DIVE-1095 is a whole row about
+# a fix shipping dormant), while a wrong restart is loud and recoverable. So only
+# an explicit, parseable `stopped` skips; a missing file, absent jq, or a parse
+# failure all read as running.
+_agent_is_parked() {
+  local name="${1:-}" desired=""
+  [[ -n "$name" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  [[ -n "${REGISTRY:-}" && -f "$REGISTRY" ]] || return 1
+  desired=$(jq -r --arg n "$name" '.agents[$n].desiredState // "running"' "$REGISTRY" 2>/dev/null) || return 1
+  [[ "$desired" == "stopped" ]]
+}
+
+# The line an operator reads, in both the nightly log and the interactive run.
+# It names BOTH exits because either can be the correct one and only a person
+# knows which: the stop is real (enforce it) or the stop is stale (clear it).
+# "skipped" on its own would read as a decision already taken.
+_parked_override_note() {
+  local n="${1:-}"
+  printf "agent '%s' is RUNNING but the registry says desiredState=stopped — not restarting it, and not stopping it either. Reconcile: '5dive agent stop %s' if the stop is real, '5dive agent start %s' if the intent is stale." "$n" "$n" "$n"
+}
+# <<< DIVE-4033 an operator-parked agent stays parked
+
 # The sweep. Root-only by what it does (systemctl restart); best-effort by
 # contract — a failure here must never abort its caller's pass. Counters are
 # globals so the caller can put them in its own summary.
-_PR_FIRED=0; _PR_DEFERRED=0; _PR_OVERDUE=0; _PR_CLEARED=0; _PR_FAILED=0
+_PR_FIRED=0; _PR_DEFERRED=0; _PR_OVERDUE=0; _PR_CLEARED=0; _PR_FAILED=0; _PR_PARKED=0
 _pending_restart_sweep() {
   local dir f name marked started busy verdict now unit why
-  _PR_FIRED=0; _PR_DEFERRED=0; _PR_OVERDUE=0; _PR_CLEARED=0; _PR_FAILED=0
+  _PR_FIRED=0; _PR_DEFERRED=0; _PR_OVERDUE=0; _PR_CLEARED=0; _PR_FAILED=0; _PR_PARKED=0
   dir="$(_pending_restart_dir)"
   [[ -d "$dir" ]] || return 0
   now=$(date +%s)
@@ -386,6 +433,21 @@ _pending_restart_sweep() {
     if command -v systemctl >/dev/null 2>&1 \
        && ! systemctl is-active --quiet "$unit" 2>/dev/null; then
       _pending_restart_clear "$name"; _PR_CLEARED=$((_PR_CLEARED + 1)); continue
+    fi
+    # DIVE-4033: the unit IS running, and the registry says this agent was
+    # parked. Asked after the is-active guard, not before it: a parked agent
+    # whose unit is already down is the state the operator asked for, and
+    # shouting about it every sweep would bury the case that is actually wrong.
+    #
+    # The marker is CLEARED rather than held. Holding it would count a debt that
+    # can only be paid by resurrecting the agent, i.e. it would report as owed
+    # forever; and it is not owed either way — whichever exit the operator takes,
+    # the unit ends up stopped or restarted, and both load the new payload by
+    # construction. Same argument as the branch above, different reason.
+    if _agent_is_parked "$name"; then
+      _pending_restart_clear "$name"; _PR_PARKED=$((_PR_PARKED + 1))
+      _pr_log "[$name] $(_parked_override_note "$name")"
+      continue
     fi
     started="$(_unit_active_enter_epoch "$unit")"
     busy="$(_agent_busy_state "$name")"
@@ -445,6 +507,7 @@ cmd_self_update() {
   # timer being armed.
   _pending_restart_sweep || true
   (( _PR_FIRED )) && step "fired ${_PR_FIRED} restart(s) deferred by an earlier run"
+  (( _PR_PARKED )) && warn "${_PR_PARKED} owed restart(s) dropped — the agent(s) are parked (desiredState=stopped) but their units are running"
 
   # DIVE-3172: snapshot each running agent's in-memory payload BEFORE the
   # upgrade. It has to be taken here — after the upgrade there is nothing left
@@ -466,10 +529,19 @@ cmd_self_update() {
 
   # Restart only the agents whose payload actually moved. Best-effort per unit —
   # one failed restart shouldn't abort the rest.
-  local -a restarted=() failed=() skipped=() deferred=()
+  local -a restarted=() failed=() skipped=() deferred=() parked=()
   local i after before atype why busy
   for i in "${!units[@]}"; do
     name="${names[$i]}"; before="${befores[$i]}"
+    # DIVE-4033: asked BEFORE the payload predicate, so the operator is told the
+    # contradiction rather than "skipped (payload unchanged)" — which happens to
+    # be true on a CLI-only night and would not be on the next one, when the same
+    # parked agent gets bounced back to life with no line saying why.
+    if _agent_is_parked "$name"; then
+      warn "$(_parked_override_note "$name")"
+      parked+=("$name")
+      continue
+    fi
     after="$(_agent_payload_fingerprint "$(_agent_home "$name")")"
     # An agent whose type we cannot read is unmeasurable, which restarts — same
     # branch as a type with non-derivable config, so a registry miss is safe.
@@ -530,11 +602,12 @@ cmd_self_update() {
     fi
   fi
 
-  local r f s d prose
+  local r f s d pk prose
   r=$(json_array "${restarted[@]}")
   f=$(json_array "${failed[@]}")
   s=$(json_array "${skipped[@]}")
   d=$(json_array "${deferred[@]}")
+  pk=$(json_array "${parked[@]}")
   prose="self-update complete — ${#restarted[@]} agent(s) restarted"
   # Say the skip count out loud. "0 agents restarted" alone is emitted both by a
   # CLI-only night (the good case this change exists to produce) and by a box
@@ -545,13 +618,17 @@ cmd_self_update() {
   # DID move for these, the bounce is owed, and someone reading the nightly log
   # has to be able to see that it is outstanding rather than decided against.
   (( ${#deferred[@]} )) && prose+=", ${#deferred[@]} deferred (busy — bounce at next task boundary)"
+  # DIVE-4033: a parked agent is neither a skip nor a deferral — nothing is owed
+  # and nothing was decided. It is an operator contradiction that self-update
+  # declined to resolve, and the count is how it reaches someone reading the log.
+  (( ${#parked[@]} )) && prose+=", ${#parked[@]} left parked (desiredState=stopped but running — reconcile)"
   (( ${#failed[@]} )) && prose+=", ${#failed[@]} failed to restart"
   [[ "$listener_refreshed" == "true" ]] && prose+=", team-bot listener refreshed"
   # `skipped` and `deferred` are ADDITIVE — `restarted`/`failed` keep their exact
   # prior meaning, so every existing consumer reads the field it always did.
   ok "$prose" \
-     '{restarted:$r, restarted_count:($r|length), skipped:$s, skipped_count:($s|length), deferred:$d, deferred_count:($d|length), failed:$f, listener_refreshed:$lr}' \
-     --argjson r "$r" --argjson f "$f" --argjson s "$s" --argjson d "$d" --argjson lr "$listener_refreshed"
+     '{restarted:$r, restarted_count:($r|length), skipped:$s, skipped_count:($s|length), deferred:$d, deferred_count:($d|length), parked:$pk, parked_count:($pk|length), failed:$f, listener_refreshed:$lr}' \
+     --argjson r "$r" --argjson f "$f" --argjson s "$s" --argjson d "$d" --argjson pk "$pk" --argjson lr "$listener_refreshed"
 }
 
 # version_lt A B — true when semver A is strictly older than B (sort -V).
