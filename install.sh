@@ -928,6 +928,36 @@ JOURNALD
   done
   ok "team-templates"
 
+  # DIVE-4020 — the plugins the CLI itself SHIPS, staged as a bundled
+  # marketplace. `5dive plugin` registers $LIB_DIR/plugins as the marketplace
+  # named "5dive" on first use, which is what makes `5dive plugin add voice`
+  # resolve on a box with no network and no GitHub credential — the contract's
+  # reference implementation has to be reachable before a user has added any
+  # source, or the first thing they must do to install our own plugin is the
+  # very setup step the verb exists to remove.
+  #
+  # Enumerated per file for the same reason team-templates is: $REPO is a flat
+  # fetch URL with no directory listing. Add a line per new bundled plugin file.
+  mkdir -p "$LIB_DIR/plugins/.claude-plugin" "$LIB_DIR/plugins/voice/.claude-plugin"
+  _plug_ok=1
+  for _pf in .claude-plugin/marketplace.json voice/.claude-plugin/plugin.json voice/README.md; do
+    if curl -fsSL "$REPO/plugins/$_pf" -o "$LIB_DIR/plugins/$_pf"; then
+      chmod 644 "$LIB_DIR/plugins/$_pf"
+    else
+      _plug_ok=0
+      echo "warn: failed to stage bundled plugin file $_pf — '5dive plugin add voice' won't resolve until the next refresh" >&2
+    fi
+  done
+  # A HALF-staged marketplace is worse than none: the index would list voice and
+  # the resolver would then fail to find its manifest, which reads as a broken
+  # install rather than a missing one. Drop it and say so.
+  if [[ "$_plug_ok" != 1 ]]; then
+    rm -rf "$LIB_DIR/plugins"
+    echo "warn: bundled plugin marketplace not staged (partial download removed) — 5dive plugin marketplace list will show nothing bundled" >&2
+  else
+    ok "bundled plugins (voice)"
+  fi
+
   # /etc/claude-code/managed-settings.json — channel-plugin allowlist.
   # Claude reads a default Anthropic-blessed ledger when this file is
   # absent, which permits telegram@claude-plugins-official but NOT our

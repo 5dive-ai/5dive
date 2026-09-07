@@ -1,0 +1,30 @@
+{
+  "name": "voice",
+  "version": "1.0.0",
+  "description": "Talk to your agent by voice.",
+  "author": {
+    "name": "5dive",
+    "email": "support@5dive.com",
+    "url": "https://5dive.ai"
+  },
+  "homepage": "https://github.com/5dive-ai/5dive/tree/main/plugins/voice",
+  "license": "MIT",
+  "keywords": ["voice", "channel", "audio"],
+  "fivedive": {
+    "contract": "1",
+    "capabilities": ["channel"],
+    "verbs": [
+      {
+        "name": "voice",
+        "summary": "talk to your agent by voice",
+        "installs": "channel"
+      }
+    ],
+    "grants": ["audio-io", "telegram-token"],
+    "trust": {
+      "publisher": "5dive",
+      "did": "did:key:5dive",
+      "review": "official"
+    }
+  }
+}

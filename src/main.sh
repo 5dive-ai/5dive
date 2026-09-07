@@ -41,6 +41,8 @@ Compose (declarative agents via 5dive.yaml):
 Agents:
   5dive hire <name> [--role="CTO"]  # sugar: agent create (+ org set)
   5dive market [<keyword>] [--role=<r>] [--rarity=<t>]  # browse/search the agent market; preview: 5dive market show <slug>
+  5dive market --kind=plugin                         # browse plugins (voice, telegram, dashboard, buzz)
+  5dive plugin add|list|remove|upgrade <plugin>      # install a plugin; see '5dive plugin --help'
   5dive hire <role> --from-market [--as=<name>]  # hire from the open market; see '5dive hire --help'
   5dive agent list
   5dive agent info <name>                            # type, CLI version, model, channel, state + OUTPUT (DIVE-3274:
@@ -634,6 +636,16 @@ main() {
       # verb is) and never advertised.
       cmd_push_do "$@"
       exit $? ;;
+    plugin)
+      # DIVE-4020: the plugin lifecycle verb. Until this existed there was no
+      # `5dive plugin` at all — plugins installed only as side effects of
+      # `agent create` / `agent buzz enable`, so a CLI-only self-hoster had no
+      # path to one. Mutating and root-only (it writes under STATE_DIR and
+      # copies code onto the box), but it does NOT take the registry lock: it
+      # touches no agent, and holding the agent lock while cloning a marketplace
+      # would block every seat on a network fetch.
+      AUDIT_CMD="plugin"; AUDIT_ARGS=("$@")
+      cmd_plugin "$@" ;;
     market)
       # DIVE-1020: front door to the agent market — browse/search the
       # character-pack registry + preview a persona before hiring. Read-only
