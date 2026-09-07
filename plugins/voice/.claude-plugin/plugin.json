@@ -17,7 +17,8 @@
   "fivedive": {
     "contract": "1",
     "capabilities": [
-      "channel"
+      "channel",
+      "verb"
     ],
     "verbs": [
       {

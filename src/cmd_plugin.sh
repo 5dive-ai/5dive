@@ -51,6 +51,27 @@ _plugin_cache_dir() { echo "$(_plugin_root)/cache"; }
 _plugin_enabled_dir() { echo "$(_plugin_root)/enabled"; }
 _plugin_installed_json() { echo "$(_plugin_root)/installed.json"; }
 
+# _plugin_publish_json <tmp> <dest> — the ONLY way these two files are replaced.
+#
+# DIVE-4035, and it is a real box defect rather than tidiness. Every writer here
+# builds the new document in a `mktemp` and moves it into place, and mktemp
+# creates 0600 — so `installed.json` ended up ROOT-ONLY on a real install. That
+# was invisible for the whole of DIVE-4020 because every `5dive plugin` subverb
+# is root-gated, so the only readers were root. Verb dispatch is the first
+# UNPRIVILEGED reader of this registry: a normal user typing `5dive voice` could
+# not read it, `_plugin_verb_claims` came back empty, and the verb fell through
+# to "unknown command" — install said the verb was live and the box disagreed,
+# which is precisely the failure this row exists to remove, one layer down.
+#
+# The registry holds names, versions, publishers and declared grants. No secret
+# has ever been written here and none may be; 0644 is the mode that matches what
+# it is, and the directories above it are 0755 for the same reason.
+_plugin_publish_json() {
+  local tmp="$1" dest="$2"
+  mv "$tmp" "$dest" || return 1
+  chmod 644 "$dest"
+}
+
 # The capability and grant enums are contract §1. They are declared here as the
 # single source of truth because THREE places need them to agree: validation
 # (refuse an unknown value), the consent screen (render a grant in English), and
@@ -95,6 +116,13 @@ _plugin_usage() {
 
   Discovery lives in `5dive market --kind=plugin`, not here — one front door for
   "what can I add?" whether the answer is a plugin, a persona or a skill.
+
+  A plugin that declares the `verb` capability adds a top-level command. It is
+  reached only AFTER every builtin one, so a plugin can never take `5dive task`
+  from you — a manifest naming a builtin, or a verb a second plugin already
+  claims, is refused at install rather than installed dead. 5dive runs
+  <plugin>/bin/<verb> and nothing else: the manifest names the verb, it never
+  supplies a command line.
 
   Installing a plugin is installing CODE that runs with your agent's access.
   `add` prints who published it and exactly what it will be handed, and waits
@@ -196,6 +224,31 @@ _plugin_validate_manifest() {
     # not declare does not get it registered — but silently dropping it is how a
     # publisher discovers the rule in a bug report, so name it at install time.
     local caps; caps=$(jq -r '(.capabilities // []) | join(" ")' <<<"$fd")
+
+    # DIVE-4035 — the `verb` capability, both directions.
+    #
+    # DECLARED-BUT-NOT-DISPATCHED is the shape this whole row exists to kill, so
+    # it is said out loud here rather than left for the publisher to discover as
+    # a bug report. It is a warning and not a refusal on purpose: `verbs` without
+    # the capability is a manifest that is honestly inert under §2, and refusing
+    # it would make §2's own rule uninstallable.
+    #
+    # The converse IS a refusal, because it is not inert — it is incoherent. A
+    # manifest claiming the `verb` capability while naming no verbs asks for a
+    # surface and then declines to say what goes on it, and every later step
+    # (collision check, entry-point check, dispatch) has nothing to read.
+    local vnames; vnames=$(jq -r '(.verbs // []) | map(.name? // empty) | join(" ")' <<<"$fd")
+    if [[ " $caps " == *" verb "* ]]; then
+      [[ -n "$vnames" ]] \
+        || fail "$E_VALIDATION" "$name declares the 'verb' capability but names no verbs — add fivedive.verbs: [{\"name\": \"...\"}] (contract §2)"
+      local vn
+      for vn in $vnames; do
+        _plugin_verb_name_ok "$vn" \
+          || fail "$E_VALIDATION" "verb name '$vn' must be lowercase kebab-case — it becomes a top-level '5dive' command (contract §2)"
+      done
+    elif [[ -n "$vnames" ]]; then
+      warn "$name names verbs ($vnames) but does not declare the 'verb' capability — they will NOT be dispatched, and '5dive $(cut -d' ' -f1 <<<"$vnames")' stays an unknown command (contract §2: an undeclared surface is inert)"
+    fi
     [[ -f "$dir/.mcp.json" && " $caps " != *" mcp "* ]] \
       && warn "$name ships .mcp.json but does not declare the 'mcp' capability — it will NOT be registered (contract §2: an undeclared surface is inert)"
     [[ -d "$dir/skills" && " $caps " != *" skill "* ]] \
@@ -337,7 +390,7 @@ _plugin_register_bundled() {
   local tmp; tmp=$(mktemp)
   jq --arg s "$src" --arg t "$(date -u +%FT%TZ)" \
      '.["5dive"] = {source:$s, kind:"local", ref:"", added_at:$t, bundled:true}' \
-     "$(_plugin_mkt_json)" > "$tmp" && mv "$tmp" "$(_plugin_mkt_json)"
+     "$(_plugin_mkt_json)" > "$tmp" && _plugin_publish_json "$tmp" "$(_plugin_mkt_json)"
   # Explicit, because this function's last command is a CONDITIONAL and would
   # otherwise supply its exit status: every caller is `_plugin_ensure_store`,
   # which runs under errexit, so a failed jq here would take the whole verb down
@@ -350,8 +403,12 @@ _plugin_register_bundled() {
 _plugin_ensure_store() {
   require_root
   mkdir -p "$(_plugin_mkt_dir)" "$(_plugin_cache_dir)" "$(_plugin_enabled_dir)"
+  # DIVE-4035: the store is written by root and READ by whoever types a plugin
+  # verb, so its traversal has to survive a tight umask on the installing shell.
+  chmod 755 "$(_plugin_root)" "$(_plugin_mkt_dir)" "$(_plugin_cache_dir)" "$(_plugin_enabled_dir)" 2>/dev/null || true
   [[ -f "$(_plugin_mkt_json)" ]]       || echo '{}' > "$(_plugin_mkt_json)"
   [[ -f "$(_plugin_installed_json)" ]] || echo '{}' > "$(_plugin_installed_json)"
+  chmod 644 "$(_plugin_mkt_json)" "$(_plugin_installed_json)" 2>/dev/null || true
   _plugin_register_bundled
 }
 
@@ -430,7 +487,7 @@ _plugin_mkt_add() {
   local tmp; tmp=$(mktemp)
   jq --arg n "$name" --arg s "$src" --arg k "$kind" --arg r "$ref" --arg t "$(date -u +%FT%TZ)" \
      '.[$n] = {source:$s, kind:$k, ref:$r, added_at:$t}' "$(_plugin_mkt_json)" > "$tmp" \
-     && mv "$tmp" "$(_plugin_mkt_json)"
+     && _plugin_publish_json "$tmp" "$(_plugin_mkt_json)"
 
   local n; n=$(_plugin_mkt_plugins "$name" | jq 'length' 2>/dev/null || echo 0)
   ok "marketplace '$name' added ($kind) — $n plugin(s) available" \
@@ -544,7 +601,7 @@ _plugin_mkt_remove() {
 
   rm -rf "$(_plugin_mkt_dir)/$name"
   local tmp; tmp=$(mktemp)
-  jq --arg n "$name" 'del(.[$n])' "$(_plugin_mkt_json)" > "$tmp" && mv "$tmp" "$(_plugin_mkt_json)"
+  jq --arg n "$name" 'del(.[$n])' "$(_plugin_mkt_json)" > "$tmp" && _plugin_publish_json "$tmp" "$(_plugin_mkt_json)"
   ok "marketplace '$name' removed" '{marketplace:$n}' --arg n "$name"
 }
 
@@ -647,6 +704,15 @@ cmd_plugin_add() {
   _plugin_trust_gate "$plugin" "$review"
 
   local key="${plugin}@${mkt}"
+
+  # DIVE-4035, and it runs BEFORE the consent screen and before anything is
+  # copied. A verb that cannot be dispatched — because it collides with a
+  # builtin, because another plugin holds it, or because the plugin ships no
+  # executable for it — must not reach the point where the user has agreed to
+  # install it. Refusing here costs the publisher one message; refusing later
+  # would leave a half-installed plugin whose verb silently does not exist,
+  # which is the state this row was filed to remove.
+  _plugin_verb_install_check "$srcdir" "$plugin" "$key" "$caps" "$j"
   local dest; dest="$(_plugin_cache_dir)/$mkt/$plugin/$version"
 
   # §4, and this is the trap the atom
@@ -689,11 +755,22 @@ cmd_plugin_add() {
      '.[$k] = {plugin:$p, marketplace:$m, version:$v, enabled:true, review:$r,
                publisher:$pub, capabilities:$caps, grants:$grants, verbs:$verbs,
                installed_at:$t}' \
-     "$(_plugin_installed_json)" > "$tmp" && mv "$tmp" "$(_plugin_installed_json)"
+     "$(_plugin_installed_json)" > "$tmp" && _plugin_publish_json "$tmp" "$(_plugin_installed_json)"
 
   if [[ -z "$caps" ]]; then
     echo "  Note: $plugin declares no 5dive capabilities, so it registers no surfaces." >&2
     echo "  It is installed and inert (contract §2)." >&2
+  fi
+
+  # §2's live half, stated. The publisher's next question after "installed" is
+  # "so what do I type", and the answer is now a fact about this box rather than
+  # documentation.
+  if [[ " $caps " == *" verb "* ]]; then
+    local _v
+    while IFS= read -r _v; do
+      [[ -z "$_v" ]] && continue
+      echo "  '5dive $_v' now runs this plugin ($PLUGIN_VERB_BINDIR/$_v)." >&2
+    done < <(_plugin_verbs_of_manifest "$j")
   fi
 
   # `fivedive.setup` — a PROPOSED addendum to contract §6, and the whole of its
@@ -763,7 +840,7 @@ cmd_plugin_remove() {
   rm -f  "$(_plugin_enabled_dir)/$key"
   rm -rf "$(_plugin_cache_dir)/$mkt/$plugin"
   local tmp; tmp=$(mktemp)
-  jq --arg k "$key" 'del(.[$k])' <<<"$j" > "$tmp" && mv "$tmp" "$(_plugin_installed_json)"
+  jq --arg k "$key" 'del(.[$k])' <<<"$j" > "$tmp" && _plugin_publish_json "$tmp" "$(_plugin_installed_json)"
   ok "$key removed — every version, its pointer and its grants are gone" '{plugin:$k}' --arg k "$key"
 }
 
@@ -815,7 +892,7 @@ cmd_plugin_upgrade() {
      --argjson caps "$(jq -c '(.fivedive.capabilities // [])' <<<"$nj")" \
      --argjson grants "$(jq -c '(.fivedive.grants // [])' <<<"$nj")" \
      '.[$k].version = $v | .[$k].capabilities = $caps | .[$k].grants = $grants | .[$k].upgraded_at = $t' \
-     <<<"$j" > "$tmp" && mv "$tmp" "$(_plugin_installed_json)"
+     <<<"$j" > "$tmp" && _plugin_publish_json "$tmp" "$(_plugin_installed_json)"
 
   ok "$key upgraded $cur -> $new (roll back: 5dive plugin rollback $key)" \
      '{plugin:$k, from:$f, to:$t, changed:true}' --arg k "$key" --arg f "$cur" --arg t "$new"
@@ -865,7 +942,7 @@ _plugin_set_enabled() {
 
   local tmp; tmp=$(mktemp)
   jq --arg k "$key" --argjson e "$want" '.[$k].enabled = $e' <<<"$j" > "$tmp" \
-    && mv "$tmp" "$(_plugin_installed_json)"
+    && _plugin_publish_json "$tmp" "$(_plugin_installed_json)"
   if [[ "$want" == true ]]; then
     ok "$key enabled ($version)" '{plugin:$k, enabled:true, changed:true}' --arg k "$key"
   else
@@ -916,8 +993,182 @@ cmd_plugin_rollback() {
     ln -sfn "$base/$want" "$(_plugin_enabled_dir)/$key"
   fi
   local tmp; tmp=$(mktemp)
-  jq --arg k "$key" --arg v "$want" '.[$k].version = $v' <<<"$j" > "$tmp" && mv "$tmp" "$(_plugin_installed_json)"
+  jq --arg k "$key" --arg v "$want" '.[$k].version = $v' <<<"$j" > "$tmp" && _plugin_publish_json "$tmp" "$(_plugin_installed_json)"
   ok "$key rolled back $cur -> $want" '{plugin:$k, from:$f, to:$t}' --arg k "$key" --arg f "$cur" --arg t "$want"
+}
+
+# ---- contract §2, the other half: a DECLARED verb is LIVE (DIVE-4035) -------
+#
+# DIVE-4020 shipped one half of §2 and quinn signed the other half as a residual.
+# The enforcer got "an undeclared surface is inert" right; the unstated converse,
+# "a DECLARED surface is live", was false. A manifest could name a verb, install
+# cleanly, print no warning — and `5dive <verb>` was still "unknown command".
+# One clause checked and not honoured, in the more surprising direction: the
+# publisher gets no signal at all.
+#
+# ---- THE DESIGN CALL: WHAT A VERB IS INVOKED AS ----------------------------
+#
+# A verb resolves to an EXECUTABLE FILE AT A PATH 5DIVE COMPUTES, exec'd with the
+# caller's argv as an argument VECTOR. The manifest supplies one thing: the NAME.
+# It never supplies a command line, an interpreter, an entry-point path or any
+# other string that reaches a shell.
+#
+# That is the whole of it, and the alternative is the reason it is written down.
+# The obvious shape — `"verbs": [{"name": "voice", "command": "..."}]` and a
+# `$command "$@"` in the dispatcher — is arbitrary code execution chosen by the
+# publisher, which is the door contract §5 keeps shut and which DIVE-4020 already
+# refused once for `fivedive.setup` (printed, never executed). Verb dispatch must
+# not reopen it from the other side. With the path fixed by us, a plugin can only
+# ship a file where we look; `exec "$entry" "$@"` passes a vector, so no argument
+# is ever word-split or glob-expanded, and nothing from plugin.json is evaluated.
+#
+# WHY RUNNING THE FILE AT ALL IS NOT THE SAME DOOR. `plugin add` already copies
+# the publisher's whole directory onto the box after a consent screen that names
+# the publisher and the grants. What §5 keeps shut is code that runs because the
+# publisher said so — at install, before the user has seen what they installed. A
+# verb runs because the USER TYPED IT. That is the distinction, and it is the
+# only one doing work here: user-initiated, after consent, at a path we chose.
+#
+# ---- COLLISIONS: STRUCTURALLY IMPOSSIBLE, THEN REFUSED ANYWAY --------------
+#
+# Dispatch hangs off main()'s `*)` branch — the last thing before "unknown
+# command". A plugin therefore CANNOT shadow a builtin: by the time we are
+# consulted the 47 builtin verbs have already matched. That is the strong form of
+# the guarantee (a bug in the list below cannot cost a user their `5dive task`),
+# and it is why the list is a refusal aid rather than a security boundary.
+#
+# But "cannot shadow" would leave a publisher with a verb that installs and never
+# runs — the exact silent-inertness this row exists to remove. So a colliding
+# verb is REFUSED AT INSTALL, naming the builtin. Same for a second plugin
+# claiming a verb the first already holds: refused, naming the incumbent, because
+# picking a winner is a decision the box should not make on the user's behalf.
+#
+# ---- COST -----------------------------------------------------------------
+#
+# ~73% of every 5dive invocation is already bash parsing one 91k-line bundle, and
+# that is paid by every heartbeat tick fleet-wide. So the registry read happens
+# ONLY on the unknown-command path — a command that was about to die anyway. A
+# successful `5dive task ls` never reaches _plugin_dispatch_verb, never opens
+# installed.json and never shells jq.
+
+# Where a plugin's verb entry points live inside its own directory. A constant
+# rather than an inline literal because three places must agree: the install-time
+# check (source dir), the dispatcher (installed dir) and the error text that
+# tells a publisher where to put the file.
+readonly PLUGIN_VERB_BINDIR="bin"
+
+# Every label main()'s dispatch table already answers to. Kept as data because it
+# is read at install time, when the dispatcher itself is not a thing we can ask.
+# It is NOT hand-maintained on trust: tests/plugin_verb_dispatch_unit.sh
+# re-extracts the case labels from src/main.sh and asserts set equality, so a new
+# builtin verb that forgets this line reds the suite rather than silently
+# becoming claimable by a plugin.
+readonly FIVEDIVE_BUILTIN_VERBS="a2a account acp activity agent _audit_append bug buzz company constitution cost council crew deploy _deploy_do digest doctor down export fire fleet gate-proof gh _gh_do goal -h heartbeat --help help hire host human humans init liveness loop market memory _merge_do models objective objectives org paperclip-seed plugin project projects proof ps push _push_do run runs secret selfcheck self-update self_update supervisor task _task_answer team trace trigger triggers ui uninstall up update usage -v --version version watch whoami"
+
+_plugin_verb_name_ok()   { [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]; }
+_plugin_verb_is_builtin(){ [[ " $FIVEDIVE_BUILTIN_VERBS " == *" $1 "* ]]; }
+
+# _plugin_verb_claims <verb> [<key-to-ignore>]
+# Prints the installed.json key of every ENABLED plugin that declared the `verb`
+# capability AND names <verb>. Empty output means unclaimed.
+#
+# Both halves of the select are §2: the capability is the declaration, the verbs
+# array is the content, and a plugin that ships one without the other registers
+# nothing. Reading the RECORD and never the directory is DIVE-4020's rule — a
+# file dropped into bin/ after install cannot mint a verb the manifest never
+# named.
+_plugin_verb_claims() {
+  local verb="$1" skip="${2:-}" f
+  f=$(_plugin_installed_json)
+  [[ -r "$f" ]] || return 0
+  jq -r --arg v "$verb" --arg skip "$skip" '
+    to_entries[]
+    | select(.key != $skip)
+    | select(.value.enabled == true)
+    | select((.value.capabilities // []) | index("verb"))
+    | select((.value.verbs // []) | map(.name? // empty) | index($v))
+    | .key' "$f" 2>/dev/null || true
+}
+
+# _plugin_verb_entry_in <dir> <verb> — echoes the entry path, rc 1 if unusable.
+# One function for both callers so the convention cannot drift between the check
+# that gates the install and the lookup that runs the verb.
+_plugin_verb_entry_in() {
+  local dir="$1" verb="$2" entry="$1/$PLUGIN_VERB_BINDIR/$2"
+  [[ -d "$dir" ]] || return 1
+  [[ -f "$entry" && -x "$entry" ]] || return 1
+  printf '%s\n' "$entry"
+}
+
+# _plugin_verbs_of_manifest <manifest-json> — one verb name per line.
+_plugin_verbs_of_manifest() {
+  jq -r '(.fivedive.verbs // []) | map(.name? // empty)[]' <<<"$1" 2>/dev/null || true
+}
+
+# _plugin_verb_install_check <srcdir> <plugin> <key> <caps> <manifest-json>
+# Every refusal a declared verb can earn, run BEFORE anything is copied. Called
+# from cmd_plugin_add; separate so the suite can drive it without an install.
+_plugin_verb_install_check() {
+  local srcdir="$1" plugin="$2" key="$3" caps="$4" j="$5" v other
+  [[ " $caps " == *" verb "* ]] || return 0
+  while IFS= read -r v; do
+    [[ -z "$v" ]] && continue
+    _plugin_verb_is_builtin "$v" \
+      && fail "$E_VALIDATION" "$plugin declares the verb '$v', which is already a 5dive command — a plugin verb is only ever reached AFTER the builtin table, so this one could never run. Rename it in plugin.json (contract §2)."
+    other=$(_plugin_verb_claims "$v" "$key")
+    [[ -n "$other" ]] \
+      && fail "$E_VALIDATION" "$plugin declares the verb '$v', which is already claimed by $(tr '\n' ' ' <<<"$other" | sed 's/ $//') — 5dive will not pick between them. Remove or disable that plugin first, or rename this verb (contract §2)."
+    _plugin_verb_entry_in "$srcdir" "$v" >/dev/null \
+      || fail "$E_VALIDATION" "$plugin declares the verb '$v' but ships no executable at $PLUGIN_VERB_BINDIR/$v — that is the only place 5dive looks, and a verb it cannot run must not install as if it could. Add the file and chmod +x it (contract §2)."
+  done < <(_plugin_verbs_of_manifest "$j")
+  return 0
+}
+
+# _plugin_dispatch_verb <verb> [args...]
+# EXECS on success and therefore does not return. Returns 1 — quietly, with
+# nothing printed — only when no installed, enabled plugin claims <verb>, which
+# is the caller's signal to carry on to "unknown command".
+#
+# Quiet is the contract with main(): every other outcome here is a plugin problem
+# worth a sentence, but "no plugin claims it" is the overwhelmingly common case
+# (a typo) and must read exactly as it did before this row existed.
+_plugin_dispatch_verb() {
+  local verb="${1:-}"; [[ $# -gt 0 ]] && shift
+  _plugin_verb_name_ok "$verb" || return 1
+  # Belt to the structural brace: main() has already matched every builtin before
+  # we are called, so this can only fire on a hand-edited installed.json. It
+  # still refuses, because "a plugin cannot shadow a builtin" should not depend
+  # on the reader knowing where the call site sits.
+  _plugin_verb_is_builtin "$verb" && return 1
+  command -v jq >/dev/null 2>&1 || return 1
+
+  local claims; claims=$(_plugin_verb_claims "$verb")
+  [[ -n "$claims" ]] || return 1
+
+  if [[ "$(wc -l <<<"$claims")" -gt 1 ]]; then
+    fail "$E_VALIDATION" "verb '$verb' is claimed by more than one enabled plugin ($(tr '\n' ' ' <<<"$claims" | sed 's/ $//')) — 5dive will not pick between them. Disable all but one: 5dive plugin disable <plugin>"
+  fi
+
+  local key="$claims" dir entry
+  dir="$(_plugin_enabled_dir)/$key"
+  entry=$(_plugin_verb_entry_in "$dir" "$verb") \
+    || fail "$E_NOT_FOUND" "$key declares the verb '$verb' but $dir/$PLUGIN_VERB_BINDIR/$verb is missing or not executable. Reinstall it: 5dive plugin upgrade $key"
+
+  # The child gets its own location and identity and nothing else invented for
+  # it. STATE_DIR and the rest of the environment pass through untouched, which
+  # is what lets the suite run a real dispatch against a throwaway tree.
+  export FIVEDIVE_PLUGIN_DIR="$dir"
+  export FIVEDIVE_PLUGIN_KEY="$key"
+  export FIVEDIVE_VERB="$verb"
+
+  # DIVE-2797: `exec` replaces the process, so the dispatcher's EXIT trap never
+  # fires and AUDIT_CMD would be lost. Same fix cmd_acp uses — write the row
+  # here, before the exec, rather than pretending the trap will.
+  if declare -F audit_log >/dev/null 2>&1 && [[ -n "${AUDIT_LOG:-}" ]]; then
+    audit_log "plugin-verb" "start" 0 -- "verb=$verb" "plugin=$key" || true
+  fi
+
+  exec "$entry" "$@"
 }
 
 cmd_plugin() {
