@@ -457,6 +457,14 @@ _pending_restart_sweep() {
     #                          fires and the normal decide/fire path bounces it.
     # PARKED is its own counter and is NOT folded into DEFERRED/OVERDUE: it is a
     # debt whose payment is blocked on an operator, not on a task boundary.
+    #
+    # CONSEQUENCE, stated because it is a real change: a held marker means this
+    # line is logged on EVERY sweep until the operator reconciles, where the
+    # cleared marker logged it once. That is deliberate — the only agents that
+    # reach here are running-but-parked, i.e. the contradiction itself, and a
+    # correctly-parked agent (unit down) is already filtered by the guard above,
+    # so nothing benign repeats. A one-shot line for a state that persists for
+    # weeks is how katya ran for three of them unnoticed.
     if _agent_is_parked "$name"; then
       _PR_PARKED=$((_PR_PARKED + 1))
       _pr_log "[$name] $(_parked_override_note "$name")"
