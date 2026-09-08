@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased — feat(self-update): the update path checks the box it just updated still runs an agent (DIVE-4068)
+
+0.26.1 shipped a launcher that could not start any agent (DIVE-4067). The nightly installs the
+release and then restarts every agent, so every box that took it **emptied itself, unattended**,
+and stayed empty until a human noticed.
+
+`install.sh` grades the ARTIFACT — it fetched, the sha256 matches, `bash -n` parses, the version
+went forwards. Every one of those passed on 0.26.1: a self-referencing `local` is syntactically
+valid. The OUTCOME — *does an agent still start on this box* — was never asked, and it is the one
+question the box can answer for itself in about twenty seconds.
+
+`5dive self-update` now snapshots the startup path before the installer runs, and grades the
+first agent it restarts:
+
+- **The canary is free.** It is the first unit the pass was going to bounce anyway, so DIVE-3172's
+  "restart only whoever's payload moved" is not undone — and the gate settles before the loop
+  reaches agent number two, which holds a bad release to one dark agent instead of the fleet.
+- **`NRestarts`, not `is-active`.** The unit is `Type=simple`, so a launcher that execs and dies
+  one line later is `active` for the instant between them. A naive is-active check would have
+  reported 0.26.1 as a clean install.
+- **On a failure it ROLLS BACK** `5dive`, `5dive-agent-start` and the systemd template to the build
+  that was on the box, restarts the canary onto them, touches no other agent, and exits non-zero
+  naming the release and the agent it was measured on.
+- **A launcher-only release is probed deliberately.** `5dive-agent-start` lives in `/usr/local/bin`,
+  so it is invisible to the payload fingerprint — 0.26.1 would have moved no fingerprint, restarted
+  no one, and been graded by nothing. When the launcher's own hash moves and the pass restarts
+  nobody, the gate spends one restart on an idle agent.
+- **A false rollback is guarded separately.** An agent already crash-looping before the update is
+  indistinguishable from a release that broke the box, so a canary must read `active/running` at two
+  samples a second apart with the counter still between them. A unit that fails that is not judged
+  broken — it is unusable as an instrument, and the canary role moves on.
+- **Three outcomes, not two.** An unreadable unit HALTS (blast radius stays at one) but rolls back
+  nothing — reverting a release needs positive evidence of breakage. A systemd that answers nothing
+  at all is told apart from that by an `Id` positive control and PROCEEDS exactly as before, so a
+  safety check cannot freeze a box off updates.
+
+`self-update`'s JSON gains a `health_gate` object; every existing field keeps its meaning.
+
 ## Unreleased — feat(team): `loops:` — a company import brings recurring work, not just a roster (DIVE-4022)
 
 `5dive team import <slug>` provisioned a **roster**, not a working company. Agents, roles and

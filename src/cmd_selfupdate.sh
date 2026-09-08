@@ -508,6 +508,319 @@ _pending_restart_sweep() {
 }
 # <<< DIVE-3173 deferred restart for a busy agent
 
+# >>> DIVE-4068 post-install health gate
+#     (tests/self_update_health_gate_unit.sh extracts this block VERBATIM
+#      between these markers and runs the shipped bytes — keep them.)
+#
+# 0.26.1 shipped a launcher that could not start any agent (DIVE-4067). The
+# update path installed it, then restarted every agent, and every box that took
+# the release emptied itself and STAYED empty until a human noticed.
+#
+# WHAT THE UPDATE PATH ALREADY GRADED, AND WHAT IT DID NOT. install.sh grades
+# the ARTIFACT — it fetched, the sha256 matches, `bash -n` parses, the version
+# does not go backwards. Every one of those passed on 0.26.1: a self-referencing
+# `local` is syntactically valid, so the file that could not start a single agent
+# is indistinguishable from a good one by every check the installer runs. The
+# OUTCOME — "an agent still starts on this box" — was never asked, and it is the
+# one question whose answer the box can produce for itself in about twenty
+# seconds.
+#
+# THE PROBE IS ONE AGENT, AND IT IS ONE THE PASS WAS GOING TO BOUNCE ANYWAY.
+# DIVE-3172 took the nightly from "restart everyone" to "restart whoever's
+# payload moved", and a gate that adds an unconditional canary restart would put
+# that cost straight back. So the canary is the FIRST unit this pass restarts:
+# on a night with restarts the gate is free, and it fires before the second agent
+# is touched — which is what keeps the blast radius of a bad release at one agent
+# instead of the fleet.
+#
+# THE ONE NIGHT THAT BUYS NOTHING, AND WHY IT IS HANDLED SEPARATELY. The launcher
+# is NOT in DIVE-3172's payload fingerprint (it lives in /usr/local/bin, not in
+# an agent's home), so a launcher-only release changes no fingerprint, restarts
+# nobody, and would never be probed — which is EXACTLY the shape of 0.26.1. When
+# the launcher's own hash moved and the pass restarted no one, the gate probes an
+# idle agent deliberately. That is a restart that would not otherwise happen, and
+# it is bounded to the rare night the startup path itself changed.
+#
+# THREE OUTCOMES, NOT TWO. `unknown` is not folded into either answer:
+#   healthy    -> the rest of the restart loop proceeds, byte for byte as today.
+#   broken     -> restore the previous artifacts, restart the canary onto them,
+#                 and touch NO other agent.
+#   unknown    -> stop the loop, roll back NOTHING. Halting needs only the
+#                 ABSENCE of evidence of health; reverting a release across a box
+#                 needs positive evidence of breakage. Reverting on an unreadable
+#                 systemctl would freeze a box on an old build every night the
+#                 reading fails, silently — the failure mode DIVE-3173 and
+#                 DIVE-1095 both name as the worse one.
+#
+# A rollback point is captured BEFORE the installer runs, because afterwards
+# there is nothing left to restore from — install.sh has no rollback point of its
+# own (its own header says so: "one upgrade cycle, with no tag, no cut, and no
+# rollback point").
+
+# The artifacts an update swaps that can, on their own, stop every agent from
+# starting. Deliberately NOT the whole managed set (hooks, skills, refresh
+# scripts, the digest cron): those are read by an agent that is already up, and
+# reverting them would widen a targeted rollback into a general one. These three
+# are the startup path itself.
+#   $BIN/5dive                        the bundle; `5dive-agent-start` shells into it
+#   $BIN/5dive-agent-start            the launcher — DIVE-4067's file
+#   $SYSTEMD/5dive-agent@.service     ExecStart, Restart=, RestartPreventExitStatus
+_hg_artifacts() {
+  printf '%s\n' \
+    "${HEALTH_GATE_BIN_DIR:-/usr/local/bin}/5dive" \
+    "${HEALTH_GATE_BIN_DIR:-/usr/local/bin}/5dive-agent-start" \
+    "${HEALTH_GATE_SYSTEMD_DIR:-/etc/systemd/system}/5dive-agent@.service"
+}
+
+_hg_rollback_dir() {
+  printf '%s\n' "${HEALTH_GATE_ROLLBACK_DIR:-${STATE_DIR:-/var/lib/5dive}/rollback}"
+}
+
+_hg_sha() { [[ -f "${1:-}" ]] && sha256sum "$1" 2>/dev/null | awk '{print $1}'; return 0; }
+
+# _hg_capture — snapshot the current startup path. Exactly ONE generation is
+# kept: a rollback that could choose between generations would need someone to
+# choose, and the only answer this gate can defend is "the thing that was
+# working ten seconds ago".
+#
+# Returns non-zero when the snapshot is not usable. That does NOT stop the probe
+# — detection without a rollback is still strictly better than the silence this
+# row exists to remove, and the operator is told which of the two they got.
+_hg_capture() {
+  local dir f base rc=0
+  dir="$(_hg_rollback_dir)"
+  rm -rf "$dir.new" 2>/dev/null
+  mkdir -p "$dir.new" 2>/dev/null || return 1
+  : > "$dir.new/manifest" 2>/dev/null || return 1
+  while read -r f; do
+    [[ -n "$f" ]] || continue
+    base="${f##*/}"
+    # An artifact that is ABSENT is recorded as absent rather than skipped. A
+    # box with no systemd template must not have one conjured onto it by a
+    # rollback, and "we never saw this file" and "we failed to copy it" have to
+    # be distinguishable at restore time.
+    if [[ ! -f "$f" ]]; then
+      printf 'absent\t%s\t-\n' "$f" >> "$dir.new/manifest"
+      continue
+    fi
+    if cp -p "$f" "$dir.new/$base" 2>/dev/null; then
+      printf 'present\t%s\t%s\n' "$f" "$(_hg_sha "$f")" >> "$dir.new/manifest"
+    else
+      printf 'uncopied\t%s\t%s\n' "$f" "$(_hg_sha "$f")" >> "$dir.new/manifest"
+      rc=1
+    fi
+  done < <(_hg_artifacts)
+  rm -rf "$dir" 2>/dev/null
+  mv -f "$dir.new" "$dir" 2>/dev/null || return 1
+  return $rc
+}
+
+# _hg_artifact_moved <path> — did the upgrade change this file since the capture?
+# "no snapshot line" answers UNKNOWN (2), never "no": the launcher-only probe
+# below must not be skipped because the manifest was unreadable.
+_hg_artifact_moved() {
+  local f="${1:-}" line was now
+  line=$(awk -F'\t' -v p="$f" '$2==p{print; exit}' "$(_hg_rollback_dir)/manifest" 2>/dev/null) || line=""
+  [[ -n "$line" ]] || return 2
+  was="${line##*$'\t'}"
+  now="$(_hg_sha "$f")"
+  [[ -n "$now" ]] || return 2
+  case "$line" in
+    absent*) return 0 ;;
+  esac
+  [[ "$was" == "$now" ]] && return 1
+  return 0
+}
+
+# _hg_restore — put the captured startup path back. Echoes the basenames it
+# restored, one per line; empty output means nothing was restored.
+_hg_restore() {
+  local dir line status f base restored=0
+  dir="$(_hg_rollback_dir)"
+  [[ -f "$dir/manifest" ]] || return 1
+  while IFS=$'\t' read -r status f _; do
+    [[ -n "$f" ]] || continue
+    base="${f##*/}"
+    [[ "$status" == "present" ]] || continue
+    [[ -f "$dir/$base" ]] || continue
+    # Same-fs temp + mv, the shape install.sh uses for the bundle swap: a box
+    # that loses power mid-restore keeps a whole file rather than a half-written
+    # one that execs into garbage.
+    if cp -p "$dir/$base" "$f.hgtmp" 2>/dev/null && mv -f "$f.hgtmp" "$f" 2>/dev/null; then
+      printf '%s\n' "$base"; restored=$((restored + 1))
+    else
+      rm -f "$f.hgtmp" 2>/dev/null
+    fi
+  done < "$dir/manifest"
+  (( restored > 0 )) || return 1
+  # The unit template is one of the three, and systemd does not re-read it on
+  # its own. Unconditional and best-effort: a reload with nothing to reload is
+  # free, and skipping it after restoring the template would leave the box
+  # running the bad ExecStart it just reverted.
+  command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null
+  return 0
+}
+
+# _hg_unit_field <unit> <property> — one systemd property, empty when unreadable.
+_hg_unit_field() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  systemctl show "${1:-}" --property="${2:-}" --value 2>/dev/null || true
+}
+
+# _hg_verdict <ActiveState> <SubState> <NRestarts-before> <NRestarts-after>
+#   healthy | crash-loop | failed | down | unknown
+#
+# Pure, so the harness grades the decision itself rather than a restatement.
+#
+# NRestarts IS THE FAST SIGNAL, and it is why this does not just read is-active.
+# The unit is Type=simple, so a launcher that execs and dies one line later is
+# `active` for the instant between them — the very reading a naive check would
+# take. RestartSec=3 means systemd's first re-start lands ~3s in and NRestarts
+# ticks to 1, which is decisive long before StartLimitBurst=10 finally parks the
+# unit in `failed` some 30s later. So a crash-loop is caught by the counter, and
+# the two exits the launcher itself uses for permanent conditions (2 unknown
+# type, 3 not installed) are caught by `failed` via RestartPreventExitStatus.
+_hg_verdict() {
+  local active="${1:-}" sub="${2:-}" before="${3:-}" after="${4:-}"
+  [[ -n "$active" ]] || { printf 'unknown\n'; return 0; }
+  [[ "$before" =~ ^[0-9]+$ ]] || before=""
+  [[ "$after"  =~ ^[0-9]+$ ]] || after=""
+  [[ "$active" == "failed" ]] && { printf 'failed\n'; return 0; }
+  if [[ -n "$before" && -n "$after" ]] && (( after > before )); then
+    printf 'crash-loop\n'; return 0
+  fi
+  [[ "$active" == "active" && "$sub" == "running" ]] && { printf 'healthy\n'; return 0; }
+  # Still coming up when the window ran out. NOT `down` — we did not watch long
+  # enough to say, and `down` reverts a release.
+  [[ "$active" == "activating" || "$active" == "reloading" ]] && { printf 'unknown\n'; return 0; }
+  printf 'down\n'
+}
+
+# _hg_watch <unit> <baseline-NRestarts> [window-secs] [poll-secs]
+# Echoes the verdict after watching the unit settle. Short-circuits on a
+# DECISIVE failure only: an early `healthy` reading is not an answer, because
+# "started" is not the question — "stayed up past the restart burst" is.
+_hg_watch() {
+  local unit="${1:-}" base="${2:-}" window="${3:-${HEALTH_GATE_WINDOW_SECS:-20}}" poll="${4:-${HEALTH_GATE_POLL_SECS:-1}}"
+  local waited=0 v
+  [[ "$window" =~ ^[0-9]+$ ]] || window=20
+  [[ "$poll" =~ ^[0-9]+$ && "$poll" -gt 0 ]] || poll=1
+  while :; do
+    v="$(_hg_verdict "$(_hg_unit_field "$unit" ActiveState)" "$(_hg_unit_field "$unit" SubState)" \
+                     "$base" "$(_hg_unit_field "$unit" NRestarts)")"
+    case "$v" in
+      crash-loop|failed) printf '%s\n' "$v"; return 0 ;;
+    esac
+    (( waited >= window )) && break
+    sleep "$poll" 2>/dev/null || true
+    waited=$((waited + poll))
+  done
+  printf '%s\n' "$v"
+}
+
+# _hg_probe <unit> — restart the unit and grade the outcome. Echoes the verdict.
+# The baseline is read BEFORE the restart: NRestarts is cumulative for the life
+# of the unit, so only the DELTA across this restart is about this release.
+# _hg_canary_ok <unit> — is this unit a unit we can LEARN anything from?
+#
+# The gate reads a crash-loop as "the release broke the box". An agent that was
+# ALREADY crash-looping before the update reads exactly the same, and would make
+# the gate revert a perfectly good release for the whole box because one agent
+# was independently sick — a false rollback is the one way this row can make a
+# night worse than it found it.
+#
+# `systemctl list-units --state=running` does not settle it: a unit that dies and
+# is re-started every 3s IS running at the instant it is enumerated. So this takes
+# TWO samples a second apart and requires the unit to be active/running at both,
+# with the counter still between them. A unit that fails this is not judged
+# broken — it is judged UNREADABLE as an instrument, and the canary role moves to
+# the next agent.
+_hg_canary_ok() {
+  local unit="${1:-}" a1 n1 a2 n2
+  a1="$(_hg_unit_field "$unit" ActiveState)"; n1="$(_hg_unit_field "$unit" NRestarts)"
+  [[ "$a1" == "active" && "$(_hg_unit_field "$unit" SubState)" == "running" ]] || return 1
+  sleep "${HEALTH_GATE_PRECHECK_SECS:-1}" 2>/dev/null || true
+  a2="$(_hg_unit_field "$unit" ActiveState)"; n2="$(_hg_unit_field "$unit" NRestarts)"
+  [[ "$a2" == "active" && "$(_hg_unit_field "$unit" SubState)" == "running" ]] || return 1
+  # Counters unreadable on both samples is not evidence of a loop — the verdict
+  # path already treats an unreadable counter as no-delta, and being stricter
+  # here would disqualify every canary on a systemd too old to report it.
+  [[ -n "$n1" && -n "$n2" && "$n1" != "$n2" ]] && return 1
+  return 0
+}
+
+_hg_probe() {
+  local unit="${1:-}" base
+  # POSITIVE CONTROL BEFORE THE MEASUREMENT. `Id` is set for every unit systemd
+  # knows, so an empty one means systemd answered NOTHING — not that the unit is
+  # sick. Without this control an uninterrogable systemd reads exactly like a
+  # unit in an unclassifiable state, and the gate would halt the nightly on every
+  # such box forever. (The same failure shape the CLAUDE.md rule names for a
+  # cross-seat probe: a denial and a real negative are the same empty string
+  # until something known-present is read alongside it.)
+  if [[ -z "$(_hg_unit_field "$unit" Id)" ]]; then
+    systemctl restart "$unit" 2>/dev/null || { printf 'restart-refused\n'; return 0; }
+    printf 'gate-unavailable\n'; return 0
+  fi
+  # A unit that was already sick cannot answer a question about the release.
+  if ! _hg_canary_ok "$unit"; then
+    printf 'not-a-canary\n'; return 0
+  fi
+  base="$(_hg_unit_field "$unit" NRestarts)"
+  if ! systemctl restart "$unit" 2>/dev/null; then
+    printf 'restart-refused\n'; return 0
+  fi
+  _hg_watch "$unit" "$base"
+}
+# _hg_action <verdict> -> proceed | rollback | halt | next-canary
+#
+# The split is asymmetric on purpose, and the two outcomes that are NOT `halt`
+# are the ones worth reading twice — each exists because halting there would
+# introduce a NEW fleet-wide failure in the name of preventing one.
+#
+#   ROLLBACK needs POSITIVE evidence of breakage — the unit died, systemd
+#     re-started it, or it parked in `failed`. Reverting a box's startup path is
+#     itself a change; doing it on a hunch is how a box never takes an update
+#     again.
+#   HALT needs only the ABSENCE of evidence of health. It costs the agents this
+#     pass had not yet reached one night's payload refresh, it is loud, and it is
+#     what holds the blast radius at one agent.
+#   GATE-UNAVAILABLE PROCEEDS. This is not a reading we could not classify — it
+#     is systemd declining to answer anything at all about the unit, on a box
+#     where the gate therefore never ran. Halting there would take every box with
+#     an uninterrogable systemd off updates entirely, permanently and for a
+#     reason nobody would connect to this row: a new fleet-wide freeze introduced
+#     by a safety check. Proceeding is exactly today's behaviour, and it is said
+#     out loud at the call site rather than folded into a pass.
+#   NOT-A-CANARY TAKES THE NEXT AGENT INSTEAD, and this one is load-bearing. An
+#     agent that was already crash-looping before the update is indistinguishable
+#     from a release that broke the box, and treating it as the latter reverts a
+#     good release for every agent on the box. A false rollback is the one way
+#     this row can make a night worse than it found it, so a canary that cannot
+#     be read as an instrument is skipped rather than believed.
+#   RESTART-REFUSED TAKES THE NEXT AGENT INSTEAD. systemctl declining to restart
+#     one unit (masked, mid-stop, a bad drop-in) says nothing about the artifact,
+#     and before this row that agent simply landed in `failed` and the loop went
+#     on. Halting on it would let one stuck unit stop the nightly for the whole
+#     box, so the canary role moves to the next agent the pass restarts and this
+#     one is reported exactly as it always was.
+_hg_action() {
+  case "${1:-}" in
+    healthy|gate-unavailable) printf 'proceed\n' ;;
+    crash-loop|failed|down)   printf 'rollback\n' ;;
+    restart-refused|not-a-canary) printf 'next-canary\n' ;;
+    *)                        printf 'halt\n' ;;
+  esac
+}
+
+# The line an operator reads in the nightly log. It names the release that was
+# reverted and the agent it was measured on, because "update rolled back" with
+# no subject is the same silence in a louder font.
+_hg_rollback_note() {
+  printf "POST-INSTALL HEALTH GATE FAILED on agent '%s' (%s) — this box installed a build on which an agent does not stay running. The startup path has been RESTORED to the build that was on this box before the update (%s); no other agent was touched. Nothing here retries: this box stays on the old build until the next update pass, and if that pass installs the same release it will fail the same way. Check the release before re-running \`5dive self-update\`." "${1:-?}" "${2:-?}" "${3:-nothing restored}"
+}
+# <<< DIVE-4068 post-install health gate
+
 cmd_self_update() {
   [[ $# -eq 0 ]] || fail "$E_USAGE" "self-update takes no arguments"
   command -v curl >/dev/null 2>&1 || fail "$E_NOT_FOUND" "curl is required for 5dive self-update"
@@ -544,6 +857,14 @@ cmd_self_update() {
     done < <(systemctl list-units '5dive-agent@*' --state=running --no-legend --plain 2>/dev/null | awk '{print $1}')
   fi
 
+  # DIVE-4068: snapshot the startup path BEFORE the installer overwrites it —
+  # afterwards there is nothing left to restore from. A capture that fails does
+  # NOT abort the upgrade and does not disarm the probe: detection with no
+  # rollback is still better than the silence this replaces, and the operator is
+  # told which of the two this box has.
+  local hg_capture=ok
+  _hg_capture || { hg_capture=unusable; warn "could not capture a rollback point in $(_hg_rollback_dir) — the post-install health gate will still DETECT a box that cannot start an agent, but it will not be able to put the previous build back"; }
+
   step "Upgrading 5dive CLI + plugins"
   # Send installer chatter to stderr so JSON stdout stays parseable.
   bash "$installer" --upgrade >&2 || fail "$E_GENERIC" "upgrade failed"
@@ -552,6 +873,10 @@ cmd_self_update() {
   # one failed restart shouldn't abort the rest.
   local -a restarted=() failed=() skipped=() deferred=() parked=()
   local i after before atype why busy
+  # DIVE-4068 gate state. `hg_verdict` stays "not-probed" until a unit is
+  # actually restarted, and that is a THIRD value, not a pass — a pass has to be
+  # something the box measured.
+  local hg_canary="" hg_verdict="not-probed" hg_verdict_raw="" hg_action="proceed" hg_why=""
   for i in "${!units[@]}"; do
     name="${names[$i]}"; before="${befores[$i]}"
     # DIVE-4033: asked BEFORE the payload predicate, so the operator is told the
@@ -619,6 +944,42 @@ cmd_self_update() {
       # change deliberately keeps the behaviour it exists to remove.
       warn "could not record a deferred restart for '$name' — restarting now"
     fi
+    # DIVE-4068: the FIRST unit this pass bounces is the canary. Not an extra
+    # restart — this agent was being restarted either way — and the gate settles
+    # before the loop reaches agent number two, which is what keeps a bad release
+    # to one dark agent instead of the box.
+    if [[ -z "$hg_canary" ]]; then
+      hg_canary="$name"; hg_why="first agent this pass restarts"
+      hg_verdict="$(_hg_probe "${units[$i]}")"; hg_verdict_raw="$hg_verdict"
+      hg_action="$(_hg_action "$hg_verdict")"
+      if [[ "$hg_action" == "next-canary" ]]; then
+        hg_canary=""; hg_verdict="not-probed"; hg_action=proceed
+        if [[ "$hg_verdict_raw" == "not-a-canary" ]]; then
+          # The unit was not steady BEFORE the update, so it cannot answer a
+          # question about the release. Nothing has been restarted yet on this
+          # branch — `_hg_probe` returns before the restart — so fall through to
+          # the ORDINARY restart below and let the next agent take the canary
+          # role. Believing this unit would revert a good release for the whole
+          # box on one independently sick agent.
+          step "not using $name as the health-gate canary (its unit was not steady before the update) — the next agent this pass restarts takes that role"
+        else
+          # systemctl would not restart this unit: the pre-DIVE-4068 `failed`
+          # case verbatim, and not evidence about the release.
+          warn "failed to restart agent '$name'"
+          failed+=("$name"); continue
+        fi
+      elif [[ "$hg_action" != "proceed" ]]; then
+        break
+      else
+        if [[ "$hg_verdict" == "gate-unavailable" ]]; then
+          warn "restarted $name, but systemd answered nothing about the unit — the post-install health gate could NOT run on this box. This pass behaves exactly as it did before the gate existed: a release that cannot start an agent will not be caught here."
+        else
+          step "restarted $name ($why) — health gate PASSED (the unit was still running ${HEALTH_GATE_WINDOW_SECS:-20}s later, with no systemd re-start)"
+        fi
+        restarted+=("$name")
+        continue
+      fi
+    fi
     if systemctl restart "${units[$i]}" 2>/dev/null; then
       step "restarted $name ($why)"
       restarted+=("$name")
@@ -627,6 +988,89 @@ cmd_self_update() {
       failed+=("$name")
     fi
   done
+
+  # DIVE-4068: the pass restarted nobody, so nothing exercised the startup path
+  # the installer just replaced — and a LAUNCHER-ONLY release is exactly that
+  # shape. `5dive-agent-start` lives in /usr/local/bin, not in an agent's home,
+  # so it is invisible to DIVE-3172's payload fingerprint: 0.26.1 would have
+  # moved no fingerprint, restarted no one, and been probed by nothing. Then the
+  # first crash-restart, operator bounce or deferred sweep to follow would have
+  # found the box dark, with no gate anywhere near it.
+  #
+  # So on that night, and only that night, the gate spends one restart. An
+  # UNREADABLE manifest probes too (`_hg_artifact_moved` exit 2): DIVE-2230's
+  # rule, an absent reading resolves to neither answer, and the branch that costs
+  # a restart is the recoverable one.
+  if [[ -z "$hg_canary" && "$hg_action" == "proceed" ]] && command -v systemctl >/dev/null 2>&1; then
+    # Declared and assigned SEPARATELY. `local hg_moved=$?` reads local's own
+    # status on some shells, and this row exists because of a `local` that
+    # referred to itself.
+    local hg_moved=0
+    _hg_artifact_moved "${HEALTH_GATE_BIN_DIR:-/usr/local/bin}/5dive-agent-start" || hg_moved=$?
+    if (( hg_moved != 1 )); then
+      local cand
+      for i in "${!units[@]}"; do
+        cand="${names[$i]}"
+        # Every guard the loop above applies, applied again: an agent nobody
+        # asked to restart must not be resurrected from a park, interrupted
+        # mid-row, or bounced between turns of a closing one.
+        _agent_is_parked "$cand" && continue
+        [[ "$(_agent_busy_state "$cand")" == "idle" ]] || continue
+        if declare -F _hb_agent_idle >/dev/null 2>&1 && ! _hb_agent_idle "$cand" 0.4; then continue; fi
+        systemctl is-active --quiet "${units[$i]}" 2>/dev/null || continue
+        hg_canary="$cand"
+        hg_why="the launcher itself changed and this pass restarted no one$( (( hg_moved == 2 )) && printf ' (manifest unreadable — probed rather than assumed unchanged)')"
+        step "no agent needed a restart, but the launcher changed — probing '$cand' so a build that cannot start an agent is found now rather than on its next bounce"
+        hg_verdict="$(_hg_probe "${units[$i]}")"; hg_verdict_raw="$hg_verdict"
+        hg_action="$(_hg_action "$hg_verdict")"
+        if [[ "$hg_action" == "next-canary" ]]; then
+          [[ "$hg_verdict_raw" == "restart-refused" ]] && { warn "failed to restart agent '$cand'"; failed+=("$cand"); }
+          hg_canary=""; hg_verdict=not-probed; hg_action=proceed; continue
+        fi
+        [[ "$hg_action" == "proceed" ]] && restarted+=("$cand")
+        break
+      done
+      if [[ -z "$hg_canary" ]]; then
+        hg_verdict="no-safe-canary"
+        warn "the launcher changed and no agent was safe to probe (all parked, busy or down) — this box installed a new startup path that NOTHING on it has exercised. The next agent restart, from any cause, is the first thing that will find out."
+      fi
+    fi
+  fi
+
+  # DIVE-4068: the gate said stop. Everything below this point — the rest of the
+  # restart loop, the listener refresh, the ok summary — is skipped, because each
+  # of them touches something else on a box we have just measured as unable to
+  # keep an agent running.
+  if [[ "$hg_action" != "proceed" ]]; then
+    local hg_restored="" hg_rolled=false hg_canary_state=""
+    if [[ "$hg_action" == "rollback" ]]; then
+      if [[ "$hg_capture" == "unusable" ]]; then
+        warn "the health gate would roll this box back and CANNOT — no rollback point was captured before the upgrade. The box is on the new build and agent '$hg_canary' is not running."
+      else
+        hg_restored="$(_hg_restore | paste -sd, - 2>/dev/null)" || hg_restored=""
+        [[ -n "$hg_restored" ]] && hg_rolled=true
+      fi
+      if [[ "$hg_rolled" == true ]]; then
+        # Bring the canary back UP on the restored path. Without this the gate
+        # ends its run having darkened exactly one agent — a smaller version of
+        # the failure it exists to prevent, and one nobody would be watching for.
+        local hg_cu="5dive-agent@${hg_canary}.service" hg_cbase
+        hg_cbase="$(_hg_unit_field "$hg_cu" NRestarts)"
+        if systemctl restart "$hg_cu" 2>/dev/null \
+           && [[ "$(_hg_watch "$hg_cu" "$hg_cbase")" == "healthy" ]]; then
+          hg_canary_state=recovered
+          step "agent '$hg_canary' is running again on the restored build"
+        else
+          hg_canary_state=still-down
+          warn "agent '$hg_canary' did NOT come back after the rollback — the old build is back on disk but this agent needs a look. Start it with 'systemctl restart 5dive-agent@${hg_canary}.service' and read 'journalctl -u 5dive-agent@${hg_canary}'."
+        fi
+        warn "$(_hg_rollback_note "$hg_canary" "$hg_verdict" "$hg_restored")"
+      fi
+    else
+      warn "POST-INSTALL HEALTH GATE INCONCLUSIVE on agent '$hg_canary' (verdict '$hg_verdict') — this box could not be read well enough to say whether an agent stays running on the new build. NOTHING was rolled back: reverting a release needs evidence it is broken, and this is the absence of evidence that it works. The other agents this pass had not yet reached were left alone, so the blast radius stays at one. Check 'systemctl status 5dive-agent@${hg_canary}' before re-running."
+    fi
+    fail "$E_GENERIC" "self-update HALTED by the post-install health gate — agent '$hg_canary' ($hg_why) did not stay running on the new build (verdict '$hg_verdict'); rolled_back=$hg_rolled${hg_restored:+ ($hg_restored)}, canary=${hg_canary_state:-not-recovered}, other agents untouched"
+  fi
 
   # DIVE-1095: refresh the materialized shared team-bot listener. It lives at
   # /opt/5dive/team-bot-listener.ts and is (re)written ONLY by `team-bot shared`,
@@ -668,12 +1112,23 @@ cmd_self_update() {
   # contradiction reaches someone reading the log.
   (( ${#parked[@]} )) && prose+=", ${#parked[@]} left parked (desiredState=stopped but running — restart held, reconcile)"
   (( ${#failed[@]} )) && prose+=", ${#failed[@]} failed to restart"
+  # DIVE-4068: say which of the three the gate did. "not-probed" is a real
+  # answer and must not read as a pass — it means this pass bounced nobody and
+  # the launcher had not moved, so the new startup path is untested on this box
+  # by construction, not by measurement.
+  case "$hg_verdict" in
+    healthy)          prose+=", health gate passed on '$hg_canary'" ;;
+    gate-unavailable) prose+=", health gate COULD NOT RUN (systemd answered nothing about '$hg_canary')" ;;
+    not-probed) prose+=", health gate not probed (no agent restarted and the launcher did not change)" ;;
+    *)          prose+=", health gate: $hg_verdict" ;;
+  esac
   [[ "$listener_refreshed" == "true" ]] && prose+=", team-bot listener refreshed"
   # `skipped` and `deferred` are ADDITIVE — `restarted`/`failed` keep their exact
   # prior meaning, so every existing consumer reads the field it always did.
   ok "$prose" \
-     '{restarted:$r, restarted_count:($r|length), skipped:$s, skipped_count:($s|length), deferred:$d, deferred_count:($d|length), parked:$pk, parked_count:($pk|length), failed:$f, listener_refreshed:$lr}' \
-     --argjson r "$r" --argjson f "$f" --argjson s "$s" --argjson d "$d" --argjson pk "$pk" --argjson lr "$listener_refreshed"
+     '{restarted:$r, restarted_count:($r|length), skipped:$s, skipped_count:($s|length), deferred:$d, deferred_count:($d|length), parked:$pk, parked_count:($pk|length), failed:$f, listener_refreshed:$lr, health_gate:{verdict:$hgv, agent:(if $hgc == "" then null else $hgc end), reason:(if $hgw == "" then null else $hgw end), rollback_point:$hgcap}}' \
+     --argjson r "$r" --argjson f "$f" --argjson s "$s" --argjson d "$d" --argjson pk "$pk" --argjson lr "$listener_refreshed" \
+     --arg hgv "$hg_verdict" --arg hgc "$hg_canary" --arg hgw "$hg_why" --arg hgcap "$hg_capture"
 }
 
 # version_lt A B — true when semver A is strictly older than B (sort -V).
