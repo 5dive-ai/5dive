@@ -38,14 +38,14 @@ jobs:
           # other in the same commit: a type the lint admits and the cut rejects reds
           # every later cut, and the reverse ships a feature as a patch — which is the
           # whole defect (DIVE-4086).
-          if [[ "$PR_TITLE" =~ ^(feat|fix|test|chore|docs|refactor|ci|perf|revert)(\([^\)]*\))?!?:\  ]]; then
+          if [[ "$PR_TITLE" =~ ^(feat|fix|test|chore|docs|refactor|ci|perf)(\([^\)]*\))?!?:\  ]]; then
             printf 'ok — "%s"\n' "$PR_TITLE"
             exit 0
           fi
           {
             echo "::error::the PR title must start with a conventional type, because the squash merge makes it the commit subject and release-cut reads that subject to decide whether this cut is a feature release (DIVE-4086)."
             echo "::error::  got:  ${PR_TITLE}"
-            echo "::error::  want: feat|fix|test|chore|docs|refactor|ci|perf|revert, an optional (scope), an optional ! for breaking, then a colon and a space"
+            echo "::error::  want: feat|fix|test|chore|docs|refactor|ci|perf, an optional (scope), an optional ! for breaking, then a colon and a space"
             echo "::error::  e.g.  feat(plugin): a declared plugin verb is now dispatched (DIVE-4035)"
             echo "::error::A 'feat' title cuts the next release as a minor. Everything else cuts a patch."
           } >&2

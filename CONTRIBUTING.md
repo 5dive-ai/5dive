@@ -143,7 +143,7 @@ caught.
   | --- | --- |
   | `feat:` / `feat(scope):` | a **minor** (`0.x`) |
   | any type with `!:`, or a `BREAKING CHANGE` trailer | a **major** |
-  | `fix` `test` `chore` `docs` `refactor` `ci` `perf` `revert` | a **patch** (`0.x.x`) |
+  | `fix` `test` `chore` `docs` `refactor` `ci` `perf` | a **patch** (`0.x.x`) |
 
   So `feat` is a release decision rather than a label — nobody passes a version
   level by hand any more (DIVE-4086). Do NOT copy the older prefixes still

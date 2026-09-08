@@ -318,8 +318,8 @@ grep -q '^DERIVED=v0\.28\.0$' <<<"$out" \
 
 echo "-- and the level the cut REPORTS names what forced it (acceptance c)"
 out=$(run_derive '0.17.8' v0.27.1 nolint 'feat(plugin): a declared plugin verb is now dispatched'); rc=$?
-grep -q "level: minor (derived minor from v0.27.1..HEAD — forced by .*feat(plugin)" <<<"$out" \
-  && ok_t 'the log line names the commit that forced the level, so a reader of the run can see WHY' \
+grep -q "Release level: minor (derived minor from v0.27.1..HEAD — forced by .*feat(plugin)" <<<"$out" \
+  && ok_t 'the provenance line names the commit that forced the level, so the log and release notes can say WHY' \
   || bad_t 'the cut does not say which commit forced the level' "rc=$rc out=$out"
 
 echo "-- DIVE-4086: an untyped subject REFUSES, but only after the lint landed"
@@ -385,7 +385,7 @@ LINT_COND=$(grep -E '^ *if \[\[ "\$PR_TITLE" =~ ' "$LINT" | head -1 | sed 's/^ *
 # of the pattern would never have shown me.
 title_ok(){ ( PR_TITLE="$1"; eval "${LINT_COND} then :; else false; fi" ) >/dev/null 2>&1; }
 
-for _t in 'feat: a thing' 'fix(cli): a thing' 'feat(plugin)!: breaking' 'chore: tidy' 'revert: undo it'; do
+for _t in 'feat: a thing' 'fix(cli): a thing' 'feat(plugin)!: breaking' 'chore: tidy'; do
   title_ok "$_t" && ok_t "the lint ACCEPTS '$_t'" \
     || bad_t "the lint rejects a conventional title, so every PR of this shape is blocked" "title=$_t cond=$LINT_COND"
 done

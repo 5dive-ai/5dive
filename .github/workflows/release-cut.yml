@@ -231,7 +231,7 @@ jobs:
             git merge-base --is-ancestor "$_lint_epoch" "${incumbent:-HEAD}" 2>/dev/null \
               || _enforce="${_lint_epoch}..HEAD"
             _untyped=$(git log --no-merges --format='%h %s' "$_enforce" 2>/dev/null \
-              | grep -vE '^[0-9a-f]+ (feat|fix|test|chore|docs|refactor|ci|perf|revert)(\([^)]*\))?!?: ' | head -5)
+              | grep -vE '^[0-9a-f]+ (feat|fix|test|chore|docs|refactor|ci|perf)(\([^)]*\))?!?: ' | head -5)
           fi
           if [[ -n "$_untyped" ]]; then
             echo "::error::commits since ${incumbent:-<root>} carry no conventional type, so this cut cannot tell whether it contains a feature (DIVE-4086). The PR-title lint should have made this unreachable; fix the subject, or cut by hand and say why:"
@@ -258,7 +258,8 @@ jobs:
             fi
             _level="$RELEASE_LEVEL"
           fi
-          echo "level: ${_level} (derived ${_derived} from ${_range}${_forced_by:+ — forced by ${_forced_by//$'\n'/; }})"
+          _release_level_provenance="Release level: ${_level} (derived ${_derived} from ${_range}${_forced_by:+ — forced by ${_forced_by//$'\n'/; }})."
+          echo "$_release_level_provenance"
           case "$_level" in
             patch) version="${_maj}.${_min}.$(( _pat + 1 ))" ;;
             minor) version="${_maj}.$(( _min + 1 )).0" ;;
@@ -1134,6 +1135,7 @@ jobs:
           fi
           {
             printf '\n---\n\n'
+            printf '%s\n\n' "$_release_level_provenance"
             printf '%s\n\n' "$note"
             printf "Installed by every box via install.sh's tag resolver (DIVE-2144). Previous published tag: %s.\n" "${incumbent:-none}"
           } >> "$_notes_file"
