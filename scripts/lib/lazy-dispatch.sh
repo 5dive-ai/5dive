@@ -60,7 +60,7 @@
 # instead of trusting the offsets. Fast path when the file is pristine, correct
 # path when it is not.
 #
-# See community/wiki/bash-does-not-parse-past-exit.md.
+# See community/wiki/bash-does-not-parse-past-exit-and-what-that-buys-a-94k-line-cli.md.
 # -----------------------------------------------------------------------------
 
 # src/task/need.sh -> task__need ; src/cmd_auth.sh -> cmd_auth

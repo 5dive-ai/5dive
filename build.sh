@@ -186,6 +186,17 @@ for _f in "${CORE_FILES[@]}" "$CORE_TAIL" "${LAZY_FILES[@]}"; do
   fi
 done
 
+# The build recipe is TWO files now. Say so by name, because the bare
+# "No such file or directory" this replaces is what a harness that copies
+# src/ + build.sh into a temp tree sees, and it reads as a broken build rather
+# than a missing input (it cost two red harnesses on DIVE-4087: see
+# tests/install_monotonicity_unit.sh and tests/selfcheck_mutation_e2e.sh).
+if [[ ! -r scripts/lib/lazy-dispatch.sh ]]; then
+  echo "build.sh: scripts/lib/lazy-dispatch.sh is missing — it generates the lazy" >&2
+  echo "  dispatch index (DIVE-4087) and the build recipe is BOTH files. If you are" >&2
+  echo "  assembling a tree to build in, copy scripts/ alongside src/ and build.sh." >&2
+  exit 1
+fi
 # shellcheck source=scripts/lib/lazy-dispatch.sh
 . scripts/lib/lazy-dispatch.sh
 
