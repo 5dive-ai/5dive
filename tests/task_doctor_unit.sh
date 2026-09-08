@@ -14,10 +14,12 @@
 #   T3  wake-passed  parked, wake_at in the past                     -> found
 #   T4  park-no-wake parked, wake_at NULL                            -> found
 #   T5  dead-lane    assignee registered, heartbeat absent               -> found
-#   T5b dead-lane    assignee registered + heartbeat ON but desiredState=stopped -> found
-#                    (the OTHER half: the wake loop DOES iterate it and the wake
-#                     then fails every tick, forever — same outcome for the row)
-#   T6  NEGATIVES    a live gate, a live edge, a future park, a todo -> NOT found
+#   T5b NOT a finding assignee heartbeat ON but desiredState=stopped     -> NOT found
+#                    (DIVE-4071: the wake loop DOES iterate it and STARTS the down
+#                     unit — it is wakeable, so reporting dead-lane was a false
+#                     positive whose `task assign` remedy re-points a live row)
+#   T6  NEGATIVES    a live gate, a live edge, a future park, a todo,
+#                    an operator-stopped-but-enabled seat            -> NOT found
 #   T7  the remedy SLOT for a park holds `unpark` and NOT `unblock` (the filed
 #       symptom: `unblock` on a parked row reports success and changes nothing)
 #   T7c the census prints on the FINDINGS path, not only on a clean board
@@ -65,12 +67,18 @@ tasks_db_init
 
 # The registry fixture. `live` is wakeable; `zombie` is registered and will never
 # be woken (no heartbeat key at all — the measured shape: 4 of 17 agents on the
-# host carry none). Names are fixtures, not real seats.
+# host carry none). `offhb` is registered with heartbeat.enabled=false — the OTHER
+# unwakeable shape, and the only two: the tick's population is `heartbeat.enabled
+# == true` alone. `stopped` is heartbeat-ON but operator-stopped (desiredState=
+# stopped); it IS wakeable, because `_hb_wake` never reads desiredState — it
+# iterates every enabled seat and STARTS the down unit (DIVE-4071). Names are
+# fixtures, not real seats.
 mk_registry() {
   cat > "$TMP/agents.json" <<'JSON'
 {"agents":{
   "live":  {"type":"claude","heartbeat":{"enabled":true}},
   "zombie":{"type":"claude"},
+  "offhb": {"type":"claude","heartbeat":{"enabled":false}},
   "stopped":{"type":"claude","heartbeat":{"enabled":true},"desiredState":"stopped"}
 }}
 JSON
@@ -143,7 +151,7 @@ out=$(doctor)
 
 # ---- T1..T5: each class is found, with its OWN label -------------------------
 for pair in "$t_noanchor:no-anchor" "$t_stale:stale-edge" "$t_wakepast:wake-passed" \
-            "$t_nowake:park-no-wake" "$t_dead:dead-lane" "$t_stopped:dead-lane"; do
+            "$t_nowake:park-no-wake" "$t_dead:dead-lane"; do
   id="${pair%%:*}"; want="${pair##*:}"; i=$(ident "$id"); got=$(reason_of "$out" "$i")
   [[ "$got" == "$want" ]] \
     && ok_t "${want}: ${i} classified ${want}" \
@@ -155,18 +163,19 @@ neg_bad=""
 for pair in "$t_gate:live human gate" "$t_gatedone:an ANSWERED gate" \
             "$t_livedep:live blocker edge" \
             "$t_futurepark:park with a future wake" "$t_todo:plain todo" \
+            "$t_stopped:an operator-stopped-but-enabled seat" \
             "$t_openblocker:the open blocker itself"; do
   id="${pair%%:*}"; what="${pair##*:}"; i=$(ident "$id"); got=$(reason_of "$out" "$i")
   [[ -z "$got" ]] || neg_bad+="${i} (${what}) -> ${got}; "
 done
 [[ -z "$neg_bad" ]] \
-  && ok_t "a live gate / an answered gate / live edge / future park / plain todo are NOT reported undispatchable" \
+  && ok_t "a live gate / an answered gate / live edge / future park / plain todo / an operator-stopped-but-enabled seat are NOT reported undispatchable" \
   || bad_t "false positives" "$neg_bad"
 
 # ---- count is exactly the five --------------------------------------------
 nf=$(printf '%s' "$out" | jq -r '.data.findings')
-[[ "$nf" == "6" ]] && ok_t "findings count is exactly the 6 planted rows" \
-                   || bad_t "findings count" "wanted 6, got '${nf}' (rows: $(printf '%s' "$out" | jq -rc '[.data.rows[]?|{ident,reason}]'))"
+[[ "$nf" == "5" ]] && ok_t "findings count is exactly the 5 planted rows" \
+                   || bad_t "findings count" "wanted 5, got '${nf}' (rows: $(printf '%s' "$out" | jq -rc '[.data.rows[]?|{ident,reason}]'))"
 
 # ---- census counts the rest, and names what clears them ---------------------
 disp=$(printf '%s' "$out" | jq -r '.data.census.dispatchable')
@@ -317,19 +326,23 @@ fix "$i_dl" >/dev/null 2>"$TMP/fix.err"; rc13=$?
   || bad_t "dead-lane without --to" "rc=$rc13 assignee=$(asgof "$t_dead") :: $(cat "$TMP/fix.err")"
 
 # ---- T14: --to a lane that is ALSO dead is refused --------------------------
-# The verb that reports dead lanes must not be the fastest way to make one. Both
-# halves of the wakeability test are exercised: 'zombie' (no heartbeat key) was
-# the finding, 'stopped' (heartbeat on, operator-stopped) is the destination.
-fix "$i_dl" --to=stopped >/dev/null 2>"$TMP/fix.err"; rc14=$?
+# The verb that reports dead lanes must not be the fastest way to make one. The
+# genuinely unwakeable destination is 'offhb' (heartbeat.enabled=false — the tick
+# never iterates it), not an operator-stopped seat: DIVE-4071 established that an
+# operator-stopped-but-enabled seat IS wakeable, exercised as the ACCEPT arm below.
+fix "$i_dl" --to=offhb >/dev/null 2>"$TMP/fix.err"; rc14=$?
 { [[ $rc14 -ne 0 ]] && [[ "$(asgof "$t_dead")" == "zombie" ]]; } \
-  && ok_t "--fix --to=<an operator-stopped seat> is refused; the row stays where it was" \
+  && ok_t "--fix --to=<a seat whose heartbeat is disabled> is refused; the row stays where it was" \
   || bad_t "--to a dead lane accepted" "rc=$rc14 assignee=$(asgof "$t_dead") :: $(cat "$TMP/fix.err")"
 
-# ...and a WAKEABLE destination is accepted and the row actually moves.
-fix "$i_dl" --to=live >/dev/null 2>"$TMP/fix.err"; rc14b=$?
-{ [[ $rc14b -eq 0 ]] && [[ "$(asgof "$t_dead")" == "live" ]]; } \
-  && ok_t "--fix dead-lane --to=<a wakeable seat>: the row is re-assigned" \
-  || bad_t "--fix dead-lane --to=live" "rc=$rc14b assignee=$(asgof "$t_dead") :: $(cat "$TMP/fix.err")"
+# ...and a WAKEABLE destination is accepted and the row actually moves. 'stopped'
+# is operator-stopped but heartbeat-ON: DIVE-4071 says the tick wakes it (it STARTS
+# the down unit), so it is a VALID re-point target — the behaviour change this row
+# lands. Assigning a live row TO an operator-stopped seat is now accepted by design.
+fix "$i_dl" --to=stopped >/dev/null 2>"$TMP/fix.err"; rc14b=$?
+{ [[ $rc14b -eq 0 ]] && [[ "$(asgof "$t_dead")" == "stopped" ]]; } \
+  && ok_t "--fix dead-lane --to=<an operator-stopped-but-enabled seat>: accepted, the row is re-assigned (the wake loop will start it)" \
+  || bad_t "--fix dead-lane --to=stopped" "rc=$rc14b assignee=$(asgof "$t_dead") :: $(cat "$TMP/fix.err")"
 
 # ---- T15: a row that is NOT a current finding is refused ---------------------
 # This is the whole reason --fix re-derives instead of reading the report: the
