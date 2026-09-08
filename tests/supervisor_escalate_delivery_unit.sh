@@ -246,7 +246,7 @@ tick_arm() {  # <snapshot-json> [armed] [seed-sql] [registry-json] [rotated|no-t
       cmd_supervisor_tick >/dev/null 2>&1 || { printf "TICK-RC=%s|" "$?"; }
       tick_n=$((tick_n + 1))
     done
-    printf "ESC=%s|SENT=%s|ACT=%s|RESTARTED=%s|ROTATED=%s|ALERTS=%s|ALERT_ROWS=%s|NUDGE_ROWS=%s|HUMAN=%s|MACHINE=%s|EXCERPT=%s" \
+    printf "ESC=%s|SENT=%s|ACT=%s|RESTARTED=%s|ROTATED=%s|ALERTS=%s|ALERT_ROWS=%s|NUDGE_ROWS=%s|HUMAN=%s|MACHINE=%s|EXCERPT=%s|TASK_STATUS=%s|TASK_STARTED=%s|TASK_BODY=%s" \
       "$(db "SELECT COALESCE(GROUP_CONCAT(signals), \"\") FROM supervisor_events WHERE event=$(sqlq escalate);")" \
       "$(paste -sd, <"$TMP/sent")" \
       "$(db "SELECT COALESCE(GROUP_CONCAT(signals), \"\") FROM supervisor_events WHERE event=$(sqlq action);")" \
@@ -257,7 +257,10 @@ tick_arm() {  # <snapshot-json> [armed] [seed-sql] [registry-json] [rotated|no-t
       "$(db "SELECT COUNT(*) FROM supervisor_events WHERE event=$(sqlq action) AND signals LIKE $(sqlq %\\\"rung\\\":\\\"nudge\\\"%);")" \
       "$(paste -sd, <"$TMP/capacity-human")" \
       "$(paste -sd, <"$TMP/capacity-machine")" \
-      "$(paste -sd, <"$TMP/capacity-excerpt" | tr "|" "/")"
+      "$(paste -sd, <"$TMP/capacity-excerpt" | tr "|" "/")" \
+      "$(db "SELECT COALESCE(GROUP_CONCAT(status), \"\") FROM tasks WHERE title=$(sqlq quota-boundary-fixture);")" \
+      "$(db "SELECT COALESCE(GROUP_CONCAT(started_at), \"\") FROM tasks WHERE title=$(sqlq quota-boundary-fixture);")" \
+      "$(db "SELECT COALESCE(GROUP_CONCAT(body), \"\") FROM tasks WHERE title=$(sqlq quota-boundary-fixture);" | tr "|" "/")"
   '   # stderr deliberately NOT swallowed: the arm already fails closed (an abort
       # yields an empty receipt, which reds), but a red with no reason costs the
       # next reader a repro. The tick's own warns are silenced at its call above.
@@ -403,13 +406,33 @@ _QUOTA_SNAP='[{"name":"ops","type":"claude","classification":"quota-exhausted","
 _QUOTA_REG='{"agents":{"ops":{"rotation":{"enabled":true}}}}'
 
 quota_rotated_out=$(tick_arm "$_QUOTA_SNAP" armed "" "$_QUOTA_REG" rotated)
-t "quota tick: invokes rotation through the measured-headroom fence" \
+t "quota tick positive control: NO live row invokes rotation through the measured-headroom fence" \
   "ops --require-live-headroom" "$(fld "$quota_rotated_out" ROTATED)"
 t "quota tick: an eligible target records the rotate action" "rotate" \
   "$(jq -r '.rung // "NO-RUNG"' <<<"$(fld "$quota_rotated_out" ACT)" 2>/dev/null || echo NO-ACTION-ROW)"
 t "quota tick: successful rotation is quiet" "" "$(fld "$quota_rotated_out" ALERTS)"
 t "quota tick: successful rotation never reaches the nudge ladder" "0" \
   "$(fld "$quota_rotated_out" NUDGE_ROWS)"
+
+# DIVE-4055 grading mutant: the identical wall and eligible destination, with
+# only one added in_progress row.  Any implementation that leaves the old
+# `_sup_quota_rotate` call reachable goes red on ROTATED; simply disabling
+# rotation goes red on the positive control immediately above.
+_QUOTA_LIVE_SEED="INSERT INTO tasks (title,body,status,assignee,created_by,kind,started_at)
+  VALUES ('quota-boundary-fixture','filer context','in_progress','ops','main','standard',datetime('now'));"
+quota_live_out=$(tick_arm "$_QUOTA_SNAP" armed "$_QUOTA_LIVE_SEED" "$_QUOTA_REG" rotated)
+t "4055 live-task mutant: a wall while in_progress never flips the account" \
+  "" "$(fld "$quota_live_out" ROTATED)"
+t "4055 live-task wall records checkpoint instead of rotate" "checkpoint" \
+  "$(jq -r '.rung // "NO-RUNG"' <<<"$(fld "$quota_live_out" ACT)" 2>/dev/null || echo NO-ACTION-ROW)"
+t "4055 checkpoint requeues the row for a fresh dispatch boundary" "todo" \
+  "$(fld "$quota_live_out" TASK_STATUS)"
+t "4055 checkpoint clears the per-attempt start clock" "" \
+  "$(fld "$quota_live_out" TASK_STARTED)"
+t "4055 checkpoint preserves the filer body and records done+next" "yes" \
+  "$([[ "$(fld "$quota_live_out" TASK_BODY)" == filer\ context*done:*next:* ]] && printf yes || printf no)"
+t "4055 successful checkpoint is quiet; boundary selection owns recovery" "" \
+  "$(fld "$quota_live_out" ALERTS)"
 
 quota_no_target_out=$(tick_arm "$_QUOTA_SNAP" armed "" "$_QUOTA_REG" no-target 2)
 t "quota tick: no measured target still uses the headroom-fenced selector" \
