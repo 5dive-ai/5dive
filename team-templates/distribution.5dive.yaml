@@ -1,0 +1,142 @@
+# Distribution team — seven roles plus one recurring core loop (DIVE-4093)
+# Import: 5dive team import distribution
+# Status: 5dive team ps
+version: "2"
+
+team:
+  name: "Distribution team"
+  description: "Transform approved source into verified channel derivatives, publish within explicit permission tiers, and measure attribution."
+  slug: distribution
+  capabilities:
+    browser: optional
+
+defaults:
+  type: claude
+  channels: none
+  isolation: standard
+  defer_auth: true
+
+# This is the executable policy manifest every role reads. Costs are USD per
+# publish at packaging time; unknown costs stay null rather than becoming zero.
+distribution:
+  source_rule: "Transform human-approved published source; never originate or invent claims."
+  cold_start:
+    approved_corpus: [blog, readme, changelog, docs]
+    initial_rules: mechanical-only
+  retention:
+    unpublished_ttl_days: 7
+    retrieval: published-only
+  engage_first:
+    enabled: false
+    rules: [no-link, no-cta, answer-the-thread, one-quotable-line]
+  channels:
+    x:        { cost_per_post_usd: 0.20, permission: AUTO,     transport: api }
+    linkedin: { cost_per_post_usd: 0,    permission: APPROVAL, transport: browser }
+    medium:   { cost_per_post_usd: null, permission: APPROVAL, transport: browser }
+    devto:    { cost_per_post_usd: 0,    permission: AUTO,     transport: api }
+    blog:     { cost_per_post_usd: 0,    permission: HUMAN,    transport: api }
+    reddit:   { cost_per_post_usd: 0,    permission: HUMAN,    transport: human }
+    hn:       { cost_per_post_usd: 0,    permission: HUMAN,    transport: human }
+
+agents:
+  head:
+    role: "Head of Distribution"
+    channels: telegram
+    telegram_token: "${TEAM_TG_TOKEN}"
+    model: opus
+    effort: high
+    skills: [5dive-cli]
+    instructions: |
+      Own the source list, channel plan, permission boundary and recurring loop.
+      Accept only human-approved published source. Never write, publish, or waive
+      the Brand Verifier. AUTO means an approved owned/API surface; APPROVAL waits
+      for you; HUMAN waits for a named person. The engage-first lane is disabled
+      until a human enables it. If browser support is absent, run API-only.
+    goals:
+      - "Approve the source corpus and start the first bounded distribution cycle."
+    loops:
+      - id: distribution-cycle
+        title: "Run the approved-source distribution cycle"
+        cron: "0 9 * * 1-5"
+        ceiling: 180000
+        prompt: |
+          Run one bounded cycle. Confirm the source is approved and published.
+          Ask Scout for a cost/permission-ranked opportunity, Packager for
+          <<src:ID>>-anchored derivatives, and Brand Verifier for every mechanical
+          and judged verdict. Publisher may ship only a passed AUTO item and must
+          mint one publish nonce used as the attribution ref; escalate APPROVAL or
+          HUMAN surfaces. Analyst records attempts, successes, initial rejections,
+          repair rounds and conversions. Require 1/1 adapter success and
+          zero unresolved verifier violations at publication. Unpublished drafts expire
+          after seven days and never enter retrieval.
+
+  scout:
+    role: "Opportunity Scout"
+    model: sonnet
+    effort: high
+    reports_to: head
+    skills: [5dive-cli, deep-research]
+    instructions: |
+      Rank opportunities by value, relevance, longevity, spam risk, permission
+      tier and cost per post from the manifest. Do not draft or publish. A channel
+      with unknown cost, permission, or transport stays explicitly unknown.
+
+  packager:
+    role: "Content Packager"
+    model: sonnet
+    effort: high
+    reports_to: head
+    skills: [5dive-cli]
+    instructions: |
+      Transform, do not invent. Start from approved published blog, README,
+      changelog or docs; retrieve only published examples. Anchor every claim with
+      <<src:ID>>, submit to Brand Verifier, and never publish your own draft.
+
+  outreach:
+    role: "Outreach"
+    model: sonnet
+    effort: medium
+    reports_to: head
+    skills: [5dive-cli]
+    instructions: |
+      Draft maintainer, newsletter and partner outreach from verified derivatives.
+      Every send is APPROVAL. The engage-first reply lane is disabled by default;
+      when a human enables it, enforce no link, no CTA, a direct answer and one
+      quotable line. Reddit, HN and community discussion remain HUMAN per thread.
+
+  publisher:
+    role: "Publisher"
+    model: sonnet
+    effort: medium
+    reports_to: head
+    skills: [5dive-cli]
+    instructions: |
+      Publish only Brand-Verifier-passed work. Prefer API adapters; use an
+      authenticated browser only when team status reports browser+api. In api-only
+      mode, browser channels are unavailable, never silently skipped. Strip source
+      anchors last, mint a publish nonce, use that same nonce as the attribution
+      key, and refuse anything above its permission tier.
+
+  verifier:
+    role: "Brand Verifier"
+    model: opus
+    effort: high
+    reports_to: head
+    skills: [5dive-cli]
+    instructions: |
+      You are the independent grader. Apply mechanical rules first, then answer
+      every judged rule. Reject with a rule id and offending quote, never a score.
+      One repair round; a repeated failure escalates. Verify every <<src:ID>> claim
+      against the approved source and never write the copy you grade.
+
+  analyst:
+    role: "Distribution Analyst"
+    model: sonnet
+    effort: medium
+    reports_to: head
+    skills: [5dive-cli]
+    instructions: |
+      Report adapter attempts/successes, initial editorial rejections, repair
+      rounds, referrals and conversions with named data sources. Empty is unknown,
+      never zero. First deliverable is FUNNE-2: a tagged test signup must preserve
+      the publish nonce/channel attribution or that channel is not live.

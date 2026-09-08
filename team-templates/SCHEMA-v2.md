@@ -24,6 +24,10 @@ defaults:                  # NEW — merged into every agent (agent-level keys w
   isolation: standard
   auth_profile: "${TEAM_AUTH_PROFILE}"   # one account for the whole org by default
 
+team:
+  capabilities:
+    browser: optional      # fixed CLI probe; absent support reports api-only
+
 agents:
   <name>: { ... }          # name = system id (a-z0-9-), used by `5dive agent send`
 ```
@@ -68,6 +72,10 @@ agents:
   whole roster, and is validated against the box's known harnesses before anything is
   provisioned. Claude-only `model`/`effort` pins are dropped (and reported) when the target
   harness is not claude.
+- `5dive team ps [<slug|path>]` — status for a bundled team, including each role's
+  recurring loop schedules and any declared browser capability mode. The browser
+  probe is fixed by the CLI (`5dive browser --help`); templates cannot supply commands.
+  With no slug it finds complete installed rosters, so it is the import receipt.
 - `5dive export [-o team.yaml]` — NEW. Dump the live fleet (from the registry + each
   agent's config/instructions/reports) back to a v2 spec, so a running org can be saved,
   versioned, and forked into a template. Closes the "exportable" round-trip.
