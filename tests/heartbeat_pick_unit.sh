@@ -142,5 +142,13 @@ got=$(_hb_pick_task dev)
 [[ -z "$got" ]] && ok_t "open human gate: gated-only queue yields no pick" \
                 || bad_t "gated-only queue must be empty" "got $got, gated=$G"
 
+# Answering the gate makes the same todo actionable again. This pins the
+# need_answered_at half of the predicate: checking need_type alone would keep
+# every previously-gated row suppressed forever.
+db "UPDATE tasks SET need_answered_at=datetime('now') WHERE id=${G};"
+got=$(_hb_pick_task dev)
+[[ "$got" == "$G" ]] && ok_t "answered human gate: todo becomes selectable again ($G)" \
+                      || bad_t "answered gate must restore selection" "got $got, answered=$G"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
