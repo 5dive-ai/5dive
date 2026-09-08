@@ -180,3 +180,85 @@ jobs:
             echo "ERROR: installed 5dive reports '$actual', expected version '$expected'"
             exit 1
           fi
+      # DIVE-4091: nothing in CI ever STARTED an agent. v0.26.1 emptied every box
+      # on 2026-09-07 because `5dive-agent-start` died at line 1687 under
+      # `set -euo pipefail`, and the whole ~1700-line startup path above
+      # `tmux new-session` was executed by no check: the unit corpus sources
+      # functions without running the launcher, and the steps above install the
+      # bundle and ask it for a version string. DIVE-4067 wired
+      # `shellcheck --include=SC2318`, which catches that bug's SYNTACTIC shape
+      # and nothing else. This arm runs the launcher and asserts it reaches the
+      # session it exists to create — the whole class, not one shellcheck code.
+      #
+      # Deterministic by construction: no network, no credential, no sleep the
+      # arm does not bound, and a hard `timeout` so a launcher that hangs turns
+      # this REQUIRED context red in 2 minutes instead of parking the job.
+      - name: Launcher survives its own startup (behavioural, DIVE-4091)
+        run: |
+          cat > /tmp/launcher-arm.sh <<'ARM'
+          #!/bin/bash
+          set -euo pipefail
+          NAME=smoketest
+          CALLS=/tmp/tmux.calls
+
+          # The launcher hard-codes /usr/bin/tmux, so shim THAT path — putting a
+          # stub earlier on PATH would never be consulted.
+          # has-session MUST exit non-zero: the launcher's final statement is
+          #   while /usr/bin/tmux has-session -t "$SESSION"; do sleep 5; done
+          # (it blocks so systemd keeps the unit active), and a stub that exits 0
+          # there would hang this job until the workflow timeout.
+          cat > /usr/bin/tmux <<'STUB'
+          #!/bin/sh
+          printf '%s\n' "$*" >> /tmp/tmux.calls
+          case "$1" in has-session) exit 1 ;; *) exit 0 ;; esac
+          STUB
+          chmod +x /usr/bin/tmux
+
+          # install.sh does not lay down the agent binary, and the launcher
+          # refuses at `[[ -x "$BIN" ]] || exit 3` before it reaches anything
+          # interesting. It only needs to be executable — it is exec'd INSIDE the
+          # tmux session, which is stubbed, so nothing here runs an agent.
+          install -d -m 755 /home/claude/.local/bin /home/claude/projects
+          printf '#!/bin/sh\nexit 0\n' > /home/claude/.local/bin/claude
+          chmod +x /home/claude/.local/bin/claude
+
+          install -d -m 2750 /var/lib/5dive/agents.d
+          printf 'AGENT_TYPE=claude\nAGENT_CHANNELS=none\nAGENT_WORKDIR=/home/claude/projects\n' \
+            > /var/lib/5dive/agents.d/${NAME}.env
+
+          # No credential is seeded, so the launcher takes its degraded-start
+          # branch — the same one a freshly provisioned box takes before its
+          # creds land. CLAUDE_AUTH_WAIT_SECS bounds that wait (default 45s).
+          rc=0
+          CLAUDE_AUTH_WAIT_SECS=1 timeout 120 /usr/local/bin/5dive-agent-start "$NAME" || rc=$?
+
+          echo "--- tmux calls recorded ---"
+          cat "$CALLS" 2>/dev/null || echo "(none)"
+          echo "---------------------------"
+
+          if [ "$rc" -eq 124 ]; then
+            echo "FAIL: 5dive-agent-start did not return within 120s — it hangs during startup" >&2
+            exit 1
+          fi
+          if [ "$rc" -ne 0 ]; then
+            echo "FAIL: 5dive-agent-start exited $rc — the launcher dies during its own startup." >&2
+            echo "      Every managed box runs this file on every agent restart; the nightly" >&2
+            echo "      restarts every agent, so shipping this empties the fleet unattended." >&2
+            exit 1
+          fi
+          # Exit 0 is NOT the assertion. A launcher that returned early because a
+          # precondition was unmet would satisfy an exit-code-only arm forever —
+          # the same green-from-a-filter shape that caused the incident. Assert the
+          # session was actually LAUNCHED. `new-session`, not merely "the stub was
+          # touched": `tmux kill-session` runs ~500 lines earlier and would satisfy
+          # any weaker check while the startup path still died.
+          if ! grep -q '^new-session ' "$CALLS"; then
+            echo "FAIL: launcher exited 0 without ever calling 'tmux new-session' —" >&2
+            echo "      it returned before launching the session it exists to launch." >&2
+            exit 1
+          fi
+          echo "OK: launcher ran its full startup path and launched the session"
+          ARM
+          chmod +x /tmp/launcher-arm.sh
+          docker run --rm -v /tmp/launcher-arm.sh:/arm.sh:ro \
+            --entrypoint /bin/bash 5dive-smoke /arm.sh
