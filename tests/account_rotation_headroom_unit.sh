@@ -49,6 +49,21 @@ RATELIMIT_FIXTURE=$(jq -cn --argjson now "$NOW" \
   '{asOf:$now,fiveHourPct:null,sevenDayPct:28}')
 t "missing 5h fails closed for destination measurement" "1" "$(rc_of account_has_live_headroom unmeasured)"
 
+# DIVE-4055: source and destination are different predicates.  A stale/missing
+# source is not a measured wall, and either fresh window at the threshold is.
+RATELIMIT_FIXTURE=$(jq -cn --argjson now "$NOW" \
+  '{asOf:$now,fiveHourPct:90,sevenDayPct:34}')
+t "fresh 5h at threshold is near the wall" "near" "$(account_near_wall_state full-5h)"
+RATELIMIT_FIXTURE=$(jq -cn --argjson now "$NOW" \
+  '{asOf:$now,fiveHourPct:12,sevenDayPct:90}')
+t "fresh weekly window at threshold is near the wall" "near" "$(account_near_wall_state full-week)"
+RATELIMIT_FIXTURE=$(jq -cn --argjson now "$NOW" \
+  '{asOf:$now,fiveHourPct:89,sevenDayPct:89}')
+t "fresh windows below threshold are clear" "clear" "$(account_near_wall_state clear)"
+RATELIMIT_FIXTURE=$(jq -cn --argjson old "$((NOW - HEADROOM_FRESH_SECS - 1))" \
+  '{asOf:$old,fiveHourPct:100,sevenDayPct:100}')
+t "a stale full-looking source is unmeasured, not near" "unmeasured" "$(account_near_wall_state stale)"
+
 account_has_live_headroom() { [[ "$1" == "roomy" || "$1" == "also-roomy" ]]; }
 t "candidate filter keeps only measured profiles, in preference order" \
   '["roomy","also-roomy"]' \
@@ -80,10 +95,28 @@ rot_fixture() { # $1 = channels string, or "" for a seat with no channels key
 
 rot_json() { REG_FIXTURE="$(rot_fixture "$1")"; JSON_MODE=1 cmd_agent_rotation_rotate seat; }
 rot_prose() { REG_FIXTURE="$(rot_fixture "$1")"; JSON_MODE=0 cmd_agent_rotation_rotate seat; }
-
 # jq -e on the VALUE, not a grep of the rendered text: `false` and `null` are
 # distinct JSON values here and the whole point of the field is which one it is.
 jqv() { jq -r "$2" <<<"$1"; }
+
+# The dispatch-boundary flag must prove the CURRENT account is near its wall
+# before the existing destination fence is allowed to change anything.
+account_near_wall_state() { printf '%s' "${SOURCE_STATE:-unmeasured}"; }
+account_has_live_headroom() { [[ "$1" == "roomy" ]]; }
+rot_boundary() {
+  REG_FIXTURE="$(rot_fixture '')"
+  JSON_MODE=1 cmd_agent_rotation_rotate seat --if-current-near-wall --require-live-headroom
+}
+SOURCE_STATE=near
+BOUNDARY_NEAR="$(rot_boundary)"
+t "4055 boundary: measured-near current account rotates" "true" "$(jqv "$BOUNDARY_NEAR" '.data.rotated')"
+t "4055 boundary: measured-near current lands on measured-headroom target" "roomy" "$(jqv "$BOUNDARY_NEAR" '.data.to')"
+SOURCE_STATE=clear
+BOUNDARY_CLEAR="$(rot_boundary)"
+t "4055 boundary: a clear current account does not rotate" "false" "$(jqv "$BOUNDARY_CLEAR" '.data.rotated')"
+SOURCE_STATE=unmeasured
+BOUNDARY_UNKNOWN="$(rot_boundary)"
+t "4055 boundary: an unmeasured current account does not rotate" "false" "$(jqv "$BOUNDARY_UNKNOWN" '.data.rotated')"
 
 CHAT_ENV="$(rot_json telegram)"
 t "3856 rotate: a CHAT seat's envelope reports the bounce as scheduled" \

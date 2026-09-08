@@ -822,6 +822,38 @@ _hb_row_note() {
       WHERE id=${id};" 2>/dev/null || true
 }
 
+# DIVE-4055: rotate only at the dispatch boundary, while the row is still todo
+# and before `_hb_wake` can submit its first turn.  Returns 0 only when a profile
+# was actually changed; 1 is a measured/no-op result and 2 is an execution or
+# envelope failure.  The caller defers the wake on 0 so cmd_config's scheduled
+# bounce completes before any task text reaches the seat.
+_HB_BOUNDARY_ROTATION_REASON=""
+_HB_BOUNDARY_ROTATION_FROM=""
+_HB_BOUNDARY_ROTATION_TO=""
+_hb_rotate_at_dispatch_boundary() { # <agent> <registry-snapshot>
+  local name="$1" reg="${2:-}" out enabled
+  _HB_BOUNDARY_ROTATION_REASON=""
+  _HB_BOUNDARY_ROTATION_FROM=""
+  _HB_BOUNDARY_ROTATION_TO=""
+  enabled=$(jq -r --arg n "$name" '.agents[$n].rotation.enabled // false' <<<"$reg" 2>/dev/null) || enabled=false
+  [[ "$enabled" == "true" ]] || return 1
+  if ! out=$(JSON_MODE=1 with_registry_lock cmd_agent_rotation_rotate "$name" \
+      --if-current-near-wall --require-live-headroom 2>/dev/null); then
+    _HB_BOUNDARY_ROTATION_REASON="rotation command failed"
+    return 2
+  fi
+  _HB_BOUNDARY_ROTATION_REASON=$(jq -r '.data.reason // ""' <<<"$out" 2>/dev/null) || return 2
+  _HB_BOUNDARY_ROTATION_FROM=$(jq -r '.data.from // ""' <<<"$out" 2>/dev/null) || return 2
+  _HB_BOUNDARY_ROTATION_TO=$(jq -r '.data.to // ""' <<<"$out" 2>/dev/null) || return 2
+  if jq -e '.ok == true and .data.rotated == true and (.data.to | type == "string") and (.data.to | length > 0)' \
+      <<<"$out" >/dev/null 2>&1; then
+    return 0
+  fi
+  jq -e '.ok == true and .data.rotated == false' <<<"$out" >/dev/null 2>&1 && return 1
+  _HB_BOUNDARY_ROTATION_REASON="rotation returned an unreadable envelope"
+  return 2
+}
+
 # DIVE-3218 — consume the nudge count. Called once per delivered nudge, straight
 # after _hb_mark_run, with the post-increment count.
 #
@@ -5073,6 +5105,25 @@ cmd_heartbeat_tick() {
       sk_budget=$((sk_budget + 1))
       _hb_log "[$name] wake-budget spent for ${today} (cold-mode cap reached) — skip wake this tick"
       continue
+    fi
+
+    # DIVE-4055 — THE ACCOUNT SWITCH LIVES ON THIS SIDE OF THE FIRST TURN.
+    # A successful rotation schedules a service bounce, so leave the row todo
+    # and let the next tick dispatch it into the new account.  A no-op (current
+    # account clear/unmeasured, or no measured destination) preserves the old
+    # dispatch behavior; if that account really is walled, the supervisor will
+    # checkpoint the row and use the existing deduped capacity alert fallback.
+    local _boundary_rot_rc=0
+    if _hb_rotate_at_dispatch_boundary "$name" "$reg"; then
+      _hb_log "[$name] dispatch-boundary rotation ${_HB_BOUNDARY_ROTATION_FROM:--} -> ${_HB_BOUNDARY_ROTATION_TO:--} before ${task_ident}; row remains todo until the post-bounce tick (DIVE-4055)"
+      continue
+    else
+      _boundary_rot_rc=$?
+      if (( _boundary_rot_rc == 2 )); then
+        _hb_log "[$name] WARN: dispatch-boundary rotation could not be measured/executed (${_HB_BOUNDARY_ROTATION_REASON:-unknown}); dispatching ${task_ident} unchanged so a real wall reaches the existing capacity alert (DIVE-4055)"
+      elif [[ "${_HB_BOUNDARY_ROTATION_REASON:-}" == no\ eligible\ account* ]]; then
+        _hb_log "[$name] dispatch-boundary account is near its wall but no measured destination has headroom; dispatching ${task_ident} unchanged so a wall reaches the existing capacity alert (DIVE-4055)"
+      fi
     fi
 
     _hb_log "[$name] due + todo ${task_ident} — waking (fresh=${eff_fresh})"
