@@ -38,14 +38,20 @@ pass=0; fail=0
 ok(){ if [[ "$2" == "$3" ]]; then pass=$((pass+1)); echo "ok   - $1"; else fail=$((fail+1)); echo "FAIL - $1: got '$2' want '$3'"; fi; }
 
 # Extract a fenced block verbatim and strip the workflow's 10-space run: indent.
-extract(){ # $1 = fence name
-  sed -n "/# >>> DIVE-2144 $1/,/# <<< DIVE-2144 $1/p" "$WF" \
+# DIVE-4072: the label is now the WHOLE marker, ticket included, because not every fence in
+# this file belongs to DIVE-2144 any more. `extract` keeps its old one-argument meaning so the
+# two pre-existing call sites read exactly as they did.
+extract_fence(){ # $1 = full fence label, e.g. 'DIVE-4072 required-contexts block'
+  sed -n "/# >>> $1/,/# <<< $1/p" "$WF" \
     | sed '1d;$d' | sed 's/^          //'
 }
+extract(){ extract_fence "DIVE-2144 $1"; }
 
 GUARD=$(extract 'release-cut guard block')
 SORTA=$(extract 'sort-assertion block')
+REQBLK=$(extract_fence 'DIVE-4072 required-contexts block')
 [[ -n "$GUARD" && -n "$SORTA" ]] || { echo "FAIL - could not extract the fenced blocks from $WF"; exit 1; }
+[[ -n "$REQBLK" ]] || { echo "FAIL - could not extract the DIVE-4072 required-contexts block from $WF"; exit 1; }
 
 # --- harness: run the extracted bytes against a fixture -----------------------
 # DIVE-2466: the guard now POLLS. RELEASE_CUT_POLL_SECONDS=0 pins these two helpers
@@ -663,6 +669,343 @@ if m=$(mutate '/MANUAL lane and this run is/d' GUARD); then
 else
   vacuous "drop the event guard"
 fi
+
+# ── DIVE-4072 iteration 2: GRADE THE READ, NOT ONLY THE FILTER ────────────────
+# quinn's iteration-1 reject: every arm above stubs `_required_contexts`, so the one link
+# that decides whether the lane works at all — the API read — was the one link never
+# exercised. It read branches/main/protection, which needs Administration:read, a scope no
+# workflow `permissions:` block can grant; it 403s, `2>/dev/null` swallowed that, and the
+# empty-list guard then refused EVERY real invocation. The suite was 83/0 throughout, and the
+# arm "an EMPTY required list refuses" PASSED for the wrong reason, which is the tell.
+#
+# So these arms extract the REAL `_required_contexts` from the workflow and stub only the
+# TRANSPORT (`gh`). The two fixture bodies are the verbatim 200 responses measured on this
+# repo 2026-09-08, and the stub 403s on any path but the two the function is supposed to
+# read — so re-pointing a read at an endpoint the token cannot reach REDS here instead of
+# shipping green.
+echo
+echo "== DIVE-4072 the READ (unstubbed _required_contexts, gh transport stubbed) =="
+
+# Verbatim `.protection` subtree of GET repos/5dive-ai/5dive/branches/main, 2026-09-08, HTTP
+# 200 UNAUTHENTICATED. This is CLASSIC branch protection — the merge gate itself — and the
+# whole point of the endpoint swap is that it is not admin-class. Siblings the filter does not
+# read are trimmed; `.protection` is byte-for-byte what the API returned, `checks[]` included,
+# because a fixture reshaped to the author's model is the defect this section exists to catch.
+BRANCH_JSON='{
+  "name": "main",
+  "protected": true,
+  "protection": {
+    "enabled": true,
+    "required_status_checks": {
+      "enforcement_level": "non_admins",
+      "contexts": [
+        "test", "test-installed-host", "shellcheck", "docker-install", "scan",
+        "check", "supply-chain-guard", "test-confirm", "test-installed-host-confirm"
+      ],
+      "checks": [
+        { "context": "test", "app_id": 15368 },
+        { "context": "test-installed-host", "app_id": 15368 },
+        { "context": "shellcheck", "app_id": 15368 },
+        { "context": "docker-install", "app_id": 15368 },
+        { "context": "scan", "app_id": 15368 },
+        { "context": "check", "app_id": 15368 },
+        { "context": "supply-chain-guard", "app_id": 15368 },
+        { "context": "test-confirm", "app_id": 15368 },
+        { "context": "test-installed-host-confirm", "app_id": 15368 }
+      ]
+    }
+  }
+}'
+# Verbatim body of GET repos/5dive-ai/5dive/rules/branches/main, 2026-09-08 (HTTP 200):
+# ruleset 22522554, created while classic protection was believed unreadable, same nine.
+RULES_JSON='[
+  {
+    "type": "required_status_checks",
+    "parameters": {
+      "strict_required_status_checks_policy": false,
+      "do_not_enforce_on_create": false,
+      "required_status_checks": [
+        { "context": "test" },
+        { "context": "test-installed-host" },
+        { "context": "shellcheck" },
+        { "context": "docker-install" },
+        { "context": "scan" },
+        { "context": "check" },
+        { "context": "supply-chain-guard" },
+        { "context": "test-confirm" },
+        { "context": "test-installed-host-confirm" }
+      ]
+    },
+    "ruleset_source_type": "Repository",
+    "ruleset_source": "5dive-ai/5dive",
+    "ruleset_id": 22522554
+  }
+]'
+# The same rulesets body plus a TENTH context that classic protection does not carry. A PR must
+# satisfy both mechanisms, so this context gates merges — and it is how the arms below tell a
+# UNION from "whichever endpoint I happened to read first".
+RULES_JSON_EXTRA=$(printf '%s' "$RULES_JSON" | sed 's|{ "context": "test" },|{ "context": "test" }, { "context": "ruleset-only-guard" },|')
+
+# `_required_contexts` emits a SORTED union, so the expectation is sorted too — the order the
+# API returns is not part of the contract (the filter builds a set from it).
+REQ_NINE_SORTED=$(printf '%s\n' "$REQ_NINE" | sort -u)
+
+# A transport that serves those bodies for the two READABLE paths and answers anything else
+# with the 403 the real API gives an installation token on branch protection. gh applies --jq
+# itself, so the stub does too: the filters under test stay the workflow's own bytes.
+_GH_DISPATCH='
+  local f="" path=""
+  [[ "$1" == "api" ]] || { echo "gh: unexpected subcommand: $1" >&2; return 1; }
+  shift
+  while (( $# )); do
+    case "$1" in
+      --jq) f="$2"; shift 2 ;;
+      -*)   shift ;;
+      *)    path="$1"; shift ;;
+    esac
+  done
+'
+GH_403='{ echo "gh: HTTP 403: Resource not accessible by integration (https://api.github.com/$path)" >&2; return 1; }'
+GH_STUB_LIVE="$_GH_DISPATCH"'
+  case "$path" in
+    repos/5dive-ai/5dive/branches/main)       printf "%s" "$BRANCH_JSON" | jq -r "$f" ;;
+    repos/5dive-ai/5dive/rules/branches/main) printf "%s" "$RULES_JSON"  | jq -r "$f" ;;
+    *) '"$GH_403"' ;;
+  esac
+'
+# Same, but the ruleset carries the tenth context.
+GH_STUB_UNION="$_GH_DISPATCH"'
+  case "$path" in
+    repos/5dive-ai/5dive/branches/main)       printf "%s" "$BRANCH_JSON"      | jq -r "$f" ;;
+    repos/5dive-ai/5dive/rules/branches/main) printf "%s" "$RULES_JSON_EXTRA" | jq -r "$f" ;;
+    *) '"$GH_403"' ;;
+  esac
+'
+# Classic protection unreadable, rulesets fine — and vice versa. Either is a refusal.
+GH_STUB_403_CLASSIC="$_GH_DISPATCH"'
+  case "$path" in
+    repos/5dive-ai/5dive/rules/branches/main) printf "%s" "$RULES_JSON" | jq -r "$f" ;;
+    *) '"$GH_403"' ;;
+  esac
+'
+GH_STUB_403_RULES="$_GH_DISPATCH"'
+  case "$path" in
+    repos/5dive-ai/5dive/branches/main) printf "%s" "$BRANCH_JSON" | jq -r "$f" ;;
+    *) '"$GH_403"' ;;
+  esac
+'
+# Both endpoints 200 and both genuinely name nothing: an UNPROTECTED main with no rulesets.
+# A real answer, not a failed read — and the caller refuses it in different words.
+GH_STUB_EMPTY_200="$_GH_DISPATCH"'
+  case "$path" in
+    repos/5dive-ai/5dive/branches/main)       printf "%s" "{\"name\":\"main\",\"protected\":false}" | jq -r "$f" ;;
+    repos/5dive-ai/5dive/rules/branches/main) printf "%s" "[]" | jq -r "$f" ;;
+    *) '"$GH_403"' ;;
+  esac
+'
+
+REQ_OUT=""; REQ_ERR=""; REQ_RC=0
+req_run(){ # $1 = gh transport stub ; sets REQ_OUT / REQ_ERR / REQ_RC
+  local errf; errf=$(mktemp)
+  REQ_OUT=$(GITHUB_REPOSITORY=5dive-ai/5dive _GH_STUB="$1" \
+            BRANCH_JSON="$BRANCH_JSON" RULES_JSON="$RULES_JSON" RULES_JSON_EXTRA="$RULES_JSON_EXTRA" bash -c '
+    set -uo pipefail
+    gh(){ eval "$_GH_STUB"; }
+    '"$REQBLK"'
+    _required_contexts
+  ' 2>"$errf"); REQ_RC=$?
+  REQ_ERR=$(cat "$errf"); rm -f "$errf"
+}
+
+# 1. THE READ ITSELF: the real gh calls and the real --jq filters, against the real 200 bodies,
+#    must yield exactly the nine contexts that gate a merge to main.
+req_run "$GH_STUB_LIVE"
+ok "the READ returns the nine required contexts from the real 200 bodies" "$REQ_OUT" "$REQ_NINE_SORTED"
+ok "the READ exits 0 on a 200" "$REQ_RC" "0"
+
+# 2. IT IS A UNION, NOT A FAVOURITE. A context required by only ONE of the two mechanisms still
+#    gates the merge, so it must still gate this cut. Without this arm, reading either endpoint
+#    alone passes arm 1 — the two fixtures agree today, which is exactly why agreement cannot be
+#    the evidence.
+req_run "$GH_STUB_UNION"
+ok "a context required by the RULESET only is in the union" \
+   "$(grep -cx 'ruleset-only-guard' <<<"$REQ_OUT")" "1"
+ok "the union does not lose the classic nine" \
+   "$(comm -23 <(printf '%s\n' "$REQ_NINE_SORTED") <(printf '%s\n' "$REQ_OUT" | sort -u) | wc -l | tr -d ' ')" "0"
+
+# 2b. THE CLASSIC PAYLOAD CARRIES THE LIST TWICE — the flat `contexts` array (which GitHub
+#     documents as DEPRECATED) and `checks[].context`. Both are read, so either field alone still
+#     answers. These two fixtures drop one field each; without them, the day GitHub retires
+#     `contexts` the lane reads an empty list and refuses every hotfix again.
+GH_STUB_CHECKS_ONLY="$_GH_DISPATCH"'
+  case "$path" in
+    repos/5dive-ai/5dive/branches/main)       printf "%s" "$BRANCH_JSON" | jq -r "del(.protection.required_status_checks.contexts) | $f" ;;
+    repos/5dive-ai/5dive/rules/branches/main) printf "%s" "$RULES_JSON"  | jq -r "$f" ;;
+    *) '"$GH_403"' ;;
+  esac
+'
+GH_STUB_CONTEXTS_ONLY="$_GH_DISPATCH"'
+  case "$path" in
+    repos/5dive-ai/5dive/branches/main)       printf "%s" "$BRANCH_JSON" | jq -r "del(.protection.required_status_checks.checks) | $f" ;;
+    repos/5dive-ai/5dive/rules/branches/main) printf "%s" "$RULES_JSON"  | jq -r "$f" ;;
+    *) '"$GH_403"' ;;
+  esac
+'
+req_run "$GH_STUB_CHECKS_ONLY"
+ok "classic protection with checks[] but no deprecated contexts[] still yields the nine" "$REQ_OUT" "$REQ_NINE_SORTED"
+req_run "$GH_STUB_CONTEXTS_ONLY"
+ok "classic protection with contexts[] but no checks[] still yields the nine" "$REQ_OUT" "$REQ_NINE_SORTED"
+
+# 3. EITHER READ FAILING IS ITS OWN REFUSAL, and it names the status. This is the arm whose
+#    absence let a lane that 403s on every invocation ship as 83/0.
+for arm in "classic:$GH_STUB_403_CLASSIC" "rulesets:$GH_STUB_403_RULES"; do
+  req_run "${arm#*:}"
+  ok "a 403 on the ${arm%%:*} read exits NON-zero (never an empty list)" \
+     "$([[ "$REQ_RC" != 0 ]] && echo nonzero || echo zero)" "nonzero"
+  ok "a 403 on the ${arm%%:*} read names the HTTP status in its error" \
+     "$(grep -q 'HTTP 403' <<<"$REQ_ERR" && echo named || echo "unnamed:$REQ_ERR")" "named"
+done
+req_run "$GH_STUB_403_CLASSIC"
+ok "a failed read prints NOTHING on stdout — a partial list is not a gate" "$REQ_OUT" ""
+
+# 4. AND THE OTHER SIDE OF THAT DISTINCTION: two 200s that genuinely require nothing must NOT
+#    look like a failed read. They succeed with an empty list, and the lane's own empty-list
+#    refusal (arm above) is what stops the cut. Without this arm, "always refuse" would pass 3.
+req_run "$GH_STUB_EMPTY_200"
+ok "an unprotected main with no rulesets exits 0 with an empty list, not as a read failure" \
+   "$REQ_RC:$REQ_OUT" "0:"
+
+# 5. READ AND FILTER COMPOSE. The lane is driven with the list the REAL read produced rather
+#    than with REQ_NINE typed into this file, so a parse that lost or mangled a context shows
+#    up as a verdict change and not merely as a string mismatch above.
+req_run "$GH_STUB_LIVE"
+ok "read -> lane: the incident board is GREEN on the list the read actually produced" \
+   "$(lane "$INCIDENT" "$REQ_OUT" workflow_dispatch)" "GREEN"
+ok "read -> lane: a REQUIRED red on that same list still refuses" \
+   "$(lane "$INCIDENT_REQ" "$REQ_OUT" workflow_dispatch)" "RED"
+
+# 6. MUTANT — the iteration-1 defect, put back. Re-point the classic read at the admin-only
+#    endpoint (the one the workflow token gets 403 on) and this section must fail.
+if m=$(mutate "s|'branches/main' \\\\|'branches/main/protection' \\\\|" REQBLK); then
+  REQ_SAVE="$REQBLK"; REQBLK="$m"
+  req_run "$GH_STUB_LIVE"
+  ok "MUTANT read an endpoint the token cannot reach: the read stops returning the nine" \
+     "$([[ "$REQ_OUT" == "$REQ_NINE_SORTED" ]] && echo caught-nothing || echo mutant-detected)" "mutant-detected"
+  REQBLK="$REQ_SAVE"
+else
+  vacuous "read an endpoint the token cannot reach"
+fi
+
+# 7. MUTANT — swallow the failure again (drop the read's non-zero return), which is what made a
+#    403 indistinguishable from "nothing is required".
+if m=$(mutate '/^    return 1$/d' REQBLK); then
+  REQ_SAVE="$REQBLK"; REQBLK="$m"
+  req_run "$GH_STUB_403_CLASSIC"
+  ok "MUTANT drop the read's refusal: a 403 stops being distinguishable from an empty list" \
+     "$([[ "$REQ_RC" != 0 ]] && echo caught-nothing || echo mutant-detected)" "mutant-detected"
+  REQBLK="$REQ_SAVE"
+else
+  vacuous "drop the read's refusal"
+fi
+
+# 8. MUTANT — read only classic protection (drop the rulesets read), the loose direction the
+#    union exists to close.
+if m=$(mutate '/RULESET-required contexts/d' REQBLK); then
+  REQ_SAVE="$REQBLK"; REQBLK="$m"
+  req_run "$GH_STUB_UNION"
+  ok "MUTANT drop the rulesets read: a ruleset-only required context stops gating the cut" \
+     "$(grep -qx 'ruleset-only-guard' <<<"$REQ_OUT" && echo caught-nothing || echo mutant-detected)" "mutant-detected"
+  REQBLK="$REQ_SAVE"
+else
+  vacuous "drop the rulesets read"
+fi
+
+# ── DIVE-4072 iteration 2: THE RELEASE NOTE MUST NOT NAME A NON-GATE ──────────
+# quinn's second finding: `_DROPPED` was computed at the fetch, BEFORE the DIVE-2238/2466
+# self-and-sibling drop, so this run's own permanently-pending `cut` row — not a required
+# context, so never filtered out as one — was reported as something the hotfix "did not wait
+# for". The row asked the notes to name what was skipped; that named a check that was never a
+# gate, and it would have appeared in every hotfix release ever cut.
+echo
+echo "== DIVE-4072 what the release note says was skipped =="
+
+# The board a real hotfix sees: nine green, one red sweep shard, plus THIS run's own `cut`
+# row. Column 4 carries the run id the self-filter matches on.
+SELFRUN=987654321
+BOARD_SELF=$(printf '%s\ncut\tin_progress\tpending\thttps://github.com/o/r/actions/runs/%s/job/1\n' "$INCIDENT" "$SELFRUN")
+
+dropped(){ # $1 = board, $2 = required list, $3 = GITHUB_RUN_ID ; echoes the note fragment
+  runs="$1" sha=deadbeefcafe tag=v9.9.9 RELEASE_CUT_POLL_SECONDS=0 \
+  REQUIRED_ONLY=true GITHUB_EVENT_NAME=workflow_dispatch _REQ_FIXTURE="$2" GITHUB_RUN_ID="$3" \
+  bash -c '
+    set -uo pipefail
+    _required_contexts(){ printf "%s\n" "$_REQ_FIXTURE"; }
+    # The guard block itself is loud; its own verdict is graded by lane()/lane_run() above.
+    # Here only the note fragment is under test, so the block keeps its verbatim bytes and it
+    # is the GROUP that is silenced — an `exit` inside it still exits, so a refusal still
+    # yields an empty fragment rather than a stale one.
+    {
+    '"$GUARD"'
+    } >/dev/null
+    printf "%s\n" "$_DROPPED" | awk -F"\t" "{printf \"%s(%s) \", \$1, \$3}"
+  ' 2>/dev/null
+}
+
+ok "the note names the non-required red that was skipped" \
+   "$(dropped "$BOARD_SELF" "$REQ_NINE" "$SELFRUN")" "full-pristine (2)(failure) "
+ok "the note does NOT name this run's own pending cut row" \
+   "$(dropped "$BOARD_SELF" "$REQ_NINE" "$SELFRUN" | grep -c 'cut(pending)')" "0"
+
+# MUTANT — put the computation back before the self drop and the corpse returns to the note.
+if m=$(mutate 's|^  _DROPPED=.*_filter_dropped)$|  _DROPPED=""|' GUARD); then
+  GUARD_SAVE="$GUARD"; GUARD="$m"
+  ok "MUTANT delete the relocated _DROPPED: the note stops naming what was skipped" \
+     "$([[ "$(dropped "$BOARD_SELF" "$REQ_NINE" "$SELFRUN")" == "full-pristine (2)(failure) " ]] && echo caught-nothing || echo mutant-detected)" "mutant-detected"
+  GUARD="$GUARD_SAVE"
+else
+  vacuous "delete the relocated _DROPPED"
+fi
+
+# NEGATIVE CONTROL for the two arms above, and it reproduces the PRE-FIX SHAPE rather than
+# merely deleting the fixed line: disable the self-row drop entirely (both the id filter and
+# the name it is learned from) and the board reaching the filters is the board the old order
+# handed them — our own pending `cut` row included. The note must then name it again. Without
+# this arm "does NOT name cut(pending)" would also pass on a board that never had the row.
+if m=$(mutate '/_found/d; /index($4, self) == 0/d' GUARD); then
+  GUARD_SAVE="$GUARD"; GUARD="$m"
+  ok "PRE-FIX SHAPE (self row never dropped): the note names cut(pending) again" \
+     "$(dropped "$BOARD_SELF" "$REQ_NINE" "$SELFRUN" | grep -c 'cut(pending)')" "1"
+  GUARD="$GUARD_SAVE"
+else
+  vacuous "self row never dropped"
+fi
+
+# And the sibling repair the same move bought: under the lane, our own row is not a required
+# context, so the OLD order deleted the row `_self_name` is learned from — leaving every red
+# unattributable and a required red waited out to the deadline instead of refused. With the
+# split after the drop, the required red refuses as RED on a board that also carries our row.
+lane_run(){ # $1 = board, $2 = required list, $3 = GITHUB_RUN_ID ; echoes like lane()
+  local out rc
+  out=$(runs="$1" sha=deadbeefcafe tag=v9.9.9 RELEASE_CUT_POLL_SECONDS=0 \
+        REQUIRED_ONLY=true GITHUB_EVENT_NAME=workflow_dispatch _REQ_FIXTURE="$2" \
+        GITHUB_RUN_ID="$3" bash -c '
+    set -uo pipefail
+    _required_contexts(){ printf "%s\n" "$_REQ_FIXTURE"; }
+    '"$GUARD"'
+  ' 2>&1); rc=$?
+  if (( rc != 0 )); then
+    grep -q 'CI is RED'         <<<"$out" && { echo RED;       return; }
+    grep -q 'CI still IN FLIGHT'<<<"$out" && { echo IN-FLIGHT; return; }
+    grep -q 'CI NOT REACHED'    <<<"$out" && { echo NOT-REACHED; return; }
+    echo "OTHER-FAIL:$out"; return
+  fi
+  grep -q 'CI green on' <<<"$out" && echo GREEN || echo "OTHER-OK:$out"
+}
+BOARD_SELF_REQRED=$(printf '%s\ncut\tin_progress\tpending\thttps://github.com/o/r/actions/runs/%s/job/1\n' "$INCIDENT_REQ" "$SELFRUN")
+ok "lane ON, our own row on the board: a REQUIRED red is REFUSED, not waited out" \
+   "$(lane_run "$BOARD_SELF_REQRED" "$REQ_NINE" "$SELFRUN")" "RED"
+ok "lane ON, our own row on the board: an all-green board still cuts" \
+   "$(lane_run "$BOARD_SELF" "$REQ_NINE" "$SELFRUN")" "GREEN"
 
 echo
 echo "$pass passed, $fail failed"

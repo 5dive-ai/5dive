@@ -24,6 +24,16 @@
 # that can defeat protection. version-assign.yml is retired; this job is now the ONLY
 # writer of a version anywhere in the repo, which is also what retires the collision
 # race it used to be possible to lose (see the derivation block below).
+#
+# WHAT READS WHAT (DIVE-4072). The manual cut has a HOTFIX LANE (`required_only`) that
+# grades the sha against the contexts REQUIRED on main instead of every check-run on it,
+# because this job used to publish on nine-plus-everything while main merges on nine. That
+# lane reads that list LIVE from the two authorities that actually gate a merge, and grades
+# against their UNION: `repos/:owner/:repo/branches/main` (`.protection.required_status_checks`
+# — CLASSIC branch protection, and NOT admin-class, whatever `branches/main/protection` says)
+# and `repos/:owner/:repo/rules/branches/main` (the rulesets view). Never a list copied into
+# this file: that is the same "one rule implemented twice" trap as the sort above, and it
+# would fail in the loose direction. Full argument at `_required_contexts` below.
 name: release-cut
 on:
   schedule:
@@ -272,17 +282,79 @@ jobs:
             git merge-base --is-ancestor "$1" "$_t" 2>/dev/null || return 0
             printf '%s\n' "$_t"
           }
-          # DIVE-4072: the REQUIRED contexts, read LIVE from branch protection.
-          # Outside the fence for exactly the reason _ci_fetch_runs is: the block below is
-          # extracted and executed by tests/release_cut_guards_unit.sh, which supplies its own
-          # stub. NEVER a hand-copied list in this file — release-cut and branch protection
-          # disagreeing about what "required" means is the DIVE-2144 "one rule implemented
-          # twice" trap this workflow already carries a warning about, and the failure would be
-          # silent in the dangerous direction: publishing against a list that has drifted SHORT.
-          _required_contexts() {
-            gh api "repos/${GITHUB_REPOSITORY}/branches/main/protection" \
-              --jq '.required_status_checks.contexts[]' 2>/dev/null
+          # >>> DIVE-4072 required-contexts block (extracted verbatim by tests/release_cut_guards_unit.sh)
+          # DIVE-4072: the contexts REQUIRED on main, read LIVE from the same authorities that
+          # gate the merge. NEVER a hand-copied list in this file — release-cut and the merge gate
+          # disagreeing about what "required" means is the DIVE-2144 "one rule implemented twice"
+          # trap this workflow already carries a warning about, and it fails SILENTLY in the
+          # dangerous direction: publishing against a list that has drifted SHORT.
+          #
+          # WHY NOT branches/main/protection (quinn, iteration 1). The first revision read
+          # `repos/:owner/:repo/branches/main/protection`, which needs the Administration:read
+          # repo permission — and `administration` is NOT a scope a workflow `permissions:` block
+          # can grant at all, so no edit to this job's own permissions could have fixed it; the
+          # endpoint had to change. Measured on this repo with an installation token:
+          # /commits/main/check-runs returns 60 rows, /branches/main/protection returns 403
+          # "Resource not accessible by integration". The lane therefore refused on EVERY real
+          # invocation while the harness stayed 83/0, because this read was the one link stubbed.
+          #
+          # WHAT IS READ INSTEAD — TWO ENDPOINTS, AND THE UNION OF THEM:
+          #   1. `repos/:owner/:repo/branches/main` -> `.protection.required_status_checks.contexts`
+          #      This is CLASSIC branch protection itself — the merge gate, not a proxy for it —
+          #      and it is NOT admin-class. Measured 200 with all nine contexts UNAUTHENTICATED on
+          #      2026-09-08, i.e. strictly below the floor github.token has, and independently as
+          #      `5dive-bot` on 2026-08-11 (DIVE-3244, wiki:
+          #      a-check-run-is-not-a-commit-status-and-protection-is-readable-without-admin).
+          #      That page is why this revision does not need the ruleset workaround: the 403 was
+          #      an artefact of WHICH URL was picked for a question that has a non-privileged
+          #      answer.
+          #   2. `repos/:owner/:repo/rules/branches/main` -> the RULESETS view (also 200
+          #      unauthenticated). Ruleset 22522554 ('main-required-checks', active) was created
+          #      2026-09-08 while classic protection was believed unreadable, and it holds the
+          #      same nine.
+          # A PR must satisfy BOTH mechanisms, so the honest predicate is their UNION, and taking
+          # the union is also what makes the redundancy safe in the only direction that matters:
+          # a context that lives in only one of the two still gates this cut. Grading against
+          # either one ALONE would be the loose direction the moment they diverge — which is the
+          # residual an earlier revision of this block signed rather than closed, and it did not
+          # have to be signed at all.
+          #
+          # BOTH HALVES OF THE CLASSIC PAYLOAD ARE READ. `required_status_checks` carries the same
+          # list twice — the flat `contexts` array, which GitHub documents as DEPRECATED, and
+          # `checks[].context`, its replacement — and the response measured 2026-09-08 carries both,
+          # identical. Reading only `contexts` would go EMPTY the day GitHub drops it; reading only
+          # `checks` would go empty on any older shape. Unioned, either field alone still answers,
+          # and if both ever vanish the empty list is a refusal rather than a publish.
+          #
+          # EITHER READ FAILING IS A REFUSAL, WITH THE HTTP STATUS NAMED, and stderr is not
+          # swallowed. The first revision ended in `2>/dev/null`, which turns a 403 into an empty
+          # list — byte-identical to "nothing is required" — and hands the operator "returned NO
+          # required contexts" in the middle of an incident. A read that 200s and legitimately
+          # names nothing stays a SUCCESS with an empty list, refused one layer up in different
+          # words, so the two can never be confused again.
+          _req_read_one() {   # $1 = api path under the repo, $2 = jq filter, $3 = what it is
+            local _out _rc _status
+            _out=$(gh api "repos/${GITHUB_REPOSITORY}/$1" --jq "$2" 2>&1); _rc=$?
+            if (( _rc != 0 )); then
+              _status=$(printf '%s\n' "$_out" | sed -n 's/.*HTTP \([0-9][0-9][0-9]\).*/\1/p' | head -1)
+              echo "::error::DIVE-4072: could not READ $3 from repos/${GITHUB_REPOSITORY}/$1 — HTTP ${_status:-unknown} (gh exit ${_rc}). A failed read is NOT 'nothing is required'. gh said: $(printf '%s' "$_out" | tr '\n' ' ' | cut -c1-300)" >&2
+              return 1
+            fi
+            printf '%s\n' "$_out"
+            return 0
           }
+          _required_contexts() {
+            local _classic _rules
+            _classic=$(_req_read_one 'branches/main' \
+                       '(.protection.required_status_checks.contexts[]?, .protection.required_status_checks.checks[]?.context)' \
+                       "main's CLASSIC branch-protection contexts") || return 1
+            _rules=$(_req_read_one 'rules/branches/main' \
+                     '.[]? | select(.type == "required_status_checks") | .parameters?.required_status_checks[]? | .context' \
+                     "main's RULESET-required contexts") || return 1
+            printf '%s\n%s\n' "$_classic" "$_rules" | grep -v '^[[:space:]]*$' | sort -u
+            return 0
+          }
+          # <<< DIVE-4072 required-contexts block
           runs=$(_ci_fetch_runs)
           # >>> DIVE-2144 release-cut guard block (extracted verbatim by tests/release_cut_guards_unit.sh)
           # DIVE-4072 — THE HOTFIX LANE, and its three refusals.
@@ -312,9 +384,12 @@ jobs:
               echo "::error::required_only is a MANUAL lane and this run is '${GITHUB_EVENT_NAME:-unknown}'. The scheduled and push cuts grade every check-run, deliberately. Refusing."
               exit 1
             fi
-            _REQ_LIST=$(_required_contexts)
+            if ! _REQ_LIST=$(_required_contexts); then
+              echo "::error::required_only was requested but the READ of main's required contexts FAILED (the HTTP status is in the error immediately above). Refusing: a tag published against an unknown gate is worse than a late tag."
+              exit 1
+            fi
             if [[ -z "$_REQ_LIST" ]]; then
-              echo "::error::required_only was requested but branch protection returned NO required contexts for main. That is indistinguishable from a failed read, and grading against an empty list is publishing with no gate at all. Refusing."
+              echo "::error::required_only was requested but main's rules report NO required contexts. Grading against an empty list is publishing with no gate at all. Refusing."
               exit 1
             fi
             echo "DIVE-4072 HOTFIX LANE: grading ${sha:0:12} against the $(printf '%s\n' "$_REQ_LIST" | grep -c .) REQUIRED context(s) only."
@@ -337,7 +412,6 @@ jobs:
               BEGIN { n = split(req, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") R[a[i]] = 1 }
               !($1 in R) && $3 != "success" && $3 != "skipped" && $3 != "neutral"'
           }
-          _DROPPED=$(printf '%s\n' "$runs" | _filter_dropped); runs=$(printf '%s\n' "$runs" | _filter_required)
           # DIVE-2238: DROP THIS RUN'S OWN CHECK-RUNS BEFORE COUNTING ANYTHING.
           # This job runs against main's tip, so its own `cut` job is a check-run on
           # the very sha it is grading — permanently `in_progress` for as long as it
@@ -478,6 +552,21 @@ jobs:
                 { if ($2 == "completed" && $3 == "cancelled" && ($1 in v)) next; print }
               ' <(printf '%s\n' "$runs") <(printf '%s\n' "$runs"))
             fi
+            # DIVE-4072: SPLIT THE BOARD HERE, NOT AT THE FETCH (quinn, iteration 1).
+            # These two filters used to run immediately after every `_ci_fetch_runs`, i.e. BEFORE
+            # the DIVE-2238/2466 self-and-sibling drop above — so this run's own `cut` row
+            # (permanently pending, and never a required context) landed in `_DROPPED` and then in
+            # the release note as "NOT waited for: cut(pending)", naming as skipped a check that
+            # was never a gate. The row asked the notes to name what was skipped; this is what
+            # makes that list true.
+            # It repairs a second, quieter thing in the same move: our own row is not a required
+            # context either, so the old order deleted the very row `_self_name` is learned off,
+            # and under the lane the unattributable-red deferral could never clear — a required
+            # red would have been waited out to the deadline and then refused with the wrong
+            # message. Filtering after the drop means the lane grades exactly the board every
+            # pre-existing arm grades, minus the non-required rows and nothing else.
+            _DROPPED=$(printf '%s\n' "$runs" | _filter_dropped)
+            runs=$(printf '%s\n' "$runs" | _filter_required)
             total=$(printf '%s' "$runs" | grep -c . || true)
             incomplete=$(awk -F'\t' '$2 != "completed"' <<<"$runs")
             bad=$(awk -F'\t' '$3 != "success" && $3 != "skipped" && $3 != "neutral"' <<<"$runs" | awk -F'\t' '$2 == "completed"')
@@ -612,7 +701,6 @@ jobs:
                 printf '%s\n' "$bad" | sed 's/^/  abandoned: /'
                 sha="$_newtip"
                 runs=$(_ci_fetch_runs)
-          _DROPPED=$(printf '%s\n' "$runs" | _filter_dropped); runs=$(printf '%s\n' "$runs" | _filter_required)
                 continue
               fi
               echo "::error::CI is RED on ${sha:0:12} — refusing to cut ${tag}. Failing:"
@@ -641,7 +729,6 @@ jobs:
             fi
             sleep "$_poll_int"
             runs=$(_ci_fetch_runs)
-          _DROPPED=$(printf '%s\n' "$runs" | _filter_dropped); runs=$(printf '%s\n' "$runs" | _filter_required)
           done
           # <<< DIVE-2144 release-cut guard block
 
@@ -670,7 +757,7 @@ jobs:
           # DIVE-4072: a hotfix-lane cut says so IN THE RELEASE, and names what it did not wait
           # for. A later reader must not have to reconstruct that from workflow logs that age out.
           if [[ "$REQUIRED_ONLY" == "true" ]]; then
-            note="${note} [HOTFIX LANE: graded against required contexts only"
+            note="${note} [HOTFIX LANE (DIVE-4072): graded against the contexts required on main only, read live from branch protection and the repo rules"
             if [[ -n "${_DROPPED:-}" ]]; then
               note="${note}; NOT waited for: $(printf '%s\n' "$_DROPPED" | awk -F'\t' '{printf "%s(%s) ", $1, $3}')"
             else
