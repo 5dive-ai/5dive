@@ -4,6 +4,18 @@ Before opening, please read CONTRIBUTING.md (especially the "Scope" and
 has agreed the direction first.
 -->
 
+<!-- TITLE: start it with a conventional type. This is checked (pr-title-lint)
+and it is not cosmetic — main takes SQUASH merges, so your PR title becomes the
+commit subject, and release-cut reads those subjects to decide the next version:
+
+    feat: ...            -> the next release is a MINOR (a 0.x cut)
+    feat!: / BREAKING CHANGE -> a MAJOR
+    fix|test|chore|docs|refactor|ci|perf|revert: ... -> a PATCH (0.x.x)
+
+So "feat" is a release decision, not a label. Nobody passes a level by hand any
+more; if the title is wrong, the version is wrong. (DIVE-4086)
+-->
+
 ## What this changes
 
 <!-- One paragraph: what's different after this PR, and the user-visible

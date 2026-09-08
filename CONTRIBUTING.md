@@ -134,10 +134,24 @@ caught.
 
 - One concern per PR. Reviewers spend more time on a 200-line PR with mixed
   concerns than on two 100-line PRs.
-- Commit message style follows the existing log. Skim `git log --oneline`
-  for the pattern — typically a short prefix (`cli:`, `ui:`, `docs:`,
-  `install:`, `build:`) followed by a one-line summary, then a paragraph
-  on the *why* if it isn't obvious.
+- **Start the PR title with a conventional type — it is checked, and it picks
+  the next version number.** main takes squash merges, so the PR title becomes
+  the commit subject, and `release-cut` reads those subjects to decide the
+  level of the next release:
+
+  | title starts with | the next release is |
+  | --- | --- |
+  | `feat:` / `feat(scope):` | a **minor** (`0.x`) |
+  | any type with `!:`, or a `BREAKING CHANGE` trailer | a **major** |
+  | `fix` `test` `chore` `docs` `refactor` `ci` `perf` `revert` | a **patch** (`0.x.x`) |
+
+  So `feat` is a release decision rather than a label — nobody passes a version
+  level by hand any more (DIVE-4086). Do NOT copy the older prefixes still
+  visible in `git log` (`cli:`, `ui:`, `install:`, `build:`, or a bare
+  `DIVE-1234:`): 30 of the 60 merges before this rule landed carry no type at
+  all, which is exactly why the check exists. Follow the table, not the log.
+- After the title, a one-line summary and then a paragraph on the *why* if it
+  isn't obvious.
 - No `--no-verify` on commits — CI runs the same checks anyway, you'll
   just learn about the failure later.
 - Never bump the version — not in your PR, and not on `main` either. Since

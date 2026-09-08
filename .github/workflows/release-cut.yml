@@ -198,7 +198,7 @@ jobs:
             _derived=major; _forced_by="a BREAKING CHANGE trailer in ${_range}"
           else
             _forced_by=$(grep -E '^[0-9a-f]+ feat(\([^)]*\))?:' <<<"$_subjects" | head -3)
-            if [[ -n "$_forced_by" ]]; then _derived=minor; else _derived=patch; fi
+            if [[ -n "$_forced_by" ]]; then _derived=minor; else _derived="patch"; fi
           fi
 
           # THE REFUSAL IS BOUNDED BY WHEN THE LINT LANDED, and that boundary is read
@@ -219,6 +219,7 @@ jobs:
           fi
           if [[ -n "$_untyped" ]]; then
             echo "::error::commits since ${incumbent:-<root>} carry no conventional type, so this cut cannot tell whether it contains a feature (DIVE-4086). The PR-title lint should have made this unreachable; fix the subject, or cut by hand and say why:"
+            # shellcheck disable=SC2001  # prefixing every LINE, which ${x//y/z} cannot do
             sed 's/^/::error::  /' <<<"$_untyped"
             exit 1
           fi
