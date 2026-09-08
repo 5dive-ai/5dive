@@ -45,6 +45,15 @@
 #   T9  startup budget, spent RELATIVE to this bundle's own `bash -n` time, so a
 #       slow runner scales both halves and cancels: a command must cost under
 #       75% of a full parse. Eager was 119-161% of it, lazy is 26-48%.
+#   T10 LOAD-PATH budget: a verb that loads SEVERAL modules, timed against an
+#       eager bundle built from the same src/, interleaved. T9 cannot see this
+#       class by construction — it probes the two verbs that load nothing and
+#       one module — and iteration 1 of this row shipped a real regression
+#       underneath it: `task ls` and `agent list` were SLOWER than eager because
+#       a module whose first call lands inside `$( )` is re-read on every call.
+#   T11 the preload table exists, is capped, and names known call edges. It is
+#       what keeps T10 green, and an empty one reads exactly like "nothing calls
+#       across a module boundary" — the same silent shape as T3.
 #
 # Run: bash tests/lazy_dispatch_unit.sh   (no root, no network)
 set -uo pipefail
@@ -280,6 +289,99 @@ else
             "${ms}ms against a ${PARSE}ms parse = ${pct}%. Eager was 119-161%; a module has moved back into the eager core."
     fi
   done
+fi
+
+# --- T11: the preload table -------------------------------------------------
+# `__MODCALLS` is what makes T10 pass. It is a HINT, not a contract: a missing
+# entry costs one more `sed` and a wrong one costs one more module, because the
+# autoload stubs resolve the call either way. That is exactly why it must be
+# graded by CONTENT — an empty table is a valid, working, and 25% slower bundle,
+# and it reads identically to "nothing calls across a module boundary" (the same
+# silent shape as T3, and the shape `sort -u "$f" >"$f"` actually produced once).
+CALLS_BLOCK=$(sed -n '/^declare -gA __MODCALLS=(/,/^)/p' "$BUNDLE")
+CALLS_N=$(grep -cE '^  \[' <<<"$CALLS_BLOCK" || true)
+if [[ "$CALLS_N" -ge 20 ]]; then
+  ok_t "the preload table names $CALLS_N modules"
+else
+  bad_t "the preload table is populated" \
+        "only $CALLS_N entries. An empty or near-empty __MODCALLS builds and runs; it just puts every multi-module verb back behind the eager bundle (T10)."
+fi
+# By content, and these three are read out of src/ rather than restated: the
+# edge must still be a real call site, not a name this harness remembers.
+CALLS_MISSING=""
+for edge in "cmd_agent cmd_auth" "task__crud task__inbox" "cmd_agent cmd_agent_runtime"; do
+  set -- $edge
+  grep -qE "^  \[$1\]=.*$2" <<<"$CALLS_BLOCK" || CALLS_MISSING+="$1 -> $2 "
+done
+if [[ -z "$CALLS_MISSING" ]]; then
+  ok_t "the preload table holds the measured thrash edges by content"
+else
+  bad_t "the preload table holds the measured thrash edges by content" \
+        "absent: $CALLS_MISSING — these are the edges that took \`agent list\` from +656ms to parity."
+fi
+# And the cap holds. A module that calls into many others is a DISPATCHER, and
+# preloading a dispatcher's whole surface is the eager bundle with extra steps:
+# uncapped, cmd_heartbeat (13 callees) took `heartbeat ls` from 1352ms to 1980.
+CAP_MAX=$(awk -F= '/^  \[/ { gsub(/\\/, "", $2); n = split($2, a, " ");
+                    if (n > m) { m = n; w = $1; gsub(/[][ ]/, "", w) } }
+                  END { print m+0, w }' <<<"$CALLS_BLOCK")
+CAP_N="${CAP_MAX%% *}"
+if [[ "$CAP_N" -ge 1 && "$CAP_N" -le 6 ]]; then
+  ok_t "no module preloads more than 6 others (widest: ${CAP_MAX#* } with $CAP_N)"
+else
+  bad_t "no module preloads more than 6 others" \
+        "widest is ${CAP_MAX#* } with $CAP_N. The fan-out cap in scripts/lib/lazy-dispatch.sh has moved or stopped applying."
+fi
+
+# --- T10: the LOAD-PATH budget, against an eager control from the same src ----
+# T9 probes `--version` and `whoami`: the verbs that load NOTHING and ONE
+# module. It is blind to the load path by construction, and iteration 1 of this
+# row shipped a real regression underneath it — quinn measured `task ls`
+# 621 -> 755ms and `agent list` 2590 -> 3390ms while startup was 5x faster,
+# because a module whose first call lands inside `$( )` is re-read on every
+# call. This arm is the one that can see that.
+#
+# It is graded against an EAGER bundle built from the SAME src/, interleaved,
+# min-of-N: both halves meet the same contention in the same seconds, so the
+# ratio is the measurement and the runner's speed cancels. Same relative-unit
+# argument as T9 — a fixed millisecond cap here would be measuring the VM.
+CONTROL="$TMP/5dive-eager-control"
+cat "${CORE_FILES[@]}" "${LAZY_FILES[@]}" src/main.sh >"$CONTROL" 2>/dev/null
+chmod +x "$CONTROL"
+if ! "$CONTROL" --version >/dev/null 2>&1; then
+  bad_t "an eager control bundle builds from the same src/" \
+        "$CONTROL does not run; without it this arm cannot separate a lazy regression from a slow box."
+else
+  ok_t "an eager control bundle builds from the same src/ ($(wc -l <"$CONTROL" | tr -d ' ') lines)"
+  # Non-vacuity, checked and not assumed: the probe has to be a MULTI-module
+  # verb or this arm grades the same thing T9 already does.
+  LOADED=$(FIVE_LAZY_TRACE=1 "$BUNDLE" task ls 2>&1 >/dev/null \
+           | sed -n 's/^5dive\[lazy\] load //p' | tr ' ' '\n' | sort -u | grep -c .)
+  if [[ "$LOADED" -ge 3 ]]; then
+    ok_t "\`task ls\` is a multi-module probe (loads $LOADED modules)"
+  else
+    bad_t "\`task ls\` is a multi-module probe" \
+          "it loaded $LOADED. This arm only grades the load path while the probe uses it; pick a wider verb."
+  fi
+  bc=999999; bl=999999
+  for i in 1 2 3 4 5; do
+    t0=$(date +%s%N); "$CONTROL" task ls >/dev/null 2>&1 || true; t1=$(date +%s%N)
+    d=$(( (t1 - t0) / 1000000 )); [[ "$d" -lt "$bc" ]] && bc=$d
+    t0=$(date +%s%N); "$BUNDLE"  task ls >/dev/null 2>&1 || true; t1=$(date +%s%N)
+    d=$(( (t1 - t0) / 1000000 )); [[ "$d" -lt "$bl" ]] && bl=$d
+  done
+  if [[ "$bc" -lt 150 ]]; then
+    bad_t "the eager control is measurable" \
+          "\`task ls\` on the eager control read ${bc}ms — too small to divide by, so the ratio below would be noise."
+  else
+    pct=$(( bl * 100 / bc ))
+    if [[ "$pct" -le 110 ]]; then
+      ok_t "\`task ls\` costs ${bl}ms = ${pct}% of the eager control's ${bc}ms (budget 110%)"
+    else
+      bad_t "\`task ls\` stays within 110% of the eager control" \
+            "${bl}ms against ${bc}ms = ${pct}%. A module is being re-read out of a \`\$( )\`: run with FIVE_LAZY_TRACE=1 and look for the same module loading twice. Iteration 1 of DIVE-4087 measured 124% here."
+    fi
+  fi
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

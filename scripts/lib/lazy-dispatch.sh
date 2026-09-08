@@ -172,6 +172,46 @@ lazy_tokens() {
   grep -ohE '[A-Za-z_][A-Za-z0-9_]*' "$1" | sort -u
 }
 
+# Every identifier in COMMAND POSITION — i.e. a plausible CALL SITE. This is the
+# PRELOAD side, and unlike lazy_assigns/lazy_tokens above it is deliberately
+# STRICT: it may under-report freely.
+#
+# WHY THE DIRECTION IS OPPOSITE. __MODDEPS exists because a missing variable
+# provider is an `unbound variable` and the CLI dies, so it must over-report.
+# __MODCALLS exists only to stop a module being re-read: the autoload stubs make
+# the call correct either way, so a MISSING call edge costs one more `sed` (i.e.
+# exactly today's behaviour) and a SPURIOUS one costs a module we did not need.
+# Both are performance, neither is correctness — so here we buy precision.
+#
+# THIS IS ALSO WHY IT IS NOT THE TOKEN SCAN. Feeding call edges from lazy_tokens
+# into __MODDEPS was measured on DIVE-4087 and is a mistake: a bare word match
+# cannot tell a call site from a function name in a comment, transitivity closes
+# the graph over 51 of 71 modules, and `whoami` went 84ms -> 4924ms. Splitting on
+# command separators and taking the FIRST word of each segment gives 187 edges
+# with a maximum fan-out of 13, and it is used ONE HOP DEEP, never closed.
+lazy_calls() {
+  awk '
+    /^[[:space:]]*#/ { next }
+    {
+      line = $0
+      gsub(/\$\(/, "\002", line)
+      gsub(/&&|\|\||[;|&({]/, "\002", line)
+      n = split(line, seg, "\002")
+      for (i = 1; i <= n; i++) {
+        s = seg[i]
+        sub(/^[[:space:]]+/, "", s)
+        if (s !~ /^[A-Za-z_][A-Za-z0-9_]*([[:space:]]|$|\))/) continue
+        match(s, /^[A-Za-z_][A-Za-z0-9_]*/)
+        w = substr(s, 1, RLENGTH)
+        rest = substr(s, RLENGTH + 1)
+        if (rest ~ /^[[:space:]]*=/) continue     # an assignment, not a call
+        if (rest ~ /^[[:space:]]*\(\)/) continue  # a definition, not a call
+        print w
+      }
+    }
+  ' "$1" | sort -u
+}
+
 # lazy_core_names <core-file>...
 # Names the core already defines, plus the build shell's own environment. Used
 # only to SUBTRACT from the payload's assignment scan.
@@ -194,12 +234,14 @@ lazy_build_index() {
   : >"$work/funcs"      # "<fn> <mod>"
   : >"$work/assigns"    # "<name> <mod>"
   : >"$work/tokens"     # "<mod> <token>"
+  : >"$work/callsraw"   # "<mod> <word-in-command-position>"
 
   while read -r mod relstart relend path; do
     [[ -n "$mod" ]] || continue
     lazy_funcs "$path"   | sed "s|\$| $mod|" >>"$work/funcs"
     lazy_assigns "$path" | sed "s|\$| $mod|" >>"$work/assigns"
     lazy_tokens "$path"  | sed "s|^|$mod |"  >>"$work/tokens"
+    lazy_calls "$path"   | sed "s|^|$mod |"  >>"$work/callsraw"
   done <"$index"
 
   # A function defined at column 0 by two different payload modules would make
@@ -269,6 +311,14 @@ lazy_build_index() {
       for (e in edge) { split(e, a, " "); print a[1], a[2] }
     }
   ' "$work/edges" | sort -u >"$work/deps"
+
+  # calls: module -> module, ONE HOP, from a call site (see lazy_calls). Consumed
+  # by _load_module as a PRELOAD hint for the modules it was actually asked for,
+  # never expanded recursively — that is what keeps it at ~5 extra modules on the
+  # widest verb instead of the whole payload.
+  awk 'NR==FNR { def[$1] = $2; next }
+       ($2 in def) && def[$2] != $1 { print $1, def[$2] }' \
+    "$work/funcs" "$work/callsraw" | sort -u >"$work/calls"
 }
 
 # lazy_emit <payload-index-file> <workdir> <payload-offset>
@@ -312,6 +362,25 @@ LAZY_HEAD
   done
   printf ')\n'
 
+  # A PRELOAD IS A BET, AND A WIDE FAN-OUT IS A BAD ONE. Preloading a callee pays
+  # when the caller would otherwise re-read it out of a `$( )` (~24ms every time)
+  # and costs when the caller never reaches it. A module that calls into many
+  # others is a DISPATCHER — cmd_heartbeat calls 13 because it has that many
+  # subcommands and any one invocation runs ONE of them — so preloading its whole
+  # surface is just the eager bundle with extra steps. Measured on DIVE-4087:
+  # uncapped, `agent list` went 3415ms -> 3028ms and `task ls` 692 -> 650 (both
+  # now FASTER than eager), but `heartbeat ls` went 1131 -> 1980ms. At this cap
+  # heartbeat keeps its pre-preload figure and the other two keep their win.
+  # Dropping an entry is always safe: the stub still resolves the call.
+  local __lz_fanout_cap="${LAZY_PRELOAD_FANOUT_CAP:-6}"
+  printf 'declare -gA __MODCALLS=(\n'
+  awk '{ d[$1] = d[$1] " " $2; n[$1]++ }
+       END { for (m in d) if (n[m] <= cap) print m, substr(d[m], 2) }' \
+    cap="$__lz_fanout_cap" "$work/calls" | sort | while read -r mod calls; do
+    printf '  [%s]=%q\n' "$mod" "$calls"
+  done
+  printf ')\n'
+
   cat <<'LAZY_BODY'
 
 # Load one or more modules and everything they read a top-level global from.
@@ -323,7 +392,21 @@ LAZY_HEAD
 # and tests/lazy_dispatch_unit.sh refuses a new one that is not.)
 _load_module() {
   local -a __lz_queue=("$@") __lz_pending=() __lz_sed=()
-  local __lz_m __lz_dep __lz_s __lz_e __lz_txt
+  local __lz_m __lz_dep __lz_s __lz_e __lz_txt __lz_max=0
+  # PRELOAD (DIVE-4087 iteration 2). The cost of lazy dispatch is not the first
+  # load, it is a module whose first call happens inside `$( )`: it lands in the
+  # subshell and is gone on return, so the NEXT call re-reads and re-evals it.
+  # Measured before this: `agent list` loaded cmd_auth 17 times (~24ms each) and
+  # `task ls` loaded the same three task modules 3 times, which made both verbs
+  # SLOWER than the eager bundle even though startup got 190ms cheaper.
+  # So when something asks for a module, also take what that module CALLS —
+  # one hop, from the modules named in "$@" only, never recursively (a closed
+  # call graph costs two orders of magnitude more than the thrash: see
+  # scripts/lib/lazy-dispatch.sh). A missing edge here is not a bug, it is just
+  # the old behaviour: the stub still resolves the call.
+  for __lz_m in "$@"; do
+    for __lz_dep in ${__MODCALLS[$__lz_m]:-}; do __lz_queue+=("$__lz_dep"); done
+  done
   while ((${#__lz_queue[@]})); do
     __lz_m="${__lz_queue[0]}"
     __lz_queue=("${__lz_queue[@]:1}")
@@ -341,7 +424,11 @@ _load_module() {
   for __lz_m in "${__lz_pending[@]}"; do
     read -r __lz_s __lz_e <<<"${__MOD[$__lz_m]}"
     __lz_sed+=( -e "$((__lz_s + __FIVE_PAYLOAD_AT)),$((__lz_e + __FIVE_PAYLOAD_AT))p" )
+    (( __lz_e + __FIVE_PAYLOAD_AT > __lz_max )) && __lz_max=$(( __lz_e + __FIVE_PAYLOAD_AT ))
   done
+  # `q` past the last line we want. Without it sed reads all ~96k lines of a 3MB
+  # file on every load; with it, an early module costs 4ms instead of 10ms.
+  __lz_sed+=( -e "${__lz_max}q" )
   __lz_txt="$(sed -n "${__lz_sed[@]}" "$__FIVE_BUNDLE")"
 
   # Did we get what we asked for? Every module is framed by its own name, so
