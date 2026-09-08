@@ -1517,8 +1517,9 @@ _hb_press_continue() {
 #   (a) SKIP any todo whose task_deps carries an OPEN blocker — a blocked_by task
 #       that is not yet done/cancelled — so we never hand out work that can't start.
 #   (b) SKIP any todo with an OPEN HUMAN GATE. Gate state is the authority here,
-#       not status alone: verifier/handoff transitions can leave a gated row todo,
-#       but its maker still has nothing actionable until the person answers.
+#       not status alone: verifier/handoff transitions and `_hb_reclaim` can leave
+#       a gated row todo. The latter repeatedly requeued DIVE-3994 after its gate
+#       was filed, so its maker still has nothing actionable until the person answers.
 #   (c) Within a priority tier, PREFER the critical path: the todo whose downstream
 #       dependent chain is longest, so the longest remaining chain starts soonest.
 # The recursive CTE walks task_deps forward (blocked_by -> task_id, i.e. toward
