@@ -1513,10 +1513,14 @@ _hb_press_continue() {
 
 # DIVE-979 — dependency-aware task pick for one agent. Echoes the single DIVE row
 # id the heartbeat should wake this agent against, or empty when nothing is
-# actionable. Two rules layered on top of the plain priority order:
+# actionable. Three rules layered on top of the plain priority order:
 #   (a) SKIP any todo whose task_deps carries an OPEN blocker — a blocked_by task
 #       that is not yet done/cancelled — so we never hand out work that can't start.
-#   (b) Within a priority tier, PREFER the critical path: the todo whose downstream
+#   (b) SKIP any todo with an OPEN HUMAN GATE. Gate state is the authority here,
+#       not status alone: verifier/handoff transitions and `_hb_reclaim` can leave
+#       a gated row todo. The latter repeatedly requeued DIVE-3994 after its gate
+#       was filed, so its maker still has nothing actionable until the person answers.
+#   (c) Within a priority tier, PREFER the critical path: the todo whose downstream
 #       dependent chain is longest, so the longest remaining chain starts soonest.
 # The recursive CTE walks task_deps forward (blocked_by -> task_id, i.e. toward
 # dependents) and is depth-capped at 64 so a pathological/cyclic graph can't spin.
@@ -1549,6 +1553,7 @@ _hb_pick_tasks() {
       SELECT t.id
         FROM tasks t LEFT JOIN crit c ON c.root = t.id
         WHERE t.assignee=$(sqlq "$name") AND t.status='todo' AND t.kind='standard'
+          AND NOT (t.need_type IS NOT NULL AND t.need_answered_at IS NULL)
           AND NOT EXISTS (
             SELECT 1 FROM task_deps dd JOIN tasks b ON b.id = dd.blocked_by
              WHERE dd.task_id = t.id AND b.status NOT IN ('done','cancelled'))
