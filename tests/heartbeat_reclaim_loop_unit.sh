@@ -97,14 +97,39 @@ _hb_agent_idle()      { return 0; }  # confident idle by default
 _HB_PROJECTS_ROOT="$TMP/projects"
 mkdir -p "$_HB_PROJECTS_ROOT"
 
-# A real (tiny) git repo, so arm 8 grades `_hb_row_workspace_intact` against
-# actual ref resolution rather than a stub of the thing under test.
-mk_checkout_with_branch() {
-  local branch="$1" d="$_HB_PROJECTS_ROOT/repo-$1"
-  rm -rf "$d"; mkdir -p "$d"
-  git -C "$d" init -q 2>/dev/null
-  git -C "$d" -c user.email=t@example.com -c user.name=t commit -q --allow-empty -m seed 2>/dev/null
-  git -C "$d" branch -f "$branch" HEAD 2>/dev/null
+# Real (tiny) git checkouts, so arms 8/8b/8c grade `_hb_row_workspace_intact`
+# against actual git state rather than a stub of the thing under test.
+#
+# THE TOPOLOGY IS THE POINT (DIVE-4104 iteration 2). The first cut of this
+# fixture stood up ONE standalone repo and created the branch with
+# `git branch -f` — no worktree. In that shape a ref lookup and a worktree
+# lookup are indistinguishable, so it passed against a probe that only asked
+# `rev-parse refs/heads/<x>` and would have kept passing after that probe was
+# inverted. Prod's shape is many worktrees sharing one `.git`, with refs for
+# branches checked out nowhere, so the fixture is built that way: a base
+# checkout plus linked worktrees, and a branch that exists only as a ref.
+_FX_BASE="$_HB_PROJECTS_ROOT/repo-base"
+mk_base_clone() {
+  rm -rf "$_HB_PROJECTS_ROOT"; mkdir -p "$_FX_BASE"
+  git -C "$_FX_BASE" init -q -b trunk 2>/dev/null
+  git -C "$_FX_BASE" -c user.email=t@example.com -c user.name=t \
+      commit -q --allow-empty -m seed 2>/dev/null
+}
+# A branch CHECKED OUT in its own linked worktree, sharing the base .git.
+mk_worktree_on_branch() {
+  local branch="$1" d="$_HB_PROJECTS_ROOT/wt-$1"
+  rm -rf "$d"
+  git -C "$_FX_BASE" worktree add -q -b "$branch" "$d" HEAD 2>/dev/null
+  printf '%s' "$d"
+}
+# A branch that exists only as a ref in the shared clone — checked out nowhere.
+mk_ref_only_branch() { git -C "$_FX_BASE" branch -f "$1" HEAD 2>/dev/null; }
+# Bind a row to a pushed branch the way a real push does.
+bind_branch() {
+  local id="$1" branch="$2" ident
+  ident=$(db "SELECT ident FROM tasks WHERE id=${id};")
+  db "INSERT INTO ship_events (kind, actor, ident, repo, branch, sha)
+      VALUES ('ship','agent-dev',$(sqlq "$ident"),'5dive-ai/5dive',$(sqlq "$branch"),'$(printf 'a%039d' "$id")');"
 }
 
 # --- fixtures ---------------------------------------------------------------
@@ -259,9 +284,21 @@ read -r RC6 _ < <(_hb_reclaim dev 30)
 reset_all
 sup_obs dev quota-exhausted "10 minutes" "$(date -u -d '+30 minutes' '+%Y-%m-%d %H:%M:%S')"
 P7=$(_hb_quota_parked dev 5)
-[[ "${P7:-}" =~ ^[0-9]+$ ]] && (( P7 >= 30 && P7 <= 40 )) \
+# The window is tight ON PURPOSE and the tick is asserted as a DELTA. A
+# 30..40m window accepts a park that dropped `+ everyMin * 60` entirely, so
+# the "plus ONE TICK" half of the acceptance went unmeasured; reading the same
+# deadline at two tick lengths pins the tick itself, whatever the clock did
+# between the two calls.
+P7T=$(_hb_quota_parked dev 20)
+[[ "${P7:-}" =~ ^[0-9]+$ ]] && (( P7 >= 33 && P7 <= 35 )) \
   && ok_t "a parseable deadline parks to the deadline plus one tick (~${P7}m left)" \
   || bad_t "parseable deadline did not set the park window" "remaining=${P7:-<empty>}"
+# 14 or 15: the remainder is floor-divided into minutes and the two calls do
+# not share a clock second, so a whole-minute equality would be flaky. Zero is
+# what dropping the tick scores.
+[[ "${P7T:-}" =~ ^[0-9]+$ ]] && (( P7T - P7 >= 14 && P7T - P7 <= 15 )) \
+  && ok_t "the park's tail IS one tick: a 20m tick parks exactly 15m longer than a 5m tick" \
+  || bad_t "the park did not scale with the tick length (expected +15m for a 20m tick)" "park5=${P7:-<empty>} park20=${P7T:-<empty>}"
 db "DELETE FROM supervisor_events;"
 sup_obs dev quota-exhausted "10 minutes" "$(date -u -d '-30 minutes' '+%Y-%m-%d %H:%M:%S')"
 P7B=$(_hb_quota_parked dev 5)
@@ -273,12 +310,11 @@ P7B=$(_hb_quota_parked dev 5)
 # 8) session gone but the pushed branch is still checked out -> claim KEPT
 # =============================================================================
 reset_all
+mk_base_clone
+mk_worktree_on_branch dive-4104-fixture >/dev/null
 T8=$(mk_plain_claimed dev)
 db "UPDATE tasks SET started_at=datetime('now','-10 minutes') WHERE id=${T8};"
-IDENT8=$(db "SELECT ident FROM tasks WHERE id=${T8};")
-mk_checkout_with_branch dive-4104-fixture
-db "INSERT INTO ship_events (kind, actor, ident, repo, branch, sha)
-    VALUES ('ship','agent-dev',$(sqlq "$IDENT8"),'5dive-ai/5dive','dive-4104-fixture','$(printf 'a%039d' 1)');"
+bind_branch "$T8" dive-4104-fixture
 BEFORE8=$(row "$T8")
 gone_session "$T8"
 read -r RC8 _ < <(_hb_reclaim dev 30)
@@ -288,16 +324,57 @@ live_session
   || bad_t "an intact workspace was still reclaimed" "reclaimed=${RC8:-?} row=$(row "$T8") before=$BEFORE8"
 
 # =============================================================================
-# 9) CONTROL — branch gone: no positive evidence, so it reclaims normally
+# 8b) CONTROL — the ref survives but NO worktree holds it -> reclaims
+#
+# This is the arm the old fixture could not have: a second branch in the SAME
+# shared clone, created with `git branch` and checked out nowhere. `rev-parse
+# refs/heads/<x>` resolves it from any of the sibling checkouts, so a probe
+# that asks the ref store answers INTACT and wedges the claim; only a
+# per-worktree probe reclaims. Measured on the real host root the same way:
+# dive-1002-least-priv-isolation resolves as a ref and is checked out in zero
+# worktrees.
 # =============================================================================
-rm -rf "$_HB_PROJECTS_ROOT/repo-dive-4104-fixture"
+mk_ref_only_branch dive-4104-ref-only
+T8B=$(mk_plain_claimed dev)
+db "UPDATE tasks SET started_at=datetime('now','-10 minutes') WHERE id=${T8B};"
+bind_branch "$T8B" dive-4104-ref-only
+gone_session "$T8B"
+read -r RC8B _ < <(_hb_reclaim dev 30)
+live_session
+[[ "$(row "$T8B")" == "todo|NULL" ]] && (( ${RC8B:-0} >= 1 )) \
+  && ok_t "[control] a branch whose ref exists in the shared clone but whose worktree does not still reclaims" \
+  || bad_t "a ref with no worktree held the claim — the probe is reading the ref store, not a workspace" \
+          "reclaimed=${RC8B:-?} row=$(row "$T8B")"
+
+# =============================================================================
+# 8c) CONTROL — the worktree DIRECTORY is deleted while git's admin record and
+# the ref both survive (the shape this host leaves behind: nothing ever runs
+# `git worktree prune`, so `worktree list` keeps naming checkouts that are
+# gone) -> reclaims
+# =============================================================================
+rm -rf "$_HB_PROJECTS_ROOT/wt-dive-4104-fixture"
 db "UPDATE tasks SET status='in_progress', started_at=datetime('now','-10 minutes') WHERE id=${T8};"
 gone_session "$T8"
+read -r RC8C _ < <(_hb_reclaim dev 30)
+live_session
+[[ "$(row "$T8")" == "todo|NULL" ]] && (( ${RC8C:-0} >= 1 )) \
+  && ok_t "[control] a deleted checkout whose git admin record survives reclaims — a listed worktree is not a live one" \
+  || bad_t "a worktree entry whose directory is gone still held the claim" "reclaimed=${RC8C:-?} row=$(row "$T8")"
+
+# =============================================================================
+# 9) CONTROL — the whole projects root is gone: unknown is not intact
+# =============================================================================
+rm -rf "$_HB_PROJECTS_ROOT"
+T9=$(mk_plain_claimed dev)
+db "UPDATE tasks SET started_at=datetime('now','-10 minutes') WHERE id=${T9};"
+bind_branch "$T9" dive-4104-fixture
+gone_session "$T9"
 read -r RC9 _ < <(_hb_reclaim dev 30)
 live_session
-[[ "$(row "$T8")" == "todo|NULL" ]] && (( ${RC9:-0} == 1 )) \
-  && ok_t "[control] the same row with its checkout deleted reclaims — evidence, not a blanket exemption" \
-  || bad_t "[control] a missing workspace still held the claim" "reclaimed=${RC9:-?} row=$(row "$T8")"
+mkdir -p "$_HB_PROJECTS_ROOT"
+[[ "$(row "$T9")" == "todo|NULL" ]] && (( ${RC9:-0} >= 1 )) \
+  && ok_t "[control] an unreadable checkout root reclaims — evidence, not a blanket exemption" \
+  || bad_t "[control] a missing workspace still held the claim" "reclaimed=${RC9:-?} row=$(row "$T9")"
 
 # =============================================================================
 # 10) REPLAY — the four rows that bounced on 2026-09-08 stay on quinn

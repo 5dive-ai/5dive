@@ -2113,17 +2113,65 @@ _hb_quota_parked() {
 # see is never allowed to hold a claim (the failure it would cause — a wedged
 # claim nothing can take back — is worse than the churn it would prevent).
 #
+# A REF IS NOT A WORKSPACE (DIVE-4104 iteration 2). The first cut asked
+# `git rev-parse --verify refs/heads/<branch>` per checkout. `refs/heads` is
+# per-CLONE, not per-worktree: the ~700 checkouts under this root share a
+# handful of `.git` directories, so that question resolves to "somebody once
+# pushed this branch from this host" — true for nearly every branch ever — and
+# it answered INTACT for branches checked out in zero worktrees. Since rule (a)
+# reacts with a bare `continue`, the row then skipped (b) and (c) too: a dead
+# session would have held such a row forever, with no counter and no ledger
+# event. So the probe asks the per-worktree question instead: does a LIVE
+# worktree of this clone have that branch checked out right now?
+# `git worktree list --porcelain` is the only reader that knows, and a listed
+# worktree whose DIRECTORY is gone is not a workspace — git still carries the
+# admin record of a deleted checkout (that is what it calls `prunable`) until
+# somebody prunes it, and this host never does.
+#
 # IT IS BOUNDED, and the bound is measured rather than defensive: this host's
 # projects root holds ~700 checkouts (one worktree per ticket, never swept), and
-# an unbounded scan forks `git rev-parse` once per checkout INSIDE the heartbeat
-# tick. So it probes at most _HB_WORKSPACE_SCAN_MAX of them and then gives up,
-# and giving up returns 1 — i.e. it reclaims exactly as before. Hitting the cap
-# is the same "no positive evidence" answer as an absent branch, which is why a
-# cap is safe here and would not be in a rule that acted on the negative.
+# an unbounded scan forks `git` once per checkout INSIDE the heartbeat tick. So
+# it probes at most _HB_WORKSPACE_SCAN_MAX of them and then gives up, and giving
+# up returns 1 — i.e. it reclaims exactly as before. Hitting the cap is the same
+# "no positive evidence" answer as an absent branch, which is why a cap is safe
+# here and would not be in a rule that acted on the negative. The cap costs less
+# than it used to: checkouts are DEDUPED BY SHARED CLONE, and one
+# `worktree list` per clone sees every worktree of it — including the ones that
+# live outside this root, which the old per-directory scan could never reach.
 _HB_PROJECTS_ROOT="${FIVE_PROJECTS_ROOT:-/home/claude/projects/5dive}"
 _HB_WORKSPACE_SCAN_MAX=400
+# Does any LIVE worktree of the clone reachable from `$1` have branch `$2`
+# checked out? Parses `worktree list --porcelain` records (blank-line
+# separated: `worktree <path>`, `HEAD <sha>`, then `branch refs/heads/<x>` or
+# `detached`, plus optional `locked`/`prunable` annotations). A record only
+# counts when the branch matches, git has not marked it prunable, and the
+# directory is still there.
+_hb_worktree_holds_branch() {
+  local d="$1" branch="$2" line wt="" br=""
+  # `-d "$wt"` is the whole liveness test, and it is the one the harness can
+  # grade. git's own `prunable` annotation is not read here because it is not
+  # independent evidence: measured on git 2.43, the annotation appears exactly
+  # when the directory the admin record names is gone, which is the condition
+  # below — a checkout whose directory survives is never marked prunable, so a
+  # `prunable` arm would be a line no fixture can reach.
+  #
+  # The trailing `echo` terminates the LAST record: git emits a blank line
+  # after every record today, but a stream whose final record is only closed
+  # by EOF would silently drop the newest worktree, and that is the one a
+  # just-restarted seat is most likely to be sitting in.
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*)          wt="${line#worktree }"; br="" ;;
+      "branch refs/heads/"*) br="${line#branch refs/heads/}" ;;
+      "")                    [[ "$br" == "$branch" && -d "$wt" ]] && return 0
+                             wt=""; br="" ;;
+    esac
+  done < <( { git -C "$d" worktree list --porcelain 2>/dev/null; echo; } )
+  return 1
+}
+
 _hb_row_workspace_intact() {
-  local id="$1" branch d scanned=0
+  local id="$1" branch d cdir scanned=0 seen=" "
   branch=$(db "SELECT branch FROM ship_events
                 WHERE ident=(SELECT ident FROM tasks WHERE id=${id})
                   AND branch IS NOT NULL AND branch<>''
@@ -2134,7 +2182,15 @@ _hb_row_workspace_intact() {
     [[ -e "$d/.git" ]] || continue
     scanned=$((scanned + 1))
     (( scanned > _HB_WORKSPACE_SCAN_MAX )) && return 1
-    if git -C "$d" rev-parse --verify --quiet "refs/heads/${branch}" >/dev/null 2>&1; then
+    # One `worktree list` per CLONE, not per checkout: --git-common-dir is the
+    # shared `.git` every worktree of a clone points at, so this collapses the
+    # ~343 sibling checkouts of one repo into a single probe.
+    cdir=$(git -C "$d" rev-parse --git-common-dir 2>/dev/null) || continue
+    [[ -n "$cdir" ]] || continue
+    case "$cdir" in /*) ;; *) cdir="${d}/${cdir#./}" ;; esac
+    [[ "$seen" == *" ${cdir} "* ]] && continue
+    seen="${seen}${cdir} "
+    if _hb_worktree_holds_branch "$d" "$branch"; then
       printf '%s' "$branch"; return 0
     fi
   done
