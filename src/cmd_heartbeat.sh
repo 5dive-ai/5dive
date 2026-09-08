@@ -2082,9 +2082,18 @@ _hb_quota_parked() {
 # may only ever SUPPRESS a reclaim on positive evidence; a probe that cannot
 # see is never allowed to hold a claim (the failure it would cause — a wedged
 # claim nothing can take back — is worse than the churn it would prevent).
+#
+# IT IS BOUNDED, and the bound is measured rather than defensive: this host's
+# projects root holds ~700 checkouts (one worktree per ticket, never swept), and
+# an unbounded scan forks `git rev-parse` once per checkout INSIDE the heartbeat
+# tick. So it probes at most _HB_WORKSPACE_SCAN_MAX of them and then gives up,
+# and giving up returns 1 — i.e. it reclaims exactly as before. Hitting the cap
+# is the same "no positive evidence" answer as an absent branch, which is why a
+# cap is safe here and would not be in a rule that acted on the negative.
 _HB_PROJECTS_ROOT="${FIVE_PROJECTS_ROOT:-/home/claude/projects/5dive}"
+_HB_WORKSPACE_SCAN_MAX=400
 _hb_row_workspace_intact() {
-  local id="$1" branch d
+  local id="$1" branch d scanned=0
   branch=$(db "SELECT branch FROM ship_events
                 WHERE ident=(SELECT ident FROM tasks WHERE id=${id})
                   AND branch IS NOT NULL AND branch<>''
@@ -2093,6 +2102,8 @@ _hb_row_workspace_intact() {
   [[ -d "$_HB_PROJECTS_ROOT" ]] || return 1
   for d in "$_HB_PROJECTS_ROOT"/*; do
     [[ -e "$d/.git" ]] || continue
+    scanned=$((scanned + 1))
+    (( scanned > _HB_WORKSPACE_SCAN_MAX )) && return 1
     if git -C "$d" rev-parse --verify --quiet "refs/heads/${branch}" >/dev/null 2>&1; then
       printf '%s' "$branch"; return 0
     fi
