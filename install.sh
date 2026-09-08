@@ -539,6 +539,15 @@ refresh_managed_files() {
   mv -f "$_bundle_tmp" "$BIN_DIR/5dive"
   ok "5dive → $BIN_DIR/5dive${_want:+ (sha256 verified)}"
 
+  # DIVE-4081: the sudoers template is installed runtime, not just agent-create
+  # state. Existing standard seats otherwise keep the grant set they were born
+  # with, so a newly shipped narrow root primitive exists but is unreachable.
+  # The new bundle touches only clean 5dive-managed cli-scoped files and
+  # preserves conditional push/deploy grants from the enforced file.
+  if ! "$BIN_DIR/5dive" agent _reconcile_sudoers; then
+    echo "warn: existing standard-seat sudoers were not reconciled; routed reviewers may be unable to use newly shipped narrow primitives" >&2
+  fi
+
   # DIVE-3554: the relay binaries the shipped Connect Buzz panel shells out to.
   # Fail-soft on purpose (see stage_buzz_binaries) — a buzz release outage must
   # not stop the CLI update this function exists to perform.

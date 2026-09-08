@@ -137,6 +137,11 @@ SHIM
 chmod +x "$TMP/bin/sudo"
 export CALLS
 PATH="$TMP/bin:$PATH"
+# Sourcing the command bundle can resolve sudo before this fixture prepends its
+# shim, and some runners inject a sudo shell function. Remove both sources of
+# precedence so the arm grades the exact executable it just installed.
+unset -f sudo 2>/dev/null || true
+hash -r
 
 : >"$CALLS"; export SUDO_SHIM_CAN="sign"          # seat CAN sign directly
 _task_answer_try_delegated DIVE-1 --value=approve >/dev/null 2>&1
