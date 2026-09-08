@@ -42,9 +42,12 @@
 #       bundle resolves that by cat order, and lazy loading cannot.
 #   T8  the built bundle parses (`bash -n`) and the core region ends in the
 #       `exit` + marker pair build.sh promises.
-#   T9  startup budget, spent RELATIVE to this bundle's own `bash -n` time, so a
-#       slow runner scales both halves and cancels: a command must cost under
-#       75% of a full parse. Eager was 119-161% of it, lazy is 26-48%.
+#   T9  startup budget for `--version`, spent RELATIVE to this bundle's own
+#       `bash -n` time, so a slow runner scales both halves and cancels: it must
+#       cost under 75% of a full parse. Eager was 119%, lazy is 29-30%. Only a
+#       probe whose cost IS the parse belongs here — `whoami` does not, and it
+#       red-gated at 78% inside a contended --tier=core run; it is graded
+#       against the eager control in T10 instead.
 #   T10 LOAD-PATH budget: a verb that loads SEVERAL modules, timed against an
 #       eager bundle built from the same src/, interleaved. T9 cannot see this
 #       class by construction — it probes the two verbs that load nothing and
@@ -279,16 +282,25 @@ if [[ "$PARSE" -lt 20 ]]; then
         "bash -n on the bundle read ${PARSE}ms — too small to divide by; the ratio arms below would be noise"
 else
   ok_t "full parse of the bundle is ${PARSE}ms (the cost lazy dispatch exists to avoid)"
-  for probe in "--version" "whoami"; do
-    ms=$(run_ms "$probe")
-    pct=$(( ms * 100 / PARSE ))
-    if [[ "$pct" -le 75 ]]; then
-      ok_t "\`5dive $probe\` costs ${ms}ms = ${pct}% of a full parse (budget 75%)"
-    else
-      bad_t "\`5dive $probe\` stays under 75% of a full parse" \
-            "${ms}ms against a ${PARSE}ms parse = ${pct}%. Eager was 119-161%; a module has moved back into the eager core."
-    fi
-  done
+  # ONLY `--version` is graded against the parse unit, and that is a correction,
+  # not a narrowing. The relative unit cancels the box only for a probe whose
+  # cost IS the parse: `--version` is 29-30% of it here and 119% eagerly, so the
+  # two regimes are three-fold apart and no amount of contention closes that.
+  # `whoami` is not that probe — it forks, execs and reads identity, so its own
+  # work is most of its 94ms, and contention inflates a fork-heavy numerator
+  # much harder than it inflates a pure `bash -n` denominator. It measured 69%
+  # standalone and 78% against the same 75% cap inside a full --tier=core run,
+  # i.e. the arm was grading the runner, which is the exact failure the relative
+  # unit exists to end. It moves down to T10 and is graded against an EAGER
+  # CONTROL instead: same work on both sides, contention hits both.
+  ms=$(run_ms "--version")
+  pct=$(( ms * 100 / PARSE ))
+  if [[ "$pct" -le 75 ]]; then
+    ok_t "\`5dive --version\` costs ${ms}ms = ${pct}% of a full parse (budget 75%)"
+  else
+    bad_t "\`5dive --version\` stays under 75% of a full parse" \
+          "${ms}ms against a ${PARSE}ms parse = ${pct}%. Eager was 119-161%; a module has moved back into the eager core."
+  fi
 fi
 
 # --- T11: the preload table -------------------------------------------------
@@ -353,6 +365,30 @@ if ! "$CONTROL" --version >/dev/null 2>&1; then
         "$CONTROL does not run; without it this arm cannot separate a lazy regression from a slow box."
 else
   ok_t "an eager control bundle builds from the same src/ ($(wc -l <"$CONTROL" | tr -d ' ') lines)"
+  # STARTUP, graded against the control rather than against `bash -n` (see T9).
+  # `whoami` loads exactly one module, so it is the cheapest probe that still
+  # touches the load path at all, and against an eager twin the comparison is
+  # like-for-like: both forks, both sqlite reads, both contended in the same
+  # seconds. Measured 266ms eager -> 94ms lazy = 35%; the budget is 75%.
+  bwc=999999; bwl=999999
+  for i in 1 2 3 4 5; do
+    t0=$(date +%s%N); "$CONTROL" whoami >/dev/null 2>&1 || true; t1=$(date +%s%N)
+    d=$(( (t1 - t0) / 1000000 )); [[ "$d" -lt "$bwc" ]] && bwc=$d
+    t0=$(date +%s%N); "$BUNDLE"  whoami >/dev/null 2>&1 || true; t1=$(date +%s%N)
+    d=$(( (t1 - t0) / 1000000 )); [[ "$d" -lt "$bwl" ]] && bwl=$d
+  done
+  if [[ "$bwc" -lt 60 ]]; then
+    bad_t "the eager control is measurable on \`whoami\`" \
+          "it read ${bwc}ms — too small to divide by."
+  else
+    wpct=$(( bwl * 100 / bwc ))
+    if [[ "$wpct" -le 75 ]]; then
+      ok_t "\`whoami\` costs ${bwl}ms = ${wpct}% of the eager control's ${bwc}ms (budget 75%)"
+    else
+      bad_t "\`whoami\` stays under 75% of the eager control" \
+            "${bwl}ms against ${bwc}ms = ${wpct}%. Startup has moved back toward the eager bundle: a module is being parsed that no longer needs to be."
+    fi
+  fi
   # Non-vacuity, checked and not assumed: the probe has to be a MULTI-module
   # verb or this arm grades the same thing T9 already does.
   LOADED=$(FIVE_LAZY_TRACE=1 "$BUNDLE" task ls 2>&1 >/dev/null \
