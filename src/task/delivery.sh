@@ -358,7 +358,7 @@ cmd_task_merge_audit() {
       # OR the same number asserted BARE — the extractor may have upgraded a bare
       # "PR #N" to `slug|N` off a URL elsewhere in the same text, so a number-only
       # match on the cited side would be too loose and an exact-only match too tight.
-      if printf '%s\n' "$tdeliv" | grep -qxF -e "$qref" -e "|${qref#*|}"; then
+      if grep -qxF -e "$qref" -e "|${qref#*|}" <<<"$tdeliv"; then
         origin="delivered"; deliv_n=$((deliv_n+1))
       else
         origin="cited"; cited_n=$((cited_n+1))

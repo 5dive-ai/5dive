@@ -1705,7 +1705,7 @@ $_body"
         # resolved (no API call), not refused, and not stamped. There is no question
         # about it for the gate to answer or decline: it is another task's delivery.
         # Skipped BEFORE the cap so five cited PRs cannot crowd out the real one.
-        if ! printf '%s\n' "$_deliv" | grep -qxF -e "$_qref" -e "|${_qref#*|}"; then
+        if ! grep -qxF -e "$_qref" -e "|${_qref#*|}" <<<"$_deliv"; then
           _txt_cited="${_txt_cited:+$_txt_cited,}${_qref#*|}"
           _txt_cited_q="${_txt_cited_q:+$_txt_cited_q$'\n'}${_qref}"
           continue
@@ -2070,7 +2070,7 @@ _task_start_preflight() {
   if [[ -n "$gerr" ]]; then
     # git refused to even look. The classic case is dubious ownership — EXACTLY
     # the wall Marcus hit on DIVE-1356 — so hand over the one-line fix.
-    if printf '%s' "$gerr" | grep -qi 'dubious ownership'; then
+    if grep -qi 'dubious ownership' <<<"$gerr"; then
       _pf "git refuses this repo (dubious ownership). Fix: git config --global --add safe.directory \"\$(pwd)\" — then retry your git commands."
     fi
     # Otherwise cwd just isn't a git repo → no repo checks apply; stay quiet.

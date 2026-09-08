@@ -215,7 +215,7 @@ broker_gate_check() {
   # the null hypothesis" as false positives (main, DIVE-2614 review). Any new
   # stem added here needs its own inflected forms added too, deliberately —
   # this list is maintained by hand, not enforced by the pattern.
-  if printf '%s' "$gverdict" | grep -qiE '^\s*(no|reject|rejected|deny|denied|block|blocked)\b'; then
+  if grep -qiE '^\s*(no|reject|rejected|deny|denied|block|blocked)\b' <<<"$gverdict"; then
     audit_log "${surface} gate" error "$E_VALIDATION" -- "ident=${ident}" "line=${gverdict}"
     fail "$E_VALIDATION" "gate on ${ident} was REJECTED ('${ganswer}') — ${noun} refused.${from_note}"
   fi

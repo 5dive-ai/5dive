@@ -281,7 +281,7 @@ _push_author_scan() {
     # repo with an author policy lands HERE. Hand it the fix instead of a wall —
     # the mitigation must not live as tribal knowledge (main's call).
     local seeded_hint=""
-    if printf '%s\n' "$offenders" | grep -q '@agents\.noreply\.5dive\.ai>'; then
+    if grep -q '@agents\.noreply\.5dive\.ai>' <<<"$offenders"; then
       local a_name a_email; a_name="${author%% <*}"; a_email="${author##*<}"; a_email="${a_email%>}"
       seeded_hint=" NOTE: the address above is the SYNTHETIC identity 5dive provisioning gives an agent user (DIVE-2051) — deliberate, not a mistake, but not an author this repo accepts. Set the repo-local author once in the checkout you commit from, then re-author:  git -C <your checkout> config user.name '${a_name}' && git -C <your checkout> config user.email '${a_email}'"
     fi

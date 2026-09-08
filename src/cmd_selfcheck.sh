@@ -1099,7 +1099,7 @@ cmd_selfcheck() {
     local p
     IFS=',' read -r -a run <<< "$only"
     for p in "${run[@]}"; do
-      printf '%s\n' "${SELFCHECK_PROBES[@]}" | grep -qx "$p" \
+      grep -qx "$p" < <(printf '%s\n' "${SELFCHECK_PROBES[@]}") \
         || fail "$E_USAGE" "selfcheck: unknown probe '$p' (see: 5dive selfcheck --list)"
     done
   else
