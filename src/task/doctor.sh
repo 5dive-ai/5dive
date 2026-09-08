@@ -50,13 +50,23 @@
 # Measured 2026-08-28 on this host: 4 of 17 registered agents carry no heartbeat
 # key at all, and one of them held an open row.
 #
-# THE SECOND HALF: `desiredState`. An operator-stopped seat (`desiredState:
-# "stopped"`) IS iterated by the wake loop and the wake then FAILS — the tick logs
-# "wake failed — will retry next tick" and moves on, forever. That is a different
-# mechanism from the heartbeat key and the same outcome for the row, so it is the
-# same finding. It is deliberately NOT treated as a registry error: an operator
-# stopped that seat on purpose, and the honest report is "these rows are parked on
-# a seat you turned off", not "your registry is broken".
+# `heartbeat.enabled == true` IS THE WHOLE GATE — because it is the whole gate the
+# tick uses. `_hb_wake` (cmd_heartbeat.sh) never reads `desiredState`: on an
+# iterated seat it runs `systemctl is-active` and STARTS a unit that is down. So a
+# seat is woken by the tick if and only if it is in that population, and that
+# population is `heartbeat.enabled == true` alone (DIVE-4071).
+#
+# WHY `desiredState=stopped` IS NOT FOLDED IN HERE (it used to be, and it was
+# wrong). The old comment claimed an operator-stopped seat "IS iterated by the
+# wake loop and the wake then FAILS". It does not fail: the tick still iterates it
+# (`cmd_stop` sets `desiredState=stopped` but leaves `heartbeat.enabled` untouched)
+# and `_hb_wake` STARTS the stopped unit — so the row dispatches. Reporting that as
+# `dead-lane` was a FALSE finding whose printed remedy (`task assign`) re-points a
+# row off a seat that is actively working it. Any seat started outside
+# `5dive agent start` — a manual `systemctl start`, a crash-loop recovery — carries
+# `desiredState=stopped` with a live unit and manufactured that false finding.
+# (The tick overriding an operator's stop is a real anomaly, but a DIFFERENT one:
+# it is not "nothing wakes this lane", so it does not belong in this predicate.)
 #
 # Returns 2 (NOT 1) when the registry could not be read, so the caller can tell
 # "this seat is dead" from "I could not find out" and degrade instead of
@@ -66,12 +76,11 @@ _task_doctor_lane_wakeable() {
   [[ -n "$name" ]] || return 2
   reg="${STATE_DIR:-/var/lib/5dive}/agents.json"
   [[ -r "$reg" ]] || return 2
-  # ONE jq read for both facts: an agent absent from the file yields "false|running",
+  # The tick's exact population: an agent absent from the file yields "false",
   # which is correctly not wakeable and needs no separate existence probe.
-  v=$(jq -r --arg n "$name" '((.agents[$n].heartbeat.enabled // false)|tostring) + "|" + (.agents[$n].desiredState // "running")' "$reg" 2>/dev/null) || return 2
+  v=$(jq -r --arg n "$name" '(.agents[$n].heartbeat.enabled // false)|tostring' "$reg" 2>/dev/null) || return 2
   [[ -n "$v" ]] || return 2
-  [[ "${v%%|*}" == "true" ]] || return 1
-  [[ "${v##*|}" != "stopped" ]]
+  [[ "$v" == "true" ]]
 }
 
 # The four classes, as SQL predicates over open standard rows. Kept as one
@@ -136,7 +145,7 @@ _task_doctor_explain() {
     stale-edge)   printf '%s' "blocked by rows that are ALL closed — a stale edge the cascade missed. -> 5dive task unblock <id>" ;;
     wake-passed)  printf '%s' "parked, and its wake time has already passed — the heartbeat TTL pass should have unparked it. -> 5dive task unpark <id>  (NOT unblock: unblock only drops edges, and a park has none, so it reports success and changes nothing)" ;;
     park-no-wake) printf '%s' "parked with NO wake time — it will never revisit itself. -> 5dive task unpark <id>, or re-park with a --wake" ;;
-    dead-lane)    printf '%s' "assigned to a seat nothing wakes (no heartbeat, or operator-stopped) — nothing will pick it up. -> 5dive task assign <id> <agent>   (roster: 5dive agent list)" ;;
+    dead-lane)    printf '%s' "assigned to a seat the heartbeat tick never wakes (heartbeat disabled or absent) — nothing will pick it up. -> 5dive task assign <id> <agent>   (roster: 5dive agent list)" ;;
     dead-verifier) printf '%s' "GRADER nothing wakes: this row dispatches fine and STRANDS AT HANDOFF, not now — \`task done\` writes assignee=<verifier>, so the maker spends the whole task first and the delivery goes to a seat no tick will ever iterate. -> 5dive task verifier <id> <agent>   (roster: 5dive agent list)" ;;
     *)            printf '%s' "undispatchable" ;;
   esac
