@@ -325,8 +325,15 @@ t "T7f ...and voice resolves from it" "yes" \
   "$(_plugin_source_dir 5dive voice >/dev/null 2>&1 && echo yes || echo no)"
 t "T7g ...as an official plugin, so it is the one thing that installs today" "official" \
   "$(jq -r '.fivedive.trust.review' "$(_plugin_source_dir 5dive voice)/.claude-plugin/plugin.json")"
-t "T7h ...declaring channel, the shape browser will copy" '["channel"]' \
+# DIVE-4035 added `verb` here. Kept as an EXACT set rather than an `index("channel")`
+# containment check on purpose: voice is the reference implementation, so the arm's
+# job is to notice when the reference shape changes at all, and a containment check
+# would have let `verb` in silently — which is the drift a reference implementation
+# is least able to afford.
+t "T7h ...declaring channel + verb, the shape browser will copy" '["channel","verb"]' \
   "$(jq -c '.fivedive.capabilities' "$(_plugin_source_dir 5dive voice)/.claude-plugin/plugin.json")"
+t "T7i ...and shipping the executable its verb resolves to (DIVE-4035)" "yes" \
+  "$([[ -x "$(_plugin_source_dir 5dive voice)/bin/voice" ]] && echo yes || echo no)"
 
 # =============================================================================
 # §7.2 — discovery folds into `market`; it does not become a fourth silo
