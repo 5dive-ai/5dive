@@ -244,7 +244,7 @@ _SUP_RESTART_VERIFY_SEC="${SUPERVISOR_RESTART_VERIFY_SEC:-30}"
 # agent-<n>` FAILS OPEN on a 5dive-only sudo grant ("a password is required"
 # exits like a real zero) so plain pgrep is used — the process table is
 # world-readable; `5dive agent info`'s verdict is CACHED and cannot be a check.
-declare -A _SUP_TRUE_POLLER_PAT=(
+declare -gA _SUP_TRUE_POLLER_PAT=(
   [claude]='bun ([^ ]*/)?(start|server)\.ts'
   [codex]='bun ([^ ]*/)?(start|server)\.ts'
   [grok]='bun ([^ ]*/)?(start|server)\.ts'
@@ -327,7 +327,7 @@ _SUP_VERIFY_PAT="${SUPERVISOR_VERIFY_PAT:-}"
 # `bun run --cwd <plugin> … start` — every non-claude plugin dir is
 # telegram-<name>, so the dir name is a unique, argv-stable match. A type
 # absent here has no probeable bridge -> poller stays "n/a" (never classifies).
-declare -A _SUP_POLLER_PAT=(
+declare -gA _SUP_POLLER_PAT=(
   [claude]='5dive-plugins/telegram'
   [codex]='telegram-codex'
   [grok]='telegram-grok'
@@ -339,7 +339,7 @@ declare -A _SUP_POLLER_PAT=(
 # is under the agent's $HOME; find-args select the append-on-progress transcript
 # files so the newest mtime IS the last-token-progress time (see header). A type
 # absent here (or a missing/empty root) => age unknown => never stuck.
-declare -A _SUP_ACTIVITY_PROBE=(
+declare -gA _SUP_ACTIVITY_PROBE=(
   [claude]=".claude/projects|-name *.jsonl"
   [codex]=".codex/sessions|-name rollout-*.jsonl"
   [grok]=".grok/sessions|( -name *.json -o -name *.sqlite* )"
