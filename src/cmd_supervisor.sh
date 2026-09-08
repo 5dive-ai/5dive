@@ -667,6 +667,54 @@ _sup_quota_escalate_after() {  # <kind> <resume_epoch|""> <first_alert_epoch> ->
   printf '%s' $(( first + _SUP_SELFHEAL_SOON_H * 3600 ))
 }
 
+# DIVE-4097 (iteration 2): "is this wall STILL promising to fix itself?", asked
+# of the CURRENT wall text rather than of the episode's opening one. Pure.
+#
+# WHY IT EXISTS. Both doors computed their horizon from the EPISODE's first
+# alert, read at that alert's own clock, and a dated reset read at that clock
+# can never land later than the day the episode opened. So any wall that lasts
+# more than a day — or re-walls inside the 36h continuity gap — is promoted to
+# "hard wall, rotate the profile or authorise the spend" no matter what the seat
+# is currently being told. Measured twice: codex 13:22Z (door 2, the page that
+# opened this row) and quinn 19:50Z (door 1, episode 53h old, current text
+# naming a reset 2h09m in the FUTURE, promoted anyway).
+#
+# The rule both doors now share: a parsed reset still ahead of us is
+# self-healing BY DEFINITION, whatever the episode's age. A hard wall therefore
+# additionally requires a deadline that is absent, unparseable, or already PAST.
+# Only a `clock` reading carries a deadline at all — `soon`/`week` name none, so
+# they keep the episode horizon they have always had and this returns false for
+# them, which is the LOUD side.
+_sup_quota_reset_pending() {  # <kind> <resume_epoch|""> <now> -> true|false
+  local kind="${1:-no}" ep="${2:-}" now="${3:-}"
+  [[ "$kind" == "clock" && "$ep" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ ]] \
+    || { printf 'false'; return 0; }
+  if (( now < ep )); then printf 'true'; else printf 'false'; fi
+}
+
+# DIVE-4097 (iteration 2): DOOR 1's expiry decision, split out of the alert loop
+# so it is gradeable at all. It was inline, and "the same correction is owed to
+# door 1" (quinn) could not otherwise be pinned by an arm — door 1 is the leg
+# that actually rang the phone at 19:50Z.
+#
+# Semantics are DIVE-3970's, unchanged, plus one clause:
+#   - nothing was muted then and nothing reads self-healing now -> nothing to
+#     expire (an ordinary loud wall must not gain a second alert);
+#   - the episode's horizon has to have been REACHED;
+#   - NEW: and the wall must not still be promising a reset. A parsed future
+#     reset is self-healing by definition, so it holds the expiry shut however
+#     old the episode is. A lapsed clock reads `no`, so a wall that stops
+#     resetting expires on the very next tick.
+_sup_quota_expired() {  # <ep_muted> <cur_kind> <cur_resume|""> <ep_due|""> <now> -> true|false
+  local muted="${1:-false}" kind="${2:-no}" kep="${3:-}" due="${4:-}" now="${5:-}"
+  [[ "$muted" == "true" || "$kind" != "no" ]] || { printf 'false'; return 0; }
+  [[ "$due" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ ]] || { printf 'false'; return 0; }
+  (( now >= due )) || { printf 'false'; return 0; }
+  [[ "$(_sup_quota_reset_pending "$kind" "$kep" "$now")" == "true" ]] \
+    && { printf 'false'; return 0; }
+  printf 'true'
+}
+
 # DIVE-3970 (iteration 2): the first alert of the unbroken run of alerts this
 # wall belongs to — the EPISODE — and that alert's stored signals.
 # Echoes "<epoch>\x1f<signals-json>", both empty when the seat has no prior
@@ -737,8 +785,8 @@ _sup_quota_episode_first() {  # <agent> <class> -> "<epoch>\x1f<signals-json>"
 # `first`/`sig` are the wall EPISODE's opening alert and its stored signals;
 # `last` is the newest alert of that episode, which is what makes the episode
 # CURRENT rather than merely long.
-_sup_quota_hold_live() {  # <ep_first_epoch> <ep_signals> <last_alert_epoch> <now> -> true|false
-  local first="${1:-}" sig="${2:-}" last="${3:-}" now="${4:-}"
+_sup_quota_hold_live() {  # <ep_first> <ep_signals> <last_alert_epoch> <now> [last_signals]
+  local first="${1:-}" sig="${2:-}" last="${3:-}" now="${4:-}" lsig="${5:-}"
   [[ "$first" =~ ^[0-9]+$ && "$last" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ ]] \
     || { printf 'false'; return 0; }
   # A wall we have not SEEN inside the episode-continuity gap is not a wall we
@@ -747,10 +795,31 @@ _sup_quota_hold_live() {  # <ep_first_epoch> <ep_signals> <last_alert_epoch> <no
   # walled again, or not walled at all. Errs LOUD — a stale episode releases the
   # hold and the ladder escalates exactly as it does today.
   (( now - last > _SUP_EPISODE_GAP_H * 3600 )) && { printf 'false'; return 0; }
-  # Read the episode's self-heal shape AT ITS OWN CLOCK, never at `now`: a
-  # deadline it named has lapsed by construction if we are asking late, and
-  # re-reading at `now` answers `no` and erases the promise the hold is owed to
-  # (the trap DIVE-3970 iteration 3 measured).
+  # ITERATION 2. The NEWEST alert of the episode is asked first, and it is asked
+  # AT ITS OWN FILING TIME (`last`), not at `now` and not at `first`. That is
+  # the only reading that can say what the seat is being told TODAY: the
+  # episode's opening text is a promise about a day that may be long gone, which
+  # is exactly how a 53h-old episode with a live future reset got promoted to a
+  # hard wall (quinn, 19:50Z). Reading it at its own clock also keeps the
+  # DIVE-3970 iteration-3 trap shut — we never re-read an OLD text at a NEW
+  # clock, which is the read that answers `no` and erases a promise.
+  local lkind lep
+  if [[ -n "$lsig" ]]; then
+    IFS=$'\x1f' read -r lkind lep <<<"$(_sup_quota_selfheal "$lsig" "$last")"
+    # A reset still ahead of us is self-healing whatever the episode's age.
+    [[ "$(_sup_quota_reset_pending "$lkind" "$lep" "$now")" == "true" ]] \
+      && { printf 'true'; return 0; }
+    # A dated wall whose named reset has PASSED and which is still walled is the
+    # hard wall this hold exists not to hide — page, regardless of the episode.
+    [[ "$lkind" == "clock" ]] && { printf 'false'; return 0; }
+    # An unrecognised refusal keeps door 1's human leg armed, so door 2 must not
+    # be quieter than door 1.
+    [[ "$lkind" == "no" ]] && { printf 'false'; return 0; }
+    # `soon` / `week` name no deadline: they fall through to the episode horizon
+    # below, which is the only clock they have ever had.
+  fi
+  # The episode's own shape, read AT ITS OWN CLOCK, never at `now` — same reason
+  # as above, and the only path left when the newest alert stored no signature.
   local kind ep
   IFS=$'\x1f' read -r kind ep <<<"$(_sup_quota_selfheal "$sig" "$first")"
   # `no` is an UNRECOGNISED refusal, not a benign one. Door 1 leaves the human
@@ -769,12 +838,21 @@ _sup_quota_hold() {  # <name> <now_epoch> -> true|false
   local name="${1:-}" now="${2:-}" ep_ts ep_row last
   IFS=$'\x1f' read -r ep_ts ep_row <<<"$(_sup_quota_episode_first "$name" 'quota-exhausted')"
   [[ "$ep_ts" =~ ^[0-9]+$ ]] || { printf 'false'; return 0; }
-  last=$(db "SELECT CAST(strftime('%s', MAX(ts)) AS INTEGER)
-             FROM supervisor_events
-             WHERE agent=$(sqlq "$name") AND event='alert'
-               AND classification='quota-exhausted';" 2>/dev/null || echo "")
-  local sig; sig=$(jq -r '.signals.quotaSignature // ""' <<<"$ep_row" 2>/dev/null || echo "")
-  _sup_quota_hold_live "$ep_ts" "$sig" "$last" "$now"
+  # The newest alert's ts AND its signals in one row: iteration 1 took only
+  # MAX(ts) here, so the decision could never see what the seat is being told
+  # now — the whole of blocker 1.
+  local last_row lrow=""
+  last_row=$(db "SELECT CAST(strftime('%s', ts) AS INTEGER) || char(31) ||
+                        REPLACE(COALESCE(signals, ''), char(10), ' ')
+                 FROM supervisor_events
+                 WHERE agent=$(sqlq "$name") AND event='alert'
+                   AND classification='quota-exhausted'
+                 ORDER BY id DESC LIMIT 1;" 2>/dev/null || echo "")
+  IFS=$'\x1f' read -r last lrow <<<"$last_row"
+  local sig lsig
+  sig=$(jq -r '.signals.quotaSignature // ""' <<<"$ep_row" 2>/dev/null || echo "")
+  lsig=$(jq -r '.signals.quotaSignature // ""' <<<"$lrow" 2>/dev/null || echo "")
+  _sup_quota_hold_live "$ep_ts" "$sig" "$last" "$now" "$lsig"
 }
 
 # DIVE-3272: does this agent's live pane show a capacity refusal? Root-only (the
@@ -2337,11 +2415,13 @@ cmd_supervisor_tick() {
     # DIVE-3940/3970: a confirmed self-healing quota wall mutes the human leg
     # only — the machine leg + audited row still fire (main triages; DIVE-3272
     # cover unchanged). Both reads are guarded so non-quota rows spend no jq.
-    local qdl="unknown" qsig="" qkind="no"
+    local qdl="unknown" qsig="" qkind="no" qkep=""
     if [[ "$cls" == "quota-exhausted" ]]; then
       qdl=$(jq -r '.signals.quotaDeadline // "unknown"' <<<"$row")
       qsig=$(jq -r '.signals.quotaSignature // ""' <<<"$row")
-      IFS=$'\x1f' read -r qkind _ <<<"$(_sup_quota_selfheal "$qsig" "$now_s")"
+      # DIVE-4097 it.2: the resume epoch is KEPT, not discarded. It is what
+      # tells the expiry below that this wall is still promising to fix itself.
+      IFS=$'\x1f' read -r qkind qkep <<<"$(_sup_quota_selfheal "$qsig" "$now_s")"
     fi
     local prev_alert
     # Dedup is scoped BY CLASS (DIVE-3272): a seat can be both quota-walled and
@@ -2412,10 +2492,15 @@ cmd_supervisor_tick() {
         # expire, and a horizon computed anyway would turn an ordinary loud
         # wall into a second alert. (Without this the widened entry above would
         # regress exactly that.)
-        if [[ "$ep_muted" == "true" || "$qkind" != "no" ]]; then
-          ep_due=$(_sup_quota_escalate_after "$ep_kind" "$ep_kep_use" "$ep_ts")
-          [[ "$ep_due" =~ ^[0-9]+$ ]] && (( now_s >= ep_due )) && persisted="true"
-        fi
+        # DIVE-4097 it.2, and the correction door 2 owes door 1: this horizon is
+        # read at the EPISODE's clock, so a dated reset in it can never land
+        # later than the day the episode opened — every wall older than a day
+        # expired into "hard wall, rotate the profile or authorise the spend" no
+        # matter what the seat was currently being told. Measured on quinn at
+        # 19:50Z: episode 53h old, current text naming a reset 2h09m AHEAD,
+        # promoted anyway. _sup_quota_expired carries that clause and is graded.
+        ep_due=$(_sup_quota_escalate_after "$ep_kind" "$ep_kep_use" "$ep_ts")
+        persisted=$(_sup_quota_expired "$ep_muted" "$qkind" "$qkep" "$ep_due" "$now_s")
       fi
       if (( prev_alert > 0 )); then
         # Deduped by the window, but the mute may have expired MID-window (a
