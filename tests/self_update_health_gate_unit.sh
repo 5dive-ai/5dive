@@ -454,7 +454,7 @@ fi
 #   `_agent_busy_state`/`_agent_is_parked` report as not-idle and parked, so the
 #   candidate loop's own guards are reachable too.
 hg_loop(){
-  local tag="$1" expr="$2" newl="$3" rcneed="${4:-0}" busylist="${5:-}" parkedlist="${6:-}" rbdir="${7:-}" mutated d
+  local tag="$1" expr="$2" newl="$3" rcneed="${4:-0}" busylist="${5:-}" parkedlist="${6:-}" rbdir="${7:-}" deathmode="${8:-crash}" dying="${9:-a1}" unsteady="${10:-}" mutated d
   d="$WORK/loop-$tag"
   rm -rf "$d"; mkdir -p "$d/bin" "$d/sysd" "$d/sbin" "$d/fake/u" "$d/homes"
   local u n
@@ -472,12 +472,24 @@ hg_loop(){
   # while the BAD launcher is installed, and comes back once the good one is
   # restored. The unit's behaviour is a FUNCTION of the artifact, so a rollback
   # that does not actually replace the bytes cannot read as a recovery.
-  cat > "$d/fake/u/5dive-agent@a1.service/on_restart" <<'ORS'
+  for n in ${unsteady//,/ }; do printf 'activating\n' > "$d/fake/u/5dive-agent@$n.service/ActiveState"; done
+  cat > "$d/fake/u/5dive-agent@$dying.service/on_restart" <<'ORS'
 if grep -q BAD "$HG_BIN/5dive-agent-start" 2>/dev/null; then
   n="$(cat "$FK/u/$UNIT/NRestarts" 2>/dev/null)"; [[ "$n" =~ ^[0-9]+$ ]] || n=0
   printf '%s\n' "$((n + 1))" > "$FK/u/$UNIT/NRestarts"
 fi
 ORS
+  # `blind`: the unit does not crash, systemd just stops answering about it after
+  # the bounce. That is the UNKNOWN verdict, and it must HALT without reverting —
+  # absence of evidence of health is not evidence of breakage. Id stays readable,
+  # which is the positive control that separates the two.
+  if [[ "$deathmode" == "blind" ]]; then
+    cat > "$d/fake/u/5dive-agent@$dying.service/on_restart" <<'ORS2'
+: > "$FK/u/$UNIT/ActiveState"
+: > "$FK/u/$UNIT/SubState"
+: > "$FK/u/$UNIT/NRestarts"
+ORS2
+  fi
   cat > "$d/sbin/systemctl" <<'STUB2'
 #!/usr/bin/env bash
 FK="$SYSTEMCTL_FAKE"
@@ -804,6 +816,69 @@ elif [[ "$rc" == 0 || "$(hg_restarted_units lonlyunreadmut)" != 5dive-agent@a1.s
   ok_t "MUTANT KILLED — treating an unreadable manifest as 'unchanged' skips the probe (rc=$rc restarted=[$(hg_restarted_units lonlyunreadmut)])"
 else
   bad_t "MUTANT SURVIVED — unreadable treated as unchanged" "the launcher-only probe is skipped on exactly the box that cannot answer"
+fi
+
+# 9c. The HALT consumer, driven. `_hg_action`'s asymmetry is graded four ways in
+# section 3 and its unknown->halt arm has a mutant, but the CONSUMER of a halt —
+# the block that must warn, revert NOTHING, and still stop the pass — was entered
+# by no driven arm. It is the third of the three outcomes this row turns on, and
+# the one where getting it wrong (reverting) freezes a box off updates forever.
+hg_loop lonlyblind "" BAD-LAUNCHER 1 "" "" "" blind
+d="$WORK/loop-lonlyblind"
+eq_t "HALT: a canary systemd stops answering about still stops the pass (non-zero)" \
+  "$( [[ "$(cat "$d/rc" 2>/dev/null)" == 0 ]] && echo zero || echo non-zero )" non-zero
+eq_t "HALT: the blast radius is still one — agents two and three are never reached" \
+  "$(hg_restarted_units lonlyblind)" 5dive-agent@a1.service
+eq_t "HALT: NOTHING is reverted on an unreadable box — the new launcher stays on disk" \
+  "$(cat "$d/bin/5dive-agent-start" 2>/dev/null)" BAD-LAUNCHER
+eq_t "HALT: and the new bundle stays too — a halt is not a rollback" \
+  "$(cat "$d/bin/5dive" 2>/dev/null)" NEW-BUNDLE
+grep -q 'INCONCLUSIVE' "$d/out" \
+  && ok_t "HALT: the operator is told the box could not be read, not that it was rolled back" \
+  || bad_t "the halt was not reported as inconclusive" "$(tail -n3 "$d/out")"
+# The mutant is the TRIGGER-HAPPY direction, which this file names as the worse
+# one: treat every non-proceed verdict as a rollback and a box systemd merely
+# would not talk about gets a good release reverted under it.
+hg_loop lonlyblindmut 's/if \[\[ "$hg_action" == "rollback" \]\]; then/if true; then/' \
+  BAD-LAUNCHER 1 "" "" "" blind
+if [[ "$(cat "$WORK/loop-lonlyblindmut/rc" 2>/dev/null)" == "MUTATION-DID-NOT-APPLY" ]]; then
+  bad_t "MUTATION DID NOT APPLY — halt treated as rollback" "sed matched nothing"
+elif [[ "$(cat "$WORK/loop-lonlyblindmut/bin/5dive-agent-start" 2>/dev/null)" != BAD-LAUNCHER ]]; then
+  ok_t "MUTANT KILLED — treating a halt as a rollback reverts a release on a box that was merely unreadable"
+else
+  bad_t "MUTANT SURVIVED — halt treated as rollback" "nothing grades the difference between halting and reverting"
+fi
+
+# 9d. The last consumer inside the restart loop: an agent that was ALREADY
+# unsteady before the update. `_hg_canary_ok` is graded at the helper in 5b, but
+# its caller's answer — restart that agent ORDINARILY and let the NEXT one take
+# the canary role — was entered by no driven arm. Believing a sick unit is the one
+# way this gate makes a night worse than it found it: it reverts a good release
+# for the whole box on one independently broken agent.
+hg_loop notacanary "" BAD-LAUNCHER 0 "" "" "" crash a2 a1
+d="$WORK/loop-notacanary"
+grep -q 'not using a1 as the health-gate canary' "$d/out" \
+  && ok_t "a unit that was not steady BEFORE the update is refused as an instrument, out loud" \
+  || bad_t "the unsteady unit was used as a canary" "$(tail -n3 "$d/out")"
+eq_t "the sick agent is still restarted ORDINARILY and the NEXT agent takes the canary role — a3 is never reached" \
+  "$(hg_restarted_units notacanary)" "5dive-agent@a1.service,5dive-agent@a2.service"
+eq_t "the release is judged on the agent that could answer: bytes reverted" \
+  "$(cat "$d/bin/5dive-agent-start" 2>/dev/null)" GOOD-LAUNCHER
+eq_t "and the pass exits non-zero" \
+  "$( [[ "$(cat "$d/rc" 2>/dev/null)" == 0 ]] && echo zero || echo non-zero )" non-zero
+# The mutant is the CONSUMER's own branch (the validity check itself lives in the
+# extracted block, which this driver runs as shipped bytes): if `not-a-canary` is
+# not distinguished from `restart-refused`, the sick agent is never restarted at
+# all and is logged as a failed restart — it silently stays on the old payload,
+# which is the DIVE-4033 shape this row must not reintroduce.
+hg_loop notacanarymut 's/^        if \[\[ "$hg_verdict_raw" == "not-a-canary" \]\]; then$/        if false; then/' BAD-LAUNCHER 0 "" "" "" crash a2 a1
+u="$(hg_restarted_units notacanarymut)"
+if [[ "$(cat "$WORK/loop-notacanarymut/rc" 2>/dev/null)" == "MUTATION-DID-NOT-APPLY" ]]; then
+  bad_t "MUTATION DID NOT APPLY — the canary validity check removed" "sed matched nothing"
+elif [[ "$u" != "5dive-agent@a1.service,5dive-agent@a2.service" ]]; then
+  ok_t "MUTANT KILLED — conflating 'not an instrument' with 'systemctl refused' leaves the sick agent unrestarted and mislogged (restarted=[$u])"
+else
+  bad_t "MUTANT SURVIVED — the not-a-canary fall-through removed" "an agent left on the old payload and logged as a failed restart is graded by nothing"
 fi
 
 # --- MUTANT of the second sample (helper, but only reachable from 6c) --------
