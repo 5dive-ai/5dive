@@ -69,6 +69,22 @@ parked() {
     if _agent_is_parked "$name"; then echo yes; else echo no; fi
   )
 }
+# Same, with jq unreachable. `command -v jq || return 1` was the ONE unknown
+# reading with no arm: flipping it to `return 0` (a missing tool reads as parked)
+# is a fleet-wide freeze from an unrelated cause, and it survived every arm.
+parked_nojq() {
+  local body="$1" name="${2:-}"
+  (
+    mkdir -p "$WORK/emptybin"
+    # Shadowing PATH is the POINT — it is how a box with no jq is reproduced
+    # without uninstalling anything. Scoped to this subshell.
+    # shellcheck disable=SC2123
+    PATH="$WORK/emptybin"
+    REGISTRY="$WORK/agents.json"; printf '%s' "$body" > "$REGISTRY"
+    eval "$block"
+    if _agent_is_parked "$name"; then echo yes; else echo no; fi
+  )
+}
 STOPPED='{"agents":{"katya":{"desiredState":"stopped"},"nova":{"desiredState":"running"}}}'
 
 if [[ "$(parked "$STOPPED" katya)" == yes ]]; then
@@ -101,6 +117,16 @@ if [[ "$(parked '{"agents":{"katya":{"desiredSt' katya)" == no ]]; then
 else
   bad_t "corrupt JSON read as parked" "FREEZES on a partially-written registry"
 fi
+if [[ "$(parked_nojq "$STOPPED" katya)" == no ]]; then
+  ok_t "NEGATIVE CONTROL: with jq unreachable an explicitly-stopped agent still restarts (a missing tool is unknown, not parked)"
+else
+  bad_t "no jq read as parked" "FREEZES: a box without jq would skip its whole fleet forever"
+fi
+if [[ "$(parked_nojq "$STOPPED" katya)" == no ]] && [[ "$(parked "$STOPPED" katya)" == yes ]]; then
+  ok_t "and that arm is discriminating — the SAME registry and name park with jq present"
+else
+  bad_t "the no-jq arm passes for the wrong reason" "it would pass even if the helper never parked anything"
+fi
 if [[ "$(parked "$STOPPED" "")" == no ]]; then
   ok_t "an empty name is not parked (no accidental match on a nameless unit)"
 else
@@ -132,8 +158,8 @@ fi
 export PENDING_RESTART_DIR="$WORK/pending"
 mk() { ( eval "$sweepblock"; _pending_restart_mark "$@" ); }
 
-sweep_with() { # <registry-json-or-MISSING>
-  local body="$1"
+sweep_with() { # <registry-json-or-MISSING> [unit-active:yes|no]
+  local body="$1" active="${2:-yes}"
   (
     if [[ "$body" == MISSING ]]; then REGISTRY="$WORK/no-such-registry.json"
     else REGISTRY="$WORK/agents.json"; printf '%s' "$body" > "$REGISTRY"; fi
@@ -141,7 +167,7 @@ sweep_with() { # <registry-json-or-MISSING>
     RESTARTS="$WORK/restarts"
     systemctl() {
       case "${1:-}" in
-        is-active) return 0 ;;                          # the unit IS running
+        is-active) [[ "$active" == yes ]] ;;             # the unit IS running
         show)      printf '\n' ;;                       # no ActiveEnterTimestamp => 0
         restart)   printf '%s\n' "${2:-}" >> "$RESTARTS" ;;
         *)         return 0 ;;
@@ -158,11 +184,53 @@ RESTARTS="$WORK/restarts"
 
 rm -rf "$PENDING_RESTART_DIR"; mk katya "payload changed" >/dev/null; : > "$RESTARTS"
 out="$(sweep_with "$STOPPED")"
-if [[ "$out" == "fired=0 parked=1 cleared=0 deferred=0" ]] && [[ ! -s "$RESTARTS" ]] \
-   && [[ ! -f "$PENDING_RESTART_DIR/katya" ]]; then
-  ok_t "POSITIVE CONTROL: a parked agent's owed restart is DROPPED, not fired — no systemctl restart issued"
+if [[ "$out" == "fired=0 parked=1 cleared=0 deferred=0" ]] && [[ ! -s "$RESTARTS" ]]; then
+  ok_t "POSITIVE CONTROL: a parked agent is not bounced — no systemctl restart issued"
 else
   bad_t "the sweep restarted a parked agent" "sweep said '$out', restarts: $(tr '\n' ' ' < "$RESTARTS") — RESURRECTS"
+fi
+# ...and the debt SURVIVES the sweep. Clearing it here (iteration 1) meant the
+# `agent start` exit — a no-op on a live unit, it only flips the registry — left
+# the agent on the pre-update payload with nothing owed and nothing said.
+if [[ -f "$PENDING_RESTART_DIR/katya" ]]; then
+  ok_t "the owed restart is HELD, not destroyed — the marker survives the parked sweep"
+else
+  bad_t "the parked branch cleared the marker" "FREEZES: the debt is unrecoverable, and the agent stays on the old payload silently"
+fi
+
+# ---- the DISCRIMINATING pair: two sweeps, the registry edited between them ----
+# A one-sweep harness structurally cannot see the marker's fate. These arms run
+# the sweep twice with the operator's reconciliation in the middle, once per exit
+# the parked line names — and each is only reachable because the marker was kept.
+out2="$(sweep_with '{"agents":{"katya":{"desiredState":"running"}}}')"
+if [[ "$out2" == "fired=1 parked=0 cleared=0 deferred=0" ]] \
+   && grep -qx '5dive-agent@katya.service' "$RESTARTS" \
+   && [[ ! -f "$PENDING_RESTART_DIR/katya" ]]; then
+  ok_t "EXIT 1 ('the intent is stale'): after 'agent start' flips the registry, the NEXT sweep pays the held debt"
+else
+  bad_t "the owed restart never fired after the operator unparked the agent" \
+        "second sweep said '$out2', restarts: $(tr '\n' ' ' < "$RESTARTS") — FREEZES on the pre-update payload"
+fi
+
+rm -rf "$PENDING_RESTART_DIR"; mk katya "payload changed" >/dev/null; : > "$RESTARTS"
+out="$(sweep_with "$STOPPED")"
+out2="$(sweep_with "$STOPPED" no)"
+if [[ "$out" == "fired=0 parked=1 cleared=0 deferred=0" ]] \
+   && [[ "$out2" == "fired=0 parked=0 cleared=1 deferred=0" ]] \
+   && [[ ! -s "$RESTARTS" ]] && [[ ! -f "$PENDING_RESTART_DIR/katya" ]]; then
+  ok_t "EXIT 2 ('the stop is real'): once 'agent stop' takes the unit down the held marker is cleared, not fired"
+else
+  bad_t "holding the marker leaves a debt that can never be discharged" \
+        "sweeps said '$out' then '$out2', restarts: $(tr '\n' ' ' < "$RESTARTS")"
+fi
+# The held marker must not read as an ordinary deferral: nobody is waiting on a
+# task boundary, and an OVERDUE line would tell an operator to chase the agent.
+rm -rf "$PENDING_RESTART_DIR"; mk katya "payload changed" >/dev/null; : > "$RESTARTS"
+out="$(sweep_with "$STOPPED")"
+if [[ "$out" == *"deferred=0"* ]] && [[ "$out" == *"parked=1"* ]]; then
+  ok_t "a held parked debt counts as PARKED only — not folded into deferred/overdue"
+else
+  bad_t "the parked hold is reported as a deferral" "sweep said '$out'"
 fi
 
 rm -rf "$PENDING_RESTART_DIR"; mk nova "payload changed" >/dev/null; : > "$RESTARTS"
@@ -262,6 +330,31 @@ if grep -q '"parked_count":1' <<<"$(tr -d ' ' <<<"$out")"; then
   ok_t "the JSON carries parked/parked_count — the contradiction is machine-readable, not just prose"
 else
   bad_t "no parked_count in the self-update JSON" "output: $out"
+fi
+# self-update is the OTHER writer of this case, and it is the one the customer box
+# ran. Its parked branch must record the debt too — otherwise the marker the sweep
+# now holds never exists, and the whole hold above is unreachable from the nightly
+# path. The payload MOVED in this arm, so a restart is genuinely owed.
+if [[ -f "$WORK/pending-su/katya" ]]; then
+  ok_t "END TO END: self-update RECORDS the owed restart for the parked agent instead of dropping it"
+else
+  bad_t "self-update dropped the parked agent's owed restart" \
+        "the agent stays on the pre-update payload with nothing owed — the silent FREEZES direction"
+fi
+if [[ ! -f "$WORK/pending-su/nova" ]]; then
+  ok_t "the unparked agent was restarted outright, so it owes nothing (the marker is not written for everyone)"
+else
+  bad_t "a marker was written for the agent that already restarted" "it would be bounced a second time next sweep"
+fi
+
+# NEGATIVE CONTROL for that mark: parked, but the payload did NOT move. Nothing is
+# owed, so nothing may be recorded — marking unconditionally would bounce a
+# just-unparked agent for no reason, on every CLI-only night.
+out="$(self_update_with "$STOPPED" no)"
+if grep -q '"parked_count":1' <<<"$(tr -d ' ' <<<"$out")" && [[ ! -f "$WORK/pending-su/katya" ]]; then
+  ok_t "NEGATIVE CONTROL: parked with an UNCHANGED payload records no debt — the mark is conditional on the predicate"
+else
+  bad_t "self-update owed a restart for a payload that never moved" "output: $out"
 fi
 
 out="$(self_update_with MISSING yes)"

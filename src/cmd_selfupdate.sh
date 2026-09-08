@@ -407,7 +407,7 @@ _agent_is_parked() {
 # "skipped" on its own would read as a decision already taken.
 _parked_override_note() {
   local n="${1:-}"
-  printf "agent '%s' is RUNNING but the registry says desiredState=stopped — not restarting it, and not stopping it either. Reconcile: '5dive agent stop %s' if the stop is real, '5dive agent start %s' if the intent is stale." "$n" "$n" "$n"
+  printf "agent '%s' is RUNNING but the registry says desiredState=stopped — not restarting it, and not stopping it either. The owed restart is REMEMBERED, not dropped. Reconcile: '5dive agent stop %s' if the stop is real, '5dive agent start %s' if the intent is stale — start only flips the registry (systemctl start is a no-op on a live unit), and the next sweep is what bounces it onto the new payload." "$n" "$n" "$n"
 }
 # <<< DIVE-4033 an operator-parked agent stays parked
 
@@ -439,13 +439,26 @@ _pending_restart_sweep() {
     # whose unit is already down is the state the operator asked for, and
     # shouting about it every sweep would bury the case that is actually wrong.
     #
-    # The marker is CLEARED rather than held. Holding it would count a debt that
-    # can only be paid by resurrecting the agent, i.e. it would report as owed
-    # forever; and it is not owed either way — whichever exit the operator takes,
-    # the unit ends up stopped or restarted, and both load the new payload by
-    # construction. Same argument as the branch above, different reason.
+    # THE MARKER IS HELD, NOT CLEARED (iteration 2). Clearing it read as "both
+    # exits load the new payload by construction", and that is false for one of
+    # the two exits this branch prints: `5dive agent start` runs `systemctl
+    # start`, which is a NO-OP on an already-active unit (cmd_start, and this
+    # row's own body measured dev2 surviving one: uptime 4987s -> 4996s, session
+    # intact). It only flips desiredState back to "running" — so with the marker
+    # gone the agent keeps running the PRE-UPDATE payload with no marker, no
+    # counter and no line. That is exactly the silent FREEZES direction this fix
+    # exists to avoid, scoped to the one population the row is about.
+    #
+    # Held, each exit resolves itself on the next sweep with no new machinery:
+    #   `5dive agent stop`  -> the unit goes inactive -> the is-active guard
+    #                          above clears the marker; the debt is genuinely
+    #                          paid, since the next start loads the new payload.
+    #   `5dive agent start` -> desiredState=running -> this branch no longer
+    #                          fires and the normal decide/fire path bounces it.
+    # PARKED is its own counter and is NOT folded into DEFERRED/OVERDUE: it is a
+    # debt whose payment is blocked on an operator, not on a task boundary.
     if _agent_is_parked "$name"; then
-      _pending_restart_clear "$name"; _PR_PARKED=$((_PR_PARKED + 1))
+      _PR_PARKED=$((_PR_PARKED + 1))
       _pr_log "[$name] $(_parked_override_note "$name")"
       continue
     fi
@@ -507,7 +520,7 @@ cmd_self_update() {
   # timer being armed.
   _pending_restart_sweep || true
   (( _PR_FIRED )) && step "fired ${_PR_FIRED} restart(s) deferred by an earlier run"
-  (( _PR_PARKED )) && warn "${_PR_PARKED} owed restart(s) dropped — the agent(s) are parked (desiredState=stopped) but their units are running"
+  (( _PR_PARKED )) && warn "${_PR_PARKED} owed restart(s) HELD — the agent(s) are parked (desiredState=stopped) but their units are running; the bounce fires once the registry and the unit agree"
 
   # DIVE-3172: snapshot each running agent's in-memory payload BEFORE the
   # upgrade. It has to be taken here — after the upgrade there is nothing left
@@ -537,15 +550,37 @@ cmd_self_update() {
     # contradiction rather than "skipped (payload unchanged)" — which happens to
     # be true on a CLI-only night and would not be on the next one, when the same
     # parked agent gets bounced back to life with no line saying why.
-    if _agent_is_parked "$name"; then
-      warn "$(_parked_override_note "$name")"
-      parked+=("$name")
-      continue
-    fi
     after="$(_agent_payload_fingerprint "$(_agent_home "$name")")"
     # An agent whose type we cannot read is unmeasurable, which restarts — same
     # branch as a type with non-derivable config, so a registry miss is safe.
     atype=$(agent_type "$name" 2>/dev/null) || atype=""
+    if _agent_is_parked "$name"; then
+      warn "$(_parked_override_note "$name")"
+      parked+=("$name")
+      # Iteration 2. The fingerprint above is taken BEFORE this branch so the
+      # debt can be recorded, but the branch still short-circuits the payload
+      # predicate's own `continue` — the operator is told the contradiction, not
+      # "skipped (payload unchanged)", which happens to be true on a CLI-only
+      # night and would not be on the next one.
+      #
+      # Mark the pending restart when the payload actually moved. Dropping it
+      # here left the agent on the pre-update payload forever once the operator
+      # took the `agent start` exit (a no-op on a live unit — it flips the
+      # registry only), with nothing owed and nothing said. Marking is the same
+      # ledger DIVE-3173 already fires from: the very next sweep sees
+      # desiredState=running and bounces it.
+      #
+      # Conditional on the predicate on purpose: an unmarked parked agent whose
+      # payload never moved owes nothing, and marking it unconditionally would
+      # bounce a just-unparked agent for no reason. A marker we cannot WRITE is
+      # only warned about — restarting it here is the resurrection this row is
+      # about, so that fallback is not available on this branch.
+      if _agent_restart_needed "$before" "$after" "$atype"; then
+        _pending_restart_mark "$name" "payload changed while parked" \
+          || warn "could not record the owed restart for parked agent '$name' — it will stay on the old payload until it is restarted"
+      fi
+      continue
+    fi
     if ! _agent_restart_needed "$before" "$after" "$atype"; then
       step "skipped $name (payload unchanged)"
       skipped+=("$name")
@@ -618,10 +653,12 @@ cmd_self_update() {
   # DID move for these, the bounce is owed, and someone reading the nightly log
   # has to be able to see that it is outstanding rather than decided against.
   (( ${#deferred[@]} )) && prose+=", ${#deferred[@]} deferred (busy — bounce at next task boundary)"
-  # DIVE-4033: a parked agent is neither a skip nor a deferral — nothing is owed
-  # and nothing was decided. It is an operator contradiction that self-update
-  # declined to resolve, and the count is how it reaches someone reading the log.
-  (( ${#parked[@]} )) && prose+=", ${#parked[@]} left parked (desiredState=stopped but running — reconcile)"
+  # DIVE-4033: a parked agent is neither a skip nor a deferral. Nothing was
+  # decided — it is an operator contradiction that self-update declined to
+  # resolve — but where the payload moved the restart IS owed and is held in the
+  # DIVE-3173 ledger, so this must not read as "handled". The count is how the
+  # contradiction reaches someone reading the log.
+  (( ${#parked[@]} )) && prose+=", ${#parked[@]} left parked (desiredState=stopped but running — restart held, reconcile)"
   (( ${#failed[@]} )) && prose+=", ${#failed[@]} failed to restart"
   [[ "$listener_refreshed" == "true" ]] && prose+=", team-bot listener refreshed"
   # `skipped` and `deferred` are ADDITIVE — `restarted`/`failed` keep their exact
