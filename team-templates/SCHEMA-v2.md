@@ -43,6 +43,7 @@ agents:
 | `model` | enum/string | `opus\|sonnet\|haiku` (claude) or a provider model id. Applied via the existing `agent config set model=` path. |
 | `effort` | enum | `low\|medium\|high` → settings.json effortLevel. |
 | `reports_to` | string \| [string] | `name`(s) of this role's manager(s). Builds org-chart edges AND a generated "Reporting" block appended to instructions (who you answer to, who reports to you, reach them via `5dive agent send <name>`). Root role omits it. |
+| `loops` | [map] | Optional. Recurring work this role OWNS — see `loops:` below. Without it an imported team is a roster with nothing running (DIVE-4022). |
 | `goals` | [string] | Optional. Seeded into the shared task queue (`5dive task add --assignee=<name> --from=<manager>`) on first `up`, so the role starts with a backlog. |
 
 ### Reporting-line semantics
@@ -75,6 +76,94 @@ agents:
 - v1 (DIVE-98): schema v2 keys + `5dive export` + `5dive team import` wrapper + 2-3 curated templates here.
 - v2: LLM generator (business description → generated spec).
 - v3: visual org composer on the dashboard + community template marketplace.
+
+## `loops:` — the recurring work that makes a roster a company (DIVE-4022)
+
+`goals:` seeds a backlog ONCE, on first `up`. `loops:` declares the work that keeps
+coming back. A team imported without loops has agents, roles and reporting lines
+with nothing on the board — a roster that sits idle until someone hand-creates the
+work.
+
+A loop here is **not a new object**. It ends as exactly what `5dive loop install`
+produces: a `kind='recurring'` task template owned by one agent, cloned into a
+normal todo by the step-2 materializer on its cadence. Ownership is **per-agent**
+because that is how `5dive loop install --onto=<agent>` already models it.
+
+```yaml
+agents:
+  ceo:
+    loops:
+      # inline — a recurring task template written straight to the board
+      - id: weekly-priorities             # stable key (a-z0-9-), the reconcile key
+        title: "Re-set this week's top 3" # the recurring task's title
+        cron: "0 9 * * 1"                 # 5-field cron cadence
+        prompt: |                         # optional; folded into the task body
+          Review the board, pick three, assign owners.
+        ceiling: 200000                   # optional advisory tokens/run
+      # marketplace — installed via `5dive loop install`, which owns the registry
+      # fetch and the skill attach. Nothing about a pack is re-derived here.
+      - pack: ci-analyst
+        cron: "0 */4 * * *"               # optional; the pack carries its own cadence
+```
+
+| key | applies to | meaning |
+|---|---|---|
+| `id` | inline | Stable key, `a-z0-9-`. Required on an inline loop; the reconcile key. |
+| `title` | inline | The recurring task's title. Required on an inline loop. |
+| `cron` | both | 5-field cadence. Required inline; on a `pack:` it overrides the pack's own. |
+| `prompt` | inline | Optional brief, folded into the task body so every materialized run carries it. |
+| `ceiling` | both | Optional advisory tokens/run, recorded for visibility. Bind spend hard with `5dive usage budget`. |
+| `pack` | pack | A slug from the `5dive-ai/loops` registry. Mutually exclusive with `title`/`prompt`. |
+
+### Idempotency
+`up` is declarative and re-runnable, so a second import must **find** its loops, not
+add a second copy. A loop is considered present when the target agent already owns a
+`kind='recurring'` row whose body carries this loop's marker (`declared loop: <id>
+(5dive.yaml)` or `installed loop: <slug> (5dive marketplace)`) **or** whose title
+matches exactly. The title arm matters because `5dive export` also dumps recurring
+work created by hand or by `loop install`, which carries no declared-loop marker.
+
+Loops reconcile over the **whole declared roster on every `up`**, not only over
+agents created this run — otherwise adding a `loops:` block to a company you already
+imported and re-running `up` would do nothing.
+
+### Failure posture
+A loop that will not install does **not** fail the import and does **not** count
+toward `errors`. The roster is up and useful, and a marketplace fetch needs the
+network, which the one-tap dashboard import cannot assume. Failures are restated
+after the summary with the exact retry command — same rule as DIVE-2347's failed
+skill and DIVE-3994's unset bot token.
+
+### Round-trip
+`5dive export` dumps each agent's recurring templates back into a `loops:` block, so
+a saved fleet does not silently claim to have no recurring work. A pack-installed
+loop exports as `pack: <slug>`; anything else exports as an inline loop, with `id`
+taken from the marker or derived from the title.
+
+The export must survive its own parser — the parse is **whole-document**, so one
+unrepresentable row refuses the ENTIRE company, and it does so at the user's `up`,
+not at the `export` that wrote it. Three board shapes are reconciled here:
+
+- **A recurring row with an empty schedule is not exported as a loop.** It can
+  never fire (the materializer's cron match needs 5 fields), so it is a template
+  that does nothing, and emitting it as a cron-less inline loop is invalid. It is
+  skipped and REPORTED on stderr. Widening the parser to accept a cadence-less
+  inline loop was the rejected alternative: it would let `up` create dead
+  templates by design, which is the idle roster this key exists to end. A `pack:`
+  row keeps cron optional — the pack carries its own cadence.
+- **A title with no `[a-z0-9]` at all** — any non-Latin script, or symbols only —
+  slugifies to the empty string. It falls back to `loop-<digest>` over the full
+  title.
+- **Two titles agreeing on their first 64 slug characters** derive the same id.
+  The later one takes a digest suffix, applied in list order so the output is
+  stable; the loop is renamed, never dropped. The digest is over the FULL title,
+  so a third colliding title is distinguished too.
+
+### Teardown
+`5dive down` deletes the TEMPLATE rows for the loops the spec declares, before the
+seat is removed — `agent rm` does not, so without this a torn-down company leaves
+templates materializing work for an assignee that no longer exists. Already
+materialized instances are separate rows and are left alone.
 
 ## `pack:` — import a character pack (DIVE-536)
 

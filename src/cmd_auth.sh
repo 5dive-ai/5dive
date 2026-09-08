@@ -40,9 +40,18 @@ auth_creds_present() {
     local val=""
     case "$path" in
       *.env)
-        # Any non-empty KEY=... in the env file counts — user may have written
-        # ANTHROPIC_API_KEY instead of CLAUDE_CODE_OAUTH_TOKEN and both are valid.
-        val=$(grep -Ev '^\s*#' "$path" 2>/dev/null | grep -E '^[A-Z_]+=.+' | head -n1 || true)
+        # DIVE-4032: a non-empty env file is not a credential. In particular,
+        # ANTHROPIC_BASE_URL by itself made `agent list` report AUTH=ok while
+        # Claude printed "Not logged in" on every run. Match the same three
+        # credential variables the launcher accepts; configuration-only keys
+        # must not turn an unauthenticated seat green.
+        if [[ "$type" == "claude" ]]; then
+          val=$(grep -Ev '^\s*#' "$path" 2>/dev/null \
+            | grep -E '^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN)=.+' \
+            | head -n1 || true)
+        else
+          val=$(grep -Ev '^\s*#' "$path" 2>/dev/null | grep -E '^[A-Z_]+=.+' | head -n1 || true)
+        fi
         ;;
       *)
         val=$(jq -r --arg k "$key" '.env[$k] // empty' "$path" 2>/dev/null || true)
@@ -70,7 +79,13 @@ auth_creds_present() {
   fi
   [[ -f "$api_path" ]] || return 1
   local api_val
-  api_val=$(grep -Ev '^\s*#' "$api_path" 2>/dev/null | grep -E '^[A-Z_]+=.+' | head -n1 || true)
+  if [[ "$type" == "claude" ]]; then
+    api_val=$(grep -Ev '^\s*#' "$api_path" 2>/dev/null \
+      | grep -E '^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN)=.+' \
+      | head -n1 || true)
+  else
+    api_val=$(grep -Ev '^\s*#' "$api_path" 2>/dev/null | grep -E '^[A-Z_]+=.+' | head -n1 || true)
+  fi
   [[ -n "$api_val" ]]
 }
 

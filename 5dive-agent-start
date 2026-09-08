@@ -1358,6 +1358,9 @@ if [[ "$TYPE" == "claude" ]]; then
     sleep 1
   done
   if grep -qE "$_creds_re" "$_primary_auth" 2>/dev/null; then
+    # Clear a prior degraded-start verdict only after this boot observed the
+    # credential it will actually export.
+    cred_seed_ok
     # Re-export from disk so the exec'd claude sees the creds systemd read too
     # early (or not at all). Files are systemd EnvironmentFile format: literal
     # KEY=value per line, no shell expansion, unquoted — split on the first '='.
@@ -1370,7 +1373,12 @@ if [[ "$TYPE" == "claude" ]]; then
     done
     [[ "$_waited" == 1 ]] && echo "[5dive] agent=${NAME} claude creds landed during first-boot wait — launching authenticated" >&2
   else
-    echo "[5dive] agent=${NAME} WARN: claude creds absent after ${CLAUDE_AUTH_WAIT_SECS:-45}s wait; launching anyway (self-heals on next restart)" >&2
+    # The old text promised this would self-heal on the next restart. It cannot
+    # do that unless a credential is supplied between restarts, and one seat
+    # repeated this branch for 6.5 weeks. Persist the verdict on the same
+    # per-seat breadcrumb every other credential family uses so fleet views can
+    # veto process liveness instead of relying on short-lived journal history.
+    cred_seed_failed "claude credential absent after ${CLAUDE_AUTH_WAIT_SECS:-45}s wait — launched DEGRADED and cannot reach its provider; supply a credential and restart"
   fi
   unset _primary_auth _creds_re _deadline _waited _af _line 2>/dev/null || :
 fi
@@ -1658,6 +1666,47 @@ fi
 
 INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${STAGE_GUARD}${OPENCLAW_PATH_OVERRIDE}${CODEX_OVERRIDE}${OPENCODE_OVERRIDE}${PI_OVERRIDE}${PRELUDE}${LOOP}"
 [[ -n "$PROFILE" ]] && echo "[5dive] agent=${NAME} using auth-profile=${PROFILE}" >&2
+
+# DIVE-4036: DECLARE how dispatched work reaches this agent, then launch.
+#
+# PR #770 moved WHAT RUNS IN THE PANE for a codex seat with a channel (the
+# app-server dispatcher, not the codex CLI) without moving WHERE WORK IS POSTED
+# (`tmux send-keys` into that pane, src/cmd_agent_runtime.sh). Keystrokes landed
+# in the dispatcher's stdin and were discarded: the model never saw the task, the
+# board still said in_progress, and every fleet view stayed green. Two days of a
+# seat producing nothing, on every box with a codex+dashboard seat.
+#
+# The durable fix is NOT a second copy of `codex_dispatcher_enabled` on the
+# delivery side — that is the same two-places-must-agree shape, one layer over.
+# The boot path has ALREADY evaluated the predicate by the time it gets here, so
+# it writes the ANSWER down and the delivery path READS it. One evaluation, not
+# two, so they cannot drift.
+#
+# Read back with `sudo -u agent-<name> cat` (the same privilege every send site
+# already uses for tmux), so no permission is widened: mode 600 under the agent's
+# own home. The file names a MODE only — the delivery path DERIVES the inbox
+# directory under /home/agent-<name> rather than trusting a path out of a file the
+# agent itself can write, because `agent _deliver` reads it as root.
+write_delivery_declaration() {
+  local mode="pane"
+  if [[ "$TYPE" == "codex" ]] && codex_dispatcher_enabled "$CHANNELS"; then
+    mode="dispatcher-inbox"
+  fi
+  local dir="$HOME/.5dive" f="$dir/delivery.env" tmp
+  mkdir -p "$dir" 2>/dev/null || { echo "warn: cannot create $dir — delivery mode undeclared" >&2; return 0; }
+  tmp="${f}.tmp.$$"
+  {
+    printf '# written by 5dive-agent-start; regenerated on every boot (DIVE-4036)\n'
+    printf 'AGENT_DELIVERY=%s\n' "$mode"
+    printf 'AGENT_DELIVERY_TYPE=%s\n' "$TYPE"
+    printf 'AGENT_DELIVERY_CHANNELS=%s\n' "$CHANNELS"
+    printf 'AGENT_DELIVERY_DECLARED_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } >"$tmp" 2>/dev/null || { echo "warn: cannot write $f — delivery mode undeclared" >&2; rm -f "$tmp" 2>/dev/null; return 0; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$f" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 0; }
+  echo "[5dive] agent=${NAME} delivery=${mode}" >&2
+}
+write_delivery_declaration
 
 /usr/bin/tmux new-session -d -s "$SESSION" -c "$WORKDIR" \
   "bash --login -c $(printf %q "$INNER")"

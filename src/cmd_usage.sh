@@ -3,11 +3,10 @@
 # WHY this exists: our agents (and our customers') run on the Claude
 # *subscription*, not the metered API. The only ceiling that matters is the
 # 5h / 7d rate limit (the thing that hit "30% in a day"), and the only
-# ground-truth signal for who burned it is each agent's Claude Code session
-# transcript — every assistant turn logs message.usage (input / output / cache
-# tokens) + message.model + a timestamp. We sum those locally, attribute turns
-# to tasks by matching turn timestamps against the task queue's started/done
-# windows, and surface top agents + top tasks at a glance.
+# ground-truth signal for who burned it is each agent's local session transcript.
+# Claude Code logs per-turn usage; Codex logs cumulative usage snapshots. We
+# normalize both into input / output / cache-write / cache-read classes and
+# surface top agents + top tasks at a glance.
 #
 # DELIBERATELY NO DOLLARS. Subscription inference has no per-token price for the
 # user, so a "$" column would be fiction. We speak in tokens + share-of-limit.
@@ -24,7 +23,7 @@ usage_window_secs() {
   esac
 }
 
-# usage_collect <since_epoch> — emit one JSON object aggregating every claude
+# usage_collect <since_epoch> — emit one JSON object aggregating every supported
 # agent's token usage in the window, joined to the task queue. Shape:
 #   {window:{since,now}, agents:[{name,account,models:{<model>:{in,out,cc,cr,turns}},
 #            total,output,sevenDayPct,fiveHourPct}],
@@ -56,13 +55,15 @@ def to_epoch(s):
     except Exception:
         return None
 
-# --- registry: claude agents only (others have no Anthropic transcripts) ---
+# Transcript layout is selected from the registered agent type. Never infer a
+# provider from which directories happen to exist: stale state from a previous
+# install must not change which collector owns a seat (DIVE-4034).
 try:
     reg = json.load(open(registry))
 except Exception:
     reg = {"agents": {}}
 agents = {n: a for n, a in reg.get("agents", {}).items()
-          if a.get("type", "claude") == "claude"}
+          if a.get("type", "claude") in ("claude", "codex")}
 
 # DIVE-2069: is this the PRODUCTION store? Computed once, from the registry we were
 # handed — no env var a harness has to remember to set. See the fence below.
@@ -245,6 +246,46 @@ def list_sessions(projects):
             out.extend(os.path.join(subag, m) for m in sa_names if m.endswith(".jsonl"))
     return out, None
 
+def list_codex_sessions(sessions_root):
+    """Enumerate `.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` without glob.
+
+    Every wildcard level is listed explicitly so an unreadable year/month/day
+    cannot silently become zero usage. ENOENT means the live tree changed during
+    the scan; ENOTDIR means a non-directory occupied a date level and is skipped
+    only below the root, where it cannot contain a rollout.
+    """
+    out = []
+    try:
+        years = sorted(os.listdir(sessions_root))
+    except OSError as e:
+        if e.errno == errno.ENOENT:
+            return [], None
+        return [], "transcript dir %s became unreadable mid-scan: %s" % (sessions_root, e.strerror or e.errno)
+    level = [(sessions_root, y) for y in years]
+    for depth, label in ((1, "year"), (2, "month"), (3, "day")):
+        next_level = []
+        for parent, name in level:
+            path = os.path.join(parent, name)
+            try:
+                names = sorted(os.listdir(path))
+            except OSError as e:
+                if e.errno in (errno.ENOENT, errno.ENOTDIR):
+                    continue
+                return [], "codex %s dir %s unreadable: %s" % (label, path, e.strerror or e.errno)
+            if depth == 3:
+                out.extend(os.path.join(path, n) for n in names
+                           if n.startswith("rollout-") and n.endswith(".jsonl"))
+            else:
+                next_level.extend((path, n) for n in names)
+        level = next_level
+    return out, None
+
+def nonnegative_int(value):
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
 # --- scan transcripts: per agent per model token sums + per-turn timeline ---
 # turns[name] = list of (epoch, out_tokens, total_tokens) for task attribution.
 agent_rows = []
@@ -261,8 +302,11 @@ turns_by_agent = {}
 goal_pins = {}
 for name, meta in agents.items():
     home = home_of(name)
-    projects = os.path.join(home, ".claude", "projects")
-    readable, why = probe_readable(home, projects)
+    agent_type = meta.get("type", "claude")
+    transcript_root = (os.path.join(home, ".codex", "sessions")
+                       if agent_type == "codex"
+                       else os.path.join(home, ".claude", "projects"))
+    readable, why = probe_readable(home, transcript_root)
     if not readable:
         unreadable.append({"name": name, "reason": why})
         continue
@@ -273,10 +317,13 @@ for name, meta in agents.items():
     # DIVE-3419: a middle level we could not read makes this agent a blind spot,
     # not a low scorer. Same destination as an unreadable home or file — never a
     # silent short total sitting inside coverage.complete=true.
-    sessions, why = list_sessions(projects)
+    sessions, why = (list_codex_sessions(transcript_root) if agent_type == "codex"
+                     else list_sessions(transcript_root))
     if why is not None:
         unreadable.append({"name": name, "reason": why})
         continue
+    five = seven = None
+    newest_codex_rate_limit_ts = -1
     for path in sessions:
         try:
             if os.path.getmtime(path) < since:   # whole file predates window
@@ -291,6 +338,72 @@ for name, meta in agents.items():
             if e.errno != errno.ENOENT:
                 denied = denied or "some transcript files unreadable: %s" % (e.strerror or e.errno)
             continue
+        if agent_type == "codex":
+            # Codex's total_token_usage is cumulative within ONE rollout. Sum
+            # only the final valid snapshot from each file; summing snapshots
+            # multiplies the same tokens on every turn. A rollout whose final
+            # snapshot predates the requested window contributes nothing.
+            last_usage = None
+            last_ts = None
+            last_rate_limits = None
+            token_events = 0
+            with f:
+                for line in f:
+                    if '"token_count"' not in line:
+                        continue
+                    try:
+                        o = json.loads(line)
+                    except Exception:
+                        continue
+                    payload = o.get("payload") or {}
+                    info = payload.get("info") or {}
+                    usage = info.get("total_token_usage")
+                    ts = to_epoch(o.get("timestamp"))
+                    if (o.get("type") != "event_msg" or
+                            payload.get("type") != "token_count" or
+                            not isinstance(usage, dict) or ts is None):
+                        continue
+                    last_usage = usage
+                    last_ts = ts
+                    last_rate_limits = payload.get("rate_limits") or {}
+                    token_events += 1
+            if last_usage is None or last_ts < since:
+                continue
+
+            raw_input = nonnegative_int(last_usage.get("input_tokens"))
+            cr = nonnegative_int(last_usage.get("cached_input_tokens"))
+            cc = nonnegative_int(last_usage.get("cache_write_input_tokens"))
+            ot = nonnegative_int(last_usage.get("output_tokens"))
+            # Codex reports cached/cache-write tokens as subsets of input_tokens,
+            # unlike Claude's disjoint usage fields. Split them before feeding
+            # the shared classes so the headline still excludes cache reads.
+            i = max(0, raw_input - cr - cc)
+            # DIVE-4037 x DIVE-4034 — THE WEIGHT, STATED: these four classes are
+            # the same dict `quota = in+out+cc+cr` sums, so the line above is
+            # also the decision to count a CODEX cache read at 1.0x. That is
+            # DELIBERATE, not an accident of two branches meeting: Codex is the
+            # ONE provider where the weight is measured rather than assumed
+            # (DIVE-4028, n=1 — an 18-minute task moved 14,016,606 tokens,
+            # 98.2% of them cache reads, and the vendor's own gauge took 9% of
+            # the weekly pool for it; at a 0.1x weight that pool would have to
+            # be ~14M tokens, which it is not). So on Codex 1.0x is the
+            # best-supported weight we have; on Claude it is an unmeasured
+            # upper bound. Both are named by provider in the payload's
+            # `basis.quota.providerWeights` — never inferred from the sum.
+            m = models.setdefault("codex", {"in":0,"out":0,"cc":0,"cr":0,"turns":0})
+            m["in"] += i; m["out"] += ot; m["cc"] += cc; m["cr"] += cr
+            m["turns"] += token_events
+
+            if last_ts > newest_codex_rate_limit_ts:
+                newest_codex_rate_limit_ts = last_ts
+                primary = (last_rate_limits.get("primary") or {}).get("used_percent")
+                secondary = (last_rate_limits.get("secondary") or {}).get("used_percent")
+                five, seven = primary, secondary
+            # Session-cumulative totals cannot be truthfully assigned to one
+            # task window. Keep them in the agent row rather than manufacturing
+            # a task attribution at the rollout's final timestamp.
+            continue
+
         with f:
             for line in f:
                 # Match ONLY the heartbeat's fixed nudge phrasing (cmd_heartbeat.sh:
@@ -332,7 +445,12 @@ for name, meta in agents.items():
                 cr = int(u.get("cache_read_input_tokens") or 0)
                 m = models.setdefault(model, {"in":0,"out":0,"cc":0,"cr":0,"turns":0})
                 m["in"]+=i; m["out"]+=ot; m["cc"]+=cc; m["cr"]+=cr; m["turns"]+=1
-                turns.append((ts, ot, i+ot+cc))   # total excludes cache-read
+                # Two bases per turn (DIVE-4037): `tot` = API-equivalent cost
+                # (excludes cache-read), `qta` = plan/quota consumption (all four
+                # classes). They are carried side by side rather than one being
+                # derived later, because the task-attribution below sums turns and
+                # a ratio computed after the fact cannot be re-split per task.
+                turns.append((ts, ot, i+ot+cc, i+ot+cc+cr))
     if pins:
         goal_pins[name] = pins
     # A partial read of ONE agent still makes the company total partial: the row
@@ -341,27 +459,43 @@ for name, meta in agents.items():
         unreadable.append({"name": name, "reason": denied})
     if not models:
         continue
-    # Headline "total" EXCLUDES cache reads: a cache-read token is ~0.1x weight
-    # against the subscription limit, and on agentic workloads it dwarfs real
-    # work (100x), which would make the share-of-limit meaningless. We count
-    # input + output + cache-write (the tokens that actually move the limit) and
-    # keep cache-read visible only in the per-agent detail.
+    # TWO BASES, both first-class (DIVE-4037). `total` is unchanged and keeps
+    # its meaning — input + output + cache-write — which is the API-EQUIVALENT
+    # COST basis: a cache read bills at ~0.1x fresh input, so this figure
+    # approximates money and is the right denominator for value ranking.
+    #
+    # `quota` adds cache-read: all four classes, which is what a flat-rate
+    # PLAN's own meter charges for. That is the number that runs out. Measured
+    # 2026-09-07 on this fleet: `main` moved 9.8M on the cost basis against
+    # ~400M on the quota basis, so a capacity reader looking at `total` was
+    # seeing ~2% of what consumes the subscription (DIVE-4028's first-party
+    # datum: an 18-minute task, 98.2% cache reads, took 9% of a weekly pool).
+    #
+    # Neither replaces the other and neither is silently redefined: they answer
+    # different questions and every presenter below names which one it is
+    # showing. What cache-read WEIGHS on each vendor's meter is provider-
+    # specific and only measured (n=1) on OpenAI/Codex, so `quota` is
+    # deliberately an UNWEIGHTED sum of tokens moved — an upper bound on plan
+    # consumption, not a claim that every vendor charges cache reads at 1.0x.
     total  = sum(m["in"]+m["out"]+m["cc"] for m in models.values())
+    quota  = sum(m["in"]+m["out"]+m["cc"]+m["cr"] for m in models.values())
     output = sum(m["out"] for m in models.values())
     cread  = sum(m["cr"] for m in models.values())
-    # freshest rate-limit % from the statusline cache (the live 5h/7d numbers).
-    five = seven = None
-    cache = os.path.join(home, ".claude", "statusline-last.json")
-    try:
-        sc = json.load(open(cache))
-        rl = sc.get("rate_limits") or {}
-        five  = (rl.get("five_hour") or {}).get("used_percentage")
-        seven = (rl.get("seven_day") or {}).get("used_percentage")
-    except Exception:
-        pass
+    # Claude's freshest percentages live in its statusline cache. Codex's were
+    # taken from the newest included token_count snapshot above.
+    if agent_type == "claude":
+        cache = os.path.join(home, ".claude", "statusline-last.json")
+        try:
+            sc = json.load(open(cache))
+            rl = sc.get("rate_limits") or {}
+            five  = (rl.get("five_hour") or {}).get("used_percentage")
+            seven = (rl.get("seven_day") or {}).get("used_percentage")
+        except Exception:
+            pass
     agent_rows.append({
         "name": name, "account": meta.get("authProfile"),
-        "models": models, "total": total, "output": output, "cacheRead": cread,
+        "models": models, "total": total, "quota": quota,
+        "output": output, "cacheRead": cread,
         "fiveHourPct": five, "sevenDayPct": seven,
     })
     turns_by_agent[name] = sorted(turns)
@@ -391,7 +525,7 @@ for r in rows:
     e = to_epoch(r["done_at"]) or now
     wins.setdefault(a, []).append({
         "ident": r["ident"], "title": r["title"] or "",
-        "start": s, "end": e, "total": 0, "output": 0, "turns": 0,
+        "start": s, "end": e, "total": 0, "quota": 0, "output": 0, "turns": 0,
         "iteration": r["iteration"],   # DIVE-478: maker→verifier loop round (NULL if not a loop)
         "status": r["status"],
     })
@@ -400,17 +534,17 @@ for a in wins:
 
 for name, turns in turns_by_agent.items():
     ws = wins.get(name, [])
-    for ts, out, tot in turns:
+    for ts, out, tot, qta in turns:
         hit = None
         for w in ws:
             if w["start"] <= ts <= w["end"]:
                 hit = w
                 break
         if hit:
-            hit["total"]+=tot; hit["output"]+=out; hit["turns"]+=1
+            hit["total"]+=tot; hit["quota"]+=qta; hit["output"]+=out; hit["turns"]+=1
         else:
-            u = untracked.setdefault(name, {"total":0,"output":0})
-            u["total"]+=tot; u["output"]+=out
+            u = untracked.setdefault(name, {"total":0,"quota":0,"output":0})
+            u["total"]+=tot; u["quota"]+=qta; u["output"]+=out
 
 # --- dispatch cross-check (DIVE-2058, FALSIFIABLE INVARIANT) ---------------
 # "Every usage-attributed token window must intersect at least one DISPATCH
@@ -462,11 +596,52 @@ for a in wins:
             else:
                 dispatched = has_pin
             tasks.append({"ident":w["ident"],"title":w["title"],"assignee":a,
-                          "total":w["total"],"output":w["output"],"turns":w["turns"],
+                          "total":w["total"],"quota":w["quota"],
+                          "output":w["output"],"turns":w["turns"],
                           "iteration":w["iteration"],"dispatched":dispatched})
 
 print(json.dumps({
     "window": {"since": since, "now": now},
+    # DIVE-4037: the payload SAYS what each figure is made of. A consumer that
+    # reads `total` and calls it burn is the defect this row was filed for, and
+    # a number whose composition is only in a comment cannot be checked by the
+    # thing reading it.
+    "basis": {
+        "total": {"name": "API-equivalent cost",
+                  "formula": "input + output + cache_creation",
+                  "use": "value ranking / what this would have cost on the API"},
+        "quota": {"name": "plan consumption",
+                  "formula": "input + output + cache_creation + cache_read",
+                  "use": "capacity and alerting / what runs out",
+                  "caveat": "unweighted token sum; per-provider cache-read "
+                            "weighting is measured only on OpenAI/Codex (n=1, "
+                            "DIVE-4028), so treat as an upper bound",
+                  # DIVE-4037: the weight is DECLARED per provider rather than
+                  # left implicit in an unweighted sum. Both providers are
+                  # summed at 1.0x, but for different reasons and with
+                  # different standing, and a consumer must be able to tell
+                  # which figure rests on a measurement.
+                  "providerWeights": {
+                      "codex": {"cacheRead": 1.0, "basis": "measured",
+                                "evidence": "DIVE-4028, n=1: 14,016,606 tokens "
+                                            "(98.2% cache reads) = 9% of a "
+                                            "weekly pool"},
+                      "claude": {"cacheRead": 1.0, "basis": "assumed",
+                                 "evidence": "no first-party gauge-vs-token "
+                                             "measurement; 1.0x is an upper "
+                                             "bound, not a vendor statement"},
+                  },
+                  # Codex rollouts log CUMULATIVE per-session snapshots, not
+                  # per-turn events, so a Codex seat's tokens are truthfully
+                  # assignable to an agent but NOT to a task window. They are
+                  # in `agents[].quota` and in NO `tasks[]` row — so summing
+                  # tasks[].quota is not fleet plan burn on a mixed fleet.
+                  "taskAttribution": {
+                      "claude": "per-turn, attributed",
+                      "codex": "agent-row only — cumulative rollout snapshots "
+                               "cannot be assigned to a task window",
+                  }},
+    },
     "agents": agent_rows, "tasks": tasks, "untracked": untracked,
     # DIVE-1929: what this read COVERED, so a consumer can tell a company-wide
     # total from one agent's slice. Sets READ vs sets that EXIST — the count
@@ -504,6 +679,25 @@ USAGE_JQ_HELPERS='
   def qtok($unv): if $unv then "~" + htok + "(unverified)" else htok end;
   def shortmodel: if . == null then "-"
                   else (sub("^claude-";"") | sub("-20[0-9]+$";"")) end;
+  # DIVE-4037: a payload with NO `quota` field predates the quota basis. Its
+  # cost figure is the WRONG number to print under a QUOTA header — ~40x low on
+  # agentic traffic — and printing it there is worse than the original defect,
+  # because the reader now believes they are looking at plan consumption. So
+  # ORDERING falls back to the cost basis (a board must still sort) while the
+  # CELL renders "?", and usage_quota_note names the cause under the table.
+  # (This is the DIVE-1929/2312 rule applied to a second absent field: a number
+  # never renders confident when what produced it is unknown.)
+  def qta:   if (.quota == null) then null else .quota end;
+  def qtaN:  if (.quota == null) then (.total // 0) else .quota end;
+  def qcell: if . == null then "?" else htok end;
+  # DIVE-4037 (verifier residual, quinn): the same absence rule has to hold on
+  # BOTH surfaces that render a quota cell, and it did not — TOP AGENTS went
+  # through `qcell` while TOP TASKS open-coded the null test, so restoring
+  # `.quota // .total` at the TOP TASKS site left the suite green. A rule
+  # written twice is a rule held once. `qcellu` is `qcell` for a cell that also
+  # carries the DIVE-2312 unverified qualifier; both surfaces now reach the
+  # guard through `qta`, so there is one place to mutate and one place to test.
+  def qcellu($unv): if . == null then "?" else qtok($unv) end;
 '
 
 # cmd_usage — entry point. Dispatches budget subcommand, else renders the board
@@ -592,6 +786,28 @@ usage_coverage_note() {
       end' <<<"$1"
 }
 
+# usage_basis_legend — the one-line key for the two token columns (DIVE-4037).
+#
+# It is not decoration. Before this row, the single `TOTAL` column WAS the
+# subscription figure as far as every reader was concerned, and it excluded
+# ~98% of the tokens a flat-rate plan meters. Two columns with no key would
+# replace one confident wrong number with two unlabelled ones, so the key ships
+# on the same screen as the table — not in `--help`, which nobody reads while
+# looking at a burn figure.
+# It takes the payload so the per-provider weight line can name only the
+# providers actually in this window (DIVE-4037 verifier round: the merge with
+# DIVE-4034 started counting Codex cache reads at 1.0x, and a weight nobody
+# stated is a weight nobody can check).
+usage_basis_legend() {
+  local data="${1:-}"
+  printf '  %s\n' "API-EQ = input+output+cache-write (what this would have cost on the API — use for value ranking)"
+  printf '  %s\n' "QUOTA  = API-EQ + cache-read (what a flat-rate plan meters — use for capacity; this is the number that runs out)"
+  [[ -n "$data" ]] || return 0
+  if [[ "$(jq -r '[.agents[]?.models? // {} | keys[]] | any(. == "codex")' <<<"$data" 2>/dev/null)" == "true" ]]; then
+    printf '  %s\n' "QUOTA counts a cache read at 1.0x on BOTH providers: measured on Codex (DIVE-4028, n=1), ASSUMED on Claude — so Claude rows are an upper bound. Codex tokens are agent-row only, never per-task."
+  fi
+}
+
 # usage_render_board — top agents + top tasks, sorted by tokens descending.
 usage_render_board() {
   local data="$1" win="$2" budgets="$3"
@@ -606,33 +822,61 @@ usage_render_board() {
   local cov_note; cov_note=$(usage_coverage_note "$data")
   [[ -n "$cov_note" ]] && { printf '%s\n' "$cov_note"; echo; }
   echo "TOP AGENTS — $label  (subscription tokens; no \$ — these run on the plan)"
+  # DIVE-4037: TWO token columns, both named for what they are, and the old
+  # `TOTAL` header is GONE rather than reused. The number under API-EQ is
+  # bit-for-bit the number that used to sit under TOTAL — but a header that
+  # keeps its name while a sibling column appears beside it is read as "the
+  # total, and some detail", which is the misreading this row exists to end.
+  #
+  # ORDER is on QUOTA and that is deliberate: this board is the capacity view
+  # (its own header says "these run on the plan"), so "TOP" must mean "closest
+  # to running out". Ranking by API-EQ pointed at the seat writing the most
+  # fresh tokens, not the seat about to wall.
+  #
+  # SHARE follows QUOTA for the same reason, and this is the load-bearing one:
+  # SHARE apportions the account's vendor-reported 7D% across the agents on
+  # that account, and the vendor's gauge is metering the PLAN. Apportioning a
+  # plan-basis percentage by cost-basis weights hands the percentage to the
+  # wrong seat — a cache-heavy agent (the shape that actually consumes a plan)
+  # under-reports and a fresh-token-heavy one over-reports. 7D% itself is the
+  # vendor's own figure and is basis-independent: it is passed through.
   jq -r "$USAGE_JQ_HELPERS"'
-    # per-account totals → each agent gets a share of its account 7d limit.
-    (reduce .agents[] as $a ({}; .[$a.account // "-"] += $a.total)) as $acct
-    | if (.agents | length) == 0 then "  (no claude-agent transcripts in window)"
+    # per-account QUOTA totals → each agent gets a share of its account 7d limit.
+    (reduce .agents[] as $a ({}; .[$a.account // "-"] += ($a | qtaN))) as $acct
+    | if (.agents | length) == 0 then "  (no supported-agent transcripts in window)"
       else
-      (["AGENT","MODEL","OUTPUT","TOTAL","7D%","SHARE"] | @tsv),
-      (.agents | sort_by(-.total)[] |
+      (["AGENT","MODEL","OUTPUT","API-EQ","QUOTA","7D%","SHARE"] | @tsv),
+      (.agents | sort_by(-(. | qtaN))[] |
         (.models | to_entries | max_by(.value.out).key | shortmodel) as $m |
+        (. | qtaN) as $q | (. | qta) as $qshown |
         (if (.sevenDayPct != null and ($acct[.account // "-"] // 0) > 0)
-         then ((.total / $acct[.account // "-"]) * .sevenDayPct) else null end) as $share |
-        [ .name, $m, (.output|htok), (.total|htok),
+         then (($q / $acct[.account // "-"]) * .sevenDayPct) else null end) as $share |
+        [ .name, $m, (.output|htok), (.total|htok), ($qshown|qcell),
           pct(.sevenDayPct), (if $share==null then "-" else (($share|floor|tostring)+"%") end)
         ] | @tsv)
       end' <<<"$data" | column -t -s $'\t' | sed 's/^/  /'
+  usage_basis_legend "$data"
 
   echo
-  echo "TOP TASKS — $label"
+  # DIVE-4037: TOP TASKS stays ordered by API-EQ, the opposite call from TOP
+  # AGENTS, and the difference is the point. "Which task was expensive" is a
+  # VALUE question — what did this outcome cost — and the cost basis is the
+  # right denominator for it (it is also the basis the tokenmaxxing board and
+  # `proof`'s tokens-per-outcome metric rank on, and those must not silently
+  # re-rank). QUOTA is shown on every row so a capacity reader is never left
+  # without it.
+  echo "TOP TASKS — $label  (ranked by API-EQ cost)"
   jq -r "$USAGE_JQ_HELPERS"'
     if (.tasks | length) == 0 then "  (no task-attributed turns in window)"
     else
-      (["TASK","AGENT","ITER","OUTPUT","TOTAL","TITLE"] | @tsv),
+      (["TASK","AGENT","ITER","OUTPUT","API-EQ","QUOTA","TITLE"] | @tsv),
       (.tasks | sort_by(-.total)[:12][] |
         (.dispatched == false) as $unv |
         [ (.ident + (if $unv then " ⚠" else "" end)), .assignee,
           (if (.iteration // 0) > 0 then (.iteration|tostring) else "-" end),
           (.output|qtok($unv)), (.total|qtok($unv)),
-          (.title | if length > 42 then .[:41] + "…" else . end) ] | @tsv)
+          ((. | qta) | qcellu($unv)),
+          (.title | if length > 38 then .[:37] + "…" else . end) ] | @tsv)
     end' <<<"$data" | column -t -s $'\t' | sed 's/^/  /'
 
   # DIVE-2058: rows with dispatched==false attribute tokens to a task with no
@@ -680,7 +924,7 @@ usage_render_agent() {
   if [[ -z "$row" ]]; then
     [[ -n "$blind" ]] && fail "$E_PERMISSION" \
       "cannot read '$agent' transcripts: $(jq -r '.reason // "unreadable"' <<<"$blind") — this is NOT 'no usage', it is no visibility (try: sudo 5dive usage $agent)"
-    fail "$E_GENERIC" "no usage for agent '$agent' in window (or not a claude agent)"
+    fail "$E_GENERIC" "no usage for agent '$agent' in window (or unsupported agent type)"
   fi
   if (( JSON_MODE )); then
     # `partial` rides WITH the numbers: a consumer that reads .data.usage.total
@@ -708,9 +952,22 @@ usage_render_agent() {
       [ (.key|shortmodel), (.value.in|htok), (.value.out|htok),
         (.value.cc|htok), (.value.cr|htok), (.value.turns|tostring) ] | @tsv)
     ' <<<"$row" | column -t -s $'\t' | sed 's/^/  /'
+  # DIVE-4037: the per-agent view already printed all four classes and then a
+  # single "total" that summed three of them — the reader had the cache-read
+  # number in front of them and no total that included it. Both bases now get
+  # a named line, and the quota line carries the ratio because that ratio is
+  # the finding: on real agentic traffic it lands near 40x, and a reader who
+  # sees "9.8M" against "393M" stops treating the first one as burn.
   jq -r "$USAGE_JQ_HELPERS"'
-    "  total (input+output+cache-write, excl. cache-read): " + (.total|htok)
-    + "   |   cache-read: " + (.cacheRead|htok)' <<<"$row"
+    (. | qta) as $q
+    | "  API-EQ cost (input+output+cache-write): " + (.total|htok)
+      + "   |   cache-read: " + (.cacheRead|htok)
+    , (if $q == null then
+         "  QUOTA / plan consumption: UNKNOWN — this collector predates the quota basis (DIVE-4037); the figure above is NOT plan burn"
+       else
+         "  QUOTA / plan consumption (all four classes): " + ($q|htok)
+         + (if .total > 0 then "   (" + (((($q / .total) * 10 | floor) / 10)|tostring) + "x the API-EQ figure)" else "" end)
+       end)' <<<"$row"
   echo
   echo "  tasks ($label):"
   jq -r "$USAGE_JQ_HELPERS"'
@@ -790,11 +1047,23 @@ USAGE_BUDGETS_FILE="${STATE_DIR}/usage-budgets.json"
 USAGE_BUDGET_STATE_FILE="${STATE_DIR}/usage-budget-state.json"
 
 # jq snippet: normalize a stored budget value (int | object) → canonical object.
+#
+# DIVE-4037: `basis` says which token figure this agent's thresholds are
+# measured against — "cost" (input+output+cache-write) or "quota" (all four
+# classes). An ABSENT basis normalizes to "cost", and that is the whole
+# back-compat story: every budget already on disk was chosen by a human
+# looking at the old cost-basis burn, so reading those numbers on the quota
+# basis would multiply the measured burn by ~40x against an unchanged
+# threshold and trip every ceiling at once — on the agents that have
+# `hardStop` on, that is a fleet-wide stop, fired by a presentation fix. A
+# budget only moves basis when someone says so (`budget set --basis=`), and
+# NEW budgets default to quota (see cmd_usage_budget set).
 USAGE_BNORM='
-  def bnorm: if type=="number" then {soft:., hard:null, hardStop:false, notified:{}, stopped:false}
+  def bnorm: if type=="number" then {soft:., hard:null, hardStop:false, notified:{}, stopped:false, basis:"cost"}
              elif type=="object" then {soft:(.soft//null), hard:(.hard//null),
-                    hardStop:(.hardStop//false), notified:(.notified//{}), stopped:(.stopped//false)}
-             else {soft:null, hard:null, hardStop:false, notified:{}, stopped:false} end;
+                    hardStop:(.hardStop//false), notified:(.notified//{}), stopped:(.stopped//false),
+                    basis:(if (.basis=="quota") then "quota" else "cost" end)}
+             else {soft:null, hard:null, hardStop:false, notified:{}, stopped:false, basis:"cost"} end;
 '
 
 usage_budget_load() {
@@ -826,45 +1095,69 @@ cmd_usage_budget() {
       if (( JSON_MODE )); then jq -c "$USAGE_BNORM"'{ok:true,data:(with_entries(.value|=bnorm))}' <<<"$b"; return; fi
       jq -r "$USAGE_BNORM"'
         if length==0 then "no budgets set (5dive usage budget set <agent> --daily=<tok> [--ceiling=<tok>] [--hard-stop])"
-        else (["AGENT","SOFT(warn)","CEILING(hard)","HARD-STOP"]|@tsv),
+        else (["AGENT","SOFT(warn)","CEILING(hard)","HARD-STOP","BASIS"]|@tsv),
              (to_entries[] | .value as $v | (.value|bnorm) as $n |
                [.key, ($n.soft|if .==null then "-" else tostring end),
                       ($n.hard|if .==null then "-" else tostring end),
-                      (if $n.hardStop then "on" else "off" end)]|@tsv) end' <<<"$b" \
+                      (if $n.hardStop then "on" else "off" end),
+                      $n.basis]|@tsv) end' <<<"$b" \
         | column -t -s $'\t'
+      # DIVE-4037: a threshold is meaningless without the figure it is compared
+      # against, and the two figures differ by ~40x on agentic traffic. A
+      # cost-basis budget is named as the legacy one it is, in the same table.
+      if [[ "$(jq -r "$USAGE_BNORM"'[to_entries[]|select((.value|bnorm).basis=="cost")]|length' <<<"$b")" != "0" ]]; then
+        echo
+        echo "  basis: quota = input+output+cache-write+cache-read (what the plan meters — predicts a wall)"
+        echo "         cost  = input+output+cache-write only (API-equivalent; ~40x LOWER than plan burn on agentic traffic,"
+        echo "                 so a cost-basis ceiling will not fire before the plan runs out)"
+        echo "  move one:  5dive usage budget set <agent> --basis=quota   (re-pick the numbers: quota burn is far higher)"
+      fi
       ;;
     set)
       require_root
-      local agent="" daily="" ceiling="" hardstop=""
+      local agent="" daily="" ceiling="" hardstop="" basis=""
       for a in "$@"; do
         case "$a" in
           --daily=*)     daily="${a#--daily=}" ;;
           --ceiling=*)   ceiling="${a#--ceiling=}" ;;
           --hard-stop)   hardstop="true" ;;
           --no-hard-stop) hardstop="false" ;;
+          --basis=*)     basis="${a#--basis=}" ;;
           --*) fail "$E_USAGE" "unknown flag: $a" ;;
           *) agent="$a" ;;
         esac
       done
-      [[ -n "$agent" ]] || fail "$E_USAGE" "usage: 5dive usage budget set <agent> [--daily=<tok>] [--ceiling=<tok>] [--hard-stop]"
+      [[ -n "$agent" ]] || fail "$E_USAGE" "usage: 5dive usage budget set <agent> [--daily=<tok>] [--ceiling=<tok>] [--hard-stop] [--basis=quota|cost]"
       [[ -z "$daily"   || "$daily"   =~ ^[0-9]+$ ]] || fail "$E_USAGE" "--daily must be an integer token count"
       [[ -z "$ceiling" || "$ceiling" =~ ^[0-9]+$ ]] || fail "$E_USAGE" "--ceiling must be an integer token count"
-      [[ -n "$daily" || -n "$ceiling" || -n "$hardstop" ]] \
-        || fail "$E_USAGE" "nothing to set — pass --daily, --ceiling, and/or --hard-stop"
+      [[ -z "$basis" || "$basis" == "quota" || "$basis" == "cost" ]] \
+        || fail "$E_USAGE" "--basis must be 'quota' (input+output+cache-write+cache-read, what the plan meters) or 'cost' (API-equivalent, excludes cache-read)"
+      [[ -n "$daily" || -n "$ceiling" || -n "$hardstop" || -n "$basis" ]] \
+        || fail "$E_USAGE" "nothing to set — pass --daily, --ceiling, --hard-stop, and/or --basis"
       if [[ -n "$daily" && -n "$ceiling" ]] && (( ceiling < daily )); then
         fail "$E_VALIDATION" "--ceiling ($ceiling) must be >= --daily ($daily)"
       fi
-      local b cur; b=$(usage_budget_load)
+      local b cur had; b=$(usage_budget_load)
+      # DIVE-4037: whether this agent ALREADY had a budget decides the default
+      # basis, so it is read before the merge. A pre-existing entry keeps its
+      # stored basis (legacy entries normalize to "cost") — silently re-basing
+      # someone else's threshold is the 40x trip described on USAGE_BNORM. A
+      # BRAND-NEW budget defaults to quota, because a new threshold has no
+      # human expectation attached to it yet and cost basis cannot predict a
+      # wall, which is the whole reason this row was filed.
+      had=$(jq -r --arg n "$agent" 'has($n)' <<<"$b")
       cur=$(jq -c "$USAGE_BNORM"'(.[$n] // 0)|bnorm' --arg n "$agent" <<<"$b")
+      [[ -z "$basis" && "$had" != "true" ]] && basis="quota"
       [[ -n "$daily"    ]] && cur=$(jq -c --argjson v "$daily"   '.soft=$v'     <<<"$cur")
       [[ -n "$ceiling"  ]] && cur=$(jq -c --argjson v "$ceiling" '.hard=$v'     <<<"$cur")
       [[ -n "$hardstop" ]] && cur=$(jq -c --argjson v "$hardstop" '.hardStop=$v' <<<"$cur")
+      [[ -n "$basis"    ]] && cur=$(jq -c --arg v "$basis"       '.basis=$v'    <<<"$cur")
       # a change of limits re-arms alerting for the new thresholds
       cur=$(jq -c '.notified={}' <<<"$cur")
       b=$(jq -c --arg n "$agent" --argjson v "$cur" '.[$n]=$v' <<<"$b") \
         || fail "$E_GENERIC" "failed to update budget"
       usage_budget_save "$b"
-      ok "budget set: $agent soft=$(jq -r '.soft//"-"' <<<"$cur") ceiling=$(jq -r '.hard//"-"' <<<"$cur") hard-stop=$(jq -r '.hardStop' <<<"$cur")" \
+      ok "budget set: $agent soft=$(jq -r '.soft//"-"' <<<"$cur") ceiling=$(jq -r '.hard//"-"' <<<"$cur") hard-stop=$(jq -r '.hardStop' <<<"$cur") basis=$(jq -r '.basis' <<<"$cur")" \
         "$(jq -c --arg n "$agent" '{agent:$n}+.' <<<"$cur")"
       ;;
     clear|rm|unset)
@@ -912,8 +1205,16 @@ cmd_usage_budget_check() {
   fi
 
   local data; data=$(usage_collect "$since") || fail "$E_GENERIC" "failed to collect usage"
-  # per-agent 24h burn map {agent: total}
-  local burns; burns=$(jq -c '[.agents[]|{key:.name,value:.total}]|from_entries' <<<"$data")
+  # DIVE-4037: TWO per-agent 24h burn maps. `burns` stays the cost basis so a
+  # legacy (basis-absent) budget is enforced against exactly the figure its
+  # threshold was chosen from; `burnsq` is the plan basis a quota budget is
+  # enforced against. Both are carried into the plan and both land in the
+  # state cache — the alert has to be able to say what the OTHER figure was,
+  # because "you are at 82% of your ceiling" on a basis that cannot predict a
+  # wall is the alert this row was filed about.
+  local burns burnsq
+  burns=$(jq -c  '[.agents[]|{key:.name,value:.total}]|from_entries' <<<"$data")
+  burnsq=$(jq -c '[.agents[]|{key:.name,value:.quota}|select(.value!=null)]|from_entries' <<<"$data")
   # DIVE-1937: agents this read could not fully see. `// 0` below turns a blind
   # spot into a confident zero, and a confident zero is a PASSING budget check —
   # the check would report "ok" for an agent it never read. A partial burn is
@@ -927,11 +1228,21 @@ cmd_usage_budget_check() {
   local plan
   plan=$(jq -cn "$USAGE_BNORM"'
     ($budgets) as $B | ($burns) as $U | ($since) as $since | ($now) as $now
-    | ($blind) as $BL
+    | ($blind) as $BL | ($burnsq) as $Q
     | reduce ($B|keys[]) as $name (
         {store:{}, state:{}, acts:[]};
         ($B[$name]|bnorm) as $v
-        | (($U[$name]) // 0) as $burn
+        | (($U[$name]) // 0) as $burnCost
+        # DIVE-4037: an ABSENT quota is not 0 — a confident 0 is a PASSING
+        # check, which is exactly the "ok verdict it never earned" that
+        # DIVE-1937 removed for unreadable agents. A quota-basis budget whose
+        # quota figure is missing falls back to the cost burn (a FLOOR: a
+        # crossing is still a real crossing) and the state cache records the
+        # quota figure as null so no reader can mistake it for a measurement.
+        | (($Q[$name])) as $burnQuotaRaw
+        | ($burnQuotaRaw // (($U[$name]) // 0)) as $burnQuota
+        # the ENFORCED figure is whichever basis this budget declares.
+        | (if $v.basis == "quota" then $burnQuota else $burnCost end) as $burn
         | (if   ($v.hard != null and $burn >= $v.hard) then "hard"
            elif ($v.soft != null and $burn >= $v.soft) then "soft"
            elif ($BL[$name] // false) then "unknown"
@@ -946,20 +1257,26 @@ cmd_usage_budget_check() {
            elif $st=="ok" then {}
            else $noti end) as $noti2
         | (if $st=="hard" and $hardDue then [{name:$name,level:"hard",burn:$burn,
-                 limit:$v.hard,hardStop:$v.hardStop}]
-           elif $st=="soft" and $softDue then [{name:$name,level:"soft",burn:$burn,limit:$v.soft}]
+                 limit:$v.hard,hardStop:$v.hardStop,basis:$v.basis,
+                 burnCost:$burnCost,burnQuota:$burnQuotaRaw}]
+           elif $st=="soft" and $softDue then [{name:$name,level:"soft",burn:$burn,
+                 limit:$v.soft,basis:$v.basis,
+                 burnCost:$burnCost,burnQuota:$burnQuotaRaw}]
            else [] end) as $act
         | .store[$name]  = ($v + {notified:$noti2})
         # burn is NULL, not 0, when this caller could not read the agent — a 0 in
         # the state cache is what every downstream reader would treat as "quiet".
         | .state[$name]  = {burn:(if $st=="unknown" then null else $burn end),
+                            basis:$v.basis,
+                            burnCost:(if $st=="unknown" then null else $burnCost end),
+                            burnQuota:(if $st=="unknown" then null else $burnQuotaRaw end),
                             soft:$v.soft, hard:$v.hard, hardStop:$v.hardStop,
                             state:$st, stopped:$v.stopped,
                             readable:(($BL[$name] // false) | not)}
         | .acts         += $act
       )' \
-    --argjson budgets "$b" --argjson burns "$burns" --argjson blind "$blind" \
-    --argjson since "$since" --argjson now "$now")
+    --argjson budgets "$b" --argjson burns "$burns" --argjson burnsq "$burnsq" \
+    --argjson blind "$blind" --argjson since "$since" --argjson now "$now")
 
   local new_store; new_store=$(jq -c '.store' <<<"$plan")
   local acts;      acts=$(jq -c '.acts' <<<"$plan")
@@ -976,27 +1293,41 @@ cmd_usage_budget_check() {
     usage_resolve_owner_channel && chan_ok=1 || true
     local i cnt; cnt=$(jq -r 'length' <<<"$acts")
     for (( i=0; i<cnt; i++ )); do
-      local an al ab alim ahs
+      local an al ab alim ahs abasis aq
       an=$(jq -r ".[$i].name"     <<<"$acts")
       al=$(jq -r ".[$i].level"    <<<"$acts")
       ab=$(jq -r ".[$i].burn"     <<<"$acts")
       alim=$(jq -r ".[$i].limit"  <<<"$acts")
       ahs=$(jq -r ".[$i].hardStop // false" <<<"$acts")
-      local btxt ltxt msg
+      abasis=$(jq -r ".[$i].basis // \"cost\"" <<<"$acts")
+      aq=$(jq -r ".[$i].burnQuota" <<<"$acts")   # may be null: unknown, not 0
+      local btxt ltxt qtxt msg bnote
       btxt=$(jq -rn --argjson v "$ab"   "$USAGE_JQ_HELPERS"'$v|htok')
       ltxt=$(jq -rn --argjson v "$alim" "$USAGE_JQ_HELPERS"'$v|htok')
+      if [[ "$aq" == "null" ]]; then qtxt="UNKNOWN (this collector predates the quota basis)"
+      else qtxt=$(jq -rn --argjson v "$aq" "$USAGE_JQ_HELPERS"'$v|htok'); fi
+      # DIVE-4037: the alert NAMES its basis. An alert that quotes a bare token
+      # figure is why a seat could wall while `usage` looked comfortable — the
+      # reader had no way to know the number could not predict a wall. A
+      # cost-basis alert additionally carries the plan figure it is NOT
+      # watching, so the gap is visible in the message that woke someone up.
+      if [[ "$abasis" == "quota" ]]; then
+        bnote=" [basis: quota — input+output+cache-write+cache-read, what the plan meters]"
+      else
+        bnote=" [basis: API-equivalent cost, EXCLUDES cache-read — plan consumption in the same window was ${qtxt}; a cost-basis ceiling does not predict a plan wall. Move it: 5dive usage budget set ${an} --basis=quota]"
+      fi
       if [[ "$al" == "hard" ]]; then
         if [[ "$ahs" == "true" ]]; then
           # turn the agent OFF (heartbeat off THEN stop — stop alone revives).
           ( with_registry_lock cmd_heartbeat_off "$an" ) >/dev/null 2>&1 || true
           systemctl stop "5dive-agent@${an}.service" >/dev/null 2>&1 || true
           new_store=$(jq -c --arg n "$an" '.[$n].stopped=true' <<<"$new_store")
-          msg="⛔ 5dive budget: ${an} hit its token CEILING (${btxt} / ${ltxt} in 24h) — agent turned OFF (heartbeat off + stopped). Re-enable with: 5dive heartbeat on ${an} && 5dive agent start ${an}"
+          msg="⛔ 5dive budget: ${an} hit its token CEILING (${btxt} / ${ltxt} in 24h) — agent turned OFF (heartbeat off + stopped). Re-enable with: 5dive heartbeat on ${an} && 5dive agent start ${an}${bnote}"
         else
-          msg="⛔ 5dive budget: ${an} hit its token CEILING (${btxt} / ${ltxt} in 24h). Hard-stop is OFF, so it keeps running — review with: 5dive cost"
+          msg="⛔ 5dive budget: ${an} hit its token CEILING (${btxt} / ${ltxt} in 24h). Hard-stop is OFF, so it keeps running — review with: 5dive cost${bnote}"
         fi
       else
-        msg="⚠ 5dive budget: ${an} crossed its soft cap (${btxt} / ${ltxt} in 24h). Review with: 5dive cost"
+        msg="⚠ 5dive budget: ${an} crossed its soft cap (${btxt} / ${ltxt} in 24h). Review with: 5dive cost${bnote}"
       fi
       if (( chan_ok )); then _task_send_owner "$msg" "" >/dev/null 2>&1 || true; fi
     done
@@ -1061,16 +1392,32 @@ cmd_cost() {
   # there as "● 0 tok — ok", which is the exact sentence a reader checking burn
   # is looking for and the one thing this read cannot support. `readable:false`
   # rows keep their identity and lose their number.
+  # DIVE-4037: both bases are joined in, and the ENFORCED one ($t) is selected
+  # by the budget's own declared basis — the same selection cmd_usage_budget_check
+  # makes. If this board ranked or state-graded on a different figure than the
+  # engine enforces, the row would read "ok" for an agent the engine is about to
+  # stop (or the reverse), which is a worse failure than the one being fixed.
+  # An agent with NO budget has no declared basis, so its state is "-" either
+  # way and it is graded on quota — the capacity-relevant figure.
   local rows
   rows=$(jq -c "$USAGE_BNORM"'
     (reduce .agents[] as $a ({}; .[$a.name]=$a.total)) as $burn
+    | (reduce .agents[] as $a ({}; .[$a.name]=$a.quota)) as $burnq
     | ([(.coverage.unreadable // [])[]|{key:.name,value:(.reason // "unreadable")}]|from_entries) as $blind
     | [ ( ($budgets|keys) + ($burn|keys) + ($blind|keys) ) | unique[] as $n
         | ($budgets[$n] // null) as $raw
         | (if $raw==null then null else ($raw|bnorm) end) as $b
-        | ($burn[$n] // 0) as $t
+        | (if $b==null then "quota" else $b.basis end) as $basis
+        | ($burn[$n] // 0)  as $tc
+        | ($burnq[$n]) as $tqRaw
+        | ($tqRaw // $tc) as $tq
+        | (if $basis=="quota" then $tq else $tc end) as $t
         | ($blind[$n] // null) as $why
-        | { name:$n, burn:(if $why!=null and ($burn[$n]//null)==null then null else $t end),
+        | (if $why!=null and ($burn[$n]//null)==null then true else false end) as $noread
+        | { name:$n, burn:(if $noread then null else $t end),
+            basis:$basis,
+            burnCost:(if $noread then null else $tc end),
+            burnQuota:(if $noread then null else $tqRaw end),
             readable:($why==null), blindReason:$why,
             soft:(if $b==null then null else $b.soft end),
             hard:(if $b==null then null else $b.hard end),
@@ -1081,7 +1428,7 @@ cmd_cost() {
                    elif ($b.soft!=null and $t>=$b.soft) then "soft"
                    elif $why!=null then "unknown"
                    else "ok" end) } ]
-    | sort_by(-(.burn // -1))' --argjson budgets "$budgets" <<<"$data")
+    | sort_by(-(.burnQuota // .burnCost // -1))' --argjson budgets "$budgets" <<<"$data")
 
   if (( JSON_MODE )); then
     jq -cn --argjson r "$rows" --arg win "$win_flag" --argjson cov "$(jq -c '.coverage // null' <<<"$data")" \
@@ -1093,16 +1440,21 @@ cmd_cost() {
   [[ -n "$cov_note" ]] && { printf '%s\n' "$cov_note"; echo; }
   echo "COST — $label  (subscription tokens; no \$ — agents run on the plan)"
   jq -r "$USAGE_JQ_HELPERS"'
-    if (.|length)==0 then "  (no claude-agent transcripts in window)"
+    if (.|length)==0 then "  (no supported-agent transcripts in window)"
     else
-      (["","AGENT","BURN","SOFT","CEILING","HARD-STOP","STATE"]|@tsv),
+      (["","AGENT","API-EQ","QUOTA","BASIS","SOFT","CEILING","HARD-STOP","STATE"]|@tsv),
       (.[] |
         (if   .state=="hard" then "⛔"
          elif .state=="soft" then "⚠"
          elif .state=="unknown" then "?"
          elif .state=="ok"   then "●"
          else " " end) as $g |
-        [ $g, .name, (if .burn==null then "?" else (.burn|htok) end),
+        [ $g, .name,
+          (if .burnCost==null  then "?" else (.burnCost|htok)  end),
+          (if .burnQuota==null then "?" else (.burnQuota|htok) end),
+          # the basis cell marks WHICH of the two columns the thresholds are
+          # compared against — with no budget there is nothing being compared.
+          (if .soft==null and .hard==null then "-" else .basis end),
           (.soft|htok), (.hard|htok),
           (if .soft==null and .hard==null then "-" elif .hardStop then "on" else "off" end),
           (if   .state=="hard" then "OVER CEILING"
@@ -1111,8 +1463,29 @@ cmd_cost() {
            elif .state=="ok"   then "ok"
            else "no budget" end) ]|@tsv)
     end' <<<"$rows" | column -t -s $'\t' | sed 's/^/  /'
+  usage_basis_legend "$data"
+  # DIVE-4037: the specific unsafe combination, called out by name rather than
+  # left for the reader to spot in the BASIS column — a threshold being
+  # enforced against API-EQ while the plan is being consumed at QUOTA rate. The
+  # ratio is printed because the ratio is the argument: a 40x gap means the
+  # ceiling is effectively unreachable.
+  local stale
+  stale=$(jq -r "$USAGE_JQ_HELPERS"'
+    [ .[] | select(.basis=="cost" and (.soft!=null or .hard!=null)
+                   and .burnCost!=null and .burnQuota!=null and .burnCost>0
+                   and .burnQuota > .burnCost)
+      | "  ⚠ " + .name + " is graded on API-EQ (" + (.burnCost|htok)
+        + ") while its plan burn is " + (.burnQuota|htok)
+        + " (" + (((.burnQuota / .burnCost) * 10 | floor) / 10 | tostring)
+        + "x) — this budget cannot fire before the plan runs out."
+    ] | .[]' <<<"$rows" 2>/dev/null)
+  [[ -n "$stale" ]] && { echo; printf '%s\n' "$stale"; \
+    echo "    fix:  5dive usage budget set <agent> --basis=quota --daily=<tok> [--ceiling=<tok>]"; }
   echo
-  echo "  set a budget:  5dive usage budget set <agent> --daily=<tok> [--ceiling=<tok>] [--hard-stop]"
+  echo "  set a budget:  5dive usage budget set <agent> --daily=<tok> [--ceiling=<tok>] [--hard-stop] [--basis=quota|cost]"
+  # DIVE-2751 shape: the conditional render above is not the last statement —
+  # keep an explicit success so a healthy board never exits non-zero.
+  return 0
 }
 
 # --- activity log (DIVE-1022): "what your agent actually did" -----------------

@@ -1558,6 +1558,25 @@ _hb_send_line() {
   # would assert a state nobody measured — the same could-not-measure-reads-as-
   # measured shape the guard exists to stop. A tick is the one place with no human
   # watching, so the log line is the whole record.
+  # DIVE-4036: a codex seat with telegram/dashboard hands its pane to the
+  # app-server dispatcher, so send-keys types into a process that discards it —
+  # the heartbeat is the site where that is worst, because a nudge, a wake and a
+  # dispatched /goal all ride here and nobody is watching a tick. Route to the
+  # dispatcher inbox, which reports drained/undrained instead of guessing from a
+  # pane. Checked BEFORE the credential guard: that guard exists to stop a
+  # payload being typed into an API-key field, and this path types nowhere.
+  local _hb_inbox
+  if _hb_inbox="$(_agent_delivery_inbox "$name")"; then
+    if _agent_dispatch_is_tui_control "$text"; then
+      _hb_log "skip control line '${text}' to ${name}: dispatcher delivery has no thread-reset verb yet (DIVE-4036)" 2>/dev/null || true
+      return 0
+    fi
+    local _hb_drc=0
+    _agent_dispatch_inbox_send "$name" "$text" "$_hb_inbox" || _hb_drc=$?
+    (( _hb_drc == 0 )) && return 0
+    _hb_log "send to ${name} FAILED: $(_agent_submit_unconfirmed_reason "$name" "$_hb_drc")" 2>/dev/null || true
+    return 1
+  fi
   _agent_pane_safe_to_type "$name" || {
     if [[ "${_AGENT_PANE_REFUSAL_REASON:-}" == "unreadable" ]]; then
       _hb_log "skip send to ${name}: could not read the pane (tmux capture-pane failed after retries) — fail-closed, nothing typed (DIVE-2159)" 2>/dev/null || true

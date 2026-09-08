@@ -1,6 +1,76 @@
 
 # -------- agent CRUD --------
 
+# Persisted boot verdict written by 5dive-agent-start. This is intentionally a
+# read of the agent-owned breadcrumb rather than journald: the journal can be
+# shorter than the lifetime of the fault, while this file survives until a boot
+# actually observes a usable credential and clears it.
+# Emits: clear|, degraded|<reason>, or unknown|<reason>.
+_agent_startup_credential_health() { # <name>
+  local name="$1" root="${AGENT_HOME_ROOT:-/home}/agent-${1}"
+  local path="${root}/.5dive-cred-seed-failed" reason=""
+  if [[ -r "$path" ]]; then
+    reason=$(head -n1 "$path" 2>/dev/null || true)
+    reason="${reason//|//}"
+    [[ -n "$reason" ]] && { printf 'degraded|%s\n' "$reason"; return 0; }
+    printf 'unknown|credential-start breadcrumb is empty\n'; return 0
+  fi
+  if [[ -r "$root" && ! -e "$path" ]]; then
+    printf 'clear|\n'; return 0
+  fi
+  printf 'unknown|credential-start breadcrumb is not readable from here\n'
+}
+
+# One primary verdict for an agent row. Raw process/service state remains in
+# `active`/`enabled`; this verdict answers the different question operators
+# actually ask: can this seat transact? A liveness word never outranks a known
+# credential or output failure.
+_agent_operational_state() { # <active> <auth-state> <startup-state> [supervisor-json]
+  local active="${1:-unknown}" auth="${2:-unknown}" startup="${3:-unknown}" sup="${4:-}"
+  [[ "$active" == "active" ]] || { printf '%s\n' "$active"; return 0; }
+  case "$auth:$startup" in
+    needs_login:*|expired:*|*:degraded) printf 'degraded\n'; return 0 ;;
+    unknown:*|*:unknown)               printf 'unknown\n'; return 0 ;;
+  esac
+  # The survey deliberately does not run the per-seat output queries. Say what
+  # was actually established (process + auth are ready), not "active" as if
+  # current transaction output had been observed.
+  [[ -n "$sup" ]] || { printf 'ready\n'; return 0; }
+  local verdict output days
+  verdict=$(jq -r '.verdict // empty' <<<"$sup" 2>/dev/null || true)
+  [[ -z "$verdict" ]] || { printf 'degraded\n'; return 0; }
+  output=$(jq -r '.output // "unknown"' <<<"$sup" 2>/dev/null || printf 'unknown')
+  case "$output" in
+    idle) printf 'idle\n' ;;
+    ok)
+      # A close on a prior day is evidence of recent output, not proof the seat
+      # is transacting now. Preserve that useful distinction in the verdict.
+      days=$(jq -r '.daysSinceClose // -1' <<<"$sup" 2>/dev/null || printf '%s' -1)
+      if [[ "$days" =~ ^[0-9]+$ ]] && (( days == 0 )); then printf 'active\n'
+      else printf 'unverified\n'; fi ;;
+    *) printf 'unknown\n' ;;
+  esac
+}
+
+# Human rendering for the auth measurement. A refreshable OAuth credential can
+# legitimately carry an access-token expiry in the past: the runtime exchanges
+# its refresh token on demand. Printing that date beside a bare `ok` recreates
+# the false-signal shape this command is meant to remove, so explain the
+# otherwise-disconfirming date on the same line.
+_agent_auth_display() { # <state> <expiry-epoch|-> <refreshable>
+  local state="${1:-unknown}" exp="${2:--}" refreshable="${3:-false}" iso=""
+  if [[ "$exp" =~ ^[0-9]+$ ]]; then
+    iso=$(date -u -d "@$exp" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || printf '%s' "$exp")
+    if [[ "$refreshable" == "true" ]] && (( exp < $(date +%s) )); then
+      printf '%s · access token expired %s · refreshable credential (not a login failure)\n' "$state" "$iso"
+    else
+      printf '%s · expires %s\n' "$state" "$iso"
+    fi
+  else
+    printf '%s\n' "$state"
+  fi
+}
+
 cmd_list() {
   # DIVE-1074: rootless read (mirrors account list / DIVE-1035). `agent list` is
   # pure-read, and a standard-isolation agent (group claude, so it can read the
@@ -114,12 +184,17 @@ cmd_list() {
     # 3). File-state only — see agent_auth_health for why it never flags a
     # refreshable token, and why an unreadable credential is `unknown` rather
     # than an alarm. `|| true` keeps a best-effort read from aborting the list.
-    local _ha _ha_state _ha_exp _ha_refresh
+    local _ha _ha_state _ha_exp _ha_refresh _hs _hs_state _hs_reason _op_state
     _ha=$(agent_auth_health "$ltype" "$lprof" || true)
     [[ -n "$_ha" ]] || _ha="unknown|-|false"
     _ha_state="${_ha%%|*}"
     _ha_exp="${_ha#*|}"; _ha_exp="${_ha_exp%%|*}"
     _ha_refresh="${_ha##*|}"
+    _hs=$(_agent_startup_credential_health "$name" || true)
+    [[ -n "$_hs" ]] || _hs='unknown|credential-start health probe did not run'
+    _hs_state="${_hs%%|*}"
+    _hs_reason="${_hs#*|}"
+    _op_state=$(_agent_operational_state "$active" "$_ha_state" "$_hs_state")
     # DIVE-2088: measure the ENFORCED sudo grant here too. DIVE-2079 fixed the
     # per-agent DRILL-DOWN (`agent info`), but `list` is the SURVEY surface — the
     # command you run to notice something is off, not the one you run once you
@@ -147,6 +222,7 @@ cmd_list() {
       --arg model "$amodel" --arg effort "$aeffort" \
       --argjson hdeaf "$hdeaf" --argjson hasleep "$hasleep" \
       --arg haState "$_ha_state" --arg haExp "$_ha_exp" --arg haRefresh "$_ha_refresh" \
+      --arg hsState "$_hs_state" --arg hsReason "$_hs_reason" --arg opState "$_op_state" \
       --arg sgClass "$_sg_class" --arg sgRunas "$_sg_runas" \
       --arg sgExtra "$_sg_extra" --arg sgImplied "$_sg_implied" \
       '.[$n] = {active: $a, enabled: $e, botToBotEnabled: $b2b,
@@ -155,11 +231,14 @@ cmd_list() {
                 sudo: {grant: $sgClass, runas: $sgRunas, impliedIsolation: $sgImplied,
                        measured: ($sgClass != "unknown"),
                        extraEntries: ($sgExtra == "1")},
+                operationalState: $opState,
                 health: {deaf: $hdeaf, asleep: $hasleep,
                          auth: {state: $haState,
                                 expiresAt: (if $haExp == "-" then null
                                             else ($haExp | tonumber | todate) end),
-                                refreshable: ($haRefresh == "true")}}}' <<<"$enriched")
+                                refreshable: ($haRefresh == "true")},
+                         startup: {state: $hsState,
+                                   reason: (if $hsReason == "" then null else $hsReason end)}}}' <<<"$enriched")
   done
   local merged
   merged=$(jq -c --arg default_wd "$DEFAULT_WORKDIR" --argjson live "$enriched" '.agents | to_entries | map({
@@ -174,6 +253,7 @@ cmd_list() {
     createdAt: .value.createdAt,
     active: ($live[.key].active // "unknown"),
     enabled: ($live[.key].enabled // "unknown"),
+    operationalState: ($live[.key].operationalState // "unknown"),
     botToBotEnabled: ($live[.key].botToBotEnabled // false),
     model: ($live[.key].model // null),
     effort: ($live[.key].effort // null),
@@ -191,12 +271,12 @@ cmd_list() {
   else
     echo "$merged" | jq -r '
       if length == 0 then "no agents" else
-        (["NAME","TYPE","CHANNELS","PROFILE","AUTH","SUDO","ACTIVE","ENABLED"] | @tsv),
+        (["NAME","TYPE","CHANNELS","PROFILE","AUTH","SUDO","STATE","ENABLED"] | @tsv),
         (.[] | [(.name + (if (.heartbeat.enabled // false) then " ∿" + ((.heartbeat.everyMin // 30)|tostring) + "m" else "" end)), .type, .channels, (.authProfile // "-"),
                 (.health.auth.state // "unknown"),
                 (if (.sudo.measured | not) then "unknown"
                  else .sudo.grant + (if .sudo.diverges then "!" else "" end) + (if .sudo.extraEntries then "+" else "" end) end),
-                .active, .enabled] | @tsv)
+                .operationalState, .enabled] | @tsv)
       end' | column -t -s $'\t'
     # DIVE-2088: the SUDO column is a MEASUREMENT, not the stored label, so the
     # legend only prints for the states that need reading — and `unknown` says
@@ -222,7 +302,7 @@ cmd_list() {
     fi
     if (( _lg_aunk )); then
       (( _lg_login || _lg_exp )) || echo
-      echo "AUTH unknown = credential not readable as $(id -un); re-run as root. ok = the credential FILE is present/unexpired, not probed (5dive auth status)"
+      echo "AUTH unknown = credential not readable as $(id -un); re-run as root. ok = the credential FILE is present/unexpired, not probed (5dive agent auth status)"
     fi
     local _lg_unk _lg_div _lg_ext
     _lg_unk=$(jq -r '[.[] | select(.sudo.measured | not)] | length' <<<"$merged")
@@ -713,6 +793,25 @@ cmd_info() {
   sup=$(sup_info_for_agent "$name" 2>/dev/null || true)
   [[ -n "$sup" ]] || sup='{"output":"unknown","transacting":null,"classification":"unobserved","verdict":null,"stateNote":"output unknown — the task store was not readable from here","line":"unobserved — the task store was not readable from here","note":"store unreadable"}'
 
+  # DIVE-4032: info used to omit auth entirely, then lead with raw systemd
+  # `active / enabled`. That made the drill-down less truthful than the survey
+  # and hid the exact condition an operator was drilling into. Use the same
+  # credential instrument as `agent list`, plus the persisted boot verdict, and
+  # let either one veto liveness in the primary operational state.
+  local _info_prof _ha _ha_state _ha_exp _ha_refresh _hs _hs_state _hs_reason _op_state _auth_line
+  _info_prof=$(jq -r --arg n "$name" '.agents[$n].authProfile // ""' <<<"$reg")
+  _ha=$(agent_auth_health "$type" "$_info_prof" || true)
+  [[ -n "$_ha" ]] || _ha='unknown|-|false'
+  _ha_state="${_ha%%|*}"
+  _ha_exp="${_ha#*|}"; _ha_exp="${_ha_exp%%|*}"
+  _ha_refresh="${_ha##*|}"
+  _hs=$(_agent_startup_credential_health "$name" || true)
+  [[ -n "$_hs" ]] || _hs='unknown|credential-start health probe did not run'
+  _hs_state="${_hs%%|*}"
+  _hs_reason="${_hs#*|}"
+  _op_state=$(_agent_operational_state "${active:-unknown}" "$_ha_state" "$_hs_state" "$sup")
+  _auth_line=$(_agent_auth_display "$_ha_state" "$_ha_exp" "$_ha_refresh")
+
   local obj
   obj=$(jq -c \
     --argjson sup "$sup" \
@@ -733,6 +832,9 @@ cmd_info() {
     --arg cbState "$_cb_state" \
     --arg cbDetail "$_cb_detail" \
     --arg cbEvidence "$_cb_evidence" \
+    --arg haState "$_ha_state" --arg haExp "$_ha_exp" --arg haRefresh "$_ha_refresh" \
+    --arg hsState "$_hs_state" --arg hsReason "$_hs_reason" --arg opState "$_op_state" \
+    --arg authLine "$_auth_line" \
     '.agents[$n] as $a | {
       name: $n,
       type: $a.type,
@@ -784,6 +886,14 @@ cmd_info() {
       createdAt: $a.createdAt,
       active: $active,
       enabled: $enabled,
+      operationalState: $opState,
+      health: {
+        auth: {state: $haState,
+               expiresAt: (if $haExp == "-" then null else ($haExp | tonumber | todate) end),
+               refreshable: ($haRefresh == "true")},
+        startup: {state: $hsState,
+                  reason: (if $hsReason == "" then null else $hsReason end)}
+      },
       cliName: $cliName,
       cliVersion: (if $cliVersion == "" then null else $cliVersion end),
       model: (if $model == "" then null else $model end),
@@ -803,7 +913,7 @@ cmd_info() {
   if (( JSON_MODE )); then
     jq -cn --argjson d "$obj" '{ok:true, data:$d}'
   else
-    jq -r '
+    jq -r --arg authLine "$_auth_line" '
       "name:        \(.name)",
       "type:        \(.type)",
       "cli:         \(.cliName) \(.cliVersion // "unknown")",
@@ -816,10 +926,12 @@ cmd_info() {
         "bound:       \(if .channelsBinding.state == "refused" then "NO — REFUSED at runtime" else "unknown — \(.channelsBinding.detail // "not probeable from here")" end)\(if .channelsBinding.evidence then "\n             ↳ \(.channelsBinding.evidence)" else "" end)"
        end),
       "profile:     \(.authProfile // "-")",
+      "auth:        \($authLine)",
+      "startup:     \(.health.startup.state)\(if .health.startup.reason then " — \(.health.startup.reason)" else "" end)",
       "workdir:     \(.workdir)",
       "isolation:   \(.isolation) (label\(if .isolationLabelled then "" else ", defaulted — unset in registry" end))",
       "sudo:        \(if .sudo.measured then "\(.sudo.grant) — \(.sudo.scope); runas \(.sudo.runas)" else "unknown — not measurable from here; run `sudo -n -l` as agent-\(.name), or re-run this as root" end)\(if .sudo.extraEntries then " (+ entries this CLI did not write)" else "" end)",
-      "state:       \(.active) / \(.enabled) · \(.supervisor.stateNote)",
+      "state:       \(.operationalState) · process \(.active) / \(.enabled) · \(.supervisor.stateNote)",
       "output:      \(.supervisor.note)",
       "supervisor:  \(.supervisor.line)",
       "created:     \(.createdAt // "unknown")",
@@ -828,6 +940,9 @@ cmd_info() {
       # knew was dark, and the seat itself, by construction, cannot read this.
       (if .supervisor.verdict then
          "\nWARNING: this seat is UP and REACHABLE but NOT TRANSACTING (\(.supervisor.verdict)): \(.supervisor.note). Whatever is queued behind it is not moving. The `state:` line above and every other liveness signal (unit / tmux / poller / registry label) read healthy — that agreement is the DIVE-3272 defect, not evidence against this line. Check model capacity (auth-profile, quota reset) and reassign or park the queue: 5dive task ls --assignee=\(.name)"
+       else empty end),
+      (if (.health.auth.state == "needs_login" or .health.auth.state == "expired" or .health.startup.state == "degraded") then
+         "\nWARNING: this seat is DEGRADED: the process is \(.active), but its provider credential is not usable. Repair with `5dive agent auth status --agent=\(.name)` followed by the appropriate `5dive agent auth start ...`, then restart the seat."
        else empty end),
       (if .channelsBinding.state == "refused" then
          "\nWARNING: this agent DECLARES channels (\(.channelsDeclared)) and its session REFUSED them. It cannot receive or reply on any of them, however healthy every other line above looks — the registry, the unit and the bot username are all still correct, which is exactly why this reads as paired. The gate is inside the coding-CLI binary, not our plugin staging, so re-running `agent create` or re-installing the plugins will not move it (DIVE-2765). Do not attribute an unanswered message or a red round-trip on this agent to credential routing until this line is clear."
@@ -841,4 +956,3 @@ cmd_info() {
     ' <<<"$obj"
   fi
 }
-

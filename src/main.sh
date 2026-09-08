@@ -41,6 +41,8 @@ Compose (declarative agents via 5dive.yaml):
 Agents:
   5dive hire <name> [--role="CTO"]  # sugar: agent create (+ org set)
   5dive market [<keyword>] [--role=<r>] [--rarity=<t>]  # browse/search the agent market; preview: 5dive market show <slug>
+  5dive market --kind=plugin                         # browse plugins (voice, telegram, dashboard, buzz)
+  5dive plugin add|list|remove|upgrade <plugin>      # install a plugin; see '5dive plugin --help'
   5dive hire <role> --from-market [--as=<name>]  # hire from the open market; see '5dive hire --help'
   5dive agent list
   5dive agent info <name>                            # type, CLI version, model, channel, state + OUTPUT (DIVE-3274:
@@ -159,7 +161,7 @@ Agents:
                                                      # getChat for @handle via the agent's bot token; returns
                                                      # {id,isBot,displayName} so the dashboard can add bots by
                                                      # handle instead of numeric id.
-  5dive agent <name> tui                             # attach your terminal to the agent's tmux session
+  5dive agent <name> tui                             # attach to an interactive agent tmux session (dispatcher-only seats explain the alternative)
   5dive agent logs <name> [--follow] [--lines=N] [--tmux]
   5dive agent send <name> <text...>|--message=<text>|--message-file=<path>
                                     [--from=<sender>] [--raw] [--wake]
@@ -316,8 +318,12 @@ Usage (per-agent / per-task token burn — subscription tokens, no dollars):
   5dive usage <agent> [--7d]                         # one agent: per-model + per-task breakdown
   5dive cost [--7d]                                  # budget-focused: per-agent 24h burn vs soft/ceiling + state
   5dive activity <agent> [--7d] [--task=DIVE-N]      # what the agent actually did: files touched, commands run, cost
-  5dive usage budget set <agent> --daily=<tok> [--ceiling=<tok>] [--hard-stop]  # soft warn + optional hard-stop ceiling
+  5dive usage budget set <agent> --daily=<tok> [--ceiling=<tok>] [--hard-stop] [--basis=quota|cost]
   5dive usage budget ls | clear <agent>              # hard-stop is OFF by default (warn-only); check runs on the heartbeat
+  # TWO token bases, and they differ ~40x on agentic traffic (DIVE-4037):
+  #   API-EQ = input+output+cache-write        — what it would have cost on the API; use for value ranking
+  #   QUOTA  = API-EQ + cache-read             — what a flat-rate plan meters; use for capacity. THIS is what runs out.
+  # New budgets default to --basis=quota; budgets set before DIVE-4037 stay on cost until you move them.
 
 Trace (causal timeline for one task, goal → ship —):
   5dive run ls|show|events|logs|retry|metrics        # execution attempts beneath tasks (DIVE-3932); one run = one agent's one attempt
@@ -634,6 +640,16 @@ main() {
       # verb is) and never advertised.
       cmd_push_do "$@"
       exit $? ;;
+    plugin)
+      # DIVE-4020: the plugin lifecycle verb. Until this existed there was no
+      # `5dive plugin` at all — plugins installed only as side effects of
+      # `agent create` / `agent buzz enable`, so a CLI-only self-hoster had no
+      # path to one. Mutating and root-only (it writes under STATE_DIR and
+      # copies code onto the box), but it does NOT take the registry lock: it
+      # touches no agent, and holding the agent lock while cloning a marketplace
+      # would block every seat on a network fetch.
+      AUDIT_CMD="plugin"; AUDIT_ARGS=("$@")
+      cmd_plugin "$@" ;;
     market)
       # DIVE-1020: front door to the agent market — browse/search the
       # character-pack registry + preview a persona before hiring. Read-only
