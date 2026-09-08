@@ -6,7 +6,9 @@
 # same posture as goal_add_unit.sh). Asserts: a todo with an OPEN blocker is
 # never handed out; a blocker going done/cancelled makes the dependent
 # eligible; within a priority tier the longer critical path is preferred; and
-# priority still dominates critical-path depth.
+# priority still dominates critical-path depth. DIVE-4053 also pins the human-
+# gate boundary on the picker itself: an unanswered gate is not runnable while
+# an ungated row assigned to the same agent remains selectable.
 # Run: bash tests/heartbeat_pick_unit.sh  (no root, no network).
 set -uo pipefail
 
@@ -118,6 +120,27 @@ db "UPDATE tasks SET status='in_progress' WHERE id=${X};"   # X taken, Y blocked
 got=$(_hb_pick_task dev)
 [[ -z "$got" ]] && ok_t "no actionable todo → empty pick" \
                 || bad_t "expected empty pick" "got $got"
+
+# --- Case 6: an open human gate is not maker work (DIVE-4053) ----------------
+# Insert the gated row first so the old picker deterministically selects it by
+# id. The ungated row is the positive control: a fix that empties every pick
+# fails here even though it would also suppress the gated row.
+db "DELETE FROM task_deps;"; db "DELETE FROM tasks;"
+G=$(mk "G waiting on a person" urgent todo)
+db "UPDATE tasks
+       SET need_type='decision', need_answered_at=NULL
+     WHERE id=${G};"
+U=$(mk "U open and actionable" urgent todo)
+got=$(_hb_pick_task dev)
+[[ "$got" == "$U" ]] && ok_t "open human gate: skips G ($G) and selects ungated control U ($U)" \
+                      || bad_t "open human gate must not be selected while ungated work exists" "got $got, gated=$G, ungated=$U"
+
+# Remove the positive control from the todo queue. The gated row must not become
+# selectable merely because it is now the only todo left.
+db "UPDATE tasks SET status='in_progress' WHERE id=${U};"
+got=$(_hb_pick_task dev)
+[[ -z "$got" ]] && ok_t "open human gate: gated-only queue yields no pick" \
+                || bad_t "gated-only queue must be empty" "got $got, gated=$G"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
