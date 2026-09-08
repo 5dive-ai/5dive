@@ -266,6 +266,92 @@ for f in "$ROOT/plugins/browser/.claude-plugin/plugin.json" "$ROOT/plugins/brows
 done
 tc 'T8d the manifest uses the adopted framing' 'human-authenticated'   "$(jq -r '.description' "$ROOT/plugins/browser/.claude-plugin/plugin.json")"
 
+# ===================== T9 the classifier must work in the size regime PRODUCTION has
+# WHY THIS BLOCK EXISTS, and it is the lesson not the arm: every fixture above is
+# a one-line DOM, so the whole suite lived below the old 200KB capture cap and
+# graded a regime real pages never enter. Sixty-six green arms and ten killed
+# mutants all agreed, and the classifier still reported UNKNOWN for every real
+# page — and UNKNOWN fell through to the driver. The discriminating input was
+# never a new assertion; it was an EXISTING assertion at a realistic size.
+#
+# On the size: it has to be well past the cap, not cap+1. A document a little
+# over the cap often still fits the reader's last block plus the 64KB pipe
+# buffer, so the writer never takes SIGPIPE and the bug does not fire — at
+# 250KB it is a coin flip. 1MB is past every buffer on the path, so the arm is
+# deterministic. A "cap+1" arm here would have been flaky, which is worse than
+# absent because it teaches the suite to be ignored.
+PAD="$(head -c 1000000 /dev/zero | tr '\0' 'x')"
+
+# T9a — the SAME logged-out markup as T4a, only large. T4a is its negative control:
+# identical verdict at 40 lines, so a difference here is size and nothing else.
+mkprofile bigdead "$DEAD_DOM<!-- $PAD -->" >/dev/null
+mkadapter bigdead "file://$TMP/artifact.html" 'PUBLISHED'
+run "$BROWSER" status bigdead
+t  'T9a a logged-out profile over the old cap is still read as expired' 75 "$RC"
+tc 'T9a ...and not discarded as unreadable' 'session expired — human action required' "$OUT"
+tn 'T9a ...so the healthy path is not the one nobody sees' 'UNKNOWN' "$OUT"
+
+mkdriver 0
+rm -f "$TMP/driver-plan.json"
+run "$BROWSER" run bigdead publish --body=hi
+t 'T9b ...and run still fails closed at that size' 75 "$RC"
+t 'T9b ...without invoking the driver' 'no' "$([[ -f "$TMP/driver-plan.json" ]] && echo yes || echo no)"
+
+# T9c — a marker PAST the cap. Independent of the exit-status half: a truncating
+# capture cannot see it even with the status fixed, and a challenge banner is as
+# likely to sit late in a large document as early. The mutant is the worst verdict
+# this file can produce: a challenged session reported as authenticated.
+mkprofile latechal "<html><body><div id=\"feed\">posts</div><!-- $PAD --><div class=\"g-recaptcha\"></div></body></html>" >/dev/null
+mkadapter latechal "file://$TMP/artifact.html" 'PUBLISHED'
+run "$BROWSER" status latechal
+t  'T9c a challenge marker past the old cap is still found' 75 "$RC"
+tc 'T9c ...classified as a challenge'                       'CHALLENGE' "$OUT"
+tn 'T9c ...and NOT as a live session'                       'authenticated' "$OUT"
+
+# T9d/e — UNKNOWN is ASYMMETRIC, and both halves are the finding. Quiet at the
+# scheduler (body item: a network blip must not page a human) and FATAL at the
+# action (an unverified session is as likely to be a challenge page as a healthy
+# one, and the action is the irreversible half). A `!= CHALLENGE && != expired`
+# pair satisfies neither: it publishes on every state it has no name for.
+#
+# Chrome is absent here BY CONSTRUCTION — a bin dir holding only the commands
+# bin/browser uses — not by hoping the runner has none. The T9d0 positive control
+# is the point: a stripped PATH that broke `jq` would fail these arms for the
+# wrong reason and read exactly like a pass.
+NOCHROME="$TMP/nochrome"; mkdir -p "$NOCHROME"
+for c in bash basename cat chmod curl date dirname env grep head id jq mkdir mktemp rm stat; do
+  p="$(command -v "$c" 2>/dev/null)" && ln -sf "$p" "$NOCHROME/$c"
+done
+t 'T9d0 positive control: the stripped PATH still resolves jq, so a failure below means no chrome' \
+  'yes' "$(PATH="$NOCHROME" command -v jq >/dev/null 2>&1 && echo yes || echo no)"
+t 'T9d0 ...and resolves no browser at all' 'none' \
+  "$(PATH="$NOCHROME" bash -c 'for c in google-chrome chromium chromium-browser google-chrome-stable; do command -v $c >/dev/null 2>&1 && { echo found; exit; }; done; echo none')"
+
+mkprofile nochrome "$LIVE_DOM" >/dev/null
+mkadapter nochrome "file://$TMP/artifact.html" 'PUBLISHED'
+rm -f "$TMP/driver-plan.json"
+run env PATH="$NOCHROME" "$BROWSER" run nochrome publish --body=hi
+t  'T9d run on a box with no browser REFUSES rather than publishing unchecked' 75 "$RC"
+t  'T9d ...and the driver was never invoked' 'no' "$([[ -f "$TMP/driver-plan.json" ]] && echo yes || echo no)"
+tc 'T9d ...saying it will not act on a session it did not verify' 'did not verify' "$ERR"
+
+run env PATH="$NOCHROME" "$BROWSER" status nochrome
+t  'T9e status on the same box stays QUIET — a probe that did not load must not page a person' 0 "$RC"
+tc 'T9e ...while still naming what it could not do' 'UNKNOWN' "$OUT"
+
+# T9f — the other UNKNOWN: a browser that IS present and fails. Same asymmetry,
+# and it is a separate branch in the code from "no browser at all".
+BROKENBIN="$TMP/brokenbin"; mkdir -p "$BROKENBIN"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$BROKENBIN/google-chrome"; chmod +x "$BROKENBIN/google-chrome"
+mkprofile brokenprobe "$LIVE_DOM" >/dev/null
+mkadapter brokenprobe "file://$TMP/artifact.html" 'PUBLISHED'
+rm -f "$TMP/driver-plan.json"
+run env PATH="$BROKENBIN:$PATH" "$BROWSER" run brokenprobe publish --body=hi
+t 'T9f a probe that failed to load refuses at the action' 75 "$RC"
+t 'T9f ...without invoking the driver' 'no' "$([[ -f "$TMP/driver-plan.json" ]] && echo yes || echo no)"
+run env PATH="$BROKENBIN:$PATH" "$BROWSER" status brokenprobe
+t 'T9f ...and stays quiet at the scheduler' 0 "$RC"
+
 # ============================================ T7 the shipped example adapter is real
 EX="$ROOT/plugins/browser/adapters/example.json"
 run jq -e . "$EX";                                       t 'T7a the shipped adapter is valid JSON' 0 "$RC"

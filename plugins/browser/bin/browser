@@ -202,26 +202,44 @@ _auth_status() {
 # that logged you out redirects to its login page; that redirect is the signal,
 # and it is cheap. It deliberately does not parse the DOM for a "Sign in" string:
 # that string is on plenty of logged-in pages.
+#
+# TWO RULES ABOUT THE CAPTURE, both learned the expensive way (quinn, iteration 1):
+#
+#   1. NOTHING DOWNSTREAM OF THE BROWSER MAY DECIDE THE EXIT STATUS. The first
+#      version piped --dump-dom into `head -c 200000` under `set -o pipefail`.
+#      On a document over the cap, head exits at the cap, chrome takes SIGPIPE,
+#      and the PIPELINE status is 141 — so a perfectly good page load was thrown
+#      away as UNKNOWN. Real logged-in feeds and challenge interstitials are over
+#      200KB essentially always, which means the classifier worked only in the
+#      regime production never enters. So: redirect to a file, and read the
+#      status of the BROWSER.
+#   2. GREP THE WHOLE DOCUMENT. Even with the status fixed, a truncating capture
+#      cannot see a marker past the cap, and a challenge banner is as likely to
+#      be late in a large DOM as early. There is no cap here on purpose; the
+#      bound is the one page we asked for.
 _probe() {
   local site="$1" dir="$2"
   local chrome; chrome=$(_chrome) || { echo "UNKNOWN (no chrome on this box)"; return 0; }
   local url; url=$(_site_url "$site")
   local marker; marker=$(_site_logged_out_marker "$site")
-  local out
-  out=$("$chrome" --headless --no-sandbox --disable-gpu --user-data-dir="$dir" \
-        --virtual-time-budget=8000 --dump-dom "$url" 2>/dev/null | head -c 200000)
+  local dom; dom=$(mktemp) || { echo "UNKNOWN (probe did not load)"; return 0; }
+  "$chrome" --headless --no-sandbox --disable-gpu --user-data-dir="$dir" \
+        --virtual-time-budget=8000 --dump-dom "$url" >"$dom" 2>/dev/null
   local rc=$?
-  if (( rc != 0 )) || [[ -z "$out" ]]; then echo "UNKNOWN (probe did not load)"; return 0; fi
+  if (( rc != 0 )) || [[ ! -s "$dom" ]]; then
+    rm -f "$dom"; echo "UNKNOWN (probe did not load)"; return 0
+  fi
   # Challenge FIRST: a challenge page often still carries the login form's markup,
   # so testing logged-out first would classify an interrogated live session as a
   # dead one and send the user to re-authenticate a session that is fine.
-  if grep -qiE "$(_site_challenge_marker "$site")" <<<"$out"; then
-    _stamp "$dir" challenge
+  if grep -qiE "$(_site_challenge_marker "$site")" "$dom"; then
+    rm -f "$dom"; _stamp "$dir" challenge
     echo "CHALLENGE — human action required (we do not solve these)"; return 1
   fi
-  if [[ -n "$marker" ]] && grep -qiE "$marker" <<<"$out"; then
-    _stamp "$dir" expired; echo "session expired — human action required"; return 1
+  if [[ -n "$marker" ]] && grep -qiE "$marker" "$dom"; then
+    rm -f "$dom"; _stamp "$dir" expired; echo "session expired — human action required"; return 1
   fi
+  rm -f "$dom"
   _stamp "$dir" authenticated; echo "authenticated (checked $(date -u +%Y-%m-%dT%H:%MZ))"; return 0
 }
 _stamp() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" > "$1/.5dive-liveness" 2>/dev/null || true; }
@@ -293,13 +311,26 @@ cmd_run() {
 
   # LIVENESS BEFORE ACTION. Finding out mid-publish is exactly the failure this
   # whole design is arranged around, and the answer is never to improvise a login.
+  #
+  # AND THE ONLY SAFE SHAPE IS A POSITIVE LIST. This was a `!= CHALLENGE && !=
+  # expired` pair, which means every state the classifier has not got a name for
+  # — UNKNOWN from a probe that did not load, UNKNOWN from a box with no browser
+  # at all — fell straight through to the driver. A publish then ran with NO
+  # liveness check, through a challenge page, and the no-bypass decision was
+  # silently not enforced. UNKNOWN is asymmetric on purpose: QUIET at the
+  # scheduler, because a network blip must not page a person, and a REFUSAL
+  # here, because the action is the irreversible half.
   local state; state=$(_probe "$site" "$dir")
-  if [[ "$state" == CHALLENGE* ]]; then
-    die "$E_COLD" "$site is presenting a security challenge. Stopping: 5dive does not attempt to solve one, by decision and not by limitation. A person clears it — 5dive browser auth $site"
-  fi
-  if [[ "$state" == session\ expired* ]]; then
-    die "$E_COLD" "$site is logged out. Failing closed: no retry, no login attempt, no falling through to a generic click. A person clears this — 5dive browser auth $site"
-  fi
+  case "$state" in
+    CHALLENGE*)
+      die "$E_COLD" "$site is presenting a security challenge. Stopping: 5dive does not attempt to solve one, by decision and not by limitation. A person clears it — 5dive browser auth $site" ;;
+    session\ expired*)
+      die "$E_COLD" "$site is logged out. Failing closed: no retry, no login attempt, no falling through to a generic click. A person clears this — 5dive browser auth $site" ;;
+    authenticated*)
+      : ;;
+    *)
+      die "$E_COLD" "cannot confirm the $site session is live ($state). Refusing to act on a session we did not verify: an unverified session is as likely to be a challenge page as a healthy one, and this is the irreversible half. This state is deliberately QUIET on \`5dive browser status\` — a probe that did not load must not page a person — and fatal here. Re-run the probe, or clear it by hand: 5dive browser auth $site" ;;
+  esac
 
   local driver="${FIVEDIVE_BROWSER_DRIVER:-}"
   [[ -n "$driver" && -x "$driver" ]] || die "$E_UNAVAILABLE" "no executor backend. Set FIVEDIVE_BROWSER_DRIVER to an executable that drives a REAL Chrome profile (the Browser Hand shape: extension + local relay). Playwright is the right tool for BUILDING an adapter and the wrong one for running it, so this refuses rather than falling back to one."

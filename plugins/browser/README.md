@@ -58,7 +58,13 @@ without a scheduled probe the agent finds out **mid-publish**. So:
 
 - `5dive browser status` is a cheap liveness probe **on a schedule, not at publish time**. One
   page load a day is worth more than any adapter. It reports `authenticated`, `session expired —
-  human action required`, or `CHALLENGE — human action required`.
+  human action required`, `CHALLENGE — human action required`, or `UNKNOWN` when the probe could
+  not read the page at all (no browser on the box, a load that failed).
+- **`UNKNOWN` is deliberately asymmetric, and both halves are load-bearing.** `status` stays
+  QUIET on it and exits 0 — a network blip must not page a person, or the signal becomes noise.
+  `run` **refuses** on it, because the action is the irreversible half and an unverified session
+  is as likely to be a challenge page as a healthy one. `run` proceeds only on `authenticated`:
+  a positive list, so a state the classifier has no name for cannot fall through to the driver.
 - A **challenge is classified before a logged-out state**, because a challenge page usually still
   carries the login form's markup. Get that order wrong and you send someone to re-authenticate a
   session that is fine, which teaches them the signal is noise.
