@@ -3787,10 +3787,30 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
               warn "    REFUSED later, on the MAKER's command, reading as tampering rather than"
               warn "    as this (DIVE-2760/2808). 'task answer' is not a re-sign verb, so the"
               warn "    only repair at that point is to re-file the gate from scratch."
-              warn "  fix: get it answered from a seat that signs — root (\`sudo 5dive task answer"
-              warn "    $ident ...\`) or an agent whose grant is root-all/cli-root; --tier=2 if it"
-              warn "    is genuinely the human's. Do NOT grant \`gate-proof sign\` to a cli-scoped"
-              warn "    seat: it signs arbitrary stdin, so the grant forges ANY closure, human:* included."
+              # DIVE-4081: THE REMEDY MUST AGREE WITH answer.sh, OR IT SENDS THE READER
+              # AT A SEAT THAT IS REFUSED. This used to say "root, or an agent whose grant
+              # is root-all/cli-root" unconditionally. For approval/secret/manual — and for
+              # ANY type at tier 2 — answer.sh:870 (DIVE-916/950) demands HUMAN evidence,
+              # and an agent using its own sudo grant to become root is exactly the forge
+              # that rule exists to stop: under sudo `_caller` is empty so the lead-standing
+              # check is skipped, and `SUDO_UID` still belongs to an agent. So that seat CAN
+              # sign and has NO evidence form, the routed reviewer HAS evidence and cannot
+              # sign, and the filer is barred as self-approval — three seats, no mover.
+              # Measured on DIVE-4068, 2026-09-08; the reader followed this text into it.
+              if [[ "$type" == "approval" || "$type" == "secret" || "$type" == "manual" || "$tier" == "2" ]]; then
+                warn "  fix: NOT a root-all/cli-root agent — \`task answer\` REFUSES an agent-sudo"
+                warn "    answer on a ${type}${tier:+ (tier $tier)} gate (DIVE-916/950 human evidence), so that"
+                warn "    seat can sign but has no standing and the gate deadlocks. What completes it:"
+                warn "    a HUMAN tap in Telegram or the dashboard, which carries the evidence AND the"
+                warn "    signature; or re-file routed to a reviewer whose grant signs, so one seat holds"
+                warn "    both. Do NOT grant \`gate-proof sign\` to a cli-scoped seat: it signs arbitrary"
+                warn "    stdin, so the grant forges ANY closure, human:* included."
+              else
+                warn "  fix: get it answered from a seat that signs — root (\`sudo 5dive task answer"
+                warn "    $ident ...\`) or an agent whose grant is root-all/cli-root; --tier=2 if it"
+                warn "    is genuinely the human's. Do NOT grant \`gate-proof sign\` to a cli-scoped"
+                warn "    seat: it signs arbitrary stdin, so the grant forges ANY closure, human:* included."
+              fi
               ;;
             *) _rsig=" [require_sig: whether ${_reviewer} can sign is NOT MEASURABLE from this seat (grant=${_csc}) — unknown, not a no; check it first if a delegated push is refused later]" ;;
           esac
