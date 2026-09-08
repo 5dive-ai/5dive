@@ -945,9 +945,12 @@ JOURNALD
   # and then cannot run — the exact silent-inertness DIVE-4035 removed,
   # reintroduced by the installer. Anything under a plugin's bin/ is staged 755.
   mkdir -p "$LIB_DIR/plugins/.claude-plugin" "$LIB_DIR/plugins/voice/.claude-plugin" \
-           "$LIB_DIR/plugins/voice/bin"
+           "$LIB_DIR/plugins/voice/bin" "$LIB_DIR/plugins/browser/.claude-plugin" \
+           "$LIB_DIR/plugins/browser/bin" "$LIB_DIR/plugins/browser/adapters"
   _plug_ok=1
-  for _pf in .claude-plugin/marketplace.json voice/.claude-plugin/plugin.json voice/README.md voice/bin/voice; do
+  for _pf in .claude-plugin/marketplace.json voice/.claude-plugin/plugin.json voice/README.md voice/bin/voice \
+             browser/.claude-plugin/plugin.json browser/README.md browser/bin/browser \
+             browser/adapters/example.json; do
     if curl -fsSL "$REPO/plugins/$_pf" -o "$LIB_DIR/plugins/$_pf"; then
       case "$_pf" in
         */bin/*) chmod 755 "$LIB_DIR/plugins/$_pf" ;;

@@ -13,6 +13,13 @@
       "category": "channel",
       "source": "./voice",
       "homepage": "https://github.com/5dive-ai/5dive/tree/main/plugins/voice"
+    },
+    {
+      "name": "browser",
+      "description": "Operate a site as yourself — a dedicated browser profile you log into once by hand, then deterministic adapters that decide where to click. The agent is granted the session, never the credentials.",
+      "category": "channel",
+      "source": "./browser",
+      "homepage": "https://github.com/5dive-ai/5dive/tree/main/plugins/browser"
     }
   ]
 }
