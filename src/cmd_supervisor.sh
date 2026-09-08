@@ -2033,6 +2033,36 @@ _sup_quota_rotate() {  # <name>; 0=rotated, 1=no measured target, 2=failed
   return 2
 }
 
+# DIVE-4055: a wall observed while a seat owns live work is a checkpoint
+# boundary, never an account-switch trigger.  Append the only claims automation
+# can honestly make (the row/branch artifacts are preserved; the next attempt
+# must resume by inspecting them), then requeue the row so the heartbeat's
+# dispatch-boundary selector can choose an account before the next first turn.
+#
+# Returns 0=checkpointed, 1=no live row, 2=state/write unmeasured.  Callers must
+# never rotate on 2: an unreadable task state is not proof that the seat is idle.
+_SUP_QUOTA_CHECKPOINTED=0
+_sup_quota_checkpoint_live_tasks() { # <name>
+  local name="$1" n changed stamp note
+  _SUP_QUOTA_CHECKPOINTED=0
+  n=$(db "SELECT COUNT(*) FROM tasks WHERE assignee=$(sqlq "$name") AND status='in_progress';" 2>/dev/null) || return 2
+  [[ "$n" =~ ^[0-9]+$ ]] || return 2
+  (( n > 0 )) || return 1
+  stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || stamp="unknown-time"
+  note="[${stamp}] quota-boundary checkpoint (DIVE-4055) — done: automatic account rotation was held before changing profiles; the task body and task-bound branch/worktree remain the durable work record. next: resume this row from its body, inspect the bound worktree, and continue only after dispatch-boundary headroom selection."
+  changed=$(db "UPDATE tasks
+      SET body = COALESCE(body,'')
+                 || CASE WHEN COALESCE(body,'') = '' THEN '' ELSE char(10)||char(10) END
+                 || $(sqlq "$note"),
+          status='todo', started_at=NULL, updated_at=datetime('now')
+      WHERE assignee=$(sqlq "$name") AND status='in_progress';
+      SELECT changes();" 2>/dev/null) || return 2
+  [[ "$changed" =~ ^[0-9]+$ ]] || return 2
+  (( changed > 0 )) || return 2
+  _SUP_QUOTA_CHECKPOINTED="$changed"
+  return 0
+}
+
 # ── DIVE-3667: fleet rollup — count EVERY class, not a hand-picked five ──────
 #
 # The tick's rollup used to enumerate healthy/slow/stuck/drift/verify-challenge
@@ -2176,10 +2206,25 @@ cmd_supervisor_tick() {
     # successful flip is quiet; no measured destination (or a failed rotate)
     # falls through to the same 24h-deduped human alert as before.
     if [[ "$cls" == "quota-exhausted" && "$actions_on" == "true" ]]; then
-      local quota_rot qrc=0
+      local quota_rot qrc=0 checkpoint_rc=0
       quota_rot=$(jq -r --arg n "$name" '.agents[$n].rotation.enabled // false' <<<"$reg_now")
       if [[ "$quota_rot" == "true" ]]; then
-        if _sup_quota_rotate "$name"; then
+        # The live-row check is immediately adjacent to the old destructive
+        # call.  A read/write failure refuses the flip and falls through to the
+        # existing capacity alert; only a measured zero reaches rotation.
+        _sup_quota_checkpoint_live_tasks "$name" || checkpoint_rc=$?
+        if (( checkpoint_rc == 0 )); then
+          if db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
+                 VALUES ($(sqlq "$name"), 'action', 'quota-exhausted', 'quota-exhausted',
+                         $(sqlq "{\"rung\":\"checkpoint\",\"result\":\"requeued\",\"liveTasks\":${_SUP_QUOTA_CHECKPOINTED}}"));" 2>/dev/null; then
+            acted=$((acted + 1)); events=$((events + 1))
+          else
+            warn "supervisor: quota checkpoint audit insert failed for $name"
+          fi
+          continue
+        elif (( checkpoint_rc == 2 )); then
+          excerpt="${excerpt}; live-task state/checkpoint unmeasured — account rotation refused"
+        elif _sup_quota_rotate "$name"; then
           if db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
                  VALUES ($(sqlq "$name"), 'action', 'quota-exhausted', 'quota-exhausted',
                          $(sqlq "{\"rung\":\"rotate\",\"result\":\"ok\",\"measuredTarget\":true}"));" 2>/dev/null; then

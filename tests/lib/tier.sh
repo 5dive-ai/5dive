@@ -162,7 +162,50 @@ TIER_CAL_SCALE_MAX_PCT=150
 # from the box you happen to be on — that is exactly how 173000 got here, and the
 # failure mode is silent (every CI probe then reads fast, the floor clamps, and the
 # relative budget quietly stops existing while still printing a ratio).
-TIER_CAL_BASELINE_US=119000
+# ── RE-DERIVED AGAIN 2026-09-08 (DIVE-4064): 119000 -> 138281 ────────────────
+# ENVIRONMENT: GitHub-hosted `ubuntu-latest`, harvested OUT OF CI JOB LOGS with
+# scripts/tier-cal-harvest.sh --last=20 --branch=main --workflow=unit-tests.yml and read
+# by scripts/tier-cal-window.sh — 84 shard reports across 20 main runs, 2026-09-05 to
+# 2026-09-08. NOT re-derived from the box anyone happens to be on; the paragraph above
+# says why that is the failure mode and it still applies.
+#
+# THE FLEET IS BIMODAL, AND THAT IS THE FINDING. The 84 readings split into a fast
+# cluster (112890-160709, n=23) and a slow one (168627-182981, n=61), with essentially
+# nothing between. Against 119000 the slow cluster reads 141-153%, so it crosses
+# TIER_CAL_SCALE_MAX_PCT=150 and exits 6 UNDETERMINED — which the `test-installed-host`
+# aggregator then launders into a REQUIRED-context failure while every harness passed.
+# That is what blocked PR #786 (DIVE-4035) with zero non-zero harness rows.
+#
+# 138281 IS THE MEDIAN OF THE FAST CLUSTER, and the cluster choice is the whole
+# argument. The clamp floor is 1.0, so relief can only ever be granted to a draw SLOWER
+# than baseline: anchoring on the slow mode gives the slow majority no relief and turns
+# their draw into a red, which is the same silent-disable failure the paragraph above
+# records for 173000. "A runner drawing normal" has to mean the FAST mode for the
+# mechanism to have anything to do.
+#
+# MEASURED OVER THE BAND, because a single number with no sensitivity is not refutable.
+# Sweeping the baseline against all 84 reports:
+#
+#     baseline    exit-6 UNDETERMINED    over-budget
+#     119000              3                   5      <- today
+#     121500..164500      0                   5      <- the safe band
+#     165000              0                   6
+#     171689              0                  17      <- median of ALL readings
+#
+# So the band that removes the flake without inventing a single new over-budget run is
+# 121500-164500, and 138281 sits inside it with ~17k of margin below and ~26k above.
+# Note where the naive estimator lands: the median of all 84 (171333) and DIVE-4064's
+# own spot reading (~178000) are both PAST the upper edge — they would have traded 3
+# UNDETERMINED runs for 17 hard budget failures. The bimodality is why.
+#
+# WHAT THIS DOES NOT FIX, stated because it is not mine to hide: 5 of the 84 are over
+# budget at EVERY baseline in the sweep, including today's. One is in the newest 8 runs
+# (`pristine-s1`, 365s against a 300s cap). That is a real corpus overrun, it predates
+# this change, and this change neither creates nor cures it. TIER_CAL_SCALE_MAX_PCT and
+# the 300s budget are untouched, and the shard counts stay pinned at 2 — a capacity
+# raise is a policy decision with its own gate (tests/corpus_tier_budget_unit.sh
+# enforces exactly that, and it caught a first draft of this commit that raised them).
+TIER_CAL_BASELINE_US=138281
 
 # How long ONE sample of the probe should run. This is the PRECISION knob from note 1:
 # the probe's own relative error must sit well under the headroom being protected (9%

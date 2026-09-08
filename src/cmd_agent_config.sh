@@ -461,7 +461,7 @@ cmd_tui() {
   if [[ "$type" == "codex" ]]; then
     case ",${channels}," in
       *,telegram,*|*,dashboard,*)
-        fail "$E_CONFLICT" "agent '$name' has no interactive Codex TUI: its tmux session is the ${channels} dispatcher. View transport logs with '5dive agent tail $name'; inspect Codex work in /home/agent-${name}/.codex/sessions."
+fail "$E_CONFLICT" "agent '$name' has no interactive Codex TUI: its tmux session is the ${channels} dispatcher. View transport logs with '5dive agent logs $name --tmux'; inspect Codex work in /home/agent-${name}/.codex/sessions."
         ;;
     esac
   fi
