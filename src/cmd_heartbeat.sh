@@ -1938,14 +1938,37 @@ _hb_claim_task() {
 # of luck. This event carries a per-reclaim idem_key (kind|id|epoch) so cycles
 # ARE countable, and its detail records the started_at value being erased, which
 # is the fact the row itself is about to stop carrying.
+#
+# DIVE-4104 — TWO MODES, ONE ERASURE SITE. The fourth argument selects what
+# happens to the HANDOFF; the claim reset (status todo, started_at cleared,
+# first_started_at preserved because this is the only writer that clears it) is
+# identical in both and stays in exactly one statement, which is what the
+# structural arm in tests/task_first_started_at_unit.sh exists to hold.
+#
+#   clean         (default) — the row goes back as buildable work. Unchanged.
+#   keep-handoff  — the row goes back into the VERIFIER's queue: assignee is
+#                   re-asserted to the row's verifier and the delivery stamps
+#                   are left alone, so `task show` still prints
+#                   `handoff: delivered (awaiting verifier ACK)`. Guarded on
+#                   verifier set and the delivery being live and ungraded, so
+#                   it can never invent a handoff.
 _hb_reclaim_to_todo() {
-  local name="$1" id="$2" why="$3"
+  local name="$1" id="$2" why="$3" mode="${4:-clean}"
   # Read the value BEFORE the UPDATE destroys it — the whole point is that the
   # erased timestamp survives somewhere a reader can find it.
   local prev_started
   prev_started=$(db "SELECT COALESCE(started_at,'') FROM tasks WHERE id=${id};" 2>/dev/null) || prev_started=""
-  db "UPDATE tasks SET status='todo', started_at=NULL, updated_at=datetime('now')
-      WHERE id=${id} AND status='in_progress';" 2>/dev/null || true
+  # The mode's two fragments. Written as plain single-quoted shell strings and
+  # NEVER with backticks: this whole statement is one double-quoted string, so a
+  # backticked column name inside even a comment would be executed by the shell.
+  local _set_extra="" _where_extra="" vfier=""
+  if [[ "$mode" == "keep-handoff" ]]; then
+    vfier=$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${id};" 2>/dev/null) || vfier=""
+    _set_extra=", assignee=verifier"
+    _where_extra=" AND verifier IS NOT NULL AND verifier<>'' AND maker_agent IS NOT NULL AND handoff_delivered_at IS NOT NULL AND handoff_ack_at IS NULL"
+  fi
+  db "UPDATE tasks SET status='todo'${_set_extra}, started_at=NULL, updated_at=datetime('now')
+      WHERE id=${id} AND status='in_progress'${_where_extra};" 2>/dev/null || true
   # NANOSECONDS, not seconds. lifecycle_events has a UNIQUE index on idem_key and
   # a collision is a SILENT no-op — exactly how task.started lost its re-claims.
   # A second-granularity key is enough for the real cadence and NOT enough for a
@@ -1953,10 +1976,12 @@ _hb_reclaim_to_todo() {
   # later. Caught by tests/task_first_started_at_unit.sh, whose two reclaims land
   # in the same second.
   local now_stamp; now_stamp=$(date -u +%s%N 2>/dev/null) || now_stamp=""
+  local _detail="reclaim -> todo (DIVE-3251); why=${why}; cleared started_at=${prev_started:-<empty>}"
+  [[ "$mode" == "keep-handoff" ]] && _detail="reclaim -> verifier queue, delivery preserved (DIVE-4104); why=${why}; cleared started_at=${prev_started:-<empty>}"
   ledger_emit "task.reclaimed" ident="$(_hb_ident "$id")" task_id="$id" \
     actor="$name" authority="dispatcher" \
     idem="task.reclaimed|${id}|${now_stamp}" \
-    detail="reclaim -> todo (DIVE-3251); why=${why}; cleared started_at=${prev_started:-<empty>}" || true
+    detail="$_detail" || true
   # DIVE-3932 acceptance: A CRASH MUST LEAVE A FAILED RUN, NOT NO RUN. This sweep
   # is where an attempt that died without reaching any boundary is finally
   # observed — the process is gone, so nothing on the seat's side can close its
@@ -1965,8 +1990,13 @@ _hb_reclaim_to_todo() {
   # (orphan-by-restart, stall, ceiling) rather than a fault we did not witness.
   # Scoped to the reclaimed seat's run, so a row another agent is legitimately
   # working is untouched.
-  _run_close_for_task "$id" abandoned reclaimed_to_todo "$name" "$why" || true
-  _hb_log "[$name] reclaimed $(_hb_ident "$id") -> todo ($why)"
+  if [[ "$mode" == "keep-handoff" ]]; then
+    _run_close_for_task "$id" abandoned reclaimed_to_verifier "$name" "$why" || true
+    _hb_log "[$name] reclaimed $(_hb_ident "$id") -> todo on verifier ${vfier:-?}, still DELIVERED ($why) — not bounced to the maker (DIVE-4104)"
+  else
+    _run_close_for_task "$id" abandoned reclaimed_to_todo "$name" "$why" || true
+    _hb_log "[$name] reclaimed $(_hb_ident "$id") -> todo ($why)"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -2111,38 +2141,25 @@ _hb_row_workspace_intact() {
   return 1
 }
 
-# DIVE-4104 — the reclaim that KEEPS THE DELIVERY. Same clean-slate reset as
-# `_hb_reclaim_to_todo` for the CLAIM (status todo, started_at cleared so the
-# age math and nudge counter restart), and deliberately NOT a clean slate for
-# the HANDOFF: assignee is re-asserted to the row's verifier and
-# handoff_delivered_at / handoff_ack_at are not touched, so `task show` still
-# prints `handoff: delivered (awaiting verifier ACK)` and the row re-enters the
-# VERIFIER's queue rather than the maker's.
+# DIVE-4104 — the reclaim that KEEPS THE DELIVERY. A named entry point for the
+# shared reclaim's `keep-handoff` mode, so rule (a) reads as what it does and
+# there is still exactly ONE statement in this file that clears `started_at`
+# (and therefore exactly one place that has to preserve `first_started_at`).
+# The claim is reset the same way `clean` resets it; the HANDOFF deliberately is
+# not — assignee is re-asserted to the row's verifier and the delivery stamps
+# are untouched, so the row re-enters the VERIFIER's queue rather than the
+# maker's and `task show` still prints `handoff: delivered (awaiting verifier
+# ACK)`.
 #
 # The assignee write is a re-assertion, not a change: `_task_route_to_verifier`
 # already set it on delivery. It is written anyway because this function's
 # contract is "the row is in the verifier's queue when I return", and a
 # contract that holds only while no other writer has moved the column is the
-# defect this ticket is about. Guarded on `verifier IS NOT NULL` and on the
-# delivery being live, so it can never invent a handoff.
+# defect this ticket is about. The mode's WHERE guard (verifier set, maker set,
+# delivered and not yet ACKed) means it can never invent a handoff.
 _hb_reclaim_to_verifier() {
   local name="$1" id="$2" why="$3"
-  local prev_started vfier
-  prev_started=$(db "SELECT COALESCE(started_at,'') FROM tasks WHERE id=${id};" 2>/dev/null) || prev_started=""
-  vfier=$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${id};" 2>/dev/null) || vfier=""
-  db "UPDATE tasks SET status='todo', assignee=verifier, started_at=NULL,
-        updated_at=datetime('now')
-      WHERE id=${id} AND status='in_progress'
-        AND verifier IS NOT NULL AND verifier<>''
-        AND maker_agent IS NOT NULL
-        AND handoff_delivered_at IS NOT NULL AND handoff_ack_at IS NULL;" 2>/dev/null || true
-  local now_stamp; now_stamp=$(date -u +%s%N 2>/dev/null) || now_stamp=""
-  ledger_emit "task.reclaimed" ident="$(_hb_ident "$id")" task_id="$id" \
-    actor="$name" authority="dispatcher" \
-    idem="task.reclaimed|${id}|${now_stamp}" \
-    detail="reclaim -> verifier queue, delivery preserved (DIVE-4104); why=${why}; cleared started_at=${prev_started:-<empty>}" || true
-  _run_close_for_task "$id" abandoned reclaimed_to_verifier "$name" "$why" || true
-  _hb_log "[$name] reclaimed $(_hb_ident "$id") -> todo on verifier ${vfier:-?}, still DELIVERED ($why) — not bounced to the maker (DIVE-4104)"
+  _hb_reclaim_to_todo "$name" "$id" "$why" keep-handoff
 }
 
 # Unwedge this agent's stuck in_progress tasks. Three escalating rules, cheapest
