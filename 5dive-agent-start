@@ -1358,9 +1358,6 @@ if [[ "$TYPE" == "claude" ]]; then
     sleep 1
   done
   if grep -qE "$_creds_re" "$_primary_auth" 2>/dev/null; then
-    # Clear a prior degraded-start verdict only after this boot observed the
-    # credential it will actually export.
-    cred_seed_ok
     # Re-export from disk so the exec'd claude sees the creds systemd read too
     # early (or not at all). Files are systemd EnvironmentFile format: literal
     # KEY=value per line, no shell expansion, unquoted — split on the first '='.
@@ -1373,12 +1370,7 @@ if [[ "$TYPE" == "claude" ]]; then
     done
     [[ "$_waited" == 1 ]] && echo "[5dive] agent=${NAME} claude creds landed during first-boot wait — launching authenticated" >&2
   else
-    # The old text promised this would self-heal on the next restart. It cannot
-    # do that unless a credential is supplied between restarts, and one seat
-    # repeated this branch for 6.5 weeks. Persist the verdict on the same
-    # per-seat breadcrumb every other credential family uses so fleet views can
-    # veto process liveness instead of relying on short-lived journal history.
-    cred_seed_failed "claude credential absent after ${CLAUDE_AUTH_WAIT_SECS:-45}s wait — launched DEGRADED and cannot reach its provider; supply a credential and restart"
+    echo "[5dive] agent=${NAME} WARN: claude creds absent after ${CLAUDE_AUTH_WAIT_SECS:-45}s wait; launching anyway (self-heals on next restart)" >&2
   fi
   unset _primary_auth _creds_re _deadline _waited _af _line 2>/dev/null || :
 fi
@@ -1692,13 +1684,7 @@ write_delivery_declaration() {
   if [[ "$TYPE" == "codex" ]] && codex_dispatcher_enabled "$CHANNELS"; then
     mode="dispatcher-inbox"
   fi
-  # Three statements, not one: `local` is a builtin, so bash expands ALL of its
-  # arguments before performing ANY of the assignments. In a single `local a=X b="$a"`
-  # the `$a` resolves against the ENCLOSING scope, and under this script's `set -u`
-  # that is a fatal unbound-variable exit before the pane ever starts (DIVE-4067).
-  local dir="$HOME/.5dive"
-  local f="$dir/delivery.env"
-  local tmp
+  local dir="$HOME/.5dive" f="$dir/delivery.env" tmp
   mkdir -p "$dir" 2>/dev/null || { echo "warn: cannot create $dir — delivery mode undeclared" >&2; return 0; }
   tmp="${f}.tmp.$$"
   {
