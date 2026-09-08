@@ -1,7 +1,7 @@
 {
   "name": "browser",
   "version": "1.0.0",
-  "description": "Operate a site as yourself — a dedicated browser profile you log into once by hand, driven by deterministic adapters.",
+  "description": "Persistent human-authenticated browser sessions — log into a site once by hand, then let deterministic adapters operate it. Never solves a security challenge; it stops and asks you.",
   "author": {
     "name": "5dive",
     "email": "support@5dive.com",

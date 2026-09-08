@@ -63,6 +63,10 @@ mkprofile() {  # mkprofile <site> <dom>
 }
 LIVE_DOM='<html><body><div id="feed">posts</div></body></html>'
 DEAD_DOM='<html><body><form action="/login"><input name="pw"></form></body></html>'
+# A challenge page usually still carries the login form's markup. That overlap is
+# the whole reason T8 exists: classify this as "expired" and the operator is told
+# to re-authenticate a session that is fine.
+CHALLENGE_DOM='<html><body><form action="/login"></form><div class="g-recaptcha"></div></body></html>'
 
 mkadapter() {  # mkadapter <site> <verify-url> <expect> [extra-step-op]
   local extra=""
@@ -182,12 +186,14 @@ tc 'T4a ...naming the human-only fix'        '5dive browser auth dead' "$ERR"
 t  'T4a ...and the driver was never invoked' 'no' "$([[ -f "$TMP/driver-plan.json" ]] && echo yes || echo no)"
 tc 'T4a ...and does not retry or improvise'  'no retry, no login attempt' "$ERR"
 
-run "$BROWSER" auth --status dead
+run "$BROWSER" status dead
 t  'T4b --status reports a dead profile as cold' 75 "$RC"
-tc 'T4b ...by name'                              'COLD' "$OUT"
-run "$BROWSER" auth --status x
+tc 'T4b ...in the words the adopted design names' 'session expired — human action required' "$OUT"
+run "$BROWSER" auth --status dead
+t  'T4b2 auth --status is still an alias, so neither name is a dead link' 75 "$RC"
+run "$BROWSER" status x
 t  'T4c ...and a live one as live' 0 "$RC"
-tc 'T4c ...positive control'       'live' "$OUT"
+tc 'T4c ...positive control'       'authenticated' "$OUT"
 
 # ================== T5 gap 2: the verdict is the out-of-band read, not the driver
 # MUTANT 1 — driver green, artifact absent. "Posted a draft and reported success."
@@ -233,6 +239,32 @@ unset FIVEDIVE_BROWSER_DRIVER
 run "$BROWSER" run x publish --slug=slug-42
 t  'T6a no driver refuses' 69 "$RC"
 tc 'T6a ...rather than silently falling back to an automated browser' 'Browser Hand' "$ERR"
+
+# ======================= T8 a security challenge is a HARD STOP, never a bypass
+# Decided 2026-09-07: "if a platform presents a security challenge, the executor
+# stops and requests human action rather than attempting to bypass it." The mutant
+# is not "it tries to solve it" — nothing here could — it is that a challenge gets
+# classified as an expired session, which sends a human to re-authenticate a
+# session that is fine and teaches them the signal is noise.
+mkprofile chal "$CHALLENGE_DOM" >/dev/null
+mkadapter chal "file://$TMP/artifact.html" 'PUBLISHED'
+run "$BROWSER" status chal
+t  'T8a a challenge is its own state, not "expired"' 75 "$RC"
+tc 'T8a ...named as a challenge'                     'CHALLENGE' "$OUT"
+tn 'T8a ...and NOT reported as an expired session'   'session expired' "$OUT"
+mkdriver 0
+rm -f "$TMP/driver-plan.json"
+run "$BROWSER" run chal publish --body=hi
+t  'T8b run stops on a challenge'          75 "$RC"
+t  'T8b ...without invoking the driver'    'no' "$([[ -f "$TMP/driver-plan.json" ]] && echo yes || echo no)"
+tc 'T8b ...saying it is a decision, not a limitation' 'does not attempt to solve' "$ERR"
+# The framing lodar closed: this is persistent human-authenticated sessions. The
+# anti-bot wording is the one that was ruled out for docs, marketing AND the
+# plugin description, so grade the shipped strings rather than trusting a review.
+for f in "$ROOT/plugins/browser/.claude-plugin/plugin.json" "$ROOT/plugins/browser/README.md" "$ROOT/plugins/.claude-plugin/marketplace.json"; do
+  tn "T8c $(basename "$f") does not sell anti-bot evasion" 'fingerprint' "$(cat "$f")"
+done
+tc 'T8d the manifest uses the adopted framing' 'human-authenticated'   "$(jq -r '.description' "$ROOT/plugins/browser/.claude-plugin/plugin.json")"
 
 # ============================================ T7 the shipped example adapter is real
 EX="$ROOT/plugins/browser/adapters/example.json"

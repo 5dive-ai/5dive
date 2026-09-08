@@ -16,7 +16,7 @@
     },
     {
       "name": "browser",
-      "description": "Operate a site as yourself — a dedicated browser profile you log into once by hand, then deterministic adapters that decide where to click. The agent is granted the session, never the credentials.",
+      "description": "Persistent human-authenticated browser sessions: you log into a site once by hand, the agent is granted the session and never the credentials, and deterministic adapters decide where to click. A security challenge is a hard stop that asks for a person.",
       "category": "channel",
       "source": "./browser",
       "homepage": "https://github.com/5dive-ai/5dive/tree/main/plugins/browser"

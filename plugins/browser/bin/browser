@@ -41,8 +41,12 @@ usage() {
 
   5dive browser setup                 # one-time, as root: create the profile store
   5dive browser auth <site>           # open a browser; log in yourself, once
-  5dive browser auth --status [site]  # is the session still alive? (run on a SCHEDULE)
+  5dive browser status [site]         # per-site auth state (run on a SCHEDULE)
   5dive browser ls                    # profiles, and when each was last seen alive
+
+  A security challenge (CAPTCHA, 2FA, "unusual activity") is a HARD STOP that asks
+  for a person. 5dive does not attempt to solve one. What this is: persistent
+  human-authenticated sessions — not anti-bot bypassing.
   5dive browser run <site> <action> [--key=value ...]
                                       # execute an adapter action, deterministically
 
@@ -136,9 +140,10 @@ cmd_auth() {
 
   local chrome; chrome=$(_chrome) || die "$E_UNAVAILABLE" "no Chrome or Chromium on this box — auth hands a real browser to a human and there is nothing to hand over."
 
-  # NOT headless, and no automation flags: this window is for a PERSON. It is also
-  # the reason the profile survives detection later — a profile a human actually
-  # used is not fingerprinted the way an automation-controlled browser is.
+  # NOT headless, and no automation flags: this window is for a PERSON. What this
+  # capability IS, in the words the decision landed on (lodar, 2026-09-07): a
+  # persistent human-authenticated browser session. It is NOT anti-bot bypassing,
+  # and describing it that way invites exposure the design itself avoids.
   printf 'Opening a browser for %s.\n\n  profile: %s\n\nLog in yourself. 5dive never sees the password, and there is nothing here that\ntypes one. Close the window when you are logged in.\n\n' "$site" "$dir"
   if [[ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
     printf 'No display on this box, so the window cannot open HERE. Forward one and re-run,\nor run this on your own machine against the same profile path.\n' >&2
@@ -157,6 +162,14 @@ _site_url() {
 _site_logged_out_marker() {
   local a; a="$ADAPTER_DIR/$1.json"
   [[ -f "$a" ]] && jq -r '.probe.logged_out_when_dom_matches // empty' "$a"
+}
+# THERE IS DELIBERATELY NO BYPASS BEHIND THIS. It classifies, names a human, and
+# stops. Decided 2026-09-07: "if a platform presents a security challenge, the
+# executor stops and requests human action rather than attempting to bypass it."
+_site_challenge_marker() {
+  local a; a="$ADAPTER_DIR/$1.json"
+  local m; m=$([[ -f "$a" ]] && jq -r '.probe.challenge_when_dom_matches // empty' "$a")
+  echo "${m:-(g-recaptcha|hcaptcha|cf-challenge|/checkpoint/challenge|two-factor|verify-your-identity)}"
 }
 
 # Liveness. Sessions die on the SITE's schedule, not ours — device checks, 2FA
@@ -199,10 +212,17 @@ _probe() {
         --virtual-time-budget=8000 --dump-dom "$url" 2>/dev/null | head -c 200000)
   local rc=$?
   if (( rc != 0 )) || [[ -z "$out" ]]; then echo "UNKNOWN (probe did not load)"; return 0; fi
-  if [[ -n "$marker" ]] && grep -qiE "$marker" <<<"$out"; then
-    _stamp "$dir" cold; echo "COLD — logged out, needs a human"; return 1
+  # Challenge FIRST: a challenge page often still carries the login form's markup,
+  # so testing logged-out first would classify an interrogated live session as a
+  # dead one and send the user to re-authenticate a session that is fine.
+  if grep -qiE "$(_site_challenge_marker "$site")" <<<"$out"; then
+    _stamp "$dir" challenge
+    echo "CHALLENGE — human action required (we do not solve these)"; return 1
   fi
-  _stamp "$dir" live; echo "live (checked $(date -u +%Y-%m-%dT%H:%MZ))"; return 0
+  if [[ -n "$marker" ]] && grep -qiE "$marker" <<<"$out"; then
+    _stamp "$dir" expired; echo "session expired — human action required"; return 1
+  fi
+  _stamp "$dir" authenticated; echo "authenticated (checked $(date -u +%Y-%m-%dT%H:%MZ))"; return 0
 }
 _stamp() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" > "$1/.5dive-liveness" 2>/dev/null || true; }
 
@@ -274,12 +294,15 @@ cmd_run() {
   # LIVENESS BEFORE ACTION. Finding out mid-publish is exactly the failure this
   # whole design is arranged around, and the answer is never to improvise a login.
   local state; state=$(_probe "$site" "$dir")
-  if [[ "$state" == COLD* ]]; then
+  if [[ "$state" == CHALLENGE* ]]; then
+    die "$E_COLD" "$site is presenting a security challenge. Stopping: 5dive does not attempt to solve one, by decision and not by limitation. A person clears it — 5dive browser auth $site"
+  fi
+  if [[ "$state" == session\ expired* ]]; then
     die "$E_COLD" "$site is logged out. Failing closed: no retry, no login attempt, no falling through to a generic click. A person clears this — 5dive browser auth $site"
   fi
 
   local driver="${FIVEDIVE_BROWSER_DRIVER:-}"
-  [[ -n "$driver" && -x "$driver" ]] || die "$E_UNAVAILABLE" "no executor backend. Set FIVEDIVE_BROWSER_DRIVER to an executable that drives a REAL Chrome profile (the Browser Hand shape) — a real profile is not fingerprinted the way an automation-controlled browser is, which is why this is not Playwright by default."
+  [[ -n "$driver" && -x "$driver" ]] || die "$E_UNAVAILABLE" "no executor backend. Set FIVEDIVE_BROWSER_DRIVER to an executable that drives a REAL Chrome profile (the Browser Hand shape: extension + local relay). Playwright is the right tool for BUILDING an adapter and the wrong one for running it, so this refuses rather than falling back to one."
 
   local plan; plan=$(jq -c --arg a "$action" --arg profile "$dir" --argjson args "$args" \
       '{profile: $profile, steps: .actions[$a].steps, args: $args}' "$f")
@@ -312,6 +335,7 @@ case "${1:-}" in
   -h|--help|help|"") usage ;;
   setup) shift; cmd_setup "$@" ;;
   auth)  shift; cmd_auth  "$@" ;;
+  status) shift; _auth_status "${1:-}" ;;
   ls)    shift; cmd_ls    "$@" ;;
   run)   shift; cmd_run   "$@" ;;
   *) die "$E_USAGE" "unknown: $PROG $1 (see: $PROG --help)" ;;

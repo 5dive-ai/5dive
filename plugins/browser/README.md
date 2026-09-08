@@ -1,4 +1,11 @@
-# browser — operate a site as yourself
+# browser — persistent human-authenticated browser sessions
+
+**What this is, in the words the decision landed on (lodar, 2026-09-07): persistent
+human-authenticated browser sessions.** It is *not* anti-bot bypassing. A CAPTCHA, a 2FA prompt or
+an "unusual activity" interstitial is a **hard stop that asks for a person** — the executor never
+attempts to solve one. That is a decision, not a limitation, and the second framing invites legal
+and reputational exposure the actual design avoids. Use the first one in docs, marketing and the
+plugin description.
 
 `5dive browser` is a **general capability, not a distribution product.** We do not curate a
 platform list and we do not choose per-site API-vs-browser paths; the user does. Adapters are
@@ -8,7 +15,7 @@ than a detail.
 ```
 5dive browser setup                 # once, as root: create the profile store
 5dive browser auth <site>           # a browser opens; you log in yourself
-5dive browser auth --status         # is the session still alive? run this on a SCHEDULE
+5dive browser status                # per-site auth state; run this on a SCHEDULE
 5dive browser ls                    # profiles, and when each was last seen alive
 5dive browser run <site> <action> [--key=value ...]
 ```
@@ -49,8 +56,12 @@ Sites invalidate sessions on their own schedule, throw device checks, re-prompt 
 interstitial on "unusual activity". A profile that worked Monday is logged out Thursday, and
 without a scheduled probe the agent finds out **mid-publish**. So:
 
-- `5dive browser auth --status` is a cheap liveness probe **on a schedule, not at publish time**.
-  One page load a day is worth more than any adapter.
+- `5dive browser status` is a cheap liveness probe **on a schedule, not at publish time**. One
+  page load a day is worth more than any adapter. It reports `authenticated`, `session expired —
+  human action required`, or `CHALLENGE — human action required`.
+- A **challenge is classified before a logged-out state**, because a challenge page usually still
+  carries the login form's markup. Get that order wrong and you send someone to re-authenticate a
+  session that is fine, which teaches them the signal is noise.
 - A cold profile **pings a human**, naming the site, with a one-command fix. Only a person at a
   browser can clear it.
 - Adapters **fail closed** on an unexpected logged-out state: never retry, never improvise a login,
@@ -78,7 +89,20 @@ the driver's. A DOM assertion on the page you just acted on catches neither fail
 ## The executor
 
 The backend is named by `FIVEDIVE_BROWSER_DRIVER` and must drive a **real Chrome profile**
-(the Browser Hand shape: extension / local bridge). The reason is not better automation — it is
-that a real profile is not fingerprinted the way an automation-controlled browser is. Playwright is
-the right tool for *building and testing* an adapter and the wrong tool for *running* it against a
-site that detects automation. `run` refuses rather than silently falling back to one.
+(the Browser Hand shape: extension + local relay). Playwright is the right tool for *building and
+testing* an adapter and the wrong tool for *running* it, so `run` refuses rather than silently
+falling back to one. One executor, not six: each candidate runtime carries its own site adapters on
+someone else's maintenance schedule, so six dependencies is six adapter surfaces that rot.
+
+## Not shipped yet, and named so nobody assumes it
+
+- **SERVER mode** — a persistent Chrome on a virtual display (Xvfb) with the 5dive extension and a
+  local relay. `auth` currently needs a display and refuses without one instead of pretending.
+- **The re-auth viewer** — exposing the session through a temporary noVNC/KasmVNC URL so a person
+  can log in or clear a challenge from a phone. That URL is **credential-grade while it is open**:
+  short TTL, single use, and never written to a log, a task body or a chat message. Decide that
+  with the flow, not after.
+- **RELAY mode** — an outbound relay to Chrome on the user's own laptop. It must target a
+  **dedicated profile on that desktop, never the user's default**; reaching the default discards
+  the entire reason profile-per-site is the design, turning an adapter bug into their bank and
+  their email. Do not ship it unscoped.
