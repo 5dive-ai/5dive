@@ -251,5 +251,144 @@ grep -q '^DERIVED=v0\.18\.0$' <<<"$out" \
   && ok_t 'NEGATIVE CONTROL: an un-neutralised call DOES inherit it (v0.18.0) — so the arm above is not vacuous' \
   || bad_t 'the ambient value no longer reaches the derivation at all, so the neutralisation arm proves nothing' "rc=$rc out=$out"
 
+
+# =====================================================================================
+# DIVE-4086 — THE LEVEL IS DERIVED FROM THE COMMITS IN THE CUT, not from the run.
+#
+# The defect these arms pin: a scheduled cut that started at 07:24 and polled until
+# 07:54 consumed the tip a human asked at 07:28 to be cut as a minor, and tagged it
+# v0.27.1. Nothing failed — the level was attached to the RUN. So the arms below all
+# ask the same question in different ways: does the RANGE decide?
+#
+# run_range seeds a repo with real subjects so `git log` in the extracted block has
+# something to read. run_block's seed commit cannot express this: its range is empty.
+# $1 = .release-floor   $2 = incumbent tag to place on the first commit
+# $3 = 'lint' to also add .github/workflows/pr-title-lint.yml before the series
+# $4.. = commit subjects to lay down AFTER that tag
+run_range(){
+  local floorval="$1" tag="$2" lint="$3"; shift 3
+  local d subj; d=$(mktemp -d)
+  ( set -e
+    cd "$d"; git init -q .; git config user.email a@b; git config user.name t
+    printf 'seed\n' > seed.txt; git add seed.txt; git commit -q -m 'chore: seed'
+    [[ -n "$floorval" ]] && printf '%s\n' "$floorval" > .release-floor
+    git add -A; git commit -q -m 'chore: floor' --allow-empty
+    [[ -n "$tag" ]] && git tag "$tag"
+    if [[ "$lint" == lint ]]; then
+      mkdir -p .github/workflows; printf 'name: pr-title-lint\n' > .github/workflows/pr-title-lint.yml
+      git add -A; git commit -q -m 'ci: add the PR-title lint'
+    fi
+    for subj in "$@"; do git commit -q --allow-empty -m "$subj"; done
+  ) >/dev/null 2>&1
+  ( cd "$d"
+    incumbent=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+    eval "$BLOCK"
+    printf 'DERIVED=%s\n' "${tag:-<unset>}"
+  ) 2>&1
+  local rc=$?; rm -rf "$d"; return $rc
+}
+# Every call neutralises RELEASE_LEVEL for the DIVE-2539 reason above: this file runs in
+# two jobs and one of them sets it. An arm about the COMMITS must not read the run's env.
+run_derive(){ ( unset RELEASE_LEVEL; run_range "$@" ); }
+
+echo "-- DIVE-4086: a feat in the range cuts a MINOR, with no input at all"
+out=$(run_derive '0.17.8' v0.27.1 nolint 'feat(plugin): a declared plugin verb is now dispatched'); rc=$?
+grep -q '^DERIVED=v0\.28\.0$' <<<"$out" \
+  && ok_t 'THE MEASURED CASE: feat #786 in the range derives v0.28.0 from the SCHEDULED path — the cut that shipped v0.27.1 would now agree with lodar' \
+  || bad_t 'a feat in the range still derives a patch; the epoch is still decided by which run wins the tip' "rc=$rc out=$out"
+
+out=$(run_derive '0.17.8' v0.27.1 nolint 'fix: a thing' 'test: an arm' 'chore: tidy'); rc=$?
+grep -q '^DERIVED=v0\.27\.2$' <<<"$out" \
+  && ok_t 'only fix/test/chore in the range -> PATCH (the rule is a feature, not any commit)' \
+  || bad_t 'a range with no feature moved the minor; every nightly would declare an epoch' "rc=$rc out=$out"
+
+out=$(run_derive '0.17.8' v0.27.1 nolint 'feat!: the shape changed'); rc=$?
+grep -q '^DERIVED=v1\.0\.0$' <<<"$out" \
+  && ok_t "a '!' in the subject beats feat and cuts a MAJOR" \
+  || bad_t 'a breaking marker derived below major' "rc=$rc out=$out"
+
+out=$(run_derive '0.17.8' v0.27.1 nolint 'fix: ordinary' 'feat: the headline' 'chore: tidy after'); rc=$?
+grep -q '^DERIVED=v0\.28\.0$' <<<"$out" \
+  && ok_t 'ONE feat anywhere in the range is enough — it is not the last commit that decides' \
+  || bad_t 'the level followed the tip commit rather than the range' "rc=$rc out=$out"
+
+echo "-- and the level the cut REPORTS names what forced it (acceptance c)"
+out=$(run_derive '0.17.8' v0.27.1 nolint 'feat(plugin): a declared plugin verb is now dispatched'); rc=$?
+grep -q "level: minor (derived minor from v0.27.1..HEAD — forced by .*feat(plugin)" <<<"$out" \
+  && ok_t 'the log line names the commit that forced the level, so a reader of the run can see WHY' \
+  || bad_t 'the cut does not say which commit forced the level' "rc=$rc out=$out"
+
+echo "-- DIVE-4086: an untyped subject REFUSES, but only after the lint landed"
+# The bounding is the load-bearing half. 30 of the 60 merges before this change carry no
+# conventional type, so an unbounded refusal would red every cut until they aged out —
+# the change meant to stop one mis-levelled tag would stop publishing altogether.
+out=$(run_derive '0.17.8' v0.27.1 lint 'DIVE-1234: an untyped subject'); rc=$?
+[[ $rc -ne 0 ]] && grep -q 'carry no conventional type' <<<"$out" \
+  && ok_t 'AFTER the lint exists, an untyped subject refuses the cut rather than guessing patch' \
+  || bad_t 'an untyped subject silently derived a level; a feature would ship as a patch' "rc=$rc out=$out"
+
+grep -q 'DIVE-1234: an untyped subject' <<<"$out" \
+  && ok_t 'the refusal NAMES the offending commit (an error you cannot act on is a stall)' \
+  || bad_t 'the refusal does not name which commit is untyped' "rc=$rc out=$out"
+
+out=$(run_derive '0.17.8' v0.27.1 nolint 'DIVE-1234: an untyped subject'); rc=$?
+grep -q '^DERIVED=v0\.27\.2$' <<<"$out" \
+  && ok_t 'NEGATIVE CONTROL: with no lint in the tree the SAME subject cuts a patch — the refusal is bounded by the lint commit, not universal' \
+  || bad_t 'the refusal fired on a pre-lint range; this reds every cut until the old subjects age out' "rc=$rc out=$out"
+
+out=$(run_derive '0.17.8' v0.27.1 lint 'feat: after the lint' 'fix: also after'); rc=$?
+grep -q '^DERIVED=v0\.28\.0$' <<<"$out" \
+  && ok_t 'a fully-typed post-lint range still cuts normally (the refusal is not a blanket stop)' \
+  || bad_t 'a clean post-lint range was refused' "rc=$rc out=$out"
+
+echo "-- DIVE-4086: an override may RAISE the derived level and never lower it"
+out=$(export RELEASE_LEVEL=patch; run_range '0.17.8' v0.27.1 nolint 'feat: the headline'); rc=$?
+[[ $rc -ne 0 ]] && grep -q 'may raise a cut, never lower it' <<<"$out" \
+  && ok_t 'RELEASE_LEVEL=patch over a derived MINOR refuses — this is the defect wearing a hand instead of a cron' \
+  || bad_t 'a hand-passed patch silently downgraded a feature release' "rc=$rc out=$out"
+
+out=$(export RELEASE_LEVEL=major; run_range '0.17.8' v0.27.1 nolint 'feat: the headline'); rc=$?
+grep -q '^DERIVED=v1\.0\.0$' <<<"$out" \
+  && ok_t 'RELEASE_LEVEL=major over a derived minor RAISES it (the escape hatch still works)' \
+  || bad_t 'an upward override was refused; there is now no way to declare an epoch by hand' "rc=$rc out=$out"
+
+out=$(export RELEASE_LEVEL=auto; run_range '0.17.8' v0.27.1 nolint 'feat: the headline'); rc=$?
+grep -q '^DERIVED=v0\.28\.0$' <<<"$out" \
+  && ok_t "'auto' (the dispatch default) means the commits decide, so a dispatch and the nightly agree" \
+  || bad_t "'auto' was treated as a level and refused" "rc=$rc out=$out"
+
+echo "-- DIVE-4086: the shipped LINT REGEX, run rather than eyeballed"
+# Extracted from the shipped file for the same reason every other block here is: a
+# hand-written copy of the pattern agrees with every mutant of the real one.
+LINT="$ROOT/.github/workflows/pr-title-lint.yml"
+LINT_COND=$(grep -E '^ *if \[\[ "\$PR_TITLE" =~ ' "$LINT" | head -1 | sed 's/^ *//; s/ *then$//')
+[[ -n "$LINT_COND" ]] || { echo "FATAL: could not extract the title condition from $LINT" >&2; exit 2; }
+# `if C; then :; fi` succeeds for a FALSE C too, so the else arm is what makes this a
+# test. The first version of this helper omitted it, and every accept arm went red on a
+# syntax error rather than on the regex — which is the failure mode a hand-written copy
+# of the pattern would never have shown me.
+title_ok(){ ( PR_TITLE="$1"; eval "${LINT_COND} then :; else false; fi" ) >/dev/null 2>&1; }
+
+for _t in 'feat: a thing' 'fix(cli): a thing' 'feat(plugin)!: breaking' 'chore: tidy' 'revert: undo it'; do
+  title_ok "$_t" && ok_t "the lint ACCEPTS '$_t'" \
+    || bad_t "the lint rejects a conventional title, so every PR of this shape is blocked" "title=$_t cond=$LINT_COND"
+done
+# Acceptance (a) names this exact string: it is the shape 30 of the last 60 merges used.
+for _t in 'DIVE-1234: something' 'feat a thing' 'Feat: capitalised' 'feat:no space' 'update the docs'; do
+  title_ok "$_t" && bad_t "the lint ACCEPTED a title release-cut cannot read; the cut will refuse later, at the tag" "title=$_t" \
+    || ok_t "the lint REJECTS '$_t'"
+done
+
+echo "-- the shipped lint and the shipped cut must accept the SAME type list"
+# A type the lint admits and the cut rejects reds every later cut; the reverse ships a
+# feature as a patch. Comparing the two literals is what stops them drifting apart.
+LINT="$ROOT/.github/workflows/pr-title-lint.yml"
+_lint_types=$(grep -oE '\(feat\|fix\|[a-z|]+\)' "$LINT" | head -1)
+_cut_types=$(grep -oE '\(feat\|fix\|[a-z|]+\)' "$WF" | head -1)
+[[ -n "$_lint_types" && "$_lint_types" == "$_cut_types" ]] \
+  && ok_t "the lint and the cut share one type list ($_lint_types)" \
+  || bad_t 'the PR-title lint and release-cut accept different type sets; one of them will be wrong on every merge' "lint=$_lint_types cut=$_cut_types"
+
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

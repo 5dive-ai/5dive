@@ -1,0 +1,52 @@
+# DIVE-4086 — the PR title IS the commit subject, because main takes squash merges.
+#
+# release-cut derives the release level from the subjects in the range (a `feat` makes
+# the cut a minor), so a title that does not say what the change IS leaves the cut
+# unable to tell a feature from a fix. Measured on the 60 merges before this landed:
+# 8 feat, 17 fix, 5 test, and **30 with no conventional type at all**. That is why the
+# rule needs a gate at the door rather than a convention in a doc — and it is also why
+# release-cut's own refusal is bounded to commits after this file was ADDED, which is
+# the boundary a reader of that block will come here looking for.
+name: pr-title-lint
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-title-lint-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  title:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The title must name the kind of change
+        env:
+          # Through `env:`, never interpolated into the script body. A PR title is
+          # attacker-controlled text and an Actions expression is substituted before
+          # the shell exists, so a title containing a quote would end the command.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -uo pipefail
+          # Kept byte-identical to the class release-cut.yml accepts, and
+          # tests/release_cut_assign_unit.sh EXTRACTS the condition below and runs it
+          # against titles rather than grading a copy. If you widen one list, widen the
+          # other in the same commit: a type the lint admits and the cut rejects reds
+          # every later cut, and the reverse ships a feature as a patch — which is the
+          # whole defect (DIVE-4086).
+          if [[ "$PR_TITLE" =~ ^(feat|fix|test|chore|docs|refactor|ci|perf|revert)(\([^\)]*\))?!?:\  ]]; then
+            printf 'ok — "%s"\n' "$PR_TITLE"
+            exit 0
+          fi
+          {
+            echo "::error::the PR title must start with a conventional type, because the squash merge makes it the commit subject and release-cut reads that subject to decide whether this cut is a feature release (DIVE-4086)."
+            echo "::error::  got:  ${PR_TITLE}"
+            echo "::error::  want: feat|fix|test|chore|docs|refactor|ci|perf|revert, an optional (scope), an optional ! for breaking, then a colon and a space"
+            echo "::error::  e.g.  feat(plugin): a declared plugin verb is now dispatched (DIVE-4035)"
+            echo "::error::A 'feat' title cuts the next release as a minor. Everything else cuts a patch."
+          } >&2
+          exit 1
