@@ -92,7 +92,9 @@ fork_list() {
 
 # Stage one fork. Echoes "changed" when the tracked files moved.
 fork_stage_one() {
-  local rt="$1" sha="$2" dest="$FORK_STAGE_ROOT/$rt" tmp changed=0
+  local rt="$1" sha="$2"
+  local dest="$FORK_STAGE_ROOT/$rt"
+  local tmp changed=0
   tmp=$(mktemp -d "/tmp/5dive-fork-stage.XXXXXX") || return 1
   if ! git -C "$FORK_MIRROR" archive "refs/heads/${FORK_REF}" "plugins/$rt" 2>/dev/null \
        | tar -x -C "$tmp" --strip-components=2 2>/dev/null; then
@@ -179,7 +181,9 @@ stage_fork_plugins() {
 # carries a server.ts.bak-dive3179-* right now, so this is a state that HAPPENS)
 # disagrees here even though the manifest still reads CURRENT.
 fork_content_matches() {
-  local rt="$1" ref="$2" dest="$FORK_STAGE_ROOT/$rt" line mode type blob path
+  local rt="$1" ref="$2"
+  local dest="$FORK_STAGE_ROOT/$rt"
+  local line mode type blob path
   local listed=0
   while read -r mode type blob path; do
     [[ "$type" == blob ]] || continue

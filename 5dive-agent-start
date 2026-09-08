@@ -1692,7 +1692,13 @@ write_delivery_declaration() {
   if [[ "$TYPE" == "codex" ]] && codex_dispatcher_enabled "$CHANNELS"; then
     mode="dispatcher-inbox"
   fi
-  local dir="$HOME/.5dive" f="$dir/delivery.env" tmp
+  # Three statements, not one: `local` is a builtin, so bash expands ALL of its
+  # arguments before performing ANY of the assignments. In a single `local a=X b="$a"`
+  # the `$a` resolves against the ENCLOSING scope, and under this script's `set -u`
+  # that is a fatal unbound-variable exit before the pane ever starts (DIVE-4067).
+  local dir="$HOME/.5dive"
+  local f="$dir/delivery.env"
+  local tmp
   mkdir -p "$dir" 2>/dev/null || { echo "warn: cannot create $dir — delivery mode undeclared" >&2; return 0; }
   tmp="${f}.tmp.$$"
   {

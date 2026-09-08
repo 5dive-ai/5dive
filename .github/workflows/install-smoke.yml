@@ -86,8 +86,17 @@ jobs:
           ./build.sh
           bash -n 5dive
           rc=0
+          # DIVE-4067 widened this list. `5dive-stage-fork-plugins.sh` and the two
+          # `5dive-refresh-*.sh` are installed to the box and run there, and were
+          # linted by nothing — the same gap DIVE-2125 closed for scripts/, one
+          # directory out. Two of the four SC2318 findings below lived in the
+          # stage-fork script, so the omission was load-bearing, not cosmetic.
+          SHEBANG_FILES=(install.sh 5dive-agent-start build.sh
+                         5dive-stage-fork-plugins.sh
+                         5dive-refresh-plugins.sh 5dive-refresh-skills.sh
+                         scripts/*.sh)
           # These carry a bash shebang; let shellcheck read it.
-          for f in install.sh 5dive-agent-start build.sh scripts/*.sh; do
+          for f in "${SHEBANG_FILES[@]}"; do
             echo "== shellcheck $f"
             shellcheck -S error "$f" || rc=1
           done
@@ -96,6 +105,49 @@ jobs:
           for f in src/*.sh src/task/*.sh; do
             echo "== shellcheck $f"
             shellcheck -S error --shell=bash "$f" || rc=1
+          done
+
+          # DIVE-4067 — SC2318, AT ANY SEVERITY, IS A MERGE BLOCKER.
+          #
+          # 0.26.1 shipped a launcher that could not start any agent, on any box, and
+          # the nightly restarts every agent after installing, so every box that took
+          # it emptied itself unattended. One line in `5dive-agent-start`:
+          #
+          #     local dir="$HOME/.5dive" f="$dir/delivery.env" tmp
+          #
+          # `local` is a builtin — bash expands ALL of its arguments before performing
+          # ANY of its assignments, so `$dir` resolved against the ENCLOSING scope and
+          # `set -u` made it a fatal exit before the pane started.
+          #
+          # THIS JOB ALREADY LINTED THAT FILE, AND ALREADY HAD THE RULE. shellcheck
+          # names the defect exactly — SC2318, "this assignment is used again in this
+          # 'local', but won't have taken effect. Use two 'local's." It is classed a
+          # WARNING, the passes above run at `-S error`, and the severity filter threw
+          # it away. So this was never a missing instrument; it was a configured-off
+          # one, which is the more expensive kind because the check reports green.
+          #
+          # A SECOND PASS RATHER THAN A LOWER `-S`. `--include` restricts to the codes
+          # named, so it cannot be combined with `-S error` in one invocation without
+          # losing the error coverage. And dropping the passes above to `-S warning`
+          # would light up the tree at once — a gate that is red on arrival gets
+          # disabled, which is why `--with-shellcheck` is still off in
+          # scripts/actionlint-scan.sh. One code, promoted deliberately, stays green.
+          #
+          # MEASURED, and stated because it is a real cost on a REQUIRED check:
+          # 82s for this pass over the file set above (shellcheck 0.9.0, agent box,
+          # 2026-09-08), roughly doubling this job's shellcheck time. shellcheck's
+          # heap and time are superlinear in the size of one parse unit and src/
+          # carries a 15k-line file, so most of that is one file, in both passes.
+          #
+          # AND IT IS CLEAN TODAY, which is the only reason it can be a blocker: 4
+          # findings at origin/main d36b40ce (5dive-agent-start:1695,
+          # 5dive-stage-fork-plugins.sh:95 and :182, src/cmd_agent_create.sh:171),
+          # all four fixed in the commit that added this pass, 0 after.
+          for f in "${SHEBANG_FILES[@]}"; do
+            shellcheck --include=SC2318 "$f" || rc=1
+          done
+          for f in src/*.sh src/task/*.sh; do
+            shellcheck --include=SC2318 --shell=bash "$f" || rc=1
           done
           exit "$rc"
 

@@ -168,7 +168,9 @@ seed_agent_git_identity() {
 # The file is `visudo -c` validated before install so a malformed entry can never
 # lock the box out; on failure we remove it and fail loudly.
 write_admin_sudoers() {
-  local user="$1" f="/etc/sudoers.d/${user}" tmp
+  local user="$1"
+  local f="/etc/sudoers.d/${user}"
+  local tmp
   tmp=$(mktemp)
   # Only bare-trailing-`*` (any-args) forms — the single wildcard shape sudo-rs
   # accepts (DIVE-1088). The CLI-as-root grant covers all fleet + service ops.

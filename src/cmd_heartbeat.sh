@@ -4530,8 +4530,8 @@ cmd_heartbeat_tick() {
   # read under `set -u` is fatal, which would abort the whole wake loop rather
   # than skip a log line. Exactly the heartbeat-never-woke bug class this pass is
   # isolated against, entering through the isolation's own summary.
-  (( ${_PR_FIRED:-0} || ${_PR_DEFERRED:-0} || ${_PR_CLEARED:-0} || ${_PR_FAILED:-0} )) \
-    && _hb_log "[pending-restart] pass done — ${_PR_FIRED:-0} bounced, ${_PR_DEFERRED:-0} still deferred (${_PR_OVERDUE:-0} overdue), ${_PR_CLEARED:-0} cleared, ${_PR_FAILED:-0} failed"
+  (( ${_PR_FIRED:-0} || ${_PR_DEFERRED:-0} || ${_PR_CLEARED:-0} || ${_PR_FAILED:-0} || ${_PR_PARKED:-0} )) \
+    && _hb_log "[pending-restart] pass done — ${_PR_FIRED:-0} bounced, ${_PR_DEFERRED:-0} still deferred (${_PR_OVERDUE:-0} overdue), ${_PR_CLEARED:-0} cleared, ${_PR_FAILED:-0} failed, ${_PR_PARKED:-0} left parked — restart HELD until the registry and the unit agree (desiredState=stopped)"
   # DIVE-2102: renew capability rows from the installed sudoers files. Without
   # this the 7d TTL expires every row and the registry converges on permanently
   # empty. Isolated like every other sweep — and note the failure direction is
