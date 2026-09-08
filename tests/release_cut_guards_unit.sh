@@ -561,6 +561,109 @@ else
   vacuous "drop the re-read"
 fi
 
+# ── DIVE-4072: THE HOTFIX LANE ────────────────────────────────────────────────
+# `required_only` grades the sha against the NINE contexts branch protection
+# actually requires, instead of every check-run on it. The v0.26.2 incident cut sat
+# 45 minutes on two sweep shards that exited 6 UNDETERMINED with zero non-zero
+# harness rows, while every box on that night's update ran no agents.
+#
+# The lane is the dangerous kind of change — it makes a gate accept LESS — so each
+# arm below is paired with the refusal that bounds it.
+echo
+echo "== DIVE-4072 hotfix lane =="
+
+# Nine contexts as branch protection actually returns them (2026-09-08).
+REQ_NINE='test
+test-installed-host
+shellcheck
+docker-install
+scan
+check
+supply-chain-guard
+test-confirm
+test-installed-host-confirm'
+
+lane(){ # $1 = check-runs TSV, $2 = required-context list, $3 = event name
+  local out rc
+  out=$(runs="$1" sha=deadbeefcafe tag=v9.9.9 RELEASE_CUT_POLL_SECONDS=0 \
+        REQUIRED_ONLY=true GITHUB_EVENT_NAME="$3" _REQ_FIXTURE="$2" bash -c '
+    set -uo pipefail
+    _required_contexts(){ printf "%s\n" "$_REQ_FIXTURE"; }
+    '"$GUARD"'
+  ' 2>&1); rc=$?
+  if (( rc != 0 )); then
+    grep -q 'MANUAL lane'      <<<"$out" && { echo REFUSED-EVENT;  return; }
+    grep -q 'NO required contexts' <<<"$out" && { echo REFUSED-EMPTY; return; }
+    grep -q 'CI is RED'        <<<"$out" && { echo RED;            return; }
+    grep -q 'CI still IN FLIGHT'<<<"$out" && { echo IN-FLIGHT;     return; }
+    grep -q 'CI NOT REACHED'   <<<"$out" && { echo NOT-REACHED;    return; }
+    echo "OTHER-FAIL:$out"; return
+  fi
+  grep -q 'CI green on' <<<"$out" && echo GREEN || echo "OTHER-OK:$out"
+}
+
+# A board shaped like the incident: every required context green, one sweep shard
+# UNDETERMINED. Nothing gates merges on that shard; it blocked the publish anyway.
+INCIDENT=$(printf 'test\tcompleted\tsuccess\ntest-installed-host\tcompleted\tsuccess\nshellcheck\tcompleted\tsuccess\ndocker-install\tcompleted\tsuccess\nscan\tcompleted\tsuccess\ncheck\tcompleted\tsuccess\nsupply-chain-guard\tcompleted\tsuccess\ntest-confirm\tcompleted\tsuccess\ntest-installed-host-confirm\tcompleted\tsuccess\nfull-pristine (2)\tcompleted\tfailure')
+
+ok "lane ON: a NON-required red no longer blocks the cut" \
+   "$(lane "$INCIDENT" "$REQ_NINE" workflow_dispatch)" "GREEN"
+
+# THE BOUND. Same lane, same board, but the red is one of the nine.
+INCIDENT_REQ=$(printf '%s\n' "$INCIDENT" | sed 's/^scan\tcompleted\tsuccess$/scan\tcompleted\tfailure/')
+ok "lane ON: a REQUIRED red still refuses" \
+   "$(lane "$INCIDENT_REQ" "$REQ_NINE" workflow_dispatch)" "RED"
+
+# And with the lane OFF the same board must still block, or the arm above is
+# measuring nothing.
+ok "lane OFF: that same non-required red DOES block (control)" \
+   "$(verdict "$INCIDENT")" "RED"
+
+ok "lane is refused on the nightly (schedule)" \
+   "$(lane "$INCIDENT" "$REQ_NINE" schedule)" "REFUSED-EVENT"
+ok "lane is refused on push" \
+   "$(lane "$INCIDENT" "$REQ_NINE" push)" "REFUSED-EVENT"
+
+# An empty required list and a failed API read are the same empty string, and one of
+# them means publishing with no gate at all.
+ok "an EMPTY required list refuses rather than grading against nothing" \
+   "$(lane "$INCIDENT" "" workflow_dispatch)" "REFUSED-EMPTY"
+
+# Incompleteness is NOT relaxed: a required context still in flight still waits.
+INCOMPLETE_REQ=$(printf '%s\n' "$INCIDENT" | sed 's/^check\tcompleted\tsuccess$/check\tin_progress\tpending/')
+ok "lane ON: an in-flight REQUIRED context still waits" \
+   "$(lane "$INCOMPLETE_REQ" "$REQ_NINE" workflow_dispatch)" "IN-FLIGHT"
+
+# A non-required context still in flight must NOT hold the hotfix.
+INCOMPLETE_OPT=$(printf '%s\n' "$INCIDENT" | sed 's/^full-pristine (2)\tcompleted\tfailure$/full-pristine (2)\tin_progress\tpending/')
+ok "lane ON: an in-flight NON-required context does not hold it" \
+   "$(lane "$INCOMPLETE_OPT" "$REQ_NINE" workflow_dispatch)" "GREEN"
+
+# If the lane filtered EVERYTHING away it would publish against an empty board, which
+# the completeness guard must still catch as NOT-REACHED rather than as green.
+ok "lane ON: a board with no required context at all is NOT-REACHED, never GREEN" \
+   "$(lane "$(printf 'full-pristine (2)\tcompleted\tsuccess')" "$REQ_NINE" workflow_dispatch)" "NOT-REACHED"
+
+# MUTANT: make the filter keep everything (the lane becomes a lie that reports success).
+if m=$(mutate 's/^ *(\$1 in R)'"'"'$/  1/' GUARD); then
+  GUARD_SAVE="$GUARD"; GUARD="$m"
+  ok "MUTANT filter keeps every row: the incident board blocks again" \
+     "$([[ "$(lane "$INCIDENT" "$REQ_NINE" workflow_dispatch)" == "GREEN" ]] && echo caught-nothing || echo mutant-detected)" "mutant-detected"
+  GUARD="$GUARD_SAVE"
+else
+  vacuous "filter keeps every row"
+fi
+
+# MUTANT: drop the event guard, so the nightly could take the lane.
+if m=$(mutate '/MANUAL lane and this run is/d' GUARD); then
+  GUARD_SAVE="$GUARD"; GUARD="$m"
+  ok "MUTANT drop the event guard: the nightly stops refusing the lane" \
+     "$([[ "$(lane "$INCIDENT" "$REQ_NINE" schedule)" == "REFUSED-EVENT" ]] && echo caught-nothing || echo mutant-detected)" "mutant-detected"
+  GUARD="$GUARD_SAVE"
+else
+  vacuous "drop the event guard"
+fi
+
 echo
 echo "$pass passed, $fail failed"
 exit $(( fail > 0 ))
