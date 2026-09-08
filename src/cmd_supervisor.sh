@@ -98,6 +98,11 @@ _SUP_ENABLED_FLAG="${STATE_DIR}/supervisor.enabled"
 # lodar pre-cleared enabling (gate answered 2026-07-02) conditional on a clean
 # zero-false-positive audit week; root touches this file on/after Jul 9.
 _SUP_ACTIONS_FLAG="${STATE_DIR}/supervisor.actions.enabled"
+# DIVE-4052: quota exhaustion is normal subscription-window behavior, not a
+# human-actionable fleet incident. Keep the machine alert and audit trail live,
+# but make lodar's phone leg an explicit debug opt-in. Same file-sentinel shape
+# as _SUP_ACTIONS_FLAG: root may touch this file to enable; absent is quiet.
+_SUP_QUOTA_HUMAN_FLAG="${STATE_DIR}/supervisor.quota-human.enabled"
 # Ladder pacing (design §5): gap before the NEXT action on an agent is
 # base * 2^attempts (20m/40m/80m against the 10m tick); past max attempts the
 # supervisor stops acting and escalates once per window.
@@ -1053,37 +1058,21 @@ _sup_capacity_alert() {  # <name> <class> <detail> [notify_human=true]
   # verify tripwire uses. Best-effort: a miss still leaves the agent-send leg
   # and the audited alert row.
   #
-  # DIVE-3940: the human leg is SUPPRESSIBLE. A self-healing quota wall (a shared
-  # profile's 5h window, resume deadline still in the future — quotaDeadline=live)
-  # needs no human ping: the correct response is to let the reset arrive, and on a
-  # shared profile the per-seat alert fans out one ping per seat. The machine leg
-  # above and the audited row are UNCONDITIONAL, so main still triages it and the
-  # DIVE-3272 blind-spot cover is unchanged — only lodar's phone goes quiet for the
-  # confirmed-benign case. The caller sets notify_human=false; every other class
-  # (and quotaDeadline=unknown, a possible hard wall) keeps the human leg.
-  #
-  # DIVE-3970: the same leg, same argument — the set of readings that mute it is
-  # wider (every shape _sup_quota_selfheal recognises, not only a parsed live
-  # deadline) and it is no longer permanent: a wall still up past its own
-  # expected reset takes the human leg back. Nothing in THIS function changed.
+  # DIVE-4052: the human leg is opt-in for every quota-exhausted alert. The
+  # machine leg above and the audited row are unconditional, so main still
+  # triages each dedup window and the DIVE-3272 blind-spot cover is unchanged.
+  # verify-challenge uses _sup_verify_alert and stays loud.
   if [[ "$notify_human" == "true" ]] && _task_agent_channel main; then
     _task_send_owner "$msg" >/dev/null 2>&1 || true
   fi
 }
 
-# DIVE-3940: should a capacity alert's HUMAN leg fire? Pure decision, no I/O, so
-# the wiring from classification to the leg is unit-gradeable. The single mute is
-# a confirmed self-healing quota wall — class quota-exhausted with a resume
-# deadline still in the future (quotaDeadline=live). Every other class, and every
-# other deadline state (unknown may be a hard wall; lapsed never reaches here),
-# keeps the human ping. See _sup_capacity_alert for why live is benign noise.
-# DIVE-3970 widens the mute to every RECOGNISED self-healing shape (arg 3, from
-# _sup_quota_selfheal) and adds the escape from it (arg 4): a wall that is still
-# up after its own expected reset is no longer benign and takes the human leg
-# back. Both new args default to the pre-3970 values, so a 2-arg call is exactly
-# DIVE-3940's decision.
-_sup_capacity_notify_human() {  # <class> <quotaDeadline> [selfheal_kind] [persisted] -> true|false
-  local class="${1:-}" qdl="${2:-}" kind="${3:-no}" persisted="${4:-false}"
+# DIVE-4052: should a capacity alert's HUMAN leg fire? quota_human_on is read
+# once per tick from _SUP_QUOTA_HUMAN_FLAG and passed in, keeping this decision
+# pure and unit-gradeable. The default true preserves direct legacy callers;
+# the production tick always supplies the explicit current flag state.
+_sup_capacity_notify_human() {  # <class> <quotaDeadline> [selfheal_kind] [persisted] [quota_human_on] -> true|false
+  local class="${1:-}" qdl="${2:-}" kind="${3:-no}" persisted="${4:-false}" quota_human_on="${5:-true}"
   # DIVE-3982: no-output ("N open row(s), nothing closed in Nd") is never a human
   # ping — the other half of the FLEET-HEALTH family DIVE-3970 muted. Its remedy is
   # "reassign or park", which is main/ops triage, NOT lodar's, and it is the
@@ -1095,8 +1084,12 @@ _sup_capacity_notify_human() {  # <class> <quotaDeadline> [selfheal_kind] [persi
   # DIVE-3272 cover is unchanged; a genuinely stuck seat is escalated by main in
   # plain language, not by re-arming this raw template.
   [[ "$class" == "no-output" ]] && { printf 'false'; return; }
+  # Quota walls are phone-muted unconditionally unless a human explicitly opts
+  # into debug noise. This precedes the DIVE-3970 persistence escape so that an
+  # old episode cannot silently re-arm the default-off human leg.
+  [[ "$class" == "quota-exhausted" && "$quota_human_on" != "true" ]] && { printf 'false'; return; }
   # Persistence wins over every mute: this is the hard wall the mute exists to
-  # not hide.
+  # not hide — but only inside the explicit quota-human opt-in mode above.
   [[ "$persisted" == "true" ]] && { printf 'true'; return; }
   [[ "$class" == "quota-exhausted" ]] || { printf 'true'; return; }
   # `live` is kept as its own clause rather than folded into `kind`: an audited
@@ -2143,8 +2136,9 @@ cmd_supervisor_tick() {
     fi
   done < <(jq -c '.[]' <<<"$snap")
 
-  local actions_on="false" acted=0 planned=0 escalated=0 now_s
+  local actions_on="false" quota_human_on="false" acted=0 planned=0 escalated=0 now_s
   [[ -f "$_SUP_ACTIONS_FLAG" ]] && actions_on="true"
+  [[ -f "$_SUP_QUOTA_HUMAN_FLAG" ]] && quota_human_on="true"
   now_s=$(date +%s)
   local reg_now; reg_now=$(registry_read)
 
@@ -2202,11 +2196,11 @@ cmd_supervisor_tick() {
     elif [[ "$cls" == "quota-exhausted" ]]; then
       excerpt="${excerpt}; automatic actions are disabled"
     fi
-    # DIVE-3940/3970: a confirmed self-healing quota wall mutes the human leg
-    # only — the machine leg + audited row still fire (main triages; DIVE-3272
-    # cover unchanged). Both reads are guarded so non-quota rows spend no jq.
+    # DIVE-3970's self-heal/persistence logic remains available only in the
+    # DIVE-4052 debug opt-in mode. With the flag absent, quota human alerts are
+    # unconditionally muted and the old expiry cannot re-arm them.
     local qdl="unknown" qsig="" qkind="no"
-    if [[ "$cls" == "quota-exhausted" ]]; then
+    if [[ "$cls" == "quota-exhausted" && "$quota_human_on" == "true" ]]; then
       qdl=$(jq -r '.signals.quotaDeadline // "unknown"' <<<"$row")
       qsig=$(jq -r '.signals.quotaSignature // ""' <<<"$row")
       IFS=$'\x1f' read -r qkind _ <<<"$(_sup_quota_selfheal "$qsig" "$now_s")"
@@ -2254,7 +2248,7 @@ cmd_supervisor_tick() {
     # where that clock was still live — is what sets it, and the current
     # reading only decides whether the wall is still self-healing.
     local persisted="false" ep_ts="" ep_due="" ep_muted="false"
-    if [[ "$cls" == "quota-exhausted" ]]; then
+    if [[ "$cls" == "quota-exhausted" && "$quota_human_on" == "true" ]]; then
       local ep_row ep_qdl ep_sig ep_kind_raw ep_kep ep_kind ep_kep_use
       IFS=$'\x1f' read -r ep_ts ep_row <<<"$(_sup_quota_episode_first "$name" "$cls")"
       if [[ "$ep_ts" =~ ^[0-9]+$ ]]; then
@@ -2309,7 +2303,7 @@ cmd_supervisor_tick() {
       # Say WHY the human is being reached for a wall it was told to ignore.
       excerpt="${excerpt}; STILL WALLED $(( (now_s - ep_ts) / 3600 ))h after the first alert of this wall and past the reset it was promising — the self-healing mute has EXPIRED and this is now a hard wall (rotate the profile, or authorise the spend)"
     fi
-    local notify_human; notify_human=$(_sup_capacity_notify_human "$cls" "$qdl" "$qkind" "$persisted")
+    local notify_human; notify_human=$(_sup_capacity_notify_human "$cls" "$qdl" "$qkind" "$persisted" "$quota_human_on")
     if [[ "$cls" == "verify-challenge" ]]; then
       _sup_verify_alert "$name" "$excerpt"
     else

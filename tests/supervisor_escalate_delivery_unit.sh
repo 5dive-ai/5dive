@@ -162,7 +162,7 @@ t "armed + budget free -> the rung acts, it does not page a human" \
 # tick remain in the path. Recording argv proves the tick asks the production
 # selector for `--require-live-headroom`; running two ticks against one DB proves
 # the no-target alert is deduped by behavior, not merely by a helper predicate.
-tick_arm() {  # <snapshot-json> [armed] [seed-sql] [registry-json] [rotated|no-target|failed] [ticks] [poller-after-restart]
+tick_arm() {  # <snapshot-json> [armed] [seed-sql] [registry-json] [rotated|no-target|failed] [ticks] [poller-after-restart] [quota-human-mode]
   local fixture_registry="${4:-}"
   [[ -n "$fixture_registry" ]] || fixture_registry='{"agents":{}}'
   # DIVE-3856: what the post-restart poller probe SEES, as a fixture. Default 1
@@ -173,7 +173,10 @@ tick_arm() {  # <snapshot-json> [armed] [seed-sql] [registry-json] [rotated|no-t
   # only because seats named in the fixture have live pollers, and CI, which has
   # none, went red on three arms. A fixture that is realistic in its DATA is
   # still not hermetic if one of its probes reaches outside the fixture.
-  SNAP="$1" ARMED="${2:-}" SEED="${3:-}" POLLER_AFTER="${7:-1}" \
+  # Existing DIVE-3940/3970 arms grade the opt-in behavior, so the harness
+  # defaults its eighth fixture input to enabled. DIVE-4052's default-off arms
+  # pass disabled explicitly and prove the production sentinel is absent.
+  SNAP="$1" ARMED="${2:-}" SEED="${3:-}" POLLER_AFTER="${7:-1}" QUOTA_HUMAN="${8:-enabled}" \
     FIXTURE_REGISTRY="$fixture_registry" ROTATE_RESULT="${5:-no-target}" TICKS="${6:-1}" \
     REPO="$PWD" bash -c '
     set -euo pipefail
@@ -192,6 +195,8 @@ tick_arm() {  # <snapshot-json> [armed] [seed-sql] [registry-json] [rotated|no-t
     # reads as an empty result rather than as an error.
     _SUP_ACTIONS_FLAG="$TMP/actions"
     if [[ -n "$ARMED" ]]; then : >"$_SUP_ACTIONS_FLAG"; fi
+    _SUP_QUOTA_HUMAN_FLAG="$TMP/quota-human"
+    if [[ "$QUOTA_HUMAN" == "enabled" ]]; then : >"$_SUP_QUOTA_HUMAN_FLAG"; fi
     require_root()      { :; }                       # the tick is root-only in prod
     _sup_cli_check()    { :; }                        # no network
     _sup_snapshot()     { printf "%s" "$SNAP"; }      # the fixture fleet
@@ -442,6 +447,18 @@ t "notify_human: DIVE-3982 no-output is muted regardless of deadline (not human-
 t "notify_human: quota-exhausted with no deadline defaults to loud" \
   "true" "$(_sup_capacity_notify_human quota-exhausted "")"
 
+# DIVE-4052: production passes the sentinel state as arg 5. With the sentinel
+# absent, EVERY quota shape is muted ahead of DIVE-3970 persistence; other
+# classes retain their own policy.
+t "4052 notify_human: live quota is muted when debug opt-in is absent" \
+  "false" "$(_sup_capacity_notify_human quota-exhausted live no false false)"
+t "4052 notify_human: unknown quota is also muted when debug opt-in is absent" \
+  "false" "$(_sup_capacity_notify_human quota-exhausted unknown no false false)"
+t "4052 notify_human: persistence cannot re-arm quota when opt-in is absent" \
+  "false" "$(_sup_capacity_notify_human quota-exhausted unknown week true false)"
+t "4052 notify_human: verify-challenge stays loud" \
+  "true" "$(_sup_capacity_notify_human verify-challenge unknown no false false)"
+
 # (b) the guard inside the real _sup_capacity_alert. Both legs are observed: the
 # machine leg (5dive agent send main) must fire UNCONDITIONALLY; the human leg
 # obeys notify_human. `5dive` is a leading-digit function name, which bash allows.
@@ -460,6 +477,10 @@ t "capacity_alert: the machine leg still fires when muted"  "1" "$MACHINE_FIRED"
 
 MACHINE_FIRED=0; HUMAN_FIRED=0; _sup_capacity_alert ops quota-exhausted "d"
 t "capacity_alert: default (no 4th arg) preserves the old loud behavior" "1" "$HUMAN_FIRED"
+
+MACHINE_FIRED=0; HUMAN_FIRED=0; _sup_verify_alert ops "identity challenge"
+t "4052 verify-challenge: the dedicated human alert remains live" "1" "$HUMAN_FIRED"
+t "4052 verify-challenge: its machine leg also remains live" "1" "$MACHINE_FIRED"
 unset -f 5dive
 
 # (c) end-to-end through the real tick: classification -> deadline -> human leg.
@@ -476,6 +497,19 @@ t "3940 tick: a self-healing wall MUTES the human leg" \
 _HARDWALL_SNAP='[{"name":"ops","type":"claude","classification":"quota-exhausted","cause":"quota-exhausted","detail":"pane refusal [names no resume deadline]","signals":{"quotaDeadline":"unknown"}}]'
 t "3940 tick: an unknown-deadline wall keeps the human leg" \
   "ops:true" "$(fld "$(tick_arm "$_HARDWALL_SNAP")" HUMAN)"
+
+# Same real tick with the new sentinel ABSENT: both clocked and unclocked quota
+# walls retain the machine/audit legs but never reach lodar's phone.
+_D4052_LIVE_OFF=$(tick_arm "$_SELFHEAL_SNAP" "" "" "" "" "" "" disabled)
+t "4052 tick default-off: live quota mutes the human leg" \
+  "ops:false" "$(fld "$_D4052_LIVE_OFF" HUMAN)"
+t "4052 tick default-off: live quota keeps the machine leg" \
+  "ops:quota-exhausted" "$(fld "$_D4052_LIVE_OFF" ALERTS)"
+t "4052 tick default-off: live quota keeps the audited row" \
+  "1" "$(fld "$_D4052_LIVE_OFF" ALERT_ROWS)"
+_D4052_UNKNOWN_OFF=$(tick_arm "$_HARDWALL_SNAP" "" "" "" "" "" "" disabled)
+t "4052 tick default-off: deadline-free quota also mutes the human leg" \
+  "ops:false" "$(fld "$_D4052_UNKNOWN_OFF" HUMAN)"
 
 _NOOUT_SNAP='[{"name":"ops","type":"claude","classification":"no-output","cause":"no-output","detail":"3 open row(s), nothing closed in 5d"}]'
 _noout_out=$(tick_arm "$_NOOUT_SNAP")
@@ -597,6 +631,15 @@ t "3970 tick: a wall still up past its horizon takes the human leg BACK" \
   "ops:true" "$(fld "$persist_out" HUMAN)"
 t "3970 tick: the escalation is an ordinary alert row (seed + one escalation)" \
   "2" "$(fld "$persist_out" ALERT_ROWS)"
+
+# DIVE-4052 flag-gates DIVE-3970 part 2 as well. The same expired episode with
+# the sentinel absent remains deduped, so no extra machine alert or human ping
+# is manufactured merely to restore a human leg that is intentionally off.
+persist_off_out=$(tick_arm "$(_sh_snap "$_METER_SIG")" "" "$(_sh_seed 7)" "" "" "" "" disabled)
+t "4052 tick default-off: expired mute does not re-arm the human leg" \
+  "" "$(fld "$persist_off_out" HUMAN)"
+t "4052 tick default-off: expired mute does not add an escalation alert row" \
+  "1" "$(fld "$persist_off_out" ALERT_ROWS)"
 
 # The negative control at the same layer: identical seed, still inside the
 # horizon -> the dedup window holds and NOTHING is sent to anyone.
