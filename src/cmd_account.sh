@@ -428,6 +428,33 @@ account_has_live_headroom() {
   ' <<<"$rl" >/dev/null 2>&1
 }
 
+# account_near_wall_state <account> — print near | clear | unmeasured.
+#
+# Dispatch-boundary rotation needs the inverse question from destination
+# selection, but `! account_has_live_headroom` is not that inverse: it folds a
+# missing/stale cache together with a measured full account.  Rotating on that
+# collapse would make every unmeasured account look exhausted.  Require the same
+# fresh 5h observation as the destination fence, then call the current profile
+# near its wall when either observed window is at/above HEADROOM_MAX_PCT.
+account_near_wall_state() {
+  local account="$1" rl now
+  rl=$(account_best_ratelimits "$account")
+  [[ -n "$rl" ]] || { printf 'unmeasured'; return 0; }
+  now=$(date +%s)
+  jq -r --argjson now "$now" --argjson fresh "$HEADROOM_FRESH_SECS" \
+        --argjson max "$HEADROOM_MAX_PCT" '
+    if ((.asOf | type) != "number")
+       or (($now - .asOf) > $fresh)
+       or ((.fiveHourPct | type) != "number")
+    then "unmeasured"
+    elif (.fiveHourPct >= $max)
+         or (((.sevenDayPct | type) == "number") and (.sevenDayPct >= $max))
+    then "near"
+    else "clear"
+    end
+  ' <<<"$rl" 2>/dev/null || printf 'unmeasured'
+}
+
 # rotation_live_headroom_candidates <json-array> — preserve candidate order but
 # keep only profiles with a fresh, measured capacity verdict. Split out so the
 # DIVE-3822 destination fence is testable without mutating a real registry.
@@ -836,14 +863,15 @@ rotation_eligible_accounts() {
 cmd_agent_rotation_rotate() {
   local name="${1:-}"; shift || true
   [[ -n "$name" ]] \
-    || fail "$E_USAGE" "usage: 5dive agent rotation rotate <agent> [--cooldown-current=<epoch>] [--require-live-headroom]"
+    || fail "$E_USAGE" "usage: 5dive agent rotation rotate <agent> [--cooldown-current=<epoch>] [--require-live-headroom] [--if-current-near-wall]"
   require_root
   ensure_state
-  local cooldown_current="" require_live_headroom=0 a
+  local cooldown_current="" require_live_headroom=0 if_current_near_wall=0 a
   for a in "$@"; do
     case "$a" in
       --cooldown-current=*) cooldown_current="${a#--cooldown-current=}" ;;
       --require-live-headroom) require_live_headroom=1 ;;
+      --if-current-near-wall) if_current_near_wall=1 ;;
       *) fail "$E_USAGE" "unknown flag: $a" ;;
     esac
   done
@@ -853,6 +881,35 @@ cmd_agent_rotation_rotate() {
   current=$(jq -r --arg n "$name" '.agents[$n].authProfile // ""' <<<"$reg")
   [[ "$enabled" == "true" ]] \
     || fail "$E_VALIDATION" "rotation not enabled for '$name' (enable: 5dive agent rotation set $name --enabled=true)"
+  # DIVE-4055: the heartbeat calls this at a task boundary, before the first
+  # turn.  Do not rotate merely because a destination has headroom: the current
+  # profile must itself have a fresh, measured near-wall verdict.  Unmeasured is
+  # a no-op, not exhaustion.
+  local current_near_wall=null near_state=""
+  if (( if_current_near_wall )); then
+    near_state=$(account_near_wall_state "$current")
+    case "$near_state" in
+      near) current_near_wall=true ;;
+      clear)
+        if (( JSON_MODE )); then
+          ok "" '{rotated:false, from:$f, to:null, reason:"current account is not near its wall", currentNearWall:false}' \
+             --arg f "$current"
+        else
+          echo "OK — current account '$current' is not near its wall; no rotation"
+        fi
+        return 0
+        ;;
+      *)
+        if (( JSON_MODE )); then
+          ok "" '{rotated:false, from:$f, to:null, reason:"current account usage is unmeasured", currentNearWall:null}' \
+             --arg f "$current"
+        else
+          echo "OK — current account '$current' usage is unmeasured; no rotation"
+        fi
+        return 0
+        ;;
+    esac
+  fi
   # Cool down the account we're leaving (the one that just hit its limit), so
   # we don't bounce straight back to it. Persist immediately — even if no
   # eligible target exists, the cooldown should stick for the next attempt.
@@ -941,8 +998,8 @@ cmd_agent_rotation_rotate() {
 
   if [[ -z "$target" ]]; then
     if (( JSON_MODE )); then
-      ok "" '{rotated:false, from:$f, to:null, reason:"no eligible account (all cooling later than current, or none configured)"}' \
-         --arg f "$current"
+      ok "" '{rotated:false, from:$f, to:null, reason:"no eligible account (all cooling later than current, or none configured)", currentNearWall:$nw}' \
+         --arg f "$current" --argjson nw "$current_near_wall"
     else
       echo "OK — no eligible account to rotate to (all cooling later than current / none configured)"
     fi
@@ -984,10 +1041,11 @@ cmd_agent_rotation_rotate() {
   fi
   ok "$human" \
      '{rotated:true, from:$f, to:$t, tier:$tier, coolingTarget:$ct,
-       channelBounceScheduled:$cbs, channelVerified:$cv}' \
+       channelBounceScheduled:$cbs, channelVerified:$cv, currentNearWall:$nw}' \
      --arg f "$current" --arg t "$target" --argjson tier "$tier" \
      --argjson ct "$( ((cooling_target)) && echo true || echo false )" \
-     --argjson cbs "$channel_bounce" --argjson cv "$channel_verified"
+     --argjson cbs "$channel_bounce" --argjson cv "$channel_verified" \
+     --argjson nw "$current_near_wall"
 }
 
 cmd_agent_rotation_cooldown() {
