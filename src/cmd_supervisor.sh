@@ -1621,6 +1621,96 @@ _sup_restart_unhealed_history() {
   echo "$n"
 }
 
+# ── DIVE-4097: DOOR 2 — the P2 ladder holds for a seat behind a capacity wall ──
+#
+# The capacity wall has TWO doors and #798 (DIVE-4052) closed only door 1. Door 1
+# is the quota-exhausted ALERT leg: it is now audited-row-only unless
+# _SUP_QUOTA_ALERTS_FLAG is set, so no phone rings for a seat the tick actually
+# CLASSIFIED as quota-exhausted. Door 2 is this ladder, and it was left wide open,
+# because the string that opened this row is not classified quota-exhausted at all:
+#
+#   "Agent codex is stuck and needs a person — no-progress (rotation-disabled)"
+#
+# _sup_classify only reaches the quota-exhausted branch when the refusal is inside
+# the pane window this tick reads (_SUP_QUOTA_PANE_LINES). On the ticks where the
+# seat has scrolled past its own refusal — or has printed nothing at all, which is
+# what a walled seat does — the very same wall classifies as stuck/no-progress, the
+# ladder runs, and rung 3 escalates `rotation-disabled` to a human. The seat is not
+# wedged; it is throttled and self-healing, and it resumes on its own.
+#
+# Worse than the page: those ticks were also SPENDING the ladder's attempt counter.
+# Alternating classifications walked codex from rung 0 to rung 3 without a single
+# tick's evidence that a nudge or a resume was ever the right remedy.
+#
+# THIS IS DELIBERATELY NOT A SELF-HEAL READING. Iterations 1-2 of this row built a
+# horizon over _sup_quota_selfheal / _sup_quota_escalate_after / episode-first, and
+# #798 deleted all three by lodar's decision: capacity alerting is answered
+# per-CLASS, not per-shape. A per-shape decision procedure has nothing left to
+# decide, so door 2 asks the one question that survives — *is this seat behind a
+# capacity wall right now* — and holds. No horizon, no threshold, no new knob.
+#
+# TWO INPUTS, and note that neither is a clock read inside this function:
+#
+#   1. The AUDIT TRAIL. Door 1 files a quota-exhausted supervisor_events row every
+#      _SUP_ALERT_WINDOW_H, unconditionally, for as long as the wall is up — #798
+#      names that row as the whole of what still covers a walled seat. It is
+#      therefore the only durable attestation of the wall, and it is exactly the
+#      evidence the pane no longer carries on the tick that pages. Reused as the
+#      hold's oracle AND as its expiry: outside that window the wall stopped being
+#      re-attested, so the hold lapses on its own. This is the existing constant
+#      that governs the re-filing; it is not a second threshold laid on top.
+#   2. The PANE, via _sup_quota_deadline (which SURVIVES #798 — DIVE-3880
+#      classification is untouched). A `lapsed` reading is a positive statement
+#      that the refusal on screen has EXPIRED and the seat has resumed, so it
+#      RELEASES the hold on the spot however fresh the audit row is. That is the
+#      arm that stops this going quiet forever: a seat still not progressing after
+#      its own wall demonstrably came down is genuinely stuck and pages.
+#      (`live` and `unknown` never arrive here — _sup_classify routes both to
+#      quota-exhausted, so a stuck row carrying a signature carries `lapsed`.)
+#
+# WHAT IT DOES NOT TOUCH: service-dead, tmux-dead and poller-dead act and escalate
+# exactly as before. A walled seat can ALSO be genuinely dead, and a dead unit is
+# the more specific reading — holding those would trade a false page for a missed
+# outage. Only no-progress and loop-stuck, the two causes a capacity wall actually
+# explains, can be held.
+#
+# THE BOUNDARY FAILURE MODE IS A NUDGE, NOT A PAGE, and that is by construction:
+# a `defer` writes no action row (see the dispatch's `case "$verb" in defer`), so a
+# held seat spends nothing and stays at attempt 0. If the hold lapses for one tick
+# at the window edge, the ladder resumes at rung 0 — a nudge — never at rung 3.
+#
+# Pure: no db, no clock, no fleet. Echoes "true" or "false".
+_sup_ladder_quota_hold() {  # <cause> <quota_deadline> <quota_row_age_sec>
+  local cause="$1" deadline="${2:-}" age="${3:-}"
+  case "$cause" in
+    no-progress|loop-stuck) ;;
+    *) printf 'false'; return 0 ;;
+  esac
+  # The pane says the refusal it is showing has already expired -> released.
+  [[ "$deadline" == "lapsed" ]] && { printf 'false'; return 0; }
+  # No attestation, or one this cannot read as a number -> never quieter than the
+  # code without this function. Absence is not a hold.
+  [[ "$age" =~ ^[0-9]+$ ]] || { printf 'false'; return 0; }
+  (( age <= _SUP_ALERT_WINDOW_H * 3600 )) || { printf 'false'; return 0; }
+  printf 'true'
+}
+
+# The db half of the above, split out for the same reason every other pure core in
+# this file is: the decision is assertable without a fleet, and this one line is
+# the only part that needs a store. Echoes the age in whole seconds of the seat's
+# NEWEST quota-exhausted supervisor_events row, or empty when it has never had one
+# (MAX(ts) over no rows is NULL and the whole expression prints empty). Any event
+# kind counts — an `alert` row and a DIVE-3822 profile-flip `action` row are both
+# the tick stating that it found this seat behind a capacity wall.
+_sup_ladder_quota_age() {  # <agent>
+  local name="$1" age
+  age=$(db "SELECT CAST(strftime('%s','now') - strftime('%s', MAX(ts)) AS INTEGER)
+            FROM supervisor_events
+            WHERE agent=$(sqlq "$name") AND classification='quota-exhausted';" 2>/dev/null) || age=""
+  [[ "$age" =~ ^-?[0-9]+$ ]] || age=""
+  printf '%s' "$age"
+}
+
 # Pure decision, no side effects: echoes "verb [reason]" where verb is one of
 # nudge|resume|rotate|restart|escalate|defer. Attempt N picks rung N+1; the gap
 # before the next action is base * 2^attempts; ladder exhausted / unreachable
@@ -1643,7 +1733,7 @@ _sup_restart_unhealed_history() {
 # serving this cause today and give back nothing until the flag is set — the
 # opposite of the row. So a dormant ladder still escalates, and the reason
 # string says the restart is the action it was holding.
-_sup_act_plan() {  # <type> <cause> <attempts> <last_epoch> <now> <rotation_enabled> [unhealed_restarts] [actions_enabled] [total_restarts]
+_sup_act_plan() {  # <type> <cause> <attempts> <last_epoch> <now> <rotation_enabled> [unhealed_restarts] [actions_enabled] [total_restarts] [quota_hold]
   # $1 (type) is retained for signature/caller stability but no longer branches:
   # OSS-23 made the ladder runtime-agnostic (see block comment above). rung-4+
   # causes still escalate for every runtime via the case below; rotate
@@ -1660,11 +1750,23 @@ _sup_act_plan() {  # <type> <cause> <attempts> <last_epoch> <now> <rotation_enab
   # with total==unhealed, a seat at the unhealed ceiling is also at or under the
   # total ceiling, and the unhealed refusal is the one that fires.
   local total="${9:-$restarts}"
+  # DIVE-4097: the 10th parameter is door 2's capacity hold, from
+  # _sup_ladder_quota_hold. OPTIONAL and defaulting to false, so every existing
+  # caller and every existing arm keeps its exact previous meaning.
+  local qhold="${10:-false}"
   [[ "$restarts" =~ ^[0-9]+$ ]] || restarts=0
   [[ "$total" =~ ^[0-9]+$ ]] || total=0
   (( total >= restarts )) || total="$restarts"
   case "$cause" in
-    no-progress|loop-stuck) : ;;
+    # DIVE-4097 door 2: a seat behind a live capacity wall is throttled, not
+    # wedged. Hold BEFORE the rungs so the attempt counter is not spent — a
+    # `defer` writes no action row, which is what keeps a held seat at rung 0
+    # instead of walking it to `escalate rotation-disabled`. Scoped to exactly
+    # the two causes a capacity wall explains; see the block comment above
+    # _sup_ladder_quota_hold for why the dead-signal causes are not held.
+    no-progress|loop-stuck)
+      [[ "$qhold" == "true" ]] && { echo "defer quota-hold"; return; }
+      ;;
     # DIVE-3753 rung 4. The limiter's REFUSING branch escalates rather than
     # deferring: a deferral is silent and this is the seat that cannot report
     # its own unreachability, so "restarting did not fix it" has to leave the
@@ -2161,7 +2263,26 @@ cmd_supervisor_tick() {
     local restarts unhealed
     restarts=$(_sup_restart_history "$name")
     unhealed=$(_sup_restart_unhealed_history "$name")
-    plan=$(_sup_act_plan "$atype" "$cause" "$attempts" "$last" "$now_s" "$rot" "$unhealed" "$actions_on" "$restarts")
+    # DIVE-4097 door 2: is this seat behind a capacity wall right now? The pane
+    # signal comes off THIS tick's snapshot row (so it is the same judgement the
+    # alert loop made ten lines up), the audit signal off the trail door 1 keeps.
+    local qdl qage qhold
+    qdl=$(jq -r '.signals.quotaDeadline // ""' <<<"$row" 2>/dev/null) || qdl=""
+    qage=$(_sup_ladder_quota_age "$name")
+    qhold=$(_sup_ladder_quota_hold "$cause" "$qdl" "$qage")
+    plan=$(_sup_act_plan "$atype" "$cause" "$attempts" "$last" "$now_s" "$rot" "$unhealed" "$actions_on" "$restarts" "$qhold")
+    # A hold that swallows a page must SAY what it swallowed. A silent suppression
+    # is the DIVE-3208 failure shape one layer over: nothing reads unit state, so
+    # a mute nobody can see is indistinguishable from a detector that stopped
+    # working. Only warn when the hold actually changed the outcome.
+    if [[ "$qhold" == "true" ]]; then
+      local unheld
+      unheld=$(_sup_act_plan "$atype" "$cause" "$attempts" "$last" "$now_s" "$rot" "$unhealed" "$actions_on" "$restarts")
+      case "$unheld" in
+        defer*|"") : ;;
+        *) warn "supervisor: HELD $name — behind a capacity wall (${cause}); would have: ${unheld}" ;;
+      esac
+    fi
     read -r verb reason <<<"$plan"
     case "$verb" in
       defer|"") continue ;;
