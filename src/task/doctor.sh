@@ -280,7 +280,7 @@ _task_doctor_fix() {
       if [[ "$trc" == "2" ]]; then
         fail "$E_GENERIC" "cannot verify --to='${to}': ${STATE_DIR:-/var/lib/5dive}/agents.json could not be read, so this command cannot tell a live seat from another dead one — and moving the row blind is the failure it is meant to repair. Fix the registry first: 5dive doctor"
       elif [[ "$trc" != "0" ]]; then
-        fail "$E_VALIDATION" "--to='${to}' is itself a lane nothing wakes (no heartbeat enabled, or the seat is operator-stopped) — ${ident} would be exactly as undispatchable at the new address. Pick a live seat: 5dive agent list"
+        fail "$E_VALIDATION" "--to='${to}' is itself a lane nothing wakes (its heartbeat is not enabled, so the tick never iterates it) — ${ident} would be exactly as undispatchable at the new address. Pick a live seat: 5dive agent list"
       fi
       apply=(cmd_task_assign "$ident" "$to"); shown="5dive task assign ${ident} ${to}" ;;
     dead-verifier)
@@ -293,7 +293,7 @@ _task_doctor_fix() {
       if [[ "$vrc" == "2" ]]; then
         fail "$E_GENERIC" "cannot verify --to='${to}': ${STATE_DIR:-/var/lib/5dive}/agents.json could not be read, so this command cannot tell a live seat from another dead one — and re-pointing the grader blind is the failure it is meant to repair. Fix the registry first: 5dive doctor"
       elif [[ "$vrc" != "0" ]]; then
-        fail "$E_VALIDATION" "--to='${to}' is itself a seat nothing wakes (no heartbeat enabled, or the seat is operator-stopped) — ${ident} would strand at handoff exactly as it does now. Pick a live seat: 5dive agent list"
+        fail "$E_VALIDATION" "--to='${to}' is itself a seat nothing wakes (its heartbeat is not enabled, so the tick never iterates it) — ${ident} would strand at handoff exactly as it does now. Pick a live seat: 5dive agent list"
       fi
       apply=(cmd_task_verifier "$ident" "$to"); shown="5dive task verifier ${ident} ${to}" ;;
     *)

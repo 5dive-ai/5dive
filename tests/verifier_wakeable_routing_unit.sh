@@ -70,10 +70,12 @@ ident() { db "SELECT ident FROM tasks WHERE id=$1;"; }
 reroster() { _TASK_ROSTER=""; _TASK_ROSTER_STATE=""; }
 
 # ---- the registry fixture ---------------------------------------------------
-# `deadqa` and `deadlead` are REGISTERED and never woken (no heartbeat key —
-# the measured shape). `livelead` and `livehand` are wakeable. `frozen` is
-# heartbeat-on but operator-stopped: the wake loop iterates it and the wake
-# fails every tick, forever, which is the same outcome for the row.
+# `deadqa`, `deadlead` and `deadcoord` are REGISTERED and never woken (no
+# heartbeat key — the measured shape). `livelead` and `livehand` are wakeable.
+# `frozen` is heartbeat-ON but operator-stopped (desiredState=stopped): it IS
+# wakeable, because `_hb_wake` never reads desiredState — it iterates every
+# enabled seat and STARTS the down unit, so the row dispatches (DIVE-4071). The
+# only unwakeable shape is a missing/disabled heartbeat key.
 mk_registry() {
   cat > "$STATE_DIR/agents.json" <<'JSON'
 {"agents":{
@@ -82,6 +84,7 @@ mk_registry() {
   "livehand": {"type":"claude","heartbeat":{"enabled":true}},
   "deadqa":   {"type":"claude"},
   "deadlead": {"type":"claude"},
+  "deadcoord":{"type":"claude"},
   "frozen":   {"type":"claude","heartbeat":{"enabled":true},"desiredState":"stopped"}
 }}
 JSON
@@ -93,12 +96,17 @@ mk_registry
 # could be green because the fixture is wrong rather than because the code is
 # right: if `deadqa` read wakeable, "skipped" and "never a candidate" render
 # identically.
-_task_doctor_lane_wakeable livelead; rc_live=$?
-_task_doctor_lane_wakeable deadqa;   rc_dead=$?
-_task_doctor_lane_wakeable frozen;   rc_frozen=$?
-{ [[ "$rc_live" == "0" && "$rc_dead" == "1" && "$rc_frozen" == "1" ]]; } \
-  && ok_t "CONTROL: the fixture registry really does make livelead wakeable and deadqa/frozen not (0/1/1)" \
-  || bad_t "CONTROL: fixture wakeability" "livelead=$rc_live (want 0) deadqa=$rc_dead (want 1) frozen=$rc_frozen (want 1)"
+_task_doctor_lane_wakeable livelead;  rc_live=$?
+_task_doctor_lane_wakeable deadqa;    rc_dead=$?
+_task_doctor_lane_wakeable frozen;    rc_frozen=$?
+_task_doctor_lane_wakeable deadcoord; rc_coord=$?
+# DIVE-4071: `frozen` (heartbeat-on, operator-stopped) is WAKEABLE (rc 0), same as
+# livelead — the tick starts its down unit. `deadqa`/`deadcoord` (no heartbeat) are
+# the only unwakeable shape (rc 1). If this control were wrong every arm below could
+# be green because the fixture is wrong rather than because the code is right.
+{ [[ "$rc_live" == "0" && "$rc_dead" == "1" && "$rc_frozen" == "0" && "$rc_coord" == "1" ]]; } \
+  && ok_t "CONTROL: livelead and frozen (operator-stopped-but-enabled) are wakeable; deadqa/deadcoord (no heartbeat) are not (0/1/0/1)" \
+  || bad_t "CONTROL: fixture wakeability" "livelead=$rc_live (want 0) deadqa=$rc_dead (want 1) frozen=$rc_frozen (want 0) deadcoord=$rc_coord (want 1)"
 
 org_seed() {  # <name> [--role=x] [--title=y] [--reports-to=z]
   local n="$1"; shift
@@ -130,11 +138,12 @@ fi
 
 # ---- P2: an end-to-end unwakeable chain returns EMPTY ------------------------
 # Rebuild the chart so EVERY candidate resolves to a seat nothing wakes:
-# QA=deadqa, manager=deadlead, coordinator=frozen (stopped, the other half),
+# QA=deadqa, manager=deadlead, coordinator=deadcoord (all no-heartbeat — the only
+# unwakeable shape; an operator-stopped seat would be woken and is NOT used here),
 # and no org root or deputy that is alive.
 db "DELETE FROM agents_org;"
 org_seed deadlead
-org_seed frozen   --role=coordinator
+org_seed deadcoord --role=coordinator
 org_seed deadqa   --title="Deadqa · Verifier (codex)"
 org_seed maker2   --role=builder --reports-to=deadlead
 got2=$(_task_default_verifier maker2 "")
@@ -179,7 +188,9 @@ reason_of() { printf '%s' "$1" | jq -r --arg i "$2" '.data.rows[]? | select(.ide
 # is wrong today and it cannot be graded tomorrow.
 t_dv=$(addt --assignee=maker --no-verify -- "live lane, grader nothing wakes")
 db "UPDATE tasks SET verifier='deadqa' WHERE id=${t_dv};"
-t_frozenv=$(addt --assignee=maker --no-verify -- "live lane, grader the operator stopped")
+# A grader that is operator-stopped but heartbeat-ON is WAKEABLE (DIVE-4071): the
+# tick starts its unit at handoff, so this is a NEGATIVE, not a dead-verifier row.
+t_frozenv=$(addt --assignee=maker --no-verify -- "live lane, grader is operator-stopped but enabled")
 db "UPDATE tasks SET verifier='frozen' WHERE id=${t_frozenv};"
 # negative: a live grader
 t_okv=$(addt --assignee=maker --no-verify -- "live lane, live grader")
@@ -189,10 +200,19 @@ out=$(doctor)
 i_dv=$(ident "$t_dv"); i_fv=$(ident "$t_frozenv"); i_okv=$(ident "$t_okv")
 
 # ---- D1 ---------------------------------------------------------------------
-r_dv=$(reason_of "$out" "$i_dv"); r_fv=$(reason_of "$out" "$i_fv")
-{ [[ "$r_dv" == "dead-verifier" && "$r_fv" == "dead-verifier" ]]; } \
-  && ok_t "D1: a row with a live assignee and an unwakeable VERIFIER is reported dead-verifier (both halves: no-heartbeat and operator-stopped)" \
-  || bad_t "D1: the verifier column is never scanned" "no-heartbeat grader -> '${r_dv:-<not a finding>}', stopped grader -> '${r_fv:-<not a finding>}' (want dead-verifier for both)"
+r_dv=$(reason_of "$out" "$i_dv")
+{ [[ "$r_dv" == "dead-verifier" ]]; } \
+  && ok_t "D1: a row with a live assignee and an unwakeable VERIFIER (no heartbeat) is reported dead-verifier" \
+  || bad_t "D1: the verifier column is never scanned" "no-heartbeat grader -> '${r_dv:-<not a finding>}' (want dead-verifier)"
+
+# ---- D1b negative: an operator-stopped-but-enabled grader is NOT a finding ---
+# The false belief this row corrects (DIVE-4071/DIVE-3939): folding desiredState
+# into the grader check flagged a grader the tick actually wakes as dead-verifier,
+# whose remedy re-points the grading rail off a live seat.
+r_fv=$(reason_of "$out" "$i_fv")
+[[ -z "$r_fv" ]] \
+  && ok_t "D1b: a grader that is operator-stopped but heartbeat-ON is NOT dead-verifier (the tick wakes it)" \
+  || bad_t "D1b: false dead-verifier on an operator-stopped-but-enabled grader" "${i_fv} -> ${r_fv}"
 
 # ---- D2 negative ------------------------------------------------------------
 r_okv=$(reason_of "$out" "$i_okv")
