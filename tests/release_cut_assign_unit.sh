@@ -274,7 +274,11 @@ run_range(){
     [[ -n "$floorval" ]] && printf '%s\n' "$floorval" > .release-floor
     git add -A; git commit -q -m 'chore: floor' --allow-empty
     [[ -n "$tag" ]] && git tag "$tag"
-    if [[ "$lint" == lint ]]; then
+    # 'lintmid' lays an UNTYPED subject down BEFORE the lint commit — the shape the
+    # real repo is in on the day this ships, and the only shape that can tell a
+    # correctly-bounded refusal from one that just happens to find nothing.
+    [[ "$lint" == lintmid ]] && git commit -q --allow-empty -m 'DIVE-9999: a subject from before the rule'
+    if [[ "$lint" == lint || "$lint" == lintmid ]]; then
       mkdir -p .github/workflows; printf 'name: pr-title-lint\n' > .github/workflows/pr-title-lint.yml
       git add -A; git commit -q -m 'ci: add the PR-title lint'
     fi
@@ -335,6 +339,18 @@ out=$(run_derive '0.17.8' v0.27.1 nolint 'DIVE-1234: an untyped subject'); rc=$?
 grep -q '^DERIVED=v0\.27\.2$' <<<"$out" \
   && ok_t 'NEGATIVE CONTROL: with no lint in the tree the SAME subject cuts a patch — the refusal is bounded by the lint commit, not universal' \
   || bad_t 'the refusal fired on a pre-lint range; this reds every cut until the old subjects age out' "rc=$rc out=$out"
+
+# THE BOUNDING ARM, and it is the one that matters. The negative control above (no lint
+# in the tree at all) is passed by an UNBOUNDED refusal too, because an empty epoch
+# collapses the enforced range to nothing — so it proves less than it looks. This arm
+# puts an untyped subject in the range AND the lint in the tree, which is exactly the
+# repo on the morning this ships: 30 of the last 60 merges are untyped and the lint has
+# just landed. If the refusal is not bounded to commits after the lint commit, every cut
+# reds until those subjects age out of the range.
+out=$(run_derive '0.17.8' v0.27.1 lintmid 'feat: after the lint'); rc=$?
+[[ $rc -eq 0 ]] && grep -q '^DERIVED=v0\.28\.0$' <<<"$out" \
+  && ok_t 'an untyped subject from BEFORE the lint commit does not refuse the cut — the boundary is the lint commit, not the range' \
+  || bad_t 'a pre-lint untyped subject refused the cut; this stops publishing entirely until the old subjects age out' "rc=$rc out=$out"
 
 out=$(run_derive '0.17.8' v0.27.1 lint 'feat: after the lint' 'fix: also after'); rc=$?
 grep -q '^DERIVED=v0\.28\.0$' <<<"$out" \
