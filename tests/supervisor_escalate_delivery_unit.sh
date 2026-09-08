@@ -604,3 +604,5 @@ t "4052: ...and no mid-window escalation ping in debug mode either" \
 # whose own pane says it is resuming (measured on main, 2026-09-08 ~16:45Z).
 t "4052: the 'STILL WALLED / hard wall' escalation text is gone from the tick" \
   "0" "$(grep -c 'STILL WALLED' <<<"$(declare -f cmd_supervisor_tick)")"
+echo "PASS=$PASS FAIL=$FAIL"
+(( FAIL == 0 ))
