@@ -27,6 +27,10 @@ first agent it restarts:
   so it is invisible to the payload fingerprint — 0.26.1 would have moved no fingerprint, restarted
   no one, and been graded by nothing. When the launcher's own hash moves and the pass restarts
   nobody, the gate spends one restart on an idle agent.
+- **A false rollback is guarded separately.** An agent already crash-looping before the update is
+  indistinguishable from a release that broke the box, so a canary must read `active/running` at two
+  samples a second apart with the counter still between them. A unit that fails that is not judged
+  broken — it is unusable as an instrument, and the canary role moves on.
 - **Three outcomes, not two.** An unreadable unit HALTS (blast radius stays at one) but rolls back
   nothing — reverting a release needs positive evidence of breakage. A systemd that answers nothing
   at all is told apart from that by an `Id` positive control and PROCEEDS exactly as before, so a

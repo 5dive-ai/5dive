@@ -721,6 +721,34 @@ _hg_watch() {
 # _hg_probe <unit> — restart the unit and grade the outcome. Echoes the verdict.
 # The baseline is read BEFORE the restart: NRestarts is cumulative for the life
 # of the unit, so only the DELTA across this restart is about this release.
+# _hg_canary_ok <unit> — is this unit a unit we can LEARN anything from?
+#
+# The gate reads a crash-loop as "the release broke the box". An agent that was
+# ALREADY crash-looping before the update reads exactly the same, and would make
+# the gate revert a perfectly good release for the whole box because one agent
+# was independently sick — a false rollback is the one way this row can make a
+# night worse than it found it.
+#
+# `systemctl list-units --state=running` does not settle it: a unit that dies and
+# is re-started every 3s IS running at the instant it is enumerated. So this takes
+# TWO samples a second apart and requires the unit to be active/running at both,
+# with the counter still between them. A unit that fails this is not judged
+# broken — it is judged UNREADABLE as an instrument, and the canary role moves to
+# the next agent.
+_hg_canary_ok() {
+  local unit="${1:-}" a1 n1 a2 n2
+  a1="$(_hg_unit_field "$unit" ActiveState)"; n1="$(_hg_unit_field "$unit" NRestarts)"
+  [[ "$a1" == "active" && "$(_hg_unit_field "$unit" SubState)" == "running" ]] || return 1
+  sleep "${HEALTH_GATE_PRECHECK_SECS:-1}" 2>/dev/null || true
+  a2="$(_hg_unit_field "$unit" ActiveState)"; n2="$(_hg_unit_field "$unit" NRestarts)"
+  [[ "$a2" == "active" && "$(_hg_unit_field "$unit" SubState)" == "running" ]] || return 1
+  # Counters unreadable on both samples is not evidence of a loop — the verdict
+  # path already treats an unreadable counter as no-delta, and being stricter
+  # here would disqualify every canary on a systemd too old to report it.
+  [[ -n "$n1" && -n "$n2" && "$n1" != "$n2" ]] && return 1
+  return 0
+}
+
 _hg_probe() {
   local unit="${1:-}" base
   # POSITIVE CONTROL BEFORE THE MEASUREMENT. `Id` is set for every unit systemd
@@ -733,6 +761,10 @@ _hg_probe() {
   if [[ -z "$(_hg_unit_field "$unit" Id)" ]]; then
     systemctl restart "$unit" 2>/dev/null || { printf 'restart-refused\n'; return 0; }
     printf 'gate-unavailable\n'; return 0
+  fi
+  # A unit that was already sick cannot answer a question about the release.
+  if ! _hg_canary_ok "$unit"; then
+    printf 'not-a-canary\n'; return 0
   fi
   base="$(_hg_unit_field "$unit" NRestarts)"
   if ! systemctl restart "$unit" 2>/dev/null; then
@@ -760,6 +792,12 @@ _hg_probe() {
 #     reason nobody would connect to this row: a new fleet-wide freeze introduced
 #     by a safety check. Proceeding is exactly today's behaviour, and it is said
 #     out loud at the call site rather than folded into a pass.
+#   NOT-A-CANARY TAKES THE NEXT AGENT INSTEAD, and this one is load-bearing. An
+#     agent that was already crash-looping before the update is indistinguishable
+#     from a release that broke the box, and treating it as the latter reverts a
+#     good release for every agent on the box. A false rollback is the one way
+#     this row can make a night worse than it found it, so a canary that cannot
+#     be read as an instrument is skipped rather than believed.
 #   RESTART-REFUSED TAKES THE NEXT AGENT INSTEAD. systemctl declining to restart
 #     one unit (masked, mid-stop, a bad drop-in) says nothing about the artifact,
 #     and before this row that agent simply landed in `failed` and the loop went
@@ -770,7 +808,7 @@ _hg_action() {
   case "${1:-}" in
     healthy|gate-unavailable) printf 'proceed\n' ;;
     crash-loop|failed|down)   printf 'rollback\n' ;;
-    restart-refused)          printf 'next-canary\n' ;;
+    restart-refused|not-a-canary) printf 'next-canary\n' ;;
     *)                        printf 'halt\n' ;;
   esac
 }
@@ -838,7 +876,7 @@ cmd_self_update() {
   # DIVE-4068 gate state. `hg_verdict` stays "not-probed" until a unit is
   # actually restarted, and that is a THIRD value, not a pass — a pass has to be
   # something the box measured.
-  local hg_canary="" hg_verdict="not-probed" hg_action="proceed" hg_why=""
+  local hg_canary="" hg_verdict="not-probed" hg_verdict_raw="" hg_action="proceed" hg_why=""
   for i in "${!units[@]}"; do
     name="${names[$i]}"; before="${befores[$i]}"
     # DIVE-4033: asked BEFORE the payload predicate, so the operator is told the
@@ -912,25 +950,35 @@ cmd_self_update() {
     # to one dark agent instead of the box.
     if [[ -z "$hg_canary" ]]; then
       hg_canary="$name"; hg_why="first agent this pass restarts"
-      hg_verdict="$(_hg_probe "${units[$i]}")"
+      hg_verdict="$(_hg_probe "${units[$i]}")"; hg_verdict_raw="$hg_verdict"
       hg_action="$(_hg_action "$hg_verdict")"
       if [[ "$hg_action" == "next-canary" ]]; then
-        # systemctl would not restart this unit. That is the pre-DIVE-4068
-        # `failed` case verbatim, and it is not evidence about the release — so
-        # the canary role moves to the next agent the loop reaches rather than
-        # stopping the pass on one stuck unit.
-        warn "failed to restart agent '$name'"
-        failed+=("$name"); hg_canary=""; hg_verdict="not-probed"; hg_action=proceed
+        hg_canary=""; hg_verdict="not-probed"; hg_action=proceed
+        if [[ "$hg_verdict_raw" == "not-a-canary" ]]; then
+          # The unit was not steady BEFORE the update, so it cannot answer a
+          # question about the release. Nothing has been restarted yet on this
+          # branch — `_hg_probe` returns before the restart — so fall through to
+          # the ORDINARY restart below and let the next agent take the canary
+          # role. Believing this unit would revert a good release for the whole
+          # box on one independently sick agent.
+          step "not using $name as the health-gate canary (its unit was not steady before the update) — the next agent this pass restarts takes that role"
+        else
+          # systemctl would not restart this unit: the pre-DIVE-4068 `failed`
+          # case verbatim, and not evidence about the release.
+          warn "failed to restart agent '$name'"
+          failed+=("$name"); continue
+        fi
+      elif [[ "$hg_action" != "proceed" ]]; then
+        break
+      else
+        if [[ "$hg_verdict" == "gate-unavailable" ]]; then
+          warn "restarted $name, but systemd answered nothing about the unit — the post-install health gate could NOT run on this box. This pass behaves exactly as it did before the gate existed: a release that cannot start an agent will not be caught here."
+        else
+          step "restarted $name ($why) — health gate PASSED (the unit was still running ${HEALTH_GATE_WINDOW_SECS:-20}s later, with no systemd re-start)"
+        fi
+        restarted+=("$name")
         continue
       fi
-      if [[ "$hg_action" != "proceed" ]]; then break; fi
-      if [[ "$hg_verdict" == "gate-unavailable" ]]; then
-        warn "restarted $name, but systemd answered nothing about the unit — the post-install health gate could NOT run on this box. This pass behaves exactly as it did before the gate existed: a release that cannot start an agent will not be caught here."
-      else
-        step "restarted $name ($why) — health gate PASSED (the unit was still running ${HEALTH_GATE_WINDOW_SECS:-20}s later, with no systemd re-start)"
-      fi
-      restarted+=("$name")
-      continue
     fi
     if systemctl restart "${units[$i]}" 2>/dev/null; then
       step "restarted $name ($why)"
@@ -973,10 +1021,10 @@ cmd_self_update() {
         hg_canary="$cand"
         hg_why="the launcher itself changed and this pass restarted no one$( (( hg_moved == 2 )) && printf ' (manifest unreadable — probed rather than assumed unchanged)')"
         step "no agent needed a restart, but the launcher changed — probing '$cand' so a build that cannot start an agent is found now rather than on its next bounce"
-        hg_verdict="$(_hg_probe "${units[$i]}")"
+        hg_verdict="$(_hg_probe "${units[$i]}")"; hg_verdict_raw="$hg_verdict"
         hg_action="$(_hg_action "$hg_verdict")"
         if [[ "$hg_action" == "next-canary" ]]; then
-          warn "failed to restart agent '$cand'"; failed+=("$cand")
+          [[ "$hg_verdict_raw" == "restart-refused" ]] && { warn "failed to restart agent '$cand'"; failed+=("$cand"); }
           hg_canary=""; hg_verdict=not-probed; hg_action=proceed; continue
         fi
         [[ "$hg_action" == "proceed" ]] && restarted+=("$cand")

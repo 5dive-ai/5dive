@@ -112,6 +112,8 @@ eq_t "NEGATIVE CONTROL: unknown HALTS, it does not roll back (a release is not r
 # would introduce a NEW fleet-wide failure in the name of preventing one.
 eq_t "NEGATIVE CONTROL: restart-refused moves the canary role on — one stuck unit must not stop the nightly for the whole box" \
   "$(_hg_action restart-refused)" next-canary
+eq_t "NEGATIVE CONTROL: not-a-canary moves the canary role on — an already-sick agent must not revert a good release for the whole box" \
+  "$(_hg_action not-a-canary)" next-canary
 eq_t "NEGATIVE CONTROL: gate-unavailable PROCEEDS — a box whose systemd answers nothing keeps updating exactly as it did before this gate existed" \
   "$(_hg_action gate-unavailable)" proceed
 eq_t "NEGATIVE CONTROL: an unrecognised verdict halts rather than proceeding" \
@@ -211,9 +213,19 @@ rm -f "$SYSTEMCTL_FAKE/refuse"
 # a state I cannot classify" are the same empty string, and the gate would halt
 # the nightly on every box with an uninterrogable systemd — permanently, and for
 # a reason nobody would trace back to this row. `Id` is what separates them.
-set_unit active running 0; printf 'X' > "$SYSTEMCTL_FAKE/NRestarts"; : > "$SYSTEMCTL_FAKE/ActiveState"
-eq_t "Id readable but the state is not -> unknown (halts): a reading we cannot classify is never a pass" \
+# `unknown` is reached through the POST-restart path: the unit was a fine
+# instrument going in, and afterwards we cannot classify what came back. That is
+# the reading that HALTS the pass without reverting anything.
+set_unit active running 0
+printf 'printf activating > "$SYSTEMCTL_FAKE/ActiveState"\n' > "$SYSTEMCTL_FAKE/on_restart"
+eq_t "still activating when the window closed -> unknown (halts): a reading we cannot classify is never a pass" \
   "$(_hg_probe 5dive-agent@t.service)" unknown
+set_unit active running 0
+printf 'printf "" > "$SYSTEMCTL_FAKE/ActiveState"\n' > "$SYSTEMCTL_FAKE/on_restart"
+eq_t "the state going unreadable AFTER the restart -> unknown, not down (down would revert the release)" \
+  "$(_hg_probe 5dive-agent@t.service)" unknown
+rm -f "$SYSTEMCTL_FAKE/on_restart"
+set_unit active running 0
 rm -f "$SYSTEMCTL_FAKE"/{Id,ActiveState,SubState,NRestarts}
 eq_t "systemd answering NOTHING -> gate-unavailable, which PROCEEDS — not 'unknown', which would freeze the box off updates" \
   "$(_hg_probe 5dive-agent@t.service)" gate-unavailable
@@ -230,6 +242,55 @@ HEALTH_GATE_WINDOW_SECS=2 HEALTH_GATE_POLL_SECS=1
 w=$(_hg_watch 5dive-agent@t.service 0); wait 2>/dev/null
 eq_t "watch keeps looking past the first healthy reading — a unit that dies at t+1s is still caught" "$w" crash-loop
 HEALTH_GATE_WINDOW_SECS=0
+
+# ------------------------------------- 5b. the canary has to be a usable instrument
+# A false ROLLBACK is the one way this row can make a night worse than it found
+# it: an agent already crash-looping before the update is byte-for-byte
+# indistinguishable from a release that broke the box, and believing it reverts a
+# good release for every agent on the box. `--state=running` does not settle it —
+# a unit re-started every 3s IS running at the instant it is enumerated.
+export HEALTH_GATE_PRECHECK_SECS=1
+set_unit active running 5
+_hg_canary_ok 5dive-agent@t.service \
+  && ok_t "a steady active/running unit is a usable canary" \
+  || bad_t "a steady unit was rejected as a canary" "the gate would skip every valid canary"
+
+set_unit activating start 0
+_hg_canary_ok 5dive-agent@t.service \
+  && bad_t "a unit that is not active/running was accepted as a canary" "it cannot answer a question about the release" \
+  || ok_t "a unit not active/running before the update is NOT a canary"
+
+# THE ARM. The unit reads active/running at both samples, but systemd re-started
+# it between them: it was ALREADY looping before the update touched anything.
+set_unit active running 5
+( sleep 1; printf 6 > "$SYSTEMCTL_FAKE/NRestarts" ) &
+if _hg_canary_ok 5dive-agent@t.service; then
+  bad_t "an ALREADY crash-looping unit was accepted as a canary" "the gate would blame the release and roll back a good one"
+else
+  ok_t "an already crash-looping unit is rejected as a canary (a false rollback is the worst outcome this row has)"
+fi
+wait 2>/dev/null
+
+# NEGATIVE CONTROL: being stricter on an unreadable counter would disqualify every
+# canary on a systemd too old to report NRestarts.
+printf 'active\n' > "$SYSTEMCTL_FAKE/ActiveState"; printf 'running\n' > "$SYSTEMCTL_FAKE/SubState"
+printf '5dive-agent@t.service\n' > "$SYSTEMCTL_FAKE/Id"; : > "$SYSTEMCTL_FAKE/NRestarts"
+_hg_canary_ok 5dive-agent@t.service \
+  && ok_t "NEGATIVE CONTROL: an unreadable NRestarts does not disqualify a canary" \
+  || bad_t "an unreadable counter disqualified a healthy canary" "no canary would ever be usable on an older systemd"
+
+# And the probe must NOT restart a unit it has just declared unusable.
+set_unit active running 5
+printf 'printf RESTARTED > "$SYSTEMCTL_FAKE/didrestart"\n' > "$SYSTEMCTL_FAKE/on_restart"
+rm -f "$SYSTEMCTL_FAKE/didrestart"
+( sleep 1; printf 6 > "$SYSTEMCTL_FAKE/NRestarts" ) &
+v="$(_hg_probe 5dive-agent@t.service)"; wait 2>/dev/null
+eq_t "probe on an already-looping unit -> not-a-canary" "$v" not-a-canary
+[[ -e "$SYSTEMCTL_FAKE/didrestart" ]] \
+  && bad_t "the probe restarted a unit it had already rejected" "the caller does the ordinary restart; the probe must not double-bounce it" \
+  || ok_t "the probe does NOT restart a unit it rejected — the caller's ordinary restart is the only bounce"
+rm -f "$SYSTEMCTL_FAKE/on_restart"; unset HEALTH_GATE_PRECHECK_SECS
+set_unit active running 0
 
 # ------------------------------------------------------------- 6. the loud line
 note="$(_hg_rollback_note dev crash-loop 5dive,5dive-agent-start)"
@@ -305,6 +366,17 @@ mut "dropping the Id positive control makes an unreadable systemd halt the night
     'export SYSTEMCTL_FAKE PATH HEALTH_GATE_WINDOW_SECS=0
      rm -f "$SYSTEMCTL_FAKE"/{Id,ActiveState,SubState,NRestarts}
      [[ "$(_hg_action "$(_hg_probe 5dive-agent@t.service)")" != proceed ]] && echo MUTANT-CAUGHT'
+
+# M7: the canary pre-check dropped — an agent that was already crash-looping
+# before the update is believed, and the gate reverts a good release for the
+# whole box. The FALSE ROLLBACK direction.
+mut "dropping the canary pre-check lets an already-sick agent revert a good release" \
+    '/if ! _hg_canary_ok "$unit"; then/,+2d' \
+    'export SYSTEMCTL_FAKE PATH HEALTH_GATE_WINDOW_SECS=0
+     printf active > "$SYSTEMCTL_FAKE/ActiveState"; printf running > "$SYSTEMCTL_FAKE/SubState"
+     printf "5dive-agent@t.service" > "$SYSTEMCTL_FAKE/Id"; printf 5 > "$SYSTEMCTL_FAKE/NRestarts"
+     printf %s "printf 6 > \"\$SYSTEMCTL_FAKE/NRestarts\"" > "$SYSTEMCTL_FAKE/on_restart"
+     [[ "$(_hg_action "$(_hg_probe 5dive-agent@t.service)")" == rollback ]] && echo MUTANT-CAUGHT'
 
 echo; echo "$PASS passed, $FAIL failed"
 (( FAIL == 0 ))
