@@ -81,7 +81,7 @@ for seat in dash combo; do
   rc=0; out=$(run_tui "$seat") || rc=$?
   is "$seat dispatcher refuses false TUI attach" "$rc" 5
   has "$seat refusal names no interactive Codex TUI" "$out" "no interactive Codex TUI"
-  has "$seat refusal points to transport logs" "$out" "5dive agent tail $seat"
+  has "$seat refusal points to transport logs" "$out" "5dive agent logs $seat --tmux"
 done
 is "plain Codex still reaches interactive attach" "$(run_tui plain)" \
   "ATTACH:-u agent-plain tmux attach -t agent-plain"
