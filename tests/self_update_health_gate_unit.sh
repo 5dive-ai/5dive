@@ -442,11 +442,19 @@ else
   bad_t "cmd_self_update not extractable" "the wiring arms below would grade nothing"
 fi
 
-# hg_loop <tag> <sed-expr|""> <new-launcher-bytes>
+# hg_loop <tag> <sed-expr|""> <new-launcher-bytes> [restart-needed-rc] [busy-csv] [parked-csv]
 #   Runs the shipped (or mutated) cmd_self_update on a three-agent fake box and
 #   writes: $d/rc, $d/out, $d/fake/restart.log, $d/bin/*.
+#
+#   `restart-needed-rc` is what `_agent_restart_needed` returns. Iteration 3: it
+#   was hard-wired to 0, so EVERY arm ran the path where a payload fingerprint
+#   moved — and the post-loop launcher-only block, which is the branch that would
+#   have caught 0.26.1, was entered by no arm in the repo. Pass 1 for a night on
+#   which nobody needs a restart. `busy-csv`/`parked-csv` are the names
+#   `_agent_busy_state`/`_agent_is_parked` report as not-idle and parked, so the
+#   candidate loop's own guards are reachable too.
 hg_loop(){
-  local tag="$1" expr="$2" newl="$3" mutated d
+  local tag="$1" expr="$2" newl="$3" rcneed="${4:-0}" busylist="${5:-}" parkedlist="${6:-}" rbdir="${7:-}" mutated d
   d="$WORK/loop-$tag"
   rm -rf "$d"; mkdir -p "$d/bin" "$d/sysd" "$d/sbin" "$d/fake/u" "$d/homes"
   local u n
@@ -525,9 +533,11 @@ _pending_restart_mark(){ return 0; }
 _agent_home(){ printf '%s/%s\n' "$HG_HOMES" "${1:-}"; }
 _agent_payload_fingerprint(){ printf 'fp\n'; }
 agent_type(){ printf 'claude\n'; }
-_agent_is_parked(){ return 1; }
-_agent_restart_needed(){ return 0; }
-_agent_busy_state(){ printf 'idle\n'; }
+_hg_in_list(){ case ",${2:-}," in *",${1:-},"*) return 0 ;; esac; return 1; }
+_agent_is_parked(){ _hg_in_list "${1:-}" "${HG_PARKED:-}"; }
+_parked_override_note(){ printf 'agent %s is parked\n' "${1:-}"; }
+_agent_restart_needed(){ return "${HG_RESTART_NEEDED_RC:-0}"; }
+_agent_busy_state(){ _hg_in_list "${1:-}" "${HG_BUSY:-}" && printf 'busy\n' || printf 'idle\n'; }
 _team_bot_install_listener(){ return 0; }
 PRELUDE
     printf '%s\n' "$block"
@@ -538,7 +548,8 @@ PRELUDE
   (
     export PATH="$d/sbin:$PATH"
     export SYSTEMCTL_FAKE="$d/fake" HG_BIN="$d/bin" HG_HOMES="$d/homes" HG_NEW_LAUNCHER="$newl"
-    export HEALTH_GATE_BIN_DIR="$d/bin" HEALTH_GATE_SYSTEMD_DIR="$d/sysd" HEALTH_GATE_ROLLBACK_DIR="$d/rb"
+    export HG_RESTART_NEEDED_RC="$rcneed" HG_BUSY="$busylist" HG_PARKED="$parkedlist"
+    export HEALTH_GATE_BIN_DIR="$d/bin" HEALTH_GATE_SYSTEMD_DIR="$d/sysd" HEALTH_GATE_ROLLBACK_DIR="${rbdir:-$d/rb}"
     export HEALTH_GATE_WINDOW_SECS=0 HEALTH_GATE_POLL_SECS=1 HEALTH_GATE_PRECHECK_SECS=0
     bash "$d/driver.sh" > "$d/out" 2>&1
     printf '%s\n' "$?" > "$d/rc"
@@ -609,6 +620,191 @@ mutw "the post-loop rollback block disabled leaves the bad build on disk" \
 # W3: the canary is never selected, so the probe never runs inside the loop.
 mutw "the in-loop canary probe never selected lets the whole pass run unmeasured" \
      's/^    if \[\[ -z "$hg_canary" \]\]; then$/    if false; then/'
+
+# ============================================ 9. THE LAUNCHER-ONLY NIGHT, RUN
+# Section 8 drives the restart loop, but every one of its arms runs with
+# `_agent_restart_needed` returning 0 — a night on which a payload fingerprint
+# moved. 0.26.1 was NOT that night. `5dive-agent-start` lives in /usr/local/bin,
+# not in an agent's home, so DIVE-3172's fingerprint never moved: nobody needed
+# a restart, nothing exercised the new startup path, and the box went dark at its
+# next bounce from any cause. The post-loop block is the branch written for
+# exactly that, and until this section NOTHING in the repo entered it — deleting
+# it whole shipped 83/0 green. Same asymmetry as the row itself, one block over:
+# `_hg_artifact_moved` the helper was graded four ways in section 4, the CONSUMER
+# of its verdict by presence-grep.
+#
+# So: nobody needs a restart, the installer moves the launcher, the canary dies
+# on it. Asserted on behaviour, exactly as in section 8 —
+#   (a) exactly one agent is ever restarted;
+#   (b) the bytes on disk afterwards are the PRE-upgrade bytes;
+#   (c) the command exits non-zero.
+hg_loop lonly "" BAD-LAUNCHER 1
+d="$WORK/loop-lonly"
+grep -q 'skipped a1 (payload unchanged)' "$d/out" \
+  && ok_t "FIXTURE: the launcher-only night is real — no agent needed a restart, so the in-loop probe never ran" \
+  || bad_t "fixture did not reach the launcher-only shape" "$(grep -c . "$d/out" 2>/dev/null) lines; $(tail -n3 "$d/out")"
+grep -q 'the launcher changed — probing' "$d/out" \
+  && ok_t "the pass spends ONE restart because the launcher itself moved, rather than leaving the new startup path unexercised" \
+  || bad_t "the launcher-only probe never announced itself" "$(tail -n3 "$d/out")"
+eq_t "(c) LAUNCHER-ONLY: a release that kills the canary makes self-update EXIT NON-ZERO" \
+  "$( [[ "$(cat "$d/rc" 2>/dev/null)" == 0 ]] && echo zero || echo non-zero )" non-zero
+eq_t "(a) LAUNCHER-ONLY BLAST RADIUS: exactly one agent was ever restarted" \
+  "$(hg_restarted_units lonly)" 5dive-agent@a1.service
+eq_t "(b) LAUNCHER-ONLY: the launcher on disk afterwards is the PRE-upgrade one" \
+  "$(cat "$d/bin/5dive-agent-start" 2>/dev/null)" GOOD-LAUNCHER
+eq_t "(b) LAUNCHER-ONLY: the bundle on disk afterwards is the PRE-upgrade one" \
+  "$(cat "$d/bin/5dive" 2>/dev/null)" GOOD-BUNDLE
+grep -qi 'HEALTH GATE FAILED' "$d/out" \
+  && ok_t "LAUNCHER-ONLY: the operator gets the loud rollback line" \
+  || bad_t "no rollback line on the launcher-only night" "$(tail -n3 "$d/out")"
+grep -qi 'running again on the restored build' "$d/out" \
+  && ok_t "LAUNCHER-ONLY: the canary is brought back UP on the restored build" \
+  || bad_t "canary not recovered on the launcher-only night" "$(tail -n3 "$d/out")"
+
+# NEGATIVE CONTROL: the launcher did NOT move and nobody needed a restart. This
+# is the ordinary quiet night, and the block must not be a brake on it — no
+# probe, no restart, the new bundle stays. Without this arm every assertion above
+# is satisfied by a block that spends a restart on every pass, which is the
+# opposite failure and the one that costs a bounce per box per night.
+hg_loop lonlyquiet "" GOOD-LAUNCHER 1
+d="$WORK/loop-lonlyquiet"
+eq_t "NEGATIVE CONTROL: a night where the launcher did not move exits ZERO" "$(cat "$d/rc" 2>/dev/null)" 0
+eq_t "NEGATIVE CONTROL: it restarts NOBODY — an unchanged launcher is not probed" \
+  "$(hg_restarted_units lonlyquiet)" ""
+eq_t "NEGATIVE CONTROL: the new bundle stays on disk" "$(cat "$d/bin/5dive" 2>/dev/null)" NEW-BUNDLE
+grep -q 'health gate not probed' "$d/out" \
+  && ok_t "NEGATIVE CONTROL: the summary says the gate was not probed, and on this night that is TRUE" \
+  || bad_t "the quiet night did not report itself honestly" "$(tail -n3 "$d/out")"
+
+# The candidate loop re-applies every guard the restart loop applies, because an
+# agent nobody asked to restart must not be resurrected from a park or
+# interrupted mid-row. Both fixtures move the launcher to a build that is FINE
+# (GOOD-LAUNCHER-2 — different bytes, and the fake unit only dies on `BAD`), so
+# the only thing either arm can see is WHICH agent the gate chose to spend.
+hg_loop lonlybusy "" GOOD-LAUNCHER-2 1 a1
+d="$WORK/loop-lonlybusy"
+eq_t "the launcher-only probe SKIPS the agent holding an in_progress row and spends the next one" \
+  "$(hg_restarted_units lonlybusy)" 5dive-agent@a2.service
+eq_t "a healthy new launcher probed on a busy box still exits zero" "$(cat "$d/rc" 2>/dev/null)" 0
+hg_loop lonlyparked "" GOOD-LAUNCHER-2 1 "" a1
+eq_t "the launcher-only probe SKIPS a parked agent rather than resurrecting it" \
+  "$(hg_restarted_units lonlyparked)" 5dive-agent@a2.service
+
+# --- MUTANTS of the LAUNCHER-ONLY WIRING ------------------------------------
+# L1-L3 leave every `_hg_*` call text in place and pass all 83 arms that existed
+# before this section. Graded against the launcher-only fixture: killed when the
+# blast radius, the bytes on disk or the exit status stops matching the shipped
+# behaviour asserted above — never on a log message.
+mutl(){ # <name> <sed-expr>
+  local name="$1" expr="$2" tag rc units launcher
+  tag="l$(printf '%s' "$name" | cksum | cut -d' ' -f1)"
+  hg_loop "$tag" "$expr" BAD-LAUNCHER 1
+  rc="$(cat "$WORK/loop-$tag/rc" 2>/dev/null)"
+  if [[ "$rc" == "MUTATION-DID-NOT-APPLY" ]]; then
+    bad_t "MUTATION DID NOT APPLY — $name" "sed '$expr' matched nothing; this arm graded the SHIPPED loop, not a mutant"
+    return
+  fi
+  units="$(hg_restarted_units "$tag")"
+  launcher="$(cat "$WORK/loop-$tag/bin/5dive-agent-start" 2>/dev/null)"
+  if [[ "$rc" == 0 || "$units" != "5dive-agent@a1.service" || "$launcher" != GOOD-LAUNCHER ]]; then
+    ok_t "MUTANT KILLED — $name (rc=$rc restarted=[$units] launcher=$launcher)"
+  else
+    bad_t "MUTANT SURVIVED — $name" "the launcher-only night is graded by nothing but the presence of the block"
+  fi
+}
+# L1: the block's outer guard never opens. 0.26.1's night verbatim on an idle
+# box: rc=0, nothing restarted, the bad launcher left on disk, and a summary line
+# claiming the launcher did not change.
+mutl "the launcher-only block's outer guard disabled leaves the bad launcher on an unprobed box" \
+     's/^  if \[\[ -z "$hg_canary" \&\& "$hg_action" == "proceed" \]\] \&\& command -v systemctl/  if false \&\& command -v systemctl/'
+# L2: the moved-artifact test always answers "unchanged", so the probe is skipped
+# on exactly the night it exists for.
+mutl "the moved-launcher test disabled skips the probe on the launcher-only night" \
+     's/^    if (( hg_moved != 1 )); then$/    if false; then/'
+# L3: the candidate loop does not stop at its verdict, so the next agent's
+# healthy probe OVERWRITES the rollback one — detect, then un-detect.
+mutl "the candidate loop that does not stop lets a later healthy probe overwrite the rollback verdict" \
+     '/\[\[ "$hg_action" == "proceed" \]\] && restarted+=("$cand")/{n;s/break/continue/;}'
+# L4/L5: the re-applied guards. Killed on WHICH agent was spent, which is the
+# only thing these guards decide.
+mutg(){ # <name> <sed-expr> <busy-csv> <parked-csv>
+  local name="$1" expr="$2" bl="$3" pl="$4" tag rc units
+  tag="g$(printf '%s' "$name" | cksum | cut -d' ' -f1)"
+  hg_loop "$tag" "$expr" GOOD-LAUNCHER-2 1 "$bl" "$pl"
+  rc="$(cat "$WORK/loop-$tag/rc" 2>/dev/null)"
+  if [[ "$rc" == "MUTATION-DID-NOT-APPLY" ]]; then
+    bad_t "MUTATION DID NOT APPLY — $name" "sed '$expr' matched nothing; this arm graded the SHIPPED loop, not a mutant"
+    return
+  fi
+  units="$(hg_restarted_units "$tag")"
+  if [[ "$units" != "5dive-agent@a2.service" ]]; then
+    ok_t "MUTANT KILLED — $name (restarted=[$units])"
+  else
+    bad_t "MUTANT SURVIVED — $name" "the guard is graded by nothing — the probe may bounce an agent nobody asked to restart"
+  fi
+}
+mutg "dropping the idle guard lets the launcher-only probe interrupt an agent mid-row" \
+     '/\[\[ "$(_agent_busy_state "$cand")" == "idle" \]\] || continue/d' a1 ""
+mutg "dropping the parked guard lets the launcher-only probe resurrect a parked agent" \
+     '/_agent_is_parked "$cand" && continue/d' "" a1
+
+# --- the two SIBLING consumer branches in the same block --------------------
+# Quinn's iteration-2 reject was "the same class, one block over", twice. These
+# are the remaining consumers of a verdict inside this block that no arm entered:
+# `no-safe-canary`, and `hg_moved == 2` (the manifest could not be read).
+#
+# 9a. Every candidate is unsafe. The gate must NOT invent a canary, and it must
+# not go quiet either — a box that installed a startup path nothing on it has
+# exercised is the state the operator has to hear about, because the next bounce
+# from any cause is what finds out.
+hg_loop lonlynone "" GOOD-LAUNCHER-2 1 a1,a2,a3
+d="$WORK/loop-lonlynone"
+eq_t "no safe candidate: the gate restarts NOBODY rather than inventing a canary" \
+  "$(hg_restarted_units lonlynone)" ""
+eq_t "no safe candidate: the pass still exits zero — an unprobed box is not evidence of breakage" \
+  "$(cat "$d/rc" 2>/dev/null)" 0
+grep -q 'no agent was safe to probe' "$d/out" \
+  && ok_t "no safe candidate: the operator is TOLD the new startup path is unexercised" \
+  || bad_t "the unexercised box went quiet" "$(tail -n3 "$d/out")"
+hg_loop lonlynonemut '/hg_verdict="no-safe-canary"/,+1d' GOOD-LAUNCHER-2 1 a1,a2,a3
+if [[ "$(cat "$WORK/loop-lonlynonemut/rc" 2>/dev/null)" == "MUTATION-DID-NOT-APPLY" ]]; then
+  bad_t "MUTATION DID NOT APPLY — the no-safe-canary warning deleted" "sed matched nothing"
+elif grep -q 'no agent was safe to probe' "$WORK/loop-lonlynonemut/out" 2>/dev/null; then
+  bad_t "MUTANT SURVIVED — the no-safe-canary warning deleted" "the box can install an unexercised startup path silently"
+else
+  ok_t "MUTANT KILLED — deleting the no-safe-canary verdict makes an unexercised box silent"
+fi
+
+# 9b. DIVE-2230 at the CONSUMER: the capture failed, so the manifest cannot say
+# whether the launcher moved. An absent reading resolves to NEITHER answer, and
+# the branch that costs one restart is the recoverable one — so it probes anyway.
+# Nothing can be rolled back, and the arm asserts that the box is told exactly
+# that instead of being left to look rolled back.
+hg_loop lonlyunread "" BAD-LAUNCHER 1 "" "" /proc/version/cannot-mkdir
+d="$WORK/loop-lonlyunread"
+grep -q 'could not capture a rollback point' "$d/out" \
+  && ok_t "FIXTURE: the capture is unusable, so the moved-launcher question is UNREADABLE (exit 2), not 'unchanged'" \
+  || bad_t "fixture did not produce an unusable capture" "$(tail -n3 "$d/out")"
+eq_t "unreadable manifest: the gate PROBES anyway — one restart beats assuming the launcher did not move" \
+  "$(hg_restarted_units lonlyunread)" 5dive-agent@a1.service
+grep -q 'manifest unreadable — probed rather than assumed unchanged' "$d/out" \
+  && ok_t "unreadable manifest: the reason names itself in the log" \
+  || bad_t "the probed-on-unknown reason was not stated" "$(tail -n3 "$d/out")"
+eq_t "unreadable manifest: a canary that dies still EXITS NON-ZERO" \
+  "$( [[ "$(cat "$d/rc" 2>/dev/null)" == 0 ]] && echo zero || echo non-zero )" non-zero
+grep -q 'would roll this box back and CANNOT' "$d/out" \
+  && ok_t "unreadable manifest: the operator is told the box is on the new build and NOT rolled back — a rollback with no capture is not faked" \
+  || bad_t "a rollback that could not happen was not reported" "$(tail -n3 "$d/out")"
+hg_loop lonlyunreadmut 's/^    if (( hg_moved != 1 )); then$/    if (( hg_moved == 0 )); then/' \
+  BAD-LAUNCHER 1 "" "" /proc/version/cannot-mkdir
+rc="$(cat "$WORK/loop-lonlyunreadmut/rc" 2>/dev/null)"
+if [[ "$rc" == "MUTATION-DID-NOT-APPLY" ]]; then
+  bad_t "MUTATION DID NOT APPLY — unreadable treated as unchanged" "sed matched nothing"
+elif [[ "$rc" == 0 || "$(hg_restarted_units lonlyunreadmut)" != 5dive-agent@a1.service ]]; then
+  ok_t "MUTANT KILLED — treating an unreadable manifest as 'unchanged' skips the probe (rc=$rc restarted=[$(hg_restarted_units lonlyunreadmut)])"
+else
+  bad_t "MUTANT SURVIVED — unreadable treated as unchanged" "the launcher-only probe is skipped on exactly the box that cannot answer"
+fi
 
 # --- MUTANT of the second sample (helper, but only reachable from 6c) --------
 mut "dropping the second sample's active/running check accepts a unit that stopped being an instrument" \
