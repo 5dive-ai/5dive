@@ -13,6 +13,13 @@
       "category": "channel",
       "source": "./voice",
       "homepage": "https://github.com/5dive-ai/5dive/tree/main/plugins/voice"
+    },
+    {
+      "name": "browser",
+      "description": "Persistent human-authenticated browser sessions: you log into a site once by hand, the agent is granted the session and never the credentials, and deterministic adapters decide where to click. A security challenge is a hard stop that asks for a person.",
+      "category": "channel",
+      "source": "./browser",
+      "homepage": "https://github.com/5dive-ai/5dive/tree/main/plugins/browser"
     }
   ]
 }
