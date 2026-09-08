@@ -165,6 +165,19 @@ else
   ok_t 'answer-time fallback does not prescribe refused agent-to-root sudo'
 fi
 
+# Drive the installer-facing command, not only its one-seat helper. Root itself
+# is an orthogonal dispatch guard; this seam lets the unit assert registry
+# filtering and the summary without mutating the host's real sudoers.
+require_root() { return 0; }
+reconcile_out=$(JSON_MODE=1 cmd_agent_reconcile_sudoers)
+is 'installer-facing reconciliation updates the registry standard seat' \
+   "$(jq -r '.data.updated' <<<"$reconcile_out")" '1'
+is 'installer-facing reconciliation ignores the registry admin seat' \
+   "$(jq -r '.data.skipped' <<<"$reconcile_out")" '0'
+[[ ! -e "$SUDOERS_D/agent-dev" ]] \
+  && ok_t 'registry filtering never creates or rewrites an admin policy' \
+  || bad_t 'registry filtering never creates or rewrites an admin policy' 'agent-dev policy appeared'
+
 # Source-to-installer tripwire: a renderer-only fix recreates the live defect on
 # every pre-existing seat. The upgrade path must invoke the reconciler after the
 # new bundle is atomically installed.
