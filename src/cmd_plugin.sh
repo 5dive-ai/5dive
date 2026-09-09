@@ -78,7 +78,7 @@ _plugin_publish_json() {
 # registration (an undeclared surface is inert). A fourth copy in a test is fine;
 # a fourth copy in the code is how they drift.
 readonly PLUGIN_CAPABILITIES="channel mcp skill verb hook"
-readonly PLUGIN_GRANTS="telegram-token audio-io agent-credentials fs-home network"
+readonly PLUGIN_GRANTS="telegram-token audio-io agent-credentials fs-home network browser-profiles"
 readonly PLUGIN_REVIEW_TIERS="official community unreviewed"
 
 # Plain English for the consent screen (§5.2). The point of this map is that the
@@ -92,8 +92,90 @@ _plugin_grant_english() {
     agent-credentials)  echo "your agent's own login credentials" ;;
     fs-home)            echo "read and write access to your agent's home directory" ;;
     network)            echo "outbound network access" ;;
+    browser-profiles)   echo "the browser profile store — the logged-in sessions you authenticated by hand" ;;
     *)                  echo "$1" ;;
   esac
+}
+
+# ---- contract §1: a grant names a resource, and naming it is not the job -----
+#
+# DIVE-4126. `browser-profiles` was missing from the enum above, so the browser
+# plugin we SHIPPED in v0.28.0 could not be installed on any box: `plugin add
+# browser` died at "unknown grant". Adding the string is the one-line half.
+#
+# The half that matters is that a grant with nothing enforcing it is the wish §2
+# was written against — it renders on the consent screen as a promise no code
+# keeps. So the enum entry comes with (a) a plain-English rendering above, and
+# (b) this function, which is what the grant MEANS on a real box.
+#
+# What `browser-profiles` authorises, exactly, and nothing else:
+#
+#   $STATE_DIR/browser-profiles/          root, 0711   traverse, do not list
+#                              /<seat>/   that seat,   0700
+#                                     /<site>/         0700
+#
+# It is deliberately NARROWER than `fs-home` rather than a special case of it. A
+# profile directory IS a credential — anything that can read it replays the
+# session — so the grant names one root that sits outside every home, instead of
+# handing the plugin a home it could rummage. A plugin that wants both is asking
+# for two things and must declare two things.
+#
+# CREATION STAYS A ROOT ACT AND `plugin add` DOES NOT DO IT. That was the open
+# question on this row; the answer is the browser plugin's own threat model. On a
+# parent any seat can write to, a hostile seat pre-creates another seat's
+# directory NAME, owns it, and every session that seat later authenticates lands
+# somewhere it can read — that is the whole credential, not a theoretical squat.
+# Provisioning it from `plugin add` would also make a credential store appear as
+# a side effect of an install the user ran for another reason, which is the exact
+# "5dive does not create it behind your back" the plugin itself prints. So the
+# installer PRINTS `fivedive.setup` and the human runs `sudo 5dive browser
+# setup`, the same shape voice already uses for `5dive-setup-voice`.
+#
+# What the installer DOES enforce is fail-closed. If the store is ABSENT that is
+# a fresh box and setup is the next thing the user is told to run — not an error.
+# If it EXISTS and is not a root-owned 0711 directory, the install is REFUSED:
+# installing on top of a store that hands sessions to the wrong uid is worse than
+# not installing, and the plugin would only discover it later, one `auth` in.
+_plugin_browser_profile_root() { echo "${STATE_DIR}/browser-profiles"; }
+
+# _plugin_browser_store_fault <root> <owner-uid> <mode>
+# Echoes the fault in a sentence, or nothing when the store is safe. It is a
+# separate function because the two faults are not equally reachable from a
+# test: a harness running as an ordinary seat can never CREATE a root-owned
+# directory, so an end-to-end arm always trips the owner check first and the
+# mode check is graded by nobody. Splitting the predicate out lets it be driven
+# with the pairs the filesystem will not hand us, on any seat, as root or not.
+_plugin_browser_store_fault() {
+  local root="$1" owner="$2" mode="$3"
+  [[ "$owner" == "0" ]] \
+    || { echo "$root is owned by uid $owner rather than root. Anything that owns that directory can hand a seat's logged-in sessions to someone else, so this install is refused."; return 0; }
+  [[ "$mode" == "711" ]] \
+    || { echo "$root is mode $mode rather than 711. 0711 is traverse-but-not-list: on anything wider one seat can enumerate — or pre-create — another seat's profile directory and read its sessions."; return 0; }
+  return 0
+}
+
+# _plugin_grant_enforce <plugin> <grants>
+# Runs BEFORE the consent screen and before anything is copied, for the same
+# reason _plugin_verb_install_check does: a grant we cannot honour must not reach
+# the point where the user has agreed to it.
+_plugin_grant_enforce() {
+  local plugin="$1" grants="$2" g
+  for g in $grants; do
+    case "$g" in
+      browser-profiles)
+        local root; root="$(_plugin_browser_profile_root)"
+        [[ -e "$root" ]] || continue
+        [[ -d "$root" ]] \
+          || fail "$E_VALIDATION" "$plugin asks for the browser profile store, but $root exists and is not a directory. A profile is a credential and 5dive will not install on top of that. Move it aside, then: sudo 5dive browser setup"
+        local owner mode fault
+        owner=$(stat -c '%u' "$root" 2>/dev/null) || owner=""
+        mode=$(stat -c '%a' "$root" 2>/dev/null) || mode=""
+        fault=$(_plugin_browser_store_fault "$root" "$owner" "$mode")
+        [[ -z "$fault" ]] || fail "$E_PERMISSION" "$plugin asks for the browser profile store, and $fault Fix the store first: sudo 5dive browser setup"
+        ;;
+    esac
+  done
+  return 0
 }
 
 _plugin_usage() {
@@ -713,6 +795,11 @@ cmd_plugin_add() {
   # would leave a half-installed plugin whose verb silently does not exist,
   # which is the state this row was filed to remove.
   _plugin_verb_install_check "$srcdir" "$plugin" "$key" "$caps" "$j"
+
+  # §1's other half (DIVE-4126). Same placement and same reason as the line
+  # above: before the consent screen, before the copy.
+  _plugin_grant_enforce "$plugin" "$grants"
+
   local dest; dest="$(_plugin_cache_dir)/$mkt/$plugin/$version"
 
   # §4, and this is the trap the atom
