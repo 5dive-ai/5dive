@@ -2,7 +2,7 @@
   "registryFormat": 1,
   "name": "5dive company templates",
   "description": "Pre-wired multi-agent companies. Spin one up with: 5dive team import <slug>.",
-  "updated": "2026-08-30",
+  "updated": "2026-09-08",
   "companies": [
     {
       "slug": "5dive-team",
@@ -18,6 +18,19 @@
         { "key": "theo", "role": "CMO", "model": "opus", "reports_to": "olivia" },
         { "key": "dude", "role": "Head of Community", "model": "sonnet", "reports_to": "theo" },
         { "key": "lilbro", "role": "Creative Director", "model": "opus", "reports_to": "theo" }
+      ]
+    },
+    {
+      "slug": "deploy-team",
+      "name": "Deploy Team",
+      "description": "Ships code on GitHub end to end: CTO, Ops, Engineer and Verifier, wired to the delivery rail — the maker opens the PR, the verifier grades it, ops merges.",
+      "size": 4,
+      "requires": ["github_push"],
+      "roster": [
+        { "key": "marcus", "role": "CTO", "model": "opus", "reports_to": null },
+        { "key": "anton", "role": "DevOps and Delivery", "model": "opus", "reports_to": "marcus" },
+        { "key": "dario", "role": "Engineer", "model": "opus", "reports_to": "anton" },
+        { "key": "vesper", "role": "Verifier / QA", "model": "opus", "reports_to": "anton" }
       ]
     },
     {
@@ -108,6 +121,23 @@
         { "key": "release_manager", "role": "Release Manager", "model": "sonnet", "reports_to": "eng_manager" },
         { "key": "doc_engineer", "role": "Doc Engineer", "model": "sonnet", "reports_to": "eng_manager" },
         { "key": "qa", "role": "QA", "model": "sonnet", "reports_to": "eng_manager" }
+      ]
+    },
+    {
+      "slug": "distribution",
+      "name": "Distribution team",
+      "description": "Seven-role approved-source distribution team with a recurring verified publish-and-measure loop.",
+      "size": 7,
+      "capabilities": { "browser": "optional", "fallback": "api-only" },
+      "loop": { "owner": "head", "id": "distribution-cycle", "cron": "0 9 * * 1-5" },
+      "roster": [
+        { "key": "head", "role": "Head of Distribution", "model": "opus", "reports_to": null },
+        { "key": "scout", "role": "Opportunity Scout", "model": "sonnet", "reports_to": "head" },
+        { "key": "packager", "role": "Content Packager", "model": "sonnet", "reports_to": "head" },
+        { "key": "outreach", "role": "Outreach", "model": "sonnet", "reports_to": "head" },
+        { "key": "publisher", "role": "Publisher", "model": "sonnet", "reports_to": "head" },
+        { "key": "verifier", "role": "Brand Verifier", "model": "opus", "reports_to": "head" },
+        { "key": "analyst", "role": "Distribution Analyst", "model": "sonnet", "reports_to": "head" }
       ]
     }
   ]

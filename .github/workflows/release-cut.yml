@@ -52,11 +52,12 @@ on:
     # fleet had already self-updated. The stated reason for 03:00 had never once held
     # in practice, so moving the slot repairs the rationale as well as the schedule.
     #
-    # 02:37 keeps the cut ahead of the fleet's 04:00 self-update even after the polling
-    # window below — BUT ONLY IF THE SCHEDULE FIRES NEAR ITS SLOT, and that is exactly
-    # the assumption this ticket disproved for 03:00. Caught by olivia grading it: at
-    # the measured +163/+168 min delay a 02:37 cron starts ~05:20 and polls to ~06:05,
-    # past the self-update, voiding this rationale the same way the old one was voided.
+    # 23:52 (lodar, 2026-09-08 23:54Z: "23:52 UTC is fine", after "so we can catch and fix
+    # bugs before customer boxes' nightly update"): the cut lands ~4h ahead of the boxes'
+    # 04:00 self-update (install.sh cron) instead of ~1h, so a bad cut can be caught by the
+    # nightly smoke and our own boxes, and re-cut, before customers pull it. Even the
+    # +163/+168 min schedule delay measured at 03:00Z lands a 23:52 cron by ~02:40 and its
+    # poll by ~03:25 — inside the window, which the 02:37 slot never was.
     #
     # SO READ THIS SENTENCE AS A PROBABILITY, NOT A GUARANTEE. Moving off the top of the
     # hour improves the odds — that slot is the one GitHub documents as worst — and it
@@ -65,14 +66,14 @@ on:
     # cut publish before the window rather than merely earlier in it), instead of picking
     # a time and hoping. Do not re-tune the minute a third time and call it fixed.
     #
-    # The 03:43 re-arm exists for the DROPPED-run case, not the delayed one, and is safe
+    # The 00:58 re-arm exists for the DROPPED-run case, not the delayed one, and is safe
     # BY CONSTRUCTION rather than by a new guard: this job already exits 0 early when the
     # incumbent tag was cut from main's current tip ("main has not moved since the last
     # cut"), so a redundant run is a cheap no-op. The `concurrency` group below
     # (cancel-in-progress: false) means the re-arm can never race the primary — at worst
     # it queues behind it and then no-ops.
-    - cron: '37 2 * * *'
-    - cron: '43 3 * * *'
+    - cron: '52 23 * * *'
+    - cron: '58 0 * * *'
   workflow_dispatch:
     inputs:
       reason:

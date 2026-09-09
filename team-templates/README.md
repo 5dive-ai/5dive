@@ -47,9 +47,91 @@ Omit the flag and behaviour is exactly as before.
 | File | Team | Roles |
 | --- | --- | --- |
 | `5dive-team.5dive.yaml` | 5dive (AI-run company) | CEO, CTO, DevOps, Engineer, Verifier, CMO, Community, Creative |
+| `deploy-team.5dive.yaml` | Deploy Team | CTO, DevOps and Delivery, Engineer, Verifier / QA |
 | `startup.5dive.yaml` | Lean SaaS startup | CEO, CMO, DevOps, Competitor Researcher, Creative |
 | `content-studio.5dive.yaml` | Content studio | Editor-in-Chief, Writer, SEO, Designer, Distributor |
 | `eng-studio.5dive.yaml` | Eng Studio | CEO, Eng Manager, Designer, Release Manager, Doc Engineer, QA |
+| `distribution.5dive.yaml` | Distribution team | Head, Scout, Packager, Outreach, Publisher, Brand Verifier, Analyst |
+
+The Distribution team declares an optional browser capability. Its import and
+`5dive team ps` report `browser+api` when the browser plugin is
+available and `api-only` otherwise; absence never creates a silently inert Publisher.
+
+
+## Deploy Team: the two things "our GitHub loop" means
+
+`deploy-team` is the four-seat engineering subtree — CTO, Ops, Engineer,
+Verifier — plus the recurring work that makes it ship. It is our own subtree,
+not an invented roster: the same four character packs the `5dive-team` template
+already carries.
+
+```bash
+5dive team import deploy-team
+```
+
+No `--auth-profile=` here: this template pins no account (its seats come up with
+deferred auth, which is what lets a one-tap import from the dashboard work), so
+the flag has nothing to bind and the import says so. Sign each seat in afterwards
+with `5dive agent auth <name>`.
+
+The loops it ships are **two different mechanisms**, and it is worth knowing
+which is which before you change one.
+
+**1. The queue rail — already in the CLI, nothing installed.** The maker pushes
+and runs `5dive task deliver <id> --pr=<url>`; the row hands off to the verifier,
+who grades at the delivered commit; a maker's `task done` on a rail row
+re-delivers rather than closes; the push-capable seat merges. Nothing in the
+template turns this on — it engages because **exactly one seat carries a
+verifier/QA role marker** (`vesper`, role `Verifier / QA`), so `task add` binds
+that seat as the grader by default. Give a second seat a role containing "QA",
+"verifier", "test" or "quality" and the auto-pick goes ambiguous, reports it, and
+**skips the rung** — rows then get filed with no grader at all. If you rename
+roles, keep the marker unique.
+
+**2. The cron loops (`loops:`) — what keeps the rail fed.** CTO: weekly
+priorities, plus a daily board sweep that unblocks and re-assigns. Ops: a daily
+sweep of open pull requests, read straight from `gh pr list` because a PR is not
+a task row and the board cannot see it — merge what the verifier passed, bounce
+what CI reddened back onto the row. Verifier: drain the grade queue. Engineer:
+take the oldest runnable row and deliver it **on push, not on CI green** — the
+verifier re-derives the result at the delivered commit anyway, so a maker sitting
+on a check is spending, not waiting.
+
+### Push capability is a property of the box, not of a seat
+
+Schema v2 has no per-agent "can push" key, because the GitHub credential is
+box-wide. So the separation is a mandate, not a permission: the Engineer opens
+pull requests, and the Verifier is told never to merge what it graded — the
+writer is never the grader, and a grader that can also merge is both.
+
+What the import *can* check is whether the box holds a credential at all, which
+is what `team.requires:` is for.
+
+## `team.requires:` — what a team needs from the box
+
+A template may declare the capabilities it needs to do its job:
+
+```yaml
+team:
+  slug: deploy-team
+  requires: [github_push]
+```
+
+Before anything is provisioned, `5dive up` (and therefore `team import`) probes
+each key and says what it found. **A missing capability never fails the import.**
+The roster comes up in a reduced mode, and the reduced mode is named — the
+failure this prevents is not "no team", it is a team that silently cannot do the
+one thing it was imported for.
+
+| key | probe | absent |
+| --- | --- | --- |
+| `github_push` | `gh auth token` (offline; no network call) | the team imports **review-only**: it reads, grades, files and rejects, but nothing it approves is pushed or merged |
+| `browser` | `5dive browser --help` | the team imports **API-only**: steps needing an authenticated browser session do not run |
+
+The probes live in the CLI and a template only names a key — a template that
+could name its own shell command would be arbitrary code run by an import. A key
+the CLI has no probe for is reported as **unchecked**, never as satisfied and
+never as absent.
 
 ## Schema
 

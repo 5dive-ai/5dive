@@ -77,6 +77,19 @@ defaults = data.get("defaults") or {}
 if not isinstance(defaults, dict):
     print("error: 'defaults:' must be a map", file=sys.stderr); sys.exit(3)
 
+# Marketplace teams may declare the one capability whose absence changes their
+# operating mode. This is data, not an arbitrary preflight command supplied by
+# the template: the CLI owns the exact probe (`5dive browser --help`).
+team = data.get("team") or {}
+if not isinstance(team, dict):
+    print("error: 'team:' must be a map", file=sys.stderr); sys.exit(3)
+caps = team.get("capabilities") or {}
+if not isinstance(caps, dict):
+    print("error: 'team.capabilities:' must be a map", file=sys.stderr); sys.exit(3)
+browser_cap = caps.get("browser")
+if browser_cap not in (None, "optional"):
+    print("error: 'team.capabilities.browser' must be 'optional'", file=sys.stderr); sys.exit(3)
+
 # Known per-agent keys (v1 + v2). Unknown → warn, not fail (forward-compat).
 KNOWN = {
     "type","channels","telegram_token","discord_token","workdir","skills",
@@ -493,6 +506,99 @@ _compose_wire_role() {
   done
 }
 
+# -------- DIVE-4103: `team.requires:` — capability preflight --------------
+#
+# A team can declare the capabilities it needs to do its job at all. The Deploy
+# Team needs a GitHub credential that can push and merge; without one it is
+# still a useful team — it reads, grades and files — but nothing it approves
+# ever lands, and NOTHING IN THE OUTPUT SAID SO. That is the defect this
+# closes: an import that silently ships a Publisher that never publishes.
+#
+# POSTURE, and it is the same one `loops:` takes: a missing capability does NOT
+# fail the import and does NOT count toward `errors`. The roster is up and
+# useful in a reduced mode, which is named. A hard failure here would make a
+# box with no credential unable to stand up a review team, which is worse than
+# what it prevents.
+#
+# The probes live HERE, in code, and the template only names a key. A template
+# that could name its own shell probe would be arbitrary code executed by an
+# import, and the whole point of the marketplace is that a template is data.
+_team_capability_label() {
+  case "$1" in
+    github_push) printf 'a GitHub credential that can push and merge' ;;
+    browser)     printf 'the 5dive browser executor (authenticated-session channels)' ;;
+    *)           printf '%s' "$1" ;;
+  esac
+}
+
+# What the team still IS without it, and how to get it. Read by a person who
+# just ran one command, so it names the reduced mode first and the fix second.
+_team_capability_degraded() {
+  case "$1" in
+    github_push) printf 'the team comes up REVIEW-ONLY — it can read, grade, file and reject, but nothing it approves can be pushed or merged. Give the box a credential (`gh auth login`, or export GH_TOKEN) and re-run the import: it is idempotent and will not double anything.' ;;
+    browser)     printf 'the team comes up API-ONLY — any step that needs an authenticated browser session will not run. Install the executor and re-run the import.' ;;
+    *)           printf 'the work that needs it will not run.' ;;
+  esac
+}
+
+# rc 0 = present · 1 = absent · 2 = no probe for this key.
+# `gh auth token` resolves GH_TOKEN/GITHUB_TOKEN and the hosts config and makes
+# NO network call (same probe as _gh_caller_credential), so the preflight cannot
+# hang an import on a box with no route out. It answers "does this box hold a
+# credential", not "does that credential carry push on your repo" — a scope read
+# needs a repo we have not been given and a network call we just refused to make.
+# Does this spec actually PIN an account, i.e. would --auth-profile= change what
+# gets provisioned? Comment lines are stripped first: this template EXPLAINS in
+# its header why it pins no account, and a naked grep read that explanation as
+# the pin.
+#
+# Named rather than inlined at the call site so the suite can drive THIS
+# predicate. Its arms previously re-declared the same sed|grep and stayed green
+# while the production line was mutated to a naked grep (quinn, DIVE-4103
+# iteration 1) — a copy of a line is not a test of it.
+_compose_spec_pins_auth_profile() {
+  sed 's/[[:space:]]*#.*$//' "$1" 2>/dev/null | grep -q 'TEAM_AUTH_PROFILE'
+}
+
+# rc contract: 0 = present · 1 = absent · 2 = THIS CLI HAS NO PROBE for the key.
+#
+# 2 is a SENTINEL, so every known arm must collapse its probe's own exit status
+# to 0/1 before returning it. Returning a probe's status verbatim is how the
+# sentinel got claimed by accident: `5dive browser --help` on a box without the
+# plugin prints "unknown command: browser" and exits 2, which reported "not
+# checked" on exactly the box where the answer is a measured ABSENT — the one
+# lie the unknown-key arm exists to prevent. (quinn, DIVE-4103 iteration 1.)
+_team_capability_present() {
+  case "$1" in
+    github_push) command -v gh >/dev/null 2>&1 && gh auth token >/dev/null 2>&1 || return 1 ;;
+    browser)     "$(_compose_self)" browser --help >/dev/null 2>&1 || return 1 ;;
+    *)           return 2 ;;
+  esac
+}
+
+# Report every capability the spec declares, before anything is provisioned —
+# the user reads it at the top of the import, not buried after 4 agent creates.
+_compose_requires_preflight() {
+  local spec="$1" k
+  local -a keys=()
+  mapfile -t keys < <(jq -r '
+      if   (.team.requires? | type) == "array"  then .team.requires[]
+      elif (.team.requires? | type) == "string" then .team.requires
+      else empty end' <<<"$spec" 2>/dev/null || true)
+  (( ${#keys[@]} )) || return 0
+  for k in "${keys[@]}"; do
+    [[ -n "$k" ]] || continue
+    if _team_capability_present "$k"; then
+      step "precondition ok — this box has $(_team_capability_label "$k")"
+    else
+      case $? in
+        2) warn "this team declares a precondition this CLI has no probe for ('$k'). It is NOT checked — verify it by hand before you rely on the team." ;;
+        *) warn "PRECONDITION ABSENT — $(_team_capability_label "$k") is not on this box, so $(_team_capability_degraded "$k")" ;;
+      esac
+    fi
+  done
+}
+
 # -------- DIVE-4022: declared loops --------
 #
 # `team import` provisioned a ROSTER, not a working company: agents, roles and
@@ -676,6 +782,21 @@ _compose_type_override_pins() {
 # invoked from a source checkout (no +x).
 _compose_self() { realpath "${BASH_SOURCE[0]}"; }
 
+# DIVE-4093 — a Distribution import must say whether authenticated-browser
+# adapters are usable. The manifest declares only `browser: optional`; the CLI
+# owns the fixed probe, so a marketplace YAML can never make us execute an
+# arbitrary command. Empty means the team did not declare this capability.
+_compose_browser_mode() {
+  local spec="$1" self="$2" declared
+  declared=$(jq -r '.team.capabilities.browser // empty' <<<"$spec" 2>/dev/null)
+  [[ -n "$declared" ]] || { printf ''; return 0; }
+  if bash "$self" browser --help </dev/null >/dev/null 2>&1; then
+    printf 'browser+api'
+  else
+    printf 'api-only'
+  fi
+}
+
 cmd_compose_up() {
   local file="" type_override=""
   while [[ $# -gt 0 ]]; do
@@ -727,8 +848,16 @@ HELP
       warn "dropped Claude-only model/effort pins (not valid on '$type_override'): $_pins — the harness default applies; set one later with: 5dive agent config <name> set model=<id>"
     fi
   fi
+  # DIVE-4103: what this team needs from the BOX, answered before anything is
+  # provisioned. Never fatal — a missing capability names the reduced mode.
+  _compose_requires_preflight "$spec"
   spec_dir=$(realpath "$(dirname "$file")")
   self=$(_compose_self)
+  local _compose_browser_mode_value
+  _compose_browser_mode_value=$(_compose_browser_mode "$spec" "$self")
+  if [[ -n "$_compose_browser_mode_value" ]]; then
+    step "capability preflight: publishing=$_compose_browser_mode_value (browser is optional; API adapters remain available)"
+  fi
   # DIVE-4022: named here so a loop that fails to register can print the exact
   # re-run, not a `<spec>` placeholder the user has to translate.
   local _COMPOSE_SPEC_FILE="$file"
@@ -1269,6 +1398,7 @@ _team_usage() {
   cat >&2 <<HELP
 usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
                                    [--telegram-token=<bot-token>|-]
+       5dive team ps [<slug|path>] [--type=<harness>]
        5dive team ls
   Provision a whole company-structure template in one call (wraps 5dive up).
   <slug> resolves to a bundled template; a path is used as-is.
@@ -1283,10 +1413,71 @@ usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
 HELP
 }
 
+_team_resolve_template() {
+  local ref="$1"
+  if [[ -f "$ref" ]]; then
+    printf '%s' "$ref"
+    return 0
+  fi
+  local dir; dir=$(_team_templates_dir) || return 1
+  if [[ -f "$dir/${ref}.5dive.yaml" ]]; then
+    printf '%s' "$dir/${ref}.5dive.yaml"
+  elif [[ -f "$dir/${ref}.5dive.yml" ]]; then
+    printf '%s' "$dir/${ref}.5dive.yml"
+  else
+    return 1
+  fi
+}
+
 cmd_team() {
   local sub="${1:-}"; shift || true
   case "$sub" in
     import) : ;;
+    ps)
+      if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+        cat >&2 <<'HELP'
+usage: 5dive team ps [<slug|path>] [--type=<harness>]
+  Show a marketplace team's roster, state, scheduled loops and capability mode.
+  With no slug, show every bundled team whose complete roster is installed.
+HELP
+        return 0
+      fi
+      local ps_ref="${1:-}"
+      if [[ -n "$ps_ref" && "$ps_ref" != --* ]]; then
+        shift || true
+        local ps_file; ps_file=$(_team_resolve_template "$ps_ref") \
+          || fail "$E_NOT_FOUND" "no template '$ps_ref' (try: 5dive team ls)"
+        cmd_compose_ps -f "$ps_file" "$@"
+        return 0
+      fi
+
+      # A slug-free status command is the receipt shown after a one-command
+      # marketplace import. Detect complete installed rosters from registry
+      # state; do not persist a mutable "last import" pointer that can lie after
+      # a second team is installed or removed.
+      local ps_dir ps_reg ps_candidate ps_spec ps_name
+      local -a ps_matches=()
+      ps_dir=$(_team_templates_dir) || fail "$E_NOT_FOUND" "no team-templates dir found"
+      ps_reg=$(registry_read)
+      for ps_candidate in "$ps_dir"/*.5dive.yaml "$ps_dir"/*.5dive.yml; do
+        [[ -f "$ps_candidate" ]] || continue
+        ps_spec=$(TEAM_AUTH_PROFILE="${TEAM_AUTH_PROFILE:-__team_ps__}" _compose_parse "$ps_candidate" 2>/dev/null) || continue
+        if jq -e --argjson reg "$ps_reg" \
+          '(.agents | length) > 0 and ([.agents | keys[] as $n | $reg.agents[$n] != null] | all)' \
+          <<<"$ps_spec" >/dev/null; then
+          ps_matches+=("$ps_candidate")
+        fi
+      done
+      (( ${#ps_matches[@]} > 0 )) \
+        || fail "$E_NOT_FOUND" "no complete bundled team roster is installed (try: 5dive team import <slug>)"
+      for ps_file in "${ps_matches[@]}"; do
+        if (( ${#ps_matches[@]} > 1 )); then
+          ps_name=$(basename "$ps_file"); ps_name=${ps_name%.5dive.yaml}; ps_name=${ps_name%.5dive.yml}
+          echo "TEAM  $ps_name"
+        fi
+        cmd_compose_ps -f "$ps_file" "$@"
+      done
+      return 0 ;;
     ls|list)
       local dir; dir=$(_team_templates_dir) || fail "$E_NOT_FOUND" "no team-templates dir found"
       echo "Available templates ($dir):"
@@ -1300,7 +1491,7 @@ cmd_team() {
     -h|--help|"" )
       _team_usage
       return 0 ;;
-    *) fail "$E_USAGE" "unknown team subcommand: $sub (try: import, ls)" ;;
+    *) fail "$E_USAGE" "unknown team subcommand: $sub (try: import, ps, ls)" ;;
   esac
 
   local ref="" profile="" type_override="" tg_token="" tg_token_set=0
@@ -1323,18 +1514,22 @@ cmd_team() {
   [[ -n "$ref" ]] || fail "$E_USAGE" "usage: 5dive team import <slug|path>"
 
   local file=""
-  if [[ -f "$ref" ]]; then
-    file="$ref"
-  else
-    local dir; dir=$(_team_templates_dir) || fail "$E_NOT_FOUND" "no team-templates dir — pass a path"
-    if   [[ -f "$dir/${ref}.5dive.yaml" ]]; then file="$dir/${ref}.5dive.yaml"
-    elif [[ -f "$dir/${ref}.5dive.yml"  ]]; then file="$dir/${ref}.5dive.yml"
-    else fail "$E_NOT_FOUND" "no template '$ref' in $dir (try: 5dive team ls)"
-    fi
-  fi
+  file=$(_team_resolve_template "$ref") \
+    || fail "$E_NOT_FOUND" "no template '$ref' (try: 5dive team ls)"
 
   # --auth-profile overrides the template's ${TEAM_AUTH_PROFILE} default.
-  [[ -n "$profile" ]] && export TEAM_AUTH_PROFILE="$profile"
+  #
+  # DIVE-4103: a template that never references the var takes nothing from the
+  # flag, and passing it read as "the roster is on that account" when the seats
+  # were in fact created unpinned. A silently inert flag on a verb you run once
+  # per company is an account you think you chose — same rule as `--pr-title`
+  # without `--open-pr` in `5dive push`. Warn rather than refuse: the import is
+  # correct, only the caller's belief about it was not.
+  if [[ -n "$profile" ]]; then
+    export TEAM_AUTH_PROFILE="$profile"
+    _compose_spec_pins_auth_profile "$file" || warn \
+      "--auth-profile=$profile has no effect on this template — it does not pin an account (its seats come up with deferred auth, which is what lets a flagless one-tap import work). The roster still comes up; sign each seat in afterwards with: 5dive agent auth <name>"
+  fi
 
   # The lead's optional channel. Curated templates read it as ${TEAM_TG_TOKEN}
   # — ONE token for the whole company (a customer talks to the lead; the rest of
@@ -1397,12 +1592,15 @@ HELP
   [[ -f "$file" ]] || fail "$E_NOT_FOUND" "spec file not found: $file"
   ensure_state_ro   # read-only: compose ps must work for non-root agents
 
-  local spec
+  local spec self browser_mode
   spec=$(_compose_parse "$file") || fail "$E_VALIDATION" "spec parse failed"
   if [[ -n "$type_override" ]]; then
     spec=$(_compose_apply_type_override "$spec" "$type_override") \
       || fail "$E_VALIDATION" "could not apply --type=$type_override to the spec"
   fi
+  self=$(_compose_self)
+  browser_mode=$(_compose_browser_mode "$spec" "$self")
+  tasks_db_init 2>/dev/null || true
   local reg
   reg=$(registry_read)
 
@@ -1410,7 +1608,7 @@ HELP
   mapfile -t names < <(jq -r '.agents | keys[]' <<<"$spec")
   local name
   for name in "${names[@]}"; do
-    local declared_type exists active
+    local declared_type exists active loops
     declared_type=$(jq -r --arg n "$name" '.agents[$n].type // "?"' <<<"$spec")
     exists=$(jq           --arg n "$name" '.agents[$n] != null'     <<<"$reg")
     if [[ "$exists" == "true" ]]; then
@@ -1418,17 +1616,23 @@ HELP
     else
       active="missing"
     fi
-    rows=$(jq -c --arg n "$name" --arg t "$declared_type" --arg a "$active" \
-      '. + [{name:$n, type:$t, state:$a}]' <<<"$rows")
+    loops=$(db "SELECT COALESCE(json_group_array(json_object(
+                  'title', title, 'schedule', COALESCE(schedule,''))), '[]')
+                FROM tasks WHERE kind='recurring' AND assignee=$(sqlq "$name");" 2>/dev/null | head -1)
+    [[ -n "$loops" ]] || loops='[]'
+    rows=$(jq -c --arg n "$name" --arg t "$declared_type" --arg a "$active" --argjson l "$loops" \
+      '. + [{name:$n, type:$t, state:$a, loops:$l}]' <<<"$rows")
   done
 
   if (( JSON_MODE )); then
-    ok "" '{file:$f, agents: $rows}' --arg f "$file" --argjson rows "$rows"
+    ok "" '{file:$f, agents:$rows} + (if $bm == "" then {} else {capabilities:{browser:$bm}} end)' \
+      --arg f "$file" --argjson rows "$rows" --arg bm "$browser_mode"
   else
+    [[ -n "$browser_mode" ]] && echo "PUBLISHING  $browser_mode"
     echo "$rows" | jq -r '
-      (["NAME","TYPE","STATE"] | @tsv),
-      (.[] | [.name, .type, .state] | @tsv)
+      (["NAME","TYPE","STATE","LOOP SCHEDULES"] | @tsv),
+      (.[] | [.name, .type, .state,
+              ([.loops[] | "\(.schedule) \(.title)"] | join("; ") | if . == "" then "-" else . end)] | @tsv)
     ' | column -t -s $'\t'
   fi
 }
-
