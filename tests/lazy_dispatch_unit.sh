@@ -287,6 +287,43 @@ run_ms() { # <args...> -> best of 5, in ms. Contention only ever adds, so the
   done
   echo "$best"
 }
+
+# A single eager invocation can finish below the old 150ms floor on a fast
+# runner. Build a denominator from repeated identical invocations instead: the
+# ratio is unchanged, while scheduler and millisecond-quantisation noise become
+# a small part of a >=500ms batch. Both sides use the same repetition count.
+LOAD_BATCH_FLOOR_MS=500
+batch_ms() { # <bundle> <repetitions> <args...> -> total wall time, ms
+  local bin="$1" reps="$2" t0 t1 i
+  shift 2
+  t0=$(date +%s%N)
+  for ((i=0; i<reps; i++)); do
+    "$bin" "$@" >/dev/null 2>&1 || true
+  done
+  t1=$(date +%s%N)
+  echo $(( (t1 - t0) / 1000000 ))
+}
+batch_reps_for_sample() { # <single eager sample ms>
+  local sample="$1" reps=1
+  (( sample < 1 )) && sample=1
+  while (( sample * reps < LOAD_BATCH_FLOOR_MS )); do
+    reps=$((reps * 2))
+  done
+  echo "$reps"
+}
+load_path_within_budget() { # <lazy total ms> <eager total ms>
+  (( $1 * 100 <= $2 * 110 ))
+}
+
+# Acceptance control: the 124ms runner that filed DIVE-4161 selects a multi-run
+# denominator instead of failing as "unmeasurable".
+FAST_REPS=$(batch_reps_for_sample 124)
+if (( FAST_REPS > 1 && 124 * FAST_REPS >= LOAD_BATCH_FLOOR_MS )); then
+  ok_t "a 124ms eager control is accumulated into a measurable batch ($FAST_REPS runs)"
+else
+  bad_t "a sub-130ms eager control is accumulated instead of refused" \
+        "124ms selected $FAST_REPS runs, below the ${LOAD_BATCH_FLOOR_MS}ms batch floor"
+fi
 PARSE=$(parse_ms)
 if [[ "$PARSE" -lt 20 ]]; then
   bad_t "the full-parse reference is measurable" \
@@ -410,24 +447,21 @@ else
     bad_t "\`task ls\` is a multi-module probe" \
           "it loaded $LOADED. This arm only grades the load path while the probe uses it; pick a wider verb."
   fi
-  bc=999999; bl=999999
-  for i in 1 2 3 4 5; do
-    t0=$(date +%s%N); "$CONTROL" task ls >/dev/null 2>&1 || true; t1=$(date +%s%N)
-    d=$(( (t1 - t0) / 1000000 )); [[ "$d" -lt "$bc" ]] && bc=$d
-    t0=$(date +%s%N); "$BUNDLE"  task ls >/dev/null 2>&1 || true; t1=$(date +%s%N)
-    d=$(( (t1 - t0) / 1000000 )); [[ "$d" -lt "$bl" ]] && bl=$d
+  task_reps=$(batch_reps_for_sample "$(batch_ms "$CONTROL" 1 task ls)")
+  while [[ "$(batch_ms "$CONTROL" "$task_reps" task ls)" -lt "$LOAD_BATCH_FLOOR_MS" ]]; do
+    task_reps=$((task_reps * 2))
   done
-  if [[ "$bc" -lt 150 ]]; then
-    bad_t "the eager control is measurable" \
-          "\`task ls\` on the eager control read ${bc}ms — too small to divide by, so the ratio below would be noise."
+  bc=999999; bl=999999
+  for i in 1 2 3; do
+    d=$(batch_ms "$CONTROL" "$task_reps" task ls); [[ "$d" -lt "$bc" ]] && bc=$d
+    d=$(batch_ms "$BUNDLE"  "$task_reps" task ls); [[ "$d" -lt "$bl" ]] && bl=$d
+  done
+  pct=$(( bl * 100 / bc ))
+  if load_path_within_budget "$bl" "$bc"; then
+    ok_t "\`task ls\` costs ${bl}ms = ${pct}% of the eager control's ${bc}ms across $task_reps runs (budget 110%)"
   else
-    pct=$(( bl * 100 / bc ))
-    if [[ "$pct" -le 110 ]]; then
-      ok_t "\`task ls\` costs ${bl}ms = ${pct}% of the eager control's ${bc}ms (budget 110%)"
-    else
-      bad_t "\`task ls\` stays within 110% of the eager control" \
-            "${bl}ms against ${bc}ms = ${pct}%. A module is being re-read out of a \`\$( )\`: run with FIVE_LAZY_TRACE=1 and look for the same module loading twice. Iteration 1 of DIVE-4087 measured 124% here."
-    fi
+    bad_t "\`task ls\` stays within 110% of the eager control" \
+          "${bl}ms against ${bc}ms across $task_reps runs = ${pct}%. A module is being re-read out of a \`\$( )\`: run with FIVE_LAZY_TRACE=1 and look for the same module loading twice. Iteration 1 of DIVE-4087 measured 124% here."
   fi
 
   # --- T12: the SECOND load-path budget --------------------------------------
@@ -447,24 +481,28 @@ else
     bad_t "\`heartbeat ls\` is a multi-module probe" \
           "it loaded $HB_LOADED. This arm only grades the load path while the probe uses it; pick a wider verb."
   fi
-  hc=999999; hl=999999
-  for i in 1 2 3 4 5; do
-    t0=$(date +%s%N); "$CONTROL" heartbeat ls >/dev/null 2>&1 || true; t1=$(date +%s%N)
-    d=$(( (t1 - t0) / 1000000 )); [[ "$d" -lt "$hc" ]] && hc=$d
-    t0=$(date +%s%N); "$BUNDLE"  heartbeat ls >/dev/null 2>&1 || true; t1=$(date +%s%N)
-    d=$(( (t1 - t0) / 1000000 )); [[ "$d" -lt "$hl" ]] && hl=$d
+  heartbeat_reps=$(batch_reps_for_sample "$(batch_ms "$CONTROL" 1 heartbeat ls)")
+  while [[ "$(batch_ms "$CONTROL" "$heartbeat_reps" heartbeat ls)" -lt "$LOAD_BATCH_FLOOR_MS" ]]; do
+    heartbeat_reps=$((heartbeat_reps * 2))
   done
-  if [[ "$hc" -lt 150 ]]; then
-    bad_t "the eager control is measurable on \`heartbeat ls\`" \
-          "it read ${hc}ms — too small to divide by, so the ratio below would be noise."
+  hc=999999; hl=999999
+  for i in 1 2 3; do
+    d=$(batch_ms "$CONTROL" "$heartbeat_reps" heartbeat ls); [[ "$d" -lt "$hc" ]] && hc=$d
+    d=$(batch_ms "$BUNDLE"  "$heartbeat_reps" heartbeat ls); [[ "$d" -lt "$hl" ]] && hl=$d
+  done
+  hpct=$(( hl * 100 / hc ))
+  if load_path_within_budget "$hl" "$hc"; then
+    ok_t "\`heartbeat ls\` costs ${hl}ms = ${hpct}% of the eager control's ${hc}ms across $heartbeat_reps runs (budget 110%)"
   else
-    hpct=$(( hl * 100 / hc ))
-    if [[ "$hpct" -le 110 ]]; then
-      ok_t "\`heartbeat ls\` costs ${hl}ms = ${hpct}% of the eager control's ${hc}ms (budget 110%)"
-    else
-      bad_t "\`heartbeat ls\` stays within 110% of the eager control" \
-            "${hl}ms against ${hc}ms = ${hpct}%. Iteration 2 measured 117% here with no arm to catch it; the load path has regressed for the widest-closure verb."
-    fi
+    bad_t "\`heartbeat ls\` stays within 110% of the eager control" \
+          "${hl}ms against ${hc}ms across $heartbeat_reps runs = ${hpct}%. Iteration 2 measured 117% here with no arm to catch it; the load path has regressed for the widest-closure verb."
+  fi
+
+  if load_path_within_budget 1170 1000; then
+    bad_t "the iteration-2 117% mutant still exceeds the 110% budget" \
+          "the ratio predicate accepted 1170ms lazy against 1000ms eager"
+  else
+    ok_t "the iteration-2 117% mutant still exceeds the 110% budget"
   fi
 fi
 
