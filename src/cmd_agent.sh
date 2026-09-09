@@ -71,7 +71,7 @@ _agent_auth_display() { # <state> <expiry-epoch|-> <refreshable>
   fi
 }
 
-cmd_list() {
+_cmd_list_legacy() {
   # DIVE-1074: rootless read (mirrors account list / DIVE-1035). `agent list` is
   # pure-read, and a standard-isolation agent (group claude, so it can read the
   # registry) needs it to DISCOVER peers before it can send/ask them. ensure_state_ro
@@ -316,6 +316,503 @@ cmd_list() {
     if (( _lg_unk )); then
       (( _lg_div )) || echo
       echo "unknown = grant not measurable as $(id -un); re-run as root for the measured column"
+    fi
+  fi
+}
+
+# DIVE-4100: collect the whole fleet in one shaper.  The old survey above is
+# retained as a fixture-only reference path (agent_list_sudo_unit overrides
+# shell functions and SUDOERS_D); production must not pay one jq/sudo/cat per
+# seat.  This process emits only the already-public `agent list` fields.  It
+# never emits credential blobs, allowlist members, or sudoers text.
+_agent_list_snapshot_python() {
+  /usr/bin/python3 - "$REGISTRY" "$AUTH_PROFILES_DIR" "$CONNECTORS_DIR" \
+    "${AGENT_HOME_ROOT:-/home}" "${SUDOERS_D:-/etc/sudoers.d}" "$DEFAULT_WORKDIR" <<'PY'
+# __5DIVE_AGENT_LIST_PY_BEGIN__
+import base64
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+import pwd
+
+registry_path, profiles_dir, connectors_dir, home_root, sudoers_dir, default_workdir = sys.argv[1:]
+
+def read_bytes(path):
+    try:
+        with open(path, "rb") as fh:
+            return fh.read()
+    except (OSError, ValueError):
+        return None
+
+def read_text(path):
+    raw = read_bytes(path)
+    if raw is None:
+        return None
+    return raw.decode("utf-8", "replace")
+
+def read_json(path):
+    text = read_text(path)
+    if text is None:
+        return None
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError):
+        return None
+
+try:
+    registry = read_json(registry_path) or {"agents": {}}
+    agents = registry.get("agents")
+    if not isinstance(agents, dict):
+        agents = {}
+except Exception:
+    agents = {}
+
+units = [f"5dive-agent@{name}.service" for name in agents]
+active = {}
+enabled = {}
+if units:
+    try:
+        cp = subprocess.run(
+            ["/usr/bin/systemctl", "show", "--property=Id,ActiveState,UnitFileState", "--no-page", *units],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False,
+        )
+        block = {}
+        for line in cp.stdout.splitlines() + [""]:
+            if not line:
+                unit = block.get("Id", "")
+                if unit.startswith("5dive-agent@") and unit.endswith(".service"):
+                    name = unit[len("5dive-agent@"):-len(".service")]
+                    active[name] = block.get("ActiveState", "")
+                    enabled[name] = block.get("UnitFileState", "")
+                block = {}
+            elif "=" in line:
+                key, value = line.split("=", 1)
+                block[key] = value
+    except OSError:
+        pass
+
+type_auth = {
+    "claude": "/etc/5dive/connectors/anthropic.env:CLAUDE_CODE_OAUTH_TOKEN",
+    "codex": "/home/claude/.codex/auth.json",
+    "hermes": "/home/claude/.hermes/auth.json",
+    "openclaw": "/home/claude/.openclaw/agents/main/agent/openclaw-agent.sqlite",
+    "antigravity": "/home/claude/.gemini/antigravity-cli/antigravity-oauth-token",
+    "grok": "/home/claude/.grok/auth.json",
+    "pi": "/home/claude/.pi/agent/auth.json",
+    "devin": "/home/claude/.local/share/devin/credentials.toml",
+}
+api_files = {"claude": "anthropic.env", "codex": "openai.env", "opencode": "openai.env", "grok": "xai.env", "pi": "pi.env"}
+
+def env_has_credential(path, agent_type):
+    text = read_text(path)
+    if text is None:
+        return False
+    if agent_type == "claude":
+        names = {"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"}
+        return any(line.split("=", 1)[0] in names and line.split("=", 1)[1] != ""
+                   for line in text.splitlines()
+                   if line and not re.match(r"^\s*#", line) and "=" in line)
+    return any(re.match(r"^[A-Z_]+=.+", line) for line in text.splitlines()
+               if not re.match(r"^\s*#", line))
+
+def openclaw_path(root, old_path):
+    if read_bytes(old_path):
+        return old_path
+    new_path = os.path.join(root, ".openclaw/openclaw.json")
+    obj = read_json(new_path)
+    profiles = obj.get("auth", {}).get("profiles", {}) if isinstance(obj, dict) else {}
+    if isinstance(profiles, dict) and profiles:
+        return new_path
+    return None
+
+def auth_path(agent_type, profile):
+    sentinel = type_auth.get(agent_type, "")
+    path = sentinel.split(":", 1)[0]
+    if profile:
+        root = os.path.join(profiles_dir, profile, agent_type)
+        paths = {
+            "codex": os.path.join(root, "auth.json"),
+            "hermes": os.path.join(root, "auth.json"),
+            "antigravity": os.path.join(root, ".gemini/antigravity-cli/antigravity-oauth-token"),
+            "grok": os.path.join(root, ".grok/auth.json"),
+            "claude": os.path.join(root, ".credentials.json"),
+        }
+        if agent_type == "openclaw":
+            old = os.path.join(root, ".openclaw/agents/main/agent/openclaw-agent.sqlite")
+            return openclaw_path(root, old) or old
+        return paths.get(agent_type, path)
+    if agent_type == "openclaw":
+        return openclaw_path("/home/claude", path) or path
+    return path
+
+def present(agent_type, profile, path):
+    sentinel = type_auth.get(agent_type, "")
+    keyed = ":" in sentinel
+    ok = False
+    raw = read_bytes(path)
+    if not keyed:
+        ok = bool(raw)
+    elif raw is not None:
+        if path.endswith(".env"):
+            ok = env_has_credential(path, agent_type)
+        else:
+            obj = read_json(path)
+            key = sentinel.rsplit(":", 1)[1]
+            val = obj.get("env", {}).get(key) if isinstance(obj, dict) else None
+            ok = val not in (None, "")
+    fallback = os.path.join(profiles_dir, profile, "combined.env") if profile else (
+        os.path.join(connectors_dir, api_files[agent_type]) if agent_type in api_files else ""
+    )
+    if not ok and fallback:
+        ok = env_has_credential(fallback, agent_type)
+    return ok, fallback
+
+def first_value(obj, paths):
+    for path in paths:
+        cur = obj
+        for key in path:
+            if not isinstance(cur, dict) or key not in cur:
+                cur = None
+                break
+            cur = cur[key]
+        if isinstance(cur, (str, int, float)) and not isinstance(cur, bool):
+            return cur
+    return None
+
+def expiry_epoch(obj):
+    if not isinstance(obj, dict):
+        return None
+    value = first_value(obj, [("claudeAiOauth", "expiresAt"), ("expiresAt",), ("expires_at",), ("expiry",)])
+    if value is not None:
+        text = str(value)
+        if re.fullmatch(r"[0-9]+", text):
+            number = int(text)
+            return number // 1000 if number > 100_000_000_000 else number
+        try:
+            return int(dt.datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp())
+        except (ValueError, OverflowError):
+            pass
+    jwt = first_value(obj, [("tokens", "id_token"), ("tokens", "access_token"), ("id_token",), ("access_token",)])
+    if not isinstance(jwt, str) or not re.match(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.", jwt):
+        return None
+    try:
+        payload = jwt.split(".", 2)[1]
+        payload += "=" * (-len(payload) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+        exp = decoded.get("exp")
+        return int(exp) if isinstance(exp, int) and not isinstance(exp, bool) else None
+    except Exception:
+        return None
+
+def refreshable(obj):
+    if not isinstance(obj, dict):
+        return False
+    val = first_value(obj, [("claudeAiOauth", "refreshToken"), ("refreshToken",), ("refresh_token",), ("tokens", "refresh_token")])
+    return isinstance(val, str) and bool(val)
+
+def auth_health(agent_type, profile):
+    sentinel = type_auth.get(agent_type)
+    if not sentinel:
+        return "ok", None, False
+    path = auth_path(agent_type, profile)
+    ok, fallback = present(agent_type, profile, path)
+    if not ok:
+        candidates = [path] + ([fallback] if fallback else [])
+        observable = True
+        for candidate in candidates:
+            if os.access(candidate, os.R_OK):
+                continue
+            parent = os.path.dirname(candidate)
+            if os.access(parent, os.R_OK) and not os.path.exists(candidate):
+                continue
+            observable = False
+            break
+        return ("needs_login" if observable else "unknown"), None, False
+    raw = read_text(path)
+    if not raw:
+        return "ok", None, False
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        obj = None
+    renew = refreshable(obj)
+    exp = expiry_epoch(obj)
+    if exp is not None and exp < int(dt.datetime.now(dt.timezone.utc).timestamp()) and not renew:
+        return "expired", exp, False
+    return "ok", exp, renew
+
+def model_and_effort(name, agent_type):
+    home = os.path.join(home_root, f"agent-{name}")
+    if agent_type == "claude":
+        obj = read_json(os.path.join(home, ".claude/settings.json"))
+        if not isinstance(obj, dict):
+            return None, None
+        return obj.get("model") or None, obj.get("effortLevel") or None
+    if agent_type in ("codex", "grok"):
+        text = read_text(os.path.join(home, f".{agent_type}/config.toml")) or ""
+        for line in text.splitlines():
+            match = re.match(r'^\s*model\s*=\s*"?([^"#]*[^"# ])"?', line)
+            if match:
+                return match.group(1), None
+        return None, None
+    if agent_type == "antigravity":
+        obj = read_json(os.path.join(home, ".gemini/antigravity-cli/settings.json"))
+        if isinstance(obj, dict):
+            return obj.get("model") or obj.get("selectedModel") or None, None
+    return None, None
+
+def classify_sudo(text, measurable):
+    if not measurable:
+        return {"grant": "unknown", "runas": "-", "impliedIsolation": "unknown", "measured": False, "extraEntries": False}
+    has_all = has_cli = has_scoped = has_other = runas_any = any_cmd = False
+    for original in text.splitlines():
+        line = original.split("#", 1)[0]
+        match = re.search(r"\(([^)]*)\)(.*)", line)
+        if not match:
+            continue
+        runas, tail = match.groups()
+        commands = tail.split(":", 1)[1] if ":" in tail else tail
+        for command in commands.split(","):
+            command = command.strip()
+            if not command:
+                continue
+            any_cmd = True
+            runas_any = runas_any or "ALL" in runas
+            if command == "ALL":
+                has_all = True
+            elif command in ("/usr/local/bin/5dive", "/usr/local/bin/5dive *"):
+                has_cli = True
+            elif (command.startswith("/usr/local/bin/5dive agent _deliver") or
+                  command.startswith("/usr/local/bin/5dive agent _capture") or
+                  command == "/usr/local/bin/5dive agent _list_private" or
+                  command.startswith("/usr/local/bin/5dive agent buzz inbound") or
+                  command.startswith("/usr/local/bin/5dive agent _self_restart") or
+                  command.startswith("/usr/local/bin/5dive _audit_append") or
+                  command.startswith("/usr/local/bin/5dive _push_do") or
+                  command.startswith("/usr/local/bin/5dive _gh_do") or
+                  command.startswith("/usr/local/bin/5dive _task_answer") or
+                  command.startswith("/usr/local/bin/5dive _merge_do")):
+                has_scoped = True
+            else:
+                has_other = True
+    grant = "root-all" if has_all else "cli-root" if has_cli else "cli-scoped" if has_scoped else "custom" if has_other else "none"
+    implied = {"root-all": "beyond-admin", "cli-root": "admin", "cli-scoped": "standard", "none": "sandboxed", "custom": "custom"}[grant]
+    return {"grant": grant, "runas": ("any" if runas_any else "root") if any_cmd else "-",
+            "impliedIsolation": implied, "measured": True,
+            "extraEntries": grant != "custom" and has_other}
+
+sudo_sources = []
+sudo_observable = os.access(sudoers_dir, os.R_OK)
+for path in ["/etc/sudoers"] + ([os.path.join(sudoers_dir, item) for item in os.listdir(sudoers_dir)] if sudo_observable else []):
+    text = read_text(path)
+    if text is not None:
+        # Join sudoers continuation lines before matching the subject token.
+        sudo_sources.extend(re.sub(r"\\\n\s*", " ", text).splitlines())
+
+# When the root helper is not installed yet, preserve the legacy caller-row
+# measurement with one `sudo -l` for the current uid. This is one process for
+# the survey, not one per seat; all peer rows remain honestly unmeasured.
+caller_user = pwd.getpwuid(os.geteuid()).pw_name
+caller_sudo = ""
+if os.geteuid() != 0 and not sudo_observable:
+    try:
+        cp = subprocess.run(["/usr/bin/sudo", "-n", "-l"], stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True, check=False)
+        if cp.returncode == 0:
+            caller_sudo = cp.stdout
+    except OSError:
+        pass
+
+def sudo_measure(name):
+    user = f"agent-{name}"
+    if user == caller_user and caller_sudo:
+        return classify_sudo(caller_sudo, True)
+    lines = []
+    for line in sudo_sources:
+        clean = line.strip()
+        if not clean or clean.startswith("#"):
+            continue
+        subject = clean.split(None, 1)[0]
+        if subject == user:
+            lines.append(clean)
+    if lines or sudo_observable:
+        return classify_sudo("\n".join(lines), True)
+    return classify_sudo("", False)
+
+def access_dir(name, agent_type):
+    if agent_type in ("claude", "codex", "grok", "pi"):
+        return os.path.join(home_root, f"agent-{name}", f".{agent_type}", "channels", "telegram")
+    if agent_type == "antigravity":
+        return os.path.join(home_root, f"agent-{name}", ".gemini", "channels", "telegram")
+    return None
+
+def startup_health(name):
+    home = os.path.join(home_root, f"agent-{name}")
+    path = os.path.join(home, ".5dive-cred-seed-failed")
+    text = read_text(path)
+    if text is not None:
+        reason = (text.splitlines() or [""])[0].replace("|", "")
+        return ("degraded", reason) if reason else ("unknown", "credential-start breadcrumb is empty")
+    if os.access(home, os.R_OK) and not os.path.exists(path):
+        return "clear", None
+    return "unknown", "credential-start breadcrumb is not readable from here"
+
+def iso_time(epoch):
+    if epoch is None:
+        return None
+    return dt.datetime.fromtimestamp(epoch, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+rows = []
+for name, value in agents.items():
+    if not isinstance(value, dict):
+        value = {}
+    agent_type = value.get("type")
+    channels = value.get("channels")
+    profile = value.get("authProfile") or ""
+    model, effort = model_and_effort(name, agent_type)
+    b2b = False
+    if channels == "telegram":
+        state = access_dir(name, agent_type)
+        access = read_json(os.path.join(state, "access.json")) if state else None
+        if isinstance(access, dict) and isinstance(access.get("botToBot"), dict):
+            b2b = access["botToBot"].get("enabled", False)
+            if not isinstance(b2b, bool):
+                b2b = False
+    deaf = False
+    for channel in ("telegram", "discord"):
+        if channel not in str(channels or "").split(","):
+            continue
+        path = os.path.join(home_root, f"agent-{name}", f".{agent_type}", "channels", channel, "access.json")
+        access = read_json(path)
+        if isinstance(access, dict):
+            allow = access.get("allowFrom", [])
+            if isinstance(allow, list) and len(allow) == 0:
+                deaf = True
+    asleep = value.get("heartbeat", {}).get("enabled", False) is not True if isinstance(value.get("heartbeat"), dict) else True
+    auth_state, auth_exp, auth_refresh = auth_health(agent_type, profile)
+    startup_state, startup_reason = startup_health(name)
+    live = active.get(name) or "unknown"
+    unit_enabled = enabled.get(name) or "unknown"
+    if live != "active":
+        operational = live
+    elif auth_state in ("needs_login", "expired") or startup_state == "degraded":
+        operational = "degraded"
+    elif auth_state == "unknown" or startup_state == "unknown":
+        operational = "unknown"
+    else:
+        operational = "ready"
+    sudo = sudo_measure(name)
+    isolation = value.get("isolation") or "admin"
+    sudo["diverges"] = bool(sudo["measured"] and sudo["impliedIsolation"] != isolation)
+    rows.append({
+        "name": name,
+        "type": agent_type,
+        "channels": channels,
+        "workdir": value.get("workdir") or default_workdir,
+        "authProfile": value.get("authProfile"),
+        "botUsername": value.get("botUsername"),
+        "isolation": isolation,
+        "heartbeat": value.get("heartbeat"),
+        "createdAt": value.get("createdAt"),
+        "active": live,
+        "enabled": unit_enabled,
+        "operationalState": operational,
+        "botToBotEnabled": b2b,
+        "model": model,
+        "effort": effort,
+        "sudo": sudo,
+        "health": {"deaf": deaf, "asleep": asleep,
+                   "auth": {"state": auth_state, "expiresAt": iso_time(auth_exp), "refreshable": auth_refresh},
+                   "startup": {"state": startup_state, "reason": startup_reason}},
+    })
+
+print(json.dumps(rows, separators=(",", ":"), ensure_ascii=False))
+# __5DIVE_AGENT_LIST_PY_END__
+PY
+}
+
+# Single privilege crossing for a fleet snapshot. Standard seats get an exact,
+# read-only grant for the hidden primitive; older installs that have not yet had
+# their managed sudoers regenerated fall back to the same one-process shaper as
+# the caller and report unreadable fields conservatively.
+agent_list_snapshot() {
+  if (( EUID == 0 )); then
+    if [[ -x /usr/local/lib/5dive/agent-list-snapshot ]]; then
+      /usr/local/lib/5dive/agent-list-snapshot
+    else
+      _agent_list_snapshot_python
+    fi
+    return
+  fi
+  local out=""
+  if [[ -x /usr/local/lib/5dive/agent-list-snapshot ]] &&
+     out=$(/usr/bin/sudo -n /usr/local/lib/5dive/agent-list-snapshot 2>/dev/null); then
+    printf '%s\n' "$out"
+  else
+    _agent_list_snapshot_python
+  fi
+}
+
+cmd_list() {
+  # Keep the existing function-level fixture contract used by the sudo grant
+  # harness. Production never sets SUDOERS_D.
+  if [[ "${SUDOERS_D:-/etc/sudoers.d}" != "/etc/sudoers.d" ]]; then
+    _cmd_list_legacy "$@"
+    return
+  fi
+  ensure_state_ro
+  local merged
+  merged=$(agent_list_snapshot)
+  if (( JSON_MODE )); then
+    printf '{"ok":true,"data":%s}\n' "$merged"
+  else
+    echo "$merged" | /usr/bin/jq -r '
+      if length == 0 then "no agents" else
+        (["NAME","TYPE","CHANNELS","PROFILE","AUTH","SUDO","STATE","ENABLED"] | @tsv),
+        (.[] | [(.name + (if (.heartbeat.enabled // false) then " ∿" + ((.heartbeat.everyMin // 30)|tostring) + "m" else "" end)), .type, .channels, (.authProfile // "-"),
+                (.health.auth.state // "unknown"),
+                (if (.sudo.measured | not) then "unknown"
+                 else .sudo.grant + (if .sudo.diverges then "!" else "" end) + (if .sudo.extraEntries then "+" else "" end) end),
+                .operationalState, .enabled] | @tsv)
+      end' | /usr/bin/column -t -s $'\t'
+    local _legends _lg_login _lg_exp _lg_aunk _lg_live _lg_unk _lg_div _lg_ext
+    _legends=$(/usr/bin/jq -r '
+      [([.[] | select(.health.auth.state == "needs_login")] | length),
+       ([.[] | select(.health.auth.state == "expired")] | length),
+       ([.[] | select((.health.auth.state // "unknown") == "unknown")] | length),
+       ([.[] | select(.active == "active" and ((.health.auth.state == "needs_login") or (.health.auth.state == "expired"))) | .name] | join(", ")),
+       ([.[] | select(.sudo.measured | not)] | length),
+       ([.[] | select(.sudo.diverges)] | length),
+       ([.[] | select(.sudo.extraEntries)] | length)] | .[]' <<<"$merged")
+    local -a _legend_values=()
+    mapfile -t _legend_values <<<"$_legends"
+    _lg_login="${_legend_values[0]:-0}"
+    _lg_exp="${_legend_values[1]:-0}"
+    _lg_aunk="${_legend_values[2]:-0}"
+    _lg_live="${_legend_values[3]:-}"
+    _lg_unk="${_legend_values[4]:-0}"
+    _lg_div="${_legend_values[5]:-0}"
+    _lg_ext="${_legend_values[6]:-0}"
+    if (( _lg_login || _lg_exp )); then
+      echo
+      echo "AUTH: $(( _lg_login + _lg_exp )) agent(s) have no usable credential (5dive agent auth start <type> --auth-profile=<p>)"
+      [[ -n "$_lg_live" ]] && echo "      RUNNING but unauthed — the unit is up and the runtime cannot reach its provider: ${_lg_live}"
+    fi
+    if (( _lg_aunk )); then
+      (( _lg_login || _lg_exp )) || echo
+      echo "AUTH unknown = credential not readable as $(/usr/bin/id -un); re-run as root. ok = the credential FILE is present/unexpired, not probed (5dive agent auth status)"
+    fi
+    if (( _lg_div )); then
+      echo
+      echo "! enforced grant DISAGREES with the stored isolation label — trust the grant (5dive agent info <name>)"
+    fi
+    (( _lg_ext )) && echo "+ extra sudoers entries this CLI did not write"
+    if (( _lg_unk )); then
+      (( _lg_div )) || echo
+      echo "unknown = grant not measurable as $(/usr/bin/id -un); re-run as root for the measured column"
     fi
   fi
 }
