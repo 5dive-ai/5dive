@@ -271,6 +271,36 @@ delivered DIVE-9115 \
 reset
 
 
+# ── 9b. `--urgent` SKIPS THE WINDOW ON THE HUMAN PATH TOO ──────────────────
+# The env var TASK_GATE_ROUTE_URGENT is exported at ONE call site, the routed
+# branch, so a human-bound gate never saw it and `--urgent` was silently ignored
+# by this window. The row column is the durable form of the same fact and cannot
+# be lost by a call site forgetting to re-export it.
+#
+# This arm is the PRECONDITION for raising the window: the whole argument that a
+# longer delay is safe rests on the filer being able to opt out of it. At 120s a
+# missed skip is a nuisance; at 900s it is a 15-minute hold on a gate whose filer
+# said it could not wait.
+reset; mkgate DIVE-9116 high
+db "UPDATE tasks SET gate_urgent=1 WHERE ident='DIVE-9116';"
+w=$(_task_gate_undo_window_secs DIVE-9116)
+[[ "$w" == "0" ]] \
+  && ok_t "gate_urgent=1 skips the window with NO env var set (the human path)" \
+  || fail_t "--urgent is ignored on the human path: window=${w}s, so raising it delays urgent gates"
+
+# NEGATIVE CONTROL: the column must not be read as urgent when the filer said
+# nothing. Without this, a fix that returned 0 unconditionally reads green above.
+reset; mkgate DIVE-9117 high
+db "UPDATE tasks SET gate_urgent=0 WHERE ident='DIVE-9117';"
+w=$(_task_gate_undo_window_secs DIVE-9117)
+# Graded as non-zero, not as a literal: this harness pins the window to 4s for
+# speed (line 60), so asserting the shipped 120 here fails for a reason that has
+# nothing to do with the claim. The claim is that the skip is not unconditional.
+[[ "$w" != "0" && -n "$w" ]] \
+  && ok_t "gate_urgent=0 still holds the window (${w}s) — the skip is not unconditional" \
+  || fail_t "gate_urgent=0 yielded '${w}', expected a non-zero hold"
+
+
 # ── 10. THE OVERRIDE IS CLAMPED DOWNWARD: it may shorten the hold, never extend ─
 # The commit that shipped arm D called the duration "a sealed constant with no
 # write path", for the _GATE_HUMAN_CAPABILITIES reason: agents hold NOPASSWD:ALL,

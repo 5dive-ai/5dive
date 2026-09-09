@@ -2052,8 +2052,26 @@ _task_gate_undo_window_secs() {
   # release to take effect, same contract as `task pfr-autoclear`.
   local pref; pref=$(_task_pref_get gate_undo_window 2>/dev/null || echo ""); pref="${pref:-on}"
   [[ "$pref" == "off" ]] && { printf '0'; return 0; }
-  # The filer said it cannot wait.
+  # The filer said it cannot wait, in the three vocabularies that exist.
+  #
+  # READ `gate_urgent` FROM THE ROW, not only the env var. `TASK_GATE_ROUTE_URGENT`
+  # is exported at exactly one call site — the ROUTED branch — so a gate bound for
+  # the HUMAN never saw it, and `--urgent` on a human-bound gate was silently
+  # ignored by this window. That is the half of the skip nobody was told was
+  # missing, and it is the half that matters: the routed rail goes to a seat that
+  # is polling anyway, while the human path is the one a 2-minute hold delays.
+  # Found by ops's condition on DIVE-4174 — "verify, do not assume, that the urgent
+  # skip bypasses the window" — which is the precondition for RAISING the window at
+  # all. At 120s the exposure is small; at 300s or 900s it would delay every gate
+  # whose filer explicitly said it could not wait.
+  #
+  # The row column is the right source rather than more env plumbing: the schema
+  # already calls `gate_urgent` "the filer's explicit" signal, it is written before
+  # the deliverer runs on both paths, and a column cannot be lost by a call site
+  # forgetting to re-export it — which is exactly how this went missing.
   [[ "${TASK_GATE_ROUTE_URGENT:-0}" == "1" ]] && { printf '0'; return 0; }
+  local _gu; _gu=$(db "SELECT COALESCE(gate_urgent,0) FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || echo 0)
+  [[ "$_gu" == "1" ]] && { printf '0'; return 0; }
   local prio; prio=$(db "SELECT COALESCE(priority,'') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || echo "")
   [[ "$prio" == "urgent" ]] && { printf '0'; return 0; }
   printf '%s' "$secs"

@@ -4081,6 +4081,10 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
   # the chain starts from the ambient identity (auto_sender_from_sudo), which under
   # a `sudo -u agent-X` invocation is the INVOKER, not the filer — so the walk
   # would climb the wrong branch of the org chart.
+  # DIVE-4154: persist the filer's explicit urgency on THIS path too. It was
+  # written only on the routed branch, so `--urgent` on a human-bound gate reached
+  # neither the window nor any reader — see the note at _task_gate_undo_window_secs.
+  db "UPDATE tasks SET gate_urgent=${urgent} WHERE id=${id};" 2>/dev/null || true
   local _nrc=0
   TASK_GATE_FILER="$actor" \
     task_need_notify "$ident" "$type" "$ask" "$options" "$recommend" "$secret_key" "$connector" "$human_nonce" "$precedent_cite" || _nrc=$?
