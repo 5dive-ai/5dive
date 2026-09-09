@@ -71,6 +71,78 @@ _agent_auth_display() { # <state> <expiry-epoch|-> <refreshable>
   fi
 }
 
+# DIVE-4158: the NAME column's heartbeat badge shows the LAST-RUN AGE, not the
+# configured cadence.
+#
+# It used to print `∿5m` = heartbeat.everyMin. That reads exactly like "last
+# seen 5 minutes ago" and is not: on 2026-09-09 (DIVE-4157) main2 was 68m past
+# a 5m cadence — 13.5 intervals overdue — and rendered a `∿5m` identical to a
+# seat that had just ticked. The human table disagreed with reality in the
+# reassuring direction, so the only way to read true freshness was to compute
+# `now - heartbeat.lastRunAt` out of `--json` by hand. Same family as
+# DIVE-4001/4008 (`agent list` omitting desiredState).
+#
+# The badge is now `∿<age>/<cadence>m`, and a seat whose age exceeds 2x its own
+# cadence is suffixed `!` and named in a legend line. Both numbers are kept
+# because "overdue" is a RATIO: 20m means nothing until you know whether the
+# seat wakes every 5m or every 30m.
+#
+# A seat enrolled in the heartbeat that has NEVER ticked (lastRunAt absent or 0)
+# renders `∿never/<cadence>m!` and counts as overdue. Zero runs is the alarm
+# state, not a clean one — a seat that never woke is the failure this column
+# exists to show, and reporting it as fresh is how the class stays invisible.
+#
+# Clock skew (lastRunAt in the future) clamps to 0m and never flags: a negative
+# age is a broken clock, not an overdue seat, and flagging it would train the
+# reader to ignore the `!`.
+#
+# Defined ONCE and used by BOTH renderers (`cmd_list` and the fixture-only
+# `_cmd_list_legacy`). The two call sites previously carried byte-identical
+# copies of the row expression, which is exactly how a column gets fixed on one
+# path and left stale on the other.
+_AGENT_LIST_HB_DEFS='
+  def hb_every: (.heartbeat.everyMin // 30);
+  def hb_last: (.heartbeat.lastRunAt // 0) | if type == "number" then . else 0 end;
+  def hb_on: (.heartbeat.enabled // false) == true;
+  def hb_ran: hb_on and (hb_last > 0);
+  def hb_age: (if hb_ran then ($now - hb_last) else 0 end) | if . < 0 then 0 else . end;
+  def hb_overdue: hb_on and ((hb_last <= 0) or (hb_age > (hb_every * 120)));
+  def hb_agefmt:
+    if . < 5400 then ((. / 60) | floor | tostring) + "m"
+    elif . < 172800 then ((. / 3600) | floor | tostring) + "h"
+    else ((. / 86400) | floor | tostring) + "d" end;
+  def hb_badge:
+    if hb_on | not then ""
+    else " ∿" + (if hb_ran then (hb_age | hb_agefmt) else "never" end)
+         + "/" + (hb_every | tostring) + "m"
+         + (if hb_overdue then "!" else "" end)
+    end;
+'
+
+# Renders the human `agent list` table plus its heartbeat legend. $2 is the
+# clock, defaulted here and pinned by the unit tests so the ageing arms are
+# deterministic rather than racing `date`.
+_agent_list_table() {
+  local merged="$1" now="${2:-$(date +%s)}"
+  /usr/bin/jq -r --argjson now "$now" "$_AGENT_LIST_HB_DEFS"'
+    if length == 0 then "no agents" else
+      (["NAME","TYPE","CHANNELS","PROFILE","AUTH","SUDO","STATE","ENABLED"] | @tsv),
+      (.[] | [(.name + hb_badge), .type, .channels, (.authProfile // "-"),
+              (.health.auth.state // "unknown"),
+              (if (.sudo.measured | not) then "unknown"
+               else .sudo.grant + (if .sudo.diverges then "!" else "" end) + (if .sudo.extraEntries then "+" else "" end) end),
+              .operationalState, .enabled] | @tsv)
+    end' <<<"$merged" | /usr/bin/column -t -s $'\t'
+  local _hb_overdue
+  _hb_overdue=$(/usr/bin/jq -r --argjson now "$now" "$_AGENT_LIST_HB_DEFS"'
+    [.[] | select(hb_overdue) | .name] | join(", ")' <<<"$merged")
+  if [[ -n "$_hb_overdue" ]]; then
+    echo
+    echo "∿age/cadence — OVERDUE (last run > 2x its own cadence, or never run): ${_hb_overdue}"
+    echo "      a stall can also be a boot window: re-read after one full cadence before calling a seat dead (5dive agent list --json | jq '.data[].heartbeat')"
+  fi
+}
+
 _cmd_list_legacy() {
   # DIVE-1074: rootless read (mirrors account list / DIVE-1035). `agent list` is
   # pure-read, and a standard-isolation agent (group claude, so it can read the
@@ -269,15 +341,7 @@ _cmd_list_legacy() {
   if (( JSON_MODE )); then
     echo "$merged" | jq -c '{ok:true, data: .}'
   else
-    echo "$merged" | jq -r '
-      if length == 0 then "no agents" else
-        (["NAME","TYPE","CHANNELS","PROFILE","AUTH","SUDO","STATE","ENABLED"] | @tsv),
-        (.[] | [(.name + (if (.heartbeat.enabled // false) then " ∿" + ((.heartbeat.everyMin // 30)|tostring) + "m" else "" end)), .type, .channels, (.authProfile // "-"),
-                (.health.auth.state // "unknown"),
-                (if (.sudo.measured | not) then "unknown"
-                 else .sudo.grant + (if .sudo.diverges then "!" else "" end) + (if .sudo.extraEntries then "+" else "" end) end),
-                .operationalState, .enabled] | @tsv)
-      end' | column -t -s $'\t'
+    _agent_list_table "$merged"
     # DIVE-2088: the SUDO column is a MEASUREMENT, not the stored label, so the
     # legend only prints for the states that need reading — and `unknown` says
     # outright that nothing was measured rather than quietly falling back to the
@@ -769,15 +833,7 @@ cmd_list() {
   if (( JSON_MODE )); then
     printf '{"ok":true,"data":%s}\n' "$merged"
   else
-    echo "$merged" | /usr/bin/jq -r '
-      if length == 0 then "no agents" else
-        (["NAME","TYPE","CHANNELS","PROFILE","AUTH","SUDO","STATE","ENABLED"] | @tsv),
-        (.[] | [(.name + (if (.heartbeat.enabled // false) then " ∿" + ((.heartbeat.everyMin // 30)|tostring) + "m" else "" end)), .type, .channels, (.authProfile // "-"),
-                (.health.auth.state // "unknown"),
-                (if (.sudo.measured | not) then "unknown"
-                 else .sudo.grant + (if .sudo.diverges then "!" else "" end) + (if .sudo.extraEntries then "+" else "" end) end),
-                .operationalState, .enabled] | @tsv)
-      end' | /usr/bin/column -t -s $'\t'
+    _agent_list_table "$merged"
     local _legends _lg_login _lg_exp _lg_aunk _lg_live _lg_unk _lg_div _lg_ext
     _legends=$(/usr/bin/jq -r '
       [([.[] | select(.health.auth.state == "needs_login")] | length),
