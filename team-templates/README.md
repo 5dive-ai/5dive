@@ -57,6 +57,19 @@ The Distribution team declares an optional browser capability. Its import and
 `5dive team ps` report `browser+api` when the browser plugin is
 available and `api-only` otherwise; absence never creates a silently inert Publisher.
 
+Its `distribution.channels` block is a **default, not a policy.** Every channel
+carries a permission tier — `AUTO` (a verified item ships without asking),
+`APPROVAL` (the Head signs off), `HUMAN` (a named person your team nominates
+signs off) — and a transport (`api`, `browser`, `human`). Both are yours to edit
+at import time or later, per channel: 5dive does not decide which surfaces your
+team may post to, or which of them need a person. The shipped tiers are cautious
+on discussion surfaces and nothing more; no channel is HUMAN by decree.
+
+Two things in this team are product behaviour rather than preference, and stay
+whatever you set the tiers to: the Brand Verifier grades every derivative before
+it can be published, and on a `browser` channel a security challenge (CAPTCHA,
+2FA, an "unusual activity" interstitial) is a hard stop that asks for a person.
+
 
 ## Deploy Team: the two things "our GitHub loop" means
 
