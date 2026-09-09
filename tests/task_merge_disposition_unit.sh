@@ -13,7 +13,8 @@
 #   _merge_disp_risk   (repo, file list)                  -> low | look:<why>     (iii)
 #   _merge_disp_decide (mergeable, state, head, graded, risk)
 #                                                          -> merge | hold:<who>:<why>
-#   _merge_disp_probe  the one gh read                     [STUBBED here]
+#   _merge_disp_probe  the one gh read      [section E stubs `_gate_gh` UNDER it;
+#                                           sections C/D stub the probe itself]
 #   _merge_disp_do     the DIVE-3474 `_merge_do` rail      [STUBBED here]
 #
 # So sections A and B drive every (i)/(ii)/(iii) branch from a fixture — no
@@ -43,6 +44,21 @@
 #                                                        killed 4 arms (C2a, C2b, C3a, C5)
 # M4 is the defect this row exists to fix, stated as a mutant: route every hold
 # to the maker and the suite reds on exactly the arms that describe the bug.
+#
+# ITERATION 2 adds section E and the mutants it exists to kill. Quinn found at
+# iteration 1 that _merge_disp_probe was stubbed in every arm, so two mutants of
+# the one function that can fail OPEN survived a green suite:
+#   M5  whole body -> `printf merge; return 0`        killed 14 arms (E1-E3, E5,
+#                                                     E6, E7 x3, E8, E9, E10,
+#                                                     E12, E13a, E13b)
+#   M6  `hold:main:pr-state-unreadable` -> `merge`    killed  2 arms (E2, E3)
+#   M7  the new empty-slug guard deleted              killed  2 arms (E7, E12)
+#   M8  files re-joined onto ONE line before the risk
+#       check (the line-anchored patterns then miss)  killed  3 arms (E8, E13a,
+#                                                                    E13b)
+# M5 and M6 are quinn's own two survivors from iteration 1, restated. M1 also
+# picks up E6 now, so the sha comparison is graded through the read as well as
+# from a fixture.
 #
 # Run: bash tests/task_merge_disposition_unit.sh   (no root, no network).
 set -uo pipefail
@@ -166,6 +182,115 @@ for _i in 1 2 3 4 5 6 7 8 9 10; do
 done
 eq "B9  a 4000-path file list still reads look, 10/10 (DIVE-4108 shape)" \
    "" "$_big_verdict"
+
+# ===================================================================
+# E. _merge_disp_probe — THE FUNCTION THAT MANUFACTURES THE UNKNOWNS.
+#
+# It runs HERE, before section C, because C replaces this very function with a
+# fixture stub. Do not move it below C.
+#
+# WHY THIS SECTION EXISTS (quinn, iteration 1, and the finding is correct): at
+# iteration 1 the probe body was stubbed in all 43 arms, so two mutants of it
+# survived a fully green suite — (1) the whole function replaced by
+# `printf merge; return 0`, and (2) its unreadable-read guard flipped from
+# `hold:main:pr-state-unreadable` to `merge`. The polarity claim ("every unknown
+# is a HOLD") is the entire safety case of this row, and it was asserted for the
+# two PURE functions and NOT for the one impure function that can fail OPEN into
+# an unreviewed squash to main. Sections A/B grade the decision; this section
+# grades the READ, by stubbing one layer lower — `_gate_gh` — so the probe's own
+# parsing, slug extraction and file-list handling are the shipped code.
+# ===================================================================
+GH_RAW=""; GH_RC=0
+_gate_gh_token() { printf 'fixture-token'; }
+_gate_gh() { [[ -n "$GH_RAW" ]] && printf '%s' "$GH_RAW"; return "$GH_RC"; }
+US=$'\x1f'
+rec() { # rec <mergeable> <state> <head> <url> <file>... -> one US-joined record
+  local m="$1" st="$2" hd="$3" u="$4"; shift 4
+  local f=""; if (( $# )); then printf -v f '%s\n' "$@"; f="${f%$'\n'}"; fi
+  printf '%s%s%s%s%s%s%s%s%s' "$m" "$US" "$st" "$US" "$hd" "$US" "$u" "$US" "$f"
+}
+PRURL=https://github.com/5dive-ai/5dive/pull/809
+APIURL=https://github.com/lodar/5dive-api/pull/7
+
+# --- the read never happened, or came back with nothing to parse.
+GH_RAW=""; GH_RC=0
+eq "E1  no delivery ref at all                                 -> hold:main" \
+   "hold:main:no-delivery-ref" "$(_merge_disp_probe "" "$SHA40")"
+eq "E2  the read SUCCEEDS but returns nothing                  -> hold:main" \
+   "hold:main:pr-state-unreadable" "$(_merge_disp_probe "$PRURL" "$SHA40")"
+GH_RC=1
+eq "E3  the read FAILS (no rail, timeout, 404)                 -> hold:main" \
+   "hold:main:pr-state-unreadable" "$(_merge_disp_probe "$PRURL" "$SHA40")"
+GH_RC=0
+
+# --- the baseline. Without a real `merge` reachable through the shipped body,
+# every hold below could be produced by a probe that holds unconditionally, and
+# the section would grade nothing.
+GH_RAW=$(rec MERGEABLE CLEAN "$SHA40" "$PRURL" src/task/loops.sh tests/foo_unit.sh)
+eq "E4  a well-formed CLEAN record at the graded sha           -> merge" \
+   "merge" "$(_merge_disp_probe "$PRURL" "$SHA40")"
+
+# --- and the converse: the parsed fields actually reach the decision. Kills the
+# `printf merge; return 0` mutant that survived iteration 1.
+GH_RAW=$(rec CONFLICTING BLOCKED "$SHA40" "$PRURL" src/task/loops.sh)
+eq "E5  a CONFLICTING record is parsed and routed to the MAKER" \
+   "hold:maker:conflicting-needs-rebase" "$(_merge_disp_probe "$PRURL" "$SHA40")"
+GH_RAW=$(rec MERGEABLE CLEAN 0123456789abcdef0123456789abcdef01234567 "$PRURL" src/task/loops.sh)
+eq "E6  the HEAD field is the one compared against the grade" \
+   "hold:main:graded-sha-is-not-the-head" "$(_merge_disp_probe "$PRURL" "$SHA40")"
+
+# --- MISSHAPEN RECORDS. Fewer separators than expected: bash's `${rest#*$US}` on
+# a string with no US returns the string UNCHANGED, so a truncated record does not
+# error — it silently shifts every field left and would otherwise be parsed as if
+# it were whole. Each of these must hold; none may merge.
+for _shape in "MERGEABLE" "MERGEABLE${US}CLEAN" "MERGEABLE${US}CLEAN${US}${SHA40}"; do
+  GH_RAW="$_shape"
+  _got=$(_merge_disp_probe "$PRURL" "$SHA40")
+  case "$_got" in
+    hold:*) ok_t "E7  a truncated record ($(( $(grep -o "$US" <<<"$_shape" | wc -l) + 1 )) of 5 fields) holds: $_got" ;;
+    *)      bad_t "E7  a truncated record must hold" "got '$_got'" ;;
+  esac
+done
+GH_RAW=$(rec MERGEABLE CLEAN "$SHA40" "$PRURL")
+eq "E8  a whole record whose FILE LIST is empty                -> hold:main" \
+   "hold:main:file-list-unreadable" "$(_merge_disp_probe "$PRURL" "$SHA40")"
+
+# --- THE SLUG COMES FROM THE RESOLVED URL, NOT FROM THE CALLER'S REF. The ref
+# can be a bare `#7`, and a caller that named a different repo must not be able to
+# talk the risk check out of the sharp one. E9/E10/E11 are one experiment: the
+# file list is IDENTICAL in all three and only the url moves.
+GH_RAW=$(rec MERGEABLE CLEAN "$SHA40" "$APIURL" src/db/queries.ts)
+eq "E9  ref is a bare '#7'; the URL names the api repo         -> look" \
+   "hold:main:api-db-path" "$(_merge_disp_probe "#7" "$SHA40")"
+eq "E10 ...and the CALLER naming a different repo cannot undo it" \
+   "hold:main:api-db-path" "$(_merge_disp_probe "$PRURL" "$SHA40")"
+GH_RAW=$(rec MERGEABLE CLEAN "$SHA40" "$PRURL" src/db/queries.ts)
+eq "E11 NEGATIVE CONTROL: same paths, url is NOT the api repo  -> merge" \
+   "merge" "$(_merge_disp_probe "$APIURL" "$SHA40")"
+
+# --- an UNRESOLVABLE url is an unknown, so it holds. Before this arm it fell
+# through with repo='' and the `*/5dive-api` test could never fire — an unreadable
+# url failed OPEN on precisely the repo where a merge pushes schema.
+GH_RAW=$(rec MERGEABLE CLEAN "$SHA40" "" src/db/queries.ts)
+eq "E12 the url field did not come back                        -> hold:main" \
+   "hold:main:repo-unresolved" "$(_merge_disp_probe "$PRURL" "$SHA40")"
+
+# --- THE FILE LIST IS A LIST, and the look patterns are LINE-ANCHORED. If the
+# list ever collapses to one line, `install.sh` is only found when it happens to
+# be LAST — so put it FIRST. This arm reds on a probe that stopped splitting.
+GH_RAW=$(rec MERGEABLE CLEAN "$SHA40" "$PRURL" install.sh src/task/loops.sh)
+eq "E13a a look-worthy path that is NOT last is still found" \
+   "hold:main:codeowners-path" "$(_merge_disp_probe "$PRURL" "$SHA40")"
+# ...and the iteration-1 shape quinn flagged: joined with a space and re-split
+# with `tr`, `a dir/install.sh` became `a` + `dir/install.sh`. It matched anyway
+# through the basename anchor, which is why it was non-blocking — but a path with
+# a space must stay ONE token, or a pattern ever loosened to a directory prefix
+# turns a look into a low.
+GH_RAW=$(rec MERGEABLE CLEAN "$SHA40" "$PRURL" "a dir/install.sh")
+eq "E13b a path containing a SPACE stays one token" \
+   "hold:main:codeowners-path" "$(_merge_disp_probe "$PRURL" "$SHA40")"
+
+unset -f _gate_gh _gate_gh_token
 
 # ===================================================================
 # C. THE VERIFIER'S GRADE records WHO OWES THE MERGE.

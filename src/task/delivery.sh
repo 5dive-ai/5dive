@@ -1172,12 +1172,17 @@ _merge_disp_probe() {
   local pr="${1:-}" graded="${2:-}" tok raw mergeable state head files repo url rest
   [[ -n "$pr" ]] || { printf 'hold:main:no-delivery-ref'; return 0; }
   tok=$(_gate_gh_token 2>/dev/null || printf '')
-  # US (unit separator) between fields, joined by jq. A newline separator would be
+  # US (unit separator) BETWEEN fields, joined by jq. A newline separator would be
   # ambiguous against the file list, which is the one field that can be long.
+  # WITHIN the file list a newline is the right join precisely because the list is
+  # LAST: everything after the fourth US is the list, newlines and all. A space
+  # join re-split with `tr` (what shipped at iteration 1) turns one path
+  # containing a space into two tokens, and the look patterns are line-anchored,
+  # so `a b/install.sh` would stop matching. Quinn flagged the shape; arm E13.
   raw=$(_gate_gh "$tok" 20 pr view "$pr" \
           --json mergeable,mergeStateStatus,headRefOid,files,url \
           -q '[ (.mergeable // ""), (.mergeStateStatus // ""), (.headRefOid // ""),
-                (.url // ""), ([ (.files // [])[]?.path ] | join(" ")) ] | join("\u001f")' \
+                (.url // ""), ([ (.files // [])[]?.path ] | join("\n")) ] | join("\u001f")' \
           2>/dev/null) || raw=""
   [[ -n "$raw" ]] || { printf 'hold:main:pr-state-unreadable'; return 0; }
   mergeable="${raw%%$'\x1f'*}"; rest="${raw#*$'\x1f'}"
@@ -1187,8 +1192,13 @@ _merge_disp_probe() {
   # owner/name out of the RESOLVED url, not out of the caller's ref: a bare `#12`
   # delivery_ref names no repo at all.
   repo=$(sed -nE 's#^https?://[^/]+/([^/]+/[^/]+)/pull/.*#\1#p' <<<"$url")
+  # An unresolved slug is an UNKNOWN, and every unknown is a hold. Without this
+  # the sharp-repo arm of _merge_disp_risk (`*/5dive-api` + src/db) silently
+  # degrades to `low` on a record whose url field did not come back — i.e. an
+  # unreadable url would fail OPEN on exactly the repo where merge pushes schema.
+  [[ -n "$repo" ]] || { printf 'hold:main:repo-unresolved'; return 0; }
   _merge_disp_decide "$mergeable" "$state" "$head" "$graded" \
-                     "$(_merge_disp_risk "$repo" "$(tr ' ' '\n' <<<"$files")")"
+                     "$(_merge_disp_risk "$repo" "$files")"
 }
 
 # _merge_disp_do <ident> — call the DIVE-3474 rail. Returns non-zero on any
