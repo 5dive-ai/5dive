@@ -99,11 +99,11 @@ TIER_BUDGET_FULL=1320
 #      it the run is UNDETERMINED with its own non-zero exit, never green (cf.
 #      DIVE-2555 — a run that could not measure has not passed).
 #
-#   3. THE PROBE MUST MATCH THE CORPUS'S COST MIX, NOT MERELY ITS DURATION. The
-#      observed 10-36% spread was across process spawn, bash startup, the built CLI's
-#      own startup and small file I/O. A CPU spin is the tempting probe and the wrong
-#      one: it calibrates a dimension these harnesses barely pay for, so it would
-#      track a draw the corpus does not feel. See scripts/run-harnesses.sh:cal_probe.
+#   3. THE PROBE MUST MATCH THE CORPUS'S COST MIX WITHOUT TIMING THE PRODUCT. The
+#      observed 10-36% spread was across process spawn, bash startup and small file
+#      I/O. A CPU spin is the tempting probe and the wrong one: it calibrates a
+#      dimension these harnesses barely pay for. The built CLI is also wrong: a
+#      product speedup then reads as a faster runner (DIVE-4166). See cal_probe.
 #
 # THE LOWER CLAMP IS 1.0 — a fast VM never TIGHTENS the cap. Symmetric scaling is the
 # purer reading OF THE MEASUREMENT, and it was left open for the builder to argue
@@ -209,6 +209,11 @@ TIER_CAL_SCALE_MAX_PCT=150
 # 2026-09-09, because the overrun above is the corpus and no re-baseline can price it
 # away. The 300s cap and every constant in this file are still untouched by it.
 
+# DIVE-4166 removes the product from cal_probe. This incumbent intentionally remains
+# until the product-free probe has produced >=20 comparable GitHub-hosted samples for
+# one label/tier population: changing code and its baseline in the same unmeasured
+# commit would make the new number unfalsifiable. tier-cal-window now emits the durable
+# REBASELINE REQUIRED verdict that names when that evidence exists.
 TIER_CAL_BASELINE_US=138281
 
 # How long ONE sample of the probe should run. This is the PRECISION knob from note 1:

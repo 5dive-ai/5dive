@@ -883,8 +883,8 @@ want "PAIR: the same corpus one notch INSIDE the clamp exits 0 — the 6 above i
 # The lazy version of this line is "calibration unavailable, falling back to the raw
 # cap", which is the free escape hatch DIVE-2525 closed wearing a new name. A probe
 # that cannot run means the budget was not graded, and not-graded is not passed.
-OUT="$(bash "$RUNNER" --corpus-dir="$TMP" --tier=full --budget=1 --label=t \
-  --cal-cli=/nonexistent/5dive 2>&1)"; RC=$?
+OUT="$(TIER_CAL_PROBE_TMPDIR=/nonexistent/calibration-root bash "$RUNNER" \
+  --corpus-dir="$TMP" --tier=full --budget=1 --label=t 2>&1)"; RC=$?
 want "ARM 4: a calibration that cannot run FAILS CLOSED (exit 6)" "6" "$RC"
 if [[ "$OUT" == *"UNDETERMINED"* && "$OUT" != *"BUDGET DISABLED"* ]]; then
   ok "a missing probe is UNDETERMINED, never 'budget disabled' — the difference is whether the gate still exists"
@@ -893,10 +893,19 @@ else bad "a missing probe is UNDETERMINED, never 'budget disabled'" "$OUT"; fi
 # hide a failing test, which is why the undetermined verdict is resolved at the exit
 # ladder rather than short-circuiting before the corpus ever ran.
 printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/broken.sh"
-bash "$RUNNER" --corpus-dir="$TMP" --tier=full --budget=1 --label=t \
-  --cal-cli=/nonexistent/5dive >/dev/null 2>&1; RC=$?
+TIER_CAL_PROBE_TMPDIR=/nonexistent/calibration-root bash "$RUNNER" \
+  --corpus-dir="$TMP" --tier=full --budget=1 --label=t >/dev/null 2>&1; RC=$?
 want "a FAILING harness still exits 1 even when the runner could not be measured" "1" "$RC"
 rm -f "$TMP/broken.sh"
+
+# DIVE-4166: the runner probe must be product-independent. A source replay is the
+# correct arm here: restoring a product `--version` invocation makes this fail even if the two
+# binaries happen to time similarly on this particular box.
+_calbody="$(sed -n '/^cal_probe()/,/^}/p' "$RUNNER")"
+if [[ "$_calbody" == *"bash -c ':'"* && "$_calbody" == *'printf '\''cal %s'* \
+   && "$_calbody" != *'CAL_CLI'* && "$_calbody" != *'--version'* ]]; then
+  ok "the calibration workload contains fixed spawn + file IO and cannot time the product under test"
+else bad "the calibration probe is independent of the product" "$_calbody"; fi
 
 # ---- 57 ARM 5: DIVE-2592's CONFIRMATION STILL FIRES, and now against the SCALED cap
 # The two mechanisms are complementary, not alternatives (olivia, DIVE-2710): the
@@ -931,7 +940,7 @@ else bad "the report carries the calibration fields beside the originals" "missi
 # Same rule as --budget and --confirm-top: the policy lives beside the tier definition,
 # not scattered across callers. A workflow that injected its own calibration would be
 # choosing its own cap in a YAML nobody reviews as a policy change.
-_wfcal="$(grep -rn -- '--cal-us=\|--cal-baseline-us=\|--cal-cli=' .github/workflows/ 2>/dev/null || true)"
+_wfcal="$(grep -rn -- '--cal-us=\|--cal-baseline-us=' .github/workflows/ 2>/dev/null || true)"
 if [[ -z "$_wfcal" ]]; then
   ok "NO workflow injects a calibration — the seam is for this harness and for a human measuring, never for a caller picking its own cap"
 else bad "NO workflow injects a calibration" "$_wfcal"; fi
@@ -939,10 +948,9 @@ else bad "NO workflow injects a calibration" "$_wfcal"; fi
 # ---- 60 the precondition this row MADE load-bearing
 # Before DIVE-2728 a job that forgot ./build.sh ran the corpus anyway (some earlier
 # harness builds the bundle as a side effect — the ordering accident unit-tests.yml
-# already documents at its own build step). Now the calibration probe SPAWNS that
-# bundle, and a missing one fails closed at exit 6. Fail-closed is correct and it also
-# means a mis-ordered workflow reds the whole sweep for a reason whose message is
-# about calibration, not about YAML. So the ordering gets an assertion.
+# already documents at its own build step). The calibration probe no longer spawns
+# the product, but the harness corpus still grades that built artifact, so the ordering
+# remains an explicit workflow contract.
 #
 # WHAT THIS CHECKS AND WHAT IT DOES NOT: step INDEX within the SAME JOB, parsed, not
 # grepped — a file-wide "both strings appear" test would pass a workflow where the two
@@ -966,7 +974,7 @@ print(' '.join(bad))
 PY
 )"
 if [[ -z "$_ord" ]]; then
-  ok "every job that runs the budgeted runner BUILDS THE BUNDLE FIRST, in that job — the calibration probe spawns it, and a missing bundle now fails closed"
+  ok "every job that runs the budgeted runner BUILDS THE BUNDLE FIRST, in that job — the corpus grades the built artifact even though calibration does not"
 else bad "every job that runs the budgeted runner builds the bundle first, in that job" "offending job(s): $_ord"; fi
 
 # ------------------ DIVE-3477: THE CORPUS-GROWTH TRIPWIRE, GRADED AS ARITHMETIC
@@ -1317,9 +1325,35 @@ if [[ -x "$HARV" ]]; then
   # translation layer, the harvester has drifted from the report format it mimics.
   bash "$HARV" --from-log="$TMP/fake.log" --run=2 --out="$TMP/harv" >/dev/null 2>&1
   bash "$HARV" --from-log="$TMP/fake.log" --run=3 --out="$TMP/harv" >/dev/null 2>&1
-  if bash "$WIN" "$TMP"/harv/*.report >/dev/null 2>&1; then
-    ok "scripts/tier-cal-window.sh reads harvested reports with no changes — the window's stated blocker ('reports do not persist') was never true of the fields it reads"
-  else bad "window consumes harvested reports unchanged" "$(bash "$WIN" "$TMP"/harv/*.report 2>&1 | tail -3)"; fi
+  _wout="$(bash "$WIN" "$TMP"/harv/*.report 2>&1)"; _wrc=$?
+  if (( _wrc == 0 )) && [[ "$_wout" == *"across 2 label group(s)"* \
+     && "$_wout" == *"installed-host/core"* && "$_wout" == *"pristine/core"* ]]; then
+    ok "the window consumes harvested reports and computes separate medians for each label/tier population"
+  else bad "window consumes harvested reports without pooling unlike populations" "rc=$_wrc $_wout"; fi
+
+  # The per-run warning was ignored for an entire release. Twenty comparable samples
+  # at the same label now become one durable cross-run verdict that the scheduled
+  # workflow publishes to its issue.
+  mkdir -p "$TMP/rebase-window"
+  for _n in $(seq 1 20); do
+    cat > "$TMP/rebase-window/$_n.report" <<EOF
+# run-harnesses report
+# harvest_run_id=$_n
+# harvest_job=core-pristine-s1
+# tier=core
+# label=pristine-s1
+# harnesses=132
+# wall_clock_s=220
+# cal_status=measured
+# cal_us_per_iter=35000
+# cal_baseline_us_per_iter=138281
+EOF
+  done
+  _rout="$(bash "$WIN" "$TMP"/rebase-window/*.report 2>&1)"; _rrc=$?
+  if (( _rrc == 0 )) && [[ "$_rout" == *"REBASELINE REQUIRED"* \
+     && "$_rout" == *"20 comparable samples"* && "$_rout" == *"75% off baseline"* ]]; then
+    ok "twenty same-label drift readings become one actionable REBASELINE REQUIRED verdict"
+  else bad "repeated baseline drift is a cross-run verdict" "rc=$_rrc $_rout"; fi
 else
   bad "scripts/tier-cal-harvest.sh is executable" "not found or not +x"
 fi
