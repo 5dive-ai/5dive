@@ -362,15 +362,39 @@ _hb_seat_advanced rung2seat "$idz" "$since" rung2seat
 # Count SQL sites only — the prose above _hb_reclaim_to_todo names the field on
 # purpose, and a comment that explains why the erasure is deliberate must not
 # read to this guard as a second erasure.
+#
+# DIVE-4111 RE-GRADED BOTH LITERALS, and the second number is the reason the first
+# one moved. The hard-cap arm's ESCALATION branch now clears started_at too — it
+# had to, because it was the one path that left the clock running, so an unblocked
+# row was re-reaped on the first tick after the remedy and no seat ever got a full
+# budget window again. That branch CANNOT route through _hb_reclaim_to_todo: it
+# writes status='blocked', not 'todo', and it has to stamp its once-per-owner latch
+# inside the same WHERE clause that guards on it (concurrent ticks — one host cron,
+# no flock), which a shared todo-reclaim cannot express.
+#
+# So 1 -> 2 inline erasure sites and 3 -> 4 shared-reclaim call sites. The guard's
+# PURPOSE is unchanged and is what forced this paragraph: an inlined erasure owes a
+# per-rule arm rather than inheriting the other three's coverage. The escalation
+# branch's arm is tests/heartbeat_reap_escalate_latch_unit.sh — "the pause clears
+# the CLAIM clock and leaves the EVIDENCE clock (first_started_at) untouched",
+# read before and after the pause reap. A FIFTH site still fails here, as intended.
+# (The 4th _hb_reclaim_to_todo site is the repeat-offender path: past the threshold
+# with the latch already spent, the row is still requeued, just not re-escalated.)
 inline=$(grep -c "UPDATE tasks SET.*started_at=NULL" src/cmd_heartbeat.sh)
-inline=$(( inline - 1 ))   # the one legitimate site, inside _hb_reclaim_to_todo
+inline=$(( inline - 2 ))   # _hb_reclaim_to_todo, and the DIVE-4111 escalation pause
 sites=$(grep -c "_hb_reclaim_to_todo \"\$name\"" src/cmd_heartbeat.sh)
 [[ "$inline" == "0" ]] \
-  && ok_t "structural: cmd_heartbeat.sh clears started_at in exactly one place" \
+  && ok_t "structural: cmd_heartbeat.sh clears started_at in exactly the two graded places" \
   || bad_t "structural: an inlined started_at=NULL bypasses the shared reclaim" "extra=[$inline]"
-[[ "$sites" == "3" ]] \
-  && ok_t "structural: all THREE reclaim rules route through _hb_reclaim_to_todo" \
+[[ "$sites" == "4" ]] \
+  && ok_t "structural: all FOUR reclaim call sites route through _hb_reclaim_to_todo" \
   || bad_t "structural: reclaim call sites changed — re-grade the per-rule arms" "sites=[$sites]"
+# The escalation pause is a real, findable site, not a number talked up in a
+# comment: if it stops erasing the clock, `inline` reads 0 here and this guard goes
+# quiet, so pin it by name.
+grep -q "status='blocked', started_at=NULL" src/cmd_heartbeat.sh \
+  && ok_t "structural: the escalation pause is the second erasure site, by name" \
+  || bad_t "structural: no blocked+started_at=NULL site — the count above is stale" ""
 
 printf '\ntask first_started_at: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

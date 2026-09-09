@@ -134,6 +134,7 @@ T2=$(mk_overrun)
 esc_reset
 read -r _ _ < <(_hb_reclaim dev "$BUDGET")      # reap #1 -> todo
 _hb_claim_task dev "$T2" >/dev/null 2>&1; age_out "$T2"
+FS_BEFORE=$(db "SELECT COALESCE(first_started_at,'NULL') FROM tasks WHERE id=${T2};")
 read -r RC2 ES2 < <(_hb_reclaim dev "$BUDGET")  # reap #2 -> pause
 [[ "$(row "$T2")" == "blocked|NULL" ]] && (( ${ES2:-0} == 1 )) && (( $(esc_n) == 1 )) \
   && ok_t "reap #2 -> blocked, escalated exactly once, and started_at CLEARED (defect 2)" \
@@ -141,6 +142,24 @@ read -r RC2 ES2 < <(_hb_reclaim dev "$BUDGET")  # reap #2 -> pause
 [[ "$(latch "$T2")" == *"|2" && "$(latch "$T2")" != NULL\|* ]] \
   && ok_t "the pause stamps reap_escalated_at + reap_escalated_n=2" \
   || bad_t "latch not stamped by the pause" "latch=$(latch "$T2")"
+
+# The pause erases the CLAIM clock and must NOT touch the EVIDENCE clock. This arm
+# exists because the pause is the FOURTH site in cmd_heartbeat.sh that clears
+# started_at and the only one that does not route through _hb_reclaim_to_todo — it
+# cannot, because it writes status='blocked' and has to stamp the latch inside the
+# same WHERE clause that guards on it. tests/task_first_started_at_unit.sh's
+# structural guard counts those sites precisely so a new one owes a per-rule arm
+# instead of inheriting the other three's coverage; this is that arm. DIVE-3251:
+# first_started_at is what makes a reclaimed row read as started rather than as
+# never-touched, so a pause that erased it would blank the board's only evidence
+# that work happened.
+FS_AFTER=$(db "SELECT COALESCE(first_started_at,'NULL') FROM tasks WHERE id=${T2};")
+[[ "$FS_BEFORE" != NULL && "$FS_BEFORE" != "" ]] \
+  && ok_t "(precondition) the row carried a first_started_at INTO the pause" \
+  || bad_t "no first_started_at before the pause — the arm below proves nothing" "before=[$FS_BEFORE]"
+[[ "$FS_AFTER" == "$FS_BEFORE" ]] \
+  && ok_t "the pause clears the CLAIM clock and leaves the EVIDENCE clock (first_started_at) untouched" \
+  || bad_t "the pause moved first_started_at — a reclaimed row would read as never-touched" "before=[$FS_BEFORE] after=[$FS_AFTER]"
 
 # =============================================================================
 # 3) THE LOOP — unblock + re-claim the paused row, then reap in the SAME instant.
