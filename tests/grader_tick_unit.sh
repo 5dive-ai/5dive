@@ -41,7 +41,12 @@ trap 'rc=$?; rm -rf "$TMPD"; echo "HARNESS-RC=$rc"' EXIT
 SPAWNF="$TMPD/spawns"; EMITF="$TMPD/emits"
 ledger_emit(){ printf '%s\n' "$*" >> "$EMITF"; }
 # The usage document both the floor and the account map read.
+# g2 is a SECOND HEALTHY seat, and it exists for one arm: the fall-through past
+# an unreadable seat. Written against g9 that arm passed for the wrong reason —
+# g9's account is over the floor, so it is skipped before the credential probe is
+# ever consulted, and the arm would have passed with the probe deleted.
 USAGE='{"agents":[{"account":"mark","name":"g1","fiveHourPct":10,"sevenDayPct":20},
+                  {"account":"mark","name":"g2","fiveHourPct":10,"sevenDayPct":20},
                   {"account":"spent","name":"g9","fiveHourPct":99,"sevenDayPct":99}]}'
 # A FUNCTION, not a command string: `$_GRADER_USAGE_CMD` is expanded unquoted by
 # the lane, so any stub carrying quotes or spaces word-splits into nonsense. The
@@ -50,6 +55,12 @@ usage_cmd(){ printf '%s' "$USAGE"; }
 # shellcheck source=/dev/null
 source src/task/grader_pool.sh
 _GRADER_USAGE_CMD=usage_cmd
+# The credential probe is stubbed permissive by default so the arms above keep
+# measuring what they were written to measure; the arms below flip it.
+probe_ok(){ return 0; }
+probe_no(){ return 1; }
+probe_only_g1(){ [[ "$1" == g1 ]]; }
+_GRADER_READ_PROBE=probe_ok
 # Replace the ONLY fleet-touching function with a recorder.
 SPAWNS=""
 _grader_spawn_session(){ printf '%s\n' "$1:$2" >> "$SPAWNF"; return 0; }
@@ -108,6 +119,20 @@ out=$(run --cap=5 --commit)
   || bad_ 'falls through to healthy seat' "$(spawns)"
 grep -q '^g1:' "$SPAWNF" && ok_ 'chose the healthy seat, not the exhausted one' \
   || bad_ 'chose healthy seat' "$(spawns)"
+
+# ── guardrail 2: never a grader without read access to the repo it grades ────
+_GRADER_POOL="g1"; _GRADER_READ_PROBE=probe_no
+out=$(run --cap=5 --commit)
+[[ ! -s "$SPAWNF" ]] && ok_ 'no read access: spawns nothing even with headroom' \
+  || bad_ 'no read access spawns nothing' "$(spawns)"
+grep -q 'cannot read the delivery ref' <<<"$out" \
+  && ok_ 'says WHY it declined (cannot read the ref)' || bad_ 'names the reason' "$out"
+# A seat that can read is still reachable past one that cannot.
+_GRADER_POOL="g2 g1"; _GRADER_READ_PROBE=probe_only_g1
+out=$(run --cap=5 --commit)
+grep -q '^g1:' "$SPAWNF" && ok_ 'falls through an unreadable seat to a readable one' \
+  || bad_ 'falls through unreadable seat' "$(spawns)"
+_GRADER_READ_PROBE=probe_ok
 
 # ── structural: exactly one function may touch the fleet ─────────────────────
 tickbody=$(awk '/^cmd_task_grader_tick\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' src/task/grader_pool.sh)

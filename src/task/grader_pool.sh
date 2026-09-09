@@ -265,6 +265,32 @@ _grader_account_of() {  # <agent>  [<usage-json-on-stdin>]
   ' 2>/dev/null || printf ''
 }
 
+# `_grader_can_read <seat> <ident>` — can this seat get a true answer out of
+# GitHub about the repo it would grade?
+#
+# REUSES `task merge-gate-selftest`, which already asks exactly this and answers
+# with its EXIT STATUS. The question is deliberately not "did a token resolve" —
+# a seat holding a credential that cannot see the repo is, from the gate's
+# vantage, as blind as one holding nothing, and those two were indistinguishable
+# before that verb existed.
+#
+# A DENIED `sudo -u` IS INDISTINGUISHABLE FROM A REAL NEGATIVE — both exit
+# non-zero — and here that ambiguity is SAFE, which is worth stating because
+# elsewhere on this host it is the classic trap. The dangerous direction is a
+# probe that fails OPEN and reads "contained" whether or not it ran. This one
+# fails CLOSED: an unrunnable probe means we decline to spawn on that seat and
+# fall through to the next. The cost of being wrong is a queued grade, not a
+# blind one.
+_GRADER_READ_PROBE="${_GRADER_READ_PROBE:-}"
+_grader_can_read() {  # <seat> <ident>
+  local seat="$1" ident="$2"
+  [[ -n "$seat" ]] || return 1
+  if [[ -n "$_GRADER_READ_PROBE" ]]; then "$_GRADER_READ_PROBE" "$seat" "$ident"; return $?; fi
+  local ref; ref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || printf '')
+  [[ -n "$ref" ]] || return 1
+  sudo -n -u "$seat" 5dive task merge-gate-selftest --pr="$ref" >/dev/null 2>&1
+}
+
 # `5dive task grader-tick [--commit] [--cap=N] [--json]` — DIVE-4164, the lane.
 #
 # Consumes `task.grade.requested` and decides, per pending delivery, whether a
@@ -337,7 +363,13 @@ cmd_task_grader_tick() {
       local acct; acct=$(printf '%s' "$usage" | _grader_account_of "$seat")
       local verdict rc
       verdict=$(printf '%s' "$usage" | _grader_window_ok "$acct"); rc=$?
-      if (( rc == 0 )); then chosen="$seat"; why="$verdict"; break; fi
+      if (( rc == 0 )); then
+        # Guardrail 2: never a grader without read access to the repo it grades.
+        # Checked AFTER the floor because it is the more expensive probe.
+        if _grader_can_read "$seat" "$ident"; then chosen="$seat"; why="$verdict"; break; fi
+        why="${why}${seat}: has headroom but cannot read the delivery ref; "
+        continue
+      fi
       why="${why}${seat}: ${verdict}; "
     done
     if [[ -z "$chosen" ]]; then
