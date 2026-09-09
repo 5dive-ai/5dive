@@ -47,7 +47,16 @@ run_block(){
     for t in "$@"; do git tag "$t"; done
   ) >/dev/null 2>&1
   ( cd "$d"
-    incumbent=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+    # GRADE THE SHELL THE RUNNER USES, NOT THE ONE THIS FILE HAPPENS TO BE IN.
+    # Extracting the bytes verbatim (the whole point of the fence) still grades a
+    # DIFFERENT PROGRAM if the options differ: a shell program is bytes PLUS options.
+    # GitHub invokes a `run:` step as `bash -e {0}`, so -e is on before the step's own
+    # `set -uo pipefail` is read. Without this `set -e` the harness ran the block under
+    # -u -o pipefail only, and every arm below passed while the shipped step aborted
+    # silently on the first `grep` that legitimately matched nothing (DIVE-4153,
+    # run 34345097999). Removing it re-opens that blind spot; keep it in BOTH helpers.
+    set -e
+    incumbent=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1) || incumbent=""
     eval "$BLOCK"
     # Emit the derivation so an arm can assert the NUMBER, not just the exit code.
     printf 'DERIVED=%s\n' "${tag:-<unset>}"
@@ -167,7 +176,7 @@ run_moved(){
     # fixture needs it on the same relative path the workflow uses.
     mkdir -p scripts && cp "$ROOT/scripts/release-cut-baseline.sh" scripts/
     sha=$(git rev-parse HEAD)
-    incumbent=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+    incumbent=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1) || incumbent=""
     eval "$MOVED"
     printf 'PROCEEDED\n'
   ) 2>&1
@@ -285,7 +294,8 @@ run_range(){
     for subj in "$@"; do git commit -q --allow-empty -m "$subj"; done
   ) >/dev/null 2>&1
   ( cd "$d"
-    incumbent=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+    set -e   # the runner is `bash -e {0}` — see run_block (DIVE-4153)
+    incumbent=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1) || incumbent=""
     eval "$BLOCK"
     printf 'DERIVED=%s\n' "${tag:-<unset>}"
   ) 2>&1
@@ -294,6 +304,10 @@ run_range(){
 # Every call neutralises RELEASE_LEVEL for the DIVE-2539 reason above: this file runs in
 # two jobs and one of them sets it. An arm about the COMMITS must not read the run's env.
 run_derive(){ ( unset RELEASE_LEVEL; run_range "$@" ); }
+# DIVE-4153: the STATED-level path. $1 = the level a person passed on the dispatch,
+# then run_range's own arguments. Exported rather than prefixed because the block reads
+# it as an environment variable, the same way the runner supplies the dispatch input.
+run_stated(){ local lvl="$1"; shift; ( export RELEASE_LEVEL="$lvl"; run_range "$@" ); }
 
 echo "-- DIVE-4086: a feat in the range cuts a MINOR, with no input at all"
 out=$(run_derive '0.17.8' v0.27.1 nolint 'feat(plugin): a declared plugin verb is now dispatched'); rc=$?
@@ -335,9 +349,20 @@ grep -q 'DIVE-1234: an untyped subject' <<<"$out" \
   && ok_t 'the refusal NAMES the offending commit (an error you cannot act on is a stall)' \
   || bad_t 'the refusal does not name which commit is untyped' "rc=$rc out=$out"
 
-grep -q 'dispatching manually cannot bypass this refusal' <<<"$out" && ! grep -q 'cut by hand' <<<"$out" \
-  && ok_t 'the refusal names its real boundary instead of advertising a manual path that hits the same exit' \
-  || bad_t 'the refusal still sends an operator toward a nonexistent manual bypass' "rc=$rc out=$out"
+# DIVE-4153: the remedy printed here must be REACHABLE FROM THE STATE IT FIRES IN. It
+# used to say the opposite — "changing RELEASE_LEVEL or dispatching manually cannot
+# bypass this refusal" — which was true of the code and unsatisfiable in practice: the
+# offending subject is on a MERGED branch, and no tag can be cut past the lint epoch, so
+# the range never collapses and every nightly refuses forever. The assertion is still
+# that the refusal points at something an operator can DO, and still that it does not
+# advertise hand-tagging, which really is not a route.
+grep -q 'level=patch|minor|major' <<<"$out" && grep -q 'only RAISE' <<<"$out" \
+  && ok_t 'the refusal names a reachable remedy: state the size on the dispatch, and the never-lower floor still applies' \
+  || bad_t 'the refusal prints a remedy that cannot be reached from the state it fires in' "rc=$rc out=$out"
+
+grep -q 'by hand is not a route' <<<"$out" && ! grep -qi 'cut the tag yourself' <<<"$out" \
+  && ok_t 'the refusal still refuses hand-tagging, which is the one path that really cannot clear it' \
+  || bad_t 'the refusal sends an operator toward a hand-cut tag' "rc=$rc out=$out"
 
 out=$(run_derive '0.17.8' v0.27.1 nolint 'DIVE-1234: an untyped subject'); rc=$?
 grep -q '^DERIVED=v0\.27\.2$' <<<"$out" \
@@ -361,6 +386,50 @@ grep -q '^DERIVED=v0\.28\.0$' <<<"$out" \
   && ok_t 'a fully-typed post-lint range still cuts normally (the refusal is not a blanket stop)' \
   || bad_t 'a clean post-lint range was refused' "rc=$rc out=$out"
 
+echo "-- DIVE-4153: an explicit level SATISFIES the untyped-subject refusal; auto still refuses"
+# The deadlock this closes: the refusal's printed remedy is "correct the offending
+# subject in the branch being cut", and on 2026-09-09 that branch was already merged.
+# `_enforce` only collapses once a tag exists past the lint epoch, and no tag could be
+# cut — so the remedy was unreachable and every nightly would refuse forever, with 14
+# merged commits held off every managed box. A person stating the size answers the exact
+# question the refusal asks ("does this cut contain a feature?").
+out=$(run_stated minor '0.17.8' v0.27.1 lint 'DIVE-1234: an untyped subject'); rc=$?
+[[ $rc -eq 0 ]] && grep -q '^DERIVED=v0\.28\.0$' <<<"$out" \
+  && ok_t 'THE MEASURED CASE: level=minor over the same untyped range that refuses on auto PROCEEDS — the deadlocked v0.29.0 train can move' \
+  || bad_t 'an explicitly stated level still cannot clear the untyped refusal; the train stays deadlocked forever' "rc=$rc out=$out"
+
+grep -q 'level STATED by' <<<"$out" && grep -q 'DIVE-1234: an untyped subject' <<<"$out" \
+  && ok_t 'the provenance records that a PERSON decided and names the commits the check could not read (an override that leaves no trace is indistinguishable from the check never firing)' \
+  || bad_t 'the stated-level override left no trace on the release page' "rc=$rc out=$out"
+
+# THE ARM THAT KEEPS THIS FROM BEING A WIDENING. Satisfying the refusal must not
+# satisfy the FLOOR: a stated patch over a range containing a feat is still the
+# DIVE-4086 defect wearing a hand instead of a cron, untyped subjects or not.
+out=$(run_stated patch '0.17.8' v0.27.1 lint 'DIVE-1234: an untyped subject' 'feat: a real feature'); rc=$?
+[[ $rc -ne 0 ]] && grep -q 'may raise a cut, never lower it' <<<"$out" \
+  && ok_t 'level=patch over a range with a feat is STILL refused by the never-lower floor — the override satisfies the untyped check, not the floor' \
+  || bad_t 'stating a level bypassed the never-lower floor; a feature can now ship as a patch by hand' "rc=$rc out=$out"
+
+# auto is every SCHEDULED run, so this is the arm that says the nightly is unchanged.
+out=$(run_stated auto '0.17.8' v0.27.1 lint 'DIVE-1234: an untyped subject'); rc=$?
+[[ $rc -ne 0 ]] && grep -q 'carry no conventional type' <<<"$out" \
+  && ok_t "RELEASE_LEVEL=auto — the scheduled path — still refuses the untyped range exactly as before" \
+  || bad_t 'the nightly no longer refuses an untyped range; a feature would ship as a patch unattended' "rc=$rc out=$out"
+
+# And the unset case (the `test` job supplies no RELEASE_LEVEL at all) must behave like
+# auto, not like a stated level — an absent input is not a decision.
+out=$(run_derive '0.17.8' v0.27.1 lint 'DIVE-1234: an untyped subject'); rc=$?
+[[ $rc -ne 0 ]] \
+  && ok_t 'an UNSET RELEASE_LEVEL refuses too — an absent input is not a person stating the size' \
+  || bad_t 'an unset RELEASE_LEVEL was treated as an override; the refusal is now trivially bypassed' "rc=$rc out=$out"
+
+# A clean typed range must not grow the override note — the provenance says STATED only
+# when something was actually overridden.
+out=$(run_stated minor '0.17.8' v0.27.1 lint 'feat: after the lint'); rc=$?
+[[ $rc -eq 0 ]] && ! grep -q 'level STATED by' <<<"$out" \
+  && ok_t 'a stated level over a CLEAN range records no override note — the note marks a real override, not any dispatch' \
+  || bad_t 'the override note appears when nothing was overridden' "rc=$rc out=$out"
+
 echo "-- DIVE-4086: an override may RAISE the derived level and never lower it"
 out=$(export RELEASE_LEVEL=patch; run_range '0.17.8' v0.27.1 nolint 'feat: the headline'); rc=$?
 [[ $rc -ne 0 ]] && grep -q 'may raise a cut, never lower it' <<<"$out" \
@@ -381,7 +450,7 @@ echo "-- DIVE-4086: the shipped LINT REGEX, run rather than eyeballed"
 # Extracted from the shipped file for the same reason every other block here is: a
 # hand-written copy of the pattern agrees with every mutant of the real one.
 LINT="$ROOT/.github/workflows/pr-title-lint.yml"
-LINT_COND=$(grep -E '^ *if \[\[ "\$PR_TITLE" =~ ' "$LINT" | head -1 | sed 's/^ *//; s/ *then$//')
+LINT_COND=$(grep -E '^ *if \[\[ "\$PR_TITLE" =~ ' "$LINT" | head -1 | sed 's/^ *//; s/ *then$//') || LINT_COND=""
 [[ -n "$LINT_COND" ]] || { echo "FATAL: could not extract the title condition from $LINT" >&2; exit 2; }
 # `if C; then :; fi` succeeds for a FALSE C too, so the else arm is what makes this a
 # test. The first version of this helper omitted it, and every accept arm went red on a
@@ -403,8 +472,8 @@ echo "-- the shipped lint and the shipped cut must accept the SAME type list"
 # A type the lint admits and the cut rejects reds every later cut; the reverse ships a
 # feature as a patch. Comparing the two literals is what stops them drifting apart.
 LINT="$ROOT/.github/workflows/pr-title-lint.yml"
-_lint_types=$(grep -oE '\(feat\|fix\|[a-z|]+\)' "$LINT" | head -1)
-_cut_types=$(grep -oE '\(feat\|fix\|[a-z|]+\)' "$WF" | head -1)
+_lint_types=$(grep -oE '\(feat\|fix\|[a-z|]+\)' "$LINT" | head -1) || _lint_types=""
+_cut_types=$(grep -oE '\(feat\|fix\|[a-z|]+\)' "$WF" | head -1) || _cut_types=""
 [[ -n "$_lint_types" && "$_lint_types" == "$_cut_types" ]] \
   && ok_t "the lint and the cut share one type list ($_lint_types)" \
   || bad_t 'the PR-title lint and release-cut accept different type sets; one of them will be wrong on every merge' "lint=$_lint_types cut=$_cut_types"
