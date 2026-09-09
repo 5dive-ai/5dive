@@ -64,12 +64,79 @@ if jq -e '
   .distribution.retention.retrieval == "published-only" and
   .distribution.channels.x.cost_per_post_usd == 0.20 and
   .distribution.channels.x.permission == "AUTO" and
-  .distribution.channels.linkedin.permission == "APPROVAL" and
-  .distribution.channels.reddit.permission == "HUMAN"
+  .distribution.channels.linkedin.permission == "APPROVAL"
 ' <<<"$SPEC" >/dev/null; then
   ok_t 'browser fallback, cost/tier fields,comment lane default and retention are manifest data'
 else
   bad_t 'one of the marketplace policy fields is missing' "$(jq -c '.team.capabilities,.distribution' <<<"$SPEC")"
+fi
+
+# ============================ DIVE-4119: the tiers are the CUSTOMER's to set.
+# lodar, 2026-09-09: "reddit is human only is not the policy. we ship 5dive to
+# different teams. they use our tools however they please". So these arms grade
+# a PROPERTY of the shipped defaults, not the specific tier any channel holds:
+# a tier we pin in a test is a tier we have hardcoded again by another route.
+if jq -e '
+  (.distribution.channels | length) > 0 and
+  ([.distribution.channels[] | select((.permission|IN("AUTO","APPROVAL","HUMAN")) and
+                                      (.transport|IN("api","browser","human")))] | length)
+    == (.distribution.channels | length)
+' <<<"$SPEC" >/dev/null; then
+  ok_t 'every shipped channel declares a tier and a transport from the documented vocabulary'
+else
+  bad_t 'a channel default is outside the documented tier/transport vocabulary' \
+    "$(jq -c '.distribution.channels' <<<"$SPEC")"
+fi
+
+# No channel ships HUMAN-by-decree, and none ships a transport the executor
+# cannot run: a default of "a person does this one" IS the hardcoded rule.
+decreed=$(jq -r '[.distribution.channels | to_entries[]
+                  | select(.value.permission == "HUMAN" or .value.transport == "human")
+                  | .key] | join(",")' <<<"$SPEC")
+if [[ -z "$decreed" ]]; then
+  ok_t 'no channel ships HUMAN-by-decree or a transport the executor cannot run'
+else
+  bad_t 'a shipped channel is pinned to a person rather than defaulted' "$decreed"
+fi
+
+# The editability has to be VISIBLE to the customer reading the manifest, or the
+# defaults read as rules again.
+if grep -Fq 'YOURS TO' "$TPL" && grep -Eq 'DEFAULTS, not rules' "$TPL"; then
+  ok_t 'the manifest tells the customer the channel tiers are theirs to edit'
+else
+  bad_t 'the manifest no longer says the channel block is editable' ''
+fi
+
+# Our own editorial rules must not come back through a role prompt, which is the
+# route that bypasses every assertion about the channels block above.
+leaked=$(jq -r '[.agents | to_entries[]
+                 | select(.value.instructions // "" | test("(?i)\\breddit\\b|\\bhacker news\\b|\\bhn\\b"))
+                 | .key] | join(",")' <<<"$SPEC")
+if [[ -z "$leaked" ]]; then
+  ok_t 'no role instruction names a channel and its tier; channel policy lives only in the manifest'
+else
+  bad_t 'a role instruction hardcodes a named channel' "$leaked"
+fi
+
+# The row's acceptance check, both edges (a default that cannot be RAISED is as
+# hardcoded as one that cannot be lowered).
+_tier_roundtrip() { # <perm> <transport>
+  sed -E "s|^(    reddit:).*|\1   { cost_per_post_usd: 0,    permission: $1, transport: $2 }|" \
+    "$TPL" >"$TMP/edited.yaml"
+  local spec; spec=$(_compose_parse "$TMP/edited.yaml" 2>"$TMP/edited.err") || return 1
+  jq -e --arg p "$1" --arg t "$2" \
+    '.distribution.channels.reddit.permission == $p and
+     .distribution.channels.reddit.transport == $t' <<<"$spec" >/dev/null
+}
+if _tier_roundtrip AUTO browser; then
+  ok_t 'a customer can set a discussion channel to AUTO and the schema carries it through'
+else
+  bad_t 'an imported manifest cannot lower a channel tier' "$(<"$TMP/edited.err")"
+fi
+if _tier_roundtrip HUMAN human; then
+  ok_t 'the same channel can be raised to HUMAN — the default is advice in both directions'
+else
+  bad_t 'an imported manifest cannot raise a channel tier' "$(<"$TMP/edited.err")"
 fi
 
 prompt=$(jq -r '.agents.head.loops[0].prompt' <<<"$SPEC")
