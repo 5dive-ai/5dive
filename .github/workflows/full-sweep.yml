@@ -98,17 +98,47 @@ on:
   # dial — a second place the PR path and the sweep path can drift apart, which is
   # the defect tests/lib/tier.sh exists to prevent. 18% is not worth that, so this
   # ships the tier that already exists.
+  #
+  # DIVE-4135 — `build.sh`, `install.sh` and `src/**` are GONE from this list, and
+  # that is a deliberate REVERSAL of DIVE-2789's pre-merge arm. What is left is the
+  # sweep's own machinery: a change to the tiering dial or the runner must still be
+  # graded on the PR that makes it, or the first evidence a budget is mis-set arrives
+  # a day late.
+  #
+  # THE MEASUREMENT THAT FORCED IT, from PR #808's own head 34de9f9 (a normal PR, one
+  # source file class touched), summed over every job GitHub ran on that push:
+  #     full-sweep on the PR   full-pristine (1)(2)(3)  873s 757s 553s
+  #                            full-installed-host (1)(2)(3)  761s 772s 567s
+  #                            acp-graded 10s, budget-report 3s   = 4296s
+  #     everything else        unit-tests + guards               = 2351s
+  #     TOTAL                                                      6647s = 110.8 job-min
+  # The sweep was 65% of the bill on a PR where it graded nothing that could block.
+  #
+  # AND IT COULD NOT BLOCK, BY THIS FILE'S OWN DESIGN — see the ADVISORY note below.
+  # #808 is the demonstration and it is not hypothetical: `changed-harnesses` was RED
+  # on that same head and #808 merged anyway. An advisory 71-job-minute pass, on every
+  # push to every open PR, that nobody is required to read is not a control; it is the
+  # queue. DIVE-2789's own cost note ("standard runners are free") priced the dollars
+  # and not the wall-clock, and wall-clock is what is paid again on every verifier
+  # round.
+  #
+  # WHAT IS GIVEN UP, NAMED. DIVE-2789's two instances (2f8dbaa #486, 4e87712 #488 —
+  # a nightly-tier harness broken by a merge that touched only src/) are no longer
+  # caught BEFORE the merge. They are still caught: `push: [main]` above has no paths
+  # filter (DIVE-2667), so the sweep runs on the merge commit and attributes the break
+  # to ONE merge within one sweep. The loss is latency, from pre-merge to
+  # roughly-one-sweep post-merge, on the non-core tiers only.
+  #
+  # WHAT REPLACES IT PRE-MERGE, and it is a stronger instrument than the one removed:
+  # unit-tests.yml's `changed-harnesses` job runs, and verdict-probes, every harness
+  # THIS diff touched at any tier — and DIVE-4135 makes it a REQUIRED status check, so
+  # the class of red that #808 shipped past cannot merge again. tests/lib/tier.sh and
+  # tests/full_sweep_pr_trigger_unit.sh keep this list honest.
   pull_request:
     paths:
       - 'tests/lib/tier.sh'
       - 'scripts/run-harnesses.sh'
       - '.github/workflows/full-sweep.yml'
-      # DIVE-2789: the measured union of the two known instances. Keep this list and
-      # tests/full_sweep_pr_trigger_unit.sh in step — that harness fails if either
-      # instance's file list stops being covered.
-      - 'build.sh'
-      - 'install.sh'
-      - 'src/**'
 
 # DIVE-2789: THIS SWEEP IS ADVISORY ON A PR. IT DOES NOT BLOCK A MERGE.
 #
