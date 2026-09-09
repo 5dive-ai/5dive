@@ -107,10 +107,24 @@ case "$args" in
   "api repos/acme/demo/branches/changed-head --jq .commit.sha")
     echo NEW-SHA
     ;;
+  # DIVE-4138: the pull-ref-identity path now reaches the same last-moment
+  # rechecks as the merged-PR path, so the mock has to answer them for
+  # superseded-match too. It answers with the branch's own sha and no open PR,
+  # i.e. the recheck PASSES -- otherwise the armed arms below would go green on
+  # a fail-closed preserve and prove nothing about arming.
+  "api repos/acme/demo/branches/superseded-match --jq .commit.sha")
+    echo 1111111111111111111111111111111111111111
+    ;;
   *"-f state=open"*"-f head=acme:merged-old"*)
     echo 0
     ;;
+  *"-f state=open"*"-f head=acme:superseded-match"*)
+    echo 0
+    ;;
   *"--method DELETE repos/acme/demo/git/refs/heads%2Fmerged-old")
+    echo "$args" >>"${GH_MOCK_LOG:?}"
+    ;;
+  *"--method DELETE repos/acme/demo/git/refs/heads%2Fsuperseded-match")
     echo "$args" >>"${GH_MOCK_LOG:?}"
     ;;
   *)
@@ -188,16 +202,57 @@ grep -q 'PRESERVE changed-since-inventory branch=changed-head old=CHANGED new=NE
 [[ $(wc -l <"$TMP/deletes.log") -eq 1 ]]
 grep -q 'heads%2Fmerged-old' "$TMP/deletes.log"
 
-# DIVE-3490: the identity predicate is NOT armed under --apply. The weekly
-# schedule runs --apply unattended, so a branch that PASSES identity must still
-# be preserved there and must not appear in the delete log. This is the arm that
-# would fail if someone later wires the predicate into the unattended path.
+# DIVE-3490 + DIVE-4138: the identity predicate is OFF BY DEFAULT under --apply,
+# and stays off unless the CALLER sets BRANCH_HYGIENE_ARM_PULLREF_IDENTITY=1.
+# DIVE-4138 armed it in branch-hygiene.yml, not here -- so this arm still pins
+# the script's own refusal, which is what makes the workflow env var the single
+# place arming can happen and the single place it can be revoked.
 grep -q 'PRESERVE superseded-identity-not-armed branch=superseded-match sha=1111111111111111111111111111111111111111 pr=#20' <<<"$apply_output"
-refute 'the identity predicate was armed under --apply' 'DELETE-CANDIDATE branch=superseded-match' <<<"$apply_output"
+refute 'the identity predicate self-armed under --apply' 'DELETE-CANDIDATE branch=superseded-match' <<<"$apply_output"
 refute 'an identity-matched branch reached the delete API' superseded <"$TMP/deletes.log"
 # candidates stays 2 under --apply where dry-run saw 3: the identity match is
 # preserved, not counted. That difference IS the guarantee.
 grep -q 'SUMMARY candidates=2 deleted=1' <<<"$apply_output"
+grep -q 'SUMMARY .* pullref_identity=off' <<<"$apply_output"
+
+# --- DIVE-4138: --apply WITH the arm set ----------------------------------------------
+# lodar answered DIVE-4138's gate `nightly-for-reviewed-only`: delete nightly the
+# branches that have a permanent recovery ref, leave the ones that do not.
+# `match` is the ONLY state that widens. The three arms below are the widening,
+# and the four after them are the boundary -- because the failure that matters
+# here is not "it did not delete", it is "arming one state armed the others".
+: >"$TMP/deletes-armed.log"
+armed_output=$(GH_BIN="$TMP/gh" GH_MOCK_LOG="$TMP/deletes-armed.log" \
+  GITHUB_REPOSITORY=acme/demo BRANCH_HYGIENE_PRESERVE=merged-preserved \
+  BRANCH_HYGIENE_ARM_PULLREF_IDENTITY=1 \
+  "$ROOT/scripts/branch-hygiene.sh" --apply)
+
+grep -q 'DELETE-CANDIDATE branch=superseded-match sha=1111111111111111111111111111111111111111 pr=#20 via=pullref-identity' <<<"$armed_output"
+grep -q 'DELETED branch=superseded-match sha=1111111111111111111111111111111111111111 pr=#20 via=pullref-identity' <<<"$armed_output"
+grep -q 'heads%2Fsuperseded-match' "$TMP/deletes-armed.log"
+grep -q 'SUMMARY .* pullref_identity=armed' <<<"$armed_output"
+
+# The boundary. Arming `match` must arm NOTHING else: a pull ref that moved, one
+# that could not be resolved at all, and a recycled branch name whose latest
+# closed PR is not at this head all still have to preserve. `unresolved` is the
+# sharp one -- a network blip reads exactly like "nothing to do", and if it ever
+# fell through to the delete it would destroy the commit it failed to verify.
+refute 'arming match also armed a moved pull ref' 'DELETED branch=superseded-mismatch' <<<"$armed_output"
+refute 'arming match also armed an unresolvable pull ref' 'DELETED branch=superseded-unresolved' <<<"$armed_output"
+refute 'arming match also armed a branch with no matching closed PR' 'DELETED branch=superseded-reused' <<<"$armed_output"
+grep -q 'PRESERVE superseded-identity-mismatch branch=superseded-mismatch' <<<"$armed_output"
+grep -q 'PRESERVE superseded-identity-unresolved branch=superseded-unresolved' <<<"$armed_output"
+grep -q 'PRESERVE no-exact-merged-pr branch=superseded-reused' <<<"$armed_output"
+
+# Arming must not weaken the OTHER preserves either: an open PR head, an
+# explicitly preserved branch, protected branches, and the last-moment
+# changed-since-inventory recheck. The delete log is the tightest statement of
+# that -- exactly two refs, the merged one and the pull-ref-recoverable one.
+grep -q 'PRESERVE open-or-explicit branch=open-live' <<<"$armed_output"
+grep -q 'PRESERVE open-or-explicit branch=merged-preserved' <<<"$armed_output"
+grep -q 'PRESERVE changed-since-inventory branch=changed-head' <<<"$armed_output"
+[[ $(wc -l <"$TMP/deletes-armed.log") -eq 2 ]]
+grep -q 'SUMMARY candidates=3 deleted=2' <<<"$armed_output"
 
 echo "branch_hygiene_unit: PASS"
 

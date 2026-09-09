@@ -2,7 +2,10 @@ name: branch-hygiene
 
 on:
   schedule:
-    - cron: '17 5 * * 1'
+    # DIVE-4138 (lodar, 2026-09-09: "Cleanups are daily and automatic?"): daily,
+    # was weekly ('17 5 * * 1'). Cadence alone deletes nothing new -- the widening
+    # that does is BRANCH_HYGIENE_ARM_PULLREF_IDENTITY on the apply step below.
+    - cron: '17 5 * * *'
   workflow_dispatch:
     inputs:
       apply:
@@ -34,11 +37,26 @@ jobs:
           BRANCH_HYGIENE_PRESERVE: ${{ vars.BRANCH_HYGIENE_PRESERVE }}
         run: scripts/branch-hygiene.sh --dry-run
 
-      - name: Delete API-confirmed merged branches
+      # DIVE-4138: the pull-ref-identity widening is armed HERE, in the workflow,
+      # not in the script. DIVE-3490 built the predicate and refused to arm it on
+      # the unattended path until "its first live output [is] a list a human
+      # reads", and said arming must be "a deliberate change to that workflow".
+      # That list ran weekly in the stale-digest job below; lodar read the eight
+      # branches it named on 2026-09-09 and answered DIVE-4138's tier-2 gate
+      # `nightly-for-reviewed-only`. This env var is that deliberate change.
+      #
+      # What it adds: branches whose head is byte-identical to refs/pull/N/head of
+      # their own closed-unmerged PR -- reversible by construction, because GitHub
+      # retains pull refs permanently.
+      # What it does NOT add: branches that never had a PR, and orphan branches
+      # with no common ancestor (the `status` data branch). Those have no recovery
+      # ref, so they stay report-only for a human. Remove this env var to disarm.
+      - name: Delete API-confirmed merged and pull-ref-recoverable branches
         if: github.event_name == 'schedule' || inputs.apply
         env:
           GH_TOKEN: ${{ github.token }}
           BRANCH_HYGIENE_PRESERVE: ${{ vars.BRANCH_HYGIENE_PRESERVE }}
+          BRANCH_HYGIENE_ARM_PULLREF_IDENTITY: '1'
         run: scripts/branch-hygiene.sh --apply
 
       # A GitHub-hosted runner cannot inspect or remove worktrees on the 5dive
@@ -58,7 +76,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   stale-digest:
-    # Read-only weekly digest (DIVE-1833): flags unmerged PRs >3d, and classifies
+    # Read-only daily digest (DIVE-1833): flags unmerged PRs >3d, and classifies
     # every other branch by EVIDENCE that its work landed (DIVE-2394) rather than
     # by age. Never deletes/labels/closes, so it runs on every trigger (including
     # the dry-run dispatch) and is not coupled to the merged-branch delete path.
