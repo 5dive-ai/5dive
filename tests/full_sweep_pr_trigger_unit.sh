@@ -10,15 +10,29 @@
 # the FILE LISTS OF THE TWO COMMITS THAT MOTIVATED IT, which is the one claim that
 # cannot be satisfied by an empty match.
 #
-#   the filter must FIRE       arms 1-2: every file 2f8dbaa (#486, DIVE-2371) and
-#                              4e87712 (#488, DIVE-2603) touched in the source tree
-#                              is matched. These are the two measured instances of
-#                              a nightly-tier harness broken by a merge whose PR was
-#                              green; a list that stops covering either has given up
-#                              the only coverage anybody demonstrated it needed.
-#   and it must NOT fire       arm 3: paths OUTSIDE the claimed surface do not match.
-#                              A list that matched everything would pass arms 1-2 and
-#                              mean nothing.
+#   DIVE-4135 MOVED ARMS 1-2 FROM THE PR ARM TO THE PUSH ARM, and did NOT delete
+#   them. The two measured instances (2f8dbaa #486 DIVE-2371, 4e87712 #488 DIVE-2603
+#   — a nightly-tier harness broken by a merge that touched only the source tree)
+#   are still the thing this file grades. What changed is WHICH TRIGGER owes the
+#   coverage. `src/**`, `build.sh` and `install.sh` came off `on.pull_request.paths`
+#   because the PR sweep is ADVISORY (see arm 6) and cost 4296 of the 6647 job-seconds
+#   on PR #808's head 34de9f9 while blocking nothing — #808 merged with a RED
+#   `changed-harnesses`. Deleting an arm because the thing it graded moved is how the
+#   coverage silently becomes nobody's, so:
+#
+#   the sweep must FIRE for    arms 1-2: `on.push` names main and carries NO `paths:`
+#   both instances             filter, so every file either instance touched runs the
+#                              whole corpus on the merge commit. Coverage is kept; its
+#                              latency moves from pre-merge to one sweep post-merge.
+#                              An arm that reads a filter cannot be satisfied by an
+#                              empty match: a `paths:` key appearing on the push arm
+#                              is itself the red.
+#   the machinery arm FIRES    arm 2b: the three files that still trigger a PR sweep
+#                              (the tier dial, the runner, this workflow) are matched.
+#   and it must NOT fire       arm 3: the DIVE-4135 removals AND the paths outside the
+#                              claimed surface do not match the PR list. This arm is
+#                              now bidirectional — re-adding `src/**` without reading
+#                              this file reds here, exactly as removing it used to.
 #   the MATCHER can fail       arm 4: the glob translator is re-run against a
 #                              deliberately narrow list and must REJECT the instance
 #                              file lists. Without this, arms 1-2 are also satisfied
@@ -98,7 +112,15 @@ INSTANCES = {
         'build.sh', 'install.sh', 'src/header.sh',
     ],
 }
+# DIVE-4135: the PR arm's whole surface is now the sweep's own machinery.
+MACHINERY = ['tests/lib/tier.sh', 'scripts/run-harnesses.sh',
+             '.github/workflows/full-sweep.yml']
+# DIVE-4135: what the PR arm must NOT fire for. The first three are the REMOVALS —
+# they are here so a re-add is as loud as the removal was, in the other direction.
 OUTSIDE = [
+    'src/cmd_task.sh',                   # DIVE-4135 removal: src/** is a push/nightly surface
+    'build.sh',                          # DIVE-4135 removal
+    'install.sh',                        # DIVE-4135 removal
     'README.md',
     'CHANGELOG.md',
     'community/wiki/index.md',
@@ -119,18 +141,39 @@ if not paths:
 else:
     ok('on.pull_request.paths parses to a non-empty list (%d entries)' % len(paths))
 
-for name, files in INSTANCES.items():
-    missed = [f for f in files if not matches(paths, f)]
-    if missed:
-        no('instance %s: paths filter would NOT fire for %s' % (name, ', '.join(missed)))
-    else:
-        ok('instance %s: every source file it touched is covered (%s)' % (name, ', '.join(files)))
+# ARMS 1-2 (DIVE-4135): the instances are covered by the PUSH arm, unfiltered.
+push = (trig or {}).get('push') or {}
+push_branches = push.get('branches') or []
+push_paths = push.get('paths') or push.get('paths-ignore') or []
+if 'main' not in push_branches:
+    no('on.push.branches no longer names main — the post-merge sweep that now carries '
+       'the DIVE-2789 instances is GONE, and nothing else runs the full corpus per merge')
+elif push_paths:
+    no('on.push carries a paths filter (%r) — DIVE-2667 says it must not, and with the '
+       'PR arm narrowed by DIVE-4135 this is the only trigger left that covers the '
+       'instances at all' % (push_paths,))
+else:
+    for name, files in INSTANCES.items():
+        ok('instance %s: covered POST-MERGE by the unfiltered push:[main] sweep (%s)'
+           % (name, ', '.join(files)))
+
+# ARM 2b: the machinery the PR arm still owes.
+missed = [f for f in MACHINERY if not matches(paths, f)]
+if missed:
+    no('the PR arm no longer fires for its own machinery: %s' % ', '.join(missed))
+else:
+    ok('the PR arm fires for the sweep machinery (%s)' % ', '.join(MACHINERY))
 
 leaks = [p for p in OUTSIDE if matches(paths, p)]
 if leaks:
-    no('paths filter is over-broad — it matches %s, so arms 1-2 prove nothing' % ', '.join(leaks))
+    no('the PR paths filter matches %s. If that is src/**, build.sh or install.sh, it is '
+       'the DIVE-4135 removal being re-added: read the trigger comment in full-sweep.yml '
+       'first — the sweep is ADVISORY on a PR and cost 65%% of PR #808\'s CI bill '
+       'blocking nothing. If it is something else, the filter is over-broad and arm 3 '
+       'proves nothing.' % ', '.join(leaks))
 else:
-    ok('paths filter does NOT match %d files outside the claimed surface' % len(OUTSIDE))
+    ok('the PR paths filter does NOT match %d files outside the claimed surface '
+       '(including the three DIVE-4135 removals)' % len(OUTSIDE))
 
 # Arm 4: the matcher must be able to say no. If a narrow list still "covers" both
 # instances, the translator is lenient and every arm above is vacuous.

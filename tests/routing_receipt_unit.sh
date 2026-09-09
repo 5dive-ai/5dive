@@ -108,7 +108,7 @@ db "UPDATE tasks SET maker_agent='dev2', verifier='quinn', iteration=1,
       handoff_delivered_at=datetime('now'), status='todo' WHERE id=${R1};"
 I1=$(ident_of "$R1")
 ACTOR_OVERRIDE=quinn TASK_ACTOR=quinn \
-  OUT=$(cmd_task_reject "$I1" --feedback="needs another pass" 2>/dev/null)
+  OUT=$(cmd_task_reject "$I1" --feedback="needs another pass FIX: name the concrete change" 2>/dev/null)
 if has_all_three "$OUT" dev2; then
   ok_t "reject prints a receipt naming owner + queue position + next wake on stdout"
 else

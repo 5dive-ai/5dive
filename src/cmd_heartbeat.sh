@@ -2585,14 +2585,14 @@ _hb_loop_terminal_clause() {
       "'maker: ${creator}'" "'loop spec:'" \
       "'handoff: delivered (awaiting verifier ACK)'" \
       "'5dive task done ${task_ident}'" \
-      "'5dive task reject ${task_ident} --feedback=\"<what to fix>\"'"
+      "'5dive task reject ${task_ident} --feedback=\"FINDING: <what is wrong> FIX: <the concrete change that closes it> VERIFY: <what you will re-run>\"'"
     return 0
   fi
 
   # VERIFIER variant — only once the maker has actually handed off.
   [[ "$maker" != "$name" ]] || return 0
   printf ' NOTE — you are the VERIFIER on %s (maker: %s) and the handoff is already delivered, so you are here to GRADE the work, not to build or rescue it. A FAIL verdict is a complete, terminal outcome: if it does not pass, run %s and treat the goal as MET, and stop — the reject is a SECOND terminal state for THIS goal even though it leaves status todo, because it bounces the task back to %s (%s will show %s and a %s result line). Report that you rejected and why. Do NOT record a done you do not believe, cancel work that is verified-good, or file a human gate for something %s can fix in another pass — a correct reject IS the terminal action, and forcing a done/cancel past it writes a false record to the board.' \
-    "$task_ident" "$maker" "'5dive task reject ${task_ident} --feedback=\"<what to fix>\"'" \
+    "$task_ident" "$maker" "'5dive task reject ${task_ident} --feedback=\"FINDING: <what is wrong> FIX: <the concrete change that closes it> VERIFY: <what you will re-run>\"'" \
     "$maker" "'5dive task show ${task_ident}'" "'assignee = ${maker}'" \
     "'❌ ${name} rejected'" "$maker"
 }
@@ -2603,6 +2603,34 @@ _hb_loop_terminal_clause() {
 # (a freeform "your tasks" condition is ambiguous to the goal evaluator).
 # Returns 0 on a delivered nudge, nonzero on any failure (so the caller skips
 # marking lastRunAt and retries next tick).
+# DIVE-4144 (arm 2) — THE FIX HAS TO REACH THE MAKER, NOT JUST THE ROW.
+#
+# A structured reject is worth nothing if the maker does not read it before it
+# starts. The maker's next pass begins with the /goal nudge below and NOTHING
+# else: on a `--fresh` wake the window was just /clear'ed, so the reject that
+# bounced the row is not in context, and the nudge's own instruction is "run
+# `task show`" — one more turn, spent re-reading feedback the wake could have
+# carried. This prints the FIX block INTO the nudge.
+#
+# Keyed on the UNSPENT reject token (handoff_rejected_at), not on "the result
+# looks like a rejection": the token is NULLed by the next delivery, so this
+# fires for exactly the one pass that owes an answer to a bounce and goes quiet
+# afterwards. Empty for every non-loop row and every first pass.
+#
+# Best-effort like every other enrichment here — a failure must never block a
+# wake, and a tree that sources a subset of src/ has no _reject_fix_block.
+_hb_reject_fix_clause() {
+  local task_id="$1"
+  [[ "$task_id" =~ ^[0-9]+$ ]] || return 0
+  declare -F _reject_fix_block >/dev/null 2>&1 || return 0
+  local rejected; rejected=$(db "SELECT COALESCE(handoff_rejected_at,'') FROM tasks WHERE id=${task_id};" 2>/dev/null) || return 0
+  [[ -n "$rejected" ]] || return 0
+  local res; res=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${task_id};" 2>/dev/null) || return 0
+  local fix; fix=$(_reject_fix_block "$res") || return 0
+  [[ -n "$fix" ]] || return 0
+  printf ' YOUR PREVIOUS DELIVERY WAS REJECTED AND THE VERIFIER NAMED THE FIX — read this before you touch anything else: %s. Do THAT, then deliver with a result that says what you changed; a byte-identical re-delivery is refused (DIVE-4144), because it costs the verifier a full re-read of the PR to discover nothing moved.' "$fix"
+}
+
 _hb_wake() {
   local name="$1" fresh="$2" task_id="$3" task_ident="${4:-DIVE-$3}"
   # DIVE-1475 status guard: never inject a /goal for a task that isn't actionable.
@@ -2668,6 +2696,14 @@ _hb_wake() {
   local loop_clause=""
   loop_clause=$(_hb_loop_terminal_clause "$name" "$task_id" "$task_ident") || loop_clause=""
   [[ -n "$loop_clause" ]] && nudge="${nudge}${loop_clause}"
+
+  # DIVE-4144 (arm 2): FIRST of the enrichments, so a bounced maker reads the fix
+  # ahead of the memory citations and the gate queue. It is not literally above the
+  # /goal verb because that token must lead the line to be a slash command at all —
+  # this is as near the top as the transport allows.
+  local reject_clause=""
+  reject_clause=$(_hb_reject_fix_clause "$task_id" 2>/dev/null) || reject_clause=""
+  [[ -n "$reject_clause" ]] && nudge="${nudge}${reject_clause}"
 
   # DIVE-992: enrich the tick prompt from the shared seam. Pull the task's
   # title+body once, then (a) cite the most relevant memory hits so the agent
