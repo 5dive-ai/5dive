@@ -443,7 +443,7 @@ grep -q 'release-notes.sh' <<<"$BLOCK" \
 mkdir -p "$R/scripts"
 cp "$SCRIPTS/release-notes.sh" "$R/scripts/release-notes.sh"
 cp "$SCRIPTS/release-cut-baseline.sh" "$R/scripts/release-cut-baseline.sh"
-# shellcheck disable=SC2034  # incumbent/sha/version/tag/note are read by `eval "$BLOCK"`
+# shellcheck disable=SC2034  # incumbent/sha/version/tag/note/provenance are read by `eval "$BLOCK"`
 run_block() { # <incumbent> <sha> <version>
   rm -f "$TMP/ghargs" "$TMP/ghbody"
   ( cd "$R" || exit 9
@@ -462,6 +462,7 @@ run_block() { # <incumbent> <sha> <version>
       cut_from=$(bash scripts/release-cut-baseline.sh "refs/tags/${incumbent}" 2>/dev/null || true)
     fi
     note="nightly auto-cut: main changed and CI is green"
+    _release_level_provenance="Release level: minor (derived minor from v0.0.8..HEAD — forced by abc1234 feat(cli): shipped capability)."
     gh() {
       printf '%s\n' "$*" > "$TMP/ghargs"
       local prev="" a
@@ -512,6 +513,9 @@ grep -q 'machine account' "$TMP/ghbody" 2>/dev/null \
 grep -q 'nightly auto-cut' "$TMP/ghbody" 2>/dev/null \
   && ok_t "block: the cut provenance is kept as a footer, not lost" \
   || bad_t "block: cut provenance kept" "$(tail -3 "$TMP/ghbody" 2>/dev/null)"
+grep -q 'Release level: minor.*forced by abc1234 feat(cli)' "$TMP/ghbody" 2>/dev/null \
+  && ok_t "block: the release body names the commit that forced its level" \
+  || bad_t "block: release body carries level provenance" "$(tail -5 "$TMP/ghbody" 2>/dev/null)"
 
 # The refusal arm, run for real: an empty range must abort, and abort BEFORE gh is
 # called. A release page created with an underivable body is the bug being closed.

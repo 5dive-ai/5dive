@@ -81,12 +81,12 @@ on:
         required: true
         type: string
       level:
-        description: 'Which component to increment. patch = the nightly behaviour. minor/major DECLARE AN EPOCH and are only correct when the headline capability has landed.'
+        description: 'Leave on auto. The level is DERIVED from the commits in the cut (a feat makes it a minor); this can only RAISE it, and a value below the derived one is refused (DIVE-4086).'
         required: false
-        default: patch
+        default: auto
         type: choice
         options:
-          - patch
+          - auto
           - minor
           - major
       required_only:
@@ -195,7 +195,72 @@ jobs:
           # arm. Under `set -e` that arm would still pass for the wrong reason, and the
           # refusal would look pinned when it was only incidentally covered. (olivia,
           # DIVE-2539.)
-          _level="${RELEASE_LEVEL:-patch}"
+          # DIVE-4086: THE LEVEL BELONGS TO THE TIP, NOT TO THE RUN. A scheduled cut
+          # that started 07:24 and polled until 07:54 consumed a tip a human asked at
+          # 07:28 to be cut as a minor, and tagged it a patch. No component failed:
+          # the level was attached to the RUN, while the thing being decided is the
+          # TIP, and a run already in flight cannot learn what a human decided four
+          # minutes later. Deriving it from the commits makes the two cuts agree,
+          # because they read the same range. lodar, 2026-09-08: "if the cut has a
+          # feature it is a 0.x cut, otherwise it is a 0.x.x cut."
+          #
+          # The range is the one the release notes describe, so the level and the notes
+          # can never disagree about what is in the cut.
+          _range="${incumbent:+${incumbent}..}HEAD"
+          _subjects=$(git log --no-merges --format='%h %s' "$_range" 2>/dev/null) || _subjects=""
+          _forced_by=$(grep -E '^[0-9a-f]+ [a-z]+(\([^)]*\))?!:' <<<"$_subjects" | head -3)
+          if [[ -n "$_forced_by" ]]; then
+            _derived=major
+          elif git log --no-merges --format='%B' "$_range" 2>/dev/null | grep -q '^BREAKING CHANGE'; then
+            _derived=major; _forced_by="a BREAKING CHANGE trailer in ${_range}"
+          else
+            _forced_by=$(grep -E '^[0-9a-f]+ feat(\([^)]*\))?:' <<<"$_subjects" | head -3)
+            if [[ -n "$_forced_by" ]]; then _derived=minor; else _derived="patch"; fi
+          fi
+
+          # THE REFUSAL IS BOUNDED BY WHEN THE LINT LANDED, and that boundary is read
+          # off the tree rather than stored: 30 of the 60 merges before this change
+          # carry no conventional type at all ("DIVE-NNNN: ..." subjects), so a refusal
+          # over the whole range would red EVERY cut until the last of them aged out —
+          # the change meant to stop one mis-levelled tag would stop publishing
+          # altogether. A marker file would need its own reaper (this row rejected that
+          # shape as state that goes stale); the commit that ADDED the lint cannot.
+          _lint_epoch=$(git log --diff-filter=A --format='%H' -- .github/workflows/pr-title-lint.yml 2>/dev/null | tail -1)
+          _untyped=""
+          if [[ -n "$_lint_epoch" ]]; then
+            _enforce="$_range"
+            git merge-base --is-ancestor "$_lint_epoch" "${incumbent:-HEAD}" 2>/dev/null \
+              || _enforce="${_lint_epoch}..HEAD"
+            _untyped=$(git log --no-merges --format='%h %s' "$_enforce" 2>/dev/null \
+              | grep -vE '^[0-9a-f]+ (feat|fix|test|chore|docs|refactor|ci|perf)(\([^)]*\))?!?: ' | head -5)
+          fi
+          if [[ -n "$_untyped" ]]; then
+            echo "::error::commits since ${incumbent:-<root>} carry no conventional type, so this cut cannot tell whether it contains a feature (DIVE-4086). The PR-title lint should have made this unreachable. Correct the offending subject in the branch being cut, then retry; changing RELEASE_LEVEL or dispatching manually cannot bypass this refusal:"
+            # shellcheck disable=SC2001  # prefixing every LINE, which ${x//y/z} cannot do
+            sed 's/^/::error::  /' <<<"$_untyped"
+            exit 1
+          fi
+
+          # RELEASE_LEVEL is an OVERRIDE THAT MAY ONLY RAISE. Lowering it is how this
+          # row's defect comes back wearing a hand instead of a cron, and 'auto' (the
+          # dispatch default) means "use what the commits say".
+          _level="$_derived"
+          if [[ -n "${RELEASE_LEVEL:-}" && "${RELEASE_LEVEL}" != "auto" ]]; then
+            case "$RELEASE_LEVEL" in
+              patch) _ovr=0 ;;
+              minor) _ovr=1 ;;
+              major) _ovr=2 ;;
+              *) echo "::error::RELEASE_LEVEL='${RELEASE_LEVEL}' is not patch|minor|major — refusing to guess which component to move."; exit 1 ;;
+            esac
+            case "$_derived" in patch) _drv=0 ;; minor) _drv=1 ;; major) _drv=2 ;; esac
+            if (( _ovr < _drv )); then
+              echo "::error::RELEASE_LEVEL='${RELEASE_LEVEL}' is BELOW the level derived from the commits ('${_derived}') — an override may raise a cut, never lower it (DIVE-4086)."
+              exit 1
+            fi
+            _level="$RELEASE_LEVEL"
+          fi
+          _release_level_provenance="Release level: ${_level} (derived ${_derived} from ${_range}${_forced_by:+ — forced by ${_forced_by//$'\n'/; }})."
+          echo "$_release_level_provenance"
           case "$_level" in
             patch) version="${_maj}.${_min}.$(( _pat + 1 ))" ;;
             minor) version="${_maj}.$(( _min + 1 )).0" ;;
@@ -1071,6 +1136,7 @@ jobs:
           fi
           {
             printf '\n---\n\n'
+            printf '%s\n\n' "$_release_level_provenance"
             printf '%s\n\n' "$note"
             printf "Installed by every box via install.sh's tag resolver (DIVE-2144). Previous published tag: %s.\n" "${incumbent:-none}"
           } >> "$_notes_file"

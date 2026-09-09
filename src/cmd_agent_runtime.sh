@@ -644,7 +644,7 @@ _agent_pane_input_ready() {
 # reliable AT-REST idle glyph" — a stricter bar grok has not been verified against.
 # Leave _hb_idle_marker alone; a marker that is present in the composer is not thereby
 # proven to be a trustworthy at-rest signal.
-declare -A _AGENT_PROMPT_DETECTABLE=(
+declare -gA _AGENT_PROMPT_DETECTABLE=(
   [claude]=1 [codex]=1 [devin]=1 [antigravity]=1 [grok]=1
 )
 

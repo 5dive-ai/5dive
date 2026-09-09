@@ -1,0 +1,24 @@
+#!/bin/sh
+# DIVE-4100: tiny privileged half of `5dive agent list`.
+#
+# The Python shaper is embedded in the checksummed CLI bundle, so this helper
+# adds no second implementation to drift. It extracts that inert source and
+# runs it with fixed production paths. There are deliberately no arguments and
+# no environment-derived paths: the exact sudoers grant cannot be turned into
+# an arbitrary root file reader.
+set -eu
+
+bundle=/usr/local/bin/5dive
+[ -r "$bundle" ] || exit 1
+
+/usr/bin/awk '
+  /^# __5DIVE_AGENT_LIST_PY_BEGIN__$/ { emit=1; next }
+  /^# __5DIVE_AGENT_LIST_PY_END__$/   { exit }
+  emit { print }
+' "$bundle" | /usr/bin/python3 - \
+  /var/lib/5dive/agents.json \
+  /var/lib/5dive/auth-profiles \
+  /etc/5dive/connectors \
+  /home \
+  /etc/sudoers.d \
+  /home/claude/projects

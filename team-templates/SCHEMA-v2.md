@@ -17,6 +17,7 @@ team:                      # NEW — template metadata (display + marketplace)
   name: "Lean SaaS startup"
   description: "5-role founding team: CEO + CMO + DevOps + Researcher + Creative"
   slug: startup            # used by `5dive team import startup`
+  requires: [github_push]  # optional — capabilities this team needs from the BOX
 
 defaults:                  # NEW — merged into every agent (agent-level keys win)
   type: claude
@@ -172,6 +173,37 @@ not at the `export` that wrote it. Three board shapes are reconciled here:
 seat is removed — `agent rm` does not, so without this a torn-down company leaves
 templates materializing work for an assignee that no longer exists. Already
 materialized instances are separate rows and are left alone.
+
+## `team.requires:` — what the team needs from the box (DIVE-4103)
+
+An optional list of capability keys under `team:`. Before anything is
+provisioned, `up` probes each and reports it, so the user learns at the TOP of
+the import whether the team can do the job it was imported for — not after four
+seats already exist.
+
+| key | probe | reduced mode when absent |
+|---|---|---|
+| `github_push` | `gh auth token` — offline, resolves `GH_TOKEN`/`GITHUB_TOKEN` and the hosts config, makes no network call | **review-only**: reads, grades, files and rejects; nothing it approves is pushed or merged |
+| `browser` | `5dive browser --help` exits 0 | **API-only**: steps needing an authenticated browser session do not run |
+
+### Posture
+Same as `loops:` — **a missing capability does NOT fail the import** and does not
+count toward `errors`. A review-only team is worth having; a box with no
+credential must still be able to stand one up. What is not acceptable is
+silence: the defect this closes is an import that provisions a team which cannot
+land anything and says nothing about it.
+
+The probe answers *"does this box hold a credential"*, not *"does that credential
+carry push on your repo"* — a scope read needs a repo the import has not been
+given and a network call the offline probe deliberately refuses.
+
+### Probes live in the CLI, keys live in the template
+A template names a key; the CLI owns the command. A template that could name its
+own shell probe would be arbitrary code executed by an import, and a marketplace
+template must be data. A key this CLI has no probe for is reported as
+**unchecked** — never as satisfied (which would ship a team that cannot work) and
+never as absent (which would send the user hunting for a credential already
+there).
 
 ## `pack:` — import a character pack (DIVE-536)
 

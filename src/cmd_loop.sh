@@ -676,7 +676,7 @@ _loop_refresh_spend() {
 # most once per LOOP_SPEND_THROTTLE (default 20s) per loop, else return the last
 # persisted value. Drop-in replacement for the old bare SELECT so every ceiling
 # check reads a real number without re-scanning transcripts every poll.
-declare -A _LOOP_SPEND_LAST 2>/dev/null || true
+declare -gA _LOOP_SPEND_LAST 2>/dev/null || true
 _loop_spent() {
   local loop_id="$1" throttle="${LOOP_SPEND_THROTTLE:-20}" now last rc=0
   now=$(date +%s); last="${_LOOP_SPEND_LAST[$loop_id]:-0}"

@@ -202,9 +202,13 @@ TIER_CAL_SCALE_MAX_PCT=150
 # budget at EVERY baseline in the sweep, including today's. One is in the newest 8 runs
 # (`pristine-s1`, 365s against a 300s cap). That is a real corpus overrun, it predates
 # this change, and this change neither creates nor cures it. TIER_CAL_SCALE_MAX_PCT and
-# the 300s budget are untouched, and the shard counts stay pinned at 2 — a capacity
+# the 300s budget are untouched, and the shard counts stayed pinned at 2 — a capacity
 # raise is a policy decision with its own gate (tests/corpus_tier_budget_unit.sh
 # enforces exactly that, and it caught a first draft of this commit that raised them).
+# THAT GATE WAS THEN FILED AND ANSWERED: DIVE-4147 raised the core shard count to 3 on
+# 2026-09-09, because the overrun above is the corpus and no re-baseline can price it
+# away. The 300s cap and every constant in this file are still untouched by it.
+
 TIER_CAL_BASELINE_US=138281
 
 # How long ONE sample of the probe should run. This is the PRECISION knob from note 1:

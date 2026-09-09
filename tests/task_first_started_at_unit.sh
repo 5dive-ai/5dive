@@ -354,6 +354,44 @@ _hb_seat_advanced rung2seat "$idz" "$since" rung2seat
   || bad_t "rung 2: the reclaim event disarms the nudge ladder it is supposed to make visible" ""
 
 # ---------------------------------------------------------------------------
+# 6b. DIVE-4104 — the FOURTH path through the erasure: a reclaim that keeps the
+#     handoff. Rule (a) on a row whose delivery is live no longer hands the row
+#     back to the maker; it resets the claim and re-asserts the VERIFIER as
+#     assignee. That path clears `started_at` like the other three, so it owes
+#     the same evidence guarantee — and it owes it MORE than they do, because a
+#     walled verifier's row is exactly the row this ticket found reading as
+#     never-touched. The structural arm below counts sites; this one grades the
+#     behaviour on the new site, so the count bump is an extension of the
+#     invariant and not a retirement of it.
+# ---------------------------------------------------------------------------
+idv=$(addt "verifier-queue-reclaim" --assignee=mk4104 --verifier=vf4104)
+( cmd_task_done "$idv" --result="delivered in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
+_hb_claim_task vf4104 "$idv" >/dev/null 2>&1
+fv_before=$(fld "$idv" first_started_at)
+[[ "$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${idv};")" == "vf4104" \
+   && "$(db "SELECT CASE WHEN handoff_delivered_at IS NOT NULL AND handoff_ack_at IS NULL THEN 1 ELSE 0 END FROM tasks WHERE id=${idv};")" == "1" \
+   && "$fv_before" != "NULL" && -n "$fv_before" ]] \
+  && ok_t "verifier-queue reclaim (precondition): the verifier holds a live delivery and first_started_at is stamped" \
+  || bad_t "verifier-queue reclaim (precondition): fixture is not a live delivery on the verifier — the arm below proves nothing" \
+       "assignee=[$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${idv};")] first=[$fv_before]"
+db "UPDATE tasks SET started_at=datetime('now','-30 minutes') WHERE id=${idv};"
+_hb_claude_started() { date -u +%s; }            # rule (a): claiming session gone
+_hb_reclaim vf4104 100000 >/dev/null 2>&1
+_hb_claude_started() { echo ""; }
+fv_after=$(fld "$idv" first_started_at)
+[[ "$(status_of "$idv")" == "todo" && "$(fld "$idv" started_at)" == "NULL" ]] \
+  && ok_t "verifier-queue reclaim: the CLAIM is reset (todo, started_at cleared) like the other three rules" \
+  || bad_t "verifier-queue reclaim: claim not reset" "status=[$(status_of "$idv")] started=[$(fld "$idv" started_at)]"
+[[ "$fv_after" == "$fv_before" && "$fv_after" != "NULL" ]] \
+  && ok_t "verifier-queue reclaim: first_started_at SURVIVES — a walled verifier's row still reads as started" \
+  || bad_t "verifier-queue reclaim: first_started_at was destroyed by the handoff-preserving path" \
+       "before=[$fv_before] after=[$fv_after]"
+[[ "$(db "SELECT COALESCE(assignee,'')||'|'||CASE WHEN handoff_delivered_at IS NOT NULL AND handoff_ack_at IS NULL THEN 'deliv-noack' ELSE 'lost' END FROM tasks WHERE id=${idv};")" == "vf4104|deliv-noack" ]] \
+  && ok_t "verifier-queue reclaim: the row stays on the verifier with the delivery intact" \
+  || bad_t "verifier-queue reclaim: the handoff did not survive" \
+       "got=[$(db "SELECT COALESCE(assignee,'')||'|'||COALESCE(handoff_delivered_at,'NULL') FROM tasks WHERE id=${idv};")]"
+
+# ---------------------------------------------------------------------------
 # 7. Structural: all three rules reach the erasure through ONE function. This is
 #    what makes the three arms above a complete grade of the erasure rather than
 #    three samples of it — if a fourth rule ever inlines its own UPDATE, the
@@ -364,12 +402,20 @@ _hb_seat_advanced rung2seat "$idz" "$since" rung2seat
 # read to this guard as a second erasure.
 inline=$(grep -c "UPDATE tasks SET.*started_at=NULL" src/cmd_heartbeat.sh)
 inline=$(( inline - 1 ))   # the one legitimate site, inside _hb_reclaim_to_todo
+# FOUR callers since DIVE-4104, still three RULES: (a) session gone, (b) idle
+# stall, (c) budget overrun, plus `_hb_reclaim_to_verifier`, which is rule (a)'s
+# handoff-preserving entry point and delegates with mode `keep-handoff` rather
+# than writing its own UPDATE. The count is bumped and the invariant is NOT
+# retired: the arm above still demands exactly one erasure site, and 6b grades
+# first_started_at surviving on the new path. A fifth caller that inlines its
+# own UPDATE still reds the arm above; a fifth caller that does not still reds
+# this one until someone has re-read the per-rule arms.
 sites=$(grep -c "_hb_reclaim_to_todo \"\$name\"" src/cmd_heartbeat.sh)
 [[ "$inline" == "0" ]] \
   && ok_t "structural: cmd_heartbeat.sh clears started_at in exactly one place" \
   || bad_t "structural: an inlined started_at=NULL bypasses the shared reclaim" "extra=[$inline]"
-[[ "$sites" == "3" ]] \
-  && ok_t "structural: all THREE reclaim rules route through _hb_reclaim_to_todo" \
+[[ "$sites" == "4" ]] \
+  && ok_t "structural: all reclaim paths route through _hb_reclaim_to_todo (3 rules + the verifier-queue mode)" \
   || bad_t "structural: reclaim call sites changed — re-grade the per-rule arms" "sites=[$sites]"
 
 printf '\ntask first_started_at: %d passed, %d failed\n' "$PASS" "$FAIL"

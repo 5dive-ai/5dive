@@ -111,14 +111,22 @@ ROUTE_FILE="$TMP/route.log"; : >"$ROUTE_FILE"
   return 0
 }
 
-# THE SIGNING SEAM. `agent_sudo_grant` lives in cmd_agent_create.sh, which this
-# harness deliberately does not source: the real classifier is graded by that
-# file's own harnesses, and what is under test HERE is the yes/no/unknown mapping
-# and what the two call sites do with it. Stubbed per-arm via $GRANT so one seam
-# drives every polarity. The empty default is the "function not available" shape,
-# which must also read as unknown.
+# THE SIGNING SEAM. `sudo_grant_lines` and `classify_sudo_grant` live in
+# cmd_agent_create.sh, which this harness deliberately does not source: the real
+# reader/classifier pair is graded by that file's own harnesses, and what is under
+# test HERE is the yes/no/unknown mapping and what the two call sites do with it.
+# Stubbed per-arm via $GRANT so one seam drives every polarity. The empty default
+# is the "measurement unavailable" shape, which must also read as unknown.
 GRANT=""
-agent_sudo_grant() { [[ -n "$GRANT" ]] && printf '%s\n' "$GRANT"; return 0; }
+sudo_grant_lines() {
+  [[ -n "$GRANT" ]] || return 1
+  printf '# synthetic policy without the narrow answer broker\n%s\n' "$GRANT"
+}
+classify_sudo_grant() {
+  cat >/dev/null
+  [[ -n "$GRANT" ]] && printf '%s\n' "$GRANT"
+  return 0
+}
 
 db "INSERT INTO agents_org(name,reports_to,role) VALUES('main',NULL,'coordinator');"
 db "INSERT INTO agents_org(name,reports_to,role) VALUES('dev','main','builder');"
@@ -246,8 +254,8 @@ grep -q 'need_answer_sig lands EMPTY' <<<"$ERR_N" \
 grep -q 'not a re-sign verb' <<<"$ERR_N" \
   && ok_t "the warn states that the late repair does not exist — task answer cannot re-sign (DIVE-2808 step 4)" \
   || bad_t "warn states no late repair" "err: $ERR_N"
-grep -qi 'do not grant .*gate-proof sign.* to a cli-scoped' <<<"$ERR_N" \
-  && ok_t "the warn forecloses the WRONG fix (granting the signing verb to a cli-scoped seat is a forgery primitive)" \
+grep -qi 'Do NOT grant' <<<"$ERR_N" && grep -qi 'gate-proof sign' <<<"$ERR_N" \
+  && ok_t "the warn forecloses the WRONG fix (granting the broad signing verb to a cli-scoped seat is a forgery primitive)" \
   || bad_t "warn forecloses wrong fix" "err: $ERR_N"
 # DIVE-3117 landed between this harness's first base and its merge: a
 # push-for-review ask on a loop task SUPPRESSES the verifier route and resolves the
