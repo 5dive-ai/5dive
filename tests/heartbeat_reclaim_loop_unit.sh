@@ -35,6 +35,12 @@
 #      deadline already in the past does not park;
 #   8  session gone with the row's pushed branch still checked out -> the claim
 #      is KEPT IN PLACE (status stays in_progress, started_at untouched);
+#  8d  THE HOLD IS BOUNDED — the same intact workspace 600m past the 45m budget
+#      is reclaimed: rule (a)'s `continue` never touches started_at, so an
+#      unbounded hold re-fires forever and (b)/(c) are never reached;
+# 8e/f  the bound IS the budget — 44m still holds, 46m lapses;
+#  8g  a LAPSED hold is not swallowed by DIVE-2560's verifier-latency skip, the
+#      one rule between (a) and (c) that could re-create the wedge;
 #   9  CONTROL — the same row with the branch gone reclaims normally, so arm 8
 #      rests on positive evidence, never on an unreadable probe;
 #  10  REPLAY — the four rows that bounced on 2026-09-08 (DIVE-4085, 4071,
@@ -322,6 +328,81 @@ live_session
 [[ "$(row "$T8")" == "$BEFORE8" ]] && (( ${RC8:-1} == 0 )) \
   && ok_t "session gone with the row's branch still checked out -> claim kept in place, started_at intact" \
   || bad_t "an intact workspace was still reclaimed" "reclaimed=${RC8:-?} row=$(row "$T8") before=$BEFORE8"
+
+# =============================================================================
+# 8d) THE HOLD IS BOUNDED — quinn's repro (iteration 3 reject). Rule (a)'s
+# intact-workspace branch reacts with a bare `continue` and never touches
+# started_at, so `proc_start > started_epoch` stays true forever: unbounded, the
+# hold re-fires every tick and (b)/(c) are never reached, leaving a claim ten
+# hours past its budget that nothing can take back. Same fixtures as arm 8, the
+# only difference is the age. Arm 8 sets -10 minutes, which is why it cannot see
+# this.
+# =============================================================================
+T8D=$(mk_plain_claimed dev)
+db "UPDATE tasks SET started_at=datetime('now','-600 minutes') WHERE id=${T8D};"
+bind_branch "$T8D" dive-4104-fixture
+gone_session "$T8D"
+read -r RC8D _ < <(_hb_reclaim dev 5)
+live_session
+[[ "$(row "$T8D")" == "todo|NULL" ]] && (( ${RC8D:-0} >= 1 )) \
+  && ok_t "an intact workspace 600m past the 45m budget is reclaimed — the hold expires, it does not wedge" \
+  || bad_t "an intact workspace held a claim 600m past the budget — the hold is unbounded" \
+          "reclaimed=${RC8D:-?} row=$(row "$T8D")"
+
+# =============================================================================
+# 8e/8f) THE BOUND IS THE BUDGET, and it is the 45m floor either side of it —
+# 44m still holds, 46m does not. Without the pair, a mutant that deletes the
+# hold outright (always reclaim) or one that widens the comparison passes.
+# =============================================================================
+T8E=$(mk_plain_claimed dev)
+db "UPDATE tasks SET started_at=datetime('now','-44 minutes') WHERE id=${T8E};"
+bind_branch "$T8E" dive-4104-fixture
+BEFORE8E=$(row "$T8E")
+gone_session "$T8E"
+read -r RC8E _ < <(_hb_reclaim dev 5)
+live_session
+[[ "$(row "$T8E")" == "$BEFORE8E" ]] && (( ${RC8E:-1} == 0 )) \
+  && ok_t "inside the budget (44m of 45m) an intact workspace still keeps the claim in place" \
+  || bad_t "the hold lapsed while still inside the budget" "reclaimed=${RC8E:-?} row=$(row "$T8E") before=$BEFORE8E"
+
+T8F=$(mk_plain_claimed dev)
+db "UPDATE tasks SET started_at=datetime('now','-46 minutes') WHERE id=${T8F};"
+bind_branch "$T8F" dive-4104-fixture
+gone_session "$T8F"
+read -r RC8F _ < <(_hb_reclaim dev 5 2>"$TMP/8f.err")
+live_session
+[[ "$(row "$T8F")" == "todo|NULL" ]] && (( ${RC8F:-0} >= 1 )) \
+  && ok_t "one minute past the budget (46m of 45m) the hold lapses and the ordinary rules take the row" \
+  || bad_t "the hold survived past the budget boundary" "reclaimed=${RC8F:-?} row=$(row "$T8F")"
+# A hold that lapses SILENTLY reads, in the log, exactly like the wedge it fixes:
+# the last line about the row says "claim KEPT in place" and nothing ever
+# retracts it. The lapse is the interesting event, so it is a graded one.
+grep -q "hold LAPSED" "$TMP/8f.err" \
+  && ok_t "the lapse is written to the ledger — a silent lapse is indistinguishable from the wedge" \
+  || bad_t "the hold lapsed without saying so" "log=$(tail -3 "$TMP/8f.err")"
+
+# =============================================================================
+# 8g) THE LAPSE HAS NO SECOND DOOR. A lapsed hold falls through to the ordinary
+# rules, and DIVE-2560's verifier-latency skip sits between rule (a) and (c).
+# It normally cannot catch such a row (assignee=verifier + delivered + unACKed
+# reads `delivered_live` and is handled inside rule (a)) — EXCEPT when
+# maker_agent is NULL, which reads awaiting_verifier=1 and delivered_live=0.
+# Built here directly, because the defect being fixed is a hold with no exit and
+# an exit that exists in one shape only is not an exit.
+# =============================================================================
+T8G=$(mk_plain_claimed quinn)
+db "UPDATE tasks SET started_at=datetime('now','-600 minutes'),
+        verifier='quinn', maker_agent=NULL,
+        handoff_delivered_at=datetime('now','-590 minutes'), handoff_ack_at=NULL
+      WHERE id=${T8G};"
+bind_branch "$T8G" dive-4104-fixture
+gone_session "$T8G"
+read -r RC8G _ < <(_hb_reclaim quinn 5)
+live_session
+[[ "$(row "$T8G")" == "todo|NULL" ]] && (( ${RC8G:-0} >= 1 )) \
+  && ok_t "a lapsed hold is not swallowed by the verifier-latency skip — it reaches the ordinary rules" \
+  || bad_t "the verifier-latency skip re-created the unbounded hold one level down" \
+          "reclaimed=${RC8G:-?} row=$(row "$T8G")"
 
 # =============================================================================
 # 8b) CONTROL — the ref survives but NO worktree holds it -> reclaims

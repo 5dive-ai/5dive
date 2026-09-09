@@ -2260,6 +2260,9 @@ _hb_reclaim() {
   local reclaimed=0 escalated=0 id started_epoch age_min awaiting_verifier delivered_live
   while IFS='|' read -r id started_epoch age_min awaiting_verifier delivered_live; do
     [[ -n "$id" ]] || continue
+    # Reset per row: `local` is function-scoped, not block-scoped, so a lapse
+    # set on one row would otherwise leak into the next row of the same tick.
+    local _hold_lapsed=0
     # (a) the claiming session is gone — process is newer than the claim.
     if [[ -n "$proc_start" && -n "$started_epoch" ]] \
        && (( proc_start > started_epoch + _HB_PROC_SKEW_SEC )); then
@@ -2279,13 +2282,32 @@ _hb_reclaim() {
       # all left alone and the ordinary nudge re-presents the row to the SAME
       # seat. Positive evidence only (see _hb_row_workspace_intact) — no branch,
       # or a checkout root we cannot read, reclaims exactly as before.
+      # DIVE-4104 iteration 4 — THE HOLD IS BOUNDED BY THE SAME BUDGET AS
+      # EVERYTHING ELSE. Rule (a) reacts to intact-workspace evidence with a
+      # bare `continue`, which does not touch started_at, so `proc_start >
+      # started_epoch` stays true on every later tick: unbounded, the hold
+      # re-fires forever and rules (b) and (c) are never reached for that row —
+      # a wedged claim nothing can take back, which is exactly what the park's
+      # own comment calls worse than the churn. The evidence here never expires
+      # by construction (this host keeps ~700 checkouts, one per ticket, never
+      # swept), so the HOLD has to. Inside the budget the seat gets its restart
+      # for free; past it, the hold lapses and the ordinary rules own the row —
+      # (c) reaps and, on repeat, escalates, so item 4's 45m budget is kept on
+      # this path rather than made unreachable.
       local _wbranch
       if _wbranch=$(_hb_row_workspace_intact "$id"); then
-        _hb_log "[$name] $(_hb_ident "$id") session gone but workspace intact (branch ${_wbranch} still checked out) — claim KEPT in place, not reclaimed (DIVE-4104)"
-        continue
+        if (( age_min < budget )); then
+          _hb_log "[$name] $(_hb_ident "$id") session gone but workspace intact (branch ${_wbranch} still checked out) — claim KEPT in place, not reclaimed (${age_min}m of the ${budget}m budget used, DIVE-4104)"
+          continue
+        fi
+        # Past the budget: say so in the ledger (a silent lapse reads exactly
+        # like the wedge it fixes) and fall through to (b)/(c).
+        _hb_log "[$name] $(_hb_ident "$id") workspace intact (branch ${_wbranch}) but the claim is ${age_min}m past the ${budget}m budget — hold LAPSED, the ordinary rules take it (DIVE-4104)"
+        _hold_lapsed=1
+      else
+        _hb_reclaim_to_todo "$name" "$id" "$_why"
+        reclaimed=$((reclaimed + 1)); continue
       fi
-      _hb_reclaim_to_todo "$name" "$id" "$_why"
-      reclaimed=$((reclaimed + 1)); continue
     fi
     # DIVE-2560: a row currently held by its own VERIFIER, delivered but not yet
     # ACKed (same predicate _hb_stall_sweep already uses to nag the verifier
@@ -2295,7 +2317,14 @@ _hb_reclaim() {
     # above (the holder's session is actually gone) still applies. A row bounced
     # BACK to the maker by a reject is NOT this state — assignee != verifier once
     # that happens — so ordinary rework still reclaims normally.
-    if (( awaiting_verifier )); then
+    # `_hold_lapsed` overrides this skip: a row that got here from a LAPSED
+    # workspace hold has already been held past its budget by a gone session,
+    # and letting DIVE-2560's verifier-latency skip swallow it would re-create
+    # the unbounded hold one level down. (It is a narrow shape — a row whose
+    # assignee is its verifier and delivered-but-unACKed reads delivered_live
+    # above and never reaches here unless maker_agent is NULL — but the whole
+    # defect being fixed is a hold with no exit, so it gets no second door.)
+    if (( awaiting_verifier && ! _hold_lapsed )); then
       continue
     fi
     # (c) hard cap before stall: in_progress past the budget but rule (a) didn't
