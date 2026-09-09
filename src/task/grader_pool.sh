@@ -96,3 +96,52 @@ _grader_window_ok() {  # <account>  [<usage-json-on-stdin>]
   fi
   printf 'ok: %s at 5h=%s%% 7d=%s%%\n' "$acct" "$five" "$seven"; return 0
 }
+
+# `_grader_spawn_request <ident> <task_id> <verifier> <iteration>` — record that
+# this delivery wants a grader.
+#
+# EMITTED FROM `_task_route_to_verifier`, WHICH IS WHY THE GUARDRAIL HOLDS.
+# The row's first guardrail is "never maker-spawned". That helper is the ONE
+# funnel every delivery passes through — both of `task done`'s routing forks and
+# `task deliver` — which is why DIVE-4144's bare-re-deliver guard was put there
+# too. Emitting from it means the spawn is a consequence of the SYSTEM recording
+# a delivery, not an act the maker performs: there is no code path by which a
+# maker names, times or primes its own judge, and that is a structural property
+# rather than a rule someone has to remember.
+#
+# A REQUEST, NOT A SPAWN, and the distinction is deliver-on-push. The supervisor
+# lane consumes these and does the spawning on its own tick. If this function
+# actually started a grader, `task done` would block until one existed — which is
+# the polling wait deliver-on-push exists to forbid, re-introduced at the exact
+# point the maker is trying to walk away.
+#
+# NEVER FATAL. The caller invokes it with `|| true`: a delivery that is already
+# durably recorded must not be failed by a bookkeeping write. A lost request is
+# recoverable (the supervisor also sweeps delivered-but-ungraded rows); a delivery
+# that errored after the row was updated is not.
+_grader_spawn_request() {  # <ident> <task_id> <verifier> <iteration>
+  local ident="$1" tid="$2" vfier="$3" iter="$4"
+  [[ -n "$ident" ]] || return 0
+  declare -F ledger_emit >/dev/null 2>&1 || return 0
+  ledger_emit task.grade.requested ident="$ident" task_id="$tid" \
+    actor="$(task_actor "")" \
+    detail="ephemeral grader requested for iteration ${iter}${vfier:+ (pinned: ${vfier})}"
+}
+
+# `_grader_checkpoint <ident> <arm> <verdict> <sha>` — one verified arm, appended.
+#
+# TO THE LEDGER, NOT THE SESSION, because the grader has no session to come back
+# to. A walled grader must leave a partial record the NEXT one can resume from;
+# that is DIVE-4104's principle (a walled verifier must not destroy the grade)
+# applied to a grader that is ephemeral by construction.
+#
+# lifecycle_events is the store for the same reason DIVE-2777 chose it: it is
+# append-only and nothing on the re-delivery path rewrites it, so a checkpoint
+# cannot be clobbered by the next delivery the way a result column would be.
+_grader_checkpoint() {  # <ident> <arm> <verdict> <graded-sha>
+  local ident="$1" arm="$2" verdict="$3" sha="$4"
+  [[ -n "$ident" && -n "$arm" ]] || return 0
+  declare -F ledger_emit >/dev/null 2>&1 || return 0
+  ledger_emit task.grade.checkpoint ident="$ident" actor="$(task_actor "")" \
+    detail="arm=${arm} verdict=${verdict:-unknown} sha=${sha:-unknown}"
+}
