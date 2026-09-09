@@ -22,9 +22,12 @@ SRC=src
 TMP=$(mktemp -d /tmp/gate-undo-window.XXXXXX)
 
 # shellcheck disable=SC1090
+# lib/runs.sh is here for arm 9c ONLY: the e2e filing arm calls the real
+# cmd_task_need, whose run-ledger touch (need.sh:2974) is unresolved without it.
+# Every other arm drives the deliverer directly and never reaches that line.
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh lib/actor.sh cmd_agent_runtime.sh cmd_task.sh; do
+         lib/tasks_db.sh lib/actor.sh lib/runs.sh cmd_agent_runtime.sh cmd_task.sh; do
   source "$SRC/$f"
 done
 set +e
@@ -301,6 +304,52 @@ w=$(_task_gate_undo_window_secs DIVE-9117)
   || fail_t "gate_urgent=0 yielded '${w}', expected a non-zero hold"
 
 
+# ── 9c. THE WRITE HALF OF 9b, GRADED WHERE IT IS REACHABLE (quinn, iteration 1) ─
+# 9b above fixtures the column with a bare UPDATE, so it grades only the READ
+# site (notify.sh reads gate_urgent off the row). The fix has a second half — the
+# WRITE at need.sh's human-bound filing path, which persists the filer's
+# `--urgent`. Deleting that line leaves 9b, gate_route_delivery_unit (51/0, whose
+# --urgent case files a tier-1 DECISION and so exercises the OTHER, routed write)
+# and the rest of the tree fully green while `--urgent` on a human-bound gate is
+# silently ignored again — the exact defect the commit is named for. A harness
+# that builds its fixture with SQL cannot grade the code that writes that fixture.
+#
+# So this arm files through the real cmd_task_need and asserts the COLUMN.
+# `manual` is the type that pins it: it is tier-2 BY TYPE and not routable, so it
+# takes the human-bound branch with no org chart to arrange, which is what makes
+# the arm a control on the routed write as well — routed_reviewer must be empty
+# or the arm has drifted onto the branch 9b's sibling already covers.
+reset
+db "INSERT INTO tasks (ident,title,status,priority,assignee,created_by)
+    VALUES ('DIVE-9118','undo window e2e fixture','todo','high','dev','dev');"
+cmd_task_need DIVE-9118 --type=manual --urgent \
+  --ask="Approve the payment for the new box?" --from=dev >/dev/null 2>&1
+[[ "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-9118';")" == "" ]] \
+  && ok_t "9c precondition: the e2e gate is HUMAN-BOUND (routed_reviewer empty) — the write under test is the human-path one" \
+  || fail_t "9c drifted onto the ROUTED branch; this arm no longer grades need.sh's human-path write"
+[[ "$(db "SELECT COALESCE(gate_urgent,0) FROM tasks WHERE ident='DIVE-9118';")" == "1" ]] \
+  && ok_t "--urgent filed through the real cmd_task_need PERSISTS gate_urgent=1 on a human-bound gate" \
+  || fail_t "the human-path write is missing: --urgent did not reach the column, so the window will hold an urgent gate"
+w=$(_task_gate_undo_window_secs DIVE-9118)
+[[ "$w" == "0" ]] \
+  && ok_t "end to end: a gate FILED --urgent skips the window (write + read together, no SQL fixture)" \
+  || fail_t "filed --urgent still holds for ${w}s end to end"
+
+# NEGATIVE CONTROL for 9c: the same filing WITHOUT --urgent must leave the column
+# at 0 and the window standing. Without it, a write that hardcoded 1 reads green.
+reset
+db "INSERT INTO tasks (ident,title,status,priority,assignee,created_by)
+    VALUES ('DIVE-9119','undo window e2e control','todo','high','dev','dev');"
+cmd_task_need DIVE-9119 --type=manual \
+  --ask="Approve the payment for the new box?" --from=dev >/dev/null 2>&1
+[[ "$(db "SELECT COALESCE(gate_urgent,0) FROM tasks WHERE ident='DIVE-9119';")" == "0" ]] \
+  && ok_t "9c NEGATIVE: filing without --urgent leaves gate_urgent=0 — the write carries the flag, not a constant" \
+  || fail_t "gate_urgent was set without --urgent: the write is unconditional"
+w=$(_task_gate_undo_window_secs DIVE-9119)
+[[ "$w" != "0" && -n "$w" ]] \
+  && ok_t "9c NEGATIVE: the non-urgent e2e gate still holds (${w}s)" \
+  || fail_t "the non-urgent e2e gate yielded '${w}', expected a hold"
+
 # ── 10. THE OVERRIDE IS CLAMPED DOWNWARD: it may shorten the hold, never extend ─
 # The commit that shipped arm D called the duration "a sealed constant with no
 # write path", for the _GATE_HUMAN_CAPABILITIES reason: agents hold NOPASSWD:ALL,
@@ -332,8 +381,8 @@ w=$(_5DIVE_GATE_UNDO_WINDOW_SECS=30 _task_gate_undo_window_secs DIVE-9112)
 
 # ── 11. THE LONGER WINDOW IS TARGETED, AND THE CLAMP FOLLOWS THE TYPE ──────
 # manual/secret are human-only by definition, so for them the only question is
-# how long before the phone rings. Measured cost of 15m on that population: zero
-# gates lodar answered are delayed. Everything else keeps 120s.
+# how long before the phone rings. Measured cost on that population: zero gates
+# lodar answered are delayed at any candidate size. Everything else keeps 120s.
 for _t in manual secret; do
   reset; mkgate "DIVE-912${_t:0:1}" high
   db "UPDATE tasks SET need_type='$_t' WHERE ident='DIVE-912${_t:0:1}';"
@@ -358,15 +407,43 @@ w=$(_5DIVE_GATE_UNDO_WINDOW_SECS= _task_gate_undo_window_secs DIVE-9128)
 # on a manual gate would be knocked back to 120 — silently making the raise a no-op.
 reset; mkgate DIVE-9129 high
 db "UPDATE tasks SET need_type='manual' WHERE ident='DIVE-9129';"
-w=$(_5DIVE_GATE_UNDO_WINDOW_SECS=901 _task_gate_undo_window_secs DIVE-9129)
+w=$(_5DIVE_GATE_UNDO_WINDOW_SECS=$((_GATE_UNDO_WINDOW_SECS_HUMAN_ONLY+1)) _task_gate_undo_window_secs DIVE-9129)
 [[ "$w" == "$_GATE_UNDO_WINDOW_SECS_HUMAN_ONLY" ]] \
   && ok_t "one second over the manual ceiling is clamped to it (${w}s), not to the base" \
-  || fail_t "manual override 901 yielded ${w}s, expected $_GATE_UNDO_WINDOW_SECS_HUMAN_ONLY"
+  || fail_t "manual override ceiling+1 yielded ${w}s, expected $_GATE_UNDO_WINDOW_SECS_HUMAN_ONLY"
 reset; mkgate DIVE-9130 high
-w=$(_5DIVE_GATE_UNDO_WINDOW_SECS=900 _task_gate_undo_window_secs DIVE-9130)
+w=$(_5DIVE_GATE_UNDO_WINDOW_SECS=$_GATE_UNDO_WINDOW_SECS_HUMAN_ONLY _task_gate_undo_window_secs DIVE-9130)
 [[ "$w" == "$_GATE_UNDO_WINDOW_SECS" ]] \
   && ok_t "the long duration is NOT reachable on a decision gate (clamped to ${w}s) — no sideways mute" \
-  || fail_t "decision gate accepted a 900s override (${w}s): the raise reopened the mute hole"
+  || fail_t "decision gate accepted the long override (${w}s): the raise reopened the mute hole"
+
+
+# ── 11b. THE LONG CEILING MUST STAY UNDER THE HEARTBEAT'S RE-NAG ───────────
+# quinn's non-blocking finding on iteration 1, taken as a change because the
+# answer to "which contact do you intend" is load-bearing rather than cosmetic.
+#
+# The heartbeat re-nags a filed-but-unpinged gate at `gate_pinged_at IS NULL AND
+# need_asked_at <= now-15 minutes` (_HB_GATE_RENAG_WHERE). At a 900s ceiling that
+# predicate and the held ping become eligible in the SAME SECOND, so a
+# manual/secret gate's first contact could be the re-nag — the recovery path for
+# a ping lost to a dead box — instead of the normal buttoned ping. The intent is
+# that the re-nag stays a net, never the first contact on a healthy box.
+#
+# GRADED STRUCTURALLY, against the heartbeat's own literal parsed out of the
+# source, not against a number copied into this file. A copied 900 here would go
+# on passing after someone raised either side, which is the whole failure mode.
+_renag_min=$(sed -n "s/.*need_asked_at,updated_at,created_at) <= datetime('now','-\([0-9]\+\) minutes').*/\1/p" \
+               "$SRC/cmd_heartbeat.sh" | head -1)
+if [[ "$_renag_min" =~ ^[0-9]+$ ]]; then
+  ok_t "the heartbeat's re-nag eligibility was READ from cmd_heartbeat.sh (${_renag_min} minutes), not assumed"
+  if (( _GATE_UNDO_WINDOW_SECS_HUMAN_ONLY < _renag_min * 60 )); then
+    ok_t "the long ceiling (${_GATE_UNDO_WINDOW_SECS_HUMAN_ONLY}s) stays strictly under the re-nag ($((_renag_min*60))s) — the buttoned ping is the FIRST contact, the re-nag is the net"
+  else
+    fail_t "the long ceiling (${_GATE_UNDO_WINDOW_SECS_HUMAN_ONLY}s) reaches the re-nag ($((_renag_min*60))s): a manual/secret gate's first contact can be the recovery path, not the normal ping"
+  fi
+else
+  fail_t "could not read the re-nag threshold out of cmd_heartbeat.sh — this arm is vacuous, fix the parse rather than deleting it"
+fi
 
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

@@ -2039,15 +2039,28 @@ _GATE_UNDO_WINDOW_SECS=120
 #
 # **Zero cost at every size** — he answered 1 of the 38 type-default gates in the
 # window and it falls outside all of them — so this is priced on the take alone.
-# 15m doubles the 2m take (10 -> 20) and 30m adds one more, which is where it
-# flattens. A FLEET-WIDE 15m raise was the alternative and is strictly worse: 104
+# 14m nearly doubles the 2m take (10 -> 18) and 30m adds one more, which is where
+# it flattens; the 15m row is not taken, for the re-nag reason below. A FLEET-WIDE 15m raise was the alternative and is strictly worse: 104
 # removed but 12 gates he answered delayed. Targeted beats global here.
 #
 # Sealed like the base constant, and for the same reason (agents hold
 # NOPASSWD:ALL): no write path, and the env override is clamped against whichever
 # ceiling applies to THIS gate — see the clamp below, which would otherwise knock
-# a 900s type window straight back to 120 and silently make this a no-op.
-_GATE_UNDO_WINDOW_SECS_HUMAN_ONLY=900
+# a long type window straight back to 120 and silently make this a no-op.
+#
+# 840, NOT 900, AND THE 60s IS THE POINT (quinn, DIVE-4154 iteration 1). The
+# heartbeat re-nags a filed-unnotified gate at `gate_pinged_at IS NULL AND
+# need_asked_at <= now-15 minutes` (_HB_GATE_RENAG_WHERE, cmd_heartbeat.sh). At a
+# 900s ceiling the buttoned ping and the re-nag become eligible in the same
+# second, so a manual/secret gate's FIRST contact could be the recovery path
+# rather than the normal ping — and the re-nag is a plainer message. The intent
+# is the opposite: the re-nag stays what this page's own loss case calls it, the
+# net under a ping lost to a dead box, never the first contact on a healthy one.
+# Priced before changing it: exactly ONE manual/secret withdrawal in the 30 days
+# lands in (840s, 900s], so the margin costs one page of take (19 -> 18) and buys
+# back the whole ordering guarantee. Graded structurally, not by literal, in
+# gate_undo_window_unit arm 11b — a later raise past the re-nag reds there.
+_GATE_UNDO_WINDOW_SECS_HUMAN_ONLY=840
 
 # Seconds to hold this gate's phone ping. 0 = ping now.
 # Reads the row's priority, so it must be called AFTER the gate UPDATE commits —
