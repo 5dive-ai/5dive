@@ -175,7 +175,7 @@ fixture_actor fixture-runner
 # DIVE-2190: stdout only. This call can END the harness (cmd_* refusals go through fail()),
 # and `2>&1` sent the one line explaining WHY straight to /dev/null — the failure erased its
 # own reason. Redirect noise, never diagnosis.
-cmd_task_reject DIVE-505 --feedback='needs another pass' >/dev/null
+cmd_task_reject DIVE-505 --feedback='needs another pass FIX: name the concrete change' >/dev/null
 gate_open=$(db "SELECT CASE WHEN need_type IS NOT NULL AND need_answered_at IS NULL THEN 1 ELSE 0 END FROM tasks WHERE ident='DIVE-505';")
 answered_by=$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident='DIVE-505';")
 [[ "$gate_open" == "0" && "$answered_by" == "auto:reject" ]] \
@@ -194,7 +194,7 @@ db "INSERT INTO tasks(ident,title,status,created_by,assignee,verifier,maker_agen
       need_type,ask,need_answered_at)
     VALUES('DIVE-506','loop','blocked','dev','dev','main','dev',1,5,'manual','pending human thing',NULL);"
 fixture_actor dev
-rj_out=$(cmd_task_reject DIVE-506 --feedback='maker grading itself' 2>&1); rj_rc=$?
+rj_out=$(cmd_task_reject DIVE-506 --feedback='maker grading itself FIX: name the concrete change' 2>&1); rj_rc=$?
 fixture_actor fixture-runner
 [[ "$rj_rc" != "0" && "$rj_out" == *MAKER* ]] \
   && ok_t "maker impersonation is still refused (identity pin does not disarm DIVE-2112)" \

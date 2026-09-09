@@ -162,13 +162,18 @@ _task_status_cmd() {
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --result=*)     _prose_flag_dupe --result "$result_src"; result="${1#*=}"; want_result=1; result_src="--result" ;;
+      # DIVE-4144: _TASK_RAW_RESULT is the text AS SUPPLIED, captured before the
+      # DIVE-2483 result guard merges it with whatever the row already carried.
+      # The identical-redeliver guard cannot use the merged value; see
+      # _task_route_to_verifier for the measurement that forced this.
+      --result=*)     _prose_flag_dupe --result "$result_src"; result="${1#*=}"; want_result=1; result_src="--result"; _TASK_RAW_RESULT="$result" ;;
       # DIVE-2627: the result read VERBATIM from a file. `--result` is the widest
       # site in the class (32 call sites on origin/main @ 2e0e876) and it is the
       # permanent close record the dashboard and the task's creator read.
       --result-file=*) _prose_flag_dupe --result-file "$result_src"
                        _read_prose_file --result-file "${1#*=}"
-                       result="$_PROSE_FILE_VALUE"; want_result=1; result_src="--result-file" ;;
+                       result="$_PROSE_FILE_VALUE"; want_result=1; result_src="--result-file"
+                       _TASK_RAW_RESULT="$result" ;;   # DIVE-4144
       --notify)       notify=1 ;;
       --no-preflight) no_preflight=1 ;;
       --force-merge-gate) force_merge_gate=1 ;;  # DIVE-1835: audited escape from the mandatory auto-detect gate
@@ -193,6 +198,10 @@ _task_status_cmd() {
       # replace, and it is audited because it is the only lossy one.
       --append-result) append_result=1 ;;
       --force-result)  force_result=1 ;;
+      # DIVE-4144: see _task_route_to_verifier. Accepted on the close verbs
+      # because `task done` is the verb a maker actually re-delivers with.
+      --force-redeliver=*) _TASK_REDELIVER_FORCE_REASON="${1#*=}" ;;
+      --force-redeliver)   fail "$E_USAGE" "--force-redeliver needs a reason: --force-redeliver=\"<why the unchanged re-delivery is correct>\" (DIVE-4144)" ;;
       --)         shift; positional+=("$@"); break ;;
       -*)         fail "$E_USAGE" "unknown flag: $1" ;;
       *)          positional+=("$1") ;;
@@ -359,7 +368,7 @@ _task_status_cmd() {
           FROM tasks WHERE id=${id};")"
     if [[ -n "$_sd_vfier" && "$_sd_actor" != "cli" ]]; then
         policy_refuse "$E_CONFLICT" start-over-delivered-loop DIVE-2510 "$ident" \
-          "$ident is DELIVERED to verifier '${_sd_vfier}' (iteration ${_sd_iter}, maker '${_sd_maker}') and has NOT been graded — a 'task start' from '${_sd_actor}' would flip it to in_progress, so the board would show someone working a row that is actually sitting in '${_sd_vfier}''s review queue, and the delivered predicate (status='todo' AND assignee=verifier) would stop matching it. Nothing is yours to claim here until it comes back: '${_sd_vfier}' either closes it or bounces it with '5dive task reject $ident --feedback=...' — that bounce reassigns it to you and 'task start' works again. If you have a CORRECTION to the delivery, send it to '${_sd_vfier}' (5dive agent send ${_sd_vfier} \"...\") rather than taking the row back."
+          "$ident is DELIVERED to verifier '${_sd_vfier}' (iteration ${_sd_iter}, maker '${_sd_maker}') and has NOT been graded — a 'task start' from '${_sd_actor}' would flip it to in_progress, so the board would show someone working a row that is actually sitting in '${_sd_vfier}''s review queue, and the delivered predicate (status='todo' AND assignee=verifier) would stop matching it. Nothing is yours to claim here until it comes back: '${_sd_vfier}' either closes it or bounces it with '5dive task reject $ident --feedback="FINDING/FIX/VERIFY"' — that bounce reassigns it to you and 'task start' works again. If you have a CORRECTION to the delivery, send it to '${_sd_vfier}' (5dive agent send ${_sd_vfier} \"...\") rather than taking the row back."
     fi
   fi
   # DIVE-1375: fail-loud preflight — surface identity/auth/repo gaps at `start`
@@ -613,7 +622,7 @@ _task_status_cmd() {
       if [[ -n "$_maker" && "$_actor" != "$_vfier" && "$_actor" != "cli" \
             && "$_st" != "done" && "$_st" != "cancelled" ]]; then
         policy_refuse "$E_CONFLICT" done-over-delivered-loop DIVE-2007 "$ident" \
-          "$ident is DELIVERED to verifier '${_vfier}' (iteration ${_iter}, maker '${_maker}') and has NOT been graded — a 'task done' from '${_actor}' would close it ungraded, which is the maker grading its own work (writer != grader, DIVE-477). Only '${_vfier}' can grade it. To CORRECT the result text do NOT re-run done: send the correction to '${_vfier}' (5dive agent send ${_vfier} \"...\") and let them fold it in. Real exits: '5dive task reject $ident --feedback=...' (verifier bounces it back), '5dive task verify $ident --no-done --cmd=\"<acceptance test>\"' (record machine evidence and hold at graded->merge), or '5dive task cancel $ident --result=...' (abandon)."
+          "$ident is DELIVERED to verifier '${_vfier}' (iteration ${_iter}, maker '${_maker}') and has NOT been graded — a 'task done' from '${_actor}' would close it ungraded, which is the maker grading its own work (writer != grader, DIVE-477). Only '${_vfier}' can grade it. To CORRECT the result text do NOT re-run done: send the correction to '${_vfier}' (5dive agent send ${_vfier} \"...\") and let them fold it in. Real exits: '5dive task reject $ident --feedback="FINDING/FIX/VERIFY"' (verifier bounces it back), '5dive task verify $ident --no-done --cmd=\"<acceptance test>\"' (record machine evidence and hold at graded->merge), or '5dive task cancel $ident --result=...' (abandon)."
       fi
     fi
   fi
