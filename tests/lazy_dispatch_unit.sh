@@ -508,11 +508,16 @@ if [[ "$SLID" -lt 5 ]]; then
         "it removed $SLID lines; with no slide this arm proves nothing."
 else
   ok_t "the rewrite slides every payload offset by $SLID lines (control)"
-  if RW_OUT="$("$REWRITTEN" task ls --json 2>&1)" && [[ "$RW_OUT" == *"["* ]]; then
-    ok_t "a rewritten bundle still loads its modules (the frame check caught the slide)"
+  # Graded against the PRISTINE bundle's own answer, not against a literal: this
+  # arm is about the loader recovering, and a runner with no task store must not
+  # be able to red it (or green it) for a reason that is not the loader's.
+  RW_RC=0; RW_OUT="$("$REWRITTEN" task ls --json 2>&1)" || RW_RC=$?
+  OK_RC=0; OK_OUT="$("$BUNDLE" task ls --json 2>&1)"     || OK_RC=$?
+  if [[ "$RW_RC" == "$OK_RC" && "$RW_OUT" == "$OK_OUT" ]]; then
+    ok_t "a rewritten bundle answers identically to the pristine one (the frame fallback recovered)"
   else
     bad_t "a rewritten bundle still loads its modules" \
-          "the offsets slid by $SLID and the frame fallback did not recover: ${RW_OUT:0:200}"
+          "the offsets slid by $SLID and the frame fallback did not recover: rc $RW_RC vs $OK_RC, out ${RW_OUT:0:160}"
   fi
 fi
 
