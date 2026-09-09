@@ -32,7 +32,7 @@ harness() {
 agent_type(){ printf '%s' "$want_type"; }
 sudo(){ :; }
 $(sed -n '/^_agent_pane_input_ready()/,/^}/p'                      "$SRC/src/cmd_agent_runtime.sh")
-$(sed -n '/^declare -A _AGENT_PROMPT_DETECTABLE=(/,/^)/p'          "$SRC/src/cmd_agent_runtime.sh")
+$(sed -n '/^declare -g\?A _AGENT_PROMPT_DETECTABLE=(/,/^)/p'          "$SRC/src/cmd_agent_runtime.sh")
 $(sed -n '/^agent_prompt_detectable()/,/^}/p'                      "$SRC/src/cmd_agent_runtime.sh")
 $(sed -n '/^wait_agent_input_ready()/,/^}/p'                       "$SRC/src/cmd_agent_runtime.sh")
 SH
@@ -51,7 +51,7 @@ harness_without_predicate() {
 agent_type(){ printf '%s' "$want_type"; }
 sudo(){ :; }
 $(sed -n '/^_agent_pane_input_ready()/,/^}/p'                      "$SRC/src/cmd_agent_runtime.sh")
-$(sed -n '/^declare -A _AGENT_PROMPT_DETECTABLE=(/,/^)/p'          "$SRC/src/cmd_agent_runtime.sh")
+$(sed -n '/^declare -g\?A _AGENT_PROMPT_DETECTABLE=(/,/^)/p'          "$SRC/src/cmd_agent_runtime.sh")
 $(sed -n '/^wait_agent_input_ready()/,/^}/p'                       "$SRC/src/cmd_agent_runtime.sh")
 SH
 }
@@ -82,7 +82,7 @@ el=$(( $(date +%s) - start ))
 
 echo "== 4. STRUCTURAL: the set and the marker predicate agree =="
 pred=$(sed -n '/^_agent_pane_input_ready()/,/^}/p' "$SRC/src/cmd_agent_runtime.sh")
-set_types=$(sed -n '/^declare -A _AGENT_PROMPT_DETECTABLE=(/,/^)/p' "$SRC/src/cmd_agent_runtime.sh" | grep -oE '\[[a-z]+\]' | tr -d '[]')
+set_types=$(sed -n '/^declare -g\?A _AGENT_PROMPT_DETECTABLE=(/,/^)/p' "$SRC/src/cmd_agent_runtime.sh" | grep -oE '\[[a-z]+\]' | tr -d '[]')
 for t in $set_types; do
   case "$t" in
     claude)      grep -q '❯'              <<<"$pred" && ok "claude marker present"      || no "claude in set, no marker" ;;
@@ -93,7 +93,7 @@ for t in $set_types; do
     *)           no "'$t' is in the detectable set with no asserted marker" ;;
   esac
 done
-grep -qE '\[opencode\]|\[pi\]|\[hermes\]|\[openclaw\]' <<<"$(sed -n '/^declare -A _AGENT_PROMPT_DETECTABLE=(/,/^)/p' "$SRC/src/cmd_agent_runtime.sh")" \
+grep -qE '\[opencode\]|\[pi\]|\[hermes\]|\[openclaw\]' <<<"$(sed -n '/^declare -g\?A _AGENT_PROMPT_DETECTABLE=(/,/^)/p' "$SRC/src/cmd_agent_runtime.sh")" \
   && no "a markerless type is listed as detectable" || ok "no markerless type claims detectability"
 
 

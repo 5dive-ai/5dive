@@ -44,14 +44,15 @@ on:
     branches: [main]
 
 jobs:
-  # DIVE-3315: TWO INDEPENDENTLY-CAPPED SHARDS, not a bigger number. lodar's 300s
-  # stands; the core corpus does not fit under it any more. Measured on main
+  # DIVE-3315: INDEPENDENTLY-CAPPED SHARDS, not a bigger number. lodar's 300s
+  # stands; the core corpus does not fit under it any more. (Two when this was written;
+  # THREE since DIVE-4147 — the gate and the measurement are the block below.) Measured on main
   # 2026-08-11/12: 313s pristine against a 312s effective cap, with ~6% runner spread
   # and the mutation-harness lever exhausted at ~7s available against ~13s needed
   # (olivia's by-construction census, DIVE-3313). A cap breached by 1s on the draw of a
   # runner presents as a flaky test and is not one.
   #
-  # The cap is PER JOB (tests/lib/tier.sh), so two shards of ~157s each sit near 52% of
+  # The cap is PER JOB (tests/lib/tier.sh), so N shards of total/N each sit well under
   # the SAME 300s — the constraint is not relaxed, the corpus is split. Raising 300 to
   # fit today's number would green the instrument instead of the thing it measures, and
   # is explicitly out of scope on this row's parents.
@@ -59,9 +60,28 @@ jobs:
   # `${{ strategy.job-total }}` rather than a literal 2, for the reason full-sweep.yml
   # gives: the shard count is the matrix length, spelled once, so adding a shard cannot
   # leave the runner splitting the corpus a different number of ways than the matrix
-  # runs it. AGGREGATE capacity is now 2 x 300s and N is fixed here — adding a third
-  # shard is exactly as visible, and exactly as much a policy decision, as raising the
-  # number would have been.
+  # runs it. AGGREGATE capacity is N x 300s and N is fixed here — adding a shard is
+  # exactly as visible, and exactly as much a policy decision, as raising the number
+  # would have been. `tests/corpus_tier_budget_unit.sh` arm 98 is what makes that true
+  # rather than asserted: N is pinned there, so this line alone cannot move it.
+  #
+  # DIVE-4147: N = 3, decided at a tier-1 human gate on 2026-09-09 ("Split three ways —
+  # every test still runs on every change"), the alternative on the ask being to demote
+  # the slowest twenty harnesses to nightly. Measured cause: the core corpus is 650.4s
+  # over 394 harnesses (mean 1.65s), re-summed from the four shard reports of run
+  # 34314863243 — so TWO shards is 325s/327s against the 300s cap and main itself could
+  # not merge, with `budget_attribution=corpus`, `new_files=0` and
+  # `over-at-baseline-prices` on a shard carrying no new harness at all. The paydown
+  # ladder on that row was measured incapable: per-harness fixed cost is <=0.05s, so
+  # folding 394 files into 200 recovers <=4s against the 110s needed, and the cost is
+  # concentrated in ~20 harnesses that are all real work (top 15 = 160.6s, 25%).
+  # Three shards is 650.4/3 = ~217s per shard, 28% margin, no harness removed, no cap
+  # raised, no ruleset edit. WHAT IT DOES NOT DO: the corpus is still 650s and still
+  # growing, and it costs 2 more leaf jobs x their own runner queue (5.6-7.5 min each,
+  # in parallel, so wall clock is roughly flat and runner-minutes go up). This makes
+  # merges LAND; it does not make CI faster. The growth signal that sharding cannot
+  # launder is `core_us_per_harness` against a fixed reference (DIVE-3477), reading
+  # pct_of_ref=160 pristine / 141 installed-host on that run.
   #
   # AND THE UN-SHARDED TOTAL IS STILL PRINTED, by `core-budget-report` below: sharding
   # is the obvious way to lose the number this whole scheme exists to surface. Two jobs
@@ -86,7 +106,7 @@ jobs:
       # un-sharded total is re-summed from the shards' reports, and a cancelled shard
       # is a hole in exactly the number this row exists to keep legible.
       fail-fast: false
-      matrix: { shard: [1, 2] }
+      matrix: { shard: [1, 2, 3] }
     steps:
       # DIVE-2229: fetch-depth is load-bearing, not hygiene. actions/checkout@v4
       # defaults to depth 1, and the harnesses below anchor "what this code did
@@ -412,7 +432,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix: { shard: [1, 2] }
+      matrix: { shard: [1, 2, 3] }
     steps:
       # DIVE-2229: full history — pinned baselines must resolve here too.
       - uses: actions/checkout@v4
@@ -748,9 +768,10 @@ jobs:
   #
   # THE REPORTS ARE NAMED, NOT GLOBBED, and one job per environment: a shard that died
   # has to red this rather than quietly reduce the union it is checked against, and a
-  # pass in one environment must not cover for the other going ungraded. A third shard
-  # added without extending this list reds it too (the file it owns would be absent from
-  # the union) — the fail-closed direction.
+  # pass in one environment must not cover for the other going ungraded. A shard added
+  # without extending this list reds it too (the file it owns would be absent from
+  # the union) — the fail-closed direction. DIVE-4147 extended it to three; it is the
+  # one place in this file a shard-count change is not spelled once, by design.
   acp-graded-pristine:
     runs-on: ubuntu-latest
     needs: core-pristine
@@ -763,7 +784,7 @@ jobs:
       - name: The ACP server must have been GRADED (pristine)
         run: |
           bash tests/meta/harness-graded-union.sh --harness=acp_stdio_unit.sh --min-ms=1000 \
-            core-pristine-1.txt core-pristine-2.txt
+            core-pristine-1.txt core-pristine-2.txt core-pristine-3.txt
 
   acp-graded-installed:
     runs-on: ubuntu-latest
@@ -777,7 +798,7 @@ jobs:
       - name: The ACP server must have been GRADED (installed host)
         run: |
           bash tests/meta/harness-graded-union.sh --harness=acp_stdio_unit.sh --min-ms=1000 \
-            core-installed-1.txt core-installed-2.txt
+            core-installed-1.txt core-installed-2.txt core-installed-3.txt
 
   # DIVE-3315: THE FOUR REQUIRED CHECKS, kept by NAME. `test`, `test-installed-host`,
   # `test-confirm` and `test-installed-host-confirm` are required status checks on main.

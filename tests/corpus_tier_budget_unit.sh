@@ -1710,7 +1710,10 @@ if len(summ) == 1:
         ' | '.join(problems))
 
 # 98 — THE SHARD COUNT IS A PINNED NUMBER, NOT A SENTENCE. Found by codex grading this
-# row's own PR: changing BOTH core matrices from [1, 2] to [1, 2, 3] passes 142/0. Every
+# row's own PR: changing BOTH core matrices from [1, 2] to [1, 2, 3] passes 142/0.
+# (N is 3 as of DIVE-4147 — see the note on CORE_SHARDS below. Read every `[1, 2, 3]`
+# in this header as "one more shard than is pinned"; the arm is about N moving in the
+# workflow alone, whatever N is.) Every
 # arm above stays green because every one of them is about the shape of the split and not
 # its SIZE — 94 asks that a divisor be taken from the matrix length and is happier the
 # longer the matrix gets, 95/96/97 are about the total being printed and ungated, and 92/93
@@ -1778,7 +1781,19 @@ if len(summ) == 1:
 # `strategy.job-total` stays the runner's divisor throughout: arm 94 requires it and this
 # arm deliberately does not introduce a literal 2 into the workflow to satisfy itself. The
 # matrix stays the single source of N; this file is the single source of what N may BE.
-CORE_SHARDS = 2
+#
+# DIVE-4147 MOVED THIS LINE FROM 2 TO 3, and it came back as a gate exactly as this arm
+# requires: a tier-1 human decision on 2026-09-09 ("Split three ways — every test still
+# runs on every change"). The cause was measured, not felt — the core corpus is 650.4s
+# over 394 harnesses (run 34314863243, re-summed from the four shard reports), so two
+# shards read 325s/327s against the 300s cap and MAIN ITSELF could not merge, with the
+# rail's own attribution saying `corpus` / `over-at-baseline-prices` / `new_files=0`.
+# The alternative on the ask was demoting the slowest ~20 harnesses to nightly, i.e.
+# taking real guards off the per-PR path because they are expensive; the gate declined
+# it. Three shards is ~217s per shard, 28% margin, no harness removed, no cap raised.
+# TIER_BUDGET_CORE, TIER_CAL_SCALE_MAX_PCT and TIER_CAL_BASELINE_US are all untouched by
+# that change, as they were by this arm's own commit.
+CORE_SHARDS = 3
 # One corpus job per environment (pristine, installed-host) and one confirm job per
 # environment. Both are counts of JOBS, and both are capacity: another corpus job is
 # another 300s cap, and another confirm job is another box re-running a shard.

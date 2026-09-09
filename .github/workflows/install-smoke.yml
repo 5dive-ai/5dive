@@ -40,6 +40,9 @@ on:
       - 'skills/**'
       - 'systemd/**'
       - 'docker/Dockerfile'
+      - 'plugins/**'
+      - 'team-templates/**'
+      - 'scripts/install-contract.sh'
       - 'projects-CLAUDE.md'
       - 'telegram-agent-CLAUDE.md'
       - '.github/workflows/install-smoke.yml'
@@ -269,3 +272,51 @@ jobs:
           chmod +x /tmp/launcher-arm.sh
           docker run --rm -v /tmp/launcher-arm.sh:/arm.sh:ro \
             --entrypoint /bin/bash 5dive-smoke /arm.sh
+
+  # DIVE-4141 — the INSTALL CONTRACT, in its OWN job, deliberately.
+  #
+  # It belongs to `docker-install` by subject and MUST NOT live in it: that job
+  # is a REQUIRED status check on main (see the note at the top of this file),
+  # and this contract is RED on main today by design — the browser plugin
+  # cannot be installed (DIVE-4126, `unknown grant 'browser-profiles'`), which
+  # is the whole reason the check exists. Adding a red arm to a required
+  # context makes every PR unmergeable until that fix lands, which is the
+  # DIVE-2141 failure mode in a new costume: a gate that blocks everything gets
+  # bypassed, and then it is not a gate.
+  #
+  # So it ships ADVISORY. Sequence: DIVE-4126 merges -> this job goes green ->
+  # DIVE-4135 adds it to the required-contexts list. Until then a red here is a
+  # signal to read, and the ONE arm that is red names its own ticket.
+  #
+  # It pays for its own `docker build` rather than sharing docker-install's:
+  # jobs do not share a daemon, and passing the image through an artifact costs
+  # more wall-clock than rebuilding it on a warm apt mirror (~90s). The
+  # duplication buys the decoupling above, which is the point.
+  install-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image (runs install.sh against fresh ubuntu:22.04)
+        run: |
+          ./build.sh
+          docker build -f docker/Dockerfile -t 5dive-contract .
+      # Everything docker-install asserts is that the bundle lays down and
+      # reports a version. Nothing there ever installed a bundled plugin,
+      # resolved a team template, or asked a verb for its usage — so v0.28.0
+      # shipped the browser plugin uninstallable (DIVE-4126) and the
+      # `distribution` template unstaged (#808) with that job green. Both
+      # defects are "the artifact exists and does not install/run", and only a
+      # fresh-box exercise sees them.
+      #
+      # The two manifests are mounted from the CHECKOUT, not read out of the
+      # installed tree: the repo's marketplace.json and team-templates/index.json
+      # are the source of truth, so a plugin or slug that install.sh forgot to
+      # stage is still enumerated and reports as missing. Read the installed
+      # copies instead and install.sh becomes its own examiner.
+      - name: Plugins install, templates resolve, verbs answer --help
+        run: |
+          docker run --rm \
+            -v "$PWD/scripts/install-contract.sh:/contract.sh:ro" \
+            -v "$PWD/plugins/.claude-plugin/marketplace.json:/manifests/marketplace.json:ro" \
+            -v "$PWD/team-templates/index.json:/manifests/team-index.json:ro" \
+            --entrypoint /bin/bash 5dive-contract /contract.sh

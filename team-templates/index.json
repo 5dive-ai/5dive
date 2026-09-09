@@ -21,6 +21,19 @@
       ]
     },
     {
+      "slug": "deploy-team",
+      "name": "Deploy Team",
+      "description": "Ships code on GitHub end to end: CTO, Ops, Engineer and Verifier, wired to the delivery rail — the maker opens the PR, the verifier grades it, ops merges.",
+      "size": 4,
+      "requires": ["github_push"],
+      "roster": [
+        { "key": "marcus", "role": "CTO", "model": "opus", "reports_to": null },
+        { "key": "anton", "role": "DevOps and Delivery", "model": "opus", "reports_to": "marcus" },
+        { "key": "dario", "role": "Engineer", "model": "opus", "reports_to": "anton" },
+        { "key": "vesper", "role": "Verifier / QA", "model": "opus", "reports_to": "anton" }
+      ]
+    },
+    {
       "slug": "startup",
       "name": "Lean SaaS startup",
       "description": "Founding team: CEO + CMO + DevOps + Competitor Researcher + Creative",
