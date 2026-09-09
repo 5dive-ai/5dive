@@ -208,13 +208,23 @@ jobs:
           # can never disagree about what is in the cut.
           _range="${incumbent:+${incumbent}..}HEAD"
           _subjects=$(git log --no-merges --format='%h %s' "$_range" 2>/dev/null) || _subjects=""
-          _forced_by=$(grep -E '^[0-9a-f]+ [a-z]+(\([^)]*\))?!:' <<<"$_subjects" | head -3)
+          # NO-MATCH IS THE NORMAL ANSWER, AND UNDER THE RUNNER'S SHELL IT KILLS THE STEP.
+          # These three greps ask "is there a commit of this kind?" and the healthy answer
+          # is usually "no" — grep then exits 1, `set -o pipefail` (set at the top of this
+          # step) promotes that to the pipeline's status, and the runner's DEFAULT shell is
+          # `bash -e {0}`, so the assignment aborts the whole step with NO message at all.
+          # That is exactly what run 34345097999 did on 2026-09-09: it printed the incumbent
+          # line and exited 1 silently, with no ::error:: annotation to read (DIVE-4153).
+          # The comment further down claiming this step does not run under `set -e` is about
+          # what this block SETS, not what the runner INVOKES; -e has always been on.
+          # So every one of these must swallow the no-match exit explicitly.
+          _forced_by=$(grep -E '^[0-9a-f]+ [a-z]+(\([^)]*\))?!:' <<<"$_subjects" | head -3) || _forced_by=""
           if [[ -n "$_forced_by" ]]; then
             _derived=major
           elif git log --no-merges --format='%B' "$_range" 2>/dev/null | grep -q '^BREAKING CHANGE'; then
             _derived=major; _forced_by="a BREAKING CHANGE trailer in ${_range}"
           else
-            _forced_by=$(grep -E '^[0-9a-f]+ feat(\([^)]*\))?:' <<<"$_subjects" | head -3)
+            _forced_by=$(grep -E '^[0-9a-f]+ feat(\([^)]*\))?:' <<<"$_subjects" | head -3) || _forced_by=""
             if [[ -n "$_forced_by" ]]; then _derived=minor; else _derived="patch"; fi
           fi
 
@@ -232,7 +242,7 @@ jobs:
             git merge-base --is-ancestor "$_lint_epoch" "${incumbent:-HEAD}" 2>/dev/null \
               || _enforce="${_lint_epoch}..HEAD"
             _untyped=$(git log --no-merges --format='%h %s' "$_enforce" 2>/dev/null \
-              | grep -vE '^[0-9a-f]+ (feat|fix|test|chore|docs|refactor|ci|perf)(\([^)]*\))?!?: ' | head -5)
+              | grep -vE '^[0-9a-f]+ (feat|fix|test|chore|docs|refactor|ci|perf)(\([^)]*\))?!?: ' | head -5) || _untyped=""
           fi
           if [[ -n "$_untyped" ]]; then
             echo "::error::commits since ${incumbent:-<root>} carry no conventional type, so this cut cannot tell whether it contains a feature (DIVE-4086). The PR-title lint should have made this unreachable. Correct the offending subject in the branch being cut, then retry; changing RELEASE_LEVEL or dispatching manually cannot bypass this refusal:"

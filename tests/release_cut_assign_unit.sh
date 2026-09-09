@@ -47,6 +47,15 @@ run_block(){
     for t in "$@"; do git tag "$t"; done
   ) >/dev/null 2>&1
   ( cd "$d"
+    # GRADE THE SHELL THE RUNNER USES, NOT THE ONE THIS FILE HAPPENS TO BE IN.
+    # Extracting the bytes verbatim (the whole point of the fence) still grades a
+    # DIFFERENT PROGRAM if the options differ: a shell program is bytes PLUS options.
+    # GitHub invokes a `run:` step as `bash -e {0}`, so -e is on before the step's own
+    # `set -uo pipefail` is read. Without this `set -e` the harness ran the block under
+    # -u -o pipefail only, and every arm below passed while the shipped step aborted
+    # silently on the first `grep` that legitimately matched nothing (DIVE-4153,
+    # run 34345097999). Removing it re-opens that blind spot; keep it in BOTH helpers.
+    set -e
     incumbent=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
     eval "$BLOCK"
     # Emit the derivation so an arm can assert the NUMBER, not just the exit code.
@@ -285,6 +294,7 @@ run_range(){
     for subj in "$@"; do git commit -q --allow-empty -m "$subj"; done
   ) >/dev/null 2>&1
   ( cd "$d"
+    set -e   # the runner is `bash -e {0}` — see run_block (DIVE-4153)
     incumbent=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
     eval "$BLOCK"
     printf 'DERIVED=%s\n' "${tag:-<unset>}"
