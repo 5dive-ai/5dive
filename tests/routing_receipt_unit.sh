@@ -319,7 +319,10 @@ echo "── W: wiring — the lib is SHIPPED, and every routing verb calls it �
 # where the file exists and the installed CLI never loads it. build.sh is an
 # explicit manifest, not a glob: a new lib that is not listed is silently absent
 # from the artifact customers install.
-grep -q '^  src/lib/routing_receipt.sh \\$' build.sh \
+# DIVE-4087 split the manifest into CORE_FILES=( ... ) / LAZY_FILES=( ... ):
+# indented path per line, no trailing backslash. Same claim as before — the file
+# is listed, so it reaches the artifact customers install.
+grep -qE '^[[:space:]]+src/lib/routing_receipt\.sh$' build.sh \
   && ok_t "build.sh manifest ships src/lib/routing_receipt.sh" \
   || bad_t "routing_receipt.sh is not in the build manifest — the shipped CLI would not have it"
 
