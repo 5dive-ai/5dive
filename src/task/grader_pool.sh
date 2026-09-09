@@ -145,3 +145,110 @@ _grader_checkpoint() {  # <ident> <arm> <verdict> <graded-sha>
   ledger_emit task.grade.checkpoint ident="$ident" actor="$(task_actor "")" \
     detail="arm=${arm} verdict=${verdict:-unknown} sha=${sha:-unknown}"
 }
+
+# `5dive task grader-replay [--days=N] [--cap=N] [--json]` — DIVE-4164 deliverable 2.
+#
+# Replays the real delivery history through the spawner's ARITHMETIC and reports
+# what it would have done: grades per day, peak concurrent graders, and how much
+# would have queued at a given cap. Read-only and dry-run BY CONSTRUCTION — it
+# reads lifecycle_events and prints; it holds no spawn path at all, which is why
+# it is safe to point at production history.
+#
+# WHAT IT CANNOT DO, said plainly rather than left for a reader to discover: the
+# usage meter is a CURRENT reading with no history, so this cannot replay the
+# floor. It replays ARRIVALS against a cap. "How often would the floor have
+# queued us" is not answerable from any data we keep, and pretending otherwise by
+# applying today's percentages to last week's deliveries would produce a
+# confident number that means nothing.
+#
+# Pairing: each `task.delivered` is matched to the next `task.done`/`task.rejected`
+# for the same ident. Deliveries older than the window are excluded, so every
+# figure is a LOWER bound — the honest direction for a capacity argument.
+cmd_task_grader_replay() {
+  # --json may already have been consumed by the global pre-parser (main.sh
+  # sets JSON_MODE), so seed from it rather than assuming the flag reaches here.
+  local days=7 cap="$_GRADER_MAX_PER_ACCOUNT" json="${JSON_MODE:-0}" svc=""
+  while (( $# )); do
+    case "$1" in
+      --days=*) days="${1#--days=}" ;;
+      --cap=*)  cap="${1#--cap=}" ;;
+      --service-cap=*) svc="${1#--service-cap=}" ;;
+      --json)   JSON_MODE=1; json=1 ;;
+      *) fail "$E_USAGE" "usage: 5dive task grader-replay [--days=N] [--cap=N] [--json]" ;;
+    esac; shift
+  done
+  [[ "$days" =~ ^[0-9]+$ && "$cap" =~ ^[0-9]+$ ]] \
+    || fail "$E_VALIDATION" "--days and --cap take whole numbers"
+  [[ -z "$svc" || "$svc" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+    || fail "$E_VALIDATION" "--service-cap takes hours (e.g. 1 or 0.5)"
+  local rows
+  rows=$(db "SELECT ts||'|'||kind||'|'||COALESCE(ident,'')
+               FROM lifecycle_events
+              WHERE kind IN ('task.delivered','task.done','task.rejected')
+                AND ts >= datetime('now','-${days} days')
+              ORDER BY ts, id;")
+  printf '%s\n' "$rows" | python3 -c '
+import sys, datetime as dt, json as J
+cap=int(sys.argv[1]); days=int(sys.argv[2]); want_json=sys.argv[3]=="1"
+svc=float(sys.argv[4]) if len(sys.argv)>4 and sys.argv[4] else None
+ev=[]
+for line in sys.stdin:
+    p=line.rstrip("\n").split("|")
+    if len(p)<3 or not p[0]: continue
+    try: ev.append((dt.datetime.fromisoformat(p[0]), p[1], p[2]))
+    except ValueError: continue
+openq={}; spans=[]; perday={}
+for ts,kind,ident in ev:
+    if kind=="task.delivered":
+        perday[ts.date().isoformat()]=perday.get(ts.date().isoformat(),0)+1
+        openq.setdefault(ident, ts)
+    else:
+        t0=openq.pop(ident,None)
+        if t0 is not None: spans.append((t0,ts))
+lat=sorted((b-a).total_seconds()/3600 for a,b in spans)
+# THE HISTORICAL SERVICE TIME INHERITS THE DISEASE THIS DESIGN REMOVES: the p90
+# tail is a row waiting on a standing seats wake cadence, not grading. Replaying
+# it unmodified therefore OVER-estimates the pool a fast ephemeral grader needs.
+# --service-cap=H answers "what if every grade finished within H hours" instead.
+if svc is not None:
+    spans=[(a, min(b, a+dt.timedelta(hours=svc))) for a,b in spans]
+def q(v,p):
+    if not v: return None
+    return round(v[min(len(v)-1,int(round(p*(len(v)-1))))],2)
+marks=[]
+for a,b in spans: marks.append((a,1)); marks.append((b,-1))
+for t0 in openq.values(): marks.append((t0,1))
+marks.sort()
+cur=peak=0
+for t,d in marks:
+    cur+=d; peak=max(peak,cur)
+# queueing at the cap: a delivery arriving with cap graders busy waits.
+busy=[]; queued=0; maxq=0
+for a,b in sorted(spans):
+    busy=[x for x in busy if x>a]
+    if len(busy)>=cap:
+        queued+=1; maxq=max(maxq,len(busy)-cap+1)
+        busy.sort(); start=busy[0]
+    else: start=a
+    busy.append(max(b,start))
+out={"windowDays":days,"deliveries":sum(perday.values()),
+     "perDay":dict(sorted(perday.items())),"resolved":len(spans),
+     "stillOutstanding":len(openq),
+     "latencyHoursP50":q(lat,.5),"latencyHoursP90":q(lat,.9),
+     "latencyHoursMax":round(lat[-1],1) if lat else None,
+     "peakConcurrentGraders":peak,"cap":cap,
+     "wouldQueueAtCap":queued,"maxQueueDepth":maxq,"serviceCapHours":svc}
+if want_json: print(J.dumps(out,indent=2)); raise SystemExit
+nd=out["deliveries"]; nr=out["resolved"]; no=out["stillOutstanding"]
+p50=out["latencyHoursP50"]; p90=out["latencyHoursP90"]; pmx=out["latencyHoursMax"]
+print(f"deliveries in {days}d : {nd}  (resolved {nr}, still outstanding {no})")
+for d,n in out["perDay"].items(): print(f"  {d}  {n}")
+print(f"grade latency h      : p50={p50} p90={p90} max={pmx}")
+print(f"peak concurrent      : {peak} graders")
+print(f"at cap={cap}          : {queued} deliveries would queue, max depth {maxq}")
+if svc is not None:
+    print(f"service time CAPPED at {svc}h — modelling a fast ephemeral grader, not the seats we run today")
+print("NOTE: arrivals replayed against the cap. The usage meter keeps no history,")
+print("      so the spawn FLOOR is not replayable and is not modelled here.")
+' "$cap" "$days" "$json" "$svc"
+}
