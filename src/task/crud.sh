@@ -718,7 +718,7 @@ cmd_task_ls() {
     # regression test asserts against (tests/task_reject_trace_unit.sh, arm C).
     # NB: no inline SQL `--` comments in this string —
     # dbfmt flattens newlines, so a `--` would comment out the rest of the query.
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, need_answered_relay, need_answered_tap_uid, tier, gate_mode, kind, schedule, last_fired_at, last_skipped_at, on_overlap, overlap_bound, parked_at, park_reason, wake_at, project_key, maker_agent, verifier,
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, merge_owner, merge_hold_reason, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, need_answered_relay, need_answered_tap_uid, tier, gate_mode, kind, schedule, last_fired_at, last_skipped_at, on_overlap, overlap_bound, parked_at, park_reason, wake_at, project_key, maker_agent, verifier,
              CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
                   THEN CASE WHEN handoff_ack_at IS NOT NULL THEN 'reviewing' ELSE 'delivered' END
                   ELSE NULL END AS handoff_state,
@@ -775,7 +775,7 @@ cmd_task_ls() {
       # detail would get the LESS accurate answer.
       dbfmt -box "SELECT ident,
              CASE WHEN ${_TASKS_TFV_SQL}
-                  THEN 'graded->merge:'||COALESCE(NULLIF(maker_agent,''), COALESCE(assignee,'?'))
+                  THEN 'graded->merge:'||COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''), COALESCE(assignee,'?'))
                   ELSE status END AS status,
              ${_gate_cell} AS gate,
              priority, COALESCE(assignee,'-') AS assignee, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, title FROM tasks WHERE ${where} ${order};"
@@ -786,7 +786,7 @@ cmd_task_ls() {
       # cell rather than a new column so the compact board stays compact.
       dbfmt -box "SELECT ident,
              CASE WHEN ${_TASKS_TFV_SQL}
-                  THEN 'graded->merge:'||COALESCE(NULLIF(maker_agent,''), COALESCE(assignee,'?'))
+                  THEN 'graded->merge:'||COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''), COALESCE(assignee,'?'))
                   ELSE status END AS status,
              ${_gate_cell} AS gate,
              priority, COALESCE(assignee,'-') AS assignee, title FROM tasks WHERE ${where} ${order};"
@@ -875,9 +875,9 @@ cmd_task_show() {
     # "never started" FROM THE BOARD ALONE. A fix that records the first start but
     # does not surface it here does not satisfy that.
     if (( no_body )); then
-      dbfmt -line "SELECT ident, title, status, ${_gate_hdr} AS gate, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref FROM tasks WHERE id=${id};"
+      dbfmt -line "SELECT ident, title, status, ${_gate_hdr} AS gate, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, CASE WHEN COALESCE(merge_owner,'')='' THEN '-' ELSE merge_owner||' ('||COALESCE(NULLIF(merge_hold_reason,''),'no reason recorded')||')' END AS merge_owner FROM tasks WHERE id=${id};"
     else
-      dbfmt -line "SELECT ident, title, status, ${_gate_hdr} AS gate, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, body, result FROM tasks WHERE id=${id};"
+      dbfmt -line "SELECT ident, title, status, ${_gate_hdr} AS gate, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, CASE WHEN COALESCE(merge_owner,'')='' THEN '-' ELSE merge_owner||' ('||COALESCE(NULLIF(merge_hold_reason,''),'no reason recorded')||')' END AS merge_owner, body, result FROM tasks WHERE id=${id};"
     fi
     # DIVE-1064: surface the creator's isolation tier (read-time from the
     # registry, no schema change) so a reader/agent can down-trust a task filed

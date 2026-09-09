@@ -1039,6 +1039,168 @@ _task_merge_standing_sql() {
   printf '%s' "${_TASKS_TFV_SQL} AND graded_by = $(sqlq "${1:-}")"
 }
 
+# ── DIVE-4137 — the DISPOSITION of a graded pull request at the verifier's close ─
+#
+# THE DEFECT, measured by main 2026-09-09 (lodar, Telegram 04:22Z: "10 PRs and 21
+# branches on the 5dive-ai/5dive — i think something is wrong with our merging to
+# main or we forgetting to merge"). Nine open PRs, none forgotten, all inside the
+# pipeline. Four of them — #799, #807, #809 and the frontend #220 — were graded
+# PASS and rendered `graded->merge:<maker>`. The merge is routed BACK to the
+# MAKER, who wakes cold or is at WIP cap, so the pull request waits; main moved
+# all four by hand that night. That hand-move IS the loop, not the fix.
+#
+# Meanwhile the seat that just proved the head sha is green does NOTHING with that
+# evidence. DIVE-3474 already gave it the rail (`task merge`) — this ticket makes
+# the rail fire at the close instead of requiring a second, separate act.
+#
+# WHAT THIS IS NOT, and the boundary is the whole design: it is not a merge grant
+# and it does not widen `_merge_do` by one byte. Standing is still re-derived as
+# root from the row over `_TASKS_TFV_SQL AND graded_by = <this seat>`. All this
+# adds is a DISPOSITION — three questions asked before the rail is called at all,
+# each of which can only ever move a row from "merge" to "a human looks".
+#
+# THE POLARITY IS THE SAFETY ARGUMENT. Every unknown resolves to a HOLD: an
+# unreadable head, an unreadable file list, a missing graded-sha, a merge state
+# this function has not been taught, a probe that could not run. So the failure
+# mode of a bug in here is the behaviour we have TODAY (the row waits), never an
+# unreviewed merge. That is why the pure halves below return a hold STRING rather
+# than an exit status — an exit status has one bit, and the reason is what the
+# board has to render.
+#
+# WHO OWES THE LOOK. Today a hold always renders `graded->merge:<maker_agent>`,
+# which is wrong in the common case: the maker has nothing left to do on a branch
+# that is green and clean but merely needs a person's eyes. A hold now names
+# `main` — the seat that can look — and names the MAKER only for the one condition
+# a maker alone can clear: a conflicted branch needing a rebase.
+
+# Paths whose merge a PERSON has to have looked at. This is NOT a danger list; it
+# is the list of paths where our own rules already say a human moment exists —
+# CODEOWNERS-covered files, and the schema-bearing paths where a merge to main
+# runs `drizzle-kit push --force` against the prod DB and a redeploy does not
+# undo it (projects/5dive/CLAUDE.md, "the gate is filed BEFORE THE MERGE").
+readonly _MERGE_DISP_LOOK_RX='(^|/)install\.sh$|(^|/)CODEOWNERS$|(^|/)\.github/workflows/'
+readonly _MERGE_DISP_SCHEMA_RX='(^|/)(drizzle|migrations)/|(^|/)schema\.ts$|(^|/)db/schema'
+# A user-facing surface. "Tests grade code; they do not grade a page" — a surface
+# does not merge unseen, and this rail cannot look at a Vercel preview.
+readonly _MERGE_DISP_SURFACE_RX='\.(tsx|jsx|css|scss)$'
+
+# _merge_disp_risk <repo_slug> <files, one per line> -> "low" | "look:<reason>"
+#
+# PURE — no gh, no root, no db. That is the point of splitting it out: every (iii)
+# branch is gradeable from a fixture instead of from a live pull request, which is
+# the difference between a test of this rule and a test of GitHub.
+_merge_disp_risk() {
+  local repo="${1:-}" files="${2:-}"
+  # An empty file list is "I could not read the diff", never "the diff is empty".
+  [[ -n "$files" ]] || { printf 'look:file-list-unreadable'; return 0; }
+  # NOTE the herestrings. A `printf ... | grep -q` here would be the DIVE-4108
+  # shape — grep exits on first match, printf dies of SIGPIPE, pipefail promotes
+  # 141, and the test reads as NO MATCH. In this function that inverts a `look`
+  # into a `low`, i.e. it fails OPEN. Never reintroduce the pipeline.
+  if grep -qE "$_MERGE_DISP_LOOK_RX" <<<"$files"; then
+    printf 'look:codeowners-path'; return 0
+  fi
+  if grep -qE "$_MERGE_DISP_SCHEMA_RX" <<<"$files"; then
+    printf 'look:schema-path'; return 0
+  fi
+  # 5dive-api is the sharp repo by NAME as well as by path: merge deploys AND
+  # pushes the schema. Anything under its src/db is a look even if the filename
+  # does not match the generic schema pattern above.
+  if [[ "$repo" == */5dive-api ]] && grep -qE '(^|/)src/db/' <<<"$files"; then
+    printf 'look:api-db-path'; return 0
+  fi
+  if grep -qE "$_MERGE_DISP_SURFACE_RX" <<<"$files"; then
+    printf 'look:user-facing-surface'; return 0
+  fi
+  printf 'low'
+}
+
+# _merge_disp_decide <mergeable> <merge_state> <head_sha> <graded_sha> <risk>
+#   -> "merge" | "hold:main:<why>" | "hold:maker:<why>"
+#
+# PURE, same reason. <risk> is _merge_disp_risk's output; the caller passes it in
+# rather than this function calling it, so each of (i), (ii) and (iii) can be
+# driven independently in a harness.
+_merge_disp_decide() {
+  local mergeable="${1^^}" state="${2^^}" head="${3,,}" graded="${4,,}" risk="${5:-}"
+
+  # (i) A GRADE IS BOUND TO A SHA, NOT TO A PULL REQUEST. This is DIVE-2656's rule
+  # read forwards instead of at the close: if the head has moved since the grade,
+  # the thing that would merge is not the thing that was graded.
+  [[ -n "$graded" ]] || { printf 'hold:main:no-graded-sha-stated'; return 0; }
+  [[ -n "$head"   ]] || { printf 'hold:main:head-sha-unreadable';  return 0; }
+  # Prefix either way: a verifier routinely states an abbreviated sha against a
+  # 40-char head, and DIVE-2656's own comparison is a prefix comparison.
+  if [[ "$head" != "$graded"* && "$graded" != "$head"* ]]; then
+    printf 'hold:main:graded-sha-is-not-the-head'; return 0
+  fi
+
+  # THE ONE MAKER CASE, and it is deliberately the only one. A conflicted branch
+  # needs a rebase and nobody but the maker can do that. Everything else that is
+  # not clean is a LOOK — routing it to the maker is what this ticket exists to
+  # stop, because the maker has nothing to change.
+  if [[ "$mergeable" == "CONFLICTING" || "$state" == "DIRTY" ]]; then
+    printf 'hold:maker:conflicting-needs-rebase'; return 0
+  fi
+  [[ "$mergeable" == "MERGEABLE" ]] || { printf 'hold:main:mergeable-%s' "${mergeable:-unknown}"; return 0; }
+
+  # (ii) REQUIRED CHECKS AT THAT SHA. BLOCKED is GitHub's single answer for both a
+  # red/pending required check AND a required review (CODEOWNERS) — both are a
+  # look, and collapsing them here is correct because the response is the same.
+  #
+  # UNSTABLE is held on purpose. It means "mergeable, some NON-required check is
+  # not green", so branch protection would let it through — but a red check at the
+  # graded head is exactly the thing a person should see before it lands, and this
+  # rail has no way to tell a flaky non-required check from a real one. Holding
+  # costs a look; merging costs the thing we cannot undo.
+  case "$state" in
+    CLEAN|HAS_HOOKS) : ;;
+    *) printf 'hold:main:merge-state-%s' "${state:-unknown}"; return 0 ;;
+  esac
+
+  # (iii) RISK.
+  [[ "$risk" == "low" ]] || { printf 'hold:main:%s' "${risk#look:}"; return 0; }
+  printf 'merge'
+}
+
+# _merge_disp_probe <pr> <graded_sha> -> the disposition, on stdout.
+#
+# IMPURE: this is the half that talks to GitHub, and it is kept as thin as it can
+# be — one read, then the two pure functions above. A read that fails for any
+# reason yields a hold naming that fact, never a merge.
+_merge_disp_probe() {
+  local pr="${1:-}" graded="${2:-}" tok raw mergeable state head files repo url rest
+  [[ -n "$pr" ]] || { printf 'hold:main:no-delivery-ref'; return 0; }
+  tok=$(_gate_gh_token 2>/dev/null || printf '')
+  # US (unit separator) between fields, joined by jq. A newline separator would be
+  # ambiguous against the file list, which is the one field that can be long.
+  raw=$(_gate_gh "$tok" 20 pr view "$pr" \
+          --json mergeable,mergeStateStatus,headRefOid,files,url \
+          -q '[ (.mergeable // ""), (.mergeStateStatus // ""), (.headRefOid // ""),
+                (.url // ""), ([ (.files // [])[]?.path ] | join(" ")) ] | join("\u001f")' \
+          2>/dev/null) || raw=""
+  [[ -n "$raw" ]] || { printf 'hold:main:pr-state-unreadable'; return 0; }
+  mergeable="${raw%%$'\x1f'*}"; rest="${raw#*$'\x1f'}"
+  state="${rest%%$'\x1f'*}";    rest="${rest#*$'\x1f'}"
+  head="${rest%%$'\x1f'*}";     rest="${rest#*$'\x1f'}"
+  url="${rest%%$'\x1f'*}";      files="${rest#*$'\x1f'}"
+  # owner/name out of the RESOLVED url, not out of the caller's ref: a bare `#12`
+  # delivery_ref names no repo at all.
+  repo=$(sed -nE 's#^https?://[^/]+/([^/]+/[^/]+)/pull/.*#\1#p' <<<"$url")
+  _merge_disp_decide "$mergeable" "$state" "$head" "$graded" \
+                     "$(_merge_disp_risk "$repo" "$(tr ' ' '\n' <<<"$files")")"
+}
+
+# _merge_disp_do <ident> — call the DIVE-3474 rail. Returns non-zero on any
+# refusal and prints the primitive's own words to stderr, so a hold can name them.
+# Deliberately the SAME primitive `task merge` uses: no second door into a merge.
+_merge_disp_do() {
+  local ident="$1" rc=0 out=""
+  out=$(printf '%s\0' "$ident" | sudo -n /usr/local/bin/5dive _merge_do 2>&1) || rc=$?
+  [[ -n "$out" ]] && printf '%s\n' "$out" >&2
+  return "$rc"
+}
+
 # cmd_task_merge — the caller half. Resolves nothing security-relevant itself:
 # every check below is re-run authoritatively inside the root executor, and these
 # exist only so a refusal arrives with its reason instead of as a sudo exit code.
