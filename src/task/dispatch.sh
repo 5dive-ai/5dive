@@ -399,7 +399,7 @@ cmd_task_set_body() {
   local st
   st=$(db "SELECT status FROM tasks WHERE id=${id};")
   [[ "$st" != "done" && "$st" != "cancelled" ]] \
-    || fail "$E_VALIDATION" "$ident is already $st — bounce it back first: 5dive task reject $ident --feedback=\"…\""
+    || fail "$E_VALIDATION" "$ident is already $st — bounce it back first: 5dive task reject $ident --feedback=\"FINDING/FIX/VERIFY\""
   local body; body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
   local prior_len=${#body} prior_lines=0
   if [[ -n "$body" ]]; then
@@ -739,7 +739,7 @@ cmd_task_set_title() {
   resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   local st; st=$(db "SELECT status FROM tasks WHERE id=${id};")
   [[ "$st" != "done" && "$st" != "cancelled" ]] \
-    || fail "$E_VALIDATION" "$ident is already $st — its title is frozen (closed tasks don't get retro-edited; bounce it back first with: 5dive task reject $ident --feedback=\"…\")"
+    || fail "$E_VALIDATION" "$ident is already $st — its title is frozen (closed tasks don't get retro-edited; bounce it back first with: 5dive task reject $ident --feedback=\"FINDING/FIX/VERIFY\")"
   local prior; prior=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
   if [[ "$prior" == "$text" ]]; then
     ok "$ident title unchanged (already \"$text\")" '{ident:$id, changed:false, title:$t}' \

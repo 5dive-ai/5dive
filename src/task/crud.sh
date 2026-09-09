@@ -1228,7 +1228,7 @@ cmd_task_verifier() {
   # here would be a grade that never ran. `task reject` is the real remedy: it
   # bounces a closed task back to its maker.
   [[ "$st" != "done" && "$st" != "cancelled" ]] \
-    || fail "$E_VALIDATION" "$ident is already $st — a verifier can't grade a closed task; bounce it back: 5dive task reject $ident"
+    || fail "$E_VALIDATION" "$ident is already $st — a verifier can't grade a closed task; bounce it back: 5dive task reject $ident --feedback=\"FINDING/FIX/VERIFY\""
   [[ "$kind" == "standard" ]] \
     || fail "$E_VALIDATION" "$ident is a $kind template, not a worked task — set the rail on its instances (task add … --verifier=)"
   # The DELIVERED / awaiting-verifier middle state (DIVE-477 + DIVE-1416): a

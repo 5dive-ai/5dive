@@ -876,7 +876,7 @@ cmd_task_reject() {
     esac
     shift
   done
-  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task reject <id|DIVE-N> [--feedback=\"<what to fix>\"]"
+  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task reject <id|DIVE-N> [--feedback=\"FINDING: … FIX: … VERIFY: …\"]"
   resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   local maker iter maxi vfier
   maker=$(db "SELECT COALESCE(maker_agent,'')    FROM tasks WHERE id=${id};")
