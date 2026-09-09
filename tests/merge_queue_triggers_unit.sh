@@ -11,6 +11,11 @@
 # That is the same shape as DIVE-2141 (a required context that does not RUN blocks
 # forever), which is why the invariant is pinned in the corpus and not in a comment.
 set -uo pipefail
+# DIVE-2573/DIVE-2692: every harness in this corpus carries ONE EXIT trap whose
+# FIRST act is capturing $? — a runner that sees a harness die before its summary
+# line reads the rc from here. Registered before anything that can exit; bash keeps
+# only the LAST EXIT trap, so any future cleanup folds into this line, never beside it.
+trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
 # Three-state: if the helper is unreachable (a staged copy that did not carry
 # tests/lib/), the log says NO TREE WAS NAMED rather than falling silent, and a
