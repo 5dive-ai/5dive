@@ -13,7 +13,12 @@ trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"
 TPL="$ROOT/team-templates/distribution.5dive.yaml"
-PASS=0 FAIL=0
+# Keep the verdict counter in statement position on its own line: the empirical
+# harness-verdict probe identifies and mutates this variable to prove failures
+# reach the process exit status. A second assignment on the PASS line is valid
+# shell but invisible to that instrument.
+PASS=0
+FAIL=0
 ok_t() { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
