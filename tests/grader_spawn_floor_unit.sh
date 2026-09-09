@@ -17,6 +17,15 @@
 # usage JSON is a fixture on stdin.
 # Run: bash tests/grader_spawn_floor_unit.sh
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+# Three-state: if the helper is unreachable (a staged copy that did not carry
+# tests/lib/), the log says NO TREE WAS NAMED rather than falling silent, and a
+# `set -e` harness is not killed by a failed source.
+# NOTE the absence of `2>/dev/null`. Redirecting the source's stderr would also
+# swallow the helper's own stderr line, which IS the payload.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
+  || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.."
 SRC=src
