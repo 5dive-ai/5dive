@@ -1279,6 +1279,25 @@ if (( _rc == 0 )) && [[ "$_r" == *"median-widen"* ]]; then
   ok "an admitted lowering REPORTS the widening it bought, so the cost is in the output rather than in the reviewer's head"
 else bad "an admitted lowering prints its median-widen" "rc=$_rc $_r"; fi
 
+# DIVE-4166's replacement reference is tied to the harvested GitHub-hosted window,
+# not to a spot reading from the authoring box. Run 34370181210 supplied exactly 20
+# independent ubuntu-latest samples of the product-free workload. tier-cal-window
+# classified the second list as concordant; the first supported candidate is 1641.
+PF_ALL=(1208 1227 1444 1479 1486 1507 1520 1526 1526 1532 1532 1541 1580 1584 1629 1641 1671 1687 1805 3768)
+PF_CONC=(1208 1227 1584 1629 1641 1671 1687 3768)
+_pf_ref="$(awk -F= '$1 == "TIER_CAL_BASELINE_US" { print $2; exit }' tests/lib/tier.sh)"
+if (( ${#PF_ALL[@]} == 20 )) && [[ "${PF_ALL[9]}" == 1532 ]]; then
+  ok "the product-free reference carries the complete n=20 GitHub-hosted window and its measured lower median"
+else bad "the product-free reference window remains complete" "n=${#PF_ALL[@]} median=${PF_ALL[9]:-absent}"; fi
+_r="$(bash tests/lib/tier.sh refadmit 1629 138281 "${PF_CONC[@]}" 2>&1)"; _rc=$?
+if (( _rc != 0 )) && [[ "$_r" == *"refuse support K=1"* ]]; then
+  ok "the raw concordant median is REFUSED when only one in-band neighbour supports it"
+else bad "an under-supported product-free candidate is refused" "rc=$_rc $_r"; fi
+if _r="$(bash tests/lib/tier.sh refadmit "$_pf_ref" 138281 "${PF_CONC[@]}" 2>&1)" \
+   && [[ "$_pf_ref" == 1641 && "$_r" == *"K=2"* && "$_r" == *"median-widen=100%"* ]]; then
+  ok "TIER_CAL_BASELINE_US is the first admissible product-free candidate (K=2, bounded at 100%)"
+else bad "the shipped product-free reference is admissible on its named window" "ref=$_pf_ref result=$_r"; fi
+
 # The harvester. Graded on a SAVED log rather than a live gh call: a test that needs
 # credentials and a network is a test that gets skipped, and a skip on the arm that
 # proves the window can be rebuilt is exactly the silence this row is about.

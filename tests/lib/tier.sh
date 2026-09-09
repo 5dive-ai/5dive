@@ -209,17 +209,21 @@ TIER_CAL_SCALE_MAX_PCT=150
 # 2026-09-09, because the overrun above is the corpus and no re-baseline can price it
 # away. The 300s cap and every constant in this file are still untouched by it.
 
-# DIVE-4166 removes the product from cal_probe. This incumbent intentionally remains
-# until the product-free probe has produced >=20 comparable GitHub-hosted samples for
-# one label/tier population: changing code and its baseline in the same unmeasured
-# commit would make the new number unfalsifiable. tier-cal-window now emits the durable
-# REBASELINE REQUIRED verdict that names when that evidence exists.
-TIER_CAL_BASELINE_US=138281
+# ── RE-DERIVED 2026-09-09 (DIVE-4166): 138281 -> 1641 ─────────────────
+# GitHub-hosted ubuntu-latest, run 34370181210: 20 fresh ephemeral VMs measured
+# the product-free bash-spawn + file write/read probe. One label/tier population,
+# n=20, range 1208-3768us/iter, lower median 1532. tier-cal-window emitted
+# REBASELINE REQUIRED at 99% off the incumbent. The raw median was REFUSED by
+# tier_cal_ref_admissible (K=0 in-band support); 1629 was also refused (K=1).
+# Candidate 1641 is the first supported neighbour: K=2 and median-widen=100% over
+# the concordant population. This is a measured reference, not the spot reading
+# from the authoring box, and the temporary sampling matrix was removed afterward.
+TIER_CAL_BASELINE_US=1641
 
 # How long ONE sample of the probe should run. This is the PRECISION knob from note 1:
 # the probe's own relative error must sit well under the headroom being protected (9%
-# today), and a ~10s sample of a ~180ms unit is ~55 iterations, whose spread is small
-# beside a 10-36% platform draw. Two samples ~= 20s of job time, which is deliberately
+# today), and a ~10s sample of the ~1.6ms product-free unit is ~6,000 iterations,
+# whose spread is small beside a 10-36% platform draw. Two samples ~= 20s of job time, which is deliberately
 # NOT counted toward the corpus total — the runner says so in its report.
 TIER_CAL_TARGET_MS=10000
 TIER_CAL_PILOT_ITERS=5
