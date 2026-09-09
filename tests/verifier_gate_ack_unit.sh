@@ -195,7 +195,7 @@ out=$(as reviewer cmd_task_done "$A" --result="graded pass"); rc=$?
 
 # (b) `task reject` — the other verb the nag prescribes. It auto-answers the gate
 #     'auto:reject', a NON-HUMAN provenance the tier-2 floor forbids.
-out=$(as reviewer cmd_task_reject "$A" --feedback="bounce it"); rc=$?
+out=$(as reviewer cmd_task_reject "$A" --feedback="bounce it FIX: name the concrete change"); rc=$?
 (( rc != 0 )) && ok_t "ARM3b reject over a TIER-2 gate exits non-zero (rc=$rc)" \
   || bad_t "ARM3b reject went through" "rc=$rc out=$out"
 [[ -z "$(col "$A" need_answered_at)" && "$(col "$A" assignee)" == "reviewer" ]] \
@@ -206,7 +206,7 @@ out=$(as reviewer cmd_task_reject "$A" --feedback="bounce it"); rc=$?
 #     still work: the CNCL-9 re-nag defect it fixed is not reintroduced.
 D=$(deliver "tier-1 gate, reject supersedes")
 as reviewer cmd_task_need "$D" --type=manual --tier=1 --ask="which colour should the banner be" >/dev/null
-as reviewer cmd_task_reject "$D" --feedback="needs another pass" >/dev/null
+as reviewer cmd_task_reject "$D" --feedback="needs another pass FIX: name the concrete change" >/dev/null
 [[ "$(col "$D" need_answered_by)" == "auto:reject" && "$(col "$D" assignee)" == "maker" ]] \
   && ok_t "CONTROL tier-1 gate still superseded by reject (DIVE-1495 intact)" \
   || bad_t "tier-1 supersede broken" "answered_by=$(col "$D" need_answered_by) assignee=$(col "$D" assignee)"
@@ -218,7 +218,7 @@ E=$(deliver "tier-2 gate, human rejects")
 as reviewer cmd_task_need "$E" --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --options="A|B" --recommend="A" \
    --ask="Leave open and parked, or close as delivered?" >/dev/null
 GATE_ACTOR="human"
-as reviewer cmd_task_reject "$E" --feedback="human call: bounce it" >/dev/null
+as reviewer cmd_task_reject "$E" --feedback="human call: bounce it FIX: name the concrete change" >/dev/null
 GATE_ACTOR="agent reviewer"
 [[ "$(col "$E" need_answered_by)" == "auto:reject" && "$(col "$E" assignee)" == "maker" ]] \
   && ok_t "BOUNDARY a HUMAN caller's reject over a tier-2 gate still proceeds" \
@@ -230,7 +230,7 @@ GATE_ACTOR="agent reviewer"
 H=$(deliver "legacy untiered gate, reject supersedes")
 db "UPDATE tasks SET status='blocked', need_type='manual', ask='pending human thing',
       tier=NULL, need_asked_at=datetime('now') WHERE ident=$(sqlq "$H");"
-as reviewer cmd_task_reject "$H" --feedback="needs another pass" >/dev/null
+as reviewer cmd_task_reject "$H" --feedback="needs another pass FIX: name the concrete change" >/dev/null
 [[ "$(col "$H" need_answered_by)" == "auto:reject" && "$(col "$H" assignee)" == "maker" ]] \
   && ok_t "BOUNDARY an untiered legacy gate is still superseded (no retro-fit)" \
   || bad_t "untiered gate blocked" "answered_by=$(col "$H" need_answered_by) assignee=$(col "$H" assignee)"
@@ -242,12 +242,12 @@ as reviewer cmd_task_reject "$H" --feedback="needs another pass" >/dev/null
 I=$(deliver "verifier's own gate, withdraw then reject")
 as reviewer cmd_task_need "$I" --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --options="A|B" --recommend="A" \
    --ask="Leave open and parked, or close as delivered?" >/dev/null
-msg=$(as reviewer cmd_task_reject "$I" --feedback="it fails" 2>&1; cat "$TMP/err")
+msg=$(as reviewer cmd_task_reject "$I" --feedback="it fails FIX: name the concrete change" 2>&1; cat "$TMP/err")
 [[ "$msg" == *"--withdraw"* && "$msg" == *"you can retire it yourself"* ]] \
   && ok_t "ESCAPE the filer's refusal names withdraw-then-reject" \
   || bad_t "no exit named to the filer" "$msg"
 as reviewer cmd_task_need "$I" --withdraw >/dev/null
-as reviewer cmd_task_reject "$I" --feedback="it fails" >/dev/null
+as reviewer cmd_task_reject "$I" --feedback="it fails FIX: name the concrete change" >/dev/null
 [[ "$(col "$I" assignee)" == "maker" && "$(col "$I" need_type)" == "" \
    && "$(col "$I" need_answered_by)" == "" ]] \
   && ok_t "ESCAPE withdraw-then-reject completes; no forged answer on the record" \
@@ -260,7 +260,7 @@ J=$(deliver "third party's gate, verdict recorded meanwhile")
 as lead cmd_task_need "$J" --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --options="A|B" --recommend="A" \
    --ask="policy call only a human can make" >/dev/null
 db "UPDATE tasks SET assignee='reviewer' WHERE ident=$(sqlq "$J");"   # row still held by the verifier
-msg=$(as reviewer cmd_task_reject "$J" --feedback="it fails" 2>&1; cat "$TMP/err")
+msg=$(as reviewer cmd_task_reject "$J" --feedback="it fails FIX: name the concrete change" 2>&1; cat "$TMP/err")
 [[ "$msg" == *"set-body"* && "$msg" == *"lead"* ]] \
   && ok_t "ESCAPE a non-filer's refusal names record-now, reject-later" \
   || bad_t "no exit named to a non-filer" "$msg"

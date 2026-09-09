@@ -50,7 +50,10 @@ ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
 # --- 1. the file is in the bundle -------------------------------------------
-grep -q '^  src/cmd_agent_buzz_pair\.sh \\$' build.sh \
+# DIVE-4087 moved the cat list into LAZY_FILES=( ... ), one indented path per
+# line with no trailing backslash. Same claim as before: this file is in the
+# bundle, so the greps below are not grading dead code.
+grep -qE '^[[:space:]]+src/cmd_agent_buzz_pair\.sh$' build.sh \
   && ok_t "build.sh concatenates cmd_agent_buzz_pair.sh" \
   || bad_t "build.sh concatenates cmd_agent_buzz_pair.sh" \
            "present but never concatenated — \`agent buzz pair\` would be 'command not found' in the built bundle"

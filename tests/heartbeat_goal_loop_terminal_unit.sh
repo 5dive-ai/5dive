@@ -274,7 +274,7 @@ fi
 # the clause tells the verifier to look for. Same trap as the maker side — the
 # clause could name a string no verb emits and every assert above stays green.
 task_actor() { echo olivia; }        # the verifier grades
-rout=$(cmd_task_reject "$live" --feedback="PR unmergeable against moved main" 2>&1)
+rout=$(cmd_task_reject "$live" --feedback="PR unmergeable against moved main FIX: name the concrete change" 2>&1)
 [[ "$rout" == *"bounced back to maker 'dev'"* ]] \
   && ok_t "liveness: verifier's 'task reject' bounces to the maker" \
   || bad_t "liveness: verifier's 'task reject' bounces to the maker" "got: $rout"

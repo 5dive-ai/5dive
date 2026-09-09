@@ -175,7 +175,7 @@ F=$(add "F reject clears done_at" --assignee=dev --verifier=main)
 as dev  cmd_task_done "$F" --result="maker delivery" >/dev/null   # routes to verifier
 as main cmd_task_done "$F" --result="verifier ACK" >/dev/null     # real close
 backdate "$F"
-as main cmd_task_reject "$F" --feedback="withdrawing my own grade" >/dev/null; f_rc=$?
+as main cmd_task_reject "$F" --feedback="withdrawing my own grade FIX: name the concrete change" >/dev/null; f_rc=$?
 f_reopened=$(status_of "$F"); f_at=$(doneat_of "$F")
 (( f_rc == 0 )) && [[ "$f_reopened" == "todo" ]] \
   && ok_t "F/REACHABILITY: the verifier's reject reopens their own closed row (rc=0, status=todo)" \
@@ -217,7 +217,7 @@ as dev  cmd_task_done "$G" --result="maker delivery" >/dev/null
 as main cmd_task_done "$G" --result="verifier ACK" >/dev/null
 backdate "$G"
 db "UPDATE tasks SET max_iterations=1, iteration=1 WHERE ident=$(sqlq "$G");"
-as main cmd_task_reject "$G" --feedback="stuck, escalating" >/dev/null; g_rc=$?
+as main cmd_task_reject "$G" --feedback="stuck, escalating FIX: name the concrete change" >/dev/null; g_rc=$?
 g_st=$(status_of "$G"); g_at=$(doneat_of "$G")
 # Reachability is the FEEDBACK WRITE, not rc: this branch is known to fail rc=5 on
 # a closed row (that is the separate defect above). Keying reachability on rc would

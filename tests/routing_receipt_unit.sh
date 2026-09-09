@@ -108,7 +108,7 @@ db "UPDATE tasks SET maker_agent='dev2', verifier='quinn', iteration=1,
       handoff_delivered_at=datetime('now'), status='todo' WHERE id=${R1};"
 I1=$(ident_of "$R1")
 ACTOR_OVERRIDE=quinn TASK_ACTOR=quinn \
-  OUT=$(cmd_task_reject "$I1" --feedback="needs another pass" 2>/dev/null)
+  OUT=$(cmd_task_reject "$I1" --feedback="needs another pass FIX: name the concrete change" 2>/dev/null)
 if has_all_three "$OUT" dev2; then
   ok_t "reject prints a receipt naming owner + queue position + next wake on stdout"
 else
@@ -319,7 +319,10 @@ echo "── W: wiring — the lib is SHIPPED, and every routing verb calls it �
 # where the file exists and the installed CLI never loads it. build.sh is an
 # explicit manifest, not a glob: a new lib that is not listed is silently absent
 # from the artifact customers install.
-grep -q '^  src/lib/routing_receipt.sh \\$' build.sh \
+# DIVE-4087 split the manifest into CORE_FILES=( ... ) / LAZY_FILES=( ... ):
+# indented path per line, no trailing backslash. Same claim as before — the file
+# is listed, so it reaches the artifact customers install.
+grep -qE '^[[:space:]]+src/lib/routing_receipt\.sh$' build.sh \
   && ok_t "build.sh manifest ships src/lib/routing_receipt.sh" \
   || bad_t "routing_receipt.sh is not in the build manifest — the shipped CLI would not have it"
 

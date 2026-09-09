@@ -17,6 +17,7 @@ team:                      # NEW — template metadata (display + marketplace)
   name: "Lean SaaS startup"
   description: "5-role founding team: CEO + CMO + DevOps + Researcher + Creative"
   slug: startup            # used by `5dive team import startup`
+  requires: [github_push]  # optional — capabilities this team needs from the BOX
 
 defaults:                  # NEW — merged into every agent (agent-level keys win)
   type: claude
@@ -173,6 +174,37 @@ seat is removed — `agent rm` does not, so without this a torn-down company lea
 templates materializing work for an assignee that no longer exists. Already
 materialized instances are separate rows and are left alone.
 
+## `team.requires:` — what the team needs from the box (DIVE-4103)
+
+An optional list of capability keys under `team:`. Before anything is
+provisioned, `up` probes each and reports it, so the user learns at the TOP of
+the import whether the team can do the job it was imported for — not after four
+seats already exist.
+
+| key | probe | reduced mode when absent |
+|---|---|---|
+| `github_push` | `gh auth token` — offline, resolves `GH_TOKEN`/`GITHUB_TOKEN` and the hosts config, makes no network call | **review-only**: reads, grades, files and rejects; nothing it approves is pushed or merged |
+| `browser` | `5dive browser --help` exits 0 | **API-only**: steps needing an authenticated browser session do not run |
+
+### Posture
+Same as `loops:` — **a missing capability does NOT fail the import** and does not
+count toward `errors`. A review-only team is worth having; a box with no
+credential must still be able to stand one up. What is not acceptable is
+silence: the defect this closes is an import that provisions a team which cannot
+land anything and says nothing about it.
+
+The probe answers *"does this box hold a credential"*, not *"does that credential
+carry push on your repo"* — a scope read needs a repo the import has not been
+given and a network call the offline probe deliberately refuses.
+
+### Probes live in the CLI, keys live in the template
+A template names a key; the CLI owns the command. A template that could name its
+own shell probe would be arbitrary code executed by an import, and a marketplace
+template must be data. A key this CLI has no probe for is reported as
+**unchecked** — never as satisfied (which would ship a team that cannot work) and
+never as absent (which would send the user hunting for a credential already
+there).
+
 ## `pack:` — import a character pack (DIVE-536)
 
 An agent may set `pack: <slug>` instead of `type:`/`instructions:`. The seat is
@@ -181,3 +213,42 @@ and model/effort from the `5dive-ai/character-packs` registry. `reports_to`,
 `role`, `goals`, and an explicit `model`/`effort` override still apply on top.
 `channels`, `telegram_token`, `auth_profile`, `workdir`, `defer_auth` pass through.
 See the `5dive-team` template for a full company built this way.
+
+## Permission tiers are the importer's, not the template's (DIVE-4119)
+
+A template may carry a policy block its roles read — `distribution.channels` in
+the Distribution team is the shipped example. Everything in such a block is a
+**default the importer edits**, at import time or later, and the roles read
+whatever the file says at the time they run. 5dive does not decide which
+surfaces a customer's team may act on, or which of them need a person.
+
+Where a block gives a target a permission tier and a transport, use this
+vocabulary so the tiers mean the same thing across templates:
+
+| `permission` | meaning |
+|---|---|
+| `AUTO` | a verifier-passed item proceeds without asking |
+| `APPROVAL` | the team's Head signs off first |
+| `HUMAN` | a named person the importing team nominates signs off first |
+
+| `transport` | meaning |
+|---|---|
+| `api` | an adapter over the target's API |
+| `browser` | the browser plugin drives a session a person logged into by hand; the template supplies no platform list, and a target with no adapter is reported unavailable rather than assumed |
+| `human` | a person acts by hand; the team prepares and stops |
+
+Two rules keep a default from hardening back into a rule:
+
+1. **Ship no target at `HUMAN` by decree, and none at a transport the executor
+   cannot run.** A default of "a person does this one" is the hardcode, however
+   it is labelled. Be cautious in the tier, never in the vocabulary.
+2. **Keep policy out of role instructions.** An `instructions:` prompt is prose
+   the schema never reads, so a target named there is policy no importer can
+   edit and no test can see. Roles reference the block; they do not restate it.
+
+The same applies to a template's own tests: an arm that pins a target's *value*
+(`reddit == HUMAN`) re-imposes the tier on the next person to touch the file,
+with a green harness as the enforcement. Grade the *property* — the vocabulary,
+the absence of decreed tiers, and a round trip through the parser in **both**
+directions, since a default that cannot be raised is as hardcoded as one that
+cannot be lowered.

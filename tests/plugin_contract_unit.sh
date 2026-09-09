@@ -429,6 +429,50 @@ else
 fi
 
 # =============================================================================
+# T13 — install.sh's TEMPLATE staging list vs team-templates/index.json
+# =============================================================================
+# DIVE-4149. This is the second half of T10's subject: the team-templates block
+# in install.sh has the same shape and the same drift hazard as the bundled-
+# plugin block above, and it is the one where the hazard actually fired.
+# `deploy-team` shipped in team-templates/index.json (#807) and was never added
+# to install.sh's `for _tpl in` list, so every installed box ADVERTISED the slug
+# through `5dive team ls` and then answered `no template 'deploy-team'` on
+# import. `distribution` was the same miss one PR earlier (#808), and the
+# one-line staging fix landed separately as #820 — this arm is what stops the
+# third one. Two declarations of one set with nothing holding them equal is a
+# defect that recurs per template, so the guard is a SET COMPARISON, not a grep
+# for a slug: it reds on the template that was ADDED, which is the direction the
+# drift travels.
+#
+# It lives here rather than in a new harness on purpose — same subject as T10,
+# and the corpus is at ~85% of its own wall-clock cap (tests/lib/tier.sh), where
+# a new file is a cost and four string comparisons are not. Numbered T13 because
+# T11a-j (plugin disable/enable) and T12a-g (errexit) are both already taken.
+#
+# install.sh carries a KEEP-THIS-ON-ONE-LINE instruction above the `for _pf in`
+# list for T10a's sake and does NOT carry one above `for _tpl in`. That is fine
+# and deliberately not fixed here (install.sh is a CODEOWNERS path): a backslash
+# continuation would make the sed extract NOTHING, and T13c below is the control
+# that turns an empty extraction into a red instead of a vacuous pass.
+tpl_staged=$(sed -n 's|.*for _tpl in \(.*\); do.*|\1|p' install.sh | tr ' ' '\n' | sort)
+tpl_staged_yaml=$(grep '\.5dive\.yaml$' <<<"$tpl_staged" | sort)
+tpl_index=$(jq -r '.companies[].slug + ".5dive.yaml"' team-templates/index.json | sort)
+tpl_ondisk=$(cd team-templates && printf '%s\n' *.5dive.yaml | sort)
+t "T13a install.sh stages exactly the templates index.json advertises (add a slug, add its line)" \
+  "$tpl_index" "$tpl_staged_yaml"
+t "T13b ...and index.json advertises exactly the templates team-templates/ contains" \
+  "$tpl_ondisk" "$tpl_index"
+t "T13c ...and the extracted list is non-empty, so T13a/T13b cannot pass by comparing blanks" "yes" \
+  "$([[ -n "$tpl_staged_yaml" && -n "$tpl_index" ]] && echo yes || echo no)"
+# A staged name that does not exist is the OTHER direction: `curl` 404s, install.sh
+# only warns, and the box ends up with the same missing template — a red here, not
+# a line in a log nobody reads.
+tpl_absent=""
+for _t in $tpl_staged; do [[ -f "team-templates/$_t" ]] || tpl_absent+="$_t "; done
+t "T13d every name install.sh stages exists in team-templates/ (a typo 404s and only warns)" \
+  "" "${tpl_absent% }"
+
+# =============================================================================
 # T12 — arms that can SEE a death under errexit
 # =============================================================================
 # quinn's iteration-2 reject, and it is the structural finding, not the three

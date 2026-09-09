@@ -50,7 +50,9 @@ fail_t() { FAIL=$((FAIL+1)); _rail "$1"; printf 'FAIL - %s\n' "$1"; }
 # A pristine copy of the tree, rebuilt into its own bundle.
 WORK="$TMP/repo"
 mkdir -p "$WORK"
-cp -R "$REPO/src" "$REPO/tests" "$REPO/build.sh" "$WORK/" 2>/dev/null
+# scripts/ comes along because DIVE-4087 made the build recipe two files:
+# build.sh sources scripts/lib/lazy-dispatch.sh to generate the payload index.
+cp -R "$REPO/src" "$REPO/tests" "$REPO/scripts" "$REPO/build.sh" "$WORK/" 2>/dev/null
 cp "$REPO/5dive.sha256" "$WORK/" 2>/dev/null || true
 # DIVE-2783: build.sh has hard-required a resolvable source commit since DIVE-2603
 # (#488) — `git rev-parse --verify 'HEAD^{commit}'` or exit 1. This copy is

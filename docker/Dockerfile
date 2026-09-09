@@ -53,10 +53,20 @@ RUN systemctl mask \
 # `curl: (37) Couldn't open file` — this list and install.sh's fetches are two
 # copies of one set, and only the docker-install job notices when they disagree.
 # (DIVE-3269 added 5dive-stage-fork-plugins.sh and this line went red first.)
-COPY 5dive 5dive-agent-start 5dive-refresh-plugins.sh 5dive-stage-fork-plugins.sh 5dive-refresh-skills.sh install.sh projects-CLAUDE.md telegram-agent-CLAUDE.md model-tiering-CLAUDE.md operational-comms-CLAUDE.md /opt/5dive-bundle/
+COPY 5dive 5dive-agent-list-snapshot 5dive-agent-start 5dive-refresh-plugins.sh 5dive-stage-fork-plugins.sh 5dive-refresh-skills.sh install.sh projects-CLAUDE.md telegram-agent-CLAUDE.md model-tiering-CLAUDE.md operational-comms-CLAUDE.md /opt/5dive-bundle/
 COPY hooks /opt/5dive-bundle/hooks/
 COPY skills /opt/5dive-bundle/skills/
 COPY systemd /opt/5dive-bundle/systemd/
+# DIVE-4141: the bundled plugin marketplace and the team-template registry.
+# Both were MISSING here while install.sh fetched them, and both of those
+# fetches are fail-soft (`curl -f` on a file:// bundle that omits a path exits
+# 37, and the installer only warns) — so every image built by this job shipped
+# with an EMPTY /usr/local/lib/5dive/plugins and only whatever team-templates
+# the warn loop happened to find. That is why the browser plugin could ship
+# uninstallable (DIVE-4126) with docker-install green: the one job that installs
+# on a fresh box never had the plugin to install.
+COPY plugins /opt/5dive-bundle/plugins/
+COPY team-templates /opt/5dive-bundle/team-templates/
 # install.sh's curl fetches the unit at $REPO/systemd/5dive-agent%40.service
 # (URL-encoded '@'). curl with file:// decodes %40 → @, so a symlink is enough
 # to make both names resolve.

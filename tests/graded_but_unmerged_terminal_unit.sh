@@ -213,7 +213,7 @@ echo "── (e) DIVE-3428: a grade is NOT a latch — a live reject that post-d
 mkreject() { # <how graded_at relates to the reject> -> id
   local rel="$1" id; id=$(mkrow graded_and_bound)
   [[ "$id" =~ ^[0-9]+$ ]] || { printf '0'; return; }
-  ( cmd_task_reject "$id" --feedback="the diff does not do what the result claims" ) >/dev/null 2>&1
+  ( cmd_task_reject "$id" --feedback="the diff does not do what the result claims FIX: name the concrete change" ) >/dev/null 2>&1
   case "$rel" in
     newer) db "UPDATE tasks SET graded_at=datetime(handoff_rejected_at,'-4 days') WHERE id=${id};" ;;
     tie)   db "UPDATE tasks SET graded_at=handoff_rejected_at WHERE id=${id};" ;;
@@ -226,7 +226,7 @@ mkreject() { # <how graded_at relates to the reject> -> id
 # re-delivery spends the token before the assertion reads it. Assert the cause is
 # present and in the real-world DIRECTION before grading any absence.
 R0=$(mkrow graded_and_bound)
-( cmd_task_reject "$R0" --feedback="bounced" ) >/dev/null 2>&1
+( cmd_task_reject "$R0" --feedback="bounced FIX: name the concrete change" ) >/dev/null 2>&1
 [[ -n "$(db "SELECT COALESCE(handoff_rejected_at,'') FROM tasks WHERE id=${R0};")" ]] \
   && ok_t "E0/PRECONDITION: the real \`task reject\` verb stamps handoff_rejected_at" \
   || bad_t "E0/PRECONDITION: reject stamped the column" "every arm below would be vacuous"

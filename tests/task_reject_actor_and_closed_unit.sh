@@ -78,7 +78,7 @@ seed_closed() { local id; id=$(seed "$1"); as main cmd_task_done "$id" --result=
 
 # --- A: the MAKER may not reject its own delivery (writer grading own work).
 A=$(seed "A maker rejects own delivery")
-out=$(as dev cmd_task_reject "$A" --feedback="I changed my mind"); rc=$?
+out=$(as dev cmd_task_reject "$A" --feedback="I changed my mind FIX: name the concrete change"); rc=$?
 (( rc != 0 )) && ok_t "A maker's reject exits non-zero (rc=$rc)" || bad_t "A should refuse" "rc=$rc $out"
 [[ "$(res_of "$A")" == "maker delivery v1" ]] \
   && ok_t "A delivered result untouched by the refused reject" || bad_t "A result mutated" "$(res_of "$A")"
@@ -97,7 +97,7 @@ B=$(seed_closed "B outsider reopens a graded task")
 # PRESENT and the maker's record SURVIVES beneath it, which is what this checks.
 [[ "$(status_of "$B")" == "done" && "$(res_of "$B")" == *"$ACK"* ]] \
   || bad_t "B fixture" "expected a closed, graded task; got $(status_of "$B")"
-out=$(as dev2 cmd_task_reject "$B" --feedback="please add X"); rc=$?
+out=$(as dev2 cmd_task_reject "$B" --feedback="please add X FIX: name the concrete change"); rc=$?
 (( rc != 0 )) && ok_t "B outsider's reject over a closed task exits non-zero (rc=$rc)" \
   || bad_t "B should refuse" "rc=$rc — this is olivia's exact repro"
 [[ "$(status_of "$B")" == "done" ]] \
@@ -110,7 +110,7 @@ out=$(as dev2 cmd_task_reject "$B" --feedback="please add X"); rc=$?
 # --- C: FALSE ATTRIBUTION — the reject must name the ACTUAL actor.
 C=$(seed "C attribution names the real actor")
 as main cmd_task_reject "C-nonexistent" --feedback=x >/dev/null 2>&1  # noise, ignored
-out=$(as main cmd_task_reject "$C" --feedback="needs a test"); rc=$?
+out=$(as main cmd_task_reject "$C" --feedback="needs a test FIX: name the concrete change"); rc=$?
 (( rc == 0 )) && ok_t "C the verifier's own reject still works (rc=0)" \
   || bad_t "C verifier reject broken" "rc=$rc $(cat "$TMP"/err)"
 [[ "$(res_of "$C")" == *"main rejected"* ]] \
@@ -122,7 +122,7 @@ out=$(as main cmd_task_reject "$C" --feedback="needs a test"); rc=$?
 
 # --- D: the VERIFIER reopening their OWN grade preserves the prior record.
 D=$(seed_closed "D verifier reopens own grade")
-out=$(as main cmd_task_reject "$D" --feedback="I was wrong, reopening"); rc=$?
+out=$(as main cmd_task_reject "$D" --feedback="I was wrong, reopening FIX: name the concrete change"); rc=$?
 (( rc == 0 )) && ok_t "D the grader may reopen their own grade (rc=0)" \
   || bad_t "D grader locked out" "rc=$rc $(cat "$TMP"/err)"
 # DIVE-2773: reject no longer hand-rolls this preservation — it routes through
@@ -149,7 +149,7 @@ out=$(as main cmd_task_reject "$D" --feedback="I was wrong, reopening"); rc=$?
 
 # --- F: NOT over-tightened — a lead bouncing an OPEN task still works.
 F=$(seed "F lead bounces an open delivered task")
-out=$(as olivia cmd_task_reject "$F" --feedback="scope is wrong"); rc=$?
+out=$(as olivia cmd_task_reject "$F" --feedback="scope is wrong FIX: name the concrete change"); rc=$?
 (( rc == 0 )) && ok_t "F a non-maker non-verifier may still bounce an OPEN task" \
   || bad_t "F over-tightened" "rc=$rc — the guard broke a legitimate flow: $(cat "$TMP"/err)"
 [[ "$(res_of "$F")" == *"olivia rejected"* ]] \
@@ -162,7 +162,7 @@ out=$(as olivia cmd_task_reject "$F" --feedback="scope is wrong"); rc=$?
 Gid=$(JSON_MODE=1 cmd_task_add "G max-iters escalation" --assignee=dev --verifier=main \
         --accept=x --max-iters=1 2>"$TMP"/err | jq -r '.data.ident // empty')
 as dev cmd_task_done "$Gid" --result="maker delivery v1" >/dev/null
-out=$(as main cmd_task_reject "$Gid" --feedback="not good enough"); rc=$?
+out=$(as main cmd_task_reject "$Gid" --feedback="not good enough FIX: name the concrete change"); rc=$?
 [[ "$(db "SELECT COALESCE(max_iterations,0) FROM tasks WHERE ident=$(sqlq "$Gid");")" == "1" \
    && "$(db "SELECT COALESCE(iteration,0) FROM tasks WHERE ident=$(sqlq "$Gid");")" -ge 1 ]] \
   && ok_t "G fixture really is on the max_iterations branch (maxi=1, iter>=1)" \
