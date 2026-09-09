@@ -726,28 +726,67 @@ _gate_route_why() {
   esac
 }
 
-# Can this seat mint a DIVE-756 closure signature? Echoes `<yes|no|unknown>|<class>`.
+# Can this seat produce a DIVE-756 closure signature while answering its routed
+# gate? Echoes `<yes|no|unknown>|<class>`.
 #
-# The classes come from the same measurement `agent info` renders
-# (classify_sudo_grant), and the yes/no split is the one DIVE-2760's own answer-
-# time warning already states in prose: root-all and cli-root seats hold sudo for
-# `5dive gate-proof sign`; cli-scoped seats do not.
+# Root-all and cli-root seats can sign directly. DIVE-3160 also deliberately lets
+# a cli-scoped seat sign ONLY its own routed answer through the exact `_task_answer`
+# broker. Read the grant lines once so the capability answer and class label come
+# from the same snapshot; class alone cannot distinguish an old cli-scoped policy
+# from one carrying that narrow broker.
 #
-# `custom` and `unknown` return UNKNOWN and never `no`. DIVE-2318: an unmeasured
-# grant is the absence of a measurement, not evidence of absence, and the cost of
-# the two errors is asymmetric here — a false `no` sends the filer to re-route a
-# gate that would have cleared fine, on a box where the peer read simply did not
-# work (DIVE-2135 makes that read possible, not guaranteed).
+# `custom` and `unknown` without the exact broker return UNKNOWN and never `no`;
+# finding the broker itself is positive capability evidence regardless of class.
+# DIVE-2318: an unmeasured grant is the absence of a measurement, not evidence of
+# absence, and the cost of the two errors is asymmetric here — a false `no` sends
+# the filer to re-route a gate that would have cleared fine, on a box where the
+# peer read simply did not work (DIVE-2135 makes that read possible, not guaranteed).
 _gate_seat_can_sign() {
-  local name="$1" grant cls
+  local name="$1" lines grant cls
   [[ -n "$name" ]] || { printf 'unknown|unknown\n'; return 0; }
-  grant=$(agent_sudo_grant "agent-${name}" 2>/dev/null) || grant=""
+  lines=$(sudo_grant_lines "agent-${name}" 2>/dev/null) \
+    || { printf 'unknown|unknown\n'; return 0; }
+  grant=$(printf '%s\n' "$lines" | classify_sudo_grant)
   cls="${grant%%|*}"; [[ -n "$cls" ]] || cls="unknown"
+  if printf '%s\n' "$lines" \
+      | grep -Eq '(^|[,:][[:space:]]*)/usr/local/bin/5dive _task_answer([[:space:]]*(,|$))'; then
+    printf 'yes|%s\n' "$cls"
+    return 0
+  fi
   case "$cls" in
     root-all|cli-root) printf 'yes|%s\n' "$cls" ;;
     cli-scoped|none)   printf 'no|%s\n' "$cls" ;;
     *)                 printf 'unknown|%s\n' "$cls" ;;
   esac
+}
+
+# The command a routed reviewer is told to run. Keep its rendering in one place:
+# DIVE-4081 was caused in part by prose prescribing a different authority path
+# than answer.sh actually admits. `%q` makes an arbitrary recommendation safe to
+# paste into a shell without changing its value.
+_gate_routed_answer_command() {
+  local ident="$1" value="${2:-<answer>}" q
+  printf -v q '%q' "$value"
+  printf '5dive task answer %s --value=%s' "$ident" "$q"
+}
+
+_gate_warn_unsigned_routed_reviewer() {
+  local ident="$1" reviewer="$2" cls="$3" value="${4:-<answer>}" answer_cmd
+  answer_cmd=$(_gate_routed_answer_command "$ident" "$value")
+  warn "$ident routed to $reviewer, who CANNOT MINT A CLOSURE SIGNATURE (sudo grant: ${cls})."
+  warn "  This ask is push/deploy shaped, and the root-only executor verifies the"
+  warn "  DIVE-756 signed closure before any delegated push or deploy."
+  warn "  what happens if you leave it: $reviewer can ANSWER the gate and the board"
+  warn "    will show it APPROVED — but need_answer_sig lands EMPTY, and the push is"
+  warn "    REFUSED later, on the MAKER's command, reading as tampering rather than"
+  warn "    as this (DIVE-2760/2808). 'task answer' is not a re-sign verb, so the"
+  warn "    only repair at that point is to re-file the gate from scratch."
+  warn "  fix: install/upgrade first so a clean managed standard policy is reconciled,"
+  warn "    then have the routed reviewer run the command the gate already names:"
+  warn "    $answer_cmd"
+  warn "    That delegates the exact answer through the narrow _task_answer signer."
+  warn "    A custom or missing policy is never rewritten automatically. Do NOT grant"
+  warn "    gate-proof sign: it signs arbitrary stdin and can forge human:* closures."
 }
 
 # DIVE-2099: the org lead's STANDING authority to clear an ENGINEERING approval
@@ -3779,18 +3818,7 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
             yes) _rsig=" [require_sig: ${_reviewer} can sign this closure (grant=${_csc})]" ;;
             no)
               _rsig=" [require_sig: ⚠ ${_reviewer} CANNOT sign this closure (grant=${_csc}) — see the warning above]"
-              warn "$ident routed to $_reviewer, who CANNOT MINT A CLOSURE SIGNATURE (sudo grant: ${_csc})."
-              warn "  This ask is push/deploy shaped, and the root-only executor verifies the"
-              warn "  DIVE-756 signed closure before any delegated push or deploy."
-              warn "  what happens if you leave it: $_reviewer can ANSWER the gate and the board"
-              warn "    will show it APPROVED — but need_answer_sig lands EMPTY, and the push is"
-              warn "    REFUSED later, on the MAKER's command, reading as tampering rather than"
-              warn "    as this (DIVE-2760/2808). 'task answer' is not a re-sign verb, so the"
-              warn "    only repair at that point is to re-file the gate from scratch."
-              warn "  fix: get it answered from a seat that signs — root (\`sudo 5dive task answer"
-              warn "    $ident ...\`) or an agent whose grant is root-all/cli-root; --tier=2 if it"
-              warn "    is genuinely the human's. Do NOT grant \`gate-proof sign\` to a cli-scoped"
-              warn "    seat: it signs arbitrary stdin, so the grant forges ANY closure, human:* included."
+              _gate_warn_unsigned_routed_reviewer "$ident" "$_reviewer" "$_csc" "${rec:-<answer>}"
               ;;
             *) _rsig=" [require_sig: whether ${_reviewer} can sign is NOT MEASURABLE from this seat (grant=${_csc}) — unknown, not a no; check it first if a delegated push is refused later]" ;;
           esac
@@ -4118,4 +4146,3 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
      '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), floor_term:(($ft|select(length>0)) // null), needs_capability:(($nc|select(length>0)) // null), needs_human:($nh=="1"), rubber_stamp_ok:(($rs|select(length>0)) // null), notified:($nf=="1"), routed_to:null, route_declined:$rd, ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), precedent_ref:(($pr|select(length>0)|tonumber?) // null), assignee:$ac}' \
      --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg ft "$floor_term" --arg nc "$needs" --arg nh "$_needs_human" --arg rs "$rubber_stamp" --arg nf "$notified" --arg rd "$_nr_reason" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg pr "$precedent_ref" --arg ac "$actor"
 }
-
