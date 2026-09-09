@@ -203,6 +203,74 @@ w=$(_5DIVE_GATE_UNDO_WINDOW_SECS="two minutes" _task_gate_undo_window_secs DIVE-
   || fail_t "shipped window is ${_GATE_UNDO_WINDOW_SECS}s, expected 120"
 
 
+# ── 8d. AN AGE THE CODE CANNOT READ IS DELIVERED, NEVER HELD ───────────────
+# The remainder subtraction runs on the value `db` returned. Three ways that
+# value is not a non-negative integer, and holding is wrong for every one. These
+# arms exist because the failure they guard is a DROPPED ping, not a late one —
+# the outcome the whole mechanism is built to be incapable of.
+
+# (i) A malformed need_asked_at. julianday() returns NULL and the CAST yields ''.
+# Held, this charges a full window measured from NOW on every call, re-nag
+# included: defect 8b reintroduced for that row, and invisible because the row
+# still looks pending the whole time.
+reset; mkgate DIVE-9113 high
+db "UPDATE tasks SET need_asked_at='not-a-timestamp' WHERE ident='DIVE-9113';"
+_task_need_notify_deliver DIVE-9113 decision "ask" ""
+delivered DIVE-9113 \
+  && ok_t "an unparseable need_asked_at pings immediately rather than holding forever" \
+  || fail_t "an unparseable timestamp was held — the row can never outrun a window it cannot measure"
+
+# (ii) Clock skew puts need_asked_at in the FUTURE, so the age is negative. Same
+# swallow, and while the clock is ahead the row outruns the window on every call.
+reset; mkgate DIVE-9114 high
+db "UPDATE tasks SET need_asked_at=datetime('now','+300 seconds') WHERE ident='DIVE-9114';"
+_task_need_notify_deliver DIVE-9114 decision "ask" ""
+delivered DIVE-9114 \
+  && ok_t "a future-dated gate (clock skew) pings immediately, not after the skew clears" \
+  || fail_t "a negative age was held — clock skew can mute a gate for as long as it lasts"
+
+# (iii) `db` puts an error string on stdout (a locked or corrupt database).
+# Bash arithmetic parses a bare word as a variable NAME, so `$(( _secs - abc ))`
+# under `set -euo pipefail` dies with "unbound variable" MID-FUNCTION: hold row
+# unwritten, ping gone. Not a late page — no page, which is the one outcome this
+# mechanism is built to be incapable of.
+#
+# Driven through the REAL resolver with `db` stubbed for the age query only, not
+# against an inline copy of the guard: a copy grades the test, not the product,
+# and would stay green against any shape of the shipped code.
+reset; mkgate DIVE-9115 high
+_orig_db=$(declare -f db)
+eval "${_orig_db/#db/_db_real}"          # same body, second name
+db() {                                    # intercept ONLY the age query
+  if [[ "$*" == *julianday* ]]; then
+    printf 'Error: database is locked\n'; : >"$TMP/stub_fired"; return 0
+  fi
+  _db_real "$@"
+}
+: >"$TMP/stub_fired"; rm -f "$TMP/stub_fired"
+# RUN IT IN A SUBSHELL, AND ATTACH NO `||`. Two separate traps here:
+#   - A `set -u` failure inside $(( )) is fatal to the SHELL, not a return code.
+#     Called at top level it takes the whole harness down mid-run: no summary
+#     line, no FAIL, just rc=1 — which reads like a crashed harness rather than a
+#     graded defect, and the next reader "fixes" the harness. The subshell
+#     contains the death so this arm can report it.
+#   - But `( ... ) || fail_t` would REMOVE the death it is testing for: errexit is
+#     exempt on the left of ||, and the exemption propagates INTO the subshell.
+#     So: bare subshell, then assert on MARK, which the subshell writes through to
+#     the parent as a FILE. Absence of the delivery IS the death.
+( _task_need_notify_deliver DIVE-9115 decision "ask" "" ) >/dev/null 2>&1
+eval "$_orig_db"; unset -f _db_real       # restore before asserting
+# The stub must actually have fired, or this arm grades nothing and reads green
+# against every shape of the shipped code.
+[[ -f "$TMP/stub_fired" ]] \
+  && ok_t "the non-numeric-age stub intercepted the age query (this arm is live)" \
+  || fail_t "the db stub never fired — the non-numeric-age arm below is vacuous"
+delivered DIVE-9115 \
+  && ok_t "a non-numeric age pings immediately — it never reaches \$(( )) to die on set -u" \
+  || fail_t "a non-numeric age dropped the ping: the guard is a filter, not the delivery condition"
+reset
+
+
 # ── 10. THE OVERRIDE IS CLAMPED DOWNWARD: it may shorten the hold, never extend ─
 # The commit that shipped arm D called the duration "a sealed constant with no
 # write path", for the _GATE_HUMAN_CAPABILITIES reason: agents hold NOPASSWD:ALL,

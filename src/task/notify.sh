@@ -2100,11 +2100,30 @@ _task_need_notify_deliver() {
   # swallow. So a gate already past its window pings NOW, on every path.
   local _age
   _age=$(db "SELECT CAST((julianday('now')-julianday($(sqlq "$_asked")))*86400 AS INT);" 2>/dev/null || echo "")
-  if [[ "$_age" =~ ^[0-9]+$ ]] && (( _age >= _secs )); then
+  #
+  # AN AGE WE CANNOT READ IS DELIVERED, NOT HELD — the same call the empty
+  # `$_asked` branch above makes, for the same reason: the window is an
+  # optimisation, never a precondition for a gate reaching its human. Three ways
+  # the age is unreadable, and holding is wrong for all three:
+  #   - EMPTY. `julianday()` returns NULL on a malformed need_asked_at and the
+  #     CAST yields ''. Treating that as 0 charges a FULL window measured from
+  #     now on EVERY call, re-nag included — defect 1 reintroduced for that row.
+  #   - NEGATIVE. Clock skew puts need_asked_at in the future. Same as above, and
+  #     the row can outrun the window indefinitely while the clock is ahead.
+  #   - NON-NUMERIC. If `db` ever puts an error string on stdout, the arithmetic
+  #     below dies on `set -u` with "unbound variable" — it parses the word as a
+  #     variable name. That does not delay the ping, it DROPS it, mid-function,
+  #     with the hold row unwritten. The one outcome this whole mechanism is
+  #     built to be incapable of.
+  # So the guard is the delivery condition, not a filter in front of it, and the
+  # subtraction runs only on a value already proven a non-negative integer.
+  # Fail-open is also the invariant's direction: unreadable state may only ever
+  # move a gate TOWARD the phone, never away from it.
+  if ! [[ "$_age" =~ ^[0-9]+$ ]] || (( _age >= _secs )); then
     _task_need_notify_deliver_now "$@"
     return $?
   fi
-  _secs=$(( _secs - ( ${_age:-0} > 0 ? ${_age:-0} : 0 ) ))
+  _secs=$(( _secs - _age ))
   # The hold is RECORDED, and that record is what keeps the wrapper's delivery
   # assertion quiet: without a row it would synthesise an `error` verdict for a
   # gate that is deliberately, auditably, not yet delivered. No explicit
