@@ -325,6 +325,29 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- resurrect exactly the FAILs this column exists to record.
   graded_verdict TEXT,
   graded_verdict_at TEXT,
+  -- DIVE-4137: WHO OWES THE MERGE on a graded-and-waiting row, and WHY.
+  -- Until now the board derived that owner from maker_agent, which is wrong in the
+  -- common case: the maker has nothing left to do on a branch that is green and
+  -- clean and merely needs a person's eyes, and waking them costs a full reload of
+  -- a pull request they had closed out. The verifier's close now DECIDES the owner
+  -- (src/task/delivery.sh, _merge_disp_decide) and records it, so the board renders
+  -- a decision that was actually made rather than a guess re-derived per render.
+  --   merge_owner  the seat that owes the look — 'main' for every hold except the
+  --                one a maker alone can clear (a conflicted branch needing a
+  --                rebase), which names the maker.
+  --   merge_hold_reason  the disposition's own reason token, e.g.
+  --                'graded-sha-is-not-the-head', 'merge-state-BLOCKED',
+  --                'user-facing-surface'. Rendered in `task show`, not on the
+  --                compact board.
+  -- BARE SET, not COALESCE: this is CURRENT STATE about the CURRENT head. A row
+  -- re-graded after the maker pushes must be able to move from a hold back to a
+  -- merge, and a frozen first answer would make that impossible. NULL = no
+  -- disposition has been recorded (a row graded before this column existed, or one
+  -- that never reached the verifier close), and every reader COALESCEs NULL back to
+  -- the pre-DIVE-4137 maker_agent render, so the migration is a pure ALTER with no
+  -- backfill and no already-graded row changes how it paints.
+  merge_owner TEXT,
+  merge_hold_reason TEXT,
   -- DIVE-3823: RECORDED MERGE EVIDENCE. The merge gate has three ways to ASK
   -- GitHub (caller token, the root-only `_gh_do` bot rail, the anonymous rail) and
   -- a verifier seat on a PRIVATE repo holds none of them: `_gh_do` is the can-push
@@ -1756,6 +1779,10 @@ _TASKS_ADDITIVE_COLUMNS=(
   # See the CREATE TABLE comment for why these are bare-SET while graded_at is
   # COALESCE'd, and why NULL must keep reading as a pass.
   'graded_verdict TEXT' 'graded_verdict_at TEXT'
+  # DIVE-4137: the recorded merge disposition — who owes the look and why. See the
+  # CREATE TABLE comment for why it is bare-SET and why NULL must keep reading as
+  # the pre-DIVE-4137 maker_agent render.
+  'merge_owner TEXT' 'merge_hold_reason TEXT'
   # DIVE-3823: recorded merge evidence the credential-less verifier's close can
   # consult. See the CREATE TABLE comment for why it is structural and why
   # merge_proof_ref must match the CURRENT binding.

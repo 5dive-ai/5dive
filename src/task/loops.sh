@@ -780,6 +780,52 @@ cmd_task_verify() {
            graded_verdict=$( (( rc == 0 )) && printf "'pass'" || printf "'fail'" ),
            graded_verdict_at=datetime('now')
         WHERE id=${id};"
+
+    # DIVE-4137: RECORD WHO OWES THE MERGE, at the moment the grade is stamped.
+    #
+    # Until now the board DERIVED that owner per render, as maker_agent, and that
+    # is wrong in the common case (measured by main 2026-09-09 across #799, #807,
+    # #809 and the frontend #220): the maker has nothing left to do on a branch
+    # that is green and clean and merely needs a person's eyes, and waking them
+    # costs a full reload of a pull request they had closed out. The disposition
+    # (src/task/delivery.sh) answers who owes the LOOK, and the answer is recorded
+    # rather than re-derived, so the board renders a decision that was made.
+    #
+    # BOTH VERIFIER SHAPES REACH HERE, which is why the call site is this one and
+    # not the DIVE-3330 divert above: `verify --cmd=<script>` on a bound row is
+    # diverted into this else-branch by that divert, and `verify --no-done
+    # --result=<prose>` — the shape a credential-less verifier actually uses, and
+    # the one that carries the `graded-sha:` line — enters it directly.
+    #
+    # ONLY ON A PASS, and only with a binding. A FAIL owes the MAKER a fix, not
+    # anyone a look, and this must not paint one. Non-fatal by construction: the
+    # probe is one read whose every failure mode already returns a hold, and the
+    # `|| true` covers a tree that sourced a subset of src/ without delivery.sh.
+    if (( rc == 0 )); then
+      local _md_dref _md_disp _md_owner _md_why
+      _md_dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};")
+      if [[ -n "$_md_dref" ]] && declare -F _merge_disp_probe >/dev/null 2>&1; then
+        _md_disp=$(_merge_disp_probe "$_md_dref" "$(_gate_graded_sha "$result_txt")" 2>/dev/null) \
+          || _md_disp="hold:main:disposition-probe-failed"
+        if [[ "$_md_disp" == "merge" ]]; then
+          # Auto-mergeable at the graded sha. The MERGE itself is not done here —
+          # it belongs to `task done`, where the DIVE-1830 gate can re-derive that
+          # it landed and DIVE-2656 can compare what landed against what was
+          # graded. Recording it as this seat's own name is what turns the board
+          # line into an instruction the grader can act on immediately.
+          _md_owner=$(task_actor ""); _md_why="auto-mergeable at the graded sha — run \`5dive task done ${ident}\`"
+        else
+          _md_owner="${_md_disp#hold:}"; _md_why="${_md_owner#*:}"; _md_owner="${_md_owner%%:*}"
+          # `maker` is a ROLE in the disposition's vocabulary, resolved to a seat
+          # only here, where the row is in hand.
+          [[ "$_md_owner" == "maker" ]] \
+            && _md_owner=$(db "SELECT COALESCE(NULLIF(maker_agent,''), COALESCE(assignee,'')) FROM tasks WHERE id=${id};")
+        fi
+        db "UPDATE tasks SET merge_owner=$(sqlq "${_md_owner:-main}"),
+               merge_hold_reason=$(sqlq "$_md_why")
+            WHERE id=${id};" || true
+      fi
+    fi
   fi
 
   # DIVE-3823: stamp the proof. AFTER the verdict write above, and only on a PASS —
