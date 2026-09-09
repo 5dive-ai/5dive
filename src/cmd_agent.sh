@@ -587,7 +587,7 @@ def classify_sudo(text, measurable):
                 has_cli = True
             elif (command.startswith("/usr/local/bin/5dive agent _deliver") or
                   command.startswith("/usr/local/bin/5dive agent _capture") or
-                  command == "/usr/local/bin/5dive agent _list_private" or
+                  command == "/usr/local/lib/5dive/agent-list-snapshot" or
                   command.startswith("/usr/local/bin/5dive agent buzz inbound") or
                   command.startswith("/usr/local/bin/5dive agent _self_restart") or
                   command.startswith("/usr/local/bin/5dive _audit_append") or

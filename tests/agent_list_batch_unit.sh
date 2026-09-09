@@ -43,6 +43,30 @@ OUT=$(python3 "$PY" "$TMP/agents.json" "$TMP/profiles" "$TMP/connectors" \
   && ok 'readable absent startup breadcrumb is clear' || bad 'startup health changed'
 [[ ! -s "$TMP/stderr" ]] && ok 'batch shaper is quiet on a valid fixture' || bad 'batch shaper wrote unexpected stderr'
 
+# The shaper owns the Python twin of classify_sudo_grant. Exercise both twins
+# against the policy the CLI actually writes: an empty sudoers fixture cannot
+# detect a known-command rename that was applied to only one whitelist.
+# shellcheck source=/dev/null
+source "$ROOT/src/cmd_agent_create.sh"
+render_standard_sudoers agent-alpha 0 >"$TMP/sudoers/agent-alpha"
+SCOPED=$(python3 "$PY" "$TMP/agents.json" "$TMP/profiles" "$TMP/connectors" \
+  "$TMP/home" "$TMP/sudoers" /default 2>"$TMP/scoped-stderr")
+[[ "$(jq -r '.[0].sudo.grant' <<<"$SCOPED")" == cli-scoped &&
+   "$(jq -r '.[0].sudo.extraEntries' <<<"$SCOPED")" == false ]] \
+  && ok 'shaper recognises the exact standard-seat policy without inventing extra entries' \
+  || bad 'shaper misclassifies a policy emitted by render_standard_sudoers'
+
+SHELL_CLASS=$(render_standard_sudoers agent-alpha 0 | classify_sudo_grant)
+PY_CLASS="$(jq -r '.[0].sudo.grant' <<<"$SCOPED")|$(jq -r '.[0].sudo.runas' <<<"$SCOPED")|$([[ "$(jq -r '.[0].sudo.extraEntries' <<<"$SCOPED")" == true ]] && printf 1 || printf 0)"
+[[ "$SHELL_CLASS" == 'cli-scoped|root|0' && "$PY_CLASS" == "$SHELL_CLASS" ]] \
+  && ok 'shell and Python sudo classifiers agree on the generated scoped grant' \
+  || bad "sudo classifier twins disagree: shell=$SHELL_CLASS python=$PY_CLASS"
+
+retired_private="/usr/local/bin/5dive agent _list"'_private'
+! grep -R -Fq "$retired_private" "$ROOT/src" \
+  && ok 'retired privileged command name has zero source consumers' \
+  || bad 'retired privileged command name still survives in a source consumer'
+
 grep -q '^bundle=/usr/local/bin/5dive$' "$ROOT/5dive-agent-list-snapshot" \
   && ! grep -q '\$@\|\${[1-9]' "$ROOT/5dive-agent-list-snapshot" \
   && ok 'privileged helper uses fixed paths and no caller arguments' || bad 'privileged helper accepts caller-controlled paths'
