@@ -106,5 +106,47 @@ grep -q 'task.grade.checkpoint' <<<"$EMITS" && grep -q 'arm=mutant-3' <<<"$EMITS
 EMITS=""; _grader_checkpoint DIVE-1 "" pass abc; rc=$?
 [[ $rc == 0 && -z "$EMITS" ]] && ok_ 'arm4b: nameless arm is a no-op' || bad_ 'arm4b' "rc=$rc $EMITS"
 
+# The MIRROR: the ledger row is durable, but a fresh grader reads the ROW, so a
+# checkpoint that never reaches the body is one the next grader cannot resume
+# from. Recorded to a file — cmd_task_set_body is called inside a subshell here,
+# and a variable written there would not survive it (the same trap that made the
+# pool lane's safety arms pass vacuously).
+MIRROR="$(mktemp)"; trap 'rm -f "$MIRROR"' RETURN 2>/dev/null || true
+cmd_task_set_body(){ printf '%s\n' "$*" >> "$MIRROR"; }
+EMITS=""; _grader_checkpoint DIVE-9 mutant-7 fail deadbee
+grep -q 'DIVE-9' "$MIRROR" && grep -q 'arm=mutant-7' "$MIRROR" && grep -q -- '--append' "$MIRROR" \
+  && ok_ 'arm4c: checkpoint is mirrored into the row body, appended' \
+  || bad_ 'arm4c: mirrored into the row body' "$(cat "$MIRROR")"
+# A failing mirror must not lose the ledger row that already landed.
+cmd_task_set_body(){ return 1; }
+EMITS=""; _grader_checkpoint DIVE-9 arm-x pass abc; rc=$?
+[[ $rc == 0 ]] && grep -q 'task.grade.checkpoint' <<<"$EMITS" \
+  && ok_ 'arm4d: a failed mirror keeps the ledger row and returns 0' \
+  || bad_ 'arm4d: failed mirror is non-fatal' "rc=$rc emits=$EMITS"
+
+# ══ UNDER ERREXIT, WHICH IS THE ONLY PLACE THIS DEFECT IS VISIBLE ══
+# The bundle runs `set -euo pipefail`; this harness does not. A mirror call left
+# unguarded is a bare failing statement — harmless here, and it ABORTS the grader
+# there — so a mutant dropping the `|| true` survived every arm above. Graded by
+# running the function under `set -e` in a child shell.
+#
+# THE SENTINEL IS READ FROM STDOUT AND ITS ABSENCE IS THE DEATH. Writing this as
+# `( set -e; ... ) || echo DIED` cannot work: attaching a catch puts the subshell
+# in a guarded context, the errexit exemption propagates inward, and the death it
+# is meant to detect stops happening.
+errexit_out=$(bash -c '
+  set -euo pipefail
+  ledger_emit(){ :; }
+  task_actor(){ printf t; }
+  cmd_task_set_body(){ return 1; }
+  source src/task/grader_pool.sh
+  _grader_checkpoint DIVE-9 arm-z pass abc
+  echo SURVIVED
+' 2>/dev/null)
+[[ "$errexit_out" == *SURVIVED* ]] \
+  && ok_ 'arm4e: a failing mirror does not abort the grader under set -e' \
+  || bad_ 'arm4e: failing mirror under set -e' 'the grader died — the mirror call is unguarded'
+rm -f "$MIRROR"
+
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]

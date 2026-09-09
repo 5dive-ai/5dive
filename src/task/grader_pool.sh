@@ -144,6 +144,18 @@ _grader_checkpoint() {  # <ident> <arm> <verdict> <graded-sha>
   declare -F ledger_emit >/dev/null 2>&1 || return 0
   ledger_emit task.grade.checkpoint ident="$ident" actor="$(task_actor "")" \
     detail="arm=${arm} verdict=${verdict:-unknown} sha=${sha:-unknown}"
+  # MIRRORED INTO THE ROW BODY, and the mirror is the half that matters for
+  # resumption. The ledger is the durable record, but the NEXT grader is a fresh
+  # wake, and a fresh wake reads the ROW — that is the assumption the whole loop
+  # already runs on. A checkpoint only the ledger holds is a checkpoint the
+  # thing it exists for will never look at.
+  #
+  # Best-effort: a failed mirror must not lose the ledger row that already
+  # landed, so the append is guarded and never propagates a failure.
+  declare -F cmd_task_set_body >/dev/null 2>&1 || return 0
+  local line="- grade checkpoint: arm=${arm} verdict=${verdict:-unknown} sha=${sha:-unknown}"
+  ( JSON_MODE=0; cmd_task_set_body "$ident" "$line" --append ) >/dev/null 2>&1 || true
+  return 0
 }
 
 # `5dive task grader-replay [--days=N] [--cap=N] [--json]` — DIVE-4164 deliverable 2.
