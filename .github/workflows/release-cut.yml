@@ -126,7 +126,12 @@ jobs:
           # Same filter and same `sort -V` as resolve_gh_tag(). If these two ever
           # disagree, the assertion further down is what surfaces it.
           git fetch -q --tags origin
-          incumbent=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          # `|| incumbent=""` for the same reason as the three greps below (DIVE-4153):
+          # no release tag at all is the FIRST-CUT lane this job's own `reason` input
+          # advertises, and there grep exits 1, pipefail promotes it and `bash -e {0}`
+          # aborts the step before the `${incumbent:-<none>}` path can ever be taken.
+          # Not currently reachable (v0.28.0 exists) — it is the same defect one tag away.
+          incumbent=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1) || incumbent=""
           echo "incumbent published tag (install.sh's rule): ${incumbent:-<none>}"
 
           # >>> DIVE-2247 cut-time version derivation
