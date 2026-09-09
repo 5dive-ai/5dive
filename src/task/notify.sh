@@ -1995,7 +1995,111 @@ _task_need_route_deliver() {
   return 3
 }
 
+# ── DIVE-4154 arm D — THE UNDO WINDOW, ON THE PHONE PING ONLY ────────────────
+#
+# Measured on gate_history, 30 days to 2026-09-09 (DIVE-4150): of 193 human-facing
+# gates, 138 were WITHDRAWN BY THE FILING SEAT ITSELF after the phone had already
+# rung — median 1.0 min, 76 inside 2 minutes, 104 inside 15. The system pages
+# first and thinks later; the seat then retracts. Those pages bought the human
+# nothing: by the time he looked, the question was gone.
+#
+# WHAT IS HELD IS THE PUSH NOTIFICATION, AND NOTHING ELSE. The gate row is
+# written, blocked and pending BEFORE this function is reached, so at file time it
+# is already on the dashboard "Needs you" card, in `5dive task inbox`, in
+# `task queue`, in the digest, and answerable by `5dive task answer`. The only
+# thing that waits is the buzz in his pocket. A withdrawal inside the window
+# therefore pages NOBODY, and a gate that survives the window pages exactly as it
+# does today, with the same text and the same buttons.
+#
+# WHY NOT LONGER, when 104 of 138 land inside 15 minutes: because the false-page
+# saving is not the only axis. A REAL gate delayed 15 minutes is a real cost, and
+# the withdrawal distribution is front-loaded hard enough (median 1.0 min) that
+# 2 minutes already takes 76 of the 138 — over half the win for an eighth of the
+# delay. Widen it later against a measurement, not against this comment.
+#
+# THE TWO SKIPS ARE THE FILER SAYING "THIS CANNOT WAIT", in the two vocabularies
+# that exist: `--urgent` on the gate, and `priority=urgent` on the row. Neither is
+# inferred from the ask text — that is the keyword-floor mistake this row's arm C
+# is deleting, and re-introducing it here would be the same defect wearing a
+# different hat.
+#
+# THIS IS NOT THE ONLY DELIVERY PATH. If the box dies inside the window the child
+# dies with it and the ping is lost — which is why the loss is bounded rather than
+# unhandled: gate_pinged_at stays NULL, so the heartbeat's 15-minute gate re-nag
+# treats the row exactly as it treats any filed-unnotified gate and escalates it.
+# The window can delay a page; it cannot swallow one.
+_GATE_UNDO_WINDOW_SECS=120
+
+# Seconds to hold this gate's phone ping. 0 = ping now.
+# Reads the row's priority, so it must be called AFTER the gate UPDATE commits —
+# which is the case: task_need_notify runs after cmd_task_need's write.
+_task_gate_undo_window_secs() {
+  local ident="$1" secs="${_5DIVE_GATE_UNDO_WINDOW_SECS:-$_GATE_UNDO_WINDOW_SECS}"
+  # An explicit numeric override (harnesses, and the operator escape hatch) wins,
+  # but a non-numeric one is a typo, not a policy — fall back rather than defer
+  # forever on a garbage value.
+  [[ "$secs" =~ ^[0-9]+$ ]] || secs="$_GATE_UNDO_WINDOW_SECS"
+  # Kill switch. `off` restores the pre-DIVE-4154 ping byte for byte and needs no
+  # release to take effect, same contract as `task pfr-autoclear`.
+  local pref; pref=$(_task_pref_get gate_undo_window 2>/dev/null || echo ""); pref="${pref:-on}"
+  [[ "$pref" == "off" ]] && { printf '0'; return 0; }
+  # The filer said it cannot wait.
+  [[ "${TASK_GATE_ROUTE_URGENT:-0}" == "1" ]] && { printf '0'; return 0; }
+  local prio; prio=$(db "SELECT COALESCE(priority,'') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || echo "")
+  [[ "$prio" == "urgent" ]] && { printf '0'; return 0; }
+  printf '%s' "$secs"
+}
+
+# True iff the gate this window was opened for is STILL the live, unanswered gate.
+# Keyed on need_asked_at, not on a bare "is something pending": a withdraw inside
+# the window followed by a re-file is a DIFFERENT gate with its own window and its
+# own child, and this one must not deliver the new one's page.
+_task_gate_still_live() {
+  local ident="$1" asked_at="$2" n
+  n=$(db "SELECT COUNT(*) FROM tasks
+            WHERE ident=$(sqlq "$ident")
+              AND need_asked_at IS NOT NULL
+              AND need_asked_at=$(sqlq "$asked_at")
+              AND (need_answer IS NULL OR trim(need_answer)='');" 2>/dev/null || echo "")
+  [[ "$n" == "1" ]]
+}
+
+# The window's wrapper. Delegates to _task_need_notify_deliver_now, which is the
+# unchanged pre-DIVE-4154 deliverer, either now or once the window closes.
 _task_need_notify_deliver() {
+  local ident="$1"
+  local _secs; _secs=$(_task_gate_undo_window_secs "$ident")
+  if (( _secs <= 0 )); then
+    _task_need_notify_deliver_now "$@"
+    return $?
+  fi
+  local _asked; _asked=$(db "SELECT COALESCE(need_asked_at,'') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || echo "")
+  if [[ -z "$_asked" ]]; then
+    # No timestamp to pin the window to means no way to tell a withdrawal from a
+    # re-file, so there is nothing safe to hold. Deliver now — the window is an
+    # optimisation, never a precondition for a gate reaching its human.
+    _task_need_notify_deliver_now "$@"
+    return $?
+  fi
+  # The hold is RECORDED, and that record is what keeps the wrapper's delivery
+  # assertion quiet: without a row it would synthesise an `error` verdict for a
+  # gate that is deliberately, auditably, not yet delivered. No explicit
+  # TASK_GATE_DELIVERY_ROWS bump — _task_gate_delivery_log credits itself.
+  _task_gate_delivery_log ok "$ident" "hold:${_secs}s" "" \
+    "phone ping HELD ${_secs}s (DIVE-4154 undo window) — the gate is live NOW on the dashboard, in task inbox and in task queue; a withdrawal inside the window pages nobody. gate_pinged_at stays NULL so the re-nag still escalates if the ping is lost"
+  ( {
+      sleep "$_secs"
+      if _task_gate_still_live "$ident" "$_asked"; then
+        _task_need_notify_deliver_now "$@"
+      else
+        _task_gate_delivery_log ok "$ident" "hold:withdrawn" "" \
+          "undo window closed with the gate no longer live (withdrawn or answered inside ${_secs}s) — NOBODY was paged"
+      fi
+    } >/dev/null 2>&1 & ) || true
+  return 0
+}
+
+_task_need_notify_deliver_now() {
   local ident="$1" need_type="$2" ask="$3" options="$4" recommend="${5:-}"
   local secret_key="${6:-}" connector="${7:-}" human_nonce="${8:-}"
   local precedent_cite="${9:-}"  # OSS-11: prior-answer citation, empty if none
