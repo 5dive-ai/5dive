@@ -269,6 +269,7 @@ cmd_task() {
     merge)           cmd_task_merge "$@" ;;         # DIVE-3474 verifier merges what IT graded
     merge-audit)     cmd_task_merge_audit "$@" ;;   # DIVE-1935 retrospective sweep
     grader-replay)   cmd_task_grader_replay "$@" ;;  # DIVE-4164 dry-run capacity replay
+    grader-tick)     cmd_task_grader_tick "$@" ;;    # DIVE-4164 pool lane (dark by default)
     merge-unverified) cmd_task_merge_unverified "$@" ;;  # DIVE-3526 consume the unverified stamp
     merge-gate-selftest) cmd_task_merge_gate_selftest "$@" ;;  # DIVE-1935 instrument check
     verify)          cmd_task_verify "$@" ;;

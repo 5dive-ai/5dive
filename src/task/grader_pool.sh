@@ -252,3 +252,133 @@ print("NOTE: arrivals replayed against the cap. The usage meter keeps no history
 print("      so the spawn FLOOR is not replayable and is not modelled here.")
 ' "$cap" "$days" "$json" "$svc"
 }
+
+# `_grader_account_of <agent>` — which auth account a pool seat spends from.
+# Read from the SAME `5dive usage --json` document the floor reads, deliberately:
+# the mapping and the meter must agree, and two sources could disagree about
+# which window a seat draws on — which is the one thing the cap cannot survive.
+_grader_account_of() {  # <agent>  [<usage-json-on-stdin>]
+  local agent="$1"
+  [[ -n "$agent" ]] || { printf ''; return 0; }
+  jq -r --arg n "$agent" '
+    [ .. | objects | select(.name? == $n) | .account? | strings ] | (.[0] // "")
+  ' 2>/dev/null || printf ''
+}
+
+# `5dive task grader-tick [--commit] [--cap=N] [--json]` — DIVE-4164, the lane.
+#
+# Consumes `task.grade.requested` and decides, per pending delivery, whether a
+# grader may be spawned right now: is there a free slot under the cap, does the
+# chosen pool seat's ACCOUNT have window headroom, and can that seat actually
+# read the repo it would grade.
+#
+# ══ IT SHIPS DARK, AND THAT IS DELIBERATE ══
+# Two independent locks, because this is the one verb in the row that starts
+# real sessions on a live fleet:
+#   1. DRY-RUN IS THE DEFAULT. Without --commit it prints the plan and spawns
+#      nothing. The plan is the useful artifact on its own — it is how you see
+#      what the lane WOULD do before letting it do anything.
+#   2. THE POOL IS EMPTY BY DEFAULT. `_GRADER_POOL` ships unset, so even
+#      `--commit` has nowhere to spawn and says so. Naming the pool is a
+#      separate, deliberate act from enabling the lane.
+# A customer-facing flow does not ship while its end-to-end arm is owed; this
+# one's arm is owed, so the surface ships dark rather than waiting in a branch.
+_GRADER_POOL="${_GRADER_POOL:-}"
+cmd_task_grader_tick() {
+  local commit=0 cap="$_GRADER_MAX_PER_ACCOUNT" json="${JSON_MODE:-0}"
+  while (( $# )); do
+    case "$1" in
+      --commit) commit=1 ;;
+      --cap=*)  cap="${1#--cap=}" ;;
+      --json)   JSON_MODE=1; json=1 ;;
+      *) fail "$E_USAGE" "usage: 5dive task grader-tick [--commit] [--cap=N] [--json]" ;;
+    esac; shift
+  done
+  [[ "$cap" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "--cap takes a whole number"
+
+  # Pending = a request with no later spawn record, whose row is still open.
+  local pending
+  pending=$(db "SELECT DISTINCT e.ident FROM lifecycle_events e
+                  JOIN tasks t ON t.ident = e.ident
+                 WHERE e.kind='task.grade.requested'
+                   AND t.status NOT IN ('done','cancelled')
+                   AND NOT EXISTS (SELECT 1 FROM lifecycle_events s
+                                    WHERE s.ident=e.ident AND s.kind='task.grade.spawned'
+                                      AND s.id > e.id)
+                 ORDER BY e.id;" 2>/dev/null || printf '')
+
+  local usage="" ; usage=$($_GRADER_USAGE_CMD 2>/dev/null || printf '')
+  local n_pending=0 n_spawn=0 n_queue=0 n_refuse=0 plan=""
+  local inflight; inflight=$(db "SELECT COUNT(*) FROM lifecycle_events s
+                                  WHERE s.kind='task.grade.spawned'
+                                    AND NOT EXISTS (SELECT 1 FROM lifecycle_events d
+                                                     WHERE d.ident=s.ident
+                                                       AND d.kind IN ('task.done','task.rejected')
+                                                       AND d.id > s.id);" 2>/dev/null || printf 0)
+  [[ "$inflight" =~ ^[0-9]+$ ]] || inflight=0
+
+  local ident
+  while IFS= read -r ident; do
+    [[ -n "$ident" ]] || continue
+    n_pending=$((n_pending+1))
+    # THE CAP IS CHECKED BEFORE THE SEAT, so a full lane costs no meter reads and
+    # no credential probes — a queued delivery must be cheap or the tick becomes
+    # the burn it was meant to bound.
+    if (( inflight >= cap )); then
+      n_queue=$((n_queue+1)); plan+="queue   $ident  (cap $cap reached; $inflight in flight)"$'\n'; continue
+    fi
+    if [[ -z "$_GRADER_POOL" ]]; then
+      n_refuse=$((n_refuse+1))
+      plan+="dark    $ident  (no pool configured — set _GRADER_POOL to enable)"$'\n'; continue
+    fi
+    # First pool seat whose ACCOUNT has headroom.
+    local seat="" chosen="" why=""
+    for seat in $_GRADER_POOL; do
+      local acct; acct=$(printf '%s' "$usage" | _grader_account_of "$seat")
+      local verdict rc
+      verdict=$(printf '%s' "$usage" | _grader_window_ok "$acct"); rc=$?
+      if (( rc == 0 )); then chosen="$seat"; why="$verdict"; break; fi
+      why="${why}${seat}: ${verdict}; "
+    done
+    if [[ -z "$chosen" ]]; then
+      n_queue=$((n_queue+1)); plan+="queue   $ident  (no seat with headroom — $why)"$'\n'; continue
+    fi
+    n_spawn=$((n_spawn+1)); inflight=$((inflight+1))
+    plan+="spawn   $ident  -> $chosen  ($why)"$'\n'
+    if (( commit )); then
+      # THE ONLY LINE THAT STARTS ANYTHING, and it records the intent to the
+      # ledger BEFORE acting so a crash between the two leaves a spawn we can
+      # see rather than one we cannot account for.
+      ledger_emit task.grade.spawned ident="$ident" actor="$(task_actor "")" \
+        detail="grader session on ${chosen}" || true
+      _grader_spawn_session "$chosen" "$ident" || warn "$ident: spawn on $chosen failed"
+    fi
+  done <<<"$pending"
+
+  if (( json )); then
+    printf '{"pending":%d,"spawned":%d,"queued":%d,"dark":%d,"cap":%d,"commit":%s,"pool":"%s"}\n' \
+      "$n_pending" "$n_spawn" "$n_queue" "$n_refuse" "$cap" \
+      "$( ((commit)) && printf true || printf false )" "$_GRADER_POOL"
+    return 0
+  fi
+  printf '%s' "$plan"
+  printf 'pending=%d spawn=%d queue=%d dark=%d cap=%d %s\n' \
+    "$n_pending" "$n_spawn" "$n_queue" "$n_refuse" "$cap" \
+    "$( ((commit)) && printf '(COMMITTED)' || printf '(dry-run — pass --commit to act)' )"
+}
+
+# `_grader_spawn_session <seat> <ident>` — start one grading session.
+#
+# A SESSION ON A POOL SEAT, not a new seat: the isolation this design needs is
+# "no maker context, no previous-grade context", and a cold wake already IS an
+# empty session window. A seat costs a unix account plus a runtime provision
+# (~50s measured) plus a sudoers render; a wake is seconds.
+#
+# Deliberately the ONLY function here that touches the fleet, so there is exactly
+# one place to audit and one place to stub in a harness.
+_grader_spawn_session() {  # <seat> <ident>
+  local seat="$1" ident="$2"
+  [[ -n "$seat" && -n "$ident" ]] || return 1
+  5dive task assign "$ident" "$seat" >/dev/null 2>&1 || return 1
+  5dive agent send "$seat" "Grade delivered task ${ident}. Read the row, grade the delivery, then run 5dive task done or 5dive task reject. Checkpoint each verified arm to the row as you go." >/dev/null 2>&1
+}
