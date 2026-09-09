@@ -43,7 +43,7 @@ command -v python3 >/dev/null && python3 -c 'import yaml' 2>/dev/null || {
 
 # ---- load the units under test, without the rest of the CLI -----------------
 awk '/^_compose_parse\(\)/{f=1} f{print} f&&/^PY$/{p=1} p&&/^}$/{exit}' "$SRC" > "$TMP/parse.sh"
-for fn in _team_capability_label _team_capability_degraded _team_capability_present _compose_requires_preflight; do
+for fn in _team_capability_label _team_capability_degraded _team_capability_present _compose_requires_preflight _compose_spec_pins_auth_profile; do
   sed -n "/^${fn}()/,/^}/p" "$SRC" >> "$TMP/req.sh"
 done
 bash -n "$TMP/parse.sh" && bash -n "$TMP/req.sh" \
@@ -62,7 +62,7 @@ preflight() {
     . "$TMP/req.sh"
     step() { printf 'STEP %s\n' "$*"; }
     warn() { printf 'WARN %s\n' "$*" >&2; }
-    _compose_self() { printf '%s' "$TMP/bin-$mode/nosuchcli"; }
+    _compose_self() { printf '%s' "${SELF_CLI:-$TMP/bin-$mode/nosuchcli}"; }
     _compose_requires_preflight "$spec"
     printf 'RC=%s\n' "$?" )
 }
@@ -119,6 +119,38 @@ if grep -q 'RC=0' <<<"$out" && grep -q 'no probe for' <<<"$out" \
   ok_t 'T4 an unprobeable key says so — it is claimed neither satisfied nor absent'
 else
   bad_t 'T4 an unknown requires: key was mis-reported' "out=$out"
+fi
+
+# A PROBE THAT ITSELF EXITS 2 MUST NOT BE READ AS THE "no probe" SENTINEL.
+# This is the real-world browser case, not a hypothetical: `5dive browser --help`
+# on a box without the plugin prints "unknown command: browser" and exits 2. If
+# that status reaches the case in _compose_requires_preflight it prints "no probe
+# for ('browser')" — the exact lie T4 exists to forbid — on a box where the
+# capability is a MEASURED absence. (quinn, DIVE-4103 iteration 1.)
+printf '#!/usr/bin/env bash\nprintf "unknown command: %%s\\n" "$1" >&2\nexit 2\n' > "$TMP/self-rc2"
+chmod +x "$TMP/self-rc2"
+out=$(SELF_CLI="$TMP/self-rc2" preflight '{"team":{"requires":["browser"]},"agents":{}}' present 2>&1)
+if grep -q 'RC=0' <<<"$out" && grep -q 'PRECONDITION ABSENT' <<<"$out" && ! grep -q 'no probe for' <<<"$out"; then
+  ok_t 'T4a a probe that exits 2 reports ABSENT — its status does not impersonate the no-probe sentinel'
+else
+  bad_t 'T4a a known probe exiting 2 was reported as unchecked; the sentinel collides with a real exit status' "out=$out"
+fi
+# Negative control for T4a: the same stub must still leave an UNKNOWN key
+# unchecked. Without this, collapsing every arm to 0/1 could pass T4a by simply
+# never reporting "no probe" at all.
+out=$(SELF_CLI="$TMP/self-rc2" preflight '{"team":{"requires":["teleportation"]},"agents":{}}' present 2>&1)
+if grep -q 'no probe for' <<<"$out" && ! grep -q 'PRECONDITION ABSENT' <<<"$out"; then
+  ok_t 'T4an negative control — the sentinel still fires for a key with no probe (T4a did not just delete it)'
+else
+  bad_t 'T4an the no-probe sentinel no longer fires for an unknown key' "out=$out"
+fi
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/self-ok"
+chmod +x "$TMP/self-ok"
+out=$(SELF_CLI="$TMP/self-ok" preflight '{"team":{"requires":["browser"]},"agents":{}}' present 2>&1)
+if grep -q '^STEP precondition ok' <<<"$out" && ! grep -q 'WARN' <<<"$out"; then
+  ok_t 'T4b a browser probe that SUCCEEDS is still reported satisfied (the 0/1 collapse kept the true arm)'
+else
+  bad_t 'T4b a successful browser probe was not reported satisfied' "out=$out"
 fi
 
 # Forward-compat / malformed shapes must not take the import down.
@@ -205,7 +237,17 @@ grep -qi 'does not merge unseen' <<<"$cto" \
 # account. Functional where it can be: the guard is a grep over the spec FILE, so
 # the arm runs that same predicate over both shapes and requires it to separate
 # them. A guard that answers the same for both is inert.
-pins() { sed 's/[[:space:]]*#.*$//' "$1" 2>/dev/null | grep -q 'TEAM_AUTH_PROFILE'; }
+# Driven through the PRODUCTION predicate extracted above, not a copy of it:
+# these arms previously re-declared the same sed|grep and stayed 31/31 green
+# while the real line in cmd_compose.sh was mutated to a naked grep — which is a
+# live regression, because deploy-team.5dive.yaml explains ${TEAM_AUTH_PROFILE}
+# in a COMMENT, so a naked grep reads this very template as pinned and suppresses
+# the warning the guard exists for. (quinn, DIVE-4103 iteration 1.)
+pins() { ( set -uo pipefail; . "$TMP/req.sh"; _compose_spec_pins_auth_profile "$1" ); }
+( . "$TMP/req.sh"; declare -F _compose_spec_pins_auth_profile >/dev/null ) \
+  && ok_t 'T16e the production auth-profile predicate was extracted — T16/T16n are not grading a missing function' \
+  || bad_t 'T16e _compose_spec_pins_auth_profile was not extracted from the source; T16/T16n are vacuous' ''
+
 if pins "$ROOT/team-templates/eng-studio.5dive.yaml" && ! pins "$TPL"; then
   ok_t 'T16 the inert-flag guard separates a template that pins an account from one that does not'
 else

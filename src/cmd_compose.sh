@@ -534,10 +534,31 @@ _team_capability_degraded() {
 # hang an import on a box with no route out. It answers "does this box hold a
 # credential", not "does that credential carry push on your repo" — a scope read
 # needs a repo we have not been given and a network call we just refused to make.
+# Does this spec actually PIN an account, i.e. would --auth-profile= change what
+# gets provisioned? Comment lines are stripped first: this template EXPLAINS in
+# its header why it pins no account, and a naked grep read that explanation as
+# the pin.
+#
+# Named rather than inlined at the call site so the suite can drive THIS
+# predicate. Its arms previously re-declared the same sed|grep and stayed green
+# while the production line was mutated to a naked grep (quinn, DIVE-4103
+# iteration 1) — a copy of a line is not a test of it.
+_compose_spec_pins_auth_profile() {
+  sed 's/[[:space:]]*#.*$//' "$1" 2>/dev/null | grep -q 'TEAM_AUTH_PROFILE'
+}
+
+# rc contract: 0 = present · 1 = absent · 2 = THIS CLI HAS NO PROBE for the key.
+#
+# 2 is a SENTINEL, so every known arm must collapse its probe's own exit status
+# to 0/1 before returning it. Returning a probe's status verbatim is how the
+# sentinel got claimed by accident: `5dive browser --help` on a box without the
+# plugin prints "unknown command: browser" and exits 2, which reported "not
+# checked" on exactly the box where the answer is a measured ABSENT — the one
+# lie the unknown-key arm exists to prevent. (quinn, DIVE-4103 iteration 1.)
 _team_capability_present() {
   case "$1" in
-    github_push) command -v gh >/dev/null 2>&1 && gh auth token >/dev/null 2>&1 ;;
-    browser)     "$(_compose_self)" browser --help >/dev/null 2>&1 ;;
+    github_push) command -v gh >/dev/null 2>&1 && gh auth token >/dev/null 2>&1 || return 1 ;;
+    browser)     "$(_compose_self)" browser --help >/dev/null 2>&1 || return 1 ;;
     *)           return 2 ;;
   esac
 }
@@ -1418,9 +1439,7 @@ cmd_team() {
   # correct, only the caller's belief about it was not.
   if [[ -n "$profile" ]]; then
     export TEAM_AUTH_PROFILE="$profile"
-    # Comment lines are stripped first: this template EXPLAINS in its header why
-    # it pins no account, and a naked grep read that explanation as the pin.
-    sed 's/[[:space:]]*#.*$//' "$file" 2>/dev/null | grep -q 'TEAM_AUTH_PROFILE' || warn \
+    _compose_spec_pins_auth_profile "$file" || warn \
       "--auth-profile=$profile has no effect on this template — it does not pin an account (its seats come up with deferred auth, which is what lets a flagless one-tap import work). The roster still comes up; sign each seat in afterwards with: 5dive agent auth <name>"
   fi
 
