@@ -7,9 +7,12 @@
 # A second predicate (DIVE-3490, `superseded_identity`) reaches branches whose PR
 # was closed UNMERGED, on proof of content identity with the permanent
 # `refs/pull/N/head`. In --report it is the FOURTH ARM of the evidence classifier
-# (DIVE-2394), the one that discharges a finding. On the delete path it is
-# REPORT/DRY-RUN ONLY and deliberately not armed under --apply -- see the comment
-# on the function and at its call sites.
+# (DIVE-2394), the one that discharges a finding.
+#
+# On the delete path it is OFF BY DEFAULT and armed only by the caller setting
+# BRANCH_HYGIENE_ARM_PULLREF_IDENTITY=1 (DIVE-4138). DIVE-3490 conditioned arming
+# on "a deliberate change to that workflow, not a merge of this file", so the
+# switch lives in the workflow env and this file still refuses on its own.
 
 set -euo pipefail
 
@@ -514,6 +517,63 @@ if [[ "$mode" == "report" ]]; then
   exit 0
 fi
 
+# DIVE-4138. Arming the pull-ref-identity predicate on the delete path. The
+# refusal this lifts was NOT arbitrary caution, and the condition it named has
+# now been met, so record both rather than just deleting the comment:
+#
+#   DIVE-3490 armed the predicate in --report/--dry-run only, because "this
+#   predicate's authorisation was explicitly conditioned on its first live
+#   output being a list a human reads."
+#
+# That list exists. The weekly stale-digest arm has been printing
+# `PRESERVED pull-ref-identity #N` lines into the run summary since DIVE-3490
+# merged; on 2026-09-09 a human (lodar) read the eight branches it names,
+# one by one, and answered a tier-2 decision gate on DIVE-4138 with
+# `nightly-for-reviewed-only`: delete nightly the branches that HAVE a
+# recovery ref, leave the ones that do not for a person.
+#
+# The safety property is unchanged and is the whole reason this is armable: a
+# `match` means the branch head is byte-identical to `refs/pull/N/head`, a ref
+# GitHub retains permanently, so the delete is reversible with
+# `git push origin <sha>:refs/heads/<name>`. `mismatch`, `unresolved` and
+# `none` still PRESERVE -- and `none` is what covers every branch that never
+# had a PR at all (including the orphan `status` data branch), which is
+# exactly the class with no undo.
+#
+# Note what is deliberately NOT the predicate: branch AGE. A 7-day tip cutoff
+# would spare `status` only by accident (it is force-pushed daily, so it is
+# never old) and would delete no-PR branches once they aged. Recoverability is
+# the axis; age is not.
+arm_pullref="${BRANCH_HYGIENE_ARM_PULLREF_IDENTITY:-0}"
+
+# Race-guarded delete, shared by both delete predicates so the pull-ref path
+# cannot acquire weaker last-moment checks than the merged-PR path. Fails
+# closed: the ref must still point at the inventoried SHA and must still have
+# no open PR. Returns 0 if deleted, 1 if a recheck preserved it; prints its own
+# DELETED/PRESERVE line either way.
+guarded_delete() { # <branch> <sha> <label>
+  local branch="$1" sha="$2" label="$3"
+  local encoded_branch current_sha open_count encoded_ref
+
+  encoded_branch=$(urlencode "$branch")
+  current_sha=$("$GH_BIN" api "repos/$repo/branches/$encoded_branch" --jq .commit.sha)
+  if [[ "$current_sha" != "$sha" ]]; then
+    echo "PRESERVE changed-since-inventory branch=$branch old=$sha new=$current_sha"
+    return 1
+  fi
+  open_count=$("$GH_BIN" api --method GET "repos/$repo/pulls" \
+    -f state=open -f "head=$owner:$branch" -f per_page=1 --jq length)
+  if [[ "$open_count" != "0" ]]; then
+    echo "PRESERVE newly-open-pr branch=$branch"
+    return 1
+  fi
+
+  encoded_ref=$(urlencode "heads/$branch")
+  "$GH_BIN" api --method DELETE "repos/$repo/git/refs/$encoded_ref" >/dev/null
+  echo "DELETED branch=$branch sha=$sha $label"
+  return 0
+}
+
 declare -A preserve=()
 while IFS= read -r branch; do
   [[ -n "$branch" ]] && preserve["$branch"]=1
@@ -569,12 +629,16 @@ while IFS=$'\t' read -r branch sha protected; do
       < <(superseded_identity "$sha" "$closed_prs")
     case "$ident_state" in
       match)
-        if [[ "$mode" == "apply" ]]; then
+        if [[ "$mode" == "apply" && "$arm_pullref" != "1" ]]; then
           echo "PRESERVE superseded-identity-not-armed branch=$branch sha=$sha pr=#$ident_pr"
           ((skipped_count += 1))
         else
           echo "DELETE-CANDIDATE branch=$branch sha=$sha pr=#$ident_pr via=pullref-identity pullref=$ident_pullref"
           ((candidate_count += 1))
+          if [[ "$mode" == "apply" ]] \
+            && guarded_delete "$branch" "$sha" "pr=#$ident_pr via=pullref-identity"; then
+            ((deleted_count += 1))
+          fi
         fi
         ;;
       mismatch)
@@ -598,26 +662,15 @@ while IFS=$'\t' read -r branch sha protected; do
   ((candidate_count += 1))
   [[ "$mode" == "apply" ]] || continue
 
-  # Fail closed on races: the ref must still point at the inventoried SHA and it
-  # must still have no open PR immediately before deletion.
-  encoded_branch=$(urlencode "$branch")
-  current_sha=$("$GH_BIN" api "repos/$repo/branches/$encoded_branch" --jq .commit.sha)
-  if [[ "$current_sha" != "$sha" ]]; then
-    echo "PRESERVE changed-since-inventory branch=$branch old=$sha new=$current_sha"
-    continue
+  if guarded_delete "$branch" "$sha" "pr=#$pr_number"; then
+    ((deleted_count += 1))
   fi
-  open_count=$("$GH_BIN" api --method GET "repos/$repo/pulls" \
-    -f state=open -f "head=$owner:$branch" -f per_page=1 --jq length)
-  if [[ "$open_count" != "0" ]]; then
-    echo "PRESERVE newly-open-pr branch=$branch"
-    continue
-  fi
-
-  encoded_ref=$(urlencode "heads/$branch")
-  "$GH_BIN" api --method DELETE "repos/$repo/git/refs/$encoded_ref" >/dev/null
-  echo "DELETED branch=$branch sha=$sha pr=#$pr_number"
-  ((deleted_count += 1))
 done < <("$GH_BIN" api --paginate "repos/$repo/branches?per_page=100" \
   --jq '.[] | [.name, .commit.sha, .protected] | @tsv')
 
-echo "SUMMARY candidates=$candidate_count deleted=$deleted_count preserved=$skipped_count mode=$mode"
+# DIVE-4138: name the arming state in SUMMARY. Without it, `deleted=0` reads the
+# same whether nothing qualified or the predicate was simply off -- and
+# `deleted=0` is the SUCCESS case for this job, so nobody re-reads the log to
+# find out which one they are looking at.
+if [[ "$arm_pullref" == "1" ]]; then arm_note=armed; else arm_note=off; fi
+echo "SUMMARY candidates=$candidate_count deleted=$deleted_count preserved=$skipped_count mode=$mode pullref_identity=$arm_note"
