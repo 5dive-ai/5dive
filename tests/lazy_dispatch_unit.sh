@@ -68,6 +68,12 @@
 #   T11 the preload table exists, is capped, and names known call edges. It is
 #       what keeps T10 green, and an empty one reads exactly like "nothing calls
 #       across a module boundary" — the same silent shape as T3.
+#   T15 the ratio arms' DENOMINATOR FLOOR skips instead of failing. T10's floor
+#       shipped as a bad_t, and on 2026-09-09 a lean runner reading a 146ms
+#       control red-gated a required context on main and held release-cut with
+#       10 commits uncut — while the ratio at that reading was 61-63% against a
+#       110% cap. The branch is unreachable on a fat box, so it is graded here
+#       with synthetic readings, in both directions.
 #
 # Run: bash tests/lazy_dispatch_unit.sh   (no root, no network)
 set -uo pipefail
@@ -78,9 +84,105 @@ trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.."
 TMP="$(mktemp -d /tmp/lazy-dispatch-unit.XXXXXX)"
 
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIPPED=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
+# A GUARD THAT CANNOT MEASURE MUST NOT RETURN A VERDICT.
+#
+# Iteration 3 of this row shipped the opposite and it stopped the fleet. The
+# ratio arms below refuse to divide by a control that is too small, and that
+# refusal was spelled bad_t — a FAILURE, worded as if the load path were over
+# budget. On 2026-09-09 a lean runner read the control at 146ms where this fat
+# box reads ~690ms, `core-pristine (2)` went red on main at bd650aef with
+# 30 passed / 1 failed, `release-cut` gates on main being green, and 10 merged
+# commits sat uncut on every managed box. Nothing was wrong with the code: the
+# ratio at that reading was 61-63% against a 110% cap.
+#
+# skip_t is the third verdict that was missing. NOT MEASURED is not NOT WORKING,
+# and a harness that cannot tell them apart will eventually accuse the code for
+# the runner's speed. Skips do not count toward FAIL and do not change the exit
+# code; they are printed so the log says plainly that an arm graded nothing.
+skip_t() { SKIPPED=$((SKIPPED+1)); printf 'skip - %s\n   %s\n' "$1" "${2:-}"; }
+
+# THE DENOMINATOR FLOOR, and why it is 60 and not 150.
+#
+# Every timing arm here is a RATIO against an eager control built from the same
+# src/ and measured in the same seconds, so the runner cancels out. What does
+# not cancel is the cost of the measurement itself — two `date +%s%N` calls plus
+# a fork and exec, ~5ms on this class of box. Below some control reading that
+# stops being a rounding error, so the arms refuse to grade. This is that
+# threshold, and it is now ONE constant: this file carrying a 60ms floor on
+# `whoami` and a 150ms floor on `task ls`, off the same timer, was the tell.
+#
+# 150 was wrong in the dangerous direction. It was picked on this fat host,
+# where `task ls` costs ~690ms (~550ms of it sqlite) and 150 looks like a fifth
+# of nothing. Across the shards of the last green run the SAME control measured
+# 175/177/185/186/192ms, so the floor sat ~15% below the low end of its own
+# observed distribution — and the sibling `heartbeat ls` arm cleared it by 2ms
+# in the same job. Which of the two arms tripped was a per-run coin flip.
+#
+# WHY 60 IS THE RIGHT DIRECTION TO BE WRONG IN. The ~5ms overhead is ADDITIVE
+# and it lands on BOTH halves of the ratio. For a lazy reading below its control
+# — every case this file is trying to hold — (l+e)/(c+e) > l/c, so the overhead
+# biases the ratio UPWARD, toward the cap. It can make a passing arm read worse;
+# it cannot let a regression through. Combined with min-of-5, which already
+# suppresses the upward tail, the floor is therefore not what protects the cap
+# from noise. Its only job is to stop a division that is mostly overhead. At
+# 60ms the overhead is 8% of the denominator; below that the reading is more
+# timer than probe. Raising the floor "to be safe" is not safe — it is how the
+# LEAN runner, the only box where the load path is a large enough share of the
+# call to see at all, silently loses the arm that caught a real 117% regression
+# in iteration 2.
+#
+# Overridable so the skip path can be graded (T15) without re-running the file.
+RATIO_FLOOR_MS="${LAZY_RATIO_FLOOR_MS:-60}"
+
+# The verdict half of every ratio arm, split from the measurement half so the
+# sub-floor branch can be exercised with synthetic readings. On this host the
+# floor cannot fire naturally, which is precisely why the bad_t shipped.
+_ratio_verdict() { # <what> <control_ms> <lazy_ms> <cap_pct> <regression_hint>
+  local what="$1" c="$2" l="$3" cap="$4" hint="$5" pct
+  if (( c < RATIO_FLOOR_MS )); then
+    skip_t "$what: NOT MEASURED — the eager control is under the ${RATIO_FLOOR_MS}ms floor" \
+           "control ${c}ms, lazy ${l}ms (resampled, still under). At this size the ratio is mostly the timer, so this arm graded NOTHING. This is not a statement about the load path and must not be read as one."
+    return 0
+  fi
+  pct=$(( l * 100 / c ))
+  if (( pct <= cap )); then
+    ok_t "$what costs ${l}ms = ${pct}% of the eager control's ${c}ms (budget ${cap}%)"
+  else
+    bad_t "$what stays within ${cap}% of the eager control" \
+          "${l}ms against ${c}ms = ${pct}%. $hint"
+  fi
+}
+
+# Interleaved min-of-N, control and lazy alternating inside one loop so a
+# scheduling gust lands on both. Unchanged sampling: the min-of-5 IS the arm's
+# non-flakiness margin and this row is not permitted to spend it.
+_min_pair() { # <samples> <verb...> -> "<control_ms> <lazy_ms>"
+  local n="$1"; shift
+  local bc=999999 bl=999999 t0 t1 d i
+  for (( i = 0; i < n; i++ )); do
+    t0=$(date +%s%N); "$CONTROL" "$@" >/dev/null 2>&1 || true; t1=$(date +%s%N)
+    d=$(( (t1 - t0) / 1000000 )); if (( d < bc )); then bc=$d; fi
+    t0=$(date +%s%N); "$BUNDLE"  "$@" >/dev/null 2>&1 || true; t1=$(date +%s%N)
+    d=$(( (t1 - t0) / 1000000 )); if (( d < bl )); then bl=$d; fi
+  done
+  printf '%s %s\n' "$bc" "$bl"
+}
+
+# SKIP *AND* RESAMPLE, in that order. A single sub-floor read can be one lucky
+# scheduling window rather than a genuinely fast box, so the second min-of-5 is
+# paid only on runs that were about to grade nothing anyway.
+_timed_ratio_arm() { # <what> <cap_pct> <hint> <verb...>
+  local what="$1" cap="$2" hint="$3"; shift 3
+  local c l
+  read -r c l < <(_min_pair 5 "$@")
+  if (( c < RATIO_FLOOR_MS )); then
+    read -r c l < <(_min_pair 5 "$@")
+  fi
+  _ratio_verdict "$what" "$c" "$l" "$cap" "$hint"
+}
 
 # shellcheck source=scripts/lib/lazy-dispatch.sh
 . scripts/lib/lazy-dispatch.sh
@@ -102,7 +204,7 @@ fi
 BUNDLE="$TMP/5dive"
 if ! BUILD_OUT="$BUNDLE" ./build.sh >"$TMP/build.log" 2>&1; then
   bad_t "build.sh produces a bundle" "$(tail -5 "$TMP/build.log")"
-printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIPPED"
   exit 1
 fi
 MARKER_LINE=$(grep -n '^# ==== 5dive lazy payload' "$BUNDLE" | head -1 | cut -d: -f1)
@@ -381,25 +483,12 @@ else
   # touches the load path at all, and against an eager twin the comparison is
   # like-for-like: both forks, both sqlite reads, both contended in the same
   # seconds. Measured 266ms eager -> 94ms lazy = 35%; the budget is 75%.
-  bwc=999999; bwl=999999
-  for i in 1 2 3 4 5; do
-    t0=$(date +%s%N); "$CONTROL" whoami >/dev/null 2>&1 || true; t1=$(date +%s%N)
-    d=$(( (t1 - t0) / 1000000 )); [[ "$d" -lt "$bwc" ]] && bwc=$d
-    t0=$(date +%s%N); "$BUNDLE"  whoami >/dev/null 2>&1 || true; t1=$(date +%s%N)
-    d=$(( (t1 - t0) / 1000000 )); [[ "$d" -lt "$bwl" ]] && bwl=$d
-  done
-  if [[ "$bwc" -lt 60 ]]; then
-    bad_t "the eager control is measurable on \`whoami\`" \
-          "it read ${bwc}ms — too small to divide by."
-  else
-    wpct=$(( bwl * 100 / bwc ))
-    if [[ "$wpct" -le 75 ]]; then
-      ok_t "\`whoami\` costs ${bwl}ms = ${wpct}% of the eager control's ${bwc}ms (budget 75%)"
-    else
-      bad_t "\`whoami\` stays under 75% of the eager control" \
-            "${bwl}ms against ${bwc}ms = ${wpct}%. Startup has moved back toward the eager bundle: a module is being parsed that no longer needs to be."
-    fi
-  fi
+  # This arm carried the SAME sub-floor bad_t as T10 and T12 — it simply never
+  # fired, because `whoami` is cheap enough that 60 was already the derived
+  # number. Routed through the shared verdict so the three cannot drift again.
+  _timed_ratio_arm '`whoami`' 75 \
+    'Startup has moved back toward the eager bundle: a module is being parsed that no longer needs to be.' \
+    whoami
   # Non-vacuity, checked and not assumed: the probe has to be a MULTI-module
   # verb or this arm grades the same thing T9 already does.
   LOADED=$(FIVE_LAZY_TRACE=1 "$BUNDLE" task ls 2>&1 >/dev/null \
@@ -410,25 +499,9 @@ else
     bad_t "\`task ls\` is a multi-module probe" \
           "it loaded $LOADED. This arm only grades the load path while the probe uses it; pick a wider verb."
   fi
-  bc=999999; bl=999999
-  for i in 1 2 3 4 5; do
-    t0=$(date +%s%N); "$CONTROL" task ls >/dev/null 2>&1 || true; t1=$(date +%s%N)
-    d=$(( (t1 - t0) / 1000000 )); [[ "$d" -lt "$bc" ]] && bc=$d
-    t0=$(date +%s%N); "$BUNDLE"  task ls >/dev/null 2>&1 || true; t1=$(date +%s%N)
-    d=$(( (t1 - t0) / 1000000 )); [[ "$d" -lt "$bl" ]] && bl=$d
-  done
-  if [[ "$bc" -lt 150 ]]; then
-    bad_t "the eager control is measurable" \
-          "\`task ls\` on the eager control read ${bc}ms — too small to divide by, so the ratio below would be noise."
-  else
-    pct=$(( bl * 100 / bc ))
-    if [[ "$pct" -le 110 ]]; then
-      ok_t "\`task ls\` costs ${bl}ms = ${pct}% of the eager control's ${bc}ms (budget 110%)"
-    else
-      bad_t "\`task ls\` stays within 110% of the eager control" \
-            "${bl}ms against ${bc}ms = ${pct}%. A module is being re-read out of a \`\$( )\`: run with FIVE_LAZY_TRACE=1 and look for the same module loading twice. Iteration 1 of DIVE-4087 measured 124% here."
-    fi
-  fi
+  _timed_ratio_arm '`task ls`' 110 \
+    'A module is being re-read out of a `$( )`: run with FIVE_LAZY_TRACE=1 and look for the same module loading twice. Iteration 1 of DIVE-4087 measured 124% here.' \
+    task ls
 
   # --- T12: the SECOND load-path budget --------------------------------------
   # WHY A SECOND ONE. T10 caps `task ls`, and on iteration 2 that left
@@ -447,25 +520,9 @@ else
     bad_t "\`heartbeat ls\` is a multi-module probe" \
           "it loaded $HB_LOADED. This arm only grades the load path while the probe uses it; pick a wider verb."
   fi
-  hc=999999; hl=999999
-  for i in 1 2 3 4 5; do
-    t0=$(date +%s%N); "$CONTROL" heartbeat ls >/dev/null 2>&1 || true; t1=$(date +%s%N)
-    d=$(( (t1 - t0) / 1000000 )); [[ "$d" -lt "$hc" ]] && hc=$d
-    t0=$(date +%s%N); "$BUNDLE"  heartbeat ls >/dev/null 2>&1 || true; t1=$(date +%s%N)
-    d=$(( (t1 - t0) / 1000000 )); [[ "$d" -lt "$hl" ]] && hl=$d
-  done
-  if [[ "$hc" -lt 150 ]]; then
-    bad_t "the eager control is measurable on \`heartbeat ls\`" \
-          "it read ${hc}ms — too small to divide by, so the ratio below would be noise."
-  else
-    hpct=$(( hl * 100 / hc ))
-    if [[ "$hpct" -le 110 ]]; then
-      ok_t "\`heartbeat ls\` costs ${hl}ms = ${hpct}% of the eager control's ${hc}ms (budget 110%)"
-    else
-      bad_t "\`heartbeat ls\` stays within 110% of the eager control" \
-            "${hl}ms against ${hc}ms = ${hpct}%. Iteration 2 measured 117% here with no arm to catch it; the load path has regressed for the widest-closure verb."
-    fi
-  fi
+  _timed_ratio_arm '`heartbeat ls`' 110 \
+    'Iteration 2 measured 117% here with no arm to catch it; the load path has regressed for the widest-closure verb.' \
+    heartbeat ls
 fi
 
 # --- T13: piped into a shell, it refuses with a reason -----------------------
@@ -521,5 +578,72 @@ else
   fi
 fi
 
-printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+
+# --- T15: the sub-floor branch SKIPS, and it can still FAIL ------------------
+# WHAT THIS EXISTS FOR. The defect that red-gated main was not a wrong number,
+# it was a wrong VERDICT CLASS: "I could not measure" printed as "the load path
+# is over budget". That branch is unreachable on this fat host — `task ls` here
+# is ~690ms — which is exactly why it shipped and why quinn could only reproduce
+# it by editing the constant. So grade the verdict function DIRECTLY with
+# synthetic readings: microseconds, no rebuild, and it fires on every box.
+#
+# BOTH DIRECTIONS ARE ASSERTED. A guard that never fails is the other way to
+# ship this bug, and "make the red go away" is the failure mode a fix to a red
+# is most likely to have. Each call runs in a `$( )` so the corpus counters are
+# untouched, and the counts are read back out of the subshell.
+_t15_under="$( PASS=0; FAIL=0; SKIPPED=0
+  RATIO_FLOOR_MS=60 _ratio_verdict '`synthetic`' 10 9 110 'unreachable hint'
+  printf '::%d/%d/%d' "$PASS" "$FAIL" "$SKIPPED" )"
+_t15_over="$( PASS=0; FAIL=0; SKIPPED=0
+  RATIO_FLOOR_MS=60 _ratio_verdict '`synthetic`' 200 300 110 'unreachable hint'
+  printf '::%d/%d/%d' "$PASS" "$FAIL" "$SKIPPED" )"
+_t15_ok="$( PASS=0; FAIL=0; SKIPPED=0
+  RATIO_FLOOR_MS=60 _ratio_verdict '`synthetic`' 200 100 110 'unreachable hint'
+  printf '::%d/%d/%d' "$PASS" "$FAIL" "$SKIPPED" )"
+
+if [[ "$_t15_under" == *"::0/0/1" && "$_t15_under" == *"skip - "* ]]; then
+  ok_t "a sub-floor control SKIPS: it adds nothing to FAIL and cannot red a shard"
+else
+  bad_t "a sub-floor control SKIPS rather than failing" \
+        "counts were ${_t15_under##*::} (want 0/0/1). A control too small to divide by must not be spelled as a load-path verdict — that is the bug this arm exists for."
+fi
+
+# ASK 3: the message has to name the lazy reading too. Without it CI could not
+# even show that the ratio WOULD have passed, so the log said "too small to
+# divide by" and nothing else — undiagnosable from the artifact alone.
+if [[ "$_t15_under" == *"control 10ms, lazy 9ms"* ]]; then
+  ok_t "the sub-floor message prints BOTH readings, so the next one is diagnosable from the log"
+else
+  bad_t "the sub-floor message prints both readings" \
+        "it said: ${_t15_under%::*}"
+fi
+
+if [[ "$_t15_over" == *"::0/1/0" && "$_t15_over" == *"FAIL - "* ]]; then
+  ok_t "an over-cap ratio still FAILS (300 of 200 = 150% against a 110% cap)"
+else
+  bad_t "an over-cap ratio still fails" \
+        "counts were ${_t15_over##*::} (want 0/1/0). Skipping is not allowed to become the way every reading is answered."
+fi
+
+if [[ "$_t15_ok" == *"::1/0/0" ]]; then
+  ok_t "an in-budget ratio still PASSES (100 of 200 = 50%)"
+else
+  bad_t "an in-budget ratio still passes" \
+        "counts were ${_t15_ok##*::} (want 1/0/0)."
+fi
+
+# The floor is ONE constant now, reached by all three probes. Two floors off the
+# same timer, 60 and 150, is what let the wrong one hide behind the right one for
+# a whole iteration. Both patterns are split across a string concatenation so
+# this arm cannot match its own source lines and grade itself green.
+_t15_arms=$(grep -cE "_timed""_ratio_arm '" "$0" || true)
+_t15_legacy=$(grep -cE -- "-lt 1""50" "$0" || true)
+if (( _t15_arms == 3 && _t15_legacy == 0 )); then
+  ok_t "all 3 ratio probes route through one derived floor (${RATIO_FLOOR_MS}ms); no hand-picked 150 survives"
+else
+  bad_t "the denominator floor is a single derived constant reached by every ratio arm" \
+        "found $_t15_arms ratio arms and $_t15_legacy legacy 150ms literals (want 3 and 0)."
+fi
+
+printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIPPED"
 [[ "$FAIL" -eq 0 ]]
