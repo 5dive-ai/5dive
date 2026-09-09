@@ -59,6 +59,7 @@ concurrency:
 
 jobs:
   window:
+    if: github.ref_name != 'dive-4166-external-cal-probe'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -172,3 +173,111 @@ jobs:
           else
             gh issue create --title "$TITLE" --body-file issue-body.md
           fi
+
+  # TEMPORARY DIVE-4166 SAMPLER. This job exists only on the measurement commit and
+  # is removed before delivery. Each matrix cell is one fresh GitHub-hosted VM and
+  # runs the exact product-free cal_probe definition from run-harnesses.sh.
+  tier-cal-sample:
+    if: github.ref_name == 'dive-4166-external-cal-probe'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sample: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Measure the fixed external workload
+        env:
+          SAMPLE: ${{ matrix.sample }}
+        run: |
+          set -euo pipefail
+          . tests/lib/tier.sh
+          eval "$(sed -n '/^cal_probe() {/,/^}/p' scripts/run-harnesses.sh)"
+
+          sample_probe() {
+            local pilot iters best='' ms us i
+            cal_probe 1 >/dev/null
+            pilot="$(cal_probe "$TIER_CAL_PILOT_ITERS")"
+            (( pilot > 0 )) || pilot=1
+            iters=$(( TIER_CAL_TARGET_MS * TIER_CAL_PILOT_ITERS / pilot ))
+            (( iters < TIER_CAL_MIN_ITERS )) && iters=$TIER_CAL_MIN_ITERS
+            (( iters > TIER_CAL_MAX_ITERS )) && iters=$TIER_CAL_MAX_ITERS
+            for (( i=0; i<TIER_CAL_SAMPLES; i++ )); do
+              ms="$(cal_probe "$iters")"
+              us=$(( ms * 1000 / iters )); (( us > 0 )) || us=1
+              [[ -z "$best" || "$us" -lt "$best" ]] && best="$us"
+            done
+            printf '%s %s\n' "$best" "$iters"
+          }
+
+          read -r cal_us iters < <(sample_probe)
+          # A second fixed external workload supplies the same-box comparison needed
+          # to classify concordance without timing any 5dive product path.
+          load_ms="$(cal_probe "$iters")"
+          wall_s=$(( (load_ms + 999) / 1000 )); (( wall_s > 0 )) || wall_s=1
+          {
+            echo '# run-harnesses report (DIVE-4166 temporary calibration sampler)'
+            echo '# tier=core'
+            echo '# label=baseline-matrix'
+            echo '# shard=1/1'
+            echo "# harnesses=$iters"
+            echo "# wall_clock_s=$wall_s"
+            echo '# cal_status=measured'
+            echo "# cal_us_per_iter=$cal_us"
+            echo "# cal_baseline_us_per_iter=$TIER_CAL_BASELINE_US"
+            echo '# cal_post_status=skipped'
+            echo '# cal_post_us_per_iter=0'
+            echo '# cal_post_delta_pct=0'
+            echo '# header_drift_wrong=0'
+            echo "# harvest_run_id=$GITHUB_RUN_ID"
+            echo "# harvest_job=tier-cal-sample-$SAMPLE"
+          } > "sample-$SAMPLE.report"
+          cat "sample-$SAMPLE.report"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tier-cal-sample-${{ matrix.sample }}
+          path: sample-${{ matrix.sample }}.report
+          if-no-files-found: error
+
+  startup-control:
+    if: github.ref_name == 'dive-4166-external-cal-probe'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: A product startup speedup cannot move the external probe
+        run: |
+          set -euo pipefail
+          . tests/lib/tier.sh
+          eval "$(sed -n '/^cal_probe() {/,/^}/p' scripts/run-harnesses.sh)"
+          old=588ab83edb664221ed5dbf8f2c3063be7a7d9bbd
+          new=bd650aef4c37e08a78eecf9bf49ec8f9fab288cd
+          git worktree add /tmp/product-old "$old"
+          git worktree add /tmp/product-new "$new"
+          (cd /tmp/product-old && ./build.sh)
+          (cd /tmp/product-new && ./build.sh)
+          timed_versions() {
+            local cli="$1" start end i
+            start="$(date +%s%N)"
+            for (( i=0; i<10; i++ )); do "$cli" --version >/dev/null; done
+            end="$(date +%s%N)"
+            echo $(( (end - start) / 10000 ))
+          }
+          probe_us() {
+            local ms
+            cal_probe 1 >/dev/null
+            ms="$(cal_probe 100)"
+            echo $(( ms * 10 ))
+          }
+          old_cli_us="$(timed_versions /tmp/product-old/5dive)"
+          old_cal_us="$(probe_us)"
+          new_cli_us="$(timed_versions /tmp/product-new/5dive)"
+          new_cal_us="$(probe_us)"
+          old_scale="$(tier_cal_scale_pct "$old_cal_us" "$TIER_CAL_BASELINE_US")"
+          new_scale="$(tier_cal_scale_pct "$new_cal_us" "$TIER_CAL_BASELINE_US")"
+          cli_ratio=$(( old_cli_us * 100 / new_cli_us ))
+          scale_delta=$(( old_scale - new_scale )); (( scale_delta < 0 )) && scale_delta=$(( -scale_delta ))
+          printf 'startup-control: old=%dus new=%dus ratio=%d%%; probe old=%dus new=%dus; cal_scale_pct %d -> %d\n' \
+            "$old_cli_us" "$new_cli_us" "$cli_ratio" "$old_cal_us" "$new_cal_us" "$old_scale" "$new_scale"
+          (( cli_ratio >= 200 )) || { echo 'startup-control: historical startup change was not reproduced' >&2; exit 1; }
+          (( scale_delta <= 2 )) || { echo 'startup-control: product-free scale moved by more than 2 points' >&2; exit 1; }
