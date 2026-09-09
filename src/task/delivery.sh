@@ -757,6 +757,13 @@ _task_route_to_verifier() {
     && _rd_emit_hash=$(ledger_hash "${_TASK_RAW_RESULT-${result:-}}")
   ledger_emit task.delivered ident="$ident" task_id="$id" actor="$(task_actor "")" \
     out="${result:-}" detail="delivered to verifier ${vfier} (iteration ${iter}${iter_note}; awaiting ACK)${_rd_emit_hash:+ raw_result_hash=${_rd_emit_hash}}"
+  # DIVE-4164: the delivery event asks for an ephemeral grader. Emitted HERE, in
+  # the one funnel every delivery passes through, so "never maker-spawned" is
+  # structural — see _grader_spawn_request. `|| true`: the row is already durably
+  # updated and a bookkeeping write must never fail a recorded delivery.
+  declare -F _grader_spawn_request >/dev/null 2>&1 \
+    && _grader_spawn_request "$ident" "$id" "$vfier" "$iter" || true
+
   # DIVE-3503 — `task deliver` is a terminal boundary for the MAKER even though
   # the row stays open, so it reaps like done/cancel. Same predicate, same
   # protections; see src/lib/reap.sh.
