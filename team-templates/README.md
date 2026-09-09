@@ -50,6 +50,11 @@ Omit the flag and behaviour is exactly as before.
 | `startup.5dive.yaml` | Lean SaaS startup | CEO, CMO, DevOps, Competitor Researcher, Creative |
 | `content-studio.5dive.yaml` | Content studio | Editor-in-Chief, Writer, SEO, Designer, Distributor |
 | `eng-studio.5dive.yaml` | Eng Studio | CEO, Eng Manager, Designer, Release Manager, Doc Engineer, QA |
+| `distribution.5dive.yaml` | Distribution team | Head, Scout, Packager, Outreach, Publisher, Brand Verifier, Analyst |
+
+The Distribution team declares an optional browser capability. Its import and
+`5dive team ps` report `browser+api` when the browser plugin is
+available and `api-only` otherwise; absence never creates a silently inert Publisher.
 
 ## Schema
 
