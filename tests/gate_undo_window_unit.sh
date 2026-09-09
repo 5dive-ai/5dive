@@ -330,5 +330,44 @@ w=$(_5DIVE_GATE_UNDO_WINDOW_SECS=30 _task_gate_undo_window_secs DIVE-9112)
   && ok_t "a SHORTER override is honoured verbatim (30s) — operators may only hurry the page" \
   || fail_t "override of 30 yielded '$w', expected 30"
 
+# ── 11. THE LONGER WINDOW IS TARGETED, AND THE CLAMP FOLLOWS THE TYPE ──────
+# manual/secret are human-only by definition, so for them the only question is
+# how long before the phone rings. Measured cost of 15m on that population: zero
+# gates lodar answered are delayed. Everything else keeps 120s.
+for _t in manual secret; do
+  reset; mkgate "DIVE-912${_t:0:1}" high
+  db "UPDATE tasks SET need_type='$_t' WHERE ident='DIVE-912${_t:0:1}';"
+  w=$(_5DIVE_GATE_UNDO_WINDOW_SECS= _task_gate_undo_window_secs "DIVE-912${_t:0:1}")
+  [[ "$w" == "$_GATE_UNDO_WINDOW_SECS_HUMAN_ONLY" ]] \
+    && ok_t "a $_t gate gets the long window (${w}s) — no routing arm can take it off the phone" \
+    || fail_t "$_t gate window=${w}s, expected $_GATE_UNDO_WINDOW_SECS_HUMAN_ONLY"
+done
+
+# NEGATIVE CONTROL: the raise is TARGETED. A fleet-wide raise was the alternative
+# and is strictly worse (104 removed but 12 real gates delayed), so a change that
+# lengthened everything would be a different, worse product reading green above.
+reset; mkgate DIVE-9128 high
+w=$(_5DIVE_GATE_UNDO_WINDOW_SECS= _task_gate_undo_window_secs DIVE-9128)
+[[ "$w" == "$_GATE_UNDO_WINDOW_SECS" ]] \
+  && ok_t "a decision gate still gets the SHORT window (${w}s) — the raise is targeted, not global" \
+  || fail_t "decision gate window=${w}s, expected $_GATE_UNDO_WINDOW_SECS"
+
+# THE CLAMP FOLLOWS THE TYPE'S CEILING, in both directions. Without this the mute
+# hole reopens sideways: if the clamp still read the BASE constant, an override of
+# 900 on a decision gate would pass on a manual-shaped read, and a legitimate 900
+# on a manual gate would be knocked back to 120 — silently making the raise a no-op.
+reset; mkgate DIVE-9129 high
+db "UPDATE tasks SET need_type='manual' WHERE ident='DIVE-9129';"
+w=$(_5DIVE_GATE_UNDO_WINDOW_SECS=901 _task_gate_undo_window_secs DIVE-9129)
+[[ "$w" == "$_GATE_UNDO_WINDOW_SECS_HUMAN_ONLY" ]] \
+  && ok_t "one second over the manual ceiling is clamped to it (${w}s), not to the base" \
+  || fail_t "manual override 901 yielded ${w}s, expected $_GATE_UNDO_WINDOW_SECS_HUMAN_ONLY"
+reset; mkgate DIVE-9130 high
+w=$(_5DIVE_GATE_UNDO_WINDOW_SECS=900 _task_gate_undo_window_secs DIVE-9130)
+[[ "$w" == "$_GATE_UNDO_WINDOW_SECS" ]] \
+  && ok_t "the long duration is NOT reachable on a decision gate (clamped to ${w}s) — no sideways mute" \
+  || fail_t "decision gate accepted a 900s override (${w}s): the raise reopened the mute hole"
+
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

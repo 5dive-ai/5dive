@@ -2030,15 +2030,41 @@ _task_need_route_deliver() {
 # The window can delay a page; it cannot swallow one.
 _GATE_UNDO_WINDOW_SECS=120
 
+# DIVE-4174 sizing: a LONGER window for the gate types no routing arm can ever
+# take off the phone. `manual` is human-only by definition and `secret` must be
+# delivered by a human, so for these two the question is never "route it better",
+# only "how long before the phone rings". Measured over the frozen 30 days, on
+# manual+secret human-facing gates (pages removed / gates lodar ANSWERED that get
+# delayed): 2m 10/0 · 5m 13/0 · 10m 17/0 · 15m 20/0 · 30m 21/0.
+#
+# **Zero cost at every size** — he answered 1 of the 38 type-default gates in the
+# window and it falls outside all of them — so this is priced on the take alone.
+# 15m doubles the 2m take (10 -> 20) and 30m adds one more, which is where it
+# flattens. A FLEET-WIDE 15m raise was the alternative and is strictly worse: 104
+# removed but 12 gates he answered delayed. Targeted beats global here.
+#
+# Sealed like the base constant, and for the same reason (agents hold
+# NOPASSWD:ALL): no write path, and the env override is clamped against whichever
+# ceiling applies to THIS gate — see the clamp below, which would otherwise knock
+# a 900s type window straight back to 120 and silently make this a no-op.
+_GATE_UNDO_WINDOW_SECS_HUMAN_ONLY=900
+
 # Seconds to hold this gate's phone ping. 0 = ping now.
 # Reads the row's priority, so it must be called AFTER the gate UPDATE commits —
 # which is the case: task_need_notify runs after cmd_task_need's write.
 _task_gate_undo_window_secs() {
-  local ident="$1" secs="${_5DIVE_GATE_UNDO_WINDOW_SECS:-$_GATE_UNDO_WINDOW_SECS}"
+  local ident="$1"
+  # The CEILING for this gate, resolved by type BEFORE anything else reads it:
+  # both the default and the clamp below are relative to it. Resolving it after
+  # the clamp is the bug this ordering exists to prevent.
+  local _ntype _ceil="$_GATE_UNDO_WINDOW_SECS"
+  _ntype=$(db "SELECT COALESCE(need_type,'') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || echo "")
+  case "$_ntype" in manual|secret) _ceil="$_GATE_UNDO_WINDOW_SECS_HUMAN_ONLY" ;; esac
+  local secs="${_5DIVE_GATE_UNDO_WINDOW_SECS:-$_ceil}"
   # An explicit numeric override (harnesses, and the operator escape hatch) wins,
   # but a non-numeric one is a typo, not a policy — fall back rather than defer
   # forever on a garbage value.
-  [[ "$secs" =~ ^[0-9]+$ ]] || secs="$_GATE_UNDO_WINDOW_SECS"
+  [[ "$secs" =~ ^[0-9]+$ ]] || secs="$_ceil"
   # THE OVERRIDE MAY ONLY EVER SHORTEN THE HOLD, NEVER LENGTHEN IT. This is the
   # _GATE_HUMAN_CAPABILITIES seal (DIVE-2241/2131) applied to a duration: agents
   # hold NOPASSWD:ALL, so an unclamped env var IS a write path to the constant,
@@ -2047,7 +2073,7 @@ _task_gate_undo_window_secs() {
   # legitimate use (harnesses pass 0, an operator shortens) and leaves the mute
   # unreachable. It is arm D's form of the row's invariant: a knob may only ever
   # move a gate TOWARD the phone, never away from it.
-  (( secs > _GATE_UNDO_WINDOW_SECS )) && secs="$_GATE_UNDO_WINDOW_SECS"
+  (( secs > _ceil )) && secs="$_ceil"
   # Kill switch. `off` restores the pre-DIVE-4154 ping byte for byte and needs no
   # release to take effect, same contract as `task pfr-autoclear`.
   local pref; pref=$(_task_pref_get gate_undo_window 2>/dev/null || echo ""); pref="${pref:-on}"
