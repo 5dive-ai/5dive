@@ -142,14 +142,14 @@ else
 fi
 
 # --- T6 EVERY bundled template, not just the one we edited -------------------
-# The row was filed because all four shipped the same shape. A fix proved on one
+# The row was filed because every bundled template shipped the same shape. A fix proved on one
 # template is a fix proved on one template.
 allok=1; badf=""
 for f in "$TPL"/*.5dive.yaml; do
   parse "$f" TEAM_AUTH_PROFILE=acct >/dev/null || { allok=0; badf+=" $(basename "$f")"; }
 done
 (( allok == 1 )) \
-  && ok_t 'T6 all four bundled templates parse with no bot token set' \
+  && ok_t 'T6 all bundled templates parse with no bot token set' \
   || bad_t 'T6 a bundled template still requires a token to import' "failed:$badf"
 
 # --- T7 no template asks for a per-ROLE token any more -----------------------
@@ -164,7 +164,7 @@ leftover=$(grep -l '_TG_TOKEN' "$TPL"/*.5dive.yaml 2>/dev/null | xargs -r grep -
 # report stayed empty — an agent created with a channel it has no credential
 # for, silently. `agent create` takes `--channels=<a,b,...>`, and `team import`
 # takes a PATH as well as a slug, so a customer's own multi-channel spec reaches
-# this. Our four bundled templates are all single-valued, which is exactly why
+# this. Our bundled templates are all single-valued, which is exactly why
 # T1-T7 above cannot fail on it.
 cat > "$TMP/multi.yaml" <<'YML'
 version: "2"
