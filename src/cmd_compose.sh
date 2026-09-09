@@ -77,6 +77,19 @@ defaults = data.get("defaults") or {}
 if not isinstance(defaults, dict):
     print("error: 'defaults:' must be a map", file=sys.stderr); sys.exit(3)
 
+# Marketplace teams may declare the one capability whose absence changes their
+# operating mode. This is data, not an arbitrary preflight command supplied by
+# the template: the CLI owns the exact probe (`5dive browser --help`).
+team = data.get("team") or {}
+if not isinstance(team, dict):
+    print("error: 'team:' must be a map", file=sys.stderr); sys.exit(3)
+caps = team.get("capabilities") or {}
+if not isinstance(caps, dict):
+    print("error: 'team.capabilities:' must be a map", file=sys.stderr); sys.exit(3)
+browser_cap = caps.get("browser")
+if browser_cap not in (None, "optional"):
+    print("error: 'team.capabilities.browser' must be 'optional'", file=sys.stderr); sys.exit(3)
+
 # Known per-agent keys (v1 + v2). Unknown → warn, not fail (forward-compat).
 KNOWN = {
     "type","channels","telegram_token","discord_token","workdir","skills",
@@ -676,6 +689,21 @@ _compose_type_override_pins() {
 # invoked from a source checkout (no +x).
 _compose_self() { realpath "${BASH_SOURCE[0]}"; }
 
+# DIVE-4093 — a Distribution import must say whether authenticated-browser
+# adapters are usable. The manifest declares only `browser: optional`; the CLI
+# owns the fixed probe, so a marketplace YAML can never make us execute an
+# arbitrary command. Empty means the team did not declare this capability.
+_compose_browser_mode() {
+  local spec="$1" self="$2" declared
+  declared=$(jq -r '.team.capabilities.browser // empty' <<<"$spec" 2>/dev/null)
+  [[ -n "$declared" ]] || { printf ''; return 0; }
+  if bash "$self" browser --help </dev/null >/dev/null 2>&1; then
+    printf 'browser+api'
+  else
+    printf 'api-only'
+  fi
+}
+
 cmd_compose_up() {
   local file="" type_override=""
   while [[ $# -gt 0 ]]; do
@@ -729,6 +757,11 @@ HELP
   fi
   spec_dir=$(realpath "$(dirname "$file")")
   self=$(_compose_self)
+  local _compose_browser_mode_value
+  _compose_browser_mode_value=$(_compose_browser_mode "$spec" "$self")
+  if [[ -n "$_compose_browser_mode_value" ]]; then
+    step "capability preflight: publishing=$_compose_browser_mode_value (browser is optional; API adapters remain available)"
+  fi
   # DIVE-4022: named here so a loop that fails to register can print the exact
   # re-run, not a `<spec>` placeholder the user has to translate.
   local _COMPOSE_SPEC_FILE="$file"
@@ -1269,6 +1302,7 @@ _team_usage() {
   cat >&2 <<HELP
 usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
                                    [--telegram-token=<bot-token>|-]
+       5dive team ps [<slug|path>] [--type=<harness>]
        5dive team ls
   Provision a whole company-structure template in one call (wraps 5dive up).
   <slug> resolves to a bundled template; a path is used as-is.
@@ -1283,10 +1317,71 @@ usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
 HELP
 }
 
+_team_resolve_template() {
+  local ref="$1"
+  if [[ -f "$ref" ]]; then
+    printf '%s' "$ref"
+    return 0
+  fi
+  local dir; dir=$(_team_templates_dir) || return 1
+  if [[ -f "$dir/${ref}.5dive.yaml" ]]; then
+    printf '%s' "$dir/${ref}.5dive.yaml"
+  elif [[ -f "$dir/${ref}.5dive.yml" ]]; then
+    printf '%s' "$dir/${ref}.5dive.yml"
+  else
+    return 1
+  fi
+}
+
 cmd_team() {
   local sub="${1:-}"; shift || true
   case "$sub" in
     import) : ;;
+    ps)
+      if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+        cat >&2 <<'HELP'
+usage: 5dive team ps [<slug|path>] [--type=<harness>]
+  Show a marketplace team's roster, state, scheduled loops and capability mode.
+  With no slug, show every bundled team whose complete roster is installed.
+HELP
+        return 0
+      fi
+      local ps_ref="${1:-}"
+      if [[ -n "$ps_ref" && "$ps_ref" != --* ]]; then
+        shift || true
+        local ps_file; ps_file=$(_team_resolve_template "$ps_ref") \
+          || fail "$E_NOT_FOUND" "no template '$ps_ref' (try: 5dive team ls)"
+        cmd_compose_ps -f "$ps_file" "$@"
+        return 0
+      fi
+
+      # A slug-free status command is the receipt shown after a one-command
+      # marketplace import. Detect complete installed rosters from registry
+      # state; do not persist a mutable "last import" pointer that can lie after
+      # a second team is installed or removed.
+      local ps_dir ps_reg ps_candidate ps_spec ps_name
+      local -a ps_matches=()
+      ps_dir=$(_team_templates_dir) || fail "$E_NOT_FOUND" "no team-templates dir found"
+      ps_reg=$(registry_read)
+      for ps_candidate in "$ps_dir"/*.5dive.yaml "$ps_dir"/*.5dive.yml; do
+        [[ -f "$ps_candidate" ]] || continue
+        ps_spec=$(TEAM_AUTH_PROFILE="${TEAM_AUTH_PROFILE:-__team_ps__}" _compose_parse "$ps_candidate" 2>/dev/null) || continue
+        if jq -e --argjson reg "$ps_reg" \
+          '(.agents | length) > 0 and ([.agents | keys[] as $n | $reg.agents[$n] != null] | all)' \
+          <<<"$ps_spec" >/dev/null; then
+          ps_matches+=("$ps_candidate")
+        fi
+      done
+      (( ${#ps_matches[@]} > 0 )) \
+        || fail "$E_NOT_FOUND" "no complete bundled team roster is installed (try: 5dive team import <slug>)"
+      for ps_file in "${ps_matches[@]}"; do
+        if (( ${#ps_matches[@]} > 1 )); then
+          ps_name=$(basename "$ps_file"); ps_name=${ps_name%.5dive.yaml}; ps_name=${ps_name%.5dive.yml}
+          echo "TEAM  $ps_name"
+        fi
+        cmd_compose_ps -f "$ps_file" "$@"
+      done
+      return 0 ;;
     ls|list)
       local dir; dir=$(_team_templates_dir) || fail "$E_NOT_FOUND" "no team-templates dir found"
       echo "Available templates ($dir):"
@@ -1300,7 +1395,7 @@ cmd_team() {
     -h|--help|"" )
       _team_usage
       return 0 ;;
-    *) fail "$E_USAGE" "unknown team subcommand: $sub (try: import, ls)" ;;
+    *) fail "$E_USAGE" "unknown team subcommand: $sub (try: import, ps, ls)" ;;
   esac
 
   local ref="" profile="" type_override="" tg_token="" tg_token_set=0
@@ -1323,15 +1418,8 @@ cmd_team() {
   [[ -n "$ref" ]] || fail "$E_USAGE" "usage: 5dive team import <slug|path>"
 
   local file=""
-  if [[ -f "$ref" ]]; then
-    file="$ref"
-  else
-    local dir; dir=$(_team_templates_dir) || fail "$E_NOT_FOUND" "no team-templates dir — pass a path"
-    if   [[ -f "$dir/${ref}.5dive.yaml" ]]; then file="$dir/${ref}.5dive.yaml"
-    elif [[ -f "$dir/${ref}.5dive.yml"  ]]; then file="$dir/${ref}.5dive.yml"
-    else fail "$E_NOT_FOUND" "no template '$ref' in $dir (try: 5dive team ls)"
-    fi
-  fi
+  file=$(_team_resolve_template "$ref") \
+    || fail "$E_NOT_FOUND" "no template '$ref' (try: 5dive team ls)"
 
   # --auth-profile overrides the template's ${TEAM_AUTH_PROFILE} default.
   [[ -n "$profile" ]] && export TEAM_AUTH_PROFILE="$profile"
@@ -1397,12 +1485,15 @@ HELP
   [[ -f "$file" ]] || fail "$E_NOT_FOUND" "spec file not found: $file"
   ensure_state_ro   # read-only: compose ps must work for non-root agents
 
-  local spec
+  local spec self browser_mode
   spec=$(_compose_parse "$file") || fail "$E_VALIDATION" "spec parse failed"
   if [[ -n "$type_override" ]]; then
     spec=$(_compose_apply_type_override "$spec" "$type_override") \
       || fail "$E_VALIDATION" "could not apply --type=$type_override to the spec"
   fi
+  self=$(_compose_self)
+  browser_mode=$(_compose_browser_mode "$spec" "$self")
+  tasks_db_init 2>/dev/null || true
   local reg
   reg=$(registry_read)
 
@@ -1410,7 +1501,7 @@ HELP
   mapfile -t names < <(jq -r '.agents | keys[]' <<<"$spec")
   local name
   for name in "${names[@]}"; do
-    local declared_type exists active
+    local declared_type exists active loops
     declared_type=$(jq -r --arg n "$name" '.agents[$n].type // "?"' <<<"$spec")
     exists=$(jq           --arg n "$name" '.agents[$n] != null'     <<<"$reg")
     if [[ "$exists" == "true" ]]; then
@@ -1418,17 +1509,23 @@ HELP
     else
       active="missing"
     fi
-    rows=$(jq -c --arg n "$name" --arg t "$declared_type" --arg a "$active" \
-      '. + [{name:$n, type:$t, state:$a}]' <<<"$rows")
+    loops=$(db "SELECT COALESCE(json_group_array(json_object(
+                  'title', title, 'schedule', COALESCE(schedule,''))), '[]')
+                FROM tasks WHERE kind='recurring' AND assignee=$(sqlq "$name");" 2>/dev/null | head -1)
+    [[ -n "$loops" ]] || loops='[]'
+    rows=$(jq -c --arg n "$name" --arg t "$declared_type" --arg a "$active" --argjson l "$loops" \
+      '. + [{name:$n, type:$t, state:$a, loops:$l}]' <<<"$rows")
   done
 
   if (( JSON_MODE )); then
-    ok "" '{file:$f, agents: $rows}' --arg f "$file" --argjson rows "$rows"
+    ok "" '{file:$f, agents:$rows} + (if $bm == "" then {} else {capabilities:{browser:$bm}} end)' \
+      --arg f "$file" --argjson rows "$rows" --arg bm "$browser_mode"
   else
+    [[ -n "$browser_mode" ]] && echo "PUBLISHING  $browser_mode"
     echo "$rows" | jq -r '
-      (["NAME","TYPE","STATE"] | @tsv),
-      (.[] | [.name, .type, .state] | @tsv)
+      (["NAME","TYPE","STATE","LOOP SCHEDULES"] | @tsv),
+      (.[] | [.name, .type, .state,
+              ([.loops[] | "\(.schedule) \(.title)"] | join("; ") | if . == "" then "-" else . end)] | @tsv)
     ' | column -t -s $'\t'
   fi
 }
-
