@@ -54,6 +54,17 @@
 #       one module — and iteration 1 of this row shipped a real regression
 #       underneath it: `task ls` and `agent list` were SLOWER than eager because
 #       a module whose first call lands inside `$( )` is re-read on every call.
+#   T12 the SECOND load-path budget. T10 caps `task ls` only, and quinn's
+#       iteration-2 read found `heartbeat ls` at ~117% of eager with nothing
+#       watching it — a disclosed residual with no arm is a residual that grows.
+#       `heartbeat ls` has the widest closure of any cheap verb (7 modules).
+#   T13 the bundle refuses to be PIPED into a shell with a reason. It reads its
+#       modules back out of $0, so `cat 5dive | bash -s -- whoami` cannot work;
+#       before this it died `sed: can't read /.../bash`, a message about the
+#       wrong thing. Unsupported, but it must fail legibly.
+#   T14 the integrity check still fires on a REWRITTEN bundle. Iteration 3 made
+#       it 20x cheaper by grepping the frame lines out first; this arm is what
+#       says cheaper did not become vacuous.
 #   T11 the preload table exists, is capped, and names known call edges. It is
 #       what keeps T10 green, and an empty one reads exactly like "nothing calls
 #       across a module boundary" — the same silent shape as T3.
@@ -417,6 +428,91 @@ else
       bad_t "\`task ls\` stays within 110% of the eager control" \
             "${bl}ms against ${bc}ms = ${pct}%. A module is being re-read out of a \`\$( )\`: run with FIVE_LAZY_TRACE=1 and look for the same module loading twice. Iteration 1 of DIVE-4087 measured 124% here."
     fi
+  fi
+
+  # --- T12: the SECOND load-path budget --------------------------------------
+  # WHY A SECOND ONE. T10 caps `task ls`, and on iteration 2 that left
+  # `heartbeat ls` sitting at ~117% of eager with no arm on it at all — quinn
+  # found it by hand and correctly refused to accept a disclosed residual that
+  # nothing would notice growing. `heartbeat ls` is the right second probe
+  # because it has the widest closure of any verb cheap enough to time (7
+  # modules against `task ls`'s 6) AND it is the one the fan-out cap
+  # deliberately keeps OUT of the preload table, so it exercises the load path
+  # in its unassisted shape. Same relative unit and the same 110% cap as T10.
+  HB_LOADED=$(FIVE_LAZY_TRACE=1 "$BUNDLE" heartbeat ls 2>&1 >/dev/null \
+              | sed -n 's/^5dive\[lazy\] load //p' | tr ' ' '\n' | sort -u | grep -c .)
+  if [[ "$HB_LOADED" -ge 3 ]]; then
+    ok_t "\`heartbeat ls\` is a multi-module probe (loads $HB_LOADED modules)"
+  else
+    bad_t "\`heartbeat ls\` is a multi-module probe" \
+          "it loaded $HB_LOADED. This arm only grades the load path while the probe uses it; pick a wider verb."
+  fi
+  hc=999999; hl=999999
+  for i in 1 2 3 4 5; do
+    t0=$(date +%s%N); "$CONTROL" heartbeat ls >/dev/null 2>&1 || true; t1=$(date +%s%N)
+    d=$(( (t1 - t0) / 1000000 )); [[ "$d" -lt "$hc" ]] && hc=$d
+    t0=$(date +%s%N); "$BUNDLE"  heartbeat ls >/dev/null 2>&1 || true; t1=$(date +%s%N)
+    d=$(( (t1 - t0) / 1000000 )); [[ "$d" -lt "$hl" ]] && hl=$d
+  done
+  if [[ "$hc" -lt 150 ]]; then
+    bad_t "the eager control is measurable on \`heartbeat ls\`" \
+          "it read ${hc}ms — too small to divide by, so the ratio below would be noise."
+  else
+    hpct=$(( hl * 100 / hc ))
+    if [[ "$hpct" -le 110 ]]; then
+      ok_t "\`heartbeat ls\` costs ${hl}ms = ${hpct}% of the eager control's ${hc}ms (budget 110%)"
+    else
+      bad_t "\`heartbeat ls\` stays within 110% of the eager control" \
+            "${hl}ms against ${hc}ms = ${hpct}%. Iteration 2 measured 117% here with no arm to catch it; the load path has regressed for the widest-closure verb."
+    fi
+  fi
+fi
+
+# --- T13: piped into a shell, it refuses with a reason -----------------------
+# `cat 5dive | bash -s -- whoami` gives the loader no file to read its modules
+# out of, so it cannot work — and until this row it died `sed: can't read
+# /.../bash`, which names the wrong thing entirely. It is not a supported
+# invocation (install.sh pipes the INSTALLER, never the bundle); the contract is
+# only that it fails legibly and does not look like a broken install.
+PIPED="$(cat "$BUNDLE" | bash -s -- whoami 2>&1 || true)"
+if [[ "$PIPED" == *"is a file, not a stream"* ]]; then
+  ok_t "piping the bundle into bash refuses with a reason, not a sed ENOENT"
+elif [[ "$PIPED" == *"can't read"* || "$PIPED" == *"No such file"* ]]; then
+  bad_t "piping the bundle into bash refuses with a reason" \
+        "it died on the loader's own sed instead: ${PIPED:0:200}"
+else
+  bad_t "piping the bundle into bash refuses with a reason" \
+        "unexpected output: ${PIPED:0:200}"
+fi
+if [[ "$PIPED" != *"exited"*"without reporting a reason"* ]]; then
+  ok_t "that refusal goes through fail(), so the exit-backstop stays quiet"
+else
+  bad_t "that refusal goes through fail()" \
+        "the DIVE-2598 backstop fired on top of it, which reads as a CLI bug rather than an unsupported invocation."
+fi
+
+# --- T14: the integrity check still fires on a rewritten bundle --------------
+# The frame check is the reason a bundle someone else edited does not run a
+# module sliced mid-function (`line 11582: name: No such file or directory`).
+# Iteration 3 made it ~20x cheaper by grepping the ~14 frame lines out of the
+# slice before matching, instead of scanning the whole 444KB slice twice per
+# module. CHEAPER MUST NOT MEAN VACUOUS, so: delete lines from the CORE of a
+# built bundle — exactly what tests/buzz_by_design_rc3_not_a_panic_unit.sh does
+# — which slides every payload offset, and assert the CLI still answers.
+REWRITTEN="$TMP/5dive-rewritten"
+awk 'NR>=200 && NR<=260 && /^#/ { next } { print }' "$BUNDLE" >"$REWRITTEN"
+chmod +x "$REWRITTEN"
+SLID=$(( $(grep -c "" "$BUNDLE") - $(grep -c "" "$REWRITTEN") ))
+if [[ "$SLID" -lt 5 ]]; then
+  bad_t "the rewrite really slides the payload offsets" \
+        "it removed $SLID lines; with no slide this arm proves nothing."
+else
+  ok_t "the rewrite slides every payload offset by $SLID lines (control)"
+  if RW_OUT="$("$REWRITTEN" task ls --json 2>&1)" && [[ "$RW_OUT" == *"["* ]]; then
+    ok_t "a rewritten bundle still loads its modules (the frame check caught the slide)"
+  else
+    bad_t "a rewritten bundle still loads its modules" \
+          "the offsets slid by $SLID and the frame fallback did not recover: ${RW_OUT:0:200}"
   fi
 fi
 

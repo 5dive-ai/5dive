@@ -392,7 +392,7 @@ LAZY_HEAD
 # and tests/lazy_dispatch_unit.sh refuses a new one that is not.)
 _load_module() {
   local -a __lz_queue=("$@") __lz_pending=() __lz_sed=()
-  local __lz_m __lz_dep __lz_s __lz_e __lz_txt __lz_max=0
+  local __lz_m __lz_dep __lz_s __lz_e __lz_txt __lz_frames __lz_max=0
   # PRELOAD (DIVE-4087 iteration 2). The cost of lazy dispatch is not the first
   # load, it is a module whose first call happens inside `$( )`: it lands in the
   # subshell and is gone on return, so the NEXT call re-reads and re-evals it.
@@ -417,6 +417,24 @@ _load_module() {
   done
   ((${#__lz_pending[@]})) || return 0
 
+  # `cat 5dive | bash -s -- whoami` (DIVE-4087 iteration 2, found by quinn). The
+  # loader reads its own modules back out of the file it was invoked as, so an
+  # invocation that gives it no file to read cannot work — piped into a shell,
+  # $0 is "bash" and the first load died with `sed: can't read /.../bash`, a
+  # message about the wrong thing entirely. The eager bundle happened to survive
+  # this because a pipe carries the whole script; it was never a supported way
+  # to run the CLI (install.sh pipes the INSTALLER, not the bundle). Say so.
+  # `die` (not a bare exit): src/lib/output.sh's EXIT backstop shouts "exited
+  # without reporting a reason — this is a bug in the CLI" at any non-zero exit
+  # that did not go through fail(), and this one has a reason and a remedy.
+  if [[ ! -r "$__FIVE_BUNDLE" ]]; then
+    die "5dive cannot read its own program at $__FIVE_BUNDLE.
+  5dive is a file, not a stream: since DIVE-4087 it reads its command modules
+  back out of itself on demand, so it cannot be piped into a shell. Run the
+  installed binary, or bash the file: \`bash ./5dive <command>\`.
+  (install.sh pipes the INSTALLER into bash, never the bundle — that is unchanged.)"
+  fi
+
   # FAST PATH: one sed for the whole set. sed emits the ranges in FILE order
   # however they were passed — which is bundle order, the order the eager bundle
   # cat'd them in. src/task/*.sh relies on that: a few of those files open with
@@ -434,11 +452,28 @@ _load_module() {
   # Did we get what we asked for? Every module is framed by its own name, so
   # this is a real check on the bytes, not a checksum of the offsets against
   # themselves. It fires when something rewrote the file after the build.
+  #
+  # THE CHECK RUNS AGAINST THE FRAME LINES, NOT AGAINST THE SLICE, AND THAT IS
+  # THE WHOLE PERFORMANCE STORY OF ITERATION 3. `[[ $big == *needle* ]]` is a
+  # linear scan per attempt, and this loop makes TWO per module: on `task ls`
+  # that was 8 scans of a 444KB slice = 87ms, and on `heartbeat ls` 14 scans of
+  # 920KB = 190ms — i.e. the integrity check, not sed and not the eval, was the
+  # entire load-path regression quinn's own budget arm caught in CI (117% of the
+  # eager control). One grep reduces the haystack to the ~14 frame lines the
+  # patterns are actually about, and the same globs then cost 0.6ms. Measured on
+  # this host, `task ls` slice: globs 251ms -> grep 15ms + globs 0.6ms.
+  #
+  # The grep is anchored (`^#@`) so it cannot pick a frame word out of a comment
+  # or a string inside a module body, and the patterns below still match whole
+  # frame lines — the check is exactly as strict as it was, only cheaper.
+  __lz_frames="$(grep '^#@' <<<"$__lz_txt")" || __lz_frames=''
   for __lz_m in "${__lz_pending[@]}"; do
     # The trailing newline in the pattern is load-bearing: "#@MOD cmd_agent" is
     # a prefix of "#@MOD cmd_agent_create", so an unanchored match would accept
     # the wrong module and report success on a slice that never contained it.
-    if [[ "$__lz_txt" != *"#@MOD $__lz_m"$'\n'* || "$__lz_txt" != *"#@ENDMOD $__lz_m"$'\n'* ]]; then
+    # (grep drops the final newline, so the frame list is re-terminated.)
+    if [[ "$__lz_frames"$'\n' != *"#@MOD $__lz_m"$'\n'* \
+       || "$__lz_frames"$'\n' != *"#@ENDMOD $__lz_m"$'\n'* ]]; then
       # SLOW PATH, and it is the correct one: match the frames instead of
       # trusting line numbers. A full pass over the bundle, paid only by a
       # rewritten artifact.
