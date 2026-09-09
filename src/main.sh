@@ -726,6 +726,12 @@ main() {
         # Reached via the scoped render_standard_sudoers grant so a standard
         # agent's /restart + /model work without a raw systemd-run/sudo grant.
         _self_restart) cmd_self_restart "$@" ;;
+        # DIVE-4081: hidden installer migration. Refresh managed standard-seat
+        # sudoers after a bundle upgrade so existing routed reviewers gain the
+        # narrow _task_answer path already rendered for newly-created seats.
+        _reconcile_sudoers)
+          AUDIT_CMD="agent _reconcile_sudoers"; AUDIT_ARGS=()
+          cmd_agent_reconcile_sudoers "$@" ;;
         stats)   cmd_stats "$@" ;;
         create)
           AUDIT_CMD="agent create"; AUDIT_ARGS=("$@")

@@ -85,7 +85,7 @@ as_agent substitute cmd_task_assign "$tid" reviewer >/dev/null 2>"$TMP/err"
 
 # A rejection returns ownership and clears the prior ACK; the next maker close
 # will create a fresh delivered handoff for the next review iteration.
-as_agent reviewer cmd_task_reject "$tid" --feedback="revise" >/dev/null 2>"$TMP/err"
+as_agent reviewer cmd_task_reject "$tid" --feedback="revise FIX: name the concrete change" >/dev/null 2>"$TMP/err"
 reset=$(db "SELECT assignee||'|'||COALESCE(handoff_ack_at,'') FROM tasks WHERE id=$tid;")
 [[ "$reset" == "maker|" ]] \
   && ok_t "reject clears ACK for the next handoff" \

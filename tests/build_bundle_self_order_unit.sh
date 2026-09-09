@@ -51,15 +51,29 @@ fi
 # Moves src/lib/self.sh to just AFTER src/cmd_digest.sh (a real consumer). If this
 # stays green the check is vacuous; it MUST fail, and fail on the ordering message,
 # not on some unrelated breakage.
+# DIVE-4087 made this a TWO-move mutation, and the reason is the point of the
+# arm. The manifest is now two lists: CORE_FILES (parsed on every call) and
+# LAZY_FILES (trailing text, pulled in by line range). A consumer that sits in
+# LAZY_FILES can never see an unparsed definition, because the core carries an
+# autoload stub for it — so the old one-move mutation (slide self.sh past
+# cmd_digest.sh, which is now lazy) no longer constructs the defect and the arm
+# would have gone VACUOUS while still reading green.
+#
+# The defect class is unchanged: a `declare -F five_self_bundle || source
+# .../lib/self.sh` guard PARSED BEFORE the definition, inside the always-parsed
+# region, where nothing but list order orders them. So: pull cmd_digest.sh into
+# CORE_FILES and put self.sh after it.
 python3 - "$ROOT/build.sh" "$MUT_BUILD" <<'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 lines = open(src).read().splitlines(keepends=True)
-self_idx = next(i for i, l in enumerate(lines) if l.strip() == 'src/lib/self.sh \\')
-digest_idx = next(i for i, l in enumerate(lines) if l.strip() == 'src/cmd_digest.sh \\')
-assert self_idx < digest_idx, "fixture assumption broken: self.sh already after cmd_digest.sh"
-moved = lines.pop(self_idx)
-lines.insert(digest_idx, moved)  # index shifts by one after the pop, landing AFTER cmd_digest.sh
+self_idx = next(i for i, l in enumerate(lines) if l.strip() == 'src/lib/self.sh')
+lazy_digest = next(i for i, l in enumerate(lines) if l.strip() == 'src/cmd_digest.sh')
+assert lazy_digest > self_idx, "fixture assumption broken: cmd_digest.sh is not in LAZY_FILES"
+lines.pop(lazy_digest)                      # out of the lazy region
+moved_self = lines.pop(self_idx)            # out of its ordered slot in the core
+lines.insert(self_idx, '  src/cmd_digest.sh\n')   # consumer first ...
+lines.insert(self_idx + 1, moved_self)      # ... definition after it
 open(dst, 'w').write(''.join(lines))
 PY
 chmod +x "$MUT_BUILD"

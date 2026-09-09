@@ -160,7 +160,7 @@ t4_rc=$(rc_of vfy start "$t4")
 # The refusal tells the maker to wait for the bounce. Grade the remedy half, not
 # only the predicate: after `task reject`, the maker's start must work again.
 t5=$(mk_delivered)
-run_as vfy reject "$t5" --feedback="needs another pass" >/dev/null
+run_as vfy reject "$t5" --feedback="needs another pass FIX: name the concrete change" >/dev/null
 [[ "$(db "SELECT assignee FROM tasks WHERE id=${t5};")" == "mak" ]] \
   && ok_t "T5a a reject bounces the row back to the maker" \
   || bad_t "T5a a reject bounces the row back to the maker" "assignee=$(db "SELECT assignee FROM tasks WHERE id=${t5};")"

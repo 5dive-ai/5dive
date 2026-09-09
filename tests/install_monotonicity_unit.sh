@@ -259,6 +259,13 @@ fi
 dirty_repo="$TD/dirty-repo"
 git clone -q "$ROOT" "$dirty_repo"
 cp "$ROOT/build.sh" "$dirty_repo/build.sh"
+# DIVE-4087: the build recipe is TWO files — build.sh sources the lazy-dispatch
+# index generator. Copying only build.sh made the clone's build die with
+# "scripts/lib/lazy-dispatch.sh: No such file or directory", which this arm read
+# as "the dirty stamp is missing". Copy the whole recipe, or an uncommitted
+# generator is not the one being graded.
+mkdir -p "$dirty_repo/scripts/lib"
+cp "$ROOT/scripts/lib/lazy-dispatch.sh" "$dirty_repo/scripts/lib/lazy-dispatch.sh"
 printf '\n# dirty fixture\n' >> "$dirty_repo/src/header.sh"
 dirty_head="$(git -C "$dirty_repo" rev-parse HEAD)"
 dirty_out="$TD/dirty-5dive"

@@ -5,8 +5,20 @@ name: bundle-drift
 # bundle must always match what build.sh produces from src/.
 on:
   pull_request:
+  # DIVE-4139 — MERGE QUEUE. Every context in this file that is a REQUIRED status
+  # check on main must also fire on `merge_group`, or the queue never receives it:
+  # with a queue enabled GitHub evaluates required checks on the temporary
+  # `gh-readonly-queue/main/...` merge group, and a required context that never
+  # reports there holds the entry until the check-response timeout and then EVICTS
+  # it. That failure is silent at the PR — the PR just never merges.
+  merge_group:
   push:
-    branches: ['**']
+    # DIVE-4139: `'**'` MATCHES `gh-readonly-queue/main/...`, so without the
+    # exclusion this workflow would run TWICE on the same merge group — once from
+    # the queue branch push, once from `merge_group` — and both runs report the
+    # same context name `check`. Two runs racing one required context is how a
+    # queue entry goes red on the loser.
+    branches: ['**', '!gh-readonly-queue/**']
   # DIVE-2118: dispatchable, so version-assign can trigger this after its own push.
   # A GITHUB_TOKEN push does NOT trigger workflows; workflow_dispatch is GitHub's
   # documented exception ("workflow_dispatch and repository_dispatch events always

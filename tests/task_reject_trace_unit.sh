@@ -83,7 +83,7 @@ A=$(seed "A verifier bounces a delivered row")
 [[ "$(status_of "$A")" == "todo" && -n "$(col_of "$A" handoff_delivered_at)" ]] \
   && ok_t "A fixture is a DELIVERED row (status todo, handoff_delivered_at set)" \
   || bad_t "A fixture" "status=$(status_of "$A") delivered_at='$(col_of "$A" handoff_delivered_at)' — arms A-E would grade the wrong path"
-out=$(as main cmd_task_reject "$A" --feedback="needs a test"); rc=$?
+out=$(as main cmd_task_reject "$A" --feedback="needs a test FIX: name the concrete change"); rc=$?
 (( rc == 0 )) && ok_t "A the verifier's bounce succeeds (rc=0)" \
   || bad_t "A reject broken" "rc=$rc $(cat "$TMP"/err)"
 
@@ -171,7 +171,7 @@ c_row2=$(JSON_MODE=1 cmd_task_ls --all 2>/dev/null | jq -c --arg i "$C" '.data.t
 # verbs through the shared guard and left reject's fourth site hand-rolled).
 F=$(seed "F reject at the iteration cap escalates")
 db "UPDATE tasks SET max_iterations=1, iteration=1 WHERE ident=$(sqlq "$F");"
-out=$(as main cmd_task_reject "$F" --feedback="still wrong at the cap"); rc=$?
+out=$(as main cmd_task_reject "$F" --feedback="still wrong at the cap FIX: name the concrete change"); rc=$?
 [[ "$(db "SELECT COALESCE(need_type,'') FROM tasks WHERE ident=$(sqlq "$F");")" == "manual" ]] \
   && ok_t "F fixture took the ESCALATION branch (a manual gate was filed), not the bounce-back" \
   || bad_t "F wrong branch" "need_type='$(db "SELECT COALESCE(need_type,'') FROM tasks WHERE ident=$(sqlq "$F");")' — arm F below would grade the ordinary path twice"
@@ -190,8 +190,8 @@ f_detail=$(db "SELECT COALESCE(detail,'') FROM lifecycle_events WHERE ident=$(sq
 # tests it; the prior text differs (it now contains the first rejection), so the
 # hashes must differ and both rows must survive.
 G=$(seed "G two bounces with identical feedback both record")
-as main cmd_task_reject "$G" --feedback="same words twice" >/dev/null
-as main cmd_task_reject "$G" --feedback="same words twice" >/dev/null
+as main cmd_task_reject "$G" --feedback="same words twice FIX: name the concrete change" >/dev/null
+as main cmd_task_reject "$G" --feedback="same words twice FIX: name the concrete change" >/dev/null
 [[ "$(events_of "$G" task.rejected)" == "2" ]] \
   && ok_t "G two rejects with identical feedback record TWO events (no idem collision)" \
   || bad_t "G events collapsed" "count=$(events_of "$G" task.rejected) — INSERT OR IGNORE silently dropped a bounce"

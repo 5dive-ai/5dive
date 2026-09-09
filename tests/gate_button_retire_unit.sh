@@ -377,7 +377,7 @@ if [[ -z "$ident" ]]; then chk "wiring/reject: seeded a gate" "yes" "no"; else
   db "UPDATE tasks SET maker_agent='fixture-maker', verifier=$(sqlq "$(task_actor "")"),
         status='todo' WHERE ident=$(sqlq "$ident");"
   reset_edits; reset_deletes
-  ( cmd_task_reject "$ident" --feedback="fixture bounce" ) >/dev/null 2>&1
+  ( cmd_task_reject "$ident" --feedback="fixture bounce FIX: name the concrete change" ) >/dev/null 2>&1
   chk "wiring/reject: auto:reject supersedes the gate and DELETES its card" \
       "tok-marketing|1234567890|15491" "$(deletes)"
   chk "wiring/reject: and the gate really was superseded (the arm graded the retire, not a refusal)" \

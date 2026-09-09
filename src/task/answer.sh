@@ -248,7 +248,7 @@ _task_answer_forbidden_flag() {
 }
 
 cmd_task_answer_delegated() {
-  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "_task_answer is a privileged internal primitive (reachable only through the exact-path NOPASSWD grant)."
+  _gate_is_root || fail "$E_PERMISSION" "_task_answer is a privileged internal primitive (reachable only through the exact-path NOPASSWD grant)."
 
   # Parameters over stdin, NUL-separated, never argv (main's condition 3): nothing
   # gate-bearing lands in the process table, and the grant stays an exact command
@@ -319,7 +319,7 @@ cmd_task_answer_delegated() {
 # today (unsigned, with the DIVE-2760 notice naming the cause) — so this can make
 # a closure signed and can never make an answer fail.
 _task_answer_try_delegated() {
-  [[ $EUID -ne 0 ]]                        || return 1   # root already signs in-process
+  _gate_is_root                            && return 1   # root already signs in-process
   [[ -z "${TASK_ANSWER_DELEGATED:-}" ]]    || return 1   # no recursion from the executor
   sudo -n -l /usr/local/bin/5dive gate-proof sign >/dev/null 2>&1 && return 1
   sudo -n -l /usr/local/bin/5dive _task_answer    >/dev/null 2>&1 || return 1
@@ -1265,7 +1265,7 @@ cmd_task_answer() {
   local _vfs=""; [[ "$nt" != "secret" ]] && _vfs="$value"
   local _sig="" _sig_why=""
   if [[ -n "$_uid" ]]; then
-    if [[ $EUID -eq 0 ]]; then
+    if _gate_is_root; then
       _gate_proof_ensure_key 2>/dev/null || true
       _sig=$(_gate_closure_sign "$id" "$nt" "$_vfs" "$answered_by" "$_ts" "$_uid" 2>/dev/null || echo "")
       [[ -n "$_sig" ]] || _sig_why="running as root, but the gate-proof key could not be created or read on this box"
@@ -1318,10 +1318,21 @@ cmd_task_answer() {
     warn "    (\"gate on ${ident} has no valid signed closure\"). The closure is signed by"
     warn "    the ANSWERER, not by the agent acting on it, so that refusal lands on the"
     warn "    maker's next round-trip and reads as tampering rather than as this."
-    warn "  fix: have this gate re-answered from a seat that can sign — root"
-    warn "    (\`sudo 5dive task answer ${ident} ...\`) or an agent whose sudo covers"
-    warn "    \`5dive gate-proof sign\`. Do NOT grant that to a cli-scoped seat: it signs"
-    warn "    arbitrary stdin, so the grant forges any closure, including a human:* one."
+    if [[ "$answered_by" == lead:* && -n "${_routed_rev:-}" ]]; then
+      local _retry_cmd
+      _retry_cmd=$(_gate_routed_answer_command "$ident" "$value")
+      warn "  fix: this answer-once gate cannot be re-signed. Re-file it, reconcile the"
+      warn "    managed standard-seat grants by installing/upgrading the current CLI, then"
+      warn "    have the routed reviewer run the ordinary command the gate names:"
+      warn "      $_retry_cmd"
+      warn "    Do NOT use agent-to-root sudo or grant gate-proof sign: neither is the"
+      warn "    routed-reviewer evidence path, and the latter can forge human:* closures."
+    else
+      warn "  fix: have this gate re-answered from a seat that can sign — root"
+      warn "    (\`sudo 5dive task answer ${ident} ...\`) or an agent whose sudo covers"
+      warn "    \`5dive gate-proof sign\`. Do NOT grant that to a cli-scoped seat: it signs"
+      warn "    arbitrary stdin, so the grant forges any closure, including a human:* one."
+    fi
   fi
 
   # DIVE-2410: the gate is settled, so its buttons must stop looking tappable.

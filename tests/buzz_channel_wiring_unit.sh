@@ -353,7 +353,9 @@ BZ=$SRC/cmd_agent_buzz.sh
 [[ -f "$BZ" ]] \
   && ok_t "src/cmd_agent_buzz.sh exists" \
   || bad_t "src/cmd_agent_buzz.sh exists" "the CLI half of buzz onboarding is missing"
-grep -qE '^\s*src/cmd_agent_buzz\.sh \\$' build.sh \
+# DIVE-4087: the cat list is now LAZY_FILES=( ... ) — indented path, no trailing
+# backslash. Same claim: this file reaches the bundle.
+grep -qE '^[[:space:]]*src/cmd_agent_buzz\.sh$' build.sh \
   && ok_t "build.sh bundles src/cmd_agent_buzz.sh" \
   || bad_t "build.sh bundles src/cmd_agent_buzz.sh" \
            "the file is present but never concatenated — \`5dive agent buzz\` would be 'command not found' in the built bundle"

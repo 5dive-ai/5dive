@@ -350,7 +350,7 @@ k_delivered_st=$(status_of "$K")
 [[ "$k_delivered_st" == "todo" && "$(res_of "$K")" == *"MAKER-RECORD"* ]] \
   && ok_t "K/REACHABILITY: the delivered row is 'todo' and carries the maker's result — the exact cell the old predicate skipped" \
   || bad_t "K/REACHABILITY: fixture is not the delivered shape" "status=$k_delivered_st result='$(res_of "$K")'"
-as vfy cmd_task_reject "$K" --feedback="missing the migration" >/dev/null; k_rc=$?
+as vfy cmd_task_reject "$K" --feedback="missing the migration FIX: name the concrete change" >/dev/null; k_rc=$?
 k_res=$(res_of "$K")
 (( k_rc == 0 )) && [[ "$k_res" == *"MAKER-RECORD: built X, see PR #9"* ]] \
   && ok_t "K: the maker's result SURVIVES the reject (preserved under a seam)" \
@@ -369,7 +369,7 @@ as vfy cmd_task_done "$L" --result="VERIFIER-GRADE-L: pass" >/dev/null
 [[ "$(status_of "$L")" == "done" ]] \
   && ok_t "L/REACHABILITY: the row is CLOSED and graded before the reject" \
   || bad_t "L/REACHABILITY: fixture never closed" "status=$(status_of "$L")"
-as vfy cmd_task_reject "$L" --feedback="withdrawing my grade" >/dev/null; l_rc=$?
+as vfy cmd_task_reject "$L" --feedback="withdrawing my grade FIX: name the concrete change" >/dev/null; l_rc=$?
 l_res=$(res_of "$L")
 (( l_rc == 0 )) && [[ "$l_res" == *"VERIFIER-GRADE-L: pass"* && "$l_res" == *"withdrawing my grade"* ]] \
   && ok_t "L: a verifier reopening their own closed grade still preserves it (not refused, not replaced)" \

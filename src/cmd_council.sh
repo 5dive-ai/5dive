@@ -309,7 +309,7 @@ export function verifierVerdictToAction(task, verdict) {
     const critique = verdict.dissent && verdict.dissent !== 'none' ? verdict.dissent : (verdict.brief || 'Did not meet the acceptance criteria.')
     return {
       action: 'reject',
-      command: `5dive task reject ${task.ident} --feedback=${shellQuote(`[council verifier] FAIL (tally ${tly}). ${critique}`)}`,
+      command: `5dive task reject ${task.ident} --feedback=${shellQuote(`[council verifier] FAIL (tally ${tly}). FINDING: ${critique}`)} --no-fix=${shellQuote('council tally verdict — the critique above is the finding; the council prescribes no single change (DIVE-4144)')}`,
     }
   }
   const brief = (verdict.brief || verdict.dissent) || 'Council could not grade; human decision required.'

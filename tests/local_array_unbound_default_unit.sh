@@ -348,7 +348,7 @@ def file_scope_names(lines):
         # below requires one. A BARE `declare -A NAME` creates nothing readable:
         # `set -u; declare -A X; echo ${#X[@]}` is an unbound-variable crash, so
         # whitelisting a bare declare would silence the very class this harness
-        # exists for. src/cmd_loop.sh:354 `declare -A _LOOP_SPEND_LAST` is that
+        # exists for. src/cmd_loop.sh:354 `declare -gA _LOOP_SPEND_LAST` is that
         # shape and is the only name the `=` drops from this tree. Graded by G3d.
         m = re.match(r'(?:declare|typeset)\s+((?:-[A-Za-z]+\s+)*)([A-Za-z_][A-Za-z0-9_]*)=', l)
         if m:
@@ -488,10 +488,15 @@ grade "G3c: a local shadowing a file-scope global is still REPORTED" \
 # creates NOTHING readable — `set -u; declare -A X; echo ${#X[@]}` exits 1 with
 # `X: unbound variable` — so a resolver that whitelists it silences a live crash
 # instead of teaching the scope rule. src/cmd_loop.sh:354 is the real instance
-# (`declare -A _LOOP_SPEND_LAST 2>/dev/null || true`, populated only at :360).
+# (`declare -gA _LOOP_SPEND_LAST 2>/dev/null || true`, populated only at :360).
 mkdir -p "$TMP/mut5" && cp -R "$SRC" "$TMP/mut5/src"
+# `-g` is accepted here and is not a widening: DIVE-4087 made every column-0
+# `declare` in a lazily loaded module `declare -g`, because _load_module evals
+# the module inside a function where a plain `declare -A` would be a LOCAL. The
+# shape G3d grades — a file-scope array declared with NO initialiser, so
+# `${#X[@]}` is unbound under `set -u` — is exactly the same either way.
 grade "G3d: the bare file-scope declare still exists in cmd_loop.sh (anchor)" \
-      "1" "$(grep -cE '^declare -A _LOOP_SPEND_LAST\b' "$TMP/mut5/src/cmd_loop.sh")"
+      "1" "$(grep -cE '^declare -g?A _LOOP_SPEND_LAST\b' "$TMP/mut5/src/cmd_loop.sh")"
 python3 - "$TMP/mut5/src/cmd_doctor.sh" "$ANCHOR" <<'PY'
 import sys
 p, anchor = sys.argv[1], sys.argv[2]

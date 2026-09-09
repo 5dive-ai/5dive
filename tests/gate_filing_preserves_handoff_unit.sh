@@ -159,7 +159,7 @@ printf '%s' "$red" | jf '.data.iteration' | grep -qx 1 \
 
 # T8 — a REAL second pass. The verifier bounces it; the maker's next delivery is
 # rework and must bump. This is the arm that stops T7 being "never bump again".
-as_agent reviewer cmd_task_reject "$rid" --feedback="missed the criteria" >/dev/null 2>&1
+as_agent reviewer cmd_task_reject "$rid" --feedback="missed the criteria FIX: name the concrete change" >/dev/null 2>&1
 rej=$(db "SELECT COALESCE(handoff_rejected_at,'') FROM tasks WHERE id=$rid;")
 [[ -n "$rej" ]] && ok_t "T8 reject stamps handoff_rejected_at" || bad_t "T8 reject clock" "empty"
 as_agent maker cmd_task_start "$rid" >/dev/null 2>&1
