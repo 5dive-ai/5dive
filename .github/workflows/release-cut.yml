@@ -249,11 +249,34 @@ jobs:
             _untyped=$(git log --no-merges --format='%h %s' "$_enforce" 2>/dev/null \
               | grep -vE '^[0-9a-f]+ (feat|fix|test|chore|docs|refactor|ci|perf)(\([^)]*\))?!?: ' | head -5) || _untyped=""
           fi
+          # THE REFUSAL ASKS A QUESTION A PERSON CAN ANSWER, so an explicit level
+          # SATISFIES it rather than being forbidden by it (DIVE-4153). The refusal
+          # exists because the cut "cannot tell whether it contains a feature"; someone
+          # passing level=patch|minor|major has answered precisely that. Before this,
+          # the printed remedy ("correct the offending subject in the branch being cut")
+          # was unreachable from the state it fires in: the branch is already MERGED, no
+          # tag can be cut past the lint epoch, so `_enforce` never collapses and every
+          # nightly refuses forever. That deadlocked the v0.29.0 train on 2026-09-09 with
+          # 14 merged commits uncut and every managed box held on v0.28.0.
+          #
+          # This does NOT lower the bar. The never-lower floor below still applies to the
+          # stated level, so a human cannot ship a feature as a patch this way; and
+          # RELEASE_LEVEL=auto — every scheduled run — still refuses exactly as before.
+          # What changes is only that the printed remedy is reachable from the state the
+          # refusal fires in.
+          _untyped_note=""
           if [[ -n "$_untyped" ]]; then
-            echo "::error::commits since ${incumbent:-<root>} carry no conventional type, so this cut cannot tell whether it contains a feature (DIVE-4086). The PR-title lint should have made this unreachable. Correct the offending subject in the branch being cut, then retry; changing RELEASE_LEVEL or dispatching manually cannot bypass this refusal:"
-            # shellcheck disable=SC2001  # prefixing every LINE, which ${x//y/z} cannot do
-            sed 's/^/::error::  /' <<<"$_untyped"
-            exit 1
+            if [[ -z "${RELEASE_LEVEL:-}" || "${RELEASE_LEVEL}" == "auto" ]]; then
+              echo "::error::commits since ${incumbent:-<root>} carry no conventional type, so this cut cannot tell whether it contains a feature (DIVE-4086). The PR-title lint should have made this unreachable. Correct the offending subject in the branch being cut, then retry — or, if it is already merged, re-dispatch this workflow with an explicit level=patch|minor|major to state the size yourself (DIVE-4153); an override may still only RAISE the cut, never lower it. Cutting a tag by hand is not a route:"
+              # shellcheck disable=SC2001  # prefixing every LINE, which ${x//y/z} cannot do
+              sed 's/^/::error::  /' <<<"$_untyped"
+              exit 1
+            fi
+            # A person overrode the refusal, so the release page must record that a
+            # person decided and WHICH commits the check could not read. An override
+            # that leaves no trace is indistinguishable from the check never firing.
+            _untyped_count=$(wc -l <<<"$_untyped"); _untyped_count="${_untyped_count// /}"
+            _untyped_note=" — level STATED by ${GITHUB_ACTOR:-unknown}, overriding the untyped-subject refusal (untyped subjects in range: ${_untyped_count}; ${_untyped//$'\n'/; })"
           fi
 
           # RELEASE_LEVEL is an OVERRIDE THAT MAY ONLY RAISE. Lowering it is how this
@@ -274,7 +297,7 @@ jobs:
             fi
             _level="$RELEASE_LEVEL"
           fi
-          _release_level_provenance="Release level: ${_level} (derived ${_derived} from ${_range}${_forced_by:+ — forced by ${_forced_by//$'\n'/; }})."
+          _release_level_provenance="Release level: ${_level} (derived ${_derived} from ${_range}${_forced_by:+ — forced by ${_forced_by//$'\n'/; }})${_untyped_note}."
           echo "$_release_level_provenance"
           case "$_level" in
             patch) version="${_maj}.${_min}.$(( _pat + 1 ))" ;;

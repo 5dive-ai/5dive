@@ -304,6 +304,10 @@ run_range(){
 # Every call neutralises RELEASE_LEVEL for the DIVE-2539 reason above: this file runs in
 # two jobs and one of them sets it. An arm about the COMMITS must not read the run's env.
 run_derive(){ ( unset RELEASE_LEVEL; run_range "$@" ); }
+# DIVE-4153: the STATED-level path. $1 = the level a person passed on the dispatch,
+# then run_range's own arguments. Exported rather than prefixed because the block reads
+# it as an environment variable, the same way the runner supplies the dispatch input.
+run_stated(){ local lvl="$1"; shift; ( export RELEASE_LEVEL="$lvl"; run_range "$@" ); }
 
 echo "-- DIVE-4086: a feat in the range cuts a MINOR, with no input at all"
 out=$(run_derive '0.17.8' v0.27.1 nolint 'feat(plugin): a declared plugin verb is now dispatched'); rc=$?
@@ -345,9 +349,20 @@ grep -q 'DIVE-1234: an untyped subject' <<<"$out" \
   && ok_t 'the refusal NAMES the offending commit (an error you cannot act on is a stall)' \
   || bad_t 'the refusal does not name which commit is untyped' "rc=$rc out=$out"
 
-grep -q 'dispatching manually cannot bypass this refusal' <<<"$out" && ! grep -q 'cut by hand' <<<"$out" \
-  && ok_t 'the refusal names its real boundary instead of advertising a manual path that hits the same exit' \
-  || bad_t 'the refusal still sends an operator toward a nonexistent manual bypass' "rc=$rc out=$out"
+# DIVE-4153: the remedy printed here must be REACHABLE FROM THE STATE IT FIRES IN. It
+# used to say the opposite — "changing RELEASE_LEVEL or dispatching manually cannot
+# bypass this refusal" — which was true of the code and unsatisfiable in practice: the
+# offending subject is on a MERGED branch, and no tag can be cut past the lint epoch, so
+# the range never collapses and every nightly refuses forever. The assertion is still
+# that the refusal points at something an operator can DO, and still that it does not
+# advertise hand-tagging, which really is not a route.
+grep -q 'level=patch|minor|major' <<<"$out" && grep -q 'only RAISE' <<<"$out" \
+  && ok_t 'the refusal names a reachable remedy: state the size on the dispatch, and the never-lower floor still applies' \
+  || bad_t 'the refusal prints a remedy that cannot be reached from the state it fires in' "rc=$rc out=$out"
+
+grep -q 'by hand is not a route' <<<"$out" && ! grep -qi 'cut the tag yourself' <<<"$out" \
+  && ok_t 'the refusal still refuses hand-tagging, which is the one path that really cannot clear it' \
+  || bad_t 'the refusal sends an operator toward a hand-cut tag' "rc=$rc out=$out"
 
 out=$(run_derive '0.17.8' v0.27.1 nolint 'DIVE-1234: an untyped subject'); rc=$?
 grep -q '^DERIVED=v0\.27\.2$' <<<"$out" \
@@ -370,6 +385,50 @@ out=$(run_derive '0.17.8' v0.27.1 lint 'feat: after the lint' 'fix: also after')
 grep -q '^DERIVED=v0\.28\.0$' <<<"$out" \
   && ok_t 'a fully-typed post-lint range still cuts normally (the refusal is not a blanket stop)' \
   || bad_t 'a clean post-lint range was refused' "rc=$rc out=$out"
+
+echo "-- DIVE-4153: an explicit level SATISFIES the untyped-subject refusal; auto still refuses"
+# The deadlock this closes: the refusal's printed remedy is "correct the offending
+# subject in the branch being cut", and on 2026-09-09 that branch was already merged.
+# `_enforce` only collapses once a tag exists past the lint epoch, and no tag could be
+# cut — so the remedy was unreachable and every nightly would refuse forever, with 14
+# merged commits held off every managed box. A person stating the size answers the exact
+# question the refusal asks ("does this cut contain a feature?").
+out=$(run_stated minor '0.17.8' v0.27.1 lint 'DIVE-1234: an untyped subject'); rc=$?
+[[ $rc -eq 0 ]] && grep -q '^DERIVED=v0\.28\.0$' <<<"$out" \
+  && ok_t 'THE MEASURED CASE: level=minor over the same untyped range that refuses on auto PROCEEDS — the deadlocked v0.29.0 train can move' \
+  || bad_t 'an explicitly stated level still cannot clear the untyped refusal; the train stays deadlocked forever' "rc=$rc out=$out"
+
+grep -q 'level STATED by' <<<"$out" && grep -q 'DIVE-1234: an untyped subject' <<<"$out" \
+  && ok_t 'the provenance records that a PERSON decided and names the commits the check could not read (an override that leaves no trace is indistinguishable from the check never firing)' \
+  || bad_t 'the stated-level override left no trace on the release page' "rc=$rc out=$out"
+
+# THE ARM THAT KEEPS THIS FROM BEING A WIDENING. Satisfying the refusal must not
+# satisfy the FLOOR: a stated patch over a range containing a feat is still the
+# DIVE-4086 defect wearing a hand instead of a cron, untyped subjects or not.
+out=$(run_stated patch '0.17.8' v0.27.1 lint 'DIVE-1234: an untyped subject' 'feat: a real feature'); rc=$?
+[[ $rc -ne 0 ]] && grep -q 'may raise a cut, never lower it' <<<"$out" \
+  && ok_t 'level=patch over a range with a feat is STILL refused by the never-lower floor — the override satisfies the untyped check, not the floor' \
+  || bad_t 'stating a level bypassed the never-lower floor; a feature can now ship as a patch by hand' "rc=$rc out=$out"
+
+# auto is every SCHEDULED run, so this is the arm that says the nightly is unchanged.
+out=$(run_stated auto '0.17.8' v0.27.1 lint 'DIVE-1234: an untyped subject'); rc=$?
+[[ $rc -ne 0 ]] && grep -q 'carry no conventional type' <<<"$out" \
+  && ok_t "RELEASE_LEVEL=auto — the scheduled path — still refuses the untyped range exactly as before" \
+  || bad_t 'the nightly no longer refuses an untyped range; a feature would ship as a patch unattended' "rc=$rc out=$out"
+
+# And the unset case (the `test` job supplies no RELEASE_LEVEL at all) must behave like
+# auto, not like a stated level — an absent input is not a decision.
+out=$(run_derive '0.17.8' v0.27.1 lint 'DIVE-1234: an untyped subject'); rc=$?
+[[ $rc -ne 0 ]] \
+  && ok_t 'an UNSET RELEASE_LEVEL refuses too — an absent input is not a person stating the size' \
+  || bad_t 'an unset RELEASE_LEVEL was treated as an override; the refusal is now trivially bypassed' "rc=$rc out=$out"
+
+# A clean typed range must not grow the override note — the provenance says STATED only
+# when something was actually overridden.
+out=$(run_stated minor '0.17.8' v0.27.1 lint 'feat: after the lint'); rc=$?
+[[ $rc -eq 0 ]] && ! grep -q 'level STATED by' <<<"$out" \
+  && ok_t 'a stated level over a CLEAN range records no override note — the note marks a real override, not any dispatch' \
+  || bad_t 'the override note appears when nothing was overridden' "rc=$rc out=$out"
 
 echo "-- DIVE-4086: an override may RAISE the derived level and never lower it"
 out=$(export RELEASE_LEVEL=patch; run_range '0.17.8' v0.27.1 nolint 'feat: the headline'); rc=$?
