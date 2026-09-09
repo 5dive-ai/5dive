@@ -2039,6 +2039,15 @@ _task_gate_undo_window_secs() {
   # but a non-numeric one is a typo, not a policy — fall back rather than defer
   # forever on a garbage value.
   [[ "$secs" =~ ^[0-9]+$ ]] || secs="$_GATE_UNDO_WINDOW_SECS"
+  # THE OVERRIDE MAY ONLY EVER SHORTEN THE HOLD, NEVER LENGTHEN IT. This is the
+  # _GATE_HUMAN_CAPABILITIES seal (DIVE-2241/2131) applied to a duration: agents
+  # hold NOPASSWD:ALL, so an unclamped env var IS a write path to the constant,
+  # and the write an agent wants is upward — set it to a week and a gate it does
+  # not want answered never reaches the phone at all. Clamping down keeps every
+  # legitimate use (harnesses pass 0, an operator shortens) and leaves the mute
+  # unreachable. It is arm D's form of the row's invariant: a knob may only ever
+  # move a gate TOWARD the phone, never away from it.
+  (( secs > _GATE_UNDO_WINDOW_SECS )) && secs="$_GATE_UNDO_WINDOW_SECS"
   # Kill switch. `off` restores the pre-DIVE-4154 ping byte for byte and needs no
   # release to take effect, same contract as `task pfr-autoclear`.
   local pref; pref=$(_task_pref_get gate_undo_window 2>/dev/null || echo ""); pref="${pref:-on}"
@@ -2081,6 +2090,21 @@ _task_need_notify_deliver() {
     _task_need_notify_deliver_now "$@"
     return $?
   fi
+  # THE WINDOW IS ABSOLUTE, MEASURED FROM need_asked_at — not relative to this
+  # call. task_need_notify has callers other than the filing path: the heartbeat
+  # gate re-nag and the /inbox batch re-send both drive it for gates that were
+  # asked long ago. A window relative to the call would hold THOSE too, which is
+  # backwards twice over — the gate has already waited far longer than the window
+  # it would be charged, and the re-nag is precisely the recovery path for a ping
+  # this window lost to a dead box. Holding the recovery is how a delay becomes a
+  # swallow. So a gate already past its window pings NOW, on every path.
+  local _age
+  _age=$(db "SELECT CAST((julianday('now')-julianday($(sqlq "$_asked")))*86400 AS INT);" 2>/dev/null || echo "")
+  if [[ "$_age" =~ ^[0-9]+$ ]] && (( _age >= _secs )); then
+    _task_need_notify_deliver_now "$@"
+    return $?
+  fi
+  _secs=$(( _secs - ( ${_age:-0} > 0 ? ${_age:-0} : 0 ) ))
   # The hold is RECORDED, and that record is what keeps the wrapper's delivery
   # assertion quiet: without a row it would synthesise an `error` verdict for a
   # gate that is deliberately, auditably, not yet delivered. No explicit

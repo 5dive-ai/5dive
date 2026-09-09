@@ -57,7 +57,11 @@ mkgate() {   # $1=ident $2=priority
 }
 reset() { : >"$FIVEDIVE_GATE_NOTIFY_LOG"; : >"$MARK"; TASK_GATE_DELIVERY_ROWS=0; TASK_GATE_ROUTE_URGENT=0; }
 
-export _5DIVE_GATE_UNDO_WINDOW_SECS=1   # keep the harness fast; 120 in the shipped constant
+export _5DIVE_GATE_UNDO_WINDOW_SECS=4   # keep the harness fast; 120 in the shipped constant.
+# 4s, not 1s: the fixture mutates the row AFTER the deferring call returns, and
+# under load a sqlite write can take longer than a 1s window — the child then
+# wins the race and the arm fails for a reason that is not the property. The
+# margin is the harness making the state change unambiguously precede the wake.
 
 # ── 1. THE HOLD ─────────────────────────────────────────────────────────────
 reset; mkgate DIVE-9101 high
@@ -68,7 +72,11 @@ _task_need_notify_deliver DIVE-9101 decision "ask" "" ; rc=$?
 delivered DIVE-9101 \
   && fail_t "the push fired SYNCHRONOUSLY — nothing was held" \
   || ok_t "the push did not fire at filing time"
-grep -q 'hold:1s' "$FIVEDIVE_GATE_NOTIFY_LOG" \
+# A RANGE, not the literal window: the hold is the REMAINDER of an absolute
+# window (arm 8c), so the second or two between mkgate writing need_asked_at and
+# this call is legitimately subtracted. Pinning the exact number grades the
+# harness's own scheduling, and fails on a loaded box for a correct implementation.
+grep -qE 'hold:[1-4]s' "$FIVEDIVE_GATE_NOTIFY_LOG" \
   && ok_t "the hold is RECORDED as a delivery row (auditable, not a silent drop)" \
   || fail_t "no hold row: $(cat "$FIVEDIVE_GATE_NOTIFY_LOG")"
 [[ "${TASK_GATE_DELIVERY_ROWS:-0}" == "1" ]] \
@@ -78,7 +86,7 @@ grep -q 'hold:1s' "$FIVEDIVE_GATE_NOTIFY_LOG" \
 # ── 2. THE WINDOW CLOSES ON A LIVE GATE: the push fires ─────────────────────
 # The negative control for arms 3 and 4 — without it, "nobody was paged" passes
 # for a window that never delivers anything at all.
-sleep 2
+sleep 6
 delivered DIVE-9101 \
   && ok_t "a gate still live when the window closes IS pushed (the hold delays, it does not swallow)" \
   || fail_t "the held push never fired — the window swallowed a real gate"
@@ -87,7 +95,7 @@ delivered DIVE-9101 \
 reset; mkgate DIVE-9102 high
 _task_need_notify_deliver DIVE-9102 decision "ask" ""
 db "UPDATE tasks SET need_asked_at=NULL WHERE ident='DIVE-9102';"   # `task need --withdraw`
-sleep 2
+sleep 6
 delivered DIVE-9102 \
   && fail_t "a gate withdrawn inside the window still paged the human — the whole arm" \
   || ok_t "a withdrawal inside the window pages NOBODY"
@@ -99,7 +107,7 @@ grep -q 'hold:withdrawn' "$FIVEDIVE_GATE_NOTIFY_LOG" \
 reset; mkgate DIVE-9103 high
 _task_need_notify_deliver DIVE-9103 decision "ask" ""
 db "UPDATE tasks SET need_answer='merge' WHERE ident='DIVE-9103';"
-sleep 2
+sleep 6
 delivered DIVE-9103 \
   && fail_t "a gate answered inside the window still paged" \
   || ok_t "an answer inside the window pages nobody"
@@ -111,7 +119,7 @@ delivered DIVE-9103 \
 reset; mkgate DIVE-9104 high
 _task_need_notify_deliver DIVE-9104 decision "old ask" ""
 db "UPDATE tasks SET need_asked_at=datetime('now','+1 second') WHERE ident='DIVE-9104';"
-sleep 2
+sleep 6
 delivered DIVE-9104 \
   && fail_t "the withdrawn gate's child delivered the RE-FILED gate's page" \
   || ok_t "a re-file inside the window is a different gate; the old child stands down"
@@ -146,7 +154,43 @@ _task_need_notify_deliver DIVE-9108 decision "ask" ""
 delivered DIVE-9108 \
   && fail_t "gate-undo-window on did not re-enable the hold" \
   || ok_t "gate-undo-window on re-enables the hold"
-sleep 2
+sleep 6
+
+# ── 8b. THE WINDOW IS ABSOLUTE: a re-nag on an OLD gate pings NOW ──────────
+# task_need_notify is also driven by the heartbeat gate re-nag and the /inbox
+# batch re-send, for gates asked long ago. Holding those would charge a gate a
+# window it has already served many times over — and worse, the re-nag is the
+# recovery path for a ping this very window lost to a dead box. Holding the
+# recovery is how a delay becomes a swallow.
+reset; mkgate DIVE-9110 high
+db "UPDATE tasks SET need_asked_at=datetime('now','-2 hours') WHERE ident='DIVE-9110';"
+_task_need_notify_deliver DIVE-9110 decision "ask" ""
+delivered DIVE-9110 \
+  && ok_t "a re-nag on a gate past its window pings immediately (the recovery path is never held)" \
+  || fail_t "the window held a re-nag — a delayed ping became a swallowed one"
+grep -q 'hold:' "$FIVEDIVE_GATE_NOTIFY_LOG" \
+  && fail_t "an already-aged gate logged a hold row" \
+  || ok_t "no hold row for a gate past its window"
+
+# ── 8c. A PARTLY-SERVED WINDOW IS NOT RESTARTED ────────────────────────────
+# Same defect as 8b, one notch smaller: a second call part-way through the window
+# must serve only the REMAINDER, or a repeated call (the re-nag ladder) can hold
+# a gate indefinitely by restarting its window every time.
+#
+# Graded on the RECORDED remainder, not on whether a push eventually landed. A
+# delivery-based arm cannot see this at all: the FIRST call's child delivers at
+# the original deadline either way, so `delivered` reads true for both the fixed
+# and the broken shape — an arm that passes against the mutant, and flakes on the
+# sleep timings while doing it.
+reset; mkgate DIVE-9111 high
+db "UPDATE tasks SET need_asked_at=datetime('now','-90 seconds') WHERE ident='DIVE-9111';"
+_5DIVE_GATE_UNDO_WINDOW_SECS=120 _task_need_notify_deliver DIVE-9111 decision "ask" ""
+if grep -qE 'hold:(2[6-9]|3[0-4])s' "$FIVEDIVE_GATE_NOTIFY_LOG"; then
+  ok_t "a gate 90s into a 120s window is held for the ~30s REMAINDER, not a fresh 120"
+else
+  fail_t "window restarted on re-entry: $(grep -o 'hold:[0-9]*s' "$FIVEDIVE_GATE_NOTIFY_LOG" | head -1) (expected ~30s)"
+fi
+sleep 1
 
 # ── 9. A GARBAGE DURATION FALLS BACK TO THE CONSTANT, never to 0 or forever ─
 reset; mkgate DIVE-9109 high
@@ -157,6 +201,36 @@ w=$(_5DIVE_GATE_UNDO_WINDOW_SECS="two minutes" _task_gate_undo_window_secs DIVE-
 [[ "$_GATE_UNDO_WINDOW_SECS" == "120" ]] \
   && ok_t "the shipped window is 2 minutes, as the row specifies" \
   || fail_t "shipped window is ${_GATE_UNDO_WINDOW_SECS}s, expected 120"
+
+
+# ── 10. THE OVERRIDE IS CLAMPED DOWNWARD: it may shorten the hold, never extend ─
+# The commit that shipped arm D called the duration "a sealed constant with no
+# write path", for the _GATE_HUMAN_CAPABILITIES reason: agents hold NOPASSWD:ALL,
+# so a duration they can raise is a mute button on any gate they do not want
+# answered. An unclamped env override IS that write path, and it is the UPWARD
+# direction that is dangerous — downward only makes the phone ring sooner.
+reset; mkgate DIVE-9112 high
+w=$(_5DIVE_GATE_UNDO_WINDOW_SECS=604800 _task_gate_undo_window_secs DIVE-9112)
+[[ "$w" == "$_GATE_UNDO_WINDOW_SECS" ]] \
+  && ok_t "a week-long override is clamped to the sealed constant ($w s) — no mute" \
+  || fail_t "override of 604800 yielded '$w': the constant is writable upward, a gate can be muted"
+w=$(_5DIVE_GATE_UNDO_WINDOW_SECS=121 _task_gate_undo_window_secs DIVE-9112)
+[[ "$w" == "$_GATE_UNDO_WINDOW_SECS" ]] \
+  && ok_t "one second over the constant is clamped too — the bound is <=, not a magnitude check" \
+  || fail_t "override of 121 yielded '$w', expected $_GATE_UNDO_WINDOW_SECS"
+
+# NEGATIVE CONTROLS. Both of these pass against the UNCLAMPED code, so arm 10
+# alone does not prove the clamp is narrow: without them a clamp written as a
+# blanket "ignore the override" would read green here and silently break every
+# sibling harness, which disables the window by exporting 0.
+w=$(_5DIVE_GATE_UNDO_WINDOW_SECS=0 _task_gate_undo_window_secs DIVE-9112)
+[[ "$w" == "0" ]] \
+  && ok_t "0 still disables the hold — the clamp is one-directional, not an override ban" \
+  || fail_t "override of 0 yielded '$w': the clamp swallowed the harness escape hatch"
+w=$(_5DIVE_GATE_UNDO_WINDOW_SECS=30 _task_gate_undo_window_secs DIVE-9112)
+[[ "$w" == "30" ]] \
+  && ok_t "a SHORTER override is honoured verbatim (30s) — operators may only hurry the page" \
+  || fail_t "override of 30 yielded '$w', expected 30"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

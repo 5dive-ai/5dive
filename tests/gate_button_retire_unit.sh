@@ -35,6 +35,16 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
 done
 set +e
 
+# DIVE-4154: this harness grades the DELIVERER — the escalation chain, the
+# channel resolution, the message the human actually receives. Arm D inserted a
+# phone-ping hold in FRONT of that deliverer, so driving these arms through the
+# default 120s window would grade the window instead and every assertion about a
+# sent message would read false. Disable it explicitly rather than silently: the
+# window is a separate unit with its own harness (tests/gate_undo_window_unit.sh)
+# and its own replay, and nothing below is about when the push fires.
+export _5DIVE_GATE_UNDO_WINDOW_SECS=0
+
+
 PASS=0; FAIL=0
 chk() { # <desc> <expected> <actual>
   if [[ "$2" == "$3" ]]; then PASS=$((PASS+1)); printf 'ok   %s\n' "$1"
