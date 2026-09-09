@@ -112,7 +112,7 @@ decision to add one is ever wrong on its own merits. See
     exist for humans and no workflow may pass either (`tests/header_drift_window_unit.sh`).
   - `--no-calibrate` grades against the raw cap (useful with no built bundle). The
     clamp floor is 1.0, so that is the **strictest** this gate gets, never a
-    relaxation. `--cal-us=` / `--cal-baseline-us=` / `--cal-cli=` are harness seams;
+    relaxation. `--cal-us=` / `--cal-baseline-us=` are harness seams;
     no workflow passes them, for the same reason no workflow passes `--budget`.
 - Locally: `bash scripts/run-harnesses.sh --tier=core` (or `--tier=full`). Both
   budgets, the calibration constants and the tier marker live in `tests/lib/tier.sh`,
