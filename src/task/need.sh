@@ -2925,8 +2925,29 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
   #
   # BEFORE THE WRITE, like every other refusal on this path: an rc-only failure
   # that had already filed the row would leave the ping it refused.
+  # "REACHES THE HUMAN" IS NOT "tier == 2", and assuming it was is the one way
+  # this refusal could do damage. A tier-2 approval / manual / access gate is
+  # ROUTED to a lead or to the task's verifier by the block further down
+  # (DIVE-1243 / DIVE-1495) unless the caller pinned --tier=2, the category floor
+  # fired, or a human capability was declared. Those routed gates are read by an
+  # AGENT, and refusing them over vocabulary is the tier-1 mistake wearing a
+  # different tier: caught by tests/gate_access_lead_clear_unit.sh, whose access
+  # gate legitimately asks to "push branch dive-3212-openclaw-harness-30s" to a
+  # LEAD. The route itself is resolved after the write, so the routability
+  # question is asked here with the routing block's own helper rather than read
+  # off the row — the same shape the eng-ship guard above uses.
   local _ar_human=0
-  [[ "$tier" == "2" || "$_needs_human" == "1" ]] && _ar_human=1
+  if [[ "$tier" == "2" ]]; then
+    if [[ "$type" == "secret" || "$tier_arg" == "2" || "$tier_floored" == "1" \
+          || "$_needs_human" == "1" || -z "$(_gate_route_reviewer "$(task_actor "$from")")" ]]; then
+      _ar_human=1
+    fi
+  elif [[ "$_needs_human" == "1" ]]; then
+    # Declared human capability below tier 2: the DIVE-2241 re-assert further
+    # down raises it back, so it is human-facing here whatever the running tier
+    # says. Without this arm the check is skipped by --tier=1 --needs=human_tap.
+    _ar_human=1
+  fi
   if (( _ar_human )); then
     local _ar_words _ar_term="" _ar_why=""
     _ar_words=$(_gate_ask_word_count "$ask")

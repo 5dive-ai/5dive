@@ -200,6 +200,24 @@ A returning customer bought a cheaper plan but kept bigger hardware. Which one s
 Ten minutes on your phone today to switch chat setup on for customers?
 CORPUS
 
+# D1d — THE ROUTED TIER-2 CONTROL. A tier-2 approval/manual/access gate that is
+# ROUTED to a lead or to the task's verifier is read by an AGENT, not by lodar,
+# so the rule must not reach it either. Without this case the refusal regresses
+# tests/gate_access_lead_clear_unit.sh, whose access gate legitimately asks a
+# LEAD to "push branch dive-3212-openclaw-harness-30s" — which it did, before
+# this scope was narrowed. The harness's global stub returns no lead (that is
+# what makes every other case land on the human), so the lead is granted for the
+# length of this case only, and the case asserts the stub really did flip.
+seed ROUTED-1
+_gate_route_reviewer() { printf 'main'; }
+eq_t "D1d-pre: the lead stub is live (or this case proves nothing)" \
+     "$(_gate_route_reviewer dev)" "main"
+file_gate ROUTED-1 --type=access --ask="Push branch dive-3212-openclaw-harness-30s and open the PR?"
+eq_t "D1d: a ROUTED tier-2 gate with the same jargon still files (rc 0)" "$RC" "0"
+eq_t "D1d2: ... and it really was tier 2, not downgraded past the rule" "$(field ROUTED-1 tier)" "2"
+_gate_route_reviewer() { printf ''; }
+eq_t "D1d3: the stub is restored for the cases below" "$(_gate_route_reviewer dev)" ""
+
 # D3 — a DECLARED human capability is human-facing even before the DIVE-2241
 # re-assert runs, so the rule must reach it. Without this case the check could be
 # skipped by filing --tier=1 --needs=human_tap and still page the human.
