@@ -7,6 +7,13 @@ name: pii-guard
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
+  # DIVE-4139 — MERGE QUEUE. Every context in this file that is a REQUIRED status
+  # check on main must also fire on `merge_group`, or the queue never receives it:
+  # with a queue enabled GitHub evaluates required checks on the temporary
+  # `gh-readonly-queue/main/...` merge group, and a required context that never
+  # reports there holds the entry until the check-response timeout and then EVICTS
+  # it. That failure is silent at the PR — the PR just never merges.
+  merge_group:
   push:
     branches: [main]
 
@@ -21,12 +28,18 @@ jobs:
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # DIVE-4139: on `merge_group` the pull_request context is empty, and an
+          # empty HEAD_SHA sends this scan down the push branch — which anchors on
+          # PUSH_BEFORE, absent here. Point it at the merge group's own range so the
+          # batch's commit messages and added lines are scanned exactly once.
+          BASE_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.event.pull_request.head.sha }}
           # DIVE-2267: the push path needs a range anchor. Passed through env
           # rather than interpolated into the run body, matching PR_TITLE above --
           # a bare ${{ }} expansion inside `run:` is a script-injection site.
-          PUSH_BEFORE: ${{ github.event.before }}
+          # DIVE-4139: a merge group has no `before`; its base is the tip of main the
+          # batch was built on.
+          PUSH_BEFORE: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.before }}
         run: |
           rc=0
 

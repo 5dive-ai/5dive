@@ -22,6 +22,13 @@ on:
   # The `push:` filter below is UNCHANGED — required checks are enforced at the
   # PR, and main pushes carry the admin bypass.
   pull_request:
+  # DIVE-4139 — MERGE QUEUE. Every context in this file that is a REQUIRED status
+  # check on main must also fire on `merge_group`, or the queue never receives it:
+  # with a queue enabled GitHub evaluates required checks on the temporary
+  # `gh-readonly-queue/main/...` merge group, and a required context that never
+  # reports there holds the entry until the check-response timeout and then EVICTS
+  # it. That failure is silent at the PR — the PR just never merges.
+  merge_group:
   push:
     branches: [main]
     paths:

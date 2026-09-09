@@ -33,6 +33,13 @@ name: unit-tests
 # property; it is graded nightly and at release-cut, and it blocks a release.
 on:
   pull_request:
+  # DIVE-4139 — MERGE QUEUE. Every context in this file that is a REQUIRED status
+  # check on main must also fire on `merge_group`, or the queue never receives it:
+  # with a queue enabled GitHub evaluates required checks on the temporary
+  # `gh-readonly-queue/main/...` merge group, and a required context that never
+  # reports there holds the entry until the check-response timeout and then EVICTS
+  # it. That failure is silent at the PR — the PR just never merges.
+  merge_group:
   push:
     branches: [main]
 
@@ -241,7 +248,12 @@ jobs:
       - name: Which harnesses did this change touch?
         id: changed
         env:
-          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          # DIVE-4139: three events, three places the base lives. On `merge_group`
+          # `github.event.before` is ABSENT, so the old expression yielded the empty
+          # string and fell through to the origin/main fallback below — which is
+          # nearly right (a merge group IS main + the batch) but is a fallback, not a
+          # base, and the fallback exists to report BLOCKED, not to be the happy path.
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.before }}
         run: |
           # A base we cannot resolve is NOT "nothing changed" — that is the failure
           # mode where a check reports clean on what it never looked at. Fall back to
