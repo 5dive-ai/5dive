@@ -10,7 +10,7 @@ commit subject, and release-cut reads those subjects to decide the next version:
 
     feat: ...            -> the next release is a MINOR (a 0.x cut)
     feat!: / BREAKING CHANGE -> a MAJOR
-    fix|test|chore|docs|refactor|ci|perf|revert: ... -> a PATCH (0.x.x)
+    fix|test|chore|docs|refactor|ci|perf: ... -> a PATCH (0.x.x)
 
 So "feat" is a release decision, not a label. Nobody passes a level by hand any
 more; if the title is wrong, the version is wrong. (DIVE-4086)

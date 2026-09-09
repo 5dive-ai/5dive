@@ -335,6 +335,10 @@ grep -q 'DIVE-1234: an untyped subject' <<<"$out" \
   && ok_t 'the refusal NAMES the offending commit (an error you cannot act on is a stall)' \
   || bad_t 'the refusal does not name which commit is untyped' "rc=$rc out=$out"
 
+grep -q 'dispatching manually cannot bypass this refusal' <<<"$out" && ! grep -q 'cut by hand' <<<"$out" \
+  && ok_t 'the refusal names its real boundary instead of advertising a manual path that hits the same exit' \
+  || bad_t 'the refusal still sends an operator toward a nonexistent manual bypass' "rc=$rc out=$out"
+
 out=$(run_derive '0.17.8' v0.27.1 nolint 'DIVE-1234: an untyped subject'); rc=$?
 grep -q '^DERIVED=v0\.27\.2$' <<<"$out" \
   && ok_t 'NEGATIVE CONTROL: with no lint in the tree the SAME subject cuts a patch — the refusal is bounded by the lint commit, not universal' \
@@ -404,6 +408,13 @@ _cut_types=$(grep -oE '\(feat\|fix\|[a-z|]+\)' "$WF" | head -1)
 [[ -n "$_lint_types" && "$_lint_types" == "$_cut_types" ]] \
   && ok_t "the lint and the cut share one type list ($_lint_types)" \
   || bad_t 'the PR-title lint and release-cut accept different type sets; one of them will be wrong on every merge' "lint=$_lint_types cut=$_cut_types"
+
+TEMPLATE="$ROOT/.github/pull_request_template.md"
+if grep -qE '(^|[|`[:space:]])revert:' "$TEMPLATE"; then
+  bad_t 'the PR template advertises revert: even though the blocking lint rejects it' "$(grep -n 'revert:' "$TEMPLATE")"
+else
+  ok_t 'the PR template does not advertise a title the blocking lint rejects'
+fi
 
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"

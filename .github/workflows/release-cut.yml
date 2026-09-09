@@ -234,7 +234,7 @@ jobs:
               | grep -vE '^[0-9a-f]+ (feat|fix|test|chore|docs|refactor|ci|perf)(\([^)]*\))?!?: ' | head -5)
           fi
           if [[ -n "$_untyped" ]]; then
-            echo "::error::commits since ${incumbent:-<root>} carry no conventional type, so this cut cannot tell whether it contains a feature (DIVE-4086). The PR-title lint should have made this unreachable; fix the subject, or cut by hand and say why:"
+            echo "::error::commits since ${incumbent:-<root>} carry no conventional type, so this cut cannot tell whether it contains a feature (DIVE-4086). The PR-title lint should have made this unreachable. Correct the offending subject in the branch being cut, then retry; changing RELEASE_LEVEL or dispatching manually cannot bypass this refusal:"
             # shellcheck disable=SC2001  # prefixing every LINE, which ${x//y/z} cannot do
             sed 's/^/::error::  /' <<<"$_untyped"
             exit 1
