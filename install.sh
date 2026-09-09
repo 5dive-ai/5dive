@@ -539,6 +539,32 @@ refresh_managed_files() {
   mv -f "$_bundle_tmp" "$BIN_DIR/5dive"
   ok "5dive → $BIN_DIR/5dive${_want:+ (sha256 verified)}"
 
+  # DIVE-4100: `agent list` crosses privilege once through this tiny extractor
+  # instead of re-entering the 95k-line shell bundle or sudo-reading every
+  # agent file separately. The helper accepts no arguments and its Python body
+  # comes from the checksummed bundle just installed above.
+  install -d -m 755 "$LIB_DIR"
+  local _list_helper_tmp
+  _list_helper_tmp="$(mktemp "${LIB_DIR}/.agent-list-snapshot.XXXXXX")"
+  curl -fsSL "$REPO/5dive-agent-list-snapshot" -o "$_list_helper_tmp" \
+    || { rm -f "$_list_helper_tmp"; die "failed to download agent-list snapshot helper"; }
+  chmod 755 "$_list_helper_tmp"
+  mv -f "$_list_helper_tmp" "$LIB_DIR/agent-list-snapshot"
+  ok "agent-list snapshot helper → $LIB_DIR/agent-list-snapshot"
+
+  # Admin and standard seats share the claude group; sandboxed seats do not.
+  # Grant only this argument-free, verdict-only reader. A separate managed file
+  # backfills existing seats immediately instead of waiting for reprovision.
+  local _list_sudo_tmp
+  _list_sudo_tmp="$(mktemp /etc/sudoers.d/.5dive-agent-list.XXXXXX)"
+  printf '%%claude ALL=(root) NOPASSWD: %s/agent-list-snapshot\n' "$LIB_DIR" >"$_list_sudo_tmp"
+  chmod 440 "$_list_sudo_tmp"
+  if ! visudo -cf "$_list_sudo_tmp" >/dev/null 2>&1; then
+    rm -f "$_list_sudo_tmp"
+    die "agent-list snapshot sudoers policy failed validation"
+  fi
+  mv -f "$_list_sudo_tmp" /etc/sudoers.d/5dive-agent-list
+  ok "/etc/sudoers.d/5dive-agent-list (one read-only fleet snapshot)"
   # DIVE-4081: the sudoers template is installed runtime, not just agent-create
   # state. Existing standard seats otherwise keep the grant set they were born
   # with, so a newly shipped narrow root primitive exists but is unreachable.
@@ -1216,6 +1242,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     rm -f "$SYSTEMD_DIR/5dive-agent@.service"
     ok "removed systemd template"
   fi
+  rm -f /etc/sudoers.d/5dive-agent-list
   systemctl daemon-reload || true
 
   # 3. Binaries + shared libs

@@ -462,6 +462,7 @@ classify_sudo_grant() {
         ALL)                                            has_all=1 ;;
         "/usr/local/bin/5dive"|"/usr/local/bin/5dive *") has_cli=1 ;;
         "/usr/local/bin/5dive agent _deliver"*|"/usr/local/bin/5dive agent _capture"*|\
+        "/usr/local/lib/5dive/agent-list-snapshot"|\
         "/usr/local/bin/5dive agent buzz inbound"*|\
         "/usr/local/bin/5dive agent _self_restart"*|"/usr/local/bin/5dive _audit_append"*|\
         "/usr/local/bin/5dive _push_do"*|\
@@ -528,10 +529,11 @@ agent_sudo_grant() {
   printf '%s\n' "$lines" | classify_sudo_grant
 }
 
-# DIVE-1065/1074: scoped inter-agent a2a grants for a 'standard'-isolation agent.
+# DIVE-1065/1074: scoped operational grants for a 'standard'-isolation agent.
 # A standard agent has NO broad sudo, so it can't run the `sudo -u agent-X tmux`
 # inject/capture that `5dive agent send`/`ask` use (those need root). This grants
-# EXACTLY three hidden, single-purpose subcommands as root, NOPASSWD:
+# EXACTLY the hidden, single-purpose subcommands rendered below as root,
+# NOPASSWD. The fleet snapshot grant is read-only and returns verdicts only.
 #   * `5dive agent _deliver` (DIVE-1065) — the send/ask INJECT half.
 #   * `5dive agent _capture` (DIVE-1074) — the ask reply-READ half.
 #   * `5dive _audit_append`  (DIVE-1268) — append-only audit-log write (so a
@@ -574,6 +576,7 @@ render_standard_sudoers() {
 # Do not edit by hand; regenerated on agent create/provision.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _deliver *
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _capture *
+${user} ALL=(root) NOPASSWD: /usr/local/lib/5dive/agent-list-snapshot
 # DIVE-3573: the buzz bridge's inbound router. The buzz plugin runs AS this agent
 # and cannot inject into a pane, so the trust decision and the delivery both have
 # to happen root-side. This grant confers no authority over any OTHER seat: the
