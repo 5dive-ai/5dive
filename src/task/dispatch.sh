@@ -65,7 +65,9 @@ _task_usage() {
   deliver <id> --pr=<url> [--result=|--result-file=<path>]   record the delivery PR, hand to the verifier
   verify <id> [--cmd=] [--result=|--result-file=<path>] [--no-done] [--merge-proof] [--timeout=]
                                                 run the check; exit 0 = pass
-  reject <id> [--feedback=<what to fix>]        verifier FAIL: bounce back to the maker
+  reject <id> --feedback="FINDING/FIX/VERIFY"    verifier FAIL: bounce back to the maker
+                                                (DIVE-4144: the feedback must name a
+                                                FIX, or --no-fix=<why>)
   cancel <id> [--result=<text>]                 -> cancelled
   done|cancel [--keep-worktree]                 keep node_modules in that row's worktrees
   done|cancel|deliver [--append-result|--force-result]   close a row that already has a result

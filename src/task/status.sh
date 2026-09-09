@@ -162,13 +162,18 @@ _task_status_cmd() {
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --result=*)     _prose_flag_dupe --result "$result_src"; result="${1#*=}"; want_result=1; result_src="--result" ;;
+      # DIVE-4144: _TASK_RAW_RESULT is the text AS SUPPLIED, captured before the
+      # DIVE-2483 result guard merges it with whatever the row already carried.
+      # The identical-redeliver guard cannot use the merged value; see
+      # _task_route_to_verifier for the measurement that forced this.
+      --result=*)     _prose_flag_dupe --result "$result_src"; result="${1#*=}"; want_result=1; result_src="--result"; _TASK_RAW_RESULT="$result" ;;
       # DIVE-2627: the result read VERBATIM from a file. `--result` is the widest
       # site in the class (32 call sites on origin/main @ 2e0e876) and it is the
       # permanent close record the dashboard and the task's creator read.
       --result-file=*) _prose_flag_dupe --result-file "$result_src"
                        _read_prose_file --result-file "${1#*=}"
-                       result="$_PROSE_FILE_VALUE"; want_result=1; result_src="--result-file" ;;
+                       result="$_PROSE_FILE_VALUE"; want_result=1; result_src="--result-file"
+                       _TASK_RAW_RESULT="$result" ;;   # DIVE-4144
       --notify)       notify=1 ;;
       --no-preflight) no_preflight=1 ;;
       --force-merge-gate) force_merge_gate=1 ;;  # DIVE-1835: audited escape from the mandatory auto-detect gate
@@ -193,6 +198,10 @@ _task_status_cmd() {
       # replace, and it is audited because it is the only lossy one.
       --append-result) append_result=1 ;;
       --force-result)  force_result=1 ;;
+      # DIVE-4144: see _task_route_to_verifier. Accepted on the close verbs
+      # because `task done` is the verb a maker actually re-delivers with.
+      --force-redeliver=*) _TASK_REDELIVER_FORCE_REASON="${1#*=}" ;;
+      --force-redeliver)   fail "$E_USAGE" "--force-redeliver needs a reason: --force-redeliver=\"<why the unchanged re-delivery is correct>\" (DIVE-4144)" ;;
       --)         shift; positional+=("$@"); break ;;
       -*)         fail "$E_USAGE" "unknown flag: $1" ;;
       *)          positional+=("$1") ;;
