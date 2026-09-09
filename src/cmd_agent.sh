@@ -1448,7 +1448,7 @@ cmd_info() {
          "\nWARNING: this openclaw agent has a credential on disk and NO model pin. That is not a neutral default — openclaw model ids are `<provider>/<model>`, so with nothing pinned it uses its built-in default, whose provider prefix is not the one you configured. It will consult a credential that does not exist and return HTTP 401 while your key sits unused (DIVE-3112). Repair: sudo 5dive agent auth set openclaw --provider=<provider> --api-key=<key> --auth-profile=\(.authProfile // "<profile>") --model=<provider>/<model>"
        else empty end),
       (if .sudo.diverges then
-         "\nWARNING: the label and the enforced grant DISAGREE. Label \"\(.isolation)\" describes \(if .isolation == "admin" then "the 5dive CLI as root" elif .isolation == "standard" then "5dive agent _deliver/_capture only" else "no sudo" end); the enforced grant is \(.sudo.grant) (\(.sudo.scope), runas \(.sudo.runas)). Trust the grant, not the label. Nothing re-writes a drop-in after create (create_agent_user is the only writer), so a drifted grant stays drifted until someone edits /etc/sudoers.d/agent-\(.name) by hand or recreates the agent."
+         "\nWARNING: the label and the enforced grant DISAGREE. Label \"\(.isolation)\" describes \(if .isolation == "admin" then "the 5dive CLI as root" elif .isolation == "standard" then "a few named 5dive subcommands only" else "no sudo" end); the enforced grant is \(.sudo.grant) (\(.sudo.scope), runas \(.sudo.runas)). Trust the grant, not the label. Install/upgrade reconciles only clean 5dive-managed standard grants; custom, missing, admin and root-all policies stay untouched and need an operator decision."
        else empty end)
     ' <<<"$obj"
   fi

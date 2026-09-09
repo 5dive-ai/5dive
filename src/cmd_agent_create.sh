@@ -466,6 +466,7 @@ classify_sudo_grant() {
         "/usr/local/bin/5dive agent buzz inbound"*|\
         "/usr/local/bin/5dive agent _self_restart"*|"/usr/local/bin/5dive _audit_append"*|\
         "/usr/local/bin/5dive _push_do"*|\
+        "/usr/local/bin/5dive _deploy_do"*|\
         "/usr/local/bin/5dive _gh_do"*|\
         "/usr/local/bin/5dive _task_answer"*|\
         "/usr/local/bin/5dive _merge_do"*)              has_a2a=1 ;;
@@ -678,6 +679,56 @@ write_standard_sudoers() {
     rm -f "$tmp"
     fail "$E_GENERIC" "generated sudoers for ${user} failed visudo validation; aborting (no partial install)"
   fi
+}
+
+# DIVE-4081: bring EXISTING standard seats forward when the managed sudoers
+# template grows a new narrow primitive. create_agent_user writes the canonical
+# policy for NEW seats, but a seat created before DIVE-3160 kept its old drop-in
+# forever: the bundle knew how to delegate a signed gate answer through
+# _task_answer, while the routed reviewer had no grant to reach it.
+#
+# Reconcile only a registry-labelled standard seat whose CURRENT per-user file
+# is both 5dive-managed and cleanly classified cli-scoped. Missing, custom,
+# admin, root-all, and extra-entry policies are left untouched. Preserve the two
+# conditional broker capabilities from the enforced file itself, never from a
+# registry label or stale env copy. The writer still visudo-validates and swaps
+# atomically.
+_reconcile_standard_sudoers_one() {
+  local user="$1" d="${SUDOERS_D:-/etc/sudoers.d}" f current grant cls rest extra
+  local can_push=0 can_deploy=0 wanted
+  f="${d}/${user}"
+  [[ -r "$f" ]] || { printf 'skipped\n'; return 0; }
+  current=$(cat "$f")
+  [[ "$current" == '# Managed by 5dive '* ]] || { printf 'skipped\n'; return 0; }
+  grant=$(printf '%s\n' "$current" | classify_sudo_grant)
+  cls="${grant%%|*}"; rest="${grant#*|}"; extra="${rest##*|}"
+  [[ "$cls" == "cli-scoped" && "$extra" == "0" ]] \
+    || { printf 'skipped\n'; return 0; }
+  grep -qE '^[^#]*NOPASSWD: /usr/local/bin/5dive _push_do[[:space:]]*$' "$f" && can_push=1
+  grep -qE '^[^#]*NOPASSWD: /usr/local/bin/5dive _deploy_do[[:space:]]*$' "$f" && can_deploy=1
+  wanted=$(render_standard_sudoers "$user" "$can_push" "$can_deploy")
+  [[ "$current" != "$wanted" ]] || { printf 'current\n'; return 0; }
+  write_standard_sudoers "$user" "$can_push" "$can_deploy"
+  printf 'updated\n'
+}
+
+cmd_agent_reconcile_sudoers() {
+  require_root "agent _reconcile_sudoers"
+  [[ $# -eq 0 ]] || fail "$E_USAGE" "agent _reconcile_sudoers takes no arguments"
+  local reg name state updated=0 current=0 skipped=0
+  reg=$(registry_read)
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    state=$(_reconcile_standard_sudoers_one "agent-${name}")
+    case "$state" in
+      updated) updated=$((updated + 1)) ;;
+      current) current=$((current + 1)) ;;
+      *)       skipped=$((skipped + 1)) ;;
+    esac
+  done < <(jq -r '.agents | to_entries[] | select(.value.isolation == "standard") | .key' <<<"$reg")
+  ok "standard-seat sudoers reconciled: updated=${updated}, current=${current}, skipped=${skipped}" \
+     '{updated:($u|tonumber), current:($c|tonumber), skipped:($s|tonumber)}' \
+     --arg u "$updated" --arg c "$current" --arg s "$skipped"
 }
 
 # DIVE-2138 (gh#222, A-MO7SEN): where agent homes live, and where a removed

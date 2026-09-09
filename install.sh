@@ -565,6 +565,14 @@ refresh_managed_files() {
   fi
   mv -f "$_list_sudo_tmp" /etc/sudoers.d/5dive-agent-list
   ok "/etc/sudoers.d/5dive-agent-list (one read-only fleet snapshot)"
+  # DIVE-4081: the sudoers template is installed runtime, not just agent-create
+  # state. Existing standard seats otherwise keep the grant set they were born
+  # with, so a newly shipped narrow root primitive exists but is unreachable.
+  # The new bundle touches only clean 5dive-managed cli-scoped files and
+  # preserves conditional push/deploy grants from the enforced file.
+  if ! "$BIN_DIR/5dive" agent _reconcile_sudoers; then
+    echo "warn: existing standard-seat sudoers were not reconciled; routed reviewers may be unable to use newly shipped narrow primitives" >&2
+  fi
 
   # DIVE-3554: the relay binaries the shipped Connect Buzz panel shells out to.
   # Fail-soft on purpose (see stage_buzz_binaries) — a buzz release outage must
@@ -946,7 +954,7 @@ JOURNALD
   # resolves $LIB_DIR/team-templates first). Enumerated explicitly because $REPO
   # is a flat fetch URL with no directory listing — add a line per new template.
   mkdir -p "$LIB_DIR/team-templates"
-  for _tpl in 5dive-team.5dive.yaml startup.5dive.yaml content-studio.5dive.yaml eng-studio.5dive.yaml distribution.5dive.yaml SCHEMA-v2.md; do
+  for _tpl in 5dive-team.5dive.yaml startup.5dive.yaml deploy-team.5dive.yaml content-studio.5dive.yaml eng-studio.5dive.yaml distribution.5dive.yaml SCHEMA-v2.md; do
     if curl -fsSL "$REPO/team-templates/$_tpl" -o "$LIB_DIR/team-templates/$_tpl"; then
       chmod 644 "$LIB_DIR/team-templates/$_tpl"
     else

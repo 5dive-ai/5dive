@@ -230,7 +230,7 @@ E_NOT_RUNNING=8   # src/lib/error_codes.sh
 
 # The real detectability table, extracted from source for the same
 # cannot-drift reason as the functions.
-eval "$(awk '/^declare -A _AGENT_PROMPT_DETECTABLE=\(/ { on=1 } on { print } on && /^\)/ { exit }' "$RT")"
+eval "$(awk '/^declare -g?A _AGENT_PROMPT_DETECTABLE=\(/ { on=1 } on { print } on && /^\)/ { exit }' "$RT")"
 [[ -n "${_AGENT_PROMPT_DETECTABLE[claude]+x}" ]] \
   || { printf 'FATAL - could not extract _AGENT_PROMPT_DETECTABLE from %s\n' "$RT"; exit 1; }
 

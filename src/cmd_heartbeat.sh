@@ -1938,14 +1938,37 @@ _hb_claim_task() {
 # of luck. This event carries a per-reclaim idem_key (kind|id|epoch) so cycles
 # ARE countable, and its detail records the started_at value being erased, which
 # is the fact the row itself is about to stop carrying.
+#
+# DIVE-4104 — TWO MODES, ONE ERASURE SITE. The fourth argument selects what
+# happens to the HANDOFF; the claim reset (status todo, started_at cleared,
+# first_started_at preserved because this is the only writer that clears it) is
+# identical in both and stays in exactly one statement, which is what the
+# structural arm in tests/task_first_started_at_unit.sh exists to hold.
+#
+#   clean         (default) — the row goes back as buildable work. Unchanged.
+#   keep-handoff  — the row goes back into the VERIFIER's queue: assignee is
+#                   re-asserted to the row's verifier and the delivery stamps
+#                   are left alone, so `task show` still prints
+#                   `handoff: delivered (awaiting verifier ACK)`. Guarded on
+#                   verifier set and the delivery being live and ungraded, so
+#                   it can never invent a handoff.
 _hb_reclaim_to_todo() {
-  local name="$1" id="$2" why="$3"
+  local name="$1" id="$2" why="$3" mode="${4:-clean}"
   # Read the value BEFORE the UPDATE destroys it — the whole point is that the
   # erased timestamp survives somewhere a reader can find it.
   local prev_started
   prev_started=$(db "SELECT COALESCE(started_at,'') FROM tasks WHERE id=${id};" 2>/dev/null) || prev_started=""
-  db "UPDATE tasks SET status='todo', started_at=NULL, updated_at=datetime('now')
-      WHERE id=${id} AND status='in_progress';" 2>/dev/null || true
+  # The mode's two fragments. Written as plain single-quoted shell strings and
+  # NEVER with backticks: this whole statement is one double-quoted string, so a
+  # backticked column name inside even a comment would be executed by the shell.
+  local _set_extra="" _where_extra="" vfier=""
+  if [[ "$mode" == "keep-handoff" ]]; then
+    vfier=$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${id};" 2>/dev/null) || vfier=""
+    _set_extra=", assignee=verifier"
+    _where_extra=" AND verifier IS NOT NULL AND verifier<>'' AND maker_agent IS NOT NULL AND handoff_delivered_at IS NOT NULL AND handoff_ack_at IS NULL"
+  fi
+  db "UPDATE tasks SET status='todo'${_set_extra}, started_at=NULL, updated_at=datetime('now')
+      WHERE id=${id} AND status='in_progress'${_where_extra};" 2>/dev/null || true
   # NANOSECONDS, not seconds. lifecycle_events has a UNIQUE index on idem_key and
   # a collision is a SILENT no-op — exactly how task.started lost its re-claims.
   # A second-granularity key is enough for the real cadence and NOT enough for a
@@ -1953,10 +1976,12 @@ _hb_reclaim_to_todo() {
   # later. Caught by tests/task_first_started_at_unit.sh, whose two reclaims land
   # in the same second.
   local now_stamp; now_stamp=$(date -u +%s%N 2>/dev/null) || now_stamp=""
+  local _detail="reclaim -> todo (DIVE-3251); why=${why}; cleared started_at=${prev_started:-<empty>}"
+  [[ "$mode" == "keep-handoff" ]] && _detail="reclaim -> verifier queue, delivery preserved (DIVE-4104); why=${why}; cleared started_at=${prev_started:-<empty>}"
   ledger_emit "task.reclaimed" ident="$(_hb_ident "$id")" task_id="$id" \
     actor="$name" authority="dispatcher" \
     idem="task.reclaimed|${id}|${now_stamp}" \
-    detail="reclaim -> todo (DIVE-3251); why=${why}; cleared started_at=${prev_started:-<empty>}" || true
+    detail="$_detail" || true
   # DIVE-3932 acceptance: A CRASH MUST LEAVE A FAILED RUN, NOT NO RUN. This sweep
   # is where an attempt that died without reaching any boundary is finally
   # observed — the process is gone, so nothing on the seat's side can close its
@@ -1965,8 +1990,232 @@ _hb_reclaim_to_todo() {
   # (orphan-by-restart, stall, ceiling) rather than a fault we did not witness.
   # Scoped to the reclaimed seat's run, so a row another agent is legitimately
   # working is untouched.
-  _run_close_for_task "$id" abandoned reclaimed_to_todo "$name" "$why" || true
-  _hb_log "[$name] reclaimed $(_hb_ident "$id") -> todo ($why)"
+  if [[ "$mode" == "keep-handoff" ]]; then
+    _run_close_for_task "$id" abandoned reclaimed_to_verifier "$name" "$why" || true
+    _hb_log "[$name] reclaimed $(_hb_ident "$id") -> todo on verifier ${vfier:-?}, still DELIVERED ($why) — not bounced to the maker (DIVE-4104)"
+  else
+    _run_close_for_task "$id" abandoned reclaimed_to_todo "$name" "$why" || true
+    _hb_log "[$name] reclaimed $(_hb_ident "$id") -> todo ($why)"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# DIVE-4104 — THE RECLAIM LOOP. Measured over the 7 days to 2026-09-08: the
+# heartbeat reclaimed quinn's claimed rows 88 times across 40 distinct rows
+# (51 `idle`, 31 `session gone`, 6 real 45m overruns), and 17 deliveries that
+# week carry "re-delivery of the same pass, not rework" — a grade that was in
+# flight got destroyed and the row went round again. Three of those four
+# buckets are not neglect at all:
+#
+#   * `idle` on a WALLED seat. quinn's account was quota-walled 840 min on
+#     09-07 and 540 min on 09-08. A seat sitting on "⚠ Usage limit reached" is
+#     byte-identical to an abandoned one through `_hb_agent_idle`, which reads
+#     a pane, not a reason. So the wall did not PAUSE the grade, it DESTROYED
+#     it — and the supervisor already knows better: it classifies exactly that
+#     pane `quota-exhausted` (supervisor_events), which is the fact the
+#     reclaimer never asked for.
+#   * `session gone` on a row that is ALREADY DELIVERED. DIVE-2560 exempted a
+#     delivered, unacked verifier-held row from the idle-stall and hard-cap
+#     arms and deliberately left rule (a) firing, on the reasoning that a truly
+#     gone session should re-present the row fresh. That is right about the
+#     NUDGE and wrong about the DELIVERY: the reclaim hands the row back as a
+#     clean slate, and a clean slate is what lets it be picked up as buildable
+#     work again. The maker has nothing to do — the pass is delivered — so the
+#     re-delivery round is pure churn, and each one wakes a fresh maker session
+#     that reloads a PR it had already closed out.
+#   * `session gone` on a seat whose WORKSPACE for the row survived. A restart
+#     that leaves the branch it pushed sitting in a local checkout has not lost
+#     the work; re-presenting the row from a clean slate throws away the claim
+#     and the run for nothing.
+#
+# The 45m budget arm (6 of 88) is left exactly as it was: those are real
+# overruns and requeueing them is correct.
+# ---------------------------------------------------------------------------
+
+# DIVE-4104 — how long a quota-walled seat's claim is held rather than
+# reclaimed. Echoes the epoch until which `name`'s claims are PARKED, or empty
+# when the seat is not currently walled.
+#
+# The authority is the supervisor's LATEST observation for the agent, not a
+# scan for any wall ever seen: a seat that was walled at 09:00 and healthy at
+# 09:10 is not walled, and the reclaimer must act on the current reading. Only
+# `quota-exhausted` parks; every other classification (including `stalled`,
+# which is what an idle-stranded seat reads as) falls through to the ordinary
+# rules, so this can never park a genuinely abandoned claim.
+#
+# THE CAP IS NOT OPTIONAL AND IT IS NOT INFINITE. A park with no deadline is a
+# wedge: the seat never transitions, the claim is never reclaimed, and the row
+# is invisible to every other rule in this file. The wall itself sometimes
+# names its resume time (`quotaDeadline` in the observation's signals) and
+# sometimes does not — the supervisor writes the literal string `unknown` when
+# the refusal names no parseable deadline. When it IS parseable the park runs
+# to that deadline plus one tick, so the seat gets a whole tick after the wall
+# lifts to resume on its own before anything is taken off it. When it is not,
+# the park runs 6h from the observation — long enough to cover the 840-minute
+# and 540-minute walls measured on this account only in the parseable case, and
+# deliberately SHORTER than those in the unknown case: an unparseable wall is
+# not evidence the seat is alive, so the fallback has to expire on its own.
+_HB_QUOTA_PARK_FALLBACK_SEC=21600   # 6h — the unknown-deadline cap
+_hb_quota_park_until() {
+  local name="$1" everyMin="${2:-5}"
+  local row cls sigts deadline base_epoch
+  # ORDER BY id, not ts: two observations can share a second and `id` is the
+  # only total order the table guarantees.
+  row=$(db "SELECT classification || '|' || ts || '|' ||
+                   COALESCE(json_extract(signals, '\$.signals.quotaDeadline'), '')
+              FROM supervisor_events
+             WHERE agent=$(sqlq "$name")
+             ORDER BY id DESC LIMIT 1;" 2>/dev/null) || return 0
+  [[ -n "$row" ]] || return 0
+  cls="${row%%|*}"; row="${row#*|}"
+  sigts="${row%%|*}"; deadline="${row#*|}"
+  [[ "$cls" == "quota-exhausted" ]] || return 0
+  # A deadline the wall named and we can parse: park to it plus one tick.
+  if [[ -n "$deadline" && "$deadline" != "unknown" && "$deadline" != "null" ]]; then
+    local dl_epoch
+    dl_epoch=$(date -u -d "$deadline" +%s 2>/dev/null) || dl_epoch=""
+    if [[ "$dl_epoch" =~ ^[0-9]+$ ]]; then
+      printf '%s' "$(( dl_epoch + everyMin * 60 ))"; return 0
+    fi
+  fi
+  # No parseable deadline: 6h from the observation, then the park expires and
+  # the ordinary rules apply again.
+  base_epoch=$(date -u -d "${sigts} UTC" +%s 2>/dev/null) || base_epoch=""
+  [[ "$base_epoch" =~ ^[0-9]+$ ]] || return 0
+  printf '%s' "$(( base_epoch + _HB_QUOTA_PARK_FALLBACK_SEC ))"
+}
+
+# DIVE-4104 — is `name` quota-walled right now, with the park still in force?
+# Echoes the human-readable remainder on the park path so the log line can say
+# how long it holds. rc 0 = park (do not reclaim), rc 1 = act normally.
+_hb_quota_parked() {
+  local name="$1" everyMin="${2:-5}"
+  local until_epoch now
+  until_epoch=$(_hb_quota_park_until "$name" "$everyMin") || return 1
+  [[ "$until_epoch" =~ ^[0-9]+$ ]] || return 1
+  now=$(date -u +%s)
+  (( now < until_epoch )) || return 1
+  printf '%s' "$(( (until_epoch - now) / 60 ))"
+  return 0
+}
+
+# DIVE-4104 — does the workspace this row was being worked in still exist?
+#
+# The only branch binding the board records mechanically is the one a push
+# wrote to `ship_events`, so that is what this asks about: the latest branch
+# pushed for this task, resolved in the local checkouts. A branch still sitting
+# in a local checkout means the restarted seat can pick the work up where it
+# left off; nothing was lost, so nothing needs re-presenting from scratch.
+#
+# UNKNOWN IS NOT INTACT. No push, no branch, an unreadable checkout root — all
+# return 1, and rule (a) then reclaims exactly as it did before. This function
+# may only ever SUPPRESS a reclaim on positive evidence; a probe that cannot
+# see is never allowed to hold a claim (the failure it would cause — a wedged
+# claim nothing can take back — is worse than the churn it would prevent).
+#
+# A REF IS NOT A WORKSPACE (DIVE-4104 iteration 2). The first cut asked
+# `git rev-parse --verify refs/heads/<branch>` per checkout. `refs/heads` is
+# per-CLONE, not per-worktree: the ~700 checkouts under this root share a
+# handful of `.git` directories, so that question resolves to "somebody once
+# pushed this branch from this host" — true for nearly every branch ever — and
+# it answered INTACT for branches checked out in zero worktrees. Since rule (a)
+# reacts with a bare `continue`, the row then skipped (b) and (c) too: a dead
+# session would have held such a row forever, with no counter and no ledger
+# event. So the probe asks the per-worktree question instead: does a LIVE
+# worktree of this clone have that branch checked out right now?
+# `git worktree list --porcelain` is the only reader that knows, and a listed
+# worktree whose DIRECTORY is gone is not a workspace — git still carries the
+# admin record of a deleted checkout (that is what it calls `prunable`) until
+# somebody prunes it, and this host never does.
+#
+# IT IS BOUNDED, and the bound is measured rather than defensive: this host's
+# projects root holds ~700 checkouts (one worktree per ticket, never swept), and
+# an unbounded scan forks `git` once per checkout INSIDE the heartbeat tick. So
+# it probes at most _HB_WORKSPACE_SCAN_MAX of them and then gives up, and giving
+# up returns 1 — i.e. it reclaims exactly as before. Hitting the cap is the same
+# "no positive evidence" answer as an absent branch, which is why a cap is safe
+# here and would not be in a rule that acted on the negative. The cap costs less
+# than it used to: checkouts are DEDUPED BY SHARED CLONE, and one
+# `worktree list` per clone sees every worktree of it — including the ones that
+# live outside this root, which the old per-directory scan could never reach.
+_HB_PROJECTS_ROOT="${FIVE_PROJECTS_ROOT:-/home/claude/projects/5dive}"
+_HB_WORKSPACE_SCAN_MAX=400
+# Does any LIVE worktree of the clone reachable from `$1` have branch `$2`
+# checked out? Parses `worktree list --porcelain` records (blank-line
+# separated: `worktree <path>`, `HEAD <sha>`, then `branch refs/heads/<x>` or
+# `detached`, plus optional `locked`/`prunable` annotations). A record only
+# counts when the branch matches, git has not marked it prunable, and the
+# directory is still there.
+_hb_worktree_holds_branch() {
+  local d="$1" branch="$2" line wt="" br=""
+  # `-d "$wt"` is the whole liveness test, and it is the one the harness can
+  # grade. git's own `prunable` annotation is not read here because it is not
+  # independent evidence: measured on git 2.43, the annotation appears exactly
+  # when the directory the admin record names is gone, which is the condition
+  # below — a checkout whose directory survives is never marked prunable, so a
+  # `prunable` arm would be a line no fixture can reach.
+  #
+  # The trailing `echo` terminates the LAST record: git emits a blank line
+  # after every record today, but a stream whose final record is only closed
+  # by EOF would silently drop the newest worktree, and that is the one a
+  # just-restarted seat is most likely to be sitting in.
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*)          wt="${line#worktree }"; br="" ;;
+      "branch refs/heads/"*) br="${line#branch refs/heads/}" ;;
+      "")                    [[ "$br" == "$branch" && -d "$wt" ]] && return 0
+                             wt=""; br="" ;;
+    esac
+  done < <( { git -C "$d" worktree list --porcelain 2>/dev/null; echo; } )
+  return 1
+}
+
+_hb_row_workspace_intact() {
+  local id="$1" branch d cdir scanned=0 seen=" "
+  branch=$(db "SELECT branch FROM ship_events
+                WHERE ident=(SELECT ident FROM tasks WHERE id=${id})
+                  AND branch IS NOT NULL AND branch<>''
+                ORDER BY id DESC LIMIT 1;" 2>/dev/null) || return 1
+  [[ -n "$branch" ]] || return 1
+  [[ -d "$_HB_PROJECTS_ROOT" ]] || return 1
+  for d in "$_HB_PROJECTS_ROOT"/*; do
+    [[ -e "$d/.git" ]] || continue
+    scanned=$((scanned + 1))
+    (( scanned > _HB_WORKSPACE_SCAN_MAX )) && return 1
+    # One `worktree list` per CLONE, not per checkout: --git-common-dir is the
+    # shared `.git` every worktree of a clone points at, so this collapses the
+    # ~343 sibling checkouts of one repo into a single probe.
+    cdir=$(git -C "$d" rev-parse --git-common-dir 2>/dev/null) || continue
+    [[ -n "$cdir" ]] || continue
+    case "$cdir" in /*) ;; *) cdir="${d}/${cdir#./}" ;; esac
+    [[ "$seen" == *" ${cdir} "* ]] && continue
+    seen="${seen}${cdir} "
+    if _hb_worktree_holds_branch "$d" "$branch"; then
+      printf '%s' "$branch"; return 0
+    fi
+  done
+  return 1
+}
+
+# DIVE-4104 — the reclaim that KEEPS THE DELIVERY. A named entry point for the
+# shared reclaim's `keep-handoff` mode, so rule (a) reads as what it does and
+# there is still exactly ONE statement in this file that clears `started_at`
+# (and therefore exactly one place that has to preserve `first_started_at`).
+# The claim is reset the same way `clean` resets it; the HANDOFF deliberately is
+# not — assignee is re-asserted to the row's verifier and the delivery stamps
+# are untouched, so the row re-enters the VERIFIER's queue rather than the
+# maker's and `task show` still prints `handoff: delivered (awaiting verifier
+# ACK)`.
+#
+# The assignee write is a re-assertion, not a change: `_task_route_to_verifier`
+# already set it on delivery. It is written anyway because this function's
+# contract is "the row is in the verifier's queue when I return", and a
+# contract that holds only while no other writer has moved the column is the
+# defect this ticket is about. The mode's WHERE guard (verifier set, maker set,
+# delivered and not yet ACKed) means it can never invent a handoff.
+_hb_reclaim_to_verifier() {
+  local name="$1" id="$2" why="$3"
+  _hb_reclaim_to_todo "$name" "$id" "$why" keep-handoff
 }
 
 # Unwedge this agent's stuck in_progress tasks. Three escalating rules, cheapest
@@ -2008,14 +2257,57 @@ _hb_reclaim() {
   local budget=$(( everyMin * _HB_STALE_MULT ))
   (( budget < _HB_STALE_MIN_MINUTES )) && budget=$_HB_STALE_MIN_MINUTES
   local proc_start; proc_start=$(_hb_claude_started "$name" 2>/dev/null || true)
-  local reclaimed=0 escalated=0 id started_epoch age_min awaiting_verifier
-  while IFS='|' read -r id started_epoch age_min awaiting_verifier; do
+  local reclaimed=0 escalated=0 id started_epoch age_min awaiting_verifier delivered_live
+  while IFS='|' read -r id started_epoch age_min awaiting_verifier delivered_live; do
     [[ -n "$id" ]] || continue
+    # Reset per row: `local` is function-scoped, not block-scoped, so a lapse
+    # set on one row would otherwise leak into the next row of the same tick.
+    local _hold_lapsed=0
     # (a) the claiming session is gone — process is newer than the claim.
     if [[ -n "$proc_start" && -n "$started_epoch" ]] \
        && (( proc_start > started_epoch + _HB_PROC_SKEW_SEC )); then
-      _hb_reclaim_to_todo "$name" "$id" "claiming session gone (claude restarted $(( (proc_start - started_epoch) / 60 ))m after the claim)"
-      reclaimed=$((reclaimed + 1)); continue
+      local _why="claiming session gone (claude restarted $(( (proc_start - started_epoch) / 60 ))m after the claim)"
+      # DIVE-4104 (1) — the session is gone, but the DELIVERY is not. Rule (a)
+      # still fires (a dead session's claim must not be left standing), and it
+      # fires into the VERIFIER's queue with the handoff intact instead of
+      # handing the row back as a clean slate. 31 of quinn's 88 reclaims this
+      # week were this shape, and the maker had nothing to do in any of them.
+      if (( delivered_live )); then
+        _hb_reclaim_to_verifier "$name" "$id" "$_why"
+        reclaimed=$((reclaimed + 1)); continue
+      fi
+      # DIVE-4104 (3) — the session is gone and the WORKSPACE is not. A restart
+      # that left the branch it pushed sitting in a local checkout lost no work,
+      # so the claim is re-claimed in place: status, started_at and the run are
+      # all left alone and the ordinary nudge re-presents the row to the SAME
+      # seat. Positive evidence only (see _hb_row_workspace_intact) — no branch,
+      # or a checkout root we cannot read, reclaims exactly as before.
+      # DIVE-4104 iteration 4 — THE HOLD IS BOUNDED BY THE SAME BUDGET AS
+      # EVERYTHING ELSE. Rule (a) reacts to intact-workspace evidence with a
+      # bare `continue`, which does not touch started_at, so `proc_start >
+      # started_epoch` stays true on every later tick: unbounded, the hold
+      # re-fires forever and rules (b) and (c) are never reached for that row —
+      # a wedged claim nothing can take back, which is exactly what the park's
+      # own comment calls worse than the churn. The evidence here never expires
+      # by construction (this host keeps ~700 checkouts, one per ticket, never
+      # swept), so the HOLD has to. Inside the budget the seat gets its restart
+      # for free; past it, the hold lapses and the ordinary rules own the row —
+      # (c) reaps and, on repeat, escalates, so item 4's 45m budget is kept on
+      # this path rather than made unreachable.
+      local _wbranch
+      if _wbranch=$(_hb_row_workspace_intact "$id"); then
+        if (( age_min < budget )); then
+          _hb_log "[$name] $(_hb_ident "$id") session gone but workspace intact (branch ${_wbranch} still checked out) — claim KEPT in place, not reclaimed (${age_min}m of the ${budget}m budget used, DIVE-4104)"
+          continue
+        fi
+        # Past the budget: say so in the ledger (a silent lapse reads exactly
+        # like the wedge it fixes) and fall through to (b)/(c).
+        _hb_log "[$name] $(_hb_ident "$id") workspace intact (branch ${_wbranch}) but the claim is ${age_min}m past the ${budget}m budget — hold LAPSED, the ordinary rules take it (DIVE-4104)"
+        _hold_lapsed=1
+      else
+        _hb_reclaim_to_todo "$name" "$id" "$_why"
+        reclaimed=$((reclaimed + 1)); continue
+      fi
     fi
     # DIVE-2560: a row currently held by its own VERIFIER, delivered but not yet
     # ACKed (same predicate _hb_stall_sweep already uses to nag the verifier
@@ -2025,7 +2317,14 @@ _hb_reclaim() {
     # above (the holder's session is actually gone) still applies. A row bounced
     # BACK to the maker by a reject is NOT this state — assignee != verifier once
     # that happens — so ordinary rework still reclaims normally.
-    if (( awaiting_verifier )); then
+    # `_hold_lapsed` overrides this skip: a row that got here from a LAPSED
+    # workspace hold has already been held past its budget by a gone session,
+    # and letting DIVE-2560's verifier-latency skip swallow it would re-create
+    # the unbounded hold one level down. (It is a narrow shape — a row whose
+    # assignee is its verifier and delivered-but-unACKed reads delivered_live
+    # above and never reaches here unless maker_agent is NULL — but the whole
+    # defect being fixed is a hold with no exit, so it gets no second door.)
+    if (( awaiting_verifier && ! _hold_lapsed )); then
       continue
     fi
     # (c) hard cap before stall: in_progress past the budget but rule (a) didn't
@@ -2055,6 +2354,21 @@ _hb_reclaim() {
     fi
     # (b) idle stall — only if past grace AND a confident idle reading (rc 0).
     if (( age_min >= _HB_STALL_MIN_MINUTES )) && _hb_agent_idle "$name"; then
+      # DIVE-4104 (2) — A WALLED SEAT IS NOT AN IDLE SEAT. `_hb_agent_idle`
+      # reads a pane, so "⚠ Usage limit reached" and "walked away" are the same
+      # reading; the supervisor already tells the two apart and classifies the
+      # first `quota-exhausted`. 51 of quinn's 88 reclaims this week were this,
+      # against 840 and 540 minutes of measured wall on the account. PARK the
+      # claim — the seat resumes on its own when the wall lifts, and the park
+      # expires on its own (deadline + one tick, else 6h) so a claim can never
+      # be wedged here. Checked INSIDE the idle arm, after the idle reading, so
+      # it narrows exactly one rule and leaves (a) and (c) untouched: a walled
+      # seat that also overran its 45m budget is still a real overrun.
+      local _qpark
+      if _qpark=$(_hb_quota_parked "$name" "$everyMin"); then
+        _hb_log "[$name] $(_hb_ident "$id") reads idle ${age_min}m but the supervisor classifies this seat quota-exhausted — claim PARKED, not reclaimed (~${_qpark}m of park left, DIVE-4104)"
+        continue
+      fi
       _hb_reclaim_to_todo "$name" "$id" "idle ${age_min}m with the task still open (claimed then went idle)"
       reclaimed=$((reclaimed + 1)); continue
     fi
@@ -2062,6 +2376,20 @@ _hb_reclaim() {
                  strftime('%s', COALESCE(started_at, created_at)) || '|' ||
                  CAST((julianday('now') - julianday(COALESCE(started_at, created_at))) * 1440 AS INTEGER) || '|' ||
                  CASE WHEN verifier IS NOT NULL AND verifier = assignee
+                           AND handoff_delivered_at IS NOT NULL AND handoff_ack_at IS NULL
+                      THEN 1 ELSE 0 END || '|' ||
+                 -- DIVE-4104: a LIVE DELIVERY, which is a different question from
+                 -- the awaiting_verifier flag above and deliberately does not ask who
+                 -- holds the row. The pass is delivered and ungraded; the maker owes
+                 -- nothing. It stays true across a reclaim, and across another writer
+                 -- moving the assignee column off the verifier -- which is precisely
+                 -- the state in which the row must NOT be handed back as buildable.
+                 -- NO BACKTICKS IN THIS COMMENT, and that is not style: the whole
+                 -- statement is one double-quoted bash string, so a backtick here RUNS
+                 -- A COMMAND before sqlite ever sees the SQL. The first cut of this
+                 -- comment quoted two column names that way and every reclaim tick
+                 -- printed 'assignee: command not found' to stderr.
+                 CASE WHEN verifier IS NOT NULL AND maker_agent IS NOT NULL
                            AND handoff_delivered_at IS NOT NULL AND handoff_ack_at IS NULL
                       THEN 1 ELSE 0 END
                FROM tasks
