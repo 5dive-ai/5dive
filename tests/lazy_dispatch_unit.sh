@@ -766,11 +766,22 @@ _t16_batched="$( PASS=0; FAIL=0; SKIPPED=0
   _timed_ratio_arm '`stand-in`' 110 'unreachable hint'
   printf '::%d/%d/%d' "$PASS" "$FAIL" "$SKIPPED" )"
 
-if [[ "$_t16_batched" == *"::1/0/0" ]]; then
-  ok_t "a sub-floor probe is GRADED after batching, where it used to grade nothing"
+# WHAT THIS ARM MAY AND MAY NOT ASSERT (main2's iteration-2 reject, DIVE-4161).
+# It exists to prove a VERDICT WAS RETURNED where the old code graded nothing, so
+# it asserts GRADED — exactly one of PASS/FAIL, and no skip — and never PASS.
+# Demanding PASS smuggles in a claim about the RATIO between two byte-identical
+# stand-ins, and batching cannot buy that: lifting the denominator over the floor
+# bounds its MAGNITUDE, not the relative DISPERSION of two independent best-of-5
+# minima at ~1.2ms per spawn. Measured on the grading host, the PASS form read
+# 144% and 120% between two identical scripts and went red 5 times in 19 runs
+# (~26%) — a nondeterministic red in a REQUIRED context, which is the very defect
+# this row was filed to remove, reproduced one level up in the guard's own test.
+IFS='/' read -r _t16_p _t16_f _t16_s <<<"${_t16_batched##*::}"
+if (( _t16_p + _t16_f == 1 && _t16_s == 0 )); then
+  ok_t "a sub-floor probe is GRADED after batching (verdict returned, not skipped), where it used to grade nothing"
 else
   bad_t "a sub-floor probe is graded after batching" \
-        "counts were ${_t16_batched##*::} (want 1/0/0). If this skipped, the batch did not lift the control over the floor and the arm is still blind on a fast runner: ${_t16_batched%::*}"
+        "counts were ${_t16_batched##*::} (want exactly one of PASS/FAIL and no skip). If this skipped, the batch did not lift the control over the floor and the arm is still blind on a fast runner: ${_t16_batched%::*}"
 fi
 
 if [[ "$_t16_batched" == *"across "* ]]; then
