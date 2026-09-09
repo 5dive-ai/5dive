@@ -31,15 +31,38 @@ no(){ fail=$((fail+1)); printf '  FAIL %s\n' "$1"; }
 
 WF=.github/workflows
 
-# The ten REQUIRED status checks on main, read from the API 2026-09-09 (classic
-# protection and ruleset 22522554 agree), mapped to the workflow that DECLARES the
+# The ELEVEN REQUIRED status checks on main, mapped to the workflow that DECLARES the
 # job of that name. Pinned, not derived: a harness must not need a credential.
+#
+# `title` was MISSING from this map until DIVE-4139's second pass, and with it the
+# merge_group arm on pr-title-lint.yml. The first pass wrote "the ten required contexts"
+# and wired five workflows; both surfaces say ELEVEN. A hand-copied census of a remote
+# set is wrong in exactly one direction — it can only ever be SHORT — and short is the
+# expensive direction here, because a required context absent from the queue does not go
+# red, it holds the batch to the check-response timeout and EVICTS it. Re-derive BOTH
+# surfaces before trusting this map; they are separate objects that agree only by upkeep:
+#
+#   5dive gh api repos/5dive-ai/5dive/branches/main/protection \
+#     --jq='.required_status_checks.contexts'
+#   5dive gh api repos/5dive-ai/5dive/rulesets/22522554 \
+#     --jq='.rules[]|select(.type=="required_status_checks")
+#           |.parameters.required_status_checks[].context'
+#
+# RESIDUAL, uncovered on purpose: this map is text and the required set is remote, so a
+# context ADDED to protection later is invisible here until someone re-runs the two
+# commands above. This harness cannot close that gap without a credential.
 declare -A OWNER=(
   [test]=unit-tests [test-installed-host]=unit-tests [test-confirm]=unit-tests
   [test-installed-host-confirm]=unit-tests [changed-harnesses]=unit-tests
   [shellcheck]=install-smoke [docker-install]=install-smoke
   [scan]=pii-guard [check]=bundle-drift [supply-chain-guard]=supply-chain-guard
+  [title]=pr-title-lint
 )
+
+# Guards the transcription itself. This is the arm that reds on the ORIGINAL defect:
+# drop [title] and it reports 10 against 11 before any per-context arm runs.
+if (( ${#OWNER[@]} == 11 )); then ok "arm0 OWNER carries all 11 required contexts"
+else no "arm0 OWNER has ${#OWNER[@]} contexts, expected 11 — re-derive from both surfaces"; fi
 
 # The `on:` block only — a `merge_group` word inside a job or a comment is not a
 # trigger. awk from `on:` to the first column-0 line that is not part of it.
