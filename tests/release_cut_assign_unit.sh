@@ -56,7 +56,7 @@ run_block(){
     # silently on the first `grep` that legitimately matched nothing (DIVE-4153,
     # run 34345097999). Removing it re-opens that blind spot; keep it in BOTH helpers.
     set -e
-    incumbent=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+    incumbent=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1) || incumbent=""
     eval "$BLOCK"
     # Emit the derivation so an arm can assert the NUMBER, not just the exit code.
     printf 'DERIVED=%s\n' "${tag:-<unset>}"
@@ -176,7 +176,7 @@ run_moved(){
     # fixture needs it on the same relative path the workflow uses.
     mkdir -p scripts && cp "$ROOT/scripts/release-cut-baseline.sh" scripts/
     sha=$(git rev-parse HEAD)
-    incumbent=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+    incumbent=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1) || incumbent=""
     eval "$MOVED"
     printf 'PROCEEDED\n'
   ) 2>&1
@@ -295,7 +295,7 @@ run_range(){
   ) >/dev/null 2>&1
   ( cd "$d"
     set -e   # the runner is `bash -e {0}` — see run_block (DIVE-4153)
-    incumbent=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+    incumbent=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1) || incumbent=""
     eval "$BLOCK"
     printf 'DERIVED=%s\n' "${tag:-<unset>}"
   ) 2>&1
@@ -391,7 +391,7 @@ echo "-- DIVE-4086: the shipped LINT REGEX, run rather than eyeballed"
 # Extracted from the shipped file for the same reason every other block here is: a
 # hand-written copy of the pattern agrees with every mutant of the real one.
 LINT="$ROOT/.github/workflows/pr-title-lint.yml"
-LINT_COND=$(grep -E '^ *if \[\[ "\$PR_TITLE" =~ ' "$LINT" | head -1 | sed 's/^ *//; s/ *then$//')
+LINT_COND=$(grep -E '^ *if \[\[ "\$PR_TITLE" =~ ' "$LINT" | head -1 | sed 's/^ *//; s/ *then$//') || LINT_COND=""
 [[ -n "$LINT_COND" ]] || { echo "FATAL: could not extract the title condition from $LINT" >&2; exit 2; }
 # `if C; then :; fi` succeeds for a FALSE C too, so the else arm is what makes this a
 # test. The first version of this helper omitted it, and every accept arm went red on a
@@ -413,8 +413,8 @@ echo "-- the shipped lint and the shipped cut must accept the SAME type list"
 # A type the lint admits and the cut rejects reds every later cut; the reverse ships a
 # feature as a patch. Comparing the two literals is what stops them drifting apart.
 LINT="$ROOT/.github/workflows/pr-title-lint.yml"
-_lint_types=$(grep -oE '\(feat\|fix\|[a-z|]+\)' "$LINT" | head -1)
-_cut_types=$(grep -oE '\(feat\|fix\|[a-z|]+\)' "$WF" | head -1)
+_lint_types=$(grep -oE '\(feat\|fix\|[a-z|]+\)' "$LINT" | head -1) || _lint_types=""
+_cut_types=$(grep -oE '\(feat\|fix\|[a-z|]+\)' "$WF" | head -1) || _cut_types=""
 [[ -n "$_lint_types" && "$_lint_types" == "$_cut_types" ]] \
   && ok_t "the lint and the cut share one type list ($_lint_types)" \
   || bad_t 'the PR-title lint and release-cut accept different type sets; one of them will be wrong on every merge' "lint=$_lint_types cut=$_cut_types"
