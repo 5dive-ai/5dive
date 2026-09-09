@@ -276,7 +276,7 @@ jobs:
             # person decided and WHICH commits the check could not read. An override
             # that leaves no trace is indistinguishable from the check never firing.
             _untyped_count=$(wc -l <<<"$_untyped"); _untyped_count="${_untyped_count// /}"
-            _untyped_note=" — level STATED by ${GITHUB_ACTOR:-unknown}, overriding the untyped-subject refusal (untyped subjects in range: ${_untyped_count}; ${_untyped//$'\n'/; })"
+            _untyped_note=" — level STATED by ${GITHUB_ACTOR:-unknown}, overriding the untyped-subject refusal (untyped subjects listed, capped at 5: ${_untyped_count}; ${_untyped//$'\n'/; })"
           fi
 
           # RELEASE_LEVEL is an OVERRIDE THAT MAY ONLY RAISE. Lowering it is how this
