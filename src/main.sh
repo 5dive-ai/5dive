@@ -730,6 +730,12 @@ main() {
         # Reached via the scoped render_standard_sudoers grant so a standard
         # agent's /restart + /model work without a raw systemd-run/sudo grant.
         _self_restart) cmd_self_restart "$@" ;;
+        # DIVE-4203: hidden read-only primitive — prints THE default-skills list
+        # (DEFAULT_AGENT_SKILLS in lib/agent_setup.sh), one `<owner>/<repo>:<skill>`
+        # per line. Exists so 5dive-refresh-skills.sh, installed standalone beside
+        # the bundle with no way to source src/, reads the same list the provisioner
+        # seeds instead of carrying a second copy that drifts. No root, no state.
+        _default_skills) cmd_agent_default_skills "$@" ;;
         # DIVE-4081: hidden installer migration. Refresh managed standard-seat
         # sudoers after a bundle upgrade so existing routed reviewers gain the
         # narrow _task_answer path already rendered for newly-created seats.

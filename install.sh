@@ -643,7 +643,10 @@ JOURNALD
   ok "5dive-stage-fork-plugins.sh → $BIN_DIR/5dive-stage-fork-plugins.sh"
 
   # Skills backfill — brings existing agents up to the current default skill
-  # set (new defaults like openagent, DIVE-658). The daily update cron runs it
+  # set. It reads THE default-skills list back out of the bundle installed just
+  # above (`5dive agent _default_skills`, DIVE-4203) rather than carrying its
+  # own — so the binary must be refreshed BEFORE this script runs, which is the
+  # order refresh_managed_files already uses. The daily update cron runs it
   # right after the plugin refresh, before agents restart.
   curl -fsSL "$REPO/5dive-refresh-skills.sh" -o "$BIN_DIR/5dive-refresh-skills.sh"
   chmod 755 "$BIN_DIR/5dive-refresh-skills.sh"
@@ -1308,7 +1311,8 @@ if [[ "${1:-}" == "--upgrade" ]]; then
     "$BIN_DIR/5dive-refresh-plugins.sh" 2>&1 | tail -20 || true
   fi
 
-  # Backfill default skills onto existing agents (e.g. openagent, DIVE-658).
+  # Backfill default skills onto existing agents, from the one list the create
+  # path also seeds (DEFAULT_AGENT_SKILLS, DIVE-4203).
   # Same best-effort contract: no-op on a fresh box, self-skips never-booted
   # agents, failures don't block the upgrade.
   if [[ -x "$BIN_DIR/5dive-refresh-skills.sh" ]]; then
