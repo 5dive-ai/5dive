@@ -79,13 +79,21 @@ cmd_task_need DIVE-203 --type=manual --ask="run the physical box swap" >/dev/nul
   && ok_t "A3 manual still defaults to tier 2 (hard human — only decision|approval lowered)" \
   || bad_t "A3 manual defaults tier 2" "got tier '$(tierof DIVE-203)'"
 
-# --- A4: SAFETY BACKSTOP (money) — an `approval` whose ask trips the T2 category
-#     floor is force-floored to tier 2 despite the new tier-1 default. --------------
+# --- A4: SAFETY BACKSTOP (money) — DIVE-4175 arm C moved the backstop from the
+#     ask's WORDING to the filer's DECLARATION. The property is unchanged: an
+#     approval that really is asking to spend reaches the human despite the tier-1
+#     default. What changed is what makes it so. The undeclared control below
+#     records the loosening rather than losing it.
 seed_task DIVE-204
-cmd_task_need DIVE-204 --type=approval --ask="approve the \$500 ad spend increase?" --recommend="no" >/dev/null 2>&1
+cmd_task_need DIVE-204 --type=approval --needs=spend_authority --ask="approve the \$500 ad spend increase?" --recommend="no" >/dev/null 2>&1
 [[ "$(tierof DIVE-204)" == "2" ]] \
-  && ok_t "A4 money approval still floors to tier 2 -> human (backstop holds)" \
-  || bad_t "A4 money approval floors tier 2" "got tier '$(tierof DIVE-204)' (floor may have moved)"
+  && ok_t "A4 DECLARED money approval is tier 2 -> human (backstop holds)" \
+  || bad_t "A4 money approval floors tier 2" "got tier '$(tierof DIVE-204)' (the --needs human half is the sole route now)"
+seed_task DIVE-214
+cmd_task_need DIVE-214 --type=approval --ask="approve the \$500 ad spend increase?" --recommend="no" >/dev/null 2>&1
+[[ "$(tierof DIVE-214)" == "1" ]] \
+  && ok_t "A4 control (arm C): the SAME ask UNDECLARED is tier 1 — wording no longer promotes" \
+  || bad_t "A4 undeclared must not floor" "got tier '$(tierof DIVE-214)' — the keyword promoter is back"
 
 # --- A5: DIVE-1492 — a PURE brand ask is lead-clearable tier 1, not human-only. ----
 seed_task DIVE-205
@@ -95,18 +103,39 @@ cmd_task_need DIVE-205 --type=approval --ask="approve the brand palette directio
   || bad_t "A5 pure brand approval should stay tier 1" "got tier '$(tierof DIVE-205)'"
 
 # --- A5b: public/publish terms remain a hard-human backstop after brand removal. ---
+# DIVE-4175 arm C: `publish` is the term the row was BUILT on — it alone promoted
+# 27 gates in the 30 days to 2026-09-09 and lodar answered zero of them. So this
+# arm converts to the declaration, and the undeclared control is not an incidental
+# loosening here but the change's whole purpose.
 seed_task DIVE-209
-cmd_task_need DIVE-209 --type=approval --ask="approve publishing the launch announce post?" --recommend="no" >/dev/null 2>&1
+cmd_task_need DIVE-209 --type=approval --needs=human_tap --ask="approve publishing the launch announce post?" --recommend="no" >/dev/null 2>&1
 [[ "$(tierof DIVE-209)" == "2" ]] \
-  && ok_t "A5b public-comms approval still floors to tier 2 -> human" \
+  && ok_t "A5b DECLARED public-comms approval is tier 2 -> human" \
   || bad_t "A5b public-comms approval floors tier 2" "got tier '$(tierof DIVE-209)'"
+seed_task DIVE-219
+cmd_task_need DIVE-219 --type=approval --ask="approve publishing the launch announce post?" --recommend="no" >/dev/null 2>&1
+[[ "$(tierof DIVE-219)" == "1" ]] \
+  && ok_t "A5b control (arm C): an undeclared 'publish' approval no longer pages the human — the 27-gate class" \
+  || bad_t "A5b undeclared must not floor" "got tier '$(tierof DIVE-219)'"
 
 # --- A6: SAFETY BACKSTOP (destructive) — approval to delete/teardown floors to tier 2.
 seed_task DIVE-206
-cmd_task_need DIVE-206 --type=approval --ask="approve teardown of the prod database?" --recommend="no" >/dev/null 2>&1
+cmd_task_need DIVE-206 --type=approval --needs=human_tap --ask="approve teardown of the prod database?" --recommend="no" >/dev/null 2>&1
 [[ "$(tierof DIVE-206)" == "2" ]] \
-  && ok_t "A6 destructive approval still floors to tier 2 -> human" \
+  && ok_t "A6 DECLARED destructive approval is tier 2 -> human" \
   || bad_t "A6 destructive approval floors tier 2" "got tier '$(tierof DIVE-206)'"
+# THE RESIDUAL ARM C SIGNS, asserted rather than described. An undeclared teardown
+# of a production database now reaches a SEAT. The 30-day replay found two real
+# instances of this shape that the human had answered (DIVE-3496 personal-account
+# repo access, DIVE-3614 purge-and-reprovision a box), neither of which declared a
+# capability. Arm E (DIVE-4176) and the lint are what cover it; the lint ships as a
+# WARNING, so nothing REFUSES this filing today. Written down here so the next
+# reader meets the residual in the corpus and not only in a task body.
+seed_task DIVE-216
+cmd_task_need DIVE-216 --type=approval --ask="approve teardown of the prod database?" --recommend="no" >/dev/null 2>&1
+[[ "$(tierof DIVE-216)" == "1" ]] \
+  && ok_t "A6 residual (arm C): an UNDECLARED prod teardown reaches a seat, not the human — signed, not fixed" \
+  || bad_t "A6 undeclared teardown" "got tier '$(tierof DIVE-216)' — if this is 2 the promoter is back"
 
 # --- A7: SAFETY BACKSTOP (secret type) — a `secret` gate is always tier 2. ----------
 seed_task DIVE-207

@@ -231,8 +231,15 @@ fi
 if declare -F cmd_task_need >/dev/null && declare -F _push_branch_from_body >/dev/null; then
   r3id=$(mk "probe row for the rule 3 appeal path")
   r3=$(ident_of "$r3id")
+  # DIVE-4175 arm C: reaching Rule 3 needs a gate with `tier_floored == 1`, and the
+  # ask's wording no longer produces one. The appeal path itself is UNCHANGED, and
+  # the other route into it is unchanged too — a DECLARED human capability floors
+  # the gate exactly as before (need.sh, `_needs_human` ⇒ `tier=2; tier_floored=1`).
+  # So the probe declares the capability and the arm still EXECUTES the path,
+  # residual and all, rather than going vacuous: the refusal below still has to
+  # render and still has to name the surviving term.
   r3out=$( set -euo pipefail
-           cmd_task_need "$r3" --type=decision \
+           cmd_task_need "$r3" --type=decision --needs=spend_authority \
              --ask="approve a \$500 spend on the ads account" \
              --discusses="this is a design discussion, not a spend" 2>&1
            echo "__REACHED__" )

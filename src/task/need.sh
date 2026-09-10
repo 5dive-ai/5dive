@@ -4098,7 +4098,17 @@ THE TEST, and it is a diagnostic and not a style note: if you cannot write the a
         elif [[ "$_curation"         == "1" ]]; then _rtrigger="curation"
         elif [[ "$_internal_ops"     == "1" ]]; then _rtrigger="internal-ops"
         elif [[ "$_discusses_applied" == "1" ]]; then _rtrigger="declared-discussion"
-        elif [[ "$_floored_by_title" == "1" ]]; then _rtrigger="floored-by-title"
+        # DIVE-4175 arm C: AXIS-ACCURATE, and this was the third stamp. Arm C sets
+        # `_floored_by_title` for the `ask` and `title-fallback` axes as well as
+        # `title`, so a constant `floored-by-title` token reports the TITLE as the
+        # source of a term that was in the ASK — on the machine-readable surface, and
+        # on the majority of hits. That is the row's own defect class (a field read
+        # where a category was meant) re-introduced by its own fix. The stderr warn
+        # and TASK_GATE_FLOORED_BY were made axis-accurate in the same commit; this
+        # one was missed. `_gate_route_why` switches on the BASIS, never on this
+        # token, and no other reader in src/ or tests/ matches its literal — so the
+        # value can carry the axis it actually came from.
+        elif [[ "$_floored_by_title" == "1" ]]; then _rtrigger="floored-by-${_floor_axis}"
         elif [[ "$_standing_route"   == "1" ]]; then _rtrigger="standing-lead"
         else _rtrigger="gate_builder_routing=on"
         fi
@@ -4191,15 +4201,34 @@ THE TEST, and it is a diagnostic and not a style note: if you cannot write the a
         # three iterations got wrong, and this false rc arrives from the RHS, where
         # no detector that classifies the LEFT side of `&&` can ever see it. Split
         # so the status is absorbed instead of argued about.
+        # DIVE-4175 arm C: TAKE THE TERM FROM THE AXIS THAT MATCHED. This line
+        # derived it from `_ft_title` unconditionally, which was correct while the
+        # only lead-routing axis WAS the title. Arm C routes the `ask` axis through
+        # the same flag, and an ask-axis hit on a task with a neutral title then
+        # rendered `floored_by=ask: … matched '' in the ask` — the durable surface
+        # naming no term at all, on the majority of hits, which is precisely the
+        # unasserted-surface defect arm 16 of tests/gate_floor_declared_discussion_unit.sh
+        # exists to catch. `_floor_term` was already computed per-axis a thousand
+        # lines up and stamped into floor_provenance; reuse it so the two surfaces
+        # cannot disagree, and keep the title derivation as the fallback for the
+        # title axis if it is ever reached with `_floor_term` unset.
+        # `_fbt_term` also rides the JSON payload below as `floor_term`. DIVE-4175
+        # arm C: the UNROUTED payload has carried `floor_term` since DIVE-2224, and
+        # before arm C a floored gate was unrouted, so a --json filer always got the
+        # term. Arm C sends this class down the ROUTED payload instead, which named
+        # the trigger but not the term — so the machine-readable surface lost the
+        # WHY that the prose result line kept. Additive: one field, null when no
+        # floor matched, and no routing behaviour changes.
         local _fbt="" _fbt_term=""
         if [[ "$_floored_by_title" == "1" ]]; then
-          _fbt_term=$(_gate_tier2_floor_term "$_ft_title" 2>/dev/null) || _fbt_term=""
+          _fbt_term="${_floor_term:-}"
+          [[ -n "$_fbt_term" ]] || { _fbt_term=$(_gate_tier2_floor_term "$_ft_title" 2>/dev/null) || _fbt_term=""; }
           _fbt=" [floored_by=${_floor_axis}: the T2 category floor matched '${_fbt_term}' in the ${_floor_axis} — escalate to the human if the ask really is asking for that]"
         fi
         ok "$ident routed to $_reviewer for ${_rrole} ($type, tier $tier)${_rnote}${_fbt}${_rsig} [${_rwhy}] — $ask" \
-           '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), routed_to:$rv, route_basis:$rb, route_trigger:$rt, require_sig_seat:(($cs|select(length>0)) // null), delivery:$ds, notified:($ds=="delivered"), ask:$ak, recommend:(($rc|select(length>0)) // null)}' \
+           '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), routed_to:$rv, route_basis:$rb, route_trigger:$rt, floor_term:(($ft|select(length>0)) // null), require_sig_seat:(($cs|select(length>0)) // null), delivery:$ds, notified:($ds=="delivered"), ask:$ak, recommend:(($rc|select(length>0)) // null)}' \
            --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg rv "$_reviewer" --arg ds "$_rstate" --arg ak "$ask" --arg rc "$recommend" \
-           --arg rb "$_route_prov" --arg rt "$_rtrigger" --arg cs "$_csv"
+           --arg rb "$_route_prov" --arg rt "$_rtrigger" --arg ft "$_fbt_term" --arg cs "$_csv"
         # No separate undelivered row: the lead-route row above already carries
         # delivery=<state>, and a second row for the same event is how one send
         # becomes two data points (the re-inflation DIVE-1968 spent a round undoing).

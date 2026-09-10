@@ -89,6 +89,19 @@ db "INSERT INTO agents_org(name,reports_to,role) VALUES('dev','main','builder');
 seed()    { db "INSERT INTO tasks(ident,title,status,created_by) VALUES('$1',$(sqlq "$2"),'todo','main');"; }
 tierof()  { db "SELECT tier FROM tasks WHERE ident='$1';"; }
 routedof(){ db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='$1';"; }
+# DIVE-4175 arm C: the floor no longer promotes the TIER, so the tier is no longer a
+# probe for "did the floor fire on this field?" — under arm C it reads 1 either way,
+# which would make every seam arm below vacuous. The floor still RUNS and still
+# stamps which field it fired on, so the seam is graded on that stamp instead: it is
+# the same predicate, read one hop closer, and it is what the 30-day measurement is
+# computed from. `axis=none` = the floor ran and did not fire (the seam was NOT
+# fabricated); `axis=ask` / `axis=title-fallback` = it fired on that field.
+provof()  { db "SELECT COALESCE(floor_provenance,'') FROM tasks WHERE ident='$1';"; }
+assert_axis() { # <ident> <expected-axis-prefix> <label>
+  local id="$1" want="$2" lbl="$3" p; p=$(provof "$id")
+  [[ "$p" == "$want" || "$p" == "$want;"* ]] \
+    && ok_t "$lbl" || bad_t "$lbl" "floor_provenance='$p' want axis '$want' (tier='$(tierof "$id")')"
+}
 
 # hard-human: tier 2, no reviewer, the paired human was pinged.
 assert_human() { # <ident> <label>
@@ -123,13 +136,15 @@ assert_lead_routed() { # <ident> <label>
 route_reset; seed DIVE-801 'table stakes: the onboarding rewrite'
 actor_seam_as dev; cmd_task_need DIVE-801 --type=decision --from=dev \
   --ask="confirm we can drop" --options="A|B" --recommend="A" >/dev/null 2>&1
-assert_not_floored DIVE-801 "seam: 'drop' in ask + 'table' in title does NOT fabricate a floor hit"
+# Graded on the AXIS, not the tier: under arm C every gate here is tier 1, so the
+# tier can no longer tell a fabricated hit from a real one (DIVE-4175).
+assert_axis DIVE-801 "axis=none" "seam: 'drop' in ask + 'table' in title does NOT fabricate a floor hit"
 
 # (2) NON-VACUITY, ask axis: a real floor term in the ASK still forces hard-human.
 route_reset; seed DIVE-802 'onboarding rewrite'
 actor_seam_as dev; cmd_task_need DIVE-802 --type=decision --from=dev \
   --ask="approve the refund to the customer" --options="A|B" --recommend="A" >/dev/null 2>&1
-assert_human DIVE-802 "non-vacuity: a floor term in the ASK still floors to hard-human"
+assert_axis DIVE-802 "axis=ask" "non-vacuity: a real floor term in the ASK is still FOUND in the ask (arm C: found, no longer promoted)"
 
 # (3) PART 2 / ANSWER A: a floor term in the TITLE, with a SUBSTANTIVE ask that names
 #     nothing of the sort, no longer reaches the human -- it routes to the lead. This
@@ -159,7 +174,15 @@ assert_not_floored DIVE-804 "control: a gate with no floor term in either field 
 route_reset; seed DIVE-805 'task board tidy-up for DIVE-2224'
 actor_seam_as dev; cmd_task_need DIVE-805 --type=decision --from=dev \
   --ask="approve the purge" --options="A|B" --recommend="A" >/dev/null 2>&1
-assert_human DIVE-805 "seam: a co-reference manufactured ACROSS the join does NOT strip the floor (stays human)"
+# DIVE-4175 arm C: the down direction used to be observable as "stays human". The
+# internal-ops carve-out that the phantom co-reference attacked (DIVE-1481) fires
+# only on `tier_floored == 1`, which arm C no longer produces, so the carve-out
+# cannot strip anything today and the human/lead split cannot express this property.
+# What is still true and still graded: the floor is NOT fooled by the join — it
+# finds 'purge' in the ask, on the ask axis. Whether DIVE-1481's carve-out still
+# changes any observable at all is the follow-up row's question; this arm is one of
+# its pieces of evidence.
+assert_axis DIVE-805 "axis=ask" "seam: a co-reference manufactured ACROSS the join does NOT hide the term from the floor"
 
 # (6) NON-VACUITY: the genuine internal-ops case — verb and object BOTH in the ask —
 #     must still be lead-clearable. Without this, (5) could pass by breaking the
@@ -260,13 +283,16 @@ _gate_ask_substantive "approve this" \
 route_reset; seed DIVE-808 'delete all customer data'
 actor_seam_as dev; cmd_task_need DIVE-808 --type=decision --from=dev \
   --ask="approve this" --options="A|B" --recommend="A" >/dev/null 2>&1
-assert_human DIVE-808 "FALLBACK: ask 'approve this' + destructive TITLE still reaches the human (fail-closed)"
+# arm C: the fallback still CLASSIFIES (axis=title-fallback) and no longer floors.
+# Arm E (DIVE-4176) refuses an ask this thin at filing time, which is what replaces
+# the fail-closed cover — the named, accepted residual until it is in the cut.
+assert_axis DIVE-808 "axis=title-fallback" "FALLBACK: ask 'approve this' + destructive TITLE still classifies title-fallback"
 
 # (10) the same fallback with an ask that is pure politeness.
 route_reset; seed DIVE-809 'wipe the production database and start over'
 actor_seam_as dev; cmd_task_need DIVE-809 --type=decision --from=dev \
   --ask="please confirm" --options="A|B" --recommend="A" >/dev/null 2>&1
-assert_human DIVE-809 "FALLBACK: a politeness-only ask + destructive TITLE still reaches the human"
+assert_axis DIVE-809 "axis=title-fallback" "FALLBACK: a politeness-only ask + destructive TITLE still classifies title-fallback"
 
 # (11) THE NAMED VICTIM. DIVE-2216's real title contains 'deleted', so before answer A
 #      EVERY push gate on that ticket escalated to the human and no rewording of the
@@ -300,25 +326,31 @@ assert_lead_routed DIVE-811 "answer A applies to an APPROVAL gate too (filing fl
 route_reset; seed DIVE-812 'delete all customer data'
 actor_seam_as dev; cmd_task_need DIVE-812 --type=decision --from=dev \
   --ask="approve this" --options="A|B" --recommend="A" >/dev/null 2>&1
-_REAL_TIER=$(tierof DIVE-812)
+_REAL_AXIS=$(provof DIVE-812)
 _SUBSTANTIVE_REAL=$(declare -f _gate_ask_substantive)
 _gate_ask_substantive() { return 0; }   # MUTANT: every ask counts as substantive
 route_reset; seed DIVE-814 'delete all customer data'
 actor_seam_as dev; cmd_task_need DIVE-814 --type=decision --from=dev \
   --ask="approve this" --options="A|B" --recommend="A" >/dev/null 2>&1
-_MUTANT_TIER=$(tierof DIVE-814)
+_MUTANT_AXIS=$(provof DIVE-814)
 eval "$_SUBSTANTIVE_REAL"               # restore BEFORE asserting, so a failed
                                         # assertion can never leave the mutant live
-{ [[ "$_REAL_TIER" == "2" && "$_MUTANT_TIER" != "2" ]]; } \
-  && ok_t "MUTATION: real='2' vs mutant='$_MUTANT_TIER' — regressing _gate_ask_substantive CHANGES the outcome, so the fallback is load-bearing" \
-  || bad_t "MUTATION: fallback is decorative" "real tier='$_REAL_TIER' mutant tier='$_MUTANT_TIER' — the mutation changed nothing, so this arm proves nothing"
+# DIVE-4175 arm C: the differential is on the AXIS, for the same reason as above —
+# the tier is 1 in both runs now, so a tier differential would have gone vacuous in
+# exactly the way this arm's own comment warns about. Real: the fallback fires and
+# the stamp says title-fallback. Mutant (every ask counts as substantive): the floor
+# never looks at the title, so it reports axis=none. Still differential, still reds
+# if someone deletes the fallback.
+{ [[ "$_REAL_AXIS" == "axis=title-fallback"* && "$_MUTANT_AXIS" != "axis=title-fallback"* ]]; } \
+  && ok_t "MUTATION: real='$_REAL_AXIS' vs mutant='$_MUTANT_AXIS' — regressing _gate_ask_substantive CHANGES the classification, so the fallback is load-bearing" \
+  || bad_t "MUTATION: fallback is decorative" "real axis='$_REAL_AXIS' mutant axis='$_MUTANT_AXIS' — the mutation changed nothing, so this arm proves nothing"
 
 # (14) …and prove the RESTORE took, or every assertion after (13) would be grading
 #      the mutant and this suite would report on code that is not shipped.
 route_reset; seed DIVE-813 'delete all customer data'
 actor_seam_as dev; cmd_task_need DIVE-813 --type=decision --from=dev \
   --ask="approve this" --options="A|B" --recommend="A" >/dev/null 2>&1
-assert_human DIVE-813 "MUTATION: the real predicate is RESTORED (the mutant did not leak into the suite)"
+assert_axis DIVE-813 "axis=title-fallback" "MUTATION: the real predicate is RESTORED (the mutant did not leak into the suite)"
 
 printf '\nDIVE-2224 gate seam: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
