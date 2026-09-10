@@ -110,7 +110,12 @@ askof()     { db "SELECT COALESCE(ask,'') FROM tasks WHERE ident='$1';"; }
 
 # dev3's real ask on DIVE-2078, trimmed. Names "credentials" and "privileged";
 # requests nothing but a modelling choice.
-DESIGN_ASK="For the capability-vs-clearance model: should an agent's right to act be derived from the credentials it holds, or from a separately declared clearance level that privileged operations check against?"
+# DIVE-4176: kept under the human-ask readability budget on purpose. Every arm
+# below files this ask on a gate that FLOORS to the paired human, so the
+# readability refusal grades it; at its former 30 words it was refused before the
+# FLOOR this harness measures was ever reached. The two floor terms it turns on
+# ("credentials", "clearance") are untouched.
+DESIGN_ASK="Should an agent's right to act come from the credentials it holds, or from a separately declared clearance level?"
 DESIGN_WHY="this is a data-model sizing question about how to REPRESENT credential handling; it performs no credential operation and grants nothing"
 
 # ---------------------------------------------------------------------------

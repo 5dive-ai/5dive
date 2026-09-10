@@ -237,5 +237,36 @@ file_gate ADV-1 --type=manual --ask="Please try one agent-file import on your bo
 eq_t  "E1: an imperative ask still FILES (rc 0)" "$RC" "0"
 has_t "E1b: ... and is warned about the missing question" "$OUT" "states an instruction rather than asking a question"
 
+# ============ F. the gate the PRODUCT files must pass its own rule ==========
+# `task reject` at the iteration cap files a --type=manual gate that parks the
+# stuck loop on the paired human. That ask is written by delivery.sh, not by a
+# filer, and nothing else grades it — so when it carried the row's ident and the
+# verifier's raw feedback it was refused by this very rule, which made `reject`
+# itself fail at the cap (caught in CI on this branch, not in review). The arm
+# reads the SHIPPED string out of the source rather than restating it, so a later
+# edit that reintroduces machine vocabulary reds here instead of in production.
+ESC_ASK=$(grep -A1 'cmd_task_need "\$id" --type=manual --from=' "$SRC/task/delivery.sh" \
+          | sed -n 's/.*--ask="\(.*\)"$/\1/p')
+[[ -n "$ESC_ASK" ]] \
+  && ok_t "F0: the escalation ask was located in delivery.sh (or arm F proves nothing)" \
+  || bad_t "F0: escalation ask not found in delivery.sh" "grep found nothing — the call shape moved"
+# Substitute the call site's live variables with REALISTIC values — an ident, a
+# count, a cap, a verifier's raw feedback — because the jargon this rule refuses
+# arrives through exactly those slots, not through the prose around them. Any $
+# left after this means a new slot appeared that the arm is not filling, and the
+# arm must red rather than grade a half-expanded string.
+ESC_ASK="${ESC_ASK//\$\{iter\}/3}"
+ESC_ASK="${ESC_ASK//\$\{maxi\}/3}"
+ESC_ASK="${ESC_ASK//\$ident/DIVE-4176}"
+ESC_ASK="${ESC_ASK//\$\{ident\}/DIVE-4176}"
+ESC_ASK="${ESC_ASK//\$\{feedback:-none\}/CI is red on core-pristine at head 777e23a9, see tests/gate_ask_readability_unit.sh}"
+[[ "$ESC_ASK" != *'$'* ]] \
+  && ok_t "F0b: every shell expansion in it was substituted (no \$… left half-graded)" \
+  || bad_t "F0b: unsubstituted expansion left in the escalation ask" "ask='$ESC_ASK'"
+seed ESC-1
+file_gate ESC-1 --type=manual --ask="$ESC_ASK" --tier=2
+eq_t "F1: the iteration-cap escalation gate the product files is READABLE (rc 0)" "$RC" "0"
+eq_t "F2: ... and it really was filed, not swallowed" "$(field ESC-1 need_type)" "manual"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == "0" ]]

@@ -1071,8 +1071,15 @@ cmd_task_reject() {
     _task_reject_emit_event "$ident" "$id" "$_rj_actor" "$_rj_prev" "$iter" "$maxi" \
       "escalated to human review at the iteration cap (loop stuck, not bounced back)"
     warn "$ident hit max_iterations ($maxi) — escalating to human review"
+    # DIVE-4176: this ask lands on the PAIRED HUMAN, so it is written for one —
+    # no ident, no branch, no interpolated verifier feedback (that text is already
+    # on the row's `result`, written six lines up, and the row is what the gate
+    # points at). The readability refusal in `task need` grades this string like
+    # any other; a control arm in tests/gate_ask_readability_unit.sh keeps it from
+    # drifting back into machine vocabulary, where the refusal would make `reject`
+    # itself fail at the iteration cap.
     cmd_task_need "$id" --type=manual --from="${vfier:-verifier}" \
-      --ask="Maker→verifier loop stuck: $ident failed verification ${iter}× (max ${maxi}). Last feedback: ${feedback:-none}. Review + decide."
+      --ask="A piece of work has failed review ${iter} times and stopped. Decide whether to keep going or drop it."
     return
   fi
   # Otherwise bounce back to the maker for another pass.
