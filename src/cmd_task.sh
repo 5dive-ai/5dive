@@ -21,6 +21,12 @@
 # `unset -f`s a task function and re-sources to restore it must source the MODULE
 # that defines it (src/task/<file>.sh), not this loader.
 _task_src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# DIVE-4251: the verification-policy resolver lives in lib/ (it is CORE in the
+# bundle, parsed on every call) but the split tree only guarantees what a harness
+# sources by hand — and ~60 harnesses source THIS file to get the whole of `task`.
+# `task add`, `task deliver`, `task done` and the grader lane all call into it, so
+# it is loaded here rather than added to sixty source lists.
+declare -F verify_grants_grader >/dev/null 2>&1 || . "$_task_src_dir/lib/verify_policy.sh"
 declare -F cmd_task >/dev/null 2>&1 || . "$_task_src_dir/task/dispatch.sh"
 declare -F _task_resolve_coordinator >/dev/null 2>&1 || . "$_task_src_dir/task/routing.sh"
 declare -F cmd_task_add >/dev/null 2>&1 || . "$_task_src_dir/task/crud.sh"

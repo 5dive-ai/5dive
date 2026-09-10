@@ -537,7 +537,22 @@ _task_status_cmd() {
     if [[ "$_route_st" != "done" && "$_route_st" != "cancelled" ]]; then
       _depth=$(_task_delivery_paths "$id" | _task_delivery_depth)
     fi
+    # DIVE-4251: the box's verification policy is consulted BEFORE the routing
+    # fork, not inside it. On a box that grants this row no grader the handoff
+    # DEGRADES TO A PLAIN CLOSE — the row falls through to the ordinary close
+    # below, which still has to satisfy the DIVE-1830 merge gate, so "no grader"
+    # never becomes "no gate". Same shape as the DIVE-2719 shallow downgrade
+    # directly below it, and deliberately so: both are "the rail was earned by the
+    # title, something measured later says skip it".
+    local _vp_grants_row=1
+    if [[ "$_route_st" != "done" && "$_route_st" != "cancelled" ]]; then
+      _task_verify_grants "$id" || _vp_grants_row=0
+    fi
     if [[ -n "$_vfier" && "$_vfier" != "$_asignee" \
+          && "$_route_st" != "done" && "$_route_st" != "cancelled" \
+          && $_vp_grants_row == 0 ]]; then
+      warn "$ident: verifier round skipped (verify=$(box_verify_policy), DIVE-4251) — this box's verification policy grants this row no grader session, so '$_vfier' is not handed the row and no grader is spawned. Closing outright (the merge gate still applies). Set '5dive config verify=always', or file with --verify, to get the round back."
+    elif [[ -n "$_vfier" && "$_vfier" != "$_asignee" \
           && "$_route_st" != "done" && "$_route_st" != "cancelled" ]]; then
       if [[ "$_depth" == "shallow" ]]; then
         # DOWNGRADE. The rail was earned by the title; the diff says tests/docs
@@ -552,7 +567,14 @@ _task_status_cmd() {
       fi
     elif [[ -z "$_vfier" && "$_depth" == "deep" && -n "$_asignee" \
             && "$_route_st" != "done" && "$_route_st" != "cancelled" \
-            && "${FIVE_VERIFY_DEFAULT:-1}" != "0" ]]; then
+            && "${FIVE_VERIFY_DEFAULT:-1}" != "0" ]] \
+            && _task_verify_grants "$id" 1; then
+      # DIVE-4251: `ignore-skip=1`. The BOX policy gates this upgrade — a customer
+      # on verify=never is not handed a grader session by a blast-radius rule they
+      # never bought. The ROW's `--no-verify` still does NOT suppress it, which is
+      # DIVE-2730's finding preserved exactly: a file-time sentence must not
+      # pre-authorise closing a credentials diff nobody had written yet. Those are
+      # two different claims and the argument is what keeps them apart.
       # UPGRADE. `task add` read this row as trivial (bodyless chore title, or
       # low priority) and gave it no grader — but the diff reached the scheduler,
       # the task store, credentials or deploy. This is a ROUND TRIP, not a block:
@@ -619,8 +641,14 @@ _task_status_cmd() {
       # unattributable caller is a DIFFERENT question and not this ticket's to
       # answer. It stayed green on every dev box because $USER there resolves to
       # an agent, which is exactly why local green is not CI green.
+      # DIVE-4251: on a box whose policy grants this row no grader, there is no
+      # grade for the maker to be pre-empting — refusing here would leave the row
+      # permanently unclosable, since the "only '$_vfier' can grade it" exit
+      # requires a grader the customer has declined to pay for. The guard is
+      # unchanged wherever a grader IS granted, which is every row on our fleet.
       if [[ -n "$_maker" && "$_actor" != "$_vfier" && "$_actor" != "cli" \
-            && "$_st" != "done" && "$_st" != "cancelled" ]]; then
+            && "$_st" != "done" && "$_st" != "cancelled" ]] \
+         && _task_verify_grants "$id"; then
         policy_refuse "$E_CONFLICT" done-over-delivered-loop DIVE-2007 "$ident" \
           "$ident is DELIVERED to verifier '${_vfier}' (iteration ${_iter}, maker '${_maker}') and has NOT been graded — a 'task done' from '${_actor}' would close it ungraded, which is the maker grading its own work (writer != grader, DIVE-477). Only '${_vfier}' can grade it. To CORRECT the result text do NOT re-run done: send the correction to '${_vfier}' (5dive agent send ${_vfier} \"...\") and let them fold it in. Real exits: '5dive task reject $ident --feedback="FINDING/FIX/VERIFY"' (verifier bounces it back), '5dive task verify $ident --no-done --cmd=\"<acceptance test>\"' (record machine evidence and hold at graded->merge), or '5dive task cancel $ident --result=...' (abandon)."
       fi

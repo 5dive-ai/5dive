@@ -400,6 +400,23 @@ cmd_task_grader_tick() {
     [[ -n "$ident" ]] || continue
     [[ -z "$only" || "$ident" == "$only" ]] || continue
     n_pending=$((n_pending+1))
+    # DIVE-4251: THE POLICY IS CHECKED FIRST, before the cap, the meter and the
+    # credential probe — a row the customer's box grants no grader must cost this
+    # lane nothing at all, and must never appear in the plan as merely "queued"
+    # (a queue is a promise to spawn later; a declined row is not).
+    #
+    # THIS IS DEFENCE IN DEPTH, NOT THE ONLY CONTROL, and saying so matters for
+    # anyone reading it later: `_task_route_to_verifier`'s callers already decline
+    # to EMIT a `task.grade.requested` for such a row, so on a correct box this
+    # branch never fires. It exists because policy can change AFTER a request was
+    # emitted — a customer flipping to `never` must stop the graders that are
+    # already queued, not just the next ones — and because a lane that re-derives
+    # the answer cannot be desynchronised from the emitter by a future edit.
+    local _gp_id; _gp_id=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || printf '')
+    if [[ -n "$_gp_id" ]] && ! _task_verify_grants "$_gp_id"; then
+      n_refuse=$((n_refuse+1))
+      plan+="skip    $ident  (verification policy grants this row no grader — 5dive config verify=)"$'\n'; continue
+    fi
     # THE CAP IS CHECKED BEFORE THE SEAT, so a full lane costs no meter reads and
     # no credential probes — a queued delivery must be cheap or the tick becomes
     # the burn it was meant to bound.
