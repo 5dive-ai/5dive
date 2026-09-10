@@ -33,6 +33,23 @@
 # corpus shape the shell glob in tests/lib/tier.sh selects. --diff-filter=ACMR
 # excludes deletions: a harness that is gone cannot be run, and making deletion
 # easy is the direction DIVE-2525's budget work is pushing.
+#
+# A CHANGED-FILES SELECTOR CANNOT SEE A CORPUS-WIDE CONTRACT. Some harnesses do
+# not grade their own source — they enumerate `tests/*.sh` and assert a property
+# of EVERY OTHER harness (the HARNESS-RC EXIT trap, the named grading tree). For
+# those, the input is the corpus, so ADDING a harness invalidates them while
+# leaving their own diff empty: a path-keyed selection returns them exactly never,
+# and the rail greens on a set chosen to exclude the check that is about to red
+# the PR. Measured on this row's own first push (DIVE-4208, quinn's iteration-1
+# rejection): `harnesses 2.5s green` locally, then core-pristine(1) /
+# core-installed-host(1) / test / test-installed-host red on
+# harness_rc_corpus_contract_unit.sh naming the harness the branch had just added.
+#
+# So when the diff ADDS or DELETES any tests/*.sh, the corpus-wide contracts join
+# the selection. They are DISCOVERED, not hardcoded: any harness whose source
+# enumerates the corpus glob is one, so the next contract of this shape is covered
+# the day it lands, without editing this file. Graded by A15/A16 in
+# tests/pre_push_rail_unit.sh; the path-keyed mutant reds A15.
 set -uo pipefail
 
 base="${1:-}"
@@ -58,5 +75,31 @@ fi
 
 echo "changed-harnesses: base=$base head=$head_rev" >&2
 
-git diff --name-only --diff-filter=ACMR "$base" "$head_rev" -- \
-  'tests/*.sh' ':(exclude)tests/lib/*' ':(exclude)tests/meta/*'
+# The corpus of the repo BEING DIFFED, not of wherever this script happens to
+# live: the rail copies this file around, and the contracts that matter are the
+# ones in the tree whose push is being graded.
+TOP="$(git rev-parse --show-toplevel 2>/dev/null)"
+[[ -n "$TOP" ]] || TOP="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+
+sel="$(git diff --name-only --diff-filter=ACMR "$base" "$head_rev" -- \
+  'tests/*.sh' ':(exclude)tests/lib/*' ':(exclude)tests/meta/*')"
+
+# ADDED or DELETED — the two edits that change what a corpus-wide contract reads.
+# A pure MODIFY does not: the corpus membership is the same set before and after.
+addel="$(git diff --name-only --diff-filter=AD "$base" "$head_rev" -- \
+  'tests/*.sh' ':(exclude)tests/lib/*' ':(exclude)tests/meta/*')"
+
+if [[ -n "$addel" ]]; then
+  contracts=()
+  while IFS= read -r c; do [[ -n "$c" ]] && contracts+=("tests/$(basename "$c")"); done < <(
+    grep -lE '^[[:space:]]*[A-Za-z_]+=\(tests/\*\.sh\)' "$TOP"/tests/*.sh 2>/dev/null
+  )
+  if (( ${#contracts[@]} )); then
+    echo "changed-harnesses: diff adds/deletes harness(es); adding ${#contracts[@]} corpus-wide contract(s) whose input is the corpus, not their own source." >&2
+    sel="$(printf '%s\n' "$sel" "${contracts[@]}")"
+  else
+    echo "changed-harnesses: diff adds/deletes harness(es) but NO corpus-wide contract was discovered — if one exists it is not being selected." >&2
+  fi
+fi
+
+printf '%s\n' "$sel" | sed '/^$/d' | sort -u

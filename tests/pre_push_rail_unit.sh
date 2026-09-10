@@ -28,6 +28,12 @@
 #
 # Run: bash tests/pre_push_rail_unit.sh
 set -uo pipefail
+# DIVE-2692 corpus contract (tests/harness_rc_corpus_contract_unit.sh): ONE folded
+# EXIT trap, registered here — before any early exit — with `rc=$?` captured FIRST
+# and the marker echoed LAST, so no cleanup can disturb the code being reported.
+# $TMP is created ~25 lines below, hence ${TMP:-}: under `set -u` an unset name in
+# the trap body would itself abort the trap on an early exit.
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 
 # DIVE-2211 / DIVE-2286: name the tree this harness grades.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
@@ -52,7 +58,7 @@ ok()   { PASS=$((PASS+1)); printf 'ok   %s\n' "$1"; }
 no()   { FAIL=$((FAIL+1)); printf 'FAIL %s\n' "$1"; }
 skip() { SKIP=$((SKIP+1)); printf 'skip %s\n' "$1"; }
 
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+TMP="$(mktemp -d)"   # cleaned by the single folded EXIT trap at the top of this file.
 
 # A SANDBOX REPO with its own copy of the two scripts and the title workflow, so
 # an arm may MUTATE the rule the rail reads without touching this checkout. The
@@ -117,6 +123,47 @@ want=$'tests/keep_unit.sh\ntests/new_unit.sh'
 [[ "$(printf '%s\n' "$sel_out" | sort)" == "$want" ]] \
   && ok "A4 the selector takes added+modified tests/*.sh and excludes tests/lib, tests/meta and deletions" \
   || no "A4 selection is wrong: $(printf '%s' "$sel_out" | tr '\n' ' ')"
+
+# A15/A16: A CHANGED-FILES SELECTOR CANNOT SEE A CORPUS-WIDE CONTRACT, and this
+# is the arm that exists because it bit this row. A harness like
+# tests/harness_rc_corpus_contract_unit.sh enumerates `tests/*.sh` and asserts a
+# property of EVERY OTHER harness — so ADDING a harness invalidates it while
+# changing its own diff not at all. Path-keyed selection therefore returns it
+# never, and the rail greens on a set chosen to exclude the check about to red
+# the PR: measured on this branch's first push (`harnesses 2.5s green`, then four
+# required checks red on exactly that contract).
+#
+# A15 requires an ADD to pull the contract in; A16 requires a pure MODIFY not to,
+# because a selection that is unconditional is not a selection. Mutating the
+# script back to the path-keyed rule (delete the addel block) reds A15 and leaves
+# A16 and A4 green — that mutation is the one that reproduces the rejection.
+SB3="$TMP/sel-corpus"; mkdir -p "$SB3/tests"
+git -C "$SB3" init -q 2>/dev/null || git init -q "$SB3"
+git -C "$SB3" config user.email t@example.com; git -C "$SB3" config user.name t
+# A stand-in corpus contract: what makes it one is that its SOURCE enumerates the
+# corpus glob, which is how the selector discovers it — not a name on a list.
+printf '#!/usr/bin/env bash\nCORPUS=(tests/*.sh)\necho "${#CORPUS[@]}"\n' \
+  >"$SB3/tests/some_corpus_contract_unit.sh"
+: >"$SB3/tests/keep_unit.sh"
+git -C "$SB3" add -A >/dev/null; git -C "$SB3" commit -qm base >/dev/null
+b3="$(git -C "$SB3" rev-parse HEAD)"
+
+: >"$SB3/tests/brand_new_unit.sh"
+git -C "$SB3" add -A >/dev/null; git -C "$SB3" commit -qm add >/dev/null
+sel_out="$( cd "$SB3" && bash "$SEL" "$b3" HEAD 2>/dev/null )"
+{ grep -qx 'tests/brand_new_unit.sh' <<<"$sel_out" \
+  && grep -qx 'tests/some_corpus_contract_unit.sh' <<<"$sel_out"; } \
+  && ok "A15 a diff that only ADDS a harness selects the corpus-wide contract too — the contract's input is the corpus, not its own source" \
+  || no "A15 an added harness did not pull in the corpus-wide contract: $(printf '%s' "$sel_out" | tr '\n' ' ')"
+
+add_head="$(git -C "$SB3" rev-parse HEAD)"
+echo x >"$SB3/tests/keep_unit.sh"
+git -C "$SB3" add -A >/dev/null; git -C "$SB3" commit -qm modify >/dev/null
+sel_out="$( cd "$SB3" && bash "$SEL" "$add_head" HEAD 2>/dev/null )"
+{ grep -qx 'tests/keep_unit.sh' <<<"$sel_out" \
+  && ! grep -qx 'tests/some_corpus_contract_unit.sh' <<<"$sel_out"; } \
+  && ok "A16 a pure MODIFY does not pull the corpus-wide contract in — corpus membership did not change" \
+  || no "A16 a modify-only diff wrongly selected the corpus-wide contract: $(printf '%s' "$sel_out" | tr '\n' ' ')"
 
 # A5: no such base, and no origin/main to fall back to.
 sel_out="$( cd "$SB2" && bash "$SEL" deadbeefdeadbeefdeadbeefdeadbeefdeadbeef HEAD 2>&1 )"; rc=$?
