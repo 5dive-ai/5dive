@@ -45,6 +45,11 @@ BLOCK=$(extract_block)
 
 LOGS=""
 _hb_log() { LOGS+="$*"$'\n'; }
+# Declared EMPTY so a source-level revert of the fix (which re-reads this array) does not
+# crash the harness under set -u; such a revert is caught by arm E (the reference is back)
+# and its semantics by arm D, which re-inserts the bump AND simulates the loop's post-wake
+# write. Arm A alone cannot see a revert: the harness does not emulate the removed write.
+declare -A in_tick_woke=()
 
 # spread_gate <name> <registry-json> <now> <everyMin>: 0 = wake, 1 = defer
 define_gate() {   # $1 = block text
@@ -79,7 +84,7 @@ LOGS=""; r=0; spread_gate a1 "$REG" "$NOW" 5 || r=$?
 # D. NON-VACUITY: put the in-tick bump back into the extracted block; arm A must red.
 MUT=$(printf '%s\n' "$BLOCK" | sed 's/^\([[:space:]]*\)gap=\$(( everyMin \* 60 \/ acct_count ))$/\1if [[ -n "${in_tick_woke[$acct]:-}" ]] \&\& (( in_tick_woke[$acct] > acct_last )); then acct_last=${in_tick_woke[$acct]}; fi\n&/')
 [[ "$MUT" != "$BLOCK" ]] || bad "D: mutant did not apply (gap= line not found)"
-declare -A in_tick_woke=()
+in_tick_woke=()
 define_gate "$MUT"
 REG=$(reg_two $((NOW-600)) $((NOW-600)))
 m1=0; spread_gate a1 "$REG" "$NOW" 5 || m1=$?
