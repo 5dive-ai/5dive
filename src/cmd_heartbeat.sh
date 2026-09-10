@@ -1695,6 +1695,17 @@ _hb_send_line() {
     fi
     return 1
   }
+  # DIVE-4242: COMPOSER HYGIENE, then the payload. Measured 2026-09-10 15:43Z on
+  # ops: the tick typed a /goal at 15:40:31Z and claimed the row; the pane then
+  # showed `❯ [Pasted text #7]irst (verify before relying...` — the NUDGE's own
+  # tail, NOT dim — sitting unsent in the composer while every later tick read
+  # 'busy — 1 in_progress, skip'. Whatever is already in the composer (a previous
+  # injector's remainder, a human's half-typed line) must not be prepended to
+  # this payload, so clear the line first. C-u, never Escape: Escape on a seat
+  # that is mid-turn ABORTS the turn, C-u only edits the composer. Ghost text
+  # (CC 2.1.267 promptSuggestion, rendered DIM) is not input and is replaced by
+  # typing anyway; it is excluded from the verify below rather than cleared.
+  sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" C-u 2>/dev/null || return 1
   sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" -l -- "$text" 2>/dev/null || return 1
   # DIVE-1217: `send-keys -l` lands as a bracketed PASTE. Claude commits it
   # synchronously so an immediate Enter submits (leave that path alone). Non-claude
@@ -1703,9 +1714,22 @@ _hb_send_line() {
   # starts and the nudge is silently dropped. For those: let the paste settle,
   # Enter, then CONFIRM the turn started (agent left idle), re-sending Enter a few
   # times before giving up.
+  # DIVE-4242: the claude path now VERIFIES the submit instead of assuming it. A
+  # long payload on CC 2.1.267 can leave its tail in the composer after the
+  # Enter (measured above); the caller then claims the row and the dispatcher is
+  # blind to a seat that never received its task. Verify = the composer line holds
+  # no non-dim text. Retry the Enter once; then return failure LOUDLY so
+  # _hb_wake fails and the tick does not claim — the next tick re-nudges, which is
+  # the pre-DIVE-2244 behaviour for exactly this task and strictly better than a
+  # claim on a prompt nobody received.
   if [[ -n "$(_hb_claude_pid "$name")" ]]; then
     sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter 2>/dev/null || return 1
-    return 0
+    _hb_verify_submit "$name" && return 0
+    sleep "${_HB_SUBMIT_RETRY_SEC:-0.5}"
+    sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter 2>/dev/null || return 1
+    _hb_verify_submit "$name" && return 0
+    _hb_log "[$name] submit UNVERIFIED — the composer still holds ${#_HB_COMPOSER_UNSENT} chars of non-ghost text after 2 Enters ('${_HB_COMPOSER_UNSENT:0:60}'); returning failure so nothing is claimed on it (DIVE-4242)" 2>/dev/null || true
+    return 1
   fi
   sleep 0.4
   while (( tries < 5 )); do
@@ -1717,6 +1741,42 @@ _hb_send_line() {
     tries=$((tries+1))
   done
   return 1
+}
+
+# DIVE-4242: the text a seat's composer is holding RIGHT NOW, with ghost text
+# excluded. `capture-pane -e` keeps the SGR codes; CC 2.1.267 renders its prompt
+# suggestion (promptSuggestionEnabled) as a DIM run `ESC[2m...ESC[0m` after the
+# composer glyph, and that run is not input — a plain Enter does nothing to it.
+# Anything else after the last `❯` is real unsent input (a paste placeholder,
+# a half-typed line). Empty output = composer empty (or unreadable: a pane we
+# cannot read is handled by the credential guard before we ever type).
+_hb_composer_unsent() {
+  local name="$1" raw line esc=$'\e'
+  raw=$(sudo -u "agent-${name}" tmux capture-pane -e -p -t "agent-${name}" 2>/dev/null) || { printf ''; return 0; }
+  line=$(grep -a '❯' <<<"$raw" | tail -1) || line=""   # no glyph on the pane = empty composer, not a fatal probe
+  [[ -n "$line" ]] || { printf ''; return 0; }
+  line="${line#*❯}"
+  # 1) drop DIM runs (ghost text); 2) strip every remaining CSI sequence.
+  line=$(sed -E "s/${esc}\[2m[^${esc}]*(${esc}\[0m|${esc}\[22m)//g; s/${esc}\[[0-9;?]*[A-Za-z]//g" <<<"$line")
+  # The composer glyph is followed by a NO-BREAK SPACE (U+00A0, bytes C2 A0),
+  # which [[:space:]] does not match. Measured 2026-09-10 15:58Z on all 13 live
+  # seats: without this line every idle composer read as one leftover character,
+  # i.e. every wake would have failed the verify and nothing would ever be claimed.
+  line="${line//$'\xc2\xa0'/ }"
+  line="${line//[$'\t\r\n']/ }"
+  line=$(sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$line")
+  printf '%s' "$line"
+}
+
+# DIVE-4242: did the Enter take? 0 = composer empty of non-ghost text (the
+# payload left it), 1 = text still sitting there (sets _HB_COMPOSER_UNSENT for
+# the caller's log line). Waits a beat first so the TUI has redrawn.
+_HB_COMPOSER_UNSENT=""
+_hb_verify_submit() {
+  local name="$1"
+  sleep "${_HB_SUBMIT_VERIFY_SEC:-0.3}"
+  _HB_COMPOSER_UNSENT=$(_hb_composer_unsent "$name")
+  [[ -z "$_HB_COMPOSER_UNSENT" ]]
 }
 
 # PID of this agent's live inner `claude` process, or empty if not found. This is
