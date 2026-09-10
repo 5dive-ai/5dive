@@ -102,7 +102,83 @@ fi
 #   already exist and the error names both — GH_SHA (pin a tree directly) and
 #   REPO (override the source entirely).
 
-# Newest release tag name (e.g. v0.15.34) on stdout, or return 1.
+# DIVE-4223 — THE RELEASE HOLD, and why it lives on `main` rather than on the
+# release object.
+#
+# The intuition "flag the bad release prerelease and every box falls back" is a
+# NO-OP for us: `releases/latest` honours that flag and nothing on a customer box
+# resolves through it. All three rungs below enumerate a TAG LIST, and a git tag
+# is not a GitHub Release — the Release object carries the flag, the tag carries
+# the code, and the tag is what gets installed. Measured 2026-09-09; the table is
+# in community/wiki/a-brake-is-only-a-brake-if-the-fleets-resolver-reads-it.md.
+# Deleting or moving a published tag is the other option and is barred: boxes
+# already on it have no coherent story.
+#
+# What IS reachable: `5dive self-update` re-fetches THIS FILE from `main` on every
+# run, so `main` is a live fleet control plane — one commit to arm a hold, one to
+# revert, and it reaches every box at its next 04:00Z. So the hold is a file on
+# `main` that this resolver reads and SKIPS the named tags.
+#
+# THE HOLD IS READ FROM `main`, NEVER FROM THE TAG BEING RESOLVED. Reading it
+# from the candidate tree would let a bad release exempt itself, which is the
+# whole failure this exists to prevent.
+#
+# THREE STATES, and the third is the point. `open` (fetched, tag not listed) and
+# `held` (fetched, tag listed) are both ANSWERS. "Could not read the hold" is not
+# an answer and must never collapse into `open` — a broken signal failing open
+# and a real outage are the same observation, and the direction that greens on
+# nothing is the one that ships the release the hold exists to stop. So an
+# unreadable hold FAILS CLOSED, and failing closed here is a no-op rather than a
+# brick: the box keeps the CLI it already has, exactly as it does every hour
+# nothing is published. GH_SHA= and REPO= remain the documented ways out.
+#
+# The file is COMMITTED and always present with a version banner, so "404" is not
+# a state we have to interpret: any fetch that does not return a body starting
+# `# 5dive-release-hold v1` is `unknown`, which also catches a CDN or captive
+# portal handing back a 200 of HTML.
+#
+# WHAT A HOLD DOES NOT DO: it holds boxes BACK, it does not pull them back. A box
+# that already installed the held tag stays on it (DIVE-2243's monotonicity guard
+# refuses the downgrade). The brake bounds how many boxes reach a bad release; it
+# does not undo the ones that did.
+RELEASE_HOLD_LIST=""      # newline-separated held tag names; may legitimately be empty
+RELEASE_HOLD_STATE=""     # ok | unreadable
+
+# Populates RELEASE_HOLD_LIST / RELEASE_HOLD_STATE. Never fails the caller.
+load_release_hold() {
+  local body=""
+  # Idempotent: resolve_cli_target consults the hold once per run, and on the
+  # canary rung resolve_gh_tag has already loaded it. Two fetches would double
+  # the fail-closed surface for no extra information.
+  [[ -z "$RELEASE_HOLD_STATE" ]] || return 0
+  # Rung 1: the raw CDN — the same origin this installer itself was fetched from,
+  # so its availability is already a precondition of getting this far.
+  body="$(curl -fsSL --max-time 10 \
+    "https://raw.githubusercontent.com/$GH_ORG/5dive/main/.release-hold" 2>/dev/null)" || body=""
+  # Rung 2: the contents API. Not redundancy for its own sake — fail-closed means
+  # a raw.githubusercontent blip would otherwise stop the whole fleet's nightly
+  # upgrade, so the second rung is what keeps "unknown" rare enough to be signal.
+  if [[ "$body" != "# 5dive-release-hold v1"* ]]; then
+    body="$(curl -fsSL --max-time 10 -H 'Accept: application/vnd.github.raw' \
+      "https://api.github.com/repos/$GH_ORG/5dive/contents/.release-hold?ref=main" 2>/dev/null)" || body=""
+  fi
+  if [[ "$body" != "# 5dive-release-hold v1"* ]]; then
+    RELEASE_HOLD_LIST=""; RELEASE_HOLD_STATE="unreadable"; return 0
+  fi
+  # A held line is a bare release tag, optionally followed by a human reason.
+  # Anything else in the file (comments, blank lines, the banner) is not a hold —
+  # a typo must not silently become one. The file's own header states the exact
+  # line shape for whoever arms it under incident pressure.
+  RELEASE_HOLD_LIST="$(printf '%s\n' "$body" \
+    | sed -n 's/^\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)\([[:space:]].*\)\{0,1\}$/\1/p')"
+  RELEASE_HOLD_STATE="ok"
+}
+
+# Newest release tag name (e.g. v0.15.34) on stdout.
+#   0  resolved            tag on stdout
+#   1  no tag resolved     the release rail is unreachable or empty
+#   2  hold unreadable     we could not establish whether a hold is armed
+#   3  every candidate held
 resolve_gh_tag() {
   local tags=""
   # git ls-remote is exact and carries no API rate limit. A brand-new box may
@@ -129,9 +205,32 @@ resolve_gh_tag() {
   # `sort -V`, never `sort` — see the LEXICAL SORT note above. The regex also
   # drops anything that is not a plain vMAJOR.MINOR.PATCH release tag, so a
   # `v1.0.0-rc1` or a `nightly` can never become the thing every box installs.
+  local candidates
+  candidates="$(printf '%s\n' "$tags" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V)"
+  [[ -n "$candidates" ]] || return 1
+
+  # Resolve the hold ONLY once we know a tag exists at all, so an unreachable
+  # release rail keeps reporting itself as an unreachable release rail rather
+  # than being reported as a hold problem. Two different incidents, two pages.
+  load_release_hold
+  [[ "$RELEASE_HOLD_STATE" == "ok" ]] || return 2
+
+  # Subtract the held tags, THEN take the newest of what is left — a hold on the
+  # newest tag must land the box on the previous good release, not on nothing:
+  # holding one bad cut must not read to a box as "the release rail is broken".
+  # Whole-line fixed-string match (`-vxF`), so a hold on v0.1.2 can never also
+  # hold v0.1.20. Coreutils only, no `tac` and no process substitution: this runs
+  # on a first-boot box before we have installed anything.
+  if [[ -n "$RELEASE_HOLD_LIST" ]]; then
+    candidates="$(printf '%s\n' "$candidates" \
+      | grep -vxF "$RELEASE_HOLD_LIST")" || candidates=""
+  fi
   local newest
-  newest="$(printf '%s\n' "$tags" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
-  [[ -n "$newest" ]] || return 1
+  newest="$(printf '%s\n' "$candidates" | tail -1)"
+  # Distinct from the `return 1` above: the rail is healthy and the refusal is
+  # deliberate. An operator paged for "no tag resolved" looks at GitHub; one
+  # paged for "every tag is held" looks at whoever armed the hold.
+  [[ -n "$newest" ]] || return 3
   printf '%s\n' "$newest"
 }
 
@@ -199,7 +298,14 @@ resolve_cli_target() {
       return 1
     fi
   elif [[ -e "$canary_file" ]]; then
-    target="$(resolve_gh_tag || true)"
+    # DIVE-4223: resolve_gh_tag already subtracts the hold from its candidate
+    # list, so the canary rung's hold answer arrives as its RETURN CODE. `|| true`
+    # here would flatten "hold unreadable" and "every tag held" into the generic
+    # "no tag resolved" page, which is the one thing the three codes exist to
+    # keep apart.
+    local _rgt_rc=0
+    target="$(resolve_gh_tag)" || _rgt_rc=$?
+    case "$_rgt_rc" in 2|3) return "$_rgt_rc" ;; esac
     source="canary opt-in ($canary_file) — newest released tag, ahead of the fleet pin"; rung=canary
   else
     target="$(curl -fsSL --max-time 5 "$route" 2>/dev/null | tr -d '[:space:]')" || target=""
@@ -225,6 +331,36 @@ resolve_cli_target() {
   if [[ ! "$target" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     printf 'error: 5dive install: NO STABLE CLI TAG RESOLVED — route unavailable/invalid and no usable last-known tag.\n' >&2
     return 1
+  fi
+
+  # DIVE-4223 / DIVE-4366 — THE HOLD IS CHECKED HERE, not only inside
+  # resolve_gh_tag, because since DIVE-4140 resolve_gh_tag is NOT the fleet's
+  # resolver: it answers the CANARY rung only. A customer box takes the `route`
+  # rung (the fleet pin from api.5dive.com) or `last-known`, and neither passes
+  # through a candidate list there is anything to subtract from. A hold wired
+  # only into resolve_gh_tag would therefore brake the canary boxes and leave
+  # every box the brake exists for running — a brake is only a brake if the
+  # resolver the fleet actually uses reads it.
+  #
+  # Single tags have no "next best candidate", so a held target is a REFUSAL,
+  # not a fallback: falling back to last-known would turn a hold into a silent
+  # downgrade, and the hold holds boxes BACK rather than pulling them back. The
+  # box keeps the CLI it has; a fresh install stops with nothing written. On the
+  # canary rung this is a no-op (the tag returned was already unheld) and costs
+  # no second fetch — load_release_hold is idempotent.
+  #
+  # The `override` rung is included deliberately. A local /etc/5dive/cli-version
+  # is an operator choice, but so is arming a hold against a release known to be
+  # broken, and the operator's way past it is the same documented pair the other
+  # refusals name: GH_SHA= or REPO=, both of which skip this resolver entirely.
+  load_release_hold
+  if [[ "$RELEASE_HOLD_STATE" != "ok" ]]; then
+    printf 'error: 5dive install: release hold on main is UNREADABLE — cannot confirm %s is not held.\n' "$target" >&2
+    return 2
+  fi
+  if [[ -n "$RELEASE_HOLD_LIST" ]] && printf '%s\n' "$RELEASE_HOLD_LIST" | grep -qxF "$target"; then
+    printf 'error: 5dive install: CLI target %s (%s) is HELD on main — staying put.\n' "$target" "$source" >&2
+    return 3
   fi
 
   if [[ -x "$installed_bin" ]]; then
@@ -298,11 +434,27 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   GH_PINNED_SHA=""
 elif [[ -z "${REPO:-}" ]]; then
   if [[ -z "$GH_PINNED_SHA" ]]; then
-    GH_PINNED_TAG="$(resolve_cli_target || true)"
+    GH_PINNED_TAG=""; _rct_rc=0
+    GH_PINNED_TAG="$(resolve_cli_target)" || _rct_rc=$?
     if [[ -z "$GH_PINNED_TAG" ]]; then
       # Distinct and greppable on purpose: this must never read like the ordinary
       # "pinned to <tag>" line, and must never be a silent `|| true` into main.
-      printf 'error: 5dive install: NO STABLE RELEASE TAG RESOLVED — refusing to install from ungated main.\n' >&2
+      # DIVE-4223: and the three refusals must stay DISTINGUISHABLE in the log —
+      # "we could not read the hold" is a different incident from "the release
+      # rail is empty", and one operator page that covers both tells you nothing.
+      case "$_rct_rc" in
+        2)
+          printf 'error: 5dive install: RELEASE HOLD UNREADABLE — refusing to install without knowing whether a release is held.\n' >&2
+          printf '       This is NOT "no hold is armed": we could not fetch .release-hold from main at all.\n' >&2
+          ;;
+        3)
+          printf 'error: 5dive install: RELEASE TARGET IS HELD — refusing to install a held release.\n' >&2
+          printf '       A hold is armed on main against the tag this box resolves. This is deliberate; ask whoever armed it.\n' >&2
+          ;;
+        *)
+          printf 'error: 5dive install: NO STABLE RELEASE TAG RESOLVED — refusing to install from ungated main.\n' >&2
+          ;;
+      esac
       printf '       Nothing was changed; if 5dive is already installed it keeps running the version it has.\n' >&2
       printf '       Retry later, or choose a source explicitly:\n' >&2
       printf '         GH_SHA=<40-hex commit>   pin one tree directly (rollback, CI, a PR head)\n' >&2
