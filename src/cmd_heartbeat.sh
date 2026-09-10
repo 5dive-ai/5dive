@@ -1728,7 +1728,7 @@ _hb_send_line() {
 _hb_composer_unsent() {
   local name="$1" raw line esc=$'\e'
   raw=$(sudo -u "agent-${name}" tmux capture-pane -e -p -t "agent-${name}" 2>/dev/null) || { printf ''; return 0; }
-  line=$(grep -a '❯' <<<"$raw" | tail -1)
+  line=$(grep -a '❯' <<<"$raw" | tail -1) || line=""   # no glyph on the pane = empty composer, not a fatal probe
   [[ -n "$line" ]] || { printf ''; return 0; }
   line="${line#*❯}"
   # 1) drop DIM runs (ghost text); 2) strip every remaining CSI sequence.
