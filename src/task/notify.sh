@@ -2132,6 +2132,45 @@ _task_gate_undo_window_secs() {
   printf '%s' "$secs"
 }
 
+# DIVE-4244: A DETACHED CHILD MUST HOLD NO DESCRIPTOR OF ITS CALLER'S.
+#
+# `{ ...; } >/dev/null 2>&1 &` redirects the child's OWN 0/1/2 and nothing else.
+# It cannot close what bash had ALREADY duplicated before the fork. A restorable
+# redirection on a shell-function call — `<the gate filer> >/dev/null`, the shape
+# at cmd_objective.sh:1012 — makes bash dup the caller's stdout to a descriptor
+# at or above 10 and hold that dup open for the whole length of the call. The
+# hold child forks inside that call, inherits the dup, and so keeps the WRITE end
+# of the caller's `$(...)` pipe open for the entire window. The caller is reading
+# that pipe: it blocks until the ping fires. A 120s hold therefore became 120s of
+# added latency on every command substitution that captures a gate-filing
+# command, which is how a background hold turned into a foreground wait.
+#
+# MEASURED (DIVE-4244, 2026-09-10): tests/objective_replan_unit.sh 24.1s -> 732s
+# on main, six gate-filing arms x one full window each; both full shards, 1.3s
+# apart, i.e. deterministic. It reds main's full sweep, and a red on main's tip
+# re-refuses every merged row's close and the release cut.
+#
+# So redirecting 0/1/2 is necessary and NOT sufficient. The saved dups have no
+# names to close by, and their numbers are an internal detail of bash, so they
+# are closed by ENUMERATION of the child's own table. /proc/self/fd, not $$ —
+# inside a subshell `$$` still reads the PARENT's pid, which would enumerate the
+# wrong process and leave the leak exactly as it was.
+#
+# Two descriptors are deliberately spared: 255 is bash's own handle on the
+# running script, and BASH_XTRACEFD is where a tracing harness is writing. Both
+# belong to this child, neither is a caller's pipe. Everything else above 2 is,
+# by construction, something the child was never given on purpose.
+_task_detach_inherited_fds() {
+  local _f _n
+  for _f in /proc/self/fd/*; do
+    _n="${_f##*/}"
+    [[ "$_n" =~ ^[0-9]+$ ]] || continue
+    (( _n < 3 )) && continue
+    [[ "$_n" == "255" || "$_n" == "${BASH_XTRACEFD:-}" ]] && continue
+    eval "exec ${_n}>&-" 2>/dev/null || true
+  done
+}
+
 # True iff the gate this window was opened for is STILL the live, unanswered gate.
 # Keyed on need_asked_at, not on a bare "is something pending": a withdraw inside
 # the window followed by a re-file is a DIFFERENT gate with its own window and its
@@ -2204,6 +2243,11 @@ _task_need_notify_deliver() {
   _task_gate_delivery_log ok "$ident" "hold:${_secs}s" "" \
     "phone ping HELD ${_secs}s (DIVE-4154 undo window) — the gate is live NOW on the dashboard, in task inbox and in task queue; a withdrawal inside the window pages nobody. gate_pinged_at stays NULL so the re-nag still escalates if the ping is lost"
   ( {
+      # `exec`, not a redirection on the group: a group redirection is RESTORABLE,
+      # so bash saves the very descriptors this child must not keep. exec replaces
+      # them outright and saves nothing.
+      exec 0</dev/null >/dev/null 2>&1
+      _task_detach_inherited_fds
       sleep "$_secs"
       if _task_gate_still_live "$ident" "$_asked"; then
         _task_need_notify_deliver_now "$@"
@@ -2211,7 +2255,7 @@ _task_need_notify_deliver() {
         _task_gate_delivery_log ok "$ident" "hold:withdrawn" "" \
           "undo window closed with the gate no longer live (withdrawn or answered inside ${_secs}s) — NOBODY was paged"
       fi
-    } >/dev/null 2>&1 & ) || true
+    } & ) || true
   return 0
 }
 
