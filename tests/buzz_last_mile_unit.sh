@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# TIER: nightly — 21.7s measured (CI installed-host shard 1, run 34526078130, 2026-09-10): does
+#   not fit the 300s PR core; the nightly sweep runs it (DIVE-4250).
 # DIVE-3513 unit harness for the buzz last mile (steps 5 and 6 of six).
 #
 # What this can grade WITHOUT a relay, and deliberately only that: the two

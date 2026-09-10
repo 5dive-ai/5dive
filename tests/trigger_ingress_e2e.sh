@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# TIER: nightly — 12.3s measured (CI installed-host shard 1, run 34526078130, 2026-09-10): does
+#   not fit the 300s PR core; the nightly sweep runs it (DIVE-4250).
 # DIVE-3931 acceptance harness: signed GitHub + generic webhook -> ordinary task.
 # No root, no external network, no live board. The built single-file artifact is
 # the subject, and every state write is confined to a throwaway STATE_DIR.

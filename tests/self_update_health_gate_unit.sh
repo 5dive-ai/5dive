@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# TIER: nightly — 17.2s measured (CI installed-host shard 2, run 34526078130, 2026-09-10): shard 2
+#   drew 296s of the 300s core cap, so this file is the largest line item in the shard nearest the
+#   ceiling; it does not fit the 300s PR core and the nightly sweep runs it unchanged (DIVE-4250).
 # DIVE-4068: the update path grades the ARTIFACT and never the OUTCOME.
 #
 # 0.26.1 shipped a launcher that could not start any agent (DIVE-4067). It

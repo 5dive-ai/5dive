@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# TIER: nightly — 39.1s measured (CI installed-host shard 1, run 34526078130, 2026-09-10): 31s of
+#   that 39.1s is literal `sleep` on the undo window itself, so this file is priced by the WINDOW
+#   and not by its assertions — a wall-clock cap cannot budget it, and it is the single largest
+#   line item in a core tier that went over. The nightly sweep runs it unchanged. Return it to
+#   core when the waits are event-driven rather than fixed sleeps (DIVE-4250).
 # DIVE-4154 arm D — THE PHONE-PING UNDO WINDOW.
 #
 # Measured motivation (DIVE-4150, gate_history 30d to 2026-09-09): of 193
