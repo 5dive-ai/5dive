@@ -271,7 +271,7 @@ _memory_resolve_roots() {
     fi
     if [ -n "$own" ] && [ -n "$wiki" ]; then roots="$own,$wiki"; else roots="${own}${wiki}"; fi
   fi
-  [ -n "$roots" ] || fail "$E_NOT_FOUND" "no memory stores found (looked in ~/.claude/projects/*/memory); pass --roots="
+  [ -n "$roots" ] || fail "$E_NOT_FOUND" "no memory stores found for this user (looked in ~/.claude/projects/*/memory); name whose store to read with --agent=<agent>, or point at one with --roots=<dir>"
   echo "$roots"
 }
 
@@ -1310,7 +1310,7 @@ _memory_doctor() {
     if [ -n "$own" ] && [ -n "$wiki" ]; then roots="$own,$wiki"
     else roots="${own}${wiki}"; fi
   fi
-  [ -n "$roots" ] || fail "$E_NOT_FOUND" "no memory stores found (looked in ~/.claude/projects/*/memory); pass --roots="
+  [ -n "$roots" ] || fail "$E_NOT_FOUND" "no memory stores found for this user (looked in ~/.claude/projects/*/memory); name whose store to read with --agent=<agent>, or point at one with --roots=<dir>"
   # Default code-root for stale-ref checks: the 5dive monorepo if it's here.
   if [ -z "$code_root" ]; then
     for d in /home/claude/projects/5dive "$HOME/projects/5dive"; do
