@@ -61,10 +61,11 @@ ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 not_ok(){ FAIL=$((FAIL+1)); printf 'not ok - %s\n' "$1"; }
 grade() { if eval "$2"; then ok_t "$1"; else not_ok "$1"; fi; }
 enters() { grep -cx 'Enter' "$KEYS"; }
-E=$'\e'
-P_EMPTY="${E}[39m❯ ${E}[39m\n  Opus 5 5h: 3%\n"
-P_GHOST="${E}[39m❯ ${E}[2mnext task${E}[0m\n  Opus 5 5h: 3%\n"
-P_STUCK="${E}[38;5;246m❯ ${E}[39m[Pasted text #7]irst (verify before relying)\n  Opus 5 5h: 3%\n"
+E=$'\e'; NB=$'\xc2\xa0'   # CC renders "❯" + NO-BREAK SPACE (U+00A0), exactly as live panes show it
+P_EMPTY="${E}[39m❯${NB} ${E}[39m\n  Opus 5 5h: 3%\n"
+P_GHOST="${E}[39m❯${NB} ${E}[2mnext task${E}[0m\n  Opus 5 5h: 3%\n"
+P_STUCK="${E}[38;5;246m❯${NB} ${E}[39m[Pasted text #7]irst (verify before relying)\n  Opus 5 5h: 3%\n"
+P_NBSP_ONLY="${E}[38;5;246m❯${NB}${E}[39m\n  Opus 5 5h: 3%\n"
 P_NOGLYPH="  booting...\n"
 
 # A1 — clean submit: C-u first, payload, one Enter, rc 0.
@@ -90,6 +91,11 @@ _reset; PANES=("$P_GHOST");   u1=$(_hb_composer_unsent seatx)
 _reset; PANES=("$P_STUCK");   u2=$(_hb_composer_unsent seatx)
 _reset; PANES=("$P_NOGLYPH"); u3=$(_hb_composer_unsent seatx)
 grade "A7 composer reader: ghost-only -> '' ; stuck -> the visible text ; no glyph -> ''" "[[ -z '$u1' && '$u2' == '[Pasted text #7]irst (verify before relying)' && -z '$u3' ]]"
+
+# A7b — the glyph's trailing NO-BREAK SPACE alone is an EMPTY composer. Measured live
+# 2026-09-10 15:58Z on 13 seats: an ASCII-only trim left one char on every idle seat.
+_reset; PANES=("$P_NBSP_ONLY"); u4=$(_hb_composer_unsent seatx)
+grade "A7b a composer holding only the glyph's U+00A0 reads as empty (live shape on every idle seat)" "[[ -z '$u4' ]]"
 
 # A8 — MUTATION: with the verify stubbed to always-pass, the stuck fixture returns 0 again.
 _hb_verify_submit() { return 0; }

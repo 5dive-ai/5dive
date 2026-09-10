@@ -1733,6 +1733,11 @@ _hb_composer_unsent() {
   line="${line#*❯}"
   # 1) drop DIM runs (ghost text); 2) strip every remaining CSI sequence.
   line=$(sed -E "s/${esc}\[2m[^${esc}]*(${esc}\[0m|${esc}\[22m)//g; s/${esc}\[[0-9;?]*[A-Za-z]//g" <<<"$line")
+  # The composer glyph is followed by a NO-BREAK SPACE (U+00A0, bytes C2 A0),
+  # which [[:space:]] does not match. Measured 2026-09-10 15:58Z on all 13 live
+  # seats: without this line every idle composer read as one leftover character,
+  # i.e. every wake would have failed the verify and nothing would ever be claimed.
+  line="${line//$'\xc2\xa0'/ }"
   line="${line//[$'\t\r\n']/ }"
   line=$(sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$line")
   printf '%s' "$line"
