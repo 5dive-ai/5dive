@@ -412,7 +412,9 @@ cmd_run() {
 #      stores only SHA-256 of it (gate-human-nonce-spec's rule, same reason: a
 #      stored secret is a stealable secret). The raw value exists exactly once,
 #      in the URL we print, and reading it back off this box is impossible.
-#   3. IT IS SINGLE-USE. Redeeming consumes the ticket, in one file rename that
+#   3. IT IS SINGLE-USE, and it is what CARRIES the VNC password: redemption is
+#      the only place the viewer's credential is ever emitted, so the port and the
+#      key to it have exactly one lifetime. Redeeming consumes the ticket, in one file rename that
 #      cannot interleave. A second redemption of a leaked URL gets nothing —
 #      which is the property a TTL alone can never give you.
 #   4. IT IS BOUND TO THE SESSION THAT ASKED. --bind names the dashboard session
@@ -507,6 +509,10 @@ cmd_serve() {
   _ensure_profile_dir "$dir"
 
   if (( stop )); then
+    # Revoke BEFORE killing: a ticket that survives its viewer redeems 0 onto a
+    # port with nothing behind it, which is the same customer-facing failure as a
+    # dead -timeout — a link that says yes and shows nothing.
+    _viewer_revoke_file "$dir" revoked
     _viewer_stop "$dir"
     local f; f="$(_serve_pidfile "$dir")"
     local xpid cpid; xpid=$(_kv "$f" xvfb_pid); cpid=$(_kv "$f" chrome_pid)
@@ -555,6 +561,10 @@ _viewer_stop() {
   local p
   for p in $(_kv "$f" vnc_pid) $(_kv "$f" ws_pid); do kill "$p" 2>/dev/null; done
   rm -f "$f"
+  # The VNC password outlives nothing. It is only ever meaningful while the
+  # process that was started with it is alive, so a copy left behind in the
+  # profile directory is a stored secret with no live purpose.
+  rm -f "$dir/.5dive-viewer.pw"
 }
 
 # A ticket is minted, printed ONCE, and never recoverable. The file holds the
@@ -607,10 +617,17 @@ cmd_viewer() {
   # -localhost and -once: the VNC side is reachable only from this box, and it
   # accepts exactly one client. The second connection on a leaked URL is refused
   # by x11vnc itself, not merely by our bookkeeping.
+  #
+  # -timeout IS THE TICKET'S TTL, not a constant. x11vnc -timeout n exits unless a
+  # client connects inside the first n seconds, so a fixed 30 killed the viewer
+  # half a minute into a ticket that advertises up to an hour — and redemption
+  # still consumed the ticket, leaving the customer a spent link and a dead port.
+  # The window the ticket promises and the window the VNC server honours are ONE
+  # number; two constants thirty lines apart is how they drift.
   local pwfile="$dir/.5dive-viewer.pw"
   ( umask 077; printf '%s\n' "$vncpw" > "$pwfile" )
   x11vnc -display ":$disp" -localhost -once -rfbport "$vncport" \
-         -timeout 30 -passwdfile "$pwfile" >/dev/null 2>&1 &
+         -timeout "$ttl" -passwdfile "$pwfile" >/dev/null 2>&1 &
   local vncpid=$!
   websockify "127.0.0.1:$port" "127.0.0.1:$vncport" >/dev/null 2>&1 &
   local wspid=$!
@@ -672,8 +689,24 @@ cmd_viewer_redeem() {
   local got; got=$(printf '%s' "$presented" | sha256sum | cut -d' ' -f1)
   [[ "$got" == "$hash" ]] || die "$E_PERM" "that viewer link is not valid for $site."
 
+  # THE PASSWORD IS PART OF THE ANSWER, not a second secret the relay must find.
+  # x11vnc runs with -passwdfile, and that file lives inside the 0700 seat-owned
+  # profile directory — which is precisely what DIVE-4021's isolation stops the
+  # relay from reading. Handing over a target without it is handing over a port
+  # that prompts for a password nobody has. Emitting it here is safe for exactly
+  # the reasons the ticket is: this answer is printed once, to the session the
+  # ticket was bound to, and the ticket is consumed in the same breath.
+  #
+  # Read it BEFORE consuming: a viewer whose password file is gone cannot be
+  # entered, and spending the customer's one-time link to tell them so is the
+  # worst of both.
+  local pwfile="$dir/.5dive-viewer.pw" vncpw=""
+  [[ -f "$pwfile" ]] || die "$E_UNAVAILABLE" "the viewer for $site is no longer running (its credential is gone). The ticket was NOT spent — ask the dashboard for a new viewer."
+  IFS= read -r vncpw < "$pwfile"
+  [[ -n "$vncpw" ]] || die "$E_UNAVAILABLE" "the viewer for $site has no usable credential. The ticket was NOT spent — ask the dashboard for a new viewer."
+
   _viewer_revoke_file "$dir" consumed
-  printf '127.0.0.1:%s\n' "$port"
+  printf 'target=127.0.0.1:%s\npassword=%s\n' "$port" "$vncpw"
 }
 
 _viewer_revoke_file() {

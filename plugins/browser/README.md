@@ -37,6 +37,21 @@ reaches it through a viewer that is handed out as a **one-time, expiring, sessio
 5dive browser viewer-revoke <site>                           # kill the view, keep the login
 ```
 
+A successful `viewer-redeem` prints the two things the relay needs, and prints them exactly once:
+
+```
+target=127.0.0.1:6080
+password=<the VNC credential x11vnc was started with>
+```
+
+The password is emitted **here and nowhere else**. `x11vnc` runs with `-passwdfile` inside the
+seat's `0700` profile directory — the one place the relay is deliberately unable to read — so a
+target without the password is a port that prompts for a secret nobody has. It rides the redemption
+because the redemption already has exactly the right lifetime: one use, one bound session, consumed
+in the same breath. The `-timeout` `x11vnc` is started with **is the ticket's TTL**, not a constant:
+a VNC server that gives up before its own link expires hands the customer a spent link and a dead
+port.
+
 `auth` on a display-less box starts server mode instead of dead-ending. A box that does not have
 the server-mode packages still refuses — and names which ones it lacks, rather than half-starting.
 
@@ -145,12 +160,12 @@ someone else's maintenance schedule, so six dependencies is six adapter surfaces
 
 ## Not shipped yet, and named so nobody assumes it
 
-- **SERVER mode** — a persistent Chrome on a virtual display (Xvfb) with the 5dive extension and a
-  local relay. `auth` currently needs a display and refuses without one instead of pretending.
-- **The re-auth viewer** — exposing the session through a temporary noVNC/KasmVNC URL so a person
-  can log in or clear a challenge from a phone. That URL is **credential-grade while it is open**:
-  short TTL, single use, and never written to a log, a task body or a chat message. Decide that
-  with the flow, not after.
+- **The customer-facing FLOW.** Server mode and the viewer above are built, but they ship **dark**:
+  reachable by hand on a box that has the packages, wired to no button. The dashboard tile and the
+  relay that gates on `viewer-redeem` are DIVE-4239; the provisioning that installs
+  chromium/xvfb/x11vnc/websockify is DIVE-4238; and no human has yet logged into a real site
+  through a real viewer on a managed box. Until that end-to-end arm runs, the flow is not shipped —
+  a tile that promises a login nobody has driven is the failure DIVE-3590 named.
 - **RELAY mode** — an outbound relay to Chrome on the user's own laptop. It must target a
   **dedicated profile on that desktop, never the user's default**; reaching the default discards
   the entire reason profile-per-site is the design, turning an adapter bug into their bank and

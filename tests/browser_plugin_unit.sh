@@ -380,26 +380,43 @@ t 'T7d ...and its probe marker is the one bin/browser reads' 'yes' \
 #   T10j  revoke leaves the ticket redeemable
 #   T10c  a box missing the packages half-starts instead of saying so
 #   T10k  a viewer is minted with no session binding at all
+#   T10m  x11vnc/websockify/Xvfb are started with a flag that opens the box
+#   T10n  the VNC server dies before the ticket it was minted for expires
+#   T10o  a spent ticket still tells an attacker whether a nonce was right
+#   T10p  a ticket outlives the browser it views, and redeems onto a dead port
 #
 # There is no X server on a CI runner, so Xvfb/x11vnc/websockify are FAKES on
 # PATH. They are not product hooks: liveness is still the real PID check in
 # _serve_running, and redemption is the real sha256 compare. The only override is
 # the X socket DIRECTORY, which is a path — pointing it somewhere else cannot make
 # a dead display read as live.
+#
+# AND THE FAKES RECORD THEIR ARGV. The first version of them ran `exec sleep 300`
+# and threw "$@" away, which quietly deleted a whole test surface: the property
+# this design LEADS with — nothing listens off-box — lives entirely in the flags
+# we pass these three programs, so with argv discarded, dropping -localhost, or
+# binding websockify to 0.0.0.0, or dropping -nolisten tcp changed nothing any arm
+# could see (measured: 125/0 for each). A fake that ignores argv cannot grade a
+# flag. These write "$*" to a file the T10m arms below assert on, so the flags are
+# MEASURED here and not merely unverified against the real programs.
 SBIN="$TMP/sbin"; mkdir -p "$SBIN"
+ARGV="$TMP/argv"; mkdir -p "$ARGV"
 export FIVEDIVE_BROWSER_X11_DIR="$TMP/x11"; mkdir -p "$FIVEDIVE_BROWSER_X11_DIR"
 cat > "$SBIN/Xvfb" <<XVFB
 #!/usr/bin/env bash
+printf '%s\\n' "\$*" > "$ARGV/Xvfb.argv"
 d="\${1#:}"
 : > "$TMP/x11/X\$d"
 exec sleep 300
 XVFB
-cat > "$SBIN/x11vnc" <<'VNC'
+cat > "$SBIN/x11vnc" <<VNC
 #!/usr/bin/env bash
+printf '%s\\n' "\$*" > "$ARGV/x11vnc.argv"
 exec sleep 300
 VNC
-cat > "$SBIN/websockify" <<'WS'
+cat > "$SBIN/websockify" <<WS
 #!/usr/bin/env bash
+printf '%s\\n' "\$*" > "$ARGV/websockify.argv"
 exec sleep 300
 WS
 chmod +x "$SBIN/Xvfb" "$SBIN/x11vnc" "$SBIN/websockify"
@@ -448,7 +465,20 @@ t  'T10b ...and the ticket is 0600' '600' "$(stat -c '%a' "$VDIR/.5dive-viewer.t
 # --- T10d/T10e it redeems ONCE ------------------------------------------------
 run env PATH="$SPATH" bash -c "printf '%s' '$NONCE' | '$BROWSER' viewer-redeem viewsite --nonce=- --session=sess-A"
 t  'T10d the right nonce in the right session redeems' 0 "$RC"
-tc 'T10d ...handing the relay a LOOPBACK target and nothing routable' '127.0.0.1:' "$OUT"
+tc 'T10d ...handing the relay a LOOPBACK target and nothing routable' 'target=127.0.0.1:' "$OUT"
+tn 'T10d ...never a routable one' '0.0.0.0' "$OUT"
+# x11vnc is started with -passwdfile inside the 0700 profile dir, which is the one
+# place DIVE-4021's isolation stops the relay from reading. If redemption does not
+# emit the password, the relay gets a port that prompts for a secret nobody has —
+# a viewer that provably cannot be entered, in a PR whose whole point is the login.
+REDEEMED_PW="$(sed -n 's/^password=//p' <<<"$OUT")"
+t  'T10d THE VIEWER PASSWORD IS EMITTED WITH THE TARGET, not stranded in the profile dir' \
+   'yes' "$([[ -n "$REDEEMED_PW" ]] && echo yes || echo no)"
+t  'T10d ...and it is the password x11vnc was actually started with' 'match' \
+   "$([[ "$REDEEMED_PW" == "$(cat "$VDIR/.5dive-viewer.pw" 2>/dev/null)" ]] && echo match || echo differs)"
+tc 'T10d ...which x11vnc was handed as a FILE, never in argv' '-passwdfile' "$(cat "$ARGV/x11vnc.argv")"
+tn 'T10d ...so the password itself never reaches /proc/<pid>/cmdline' \
+   "$REDEEMED_PW" "$(cat "$ARGV/x11vnc.argv")"
 run env PATH="$SPATH" bash -c "printf '%s' '$NONCE' | '$BROWSER' viewer-redeem viewsite --nonce=- --session=sess-A"
 t  'T10e A REPLAY OF THE SAME LINK IS REFUSED' 77 "$RC"
 tc 'T10e ...saying so in words a customer can act on' 'already been used' "$ERR"
@@ -502,6 +532,65 @@ t  'T10k AN UNBOUND TICKET CANNOT BE MINTED AT ALL' 64 "$RC"
 tc 'T10k ...and the escape is explicit, never implicit' '--bind=local' "$ERR"
 run env PATH="$SPATH" "$BROWSER" viewer viewsite --bind=sess-A --ttl=99999
 t  'T10k a ttl past the re-auth window is refused' 64 "$RC"
+
+# --- T10m NOTHING LISTENS OFF-BOX, measured on the argv the fakes recorded -----
+# This is the property the README and the design note LEAD with, and until the
+# fakes recorded argv it was graded by zero arms. Each assertion below is the
+# mutant it kills: drop -localhost and x11vnc answers every seat on the box;
+# bind websockify to 0.0.0.0 and the bridge is reachable from the internet; drop
+# -nolisten tcp and the X display itself is an unauthenticated remote keyboard.
+run env PATH="$SPATH" "$BROWSER" viewer viewsite --bind=sess-A --ttl=900
+t  'T10m viewer mints (fixture for the argv arms)' 0 "$RC"
+NONCE5="${OUT##*/}"
+VNC_ARGV="$(cat "$ARGV/x11vnc.argv")"; WS_ARGV="$(cat "$ARGV/websockify.argv")"; X_ARGV="$(cat "$ARGV/Xvfb.argv")"
+tc 'T10m x11vnc IS BOUND TO LOOPBACK'                 '-localhost'   "$VNC_ARGV"
+tc 'T10m ...and accepts exactly one client'           '-once'        "$VNC_ARGV"
+tc 'T10m the websocket bridge LISTENS ON 127.0.0.1'   '127.0.0.1:'   "$WS_ARGV"
+tn 'T10m ...and never on every interface'             '0.0.0.0'      "$WS_ARGV"
+tc 'T10m ...bridging to a loopback VNC port, not a routable one' '127.0.0.1:' "${WS_ARGV#* }"
+tc 'T10m THE X DISPLAY REFUSES TCP ENTIRELY'          '-nolisten tcp' "$X_ARGV"
+
+# --- T10n the VNC timeout IS the ticket TTL -----------------------------------
+# x11vnc -timeout n exits unless a client connects inside the first n seconds. A
+# hardcoded 30 meant the viewer was dead half a minute into a ticket that
+# advertises 60-3600s, while redemption still exited 0 and SPENT the ticket: the
+# customer gets a used-up link and a port with nothing behind it. The window the
+# ticket promises and the window x11vnc honours must be one number.
+tc 'T10n x11vnc is given the TICKET TTL, not a constant shorter than the minimum' \
+   '-timeout 900' "$VNC_ARGV"
+run env PATH="$SPATH" "$BROWSER" viewer viewsite --bind=sess-A --ttl=60
+tc 'T10n ...and it TRACKS the ttl rather than matching one value by luck' \
+   '-timeout 60' "$(cat "$ARGV/x11vnc.argv")"
+
+# --- T10o a spent ticket is not an oracle ------------------------------------
+# The design note claims the spent-state check runs BEFORE the nonce compare. Move
+# the compare first and every other arm still passes (measured 125/0): the only
+# thing that changes is WHICH refusal a used ticket gives to a WRONG nonce — and
+# that difference is exactly the oracle. A dead ticket must not grade guesses.
+run env PATH="$SPATH" "$BROWSER" viewer viewsite --bind=sess-A --ttl=600
+NONCE6="${OUT##*/}"
+run env PATH="$SPATH" bash -c "printf '%s' '$NONCE6' | '$BROWSER' viewer-redeem viewsite --nonce=- --session=sess-A"
+t  'T10o (fixture) the ticket is spent' 0 "$RC"
+run env PATH="$SPATH" bash -c "printf '%s' 'deadbeef' | '$BROWSER' viewer-redeem viewsite --nonce=- --session=sess-A"
+t  'T10o a WRONG nonce on a SPENT ticket is refused' 77 "$RC"
+tc 'T10o ...for being spent, so it cannot answer "was that the right nonce"' \
+   'already been used' "$ERR"
+tn 'T10o ...and never grades the guess' 'not valid for' "$ERR"
+
+# --- T10p stopping the browser takes the ticket with it -----------------------
+# A ticket that outlives its viewer redeems 0 onto a dead port — the same
+# customer-facing failure as the timeout bug, arriving by a different door.
+run env PATH="$SPATH" "$BROWSER" viewer viewsite --bind=sess-A --ttl=600
+NONCE7="${OUT##*/}"
+run env PATH="$SPATH" DISPLAY= "$BROWSER" serve viewsite --stop
+t  'T10p serve --stop exits 0' 0 "$RC"
+run env PATH="$SPATH" bash -c "printf '%s' '$NONCE7' | '$BROWSER' viewer-redeem viewsite --nonce=- --session=sess-A"
+t  'T10p A TICKET DOES NOT SURVIVE THE BROWSER IT VIEWS' 77 "$RC"
+t  'T10p ...and the VNC password is not left behind in the profile' 'no' \
+   "$([[ -f "$VDIR/.5dive-viewer.pw" ]] && echo yes || echo no)"
+t  'T10p ...while the PROFILE ITSELF survives — the durable half' 'yes' \
+   "$([[ -d "$VDIR" ]] && echo yes || echo no)"
+env PATH="$SPATH" DISPLAY= "$BROWSER" serve viewsite >/dev/null 2>&1 || true
 
 # --- T10c a box without the packages says so, and starts nothing --------------
 mkprofile barebox "$LIVE_DOM" >/dev/null
