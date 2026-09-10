@@ -174,19 +174,23 @@ else
   # iteration 2's three dependent arms grade an UNSTAGED process and pass
   # vacuously (DIVE-3986). And "non-empty" is NOT enough: in the fork-before-exec
   # window the argv reads back as the PARENT harness argv (non-empty), so poll
-  # until both argvs carry the decoy's own sentinel token, bounded ~5s.
+  # until both argvs carry the decoy's sentinel and have left nohup's own
+  # pre-exec image, bounded ~5s.
+  # nohup has its own pre-exec argv. It already contains the sentinel but is
+  # not the staged bash image, so require both the token and the final shape.
+  _staged_argv() { [[ "$1" == *"$STAGE_TOKEN"* && "$1" != nohup\ * ]]; }
   A_CMD=""; B_CMD=""
   for _try in $(seq 1 50); do
     kill -0 "$A" 2>/dev/null && kill -0 "$B" 2>/dev/null || break
     A_CMD=$(tr '\0' ' ' <"/proc/$A/cmdline" 2>/dev/null); A_CMD="${A_CMD% }"
     B_CMD=$(tr '\0' ' ' <"/proc/$B/cmdline" 2>/dev/null); B_CMD="${B_CMD% }"
-    [[ "$A_CMD" == *"$STAGE_TOKEN"* && "$B_CMD" == *"$STAGE_TOKEN"* ]] && break
+    _staged_argv "$A_CMD" && _staged_argv "$B_CMD" && break
     sleep 0.1
   done
   if ! kill -0 "$A" 2>/dev/null || ! kill -0 "$B" 2>/dev/null; then
     bad "STAGING: could not stage the decoys (A=$A B=$B) — the arms below cannot be graded"
-  elif [[ "$A_CMD" != *"$STAGE_TOKEN"* || "$B_CMD" != *"$STAGE_TOKEN"* ]]; then
-    bad "STAGING: staged argv never reached the decoy after ~5s (A_CMD='$A_CMD' B_CMD='$B_CMD') — /proc/<pid>/cmdline was EMPTY or still the parent harness argv (fork-before-exec); refusing to grade the opt-out arms on an unstaged process (DIVE-3986)"
+  elif ! _staged_argv "$A_CMD" || ! _staged_argv "$B_CMD"; then
+    bad "STAGING: staged argv never reached the decoy after ~5s (A_CMD='$A_CMD' B_CMD='$B_CMD') — /proc/<pid>/cmdline was EMPTY, still the parent harness argv (fork-before-exec), or still nohup's own pre-exec argv (DIVE-4169); refusing to grade the opt-out arms on an unstaged process (DIVE-3986)"
   else
 
     # The fact iteration 2's fixture got wrong, asserted directly.
