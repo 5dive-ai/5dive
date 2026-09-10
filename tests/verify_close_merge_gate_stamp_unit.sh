@@ -115,9 +115,36 @@ if [[ -n "$B" ]]; then
   [[ "$(field_of "$B" status)" != "done" && -n "$(field_of "$B" graded_at)" ]] \
     && ok_t "B RED: delivery_ref row is graded but remains open" \
     || bad_t "B RED: delivery_ref row is graded but remains open" "status=$(field_of "$B" status), graded_at=$(field_of "$B" graded_at)"
-  "$CLI" task ls --all 2>/dev/null | grep -F "$B" | grep -q 'graded->merge:fixturemaker' \
-    && ok_t "B: held row renders graded->merge and names the merge owner" \
-    || bad_t "B: held row renders graded->merge and names the merge owner" "render missing"
+  # DIVE-4137 CHANGED WHO THIS NAMES, deliberately, and the change is the point of
+  # that row — so this arm now asserts the NEW contract and the old expectation
+  # (`graded->merge:fixturemaker`) is the thing it must NOT print.
+  #
+  # Until DIVE-4137 the owner was DERIVED per render as `maker_agent`, which sent
+  # every hold to the maker. Measured 2026-09-09: four graded, clean, green pull
+  # requests waited that way because the maker wakes cold and has nothing to
+  # change. The owner is now DECIDED at the grade and recorded (`merge_owner`).
+  #
+  # THIS FIXTURE'S PR IS DELIBERATELY UNREADABLE — example/repo does not exist —
+  # so it exercises the disposition's fail-closed arm: an unreadable pull request
+  # is an unknown, every unknown is a hold, and a hold that a rebase cannot clear
+  # owes a LOOK from main rather than a wake-up for the maker.
+  # Herestring, not a second pipe stage: `<producer> | grep -q` under pipefail is
+  # the DIVE-4108 shape, and it reads a MATCH as a no-match whenever the producer
+  # loses the SIGPIPE race. It cannot lose it on one line — and writing it the
+  # broken way in a harness is how the shape survives its own fix.
+  _B_ROW=$("$CLI" task ls --all 2>/dev/null | grep -F "$B")
+  grep -q 'graded->merge:main' <<<"$_B_ROW" \
+    && ok_t "B: held row renders graded->merge and names MAIN — the seat that can look (DIVE-4137)" \
+    || bad_t "B: held row renders graded->merge and names MAIN — the seat that can look (DIVE-4137)" \
+             "got: $_B_ROW"
+  # THE NEGATIVE THAT MAKES THE ARM ABOVE MEAN SOMETHING: it must not merely have
+  # stopped rendering an owner. The maker is still named for the ONE hold a maker
+  # alone can clear, and that is asserted on the same row by forcing that verdict.
+  sqlite3 "$TASKS_DB" "UPDATE tasks SET merge_owner='fixturemaker', merge_hold_reason='conflicting-needs-rebase' WHERE ident='$B';"
+  _B_ROW=$("$CLI" task ls --all 2>/dev/null | grep -F "$B")
+  grep -q 'graded->merge:fixturemaker' <<<"$_B_ROW" \
+    && ok_t "B2: a conflicted branch still names the MAKER — the render reads the recorded owner" \
+    || bad_t "B2: a conflicted branch still names the MAKER — the render reads the recorded owner" "render missing"
 else
   bad_t "B: fixture row could not be created"
 fi

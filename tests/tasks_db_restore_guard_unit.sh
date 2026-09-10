@@ -275,6 +275,11 @@ out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
 # its detail, one run, `count=98` with got==want and rc=0, patch reverted — not
 # derived by adding two.
 
+# 96 -> 98 (DIVE-4137): +merge_owner/merge_hold_reason, the recorded disposition of
+# a graded pull request — WHO owes the merge and WHY, so a hold names the seat that
+# can clear it instead of the board re-deriving `maker_agent` per render. READ off
+# this tree the way this file instructs, not derived by adding two.
+
 fresh_tree
 out=$(tasks_db_init 2>&1); rc=$?
 required='delivered_at delivery_ref delivery_ref_iteration escalated_at escalated_by human_evidence park_reason parked_at'
