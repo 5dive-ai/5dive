@@ -625,29 +625,41 @@ JOURNALD
   chmod 755 "$BIN_DIR/5dive-agent-start"
   ok "5dive-agent-start → $BIN_DIR/5dive-agent-start"
 
-  # Refresh helper — plugin updates are SHA-pinned in installed_plugins.json,
-  # so a claude restart alone won't pick up new plugin versions. The daily
-  # update cron calls this script before restarting agents.
-  curl -fsSL "$REPO/5dive-refresh-plugins.sh" -o "$BIN_DIR/5dive-refresh-plugins.sh"
-  chmod 755 "$BIN_DIR/5dive-refresh-plugins.sh"
-  ok "5dive-refresh-plugins.sh → $BIN_DIR/5dive-refresh-plugins.sh"
-
-  # Fork-plugin staging (DIVE-3269) — the refresh helper above serves the CLAUDE
-  # lineage only; the codex/grok/agy/pi/opencode plugins load a staged copy under
-  # /usr/local/lib/5dive that nothing wrote until this script existed. It is
-  # fetched HERE, beside its caller, because a delivery mechanism that ships one
-  # box-half is the defect it fixes: refresh-plugins degrades to a WARN when this
-  # file is absent, so a missed install line would read as "no forks changed".
-  curl -fsSL "$REPO/5dive-stage-fork-plugins.sh" -o "$BIN_DIR/5dive-stage-fork-plugins.sh"
-  chmod 755 "$BIN_DIR/5dive-stage-fork-plugins.sh"
-  ok "5dive-stage-fork-plugins.sh → $BIN_DIR/5dive-stage-fork-plugins.sh"
-
-  # Skills backfill — brings existing agents up to the current default skill
-  # set (new defaults like openagent, DIVE-658). The daily update cron runs it
-  # right after the plugin refresh, before agents restart.
-  curl -fsSL "$REPO/5dive-refresh-skills.sh" -o "$BIN_DIR/5dive-refresh-skills.sh"
-  chmod 755 "$BIN_DIR/5dive-refresh-skills.sh"
-  ok "5dive-refresh-skills.sh → $BIN_DIR/5dive-refresh-skills.sh"
+  # >>> DIVE-4194 box-side scripts
+  # The helper scripts below used to be three hand-written curl/chmod/ok blocks
+  # right here, and this file was their ONLY writer. The control plane's nightly
+  # pass EXECUTED two of them and replaced neither, so a merged one-line fix to a
+  # helper reached zero existing boxes (measured DIVE-4130). They are enumerated
+  # from host-scripts.manifest now, and 5dive-host-updates.sh reads THAT SAME
+  # FILE out of the release tag — so a script added to the manifest reaches both
+  # the installer and the fleet's nightly, and a script added to neither is
+  # visible as a diff to one list rather than as a missing line in one of two.
+  #
+  # Add a box-side script by adding its name to host-scripts.manifest.
+  # tests/install_box_scripts_manifest_unit.sh refuses a $BIN_DIR write here that
+  # the manifest does not name.
+  local _hs_manifest _hs_list _hs_name
+  _hs_manifest="$(curl -fsSL "$REPO/host-scripts.manifest" 2>/dev/null || true)"
+  # An entry becomes an install destination under $BIN_DIR as root: reject a
+  # slash, a leading dot or anything outside [A-Za-z0-9._-] rather than sanitise
+  # it. Comments and blank lines are dropped; leading/trailing space is trimmed,
+  # never interior space (that would turn "two words" into a passing name).
+  _hs_list="$(printf '%s\n' "$_hs_manifest" \
+              | sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+              | grep -E '^[A-Za-z0-9][A-Za-z0-9._-]*$' || true)"
+  if [[ -z "$_hs_list" ]]; then
+    # Only reachable from a pin that predates the manifest. Named, not silent:
+    # a box-side script added since that pin is NOT installed by this run.
+    echo "  ! host-scripts.manifest unreadable at this pin — falling back to the pre-DIVE-4194 list; a box-side script added since that pin is NOT installed by this run" >&2
+    _hs_list=$'5dive-refresh-plugins.sh\n5dive-stage-fork-plugins.sh\n5dive-refresh-skills.sh'
+  fi
+  while IFS= read -r _hs_name; do
+    [[ -n "$_hs_name" ]] || continue
+    curl -fsSL "$REPO/$_hs_name" -o "$BIN_DIR/$_hs_name"
+    chmod 755 "$BIN_DIR/$_hs_name"
+    ok "$_hs_name → $BIN_DIR/$_hs_name"
+  done <<< "$_hs_list"
+  # <<< DIVE-4194 box-side scripts
 
   curl -fsSL "$REPO/systemd/5dive-agent%40.service" -o "$SYSTEMD_DIR/5dive-agent@.service"
   ok "systemd template installed"

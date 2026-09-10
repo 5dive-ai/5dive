@@ -1,0 +1,42 @@
+# BOX-SIDE SCRIPTS — one basename per line, installed to /usr/local/bin.
+#
+# THIS FILE IS THE ONE LIST. install.sh installs every name here on an install or
+# an --upgrade, and the control plane's nightly pass
+# (5dive-api scripts/control-plane/5dive-host-updates.sh) fetches this same file
+# out of the release tag and reconciles each name against the tag's bytes BEFORE
+# it executes them.
+#
+# WHY (DIVE-4194): the nightly used to install exactly two files from the tag —
+# /usr/local/bin/5dive and /usr/local/bin/5dive-agent-start — and then EXECUTE
+# the helpers below without ever replacing them. install.sh was their only
+# writer, so a merged one-line fix to a helper reached ZERO existing boxes; each
+# box ran its install-day copy, nightly, forever. Measured on DIVE-4130.
+#
+# So: adding a box-side script means adding it HERE. A name added to install.sh
+# alone is a script the fleet never updates again — that is the whole defect.
+#
+# NOT in this list, on purpose:
+#   5dive              built by build.sh, checksum- and version-gated, and half
+#                      of DIVE-4080's rollback pair — the nightly installs it
+#                      through its own version decision.
+#   5dive-agent-start  the other half of that rollback pair. The nightly captures
+#                      its pre-update bytes before replacing it; a second writer
+#                      running earlier in the pass would make the snapshot record
+#                      the NEW bytes as the old ones.
+
+# Plugin updates are SHA-pinned in installed_plugins.json, so a claude restart
+# alone won't pick up new plugin versions. The nightly calls this before
+# restarting agents.
+5dive-refresh-plugins.sh
+
+# Fork-plugin staging (DIVE-3269) — the refresh helper above serves the CLAUDE
+# lineage only; the codex/grok/agy/pi/opencode plugins load a staged copy under
+# /usr/local/lib/5dive that nothing wrote until this script existed.
+# refresh-plugins degrades to a WARN when it is absent, so a missing install
+# reads as "no forks changed".
+5dive-stage-fork-plugins.sh
+
+# Skills backfill — brings existing agents up to the current default skill set
+# (DIVE-658). The nightly runs it right after the plugin refresh, before agents
+# restart. This is the file DIVE-4130's fix lives in.
+5dive-refresh-skills.sh
