@@ -135,6 +135,72 @@ resolve_gh_tag() {
   printf '%s\n' "$newest"
 }
 
+# >>> DIVE-4140 stable CLI target
+# Customer boxes follow the promoted fleet tag, not the newest release merely
+# because it exists. Resolution order is deliberately explicit:
+#   local override > canary opt-in > fleet stable route > last known stable.
+# A failed/invalid route NEVER means "latest". On an existing box the running
+# version is the floor, so stale control-plane state cannot cause a downgrade;
+# FIVE_ALLOW_DOWNGRADE=1 remains the deliberate rollback escape hatch.
+resolve_cli_target() {
+  local override_file="${CLI_VERSION_OVERRIDE_FILE:-/etc/5dive/cli-version}"
+  local canary_file="${CLI_CANARY_FILE:-/etc/5dive/cli-canary}"
+  local known_file="${CLI_VERSION_KNOWN_FILE:-/var/lib/5dive/cli-version.last-known}"
+  local route="${CLI_VERSION_URL:-https://api.5dive.com/cli-version}"
+  local installed_bin="${CLI_INSTALLED_BIN:-/usr/local/bin/5dive}"
+  local target="" source="" floor=""
+
+  if [[ -e "$override_file" ]]; then
+    target="$(tr -d '[:space:]' < "$override_file" 2>/dev/null)"
+    source="local override $override_file"
+    if [[ ! "$target" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      printf 'error: 5dive install: invalid CLI tag in %s (expected vMAJOR.MINOR.PATCH).\n' "$override_file" >&2
+      return 1
+    fi
+  elif [[ -e "$canary_file" ]]; then
+    target="$(resolve_gh_tag || true)"
+    source="canary newest release"
+  else
+    target="$(curl -fsSL --max-time 5 "$route" 2>/dev/null | tr -d '[:space:]')" || target=""
+    if [[ "$target" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      source="fleet stable route $route"
+      if mkdir -p "$(dirname "$known_file")" 2>/dev/null; then
+        local known_tmp="${known_file}.tmp.$$"
+        if printf '%s\n' "$target" > "$known_tmp" 2>/dev/null; then
+          chmod 0644 "$known_tmp" 2>/dev/null || true
+          mv -f "$known_tmp" "$known_file" 2>/dev/null || rm -f "$known_tmp"
+        fi
+      fi
+    else
+      if [[ -r "$known_file" ]]; then
+        target="$(tr -d '[:space:]' < "$known_file" 2>/dev/null)"
+      else
+        target=""
+      fi
+      source="last known stable $known_file"
+    fi
+  fi
+
+  if [[ ! "$target" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    printf 'error: 5dive install: NO STABLE CLI TAG RESOLVED — route unavailable/invalid and no usable last-known tag.\n' >&2
+    return 1
+  fi
+
+  if [[ -x "$installed_bin" ]]; then
+    floor="$($installed_bin --version 2>/dev/null | awk 'NR==1 {print $2}')" || floor=""
+  fi
+  if [[ "${FIVE_ALLOW_DOWNGRADE:-0}" != 1 && "$floor" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    local candidate="${target#v}"
+    if [[ "$candidate" != "$floor" && "$(printf '%s\n%s\n' "$candidate" "$floor" | sort -V | head -1)" == "$candidate" ]]; then
+      printf 'error: 5dive install: stable target %s from %s is below installed floor %s — staying put.\n' "$target" "$source" "$floor" >&2
+      return 1
+    fi
+  fi
+
+  printf '%s\n' "$target"
+}
+# <<< DIVE-4140 stable CLI target
+
 # Commit sha for tag $1 on stdout, or return 1. Same three-rung ladder.
 resolve_gh_sha() {
   local tag="$1" sha="" out=""
@@ -175,11 +241,11 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   GH_PINNED_SHA=""
 elif [[ -z "${REPO:-}" ]]; then
   if [[ -z "$GH_PINNED_SHA" ]]; then
-    GH_PINNED_TAG="$(resolve_gh_tag || true)"
+    GH_PINNED_TAG="$(resolve_cli_target || true)"
     if [[ -z "$GH_PINNED_TAG" ]]; then
       # Distinct and greppable on purpose: this must never read like the ordinary
       # "pinned to <tag>" line, and must never be a silent `|| true` into main.
-      printf 'error: 5dive install: NO RELEASE TAG RESOLVED — refusing to install from ungated main.\n' >&2
+      printf 'error: 5dive install: NO STABLE RELEASE TAG RESOLVED — refusing to install from ungated main.\n' >&2
       printf '       Nothing was changed; if 5dive is already installed it keeps running the version it has.\n' >&2
       printf '       Retry later, or choose a source explicitly:\n' >&2
       printf '         GH_SHA=<40-hex commit>   pin one tree directly (rollback, CI, a PR head)\n' >&2
