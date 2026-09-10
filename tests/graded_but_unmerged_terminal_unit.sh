@@ -291,8 +291,18 @@ grep -q "graded->merge:${MAKER}" <<<"$render2" \
 # The wrapper's discrimination control: SAME actor and SAME post-reject row shape as
 # E1, differing only in which clock is newer. Without this, E1's wrapper arm could be
 # green because the clause never speaks to a maker at all.
-grep -q "GRADED AND WAITING" <<<"$(_hb_loop_terminal_clause "$MAKER" "$R2" "DIVE-$R2")" \
-  && ok_t "E2/CONTROL: and the wrapper DOES still say TERMINAL here — E1's silence is the clock, not the seat" \
+# DIVE-4220 WIDENED THE MATCH, AND ONLY THE MATCH. What this arm grades is
+# SPEECH vs SILENCE — "E1's silence is the clock, not the seat" — and that is
+# unchanged. The clause now has two variants on a graded-and-waiting row: the
+# stand-down text for a seat that owes nothing, and a "the merge is yours" text
+# for the seat the disposition named as merge owner. In THIS fixture the maker is
+# also the merge owner (no merge_owner recorded, so the board's expression falls
+# back to maker_agent), so it is the second variant that speaks here. Matching
+# either is the same discrimination this arm always made; matching one string was
+# incidental to it. The two texts are told apart, on the same row, by arms 5 and 6
+# of tests/heartbeat_graded_merge_dispatch_unit.sh, which is where that belongs.
+grep -qE "GRADED AND WAITING|GRADED AND THE MERGE IS YOURS" <<<"$(_hb_loop_terminal_clause "$MAKER" "$R2" "DIVE-$R2")" \
+  && ok_t "E2/CONTROL: and the wrapper DOES still speak on this row — E1's silence is the clock, not the seat" \
   || bad_t "E2/CONTROL: wrapper terminal on the older-reject row" "E1's wrapper arm cannot distinguish anything"
 
 # E3/THE TIE, which is why this conjunct is `<` and not the `<=` the row proposed.
