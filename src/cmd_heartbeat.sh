@@ -1984,8 +1984,16 @@ _hb_ident() {
 #   * WHERE status='todo' AND kind='standard' — never stomps a row something else
 #     already moved between the wake and this stamp, and never touches a
 #     recurring TEMPLATE (starting one silently retires it, DIVE-2055/2059);
-#   * started_at=COALESCE(started_at, ...) — same idempotence as `task start`, so
-#     an agent that DOES run `task start` afterwards is a no-op, not a re-clock.
+#   * started_at=datetime('now') — a claim is only ever made from `todo`, and a
+#     todo row has NO live attempt, so the clock is the claim's, not an older one's.
+#     DIVE-4253: it used to be COALESCE(started_at, now), which kept the started_at
+#     a gate-answered row carried back from its previous attempt (`task need` ->
+#     blocked -> answer -> todo clears nothing). The next claim then inherited an
+#     hours-old clock and _hb_reclaim reaped it on its FIRST tick — measured
+#     2026-09-10: DIVE-4218 claimed 22:30:21Z, reaped 22:35:09Z; DIVE-4214 gate
+#     answered 22:28:11Z, reaped 22:30:13Z. One wasted attempt per gated row.
+#     `task start` on an already-in_progress row stays a no-op (it COALESCEs on
+#     in_progress only), so the DIVE-2244 idempotence arm still holds.
 #
 # Returns nonzero when the claim did not land, so the caller can say so out loud
 # rather than logging a claim it never made. Never exits: the agent is already
@@ -1998,7 +2006,7 @@ _hb_claim_task() {
   # blindness this column exists to remove. Seeded from started_at too, so a row
   # already claimed when this ships keeps its real start.
   db "UPDATE tasks SET status='in_progress',
-        started_at=COALESCE(started_at, datetime('now')),
+        started_at=datetime('now'),
         first_started_at=COALESCE(first_started_at, started_at, datetime('now')),
         updated_at=datetime('now')
       WHERE id=${id} AND status='todo' AND kind='standard';" 2>/dev/null || return 1
@@ -2625,7 +2633,10 @@ _hb_reclaim() {
         #
         # (2) started_at SURVIVED THE PAUSE, and every path back to `todo`
         # COALESCEs it: cmd_task_unblock sets status only, cmd_task_start is
-        # `started_at=COALESCE(started_at, datetime('now'))`. So an unblocked row
+        # `started_at=COALESCE(started_at, datetime('now'))`. (DIVE-4253 later made
+        # the dispatcher claim and `task start` stamp a FRESH clock on any start
+        # from todo, so this clear is now belt-and-braces, not the only defence;
+        # it stays — a pause that hands back a stale clock is still wrong.) So an unblocked row
         # re-entered in_progress carrying a timestamp from hours earlier,
         # `age_min >= budget` was true immediately, and it was reaped on the
         # FIRST tick after the unblock — it never got its ${budget} minutes.

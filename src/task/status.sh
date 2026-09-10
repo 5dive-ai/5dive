@@ -2185,7 +2185,13 @@ _task_start_preflight() {
 # the nudge path may touch it. Seeded from started_at as well as now(), so a row
 # already in flight when this ships records its real start rather than the moment
 # of its next re-claim. See src/lib/tasks_db.sh for the full rationale.
-cmd_task_start()  { _task_status_cmd in_progress ", started_at=COALESCE(started_at, datetime('now')), first_started_at=COALESCE(first_started_at, started_at, datetime('now'))" start "$@"; }
+# DIVE-4253: from `todo` a start is a NEW attempt, so it gets a fresh clock; only an
+# already-in_progress row keeps its started_at (the DIVE-2244 idempotence: an agent
+# that runs `task start` after the dispatcher claimed for it must not re-clock).
+# The CASE reads the row's PRE-update status, which is what SQLite's SET does.
+# Pre-fix this COALESCEd unconditionally, so a row coming back from a gate kept
+# an hours-old started_at and the reaper took it on its next tick.
+cmd_task_start()  { _task_status_cmd in_progress ", started_at=CASE WHEN status='in_progress' THEN COALESCE(started_at, datetime('now')) ELSE datetime('now') END, first_started_at=COALESCE(first_started_at, started_at, datetime('now'))" start "$@"; }
 # DIVE-2477: COALESCE, not a bare stamp — FIRST close wins. These wrote
 # done_at=datetime('now') unconditionally, so any second close silently moved the
 # original close timestamp forward: measured on a fixture, a row closed at T then

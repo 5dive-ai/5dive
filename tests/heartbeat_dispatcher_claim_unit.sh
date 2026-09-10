@@ -198,6 +198,41 @@ _hb_claim_task dev "$T4" && bad_t "claim refuses a recurring TEMPLATE (DIVE-2055
 [[ "$(row "$T4")" == "todo|NULL" ]] && ok_t "refused claim left the template firing (still todo)" \
                                     || bad_t "refused claim left the template firing" "got $(row "$T4")"
 
+# --- 3b) DIVE-4253: a claim from todo RE-CLOCKS — the gate-return shape -------
+# A row that was in_progress, went blocked on a gate and came back to todo on the
+# answer still carries its previous attempt's started_at (`task need`, `answer`
+# and `unblock` clear nothing). Pre-fix the claim COALESCEd it, so the reaper's
+# very next tick read `age_min >= budget` and reclaimed a row claimed minutes
+# earlier — measured 2026-09-10: DIVE-4218 claimed 22:30:21Z, reaped 22:35:09Z;
+# DIVE-4214 gate answered 22:28:11Z, reaped 22:30:13Z. One wasted attempt per
+# gated row. first_started_at is the durable history (DIVE-3251) and must NOT move.
+T5=$(mk "came back from a gate")
+db "UPDATE tasks SET started_at=datetime('now','-200 minutes'), first_started_at=datetime('now','-200 minutes') WHERE id=${T5};"
+T5_FIRST=$(db "SELECT first_started_at FROM tasks WHERE id=${T5};")
+_hb_claim_task dev "$T5" >/dev/null 2>&1
+T5_AGE=$(db "SELECT CAST((julianday('now') - julianday(started_at)) * 1440 AS INTEGER) FROM tasks WHERE id=${T5};")
+[[ "$(row "$T5")" == in_progress\|* ]] && (( ${T5_AGE:-999} < 2 )) \
+  && ok_t "[4253] a claim from todo stamps a FRESH started_at (stale clock was 200m old, now ${T5_AGE}m)" \
+  || bad_t "[4253] a claim from todo stamps a FRESH started_at" "row=$(row "$T5") age_min=${T5_AGE:-?}"
+[[ "$(db "SELECT first_started_at FROM tasks WHERE id=${T5};")" == "$T5_FIRST" ]] \
+  && ok_t "[4253] first_started_at is history and does not move on re-claim" \
+  || bad_t "[4253] first_started_at must not move" "was $T5_FIRST now $(db "SELECT first_started_at FROM tasks WHERE id=${T5};")"
+# The consequence that matters: the reaper's next tick does NOT take it back.
+# Same budget as arm 5 (everyMin 30 => 90m); a fresh clock is far under it.
+read -r T5_RC _ < <(_hb_reclaim dev 30)
+[[ "$(row "$T5")" == in_progress\|* ]] && (( ${T5_RC:-0} == 0 )) \
+  && ok_t "[4253] the re-claimed row survives the reaper's next tick (gets its full budget window)" \
+  || bad_t "[4253] re-claimed row must survive the next reap" "row=$(row "$T5") reclaimed=${T5_RC:-?}"
+# Same shape through the agent's own verb: `task start` from todo is a new attempt
+# (arm 4 above holds the other half — on an in_progress row it is still a no-op).
+T6=$(mk "came back from a gate, started by hand")
+db "UPDATE tasks SET started_at=datetime('now','-200 minutes'), first_started_at=datetime('now','-200 minutes') WHERE id=${T6};"
+cmd_task_start "$T6" >/dev/null 2>&1
+T6_AGE=$(db "SELECT CAST((julianday('now') - julianday(started_at)) * 1440 AS INTEGER) FROM tasks WHERE id=${T6};")
+[[ "$(row "$T6")" == in_progress\|* ]] && (( ${T6_AGE:-999} < 2 )) \
+  && ok_t "[4253] 'task start' from todo also stamps a FRESH started_at" \
+  || bad_t "[4253] 'task start' from todo stamps a fresh started_at" "row=$(row "$T6") age_min=${T6_AGE:-?}"
+
 # --- 5) End-to-end reaper, reached ONLY via the dispatcher claim -------------
 # This is the assertion the ticket asked to mutation-grade. Note what is NOT
 # done: the in_progress row is never INSERTed. It is produced by running the
