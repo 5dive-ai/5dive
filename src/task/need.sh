@@ -2361,15 +2361,81 @@ cmd_task_need() {
           _floor_term=$(_gate_tier2_floor_term "$ttl_title" 2>/dev/null) || _floor_term="" ;;
       esac
       _floor_prov="axis=${_floor_axis}${_floor_term:+;term=${_floor_term}}"
+      # DIVE-4175 arm C: THE KEYWORD FLOOR NO LONGER PROMOTES THE TIER.
+      #
+      # `_floor_axis` is still computed and still stamped into floor_provenance —
+      # the measurement continues, and every other consumer of
+      # `_gate_tier2_floor_hit` (cmd_goal.sh's risk gating, cmd_objective.sh, the
+      # curation/eng-ship/manual re-tests below) is untouched. What is deleted is
+      # the one line that turned a SUBSTRING OF PROSE into a hard human gate.
+      #
+      # Measured over the 30 days to 2026-09-09 on `gate_history`: `term=publish`
+      # alone promoted 27 gates to tier 2 and lodar answered ZERO of them. The
+      # class of defect is the substring match — vocabulary read where category
+      # was meant — not the particular term list.
+      #
+      # THE HUMAN HALF IS NOT LOOSENED, and this is the constraint ops attached to
+      # the decision (2026-09-09): the reserved classes stay reachable, by
+      # DECLARATION rather than by guess. Three arms carry it, all still in force:
+      #   1. `--needs=<human capability>` immediately below still sets tier=2 —
+      #      the filer STATING what the ask consumes (DIVE-2241).
+      #   2. Floor B — `task answer` refuses approval/secret/manual from an
+      #      `agent-*` unix identity (DIVE-394/916/1182, pinned by DIVE-2004).
+      #      No constitution edit and no change here reaches it.
+      #   3. `type == secret` is floored above, before this branch.
+      # So "spend, secrets and destructive stay human-only" survives; only the
+      # TRIGGER moves from scanning the filer's prose to the filer declaring it.
+      #
+      # COUPLED TO ARM E (DIVE-4176), and that is why C must not land first. The
+      # `title-fallback` arm was olivia's deliberate fail-closed cover for an ask
+      # that states nothing of its own. Removing the promoter removes that cover,
+      # and arm E's ask-refusal is what replaces it: an ask too thin to state its
+      # own request is refused at filing time rather than silently floored on the
+      # ticket title.
       case "$_floor_axis" in
-        ask) tier=2; tier_floored=1 ;;
-        title-fallback)
-          tier=2; tier_floored=1
-          warn "gate floored on the TITLE because the ask states nothing of its own ('${ask}'). A self-contained ask is the standing rule; the floor fails closed rather than trust a filing whose only statement of the request is the ticket title."
+        ask|title-fallback)
+          # THE LINT (arm C's second half), and it is a WARNING, not a refusal.
+          # Sized before building: 16 gates in the 30-day window carry a floor
+          # term in the ask, 15 of them declare no capability — and reading all
+          # 15 individually, ZERO ask for a destructive/spend/secret action.
+          # They are asks that mention what a change PREVENTS ("stops deleting a
+          # churned payer's box"), report a past act, or describe a report. A
+          # refusal would therefore have blocked 15 legitimate filings a month
+          # for no true positive, and would have reproduced arm C's own defect
+          # one layer up — the same substring match, with a louder consequence,
+          # still penalising the precise filer over the vague one.
+          #
+          # As a warning it is strictly better than today for that same
+          # population: those 15 used to become false pages and now do not, and
+          # the filer who genuinely IS asking for a reserved action is told the
+          # one thing that routes it. Promote it to a refusal only on evidence of
+          # a real undeclared destructive ask reaching a seat.
+          # LEAD-ROUTE, do not fall through to the human. MEASURED on the corpus
+          # while building this arm, and it is the correction to the arm as
+          # specified: the three shipped downgrade classes — curation (DIVE-1381),
+          # internal-ops (DIVE-1480/1481/1487) and the declared-discussion appeal
+          # (DIVE-2089) — are all guarded by `tier_floored == 1`. They exist ONLY
+          # to catch this floor over-firing, and what they actually do is set a
+          # LEAD ROUTE. Deleting the promotion without this line makes all three
+          # unreachable, and the gate then resolves to no reviewer at all: on
+          # tests/gate_internal_ops_floor_unit.sh's repro arm the board-wipe
+          # decision went routed_reviewer 'main' -> '' and HUMAN_PINGED 0 -> 1.
+          # That is a page ADDED, on the very axis this row exists to reduce.
+          #
+          # So the floor's replacement is not "nothing", it is the route the
+          # carve-outs were reaching for, applied to the whole class instead of to
+          # three hand-carved subsets: a floor-term ask with no declared capability
+          # goes to a SEAT. It reuses the shipped title-axis mechanism (DIVE-2224)
+          # verbatim — same flag, same _routable backstop, same stamp — so nothing
+          # new has to be trusted.
+          _floored_by_title=1; _ft_title="$ttl_title"
+          if [[ -z "$needs" ]]; then
+            warn "the ask names a term from a human-reserved class ('${_floor_term:-?}') but declares no capability, so this gate is NOT routed to the paired human. Wording alone no longer promotes a gate (DIVE-4175). If the ask really is asking to spend, to hand over a secret, or to destroy something, re-file with --needs=${_GATE_HUMAN_CAPABILITIES%% *} (or the capability that fits) — that is what reaches a person."
+          fi
           ;;
         title)
-          # Not floored. The reviewer is told WHY in one line so 'this ticket is
-          # about deletion' is a fact they hold, and escalating is one step.
+          # Unchanged by arm C: this arm never promoted the tier. It lead-routes
+          # and tells the reviewer why, which costs a seat's read, not a page.
           _floored_by_title=1; _ft_title="$ttl_title"
           warn "gate NOT floored: the tier-2 category term is in the TASK TITLE, not in the ask (DIVE-2224 answer A). Routed to the lead, stamped floored_by=title — escalate it if the ask really is asking for that."
           ;;
@@ -4089,7 +4155,7 @@ THE TEST, and it is a diagnostic and not a style note: if you cannot write the a
         db "UPDATE tasks SET gate_urgent=${urgent} WHERE id=${id};" 2>/dev/null || true
         TASK_GATE_FILER="$actor" TASK_GATE_ROUTE_TO="$_reviewer" TASK_GATE_ROUTE_ROLE="$_rrole" \
         TASK_GATE_ROUTE_URGENT="$urgent" \
-        TASK_GATE_FLOORED_BY="$([[ "$_floored_by_title" == "1" ]] && printf 'title' || printf '')" \
+        TASK_GATE_FLOORED_BY="$([[ "$_floored_by_title" == "1" ]] && printf '%s' "${_floor_axis}" || printf '')" \
           task_need_notify "$ident" "$type" "$ask" "$options" "$recommend" || _nrc=$?
         # Never print a bare "routed to X" on an unobserved send again. The claim
         # is exactly what the delivery state supports: pinged, not-yet, or NOT.
@@ -4128,7 +4194,7 @@ THE TEST, and it is a diagnostic and not a style note: if you cannot write the a
         local _fbt="" _fbt_term=""
         if [[ "$_floored_by_title" == "1" ]]; then
           _fbt_term=$(_gate_tier2_floor_term "$_ft_title" 2>/dev/null) || _fbt_term=""
-          _fbt=" [floored_by=title: the T2 category floor matched '${_fbt_term}' in the TASK TITLE, not in the ask — escalate to the human if the ask really is asking for that]"
+          _fbt=" [floored_by=${_floor_axis}: the T2 category floor matched '${_fbt_term}' in the ${_floor_axis} — escalate to the human if the ask really is asking for that]"
         fi
         ok "$ident routed to $_reviewer for ${_rrole} ($type, tier $tier)${_rnote}${_fbt}${_rsig} [${_rwhy}] — $ask" \
            '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), routed_to:$rv, route_basis:$rb, route_trigger:$rt, require_sig_seat:(($cs|select(length>0)) // null), delivery:$ds, notified:($ds=="delivered"), ask:$ak, recommend:(($rc|select(length>0)) // null)}' \

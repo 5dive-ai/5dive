@@ -136,9 +136,16 @@ seed DIVE-9002 'ordinary title'
 # --- 3. axis=ask + term — the floor fired on the ask ----------------------------
 seed DIVE-9003 'ordinary title'
 ( cmd_task_need DIVE-9003 --type=decision --ask="approve the spend on a bigger volume" --options="A|B" --recommend=A >/dev/null 2>&1 )
-[[ "$(prov DIVE-9003)" == "axis=ask;term=spend" && "$(tier_of DIVE-9003)" == "2" ]] \
-  && ok_t 'a floored ask records the axis AND the term that fired' \
-  || bad_t 'axis=ask must carry the term' "got [$(prov DIVE-9003)] tier=$(tier_of DIVE-9003)"
+# DIVE-4175 arm C: the axis and term are still RECORDED — the measurement is the
+# whole reason this column exists — but they no longer promote the tier. The pair
+# below is the liveness check: provenance present, tier unchanged. If the tier
+# ever reads 2 again the promoter has been reinstated.
+[[ "$(prov DIVE-9003)" == "axis=ask;term=spend" ]] \
+  && ok_t 'a floor-term ask still records the axis AND the term that fired' \
+  || bad_t 'axis=ask must carry the term' "got [$(prov DIVE-9003)]"
+[[ "$(tier_of DIVE-9003)" == "1" ]] \
+  && ok_t 'liveness pair: the ask-axis term does NOT promote the tier (DIVE-4175 arm C)' \
+  || bad_t 'ask-axis term must not floor the gate' "tier=$(tier_of DIVE-9003) — the keyword promoter is back"
 
 # --- 4. axis=title — floored on nothing, routed by kind ------------------------
 # DIVE-2224: a category term in the TITLE with a substantive ask does NOT floor.
@@ -156,9 +163,17 @@ seed DIVE-9004 'delete the old customer records table'
 # --- 5. axis=title-fallback — the ask states nothing of its own -----------------
 seed DIVE-9005 'delete the old customer records table'
 ( cmd_task_need DIVE-9005 --type=decision --ask="?" --options="A|B" --recommend=A >/dev/null 2>&1 )
-[[ "$(prov DIVE-9005)" == "axis=title-fallback;term=delete" && "$(tier_of DIVE-9005)" == "2" ]] \
-  && ok_t 'an insubstantial ask floors on the title and records title-fallback' \
-  || bad_t 'title-fallback must be recorded and must floor' "got [$(prov DIVE-9005)] tier=$(tier_of DIVE-9005)"
+# DIVE-4175 arm C: title-fallback is still CLASSIFIED and recorded, and no longer
+# floors. This arm was olivia's fail-closed cover for an ask that states nothing of
+# its own; arm E (DIVE-4176) replaces it by REFUSING such an ask at filing time,
+# which is why C must not land before E. Until E lands, an insubstantial ask with a
+# destructive title is the accepted, named residual of this change.
+[[ "$(prov DIVE-9005)" == "axis=title-fallback;term=delete" ]] \
+  && ok_t 'an insubstantial ask is still classified title-fallback and records the term' \
+  || bad_t 'title-fallback must be recorded' "got [$(prov DIVE-9005)]"
+[[ "$(tier_of DIVE-9005)" == "1" ]] \
+  && ok_t 'liveness pair: title-fallback no longer floors — arm E owns the empty ask now' \
+  || bad_t 'title-fallback must not floor' "tier=$(tier_of DIVE-9005) — the keyword promoter is back"
 
 # --- 6. axis=none — the floor RAN and did not fire ------------------------------
 seed DIVE-9006 'panel rendering library choice'

@@ -199,18 +199,21 @@ _tier=$(db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='DIVE-901';")
 db "INSERT INTO tasks (ident, title, status, created_by) VALUES ('DIVE-902','t','todo','main');"
 cmd_task_need DIVE-902 --type=decision --ask="approve the press release copy" \
   --options="A|B" --recommend="A" >/dev/null 2>&1
-_tier=$(db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='DIVE-902';")
-[[ "$_tier" == "2" ]] \
-  && ok_t "T8 e2e: a decision gate whose ASK says 'press release' IS still floored to tier 2" \
-  || bad_t "T8 e2e press release still floored" "got tier '$_tier'"
+# DIVE-4175 arm C: the tier is no longer the observable — the promoter is gone. What
+# T8 is protecting is that the per-term word boundary did not FAIL OPEN, and that is
+# now read off floor_provenance, which still records the axis and the term.
+_prov=$(db "SELECT COALESCE(floor_provenance,'') FROM tasks WHERE ident='DIVE-902';")
+[[ "$_prov" == axis=ask* ]] \
+  && ok_t "T8 e2e: a decision gate whose ASK says 'press release' still MATCHES the floor (prov $_prov)" \
+  || bad_t "T8 e2e press release still matches" "got prov '$_prov' — the boundary fix failed open"
 
 db "INSERT INTO tasks (ident, title, status, created_by) VALUES ('DIVE-903','t','todo','main');"
 cmd_task_need DIVE-903 --type=decision --ask="approve \$500 for ads" \
   --options="A|B" --recommend="A" >/dev/null 2>&1
-_tier=$(db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='DIVE-903';")
-[[ "$_tier" == "2" ]] \
-  && ok_t "T8 e2e: a money ask is STILL floored to tier 2 (the fail-open a per-term \\b would open)" \
-  || bad_t "T8 e2e money still floored" "got tier '$_tier' — money stopped flooring"
+_prov=$(db "SELECT COALESCE(floor_provenance,'') FROM tasks WHERE ident='DIVE-903';")
+[[ "$_prov" == axis=ask* ]] \
+  && ok_t "T8 e2e: a money ask STILL matches the floor (the fail-open a per-term \\b would open)" \
+  || bad_t "T8 e2e money still matches" "got prov '$_prov' — money stopped matching"
 
 echo "-----"
 printf 'gate_floor_word_boundary_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
