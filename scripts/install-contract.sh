@@ -113,10 +113,64 @@ if [[ ! -f "$MARKET" ]]; then
 else
   mapfile -t PLUGINS < <(jq -r '.plugins[].name' "$MARKET")
   (( ${#PLUGINS[@]} > 0 )) || bad_t "T1 preconditions" "registry marketplace.json declares no plugins"
+
+  # THE BUILT-IN CHANNEL PLUGINS ARE NOT BOX-INSTALLABLE, AND THAT IS BY DESIGN.
+  #
+  # DIVE-4202 iteration 2. The old bundled manifest was [voice, browser] and
+  # held no channel plugin, so enumerating it and running `plugin add` on every
+  # member was sound. The REGISTRY's manifest also publishes telegram, dashboard
+  # and buzz — installed per AGENT, never per box — and `plugin add` refuses
+  # them (cmd_plugin.sh _plugin_is_builtin_channel, rc E_USAGE). Repointing the
+  # enumerator inherited the new source's population: T1b went red on three
+  # members whose refusal is the product working.
+  #
+  # So the same filter the corpus harnesses apply is applied here, and it is
+  # read from the CLI UNDER TEST rather than re-typed: the installed bundle's
+  # own FIVEDIVE_CHANNEL_PLUGINS_JSON is the single place that set is declared
+  # (header.sh says "never re-type the list"). A channel added there tomorrow
+  # is filtered here with no edit to this file.
+  #
+  # Filtered OUT of T1b/T2, not dropped: T1c below asserts each one is REFUSED,
+  # with the refusal's own reason, so "not installable per box" is graded rather
+  # than assumed. And the surviving set is asserted non-empty, so this filter
+  # can never turn the install arms vacuous — a registry that published nothing
+  # but channels would fail here, loudly, instead of passing having run nothing.
+  CHANNELS_JSON=$(sed -n "s/^readonly FIVEDIVE_CHANNEL_PLUGINS_JSON='\\(.*\\)'[[:space:]]*$/\\1/p" "$FIVE" | head -1)
+  CHANNELS=()
+  if [[ -n "$CHANNELS_JSON" ]] && jq -e . <<<"$CHANNELS_JSON" >/dev/null 2>&1; then
+    mapfile -t CHANNELS < <(jq -r '.[].plugin' <<<"$CHANNELS_JSON")
+  fi
+  if (( ${#CHANNELS[@]} > 0 )); then
+    ok_t "T1 preconditions: built-in channel set read from the installed CLI (${CHANNELS[*]})"
+  else
+    bad_t "T1 preconditions: built-in channel set read from the installed CLI" \
+      "could not read FIVEDIVE_CHANNEL_PLUGINS_JSON out of $FIVE — without it the filter below is a no-op and T1b would grade plugins 'plugin add' refuses by design"
+  fi
+
+  INSTALLABLE=(); CHANNEL_MEMBERS=()
+  for p in "${PLUGINS[@]}"; do
+    if in_list "$p" "${CHANNELS[@]}"; then CHANNEL_MEMBERS+=("$p"); else INSTALLABLE+=("$p"); fi
+  done
+  if (( ${#INSTALLABLE[@]} > 0 )); then
+    ok_t "T1 preconditions: ${#INSTALLABLE[@]} box-installable plugin(s) after the built-in channels are dropped (${INSTALLABLE[*]})"
+  else
+    bad_t "T1 preconditions: at least one box-installable plugin survives the filter" \
+      "the registry publishes ${#PLUGINS[@]} plugin(s) and every one of them is a built-in channel — the T1b/T2 install arms below would run on nothing and pass vacuously"
+  fi
   # One plugin verb first, so the registry is registered (and cloned) once
   # before the per-plugin arms read out of the clone.
   timeout 120 "$FIVE" plugin marketplace list </dev/null >/dev/null 2>&1
-  for p in "${PLUGINS[@]}"; do
+  # T1c — the filtered-out members, graded on the refusal rather than skipped.
+  for p in "${CHANNEL_MEMBERS[@]}"; do
+    out=$(timeout 120 "$FIVE" plugin add "$p" --yes </dev/null 2>&1); rc=$?
+    if (( rc != 0 )) && printf '%s' "$out" | grep -qi "built-in channel"; then
+      ok_t "T1c $p: 'plugin add' refuses a built-in channel plugin, per agent not per box (rc=$rc)"
+    else
+      bad_t "T1c $p: 'plugin add' refuses a built-in channel plugin" "rc=$rc — $(printf '%s' "$out" | tail -3 | tr '\n' ' ')"
+    fi
+  done
+
+  for p in "${INSTALLABLE[@]}"; do
     # Resolve the plugin's directory inside the REGISTERED clone the same way
     # the CLI does: the manifest's own `source`, relative to the clone root.
     psrc=$(jq -r --arg p "$p" '.plugins[] | select(.name==$p) | .source // ""' "$MARKET")

@@ -150,6 +150,81 @@ def substitution_end(text, start):
         i += 1
     return -1
 
+# ── DIVE-4202: THE TWO CONTEXTS WHERE errexit DOES NOT REACH THE ASSIGNMENT ──
+#
+# `set -e` exempts a command that is (1) not the last element of an `&&`/`||`
+# list, or (2) part of the condition list of if/elif/while/until. An assignment
+# in either place still ASSIGNS (empty, on the no-match path) and the shell
+# lives. Flagging it is a false positive, and the prescribed `|| v=""` there
+# changes no behaviour — it only silences a context-blind scan, which is how a
+# guard gets switched off. This is NOT a widening: the two shapes the scanner
+# exists for — a bare assignment, and one that is the FINAL element of a list —
+# are untouched and still fatal.
+#
+# Measured on this box (standalone script per row, graded by exit code, with a
+# positive control), 2026-09-10:
+#     v=$(false)                                  DIES 1
+#     (( ! r )) && v=$(false)          [final]    DIES 1
+#     v=$(false) && printf x           [non-final] survives 0
+#     (( ! r )) && v=$(false) && printf x          survives 0
+#     if (( ! r )) && v=$(false) && printf x; then survives 0   <- src/cmd_pack.sh
+#     if v=$(false); then :; fi                    survives 0
+#     while v=$(false); do break; done             survives 0
+#     false                            [control]  DIES 1
+# The verification trap: running the rows inside `bash -c '…' || echo survived`
+# reports "survived" for EVERY row, because errexit is disabled inside a
+# subshell on the left of `||`. Each row above was run as its own script.
+# community/wiki/an-if-condition-exempts-an-assignment-from-errexit-and-the-scanner-cannot-see-it.md
+
+COND_KW  = re.compile(r'(?:^|[;&|(]|\bthen\b|\bdo\b|\belse\b)\s*(if|elif|while|until)\b')
+COND_END = re.compile(r'(?:^|[;\s])(then|do)(?:[;\s]|$)')
+LIST_OP  = re.compile(r'(?:&&|\|\|)\s*\S')
+
+def logical_prefix(lines, idx, col):
+    """Everything before this assignment on its LOGICAL line — backslash
+    continuations joined backwards, so an `if` line ending in a backslash
+    and the next line opening with `&&` read as one statement."""
+    start = idx
+    while start > 0 and lines[start - 1].rstrip().endswith('\\'):
+        start -= 1
+    parts = []
+    for i in range(start, idx):
+        t = lines[i].rstrip()
+        parts.append(t[:-1] if t.endswith('\\') else t)
+    parts.append(lines[idx][:col])
+    return ' '.join(x.strip() for x in parts).strip()
+
+def first_statement(text):
+    """text up to the first UNQUOTED `;` — the rest is a separate statement and
+    says nothing about this one's list membership."""
+    q = None; i = 0
+    while i < len(text):
+        c = text[i]
+        if q:
+            if c == '\\' and q == '"': i += 2; continue
+            if c == q: q = None
+            i += 1; continue
+        if c in ('"', "'"): q = c
+        elif c == ';': return text[:i]
+        i += 1
+    return text
+
+def in_condition_list(prefix):
+    """Is this assignment inside an if/elif/while/until CONDITION (i.e. before
+    the matching `then`/`do`)? `if [[ x ]]; then v=$(grep …)` is NOT — the
+    condition ended at `then`, and that assignment is fatal."""
+    last = None
+    for mm in COND_KW.finditer(prefix):
+        last = mm
+    if last is None:
+        return False
+    return not COND_END.search(prefix[last.end():])
+
+def non_final_in_list(tail):
+    """Is another `&&`/`||` element still to come in THIS statement? Then the
+    assignment is not the list's final command, and errexit skips it."""
+    return bool(LIST_OP.search(first_statement(tail)))
+
 def group_span(depth, quoted, pos):
     """Extent of the group enclosing pos, at pos's own depth."""
     d = depth[pos]
@@ -205,6 +280,9 @@ for root in roots:
                   examined += 1
                   # An outer guard on the statement itself absorbs everything.
                   if re.match(r'\s*(\|\||&&\s*\S+\s*\|\|)', tail): continue
+                  # ...and so does a context errexit never reaches (see above).
+                  _prefix = logical_prefix(lines, idx, m.start())
+                  if non_final_in_list(tail) or in_condition_list(_prefix): continue
                   depth, quoted = scan_groups(inner)
                   bad = None
                   for pm in PROBE.finditer(inner):
