@@ -88,8 +88,14 @@ cat > "$R3/changelog.d/DIVE-9003.md" <<'EOF'
 not a heading, just prose
 EOF
 out3=$(cd "$R3" && bash "$SCRIPT" 2>"$TMP/err3"); rc3=$?
-[[ $rc3 -eq 0 && "$out3" == "0" ]] \
-  && ok_t "malformed fragment: folds 0, exit 0 (non-fatal)" \
+# DIVE-4177: this used to assert "exit 0, non-fatal". That reading is what shipped
+# v0.29.0's notes with two entries and no feature — the skip was reported into a cut
+# log nobody reads and the release published anyway. A skip is a DROPPED ENTRY and is
+# unrecoverable after the tag, so it now has its own exit code and release-cut.yml
+# turns it into a failed cut. Everything else about the arm is unchanged: nothing is
+# folded, the fragment is left in place for repair, and it is named on stderr.
+[[ $rc3 -eq 3 && "$out3" == "0" ]] \
+  && ok_t "malformed fragment: folds 0, exit 3 (refuses the cut — DIVE-4177)" \
   || bad_t "malformed fragment fold count" "rc=$rc3 out=$out3"
 [[ -f "$R3/changelog.d/DIVE-9003.md" ]] \
   && ok_t "malformed fragment left in place, not deleted" \
@@ -260,7 +266,6 @@ cp "$(dirname "$SCRIPT")/release-cut-baseline.sh" "$RG7/scripts/"
   printf '# Changelog\n' > CHANGELOG.md
   printf '## Unreleased — feat(a): alpha (DIVE-9201)\n\nA.\n' > changelog.d/DIVE-9201.md
   printf '## Unreleased — feat(b): beta (DIVE-9202)\n\nB.\n' > changelog.d/DIVE-9202.md
-  printf 'legacy prose with no release heading\n' > changelog.d/DIVE-9200.md
   git add -A; git commit -q -m 'main: two fragments'
 ) >/dev/null 2>&1
 # cut() — mirrors release-cut.yml: detach, fold against the derived baseline, then
@@ -272,7 +277,17 @@ cut(){ ( set -e; cd "$RG7"
     base=""
     if [[ -n "$inc" ]]; then base="$(bash scripts/release-cut-baseline.sh "$inc")"; fi
     git checkout -q --detach main
+    # DIVE-4177: mirror release-cut.yml's rc handling EXACTLY, and do not lean on
+    # `set -e` to do it. This subshell is the left operand of a `||`, and bash
+    # suppresses errexit there even with an explicit `set -e` — so the fold's refusal
+    # was swallowed and this helper tagged a release the real cut refuses to publish.
+    # rc 3 is the dropped-entry refusal (fatal); every other non-zero stays a warning,
+    # because a cut must still not die over a changelog that merely failed to fold.
+    set +e
     FOLD_RELEASED_BASELINE="$base" bash scripts/fold-changelog-fragments.sh >/dev/null
+    _frc=$?
+    set -e
+    if [[ $_frc -eq 3 ]]; then echo "cut refused: a fragment would be dropped (DIVE-4177)"; exit 1; fi
     git add -A; git commit -q -m "release $1: assign"
     printf 'bundle %s\n' "$1" > 5dive; git add -f 5dive; git commit -q -m "release $1: bundle"
     git tag "$1"; git checkout -q main
@@ -285,7 +300,7 @@ grep -q 'DIVE-9201' <<<"$body1" && grep -q 'DIVE-9202' <<<"$body1" \
   || bad_t "first cut body" "$body1"
 # main keeps its fragments (DIVE-2247, no push to a protected branch) — the very
 # condition that made the repeat possible, asserted rather than assumed.
-[[ $(cd "$RG7" && git ls-tree --name-only main changelog.d/ | wc -l) -eq 3 ]] \
+[[ $(cd "$RG7" && git ls-tree --name-only main changelog.d/ | wc -l) -eq 2 ]] \
   && ok_t "main still carries both valid fragments after the cut (the precondition holds)" \
   || bad_t "main's fragments" "$(cd "$RG7" && git ls-tree --name-only main changelog.d/)"
 # ONE new fragment lands, then cut again.
@@ -316,16 +331,35 @@ if grep -qE 'DIVE-920[12]' <<<"$c2"; then
 else
   ok_t "second cut's entries are DISJOINT from the first's (acceptance 1)"
 fi
-# DIVE-3291: already-shipped VALID fragments are consumed from the next tag's
-# tree even though their prose is not folded again. The malformed control stays:
-# presence in the baseline cannot prove content that never folded was shipped.
+# DIVE-3291: already-shipped VALID fragments are consumed from the next tag's tree
+# even though their prose is not folded again. The malformed control that used to sit
+# here is gone with DIVE-4177 — a cut over a malformed fragment now refuses, so a tree
+# carrying one cannot reach a tag at all, and that property is asserted directly below
+# instead of being carried as a passenger through this scenario.
 tag2_fragments=$(git -C "$RG7" ls-tree -r --name-only v0.1.1 -- changelog.d)
-[[ "$tag2_fragments" == "changelog.d/DIVE-9200.md" ]] \
-  && ok_t "second cut drops shipped fragments from the tag tree and preserves only malformed input (DIVE-3291)" \
+[[ -z "$tag2_fragments" ]] \
+  && ok_t "second cut drops every shipped fragment from the tag tree (DIVE-3291)" \
   || bad_t "second cut tag-tree fragment population" "$tag2_fragments"
 grep -q 'already shipped in a previous cut' "$TMP/cut.log" \
   && ok_t "the fold REPORTS the skips, so a future regression is visible in the cut log" \
   || bad_t "fold skipped nothing / said nothing on the second cut" "$(cat "$TMP/cut.log")"
+
+# DIVE-4177: THE CUT ITSELF REFUSES, on the same two-commit shape — the arm above
+# grades the script, this one grades what a cut does with it. Under the old contract
+# this cut succeeded and published notes missing the entry.
+echo "-- DIVE-4177: a cut over a malformed fragment does not produce a tag"
+( set -e; cd "$RG7"
+  printf 'legacy prose with no release heading\n' > changelog.d/DIVE-9204.md
+  git add -A; git commit -q -m 'main: a malformed fragment' ) >/dev/null 2>&1
+cut v0.1.2
+if git -C "$RG7" rev-parse -q --verify v0.1.2 >/dev/null 2>&1; then
+  bad_t "a cut over a malformed fragment must not tag" "v0.1.2 exists — the notes would be missing DIVE-9204"
+else
+  ok_t "a cut over a malformed fragment refuses and tags nothing (DIVE-4177)"
+fi
+grep -q 'DIVE-9204' "$TMP/cut.log" \
+  && ok_t "the refusal names the fragment that would have been dropped" \
+  || bad_t "the refusal names the fragment" "$(cat "$TMP/cut.log")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

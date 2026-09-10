@@ -41,3 +41,25 @@ worth knowing when you write one:
 - **Editing** a fragment after it shipped makes it new content, so it folds again
   and the entry appears in a second release's notes. If that is not what you want,
   write a new fragment instead of editing the shipped one.
+
+**The heading is enforced, at the door and at the cut (DIVE-4177).** Both halves
+exist because a fragment without that first line was silently *skipped* by the fold
+and its entry never reached a release page — v0.29.0 published two entries and no
+feature for a cut correctly derived MINOR from three `feat` commits, and v0.30.0
+omitted the very commit that forced its own minor.
+
+- **At PR time**, `scripts/lint-changelog-fragments.sh` runs inside the required
+  `title` check: every fragment your PR adds or edits must start with the heading
+  above, and a `feat`/`fix` PR must add a fragment at all (`test`, `ci`, `chore`,
+  `docs`, `refactor` and `perf` only get a warning). It grades *your* files, not the
+  whole directory, so nobody else's fragment can red your PR.
+- **At cut time**, the fold now *refuses* rather than skipping: a malformed fragment
+  fails the release instead of quietly dropping its entry. With the lint in place that
+  is a tripwire, not a gate.
+
+Locally, before you push:
+
+```sh
+git diff --name-only origin/main... \
+  | bash scripts/lint-changelog-fragments.sh --title="$(git log -1 --format=%s)" --changed-from=-
+```

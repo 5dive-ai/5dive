@@ -73,6 +73,14 @@
 # that would otherwise have been typed at the top of CHANGELOG.md, so authoring a
 # fragment is not a new format to learn, only a new file to put it in.
 #
+# AND A FRAGMENT THAT IS NOT IN THAT FORMAT ENDS THE CUT (DIVE-4177, exit 3). It used
+# to be skipped with a line on stderr and the cut published anyway: v0.29.0's notes
+# listed two entries and no feature for a release correctly derived MINOR from three
+# `feat` commits, because six fragments were skipped that way. A dropped entry is not a
+# degraded artifact, it is a wrong one, and the tag makes it permanent. The refusal
+# cannot fire on a clean main — scripts/lint-changelog-fragments.sh grades the same
+# heading at PR time, under the required `title` context.
+#
 # Usage: fold-changelog-fragments.sh [changelog-path] [fragments-dir]
 #        folds newest-fragment-first (by filename, descending) to the TOP of
 #        changelog-path, deletes the folded fragments, prints the number folded.
@@ -134,6 +142,14 @@ prefix="$(git rev-parse --show-prefix 2>/dev/null || true)"
 
 folded=0
 skipped_released=0
+skipped_malformed=0
+# THE ACCEPTED HEADING, kept byte-identical to the condition in
+# scripts/lint-changelog-fragments.sh (DIVE-4177). The PR-time lint is what keeps this
+# refusal from ever firing on a clean main; if the two patterns drift, the lint admits
+# a fragment this loop then skips, which is the exact defect wearing a green check.
+# tests/changelog_fragment_lint_unit.sh asserts they are the same string.
+readonly FRAGMENT_HEADING_RE='^##[[:space:]]+Unreleased([[:space:]]|$)'
+malformed_paths=()
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
 
@@ -144,8 +160,10 @@ for f in "${frags[@]}"; do
   # It must remain visible for repair, not disappear from the release tree under
   # the already-consumed cleanup below.
   first_content_line="$(grep -m1 -v '^[[:space:]]*$' "$path" || true)"
-  if [[ ! "$first_content_line" =~ ^##[[:space:]]+Unreleased([[:space:]]|$) ]]; then
+  if [[ ! "$first_content_line" =~ $FRAGMENT_HEADING_RE ]]; then
     echo "fold-changelog-fragments: ${path} does not start with '## Unreleased' — skipping (not folded, not deleted)" >&2
+    skipped_malformed=$((skipped_malformed + 1))
+    malformed_paths+=("$path")
     continue
   fi
   # DIVE-2702: already consumed by an earlier cut? Compare BLOBS, not idents —
@@ -182,6 +200,20 @@ fi
 
 if [[ "$skipped_released" -gt 0 ]]; then
   echo "fold-changelog-fragments: ${skipped_released} fragment(s) skipped as already shipped before ${baseline} (DIVE-2702)" >&2
+fi
+
+# DIVE-4177: A SKIP IS A DROPPED FEATURE, so it ends the cut instead of decorating it.
+# Until now this loop printed the skip on stderr and returned 0, and release-cut.yml
+# published anyway — v0.29.0 shipped six entries into the void that way and v0.30.0
+# repeated it with the very commit that forced its own minor. The skipped prose is not
+# recoverable after the tag: the notes are the diff over a range that has moved on.
+# ITS OWN EXIT CODE (3), not the generic non-zero, because release-cut.yml maps a
+# generic failure to `::warning ... publishing anyway` and must keep doing so — a fold
+# that dies for some other reason is still not worth killing a cut over.
+if [[ "$skipped_malformed" -gt 0 ]]; then
+  echo "fold-changelog-fragments: REFUSING the fold — ${skipped_malformed} fragment(s) do not start with '## Unreleased' and would be dropped from these notes silently (DIVE-4177): ${malformed_paths[*]}" >&2
+  echo "$folded"
+  exit 3
 fi
 
 echo "$folded"
