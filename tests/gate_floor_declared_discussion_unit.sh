@@ -223,7 +223,13 @@ sr_tier="$(tierof DIVE-408)"; sr_ping="$HUMAN_PINGED"
 # And the counterfactual olivia actually cares about: hand main its pin back and
 # the gate is hard-human, by the pin, with or without this ticket.
 route_reset; seed DIVE-419 "$SR_TITLE_2146"
-actor_seam_as dev; cmd_task_need DIVE-419 --type=approval --from=dev --tier=2 --ask="$SR_ASK_2146" >/dev/null 2>&1
+# --ask-ok (DIVE-4176): SR_ASK_2146 is the REAL DIVE-2146 ask reproduced verbatim,
+# and the pin makes it hard-human, so the readability rule refuses it — correctly:
+# at 40 words with an ident and a filename in it, it is precisely the shape the
+# rule exists to bounce. Rewording it would destroy the historical artifact this
+# arm grades, so the escape is declared instead.
+actor_seam_as dev; cmd_task_need DIVE-419 --type=approval --from=dev --tier=2 --ask="$SR_ASK_2146" \
+  --ask-ok="fixture: a verbatim historical ask, reproduced to grade the floor rather than to be read" >/dev/null 2>&1
 [[ "$(tierof DIVE-419)" == "2" && "$HUMAN_PINGED" == "1" ]] \
   && ok_t "precondition: the pinned re-file (what DIVE-2146 actually did) is hard-human independent of the floor" \
   || bad_t "precondition pinned refile" "tier=$(tierof DIVE-419) ping=$HUMAN_PINGED"

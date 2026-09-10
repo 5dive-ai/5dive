@@ -161,7 +161,12 @@ seed_loop() { db "INSERT INTO tasks(ident,title,status,created_by,assignee,verif
 
 # The ask that produced the complaint, verbatim in shape (DIVE-3047's): eng-ship
 # classified, no tier-2 floor term, tier 1 by the DIVE-1284 approval default.
-ENG_ASK='approve delegated push for review of branch dive-3171-root-filer (@abc1234)'
+# DIVE-4176: no branch, no sha. A2 files this on a gate that stays with the HUMAN,
+# so the readability refusal grades it there and the old string was refused before
+# the eligibility conjunct this harness measures was ever reached. `delegated push
+# for review` is what the eng-ship class matches; the branch and the sha were not
+# load-bearing for it, and A1 (which routes to an agent) is unaffected either way.
+ENG_ASK='approve a delegated push for review'
 
 # ---- P0. PRECONDITIONS. Both halves of this fix are fixture-dependent, and a dead
 # fixture greens the negative arms for exactly the wrong reason (an empty standing lead
