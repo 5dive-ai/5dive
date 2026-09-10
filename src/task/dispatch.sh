@@ -82,6 +82,10 @@ _task_usage() {
   need <id> --type=decision|secret|approval|manual|access --ask="..."|--ask-file=<path>
       [--options=A|B] [--recommend=<A>|--recommend-file=<path>] [--tier=0|1|2]
       [--needs=<capability>] [--discusses=<why>] [--rubber-stamp-ok="<why>"]
+      [--ask-ok="<why>"]   DIVE-4176: a gate that reaches the PAIRED HUMAN is refused
+                   when its --ask runs over 25 words or names an ident/sha/branch/
+                   path/flag — that text is all he sees. Rewrite it as a choice
+                   between outcomes; this flag is the audited exception.
       [--urgent]   a ROUTED gate normally QUEUES for the reviewer's next natural
                    wake instead of waking their session (DIVE-3474). --urgent
                    pings at file time. It is NOT --recommend: "I think the answer

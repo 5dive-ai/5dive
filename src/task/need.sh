@@ -1506,6 +1506,121 @@ _gate_option_has_second_person() {
   LC_ALL=C grep -Eiq '(^|[^[:alnum:]_])(you|your|yours|yourself|yourselves)([^[:alnum:]_]|$)' <<<"${1:-}"
 }
 
+# ============================================================================
+# DIVE-4176 — THE HUMAN-ASK READABILITY CHECK IS A REFUSAL, NOT A WARNING.
+#
+# lodar, 2026-08-12: "I cannot understand most of the tech stuff when I got to my
+# human gate". The rule has been in CLAUDE.md since; the CODE has only ever
+# warned (DIVE-3661, the ~15-word render-cut warning further down). A warning
+# delivered to a HEADLESS filer is read by nobody, and the proof is this ticket's
+# own parent: DIVE-4150 was warned that its 34-word ask "will render cut" and was
+# filed anyway, unchanged. Advisory was the right call when the check was a
+# render-budget hint; it is the wrong call for the only text the human sees.
+#
+# SCOPE IS THE LOAD-BEARING PART, and it is not "every gate". Replayed over
+# gate_history, 30 days to 2026-09-09, 511 asks:
+#
+#   human-facing (tier 2)  165 of 191 refused (86%)
+#   lead-facing  (tier 1)  264 of 319 refused (83%)
+#
+# The tier-1 number is why the refusal fires ONLY on a gate that reaches the
+# paired human (tier 2, or a declared human capability). A tier-1 gate is read by
+# an AGENT — a sha, a branch and a file path are the clearest thing you can write
+# to one, and refusing 83% of lead-routed gates over vocabulary would bounce
+# correct filings to satisfy a rule about a reader who is not on that gate. The
+# DIVE-3661 warning still covers tier 1, where advisory is the right strength.
+#
+# THE 86% IS NOT A REDESIGN SIGNAL — the row required this be checked before
+# shipping. The 26 tier-2 asks that survive are the lodar-readable corpus
+# verbatim ("Two AI workers have been signed out since July. Sign them back in,
+# or retire them?"), and the 165 refused are the machine-shaped ones the
+# DIVE-4150 measurement already counted: 137 of 193 human-facing gates named a
+# push, merge, PR, branch, diff, sudo, token, sha or a DIVE ident, the human
+# answered 37, and the filing seat itself withdrew 135 after paging. The refusal
+# does not red a legitimate historical filing; it reds the population that was
+# already being retracted.
+#
+# WHY VOCABULARY IS A SAFE PREDICATE HERE AND IS NOT AT THE T2 FLOOR. The floor
+# reads vocabulary where CATEGORY was meant, so it penalises the precise filer
+# (DIVE-2629/4001, and the [[naming-your-blocker...]] wiki page). Here vocabulary
+# IS the subject: the claim is not "this ask is about a sha", it is "this string
+# contains a token the reader cannot parse". A false positive costs one rewrite
+# of a sentence that had to be rewritten anyway; it never routes a gate to the
+# wrong desk, and never lowers a tier.
+#
+# THE ESCAPE IS DECLARED, NOT INFERRED. `--ask-ok="<why>"` files anyway and is
+# audited, same shape as --discusses (DIVE-2089) and --rubber-stamp-ok
+# (DIVE-2848): a gate must never become unfileable (DIVE-2216), and an exception
+# that leaves a row is countable, which an invisible reword is not.
+_GATE_ASK_MAX_WORDS=25
+
+# Each alternation is a shape a person outside our codebase cannot read. Tuned
+# against the 30-day corpus (every match printed and eyeballed) so the ENGLISH
+# neighbours of each shape survive:
+#   ident   DIVE-3164, CNCL-9, PR #566.
+#   sha     hex >=7 that carries BOTH a digit and an a-f letter, so the token
+#           budget '5000000' and the word 'deadbeef'-shaped prose are not shas.
+#   path    an absolute path, a slash-token with a dot/hyphen/underscore in it
+#           (5dive-ai/5dive, /home/claude/projects), an explicit git ref prefix
+#           (origin/main), or a source-file extension. A bare two-word slash is
+#           deliberately NOT matched: 'and/or', 'read/write' and '19/19' are
+#           English, and under-reaching here is the cheap direction.
+#   branch  a hyphenated token of 3+ segments that also carries a digit
+#           (dive-3664-server-held-pair). Without the digit clause this eats
+#           'out-of-band' and 'end-to-end'.
+#   flag    a --long-option.
+#   snake   held_at, node_modules, need_answered_by.
+#   camel   mergePullRequest.
+_GATE_ASK_JARGON_IDENT='\b[A-Z]{2,6}-[0-9]{1,6}\b|#[0-9]{1,6}\b'
+_GATE_ASK_JARGON_SHA='\b[0-9a-f]{7,40}\b'
+_GATE_ASK_JARGON_PATH='(^|[[:space:]])/[A-Za-z][A-Za-z0-9._/-]*|[A-Za-z0-9_-]*[._-][A-Za-z0-9._-]*/[A-Za-z0-9._/-]*[A-Za-z][A-Za-z0-9._/-]*|\b(origin|upstream|refs)/[A-Za-z0-9._/-]+|\b[A-Za-z0-9_-]+\.(sh|ts|tsx|js|py|json|ya?ml|md|sql)\b'
+_GATE_ASK_JARGON_BRANCH='\b[a-z][a-z0-9]*(-[a-z0-9]+){2,}\b'
+_GATE_ASK_JARGON_FLAG='(^|[[:space:]])--[a-z][a-z0-9-]*'
+_GATE_ASK_JARGON_SNAKE='\b[a-z][a-z0-9]*_[a-z0-9_]+\b'
+_GATE_ASK_JARGON_CAMEL='\b[a-z]+[A-Z][a-zA-Z]*\b'
+
+# Prints the FIRST offending token and its class as "<class>:<token>", rc 0 on a
+# hit, rc 1 on none. It names the token because "your ask is unreadable" is not
+# actionable — the filer has to be told which word to delete (the DIVE-2224
+# lesson: a floor message that does not say WHICH word cannot be appealed).
+_gate_ask_jargon_term() {
+  local s="$1" cls rx tok
+  for cls in ident sha path branch flag snake camel; do
+    case "$cls" in
+      ident)  rx="$_GATE_ASK_JARGON_IDENT" ;;
+      sha)    rx="$_GATE_ASK_JARGON_SHA" ;;
+      path)   rx="$_GATE_ASK_JARGON_PATH" ;;
+      branch) rx="$_GATE_ASK_JARGON_BRANCH" ;;
+      flag)   rx="$_GATE_ASK_JARGON_FLAG" ;;
+      snake)  rx="$_GATE_ASK_JARGON_SNAKE" ;;
+      camel)  rx="$_GATE_ASK_JARGON_CAMEL" ;;
+    esac
+    while read -r tok; do
+      [[ -n "$tok" ]] || continue
+      tok="${tok#"${tok%%[![:space:]]*}"}"
+      case "$cls" in
+        # A hex run is only a sha if it is not a plain number and not a plain
+        # word: it must carry a digit AND an a-f letter. grep -E has no
+        # lookahead, so the two conditions are asserted here.
+        sha)    [[ "$tok" == *[0-9]* && "$tok" == *[a-f]* ]] || continue ;;
+        # 'out-of-band' is English; 'dive-3664-server-held-pair' is a branch.
+        branch) [[ "$tok" == *[0-9]* ]] || continue ;;
+      esac
+      printf '%s:%s' "$cls" "$tok"
+      return 0
+    done < <(printf '%s' "$s" | grep -oE "$rx" 2>/dev/null || true)
+  done
+  return 1
+}
+
+# Word count on whitespace. Deliberately the same unit the human experiences —
+# words on a phone screen — not characters or bytes.
+_gate_ask_word_count() {
+  local -a w=(); read -r -a w <<<"$1"
+  printf '%s' "${#w[@]}"
+}
+
+
 # DIVE-2848 — THE KEYSTROKE CAP ON RUBBER-STAMP GATES.
 #
 # lodar, 2026-08-06 04:11Z: "im fighting with unnecessary human gates for the past
@@ -1723,7 +1838,7 @@ _gate_record_line() {
 
 cmd_task_need() {
   tasks_db_init
-  local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw="" discusses="" needs="" oob="" rubber_stamp="" gate_mode=""
+  local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw="" discusses="" needs="" oob="" rubber_stamp="" gate_mode="" ask_ok=""
   local gate_owner=""   # DIVE-3342
   local urgent=0        # DIVE-3474 arm 2
   # DIVE-2627: which flag supplied each prose value (see _read_prose_file).
@@ -1793,6 +1908,8 @@ cmd_task_need() {
       # never inferred, and written to the gate row — an escape that leaves no
       # record is `--tier=2` with extra steps, which is the thing being fixed.
       --rubber-stamp-ok=*) rubber_stamp="${1#*=}" ;;
+      # DIVE-4176: the audited escape from the human-ask readability refusal.
+      --ask-ok=*) ask_ok="${1#*=}" ;;
       # DIVE-2354: WHICH ORDER this gate is in. Declared, never inferred — the
       # filer is the only party who knows whether the action has already happened,
       # and inferring it from timestamps would be a guess presented as a record.
@@ -2829,6 +2946,103 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
   fi
   if [[ -n "$rubber_stamp" && "$_rs_capped" == "0" ]]; then
     warn "--rubber-stamp-ok changed nothing on this gate — the keystroke cap did not fire (type=${type}, tier=${tier}$( ((tier_floored)) && printf ', floored by category or declaration')). The declaration is still written to the row, so it stays readable; it just did not need to buy anything."
+  fi
+
+  # DIVE-4176 — THE HUMAN-ASK READABILITY REFUSAL. Design note and the 30-day
+  # replay are at _GATE_ASK_MAX_WORDS above.
+  #
+  # PLACED HERE, after every floor / downgrade / declaration and after the
+  # keystroke cap, for the same reason the cap is: only at this point does
+  # `tier` mean "this ask reaches the paired human". Filing it earlier (next to
+  # the DIVE-3661 render warning, which runs before the tier exists) would apply
+  # a human-reader rule to lead-routed gates — the 83%/319 population that must
+  # not be bounced. `_needs_human` is read alongside `tier` because the DIVE-2241
+  # re-assert below can still raise a declared-capability gate back to 2; a gate
+  # that DECLARES it consumes human_tap is human-facing here whatever the running
+  # tier says.
+  #
+  # BEFORE THE WRITE, like every other refusal on this path: an rc-only failure
+  # that had already filed the row would leave the ping it refused.
+  # "REACHES THE HUMAN" IS NOT "tier == 2", and assuming it was is the one way
+  # this refusal could do damage. A tier-2 approval / manual / access gate is
+  # ROUTED to a lead or to the task's verifier by the block further down
+  # (DIVE-1243 / DIVE-1495) unless the caller pinned --tier=2, the category floor
+  # fired, or a human capability was declared. Those routed gates are read by an
+  # AGENT, and refusing them over vocabulary is the tier-1 mistake wearing a
+  # different tier: caught by tests/gate_access_lead_clear_unit.sh, whose access
+  # gate legitimately asks to "push branch dive-3212-openclaw-harness-30s" to a
+  # LEAD. The route itself is resolved after the write, so the routability
+  # question is asked here with the routing block's own helper rather than read
+  # off the row — the same shape the eng-ship guard above uses.
+  local _ar_human=0
+  if [[ "$tier" == "2" ]]; then
+    if [[ "$type" == "secret" || "$tier_arg" == "2" || "$tier_floored" == "1" \
+          || "$_needs_human" == "1" || -z "$(_gate_route_reviewer "$(task_actor "$from")")" ]]; then
+      _ar_human=1
+    fi
+  elif [[ "$_needs_human" == "1" ]]; then
+    # Declared human capability below tier 2: the DIVE-2241 re-assert further
+    # down raises it back, so it is human-facing here whatever the running tier
+    # says. Without this arm the check is skipped by --tier=1 --needs=human_tap.
+    _ar_human=1
+  fi
+  if (( _ar_human )); then
+    local _ar_words _ar_term="" _ar_why=""
+    _ar_words=$(_gate_ask_word_count "$ask")
+    _ar_term=$(_gate_ask_jargon_term "$ask" 2>/dev/null) || _ar_term=""
+    # --options are read by the human too (they are the buttons), so they are
+    # held to the vocabulary rule as well. Not to the word cap: an option is a
+    # label, and the cap is a budget for one sentence.
+    local _ar_opt_term=""
+    if [[ -n "$options" ]]; then
+      _ar_opt_term=$(_gate_ask_jargon_term "$options" 2>/dev/null) || _ar_opt_term=""
+    fi
+    (( _ar_words > _GATE_ASK_MAX_WORDS )) \
+      && _ar_why="it runs ${_ar_words} words (the cap is ${_GATE_ASK_MAX_WORDS})"
+    if [[ -n "$_ar_term" ]]; then
+      _ar_why="${_ar_why:+${_ar_why}, and }it contains '${_ar_term#*:}' (a ${_ar_term%%:*} — an internal name)"
+    fi
+    if [[ -n "$_ar_opt_term" ]]; then
+      _ar_why="${_ar_why:+${_ar_why}, and }--options contains '${_ar_opt_term#*:}' (a ${_ar_opt_term%%:*} — an internal name)"
+    fi
+    if [[ -n "$_ar_why" ]]; then
+      if [[ -z "$ask_ok" ]]; then
+        _task_store_audit_log "task need ask-readability" "refused" 0 -- \
+          "task=$ident" "filer=${actor:-}" "type=$type" "words=${_ar_words}" \
+          "term=${_ar_term:-none}" "options_term=${_ar_opt_term:-none}" || true
+        fail "$E_VALIDATION" "$ident: refusing this gate because its --ask is the ONE piece of text the paired human sees, and ${_ar_why}. He has never read our code: an ident, a sha, a branch, a check name, a file path or a flag is noise to the person deciding — put them in the task BODY, which is where mechanism belongs.
+Rewrite the ask as a CHOICE BETWEEN OUTCOMES, consequence first: what changes if he says yes, what changes if he says no. Not what component is involved.
+  bad   \"grant agent-ops NOPASSWD sudo, or run the pass as root — blocks both DIVE-3208 preconditions.\"
+  good  \"A cleanup job needs read access it doesn't have. Give it that access permanently, or have me run the one-off check myself?\"
+THE TEST, and it is a diagnostic and not a style note: if you cannot write the ask without our vocabulary, you have not found the decision yet — you are still describing your investigation. A real decision is always expressible as a choice between outcomes. Your exits:
+  rewrite the ask       one short sentence, under ${_GATE_ASK_MAX_WORDS} words, no internal names. This is the exit that is wanted.
+  --tier=1              route it to your lead or this task's verifier instead — an AGENT reads that gate, and a sha is the clearest thing you can write to one. This rule does not apply there.
+  --ask-ok=\"<why this ask cannot be written in plain English>\"    the audited exception. Recorded on the gate and countable afterwards."
+      fi
+      # Declared: file it, say so, and leave a row. An exception nobody can count
+      # is a warning with extra steps, which is the thing this ticket replaced.
+      [[ ${#ask_ok} -ge 12 ]] \
+        || fail "$E_VALIDATION" "--ask-ok must state WHY this ask cannot be written in plain English (it is recorded on the gate and read by whoever counts these exceptions later)"
+      _task_store_audit_log "task need ask-readability" "escaped" 0 -- \
+        "task=$ident" "filer=${actor:-}" "type=$type" "words=${_ar_words}" \
+        "term=${_ar_term:-none}" "declared=$ask_ok" || true
+      warn "readability escape ACCEPTED and RECORDED: --ask-ok=\"${ask_ok}\". This ask ${_ar_why}, and the human is still being sent it; the reason is now in the audit log so the exception is countable."
+    elif [[ -n "$ask_ok" ]]; then
+      warn "--ask-ok changed nothing on this gate — the readability check passed on its own (${_ar_words} words, no internal names)."
+    fi
+    # DIVE-4176, THE HALF THAT STAYS ADVISORY AND WHY. "Consequence-first, a
+    # choice between outcomes" is the rule that matters most and it is the one
+    # with no honest mechanical predicate. The closest proxy is "the ask asks a
+    # question", and on the 30-day corpus 24 of the 26 tier-2 asks that clear the
+    # refusal above already end in one — but the 2 that do not are legitimate
+    # manual gates in the imperative ("Please try one agent-file import on your
+    # box…"). Refusing those would be a style rule bouncing a correct filing, so
+    # this arm nudges and does not refuse. It is a WARNING ON PURPOSE, not an
+    # oversight: see the block comment above for why the other two arms are not.
+    [[ "$ask" == *'?'* ]] \
+      || warn "your ask states an instruction rather than asking a question. A gate is a choice between outcomes — the most readable asks name the two outcomes and end in '?'. (Advisory: some manual asks are legitimately imperative.)"
+  elif [[ -n "$ask_ok" ]]; then
+    warn "--ask-ok changed nothing on this gate — it is tier ${tier}, so it is read by an agent, not by the paired human, and the readability refusal does not run on it."
   fi
 
   _task_gate_card_apply "$ident" die "superseded by a re-filed gate" || true

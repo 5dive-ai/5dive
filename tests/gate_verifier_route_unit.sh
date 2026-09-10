@@ -287,9 +287,14 @@ cmd_task_need DIVE-3121 --type=approval \
 
 # 7f. The tier-2 human floor still wins over the whole class: a push ask that also
 # names a spend stays with the human and reaches NO agent, verifier or lead.
+# The ask names no branch on purpose (DIVE-4176): this gate lands on the human by
+# construction, so the readability refusal now grades it, and a branch name here
+# would have the fixture refused before the ROUTE this arm exists to measure is
+# ever taken. `delegated push for review` is what the push class matches on — the
+# branch name was never load-bearing for it.
 route_reset; seed_loop_g DIVE-3122; fixture_actor dev
 cmd_task_need DIVE-3122 --type=approval \
-  --ask='approve delegated push for review of branch dive-3117-x and the $900 runner spend' --from=dev >/dev/null 2>&1
+  --ask='approve a delegated push for review and the $900 runner spend' --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" && "$(route_sent)" == "0" ]] \
   && ok_t "a push ask naming a spend stays human (T2 floor outranks the class)" \
   || bad_t "a push ask naming a spend stays human" "human=$HUMAN_PINGED sent=$(route_sent) routed=$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-3122';")"
