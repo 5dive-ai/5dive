@@ -32,7 +32,11 @@
 #   6  DEGRADED — an unreadable transcript still yields items (1) and (2) and
 #      says item (3) is missing rather than dropping the whole carryover;
 #   7  the pasted last message is BOUNDED and single-line: a transcript replay
-#      in a tmux line is not a pointer.
+#      in a tmux line is not a pointer;
+#   8  CONTROL — a reclaim SUPERSEDED by a later closed run (the reject bounce:
+#      attempt 1 reclaimed_to_todo, attempt 2 completed/verifier_rejected)
+#      carries nothing, because the clause keys on the seat's LATEST CLOSED run
+#      and not on the newest reclaimed one anywhere in its history.
 #
 # Same isolation contract as tests/heartbeat_reclaim_loop_unit.sh: source src/
 # directly, throwaway tasks.db, throwaway projects root, throwaway seat homes,
@@ -302,6 +306,52 @@ if [[ "$(printf '%s' "$C7" | wc -l)" -eq 0 ]] && (( ${#C7} < 2500 )) && has "$C7
 else
   bad_t "the pasted last message was not bounded/flattened" "len=${#C7} newlines=$(printf '%s' "$C7" | wc -l) tail=${C7: -80}"
 fi
+
+# =============================================================================
+# 8) CONTROL — a reclaim SUPERSEDED by a later closed run is not a resume
+#
+# The reject bounce, and it is the common shape rather than an exotic one: 57% of
+# maker runs are reclaimed, and a verifier reject is exactly when the seat is woken
+# again. Attempt 1 is reclaimed to todo; attempt 2 delivers and is rejected, which
+# closes that run completed/verifier_rejected through the same `_run_close_for_task`
+# call `task reject` makes (src/task/delivery.sh). Selecting the newest RECLAIMED
+# run reaches PAST attempt 2 and emits a clause that says "attempt 1 ... so this is
+# attempt 2" when it is attempt 3, and prints attempt 2's transcript line under a
+# label naming attempt 1. The clause must therefore key on the seat's LATEST CLOSED
+# run, and stay silent when that run is not a reclaim.
+# =============================================================================
+reset_all; mk_base_clone
+T8=$(addt --assignee=dev --verifier=quinn -- "reclaimed, then delivered and rejected")
+WT8=$(mk_worktree_on_branch "dive-4213-h")
+bind_branch "$T8" "dive-4213-h"
+seat_transcript dev "$LAST_MSG"
+attempt_then_reclaim dev idle "$T8"                 # attempt 1: abandoned/reclaimed_to_todo
+_hb_claim_task dev "$T8" >/dev/null 2>&1            # attempt 2: a real run opens
+# ... and the real reject closes it. The seat is named explicitly because
+# `run_current` otherwise defaults to the CALLING actor's seat, which in a harness
+# is the host user and not `dev`; on the live path the caller already is that seat.
+_run_close_for_task "$T8" completed verifier_rejected dev
+
+RUNS8=$(db "SELECT COALESCE(attempt,1)||'/'||status||'/'||COALESCE(outcome,'') FROM runs WHERE task_id=$T8 AND agent='dev' AND ended_at IS NOT NULL ORDER BY COALESCE(ended_at,started_at), rowid;" | tr '\n' ' ')
+case "$RUNS8" in
+  *"abandoned/reclaimed_to_todo"*"completed/verifier_rejected"*)
+    ok_t "[fixture] the reject bounce is built by the real path: $RUNS8" ;;
+  *) bad_t "the reject-bounce fixture did not produce reclaim-then-reject" "$RUNS8" ;;
+esac
+
+C8=$(_hb_carryover_clause dev "$T8" "$(ident_of "$T8")" 2>/dev/null); C8RC=$?
+if (( C8RC != 0 )) && [[ -z "$C8" ]]; then
+  ok_t "[control] a reclaim superseded by a later completed/verifier_rejected run carries nothing"
+else
+  bad_t "the carryover reached PAST a newer closed run (the reject bounce)" "rc=$C8RC runs=$RUNS8 clause=$C8"
+fi
+
+# 8b) and the nudge the pane receives says nothing about a resume, so it cannot
+#     disagree with the reject-fix clause it arrives beside.
+N8=$(wake_nudge dev "$T8")
+has "$N8" "CARRYOVER" \
+  && bad_t "the nudge for a reject bounce still carried a carryover clause" "$N8" \
+  || ok_t "[control] the reject-bounce nudge carries no carryover beside the reject fix"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

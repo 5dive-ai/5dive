@@ -2896,9 +2896,12 @@ _hb_last_assistant_message() { # <agent>
 # `_hb_carryover_clause <agent> <task_id> <ident>` — echoes the clause, or
 # returns 1 when this is not a resume. FOUR conditions, all positive evidence:
 #
-#   1. a CLOSED run exists on this row for THIS seat whose outcome is
-#      `reclaimed_to_todo` (so attempt 1 on a fresh row gets nothing, and a row
-#      whose last run was reclaimed to the VERIFIER is not a maker's resume);
+#   1. this seat's LATEST CLOSED run on this row has outcome `reclaimed_to_todo`
+#      (so attempt 1 on a fresh row gets nothing; a row whose last run was
+#      reclaimed to the VERIFIER is not a maker's resume; and a reclaim that a
+#      LATER closed run has already superseded — the reject bounce, where the
+#      newer run is completed/verifier_rejected — is not resumed, because the
+#      attempt number and the transcript attribution would both be wrong);
 #   2. that reclaim's reason is not the hard cap. The bound is stated in the
 #      ticket and it is the only reclaim reason that is evidence AGAINST
 #      resuming: `overran the budget` means the attempt was wedged, and handing
@@ -2913,16 +2916,30 @@ _hb_carryover_clause() { # <agent> <task_id> <ident>
   # parentheses and '|' (see rule (a)'s why), so every printable delimiter is
   # reachable by the data. SQLite does not interpret \x escapes inside a string
   # literal, which is why this is char(31) and not '\x1f'.
+  # DIVE-4213 (iteration 2): the reclaimed run must BE this seat's LATEST CLOSED
+  # run on this row, not merely the newest reclaimed one anywhere in its history.
+  # Selecting `status='abandoned' AND outcome='reclaimed_to_todo'` directly reaches
+  # PAST a newer closed run, and the common shape has one: a verifier reject writes
+  # attempt N+1 as completed/verifier_rejected (src/task/delivery.sh), and a reject
+  # bounce is exactly when the seat is re-woken — so the carryover would arrive
+  # beside `_hb_reject_fix_clause` claiming an attempt number one too low and
+  # attributing the NEWER attempt's transcript line to the OLDER attempt it names.
+  # The new attempt's own run row is already open by then (`_hb_claim_task` calls
+  # `run_open` before the nudge is composed), which is why this asks for the latest
+  # run that has ENDED rather than the latest run.
+  local outcome=""
   prev=$(db "SELECT COALESCE(attempt,1)
                     || char(31) || COALESCE(ended_at,'')
                     || char(31) || COALESCE(error_class,'')
+                    || char(31) || COALESCE(outcome,'')
                FROM runs
               WHERE task_id=${id} AND agent=$(sqlq "$name")
-                AND status='abandoned' AND outcome='reclaimed_to_todo'
+                AND ended_at IS NOT NULL AND status <> 'running'
               ORDER BY COALESCE(ended_at, started_at) DESC, rowid DESC
               LIMIT 1;" 2>/dev/null) || return 1
   [[ -n "$prev" ]] || return 1
-  IFS=$'\x1f' read -r attempt ended why <<<"$prev"
+  IFS=$'\x1f' read -r attempt ended why outcome <<<"$prev"
+  [[ "$outcome" == "reclaimed_to_todo" ]] || return 1
   [[ "${attempt:-}" =~ ^[0-9]+$ ]] || attempt=1
   # (2) the one reclaim reason that forbids a resume. Matched on the prefix
   # `_hb_reclaim` writes for rule (c); see the hard-cap arm.
