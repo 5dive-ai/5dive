@@ -76,6 +76,27 @@ for a in "${@:3}"; do
 done
 [[ -n "$BASE" ]] || { echo "usage: scripts/pre-push-rail.sh <base> <head> [--only=STAGE]" >&2; exit 2; }
 
+# WIDEN TO THE PR RANGE. `git push` hands a hook the PUSH range (the remote's
+# current tip), but every CI job this rail stands in for grades the PULL REQUEST
+# range — `changed-harnesses` diffs the PR base sha, and so do the title and
+# lint jobs. On the FIRST push of a branch those coincide; on the second
+# they do not, and the difference is silent in the worst direction: a follow-up
+# commit that only MODIFIES is graded here against a base that already contains
+# the harness an earlier commit ADDED, so the corpus-wide contracts are not
+# selected, the rail greens, and CI reds on the wider range. That is the same
+# defect class as the selector's (a set chosen narrower than the merge gate's),
+# reached by a different route, and it is why this widening lives here rather
+# than in the hook: it is the rail's contract to grade what the gate will grade.
+#
+# Only ever widens: the merge base must be a real ancestor of the pushed base.
+# Pushing main itself leaves this alone (the merge base IS the remote tip), and
+# a repo with no origin/main keeps the base it was handed.
+if mb="$(git merge-base origin/main "$HEAD_REV" 2>/dev/null)" && [[ -n "$mb" ]] \
+   && [[ "$mb" != "$BASE" ]] && git merge-base --is-ancestor "$mb" "$BASE" 2>/dev/null; then
+  echo "pre-push-rail: widening base $(git rev-parse --short "$BASE" 2>/dev/null || echo "$BASE") -> $(git rev-parse --short "$mb") (the PR range CI grades, not the push range)." >&2
+  BASE="$mb"
+fi
+
 CAP="${FIVE_PUSH_RAIL_CAP:-360}"
 rc=0
 now_ms() { printf '%s' "$(( $(date +%s%N) / 1000000 ))"; }

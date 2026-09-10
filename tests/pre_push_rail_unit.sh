@@ -297,6 +297,35 @@ out="$( GIT_DIR="$SB/.git" rail "$BASE" HEAD --only=harnesses )"; rc=$?
   || no "A14 the hook's git environment reached the harness (rc=$rc): $out"
 git -C "$SB" reset -q --hard "$BASE"
 
+# A17: THE RAIL GRADES THE PR RANGE, NOT THE PUSH RANGE. `git push` hands a hook
+# the remote's current tip, but every CI job the rail stands in for diffs the PR
+# BASE. They coincide on a branch's first push and diverge on every one after —
+# so a follow-up commit that only MODIFIES would be graded against a base that
+# already contains the harness an earlier commit ADDED, the corpus-wide contracts
+# would not be selected (A16's rule, correctly applied to the wrong range), the
+# rail would green and CI would red. Same defect class as A15, different route.
+# Measured live: this branch's own second push reported "1/1 changed harness"
+# while its PR range adds a harness and touches three.
+#
+# The arm: a sandbox with a real origin/main two commits behind, an ADD in the
+# first branch commit and a MODIFY in the second, and the rail invoked with the
+# PUSH base. It must widen to the merge base and select the corpus contract.
+SB4="$TMP/pr-range"; mk_sandbox "$SB4"
+git -C "$SB4" update-ref refs/remotes/origin/main "$(git -C "$SB4" rev-parse HEAD)"
+printf '#!/usr/bin/env bash\nCORPUS=(tests/*.sh)\necho ok\n' >"$SB4/tests/a_corpus_contract_unit.sh"
+: >"$SB4/tests/keep_unit.sh"
+git -C "$SB4" add -A >/dev/null; git -C "$SB4" commit -qm 'chore: contract' >/dev/null
+git -C "$SB4" update-ref refs/remotes/origin/main "$(git -C "$SB4" rev-parse HEAD)"
+printf '#!/usr/bin/env bash\necho added\n' >"$SB4/tests/added_unit.sh"
+git -C "$SB4" add -A >/dev/null; git -C "$SB4" commit -qm 'test: add' >/dev/null
+push_base="$(git -C "$SB4" rev-parse HEAD)"   # what the SECOND push would hand the hook
+echo x >>"$SB4/tests/keep_unit.sh"
+git -C "$SB4" add -A >/dev/null; git -C "$SB4" commit -qm 'test: tweak' >/dev/null
+out="$( cd "$SB4" && bash scripts/pre-push-rail.sh "$push_base" HEAD --only=harnesses 2>&1 )"; rc=$?
+{ grep -q 'widening base' <<<"$out" && grep -q 'a_corpus_contract_unit.sh' <<<"$out"; } \
+  && ok "A17 the rail widens the push range to the PR range, so a follow-up commit is graded against the base CI grades" \
+  || no "A17 the rail graded the narrow push range (rc=$rc): $out"
+
 # ── both callers use the one selector ─────────────────────────────────────────
 wf="$ROOT/.github/workflows/unit-tests.yml"
 { grep -q 'bash scripts/changed-harnesses.sh' "$wf" \
