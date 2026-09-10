@@ -279,6 +279,12 @@ out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
 # a graded pull request — WHO owes the merge and WHY, so a hold names the seat that
 # can clear it instead of the board re-deriving `maker_agent` per render. READ off
 # this tree the way this file instructs, not derived by adding two.
+#
+# 98 -> 100 (DIVE-4111 + DIVE-4137 merge): both branches independently moved the
+# same 96-column literal to 98 for different pairs: reap_escalated_at/_n here and
+# merge_owner/merge_hold_reason on main. The merged tree contains both pairs, so
+# the value below was READ from a fresh tasks_db_init result on the merged tree;
+# it was not derived by adding either branch's delta.
 
 fresh_tree
 out=$(tasks_db_init 2>&1); rc=$?
@@ -288,8 +294,8 @@ actual=$(sqlite3 "$TASKS_DB" \
     WHERE name IN ('delivery_ref','delivered_at','delivery_ref_iteration','parked_at','park_reason','escalated_at','escalated_by','human_evidence')
     ORDER BY name;" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
 column_count=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM pragma_table_info('tasks');" 2>/dev/null)
-[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "98" ]] \
-  && ok "fresh schema: all 98 columns, including the eight former holes, are present" \
+[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "100" ]] \
+  && ok "fresh schema: all 100 columns, including the eight former holes, are present" \
   || bad "fresh schema: init returned a partial tasks table" "rc=$rc count=$column_count got=[$actual] want=[$required] out=$out"
 
 # --- Case 10 (DIVE-2197): migrate arm still rejects a failed ALTER ------------
