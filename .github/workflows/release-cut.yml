@@ -904,8 +904,9 @@ jobs:
           # DIVE-2582: FOLD changelog.d/*.md FRAGMENTS into CHANGELOG.md's top,
           # BEFORE the stamp below — same detached-commit-only rule (never main),
           # so stamp-changelog.sh sees the folded headings same as a manually-typed
-          # one. Not fatal for the same reason the stamp isn't: a cut must not die
-          # because a fragment drifted from the expected format.
+          # one. NO LONGER "not fatal because a fragment drifted from the expected
+          # format" — that exact reading is what DIVE-4177 measured as a shipped defect;
+          # see the refusal below.
           #
           # DIVE-2702: PASS THE ALREADY-CONSUMED BASELINE. The fold deletes fragments
           # in this detached tree only — main keeps them (DIVE-2247: no push to a
@@ -922,8 +923,26 @@ jobs:
           if [[ -n "${incumbent-}" && -z "${cut_from-}" ]]; then
             echo "::warning::could not resolve the main commit ${incumbent} was cut from — every already-shipped fragment will fold again and these notes will repeat previous releases' entries (DIVE-2702, DIVE-3170)"
           fi
-          if _folded=$(FOLD_RELEASED_BASELINE="${cut_from-}" bash scripts/fold-changelog-fragments.sh 2>&1); then
+          # DIVE-4177: THE ONE FAILURE THAT IS FATAL. A fragment whose first line is not
+          # `## Unreleased` used to be skipped and this step published anyway — that is
+          # how v0.29.0's notes listed two entries and no feature for a cut derived MINOR
+          # from three `feat` commits, and how v0.30.0 omitted the very commit that forced
+          # its own minor. Dropping an entry is not a degraded artifact, it is a WRONG one,
+          # and it is unrecoverable after the tag. The fold now exits 3 for exactly that
+          # case; every other non-zero keeps the old "publish anyway" reading, because a
+          # cut must still not die over a changelog that merely failed to fold.
+          # This cannot fire on a clean main — pr-title-lint grades the same heading at PR
+          # time (scripts/lint-changelog-fragments.sh), so it is a tripwire behind a gate.
+          set +e
+          _folded=$(FOLD_RELEASED_BASELINE="${cut_from-}" bash scripts/fold-changelog-fragments.sh 2>&1)
+          _fold_rc=$?
+          set -e
+          if [ "$_fold_rc" -eq 0 ]; then
             echo "changelog.d fragments folded for ${tag}: ${_folded} (DIVE-2582)"
+          elif [ "$_fold_rc" -eq 3 ]; then
+            echo "::error::REFUSING to cut ${tag}: one or more changelog.d fragments would be dropped from the release notes silently (DIVE-4177). Fix the fragment heading on main and re-run the cut — the notes are the only thing a box operator reads to decide what this version contains."
+            echo "::error::${_folded}"
+            exit 1
           else
             echo "::warning::changelog.d fragments could not be folded for ${tag} (${_folded}) — publishing anyway"
           fi

@@ -758,8 +758,20 @@ fi
 # The live half, against two stand-in bundles cheap enough to sit under the
 # floor on any box. This grades the whole arm — sizer, batched sampling and
 # verdict together — which the three arms above deliberately do not.
-printf '#!/bin/bash\nexit 0\n' >"$TMP/fake-eager";  chmod +x "$TMP/fake-eager"
-printf '#!/bin/bash\nexit 0\n' >"$TMP/fake-lazy";   chmod +x "$TMP/fake-lazy"
+#
+# THE STAND-IN MUST BE SUB-FLOOR, NOT ARBITRARILY CHEAP (DIVE-4177). A bare
+# `exit 0` costs whatever a fork costs on the day's runner, and the batch that
+# lifts it is BOUNDED at RATIO_BATCH_MAX_REPS — so on a fast box the two are in
+# a race the harness cannot win: measured on a GitHub runner 2026-09-10 (job
+# 102745705652) the capped batch of 64 read 55ms against the 60ms floor, the
+# probe SKIPPED, and both arms below went red on a box where nothing was wrong.
+# `sleep 0.005` makes the cost of one run a PROPERTY OF THE SCRIPT rather than
+# of the runner: one run stays far under the 60ms floor (so the arm still grades
+# the sub-floor path it exists for, and the capped-out arm below still skips at
+# reps=1), while any batch of 12 or more clears it on every box. The sizer picks
+# 16 from a ~5ms sample, so the bound is never approached.
+printf '#!/bin/bash\nsleep 0.005\nexit 0\n' >"$TMP/fake-eager";  chmod +x "$TMP/fake-eager"
+printf '#!/bin/bash\nsleep 0.005\nexit 0\n' >"$TMP/fake-lazy";   chmod +x "$TMP/fake-lazy"
 
 _t16_batched="$( PASS=0; FAIL=0; SKIPPED=0
   CONTROL="$TMP/fake-eager"; BUNDLE="$TMP/fake-lazy"; RATIO_FLOOR_MS=$_T16_FLOOR
