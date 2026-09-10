@@ -1387,7 +1387,7 @@ cmd_task_merge() {
   local rc=0 out=""
   out=$(printf '%s\0' "$ident" | sudo -n /usr/local/bin/5dive _merge_do 2>&1) || rc=$?
   if (( rc != 0 )) && ! sudo -n -l /usr/local/bin/5dive _merge_do >/dev/null 2>&1; then
-    fail "$E_PERMISSION" "$ident: this seat holds no _merge_do grant, so NOTHING RAN — the merge was not attempted and was not refused on standing. A seat provisioned before DIVE-3474 does not carry the grant until it is re-provisioned (5dive agent provision <seat>). Until then the merge stays with a seat that holds one."
+    fail "$E_PERMISSION" "$ident: this seat holds no _merge_do grant, so NOTHING RAN — the merge was not attempted and was not refused on standing. A seat provisioned before DIVE-3474 does not carry the grant until its managed sudoers is re-rendered: run 'sudo 5dive agent grant <seat> merge' as root on the box (DIVE-4183). Until then the merge stays with a seat that holds one."
   fi
   [[ -n "$out" ]] && printf '%s\n' "$out" >&2
   (( rc == 0 )) || { mark_reported; return "$rc"; }
