@@ -261,16 +261,40 @@ read -r RC4 _ < <(_hb_reclaim dev 30)
   || bad_t "[control] a healthy seat was parked on a stale wall" "reclaimed=${RC4:-?} row=$(row "$T4")"
 
 # =============================================================================
-# 5) CONTROL — a walled seat that overran the 45m budget still reclaims (c)
+# 5) a walled seat that overran the budget is HELD by rule (c) too (DIVE-4171)
+#
+# THIS ARM IS INVERTED FROM ITS FIRST FORM, deliberately, and the inversion is
+# the ticket. DIVE-4104 narrowed the park to rule (b) only and asserted here
+# that "a walled seat that also overran its 45m budget is still a real
+# overrun". Measured on codex 2026-09-09, that premise fails for any wall
+# OUTLASTING the budget — which every ChatGPT usage wall does: DIVE-4119 was
+# reaped at 11:20 ("overran 45m budget (reap #1)"), re-nudged into the same wall
+# at 11:30, and blocked + escalated at 12:21. A human gate was filed for a seat
+# that had lost nothing. DIVE-4171 extends the park to rule (c); the hold is
+# bounded by the SAME park (deadline+tick, else the 6h fallback), so arm 5b
+# below is the control that replaces this one's old job.
 # =============================================================================
 reset_all
 T5=$(mk_plain_claimed dev)
 db "UPDATE tasks SET started_at=datetime('now','-200 minutes') WHERE id=${T5};"
 sup_obs dev quota-exhausted "10 minutes"
 read -r RC5 _ < <(_hb_reclaim dev 30)
-[[ "$(row "$T5")" == "todo|NULL" ]] && (( ${RC5:-0} == 1 )) \
-  && ok_t "[control] the 45m budget arm is untouched — a walled seat's real overrun still reclaims" \
-  || bad_t "[control] the park swallowed a hard-cap overrun" "reclaimed=${RC5:-?} row=$(row "$T5")"
+[[ "$(row "$T5")" == in_progress\|* ]] && (( ${RC5:-1} == 0 )) \
+  && ok_t "a walled seat 200m past the budget is HELD by rule (c), not reaped (DIVE-4171)" \
+  || bad_t "a walled seat's overrun still reaped" "reclaimed=${RC5:-?} row=$(row "$T5")"
+
+# 5b) CONTROL — the hold is BOUNDED. The same row, same overrun, but the wall
+# observation is older than the 6h fallback cap (_HB_QUOTA_PARK_FALLBACK_SEC),
+# so the park has expired and rule (c) owns the row again. This is what keeps
+# arm 5 from being the wedge DIVE-4104's own comment calls worse than churn.
+reset_all
+T5B=$(mk_plain_claimed dev)
+db "UPDATE tasks SET started_at=datetime('now','-200 minutes') WHERE id=${T5B};"
+sup_obs dev quota-exhausted "7 hours"
+read -r RC5B _ < <(_hb_reclaim dev 30)
+[[ "$(row "$T5B")" == "todo|NULL" ]] && (( ${RC5B:-0} == 1 )) \
+  && ok_t "[control] an EXPIRED park releases the overrun to rule (c) — the hold cannot outlive its reason" \
+  || bad_t "[control] the park outlived its 6h cap" "reclaimed=${RC5B:-?} row=$(row "$T5B")"
 
 # =============================================================================
 # 6) CONTROL — an EXPIRED park reclaims: a park cannot wedge a claim
