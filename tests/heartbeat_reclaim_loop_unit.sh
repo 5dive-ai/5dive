@@ -481,5 +481,157 @@ done
   && ok_t "[replay] all four 2026-09-08 rows (4085/4071/4090/4088) stay DELIVERED on quinn — none bounced to its maker" \
   || bad_t "[replay] rows still bounce to their makers" "${BOUNCED} of 4 bounced"
 
+# =============================================================================
+# DIVE-4206 — THE WALL IS THE ACCOUNT'S, NOT THE SEAT'S
+# =============================================================================
+# 2026-09-10 02:24-02:45Z: dev, dev3 and ops were all frozen on the same
+# session-limit banner (shared `mark` auth profile), but the reclaimer asks only
+# about the seat it is reclaiming from — and a classification exists only where
+# the supervisor got a pane capture. One readable pane on the pool now parks
+# every claim on it.
+#
+# `_hb_agent_native_state` is stubbed rather than left to the real tmux probe:
+# it is what the headroom veto reads, and the harness's contract is no tmux.
+_NATIVE_STATE=""   # what every peer reads as, unless a case says otherwise
+_hb_agent_native_state() { printf '%s' "$_NATIVE_STATE"; }
+prof() {   # prof <profile> <seat>...  — put these seats on one auth profile
+  local a="$1"; shift; local j='{"agents":{}}' n
+  for n in "$@"; do j=$(jq --arg n "$n" --arg a "$a" '.agents[$n]={authProfile:$a}' <<<"$j"); done
+  printf '%s' "$j" >"$REGISTRY"
+}
+
+reset_all
+prof mark dev dev3
+_NATIVE_STATE="blocked"
+TP1=$(mk_plain_claimed dev)
+db "UPDATE tasks SET started_at=datetime('now','-40 minutes') WHERE id=${TP1};"
+sup_obs dev3 quota-exhausted "10 minutes"          # the PEER's pane, not dev's
+read -r RCP1 _ < <(_hb_reclaim dev 30)
+[[ "$(row "$TP1")" == in_progress\|* ]] && (( ${RCP1:-1} == 0 )) \
+  && ok_t "a peer on the same auth profile is walled -> this seat's claim is PARKED too" \
+  || bad_t "a shared-profile wall did not park the claim" "reclaimed=${RCP1:-?} row=$(row "$TP1")"
+
+# CONTROL — the headroom veto. Peer evidence is second-hand, so it parks only
+# while the pool has NO proven headroom. A seat that is natively idle/busy on
+# the same profile is ground truth that the account is under its limit
+# (DIVE-1666), and that beats another seat's stale observation.
+reset_all
+prof mark dev dev3
+_NATIVE_STATE="idle"
+TP2=$(mk_plain_claimed dev)
+db "UPDATE tasks SET started_at=datetime('now','-40 minutes') WHERE id=${TP2};"
+sup_obs dev3 quota-exhausted "10 minutes"
+read -r RCP2 _ < <(_hb_reclaim dev 30)
+[[ "$(row "$TP2")" == "todo|NULL" ]] && (( ${RCP2:-0} == 1 )) \
+  && ok_t "[control] a natively idle peer proves headroom — the stale peer wall does NOT park" \
+  || bad_t "[control] peer evidence parked a pool with proven headroom" "reclaimed=${RCP2:-?} row=$(row "$TP2")"
+
+# CONTROL — a wall on a DIFFERENT account says nothing about this one.
+reset_all
+prof mark dev
+prof other dev3
+_NATIVE_STATE="blocked"
+TP3=$(mk_plain_claimed dev)
+db "UPDATE tasks SET started_at=datetime('now','-40 minutes') WHERE id=${TP3};"
+sup_obs dev3 quota-exhausted "10 minutes"
+read -r RCP3 _ < <(_hb_reclaim dev 30)
+[[ "$(row "$TP3")" == "todo|NULL" ]] && (( ${RCP3:-0} == 1 )) \
+  && ok_t "[control] a wall on a DIFFERENT auth profile does not park this seat" \
+  || bad_t "[control] an unrelated account's wall parked this seat" "reclaimed=${RCP3:-?} row=$(row "$TP3")"
+
+# CONTROL — the seat's OWN reading is first-hand and is never vetoed by headroom.
+# Pins that the veto narrows the PEER arm only; folding it over both would undo
+# DIVE-4104 for the seat we can actually see.
+reset_all
+prof mark dev dev3
+_NATIVE_STATE="idle"
+TP4=$(mk_plain_claimed dev)
+db "UPDATE tasks SET started_at=datetime('now','-40 minutes') WHERE id=${TP4};"
+sup_obs dev quota-exhausted "10 minutes"
+read -r RCP4 _ < <(_hb_reclaim dev 30)
+[[ "$(row "$TP4")" == in_progress\|* ]] && (( ${RCP4:-1} == 0 )) \
+  && ok_t "[control] the seat's OWN wall parks regardless of a healthy peer" \
+  || bad_t "[control] the headroom veto swallowed the seat's own reading" "reclaimed=${RCP4:-?} row=$(row "$TP4")"
+
+# Leave the fixture as the rest of the file expects it: empty registry, no stub
+# opinion. A case that ran after this block on a `mark` profile would otherwise
+# inherit a peer wall it never set up.
+printf '{"agents":{}}' >"$REGISTRY"; _NATIVE_STATE=""
+
+# =============================================================================
+# DIVE-4206 — graded, and the MERGE is another seat's: no rule may reclaim it
+# =============================================================================
+# The shape DIVE-4161 went round four times and DIVE-4108 ten: a verifier has
+# graded the pass, the delivery is bound, and the outstanding act is a merge
+# owed by main. Reclaiming it to todo is what makes it look like buildable work
+# again, and the picker then hands it back to a maker who owes nothing on it.
+mk_graded_awaiting_merge() {   # <maker> <merge-owner>
+  local maker="${1:-dev}" owner="${2:-main}" id
+  id=$(mk_delivered_unacked "$maker" quinn)
+  db "UPDATE tasks
+         SET assignee=$(sqlq "$maker"), status='in_progress',
+             started_at=datetime('now','-40 minutes'),
+             graded_at=datetime('now','-30 minutes'), graded_by='quinn',
+             graded_verdict='pass', merge_owner=$(sqlq "$owner"),
+             delivery_ref='https://example.com/pr/1'
+       WHERE id=${id};"
+  printf '%s' "$id"
+}
+
+reset_all
+TM1=$(mk_graded_awaiting_merge dev main)
+read -r RCM1 _ < <(_hb_reclaim dev 30)
+[[ "$(row "$TM1")" == in_progress\|* ]] && (( ${RCM1:-1} == 0 )) \
+  && ok_t "graded, merge owed by main: idle stall does NOT reclaim — claim left in place" \
+  || bad_t "a row waiting on another seat's merge was reclaimed" "reclaimed=${RCM1:-?} row=$(row "$TM1")"
+
+# Rule (a) is checked BEFORE the idle arm and had its own path back to todo, so
+# the gone-session shape gets its own assertion rather than riding on the one
+# above: a restart is not a reason to re-present a row whose remaining step
+# belongs to someone else either.
+reset_all
+TM2=$(mk_graded_awaiting_merge dev main)
+gone_session "$TM2"
+read -r RCM2 _ < <(_hb_reclaim dev 30)
+live_session
+[[ "$(row "$TM2")" == in_progress\|* ]] && (( ${RCM2:-1} == 0 )) \
+  && ok_t "graded, merge owed by main: a GONE SESSION does not reclaim it either" \
+  || bad_t "rule (a) reclaimed a row waiting on another seat's merge" "reclaimed=${RCM2:-?} row=$(row "$TM2")"
+
+# The hard-cap arm too — a merge that is not this seat's move does not become
+# this seat's move by sitting there for 200 minutes.
+reset_all
+TM3=$(mk_graded_awaiting_merge dev main)
+db "UPDATE tasks SET started_at=datetime('now','-200 minutes') WHERE id=${TM3};"
+read -r RCM3 _ < <(_hb_reclaim dev 30)
+[[ "$(row "$TM3")" == in_progress\|* ]] && (( ${RCM3:-1} == 0 )) \
+  && ok_t "graded, merge owed by main: the 200m hard cap does not reclaim it either" \
+  || bad_t "the hard-cap arm reclaimed a row waiting on another seat's merge" "reclaimed=${RCM3:-?} row=$(row "$TM3")"
+
+# CONTROL — the merge owner's OWN row is still ordinary work. Same fixture with
+# the owner flipped to dev: this seat owes the merge, so the pre-4206 rules must
+# still apply to it. A skip that swallowed every graded row would pass all three
+# assertions above and fail here.
+reset_all
+TM4=$(mk_graded_awaiting_merge dev dev)
+read -r RCM4 _ < <(_hb_reclaim dev 30)
+[[ "$(row "$TM4")" != in_progress\|* ]] && (( ${RCM4:-0} >= 1 )) \
+  && ok_t "[control] graded with the merge owed by THIS seat — the ordinary rules still fire" \
+  || bad_t "[control] the skip swallowed the merge owner's own row" "reclaimed=${RCM4:-?} row=$(row "$TM4")"
+
+# CONTROL — delivered but NOT yet graded is a different state and keeps its
+# DIVE-4104 behaviour (back to the verifier's queue, delivery intact). Pins the
+# graded_at half of the predicate.
+reset_all
+TM5=$(mk_delivered_unacked dev quinn)
+db "UPDATE tasks SET assignee='dev', status='in_progress',
+       started_at=datetime('now','-20 minutes') WHERE id=${TM5};"
+gone_session "$TM5"
+read -r RCM5 _ < <(_hb_reclaim dev 30)
+live_session
+[[ "$(who "$TM5")" == "quinn|quinn|dev|deliv|noack" ]] \
+  && ok_t "[control] delivered but UNGRADED still routes to the verifier (DIVE-4104 unchanged)" \
+  || bad_t "[control] the 4206 skip swallowed an ungraded delivery" "who=$(who "$TM5") reclaimed=${RCM5:-?}"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
