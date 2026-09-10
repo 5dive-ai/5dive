@@ -184,15 +184,6 @@ cmd_task_grader_replay() {
     case "$1" in
       --days=*) days="${1#--days=}" ;;
       --cap=*)  cap="${1#--cap=}" ;;
-      # --only=<ident>: act on ONE named delivery and leave the rest of the
-      # queue untouched. This is not a convenience — it is the control that
-      # makes the FIRST live run of this lane possible without collateral. The
-      # tick is otherwise all-or-nothing over whatever is pending, so an
-      # operator running the owed end-to-end arm (DIVE-4217) would have had to
-      # let it also spawn graders onto other people's rows, whose verifier is
-      # someone else. It filters the pending set; it releases no lock, so
-      # --commit is still required to act and the pool must still be named.
-      --only=*) only="${1#--only=}" ;;
       --service-cap=*) svc="${1#--service-cap=}" ;;
       --json)   JSON_MODE=1; json=1 ;;
       *) fail "$E_USAGE" "usage: 5dive task grader-replay [--days=N] [--cap=N] [--json]" ;;
@@ -337,7 +328,7 @@ _grader_can_read() {  # <seat> <ident>
   # `5dive gh` is used rather than bare `gh` so the read is routed by the same
   # identity policy every other read in this CLI goes through.
   #
-  # community/wiki/a-selftest-that-needs-a-merged-control-cannot-be-a-read-probe-for-an-open-pr.md
+  # community/wiki/a-selftest-is-not-a-capability-probe-and-reusing-one-inverts-the-guardrail.md
   local state
   state=$(sudo -n -u "agent-${seat}" 5dive gh pr view "$ref" --json state -q .state 2>/dev/null | tail -1)
   [[ -n "$state" ]]
