@@ -103,8 +103,13 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # DIVE-4177: the `if` above already keeps this step off `merge_group`, but
+          # tests/merge_queue_triggers_unit.sh arm3 is a TEXT grep over the file and
+          # cannot see a step-level condition. Use the branching idiom pii-guard.yml
+          # and supply-chain-guard.yml already use, so the expression itself is safe
+          # on either event.
+          BASE_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.event.pull_request.head.sha }}
         run: |
           set -uo pipefail
           # --diff-filter=d: a fragment DELETED by this PR is not graded (that is how an

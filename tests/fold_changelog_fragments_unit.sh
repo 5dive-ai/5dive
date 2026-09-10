@@ -271,7 +271,7 @@ cp "$(dirname "$SCRIPT")/release-cut-baseline.sh" "$RG7/scripts/"
 # cut() — mirrors release-cut.yml: detach, fold against the derived baseline, then
 # TWO commits (assign, bundle), tag the second, and return main to where it was.
 cut(){ ( set -e; cd "$RG7"
-    inc="$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
+    inc="$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)" || inc=""
     # `[[ -n "$inc" ]] && ...` would return 1 on the first cut and kill this
     # subshell under set -e, silently producing no tag at all.
     base=""
