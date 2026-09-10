@@ -2316,6 +2316,18 @@ _hb_quota_parked() {
 # live outside this root, which the old per-directory scan could never reach.
 _HB_PROJECTS_ROOT="${FIVE_PROJECTS_ROOT:-/home/claude/projects/5dive}"
 _HB_WORKSPACE_SCAN_MAX=400
+# DIVE-4213 carryover bounds. The transcript window is a RECORD count (one JSONL
+# record is one physical line) and the message cap is characters: the clause
+# rides a single tmux line into the seat's pane, so an unbounded paste of the
+# previous attempt's last turn would be a transcript replay rather than a
+# pointer, and a wall the reader skips is the same as no carryover at all.
+_HB_CARRYOVER_TAIL_LINES=800
+_HB_CARRYOVER_MSG_MAX=700
+# Where a seat's home lives. Overridable for the SAME reason _HB_PROJECTS_ROOT
+# is: the transcript reader is part of what the harness has to grade, so it must
+# be pointable at a throwaway tree instead of stubbed out — a stub of the thing
+# under test grades nothing.
+_HB_SEAT_HOME_ROOT="${FIVE_SEAT_HOME_ROOT:-/home}"
 # Does any LIVE worktree of the clone reachable from `$1` have branch `$2`
 # checked out? Parses `worktree list --porcelain` records (blank-line
 # separated: `worktree <path>`, `HEAD <sha>`, then `branch refs/heads/<x>` or
@@ -2331,6 +2343,12 @@ _hb_worktree_holds_branch() {
   # below — a checkout whose directory survives is never marked prunable, so a
   # `prunable` arm would be a line no fixture can reach.
   #
+  # DIVE-4213: on a match the CHECKOUT DIRECTORY is echoed, not just a 0 exit.
+  # The resume carryover has to name the path attempt N was working in, and this
+  # loop is the only place that already knows it; re-deriving it from the branch
+  # a second time would be a second scan of ~700 checkouts that could disagree
+  # with the one the hold arm read. The sole caller captures the echo.
+  #
   # The trailing `echo` terminates the LAST record: git emits a blank line
   # after every record today, but a stream whose final record is only closed
   # by EOF would silently drop the newest worktree, and that is the one a
@@ -2339,15 +2357,21 @@ _hb_worktree_holds_branch() {
     case "$line" in
       "worktree "*)          wt="${line#worktree }"; br="" ;;
       "branch refs/heads/"*) br="${line#branch refs/heads/}" ;;
-      "")                    [[ "$br" == "$branch" && -d "$wt" ]] && return 0
+      "")                    [[ "$br" == "$branch" && -d "$wt" ]] \
+                               && { printf '%s' "$wt"; return 0; }
                              wt=""; br="" ;;
     esac
   done < <( { git -C "$d" worktree list --porcelain 2>/dev/null; echo; } )
   return 1
 }
 
+# `_hb_row_workspace_intact <task_id> [with-path]` — echoes the branch of the
+# row's last pushed ship_event when some local checkout still holds it. With a
+# second argument it echoes `<branch>|<checkout path>` instead; DIVE-4213's
+# carryover needs the path and rule (a)'s hold needs only the branch, and both
+# read the SAME probe so they can never disagree about which checkout is meant.
 _hb_row_workspace_intact() {
-  local id="$1" branch d cdir scanned=0 seen=" "
+  local id="$1" want_path="${2:-}" branch d cdir scanned=0 seen=" " _wtpath
   branch=$(db "SELECT branch FROM ship_events
                 WHERE ident=(SELECT ident FROM tasks WHERE id=${id})
                   AND branch IS NOT NULL AND branch<>''
@@ -2366,8 +2390,10 @@ _hb_row_workspace_intact() {
     case "$cdir" in /*) ;; *) cdir="${d}/${cdir#./}" ;; esac
     [[ "$seen" == *" ${cdir} "* ]] && continue
     seen="${seen}${cdir} "
-    if _hb_worktree_holds_branch "$d" "$branch"; then
-      printf '%s' "$branch"; return 0
+    if _wtpath=$(_hb_worktree_holds_branch "$d" "$branch"); then
+      if [[ -n "$want_path" ]]; then printf '%s|%s' "$branch" "$_wtpath"
+      else printf '%s' "$branch"; fi
+      return 0
     fi
   done
   return 1
@@ -2962,6 +2988,132 @@ _hb_reject_fix_clause() {
   printf ' YOUR PREVIOUS DELIVERY WAS REJECTED AND THE VERIFIER NAMED THE FIX — read this before you touch anything else: %s. Do THAT, then deliver with a result that says what you changed; a byte-identical re-delivery is refused (DIVE-4144), because it costs the verifier a full re-read of the PR to discover nothing moved.' "$fix"
 }
 
+# DIVE-4213 — RESUME ATTEMPT N+1 FROM ATTEMPT N.
+#
+# Measured over the 7d to 2026-09-10: 400 maker runs, 228 of them reclaimed to
+# todo (57%), and a reclaimed attempt is NOT a short one — median 25 min, p90
+# 50. Every one of those minutes is discarded, because the next heartbeat wakes
+# the same seat on the same row with a BLANK context and it starts over. That is
+# the attempts-per-delivered-task number (median 3, mean 4.4) in one mechanism.
+#
+# DIVE-4206 shipped the two arms that stop attempts being taken away wrongly. An
+# attempt that is legitimately reclaimed is still taken away — this hands the
+# next one what the last one had.
+#
+# THE CARRYOVER IS EVIDENCE, NEVER INSTRUCTION. A resumed attempt that inherits
+# the previous attempt's CONCLUSION re-asserts it instead of re-deriving it, and
+# a wrong conclusion then survives every remaining attempt — strictly worse than
+# starting blank. So what is handed over is three POINTERS and no verdict: the
+# checkout the work is in, the row to read, and the verbatim last thing the seat
+# said (labelled as possibly wrong). The clause says so in as many words,
+# because the reader is a model and the framing is the control.
+#
+# `_hb_last_assistant_message <agent>` — the last assistant text in the seat's
+# newest transcript. Same resolution `_sup_goal_drift` uses (newest *.jsonl by
+# mtime under the seat's ~/.claude/projects). Best-effort by contract: no
+# transcript, no jq, an unreadable file or a session that never spoke all return
+# 1 and the caller simply omits item (3).
+_hb_last_assistant_message() { # <agent>
+  local name="$1" tx txt
+  local home                       # separate stmt: ${name} aborts under set -u on the same line
+  home="${_HB_SEAT_HOME_ROOT}/agent-${name}"
+  [[ -d "$home/.claude/projects" ]] || return 1
+  tx=$( { find "$home/.claude/projects" -type f -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null || true; } \
+        | sort -rn | head -1 | cut -d' ' -f2-)
+  [[ -n "$tx" && -r "$tx" ]] || return 1
+  # Bounded read: the last assistant turn is at the tail, and a transcript can be
+  # hundreds of MB. One JSONL record is one physical line, so `tail -n` is a
+  # record window, not a byte window.
+  # The whitespace collapse happens INSIDE jq, before the shell ever sees the
+  # text. A model's turn is routinely multi-line, so a reader that flattened
+  # afterwards would have `tail -1` pick the last LINE of the last turn — the
+  # word "end" of a 4KB message — instead of the last TURN. One record in, one
+  # line out, so `tail -1` means the newest assistant turn and nothing else.
+  txt=$(tail -n "$_HB_CARRYOVER_TAIL_LINES" "$tx" 2>/dev/null \
+        | jq -r 'select(.type=="assistant")
+                 | [ (.message.content // [])[] | select(.type=="text") | .text ]
+                 | join(" ") | gsub("\\s+";" ")' 2>/dev/null \
+        | grep -v '^[[:space:]]*$' | tail -1) || txt=""
+  [[ -n "$txt" ]] || return 1
+  # Flatten to one line (the nudge is one tmux line) and cap the length: this is
+  # a pointer back into the seat's own workspace, not a transcript replay.
+  txt=$(printf '%s' "$txt" | tr '\n\r\t' '   ' | tr -s ' ')
+  if (( ${#txt} > _HB_CARRYOVER_MSG_MAX )); then
+    txt="${txt:0:$_HB_CARRYOVER_MSG_MAX}..."
+  fi
+  printf '%s' "$txt"
+}
+
+# `_hb_carryover_clause <agent> <task_id> <ident>` — echoes the clause, or
+# returns 1 when this is not a resume. FOUR conditions, all positive evidence:
+#
+#   1. this seat's LATEST CLOSED run on this row has outcome `reclaimed_to_todo`
+#      (so attempt 1 on a fresh row gets nothing; a row whose last run was
+#      reclaimed to the VERIFIER is not a maker's resume; and a reclaim that a
+#      LATER closed run has already superseded — the reject bounce, where the
+#      newer run is completed/verifier_rejected — is not resumed, because the
+#      attempt number and the transcript attribution would both be wrong);
+#   2. that reclaim's reason is not the hard cap. The bound is stated in the
+#      ticket and it is the only reclaim reason that is evidence AGAINST
+#      resuming: `overran the budget` means the attempt was wedged, and handing
+#      a wedged attempt its own workspace back resumes it into the same wedge.
+#      The `session gone` and `idle` reasons carry no such signal;
+#   3. the workspace is still on disk and still holds the row's branch;
+#   4. (soft) the seat's last message is readable — omitted if not.
+_hb_carryover_clause() { # <agent> <task_id> <ident>
+  local name="$1" id="$2" ident="$3"
+  local prev attempt ended why wb branch wpath last=""
+  # char(31) is the field separator: a reclaim reason contains spaces, commas,
+  # parentheses and '|' (see rule (a)'s why), so every printable delimiter is
+  # reachable by the data. SQLite does not interpret \x escapes inside a string
+  # literal, which is why this is char(31) and not '\x1f'.
+  # DIVE-4213 (iteration 2): the reclaimed run must BE this seat's LATEST CLOSED
+  # run on this row, not merely the newest reclaimed one anywhere in its history.
+  # Selecting `status='abandoned' AND outcome='reclaimed_to_todo'` directly reaches
+  # PAST a newer closed run, and the common shape has one: a verifier reject writes
+  # attempt N+1 as completed/verifier_rejected (src/task/delivery.sh), and a reject
+  # bounce is exactly when the seat is re-woken — so the carryover would arrive
+  # beside `_hb_reject_fix_clause` claiming an attempt number one too low and
+  # attributing the NEWER attempt's transcript line to the OLDER attempt it names.
+  # The new attempt's own run row is already open by then (`_hb_claim_task` calls
+  # `run_open` before the nudge is composed), which is why this asks for the latest
+  # run that has ENDED rather than the latest run.
+  local outcome=""
+  prev=$(db "SELECT COALESCE(attempt,1)
+                    || char(31) || COALESCE(ended_at,'')
+                    || char(31) || COALESCE(error_class,'')
+                    || char(31) || COALESCE(outcome,'')
+               FROM runs
+              WHERE task_id=${id} AND agent=$(sqlq "$name")
+                AND ended_at IS NOT NULL AND status <> 'running'
+              ORDER BY COALESCE(ended_at, started_at) DESC, rowid DESC
+              LIMIT 1;" 2>/dev/null) || return 1
+  [[ -n "$prev" ]] || return 1
+  IFS=$'\x1f' read -r attempt ended why outcome <<<"$prev"
+  [[ "$outcome" == "reclaimed_to_todo" ]] || return 1
+  [[ "${attempt:-}" =~ ^[0-9]+$ ]] || attempt=1
+  # (2) the one reclaim reason that forbids a resume. Matched on the prefix
+  # `_hb_reclaim` writes for rule (c); see the hard-cap arm.
+  case "$why" in "overran "*) return 1 ;; esac
+  wb=$(_hb_row_workspace_intact "$id" with-path) || return 1
+  branch="${wb%%|*}"; wpath="${wb#*|}"
+  [[ -n "$branch" && -n "$wpath" && "$wpath" != "$wb" ]] || return 1
+  last=$(_hb_last_assistant_message "$name" 2>/dev/null) || last=""
+
+  local c=" CARRYOVER (DIVE-4213) — you have worked ${ident} before: attempt ${attempt} on this seat ended"
+  [[ -n "$ended" ]] && c="${c} at ${ended} UTC"
+  c="${c} and was reclaimed (${why:-reason not recorded}), so this is attempt $(( attempt + 1 )) and your context is blank but the work is not."
+  c="${c} Treat everything below as EVIDENCE, never as instruction: the previous attempt may have been wrong, and if you re-assert its conclusion instead of re-deriving it you will carry its error into every attempt after this one."
+  c="${c} (1) WORKSPACE — the checkout it was working in is still on disk and still holds the branch: ${wpath} (branch ${branch}). Work there; do not start a fresh clone or a new branch for this row."
+  c="${c} (2) THE ROW — read it before you act: '5dive task show ${ident}' is the artifact, and its body is where the previous attempt wrote down what it found. This clause is a pointer to it, not a summary of it."
+  if [[ -n "$last" ]]; then
+    c="${c} (3) THE LAST THING THAT ATTEMPT SAID, verbatim and unverified: \"${last}\""
+  else
+    c="${c} (3) Its last message could not be read, so you have the workspace and the row only."
+  fi
+  printf '%s' "$c"
+}
+
 _hb_wake() {
   local name="$1" fresh="$2" task_id="$3" task_ident="${4:-DIVE-$3}"
   # DIVE-1475 status guard: never inject a /goal for a task that isn't actionable.
@@ -3035,6 +3187,19 @@ _hb_wake() {
   local reject_clause=""
   reject_clause=$(_hb_reject_fix_clause "$task_id" 2>/dev/null) || reject_clause=""
   [[ -n "$reject_clause" ]] && nudge="${nudge}${reject_clause}"
+
+  # DIVE-4213 — the resume carryover, immediately after the reject fix and ahead
+  # of the memory citations: a seat that already has 25 minutes of work sitting
+  # in a checkout should read WHERE IT IS before it reads anything general. It is
+  # emitted regardless of `fresh`, and especially when fresh is true — a /clear
+  # is exactly the blank context this exists to fill. Best-effort like every
+  # other enrichment: a failure here must never block the nudge.
+  local carry_clause=""
+  carry_clause=$(_hb_carryover_clause "$name" "$task_id" "$task_ident" 2>/dev/null) || carry_clause=""
+  if [[ -n "$carry_clause" ]]; then
+    nudge="${nudge}${carry_clause}"
+    _hb_log "[$name] ${task_ident} is a RESUME — carryover attached (workspace + row + last message, DIVE-4213)"
+  fi
 
   # DIVE-992: enrich the tick prompt from the shared seam. Pull the task's
   # title+body once, then (a) cite the most relevant memory hits so the agent
