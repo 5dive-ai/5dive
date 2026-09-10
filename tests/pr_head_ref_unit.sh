@@ -183,4 +183,4 @@ else
 fi
 
 echo "pr-head-ref: $pass passed, $fail failed"
-[ "$fail" = 0 ]
+[ "$fail" -eq 0 ]
