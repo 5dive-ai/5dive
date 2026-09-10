@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Backfill default skills onto every existing agent user. New agents get the
-# default skill set at create time (install_default_skill_for_agent in the
-# CLI); this script brings already-provisioned boxes up to the same set so a
-# newly-added default skill (e.g. `openagent`, DIVE-658) lands on agents that
-# were created before it joined the defaults. Idempotent.
+# same set at create time (preseed_default_skills_for_type in the CLI); this
+# script brings already-provisioned boxes up to it, so a newly-added default
+# lands on agents created before it joined the list. Both halves read ONE list
+# — see DIVE-4203 below. Idempotent.
 #
 # Per agent: for each default skill, force re-pull it via
 # `5dive agent skill <name> add --force` (which resolves the agent's type,
@@ -27,41 +27,53 @@
 # Standalone usage:
 #   sudo /usr/local/bin/5dive-refresh-skills.sh            # all agents
 #   sudo /usr/local/bin/5dive-refresh-skills.sh dev        # one agent (sans agent- prefix)
+#   REFRESH_SKILLS_PRINT_PLAN=1 /usr/local/bin/5dive-refresh-skills.sh  # list only, touch nothing
 
 set -uo pipefail
 
 FIVE_BIN="${FIVE_BIN:-/usr/local/bin/5dive}"
 
-# Default skills every agent should carry, as `<owner/repo>:<skill-id>` specs.
-# Keep in sync with install_default_skill_for_agent calls in the CLI's
-# lib/agent_setup.sh. find-skills / 5dive-cli / compile-knowledge are seeded at
-# create time and rarely change; the backfill's job is mainly to roll out
-# newly-added defaults like openagent onto pre-existing boxes.
-# DIVE-4130 (2026-09-10): `openagent` REMOVED from this array. It was added by
-# DIVE-658 as a backfill of a then-new default; it is a one-shot persona/card
-# minting skill, every seat that wanted a card has one, and no charter names it
-# in a keep-set. Because this loop is a FORCE re-pull with no skip-if-present,
-# membership here made the skill *unremovable per seat*: `5dive agent skill rm
-# openagent` returned ok:true and the 23:15 cron re-created the directory the
-# same night (measured 2026-09-09, /var/log/5dive-host-updates.log: "+ <seat> —
-# re-pulling openagent" x17, then ctime 23:17:12 on the fresh copy). A daily
-# reconciler does not propagate a local deletion, it reverts it — so the removal
-# had to be a one-line edit HERE, not 17 `rm`s.
-# NOTE (residue, not fixed here): openagent is ALSO seeded at agent-create time
-# by install_default_skill_for_agent in src/lib/agent_setup.sh, so newly created
-# seats still get it. This edit makes the removal durable on EXISTING seats only.
-DEFAULT_SKILLS=(
-  # DIVE-2160: 5dive-cli was MISSING here while being seeded at provisioning
-  # (cmd_agent_create.sh: skills_specs=("5dive-cli")), so every agent carried a
-  # copy that this script could never refresh — the loop below iterates ONLY
-  # DEFAULT_SKILLS, there is no refresh-what-is-installed path. Result: a skill
-  # resync reached the repo and never reached a single agent, silently, while
-  # the maintenance wiki told people to "refresh via 5dive-refresh-skills.sh".
-  # The mechanism was right and the DATA was wrong, which is why nothing failed.
-  "5dive-ai/skills:5dive-cli"
-)
+# THE DEFAULT-SKILLS LIST LIVES IN ONE PLACE, AND IT IS NOT HERE (DIVE-4203).
+# It is DEFAULT_AGENT_SKILLS in the CLI's src/lib/agent_setup.sh, read back below
+# via the hidden `5dive agent _default_skills` primitive.
+#
+# Why: this file used to carry its own hand-maintained DEFAULT_SKILLS array, and
+# it had already drifted from the provisioner's — the create path seeded four
+# skills, this array held one. The consequence was not cosmetic. DIVE-4130
+# removed `openagent` from 16 of 16 on-type seats and PR #837 removed it from
+# THIS array so the nightly force re-pull would stop reverting the deletion; the
+# create path still seeded it, so the fleet-wide removal lasted exactly until the
+# next `5dive agent create`. Fixing the reconciler does not fix the provisioner.
+# One list, two consumers, and tests/default_skills_single_list_unit.sh diffs
+# them so they cannot drift apart again.
+#
+# FORCE RE-PULL, NOT install-if-missing (DIVE-698) — see the header above; that
+# is also why membership in this list makes a skill unremovable per seat, and why
+# a removal has to be an edit to the LIST rather than N `rm`s.
 
 [[ -x "$FIVE_BIN" ]] || { echo "no 5dive at $FIVE_BIN — skipping skills refresh" >&2; exit 0; }
+
+# Read THE list. A bundle too old to know `_default_skills` prints nothing and
+# exits non-zero; say so and refresh NOTHING rather than fall back to a second
+# hardcoded copy — a silent fallback list is the drift this row exists to end,
+# and the installer refreshes the bundle before it runs this script, so an empty
+# read here means something is genuinely wrong.
+mapfile -t DEFAULT_SKILLS < <("$FIVE_BIN" agent _default_skills 2>/dev/null || true)
+if [[ ${#DEFAULT_SKILLS[@]} -eq 0 ]]; then
+  echo "warn: '$FIVE_BIN agent _default_skills' returned no skills — refreshing nothing." >&2
+  echo "      (bundle predates DIVE-4203? upgrade the CLI, then re-run this script.)" >&2
+  exit 0
+fi
+
+# Plan seam (DIVE-4203): print the resolved list and stop, touching no agent.
+# Two callers — an operator asking "what would tonight's refresh pull?", and
+# tests/default_skills_single_list_unit.sh, which diffs THIS output against what
+# the provisioner seeds. The drift arm needs the refresh half of the comparison
+# to be readable without a box, 17 seats and a network.
+if [[ -n "${REFRESH_SKILLS_PRINT_PLAN:-}" ]]; then
+  printf '%s\n' "${DEFAULT_SKILLS[@]}"
+  exit 0
+fi
 
 # Resolve the requested agents: an explicit name argument, else every
 # registered agent (registry first, /home/agent-* fallback like
