@@ -103,9 +103,17 @@ for f in undetermined cross_runner_state budget_attribution; do
 done
 
 # --- Arm 8: a non-numeric rc REFUSES rather than being swallowed -------------
-run_se '' 'core/pristine-s1'
-[[ $rc -eq 2 ]] && ok_t "arm 8: an empty rc refuses (exit 2), it is not read as green" \
-               || bad_t "arm 8: a non-numeric rc must refuse" "rc=$rc"
+# GRADE THE REFUSAL MESSAGE, NOT ONLY THE CODE. A mutation battery caught this:
+# with the guard deleted the arm still passed, because `exit ""` makes bash itself
+# exit 2 with its own error. The status was right for a reason that had nothing to
+# do with the guard, so the arm proved nothing about it. The message is the one
+# observable only this script can produce.
+for bad_rc in '' 'abc' '-1'; do
+  run_se "$bad_rc" 'core/pristine-s1'
+  { [[ $rc -eq 2 ]] && grep -q 'shard-exit: refusing a non-numeric rc' <<<"$out"; } \
+    && ok_t "arm 8: rc '${bad_rc:-<empty>}' is REFUSED by name (exit 2), not read as green" \
+    || bad_t "arm 8: a non-numeric rc must refuse in this script's own words" "rc=$rc out=$out"
+done
 
 # --- Arm 9: EVERY workflow shard routes through the translator ---------------
 # The fix is worth nothing on a call site that did not get it, and a new shard is
