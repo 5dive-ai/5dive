@@ -166,7 +166,7 @@ cmd_task_add() {
   local proj_lead
   proj_lead=$(db "SELECT COALESCE(lead_agent,'') FROM projects WHERE key=$(sqlq "$project") AND status='active';")
   if [[ -z "$proj_lead" ]]; then
-    db "SELECT 1 FROM projects WHERE key=$(sqlq "$project") AND status='active';" | grep -q 1 \
+    grep -q 1 < <(db "SELECT 1 FROM projects WHERE key=$(sqlq "$project") AND status='active';") \
       || fail "$E_NOT_FOUND" "no active project '$project' (see: 5dive project ls; create: 5dive project add)"
   fi
   local parent_sql="NULL"

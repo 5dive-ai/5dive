@@ -71,19 +71,19 @@ while IFS= read -r line; do
   # MISSED. The second is the dangerous one — NEW-DOMAIN is the backstop for an unknown
   # host, but a fetch-to-shell from a domain ALREADY trusted in the base tree yields no
   # new domain, so process substitution slipped past BOTH checks and this printed "none".
-  printf '%s' "$line" | grep -qE "(curl|wget)[^|]*\|[[:space:]]*(sudo[[:space:]]+)?($_INTERP)\b" \
+  grep -qE "(curl|wget)[^|]*\|[[:space:]]*(sudo[[:space:]]+)?($_INTERP)\b" <<<"$line" \
     && { emit "FETCH-TO-SHELL: $(printf '%s' "$line" | sed 's/^[[:space:]]*//' | cut -c1-140)"; continue; }
-  printf '%s' "$line" | grep -qE "($_INTERP|source|\.)[[:space:]]+<\([[:space:]]*(curl|wget)" \
+  grep -qE "($_INTERP|source|\.)[[:space:]]+<\([[:space:]]*(curl|wget)" <<<"$line" \
     && { emit "FETCH-TO-SHELL(procsub): $(printf '%s' "$line" | sed 's/^[[:space:]]*//' | cut -c1-140)"; continue; }
-  printf '%s' "$line" | grep -qE '(eval|exec)[^;]*\$\([[:space:]]*(curl|wget)' \
+  grep -qE '(eval|exec)[^;]*\$\([[:space:]]*(curl|wget)' <<<"$line" \
     && { emit "FETCH-TO-SHELL(eval): $(printf '%s' "$line" | sed 's/^[[:space:]]*//' | cut -c1-140)"; continue; }
 done <<< "$ADDED"
 
 # 2. NEW TYPE_INSTALL RECIPE — the agent-type install path, which runs as root.
 while IFS= read -r line; do
   [[ -z "$line" ]] && continue
-  printf '%s' "$line" | grep -qE '^\s*\[[a-z0-9_-]+\]="' \
-    && printf '%s' "$line" | grep -qE 'curl|wget|npm|pip|install' \
+  grep -qE '^\s*\[[a-z0-9_-]+\]="' <<<"$line" \
+    && grep -qE 'curl|wget|npm|pip|install' <<<"$line" \
     && emit "INSTALL-RECIPE: $(printf '%s' "$line" | sed 's/^[[:space:]]*//' | cut -c1-140)"
 done <<< "$ADDED"
 
@@ -97,7 +97,7 @@ if [[ -n "$NEWHOSTS" ]]; then
                | sed -E 's#https?://##' | tr 'A-Z' 'a-z' | sort -u)"
   while IFS= read -r h; do
     [[ -z "$h" ]] && continue
-    printf '%s\n' "$BASEHOSTS" | grep -qxF "$h" || emit "NEW-DOMAIN: $h  (not contacted anywhere in $BASE)"
+    grep -qxF "$h" <<<"$BASEHOSTS" || emit "NEW-DOMAIN: $h  (not contacted anywhere in $BASE)"
   done <<< "$NEWHOSTS"
 fi
 

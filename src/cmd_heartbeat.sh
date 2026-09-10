@@ -2434,8 +2434,8 @@ _hb_recall_cite() {
 # broad; a false positive just adds one reminder line.
 _hb_is_knowledge_task() {
   local text="$1"
-  printf '%s' "$text" \
-    | grep -qiE 'research|digest|competitor|market (scan|intel|research)|\bintel\b|analy[sz]|\bfindings\b|survey|benchmark|landscape|write-?up|\bwiki\b|knowledge|investigat|\brecap\b|\bstudy\b'
+  grep -qiE 'research|digest|competitor|market (scan|intel|research)|\bintel\b|analy[sz]|\bfindings\b|survey|benchmark|landscape|write-?up|\bwiki\b|knowledge|investigat|\brecap\b|\bstudy\b' \
+    <<<"$text"
 }
 
 # DIVE-2063 / DIVE-2111: the maker→verifier terminal-state clause appended to the

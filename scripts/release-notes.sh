@@ -268,17 +268,17 @@ added=$(_rn_changelog_added | _rn_group)
 # "Has content" means a non-blank line exists — a range that only added blank lines
 # or a heading-less fragment is not notes, and treating it as notes would publish an
 # empty body while reporting success.
-if printf '%s\n' "$added" | grep -q '[^[:space:]]'; then
+if grep -q '[^[:space:]]' <<<"$added"; then
   body="$added"
   source_label="CHANGELOG.md over ${from:-<root>}..${to}"
 else
   body=$(_rn_commit_summary)
-  if printf '%s\n' "$body" | grep -q '[^[:space:]]'; then
+  if grep -q '[^[:space:]]' <<<"$body"; then
     source_label="commit subjects over ${from:-<root>}..${to} (CHANGELOG.md gained nothing in this range)"
   fi
 fi
 
-if ! printf '%s\n' "$body" | grep -q '[^[:space:]]'; then
+if ! grep -q '[^[:space:]]' <<<"$body"; then
   echo "::error::release notes for v${version} could not be derived — CHANGELOG.md gained nothing over ${from:-<root>}..${to} and the range has no commits. Refusing to publish a release whose body would describe only how it was cut (DIVE-2452)." >&2
   exit 1
 fi

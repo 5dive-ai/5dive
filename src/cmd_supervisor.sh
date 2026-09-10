@@ -1136,7 +1136,7 @@ _sup_cli_check() {
   if [[ -r "$log" ]]; then
     local start_line ok_last=true last_at last_epoch=""
     start_line=$(grep -n "soft updates start" "$log" | tail -1 | cut -d: -f1) || start_line=""
-    if [[ -n "$start_line" ]] && tail -n "+${start_line}" "$log" | grep -q "CLI upgrade via install.5dive.com failed"; then
+    if [[ -n "$start_line" ]] && grep -q "CLI upgrade via install.5dive.com failed" < <(tail -n "+${start_line}" "$log"); then
       ok_last=false
     fi
     last_at=$(grep -oE "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:+-]+ soft updates done" "$log" \

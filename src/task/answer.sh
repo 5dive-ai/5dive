@@ -89,14 +89,14 @@ _loop_answer_is_bounce() {
   # colon, semicolon, comma or sentence stop. Everything after that is the
   # REASONING, and the reasoning is where the false positives live.
   _seg="${_first%%[—:;,.]*}"
-  if printf '%s' "$_seg" | grep -qE "\b(${_LOOP_BOUNCE_STEMS})\b"; then
+  if grep -qE "\b(${_LOOP_BOUNCE_STEMS})\b" <<<"$_seg"; then
     return 0
   fi
   # Advancing — but say so when the vocabulary appears anywhere, rather than
   # silently choosing. This is the compatibility window: it surfaces the real
   # population before anything is gated on it
   # (community/wiki/a-control-partitions-a-population-and-populations-drift.md).
-  printf '%s' "$_v" | grep -qE "\b(${_LOOP_BOUNCE_STEMS})\b" && _LOOP_BOUNCE_AMBIGUOUS=1
+  grep -qE "\b(${_LOOP_BOUNCE_STEMS})\b" <<<"$_v" && _LOOP_BOUNCE_AMBIGUOUS=1
   return 1
 }
 
