@@ -288,11 +288,15 @@ jobs:
             echo "changed-harnesses: BLOCKED — could not resolve a base commit to diff against; refusing to report 'no harnesses changed' on the strength of a diff that never ran." >&2
             exit 1
           fi
-          # tests/*.sh only, never tests/lib/ or tests/meta/ — the same corpus shape
-          # the shell glob in tier.sh selects. Deleted files are excluded (ACMR): a
-          # harness that is gone cannot be run, and a deletion is the one direction
-          # this whole row is trying to make easier.
-          mapfile -t files < <(git diff --name-only --diff-filter=ACMR "$base" HEAD -- 'tests/*.sh' ':(exclude)tests/lib/*' ':(exclude)tests/meta/*')
+          # DIVE-4208: the selection itself lives in scripts/changed-harnesses.sh and
+          # is CALLED, not inlined, because the pre-push rail
+          # (scripts/pre-push-rail.sh) now runs the same set in the maker's worktree
+          # before the push. Two copies of this pathspec would be one contract with
+          # two authors, and the drift is silent in the worst direction: the local
+          # rail greens on a set that does not include the harness CI is about to
+          # red on. The base-resolution above stays here because only CI knows about
+          # merge groups; everything downstream of "which files" is the script's.
+          mapfile -t files < <(bash scripts/changed-harnesses.sh "$base" HEAD)
           printf 'base=%s\n' "$base"
           printf 'changed harnesses: %d\n' "${#files[@]}"
           printf '  %s\n' "${files[@]:-（none）}"
