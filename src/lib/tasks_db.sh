@@ -325,6 +325,29 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- resurrect exactly the FAILs this column exists to record.
   graded_verdict TEXT,
   graded_verdict_at TEXT,
+  -- DIVE-4137: WHO OWES THE MERGE on a graded-and-waiting row, and WHY.
+  -- Until now the board derived that owner from maker_agent, which is wrong in the
+  -- common case: the maker has nothing left to do on a branch that is green and
+  -- clean and merely needs a person's eyes, and waking them costs a full reload of
+  -- a pull request they had closed out. The verifier's close now DECIDES the owner
+  -- (src/task/delivery.sh, _merge_disp_decide) and records it, so the board renders
+  -- a decision that was actually made rather than a guess re-derived per render.
+  --   merge_owner  the seat that owes the look — 'main' for every hold except the
+  --                one a maker alone can clear (a conflicted branch needing a
+  --                rebase), which names the maker.
+  --   merge_hold_reason  the disposition's own reason token, e.g.
+  --                'graded-sha-is-not-the-head', 'merge-state-BLOCKED',
+  --                'user-facing-surface'. Rendered in `task show`, not on the
+  --                compact board.
+  -- BARE SET, not COALESCE: this is CURRENT STATE about the CURRENT head. A row
+  -- re-graded after the maker pushes must be able to move from a hold back to a
+  -- merge, and a frozen first answer would make that impossible. NULL = no
+  -- disposition has been recorded (a row graded before this column existed, or one
+  -- that never reached the verifier close), and every reader COALESCEs NULL back to
+  -- the pre-DIVE-4137 maker_agent render, so the migration is a pure ALTER with no
+  -- backfill and no already-graded row changes how it paints.
+  merge_owner TEXT,
+  merge_hold_reason TEXT,
   -- DIVE-3823: RECORDED MERGE EVIDENCE. The merge gate has three ways to ASK
   -- GitHub (caller token, the root-only `_gh_do` bot rail, the anonymous rail) and
   -- a verifier seat on a PRIVATE repo holds none of them: `_gh_do` is the can-push
@@ -636,6 +659,27 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- which is what the ladder means and is immune to the band moving underneath it.
   nudge_escalated_n INTEGER,
   nudge_parked_at TEXT,
+  -- DIVE-4111: reap_escalated_at / reap_escalated_n latch the heartbeat's
+  -- hard-cap AUTO-PAUSE to once per (row, owner). The arm it guards used a
+  -- THRESHOLD on a monotonic counter -- `reap_n >= _HB_REAP_ESCALATE_AFTER` --
+  -- and _hb_mark_reap only ever increments, so the 3rd, 4th and 5th reap of the
+  -- same row each re-ran the whole escalation: re-block, re-bump the priority,
+  -- re-ping the owner AND the paired human. Measured 2026-09-08: 12 of the
+  -- fleet's 14 escalations that day were reaps 2..5 of four codex rows. A
+  -- threshold on a counter that never resets is not a latch; this column is.
+  -- CLEARED by an explicit `task assign` to a DIFFERENT owner (src/task/crud.sh,
+  -- alongside recurring_stall_escalated_at) and only there: the reap COUNT it
+  -- throttles lives per-agent in the registry
+  -- (.agents[<name>].heartbeat.reaps), so a latch that outlived the owner would
+  -- leave the new seat's own count able to climb with the pause permanently
+  -- disarmed. NOT cleared by `task unblock` -- re-arming it there is exactly the
+  -- loop this row was filed for, since `unblock` is the verb `task doctor`
+  -- prescribes for the no-anchor finding the pause itself produces.
+  reap_escalated_at TEXT,
+  -- DIVE-4111: the reap count at which the auto-pause fired, for the record --
+  -- read by nothing that branches, so a NULL on a pre-existing row is not a
+  -- behaviour change.
+  reap_escalated_n INTEGER,
   -- DIVE-2207: gate_answered_nudged_at throttles the POST-GATE-ANSWER nudge
   -- (gap#2's second predicate) to once per row. It is a SEPARATE column from
   -- handoff_stale_pinged_at on purpose, and reusing that one would have shipped
@@ -1709,6 +1753,7 @@ _TASKS_ADDITIVE_COLUMNS=(
   'stranded_pinged_at TEXT'
   'gate_answered_nudged_at TEXT'
   'nudge_escalated_at TEXT' 'nudge_escalated_n INTEGER' 'nudge_parked_at TEXT'
+  'reap_escalated_at TEXT' 'reap_escalated_n INTEGER'
   'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT'
   'gate_filed_by TEXT'
   'secret_key TEXT' 'connector TEXT' 'secret_oob TEXT' 'human_nonce_hash TEXT'
@@ -1756,6 +1801,10 @@ _TASKS_ADDITIVE_COLUMNS=(
   # See the CREATE TABLE comment for why these are bare-SET while graded_at is
   # COALESCE'd, and why NULL must keep reading as a pass.
   'graded_verdict TEXT' 'graded_verdict_at TEXT'
+  # DIVE-4137: the recorded merge disposition — who owes the look and why. See the
+  # CREATE TABLE comment for why it is bare-SET and why NULL must keep reading as
+  # the pre-DIVE-4137 maker_agent render.
+  'merge_owner TEXT' 'merge_hold_reason TEXT'
   # DIVE-3823: recorded merge evidence the credential-less verifier's close can
   # consult. See the CREATE TABLE comment for why it is structural and why
   # merge_proof_ref must match the CURRENT binding.

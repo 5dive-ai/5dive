@@ -213,3 +213,42 @@ and model/effort from the `5dive-ai/character-packs` registry. `reports_to`,
 `role`, `goals`, and an explicit `model`/`effort` override still apply on top.
 `channels`, `telegram_token`, `auth_profile`, `workdir`, `defer_auth` pass through.
 See the `5dive-team` template for a full company built this way.
+
+## Permission tiers are the importer's, not the template's (DIVE-4119)
+
+A template may carry a policy block its roles read — `distribution.channels` in
+the Distribution team is the shipped example. Everything in such a block is a
+**default the importer edits**, at import time or later, and the roles read
+whatever the file says at the time they run. 5dive does not decide which
+surfaces a customer's team may act on, or which of them need a person.
+
+Where a block gives a target a permission tier and a transport, use this
+vocabulary so the tiers mean the same thing across templates:
+
+| `permission` | meaning |
+|---|---|
+| `AUTO` | a verifier-passed item proceeds without asking |
+| `APPROVAL` | the team's Head signs off first |
+| `HUMAN` | a named person the importing team nominates signs off first |
+
+| `transport` | meaning |
+|---|---|
+| `api` | an adapter over the target's API |
+| `browser` | the browser plugin drives a session a person logged into by hand; the template supplies no platform list, and a target with no adapter is reported unavailable rather than assumed |
+| `human` | a person acts by hand; the team prepares and stops |
+
+Two rules keep a default from hardening back into a rule:
+
+1. **Ship no target at `HUMAN` by decree, and none at a transport the executor
+   cannot run.** A default of "a person does this one" is the hardcode, however
+   it is labelled. Be cautious in the tier, never in the vocabulary.
+2. **Keep policy out of role instructions.** An `instructions:` prompt is prose
+   the schema never reads, so a target named there is policy no importer can
+   edit and no test can see. Roles reference the block; they do not restate it.
+
+The same applies to a template's own tests: an arm that pins a target's *value*
+(`reddit == HUMAN`) re-imposes the tier on the next person to touch the file,
+with a green harness as the enforcement. Grade the *property* — the vocabulary,
+the absence of decreed tiers, and a round trip through the parser in **both**
+directions, since a default that cannot be raised is as hardcoded as one that
+cannot be lowered.

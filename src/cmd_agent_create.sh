@@ -2749,7 +2749,7 @@ cmd_create() {
     tb_owner=$(jq -r '.owner // empty' /etc/5dive/team-bot.json 2>/dev/null)
     if [[ -z "$tb_token" || -z "$tb_group" ]]; then
       team_bot_status="off"
-    elif _team_bot_relay_agent_list | grep -qxF "$name"; then
+    elif grep -qxF "$name" < <(_team_bot_relay_agent_list); then
       step "Attaching $name to the shared team bot (group $tb_group)"
       local tb_prev_json="$JSON_MODE"
       JSON_MODE=0
@@ -2888,8 +2888,8 @@ cmd_create() {
   if channel_in_list buzz "$channels"; then
     local _bz_home="/home/agent-${name}" _bz_gaps=() _bz_cfg _bz_path
     _bz_cfg="${_bz_home}/.claude/channels/buzz/config.json"
-    if ! find "${_bz_home}/.claude/plugins/cache" -maxdepth 3 -type d -name buzz \
-         -print -quit 2>/dev/null | grep -q .; then
+    if ! grep -q . < <(find "${_bz_home}/.claude/plugins/cache" -maxdepth 3 -type d -name buzz \
+         -print -quit 2>/dev/null); then
       _bz_gaps+=("plugin not installed")
     fi
     if [[ ! -f "$_bz_cfg" ]]; then

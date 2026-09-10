@@ -214,7 +214,7 @@ for f in "${ADDED[@]}"; do
     continue
   fi
   violation=""
-  if ! printf '%s\n' "$content" | grep -qE "$GRADING_TREE_SOURCE_RE"; then
+  if ! grep -qE "$GRADING_TREE_SOURCE_RE" <<<"$content"; then
     violation="$f is a new harness that does not source tests/lib/grading_tree.sh (DIVE-2211 contract)."
   else
     # DIVE-3074: the text match is not the property. A `$(dirname ...)`-relative

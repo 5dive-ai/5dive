@@ -556,20 +556,20 @@ _memory_check_validate() {
   # honest outcome; the damage this row is about is a TRUE fact demoted 0.4x,
   # and the parse refusal plus the unknown net close that completely.
   # 1. read-only
-  if printf '%s' "$c" | grep -qE '(^|[;&|[:space:]])(sudo|rm|rmdir|mv|dd|mkfs|shutdown|reboot|kill|pkill|truncate|chmod|chown|tee)([[:space:]]|$)'; then
+  if grep -qE '(^|[;&|[:space:]])(sudo|rm|rmdir|mv|dd|mkfs|shutdown|reboot|kill|pkill|truncate|chmod|chown|tee)([[:space:]]|$)' <<<"$c"; then
     fail "$E_VALIDATION" "--check must be READ-ONLY — it is run unattended by \`memory check\` (refused: writes/escalates)"
   fi
   # Redirection: silencing is fine, writing a file is not. Strip the shapes that
   # produce no file (>/dev/null, >/dev/stderr, 2>&1) and refuse whatever `>` is
   # left — that one has a path on the end of it.
   local _redir; _redir="$(printf '%s' "$c" | sed -E 's/[0-9]?>>?[[:space:]]*\/dev\/(null|stdout|stderr)//g; s/[0-9]?>>?&[0-9-]//g')"
-  if printf '%s' "$_redir" | grep -q '>'; then
+  if grep -q '>' <<<"$_redir"; then
     fail "$E_VALIDATION" "--check must be READ-ONLY — redirecting to a file is a write (>/dev/null 2>&1 is allowed if you only meant to silence it)"
   fi
-  if printf '%s' "$c" | grep -qE '(curl|wget)[^|]*\|[[:space:]]*(ba)?sh'; then
+  if grep -qE '(curl|wget)[^|]*\|[[:space:]]*(ba)?sh' <<<"$c"; then
     fail "$E_VALIDATION" "--check must be READ-ONLY — piping a download into a shell is not a check"
   fi
-  if printf '%s' "$c" | grep -qE '5dive[[:space:]]+(task|agent|memory)[[:space:]]+(done|add|cancel|start|send|kill|rm|reject|deliver)'; then
+  if grep -qE '5dive[[:space:]]+(task|agent|memory)[[:space:]]+(done|add|cancel|start|send|kill|rm|reject|deliver)' <<<"$c"; then
     fail "$E_VALIDATION" "--check must be READ-ONLY — it must not drive the board or the fleet"
   fi
   # 2. cannot go red
@@ -608,7 +608,7 @@ _memory_add() {
     shift
   done
   [ -n "$name" ] || fail "$E_USAGE" "memory add: --name=<kebab-slug> is required"
-  printf '%s' "$name" | grep -qE '^[a-z0-9][a-z0-9-]{0,63}$' \
+  grep -qE '^[a-z0-9][a-z0-9-]{0,63}$' <<<"$name" \
     || fail "$E_VALIDATION" "--name must be kebab-case, ≤ 64 chars"
   [ -n "$desc" ] || fail "$E_USAGE" "memory add: --description is required (it's what recall ranks on)"
   case "$store" in mine|wiki) : ;; *) fail "$E_VALIDATION" "bad --store '$store' (mine | wiki)" ;; esac
@@ -617,10 +617,10 @@ _memory_add() {
     case "$type" in user|feedback|project|reference) : ;; *) fail "$E_VALIDATION" "bad --type '$type' (user | feedback | project | reference)" ;; esac
   fi
   # DIVE-1024 lifecycle envelope (all optional; absent = pre-1024 behavior).
-  if [ -n "$valid_to" ]; then printf '%s' "$valid_to" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
+  if [ -n "$valid_to" ]; then grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' <<<"$valid_to" \
       || fail "$E_VALIDATION" "--valid-to must be an ISO date (YYYY-MM-DD)"; fi
   if [ -n "$confidence" ]; then case "$confidence" in high|medium|low) : ;; *) fail "$E_VALIDATION" "--confidence must be high|medium|low" ;; esac; fi
-  if [ -n "$supersedes" ]; then printf '%s' "$supersedes" | grep -qE '^[a-z0-9][a-z0-9_-]{0,63}$' \
+  if [ -n "$supersedes" ]; then grep -qE '^[a-z0-9][a-z0-9_-]{0,63}$' <<<"$supersedes" \
       || fail "$E_VALIDATION" "--supersedes must be the slug of the memory it replaces"; fi
   # DIVE-3106 evidence back-refs: a STRUCTURAL path from the claim to the ground
   # truth, so re-verification is a mechanical walk. The kind prefix is what makes
@@ -632,11 +632,11 @@ _memory_add() {
       *) fail "$E_VALIDATION" "--evidence must be <kind>:<ref> (file|task|cmd|sha|url|run), got: $_ev" ;;
     esac
     case "$_ev" in
-      task:*) printf '%s' "${_ev#task:}" | grep -qE '^[A-Z]+-[0-9]+$' \
+      task:*) grep -qE '^[A-Z]+-[0-9]+$' <<<"${_ev#task:}" \
           || fail "$E_VALIDATION" "--evidence task: wants a board ident like DIVE-1234, got: ${_ev#task:}" ;;
-      sha:*)  printf '%s' "${_ev#sha:}" | grep -qE '^[0-9a-f]{7,40}$' \
+      sha:*)  grep -qE '^[0-9a-f]{7,40}$' <<<"${_ev#sha:}" \
           || fail "$E_VALIDATION" "--evidence sha: wants a git sha, got: ${_ev#sha:}" ;;
-      url:*)  printf '%s' "${_ev#url:}" | grep -qE '^https?://' \
+      url:*)  grep -qE '^https?://' <<<"${_ev#url:}" \
           || fail "$E_VALIDATION" "--evidence url: wants an http(s) URL, got: ${_ev#url:}" ;;
     esac
   done
@@ -675,7 +675,7 @@ _memory_add() {
   # blocked (unlike the pack exporter, which stages whole files). --force does
   # not bypass this: a secret in a memory store outlives the session that knew
   # why it was there.
-  if printf '%s\n%s' "$desc" "$body" | grep -qiE 'BOT_TOKEN=|API_KEY=|-----BEGIN|sk-[A-Za-z0-9]{8,}|[0-9]{8,}:[A-Za-z0-9_-]{30,}'; then
+  if grep -qiE 'BOT_TOKEN=|API_KEY=|-----BEGIN|sk-[A-Za-z0-9]{8,}|[0-9]{8,}:[A-Za-z0-9_-]{30,}' <<<"${desc}"$'\n'"${body}"; then
     fail "$E_VALIDATION" "the body looks like it contains a token/key (tripwire) — memories must reference where a secret LIVES, never its value"
   fi
 
@@ -800,7 +800,7 @@ _memory_check() {
     shift
   done
   case "$store" in all|mine|wiki) : ;; *) fail "$E_VALIDATION" "bad --store '$store' (all | mine | wiki)" ;; esac
-  printf '%s' "$timeout_s" | grep -qE '^[0-9]+$' || fail "$E_VALIDATION" "--timeout must be whole seconds"
+  grep -qE '^[0-9]+$' <<<"$timeout_s" || fail "$E_VALIDATION" "--timeout must be whole seconds"
   [ "$timeout_s" -gt 0 ] || fail "$E_VALIDATION" "--timeout must be > 0"
   command -v python3 >/dev/null 2>&1 || fail "$E_GENERIC" "memory check needs python3"
   local resolved; resolved=$(_memory_resolve_roots "$store" "$agent" "$roots")
@@ -1517,9 +1517,9 @@ _memory_consolidate() {
     esac
     shift
   done
-  printf '%s' "$max_sessions" | grep -qE '^[0-9]+$' || fail "$E_VALIDATION" "--max-sessions must be a number"
-  printf '%s' "$idle_min"     | grep -qE '^[0-9]+$' || fail "$E_VALIDATION" "--idle-min must be a number (minutes)"
-  printf '%s' "$max_chars"    | grep -qE '^[0-9]+$' || fail "$E_VALIDATION" "--max-chars must be a number"
+  grep -qE '^[0-9]+$' <<<"$max_sessions" || fail "$E_VALIDATION" "--max-sessions must be a number"
+  grep -qE '^[0-9]+$' <<<"$idle_min"     || fail "$E_VALIDATION" "--idle-min must be a number (minutes)"
+  grep -qE '^[0-9]+$' <<<"$max_chars"    || fail "$E_VALIDATION" "--max-chars must be a number"
   [ "$max_chars" -ge 500 ] || fail "$E_VALIDATION" "--max-chars below 500 leaves nothing to distill"
 
   # Own store only. Same resolution rule as `memory add` so both verbs agree on
@@ -1627,7 +1627,7 @@ _memory_consolidate() {
         # could-not-run with zero atoms. That is this row's defect wearing the
         # fix's clothes: the headline number stays zero for the working case.
         (( JSON_MODE )) || echo "  ✓ [$a_type] $a_name"
-      elif printf '%s' "$addout" | grep -q 'already exists'; then
+      elif grep -q 'already exists' <<<"$addout"; then
         n_dupe=$((n_dupe+1))
       else
         # A refusal is a RESULT, not an error to swallow: the secret tripwire

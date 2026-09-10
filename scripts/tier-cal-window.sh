@@ -195,7 +195,7 @@ else
 fi
 printf '\n'
 
-declare -a LBL=() CAL=() LOAD=() POST=() DELTA=() HN=() WALL=()
+declare -a LBL=() CAL=() BASE=() LOAD=() POST=() DELTA=() HN=() WALL=()
 skipped=0; skipnames=""
 for f in "${FILES[@]}"; do
   if [[ ! -r "$f" ]]; then skipped=$((skipped+1)); skipnames="$skipnames $f(unreadable)"; continue; fi
@@ -211,6 +211,9 @@ for f in "${FILES[@]}"; do
   fi
   LBL+=("$(field "$f" label)/$(field "$f" tier)")
   CAL+=("$_cal"); HN+=("$_h"); WALL+=("$_w")
+  _base="$(field "$f" cal_baseline_us_per_iter)"
+  [[ "$_base" =~ ^[0-9]+$ ]] || _base=0
+  BASE+=("$_base")
   LOAD+=("$(( _w * 1000000 / _h ))")
   _p="$(field "$f" cal_post_us_per_iter)"; [[ "$_p" =~ ^[0-9]+$ ]] || _p=0
   _d="$(field "$f" cal_post_delta_pct)";   [[ "$_d" =~ ^-?[0-9]+$ ]] || _d=0
@@ -235,16 +238,65 @@ fi
 med() { # med <values...> -> lower median
   printf '%s\n' "$@" | sort -n | sed -n "$(( (${#@} + 1) / 2 ))p"
 }
-mcal="$(med "${CAL[@]}")"; mload="$(med "${LOAD[@]}")"
 
-printf 'tier-cal-window: %d run(s), median probe %dus/iter, median corpus %dus/harness\n' \
-  "$n" "$mcal" "$mload"
+# DIVE-4166: a label is the comparison population. Pooling pristine/installed-host,
+# core/full, or old/new shard layouts manufactures movement from composition. Build
+# each median from its own label+tier and exclude groups too small to have an interior.
+declare -A GCAL=() GLOAD=() GBASE=() GN=() GMCAL=() GMLOAD=() GMBASE=() GOK=()
+for i in "${!CAL[@]}"; do
+  _g="${LBL[$i]}"
+  GCAL["$_g"]+=" ${CAL[$i]}"; GLOAD["$_g"]+=" ${LOAD[$i]}"
+  (( BASE[i] > 0 )) && GBASE["$_g"]+=" ${BASE[$i]}"
+  GN["$_g"]=$(( ${GN["$_g"]:-0} + 1 ))
+done
+eligible_n=0; eligible_groups=0; thin_groups=0; rebaseline_required=0
+while IFS= read -r _g; do
+  (( ${GN["$_g"]} >= MIN_RUNS )) || { thin_groups=$((thin_groups+1)); continue; }
+  read -r -a _gc <<<"${GCAL["$_g"]}"
+  read -r -a _gl <<<"${GLOAD["$_g"]}"
+  GMCAL["$_g"]="$(med "${_gc[@]}")"; GMLOAD["$_g"]="$(med "${_gl[@]}")"
+  if [[ -n "${GBASE["$_g"]:-}" ]]; then
+    read -r -a _gb <<<"${GBASE["$_g"]}"
+    GMBASE["$_g"]="$(med "${_gb[@]}")"
+  else
+    GMBASE["$_g"]=0
+  fi
+  GOK["$_g"]=1; eligible_groups=$((eligible_groups+1)); eligible_n=$((eligible_n + ${GN["$_g"]}))
+done < <(printf '%s\n' "${!GN[@]}" | sort)
+
+if (( eligible_groups == 0 )); then
+  printf 'tier-cal-window: UNDETERMINED — %d samples split across %d label group(s), but no group has %d comparable runs.\n' \
+    "$n" "${#GN[@]}" "$MIN_RUNS" >&2
+  printf 'Do not pool labels: shard/layout and pristine/installed-host composition are part of the measurement.\n' >&2
+  exit 2
+fi
+
+printf 'tier-cal-window: %d comparable run(s) across %d label group(s); medians are per label, never pooled\n' \
+  "$eligible_n" "$eligible_groups"
+while IFS= read -r _g; do
+  [[ "${GOK["$_g"]:-}" == 1 ]] || { printf '  %-28s excluded: %d run(s), need %d\n' "$_g" "${GN["$_g"]}" "$MIN_RUNS"; continue; }
+  printf '  %-28s n=%d probe=%dus/iter corpus=%dus/harness\n' \
+    "$_g" "${GN["$_g"]}" "${GMCAL["$_g"]}" "${GMLOAD["$_g"]}"
+  _base="${GMBASE["$_g"]}"
+  if (( _base > 0 && ${GN["$_g"]} >= 20 )); then
+    _off=$(( ${GMCAL["$_g"]} * 100 / _base - 100 )); (( _off < 0 )) && _off=$(( -_off ))
+    if (( _off >= TIER_CAL_REBASELINE_PCT )); then
+      printf '  REBASELINE REQUIRED: %s has %d comparable samples and its median probe is %d%% off baseline %dus/iter.\n' \
+        "$_g" "${GN["$_g"]}" "$_off" "$_base"
+      rebaseline_required=$((rebaseline_required+1))
+    fi
+  fi
+done < <(printf '%s\n' "${!GN[@]}" | sort)
+(( thin_groups )) && printf 'tier-cal-window: %d thin label group(s) excluded from calibration verdicts\n' "$thin_groups"
 (( skipped )) && printf 'tier-cal-window: skipped %d —%s\n' "$skipped" "$skipnames"
 printf '\n%-22s %5s %6s %11s %11s %11s %7s  %s\n' \
   RUN HARN WALL_S US/HARN CAL_US POST_US DELTA% VERDICT
 
 conc=0; disc=0; unprot=0; neutral=0
 for i in "${!CAL[@]}"; do
+  _g="${LBL[$i]}"
+  [[ "${GOK["$_g"]:-}" == 1 ]] || continue
+  mcal="${GMCAL["$_g"]}"; mload="${GMLOAD["$_g"]}"
   cs=0; (( CAL[i]  > mcal ))  && cs=1;  (( CAL[i]  < mcal ))  && cs=-1
   ls=0; (( LOAD[i] > mload )) && ls=1;  (( LOAD[i] < mload )) && ls=-1
   if (( cs == 0 || ls == 0 )); then v="at-median"; neutral=$((neutral+1))
@@ -264,6 +316,10 @@ printf 'CONCORDANT = probe and corpus sat on the SAME side of the window median,
 printf 'relative budget doing what DIVE-2710 assumed. DISCORDANT = opposite sides. UNPROTECTED is\n'
 printf 'the discordant half that costs somebody a red: probe below median (reads FAST, so the\n'
 printf 'clamp floors the scale at 100%% and the cap cannot widen) while the corpus sat above it.\n'
+if (( rebaseline_required )); then
+  printf '\ntier-cal-window: %d label group(s) need a re-baseline. This verdict is published by\n' "$rebaseline_required"
+  printf 'header-drift-window.yml to its durable issue; it is not another warning buried in one shard log.\n'
+fi
 
 if (( unprot )); then
   printf '\ntier-cal-window: %d UNPROTECTED run(s). On each, the mechanism was live and applied no\n' "$unprot"

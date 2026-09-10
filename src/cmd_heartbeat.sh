@@ -2235,7 +2235,10 @@ _hb_reclaim_to_verifier() {
 #       loses real mid-flight work (DIVE-482/200). A task that keeps overrunning
 #       even after a clean requeue is genuinely stuck: on the
 #       _HB_REAP_ESCALATE_AFTER'th reap, block it + escalate (ping owner & human)
-#       so it's visible, not churning — still never auto-cancelled.
+#       so it's visible, not churning — still never auto-cancelled. DIVE-4111:
+#       that escalation fires ONCE per (row, owner), latched on
+#       reap_escalated_at, and the pause CLEARS started_at like every other
+#       reclaim does; later reaps of the same row requeue it silently.
 #
 # (a)/(b)/(c) all reclaim the work (it still needs doing); (c) additionally
 # escalates a repeat offender. Nothing is ever cancelled here. Echoes
@@ -2340,14 +2343,63 @@ _hb_reclaim() {
       local reap_n
       reap_n=$(with_registry_lock _hb_mark_reap "$name" "$id")
       if [[ "${reap_n:-0}" =~ ^[0-9]+$ ]] && (( reap_n >= _HB_REAP_ESCALATE_AFTER )); then
-        db "UPDATE tasks SET status='blocked', updated_at=datetime('now'),
+        # DIVE-4111 — TWO defects lived in this one branch, and each alone made
+        # the auto-pause permanent.
+        #
+        # (1) A THRESHOLD ON A MONOTONIC COUNTER IS NOT A LATCH. `reap_n >=
+        # _HB_REAP_ESCALATE_AFTER` was true on the 2nd reap and on every reap
+        # after it, and _hb_mark_reap only ever increments — the sole thing that
+        # clears an entry is the row leaving the agent's open set. So a row that
+        # was unblocked and overran again re-ran the WHOLE escalation: re-block,
+        # cmd_task_escalate (priority bump, ping the owner, ping the paired
+        # HUMAN'S PHONE), log line. Measured 2026-09-08: 12 of the fleet's 14
+        # escalations that day were reaps 2..5 of four codex rows. The comment
+        # above says the point is that the row is "visible, not churning"; the
+        # threshold delivered the opposite. The latch column now sits IN THE
+        # WHERE CLAUSE THAT SETS IT (the DIVE-3218 rung-1 pattern ~900 lines up),
+        # so `changes()==0` is the refusal — a status-only guard would say yes to
+        # both of two concurrent ticks, and cron starts tick N+1 while N still
+        # runs (src/cmd_heartbeat.sh:4 — one host cron, no flock).
+        #
+        # (2) started_at SURVIVED THE PAUSE, and every path back to `todo`
+        # COALESCEs it: cmd_task_unblock sets status only, cmd_task_start is
+        # `started_at=COALESCE(started_at, datetime('now'))`. So an unblocked row
+        # re-entered in_progress carrying a timestamp from hours earlier,
+        # `age_min >= budget` was true immediately, and it was reaped on the
+        # FIRST tick after the unblock — it never got its ${budget} minutes.
+        # `task unblock` is the exact verb `task doctor` prescribes for the
+        # no-anchor finding this pause produces, so the remedy fed the loop.
+        # Clearing it here is the same one-column write _hb_reclaim_to_todo makes
+        # deliberately; `first_started_at` still carries the board-visible
+        # evidence that work happened (DIVE-3251) and is NOT in this UPDATE.
+        local prev_started applied_pause
+        prev_started=$(db "SELECT COALESCE(started_at,'') FROM tasks WHERE id=${id};" 2>/dev/null) || prev_started=""
+        applied_pause=$(db "UPDATE tasks SET status='blocked', started_at=NULL, updated_at=datetime('now'),
+              reap_escalated_at=datetime('now'), reap_escalated_n=${reap_n},
               result='auto-paused by heartbeat: overran the ${budget}m in_progress budget ${reap_n}x even after a clean requeue — needs a human to requeue or close. NEVER auto-cancelled.'
-            WHERE id=${id} AND status='in_progress';" 2>/dev/null || true
-        # Subshell-wrap: cmd_task_escalate may fail->exit on an edge case; a bare
-        # call would kill the whole tick. It bumps priority + pings owner & human.
-        ( cmd_task_escalate "$id" --from=heartbeat ) >/dev/null 2>&1 || true
-        _hb_log "[$name] $(_hb_ident "$id") overran ${budget}m ${reap_n}x — blocked + escalated (NEVER cancelled)"
-        escalated=$((escalated + 1)); continue
+            WHERE id=${id} AND status='in_progress' AND reap_escalated_at IS NULL;
+            SELECT changes();" 2>/dev/null || echo 0)
+        [[ "$applied_pause" =~ ^[0-9]+$ ]] || applied_pause=0
+        if (( applied_pause > 0 )); then
+          # ACT-THEN-NARRATE, deliberately: the latch is stamped BEFORE the page,
+          # so a cmd_task_escalate that dies leaves a paused row nobody was told
+          # about rather than a row that can be paged twice. That is the right
+          # way round HERE — being paged twice about a row you cannot clear is
+          # the whole defect — and it matches the DIVE-3218 rung-1 ordering.
+          # Subshell-wrap: cmd_task_escalate may fail->exit on an edge case; a bare
+          # call would kill the whole tick. It bumps priority + pings owner & human.
+          ( cmd_task_escalate "$id" --from=heartbeat ) >/dev/null 2>&1 || true
+          _hb_log "[$name] $(_hb_ident "$id") overran ${budget}m ${reap_n}x — blocked + escalated (NEVER cancelled; cleared started_at=${prev_started:-<empty>} so a requeue gets a full ${budget}m window)"
+          escalated=$((escalated + 1)); continue
+        fi
+        # Latch already spent for this owner (or the row moved under us). A
+        # repeat offender past the threshold STILL gets reclaimed — the work
+        # still needs doing and leaving it in_progress would strand it — but it
+        # does not re-page anyone. The escalation's record (priority, escalated_at,
+        # the result text) is already on the row for whoever looks.
+        _hb_log "[$name] $(_hb_ident "$id") overran ${budget}m ${reap_n}x — ALREADY auto-paused once (reap_escalated_at set); requeued to todo with NO second escalation (DIVE-4111)"
+        _hb_reclaim_to_todo "$name" "$id" "overran ${budget}m budget (reap #${reap_n}) — repeat offender, already escalated once; requeued from a clean slate, NOT cancelled"
+        reclaimed=$((reclaimed + 1)); continue
       fi
       _hb_reclaim_to_todo "$name" "$id" "overran ${budget}m budget (reap #${reap_n}) — requeued from a clean slate, NOT cancelled"
       reclaimed=$((reclaimed + 1)); continue
@@ -2434,8 +2486,8 @@ _hb_recall_cite() {
 # broad; a false positive just adds one reminder line.
 _hb_is_knowledge_task() {
   local text="$1"
-  printf '%s' "$text" \
-    | grep -qiE 'research|digest|competitor|market (scan|intel|research)|\bintel\b|analy[sz]|\bfindings\b|survey|benchmark|landscape|write-?up|\bwiki\b|knowledge|investigat|\brecap\b|\bstudy\b'
+  grep -qiE 'research|digest|competitor|market (scan|intel|research)|\bintel\b|analy[sz]|\bfindings\b|survey|benchmark|landscape|write-?up|\bwiki\b|knowledge|investigat|\brecap\b|\bstudy\b' \
+    <<<"$text"
 }
 
 # DIVE-2063 / DIVE-2111: the maker→verifier terminal-state clause appended to the
@@ -2556,7 +2608,7 @@ _hb_loop_terminal_clause() {
   # another pass, so it is deliberately not gated on which one was woken.
   if [[ "$(db "SELECT 1 FROM tasks WHERE id=${task_id} AND ${_TASKS_TFV_SQL};" 2>/dev/null)" == "1" ]]; then
     local _tfv_owner
-    _tfv_owner=$(db "SELECT COALESCE(NULLIF(maker_agent,''), COALESCE(assignee,'?')) FROM tasks WHERE id=${task_id};" 2>/dev/null)
+    _tfv_owner=$(db "SELECT COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''), COALESCE(assignee,'?')) FROM tasks WHERE id=${task_id};" 2>/dev/null)
     printf ' NOTE — %s is GRADED AND WAITING ON A MERGE: a verifier grade is recorded and a delivery ref is bound, so the verifier has discharged their role and this is TERMINAL FOR THIS GOAL. Treat the goal as MET and stop — %s renders it as %s. The row stays OPEN on purpose and closes only when the work MERGES, because %s keeps meaning merged-to-main; the outstanding act is a MERGE owed by %s, not another pass by you. Do NOT re-grade it, re-deliver it, or close it to make the loop stop.' \
       "$task_ident" "'5dive task ls'" "'graded->merge:${_tfv_owner}'" "'done'" "${_tfv_owner:-the maker}"
     return 0

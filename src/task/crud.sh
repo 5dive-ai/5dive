@@ -166,7 +166,7 @@ cmd_task_add() {
   local proj_lead
   proj_lead=$(db "SELECT COALESCE(lead_agent,'') FROM projects WHERE key=$(sqlq "$project") AND status='active';")
   if [[ -z "$proj_lead" ]]; then
-    db "SELECT 1 FROM projects WHERE key=$(sqlq "$project") AND status='active';" | grep -q 1 \
+    grep -q 1 < <(db "SELECT 1 FROM projects WHERE key=$(sqlq "$project") AND status='active';") \
       || fail "$E_NOT_FOUND" "no active project '$project' (see: 5dive project ls; create: 5dive project add)"
   fi
   local parent_sql="NULL"
@@ -718,7 +718,7 @@ cmd_task_ls() {
     # regression test asserts against (tests/task_reject_trace_unit.sh, arm C).
     # NB: no inline SQL `--` comments in this string —
     # dbfmt flattens newlines, so a `--` would comment out the rest of the query.
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, need_answered_relay, need_answered_tap_uid, tier, gate_mode, kind, schedule, last_fired_at, last_skipped_at, on_overlap, overlap_bound, parked_at, park_reason, wake_at, project_key, maker_agent, verifier,
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, merge_owner, merge_hold_reason, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, need_answered_relay, need_answered_tap_uid, tier, gate_mode, kind, schedule, last_fired_at, last_skipped_at, on_overlap, overlap_bound, parked_at, park_reason, wake_at, project_key, maker_agent, verifier,
              CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
                   THEN CASE WHEN handoff_ack_at IS NOT NULL THEN 'reviewing' ELSE 'delivered' END
                   ELSE NULL END AS handoff_state,
@@ -775,7 +775,7 @@ cmd_task_ls() {
       # detail would get the LESS accurate answer.
       dbfmt -box "SELECT ident,
              CASE WHEN ${_TASKS_TFV_SQL}
-                  THEN 'graded->merge:'||COALESCE(NULLIF(maker_agent,''), COALESCE(assignee,'?'))
+                  THEN 'graded->merge:'||COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''), COALESCE(assignee,'?'))
                   ELSE status END AS status,
              ${_gate_cell} AS gate,
              priority, COALESCE(assignee,'-') AS assignee, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, title FROM tasks WHERE ${where} ${order};"
@@ -786,7 +786,7 @@ cmd_task_ls() {
       # cell rather than a new column so the compact board stays compact.
       dbfmt -box "SELECT ident,
              CASE WHEN ${_TASKS_TFV_SQL}
-                  THEN 'graded->merge:'||COALESCE(NULLIF(maker_agent,''), COALESCE(assignee,'?'))
+                  THEN 'graded->merge:'||COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''), COALESCE(assignee,'?'))
                   ELSE status END AS status,
              ${_gate_cell} AS gate,
              priority, COALESCE(assignee,'-') AS assignee, title FROM tasks WHERE ${where} ${order};"
@@ -875,9 +875,9 @@ cmd_task_show() {
     # "never started" FROM THE BOARD ALONE. A fix that records the first start but
     # does not surface it here does not satisfy that.
     if (( no_body )); then
-      dbfmt -line "SELECT ident, title, status, ${_gate_hdr} AS gate, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref FROM tasks WHERE id=${id};"
+      dbfmt -line "SELECT ident, title, status, ${_gate_hdr} AS gate, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, CASE WHEN COALESCE(merge_owner,'')='' THEN '-' ELSE merge_owner||' ('||COALESCE(NULLIF(merge_hold_reason,''),'no reason recorded')||')' END AS merge_owner FROM tasks WHERE id=${id};"
     else
-      dbfmt -line "SELECT ident, title, status, ${_gate_hdr} AS gate, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, body, result FROM tasks WHERE id=${id};"
+      dbfmt -line "SELECT ident, title, status, ${_gate_hdr} AS gate, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, CASE WHEN COALESCE(merge_owner,'')='' THEN '-' ELSE merge_owner||' ('||COALESCE(NULLIF(merge_hold_reason,''),'no reason recorded')||')' END AS merge_owner, body, result FROM tasks WHERE id=${id};"
     fi
     # DIVE-1064: surface the creator's isolation tier (read-time from the
     # registry, no schema change) so a reader/agent can down-trust a task filed
@@ -1159,12 +1159,23 @@ cmd_task_assign() {
   # rung-1 window, and is re-flagged on their own clock if they also sit on it.
   # Only an explicit `task assign` resets it — the ladder writes assignee directly
   # and keeps its own latch, so the machine's own move still cannot repeat.
+  # DIVE-4111 adds reap_escalated_at/_n on the same fence, for a reason specific
+  # to it: the count that latch throttles is stored PER AGENT in the registry
+  # (.agents[<name>].heartbeat.reaps), so a new owner starts counting at zero. A
+  # latch that outlived the owner would let the new seat's count climb to the
+  # threshold with the auto-pause permanently disarmed — the row would churn past
+  # the budget forever and never once become visible. The counter is per-owner,
+  # so the latch has to be too.
   db "UPDATE tasks SET
         handoff_ack_at=CASE WHEN assignee IS NOT $(sqlq "$who") THEN NULL ELSE handoff_ack_at END,
         recurring_stall_pinged_at=CASE WHEN assignee IS NOT $(sqlq "$who")
                                        THEN NULL ELSE recurring_stall_pinged_at END,
         recurring_stall_escalated_at=CASE WHEN assignee IS NOT $(sqlq "$who")
                                           THEN NULL ELSE recurring_stall_escalated_at END,
+        reap_escalated_at=CASE WHEN assignee IS NOT $(sqlq "$who")
+                               THEN NULL ELSE reap_escalated_at END,
+        reap_escalated_n=CASE WHEN assignee IS NOT $(sqlq "$who")
+                              THEN NULL ELSE reap_escalated_n END,
         assignee=$(sqlq "$who"),
         started_at=CASE WHEN status='in_progress' AND assignee IS NOT $(sqlq "$who")
                         THEN datetime('now') ELSE started_at END
