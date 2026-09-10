@@ -127,8 +127,13 @@ mkindex
 # through this seam (cmd_plugin.sh _plugin_registry_source), which takes a local
 # path so a unit test never touches the network. With no registry checkout the
 # registry arms are NOT RUN and say so; the fixture arms are unaffected.
+# EXPLICIT ONLY — no sibling-path fallback. `projects/5dive/5dive-plugins` is a
+# SHARED checkout that sits on whatever feature branch someone left it on, so
+# guessing it grades an arbitrary tree and calls the result "the registry". The
+# pre-push rail caught exactly that: the shared checkout had no browser/voice and
+# these arms went red against a tree nobody meant to grade. An unset variable
+# gives a NOT-RUN banner, which is honest; a wrong tree is worse than no tree.
 REGISTRY="${FIVEDIVE_PLUGIN_REGISTRY:-}"
-[[ -z "$REGISTRY" && -d "$ROOT/../5dive-plugins/.claude-plugin" ]] && REGISTRY="$ROOT/../5dive-plugins"
 if [[ -n "$REGISTRY" && -d "$REGISTRY" ]]; then
   export FIVEDIVE_PLUGIN_REGISTRY="$REGISTRY"
 else
@@ -359,9 +364,17 @@ fi
 JSON_MODE=1
 run cmd_market --kind=plugin
 t  "T8a market --kind=plugin answers" "0" "$RC"
-tc "T8b ...and the registry's voice is in it, so discovery and the installer agree" '"name":"voice"' "$OUT"
-t  "T8c ...marked installable right now (it needs no marketplace to be added first)" "true" \
-   "$(jq -r '.data.plugins[] | select(.name=="voice") | .ready' <<<"$OUT")"
+if [[ -z "$REGISTRY" ]]; then
+  # Without a pinned registry checkout `plugin ls` reads the LIVE published
+  # registry over the network, so these two would grade whatever is on the
+  # registry's main today rather than the tree under test — green or red for
+  # reasons that have nothing to do with this diff.
+  printf '  !! NOT RUN — T8b/T8c (voice in the discovery list) need a registry checkout.\n'
+else
+  tc "T8b ...and the registry's voice is in it, so discovery and the installer agree" '"name":"voice"' "$OUT"
+  t  "T8c ...marked installable right now (it needs no marketplace to be added first)" "true" \
+     "$(jq -r '.data.plugins[] | select(.name=="voice") | .ready' <<<"$OUT")"
+fi
 JSON_MODE=0
 run cmd_market --kind=banana; t "T8d an unknown --kind is refused rather than silently browsing agents" "$E_USAGE" "$RC"
 # Regression control: the persona market is the pre-existing behaviour of this

@@ -61,8 +61,13 @@ export STATE_DIR="$TMP/state"
 # _plugin_registry_source), which is what lets the arms below install the REAL
 # published plugin tree rather than whatever is on the box — and, because the
 # seam accepts a local path, WITHOUT a network fetch inside a unit test.
+# EXPLICIT ONLY — no sibling-path fallback. `projects/5dive/5dive-plugins` is a
+# SHARED checkout that sits on whatever feature branch someone left it on, so
+# guessing it grades an arbitrary tree and calls the result "the registry". The
+# pre-push rail caught exactly that: the shared checkout had no browser/voice and
+# these arms went red against a tree nobody meant to grade. An unset variable
+# gives a NOT-RUN banner, which is honest; a wrong tree is worse than no tree.
 REGISTRY="${FIVEDIVE_PLUGIN_REGISTRY:-}"
-[[ -z "$REGISTRY" && -d "$ROOT/../5dive-plugins/.claude-plugin" ]] && REGISTRY="$ROOT/../5dive-plugins"
 if [[ -n "$REGISTRY" && -d "$REGISTRY" ]]; then
   export FIVEDIVE_PLUGIN_REGISTRY="$REGISTRY"
 else
@@ -103,7 +108,14 @@ if [[ -n "$REGISTRY" ]]; then
     _plugin_is_builtin_channel "$n" && continue
     BUNDLED+=("$n")
   done < <(jq -r '.plugins[].name' "$REGISTRY/.claude-plugin/marketplace.json" 2>/dev/null | sort)
-  t "T0 the registry publishes at least one plugin to grade (an empty loop is a vacuous suite)" \
+  # Two separate facts. The manifest must declare plugins at all (a checkout
+  # pointed at the wrong tree fails HERE, loudly, instead of silently grading an
+  # empty loop), and separately there must be a BOX-INSTALLABLE one left after
+  # the built-in channels are dropped — if a future registry published nothing
+  # but channels, the loops below would be vacuous and must say so, not pass.
+  t "T0 the registry manifest declares at least one plugin (else the checkout is not a registry)" \
+    "yes" "$([[ $(jq -r '.plugins | length' "$REGISTRY/.claude-plugin/marketplace.json" 2>/dev/null || echo 0) -ge 1 ]] && echo yes || echo no)"
+  t "T0b ...and at least one of them is box-installable, so the corpus loops are not vacuous" \
     "yes" "$([[ ${#BUNDLED[@]} -ge 1 ]] && echo yes || echo no)"
 else
   NOTRUN=1
