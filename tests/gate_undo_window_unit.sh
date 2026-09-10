@@ -446,5 +446,76 @@ else
 fi
 
 
+# ── 12. THIS FILE MAY NOT BUY A MODULE LOAD WITH A COMMENT ────────────────────
+# quinn's iteration-2 REJECT. Iteration 2 cited two other modules' globals BY
+# NAME in comments — `_HB_GATE_RENAG_WHERE` (cmd_heartbeat) and
+# `_GATE_HUMAN_CAPABILITIES` (task__need). Neither is read by any code here. But
+# the lazy-dispatch dep scanner is a blunt token match over the WHOLE file,
+# comments included, and it is blunt ON PURPOSE: it feeds __MODDEPS, where a
+# MISSING provider is an `unbound variable` on a cold path, so it over-reports by
+# design (scripts/lib/lazy-dispatch.sh: "matching every word costs us some
+# phantom edges and misses none"). Two prose citations therefore became two real
+# load edges out of task__notify — which task__dispatch preloads, i.e. every
+# `task` verb pays them. Measured: a plain `task ls` went from 6 modules to 12
+# (cmd_heartbeat and task__need, plus cmd_goal, cmd_objective, cmd_selfupdate and
+# task__loops behind them) and tests/lazy_dispatch_unit.sh's `task ls` ratio arm
+# went from ~70% of the eager control to 112%, red-gating a required check.
+#
+# WHY THE GUARD LIVES HERE AND NOT IN THE SCANNER. Teaching lazy_tokens to skip
+# full-line comments would delete HALF its input (53,181 of 102,454 unique tokens
+# across the payload) in the one direction that reaches users, and 291 payload
+# comment lines carry a `$` expansion — some of them heredoc DATA, where a `#`
+# line is not a comment at all. That is a DIVE-4087 change with its own grading
+# burden, not a rider on arm D. What is arm D's to own is arm D's own file.
+#
+# NON-VACUITY IS THE WHOLE PROBLEM with this shape: a checker that finds nothing
+# reads exactly like a clean file. So the arm carries a POSITIVE CONTROL — the
+# same predicate is run against a copy of this module with iteration 2's citation
+# put back, and must flag it.
+_comment_only_edges() {   # $1=module file  → "<token> <provider-module>" lines
+  local target="$1" f mod
+  : >"$TMP/prov"
+  for f in "$SRC"/cmd_*.sh "$SRC"/task/*.sh; do
+    [[ "$(readlink -f "$f")" == "$(readlink -f "$target")" ]] && continue
+    mod=$(basename "$f" .sh); [[ "$f" == "$SRC"/task/* ]] && mod="task__$mod"
+    lazy_assigns "$f" | sed "s|\$| $mod|" >>"$TMP/prov"
+  done
+  # A name assigned by two modules is dropped by the real build (it will not
+  # guess a provider), so it cannot be an edge here either.
+  awk '{print $1}' "$TMP/prov" | sort | uniq -u >"$TMP/prov1"
+  awk 'NR==FNR{u[$1]=1;next} ($1 in u)' "$TMP/prov1" "$TMP/prov" | sort -u >"$TMP/provuniq"
+  grep -ohE '[A-Za-z_][A-Za-z0-9_]*' "$target" | sort -u >"$TMP/tok_all"
+  grep -vE '^[[:space:]]*#' "$target" | grep -ohE '[A-Za-z_][A-Za-z0-9_]*' | sort -u >"$TMP/tok_code"
+  comm -23 "$TMP/tok_all" "$TMP/tok_code" >"$TMP/tok_cmt"
+  awk 'NR==FNR{c[$1]=1;next} ($1 in c){print $1, $2}' "$TMP/tok_cmt" "$TMP/provuniq" | sort -u
+}
+
+if source "$SRC/../scripts/lib/lazy-dispatch.sh" 2>/dev/null && declare -F lazy_assigns >/dev/null; then
+  ok_t "the real dep scanner (scripts/lib/lazy-dispatch.sh) was sourced — this arm grades the build's own predicate, not a copy of it"
+
+  _cmt_edges=$(_comment_only_edges "$SRC/task/notify.sh")
+  if [[ -z "$_cmt_edges" ]]; then
+    ok_t "no module load edge out of src/task/notify.sh is bought by a comment alone"
+  else
+    fail_t "src/task/notify.sh cites another module's global in a COMMENT, which is a real __MODDEPS edge and makes every \`task\` verb load that module:
+$(printf '%s\n' "$_cmt_edges" | sed 's/^/      /')
+      Cite the FILE and the clause, never the identifier."
+  fi
+
+  # POSITIVE CONTROL: put iteration 2's citation back and require a flag.
+  _probe="$TMP/notify_probe.sh"
+  cp "$SRC/task/notify.sh" "$_probe"
+  printf '# regression probe: _GATE_HUMAN_CAPABILITIES seal (DIVE-2241/2131)\n' >>"$_probe"
+  _probe_edges=$(_comment_only_edges "$_probe")
+  if printf '%s\n' "$_probe_edges" | grep -q '^_GATE_HUMAN_CAPABILITIES '; then
+    ok_t "positive control: the same predicate DOES flag iteration 2's comment citation, so the clean answer above is a reading and not a silence"
+  else
+    fail_t "positive control failed — the predicate did not flag a comment naming _GATE_HUMAN_CAPABILITIES, so the arm above is vacuous. Got: ${_probe_edges:-<nothing>}"
+  fi
+else
+  fail_t "could not source scripts/lib/lazy-dispatch.sh — arm 12 is vacuous; fix the path rather than deleting it"
+fi
+
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

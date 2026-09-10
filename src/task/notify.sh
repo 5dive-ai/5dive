@@ -2050,7 +2050,9 @@ _GATE_UNDO_WINDOW_SECS=120
 #
 # 840, NOT 900, AND THE 60s IS THE POINT (quinn, DIVE-4154 iteration 1). The
 # heartbeat re-nags a filed-unnotified gate at `gate_pinged_at IS NULL AND
-# need_asked_at <= now-15 minutes` (_HB_GATE_RENAG_WHERE, cmd_heartbeat.sh). At a
+# need_asked_at <= now-15 minutes` (the re-nag WHERE clause in cmd_heartbeat.sh;
+# its constant is deliberately NOT named here — see the note on the clamp below).
+# At a
 # 900s ceiling the buttoned ping and the re-nag become eligible in the same
 # second, so a manual/secret gate's FIRST contact could be the recovery path
 # rather than the normal ping — and the re-nag is a plainer message. The intent
@@ -2079,13 +2081,26 @@ _task_gate_undo_window_secs() {
   # forever on a garbage value.
   [[ "$secs" =~ ^[0-9]+$ ]] || secs="$_ceil"
   # THE OVERRIDE MAY ONLY EVER SHORTEN THE HOLD, NEVER LENGTHEN IT. This is the
-  # _GATE_HUMAN_CAPABILITIES seal (DIVE-2241/2131) applied to a duration: agents
+  # sealed human-capability constant's seal (need.sh, DIVE-2241/2131) applied to
+  # a duration: agents
   # hold NOPASSWD:ALL, so an unclamped env var IS a write path to the constant,
   # and the write an agent wants is upward — set it to a week and a gate it does
   # not want answered never reaches the phone at all. Clamping down keeps every
   # legitimate use (harnesses pass 0, an operator shortens) and leaves the mute
   # unreachable. It is arm D's form of the row's invariant: a knob may only ever
   # move a gate TOWARD the phone, never away from it.
+  #
+  # WHY NEITHER OF THOSE TWO CONSTANTS IS SPELLED OUT ABOVE (quinn, iteration 2).
+  # The lazy-dispatch dep scanner is a blunt token match over the WHOLE file,
+  # comments included (scripts/lib/lazy-dispatch.sh: "matching every word costs
+  # us some phantom edges and misses none"). So a comment here that cites another
+  # module's global BY NAME creates a real load edge out of task__notify — and
+  # task__notify is preloaded by task__dispatch, i.e. by every `task` verb. The
+  # first draft of this file named both, which pulled cmd_heartbeat and task__need
+  # (and transitively cmd_goal, cmd_objective, cmd_selfupdate, task__loops) into a
+  # plain `task ls`: 6 modules to 12, and the load-path ratio arm red. Cite the
+  # FILE and the clause, never the identifier. Graded by arm 12 in
+  # tests/gate_undo_window_unit.sh.
   (( secs > _ceil )) && secs="$_ceil"
   # Kill switch. `off` restores the pre-DIVE-4154 ping byte for byte and needs no
   # release to take effect, same contract as `task pfr-autoclear`.
