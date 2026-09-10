@@ -430,6 +430,9 @@ cmd_run() {
 VIEWER_TTL_DEFAULT=600
 VIEWER_TTL_MAX=3600
 VIEWER_TTL_MIN=60
+# How long a mint waits for the display server and the bridge to be accepting
+# before it refuses. Starting them is not the same moment as them listening.
+VIEWER_BRIDGE_WAIT_S=10
 
 _serve_pidfile()  { echo "$1/.5dive-serve"; }
 _viewer_ticket()  { echo "$1/.5dive-viewer.ticket"; }
@@ -445,6 +448,34 @@ _free_port() {
     if ! { exec 9<>"/dev/tcp/127.0.0.1/$p"; } 2>/dev/null; then echo "$p"; return 0; fi
     exec 9>&- 2>/dev/null || true
     p=$(( p + 1 )); tries=$(( tries + 1 ))
+  done
+  return 1
+}
+
+# Is anything LISTENING on this loopback port? Read it out of /proc/net/tcp
+# instead of connecting to find out: the bridge's other side is an x11vnc started
+# with -once, so a probe that opens a connection spends the customer's single
+# admission to check that they can have it. A read costs the connection budget
+# nothing. (_free_port established a moment earlier that the port was ours to
+# take, which is what makes "something is listening here" mean "ours came up".)
+_port_listening() {
+  local hex f
+  hex=$(printf '%04X' "$1")
+  for f in /proc/net/tcp /proc/net/tcp6; do
+    [[ -r "$f" ]] || continue
+    awk -v pat="$hex" '$4=="0A" && $2 ~ (":" pat "$") {f=1} END{exit !f}' "$f" && return 0
+  done
+  return 1
+}
+
+# Wait, bounded, for a port to start accepting — and give up early if the process
+# that was supposed to bind it is already gone.
+_wait_listening() {  # _wait_listening <port> <pid>
+  local port="$1" pid="$2" i=0 max=$(( VIEWER_BRIDGE_WAIT_S * 20 ))
+  while (( i < max )); do
+    _port_listening "$port" && return 0
+    kill -0 "$pid" 2>/dev/null || { _port_listening "$port" && return 0; return 1; }
+    sleep 0.05; i=$(( i + 1 ))
   done
   return 1
 }
@@ -602,7 +633,10 @@ cmd_viewer() {
   _viewer_requires
 
   # Replacing a ticket revokes the previous one. Two live tickets on one profile
-  # is two answers to "who is allowed in right now".
+  # is two answers to "who is allowed in right now" — and the revoke happens
+  # BEFORE anything that can fail, so a mint that dies halfway cannot leave the
+  # previous ticket redeemable onto the viewer this call just killed.
+  _viewer_revoke_file "$dir" replaced
   _viewer_stop "$dir"
 
   local port vncport
@@ -633,6 +667,21 @@ cmd_viewer() {
   local wspid=$!
 
   ( umask 077; printf 'vnc_pid=%s\nws_pid=%s\nport=%s\nvnc_port=%s\n' "$vncpid" "$wspid" "$port" "$vncport" > "$(_viewer_pidfile "$dir")" )
+
+  # A TICKET IS ONLY MINTED ONTO A BRIDGE THAT IS ALREADY ACCEPTING. Both
+  # programs are started in the background, so "the mint returned" and "the port
+  # is bound" are two different moments — and the whole shape of this product is
+  # a one-time link handed to a relay that redeems it AT ONCE. Redeem inside that
+  # window and the relay is given 127.0.0.1:<port> with nothing behind it: the
+  # customer gets a blank viewer and the link is spent, which is the same
+  # customer-facing failure as the old hardcoded -timeout, arriving by a race
+  # instead of a constant. So wait for both ports, and if either never comes up,
+  # reap and refuse. NO link at all is strictly better than a live link onto a
+  # dead port, because the second one costs the customer their one redemption.
+  if ! _wait_listening "$vncport" "$vncpid" || ! _wait_listening "$port" "$wspid"; then
+    _viewer_stop "$dir"
+    die "$E_UNAVAILABLE" "the viewer for $site never started listening within ${VIEWER_BRIDGE_WAIT_S}s (the display server or the websocket bridge did not come up). No link was issued, so there is nothing to redeem onto a dead port. The browser session itself is untouched and still logged in."
+  fi
 
   local expires=$(( $(date -u +%s) + ttl ))
   ( umask 077; printf 'hash=%s\nexpires_at=%s\nbind=%s\nstate=open\nminted_at=%s\nport=%s\n' \

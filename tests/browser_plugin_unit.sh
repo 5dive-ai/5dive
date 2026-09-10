@@ -411,17 +411,50 @@ d="\${1#:}"
 : > "$TMP/x11/X\$d"
 exec sleep 300
 XVFB
+# AND THEY BIND THE PORT THEY WERE GIVEN. A fake that records its flags and
+# listens on nothing is a bridge that is never up, which is indistinguishable
+# from a bridge that is merely slow — and the difference between those two is the
+# arm T10s exists to be. `exec` keeps the recorded pid the listening pid, so the
+# product's own liveness bookkeeping stays honest.
+listen_forever='import socket,sys,time
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(("127.0.0.1",int(sys.argv[1]))); s.listen(1); time.sleep(300)'
 cat > "$SBIN/x11vnc" <<VNC
 #!/usr/bin/env bash
 printf '%s\\n' "\$*" > "$ARGV/x11vnc.argv"
-exec sleep 300
+port=""; while (( \$# )); do [[ "\$1" == -rfbport ]] && port="\$2"; shift; done
+exec python3 -c '$listen_forever' "\$port"
 VNC
 cat > "$SBIN/websockify" <<WS
 #!/usr/bin/env bash
 printf '%s\\n' "\$*" > "$ARGV/websockify.argv"
-exec sleep 300
+exec python3 -c '$listen_forever' "\${1##*:}"
 WS
 chmod +x "$SBIN/Xvfb" "$SBIN/x11vnc" "$SBIN/websockify"
+
+# THE FAKES ARE STARTED IN THE BACKGROUND BY THE PRODUCT, so a capture read the
+# instant the command returns can be missing for a reason that has nothing to do
+# with the flag under test. That matters most for `tn`: "expected NOT to contain"
+# passes on an EMPTY file exactly as it passes on a correct one, so an unlucky
+# read turns a security arm into a green no-op. Every read below therefore waits,
+# bounded, for a NON-EMPTY capture; every capture is cleared before the mint that
+# should rewrite it (a stale one from the previous mint is the same lie with a
+# later timestamp); and every `tn` over a capture is paired with a control arm
+# that asserts the capture is not empty.
+_reset_argv() { local n; for n in "$@"; do rm -f "$ARGV/$n.argv"; done; }
+_wait_argv() {  # _wait_argv <prog> -> echoes its recorded argv, or nothing
+  local f="$ARGV/$1.argv" i=0
+  while (( i < 200 )); do [[ -s "$f" ]] && { cat "$f"; return 0; }; sleep 0.05; i=$(( i + 1 )); done
+  return 1
+}
+nonempty() { [[ -n "$1" ]] && echo yes || echo no; }
+# Reads /proc, never connects: connecting to the bridge would spend the -once
+# admission this whole design hands to the customer.
+port_state() {
+  local hex; hex=$(printf '%04X' "$1")
+  awk -v pat="$hex" '$4=="0A" && $2 ~ (":" pat "$") {f=1} END{exit !f}' /proc/net/tcp \
+    && echo listening || echo dead
+}
 
 # The fake chrome above exits immediately (it cats a DOM). Server mode needs a
 # chrome that STAYS UP, because "is the browser still serving" is a live PID.
@@ -465,6 +498,7 @@ t  'T10a auth on a display-less box no longer dead-ends' 0 "$RC"
 tn 'T10a ...and does not tell a paying customer to forward an X display' 'Forward one' "$ERR"
 
 # --- T10b the ticket is a hash, never the nonce ------------------------------
+_reset_argv x11vnc websockify
 run env PATH="$SPATH" "$BROWSER" viewer viewsite --bind=sess-A --ttl=600
 t  'T10b viewer mints' 0 "$RC"
 NONCE="${OUT##*/}"
@@ -490,9 +524,12 @@ t  'T10d THE VIEWER PASSWORD IS EMITTED WITH THE TARGET, not stranded in the pro
    'yes' "$([[ -n "$REDEEMED_PW" ]] && echo yes || echo no)"
 t  'T10d ...and it is the password x11vnc was actually started with' 'match' \
    "$([[ "$REDEEMED_PW" == "$(cat "$VDIR/.5dive-viewer.pw" 2>/dev/null)" ]] && echo match || echo differs)"
-tc 'T10d ...which x11vnc was handed as a FILE, never in argv' '-passwdfile' "$(cat "$ARGV/x11vnc.argv")"
+VNC_ARGV_D="$(_wait_argv x11vnc)"
+t  'T10d (control) x11vnc recorded its argv, so the two arms below are graded' \
+   'yes' "$(nonempty "$VNC_ARGV_D")"
+tc 'T10d ...which x11vnc was handed as a FILE, never in argv' '-passwdfile' "$VNC_ARGV_D"
 tn 'T10d ...so the password itself never reaches /proc/<pid>/cmdline' \
-   "$REDEEMED_PW" "$(cat "$ARGV/x11vnc.argv")"
+   "$REDEEMED_PW" "$VNC_ARGV_D"
 run env PATH="$SPATH" bash -c "printf '%s' '$NONCE' | '$BROWSER' viewer-redeem viewsite --nonce=- --session=sess-A"
 t  'T10e A REPLAY OF THE SAME LINK IS REFUSED' 77 "$RC"
 tc 'T10e ...saying so in words a customer can act on' 'already been used' "$ERR"
@@ -553,10 +590,14 @@ t  'T10k a ttl past the re-auth window is refused' 64 "$RC"
 # mutant it kills: drop -localhost and x11vnc answers every seat on the box;
 # bind websockify to 0.0.0.0 and the bridge is reachable from the internet; drop
 # -nolisten tcp and the X display itself is an unauthenticated remote keyboard.
+_reset_argv x11vnc websockify
 run env PATH="$SPATH" "$BROWSER" viewer viewsite --bind=sess-A --ttl=900
 t  'T10m viewer mints (fixture for the argv arms)' 0 "$RC"
 NONCE5="${OUT##*/}"
-VNC_ARGV="$(cat "$ARGV/x11vnc.argv")"; WS_ARGV="$(cat "$ARGV/websockify.argv")"; X_ARGV="$(cat "$ARGV/Xvfb.argv")"
+VNC_ARGV="$(_wait_argv x11vnc)"; WS_ARGV="$(_wait_argv websockify)"; X_ARGV="$(_wait_argv Xvfb)"
+t  'T10m (control) x11vnc recorded its argv'     'yes' "$(nonempty "$VNC_ARGV")"
+t  'T10m (control) websockify recorded its argv' 'yes' "$(nonempty "$WS_ARGV")"
+t  'T10m (control) Xvfb recorded its argv'       'yes' "$(nonempty "$X_ARGV")"
 tc 'T10m x11vnc IS BOUND TO LOOPBACK'                 '-localhost'   "$VNC_ARGV"
 tc 'T10m ...and accepts exactly one client'           '-once'        "$VNC_ARGV"
 tc 'T10m the websocket bridge LISTENS ON 127.0.0.1'   '127.0.0.1:'   "$WS_ARGV"
@@ -572,9 +613,13 @@ tc 'T10m THE X DISPLAY REFUSES TCP ENTIRELY'          '-nolisten tcp' "$X_ARGV"
 # ticket promises and the window x11vnc honours must be one number.
 tc 'T10n x11vnc is given the TICKET TTL, not a constant shorter than the minimum' \
    '-timeout 900' "$VNC_ARGV"
+_reset_argv x11vnc
 run env PATH="$SPATH" "$BROWSER" viewer viewsite --bind=sess-A --ttl=60
+VNC_ARGV_N="$(_wait_argv x11vnc)"
+t  'T10n (control) the second mint recorded a FRESH argv, not the one before it' \
+   'yes' "$(nonempty "$VNC_ARGV_N")"
 tc 'T10n ...and it TRACKS the ttl rather than matching one value by luck' \
-   '-timeout 60' "$(cat "$ARGV/x11vnc.argv")"
+   '-timeout 60' "$VNC_ARGV_N"
 
 # --- T10o a spent ticket is not an oracle ------------------------------------
 # The design note claims the spent-state check runs BEFORE the nonce compare. Move
@@ -658,6 +703,65 @@ t  'T10r ...and also leaves the ticket open' 'state=open' \
 run env PATH="$SPATH" bash -c "printf '%s' '$NONCE9' | '$BROWSER' viewer-redeem viewsite --nonce=- --session=sess-A"
 t  'T10r AND THE SAME NONCE REDEEMS AFTERWARDS' 0 "$RC"
 tc 'T10r ...handing over the credential it could not find a moment ago' "password=$PW_SAVED" "$OUT"
+
+# --- T10s A LINK IS NEVER ISSUED ONTO A BRIDGE THAT IS NOT LISTENING YET ------
+# The mint starts x11vnc and websockify in the BACKGROUND and returns. "Started"
+# and "accepting" are two different moments, and the product's own shape is a
+# one-time link handed to a relay that redeems it AT ONCE — dashboard mints,
+# relay redeems, customer's phone connects. Redeem inside that window and the
+# relay is handed 127.0.0.1:<port> with nothing behind it: a blank viewer and a
+# SPENT link, the same customer-facing failure as the old hardcoded -timeout,
+# reached by a race instead of by a constant. These arms read /proc rather than
+# connecting, because connecting is itself the single admission x11vnc -once
+# gives the customer.
+_reset_argv x11vnc websockify
+run env PATH="$SPATH" "$BROWSER" viewer viewsite --bind=sess-A --ttl=600
+t  'T10s viewer mints' 0 "$RC"
+NONCE10="${OUT##*/}"
+PORT10="$(sed -n 's/^port=//p' "$VDIR/.5dive-viewer.ticket")"
+t  'T10s (control) the ticket names a bridge port' 'yes' "$(nonempty "$PORT10")"
+t  'T10s BY THE TIME THE LINK EXISTS, THE BRIDGE IS ALREADY ACCEPTING' \
+   'listening' "$(port_state "$PORT10")"
+run env PATH="$SPATH" bash -c "printf '%s' '$NONCE10' | '$BROWSER' viewer-redeem viewsite --nonce=- --session=sess-A"
+t  'T10s a relay that redeems the INSTANT it gets the link is served' 0 "$RC"
+TGT10="$(sed -n 's/^target=127.0.0.1://p' <<<"$OUT")"
+t  'T10s ...and the target it was handed has something on it' 'listening' "$(port_state "$TGT10")"
+
+# The mutant: a bridge that never binds. Without the wait, this mints a ticket
+# and exits 0 onto a dead port — the failure above, made permanent.
+NOBIND="$TMP/nobind"; mkdir -p "$NOBIND"
+cat > "$NOBIND/websockify" <<WS
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" > "$ARGV/websockify.argv"
+exec sleep 300
+WS
+chmod +x "$NOBIND/websockify"
+# An OPEN ticket is left standing on purpose: the failing mint kills the viewer
+# that ticket points at, so it must take the ticket with it. Otherwise the
+# customer holds a live one-time link to a viewer that no longer exists — the
+# dead-port failure again, now reached by a mint that FAILED.
+_reset_argv x11vnc websockify
+run env PATH="$SPATH" "$BROWSER" viewer viewsite --bind=sess-A --ttl=600
+t  'T10s (fixture) an OPEN ticket stands before the failing mint' 'state=open' \
+   "$(grep '^state=' "$VDIR/.5dive-viewer.ticket")"
+NONCE11="${OUT##*/}"
+_reset_argv websockify
+run env PATH="$NOBIND:$SPATH" "$BROWSER" viewer viewsite --bind=sess-A --ttl=600
+t  'T10s A BRIDGE THAT NEVER BINDS ISSUES NO LINK AT ALL' 69 "$RC"
+t  'T10s (control) it really was started, it just never listened' 'yes' \
+   "$(nonempty "$(_wait_argv websockify)")"
+tn 'T10s ...so there is no nonce for a relay to redeem' '/browser/viewer/' "$OUT"
+tc 'T10s ...and the refusal names what did not come up' 'never started listening' "$ERR"
+t  'T10s ...no ticket is left OPEN onto the dead port' 'no' \
+   "$(grep -q '^state=open' "$VDIR/.5dive-viewer.ticket" && echo yes || echo no)"
+t  'T10s ...the half-started viewer was reaped, not left running' 'dead' "$(vnc_state)"
+t  'T10s ...its credential did not survive the failed mint' 'no' \
+   "$([[ -f "$VDIR/.5dive-viewer.pw" ]] && echo yes || echo no)"
+run env PATH="$SPATH" bash -c "printf '%s' '$NONCE11' | '$BROWSER' viewer-redeem viewsite --nonce=- --session=sess-A"
+t  'T10s ...AND THE TICKET THAT WAS STANDING BEFORE IT DIED WITH THE VIEWER' 77 "$RC"
+t  'T10s ...and the BROWSER survives, because a failed view is not a lost login' '0' \
+   "$(env PATH="$SPATH" bash -c '
+        f='"$VDIR"'/.5dive-serve; kill -0 "$(sed -n s/^chrome_pid=//p "$f")" 2>/dev/null && echo 0 || echo 1')"
 
 # --- T10c a box without the packages says so, and starts nothing --------------
 mkprofile barebox "$LIVE_DOM" >/dev/null

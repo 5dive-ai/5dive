@@ -81,6 +81,13 @@ attached. Five properties, each of which fails closed:
    once a viewer is running again.
 5. **The nonce never enters argv.** `/proc/<pid>/cmdline` is readable by other seats, so
    `viewer-redeem` takes the nonce on **stdin** and refuses `--nonce=<value>` outright.
+6. **It is never minted onto a port that is not accepting yet.** The display server and the
+   websocket bridge start in the background, so "the mint returned" and "the port is bound" are
+   different moments — and the relay redeems the link the instant it gets it. `viewer` waits for
+   both loopback ports to be listening before it prints a link, and refuses (issuing no link at
+   all) if either never comes up. A one-time link onto a dead port costs the customer their single
+   redemption; no link costs them a retry. The wait reads `/proc/net/tcp` rather than connecting,
+   because connecting would itself spend the one client `x11vnc -once` admits.
 
 **Killing the viewer does not kill the browser.** The profile is the durable half; the view onto it
 is the ephemeral half. `viewer-revoke` ends the view and the session stays logged in.
