@@ -737,7 +737,7 @@ _plugin_split_ref() {
       _plugin_source_dir "$m" "$plugin" >/dev/null 2>&1 && found+=("$m")
     done < <(jq -r 'keys[]' "$(_plugin_mkt_json)" 2>/dev/null)
     if (( ${#found[@]} == 0 )); then
-      fail "$E_NOT_FOUND" "no plugin '$plugin' in any registered marketplace. Registered: $(jq -r 'keys | join(", ") // "(none)"' "$(_plugin_mkt_json)" 2>/dev/null). Every 5dive plugin is published to the registry — add it first: 5dive plugin marketplace add $(gh_org)/5dive-plugins"
+      fail "$E_NOT_FOUND" "no plugin '$plugin' in any registered marketplace. Registered: $(jq -r 'if (keys | length) == 0 then "(none)" else (keys | join(", ")) end' "$(_plugin_mkt_json)" 2>/dev/null). Every 5dive plugin is published to the registry — add it first: 5dive plugin marketplace add $(gh_org)/5dive-plugins"
     elif (( ${#found[@]} > 1 )); then
       fail "$E_CONFLICT" "'$plugin' exists in ${#found[@]} marketplaces (${found[*]}) — name one: ${plugin}@${found[0]}"
     fi
