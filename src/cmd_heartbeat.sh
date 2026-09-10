@@ -1275,7 +1275,18 @@ _hb_pane_is_usage_limit() {
   # does not weaken the two-signature discipline that stops ordinary output
   # mentioning "limit" from false-matching (asserted in both harnesses).
   grep -qiE 'hit your ((monthly|weekly|daily)([ -]?spend)?|usage|session|5[ -]?hour) limit|usage limit reached|reached your .* limit|limit reached' <<<"$pane" || return 1
-  grep -qiE "upgrade your plan|wait for .*limit to reset|limit will reset|${_HB_RESET_TIME_RE}" <<<"$pane" || return 1
+  # DIVE-4171 added `upgrade to pro` to the ACTION alternation. codex's wall is
+  # one line carrying both signatures -- `Codex could not complete this turn:
+  # You've hit your usage limit. Upgrade to Pro` -- and after DIVE-4206 widened
+  # the header arm it matched the header and FAILED here: every action phrasing
+  # in the list is Claude Code's copy ("Upgrade your plan"), and codex names the
+  # plan instead of the verb's object. So a walled codex seat read as "not a
+  # wall" to every caller of this matcher (`_hb_usage_limit_frozen`, and
+  # `_hb_wall_class` which short-circuits on it), while the SUPERVISOR's own
+  # pattern matched the same line -- two instruments disagreeing about one pane.
+  # Two-signature discipline is unchanged: this is still the action arm, and a
+  # header line alone still does not match (asserted in tests/heartbeat_codex_wall_unit.sh).
+  grep -qiE "upgrade your plan|upgrade to pro|wait for .*limit to reset|limit will reset|${_HB_RESET_TIME_RE}" <<<"$pane" || return 1
   return 0
 }
 
@@ -2456,6 +2467,40 @@ _hb_reclaim() {
     # requeue is genuinely stuck → on the _HB_REAP_ESCALATE_AFTER'th reap, block
     # it + escalate (pings owner & paired human) so a person decides its fate.
     if (( age_min >= budget )); then
+      # DIVE-4171 — A WALLED SEAT MUST NEVER MANUFACTURE A HUMAN GATE. DIVE-4104
+      # parked rule (b) only, on the stated ground that "a walled seat that also
+      # overran its 45m budget is still a real overrun". Measured on codex
+      # 2026-09-09, that ground does not hold for a wall that OUTLASTS the
+      # budget, and every ChatGPT usage wall does: 11:20:07 reclaimed DIVE-4119
+      # as "overran 45m budget (reap #1)", 11:30:19 re-nudged the same seat into
+      # the same wall, 12:21:06 "overran 45m 2x — blocked + escalated". The row
+      # was then `blocked` with "needs a human to requeue" — a human gate filed
+      # for a seat that had lost nothing and would resume on its own. DIVE-4161
+      # took the same shape 14 minutes later. The overrun is real and it is also
+      # fully EXPLAINED: nothing was working, so requeueing from a clean slate
+      # buys nothing and the reap counter is measuring the wall, not the row.
+      #
+      # HELD, not reclaimed-once, and the difference is the counter: a reclaim
+      # still spends a `_hb_mark_reap` tick, so a wall spanning two budgets would
+      # still reach _HB_REAP_ESCALATE_AFTER by a different route. The hold is the
+      # same shape rule (b) already uses and it is bounded by the SAME park —
+      # deadline plus one tick when the wall names one, else the 6h fallback cap
+      # (_HB_QUOTA_PARK_FALLBACK_SEC) — so it expires on its own and this arm
+      # then reaps exactly as before. It cannot wedge a claim: no arm here can
+      # extend the park, only the supervisor's next observation can.
+      #
+      # It also stops the `/goal clear` below being sent INTO the wall. On the
+      # codex dispatcher that line is not free: `_hb_send_line` skips /clear on
+      # that path (DIVE-4036, no thread-reset verb), so each nudge appends
+      # another full /goal to one ever-growing thread that is re-sent every turn
+      # — the seat's own pane complained of "a huge thread containing many
+      # repeated /goal messages". Nudging a walled seat spends the quota that
+      # walled it.
+      local _cpark
+      if _cpark=$(_hb_quota_parked "$name" "$everyMin"); then
+        _hb_log "[$name] $(_hb_ident "$id") is ${age_min}m past the ${budget}m budget but the supervisor classifies this seat (or a peer on its auth profile) quota-exhausted — claim HELD, NOT reaped and NOT escalated (~${_cpark}m of park left, DIVE-4171)"
+        continue
+      fi
       _hb_send_line "$name" "/goal clear" || true
       local reap_n
       reap_n=$(with_registry_lock _hb_mark_reap "$name" "$id")
