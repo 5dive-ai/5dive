@@ -16,6 +16,8 @@
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+. "$(dirname "${BASH_SOURCE[0]}")/lib/pinned_baseline.sh" \
+  || printf 'pinned baseline helper: UNRESOLVED (tests/lib/pinned_baseline.sh not reachable)\n' >&2
 trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.."
 SRC=src
@@ -446,7 +448,7 @@ else
 fi
 
 
-# ── 12. THIS FILE MAY NOT BUY A MODULE LOAD WITH A COMMENT ────────────────────
+# ── 12. THIS DIFF MAY NOT BUY A MODULE LOAD WITH A COMMENT ────────────────────
 # quinn's iteration-2 REJECT. Iteration 2 cited two other modules' globals BY
 # NAME in comments — `_HB_GATE_RENAG_WHERE` (cmd_heartbeat) and
 # `_GATE_HUMAN_CAPABILITIES` (task__need). Neither is read by any code here. But
@@ -461,22 +463,38 @@ fi
 # task__loops behind them) and tests/lazy_dispatch_unit.sh's `task ls` ratio arm
 # went from ~70% of the eager control to 112%, red-gating a required check.
 #
+# THE SCOPE IS THE DIFF, NOT THE FILE — quinn's iteration-3 REJECT, and the
+# correction that matters most here. The first cut of this arm scanned every
+# comment line in notify.sh. That made it accuse prose it did not write: when
+# src/task/grader_pool.sh landed on main with an embedded python block assigning
+# `cap=`, `days=`, `marks=` and `busy=`, four ordinary English words in this
+# module's decade-old comments became "another module's globals" overnight, and
+# the arm reddened this branch for four lines nobody on it had touched. A guard
+# that widens its accusation every time an unrelated module assigns a common word
+# is not measuring the change it is attached to. So the population is the comment
+# lines THIS BRANCH ADDS, diffed against its merge base — an older line that
+# already buys an edge is pre-existing debt and wants its own row, not a red here.
+#
 # WHY THE GUARD LIVES HERE AND NOT IN THE SCANNER. Teaching lazy_tokens to skip
 # full-line comments would delete HALF its input (53,181 of 102,454 unique tokens
 # across the payload) in the one direction that reaches users, and 291 payload
 # comment lines carry a `$` expansion — some of them heredoc DATA, where a `#`
 # line is not a comment at all. That is a DIVE-4087 change with its own grading
-# burden, not a rider on arm D. What is arm D's to own is arm D's own file.
+# burden, not a rider on arm D. What is arm D's to own is what arm D wrote.
 #
 # NON-VACUITY IS THE WHOLE PROBLEM with this shape: a checker that finds nothing
-# reads exactly like a clean file. So the arm carries a POSITIVE CONTROL — the
-# same predicate is run against a copy of this module with iteration 2's citation
-# put back, and must flag it.
-_comment_only_edges() {   # $1=module file  → "<token> <provider-module>" lines
-  local target="$1" f mod
+# reads exactly like a clean file, and now it also reads exactly like an
+# unresolvable base or an empty diff. So the arm carries a POSITIVE CONTROL that
+# does not depend on git — iteration 2's citation is fed to the same predicate as
+# if the diff had added it, and must be flagged — and an unresolvable base FAILS
+# rather than reporting clean.
+# The commit this branch forked from (origin/main at the iteration-4 merge).
+NOTIFY_COMMENT_BASE_REF="28f6a87dabe84c9543e4237697588d22d9f9044a"
+_provider_index() {   # → $TMP/provuniq : "<token> <module>", one provider each
+  local f mod
   : >"$TMP/prov"
   for f in "$SRC"/cmd_*.sh "$SRC"/task/*.sh; do
-    [[ "$(readlink -f "$f")" == "$(readlink -f "$target")" ]] && continue
+    [[ "$(readlink -f "$f")" == "$(readlink -f "$SRC/task/notify.sh")" ]] && continue
     mod=$(basename "$f" .sh); [[ "$f" == "$SRC"/task/* ]] && mod="task__$mod"
     lazy_assigns "$f" | sed "s|\$| $mod|" >>"$TMP/prov"
   done
@@ -484,29 +502,52 @@ _comment_only_edges() {   # $1=module file  → "<token> <provider-module>" line
   # guess a provider), so it cannot be an edge here either.
   awk '{print $1}' "$TMP/prov" | sort | uniq -u >"$TMP/prov1"
   awk 'NR==FNR{u[$1]=1;next} ($1 in u)' "$TMP/prov1" "$TMP/prov" | sort -u >"$TMP/provuniq"
-  grep -ohE '[A-Za-z_][A-Za-z0-9_]*' "$target" | sort -u >"$TMP/tok_all"
-  grep -vE '^[[:space:]]*#' "$target" | grep -ohE '[A-Za-z_][A-Za-z0-9_]*' | sort -u >"$TMP/tok_code"
-  comm -23 "$TMP/tok_all" "$TMP/tok_code" >"$TMP/tok_cmt"
+}
+_edges_bought_by() {   # $1=file of comment lines → "<token> <provider-module>"
+  # A token this module's own CODE already uses is a real edge with or without
+  # the comment, so it is not bought by prose and is not this arm's finding.
+  grep -vE '^[[:space:]]*#' "$SRC/task/notify.sh" \
+    | grep -ohE '[A-Za-z_][A-Za-z0-9_]*' | sort -u >"$TMP/tok_code"
+  grep -ohE '[A-Za-z_][A-Za-z0-9_]*' "$1" | sort -u >"$TMP/tok_line"
+  comm -23 "$TMP/tok_line" "$TMP/tok_code" >"$TMP/tok_cmt"
   awk 'NR==FNR{c[$1]=1;next} ($1 in c){print $1, $2}' "$TMP/tok_cmt" "$TMP/provuniq" | sort -u
 }
 
 if source "$SRC/../scripts/lib/lazy-dispatch.sh" 2>/dev/null && declare -F lazy_assigns >/dev/null; then
   ok_t "the real dep scanner (scripts/lib/lazy-dispatch.sh) was sourced — this arm grades the build's own predicate, not a copy of it"
+  _provider_index
 
-  _cmt_edges=$(_comment_only_edges "$SRC/task/notify.sh")
-  if [[ -z "$_cmt_edges" ]]; then
-    ok_t "no module load edge out of src/task/notify.sh is bought by a comment alone"
+  # THE BASE IS PINNED TO A COMMIT, NOT NAMED BY A BRANCH (DIVE-2229,
+  # tests/lib/pinned_baseline.sh, fenced by tests/baseline_pin_unit.sh). Writing
+  # `origin/main` here would be right exactly until this branch merges — after
+  # which origin/main IS the post-fix tree, the diff is empty, every token is out
+  # of scope and the arm reports `ok` having read nothing. This sha is the commit
+  # this branch forked from; every comment line at or below it is pre-existing
+  # prose that arm D did not write. The diff is against the WORKING TREE on
+  # purpose, so an edit that is not committed yet is graded too.
+  if ! pinned_commit_available "$NOTIFY_COMMENT_BASE_REF"; then
+    fail_t "$(pinned_unavailable_msg "$NOTIFY_COMMENT_BASE_REF")"
   else
-    fail_t "src/task/notify.sh cites another module's global in a COMMENT, which is a real __MODDEPS edge and makes every \`task\` verb load that module:
+    git diff -U0 "$NOTIFY_COMMENT_BASE_REF" -- "$SRC/task/notify.sh" 2>/dev/null \
+      | grep -E '^\+' | grep -vE '^\+\+\+' | sed 's/^+//' \
+      | grep -E '^[[:space:]]*#' >"$TMP/added_cmt" || :
+    _added_n=$(wc -l <"$TMP/added_cmt")
+    _cmt_edges=$(_edges_bought_by "$TMP/added_cmt")
+    if [[ -z "$_cmt_edges" ]]; then
+      ok_t "no module load edge out of src/task/notify.sh is bought by a comment THIS DIFF added (base ${NOTIFY_COMMENT_BASE_REF:0:8}, $_added_n added comment lines in scope)"
+    else
+      fail_t "a comment line THIS DIFF adds to src/task/notify.sh cites another module's global, which is a real __MODDEPS edge and makes every \`task\` verb load that module:
 $(printf '%s\n' "$_cmt_edges" | sed 's/^/      /')
-      Cite the FILE and the clause, never the identifier."
+      Cite the FILE and the clause, never the identifier. (base ${NOTIFY_COMMENT_BASE_REF:0:8}, $_added_n added comment lines in scope.)"
+    fi
   fi
 
-  # POSITIVE CONTROL: put iteration 2's citation back and require a flag.
-  _probe="$TMP/notify_probe.sh"
-  cp "$SRC/task/notify.sh" "$_probe"
-  printf '# regression probe: _GATE_HUMAN_CAPABILITIES seal (DIVE-2241/2131)\n' >>"$_probe"
-  _probe_edges=$(_comment_only_edges "$_probe")
+  # POSITIVE CONTROL, git-independent: feed iteration 2's citation to the same
+  # predicate as if the diff had added it. This is what separates "clean" above
+  # from "the predicate read nothing" — an empty diff, an unresolvable base or a
+  # broken token match all produce the same silence otherwise.
+  printf '# regression probe: _GATE_HUMAN_CAPABILITIES seal (DIVE-2241/2131)\n' >"$TMP/probe_cmt"
+  _probe_edges=$(_edges_bought_by "$TMP/probe_cmt")
   if printf '%s\n' "$_probe_edges" | grep -q '^_GATE_HUMAN_CAPABILITIES '; then
     ok_t "positive control: the same predicate DOES flag iteration 2's comment citation, so the clean answer above is a reading and not a silence"
   else

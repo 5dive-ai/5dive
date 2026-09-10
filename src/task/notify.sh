@@ -1997,11 +1997,11 @@ _task_need_route_deliver() {
 
 # ── DIVE-4154 arm D — THE UNDO WINDOW, ON THE PHONE PING ONLY ────────────────
 #
-# Measured on gate_history, 30 days to 2026-09-09 (DIVE-4150): of 193 human-facing
-# gates, 138 were WITHDRAWN BY THE FILING SEAT ITSELF after the phone had already
-# rung — median 1.0 min, 76 inside 2 minutes, 104 inside 15. The system pages
-# first and thinks later; the seat then retracts. Those pages bought the human
-# nothing: by the time he looked, the question was gone.
+# Measured on gate_history, the 30-day window to 2026-09-09 (DIVE-4150): of 193
+# human-facing gates, 138 were WITHDRAWN BY THE FILING SEAT ITSELF after the
+# phone had already rung — median 1.0 min, 76 inside 2 minutes, 104 inside 15.
+# The system pages first and thinks later; the seat then retracts. Those pages
+# bought the human nothing: by the time he looked, the question was gone.
 #
 # WHAT IS HELD IS THE PUSH NOTIFICATION, AND NOTHING ELSE. The gate row is
 # written, blocked and pending BEFORE this function is reached, so at file time it
@@ -2033,9 +2033,9 @@ _GATE_UNDO_WINDOW_SECS=120
 # DIVE-4174 sizing: a LONGER window for the gate types no routing arm can ever
 # take off the phone. `manual` is human-only by definition and `secret` must be
 # delivered by a human, so for these two the question is never "route it better",
-# only "how long before the phone rings". Measured over the frozen 30 days, on
-# manual+secret human-facing gates (pages removed / gates lodar ANSWERED that get
-# delayed): 2m 10/0 · 5m 13/0 · 10m 17/0 · 15m 20/0 · 30m 21/0.
+# only "how long before the phone rings". Measured over the frozen 30-day window,
+# on manual+secret human-facing gates (pages removed / gates lodar ANSWERED that
+# get delayed): 2m 10/0 · 5m 13/0 · 10m 17/0 · 15m 20/0 · 30m 21/0.
 #
 # **Zero cost at every size** — he answered 1 of the 38 type-default gates in the
 # window and it falls outside all of them — so this is priced on the take alone.
@@ -2058,10 +2058,11 @@ _GATE_UNDO_WINDOW_SECS=120
 # rather than the normal ping — and the re-nag is a plainer message. The intent
 # is the opposite: the re-nag stays what this page's own loss case calls it, the
 # net under a ping lost to a dead box, never the first contact on a healthy one.
-# Priced before changing it: exactly ONE manual/secret withdrawal in the 30 days
-# lands in (840s, 900s], so the margin costs one page of take (19 -> 18) and buys
-# back the whole ordering guarantee. Graded structurally, not by literal, in
-# gate_undo_window_unit arm 11b — a later raise past the re-nag reds there.
+# Priced before changing it: exactly ONE manual/secret withdrawal in the 30-day
+# window lands in (840s, 900s], so the margin costs one page of take (19 -> 18)
+# and buys back the whole ordering guarantee. Graded structurally, not by
+# literal, in gate_undo_window_unit arm 11b — a later raise past the re-nag
+# reds there.
 _GATE_UNDO_WINDOW_SECS_HUMAN_ONLY=840
 
 # Seconds to hold this gate's phone ping. 0 = ping now.
