@@ -14,8 +14,9 @@ block="$(sed -n '/^# >>> DIVE-4140 stable CLI target/,/^# <<< DIVE-4140 stable C
 if [[ -n "$block" ]] && grep -q 'resolve_cli_target()' <<<"$block"; then ok "stable resolver is extractable from install.sh"
 else bad "stable resolver is missing"; echo "$PASS passed, $FAIL failed"; exit 1; fi
 
-handoff="$(sed -n '/^# >>> DIVE-4140 stable installer handoff/,/^# <<< DIVE-4140 stable installer handoff/p' src/cmd_selfupdate.sh)"
-if [[ -n "$handoff" ]] && grep -q '_self_update_run_installer()' <<<"$handoff"; then
+handoff="$(sed -n '/^[[:space:]]*# >>> DIVE-4140 stable installer handoff/,/^[[:space:]]*# <<< DIVE-4140 stable installer handoff/p' src/cmd_selfupdate.sh)"
+if [[ -n "$handoff" ]] && grep -q 'CLI_VERSION_URL=' <<<"$handoff" \
+   && grep -q 'bash "$installer" --upgrade' <<<"$handoff"; then
   ok "self-update installer handoff is extractable from src/cmd_selfupdate.sh"
 else
   bad "self-update installer handoff is missing"
@@ -101,8 +102,9 @@ out="$(env -i PATH="$TD/bin:/usr/bin:/bin" FAKE_ROUTE=v9.9.9 FAKE_INSTALLED=1.4.
   CLI_VERSION_OVERRIDE_FILE="$TD/etc/override" CLI_CANARY_FILE="$TD/etc/canary" \
   CLI_VERSION_KNOWN_FILE="$TD/state/known" CLI_INSTALLED_BIN="$TD/bin/installed" \
   bash -c "set -euo pipefail
+installer=\"\$1\"
 $handoff
-_self_update_run_installer \"\$1\"" _ "$TD/bin/fetched-installer" 2>&1)"; rc=$?
+" _ "$TD/bin/fetched-installer" 2>&1)"; rc=$?
 [[ $rc -eq 0 && "$out" == v1.4.0 ]] \
   && ok "fake-red brake holds the real self-update installer handoff" \
   || bad "fake-red self-update rehearsal failed" "$out"

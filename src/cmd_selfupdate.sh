@@ -821,17 +821,6 @@ _hg_rollback_note() {
 }
 # <<< DIVE-4068 post-install health gate
 
-# >>> DIVE-4140 stable installer handoff
-# The installer owns target resolution (override/canary/stable/last-known/floor).
-# Keep the caller explicit about the shared route instead of growing a second,
-# drifting resolver inside self-update.
-_self_update_run_installer() {
-  local installer="$1"
-  CLI_VERSION_URL="${CLI_VERSION_URL:-https://api.5dive.com/cli-version}" \
-    bash "$installer" --upgrade
-}
-# <<< DIVE-4140 stable installer handoff
-
 cmd_self_update() {
   [[ $# -eq 0 ]] || fail "$E_USAGE" "self-update takes no arguments"
   command -v curl >/dev/null 2>&1 || fail "$E_NOT_FOUND" "curl is required for 5dive self-update"
@@ -878,7 +867,13 @@ cmd_self_update() {
 
   step "Upgrading 5dive CLI + plugins"
   # Send installer chatter to stderr so JSON stdout stays parseable.
-  _self_update_run_installer "$installer" >&2 || fail "$E_GENERIC" "upgrade failed"
+  # >>> DIVE-4140 stable installer handoff
+  # The installer owns target resolution (override/canary/stable/last-known/floor).
+  # Keep the caller explicit about the shared route instead of growing a second,
+  # drifting resolver inside self-update.
+  CLI_VERSION_URL="${CLI_VERSION_URL:-https://api.5dive.com/cli-version}" \
+    bash "$installer" --upgrade >&2 || fail "$E_GENERIC" "upgrade failed"
+  # <<< DIVE-4140 stable installer handoff
 
   # Restart only the agents whose payload actually moved. Best-effort per unit —
   # one failed restart shouldn't abort the rest.
