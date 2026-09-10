@@ -229,6 +229,56 @@ else
   bad_t "E3: src/ members must be judged by the bundle header, not their own text" "out=[${sout//$'\n'/ }]"
 fi
 
+# ── E4. the two errexit-EXEMPT contexts, both directions (DIVE-4202) ─────────
+# `set -e` does not reach a command that is a non-final element of an `&&`/`||`
+# list, or that sits in an if/elif/while/until CONDITION. The assignment still
+# assigns (empty) and the shell lives, so accusing it is a false positive and
+# the prescribed `|| v=""` there changes nothing — which is how a guard gets
+# switched off. src/cmd_pack.sh:2853 is the live instance.
+#
+# Each fixture is paired with the SAME probe in a FATAL position, so these arms
+# can never read as blanket silence: if the exemption ever over-reaches, the
+# paired arm goes red.
+mkdir -p "$TMP/exempt/src"
+PROBE='$(grep -oE "DIVE-[0-9]+" <<<"$1" | head -1)'
+# exempt: non-final element of an && list
+printf '#!/usr/bin/env bash\nf() {\n  local nonfinal\n  nonfinal=%s && printf x\n}\n' "$PROBE" \
+  > "$TMP/exempt/src/nonfinal_ok.sh"
+# exempt: an if-condition, spelled across a backslash continuation like cmd_pack.sh
+printf '#!/usr/bin/env bash\nf() {\n  local cond\n  if (( 1 )) \\\n     && cond=%s \\\n     && [[ -n "$cond" ]]; then :; fi\n}\n' "$PROBE" \
+  > "$TMP/exempt/src/ifcond_ok.sh"
+# exempt: a while-condition, with the assignment as the FINAL element of the
+# condition's && list — so ONLY the condition rule can clear it, never the
+# non-final one. (A bare `while w=$(…)` would grade nothing: the scanner's
+# ASSIGN anchor does not fire directly after the keyword, a documented
+# limitation, and a fixture must not quietly exercise a shape it never sees.)
+printf '#!/usr/bin/env bash\nf() {\n  local w\n  while (( 1 )) && w=%s; do break; done\n}\n' "$PROBE" \
+  > "$TMP/exempt/src/whilecond_ok.sh"
+# exempt: same, an if-condition — assignment final, so again the condition rule alone
+printf '#!/usr/bin/env bash\nf() {\n  local c2\n  if (( 1 )) && c2=%s; then :; fi\n}\n' "$PROBE" \
+  > "$TMP/exempt/src/ifcond_final_ok.sh"
+# FATAL, same probe: the FINAL element of an && list
+printf '#!/usr/bin/env bash\nf() {\n  local fin\n  (( 1 )) && fin=%s\n}\n' "$PROBE" \
+  > "$TMP/exempt/src/final_bad.sh"
+# FATAL, same probe: inside the then-BODY, i.e. after the condition ended
+printf '#!/usr/bin/env bash\nf() {\n  local body\n  if (( 1 )); then\n  body=%s\n  fi\n}\n' "$PROBE" \
+  > "$TMP/exempt/src/thenbody_bad.sh"
+eout=$(cd "$TMP/exempt" && bash "$SCAN" --root=src 2>&1)
+for fx in nonfinal_ok ifcond_ok whilecond_ok ifcond_final_ok; do
+  if [[ "$eout" != *"$fx"* ]]; then
+    ok_t "E4: $fx.sh — an errexit-exempt context is not accused"
+  else
+    bad_t "E4: false positive on $fx.sh (errexit never reaches it)" "out=[${eout//$'\n'/ }]"
+  fi
+done
+for fx in final_bad thenbody_bad; do
+  if [[ "$eout" == *"$fx"* ]]; then
+    ok_t "E4: $fx.sh — the SAME probe in a fatal position is still accused"
+  else
+    bad_t "E4: $fx.sh must remain an offender — the exemption has over-reached into the class this scanner exists for" "out=[${eout//$'\n'/ }]"
+  fi
+done
+
 # ── F. MUTATION: strip each fix, require the scanner to name it back ──────────
 # file:line:VAR — the sites DIVE-2604 guarded. A fix that is reverted, moved, or
 # re-merged into a `local` must make this arm red, or the guard is decorative.

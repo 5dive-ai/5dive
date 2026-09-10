@@ -316,25 +316,41 @@ jobs:
           ./build.sh
           docker build -f docker/Dockerfile -t 5dive-contract .
       # Everything docker-install asserts is that the bundle lays down and
-      # reports a version. Nothing there ever installed a bundled plugin,
+      # reports a version. Nothing there ever installed a published plugin,
       # resolved a team template, or asked a verb for its usage — so v0.28.0
       # shipped the browser plugin uninstallable (DIVE-4126) and the
       # `distribution` template unstaged (#808) with that job green. Both
       # defects are "the artifact exists and does not install/run", and only a
       # fresh-box exercise sees them.
       #
-      # marketplace.json is mounted from the CHECKOUT, not read out of the
-      # installed tree: the repo's manifest is the source of truth, so a plugin
-      # install.sh forgot to stage is still enumerated and reports as missing.
-      # Read the installed copy instead and install.sh becomes its own examiner.
+      # NEITHER manifest is read out of the installed tree: they are the
+      # PUBLISHERS' copies, so a plugin or a slug the box failed to get is still
+      # enumerated and reports as missing. Read the box's own copies instead and
+      # the box becomes its own examiner.
       #
-      # DIVE-4196: the TEMPLATE half is no longer mounted. Templates moved to
-      # <org>/character-packs (teams/) and the contract fetches that index from
-      # inside the container — the registry is the only declaration there is, so
-      # a mounted checkout copy would grade a file no customer reads.
+      # DIVE-4202: the plugin manifest is FETCHED from the registry
+      # (5dive-ai/5dive-plugins) rather than mounted from this checkout — this
+      # repo ships no plugins.
+      # DIVE-4196: the TEMPLATE half is not mounted either, and is fetched by
+      # the contract from inside the container — templates moved to
+      # <org>/character-packs (teams/) and that index is the only declaration
+      # there is, so a mounted checkout copy would grade a file no customer
+      # reads.
+      #
+      # Together that is what makes this job grade a PUBLISH: a plugin or a
+      # template that lands in its registry is exercised on a fresh box by the
+      # next run, with no CLI release and no edit here. It also means both arms
+      # depend on the registries being reachable; the plugin fetch is asserted
+      # non-empty here and the contract FAILS (never skips) on an unreadable
+      # team index, so an outage reports as itself rather than as clean.
       - name: Plugins install, templates resolve, verbs answer --help
         run: |
+          curl -fsSL \
+            "https://raw.githubusercontent.com/${GITHUB_REPOSITORY%%/*}/5dive-plugins/main/.claude-plugin/marketplace.json" \
+            -o "$PWD/registry-marketplace.json"
+          jq -e '.plugins | length > 0' "$PWD/registry-marketplace.json" >/dev/null \
+            || { echo "registry marketplace.json fetched but declares no plugins"; exit 1; }
           docker run --rm \
             -v "$PWD/scripts/install-contract.sh:/contract.sh:ro" \
-            -v "$PWD/plugins/.claude-plugin/marketplace.json:/manifests/marketplace.json:ro" \
+            -v "$PWD/registry-marketplace.json:/manifests/marketplace.json:ro" \
             --entrypoint /bin/bash 5dive-contract /contract.sh

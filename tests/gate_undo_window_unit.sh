@@ -558,5 +558,54 @@ else
 fi
 
 
+# ── 13. THE HOLD MUST NOT BLOCK A CALLER THAT CAPTURES STDOUT (DIVE-4244) ─────
+#
+# Every arm above drives the deliverer with its stdout going straight to the
+# harness's own, which is the one shape where the leak is invisible. The
+# PRODUCTION shape is the opposite: the gate filer is called with a restorable
+# redirection (`<filer> >/dev/null`, cmd_objective.sh:1012) from inside a command
+# substitution. bash then holds a dup of the CALLER's stdout while that call
+# runs, the detached child inherits it, and the caller's `$(...)` pipe cannot
+# reach EOF until the window closes. Shipped, that turned a 120s background hold
+# into 120s of foreground latency per gate — tests/objective_replan_unit.sh went
+# 24.1s -> 732s and red-ed main's full sweep.
+#
+# NEGATIVE CONTROL, and the arm is worthless without it: the same call is also
+# timed WITHOUT the enclosing redirection. The leak needs the redirection, so an
+# arm that only timed the redirected form would pass identically if the hold had
+# been deleted outright, if the window had resolved to 0, or if the fixture never
+# reached the deferring branch at all.
+reset; mkgate DIVE-9120 high
+_undo_probe_mark="$TMP/undo-probe-delivered"; : >"$_undo_probe_mark"
+_task_need_notify_deliver_now() { printf '%s\n' "$1" >>"$_undo_probe_mark"; TASK_SEND_DELIVERED=1; return 0; }
+_undo_probe_filer() { _task_need_notify_deliver "$@" >/dev/null; printf 'filed'; }
+
+_t0=$SECONDS; _out=$( _undo_probe_filer DIVE-9120 decision "ask" "" ); _redir_el=$(( SECONDS - _t0 ))
+[[ "$_out" == "filed" ]] \
+  && ok_t "the capturing caller got its stdout back" \
+  || fail_t "capturing caller read '${_out}', expected 'filed'"
+# The window here is 4s (fixture). "Under 2s" is the whole claim: the caller
+# returns without waiting on the hold at all, not merely faster than the window.
+(( _redir_el < 2 )) \
+  && ok_t "a \$(...) capture of a REDIRECTED gate-filing call returns at once (${_redir_el}s, window ${_5DIVE_GATE_UNDO_WINDOW_SECS}s) — the detached child holds none of the caller's descriptors" \
+  || fail_t "the hold blocked its capturing caller for ${_redir_el}s (window ${_5DIVE_GATE_UNDO_WINDOW_SECS}s) — a detached child is still holding the caller's stdout (DIVE-4244)"
+
+reset; mkgate DIVE-9121 high; : >"$_undo_probe_mark"
+_t0=$SECONDS; _out=$( _task_need_notify_deliver DIVE-9121 decision "ask" "" ); _plain_el=$(( SECONDS - _t0 ))
+(( _plain_el < 2 )) \
+  && ok_t "negative control: the UNREDIRECTED capture is fast too (${_plain_el}s), so the arm above is timing the redirection and not a hold that stopped happening" \
+  || fail_t "negative control failed — even the unredirected capture blocked ${_plain_el}s"
+# And the hold is still a hold: nothing was pushed at filing time on either path.
+[[ ! -s "$_undo_probe_mark" ]] \
+  && ok_t "neither capture delivered at filing time — the ping is still HELD, not skipped" \
+  || fail_t "a capture delivered the push synchronously: $(tr '\n' ' ' <"$_undo_probe_mark") — the window was bypassed, so arms above are vacuous"
+# The held ping must still FIRE. Without this the fastest way to pass every arm
+# above is to drop the child entirely, which is the one outcome DIVE-4154 forbids.
+_w=0; while (( _w < 25 )); do grep -qx DIVE-9121 "$_undo_probe_mark" && break; sleep 1; _w=$(( _w + 1 )); done
+grep -qx DIVE-9121 "$_undo_probe_mark" \
+  && ok_t "the held ping still fired after the window (${_w}s) — the child survives losing the caller's descriptors" \
+  || fail_t "the held ping NEVER fired within 25s of a ${_5DIVE_GATE_UNDO_WINDOW_SECS}s window — detaching the descriptors killed the delivery it was protecting"
+
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

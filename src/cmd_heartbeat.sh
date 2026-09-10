@@ -1275,7 +1275,18 @@ _hb_pane_is_usage_limit() {
   # does not weaken the two-signature discipline that stops ordinary output
   # mentioning "limit" from false-matching (asserted in both harnesses).
   grep -qiE 'hit your ((monthly|weekly|daily)([ -]?spend)?|usage|session|5[ -]?hour) limit|usage limit reached|reached your .* limit|limit reached' <<<"$pane" || return 1
-  grep -qiE "upgrade your plan|wait for .*limit to reset|limit will reset|${_HB_RESET_TIME_RE}" <<<"$pane" || return 1
+  # DIVE-4171 added `upgrade to pro` to the ACTION alternation. codex's wall is
+  # one line carrying both signatures -- `Codex could not complete this turn:
+  # You've hit your usage limit. Upgrade to Pro` -- and after DIVE-4206 widened
+  # the header arm it matched the header and FAILED here: every action phrasing
+  # in the list is Claude Code's copy ("Upgrade your plan"), and codex names the
+  # plan instead of the verb's object. So a walled codex seat read as "not a
+  # wall" to every caller of this matcher (`_hb_usage_limit_frozen`, and
+  # `_hb_wall_class` which short-circuits on it), while the SUPERVISOR's own
+  # pattern matched the same line -- two instruments disagreeing about one pane.
+  # Two-signature discipline is unchanged: this is still the action arm, and a
+  # header line alone still does not match (asserted in tests/heartbeat_codex_wall_unit.sh).
+  grep -qiE "upgrade your plan|upgrade to pro|wait for .*limit to reset|limit will reset|${_HB_RESET_TIME_RE}" <<<"$pane" || return 1
   return 0
 }
 
@@ -1573,7 +1584,21 @@ _hb_pick_tasks() {
         crit(root, cp) AS (SELECT root, MAX(depth) AS cp FROM cp GROUP BY root)
       SELECT t.id
         FROM tasks t LEFT JOIN crit c ON c.root = t.id
-        WHERE t.assignee=$(sqlq "$name") AND t.status='todo' AND t.kind='standard'
+        WHERE t.status='todo' AND t.kind='standard'
+          -- DIVE-4220: THE SEAT THAT HOLDS THE MERGE IS NOT ALWAYS THE ASSIGNEE.
+          -- DIVE-4206 (below) stopped waking a maker onto a merge owed by someone
+          -- else, which was right, but it left the row dispatched to NOBODY: the
+          -- picker only ever selected assignee=<seat>, so a row whose merge owner
+          -- is the GRADER waits until a seat happens to look. Measured 2026-09-10
+          -- 10:45Z: 8 rows sat in graded-to-merge, three of them with the pull
+          -- request already MERGED hours earlier. The second arm here is what
+          -- makes the merge a DISPATCHED turn for the seat that can act on it.
+          -- The owner expression is the board's, character for character, and it
+          -- is only ever read on a graded-and-waiting row.
+          AND ( t.assignee=$(sqlq "$name")
+                OR ( (${_TASKS_TFV_SQL})
+                     AND COALESCE(NULLIF(t.merge_owner,''), NULLIF(t.maker_agent,''),
+                                  COALESCE(t.assignee,'?')) = $(sqlq "$name") ) )
           AND NOT (t.need_type IS NOT NULL AND t.need_answered_at IS NULL)
           AND NOT EXISTS (
             SELECT 1 FROM task_deps dd JOIN tasks b ON b.id = dd.blocked_by
@@ -1670,6 +1695,17 @@ _hb_send_line() {
     fi
     return 1
   }
+  # DIVE-4242: COMPOSER HYGIENE, then the payload. Measured 2026-09-10 15:43Z on
+  # ops: the tick typed a /goal at 15:40:31Z and claimed the row; the pane then
+  # showed `❯ [Pasted text #7]irst (verify before relying...` — the NUDGE's own
+  # tail, NOT dim — sitting unsent in the composer while every later tick read
+  # 'busy — 1 in_progress, skip'. Whatever is already in the composer (a previous
+  # injector's remainder, a human's half-typed line) must not be prepended to
+  # this payload, so clear the line first. C-u, never Escape: Escape on a seat
+  # that is mid-turn ABORTS the turn, C-u only edits the composer. Ghost text
+  # (CC 2.1.267 promptSuggestion, rendered DIM) is not input and is replaced by
+  # typing anyway; it is excluded from the verify below rather than cleared.
+  sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" C-u 2>/dev/null || return 1
   sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" -l -- "$text" 2>/dev/null || return 1
   # DIVE-1217: `send-keys -l` lands as a bracketed PASTE. Claude commits it
   # synchronously so an immediate Enter submits (leave that path alone). Non-claude
@@ -1678,9 +1714,22 @@ _hb_send_line() {
   # starts and the nudge is silently dropped. For those: let the paste settle,
   # Enter, then CONFIRM the turn started (agent left idle), re-sending Enter a few
   # times before giving up.
+  # DIVE-4242: the claude path now VERIFIES the submit instead of assuming it. A
+  # long payload on CC 2.1.267 can leave its tail in the composer after the
+  # Enter (measured above); the caller then claims the row and the dispatcher is
+  # blind to a seat that never received its task. Verify = the composer line holds
+  # no non-dim text. Retry the Enter once; then return failure LOUDLY so
+  # _hb_wake fails and the tick does not claim — the next tick re-nudges, which is
+  # the pre-DIVE-2244 behaviour for exactly this task and strictly better than a
+  # claim on a prompt nobody received.
   if [[ -n "$(_hb_claude_pid "$name")" ]]; then
     sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter 2>/dev/null || return 1
-    return 0
+    _hb_verify_submit "$name" && return 0
+    sleep "${_HB_SUBMIT_RETRY_SEC:-0.5}"
+    sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter 2>/dev/null || return 1
+    _hb_verify_submit "$name" && return 0
+    _hb_log "[$name] submit UNVERIFIED — the composer still holds ${#_HB_COMPOSER_UNSENT} chars of non-ghost text after 2 Enters ('${_HB_COMPOSER_UNSENT:0:60}'); returning failure so nothing is claimed on it (DIVE-4242)" 2>/dev/null || true
+    return 1
   fi
   sleep 0.4
   while (( tries < 5 )); do
@@ -1692,6 +1741,42 @@ _hb_send_line() {
     tries=$((tries+1))
   done
   return 1
+}
+
+# DIVE-4242: the text a seat's composer is holding RIGHT NOW, with ghost text
+# excluded. `capture-pane -e` keeps the SGR codes; CC 2.1.267 renders its prompt
+# suggestion (promptSuggestionEnabled) as a DIM run `ESC[2m...ESC[0m` after the
+# composer glyph, and that run is not input — a plain Enter does nothing to it.
+# Anything else after the last `❯` is real unsent input (a paste placeholder,
+# a half-typed line). Empty output = composer empty (or unreadable: a pane we
+# cannot read is handled by the credential guard before we ever type).
+_hb_composer_unsent() {
+  local name="$1" raw line esc=$'\e'
+  raw=$(sudo -u "agent-${name}" tmux capture-pane -e -p -t "agent-${name}" 2>/dev/null) || { printf ''; return 0; }
+  line=$(grep -a '❯' <<<"$raw" | tail -1) || line=""   # no glyph on the pane = empty composer, not a fatal probe
+  [[ -n "$line" ]] || { printf ''; return 0; }
+  line="${line#*❯}"
+  # 1) drop DIM runs (ghost text); 2) strip every remaining CSI sequence.
+  line=$(sed -E "s/${esc}\[2m[^${esc}]*(${esc}\[0m|${esc}\[22m)//g; s/${esc}\[[0-9;?]*[A-Za-z]//g" <<<"$line")
+  # The composer glyph is followed by a NO-BREAK SPACE (U+00A0, bytes C2 A0),
+  # which [[:space:]] does not match. Measured 2026-09-10 15:58Z on all 13 live
+  # seats: without this line every idle composer read as one leftover character,
+  # i.e. every wake would have failed the verify and nothing would ever be claimed.
+  line="${line//$'\xc2\xa0'/ }"
+  line="${line//[$'\t\r\n']/ }"
+  line=$(sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$line")
+  printf '%s' "$line"
+}
+
+# DIVE-4242: did the Enter take? 0 = composer empty of non-ghost text (the
+# payload left it), 1 = text still sitting there (sets _HB_COMPOSER_UNSENT for
+# the caller's log line). Waits a beat first so the TUI has redrawn.
+_HB_COMPOSER_UNSENT=""
+_hb_verify_submit() {
+  local name="$1"
+  sleep "${_HB_SUBMIT_VERIFY_SEC:-0.3}"
+  _HB_COMPOSER_UNSENT=$(_hb_composer_unsent "$name")
+  [[ -z "$_HB_COMPOSER_UNSENT" ]]
 }
 
 # PID of this agent's live inner `claude` process, or empty if not found. This is
@@ -2231,6 +2316,18 @@ _hb_quota_parked() {
 # live outside this root, which the old per-directory scan could never reach.
 _HB_PROJECTS_ROOT="${FIVE_PROJECTS_ROOT:-/home/claude/projects/5dive}"
 _HB_WORKSPACE_SCAN_MAX=400
+# DIVE-4213 carryover bounds. The transcript window is a RECORD count (one JSONL
+# record is one physical line) and the message cap is characters: the clause
+# rides a single tmux line into the seat's pane, so an unbounded paste of the
+# previous attempt's last turn would be a transcript replay rather than a
+# pointer, and a wall the reader skips is the same as no carryover at all.
+_HB_CARRYOVER_TAIL_LINES=800
+_HB_CARRYOVER_MSG_MAX=700
+# Where a seat's home lives. Overridable for the SAME reason _HB_PROJECTS_ROOT
+# is: the transcript reader is part of what the harness has to grade, so it must
+# be pointable at a throwaway tree instead of stubbed out — a stub of the thing
+# under test grades nothing.
+_HB_SEAT_HOME_ROOT="${FIVE_SEAT_HOME_ROOT:-/home}"
 # Does any LIVE worktree of the clone reachable from `$1` have branch `$2`
 # checked out? Parses `worktree list --porcelain` records (blank-line
 # separated: `worktree <path>`, `HEAD <sha>`, then `branch refs/heads/<x>` or
@@ -2246,6 +2343,12 @@ _hb_worktree_holds_branch() {
   # below — a checkout whose directory survives is never marked prunable, so a
   # `prunable` arm would be a line no fixture can reach.
   #
+  # DIVE-4213: on a match the CHECKOUT DIRECTORY is echoed, not just a 0 exit.
+  # The resume carryover has to name the path attempt N was working in, and this
+  # loop is the only place that already knows it; re-deriving it from the branch
+  # a second time would be a second scan of ~700 checkouts that could disagree
+  # with the one the hold arm read. The sole caller captures the echo.
+  #
   # The trailing `echo` terminates the LAST record: git emits a blank line
   # after every record today, but a stream whose final record is only closed
   # by EOF would silently drop the newest worktree, and that is the one a
@@ -2254,15 +2357,21 @@ _hb_worktree_holds_branch() {
     case "$line" in
       "worktree "*)          wt="${line#worktree }"; br="" ;;
       "branch refs/heads/"*) br="${line#branch refs/heads/}" ;;
-      "")                    [[ "$br" == "$branch" && -d "$wt" ]] && return 0
+      "")                    [[ "$br" == "$branch" && -d "$wt" ]] \
+                               && { printf '%s' "$wt"; return 0; }
                              wt=""; br="" ;;
     esac
   done < <( { git -C "$d" worktree list --porcelain 2>/dev/null; echo; } )
   return 1
 }
 
+# `_hb_row_workspace_intact <task_id> [with-path]` — echoes the branch of the
+# row's last pushed ship_event when some local checkout still holds it. With a
+# second argument it echoes `<branch>|<checkout path>` instead; DIVE-4213's
+# carryover needs the path and rule (a)'s hold needs only the branch, and both
+# read the SAME probe so they can never disagree about which checkout is meant.
 _hb_row_workspace_intact() {
-  local id="$1" branch d cdir scanned=0 seen=" "
+  local id="$1" want_path="${2:-}" branch d cdir scanned=0 seen=" " _wtpath
   branch=$(db "SELECT branch FROM ship_events
                 WHERE ident=(SELECT ident FROM tasks WHERE id=${id})
                   AND branch IS NOT NULL AND branch<>''
@@ -2281,8 +2390,10 @@ _hb_row_workspace_intact() {
     case "$cdir" in /*) ;; *) cdir="${d}/${cdir#./}" ;; esac
     [[ "$seen" == *" ${cdir} "* ]] && continue
     seen="${seen}${cdir} "
-    if _hb_worktree_holds_branch "$d" "$branch"; then
-      printf '%s' "$branch"; return 0
+    if _wtpath=$(_hb_worktree_holds_branch "$d" "$branch"); then
+      if [[ -n "$want_path" ]]; then printf '%s|%s' "$branch" "$_wtpath"
+      else printf '%s' "$branch"; fi
+      return 0
     fi
   done
   return 1
@@ -2456,6 +2567,40 @@ _hb_reclaim() {
     # requeue is genuinely stuck → on the _HB_REAP_ESCALATE_AFTER'th reap, block
     # it + escalate (pings owner & paired human) so a person decides its fate.
     if (( age_min >= budget )); then
+      # DIVE-4171 — A WALLED SEAT MUST NEVER MANUFACTURE A HUMAN GATE. DIVE-4104
+      # parked rule (b) only, on the stated ground that "a walled seat that also
+      # overran its 45m budget is still a real overrun". Measured on codex
+      # 2026-09-09, that ground does not hold for a wall that OUTLASTS the
+      # budget, and every ChatGPT usage wall does: 11:20:07 reclaimed DIVE-4119
+      # as "overran 45m budget (reap #1)", 11:30:19 re-nudged the same seat into
+      # the same wall, 12:21:06 "overran 45m 2x — blocked + escalated". The row
+      # was then `blocked` with "needs a human to requeue" — a human gate filed
+      # for a seat that had lost nothing and would resume on its own. DIVE-4161
+      # took the same shape 14 minutes later. The overrun is real and it is also
+      # fully EXPLAINED: nothing was working, so requeueing from a clean slate
+      # buys nothing and the reap counter is measuring the wall, not the row.
+      #
+      # HELD, not reclaimed-once, and the difference is the counter: a reclaim
+      # still spends a `_hb_mark_reap` tick, so a wall spanning two budgets would
+      # still reach _HB_REAP_ESCALATE_AFTER by a different route. The hold is the
+      # same shape rule (b) already uses and it is bounded by the SAME park —
+      # deadline plus one tick when the wall names one, else the 6h fallback cap
+      # (_HB_QUOTA_PARK_FALLBACK_SEC) — so it expires on its own and this arm
+      # then reaps exactly as before. It cannot wedge a claim: no arm here can
+      # extend the park, only the supervisor's next observation can.
+      #
+      # It also stops the `/goal clear` below being sent INTO the wall. On the
+      # codex dispatcher that line is not free: `_hb_send_line` skips /clear on
+      # that path (DIVE-4036, no thread-reset verb), so each nudge appends
+      # another full /goal to one ever-growing thread that is re-sent every turn
+      # — the seat's own pane complained of "a huge thread containing many
+      # repeated /goal messages". Nudging a walled seat spends the quota that
+      # walled it.
+      local _cpark
+      if _cpark=$(_hb_quota_parked "$name" "$everyMin"); then
+        _hb_log "[$name] $(_hb_ident "$id") is ${age_min}m past the ${budget}m budget but the supervisor classifies this seat (or a peer on its auth profile) quota-exhausted — claim HELD, NOT reaped and NOT escalated (~${_cpark}m of park left, DIVE-4171)"
+        continue
+      fi
       _hb_send_line "$name" "/goal clear" || true
       local reap_n
       reap_n=$(with_registry_lock _hb_mark_reap "$name" "$id")
@@ -2713,9 +2858,19 @@ _hb_loop_terminal_clause() {
   # One read, three fields: the verifier selects the variant, maker_agent proves
   # (or disproves) the handoff, created_by names the routing variant's destination.
   # '|' is safe as a separator — all three are agent names (validated slugs).
+  # DIVE-4220: the woken seat is not always the ASSIGNEE. Once the picker
+  # dispatches a graded-and-waiting row to the seat that OWNS the merge, that seat
+  # is frequently the GRADER while the row stays assigned to the maker — and an
+  # assignee-only read returned empty there, so the one wake that exists to move a
+  # merge arrived with no note at all. The second arm is the same owner expression
+  # the picker and the board use, and it is only ever reached on a graded row.
   row=$(db "SELECT COALESCE(verifier,'')||'|'||COALESCE(maker_agent,'')||'|'||COALESCE(created_by,'')
               FROM tasks
-               WHERE id=${task_id} AND assignee=$(sqlq "$name")
+               WHERE id=${task_id}
+                 AND ( assignee=$(sqlq "$name")
+                       OR ( (${_TASKS_TFV_SQL})
+                            AND COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''),
+                                         COALESCE(assignee,'?')) = $(sqlq "$name") ) )
                  AND status NOT IN ('done','cancelled');" 2>/dev/null) || return 0
   vfier="${row%%|*}"; rest="${row#*|}"; maker="${rest%%|*}"; creator="${rest#*|}"
   [[ -n "$vfier" ]] || return 0
@@ -2737,6 +2892,28 @@ _hb_loop_terminal_clause() {
   if [[ "$(db "SELECT 1 FROM tasks WHERE id=${task_id} AND ${_TASKS_TFV_SQL};" 2>/dev/null)" == "1" ]]; then
     local _tfv_owner
     _tfv_owner=$(db "SELECT COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''), COALESCE(assignee,'?')) FROM tasks WHERE id=${task_id};" 2>/dev/null)
+    # DIVE-4220 — THE OWNER'S OWN ROW IS NOT TERMINAL FOR THE OWNER. The clause
+    # below is correct for everyone EXCEPT the seat that owes the merge, and to
+    # that seat it says the exact opposite of the truth: stop, someone else acts.
+    # It was never reached before, because the picker never woke a non-assignee
+    # owner and the read above was assignee-only; widening the picker without
+    # widening this would hand the merge owner a note telling them to stand down,
+    # which is the strand this row exists to end. Three outcomes are named because
+    # the wake is one turn and the seat should not have to re-derive which it is
+    # in: already merged, mergeable, or a red required check that belongs to the
+    # maker. Deliberately NOT an auto-close (main2, 2026-09-10): a merged pull
+    # request is not a finished row — two of seven rows triaged that morning had
+    # an owed clause in their own PASS verdict — so the wake DISPATCHES the seat
+    # that can read the verdict, and the close stays a judgement someone makes.
+    if [[ -n "$_tfv_owner" && "$_tfv_owner" == "$name" ]]; then
+      printf ' NOTE — %s is GRADED AND THE MERGE IS YOURS: a verifier grade is recorded, a delivery ref is bound, and %s names YOU (%s) as the seat that owes the merge. This wake IS that move — nothing here is owed by anyone else, so do not route it onward, do not re-grade it and do not re-deliver it. START BY READING THE PULL REQUEST STATE, because which of three things you should do is decided there and not in this note. (1) ALREADY MERGED: close the row with %s — but read the PASS verdict first, since a merged pull request is NOT automatically a finished row (a verdict routinely carries an owed clause, or the branch was one item of several), and if something is still owed, say so on the row and leave it open. (2) MERGEABLE AND GREEN: land it (%s, or %s if you hold the merge), then close. (3) A REQUIRED CHECK IS RED, or the branch conflicts: that is the MAKER%s move, not yours — bounce it with %s naming the check, and stop. Whatever you do, say which of the three it was.' \
+        "$task_ident" "'5dive task ls'" "$name" \
+        "'5dive task done ${task_ident}'" \
+        "'5dive task merge ${task_ident}'" "'5dive task done ${task_ident}'" \
+        "$([[ -n "$maker" ]] && printf "'s (%s)" "$maker" || printf "'s")" \
+        "'5dive task reject ${task_ident} --feedback=...'"
+      return 0
+    fi
     printf ' NOTE — %s is GRADED AND WAITING ON A MERGE: a verifier grade is recorded and a delivery ref is bound, so the verifier has discharged their role and this is TERMINAL FOR THIS GOAL. Treat the goal as MET and stop — %s renders it as %s. The row stays OPEN on purpose and closes only when the work MERGES, because %s keeps meaning merged-to-main; the outstanding act is a MERGE owed by %s, not another pass by you. Do NOT re-grade it, re-deliver it, or close it to make the loop stop.' \
       "$task_ident" "'5dive task ls'" "'graded->merge:${_tfv_owner}'" "'done'" "${_tfv_owner:-the maker}"
     return 0
@@ -2809,6 +2986,132 @@ _hb_reject_fix_clause() {
   local fix; fix=$(_reject_fix_block "$res") || return 0
   [[ -n "$fix" ]] || return 0
   printf ' YOUR PREVIOUS DELIVERY WAS REJECTED AND THE VERIFIER NAMED THE FIX — read this before you touch anything else: %s. Do THAT, then deliver with a result that says what you changed; a byte-identical re-delivery is refused (DIVE-4144), because it costs the verifier a full re-read of the PR to discover nothing moved.' "$fix"
+}
+
+# DIVE-4213 — RESUME ATTEMPT N+1 FROM ATTEMPT N.
+#
+# Measured over the 7d to 2026-09-10: 400 maker runs, 228 of them reclaimed to
+# todo (57%), and a reclaimed attempt is NOT a short one — median 25 min, p90
+# 50. Every one of those minutes is discarded, because the next heartbeat wakes
+# the same seat on the same row with a BLANK context and it starts over. That is
+# the attempts-per-delivered-task number (median 3, mean 4.4) in one mechanism.
+#
+# DIVE-4206 shipped the two arms that stop attempts being taken away wrongly. An
+# attempt that is legitimately reclaimed is still taken away — this hands the
+# next one what the last one had.
+#
+# THE CARRYOVER IS EVIDENCE, NEVER INSTRUCTION. A resumed attempt that inherits
+# the previous attempt's CONCLUSION re-asserts it instead of re-deriving it, and
+# a wrong conclusion then survives every remaining attempt — strictly worse than
+# starting blank. So what is handed over is three POINTERS and no verdict: the
+# checkout the work is in, the row to read, and the verbatim last thing the seat
+# said (labelled as possibly wrong). The clause says so in as many words,
+# because the reader is a model and the framing is the control.
+#
+# `_hb_last_assistant_message <agent>` — the last assistant text in the seat's
+# newest transcript. Same resolution `_sup_goal_drift` uses (newest *.jsonl by
+# mtime under the seat's ~/.claude/projects). Best-effort by contract: no
+# transcript, no jq, an unreadable file or a session that never spoke all return
+# 1 and the caller simply omits item (3).
+_hb_last_assistant_message() { # <agent>
+  local name="$1" tx txt
+  local home                       # separate stmt: ${name} aborts under set -u on the same line
+  home="${_HB_SEAT_HOME_ROOT}/agent-${name}"
+  [[ -d "$home/.claude/projects" ]] || return 1
+  tx=$( { find "$home/.claude/projects" -type f -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null || true; } \
+        | sort -rn | head -1 | cut -d' ' -f2-)
+  [[ -n "$tx" && -r "$tx" ]] || return 1
+  # Bounded read: the last assistant turn is at the tail, and a transcript can be
+  # hundreds of MB. One JSONL record is one physical line, so `tail -n` is a
+  # record window, not a byte window.
+  # The whitespace collapse happens INSIDE jq, before the shell ever sees the
+  # text. A model's turn is routinely multi-line, so a reader that flattened
+  # afterwards would have `tail -1` pick the last LINE of the last turn — the
+  # word "end" of a 4KB message — instead of the last TURN. One record in, one
+  # line out, so `tail -1` means the newest assistant turn and nothing else.
+  txt=$(tail -n "$_HB_CARRYOVER_TAIL_LINES" "$tx" 2>/dev/null \
+        | jq -r 'select(.type=="assistant")
+                 | [ (.message.content // [])[] | select(.type=="text") | .text ]
+                 | join(" ") | gsub("\\s+";" ")' 2>/dev/null \
+        | grep -v '^[[:space:]]*$' | tail -1) || txt=""
+  [[ -n "$txt" ]] || return 1
+  # Flatten to one line (the nudge is one tmux line) and cap the length: this is
+  # a pointer back into the seat's own workspace, not a transcript replay.
+  txt=$(printf '%s' "$txt" | tr '\n\r\t' '   ' | tr -s ' ')
+  if (( ${#txt} > _HB_CARRYOVER_MSG_MAX )); then
+    txt="${txt:0:$_HB_CARRYOVER_MSG_MAX}..."
+  fi
+  printf '%s' "$txt"
+}
+
+# `_hb_carryover_clause <agent> <task_id> <ident>` — echoes the clause, or
+# returns 1 when this is not a resume. FOUR conditions, all positive evidence:
+#
+#   1. this seat's LATEST CLOSED run on this row has outcome `reclaimed_to_todo`
+#      (so attempt 1 on a fresh row gets nothing; a row whose last run was
+#      reclaimed to the VERIFIER is not a maker's resume; and a reclaim that a
+#      LATER closed run has already superseded — the reject bounce, where the
+#      newer run is completed/verifier_rejected — is not resumed, because the
+#      attempt number and the transcript attribution would both be wrong);
+#   2. that reclaim's reason is not the hard cap. The bound is stated in the
+#      ticket and it is the only reclaim reason that is evidence AGAINST
+#      resuming: `overran the budget` means the attempt was wedged, and handing
+#      a wedged attempt its own workspace back resumes it into the same wedge.
+#      The `session gone` and `idle` reasons carry no such signal;
+#   3. the workspace is still on disk and still holds the row's branch;
+#   4. (soft) the seat's last message is readable — omitted if not.
+_hb_carryover_clause() { # <agent> <task_id> <ident>
+  local name="$1" id="$2" ident="$3"
+  local prev attempt ended why wb branch wpath last=""
+  # char(31) is the field separator: a reclaim reason contains spaces, commas,
+  # parentheses and '|' (see rule (a)'s why), so every printable delimiter is
+  # reachable by the data. SQLite does not interpret \x escapes inside a string
+  # literal, which is why this is char(31) and not '\x1f'.
+  # DIVE-4213 (iteration 2): the reclaimed run must BE this seat's LATEST CLOSED
+  # run on this row, not merely the newest reclaimed one anywhere in its history.
+  # Selecting `status='abandoned' AND outcome='reclaimed_to_todo'` directly reaches
+  # PAST a newer closed run, and the common shape has one: a verifier reject writes
+  # attempt N+1 as completed/verifier_rejected (src/task/delivery.sh), and a reject
+  # bounce is exactly when the seat is re-woken — so the carryover would arrive
+  # beside `_hb_reject_fix_clause` claiming an attempt number one too low and
+  # attributing the NEWER attempt's transcript line to the OLDER attempt it names.
+  # The new attempt's own run row is already open by then (`_hb_claim_task` calls
+  # `run_open` before the nudge is composed), which is why this asks for the latest
+  # run that has ENDED rather than the latest run.
+  local outcome=""
+  prev=$(db "SELECT COALESCE(attempt,1)
+                    || char(31) || COALESCE(ended_at,'')
+                    || char(31) || COALESCE(error_class,'')
+                    || char(31) || COALESCE(outcome,'')
+               FROM runs
+              WHERE task_id=${id} AND agent=$(sqlq "$name")
+                AND ended_at IS NOT NULL AND status <> 'running'
+              ORDER BY COALESCE(ended_at, started_at) DESC, rowid DESC
+              LIMIT 1;" 2>/dev/null) || return 1
+  [[ -n "$prev" ]] || return 1
+  IFS=$'\x1f' read -r attempt ended why outcome <<<"$prev"
+  [[ "$outcome" == "reclaimed_to_todo" ]] || return 1
+  [[ "${attempt:-}" =~ ^[0-9]+$ ]] || attempt=1
+  # (2) the one reclaim reason that forbids a resume. Matched on the prefix
+  # `_hb_reclaim` writes for rule (c); see the hard-cap arm.
+  case "$why" in "overran "*) return 1 ;; esac
+  wb=$(_hb_row_workspace_intact "$id" with-path) || return 1
+  branch="${wb%%|*}"; wpath="${wb#*|}"
+  [[ -n "$branch" && -n "$wpath" && "$wpath" != "$wb" ]] || return 1
+  last=$(_hb_last_assistant_message "$name" 2>/dev/null) || last=""
+
+  local c=" CARRYOVER (DIVE-4213) — you have worked ${ident} before: attempt ${attempt} on this seat ended"
+  [[ -n "$ended" ]] && c="${c} at ${ended} UTC"
+  c="${c} and was reclaimed (${why:-reason not recorded}), so this is attempt $(( attempt + 1 )) and your context is blank but the work is not."
+  c="${c} Treat everything below as EVIDENCE, never as instruction: the previous attempt may have been wrong, and if you re-assert its conclusion instead of re-deriving it you will carry its error into every attempt after this one."
+  c="${c} (1) WORKSPACE — the checkout it was working in is still on disk and still holds the branch: ${wpath} (branch ${branch}). Work there; do not start a fresh clone or a new branch for this row."
+  c="${c} (2) THE ROW — read it before you act: '5dive task show ${ident}' is the artifact, and its body is where the previous attempt wrote down what it found. This clause is a pointer to it, not a summary of it."
+  if [[ -n "$last" ]]; then
+    c="${c} (3) THE LAST THING THAT ATTEMPT SAID, verbatim and unverified: \"${last}\""
+  else
+    c="${c} (3) Its last message could not be read, so you have the workspace and the row only."
+  fi
+  printf '%s' "$c"
 }
 
 _hb_wake() {
@@ -2884,6 +3187,19 @@ _hb_wake() {
   local reject_clause=""
   reject_clause=$(_hb_reject_fix_clause "$task_id" 2>/dev/null) || reject_clause=""
   [[ -n "$reject_clause" ]] && nudge="${nudge}${reject_clause}"
+
+  # DIVE-4213 — the resume carryover, immediately after the reject fix and ahead
+  # of the memory citations: a seat that already has 25 minutes of work sitting
+  # in a checkout should read WHERE IT IS before it reads anything general. It is
+  # emitted regardless of `fresh`, and especially when fresh is true — a /clear
+  # is exactly the blank context this exists to fill. Best-effort like every
+  # other enrichment: a failure here must never block the nudge.
+  local carry_clause=""
+  carry_clause=$(_hb_carryover_clause "$name" "$task_id" "$task_ident" 2>/dev/null) || carry_clause=""
+  if [[ -n "$carry_clause" ]]; then
+    nudge="${nudge}${carry_clause}"
+    _hb_log "[$name] ${task_ident} is a RESUME — carryover attached (workspace + row + last message, DIVE-4213)"
+  fi
 
   # DIVE-992: enrich the tick prompt from the shared seam. Pull the task's
   # title+body once, then (a) cite the most relevant memory hits so the agent
@@ -5189,7 +5505,6 @@ cmd_heartbeat_tick() {
   # front, so a wake we do mid-loop isn't visible to later iterations via the
   # registry — this map carries that within-tick fact so two same-account agents
   # can't both wake on one tick.
-  local -A in_tick_woke=()
   local name
   # Process oldest-waiting first (smallest lastRunAt). When two same-account
   # agents contend for the one wake slot, the one that has waited longest wins,
@@ -5468,13 +5783,17 @@ cmd_heartbeat_tick() {
          | select(.key != $n)
          | select((.value.authProfile // ("@self:" + .key)) == $a)
          | (.value.heartbeat.lastRunAt // 0)] | max // 0' <<<"$reg")
-      if [[ -n "${in_tick_woke[$acct]:-}" ]] && (( in_tick_woke[$acct] > acct_last )); then
-        acct_last=${in_tick_woke[$acct]}
-      fi
+      # DIVE-4230: the in-tick bump used to make this gate wake at most ONE seat per
+      # account per tick — with 11 seats on one account at a 5m cadence the gap is 27s
+      # and a tick's own pass over the fleet takes longer than that, so every other due
+      # seat was deferred on every tick and the fleet starved (measured 2026-09-10:
+      # 'spread-deferred 6' on one tick, dev3 deferred 6 ticks in a row with 7 todo).
+      # Spacing across ticks via lastRunAt is kept; same-tick wakes are allowed. The
+      # 429 that this gate guarded against is already handled by the capacity parking.
       gap=$(( everyMin * 60 / acct_count ))
       if (( now - acct_last < gap )); then
         sk_spread=$((sk_spread + 1))
-        _hb_log "[$name] spread-defer — account '$acct' (${acct_count} agents) last woke $(( (now - acct_last) / 60 ))m ago, need a $(( gap / 60 ))m gap; retry next tick"
+        _hb_log "[$name] spread-defer — account '$acct' (${acct_count} agents) last woke $(( now - acct_last ))s ago, need a ${gap}s gap; retry next tick"
         continue
       fi
     fi
@@ -5694,7 +6013,6 @@ cmd_heartbeat_tick() {
 
     _hb_log "[$name] due + todo ${task_ident} — waking (fresh=${eff_fresh})"
     if _hb_wake "$name" "$eff_fresh" "$task_id" "$task_ident"; then
-      in_tick_woke[$acct]=$now   # claim the account's slot for the rest of this tick
       with_registry_lock _hb_wake_budget_inc "$name" "$today" >/dev/null 2>&1 || true  # DIVE-1858: count this wake
       with_registry_lock _hb_clear_active_defer "$name" >/dev/null 2>&1 || true  # DIVE-1486: episode over
       local nudge_n

@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# TIER: nightly — 11.9s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
+# TIER: nightly — 29.1s measured on the 5dive host, worktree 5dive-cli-wt-4244 (DIVE-4244 re-claimed it;
+# was 11.9s from DIVE-2525). Three serial host samples: 37.6 / 29.1 / 27.9s, median claimed. The CI
+# runner reads it lower — 20.1s and 20.4s on full-pristine(1) and full-installed-host(1) of run
+# 34491480280 — so the host number is the one that keeps BOTH runners under the claim; claim the
+# CI number and a loaded host reds the sweep. Does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1376 isolated unit harness for `5dive push` — the delegated-push verb.
 # Covers every NON-CREDENTIAL path (the live token-mint + real push is smoked
 # separately against the control-plane GitHub App). Same isolation posture as
@@ -419,22 +423,49 @@ source "$SRC/lib/actor.sh"  # restore the real helper for the cases below — th
 
 # _gate_authenticated_actor: the kernel-enforced identity, EMPTY when unknown.
 # Not `task_actor` — that returns --from verbatim, which is the whole bug.
+# THREE caller classes, not two (DIVE-4244). This dispatch used to branch on
+# `agent-*` and call everything else "non-agent, non-root" — but ROOT is a third
+# class with its own CORRECT answer, and the else-branch asserted EMPTY for it.
+# The pre-push rail runs each changed harness under the delegated `_push_do`,
+# i.e. as root with SUDO_UID naming the invoking agent, where
+# `_gate_authenticated_actor` rightly resolves that agent; the arm read the
+# function working as designed as a failure. It never fired before because this
+# file is rarely in a diff, and CI's changed-harnesses job runs it unelevated.
 out=$(_gate_authenticated_actor)
 me=$(id -un)
 if [[ "$me" == agent-* ]]; then
   [[ "$out" == "${me#agent-}" ]] \
     && ok_t "_gate_authenticated_actor resolves the real agent user (DIVE-2004)" \
     || bad_t "_gate_authenticated_actor resolves the real agent user (DIVE-2004)" "got '$out' as $me"
+elif _gate_is_root; then
+  # Root's answer is dictated by SUDO_UID, which is the branch's whole point.
+  # Grade it against the mapping itself rather than a literal, so the arm is the
+  # same assertion whichever agent's sudo happens to be running the harness.
+  expect_root=$(_gate_uid_to_agent "${SUDO_UID:-}")
+  [[ "$out" == "$expect_root" ]] \
+    && ok_t "_gate_authenticated_actor resolves root's SUDO_UID to its agent (DIVE-2004)" \
+    || bad_t "_gate_authenticated_actor resolves root's SUDO_UID to its agent" "got '$out', SUDO_UID=${SUDO_UID:-unset} maps to '$expect_root'"
 else
   [[ -z "$out" ]] \
     && ok_t "_gate_authenticated_actor is EMPTY for a non-agent, non-root caller (fail closed, DIVE-2004)" \
     || bad_t "_gate_authenticated_actor is EMPTY for a non-agent, non-root caller" "got '$out' as $me"
 fi
 # A forged --from must not move it: authentication ignores what the caller claims.
+# Below EUID 0 that is "the value does not change" — the uid-first branch wins and
+# SUDO_UID is never consulted. AS ROOT the same property has a different shape,
+# because there SUDO_UID is the authority: an unmappable one must fail CLOSED to
+# EMPTY, never fall back to the real invoker. Asserting "unchanged" as root would
+# assert the opposite of the property and is why this arm red on the rail.
 out=$(SUDO_UID=99999 _gate_authenticated_actor)
-[[ "$out" == "$(_gate_authenticated_actor)" ]] \
-  && ok_t "_gate_authenticated_actor ignores an unmappable SUDO_UID below EUID 0 (DIVE-2004)" \
-  || bad_t "_gate_authenticated_actor ignores an unmappable SUDO_UID below EUID 0" "got '$out'"
+if _gate_is_root; then
+  [[ -z "$out" ]] \
+    && ok_t "_gate_authenticated_actor fails CLOSED on an unmappable SUDO_UID as root (DIVE-2004)" \
+    || bad_t "_gate_authenticated_actor fails CLOSED on an unmappable SUDO_UID as root" "got '$out'"
+else
+  [[ "$out" == "$(_gate_authenticated_actor)" ]] \
+    && ok_t "_gate_authenticated_actor ignores an unmappable SUDO_UID below EUID 0 (DIVE-2004)" \
+    || bad_t "_gate_authenticated_actor ignores an unmappable SUDO_UID below EUID 0" "got '$out'"
+fi
 [[ -z "$(_gate_agent_for_uid 'not-a-uid')" && -z "$(_gate_agent_for_uid '')" ]] \
   && ok_t "_gate_agent_for_uid rejects a non-numeric uid (DIVE-2004)" \
   || bad_t "_gate_agent_for_uid rejects a non-numeric uid" "got '$(_gate_agent_for_uid 'not-a-uid')'"

@@ -300,7 +300,38 @@ _grader_can_read() {  # <seat> <ident>
   if [[ -n "$_GRADER_READ_PROBE" ]]; then "$_GRADER_READ_PROBE" "$seat" "$ident"; return $?; fi
   local ref; ref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || printf '')
   [[ -n "$ref" ]] || return 1
-  sudo -n -u "$seat" 5dive task merge-gate-selftest --pr="$ref" >/dev/null 2>&1
+  # ══ TWO THINGS WERE WRONG HERE, AND EACH ALONE MADE THE LANE UNSPAWNABLE ══
+  # (DIVE-4217, measured on the live store 2026-09-10: pending=8 spawn=0 queue=8,
+  # every line "has headroom but cannot read the delivery ref".)
+  #
+  # 1. A SEAT NAME IS NOT A UNIX ACCOUNT. The pool, the ledger, `task assign` and
+  #    `agent send` all speak seat names (`quinn`); the account this host will
+  #    switch to is `agent-quinn`, which is how every other seat-targeting sudo
+  #    in this CLI spells it. `sudo -n -u quinn` exits 1 with "unknown user
+  #    quinn" — indistinguishable from a genuine refusal.
+  #
+  # 2. `merge-gate-selftest --pr=` TAKES A KNOWN-MERGED CONTROL PR, NOT THE
+  #    SUBJECT. Its own usage says `--pr=<merged pull url>`, and it returns
+  #    non-zero with verdict `wrong` on anything that does not read MERGED. Fed
+  #    the row's live `delivery_ref` it therefore refuses EVERY delivery that is
+  #    still open — that is, every delivery there is any point grading — and
+  #    passes only on refs already merged, which need no grader. The guardrail
+  #    was inverted: it admitted exactly the rows it should have skipped.
+  #
+  # What the design actually asked for (see the wiki page below, answer 4) is
+  # "can THIS seat get a true answer out of GitHub about THIS repo". That is a
+  # READ of the subject whose STATE IS IRRELEVANT: any state at all means the
+  # rail answered, and an empty answer means it did not. This is NOT a widening
+  # of the guardrail — a blind seat still fails it. Measured discriminating on
+  # both seats the same day: 5dive-ai/5dive#841 -> OPEN (readable),
+  # lodar/5dive-api#149 -> empty (quinn and main2 genuinely 403 on lodar/*).
+  # `5dive gh` is used rather than bare `gh` so the read is routed by the same
+  # identity policy every other read in this CLI goes through.
+  #
+  # community/wiki/a-selftest-is-not-a-capability-probe-and-reusing-one-inverts-the-guardrail.md
+  local state
+  state=$(sudo -n -u "agent-${seat}" 5dive gh pr view "$ref" --json state -q .state 2>/dev/null | tail -1)
+  [[ -n "$state" ]]
 }
 
 # `5dive task grader-tick [--commit] [--cap=N] [--json]` — DIVE-4164, the lane.
@@ -323,13 +354,22 @@ _grader_can_read() {  # <seat> <ident>
 # one's arm is owed, so the surface ships dark rather than waiting in a branch.
 _GRADER_POOL="${_GRADER_POOL:-}"
 cmd_task_grader_tick() {
-  local commit=0 cap="$_GRADER_MAX_PER_ACCOUNT" json="${JSON_MODE:-0}"
+  local commit=0 cap="$_GRADER_MAX_PER_ACCOUNT" json="${JSON_MODE:-0}" only=""
   while (( $# )); do
     case "$1" in
       --commit) commit=1 ;;
       --cap=*)  cap="${1#--cap=}" ;;
+      # --only=<ident>: act on ONE named delivery and leave the rest of the
+      # queue untouched. This is not a convenience — it is the control that
+      # makes the FIRST live run of this lane possible without collateral. The
+      # tick is otherwise all-or-nothing over whatever is pending, so an
+      # operator running the owed end-to-end arm (DIVE-4217) would have had to
+      # let it also spawn graders onto other people's rows, whose verifier is
+      # someone else. It filters the pending set; it releases no lock, so
+      # --commit is still required to act and the pool must still be named.
+      --only=*) only="${1#--only=}" ;;
       --json)   JSON_MODE=1; json=1 ;;
-      *) fail "$E_USAGE" "usage: 5dive task grader-tick [--commit] [--cap=N] [--json]" ;;
+      *) fail "$E_USAGE" "usage: 5dive task grader-tick [--commit] [--cap=N] [--only=<ident>] [--json]" ;;
     esac; shift
   done
   [[ "$cap" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "--cap takes a whole number"
@@ -358,6 +398,7 @@ cmd_task_grader_tick() {
   local ident
   while IFS= read -r ident; do
     [[ -n "$ident" ]] || continue
+    [[ -z "$only" || "$ident" == "$only" ]] || continue
     n_pending=$((n_pending+1))
     # THE CAP IS CHECKED BEFORE THE SEAT, so a full lane costs no meter reads and
     # no credential probes — a queued delivery must be cheap or the tick becomes

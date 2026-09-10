@@ -137,6 +137,7 @@ assert_pin_held DIVE-902 "eng-ship in TITLE: explicit --tier=2 survives (the axi
 #    before the fix this was downgraded despite carrying a floor keyword.
 route_reset; seed DIVE-903 'Council page polish'
 actor_seam_as dev; cmd_task_need DIVE-903 --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --from=dev \
+  --ask-ok="fixture: the ask names a PUBLIC page path (/council), which the DIVE-4176 readability rule cannot tell from a filesystem path — the declared escape is the designed exit for exactly this, and rewording it would drop the 'brand'+'ship' pair this arm grades" \
   --ask="BRAND call on the public 5dive.ai /council page before we ship it" \
   --options="A|B" --recommend="A" >/dev/null 2>&1
 assert_pin_held DIVE-903 "eng-ship + floor term ('brand'+'ship') with --tier=2 stays hard-human"

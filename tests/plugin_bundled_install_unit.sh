@@ -15,9 +15,18 @@
 # So the corpus graded the installer against synthetic input and graded the
 # payload against a file listing, and the one question a customer asks — does
 # `plugin add <the thing you ship>` work — was asked by nobody. This file asks
-# exactly that, and it asks it of EVERY directory under plugins/ discovered at
-# run time, so plugin number three is covered the day it lands rather than the
+# exactly that, and it asks it of EVERY plugin the REGISTRY publishes, discovered
+# at run time, so plugin number three is covered the day it lands rather than the
 # day someone remembers to add an arm.
+#
+# DIVE-4202 MOVED THE CORPUS. `voice` and `browser` were the last two plugins in
+# this repo; they now live in 5dive-ai/5dive-plugins with every other one, so the
+# tree this harness grades is no longer inside the checkout. It resolves a
+# registry checkout from $FIVEDIVE_PLUGIN_REGISTRY (CI checks the registry out
+# and sets it — see .github/workflows/*, unit-tests). With no registry checkout
+# the corpus arms CANNOT run, and they say so in a NOT-RUN banner and a count on
+# the summary line rather than passing vacuously: a skipped arm is silence, not
+# a green. The fixture arms (T3-T6) are unaffected and always run.
 #
 # NEGATIVE CONTROLS. Two arms exist so a green here cannot mean "the enum was
 # widened until everything passes": T3 proves an unknown grant is STILL refused,
@@ -48,10 +57,26 @@ require_root() { :; }
 
 TMP="$(mktemp -d)"
 export STATE_DIR="$TMP/state"
-# The bundled marketplace resolves through this seam (cmd_plugin.sh
-# _plugin_bundled_dir), which is what lets the arms below install the REAL
-# plugins/ tree of the checkout being graded rather than whatever is on the box.
-export FIVEDIVE_BUNDLED_PLUGINS="$ROOT/plugins"
+# The registry resolves through this seam (cmd_plugin.sh
+# _plugin_registry_source), which is what lets the arms below install the REAL
+# published plugin tree rather than whatever is on the box — and, because the
+# seam accepts a local path, WITHOUT a network fetch inside a unit test.
+# EXPLICIT ONLY — no sibling-path fallback. `projects/5dive/5dive-plugins` is a
+# SHARED checkout that sits on whatever feature branch someone left it on, so
+# guessing it grades an arbitrary tree and calls the result "the registry". The
+# pre-push rail caught exactly that: the shared checkout had no browser/voice and
+# these arms went red against a tree nobody meant to grade. An unset variable
+# gives a NOT-RUN banner, which is honest; a wrong tree is worse than no tree.
+REGISTRY="${FIVEDIVE_PLUGIN_REGISTRY:-}"
+if [[ -n "$REGISTRY" && -d "$REGISTRY" ]]; then
+  export FIVEDIVE_PLUGIN_REGISTRY="$REGISTRY"
+else
+  REGISTRY=""
+  unset FIVEDIVE_PLUGIN_REGISTRY
+fi
+# RMKT, not MKT: the fixture arms below already own the name MKT.
+RMKT=5dive-plugins
+NOTRUN=0
 
 PASS=0; FAIL=0
 t()  { if [[ "$2" == "$3" ]]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); printf 'FAIL: %s\n   expected: %s\n   got:      %s\n' "$1" "$2" "$3"; fi; }
@@ -69,25 +94,44 @@ run() {
 }
 
 # ---- what we ship ----------------------------------------------------------
-# Discovered, never listed. A hardcoded list is how this gap reappears.
+# Discovered from the registry's own manifest, never listed. A hardcoded list is
+# how this gap reappears.
 BUNDLED=()
-while IFS= read -r d; do
-  [[ -z "$d" ]] && continue
-  n=$(basename "$d")
-  # `.claude-plugin/` is the marketplace INDEX, not a plugin. Skipping dot-dirs
-  # is the same rule mkindex uses in plugin_contract_unit.
-  [[ "$n" == .* ]] && continue
-  BUNDLED+=("$n")
-done < <(find "$ROOT/plugins" -mindepth 1 -maxdepth 1 -type d | sort)
-
-t "T0 there is at least one bundled plugin to grade (an empty loop is a vacuous suite)" \
-  "yes" "$([[ ${#BUNDLED[@]} -ge 1 ]] && echo yes || echo no)"
+if [[ -n "$REGISTRY" ]]; then
+  while IFS= read -r n; do
+    [[ -z "$n" ]] && continue
+    # A BUILT-IN channel plugin (telegram, dashboard, buzz) is installed per
+    # AGENT, not per box — `plugin add` refuses it by design (cmd_plugin.sh
+    # _plugin_is_builtin_channel). Grading it here would assert the opposite of
+    # the product's rule. The registry publishes both kinds; only the
+    # box-installable kind is this harness's subject.
+    _plugin_is_builtin_channel "$n" && continue
+    BUNDLED+=("$n")
+  done < <(jq -r '.plugins[].name' "$REGISTRY/.claude-plugin/marketplace.json" 2>/dev/null | sort)
+  # Two separate facts. The manifest must declare plugins at all (a checkout
+  # pointed at the wrong tree fails HERE, loudly, instead of silently grading an
+  # empty loop), and separately there must be a BOX-INSTALLABLE one left after
+  # the built-in channels are dropped — if a future registry published nothing
+  # but channels, the loops below would be vacuous and must say so, not pass.
+  t "T0 the registry manifest declares at least one plugin (else the checkout is not a registry)" \
+    "yes" "$([[ $(jq -r '.plugins | length' "$REGISTRY/.claude-plugin/marketplace.json" 2>/dev/null || echo 0) -ge 1 ]] && echo yes || echo no)"
+  t "T0b ...and at least one of them is box-installable, so the corpus loops are not vacuous" \
+    "yes" "$([[ ${#BUNDLED[@]} -ge 1 ]] && echo yes || echo no)"
+else
+  NOTRUN=1
+  printf '\n'
+  printf '  !! NOT RUN — no registry checkout, so the CORPUS arms (T0/T1/T2/T5b/T6/T7)\n'
+  printf '  !! graded NOTHING in this run. They are not passing; they did not execute.\n'
+  printf '  !! Point FIVEDIVE_PLUGIN_REGISTRY at a 5dive-ai/5dive-plugins checkout, or\n'
+  printf '  !! clone it beside this repo, to grade them. The fixture arms below did run.\n'
+  printf '\n'
+fi
 
 # ---- T1: every bundled plugin INSTALLS -------------------------------------
 # The row's whole subject. rc 0, from the real cmd_plugin_add, against the real
 # manifest — not a file-list comparison.
 for p in "${BUNDLED[@]}"; do
-  run cmd_plugin_add "$p@5dive" --yes
+  run cmd_plugin_add "$p@$RMKT" --yes
   t "T1 'plugin add $p' installs on a stock box" "0" "$RC"
   [[ "$RC" == 0 ]] || printf '   stderr: %s\n' "$ERR"
 done
@@ -97,7 +141,7 @@ done
 # copied nothing would pass T1. Read the registry the dispatcher reads.
 for p in "${BUNDLED[@]}"; do
   t "T2 $p is recorded in installed.json as enabled" "true" \
-    "$(jq -r --arg k "$p@5dive" '.[$k].enabled // false' "$(_plugin_installed_json)" 2>/dev/null)"
+    "$(jq -r --arg k "$p@$RMKT" '.[$k].enabled // false' "$(_plugin_installed_json)" 2>/dev/null)"
 done
 
 # ---- T3: NEGATIVE CONTROL — an unknown grant is still refused ---------------
@@ -139,10 +183,14 @@ done
 _add_browser_with_store() {   # <mode> [--as-me]
   local mode="$1" st; st=$(mktemp -d)
   mkdir -p "$st/browser-profiles"; chmod "$mode" "$st/browser-profiles"
-  ( export STATE_DIR="$st"; run cmd_plugin_add browser@5dive --yes; printf '%s\t%s' "$RC" "$ERR" )
+  ( export STATE_DIR="$st"; run cmd_plugin_add "browser@$RMKT" --yes; printf '%s\t%s' "$RC" "$ERR" )
   rm -rf "$st"
 }
-if [[ "$(id -u)" == 0 ]]; then
+if [[ -z "$REGISTRY" ]]; then
+  # T5a/T5b install the REAL browser plugin, so they need the registry corpus.
+  # T5c-e below grade the same predicate directly and always run.
+  printf '  !! NOT RUN — T5a/T5b (end-to-end refusal) need a registry checkout.\n'
+elif [[ "$(id -u)" == 0 ]]; then
   # Running as root the store WOULD be root-owned, so only the mode arm is
   # meaningful; say so rather than asserting something the uid decides.
   printf 'NOTE: running as root — the wrong-owner arm (T5a) is not meaningful here; T5b still is.\n'
@@ -151,9 +199,11 @@ else
   t  "T5a a store owned by someone other than root REFUSES the install" "$E_PERMISSION" "${res%%$'\t'*}"
   tc "T5a2 ...and says why in terms of the session, not the mode bits" "sessions" "${res#*$'\t'}"
 fi
-res=$(_add_browser_with_store 777)
-t  "T5b a world-writable store REFUSES the install (0711 is traverse, not list)" \
-   "$E_PERMISSION" "${res%%$'\t'*}"
+if [[ -n "$REGISTRY" ]]; then
+  res=$(_add_browser_with_store 777)
+  t  "T5b a world-writable store REFUSES the install (0711 is traverse, not list)" \
+     "$E_PERMISSION" "${res%%$'\t'*}"
+fi
 
 # T5c-e grade the PREDICATE directly, with the pairs the filesystem will not hand
 # a harness. As an ordinary seat, every store this suite can create is seat-owned,
@@ -174,12 +224,16 @@ tc "T5e a seat-owned store is a fault, named by uid" \
 # store". `setup` is a separate root act the install PRINTS; a first install on a
 # box that has never run it must succeed. T1 already installed browser against a
 # STATE_DIR with no store, so this arm asserts the message the user is left with.
-st6=$(mktemp -d)
-res6=$( export STATE_DIR="$st6"; run cmd_plugin_add browser@5dive --yes; printf '%s\t%s' "$RC" "$ERR" )
-t  "T6 with NO store on the box the install SUCCEEDS (setup is the user's next step, not a precondition)" \
-   "0" "${res6%%$'\t'*}"
-tc "T6b ...and it points at the one root act that creates the store" "5dive browser setup" "${res6#*$'\t'}"
-rm -rf "$st6"
+if [[ -n "$REGISTRY" ]]; then
+  st6=$(mktemp -d)
+  res6=$( export STATE_DIR="$st6"; run cmd_plugin_add "browser@$RMKT" --yes; printf '%s\t%s' "$RC" "$ERR" )
+  t  "T6 with NO store on the box the install SUCCEEDS (setup is the user's next step, not a precondition)" \
+     "0" "${res6%%$'\t'*}"
+  tc "T6b ...and it points at the one root act that creates the store" "5dive browser setup" "${res6#*$'\t'}"
+  rm -rf "$st6"
+else
+  printf '  !! NOT RUN — T6/T6b (absent-store install) need a registry checkout.\n'
+fi
 
 # ---- T7: the declared verb DISPATCHES --------------------------------------
 # The measured symptom on lodar's box was `5dive browser --help` -> rc 2, i.e.
@@ -188,7 +242,7 @@ rm -rf "$st6"
 # _plugin_dispatch_verb ends in `exec`, so this runs in run()'s subshell and
 # reads the child's exit status.
 for p in "${BUNDLED[@]}"; do
-  mf="$ROOT/plugins/$p/.claude-plugin/plugin.json"
+  mf="$REGISTRY/plugins/$p/.claude-plugin/plugin.json"
   [[ -f "$mf" ]] || continue
   while IFS= read -r v; do
     [[ -z "$v" ]] && continue
@@ -197,5 +251,9 @@ for p in "${BUNDLED[@]}"; do
   done < <(jq -r '(.fivedive.verbs // []) | map(.name? // empty)[]' "$mf" 2>/dev/null)
 done
 
-printf 'plugin_bundled_install_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
+if (( NOTRUN )); then
+  printf 'plugin_bundled_install_unit: %d passed, %d failed, CORPUS ARMS NOT RUN (no registry checkout)\n' "$PASS" "$FAIL"
+else
+  printf 'plugin_bundled_install_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
+fi
 [[ "$FAIL" -eq 0 ]]

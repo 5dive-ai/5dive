@@ -57,18 +57,22 @@ COPY 5dive 5dive-agent-list-snapshot 5dive-agent-start 5dive-refresh-plugins.sh 
 COPY hooks /opt/5dive-bundle/hooks/
 COPY skills /opt/5dive-bundle/skills/
 COPY systemd /opt/5dive-bundle/systemd/
-# DIVE-4141: the bundled plugin marketplace (the team-template half of this
-# block moved to the registry in DIVE-4196 and is gone).
-# It was MISSING here while install.sh fetched it, and that
-# fetches are fail-soft (`curl -f` on a file:// bundle that omits a path exits
-# 37, and the installer only warns) — so every image built by this job shipped
-# with an EMPTY /usr/local/lib/5dive/plugins. That is why the browser plugin could ship
-# uninstallable (DIVE-4126) with docker-install green: the one job that installs
-# on a fresh box never had the plugin to install.
-COPY plugins /opt/5dive-bundle/plugins/
-# DIVE-4196: team-templates is NOT copied — it no longer exists in this repo and
-# install.sh no longer stages it. `5dive team` reads the registry
-# (<org>/character-packs, teams/) live, so there is nothing to bundle.
+# NOTHING template- or plugin-shaped is COPYed into the bundle any more.
+#
+# DIVE-4141 is why the comment is this long: team-templates was MISSING here
+# while install.sh fetched it, and that fetch is fail-soft (`curl -f` on a
+# file:// bundle that omits a path exits 37, and the installer only warns) — so
+# every image built by this job shipped with only whatever the warn loop
+# happened to find, and docker-install stayed green over it. The fix is not a
+# COPY line: it is that neither artifact is bundled at all.
+#
+# DIVE-4202: plugins are published to 5dive-ai/5dive-plugins and `5dive plugin`
+# registers that registry itself.
+# DIVE-4196: team templates are published to <org>/character-packs under teams/
+# and `5dive team` reads that index live.
+#
+# Do not restore a COPY for either: bundling is what made a fix reach a customer
+# on a CLI release instead of on a publish.
 # install.sh's curl fetches the unit at $REPO/systemd/5dive-agent%40.service
 # (URL-encoded '@'). curl with file:// decodes %40 → @, so a symlink is enough
 # to make both names resolve.

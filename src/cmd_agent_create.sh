@@ -1721,7 +1721,10 @@ seed_openclaw_state_into_seat() { # <name> [profile]
 # `create --inherit-memory=<scope>` is passed we seed the new agent's own recall
 # store (~/.claude/projects/<slug>/memory/) so `5dive memory search` returns
 # team knowledge from the first minute. Scope is a comma-list of sources:
-#   wiki            the shared team wiki (community/wiki) — canonical shared facts
+#   wiki            the shared team wiki — canonical shared facts. Resolved by
+#                   _memory_wiki_root: $FIVEDIVE_WIKI_ROOT, then the per-box
+#                   /var/lib/5dive/wiki the installer provisions, then our own
+#                   fleet's community/wiki checkout (DIVE-4128).
 #   <agent-name>    that sibling's SHAREABLE facts only (reference/project, never
 #                   user/feedback — deny-by-default, same L1 scoping as `export`)
 #   all | team      wiki + every sibling agent's shareable facts
@@ -1730,9 +1733,19 @@ seed_openclaw_state_into_seat() { # <name> [profile]
 
 # Copy the shared wiki (index first — the onboarding entry point) into <target>.
 # Echoes the number of files seeded. Pure (no root/chown) so it's unit-testable.
+# DIVE-4128: this used to return a bare `0` when there was no wiki root, and
+# the caller then printed "Inherited 0 memory file(s)" as a SUCCESS step. On a
+# customer box that was every agent ever created: seeded nothing, said nothing,
+# booted cold. A seeding pass that seeded nothing must say so and say WHY —
+# the count alone cannot distinguish "no wiki on this box" from "the wiki is
+# empty", and those have different fixes.
 _seed_wiki_memory() {
   local target="$1" wiki wf b n=0
-  wiki=$(_memory_wiki_root); [[ -n "$wiki" ]] || { printf '0'; return 0; }
+  wiki=$(_memory_wiki_root)
+  if [[ -z "$wiki" ]]; then
+    warn "inherit-memory: seeded 0 files from the wiki — no shared team wiki root on this box (looked for \$FIVEDIVE_WIKI_ROOT, /var/lib/5dive/wiki, ~/projects/5dive/community/wiki). Re-run the 5dive installer to provision /var/lib/5dive/wiki, then re-seed."
+    printf '0'; return 0
+  fi
   for wf in "$wiki"/index.md "$wiki"/*.md; do
     [[ -f "$wf" ]] || continue
     b=$(basename "$wf")
@@ -1740,6 +1753,7 @@ _seed_wiki_memory() {
     [[ -e "$target/$b" ]] && continue   # index.md matches both globs; dedup
     cp "$wf" "$target/$b" 2>/dev/null && n=$((n+1))
   done
+  (( n == 0 )) && warn "inherit-memory: seeded 0 files from the wiki — the shared wiki root $wiki exists but holds no pages yet. Nothing to inherit; this agent boots without team knowledge."
   printf '%s' "$n"
 }
 
@@ -1983,7 +1997,13 @@ seed_inherited_memory() {
   done < <(_resolve_inherit_sources "$scope" "$name")
   _rebuild_inherited_index "$target"
   chown -R "$user":"$user" "/home/${user}/.claude/projects/${slug}"
-  step "Inherited $seeded memory file(s) into agent-${name}'s recall (scope: $scope)"
+  # DIVE-4128: zero is not a success. Reporting it as a normal step is what let
+  # a whole box of cold-booted agents look correctly provisioned.
+  if (( seeded == 0 )); then
+    warn "Inherited 0 memory file(s) into agent-${name}'s recall (scope: $scope) — agent-${name} boots COLD. See the reason(s) printed above."
+  else
+    step "Inherited $seeded memory file(s) into agent-${name}'s recall (scope: $scope)"
+  fi
 }
 
 cmd_create() {

@@ -199,5 +199,128 @@ hits=$(grep -vE '^[[:space:]]*#' <<<"$tickbody" | grep -nE '5dive agent send|sys
 [[ -z "$hits" ]] && ok_ 'structural: the tick body touches no fleet verb directly' \
   || bad_ 'structural: tick touches the fleet' "$hits"
 
+
+# ── _grader_can_read: the REAL body, which no arm above ever executes ────────
+#
+# Every arm in this file replaces the credential probe through
+# `_GRADER_READ_PROBE`, so the lane's DECISION logic is graded twenty ways and
+# the probe's own body is graded nowhere. That blind spot shipped a defect.
+#
+# A SEAT NAME IS NOT A UNIX ACCOUNT. The pool, the ledger, `task assign` and
+# `agent send` all take `quinn`; the account this host switches to is
+# `agent-quinn`, which is how every other seat-targeting sudo in the CLI spells
+# it. The body ran `sudo -n -u "$seat"`, so on the live host it exited 1 with
+# "unknown user quinn" — and an unknown user exits exactly like a refused one.
+# Measured 2026-09-10 (DIVE-4217) against the live store with a real pool:
+# pending=8 spawn=0 queue=8, every line reading "has headroom but cannot read
+# the delivery ref", while the same probe spelled `agent-quinn` / `agent-main2`
+# returned 0 for both seats. The lane could not spawn, and said nothing that
+# pointed at why.
+#
+# THIS ARM ASSERTS THE ARGV, NOT THE EXIT STATUS, and that is the lesson: a
+# wrong account and an unreadable ref produce the SAME non-zero, so no
+# outcome-shaped arm can see this class of bug. Compare
+# community/wiki/an-arm-that-assigns-the-flag-cannot-grade-the-default-it-ships-with.md
+# — there behaviour masked the setting; here it masks the callee.
+#
+# THE STUB IS A FUNCTION, NOT A SCRIPT ON $PATH, and that is not a style choice.
+# This corpus installs a `sudo` shell FUNCTION (tests/lib/env_isolation.sh) that
+# refuses with rc=125, and a function shadows every $PATH entry — a PATH stub
+# here is unreachable and records nothing, which reads as "the probe never ran".
+# The reachability control below is what caught that; keep it first.
+SUDO_ARGVF="$TMPD/sudo.argv"
+probe_argv=$(
+  : > "$SUDO_ARGVF"
+  sudo(){ printf '%s\n' "$*" >> "$SUDO_ARGVF"; return 0; }
+  db(){ case "$*" in *delivery_ref*) printf '%s\n' 'https://github.com/o/r/pull/1' ;; *) printf '' ;; esac; }
+  sqlq(){ printf "'%s'" "$1"; }
+  _GRADER_READ_PROBE=
+  _grader_can_read g1 DIVE-1 >/dev/null 2>&1
+  cat "$SUDO_ARGVF"
+)
+[[ -n "$probe_argv" ]] && ok_ 'PROBE control: the real _grader_can_read body reached sudo' \
+  || bad_ 'probe body reached sudo' 'nothing recorded — every arm below would be vacuous'
+grep -qE '(^| )-u agent-g1( |$)' <<<"$probe_argv" \
+  && ok_ 'PROBE: switches to the UNIX ACCOUNT agent-g1, not the seat name' \
+  || bad_ 'probe names agent-<seat>' "argv: $probe_argv"
+grep -qE '(^| )-u g1( |$)' <<<"$probe_argv" \
+  && bad_ 'probe must not pass the bare seat name' "argv: $probe_argv" \
+  || ok_ 'PROBE: never hands sudo a bare seat name (unknown user == a false refusal)'
+grep -qE 'gh pr view https://github.com/o/r/pull/1( |$)' <<<"$probe_argv" \
+  && ok_ 'PROBE: reads the row own delivery ref, not a substitute' \
+  || bad_ 'probe reads the delivery ref' "argv: $probe_argv"
+# The inverted guardrail, kept as a named arm because the mutant is a REVERT.
+# `merge-gate-selftest --pr=` demands a MERGED control PR and returns non-zero on
+# anything else, so using it on the subject refuses every OPEN delivery — i.e.
+# every delivery worth grading — and admits only already-merged refs.
+grep -q 'merge-gate-selftest' <<<"$probe_argv" \
+  && bad_ 'probe must not use the merged-control selftest on the subject' "argv: $probe_argv" \
+  || ok_ 'PROBE: does not ask a merged-control selftest about an open PR'
+
+# STATE-AGNOSTIC: an OPEN pull request is READABLE. This is the arm the shipped
+# code failed; it is the difference between "the rail answered" and "the answer
+# was the one we like".
+for st in OPEN CLOSED MERGED; do
+  rc_st=$(
+    sudo(){ printf '%s\n' "$st"; return 0; }
+    db(){ case "$*" in *delivery_ref*) printf '%s\n' 'https://github.com/o/r/pull/1' ;; *) printf '' ;; esac; }
+    sqlq(){ printf "'%s'" "$1"; }
+    _GRADER_READ_PROBE=
+    _grader_can_read g1 DIVE-1 >/dev/null 2>&1; echo $?
+  )
+  [[ "$rc_st" == 0 ]] && ok_ "PROBE: a PR reading $st counts as READABLE" \
+    || bad_ "PR state $st is readable" "rc=$rc_st"
+done
+# ...and a rail that answers NOTHING is a refusal, not a pass. This is the
+# fail-CLOSED half; without it the change above would be a widening.
+rc_blind=$(
+  sudo(){ printf ''; return 1; }
+  db(){ case "$*" in *delivery_ref*) printf '%s\n' 'https://github.com/o/r/pull/1' ;; *) printf '' ;; esac; }
+  sqlq(){ printf "'%s'" "$1"; }
+  _GRADER_READ_PROBE=
+  _grader_can_read g1 DIVE-1 >/dev/null 2>&1; echo $?
+)
+[[ "$rc_blind" != 0 ]] && ok_ 'PROBE: a blind seat (empty answer) is REFUSED, not admitted' \
+  || bad_ 'blind seat refused' "rc=$rc_blind"
+
+# The early guard: a row with no delivery_ref must be refused before the probe,
+# not probed with --pr= empty.
+noref_argv=$(
+  : > "$TMPD/sudo.noref"
+  sudo(){ printf '%s\n' "$*" >> "$TMPD/sudo.noref"; return 0; }
+  db(){ printf ''; }
+  sqlq(){ printf "'%s'" "$1"; }
+  _GRADER_READ_PROBE=
+  _grader_can_read g1 DIVE-1 >/dev/null 2>&1
+  cat "$TMPD/sudo.noref"
+)
+[[ -z "$noref_argv" ]] && ok_ 'PROBE: a row with no delivery_ref is refused without spending a sudo' \
+  || bad_ 'no ref means no sudo' "argv: $noref_argv"
+
+
+# ── --only=<ident>: one named delivery, and no collateral ───────────────────
+# The control that made the owed end-to-end arm runnable at all: without it the
+# tick is all-or-nothing over the pending set, so a first live run also spawns
+# graders onto rows whose verifier is someone else. It must FILTER, never
+# RELEASE — --commit is still the lock, an unnamed pool is still dark.
+_GRADER_POOL="g1"; _GRADER_READ_PROBE=probe_ok
+out=$(run --cap=5 --commit --only=DIVE-2)
+[[ "$(grep -c . "$SPAWNF")" == 1 ]] && ok_ 'ONLY: spawns exactly one' || bad_ 'only spawns one' "$(spawns)"
+grep -q ':DIVE-2$' "$SPAWNF" && ok_ 'ONLY: spawns the NAMED row' || bad_ 'only spawns the named row' "$(spawns)"
+grep -qE 'DIVE-(1|3)' <<<"$out" && bad_ 'only must not report the unnamed rows' "$out" \
+  || ok_ 'ONLY: the rest of the queue is untouched and unreported'
+outj=$(run --cap=5 --commit --only=DIVE-2 --json)
+[[ "$(printf '%s' "$outj" | python3 -c 'import json,sys;print(json.load(sys.stdin)["pending"])')" == 1 ]] \
+  && ok_ 'ONLY: counts only the named row as pending' || bad_ 'only counts 1 pending' "$outj"
+out=$(run --cap=5 --commit --only=DIVE-NOPE)
+[[ ! -s "$SPAWNF" ]] && ok_ 'ONLY: an ident that is not pending spawns nothing' || bad_ 'only unknown ident' "$(spawns)"
+# It filters; it does not release either lock.
+out=$(run --cap=5 --only=DIVE-2)
+[[ ! -s "$SPAWNF" ]] && ok_ 'ONLY: still honours LOCK 1 (no --commit, no spawn)' || bad_ 'only + dry-run' "$(spawns)"
+_GRADER_POOL=""
+out=$(run --cap=5 --commit --only=DIVE-2)
+[[ ! -s "$SPAWNF" ]] && ok_ 'ONLY: still honours LOCK 2 (empty pool, no spawn)' || bad_ 'only + empty pool' "$(spawns)"
+_GRADER_POOL="g1"
+
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]
