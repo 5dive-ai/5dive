@@ -110,6 +110,10 @@ Agents:
                                                      # form; who talks in team chat is \`agent buzz enable\`.
   5dive buzz owner [--envelope]                      # the box's handset identity (public half; --envelope is
                                                      # the DIVE-3300 payload and carries a PRIVATE key)
+  5dive agent grant <name> <merge|push|deploy>       # root: re-render an existing STANDARD seat's managed
+                                                     # sudoers from the current template so it gains a
+                                                     # capability added after it was created. Idempotent;
+                                                     # refuses any policy this CLI did not write.
   5dive agent config <name> set workdir=<path>       # tmux cwd; "default" clears override
   5dive agent config <name> set auth-profile=<name>  # swap profile; "default" clears override
   5dive agent config <name> set model=<id>           # runtime model (claude/codex/grok/antigravity)
@@ -732,6 +736,13 @@ main() {
         _reconcile_sudoers)
           AUDIT_CMD="agent _reconcile_sudoers"; AUDIT_ARGS=()
           cmd_agent_reconcile_sudoers "$@" ;;
+        # DIVE-4183: the per-seat, named-capability half of the same migration.
+        # `_reconcile_sudoers` is a hidden fleet-wide installer pass; this is what
+        # an operator reaches for when ONE seat is missing ONE capability the
+        # template already emits, and it prints what it did for that seat.
+        grant)
+          AUDIT_CMD="agent grant"; AUDIT_ARGS=("$@")
+          cmd_agent_grant "$@" ;;
         stats)   cmd_stats "$@" ;;
         create)
           AUDIT_CMD="agent create"; AUDIT_ARGS=("$@")

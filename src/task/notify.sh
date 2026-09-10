@@ -1995,7 +1995,227 @@ _task_need_route_deliver() {
   return 3
 }
 
+# ── DIVE-4154 arm D — THE UNDO WINDOW, ON THE PHONE PING ONLY ────────────────
+#
+# Measured on gate_history, the 30-day window to 2026-09-09 (DIVE-4150): of 193
+# human-facing gates, 138 were WITHDRAWN BY THE FILING SEAT ITSELF after the
+# phone had already rung — median 1.0 min, 76 inside 2 minutes, 104 inside 15.
+# The system pages first and thinks later; the seat then retracts. Those pages
+# bought the human nothing: by the time he looked, the question was gone.
+#
+# WHAT IS HELD IS THE PUSH NOTIFICATION, AND NOTHING ELSE. The gate row is
+# written, blocked and pending BEFORE this function is reached, so at file time it
+# is already on the dashboard "Needs you" card, in `5dive task inbox`, in
+# `task queue`, in the digest, and answerable by `5dive task answer`. The only
+# thing that waits is the buzz in his pocket. A withdrawal inside the window
+# therefore pages NOBODY, and a gate that survives the window pages exactly as it
+# does today, with the same text and the same buttons.
+#
+# WHY NOT LONGER, when 104 of 138 land inside 15 minutes: because the false-page
+# saving is not the only axis. A REAL gate delayed 15 minutes is a real cost, and
+# the withdrawal distribution is front-loaded hard enough (median 1.0 min) that
+# 2 minutes already takes 76 of the 138 — over half the win for an eighth of the
+# delay. Widen it later against a measurement, not against this comment.
+#
+# THE TWO SKIPS ARE THE FILER SAYING "THIS CANNOT WAIT", in the two vocabularies
+# that exist: `--urgent` on the gate, and `priority=urgent` on the row. Neither is
+# inferred from the ask text — that is the keyword-floor mistake this row's arm C
+# is deleting, and re-introducing it here would be the same defect wearing a
+# different hat.
+#
+# THIS IS NOT THE ONLY DELIVERY PATH. If the box dies inside the window the child
+# dies with it and the ping is lost — which is why the loss is bounded rather than
+# unhandled: gate_pinged_at stays NULL, so the heartbeat's 15-minute gate re-nag
+# treats the row exactly as it treats any filed-unnotified gate and escalates it.
+# The window can delay a page; it cannot swallow one.
+_GATE_UNDO_WINDOW_SECS=120
+
+# DIVE-4174 sizing: a LONGER window for the gate types no routing arm can ever
+# take off the phone. `manual` is human-only by definition and `secret` must be
+# delivered by a human, so for these two the question is never "route it better",
+# only "how long before the phone rings". Measured over the frozen 30-day window,
+# on manual+secret human-facing gates (pages removed / gates lodar ANSWERED that
+# get delayed): 2m 10/0 · 5m 13/0 · 10m 17/0 · 15m 20/0 · 30m 21/0.
+#
+# **Zero cost at every size** — he answered 1 of the 38 type-default gates in the
+# window and it falls outside all of them — so this is priced on the take alone.
+# 14m nearly doubles the 2m take (10 -> 18) and 30m adds one more, which is where
+# it flattens; the 15m row is not taken, for the re-nag reason below. A FLEET-WIDE 15m raise was the alternative and is strictly worse: 104
+# removed but 12 gates he answered delayed. Targeted beats global here.
+#
+# Sealed like the base constant, and for the same reason (agents hold
+# NOPASSWD:ALL): no write path, and the env override is clamped against whichever
+# ceiling applies to THIS gate — see the clamp below, which would otherwise knock
+# a long type window straight back to 120 and silently make this a no-op.
+#
+# 840, NOT 900, AND THE 60s IS THE POINT (quinn, DIVE-4154 iteration 1). The
+# heartbeat re-nags a filed-unnotified gate at `gate_pinged_at IS NULL AND
+# need_asked_at <= now-15 minutes` (the re-nag WHERE clause in cmd_heartbeat.sh;
+# its constant is deliberately NOT named here — see the note on the clamp below).
+# At a
+# 900s ceiling the buttoned ping and the re-nag become eligible in the same
+# second, so a manual/secret gate's FIRST contact could be the recovery path
+# rather than the normal ping — and the re-nag is a plainer message. The intent
+# is the opposite: the re-nag stays what this page's own loss case calls it, the
+# net under a ping lost to a dead box, never the first contact on a healthy one.
+# Priced before changing it: exactly ONE manual/secret withdrawal in the 30-day
+# window lands in (840s, 900s], so the margin costs one page of take (19 -> 18)
+# and buys back the whole ordering guarantee. Graded structurally, not by
+# literal, in gate_undo_window_unit arm 11b — a later raise past the re-nag
+# reds there.
+_GATE_UNDO_WINDOW_SECS_HUMAN_ONLY=840
+
+# Seconds to hold this gate's phone ping. 0 = ping now.
+# Reads the row's priority, so it must be called AFTER the gate UPDATE commits —
+# which is the case: task_need_notify runs after cmd_task_need's write.
+_task_gate_undo_window_secs() {
+  local ident="$1"
+  # The CEILING for this gate, resolved by type BEFORE anything else reads it:
+  # both the default and the clamp below are relative to it. Resolving it after
+  # the clamp is the bug this ordering exists to prevent.
+  local _ntype _ceil="$_GATE_UNDO_WINDOW_SECS"
+  _ntype=$(db "SELECT COALESCE(need_type,'') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || echo "")
+  case "$_ntype" in manual|secret) _ceil="$_GATE_UNDO_WINDOW_SECS_HUMAN_ONLY" ;; esac
+  local secs="${_5DIVE_GATE_UNDO_WINDOW_SECS:-$_ceil}"
+  # An explicit numeric override (harnesses, and the operator escape hatch) wins,
+  # but a non-numeric one is a typo, not a policy — fall back rather than defer
+  # forever on a garbage value.
+  [[ "$secs" =~ ^[0-9]+$ ]] || secs="$_ceil"
+  # THE OVERRIDE MAY ONLY EVER SHORTEN THE HOLD, NEVER LENGTHEN IT. This is the
+  # sealed human-capability constant's seal (need.sh, DIVE-2241/2131) applied to
+  # a duration: agents
+  # hold NOPASSWD:ALL, so an unclamped env var IS a write path to the constant,
+  # and the write an agent wants is upward — set it to a week and a gate it does
+  # not want answered never reaches the phone at all. Clamping down keeps every
+  # legitimate use (harnesses pass 0, an operator shortens) and leaves the mute
+  # unreachable. It is arm D's form of the row's invariant: a knob may only ever
+  # move a gate TOWARD the phone, never away from it.
+  #
+  # WHY NEITHER OF THOSE TWO CONSTANTS IS SPELLED OUT ABOVE (quinn, iteration 2).
+  # The lazy-dispatch dep scanner is a blunt token match over the WHOLE file,
+  # comments included (scripts/lib/lazy-dispatch.sh: "matching every word costs
+  # us some phantom edges and misses none"). So a comment here that cites another
+  # module's global BY NAME creates a real load edge out of task__notify — and
+  # task__notify is preloaded by task__dispatch, i.e. by every `task` verb. The
+  # first draft of this file named both, which pulled cmd_heartbeat and task__need
+  # (and transitively cmd_goal, cmd_objective, cmd_selfupdate, task__loops) into a
+  # plain `task ls`: 6 modules to 12, and the load-path ratio arm red. Cite the
+  # FILE and the clause, never the identifier. Graded by arm 12 in
+  # tests/gate_undo_window_unit.sh.
+  (( secs > _ceil )) && secs="$_ceil"
+  # Kill switch. `off` restores the pre-DIVE-4154 ping byte for byte and needs no
+  # release to take effect, same contract as `task pfr-autoclear`.
+  local pref; pref=$(_task_pref_get gate_undo_window 2>/dev/null || echo ""); pref="${pref:-on}"
+  [[ "$pref" == "off" ]] && { printf '0'; return 0; }
+  # The filer said it cannot wait, in the three vocabularies that exist.
+  #
+  # READ `gate_urgent` FROM THE ROW, not only the env var. `TASK_GATE_ROUTE_URGENT`
+  # is exported at exactly one call site — the ROUTED branch — so a gate bound for
+  # the HUMAN never saw it, and `--urgent` on a human-bound gate was silently
+  # ignored by this window. That is the half of the skip nobody was told was
+  # missing, and it is the half that matters: the routed rail goes to a seat that
+  # is polling anyway, while the human path is the one a 2-minute hold delays.
+  # Found by ops's condition on DIVE-4174 — "verify, do not assume, that the urgent
+  # skip bypasses the window" — which is the precondition for RAISING the window at
+  # all. At 120s the exposure is small; at 300s or 900s it would delay every gate
+  # whose filer explicitly said it could not wait.
+  #
+  # The row column is the right source rather than more env plumbing: the schema
+  # already calls `gate_urgent` "the filer's explicit" signal, it is written before
+  # the deliverer runs on both paths, and a column cannot be lost by a call site
+  # forgetting to re-export it — which is exactly how this went missing.
+  [[ "${TASK_GATE_ROUTE_URGENT:-0}" == "1" ]] && { printf '0'; return 0; }
+  local _gu; _gu=$(db "SELECT COALESCE(gate_urgent,0) FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || echo 0)
+  [[ "$_gu" == "1" ]] && { printf '0'; return 0; }
+  local prio; prio=$(db "SELECT COALESCE(priority,'') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || echo "")
+  [[ "$prio" == "urgent" ]] && { printf '0'; return 0; }
+  printf '%s' "$secs"
+}
+
+# True iff the gate this window was opened for is STILL the live, unanswered gate.
+# Keyed on need_asked_at, not on a bare "is something pending": a withdraw inside
+# the window followed by a re-file is a DIFFERENT gate with its own window and its
+# own child, and this one must not deliver the new one's page.
+_task_gate_still_live() {
+  local ident="$1" asked_at="$2" n
+  n=$(db "SELECT COUNT(*) FROM tasks
+            WHERE ident=$(sqlq "$ident")
+              AND need_asked_at IS NOT NULL
+              AND need_asked_at=$(sqlq "$asked_at")
+              AND (need_answer IS NULL OR trim(need_answer)='');" 2>/dev/null || echo "")
+  [[ "$n" == "1" ]]
+}
+
+# The window's wrapper. Delegates to _task_need_notify_deliver_now, which is the
+# unchanged pre-DIVE-4154 deliverer, either now or once the window closes.
 _task_need_notify_deliver() {
+  local ident="$1"
+  local _secs; _secs=$(_task_gate_undo_window_secs "$ident")
+  if (( _secs <= 0 )); then
+    _task_need_notify_deliver_now "$@"
+    return $?
+  fi
+  local _asked; _asked=$(db "SELECT COALESCE(need_asked_at,'') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || echo "")
+  if [[ -z "$_asked" ]]; then
+    # No timestamp to pin the window to means no way to tell a withdrawal from a
+    # re-file, so there is nothing safe to hold. Deliver now — the window is an
+    # optimisation, never a precondition for a gate reaching its human.
+    _task_need_notify_deliver_now "$@"
+    return $?
+  fi
+  # THE WINDOW IS ABSOLUTE, MEASURED FROM need_asked_at — not relative to this
+  # call. task_need_notify has callers other than the filing path: the heartbeat
+  # gate re-nag and the /inbox batch re-send both drive it for gates that were
+  # asked long ago. A window relative to the call would hold THOSE too, which is
+  # backwards twice over — the gate has already waited far longer than the window
+  # it would be charged, and the re-nag is precisely the recovery path for a ping
+  # this window lost to a dead box. Holding the recovery is how a delay becomes a
+  # swallow. So a gate already past its window pings NOW, on every path.
+  local _age
+  _age=$(db "SELECT CAST((julianday('now')-julianday($(sqlq "$_asked")))*86400 AS INT);" 2>/dev/null || echo "")
+  #
+  # AN AGE WE CANNOT READ IS DELIVERED, NOT HELD — the same call the empty
+  # `$_asked` branch above makes, for the same reason: the window is an
+  # optimisation, never a precondition for a gate reaching its human. Three ways
+  # the age is unreadable, and holding is wrong for all three:
+  #   - EMPTY. `julianday()` returns NULL on a malformed need_asked_at and the
+  #     CAST yields ''. Treating that as 0 charges a FULL window measured from
+  #     now on EVERY call, re-nag included — defect 1 reintroduced for that row.
+  #   - NEGATIVE. Clock skew puts need_asked_at in the future. Same as above, and
+  #     the row can outrun the window indefinitely while the clock is ahead.
+  #   - NON-NUMERIC. If `db` ever puts an error string on stdout, the arithmetic
+  #     below dies on `set -u` with "unbound variable" — it parses the word as a
+  #     variable name. That does not delay the ping, it DROPS it, mid-function,
+  #     with the hold row unwritten. The one outcome this whole mechanism is
+  #     built to be incapable of.
+  # So the guard is the delivery condition, not a filter in front of it, and the
+  # subtraction runs only on a value already proven a non-negative integer.
+  # Fail-open is also the invariant's direction: unreadable state may only ever
+  # move a gate TOWARD the phone, never away from it.
+  if ! [[ "$_age" =~ ^[0-9]+$ ]] || (( _age >= _secs )); then
+    _task_need_notify_deliver_now "$@"
+    return $?
+  fi
+  _secs=$(( _secs - _age ))
+  # The hold is RECORDED, and that record is what keeps the wrapper's delivery
+  # assertion quiet: without a row it would synthesise an `error` verdict for a
+  # gate that is deliberately, auditably, not yet delivered. No explicit
+  # TASK_GATE_DELIVERY_ROWS bump — _task_gate_delivery_log credits itself.
+  _task_gate_delivery_log ok "$ident" "hold:${_secs}s" "" \
+    "phone ping HELD ${_secs}s (DIVE-4154 undo window) — the gate is live NOW on the dashboard, in task inbox and in task queue; a withdrawal inside the window pages nobody. gate_pinged_at stays NULL so the re-nag still escalates if the ping is lost"
+  ( {
+      sleep "$_secs"
+      if _task_gate_still_live "$ident" "$_asked"; then
+        _task_need_notify_deliver_now "$@"
+      else
+        _task_gate_delivery_log ok "$ident" "hold:withdrawn" "" \
+          "undo window closed with the gate no longer live (withdrawn or answered inside ${_secs}s) — NOBODY was paged"
+      fi
+    } >/dev/null 2>&1 & ) || true
+  return 0
+}
+
+_task_need_notify_deliver_now() {
   local ident="$1" need_type="$2" ask="$3" options="$4" recommend="${5:-}"
   local secret_key="${6:-}" connector="${7:-}" human_nonce="${8:-}"
   local precedent_cite="${9:-}"  # OSS-11: prior-answer citation, empty if none

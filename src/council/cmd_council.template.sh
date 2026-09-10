@@ -1197,7 +1197,7 @@ _council_rot_triage() {
     # Belt-and-suspenders: the pure mapper never emits `task answer` for a triage, but assert it here
     # too — a triage must NEVER clear a tier-2 gate even if the mapping ever regresses.
     cmd="$(printf '%s' "$plan2" | jq -r '.command')"
-    if printf '%s' "$cmd" | grep -q 'task answer'; then
+    if grep -q 'task answer' <<<"$cmd"; then
       continue   # refuse: fail-closed, a tier-2 triage NEVER clears (should be unreachable)
     fi
     local runnable="${cmd//5dive /$(_council_bin) }"

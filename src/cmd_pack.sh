@@ -1657,7 +1657,7 @@ _agents_md_render() {
 _agents_md_render_memory() {
   local stage="$1"
   [[ -d "$stage/memory" ]] || return 0
-  find "$stage/memory" -maxdepth 1 -name '*.md' 2>/dev/null | grep -q . || return 0
+  grep -q . < <(find "$stage/memory" -maxdepth 1 -name '*.md' 2>/dev/null) || return 0
   printf '%s\n' "$AGENTS_MD_S_MEMORY"
   printf '# Memory\n\n'
   printf 'Distilled persona memory, one fact per section. `5dive agent import`\n'
@@ -1711,7 +1711,7 @@ _pack_inline_memory_into_doc() {   # _pack_inline_memory_into_doc <stage> <type>
   # on "distilled" made a raw restore onto a non-claude seat silently load nothing.
   [[ "$type" != "claude" && "$mem_inc" != "false" ]] || return 1
   [[ -d "$stage/memory" ]] || return 1
-  find "$stage/memory" -maxdepth 1 -name '*.md' 2>/dev/null | grep -q . || return 1
+  grep -q . < <(find "$stage/memory" -maxdepth 1 -name '*.md' 2>/dev/null) || return 1
   local inl="$doc.inline.$$" n
   n=$(find "$stage/memory" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l)
   if { cat "$doc"; printf '\n'; _agents_md_render_memory "$stage"; } > "$inl" 2>/dev/null \
@@ -1855,7 +1855,7 @@ _agents_md_explode() {
       fence == "" && /^~{3,}[[:space:]]*$/ { fence = $0; sub(/[[:space:]]+$/, "", fence); body = 1; next }
       body && $0 == fence { cur = ""; fence = ""; body = 0; next }
       body { print >> cur }' "$file"
-    find "$outdir/memory" -maxdepth 1 -name '*.md' 2>/dev/null | grep -q . || rm -rf "$outdir/memory"
+    grep -q . < <(find "$outdir/memory" -maxdepth 1 -name '*.md' 2>/dev/null) || rm -rf "$outdir/memory"
   fi
   return 0
 }
@@ -1987,7 +1987,7 @@ cmd_export() {
       # the human re-added a private fact to. Human review edits CONTENT; the tool
       # always re-enforces the {reference,project}-only filter + secret tripwire.
       [[ -d "$approve_memory" ]] || fail "$E_NOT_FOUND" "--approve-memory dir not found: $approve_memory"
-      find "$approve_memory" -maxdepth 1 -name '*.md' 2>/dev/null | grep -q . \
+      grep -q . < <(find "$approve_memory" -maxdepth 1 -name '*.md' 2>/dev/null) \
         || fail "$E_VALIDATION" "--approve-memory has no .md facts: $approve_memory"
       mem_tmp=$(mktemp -d)
       local scounts skept sexcl
@@ -2402,7 +2402,7 @@ cmd_import() {
   # the entire payload (persona_install_doc warns and returns 1, import carries
   # on and reports success).
   local -a _lands=(); mapfile -t _lands < <(_pack_harness_targets "$stage/manifest.json")
-  if ! printf '%s\n' "${_lands[@]+"${_lands[@]}"}" | grep -qxF -- "$type"; then
+  if ! grep -qxF -- "$type" < <(printf '%s\n' "${_lands[@]+"${_lands[@]}"}"); then
     local _why="this CLI has no probe-verified persona path for a '$type' seat, so the pack's identity doc would never reach the model (DIVE-2223)"
     if _pack_targets_declared "$stage/manifest.json"; then
       _why="the pack narrows itself to: $(jq -r '(.config.targets // []) | join(", ")' "$stage/manifest.json")"

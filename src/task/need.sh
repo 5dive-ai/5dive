@@ -79,6 +79,44 @@ cmd_task_pfr_autoclear() {
   esac
 }
 
+# DIVE-4154 arm D: the kill switch for the phone-ping undo window. Default ON —
+# this is the deliverable, not an experiment (mirrors `task pfr-autoclear`).
+# `off` restores the pre-DIVE-4154 immediate push byte for byte and needs no
+# release to take effect. Read-only `status` needs no privilege.
+#
+# There is deliberately NO way to set the LENGTH from here. The window is a
+# constant sealed into the release artifact for the same reason
+# _GATE_HUMAN_CAPABILITIES is (DIVE-2241/2131): agents hold NOPASSWD:ALL, so a
+# writable duration is one an agent can set to a week and thereby mute a gate it
+# does not want answered. On/off is auditable and coarse; a dial is neither.
+cmd_task_gate_undo_window() {
+  tasks_db_init
+  local sub="${1:-status}"
+  case "$sub" in
+    status|"")
+      local v; v=$(_task_pref_get gate_undo_window); v="${v:-on}"
+      ok "gate phone-ping undo window: ${v} (${_GATE_UNDO_WINDOW_SECS}s)" \
+         '{pref:"gate_undo_window", value:$v, seconds:($s|tonumber)}' \
+         --arg v "$v" --arg s "${_GATE_UNDO_WINDOW_SECS:-120}"
+      ;;
+    on|enable)
+      _task_pref_set gate_undo_window on
+      _task_store_audit_log "task gate-undo-window" "on" 0 -- "pref=gate_undo_window" || true
+      ok "gate phone-ping undo window: ON — a non-urgent gate is live on the dashboard and in task inbox at once, but the push notification waits ${_GATE_UNDO_WINDOW_SECS}s; a withdrawal inside that window pages nobody" \
+         '{pref:"gate_undo_window", value:"on"}'
+      ;;
+    off|disable)
+      _task_pref_set gate_undo_window off
+      _task_store_audit_log "task gate-undo-window" "off" 0 -- "pref=gate_undo_window" || true
+      ok "gate phone-ping undo window: OFF — every gate pushes to the phone at filing again" \
+         '{pref:"gate_undo_window", value:"off"}'
+      ;;
+    *)
+      fail "$E_USAGE" "usage: 5dive task gate-undo-window [on|off|status]"
+      ;;
+  esac
+}
+
 # DIVE-3694 (ROADMAP #22) — the track-record view and its kill switch.
 # `5dive task track-record [status] [<seat>]` reports what the engine reads: the
 # seat's rate, over how many, and WHAT WOULD REVOKE IT (row scope item 4 — the
@@ -4043,6 +4081,10 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
   # the chain starts from the ambient identity (auto_sender_from_sudo), which under
   # a `sudo -u agent-X` invocation is the INVOKER, not the filer — so the walk
   # would climb the wrong branch of the org chart.
+  # DIVE-4154: persist the filer's explicit urgency on THIS path too. It was
+  # written only on the routed branch, so `--urgent` on a human-bound gate reached
+  # neither the window nor any reader — see the note at _task_gate_undo_window_secs.
+  db "UPDATE tasks SET gate_urgent=${urgent} WHERE id=${id};" 2>/dev/null || true
   local _nrc=0
   TASK_GATE_FILER="$actor" \
     task_need_notify "$ident" "$type" "$ask" "$options" "$recommend" "$secret_key" "$connector" "$human_nonce" "$precedent_cite" || _nrc=$?

@@ -166,7 +166,7 @@ cmd_task_add() {
   local proj_lead
   proj_lead=$(db "SELECT COALESCE(lead_agent,'') FROM projects WHERE key=$(sqlq "$project") AND status='active';")
   if [[ -z "$proj_lead" ]]; then
-    db "SELECT 1 FROM projects WHERE key=$(sqlq "$project") AND status='active';" | grep -q 1 \
+    grep -q 1 < <(db "SELECT 1 FROM projects WHERE key=$(sqlq "$project") AND status='active';") \
       || fail "$E_NOT_FOUND" "no active project '$project' (see: 5dive project ls; create: 5dive project add)"
   fi
   local parent_sql="NULL"
@@ -1159,12 +1159,23 @@ cmd_task_assign() {
   # rung-1 window, and is re-flagged on their own clock if they also sit on it.
   # Only an explicit `task assign` resets it — the ladder writes assignee directly
   # and keeps its own latch, so the machine's own move still cannot repeat.
+  # DIVE-4111 adds reap_escalated_at/_n on the same fence, for a reason specific
+  # to it: the count that latch throttles is stored PER AGENT in the registry
+  # (.agents[<name>].heartbeat.reaps), so a new owner starts counting at zero. A
+  # latch that outlived the owner would let the new seat's count climb to the
+  # threshold with the auto-pause permanently disarmed — the row would churn past
+  # the budget forever and never once become visible. The counter is per-owner,
+  # so the latch has to be too.
   db "UPDATE tasks SET
         handoff_ack_at=CASE WHEN assignee IS NOT $(sqlq "$who") THEN NULL ELSE handoff_ack_at END,
         recurring_stall_pinged_at=CASE WHEN assignee IS NOT $(sqlq "$who")
                                        THEN NULL ELSE recurring_stall_pinged_at END,
         recurring_stall_escalated_at=CASE WHEN assignee IS NOT $(sqlq "$who")
                                           THEN NULL ELSE recurring_stall_escalated_at END,
+        reap_escalated_at=CASE WHEN assignee IS NOT $(sqlq "$who")
+                               THEN NULL ELSE reap_escalated_at END,
+        reap_escalated_n=CASE WHEN assignee IS NOT $(sqlq "$who")
+                              THEN NULL ELSE reap_escalated_n END,
         assignee=$(sqlq "$who"),
         started_at=CASE WHEN status='in_progress' AND assignee IS NOT $(sqlq "$who")
                         THEN datetime('now') ELSE started_at END
