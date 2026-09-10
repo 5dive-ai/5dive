@@ -189,7 +189,13 @@ jobs:
             '${{ matrix.shard }}' '${{ strategy.job-total }}' "$nc" "$rid" \
             > core-verdict-pristine-${{ matrix.shard }}.txt
           if [ "$nc" = 1 ]; then exit 0; fi
-          exit "$rc"
+          # DIVE-4229: exit 6 is run-harnesses.sh's UNGRADED slot, not a red -- the
+          # calibration clamp, an unconfirmed over-budget verdict, or one attributed to
+          # the runner. A non-zero step reds the job whatever the number meant, so an
+          # ungraded shard reached release-cut as a red and refused the v0.31.0 cut at
+          # 65% of budget with zero failing harnesses (run 34470906776). The translator
+          # annotates and returns 0 for a 6 ONLY; exit 1 and exit 4 pass through.
+          bash scripts/shard-exit.sh "$rc" 'core/pristine-s${{ matrix.shard }}' 'core-pristine-${{ matrix.shard }}.txt'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -517,7 +523,13 @@ jobs:
             '${{ matrix.shard }}' '${{ strategy.job-total }}' "$nc" "$rid" \
             > core-verdict-installed-${{ matrix.shard }}.txt
           if [ "$nc" = 1 ]; then exit 0; fi
-          exit "$rc"
+          # DIVE-4229: exit 6 is run-harnesses.sh's UNGRADED slot, not a red -- the
+          # calibration clamp, an unconfirmed over-budget verdict, or one attributed to
+          # the runner. A non-zero step reds the job whatever the number meant, so an
+          # ungraded shard reached release-cut as a red and refused the v0.31.0 cut at
+          # 65% of budget with zero failing harnesses (run 34470906776). The translator
+          # annotates and returns 0 for a 6 ONLY; exit 1 and exit 4 pass through.
+          bash scripts/shard-exit.sh "$rc" 'core/installed-host-s${{ matrix.shard }}' 'core-installed-${{ matrix.shard }}.txt'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -663,7 +675,13 @@ jobs:
             echo "budget red ATTRIBUTED TO THE RUNNER against the last green main run — no corpus finding; not blocking (DIVE-3580)."
             exit 0
           fi
-          exit "$rc"
+          # DIVE-4229: exit 6 is run-harnesses.sh's UNGRADED slot, not a red -- the
+          # calibration clamp, an unconfirmed over-budget verdict, or one attributed to
+          # the runner. A non-zero step reds the job whatever the number meant, so an
+          # ungraded shard reached release-cut as a red and refused the v0.31.0 cut at
+          # 65% of budget with zero failing harnesses (run 34470906776). The translator
+          # annotates and returns 0 for a 6 ONLY; exit 1 and exit 4 pass through.
+          bash scripts/shard-exit.sh "$rc" 'core/pristine-confirm-s${{ matrix.shard }}' 'core-pristine-confirm-${{ matrix.shard }}.txt'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -726,7 +744,13 @@ jobs:
             echo "budget red ATTRIBUTED TO THE RUNNER against the last green main run — no corpus finding; not blocking (DIVE-3580)."
             exit 0
           fi
-          exit "$rc"
+          # DIVE-4229: exit 6 is run-harnesses.sh's UNGRADED slot, not a red -- the
+          # calibration clamp, an unconfirmed over-budget verdict, or one attributed to
+          # the runner. A non-zero step reds the job whatever the number meant, so an
+          # ungraded shard reached release-cut as a red and refused the v0.31.0 cut at
+          # 65% of budget with zero failing harnesses (run 34470906776). The translator
+          # annotates and returns 0 for a 6 ONLY; exit 1 and exit 4 pass through.
+          bash scripts/shard-exit.sh "$rc" 'core/installed-host-confirm-s${{ matrix.shard }}' 'core-installed-confirm-${{ matrix.shard }}.txt'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
