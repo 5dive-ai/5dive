@@ -37,8 +37,20 @@ FIVE_BIN="${FIVE_BIN:-/usr/local/bin/5dive}"
 # lib/agent_setup.sh. find-skills / 5dive-cli / compile-knowledge are seeded at
 # create time and rarely change; the backfill's job is mainly to roll out
 # newly-added defaults like openagent onto pre-existing boxes.
+# DIVE-4130 (2026-09-10): `openagent` REMOVED from this array. It was added by
+# DIVE-658 as a backfill of a then-new default; it is a one-shot persona/card
+# minting skill, every seat that wanted a card has one, and no charter names it
+# in a keep-set. Because this loop is a FORCE re-pull with no skip-if-present,
+# membership here made the skill *unremovable per seat*: `5dive agent skill rm
+# openagent` returned ok:true and the 23:15 cron re-created the directory the
+# same night (measured 2026-09-09, /var/log/5dive-host-updates.log: "+ <seat> —
+# re-pulling openagent" x17, then ctime 23:17:12 on the fresh copy). A daily
+# reconciler does not propagate a local deletion, it reverts it — so the removal
+# had to be a one-line edit HERE, not 17 `rm`s.
+# NOTE (residue, not fixed here): openagent is ALSO seeded at agent-create time
+# by install_default_skill_for_agent in src/lib/agent_setup.sh, so newly created
+# seats still get it. This edit makes the removal durable on EXISTING seats only.
 DEFAULT_SKILLS=(
-  "5dive-ai/skills:openagent"
   # DIVE-2160: 5dive-cli was MISSING here while being seeded at provisioning
   # (cmd_agent_create.sh: skills_specs=("5dive-cli")), so every agent carried a
   # copy that this script could never refresh — the loop below iterates ONLY

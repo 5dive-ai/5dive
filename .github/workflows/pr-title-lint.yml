@@ -12,19 +12,49 @@ name: pr-title-lint
 on:
   pull_request:
     types: [opened, edited, reopened, synchronize]
+  # DIVE-4139 — MERGE QUEUE. `title` is a REQUIRED status check on main (it is in
+  # ruleset 22522554 AND in classic protection — eleven contexts, not the ten the
+  # first pass of DIVE-4139 inventoried, which is how this file was missed). With a
+  # queue enabled GitHub grades required checks on the `gh-readonly-queue/main/...`
+  # merge group, so a required context that never reports there does NOT go red — the
+  # entry waits for the check-response timeout and is EVICTED. Without this arm the
+  # flip evicts every batch, which is the exact failure the rest of DIVE-4139 exists
+  # to prevent, applied to every PR at once.
+  merge_group:
 
 permissions:
   contents: read
 
 concurrency:
-  group: pr-title-lint-${{ github.event.pull_request.number }}
+  # `pull_request.number` is empty on a merge_group event, so keying on it alone would
+  # give every merge group the SAME concurrency group and cancel-in-progress would have
+  # each batch cancel the one before it.
+  group: pr-title-lint-${{ github.event.pull_request.number || github.event.merge_group.head_ref }}
   cancel-in-progress: true
 
 jobs:
   title:
     runs-on: ubuntu-latest
     steps:
+      # There is NOTHING at queue time for this lint to grade, and that is a property of
+      # the check rather than a gap being waved through. What it exists to protect is the
+      # SQUASH SUBJECT, and the squash subject is composed by GitHub at the moment of
+      # merge out of the PR title — it does not exist yet on the merge group, whose
+      # commits are the branch's own commits (routinely non-conventional by design; that
+      # is what squashing is for). So grading the merge group's subjects would reject
+      # healthy batches, and grading the PR title is impossible without a PR. The
+      # enforcement point is structurally the pull request, where it is unchanged below.
+      # This arm reports the required context so the batch is graded instead of evicted.
+      - name: Queue time — nothing to grade, report and pass
+        if: github.event_name == 'merge_group'
+        run: |
+          printf 'pr-title-lint is a PR-time check: it grades the title that BECOMES the\n'
+          printf 'squash subject, and no such subject exists on a merge group. Every PR in\n'
+          printf 'this batch was linted on its own pull_request event before it could be\n'
+          printf 'enqueued. Reporting `title` so the merge group is graded, not evicted.\n'
+
       - name: The title must name the kind of change
+        if: github.event_name == 'pull_request'
         env:
           # Through `env:`, never interpolated into the script body. A PR title is
           # attacker-controlled text and an Actions expression is substituted before

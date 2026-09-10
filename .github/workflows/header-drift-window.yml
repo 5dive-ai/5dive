@@ -27,6 +27,10 @@ name: Header-drift window
 # this rail's own liveness signal, on the DIVE-1924 badge-staleness principle: the
 # body carries the date it was written, so a rail that dies leaves an issue visibly
 # frozen rather than a silence indistinguishable from "nothing recurred".
+# DIVE-4166 adds the calibration half to this same durable window: label/tier
+# populations get separate medians, and 20 comparable samples still >=25% off their
+# baseline print REBASELINE REQUIRED into this issue. It remains non-red for the same
+# release-cut reason; the durable named issue is the escalation surface.
 
 on:
   schedule:
@@ -145,6 +149,11 @@ jobs:
             echo "A single-box \`WRONG\` is NOT a stale claim and is listed as a stopwatch"
             echo "disagreement, because that reading was measured false three times on 2026-08-10"
             echo "(DIVE-3163) including a green re-run at the same sha."
+            echo
+            echo "A \`REBASELINE REQUIRED\` line is a separate calibration verdict: at least 20"
+            echo "comparable samples from one label/tier population still sit 25% or more away"
+            echo "from the stored reference. Re-derive the reference from that named population;"
+            echo "do not pool shard layouts or pristine/installed-host jobs."
             echo
             echo '```'
             cat window.txt

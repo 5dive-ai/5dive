@@ -99,11 +99,11 @@ TIER_BUDGET_FULL=1320
 #      it the run is UNDETERMINED with its own non-zero exit, never green (cf.
 #      DIVE-2555 — a run that could not measure has not passed).
 #
-#   3. THE PROBE MUST MATCH THE CORPUS'S COST MIX, NOT MERELY ITS DURATION. The
-#      observed 10-36% spread was across process spawn, bash startup, the built CLI's
-#      own startup and small file I/O. A CPU spin is the tempting probe and the wrong
-#      one: it calibrates a dimension these harnesses barely pay for, so it would
-#      track a draw the corpus does not feel. See scripts/run-harnesses.sh:cal_probe.
+#   3. THE PROBE MUST MATCH THE CORPUS'S COST MIX WITHOUT TIMING THE PRODUCT. The
+#      observed 10-36% spread was across process spawn, bash startup and small file
+#      I/O. A CPU spin is the tempting probe and the wrong one: it calibrates a
+#      dimension these harnesses barely pay for. The built CLI is also wrong: a
+#      product speedup then reads as a faster runner (DIVE-4166). See cal_probe.
 #
 # THE LOWER CLAMP IS 1.0 — a fast VM never TIGHTENS the cap. Symmetric scaling is the
 # purer reading OF THE MEASUREMENT, and it was left open for the builder to argue
@@ -209,12 +209,21 @@ TIER_CAL_SCALE_MAX_PCT=150
 # 2026-09-09, because the overrun above is the corpus and no re-baseline can price it
 # away. The 300s cap and every constant in this file are still untouched by it.
 
-TIER_CAL_BASELINE_US=138281
+# ── RE-DERIVED 2026-09-09 (DIVE-4166): 138281 -> 1641 ─────────────────
+# GitHub-hosted ubuntu-latest, run 34370181210: 20 fresh ephemeral VMs measured
+# the product-free bash-spawn + file write/read probe. One label/tier population,
+# n=20, range 1208-3768us/iter, lower median 1532. tier-cal-window emitted
+# REBASELINE REQUIRED at 99% off the incumbent. The raw median was REFUSED by
+# tier_cal_ref_admissible (K=0 in-band support); 1629 was also refused (K=1).
+# Candidate 1641 is the first supported neighbour: K=2 and median-widen=100% over
+# the concordant population. This is a measured reference, not the spot reading
+# from the authoring box, and the temporary sampling matrix was removed afterward.
+TIER_CAL_BASELINE_US=1641
 
 # How long ONE sample of the probe should run. This is the PRECISION knob from note 1:
 # the probe's own relative error must sit well under the headroom being protected (9%
-# today), and a ~10s sample of a ~180ms unit is ~55 iterations, whose spread is small
-# beside a 10-36% platform draw. Two samples ~= 20s of job time, which is deliberately
+# today), and a ~10s sample of the ~1.6ms product-free unit is ~6,000 iterations,
+# whose spread is small beside a 10-36% platform draw. Two samples ~= 20s of job time, which is deliberately
 # NOT counted toward the corpus total — the runner says so in its report.
 TIER_CAL_TARGET_MS=10000
 TIER_CAL_PILOT_ITERS=5
