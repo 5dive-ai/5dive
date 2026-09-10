@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# TIER: nightly — 20.3s measured on the 5dive host, worktree 5dive-cli-wt-2207 (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it. Was 12.4s; DIVE-2207 added 14 arms (the (a3) post-gate-answer rail and the gap#3 label/parked-term arms), each of which drives a full _hb_stall_sweep.
+# TIER: nightly — 38.0s measured on the 5dive host, worktree 5dive-cli-wt-4244 (DIVE-4244 re-claimed it;
+# was 20.3s from DIVE-2525, and 12.4s before DIVE-2207 added 14 arms — the (a3) post-gate-answer rail
+# and the gap#3 label/parked-term arms — each of which drives a full _hb_stall_sweep). Three serial
+# host samples: 39.4 / 39.0 / 37.3s. The CI runner reads it lower (26.7s and 28.8s on
+# full-pristine(1) and full-installed-host(1) of run 34491480280), so the host number is the one that
+# keeps both runners under the claim. Does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1416 isolated unit harness for _hb_stall_sweep (cmd_heartbeat.sh) —
 # fleet-stall self-heal gaps #2 and #3 (gap #1 is _hb_blocked_sweep, covered by
 # tests/task_cascade_unblock_unit.sh):

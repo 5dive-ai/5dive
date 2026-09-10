@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# TIER: nightly — 11.9s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
+# TIER: nightly — 29.1s measured on the 5dive host, worktree 5dive-cli-wt-4244 (DIVE-4244 re-claimed it;
+# was 11.9s from DIVE-2525). Three serial host samples: 37.6 / 29.1 / 27.9s, median claimed. The CI
+# runner reads it lower — 20.1s and 20.4s on full-pristine(1) and full-installed-host(1) of run
+# 34491480280 — so the host number is the one that keeps BOTH runners under the claim; claim the
+# CI number and a loaded host reds the sweep. Does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1376 isolated unit harness for `5dive push` — the delegated-push verb.
 # Covers every NON-CREDENTIAL path (the live token-mint + real push is smoked
 # separately against the control-plane GitHub App). Same isolation posture as
