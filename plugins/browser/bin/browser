@@ -682,7 +682,19 @@ cmd_viewer_redeem() {
 
   # SINGLE USE FIRST. A consumed ticket must not even leak whether the nonce was
   # right, and checking state last is how a "used" ticket becomes an oracle.
-  [[ "$state" == open ]] || { _viewer_stop "$dir"; die "$E_PERM" "that viewer link has already been used (state: $state). Links are one-time by design — ask the dashboard for a new one."; }
+  #
+  # AND THIS BRANCH IS A PURE REFUSAL — it computes, it dies, it touches nothing.
+  # It is hoisted above the session binding and the nonce compare for a LEAK
+  # reason, which means it also runs before anything has established the caller is
+  # anyone at all. A `_viewer_stop` here therefore let one unauthenticated call
+  # (no nonce, no session, just the site name) kill the customer's LIVE viewer and
+  # delete its credential: a hoisted check drags whatever side effect it carries
+  # ahead of every auth check with it. The likeliest trigger was never an attacker
+  # but the customer's own phone reloading the viewer URL mid-login. Reaping is
+  # legitimate on the EXPIRED branch below, because expiry is a fact about the
+  # ticket rather than a claim about who is calling; here it never is. x11vnc's
+  # -once and -timeout reap the view on their own.
+  [[ "$state" == open ]] || die "$E_PERM" "that viewer link has already been used (state: $state). Links are one-time by design — ask the dashboard for a new one. The browser session itself is untouched and still logged in."
   (( $(date -u +%s) < expires )) || { _viewer_revoke_file "$dir" expired; _viewer_stop "$dir"; die "$E_PERM" "that viewer link expired. Ask the dashboard for a new one; the browser session itself is untouched."; }
   [[ "$session" == "$bind" ]] || die "$E_PERM" "that viewer link was issued to a different dashboard session. Refusing: a link pasted somewhere else is exactly what the binding exists to stop."
 

@@ -384,6 +384,8 @@ t 'T7d ...and its probe marker is the one bin/browser reads' 'yes' \
 #   T10n  the VNC server dies before the ticket it was minted for expires
 #   T10o  a spent ticket still tells an attacker whether a nonce was right
 #   T10p  a ticket outlives the browser it views, and redeems onto a dead port
+#   T10q  a REPLAY kills the live viewer -> a hoisted refusal that is not pure
+#   T10r  a missing VNC credential SPENDS the customer's one-time link
 #
 # There is no X server on a CI runner, so Xvfb/x11vnc/websockify are FAKES on
 # PATH. They are not product hooks: liveness is still the real PID check in
@@ -434,6 +436,18 @@ SPATH="$SRVBIN:$SBIN:$PATH"
 
 mkprofile viewsite "$LIVE_DOM" >/dev/null
 VDIR="$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/viewsite"
+
+# Is the customer still looking at their viewer? Read it the only way that cannot
+# lie: the PIDs the product recorded, probed with kill -0. "The command exited 77"
+# says nothing about whether it killed something on the way out.
+vnc_state() {
+  local f="$VDIR/.5dive-viewer" p
+  [[ -f "$f" ]] || { echo dead; return; }
+  for p in $(sed -n 's/^vnc_pid=//p' "$f") $(sed -n 's/^ws_pid=//p' "$f"); do
+    [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null || { echo dead; return; }
+  done
+  echo live
+}
 
 # --- T10a a display-less box SERVES instead of refusing -----------------------
 run env PATH="$SPATH" DISPLAY= "$BROWSER" serve viewsite
@@ -591,6 +605,59 @@ t  'T10p ...and the VNC password is not left behind in the profile' 'no' \
 t  'T10p ...while the PROFILE ITSELF survives — the durable half' 'yes' \
    "$([[ -d "$VDIR" ]] && echo yes || echo no)"
 env PATH="$SPATH" DISPLAY= "$BROWSER" serve viewsite >/dev/null 2>&1 || true
+
+# --- T10q A REPLAY DOES NOT KILL THE LIVE VIEWER ------------------------------
+# The spent-state check is hoisted above the session binding and the nonce compare
+# for a LEAK reason (T10o). That hoist also puts it ahead of everything that
+# establishes the caller is anyone at all, so any side effect attached to it fires
+# for a call carrying NO valid nonce and NO valid session — naming the site is the
+# entire cost of entry. When that side effect was _viewer_stop, one such call
+# killed the customer's LIVE viewer and deleted its credential: exactly the denial
+# the binding exists to prevent (design note §4, "a wrong-session attempt does not
+# spend the ticket for the rightful one"). The likeliest trigger was never an
+# attacker but the customer's own phone reloading the viewer URL mid-login. A
+# refusal hoisted for a leak reason must be PURE: compute, die, touch nothing.
+run env PATH="$SPATH" "$BROWSER" viewer viewsite --bind=sess-A --ttl=600
+t  'T10q viewer mints onto the live browser' 0 "$RC"
+NONCE8="${OUT##*/}"
+run env PATH="$SPATH" bash -c "printf '%s' '$NONCE8' | '$BROWSER' viewer-redeem viewsite --nonce=- --session=sess-A"
+t  'T10q the customer redeems it legitimately' 0 "$RC"
+t  'T10q ...and the viewer they are now looking at is LIVE' 'live' "$(vnc_state)"
+run env PATH="$SPATH" bash -c "printf '%s' 'totally-wrong-nonce' | '$BROWSER' viewer-redeem viewsite --nonce=- --session=sess-EVIL"
+t  'T10q a replay with a WRONG nonce AND a WRONG session is refused' 77 "$RC"
+t  'T10q ...AND THE CUSTOMER IS STILL LOOKING AT THEIR VIEWER' 'live' "$(vnc_state)"
+t  'T10q ...and its credential was not deleted out from under them' 'yes' \
+   "$([[ -s "$VDIR/.5dive-viewer.pw" ]] && echo yes || echo no)"
+tc 'T10q ...and the refusal SAYS the session survived, so the customer waits instead of re-logging in' \
+   'untouched' "$ERR"
+
+# --- T10r a viewer with no credential REFUSES WITHOUT SPENDING THE TICKET -----
+# Redemption reads the VNC password BEFORE it consumes the ticket, so a viewer
+# whose credential is gone cannot burn the customer's one-time link merely to
+# report that it is gone. The die string PROMISES "The ticket was NOT spent" —
+# until these arms nothing checked the promise was kept: moving the consume ahead
+# of the read passed all 147 other arms, the same unmeasured-claim shape as T10m.
+run env PATH="$SPATH" "$BROWSER" viewer viewsite --bind=sess-A --ttl=600
+t  'T10r viewer mints' 0 "$RC"
+NONCE9="${OUT##*/}"
+PW_SAVED="$(cat "$VDIR/.5dive-viewer.pw")"
+rm -f "$VDIR/.5dive-viewer.pw"
+run env PATH="$SPATH" bash -c "printf '%s' '$NONCE9' | '$BROWSER' viewer-redeem viewsite --nonce=- --session=sess-A"
+t  'T10r a redemption onto a viewer with no credential is refused' 69 "$RC"
+tc 'T10r ...because a target without its password is a port nobody can enter' 'credential is gone' "$ERR"
+t  'T10r THE TICKET IS STILL OPEN — the refusal did not spend it' 'state=open' \
+   "$(grep '^state=' "$VDIR/.5dive-viewer.ticket")"
+# An EMPTY credential file is the same customer outcome through a different door.
+( umask 077; : > "$VDIR/.5dive-viewer.pw" )
+run env PATH="$SPATH" bash -c "printf '%s' '$NONCE9' | '$BROWSER' viewer-redeem viewsite --nonce=- --session=sess-A"
+t  'T10r an EMPTY credential file is refused too' 69 "$RC"
+t  'T10r ...and also leaves the ticket open' 'state=open' \
+   "$(grep '^state=' "$VDIR/.5dive-viewer.ticket")"
+# ...and "not spent" only means anything if the SAME link still works afterwards.
+( umask 077; printf '%s\n' "$PW_SAVED" > "$VDIR/.5dive-viewer.pw" )
+run env PATH="$SPATH" bash -c "printf '%s' '$NONCE9' | '$BROWSER' viewer-redeem viewsite --nonce=- --session=sess-A"
+t  'T10r AND THE SAME NONCE REDEEMS AFTERWARDS' 0 "$RC"
+tc 'T10r ...handing over the credential it could not find a moment ago' "password=$PW_SAVED" "$OUT"
 
 # --- T10c a box without the packages says so, and starts nothing --------------
 mkprofile barebox "$LIVE_DOM" >/dev/null

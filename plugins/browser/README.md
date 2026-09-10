@@ -66,12 +66,19 @@ attached. Five properties, each of which fails closed:
 2. **The ticket is a nonce we do not keep.** 32 bytes of urandom, stored only as its SHA-256 — the
    same rule the human-gate nonces use, for the same reason. The raw value exists once, in the line
    printed to whoever asked.
-3. **It is single-use.** A TTL cannot close a replay inside its own window; consuming the ticket
-   can. The spent-state check runs *before* the nonce compare, so a used ticket is not an oracle.
+3. **It is single-use, and the replay branch is a PURE refusal.** A TTL cannot close a replay inside
+   its own window; consuming the ticket can. The spent-state check runs *before* the nonce compare,
+   so a used ticket is not an oracle — which also puts it ahead of everything that establishes who
+   is calling, so it computes, refuses, and touches nothing. A teardown on that branch would let one
+   call that names only the site kill a customer's live viewer. Reaping the view belongs to
+   `x11vnc -once`/`-timeout` and to the expiry branch, where the fact is about the ticket rather
+   than a claim about the caller.
 4. **It is bound to the session that asked.** `--bind` is mandatory; there is no implicit unbound
    ticket, because an unbound one is a bearer credential for a live logged-in account.
    `--bind=local` is the named escape for a hand-run on the box. A refused redemption from the
-   wrong session does not spend the ticket for the right one.
+   wrong session does not spend the ticket for the right one — and neither does a redemption that
+   finds the viewer's credential gone: it refuses, leaves the ticket open, and the same link works
+   once a viewer is running again.
 5. **The nonce never enters argv.** `/proc/<pid>/cmdline` is readable by other seats, so
    `viewer-redeem` takes the nonce on **stdin** and refuses `--nonce=<value>` outright.
 
