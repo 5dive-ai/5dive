@@ -966,56 +966,18 @@ JOURNALD
   done
   ok "team-templates"
 
-  # DIVE-4020 — the plugins the CLI itself SHIPS, staged as a bundled
-  # marketplace. `5dive plugin` registers $LIB_DIR/plugins as the marketplace
-  # named "5dive" on first use, which is what makes `5dive plugin add voice`
-  # resolve on a box with no network and no GitHub credential — the contract's
-  # reference implementation has to be reachable before a user has added any
-  # source, or the first thing they must do to install our own plugin is the
-  # very setup step the verb exists to remove.
+  # DIVE-4202 — NO bundled plugin marketplace is staged here any more.
   #
-  # Enumerated per file for the same reason team-templates is: $REPO is a flat
-  # fetch URL with no directory listing. Add a line per new bundled plugin file.
-  #
-  # KEEP THE `for _pf in` LIST ON ONE LINE: tests/plugin_contract_unit.sh T10a
-  # extracts it with a single-line sed and set-compares it against what plugins/
-  # actually contains, so a backslash continuation there does not break the
-  # install — it breaks the GUARD, silently, in the direction drift travels.
-  #
-  # DIVE-4035 — MODE IS PART OF THE STAGE, not a detail. A plugin verb resolves
-  # to <plugin>/bin/<verb> and 5dive refuses to dispatch a file that is not
-  # executable, so a blanket `chmod 644` here would stage a voice that installs
-  # and then cannot run — the exact silent-inertness DIVE-4035 removed,
-  # reintroduced by the installer. Anything under a plugin's bin/ is staged 755.
-  mkdir -p "$LIB_DIR/plugins/.claude-plugin" "$LIB_DIR/plugins/voice/.claude-plugin" \
-           "$LIB_DIR/plugins/voice/bin" "$LIB_DIR/plugins/browser/.claude-plugin" \
-           "$LIB_DIR/plugins/browser/bin" "$LIB_DIR/plugins/browser/adapters"
-  _plug_ok=1
-  for _pf in .claude-plugin/marketplace.json voice/.claude-plugin/plugin.json voice/README.md voice/bin/voice browser/.claude-plugin/plugin.json browser/README.md browser/bin/browser browser/adapters/example.json; do
-    if curl -fsSL "$REPO/plugins/$_pf" -o "$LIB_DIR/plugins/$_pf"; then
-      case "$_pf" in
-        */bin/*) chmod 755 "$LIB_DIR/plugins/$_pf" ;;
-        *)       chmod 644 "$LIB_DIR/plugins/$_pf" ;;
-      esac
-    else
-      _plug_ok=0
-      echo "warn: failed to stage bundled plugin file $_pf — '5dive plugin add voice' won't resolve until the next refresh" >&2
-    fi
-  done
-  # A HALF-staged marketplace is worse than none: the index would list voice and
-  # the resolver would then fail to find its manifest, which reads as a broken
-  # install rather than a missing one. Drop it and say so.
-  # >>> bundled-plugins partial guard (extracted and EXECUTED by
-  # tests/plugin_contract_unit.sh T10c/T10d — the markers are the anchor so the
-  # condition below is inside the graded text rather than being the anchor
-  # itself; a test that anchors on the line it wants to grade cannot grade it).
-  if [[ "$_plug_ok" != 1 ]]; then
-    rm -rf "$LIB_DIR/plugins"
-    echo "warn: bundled plugin marketplace not staged (partial download removed) — 5dive plugin marketplace list will show nothing bundled" >&2
-  else
-    ok "bundled plugins (voice)"
-  fi
-  # <<< bundled-plugins partial guard
+  # The CLI used to ship `plugins/voice` and `plugins/browser` in its own repo
+  # and this block curled them onto the box as a local marketplace named
+  # "5dive". That made those two the only plugins whose fix reached a customer
+  # on a CLI release rather than on a publish, and it is how the browser plugin
+  # shipped uninstallable on 0.28.0 (DIVE-4126). Both now live in
+  # 5dive-ai/5dive-plugins with every other plugin, and `5dive plugin`
+  # registers that ONE registry itself on first use
+  # (src/cmd_plugin.sh:_plugin_register_registry) — so there is nothing for the
+  # installer to stage, and no per-file list here to drift from what plugins/
+  # contains.
 
   # /etc/claude-code/managed-settings.json — channel-plugin allowlist.
   # Claude reads a default Anthropic-blessed ledger when this file is

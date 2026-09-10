@@ -424,61 +424,82 @@ _plugin_consent() {
 
 # ---- marketplaces ----------------------------------------------------------
 
-# Where the CLI's OWN bundled plugins live. Mirrors _team_templates_dir: the
-# installed path first, a repo-local plugins/ second so a source checkout and a
-# test worktree behave like a real box.
-_plugin_bundled_dir() {
-  # FIVEDIVE_BUNDLED_PLUGINS wins and, when set, is the ONLY thing consulted —
-  # a test that points it at a fixture must not silently fall through to
-  # /usr/local/lib/5dive/plugins and grade the real box's plugins instead of its
-  # own. Same env-honouring convention as STATE_DIR (header.sh:70).
-  if [[ -n "${FIVEDIVE_BUNDLED_PLUGINS:-}" ]]; then
-    [[ -d "$FIVEDIVE_BUNDLED_PLUGINS" ]] && { realpath "$FIVEDIVE_BUNDLED_PLUGINS"; return 0; }
-    return 1
+# The ONE registry. Every 5dive plugin — telegram, dashboard, buzz, voice,
+# browser — is published to 5dive-ai/5dive-plugins, and that repo is the only
+# marketplace this CLI registers for you.
+#
+# DIVE-4202 removed the second home. `voice` and `browser` used to be BUNDLED in
+# this repo's plugins/ and registered as a local marketplace named "5dive", so
+# they were the only two plugins whose fix reached a customer on a CLI release
+# rather than on a publish — which is how the browser plugin shipped
+# uninstallable on 0.28.0 (DIVE-4126) with every check green. One home, one
+# grading path: the install-contract enumerates the registry's manifest, so a
+# plugin published there is graded on a fresh box the day it lands.
+#
+# FIVEDIVE_PLUGIN_REGISTRY overrides the source and, when set, is the ONLY thing
+# consulted — a test or the docker-install contract points it at a local clone
+# and must not silently fall through to the network and grade the real registry
+# instead of its own fixture. Same env-honouring convention as STATE_DIR
+# (header.sh:70). It takes anything `marketplace add` takes: a local path, an
+# owner/repo, or a git URL.
+_plugin_registry_name() { echo "5dive-plugins"; }
+_plugin_registry_source() {
+  if [[ -n "${FIVEDIVE_PLUGIN_REGISTRY:-}" ]]; then
+    printf '%s' "$FIVEDIVE_PLUGIN_REGISTRY"; return 0
   fi
-  local self d
-  self=$(realpath "${BASH_SOURCE[0]}" 2>/dev/null) || self=""
-  # Installed layout first, then both source shapes: the BUILT single-file
-  # binary sits at the repo root (so plugins/ is its sibling) while the SPLIT
-  # source sits in src/ (so plugins/ is one level up). Checking both is what
-  # keeps `./build.sh && ./5dive plugin ...` in a worktree behave like a box.
-  for d in /usr/local/lib/5dive/plugins \
-           ${self:+"$(dirname "$self")/plugins"} \
-           ${self:+"$(dirname "$self")/../plugins"}; do
-    [[ -n "$d" && -d "$d" ]] && { realpath "$d"; return 0; }
-  done
-  return 1
+  printf 'https://github.com/%s/5dive-plugins.git' "$(gh_org)"
 }
 
-# The bundled marketplace registers ITSELF, once, on first use.
+# The registry registers ITSELF, once, on first use.
 #
-# This is what makes contract §6 literally true — `5dive plugin add voice@5dive`
-# resolves on a box with no network, no GitHub credential and no prior setup.
-# Without it the very first thing a new user must do to install our own
-# reference plugin is add a marketplace by hand, which is the gap this whole
-# verb exists to close, reintroduced one level up.
+# This is what keeps contract §6 true after the move: `5dive plugin add voice`
+# resolves with no prior setup, because the very first thing a new user would
+# otherwise have to do to install our own reference plugin is add a marketplace
+# by hand — the gap this verb exists to close, reintroduced one level up.
 #
-# Registered as kind=local pointing at the bundled dir, so `plugin marketplace
-# upgrade 5dive` re-copies from whatever the installed CLI now ships — a CLI
-# upgrade therefore refreshes the source, and (per §4) still installs nothing
-# until the plugin's own version is bumped.
-_plugin_register_bundled() {
-  local src; src=$(_plugin_bundled_dir) || return 0
-  [[ -f "$src/.claude-plugin/marketplace.json" ]] || return 0
-  jq -e 'has("5dive")' "$(_plugin_mkt_json)" >/dev/null 2>&1 && return 0
-  local dest; dest="$(_plugin_mkt_dir)/5dive"
+# Unlike the bundled dir it replaces, this needs the network ONCE (the clone).
+# It is best-effort by design: every failure path returns 0 and leaves the
+# marketplace unregistered, so an offline box gets `plugin ls` with no
+# marketplace rather than a plugin verb that dies. `plugin add`'s not-found
+# message names the registry, so the recovery is one documented command.
+_plugin_register_registry() {
+  local name; name=$(_plugin_registry_name)
+  jq -e --arg n "$name" 'has($n)' "$(_plugin_mkt_json)" >/dev/null 2>&1 && return 0
+  local src; src=$(_plugin_registry_source)
+  local dest; dest="$(_plugin_mkt_dir)/$name"
   rm -rf "$dest"
-  cp -a "$src" "$dest" 2>/dev/null || return 0
+  if [[ -d "$src" ]]; then
+    cp -a "$src" "$dest" 2>/dev/null || { rm -rf "$dest"; return 0; }
+  else
+    command -v git >/dev/null 2>&1 || return 0
+    local url="$src" ref=""
+    case "$src" in
+      *://*|*@*:*) : ;;
+      */*) ref="${src##*@}"; [[ "$ref" == "$src" ]] && ref="" || src="${src%@*}"
+           url="https://github.com/${src}.git" ;;
+      *)   return 0 ;;
+    esac
+    if [[ -n "$ref" ]]; then
+      timeout 30 git clone --quiet --depth 1 --branch "$ref" "$url" "$dest" 2>/dev/null \
+        || { rm -rf "$dest"; return 0; }
+    else
+      timeout 30 git clone --quiet --depth 1 "$url" "$dest" 2>/dev/null \
+        || { rm -rf "$dest"; return 0; }
+    fi
+  fi
+  # A registry clone with no manifest is not a registry — leave it unregistered
+  # rather than record a marketplace whose every resolve then fails.
+  [[ -f "$dest/.claude-plugin/marketplace.json" ]] || { rm -rf "$dest"; return 0; }
   local tmp; tmp=$(mktemp)
-  jq --arg s "$src" --arg t "$(date -u +%FT%TZ)" \
-     '.["5dive"] = {source:$s, kind:"local", ref:"", added_at:$t, bundled:true}' \
+  jq --arg n "$name" --arg s "$(_plugin_registry_source)" --arg t "$(date -u +%FT%TZ)" \
+     '.[$n] = {source:$s, kind:"git", ref:"", added_at:$t, registry:true}' \
      "$(_plugin_mkt_json)" > "$tmp" && _plugin_publish_json "$tmp" "$(_plugin_mkt_json)"
   # Explicit, because this function's last command is a CONDITIONAL and would
   # otherwise supply its exit status: every caller is `_plugin_ensure_store`,
   # which runs under errexit, so a failed jq here would take the whole verb down
-  # with no message rather than leaving the bundled marketplace unregistered.
-  # Registering the bundle is best-effort by design — every early `return 0`
-  # above says so — and the last line must agree with them.
+  # with no message rather than leaving the registry unregistered. Registering
+  # is best-effort by design — every early `return 0` above says so — and the
+  # last line must agree with them.
   return 0
 }
 
@@ -491,7 +512,7 @@ _plugin_ensure_store() {
   [[ -f "$(_plugin_mkt_json)" ]]       || echo '{}' > "$(_plugin_mkt_json)"
   [[ -f "$(_plugin_installed_json)" ]] || echo '{}' > "$(_plugin_installed_json)"
   chmod 644 "$(_plugin_mkt_json)" "$(_plugin_installed_json)" 2>/dev/null || true
-  _plugin_register_bundled
+  _plugin_register_registry
 }
 
 # A marketplace name keys a directory and a config stanza, so it is constrained
@@ -716,7 +737,7 @@ _plugin_split_ref() {
       _plugin_source_dir "$m" "$plugin" >/dev/null 2>&1 && found+=("$m")
     done < <(jq -r 'keys[]' "$(_plugin_mkt_json)" 2>/dev/null)
     if (( ${#found[@]} == 0 )); then
-      fail "$E_NOT_FOUND" "no plugin '$plugin' in any registered marketplace. Registered: $(jq -r 'keys | join(", ") // "(none)"' "$(_plugin_mkt_json)" 2>/dev/null). If it is published rather than bundled, add its source first: 5dive plugin marketplace add $(gh_org)/5dive-plugins"
+      fail "$E_NOT_FOUND" "no plugin '$plugin' in any registered marketplace. Registered: $(jq -r 'if (keys | length) == 0 then "(none)" else (keys | join(", ")) end' "$(_plugin_mkt_json)" 2>/dev/null). Every 5dive plugin is published to the registry — add it first: 5dive plugin marketplace add $(gh_org)/5dive-plugins"
     elif (( ${#found[@]} > 1 )); then
       fail "$E_CONFLICT" "'$plugin' exists in ${#found[@]} marketplaces (${found[*]}) — name one: ${plugin}@${found[0]}"
     fi

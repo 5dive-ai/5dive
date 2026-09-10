@@ -316,22 +316,34 @@ jobs:
           ./build.sh
           docker build -f docker/Dockerfile -t 5dive-contract .
       # Everything docker-install asserts is that the bundle lays down and
-      # reports a version. Nothing there ever installed a bundled plugin,
+      # reports a version. Nothing there ever installed a published plugin,
       # resolved a team template, or asked a verb for its usage — so v0.28.0
       # shipped the browser plugin uninstallable (DIVE-4126) and the
       # `distribution` template unstaged (#808) with that job green. Both
       # defects are "the artifact exists and does not install/run", and only a
       # fresh-box exercise sees them.
       #
-      # The two manifests are mounted from the CHECKOUT, not read out of the
-      # installed tree: the repo's marketplace.json and team-templates/index.json
-      # are the source of truth, so a plugin or slug that install.sh forgot to
-      # stage is still enumerated and reports as missing. Read the installed
-      # copies instead and install.sh becomes its own examiner.
+      # Neither manifest is read out of the installed tree: they are the
+      # publishers' copies, so a plugin or slug the box failed to get is still
+      # enumerated and reports as missing. Read the box's own copies instead and
+      # the box becomes its own examiner.
+      #
+      # DIVE-4202: the plugin manifest is now FETCHED from the registry
+      # (5dive-ai/5dive-plugins) rather than mounted from this checkout — this
+      # repo ships no plugins. That is what makes the contract grade a PUBLISH:
+      # a plugin that lands in the registry is installed on a fresh box by the
+      # next run of this job, with no CLI release and no edit here. It also
+      # means this arm depends on the registry being reachable; the fetch is
+      # asserted non-empty so an outage reports as itself.
       - name: Plugins install, templates resolve, verbs answer --help
         run: |
+          curl -fsSL \
+            "https://raw.githubusercontent.com/${GITHUB_REPOSITORY%%/*}/5dive-plugins/main/.claude-plugin/marketplace.json" \
+            -o "$PWD/registry-marketplace.json"
+          jq -e '.plugins | length > 0' "$PWD/registry-marketplace.json" >/dev/null \
+            || { echo "registry marketplace.json fetched but declares no plugins"; exit 1; }
           docker run --rm \
             -v "$PWD/scripts/install-contract.sh:/contract.sh:ro" \
-            -v "$PWD/plugins/.claude-plugin/marketplace.json:/manifests/marketplace.json:ro" \
+            -v "$PWD/registry-marketplace.json:/manifests/marketplace.json:ro" \
             -v "$PWD/team-templates/index.json:/manifests/team-index.json:ro" \
             --entrypoint /bin/bash 5dive-contract /contract.sh

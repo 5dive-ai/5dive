@@ -2824,29 +2824,33 @@ cmd_market_plugins() {
     esac
   done
 
-  # TWO sources, and listing both is the point rather than a nicety.
+  # ONE source, and that is the point rather than a simplification.
   #
-  #   1. The BUNDLED marketplace that ships with the CLI (plugins/, world-readable
-  #      at /usr/local/lib/5dive/plugins). It needs no network and no root, and it
-  #      is the only one whose plugins `plugin add <name>` resolves with no setup.
-  #   2. The PUBLISHED 5dive-plugins marketplace, over the network.
+  # DIVE-4202 moved `voice` and `browser` into 5dive-ai/5dive-plugins, so the
+  # CLI no longer ships a second, BUNDLED marketplace of its own. Everything is
+  # published to the registry, which means the discovery surface and the
+  # installer now read the same manifest and cannot disagree — the failure this
+  # listing was built to avoid, removed at the source instead of papered over
+  # by showing two lists.
   #
-  # Showing only (2) — which is what this did first — produces a discovery
-  # surface that disagrees with the installer: the user reads `telegram`, runs
-  # `plugin add telegram`, and is told no marketplace has it. So every row
-  # carries the marketplace it came from, and the footer names the one command
-  # that makes the remote ones installable.
-  local rows="[]" bundled remote_ok=0
-  if bundled=$(_plugin_bundled_dir 2>/dev/null) && [[ -f "$bundled/.claude-plugin/marketplace.json" ]]; then
-    local bname; bname=$(jq -r '.name // "5dive"' "$bundled/.claude-plugin/marketplace.json")
-    rows=$(jq -c --arg m "$bname" --argjson r "$rows" \
-      '[.plugins[]? | {name, description:(.description//""), category:(.category//"-"), marketplace:$m, ready:true}] + $r' \
-      "$bundled/.claude-plugin/marketplace.json")
+  # Read the REGISTERED clone first (on disk, no network, and the exact tree
+  # `plugin add` will resolve against), then fall back to fetching the published
+  # manifest — a box that has not run a plugin verb yet has no clone, and
+  # `plugin ls` must still show what is installable.
+  local rows="[]" remote_ok=0 local_mkt=""
+  local_mkt="$(_plugin_mkt_dir)/$(_plugin_registry_name)/.claude-plugin/marketplace.json"
+  if [[ -r "$local_mkt" ]] && jq -e '.plugins' >/dev/null 2>&1 <"$local_mkt"; then
+    remote_ok=1
+    local lname; lname=$(jq -r '.name // "5dive-plugins"' "$local_mkt")
+    rows=$(jq -c --arg m "$lname" --argjson r "$rows" \
+      '$r + [.plugins[]? | {name, description:(.description//""), category:(.category//"-"), marketplace:$m, ready:true}]' \
+      "$local_mkt")
   fi
 
   local base idx
   base=$(_plugin_market_base)
-  if idx=$(curl -fsSL --max-time 15 "${base}/.claude-plugin/marketplace.json" 2>/dev/null) \
+  if (( ! remote_ok )) \
+     && idx=$(curl -fsSL --max-time 15 "${base}/.claude-plugin/marketplace.json" 2>/dev/null) \
      && jq -e '.plugins' >/dev/null 2>&1 <<<"$idx"; then
     remote_ok=1
     local rname; rname=$(jq -r '.name // "5dive-plugins"' <<<"$idx")
@@ -2855,12 +2859,11 @@ cmd_market_plugins() {
       <<<"$idx")
   fi
 
-  # A box with no internet still has the bundled marketplace, so an unreachable
-  # remote degrades to a shorter list rather than to an error. It only fails when
-  # there is genuinely nothing to show.
+  # With one registry there is no offline half-list to degrade to: either the
+  # registered clone is on disk or the manifest fetch worked. Say which is
+  # missing rather than printing an empty table.
   local total; total=$(jq 'length' <<<"$rows")
-  (( total > 0 )) || fail "$E_GENERIC" "no plugins to show — the bundled marketplace is missing and ${base} is unreachable"
-  (( remote_ok )) || warn "could not reach ${base} — showing bundled plugins only"
+  (( total > 0 )) || fail "$E_GENERIC" "no plugins to show — the 5dive-plugins registry is not registered on this box and ${base} is unreachable"
 
   local filtered
   filtered=$(jq -c --arg kw "$(printf '%s' "$kw" | tr '[:upper:]' '[:lower:]')" '

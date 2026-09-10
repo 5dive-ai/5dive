@@ -123,7 +123,23 @@ mkplugin honest   "$(manifest honest 1.0.0 official '["channel","mcp","skill"]')
   mkdir -p "$MKT/honest/skills"
 mkindex
 
-export FIVEDIVE_BUNDLED_PLUGINS="$ROOT/plugins"
+# DIVE-4202: the CLI ships no plugins of its own. The registry arms below resolve
+# through this seam (cmd_plugin.sh _plugin_registry_source), which takes a local
+# path so a unit test never touches the network. With no registry checkout the
+# registry arms are NOT RUN and say so; the fixture arms are unaffected.
+# EXPLICIT ONLY — no sibling-path fallback. `projects/5dive/5dive-plugins` is a
+# SHARED checkout that sits on whatever feature branch someone left it on, so
+# guessing it grades an arbitrary tree and calls the result "the registry". The
+# pre-push rail caught exactly that: the shared checkout had no browser/voice and
+# these arms went red against a tree nobody meant to grade. An unset variable
+# gives a NOT-RUN banner, which is honest; a wrong tree is worse than no tree.
+REGISTRY="${FIVEDIVE_PLUGIN_REGISTRY:-}"
+if [[ -n "$REGISTRY" && -d "$REGISTRY" ]]; then
+  export FIVEDIVE_PLUGIN_REGISTRY="$REGISTRY"
+else
+  REGISTRY=""
+  unset FIVEDIVE_PLUGIN_REGISTRY
+fi
 JSON_MODE=0
 
 # =============================================================================
@@ -317,23 +333,30 @@ run _plugin_mkt_add "$MKT2" --as=fixture2; t "T7c adding a marketplace name that
 t "T7d a local marketplace is COPIED, so the source cannot mutate under it" "yes" \
   "$([[ -f "$(_plugin_mkt_dir)/fixture2/.claude-plugin/marketplace.json" && ! -L "$(_plugin_mkt_dir)/fixture2" ]] && echo yes || echo no)"
 
-# The bundled marketplace is what makes contract §6 literally true on a box with
-# no network and no prior setup.
-t "T7e the CLI's own bundled marketplace registered itself" "true" \
-  "$(jq -r '.["5dive"].bundled // false' "$(_plugin_mkt_json)")"
-t "T7f ...and voice resolves from it" "yes" \
-  "$(_plugin_source_dir 5dive voice >/dev/null 2>&1 && echo yes || echo no)"
-t "T7g ...as an official plugin, so it is the one thing that installs today" "official" \
-  "$(jq -r '.fivedive.trust.review' "$(_plugin_source_dir 5dive voice)/.claude-plugin/plugin.json")"
-# DIVE-4035 added `verb` here. Kept as an EXACT set rather than an `index("channel")`
-# containment check on purpose: voice is the reference implementation, so the arm's
-# job is to notice when the reference shape changes at all, and a containment check
-# would have let `verb` in silently — which is the drift a reference implementation
-# is least able to afford.
-t "T7h ...declaring channel + verb, the shape browser will copy" '["channel","verb"]' \
-  "$(jq -c '.fivedive.capabilities' "$(_plugin_source_dir 5dive voice)/.claude-plugin/plugin.json")"
-t "T7i ...and shipping the executable its verb resolves to (DIVE-4035)" "yes" \
-  "$([[ -x "$(_plugin_source_dir 5dive voice)/bin/voice" ]] && echo yes || echo no)"
+# The registry registering itself is what keeps contract §6 literally true after
+# DIVE-4202 moved voice and browser out of this repo: `plugin add voice` still
+# resolves with no prior setup, from the ONE marketplace instead of a bundled
+# second one.
+if [[ -z "$REGISTRY" ]]; then
+  printf '  !! NOT RUN — T7e-T7i (the registry registers itself, voice resolves)\n'
+  printf '  !! need a 5dive-ai/5dive-plugins checkout. Set FIVEDIVE_PLUGIN_REGISTRY.\n'
+else
+  t "T7e the 5dive-plugins registry registered itself" "true" \
+    "$(jq -r '.["5dive-plugins"].registry // false' "$(_plugin_mkt_json)")"
+  t "T7f ...and voice resolves from it" "yes" \
+    "$(_plugin_source_dir 5dive-plugins voice >/dev/null 2>&1 && echo yes || echo no)"
+  t "T7g ...as an official plugin, so it is the one thing that installs today" "official" \
+    "$(jq -r '.fivedive.trust.review' "$(_plugin_source_dir 5dive-plugins voice)/.claude-plugin/plugin.json")"
+  # DIVE-4035 added `verb` here. Kept as an EXACT set rather than an `index("channel")`
+  # containment check on purpose: voice is the reference implementation, so the arm's
+  # job is to notice when the reference shape changes at all, and a containment check
+  # would have let `verb` in silently — which is the drift a reference implementation
+  # is least able to afford.
+  t "T7h ...declaring channel + verb, the shape browser copies" '["channel","verb"]' \
+    "$(jq -c '.fivedive.capabilities' "$(_plugin_source_dir 5dive-plugins voice)/.claude-plugin/plugin.json")"
+  t "T7i ...and shipping the executable its verb resolves to (DIVE-4035)" "yes" \
+    "$([[ -x "$(_plugin_source_dir 5dive-plugins voice)/bin/voice" ]] && echo yes || echo no)"
+fi
 
 # =============================================================================
 # §7.2 — discovery folds into `market`; it does not become a fourth silo
@@ -341,9 +364,17 @@ t "T7i ...and shipping the executable its verb resolves to (DIVE-4035)" "yes" \
 JSON_MODE=1
 run cmd_market --kind=plugin
 t  "T8a market --kind=plugin answers" "0" "$RC"
-tc "T8b ...and the bundled voice is in it, so discovery and the installer agree" '"name":"voice"' "$OUT"
-t  "T8c ...marked installable right now (it needs no marketplace to be added first)" "true" \
-   "$(jq -r '.data.plugins[] | select(.name=="voice") | .ready' <<<"$OUT")"
+if [[ -z "$REGISTRY" ]]; then
+  # Without a pinned registry checkout `plugin ls` reads the LIVE published
+  # registry over the network, so these two would grade whatever is on the
+  # registry's main today rather than the tree under test — green or red for
+  # reasons that have nothing to do with this diff.
+  printf '  !! NOT RUN — T8b/T8c (voice in the discovery list) need a registry checkout.\n'
+else
+  tc "T8b ...and the registry's voice is in it, so discovery and the installer agree" '"name":"voice"' "$OUT"
+  t  "T8c ...marked installable right now (it needs no marketplace to be added first)" "true" \
+     "$(jq -r '.data.plugins[] | select(.name=="voice") | .ready' <<<"$OUT")"
+fi
 JSON_MODE=0
 run cmd_market --kind=banana; t "T8d an unknown --kind is refused rather than silently browsing agents" "$E_USAGE" "$RC"
 # Regression control: the persona market is the pre-existing behaviour of this
@@ -379,54 +410,33 @@ t  "T9c ...and the command was PRINTED, NOT EXECUTED (the whole design in one ar
 # The bundled voice plugin is the live instance of that, so grade the real file
 # rather than only the fixture: if someone later drops the setup block from
 # voice, or points it at something other than the host installer, this reds.
-VOICE="$(_plugin_source_dir 5dive voice)/.claude-plugin/plugin.json"
-t "T9d voice names the real host installer, not a placeholder" "sudo 5dive-setup-voice" \
-  "$(jq -r '.fivedive.setup.command' "$VOICE")"
-t "T9e voice asks for audio, which is what makes its consent screen honest" "true" \
-  "$(jq -r '[.fivedive.grants[]] | index("audio-io") != null' "$VOICE")"
+if [[ -z "$REGISTRY" ]]; then
+  printf '  !! NOT RUN — T9d/T9e (the real voice manifest) need a registry checkout.\n'
+else
+  VOICE="$(_plugin_source_dir 5dive-plugins voice)/.claude-plugin/plugin.json"
+  t "T9d voice names the real host installer, not a placeholder" "sudo 5dive-setup-voice" \
+    "$(jq -r '.fivedive.setup.command' "$VOICE")"
+  t "T9e voice asks for audio, which is what makes its consent screen honest" "true" \
+    "$(jq -r '[.fivedive.grants[]] | index("audio-io") != null' "$VOICE")"
+fi
 
 # =============================================================================
-# T10 — install.sh's staging list vs what plugins/ actually contains
+# T10 — RETIRED by DIVE-4202: install.sh stages no plugins
 # =============================================================================
-# $REPO is a flat fetch URL with no directory listing, so install.sh must
-# ENUMERATE every bundled plugin file by hand — the same constraint the
-# team-templates block carries, and the same drift hazard: add
-# plugins/voice/hooks.json, forget the install.sh line, and every box gets a
-# marketplace that lists voice and then cannot resolve part of it.
+# T10a-d graded install.sh's per-file bundled-plugin staging list against what
+# plugins/ contained, plus the partial-download guard around it. This repo ships
+# no plugins/ any more — they are published to 5dive-ai/5dive-plugins and the
+# installer stages nothing — so there is no list to drift and no guard to run.
 #
-# This is a set comparison against the real directory, not a grep for a line, so
-# it reds on the file that was ADDED rather than only on the line that was
-# removed — which is the direction the drift actually goes.
-staged=$(sed -n 's|.*for _pf in \(.*\); do.*|\1|p' install.sh | tr ' ' '\n' | sort)
-onDisk=$(cd plugins && find . -type f | sed 's|^\./||' | sort)
-t "T10a install.sh stages exactly the files plugins/ contains (add a file, add its line)" \
-  "$onDisk" "$staged"
-t "T10b ...and the list is non-empty, so T10a cannot pass by comparing two blanks" "yes" \
-  "$([[ -n "$staged" ]] && echo yes || echo no)"
-# A half-staged marketplace is worse than an absent one: the index lists voice and
-# the resolver then fails on its manifest, which reads as broken rather than
-# missing. So the partial must be REMOVED.
+# The question those arms were standing in for ("does the plugin we ship
+# actually install on a fresh box") is not dropped: it moved UP to execution, in
+# scripts/install-contract.sh, which enumerates the REGISTRY's manifest and runs
+# `plugin add` on a freshly installed container. A file-list comparison was
+# always the weaker instrument (DIVE-4126 shipped green past it); it is gone
+# because its subject is gone, not because it was inconvenient.
 #
-# This arm EXTRACTS that branch and RUNS it, rather than grepping for the
-# `rm -rf` line. A grep would have passed on `: # rm -rf "$LIB_DIR/plugins"` —
-# measured: mutant M14 commented the line out and the substring arm stayed green,
-# which is the "a grep reds on its own explanatory comment" trap from DIVE-3754
-# pointing the other way. Running the branch cannot be fooled by a comment.
-plug_fail_branch=$(awk '/# >>> bundled-plugins partial guard/,/# <<< bundled-plugins partial guard/' install.sh)
-if [[ -z "$plug_fail_branch" ]]; then
-  FAIL=$((FAIL+1)); printf 'FAIL: T10c-extract could not find the partial-download branch in install.sh\n'
-else
-  PASS=$((PASS+1))
-  probe="$TMP/libdir"; mkdir -p "$probe/plugins/voice"
-  ( LIB_DIR="$probe"; _plug_ok=0; ok() { :; }; eval "$plug_fail_branch" ) >/dev/null 2>&1
-  t "T10c a partial download is REMOVED, not left half-staged (branch executed, not grepped)" \
-    "no" "$([[ -d "$probe/plugins" ]] && echo yes || echo no)"
-  # Negative control: the same branch must NOT delete a COMPLETE staging.
-  probe2="$TMP/libdir2"; mkdir -p "$probe2/plugins/voice"
-  ( LIB_DIR="$probe2"; _plug_ok=1; ok() { :; }; eval "$plug_fail_branch" ) >/dev/null 2>&1
-  t "T10d ...and a complete staging survives it (control: T10c is not passing by deleting always)" \
-    "yes" "$([[ -d "$probe2/plugins" ]] && echo yes || echo no)"
-fi
+# T13 below keeps the identical shape for TEAM TEMPLATES, which install.sh does
+# still stage — so the technique is still exercised and still under control.
 
 # =============================================================================
 # T13 — install.sh's TEMPLATE staging list vs team-templates/index.json
@@ -525,8 +535,12 @@ tc "T12d ...naming the state the user is actually in" "no other version" "$ERR"
 ( STATE_DIR="$TMP/bootstrap-fresh"; run_e _plugin_ensure_store; printf '%s' "$RC" > "$TMP/.bootrc" )
 t "T12e the bootstrap returns success on a FRESH store, so its callers survive errexit" \
   "0" "$(cat "$TMP/.bootrc" 2>/dev/null)"
-t "T12e2 ...and it really did register the bundled marketplace (the arm is not grading an early return)" "true" \
-  "$(jq -r '.["5dive"].bundled // false' "$TMP/bootstrap-fresh/plugins/marketplaces.json" 2>/dev/null)"
+if [[ -z "$REGISTRY" ]]; then
+  printf '  !! NOT RUN — T12e2 (the bootstrap really registered the registry) needs a registry checkout.\n'
+else
+  t "T12e2 ...and it really did register the registry (the arm is not grading an early return)" "true" \
+    "$(jq -r '.["5dive-plugins"].registry // false' "$TMP/bootstrap-fresh/plugins/marketplaces.json" 2>/dev/null)"
+fi
 
 # quinn measured this on a FRESH box: the built-in hint never fired, because it
 # sat behind the trust gate, which sits behind manifest resolution, which needs

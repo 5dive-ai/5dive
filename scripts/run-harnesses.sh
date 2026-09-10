@@ -65,6 +65,32 @@
 set -uo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." || exit 2
 
+# DIVE-4202 — the plugin corpus is no longer inside this repo.
+#
+# `voice` and `browser` moved to 5dive-ai/5dive-plugins with every other plugin,
+# so the harnesses that grade "does the plugin we publish actually install"
+# resolve their subject through $FIVEDIVE_PLUGIN_REGISTRY (a local checkout;
+# never a network fetch from inside a unit test). Without it those arms print a
+# NOT-RUN banner and grade nothing — which is silence, not a green, and on CI
+# silence is exactly what must not happen.
+#
+# So on CI, and ONLY on CI, fetch it once here rather than in each of the six
+# jobs that call this script. The registry is public (install.sh already curls
+# it unauthenticated), so this needs no token. A failure is not fatal: the
+# harnesses still run and still say the arms did not, which is a louder and more
+# accurate report than aborting the whole tier over a plugin corpus.
+if [[ -z "${FIVEDIVE_PLUGIN_REGISTRY:-}" && -n "${CI:-}" ]]; then
+  _reg="${RUNNER_TEMP:-/tmp}/5dive-plugins-registry"
+  _org="${GITHUB_REPOSITORY_OWNER:-5dive-ai}"
+  if [[ -d "$_reg/.claude-plugin" ]] \
+     || timeout 60 git clone --quiet --depth 1           "https://github.com/$_org/5dive-plugins.git" "$_reg" 2>/dev/null; then
+    export FIVEDIVE_PLUGIN_REGISTRY="$_reg"
+    printf 'plugin registry: %s @ %s\n' "$_reg" "$(git -C "$_reg" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  else
+    printf 'plugin registry: UNRESOLVED — the registry arms will report NOT RUN\n' >&2
+  fi
+fi
+
 # DIVE-3077 — RAISE A SIGNAL THE BOARD-WRITE FENCE READS. `_task_human_send_allowed`
 # (DIVE-1506) has refused on FIVEDIVE_TEST since it was written; measured across the
 # 344-harness corpus on 2026-08-09, FIVEDIVE_TEST was set by ZERO files and
