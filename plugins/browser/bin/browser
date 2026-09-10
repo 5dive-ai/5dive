@@ -44,6 +44,15 @@ usage() {
   5dive browser status [site]         # per-site auth state (run on a SCHEDULE)
   5dive browser ls                    # profiles, and when each was last seen alive
 
+  On a managed box there is no display, so the browser lives on one:
+  5dive browser serve <site>          # persistent Chrome on its own Xvfb (server mode)
+  5dive browser serve <site> --stop   # stop the browser; the profile survives
+  5dive browser viewer <site> --bind=<session> [--ttl=600]
+                                      # mint a ONE-TIME, expiring link a person logs in through
+  5dive browser viewer-redeem <site> --nonce=- --session=<id>
+                                      # the relay's gate: consumes the link, prints the loopback target
+  5dive browser viewer-revoke <site>  # kill the view; the browser stays logged in
+
   A security challenge (CAPTCHA, 2FA, "unusual activity") is a HARD STOP that asks
   for a person. 5dive does not attempt to solve one. What this is: persistent
   human-authenticated sessions — not anti-bot bypassing.
@@ -95,6 +104,15 @@ _require_store() {
   _audit "$(_seat_dir)" 700 || die "$E_UNAVAILABLE" "no profile directory for seat '$(_seat)' at $(_seat_dir). Create it once: $SETUP_CMD"
 }
 
+_ensure_profile_dir() {
+  local d="$1"
+  if [[ -d "$d" ]]; then
+    _audit "$d" 700          # existed: grade it, do not launder it
+  else
+    mkdir -p "$d"; chmod 700 "$d"; _audit "$d" 700
+  fi
+}
+
 cmd_setup() {
   [[ "$(id -u)" == 0 ]] || die "$E_PERM" "setup creates a root-owned store and a seat-owned subdirectory under it. Run: $SETUP_CMD"
   local seat; seat="$(_seat)"
@@ -135,8 +153,7 @@ cmd_auth() {
   _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name (lowercase letters, digits, . _ -)"
   _require_store
   local dir; dir="$(_site_dir "$site")"
-  mkdir -p "$dir"; chmod 700 "$dir"
-  _audit "$dir" 700
+  _ensure_profile_dir "$dir"
 
   local chrome; chrome=$(_chrome) || die "$E_UNAVAILABLE" "no Chrome or Chromium on this box — auth hands a real browser to a human and there is nothing to hand over."
 
@@ -145,9 +162,16 @@ cmd_auth() {
   # persistent human-authenticated browser session. It is NOT anti-bot bypassing,
   # and describing it that way invites exposure the design itself avoids.
   printf 'Opening a browser for %s.\n\n  profile: %s\n\nLog in yourself. 5dive never sees the password, and there is nothing here that\ntypes one. Close the window when you are logged in.\n\n' "$site" "$dir"
+  # NO DISPLAY IS THE NORMAL CASE, NOT THE ERROR CASE. A managed box has no
+  # display and never will; 4021 refused here and that refusal is what turned a
+  # one-click product into "forward an X display over ssh". Server mode is the
+  # default path now, and the old refusal survives only as the message a box
+  # without the server-mode packages gets — where it is true.
   if [[ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
-    printf 'No display on this box, so the window cannot open HERE. Forward one and re-run,\nor run this on your own machine against the same profile path.\n' >&2
-    return $E_UNAVAILABLE
+    printf 'No display here, so the browser runs on this box and you reach it through a\none-time link. Starting it:\n\n' >&2
+    cmd_serve "$site" >&2
+    printf '\nNow ask for a viewer link (the dashboard does this for you):\n  5dive browser viewer %s --bind=<your dashboard session>\n' "$site" >&2
+    return 0
   fi
   "$chrome" --user-data-dir="$dir" --no-first-run --no-default-browser-check "$(_site_url "$site")"
 }
@@ -362,6 +386,317 @@ cmd_run() {
   return 1
 }
 
+
+# =========================================================== server mode (DIVE-4118)
+#
+# WHY THIS EXISTS. DIVE-4021 shipped `auth` as "open a real Chromium and REFUSE
+# without a display". On a MANAGED box there is never a display, so the shipped
+# shape asked a paying customer for `ssh -X`, `apt install chromium` and a
+# hand-written JSON file. lodar, 2026-09-09: "thats too difficult for customers."
+#
+# Server mode is the answer 4021's own design already named as the DEFAULT: the
+# profile's Chrome lives on a persistent Xvfb display owned by the seat, and a
+# human reaches it — to log in the first time, and to re-auth when the session
+# dies — through a viewer that is handed out as a ONE-TIME, TIME-BOUND,
+# SESSION-BOUND ticket.
+#
+# THE QUESTION 4021 LEFT OPEN, answered here: what protects the session WHILE the
+# viewer is open? A viewer onto a logged-in profile is not a screenshot, it is
+# the credential itself with a keyboard attached. Five things, and every one of
+# them fails closed:
+#
+#   1. NOTHING LISTENS OFF-BOX. Xvfb runs -nolisten tcp; x11vnc binds -localhost;
+#      the websocket bridge binds 127.0.0.1. The viewer reaches the customer
+#      through the box's already-authenticated relay, never a port we opened.
+#   2. THE TICKET IS A NONCE WE DO NOT KEEP. 32 bytes of urandom; the ticket file
+#      stores only SHA-256 of it (gate-human-nonce-spec's rule, same reason: a
+#      stored secret is a stealable secret). The raw value exists exactly once,
+#      in the URL we print, and reading it back off this box is impossible.
+#   3. IT IS SINGLE-USE. Redeeming consumes the ticket, in one file rename that
+#      cannot interleave. A second redemption of a leaked URL gets nothing —
+#      which is the property a TTL alone can never give you.
+#   4. IT IS BOUND TO THE SESSION THAT ASKED. --bind names the dashboard session
+#      the ticket was minted for; a redemption presenting a different one is
+#      refused. A URL pasted into another browser is inert even inside its TTL.
+#   5. IT EXPIRES IN MINUTES AND THE NONCE NEVER TOUCHES ARGV. /proc/<pid>/cmdline
+#      is not a secret store, so redeem reads the nonce from STDIN and REFUSES a
+#      nonce passed as an argument rather than quietly accepting it.
+#
+# Killing the viewer does NOT kill the browser: the profile is the durable thing
+# and the view onto it is the ephemeral thing. That asymmetry is the design.
+
+VIEWER_TTL_DEFAULT=600
+VIEWER_TTL_MAX=3600
+VIEWER_TTL_MIN=60
+
+_serve_pidfile()  { echo "$1/.5dive-serve"; }
+_viewer_ticket()  { echo "$1/.5dive-viewer.ticket"; }
+_viewer_pidfile() { echo "$1/.5dive-viewer"; }
+
+_have() { command -v "$1" >/dev/null 2>&1; }
+
+# Loopback only. Nothing here ever binds 0.0.0.0 — the viewer reaches the customer
+# through the box's already-authenticated relay, not through a port we opened.
+_free_port() {
+  local p="$1" tries=0
+  while (( tries < 200 )); do
+    if ! { exec 9<>"/dev/tcp/127.0.0.1/$p"; } 2>/dev/null; then echo "$p"; return 0; fi
+    exec 9>&- 2>/dev/null || true
+    p=$(( p + 1 )); tries=$(( tries + 1 ))
+  done
+  return 1
+}
+
+# Fail closed, and NAME what is missing. A managed box is provisioned with these;
+# a box without them must say so out loud, because the alternative is a customer
+# clicking Connect and watching nothing happen.
+_serve_requires() {
+  local missing=()
+  _have Xvfb || missing+=("Xvfb (xvfb)")
+  _chrome >/dev/null || missing+=("chromium")
+  (( ${#missing[@]} == 0 )) && return 0
+  die "$E_UNAVAILABLE" "this box cannot run a server-mode browser: missing $(printf "%s, " "${missing[@]}" | sed "s/, $//"). A managed 5dive box installs these at provision time; on a self-hosted box install them once."
+}
+_viewer_requires() {
+  local missing=()
+  _have x11vnc || missing+=("x11vnc")
+  _have websockify || missing+=("websockify (novnc)")
+  (( ${#missing[@]} == 0 )) && return 0
+  die "$E_UNAVAILABLE" "this box cannot hand out a browser viewer: missing $(printf "%s, " "${missing[@]}" | sed "s/, $//"). Without it the only way in is a display forwarded over ssh, which is the thing server mode exists to remove."
+}
+
+# A display number that is stable per seat+site, so a reconnect finds the SAME
+# Chrome rather than starting a second one on the same profile directory. Two
+# Chromes on one --user-data-dir corrupt it; the lockfile below is what actually
+# enforces one, this only picks a number that rarely collides.
+_display_num() {
+  local h; h=$(printf '%s' "$(_seat)/$1" | sha256sum | cut -c1-4)
+  echo $(( 0x$h % 400 + 100 ))
+}
+# The X socket directory is a PATH, not a verdict: overriding it cannot make a
+# dead display read as live, because liveness is the Xvfb PID (_serve_running).
+X11_SOCKET_DIR="${FIVEDIVE_BROWSER_X11_DIR:-/tmp/.X11-unix}"
+_display_socket() { [[ -e "$X11_SOCKET_DIR/X$1" ]]; }
+_display_free()   { ! _display_socket "$1"; }
+
+_serve_running() {  # _serve_running <dir> -> echoes display, 0 if live
+  local f; f="$(_serve_pidfile "$1")"
+  [[ -f "$f" ]] || return 1
+  local xpid cpid disp; xpid=$(_kv "$f" xvfb_pid); cpid=$(_kv "$f" chrome_pid); disp=$(_kv "$f" display)
+  [[ -n "$xpid" && -n "$cpid" ]] || return 1
+  kill -0 "$xpid" 2>/dev/null && kill -0 "$cpid" 2>/dev/null || return 1
+  echo "$disp"; return 0
+}
+
+_kv() { [[ -f "$1" ]] && sed -n "s/^$2=//p" "$1" | head -1; }
+
+cmd_serve() {
+  local site="" stop=0
+  while (($#)); do
+    case "$1" in
+      --stop) stop=1 ;;
+      -h|--help) usage; return 0 ;;
+      -*) die "$E_USAGE" "unknown flag: $1" ;;
+      *) site="$1" ;;
+    esac; shift
+  done
+  [[ -n "$site" ]] || die "$E_USAGE" "which site? e.g. 5dive browser serve linkedin"
+  _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
+  _require_store
+  local dir; dir="$(_site_dir "$site")"
+  _ensure_profile_dir "$dir"
+
+  if (( stop )); then
+    _viewer_stop "$dir"
+    local f; f="$(_serve_pidfile "$dir")"
+    local xpid cpid; xpid=$(_kv "$f" xvfb_pid); cpid=$(_kv "$f" chrome_pid)
+    [[ -n "$cpid" ]] && kill "$cpid" 2>/dev/null
+    [[ -n "$xpid" ]] && kill "$xpid" 2>/dev/null
+    rm -f "$f"
+    printf 'stopped the %s browser. The profile is untouched — it is the durable half.\n' "$site"
+    return 0
+  fi
+
+  local disp
+  if disp=$(_serve_running "$dir"); then
+    printf 'already serving %s on :%s\n' "$site" "$disp"; return 0
+  fi
+  _serve_requires
+
+  disp=$(_display_num "$site")
+  local tries=0
+  while ! _display_free "$disp"; do
+    disp=$(( disp + 1 )); tries=$(( tries + 1 ))
+    (( tries < 50 )) || die "$E_UNAVAILABLE" "no free X display in the seat's range"
+  done
+
+  # -nolisten tcp: the display is a unix socket and nothing else. An X server on
+  # a TCP port is an unauthenticated remote keyboard for every seat on the box.
+  Xvfb ":$disp" -screen 0 1280x800x24 -nolisten tcp >/dev/null 2>&1 &
+  local xpid=$!
+  local waited=0
+  while ! _display_socket "$disp" && (( waited < 300 )); do waited=$(( waited + 1 )); sleep 0.05; done
+  kill -0 "$xpid" 2>/dev/null || die "$E_UNAVAILABLE" "Xvfb did not start on :$disp"
+
+  local chrome; chrome=$(_chrome)
+  DISPLAY=":$disp" "$chrome" --user-data-dir="$dir" --no-first-run \
+      --no-default-browser-check --window-size=1280,800 \
+      --disable-features=TranslateUI "$(_site_url "$site")" >/dev/null 2>&1 &
+  local cpid=$!
+
+  ( umask 077; printf 'display=%s\nxvfb_pid=%s\nchrome_pid=%s\nstarted_at=%s\n' \
+      "$disp" "$xpid" "$cpid" "$(date -u +%s)" > "$(_serve_pidfile "$dir")" )
+  printf 'serving %s on :%s (persistent — the profile outlives every viewer)\n' "$site" "$disp"
+}
+
+# ------------------------------------------------------------------ the viewer
+_viewer_stop() {
+  local dir="$1" f; f="$(_viewer_pidfile "$dir")"
+  local p
+  for p in $(_kv "$f" vnc_pid) $(_kv "$f" ws_pid); do kill "$p" 2>/dev/null; done
+  rm -f "$f"
+}
+
+# A ticket is minted, printed ONCE, and never recoverable. The file holds the
+# HASH; if this box is later read by anyone, there is no viewer URL in it.
+cmd_viewer() {
+  local site="" ttl="$VIEWER_TTL_DEFAULT" bind=""
+  while (($#)); do
+    case "$1" in
+      --ttl=*)  ttl="${1#*=}" ;;
+      --bind=*) bind="${1#*=}" ;;
+      -h|--help) usage; return 0 ;;
+      -*) die "$E_USAGE" "unknown flag: $1" ;;
+      *) site="$1" ;;
+    esac; shift
+  done
+  [[ -n "$site" ]] || die "$E_USAGE" "which site? e.g. 5dive browser viewer linkedin --bind=<dashboard session>"
+  _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
+  # BINDING IS MANDATORY. An unbound ticket is a bearer credential for a live
+  # logged-in session, and "we will add the binding later" is how it ships as one
+  # forever. `--bind=local` is the explicit, named escape for a hand-run on the
+  # box; there is no implicit one.
+  [[ -n "$bind" ]] || die "$E_USAGE" "--bind=<dashboard session id> is required: the viewer is a live keyboard on a logged-in profile, so a ticket anyone can redeem is the credential itself. Use --bind=local for a hand-run on this box."
+  [[ "$bind" =~ ^[A-Za-z0-9._:-]{1,128}$ ]] || die "$E_USAGE" "--bind must be a short opaque session id"
+  [[ "$ttl" =~ ^[0-9]+$ ]] || die "$E_USAGE" "--ttl is seconds"
+  (( ttl >= VIEWER_TTL_MIN )) || die "$E_USAGE" "--ttl below ${VIEWER_TTL_MIN}s is not long enough for a person to log in"
+  (( ttl <= VIEWER_TTL_MAX )) || die "$E_USAGE" "--ttl above ${VIEWER_TTL_MAX}s: this is a re-auth window, not a session. The browser persists; the VIEW does not."
+
+  _require_store
+  local dir; dir="$(_site_dir "$site")"
+  [[ -d "$dir" ]] || die "$E_UNAVAILABLE" "no profile for $site — 5dive browser serve $site"
+  _audit "$dir" 700
+
+  local disp
+  disp=$(_serve_running "$dir") || die "$E_UNAVAILABLE" "no browser is serving $site — start it first: 5dive browser serve $site"
+  _viewer_requires
+
+  # Replacing a ticket revokes the previous one. Two live tickets on one profile
+  # is two answers to "who is allowed in right now".
+  _viewer_stop "$dir"
+
+  local port vncport
+  port=$(_free_port 6080) || die "$E_UNAVAILABLE" "no free loopback port for the viewer bridge"
+  vncport=$(_free_port 5900) || die "$E_UNAVAILABLE" "no free loopback port for the display server"
+
+  local nonce hash vncpw
+  nonce=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  hash=$(printf '%s' "$nonce" | sha256sum | cut -d' ' -f1)
+  vncpw=$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')
+
+  # -localhost and -once: the VNC side is reachable only from this box, and it
+  # accepts exactly one client. The second connection on a leaked URL is refused
+  # by x11vnc itself, not merely by our bookkeeping.
+  local pwfile="$dir/.5dive-viewer.pw"
+  ( umask 077; printf '%s\n' "$vncpw" > "$pwfile" )
+  x11vnc -display ":$disp" -localhost -once -rfbport "$vncport" \
+         -timeout 30 -passwdfile "$pwfile" >/dev/null 2>&1 &
+  local vncpid=$!
+  websockify "127.0.0.1:$port" "127.0.0.1:$vncport" >/dev/null 2>&1 &
+  local wspid=$!
+
+  ( umask 077; printf 'vnc_pid=%s\nws_pid=%s\nport=%s\nvnc_port=%s\n' "$vncpid" "$wspid" "$port" "$vncport" > "$(_viewer_pidfile "$dir")" )
+
+  local expires=$(( $(date -u +%s) + ttl ))
+  ( umask 077; printf 'hash=%s\nexpires_at=%s\nbind=%s\nstate=open\nminted_at=%s\nport=%s\n' \
+      "$hash" "$expires" "$bind" "$(date -u +%s)" "$port" > "$(_viewer_ticket "$dir")" )
+  chmod 600 "$(_viewer_ticket "$dir")"
+
+  printf '/browser/viewer/%s/%s\n' "$site" "$nonce"
+  printf 'one-time, expires %s, bound to session %s. Redeeming it consumes it.\n' \
+    "$(date -u -d "@$expires" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "in ${ttl}s")" "$bind" >&2
+}
+
+# Redemption is the whole security boundary, so it is one verb with one answer.
+# The relay calls this before it bridges a websocket; if this exits non-zero the
+# relay must serve nothing.
+cmd_viewer_redeem() {
+  local site="" session="" nonce_from_argv=0
+  while (($#)); do
+    case "$1" in
+      --session=*) session="${1#*=}" ;;
+      --nonce=-)   : ;;                 # the only accepted form: read from stdin
+      --nonce=*)   nonce_from_argv=1 ;;
+      -h|--help) usage; return 0 ;;
+      -*) die "$E_USAGE" "unknown flag: $1" ;;
+      *) site="$1" ;;
+    esac; shift
+  done
+  # /proc/<pid>/cmdline is readable by other seats on a default Linux box, so a
+  # nonce on the command line is a nonce in a world-readable file for the life of
+  # the process. Refuse it rather than accept it and hope.
+  (( nonce_from_argv )) && die "$E_USAGE" "the viewer nonce must arrive on STDIN, not in argv — every seat on this box can read /proc/<pid>/cmdline. Use: ... | 5dive browser viewer-redeem $site --nonce=- --session=<id>"
+  [[ -n "$site" ]] || die "$E_USAGE" "usage: 5dive browser viewer-redeem <site> --nonce=- --session=<id>"
+  _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
+  [[ -n "$session" ]] || die "$E_USAGE" "--session=<id> is required: a ticket is bound to the session that asked for it"
+
+  _require_store
+  local dir; dir="$(_site_dir "$site")"
+  _audit "$dir" 700
+  local tf; tf="$(_viewer_ticket "$dir")"
+  [[ -f "$tf" ]] || die "$E_PERM" "no viewer ticket for $site"
+
+  local presented; IFS= read -r presented || true
+  [[ -n "$presented" ]] || die "$E_PERM" "no nonce on stdin"
+
+  local state hash expires bind port
+  state=$(_kv "$tf" state); hash=$(_kv "$tf" hash)
+  expires=$(_kv "$tf" expires_at); bind=$(_kv "$tf" bind); port=$(_kv "$tf" port)
+
+  # SINGLE USE FIRST. A consumed ticket must not even leak whether the nonce was
+  # right, and checking state last is how a "used" ticket becomes an oracle.
+  [[ "$state" == open ]] || { _viewer_stop "$dir"; die "$E_PERM" "that viewer link has already been used (state: $state). Links are one-time by design — ask the dashboard for a new one."; }
+  (( $(date -u +%s) < expires )) || { _viewer_revoke_file "$dir" expired; _viewer_stop "$dir"; die "$E_PERM" "that viewer link expired. Ask the dashboard for a new one; the browser session itself is untouched."; }
+  [[ "$session" == "$bind" ]] || die "$E_PERM" "that viewer link was issued to a different dashboard session. Refusing: a link pasted somewhere else is exactly what the binding exists to stop."
+
+  local got; got=$(printf '%s' "$presented" | sha256sum | cut -d' ' -f1)
+  [[ "$got" == "$hash" ]] || die "$E_PERM" "that viewer link is not valid for $site."
+
+  _viewer_revoke_file "$dir" consumed
+  printf '127.0.0.1:%s\n' "$port"
+}
+
+_viewer_revoke_file() {
+  local dir="$1" newstate="$2" tf; tf="$(_viewer_ticket "$dir")"
+  [[ -f "$tf" ]] || return 0
+  local tmp="$tf.$$"
+  ( umask 077; sed "s/^state=.*/state=$newstate/" "$tf" > "$tmp" ) && mv -f "$tmp" "$tf"
+  chmod 600 "$tf" 2>/dev/null || true
+}
+
+cmd_viewer_revoke() {
+  local site="${1:-}"
+  [[ -n "$site" ]] || die "$E_USAGE" "usage: 5dive browser viewer-revoke <site>"
+  _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
+  _require_store
+  local dir; dir="$(_site_dir "$site")"
+  _audit "$dir" 700
+  _viewer_revoke_file "$dir" revoked
+  _viewer_stop "$dir"
+  rm -f "$dir/.5dive-viewer.pw"
+  printf 'viewer for %s revoked. The browser keeps running and stays logged in.\n' "$site"
+}
+
 case "${1:-}" in
   -h|--help|help|"") usage ;;
   setup) shift; cmd_setup "$@" ;;
@@ -369,5 +704,9 @@ case "${1:-}" in
   status) shift; _auth_status "${1:-}" ;;
   ls)    shift; cmd_ls    "$@" ;;
   run)   shift; cmd_run   "$@" ;;
+  serve) shift; cmd_serve "$@" ;;
+  viewer) shift; cmd_viewer "$@" ;;
+  viewer-redeem) shift; cmd_viewer_redeem "$@" ;;
+  viewer-revoke) shift; cmd_viewer_revoke "$@" ;;
   *) die "$E_USAGE" "unknown: $PROG $1 (see: $PROG --help)" ;;
 esac

@@ -20,6 +20,49 @@ than a detail.
 5dive browser run <site> <action> [--key=value ...]
 ```
 
+## Server mode: the browser lives on the box, you reach it through a one-time link
+
+On a managed 5dive VM there is no display and there never will be one. `auth` used to refuse
+there, and the only route past that refusal was `ssh -X` + `apt install chromium` + a hand-written
+JSON file — which is not a product a customer can use.
+
+So the browser runs **on the box**, on a persistent Xvfb display owned by the seat, and a person
+reaches it through a viewer that is handed out as a **one-time, expiring, session-bound** ticket:
+
+```
+5dive browser serve <site>                                   # persistent Chrome on its own Xvfb
+5dive browser serve <site> --stop                            # stop the browser; the profile survives
+5dive browser viewer <site> --bind=<session> [--ttl=600]     # mint a one-time link
+5dive browser viewer-redeem <site> --nonce=- --session=<id>  # the relay's gate; consumes the link
+5dive browser viewer-revoke <site>                           # kill the view, keep the login
+```
+
+`auth` on a display-less box starts server mode instead of dead-ending. A box that does not have
+the server-mode packages still refuses — and names which ones it lacks, rather than half-starting.
+
+### What protects the session while the viewer is open
+
+A viewer onto a logged-in profile is not a screenshot; it is the credential with a keyboard
+attached. Five properties, each of which fails closed:
+
+1. **Nothing listens off-box.** `Xvfb -nolisten tcp`, `x11vnc -localhost -once`, the bridge on
+   `127.0.0.1`. Redemption returns a loopback target; the customer arrives through the box's
+   already-authenticated relay, never through a port we opened.
+2. **The ticket is a nonce we do not keep.** 32 bytes of urandom, stored only as its SHA-256 — the
+   same rule the human-gate nonces use, for the same reason. The raw value exists once, in the line
+   printed to whoever asked.
+3. **It is single-use.** A TTL cannot close a replay inside its own window; consuming the ticket
+   can. The spent-state check runs *before* the nonce compare, so a used ticket is not an oracle.
+4. **It is bound to the session that asked.** `--bind` is mandatory; there is no implicit unbound
+   ticket, because an unbound one is a bearer credential for a live logged-in account.
+   `--bind=local` is the named escape for a hand-run on the box. A refused redemption from the
+   wrong session does not spend the ticket for the right one.
+5. **The nonce never enters argv.** `/proc/<pid>/cmdline` is readable by other seats, so
+   `viewer-redeem` takes the nonce on **stdin** and refuses `--nonce=<value>` outright.
+
+**Killing the viewer does not kill the browser.** The profile is the durable half; the view onto it
+is the ephemeral half. `viewer-revoke` ends the view and the session stays logged in.
+
 ## The auth model
 
 `5dive browser auth <site>` opens a browser profile dedicated to that site and you log in

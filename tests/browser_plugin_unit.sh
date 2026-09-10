@@ -365,5 +365,185 @@ t 'T7c ...and uses only the fixed vocabulary' '' \
 t 'T7d ...and its probe marker is the one bin/browser reads' 'yes' \
   "$(jq -e '.probe.logged_out_when_dom_matches' "$EX" >/dev/null && echo yes || echo no)"
 
+
+# ================================== T10 server mode + the one-time viewer (DIVE-4118)
+#
+# The viewer is a live keyboard on a logged-in profile, so every arm here is a
+# MUTANT of a way that keyboard gets handed to the wrong person:
+#
+#   T10b  the ticket file keeps the raw nonce  -> a stolen box is a stolen session
+#   T10e  a leaked URL is replayable           -> a TTL alone never closes this
+#   T10f  the URL works past its expiry
+#   T10g  the URL works in a DIFFERENT session -> pasted-link theft
+#   T10h  the nonce is accepted from argv      -> /proc/<pid>/cmdline is not a vault
+#   T10i  a wrong nonce is accepted
+#   T10j  revoke leaves the ticket redeemable
+#   T10c  a box missing the packages half-starts instead of saying so
+#   T10k  a viewer is minted with no session binding at all
+#
+# There is no X server on a CI runner, so Xvfb/x11vnc/websockify are FAKES on
+# PATH. They are not product hooks: liveness is still the real PID check in
+# _serve_running, and redemption is the real sha256 compare. The only override is
+# the X socket DIRECTORY, which is a path — pointing it somewhere else cannot make
+# a dead display read as live.
+SBIN="$TMP/sbin"; mkdir -p "$SBIN"
+export FIVEDIVE_BROWSER_X11_DIR="$TMP/x11"; mkdir -p "$FIVEDIVE_BROWSER_X11_DIR"
+cat > "$SBIN/Xvfb" <<XVFB
+#!/usr/bin/env bash
+d="\${1#:}"
+: > "$TMP/x11/X\$d"
+exec sleep 300
+XVFB
+cat > "$SBIN/x11vnc" <<'VNC'
+#!/usr/bin/env bash
+exec sleep 300
+VNC
+cat > "$SBIN/websockify" <<'WS'
+#!/usr/bin/env bash
+exec sleep 300
+WS
+chmod +x "$SBIN/Xvfb" "$SBIN/x11vnc" "$SBIN/websockify"
+
+# The fake chrome above exits immediately (it cats a DOM). Server mode needs a
+# chrome that STAYS UP, because "is the browser still serving" is a live PID.
+SRVBIN="$TMP/srvbin"; mkdir -p "$SRVBIN"
+cat > "$SRVBIN/google-chrome" <<'SRVC'
+#!/usr/bin/env bash
+for a in "$@"; do case "$a" in --headless) exec sleep 0 ;; esac; done
+exec sleep 300
+SRVC
+chmod +x "$SRVBIN/google-chrome"
+SPATH="$SRVBIN:$SBIN:$PATH"
+
+mkprofile viewsite "$LIVE_DOM" >/dev/null
+VDIR="$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/viewsite"
+
+# --- T10a a display-less box SERVES instead of refusing -----------------------
+run env PATH="$SPATH" DISPLAY= "$BROWSER" serve viewsite
+t  'T10a serve starts on a box with no display' 0 "$RC"
+tc 'T10a ...and says which display it took' 'serving viewsite on :' "$OUT"
+t  'T10a ...and records a live browser' '0' "$(env PATH="$SPATH" bash -c '
+     f='"$VDIR"'/.5dive-serve; kill -0 "$(sed -n s/^chrome_pid=//p "$f")" 2>/dev/null && echo 0 || echo 1')"
+run env PATH="$SPATH" DISPLAY= "$BROWSER" serve viewsite
+tc 'T10a ...and a second serve REUSES it, never a second chrome on one profile' \
+   'already serving' "$OUT"
+
+# 4021 refused here. That refusal is what made the product need ssh -X.
+run env PATH="$SPATH" DISPLAY= "$BROWSER" auth viewsite
+t  'T10a auth on a display-less box no longer dead-ends' 0 "$RC"
+tn 'T10a ...and does not tell a paying customer to forward an X display' 'Forward one' "$ERR"
+
+# --- T10b the ticket is a hash, never the nonce ------------------------------
+run env PATH="$SPATH" "$BROWSER" viewer viewsite --bind=sess-A --ttl=600
+t  'T10b viewer mints' 0 "$RC"
+NONCE="${OUT##*/}"
+tc 'T10b ...printing a path with the nonce in it' '/browser/viewer/viewsite/' "$OUT"
+t  'T10b ...a 64-hex nonce' 64 "${#NONCE}"
+t  'T10b THE TICKET FILE DOES NOT CONTAIN THE RAW NONCE' 'absent' \
+   "$(grep -qF "$NONCE" "$VDIR/.5dive-viewer.ticket" && echo present || echo absent)"
+tc 'T10b ...it contains its sha256' "$(printf '%s' "$NONCE" | sha256sum | cut -d' ' -f1)" \
+   "$(cat "$VDIR/.5dive-viewer.ticket")"
+t  'T10b ...and the ticket is 0600' '600' "$(stat -c '%a' "$VDIR/.5dive-viewer.ticket")"
+
+# --- T10d/T10e it redeems ONCE ------------------------------------------------
+run env PATH="$SPATH" bash -c "printf '%s' '$NONCE' | '$BROWSER' viewer-redeem viewsite --nonce=- --session=sess-A"
+t  'T10d the right nonce in the right session redeems' 0 "$RC"
+tc 'T10d ...handing the relay a LOOPBACK target and nothing routable' '127.0.0.1:' "$OUT"
+run env PATH="$SPATH" bash -c "printf '%s' '$NONCE' | '$BROWSER' viewer-redeem viewsite --nonce=- --session=sess-A"
+t  'T10e A REPLAY OF THE SAME LINK IS REFUSED' 77 "$RC"
+tc 'T10e ...saying so in words a customer can act on' 'already been used' "$ERR"
+
+# --- T10f expiry --------------------------------------------------------------
+run env PATH="$SPATH" "$BROWSER" viewer viewsite --bind=sess-A --ttl=60
+NONCE2="${OUT##*/}"
+python3 - "$VDIR/.5dive-viewer.ticket" <<'EXPIRE'
+import sys,re,time
+p=sys.argv[1]; s=open(p).read()
+open(p,'w').write(re.sub(r'^expires_at=.*$','expires_at=%d'%(time.time()-1),s,flags=re.M))
+EXPIRE
+run env PATH="$SPATH" bash -c "printf '%s' '$NONCE2' | '$BROWSER' viewer-redeem viewsite --nonce=- --session=sess-A"
+t  'T10f AN EXPIRED LINK IS REFUSED even with the right nonce' 77 "$RC"
+tc 'T10f ...and says the browser session itself survived' 'untouched' "$ERR"
+
+# --- T10g the binding ---------------------------------------------------------
+run env PATH="$SPATH" "$BROWSER" viewer viewsite --bind=sess-A --ttl=600
+NONCE3="${OUT##*/}"
+run env PATH="$SPATH" bash -c "printf '%s' '$NONCE3' | '$BROWSER' viewer-redeem viewsite --nonce=- --session=sess-B"
+t  'T10g A VALID LINK IN A DIFFERENT SESSION IS REFUSED' 77 "$RC"
+tc 'T10g ...naming the reason, because this is the pasted-link case' 'different dashboard session' "$ERR"
+run env PATH="$SPATH" bash -c "printf '%s' '$NONCE3' | '$BROWSER' viewer-redeem viewsite --nonce=- --session=sess-A"
+t  'T10g ...and the failed attempt did NOT consume it for the rightful session' 0 "$RC"
+
+# --- T10h the nonce never goes in argv ---------------------------------------
+run env PATH="$SPATH" "$BROWSER" viewer viewsite --bind=sess-A --ttl=600
+NONCE4="${OUT##*/}"
+# stdin from /dev/null on purpose: a MUTANT that accepts the argv nonce falls
+# through to the stdin read, and an arm that hangs on a regression is an arm that
+# hangs CI instead of failing it.
+run env PATH="$SPATH" bash -c "'$BROWSER' viewer-redeem viewsite '--nonce=$NONCE4' --session=sess-A < /dev/null"
+t  'T10h A NONCE PASSED IN ARGV IS REFUSED, not quietly accepted' 64 "$RC"
+tc 'T10h ...naming why' '/proc/<pid>/cmdline' "$ERR"
+
+# --- T10i a wrong nonce -------------------------------------------------------
+run env PATH="$SPATH" bash -c "printf '%s' 'deadbeef' | '$BROWSER' viewer-redeem viewsite --nonce=- --session=sess-A"
+t  'T10i a wrong nonce is refused' 77 "$RC"
+tn 'T10i ...without leaking the real one' "$NONCE4" "$ERR$OUT"
+
+# --- T10j revoke --------------------------------------------------------------
+run env PATH="$SPATH" "$BROWSER" viewer-revoke viewsite
+t  'T10j revoke exits 0' 0 "$RC"
+tc 'T10j ...and says the login SURVIVES the view dying' 'stays logged in' "$OUT"
+run env PATH="$SPATH" bash -c "printf '%s' '$NONCE4' | '$BROWSER' viewer-redeem viewsite --nonce=- --session=sess-A"
+t  'T10j A REVOKED LINK IS DEAD' 77 "$RC"
+
+# --- T10k binding is mandatory ------------------------------------------------
+run env PATH="$SPATH" "$BROWSER" viewer viewsite --ttl=600
+t  'T10k AN UNBOUND TICKET CANNOT BE MINTED AT ALL' 64 "$RC"
+tc 'T10k ...and the escape is explicit, never implicit' '--bind=local' "$ERR"
+run env PATH="$SPATH" "$BROWSER" viewer viewsite --bind=sess-A --ttl=99999
+t  'T10k a ttl past the re-auth window is refused' 64 "$RC"
+
+# --- T10c a box without the packages says so, and starts nothing --------------
+mkprofile barebox "$LIVE_DOM" >/dev/null
+# This host HAS Xvfb, so "a bare box" has to be constructed rather than assumed:
+# a PATH of everything except the three server-mode packages. Trimming PATH to
+# /usr/bin silently passed this arm against a box that had them.
+MINBIN="$TMP/minbin"; mkdir -p "$MINBIN"
+for b in /usr/bin/* /bin/*; do
+  case "${b##*/}" in Xvfb|x11vnc|websockify|chrom*|google-chrome*) continue ;; esac
+  [[ -x "$b" ]] && ln -sf "$b" "$MINBIN/${b##*/}" 2>/dev/null
+done
+t 'T10c ...(control) the bare-box PATH really has no Xvfb' 'no' \
+  "$(PATH="$FAKEBIN:$MINBIN" command -v Xvfb >/dev/null 2>&1 && echo yes || echo no)"
+run env PATH="$FAKEBIN:$MINBIN" "$BROWSER" serve barebox
+t  'T10c serve on a box with no Xvfb fails closed' 69 "$RC"
+tc 'T10c ...naming what is missing' 'Xvfb' "$ERR"
+t  'T10c ...and leaves no half-started state behind' 'no' \
+   "$([[ -f "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/barebox/.5dive-serve" ]] && echo yes || echo no)"
+tc 'T10c ...refusing on the PRECONDITION, not on a launch that then failed' \
+   'cannot run a server-mode browser' "$ERR"
+# The missing-Xvfb arm alone does NOT grade the precondition: with it deleted,
+# Xvfb-not-on-PATH still dies at the "did not start" check with the same exit
+# status and the same word in the message. A box that has Xvfb and NO chromium
+# is the case that separates them — without the precondition the chrome launch
+# runs with an empty binary name and a pidfile is written for a browser that was
+# never started, which is exactly "the tile says connected and nothing is there".
+mkprofile nochrome "$LIVE_DOM" >/dev/null
+run env PATH="$MINBIN:$SBIN" "$BROWSER" serve nochrome
+t  'T10c2 a box with a display server but no chromium fails closed' 69 "$RC"
+tc 'T10c2 ...naming chromium' 'chromium' "$ERR"
+t  'T10c2 ...and writes NO pidfile for a browser that never started' 'no' \
+   "$([[ -f "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/nochrome/.5dive-serve" ]] && echo yes || echo no)"
+
+# --- T10l a profile this seat cannot own is refused BEFORE any of this --------
+BADV="$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/loosev"; mkdir -p "$BADV"; chmod 755 "$BADV"
+run env PATH="$SPATH" "$BROWSER" serve loosev
+t  'T10l a group-readable profile is refused by serve, not repaired' 77 "$RC"
+run env PATH="$SPATH" "$BROWSER" viewer loosev --bind=sess-A
+t  'T10l ...and by viewer' 77 "$RC"
+chmod 700 "$BADV"
+
+env PATH="$SPATH" "$BROWSER" serve viewsite --stop >/dev/null 2>&1 || true
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
