@@ -57,15 +57,16 @@ COPY 5dive 5dive-agent-list-snapshot 5dive-agent-start 5dive-refresh-plugins.sh 
 COPY hooks /opt/5dive-bundle/hooks/
 COPY skills /opt/5dive-bundle/skills/
 COPY systemd /opt/5dive-bundle/systemd/
-# DIVE-4141: the bundled plugin marketplace and the team-template registry.
-# Both were MISSING here while install.sh fetched them, and both of those
-# fetches are fail-soft (`curl -f` on a file:// bundle that omits a path exits
-# 37, and the installer only warns) — so every image built by this job shipped
-# with an EMPTY /usr/local/lib/5dive/plugins and only whatever team-templates
-# the warn loop happened to find. That is why the browser plugin could ship
-# uninstallable (DIVE-4126) with docker-install green: the one job that installs
-# on a fresh box never had the plugin to install.
-COPY plugins /opt/5dive-bundle/plugins/
+# DIVE-4141: the team-template registry. It was MISSING here while install.sh
+# fetched it, and that fetch is fail-soft (`curl -f` on a file:// bundle that
+# omits a path exits 37, and the installer only warns) — so every image built by
+# this job shipped with only whatever team-templates the warn loop happened to
+# find.
+#
+# DIVE-4202: the bundled plugin marketplace that used to be COPYed alongside it
+# is gone. Plugins are not shipped by this repo any more — they are published to
+# 5dive-ai/5dive-plugins and `5dive plugin` registers that registry itself, so
+# there is nothing plugin-shaped in the bundle to copy.
 COPY team-templates /opt/5dive-bundle/team-templates/
 # install.sh's curl fetches the unit at $REPO/systemd/5dive-agent%40.service
 # (URL-encoded '@'). curl with file:// decodes %40 → @, so a symlink is enough
