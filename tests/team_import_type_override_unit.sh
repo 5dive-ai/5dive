@@ -69,7 +69,7 @@ export SEO_TG_TOKEN="$EDITOR_TG_TOKEN"
 export DESIGNER_TG_TOKEN="$EDITOR_TG_TOKEN"
 export DISTRIBUTOR_TG_TOKEN="$EDITOR_TG_TOKEN"
 
-TPL="$ROOT/team-templates/content-studio.5dive.yaml"
+TPL="$ROOT/tests/fixtures/team-templates/content-studio.5dive.yaml"
 
 # --- T0 preconditions: the arms below are not reading an empty file ----------
 if [[ -s "$TPL" ]] && declare -F _compose_apply_type_override >/dev/null; then

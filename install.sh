@@ -915,7 +915,7 @@ JOURNALD
   # model-tiering default (DIVE-899 — inert unless the session model is Fable).
   # Fail-soft: a missing/transient-404 content fragment shouldn't hard-abort
   # the whole install (curl -f exits 37 on a file:// bundle that omits it, which
-  # is what reddened install-smoke — DIVE-938). This mirrors the team-templates
+  # is what reddened install-smoke — DIVE-938). Same shape as the plugin
   # staging below. The file is inert unless the session model is Fable (DIVE-899).
   if curl -fsSL "$REPO/model-tiering-CLAUDE.md" -o "$LIB_DIR/model-tiering-CLAUDE.md"; then
     chmod 644 "$LIB_DIR/model-tiering-CLAUDE.md"
@@ -953,18 +953,15 @@ JOURNALD
     echo "warn: failed to stage explore-agent.md — the haiku-pinned Explore override won't apply until the next refresh" >&2
   fi
 
-  # Curated team templates for `5dive team import <slug>` (the compose engine
-  # resolves $LIB_DIR/team-templates first). Enumerated explicitly because $REPO
-  # is a flat fetch URL with no directory listing — add a line per new template.
-  mkdir -p "$LIB_DIR/team-templates"
-  for _tpl in 5dive-team.5dive.yaml startup.5dive.yaml deploy-team.5dive.yaml content-studio.5dive.yaml eng-studio.5dive.yaml distribution.5dive.yaml SCHEMA-v2.md; do
-    if curl -fsSL "$REPO/team-templates/$_tpl" -o "$LIB_DIR/team-templates/$_tpl"; then
-      chmod 644 "$LIB_DIR/team-templates/$_tpl"
-    else
-      echo "warn: failed to stage team-template $_tpl — 5dive team import $_tpl won't be available until the next refresh" >&2
-    fi
-  done
-  ok "team-templates"
+  # DIVE-4196 — TEAM TEMPLATES ARE NO LONGER STAGED. They moved to the same
+  # marketplace registry the character packs come from (<org>/character-packs,
+  # under teams/) and `5dive team` reads them live.
+  #
+  # Do not restore a staging loop here. Staging at install time is the defect,
+  # not the delivery: a box that has already installed never receives a template
+  # published afterwards, and the hand-maintained list above it drifted from
+  # index.json twice (#807 deploy-team, #808 distribution) — each time
+  # advertising a slug through `team ls` that `team import` then refused.
 
   # DIVE-4020 — the plugins the CLI itself SHIPS, staged as a bundled
   # marketplace. `5dive plugin` registers $LIB_DIR/plugins as the marketplace
@@ -974,7 +971,7 @@ JOURNALD
   # source, or the first thing they must do to install our own plugin is the
   # very setup step the verb exists to remove.
   #
-  # Enumerated per file for the same reason team-templates is: $REPO is a flat
+  # Enumerated per file because $REPO is a flat
   # fetch URL with no directory listing. Add a line per new bundled plugin file.
   #
   # KEEP THE `for _pf in` LIST ON ONE LINE: tests/plugin_contract_unit.sh T10a

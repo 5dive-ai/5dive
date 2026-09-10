@@ -41,7 +41,7 @@ on:
       - 'systemd/**'
       - 'docker/Dockerfile'
       - 'plugins/**'
-      - 'team-templates/**'
+      - 'tests/fixtures/team-templates/**'
       - 'scripts/install-contract.sh'
       - 'projects-CLAUDE.md'
       - 'telegram-agent-CLAUDE.md'
@@ -323,15 +323,18 @@ jobs:
       # defects are "the artifact exists and does not install/run", and only a
       # fresh-box exercise sees them.
       #
-      # The two manifests are mounted from the CHECKOUT, not read out of the
-      # installed tree: the repo's marketplace.json and team-templates/index.json
-      # are the source of truth, so a plugin or slug that install.sh forgot to
-      # stage is still enumerated and reports as missing. Read the installed
-      # copies instead and install.sh becomes its own examiner.
+      # marketplace.json is mounted from the CHECKOUT, not read out of the
+      # installed tree: the repo's manifest is the source of truth, so a plugin
+      # install.sh forgot to stage is still enumerated and reports as missing.
+      # Read the installed copy instead and install.sh becomes its own examiner.
+      #
+      # DIVE-4196: the TEMPLATE half is no longer mounted. Templates moved to
+      # <org>/character-packs (teams/) and the contract fetches that index from
+      # inside the container — the registry is the only declaration there is, so
+      # a mounted checkout copy would grade a file no customer reads.
       - name: Plugins install, templates resolve, verbs answer --help
         run: |
           docker run --rm \
             -v "$PWD/scripts/install-contract.sh:/contract.sh:ro" \
             -v "$PWD/plugins/.claude-plugin/marketplace.json:/manifests/marketplace.json:ro" \
-            -v "$PWD/team-templates/index.json:/manifests/team-index.json:ro" \
             --entrypoint /bin/bash 5dive-contract /contract.sh

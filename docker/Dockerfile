@@ -57,16 +57,18 @@ COPY 5dive 5dive-agent-list-snapshot 5dive-agent-start 5dive-refresh-plugins.sh 
 COPY hooks /opt/5dive-bundle/hooks/
 COPY skills /opt/5dive-bundle/skills/
 COPY systemd /opt/5dive-bundle/systemd/
-# DIVE-4141: the bundled plugin marketplace and the team-template registry.
-# Both were MISSING here while install.sh fetched them, and both of those
+# DIVE-4141: the bundled plugin marketplace (the team-template half of this
+# block moved to the registry in DIVE-4196 and is gone).
+# It was MISSING here while install.sh fetched it, and that
 # fetches are fail-soft (`curl -f` on a file:// bundle that omits a path exits
 # 37, and the installer only warns) — so every image built by this job shipped
-# with an EMPTY /usr/local/lib/5dive/plugins and only whatever team-templates
-# the warn loop happened to find. That is why the browser plugin could ship
+# with an EMPTY /usr/local/lib/5dive/plugins. That is why the browser plugin could ship
 # uninstallable (DIVE-4126) with docker-install green: the one job that installs
 # on a fresh box never had the plugin to install.
 COPY plugins /opt/5dive-bundle/plugins/
-COPY team-templates /opt/5dive-bundle/team-templates/
+# DIVE-4196: team-templates is NOT copied — it no longer exists in this repo and
+# install.sh no longer stages it. `5dive team` reads the registry
+# (<org>/character-packs, teams/) live, so there is nothing to bundle.
 # install.sh's curl fetches the unit at $REPO/systemd/5dive-agent%40.service
 # (URL-encoded '@'). curl with file:// decodes %40 → @, so a symlink is enough
 # to make both names resolve.
