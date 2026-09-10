@@ -1071,8 +1071,15 @@ cmd_task_reject() {
     _task_reject_emit_event "$ident" "$id" "$_rj_actor" "$_rj_prev" "$iter" "$maxi" \
       "escalated to human review at the iteration cap (loop stuck, not bounced back)"
     warn "$ident hit max_iterations ($maxi) — escalating to human review"
+    # DIVE-4176: this ask lands on the PAIRED HUMAN, so it is written for one —
+    # no ident, no branch, no interpolated verifier feedback (that text is already
+    # on the row's `result`, written six lines up, and the row is what the gate
+    # points at). The readability refusal in `task need` grades this string like
+    # any other; a control arm in tests/gate_ask_readability_unit.sh keeps it from
+    # drifting back into machine vocabulary, where the refusal would make `reject`
+    # itself fail at the iteration cap.
     cmd_task_need "$id" --type=manual --from="${vfier:-verifier}" \
-      --ask="Maker→verifier loop stuck: $ident failed verification ${iter}× (max ${maxi}). Last feedback: ${feedback:-none}. Review + decide."
+      --ask="A piece of work has failed review ${iter} times and stopped. Decide whether to keep going or drop it."
     return
   fi
   # Otherwise bounce back to the maker for another pass.
@@ -1387,7 +1394,7 @@ cmd_task_merge() {
   local rc=0 out=""
   out=$(printf '%s\0' "$ident" | sudo -n /usr/local/bin/5dive _merge_do 2>&1) || rc=$?
   if (( rc != 0 )) && ! sudo -n -l /usr/local/bin/5dive _merge_do >/dev/null 2>&1; then
-    fail "$E_PERMISSION" "$ident: this seat holds no _merge_do grant, so NOTHING RAN — the merge was not attempted and was not refused on standing. A seat provisioned before DIVE-3474 does not carry the grant until it is re-provisioned (5dive agent provision <seat>). Until then the merge stays with a seat that holds one."
+    fail "$E_PERMISSION" "$ident: this seat holds no _merge_do grant, so NOTHING RAN — the merge was not attempted and was not refused on standing. A seat provisioned before DIVE-3474 does not carry the grant until its managed sudoers is re-rendered: run 'sudo 5dive agent grant <seat> merge' as root on the box (DIVE-4183). Until then the merge stays with a seat that holds one."
   fi
   [[ -n "$out" ]] && printf '%s\n' "$out" >&2
   (( rc == 0 )) || { mark_reported; return "$rc"; }

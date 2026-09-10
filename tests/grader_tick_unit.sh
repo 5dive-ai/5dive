@@ -101,6 +101,56 @@ outj=$(run --cap=5 --commit --json)
   && ok_ 'LOCK2 counts all 3 as dark (not merely queued)' \
   || bad_ 'LOCK2 counts them dark' "$outj"
 
+# ── LOCK 2, THE SETTING: the pool the lane SHIPS WITH, not one we handed it ───
+#
+# Every arm in this file — LOCK 2 above included — assigns `_GRADER_POOL` in its
+# own setup, so all of them grade the lock's MECHANISM (an empty pool refuses)
+# and none of them grade its SHIPPED DEFAULT. Measured on the graded sha
+# (DIVE-4164, f4178890): flipping `src/task/grader_pool.sh`'s
+# `_GRADER_POOL="${_GRADER_POOL:-}"` to name a live seat left this file 19/0
+# GREEN. "Ships dark" is exactly the half a reviewer is asked to accept, and it
+# was the half nothing measured.
+# See community/wiki/an-arm-that-assigns-the-flag-cannot-grade-the-default-it-ships-with.md
+#
+# So this arm assigns NOTHING: it unsets the variable, re-sources the lane so the
+# default expansion actually runs, and reads what the lane says its pool is.
+#
+# WHY IT RE-APPLIES THE STUBS. Re-sourcing restores the REAL
+# `_grader_spawn_session` and the real `_GRADER_USAGE_CMD`. Against a mutant that
+# ships a non-empty default, an un-stubbed subshell would reach the live fleet
+# verb — a harness that spawns for real is a worse failure than the one it is
+# hunting. The stubs are re-applied after the source, in the same order the file
+# header does it, so the fleet primitive is never reachable.
+#
+# WHY IT ASSERTS THE POOL FIELD AND THE DARK COUNT, NOT "NOTHING SPAWNED".
+# A mutant naming a seat the usage fixture does not know (`quinn`) resolves to an
+# empty account, is refused by the floor, and spawns nothing — so a spawn-count
+# assertion passes against it. `pool` and `dark` separate "empty by default" from
+# "non-empty but unlucky", which is the whole distinction.
+#
+# `--commit` HAS NO EQUIVALENT ARM AND DOES NOT NEED ONE. Its default is
+# `local commit=0` inside `cmd_task_grader_tick`: no caller can assign it from
+# outside, so no arm here can be blind to it the way these were blind to the
+# pool, and LOCK 1 already kills the `local commit=1` mutant directly.
+: > "$SPAWNF"; : > "$EMITF"
+defj=$(
+  unset _GRADER_POOL
+  # shellcheck source=/dev/null
+  source src/task/grader_pool.sh
+  _GRADER_USAGE_CMD=usage_cmd
+  _GRADER_READ_PROBE=probe_ok
+  _grader_spawn_session(){ printf '%s\n' "$1:$2" >> "$SPAWNF"; return 0; }
+  cmd_task_grader_tick --cap=5 --commit --json 2>/dev/null
+)
+[[ "$(printf '%s' "$defj" | python3 -c 'import json,sys;print(json.load(sys.stdin)["pool"])')" == "" ]] \
+  && ok_ 'DEFAULT: the shipped _GRADER_POOL is empty (nothing assigned it)' \
+  || bad_ 'shipped default pool is empty' "$defj"
+[[ "$(printf '%s' "$defj" | python3 -c 'import json,sys;print(json.load(sys.stdin)["dark"])')" == 3 ]] \
+  && ok_ 'DEFAULT: --commit on the shipped default counts all 3 dark, not queued' \
+  || bad_ 'shipped default is dark' "$defj"
+[[ ! -s "$SPAWNF" ]] && ok_ 'DEFAULT: --commit on the shipped default spawns nothing' \
+  || bad_ 'shipped default spawns nothing' "spawned: $(spawns)"
+
 # ── both released: it actually works, or the locks prove nothing ─────────────
 _GRADER_POOL="g1"
 out=$(run --cap=5 --commit)

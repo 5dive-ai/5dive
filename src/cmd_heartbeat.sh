@@ -1244,6 +1244,19 @@ _hb_clear_active_defer() {
 # Case-insensitive and tolerant of CC copy drift across the monthly-spend and
 # 5-hour variants. Callers reach this ONLY on a confirmed rc==3 "blocked" pane,
 # so the pane really is parked on a dialog, not mid-turn text.
+# DIVE-4206 — the "this wall names a resume time" signature, in ONE place. It is
+# read by the action-line arm of _hb_pane_is_usage_limit AND by the rate-limit
+# arm of _hb_wall_class, and before this row those two carried near-identical
+# copies of it that had to be widened together or the seat classified
+# `undetermined` while the matcher above said `wall`. Covers the pre-4206 forms
+# (`resets at 4pm`, `resets in 20 minutes`) and the bare clock Claude Code
+# actually prints today (`resets 4am`, `resets 11:30am`), plus `continuing
+# automatically at <time>` -- the resume line of the DIVE-1666 dialog itself,
+# which the supervisor's deadline parser has always read and which the action
+# arm here nonetheless did not match, so `⚠ Usage limit reached · continuing
+# automatically at 4pm` failed the two-signature test on its second line.
+_HB_RESET_TIME_RE='resets? (at |in )|resets? [0-9]{1,2}([:.][0-9]{2})? ?[ap]\.?m|continuing automatically at '
+
 _hb_pane_is_usage_limit() {
   local pane="$1"
   # DIVE-3465 widened the HEADER alternation to the weekly/daily variants. It was
@@ -1253,8 +1266,27 @@ _hb_pane_is_usage_limit() {
   # fired on it and the classifier below never got to see it. The two-signature
   # discipline is unchanged, so this does not widen the false-match surface -- a
   # header line on its own still does not match (asserted in both harnesses).
-  grep -qiE 'hit your ((monthly|weekly|daily)([ -]?spend)?|usage|5[ -]?hour) limit|usage limit reached|reached your .* limit|limit reached' <<<"$pane" || return 1
-  grep -qiE 'upgrade your plan|wait for .*limit to reset|limit will reset|resets? (at|in) ' <<<"$pane" || return 1
+  # DIVE-4206 added `session` to the header and a bare `resets <time>` to the
+  # action line. The banner Claude Code prints today is ONE line carrying both
+  # signatures — `You've hit your session limit · resets 4am (UTC)` — and it
+  # matched NEITHER: `session limit` is absent from the header alternation, and
+  # the action arm demanded the word `at` or `in` after `resets`, which this
+  # copy does not print. Both signatures are still required, so the widening
+  # does not weaken the two-signature discipline that stops ordinary output
+  # mentioning "limit" from false-matching (asserted in both harnesses).
+  grep -qiE 'hit your ((monthly|weekly|daily)([ -]?spend)?|usage|session|5[ -]?hour) limit|usage limit reached|reached your .* limit|limit reached' <<<"$pane" || return 1
+  # DIVE-4171 added `upgrade to pro` to the ACTION alternation. codex's wall is
+  # one line carrying both signatures -- `Codex could not complete this turn:
+  # You've hit your usage limit. Upgrade to Pro` -- and after DIVE-4206 widened
+  # the header arm it matched the header and FAILED here: every action phrasing
+  # in the list is Claude Code's copy ("Upgrade your plan"), and codex names the
+  # plan instead of the verb's object. So a walled codex seat read as "not a
+  # wall" to every caller of this matcher (`_hb_usage_limit_frozen`, and
+  # `_hb_wall_class` which short-circuits on it), while the SUPERVISOR's own
+  # pattern matched the same line -- two instruments disagreeing about one pane.
+  # Two-signature discipline is unchanged: this is still the action arm, and a
+  # header line alone still does not match (asserted in tests/heartbeat_codex_wall_unit.sh).
+  grep -qiE "upgrade your plan|upgrade to pro|wait for .*limit to reset|limit will reset|${_HB_RESET_TIME_RE}" <<<"$pane" || return 1
   return 0
 }
 
@@ -1315,7 +1347,7 @@ _hb_wall_class() {
     printf 'spend-cap'; return 0
   fi
   if grep -qiE '(5[ -]?hour|five[ -]?hour|usage|weekly|session) limit' <<<"$pane" \
-     && grep -qiE 'resets? (at|in) |limit will reset|try again (at|in|after)|wait for .*limit to reset' <<<"$pane"; then
+     && grep -qiE "${_HB_RESET_TIME_RE}|limit will reset|try again (at|in|after)|wait for .*limit to reset" <<<"$pane"; then
     printf 'rate-limit'; return 0
   fi
   printf 'undetermined'; return 0
@@ -1552,11 +1584,52 @@ _hb_pick_tasks() {
         crit(root, cp) AS (SELECT root, MAX(depth) AS cp FROM cp GROUP BY root)
       SELECT t.id
         FROM tasks t LEFT JOIN crit c ON c.root = t.id
-        WHERE t.assignee=$(sqlq "$name") AND t.status='todo' AND t.kind='standard'
+        WHERE t.status='todo' AND t.kind='standard'
+          -- DIVE-4220: THE SEAT THAT HOLDS THE MERGE IS NOT ALWAYS THE ASSIGNEE.
+          -- DIVE-4206 (below) stopped waking a maker onto a merge owed by someone
+          -- else, which was right, but it left the row dispatched to NOBODY: the
+          -- picker only ever selected assignee=<seat>, so a row whose merge owner
+          -- is the GRADER waits until a seat happens to look. Measured 2026-09-10
+          -- 10:45Z: 8 rows sat in graded-to-merge, three of them with the pull
+          -- request already MERGED hours earlier. The second arm here is what
+          -- makes the merge a DISPATCHED turn for the seat that can act on it.
+          -- The owner expression is the board's, character for character, and it
+          -- is only ever read on a graded-and-waiting row.
+          AND ( t.assignee=$(sqlq "$name")
+                OR ( (${_TASKS_TFV_SQL})
+                     AND COALESCE(NULLIF(t.merge_owner,''), NULLIF(t.maker_agent,''),
+                                  COALESCE(t.assignee,'?')) = $(sqlq "$name") ) )
           AND NOT (t.need_type IS NOT NULL AND t.need_answered_at IS NULL)
           AND NOT EXISTS (
             SELECT 1 FROM task_deps dd JOIN tasks b ON b.id = dd.blocked_by
              WHERE dd.task_id = t.id AND b.status NOT IN ('done','cancelled'))
+          -- DIVE-4206: A ROW WHOSE NEXT MOVE IS SOMEONE ELSE'S IS NOT RUNNABLE.
+          -- _hb_wake already appends a NOTE telling a maker woken onto a
+          -- graded-and-waiting row to stop, which is the right text and arrives
+          -- one whole session too late: the seat still boots, reloads the PR and
+          -- re-derives that nothing is owed by it before it reads the note.
+          -- Measured
+          -- 2026-09-10 over 400 maker runs: DIVE-4108 attempt 7 spent 25 min on
+          -- exactly that and was then reclaimed as idle, and DIVE-4161 spent two
+          -- 45-min attempts the same way. Same predicate the board paints
+          -- graded-to-merge with, so the picker and the board cannot disagree
+          -- about which rows are waiting on a merge.
+          --
+          -- NO BACKTICKS AND NO DOUBLE QUOTES IN THIS COMMENT, and neither is
+          -- style. The whole statement is one double-quoted bash string, so a
+          -- backticked name here RUNS AS A COMMAND before sqlite sees the SQL
+          -- (the trap the reclaim query's comment already records) and a double
+          -- quote ENDS THE STRING -- the first cut of this comment quoted a
+          -- phrase and silently truncated the query mid-word, dropping this
+          -- clause, the ORDER BY and the LIMIT. It still parsed and still
+          -- returned rows, just the wrong ones, and shellcheck saw nothing.
+          --
+          -- SCOPED TO OTHER SEATS' MERGES on purpose: when the owner IS this
+          -- agent the merge is its move and waking it is the whole point. The
+          -- owner expression is the board's, character for character.
+          AND NOT ( (${_TASKS_TFV_SQL})
+                    AND COALESCE(NULLIF(t.merge_owner,''), NULLIF(t.maker_agent,''),
+                                 COALESCE(t.assignee,'?')) <> $(sqlq "$name") )
         ORDER BY CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1
                                  WHEN 'medium' THEN 2 ELSE 3 END,
                  COALESCE(c.cp,0) DESC, t.id
@@ -2056,7 +2129,10 @@ _hb_reclaim_to_todo() {
 # deliberately SHORTER than those in the unknown case: an unparseable wall is
 # not evidence the seat is alive, so the fallback has to expire on its own.
 _HB_QUOTA_PARK_FALLBACK_SEC=21600   # 6h — the unknown-deadline cap
-_hb_quota_park_until() {
+# DIVE-4206 — the SEAT'S OWN observation, unchanged from DIVE-4104. Split out so
+# the profile-peer arm below can ask the same question of another seat without a
+# second copy of the deadline arithmetic.
+_hb_quota_park_until_seat() {
   local name="$1" everyMin="${2:-5}"
   local row cls sigts deadline base_epoch
   # ORDER BY id, not ts: two observations can share a second and `id` is the
@@ -2083,6 +2159,46 @@ _hb_quota_park_until() {
   base_epoch=$(date -u -d "${sigts} UTC" +%s 2>/dev/null) || base_epoch=""
   [[ "$base_epoch" =~ ^[0-9]+$ ]] || return 0
   printf '%s' "$(( base_epoch + _HB_QUOTA_PARK_FALLBACK_SEC ))"
+}
+
+# DIVE-4206 — THE WALL IS AN ACCOUNT'S, NOT A SEAT'S. The auth profile is pooled,
+# so when it is exhausted every seat on it is frozen at once — but each seat is
+# classified from its OWN pane, and a pane is only read when the supervisor got a
+# capture. Measured 2026-09-10 02:24-02:45Z: dev, dev3 and ops were all sitting
+# on the same session-limit banner (shared `mark` profile) and the reclaimer took
+# claims off two of them. Asking the profile, not just the seat, means one
+# readable pane parks every claim on the account instead of one.
+#
+# THE HEADROOM VETO IS WHAT KEEPS THIS FROM BEING A NEW WEDGE. Peer evidence is
+# second-hand and can be stale, so it parks only while the profile has NO proven
+# headroom — _hb_account_has_headroom returns 0 the moment any seat on the pool
+# is natively idle/busy, which is ground truth that the pool is under its limit
+# (DIVE-1666). The seat's OWN reading is first-hand and is never vetoed. Both
+# arms stay bounded by the same deadline/6h cap, so no park outlives its reason.
+#
+# A solo profile (`@self:<name>`, the default when a seat declares none) has no
+# peers by construction and short-circuits to the seat's own answer.
+_hb_quota_park_until() {
+  local name="$1" everyMin="${2:-5}"
+  local own; own=$(_hb_quota_park_until_seat "$name" "$everyMin")
+  [[ "$own" =~ ^[0-9]+$ ]] && { printf '%s' "$own"; return 0; }
+  local reg acct; reg=$(registry_read 2>/dev/null) || return 0
+  [[ -n "$reg" ]] || return 0
+  acct=$(jq -r --arg n "$name" '.agents[$n].authProfile // empty' <<<"$reg" 2>/dev/null) || return 0
+  [[ -n "$acct" && "$acct" != "null" ]] || return 0
+  _hb_account_has_headroom "$name" "$acct" "$reg" && return 0
+  local peer best="" p
+  while IFS= read -r peer; do
+    [[ -n "$peer" && "$peer" != "$name" ]] || continue
+    p=$(_hb_quota_park_until_seat "$peer" "$everyMin")
+    [[ "$p" =~ ^[0-9]+$ ]] || continue
+    if [[ -z "$best" ]] || (( p > best )); then best="$p"; fi
+  done < <(jq -r --arg a "$acct" '
+      .agents | to_entries
+      | map(select((.value.authProfile // ("@self:" + .key)) == $a))
+      | .[].key' <<<"$reg" 2>/dev/null)
+  [[ -n "$best" ]] && printf '%s' "$best"
+  return 0
 }
 
 # DIVE-4104 — is `name` quota-walled right now, with the park still in force?
@@ -2260,9 +2376,35 @@ _hb_reclaim() {
   local budget=$(( everyMin * _HB_STALE_MULT ))
   (( budget < _HB_STALE_MIN_MINUTES )) && budget=$_HB_STALE_MIN_MINUTES
   local proc_start; proc_start=$(_hb_claude_started "$name" 2>/dev/null || true)
-  local reclaimed=0 escalated=0 id started_epoch age_min awaiting_verifier delivered_live
-  while IFS='|' read -r id started_epoch age_min awaiting_verifier delivered_live; do
+  local reclaimed=0 escalated=0 id started_epoch age_min awaiting_verifier delivered_live merge_elsewhere
+  while IFS='|' read -r id started_epoch age_min awaiting_verifier delivered_live merge_elsewhere; do
     [[ -n "$id" ]] || continue
+    # DIVE-4206 — GRADED, AND THE MERGE IS ANOTHER SEAT'S. Recorded here for
+    # the log ONLY; the three rules below still run and the row still reclaims.
+    #
+    # Iteration 1 of this ticket made this a `continue`, holding the claim
+    # because "the exit is another seat's act and a timeout would hand the row
+    # back exactly as before". That reasoning was wrong about where the row is
+    # re-handed. It is the PICKER clause above that refuses to re-hand a
+    # graded-merge-elsewhere row, and the picker is not the guard the tick hits
+    # first: the dispatch tick's busy-guard (see _hb_dispatch, "busy — N
+    # in_progress, skip") counts EVERY in_progress row for the seat and returns
+    # one level ABOVE the picker. So a standing claim on a row nobody here owes
+    # does not merely cost the re-pick it was meant to save -- it makes the seat
+    # undispatchable onto ANY row until some other seat merges, which is this
+    # ticket's own axis inverted: 57% wasted attempts becomes 0 attempts. It
+    # also breaks the boundedness invariant tests/heartbeat_reclaim_loop_unit.sh
+    # exists to defend (a hold whose exit is not this seat's act re-fires
+    # forever).
+    #
+    # Letting it reclaim costs nothing that the skip was buying: the board
+    # paints the row graded-to-merge off _TASKS_TFV_SQL whether it is todo or
+    # in_progress, and the picker clause -- same predicate, same owner
+    # expression -- still refuses to hand it back to a maker. Zero wasted
+    # re-pick AND zero wedge, which is what arm B asked for.
+    if (( merge_elsewhere )); then
+      _hb_log "[$name] $(_hb_ident "$id") is graded and waiting on a merge owed by another seat — reclaiming the claim so $name stays dispatchable; the picker will not re-hand it (DIVE-4206)"
+    fi
     # Reset per row: `local` is function-scoped, not block-scoped, so a lapse
     # set on one row would otherwise leak into the next row of the same tick.
     local _hold_lapsed=0
@@ -2339,6 +2481,40 @@ _hb_reclaim() {
     # requeue is genuinely stuck → on the _HB_REAP_ESCALATE_AFTER'th reap, block
     # it + escalate (pings owner & paired human) so a person decides its fate.
     if (( age_min >= budget )); then
+      # DIVE-4171 — A WALLED SEAT MUST NEVER MANUFACTURE A HUMAN GATE. DIVE-4104
+      # parked rule (b) only, on the stated ground that "a walled seat that also
+      # overran its 45m budget is still a real overrun". Measured on codex
+      # 2026-09-09, that ground does not hold for a wall that OUTLASTS the
+      # budget, and every ChatGPT usage wall does: 11:20:07 reclaimed DIVE-4119
+      # as "overran 45m budget (reap #1)", 11:30:19 re-nudged the same seat into
+      # the same wall, 12:21:06 "overran 45m 2x — blocked + escalated". The row
+      # was then `blocked` with "needs a human to requeue" — a human gate filed
+      # for a seat that had lost nothing and would resume on its own. DIVE-4161
+      # took the same shape 14 minutes later. The overrun is real and it is also
+      # fully EXPLAINED: nothing was working, so requeueing from a clean slate
+      # buys nothing and the reap counter is measuring the wall, not the row.
+      #
+      # HELD, not reclaimed-once, and the difference is the counter: a reclaim
+      # still spends a `_hb_mark_reap` tick, so a wall spanning two budgets would
+      # still reach _HB_REAP_ESCALATE_AFTER by a different route. The hold is the
+      # same shape rule (b) already uses and it is bounded by the SAME park —
+      # deadline plus one tick when the wall names one, else the 6h fallback cap
+      # (_HB_QUOTA_PARK_FALLBACK_SEC) — so it expires on its own and this arm
+      # then reaps exactly as before. It cannot wedge a claim: no arm here can
+      # extend the park, only the supervisor's next observation can.
+      #
+      # It also stops the `/goal clear` below being sent INTO the wall. On the
+      # codex dispatcher that line is not free: `_hb_send_line` skips /clear on
+      # that path (DIVE-4036, no thread-reset verb), so each nudge appends
+      # another full /goal to one ever-growing thread that is re-sent every turn
+      # — the seat's own pane complained of "a huge thread containing many
+      # repeated /goal messages". Nudging a walled seat spends the quota that
+      # walled it.
+      local _cpark
+      if _cpark=$(_hb_quota_parked "$name" "$everyMin"); then
+        _hb_log "[$name] $(_hb_ident "$id") is ${age_min}m past the ${budget}m budget but the supervisor classifies this seat (or a peer on its auth profile) quota-exhausted — claim HELD, NOT reaped and NOT escalated (~${_cpark}m of park left, DIVE-4171)"
+        continue
+      fi
       _hb_send_line "$name" "/goal clear" || true
       local reap_n
       reap_n=$(with_registry_lock _hb_mark_reap "$name" "$id")
@@ -2418,7 +2594,7 @@ _hb_reclaim() {
       # seat that also overran its 45m budget is still a real overrun.
       local _qpark
       if _qpark=$(_hb_quota_parked "$name" "$everyMin"); then
-        _hb_log "[$name] $(_hb_ident "$id") reads idle ${age_min}m but the supervisor classifies this seat quota-exhausted — claim PARKED, not reclaimed (~${_qpark}m of park left, DIVE-4104)"
+        _hb_log "[$name] $(_hb_ident "$id") reads idle ${age_min}m but the supervisor classifies this seat (or a peer on its auth profile) quota-exhausted — claim PARKED, not reclaimed (~${_qpark}m of park left, DIVE-4104/DIVE-4206)"
         continue
       fi
       _hb_reclaim_to_todo "$name" "$id" "idle ${age_min}m with the task still open (claimed then went idle)"
@@ -2443,6 +2619,17 @@ _hb_reclaim() {
                  -- printed 'assignee: command not found' to stderr.
                  CASE WHEN verifier IS NOT NULL AND maker_agent IS NOT NULL
                            AND handoff_delivered_at IS NOT NULL AND handoff_ack_at IS NULL
+                      THEN 1 ELSE 0 END || '|' ||
+                 -- DIVE-4206: graded, bound, and the merge is owed by a seat that
+                 -- is not this one. Same predicate the board paints graded-to-merge
+                 -- with, and the same owner expression, so the reclaimer and the
+                 -- board cannot disagree about whose move a row is. Same two
+                 -- lexical traps as the comment above: no backticks, no double
+                 -- quotes -- either one silently truncates or executes part of
+                 -- this statement.
+                 CASE WHEN (${_TASKS_TFV_SQL})
+                           AND COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''),
+                                        COALESCE(assignee,'?')) <> $(sqlq "$name")
                       THEN 1 ELSE 0 END
                FROM tasks
                WHERE assignee=$(sqlq "$name") AND status='in_progress';" 2>/dev/null || true)
@@ -2585,9 +2772,19 @@ _hb_loop_terminal_clause() {
   # One read, three fields: the verifier selects the variant, maker_agent proves
   # (or disproves) the handoff, created_by names the routing variant's destination.
   # '|' is safe as a separator — all three are agent names (validated slugs).
+  # DIVE-4220: the woken seat is not always the ASSIGNEE. Once the picker
+  # dispatches a graded-and-waiting row to the seat that OWNS the merge, that seat
+  # is frequently the GRADER while the row stays assigned to the maker — and an
+  # assignee-only read returned empty there, so the one wake that exists to move a
+  # merge arrived with no note at all. The second arm is the same owner expression
+  # the picker and the board use, and it is only ever reached on a graded row.
   row=$(db "SELECT COALESCE(verifier,'')||'|'||COALESCE(maker_agent,'')||'|'||COALESCE(created_by,'')
               FROM tasks
-               WHERE id=${task_id} AND assignee=$(sqlq "$name")
+               WHERE id=${task_id}
+                 AND ( assignee=$(sqlq "$name")
+                       OR ( (${_TASKS_TFV_SQL})
+                            AND COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''),
+                                         COALESCE(assignee,'?')) = $(sqlq "$name") ) )
                  AND status NOT IN ('done','cancelled');" 2>/dev/null) || return 0
   vfier="${row%%|*}"; rest="${row#*|}"; maker="${rest%%|*}"; creator="${rest#*|}"
   [[ -n "$vfier" ]] || return 0
@@ -2609,6 +2806,28 @@ _hb_loop_terminal_clause() {
   if [[ "$(db "SELECT 1 FROM tasks WHERE id=${task_id} AND ${_TASKS_TFV_SQL};" 2>/dev/null)" == "1" ]]; then
     local _tfv_owner
     _tfv_owner=$(db "SELECT COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''), COALESCE(assignee,'?')) FROM tasks WHERE id=${task_id};" 2>/dev/null)
+    # DIVE-4220 — THE OWNER'S OWN ROW IS NOT TERMINAL FOR THE OWNER. The clause
+    # below is correct for everyone EXCEPT the seat that owes the merge, and to
+    # that seat it says the exact opposite of the truth: stop, someone else acts.
+    # It was never reached before, because the picker never woke a non-assignee
+    # owner and the read above was assignee-only; widening the picker without
+    # widening this would hand the merge owner a note telling them to stand down,
+    # which is the strand this row exists to end. Three outcomes are named because
+    # the wake is one turn and the seat should not have to re-derive which it is
+    # in: already merged, mergeable, or a red required check that belongs to the
+    # maker. Deliberately NOT an auto-close (main2, 2026-09-10): a merged pull
+    # request is not a finished row — two of seven rows triaged that morning had
+    # an owed clause in their own PASS verdict — so the wake DISPATCHES the seat
+    # that can read the verdict, and the close stays a judgement someone makes.
+    if [[ -n "$_tfv_owner" && "$_tfv_owner" == "$name" ]]; then
+      printf ' NOTE — %s is GRADED AND THE MERGE IS YOURS: a verifier grade is recorded, a delivery ref is bound, and %s names YOU (%s) as the seat that owes the merge. This wake IS that move — nothing here is owed by anyone else, so do not route it onward, do not re-grade it and do not re-deliver it. START BY READING THE PULL REQUEST STATE, because which of three things you should do is decided there and not in this note. (1) ALREADY MERGED: close the row with %s — but read the PASS verdict first, since a merged pull request is NOT automatically a finished row (a verdict routinely carries an owed clause, or the branch was one item of several), and if something is still owed, say so on the row and leave it open. (2) MERGEABLE AND GREEN: land it (%s, or %s if you hold the merge), then close. (3) A REQUIRED CHECK IS RED, or the branch conflicts: that is the MAKER%s move, not yours — bounce it with %s naming the check, and stop. Whatever you do, say which of the three it was.' \
+        "$task_ident" "'5dive task ls'" "$name" \
+        "'5dive task done ${task_ident}'" \
+        "'5dive task merge ${task_ident}'" "'5dive task done ${task_ident}'" \
+        "$([[ -n "$maker" ]] && printf "'s (%s)" "$maker" || printf "'s")" \
+        "'5dive task reject ${task_ident} --feedback=...'"
+      return 0
+    fi
     printf ' NOTE — %s is GRADED AND WAITING ON A MERGE: a verifier grade is recorded and a delivery ref is bound, so the verifier has discharged their role and this is TERMINAL FOR THIS GOAL. Treat the goal as MET and stop — %s renders it as %s. The row stays OPEN on purpose and closes only when the work MERGES, because %s keeps meaning merged-to-main; the outstanding act is a MERGE owed by %s, not another pass by you. Do NOT re-grade it, re-deliver it, or close it to make the loop stop.' \
       "$task_ident" "'5dive task ls'" "'graded->merge:${_tfv_owner}'" "'done'" "${_tfv_owner:-the maker}"
     return 0
@@ -3877,8 +4096,25 @@ _hb_stall_sweep() {
     vmins=$(( ($(date -u +%s) - $(date -u -d "$vdelivered" +%s 2>/dev/null || date -u +%s)) / 60 ))
     ( cmd_send "$vfier" --from="task-engine" \
         --message="📥 ${vident} was delivered to you for review ${vmins}m ago and is still unacknowledged — run \`5dive task start ${vident}\` then \`task done\`/\`task reject\` so it doesn't rot in your queue." ) >/dev/null 2>&1 || true
-    ( cmd_send "ops" --from="task-engine" \
-        --message="📥 Delivered-awaiting-verifier: ${vident} handed to '${vfier}' ${vmins}m ago, still unacknowledged — surfaced so it never sits invisible (DIVE-1416 gap#2)." ) >/dev/null 2>&1 || true
+    # DIVE-4206 removed the third-seat COPY that used to fire here:
+    #
+    #   cmd_send ops "📥 Delivered-awaiting-verifier: <ident> handed to '<vfier>'
+    #                 <n>m ago, still unacknowledged"
+    #
+    # Measured in ops's session log, 2026-09-08..09: 295 of these in two days,
+    # none of them ops's move. Delivery is tmux send-keys into the live pane
+    # (src/cmd_agent_runtime.sh), so each one becomes ops's NEXT USER TURN in the
+    # middle of whatever row it is working -- and this repo's own a2a rule is
+    # that a message costs the recipient a re-investigation, not its bytes. Two
+    # readers, and neither one needed the copy: the VERIFIER is pinged directly
+    # on the line above (which is the seat that can act), and anyone auditing
+    # the queue reads the BOARD, where handoff_stale_pinged_at is stamped on the
+    # next line and `task ls` renders the row's state. lodar, 2026-09-10 04:57:
+    # ops "by design is constantly bombarded by incoming a2a from other agents".
+    #
+    # This deletes the COPY, not the surfacing: the ping, the stamp and the
+    # ledger line below are all unchanged, so nothing that was visible becomes
+    # invisible -- it stops being visible IN A THIRD SEAT'S TURN.
     db "UPDATE tasks SET handoff_stale_pinged_at=datetime('now') WHERE id=${vid};"
     _hb_log "[stall-sweep] ${vident} delivered->${vfier} unacked ${vmins}m -> surfaced"
   done < <(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id)||x'1f'||verifier||x'1f'||handoff_delivered_at
@@ -5044,7 +5280,6 @@ cmd_heartbeat_tick() {
   # front, so a wake we do mid-loop isn't visible to later iterations via the
   # registry — this map carries that within-tick fact so two same-account agents
   # can't both wake on one tick.
-  local -A in_tick_woke=()
   local name
   # Process oldest-waiting first (smallest lastRunAt). When two same-account
   # agents contend for the one wake slot, the one that has waited longest wins,
@@ -5323,13 +5558,17 @@ cmd_heartbeat_tick() {
          | select(.key != $n)
          | select((.value.authProfile // ("@self:" + .key)) == $a)
          | (.value.heartbeat.lastRunAt // 0)] | max // 0' <<<"$reg")
-      if [[ -n "${in_tick_woke[$acct]:-}" ]] && (( in_tick_woke[$acct] > acct_last )); then
-        acct_last=${in_tick_woke[$acct]}
-      fi
+      # DIVE-4230: the in-tick bump used to make this gate wake at most ONE seat per
+      # account per tick — with 11 seats on one account at a 5m cadence the gap is 27s
+      # and a tick's own pass over the fleet takes longer than that, so every other due
+      # seat was deferred on every tick and the fleet starved (measured 2026-09-10:
+      # 'spread-deferred 6' on one tick, dev3 deferred 6 ticks in a row with 7 todo).
+      # Spacing across ticks via lastRunAt is kept; same-tick wakes are allowed. The
+      # 429 that this gate guarded against is already handled by the capacity parking.
       gap=$(( everyMin * 60 / acct_count ))
       if (( now - acct_last < gap )); then
         sk_spread=$((sk_spread + 1))
-        _hb_log "[$name] spread-defer — account '$acct' (${acct_count} agents) last woke $(( (now - acct_last) / 60 ))m ago, need a $(( gap / 60 ))m gap; retry next tick"
+        _hb_log "[$name] spread-defer — account '$acct' (${acct_count} agents) last woke $(( now - acct_last ))s ago, need a ${gap}s gap; retry next tick"
         continue
       fi
     fi
@@ -5549,7 +5788,6 @@ cmd_heartbeat_tick() {
 
     _hb_log "[$name] due + todo ${task_ident} — waking (fresh=${eff_fresh})"
     if _hb_wake "$name" "$eff_fresh" "$task_id" "$task_ident"; then
-      in_tick_woke[$acct]=$now   # claim the account's slot for the rest of this tick
       with_registry_lock _hb_wake_budget_inc "$name" "$today" >/dev/null 2>&1 || true  # DIVE-1858: count this wake
       with_registry_lock _hb_clear_active_defer "$name" >/dev/null 2>&1 || true  # DIVE-1486: episode over
       local nudge_n

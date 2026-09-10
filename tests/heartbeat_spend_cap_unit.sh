@@ -122,6 +122,32 @@ cls_t "wall with no discriminator = undetermined (never rate-limit by default)" 
 PERM=$'Claude wants to run:\n  rm -rf build/\n\n  1. Yes  2. No, and tell Claude what to do differently'
 cls_t "permission dialog is not a wall" "$PERM" "none"
 cls_t "marketing copy alone is not a wall" "Upgrade your plan for more features" "none"
+
+# --- DIVE-4206: the banners the harnesses actually print in 2026-09 ----------
+# Both signatures of _hb_pane_is_usage_limit live on ONE line in today's copy,
+# and the pane matched neither half: `session limit` was missing from the header
+# alternation, and the action arm demanded `at` or `in` after `resets`. So a
+# walled seat read `none` here, the DIVE-1666 self-heal never fired, and — via
+# the supervisor's matching gap — the DIVE-4104 park did not fire either.
+SESSION_BANNER="You've hit your session limit · resets 4am (UTC)"
+cls_t "the session-limit banner is a rate limit, not undetermined" "$SESSION_BANNER" "rate-limit"
+cls_t "a bare clock without a meridiem still classifies" "You've hit your usage limit · resets 11:30am" "rate-limit"
+cls_t "the DIVE-1666 dialog's own resume line satisfies the action arm" \
+  $'● Usage limit reached\n  continuing automatically at 4pm' "rate-limit"
+_hb_pane_is_usage_limit "$SESSION_BANNER" \
+  && ok_t "the session-limit banner reads as a wall (DIVE-4206)" \
+  || bad_t "the live session-limit banner is not detected as a wall" "$SESSION_BANNER"
+# THE TWO-SIGNATURE DISCIPLINE SURVIVES THE WIDENING. A header on its own is
+# still not a wall, and neither is an action line on its own — the property that
+# stops ordinary output mentioning `limit` from freezing a healthy seat.
+_hb_pane_is_usage_limit "You've hit your session limit" \
+  && bad_t "a header with no action line must not match" "one signature is not a wall" \
+  || ok_t "a session-limit header ALONE is still not a wall (two signatures required)"
+_hb_pane_is_usage_limit "the job resets 4am nightly" \
+  && bad_t "an action line with no header must not match" "one signature is not a wall" \
+  || ok_t "a bare reset time with no header is still not a wall"
+cls_t "a spend cap that also names a reset time is STILL a spend cap" \
+  $'You'"'"'ve hit your monthly spend limit · resets 4am\n  Upgrade your plan' "spend-cap"
 # rc contract: `none` must ALSO return non-zero, so `_hb_wall_class ... || x=none`
 # is a correct idiom at every call site.
 _hb_wall_class "$PERM" >/dev/null && bad_t "none must return non-zero" || ok_t "none returns non-zero (callers may use ||)"

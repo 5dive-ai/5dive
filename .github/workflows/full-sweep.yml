@@ -271,9 +271,20 @@ jobs:
         uses: oven-sh/setup-bun@v2
       - name: Run the FULL corpus (budgeted, shard ${{ matrix.shard }})
         run: |
+          # DIVE-4229: an UNGRADED shard (exit 6 -- the calibration clamp, or an
+          # over-budget verdict no second runner has confirmed) is not a red, and
+          # reached release-cut as one because a non-zero step reds the job whatever
+          # the number meant. Measured on run 34470906776: this job at 65% of budget
+          # with zero failing harnesses refused the v0.31.0 cut. exit 1 and exit 4 are
+          # GRADED verdicts and pass through untouched -- shard 1 of that same run was
+          # a real 118% budget red and still reds.
+          set +e
           bash scripts/run-harnesses.sh --tier=full \
             --shard=${{ matrix.shard }}/${{ strategy.job-total }} \
             --label=pristine --report=full-pristine-${{ matrix.shard }}.txt
+          rc=$?
+          set -e
+          bash scripts/shard-exit.sh "$rc" 'full/pristine-s${{ matrix.shard }}' 'full-pristine-${{ matrix.shard }}.txt'
       # if: always() — an over-budget or red run is exactly the run whose timings
       # somebody needs, and losing the report would leave the trend with a hole
       # precisely where it changed.
@@ -343,9 +354,20 @@ jobs:
         uses: oven-sh/setup-bun@v2
       - name: Run the FULL corpus (installed host, budgeted, shard ${{ matrix.shard }})
         run: |
+          # DIVE-4229: an UNGRADED shard (exit 6 -- the calibration clamp, or an
+          # over-budget verdict no second runner has confirmed) is not a red, and
+          # reached release-cut as one because a non-zero step reds the job whatever
+          # the number meant. Measured on run 34470906776: this job at 65% of budget
+          # with zero failing harnesses refused the v0.31.0 cut. exit 1 and exit 4 are
+          # GRADED verdicts and pass through untouched -- shard 1 of that same run was
+          # a real 118% budget red and still reds.
+          set +e
           bash scripts/run-harnesses.sh --tier=full \
             --shard=${{ matrix.shard }}/${{ strategy.job-total }} \
             --label=installed-host --report=full-installed-${{ matrix.shard }}.txt
+          rc=$?
+          set -e
+          bash scripts/shard-exit.sh "$rc" 'full/installed-host-s${{ matrix.shard }}' 'full-installed-${{ matrix.shard }}.txt'
       - uses: actions/upload-artifact@v4
         if: always()
         with:

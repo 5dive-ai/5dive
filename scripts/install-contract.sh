@@ -229,6 +229,151 @@ if (( ${#VERBS[@]} >= 40 )); then
   done
 fi
 
+# ---------------------------------------------------------------------------
+# T6 — DIVE-4128: the per-box shared team wiki, graded by EXECUTION
+# ---------------------------------------------------------------------------
+# The row's VERIFY section asks for a FRESH BOX: `memory add --store=wiki`
+# succeeds, a SECOND SEAT can search what the first published, and the negative
+# arm (no root anywhere -> the refusal says why). None of that is producible on
+# our own fleet: `_memory_wiki_root`'s last fallback
+# /home/claude/projects/5dive/community/wiki is hardcoded and EXISTS there, so a
+# fleet box cannot make the absent-root state at all, and the 2775 root:claude
+# modes need an installer running as root. This container is the fresh box —
+# install.sh has just run against ubuntu:22.04 as root and there is no
+# community/wiki checkout on it.
+#
+# The arms below therefore grade the two halves a unit suite structurally
+# cannot: the REAL mode bits the installer produced, and two REAL unprivileged
+# seats sharing knowledge through them.
+#
+# NOT covered here, stated rather than implied: `agent create
+# --inherit-memory=wiki` seeding N>0 and printing N. Creating an agent needs a
+# credential this container has none of. That path is graded by execution in
+# tests/shared_wiki_root_unit.sh, which calls the real `_seed_wiki_memory`
+# against populated / empty / absent roots and was mutation-graded (silencing
+# the absent-root warn reds 2 arms).
+WIKI_ROOT=/var/lib/5dive/wiki
+
+if [[ ! -d "$WIKI_ROOT" ]]; then
+  bad_t "T6a the installer provisioned the shared team wiki" \
+        "$WIKI_ROOT is not a directory on a box install.sh has just run against — every seat's atoms stay private and 'memory add --store=wiki' refuses"
+else
+  ok_t "T6a the installer provisioned the shared team wiki at $WIKI_ROOT"
+
+  # Exact bits, not an installer 'ok' line. setgid keeps a page written by any
+  # seat in group claude; g+w is what makes every seat a PUBLISHER rather than
+  # a reader; root:claude is the ownership the resolver's consumers assume.
+  got=$(stat -c '%a %U:%G' "$WIKI_ROOT" 2>/dev/null || echo "unreadable")
+  if [[ "$got" == "2775 root:claude" ]]; then
+    ok_t "T6b $WIKI_ROOT is 2775 root:claude (setgid + group-writable)"
+  else
+    bad_t "T6b $WIKI_ROOT is 2775 root:claude" "stat says '$got' — expected '2775 root:claude'"
+  fi
+
+  # `memory add` deliberately never invents an index, so without this seed the
+  # first page published on a fresh box is written and then never listed.
+  if [[ -f "$WIKI_ROOT/index.md" ]]; then
+    imode=$(stat -c '%a' "$WIKI_ROOT/index.md" 2>/dev/null || echo "?")
+    if [[ "$imode" == "664" ]]; then
+      ok_t "T6c the seeded index.md is present and group-writable (664)"
+    else
+      bad_t "T6c the seeded index.md is group-writable" "mode $imode — the second publisher's index append will be refused"
+    fi
+  else
+    bad_t "T6c the installer seeded an index.md" "absent — the first page published here is never listed"
+  fi
+
+  # --- two REAL unprivileged seats, which is the whole point of a team wiki ---
+  if ! getent group claude >/dev/null 2>&1; then
+    bad_t "T6d group 'claude' exists" "absent — the shared wiki has no group to share through"
+  else
+    seat_rc=0
+    id -u wikiseat_a >/dev/null 2>&1 || useradd -m -G claude wikiseat_a >/dev/null 2>&1 || seat_rc=1
+    id -u wikiseat_b >/dev/null 2>&1 || useradd -m -G claude wikiseat_b >/dev/null 2>&1 || seat_rc=1
+    if (( seat_rc != 0 )); then
+      bad_t "T6d two unprivileged seats can be created" "useradd failed; the second-seat arms cannot run"
+    else
+      as_seat() { # <user> <command-string>  (body, if any, on stdin)
+        su -s /bin/bash "$1" -c "$2"
+      }
+
+      # (1) fresh box -> `memory add --store=wiki` SUCCEEDS as a non-root seat.
+      addout=$(printf 'A page published by the first seat, to be found by the second.\n' \
+        | as_seat wikiseat_a "$FIVE memory add --store=wiki --name=contract-probe-seat-a \
+            --description='install-contract probe: seat A publishes to the shared team wiki'" 2>&1)
+      arc=$?
+      if (( arc == 0 )) && [[ -f "$WIKI_ROOT/contract-probe-seat-a.md" ]]; then
+        ok_t "T6d a non-root seat publishes to the shared wiki (memory add --store=wiki, rc 0)"
+      else
+        bad_t "T6d a non-root seat publishes to the shared wiki" "rc=$arc out=$(tr '\n' ' ' <<<"$addout" | cut -c1-300)"
+      fi
+
+      # setgid doing its job: the page seat A wrote carries the SHARED group,
+      # not seat A's private one. Without it the wiki de-shares itself one page
+      # at a time and the failure surfaces as a permission error on some later
+      # seat's edit, which nobody connects back to here.
+      if [[ -f "$WIKI_ROOT/contract-probe-seat-a.md" ]]; then
+        pg=$(stat -c '%G' "$WIKI_ROOT/contract-probe-seat-a.md" 2>/dev/null || echo "?")
+        if [[ "$pg" == "claude" ]]; then
+          ok_t "T6e a page written by seat A keeps group 'claude' (setgid held)"
+        else
+          bad_t "T6e a page written by seat A keeps group 'claude'" "group is '$pg' — the wiki de-shares itself page by page"
+        fi
+      fi
+
+      # (2) A SECOND SEAT CAN SEARCH IT. This is the row's headline claim and
+      # the one thing no unit arm on a fleet box can stand in for.
+      sout=$(as_seat wikiseat_b "$FIVE memory search --store=wiki 'install-contract probe seat A publishes'" 2>&1)
+      src=$?
+      if (( src == 0 )) && grep -q 'contract-probe-seat-a' <<<"$sout"; then
+        ok_t "T6f a SECOND seat searches the wiki and finds what the first published"
+      else
+        bad_t "T6f a SECOND seat searches the wiki and finds what the first published" \
+              "rc=$src out=$(tr '\n' ' ' <<<"$sout" | cut -c1-300)"
+      fi
+
+      # (3) The second writer. A shared wiki that is write-once per author is a
+      # set of private pages in one directory: seat B must be able to append the
+      # index seat A just wrote into.
+      bout=$(printf 'A page published by the second seat.\n' \
+        | as_seat wikiseat_b "$FIVE memory add --store=wiki --name=contract-probe-seat-b \
+            --description='install-contract probe: seat B publishes after seat A'" 2>&1)
+      brc=$?
+      if (( brc == 0 )) && grep -q 'contract-probe-seat-b' "$WIKI_ROOT/index.md" 2>/dev/null; then
+        ok_t "T6g seat B publishes too and its line reaches the index seat A wrote into"
+      else
+        bad_t "T6g seat B publishes too and its line reaches the shared index" "rc=$brc out=$(tr '\n' ' ' <<<"$bout" | cut -c1-300)"
+      fi
+
+      # (4) THE NEGATIVE ARM — the defect this row exists to remove. With no
+      # wiki root anywhere, the old code refused with a path the operator could
+      # not create, and the seeding path reported success. Producible only here:
+      # a fleet box always has the hardcoded community/wiki fallback.
+      mv "$WIKI_ROOT" "${WIKI_ROOT}.contract-off" 2>/dev/null || true
+      nout=$(printf 'x\n' | as_seat wikiseat_a "$FIVE memory add --store=wiki --name=contract-probe-noroot \
+            --description='install-contract probe: must be refused when no root exists'" 2>&1)
+      nrc=$?
+      mv "${WIKI_ROOT}.contract-off" "$WIKI_ROOT" 2>/dev/null || true
+      if (( nrc != 0 )); then
+        ok_t "T6h with no wiki root anywhere, 'memory add --store=wiki' REFUSES (rc $nrc)"
+      else
+        bad_t "T6h with no wiki root anywhere, 'memory add --store=wiki' refuses" "it exited 0 — a publish that went nowhere reported success"
+      fi
+      # The refusal must name the root the operator can actually get, and how to
+      # get it. The pre-DIVE-4128 message named `community/wiki`, a path that
+      # exists only on our fleet and that no customer can create.
+      if grep -q '/var/lib/5dive/wiki' <<<"$nout" && grep -qi 'installer' <<<"$nout"; then
+        ok_t "T6i the refusal names /var/lib/5dive/wiki and the installer as the fix"
+      else
+        bad_t "T6i the refusal names /var/lib/5dive/wiki and the installer as the fix" \
+              "out=$(tr '\n' ' ' <<<"$nout" | cut -c1-300)"
+      fi
+
+      rm -f "$WIKI_ROOT/contract-probe-seat-a.md" "$WIKI_ROOT/contract-probe-seat-b.md"
+    fi
+  fi
+fi
+
 echo
 echo "install contract: $PASS passed, $FAIL failed"
 (( FAIL == 0 )) || exit 1

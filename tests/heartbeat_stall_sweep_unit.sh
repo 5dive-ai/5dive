@@ -117,8 +117,15 @@ db "UPDATE tasks SET handoff_delivered_at=datetime('now','-${_HB_VERIFY_STALE_MI
 _hb_stall_sweep >/dev/null 2>&1
 grep -q $'^olivia\t.*delivered to you' "$SEND_LOG" \
   && ok_t "stale delivery pings the verifier" || bad_t "verifier not pinged" "$(cat "$SEND_LOG")"
-grep -q $'^ops\t.*Delivered-awaiting-verifier' "$SEND_LOG" \
-  && ok_t "stale delivery also pings ops (never invisible)" || bad_t "ops not pinged" "$(cat "$SEND_LOG")"
+# DIVE-4206 INVERTED this assertion. It used to demand a COPY to ops on every
+# stale delivery in the fleet — 295 of them in ops's session log over two days,
+# none of them ops's move, each one landing as a user turn in the middle of the
+# row ops was working. The verifier ping above is the one that reaches a seat
+# that can act; the board carries the rest. So the copy is now a REGRESSION, and
+# this is the assertion that keeps it from coming back.
+[[ "$(cut -f1 "$SEND_LOG" | grep -c '^ops$')" == "0" ]] \
+  && ok_t "stale delivery does NOT copy a third seat — only the verifier is pinged (DIVE-4206)" \
+  || bad_t "the ops copy is back" "$(cat "$SEND_LOG")"
 [[ "$(db "SELECT COALESCE(handoff_stale_pinged_at,'NULL') FROM tasks WHERE id=${a};")" != "NULL" ]] \
   && ok_t "stale-ping flag stamped" || bad_t "flag not stamped" ""
 

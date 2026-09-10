@@ -185,7 +185,13 @@ id6=$(run add --assignee=alice --no-verify -- "prose file gate" | jf '.data.id')
 # --recommend applies only to decision/approval. The thing under test is the
 # READER, which is the same reader for every gate type — so grading it on the type
 # that lets prose through is the honest arm, not a weaker one.
-run need "$id6" --type=approval --ask-file="$PF" --recommend-file="$PF" >/dev/null
+# --ask-ok (DIVE-4176): the payload is a deliberately hostile byte string — flags,
+# braces, backticks, a dollar amount — and it is meant to be, because the thing
+# under test is BYTE FIDELITY through the file flags, not readability. Declaring
+# the escape is the honest way to say so; rewording the payload would delete the
+# property the arm exists to grade.
+run need "$id6" --type=approval --ask-file="$PF" --recommend-file="$PF" \
+    --ask-ok="fixture: this payload is a byte-fidelity probe, not prose a human reads" >/dev/null
 [[ "$(dbhex ask "$id6")" == "$PAYLOAD_HEX" ]] \
   && ok_t "task need --ask-file records the ask byte-identically" \
   || bad_t "task need --ask-file byte-identical" "got hex: $(dbhex ask "$id6"); err: $(cat "$TMP"/err)"

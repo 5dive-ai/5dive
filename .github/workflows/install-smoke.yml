@@ -161,7 +161,22 @@ jobs:
           done
           exit "$rc"
 
+  # DIVE-4186 — QUEUE-TIME ONLY (115 job-s per PR). The merge queue (DIVE-4139) grades
+  # `docker-install` on the `gh-readonly-queue/main/...` merge group, so its `pull_request`
+  # arm was a second full `docker build` of the same tree. `merge_group` and `push` keep it.
+  #
+  # This does NOT contradict the "no path filter on a required context" invariant at the top
+  # of this file. That rule is about a required context that can never report on the event
+  # branch protection reads — an unmergeable PR. Here the context still reports on the event
+  # the merge is decided on (the merge group), and on a `pull_request` it reports the
+  # conclusion `skipped`, which branch protection counts as satisfied.
+  #
+  # THE HAZARD THAT BUYS: if the queue is ever turned OFF, a PR would merge with
+  # `docker-install` never having run — skipped-as-satisfied, silently. Turning the queue
+  # off means reverting this arm in the same window; `tests/queue_time_only_arms_unit.sh`
+  # is what keeps the pairing visible.
   docker-install:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

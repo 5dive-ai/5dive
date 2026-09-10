@@ -70,7 +70,8 @@ _memory_usage() {
                    [--no-dedup] [--force]  (body on stdin)
       Compile a durable memory: writes a frontmatter markdown file into your
       own store (default) or the shared team wiki (--store=wiki, the publish
-      path other agents can search), stamps provenance (who/when), appends the
+      path other agents can search — /var/lib/5dive/wiki on a normal box, the
+      product repo's community/wiki on our fleet, $FIVEDIVE_WIKI_ROOT overrides), stamps provenance (who/when), appends the
       store's index line, and refuses token/key-shaped content (tripwire;
       --force does NOT bypass it). Existing file needs --force to overwrite.
       Lifecycle envelope (, all optional): --valid-to = date the fact
@@ -198,10 +199,38 @@ _memory_own_roots() {
   local IFS=,; echo "${roots[*]}"
 }
 
+# DIVE-4128: the shared team wiki root. This used to test ONLY the two paths
+# where OUR fleet keeps it — the product repo's `community/wiki` checkout — so
+# on a customer box it resolved to "" and every consumer degraded SILENTLY:
+# `memory add --store=wiki` refused, `_memory_default_roots` fell back to
+# own-stores-only (so every seat's atoms stayed 0600-private and no teammate
+# could search them), and `agent create --inherit-memory=wiki` seeded 0 files
+# while REPORTING SUCCESS. Measured on a v0.28.0 customer box: one seat with
+# 119 private atoms, the other three with 0, every agent booted cold.
+#
+# Precedence, and why:
+#   $FIVEDIVE_WIKI_ROOT   explicit override — tests, and a box that keeps its
+#                         wiki somewhere else. Honoured even if it does not
+#                         exist yet is NOT the behaviour: an override naming a
+#                         missing dir is the same "no wiki here" as any other,
+#                         and reporting one that isn't there is the defect this
+#                         row exists to remove.
+#   /var/lib/5dive/wiki   THE per-box shared wiki, provisioned by install.sh at
+#                         install and upgrade as 2775 root:claude — setgid so a
+#                         page written by any seat keeps the shared group, and
+#                         group-writable so every seat can publish, not just
+#                         read. This is the root customer boxes have.
+#   .../community/wiki    our own fleet, where the wiki IS a git-tracked
+#                         directory in the product repo. Kept as fallbacks so
+#                         nothing on the fleet moves under us — and install.sh
+#                         deliberately does NOT provision the box root on a box
+#                         that has this checkout, so the fleet keeps publishing
+#                         into git rather than into a second, untracked copy.
 _memory_wiki_root() {
-  # Shared wiki (internal fleet only; absent on customer boxes — harmless).
   local d
-  for d in "$HOME"/projects/5dive/community/wiki /home/claude/projects/5dive/community/wiki; do
+  for d in "${FIVEDIVE_WIKI_ROOT:-}" /var/lib/5dive/wiki \
+           "$HOME"/projects/5dive/community/wiki /home/claude/projects/5dive/community/wiki; do
+    [ -n "$d" ] || continue
     [ -d "$d" ] && { echo "$d"; return 0; }
   done
   echo ""
@@ -242,7 +271,7 @@ _memory_resolve_roots() {
     fi
     if [ -n "$own" ] && [ -n "$wiki" ]; then roots="$own,$wiki"; else roots="${own}${wiki}"; fi
   fi
-  [ -n "$roots" ] || fail "$E_NOT_FOUND" "no memory stores found (looked in ~/.claude/projects/*/memory); pass --roots="
+  [ -n "$roots" ] || fail "$E_NOT_FOUND" "no memory stores found for this user (looked in ~/.claude/projects/*/memory); name whose store to read with --agent=<agent>, or point at one with --roots=<dir>"
   echo "$roots"
 }
 
@@ -686,7 +715,7 @@ _memory_add() {
   local dir="" file="" index_file="" index_line=""
   if [ "$store" = "wiki" ]; then
     dir=$(_memory_wiki_root)
-    [ -n "$dir" ] || fail "$E_NOT_FOUND" "no shared wiki on this box (community/wiki) — use --store=mine"
+    [ -n "$dir" ] || fail "$E_NOT_FOUND" "no shared team wiki on this box — looked for \$FIVEDIVE_WIKI_ROOT, /var/lib/5dive/wiki, ~/projects/5dive/community/wiki. Provision the box-shared root by re-running the 5dive installer (it creates /var/lib/5dive/wiki, group-writable by every seat), or publish privately with --store=mine"
     [ -w "$dir" ] || fail "$E_PERMISSION" "wiki dir $dir is not writable by $(whoami)"
     file="$dir/$name.md"
     index_file="$dir/index.md"
@@ -750,6 +779,18 @@ _memory_add() {
   # never invent a MEMORY.md/index.md the store's owner didn't set up).
   if [ "$existed" -eq 0 ] && [ -f "$index_file" ] && ! grep -qF "]($(basename "$file"))" "$index_file"; then
     printf '%s\n' "$index_line" >> "$index_file"
+  fi
+
+  # DIVE-4128: a SHARED wiki is only shared if the NEXT seat can write it too.
+  # The default umask leaves a new page and the index 0644 — readable by every
+  # seat and appendable by none but its author, so the second publisher's
+  # `memory add --store=wiki` dies on a permission error nobody would connect
+  # to the wiki being shared. setgid on the root (install.sh) keeps the group;
+  # this keeps the group WRITE bit. Best-effort by design: on a root we do not
+  # own the chmod fails and the page we just wrote is still there.
+  if [ "$store" = "wiki" ]; then
+    chmod g+w "$file" 2>/dev/null || true
+    [ -f "$index_file" ] && { chmod g+w "$index_file" 2>/dev/null || true; }
   fi
 
   if (( JSON_MODE )); then
@@ -1269,7 +1310,7 @@ _memory_doctor() {
     if [ -n "$own" ] && [ -n "$wiki" ]; then roots="$own,$wiki"
     else roots="${own}${wiki}"; fi
   fi
-  [ -n "$roots" ] || fail "$E_NOT_FOUND" "no memory stores found (looked in ~/.claude/projects/*/memory); pass --roots="
+  [ -n "$roots" ] || fail "$E_NOT_FOUND" "no memory stores found for this user (looked in ~/.claude/projects/*/memory); name whose store to read with --agent=<agent>, or point at one with --roots=<dir>"
   # Default code-root for stale-ref checks: the 5dive monorepo if it's here.
   if [ -z "$code_root" ]; then
     for d in /home/claude/projects/5dive "$HOME/projects/5dive"; do
