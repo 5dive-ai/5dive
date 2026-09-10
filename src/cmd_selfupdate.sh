@@ -1458,7 +1458,7 @@ cmd_update_check() {
     local start_line
     start_line=$(grep -n "soft updates start" "$log" | tail -1 | cut -d: -f1) || start_line=""
     if [[ -n "$start_line" ]]; then
-      if tail -n "+${start_line}" "$log" | grep -q "CLI upgrade via install.5dive.com failed"; then
+      if grep -q "CLI upgrade via install.5dive.com failed" < <(tail -n "+${start_line}" "$log"); then
         last_ok_json="false"
       else
         last_ok_json="true"

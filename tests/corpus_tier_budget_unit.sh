@@ -883,8 +883,8 @@ want "PAIR: the same corpus one notch INSIDE the clamp exits 0 — the 6 above i
 # The lazy version of this line is "calibration unavailable, falling back to the raw
 # cap", which is the free escape hatch DIVE-2525 closed wearing a new name. A probe
 # that cannot run means the budget was not graded, and not-graded is not passed.
-OUT="$(bash "$RUNNER" --corpus-dir="$TMP" --tier=full --budget=1 --label=t \
-  --cal-cli=/nonexistent/5dive 2>&1)"; RC=$?
+OUT="$(TIER_CAL_PROBE_TMPDIR=/nonexistent/calibration-root bash "$RUNNER" \
+  --corpus-dir="$TMP" --tier=full --budget=1 --label=t 2>&1)"; RC=$?
 want "ARM 4: a calibration that cannot run FAILS CLOSED (exit 6)" "6" "$RC"
 if [[ "$OUT" == *"UNDETERMINED"* && "$OUT" != *"BUDGET DISABLED"* ]]; then
   ok "a missing probe is UNDETERMINED, never 'budget disabled' — the difference is whether the gate still exists"
@@ -893,10 +893,19 @@ else bad "a missing probe is UNDETERMINED, never 'budget disabled'" "$OUT"; fi
 # hide a failing test, which is why the undetermined verdict is resolved at the exit
 # ladder rather than short-circuiting before the corpus ever ran.
 printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/broken.sh"
-bash "$RUNNER" --corpus-dir="$TMP" --tier=full --budget=1 --label=t \
-  --cal-cli=/nonexistent/5dive >/dev/null 2>&1; RC=$?
+TIER_CAL_PROBE_TMPDIR=/nonexistent/calibration-root bash "$RUNNER" \
+  --corpus-dir="$TMP" --tier=full --budget=1 --label=t >/dev/null 2>&1; RC=$?
 want "a FAILING harness still exits 1 even when the runner could not be measured" "1" "$RC"
 rm -f "$TMP/broken.sh"
+
+# DIVE-4166: the runner probe must be product-independent. A source replay is the
+# correct arm here: restoring a product `--version` invocation makes this fail even if the two
+# binaries happen to time similarly on this particular box.
+_calbody="$(sed -n '/^cal_probe()/,/^}/p' "$RUNNER")"
+if [[ "$_calbody" == *"bash -c ':'"* && "$_calbody" == *'printf '\''cal %s'* \
+   && "$_calbody" != *'CAL_CLI'* && "$_calbody" != *'--version'* ]]; then
+  ok "the calibration workload contains fixed spawn + file IO and cannot time the product under test"
+else bad "the calibration probe is independent of the product" "$_calbody"; fi
 
 # ---- 57 ARM 5: DIVE-2592's CONFIRMATION STILL FIRES, and now against the SCALED cap
 # The two mechanisms are complementary, not alternatives (olivia, DIVE-2710): the
@@ -931,7 +940,7 @@ else bad "the report carries the calibration fields beside the originals" "missi
 # Same rule as --budget and --confirm-top: the policy lives beside the tier definition,
 # not scattered across callers. A workflow that injected its own calibration would be
 # choosing its own cap in a YAML nobody reviews as a policy change.
-_wfcal="$(grep -rn -- '--cal-us=\|--cal-baseline-us=\|--cal-cli=' .github/workflows/ 2>/dev/null || true)"
+_wfcal="$(grep -rn -- '--cal-us=\|--cal-baseline-us=' .github/workflows/ 2>/dev/null || true)"
 if [[ -z "$_wfcal" ]]; then
   ok "NO workflow injects a calibration — the seam is for this harness and for a human measuring, never for a caller picking its own cap"
 else bad "NO workflow injects a calibration" "$_wfcal"; fi
@@ -939,10 +948,9 @@ else bad "NO workflow injects a calibration" "$_wfcal"; fi
 # ---- 60 the precondition this row MADE load-bearing
 # Before DIVE-2728 a job that forgot ./build.sh ran the corpus anyway (some earlier
 # harness builds the bundle as a side effect — the ordering accident unit-tests.yml
-# already documents at its own build step). Now the calibration probe SPAWNS that
-# bundle, and a missing one fails closed at exit 6. Fail-closed is correct and it also
-# means a mis-ordered workflow reds the whole sweep for a reason whose message is
-# about calibration, not about YAML. So the ordering gets an assertion.
+# already documents at its own build step). The calibration probe no longer spawns
+# the product, but the harness corpus still grades that built artifact, so the ordering
+# remains an explicit workflow contract.
 #
 # WHAT THIS CHECKS AND WHAT IT DOES NOT: step INDEX within the SAME JOB, parsed, not
 # grepped — a file-wide "both strings appear" test would pass a workflow where the two
@@ -966,7 +974,7 @@ print(' '.join(bad))
 PY
 )"
 if [[ -z "$_ord" ]]; then
-  ok "every job that runs the budgeted runner BUILDS THE BUNDLE FIRST, in that job — the calibration probe spawns it, and a missing bundle now fails closed"
+  ok "every job that runs the budgeted runner BUILDS THE BUNDLE FIRST, in that job — the corpus grades the built artifact even though calibration does not"
 else bad "every job that runs the budgeted runner builds the bundle first, in that job" "offending job(s): $_ord"; fi
 
 # ------------------ DIVE-3477: THE CORPUS-GROWTH TRIPWIRE, GRADED AS ARITHMETIC
@@ -1271,6 +1279,25 @@ if (( _rc == 0 )) && [[ "$_r" == *"median-widen"* ]]; then
   ok "an admitted lowering REPORTS the widening it bought, so the cost is in the output rather than in the reviewer's head"
 else bad "an admitted lowering prints its median-widen" "rc=$_rc $_r"; fi
 
+# DIVE-4166's replacement reference is tied to the harvested GitHub-hosted window,
+# not to a spot reading from the authoring box. Run 34370181210 supplied exactly 20
+# independent ubuntu-latest samples of the product-free workload. tier-cal-window
+# classified the second list as concordant; the first supported candidate is 1641.
+PF_ALL=(1208 1227 1444 1479 1486 1507 1520 1526 1526 1532 1532 1541 1580 1584 1629 1641 1671 1687 1805 3768)
+PF_CONC=(1208 1227 1584 1629 1641 1671 1687 3768)
+_pf_ref="$(awk -F= '$1 == "TIER_CAL_BASELINE_US" { print $2; exit }' tests/lib/tier.sh)"
+if (( ${#PF_ALL[@]} == 20 )) && [[ "${PF_ALL[9]}" == 1532 ]]; then
+  ok "the product-free reference carries the complete n=20 GitHub-hosted window and its measured lower median"
+else bad "the product-free reference window remains complete" "n=${#PF_ALL[@]} median=${PF_ALL[9]:-absent}"; fi
+_r="$(bash tests/lib/tier.sh refadmit 1629 138281 "${PF_CONC[@]}" 2>&1)"; _rc=$?
+if (( _rc != 0 )) && [[ "$_r" == *"refuse support K=1"* ]]; then
+  ok "the raw concordant median is REFUSED when only one in-band neighbour supports it"
+else bad "an under-supported product-free candidate is refused" "rc=$_rc $_r"; fi
+if _r="$(bash tests/lib/tier.sh refadmit "$_pf_ref" 138281 "${PF_CONC[@]}" 2>&1)" \
+   && [[ "$_pf_ref" == 1641 && "$_r" == *"K=2"* && "$_r" == *"median-widen=100%"* ]]; then
+  ok "TIER_CAL_BASELINE_US is the first admissible product-free candidate (K=2, bounded at 100%)"
+else bad "the shipped product-free reference is admissible on its named window" "ref=$_pf_ref result=$_r"; fi
+
 # The harvester. Graded on a SAVED log rather than a live gh call: a test that needs
 # credentials and a network is a test that gets skipped, and a skip on the arm that
 # proves the window can be rebuilt is exactly the silence this row is about.
@@ -1317,9 +1344,35 @@ if [[ -x "$HARV" ]]; then
   # translation layer, the harvester has drifted from the report format it mimics.
   bash "$HARV" --from-log="$TMP/fake.log" --run=2 --out="$TMP/harv" >/dev/null 2>&1
   bash "$HARV" --from-log="$TMP/fake.log" --run=3 --out="$TMP/harv" >/dev/null 2>&1
-  if bash "$WIN" "$TMP"/harv/*.report >/dev/null 2>&1; then
-    ok "scripts/tier-cal-window.sh reads harvested reports with no changes — the window's stated blocker ('reports do not persist') was never true of the fields it reads"
-  else bad "window consumes harvested reports unchanged" "$(bash "$WIN" "$TMP"/harv/*.report 2>&1 | tail -3)"; fi
+  _wout="$(bash "$WIN" "$TMP"/harv/*.report 2>&1)"; _wrc=$?
+  if (( _wrc == 0 )) && [[ "$_wout" == *"across 2 label group(s)"* \
+     && "$_wout" == *"installed-host/core"* && "$_wout" == *"pristine/core"* ]]; then
+    ok "the window consumes harvested reports and computes separate medians for each label/tier population"
+  else bad "window consumes harvested reports without pooling unlike populations" "rc=$_wrc $_wout"; fi
+
+  # The per-run warning was ignored for an entire release. Twenty comparable samples
+  # at the same label now become one durable cross-run verdict that the scheduled
+  # workflow publishes to its issue.
+  mkdir -p "$TMP/rebase-window"
+  for _n in $(seq 1 20); do
+    cat > "$TMP/rebase-window/$_n.report" <<EOF
+# run-harnesses report
+# harvest_run_id=$_n
+# harvest_job=core-pristine-s1
+# tier=core
+# label=pristine-s1
+# harnesses=132
+# wall_clock_s=220
+# cal_status=measured
+# cal_us_per_iter=35000
+# cal_baseline_us_per_iter=138281
+EOF
+  done
+  _rout="$(bash "$WIN" "$TMP"/rebase-window/*.report 2>&1)"; _rrc=$?
+  if (( _rrc == 0 )) && [[ "$_rout" == *"REBASELINE REQUIRED"* \
+     && "$_rout" == *"20 comparable samples"* && "$_rout" == *"75% off baseline"* ]]; then
+    ok "twenty same-label drift readings become one actionable REBASELINE REQUIRED verdict"
+  else bad "repeated baseline drift is a cross-run verdict" "rc=$_rrc $_rout"; fi
 else
   bad "scripts/tier-cal-harvest.sh is executable" "not found or not +x"
 fi
@@ -1559,10 +1612,23 @@ chk(not missing,
     'missing: ' + ','.join(missing))
 
 # 93 — fail closed. Grades the aggregator's `if:` and the presence of a .result test.
+#
+# DIVE-4186 — ONE extra conjunct is allowed, spelled in full, and nothing else. The
+# installed-host aggregators are QUEUE-TIME ONLY now: they carry
+# `always() && github.event_name != 'pull_request'` so the merge queue grades them on the
+# merge group and a PR does not pay for a second grade of the same tree.
+#
+# THIS IS A WHITELIST, NOT A LOOSENING, and the difference is the whole point. A prefix
+# test (`startswith('always()')`) would admit `always() && false`, which is the vacuity
+# this arm exists to refuse, one character away. So the accepted set is TWO EXACT STRINGS:
+# `always()` and `always() && <that one guard>`. Any other conjunct — a different event, a
+# `false`, an input — reds here, and the negative control below drives all three.
+QUEUE_ONLY_GUARD = "always() && github.event_name != 'pull_request'"
+ACCEPTED_IF = ('always()', QUEUE_ONLY_GUARD)
 bad_agg = []
 for c in REQUIRED:
     j = jobs.get(c) or {}
-    if str(j.get('if', '')).strip() != 'always()':
+    if str(j.get('if', '')).strip() not in ACCEPTED_IF:
         bad_agg.append('%s: if=%r, so a failed dependency SKIPS it and a skipped required check reads as satisfied' % (c, j.get('if')))
         continue
     if not any('.result' in r for r in runs(j)):
@@ -1570,6 +1636,22 @@ for c in REQUIRED:
 chk(not bad_agg,
     'each required check RUNS on always() and asserts its dependencies\' .result (a bare needs: is satisfied by a skip, which is the merge gate passing precisely when the corpus went red)',
     ' | '.join(bad_agg))
+
+# 93b — DIVE-4186 POSITIVE CONTROL ON THE WHITELIST. A two-string whitelist is one
+# careless edit from a prefix test, and a prefix test admits `always() && false`. Drive
+# the acceptance predicate over expressions whose verdict is known, both directions.
+_accept = lambda e: e in ACCEPTED_IF
+_ctl = []
+for _e in ('always()', QUEUE_ONLY_GUARD):
+    if not _accept(_e):
+        _ctl.append('rejects the legitimate %r' % _e)
+for _e in ('always() && false', "always() && github.event_name != 'push'",
+           "always() && github.event_name != 'pull_request' && false", 'success()', ''):
+    if _accept(_e):
+        _ctl.append('admits %r' % _e)
+chk(not _ctl,
+    'the aggregator if: whitelist admits exactly always() and the queue-time-only guard, and refuses always() && false, a different event, an extra conjunct and success()',
+    ' | '.join(_ctl))
 
 # 94 — sharded, with the divisor taken from the matrix length.
 bad_shard, sharded = [], 0

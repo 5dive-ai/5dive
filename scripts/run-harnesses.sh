@@ -103,7 +103,7 @@ TIER=""; BUDGET=""; LABEL=""; REPORT=""; TOP=10; CORPUS_DIR="tests"; SHARD=""
 CONFIRM_TOP=3
 # DIVE-2728 calibration. CALIBRATE=1 means MEASURE this runner before spending the
 # budget on it; the flags below are seams, not policy, and each carries its own note.
-CALIBRATE=1; CAL_US_IN=""; CAL_BASELINE_US=""; CAL_CLI="./5dive"
+CALIBRATE=1; CAL_US_IN=""; CAL_BASELINE_US=""
 # DIVE-2736. CAL_POST=1 means take a SECOND probe after the corpus. It is a
 # discriminator, not an input to the verdict — see the block after the run loop.
 CAL_POST=1; CAL_POST_US_IN=""
@@ -180,10 +180,6 @@ for a in "$@"; do case "$a" in
   # green), but it is still an override and it is still logged as `injected`.
   --cal-us=*) CAL_US_IN="${a#--cal-us=}" ;;
   --cal-baseline-us=*) CAL_BASELINE_US="${a#--cal-baseline-us=}" ;;
-  # Which binary the probe spawns. The probe must pay the CLI's own startup because
-  # that is what the corpus pays; pointing this at a path that does not exist is how
-  # the harness grades the fail-closed arm.
-  --cal-cli=*) CAL_CLI="${a#--cal-cli=}" ;;
   # DIVE-2736 seams. The post-corpus probe costs another ~20s of job time and grades
   # NOTHING, so --no-cal-post exists for anyone who wants the old cost; it cannot move a
   # verdict in either direction, which is the whole point of it. --cal-post-us= injects
@@ -213,7 +209,7 @@ esac; done
 
 case "$TIER" in
   core|full) ;;
-  *) printf 'usage: run-harnesses.sh --tier=core|full [--budget=<seconds>] [--label=<env>] [--report=<file>] [--corpus-dir=<dir>] [--confirm-top=<n>] [--no-calibrate] [--cal-us=<us/iter>] [--cal-baseline-us=<us/iter>] [--cal-cli=<path>] [--no-cal-post] [--cal-post-us=<us/iter>] [--cross-runner=off|required] [--runner-id=<id>] [--prior-over-runner=<id>] [--drift-fatal=off|required] [--baseline-report=<file>]...\n' >&2; exit 2 ;;
+  *) printf 'usage: run-harnesses.sh --tier=core|full [--budget=<seconds>] [--label=<env>] [--report=<file>] [--corpus-dir=<dir>] [--confirm-top=<n>] [--no-calibrate] [--cal-us=<us/iter>] [--cal-baseline-us=<us/iter>] [--no-cal-post] [--cal-post-us=<us/iter>] [--cross-runner=off|required] [--runner-id=<id>] [--prior-over-runner=<id>] [--drift-fatal=off|required] [--baseline-report=<file>]...\n' >&2; exit 2 ;;
 esac
 [[ "$CONFIRM_TOP" =~ ^[0-9]+$ ]] || { printf 'run-harnesses: --confirm-top must be a non-negative integer, got %s\n' "$CONFIRM_TOP" >&2; exit 2; }
 # DIVE-2829: an unrecognised MODE is usage, never a silent fall back to `off`. A typo
@@ -278,10 +274,9 @@ fi
 # probe that spent the corpus's budget would be a tax for the privilege of measuring.
 #
 # THE PROBE'S SHAPE IS THE LOAD-BEARING CHOICE (trap 3 in tests/lib/tier.sh): process
-# spawn, bash startup, the built CLI's own startup, small file write+read. That is
-# what these harnesses actually cost. A CPU spin would have been shorter to write and
-# would calibrate a dimension the corpus barely pays for, so it would track a draw the
-# corpus does not feel — a probe can be perfectly precise about the wrong thing.
+# spawn, bash startup and small file write+read. Those are fixed external costs the
+# harness corpus pays. The artifact under test must never enter this workload: a CLI
+# speedup is a product change, not evidence that the runner drew fast (DIVE-4166).
 #
 # AUTO-SIZED TO A TIME TARGET, NOT TO A FIXED ITERATION COUNT, and reported PER
 # ITERATION. A fixed count is a probe whose DURATION depends on the box, which is
@@ -291,11 +286,10 @@ fi
 # different counts. Min of TIER_CAL_SAMPLES, on DIVE-2592's one-sided-noise argument.
 cal_probe() { # <iters> -> elapsed ms on stdout; non-zero if the probe could not run
   local n="$1" i s e d rc=0
-  d="$(mktemp -d "${TMPDIR:-/tmp}/harness-cal.XXXXXX")" || return 1
+  d="$(mktemp -d "${TIER_CAL_PROBE_TMPDIR:-${TMPDIR:-/tmp}}/harness-cal.XXXXXX")" || return 1
   s=$(date +%s%N)
   for (( i = 0; i < n; i++ )); do
     bash -c ':' || { rc=1; break; }
-    "$CAL_CLI" --version >/dev/null 2>&1 || { rc=1; break; }
     printf 'cal %s\n' "$i" > "$d/probe" || { rc=1; break; }
     read -r _ < "$d/probe" || { rc=1; break; }
   done
@@ -334,9 +328,6 @@ undetermined=0
 if (( BUDGET > 0 )) && [[ -n "$CAL_US_IN" ]]; then
   CAL_US="$CAL_US_IN"; CAL_STATUS="injected"
 elif (( BUDGET > 0 && CALIBRATE == 1 )); then
-  if [[ ! -x "$CAL_CLI" ]]; then
-    CAL_STATUS="failed"; CAL_WHY="no executable CLI at $CAL_CLI (run ./build.sh)"
-  else
     printf 'harness-budget[%s/%s]: calibrating this runner (~%ds, NOT counted toward the corpus total)\n' \
       "$TIER" "$LABEL" "$(( TIER_CAL_TARGET_MS * TIER_CAL_SAMPLES / 1000 ))"
     # ONE UNTIMED WARM-UP ITERATION, and it is not decoration. Measured here on the
@@ -362,7 +353,6 @@ elif (( BUDGET > 0 && CALIBRATE == 1 )); then
       done
       if [[ -n "$_best" ]]; then CAL_US="$_best"; CAL_STATUS="measured"; fi
     fi
-  fi
 fi
 
 if [[ "$CAL_STATUS" == "measured" || "$CAL_STATUS" == "injected" ]]; then

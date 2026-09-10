@@ -261,5 +261,80 @@ r0="$(commit_add_harness "still_fine_unit.sh" "$GOOD_HARNESS" "depth-0 harness, 
 bash "$GUARD" "$r0" "$c0" >/dev/null 2>&1
 assert_exit "guard: regression — the canonical line still passes directly in tests/" 0 "$?"
 
+# --- DIVE-4108: a LARGE compliant harness must never be refused -----------
+# The guard asked `printf '%s\n' "$content" | grep -qE "$RE"` under `set -o
+# pipefail`. grep -q exits the instant it matches; on a blob bigger than the
+# pipe can hold, printf is still writing, dies of SIGPIPE (141), pipefail
+# promotes 141 to the pipeline's status, and `if !` reads that as NO MATCH --
+# so the guard reported the OPPOSITE of what it measured and refused a
+# compliant push. Measured 2026-09-08 on DIVE-4052: `5dive push` refused on
+# attempts 1 and 2 and passed UNCHANGED on 3; six identical direct runs of the
+# guard gave rc 0,0,1,0,1,1.
+#
+# WHY THE SIZE IS THE ARM. A Linux pipe holds 64 KiB, so under that capacity
+# printf hands off its whole output and exits before grep can matter -- every
+# scenario above is small, which is exactly why none of them could ever lose
+# this race. The blob below is 256 KiB (4x capacity) with the source line at
+# the TOP, so the match is immediate and the producer is guaranteed to still
+# be blocked on write. N repeats because the outcome was a race, not a
+# constant: one green run was never evidence.
+git checkout -q "$c0"
+BIG_HARNESS_FILE="$TMP/big_harness.sh"
+{
+  printf '%s\n' "$GOOD_HARNESS"
+  # pad past the pipe's 64 KiB capacity; content is irrelevant, volume is the arm
+  for _i in $(seq 1 4000); do
+    printf '# pad line %04d -- volume is the point: this file must exceed one pipe buffer.\n' "$_i"
+  done
+} > "$BIG_HARNESS_FILE"
+BIG_BYTES=$(wc -c < "$BIG_HARNESS_FILE")
+if (( BIG_BYTES >= 65536 )); then
+  ok_t "guard/DIVE-4108: the large-blob fixture actually exceeds one 64 KiB pipe buffer ($BIG_BYTES bytes)"
+else
+  bad_t "guard/DIVE-4108: the large-blob fixture actually exceeds one 64 KiB pipe buffer" "only $BIG_BYTES bytes -- this arm cannot lose the race and proves nothing"
+fi
+
+cp "$BIG_HARNESS_FILE" tests/big_compliant_unit.sh
+git add -A >/dev/null
+git commit -q -m "add a large COMPLIANT harness (>=64 KiB)"
+big="$(git rev-parse HEAD)"
+
+BIG_N=20
+big_refusals=0
+for _r in $(seq 1 "$BIG_N"); do
+  bash "$GUARD" "$big" "$c0" >/dev/null 2>&1 || big_refusals=$((big_refusals+1))
+done
+if (( big_refusals == 0 )); then
+  ok_t "guard/DIVE-4108: $BIG_N identical runs over a 256 KiB compliant harness, zero refusals"
+else
+  bad_t "guard/DIVE-4108: $BIG_N identical runs over a 256 KiB compliant harness, zero refusals" \
+        "$big_refusals of $BIG_N runs REFUSED a compliant file -- the SIGPIPE race is back (see DIVE-4108)"
+fi
+
+# The size must not have bought the pass by making the guard blind: the same
+# 256 KiB shape with the source line REMOVED still has to be refused, every run.
+git checkout -q "$c0"
+{
+  printf '%s\n' "$BAD_HARNESS"
+  for _i in $(seq 1 4000); do
+    printf '# pad line %04d -- volume is the point: this file must exceed one pipe buffer.\n' "$_i"
+  done
+} > tests/big_noncompliant_unit.sh
+git add -A >/dev/null
+git commit -q -m "add a large NON-compliant harness (>=64 KiB)"
+bigbad="$(git rev-parse HEAD)"
+bigbad_passes=0
+for _r in $(seq 1 "$BIG_N"); do
+  bash "$GUARD" "$bigbad" "$c0" >/dev/null 2>&1 && bigbad_passes=$((bigbad_passes+1))
+done
+if (( bigbad_passes == 0 )); then
+  ok_t "guard/DIVE-4108: negative control — a 256 KiB harness MISSING the line is refused on all $BIG_N runs"
+else
+  bad_t "guard/DIVE-4108: negative control — a 256 KiB harness MISSING the line is refused on all $BIG_N runs" \
+        "$bigbad_passes of $BIG_N runs let it through -- the fix made the guard blind on large files"
+fi
+
+git checkout -q "$c0"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

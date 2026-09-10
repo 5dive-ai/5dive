@@ -162,6 +162,25 @@ t "DIVE-3272 regex: a bare 4290 does NOT match" "MISS" \
 t "DIVE-3272 regex: an empty pane does NOT match" "MISS" \
   "$( [[ -n "$(q '')" ]] && echo MATCH || echo MISS )"
 
+# --- DIVE-4206: the banner the harnesses actually print in 2026-09 -----------
+# The whole quota-park apparatus (DIVE-4104) reads THIS classification, and it
+# never fired on either live banner: `session limit` was absent from the header
+# alternation and `hit your usage limit` is a different word ORDER from the
+# `usage limit reached` the pattern already had. Measured 2026-09-10 02:24-02:45Z
+# on dev/dev3/ops, all three on the first string, two claims reclaimed as idle.
+t "DIVE-4206 regex: Claude Code's session-limit banner matches" "MATCH" \
+  "$( [[ -n "$(q "You've hit your session limit · resets 4am (UTC)")" ]] && echo MATCH || echo MISS )"
+t "DIVE-4206 regex: codex's usage-limit banner matches" "MATCH" \
+  "$( [[ -n "$(q "You've hit your usage limit")" ]] && echo MATCH || echo MISS )"
+t "DIVE-4206 regex: the 5-hour phrasing matches" "MATCH" \
+  "$( [[ -n "$(q "You've hit your 5-hour limit")" ]] && echo MATCH || echo MISS )"
+# The negative controls the widening has to keep passing: `limit` is an ordinary
+# English word and this pattern runs against every line of every seat's pane.
+t "DIVE-4206 regex: a session-limit setting in prose does NOT match" "MISS" \
+  "$( [[ -n "$(q 'set the session limit to 20 in the config')" ]] && echo MATCH || echo MISS )"
+t "DIVE-4206 regex: a rate limit in ordinary prose does NOT match" "MISS" \
+  "$( [[ -n "$(q 'we hit your rate limit assumptions in the load test')" ]] && echo MATCH || echo MISS )"
+
 # --- DIVE-3880: the DEADLINE inside the refusal, and what the class does with it
 #     Measured 2026-09-01 14:17Z: `agent info ops` printed NOT TRANSACTING off a
 #     refusal whose own "continuing automatically at 2:10pm" had already passed
@@ -177,6 +196,32 @@ t "DIVE-3880: a 3pm deadline read at 14:17 is live" "live" \
   "$(dl '● Usage limit reached · continuing automatically at 3pm')"
 t "DIVE-3880: a 24h form parses too" "lapsed" \
   "$(dl '● Usage limit reached · continuing automatically at 14:10')"
+# DIVE-4206: the SECOND phrasing, `... limit · resets 4am`. DIVE-3970 split
+# _sup_clock_state out expressly so this one could reuse the identical clock
+# arithmetic and then wired no caller, so until now this banner parsed as
+# `unknown` and its park fell back to the blind 6h cap instead of the reset time
+# printed on the seat's own screen.
+# Read at the clock of the incident itself (02:25Z, when dev/dev3/ops were all
+# on this banner): 04:00 is 95 minutes away and the refusal is live.
+t "DIVE-4206: the 02:25Z incident banner reads live against its own 4am reset" "live" \
+  "$(dl "You've hit your session limit · resets 4am (UTC)" "$(date -u -d '2026-09-10 02:25:00' +%s)")"
+# The SAME string at 14:17 reads lapsed, and that is _sup_quota_deadline's
+# documented residual, not a defect this row introduces: a pane line carries no
+# DATE, so the nearest-day rule picks today 04:00 (10h ago) over tomorrow's.
+# Asserted rather than left implicit — a later widening that starts anchoring on
+# tomorrow would pin every stale banner as live forever.
+t "DIVE-4206: the same banner 10h later reads lapsed (the undated-line residual)" "lapsed" \
+  "$(dl "You've hit your session limit · resets 4am (UTC)")"
+t "DIVE-4206: a resets-2:10pm banner read at 14:17 is lapsed" "lapsed" \
+  "$(dl "You've hit your session limit · resets 2:10pm")"
+t "DIVE-4206: resets with an explicit at still parses" "lapsed" \
+  "$(dl "You've hit your session limit · resets at 2:10pm")"
+# A bare hour with no meridiem stays UNKNOWN — `resets 9` is 09:00 or 21:00 and
+# guessing invents the answer. This is _sup_clock_state's own third state,
+# inherited rather than re-decided, which is the point of reusing it.
+t "DIVE-4206: an ambiguous bare hour abstains rather than guessing" "unknown" \
+  "$(dl "You've hit your session limit · resets 9")"
+
 t "DIVE-3880: no deadline in the string is UNKNOWN, never a verdict" "unknown" \
   "$(dl '● API Error: Request rejected (429) · quota has been exhausted')"
 t "DIVE-3880: a bare hour with no meridiem is ambiguous -> UNKNOWN, not a guess" "unknown" \

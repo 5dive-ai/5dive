@@ -110,6 +110,10 @@ Agents:
                                                      # form; who talks in team chat is \`agent buzz enable\`.
   5dive buzz owner [--envelope]                      # the box's handset identity (public half; --envelope is
                                                      # the DIVE-3300 payload and carries a PRIVATE key)
+  5dive agent grant <name> <merge|push|deploy>       # root: re-render an existing STANDARD seat's managed
+                                                     # sudoers from the current template so it gains a
+                                                     # capability added after it was created. Idempotent;
+                                                     # refuses any policy this CLI did not write.
   5dive agent config <name> set workdir=<path>       # tmux cwd; "default" clears override
   5dive agent config <name> set auth-profile=<name>  # swap profile; "default" clears override
   5dive agent config <name> set model=<id>           # runtime model (claude/codex/grok/antigravity)
@@ -726,12 +730,25 @@ main() {
         # Reached via the scoped render_standard_sudoers grant so a standard
         # agent's /restart + /model work without a raw systemd-run/sudo grant.
         _self_restart) cmd_self_restart "$@" ;;
+        # DIVE-4203: hidden read-only primitive — prints THE default-skills list
+        # (DEFAULT_AGENT_SKILLS in lib/agent_setup.sh), one `<owner>/<repo>:<skill>`
+        # per line. Exists so 5dive-refresh-skills.sh, installed standalone beside
+        # the bundle with no way to source src/, reads the same list the provisioner
+        # seeds instead of carrying a second copy that drifts. No root, no state.
+        _default_skills) cmd_agent_default_skills "$@" ;;
         # DIVE-4081: hidden installer migration. Refresh managed standard-seat
         # sudoers after a bundle upgrade so existing routed reviewers gain the
         # narrow _task_answer path already rendered for newly-created seats.
         _reconcile_sudoers)
           AUDIT_CMD="agent _reconcile_sudoers"; AUDIT_ARGS=()
           cmd_agent_reconcile_sudoers "$@" ;;
+        # DIVE-4183: the per-seat, named-capability half of the same migration.
+        # `_reconcile_sudoers` is a hidden fleet-wide installer pass; this is what
+        # an operator reaches for when ONE seat is missing ONE capability the
+        # template already emits, and it prints what it did for that seat.
+        grant)
+          AUDIT_CMD="agent grant"; AUDIT_ARGS=("$@")
+          cmd_agent_grant "$@" ;;
         stats)   cmd_stats "$@" ;;
         create)
           AUDIT_CMD="agent create"; AUDIT_ARGS=("$@")

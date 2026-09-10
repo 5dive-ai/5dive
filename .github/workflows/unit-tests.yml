@@ -33,6 +33,13 @@ name: unit-tests
 # property; it is graded nightly and at release-cut, and it blocks a release.
 on:
   pull_request:
+  # DIVE-4139 — MERGE QUEUE. Every context in this file that is a REQUIRED status
+  # check on main must also fire on `merge_group`, or the queue never receives it:
+  # with a queue enabled GitHub evaluates required checks on the temporary
+  # `gh-readonly-queue/main/...` merge group, and a required context that never
+  # reports there holds the entry until the check-response timeout and then EVICTS
+  # it. That failure is silent at the PR — the PR just never merges.
+  merge_group:
   push:
     branches: [main]
 
@@ -261,7 +268,12 @@ jobs:
       - name: Which harnesses did this change touch?
         id: changed
         env:
-          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          # DIVE-4139: three events, three places the base lives. On `merge_group`
+          # `github.event.before` is ABSENT, so the old expression yielded the empty
+          # string and fell through to the origin/main fallback below — which is
+          # nearly right (a merge group IS main + the batch) but is a fallback, not a
+          # base, and the fallback exists to report BLOCKED, not to be the happy path.
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.before }}
         run: |
           # A base we cannot resolve is NOT "nothing changed" — that is the failure
           # mode where a check reports clean on what it never looked at. Fall back to
@@ -416,7 +428,28 @@ jobs:
   # bottom of this job moved to `rails-installed-host`: it is not the corpus, it would
   # have run once per shard for no gain, and two shards uploading one artifact name is
   # a hard error in upload-artifact@v4.
+  # DIVE-4186 — QUEUE-TIME ONLY. This job no longer fires on `pull_request`.
+  # With the merge queue live (DIVE-4139) the required contexts are graded on the
+  # `gh-readonly-queue/main/...` merge group, so a PR arm here is a SECOND full grade
+  # of the same tree. Measured on batch #834: the installed-host arm is ~1551 job-s of
+  # the 2866 a PR paid. `merge_group` and `push` keep it, so nothing that decides a
+  # merge is ungraded.
+  #
+  # THE TRADEOFF, written where the change is: a maker stops learning they broke an
+  # installed-host context until the PR is ENQUEUED, where a red costs the whole batch
+  # rather than one PR. Cheap at N=1-2, dearer as batches grow. If batches red often,
+  # the repair is to put the CHEAPEST installed-host arm back on `pull_request`, not to
+  # drop the queue.
+  #
+  # AND THE HAZARD, stated once here and referenced below: a skipped job reports the
+  # conclusion `skipped`, which branch protection counts as SATISFIED. That is what makes
+  # this safe (the required contexts still report on the merge group) and it is also what
+  # makes it dangerous IF THE QUEUE IS EVER TURNED OFF — PRs would then merge with the
+  # installed-host tier never graded at all, silently. Turning the queue off means
+  # reverting this commit in the same window. `tests/queue_time_only_arms_unit.sh` holds
+  # the pairing open.
   core-installed-host:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -495,6 +528,8 @@ jobs:
   # `test-installed-host` aggregator requires THIS job green as well as both shards, so
   # moving these steps did not shrink the required check that used to contain them.
   rails-installed-host:
+    # DIVE-4186: queue-time only — see the block above `core-installed-host`.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       # DIVE-2229: full history — pinned baselines must resolve here too.
@@ -642,7 +677,10 @@ jobs:
     # missing verdict emits no output at all, and an empty string is not '[]' — without
     # this, the reason no confirmation ran would surface as an empty-matrix YAML error
     # instead of the refusal the plan job printed.
-    if: needs['core-confirm-plan'].result == 'success' && needs['core-confirm-plan'].outputs.installed != '[]'
+    # DIVE-4186: `&& github.event_name != 'pull_request'` — queue-time only, like the
+    # first box it confirms. Without it a PR could spawn a confirmation of an environment
+    # that never ran on that event.
+    if: github.event_name != 'pull_request' && needs['core-confirm-plan'].result == 'success' && needs['core-confirm-plan'].outputs.installed != '[]'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -717,6 +755,10 @@ jobs:
         with: { pattern: 'core-*', merge-multiple: true }
       - name: Which shards went over their cap on their FIRST box?
         id: plan
+        env:
+          # DIVE-4186: the shard job's own result, so an absence of installed verdicts can be
+          # distinguished from a shard that ran and vanished. See the branch at the bottom.
+          INSTALLED_RESULT: ${{ needs['core-installed-host'].result }}
         run: |
           set -euo pipefail
           plan() {   # <env> -> "<env>=[{shard,shards,prior}...]" into $GITHUB_OUTPUT
@@ -746,7 +788,19 @@ jobs:
             printf '%s (of %s shards): [%s]\n' "$env" "$n" "$joined"
           }
           plan pristine
-          plan installed
+          # DIVE-4186: the installed-host tier is QUEUE-TIME ONLY, so on a pull_request its
+          # shards never ran and there are no verdict files to plan over. `plan` fails CLOSED
+          # on that absence, which is correct when the shards were supposed to run and is a
+          # false red when they were not. So the absence is allowed EXACTLY ONE WAY — the
+          # shard job's own result being `skipped` — and never by "no files found". A shard
+          # that ran and died still reports `failure`/`cancelled` here and still gets the
+          # BLOCKED refusal.
+          if [ "$INSTALLED_RESULT" = skipped ]; then
+            printf 'installed (skipped this event): []\n'
+            printf 'installed=[]\n' >> "$GITHUB_OUTPUT"
+          else
+            plan installed
+          fi
 
   # DIVE-3017, one level out: the ACP grade is now a UNION OVER THE SHARDS, because
   # acp_stdio_unit.sh lands in exactly one of them and the other shard's report cannot
@@ -775,6 +829,9 @@ jobs:
             core-pristine-1.txt core-pristine-2.txt core-pristine-3.txt
 
   acp-graded-installed:
+    # DIVE-4186: queue-time only. Its `needs` would carry the skip anyway; spelled out
+    # so the arm is greppable from the job that owns it rather than inferred.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     needs: core-installed-host
     steps:
@@ -823,7 +880,12 @@ jobs:
 
   test-installed-host:
     needs: [core-installed-host, rails-installed-host, acp-graded-installed, core-total-produced, workflow-structure-guards]
-    if: always()
+    # DIVE-4186: `always()` AND not a pull_request. The explicit-result check below treats
+    # `skipped` as a failure — deliberately, that is the DIVE-3315 keeper — so this
+    # aggregator has to leave the event entirely rather than learn to accept a skip. It
+    # reports `skipped` on a PR (counted as satisfied by branch protection) and grades
+    # normally on the merge group, which is where the merge is actually decided.
+    if: always() && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       # rails-installed-host is in here because those steps USED to be in the job this
@@ -861,7 +923,8 @@ jobs:
 
   test-installed-host-confirm:
     needs: [core-confirm-plan, core-installed-host-confirm]
-    if: always()
+    # DIVE-4186: queue-time only, for the same reason as `test-installed-host` above.
+    if: always() && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: A second box's verdict, or a plan that proved none was needed

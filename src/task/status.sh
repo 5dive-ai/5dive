@@ -1112,6 +1112,66 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
           fi
           policy_refuse "$E_CONFLICT" done-pr-state-unresolved DIVE-2318 "$ident" "$ident cannot close: gh could not read $_dref, so the merge is UNKNOWN, not absent — check by hand (gh pr view $_dref --json state,mergedAt) and re-run, or task cancel to abandon."
         fi
+        # DIVE-4137: THE MERGE IS THE STEP WHERE GRADED WORK SITS.
+        #
+        # lodar, Telegram 2026-09-09 04:22Z: "10 PRs and 21 branches on the
+        # 5dive-ai/5dive — i think something is wrong with our merging to main or
+        # we forgetting to merge". Nine were open, none forgotten, all inside the
+        # maker->verifier->merge pipeline; four were graded PASS and waiting for
+        # someone to press a button on a pull request that was already clean and
+        # green. The verifier that proved the head is the seat with the freshest
+        # evidence, and it did nothing with it.
+        #
+        # So: BEFORE refusing this close for "not merged", ask whether this caller
+        # may simply finish it, and if so, do. On success the state is re-read and
+        # the block below sees MERGED — every downstream check still runs on the
+        # merge that just happened, including DIVE-2656's comparison of the sha
+        # that LANDED against the sha the verifier says it GRADED. That is why the
+        # merge goes here and not in `task verify`: this is the only place where
+        # the row's own acceptance evidence is re-derived afterwards.
+        #
+        # THREE THINGS BOUND IT, and none of them is new authority:
+        #  1. STANDING is `_merge_do`'s, re-derived AS ROOT from the row over
+        #     `_TASKS_TFV_SQL AND graded_by = <this seat>` — this caller must have
+        #     graded this row PASS itself. We do not widen that predicate; the
+        #     preflight here only makes the refusal readable.
+        #  2. THE DISPOSITION must say `merge` — clean and mergeable AT THE GRADED
+        #     SHA, required checks green, and not a path a person has to look at
+        #     (CODEOWNERS, schema, a user-facing surface). Every unknown is a hold.
+        #  3. IT ONLY EVER CONVERTS A REFUSAL INTO A MERGE-THEN-RECHECK. If any of
+        #     it declines or fails, `_state` is untouched and the refusal below
+        #     fires exactly as it does today. There is no path on which this makes
+        #     a close accept something the gate would otherwise have rejected.
+        if [[ "$_state" == "OPEN" ]] && declare -F _merge_disp_probe >/dev/null 2>&1; then
+          local _am_actor _am_stand _am_disp="" _am_graded
+          _am_actor=$(task_actor)   # bare, as every other actor read in this file; `cli` is the "unattributable" sentinel and simply fails the standing test
+          _am_stand=$(db "SELECT COUNT(*) FROM tasks WHERE id=${id} AND $(_task_merge_standing_sql "$_am_actor");" 2>/dev/null || printf 0)
+          if [[ "$_am_stand" == "1" ]]; then
+            # The graded sha comes from the row's RESULT — the verifier's own
+            # labelled statement (DIVE-2656's fence) — never from this close's
+            # freshly-typed text, which the closer could tune to match the head.
+            _am_graded=$(_gate_graded_sha "$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")")
+            _am_disp=$(_merge_disp_probe "$_dref" "$_am_graded" 2>/dev/null) || _am_disp=""
+            if [[ "$_am_disp" == "merge" ]]; then
+              if _merge_disp_do "$ident"; then
+                _task_store_audit_log "task.merged-at-close" ok 0 -- "$ident" "ref=$_dref grader=$_am_actor graded_sha=${_am_graded:-none}"
+                warn "$ident: $_dref was CLEAN at the graded sha ${_am_graded:0:12} with every required check green, so the seat that graded it merged it (squash) as the machine account rather than routing the button back to the maker (DIVE-4137). Re-reading the merge state now — every gate below still runs on it."
+                # RE-READ, do not assume. `gh pr merge` returning 0 is GitHub's
+                # answer that it merged; the gate's answer must still come from
+                # the gate's own probe, or this line would be the one place in the
+                # close that accepts on a claim instead of on a measurement.
+                local _am_re; _am_re=$(_gate_pr_state "$_dref" "$_ghtok" "$(_gate_slug_from_url "$_dref")")
+                if [[ -n "$_am_re" ]]; then
+                  _state="${_am_re%%|*}"
+                  local _am_rest="${_am_re#*|}"; _merged="${_am_rest%%|*}"
+                fi
+                db "UPDATE tasks SET merge_owner=NULL, merge_hold_reason=NULL WHERE id=${id};" || true
+              else
+                warn "$ident: $_dref reads auto-mergeable at the graded sha, but the merge rail refused (DIVE-4137) — see its message above. Nothing changed; this close is refused below exactly as it would have been."
+              fi
+            fi
+          fi
+        fi
         if [[ "$_state" != "MERGED" || -z "$_merged" || "$_merged" == "null" ]]; then
           # DIVE-3458 ARM 2: THE PR IS NOT MERGED AND THE WORK IS ON MAIN ANYWAY.
           #
@@ -1714,7 +1774,7 @@ $_body"
         # resolved (no API call), not refused, and not stamped. There is no question
         # about it for the gate to answer or decline: it is another task's delivery.
         # Skipped BEFORE the cap so five cited PRs cannot crowd out the real one.
-        if ! printf '%s\n' "$_deliv" | grep -qxF -e "$_qref" -e "|${_qref#*|}"; then
+        if ! grep -qxF -e "$_qref" -e "|${_qref#*|}" <<<"$_deliv"; then
           _txt_cited="${_txt_cited:+$_txt_cited,}${_qref#*|}"
           _txt_cited_q="${_txt_cited_q:+$_txt_cited_q$'\n'}${_qref}"
           continue
@@ -2079,7 +2139,7 @@ _task_start_preflight() {
   if [[ -n "$gerr" ]]; then
     # git refused to even look. The classic case is dubious ownership — EXACTLY
     # the wall Marcus hit on DIVE-1356 — so hand over the one-line fix.
-    if printf '%s' "$gerr" | grep -qi 'dubious ownership'; then
+    if grep -qi 'dubious ownership' <<<"$gerr"; then
       _pf "git refuses this repo (dubious ownership). Fix: git config --global --add safe.directory \"\$(pwd)\" — then retry your git commands."
     fi
     # Otherwise cwd just isn't a git repo → no repo checks apply; stay quiet.

@@ -27,6 +27,16 @@
 # Run: bash tests/gate_channel_session_t2_mutation.sh
 set -uo pipefail
 
+# DIVE-4154: this harness grades the DELIVERER — the escalation chain, the
+# channel resolution, the message the human actually receives. Arm D inserted a
+# phone-ping hold in FRONT of that deliverer, so driving these arms through the
+# default 120s window would grade the window instead and every assertion about a
+# sent message would read false. Disable it explicitly rather than silently: the
+# window is a separate unit with its own harness (tests/gate_undo_window_unit.sh)
+# and its own replay, and nothing below is about when the push fires.
+export _5DIVE_GATE_UNDO_WINDOW_SECS=0
+
+
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
 # Three-state: if the helper is unreachable (a staged copy that did not carry
 # tests/lib/), the log says NO TREE WAS NAMED rather than falling silent, and a

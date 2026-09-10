@@ -16,10 +16,15 @@ defaults:
   isolation: standard
   defer_auth: true
 
-# This is the executable policy manifest every role reads. Costs are USD per
-# publish at packaging time; unknown costs stay null rather than becoming zero.
+# This is the executable policy manifest every role reads, and it is YOURS TO
+# EDIT. `distribution.channels` below ships DEFAULTS, not rules: change any
+# channel's permission tier at import time or later, add channels, delete the
+# ones you do not use. The roles read whatever this file says. 5dive does not
+# decide which surfaces your team may post to, or which of them need a person.
+# Costs are USD per publish at packaging time; unknown costs stay null rather
+# than becoming zero.
 distribution:
-  source_rule: "Transform human-approved published source; never originate or invent claims."
+  source_rule: "Transform approved published source; never originate or invent claims."
   cold_start:
     approved_corpus: [blog, readme, changelog, docs]
     initial_rules: mechanical-only
@@ -29,14 +34,25 @@ distribution:
   engage_first:
     enabled: false
     rules: [no-link, no-cta, answer-the-thread, one-quotable-line]
+  # permission — your team's own escalation level for this channel:
+  #   AUTO     a verifier-passed item ships without asking
+  #   APPROVAL the Head signs off first
+  #   HUMAN    a named person your team nominates signs off first
+  # transport — how the executor reaches it:
+  #   api      an adapter over the channel's API
+  #   browser  the browser plugin drives a session you logged into by hand
+  #            (supply adapters/<site>.json; 5dive ships no platform list)
+  #   human    a person posts it by hand; the team prepares and stops
+  # The tiers below are cautious defaults on discussion surfaces and nothing
+  # more. No channel is HUMAN by decree — set any of them to any tier you want.
   channels:
     x:        { cost_per_post_usd: 0.20, permission: AUTO,     transport: api }
     linkedin: { cost_per_post_usd: 0,    permission: APPROVAL, transport: browser }
     medium:   { cost_per_post_usd: null, permission: APPROVAL, transport: browser }
     devto:    { cost_per_post_usd: 0,    permission: AUTO,     transport: api }
-    blog:     { cost_per_post_usd: 0,    permission: HUMAN,    transport: api }
-    reddit:   { cost_per_post_usd: 0,    permission: HUMAN,    transport: human }
-    hn:       { cost_per_post_usd: 0,    permission: HUMAN,    transport: human }
+    blog:     { cost_per_post_usd: 0,    permission: APPROVAL, transport: api }
+    reddit:   { cost_per_post_usd: 0,    permission: APPROVAL, transport: browser }
+    hn:       { cost_per_post_usd: 0,    permission: APPROVAL, transport: browser }
 
 agents:
   head:
@@ -48,10 +64,15 @@ agents:
     skills: [5dive-cli]
     instructions: |
       Own the source list, channel plan, permission boundary and recurring loop.
-      Accept only human-approved published source. Never write, publish, or waive
-      the Brand Verifier. AUTO means an approved owned/API surface; APPROVAL waits
-      for you; HUMAN waits for a named person. The engage-first lane is disabled
-      until a human enables it. If browser support is absent, run API-only.
+      Accept only approved published source. You do not write the copy or press
+      publish yourself, and you never waive the Brand Verifier. Read every
+      channel's tier from distribution.channels and treat it as your team's own
+      escalation level: AUTO ships without asking, APPROVAL waits for you, HUMAN
+      waits for a named person your team nominates. Those tiers belong to the
+      team owner, not to this template — if one is wrong for this company, say so
+      and edit the manifest rather than working around it. The engage-first lane
+      ships off; it is enabled in the manifest. If browser support is absent, run
+      API-only.
     goals:
       - "Approve the source corpus and start the first bounded distribution cycle."
     loops:
@@ -100,9 +121,10 @@ agents:
     skills: [5dive-cli]
     instructions: |
       Draft maintainer, newsletter and partner outreach from verified derivatives.
-      Every send is APPROVAL. The engage-first reply lane is disabled by default;
-      when a human enables it, enforce no link, no CTA, a direct answer and one
-      quotable line. Reddit, HN and community discussion remain HUMAN per thread.
+      Every send is APPROVAL. The engage-first reply lane ships off; when the
+      manifest enables it, enforce no link, no CTA, a direct answer and one
+      quotable line. A community thread follows its channel's tier in
+      distribution.channels — no surface is off-limits by decree.
 
   publisher:
     role: "Publisher"
@@ -111,11 +133,14 @@ agents:
     reports_to: head
     skills: [5dive-cli]
     instructions: |
-      Publish only Brand-Verifier-passed work. Prefer API adapters; use an
-      authenticated browser only when team status reports browser+api. In api-only
-      mode, browser channels are unavailable, never silently skipped. Strip source
-      anchors last, mint a publish nonce, use that same nonce as the attribution
-      key, and refuse anything above its permission tier.
+      Publish only Brand-Verifier-passed work. Read each channel's transport and
+      permission tier from distribution.channels; use an authenticated browser
+      only when team status reports browser+api. In api-only mode, browser
+      channels are unavailable, never silently skipped, and a browser channel
+      with no adapter is unavailable rather than assumed. Strip source anchors
+      last, mint a publish nonce, use that same nonce as the attribution key, and
+      refuse anything above its permission tier — whatever tier the manifest
+      currently gives it.
 
   verifier:
     role: "Brand Verifier"

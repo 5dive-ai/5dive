@@ -12,19 +12,57 @@ name: pr-title-lint
 on:
   pull_request:
     types: [opened, edited, reopened, synchronize]
+  # DIVE-4139 — MERGE QUEUE. `title` is a REQUIRED status check on main (it is in
+  # ruleset 22522554 AND in classic protection — eleven contexts, not the ten the
+  # first pass of DIVE-4139 inventoried, which is how this file was missed). With a
+  # queue enabled GitHub grades required checks on the `gh-readonly-queue/main/...`
+  # merge group, so a required context that never reports there does NOT go red — the
+  # entry waits for the check-response timeout and is EVICTED. Without this arm the
+  # flip evicts every batch, which is the exact failure the rest of DIVE-4139 exists
+  # to prevent, applied to every PR at once.
+  merge_group:
 
 permissions:
   contents: read
 
 concurrency:
-  group: pr-title-lint-${{ github.event.pull_request.number }}
+  # `pull_request.number` is empty on a merge_group event, so keying on it alone would
+  # give every merge group the SAME concurrency group and cancel-in-progress would have
+  # each batch cancel the one before it.
+  group: pr-title-lint-${{ github.event.pull_request.number || github.event.merge_group.head_ref }}
   cancel-in-progress: true
 
 jobs:
   title:
     runs-on: ubuntu-latest
     steps:
+      # There is NOTHING at queue time for this lint to grade, and that is a property of
+      # the check rather than a gap being waved through. What it exists to protect is the
+      # SQUASH SUBJECT, and the squash subject is composed by GitHub at the moment of
+      # merge out of the PR title — it does not exist yet on the merge group, whose
+      # commits are the branch's own commits (routinely non-conventional by design; that
+      # is what squashing is for). So grading the merge group's subjects would reject
+      # healthy batches, and grading the PR title is impossible without a PR. The
+      # enforcement point is structurally the pull request, where it is unchanged below.
+      # This arm reports the required context so the batch is graded instead of evicted.
+      - name: Queue time — nothing to grade, report and pass
+        if: github.event_name == 'merge_group'
+        run: |
+          printf 'pr-title-lint is a PR-time check: it grades the title that BECOMES the\n'
+          printf 'squash subject, and no such subject exists on a merge group. Every PR in\n'
+          printf 'this batch was linted on its own pull_request event before it could be\n'
+          printf 'enqueued. Reporting `title` so the merge group is graded, not evicted.\n'
+
+      # DIVE-4177: the fragment lint below needs the tree and the PR's file list. Fetch
+      # depth 0 so the base sha is reachable — a shallow clone cannot diff against it.
+      - name: Checkout
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: The title must name the kind of change
+        if: github.event_name == 'pull_request'
         env:
           # Through `env:`, never interpolated into the script body. A PR title is
           # attacker-controlled text and an Actions expression is substituted before
@@ -50,3 +88,34 @@ jobs:
             echo "::error::A 'feat' title cuts the next release as a minor. Everything else cuts a patch."
           } >&2
           exit 1
+
+      # DIVE-4177 — THE ENTRY, not just the subject. The title decides the release
+      # LEVEL; the fragment decides whether the change appears in the release NOTES at
+      # all. v0.29.0 got the level right and printed two entries and no feature, because
+      # six fragments lacked the `## Unreleased` heading the fold requires and were
+      # skipped onto a log nobody reads. Same fix as DIVE-4086 applied one layer down:
+      # make it unmergeable rather than discovering it in a published tag.
+      #
+      # Deliberately in THIS job, under the required `title` context, rather than a new
+      # workflow: a new context is not in branch protection and would grade nothing that
+      # blocks a merge, which is the whole point.
+      - name: A changelog fragment must be foldable
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          # DIVE-4177: the `if` above already keeps this step off `merge_group`, but
+          # tests/merge_queue_triggers_unit.sh arm3 is a TEXT grep over the file and
+          # cannot see a step-level condition. Use the branching idiom pii-guard.yml
+          # and supply-chain-guard.yml already use, so the expression itself is safe
+          # on either event.
+          BASE_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.event.pull_request.head.sha }}
+        run: |
+          set -uo pipefail
+          # --diff-filter=d: a fragment DELETED by this PR is not graded (that is how an
+          # entry is withdrawn), and the script re-checks existence anyway.
+          if ! git diff --name-only --diff-filter=d "$BASE_SHA" "$HEAD_SHA" > /tmp/changed.txt; then
+            echo "::error::could not diff ${BASE_SHA}..${HEAD_SHA} — refusing to report a green fragment lint that graded nothing (DIVE-4177)"
+            exit 1
+          fi
+          bash scripts/lint-changelog-fragments.sh --title="$PR_TITLE" --changed-from=/tmp/changed.txt

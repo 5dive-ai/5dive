@@ -340,8 +340,8 @@ _buzz_status() {
   state_dir=$(_buzz_state_dir "$name")
   cfg="${state_dir}/config.json"
   channel_in_list buzz "$(jq -r --arg n "$name" '.agents[$n].channels // ""' <<<"$reg")" && chan_decl="yes"
-  find "/home/${user}/.claude/plugins/cache" -maxdepth 3 -type d -name buzz -print -quit 2>/dev/null \
-    | grep -q . && plugin="yes"
+  grep -q . < <(find "/home/${user}/.claude/plugins/cache" -maxdepth 3 -type d -name buzz -print -quit 2>/dev/null) \
+    && plugin="yes"
   jq -e '.relay_url and .private_key' "$cfg" >/dev/null 2>&1 && conf="yes"
   if bin_path=$(_buzz_resolve_binary "$user"); then bin="yes"; fi
   printf 'agent:            %s\n' "$name"

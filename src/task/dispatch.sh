@@ -272,6 +272,8 @@ cmd_task() {
     deliver)         cmd_task_deliver "$@" ;;
     merge)           cmd_task_merge "$@" ;;         # DIVE-3474 verifier merges what IT graded
     merge-audit)     cmd_task_merge_audit "$@" ;;   # DIVE-1935 retrospective sweep
+    grader-replay)   cmd_task_grader_replay "$@" ;;  # DIVE-4164 dry-run capacity replay
+    grader-tick)     cmd_task_grader_tick "$@" ;;    # DIVE-4164 pool lane (dark by default)
     merge-unverified) cmd_task_merge_unverified "$@" ;;  # DIVE-3526 consume the unverified stamp
     merge-gate-selftest) cmd_task_merge_gate_selftest "$@" ;;  # DIVE-1935 instrument check
     verify)          cmd_task_verify "$@" ;;
@@ -294,6 +296,7 @@ cmd_task() {
     clear-recs)      cmd_task_clear_recs "$@" ;;
     precedent)       cmd_task_precedent "$@" ;;
     pfr-autoclear)   cmd_task_pfr_autoclear "$@" ;;   # DIVE-3481 inert push-for-review auto-clear switch
+    gate-undo-window) cmd_task_gate_undo_window "$@" ;;  # DIVE-4154 arm D: hold the phone ping for a 2-minute undo window
     track-record)    cmd_task_track_record "$@" ;;   # DIVE-3694 per-filer track-record auto-clear switch + view
     routing)         cmd_task_routing "$@" ;;
     reclaim)         cmd_task_reclaim "$@" ;;   # DIVE-1967 worktree node_modules reclaim

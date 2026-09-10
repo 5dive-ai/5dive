@@ -7,6 +7,13 @@ name: supply-chain-guard
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  # DIVE-4139 — MERGE QUEUE. Every context in this file that is a REQUIRED status
+  # check on main must also fire on `merge_group`, or the queue never receives it:
+  # with a queue enabled GitHub evaluates required checks on the temporary
+  # `gh-readonly-queue/main/...` merge group, and a required context that never
+  # reports there holds the entry until the check-response timeout and then EVICTS
+  # it. That failure is silent at the PR — the PR just never merges.
+  merge_group:
 jobs:
   supply-chain-guard:
     runs-on: ubuntu-latest
@@ -16,8 +23,12 @@ jobs:
           fetch-depth: 0
       - name: Scan the added surface
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # DIVE-4139: on `merge_group` there is no pull_request context. Empty shas
+          # would reach supply-chain-scan.sh as empty args, and its "could not scan"
+          # exit 2 is wired to ::error:: + exit 1 below — so an unhandled merge group
+          # would not merely skip the audit, it would RED the queue entry.
+          BASE_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.event.pull_request.head.sha }}
         run: |
           # set +e is LOAD-BEARING: GitHub runs `run:` under `bash -e`, so a
           # findings exit (3) would abort the step before rc is ever read and a
