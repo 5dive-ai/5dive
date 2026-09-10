@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased — feat(heartbeat): attempt N+1 resumes from attempt N instead of redoing it (DIVE-4213)
+
+Measured over the 7 days to 2026-09-10: 400 maker runs, **228 reclaimed to todo (57%)**, and a
+reclaimed attempt is not a short one — median 25 minutes, p90 50. Every one of those minutes was
+discarded: the next heartbeat woke the same seat on the same row with a blank context and it started
+over. That is the attempts-per-delivered-task number (median 3, mean 4.4 over 75 delivered tasks) in
+one mechanism, and it is the last arm of DIVE-4206 — the other three shipped without it.
+
+DIVE-4206 stopped attempts being taken away *wrongly* (a quota wall parks the claim; a maker is no
+longer woken onto a row whose merge another seat owes). An attempt that is *legitimately* reclaimed
+is still taken away. The wake now hands the next attempt what the last one had:
+
+- **The workspace.** The checkout attempt N was working in, named by path and branch — read from the
+  same `_hb_row_workspace_intact` probe DIVE-4104's hold arm uses, so the two can never disagree
+  about which checkout is meant.
+- **The row.** `5dive task show <ident>` as the artifact to read, not a summary of it.
+- **The last thing that attempt said**, verbatim from the seat's own transcript, bounded to one line.
+
+**It is evidence, never instruction.** A resumed attempt that inherits the previous attempt's
+CONCLUSION re-asserts it instead of re-deriving it, and a wrong conclusion then survives every
+remaining attempt — strictly worse than starting blank. The clause says so in as many words, and
+hands three pointers with no verdict attached.
+
+**The wedge is the one reclaim reason that forbids a resume.** `overran the budget` (the hard cap)
+means the attempt was stuck; handing it its own workspace back resumes it into the same wedge. The
+`session gone` and `idle` reasons carry no such signal and do resume. Everything else rests on
+positive evidence only: no prior reclaimed run *by this seat* on *this row*, or no live checkout
+holding the branch, and attempt 1 gets nothing — no carryover is invented where there was no
+attempt N.
+
+`tests/heartbeat_resume_carryover_unit.sh` (20 arms) grades it against real git worktrees, real
+`runs` rows written by the real reclaim path, and real JSONL transcripts.
+
 ## Unreleased — feat(self-update): the update path checks the box it just updated still runs an agent (DIVE-4068)
 
 0.26.1 shipped a launcher that could not start any agent (DIVE-4067). The nightly installs the
