@@ -126,5 +126,27 @@ writes=$(grep -vE '^[[:space:]]*#' <<<"$body" | grep -nE 'INSERT|UPDATE|DELETE|l
 [[ -z "$writes" ]] && ok_ 'structural: read-only — no INSERT/UPDATE/DELETE/ledger_emit' \
   || bad_ 'structural: read-only' "$writes"
 
+# ── DIVE-4217 iteration 2: a flag replay does not IMPLEMENT must fail loudly ──
+# The rejected first cut carried an --only=<ident> arm here that parsed and was
+# never read: `grader-replay --days=7` and `--days=7 --only=DIVE-4208` returned
+# BYTE-IDENTICAL whole-queue output, so the operator got positive confirmation
+# the flag was understood and 7-day figures presented as scoped to one ident —
+# on the one command whose numbers feed a spend argument. The discriminator is
+# not "does --only work" (replay has no pairing filter) but "does an unhandled
+# flag reach the usage arm". Both halves are asserted: non-zero exit AND that
+# the two invocations are not the same bytes.
+$BIN task grader-replay --days=7 --only=DIVE-4208 >/dev/null 2>&1 \
+  && bad_ 'replay rejects --only rather than silently ignoring it' 'accepted a flag it does not implement' \
+  || ok_ 'replay rejects --only rather than silently ignoring it'
+plain=$($BIN task grader-replay --days=7 --json 2>/dev/null)
+scoped=$($BIN task grader-replay --days=7 --only=DIVE-4208 --json 2>/dev/null)
+[[ "$plain" != "$scoped" ]] \
+  && ok_ 'replay --only does not return byte-identical whole-queue output' \
+  || bad_ 'replay --only does not return byte-identical whole-queue output' 'unscoped figures presented as scoped'
+# The tick, whose --only IS wired into the pending filter, keeps it in usage.
+grep -q -- '--only=<ident>' <(awk '/^cmd_task_grader_tick\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' src/task/grader_pool.sh) \
+  && ok_ 'the tick still documents --only in its own usage string' \
+  || bad_ 'the tick still documents --only in its own usage string' 'usage line lost'
+
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]
