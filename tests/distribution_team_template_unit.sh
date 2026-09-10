@@ -202,7 +202,6 @@ _teams_get() {
   esac
 }
 gh_org() { echo 5dive-ai; }
-_TEAMS_IDX_CACHE=""
 ensure_state_ro() { :; }
 tasks_db_init() { :; }
 sqlq() { printf "'%s'" "$1"; }
