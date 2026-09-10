@@ -867,13 +867,7 @@ cmd_self_update() {
 
   step "Upgrading 5dive CLI + plugins"
   # Send installer chatter to stderr so JSON stdout stays parseable.
-  # >>> DIVE-4140 stable installer handoff
-  # The installer owns target resolution (override/canary/stable/last-known/floor).
-  # Keep the caller explicit about the shared route instead of growing a second,
-  # drifting resolver inside self-update.
-  CLI_VERSION_URL="${CLI_VERSION_URL:-https://api.5dive.com/cli-version}" \
-    bash "$installer" --upgrade >&2 || fail "$E_GENERIC" "upgrade failed"
-  # <<< DIVE-4140 stable installer handoff
+  bash "$installer" --upgrade >&2 || fail "$E_GENERIC" "upgrade failed"
 
   # Restart only the agents whose payload actually moved. Best-effort per unit —
   # one failed restart shouldn't abort the rest.
