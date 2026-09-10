@@ -66,6 +66,7 @@ run_block_with() { # $1=block  $2=git stub  $3=curl stub  [$4=REPO] [$5=GH_SHA] 
   # grep/sort). A stub that exits nonzero stands in for "git present but can't
   # resolve" and for "git absent" alike: both leave the ladder empty.
   out="$(env -i PATH="$stubs:/usr/bin:/bin" GH_ORG="testorg" \
+    CLI_CANARY_FILE=/dev/null CLI_INSTALLED_BIN="$stubs/no-installed-cli" \
     ${4+REPO="$4"} ${5+GH_SHA="$5"} \
     bash -c "set -euo pipefail
 $blk
@@ -137,7 +138,7 @@ fi
 #    (GH_SHA, REPO) so an operator leaves the guarantee by choosing to.
 out="$(run_block "exit 1" "exit 22")"
 if [[ "$out" != *"REPO=https"* ]] && [[ "$out" == *"RC=1"* ]] \
-   && [[ "$out" == *"NO RELEASE TAG RESOLVED"* ]] \
+   && [[ "$out" == *"NO STABLE RELEASE TAG RESOLVED"* ]] \
    && [[ "$out" == *"GH_SHA"* && "$out" == *"REPO=<base url>"* ]]; then
   ok_t "no tag resolvable fails CLOSED, naming GH_SHA and REPO — never falls back to /main"
 else
