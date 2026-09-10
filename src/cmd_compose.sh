@@ -1406,14 +1406,19 @@ _teams_get() {
   fi
 }
 
-# The index, memoised for the life of the process. `team ps` resolves every slug
-# in one call; refetching the index per slug would turn one command into N round
-# trips for a document that cannot change mid-command. Nothing is written to
-# disk: a cache on disk is a second thing that can be stale, which is the defect
-# this row exists to remove.
-_TEAMS_IDX_CACHE=""
+# Fetch the index. It is NOT memoised in a variable, and the reason is the same
+# subshell rule that _team_resolve_template documents below: every caller reads
+# this through `idx=$(_teams_registry_index)`, a command substitution, so an
+# assignment made in here happens in the subshell and is discarded. A cache
+# written that way is inert — worse than none, because a green "fetched once"
+# arm can only be written by calling this function in a shape no caller uses.
+#
+# So the index is CARRIED instead of cached: a caller fetches it once and passes
+# it to _team_resolve_template, which is what keeps `team ps` at one index round
+# trip instead of one per slug. Nothing is written to disk either: a cache on
+# disk is a second thing that can be stale, which is the defect this row exists
+# to remove.
 _teams_registry_index() {
-  if [[ -n "$_TEAMS_IDX_CACHE" ]]; then printf '%s' "$_TEAMS_IDX_CACHE"; return 0; fi
   local tmp rc; tmp=$(mktemp)
   # CAPTURE BEFORE BRANCHING. `$?` read inside `if ! cmd; then` is the status
   # the `!` produced, not the one the command exited with — it is 0 exactly when
@@ -1425,8 +1430,7 @@ _teams_registry_index() {
   if ! jq -e '.companies | type == "array"' >/dev/null 2>&1 <"$tmp"; then
     rm -f "$tmp"; return 5
   fi
-  _TEAMS_IDX_CACHE=$(cat "$tmp"); rm -f "$tmp"
-  printf '%s' "$_TEAMS_IDX_CACHE"
+  cat "$tmp"; rm -f "$tmp"
 }
 
 # One sentence per failure class, so "cannot reach the registry" never reads as
@@ -1505,9 +1509,18 @@ usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
 HELP
 }
 
-# <slug|path> -> a readable local file. A path is used as-is; a slug is resolved
-# through the registry index and fetched. Return codes are distinct on purpose,
-# so the caller can tell "no such slug" from "could not ask".
+# <slug|path> [<index-json>] -> a readable local file. A path is used as-is; a
+# slug is resolved through the registry index and fetched. Return codes are
+# distinct on purpose, so the caller can tell "no such slug" from "could not
+# ask".
+#
+# The optional second argument is an ALREADY-FETCHED index, and it is how a
+# caller that resolves more than one slug (`team ps` with no slug) stays at one
+# index round trip: the index cannot be memoised here, because every caller
+# reads this function through a command substitution and an assignment made in
+# a subshell is discarded. Omit it and this fetches the index itself, which is
+# right for the one-slug callers (`team import <slug>`, `team ps <slug>`) and
+# keeps a PATH resolving with no network at all.
 #    1     = the fetched, valid index has no such slug — the ONLY code that
 #            licenses telling a customer their template does not exist
 #    3     = the index entry carries no path (a broken registry, not a bad call)
@@ -1520,14 +1533,16 @@ HELP
 # it. A diagnostic that silently empties is worse than none — it prints
 # "unknown" and reads like a bug in the customer's command.
 _team_resolve_template() {
-  local ref="$1"
+  local ref="$1" idx="${2-}"
   if [[ -f "$ref" ]]; then
     printf '%s' "$ref"
     return 0
   fi
-  local idx rc entry path dest
-  idx=$(_teams_registry_index); rc=$?   # never inside `if !` — see _teams_registry_index
-  if (( rc != 0 )); then return $(( 20 + rc )); fi
+  local rc entry path dest
+  if [[ -z "$idx" ]]; then
+    idx=$(_teams_registry_index); rc=$?   # never inside `if !` — see _teams_registry_index
+    if (( rc != 0 )); then return $(( 20 + rc )); fi
+  fi
   entry=$(jq -e --arg s "$ref" '.companies[] | select(.slug==$s)' <<<"$idx" 2>/dev/null) || return 1
   path=$(jq -r '.path // empty' <<<"$entry"); [[ -n "$path" ]] || return 3
   dest="$(mktemp -d)/${ref}.5dive.yaml"
@@ -1576,8 +1591,9 @@ HELP
       # marketplace import. Detect complete installed rosters from registry
       # state; do not persist a mutable "last import" pointer that can lie after
       # a second team is installed or removed.
-      local ps_idx ps_rc ps_reg ps_slug ps_candidate ps_spec
+      local ps_idx ps_rc ps_reg ps_slug ps_candidate ps_spec ps_res_rc ps_why
       local -a ps_matches=() ps_names=()
+      local ps_unreadable=0
       ps_idx=$(_teams_registry_index); ps_rc=$?
       if (( ps_rc != 0 )); then
         fail "$E_NOT_FOUND" "cannot list installed teams — $(_teams_index_diag "$ps_rc"). Name a template instead: 5dive team ps <slug|path>"
@@ -1585,7 +1601,33 @@ HELP
       ps_reg=$(registry_read)
       while IFS= read -r ps_slug; do
         [[ -n "$ps_slug" ]] || continue
-        ps_candidate=$(_team_resolve_template "$ps_slug") || continue
+        # THE INDEX IS CARRIED IN, not refetched per slug: this loop is the one
+        # caller that resolves N slugs, so `$ps_idx` here is what keeps the
+        # whole command at a single index round trip.
+        #
+        # And the RETURN CODE is read rather than `|| continue`d. `|| continue`
+        # swallowed rc 4 (the template BODY could not be fetched) and rc 21..25
+        # (the index could not be read) identically to rc 1 (no such slug) — so
+        # a dropped connection came out the bottom of this loop as the much
+        # stronger claim that no roster is installed, which is the exact
+        # conflation the rest of this path exists to remove, one level up.
+        ps_candidate=$(_team_resolve_template "$ps_slug" "$ps_idx"); ps_res_rc=$?
+        if (( ps_res_rc != 0 )); then
+          case "$ps_res_rc" in
+            1) : ;;   # the index named it and it is gone: genuinely absent, skip
+            3) warn "registry entry '$ps_slug' carries no path — skipping it (the registry index is broken, not your command)" ;;
+            4) ps_unreadable=$((ps_unreadable+1))
+               ps_why="the template body could not be fetched from the registry"
+               warn "could not read template '$ps_slug' — ${ps_why}; its roster is not counted here" ;;
+            2?) ps_unreadable=$((ps_unreadable+1))
+                ps_why=$(_teams_index_diag "$(( ps_res_rc - 20 ))")
+                warn "could not read template '$ps_slug' — ${ps_why}; its roster is not counted here" ;;
+            *) ps_unreadable=$((ps_unreadable+1))
+               ps_why="the template could not be read (rc=$ps_res_rc)"
+               warn "could not read template '$ps_slug' — ${ps_why}; its roster is not counted here" ;;
+          esac
+          continue
+        fi
         # A registry template this binary cannot read is skipped, not fatal: the
         # question here is "which rosters are installed", and one unreadable
         # template must not hide the ones that are.
@@ -1597,8 +1639,15 @@ HELP
           ps_matches+=("$ps_candidate"); ps_names+=("$ps_slug")
         fi
       done < <(jq -r '.companies[].slug' <<<"$ps_idx")
-      (( ${#ps_matches[@]} > 0 )) \
-        || fail "$E_NOT_FOUND" "no complete team roster from $(gh_org)/character-packs is installed (try: 5dive team import <slug>)"
+      # NOTHING MATCHED — and the two reasons are not the same answer. If any
+      # template could not be READ, "no roster is installed" is a claim this
+      # command did not earn: it never got to look. Say which it was.
+      if (( ${#ps_matches[@]} == 0 )); then
+        if (( ps_unreadable > 0 )); then
+          fail "$E_NOT_FOUND" "could not determine which teams are installed — ${ps_why} ($ps_unreadable of the registry's templates could not be read). This is NOT a claim that no roster is installed; retry, or name one: 5dive team ps <slug|path>"
+        fi
+        fail "$E_NOT_FOUND" "no complete team roster from $(gh_org)/character-packs is installed (try: 5dive team import <slug>)"
+      fi
       local ps_i=0
       for ps_file in "${ps_matches[@]}"; do
         if (( ${#ps_matches[@]} > 1 )); then
