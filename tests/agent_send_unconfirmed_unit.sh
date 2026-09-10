@@ -57,7 +57,7 @@ sudo() {
   if [[ "$*" == *"agent _deliver"* ]]; then
     printf '%s\n' "$*" >"$SCOPED_DELIVER_ARGV"
     if [[ "${INJECT_RC:-0}" == 1 ]]; then
-      printf '%s\n' '{"ok":true,"data":{"delivered":false,"reason":"pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)"}}'
+      printf '%s\n' '{"ok":true,"data":{"delivered":false,"reason":"the composer still holds unsent text after two Enters — the payload was typed but the submit could not be verified (DIVE-4246; was the DIVE-147 paste-placeholder poll)"}}'
     else
       printf '%s\n' '{"ok":true,"data":{"delivered":true}}'
     fi
@@ -103,13 +103,13 @@ out=$(run_send_json 1)
 is 'T1 send rc=1 keeps the envelope usable' true "$(jq -r '.ok' <<<"$out")"
 is 'T2 send rc=1 reports sent:false' false "$(jq -r '.data.sent' <<<"$out")"
 is 'T3 send rc=1 carries the shared reason' \
-  'pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)' \
+  'the composer still holds unsent text after two Enters — the payload was typed but the submit could not be verified (DIVE-4246; was the DIVE-147 paste-placeholder poll)' \
   "$(jq -r '.data.reason' <<<"$out")"
 
 out=$(run_deliver_json 1)
 is 'T4 scoped delivery rc=1 reports delivered:false' false "$(jq -r '.data.delivered' <<<"$out")"
 is 'T5 scoped delivery rc=1 carries the same reason' \
-  'pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)' \
+  'the composer still holds unsent text after two Enters — the payload was typed but the submit could not be verified (DIVE-4246; was the DIVE-147 paste-placeholder poll)' \
   "$(jq -r '.data.reason' <<<"$out")"
 
 out=$(run_send_text 1)
@@ -140,12 +140,12 @@ is 'T11 confirmed scoped delivery omits reason' false "$(jq -r '.data | has("rea
 out=$(run_ask_json 1 0)
 is 'T12 direct ask rc=1 reports sent:false' false "$(jq -r '.data.sent' <<<"$out")"
 is 'T13 direct ask rc=1 carries the shared reason' \
-  'pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)' \
+  'the composer still holds unsent text after two Enters — the payload was typed but the submit could not be verified (DIVE-4246; was the DIVE-147 paste-placeholder poll)' \
   "$(jq -r '.data.reason' <<<"$out")"
 out=$(run_ask_json 1 1)
 is 'T14 scoped ask propagates _deliver sent:false' false "$(jq -r '.data.sent' <<<"$out")"
 is 'T15 scoped ask carries the shared reason' \
-  'pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)' \
+  'the composer still holds unsent text after two Enters — the payload was typed but the submit could not be verified (DIVE-4246; was the DIVE-147 paste-placeholder poll)' \
   "$(jq -r '.data.reason' <<<"$out")"
 if [[ "$(<"$SCOPED_DELIVER_ARGV")" == "-n /usr/local/bin/5dive agent _deliver --json --id=feed2362 ada "* ]]; then
   ok_t 'T16 scoped ask keeps _deliver in the sudoers-granted argv position'
