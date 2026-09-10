@@ -1584,7 +1584,21 @@ _hb_pick_tasks() {
         crit(root, cp) AS (SELECT root, MAX(depth) AS cp FROM cp GROUP BY root)
       SELECT t.id
         FROM tasks t LEFT JOIN crit c ON c.root = t.id
-        WHERE t.assignee=$(sqlq "$name") AND t.status='todo' AND t.kind='standard'
+        WHERE t.status='todo' AND t.kind='standard'
+          -- DIVE-4220: THE SEAT THAT HOLDS THE MERGE IS NOT ALWAYS THE ASSIGNEE.
+          -- DIVE-4206 (below) stopped waking a maker onto a merge owed by someone
+          -- else, which was right, but it left the row dispatched to NOBODY: the
+          -- picker only ever selected assignee=<seat>, so a row whose merge owner
+          -- is the GRADER waits until a seat happens to look. Measured 2026-09-10
+          -- 10:45Z: 8 rows sat in graded-to-merge, three of them with the pull
+          -- request already MERGED hours earlier. The second arm here is what
+          -- makes the merge a DISPATCHED turn for the seat that can act on it.
+          -- The owner expression is the board's, character for character, and it
+          -- is only ever read on a graded-and-waiting row.
+          AND ( t.assignee=$(sqlq "$name")
+                OR ( (${_TASKS_TFV_SQL})
+                     AND COALESCE(NULLIF(t.merge_owner,''), NULLIF(t.maker_agent,''),
+                                  COALESCE(t.assignee,'?')) = $(sqlq "$name") ) )
           AND NOT (t.need_type IS NOT NULL AND t.need_answered_at IS NULL)
           AND NOT EXISTS (
             SELECT 1 FROM task_deps dd JOIN tasks b ON b.id = dd.blocked_by
@@ -2758,9 +2772,19 @@ _hb_loop_terminal_clause() {
   # One read, three fields: the verifier selects the variant, maker_agent proves
   # (or disproves) the handoff, created_by names the routing variant's destination.
   # '|' is safe as a separator — all three are agent names (validated slugs).
+  # DIVE-4220: the woken seat is not always the ASSIGNEE. Once the picker
+  # dispatches a graded-and-waiting row to the seat that OWNS the merge, that seat
+  # is frequently the GRADER while the row stays assigned to the maker — and an
+  # assignee-only read returned empty there, so the one wake that exists to move a
+  # merge arrived with no note at all. The second arm is the same owner expression
+  # the picker and the board use, and it is only ever reached on a graded row.
   row=$(db "SELECT COALESCE(verifier,'')||'|'||COALESCE(maker_agent,'')||'|'||COALESCE(created_by,'')
               FROM tasks
-               WHERE id=${task_id} AND assignee=$(sqlq "$name")
+               WHERE id=${task_id}
+                 AND ( assignee=$(sqlq "$name")
+                       OR ( (${_TASKS_TFV_SQL})
+                            AND COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''),
+                                         COALESCE(assignee,'?')) = $(sqlq "$name") ) )
                  AND status NOT IN ('done','cancelled');" 2>/dev/null) || return 0
   vfier="${row%%|*}"; rest="${row#*|}"; maker="${rest%%|*}"; creator="${rest#*|}"
   [[ -n "$vfier" ]] || return 0
@@ -2782,6 +2806,28 @@ _hb_loop_terminal_clause() {
   if [[ "$(db "SELECT 1 FROM tasks WHERE id=${task_id} AND ${_TASKS_TFV_SQL};" 2>/dev/null)" == "1" ]]; then
     local _tfv_owner
     _tfv_owner=$(db "SELECT COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''), COALESCE(assignee,'?')) FROM tasks WHERE id=${task_id};" 2>/dev/null)
+    # DIVE-4220 — THE OWNER'S OWN ROW IS NOT TERMINAL FOR THE OWNER. The clause
+    # below is correct for everyone EXCEPT the seat that owes the merge, and to
+    # that seat it says the exact opposite of the truth: stop, someone else acts.
+    # It was never reached before, because the picker never woke a non-assignee
+    # owner and the read above was assignee-only; widening the picker without
+    # widening this would hand the merge owner a note telling them to stand down,
+    # which is the strand this row exists to end. Three outcomes are named because
+    # the wake is one turn and the seat should not have to re-derive which it is
+    # in: already merged, mergeable, or a red required check that belongs to the
+    # maker. Deliberately NOT an auto-close (main2, 2026-09-10): a merged pull
+    # request is not a finished row — two of seven rows triaged that morning had
+    # an owed clause in their own PASS verdict — so the wake DISPATCHES the seat
+    # that can read the verdict, and the close stays a judgement someone makes.
+    if [[ -n "$_tfv_owner" && "$_tfv_owner" == "$name" ]]; then
+      printf ' NOTE — %s is GRADED AND THE MERGE IS YOURS: a verifier grade is recorded, a delivery ref is bound, and %s names YOU (%s) as the seat that owes the merge. This wake IS that move — nothing here is owed by anyone else, so do not route it onward, do not re-grade it and do not re-deliver it. START BY READING THE PULL REQUEST STATE, because which of three things you should do is decided there and not in this note. (1) ALREADY MERGED: close the row with %s — but read the PASS verdict first, since a merged pull request is NOT automatically a finished row (a verdict routinely carries an owed clause, or the branch was one item of several), and if something is still owed, say so on the row and leave it open. (2) MERGEABLE AND GREEN: land it (%s, or %s if you hold the merge), then close. (3) A REQUIRED CHECK IS RED, or the branch conflicts: that is the MAKER%s move, not yours — bounce it with %s naming the check, and stop. Whatever you do, say which of the three it was.' \
+        "$task_ident" "'5dive task ls'" "$name" \
+        "'5dive task done ${task_ident}'" \
+        "'5dive task merge ${task_ident}'" "'5dive task done ${task_ident}'" \
+        "$([[ -n "$maker" ]] && printf "'s (%s)" "$maker" || printf "'s")" \
+        "'5dive task reject ${task_ident} --feedback=...'"
+      return 0
+    fi
     printf ' NOTE — %s is GRADED AND WAITING ON A MERGE: a verifier grade is recorded and a delivery ref is bound, so the verifier has discharged their role and this is TERMINAL FOR THIS GOAL. Treat the goal as MET and stop — %s renders it as %s. The row stays OPEN on purpose and closes only when the work MERGES, because %s keeps meaning merged-to-main; the outstanding act is a MERGE owed by %s, not another pass by you. Do NOT re-grade it, re-deliver it, or close it to make the loop stop.' \
       "$task_ident" "'5dive task ls'" "'graded->merge:${_tfv_owner}'" "'done'" "${_tfv_owner:-the maker}"
     return 0
