@@ -2354,23 +2354,31 @@ _hb_reclaim() {
   local reclaimed=0 escalated=0 id started_epoch age_min awaiting_verifier delivered_live merge_elsewhere
   while IFS='|' read -r id started_epoch age_min awaiting_verifier delivered_live merge_elsewhere; do
     [[ -n "$id" ]] || continue
-    # DIVE-4206 — GRADED, AND THE MERGE IS ANOTHER SEAT'S. None of the three
-    # rules below may touch this row. Reclaiming it to todo is what makes it
-    # look like buildable work again, and the picker then hands it straight
-    # back to a maker who owes nothing on it -- the loop DIVE-4161 went round
-    # four times and DIVE-4108 ten. Checked FIRST, ahead of rule (a), because a
-    # gone session is not a reason to re-present a row whose remaining step
-    # belongs to someone else either.
+    # DIVE-4206 — GRADED, AND THE MERGE IS ANOTHER SEAT'S. Recorded here for
+    # the log ONLY; the three rules below still run and the row still reclaims.
     #
-    # The claim is deliberately LEFT STANDING rather than cleared: the board
-    # already renders the row graded-to-merge rather than in_progress, the
-    # picker steps over a held row instead of stalling on it (DIVE-2716), and
-    # the merge owner is nagged by the stall sweep. The bound is the merge --
-    # this is the one state in this file whose exit is another seat's act, and
-    # inventing a timeout here would hand the row back exactly as before.
+    # Iteration 1 of this ticket made this a `continue`, holding the claim
+    # because "the exit is another seat's act and a timeout would hand the row
+    # back exactly as before". That reasoning was wrong about where the row is
+    # re-handed. It is the PICKER clause above that refuses to re-hand a
+    # graded-merge-elsewhere row, and the picker is not the guard the tick hits
+    # first: the dispatch tick's busy-guard (see _hb_dispatch, "busy — N
+    # in_progress, skip") counts EVERY in_progress row for the seat and returns
+    # one level ABOVE the picker. So a standing claim on a row nobody here owes
+    # does not merely cost the re-pick it was meant to save -- it makes the seat
+    # undispatchable onto ANY row until some other seat merges, which is this
+    # ticket's own axis inverted: 57% wasted attempts becomes 0 attempts. It
+    # also breaks the boundedness invariant tests/heartbeat_reclaim_loop_unit.sh
+    # exists to defend (a hold whose exit is not this seat's act re-fires
+    # forever).
+    #
+    # Letting it reclaim costs nothing that the skip was buying: the board
+    # paints the row graded-to-merge off _TASKS_TFV_SQL whether it is todo or
+    # in_progress, and the picker clause -- same predicate, same owner
+    # expression -- still refuses to hand it back to a maker. Zero wasted
+    # re-pick AND zero wedge, which is what arm B asked for.
     if (( merge_elsewhere )); then
-      _hb_log "[$name] $(_hb_ident "$id") is graded and waiting on a merge owed by another seat — claim left in place, NOT reclaimed (nothing is owed by $name here, DIVE-4206)"
-      continue
+      _hb_log "[$name] $(_hb_ident "$id") is graded and waiting on a merge owed by another seat — reclaiming the claim so $name stays dispatchable; the picker will not re-hand it (DIVE-4206)"
     fi
     # Reset per row: `local` is function-scoped, not block-scoped, so a lapse
     # set on one row would otherwise leak into the next row of the same tick.

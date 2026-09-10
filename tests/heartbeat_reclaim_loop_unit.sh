@@ -559,12 +559,24 @@ read -r RCP4 _ < <(_hb_reclaim dev 30)
 printf '{"agents":{}}' >"$REGISTRY"; _NATIVE_STATE=""
 
 # =============================================================================
-# DIVE-4206 — graded, and the MERGE is another seat's: no rule may reclaim it
+# DIVE-4206 — graded, and the MERGE is another seat's: the row RECLAIMS, and
+#             the seat stays dispatchable. The picker is the half that refuses.
 # =============================================================================
 # The shape DIVE-4161 went round four times and DIVE-4108 ten: a verifier has
 # graded the pass, the delivery is bound, and the outstanding act is a merge
-# owed by main. Reclaiming it to todo is what makes it look like buildable work
-# again, and the picker then hands it back to a maker who owes nothing on it.
+# owed by main. Iteration 1 of this ticket answered that by holding the claim
+# here in _hb_reclaim. That inverted the ticket's own axis: the dispatch tick's
+# busy-guard counts EVERY in_progress row for the seat and returns one level
+# ABOVE the picker, so a standing claim on a row nobody here owes made the seat
+# undispatchable onto ANY row until another seat merged -- 57% wasted attempts
+# becoming 0 attempts, and an unbounded hold whose exit is not this seat's act,
+# the exact class arms 6 and 8d of this file exist to forbid.
+#
+# The correct half is the PICKER clause (tests/heartbeat_pick_unit.sh): the row
+# reclaims to todo, the seat is dispatchable again, and the picker still refuses
+# to hand the graded row back. Zero wasted re-pick AND zero wedge. Nothing is
+# lost by reclaiming: the board paints the row graded-to-merge off _TASKS_TFV_SQL
+# whether it is todo or in_progress.
 mk_graded_awaiting_merge() {   # <maker> <merge-owner>
   local maker="${1:-dev}" owner="${2:-main}" id
   id=$(mk_delivered_unacked "$maker" quinn)
@@ -577,47 +589,61 @@ mk_graded_awaiting_merge() {   # <maker> <merge-owner>
        WHERE id=${id};"
   printf '%s' "$id"
 }
+inprog() { db "SELECT COUNT(*) FROM tasks WHERE assignee=$(sqlq "$1") AND status='in_progress';"; }
 
 reset_all
 TM1=$(mk_graded_awaiting_merge dev main)
 read -r RCM1 _ < <(_hb_reclaim dev 30)
-[[ "$(row "$TM1")" == in_progress\|* ]] && (( ${RCM1:-1} == 0 )) \
-  && ok_t "graded, merge owed by main: idle stall does NOT reclaim — claim left in place" \
-  || bad_t "a row waiting on another seat's merge was reclaimed" "reclaimed=${RCM1:-?} row=$(row "$TM1")"
+[[ "$(row "$TM1")" != in_progress\|* ]] && (( ${RCM1:-0} >= 1 )) && (( $(inprog dev) == 0 )) \
+  && ok_t "graded, merge owed by main: the idle stall RECLAIMS it — the seat is not wedged behind another seat's merge" \
+  || bad_t "the graded row kept its claim and left the seat undispatchable" "reclaimed=${RCM1:-?} row=$(row "$TM1") inprog=$(inprog dev)"
 
-# Rule (a) is checked BEFORE the idle arm and had its own path back to todo, so
-# the gone-session shape gets its own assertion rather than riding on the one
-# above: a restart is not a reason to re-present a row whose remaining step
-# belongs to someone else either.
+# THE ARM THE VERIFIER ASKED FOR, end to end: the wedge is a DISPATCH-tick
+# property, not a row property, so it is asserted with a second, ordinary row
+# in the same queue. After the reclaim tick the seat must have inprog=0 (the
+# busy-guard would otherwise skip it before the picker is ever reached) AND the
+# picker must offer the ordinary row while still omitting the graded one.
+reset_all
+TM1b=$(mk_graded_awaiting_merge dev main)
+TODO1=$(addt "an ordinary urgent row" --assignee=dev --priority=urgent)
+read -r _ _ < <(_hb_reclaim dev 30)
+PICKED=$(_hb_pick_tasks dev 5 | tr '\n' ' ')
+(( $(inprog dev) == 0 )) && [[ " $PICKED " == *" $TODO1 "* ]] && [[ " $PICKED " != *" $TM1b "* ]] \
+  && ok_t "after a reclaim tick the seat is dispatchable (inprog=0) and the picker offers the ordinary row but NOT the graded one" \
+  || bad_t "the seat is still wedged, or the picker re-handed the graded row" "inprog=$(inprog dev) picked=[$PICKED] graded=$TM1b todo=$TODO1"
+
+# Rule (a) is checked before the idle arm and has its own path: a gone session
+# on a live delivery routes to the VERIFIER (DIVE-4104), which also clears the
+# maker's claim. Either way the seat is left dispatchable.
 reset_all
 TM2=$(mk_graded_awaiting_merge dev main)
 gone_session "$TM2"
 read -r RCM2 _ < <(_hb_reclaim dev 30)
 live_session
-[[ "$(row "$TM2")" == in_progress\|* ]] && (( ${RCM2:-1} == 0 )) \
-  && ok_t "graded, merge owed by main: a GONE SESSION does not reclaim it either" \
-  || bad_t "rule (a) reclaimed a row waiting on another seat's merge" "reclaimed=${RCM2:-?} row=$(row "$TM2")"
+[[ "$(row "$TM2")" != in_progress\|* ]] && (( $(inprog dev) == 0 )) \
+  && ok_t "graded, merge owed by main: a GONE SESSION clears the claim too — no wedge on rule (a)" \
+  || bad_t "rule (a) left a graded row claimed" "reclaimed=${RCM2:-?} row=$(row "$TM2") inprog=$(inprog dev)"
 
-# The hard-cap arm too — a merge that is not this seat's move does not become
-# this seat's move by sitting there for 200 minutes.
+# The hard-cap arm too — the runaway backstop is not disarmed by a merge that
+# belongs to someone else. This is the boundedness assertion for the new state.
 reset_all
 TM3=$(mk_graded_awaiting_merge dev main)
 db "UPDATE tasks SET started_at=datetime('now','-200 minutes') WHERE id=${TM3};"
 read -r RCM3 _ < <(_hb_reclaim dev 30)
-[[ "$(row "$TM3")" == in_progress\|* ]] && (( ${RCM3:-1} == 0 )) \
-  && ok_t "graded, merge owed by main: the 200m hard cap does not reclaim it either" \
-  || bad_t "the hard-cap arm reclaimed a row waiting on another seat's merge" "reclaimed=${RCM3:-?} row=$(row "$TM3")"
+[[ "$(row "$TM3")" != in_progress\|* ]] && (( $(inprog dev) == 0 )) \
+  && ok_t "graded, merge owed by main: the 200m hard cap still fires — the hold is bounded" \
+  || bad_t "the hard-cap arm was disarmed by another seat's merge" "reclaimed=${RCM3:-?} row=$(row "$TM3") inprog=$(inprog dev)"
 
 # CONTROL — the merge owner's OWN row is still ordinary work. Same fixture with
-# the owner flipped to dev: this seat owes the merge, so the pre-4206 rules must
-# still apply to it. A skip that swallowed every graded row would pass all three
-# assertions above and fail here.
+# the owner flipped to dev. The merge_elsewhere column is still SELECTed (it is
+# logged), so this pins that it drives nothing but the log line: both owners
+# reclaim identically.
 reset_all
 TM4=$(mk_graded_awaiting_merge dev dev)
 read -r RCM4 _ < <(_hb_reclaim dev 30)
 [[ "$(row "$TM4")" != in_progress\|* ]] && (( ${RCM4:-0} >= 1 )) \
   && ok_t "[control] graded with the merge owed by THIS seat — the ordinary rules still fire" \
-  || bad_t "[control] the skip swallowed the merge owner's own row" "reclaimed=${RCM4:-?} row=$(row "$TM4")"
+  || bad_t "[control] the merge owner's own row stopped reclaiming" "reclaimed=${RCM4:-?} row=$(row "$TM4")"
 
 # CONTROL — delivered but NOT yet graded is a different state and keeps its
 # DIVE-4104 behaviour (back to the verifier's queue, delivery intact). Pins the
@@ -631,7 +657,7 @@ read -r RCM5 _ < <(_hb_reclaim dev 30)
 live_session
 [[ "$(who "$TM5")" == "quinn|quinn|dev|deliv|noack" ]] \
   && ok_t "[control] delivered but UNGRADED still routes to the verifier (DIVE-4104 unchanged)" \
-  || bad_t "[control] the 4206 skip swallowed an ungraded delivery" "who=$(who "$TM5") reclaimed=${RCM5:-?}"
+  || bad_t "[control] the 4206 change swallowed an ungraded delivery" "who=$(who "$TM5") reclaimed=${RCM5:-?}"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
