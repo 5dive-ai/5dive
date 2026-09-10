@@ -74,6 +74,11 @@
 #       10 commits uncut — while the ratio at that reading was 61-63% against a
 #       110% cap. The branch is unreachable on a fat box, so it is graded here
 #       with synthetic readings, in both directions.
+#   T16 a control too fast to divide by is BATCHED so the arm still grades,
+#       instead of skipping and grading nothing. Same floor, same cap, same
+#       verdict function — only the denominator changes. Graded here for T15's
+#       reason: the branch cannot fire on a fat box, which is where the last
+#       defect in it shipped from.
 #
 # Run: bash tests/lazy_dispatch_unit.sh   (no root, no network)
 set -uo pipefail
@@ -140,48 +145,103 @@ RATIO_FLOOR_MS="${LAZY_RATIO_FLOOR_MS:-60}"
 # The verdict half of every ratio arm, split from the measurement half so the
 # sub-floor branch can be exercised with synthetic readings. On this host the
 # floor cannot fire naturally, which is precisely why the bad_t shipped.
-_ratio_verdict() { # <what> <control_ms> <lazy_ms> <cap_pct> <regression_hint>
-  local what="$1" c="$2" l="$3" cap="$4" hint="$5" pct
+_ratio_verdict() { # <what> <control_ms> <lazy_ms> <cap_pct> <regression_hint> [reps]
+  local what="$1" c="$2" l="$3" cap="$4" hint="$5" reps="${6:-1}" pct over
   if (( c < RATIO_FLOOR_MS )); then
     skip_t "$what: NOT MEASURED — the eager control is under the ${RATIO_FLOOR_MS}ms floor" \
            "control ${c}ms, lazy ${l}ms (resampled, still under). At this size the ratio is mostly the timer, so this arm graded NOTHING. This is not a statement about the load path and must not be read as one."
     return 0
   fi
+  over=""; (( reps > 1 )) && over=" across ${reps} runs"
   pct=$(( l * 100 / c ))
   if (( pct <= cap )); then
-    ok_t "$what costs ${l}ms = ${pct}% of the eager control's ${c}ms (budget ${cap}%)"
+    ok_t "$what costs ${l}ms = ${pct}% of the eager control's ${c}ms${over} (budget ${cap}%)"
   else
     bad_t "$what stays within ${cap}% of the eager control" \
-          "${l}ms against ${c}ms = ${pct}%. $hint"
+          "${l}ms against ${c}ms${over} = ${pct}%. $hint"
   fi
 }
 
 # Interleaved min-of-N, control and lazy alternating inside one loop so a
 # scheduling gust lands on both. Unchanged sampling: the min-of-5 IS the arm's
 # non-flakiness margin and this row is not permitted to spend it.
-_min_pair() { # <samples> <verb...> -> "<control_ms> <lazy_ms>"
-  local n="$1"; shift
-  local bc=999999 bl=999999 t0 t1 d i
+_min_pair() { # <samples> <reps> <verb...> -> "<control_ms> <lazy_ms>"
+  local n="$1" reps="$2"; shift 2
+  local bc=999999 bl=999999 t0 t1 d i j
   for (( i = 0; i < n; i++ )); do
-    t0=$(date +%s%N); "$CONTROL" "$@" >/dev/null 2>&1 || true; t1=$(date +%s%N)
+    t0=$(date +%s%N)
+    for (( j = 0; j < reps; j++ )); do "$CONTROL" "$@" >/dev/null 2>&1 || true; done
+    t1=$(date +%s%N)
     d=$(( (t1 - t0) / 1000000 )); if (( d < bc )); then bc=$d; fi
-    t0=$(date +%s%N); "$BUNDLE"  "$@" >/dev/null 2>&1 || true; t1=$(date +%s%N)
+    t0=$(date +%s%N)
+    for (( j = 0; j < reps; j++ )); do "$BUNDLE"  "$@" >/dev/null 2>&1 || true; done
+    t1=$(date +%s%N)
     d=$(( (t1 - t0) / 1000000 )); if (( d < bl )); then bl=$d; fi
   done
   printf '%s %s\n' "$bc" "$bl"
 }
 
-# SKIP *AND* RESAMPLE, in that order. A single sub-floor read can be one lucky
-# scheduling window rather than a genuinely fast box, so the second min-of-5 is
-# paid only on runs that were about to grade nothing anyway.
+# BATCH, THEN SKIP — and the skip is the backstop, not the answer (DIVE-4161).
+#
+# The floor above decides "is this reading mostly timer?". Until this row the
+# only move available when it was, was to skip. That is the correct VERDICT and
+# it is still here, but on a runner fast enough to trip it the arm then grades
+# NOTHING — and an arm that cannot fire is not a guard. DIVE-4087's own receipt
+# is the arm that caught a real 117% regression; losing it on the lean runner,
+# where the load path is the largest share of the call, is losing it where it
+# matters most.
+#
+# A batch removes the reason to refuse without moving the floor. One `date` pair
+# around N runs amortises the ~5ms of timer-and-fork overhead to 5/N ms per run,
+# so applying the SAME 60ms threshold to the batch total holds the overhead at
+# the same 8% share it was derived for. The ratio is unaffected: both halves run
+# the same N, and a ratio is scale-invariant. So the cap, the hint and the
+# verdict function are untouched — only the denominator got big enough to divide
+# by. There is still exactly ONE constant, which is what the T15 arm asserts;
+# a second batch-target constant next to it would rebuild the 60-vs-150 defect
+# this file just finished removing.
+#
+# THE RESAMPLE IS NOT LOST. The old code re-measured once before skipping,
+# because a single sub-floor read can be one lucky scheduling window. The
+# batched read IS that second min-of-5 — a fresh interleaved sample, paid only
+# on runs that were about to grade nothing anyway.
+#
+# COST IS ZERO WHERE IT IS NOT NEEDED. This host reads `task ls` at ~690ms, and
+# the lean runner that filed this row read 124ms; both clear 60 on a single
+# sample, select reps=1, and run precisely the sampling they ran before. And the
+# doubling is bounded: a verb so cheap that even RATIO_BATCH_MAX_REPS of it will
+# not clear the floor is one the floor should still refuse, so the skip survives
+# with a reachable path to it.
+RATIO_BATCH_MAX_REPS="${LAZY_RATIO_BATCH_MAX_REPS:-64}"
+
+_batch_reps_for() { # <single control sample ms> -> repetitions
+  local sample="$1" reps=1
+  (( sample < 1 )) && sample=1
+  while (( sample * reps < RATIO_FLOOR_MS && reps < RATIO_BATCH_MAX_REPS )); do
+    reps=$(( reps * 2 ))
+  done
+  printf '%s\n' "$reps"
+}
+
 _timed_ratio_arm() { # <what> <cap_pct> <hint> <verb...>
   local what="$1" cap="$2" hint="$3"; shift 3
-  local c l
-  read -r c l < <(_min_pair 5 "$@")
-  if (( c < RATIO_FLOOR_MS )); then
-    read -r c l < <(_min_pair 5 "$@")
-  fi
-  _ratio_verdict "$what" "$c" "$l" "$cap" "$hint"
+  local c l reps=1
+  read -r c l < <(_min_pair 5 1 "$@")
+  # PREDICT, THEN VERIFY — do not trust the prediction. `_batch_reps_for` sizes
+  # the batch from a SINGLE-run reading, and a single run carries fork and exec
+  # overhead that a batch amortises away, so N runs routinely cost less than N
+  # times the sample and the predicted batch can still land under the floor.
+  # Measured here: a stand-in sampled at ~2ms predicted 32 runs and the batch of
+  # 32 read 47ms, still under 60 — a prediction-only sizer would have skipped
+  # while reporting a batch, which is the failure this loop exists to stop.
+  # Doubling on the re-measured total terminates at RATIO_BATCH_MAX_REPS, where
+  # the skip backstop takes it.
+  while (( c < RATIO_FLOOR_MS && reps < RATIO_BATCH_MAX_REPS )); do
+    if (( reps == 1 )); then reps=$(_batch_reps_for "$c"); else reps=$(( reps * 2 )); fi
+    (( reps > RATIO_BATCH_MAX_REPS )) && reps=$RATIO_BATCH_MAX_REPS
+    read -r c l < <(_min_pair 5 "$reps" "$@")
+  done
+  _ratio_verdict "$what" "$c" "$l" "$cap" "$hint" "$reps"
 }
 
 # shellcheck source=scripts/lib/lazy-dispatch.sh
@@ -636,13 +696,126 @@ fi
 # same timer, 60 and 150, is what let the wrong one hide behind the right one for
 # a whole iteration. Both patterns are split across a string concatenation so
 # this arm cannot match its own source lines and grade itself green.
-_t15_arms=$(grep -cE "_timed""_ratio_arm '" "$0" || true)
+_t15_arms=$(grep -E "_timed""_ratio_arm '" "$0" | grep -vc 'stand-in' || true)
 _t15_legacy=$(grep -cE -- "-lt 1""50" "$0" || true)
 if (( _t15_arms == 3 && _t15_legacy == 0 )); then
   ok_t "all 3 ratio probes route through one derived floor (${RATIO_FLOOR_MS}ms); no hand-picked 150 survives"
 else
   bad_t "the denominator floor is a single derived constant reached by every ratio arm" \
-        "found $_t15_arms ratio arms and $_t15_legacy legacy 150ms literals (want 3 and 0)."
+        "found $_t15_arms live ratio arms and $_t15_legacy legacy 150ms literals (want 3 and 0). T16's stand-in calls are excluded by name: they grade the helper, they are not probes of the product."
+fi
+
+# --- T16: a control too fast to divide by is BATCHED, not refused ------------
+# WHAT THIS EXISTS FOR (DIVE-4161). A required context went red on a runner that
+# read the eager control at 124ms. T15 fixed the VERDICT CLASS — it no longer
+# accuses the load path — but a skip still grades nothing, and the arm it
+# silences is the one that caught the real 117% regression. This is the other
+# half: make the denominator big enough to divide by, so the skip is a backstop
+# rather than the answer.
+#
+# It is graded here rather than through the live arms for the reason T15 was
+# written: the branch is unreachable on this host, `task ls` reads ~690ms, and
+# an unreachable branch is exactly where the last defect shipped from.
+
+# The sizer is a pure function of one reading, so grade it with readings.
+# Pinned to the derived floor, exactly as T15 pins it: LAZY_RATIO_FLOOR_MS is an
+# override that exists so these branches can be exercised, and an arm whose
+# verdict moves when someone exercises a NEIGHBOURING branch grades the override
+# rather than the code. Measured: without this, a run at LAZY_RATIO_FLOOR_MS=1400
+# — the override that proves the live probes batch — turned all four stand-in
+# arms red, because no batch of a trivial script reaches 1400ms.
+_T16_FLOOR=60
+_t16_124=$(RATIO_FLOOR_MS=$_T16_FLOOR _batch_reps_for 124)
+_t16_fast=$(RATIO_FLOOR_MS=$_T16_FLOOR _batch_reps_for 5)
+_t16_zero=$(RATIO_FLOOR_MS=$_T16_FLOOR _batch_reps_for 0)
+
+# NOT AN ACCIDENT AND WORTH SAYING PLAINLY: the 124ms runner that filed this row
+# needs NO batching once the floor is the derived 60 rather than the hand-picked
+# 150 — that reading was never unmeasurable, it was under a wrong constant. So
+# this arm pins that the fix does not bill every fast runner for a defect it
+# does not have; batching is for the boxes genuinely below the floor.
+if (( _t16_124 == 1 )); then
+  ok_t "the 124ms control that filed this row selects reps=1 — the derived ${_T16_FLOOR}ms floor already clears it"
+else
+  bad_t "a 124ms control needs no batching under the derived floor" \
+        "it selected $_t16_124 runs. Batching a reading that is already over the floor spends wall clock on every fast runner to fix a case that is not broken."
+fi
+
+if (( _t16_fast * 5 >= _T16_FLOOR && _t16_fast > 1 )); then
+  ok_t "a genuinely sub-floor control is accumulated into a measurable batch (5ms -> $_t16_fast runs)"
+else
+  bad_t "a sub-floor control is accumulated instead of refused" \
+        "5ms selected $_t16_fast runs = $(( _t16_fast * 5 ))ms, still under the ${_T16_FLOOR}ms floor."
+fi
+
+if (( _t16_zero <= RATIO_BATCH_MAX_REPS )); then
+  ok_t "the doubling is bounded at ${RATIO_BATCH_MAX_REPS} runs, so an unmeasurable verb cannot spin"
+else
+  bad_t "the batch doubling is bounded" \
+        "a 0ms reading selected $_t16_zero runs against a ${RATIO_BATCH_MAX_REPS} cap."
+fi
+
+# The live half, against two stand-in bundles cheap enough to sit under the
+# floor on any box. This grades the whole arm — sizer, batched sampling and
+# verdict together — which the three arms above deliberately do not.
+#
+# THE STAND-IN MUST BE SUB-FLOOR, NOT ARBITRARILY CHEAP (DIVE-4177). A bare
+# `exit 0` costs whatever a fork costs on the day's runner, and the batch that
+# lifts it is BOUNDED at RATIO_BATCH_MAX_REPS — so on a fast box the two are in
+# a race the harness cannot win: measured on a GitHub runner 2026-09-10 (job
+# 102745705652) the capped batch of 64 read 55ms against the 60ms floor, the
+# probe SKIPPED, and both arms below went red on a box where nothing was wrong.
+# `sleep 0.005` makes the cost of one run a PROPERTY OF THE SCRIPT rather than
+# of the runner: one run stays far under the 60ms floor (so the arm still grades
+# the sub-floor path it exists for, and the capped-out arm below still skips at
+# reps=1), while any batch of 12 or more clears it on every box. The sizer picks
+# 16 from a ~5ms sample, so the bound is never approached.
+printf '#!/bin/bash\nsleep 0.005\nexit 0\n' >"$TMP/fake-eager";  chmod +x "$TMP/fake-eager"
+printf '#!/bin/bash\nsleep 0.005\nexit 0\n' >"$TMP/fake-lazy";   chmod +x "$TMP/fake-lazy"
+
+_t16_batched="$( PASS=0; FAIL=0; SKIPPED=0
+  CONTROL="$TMP/fake-eager"; BUNDLE="$TMP/fake-lazy"; RATIO_FLOOR_MS=$_T16_FLOOR
+  _timed_ratio_arm '`stand-in`' 110 'unreachable hint'
+  printf '::%d/%d/%d' "$PASS" "$FAIL" "$SKIPPED" )"
+
+# WHAT THIS ARM MAY AND MAY NOT ASSERT (main2's iteration-2 reject, DIVE-4161).
+# It exists to prove a VERDICT WAS RETURNED where the old code graded nothing, so
+# it asserts GRADED — exactly one of PASS/FAIL, and no skip — and never PASS.
+# Demanding PASS smuggles in a claim about the RATIO between two byte-identical
+# stand-ins, and batching cannot buy that: lifting the denominator over the floor
+# bounds its MAGNITUDE, not the relative DISPERSION of two independent best-of-5
+# minima at ~1.2ms per spawn. Measured on the grading host, the PASS form read
+# 144% and 120% between two identical scripts and went red 5 times in 19 runs
+# (~26%) — a nondeterministic red in a REQUIRED context, which is the very defect
+# this row was filed to remove, reproduced one level up in the guard's own test.
+IFS='/' read -r _t16_p _t16_f _t16_s <<<"${_t16_batched##*::}"
+if (( _t16_p + _t16_f == 1 && _t16_s == 0 )); then
+  ok_t "a sub-floor probe is GRADED after batching (verdict returned, not skipped), where it used to grade nothing"
+else
+  bad_t "a sub-floor probe is graded after batching" \
+        "counts were ${_t16_batched##*::} (want exactly one of PASS/FAIL and no skip). If this skipped, the batch did not lift the control over the floor and the arm is still blind on a fast runner: ${_t16_batched%::*}"
+fi
+
+if [[ "$_t16_batched" == *"across "* ]]; then
+  ok_t "the batched reading names its repetition count, so the log says what was divided"
+else
+  bad_t "a batched reading names its repetition count" \
+        "it said: ${_t16_batched%::*}"
+fi
+
+# NON-VACUITY, in the direction that matters: prove it is the BATCHING that
+# rescued the arm above and not the stand-ins being slow, and prove the backstop
+# survived the change. Capped at one repetition, the identical probe must skip.
+_t16_capped="$( PASS=0; FAIL=0; SKIPPED=0
+  CONTROL="$TMP/fake-eager"; BUNDLE="$TMP/fake-lazy"; RATIO_FLOOR_MS=$_T16_FLOOR; RATIO_BATCH_MAX_REPS=1
+  _timed_ratio_arm '`stand-in`' 110 'unreachable hint'
+  printf '::%d/%d/%d' "$PASS" "$FAIL" "$SKIPPED" )"
+
+if [[ "$_t16_capped" == *"::0/0/1" && "$_t16_capped" == *"skip - "* ]]; then
+  ok_t "with batching capped out the same probe SKIPS — the backstop is intact and the batch is what lifted it"
+else
+  bad_t "an unbatchable control still skips" \
+        "counts were ${_t16_capped##*::} (want 0/0/1). Either the stand-in was never sub-floor, in which case the arm above proves nothing, or the skip backstop was lost."
 fi
 
 printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIPPED"

@@ -173,9 +173,16 @@ has "$(_pack_skill_refs "$TMP/prec/skills")" '"example-org/tools:find-skills"' \
   "an explicit manifest entry OVERRIDES the default table"
 
 printf '\n6. the default table cannot drift from the installer that seeds it\n'
-# skill_default_source is a second spelling of the install_default_skill_for_agent call
-# sites. Two spellings of one fact drift, so derive the truth from agent_setup.sh and
-# compare — adding a default skill there without adding it here reds this.
+# skill_default_source is a second spelling of the DEFAULT-SKILLS LIST. Two
+# spellings of one fact drift, so derive the truth from the list and compare —
+# adding a default skill there without adding it here reds this.
+#
+# DIVE-4203 moved the source of truth: this loop used to scrape the literal
+# `install_default_skill_for_agent "$name" <type> <src> <skill>` call sites, and
+# those call sites are gone — all seven preseed branches now route through
+# preseed_default_skills_for_type, which reads DEFAULT_AGENT_SKILLS. The
+# non-vacuity floor below caught the change instead of the arm quietly grading
+# an empty set, which is what it is for.
 DRIFT=0
 while read -r src_ skill_; do
   [[ -n "$skill_" ]] || continue
@@ -183,15 +190,20 @@ while read -r src_ skill_; do
   if [[ "$got" != "$src_" ]]; then
     bad_ "skill_default_source $skill_ -> want [$src_] got [$got]"; DRIFT=1
   fi
-done < <(grep -oE 'install_default_skill_for_agent "\$name" [a-z]+ (vercel-labs/skills|"\$\(gh_org\)/skills") [a-z0-9-]+' \
-           "$SRC/lib/agent_setup.sh" \
-         | sed -E 's/.* (vercel-labs\/skills|"\$\(gh_org\)\/skills") ([a-z0-9-]+)$/\1 \2/' \
-         | sed 's|"\$(gh_org)/skills"|5dive-ai/skills|' | sort -u)
-[[ $DRIFT -eq 0 ]] && ok_ "every installer default is known to skill_default_source"
-# Non-vacuity: the loop above must actually have read call sites.
-SITES=$(grep -cE 'install_default_skill_for_agent "\$name" [a-z]+ ' "$SRC/lib/agent_setup.sh")
-if [[ "$SITES" -ge 8 ]]; then ok_ "the drift check read $SITES real call sites"
-else bad_ "drift check read only $SITES call sites — it is not reaching agent_setup.sh"; fi
+done < <(grep -oE '^  "@org/skills:[a-z0-9-]+"' "$SRC/lib/agent_setup.sh" \
+         | sed -E 's/^  "@org\/skills:([a-z0-9-]+)"$/5dive-ai\/skills \1/' | sort -u)
+[[ $DRIFT -eq 0 ]] && ok_ "every default in DEFAULT_AGENT_SKILLS is known to skill_default_source"
+# Non-vacuity: the loop above must actually have read the list.
+SITES=$(grep -cE '^  "@org/skills:[a-z0-9-]+"' "$SRC/lib/agent_setup.sh")
+if [[ "$SITES" -ge 2 ]]; then ok_ "the drift check read $SITES real list entries"
+else bad_ "drift check read only $SITES list entries — it is not reaching DEFAULT_AGENT_SKILLS"; fi
+# skill_default_source deliberately keeps find-skills/openagent (DIVE-4130 removed
+# them from the DEFAULTS, not from the seats that already hold them — export and
+# pack roundtrip still have to name their source).
+check "openagent still resolves for seats that already carry it" \
+  "$(skill_default_source openagent 2>/dev/null)" "5dive-ai/skills"
+check "find-skills still resolves for seats that already carry it" \
+  "$(skill_default_source find-skills 2>/dev/null)" "vercel-labs/skills"
 check "an id that is not a 5dive default is rejected" \
   "$(skill_default_source not-a-5dive-skill >/dev/null 2>&1; echo $?)" "1"
 

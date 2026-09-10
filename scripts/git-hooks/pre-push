@@ -90,6 +90,7 @@ SCAN="$TOP/scripts/pii-scan.sh"
 VERSION_GUARD="$TOP/scripts/version-bump-guard.sh"
 HARNESS_TREE_GUARD="$TOP/scripts/harness-tree-guard.sh"
 ACTIONLINT_SCAN="$TOP/scripts/actionlint-scan.sh"
+PUSH_RAIL="$TOP/scripts/pre-push-rail.sh"
 EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
 Z40=0000000000000000000000000000000000000000
 
@@ -197,6 +198,25 @@ while read -r local_ref local_oid remote_ref remote_oid; do
     rm -rf "$wf_tmp"
   fi
 
+  # DIVE-4208: THE PRE-PUSH RAIL — the merge-gating checks that are cheap enough
+  # to run here: the title lint (3s in CI), shellcheck over the changed shell
+  # files, and the harnesses this diff touches. Measured cause: 3 of the 4 open
+  # PRs were red on a REQUIRED check on 2026-09-10, and a red required check is
+  # not fifteen minutes of CI, it is a verifier bounce plus a fresh maker wake
+  # (~20-45 min, DIVE-4206) charged again on every round.
+  #
+  # LAST, deliberately. Every guard above is sub-second; this one is the only
+  # stage that can take minutes, so a push that is going to be refused for PII or
+  # an unparseable workflow is refused before the rail spends anything. The rail
+  # times itself and caps its own harness stage (FIVE_PUSH_RAIL_CAP, default
+  # 360s), and it fails OPEN with a printed warning whenever an instrument is
+  # missing — never silently.
+  if [[ -f "$PUSH_RAIL" ]]; then
+    bash "$PUSH_RAIL" "$base" "$local_oid" || rc=1
+  else
+    echo "pre-push-rail: script not found ($PUSH_RAIL); skipping (CI's title, shellcheck and changed-harnesses jobs are the net)." >&2
+  fi
+
   # DIVE-2065: only fires on a push to main with an EXISTING remote main
   # (skip branch deletion, already `continue`d above; skip first-ever-push of
   # a new branch — main always already exists so $remote_oid is never Z40 for
@@ -217,7 +237,9 @@ if [[ $rc -ne 0 ]]; then
   echo "  version-bump-guard: src/header.sh at the pushed commit has no readable 'readonly FIVE_VERSION=' anchor. Fix the anchor — do NOT assign a version by hand; main carries the 0.0.0-dev sentinel and the real number is written at tag time (DIVE-2247). The version-COLLISION assertion this guard used to carry was retired by DIVE-2585; that property now lives in release-cut.yml (DIVE-2118)." >&2
   echo "  harness-tree-guard: paste the printed source-line snippet into the named harness and recommit." >&2
   echo "  actionlint-push-guard: the named workflow file does not parse. Run: bash scripts/actionlint-scan.sh" >&2
+  echo "  pre-push-rail: the named stage is red HERE and would be red in CI — fix it at your desk, where it costs minutes rather than a verifier round trip." >&2
   echo "  Emergency override (discouraged; the matching CI job is still the net): git push --no-verify" >&2
+  echo "  AUDITED override for the rail only (printed into the push and logged, unlike --no-verify): FIVE_PUSH_OVERRIDE=\"\$(cat reason.txt)\" git push" >&2
   exit 1
 fi
 exit 0

@@ -292,6 +292,7 @@ cmd_task() {
     clear-recs)      cmd_task_clear_recs "$@" ;;
     precedent)       cmd_task_precedent "$@" ;;
     pfr-autoclear)   cmd_task_pfr_autoclear "$@" ;;   # DIVE-3481 inert push-for-review auto-clear switch
+    gate-undo-window) cmd_task_gate_undo_window "$@" ;;  # DIVE-4154 arm D: hold the phone ping for a 2-minute undo window
     track-record)    cmd_task_track_record "$@" ;;   # DIVE-3694 per-filer track-record auto-clear switch + view
     routing)         cmd_task_routing "$@" ;;
     reclaim)         cmd_task_reclaim "$@" ;;   # DIVE-1967 worktree node_modules reclaim

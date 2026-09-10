@@ -81,7 +81,21 @@ _SUP_T_NO_OUTPUT_DAYS="${SUPERVISOR_T_NO_OUTPUT_DAYS:-3}"
 _SUP_QUOTA_PANE_LINES="${SUPERVISOR_QUOTA_PANE_LINES:-40}"
 [[ "$_SUP_QUOTA_PANE_LINES" =~ ^[0-9]+$ ]] || _SUP_QUOTA_PANE_LINES=40
 _SUP_QUOTA_PAT="${SUPERVISOR_QUOTA_PAT:-}"
-[[ -n "$_SUP_QUOTA_PAT" ]] || _SUP_QUOTA_PAT='(api[[:space:]]+error|request[[:space:]]+rejected)[^|]{0,60}429|quota[[:space:]]+(has[[:space:]]+been[[:space:]]+)?exhausted|exhausted[[:space:]]+your[[:space:]]+(token|weekly|monthly)|hit[[:space:]]+your[[:space:]]+(monthly|weekly|daily)[[:space:]]+spend[[:space:]]+limit|usage[[:space:]]+limit[[:space:]]+reached|insufficient_quota|credit[[:space:]]+balance[[:space:]]+is[[:space:]]+too[[:space:]]+low'
+[[ -n "$_SUP_QUOTA_PAT" ]] || _SUP_QUOTA_PAT='(api[[:space:]]+error|request[[:space:]]+rejected)[^|]{0,60}429|quota[[:space:]]+(has[[:space:]]+been[[:space:]]+)?exhausted|exhausted[[:space:]]+your[[:space:]]+(token|weekly|monthly)|hit[[:space:]]+your[[:space:]]+((monthly|weekly|daily)[[:space:]]+spend|session|usage|5[[:space:]-]?hour)[[:space:]]+limit|usage[[:space:]]+limit[[:space:]]+reached|insufficient_quota|credit[[:space:]]+balance[[:space:]]+is[[:space:]]+too[[:space:]]+low'
+# DIVE-4206 widened the `hit your ... limit` arm from the spend-only alternation
+# to `session|usage|5-hour`. It was written when the walls in evidence all said
+# "spend", and the banner both harnesses actually print today matches NONE of the
+# old alternatives:
+#   Claude Code  `You've hit your session limit · resets 4am (UTC)`
+#   codex        `You've hit your usage limit`
+# ("usage limit reached" is a different word ORDER and does not match either.) So
+# a walled seat classified `healthy`, no quota-exhausted row was written, and
+# DIVE-4104's park path -- which reads exactly that classification -- could not
+# fire: the reclaimer took the claim off a seat that was frozen, not idle.
+# Measured 2026-09-10 02:24-02:45Z: dev, dev3 and ops all on the session-limit
+# banner, two claims reclaimed as "idle 44m"/"idle 24m" and one re-nudged into
+# the same wall. Two-signature discipline is unaffected -- this is the HEADER
+# alternation, and _hb_pane_is_usage_limit still demands an action line too.
 _SUP_WEEKLY_QUOTA_PAT="${SUPERVISOR_WEEKLY_QUOTA_PAT:-}"
 [[ -n "$_SUP_WEEKLY_QUOTA_PAT" ]] || _SUP_WEEKLY_QUOTA_PAT='(^|[[:space:]])(7d|1w):[[:space:]]*100%([^0-9]|$)'
 # Ignore a missing poller right after a service start — the plugin's bun server
@@ -486,8 +500,32 @@ _sup_quota_deadline() {  # <text> [now_epoch]
   local text="$1" now="${2:-}"
   [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
   local re='[Cc]ontinuing[[:space:]]+automatically[[:space:]]+at[[:space:]]+([0-9]{1,2})(:([0-9]{2}))?[[:space:]]*([AaPp])?\.?[Mm]?\.?'
-  if [[ ! "$text" =~ $re ]]; then printf 'unknown\x1f\n'; return 0; fi
-  _sup_clock_state "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]:-00}" "${BASH_REMATCH[4]:-}" "$now"
+  if [[ "$text" =~ $re ]]; then
+    _sup_clock_state "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]:-00}" "${BASH_REMATCH[4]:-}" "$now"
+    return 0
+  fi
+  # DIVE-4206 — the SECOND recognised phrasing, `... limit · resets 4am (UTC)`.
+  # DIVE-3970 split _sup_clock_state out of the arm above expressly so this one
+  # could reuse the identical meridiem + nearest-day arithmetic instead of a
+  # second, subtly different parser, and then never wired a caller: the split's
+  # own comment names the phrasing, and until now no regex looked for it. The
+  # cost of the gap is not a misread — an unmatched deadline abstains, which is
+  # safe — it is that a park on this wall fell back to the blind 6h cap instead
+  # of running to the reset time the banner printed.
+  #
+  # RESIDUAL: the banner stamps its own zone ("(UTC)") and _sup_clock_state
+  # resolves a bare clock in the HOST's zone. On this host those are the same
+  # (`timedatectl` = UTC), so the two agree today; on a non-UTC host the parsed
+  # deadline would be wrong by the offset. Not fixed here, because reading the
+  # zone belongs with the clock arithmetic in _sup_clock_state and every caller
+  # of it, not in one of two regexes — and `unknown` (the pre-4206 behaviour on
+  # this phrasing) is still what an unparseable clock returns.
+  local re2='limit[^0-9]{0,20}resets?[[:space:]]+(at[[:space:]]+)?([0-9]{1,2})(:([0-9]{2}))?[[:space:]]*([AaPp])?\.?[Mm]?\.?'
+  if [[ "$text" =~ $re2 ]]; then
+    _sup_clock_state "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]:-00}" "${BASH_REMATCH[5]:-}" "$now"
+    return 0
+  fi
+  printf 'unknown\x1f\n'
 }
 
 # DIVE-3970: the meridiem + nearest-day arithmetic of _sup_quota_deadline, split
@@ -1136,7 +1174,7 @@ _sup_cli_check() {
   if [[ -r "$log" ]]; then
     local start_line ok_last=true last_at last_epoch=""
     start_line=$(grep -n "soft updates start" "$log" | tail -1 | cut -d: -f1) || start_line=""
-    if [[ -n "$start_line" ]] && tail -n "+${start_line}" "$log" | grep -q "CLI upgrade via install.5dive.com failed"; then
+    if [[ -n "$start_line" ]] && grep -q "CLI upgrade via install.5dive.com failed" < <(tail -n "+${start_line}" "$log"); then
       ok_last=false
     fi
     last_at=$(grep -oE "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:+-]+ soft updates done" "$log" \

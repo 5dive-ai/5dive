@@ -659,6 +659,27 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- which is what the ladder means and is immune to the band moving underneath it.
   nudge_escalated_n INTEGER,
   nudge_parked_at TEXT,
+  -- DIVE-4111: reap_escalated_at / reap_escalated_n latch the heartbeat's
+  -- hard-cap AUTO-PAUSE to once per (row, owner). The arm it guards used a
+  -- THRESHOLD on a monotonic counter -- `reap_n >= _HB_REAP_ESCALATE_AFTER` --
+  -- and _hb_mark_reap only ever increments, so the 3rd, 4th and 5th reap of the
+  -- same row each re-ran the whole escalation: re-block, re-bump the priority,
+  -- re-ping the owner AND the paired human. Measured 2026-09-08: 12 of the
+  -- fleet's 14 escalations that day were reaps 2..5 of four codex rows. A
+  -- threshold on a counter that never resets is not a latch; this column is.
+  -- CLEARED by an explicit `task assign` to a DIFFERENT owner (src/task/crud.sh,
+  -- alongside recurring_stall_escalated_at) and only there: the reap COUNT it
+  -- throttles lives per-agent in the registry
+  -- (.agents[<name>].heartbeat.reaps), so a latch that outlived the owner would
+  -- leave the new seat's own count able to climb with the pause permanently
+  -- disarmed. NOT cleared by `task unblock` -- re-arming it there is exactly the
+  -- loop this row was filed for, since `unblock` is the verb `task doctor`
+  -- prescribes for the no-anchor finding the pause itself produces.
+  reap_escalated_at TEXT,
+  -- DIVE-4111: the reap count at which the auto-pause fired, for the record --
+  -- read by nothing that branches, so a NULL on a pre-existing row is not a
+  -- behaviour change.
+  reap_escalated_n INTEGER,
   -- DIVE-2207: gate_answered_nudged_at throttles the POST-GATE-ANSWER nudge
   -- (gap#2's second predicate) to once per row. It is a SEPARATE column from
   -- handoff_stale_pinged_at on purpose, and reusing that one would have shipped
@@ -1732,6 +1753,7 @@ _TASKS_ADDITIVE_COLUMNS=(
   'stranded_pinged_at TEXT'
   'gate_answered_nudged_at TEXT'
   'nudge_escalated_at TEXT' 'nudge_escalated_n INTEGER' 'nudge_parked_at TEXT'
+  'reap_escalated_at TEXT' 'reap_escalated_n INTEGER'
   'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT'
   'gate_filed_by TEXT'
   'secret_key TEXT' 'connector TEXT' 'secret_oob TEXT' 'human_nonce_hash TEXT'

@@ -17,6 +17,69 @@
 # settings.json don't error on a missing command. New-agent settings.json
 # below no longer wires either of them.
 AGENT_SKILLS_DIR="/usr/local/lib/5dive/skills"
+
+# DIVE-4203 — THE ONE DEFAULT-SKILLS LIST. Both consumers read this and only
+# this: the provisioner (preseed_default_skills_for_type, called from all SEVEN
+# preseed call sites below — claude, codex, grok, opencode, pi, and antigravity
+# TWICE: once from cmd_create and once from the channel-attach path; the row
+# named four, the tree had seven) and the nightly backfill
+# (5dive-refresh-skills.sh, which reads it back out via `5dive agent
+# _default_skills`). Before this row they were two hand-maintained lists that
+# had already drifted — the provisioner seeded four skills, DEFAULT_SKILLS in
+# the refresh script held one — so DIVE-4130's fleet-wide removal of
+# `openagent` (16 of 16 on-type seats) survived exactly until the next
+# `5dive agent create` re-seeded it. A removal the create path re-seeds is not
+# a removal; fixing only the reconciler half fixes only the seats that already
+# exist.
+#
+# CONTENTS are DIVE-4130's measured keep-set. `openagent` (one-shot persona/card
+# minting, no charter names it) and `find-skills` (self-install-on-demand, zero
+# fires) are DELIBERATELY ABSENT — do not re-add either without a row that says
+# why. `notify-user` is not here on purpose: it is a direct SKILL.md copy out of
+# $AGENT_SKILLS_DIR in the telegram branches, not an `npx skills add` pull, and
+# it is per-channel rather than per-seat.
+#
+# FORMAT is the refresh script's spec form, `<owner>/<repo>:<skill-id>`, so the
+# two consumers compare byte-for-byte (tests/default_skills_single_list_unit.sh
+# diffs them). `@org` is a placeholder for gh_org() — resolved at use time, not
+# baked in, because the org differs between the 5dive-ai and 5dive-com mirrors
+# and a resolved list could not be a static, diffable constant.
+DEFAULT_AGENT_SKILLS=(
+  "@org/skills:5dive-cli"          # spawn sub-agents on this VM via the local 5dive CLI
+  "@org/skills:compile-knowledge"  # karpathy-method compile into the shared wiki
+)
+
+# Print the default skill specs with @org resolved, one `<owner>/<repo>:<skill>`
+# per line. The single reader-facing projection of DEFAULT_AGENT_SKILLS.
+default_agent_skill_specs() {
+  local spec
+  for spec in "${DEFAULT_AGENT_SKILLS[@]}"; do
+    printf '%s\n' "${spec/@org/$(gh_org)}"
+  done
+}
+
+# Hidden read-only primitive behind `5dive agent _default_skills` (main.sh).
+# Exists so 5dive-refresh-skills.sh — installed as a standalone file next to the
+# bundle, with no way to source src/ — can read THE list rather than carry a
+# second copy of it. No root, no registry, no side effects.
+cmd_agent_default_skills() {
+  [[ $# -eq 0 ]] || fail "$E_USAGE" "agent _default_skills takes no arguments"
+  default_agent_skill_specs
+}
+
+# Seed every default skill onto one agent, for one harness type. Best-effort per
+# skill (`|| true`): if npx isn't reachable yet (cold box, no network) the agent
+# still boots and the operator can re-trigger from the dashboard's Skills block,
+# and the nightly refresh backfills whatever did not land.
+preseed_default_skills_for_type() {
+  local name="$1" type="$2" spec source skill
+  while IFS= read -r spec; do
+    [[ -n "$spec" ]] || continue
+    source="${spec%%:*}"
+    skill="${spec##*:}"
+    install_default_skill_for_agent "$name" "$type" "$source" "$skill" || true
+  done < <(default_agent_skill_specs)
+}
 # CLAUDE.md fragment dropped into the per-agent $HOME/.claude/ when the
 # agent is created with --channels=telegram. Carries the per-turn reply
 # mandate + AskUserQuestion/ExitPlanMode warning — guidance that only
@@ -267,14 +330,9 @@ JSON
     chmod 644 "$home/.claude/CLAUDE.md"
   fi
 
-  # Default skills, best-effort: if npx isn't reachable yet (cold box, no network)
-  # the agent still boots; users can re-trigger via the dashboard's Skills block.
-  #   find-skills — search skills.sh and self-install additional skills on demand
-  #   5dive-cli   — spawn sub-agents on this VM via the local 5dive CLI
-  install_default_skill_for_agent "$name" claude vercel-labs/skills find-skills || true
-  install_default_skill_for_agent "$name" claude "$(gh_org)/skills" 5dive-cli || true
-  install_default_skill_for_agent "$name" claude "$(gh_org)/skills" compile-knowledge || true
-  install_default_skill_for_agent "$name" claude "$(gh_org)/skills" openagent || true
+  # Default skills — DEFAULT_AGENT_SKILLS, the one list read by BOTH this
+  # provisioner and the nightly 5dive-refresh-skills.sh backfill (DIVE-4203).
+  preseed_default_skills_for_type "$name" claude
 }
 
 # Preseed default skills for an antigravity agent. Unlike claude/codex/grok,
@@ -282,16 +340,13 @@ JSON
 # (install_channel_for_agent doesn't route antigravity), so the seed step
 # that lives inside channel installers for codex/grok has nowhere to land.
 # This runs unconditionally from cmd_create so antigravity gets the same
-# find-skills + 5dive-cli inheritance every other type gets. Skills land at
+# default-skill inheritance every other type gets. Skills land at
 # $HOME/.agents/skills/ (per SKILLS_INSTALL_DIR + agy's own loader path).
 preseed_antigravity_agent() {
   local name="$1"
   local home="/home/agent-${name}"
   [[ -d "$home" ]] || fail "$E_GENERIC" "agent home missing: $home"
-  install_default_skill_for_agent "$name" antigravity vercel-labs/skills find-skills || true
-  install_default_skill_for_agent "$name" antigravity "$(gh_org)/skills" 5dive-cli || true
-  install_default_skill_for_agent "$name" antigravity "$(gh_org)/skills" compile-knowledge || true
-  install_default_skill_for_agent "$name" antigravity "$(gh_org)/skills" openagent || true
+  preseed_default_skills_for_type "$name" antigravity
 }
 
 # DIVE-1535: seed the a2a return-channel convention into a new codex agent's
@@ -1120,14 +1175,9 @@ CODEX_ENV
   fi
   fi
 
-  # Default skills, best-effort: match preseed_claude_agent + the grok
-  # installer so codex+telegram agents get find-skills + 5dive-cli too.
-  # Upstream `npx skills add --agent codex` IS supported (see SKILLS_AGENT_ID),
+  # Default skills — the one DEFAULT_AGENT_SKILLS list (DIVE-4203). Upstream `npx skills add --agent codex` IS supported (see SKILLS_AGENT_ID),
   # so these route through the normal path, not the manual-install fallback.
-  install_default_skill_for_agent "$name" codex vercel-labs/skills find-skills || true
-  install_default_skill_for_agent "$name" codex "$(gh_org)/skills" 5dive-cli || true
-  install_default_skill_for_agent "$name" codex "$(gh_org)/skills" compile-knowledge || true
-  install_default_skill_for_agent "$name" codex "$(gh_org)/skills" openagent || true
+  preseed_default_skills_for_type "$name" codex
 }
 
 # Write ~/.codex/channels/telegram/access.json for agent-<name> with allowFrom
@@ -1261,14 +1311,9 @@ GROK_ENV
       "/home/${user}/.grok/skills/notify-user/SKILL.md"
   fi
 
-  # Default skills, best-effort: match the claude-side install in
-  # preseed_claude_agent so grok agents get find-skills + 5dive-cli too.
-  # Upstream `npx skills add` doesn't recognize --agent grok, so these
+  # Default skills — the one DEFAULT_AGENT_SKILLS list (DIVE-4203). Upstream `npx skills add` doesn't recognize --agent grok, so these
   # route through the manual-install fallback in install_default_skill_for_agent.
-  install_default_skill_for_agent "$name" grok vercel-labs/skills find-skills || true
-  install_default_skill_for_agent "$name" grok "$(gh_org)/skills" 5dive-cli || true
-  install_default_skill_for_agent "$name" grok "$(gh_org)/skills" compile-knowledge || true
-  install_default_skill_for_agent "$name" grok "$(gh_org)/skills" openagent || true
+  preseed_default_skills_for_type "$name" grok
 }
 
 # Write ~/.grok/channels/telegram/access.json for agent-<name> with allowFrom
@@ -1397,14 +1442,11 @@ AGY_ENV
       "/home/${user}/.agents/skills/notify-user/SKILL.md"
   fi
 
-  # Default skills, best-effort: match the grok-side install so agy agents get
-  # find-skills + 5dive-cli too. (preseed_antigravity_agent already runs these
+  # Default skills — the one DEFAULT_AGENT_SKILLS list (DIVE-4203).
+  # (preseed_antigravity_agent already runs these
   # from cmd_create; repeating here keeps channel-attach self-contained and the
   # installs are idempotent.)
-  install_default_skill_for_agent "$name" antigravity vercel-labs/skills find-skills || true
-  install_default_skill_for_agent "$name" antigravity "$(gh_org)/skills" 5dive-cli || true
-  install_default_skill_for_agent "$name" antigravity "$(gh_org)/skills" compile-knowledge || true
-  install_default_skill_for_agent "$name" antigravity "$(gh_org)/skills" openagent || true
+  preseed_default_skills_for_type "$name" antigravity
 }
 
 # Write ~/.gemini/channels/telegram/access.json for agent-<name> with allowFrom
@@ -1537,13 +1579,10 @@ OPENCODE_ENV
       "/home/${user}/.agents/skills/notify-user/SKILL.md"
   fi
 
-  # Default skills, best-effort: match the grok/agy installers. opencode IS in
+  # Default skills — the one DEFAULT_AGENT_SKILLS list (DIVE-4203). opencode IS in
   # the upstream skills registry (SKILLS_AGENT_ID[opencode]=opencode), so these
   # route through the normal `npx skills add` path.
-  install_default_skill_for_agent "$name" opencode vercel-labs/skills find-skills || true
-  install_default_skill_for_agent "$name" opencode "$(gh_org)/skills" 5dive-cli || true
-  install_default_skill_for_agent "$name" opencode "$(gh_org)/skills" compile-knowledge || true
-  install_default_skill_for_agent "$name" opencode "$(gh_org)/skills" openagent || true
+  preseed_default_skills_for_type "$name" opencode
 }
 
 # Write ~/.opencode/channels/telegram/access.json for agent-<name>. Idempotent —
@@ -1678,13 +1717,10 @@ PI_ENV
       "/home/${user}/.agents/skills/notify-user/SKILL.md"
   fi
 
-  # Default skills, best-effort: match the grok/agy/opencode installers. pi has
+  # Default skills — the one DEFAULT_AGENT_SKILLS list (DIVE-4203). pi has
   # no upstream skills-registry id, so these route through the generic path and
   # are best-effort (|| true — never block provisioning).
-  install_default_skill_for_agent "$name" pi vercel-labs/skills find-skills || true
-  install_default_skill_for_agent "$name" pi "$(gh_org)/skills" 5dive-cli || true
-  install_default_skill_for_agent "$name" pi "$(gh_org)/skills" compile-knowledge || true
-  install_default_skill_for_agent "$name" pi "$(gh_org)/skills" openagent || true
+  preseed_default_skills_for_type "$name" pi
 
   # DIVE-1246: wire the audited default pi extensions (web access + MCP bridge).
   # Fail-closed on integrity drift (unlike the best-effort skills above) — a

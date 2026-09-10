@@ -53,6 +53,14 @@ jobs:
           printf 'this batch was linted on its own pull_request event before it could be\n'
           printf 'enqueued. Reporting `title` so the merge group is graded, not evicted.\n'
 
+      # DIVE-4177: the fragment lint below needs the tree and the PR's file list. Fetch
+      # depth 0 so the base sha is reachable — a shallow clone cannot diff against it.
+      - name: Checkout
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: The title must name the kind of change
         if: github.event_name == 'pull_request'
         env:
@@ -80,3 +88,34 @@ jobs:
             echo "::error::A 'feat' title cuts the next release as a minor. Everything else cuts a patch."
           } >&2
           exit 1
+
+      # DIVE-4177 — THE ENTRY, not just the subject. The title decides the release
+      # LEVEL; the fragment decides whether the change appears in the release NOTES at
+      # all. v0.29.0 got the level right and printed two entries and no feature, because
+      # six fragments lacked the `## Unreleased` heading the fold requires and were
+      # skipped onto a log nobody reads. Same fix as DIVE-4086 applied one layer down:
+      # make it unmergeable rather than discovering it in a published tag.
+      #
+      # Deliberately in THIS job, under the required `title` context, rather than a new
+      # workflow: a new context is not in branch protection and would grade nothing that
+      # blocks a merge, which is the whole point.
+      - name: A changelog fragment must be foldable
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          # DIVE-4177: the `if` above already keeps this step off `merge_group`, but
+          # tests/merge_queue_triggers_unit.sh arm3 is a TEXT grep over the file and
+          # cannot see a step-level condition. Use the branching idiom pii-guard.yml
+          # and supply-chain-guard.yml already use, so the expression itself is safe
+          # on either event.
+          BASE_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.event.pull_request.head.sha }}
+        run: |
+          set -uo pipefail
+          # --diff-filter=d: a fragment DELETED by this PR is not graded (that is how an
+          # entry is withdrawn), and the script re-checks existence anyway.
+          if ! git diff --name-only --diff-filter=d "$BASE_SHA" "$HEAD_SHA" > /tmp/changed.txt; then
+            echo "::error::could not diff ${BASE_SHA}..${HEAD_SHA} — refusing to report a green fragment lint that graded nothing (DIVE-4177)"
+            exit 1
+          fi
+          bash scripts/lint-changelog-fragments.sh --title="$PR_TITLE" --changed-from=/tmp/changed.txt

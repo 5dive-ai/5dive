@@ -400,23 +400,62 @@ fv_after=$(fld "$idv" first_started_at)
 # Count SQL sites only — the prose above _hb_reclaim_to_todo names the field on
 # purpose, and a comment that explains why the erasure is deliberate must not
 # read to this guard as a second erasure.
+#
+# DIVE-4111 RE-GRADED BOTH LITERALS, and the second number is the reason the first
+# one moved. The hard-cap arm's ESCALATION branch now clears started_at too — it
+# had to, because it was the one path that left the clock running, so an unblocked
+# row was re-reaped on the first tick after the remedy and no seat ever got a full
+# budget window again. That branch CANNOT route through _hb_reclaim_to_todo: it
+# writes status='blocked', not 'todo', and it has to stamp its once-per-owner latch
+# inside the same WHERE clause that guards on it (concurrent ticks — one host cron,
+# no flock), which a shared todo-reclaim cannot express.
+#
+# So 1 -> 2 inline erasure sites and 3 -> 4 shared-reclaim call sites. The guard's
+# PURPOSE is unchanged and is what forced this paragraph: an inlined erasure owes a
+# per-rule arm rather than inheriting the other three's coverage. The escalation
+# branch's arm is tests/heartbeat_reap_escalate_latch_unit.sh — "the pause clears
+# the CLAIM clock and leaves the EVIDENCE clock (first_started_at) untouched",
+# read before and after the pause reap. A FIFTH site still fails here, as intended.
+# (The 4th _hb_reclaim_to_todo site is the repeat-offender path: past the threshold
+# with the latch already spent, the row is still requeued, just not re-escalated.)
 inline=$(grep -c "UPDATE tasks SET.*started_at=NULL" src/cmd_heartbeat.sh)
-inline=$(( inline - 1 ))   # the one legitimate site, inside _hb_reclaim_to_todo
-# FOUR callers since DIVE-4104, still three RULES: (a) session gone, (b) idle
-# stall, (c) budget overrun, plus `_hb_reclaim_to_verifier`, which is rule (a)'s
-# handoff-preserving entry point and delegates with mode `keep-handoff` rather
-# than writing its own UPDATE. The count is bumped and the invariant is NOT
-# retired: the arm above still demands exactly one erasure site, and 6b grades
-# first_started_at surviving on the new path. A fifth caller that inlines its
-# own UPDATE still reds the arm above; a fifth caller that does not still reds
-# this one until someone has re-read the per-rule arms.
+inline=$(( inline - 2 ))   # _hb_reclaim_to_todo, and the DIVE-4111 escalation pause
+#
+# MERGE NOTE (DIVE-4111 landing SECOND, behind DIVE-4104). Both branches edited
+# these two literals and NEITHER side's value is right on the merged tree, which
+# is why they were re-READ off it rather than picked:
+#   * DIVE-4104 added `_hb_reclaim_to_verifier` and wrote `inline-1` / `sites==4`.
+#   * DIVE-4111 added the escalation pause and the repeat-offender requeue and
+#     wrote `inline-2` / `sites==4` — the same 4, for a different fourth site.
+# So `sites` is 5, and neither branch could have written 5. The `sites==4` literal
+# is the sharp one: it sits OUTSIDE the conflict region, so git resolved it
+# silently to 4 and the collision would have been a red test, not a merge marker.
+#
+# THE FIX FOR THE NEXT COLLISION IS THE LIST, NOT THE NUMBER. A count carries no
+# evidence about WHICH sites it counted, so two people can agree on 4 and mean
+# different sets. Enumerated below; a sixth site reds this and the reader is told
+# what the five were, rather than being asked to re-derive them.
 sites=$(grep -c "_hb_reclaim_to_todo \"\$name\"" src/cmd_heartbeat.sh)
 [[ "$inline" == "0" ]] \
-  && ok_t "structural: cmd_heartbeat.sh clears started_at in exactly one place" \
+  && ok_t "structural: cmd_heartbeat.sh clears started_at in exactly the two graded places" \
   || bad_t "structural: an inlined started_at=NULL bypasses the shared reclaim" "extra=[$inline]"
-[[ "$sites" == "4" ]] \
-  && ok_t "structural: all reclaim paths route through _hb_reclaim_to_todo (3 rules + the verifier-queue mode)" \
+# The FIVE, read off the merged tree, in file order:
+#   1. _hb_reclaim_to_verifier's keep-handoff delegate   (DIVE-4104)
+#   2. rule (a) claiming session gone
+#   3. rule (c) budget overrun, repeat-offender requeue  (DIVE-4111)
+#   4. rule (c) budget overrun, first escalation
+#   5. rule (b) idle stall
+# Three RULES still, as before: the two additions are new ENTRY POINTS into them,
+# not new rules, which is why the per-rule arms above remain a complete grade.
+[[ "$sites" == "5" ]] \
+  && ok_t "structural: all FIVE reclaim call sites route through _hb_reclaim_to_todo (3 rules, 5 entry points)" \
   || bad_t "structural: reclaim call sites changed — re-grade the per-rule arms" "sites=[$sites]"
+# The escalation pause is a real, findable site, not a number talked up in a
+# comment: if it stops erasing the clock, `inline` reads 0 here and this guard goes
+# quiet, so pin it by name.
+grep -q "status='blocked', started_at=NULL" src/cmd_heartbeat.sh \
+  && ok_t "structural: the escalation pause is the second erasure site, by name" \
+  || bad_t "structural: no blocked+started_at=NULL site — the count above is stale" ""
 
 printf '\ntask first_started_at: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

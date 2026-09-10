@@ -731,6 +731,111 @@ cmd_agent_reconcile_sudoers() {
      --arg u "$updated" --arg c "$current" --arg s "$skipped"
 }
 
+# DIVE-4183: `agent grant <name> <merge|push|deploy>` — re-render ONE existing
+# standard seat's managed sudoers from the CURRENT template, so a capability the
+# template already knows how to emit reaches a seat that was created before it.
+#
+# The shape this closes. `_merge_do` is UNCONDITIONAL in render_standard_sudoers
+# (DIVE-3474), but the policy is written ONLY by the create path, so both grader
+# seats — provisioned before that line existed — held a four-grant drop-in and
+# `5dive task merge` on a row they graded PASS returned "this seat holds no
+# _merge_do grant, so NOTHING RAN". Every PASS became a message to an operator
+# and a hand relay. `_reconcile_sudoers` (DIVE-4081) already re-renders, but it is
+# a hidden fleet-wide installer migration: it names no seat, names no capability,
+# and is not something an operator can reach for one seat and read the result of.
+#
+# What this verb is NOT: a way to widen a seat. The scope stays exactly what the
+# template emits (exact command paths, params over stdin); a cli-root, root-all,
+# custom or hand-edited policy is REFUSED, never rewritten — those are the files
+# whose contents this CLI did not author and cannot re-derive.
+#
+# _agent_grant_plan <user> <capability> — the pure decision half, so the refusals
+# are unit-gradeable without root, a real /etc/sudoers.d or an adduser. Reads the
+# seat's ENFORCED policy through the documented SUDOERS_D seam and prints
+#   <state>|<can_push>|<can_deploy>|<detail>
+# where state is refuse | current | update. The two conditional broker
+# capabilities are read back from the enforced FILE, never from a registry label
+# or a stale env copy, so re-rendering for one axis cannot silently drop another.
+_agent_grant_plan() {
+  local user="$1" cap="$2" d="${SUDOERS_D:-/etc/sudoers.d}" f current grant cls rest extra
+  local can_push=0 can_deploy=0 wanted
+  f="${d}/${user}"
+  if [[ ! -r "$f" ]]; then
+    printf 'refuse|0|0|%s has no readable 5dive-managed sudoers policy at %s — a sandboxed seat holds none by design, and `agent grant` re-renders an existing policy rather than minting one\n' "$user" "$f"
+    return 0
+  fi
+  current=$(cat "$f")
+  if [[ "$current" != '# Managed by 5dive '* ]]; then
+    printf 'refuse|0|0|%s is not a 5dive-managed policy (no managed header) — refusing to overwrite a file this CLI did not write\n' "$f"
+    return 0
+  fi
+  grant=$(printf '%s\n' "$current" | classify_sudo_grant)
+  cls="${grant%%|*}"; rest="${grant#*|}"; extra="${rest##*|}"
+  if [[ "$cls" != "cli-scoped" ]]; then
+    printf 'refuse|0|0|%s enforces a %s grant, not cli-scoped — `agent grant` re-renders the STANDARD template only, and applying it here would REPLACE a broader policy rather than extend a narrow one\n' "$user" "$cls"
+    return 0
+  fi
+  if [[ "$extra" != "0" ]]; then
+    printf 'refuse|0|0|%s carries sudoers entries this CLI did not write — re-rendering from the template would delete them. Reconcile the file by hand first\n' "$user"
+    return 0
+  fi
+  grep -qE '^[^#]*NOPASSWD: /usr/local/bin/5dive _push_do[[:space:]]*$' "$f" && can_push=1
+  grep -qE '^[^#]*NOPASSWD: /usr/local/bin/5dive _deploy_do[[:space:]]*$' "$f" && can_deploy=1
+  # merge needs no axis: the template emits `_merge_do` unconditionally, so
+  # re-rendering IS the grant. push and deploy each turn their own axis on and
+  # never turn the other off.
+  case "$cap" in
+    merge)  : ;;
+    push)   can_push=1 ;;
+    deploy) can_deploy=1 ;;
+  esac
+  wanted=$(render_standard_sudoers "$user" "$can_push" "$can_deploy")
+  if [[ "$current" == "$wanted" ]]; then
+    printf 'current|%s|%s|%s already enforces the rendered policy for %s — nothing to do\n' "$can_push" "$can_deploy" "$user" "$cap"
+    return 0
+  fi
+  printf 'update|%s|%s|re-render %s from the current template (can_push=%s, can_deploy=%s)\n' \
+    "$can_push" "$can_deploy" "$f" "$can_push" "$can_deploy"
+}
+
+cmd_agent_grant() {
+  require_root "agent grant"
+  local name="${1:-}" cap="${2:-}"
+  [[ $# -eq 2 && -n "$name" && -n "$cap" ]] \
+    || fail "$E_USAGE" "usage: 5dive agent grant <name> <merge|push|deploy>"
+  case "$cap" in
+    merge|push|deploy) ;;
+    *) fail "$E_USAGE" "unknown capability '${cap}' — one of: merge, push, deploy" ;;
+  esac
+  local user="agent-${name}" reg iso
+  reg=$(registry_read)
+  jq -e --arg n "$name" '.agents[$n] != null' <<<"$reg" >/dev/null 2>&1 \
+    || fail "$E_USAGE" "no agent named '${name}' in the registry"
+  iso=$(jq -r --arg n "$name" '.agents[$n].isolation // "unknown"' <<<"$reg")
+  [[ "$iso" == "standard" ]] \
+    || fail "$E_USAGE" "agent '${name}' is labelled isolation='${iso}', not standard — \`agent grant\` re-renders the standard template only (an admin seat already reaches the whole CLI as root; a sandboxed seat holds no policy by design)"
+  local plan state push deploy detail
+  plan=$(_agent_grant_plan "$user" "$cap")
+  state="${plan%%|*}"; plan="${plan#*|}"
+  push="${plan%%|*}";  plan="${plan#*|}"
+  deploy="${plan%%|*}"; detail="${plan#*|}"
+  case "$state" in
+    refuse) fail "$E_USAGE" "$detail" ;;
+    current)
+      ok "${name}: ${cap} grant already in place (no change)" \
+         '{agent:$a, capability:$c, changed:false, canPush:($p=="1"), canDeploy:($d=="1")}' \
+         --arg a "$name" --arg c "$cap" --arg p "$push" --arg d "$deploy"
+      return 0 ;;
+  esac
+  # write_standard_sudoers visudo-validates the rendered file BEFORE it installs
+  # it and fails loudly without a partial write, so a malformed template can
+  # never lock the box out through this path either.
+  write_standard_sudoers "$user" "$push" "$deploy"
+  ok "${name}: managed sudoers re-rendered — ${cap} grant applied" \
+     '{agent:$a, capability:$c, changed:true, canPush:($p=="1"), canDeploy:($d=="1")}' \
+     --arg a "$name" --arg c "$cap" --arg p "$push" --arg d "$deploy"
+}
+
 # DIVE-2138 (gh#222, A-MO7SEN): where agent homes live, and where a removed
 # agent's home goes. Quarantine, not delete — an agent home can hold work the
 # operator still wants, and teardown is not the moment to make that call
@@ -1616,7 +1721,10 @@ seed_openclaw_state_into_seat() { # <name> [profile]
 # `create --inherit-memory=<scope>` is passed we seed the new agent's own recall
 # store (~/.claude/projects/<slug>/memory/) so `5dive memory search` returns
 # team knowledge from the first minute. Scope is a comma-list of sources:
-#   wiki            the shared team wiki (community/wiki) — canonical shared facts
+#   wiki            the shared team wiki — canonical shared facts. Resolved by
+#                   _memory_wiki_root: $FIVEDIVE_WIKI_ROOT, then the per-box
+#                   /var/lib/5dive/wiki the installer provisions, then our own
+#                   fleet's community/wiki checkout (DIVE-4128).
 #   <agent-name>    that sibling's SHAREABLE facts only (reference/project, never
 #                   user/feedback — deny-by-default, same L1 scoping as `export`)
 #   all | team      wiki + every sibling agent's shareable facts
@@ -1625,9 +1733,19 @@ seed_openclaw_state_into_seat() { # <name> [profile]
 
 # Copy the shared wiki (index first — the onboarding entry point) into <target>.
 # Echoes the number of files seeded. Pure (no root/chown) so it's unit-testable.
+# DIVE-4128: this used to return a bare `0` when there was no wiki root, and
+# the caller then printed "Inherited 0 memory file(s)" as a SUCCESS step. On a
+# customer box that was every agent ever created: seeded nothing, said nothing,
+# booted cold. A seeding pass that seeded nothing must say so and say WHY —
+# the count alone cannot distinguish "no wiki on this box" from "the wiki is
+# empty", and those have different fixes.
 _seed_wiki_memory() {
   local target="$1" wiki wf b n=0
-  wiki=$(_memory_wiki_root); [[ -n "$wiki" ]] || { printf '0'; return 0; }
+  wiki=$(_memory_wiki_root)
+  if [[ -z "$wiki" ]]; then
+    warn "inherit-memory: seeded 0 files from the wiki — no shared team wiki root on this box (looked for \$FIVEDIVE_WIKI_ROOT, /var/lib/5dive/wiki, ~/projects/5dive/community/wiki). Re-run the 5dive installer to provision /var/lib/5dive/wiki, then re-seed."
+    printf '0'; return 0
+  fi
   for wf in "$wiki"/index.md "$wiki"/*.md; do
     [[ -f "$wf" ]] || continue
     b=$(basename "$wf")
@@ -1635,6 +1753,7 @@ _seed_wiki_memory() {
     [[ -e "$target/$b" ]] && continue   # index.md matches both globs; dedup
     cp "$wf" "$target/$b" 2>/dev/null && n=$((n+1))
   done
+  (( n == 0 )) && warn "inherit-memory: seeded 0 files from the wiki — the shared wiki root $wiki exists but holds no pages yet. Nothing to inherit; this agent boots without team knowledge."
   printf '%s' "$n"
 }
 
@@ -1878,7 +1997,13 @@ seed_inherited_memory() {
   done < <(_resolve_inherit_sources "$scope" "$name")
   _rebuild_inherited_index "$target"
   chown -R "$user":"$user" "/home/${user}/.claude/projects/${slug}"
-  step "Inherited $seeded memory file(s) into agent-${name}'s recall (scope: $scope)"
+  # DIVE-4128: zero is not a success. Reporting it as a normal step is what let
+  # a whole box of cold-booted agents look correctly provisioned.
+  if (( seeded == 0 )); then
+    warn "Inherited 0 memory file(s) into agent-${name}'s recall (scope: $scope) — agent-${name} boots COLD. See the reason(s) printed above."
+  else
+    step "Inherited $seeded memory file(s) into agent-${name}'s recall (scope: $scope)"
+  fi
 }
 
 cmd_create() {
@@ -2749,7 +2874,7 @@ cmd_create() {
     tb_owner=$(jq -r '.owner // empty' /etc/5dive/team-bot.json 2>/dev/null)
     if [[ -z "$tb_token" || -z "$tb_group" ]]; then
       team_bot_status="off"
-    elif _team_bot_relay_agent_list | grep -qxF "$name"; then
+    elif grep -qxF "$name" < <(_team_bot_relay_agent_list); then
       step "Attaching $name to the shared team bot (group $tb_group)"
       local tb_prev_json="$JSON_MODE"
       JSON_MODE=0
@@ -2888,8 +3013,8 @@ cmd_create() {
   if channel_in_list buzz "$channels"; then
     local _bz_home="/home/agent-${name}" _bz_gaps=() _bz_cfg _bz_path
     _bz_cfg="${_bz_home}/.claude/channels/buzz/config.json"
-    if ! find "${_bz_home}/.claude/plugins/cache" -maxdepth 3 -type d -name buzz \
-         -print -quit 2>/dev/null | grep -q .; then
+    if ! grep -q . < <(find "${_bz_home}/.claude/plugins/cache" -maxdepth 3 -type d -name buzz \
+         -print -quit 2>/dev/null); then
       _bz_gaps+=("plugin not installed")
     fi
     if [[ ! -f "$_bz_cfg" ]]; then

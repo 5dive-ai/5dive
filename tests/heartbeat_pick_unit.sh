@@ -150,5 +150,54 @@ got=$(_hb_pick_task dev)
 [[ "$got" == "$G" ]] && ok_t "answered human gate: todo becomes selectable again ($G)" \
                       || bad_t "answered gate must restore selection" "got $got, answered=$G"
 
+# --- Case 7: a graded row waiting on ANOTHER seat's merge is not maker work ---
+# (DIVE-4206.) The row is graded, its delivery is bound and the merge is owed by
+# `main`, so nothing on it is dev's move. Before this arm the picker handed it
+# back and the seat spent a whole session re-deriving "nothing owed by me" —
+# 25-45 min per attempt, measured over 400 maker runs.
+#
+# Insert the graded row FIRST and at the same priority, so the pre-4206 picker
+# selects it by id order: if the predicate were dropped this case reds rather
+# than passing by luck of the ordering.
+db "DELETE FROM task_deps;"; db "DELETE FROM tasks;"
+GM=$(mk "GM graded, main owes the merge" urgent todo)
+db "UPDATE tasks
+       SET graded_at=datetime('now'), graded_by='quinn', graded_verdict='pass',
+           maker_agent='dev', verifier='quinn', merge_owner='main',
+           delivery_ref='https://example.com/pr/1'
+     WHERE id=${GM};"
+U2=$(mk "U2 open and actionable" urgent todo)
+got=$(_hb_pick_task dev)
+[[ "$got" == "$U2" ]] && ok_t "graded->merge:main: skips GM ($GM), selects control U2 ($U2)" \
+                      || bad_t "a row waiting on another seat's merge must not be picked" "got $got, graded=$GM, control=$U2"
+
+# Alone in the queue it still must not be handed out — the whole defect is that
+# it was, once the control ahead of it was gone.
+db "UPDATE tasks SET status='in_progress' WHERE id=${U2};"
+got=$(_hb_pick_task dev)
+[[ -z "$got" ]] && ok_t "graded->merge:main: merge-waiting-only queue yields no pick" \
+                || bad_t "merge-waiting-only queue must be empty" "got $got, graded=$GM"
+
+# THE MERGE OWNER'S OWN ROW IS STILL WORK. Same row, owner flipped to dev: the
+# merge is now this seat's move and suppressing it would strand the row nobody
+# else can close. Pins the `<> $name` half — a predicate that skipped every
+# graded row would pass both assertions above and fail here.
+db "UPDATE tasks SET merge_owner='dev' WHERE id=${GM};"
+got=$(_hb_pick_task dev)
+[[ "$got" == "$GM" ]] && ok_t "graded->merge:dev: this seat owes the merge, row stays selectable ($GM)" \
+                      || bad_t "the merge owner's own row must remain selectable" "got $got, graded=$GM"
+
+# And with no merge_owner recorded the board falls back to maker_agent, so the
+# same two readings must hold off that column too (the owner expression is the
+# board's, and this is the arm of it the fallback exercises).
+db "UPDATE tasks SET merge_owner=NULL WHERE id=${GM};"
+got=$(_hb_pick_task dev)
+[[ "$got" == "$GM" ]] && ok_t "no merge_owner: falls back to maker_agent='dev', still selectable ($GM)" \
+                      || bad_t "maker_agent fallback must keep the maker's own row selectable" "got $got, graded=$GM"
+db "UPDATE tasks SET maker_agent='codex' WHERE id=${GM};"
+got=$(_hb_pick_task dev)
+[[ -z "$got" ]] && ok_t "no merge_owner, maker_agent='codex': not dev's move, skipped" \
+                || bad_t "maker_agent fallback must skip another seat's merge" "got $got, graded=$GM"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

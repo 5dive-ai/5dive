@@ -70,7 +70,8 @@ _memory_usage() {
                    [--no-dedup] [--force]  (body on stdin)
       Compile a durable memory: writes a frontmatter markdown file into your
       own store (default) or the shared team wiki (--store=wiki, the publish
-      path other agents can search), stamps provenance (who/when), appends the
+      path other agents can search — /var/lib/5dive/wiki on a normal box, the
+      product repo's community/wiki on our fleet, $FIVEDIVE_WIKI_ROOT overrides), stamps provenance (who/when), appends the
       store's index line, and refuses token/key-shaped content (tripwire;
       --force does NOT bypass it). Existing file needs --force to overwrite.
       Lifecycle envelope (, all optional): --valid-to = date the fact
@@ -198,10 +199,38 @@ _memory_own_roots() {
   local IFS=,; echo "${roots[*]}"
 }
 
+# DIVE-4128: the shared team wiki root. This used to test ONLY the two paths
+# where OUR fleet keeps it — the product repo's `community/wiki` checkout — so
+# on a customer box it resolved to "" and every consumer degraded SILENTLY:
+# `memory add --store=wiki` refused, `_memory_default_roots` fell back to
+# own-stores-only (so every seat's atoms stayed 0600-private and no teammate
+# could search them), and `agent create --inherit-memory=wiki` seeded 0 files
+# while REPORTING SUCCESS. Measured on a v0.28.0 customer box: one seat with
+# 119 private atoms, the other three with 0, every agent booted cold.
+#
+# Precedence, and why:
+#   $FIVEDIVE_WIKI_ROOT   explicit override — tests, and a box that keeps its
+#                         wiki somewhere else. Honoured even if it does not
+#                         exist yet is NOT the behaviour: an override naming a
+#                         missing dir is the same "no wiki here" as any other,
+#                         and reporting one that isn't there is the defect this
+#                         row exists to remove.
+#   /var/lib/5dive/wiki   THE per-box shared wiki, provisioned by install.sh at
+#                         install and upgrade as 2775 root:claude — setgid so a
+#                         page written by any seat keeps the shared group, and
+#                         group-writable so every seat can publish, not just
+#                         read. This is the root customer boxes have.
+#   .../community/wiki    our own fleet, where the wiki IS a git-tracked
+#                         directory in the product repo. Kept as fallbacks so
+#                         nothing on the fleet moves under us — and install.sh
+#                         deliberately does NOT provision the box root on a box
+#                         that has this checkout, so the fleet keeps publishing
+#                         into git rather than into a second, untracked copy.
 _memory_wiki_root() {
-  # Shared wiki (internal fleet only; absent on customer boxes — harmless).
   local d
-  for d in "$HOME"/projects/5dive/community/wiki /home/claude/projects/5dive/community/wiki; do
+  for d in "${FIVEDIVE_WIKI_ROOT:-}" /var/lib/5dive/wiki \
+           "$HOME"/projects/5dive/community/wiki /home/claude/projects/5dive/community/wiki; do
+    [ -n "$d" ] || continue
     [ -d "$d" ] && { echo "$d"; return 0; }
   done
   echo ""
@@ -556,20 +585,20 @@ _memory_check_validate() {
   # honest outcome; the damage this row is about is a TRUE fact demoted 0.4x,
   # and the parse refusal plus the unknown net close that completely.
   # 1. read-only
-  if printf '%s' "$c" | grep -qE '(^|[;&|[:space:]])(sudo|rm|rmdir|mv|dd|mkfs|shutdown|reboot|kill|pkill|truncate|chmod|chown|tee)([[:space:]]|$)'; then
+  if grep -qE '(^|[;&|[:space:]])(sudo|rm|rmdir|mv|dd|mkfs|shutdown|reboot|kill|pkill|truncate|chmod|chown|tee)([[:space:]]|$)' <<<"$c"; then
     fail "$E_VALIDATION" "--check must be READ-ONLY — it is run unattended by \`memory check\` (refused: writes/escalates)"
   fi
   # Redirection: silencing is fine, writing a file is not. Strip the shapes that
   # produce no file (>/dev/null, >/dev/stderr, 2>&1) and refuse whatever `>` is
   # left — that one has a path on the end of it.
   local _redir; _redir="$(printf '%s' "$c" | sed -E 's/[0-9]?>>?[[:space:]]*\/dev\/(null|stdout|stderr)//g; s/[0-9]?>>?&[0-9-]//g')"
-  if printf '%s' "$_redir" | grep -q '>'; then
+  if grep -q '>' <<<"$_redir"; then
     fail "$E_VALIDATION" "--check must be READ-ONLY — redirecting to a file is a write (>/dev/null 2>&1 is allowed if you only meant to silence it)"
   fi
-  if printf '%s' "$c" | grep -qE '(curl|wget)[^|]*\|[[:space:]]*(ba)?sh'; then
+  if grep -qE '(curl|wget)[^|]*\|[[:space:]]*(ba)?sh' <<<"$c"; then
     fail "$E_VALIDATION" "--check must be READ-ONLY — piping a download into a shell is not a check"
   fi
-  if printf '%s' "$c" | grep -qE '5dive[[:space:]]+(task|agent|memory)[[:space:]]+(done|add|cancel|start|send|kill|rm|reject|deliver)'; then
+  if grep -qE '5dive[[:space:]]+(task|agent|memory)[[:space:]]+(done|add|cancel|start|send|kill|rm|reject|deliver)' <<<"$c"; then
     fail "$E_VALIDATION" "--check must be READ-ONLY — it must not drive the board or the fleet"
   fi
   # 2. cannot go red
@@ -608,7 +637,7 @@ _memory_add() {
     shift
   done
   [ -n "$name" ] || fail "$E_USAGE" "memory add: --name=<kebab-slug> is required"
-  printf '%s' "$name" | grep -qE '^[a-z0-9][a-z0-9-]{0,63}$' \
+  grep -qE '^[a-z0-9][a-z0-9-]{0,63}$' <<<"$name" \
     || fail "$E_VALIDATION" "--name must be kebab-case, ≤ 64 chars"
   [ -n "$desc" ] || fail "$E_USAGE" "memory add: --description is required (it's what recall ranks on)"
   case "$store" in mine|wiki) : ;; *) fail "$E_VALIDATION" "bad --store '$store' (mine | wiki)" ;; esac
@@ -617,10 +646,10 @@ _memory_add() {
     case "$type" in user|feedback|project|reference) : ;; *) fail "$E_VALIDATION" "bad --type '$type' (user | feedback | project | reference)" ;; esac
   fi
   # DIVE-1024 lifecycle envelope (all optional; absent = pre-1024 behavior).
-  if [ -n "$valid_to" ]; then printf '%s' "$valid_to" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
+  if [ -n "$valid_to" ]; then grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' <<<"$valid_to" \
       || fail "$E_VALIDATION" "--valid-to must be an ISO date (YYYY-MM-DD)"; fi
   if [ -n "$confidence" ]; then case "$confidence" in high|medium|low) : ;; *) fail "$E_VALIDATION" "--confidence must be high|medium|low" ;; esac; fi
-  if [ -n "$supersedes" ]; then printf '%s' "$supersedes" | grep -qE '^[a-z0-9][a-z0-9_-]{0,63}$' \
+  if [ -n "$supersedes" ]; then grep -qE '^[a-z0-9][a-z0-9_-]{0,63}$' <<<"$supersedes" \
       || fail "$E_VALIDATION" "--supersedes must be the slug of the memory it replaces"; fi
   # DIVE-3106 evidence back-refs: a STRUCTURAL path from the claim to the ground
   # truth, so re-verification is a mechanical walk. The kind prefix is what makes
@@ -632,11 +661,11 @@ _memory_add() {
       *) fail "$E_VALIDATION" "--evidence must be <kind>:<ref> (file|task|cmd|sha|url|run), got: $_ev" ;;
     esac
     case "$_ev" in
-      task:*) printf '%s' "${_ev#task:}" | grep -qE '^[A-Z]+-[0-9]+$' \
+      task:*) grep -qE '^[A-Z]+-[0-9]+$' <<<"${_ev#task:}" \
           || fail "$E_VALIDATION" "--evidence task: wants a board ident like DIVE-1234, got: ${_ev#task:}" ;;
-      sha:*)  printf '%s' "${_ev#sha:}" | grep -qE '^[0-9a-f]{7,40}$' \
+      sha:*)  grep -qE '^[0-9a-f]{7,40}$' <<<"${_ev#sha:}" \
           || fail "$E_VALIDATION" "--evidence sha: wants a git sha, got: ${_ev#sha:}" ;;
-      url:*)  printf '%s' "${_ev#url:}" | grep -qE '^https?://' \
+      url:*)  grep -qE '^https?://' <<<"${_ev#url:}" \
           || fail "$E_VALIDATION" "--evidence url: wants an http(s) URL, got: ${_ev#url:}" ;;
     esac
   done
@@ -675,7 +704,7 @@ _memory_add() {
   # blocked (unlike the pack exporter, which stages whole files). --force does
   # not bypass this: a secret in a memory store outlives the session that knew
   # why it was there.
-  if printf '%s\n%s' "$desc" "$body" | grep -qiE 'BOT_TOKEN=|API_KEY=|-----BEGIN|sk-[A-Za-z0-9]{8,}|[0-9]{8,}:[A-Za-z0-9_-]{30,}'; then
+  if grep -qiE 'BOT_TOKEN=|API_KEY=|-----BEGIN|sk-[A-Za-z0-9]{8,}|[0-9]{8,}:[A-Za-z0-9_-]{30,}' <<<"${desc}"$'\n'"${body}"; then
     fail "$E_VALIDATION" "the body looks like it contains a token/key (tripwire) — memories must reference where a secret LIVES, never its value"
   fi
 
@@ -686,7 +715,7 @@ _memory_add() {
   local dir="" file="" index_file="" index_line=""
   if [ "$store" = "wiki" ]; then
     dir=$(_memory_wiki_root)
-    [ -n "$dir" ] || fail "$E_NOT_FOUND" "no shared wiki on this box (community/wiki) — use --store=mine"
+    [ -n "$dir" ] || fail "$E_NOT_FOUND" "no shared team wiki on this box — looked for \$FIVEDIVE_WIKI_ROOT, /var/lib/5dive/wiki, ~/projects/5dive/community/wiki. Provision the box-shared root by re-running the 5dive installer (it creates /var/lib/5dive/wiki, group-writable by every seat), or publish privately with --store=mine"
     [ -w "$dir" ] || fail "$E_PERMISSION" "wiki dir $dir is not writable by $(whoami)"
     file="$dir/$name.md"
     index_file="$dir/index.md"
@@ -752,6 +781,18 @@ _memory_add() {
     printf '%s\n' "$index_line" >> "$index_file"
   fi
 
+  # DIVE-4128: a SHARED wiki is only shared if the NEXT seat can write it too.
+  # The default umask leaves a new page and the index 0644 — readable by every
+  # seat and appendable by none but its author, so the second publisher's
+  # `memory add --store=wiki` dies on a permission error nobody would connect
+  # to the wiki being shared. setgid on the root (install.sh) keeps the group;
+  # this keeps the group WRITE bit. Best-effort by design: on a root we do not
+  # own the chmod fails and the page we just wrote is still there.
+  if [ "$store" = "wiki" ]; then
+    chmod g+w "$file" 2>/dev/null || true
+    [ -f "$index_file" ] && { chmod g+w "$index_file" 2>/dev/null || true; }
+  fi
+
   if (( JSON_MODE )); then
     jq -nc --arg file "$file" --arg store "$store" --arg by "$who" --arg updated "$([ "$existed" -eq 1 ] && echo true || echo false)" \
       '{ok:true, data:{file:$file, store:$store, compiled_by:$by, updated:($updated=="true")}}'
@@ -800,7 +841,7 @@ _memory_check() {
     shift
   done
   case "$store" in all|mine|wiki) : ;; *) fail "$E_VALIDATION" "bad --store '$store' (all | mine | wiki)" ;; esac
-  printf '%s' "$timeout_s" | grep -qE '^[0-9]+$' || fail "$E_VALIDATION" "--timeout must be whole seconds"
+  grep -qE '^[0-9]+$' <<<"$timeout_s" || fail "$E_VALIDATION" "--timeout must be whole seconds"
   [ "$timeout_s" -gt 0 ] || fail "$E_VALIDATION" "--timeout must be > 0"
   command -v python3 >/dev/null 2>&1 || fail "$E_GENERIC" "memory check needs python3"
   local resolved; resolved=$(_memory_resolve_roots "$store" "$agent" "$roots")
@@ -1517,9 +1558,9 @@ _memory_consolidate() {
     esac
     shift
   done
-  printf '%s' "$max_sessions" | grep -qE '^[0-9]+$' || fail "$E_VALIDATION" "--max-sessions must be a number"
-  printf '%s' "$idle_min"     | grep -qE '^[0-9]+$' || fail "$E_VALIDATION" "--idle-min must be a number (minutes)"
-  printf '%s' "$max_chars"    | grep -qE '^[0-9]+$' || fail "$E_VALIDATION" "--max-chars must be a number"
+  grep -qE '^[0-9]+$' <<<"$max_sessions" || fail "$E_VALIDATION" "--max-sessions must be a number"
+  grep -qE '^[0-9]+$' <<<"$idle_min"     || fail "$E_VALIDATION" "--idle-min must be a number (minutes)"
+  grep -qE '^[0-9]+$' <<<"$max_chars"    || fail "$E_VALIDATION" "--max-chars must be a number"
   [ "$max_chars" -ge 500 ] || fail "$E_VALIDATION" "--max-chars below 500 leaves nothing to distill"
 
   # Own store only. Same resolution rule as `memory add` so both verbs agree on
@@ -1627,7 +1668,7 @@ _memory_consolidate() {
         # could-not-run with zero atoms. That is this row's defect wearing the
         # fix's clothes: the headline number stays zero for the working case.
         (( JSON_MODE )) || echo "  ✓ [$a_type] $a_name"
-      elif printf '%s' "$addout" | grep -q 'already exists'; then
+      elif grep -q 'already exists' <<<"$addout"; then
         n_dupe=$((n_dupe+1))
       else
         # A refusal is a RESULT, not an error to swallow: the secret tripwire

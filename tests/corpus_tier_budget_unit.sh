@@ -1612,10 +1612,23 @@ chk(not missing,
     'missing: ' + ','.join(missing))
 
 # 93 — fail closed. Grades the aggregator's `if:` and the presence of a .result test.
+#
+# DIVE-4186 — ONE extra conjunct is allowed, spelled in full, and nothing else. The
+# installed-host aggregators are QUEUE-TIME ONLY now: they carry
+# `always() && github.event_name != 'pull_request'` so the merge queue grades them on the
+# merge group and a PR does not pay for a second grade of the same tree.
+#
+# THIS IS A WHITELIST, NOT A LOOSENING, and the difference is the whole point. A prefix
+# test (`startswith('always()')`) would admit `always() && false`, which is the vacuity
+# this arm exists to refuse, one character away. So the accepted set is TWO EXACT STRINGS:
+# `always()` and `always() && <that one guard>`. Any other conjunct — a different event, a
+# `false`, an input — reds here, and the negative control below drives all three.
+QUEUE_ONLY_GUARD = "always() && github.event_name != 'pull_request'"
+ACCEPTED_IF = ('always()', QUEUE_ONLY_GUARD)
 bad_agg = []
 for c in REQUIRED:
     j = jobs.get(c) or {}
-    if str(j.get('if', '')).strip() != 'always()':
+    if str(j.get('if', '')).strip() not in ACCEPTED_IF:
         bad_agg.append('%s: if=%r, so a failed dependency SKIPS it and a skipped required check reads as satisfied' % (c, j.get('if')))
         continue
     if not any('.result' in r for r in runs(j)):
@@ -1623,6 +1636,22 @@ for c in REQUIRED:
 chk(not bad_agg,
     'each required check RUNS on always() and asserts its dependencies\' .result (a bare needs: is satisfied by a skip, which is the merge gate passing precisely when the corpus went red)',
     ' | '.join(bad_agg))
+
+# 93b — DIVE-4186 POSITIVE CONTROL ON THE WHITELIST. A two-string whitelist is one
+# careless edit from a prefix test, and a prefix test admits `always() && false`. Drive
+# the acceptance predicate over expressions whose verdict is known, both directions.
+_accept = lambda e: e in ACCEPTED_IF
+_ctl = []
+for _e in ('always()', QUEUE_ONLY_GUARD):
+    if not _accept(_e):
+        _ctl.append('rejects the legitimate %r' % _e)
+for _e in ('always() && false', "always() && github.event_name != 'push'",
+           "always() && github.event_name != 'pull_request' && false", 'success()', ''):
+    if _accept(_e):
+        _ctl.append('admits %r' % _e)
+chk(not _ctl,
+    'the aggregator if: whitelist admits exactly always() and the queue-time-only guard, and refuses always() && false, a different event, an extra conjunct and success()',
+    ' | '.join(_ctl))
 
 # 94 — sharded, with the divisor taken from the matrix length.
 bad_shard, sharded = [], 0
