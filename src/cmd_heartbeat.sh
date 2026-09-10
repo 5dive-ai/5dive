@@ -5189,7 +5189,6 @@ cmd_heartbeat_tick() {
   # front, so a wake we do mid-loop isn't visible to later iterations via the
   # registry — this map carries that within-tick fact so two same-account agents
   # can't both wake on one tick.
-  local -A in_tick_woke=()
   local name
   # Process oldest-waiting first (smallest lastRunAt). When two same-account
   # agents contend for the one wake slot, the one that has waited longest wins,
@@ -5468,13 +5467,17 @@ cmd_heartbeat_tick() {
          | select(.key != $n)
          | select((.value.authProfile // ("@self:" + .key)) == $a)
          | (.value.heartbeat.lastRunAt // 0)] | max // 0' <<<"$reg")
-      if [[ -n "${in_tick_woke[$acct]:-}" ]] && (( in_tick_woke[$acct] > acct_last )); then
-        acct_last=${in_tick_woke[$acct]}
-      fi
+      # DIVE-4230: the in-tick bump used to make this gate wake at most ONE seat per
+      # account per tick — with 11 seats on one account at a 5m cadence the gap is 27s
+      # and a tick's own pass over the fleet takes longer than that, so every other due
+      # seat was deferred on every tick and the fleet starved (measured 2026-09-10:
+      # 'spread-deferred 6' on one tick, dev3 deferred 6 ticks in a row with 7 todo).
+      # Spacing across ticks via lastRunAt is kept; same-tick wakes are allowed. The
+      # 429 that this gate guarded against is already handled by the capacity parking.
       gap=$(( everyMin * 60 / acct_count ))
       if (( now - acct_last < gap )); then
         sk_spread=$((sk_spread + 1))
-        _hb_log "[$name] spread-defer — account '$acct' (${acct_count} agents) last woke $(( (now - acct_last) / 60 ))m ago, need a $(( gap / 60 ))m gap; retry next tick"
+        _hb_log "[$name] spread-defer — account '$acct' (${acct_count} agents) last woke $(( now - acct_last ))s ago, need a ${gap}s gap; retry next tick"
         continue
       fi
     fi
@@ -5694,7 +5697,6 @@ cmd_heartbeat_tick() {
 
     _hb_log "[$name] due + todo ${task_ident} — waking (fresh=${eff_fresh})"
     if _hb_wake "$name" "$eff_fresh" "$task_id" "$task_ident"; then
-      in_tick_woke[$acct]=$now   # claim the account's slot for the rest of this tick
       with_registry_lock _hb_wake_budget_inc "$name" "$today" >/dev/null 2>&1 || true  # DIVE-1858: count this wake
       with_registry_lock _hb_clear_active_defer "$name" >/dev/null 2>&1 || true  # DIVE-1486: episode over
       local nudge_n
