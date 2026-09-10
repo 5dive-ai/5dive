@@ -47,6 +47,15 @@ _task_post_owner_target() { # record the attempt + report delivered, like a live
 }
 nsends() { local n; n=$(wc -l < "$SEND_LOG" 2>/dev/null); printf '%s' "${n//[[:space:]]/}"; }
 
+# DIVE-4154: this harness grades the FIXTURE-DB GUARD — which sends are refused
+# because the active store is not prod, and which are allowed because it is. Arm D
+# put a phone-ping hold in front of the deliverer, so case 2 ("the same sends
+# WORK") measured nsends=0 for a send that was DELAYED, not refused: the guard's
+# allow and the window's hold are indistinguishable to an assertion that only
+# looks once. Disable the window explicitly — nothing here is about WHEN the push
+# fires, and the window has its own harness (tests/gate_undo_window_unit.sh).
+export _5DIVE_GATE_UNDO_WINDOW_SECS=0
+
 PASS=0; FAIL=0
 ok(){ PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 no(){ FAIL=$((FAIL+1)); printf 'FAIL - %s\n' "$1"; }
