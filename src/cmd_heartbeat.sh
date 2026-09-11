@@ -1308,6 +1308,31 @@ _hb_clear_active_defer() {
   echo "$reg" | registry_write
 }
 
+# DIVE-4298 -- consecutive ticks this seat has read "turn done, N background
+# shells still running", stored under .agents[<name>].heartbeat.doneShells.
+# Deliberately NOT the active-defer counter: that one only advances on the
+# active-defer branch, which a seat holding an in_progress row never reaches
+# (the busy-guard `continue`s above it). Must run under with_registry_lock.
+_hb_mark_done_shells() {
+  local name="$1" reg prev n
+  reg=$(registry_read)
+  prev=$(jq -r --arg n "$name" '.agents[$n].heartbeat.doneShells.n // 0' <<<"$reg")
+  [[ "$prev" =~ ^[0-9]+$ ]] || prev=0
+  n=$(( prev + 1 ))
+  reg=$(echo "$reg" | jq --arg n "$name" --argjson c "$n" \
+        '.agents[$n].heartbeat.doneShells = ((.agents[$n].heartbeat.doneShells // {}) + {n:$c})')
+  echo "$reg" | registry_write
+  printf '%s' "$n"
+}
+
+# DIVE-4298 -- the episode is over (a new turn started, or the shells exited).
+_hb_clear_done_shells() {
+  local name="$1" reg
+  reg=$(registry_read)
+  reg=$(echo "$reg" | jq --arg n "$name" 'if .agents[$n].heartbeat then del(.agents[$n].heartbeat.doneShells) else . end')
+  echo "$reg" | registry_write
+}
+
 # DIVE-1666 — pure matcher (unit-testable, no tmux) for the Claude Code
 # USAGE/SPEND-LIMIT dialog. Requires TWO independent signature lines so ordinary
 # output that merely mentions "limit" can't false-match: a HEADER line (hit your
@@ -1382,6 +1407,51 @@ _hb_usage_limit_frozen() {
 _hb_pane_capture() {
   local name="$1"
   sudo -u "agent-${name}" tmux capture-pane -p -t "agent-${name}" 2>/dev/null
+}
+
+# --- DIVE-4298: REAP ON THE DONE LINE, not on the active-defer counter ---------
+#
+# `_reap_stale_shells` (src/lib/reap.sh) already exists and already knows what is
+# safe to kill. Its only automatic heartbeat trigger was
+# _HB_ACTIVE_DEFER_ESCALATE consecutive defers on an UNCHANGED pane -- and that
+# trigger is UNREACHABLE in the shape that actually strands a seat. Measured on
+# quinn, 2026-09-11: the tick alternated "active (mid-turn/conversation) --
+# active-defer #1" with "busy -- 1 in_progress, skip", and the busy-guard
+# `continue`s ABOVE the defer bookkeeping, so the counter never advanced past #1
+# across the whole 1h20m episode. The reaper was present and could not fire.
+#
+# The done line is the direct signal and needs no counter reconciliation: when
+# the pane has read done + "N shells still running" for
+# _HB_DONE_SHELL_REAP_TICKS consecutive ticks, those shells have outlived the
+# turn that spawned them. Called BEFORE the busy-guard so no branch can hide it.
+#
+# It only chooses WHEN to ask. Every guard that decides WHAT dies stays in
+# _reap_stale_shells: the grace age, FIVEDIVE_KEEP_ALIVE, the caller's ancestors,
+# kill-by-PID-never-pkill -f.
+_HB_DONE_SHELL_REAP_TICKS="${HEARTBEAT_DONE_SHELL_REAP_TICKS:-2}"
+[[ "$_HB_DONE_SHELL_REAP_TICKS" =~ ^[0-9]+$ ]] || _HB_DONE_SHELL_REAP_TICKS=2
+_hb_bg_shell_sweep() {
+  local name="$1" pane n cnt reaped
+  pane=$(_hb_pane_capture "$name") || return 0
+  [[ -n "$pane" ]] || return 0
+  if ! _hb_pane_turn_ended "$pane"; then
+    with_registry_lock _hb_clear_done_shells "$name" >/dev/null 2>&1 || true
+    return 0
+  fi
+  n=$(_hb_pane_bg_shells "$pane")
+  if [[ -z "$n" ]]; then
+    with_registry_lock _hb_clear_done_shells "$name" >/dev/null 2>&1 || true
+    return 0
+  fi
+  cnt=$(with_registry_lock _hb_mark_done_shells "$name")
+  [[ "${cnt:-0}" =~ ^[0-9]+$ ]] || return 0
+  (( cnt >= _HB_DONE_SHELL_REAP_TICKS )) || return 0
+  reaped=0
+  if declare -F _reap_stale_shells >/dev/null 2>&1; then
+    reaped=$(_reap_stale_shells "$name" --reason="the turn ended but ${n} background shell(s) outlived it across ${cnt} heartbeat ticks (DIVE-4298)" || echo 0)
+  fi
+  _hb_log "[$name] turn ended with ${n} background shell(s) still running for ${cnt} ticks -- reaped ${reaped:-0} stale agent shell(s) by PID (DIVE-4298)"
+  with_registry_lock _hb_clear_done_shells "$name" >/dev/null 2>&1 || true
 }
 
 # --- DIVE-3465: a retryable rate limit and a hard spend cap are two states -----
@@ -2054,6 +2124,98 @@ _hb_agent_native_state() {
 # returns 3 it also sets _HB_IDLE_REASON to the block reason for the caller to
 # surface. Callers that must not clobber live work defer on 1 OR 3; reclaim-on-idle
 # acts only on a confident 0 (a blocked agent is not idle, so it is never reclaimed).
+# --- DIVE-4298: native `busy` is not proof a TURN is in flight -----------------
+#
+# A Claude Code session reports status `busy` while ANY background shell it
+# launched is still alive -- including long after the turn has ENDED. The pane
+# says so out loud, on the status line right above the composer:
+#
+#     ✛ Worked for 9m 11s · done 8:09 AM · 2 shells still running
+#
+# Measured 2026-09-11 on quinn: an agent-browser Chrome tree orphaned by an
+# earlier grading turn held that seat at native `busy` for 1h20m. _hb_agent_idle
+# returned 1 on the native word alone, so every tick logged "active
+# (mid-turn/conversation)" and the seat could not take a row until a human killed
+# Chrome by hand. The reaper that exists for this could not fire either -- see
+# _hb_bg_shell_sweep.
+#
+# Typing a /goal into an idle composer while background shells run is safe; it is
+# exactly what a human does at that prompt. So the done line re-opens dispatch.
+#
+# THE GUARD IS STRICTER HERE THAN ON THE NON-CLAUDE PATH, deliberately. The
+# pane-scrape fallback trusts byte-stability plus the composer glyph; a
+# native-busy seat must ALSO show a finished status line. Claude Code lets you
+# type while it works, so mid-turn the composer is ALSO empty and ALSO renders
+# ❯ -- the glyph proves nothing on its own here and the done line is the
+# load-bearing half.
+_HB_IDLE_BG_SHELLS=""
+
+# The one status line Claude Code keeps directly above the composer: the spinner
+# while a turn runs ("✶ Spelunking… (1m 55s · ↓ 6.4k tokens)"), the summary once it
+# ends ("✛ Worked for 9m 11s · done 8:09 AM · 2 shells still running"). They share
+# the slot, which is why reading THIS line -- not "is the string anywhere in the
+# pane" -- is what tells the two apart: a done line from a previous turn can still
+# be on screen mid-turn, and a completed turn's tool blocks still carry their own
+# elapsed timers. Pure (no tmux), so the unit arms can feed it real captures.
+# Walks up from the composer, skipping blanks, rule lines (no alphanumerics) and
+# the ⎿ continuation rows Claude prints under the status line.
+_hb_pane_status_line() {
+  awk '
+    { line[NR] = $0 }
+    END {
+      c = 0
+      for (i = NR; i >= 1; i--) if (index(line[i], "❯") > 0) { c = i; break }
+      if (c == 0) exit 1
+      for (i = c - 1; i >= 1; i--) {
+        s = line[i]
+        gsub(/^[ \t]+/, "", s); gsub(/[ \t]+$/, "", s)
+        if (s == "") continue
+        if (s !~ /[A-Za-z0-9]/) continue          # a ─── separator rule
+        # A TITLED rule -- "─── DIVE-4263 box readings delivery ──" -- has alphanumerics
+        # and is still not a status line. Measured on ops, 2026-09-11: without
+        # this the walk stopped on the banner and every such seat read as
+        # mid-turn forever (fail-safe, but the fix would be inert for it).
+        if (index(s, "─") == 1) continue
+        if (index(s, "⎿") == 1) continue          # a continuation row under the status line
+        print s; exit 0
+      }
+      exit 1
+    }' <<<"$1"
+}
+
+# Has the turn ENDED? Reads the status line only.
+_hb_pane_turn_ended() {
+  local st; st=$(_hb_pane_status_line "$1") || return 1
+  [[ -n "$st" ]] || return 1
+  case "$st" in *"esc to interrupt"*) return 1 ;; esac
+  grep -qE '·[[:space:]]*done[[:space:]]+[0-9]{1,2}:[0-9]{2}' <<<"$st"
+}
+
+# How many background shells the done line still names; empty when it names none.
+_hb_pane_bg_shells() {
+  local st; st=$(_hb_pane_status_line "$1") || return 0
+  grep -oE '[0-9]+[[:space:]]+shells?[[:space:]]+still[[:space:]]+running' <<<"$st"     | tail -1 | grep -oE '^[0-9]+' || true
+}
+
+# Native said `busy`: is the seat actually parked at a finished turn with
+# background shells alive? Byte-stability AND the claude composer glyph AND a
+# finished status line, all three. Sets _HB_IDLE_BG_SHELLS to the shell count on
+# a yes so the caller can say so in the log.
+_hb_busy_pane_is_done() {
+  local name="$1" gap="${2:-$_HB_IDLE_SAMPLE_SEC}" a b marker
+  _HB_IDLE_BG_SHELLS=""
+  a=$(_hb_pane_capture "$name") || return 1
+  [[ -n "$a" ]] || return 1
+  sleep "$gap"
+  b=$(_hb_pane_capture "$name") || return 1
+  [[ "$a" == "$b" ]] || return 1
+  marker=$(_hb_idle_marker claude)
+  grep -qF "$marker" <<<"$b" || return 1
+  _hb_pane_turn_ended "$b" || return 1
+  _HB_IDLE_BG_SHELLS=$(_hb_pane_bg_shells "$b")
+  return 0
+}
+
 _HB_IDLE_REASON=""
 _hb_agent_idle() {
   local name="$1" gap="${2:-$_HB_IDLE_SAMPLE_SEC}"
@@ -2062,7 +2224,10 @@ _hb_agent_idle() {
   local native; native=$(_hb_agent_native_state "$name") || native=""
   case "$native" in
     idle)       return 0 ;;
-    busy)       return 1 ;;
+    # DIVE-4298: `busy` also means "a background shell it launched is still
+    # alive", not only "a turn is in flight" -- re-read the pane before
+    # believing it. Anything short of a proven finished turn stays busy.
+    busy)       _hb_busy_pane_is_done "$name" "$gap" && return 0; return 1 ;;
     blocked:*)  _HB_IDLE_REASON="${native#blocked:}"; return 3 ;;
   esac
   # Fallback: pane-scrape (codex/grok/agy/opencode, or native unavailable).
@@ -5768,6 +5933,11 @@ cmd_heartbeat_tick() {
         sk_notdue=$((sk_notdue + 1)); _hb_log "[$name] not due ($(( (lastRun + everyMin*60 - now + 59) / 60 ))m left)"; continue
       fi
     fi
+    # DIVE-4298 -- above the busy-guard on purpose: a seat holding an in_progress
+    # row `continue`s below and would never be swept, which is the exact shape
+    # that left an orphaned browser tree alive for 1h20m on quinn.
+    _hb_bg_shell_sweep "$name" || true
+
     # DIVE-4261 — A GRADE THIS SEAT CANNOT MERGE IS NOT WORK IN PROGRESS.
     # After `task verify` PASS the row stays status=in_progress with
     # assignee=<the grader>, and the merge is owed by a different seat (the
@@ -6238,6 +6408,11 @@ cmd_heartbeat_tick() {
         with_registry_lock _hb_mark_seen "$name" "$now" "mid-turn" >/dev/null 2>&1 || true
         continue
       fi
+    fi
+
+    # DIVE-4298 -- name the state the old code called "active (mid-turn)".
+    if (( idle_rc == 0 )) && [[ -n "${_HB_IDLE_BG_SHELLS:-}" ]]; then
+      _hb_log "[$name] idle with ${_HB_IDLE_BG_SHELLS} background shell(s) -- the turn is over, dispatching (DIVE-4298)"
     fi
 
     # Per-task fresh override (DIVE-138): a materialized recurring instance can
