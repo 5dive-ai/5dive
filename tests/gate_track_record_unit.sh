@@ -149,7 +149,9 @@ eq_t "A4: explicit --tier=2 never auto-cleared" "$(field TR-9013 need_answered_a
 eq_t "A4: explicit --tier=2 was refused at filing, not auto-applied" "$(field TR-9013 tier)" "∅"
 # The T2 SUBJECT floor (money) — the filer cannot lower it and neither can a record.
 seed_task TR-9014 alpha
-( cmd_task_need TR-9014 --type=decision --from=alpha --ask="approve spend of \$4,000 on the new box" --options="raise|hold" --recommend="raise" ) >/dev/null 2>&1 || true
+# DIVE-4175 arm C: the reserved class is reached by DECLARATION now, not by a
+# substring of the ask. The outcome asserted below is unchanged.
+( cmd_task_need TR-9014 --type=decision --from=alpha --needs=spend_authority --ask="approve spend of \$4,000 on the new box" --options="raise|hold" --recommend="raise" ) >/dev/null 2>&1 || true
 eq_t "A4: a floored (money) decision never auto-cleared" "$(field TR-9014 need_answered_at)" "∅"
 eq_t "A4: and that gate really WAS filed at tier 2 (a live negative, not a refusal)" "$(field TR-9014 tier)" "2"
 eq_t "A4: and it is still blocked on a human"  "$(field TR-9014 status)" "blocked"

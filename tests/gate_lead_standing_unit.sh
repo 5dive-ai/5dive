@@ -227,11 +227,20 @@ _gate_lead_standing_eligible approval 1 "   " \
 #     floor term is tier-2 and stays human-only — DIVE-2089 owns the floor's
 #     subject-matter misread; this authority deliberately does not route around it.
 # ---------------------------------------------------------------------------------
+# DIVE-4175 arm C: the precondition moved from the ask's WORDING to the filer's
+# DECLARATION. What S5 defends is that this authority does not route around a
+# true-human gate; the route to true-human is now `--needs=`, so the arm files one.
+# The undeclared control below records what arm C gives up.
 seed_task DIVE-405 "rotate the deploy key"
-cmd_task_need DIVE-405 --type=approval --tier=1 --ask="approve merging the branch that rotates the deploy credential" >/dev/null 2>&1
+cmd_task_need DIVE-405 --type=approval --tier=1 --needs=secret_provision --ask="approve merging the branch that rotates the deploy credential" >/dev/null 2>&1
 [[ "$(tierof DIVE-405)" == "2" ]] \
-  && ok_t "S5 precond: the T2 category floor still fires (tier forced to 2)" \
+  && ok_t "S5 precond: a DECLARED human capability is tier 2 (the floor this authority must not pierce)" \
   || bad_t "S5 precond floor fires" "tier=$(tierof DIVE-405)"
+seed_task DIVE-455 "rotate the deploy key"
+cmd_task_need DIVE-455 --type=approval --tier=1 --ask="approve merging the branch that rotates the deploy credential" >/dev/null 2>&1
+[[ "$(tierof DIVE-455)" == "1" ]] \
+  && ok_t "S5 control (arm C): the SAME ask UNDECLARED is tier 1 — wording no longer forces the tier" \
+  || bad_t "S5 undeclared must not floor" "tier=$(tierof DIVE-455) — the keyword promoter is back"
 unroute DIVE-405
 out=$(cmd_task_answer DIVE-405 --value=approved --from=marcus 2>&1); rc=$?
 [[ $rc -ne 0 && "$(answered DIVE-405)" == "open" ]] \

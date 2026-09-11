@@ -225,7 +225,9 @@ gate_written DIVE-9005 \
 # --- 6. INHERITED EXCLUSION: the T2 category floor (money) ----------------------
 seed DIVE-9006 "$PR_REF"
 actor_seam_as dev
-OUT6=$(cmd_task_need DIVE-9006 --type=approval --ask="approve the \$5,000 invoice and pay it from the company card" --recommend="yes" --from=dev 2>&1)
+# DIVE-4175 arm C: the reserved class is reached by DECLARATION now, not by a
+# substring of the ask. The outcome asserted below is unchanged.
+OUT6=$(cmd_task_need DIVE-9006 --type=approval --needs=spend_authority --ask="approve the \$5,000 invoice and pay it from the company card" --recommend="yes" --from=dev 2>&1)
 [[ "$(tier_of DIVE-9006)" == "2" ]] \
   && ok_t "a money ask still floors to tier 2" \
   || bad_t "money ask tiered to '$(tier_of DIVE-9006)'" "the floor is what case 6 leans on; without it the next assert is vacuous"

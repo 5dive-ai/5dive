@@ -154,7 +154,7 @@ actor_seam_as dev; cmd_task_need DIVE-7 --type=secret --ask="paste the deploy ke
 
 # --- DIVE-1182: a true-human-category APPROVAL (money) is NOT routed ----------
 seed DIVE-8; HUMAN_PINGED=0; route_reset
-actor_seam_as dev; cmd_task_need DIVE-8 --type=approval --ask="approve the \$5000 ad spend budget?" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-8 --type=approval --needs=spend_authority --ask="approve the \$5000 ad spend budget?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "route on: money approval → human (category floor, not routed)" || bad_t "money approval → human" "HUMAN_PINGED=$HUMAN_PINGED"
 [[ -z "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-8';")" ]] && ok_t "money approval leaves routed_reviewer NULL" || bad_t "money approval routed_reviewer NULL" "got '$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-8';")'"
 
@@ -185,7 +185,7 @@ actor_seam_as dev; cmd_task_need DIVE-31 --type=approval --ask="ship the DIVE-13
 [[ "$HUMAN_PINGED" == "0" && "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-31';")" == "main" ]] && ok_t "DIVE-1359: eng-ship routes to lead even with pref OFF" || bad_t "eng-ship pref-OFF route" "human=$HUMAN_PINGED reviewer='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-31';")'"
 # a genuine money approval with pref OFF still pings the human (floor wins over eng-ship)
 seed DIVE-32; HUMAN_PINGED=0; route_reset
-actor_seam_as dev; cmd_task_need DIVE-32 --type=approval --ask="approve the deploy AND the \$900 vercel invoice?" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-32 --type=approval --needs=spend_authority --ask="approve the deploy AND the \$900 vercel invoice?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "DIVE-1359: floor beats eng-ship (deploy+\$invoice stays human)" || bad_t "floor beats eng-ship" "HUMAN_PINGED=$HUMAN_PINGED"
 # a lead's OWN eng-ship gate is NOT downgraded (no distinct reviewer → human)
 seed DIVE-33; HUMAN_PINGED=0; route_reset
@@ -214,7 +214,7 @@ done
 # DIVE-1555: the true-human floor still wins — a push-for-review that ALSO names
 # money stays a tier-2 human call (not lead-routed).
 seed DIVE-37; HUMAN_PINGED=0; route_reset
-actor_seam_as dev; cmd_task_need DIVE-37 --type=approval --ask="approve delegated push for review AND the \$500 vercel invoice?" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-37 --type=approval --needs=spend_authority --ask="approve delegated push for review AND the \$500 vercel invoice?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" && "$(db "SELECT tier FROM tasks WHERE ident='DIVE-37';")" == "2" ]] \
   && ok_t "DIVE-1555: money floor beats push-for-review (stays tier-2 human)" \
   || bad_t "DIVE-1555: money floor beats push-for-review" "human=$HUMAN_PINGED tier='$(db "SELECT tier FROM tasks WHERE ident='DIVE-37';")'"
@@ -242,7 +242,7 @@ done
 # DIVE-1698: the true-human floor still wins — a push+fleet-roll that ALSO names a
 # secret/credential stays a tier-2 human call (not lead-routed).
 seed DIVE-46; HUMAN_PINGED=0; route_reset
-actor_seam_as dev; cmd_task_need DIVE-46 --type=approval --ask="push to github + roll the new api key to the fleet?" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-46 --type=approval --needs=secret_provision --ask="push to github + roll the new api key to the fleet?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" && "$(db "SELECT tier FROM tasks WHERE ident='DIVE-46';")" == "2" ]] \
   && ok_t "DIVE-1698: secret floor beats push+fleet-roll (stays tier-2 human)" \
   || bad_t "DIVE-1698: secret floor beats push+fleet-roll" "human=$HUMAN_PINGED tier='$(db "SELECT tier FROM tasks WHERE ident='DIVE-46';")'"
@@ -289,12 +289,12 @@ actor_seam_as dev; cmd_task_need DIVE-42 --type=approval --ask="approve the bran
 
 # floor WINS over curation: MONEY in a curation ask stays hard-human.
 seed DIVE-43; HUMAN_PINGED=0; route_reset
-actor_seam_as dev; cmd_task_need DIVE-43 --type=approval --ask="approve the \$200 spend to publish the persona pack?" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-43 --type=approval --needs=spend_authority --ask="approve the \$200 spend to publish the persona pack?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "DIVE-1381: floor beats curation (\$spend to publish persona → human)" || bad_t "money beats curation" "HUMAN_PINGED=$HUMAN_PINGED"
 
 # floor WINS over curation: customer-comms (newsletter) stays hard-human.
 seed DIVE-44; HUMAN_PINGED=0; route_reset
-actor_seam_as dev; cmd_task_need DIVE-44 --type=approval --ask="approve the persona pack newsletter blast to customers?" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-44 --type=approval --needs=human_tap --ask="approve the persona pack newsletter blast to customers?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "DIVE-1381: floor beats curation (persona newsletter blast → human)" || bad_t "newsletter beats curation" "HUMAN_PINGED=$HUMAN_PINGED"
 
 # a lead's OWN curation gate is NOT downgraded (no distinct reviewer → human)
@@ -302,22 +302,52 @@ seed DIVE-45; HUMAN_PINGED=0; route_reset
 actor_seam_as main; cmd_task_need DIVE-45 --type=approval --tier=2 --ask="approve persona 'doc' ready to publish to the drip queue?" --from=main >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" && "$(db "SELECT tier FROM tasks WHERE ident='DIVE-45';")" == "2" ]] && ok_t "DIVE-1381: a lead's own curation --tier=2 stays hard-human" || bad_t "lead curation not downgraded" "human=$HUMAN_PINGED tier='$(db "SELECT tier FROM tasks WHERE ident='DIVE-45';")'"
 
-# substring guard: 'accurate' / 'personalize' must NOT trip the curation class, so
-# a non-curation ask that merely contains those substrings + 'publish' still floors.
+# substring guard: 'accurate' / 'personalize' must NOT trip the curation class.
+# DIVE-4175 arm C: this arm used to read the guard through the FLOOR — 'not
+# curation' was observable because the ask then paged the human. With the keyword
+# promoter deleted a publish-only ask lead-routes whether or not it is curation,
+# so the floor is no longer a probe for the classifier. The guard itself is what
+# DIVE-1381 shipped, so assert it DIRECTLY on the predicate: same property, one
+# less mechanism between the assertion and the thing asserted.
+_gate_content_curation_hit "approve the accurate personalized copy before we publish it?" \
+  && bad_t "substring guard" "'accurate'/'personalized' matched the curation class" \
+  || ok_t "DIVE-1381: 'accurate'/'personalized' does NOT match the curation class (predicate, arm C)"
+_gate_content_curation_hit "approve the curated persona pack for the drip queue?" \
+  && ok_t "DIVE-1381: liveness pair — a real curation ask DOES match (the guard is not vacuous)" \
+  || bad_t "curation predicate liveness" "a genuine curation ask did not match"
 seed DIVE-47; HUMAN_PINGED=0; route_reset
 actor_seam_as dev; cmd_task_need DIVE-47 --type=approval --ask="approve the accurate personalized copy before we publish it?" --from=dev >/dev/null 2>&1
-[[ "$HUMAN_PINGED" == "1" ]] && ok_t "DIVE-1381: 'accurate'/'personalized'+publish does NOT match curation (still floors)" || bad_t "substring guard" "HUMAN_PINGED=$HUMAN_PINGED"
+[[ "$HUMAN_PINGED" == "0" ]] \
+  && ok_t "DIVE-4175: and the non-curation publish ask reaches a SEAT, not the human" \
+  || bad_t "substring guard: publish ask must not page" "HUMAN_PINGED=$HUMAN_PINGED"
 
 # a NON-curation 'publish' ask still floors to the human — proves the carve-out is
 # scoped to the curation KIND, not to any ask that merely names 'publish'. (No
 # other floor word here: 'publish' is the ONLY trigger, and it must still floor.)
+# DIVE-4175 arm C, and this is the arm the row's measurement is ABOUT: `publish`
+# alone promoted 27 gates to tier 2 in the 30 days to 2026-09-09 and the paired
+# human answered ZERO of them. So the asserted outcome inverts on purpose — a
+# publish-only ask with no declared capability now reaches a SEAT. The scoping
+# property this arm used to carry (the carve-out is a KIND, not the word) is now
+# asserted on the predicate directly, above; whether DIVE-1381's carve-out still
+# changes any observable at all once every floor hit lead-routes is the question
+# the follow-up row owns, and this arm is its first piece of evidence.
 seed DIVE-46; HUMAN_PINGED=0; route_reset
 actor_seam_as dev; cmd_task_need DIVE-46 --type=approval --ask="approve the publish of the homepage hero copy?" --from=dev >/dev/null 2>&1
-[[ "$HUMAN_PINGED" == "1" ]] && ok_t "DIVE-1381: non-curation 'publish' still floors (carve-out scoped)" || bad_t "non-curation publish floors" "HUMAN_PINGED=$HUMAN_PINGED"
+[[ "$HUMAN_PINGED" == "0" && "$(db "SELECT tier FROM tasks WHERE ident='DIVE-46';")" == "1" ]] \
+  && ok_t "DIVE-4175: a bare 'publish' ask no longer pages the human (the 27-gate defect)" \
+  || bad_t "non-curation publish must lead-route" "human=$HUMAN_PINGED tier='$(db "SELECT tier FROM tasks WHERE ident='DIVE-46';")'"
+# negative control kept explicit: the SAME ask that DECLARES the capability still
+# reaches the human. The route to a person is the declaration, not the vocabulary.
+seed DIVE-48; HUMAN_PINGED=0; route_reset
+actor_seam_as dev; cmd_task_need DIVE-48 --type=approval --needs=human_tap --ask="approve the publish of the homepage hero copy?" --from=dev >/dev/null 2>&1
+[[ "$HUMAN_PINGED" == "1" && "$(db "SELECT tier FROM tasks WHERE ident='DIVE-48';")" == "2" ]] \
+  && ok_t "DIVE-4175 negative control: the same ask WITH --needs=human_tap still reaches the human" \
+  || bad_t "declared publish ask must still page" "human=$HUMAN_PINGED tier='$(db "SELECT tier FROM tasks WHERE ident='DIVE-48';")'"
 
 # --- pref ON: tier-2-floored decision (money) is NOT routed ------------------
 seed DIVE-5; HUMAN_PINGED=0; route_reset
-actor_seam_as dev; cmd_task_need DIVE-5 --type=decision --ask="approve the \$5000 ad spend budget?" --options="yes|no" --recommend="no" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-5 --type=decision --needs=spend_authority --ask="approve the \$5000 ad spend budget?" --options="yes|no" --recommend="no" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "route on: T2-floored decision (money) → human" || bad_t "T2 floor → human" "HUMAN_PINGED=$HUMAN_PINGED"
 [[ ! -s "$ROUTE_FILE" && "$(queued_for DIVE-5 main)" == "0" ]] && ok_t "T2-floored decision: no lead route fired AND not queued for the lead" || bad_t "T2 floor no route" "sent=$(route_last) queued=$(queued_for DIVE-5 main)"
 
@@ -419,7 +449,7 @@ actor_seam_as dev; cmd_task_need DIVE-53 --type=approval --ask="make the final g
 [[ "$(nudge_of "$TMP/n53")" == "0" ]] && ok_t "DIVE-1738: non-eng-ship approval is NOT nudged" || bad_t "DIVE-1738 non-eng-ship not nudged" "nudge=$(nudge_of "$TMP/n53")"
 # a floored (money) eng-ship approval is NOT nudged (floor wins → stays hard-human)
 seed DIVE-54; HUMAN_PINGED=0; route_reset
-actor_seam_as dev; cmd_task_need DIVE-54 --type=approval --ask="approve the deploy AND the \$900 vercel invoice?" --from=dev >/dev/null 2>"$TMP/n54"
+actor_seam_as dev; cmd_task_need DIVE-54 --type=approval --needs=spend_authority --ask="approve the deploy AND the \$900 vercel invoice?" --from=dev >/dev/null 2>"$TMP/n54"
 [[ "$(nudge_of "$TMP/n54")" == "0" && "$HUMAN_PINGED" == "1" ]] && ok_t "DIVE-1738: floored money eng-ship is NOT nudged (stays human)" || bad_t "DIVE-1738 floored not nudged" "nudge=$(nudge_of "$TMP/n54") human=$HUMAN_PINGED"
 
 # --- DIVE-2004: LOUD AT FILE TIME ---------------------------------------------
@@ -507,7 +537,7 @@ actor_seam_as dev; cmd_task_need DIVE-61 --type=decision --tier=2 --ask="$ESHIP_
 # T2 category floor fired, _routable=0), so announcing "no agent can clear this" is
 # noise, not news. The new arm is scoped to gates where human-only is an ACCIDENT.
 seed DIVE-62; HUMAN_PINGED=0; route_reset
-actor_seam_as main; cmd_task_need DIVE-62 --type=approval --ask="approve delegated push for review AND the \$900 vercel invoice?" --from=main >/dev/null 2>"$TMP/n62"
+actor_seam_as main; cmd_task_need DIVE-62 --type=approval --needs=spend_authority --ask="approve delegated push for review AND the \$900 vercel invoice?" --from=main >/dev/null 2>"$TMP/n62"
 { [[ "$(w2612_of "$TMP/n62")" == "0" ]] && [[ "$HUMAN_PINGED" == "1" ]]; } \
   && ok_t "DIVE-2612: a FLOORED (money) approval is human-only by design and does NOT warn" \
   || bad_t "DIVE-2612 floored must not warn" "warn=$(w2612_of "$TMP/n62") human=$HUMAN_PINGED"

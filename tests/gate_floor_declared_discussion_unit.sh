@@ -269,11 +269,32 @@ grep -q -- "--discusses" <<<"$ann" && ok_t "announce: offers the recorded appeal
 grep -qi "reword" <<<"$ann" && ok_t "announce: explicitly warns against rewording the ask (anti-laundering)" || bad_t "announce anti-laundering" "stderr: $ann"
 
 # 12: ANNOUNCE — a non-decision gate must NOT be offered an appeal it cannot use.
+#
+# ARM C NARROWED (DIVE-4175, 2026-09-11): `type=approval` is precisely the type
+# whose keyword promotion was deleted, so there is no longer an escalation to
+# announce on this fixture — the gate lead-routes and Floor B still refuses to
+# let that seat clear it. What the arm grades is unchanged in substance: the
+# filer is TOLD what happened to the tier, and is NOT offered an appeal it cannot
+# use. Asserting "FORCED to tier 2" here would grade the deleted promoter.
 route_reset; seed DIVE-413
 ann2=$(cmd_task_need DIVE-413 --type=approval --from=dev \
   --ask="Approve deleting the leaked credential from the store." 2>&1 >/dev/null)
-grep -qi "FORCED to tier 2" <<<"$ann2" && ok_t "announce/approval: still states the escalation" || bad_t "announce approval states" "stderr: $ann2"
+grep -qi "no longer promotes an APPROVAL gate" <<<"$ann2" \
+  && ok_t "announce/approval: the demotion is stated at file time, and names --needs= as the route that does reach a person" \
+  || bad_t "announce approval states the demotion" "stderr: $ann2"
+grep -qi "credential" <<<"$ann2" \
+  && ok_t "announce/approval: still names the MATCHED TERM, so the filer can see what fired" \
+  || bad_t "announce/approval names term" "stderr: $ann2"
 grep -q -- "--discusses" <<<"$ann2" && bad_t "announce/approval must NOT advertise --discusses" "stderr: $ann2" || ok_t "announce/approval: does NOT advertise an appeal that would be refused"
+# DIFFERENTIAL, and it is the narrowing itself: the SAME ask on a `decision` —
+# the type a lead can auto-apply — is still FORCED to tier 2 and is still offered
+# the recorded appeal. One ask, two types, two outcomes.
+route_reset; seed DIVE-4131
+ann3=$(cmd_task_need DIVE-4131 --type=decision --from=dev --options="A|B" --recommend="A" \
+  --ask="Approve deleting the leaked credential from the store." 2>&1 >/dev/null)
+grep -qi "FORCED to tier 2" <<<"$ann3" \
+  && ok_t "differential: the same credential ask on a DECISION is still forced to tier 2 (the floor is kept where nothing stands behind it)" \
+  || bad_t "decision-type escalation must survive the narrowing" "stderr: $ann3"
 
 # 13: AUDIT — the declaration is on the record whether it applied or was refused.
 #     That attributability is the whole reason a declaration beats a reworded ask.

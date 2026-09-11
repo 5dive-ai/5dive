@@ -153,12 +153,33 @@ cmd_task_need DIVE-503 --type=decision --options='A|B' --recommend='A' \
   || bad_t "verifier's own gate does not self-route to itself" "route_last=$(route_last)"
 
 # ---- 4. tier-2 category floor (money) stays human even on a loop ----
+# DIVE-4175 arm C: the property is unchanged — a spend decision on a loop must not
+# land on the VERIFIER, who has no spend authority — but the route to true-human is
+# the DECLARATION now, not the ask's wording. Control below records the loosening.
 route_reset; seed_loop DIVE-504; fixture_actor dev
-cmd_task_need DIVE-504 --type=decision --options='A|B' --recommend='A' \
+cmd_task_need DIVE-504 --type=decision --options='A|B' --recommend='A' --needs=spend_authority \
   --ask='Approve the $5000 refund to the customer?' --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" && "$(route_sent)" == "0" ]] \
-  && ok_t "tier-2 money floor stays human, not verifier-routed" \
+  && ok_t "a DECLARED money decision stays human, not verifier-routed" \
   || bad_t "tier-2 money floor stays human, not verifier-routed" "human=$HUMAN_PINGED sent=$(route_sent)"
+# ARM C NARROWED (2026-09-11, ops's answered gate). The control is a PAIR now,
+# because the demotion is scoped to `type=approval` — the one type whose answer
+# side is already fenced (Floor B refuses approval/secret/manual from an agent-*
+# unix identity). On a `decision`, which a lead CAN auto-apply, the keyword floor
+# is load-bearing and STAYS: 9 decision-type gates in the 30-day window were
+# answered by the paired human and a blanket demotion deleted all 9.
+route_reset; seed_loop DIVE-554; fixture_actor dev
+cmd_task_need DIVE-554 --type=decision --options='A|B' --recommend='A' \
+  --ask='Approve the $5000 refund to the customer?' --from=dev >/dev/null 2>&1
+[[ "$HUMAN_PINGED" == "1" ]] \
+  && ok_t "arm C narrowing: the SAME spend ask undeclared on a DECISION still pages — a lead could auto-apply it, so the floor is kept" \
+  || bad_t "decision-type floor must survive the narrowing" "human=$HUMAN_PINGED — the narrowing has been widened back to all types, and the 9 regressions are back"
+route_reset; seed_loop DIVE-555; fixture_actor dev
+cmd_task_need DIVE-555 --type=approval \
+  --ask='Approve the $5000 refund to the customer?' --from=dev >/dev/null 2>&1
+[[ "$HUMAN_PINGED" == "0" ]] \
+  && ok_t "arm C control: the same spend ask undeclared on an APPROVAL no longer pages — Floor B still stands behind it" \
+  || bad_t "control undeclared spend (approval)" "human=$HUMAN_PINGED — the keyword promoter is back for approvals"
 
 # ---- 5. reject supersedes a still-open need-gate (DIVE-1490 re-nag fix) ----
 # Seed a loop task carrying an OPEN manual gate, then reject it.
@@ -292,11 +313,18 @@ cmd_task_need DIVE-3121 --type=approval \
 # would have the fixture refused before the ROUTE this arm exists to measure is
 # ever taken. `delegated push for review` is what the push class matches on — the
 # branch name was never load-bearing for it.
+#
+# DIVE-4175 arm C, NARROWED: this fixture is `--type=approval`, which is exactly
+# the type whose keyword promotion is deleted — so the spend WORD in the ask no
+# longer reaches the human on its own. The claim this arm exists for (the human
+# half outranks the push-for-review class) is unchanged; it is now reached by
+# DECLARING the capability, which is the trigger that replaced the substring.
+# Leaving it on the word would have graded the promoter, not the precedence.
 route_reset; seed_loop_g DIVE-3122; fixture_actor dev
-cmd_task_need DIVE-3122 --type=approval \
+cmd_task_need DIVE-3122 --type=approval --needs=spend_authority \
   --ask='approve a delegated push for review and the $900 runner spend' --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" && "$(route_sent)" == "0" ]] \
-  && ok_t "a push ask naming a spend stays human (T2 floor outranks the class)" \
+  && ok_t "a DECLARED spend on a push ask stays human (the human half outranks the class)" \
   || bad_t "a push ask naming a spend stays human" "human=$HUMAN_PINGED sent=$(route_sent) routed=$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-3122';")"
 # 7g. DIVE-3307 — END TO END, the live DIVE-3302 ask byte-for-byte. The unit arms in
 # tests/gate_described_not_requested_unit.sh grade the PREDICATE; this one grades the
