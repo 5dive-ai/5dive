@@ -984,6 +984,15 @@ main() {
           with_registry_lock cmd_account_set_active_provider "$@" ;;
         *) fail "$E_USAGE" "unknown account command: $acctcmd" ;;
       esac ;;
+    config)
+      # DIVE-4251: the PER-BOX settings surface (`5dive config verify=<policy>`),
+      # distinct from `5dive agent config <name> set …`, which is per-seat. A
+      # customer's "do my tasks get graded" answer belongs to the BOX; a per-seat
+      # copy of it is not a box default. Read is unprivileged; the write requires
+      # root (cmd_box_config calls require_root itself) because the file it lands
+      # in is root-owned and group-readable by every agent.
+      AUDIT_CMD="config"; AUDIT_ARGS=("$@")
+      cmd_box_config "$@" ;;
     whoami)
       # DIVE-2517 (v0.18 "Proof of who"): the one sealed actor derivation, printed
       # with the provenance of every field. Read-only — no state, no lock, and

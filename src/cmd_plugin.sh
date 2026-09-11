@@ -1171,7 +1171,7 @@ readonly PLUGIN_VERB_BINDIR="bin"
 # re-extracts the case labels from src/main.sh and asserts set equality, so a new
 # builtin verb that forgets this line reds the suite rather than silently
 # becoming claimable by a plugin.
-readonly FIVEDIVE_BUILTIN_VERBS="a2a account acp activity agent _audit_append bug buzz company constitution cost council crew deploy _deploy_do digest doctor down export fire fleet gate-proof gh _gh_do goal -h heartbeat --help help hire host human humans init liveness loop market memory _merge_do models objective objectives org paperclip-seed plugin project projects proof ps push _push_do run runs secret selfcheck self-update self_update supervisor task _task_answer team trace trigger triggers ui uninstall up update usage -v --version version watch whoami"
+readonly FIVEDIVE_BUILTIN_VERBS="a2a account acp activity agent _audit_append bug buzz company config constitution cost council crew deploy _deploy_do digest doctor down export fire fleet gate-proof gh _gh_do goal -h heartbeat --help help hire host human humans init liveness loop market memory _merge_do models objective objectives org paperclip-seed plugin project projects proof ps push _push_do run runs secret selfcheck self-update self_update supervisor task _task_answer team trace trigger triggers ui uninstall up update usage -v --version version watch whoami"
 
 _plugin_verb_name_ok()   { [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]; }
 _plugin_verb_is_builtin(){ [[ " $FIVEDIVE_BUILTIN_VERBS " == *" $1 "* ]]; }
