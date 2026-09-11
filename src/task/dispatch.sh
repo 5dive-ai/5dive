@@ -32,7 +32,10 @@ _task_usage() {
         'created DIVE-N' line and shown by 'task ls' / 'task show'.
       --no-verify / --verify   skip / demand a grader session for THIS row, whatever the
                                box default is ('5dive config verify=always|delivered-only|never')
-                               ('5dive config verify=never' still caps every mode to none)
+                               '5dive config verify=never' CAPS --review=temp and --review=<seat>
+                               to none (both book a session; the box just said not to spend one) and
+                               says so on the created line. 'check' is exempt — a command spends no
+                               session. Bare --verify is the one way to buy a row back.
       [--customer] [--already-blocked=<what it blocked>]   escapes for the internal-filing cap
   ls [--status=] [--assignee=] [--mine] [--all] [--recurring]   open rows, priority-ordered
   ls --gated[=human|agent]                      only rows holding a live gate. The 'gate' column is

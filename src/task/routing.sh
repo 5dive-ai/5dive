@@ -114,6 +114,24 @@ _task_verify_skip_reason() {
 # PRECEDENCE, and the one non-obvious rung: a PINNED SEAT outranks `check`. A row
 # with both a pinned reviewer and a command has a person on it; the command is
 # that person's instrument, not a replacement for them.
+#
+# WHAT THE BOX POLICY CAPS — stated here because iteration 2 of DIVE-4324 found
+# the code and the record disagreeing, and the record was right. `<grants>` is 0
+# when the box refused, and it gates BOTH the `seat:` rung and the `temp` rung,
+# so under `verify=never` a row filed `--review=temp` or `--review=<seat>`
+# resolves to `none` — "never wins", which is this row's acceptance criterion.
+# What previously defeated that was not this function but `crud.sh` setting
+# `force_verify` on the new spelling, which turned the box's answer into an
+# override the filer could type past. `check` is the ONE exemption and it is
+# tested ABOVE the cap on purpose: a command books no grader session, so a
+# statement about SPEND has nothing to refuse there.
+#
+# THE TWO RUNGS BELOW ARE MUTATION-TESTED AGAINST THIS FUNCTION'S OWN TEXT.
+# tests/task_review_mode_unit.sh deletes the `_grants` term, and separately the
+# `seat:` rung, out of `declare -f` output and requires the capped arms and the
+# precedence arm to go RED. An earlier version substituted a STUB instead, which
+# proved only that a stub returning 'temp' returns 'temp' — do not go back to
+# that shape; mutate the predicate that ships.
 _task_effective_review_mode() {  # <no_verify> <verify_cmd> <verifier> <grants> <skip_reason> <pinned> <deferred>
   local _nv="${1:-}" _cmd="${2:-}" _vf="${3:-}" _grants="${4:-0}" _skip="${5:-}" _pinned="${6:-0}" _defer="${7:-0}"
   [[ -n "$_nv" ]] && { printf 'none'; return 0; }

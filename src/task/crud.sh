@@ -18,6 +18,14 @@ cmd_task_add() {
   # DIVE-4324: the one filing-time review field, and whether a SEAT was pinned
   # by hand (`--verifier=`) rather than derived by the DIVE-969 default.
   local review_flag="" verifier_pinned=0
+  # DIVE-4324 iteration 3: the NEW spelling's demand, kept deliberately distinct
+  # from `force_verify`. It clears the code's own title/priority auto-skips (so
+  # `--review=temp` on a chore row is not a silent no-op) but it does NOT reach
+  # `_vp_override`, so the BOX POLICY still caps it — which is what this row's
+  # ASK and VERIFY both require ("Box policy still caps it (never wins)").
+  # `--verify` keeps its DIVE-4251 meaning and still outranks a `never` box; that
+  # is an existing, separately-tested control and this row does not touch it.
+  local review_demand="" _rm_asked=""
   local customer_facing="" already_blocked="" materialized=""
   # DIVE-2627: which flag supplied each prose value (see _read_prose_file).
   local body_src="" accept_src=""
@@ -144,23 +152,34 @@ cmd_task_add() {
         [[ -n "$force_verify" ]] && fail "$E_VALIDATION" "--review=none and --verify contradict each other — one says no grader, the other demands one (DIVE-4324)"
         [[ -n "$verifier" ]]     && fail "$E_VALIDATION" "--review=none and --verifier=$verifier contradict each other — pass one (DIVE-4324)"
         [[ -n "$verify_cmd" ]]   && fail "$E_VALIDATION" "--review=none and --verify=<cmd> contradict each other — a row graded by a command is --review=check (DIVE-4324)"
-        no_verify="1" ;;
+        no_verify="1"; _rm_asked="none" ;;
       check)
         [[ -n "$verify_cmd" ]] || fail "$E_USAGE" "--review=check needs the command that grades the row: pass --verify=\"<cmd>\" as well (DIVE-4324)"
-        [[ -n "$no_verify" ]]  && fail "$E_VALIDATION" "--review=check and --no-verify contradict each other — pass one (DIVE-4324)" ;;
+        [[ -n "$no_verify" ]]  && fail "$E_VALIDATION" "--review=check and --no-verify contradict each other — pass one (DIVE-4324)"
+        _rm_asked="check" ;;
       temp)
         [[ -n "$no_verify" ]] && fail "$E_VALIDATION" "--review=temp and --no-verify contradict each other — pass one (DIVE-4324)"
         [[ -n "$verifier" ]]  && fail "$E_VALIDATION" "--review=temp and --verifier=$verifier contradict each other — 'temp' is the pool's fresh session, '$verifier' is a pinned seat (--review=$verifier) (DIVE-4324)"
-        # A DEMAND, exactly as a bare `--verify` is: it clears the DIVE-969/2681
-        # auto-skips and outranks a `never` box, which is what makes `temp` a
-        # choice rather than a wish.
-        force_verify="1" ;;
+        # A DEMAND AGAINST THE CODE'S OWN DEFAULTS, NOT AGAINST THE BOX. It
+        # clears the DIVE-969/2681 title/priority auto-skips — otherwise
+        # `--review=temp` on a chore row is a control that silently does
+        # nothing — but it deliberately does NOT set `force_verify`, because
+        # `temp` BOOKS A POOL SESSION and `verify=never` is the box's statement
+        # about exactly that spend. This is the iteration-2 correction: the
+        # previous shape let any filer defeat a spend control by typing
+        # `--review=temp`, while three places on this row said `never` wins.
+        review_demand="1"; _rm_asked="temp" ;;
       seat)
         local _rm_seat="${review_flag#seat:}"
         [[ -n "$no_verify" ]] && fail "$E_VALIDATION" "--review=$review_flag and --no-verify contradict each other — pass one (DIVE-4324)"
         [[ -n "$verifier" && "$verifier" != "$_rm_seat" ]] \
           && fail "$E_VALIDATION" "--review=$review_flag and --verifier=$verifier name two different reviewers — pass one (DIVE-4324)"
-        verifier="$_rm_seat"; verifier_pinned=1; force_verify="1" ;;
+        # EXACTLY what `--verifier=<agent>` already does, and nothing more. The
+        # extra `force_verify` this branch used to set was the fifth mechanism
+        # the design claims not to have: it made `--review=quinn` and
+        # `--verifier=quinn` land on two different rows under a `never` box.
+        # A standing reviewer costs a session too, so the cap applies to it.
+        verifier="$_rm_seat"; verifier_pinned=1; _rm_asked="seat:${_rm_seat}" ;;
       *)
         fail "$E_VALIDATION" "bad --review value '$review_flag' — one of: none (no grader) | check (a command grades it, with --verify=<cmd>) | temp (one fresh pool session per delivery) | <seat> (a pinned standing reviewer) (DIVE-4324)" ;;
     esac
@@ -581,6 +600,11 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
   # and the customer's one way to buy a grade back on a `never` box would not work
   # on the rows most likely to need it.
   [[ -n "$force_verify" ]] && verify_skipped=""
+  # DIVE-4324: `--review=temp` clears the same auto-skips. Same reason, one rung
+  # lower: it overrides the CODE's guess about this row, not the BOX's answer
+  # about spend — `_vp_grants` above is untouched by it, so a `never` box still
+  # caps the result to `none`.
+  [[ -n "$review_demand" ]] && verify_skipped=""
   if [[ "$kind" == "standard" && -z "$no_verify" && "${FIVE_VERIFY_DEFAULT:-1}" != "0" \
         && $_vp_grants == 1 \
         && -z "$accept" && -z "$verify_cmd" && -z "$verifier" && -z "$verify_skipped" ]]; then
@@ -727,6 +751,16 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
       else                                  _rv_why="no distinct grader available"
       fi
       review_note+=" — ${_rv_why}; choose deliberately with --review=none|check|temp|<seat>"
+    elif [[ -n "$_rm_asked" && "$review_mode" != "$_rm_asked" ]]; then
+      # DIVE-4324 iteration 3: THE FILER ASKED AND SOMETHING OUTRANKED THEM, so
+      # say it here. Now that the box policy caps `temp` and `<seat>`, a silent
+      # downgrade would be the no-op-that-looks-like-a-control failure this
+      # file's own refusal arms exist to prevent — the same one the rules file
+      # names on `--tier=1`. Name what overruled the flag and how to buy it back.
+      local _rv_by="the box default verify=${_vp_policy}"
+      [[ -n "$verify_skipped" ]] && _rv_by="$verify_skipped"
+      (( verify_unavailable )) && _rv_by="no distinct grader available in this org"
+      review_note+=" — you asked for '${_rm_asked}'; ${_rv_by} overruled it. Buy a grade back for one row with --verify, or change the box with '5dive config verify=…'"
     fi
     ok "created ${ident} — $title${coord_note}${review_note}${verify_note}" \
        '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", autoCoordinated:($ac=="1"), verifyDefaulted:($vd=="1"), verifyUnavailable:($vu=="1"), verifySkipped:($vs!=""), verifySkipReason:$vs, verifier:$v, verifyPolicy:$vp, verifyOverride:$vo, verifyDeferred:($vdf=="1"), reviewMode:$rm, reviewModeChosen:($rc=="1"), parentLinkWarning:($wi!=""), citedParent:$wi, citedSeries:(if $wi=="" then "" else ($wk+" #"+$wn) end), openTitleMatches:($wm|split(",")|map(select(length>0)))}' \
