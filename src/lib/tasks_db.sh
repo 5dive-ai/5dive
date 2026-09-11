@@ -1345,8 +1345,11 @@ CREATE INDEX IF NOT EXISTS objective_cycles_idx ON objective_cycles(objective_id
 -- ledger_started pref (task_prefs) stamps the first init, and `trace` refuses to
 -- render an empty ledger section for a task that predates it.
 --   kind       dotted lifecycle verb: task.created|task.started|task.delivered|
---              task.done|task.cancelled|gate.filed|gate.answered|policy.refused|
---              ship|rollback
+--              task.graded|task.done|task.cancelled|gate.filed|gate.answered|
+--              policy.refused|ship|rollback
+--              task.graded is the VERDICT, not the close, and the two are days
+--              apart on a row held open for a merge (DIVE-4322) — a consumer
+--              asking "is this grade still running" must read the first.
 --   actor      the identity the RECORDING SITE is authoritative for, which is not
 --              the same namespace for every kind and should not be forced to be.
 --              Task lifecycle rows carry the BOARD actor (task_actor: `dev`),

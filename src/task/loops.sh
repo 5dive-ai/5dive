@@ -852,6 +852,45 @@ cmd_task_verify() {
     fi
   fi
 
+
+  # ── DIVE-4322: A GRADE ENDS AT THE VERDICT, NOT AT THE CLOSE ────────────────
+  #
+  # The pool's concurrency cap counted a grade as "in flight" from
+  # `task.grade.spawned` until the ROW closed (`task.done`/`task.rejected`). But
+  # a PASS on a bound row does not close here — DIVE-3330 deliberately holds it
+  # open as graded->merge, and the close then waits on a human's merge and the
+  # grader's own `task done`, which is hours. Measured 2026-09-11: two rows
+  # parked on main's merge (one PR unmergeable, one merged with the close still
+  # owed) held both slots of a --cap=2 lane for three hours and starved 19 queued
+  # grades while the pool seat's heartbeat read "no todo — stay idle".
+  #
+  # So the ledger needs the event the lane actually wants to key on: the moment a
+  # verdict is STORED. Emitted from here, after both branches have written it,
+  # because this function is the only writer of graded_verdict and both shapes a
+  # grader uses reach it — the `--no-done --result=` prose grade and the passing
+  # `--cmd` that DIVE-3330 diverts into the same else-branch.
+  #
+  # BOTH VERDICTS, and the flipped close too. A FAIL is just as much an end of
+  # grading as a PASS (the maker owes the next iteration, not the pool), and the
+  # auto-close above reaches `status='done'` by RAW UPDATE, so it emits no
+  # `task.done` at all — an unbound row closed by `verify --cmd=true` held a slot
+  # forever on the old query. One emit at the one place covers all three.
+  #
+  # AN EXPLICIT CLOCK-NONCE IDEM KEY, for policy_refuse's reason: a re-grade
+  # after a reject is a genuinely second event, and the derived key digests the
+  # payload — two identical FAIL verdicts on one ident would collapse into one
+  # row, and the lane would then read the re-spawned grade as still in flight
+  # forever. Never fatal: `ledger_emit` swallows its own failure, and a verdict
+  # that is already durably stored must not be undone by a bookkeeping write.
+  if declare -F ledger_emit >/dev/null 2>&1; then
+    local _g_sha=""
+    declare -F _gate_graded_sha >/dev/null 2>&1 \
+      && _g_sha=$(_gate_graded_sha "$result_txt" 2>/dev/null || printf '')
+    ledger_emit task.graded ident="$ident" task_id="$id" actor="$(task_actor "")" \
+      idem="task.graded:${ident}:$(date +%s%N 2>/dev/null || echo $$)" \
+      detail="verdict=${verdict} sha=${_g_sha:-unknown} closed=${flipped} merge-hold=${merge_hold}"
+  fi
+
   if (( JSON_MODE )); then
     printf '%s' "$result_txt" | jq -R -s \
       --arg i "$id" --arg id "$ident" --arg v "$verdict" --argjson rc "$rc" \
