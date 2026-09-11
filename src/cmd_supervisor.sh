@@ -1495,10 +1495,28 @@ _sup_agent_record() {
   # classifier rather than deciding here. The excerpt stays in `signals`
   # whatever the state says: "we read this" and "it still holds" are different
   # facts and the operator wants both.
-  local quota_deadline="unknown"
+  #
+  # DIVE-4328 — THE STATE IS NOT THE DEADLINE, AND THE PARK NEEDS THE DEADLINE.
+  # `_sup_quota_deadline` echoes "<state>\x1f<epoch>" and this site took field 1
+  # and threw field 2 away, so `signals.quotaDeadline` has only ever held one of
+  # `live`/`lapsed`/`unknown`. The reclaimer's park
+  # (`_hb_quota_park_until_seat`) then read that column and ran `date -d` on it
+  # — which fails on all three words — so EVERY park fell to the blind 6h cap,
+  # rebased on each fresh observation of the same stale pane. Measured
+  # 2026-09-11: codex held its DIVE-4290 claim 5h past the reset time its own
+  # wall printed. The parser was never the gap (DIVE-4206 taught it the
+  # `resets 4am` phrasing); the STORAGE was. Both halves are emitted now, and
+  # the state half is unchanged for every existing reader.
+  local quota_deadline="unknown" quota_deadline_epoch=""
   if [[ -n "$quota_excerpt" ]]; then
-    quota_deadline=$(_sup_quota_deadline "$quota_excerpt" "$now" | cut -f1 -d$'\x1f')
+    IFS=$'\x1f' read -r quota_deadline quota_deadline_epoch \
+      <<<"$(_sup_quota_deadline "$quota_excerpt" "$now")"
     [[ -n "$quota_deadline" ]] || quota_deadline="unknown"
+    # An epoch is emitted whenever the wall named a time this could parse —
+    # INCLUDING one already in the past. A lapsed deadline is not noise here, it
+    # is the only positive evidence that the park must end, and dropping it is
+    # what left the un-park to a timer nobody had set.
+    [[ "$quota_deadline_epoch" =~ ^[0-9]+$ ]] || quota_deadline_epoch=""
   fi
 
   # --- signal: OUTPUT (DIVE-3272) — open rows held, and days since this seat
@@ -1551,6 +1569,7 @@ _sup_agent_record() {
     --arg verifyExcerpt "$verify_excerpt" \
     --arg quotaExcerpt "$quota_excerpt" \
     --arg quotaDeadline "$quota_deadline" \
+    --arg quotaDeadlineEpoch "$quota_deadline_epoch" \
     --arg promptExcerpt "$prompt_excerpt" \
     --arg promptMark "$prompt_mark" \
     --argjson openRows "$open_rows" --argjson noOutputDays "$no_output_days" \
@@ -1568,6 +1587,11 @@ _sup_agent_record() {
                # DIVE-3880: live / lapsed / unknown for the signature above.
                # null only when there is no signature to qualify.
                quotaDeadline:(if $quotaExcerpt == "" then null else $quotaDeadline end),
+               # DIVE-4328: the RESET TIME THE WALL ITSELF PRINTED, as an
+               # epoch. null when the refusal named none this could parse (the
+               # unknown state above). This is what a park keys to; the string
+               # above says only which of three states the parse landed in.
+               quotaDeadlineEpoch:(if $quotaDeadlineEpoch == "" then null else ($quotaDeadlineEpoch|tonumber) end),
                # DIVE-4293: the picker footer the pane tail is sitting on, and
                # whether the HIGHLIGHTED option carries (Recommended). The mark
                # is null when there is no picker to qualify.
