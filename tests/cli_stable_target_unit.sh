@@ -277,59 +277,78 @@ out="$(run_target fail 9.9.9)"; rc=$?
   && ok "receipt: a refused downgrade writes no receipt" || bad "downgrade refusal left a receipt" "rc=$rc"
 rm -f "$TD/etc/override"
 
-# An unwritable state directory must cost NOTHING on either stream — this is
-# the arm that grades the REDIRECTION ORDER in _record_cli_target_receipt.
-# DIVE-4294 iteration 3 (quinn): the previous shape was vacuous twice over — it
-# pointed at a NON-EXISTENT dir, so `mkdir -p ... || return 0` returned before
-# the redirection was ever set up, and it asserted on stdout while the leak is
-# on stderr. So: a directory that EXISTS and is unwritable (mkdir -p succeeds,
-# `> "$tmp"` is the failing step), and the assertion is on the SILENCED stream.
+# A state directory the receipt cannot be written into must cost NOTHING on
+# either stream — this is the arm that grades the REDIRECTION ORDER in
+# _record_cli_target_receipt.
+#
+# DIVE-4294 iteration 3 (quinn): the previous shape was vacuous twice over. It
+# pointed CLI_TARGET_RECEIPT_FILE at a NON-EXISTENT dir, so
+# `mkdir -p "$dir" 2>/dev/null || return 0` returned before the printf
+# redirection was ever set up; and it asserted on stdout, while the leak the
+# order prevents is on STDERR. Reversing the two redirections left it at 39/0.
+#
+# So the fixture must (a) let mkdir -p SUCCEED and make `> "$tmp"` itself the
+# failing step, and (b) assert on the silenced stream. Two fixtures do (a):
+#   1. /proc/self as the state dir — it EXISTS (mkdir -p succeeds) and procfs
+#      refuses file creation for EVERY uid, root included, so this fixture
+#      binds in CI, where a mode bit would not;
+#   2. an existing 0555 directory — the realistic shape, skipped loudly when
+#      the running uid can write it anyway (root).
 rm -f "$TD/etc/override" "$TD/etc/canary"; printf 'v1.4.0\n' > "$TD/state/known"
-rodir="$TD/ro"; rm -rf "$rodir"; mkdir -p "$rodir"; chmod 0555 "$rodir"
-if [[ "$(id -u)" == 0 ]] || ( : > "$rodir/.probe" ) 2>/dev/null; then
-  # Root (or any uid that can write a 0555 dir) cannot make `> "$tmp"` fail, so
-  # the arm would pass without observing anything. Skip LOUDLY, never silently.
-  rm -f "$rodir/.probe" 2>/dev/null
-  printf 'SKIP - receipt: unwritable state dir is silent on both streams (uid=%s can write a 0555 dir; arm cannot bind here)\n' "$(id -u)"
-else
-  out="$(RECEIPT="$rodir/cli-target.json" run_target fail)"
+
+# --- fixture 1: /proc/self — exists, and unwritable for every uid ---
+silence_arm(){ # receipt_path label
+  local receipt="$1" label="$2" err
+  out="$(RECEIPT="$receipt" run_target fail)"
   err="$(tlog)"
   [[ "$out" == v1.4.0 ]] \
-    && ok "receipt: an unwritable state dir leaks nothing onto stdout" \
-    || bad "unwritable state dir leaked onto the resolver's output" "$out"
+    && ok "receipt: $label leaks nothing onto stdout" \
+    || bad "$label leaked onto the resolver's output" "$out"
   # The silenced stream. The ONE line that belongs on stderr is the rung
-  # diagnostic; bash's own "Permission denied" is what the order prevents.
+  # diagnostic; bash's own write error is exactly what the order prevents.
   if [[ "$(grep -c . <<<"$err")" == 1 ]] \
      && grep -q '5dive install: CLI target .* — source: ' <<<"$err" \
-     && ! grep -qi 'denied' <<<"$err"; then
-    ok "receipt: an unwritable state dir leaks nothing onto stderr (only the CLI target diagnostic)"
+     && [[ "$(grep -c . <<<"$err")" == 1 ]]; then
+    ok "receipt: $label leaks nothing onto stderr (only the CLI target diagnostic)"
   else
-    bad "unwritable state dir leaked onto stderr" "$err"
+    bad "$label leaked onto stderr" "$err"
   fi
-  [[ ! -e "$rodir/cli-target.json" ]] \
-    && ok "receipt: no receipt is written when the state dir is unwritable" \
-    || bad "a receipt appeared inside an unwritable dir"
+  [[ ! -e "$receipt" ]] \
+    && ok "receipt: no receipt is written when $label" \
+    || bad "a receipt appeared where it could not be written" "$receipt"
+}
+silence_arm /proc/self/cli-target.json "an unwritable receipt path"
 
-  # Mutation meta-anchor: reverse the two redirections (`2>/dev/null > "$tmp"`
-  # -> `> "$tmp" 2>/dev/null`) — redirections apply left to right, so the
-  # reversed order lets BASH print the denial onto the caller's stderr. If the
-  # stderr arm above is real, the mutant must be observably noisy here.
-  mut_redir="$(sed 's|2>/dev/null > "$tmp"|> "$tmp" 2>/dev/null|' <<<"$block")"
-  if [[ "$mut_redir" == "$block" ]]; then
-    bad "redirection-order mutation applied" "mutation did not change extracted source"
-  else
-    env -i PATH="$TD/bin:/usr/bin:/bin" FAKE_ROUTE=fail FAKE_INSTALLED=0.0.0 \
-      CLI_VERSION_OVERRIDE_FILE="$TD/etc/override" CLI_CANARY_FILE="$TD/etc/canary" \
-      CLI_VERSION_KNOWN_FILE="$TD/state/known" CLI_INSTALLED_BIN="$TD/bin/installed" \
-      CLI_TARGET_RECEIPT_FILE="$rodir/cli-target.json" \
-      bash -c "set -euo pipefail
+# Mutation meta-anchor: reverse the two redirections (`2>/dev/null > "$tmp"`
+# -> `> "$tmp" 2>/dev/null`). Redirections are applied left to right, so the
+# reversed order lets BASH print the write error onto the caller's stderr. If
+# the stderr assertion above is real, the mutant must be observably noisy.
+mut_redir="$(sed 's|2>/dev/null > "$tmp"|> "$tmp" 2>/dev/null|' <<<"$block")"
+if [[ "$mut_redir" == "$block" ]]; then
+  bad "redirection-order mutation applied" "mutation did not change extracted source"
+else
+  env -i PATH="$TD/bin:/usr/bin:/bin" FAKE_ROUTE=fail FAKE_INSTALLED=0.0.0 \
+    CLI_VERSION_OVERRIDE_FILE="$TD/etc/override" CLI_CANARY_FILE="$TD/etc/canary" \
+    CLI_VERSION_KNOWN_FILE="$TD/state/known" CLI_INSTALLED_BIN="$TD/bin/installed" \
+    CLI_TARGET_RECEIPT_FILE=/proc/self/cli-target.json \
+    bash -c "set -euo pipefail
 resolve_gh_tag(){ printf 'v9.9.9\\n'; }
 $mut_redir
 resolve_cli_target" >/dev/null 2>"$TD/mut-err"
-    grep -qi 'denied' "$TD/mut-err" \
-      && ok "redirection-order mutation is reachable by the stderr arm (mutant leaks the denial)" \
-      || bad "redirection-order mutation was not exercised" "$(cat "$TD/mut-err")"
-  fi
+  [[ "$(grep -c . "$TD/mut-err")" -gt 1 ]] \
+    && ok "redirection-order mutation is reachable by the stderr arm (mutant leaks the write error)" \
+    || bad "redirection-order mutation was not exercised" "$(cat "$TD/mut-err")"
+fi
+
+# --- fixture 2: the realistic shape — a directory that EXISTS and is 0555 ---
+rodir="$TD/ro"; rm -rf "$rodir"; mkdir -p "$rodir"; chmod 0555 "$rodir"
+if [[ "$(id -u)" == 0 ]] || ( : > "$rodir/.probe" ) 2>/dev/null; then
+  # Root cannot make a mode bit fail, so this fixture would pass without
+  # observing anything. Skip LOUDLY, never vacuously — fixture 1 still binds.
+  rm -f "$rodir/.probe" 2>/dev/null
+  printf 'SKIP - receipt: an unwritable state DIR is silent on both streams (uid=%s can write a 0555 dir; fixture 1 covers this under root)\n' "$(id -u)"
+else
+  silence_arm "$rodir/cli-target.json" "an unwritable state dir"
 fi
 chmod 0755 "$rodir" 2>/dev/null || true; rm -rf "$rodir"
 
