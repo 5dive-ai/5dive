@@ -162,12 +162,24 @@ cmd_task_need DIVE-504 --type=decision --options='A|B' --recommend='A' --needs=s
 [[ "$HUMAN_PINGED" == "1" && "$(route_sent)" == "0" ]] \
   && ok_t "a DECLARED money decision stays human, not verifier-routed" \
   || bad_t "tier-2 money floor stays human, not verifier-routed" "human=$HUMAN_PINGED sent=$(route_sent)"
+# ARM C NARROWED (2026-09-11, ops's answered gate). The control is a PAIR now,
+# because the demotion is scoped to `type=approval` — the one type whose answer
+# side is already fenced (Floor B refuses approval/secret/manual from an agent-*
+# unix identity). On a `decision`, which a lead CAN auto-apply, the keyword floor
+# is load-bearing and STAYS: 9 decision-type gates in the 30-day window were
+# answered by the paired human and a blanket demotion deleted all 9.
 route_reset; seed_loop DIVE-554; fixture_actor dev
 cmd_task_need DIVE-554 --type=decision --options='A|B' --recommend='A' \
   --ask='Approve the $5000 refund to the customer?' --from=dev >/dev/null 2>&1
+[[ "$HUMAN_PINGED" == "1" ]] \
+  && ok_t "arm C narrowing: the SAME spend ask undeclared on a DECISION still pages — a lead could auto-apply it, so the floor is kept" \
+  || bad_t "decision-type floor must survive the narrowing" "human=$HUMAN_PINGED — the narrowing has been widened back to all types, and the 9 regressions are back"
+route_reset; seed_loop DIVE-555; fixture_actor dev
+cmd_task_need DIVE-555 --type=approval \
+  --ask='Approve the $5000 refund to the customer?' --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "0" ]] \
-  && ok_t "arm C control: the SAME spend ask UNDECLARED no longer pages the human on a loop" \
-  || bad_t "control undeclared spend" "human=$HUMAN_PINGED — the keyword promoter is back"
+  && ok_t "arm C control: the same spend ask undeclared on an APPROVAL no longer pages — Floor B still stands behind it" \
+  || bad_t "control undeclared spend (approval)" "human=$HUMAN_PINGED — the keyword promoter is back for approvals"
 
 # ---- 5. reject supersedes a still-open need-gate (DIVE-1490 re-nag fix) ----
 # Seed a loop task carrying an OPEN manual gate, then reject it.
