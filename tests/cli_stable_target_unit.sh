@@ -14,6 +14,16 @@ block="$(sed -n '/^# >>> DIVE-4140 stable CLI target/,/^# <<< DIVE-4140 stable C
 if [[ -n "$block" ]] && grep -q 'resolve_cli_target()' <<<"$block"; then ok "stable resolver is extractable from install.sh"
 else bad "stable resolver is missing"; echo "$PASS passed, $FAIL failed"; exit 1; fi
 
+handoff="$(sed -n '/^[[:space:]]*# >>> DIVE-4140 stable installer handoff/,/^[[:space:]]*# <<< DIVE-4140 stable installer handoff/p' src/cmd_selfupdate.sh)"
+if [[ -n "$handoff" ]] && grep -q 'CLI_VERSION_URL=' <<<"$handoff" \
+   && grep -q 'bash "$installer" --upgrade' <<<"$handoff"; then
+  ok "self-update installer handoff is extractable from src/cmd_selfupdate.sh"
+else
+  bad "self-update installer handoff is missing"
+  echo "$PASS passed, $FAIL failed"
+  exit 1
+fi
+
 mkdir -p "$TD/bin" "$TD/etc" "$TD/state"
 cat > "$TD/bin/curl" <<'CURL'
 #!/usr/bin/env bash
@@ -74,6 +84,31 @@ printf 'v1.4.0\n' > "$TD/state/known"
 out="$(run_target v1.4.0 1.4.0)"; rc=$?
 [[ $rc -eq 0 && "$out" == v1.4.0 && "$out" != v9.9.9 ]] \
   && ok "held stable tag keeps box self-update put" || bad "held box followed newest" "$out"
+
+# Exercise the real self-update handoff, not only resolve_cli_target in
+# isolation. This fake installer contains the shipped resolver. A fake red
+# smoke writes the one-call brake, then the updater must keep the box on the
+# held tag even while the route advertises a newer release.
+cat > "$TD/bin/fetched-installer" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+resolve_gh_tag(){ printf 'v9.9.9\\n'; }
+$block
+resolve_cli_target
+EOF
+chmod +x "$TD/bin/fetched-installer"
+printf 'v1.4.0\n' > "$TD/etc/override"
+out="$(env -i PATH="$TD/bin:/usr/bin:/bin" FAKE_ROUTE=v9.9.9 FAKE_INSTALLED=1.4.0 \
+  CLI_VERSION_OVERRIDE_FILE="$TD/etc/override" CLI_CANARY_FILE="$TD/etc/canary" \
+  CLI_VERSION_KNOWN_FILE="$TD/state/known" CLI_INSTALLED_BIN="$TD/bin/installed" \
+  bash -c "set -euo pipefail
+installer=\"\$1\"
+$handoff
+" _ "$TD/bin/fetched-installer" 2>&1)"; rc=$?
+[[ $rc -eq 0 && "$out" == v1.4.0 ]] \
+  && ok "fake-red brake holds the real self-update installer handoff" \
+  || bad "fake-red self-update rehearsal failed" "$out"
+rm -f "$TD/etc/override"
 
 mutant="$(sed '/if \[\[ -r "\$known_file"/,/^[[:space:]]*fi/ s/target=""/target="$(resolve_gh_tag)"/' <<<"$block")"
 if [[ "$mutant" == "$block" ]]; then
