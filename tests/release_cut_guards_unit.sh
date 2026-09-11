@@ -80,6 +80,11 @@ verdict(){ # $1 = check-runs TSV ; echoes NOT-REACHED|IN-FLIGHT|RED|GREEN
 # guard deleted them. Any helper that drives the block must neutralise both.
 export GITHUB_JOB=""
 export GITHUB_RUN_ID=""
+# DIVE-4311: the workflow exports REQUIRED_ONLY=${{ inputs.required_only }} into the cut step's env.
+# Every lane-ON arm below sets REQUIRED_ONLY=true itself; the lane-OFF arms assume it is UNSET.
+# Dispatched with the hotfix lane on, the ambient value leaked into the lane-OFF arms and the
+# harness went 54/52 (run 34590071224, 2026-09-11) — refusing the very cut the lane exists for.
+unset REQUIRED_ONLY
 
 verdict_run(){ # $1 = check-runs TSV (4-col), $2 = GITHUB_RUN_ID ; echoes like verdict()
   local out rc

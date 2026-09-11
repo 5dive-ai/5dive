@@ -40,6 +40,11 @@ FIVE_VERSION="0.29.0"
 FAIL_MSG=""
 fail() { FAIL_MSG="$2"; printf '%s\n' "$2" >&2; return "$1"; }
 gh_org() { echo "5dive-ai"; }
+# The registry repo name is read from THE CONSTANT (src/lib/marketplace.sh), never
+# re-spelled here: point that constant at another repo and every arm below reds,
+# which is the only way this harness can catch a half-finished rename.
+. "$ROOT/src/lib/marketplace.sh"
+REG_BASE="$(_marketplace_raw_base)/"
 warn() { :; }
 step() { :; }
 
@@ -60,6 +65,26 @@ printf 'version: "2"\nteam:\n  slug: startup\n' > "$TMP/reg/teams/startup.5dive.
 printf 'version: "9"\nteam:\n  slug: from-the-future\n' > "$TMP/reg/teams/from-the-future.5dive.yaml"
 printf 'team:\n  slug: ancient\n'                       > "$TMP/v1.5dive.yaml"
 
+# --- the constant is PINNED here, and this is the only literal in the file ----
+# DIVE-4289. Every other arm derives its URL from _marketplace_raw_base, which is
+# exactly what makes them blind to the constant itself being wrong: mutate it and
+# the seam and the code move together, so all 20 stay green. This arm is the
+# negative control for that — it is the one place the real repo name is written
+# out, so a rename that lands in the constant alone still has to be made here on
+# purpose. It also pins `_teams_registry_base` TO the constant, so cmd_compose.sh
+# cannot quietly go back to spelling its own URL.
+REG_EXPECT="https://raw.githubusercontent.com/5dive-ai/5dive-marketplace/main"
+if [[ "$(_marketplace_raw_base)" == "$REG_EXPECT" ]]; then
+  ok_t 'the marketplace constant resolves to 5dive-ai/5dive-marketplace (NOT the old character-packs name)'
+else
+  bad_t 'the marketplace constant does not name the registry repo' "got $(_marketplace_raw_base), want $REG_EXPECT"
+fi
+if [[ "$(_teams_registry_base)" == "$(_marketplace_raw_base)" ]]; then
+  ok_t 'team templates read THE constant, not a second copy of the URL'
+else
+  bad_t 'the teams registry base has drifted off the shared constant' "$(_teams_registry_base)"
+fi
+
 # Replace the ONE network call. Everything above it is under test.
 #
 # Every fetch is LOGGED TO A FILE and not counted in a variable, for the same
@@ -71,7 +96,7 @@ GETLOG="$TMP/gets"; : > "$GETLOG"
 BODY_RC=0
 _teams_get() {
   local url="$1" out="$2"
-  local rel="${url#https://raw.githubusercontent.com/5dive-ai/character-packs/main/}"
+  local rel="${url#"$REG_BASE"}"
   printf '%s\n' "$rel" >> "$GETLOG"
   (( REG_RC == 0 )) || return "$REG_RC"
   if (( BODY_RC != 0 )) && [[ "$rel" != teams/index.json ]]; then return "$BODY_RC"; fi
@@ -247,7 +272,7 @@ esac
 _teams_get_ok=$(declare -f _teams_get)
 _teams_get() {
   local url="$1" out="$2"
-  local rel="${url#https://raw.githubusercontent.com/5dive-ai/character-packs/main/}"
+  local rel="${url#"$REG_BASE"}"
   printf '%s\n' "$rel" >> "$GETLOG"
   [[ "$rel" == teams/from-the-future.5dive.yaml ]] && return 4
   [[ -f "$TMP/reg/$rel" ]] || return 1

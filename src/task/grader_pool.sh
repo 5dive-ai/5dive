@@ -353,6 +353,59 @@ _grader_can_read() {  # <seat> <ident>
 # A customer-facing flow does not ship while its end-to-end arm is owed; this
 # one's arm is owed, so the surface ships dark rather than waiting in a branch.
 _GRADER_POOL="${_GRADER_POOL:-}"
+
+# Return the current working owner when assigning this row to a pool seat would
+# steal an active claim.  This is deliberately derived again in
+# `_grader_spawn_session`: the tick's plan and the eventual fleet mutation are
+# separated by several probes, and the owner may change between them.
+_grader_non_pool_working_owner() {  # <ident>
+  local ident="$1" row status owner seat
+  [[ -n "$ident" ]] || return 1
+  row=$(db "SELECT status||x'1f'||COALESCE(assignee,'') FROM tasks
+             WHERE ident=$(sqlq "$ident");" 2>/dev/null || printf '')
+  status="${row%%$'\x1f'*}"
+  owner="${row#*$'\x1f'}"
+  [[ "$row" == *$'\x1f'* && "$status" == "in_progress" && -n "$owner" ]] || return 1
+  for seat in $_GRADER_POOL; do
+    [[ "$owner" == "$seat" ]] && return 1
+  done
+  printf '%s' "$owner"
+}
+
+_grader_row_is_in_progress() {  # <ident>
+  [[ "$(db "SELECT status FROM tasks WHERE ident=$(sqlq "$1");" 2>/dev/null || printf '')" == "in_progress" ]]
+}
+
+# Close the durable request records whose answer is already known.  Dry-run
+# remains read-only: the pending query below independently excludes these rows,
+# while --commit appends the supersession receipt that prevents future readers
+# from repeatedly re-deriving the same stale request.
+_grader_supersede_resolved_requests() {
+  local rows req_id ident
+  rows=$(db "SELECT e.id||x'1f'||e.ident
+               FROM lifecycle_events e
+               JOIN tasks t ON t.ident=e.ident
+              WHERE e.kind='task.grade.requested'
+                AND NOT EXISTS (
+                      SELECT 1 FROM lifecycle_events n
+                       WHERE n.ident=e.ident AND n.id>e.id
+                         AND n.kind IN ('task.grade.requested','task.grade.spawned',
+                                        'task.grade.request.superseded'))
+                AND (
+                      t.status IN ('done','cancelled')
+                   OR t.handoff_delivered_at IS NULL
+                   OR t.handoff_rejected_at IS NOT NULL
+                   OR (t.graded_verdict_at IS NOT NULL AND t.graded_verdict_at>=e.ts)
+                   OR (t.graded_verdict_at IS NULL AND t.graded_at IS NOT NULL AND t.graded_at>=e.ts)
+                )
+              ORDER BY e.id;" 2>/dev/null || printf '')
+  while IFS=$'\x1f' read -r req_id ident; do
+    [[ "$req_id" =~ ^[0-9]+$ && -n "$ident" ]] || continue
+    ledger_emit task.grade.request.superseded ident="$ident" actor="$(task_actor "")" \
+      detail="grade request ${req_id} superseded by current row state" || true
+  done <<<"$rows"
+}
+
 cmd_task_grader_tick() {
   local commit=0 cap="$_GRADER_MAX_PER_ACCOUNT" json="${JSON_MODE:-0}" only=""
   while (( $# )); do
@@ -374,20 +427,30 @@ cmd_task_grader_tick() {
   done
   [[ "$cap" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "--cap takes a whole number"
 
-  # Pending = a request with no later spawn record, whose row is still open.
+  # Pending means the LATEST request is still a delivered, ungraded handoff.
+  # A legacy grade may have no graded_verdict_at, so graded_at is its fallback.
+  # >= is intentional: both clocks have one-second precision, and a verdict in
+  # the request's second must fail closed rather than purchase a duplicate grade.
+  (( commit )) && _grader_supersede_resolved_requests
   local pending
-  pending=$(db "SELECT DISTINCT e.ident FROM lifecycle_events e
+  pending=$(db "SELECT e.ident FROM lifecycle_events e
                   JOIN tasks t ON t.ident = e.ident
                  WHERE e.kind='task.grade.requested'
-                   AND t.status NOT IN ('done','cancelled')
-                   AND NOT EXISTS (SELECT 1 FROM lifecycle_events s
-                                    WHERE s.ident=e.ident AND s.kind='task.grade.spawned'
-                                      AND s.id > e.id)
+                   AND t.handoff_delivered_at IS NOT NULL
+                   AND t.handoff_rejected_at IS NULL
+                   AND NOT (t.graded_verdict_at IS NOT NULL AND t.graded_verdict_at >= e.ts)
+                   AND NOT (t.graded_verdict_at IS NULL AND t.graded_at IS NOT NULL AND t.graded_at >= e.ts)
+                   AND ((t.status='todo' AND (t.assignee IS NULL OR t.assignee=t.verifier))
+                        OR (t.status='in_progress' AND COALESCE(t.assignee,'')<>''))
+                   AND NOT EXISTS (SELECT 1 FROM lifecycle_events n
+                                    WHERE n.ident=e.ident AND n.id > e.id
+                                      AND n.kind IN ('task.grade.requested','task.grade.spawned',
+                                                     'task.grade.request.superseded'))
                  ORDER BY e.id;" 2>/dev/null || printf '')
 
   local usage="" ; usage=$($_GRADER_USAGE_CMD 2>/dev/null || printf '')
   local n_pending=0 n_spawn=0 n_queue=0 n_refuse=0 plan=""
-  local inflight; inflight=$(db "SELECT COUNT(*) FROM lifecycle_events s
+  local inflight; inflight=$(db "SELECT COUNT(DISTINCT s.ident) FROM lifecycle_events s
                                   WHERE s.kind='task.grade.spawned'
                                     AND NOT EXISTS (SELECT 1 FROM lifecycle_events d
                                                      WHERE d.ident=s.ident
@@ -399,6 +462,26 @@ cmd_task_grader_tick() {
   while IFS= read -r ident; do
     [[ -n "$ident" ]] || continue
     [[ -z "$only" || "$ident" == "$only" ]] || continue
+    local working_owner=""
+    working_owner=$(_grader_non_pool_working_owner "$ident" 2>/dev/null || printf '')
+    if [[ -n "$working_owner" ]]; then
+      n_refuse=$((n_refuse+1))
+      plan+="skip    $ident  (owner is $working_owner, not a pool seat)"$'\n'
+      if (( commit )); then
+        local _owner_req
+        _owner_req=$(db "SELECT id FROM lifecycle_events
+                          WHERE ident=$(sqlq "$ident") AND kind='task.grade.requested'
+                          ORDER BY id DESC LIMIT 1;" 2>/dev/null || printf '')
+        [[ "$_owner_req" =~ ^[0-9]+$ ]] && \
+          ledger_emit task.grade.request.superseded ident="$ident" actor="$(task_actor "")" \
+            detail="grade request ${_owner_req} superseded: owner is ${working_owner}, not a pool seat" || true
+      fi
+      continue
+    fi
+    # A pool seat already holding the claim IS the grader in flight; asking the
+    # lane for a second session would duplicate work even though no verdict has
+    # landed yet. Non-pool claims took the explicit safety line above.
+    _grader_row_is_in_progress "$ident" && continue
     n_pending=$((n_pending+1))
     # DIVE-4251: THE POLICY IS CHECKED FIRST, before the cap, the meter and the
     # credential probe — a row the customer's box grants no grader must cost this
@@ -481,6 +564,12 @@ cmd_task_grader_tick() {
 _grader_spawn_session() {  # <seat> <ident>
   local seat="$1" ident="$2"
   [[ -n "$seat" && -n "$ident" ]] || return 1
+  local working_owner=""
+  working_owner=$(_grader_non_pool_working_owner "$ident" 2>/dev/null || printf '')
+  if [[ -n "$working_owner" ]]; then
+    warn "$ident: skip — owner is $working_owner, not a pool seat"
+    return 2
+  fi
   5dive task assign "$ident" "$seat" >/dev/null 2>&1 || return 1
   # DIVE-4295: guard the wake so a spooled copy is dropped rather than typed if
   # the row closes or moves to another seat while it waits. `assignee_owns`, not

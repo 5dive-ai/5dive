@@ -224,12 +224,44 @@ audit_log() {
   local -a sanitized=()
   local a
   for a in "$@"; do
+    # DIVE-4297: two rules, and the SECOND is the one that was missing.
+    #
+    # The first (the exact --flag= list) is kept verbatim so nothing that was
+    # redacted before stops being redacted. The second matches on the KEY NAME
+    # of any `key=value` argument — flagged or positional, any case — because
+    # the leak this row was filed for was neither a flag nor in that list:
+    #
+    #   5dive agent config <seat> set telegram.token=<real bot token>
+    #
+    # `telegram.token=` is a POSITIONAL key=value pair, so it fell straight
+    # through to the `*)` arm and was written to /var/log/5dive/agent-audit.log
+    # in cleartext, on a 640 root:claude file every agent seat on the box can
+    # read, indefinitely (2 such values measured in the live log on 2026-09-11).
+    #
+    # Matching the key name rather than enumerating verbs is deliberate: the
+    # defect is the verbatim `args` capture, so a fix that only knew about
+    # `telegram.token` would be re-earned by the next verb that takes a secret
+    # as an argument. The KEY is kept and only the VALUE replaced, so the row
+    # still answers "what was set" — an audit line that lost the key name would
+    # trade one blind spot for another.
+    #
+    # Deliberately a denylist, and deliberately a wide one: over-redacting an
+    # argument named `--sort-key=name` costs a reader one field, under-redacting
+    # a credential costs a rotation. It is not a completeness claim — a secret
+    # passed under a key name carrying none of these words is still recorded,
+    # which is why the real rule remains "do not pass secrets as arguments".
     case "$a" in
       --api-key=*|--telegram-token=*|--discord-token=*|--code=*|--token=*)
-        sanitized+=("${a%%=*}=<redacted>") ;;
-      *)
-        sanitized+=("$a") ;;
+        sanitized+=("${a%%=*}=<redacted>"); continue ;;
     esac
+    if [[ "$a" == *=* ]]; then
+      local _k="${a%%=*}"
+      case "${_k,,}" in
+        *token*|*secret*|*key*|*password*|*passwd*|*credential*)
+          sanitized+=("$_k=<redacted>"); continue ;;
+      esac
+    fi
+    sanitized+=("$a")
   done
   # DIVE-2073: `unknown` used to mean TWO different things and the reader could
   # not tell them apart — "this process genuinely has no invoking user" (root

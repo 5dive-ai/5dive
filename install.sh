@@ -159,7 +159,7 @@ resolve_cli_target() {
     fi
   elif [[ -e "$canary_file" ]]; then
     target="$(resolve_gh_tag || true)"
-    source="canary newest release"
+    source="canary opt-in ($canary_file) — newest released tag, ahead of the fleet pin"
   else
     target="$(curl -fsSL --max-time 5 "$route" 2>/dev/null | tr -d '[:space:]')" || target=""
     if [[ "$target" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -196,6 +196,20 @@ resolve_cli_target() {
       return 1
     fi
   fi
+
+  # DIVE-4274. Say WHICH RUNG answered, not just what it answered.
+  #
+  # "Updates started", then the same version as before, with no reason given, is
+  # what produced "why it skipped update?" — the box was following the fleet pin
+  # and behaving exactly as designed, and nothing said so. The four rungs are
+  # indistinguishable from their result: a box on the pin and a box on the
+  # canary that happen to agree print the same tag.
+  #
+  # STDERR, not stdout: every caller captures this function with $(...) and the
+  # tag is the return value. A human-facing line on stdout would be appended to
+  # the tag and installed as a version string. It still reaches the operator —
+  # the nightly driver and the dashboard's update both keep stderr in the log.
+  printf '5dive install: CLI target %s — source: %s\n' "$target" "$source" >&2
 
   printf '%s\n' "$target"
 }
@@ -757,7 +771,8 @@ JOURNALD
   # receiver-side userprompt-mirror-inter-agent.sh below replaces it.
   rm -f "$LIB_DIR/mirror-agent-send.sh"
   for hook in stop-failure-telegram.sh resume-after-reset.sh run-loop.sh \
-              pretool-telegram-question.sh stop-telegram-reply-check.sh \
+              pretool-telegram-question.sh pretool-headless-question.sh \
+              stop-telegram-reply-check.sh \
               posttool-telegram-relay.sh userprompt-mirror-inter-agent.sh \
               stop-mirror-inter-agent.sh push-notify.sh \
               sessionstart-resume-context.sh; do
@@ -1029,7 +1044,7 @@ JOURNALD
   fi
 
   # DIVE-4196 — TEAM TEMPLATES ARE NO LONGER STAGED. They moved to the same
-  # marketplace registry the character packs come from (<org>/character-packs,
+  # marketplace registry the character packs come from (<org>/5dive-marketplace,
   # under teams/) and `5dive team` reads them live.
   #
   # Do not restore a staging loop here. Staging at install time is the defect,

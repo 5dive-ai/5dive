@@ -142,6 +142,39 @@ is 'a seat inside its cadence renders the bare badge' \
    "$(namecell fresh "$(_agent_list_table "$(mkrow fresh "$(hb 5 $((NOW-60)) $((NOW-60)) 'busy 1 in_progress')")" "$NOW")")" \
    'fresh ∿1m/5m'
 
+echo "== DIVE-4310: the stall window has a 15-minute FLOOR =="
+# Measured on the control plane 2026-09-11 11:44Z: quinn and main2 read OVERDUE
+# while both were mid-grade at a 1-minute cadence. 2x a 1m cadence is 120
+# SECONDS, so any turn longer than two minutes outruns the window and the seat
+# reads stalled while it is working. The window is now max(2x cadence, 15m).
+FAST=$(mkrow quinn "$(hb 1 $((NOW-10*60)))")            # 10m since the last wake, 1m cadence, never observed
+hasnt 'a 1m-cadence seat 10m past its wake is inside the floor' \
+      "$(namecell quinn "$(_agent_list_table "$FAST" "$NOW")")" '!'
+FAST2=$(mkrow quinn "$(hb 1 $((NOW-16*60)))")           # past the floor
+has   'and past 15m it flags again — the floor is not a mute' \
+      "$(namecell quinn "$(_agent_list_table "$FAST2" "$NOW")")" '!'
+EDGE_IN=$(mkrow edge2 "$(hb 1 $((NOW-900)))")           # exactly 15m
+EDGE_OUT=$(mkrow edge2 "$(hb 1 $((NOW-901)))")          # one second past
+hasnt 'exactly 15m is inside the window' "$(namecell edge2 "$(_agent_list_table "$EDGE_IN" "$NOW")")"  '!'
+has   'one second past 15m is outside'   "$(namecell edge2 "$(_agent_list_table "$EDGE_OUT" "$NOW")")" '!'
+# A FLOOR, never a cap: every cadence at or above 8 minutes is judged exactly as
+# before, which is the arm that keeps this from being a fleet-wide mute.
+SLOW=$(mkrow slow "$(hb 30 $((NOW-31*60)))")            # 31m at a 30m cadence: inside 2x (60m), as before
+hasnt 'a 30m-cadence seat inside 2x is not flagged' "$(namecell slow "$(_agent_list_table "$SLOW" "$NOW")")" '!'
+SLOW2=$(mkrow slow "$(hb 30 $((NOW-61*60)))")           # past 2x
+has 'a 30m-cadence seat past 2x still flags on 2x, not on 15m' \
+    "$(namecell slow "$(_agent_list_table "$SLOW2" "$NOW")")" '!'
+MED=$(mkrow med "$(hb 15 $((NOW-16*60)))")              # 16m at 15m: 2x=30m, floor irrelevant
+hasnt 'a 15m-cadence seat is unmoved by the floor' "$(namecell med "$(_agent_list_table "$MED" "$NOW")")" '!'
+# The observation window moves with it, or a fast seat seen working 10m ago is
+# still called stalled by the other half of the predicate.
+SEEN=$(mkrow fastseen "$(hb 1 $((NOW-3600)) $((NOW-600)) 'mid-turn')")
+hasnt 'an observation 10m old clears a 1m-cadence seat' \
+      "$(namecell fastseen "$(_agent_list_table "$SEEN" "$NOW")")" '!'
+SEEN2=$(mkrow fastseen "$(hb 1 $((NOW-3600)) $((NOW-1000)) 'mid-turn')")
+has 'an observation past the floor does not' \
+    "$(namecell fastseen "$(_agent_list_table "$SEEN2" "$NOW")")" '!'
+
 echo "== --json carries the verdict and the reason =="
 J=$(_agent_list_hb_json "$FOUR" "$NOW")
 is 'the busy seat is not overdue in json'   "$(jq -r '.[]|select(.name=="devops").heartbeatStatus.overdue' <<<"$J")" 'false'
@@ -179,8 +212,21 @@ n_seen=$(grep -c '_hb_mark_seen "\$name"' "$SRC/cmd_heartbeat.sh")
 is 'busy-skip, active-defer and no-work each record their decision' "$n_seen" '3'
 # The wake-failure path must NOT stamp: an undeliverable wake is the stall this
 # column exists to show, and stamping it would make the alarm unreachable.
+#
+# ANCHORED ON THE CODE LINE, NEVER ON THE PROSE. This arm used to anchor on the
+# verdict's text ("wake failed — will retry next tick"). DIVE-4310 reworded that
+# verdict to name the failing step and left the OLD string quoted in the comment
+# that explains why — so the text anchor matched a comment ~3000 lines earlier
+# and counted every stamp in the file below it: 3, not 0. The arm failed on a
+# change that did exactly what it was supposed to check for. A grep for a string
+# a comment may legitimately quote is not a structural predicate.
+FAIL_LN=$(grep -n '^[[:space:]]*sk_fail=\$((sk_fail + 1))' "$SRC/cmd_heartbeat.sh" | cut -d: -f1 | head -1)
+is 'the wake-failure verdict is exactly one code line' \
+   "$(grep -c '^[[:space:]]*sk_fail=\$((sk_fail + 1))' "$SRC/cmd_heartbeat.sh")" '1'
 is 'the wake-failure path stamps nothing' \
-   "$(awk '/wake failed — will retry next tick/{found=1} found && /_hb_mark_seen/{c++} END{print c+0}' "$SRC/cmd_heartbeat.sh")" '0'
+   "$(sed -n "${FAIL_LN},\$p" "$SRC/cmd_heartbeat.sh" | grep -c '_hb_mark_seen')" '0'
+has 'and the verdict names the step that failed' \
+    "$(sed -n "${FAIL_LN}p" "$SRC/cmd_heartbeat.sh")" '_HB_WAKE_FAIL_REASON'
 
 printf '\nPASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
