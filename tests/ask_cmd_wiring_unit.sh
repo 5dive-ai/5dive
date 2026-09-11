@@ -52,6 +52,7 @@ die() { echo "FAIL: $*" >&2; exit 1; }
 # mid-write frame and nothing after it. The instrument works.)
 WORK="$(mktemp -d)"
 FRAME_F="$WORK/frame_n"; echo 0 > "$FRAME_F"
+ROUND_F="$WORK/round_calls"; : > "$ROUND_F"
 
 JSON_MODE=0
 MID="feed1234"
@@ -93,8 +94,12 @@ auto_sender_from_sudo()     { echo dev; }
 _envelope_caller()          { echo dev; }
 envelope_tier()             { echo standard; }
 envelope_via()              { :; }
+envelope_provenance()       { [[ "$1" == "$2" ]] && echo corroborated || echo divergent; }
+envelope_peer_forgery()     { :; }
 gen_msg_id()                { echo "$MID"; }
 step()                      { :; }
+a2a_round_guard()           { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$ROUND_F"; }
+_buzz_mirror_outbound()     { :; }
 
 # --- the crash that shipped -------------------------------------------------
 a2a_needs_scoped() { return 1; }   # DIRECT branch — where it died
@@ -103,13 +108,35 @@ got=$(cmd_ask ada "ping" --from=dev --timeout=30 --idle-secs=1 --poll-secs=1) \
   || die "cmd_ask DIRECT branch failed outright (set -u crash?)"
 [[ "$got" == "WIRED-OK" ]] || die "direct branch: expected WIRED-OK, got: [$got]"
 ok_ "cmd_ask runs the DIRECT branch under set -u and returns the fenced reply"
+[[ "$(cat "$ROUND_F")" == $'dev\tada\tping' ]] \
+  || die "direct branch must grade and record exactly once; got [$(cat "$ROUND_F")]"
+ok_ "a full-trust ask reaches the shared round guard exactly once"
 
 a2a_needs_scoped() { return 0; }   # SCOPED branch
 echo 0 > "$FRAME_F"
+: > "$ROUND_F"
 got=$(cmd_ask ada "ping" --from=dev --timeout=30 --idle-secs=1 --poll-secs=1) \
   || die "cmd_ask SCOPED branch failed outright (set -u crash?)"
 [[ "$got" == "WIRED-OK" ]] || die "scoped branch: expected WIRED-OK, got: [$got]"
 ok_ "cmd_ask runs the SCOPED branch under set -u and returns the fenced reply"
+[[ ! -s "$ROUND_F" ]] \
+  || die "scoped cmd_ask graded locally and would be counted again by cmd_deliver: [$(cat "$ROUND_F")]"
+ok_ "a scoped ask skips the local guard so cmd_deliver remains its single recorder"
+
+# --- ordinary provenance uses the measured caller, never the verb name -------
+a2a_needs_scoped() { return 1; }
+auto_sender_from_sudo() { :; }
+echo 0 > "$FRAME_F"; : > "$ROUND_F"
+cmd_ask ada "DIVE-4277 provenance" --timeout=30 --idle-secs=1 --poll-secs=1 > "$WORK/reply" \
+  || die "ordinary direct ask failed"
+[[ "$(cat "$WORK/reply")" == "WIRED-OK" ]] || die "ordinary ask reply mismatch"
+_audit_blob="$(printf '%s\n' "${AUDIT_ARGS[@]}")"
+grep -qx 'from_claimed=dev' <<<"$_audit_blob" \
+  && grep -qx 'from_derived=dev' <<<"$_audit_blob" \
+  && grep -qx 'provenance=corroborated' <<<"$_audit_blob" \
+  || die "ordinary ask audit is not corroborated: [${AUDIT_ARGS[*]}]"
+ok_ "an ordinary ask audits the derived agent as corroborated provenance"
+auto_sender_from_sudo() { echo dev; }
 
 # --- the flag exists and reaches the extractor ------------------------------
 a2a_needs_scoped() { return 1; }

@@ -2627,15 +2627,28 @@ cmd_ask() {
   local use_scoped=0
   a2a_needs_scoped "$name" && use_scoped=1
 
+  # DIVE-4277: a scoped ask reaches this same guard in cmd_deliver after the
+  # sudo re-exec. The full-trust path does not, so grade it here and only here:
+  # every real ask is recorded once, and the existing soft-cap warning applies
+  # to ask exactly as it does to send without double-counting scoped callers.
+  local _gcaller _a2a_refusal
+  _gcaller="$(_envelope_caller)"
+  if (( ! use_scoped )); then
+    if ! _a2a_refusal="$(a2a_round_guard "$_gcaller" "$name" "$message")"; then
+      fail "$E_VALIDATION" "$_a2a_refusal"
+    fi
+  fi
+
   # Resolve sender — ask always wraps because we need a marker to slice the reply
   # window. On the scoped path `_deliver` re-derives the sender + tier from the
   # real sudo caller, so this local `sender` is only for this command's JSON
-  # summary. Fall back to a literal "ask" if we can't infer one.
+  # summary. Use the same measured caller as the guard/audit path; the literal
+  # fallback exists only for a genuinely unmeasurable process.
   local sender msg_id
   if (( from_set )); then
     sender="$from"
   else
-    sender="$(auto_sender_from_sudo)"
+    sender="$_gcaller"
   fi
   [[ -n "$sender" ]] || sender="ask"
   valid_sender_label "$sender" \
@@ -2648,7 +2661,6 @@ cmd_ask() {
   # `_gcaller` is the same resolver as `_audit_caller` and `_dcaller` below
   # (DIVE-2281's one-resolver rule), so the refusal, the audit row and the rendered
   # via= cannot disagree about who called.
-  local _gcaller; _gcaller="$(_envelope_caller)"
   _agent_refuse_peer_forgery "$sender" "$_gcaller" ask
   msg_id="$(gen_msg_id)"
 
