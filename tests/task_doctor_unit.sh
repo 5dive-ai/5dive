@@ -38,6 +38,12 @@
 #   T16  --fix changes exactly ONE row; there is no --all
 #   T17  --to / --dry-run without --fix are REFUSED, not parsed into nothing
 #   T18  --fix with no row argument is refused
+#   T19  DIVE-4269: "dispatchable now" EXCLUDES todo rows on a lane nothing wakes
+#        (the filed defect: this verb printed the reassuring number and the
+#        contradicting findings in the same run), T19b both numbers + the reason
+#        are rendered, T19c a dead VERIFIER is NOT subtracted (it strands later)
+#   T20  the fleet line names the enrolled share + the unarmed supervisor tick,
+#        T20b and says nothing at all on a healthy fleet
 # Run: bash tests/task_doctor_unit.sh   (no root, no network)
 set -uo pipefail
 
@@ -217,10 +223,77 @@ park_line=$(grep -A3 -F "$(ident "$t_wakepast")" "$TMP/err" | grep -F -- '-> 5di
 # drift apart either.
 cens_open=$(printf '%s' "$out" | jq -r '.data.census.open')
 cens_disp=$(printf '%s' "$out" | jq -r '.data.census.dispatchable')
-{ grep -qF -- "open ${cens_open}: ${cens_disp} dispatchable now," "$TMP/err" \
+{ grep -qF -- "open ${cens_open}: ${cens_disp} dispatchable now" "$TMP/err" \
     && grep -qF -- "awaiting a human gate" "$TMP/err"; } \
   && ok_t "the findings run prints the census text too (open ${cens_open}, ${cens_disp} dispatchable now)" \
   || bad_t "census absent from the findings path" "$(cat "$TMP/err")"
+
+# ---- T19 (DIVE-4269): "dispatchable now" EXCLUDES rows on a dead lane -------
+# The filed defect: this verb printed "64 dispatchable now" in the same run as it
+# listed 65 dead-lane findings. `t_dead` is a plain todo assigned to `zombie`, a
+# registered seat with no heartbeat key — it is a dead-lane FINDING above, so it
+# must not also be counted as work that will flow.
+#
+# ANCHOR THE DIFFERENCE, NOT THE TOTAL. `dispatchable == todo - todoOnDeadLane`
+# is the property; asserting a bare number would pass if both moved together (the
+# exact shape of the bug: one count used for two questions). And `todo` must
+# still carry the RAW board count, because a reader who wants "how many rows say
+# todo" must still be able to get it.
+c_todo=$(printf '%s' "$out" | jq -r '.data.census.todo')
+c_stall=$(printf '%s' "$out" | jq -r '.data.census.todoOnDeadLane')
+{ [[ "$c_stall" == "1" ]] && [[ "$cens_disp" == "$(( c_todo - 1 ))" ]] && [[ "$cens_disp" -lt "$c_todo" ]]; } \
+  && ok_t "census: dispatchable (${cens_disp}) = todo (${c_todo}) minus the ${c_stall} row on a lane nothing wakes" \
+  || bad_t "census counts a dead-lane row as dispatchable" "todo=$c_todo todoOnDeadLane=$c_stall dispatchable=$cens_disp"
+
+# ---- T19b: BOTH numbers are rendered, with the reason -----------------------
+# The honest number alone would be a silent shrink: the reader could no longer
+# see that a row is addressed to a seat nothing wakes, which IS the finding.
+{ grep -qF -- "${c_todo} todo, ${c_stall} of them on a lane nothing wakes" "$TMP/err" \
+    && grep -qF -- "5dive heartbeat on" "$TMP/err"; } \
+  && ok_t "the census line prints both numbers and names the remedy for the stall" \
+  || bad_t "census stall note missing" "$(grep -F 'dispatchable now' "$TMP/err")"
+
+# ---- T19c: a dead VERIFIER is NOT subtracted --------------------------------
+# That row dispatches fine and strands one step later, at handoff — which is what
+# its own explain line says. Subtracting it here would make the footer disagree
+# with the finding in the other direction.
+t_deadv=$(addt --assignee=live --verifier=zombie -- "live maker, grader nothing wakes")
+out_dv=$(doctor)
+dv_i=$(ident "$t_deadv")
+{ [[ "$(reason_of "$out_dv" "$dv_i")" == "dead-verifier" ]] \
+    && [[ "$(printf '%s' "$out_dv" | jq -r '.data.census.todoOnDeadLane')" == "1" ]] \
+    && [[ "$(printf '%s' "$out_dv" | jq -r '.data.census.dispatchable')" == "$(( $(printf '%s' "$out_dv" | jq -r '.data.census.todo') - 1 ))" ]]; } \
+  && ok_t "a dead-verifier row is a finding but still counts as dispatchable now (it strands at handoff, not now)" \
+  || bad_t "dead-verifier subtracted from dispatchable" "$(printf '%s' "$out_dv" | jq -rc '.data.census')"
+db "DELETE FROM tasks WHERE id=${t_deadv};"
+out=$(doctor)
+
+# ---- T20: the fleet line names WHY the board keeps producing dead lanes -----
+# Per-row remedies do not answer "65 rows on dead lanes at once". The fixture
+# registry is 4 seats, 2 enrolled, and no supervisor.enabled flag.
+{ grep -qF -- "2/4 seats carry a heartbeat" "$TMP/err" \
+    && grep -qF -- "supervisor tick is NOT armed" "$TMP/err" \
+    && [[ "$(printf '%s' "$out" | jq -r '.data.fleet | length > 0')" == "true" ]]; } \
+  && ok_t "the fleet line reports the enrolled share and the unarmed supervisor tick" \
+  || bad_t "fleet line missing" "$(cat "$TMP/err" | tail -5)"
+
+# ---- T20b: a fully-enrolled fleet with an armed supervisor says NOTHING -----
+# A note that prints on a healthy fleet is noise on every run, and noise is how
+# the create-time warning this row also fixes came to be ignored.
+cat > "$TMP/agents.json" <<'JSON'
+{"agents":{"live":{"type":"claude","heartbeat":{"enabled":true}}}}
+JSON
+: > "$TMP/supervisor.enabled"
+reroster
+out_h=$(doctor)
+{ [[ "$(printf '%s' "$out_h" | jq -r '.data.fleet')" == "null" ]] \
+    && ! grep -qF -- "seats carry a heartbeat" "$TMP/err"; } \
+  && ok_t "a fully-enrolled fleet with an armed supervisor prints no fleet line" \
+  || bad_t "fleet line printed on a healthy fleet" "$(printf '%s' "$out_h" | jq -rc '.data.fleet')"
+rm -f "$TMP/supervisor.enabled"
+mk_registry
+reroster
+out=$(doctor)
 
 # ---- T7b: it REPORTS, it does not FIX ---------------------------------------
 still=$(db "SELECT status FROM tasks WHERE id=${t_noanchor};")

@@ -2013,6 +2013,9 @@ cmd_create() {
   local byo_provider="" byo_api_key="" byo_model="" byo_base_url=""
   local skills_arg="" skills_set=0 no_skills=0 defer_auth=0
   local isolation="" isolation_explicit=0 no_team_bot=0
+  # DIVE-4269: a created seat is ENROLLED in the heartbeat by default. See the
+  # enrolment block near the self-check for why the default flipped.
+  local no_heartbeat=0 heartbeat_every=""
   local autonomy="standard"   # DIVE-499
   local can_push=0            # DIVE-1462/STEER-4: delegated-push (builder) capability
   local can_deploy=0          # INST-5: delegated-deploy (production ship) capability
@@ -2038,6 +2041,8 @@ cmd_create() {
       --with-skills=*)             skills_arg="${1#--with-skills=}"; skills_set=1 ;;
       --no-skills)                 no_skills=1 ;;
       --no-team-bot)               no_team_bot=1 ;;
+      --no-heartbeat)              no_heartbeat=1 ;;
+      --heartbeat-every=*)         heartbeat_every="${1#--heartbeat-every=}" ;;
       --defer-auth)                defer_auth=1 ;;
       --isolation=*)               isolation="${1#--isolation=}"; isolation_explicit=1 ;;
       --inherit-memory=*)          inherit_memory="${1#--inherit-memory=}" ;;
@@ -2048,7 +2053,7 @@ cmd_create() {
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--base-url=<url>] [--model=<slug>] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--defer-auth] [--isolation=admin|standard|sandboxed] [--can-push] [--can-deploy] [--inherit-memory=wiki|all|team|<agent>[,...]]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--base-url=<url>] [--model=<slug>] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--no-heartbeat] [--heartbeat-every=<dur>] [--defer-auth] [--isolation=admin|standard|sandboxed] [--can-push] [--can-deploy] [--inherit-memory=wiki|all|team|<agent>[,...]]"
   [[ -n "$type" ]] || fail "$E_USAGE" "--type is required"
   valid_name "$name" || fail "$E_VALIDATION" "invalid name (lowercase letters/digits/hyphens, start letter, <=16 chars)"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type (known: ${!TYPE_BIN[*]})"
@@ -3048,13 +3053,62 @@ cmd_create() {
       _hc_issues+=("telegram getMe FAILED (agent is BLIND) — token may be wrong/revoked; re-check: 5dive agent telegram-getme --token=<token>")
     fi
   fi
-  # autonomy: heartbeat enrolled so the agent self-acts on board tasks. Create
-  # never wires heartbeat, so this normally fires — that's the point (DIVE-1197
-  # gap "no heartbeat = won't self-act").
+  # ---- DIVE-4269: ENROL THE SEAT. The default flipped, and here is why. -----
+  #
+  # Create used to wire no heartbeat at all, and the self-check below merely
+  # REPORTED the gap ("that's the point", said the old comment). Measured on a
+  # customer box 2026-09-11: 7 of 37 seats enrolled, 65 open rows addressed to
+  # the other 30, and every surface — `task assign`, `task ls`, this verb's own
+  # PASS line — reporting success over a board nothing would ever pick up. A
+  # warning that is printed once at create and then never again does not survive
+  # contact with a 37-seat fleet; it is read as a to-do and lost.
+  #
+  # WHAT THE DEFAULT ACTUALLY ASSERTS: "a seat you created is meant to work."
+  # That is the same thing `create` already asserted by calling its absence an
+  # ISSUE. The old behaviour was the product disagreeing with itself, and the
+  # honest reading of that disagreement is that the report was right and the
+  # default was wrong.
+  #
+  # THE OPT-OUT IS REAL AND NAMED: `--no-heartbeat` for a seat a human drives.
+  # The self-check then reports it as a CHOICE, not a gap, so the one case the
+  # old default served is the one case that now has to be typed.
+  #
+  # SPEND: an enrolled seat with an empty queue costs a tick that reads the board
+  # and returns — `_hb_wake` fires only on a dispatchable todo. The cost is a
+  # seat that works the rows you assigned it, which is the cost of creating it.
+  #
+  # An enrolment failure NEVER fails the create: the agent is already up. It
+  # falls through to the self-check below, which then reports the seat asleep in
+  # the same words it always did.
+  if (( no_heartbeat )); then
+    step "heartbeat NOT enrolled for '$name' (--no-heartbeat) — nothing will wake it, so board rows assigned to it wait for a human to drive it"
+  else
+    local -a _hb_args=( "$name" )
+    [[ -n "$heartbeat_every" ]] && _hb_args+=( "--every=$heartbeat_every" )
+    # SUBSHELL, deliberately. `cmd_heartbeat_on` ends in `ok` and guards itself
+    # with `require_root`/`require_agent`, all three of which EXIT. Called inline
+    # that would end `create` at the last step of a successful provision — either
+    # silently (`ok`) or on a root check create has already passed. The subshell
+    # turns every one of those exits into a status this block can report on,
+    # which is the only behaviour that is safe here: the agent is already up, so
+    # nothing about enrolment may fail the create.
+    if ( with_registry_lock cmd_heartbeat_on "${_hb_args[@]}" ) >/dev/null 2>&1; then
+      step "heartbeat enrolled for '$name'${heartbeat_every:+ (every $heartbeat_every)} — the tick will hand it board work (opt out at create with --no-heartbeat; turn it off later with: sudo 5dive heartbeat off $name)"
+    else
+      warn "heartbeat enrolment FAILED for '$name' — the agent is up but nothing will wake it. Enrol it by hand: sudo 5dive heartbeat on $name"
+    fi
+  fi
+
+  # autonomy: heartbeat enrolled so the agent self-acts on board tasks. Since
+  # DIVE-4269 create enrols by default, so this fires only after --no-heartbeat
+  # or a failed enrolment — and those two want different words, because one is a
+  # choice and the other is a defect.
   local _hb
   _hb=$(jq -r --arg n "$name" '.agents[$n].heartbeat.enabled // false' <<<"$(registry_read)" 2>/dev/null || echo false)
   if [[ "$_hb" == "true" ]]; then
     _hc_ok+=("heartbeat on")
+  elif (( no_heartbeat )); then
+    _hc_ok+=("heartbeat off by request (--no-heartbeat) — human-driven seat, board rows assigned here are not auto-dispatched")
   else
     _hc_issues+=("no heartbeat (agent is ASLEEP — won't self-act on board work): sudo 5dive heartbeat on $name")
   fi
