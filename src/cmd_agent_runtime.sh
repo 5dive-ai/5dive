@@ -1168,11 +1168,17 @@ _a2a_queued_reason() {
 #     open, still assigned to this seat as its verifier, and still unacked.
 #   verifier_owns    — the (a4) answered-gate nag. Still true iff the row is
 #     open and still assigned to this seat as its verifier. No ack clause: that
-#     rail exists precisely for rows whose ack is already stamped.
+#     rail exists precisely for rows whose ack is already stamped — which is why
+#     it needs the graded clause below explicitly, where verifier_unacked got it
+#     for free.
 #   assignee_owns    — the grader-pool "go grade this" wake. Assignment only,
 #     NO verifier clause: the pool assigns a grading session to a pool seat that
 #     is not the row's `verifier` column, so requiring verifier=seat there would
 #     read false on every healthy row and drop the wake that makes the pool work.
+#
+# EVERY condition additionally drops a row that already carries a verifier
+# verdict for its CURRENT iteration — the third drop condition in the row's DO,
+# reasoned out at the clause itself below.
 #
 # rc 0 = still true, deliver · rc 1 = no longer true, DROP · rc 2 = could not
 # be evaluated.
@@ -1201,6 +1207,43 @@ _a2a_guard_holds() {
     assignee_owns)    extra="" ;;
     *) return 2 ;;
   esac
+  # THE THIRD DROP CONDITION (DIVE-4295 iteration 2, quinn's reject). The row's
+  # DO lists three: done/cancelled, assignee moved, "or if a verifier result is
+  # already recorded for the current iteration". Iteration 1 implemented the
+  # first two and got the third only ACCIDENTALLY, on the verifier_unacked rail,
+  # via `handoff_ack_at IS NULL` — so the answered-gate rail (verifier_owns)
+  # still nagged a row its own grader had already graded. Measured: at 11:02:15Z
+  # quinn read the answered-gate nag for DIVE-4295 ITSELF ("grading is yours ...
+  # `task start` then `task done`/`task reject`") while the row read
+  # status=in_progress, assignee=quinn, verifier=quinn, handoff_ack_at=10:52:21,
+  # graded_verdict=pass at 10:55:47. Under iteration 1's predicate every clause
+  # passed and it was delivered.
+  #
+  # WHY IT IS NOT DEFENSIBLE TO KEEP NAGGING A GRADED ROW. The close IS still
+  # owed on such a row, so there is an argument for waking someone — but not
+  # this someone with this verb. Both rails tell the seat to run `task start`
+  # then `task done`/`task reject`, which on a row that already carries a
+  # verdict is an instruction to write a SECOND verdict over a first. That is
+  # the exact hazard this ticket was filed on ("a grader who starts trusting
+  # these will eventually re-grade something"). A row waiting on a merge it does
+  # not own is a MERGE-owner problem (merge_owner, DIVE-4137), not a grading
+  # nag, so the right move is silence on this rail rather than a softer verb.
+  #
+  # CURRENT iteration, not "ever graded": handoff_delivered_at is stamped fresh
+  # on EVERY delivery (src/task/delivery.sh), so a verdict older than it belongs
+  # to a previous iteration and must NOT mute the new one — otherwise one grade
+  # would silence the rail for the life of the row. COALESCE picks up a legacy
+  # row graded before graded_verdict_at existed (DIVE-3430); graded_at is
+  # COALESCE'd at write time (first grade wins), so on a re-delivered row it is
+  # older than handoff_delivered_at and correctly does not mute.
+  #
+  # Both NULLs deliver, which is the fail-open direction this whole function
+  # takes: no verdict recorded, or no delivery recorded (a row that never went
+  # through the maker->verifier loop at all), means nothing establishes a
+  # current-iteration verdict and the message is not ours to drop.
+  extra+=" AND (COALESCE(graded_verdict_at, graded_at) IS NULL
+                OR handoff_delivered_at IS NULL
+                OR COALESCE(graded_verdict_at, graded_at) < handoff_delivered_at)"
   n=$(db "SELECT COUNT(*) FROM tasks
           WHERE COALESCE(ident,'DIVE-'||id)=$(sqlq "$ident")
             AND status NOT IN ('done','cancelled')

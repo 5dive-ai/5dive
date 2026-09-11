@@ -22,7 +22,12 @@
 #     because the sweep already burned its throttle column and a wrong drop is
 #     permanent where a wrong delivery costs one re-investigation;
 #   * a stale message at the HEAD of the queue does not cost a tick: the drop
-#     loop reaches the live message behind it in the same flush.
+#     loop reaches the live message behind it in the same flush;
+#   * a row carrying a verifier VERDICT for its current iteration produces no
+#     nag on ANY rail, while the same row with the verdict cleared still nags,
+#     and a verdict from a PREVIOUS iteration does not mute the current one
+#     (iteration 2 — the answered-gate rail delivered a nag for DIVE-4295
+#     itself at 11:02:15Z to the seat that had graded it at 10:55:47).
 #
 # Boundaries only are stubbed (tmux, the idle predicate, sudo). The spool writes
 # and reads real files, and the board is a real throwaway sqlite tasks db, so
@@ -78,7 +83,9 @@ _hb_log()                 { printf 'HBLOG %s\n' "$*" >>"${TMPROOT}/hb.log"; }
 STATE_DIR="$TMPROOT"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 mkdir -p "$TASKS_DIR"
 db "CREATE TABLE tasks (id INTEGER PRIMARY KEY, ident TEXT, status TEXT,
-                        assignee TEXT, verifier TEXT, handoff_ack_at TEXT);" >/dev/null
+                        assignee TEXT, verifier TEXT, handoff_ack_at TEXT,
+                        handoff_delivered_at TEXT, graded_at TEXT,
+                        graded_verdict_at TEXT);" >/dev/null
 row() { db "INSERT INTO tasks (ident,status,assignee,verifier,handoff_ack_at)
             VALUES ($(sqlq "$1"),$(sqlq "$2"),$(sqlq "$3"),$(sqlq "$4"),$5);" >/dev/null; }
 #    ident        status       assignee verifier  ack
@@ -86,6 +93,22 @@ row 'DIVE-LIVE'  'todo'       'quinn'  'quinn'   'NULL'          # delivered, un
 row 'DIVE-DONE'  'done'       'quinn'  'quinn'   'NULL'          # graded + merged
 row 'DIVE-BOUNCED' 'todo'     'dev2'   'quinn'   "'2026-09-11'"  # graded, rejected to maker
 row 'DIVE-ACKED' 'in_progress' 'quinn' 'quinn'   "'2026-09-11'"  # started by the verifier
+
+# Rows carrying a VERDICT, for the third drop condition. graded_verdict_at is
+# compared against handoff_delivered_at, never against "ever" — a verdict from a
+# previous iteration must not mute the nag for the current one.
+rowg() { db "INSERT INTO tasks (ident,status,assignee,verifier,handoff_ack_at,
+                                handoff_delivered_at,graded_at,graded_verdict_at)
+             VALUES ($(sqlq "$1"),$(sqlq "$2"),$(sqlq "$3"),$(sqlq "$4"),$5,$6,$7,$8);" >/dev/null; }
+#     ident            status        assignee verifier  ack                      delivered                  graded_at                  verdict_at
+# The LIVE counter-example quinn read at 11:02:15Z: DIVE-4295 itself, graded 10:55:47 and nagged anyway.
+rowg 'DIVE-GRADED'   'in_progress' 'quinn' 'quinn' "'2026-09-11 10:52:21'" "'2026-09-11 10:40:00'" "'2026-09-11 10:55:47'" "'2026-09-11 10:55:47'"
+# Same shape, but the verdict belongs to the PREVIOUS iteration — re-delivered at 11:10.
+rowg 'DIVE-REGRADE'  'todo'        'quinn' 'quinn' 'NULL'                  "'2026-09-11 11:10:00'" "'2026-09-11 09:00:00'" "'2026-09-11 09:00:00'"
+# Graded before graded_verdict_at existed (DIVE-3430): only graded_at is set.
+rowg 'DIVE-LEGACY'   'in_progress' 'quinn' 'quinn' "'2026-09-11 10:52:21'" "'2026-09-11 10:40:00'" "'2026-09-11 10:55:47'" 'NULL'
+# A verdict with NO recorded delivery — nothing establishes a current iteration.
+rowg 'DIVE-NODELIV'  'in_progress' 'quinn' 'quinn' "'2026-09-11 10:52:21'" 'NULL'                  "'2026-09-11 10:55:47'" "'2026-09-11 10:55:47'"
 
 typed_count() { grep -c -- 'send-keys -t [^ ]* -l --' "$TYPED" 2>/dev/null || true; }
 spool_count() { find "$(_a2a_queue_dir "$1")" -maxdepth 1 -name '*.msg' 2>/dev/null | wc -l | tr -d ' '; }
@@ -167,6 +190,56 @@ _SAVED_DB="$TASKS_DB"; TASKS_DB="${TMPROOT}/tasks/nonexistent-dir/tasks.db"
 IDLE_RC=0 a2a_queue_flush_one quinn >/dev/null 2>&1 || true
 TASKS_DB="$_SAVED_DB"
 is "T5: unreadable board delivers rather than drops" "1" "$(typed_count)"
+
+# --- T6: THE THIRD DROP CONDITION — a verdict for the CURRENT iteration ------
+# DIVE-4295 iteration 2. The row's DO named three drop conditions; iteration 1
+# implemented two and picked up the third only accidentally on verifier_unacked
+# (via `handoff_ack_at IS NULL`), so the answered-gate rail nagged a row its own
+# grader had already graded — measured on DIVE-4295 ITSELF at 11:02:15Z. The
+# arms below are the pair in BOTH directions: a graded row is silent, and the
+# same row with the verdict cleared still nags.
+for arm in \
+  "DIVE-GRADED:verifier_owns:1:a verdict for the current iteration silences the answered-gate rail" \
+  "DIVE-GRADED:assignee_owns:1:and silences the grader-pool wake" \
+  "DIVE-GRADED:verifier_unacked:1:and the delivered-unacked rail (already true via the ack clause)" \
+  "DIVE-REGRADE:verifier_owns:0:a verdict OLDER than this delivery does NOT mute the new iteration" \
+  "DIVE-REGRADE:assignee_owns:0:same, on the pool wake" \
+  "DIVE-LEGACY:verifier_owns:1:a pre-DIVE-3430 grade (graded_at only) still counts as a verdict" \
+  "DIVE-NODELIV:verifier_owns:0:a verdict with no recorded delivery fails OPEN, like every other NULL" \
+  "DIVE-ACKED:verifier_owns:0:an acked but UNGRADED row is still nagged — the close really is owed" ; do
+  IFS=':' read -r i c want label <<<"$arm"
+  got=0; _a2a_guard_holds "task:${i}:quinn:${c}" || got=$?
+  is "T6: ${label}" "$want" "$got"
+done
+
+# The other direction on the SAME row, not a different one: clear the verdict and
+# the identical predicate must deliver again. This is what stops the clause from
+# being satisfied by something else about DIVE-GRADED.
+db "UPDATE tasks SET graded_at=NULL, graded_verdict_at=NULL WHERE ident='DIVE-GRADED';" >/dev/null
+got=0; _a2a_guard_holds "task:DIVE-GRADED:quinn:verifier_owns" || got=$?
+is "T6: the SAME row with its verdict cleared nags again" "0" "$got"
+db "UPDATE tasks SET graded_at='2026-09-11 10:55:47', graded_verdict_at='2026-09-11 10:55:47'
+    WHERE ident='DIVE-GRADED';" >/dev/null
+got=0; _a2a_guard_holds "task:DIVE-GRADED:quinn:verifier_owns" || got=$?
+is "T6: and is silent again once restored" "1" "$got"
+
+# --- T7: end to end on the rail that was actually wrong ----------------------
+# T2 drives verifier_unacked; the live defect arrived on verifier_owns, so the
+# spool-then-flush path is pinned there too rather than assumed to follow.
+reset_arm
+_rc=0
+IDLE_RC=1 _A2A_GUARD="task:DIVE-GRADED:quinn:verifier_owns" \
+  inject_and_submit quinn "✅ DIVE-GRADED: the human gate was ANSWERED 63m ago. Pick it back up" || _rc=$?
+is "T7: the answered-gate nag spooled while busy (rc 4)" "4" "$_rc"
+IDLE_RC=0 a2a_queue_flush_one quinn >/dev/null 2>&1 || true
+is "T7: a graded row's spooled answered-gate nag is DROPPED, not typed" "0" "$(typed_count)"
+is "T7: spool drained" "0" "$(spool_count quinn)"
+
+reset_arm
+IDLE_RC=1 _A2A_GUARD="task:DIVE-REGRADE:quinn:verifier_owns" \
+  inject_and_submit quinn "✅ DIVE-REGRADE: the human gate was ANSWERED 63m ago. Pick it back up" >/dev/null 2>&1 || true
+IDLE_RC=0 a2a_queue_flush_one quinn >/dev/null 2>&1 || true
+is "T7: a re-delivered row's answered-gate nag is still DELIVERED" "1" "$(typed_count)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
