@@ -290,6 +290,13 @@ out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
 # merge_owner/merge_hold_reason on main. The merged tree contains both pairs, so
 # the value below was READ from a fresh tasks_db_init result on the merged tree;
 # it was not derived by adding either branch's delta.
+#
+# 101 -> 102 (DIVE-4324, 2026-09-11): `review_mode` — the persisted filing-time
+# reviewer choice (none | check | temp | seat:<agent>), so a row records WHO was
+# asked to grade it at the moment it was filed. READ off a fresh tasks_db_init on
+# the MERGED tree, as the header above instructs (`bad` patched to print its
+# detail, one run, `count=102` with got==want and rc=0, patch reverted); not
+# derived by adding this branch's one-column delta.
 
 fresh_tree
 out=$(tasks_db_init 2>&1); rc=$?
@@ -299,8 +306,8 @@ actual=$(sqlite3 "$TASKS_DB" \
     WHERE name IN ('delivery_ref','delivered_at','delivery_ref_iteration','parked_at','park_reason','escalated_at','escalated_by','human_evidence')
     ORDER BY name;" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
 column_count=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM pragma_table_info('tasks');" 2>/dev/null)
-[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "101" ]] \
-  && ok "fresh schema: all 101 columns, including the eight former holes, are present" \
+[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "102" ]] \
+  && ok "fresh schema: all 102 columns, including the eight former holes, are present" \
   || bad "fresh schema: init returned a partial tasks table" "rc=$rc count=$column_count got=[$actual] want=[$required] out=$out"
 
 # --- Case 10 (DIVE-2197): migrate arm still rejects a failed ALTER ------------
