@@ -1134,8 +1134,22 @@ _a2a_should_queue() {
 
 # Reason string for the rc-4 receipt. One definition, because `send` and the
 # scoped `_deliver` must not disagree about why sent:false (DIVE-2362's rule).
+#
+# DIVE-4296: it now names the DEPTH. A sender that is told only "queued, delivers
+# at its next idle" has no way to tell a 1-deep spool from the 15-deep one quinn
+# was carrying at 07:35Z, and so narrates "async by design" to a human who has
+# been waiting an hour. Position and the force verb are the two facts that turn
+# the receipt into a decision. The pre-4296 sentence is preserved verbatim as the
+# prefix — callers (and tests) that match on it are unaffected.
 _a2a_queued_reason() {
-  printf '%s\n' "target is mid-attempt — queued, delivers at its next idle or wake (DIVE-4214)"
+  local depth="${1:-}" base
+  base="target is mid-attempt — queued, delivers at its next idle or wake (DIVE-4214)"
+  if [[ "$depth" =~ ^[0-9]+$ ]] && (( depth > 0 )); then
+    base="${base}; it is #${depth} in that seat's spool"
+    if (( depth > 1 )); then base="${base} ($(( depth - 1 )) ahead of it)"; fi
+    base="${base}. The heartbeat drains the spool as the seat goes idle, about one message per turn; to jump the queue, force the seat onto the row with '5dive heartbeat wake-task <agent> <task_id>'"
+  fi
+  printf '%s\n' "$base"
 }
 
 # Drain ONE spooled message into a seat that is idle right now. One per call on
@@ -1152,19 +1166,48 @@ _a2a_queued_reason() {
 # would have stopped grading what it names. Renaming here keeps the control
 # pointed at cmd_send rather than widening the control to admit this line.
 a2a_queue_flush_one() {
-  local seat="$1" dir f msg _rc=0
+  local seat="$1" dir f msg _rc=0 reason i
   dir="$(_a2a_queue_dir "$seat")"
-  f="$(sudo -u "agent-${seat}" find "$dir" -maxdepth 1 -name '*.msg' 2>/dev/null | sort | head -1)"
-  [[ -n "$f" ]] || return 1
+  # DIVE-4296 iteration 2: the WHOLE spool in delivery order, not just its head.
+  # The staleness predicate needs to see what is queued BEHIND a message to spot
+  # a newer nudge for the same row, and dropping a stale head must let this same
+  # call go on to the next candidate rather than spending a round on a no-op.
+  local -a files=()
+  while IFS= read -r f; do [[ -n "$f" ]] && files+=("$f"); done \
+    < <(sudo -u "agent-${seat}" find "$dir" -maxdepth 1 -name '*.msg' 2>/dev/null | sort)
+  (( ${#files[@]} > 0 )) || return 1
   _hb_agent_idle "$seat" "${FIVE_A2A_QUEUE_IDLE_GAP:-0.4}" || return 1
-  msg="$(sudo -u "agent-${seat}" cat "$f" 2>/dev/null)" || return 1
-  [[ -n "$msg" ]] || { sudo -u "agent-${seat}" rm -f "$f" 2>/dev/null; return 1; }
-  # Unlink BEFORE typing. A message delivered twice is worse than one lost: the
-  # duplicate costs the recipient a second full re-investigation, which is the
-  # burn this ticket exists to remove.
-  sudo -u "agent-${seat}" rm -f "$f" 2>/dev/null || return 1
-  _A2A_INTERRUPTING=1 inject_and_submit "$seat" "$msg" || _rc=$?
-  (( _rc == 0 ))
+  for (( i=0; i<${#files[@]}; i++ )); do
+    f="${files[i]}"
+    msg="$(sudo -u "agent-${seat}" cat "$f" 2>/dev/null)" || return 1
+    if [[ -z "$msg" ]]; then
+      sudo -u "agent-${seat}" rm -f "$f" 2>/dev/null || return 1
+      continue
+    fi
+    # A machine nudge whose statement is no longer true is unlinked, not typed —
+    # and the drop does NOT consume the round, because nothing was delivered.
+    # declare -F because this predicate lives in cmd_heartbeat.sh: a runtime-only
+    # context that never loaded it must DELIVER, not drop. Fails open by design.
+    if declare -F _a2a_stale_nudge_reason >/dev/null 2>&1 \
+       && reason="$(_a2a_stale_nudge_reason "$seat" "$msg" "${files[@]:i+1}")"; then
+      sudo -u "agent-${seat}" rm -f "$f" 2>/dev/null || return 1
+      if declare -F _hb_log >/dev/null 2>&1; then
+        _hb_log "[${seat}] dropped stale spooled nudge (${reason})"
+      fi
+      continue
+    fi
+    # Unlink BEFORE typing. A message delivered twice is worse than one lost: the
+    # duplicate costs the recipient a second full re-investigation, which is the
+    # burn this ticket exists to remove.
+    sudo -u "agent-${seat}" rm -f "$f" 2>/dev/null || return 1
+    _A2A_INTERRUPTING=1 inject_and_submit "$seat" "$msg" || _rc=$?
+    (( _rc == 0 ))
+    return
+  done
+  # Every message in the spool was stale. Nothing was delivered, and the spool is
+  # now empty (or holds only what a failed unlink left) — rc 1, same as an empty
+  # spool, so the sweep records no delivery and re-reads the depth.
+  return 1
 }
 
 inject_and_submit() {
@@ -1756,7 +1799,7 @@ cmd_deliver() {
     # as an unconfirmed submit (see cmd_send) plus the additive queued:true.
     _delivered=0
     _queued=1
-    _reason="$(_a2a_queued_reason)"
+    _reason="$(_a2a_queued_reason "$(_a2a_queue_depth "$target")")"
   elif (( _rc != 0 )); then
     _delivered=0
     _reason="$(_agent_submit_unconfirmed_reason "$target" "$_rc")"
@@ -2495,7 +2538,7 @@ cmd_send() {
     # the two apart, and it is additive.
     _sent=0
     _queued=1
-    _reason="$(_a2a_queued_reason)"
+    _reason="$(_a2a_queued_reason "$(_a2a_queue_depth "$name")")"
   elif (( _rc != 0 )); then
     _sent=0
     _reason="$(_agent_submit_unconfirmed_reason "$name" "$_rc")"

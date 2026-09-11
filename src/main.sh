@@ -644,7 +644,7 @@ main() {
       # verb is) and never advertised.
       cmd_push_do "$@"
       exit $? ;;
-    plugin)
+    plugin|plugins)
       # DIVE-4020: the plugin lifecycle verb. Until this existed there was no
       # `5dive plugin` at all — plugins installed only as side effects of
       # `agent create` / `agent buzz enable`, so a CLI-only self-hoster had no

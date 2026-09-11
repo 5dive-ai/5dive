@@ -438,7 +438,7 @@ fi
 # DIVE-4196 RETIRED T13, WHICH WAS THE SAME ARM ONE ARTIFACT OVER. T13a-d
 # compared install.sh's `for _tpl in` staging list against team-templates/
 # index.json and the directory itself. Team templates moved to the same kind of
-# registry the plugins went to (<org>/character-packs, teams/): install.sh
+# registry the plugins went to (<org>/5dive-marketplace, teams/): install.sh
 # stages no templates, team-templates/ is gone from this repo, and the two
 # declarations T13 held equal no longer both exist. Left in place it would grade
 # a `for _tpl in` list that is absent — T13c, the non-empty control, is exactly

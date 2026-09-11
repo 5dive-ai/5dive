@@ -3,7 +3,7 @@
 #
 # The defect: _gate_repo_slugs defaulted to exactly three slugs, so a delivery to any
 # other repo we ship from was graded by a set that never contained it — false ACCEPT on
-# an unrelated repo's commit (measured on DIVE-2303, delivered to character-packs and
+# an unrelated repo's commit (measured on DIVE-2303, delivered to 5dive-marketplace and
 # closed on a 5dive-ai/5dive commit), and false REFUSE for genuinely landed work.
 #
 # Two properties are graded here and they are independent:
@@ -51,8 +51,8 @@ n="$(printf '%s\n' "$slugs" | grep -c .)"
 
 ok "the three original slugs are still in the default set (no coverage lost)" \
   "grep -qx '5dive-ai/5dive' <<<\"\$slugs\" && grep -qx 'lodar/5dive-api' <<<\"\$slugs\" && grep -qx 'lodar/5dive-frontend' <<<\"\$slugs\""
-ok "character-packs is in the default set (the repo whose miss produced DIVE-2431)" \
-  "grep -qx '5dive-ai/character-packs' <<<\"\$slugs\""
+ok "5dive-marketplace is in the default set (the repo whose miss produced DIVE-2431)" \
+  "grep -qx '5dive-ai/5dive-marketplace' <<<\"\$slugs\""
 for r in 5dive-ai/skills 5dive-ai/5dive-plugins 5dive-ai/5dive-mcp 5dive-ai/openagent 5dive-ai/ops lodar/5dive-blog lodar/5dive-mobile; do
   ok "shipping repo $r is searched by default" "grep -qx '$r' <<<\"\$slugs\""
 done
@@ -70,7 +70,7 @@ ov="$(FIVE_GATE_REPOS='acme/one,acme/two' _gate_repo_slugs)"
 ok "FIVE_GATE_REPOS replaces the default set entirely" \
   "[[ \$(printf '%s\n' \"\$ov\" | grep -c .) -eq 2 ]] && grep -qx 'acme/one' <<<\"\$ov\""
 ok "FIVE_GATE_REPOS override does NOT leak the widened defaults" \
-  "! grep -qx '5dive-ai/character-packs' <<<\"\$ov\""
+  "! grep -qx '5dive-ai/5dive-marketplace' <<<\"\$ov\""
 ok "comma AND whitespace separated overrides both parse" \
   "[[ \$(FIVE_GATE_REPOS='a/b c/d,e/f' _gate_repo_slugs | grep -c .) -eq 3 ]]"
 

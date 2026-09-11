@@ -408,6 +408,81 @@ _sup_verify_challenge() {  # <type> <user> <sess> <svc_running>
   printf '%s\n' "$pane" | _sup_verify_match
 }
 
+# ── DIVE-4293: BLOCKED-ON-PROMPT — a seat sitting on its own picker ──────────
+#
+# The class of stall no signal in this file could see. dev2 called
+# AskUserQuestion at ~05:40Z on 2026-09-11 and sat at "Enter to select" until
+# lodar noticed at 07:12Z. Every probe read it correctly and uselessly: the unit
+# was active, tmux alive, the poller n/a, and the transcript's mtime was fresh
+# right up to the question — so `no-progress` needs _SUP_T_STUCK_MIN of silence
+# to fire, and by the time it does the seat has been frozen for half an hour.
+# The pane is the ONLY place this state is written down, which is why it is read
+# here (a remediation signal) and not in `5dive liveness` (whose charter refuses
+# pane scrapes outright, and correctly — a present pane is not evidence of life).
+#
+# THE TAIL IS THE FALSE-POSITIVE CONTROL, not a performance choice. This regex
+# matches a string that agents routinely WRITE — this very row's body contains
+# it — so a 40-line window like the verify/quota probes use would classify any
+# seat discussing the picker as sitting on one. A live picker's footer is the
+# LAST thing on the pane; a transcript mention scrolls off within a line or two.
+_SUP_PROMPT_PANE_LINES="${SUPERVISOR_PROMPT_PANE_LINES:-12}"
+[[ "$_SUP_PROMPT_PANE_LINES" =~ ^[0-9]+$ ]] || _SUP_PROMPT_PANE_LINES=12
+
+# The footer claude renders under a choice picker ("↑/↓ to navigate · Enter to
+# select") and under the plan-approval dialog. Env-overridable on the same
+# escape-hatch pattern as _SUP_VERIFY_PAT, because this string belongs to a TUI
+# we do not ship and can change under us in any release.
+_SUP_PROMPT_PAT="${SUPERVISOR_PROMPT_PAT:-}"
+[[ -n "$_SUP_PROMPT_PAT" ]] || _SUP_PROMPT_PAT='[Ee]nter to (select|confirm|choose)'
+
+# _sup_prompt_match — pure, no I/O. Echoes the footer line (trimmed) when the
+# pane tail is sitting on a picker, empty otherwise. Split out from the capture
+# for the same reason _sup_verify_match and _sup_quota_match are: the
+# false-positive-critical regex has to be gradeable without a live tmux.
+_sup_prompt_match() {  # <pane-text-on-stdin>
+  grep -E "$_SUP_PROMPT_PAT" 2>/dev/null | tail -1 \
+    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-160
+}
+
+# _sup_prompt_recommended — pure, no I/O. rc 0 when the option the cursor is ON
+# is marked "(Recommended)", rc 1 otherwise.
+#
+# WHY THE CURSOR AND NOT THE PANE: Enter takes the HIGHLIGHTED option, so "some
+# option somewhere says Recommended" is the wrong question — answering on it
+# would press Enter on whatever the model happened to leave the cursor over.
+# Claude marks the selected row with ❯ (or a bare '>' on a terminal without it).
+# No cursor visible => rc 1 => we do not answer, we page. Fail-closed, because
+# the failure mode of guessing is an irreversible choice made by a watchdog.
+_sup_prompt_recommended() {  # <pane-text-on-stdin>
+  local line
+  line=$(grep -E '^[[:space:]]*(❯|>)[[:space:]]' 2>/dev/null | tail -1) || return 1
+  [[ -n "$line" ]] || return 1
+  [[ "$line" == *"(Recommended)"* ]]
+}
+
+# Does this agent's live pane show a choice picker? claude-only and root-only
+# (the sudo tmux hop), like every other pane probe here — any other runtime, no
+# root, or a down service returns empty (false-negative bias). Echoes
+# "<footer-excerpt>\x1f<recommended|unmarked>" when tripped, empty otherwise.
+_sup_prompt_pane_capture() {  # <user> <sess> <svc_running>
+  (( $3 )) && [[ $EUID -eq 0 ]] || return 0
+  sudo -n -u "$1" tmux capture-pane -p -t "$2" -S "-${_SUP_PROMPT_PANE_LINES}" 2>/dev/null || return 0
+}
+
+_sup_prompt_pane() {  # <type> <user> <sess> <svc_running>
+  local type="$1" pane excerpt
+  [[ "$type" == "claude" ]] || return 0
+  pane=$(_sup_prompt_pane_capture "$2" "$3" "$4") || return 0
+  [[ -n "$pane" ]] || return 0
+  excerpt=$(printf '%s\n' "$pane" | _sup_prompt_match)
+  [[ -n "$excerpt" ]] || return 0
+  if printf '%s\n' "$pane" | _sup_prompt_recommended; then
+    printf '%s\037recommended\n' "$excerpt"
+  else
+    printf '%s\037unmarked\n' "$excerpt"
+  fi
+}
+
 # DIVE-3272: pure signature match, no I/O — echoes ONE pane line that looks like
 # a model-capacity/quota refusal, empty otherwise. Split out from
 # _sup_quota_pane for the same reason _sup_verify_match is: the false-positive-
@@ -992,6 +1067,23 @@ _sup_capacity_notify_machine() {  # <class> [quota_alerts_on] -> true|false
   printf 'true'
 }
 
+# DIVE-4293: the page for a seat sitting on a picker nobody can answer. Kept
+# apart from _sup_capacity_alert because that message ends by telling the reader
+# to check model capacity and quota resets, which is the wrong runbook here and
+# an alert that sends you to the wrong place is worse than a quieter one. Both
+# legs best-effort, like every alert in this file — a wedged channel must never
+# abort the tick for the rest of the fleet.
+_sup_prompt_alert() {  # <name> <detail>
+  local name="$1" detail="$2"
+  local msg="[FLEET-HEALTH blocked-on-prompt] agent '${name}' is UP and REACHABLE and is WAITING ON A KEYPRESS: ${detail}. It called AskUserQuestion or ExitPlanMode and the picker is rendering into a tmux pane nobody is reading; the seat will sit there until someone answers it. The highlighted option is NOT marked (Recommended), so this watchdog will not choose for it. Read the pane (tmux attach -t agent-${name}), pick the option, and if the choice genuinely needed a person it belongs on a task gate, not a picker."
+  # DIVE-3318: a one-way machine notice nobody replies to is not a round.
+  _5DIVE_A2A_NOTIFY=1 5dive agent send main "$msg" >/dev/null 2>&1 \
+    || warn "prompt-alert: 'agent send main' failed for $name (alert still audited)"
+  if _task_agent_channel main; then
+    _task_send_owner "$msg" >/dev/null 2>&1 || true
+  fi
+}
+
 # DIVE-1127: fire the same-day alert for a tripped account. Both legs are
 # best-effort — a delivery failure must NEVER abort the tick (one wedged account
 # can't blind the watcher for the rest of the fleet). main (CTO, D4 runbook
@@ -1081,6 +1173,11 @@ Classification (conservative — see docs/fleet-supervisor-design.md §4):
   no-output       holds open row(s) and has closed NOTHING for ${_SUP_T_NO_OUTPUT_DAYS}d+
                   (cause: no-output) — the seat is claiming work and completing
                   none, which every liveness signal reads as "active"; alerts
+  blocked-on-prompt
+                  pane is sitting on an AskUserQuestion/ExitPlanMode picker —
+                  the seat is waiting on a keypress, not on a model (DIVE-4293).
+                  Auto-answered with Enter when the highlighted option is marked
+                  (Recommended); paged otherwise.
   quota-exhausted pane shows a model-capacity/quota refusal (cause:
                   quota-exhausted) — a fleet event, not the seat's own; alerts
   stalled         NO active work (no in_progress, no running loop) but a todo
@@ -1201,12 +1298,13 @@ _sup_cli_check() {
 #       has_work(0/1) act_age cli_stale(true/false/unknown) goal_drift_task
 #       verify_excerpt stranded open_rows no_output_days quota_excerpt
 #       quota_deadline(live/lapsed/unknown, DIVE-3880)
+#       prompt_excerpt prompt_mark(recommended/unmarked, DIVE-4293)
 _sup_classify() {
   local desired="$1" svc_running="$2" active="$3" sess="$4" tmux_state="$5" poller="$6" \
         loop_stuck="$7" has_work="$8" act_age="$9" cli_stale="${10}" goal_drift_task="${11}" \
         verify_excerpt="${12}" stranded="${13:-0}" \
         open_rows="${14:-0}" no_output_days="${15:--1}" quota_excerpt="${16:-}" \
-        quota_deadline="${17:-unknown}"
+        quota_deadline="${17:-unknown}" prompt_excerpt="${18:-}" prompt_mark="${19:-unmarked}"
   # DIVE-3880: the policy lives HERE, in the pure decision, not at the pane
   # probe — the probe owes a distinguishable signal, the classifier owes the
   # verdict (community/wiki/a-fail-open-underneath-a-fail-closed-path-feeds-it-a-lie-in-the-format-it-trusts.md).
@@ -1221,6 +1319,22 @@ _sup_classify() {
   if [[ -n "$verify_excerpt" ]]; then
     class="verify-challenge"; cause="id-verification"
     detail="pane shows an ID/age-verification challenge"
+  elif [[ -n "$prompt_excerpt" ]]; then
+    # DIVE-4293: ranked immediately under the verification challenge and above
+    # every inference, on the same reasoning — a picker FREEZES the session, so
+    # it explains any concurrent stall and is the more specific reading of one.
+    # It cannot be reached with the unit down (the probe needs a live pane), so
+    # it does not mask a dead-unit branch it is sitting above. Distinct from
+    # `stuck` on purpose: the nudge/resume ladder is the wrong remedy — a nudge
+    # types a line into a pane that is waiting for a KEY, and `resume` presses
+    # Escape, which throws the question away along with whatever the model was
+    # about to do with the answer.
+    class="blocked-on-prompt"; cause="blocked-on-prompt"
+    detail="pane is sitting on a choice picker: ${prompt_excerpt}"
+    case "$prompt_mark" in
+      recommended) detail="${detail} [highlighted option is marked (Recommended) — answerable]" ;;
+      *)           detail="${detail} [no highlighted (Recommended) option — a person must choose]" ;;
+    esac
   # desiredState (P2, DIVE-857 prereq b): an operator's explicit stop/start
   # beats inference. Recorded by `5dive agent stop|start`; absent on legacy
   # agents => the P1 inference path below, unchanged.
@@ -1406,12 +1520,24 @@ _sup_agent_record() {
                  AND created_at <= datetime('now','-${_SUP_T_STRANDED_MIN} minutes');" 2>/dev/null || echo 0)
   [[ "$stranded" =~ ^[0-9]+$ ]] || stranded=0
 
+  # --- signal: BLOCKED-ON-PROMPT (DIVE-4293) — is the pane tail sitting on a
+  # choice picker right now? Same root tmux hop as the verify/quota probes, and
+  # the same false-negative bias: no root, a down unit or a non-claude runtime
+  # yields empty and the branch simply never fires.
+  local prompt_excerpt="" prompt_mark="unmarked" prow
+  prow=$(_sup_prompt_pane "$type" "$user" "$sess" "$svc_running")
+  if [[ -n "$prow" ]]; then
+    prompt_excerpt="${prow%%$'\x1f'*}"; prompt_mark="${prow##*$'\x1f'}"
+    [[ "$prompt_mark" == "recommended" ]] || prompt_mark="unmarked"
+  fi
+
   # --- CLASSIFY (design §4) — see _sup_classify for the decision chain itself.
   local class cause detail crow
   crow=$(_sup_classify "$desired" "$svc_running" "$active" "$sess" "$tmux_state" "$poller" \
                         "$loop_stuck" "$has_work" "$act_age" "$_SUP_CLI_STALE" "$goal_drift_task" \
                         "$verify_excerpt" "$stranded" \
-                        "$open_rows" "$no_output_days" "$quota_excerpt" "$quota_deadline")
+                        "$open_rows" "$no_output_days" "$quota_excerpt" "$quota_deadline" \
+                        "$prompt_excerpt" "$prompt_mark")
   IFS=$'\x1f' read -r class cause detail <<<"$crow"
 
   jq -cn \
@@ -1425,6 +1551,8 @@ _sup_agent_record() {
     --arg verifyExcerpt "$verify_excerpt" \
     --arg quotaExcerpt "$quota_excerpt" \
     --arg quotaDeadline "$quota_deadline" \
+    --arg promptExcerpt "$prompt_excerpt" \
+    --arg promptMark "$prompt_mark" \
     --argjson openRows "$open_rows" --argjson noOutputDays "$no_output_days" \
     --arg class "$class" --arg cause "$cause" --arg detail "$detail" \
     '{name:$name, type:$type, channels:$channels, unit:$unit,
@@ -1439,7 +1567,12 @@ _sup_agent_record() {
                quotaSignature:(if $quotaExcerpt == "" then null else $quotaExcerpt end),
                # DIVE-3880: live / lapsed / unknown for the signature above.
                # null only when there is no signature to qualify.
-               quotaDeadline:(if $quotaExcerpt == "" then null else $quotaDeadline end)},
+               quotaDeadline:(if $quotaExcerpt == "" then null else $quotaDeadline end),
+               # DIVE-4293: the picker footer the pane tail is sitting on, and
+               # whether the HIGHLIGHTED option carries (Recommended). The mark
+               # is null when there is no picker to qualify.
+               blockedOnPrompt:(if $promptExcerpt == "" then null else $promptExcerpt end),
+               promptRecommended:(if $promptExcerpt == "" then null else ($promptMark == "recommended") end)},
       classification:$class,
       cause:(if $cause == "" then null else $cause end),
       detail:$detail}'
@@ -1513,6 +1646,8 @@ _sup_summary_line() {
      then " · ⚠ \([.[] | select(.classification == "quota-exhausted")] | length) QUOTA-EXHAUSTED" else "" end) +
     (if ([.[] | select(.classification == "verify-challenge")] | length) > 0
      then " · ⚠ \([.[] | select(.classification == "verify-challenge")] | length) VERIFY-CHALLENGE" else "" end) +
+    (if ([.[] | select(.classification == "blocked-on-prompt")] | length) > 0
+     then " · ⚠ \([.[] | select(.classification == "blocked-on-prompt")] | length) BLOCKED-ON-PROMPT" else "" end) +
     (if $stale == "true" then " · CLI \($cur) STALE (latest \($lat))"
      elif $stale == "unknown" then " · CLI staleness unknown (probe unavailable)"
      else " · CLI \($cur) ok" end) +
@@ -1988,6 +2123,18 @@ _sup_act_exec() {  # <name> <verb> <cause>
       sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Escape 2>/dev/null || return 1
       sleep 1
       _hb_send_line "$name" "continue" ;;
+    answer-prompt)
+      # DIVE-4293. NOT a rung on the stalled-seat ladder and never reached from
+      # _sup_act_plan — the alert loop calls it directly, and ONLY after
+      # _sup_prompt_recommended confirmed the HIGHLIGHTED option carries
+      # "(Recommended)". Enter takes whatever the cursor is on, so that check is
+      # the whole safety argument: without it this is a watchdog picking an
+      # option at random on the agent's behalf.
+      #
+      # Enter and not Escape: Escape dismisses the picker and discards the
+      # question, which is what `resume` does and why that rung is the wrong
+      # remedy here (the model has already decided; it wants its own answer).
+      sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter 2>/dev/null || return 1 ;;
     rotate)
       ( with_registry_lock cmd_agent_rotation_rotate "$name" ) >/dev/null 2>&1 ;;
     # DIVE-3753 rung 4. SUBSHELL, for the same reason rotate is one: cmd_restart
@@ -2180,14 +2327,46 @@ cmd_supervisor_tick() {
     # that alert: rotation to a destination with measured live headroom. It
     # never enters the stalled-seat nudge/resume ladder.
     local cls; cls=$(jq -r '.classification' <<<"$row")
-    case "$cls" in verify-challenge|no-output|quota-exhausted) ;; *) continue ;; esac
+    case "$cls" in verify-challenge|no-output|quota-exhausted|blocked-on-prompt) ;; *) continue ;; esac
     name=$(jq -r '.name' <<<"$row")
     local excerpt cause_s
     case "$cls" in
-      verify-challenge) excerpt=$(jq -r '.signals.verifyChallenge // ""' <<<"$row"); cause_s="id-verification" ;;
-      quota-exhausted)  excerpt=$(jq -r '.detail // ""' <<<"$row");                  cause_s="quota-exhausted" ;;
-      *)                excerpt=$(jq -r '.detail // ""' <<<"$row");                  cause_s="no-output" ;;
+      verify-challenge)  excerpt=$(jq -r '.signals.verifyChallenge // ""' <<<"$row"); cause_s="id-verification" ;;
+      quota-exhausted)   excerpt=$(jq -r '.detail // ""' <<<"$row");                  cause_s="quota-exhausted" ;;
+      blocked-on-prompt) excerpt=$(jq -r '.detail // ""' <<<"$row");                  cause_s="blocked-on-prompt" ;;
+      *)                 excerpt=$(jq -r '.detail // ""' <<<"$row");                  cause_s="no-output" ;;
     esac
+
+    # DIVE-4293: a blocked picker has one automatic remedy and it is bounded —
+    # press Enter, but ONLY when the highlighted option is the model's own
+    # "(Recommended)" one. Placed here rather than on the nudge/resume ladder
+    # because that ladder is gated on class=="stuck" and both of its early rungs
+    # are actively wrong for a pane waiting on a key (see _sup_act_exec).
+    #
+    # NOT deduped against the alert window: it is an ACT, and an act that worked
+    # removes its own trigger (the picker is gone next tick). A seat that comes
+    # back blocked is blocked on a NEW question and owes another answer.
+    # Unmarked pickers are never answered — they fall straight through to the
+    # page below, which is the whole point of the row: a person chooses.
+    if [[ "$cls" == "blocked-on-prompt" ]]; then
+      local prompt_rec; prompt_rec=$(jq -r '.signals.promptRecommended // false' <<<"$row")
+      if [[ "$prompt_rec" == "true" && "$actions_on" == "true" ]]; then
+        local ans_result="ok"
+        _sup_act_exec "$name" answer-prompt "blocked-on-prompt" || ans_result="failed"
+        db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
+            VALUES ($(sqlq "$name"), 'action', 'blocked-on-prompt', 'blocked-on-prompt',
+                    $(sqlq "{\"rung\":\"answer-prompt\",\"result\":\"${ans_result}\",\"recommended\":true}"));" 2>/dev/null \
+          && { acted=$((acted + 1)); events=$((events + 1)); } \
+          || warn "supervisor: answer-prompt audit insert failed for $name"
+        if [[ "$ans_result" == "ok" ]]; then
+          warn "supervisor: ANSWERED $name — blocked-on-prompt, took the highlighted (Recommended) option"
+          continue
+        fi
+        excerpt="${excerpt}; auto-answer failed to reach the pane"
+      elif [[ "$prompt_rec" == "true" ]]; then
+        excerpt="${excerpt}; automatic actions are disabled"
+      fi
+    fi
 
     # DIVE-3822: quota exhaustion is the one capacity class with an automatic
     # remedy. It bypasses the stalled-seat nudge ladder and asks the existing
@@ -2267,6 +2446,8 @@ cmd_supervisor_tick() {
     notify_machine=$(_sup_capacity_notify_machine "$cls" "$quota_alerts_on")
     if [[ "$cls" == "verify-challenge" ]]; then
       _sup_verify_alert "$name" "$excerpt"
+    elif [[ "$cls" == "blocked-on-prompt" ]]; then
+      _sup_prompt_alert "$name" "$excerpt"
     else
       _sup_capacity_alert "$name" "$cls" "$excerpt" "$notify_human" "$notify_machine"
     fi

@@ -1547,7 +1547,7 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
           # is the half that fails silently — an accept sourced from a repo that is not
           # where the delivery went reads as a clean close and nothing invites a second
           # look. Measured on DIVE-2303: accepted on a commit in 5dive-ai/5dive while
-          # the delivery sat in character-packs, which was not in the searched set at
+          # the delivery sat in the marketplace registry, which was not in the searched set at
           # all. Only stated when the task DECLARED no repo, because a declared repo
           # narrows the scan to itself and there is no unsearched remainder to warn about.
           _attr_scope=""
@@ -1667,6 +1667,10 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
     # the refusal messages below, and `set -u` turns an unset one into a crash on
     # the very path (no gh token) this gate is supposed to survive.
     local _ghtok2="" _slug2="" _sc_hit_slug="" _sc_total=0 _sc_ok=0
+    # DIVE-4282: what the SCAN itself failed on, first failing repo wins. The count
+    # alone ("0 of 11") cannot tell a credential problem from a listing/rate-limit/
+    # visibility one, and the warning below was written as if it could.
+    local _sc_err="" _sc_err_slug="" _sc_errf=""
     command -v gh >/dev/null 2>&1 && _ghtok2=$(_gate_gh_token)
     # DIVE-1935: NO TOKEN means the answer is unverified whatever gh prints — do
     # not run the query and then read its empty result as "repo is clean". That
@@ -1688,6 +1692,12 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
       # two of three repos. First hit wins and the refusal names WHICH repo. A repo
       # whose listing fails does not count as scanned: partial coverage reported as
       # full is the same succeeding-in-appearance shape DIVE-1935 was about.
+      # DIVE-4282: _gate_gh runs in the command substitution below — a SUBSHELL — so
+      # its `_GATE_GH_LAST_ERR` cannot travel back and every reason this scan had was
+      # being thrown away one line after it was produced. Name a file sink and read it.
+      _sc_errf="${TMPDIR:-/tmp}/.5dive-gate-scan-err.$$"
+      : >"$_sc_errf" 2>/dev/null || true
+      _GATE_GH_ERRF="$_sc_errf"
       while IFS= read -r _slug2; do
         [[ -n "$_slug2" ]] || continue
         _sc_total=$((_sc_total+1))
@@ -1696,8 +1706,18 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
                     --state open --limit 200 --json number,headRefName,title \
                     -q "[.[] | select((.title // \"\" | test(\"(^|[^A-Za-z0-9])${ident}([^A-Za-z0-9]|\$)\";\"i\")) or (.headRefName // \"\" | test(\"(^|[^A-Za-z0-9])${ident}([^A-Za-z0-9]|\$)\";\"i\"))) | .number] | .[0] // empty" \
                     2>/dev/null) && _sc_ok=$((_sc_ok+1)) || _hit=""
+        # Keep the FIRST failure's reason: it is the one an operator should read, and
+        # a `timeout`-killed call leaves an empty sink, which is itself the answer
+        # (the call never got far enough to be told anything).
+        if [[ -z "$_hit" && $_sc_ok -lt $_sc_total && -z "$_sc_err" ]]; then
+          _sc_err_slug="$_slug2"
+          _sc_err="$(head -c 400 "$_sc_errf" 2>/dev/null | tr '\n' ' ' || printf '')"
+          [[ -n "$_sc_err" ]] || _sc_err="the call produced no error text (killed by the gate's 5s timeout, or gh exited silently)"
+        fi
         if [[ -n "$_hit" ]]; then _auto_hit="$_hit"; _sc_hit_slug="$_slug2"; break; fi
       done < <(if [[ -n "$_task_slug" ]]; then printf '%s\n' "$_task_slug"; else _gate_repo_slugs; fi)
+      _GATE_GH_ERRF=""
+      rm -f "$_sc_errf" 2>/dev/null || true
       [[ $_sc_ok -eq $_sc_total && $_sc_total -gt 0 ]] && _scan_ran=1
       [[ -n "$_auto_hit" ]] && _scan_ran=1
     fi
@@ -1770,8 +1790,24 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
       # which an inert gate announces itself, so it has to say where the instrument
       # stopped. Without the seat, every reader generalises from their own.
       local _uv_why; _uv_why="$(_gate_tok_why)"
-      warn "$ident: merge-gate could not query GitHub ($_scan_why) — this close is UNVERIFIED, not verified-clean (DIVE-1935). Instrument: ${_uv_why}. Grade it with \`5dive task merge-gate-selftest\`."
-      _task_store_audit_log "task.merge-gate-unverified" ok 0 -- "$ident" "reason=$_scan_why" "seat=$(id -un 2>/dev/null || printf '?')"
+      # DIVE-4282: WHEN THE SCAN ITSELF FAILED, SAY WHAT IT FAILED ON. "could not
+      # query GitHub" is a statement about the credential, and on a seat that
+      # resolved one it sends the reader to audit an account that is fine — measured
+      # on a customer box where arm 4 RESOLVED, `gh` read the org's issues by hand,
+      # and the gate still printed 0-of-11 with no other sentence available. The
+      # credential wording is kept for the case it is actually true of: no rail
+      # answered because there was no rail.
+      local _uv_head="merge-gate could not query GitHub ($_scan_why)"
+      [[ -n "$_sc_err" ]] && _uv_head="merge-gate HELD a rail but the repo scan FAILED ($_scan_why) — first failure, ${_sc_err_slug}: ${_sc_err}"
+      warn "$ident: ${_uv_head} — this close is UNVERIFIED, not verified-clean (DIVE-1935). Instrument: ${_uv_why}. Grade it with \`5dive task merge-gate-selftest\`."
+      # The scan's own reason belongs on the AUDIT ROW too — the row is what a later
+      # sweep reads, and a reason that lives only in a warning on someone's terminal
+      # is gone by the time anyone triages the close. Built as an array: the text is
+      # gh's stderr and contains spaces, so an unquoted conditional expansion here
+      # would word-split it into a fistful of bogus audit fields.
+      local -a _uv_fields=("$ident" "reason=$_scan_why" "seat=$(id -un 2>/dev/null || printf '?')")
+      [[ -n "$_sc_err" ]] && _uv_fields+=("scan_err=${_sc_err_slug}: ${_sc_err}")
+      _task_store_audit_log "task.merge-gate-unverified" ok 0 -- "${_uv_fields[@]}"
       _mg_unverified="${_mg_unverified:+$_mg_unverified; }repo scan did not complete ($_scan_why)"
     fi
     # DIVE-1935: the PR reference the maker TYPED is a declaration too. DIVE-1922

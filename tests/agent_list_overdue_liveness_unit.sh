@@ -142,6 +142,39 @@ is 'a seat inside its cadence renders the bare badge' \
    "$(namecell fresh "$(_agent_list_table "$(mkrow fresh "$(hb 5 $((NOW-60)) $((NOW-60)) 'busy 1 in_progress')")" "$NOW")")" \
    'fresh ∿1m/5m'
 
+echo "== DIVE-4310: the stall window has a 15-minute FLOOR =="
+# Measured on the control plane 2026-09-11 11:44Z: quinn and main2 read OVERDUE
+# while both were mid-grade at a 1-minute cadence. 2x a 1m cadence is 120
+# SECONDS, so any turn longer than two minutes outruns the window and the seat
+# reads stalled while it is working. The window is now max(2x cadence, 15m).
+FAST=$(mkrow quinn "$(hb 1 $((NOW-10*60)))")            # 10m since the last wake, 1m cadence, never observed
+hasnt 'a 1m-cadence seat 10m past its wake is inside the floor' \
+      "$(namecell quinn "$(_agent_list_table "$FAST" "$NOW")")" '!'
+FAST2=$(mkrow quinn "$(hb 1 $((NOW-16*60)))")           # past the floor
+has   'and past 15m it flags again — the floor is not a mute' \
+      "$(namecell quinn "$(_agent_list_table "$FAST2" "$NOW")")" '!'
+EDGE_IN=$(mkrow edge2 "$(hb 1 $((NOW-900)))")           # exactly 15m
+EDGE_OUT=$(mkrow edge2 "$(hb 1 $((NOW-901)))")          # one second past
+hasnt 'exactly 15m is inside the window' "$(namecell edge2 "$(_agent_list_table "$EDGE_IN" "$NOW")")"  '!'
+has   'one second past 15m is outside'   "$(namecell edge2 "$(_agent_list_table "$EDGE_OUT" "$NOW")")" '!'
+# A FLOOR, never a cap: every cadence at or above 8 minutes is judged exactly as
+# before, which is the arm that keeps this from being a fleet-wide mute.
+SLOW=$(mkrow slow "$(hb 30 $((NOW-31*60)))")            # 31m at a 30m cadence: inside 2x (60m), as before
+hasnt 'a 30m-cadence seat inside 2x is not flagged' "$(namecell slow "$(_agent_list_table "$SLOW" "$NOW")")" '!'
+SLOW2=$(mkrow slow "$(hb 30 $((NOW-61*60)))")           # past 2x
+has 'a 30m-cadence seat past 2x still flags on 2x, not on 15m' \
+    "$(namecell slow "$(_agent_list_table "$SLOW2" "$NOW")")" '!'
+MED=$(mkrow med "$(hb 15 $((NOW-16*60)))")              # 16m at 15m: 2x=30m, floor irrelevant
+hasnt 'a 15m-cadence seat is unmoved by the floor' "$(namecell med "$(_agent_list_table "$MED" "$NOW")")" '!'
+# The observation window moves with it, or a fast seat seen working 10m ago is
+# still called stalled by the other half of the predicate.
+SEEN=$(mkrow fastseen "$(hb 1 $((NOW-3600)) $((NOW-600)) 'mid-turn')")
+hasnt 'an observation 10m old clears a 1m-cadence seat' \
+      "$(namecell fastseen "$(_agent_list_table "$SEEN" "$NOW")")" '!'
+SEEN2=$(mkrow fastseen "$(hb 1 $((NOW-3600)) $((NOW-1000)) 'mid-turn')")
+has 'an observation past the floor does not' \
+    "$(namecell fastseen "$(_agent_list_table "$SEEN2" "$NOW")")" '!'
+
 echo "== --json carries the verdict and the reason =="
 J=$(_agent_list_hb_json "$FOUR" "$NOW")
 is 'the busy seat is not overdue in json'   "$(jq -r '.[]|select(.name=="devops").heartbeatStatus.overdue' <<<"$J")" 'false'
@@ -190,21 +223,35 @@ is 'and a COMMENT quoting that call does not inflate the count' \
 # The wake-failure path must NOT stamp: an undeliverable wake is the stall this
 # column exists to show, and stamping it would make the alarm unreachable.
 #
-# DIVE-4299 — the first version of this arm lied twice. It anchored on the FIRST
-# line containing the log sentence, which a COMMENT carries as readily as code,
-# and then counted `_hb_mark_seen` to END OF FILE. On 2026-09-11 DIVE-4279's own
-# header comment quoted that sentence verbatim and this arm ejected PR #874 from
-# the merge queue twice, over an invariant that diff never touched (it adds zero
-# _hb_mark_seen calls). Same shape as DIVE-3591: a naive source scan matching the
-# file's own prose. So the scan below (a) drops whole-line comments — the
-# invariant is about CODE — (b) bounds its window to the wake-failure BRANCH by
-# indentation instead of running to EOF, and (c) says NO-ANCHOR rather than 0
-# when the log line is gone, so a renamed message fails loud instead of passing
-# an arm that is no longer looking at anything.
-# (d) A branch collapsed onto its own `if`/`else` line carries the enclosing
-# block's indent, so it is graded as a single line rather than expanded — the
-# alternative swallows its siblings and re-creates the false positive in the
-# small.
+# DIVE-4299 + DIVE-4310, RECONCILED. Two rows fixed half of this arm each, and
+# the halves are both load-bearing:
+#
+#   * DIVE-4278's original anchored on the FIRST line carrying the verdict's
+#     PROSE ("wake failed — will retry next tick") — which a comment carries as
+#     readily as code — then counted `_hb_mark_seen` to END OF FILE. On
+#     2026-09-11 DIVE-4279's header comment quoted that sentence verbatim and
+#     this arm ejected PR #874 from the merge queue twice, over an invariant
+#     that diff never touched (it adds zero stamps). Same shape as DIVE-3591.
+#   * DIVE-4310 replaced the prose anchor with the branch's own CODE line and
+#     added the two arms below — but kept scanning to EOF and kept matching
+#     comments, so a bare comment naming `_hb_mark_seen` three lines under its
+#     own anchor still reds it (measured by quinn on main, 2026-09-11).
+#
+# So, together: (a) the anchor is `sk_fail=$((sk_fail + 1))`, and
+# `^[[:space:]]*sk_fail=` is unsatisfiable by a comment because the `#` would
+# have to come first — that is what makes it STRUCTURAL, not that it is short;
+# (b) the window is the BRANCH, bounded by indentation in BOTH directions —
+# forward-only misses a stamp placed above the counter, the likeliest real
+# violation; (c) comments inside that window are dropped, because the invariant
+# is about CODE; (d) a vanished anchor prints NO-ANCHOR, never a passing 0, so
+# renaming the counter fails LOUD instead of grading nothing forever; (e) a
+# branch collapsed onto its own if/else line carries the enclosing block's
+# indent, so it is graded alone rather than expanded into its siblings.
+FAIL_LN=$(grep -n '^[[:space:]]*sk_fail=\$((sk_fail + 1))' "$SRC/cmd_heartbeat.sh" | cut -d: -f1 | head -1)
+is 'the wake-failure verdict is exactly one code line' \
+   "$(grep -c '^[[:space:]]*sk_fail=\$((sk_fail + 1))' "$SRC/cmd_heartbeat.sh")" '1'
+has 'and the verdict names the step that failed' \
+    "$(sed -n "${FAIL_LN}p" "$SRC/cmd_heartbeat.sh")" '_HB_WAKE_FAIL_REASON'
 wake_failure_stamps() { # <source-file> -> _hb_mark_seen calls inside the wake-failure branch
   awk '
     {
@@ -212,7 +259,7 @@ wake_failure_stamps() { # <source-file> -> _hb_mark_seen calls inside the wake-f
       bare = $0; sub(/^[[:space:]]*/, "", bare); txt[NR] = bare
       match($0, /^[[:space:]]*/); ind[NR] = RLENGTH
       if (bare ~ /^#/) cmt[NR] = 1
-      if (!anchor && !cmt[NR] && /_hb_log/ && /wake failed — will retry next tick/) {
+      if (!anchor && !cmt[NR] && $0 ~ /(^|[[:space:];&|])sk_fail=\$\(\([[:space:]]*sk_fail[[:space:]]*\+[[:space:]]*1[[:space:]]*\)\)/) {
         anchor = NR
         # A branch collapsed onto its own if/else line carries the indent of the
         # enclosing block, so expanding by indent would swallow its siblings.
@@ -240,15 +287,18 @@ echo "== and the scan that says so is pinned, in both directions =="
 FIXD="$TMPD/fx"; mkdir -p "$FIXD"
 fixture() { printf '%s\n' "$2" > "$FIXD/$1.sh"; printf '%s' "$FIXD/$1.sh"; }
 
-# (1) the PR #874 shape: a COMMENT quotes the sentence, the code stamps nothing.
-is 'a COMMENT quoting the log sentence is not the wake-failure path' \
+# (1) the PR #874 shape, now in the form that survives BOTH rewordings: a
+# comment quotes the retired log sentence AND a comment names the stamp, while
+# the code stamps nothing. This is the control main fails today.
+is 'comments quoting the log sentence and the stamp are not the wake-failure path' \
    "$(wake_failure_stamps "$(fixture comment '#!/usr/bin/env bash
 # incident log, quoted verbatim: wake failed — will retry next tick
+# and the invariant it guards: the branch must not call _hb_mark_seen
 tick() {
   if wake; then
     _hb_mark_seen "$name" "$now" "mid-turn"
   else
-    _hb_log "[$name] wake failed — will retry next tick"
+    sk_fail=$((sk_fail + 1)); _hb_log "[$name] wake failed at ${_HB_WAKE_FAIL_REASON} — will retry next tick"
   fi
 }')")" '0'
 
@@ -259,51 +309,67 @@ tick() {
   if wake; then
     :
   else
-    _hb_log "[$name] wake failed — will retry next tick"
+    sk_fail=$((sk_fail + 1)); _hb_log "[$name] wake failed"
   fi
   _hb_mark_seen "$name" "$now" "idle (no work)"
 }')")" '0'
 
-# (3) positive control, ABOVE the log line — an arm that cannot fail grades nothing.
-is 'a stamp inside the branch, before the log, is caught' \
+# (3) positive control, ABOVE the counter — an arm that cannot fail grades nothing.
+is 'a stamp inside the branch, before the counter, is caught' \
    "$(wake_failure_stamps "$(fixture before '#!/usr/bin/env bash
 tick() {
   if wake; then
     :
   else
     _hb_mark_seen "$name" "$now" "wake failed"
-    _hb_log "[$name] wake failed — will retry next tick"
+    sk_fail=$((sk_fail + 1))
+    _hb_log "[$name] wake failed"
   fi
 }')")" '1'
 
-# (4) positive control, BELOW the log line.
-is 'a stamp inside the branch, after the log, is caught' \
+# (4) positive control, BELOW the counter.
+is 'a stamp inside the branch, after the counter, is caught' \
    "$(wake_failure_stamps "$(fixture behind '#!/usr/bin/env bash
 tick() {
   if wake; then
     :
   else
-    _hb_log "[$name] wake failed — will retry next tick"
+    sk_fail=$((sk_fail + 1))
     _hb_mark_seen "$name" "$now" "wake failed"
   fi
 }')")" '1'
 
-# (5) the message renamed out from under the arm must be loud, not a silent 0.
-is 'a missing log line reads NO-ANCHOR, not a passing 0' \
-   "$(wake_failure_stamps "$(fixture gone '#!/usr/bin/env bash
-tick() { if wake; then :; else _hb_log "[$name] could not wake"; fi; }')")" 'NO-ANCHOR'
+# (5) a COMMENT naming the stamp INSIDE the window is prose, not a violation.
+# This is precisely the line quinn injected three below main's own anchor to
+# show the wire was still live there.
+is 'a COMMENT naming the stamp inside the branch is not a violation' \
+   "$(wake_failure_stamps "$(fixture incomment '#!/usr/bin/env bash
+tick() {
+  if wake; then
+    :
+  else
+    sk_fail=$((sk_fail + 1))
+    # deliberately does NOT call _hb_mark_seen — see DIVE-4278
+    _hb_log "[$name] wake failed"
+  fi
+}')")" '0'
 
-# (6)/(7) a branch collapsed onto one line is graded alone, not widened to its siblings.
+# (6) the counter renamed out from under the arm must be loud, not a silent 0.
+is 'a missing anchor reads NO-ANCHOR, not a passing 0' \
+   "$(wake_failure_stamps "$(fixture gone '#!/usr/bin/env bash
+tick() { if wake; then :; else wake_failures=$((wake_failures + 1)); fi; }')")" 'NO-ANCHOR'
+
+# (7)/(8) a branch collapsed onto one line is graded alone, not widened to its siblings.
 is 'a collapsed one-line branch does not swallow the next statement' \
    "$(wake_failure_stamps "$(fixture collapsed '#!/usr/bin/env bash
 tick() {
-  if wake; then :; else _hb_log "[$name] wake failed — will retry next tick"; fi
+  if wake; then :; else sk_fail=$((sk_fail + 1)); fi
   _hb_mark_seen "$name" "$now" "idle (no work)"
 }')")" '0'
 is 'and a violation ON that collapsed line is still caught' \
    "$(wake_failure_stamps "$(fixture collapsed_bad '#!/usr/bin/env bash
 tick() {
-  if wake; then :; else _hb_mark_seen "$n" "$t" "x"; _hb_log "[$name] wake failed — will retry next tick"; fi
+  if wake; then :; else sk_fail=$((sk_fail + 1)); _hb_mark_seen "$n" "$t" "x"; fi
 }')")" '1'
 
 printf '\nPASS=%d FAIL=%d\n' "$PASS" "$FAIL"

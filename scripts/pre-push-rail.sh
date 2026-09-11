@@ -54,8 +54,11 @@
 # counts; (3) the residual the check uniquely covers; (4) why you sign it anyway;
 # (5) what stays uncovered. A reason missing any of the five numbered clauses is
 # REFUSED — an override contract that accepts "wip" is a --no-verify with extra
-# steps. The accepted reason is printed into the push output and written to
-# .git/5dive-push-override.log, so the next reader of that branch can find it.
+# steps. The accepted reason is printed into the push output and written to a log
+# whose path is printed with it: .git/5dive-push-override.log when you run the push
+# yourself, and the root-owned /var/log/5dive/push-override.log when root runs it
+# for you (a delegated push) — root must not write into a checkout whose paths an
+# agent controls. See override_taken().
 #
 # CONTRACT
 #   usage: scripts/pre-push-rail.sh <base> <head> [--only=title|shellcheck|harnesses]
@@ -343,8 +346,45 @@ override_taken() {
     echo "pre-push-rail: OVERRIDDEN — the rail did not run. Signed reason:"
     printf '%s\n' "$reason" | sed 's/^/  | /'
   } >&2
-  local log; log="$(git rev-parse --git-common-dir 2>/dev/null)/5dive-push-override.log"
-  { date -u +'%Y-%m-%dT%H:%M:%SZ'; printf 'range %s..%s\n' "$BASE" "$HEAD_REV"; printf '%s\n\n' "$reason"; } >>"$log" 2>/dev/null || true
+  # DIVE-4288 (iteration 2, main2's finding): WHO IS WRITING DECIDES WHERE.
+  #
+  # On a delegated push this function runs as ROOT, inside `_push_do`'s git push,
+  # and <git-common-dir> is inside a checkout THE SIGNING AGENT OWNS. Iteration 1
+  # made this append reachable root-side for the first time — on `main` the reason
+  # never crosses the sudo boundary, so the branch never fires — and therefore
+  # inherited its safety: the agent controls the PATH, and `>>` writes THROUGH a
+  # symlink into the target and leaves the link intact. Root would be appending
+  # agent-supplied text to any file root can write.
+  #
+  # The fix is NOT a symlink guard on the crossing. It is to DELETE the crossing:
+  # when the writer is root, the receipt goes to a root-owned directory no agent
+  # can create a path in (/var/log/5dive is root:claude 2750 — group read and
+  # traverse, no group write), and the PATH IS PRINTED. "Findable from the seat
+  # that signed it" is the whole of what this log owes, and a printed path to a
+  # 0640 root:claude file — readable by every seat, writable by none — pays it
+  # without root ever touching agent-controlled space. See
+  # community/wiki/a-fix-that-makes-a-path-root-reachable-inherits-that-paths-safety.md
+  #
+  # Keyed on EUID as well as FIVE_PUSH_DELEGATED: the hazard is "root is the
+  # writer", not "the CLI said so", and a root-run `git push` in an agent checkout
+  # has the same shape with none of the flags set.
+  local log
+  if [[ ${EUID:-$(id -u)} -eq 0 || -n "${FIVE_PUSH_DELEGATED:-}" ]]; then
+    log="/var/log/5dive/push-override.log"
+    [[ ${EUID:-$(id -u)} -eq 0 ]] && mkdir -p /var/log/5dive 2>/dev/null
+  else
+    log="$(git rev-parse --git-common-dir 2>/dev/null)/5dive-push-override.log"
+  fi
+  # umask 027 so a root-created receipt lands 0640 in that setgid root:claude dir:
+  # every seat can READ the signature it is told to look for, none can rewrite it.
+  if ( umask 027; { date -u +'%Y-%m-%dT%H:%M:%SZ'; printf 'range %s..%s\n' "$BASE" "$HEAD_REV"; printf '%s\n\n' "$reason"; } >>"$log" 2>/dev/null ); then
+    # NAME THE PATH, on both branches and on the failure branch too: a receipt
+    # nobody can locate is not an audit trail, and this line is the only thing
+    # that makes the root-side log findable from the seat that signed it.
+    echo "  logged to: ${log}" >&2
+  else
+    echo "  NOT LOGGED — could not append to ${log}. The reason above is the only record; it is in this push's output." >&2
+  fi
   return 0
 }
 
@@ -361,7 +401,21 @@ if (( rc != 0 )); then
     echo "pre-push-rail: this push is refused because a check that gates the merge is red HERE, where the fix is cheap."
     echo "  The same red in CI costs a verifier bounce plus a fresh maker wake (~20-45 min, DIVE-4206), on every round."
     echo "  Audited escape (visible on the branch, unlike --no-verify):"
-    echo "    FIVE_PUSH_OVERRIDE=\"\$(cat reason.txt)\" git push     # five numbered clauses required"
+    # DIVE-4288: PRINT THE ESCAPE THIS READER CAN ACTUALLY TAKE. Both of the
+    # routes above assume the reader runs `git push` themselves. On a delegated
+    # push they do not and cannot — the seat holds no git credential, which is the
+    # point of the delegated rail — so root's `_push_do` sets FIVE_PUSH_DELEGATED
+    # before it runs the push that triggers this hook. Advice that names a command
+    # the reader's seat cannot run is not a weaker escape, it is a dead end: it
+    # sent DIVE-4282 to "hand the branch to a credentialed seat or edit the red
+    # gate", and editing the gate mid-ship is the one move this repo forbids.
+    if [[ -n "${FIVE_PUSH_DELEGATED:-}" ]]; then
+      echo "    FIVE_PUSH_OVERRIDE=\"\$(cat reason.txt)\" 5dive push ${FIVE_PUSH_TASK:-<row>}"
+      echo "  This push was DELEGATED: your seat holds no git credential of its own, so a direct push — and --no-verify with it — is not a route you can take."
+      echo "  The reason rides the same channel as the push parameters and is graded ROOT-side — five numbered clauses, the same contract."
+    else
+      echo "    FIVE_PUSH_OVERRIDE=\"\$(cat reason.txt)\" git push     # five numbered clauses required"
+    fi
   } >&2
 fi
 exit "$rc"
