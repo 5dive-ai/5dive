@@ -270,6 +270,29 @@ JSON
     settings=$(jq '. + {hooks: ((.hooks // {}) + {SessionStart: [{hooks: [{type: "command", command: "/usr/local/lib/5dive/sessionstart-resume-context.sh", timeout: 10}]}]})}' <<<"$settings")
   fi
 
+  # DIVE-4293: the HEADLESS QUESTION GUARD. AskUserQuestion / ExitPlanMode are
+  # tool calls the model makes on purpose, not permission prompts — so
+  # bypassPermissions above does not cover them, permissions.deny does not list
+  # them, and no liveness rule reads them. On a seat with a channel the telegram
+  # plugin's own PreToolUse hook bridges the picker to the paired phone. On a
+  # seat WITHOUT one the picker renders into a tmux pane nobody is reading and
+  # the session blocks there: measured 2026-09-11, dev2 sat at "Enter to select"
+  # for 92 minutes with two gate-cleared rows' committed work unpushed behind it.
+  #
+  # Gated on the seat having NO question-carrying channel, for two reasons and
+  # both are load-bearing: a telegram seat already has the plugin's deny and a
+  # second one would double-fire, and the refusal text ("no human sits at this
+  # keyboard") is only TRUE where it is installed. Guarded on the shared copy
+  # existing, same pattern as statusLine and SessionStart above — a host that
+  # predates the rollout gets its old behaviour, never a broken agent.
+  if ! channel_in_list telegram "$channels" && ! channel_in_list discord "$channels" \
+     && [[ -x /usr/local/lib/5dive/pretool-headless-question.sh ]]; then
+    settings=$(jq '. + {hooks: ((.hooks // {}) + {PreToolUse: (((.hooks // {}).PreToolUse // []) + [{
+      matcher: "AskUserQuestion|ExitPlanMode",
+      hooks: [{type: "command", command: "/usr/local/lib/5dive/pretool-headless-question.sh", timeout: 10}]
+    }])})}' <<<"$settings")
+  fi
+
   printf '%s\n' "$settings" | sudo -u "$user" tee "$home/.claude/settings.json" >/dev/null
   chmod 600 "$home/.claude/settings.json"
 

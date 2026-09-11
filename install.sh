@@ -757,7 +757,8 @@ JOURNALD
   # receiver-side userprompt-mirror-inter-agent.sh below replaces it.
   rm -f "$LIB_DIR/mirror-agent-send.sh"
   for hook in stop-failure-telegram.sh resume-after-reset.sh run-loop.sh \
-              pretool-telegram-question.sh stop-telegram-reply-check.sh \
+              pretool-telegram-question.sh pretool-headless-question.sh \
+              stop-telegram-reply-check.sh \
               posttool-telegram-relay.sh userprompt-mirror-inter-agent.sh \
               stop-mirror-inter-agent.sh push-notify.sh \
               sessionstart-resume-context.sh; do
