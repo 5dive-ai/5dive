@@ -76,17 +76,38 @@ EOF
   chmod 755 "$dir"/pgrep "$dir"/agent-browser
 }
 
+# The hook confirms every candidate by its OWN EXECUTABLE (readlink
+# /proc/<pid>/exe), so a fake browser must RUN FROM an agent-browser path --
+# a plain `sleep` would (correctly) be skipped. Each arm dir therefore gets a
+# COPY (not a symlink: /proc/exe resolves symlinks) of sleep and bash under
+# .../node_modules/agent-browser/bin/, and the fakes exec those.
+fake_bindir() { echo "$1/fake/node_modules/agent-browser/bin"; }
+
 spawn_fake() { # spawn_fake <pidfile> <count> [ignore-term]
-  local f="$1" n="$2" ignore="${3:-}" i
+  local f="$1" n="$2" ignore="${3:-}" i dir bin
+  dir="$(dirname "$f")"; bin="$(fake_bindir "$dir")"
   : >"$f"
   for ((i=0;i<n;i++)); do
     if [[ -n "$ignore" ]]; then
-      setsid bash -c 'trap "" TERM; exec sleep 300' >/dev/null 2>&1 &
+      setsid "$bin/chrome" -c 'trap "" TERM; exec "$0" 300' "$bin/agent-browser-linux-x64" >/dev/null 2>&1 &
     else
-      setsid sleep 300 >/dev/null 2>&1 &
+      setsid "$bin/agent-browser-linux-x64" 300 >/dev/null 2>&1 &
     fi
     echo "$!" >>"$f"
   done
+}
+
+# A BYSTANDER: a live process that is NOT the browser but whose ARGV carries a
+# PATH-shaped agent-browser token -- exactly what quinn measured on a real
+# seat (two of the seat's own tool shells, because the path was in the command
+# they had just run). Its exe is /bin/bash, so the hook must never kill it.
+spawn_bystander() { # spawn_bystander <pidfile-to-append>
+  # A loop body, not a single command: bash EXECs a lone command and the
+  # path-shaped argv would be replaced by the exec'd one.
+  setsid /bin/bash -c 'while :; do sleep 1; done # /usr/lib/node_modules/agent-browser/bin/agent-browser-linux-x64' \
+    >/dev/null 2>&1 &
+  echo "$!" >>"$1"
+  echo "$!"
 }
 
 alive_count() { local f="$1" n=0 p; while read -r p; do [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null && n=$((n+1)); done <"$f"; echo "$n"; }
@@ -94,8 +115,10 @@ reap_fakes()  { local f="$1" p; while read -r p; do [[ -n "$p" ]] && kill -KILL 
 
 arm_env() { # arm_env <name> -> prints the case dir, with stubs + dirs ready
   local name="$1"
-  local dir="$TMP/$name"
+  local dir="$TMP/$name" bin
   mkdir -p "$dir/bin" "$dir/home/.claude" "$dir/home/.5dive"
+  bin="$(fake_bindir "$dir")"; mkdir -p "$bin"
+  cp /bin/sleep "$bin/agent-browser-linux-x64"; cp /bin/bash "$bin/chrome"
   mk_stubs "$dir/bin"
   : >"$dir/calls"; : >"$dir/pids"
   echo "$dir"
@@ -193,6 +216,51 @@ check "arm8 does NOT match this hook itself" \
 check "arm8 does NOT match an unrelated chrome" \
   "$(matches '/opt/google/chrome/chrome --headless')" "no"
 
+# ---- arm 9: a live BYSTANDER whose ARGV carries a path-shaped token, and
+# which is neither the hook nor its parent, MUST SURVIVE. This is the defect
+# quinn reproduced on agent-quinn: argv-only selection returned two of the
+# seat's own tool shells alongside the real target, and background shells
+# alive at turn end are exactly what this hook runs alongside.
+d="$(arm_env a9)"; spawn_fake "$d/pids" 1
+bystander="$(spawn_bystander "$d/pids")"
+sleep 0.3
+rc="$(run_hook "$d" CLOSE_CLEARS=0 CLOSE_RC=1)"
+check "arm9 bystander: exit 0" "$rc" "0"
+check "arm9 bystander with path-shaped argv survives" \
+  "$(kill -0 "$bystander" 2>/dev/null && echo alive || echo dead)" "alive"
+check "arm9 the real browser next to it is still torn down" \
+  "$(kill -0 "$(head -1 "$d/pids")" 2>/dev/null && echo alive || echo dead)" "dead"
+reap_fakes "$d/pids"
+
+# ---- arm 9b: the exe confirmation is what saves it. Revert selection to
+# ARGV-ONLY (drop the exe test) and the same bystander dies -- so arm 9 grades
+# the predicate, not the rig.
+sed 's/^    exe_is_browser "\$p" && printf/    printf/' "$HOOK" >"$TMP/hook-argvonly.sh"
+grep -q 'exe_is_browser "\$p" &&' "$TMP/hook-argvonly.sh" \
+  && bad "arm9b argv-only mutant built" "exe test still present after sed" \
+  || ok "arm9b argv-only mutant built (exe confirmation removed)"
+d="$(arm_env a9b)"; spawn_fake "$d/pids" 1
+by2="$(spawn_bystander "$d/pids")"
+sleep 0.3
+env -i HOME="$d/home" PATH="$d/bin:/usr/bin:/bin" PIDS="$d/pids" CALLS="$d/calls" \
+    AGENT_BROWSER_KILL_GRACE=2 CLOSE_CLEARS=0 CLOSE_RC=1 \
+    bash "$TMP/hook-argvonly.sh" >/dev/null 2>&1
+check "arm9b argv-only selection DOES kill the bystander (arm9 is non-vacuous)" \
+  "$(kill -0 "$by2" 2>/dev/null && echo alive || echo dead)" "dead"
+reap_fakes "$d/pids"
+
+# ---- arm 10: a candidate whose exe cannot be read is SKIPPED, not killed.
+# Modelled by handing the confirmer a pid that no longer exists (readlink on
+# /proc/<pid>/exe fails exactly as it does for an unreadable one).
+( set -uo pipefail
+  # shellcheck disable=SC2034  # consumed by exe_is_browser, eval'd in from the hook
+  EXE_PATTERN='[/.]agent-browser[-/]'
+  eval "$(awk '/^exe_is_browser\(\) \{/,/^\}$/' "$HOOK")"
+  dead=$(bash -c 'echo $$'); sleep 0.1
+  if exe_is_browser "$dead"; then exit 1; else exit 0; fi
+) && ok "arm10 unreadable/absent exe is not confirmed (skipped, never killed)" \
+  || bad "arm10 unreadable exe" "exe_is_browser confirmed a pid with no readable exe"
+
 # ---- MUTATION CONTROL: with the teardown body removed the hook must STOP
 # ending the tree. A rig that still passes arm3 against a gutted hook grades
 # nothing.
@@ -267,7 +335,16 @@ if command -v agent-browser >/dev/null 2>&1 \
    && [[ -d "$HOME/.agent-browser/browsers" || -n "${AGENT_BROWSER_LIVE:-}" ]]; then
   # Count with the SHIPPED pattern, not a bare word: a bare one self-matches
   # the very shell running the count (see arm8).
-  own() { pgrep -u "$(id -u)" -f "$PAT" 2>/dev/null | grep -vx -e "$$" -e "$PPID" | wc -l; }
+  # Confirm by exe, exactly as the hook does -- a bare argv count would
+  # include the shell running the count (arm8/arm9).
+  # shellcheck disable=SC2034  # consumed by exe_is_browser, eval'd in from the hook
+  EXE_PATTERN='[/.]agent-browser[-/]'
+  eval "$(awk '/^exe_is_browser\(\) \{/,/^\}$/' "$HOOK")"
+  own() { local p n=0
+    while read -r p; do [[ -n "$p" ]] || continue
+      [[ "$p" == "$$" || "$p" == "$PPID" ]] && continue
+      exe_is_browser "$p" && n=$((n+1))
+    done < <(pgrep -u "$(id -u)" -f "$PAT" 2>/dev/null); echo "$n"; }
   base="$(own)"
   if [[ "$base" != "0" ]]; then
     printf 'SKIP live arm: %s agent-browser process(es) already resident for this uid\n' "$base"

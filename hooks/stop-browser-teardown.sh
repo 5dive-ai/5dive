@@ -18,10 +18,21 @@
 #   2. Anything still resident afterwards (a close that hung, a Chrome whose
 #      parent CLI already died, a crashpad handler) gets SIGTERM, then
 #      SIGKILL after $AGENT_BROWSER_KILL_GRACE (default 3s).
-# Both stages are scoped to this uid, and the match is the PATH-shaped token
-# `[/.]agent-browser[-/]` that every process in the tree carries — so it never
-# reaches another seat's browser, and never a shell that merely mentions the
-# string (this hook's own, for one).
+# Both stages are scoped to this uid, and SELECTION IS BY EXECUTABLE, not by
+# command-line text: a candidate enters the kill list only if
+# `readlink /proc/<pid>/exe` resolves under an `agent-browser`/`.agent-browser`
+# path. Every member of the real tree does — the CLI is
+# `<prefix>/node_modules/agent-browser/bin/agent-browser-linux-x64`, and the
+# Chrome and crashpad handler it spawns live under
+# `<home>/.agent-browser/browsers/chrome-<ver>/` — while a shell that merely
+# NAMES one of those paths has an exe of `/bin/bash` and is never selected.
+# The argv pattern is kept as the cheap pre-filter only. This matters because
+# an argv match is reachable by ordinary work: measured on agent-quinn
+# 2026-09-11, `pgrep -u $(id -u) -f '[/.]agent-browser[-/]'` returned the real
+# process AND two of the seat's own concurrent tool shells, whose command
+# lines quoted the CLI's path — and background shells alive at turn end are
+# precisely what this hook runs alongside. A pid whose exe is UNREADABLE is
+# SKIPPED, never killed (same fail-safe direction as the rest of the hook).
 #
 # MULTI-TURN BROWSER WORK. Closing at turn end means a session does not
 # survive into the next turn by default — that is the row's ask, and it is
@@ -41,20 +52,42 @@ LOG="${AGENT_BROWSER_TEARDOWN_LOG:-$HOME/.claude/browser-teardown.log}"
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$LOG" 2>/dev/null || true; }
 
 UID_SELF="$(id -u)"
-# The PATH-shaped token, not the bare word. The CLI is
-# `<prefix>/node_modules/agent-browser/bin/agent-browser-linux-x64` and every
-# Chrome + crashpad handler it spawns lives under
-# `<home>/.agent-browser/browsers/chrome-<ver>/`, so both carry `/agent-browser/`
-# or `.agent-browser/`. A bare `agent-browser` also matches any SHELL whose
-# command line merely mentions the string -- including the agent's own tool
-# wrapper -- and `pkill -f` on that would kill the session, not the browser.
-# Measured while writing the harness: a bare pattern self-matched the very
-# shell running the check.
+# argv PRE-FILTER only. It is cheap and it is not authoritative: a live
+# process's command line can carry a PATH-shaped agent-browser token without
+# being the browser (a shell installing, grepping or testing this thing —
+# measured on agent-quinn, two such shells came back from this very pattern).
+# Everything it returns is confirmed by exe below before it can be killed.
 PATTERN="${AGENT_BROWSER_PROC_PATTERN:-[/.]agent-browser[-/]}"
+# The authoritative test, applied to /proc/<pid>/exe. Same token, but on a
+# path the process cannot fake by quoting it: its own executable.
+EXE_PATTERN="${AGENT_BROWSER_EXE_PATTERN:-[/.]agent-browser[-/]}"
 
-# Nothing of ours running -> do no work at all (this is the common case, and
-# the hook is on the end-of-turn path of every seat).
-pgrep -u "$UID_SELF" -f "$PATTERN" >/dev/null 2>&1 || exit 0
+# Confirm a candidate by its OWN EXECUTABLE. An unreadable exe (a process
+# that exited between pgrep and here, or one we may not introspect) returns
+# non-zero, so the pid is skipped rather than killed.
+exe_is_browser() { # exe_is_browser <pid>
+  local exe
+  exe="$(readlink "/proc/$1/exe" 2>/dev/null)" || return 1
+  [[ -n "$exe" ]] || return 1
+  printf '%s' "$exe" | grep -qE -- "$EXE_PATTERN"
+}
+
+# The kill list: argv pre-filter, minus this hook and its parent, then each
+# survivor confirmed by exe. `pkill -f` cannot express this and is never used.
+browser_pids() {
+  local p
+  while read -r p; do
+    [[ -n "$p" ]] || continue
+    [[ "$p" == "$$" || "$p" == "${PPID:-0}" ]] && continue
+    exe_is_browser "$p" && printf '%s\n' "$p"
+  done < <(pgrep -u "$UID_SELF" -f "$PATTERN" 2>/dev/null)
+}
+
+# Nothing of OURS running -> do no work at all (the common case, and this hook
+# is on the end-of-turn path of every seat). Note this gate is the confirmed
+# list, not the raw pgrep: a bystander shell quoting the path must not even
+# trigger a close.
+[[ -n "$(browser_pids)" ]] || exit 0
 
 LEASE_FILE="${AGENT_BROWSER_LEASE_FILE:-$HOME/.5dive/browser-lease}"
 if [[ -r "$LEASE_FILE" ]]; then
@@ -74,15 +107,7 @@ if command -v agent-browser >/dev/null 2>&1; then
 fi
 
 # Survivors: the graceful close hung, or Chrome outlived the CLI that spawned
-# it. TERM first so Chrome flushes its profile, then KILL. Explicit pid list
-# rather than `pkill -f`: this hook's own shell (and the shell that invoked
-# it) can carry the pattern in its command line, and killing those would take
-# down the session instead of the browser.
-browser_pids() {
-  pgrep -u "$UID_SELF" -f "$PATTERN" 2>/dev/null \
-    | grep -vx -e "$$" -e "${PPID:-0}" || true
-}
-
+# it. TERM first so Chrome flushes its profile, then KILL.
 pids="$(browser_pids)"
 if [[ -n "$pids" ]]; then
   # shellcheck disable=SC2086
