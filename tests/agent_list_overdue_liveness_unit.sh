@@ -179,8 +179,97 @@ n_seen=$(grep -c '_hb_mark_seen "\$name"' "$SRC/cmd_heartbeat.sh")
 is 'busy-skip, active-defer and no-work each record their decision' "$n_seen" '3'
 # The wake-failure path must NOT stamp: an undeliverable wake is the stall this
 # column exists to show, and stamping it would make the alarm unreachable.
+#
+# DIVE-4299 — the first version of this arm lied twice. It anchored on the FIRST
+# line containing the log sentence, which a COMMENT carries as readily as code,
+# and then counted `_hb_mark_seen` to END OF FILE. On 2026-09-11 DIVE-4279's own
+# header comment quoted that sentence verbatim and this arm ejected PR #874 from
+# the merge queue twice, over an invariant that diff never touched (it adds zero
+# _hb_mark_seen calls). Same shape as DIVE-3591: a naive source scan matching the
+# file's own prose. So the scan below (a) drops whole-line comments — the
+# invariant is about CODE — (b) bounds its window to the wake-failure BRANCH by
+# indentation instead of running to EOF, and (c) says NO-ANCHOR rather than 0
+# when the log line is gone, so a renamed message fails loud instead of passing
+# an arm that is no longer looking at anything.
+wake_failure_stamps() { # <source-file> -> _hb_mark_seen calls inside the wake-failure branch
+  awk '
+    {
+      raw[NR] = $0
+      bare = $0; sub(/^[[:space:]]*/, "", bare); txt[NR] = bare
+      match($0, /^[[:space:]]*/); ind[NR] = RLENGTH
+      if (bare ~ /^#/) cmt[NR] = 1
+      if (!anchor && !cmt[NR] && /_hb_log/ && /wake failed — will retry next tick/) anchor = NR
+    }
+    END {
+      if (!anchor) { print "NO-ANCHOR"; exit }
+      lo = anchor; hi = anchor; base = ind[anchor]
+      for (i = anchor - 1; i >= 1;  i--) { if (cmt[i] || txt[i] == "") continue; if (ind[i] < base) break; lo = i }
+      for (i = anchor + 1; i <= NR; i++) { if (cmt[i] || txt[i] == "") continue; if (ind[i] < base) break; hi = i }
+      c = 0
+      for (i = lo; i <= hi; i++) if (!cmt[i] && raw[i] ~ /_hb_mark_seen/) c++
+      print c
+    }
+  ' "$1"
+}
 is 'the wake-failure path stamps nothing' \
-   "$(awk '/wake failed — will retry next tick/{found=1} found && /_hb_mark_seen/{c++} END{print c+0}' "$SRC/cmd_heartbeat.sh")" '0'
+   "$(wake_failure_stamps "$SRC/cmd_heartbeat.sh")" '0'
+
+echo "== and the scan that says so is pinned, in both directions =="
+FIXD="$TMPD/fx"; mkdir -p "$FIXD"
+fixture() { printf '%s\n' "$2" > "$FIXD/$1.sh"; printf '%s' "$FIXD/$1.sh"; }
+
+# (1) the PR #874 shape: a COMMENT quotes the sentence, the code stamps nothing.
+is 'a COMMENT quoting the log sentence is not the wake-failure path' \
+   "$(wake_failure_stamps "$(fixture comment '#!/usr/bin/env bash
+# incident log, quoted verbatim: wake failed — will retry next tick
+tick() {
+  if wake; then
+    _hb_mark_seen "$name" "$now" "mid-turn"
+  else
+    _hb_log "[$name] wake failed — will retry next tick"
+  fi
+}')")" '0'
+
+# (2) the EOF bug: a stamp on an unrelated path after the branch closes.
+is 'a stamp AFTER the branch closes is outside the window' \
+   "$(wake_failure_stamps "$(fixture after '#!/usr/bin/env bash
+tick() {
+  if wake; then
+    :
+  else
+    _hb_log "[$name] wake failed — will retry next tick"
+  fi
+  _hb_mark_seen "$name" "$now" "idle (no work)"
+}')")" '0'
+
+# (3) positive control, ABOVE the log line — an arm that cannot fail grades nothing.
+is 'a stamp inside the branch, before the log, is caught' \
+   "$(wake_failure_stamps "$(fixture before '#!/usr/bin/env bash
+tick() {
+  if wake; then
+    :
+  else
+    _hb_mark_seen "$name" "$now" "wake failed"
+    _hb_log "[$name] wake failed — will retry next tick"
+  fi
+}')")" '1'
+
+# (4) positive control, BELOW the log line.
+is 'a stamp inside the branch, after the log, is caught' \
+   "$(wake_failure_stamps "$(fixture behind '#!/usr/bin/env bash
+tick() {
+  if wake; then
+    :
+  else
+    _hb_log "[$name] wake failed — will retry next tick"
+    _hb_mark_seen "$name" "$now" "wake failed"
+  fi
+}')")" '1'
+
+# (5) the message renamed out from under the arm must be loud, not a silent 0.
+is 'a missing log line reads NO-ANCHOR, not a passing 0' \
+   "$(wake_failure_stamps "$(fixture gone '#!/usr/bin/env bash
+tick() { if wake; then :; else _hb_log "[$name] could not wake"; fi; }')")" 'NO-ANCHOR'
 
 printf '\nPASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
