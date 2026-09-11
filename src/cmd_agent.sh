@@ -148,8 +148,16 @@ _AGENT_LIST_HB_DEFS='
   # Positive evidence only: a stamp exists AND it is inside the same window the
   # age arm is judged against. An absent stamp (every seat before this ships)
   # changes nothing — the flag falls back to lastRunAt alone.
-  def hb_seen_fresh: hb_on and (hb_seen > 0) and (hb_seen_age <= (hb_every * 120));
-  def hb_stale: hb_on and ((hb_last <= 0) or (hb_age > (hb_every * 120)));
+  # DIVE-4310 — 2x cadence alone is not a stall threshold at a FAST cadence.
+  # Measured on the control plane 2026-09-11 11:44Z: quinn and main2 both read
+  # OVERDUE while mid-grade at a 1-minute cadence, because 2x = 120 SECONDS and
+  # any single turn longer than two minutes outruns it. The window is therefore
+  # the LONGER of 2x the cadence and 15 minutes — a floor, never a cap, so the
+  # slow cadences that this arm was written for (5m -> 10m, 30m -> 60m) are
+  # judged exactly as before and only the sub-8-minute cadences move.
+  def hb_window: (hb_every * 120) | if . < 900 then 900 else . end;
+  def hb_seen_fresh: hb_on and (hb_seen > 0) and (hb_seen_age <= hb_window);
+  def hb_stale: hb_on and ((hb_last <= 0) or (hb_age > hb_window));
   def hb_overdue: hb_stale and (hb_seen_fresh | not);
   # Stale by wake-age, but the tick saw it working: the row shows the reason.
   def hb_working: hb_stale and hb_seen_fresh;
@@ -182,7 +190,7 @@ _agent_list_hb_json() { # <merged-json> [now]
              ageSec: (if hb_ran then hb_age else null end),
              lastSeenAt: (if hb_seen > 0 then hb_seen else null end),
              seenAgeSec: (if hb_seen > 0 then hb_seen_age else null end),
-             reason: (if hb_overdue then (if hb_ran then "no wake and no observed activity for more than 2x cadence" else "enrolled but never run" end)
+             reason: (if hb_overdue then (if hb_ran then "no wake and no observed activity for longer than the stall window (2x cadence, min 15m)" else "enrolled but never run" end)
                       elif hb_working then hb_reason
                       else null end)}
        end)})' <<<"$merged"
@@ -210,7 +218,7 @@ _agent_list_table() {
     [.[] | select(hb_working) | .name + " (" + hb_reason + ", last wake " + (hb_age | hb_agefmt) + " ago)"] | join(", ")' <<<"$merged")
   if [[ -n "$_hb_overdue" ]]; then
     echo
-    echo "∿age/cadence — OVERDUE (no wake AND no observed activity for > 2x its own cadence, or never run): ${_hb_overdue}"
+    echo "∿age/cadence — OVERDUE (no wake AND no observed activity for > 2x its own cadence or 15m, whichever is longer, or never run): ${_hb_overdue}"
     echo "      a stall can also be a boot window: re-read after one full cadence before calling a seat dead (5dive agent list --json | jq '.data[].heartbeatStatus')"
   fi
   if [[ -n "$_hb_working" ]]; then
