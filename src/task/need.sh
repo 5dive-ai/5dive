@@ -1194,9 +1194,9 @@ _gate_clear_lead_denied_reason() {
 
 # DIVE-1381: the CONTENT-CURATION gate class — the third downgrade kind, mirror
 # of the eng-ship class (DIVE-1359) for our early-stage content surfaces
-# (OpenAgent / character-packs / the daily persona drip). Surfaced by DIVE-1366:
+# (OpenAgent / the marketplace registry / the daily persona drip). Surfaced by DIVE-1366:
 # a persona/pack QUEUE-READINESS approval is not a human call — per ship-gating,
-# OpenAgent/character-packs is an early-stage surface, safe to push, no approval
+# OpenAgent/the marketplace registry is an early-stage surface, safe to push, no approval
 # gate to the paired human; it is the org lead's (Marcus) to clear. But the T2
 # floor matches 'publish' in the ask/title and forces the gate hard-human
 # (tier-2 = unclearable by the lead), the exact wall DIVE-1366 hit. This class
@@ -1552,6 +1552,17 @@ _gate_option_has_second_person() {
 # audited, same shape as --discusses (DIVE-2089) and --rubber-stamp-ok
 # (DIVE-2848): a gate must never become unfileable (DIVE-2216), and an exception
 # that leaves a row is countable, which an invisible reword is not.
+#
+# DIVE-4329 — A LINT ABOUT WORDING MUST NOT CHANGE THE DESTINATION. The refusal
+# shipped with three exits and one of them was `--tier=1`, i.e. "send it to an
+# agent instead". That is a ROUTING verb offered as the remedy for a VOCABULARY
+# complaint, and a headless filer takes the exit that makes the command exit 0.
+# Measured 2026-09-11 14:24Z on DIVE-4239: a manual gate asking a person to try a
+# login queued on a lead seat and was never pinged. The exits are now "rewrite it"
+# and "declare the exception" — both of which leave the gate pointed at the same
+# human. Re-filing at another tier is still possible and still correct when the
+# gate was genuinely mis-typed; it is no longer SUGGESTED by a check that has no
+# opinion on who the ask belongs to.
 _GATE_ASK_MAX_WORDS=25
 
 # Each alternation is a shape a person outside our codebase cannot read. Tuned
@@ -1610,6 +1621,48 @@ _gate_ask_jargon_term() {
       return 0
     done < <(printf '%s' "$s" | grep -oE "$rx" 2>/dev/null || true)
   done
+  return 1
+}
+
+# DIVE-4329 — A LINK IS NOT JARGON WHEN THE ASK IS "GO TAP THIS".
+#
+# MEASURED 2026-09-11 14:24Z on DIVE-4239: a tier-2 `manual` gate asking lodar to
+# try a login on a preview deployment was refused by the check above, because the
+# preview URL matches the `path` arm (`5dive-app-git-xyz.vercel.app/login`) and
+# its host also matches the `branch` arm. The filer took the `--tier=1` exit the
+# refusal offered, the gate queued on a lead seat, and the person who is the only
+# party that can do the thing was never pinged. A gate that reaches nobody is a
+# stall with a receipt.
+#
+# The readability rule's subject is "this string contains a token the reader
+# cannot parse". A URL fails that test on its shape and passes it on its PURPOSE:
+# when the capability being consumed is a person at a browser, the link IS the
+# instruction, and deleting it leaves an ask nobody can act on. So the URL is
+# REMOVED FROM THE SCAN, not the scan from the gate — every other shape in the
+# remaining text is still graded, which is what "not BY ITSELF a lint failure"
+# means. The word cap is untouched: a URL is one word to the counter already, and
+# a long ask is long whatever it links to.
+#
+# SCHEME-FUL ONLY (`http://`, `https://`). A bare `vercel.app/login` is
+# indistinguishable from the `5dive-ai/5dive` repo path the `path` arm exists to
+# catch, and under-reaching is the cheap direction here exactly as it is in the
+# classifier above — a filer who wants the exception can type the scheme.
+_GATE_ASK_URL_RX='https?://[^[:space:]]+'
+_gate_ask_url_strip() {
+  printf '%s' "${1:-}" | sed -E "s#${_GATE_ASK_URL_RX}#link#g"
+}
+
+# Does this gate consume "a person at a browser/keyboard"? Two ways to say it:
+# DECLARED (`--needs=human_tap`), or stated by the TYPE — `manual` at tier 2 is
+# the type whose definition is "a step only a person can perform", so it names
+# the same capability without the flag. Kept as one predicate so the URL
+# exception and the no-lead-route backstop below cannot disagree about which
+# gates are the holder's.
+_gate_is_human_tap() {
+  local type="${1:-}" tier="${2:-}" needs="${3:-}"
+  [[ "$type" == "manual" && "$tier" == "2" ]] && return 0
+  [[ " $needs " == *" human_tap "* ]] && return 0
+  case "$needs" in *human_tap*) [[ "$needs" =~ (^|[^a-z_])human_tap([^a-z_]|$) ]] && return 0 ;; esac
   return 1
 }
 
@@ -2517,7 +2570,7 @@ cmd_task_need() {
   fi
 
   # DIVE-1381: content-curation carve-out. Mirror of the eng-ship class (DIVE-1359)
-  # for our early-stage content surfaces (OpenAgent / character-packs / the persona
+  # for our early-stage content surfaces (OpenAgent / the marketplace registry / the persona
   # drip). A persona/pack QUEUE-READINESS approval is lead-clearable, not a human
   # call — but the T2 floor matches 'publish' in the ask/title and forces it
   # hard-human (tier-2, unclearable by the lead), the exact wall DIVE-1366 hit.
@@ -3083,7 +3136,13 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
   # off the row — the same shape the eng-ship guard above uses.
   local _ar_human=0
   if [[ "$tier" == "2" ]]; then
-    if [[ "$type" == "secret" || "$tier_arg" == "2" || "$tier_floored" == "1" \
+    # DIVE-4329: `manual` joins `secret` here, and it has to — the routing
+    # backstop below now refuses every agent for a tier-2 manual gate, so it
+    # reaches the paired human whether or not the chart resolves a lead. This
+    # predicate exists to track "who actually reads this ask"; leaving it behind
+    # the routing change would let an unreadable holder-facing ask through on the
+    # strength of a lead that is no longer in the path.
+    if [[ "$type" == "secret" || "$type" == "manual" || "$tier_arg" == "2" || "$tier_floored" == "1" \
           || "$_needs_human" == "1" || -z "$(_gate_route_reviewer "$(task_actor "$from")")" ]]; then
       _ar_human=1
     fi
@@ -3094,15 +3153,23 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
     _ar_human=1
   fi
   if (( _ar_human )); then
-    local _ar_words _ar_term="" _ar_why=""
+    local _ar_words _ar_term="" _ar_why="" _ar_scan="$ask" _ar_opt_scan="$options" _ar_url=0
+    # DIVE-4329: when the capability is "a person at a browser", a link in the ask
+    # is the instruction, not jargon. Strip URLs from the SCANNED copy only — the
+    # ask itself, the word count and every other jargon shape are unchanged.
+    if _gate_is_human_tap "$type" "$tier" "$needs"; then
+      _ar_scan=$(_gate_ask_url_strip "$ask")
+      _ar_opt_scan=$(_gate_ask_url_strip "$options")
+      [[ "$_ar_scan" != "$ask" ]] && _ar_url=1
+    fi
     _ar_words=$(_gate_ask_word_count "$ask")
-    _ar_term=$(_gate_ask_jargon_term "$ask" 2>/dev/null) || _ar_term=""
+    _ar_term=$(_gate_ask_jargon_term "$_ar_scan" 2>/dev/null) || _ar_term=""
     # --options are read by the human too (they are the buttons), so they are
     # held to the vocabulary rule as well. Not to the word cap: an option is a
     # label, and the cap is a budget for one sentence.
     local _ar_opt_term=""
     if [[ -n "$options" ]]; then
-      _ar_opt_term=$(_gate_ask_jargon_term "$options" 2>/dev/null) || _ar_opt_term=""
+      _ar_opt_term=$(_gate_ask_jargon_term "$_ar_opt_scan" 2>/dev/null) || _ar_opt_term=""
     fi
     (( _ar_words > _GATE_ASK_MAX_WORDS )) \
       && _ar_why="it runs ${_ar_words} words (the cap is ${_GATE_ASK_MAX_WORDS})"
@@ -3123,8 +3190,8 @@ Rewrite the ask as a CHOICE BETWEEN OUTCOMES, consequence first: what changes if
   good  \"A cleanup job needs read access it doesn't have. Give it that access permanently, or have me run the one-off check myself?\"
 THE TEST, and it is a diagnostic and not a style note: if you cannot write the ask without our vocabulary, you have not found the decision yet — you are still describing your investigation. A real decision is always expressible as a choice between outcomes. Your exits:
   rewrite the ask       one short sentence, under ${_GATE_ASK_MAX_WORDS} words, no internal names. This is the exit that is wanted.
-  --tier=1              route it to your lead or this task's verifier instead — an AGENT reads that gate, and a sha is the clearest thing you can write to one. This rule does not apply there.
-  --ask-ok=\"<why this ask cannot be written in plain English>\"    the audited exception. Recorded on the gate and countable afterwards."
+  --ask-ok=\"<why this ask cannot be written in plain English>\"    the audited exception. Re-run this same command with that flag appended and the gate files, unchanged, to the same person. Recorded on the gate and countable afterwards.
+THE ONE EXIT THIS REFUSAL DOES NOT OFFER IS A DIFFERENT DESTINATION. --tier=1 would send this somewhere else, and nothing about the wording of an ask says the person who has to act on it is the wrong person. DIVE-4239 took that exit on 2026-09-11: a login only a person at a browser could try queued on a lead seat, which cannot open a browser, and nobody was ever pinged. If this ask genuinely belongs to an agent, re-file it as the gate you meant; do not let a note about vocabulary re-route it."
       fi
       # Declared: file it, say so, and leave a row. An exception nobody can count
       # is a warning with extra steps, which is the thing this ticket replaced.
@@ -3999,6 +4066,29 @@ THE TEST, and it is a diagnostic and not a style note: if you cannot write the a
   # override above (eng-ship / curation / internal-ops / access / verifier-route)
   # can cross it — the verifier-route being the one this ticket exists to stop.
   [[ "$_needs_human" == "1" ]] && _routable=0
+  # DIVE-4329 — A TIER-2 `manual` GATE IS THE HOLDER'S, AND `manual` IS THE TYPE
+  # THAT SAYS SO WITHOUT A FLAG.
+  #
+  # `--type=manual` means "a step only a person can perform". `secret` has been
+  # unroutable since DIVE-1182 for exactly that reason — a credential must be
+  # delivered by a human — and `manual` was left routable because a builder's
+  # ship handoff is sometimes filed as one. But the kind-based routes above do not
+  # read the type's meaning: `_row_ship` routes ANY of decision/approval/manual on
+  # a branch- or delivery-bound row, and it deliberately does NOT lower the tier
+  # (routing and clearance are separate axes). So a tier-2 manual gate on a row
+  # that happens to carry a PR was handed to a lead SEAT, which by the gate's own
+  # declaration cannot do the thing. Measured 2026-09-11 14:24Z: DIVE-4239's
+  # login-test gate queued on olivia and was never pinged.
+  #
+  # EFFECTIVE TIER, NOT `tier_arg`, IS THE PREDICATE. The eng-ship / curation /
+  # internal-ops downgrades force a misfiled builder handoff to tier 1 before this
+  # line, so the DIVE-1182 population — a ship gate a lead really can clear — keeps
+  # its lead route byte-for-byte. What is left at tier 2 is the gate that said "a
+  # person must do this" and was never talked out of it. Sibling of the DIVE-2241
+  # `_needs_human` constant directly above: same resolution (refuse every agent and
+  # fall through to task_need_notify's human ping, which stamps and pings the named
+  # holder), reached by the type instead of by the flag.
+  [[ "$type" == "manual" && "$tier" == "2" ]] && _routable=0
   # DIVE-3228 / DIVE-3525 — there is deliberately NO `_approval_default` kind here,
   # and the deletion is the finding rather than an omission. Iteration 1 of this
   # ticket added `[[ $type == approval && $_routable == 1 ]] && _approval_default=1`,

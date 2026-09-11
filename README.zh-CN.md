@@ -314,7 +314,7 @@ sudo 5dive agent marketplace ls            # 浏览 character-pack 仓库
 sudo 5dive agent import olivia --as=ceo    # 从 pack 创建具名智能体
 ```
 
-`--as` 是该智能体在你主机上的名字；pack 会提供人格、模型和技能。导入时加 `--channels=telegram` 可同时配置 bot。Pack 位于 [`5dive-ai/character-packs`](https://github.com/5dive-ai/character-packs) 仓库，`5dive.yaml` 也可以通过 `pack: <slug>` 引用。
+`--as` 是该智能体在你主机上的名字；pack 会提供人格、模型和技能。导入时加 `--channels=telegram` 可同时配置 bot。Pack 位于 [`5dive-ai/5dive-marketplace`](https://github.com/5dive-ai/5dive-marketplace) 仓库，`5dive.yaml` 也可以通过 `pack: <slug>` 引用。
 
 ### 查看组织层：`5dive ui`
 

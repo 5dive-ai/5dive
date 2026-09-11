@@ -142,28 +142,69 @@ resolve_gh_tag() {
 # A failed/invalid route NEVER means "latest". On an existing box the running
 # version is the floor, so stale control-plane state cannot cause a downgrade;
 # FIVE_ALLOW_DOWNGRADE=1 remains the deliberate rollback escape hatch.
+# DIVE-4294: the resolution RECEIPT. resolve_cli_target is the only authority on
+# which tag this box installs and from which rung; until now that answer existed
+# only in this function's locals and died with the process, so the dashboard's
+# "Updates started" could not say what started. stdout here is the RETURN VALUE
+# (every caller does GH_PINNED_TAG="$(resolve_cli_target)") and stderr is dropped
+# by the soft-update exec-into-log, so the receipt is a FILE — the one surface a
+# later `5dive update --check --json` can read back without a new shelld verb.
+#
+# `rung` is a stable machine token, deliberately NOT the prose `source` (which is
+# already the free text a human reads) and deliberately NOT reusing the name
+# `source` from `update --check --json`, where it means "the ref the answer came
+# from". A pinned box and a canary box on the SAME tag differ ONLY here.
+#
+# Best-effort in the strictest sense: it writes no byte to stdout, fails silent,
+# and its failure can never fail an install.
+_record_cli_target_receipt() {
+  local tag="$1" rung="$2" detail="$3"
+  local receipt="${CLI_TARGET_RECEIPT_FILE:-/var/lib/5dive/cli-target.json}"
+  local dir; dir="$(dirname "$receipt")"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  local tmp="${receipt}.tmp.$$"
+  # Hand-rolled JSON: install.sh runs before anything is installed, so jq is not
+  # a dependency it may take. Every value here is either a validated tag, one of
+  # four literal rungs, or a path we composed — no user text reaches it unescaped
+  # except $detail, whose only variable part is a file path or URL from our own
+  # defaults; backslashes and quotes are stripped from it rather than escaped.
+  local safe_detail; safe_detail="${detail//\\/}"; safe_detail="${safe_detail//\"/}"
+  # 2>/dev/null comes BEFORE the > redirection deliberately: redirections are
+  # applied left to right, so with the order reversed an unwritable state dir
+  # makes BASH itself print "Permission denied" — onto the caller's stderr,
+  # which on the install path is a customer's install log and on the resolver
+  # path sits one pipe away from the return value. Graded by the arm named
+  # "receipt writing is silent when the state dir is unwritable".
+  printf '{"tag":"%s","rung":"%s","rungDetail":"%s","at":"%s"}\n' \
+    "$tag" "$rung" "$safe_detail" "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" \
+    2>/dev/null > "$tmp" || { rm -f "$tmp" 2>/dev/null; return 0; }
+  chmod 0644 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$receipt" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
 resolve_cli_target() {
   local override_file="${CLI_VERSION_OVERRIDE_FILE:-/etc/5dive/cli-version}"
   local canary_file="${CLI_CANARY_FILE:-/etc/5dive/cli-canary}"
   local known_file="${CLI_VERSION_KNOWN_FILE:-/var/lib/5dive/cli-version.last-known}"
   local route="${CLI_VERSION_URL:-https://api.5dive.com/cli-version}"
   local installed_bin="${CLI_INSTALLED_BIN:-/usr/local/bin/5dive}"
-  local target="" source="" floor=""
+  local target="" source="" floor="" rung=""
 
   if [[ -e "$override_file" ]]; then
     target="$(tr -d '[:space:]' < "$override_file" 2>/dev/null)"
-    source="local override $override_file"
+    source="local override $override_file"; rung=override
     if [[ ! "$target" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
       printf 'error: 5dive install: invalid CLI tag in %s (expected vMAJOR.MINOR.PATCH).\n' "$override_file" >&2
       return 1
     fi
   elif [[ -e "$canary_file" ]]; then
     target="$(resolve_gh_tag || true)"
-    source="canary opt-in ($canary_file) — newest released tag, ahead of the fleet pin"
+    source="canary opt-in ($canary_file) — newest released tag, ahead of the fleet pin"; rung=canary
   else
     target="$(curl -fsSL --max-time 5 "$route" 2>/dev/null | tr -d '[:space:]')" || target=""
     if [[ "$target" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      source="fleet stable route $route"
+      source="fleet stable route $route"; rung=route
       if mkdir -p "$(dirname "$known_file")" 2>/dev/null; then
         local known_tmp="${known_file}.tmp.$$"
         if printf '%s\n' "$target" > "$known_tmp" 2>/dev/null; then
@@ -177,7 +218,7 @@ resolve_cli_target() {
       else
         target=""
       fi
-      source="last known stable $known_file"
+      source="last known stable $known_file"; rung=last-known
     fi
   fi
 
@@ -210,6 +251,8 @@ resolve_cli_target() {
   # the tag and installed as a version string. It still reaches the operator —
   # the nightly driver and the dashboard's update both keep stderr in the log.
   printf '5dive install: CLI target %s — source: %s\n' "$target" "$source" >&2
+
+  _record_cli_target_receipt "$target" "$rung" "$source"
 
   printf '%s\n' "$target"
 }
@@ -775,7 +818,7 @@ JOURNALD
               stop-telegram-reply-check.sh \
               posttool-telegram-relay.sh userprompt-mirror-inter-agent.sh \
               stop-mirror-inter-agent.sh push-notify.sh \
-              sessionstart-resume-context.sh; do
+              sessionstart-resume-context.sh stop-browser-teardown.sh; do
     curl -fsSL "$REPO/hooks/$hook" -o "$LIB_DIR/$hook"
     chmod 755 "$LIB_DIR/$hook"
     ok "$hook"
@@ -1044,7 +1087,7 @@ JOURNALD
   fi
 
   # DIVE-4196 — TEAM TEMPLATES ARE NO LONGER STAGED. They moved to the same
-  # marketplace registry the character packs come from (<org>/character-packs,
+  # marketplace registry the character packs come from (<org>/5dive-marketplace,
   # under teams/) and `5dive team` reads them live.
   #
   # Do not restore a staging loop here. Staging at install time is the defect,

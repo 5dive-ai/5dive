@@ -2,7 +2,7 @@
 # DIVE-2567 isolated unit harness for the memory leak-check on the EXPORT path.
 #
 # The rule ("published packs carry distilled seed memory, never raw private
-# memory") was documented in character-packs/README.md and enforced NOWHERE. This
+# memory") was documented in 5dive-marketplace/README.md and enforced NOWHERE. This
 # harness grades the enforcement, not the prose:
 #   1. _pack_memory_leakscan   — detects the CATEGORIES a published pack must not
 #      carry, and names file, line and category for each hit.

@@ -208,25 +208,262 @@ else
 fi
 
 echo "== the tick decisions that mean 'working' all stamp =="
-n_seen=$(grep -c '_hb_mark_seen "\$name"' "$SRC/cmd_heartbeat.sh")
+# A COMMENT MAP AND A CODE MAP ANSWER DIFFERENT QUESTIONS, and both scans below
+# need the second one (DIVE-4299, quinn's iteration-2 bounce).
+#   * `cmt[]` answers "is this LINE entirely prose" — that is what the
+#     indentation walk needs, because a whole-line comment inside a branch must
+#     not end the window.
+#   * every MATCH instead asks "is this OCCURRENCE prose", and a TRAILING
+#     comment lives on a line that IS code, so a line-level comment map says
+#     nothing about it. `# _hb_mark_seen "$name" is deliberately NOT called
+#     here` is the single most natural sentence a maintainer will ever write on
+#     this branch — the guard was punishing its own upkeep.
+# So: build the code-part of each line ONCE and read THAT wherever the scan asks
+# a question about code. Not `sub(/#.*/, "")`: a '#' inside a string
+# (`_hb_log "[$name] #5"`) is not a comment, and that strip silently shortens
+# real code — turning a false RED into a false GREEN, which is worse.
+AWK_STRIP='
+  function strip_inline_comment(s,   i, n, ch, out) {
+    q = ""; out = ""; n = length(s)
+    for (i = 1; i <= n; i++) {
+      ch = substr(s, i, 1)
+      if (q != "") {
+        if (ch == "\\" && q == DQ) { out = out ch substr(s, i + 1, 1); i++; continue }
+        if (ch == q) q = ""
+        out = out ch; continue
+      }
+      if (ch == SQ || ch == DQ) { q = ch; out = out ch; continue }
+      if (ch == "#" && (i == 1 || substr(s, i - 1, 1) ~ /[[:space:]]/)) return out
+      out = out ch
+    }
+    return out
+  }
+  BEGIN { SQ = sprintf("%c", 39); DQ = sprintf("%c", 34) }
+'
+stamp_call_sites() { # <source-file> -> code lines calling _hb_mark_seen "$name"
+  awk "$AWK_STRIP"'
+    { if (strip_inline_comment($0) ~ /_hb_mark_seen[[:space:]]+"\$name"/) c++ }
+    END { print c + 0 }
+  ' "$1"
+}
+n_seen=$(stamp_call_sites "$SRC/cmd_heartbeat.sh")
 is 'busy-skip, active-defer and no-work each record their decision' "$n_seen" '3'
+CMT_FIX="$TMPD/stamp_comment.sh"
+{ printf '# a comment quoting the call: _hb_mark_seen "$name" "$now" "why"\n'
+  cat "$SRC/cmd_heartbeat.sh"; } > "$CMT_FIX"
+is 'and a COMMENT quoting that call does not inflate the count' \
+   "$(stamp_call_sites "$CMT_FIX")" '3'
+TRAIL_FIX="$TMPD/stamp_trailing_comment.sh"
+{ printf 'noop() { :; }  # _hb_mark_seen "$name" is deliberately NOT called here\n'
+  cat "$SRC/cmd_heartbeat.sh"; } > "$TRAIL_FIX"
+is 'nor does a TRAILING comment quoting it on a line that is code' \
+   "$(stamp_call_sites "$TRAIL_FIX")" '3'
+HASH_FIX="$TMPD/stamp_quoted_hash.sh"
+{ printf '_hb_mark_seen "$name" "$now" "note #5 is not a comment"\n'
+  cat "$SRC/cmd_heartbeat.sh"; } > "$HASH_FIX"
+is "and a '#' inside a string is code, so the call on that line still counts" \
+   "$(stamp_call_sites "$HASH_FIX")" '4'
 # The wake-failure path must NOT stamp: an undeliverable wake is the stall this
 # column exists to show, and stamping it would make the alarm unreachable.
 #
-# ANCHORED ON THE CODE LINE, NEVER ON THE PROSE. This arm used to anchor on the
-# verdict's text ("wake failed — will retry next tick"). DIVE-4310 reworded that
-# verdict to name the failing step and left the OLD string quoted in the comment
-# that explains why — so the text anchor matched a comment ~3000 lines earlier
-# and counted every stamp in the file below it: 3, not 0. The arm failed on a
-# change that did exactly what it was supposed to check for. A grep for a string
-# a comment may legitimately quote is not a structural predicate.
+# DIVE-4299 + DIVE-4310, RECONCILED. Two rows fixed half of this arm each, and
+# the halves are both load-bearing:
+#
+#   * DIVE-4278's original anchored on the FIRST line carrying the verdict's
+#     PROSE ("wake failed — will retry next tick") — which a comment carries as
+#     readily as code — then counted `_hb_mark_seen` to END OF FILE. On
+#     2026-09-11 DIVE-4279's header comment quoted that sentence verbatim and
+#     this arm ejected PR #874 from the merge queue twice, over an invariant
+#     that diff never touched (it adds zero stamps). Same shape as DIVE-3591.
+#   * DIVE-4310 replaced the prose anchor with the branch's own CODE line and
+#     added the two arms below — but kept scanning to EOF and kept matching
+#     comments, so a bare comment naming `_hb_mark_seen` three lines under its
+#     own anchor still reds it (measured by quinn on main, 2026-09-11).
+#
+# So, together: (a) the anchor is `sk_fail=$((sk_fail + 1))`, and
+# `^[[:space:]]*sk_fail=` is unsatisfiable by a comment because the `#` would
+# have to come first — that is what makes it STRUCTURAL, not that it is short;
+# (b) the window is the BRANCH, bounded by indentation in BOTH directions —
+# forward-only misses a stamp placed above the counter, the likeliest real
+# violation; (c) comments inside that window are dropped OCCURRENCE-wise rather
+# than line-wise, because a trailing comment sits on a line that IS code — see
+# the code-map note above `stamp_call_sites`; (d) a vanished anchor prints NO-ANCHOR, never a passing 0, so
+# renaming the counter fails LOUD instead of grading nothing forever; (e) a
+# branch collapsed onto its own if/else line carries the enclosing block's
+# indent, so it is graded alone rather than expanded into its siblings.
 FAIL_LN=$(grep -n '^[[:space:]]*sk_fail=\$((sk_fail + 1))' "$SRC/cmd_heartbeat.sh" | cut -d: -f1 | head -1)
 is 'the wake-failure verdict is exactly one code line' \
    "$(grep -c '^[[:space:]]*sk_fail=\$((sk_fail + 1))' "$SRC/cmd_heartbeat.sh")" '1'
-is 'the wake-failure path stamps nothing' \
-   "$(sed -n "${FAIL_LN},\$p" "$SRC/cmd_heartbeat.sh" | grep -c '_hb_mark_seen')" '0'
 has 'and the verdict names the step that failed' \
     "$(sed -n "${FAIL_LN}p" "$SRC/cmd_heartbeat.sh")" '_HB_WAKE_FAIL_REASON'
+wake_failure_stamps() { # <source-file> -> _hb_mark_seen calls inside the wake-failure branch
+  awk "$AWK_STRIP"'
+    {
+      code[NR] = strip_inline_comment($0)
+      bare = $0; sub(/^[[:space:]]*/, "", bare); txt[NR] = bare
+      match($0, /^[[:space:]]*/); ind[NR] = RLENGTH
+      if (bare ~ /^#/) cmt[NR] = 1
+      if (!anchor && !cmt[NR] && code[NR] ~ /(^|[[:space:];&|])sk_fail=\$\(\([[:space:]]*sk_fail[[:space:]]*\+[[:space:]]*1[[:space:]]*\)\)/) {
+        anchor = NR
+        # A branch collapsed onto its own if/else line carries the indent of the
+        # enclosing block, so expanding by indent would swallow its siblings.
+        # Such a line IS the whole branch: grade it alone.
+        if (code[NR] ~ /(^|[[:space:];])(if|elif|else|then)([[:space:];]|$)/) solo = 1
+      }
+    }
+    END {
+      if (!anchor) { print "NO-ANCHOR"; exit }
+      lo = anchor; hi = anchor; base = ind[anchor]
+      if (!solo) {
+        for (i = anchor - 1; i >= 1;  i--) { if (cmt[i] || txt[i] == "") continue; if (ind[i] < base) break; lo = i }
+        for (i = anchor + 1; i <= NR; i++) { if (cmt[i] || txt[i] == "") continue; if (ind[i] < base) break; hi = i }
+      }
+      c = 0
+      for (i = lo; i <= hi; i++) if (code[i] ~ /_hb_mark_seen/) c++
+      print c
+    }
+  ' "$1"
+}
+is 'the wake-failure path stamps nothing' \
+   "$(wake_failure_stamps "$SRC/cmd_heartbeat.sh")" '0'
+
+echo "== and the scan that says so is pinned, in both directions =="
+FIXD="$TMPD/fx"; mkdir -p "$FIXD"
+fixture() { printf '%s\n' "$2" > "$FIXD/$1.sh"; printf '%s' "$FIXD/$1.sh"; }
+
+# (1) the PR #874 shape, now in the form that survives BOTH rewordings: a
+# comment quotes the retired log sentence AND a comment names the stamp, while
+# the code stamps nothing. This is the control main fails today.
+is 'comments quoting the log sentence and the stamp are not the wake-failure path' \
+   "$(wake_failure_stamps "$(fixture comment '#!/usr/bin/env bash
+# incident log, quoted verbatim: wake failed — will retry next tick
+# and the invariant it guards: the branch must not call _hb_mark_seen
+tick() {
+  if wake; then
+    _hb_mark_seen "$name" "$now" "mid-turn"
+  else
+    sk_fail=$((sk_fail + 1)); _hb_log "[$name] wake failed at ${_HB_WAKE_FAIL_REASON} — will retry next tick"
+  fi
+}')")" '0'
+
+# (2) the EOF bug: a stamp on an unrelated path after the branch closes.
+is 'a stamp AFTER the branch closes is outside the window' \
+   "$(wake_failure_stamps "$(fixture after '#!/usr/bin/env bash
+tick() {
+  if wake; then
+    :
+  else
+    sk_fail=$((sk_fail + 1)); _hb_log "[$name] wake failed"
+  fi
+  _hb_mark_seen "$name" "$now" "idle (no work)"
+}')")" '0'
+
+# (3) positive control, ABOVE the counter — an arm that cannot fail grades nothing.
+is 'a stamp inside the branch, before the counter, is caught' \
+   "$(wake_failure_stamps "$(fixture before '#!/usr/bin/env bash
+tick() {
+  if wake; then
+    :
+  else
+    _hb_mark_seen "$name" "$now" "wake failed"
+    sk_fail=$((sk_fail + 1))
+    _hb_log "[$name] wake failed"
+  fi
+}')")" '1'
+
+# (4) positive control, BELOW the counter.
+is 'a stamp inside the branch, after the counter, is caught' \
+   "$(wake_failure_stamps "$(fixture behind '#!/usr/bin/env bash
+tick() {
+  if wake; then
+    :
+  else
+    sk_fail=$((sk_fail + 1))
+    _hb_mark_seen "$name" "$now" "wake failed"
+  fi
+}')")" '1'
+
+# (5) a COMMENT naming the stamp INSIDE the window is prose, not a violation.
+# This is precisely the line quinn injected three below main's own anchor to
+# show the wire was still live there.
+is 'a COMMENT naming the stamp inside the branch is not a violation' \
+   "$(wake_failure_stamps "$(fixture incomment '#!/usr/bin/env bash
+tick() {
+  if wake; then
+    :
+  else
+    sk_fail=$((sk_fail + 1))
+    # deliberately does NOT call _hb_mark_seen — see DIVE-4278
+    _hb_log "[$name] wake failed"
+  fi
+}')")" '0'
+
+# (6) the counter renamed out from under the arm must be loud, not a silent 0.
+is 'a missing anchor reads NO-ANCHOR, not a passing 0' \
+   "$(wake_failure_stamps "$(fixture gone '#!/usr/bin/env bash
+tick() { if wake; then :; else wake_failures=$((wake_failures + 1)); fi; }')")" 'NO-ANCHOR'
+
+# (7)/(8) a branch collapsed onto one line is graded alone, not widened to its siblings.
+is 'a collapsed one-line branch does not swallow the next statement' \
+   "$(wake_failure_stamps "$(fixture collapsed '#!/usr/bin/env bash
+tick() {
+  if wake; then :; else sk_fail=$((sk_fail + 1)); fi
+  _hb_mark_seen "$name" "$now" "idle (no work)"
+}')")" '0'
+is 'and a violation ON that collapsed line is still caught' \
+   "$(wake_failure_stamps "$(fixture collapsed_bad '#!/usr/bin/env bash
+tick() {
+  if wake; then :; else sk_fail=$((sk_fail + 1)); _hb_mark_seen "$n" "$t" "x"; fi
+}')")" '1'
+
+# (9)/(10) a TRAILING comment is prose on a line that IS code, so a line-level
+# comment map cannot see it. Neither shape below changes any code and both used
+# to red — and they are the likeliest sentences anyone will ever write on this
+# branch, whose entire invariant is "do not stamp here". The guard was
+# punishing its own upkeep.
+is 'a TRAILING comment naming the stamp inside the branch is not a violation' \
+   "$(wake_failure_stamps "$(fixture trailing '#!/usr/bin/env bash
+tick() {
+  if wake; then
+    :
+  else
+    sk_fail=$((sk_fail + 1))
+    _hb_log "[$name] wake failed"  # we must not _hb_mark_seen "$name" here
+  fi
+}')")" '0'
+is 'nor one appended to the anchor line itself' \
+   "$(wake_failure_stamps "$(fixture trailing_anchor '#!/usr/bin/env bash
+tick() {
+  if wake; then
+    :
+  else
+    sk_fail=$((sk_fail + 1))  # _hb_mark_seen "$name" is deliberately NOT called here
+  fi
+}')")" '0'
+
+# (11)/(12) the other direction, and the reason the strip is quote-aware rather
+# than `sub(/#.*/, "")`: a '#' inside a string is CODE. A blind strip would cut
+# there, shorten the line, and hide a real stamp behind it — a false GREEN,
+# strictly worse than the false RED this row was filed for.
+is "a '#' inside a string does not shorten the code, so a real stamp is caught" \
+   "$(wake_failure_stamps "$(fixture quoted_hash '#!/usr/bin/env bash
+tick() {
+  if wake; then
+    :
+  else
+    sk_fail=$((sk_fail + 1))
+    _hb_log "[$name] wake failed #3"; _hb_mark_seen "$name" "$now" "wake failed"
+  fi
+}')")" '1'
+is "and the anchor survives a '#' inside a string earlier on its own line" \
+   "$(wake_failure_stamps "$(fixture quoted_hash_anchor '#!/usr/bin/env bash
+tick() {
+  if wake; then
+    :
+  else
+    _hb_log "[$name] retry #1"; sk_fail=$((sk_fail + 1))
+  fi
+}')")" '0'
 
 printf '\nPASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

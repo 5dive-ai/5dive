@@ -332,9 +332,14 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- a pull request they had closed out. The verifier's close now DECIDES the owner
   -- (src/task/delivery.sh, _merge_disp_decide) and records it, so the board renders
   -- a decision that was actually made rather than a guess re-derived per render.
-  --   merge_owner  the seat that owes the look — 'main' for every hold except the
-  --                one a maker alone can clear (a conflicted branch needing a
-  --                rebase), which names the maker.
+  --   merge_owner  the seat that owes the look. DIVE-4326: the decider emits a
+  --                ROLE ('merger' or 'maker') and never a seat, and the role is
+  --                resolved once — 'maker' from the row (a conflicted branch is
+  --                the one hold a maker alone can clear), 'merger' from the repo
+  --                and the roster: ops, and 'main' only where ops cannot reach.
+  --                Before DIVE-4326 it was the literal 'main' on every hold, and
+  --                the heartbeat's DIVE-4206 rule then made every such row
+  --                dispatchable to main alone.
   --   merge_hold_reason  the disposition's own reason token, e.g.
   --                'graded-sha-is-not-the-head', 'merge-state-BLOCKED',
   --                'user-facing-surface'. Rendered in `task show`, not on the
@@ -845,6 +850,26 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- "this one row was singled out for grading". NULL is "no force", true of every
   -- pre-existing row.
   verify_forced           INTEGER,
+  -- DIVE-4324: THE REVIEW MODE, CHOSEN AT FILING. lodar, 2026-09-11: "I think it
+  -- should be per task. easy tasks no reviewer at all. some with spawnable temp
+  -- reviewer some with agent reviewer."
+  --   none          no grader at all — `task done` closes it outright
+  --   check         a COMMAND grades it (verify_command); no grader session
+  --   temp          one fresh pool session grades one delivery, then is gone
+  --   seat:<agent>  a PINNED standing reviewer grades it in its own session
+  -- WHY A COLUMN AND NOT A DERIVATION. The four modes are already REACHABLE
+  -- today through four unrelated flags (--no-verify / --verify=<cmd> / the
+  -- DIVE-969 default / --verifier=<agent>), and that is exactly the problem this
+  -- records: the stored state of "the filer chose the pool lane" and "the filer
+  -- said nothing and the default picked the pool lane" is byte-identical, so
+  -- nobody could measure how many graded rows were ever CHOSEN. Same argument as
+  -- verify_optout/verify_forced directly above — a decision and a default that
+  -- produce the same state are the same state until one of them is written down.
+  -- NULL is "this build never recorded it", true of every pre-existing row, and
+  -- is NOT a synonym for `none`: readers must render it as unknown, not as
+  -- ungraded. Written once at `task add`; the run-time authority on whether a
+  -- grader actually spends a session stays verify_grants_grader(), never this.
+  review_mode             TEXT,
   -- DIVE-3251: THE FIRST TIME REAL WORK STARTED ON THIS ROW, and the one clock in
   -- this table that no nudge/reclaim path may touch. `started_at` is the CURRENT
   -- claim's clock and the heartbeat ladder deliberately clears it on reclaim, "so
@@ -1345,8 +1370,11 @@ CREATE INDEX IF NOT EXISTS objective_cycles_idx ON objective_cycles(objective_id
 -- ledger_started pref (task_prefs) stamps the first init, and `trace` refuses to
 -- render an empty ledger section for a task that predates it.
 --   kind       dotted lifecycle verb: task.created|task.started|task.delivered|
---              task.done|task.cancelled|gate.filed|gate.answered|policy.refused|
---              ship|rollback
+--              task.graded|task.done|task.cancelled|gate.filed|gate.answered|
+--              policy.refused|ship|rollback
+--              task.graded is the VERDICT, not the close, and the two are days
+--              apart on a row held open for a merge (DIVE-4322) — a consumer
+--              asking "is this grade still running" must read the first.
 --   actor      the identity the RECORDING SITE is authoritative for, which is not
 --              the same namespace for every kind and should not be forced to be.
 --              Task lifecycle rows carry the BOARD actor (task_actor: `dev`),
@@ -1785,6 +1813,10 @@ _TASKS_ADDITIVE_COLUMNS=(
   'verify_optout INTEGER'
   # DIVE-4251: the add-time `--verify`. See the CREATE TABLE comment.
   'verify_forced INTEGER'
+  # DIVE-4324: the filing-time review mode (none|check|temp|seat:<agent>).
+  # Nullable — NULL is "never recorded", which is a real third state and not
+  # `none`. See the CREATE TABLE comment.
+  'review_mode TEXT'
   # DIVE-3251: the durable first-start clock, split out of `started_at` so the
   # reclaim ladder can keep restarting the age without destroying the evidence
   # that work happened. Nullable — NULL means "this build never recorded it",
@@ -1902,7 +1934,43 @@ _TASKS_TFV_SQL="graded_at IS NOT NULL
        AND (maker_agent IS NULL OR graded_by IS NULL OR graded_by <> maker_agent)
        AND (handoff_rejected_at IS NULL OR handoff_rejected_at < graded_at)
        AND (graded_verdict IS NULL OR graded_verdict = 'pass')
+       -- DIVE-4327 (invariant 3): A GRADE BINDS TO AN ITERATION, NOT JUST TO A ROW.
+       -- NO BACKTICKS AND NO DOUBLE QUOTES IN THIS COMMENT: the whole constant is
+       -- one double-quoted bash string, so a backticked verb name here RUNS AS A
+       -- COMMAND before sqlite ever sees the SQL, and a double quote ends the string.
+       -- The verb 'task deliver' does not clear graded_at, so after a redelivery
+       -- (or any iteration-2 delivery) the iteration-1 PASS was still sitting on the
+       -- row and this predicate read it as graded-and-waiting-on-a-merge. Measured
+       -- 2026-09-11 on DIVE-4276: the board painted graded->merge:main off an
+       -- iteration-1 PASS while iteration 2 sat delivered-and-UNGRADED, the verifier
+       -- was never woken, and the seat that was woken had nothing to do. A delivery
+       -- clock LATER than the grade clock is, by construction, a delivery the grade
+       -- did not grade. Narrowing, and only in that direction: the rows it removes
+       -- are exactly the ones awaiting a first grade of the current iteration.
+       AND (handoff_delivered_at IS NULL OR handoff_delivered_at <= graded_at)
        AND status NOT IN ('done','cancelled')"
+
+# DIVE-4327 — THE MERGE OWNER IS ONE FUNCTION, NOT NINE COPIES.
+#
+# Invariant 1 of the loop state machine (community/wiki/the-loop-end-to-end-one-
+# state-machine-from-filing-to-merge.md): a row's stage owner is a FACT on the row,
+# and the board's label and the picker's runnable predicate must be ONE function.
+# They were the same TEXT -- nine hand-copied COALESCE chains, each carrying a
+# comment promising it matched the board "character for character". A promise in a
+# comment is not a shared function: on 2026-09-11 the board painted
+# graded->merge:main, the picker answered "not runnable for you", and a seat logged
+# "no todo" every minute for 95 minutes while TODO=2. Nothing here can drift now
+# because there is only one copy; tests/loop_state_machine_invariants_unit.sh
+# arm 1 reds if a tenth literal copy is reintroduced anywhere in src/.
+#
+# <prefix> is the SQL table alias the caller's query uses ('t.' or empty). It is
+# the only variation between the nine sites, and it is the one thing a hand copy
+# got right -- the drift risk was never the alias, it was the fallback ORDER.
+_tasks_merge_owner_sql() {
+  local p="${1:-}"
+  printf "COALESCE(NULLIF(%smerge_owner,''), NULLIF(%smaker_agent,''), COALESCE(%sassignee,'?'))" \
+    "$p" "$p" "$p"
+}
 
 _TASKS_DB_GATE_COLUMNS=''
 _TASKS_DB_GATE_EPOCH=''

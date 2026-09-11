@@ -1237,6 +1237,49 @@ case "$TYPE" in
     UNSET_CREDS="" ;;
 esac
 
+# Turn-end browser teardown (DIVE-4306, claude only). agent-browser launches a
+# headless Chrome tree and never closes it; Claude Code reports native status
+# `busy` while ANY background shell lives, so a finished seat stays
+# undispatchable for as long as that Chrome does (measured: quinn, 1h20m,
+# 2026-09-11). DIVE-4298 bounds the damage at the heartbeat; this closes the
+# leak at the source by wiring the Stop hook that tears the tree down.
+#
+# Registered HERE rather than in preseed_claude_agent because the leak is on
+# seats that ALREADY exist — every seat runs this script on every boot, so one
+# restart backfills it, while agent-create would only cover new seats.
+# Idempotent by command path: re-registering is a no-op, and a settings.json
+# the agent has since hand-edited keeps every other key (jq merge, not
+# rewrite). Guarded on the shared copy being installed, same pattern as the
+# SessionStart hook in agent_setup.sh.
+_register_browser_teardown_hook() {
+  local settings="$1" hook="$2" tmp
+  [[ -x "$hook" ]] || return 0
+  [[ -f "$settings" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  # Already wired (by an earlier boot, or by preseed) -> nothing to do.
+  if jq -e --arg h "$hook" \
+       '[.hooks.Stop // [] | .[].hooks // [] | .[].command] | index($h)' \
+       "$settings" >/dev/null 2>&1; then
+    return 0
+  fi
+  tmp="$(mktemp "${settings}.XXXXXX")" || return 0
+  # APPEND to .hooks.Stop: the telegram plugin ships its own Stop hooks via
+  # hooks.json and an agent may have others here; replacing the array would
+  # silently unwire them.
+  if jq --arg h "$hook" \
+       '.hooks = ((.hooks // {}) + {Stop: ((.hooks.Stop // []) + [{hooks: [{type: "command", command: $h, timeout: 30}]}])})' \
+       "$settings" >"$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+    chmod 600 "$tmp"
+    mv "$tmp" "$settings"
+  else
+    rm -f "$tmp"
+  fi
+}
+if [[ "$TYPE" == "claude" ]]; then
+  _register_browser_teardown_hook "$HOME/.claude/settings.json" \
+    "/usr/local/lib/5dive/stop-browser-teardown.sh"
+fi
+
 # One-shot session resume (claude only): the telegram plugin's /resume writes
 # the checkpointed session id to $HOME/.claude/channels/telegram/resume-next
 # and triggers this unit restart. We add `--resume <id>` to the FIRST claude

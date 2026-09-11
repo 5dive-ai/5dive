@@ -666,8 +666,7 @@ _task_status_cmd() {
       # request actually reached main. An unmerged row refuses there, citing the
       # rule that is actually stopping it.
       local _gm_owner=''
-      _gm_owner=$(db "SELECT COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''),
-                                      COALESCE(assignee,'?'))
+      _gm_owner=$(db "SELECT $(_tasks_merge_owner_sql)
                         FROM tasks WHERE id=${id} AND (${_TASKS_TFV_SQL});" 2>/dev/null || true)
       if [[ -n "$_maker" && "$_actor" != "$_vfier" && "$_actor" != "cli" \
             && "$_st" != "done" && "$_st" != "cancelled" \
@@ -1547,7 +1546,7 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
           # is the half that fails silently — an accept sourced from a repo that is not
           # where the delivery went reads as a clean close and nothing invites a second
           # look. Measured on DIVE-2303: accepted on a commit in 5dive-ai/5dive while
-          # the delivery sat in character-packs, which was not in the searched set at
+          # the delivery sat in the marketplace registry, which was not in the searched set at
           # all. Only stated when the task DECLARED no repo, because a declared repo
           # narrows the scan to itself and there is no unsearched remainder to warn about.
           _attr_scope=""
