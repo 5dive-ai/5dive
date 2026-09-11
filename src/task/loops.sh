@@ -806,7 +806,7 @@ cmd_task_verify() {
       _md_dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};")
       if [[ -n "$_md_dref" ]] && declare -F _merge_disp_probe >/dev/null 2>&1; then
         _md_disp=$(_merge_disp_probe "$_md_dref" "$(_gate_graded_sha "$result_txt")" 2>/dev/null) \
-          || _md_disp="hold:main:disposition-probe-failed"
+          || _md_disp="hold:merger:disposition-probe-failed"
         if [[ "$_md_disp" == "merge" ]]; then
           # Auto-mergeable at the graded sha. The MERGE itself is not done here —
           # it belongs to `task done`, where the DIVE-1830 gate can re-derive that
@@ -820,6 +820,12 @@ cmd_task_verify() {
           # only here, where the row is in hand.
           [[ "$_md_owner" == "maker" ]] \
             && _md_owner=$(db "SELECT COALESCE(NULLIF(maker_agent,''), COALESCE(assignee,'')) FROM tasks WHERE id=${id};")
+          # `merger` is the other ROLE (DIVE-4326). The probe resolves it to a
+          # seat itself, because it is the half that knows the repo; this is the
+          # net for the one disposition the probe cannot produce — its own
+          # failure, above — and for any tree that called the pure decider directly.
+          [[ "$_md_owner" == "merger" ]] \
+            && _md_owner=$(_merge_hold_seat '' 2>/dev/null || printf 'main')
         fi
         db "UPDATE tasks SET merge_owner=$(sqlq "${_md_owner:-main}"),
                merge_hold_reason=$(sqlq "$_md_why")

@@ -199,5 +199,24 @@ got=$(_hb_pick_task dev)
 [[ -z "$got" ]] && ok_t "no merge_owner, maker_agent='codex': not dev's move, skipped" \
                 || bad_t "maker_agent fallback must skip another seat's merge" "got $got, graded=$GM"
 
+# --- Case 8: DIVE-4326 — the picker reads WHOEVER the disposition recorded -----
+# The merge owner of a held row is now `ops`, not the constant `main`, and the
+# whole point of the change is that the SAME skip and the SAME wake follow the
+# column. So the two readings above must hold with `ops` in it: skipped for every
+# other seat, selectable for ops itself. An implementation that special-cased the
+# string `main` anywhere in the picker would pass case 7 and red here.
+db "UPDATE tasks SET maker_agent='dev', merge_owner='ops' WHERE id=${GM};"
+got=$(_hb_pick_task dev)
+[[ -z "$got" ]] && ok_t "graded->merge:ops: not dev's move, skipped (DIVE-4326)" \
+                || bad_t "a merge owed by ops must not be handed to the maker" "got $got, graded=$GM"
+got=$(_hb_pick_task ops)
+[[ "$got" == "$GM" ]] && ok_t "graded->merge:ops: ops owes it, so ops can be handed it ($GM)" \
+                      || bad_t "the merge owner's own row must remain selectable for ops" "got $got, graded=$GM"
+# And main is now just another seat on this row — the arm that would have passed
+# silently for the whole life of the constant.
+got=$(_hb_pick_task main)
+[[ -z "$got" ]] && ok_t "graded->merge:ops: main is no longer hands-on for it (DIVE-4326)" \
+                || bad_t "main must not be handed a merge owed by ops" "got $got, graded=$GM"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
