@@ -238,8 +238,18 @@ if [[ $rc -ne 0 ]]; then
   echo "  harness-tree-guard: paste the printed source-line snippet into the named harness and recommit." >&2
   echo "  actionlint-push-guard: the named workflow file does not parse. Run: bash scripts/actionlint-scan.sh" >&2
   echo "  pre-push-rail: the named stage is red HERE and would be red in CI — fix it at your desk, where it costs minutes rather than a verifier round trip." >&2
-  echo "  Emergency override (discouraged; the matching CI job is still the net): git push --no-verify" >&2
-  echo "  AUDITED override for the rail only (printed into the push and logged, unlike --no-verify): FIVE_PUSH_OVERRIDE=\"\$(cat reason.txt)\" git push" >&2
+  # DIVE-4288: on a delegated push (root's `_push_do` runs the git push; the
+  # authoring seat holds no git credential) BOTH of these commands are
+  # unrunnable by the reader. Print the one route that seat has instead of two
+  # it does not.
+  if [[ -n "${FIVE_PUSH_DELEGATED:-}" ]]; then
+    echo "  This push was DELEGATED — your seat runs no git push of its own, so --no-verify is not available to you." >&2
+    echo "  AUDITED override for the rail only (printed into the push and logged): FIVE_PUSH_OVERRIDE=\"\$(cat reason.txt)\" 5dive push ${FIVE_PUSH_TASK:-<row>}" >&2
+    echo "  Note: the override covers the RAIL only. A PII, harness-tree or actionlint red above is not overridable and must be fixed." >&2
+  else
+    echo "  Emergency override (discouraged; the matching CI job is still the net): git push --no-verify" >&2
+    echo "  AUDITED override for the rail only (printed into the push and logged, unlike --no-verify): FIVE_PUSH_OVERRIDE=\"\$(cat reason.txt)\" git push" >&2
+  fi
   exit 1
 fi
 exit 0
