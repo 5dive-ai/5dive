@@ -273,5 +273,137 @@ else
   bad_t "never: 'task verifier' retrofit grants a grader" "the row stores verifier='$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${_rid};")' but the resolver still declines it"
 fi
 
+# ── ARM 5 (DIVE-4322): a PASS parked on a merge must not hold a grader slot ──
+#
+# The cap counted a grade in flight from `task.grade.spawned` until the ROW
+# closed. A PASS on a bound row is held open as graded->merge (DIVE-3330) and its
+# close waits on a human's merge — hours. Measured 2026-09-11: two such rows held
+# both slots of the --cap=2 lane for three hours and starved 19 queued grades.
+#
+# DIFFERENTIAL WITHIN ONE BUILD, and it has to be: "the waiter spawned" is also
+# what a lane with no cap at all reads like, and "the waiter queued" is what a
+# lane that spawns nothing reads like. So the SAME fixture is measured three
+# times, changing only whether the two occupiers carry a verdict. The control is
+# the reading that must NOT move — two graders genuinely mid-grade still fill the
+# cap, or this change would have deleted the cap rather than corrected it.
+#
+# Fresh slate: the arms above left pending rows and ledger rows behind, and this
+# arm asserts ABSOLUTE counts (a delta cannot express "the cap bit").
+set_policy always
+db "UPDATE tasks SET status='done';" >/dev/null
+db "DELETE FROM lifecycle_events;" >/dev/null
+
+# An occupier: a row a grader was spawned on two hours ago and never closed.
+# The spawn ts is backdated because the belt keys on a verdict clock STRICTLY
+# later than the spawn, which is the property that stops a stale verdict from a
+# previous iteration releasing a slot a live grader is using.
+seed_occupier() { # -> ident
+  db "INSERT INTO tasks (title,status,assignee,verifier,maker_agent,kind,priority,created_by,delivery_ref)
+      VALUES ($(sqlq "occupier $RANDOM"),'todo','quinn','quinn','dev2','standard','high','main','https://github.com/o/r/pull/61');" >/dev/null
+  local id; id=$(db "SELECT ident FROM tasks ORDER BY id DESC LIMIT 1;")
+  db "INSERT INTO lifecycle_events (kind,ident,actor,idem_key,detail,ts)
+      VALUES ('task.grade.spawned',$(sqlq "$id"),'sys',$(sqlq "spawn-${id}-$RANDOM"),'fixture',datetime('now','-2 hours'));" >/dev/null
+  printf '%s' "$id"
+}
+_o1=$(seed_occupier); _o2=$(seed_occupier)
+_w=$(seed_pending none)   # the waiter: a request, no spawn
+
+_tick2() { cmd_task_grader_tick --cap=2 --json 2>/dev/null; }
+
+# CONTROL — both graders are still grading. No verdict anywhere, so the cap bites.
+_j=$(_tick2)
+if [[ "$(jq -r '.spawned' <<<"$_j")" == "0" && "$(jq -r '.queued' <<<"$_j")" == "1" ]]; then
+  ok_t "4322 control: two graders mid-grade fill --cap=2 and the next delivery QUEUES"
+else
+  bad_t "4322 control: the cap still bites on two live grades" "json=$_j — the two arms below would pass against a lane with no cap"
+fi
+
+# (a) THE LEDGER READING — a verdict was stored, the row is still open awaiting a
+# merge. Both slots must be released even though nothing closed.
+_graded_event() { db "INSERT INTO lifecycle_events (kind,ident,actor,idem_key,detail)
+    VALUES ('task.graded',$(sqlq "$1"),'quinn',$(sqlq "graded-$1-$RANDOM"),'verdict=pass');" >/dev/null; }
+_graded_event "$_o1"; _graded_event "$_o2"
+_j=$(_tick2)
+if [[ "$(jq -r '.spawned' <<<"$_j")" == "1" ]]; then
+  ok_t "4322 (a): a stored task.graded verdict frees the slot while the row waits on its merge"
+else
+  bad_t "4322 (a): task.graded frees the slot" "json=$_j — a PASS parked on main's merge is still counted as a grader in flight"
+fi
+
+# (b) THE STRUCTURAL BELT — the same two rows as they look after an UPGRADE: they
+# were graded before task.graded existed, so no ledger row can ever appear for
+# them. The row's own verdict clock and merge_owner must release them, or the
+# lane stays frozen by whatever is already parked at the moment the fix ships.
+db "DELETE FROM lifecycle_events WHERE kind='task.graded';" >/dev/null
+db "UPDATE tasks SET graded_verdict='pass', graded_verdict_at=datetime('now'),
+       merge_owner='main', merge_hold_reason='awaiting merge'
+     WHERE ident IN ($(sqlq "$_o1"),$(sqlq "$_o2"));" >/dev/null
+_j=$(_tick2)
+if [[ "$(jq -r '.spawned' <<<"$_j")" == "1" ]]; then
+  ok_t "4322 (b): a row already graded->merge at upgrade time frees the slot with no ledger row"
+else
+  bad_t "4322 (b): the graded->merge belt frees the slot" "json=$_j — rows graded before the fix shipped would hold the lane frozen until they closed"
+fi
+
+# The belt must NOT fire on a verdict that predates the spawn: that is the
+# re-delivered row whose grader is genuinely working right now, wearing a stale
+# merge_owner from the pass it was rejected after. Fail-open here is the one way
+# this change could spawn graders on top of live ones.
+db "UPDATE tasks SET graded_verdict_at=datetime('now','-3 hours')
+     WHERE ident IN ($(sqlq "$_o1"),$(sqlq "$_o2"));" >/dev/null
+_j=$(_tick2)
+if [[ "$(jq -r '.spawned' <<<"$_j")" == "0" ]]; then
+  ok_t "4322: a verdict OLDER than the spawn does not free the slot (stale merge_owner cannot fail the cap open)"
+else
+  bad_t "4322: a stale pre-spawn verdict must not free the slot" "json=$_j — a re-graded row would get a second grader stacked on the first"
+fi
+
+# ── ARM 6 (DIVE-4322): the producer and the consumer, end to end ─────────────
+# ARM 5's (a) hand-wrote the ledger row, so it grades the QUERY and would pass
+# just as loudly if `task verify` never emitted anything. This arm writes no
+# ledger row at all: it runs the real verb, in the shape a credential-less grader
+# actually uses (`--no-done --result=`), and asks the lane afterwards.
+#
+# The disposition probe is stubbed because it shells out to `gh`; the hold it
+# returns is the realistic answer for this fixture (a PASS whose merge is owed),
+# and it is what puts the row in graded->merge.
+_merge_disp_probe() { printf 'hold:main:awaiting a human merge'; }
+
+db "UPDATE tasks SET status='done';" >/dev/null
+db "DELETE FROM lifecycle_events;" >/dev/null
+_e1=$(seed_occupier); _e2=$(seed_occupier)
+_ew=$(seed_pending none)
+
+_j=$(_tick2)
+if [[ "$(jq -r '.spawned' <<<"$_j")" == "0" ]]; then
+  ok_t "4322 e2e control: before either grade lands, the cap holds the waiter"
+else
+  bad_t "4322 e2e control: the cap holds before the grades land" "json=$_j"
+fi
+
+grade_as_quinn() { ( actor_seam_as quinn; cmd_task_verify "$1" --no-done --result="PASS — read the diff, graded-sha: deadbeef" ) >/dev/null 2>&1; }
+grade_as_quinn "$_e1"; grade_as_quinn "$_e2"
+
+_ge=$(db "SELECT COUNT(*) FROM lifecycle_events WHERE kind='task.graded';")
+if [[ "$_ge" == "2" ]]; then
+  ok_t "4322 e2e: 'task verify --no-done --result=' emits task.graded (2 verdicts, 2 rows)"
+else
+  bad_t "4322 e2e: verify emits task.graded" "task.graded rows=$_ge (want 2) — the ledger reading in the lane has no producer"
+fi
+
+_gv=$(db "SELECT COUNT(*) FROM tasks WHERE ident IN ($(sqlq "$_e1"),$(sqlq "$_e2")) AND COALESCE(merge_owner,'')<>'';")
+if [[ "$_gv" == "2" ]]; then
+  ok_t "4322 e2e: both rows are parked in graded->merge (the state that used to freeze the lane)"
+else
+  bad_t "4322 e2e: the rows park in graded->merge" "merge_owner set on $_gv of 2 — the fixture is not reproducing the measured stall"
+fi
+
+_j=$(_tick2)
+if [[ "$(jq -r '.spawned' <<<"$_j")" == "1" ]]; then
+  ok_t "4322 e2e: with both grades VERDICTED and both rows still open, the next delivery SPAWNS"
+else
+  bad_t "4322 e2e: the waiter spawns once the verdicts land" "json=$_j — two idle graders are still holding the lane"
+fi
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAILN"
 [[ "$FAILN" -eq 0 ]]

@@ -51,7 +51,7 @@
 #   M5  whole body -> `printf merge; return 0`        killed 14 arms (E1-E3, E5,
 #                                                     E6, E7 x3, E8, E9, E10,
 #                                                     E12, E13a, E13b)
-#   M6  `hold:main:pr-state-unreadable` -> `merge`    killed  2 arms (E2, E3)
+#   M6  `hold:merger:pr-state-unreadable` -> `merge`  killed  2 arms (E2, E3)
 #   M7  the new empty-slug guard deleted              killed  2 arms (E7, E12)
 #   M8  files re-joined onto ONE line before the risk
 #       check (the line-anchored patterns then miss)  killed  3 arms (E8, E13a,
@@ -70,6 +70,16 @@ cd "$(dirname "$0")/.."
 SRC=src
 
 TMP="$(mktemp -d /tmp/merge-disp-unit.XXXXXX)"
+
+# DIVE-4326 — the roster the hold-seat resolver reads, pinned to a FIXTURE before
+# the source loop below, because the constants that name it are `readonly` and are
+# resolved from the environment at source time. Without this every arm that
+# touches a hold would depend on whether the box this suite runs on happens to
+# have agent-ops enabled, i.e. the suite would grade the host and not the code.
+ROSTER="$TMP/agents.json"
+roster() { printf '{"agents":{"ops":{"heartbeat":{"enabled":%s}},"main":{"heartbeat":{"enabled":true}}}}\n' "${1:-true}" >"$ROSTER"; }
+roster true
+export FIVE_MERGE_HOLD_ROSTER="$ROSTER"
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
@@ -109,11 +119,11 @@ eq "A1  clean + green + low risk + sha matches                 -> merge" \
 # (i) A grade is bound to a SHA, not to a pull request (DIVE-2656 read forwards).
 eq "A2  verifier stated an ABBREVIATED sha (the normal shape)  -> merge" \
    "merge" "$(_merge_disp_decide MERGEABLE CLEAN "$SHA40" "$SHA7" low)"
-eq "A3  head MOVED since the grade                             -> hold:main" \
-   "hold:main:graded-sha-is-not-the-head" \
+eq "A3  head MOVED since the grade                             -> hold:merger" \
+   "hold:merger:graded-sha-is-not-the-head" \
    "$(_merge_disp_decide MERGEABLE CLEAN "$SHA40" 0123456789abcdef0123456789abcdef01234567 low)"
-eq "A4  verifier stated NO graded-sha at all                   -> hold:main" \
-   "hold:main:no-graded-sha-stated" "$(_merge_disp_decide MERGEABLE CLEAN "$SHA40" '' low)"
+eq "A4  verifier stated NO graded-sha at all                   -> hold:merger" \
+   "hold:merger:no-graded-sha-stated" "$(_merge_disp_decide MERGEABLE CLEAN "$SHA40" '' low)"
 
 # THE ONE MAKER CASE. Everything else that is not clean is a LOOK.
 eq "A5  CONFLICTING                                            -> hold:MAKER" \
@@ -124,29 +134,29 @@ eq "A6  mergeStateStatus DIRTY (conflict by the other name)    -> hold:MAKER" \
    "$(_merge_disp_decide MERGEABLE DIRTY "$SHA40" "$SHA40" low)"
 
 # (ii) required checks / required review at that sha.
-eq "A7  BLOCKED (red-or-pending required check, OR CODEOWNERS) -> hold:main" \
-   "hold:main:merge-state-BLOCKED" "$(_merge_disp_decide MERGEABLE BLOCKED "$SHA40" "$SHA40" low)"
-eq "A8  UNSTABLE — mergeable, a NON-required check is red      -> hold:main" \
-   "hold:main:merge-state-UNSTABLE" "$(_merge_disp_decide MERGEABLE UNSTABLE "$SHA40" "$SHA40" low)"
-eq "A9  a merge state this function has never been taught      -> hold:main" \
-   "hold:main:merge-state-SOMETHING_NEW" \
+eq "A7  BLOCKED (red-or-pending required check, OR CODEOWNERS) -> hold:merger" \
+   "hold:merger:merge-state-BLOCKED" "$(_merge_disp_decide MERGEABLE BLOCKED "$SHA40" "$SHA40" low)"
+eq "A8  UNSTABLE — mergeable, a NON-required check is red      -> hold:merger" \
+   "hold:merger:merge-state-UNSTABLE" "$(_merge_disp_decide MERGEABLE UNSTABLE "$SHA40" "$SHA40" low)"
+eq "A9  a merge state this function has never been taught      -> hold:merger" \
+   "hold:merger:merge-state-SOMETHING_NEW" \
    "$(_merge_disp_decide MERGEABLE SOMETHING_NEW "$SHA40" "$SHA40" low)"
-eq "A10 mergeable UNKNOWN (GitHub still computing)             -> hold:main" \
-   "hold:main:mergeable-UNKNOWN" "$(_merge_disp_decide UNKNOWN CLEAN "$SHA40" "$SHA40" low)"
-eq "A11 head sha unreadable                                    -> hold:main" \
-   "hold:main:head-sha-unreadable" "$(_merge_disp_decide MERGEABLE CLEAN '' "$SHA40" low)"
+eq "A10 mergeable UNKNOWN (GitHub still computing)             -> hold:merger" \
+   "hold:merger:mergeable-UNKNOWN" "$(_merge_disp_decide UNKNOWN CLEAN "$SHA40" "$SHA40" low)"
+eq "A11 head sha unreadable                                    -> hold:merger" \
+   "hold:merger:head-sha-unreadable" "$(_merge_disp_decide MERGEABLE CLEAN '' "$SHA40" low)"
 
 # (iii) the risk verdict is carried through with its reason intact, so the board
 # can say WHY a look is owed rather than only that one is.
-eq "A12 risk verdict reaches the disposition                   -> hold:main" \
-   "hold:main:user-facing-surface" \
+eq "A12 risk verdict reaches the disposition                   -> hold:merger" \
+   "hold:merger:user-facing-surface" \
    "$(_merge_disp_decide MERGEABLE CLEAN "$SHA40" "$SHA40" look:user-facing-surface)"
 
 # NEGATIVE CONTROL on the ORDER of the checks. A9's unknown state must beat a low
 # risk, and A3's sha mismatch must beat everything — if the risk check ran first,
 # a low-risk diff at the wrong sha would merge.
-eq "A13 sha mismatch OUTRANKS a low-risk clean-and-green PR    -> hold:main" \
-   "hold:main:graded-sha-is-not-the-head" \
+eq "A13 sha mismatch OUTRANKS a low-risk clean-and-green PR    -> hold:merger" \
+   "hold:merger:graded-sha-is-not-the-head" \
    "$(_merge_disp_decide MERGEABLE CLEAN "$SHA40" ffffffffffffffffffffffffffffffffffffffff low)"
 
 # ===================================================================
@@ -193,7 +203,7 @@ eq "B9  a 4000-path file list still reads look, 10/10 (DIVE-4108 shape)" \
 # iteration 1 the probe body was stubbed in all 43 arms, so two mutants of it
 # survived a fully green suite — (1) the whole function replaced by
 # `printf merge; return 0`, and (2) its unreadable-read guard flipped from
-# `hold:main:pr-state-unreadable` to `merge`. The polarity claim ("every unknown
+# `hold:ops:pr-state-unreadable` to `merge`. The polarity claim ("every unknown
 # is a HOLD") is the entire safety case of this row, and it was asserted for the
 # two PURE functions and NOT for the one impure function that can fail OPEN into
 # an unreviewed squash to main. Sections A/B grade the decision; this section
@@ -214,13 +224,13 @@ APIURL=https://github.com/lodar/5dive-api/pull/7
 
 # --- the read never happened, or came back with nothing to parse.
 GH_RAW=""; GH_RC=0
-eq "E1  no delivery ref at all                                 -> hold:main" \
-   "hold:main:no-delivery-ref" "$(_merge_disp_probe "" "$SHA40")"
-eq "E2  the read SUCCEEDS but returns nothing                  -> hold:main" \
-   "hold:main:pr-state-unreadable" "$(_merge_disp_probe "$PRURL" "$SHA40")"
+eq "E1  no delivery ref at all                                 -> hold:ops" \
+   "hold:ops:no-delivery-ref" "$(_merge_disp_probe "" "$SHA40")"
+eq "E2  the read SUCCEEDS but returns nothing                  -> hold:ops" \
+   "hold:ops:pr-state-unreadable" "$(_merge_disp_probe "$PRURL" "$SHA40")"
 GH_RC=1
-eq "E3  the read FAILS (no rail, timeout, 404)                 -> hold:main" \
-   "hold:main:pr-state-unreadable" "$(_merge_disp_probe "$PRURL" "$SHA40")"
+eq "E3  the read FAILS (no rail, timeout, 404)                 -> hold:ops" \
+   "hold:ops:pr-state-unreadable" "$(_merge_disp_probe "$PRURL" "$SHA40")"
 GH_RC=0
 
 # --- the baseline. Without a real `merge` reachable through the shipped body,
@@ -237,7 +247,7 @@ eq "E5  a CONFLICTING record is parsed and routed to the MAKER" \
    "hold:maker:conflicting-needs-rebase" "$(_merge_disp_probe "$PRURL" "$SHA40")"
 GH_RAW=$(rec MERGEABLE CLEAN 0123456789abcdef0123456789abcdef01234567 "$PRURL" src/task/loops.sh)
 eq "E6  the HEAD field is the one compared against the grade" \
-   "hold:main:graded-sha-is-not-the-head" "$(_merge_disp_probe "$PRURL" "$SHA40")"
+   "hold:ops:graded-sha-is-not-the-head" "$(_merge_disp_probe "$PRURL" "$SHA40")"
 
 # --- MISSHAPEN RECORDS. Fewer separators than expected: bash's `${rest#*$US}` on
 # a string with no US returns the string UNCHANGED, so a truncated record does not
@@ -252,8 +262,8 @@ for _shape in "MERGEABLE" "MERGEABLE${US}CLEAN" "MERGEABLE${US}CLEAN${US}${SHA40
   esac
 done
 GH_RAW=$(rec MERGEABLE CLEAN "$SHA40" "$PRURL")
-eq "E8  a whole record whose FILE LIST is empty                -> hold:main" \
-   "hold:main:file-list-unreadable" "$(_merge_disp_probe "$PRURL" "$SHA40")"
+eq "E8  a whole record whose FILE LIST is empty                -> hold:ops" \
+   "hold:ops:file-list-unreadable" "$(_merge_disp_probe "$PRURL" "$SHA40")"
 
 # --- THE SLUG COMES FROM THE RESOLVED URL, NOT FROM THE CALLER'S REF. The ref
 # can be a bare `#7`, and a caller that named a different repo must not be able to
@@ -261,9 +271,9 @@ eq "E8  a whole record whose FILE LIST is empty                -> hold:main" \
 # file list is IDENTICAL in all three and only the url moves.
 GH_RAW=$(rec MERGEABLE CLEAN "$SHA40" "$APIURL" src/db/queries.ts)
 eq "E9  ref is a bare '#7'; the URL names the api repo         -> look" \
-   "hold:main:api-db-path" "$(_merge_disp_probe "#7" "$SHA40")"
+   "hold:ops:api-db-path" "$(_merge_disp_probe "#7" "$SHA40")"
 eq "E10 ...and the CALLER naming a different repo cannot undo it" \
-   "hold:main:api-db-path" "$(_merge_disp_probe "$PRURL" "$SHA40")"
+   "hold:ops:api-db-path" "$(_merge_disp_probe "$PRURL" "$SHA40")"
 GH_RAW=$(rec MERGEABLE CLEAN "$SHA40" "$PRURL" src/db/queries.ts)
 eq "E11 NEGATIVE CONTROL: same paths, url is NOT the api repo  -> merge" \
    "merge" "$(_merge_disp_probe "$APIURL" "$SHA40")"
@@ -272,15 +282,15 @@ eq "E11 NEGATIVE CONTROL: same paths, url is NOT the api repo  -> merge" \
 # through with repo='' and the `*/5dive-api` test could never fire — an unreadable
 # url failed OPEN on precisely the repo where a merge pushes schema.
 GH_RAW=$(rec MERGEABLE CLEAN "$SHA40" "" src/db/queries.ts)
-eq "E12 the url field did not come back                        -> hold:main" \
-   "hold:main:repo-unresolved" "$(_merge_disp_probe "$PRURL" "$SHA40")"
+eq "E12 the url field did not come back                        -> hold:ops" \
+   "hold:ops:repo-unresolved" "$(_merge_disp_probe "$PRURL" "$SHA40")"
 
 # --- THE FILE LIST IS A LIST, and the look patterns are LINE-ANCHORED. If the
 # list ever collapses to one line, `install.sh` is only found when it happens to
 # be LAST — so put it FIRST. This arm reds on a probe that stopped splitting.
 GH_RAW=$(rec MERGEABLE CLEAN "$SHA40" "$PRURL" install.sh src/task/loops.sh)
 eq "E13a a look-worthy path that is NOT last is still found" \
-   "hold:main:codeowners-path" "$(_merge_disp_probe "$PRURL" "$SHA40")"
+   "hold:ops:codeowners-path" "$(_merge_disp_probe "$PRURL" "$SHA40")"
 # ...and the iteration-1 shape quinn flagged: joined with a space and re-split
 # with `tr`, `a dir/install.sh` became `a` + `dir/install.sh`. It matched anyway
 # through the basename anchor, which is why it was non-blocking — but a path with
@@ -288,7 +298,7 @@ eq "E13a a look-worthy path that is NOT last is still found" \
 # turns a look into a low.
 GH_RAW=$(rec MERGEABLE CLEAN "$SHA40" "$PRURL" "a dir/install.sh")
 eq "E13b a path containing a SPACE stays one token" \
-   "hold:main:codeowners-path" "$(_merge_disp_probe "$PRURL" "$SHA40")"
+   "hold:ops:codeowners-path" "$(_merge_disp_probe "$PRURL" "$SHA40")"
 
 unset -f _gate_gh _gate_gh_token
 
@@ -305,6 +315,9 @@ unset -f _gate_gh _gate_gh_token
 # and the board render is the shipped code.
 # ===================================================================
 DISP_ANSWER="merge"
+# Keep the REAL probe reachable under a second name before stubbing it — section F
+# grades the shipped decide->resolve chain end to end and needs it back.
+eval "_merge_disp_probe_real() $(declare -f _merge_disp_probe | tail -n +2)"
 _merge_disp_probe() { printf '%s' "$DISP_ANSWER"; }
 
 mkrow() { # mkrow <title> -> row id of a DELIVERED maker->verifier row bound to a PR
@@ -349,22 +362,23 @@ else
   bad_t "C1c ...and the reason cell says what to run" "$(col "$c1" merge_hold_reason)"
 fi
 
-# --- C2: a diverged PR owes a LOOK from main. THIS IS THE DEFECT: before
-# DIVE-4137 this row read `graded->merge:dev` and woke a maker with nothing to do.
-DISP_ANSWER="hold:main:graded-sha-is-not-the-head"
+# --- C2: a diverged PR owes a LOOK from ops (DIVE-4326; `main` before). THIS IS
+# THE DEFECT DIVE-4137 fixed: before it this row read `graded->merge:dev` and
+# woke a maker with nothing to do.
+DISP_ANSWER="hold:ops:graded-sha-is-not-the-head"
 c2=$(mkrow "head moved since the grade")
 grade_prose "$c2"
-eq "C2a routed to main, NOT to the maker 'dev' (the DIVE-4137 defect)" \
-   "main" "$(col "$c2" merge_owner)"
-eq "C2b ...the board renders merge:main" "graded->merge:main" "$(board "$c2")"
+eq "C2a routed to ops, NOT to the maker 'dev' (the DIVE-4137 defect)" \
+   "ops" "$(col "$c2" merge_owner)"
+eq "C2b ...the board renders merge:ops" "graded->merge:ops" "$(board "$c2")"
 eq "C2c ...and the reason is recorded, not just the owner" \
    "graded-sha-is-not-the-head" "$(col "$c2" merge_hold_reason)"
 
-# --- C3: a CODEOWNERS PR renders merge:main (the row's third acceptance case)
-DISP_ANSWER="hold:main:codeowners-path"
+# --- C3: a CODEOWNERS PR renders merge:ops (the row's third acceptance case)
+DISP_ANSWER="hold:ops:codeowners-path"
 c3=$(mkrow "touches install.sh")
 grade_prose "$c3"
-eq "C3a a CODEOWNERS-covered diff renders merge:main" "graded->merge:main" "$(board "$c3")"
+eq "C3a a CODEOWNERS-covered diff renders merge:ops" "graded->merge:ops" "$(board "$c3")"
 eq "C3b ...naming the path class as the reason" "codeowners-path" "$(col "$c3" merge_hold_reason)"
 
 # --- C4: the ONE hold a maker alone can clear still reaches the maker.
@@ -375,11 +389,11 @@ eq "C4  a CONFLICTING branch is the one hold that names the MAKER" \
    "graded->merge:dev" "$(board "$c4")"
 
 # --- C5: the OTHER verifier shape reaches the same recording.
-DISP_ANSWER="hold:main:merge-state-BLOCKED"
+DISP_ANSWER="hold:ops:merge-state-BLOCKED"
 c5=$(mkrow "graded by --cmd, not by prose")
 grade_cmd "$c5"
 eq "C5  \`verify --cmd\` on a bound row records the disposition too" \
-   "main" "$(col "$c5" merge_owner)"
+   "ops" "$(col "$c5" merge_owner)"
 
 # --- C6: NEGATIVE CONTROLS.
 DISP_ANSWER="merge"
@@ -456,6 +470,98 @@ if grep -qE '_state" == "OPEN"' <<<"$_hook"; then
 else
   bad_t "D3d ...and only ever runs on an OPEN pull request" "no OPEN guard"
 fi
+
+# ===================================================================
+# F. DIVE-4326 — WHO THE HOLD IS RESOLVED TO.
+#
+# The defect, measured 2026-09-11: `main` was a CONSTANT in every hold branch, so
+# `merge_owner` read `main` on every graded-and-waiting row and the heartbeat's
+# DIVE-4206 rule made those rows dispatchable to main ALONE. The want is ops by
+# default, main only where ops cannot reach — and, critically, a seat the
+# heartbeat will actually wake, or the row is dispatchable to NOBODY (DIVE-4220).
+#
+# THE NON-VACUITY ARM IS F2/F5: with ops disabled or the repo outside ops's
+# credential, the SAME input must resolve to `main`. Without those two, every arm
+# here would pass against a function that returned the constant `ops` — the
+# original defect with a different constant in it.
+# ===================================================================
+
+eq "F1  an in-org repo resolves to ops (the default this row installs)" \
+   "ops" "$(_merge_hold_seat 5dive-ai/5dive)"
+eq "F1b ...for the api repo too" "ops" "$(_merge_hold_seat lodar/5dive-api)"
+
+eq "F2  a repo OUTSIDE ops's credential falls back to main" \
+   "main" "$(_merge_hold_seat someone-else/their-repo)"
+
+eq "F3  an UNRESOLVED slug is not evidence ops cannot read it -> still ops" \
+   "ops" "$(_merge_hold_seat '')"
+
+# F4/F5 — the roster half. A seat the heartbeat will not wake is not an owner.
+roster false
+eq "F4  ops present but heartbeat DISABLED -> main, not a dead row" \
+   "main" "$(_merge_hold_seat 5dive-ai/5dive)"
+printf '{"agents":{"main":{"heartbeat":{"enabled":true}}}}\n' >"$ROSTER"
+eq "F5  ops ABSENT from the roster entirely -> main" \
+   "main" "$(_merge_hold_seat 5dive-ai/5dive)"
+roster true
+eq "F5b ...and it goes back to ops once the roster says so (the arm is live)" \
+   "ops" "$(_merge_hold_seat 5dive-ai/5dive)"
+
+# F6 — FAIL OPEN on an unreadable roster, deliberately. Re-pinning every merge
+# onto main when a file cannot be read is the constant this row removes,
+# reintroduced as a failure mode; a wrong yes costs one bounce.
+chmod 000 "$ROSTER"
+if [[ -r "$ROSTER" ]]; then
+  ok_t "F6  SKIPPED (running as a user that can read a 000 file) — no claim made"
+else
+  eq "F6  an unreadable roster still resolves to ops (fail open, not to main)" \
+     "ops" "$(_merge_hold_seat 5dive-ai/5dive)"
+fi
+chmod 600 "$ROSTER"; roster true
+
+# F7 — the ROLE boundary. The pure decider must never name a seat, and the
+# resolver must leave everything that is not the `merger` role alone.
+eq "F7a the pure decider emits a ROLE, never a seat" \
+   "hold:merger:merge-state-BLOCKED" "$(_merge_disp_decide MERGEABLE BLOCKED "$SHA40" "$SHA40" low)"
+eq "F7b the resolver turns that role into a seat" \
+   "hold:ops:merge-state-BLOCKED" "$(_merge_hold_resolve hold:merger:merge-state-BLOCKED 5dive-ai/5dive)"
+eq "F7c ...and leaves the MAKER role untouched (it is resolved from the row, not the repo)" \
+   "hold:maker:conflicting-needs-rebase" "$(_merge_hold_resolve hold:maker:conflicting-needs-rebase 5dive-ai/5dive)"
+eq "F7d ...and passes a plain merge straight through" \
+   "merge" "$(_merge_hold_resolve merge 5dive-ai/5dive)"
+if grep -qE "printf 'hold:main" "$SRC/task/delivery.sh"; then
+  bad_t "F7e no seat constant survives in the disposition branches" \
+        "a hold branch still prints the literal 'main' instead of the merger role"
+else
+  ok_t "F7e no seat constant survives in the disposition branches"
+fi
+
+# F8 — END TO END through the recording, which is what the board reads. The probe
+# is the real one here; only the gh read is stubbed, so this grades the whole
+# chain decide -> resolve -> loops.sh -> merge_owner.
+# Section C unset them (line "unset -f _gate_gh _gate_gh_token"); restore the
+# section-E stubs so the READ is fixtured and everything above it is shipped code.
+_gate_gh_token() { printf 'fixture-token'; }
+_gate_gh() { [[ -n "$GH_RAW" ]] && printf '%s' "$GH_RAW"; return "$GH_RC"; }
+GH_RAW=$(rec MERGEABLE CLEAN 0123456789abcdef0123456789abcdef01234567 "$PRURL" src/task/loops.sh)
+GH_RC=0
+eq "F8  the live probe resolves an in-org hold to ops" \
+   "hold:ops:graded-sha-is-not-the-head" "$(_merge_disp_probe_real "$PRURL" "$SHA40")"
+roster false
+eq "F8b ...and to main when ops is not wakeable (same input, same read)" \
+   "hold:main:graded-sha-is-not-the-head" "$(_merge_disp_probe_real "$PRURL" "$SHA40")"
+roster true
+
+# F9 — loops.sh's own net for the ONE disposition the probe cannot resolve
+# itself: its own failure. The role must not reach the board as the word
+# `merger`, which is not a seat and would dispatch to nobody.
+DISP_ANSWER="hold:merger:disposition-probe-failed"
+f2=$(mkrow "the probe itself fell over")
+grade_prose "$f2"
+eq "F9  a bare \`merger\` role is resolved to a seat before it is recorded" \
+   "ops" "$(col "$f2" merge_owner)"
+eq "F9b ...and the reason survives intact" \
+   "disposition-probe-failed" "$(col "$f2" merge_hold_reason)"
 
 printf '\n%s\n' "----------------------------------------------------------"
 printf 'PASS=%s FAIL=%s\n' "$PASS" "$FAIL"

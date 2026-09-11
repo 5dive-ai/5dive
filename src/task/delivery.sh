@@ -1286,6 +1286,85 @@ readonly _MERGE_DISP_SCHEMA_RX='(^|/)(drizzle|migrations)/|(^|/)schema\.ts$|(^|/
 # does not merge unseen, and this rail cannot look at a Vercel preview.
 readonly _MERGE_DISP_SURFACE_RX='\.(tsx|jsx|css|scss)$'
 
+# DIVE-4326 — WHO OWES A HELD MERGE, and why this is no longer the literal `main`.
+#
+# Until now every hold below printed `hold:main:<why>`, so `merge_owner` read
+# `main` on every graded-and-waiting row. That constant — not a decision anyone
+# made — is what put main's seat on the hands-on end of a merge any seat holding
+# the credential can perform, and the heartbeat's DIVE-4206 rule then made the row
+# dispatchable to main ALONE: the most expensive window we have (5-min cadence,
+# accumulating context, one merge per wake). lodar, 2026-09-11: "why you merging?
+# shouldn't this be ops job? why you on hands now?"
+#
+# So the pure decider stops naming a seat at all. `merger` joins `maker` as a
+# ROLE in the disposition's vocabulary, and BOTH are resolved to a seat exactly
+# once, on the impure side, where the row (for `maker`) and the repo (for
+# `merger`) are in hand. The order the board now renders is: the GRADER when the
+# branch is auto-mergeable at the graded sha (DIVE-3474 already lets a grader
+# merge its own PASS, and DIVE-4137 records it), then ops, and main only where
+# ops cannot reach.
+readonly _MERGE_HOLD_SEAT="${FIVE_MERGE_HOLD_SEAT:-ops}"
+readonly _MERGE_HOLD_SEAT_FALLBACK="${FIVE_MERGE_HOLD_SEAT_FALLBACK:-main}"
+# The repo owners ops's credential covers. A LIST, not a derivation, and for
+# gate_evidence.sh's DIVE-1955 reason: a live probe would make the recorded owner
+# depend on network reachability at grade time, i.e. two boxes would record two
+# different owners for one row. Drift is the price; the hold reason NAMES the
+# seat it chose (`…-not-ops-reachable`) so a stale list announces itself to the
+# seat it is failing.
+readonly _MERGE_HOLD_SEAT_OWNERS_RX="${FIVE_MERGE_HOLD_SEAT_OWNERS_RX:-^(5dive-ai|lodar)/}"
+# The roster, so a resolved seat is one the heartbeat will actually wake. Without
+# this the fix repeats DIVE-4220 in a new place: a row whose merge_owner names a
+# seat with `heartbeat.enabled=false` is dispatchable to NOBODY, which reads on
+# the board exactly like a row waiting on a person.
+readonly _MERGE_HOLD_ROSTER="${FIVE_MERGE_HOLD_ROSTER:-/var/lib/5dive/agents.json}"
+
+# _merge_hold_seat_live <seat> -> rc 0 if the heartbeat will wake that seat.
+#
+# UNREADABLE ROSTER IS A YES, deliberately. Every seat can read agents.json today
+# (640 root:claude), but a tree that cannot must not silently re-pin every merge
+# onto main — that is the constant this row exists to remove, reintroduced as a
+# failure mode. A wrong yes costs one bounce; a wrong no costs main's window.
+_merge_hold_seat_live() {
+  local seat="${1:-}" ans
+  [[ -n "$seat" ]] || return 1
+  [[ -r "$_MERGE_HOLD_ROSTER" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  ans=$(jq -r --arg s "$seat" '
+          if (.agents | type) == "object" and (.agents[$s] == null) then "absent"
+          elif (.agents[$s].heartbeat.enabled == false) then "disabled"
+          else "live" end' "$_MERGE_HOLD_ROSTER" 2>/dev/null) || return 0
+  [[ "$ans" == "live" ]]
+}
+
+# _merge_hold_seat <repo_slug> -> the seat that owes a held merge.
+#
+# IMPURE (roster read). Two named ways to land on the fallback, and only two:
+#   (1) the pull request is in a repo outside what ops's credential covers;
+#   (2) ops is not a seat the heartbeat will wake on this box.
+# An EMPTY repo is not case (1). "We could not resolve the slug" is not evidence
+# ops cannot read it, and treating it as such would route the whole transient-read
+# family (`pr-state-unreadable`, `repo-unresolved`) back onto main — i.e. the
+# common case would be the constant again.
+_merge_hold_seat() {
+  local repo="${1:-}"
+  if [[ -n "$repo" ]] && ! grep -qE "$_MERGE_HOLD_SEAT_OWNERS_RX" <<<"$repo"; then
+    printf '%s' "$_MERGE_HOLD_SEAT_FALLBACK"; return 0
+  fi
+  _merge_hold_seat_live "$_MERGE_HOLD_SEAT" || { printf '%s' "$_MERGE_HOLD_SEAT_FALLBACK"; return 0; }
+  printf '%s' "$_MERGE_HOLD_SEAT"
+}
+
+# _merge_hold_resolve <disposition> <repo_slug> -> the disposition with the
+# `merger` ROLE replaced by the seat that owes it. Everything else — `merge`,
+# `hold:maker:…`, a disposition already naming a seat — passes through untouched.
+_merge_hold_resolve() {
+  local disp="${1:-}" repo="${2:-}"
+  case "$disp" in
+    hold:merger:*) printf 'hold:%s:%s' "$(_merge_hold_seat "$repo")" "${disp#hold:merger:}" ;;
+    *) printf '%s' "$disp" ;;
+  esac
+}
+
 # _merge_disp_risk <repo_slug> <files, one per line> -> "low" | "look:<reason>"
 #
 # PURE — no gh, no root, no db. That is the point of splitting it out: every (iii)
@@ -1318,7 +1397,7 @@ _merge_disp_risk() {
 }
 
 # _merge_disp_decide <mergeable> <merge_state> <head_sha> <graded_sha> <risk>
-#   -> "merge" | "hold:main:<why>" | "hold:maker:<why>"
+#   -> "merge" | "hold:merger:<why>" | "hold:maker:<why>"
 #
 # PURE, same reason. <risk> is _merge_disp_risk's output; the caller passes it in
 # rather than this function calling it, so each of (i), (ii) and (iii) can be
@@ -1329,12 +1408,12 @@ _merge_disp_decide() {
   # (i) A GRADE IS BOUND TO A SHA, NOT TO A PULL REQUEST. This is DIVE-2656's rule
   # read forwards instead of at the close: if the head has moved since the grade,
   # the thing that would merge is not the thing that was graded.
-  [[ -n "$graded" ]] || { printf 'hold:main:no-graded-sha-stated'; return 0; }
-  [[ -n "$head"   ]] || { printf 'hold:main:head-sha-unreadable';  return 0; }
+  [[ -n "$graded" ]] || { printf 'hold:merger:no-graded-sha-stated'; return 0; }
+  [[ -n "$head"   ]] || { printf 'hold:merger:head-sha-unreadable';  return 0; }
   # Prefix either way: a verifier routinely states an abbreviated sha against a
   # 40-char head, and DIVE-2656's own comparison is a prefix comparison.
   if [[ "$head" != "$graded"* && "$graded" != "$head"* ]]; then
-    printf 'hold:main:graded-sha-is-not-the-head'; return 0
+    printf 'hold:merger:graded-sha-is-not-the-head'; return 0
   fi
 
   # THE ONE MAKER CASE, and it is deliberately the only one. A conflicted branch
@@ -1344,7 +1423,7 @@ _merge_disp_decide() {
   if [[ "$mergeable" == "CONFLICTING" || "$state" == "DIRTY" ]]; then
     printf 'hold:maker:conflicting-needs-rebase'; return 0
   fi
-  [[ "$mergeable" == "MERGEABLE" ]] || { printf 'hold:main:mergeable-%s' "${mergeable:-unknown}"; return 0; }
+  [[ "$mergeable" == "MERGEABLE" ]] || { printf 'hold:merger:mergeable-%s' "${mergeable:-unknown}"; return 0; }
 
   # (ii) REQUIRED CHECKS AT THAT SHA. BLOCKED is GitHub's single answer for both a
   # red/pending required check AND a required review (CODEOWNERS) — both are a
@@ -1357,11 +1436,11 @@ _merge_disp_decide() {
   # costs a look; merging costs the thing we cannot undo.
   case "$state" in
     CLEAN|HAS_HOOKS) : ;;
-    *) printf 'hold:main:merge-state-%s' "${state:-unknown}"; return 0 ;;
+    *) printf 'hold:merger:merge-state-%s' "${state:-unknown}"; return 0 ;;
   esac
 
   # (iii) RISK.
-  [[ "$risk" == "low" ]] || { printf 'hold:main:%s' "${risk#look:}"; return 0; }
+  [[ "$risk" == "low" ]] || { printf 'hold:merger:%s' "${risk#look:}"; return 0; }
   printf 'merge'
 }
 
@@ -1372,7 +1451,7 @@ _merge_disp_decide() {
 # reason yields a hold naming that fact, never a merge.
 _merge_disp_probe() {
   local pr="${1:-}" graded="${2:-}" tok raw mergeable state head files repo url rest
-  [[ -n "$pr" ]] || { printf 'hold:main:no-delivery-ref'; return 0; }
+  [[ -n "$pr" ]] || { printf '%s' "$(_merge_hold_resolve hold:merger:no-delivery-ref '')"; return 0; }
   tok=$(_gate_gh_token 2>/dev/null || printf '')
   # US (unit separator) BETWEEN fields, joined by jq. A newline separator would be
   # ambiguous against the file list, which is the one field that can be long.
@@ -1386,7 +1465,7 @@ _merge_disp_probe() {
           -q '[ (.mergeable // ""), (.mergeStateStatus // ""), (.headRefOid // ""),
                 (.url // ""), ([ (.files // [])[]?.path ] | join("\n")) ] | join("\u001f")' \
           2>/dev/null) || raw=""
-  [[ -n "$raw" ]] || { printf 'hold:main:pr-state-unreadable'; return 0; }
+  [[ -n "$raw" ]] || { printf '%s' "$(_merge_hold_resolve hold:merger:pr-state-unreadable '')"; return 0; }
   mergeable="${raw%%$'\x1f'*}"; rest="${raw#*$'\x1f'}"
   state="${rest%%$'\x1f'*}";    rest="${rest#*$'\x1f'}"
   head="${rest%%$'\x1f'*}";     rest="${rest#*$'\x1f'}"
@@ -1398,9 +1477,12 @@ _merge_disp_probe() {
   # the sharp-repo arm of _merge_disp_risk (`*/5dive-api` + src/db) silently
   # degrades to `low` on a record whose url field did not come back — i.e. an
   # unreadable url would fail OPEN on exactly the repo where merge pushes schema.
-  [[ -n "$repo" ]] || { printf 'hold:main:repo-unresolved'; return 0; }
-  _merge_disp_decide "$mergeable" "$state" "$head" "$graded" \
-                     "$(_merge_disp_risk "$repo" "$files")"
+  [[ -n "$repo" ]] || { printf '%s' "$(_merge_hold_resolve hold:merger:repo-unresolved '')"; return 0; }
+  # The ROLE the pure decider emits becomes a SEAT here, where the repo is known.
+  _merge_hold_resolve \
+    "$(_merge_disp_decide "$mergeable" "$state" "$head" "$graded" \
+                          "$(_merge_disp_risk "$repo" "$files")")" \
+    "$repo"
 }
 
 # _merge_disp_do <ident> — call the DIVE-3474 rail. Returns non-zero on any

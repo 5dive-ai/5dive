@@ -450,12 +450,62 @@ cmd_task_grader_tick() {
 
   local usage="" ; usage=$($_GRADER_USAGE_CMD 2>/dev/null || printf '')
   local n_pending=0 n_spawn=0 n_queue=0 n_refuse=0 plan=""
+  # ══ DIVE-4322: IN FLIGHT MEANS GRADING, NOT "NOT YET CLOSED" ══
+  #
+  # This count was `spawned with no later task.done/task.rejected`, i.e. a grade
+  # occupied a slot until the ROW closed. That is not when grading ends. A PASS on
+  # a bound row is deliberately held open as graded->merge (DIVE-3330); the close
+  # then waits on a human's merge and the grader's own `task done`, which is hours
+  # to a day. The grader session, meanwhile, ended at the verdict and is gone —
+  # the seat is idle and holding a slot it is not using.
+  #
+  # MEASURED 2026-09-11 by main: DIVE-4276 (spawned 07:50Z, PASS, its PR
+  # CONFLICTING so nobody could merge it) and DIVE-4288 (spawned 10:30Z, PASS, PR
+  # merged 12:32Z, close still owed) held both slots of the --cap=2 root cron for
+  # three hours. 19 grades queued behind them and the pool seat's heartbeat read
+  # "no todo — stay idle" every minute while five graded rows sat on its name.
+  #
+  # RAISING THE CAP WOULD NOT FIX IT, which is why the fix is here. The leak
+  # scales with OWED MERGES, not with grading capacity: any cap is exhausted by
+  # enough rows parked on a human's merge button.
+  #
+  # THE EXIT SET IS THE VERDICT, and it has two independent readings:
+  #
+  #   (a) `task.graded` — emitted by `task verify` the moment a verdict is stored
+  #       (src/task/loops.sh), for both verdicts and for the raw-UPDATE auto-close
+  #       that emits no task.done at all. This is the primary and the precise one:
+  #       it is ordered by ledger id against THIS spawn, so a re-grade after a
+  #       reject re-occupies a slot exactly as it should.
+  #
+  #   (b) the row's own structural state, as a belt for every row graded BEFORE
+  #       (a) ships — an upgrade cannot retro-emit a ledger row, and without this
+  #       the lane would stay frozen by today's parked rows until they closed.
+  #       `graded_verdict_at` (the verdict's own clock, DIVE-3430) and a closed
+  #       status cover it; `merge_owner` is the column the graded->merge render
+  #       reads and is carried here for the same reason.
+  #
+  # (b) IS PINNED TO THIS SPAWN, NOT READ BARE, and that is the whole care in it.
+  # A bare `merge_owner IS NOT NULL` fails OPEN on the one shape that matters: a
+  # row that PASSED, was later rejected and re-delivered, and now has a grader
+  # genuinely working on it while a stale merge_owner from the first pass says
+  # otherwise. Requiring the verdict clock to be strictly LATER than the spawn
+  # makes the belt say the same thing (a) says — "a verdict landed after we
+  # started this grade" — rather than "a verdict landed at some point".
+  # The count is COUNT(DISTINCT s.ident), not COUNT(*): DIVE-4281 de-dupes a
+  # double spawn on one ident so two ledger rows cannot eat two slots. Both
+  # rows guard this one expression — keep the DISTINCT and the exits together.
   local inflight; inflight=$(db "SELECT COUNT(DISTINCT s.ident) FROM lifecycle_events s
                                   WHERE s.kind='task.grade.spawned'
                                     AND NOT EXISTS (SELECT 1 FROM lifecycle_events d
                                                      WHERE d.ident=s.ident
-                                                       AND d.kind IN ('task.done','task.rejected')
-                                                       AND d.id > s.id);" 2>/dev/null || printf 0)
+                                                       AND d.kind IN ('task.done','task.rejected','task.graded')
+                                                       AND d.id > s.id)
+                                    AND NOT EXISTS (SELECT 1 FROM tasks t
+                                                     WHERE t.ident = s.ident
+                                                       AND (t.status IN ('done','cancelled')
+                                                            OR (COALESCE(t.graded_verdict_at,'') > s.ts
+                                                                AND (COALESCE(t.graded_verdict,'') <> ''
+                                                                     OR COALESCE(t.merge_owner,'') <> ''))));" 2>/dev/null || printf 0)
   [[ "$inflight" =~ ^[0-9]+$ ]] || inflight=0
 
   local ident
@@ -499,6 +549,27 @@ cmd_task_grader_tick() {
     if [[ -n "$_gp_id" ]] && ! _task_verify_grants "$_gp_id"; then
       n_refuse=$((n_refuse+1))
       plan+="skip    $ident  (verification policy grants this row no grader — 5dive config verify=)"$'\n'; continue
+    fi
+    # DIVE-4324: a row filed with a PINNED standing reviewer who is not in this
+    # pool is not this lane's row. `seat:<agent>` means "that agent grades it in
+    # its own session"; routing has already handed the row to them, so spawning a
+    # throwaway grader on a pool seat here would buy a SECOND session for a grade
+    # that was deliberately bought as a first.
+    #
+    # SCOPED TO NON-POOL SEATS ON PURPOSE, and this is the load-bearing half: the
+    # fleet's usual pins (quinn, main2) ARE the pool, and for those the pool's
+    # fresh session IS how that seat grades. Skipping those would strand every
+    # pinned row on this box. So the skip fires only where the two genuinely
+    # disagree — a pin naming somebody the pool cannot spawn.
+    local _gp_rm=""
+    [[ -n "$_gp_id" ]] && _gp_rm=$(db "SELECT COALESCE(review_mode,'') FROM tasks WHERE id=${_gp_id};" 2>/dev/null || printf '')
+    if [[ "$_gp_rm" == seat:* ]]; then
+      local _gp_pin="${_gp_rm#seat:}" _gp_in_pool=0 _gp_s
+      for _gp_s in $_GRADER_POOL; do [[ "$_gp_s" == "$_gp_pin" ]] && { _gp_in_pool=1; break; }; done
+      if (( ! _gp_in_pool )); then
+        n_refuse=$((n_refuse+1))
+        plan+="skip    $ident  (review=$_gp_rm — pinned standing reviewer, not a pool seat; $_gp_pin grades it in its own session)"$'\n'; continue
+      fi
     fi
     # THE CAP IS CHECKED BEFORE THE SEAT, so a full lane costs no meter reads and
     # no credential probes — a queued delivery must be cheap or the tick becomes
@@ -571,5 +642,21 @@ _grader_spawn_session() {  # <seat> <ident>
     return 2
   fi
   5dive task assign "$ident" "$seat" >/dev/null 2>&1 || return 1
+  # DIVE-4295: guard the wake so a spooled copy is dropped rather than typed if
+  # the row closes or moves to another seat while it waits. `assignee_owns`, not
+  # a verifier clause: this seat is a grading session on a POOL seat, which is
+  # not the row's `verifier` column. Exported through the environment because
+  # this call crosses a process boundary into the `5dive` CLI.
+  #
+  # KNOWN LIMIT, stated rather than left to be discovered: on a SCOPED-sudo
+  # caller `cmd_send` re-execs through `sudo -n ... agent _deliver`
+  # (cmd_agent_runtime.sh:2421) and sudo SCRUBS the environment, so on that path
+  # this variable does not arrive and the wake spools UNGUARDED. It fails in the
+  # safe direction -- unguarded means delivered, which is exactly today's
+  # behaviour, never a new drop -- and the two rails this ticket was filed on
+  # (_hb_stall_sweep (a) and (a4)) call cmd_send IN-PROCESS and are unaffected.
+  # Closing it properly needs an env_keep entry or a new `_deliver` argument, and
+  # a sudoers wildcard is not something to widen inside this change.
+  _A2A_GUARD="task:${ident}:${seat}:assignee_owns" \
   5dive agent send "$seat" "Grade delivered task ${ident}. Read the row, grade the delivery, then run 5dive task done or 5dive task reject. Checkpoint each verified arm to the row as you go." >/dev/null 2>&1
 }
