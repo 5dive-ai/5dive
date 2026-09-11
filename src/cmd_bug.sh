@@ -190,8 +190,17 @@ _bug_sanitize_text() {
 # the caller wrote this line and re-reads it before filing. It removes the
 # common accident, and _bug_secret_scan below is the backstop that REFUSES
 # rather than silently rewriting when something token-shaped survives.
+#
+# DIVE-4297: the second expression is the mirror of audit_log's key-name rule.
+# The first expression alone required a leading `--`, so a positional
+# `telegram.token=<value>` — the exact shape that leaked into the audit log —
+# was filed to a PUBLIC issue verbatim. Key names are matched case-insensitively
+# and anywhere in the key, so `TELEGRAM.TOKEN=`, `api_key=` and `--auth-secret=`
+# are all covered; the key is kept and only the value replaced.
 _bug_redact_argv() {
-  printf '%s' "$1" | sed -E 's/(--(api-key|api_key|token|telegram-token|discord-token|code|password|secret|passwd)=)[^[:space:]]*/\1<redacted>/g'
+  printf '%s' "$1" \
+    | sed -E 's/(--(api-key|api_key|token|telegram-token|discord-token|code|password|secret|passwd)=)[^[:space:]]*/\1<redacted>/g' \
+    | sed -E 's/([^[:space:]=]*(token|secret|key|password|passwd|credential)[^[:space:]=]*=)[^[:space:]]*/\1<redacted>/gI'
 }
 
 # _bug_secret_scan <text> — returns 0 when the text carries something

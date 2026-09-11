@@ -501,9 +501,48 @@ out=$(authoritative_gate_check DIVE-923); rc=$?
 grep -Eq 'sudo -n /usr/local/bin/5dive _push_do' "$SRC/cmd_push.sh" \
   && ok_t "cmd_push delegates to root _push_do" \
   || bad_t "cmd_push delegates to root _push_do" "no _push_do handoff in cmd_push"
-grep -Eq 'printf .* "\$ident" "\$repopath" "\$branch" "\$repo"' "$SRC/cmd_push.sh" \
+grep -Eq '_push_do_stdin_write "\$ident" "\$repopath" "\$branch" "\$repo"' "$SRC/cmd_push.sh" \
   && ok_t "cmd_push passes params over stdin (not argv)" \
   || bad_t "cmd_push passes params over stdin" "params not piped to _push_do"
+
+# DIVE-4288: THE CALL SITE PASSES THE SIGNED OVERRIDE. The wire itself (that a
+# multi-line reason survives write->read whole) is graded in
+# tests/push_override_delegated_unit.sh; what only THIS file can grade is that
+# cmd_push actually hands FIVE_PUSH_OVERRIDE to the writer, because that needs a
+# seeded task with a cleared gate and a real work tree.
+#
+# `sudo` is resolved through PATH, so a stub ahead of the real one turns the root
+# handoff into an observable: it writes the stdin it was given to a file and exits
+# 0, and cmd_push cannot tell the difference. Nothing privileged runs; the stub is
+# gone from PATH after the arm.
+#
+# This is the arm the measured defect (dev3, 2026-09-11) would have caught: the
+# reason was exported in front of `5dive push`, plain `sudo -n` stripped it, and
+# the rail printed NEITHER of its two outcomes because it never saw a reason.
+# `sudo` is SHADOWED BY A FUNCTION, not by a stub on PATH. tests/lib/env_isolation.sh
+# already installs a refusing `sudo()` in every harness (DIVE-3096), and a shell
+# function outranks PATH — so a stub binary is never reached, and bash's command
+# hash makes that failure look like a PATH problem. Shadowing in the subshell is
+# also the honest model: cmd_push invokes `sudo` by name, and this arm answers it.
+SINK="$TMP/push-do-stdin"
+fake_sudo() {   # captures ONLY the _push_do handoff; anything else stays refused
+  sudo() { local a; for a in "$@"; do [[ "$a" == "_push_do" ]] && { cat >"$SINK"; return 0; }; done; return 1; }
+}
+seed_task DIVE-4288 "Branch: feature-ok" approval "2026-07-18 00:00:00" "yes ship it"
+OVR=$'1) one\n2) two\n3) three\n4) four\n5) five'
+: >"$SINK"
+out=$( cd "$REPO"; fake_sudo; FIVE_PUSH_OVERRIDE="$OVR" cmd_push DIVE-4288 --repo="file://$REPO" ) 2>&1
+{ [[ "$(sed -n 1p "$SINK")" == DIVE-4288 ]] \
+  && [[ "$(sed -n 3p "$SINK")" == feature-ok ]] \
+  && [[ "$(sed -n '5,$p' "$SINK")" == "$OVR" ]]; } \
+  && ok_t "4288: a signed FIVE_PUSH_OVERRIDE reaches _push_do's stdin — plain 'sudo -n' strips the variable, so the rail never saw it" \
+  || bad_t "4288: FIVE_PUSH_OVERRIDE reaches _push_do's stdin" "sink: $(cat "$SINK") :: $out"
+
+: >"$SINK"
+out=$( cd "$REPO"; fake_sudo; cmd_push DIVE-4288 --repo="file://$REPO" ) 2>&1
+{ [[ "$(wc -l <"$SINK")" == 4 ]] && [[ "$(sed -n 1p "$SINK")" == DIVE-4288 ]]; } \
+  && ok_t "4288: with no override set, the handoff is exactly the four pre-existing fields" \
+  || bad_t "4288: no-override handoff unchanged" "sink: $(cat "$SINK") :: $out"
 grep -Fq '_push_gate_check "$id" "$ident" 1' "$SRC/cmd_push.sh" \
   && ok_t "root push requires signed gate closure" \
   || bad_t "root push requires signed gate closure" "authoritative flag missing"

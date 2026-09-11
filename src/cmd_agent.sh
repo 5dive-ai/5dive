@@ -100,13 +100,70 @@ _agent_auth_display() { # <state> <expiry-epoch|-> <refreshable>
 # `_cmd_list_legacy`). The two call sites previously carried byte-identical
 # copies of the row expression, which is exactly how a column gets fixed on one
 # path and left stale on the other.
+#
+# DIVE-4278: AND `lastRunAt` ALONE IS NOT THE SEAT'S LIVENESS.
+#
+# `lastRunAt` is stamped only when the heartbeat DELIVERS a wake (_hb_mark_run).
+# Every tick that decided *not* to wake the seat because the seat was already
+# working — `[x] busy — N in_progress, skip`, `[x] active (mid-turn/conversation)
+# — defer nudge this tick` — leaves it frozen. So the age this column renders is
+# how long the seat has been continuously BUSY, and the `!` inverts onto exactly
+# the seats doing the most work.
+#
+# Measured twice. main, 2026-09-10 22:37Z on the control plane: quinn `∿84m/5m!`
+# with a heartbeat log printing `[quinn] busy — 1 in_progress, skip` every tick
+# and `5dive liveness` reading alive (it had written a task body 38s earlier).
+# Then the v0.31.0 shakedown on lodar's box, 2026-09-11 04:49Z: 4 of 4 seats
+# flagged, 0 stalled — including a seat mid-task and a seat the SAME tick logged
+# `[ceo] active (mid-turn/conversation) — defer nudge this tick`. The tick knew
+# the seat was alive at flag time and the flag ignored it. An operator who reads
+# 4/4 stalled either kicks healthy seats or stops reading the flag, and then the
+# one real stall (that box had an 11-week silent timer death) is missed.
+#
+# THE FIX IS TO SEPARATE TWO CLOCKS, not to widen the threshold:
+#   lastRunAt   — last heartbeat-INITIATED wake. Still what the age renders:
+#                 "how long since this seat was last driven" is a real question.
+#   lastSeenAt  — last tick that OBSERVED the seat alive without waking it
+#                 (busy-skip, active-defer). Written by the heartbeat, which is
+#                 the only party that runs as root and can write the registry;
+#                 `lastSeenWhy` carries the observation in the tick's own words.
+# A seat observed alive inside the same 2x window is NOT overdue, and its row
+# says WHY in place of the bare `!` — so the operator's next verb is obvious
+# (split the queue / look at the pane) instead of "kick it".
+#
+# A TRUE STALL STAYS LOUD, and that is the arm that matters: no wake AND no
+# observation for > 2x the cadence still flags, and a seat that never ran and
+# was never seen still reads `never`+`!`. Suppression requires positive,
+# dated, tick-written evidence — absence of evidence never clears the alarm.
 _AGENT_LIST_HB_DEFS='
   def hb_every: (.heartbeat.everyMin // 30);
   def hb_last: (.heartbeat.lastRunAt // 0) | if type == "number" then . else 0 end;
   def hb_on: (.heartbeat.enabled // false) == true;
   def hb_ran: hb_on and (hb_last > 0);
   def hb_age: (if hb_ran then ($now - hb_last) else 0 end) | if . < 0 then 0 else . end;
-  def hb_overdue: hb_on and ((hb_last <= 0) or (hb_age > (hb_every * 120)));
+  def hb_seen: (.heartbeat.lastSeenAt // 0) | if type == "number" then . else 0 end;
+  def hb_seen_age: (if hb_seen > 0 then ($now - hb_seen) else 0 end) | if . < 0 then 0 else . end;
+  def hb_why: (.heartbeat.lastSeenWhy // "") | if type == "string" then . else "" end
+              | if length > 24 then .[0:24] else . end;
+  # Positive evidence only: a stamp exists AND it is inside the same window the
+  # age arm is judged against. An absent stamp (every seat before this ships)
+  # changes nothing — the flag falls back to lastRunAt alone.
+  # DIVE-4310 — 2x cadence alone is not a stall threshold at a FAST cadence.
+  # Measured on the control plane 2026-09-11 11:44Z: quinn and main2 both read
+  # OVERDUE while mid-grade at a 1-minute cadence, because 2x = 120 SECONDS and
+  # any single turn longer than two minutes outruns it. The window is therefore
+  # the LONGER of 2x the cadence and 15 minutes — a floor, never a cap, so only
+  # the sub-8-minute cadences move: 1m and 5m both land on the 900s floor, so a
+  # 5m cadence DOES move (its own 2x is 600s), while 8m is 960s and every slower
+  # cadence (30m -> 3600s) is judged exactly as before.
+  def hb_window: (hb_every * 120) | if . < 900 then 900 else . end;
+  def hb_seen_fresh: hb_on and (hb_seen > 0) and (hb_seen_age <= hb_window);
+  def hb_stale: hb_on and ((hb_last <= 0) or (hb_age > hb_window));
+  def hb_overdue: hb_stale and (hb_seen_fresh | not);
+  # Stale by wake-age, but the tick saw it working: the row shows the reason.
+  def hb_working: hb_stale and hb_seen_fresh;
+  def hb_reason: if hb_working then (if (hb_why | length) > 0 then hb_why else "seen working" end)
+                 else "" end;
   def hb_agefmt:
     if . < 5400 then ((. / 60) | floor | tostring) + "m"
     elif . < 172800 then ((. / 3600) | floor | tostring) + "h"
@@ -116,8 +173,29 @@ _AGENT_LIST_HB_DEFS='
     else " ∿" + (if hb_ran then (hb_age | hb_agefmt) else "never" end)
          + "/" + (hb_every | tostring) + "m"
          + (if hb_overdue then "!" else "" end)
+         + (if hb_working then " " + hb_reason else "" end)
     end;
 '
+
+# The derived heartbeat verdict, for `--json`. The reason string must be
+# machine-readable too: a dashboard that re-derives "overdue" from lastRunAt by
+# hand re-creates the exact defect this fixes (DIVE-4278). Null for a seat that
+# is not enrolled, so a consumer can tell "not overdue" from "not asked".
+_agent_list_hb_json() { # <merged-json> [now]
+  local merged="$1" now="${2:-$(date +%s)}"
+  /usr/bin/jq -c --argjson now "$now" "$_AGENT_LIST_HB_DEFS"'
+    map(. + {heartbeatStatus:
+      (if hb_on | not then null
+       else {overdue: hb_overdue,
+             working: hb_working,
+             ageSec: (if hb_ran then hb_age else null end),
+             lastSeenAt: (if hb_seen > 0 then hb_seen else null end),
+             seenAgeSec: (if hb_seen > 0 then hb_seen_age else null end),
+             reason: (if hb_overdue then (if hb_ran then "no wake and no observed activity for longer than the stall window (2x cadence, min 15m)" else "enrolled but never run" end)
+                      elif hb_working then hb_reason
+                      else null end)}
+       end)})' <<<"$merged"
+}
 
 # Renders the human `agent list` table plus its heartbeat legend. $2 is the
 # clock, defaulted here and pinned by the unit tests so the ageing arms are
@@ -136,10 +214,19 @@ _agent_list_table() {
   local _hb_overdue
   _hb_overdue=$(/usr/bin/jq -r --argjson now "$now" "$_AGENT_LIST_HB_DEFS"'
     [.[] | select(hb_overdue) | .name] | join(", ")' <<<"$merged")
+  local _hb_working
+  _hb_working=$(/usr/bin/jq -r --argjson now "$now" "$_AGENT_LIST_HB_DEFS"'
+    [.[] | select(hb_working) | .name + " (" + hb_reason + ", last wake " + (hb_age | hb_agefmt) + " ago)"] | join(", ")' <<<"$merged")
   if [[ -n "$_hb_overdue" ]]; then
     echo
-    echo "∿age/cadence — OVERDUE (last run > 2x its own cadence, or never run): ${_hb_overdue}"
-    echo "      a stall can also be a boot window: re-read after one full cadence before calling a seat dead (5dive agent list --json | jq '.data[].heartbeat')"
+    echo "∿age/cadence — OVERDUE (no wake AND no observed activity for > 2x its own cadence or 15m, whichever is longer, or never run): ${_hb_overdue}"
+    echo "      a stall can also be a boot window: re-read after one full cadence before calling a seat dead (5dive agent list --json | jq '.data[].heartbeatStatus')"
+  fi
+  if [[ -n "$_hb_working" ]]; then
+    echo
+    echo "∿age/cadence — past its cadence, but the last tick's own decision for this seat was not a stall: ${_hb_working}"
+    echo "      busy/mid-turn: the age is how long it has been WORKING, not silent — the verb is split the queue or look at the pane, not kick the seat."
+    echo "      idle (no work): the tick had nothing to dispatch. That is not proof of life — for that ask the seat's own artifacts: 5dive liveness --agent=<name> (DIVE-4278)"
   fi
 }
 
@@ -339,7 +426,7 @@ _cmd_list_legacy() {
     health: ($live[.key].health // null)
   })' <<<"$reg")
   if (( JSON_MODE )); then
-    echo "$merged" | jq -c '{ok:true, data: .}'
+    _agent_list_hb_json "$merged" | jq -c '{ok:true, data: .}'
   else
     _agent_list_table "$merged"
     # DIVE-2088: the SUDO column is a MEASUREMENT, not the stored label, so the
@@ -831,7 +918,7 @@ cmd_list() {
   local merged
   merged=$(agent_list_snapshot)
   if (( JSON_MODE )); then
-    printf '{"ok":true,"data":%s}\n' "$merged"
+    printf '{"ok":true,"data":%s}\n' "$(_agent_list_hb_json "$merged")"
   else
     _agent_list_table "$merged"
     local _legends _lg_login _lg_exp _lg_aunk _lg_live _lg_unk _lg_div _lg_ext

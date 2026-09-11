@@ -181,6 +181,36 @@ check "an empty backlog does not inflate the distilled count"     "$_HB_CONS_RAN
 check "it is its own bucket"                                      "$_HB_CONS_IDLE"   "2"
 check "and it is NOT a failure either"                            "$((_HB_CONS_DFAIL + _HB_CONS_FAILED))" "0"
 
+echo "== DIVE-4284: the index-regrowth counters come off the same envelope =="
+# The number that matters 24h after a fleet compaction is how many indexes are
+# STILL over the loader limit — an index past it is loaded with its TAIL dropped
+# and no error, which is the defect DIVE-4222 measured regrowing in 4.5 hours.
+reset
+STUB_OUT='{"ok":true,"data":{"atoms_written":0,"processed":0,"distiller_failed":0,"index_over_limit":true,"index_rerouted":true,"index_still_over_limit":false}}'
+_hb_memory_consolidate_sweep "$NOW"
+check "a seat brought back under the limit is counted re-routed" "$_HB_CONS_ROUTED" "2"
+check "and is NOT counted as still over"                         "$_HB_CONS_OVER"   "0"
+# The one the fleet check reads: re-routed and still-over are different events,
+# and an index the router could not shrink must not hide inside the fixed count.
+reset
+STUB_OUT='{"ok":true,"data":{"atoms_written":0,"processed":0,"distiller_failed":0,"index_over_limit":true,"index_rerouted":false,"index_still_over_limit":true}}'
+_hb_memory_consolidate_sweep "$NOW"
+check "an index the router could not shrink is counted STILL OVER" "$_HB_CONS_OVER"   "2"
+check "and never as re-routed"                                     "$_HB_CONS_ROUTED" "0"
+# CONTROL: a healthy seat must move NEITHER counter, or the fleet number climbs
+# on the seats that are fine and the signal is worthless.
+reset
+STUB_OUT='{"ok":true,"data":{"atoms_written":0,"processed":0,"distiller_failed":0,"index_over_limit":false,"index_rerouted":false,"index_still_over_limit":false}}'
+_hb_memory_consolidate_sweep "$NOW"
+check "CONTROL: an under-limit seat moves neither counter" "$((_HB_CONS_ROUTED + _HB_CONS_OVER))" "0"
+# CONTROL: an older seat binary sends no index fields at all. Absent is neither
+# — it must not be read as "still over" (a false fleet alarm) nor as "re-routed".
+reset
+STUB_OUT='{"ok":true,"data":{"atoms_written":1,"processed":1,"distiller_failed":0}}'
+_hb_memory_consolidate_sweep "$NOW"
+check "CONTROL: a pre-4284 envelope moves neither counter" "$((_HB_CONS_ROUTED + _HB_CONS_OVER))" "0"
+check "CONTROL: and still grades as distilled"             "$_HB_CONS_RAN" "2"
+
 echo "== TWO envelopes on the stream still grade as one result =="
 # On a non-zero exit the CLI's EXIT-trap backstop appends its own
 # {"ok":false,"error":{...}} after the real result. A naive `jq -r .data.x` over
@@ -243,6 +273,11 @@ esac
 case "$LOGLINE" in
   *_HB_CONS_DFAIL*) ok "and surfaces the distiller-failed bucket" ;;
   *) bad "the distiller-failed bucket never reaches the log" ;;
+esac
+
+case "$LOGLINE" in
+  *_HB_CONS_OVER*) ok "and the tick summary carries the still-over-limit index count (DIVE-4284)" ;;
+  *) bad "a truncated index never reaches the tick log" ;;
 esac
 
 echo "== a seat with no unix user is skipped, not run as root =="

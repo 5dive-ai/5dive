@@ -401,10 +401,22 @@ _hb_autosleep_sweep() {
 # half — the seat's next idle, which is also its next wake, since a woken seat is
 # idle before its first turn.
 #
-# ONE MESSAGE PER SEAT PER TICK, and that is the design, not a throttle. Typing
-# the second message straight after the first would land it inside the turn the
-# first just started — the exact defect. So the flush re-asks the idle question
-# every tick and a backlog drains one message per idle observation.
+# ONE MESSAGE PER IDLE OBSERVATION — and the observation is no longer the CRON
+# TICK (DIVE-4296). Typing the second message straight after the first would land
+# it inside the turn the first just started, so the drain must re-ask the idle
+# question before every delivery; what it must NOT do is wait five minutes to ask.
+# Measured 2026-09-11 07:35-07:40Z: quinn held 15 then 16 spooled messages, a
+# 75-80 minute backlog at one per tick, and olivia force-woke ops to get round it.
+# So the pass now ROUND-ROBINS every seat with a spool, delivering at most one per
+# seat per round, sleeping _HB_A2A_DRAIN_POLL_SEC between rounds (which is both the
+# idle re-poll interval and the settle window that stops round N+1 typing into the
+# turn round N started), until every spool is empty or the pass budget is spent.
+# The budget is what keeps a tick bounded: an empty or busy fleet costs one round.
+#
+# RESIDUAL, named: a seat whose turns run longer than the remaining budget still
+# carries its backlog into the next tick — bounded now by the seat's own turn
+# length rather than by cron. Draining at the seat's own turn end needs a Stop
+# hook in the agent scaffold, which is a different rail and not in this diff.
 #
 # ORDERED BEFORE THE AUTOSLEEP SWEEP in the tick: a seat with mail waiting must
 # not be stopped with it still spooled. The spool survives a stop (it is a file
@@ -414,8 +426,83 @@ _hb_autosleep_sweep() {
 # Same isolation contract as every other sweep — a failure here must NEVER abort
 # the wake loop.
 _HB_A2A_FLUSHED=0
+# Seconds the whole drain pass may spend waiting for seats to go idle, and the
+# gap between rounds. Both overridable so a fleet can tune or neutralise the
+# in-tick drain (BUDGET=0 restores the pre-4296 one-round behaviour exactly)
+# without a revert.
+_HB_A2A_DRAIN_BUDGET_SEC="${FIVE_A2A_DRAIN_BUDGET_SEC:-90}"
+_HB_A2A_DRAIN_POLL_SEC="${FIVE_A2A_DRAIN_POLL_SEC:-5}"
+# DIVE-4296 iteration 2 — IS THIS SPOOLED MESSAGE STILL WORTH TYPING?
+#
+# The faster drain shrinks the window between "correct when written" and
+# "stale on arrival"; it does not close it. A seat busy for two hours still
+# receives a two-hour-old nudge. Measured 2026-09-11: the answered-gate nudge
+# for DIVE-4284 was written at 07:55:09Z, spooled behind quinn's 15-18 deep
+# backlog, and typed at 10:00:11Z — after main2 closed the row at 09:56:47Z.
+# quinn, 10:00Z: "Fifth false wake. DIVE-4284 was closed four minutes before the
+# message reached me." Eight such nudges reached quinn between 07:25 and 09:55Z.
+#
+# THREE WAYS A MACHINE NUDGE GOES STALE IN THE SPOOL, all measured on quinn's
+# live spool at 10:15Z (main, 10:10Z + 10:20Z):
+#   1. the row it names is done or cancelled;
+#   2. the row is no longer ASSIGNED to the recipient (4 of quinn's 15: DIVE-4288
+#      had moved to ops, DIVE-4293 to main2, two nudges each);
+#   3. a newer nudge for the same row is already spooled behind it (3 older
+#      duplicates) — delivering both spends two rounds to say one thing.
+#
+# ONLY from=task-engine, AND THAT IS THE WHOLE SAFETY ARGUMENT. A machine nudge
+# is a re-derivable statement about a row's state, so re-deriving it at delivery
+# time and finding it false makes it noise. A human- or agent-authored message is
+# not re-derivable and is NEVER dropped: it may be a question, a correction, or
+# the only copy of something. This predicate returns "deliver" for anything it
+# cannot positively prove stale — an unreadable row, an unparseable ident, a db
+# that does not answer. It fails OPEN, in the direction of delivering twice
+# rather than losing one.
+#
+# Prints the reason and returns 0 when the message should be DROPPED; returns 1
+# when it should be delivered.
+_a2a_nudge_ident() {
+  local payload="$1" id
+  case "$payload" in
+    '[5dive-msg from=task-engine '*|'[5dive-msg from=task-engine]'*) ;;
+    *) return 1 ;;
+  esac
+  # -m1 rather than a grep-into-head pipe: header.sh sets -o pipefail, and a grep
+  # whose reader closes early returns non-zero, which would abort the caller.
+  id="$(grep -m1 -oE 'DIVE-[0-9]+' <<<"$payload" 2>/dev/null)" || return 1
+  [[ -n "$id" ]] || return 1
+  printf '%s' "$id"
+}
+
+_a2a_stale_nudge_reason() {
+  local seat="$1" payload="$2"; shift 2
+  local ident row status asg later lmsg lident
+  ident="$(_a2a_nudge_ident "$payload")" || return 1
+  row="$(db "SELECT COALESCE(status,'')||x'1f'||COALESCE(assignee,'')
+              FROM tasks WHERE COALESCE(ident,'DIVE-'||id)=$(sqlq "$ident");" 2>/dev/null)" || row=""
+  # No row, or a db that did not answer: deliver. Never drop on a failed read.
+  [[ -n "$row" ]] || return 1
+  IFS=$'\x1f' read -r status asg <<<"$row"
+  case "$status" in
+    done|cancelled) printf '%s is %s' "$ident" "$status"; return 0 ;;
+  esac
+  if [[ -n "$asg" && "$asg" != "$seat" ]]; then
+    printf '%s is now on %s' "$ident" "$asg"; return 0
+  fi
+  # (3) A NEWER nudge for the same row sits behind this one. The caller passes the
+  # rest of the spool in delivery order, so anything here is strictly newer.
+  for later in "$@"; do
+    lmsg="$(sudo -u "agent-${seat}" cat "$later" 2>/dev/null)" || continue
+    lident="$(_a2a_nudge_ident "$lmsg")" || continue
+    [[ "$lident" == "$ident" ]] || continue
+    printf 'a newer nudge for %s is already spooled behind it' "$ident"; return 0
+  done
+  return 1
+}
+
 _hb_a2a_queue_sweep() {
-  local reg name depth
+  local reg name depth deadline rounds=0
+  local -a seats=() remaining=()
   _HB_A2A_FLUSHED=0
   declare -F a2a_queue_flush_one >/dev/null 2>&1 || return 0
   reg=$(registry_read) || return 0
@@ -424,12 +511,35 @@ _hb_a2a_queue_sweep() {
     [[ "$depth" =~ ^[0-9]+$ ]] || continue
     (( depth > 0 )) || continue
     systemctl is-active --quiet "5dive-agent@${name}.service" 2>/dev/null || continue
-    if a2a_queue_flush_one "$name"; then
-      _HB_A2A_FLUSHED=$((_HB_A2A_FLUSHED + 1))
-      _hb_log "[$name] delivered 1 queued a2a message at idle (${depth} were spooled)"
-    fi
+    seats+=("$name")
   done
-  (( _HB_A2A_FLUSHED > 0 )) && _hb_log "[a2a-queue] pass done — ${_HB_A2A_FLUSHED} delivered"
+  (( ${#seats[@]} > 0 )) || return 0
+  deadline=$(( $(date +%s) + ${_HB_A2A_DRAIN_BUDGET_SEC:-0} ))
+  while (( ${#seats[@]} > 0 )); do
+    rounds=$((rounds + 1))
+    remaining=()
+    for name in "${seats[@]}"; do
+      if a2a_queue_flush_one "$name"; then
+        _HB_A2A_FLUSHED=$((_HB_A2A_FLUSHED + 1))
+        depth=$(_a2a_queue_depth "$name")
+        # Depth AFTER the drain, every time: the backlog is the number the next
+        # reader of this log needs, and it is what makes a stuck spool visible.
+        _hb_log "[$name] delivered 1 queued a2a message at idle (${depth:-?} still spooled)"
+      else
+        depth=$(_a2a_queue_depth "$name")
+      fi
+      [[ "$depth" =~ ^[0-9]+$ ]] && (( depth > 0 )) && remaining+=("$name")
+    done
+    seats=( ${remaining[@]+"${remaining[@]}"} )
+    (( ${#seats[@]} > 0 )) || break
+    # Budget check BEFORE the sleep, so the pass can never overrun it.
+    if (( $(date +%s) + ${_HB_A2A_DRAIN_POLL_SEC:-0} > deadline )); then
+      _hb_log "[a2a-queue] drain budget (${_HB_A2A_DRAIN_BUDGET_SEC}s) spent after ${rounds} round(s) — ${#seats[@]} seat(s) still spooled, next tick continues"
+      break
+    fi
+    sleep "${_HB_A2A_DRAIN_POLL_SEC}"
+  done
+  (( _HB_A2A_FLUSHED > 0 )) && _hb_log "[a2a-queue] pass done — ${_HB_A2A_FLUSHED} delivered in ${rounds} round(s)"
   return 0
 }
 
@@ -444,10 +554,13 @@ _hb_usage() {
   5dive heartbeat off <name>              # stop waking the agent (keeps its settings)
   5dive heartbeat ls                      # show enrolled agents + next-wake + queued count
   5dive heartbeat tick                    # cron driver: wake every due agent that has work
-  5dive heartbeat wake-task <agent> <task_id> [<ident>]
+  5dive heartbeat wake-task [--fresh|--no-fresh] <agent> <task_id> [<ident>]
                                           # root: drive ONE agent onto ONE task now, bypassing the
                                           # cadence. The manual exit from a tier-guard hold, and
                                           # what \`loop\` uses to start a just-spawned row.
+                                          # Clears first exactly when the tick would (the seat's
+                                          # \`fresh\` setting, or the row's own override); --fresh /
+                                          # --no-fresh force it either way.
   5dive heartbeat held [--json] [--stalled-hours=<h>]
                                           # seats whose ENTIRE runnable queue is tier-guard held
                                           # (breach-only: prints nothing when no seat is stranded)
@@ -492,19 +605,76 @@ cmd_heartbeat() {
   esac
 }
 
+# THE ONE DEFINITION OF "does this wake clear first?" (DIVE-4296). Two callers
+# ask it — the tick and the forced `wake-task` — and before this row they gave
+# different answers for the same seat: the tick read the registry's
+# `heartbeat.fresh`, and wake-task hard-coded the literal "false". A fresh seat's
+# whole point is that each goal starts on a blank context, so a forced wake (every
+# hotfix wake, every grader force-wake, every `loop spawn`) landed its /goal under
+# the previous turn's output — measured 2026-09-11 07:45Z on ops and 07:49Z on
+# quinn, both registered `heartbeat.fresh: true`.
+#
+# Precedence, highest first: an explicit caller override, then the task row's own
+# `fresh` column (DIVE-138's per-instance override), then the seat's registry
+# setting, then false. The third argument lets the tick pass the agent-level value
+# it already has in its `$reg` snapshot instead of re-reading the registry per
+# seat; omit it and the registry is read here.
+_hb_effective_fresh() {
+  local name="$1" task_id="$2" agent_fresh="${3:-}"
+  if [[ -z "$agent_fresh" ]]; then
+    local reg
+    reg=$(registry_read 2>/dev/null) || reg=""
+    if [[ -n "$reg" ]]; then
+      agent_fresh=$(jq -r --arg n "$name" \
+        '(.agents[$n].heartbeat | if has("fresh") then .fresh else false end)' <<<"$reg" 2>/dev/null) \
+        || agent_fresh="false"
+    fi
+  fi
+  [[ "$agent_fresh" == "true" ]] || agent_fresh="false"
+  local task_fresh
+  task_fresh=$(db "SELECT COALESCE(fresh,'') FROM tasks WHERE id=${task_id};" 2>/dev/null || echo "")
+  [[ "$task_fresh" == "1" ]] && agent_fresh="true"
+  printf '%s' "$agent_fresh"
+}
+
 # DIVE-1349 wake-on-spawn helper (internal plumbing, not in _hb_usage). Nudges
 # ONE agent to start a specific just-spawned task now instead of on its next
 # tick. Root-gated because it drives systemd + the agent's tmux session; invoked
 # by `loop spawn` — directly when already root, else via `sudo -n 5dive heartbeat
 # wake-task …` from the claude-owned shelld exec context. Reuses the exact tick
-# nudge (_hb_wake, fresh=false: pick the task up in the running context, no
-# /clear). Best-effort by contract: _hb_wake's own failures are non-fatal here.
+# nudge (_hb_wake). Best-effort by contract: _hb_wake's own failures are non-fatal
+# here.
+#
+# DIVE-4296: `fresh` is RESOLVED, not assumed. The old literal "false" meant a
+# forced wake on a fresh seat skipped the /clear the tick would have sent, so the
+# goal landed in a warm context. `--no-fresh` keeps the old behaviour explicitly
+# (pick the task up in the running context) and `--fresh` forces the clear.
 cmd_heartbeat_wake_task() {
   require_root
-  local name="${1:-}" task_id="${2:-}" task_ident="${3:-DIVE-${2:-}}"
+  local fresh_override=""
+  local -a _pos=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --fresh)    fresh_override="true"; shift ;;
+      --no-fresh) fresh_override="false"; shift ;;
+      --)         shift; while [[ $# -gt 0 ]]; do _pos+=("$1"); shift; done ;;
+      *)          _pos+=("$1"); shift ;;
+    esac
+  done
+  local name="${_pos[0]:-}" task_id="${_pos[1]:-}"
+  local task_ident="${_pos[2]:-DIVE-${_pos[1]:-}}"
   [[ -n "$name" && "$task_id" =~ ^[0-9]+$ ]] \
-    || fail "$E_USAGE" "usage: 5dive heartbeat wake-task <agent> <task_id> [<task_ident>]"
-  _hb_wake "$name" "false" "$task_id" "$task_ident" || true
+    || fail "$E_USAGE" "usage: 5dive heartbeat wake-task [--fresh|--no-fresh] <agent> <task_id> [<task_ident>]"
+  local fresh
+  if [[ -n "$fresh_override" ]]; then
+    fresh="$fresh_override"
+  else
+    fresh="$(_hb_effective_fresh "$name" "$task_id")"
+  fi
+  _hb_log "[$name] forced wake onto ${task_ident} (fresh=${fresh}${fresh_override:+, caller override})"
+  # DIVE-4310: a forced wake fails with the same named cause as a tick wake.
+  _hb_wake "$name" "$fresh" "$task_id" "$task_ident" \
+    || _hb_log "[$name] forced wake FAILED at ${_HB_WAKE_FAIL_REASON:-<step not recorded — a wake exit is missing its _hb_wake_fail>}"
 }
 
 # Parse a duration into whole minutes. Accepts a bare integer (minutes),
@@ -1248,6 +1418,40 @@ _hb_mark_active_defer() {
   printf '%s' "$n"
 }
 
+# DIVE-4278 — record a tick that OBSERVED this seat alive WITHOUT waking it.
+#
+# `lastRunAt` (_hb_mark_run) is a wake receipt, and the two commonest tick
+# outcomes for a working seat are not wakes: `busy — N in_progress, skip` and
+# `active (mid-turn/conversation) — defer nudge this tick`. Both leave lastRunAt
+# frozen, so `agent list` rendered the busiest seats as the most overdue ones —
+# 4 of 4 seats flagged and 0 stalled on lodar's box during the v0.31.0 shakedown,
+# including a seat the same tick had just logged as mid-turn.
+#
+# So the tick writes down what it saw, in its own words. The heartbeat is the
+# right (and only) writer: it runs as root, and the registry is 640 root:claude —
+# a seat cannot stamp its own liveness here even if we asked it to.
+#
+# This must never do the opposite job: it is POSITIVE evidence only, it is never
+# cleared to accuse a seat, and `agent list` only consults it inside the same 2x
+# window the age is judged against. A seat nobody observed simply has no stamp
+# and is judged exactly as it was before this shipped.
+#
+# Best-effort and non-fatal: a failed stamp costs a false OVERDUE next tick, and
+# must never abort a dispatch tick. Must run under with_registry_lock, like
+# _hb_mark_run / _hb_mark_active_defer.
+_hb_mark_seen() { # <name> <now> <why>
+  local name="$1" now="$2" why="$3"
+  local reg; reg=$(registry_read) || return 0
+  # Only for a seat that HAS a heartbeat block — never conjure one, or an
+  # un-enrolled seat grows a half-object that reads as enrolled elsewhere.
+  reg=$(echo "$reg" | jq --arg n "$name" --argjson t "$now" --arg w "$why" '
+    if .agents[$n].heartbeat then
+      .agents[$n].heartbeat.lastSeenAt = $t
+      | .agents[$n].heartbeat.lastSeenWhy = $w
+    else . end') || return 0
+  echo "$reg" | registry_write || return 0
+}
+
 # DIVE-3503 — record the pane fingerprint an active-defer escalation FIRED ON.
 # Survives _hb_clear_active_defer's counter reset on purpose: the counter is the
 # episode's nudge budget, this is the evidence of what the last remedy was aimed
@@ -1690,10 +1894,149 @@ _hb_tier_rank() {
   esac
 }
 
+# DIVE-4279: one tmux send-keys step, with its stderr KEPT. Measured 2026-09-11
+# 04:45:24Z on lodar's box 5dive-exact-swallow (5dive 0.31.0): the devops wake
+# logged only the two bare lines (nudge send failed, then the retry notice) and
+# NOTHING else, because all three send-keys calls here were bare `|| return 1` with
+# `2>/dev/null` — the one diagnostic that would name the cause was the thing
+# discarded. Each step now names ITSELF and quotes what tmux said, so an operator
+# (or the supervisor) reads a cause instead of guessing.
+# `2>&1 >/dev/null` (that order) keeps stderr and drops stdout.
+_HB_SENDKEYS_ERR=""
+# DIVE-4310: the reason THIS send attempt failed, in the injector's own words —
+# which step (dispatcher inbox / pane-safe guard / send-keys / submit verify),
+# its rc, and the first line of whatever the underlying tool said. Set by every
+# failing exit of `_hb_send_line`; cleared at its entry so it is never stale.
+_HB_SEND_FAIL_REASON=""
+_hb_send_keys_step() {
+  local name="$1" step="$2"; shift 2
+  local err rc=0
+  err=$(sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" "$@" 2>&1 >/dev/null) || rc=$?
+  if (( rc == 0 )); then _HB_SENDKEYS_ERR=""; return 0; fi
+  err="${err//$'\n'/ }"
+  _HB_SENDKEYS_ERR="$err"
+  # DIVE-4310: publish the SAME reason to the send-line/wake seam. The log line
+  # below is read by an operator; this variable is what lets `_hb_wake` (and the
+  # tick's one-line verdict) name the step instead of saying "wake failed".
+  _HB_SEND_FAIL_REASON="send-keys/${step} (tmux rc ${rc}): ${err:-<tmux wrote nothing to stderr>}"
+  _hb_log "[$name] ${step} failed (tmux rc ${rc}): ${err:-<tmux wrote nothing to stderr>}" 2>/dev/null || true
+  return 1
+}
+
+# DIVE-4279 part 2: a failed keystroke is not proof the payload was not received.
+# On the same box the seat STARTED the row 23s after the 'nudge send failed', so
+# the tick's `woke 0` may be a FALSE NEGATIVE, not just a missing reason. Before
+# typing we mark the seat's newest transcript (path + byte size); after a failed
+# step we re-read the bytes appended SINCE the mark and look for THIS payload.
+#
+# DIVE-4279 iteration 2 — the first cut turned that false negative into a false
+# POSITIVE, which is worse. It accepted ANY `"type":"user"` record in the window,
+# and Claude Code writes every TOOL RESULT as a user record (6 of 9 user records
+# in a live transcript were tool_results), so a seat that is merely WORKING mints
+# one every few seconds. The receipt must therefore be a property of THIS
+# PAYLOAD, not of the record type:
+#   * the record must carry a distinguishing run of the payload text verbatim;
+#   * tool_result-shaped records are excluded outright, so a tool result that
+#     happens to quote the payload back (a `task show`, a grep of the log) can
+#     never be mistaken for the seat receiving it;
+#   * if no such run can be derived, or nothing matches, the answer is "could not
+#     tell" and the WAKE FAILS — DIVE-2159: never report a state nobody measured.
+# Same file and grown only: a NEW newest file is a new session, which is not
+# evidence that this payload landed, so that reads as not-landed and says so.
+_HB_TRANSCRIPT_ROOT=""      # test seam; empty = the seat's real ~/.claude/projects
+_HB_LANDED_FILE=""; _HB_LANDED_SIZE=""; _HB_LANDED_EVIDENCE=""
+_hb_transcript_newest() {
+  local name="$1"
+  local root="${_HB_TRANSCRIPT_ROOT:-/home/agent-${name}/.claude/projects}"
+  sudo -n -u "agent-${name}" bash -c "ls -1t ${root}/*/*.jsonl 2>/dev/null | head -1" 2>/dev/null
+}
+# ONE fork on the healthy path: newest transcript + its byte size in a single
+# shell. This runs before every injected line, so it must stay cheap and must
+# never fail the send — an unreadable store just leaves the mark empty and the
+# landed check then reports "could not tell" instead of guessing.
+_hb_landed_mark() {
+  local name="$1" out
+  local root="${_HB_TRANSCRIPT_ROOT:-/home/agent-${name}/.claude/projects}"
+  _HB_LANDED_FILE=""; _HB_LANDED_SIZE=""; _HB_LANDED_EVIDENCE=""
+  out=$(sudo -n -u "agent-${name}" bash -c "f=\$(ls -1t ${root}/*/*.jsonl 2>/dev/null | head -1); [ -n \"\$f\" ] && stat -c '%s %n' \"\$f\"" 2>/dev/null) || return 0
+  [[ "$out" == *" "* ]] || return 0
+  _HB_LANDED_SIZE="${out%% *}"; _HB_LANDED_FILE="${out#* }"
+  [[ "$_HB_LANDED_SIZE" =~ ^[0-9]+$ ]] || { _HB_LANDED_SIZE=""; _HB_LANDED_FILE=""; }
+  return 0
+}
+# The longest run of the payload that survives JSON encoding byte-for-byte, so a
+# plain fixed-string grep over the raw transcript can match it. Split on every
+# byte a JSON writer may re-spell — anything outside printable ASCII (control
+# bytes, and UTF-8 that some writers emit as `\uXXXX`) plus `"` and `\` — and the
+# longest surviving run is the needle. Too short a run is not distinguishing —
+# "ok" would match half the corpus — so below the floor we return failure and the
+# caller reports "could not tell" rather than guessing.
+_HB_LANDED_NEEDLE_MIN="${_HB_LANDED_NEEDLE_MIN:-12}"
+_hb_landed_needle() {
+  local text="$1" best="" part
+  # `|| [[ -n "$part" ]]`: the last run carries no trailing newline, and a plain
+  # `read` drops it — which silently threw away the whole needle for any payload
+  # holding no escapable byte at all.
+  while IFS= read -r part || [[ -n "$part" ]]; do
+    (( ${#part} > ${#best} )) && best="$part"
+  done < <(printf '%s' "$text" \
+    | LC_ALL=C tr -c '\040-\176' '\n' \
+    | LC_ALL=C tr '"\\' '\n\n')
+  best="${best#"${best%%[![:space:]]*}"}"      # trim: leading run of blanks
+  best="${best%"${best##*[![:space:]]}"}"      # trim: trailing run of blanks
+  (( ${#best} >= _HB_LANDED_NEEDLE_MIN )) || return 1
+  printf '%s' "${best:0:200}"
+}
+
+# 0 = THIS payload demonstrably reached the seat despite the failed keystroke (the
+# caller counts the wake as delivered, so `woke N` matches reality); 1 = it did
+# not, or we could not tell — either way the reason is logged, never inferred.
+# NEVER call this for a step that precedes the payload keystroke: a failed C-u
+# means the text was never typed, so nothing appended in the window can be a
+# receipt for it and a match there could only be somebody else's record.
+_hb_landed_check() {
+  local name="$1" text="$2" now_file now_size needle tail_rc=0
+  _HB_LANDED_EVIDENCE=""
+  if ! needle=$(_hb_landed_needle "$text"); then
+    _hb_log "[$name] could not tell whether the line landed: the payload has no ${_HB_LANDED_NEEDLE_MIN}-char run distinctive enough to match in the transcript, so nothing is claimed either way (DIVE-4279/DIVE-2159)" 2>/dev/null || true
+    return 1
+  fi
+  if [[ -z "$_HB_LANDED_FILE" || -z "$_HB_LANDED_SIZE" ]]; then
+    _hb_log "[$name] could not tell whether the line landed: no readable transcript to compare against (DIVE-4279)" 2>/dev/null || true
+    return 1
+  fi
+  sleep "${_HB_LANDED_WAIT_SEC:-1}"
+  now_file=$(_hb_transcript_newest "$name")
+  if [[ "$now_file" != "$_HB_LANDED_FILE" ]]; then
+    _hb_log "[$name] line did NOT land: the seat's newest transcript changed to '${now_file:-<none>}' (a new session), which is not evidence for this payload (DIVE-4279)" 2>/dev/null || true
+    return 1
+  fi
+  now_size=$(sudo -n -u "agent-${name}" stat -c %s "$_HB_LANDED_FILE" 2>/dev/null) || now_size=""
+  if ! [[ "$now_size" =~ ^[0-9]+$ ]] || (( now_size <= _HB_LANDED_SIZE )); then
+    _hb_log "[$name] line did NOT land: transcript $(basename "$_HB_LANDED_FILE") gained no bytes since the send (DIVE-4279)" 2>/dev/null || true
+    return 1
+  fi
+  # user record AND not tool_result-shaped AND carrying this payload's own text.
+  # The tool_result exclusion is a whole-RECORD drop, not a field test: a tool
+  # result that quotes the payload back must not read as the seat receiving it.
+  sudo -n -u "agent-${name}" tail -c "+$(( _HB_LANDED_SIZE + 1 ))" "$_HB_LANDED_FILE" 2>/dev/null \
+    | grep -a '"type"[[:space:]]*:[[:space:]]*"user"' \
+    | grep -av -e '"type"[[:space:]]*:[[:space:]]*"tool_result"' -e '"tool_use_id"' \
+    | grep -aqF -- "$needle" || tail_rc=1
+  if (( tail_rc != 0 )); then
+    _hb_log "[$name] line did NOT land: transcript $(basename "$_HB_LANDED_FILE") grew, but no non-tool_result user record since byte ${_HB_LANDED_SIZE} carries this payload ('${needle:0:40}') (DIVE-4279)" 2>/dev/null || true
+    return 1
+  fi
+  _HB_LANDED_EVIDENCE="$(basename "$_HB_LANDED_FILE") gained a user record carrying this payload ('${needle:0:40}') after byte ${_HB_LANDED_SIZE}"
+  _hb_log "[$name] the keystroke failed but the line DID land — ${_HB_LANDED_EVIDENCE}; counting the wake as delivered (DIVE-4279)" 2>/dev/null || true
+  return 0
+}
+
 # Inject one literal line + Enter into an agent's tmux pane. Returns nonzero
 # (never exits) so a single dead pane can't abort the whole tick.
 _hb_send_line() {
   local name="$1" text="$2" tries=0
+  _HB_SEND_FAIL_REASON=""   # DIVE-4310: never report a previous attempt's cause
   # DIVE-2137: the heartbeat is the FOURTH typed-send site (send / ask / _deliver
   # are the three in cmd_agent_runtime.sh) and had the same blind spot — it types
   # a nudge into whatever the pane happens to be showing. An agent that booted
@@ -1722,13 +2065,17 @@ _hb_send_line() {
     local _hb_drc=0
     _agent_dispatch_inbox_send "$name" "$text" "$_hb_inbox" || _hb_drc=$?
     (( _hb_drc == 0 )) && return 0
-    _hb_log "send to ${name} FAILED: $(_agent_submit_unconfirmed_reason "$name" "$_hb_drc")" 2>/dev/null || true
+    local _hb_drsn; _hb_drsn="$(_agent_submit_unconfirmed_reason "$name" "$_hb_drc" 2>/dev/null)"
+    _HB_SEND_FAIL_REASON="dispatcher inbox (rc ${_hb_drc}): ${_hb_drsn:-<no reason reported>}"   # DIVE-4310
+    _hb_log "send to ${name} FAILED: ${_hb_drsn:-<no reason reported>}" 2>/dev/null || true
     return 1
   fi
   _agent_pane_safe_to_type "$name" || {
     if [[ "${_AGENT_PANE_REFUSAL_REASON:-}" == "unreadable" ]]; then
+      _HB_SEND_FAIL_REASON="pane-safe guard (rc 1): could not read the pane (tmux capture-pane failed after retries) — fail-closed, nothing typed (DIVE-2159)"
       _hb_log "skip send to ${name}: could not read the pane (tmux capture-pane failed after retries) — fail-closed, nothing typed (DIVE-2159)" 2>/dev/null || true
     else
+      _HB_SEND_FAIL_REASON="pane-safe guard (rc 1): pane is a credential/login prompt, not a chat input (DIVE-2137)"
       _hb_log "skip send to ${name}: pane is a credential/login prompt, not a chat input (DIVE-2137)" 2>/dev/null || true
     fi
     return 1
@@ -1743,8 +2090,14 @@ _hb_send_line() {
   # that is mid-turn ABORTS the turn, C-u only edits the composer. Ghost text
   # (CC 2.1.267 promptSuggestion, rendered DIM) is not input and is replaced by
   # typing anyway; it is excluded from the verify below rather than cleared.
-  sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" C-u 2>/dev/null || return 1
-  sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" -l -- "$text" 2>/dev/null || return 1
+  # DIVE-4279: mark the transcript BEFORE the first keystroke, so a failed step
+  # can be checked against what the seat actually received.
+  _hb_landed_mark "$name"
+  # NO landed check on this step: the payload has not been typed yet, so a failed
+  # C-u can never mean the line landed. (DIVE-4279 iteration 2 — checking here is
+  # how the first cut counted a busy seat's tool_result as a delivered wake.)
+  _hb_send_keys_step "$name" "composer clear (C-u)" C-u || return 1
+  _hb_send_keys_step "$name" "payload text" -l -- "$text" || { _hb_landed_check "$name" "$text" && return 0; return 1; }
   # DIVE-1217: `send-keys -l` lands as a bracketed PASTE. Claude commits it
   # synchronously so an immediate Enter submits (leave that path alone). Non-claude
   # TUIs (codex/grok/agy/opencode) render the paste inline and a trailing Enter
@@ -1761,23 +2114,28 @@ _hb_send_line() {
   # the pre-DIVE-2244 behaviour for exactly this task and strictly better than a
   # claim on a prompt nobody received.
   if [[ -n "$(_hb_claude_pid "$name")" ]]; then
-    sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter 2>/dev/null || return 1
+    _hb_send_keys_step "$name" "submit (Enter)" Enter || { _hb_landed_check "$name" "$text" && return 0; return 1; }
     _hb_verify_submit "$name" && return 0
     sleep "${_HB_SUBMIT_RETRY_SEC:-0.5}"
-    sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter 2>/dev/null || return 1
+    _hb_send_keys_step "$name" "submit retry (Enter)" Enter || { _hb_landed_check "$name" "$text" && return 0; return 1; }
     _hb_verify_submit "$name" && return 0
+    _HB_SEND_FAIL_REASON="submit unverified (rc 1): the composer still holds ${#_HB_COMPOSER_UNSENT} chars of non-ghost text after 2 Enters ('${_HB_COMPOSER_UNSENT:0:60}') (DIVE-4242)"
     _hb_log "[$name] submit UNVERIFIED — the composer still holds ${#_HB_COMPOSER_UNSENT} chars of non-ghost text after 2 Enters ('${_HB_COMPOSER_UNSENT:0:60}'); returning failure so nothing is claimed on it (DIVE-4242)" 2>/dev/null || true
     return 1
   fi
   sleep 0.4
   while (( tries < 5 )); do
-    sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter 2>/dev/null || return 1
+    _hb_send_keys_step "$name" "submit (Enter, attempt $((tries+1)))" Enter || { _hb_landed_check "$name" "$text" && return 0; return 1; }
     sleep 0.5
     # idle()==0 means the Enter did not take (still at the prompt) -> retry; any
     # other state (busy/blocked/unknown) means the composer accepted it.
     _hb_agent_idle "$name" 0.4 || return 0
     tries=$((tries+1))
   done
+  # DIVE-4310: this exit was the silent one — five Enters, the seat never left
+  # idle, and the function returned 1 with nothing written anywhere.
+  _HB_SEND_FAIL_REASON="submit not accepted (rc 1): the seat was still idle after ${tries} Enter attempts — the paste never committed (DIVE-1217 path)"
+  _hb_log "[$name] ${_HB_SEND_FAIL_REASON}" 2>/dev/null || true
   return 1
 }
 
@@ -3163,8 +3521,33 @@ _hb_carryover_clause() { # <agent> <task_id> <ident>
   printf '%s' "$c"
 }
 
+# DIVE-4310 — EVERY wake-failure exit names ITSELF. DIVE-4279 (#874) gave the
+# tmux send-keys step a reason (which step, its rc, what it wrote to stderr); the
+# exits AROUND it still returned a bare 1, and the tick's own verdict was the
+# bare "[name] wake failed — will retry next tick". Re-measured on lodar's box
+# (5dive-exact-swallow, 0.32.0) as still-not-fixed: a seat that fails to wake and
+# logs no reason is the one class of stall nobody can diagnose from the log, and
+# it is the shape behind every "HB is buggy, X is not taking his task" report.
+#
+# The reason is written HERE (so the heartbeat log carries it at the point of
+# failure) and published in _HB_WAKE_FAIL_REASON so the caller's one-line verdict
+# carries it too — an operator reads one line, not two, and `wake-task` gets the
+# same treatment as the tick. Returns 1 so it can stand in for the bare `return 1`.
+_HB_WAKE_FAIL_STEP=""
+_HB_WAKE_FAIL_REASON=""
+_hb_wake_fail() {
+  local name="$1" step="$2" rc="${3:-?}" detail="${4:-}"
+  detail="${detail%%$'\n'*}"                              # FIRST line of stderr only
+  detail="${detail#"${detail%%[![:space:]]*}"}"            # ...trimmed
+  _HB_WAKE_FAIL_STEP="$step"
+  _HB_WAKE_FAIL_REASON="${step} (rc ${rc}): ${detail:-<no stderr>}"
+  _hb_log "[$name] wake FAILED at ${_HB_WAKE_FAIL_REASON} (DIVE-4310)" 2>/dev/null || true
+  return 1
+}
+
 _hb_wake() {
   local name="$1" fresh="$2" task_id="$3" task_ident="${4:-DIVE-$3}"
+  _HB_WAKE_FAIL_STEP=""; _HB_WAKE_FAIL_REASON=""   # DIVE-4310: never stale
   # DIVE-1475 status guard: never inject a /goal for a task that isn't actionable.
   # The tick's picker (_hb_pick_task) only ever hands us a live todo, but the direct
   # `heartbeat wake-task` verb — and any buggy or looping caller (e.g. a test harness
@@ -3186,19 +3569,24 @@ _hb_wake() {
     return 0
   fi
   if ! systemctl is-active --quiet "5dive-agent@${name}.service"; then
-    systemctl start "5dive-agent@${name}.service" 2>/dev/null \
-      || { _hb_log "[$name] systemctl start failed"; return 1; }
+    # DIVE-4310: keep systemd's stderr. `2>/dev/null` here discarded the one
+    # string that distinguishes "unit not found" from "job failed" from a
+    # masked unit — and then the caller printed neither.
+    local _sc_err _sc_rc=0
+    _sc_err=$(systemctl start "5dive-agent@${name}.service" 2>&1 >/dev/null) || _sc_rc=$?
+    (( _sc_rc == 0 )) || { _hb_wake_fail "$name" "systemctl start (5dive-agent@${name}.service)" "$_sc_rc" "$_sc_err"; return 1; }
     local i
     for ((i = 0; i < 30; i++)); do
       sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null && break
       sleep 2
     done
   fi
-  sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null \
-    || { _hb_log "[$name] no tmux session after start"; return 1; }
+  local _ts_err _ts_rc=0
+  _ts_err=$(sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>&1 >/dev/null) || _ts_rc=$?
+  (( _ts_rc == 0 )) || { _hb_wake_fail "$name" "tmux session probe (agent-${name} has no session after start)" "$_ts_rc" "$_ts_err"; return 1; }
 
   if [[ "$fresh" == "true" ]]; then
-    _hb_send_line "$name" "/clear" || { _hb_log "[$name] /clear failed"; return 1; }
+    _hb_send_line "$name" "/clear" || { _hb_wake_fail "$name" "/clear injection" 1 "${_HB_SEND_FAIL_REASON:-<injector reported no reason>}"; return 1; }
     sleep 4
   fi
 
@@ -3206,7 +3594,7 @@ _hb_wake() {
   # evaluator sees the condition met, then auto-clears. "stop after N turns" is a
   # soft, model-judged guard — it does NOT reliably halt a runaway loop, so the
   # real hard cap is the deterministic stale-in_progress reaper in the tick.
-  local nudge="/goal Task ${task_ident} shows status done or cancelled, or is blocked with a human gate filed, on the 5dive board (verify ONLY by running: 5dive task show ${task_ident}). To achieve it: claim it with '5dive task start ${task_ident}', do the work, then close it with '5dive task done ${task_ident} --result=\"<one or two self-contained sentences — any output the creator needs to see; the dashboard and creator read this>\"'. If it needs a human decision, approval, a secret, or a manual step only a person can do, do NOT cancel — file a gate that pings the owner: '5dive task need ${task_ident} --type=decision --ask=\"<what you need from them>\"' (use --type=approval|secret|manual as fits). Keep the ask to ONE crisp question + ~1 line of essential context — put heavy detail in the task BODY, not the ask — and ALWAYS surface your recommended choice with --recommend=\"<option>\" (and --options=A|B for a decision) so the owner sees the advised answer first. Only if the task is genuinely irrelevant or impossible, run '5dive task cancel ${task_ident} --result=\"<why>\"'. Before you close (done or cancel), run a fast self-audit — (a) what am I least confident about here, and (b) what did I NOT check or leave missing? If either surfaces a real gap, fix it or file a gate instead of closing silently; otherwise close. Work ONLY this one task — do not start any other. Stop after 6 turns."
+  local nudge="/goal Task ${task_ident} shows status done or cancelled, or is blocked with a human gate filed, on the 5dive board (verify ONLY by running: 5dive task show ${task_ident}). To achieve it: claim it with '5dive task start ${task_ident}', do the work, then close it with '5dive task done ${task_ident} --result=\"<one or two self-contained sentences — any output the creator needs to see; the dashboard and creator read this>\"'. If it needs a human decision, approval, a secret, or a manual step only a person can do, do NOT cancel — file a gate that pings the owner: '5dive task need ${task_ident} --type=decision --ask=\"<what you need from them>\"' (use --type=approval|secret|manual as fits). Keep the ask to ONE crisp question + ~1 line of essential context — put heavy detail in the task BODY, not the ask — and ALWAYS surface your recommended choice with --recommend=\"<option>\" (and --options=A|B for a decision) so the owner sees the advised answer first. Only if the task is genuinely irrelevant or impossible, run '5dive task cancel ${task_ident} --result=\"<why>\"'. Before you close (done or cancel), run a fast self-audit — (a) what am I least confident about here, and (b) what did I NOT check or leave missing? If either surfaces a real gap, fix it or file a gate instead of closing silently; otherwise close. Work ONLY this one task — do not start any other. A gate-cleared ping about another row YOU own with finished work is not a scope conflict: push and deliver that row, then return here. Nothing in this goal is a question for a human — you have no keyboard in front of one, so never open a chooser; decide, and write the alternatives you did not take on the task body. Stop after 6 turns."
 
   # DIVE-2063: a task carrying a maker→verifier loop can NEVER reach any of the
   # three terminal states above by the MAKER's own hand. A correct 'task done'
@@ -3279,7 +3667,7 @@ _hb_wake() {
     nudge="${nudge} Separately: ${_gq} gate(s) are ROUTED TO YOU and waiting — they were filed WITHOUT interrupting you (DIVE-3474). Read them with '5dive task queue' and answer each with '5dive task answer <ident> --value=\"<choice>\"' before you finish this turn; the filer's recommendation is shown but is NOT the answer (measured: 54 of 121 answered gates returned it, so the majority did not)."
   fi
 
-  _hb_send_line "$name" "$nudge" || { _hb_log "[$name] nudge send failed"; return 1; }
+  _hb_send_line "$name" "$nudge" || { _hb_wake_fail "$name" "nudge injection (/goal ${task_ident})" 1 "${_HB_SEND_FAIL_REASON:-<injector reported no reason>}"; return 1; }
   return 0
 }
 
@@ -4646,12 +5034,27 @@ _hb_stall_sweep() {
     IFS=$'\x1f' read -r gid gident gfier ganswered <<<"$grow"
     [[ -n "$gid" && -n "$gfier" ]] || continue
     gmins=$(( ($(date -u +%s) - $(date -u -d "$ganswered" +%s 2>/dev/null || date -u +%s)) / 60 ))
-    ( cmd_send "$gfier" --from="task-engine" \
-        --message="✅ ${gident}: the human gate that was blocking it was ANSWERED ${gmins}m ago, so grading is genuinely yours again — nothing is waiting on a person. Pick it back up: \`5dive task start ${gident}\` then \`task done\`/\`task reject\` (DIVE-2207)." ) >/dev/null 2>&1 || true
-    ( cmd_send "ops" --from="task-engine" \
-        --message="✅ Answered-gate delivery: ${gident} is back on verifier '${gfier}' — its gate was answered ${gmins}m ago and the row had left gap#2's view, so it is surfaced here rather than sitting invisible (DIVE-2207)." ) >/dev/null 2>&1 || true
+    # DIVE-4296 iteration 2 (DO 5) — THE TWO SENDS THAT USED TO LIVE HERE ARE GONE.
+    # DIVE-2207 wrote them when an answered gate left the row invisible to the
+    # queue: nothing would dispatch it, so an a2a ping WAS the delivery. DIVE-4253
+    # (v0.31.0) made a gate-answered row dispatchable again, and that turned both
+    # sends into duplicates of the tick's own pick. lodar, 2026-09-11 09:18Z: "are
+    # these messages important? i thought we use only tasks queue for that?"
+    #
+    # A DUPLICATE HERE IS NOT FREE, which is why this is a deletion and not a
+    # throttle. The ping lands in the grader's live pane as a prompt, or spools
+    # behind the drain and arrives late: measured 2026-09-11, this arm's message
+    # for DIVE-4276 was typed 101 minutes after the answer, to a seat that no
+    # longer graded that row. Each such arrival costs the recipient a full
+    # re-investigation of a row they had closed out (the a2a rule the house runs
+    # on: the round is the cost, not the message).
+    #
+    # THE OBSERVATION IS KEPT, only the sends go. The stamp still latches so the
+    # sweep does not re-examine the row every tick, and the log line still records
+    # that this arm saw it — what changes is that the DELIVERY is now the tick's
+    # dispatch, which is the one mechanism that knows who owns the row NOW.
     db "UPDATE tasks SET gate_answered_nudged_at=datetime('now') WHERE id=${gid};"
-    _hb_log "[stall-sweep] ${gident} gate answered ${gmins}m ago, back on ${gfier} -> surfaced"
+    _hb_log "[stall-sweep] ${gident} gate answered ${gmins}m ago, back on ${gfier} -> left to the queue (no a2a; DIVE-4296)"
   done < <(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id)||x'1f'||verifier||x'1f'||need_answered_at
                FROM tasks
                WHERE verifier IS NOT NULL AND maker_agent IS NOT NULL
@@ -5379,6 +5782,11 @@ _hb_memory_consolidate_sweep() {
   # the third bucket that quiet failure now has to land in, and IDLE separates
   # "ran, nothing to distil" from "ran and produced".
   _HB_CONS_ATOMS=0; _HB_CONS_DFAIL=0; _HB_CONS_IDLE=0
+  # DIVE-4284: the regrowth control's fleet numbers. ROUTED = indexes this pass
+  # brought back under the loader limit; OVER = indexes still over it afterwards,
+  # i.e. still being loaded with their TAIL dropped. OVER is the one that matters:
+  # it is the 24-hours-later number DIVE-4222's saving evaporated against.
+  _HB_CONS_ROUTED=0; _HB_CONS_OVER=0
   [[ "${MEMORY_CONSOLIDATE:-on}" == "off" ]] && return 0
   local every="${MEMORY_CONSOLIDATE_EVERY_MIN:-${_HB_CONSOLIDATE_EVERY_MIN}}"
   [[ "$every" =~ ^[0-9]+$ ]] && (( every > 0 )) || every="$_HB_CONSOLIDATE_EVERY_MIN"
@@ -5442,6 +5850,16 @@ _hb_memory_consolidate_sweep() {
     fi
     [[ "$n_dfail" =~ ^[0-9]+$ ]] || n_dfail=0
     [[ "$n_proc"  =~ ^[0-9]+$ ]] || n_proc=0
+    # DIVE-4284 index regrowth, read from the same envelope. Booleans, so the
+    # `pick` helper's `select(. != null)` is what keeps a `false` from reading as
+    # absent — and an ABSENT field (a seat still on a pre-4284 binary) counts as
+    # neither bucket, because "no answer" is not "index fine" and must not be a
+    # fleet alarm either.
+    local n_routed n_over
+    n_routed=$(jq -s -r "$jf pick(\"index_rerouted\")"         <<<"$out" 2>/dev/null) || n_routed=""
+    n_over=$(jq -s -r "$jf pick(\"index_still_over_limit\")"    <<<"$out" 2>/dev/null) || n_over=""
+    [[ "$n_routed" == "true" ]] && _HB_CONS_ROUTED=$((_HB_CONS_ROUTED + 1)) || :
+    [[ "$n_over"   == "true" ]] && _HB_CONS_OVER=$((_HB_CONS_OVER + 1)) || :
     _HB_CONS_ATOMS=$((_HB_CONS_ATOMS + n_atoms))
     if (( n_dfail > 0 )); then
       _HB_CONS_DFAIL=$((_HB_CONS_DFAIL + 1))
@@ -5537,8 +5955,10 @@ cmd_heartbeat_tick() {
   _hb_memory_consolidate_sweep "$now" || _hb_log "[memory-consolidate] pass errored (non-fatal)"
   # DIVE-3711: the atom count leads, because it is the only number here that can
   # be zero when the pipeline is dead. Every other field is an attempt count.
-  (( ${_HB_CONS_RAN:-0} || ${_HB_CONS_FAILED:-0} || ${_HB_CONS_DFAIL:-0} || ${_HB_CONS_IDLE:-0} )) \
-    && _hb_log "[memory-consolidate] ${_HB_CONS_ATOMS:-0} atom(s) from ${_HB_CONS_RAN:-0} seat(s), ${_HB_CONS_DFAIL:-0} distiller-failed, ${_HB_CONS_FAILED:-0} could not run, ${_HB_CONS_IDLE:-0} nothing to distil, ${_HB_CONS_SKIPPED:-0} not due" || true
+  # DIVE-4284: ROUTED/OVER join the guard so an index event alone still logs —
+  # a seat with nothing to distil can still be the seat whose index is truncated.
+  (( ${_HB_CONS_RAN:-0} || ${_HB_CONS_FAILED:-0} || ${_HB_CONS_DFAIL:-0} || ${_HB_CONS_IDLE:-0} || ${_HB_CONS_ROUTED:-0} || ${_HB_CONS_OVER:-0} )) \
+    && _hb_log "[memory-consolidate] ${_HB_CONS_ATOMS:-0} atom(s) from ${_HB_CONS_RAN:-0} seat(s), ${_HB_CONS_DFAIL:-0} distiller-failed, ${_HB_CONS_FAILED:-0} could not run, ${_HB_CONS_IDLE:-0} nothing to distil, ${_HB_CONS_SKIPPED:-0} not due; index: ${_HB_CONS_ROUTED:-0} re-routed under limit, ${_HB_CONS_OVER:-0} STILL OVER" || true
   # DIVE-3343: there is NO per-TASK budget sweep here any more, and its absence
   # is deliberate — see the block above _hb_loop_ceiling_sweep's neighbours in
   # this file for why the figure it enforced could not be attributed to a row.
@@ -5630,7 +6050,11 @@ cmd_heartbeat_tick() {
                               AND COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''),
                                            COALESCE(assignee,'?')) <> $(sqlq "$name") );" 2>/dev/null || echo 0)
     if [[ "${inprog:-0}" != "0" ]]; then
-      sk_busy=$((sk_busy + 1)); _hb_log "[$name] busy — $inprog in_progress, skip"; continue
+      sk_busy=$((sk_busy + 1)); _hb_log "[$name] busy — $inprog in_progress, skip"
+      # DIVE-4278: this tick just PROVED the seat is working. Say so on the
+      # record, or `agent list` reports it as the most stalled seat on the box.
+      with_registry_lock _hb_mark_seen "$name" "$now" "busy ${inprog} in_progress" >/dev/null 2>&1 || true
+      continue
     fi
 
     # --- DIVE-3465 hard-cap dispatch hold --------------------------------------
@@ -5806,7 +6230,15 @@ cmd_heartbeat_tick() {
     if (( _picked == 0 )); then
       task_id=""; task_ident=""
       if (( _cand_n == 0 )); then
-        sk_nowork=$((sk_nowork + 1)); _hb_log "[$name] no todo — stay idle"; continue
+        sk_nowork=$((sk_nowork + 1)); _hb_log "[$name] no todo — stay idle"
+        # DIVE-4278: a decision, and a WEAKER one than the two above — it says
+        # the tick had nothing to dispatch, NOT that anyone saw this seat work.
+        # Recorded (and labelled `idle` so the row and the legend say so) because
+        # ageing a seat the heartbeat deliberately left alone is what produced
+        # "4 of 4 OVERDUE, 0 stalled". Proof of life for an idle seat is
+        # `5dive liveness`, and the legend points there.
+        with_registry_lock _hb_mark_seen "$name" "$now" "idle (no work)" >/dev/null 2>&1 || true
+        continue
       fi
       # Every candidate we looked at was held. Not silent, and it names the cap:
       # if _cand_n hit _HB_PICK_SCAN there may be runnable rows we never reached,
@@ -6052,16 +6484,22 @@ cmd_heartbeat_tick() {
         with_registry_lock _hb_mark_escalation_fp "$name" "$defer_fp" >/dev/null 2>&1 || true
         # deliberately no `continue` — fall through to the wake below.
       else
-        sk_active=$((sk_active + 1)); _hb_log "[$name] active (mid-turn/conversation) — defer nudge this tick (active-defer #${defer_n})"; continue
+        sk_active=$((sk_active + 1)); _hb_log "[$name] active (mid-turn/conversation) — defer nudge this tick (active-defer #${defer_n})"
+        # DIVE-4278: mid-turn is the loudest proof of life the tick ever has.
+        with_registry_lock _hb_mark_seen "$name" "$now" "mid-turn" >/dev/null 2>&1 || true
+        continue
       fi
     fi
 
     # Per-task fresh override (DIVE-138): a materialized recurring instance can
     # carry fresh=1 to force a clean /clear before its turn, regardless of the
     # agent-level heartbeat fresh setting. NULL/0 falls back to the agent default.
-    local eff_fresh="$fresh" task_fresh
-    task_fresh=$(db "SELECT COALESCE(fresh,'') FROM tasks WHERE id=${task_id};" 2>/dev/null || echo "")
-    [[ "$task_fresh" == "1" ]] && eff_fresh="true"
+    # DIVE-4296: resolved by the shared helper, which is also what `wake-task`
+    # calls — one definition, so a forced wake and a tick wake cannot disagree
+    # about whether this seat gets its /clear. The agent-level value is passed in
+    # from the $reg snapshot this loop already holds.
+    local eff_fresh
+    eff_fresh="$(_hb_effective_fresh "$name" "$task_id" "$fresh")"
 
     # DIVE-1858 Stage 1: wake-budget guardrail. A cold-mode agent that has spent
     # today's wake cap is skipped this tick so a chatty trigger can't thrash it
@@ -6127,7 +6565,10 @@ cmd_heartbeat_tick() {
       # is the lever. Separate threshold, separate ladder — see _hb_nudge_enforce.
       _hb_nudge_enforce "$name" "$task_id" "$task_ident" "${nudge_n:-0}" || true
     else
-      sk_fail=$((sk_fail + 1)); _hb_log "[$name] wake failed — will retry next tick"
+      # DIVE-4310: the verdict carries the CAUSE. Every failing exit of _hb_wake
+      # sets _HB_WAKE_FAIL_REASON; the fallback fires only if some future exit
+      # forgets to, and says so rather than printing the old bare line.
+      sk_fail=$((sk_fail + 1)); _hb_log "[$name] wake failed at ${_HB_WAKE_FAIL_REASON:-<step not recorded — a wake exit is missing its _hb_wake_fail>} — will retry next tick"
     fi
   done < <(jq -r '.agents | to_entries
                   | map(select(.value.heartbeat.enabled == true))

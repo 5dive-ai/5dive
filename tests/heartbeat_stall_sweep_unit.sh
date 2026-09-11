@@ -177,27 +177,50 @@ db "UPDATE tasks SET handoff_delivered_at=datetime('now','-999 minutes'),
      WHERE id=${ag};"
 : >"$SEND_LOG"
 _hb_stall_sweep >/dev/null 2>&1
-grep -q $'^olivia\t.*gate that was blocking it was ANSWERED' "$SEND_LOG" \
-  && ok_t "A5 answered-gate delivery nudges the verifier (ack stamped, old throttle burned)" \
-  || bad_t "A5 answered-gate delivery not surfaced" "$(cat "$SEND_LOG")"
-grep -q $'^ops\t.*Answered-gate delivery' "$SEND_LOG" \
-  && ok_t "A5 it also reaches ops (never invisible)" || bad_t "A5 ops not pinged" "$(cat "$SEND_LOG")"
+# DIVE-4296 iteration 2 (DO 5) REPOINTED THIS WHOLE BLOCK, and the reason matters
+# more than the edit. The arm's observable used to be the a2a SEND; the send is
+# now deleted, because DIVE-4253 made a gate-answered row dispatchable through
+# the queue and the ping became a duplicate that arrived late (101 minutes late,
+# for DIVE-4276, at a seat that no longer graded it). What survives is the arm's
+# real proposition: this sweep SELECTS exactly these rows and stamps them.
+#
+# THE NEGATIVE ARMS BELOW HAD TO MOVE WITH IT OR THEY GRADE NOTHING. A8 (open
+# gate), A9 (too fresh) and A10 (parked) all asserted "no ANSWERED text in the
+# send log"; with no send in any case they pass whatever the predicate does. A10
+# carries its own control and that control is what caught it. They now grade the
+# STAMP, which is the effect the predicate still has.
+stamped() { [[ "$(db "SELECT COALESCE(gate_answered_nudged_at,'NULL') FROM tasks WHERE id=${1};")" != "NULL" ]]; }
+db "UPDATE tasks SET gate_answered_nudged_at=NULL WHERE id=${ag};"
+: >"$SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+stamped "$ag" \
+  && ok_t "A5 the answered-gate row is SELECTED by the arm (ack stamped, old throttle burned)" \
+  || bad_t "A5 answered-gate row not picked up" "$(db "SELECT gate_answered_nudged_at FROM tasks WHERE id=${ag};")"
+grep -q 'ANSWERED\|Answered-gate' "$SEND_LOG" \
+  && bad_t "A5 (DIVE-4296) the arm still sends a2a — the queue is the delivery now" "$(cat "$SEND_LOG")" \
+  || ok_t "A5 (DIVE-4296) it sends NO a2a — neither the verifier nor ops is pinged"
 
-# --- A6: the MESSAGE must not be gap#2's. "still unacknowledged" is false here —
-#     the verifier did act, and DIVE-2196 is the row that proves a false nudge costs
-#     more than a missing one.
+# --- A6: no message means gap#2's false text cannot be reused. The original arm
+#     guarded the WORDING of a nudge ("still unacknowledged" is false here — the
+#     verifier did act, and DIVE-2196 proves a false nudge costs more than a
+#     missing one). With the send deleted the guarantee is strictly stronger and
+#     is what this arm now states.
 grep -q 'still unacknowledged' "$SEND_LOG" \
   && bad_t "A6 post-answer nudge reused gap#2's false 'still unacknowledged' text" "$(cat "$SEND_LOG")" \
-  || ok_t "A6 the post-answer nudge does NOT claim the verifier never acknowledged"
+  || ok_t "A6 no post-answer nudge exists to carry gap#2's false text (DIVE-4296)"
 
 # --- A7: throttle is the NEW column, and it is stamped
 [[ "$(db "SELECT COALESCE(gate_answered_nudged_at,'NULL') FROM tasks WHERE id=${ag};")" != "NULL" ]] \
   && ok_t "A7 gate_answered_nudged_at stamped" || bad_t "A7 new throttle not stamped" ""
+_a7_first="$(db "SELECT gate_answered_nudged_at FROM tasks WHERE id=${ag};")"
 : >"$SEND_LOG"
 _hb_stall_sweep >/dev/null 2>&1
-grep -q 'ANSWERED' "$SEND_LOG" \
-  && bad_t "A7 answered-gate row re-nudged despite its throttle" "$(cat "$SEND_LOG")" \
-  || ok_t "A7 throttled — a second sweep does not re-nudge"
+# The throttle is what stops the arm re-examining the row every tick. Graded on
+# the stamp rather than on a send (DIVE-4296): an unchanged stamp means the
+# second sweep did not select the row again.
+[[ "$(db "SELECT gate_answered_nudged_at FROM tasks WHERE id=${ag};")" == "$_a7_first" ]] \
+  && ok_t "A7 throttled — a second sweep does not re-select the row" \
+  || bad_t "A7 answered-gate row re-selected despite its throttle" "was=${_a7_first} now=$(db "SELECT gate_answered_nudged_at FROM tasks WHERE id=${ag};")"
 
 # --- A8: THE SAFETY ARM. While the gate is still OPEN this rail must be silent.
 #     Nudging here prescribes closing a row whose human question is undecided —
@@ -212,16 +235,16 @@ db "UPDATE tasks SET handoff_delivered_at=datetime('now','-999 minutes'),
        need_answered_at=NULL WHERE id=${ah};"
 : >"$SEND_LOG"
 _hb_stall_sweep >/dev/null 2>&1
-grep -q 'ANSWERED' "$SEND_LOG" \
-  && bad_t "A8 nudged a row whose gate is STILL OPEN (DIVE-2196 defect)" "$(cat "$SEND_LOG")" \
-  || ok_t "A8 an OPEN gate is never nudged — the rail is post-answer only"
+stamped "$ah" \
+  && bad_t "A8 selected a row whose gate is STILL OPEN (DIVE-2196 defect)" "stamped" \
+  || ok_t "A8 an OPEN gate is never selected — the rail is post-answer only"
 
 # --- A9: answered, but not yet past the window -> not yet
 db "UPDATE tasks SET need_answered_at=datetime('now') WHERE id=${ah};"
 : >"$SEND_LOG"
 _hb_stall_sweep >/dev/null 2>&1
-grep -q 'ANSWERED' "$SEND_LOG" \
-  && bad_t "A9 nudged a gate answered seconds ago" "$(cat "$SEND_LOG")" \
+stamped "$ah" \
+  && bad_t "A9 selected a gate answered seconds ago" "stamped" \
   || ok_t "A9 a freshly-answered gate waits out _HB_VERIFY_STALE_MIN first"
 
 # --- A10: parked rows are left alone. One clause beyond the DIVE-2207 spec,
@@ -230,15 +253,15 @@ db "UPDATE tasks SET need_answered_at=datetime('now','-${_HB_VERIFY_STALE_MIN} m
        parked_at=datetime('now') WHERE id=${ah};"
 : >"$SEND_LOG"
 _hb_stall_sweep >/dev/null 2>&1
-grep -q 'ANSWERED' "$SEND_LOG" \
-  && bad_t "A10 nudged a PARKED row" "$(cat "$SEND_LOG")" \
-  || ok_t "A10 a parked row is not nudged"
+stamped "$ah" \
+  && bad_t "A10 selected a PARKED row" "stamped" \
+  || ok_t "A10 a parked row is not selected"
 db "UPDATE tasks SET parked_at=NULL WHERE id=${ah};"
 : >"$SEND_LOG"
 _hb_stall_sweep >/dev/null 2>&1
-grep -q 'ANSWERED' "$SEND_LOG" \
+stamped "$ah" \
   && ok_t "A10 CONTROL un-parking the same row makes it fire (A10 was not vacuous)" \
-  || bad_t "A10 control failed — the row never fires, so A10 proved nothing" "$(cat "$SEND_LOG")"
+  || bad_t "A10 control failed — the row never fires, so A10 proved nothing" "not stamped"
 
 # =============================================================================
 # (b) gap#3 core — fleet-idle-while-actionable-work-is-open, persisting

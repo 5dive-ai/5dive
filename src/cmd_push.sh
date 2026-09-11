@@ -30,6 +30,15 @@
 #     grant stays an EXACT command path (`/usr/local/bin/5dive _push_do`) with no
 #     trailing-`*` arg match — it therefore holds identically under classic sudo
 #     and under sudo-rs, where argument wildcards are ignored.
+#
+# DIVE-4288 (the audited override reaches the rail): the same stdin channel also
+# carries FIVE_PUSH_OVERRIDE as an optional FIFTH field — the whole remainder of
+# the stream, because a signed reason is five clauses and is multi-line by
+# construction. Plain `sudo -n` strips the variable, so the pre-push rail's
+# advertised escape was unreachable from every delegated seat: the seat exported
+# it, root never saw it, and the rail printed neither of its two outcomes.
+# Deliberately NOT a sudoers `env_keep`, which would widen the grant for every
+# command on the box to fix one call. Graded root-side (_push_override_grade).
 
 readonly _PUSH_APP_ENV_DEFAULT="/etc/5dive/connectors/github-app.env"
 readonly _PUSH_DEFAULT_REPO="https://github.com/5dive-ai/5dive.git"
@@ -476,6 +485,90 @@ _push_validate_inputs() {
   printf '%s' "$rp"
 }
 
+# ── DIVE-4288: the audited override, across the sudo boundary ────────────────
+#
+# THE DEFECT. `scripts/pre-push-rail.sh` refuses a red push and advertises an
+# audited escape: `FIVE_PUSH_OVERRIDE="$(cat reason.txt)" git push`. That escape
+# reads the variable out of the environment of the process running the rail, and
+# on a DELEGATED push that process is root's, not the agent's — `cmd_push` hands
+# the push over a plain `sudo -n`, which strips every non-whitelisted variable.
+# Measured 2026-09-11 (dev3, DIVE-4282): a five-clause reason exported in front
+# of `5dive push` produced NEITHER of `override_taken()`'s two printed outcomes
+# — no OVERRIDDEN block and no numbered-clause refusal — because the reason never
+# arrived. Both of the rail's printed escapes (`--no-verify` and the override)
+# assume the reader runs `git push` themselves; a delegated seat holds no git
+# credential, which is the entire point of this rail. The refusal instructed the
+# reader to do something their seat cannot do.
+#
+# THE FIX, and why it is stdin and not an env_keep. `env_keep += FIVE_PUSH_OVERRIDE`
+# in sudoers would carry the variable, and would widen the grant for every command
+# on the box, permanently, to fix one call. The parameters already travel on stdin
+# precisely so the NOPASSWD grant stays an exact command path (DIVE-1460); the
+# reason belongs on that same channel. `_push_do` then re-exports it for the git
+# push it runs, so the rail sees it exactly as it would in a hand-typed push.
+#
+# THE GRADING MOVES ROOT-SIDE. The rail's five-clause check still exists and still
+# runs, but it now runs SECOND: `_push_do` grades the reason before it spends a
+# token, in a process the agent cannot edit. An agent-side grader would be a
+# grader the graded party owns. The two predicates are held identical by
+# tests/push_override_delegated_unit.sh, which runs both over one fixture corpus.
+#
+# _push_override_missing_clauses <reason> — prints the numbers of the clauses the
+# reason does not answer, space-separated; empty means all five are present. The
+# predicate is EXACTLY the rail's (scripts/pre-push-rail.sh, override_taken): a
+# clause is present when its number appears followed by ')', '.' or ':' and is not
+# preceded by another digit. Kept as its own function so the parity harness can
+# grade it against the rail's rather than against a description of it.
+_push_override_missing_clauses() {
+  local reason="$1" n out=""
+  for n in 1 2 3 4 5; do
+    grep -qE "(^|[^0-9])${n}[).:]" <<<"$reason" || out+="${n} "
+  done
+  printf '%s' "${out% }"
+}
+
+# _push_override_grade <reason> — the authoritative, root-side gate on a signed
+# override. Empty reason: nothing to grade, returns 0 (the rail runs normally).
+# A reason missing any clause REFUSES THE PUSH and names the missing numbers —
+# the same contract `smoke-override` carries, and the same one the rail prints.
+# Refusing here rather than inside the rail is what stops an agent from faking
+# the audit line: the reason is graded and logged by a process it does not own.
+_push_override_grade() {
+  local reason="$1" missing
+  [[ -n "$reason" ]] || return 0
+  missing="$(_push_override_missing_clauses "$reason")"
+  [[ -z "$missing" ]] || fail "$E_VALIDATION" \
+    "delegated push OVERRIDE REFUSED — the signed reason is missing clause(s): ${missing}. An override contract that accepts 'wip' is a --no-verify with extra steps, so this one is graded root-side. Write five numbered clauses: 1) why the check did not run here; 2) what ran instead, with counts, on the tree you are pushing; 3) the residual the check uniquely covers, which you are signing; 4) why you sign it anyway; 5) what stays uncovered."
+  return 0
+}
+
+# _push_do_stdin_write <ident> <repo-path> <branch> <repo-url> [override-reason]
+# _push_do_stdin_read                     — the two ends of the `_push_do` wire.
+#
+# Four newline-terminated fields, then — optionally — the override reason as the
+# ENTIRE REMAINDER of the stream, because a signed reason is five clauses and is
+# therefore multi-line by construction; a fifth `read -r` would have silently
+# truncated it to its first clause and refused the push for missing 2-5.
+#
+# Both ends are functions rather than inline code so the round trip is gradeable
+# without root and without a network: the harness writes with one and reads with
+# the other, and a mutation that drops the reason from the writer reddens the arm.
+# A reader that runs against an OLDER writer (no fifth field) sees an empty
+# reason and behaves exactly as before, which is the no-override path.
+_push_do_stdin_write() {
+  printf '%s\n' "$1" "$2" "$3" "$4"
+  [[ -n "${5:-}" ]] && printf '%s\n' "$5"
+  return 0
+}
+_push_do_stdin_read() {
+  IFS= read -r _PUSH_DO_IDENT    || true
+  IFS= read -r _PUSH_DO_REPOPATH || true
+  IFS= read -r _PUSH_DO_BRANCH   || true
+  IFS= read -r _PUSH_DO_REPOURL  || true
+  _PUSH_DO_OVERRIDE="$(cat)"
+  return 0
+}
+
 # cmd_push <task-id> [--branch=<b>] [--repo=<url>] [--dry-run] [--yes]
 # Agent-context front door: resolve the task, pick the branch, run the same
 # guards as a friendly pre-flight (so --dry-run needs no privilege and errors are
@@ -704,8 +797,14 @@ cmd_push() {
   # a token SCOPED to just this repo, pushes the one branch, and discards the
   # token — all as root. The agent process never sees a credential. Parameters go
   # over STDIN (never argv) so the NOPASSWD grant is an exact command path.
+  #
+  # DIVE-4288: FIVE_PUSH_OVERRIDE rides the SAME stdin channel. Plain `sudo -n`
+  # strips it, so the rail's advertised audited escape was unreachable from every
+  # delegated seat — see the block above _push_override_missing_clauses. Forwarded
+  # verbatim and NOT graded here: the five-clause check runs root-side, where the
+  # signing agent cannot edit it.
   local rc=0
-  printf '%s\n' "$ident" "$repopath" "$branch" "$repo" \
+  _push_do_stdin_write "$ident" "$repopath" "$branch" "$repo" "${FIVE_PUSH_OVERRIDE:-}" \
     | sudo -n /usr/local/bin/5dive _push_do || rc=$?
   if [[ $rc -ne 0 ]]; then
     fail "$E_GENERIC" \
@@ -862,13 +961,19 @@ _push_record_ship_ledger() {
 cmd_push_do() {
   require_loaded push broker_gate_check broker_bind_target broker_task_target
   [[ "$(id -u)" -eq 0 ]] || fail "$E_PERMISSION" "_push_do is root-only"
-  local ident repopath branch repourl
-  IFS= read -r ident    || true
-  IFS= read -r repopath || true
-  IFS= read -r branch   || true
-  IFS= read -r repourl  || true
+  local ident repopath branch repourl override
+  _push_do_stdin_read
+  ident="$_PUSH_DO_IDENT"; repopath="$_PUSH_DO_REPOPATH"
+  branch="$_PUSH_DO_BRANCH"; repourl="$_PUSH_DO_REPOURL"
+  override="$_PUSH_DO_OVERRIDE"
   [[ -n "$ident" && -n "$repopath" && -n "$branch" && -n "$repourl" ]] \
     || fail "$E_USAGE" "_push_do expects <ident> <repo-path> <branch> <repo-url> on stdin (DIVE-1460)."
+
+  # DIVE-4288: grade the signed override BEFORE anything is spent — before the
+  # token mint, before the scans, before the rail. An override exists to not pay
+  # for the rail; one that refuses after the expensive half has run is a slower
+  # push, not an escape. Refuses and names the missing clause numbers.
+  _push_override_grade "$override"
 
   # Input hardening — treat branch/url/repo-path as hostile (see below). On
   # success it echoes the canonicalized repo-path (realpath'd); on any violation
@@ -1058,8 +1163,25 @@ cmd_push_do() {
   # (no leak via ps/audit). Discard the token immediately after.
   local authhdr rc=0
   authhdr="Authorization: Basic $(printf 'x-access-token:%s' "$tok" | base64 -w0)"
+  # DIVE-4288: the push runs the repo's own pre-push hooks, and the pre-push rail
+  # is one of them. THREE variables cross into that hook here and nowhere else:
+  #   FIVE_PUSH_OVERRIDE  the reason, already graded above — the rail re-grades it
+  #                       (harmless, it is the same predicate) and prints + logs
+  #                       the signed text, which is the audit artifact.
+  #   FIVE_PUSH_DELEGATED tells the rail its caller holds no git credential, so
+  #                       its refusal advertises `5dive push`, not `git push` and
+  #                       not `--no-verify`. Neither of those is a route this seat
+  #                       can take, and printing them is what sent DIVE-4282 to a
+  #                       dead end.
+  #   FIVE_PUSH_TASK      the row, so that advice is a command, not a template.
+  # Exported rather than passed through `env` in argument position: the reason is
+  # not a secret, but nothing on this rail puts agent-supplied multi-line text in
+  # a process table, and this is not the place to start.
+  export FIVE_PUSH_DELEGATED=1 FIVE_PUSH_TASK="$ident"
+  [[ -n "$override" ]] && export FIVE_PUSH_OVERRIDE="$override"
   "${G[@]}" -c http."https://github.com/".extraheader="$authhdr" \
       push "$repourl" "refs/heads/${branch}:refs/heads/${branch}" 2>&1 | sed 's/^/  /' || rc=$?
+  unset FIVE_PUSH_OVERRIDE FIVE_PUSH_DELEGATED FIVE_PUSH_TASK
   tok=""; authhdr=""   # discard
 
   [[ $rc -eq 0 ]] || fail "$E_GENERIC" "push failed (branch ${branch}); see output above."
@@ -1068,11 +1190,32 @@ cmd_push_do() {
   # DIVE-1923: ship ledger. After the push, never before — this records what
   # landed, so a failed push must leave no trace. Never fatal.
   _push_record_ship_ledger "$repopath" "$branch" "$ident" "$slug" 2>/dev/null || true
+  # DIVE-4288 (iteration 2, main2's finding): THIS FUNCTION TOUCHES NO PATH INSIDE
+  # THE AGENT'S CHECKOUT. Iteration 1 stat'd and chown'd
+  # <git-common-dir>/5dive-push-override.log from here to hand root's append back
+  # to the signing seat. Every one of those operations DEREFERENCES — `[[ -f ]]`
+  # follows a symlink, and `chown --reference` affects the referent (coreutils
+  # documents --dereference as the default) — so an agent who plants that path as
+  # a symlink gets root to append its own text to, and then hand it ownership of,
+  # any file root can write. A real delegated checkout is agent-dev:claude and
+  # /etc/5dive/connectors is root:claude 0750, traversable by any seat: the target
+  # was nameable. That is exactly the boundary this file's header defends.
+  #
+  # The guard is not the fix — the crossing is. The rail now writes root's receipt
+  # to the root-owned /var/log/5dive/push-override.log and PRINTS the path in the
+  # push output above, which is all "findable from the seat that signed it" ever
+  # asked for. So there is nothing to own back, nothing to stat, and no symlink
+  # guard needed to be correct.
+  # community/wiki/a-fix-that-makes-a-path-root-reachable-inherits-that-paths-safety.md
+  if [[ -n "$override" ]]; then
+    echo "[5dive] override signed for ${ident}; the rail printed the signed reason and the path of its root-owned log above. Nothing was written into your checkout as root." >&2
+  fi
   local author_note; [[ -n "$author" ]] && author_note="author enforced" || author_note="no author restriction"
   ok "pushed ${branch}@${sha} → ${slug} (delegated, repo-scoped token, ${author_note}, gate cleared)" \
      "$(jq -n --arg t "$ident" --arg b "$branch" --arg s "$sha" --arg r "$slug" \
            --argjson ae "$([[ -n "$author" ]] && echo true || echo false)" \
-           '{task:$t,branch:$b,sha:$s,repo:$r,pushed:true,scoped:true,authorEnforced:$ae}')"
+           --argjson ov "$([[ -n "$override" ]] && echo true || echo false)" \
+           '{task:$t,branch:$b,sha:$s,repo:$r,pushed:true,scoped:true,authorEnforced:$ae,railOverridden:$ov}')"
 }
 
 # cmd_push_setup — DIVE-1461: bring-your-own-GitHub-App onboarding for delegated

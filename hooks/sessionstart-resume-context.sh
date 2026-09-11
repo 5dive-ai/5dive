@@ -50,6 +50,39 @@ if [ -n "$latest" ] && [ -r "$latest" ]; then
 $head"
 fi
 
+# --- 3. an over-limit MEMORY.md is loaded TRUNCATED, silently (DIVE-4284) ----
+# The loader drops the TAIL of an always-loaded file past its limit and prints
+# nothing the agent can act on, so the oldest atoms in the index simply stop
+# existing — that is how a 367 KB index sat unnoticed on one seat for weeks
+# (DIVE-4222). This is the FAIL-LOUD half of the fix, and it belongs here
+# because SessionStart is the same moment the truncation happens: the warning
+# lands in the very context that lost the tail.
+#
+# The number is the loader's limit. Source of truth is `_memory_index_limit` in
+# src/cmd_memory.sh; asked of the CLI when it is on PATH, literal only as a
+# fallback so an old or absent binary still gets the warning.
+mem_limit=""
+if command -v 5dive >/dev/null 2>&1; then
+  mem_limit=$(5dive memory size --json 2>/dev/null | jq -r '.data.limit // empty' 2>/dev/null || true)
+fi
+case "$mem_limit" in ''|*[!0-9]*) mem_limit="${FIVEDIVE_MEMORY_INDEX_LIMIT:-24400}" ;; esac
+
+over=""
+for idx in "$HOME"/.claude/projects/*/memory/MEMORY.md; do
+  [ -f "$idx" ] || continue
+  b=$(stat -c %s "$idx" 2>/dev/null || echo 0)
+  [ "$b" -gt "$mem_limit" ] 2>/dev/null || continue
+  over="${over:+$over
+}  - $idx — $b B against a $mem_limit B load limit"
+done
+if [ -n "$over" ]; then
+  ctx="${ctx:+$ctx
+
+}MEMORY INDEX OVER THE LOAD LIMIT — it was loaded TRUNCATED, with no error. The TAIL was dropped, so the oldest facts in it are NOT in your context and a search that comes back empty is not evidence of absence:
+$over
+Fix it before you rely on memory: \`5dive memory router --write\` regenerates the index as a bounded router from the atoms already on disk. Hand-written lines between the router:keep markers are carried over, the old file is backed up, and nothing is deleted."
+fi
+
 [ -z "$ctx" ] && exit 0
 
 jq -n --arg c "$ctx" '{

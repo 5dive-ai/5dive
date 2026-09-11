@@ -30,7 +30,7 @@
 #                  that would drift is the registry's, not ours: a plugin
 #                  PUBLISHED there is graded on a fresh box the day it lands,
 #                  with no edit here and no CLI release.
-#   * templates <- the LIVE registry index, <org>/character-packs teams/index.json,
+#   * templates <- the LIVE registry index, <org>/5dive-marketplace teams/index.json,
 #                  fetched inside the container (DIVE-4196). Same move, one repo
 #                  over. It is FETCHED rather than mounted because the registry
 #                  is now the only declaration there is: mounting a checkout copy
@@ -226,7 +226,7 @@ fi
 # job already covers elsewhere.
 # DIVE-4196 — fetched, not mounted: the registry IS the source of truth now.
 # TEAM_REGISTRY_INDEX is overridable so a fork or a test can point it elsewhere.
-TEAM_REGISTRY_INDEX="${TEAM_REGISTRY_INDEX:-https://raw.githubusercontent.com/${FIVE_GH_ORG:-5dive-ai}/character-packs/main/teams/index.json}"
+TEAM_REGISTRY_INDEX="${TEAM_REGISTRY_INDEX:-https://raw.githubusercontent.com/${FIVE_GH_ORG:-5dive-ai}/5dive-marketplace/main/teams/index.json}"
 INDEX="$(mktemp)"
 if ! curl -fsSL --max-time 30 "$TEAM_REGISTRY_INDEX" -o "$INDEX" \
    || ! jq -e '.companies | type == "array" and length > 0' "$INDEX" >/dev/null 2>&1; then

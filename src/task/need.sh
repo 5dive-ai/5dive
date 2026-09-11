@@ -1194,9 +1194,9 @@ _gate_clear_lead_denied_reason() {
 
 # DIVE-1381: the CONTENT-CURATION gate class — the third downgrade kind, mirror
 # of the eng-ship class (DIVE-1359) for our early-stage content surfaces
-# (OpenAgent / character-packs / the daily persona drip). Surfaced by DIVE-1366:
+# (OpenAgent / the marketplace registry / the daily persona drip). Surfaced by DIVE-1366:
 # a persona/pack QUEUE-READINESS approval is not a human call — per ship-gating,
-# OpenAgent/character-packs is an early-stage surface, safe to push, no approval
+# OpenAgent/the marketplace registry is an early-stage surface, safe to push, no approval
 # gate to the paired human; it is the org lead's (Marcus) to clear. But the T2
 # floor matches 'publish' in the ask/title and forces the gate hard-human
 # (tier-2 = unclearable by the lead), the exact wall DIVE-1366 hit. This class
@@ -2517,7 +2517,7 @@ cmd_task_need() {
   fi
 
   # DIVE-1381: content-curation carve-out. Mirror of the eng-ship class (DIVE-1359)
-  # for our early-stage content surfaces (OpenAgent / character-packs / the persona
+  # for our early-stage content surfaces (OpenAgent / the marketplace registry / the persona
   # drip). A persona/pack QUEUE-READINESS approval is lead-clearable, not a human
   # call — but the T2 floor matches 'publish' in the ask/title and forces it
   # hard-human (tier-2, unclearable by the lead), the exact wall DIVE-1366 hit.
