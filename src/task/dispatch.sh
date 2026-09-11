@@ -120,7 +120,7 @@ _task_usage() {
   queue [--for=<agent>] [--json]                gates ROUTED TO YOU, filed without waking you
   inbox [--send [--channel-proof=<chat>]]       every unanswered human gate IN THE FLEET (already
                                                 fleet-wide; --fleet accepted as a no-op); --send DMs the owner
-  gates                                         alias of `inbox` (DIVE-4310)
+  gates                                         alias of \`inbox\` (DIVE-4310)
   coordinator [--json]                          the agent fronting the needs-you banner
 
   loops [--stuck] [--escalate-stuck] [--all] [--runs] [--watch[=secs]] [--kill <loopId>]

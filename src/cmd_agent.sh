@@ -152,9 +152,10 @@ _AGENT_LIST_HB_DEFS='
   # Measured on the control plane 2026-09-11 11:44Z: quinn and main2 both read
   # OVERDUE while mid-grade at a 1-minute cadence, because 2x = 120 SECONDS and
   # any single turn longer than two minutes outruns it. The window is therefore
-  # the LONGER of 2x the cadence and 15 minutes — a floor, never a cap, so the
-  # slow cadences that this arm was written for (5m -> 10m, 30m -> 60m) are
-  # judged exactly as before and only the sub-8-minute cadences move.
+  # the LONGER of 2x the cadence and 15 minutes — a floor, never a cap, so only
+  # the sub-8-minute cadences move: 1m and 5m both land on the 900s floor, so a
+  # 5m cadence DOES move (its own 2x is 600s), while 8m is 960s and every slower
+  # cadence (30m -> 3600s) is judged exactly as before.
   def hb_window: (hb_every * 120) | if . < 900 then 900 else . end;
   def hb_seen_fresh: hb_on and (hb_seen > 0) and (hb_seen_age <= hb_window);
   def hb_stale: hb_on and ((hb_last <= 0) or (hb_age > hb_window));
