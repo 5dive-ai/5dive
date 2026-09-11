@@ -20,8 +20,19 @@ _task_usage() {
       [--assignee=<agent|role:<r>|charter:<kw>>]
       [--recurring="<5-field cron>"] [--accept=<criteria>|--accept-file=<path>] [--verify=<cmd>]
       [--verifier=<agent>] [--max-iters=<n>] [--no-verify] [--verify] [--task-budget=<tokens|\$cost>]
+      [--review=none|check|temp|<seat>]   WHO GRADES THIS ROW — pick it when you file it:
+        none          nobody. 'task done' closes it outright.       cost: no session
+        check         a command grades it (needs --verify=<cmd>).   cost: no session
+        temp          one fresh pool session per delivery, gone after.
+        <seat>        a pinned standing reviewer grades it in its own session.
+        Default when you pass nothing: none for a low-priority row, a bodyless chore
+        title, a body tagged mechanical/copy/doc or a body that is one read-back
+        command; check when --verify=<cmd> is given; the filing seat when --customer
+        is set; temp otherwise. The mode is printed back with its cost on the
+        'created DIVE-N' line and shown by 'task ls' / 'task show'.
       --no-verify / --verify   skip / demand a grader session for THIS row, whatever the
                                box default is ('5dive config verify=always|delivered-only|never')
+                               ('5dive config verify=never' still caps every mode to none)
       [--customer] [--already-blocked=<what it blocked>]   escapes for the internal-filing cap
   ls [--status=] [--assignee=] [--mine] [--all] [--recurring]   open rows, priority-ordered
   ls --gated[=human|agent]                      only rows holding a live gate. The 'gate' column is

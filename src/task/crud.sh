@@ -15,6 +15,9 @@ cmd_task_add() {
   local on_overlap="" overlap_bound=""   # DIVE-2272: per-template overlap policy
   local accept="" verify_cmd="" max_iters="" verifier="" task_budget="" no_verify="" branch=""
   local force_verify=""   # DIVE-4251: bare --verify, the row's demand for a grade
+  # DIVE-4324: the one filing-time review field, and whether a SEAT was pinned
+  # by hand (`--verifier=`) rather than derived by the DIVE-969 default.
+  local review_flag="" verifier_pinned=0
   local customer_facing="" already_blocked="" materialized=""
   # DIVE-2627: which flag supplied each prose value (see _read_prose_file).
   local body_src="" accept_src=""
@@ -51,7 +54,12 @@ cmd_task_add() {
                        accept="$_PROSE_FILE_VALUE"; accept_src="--accept-file" ;;
       --verify=*)    verify_cmd="${1#*=}" ;;
       --max-iters=*) max_iters="${1#*=}" ;;
-      --verifier=*)  verifier="${1#*=}" ;;
+      --verifier=*)  verifier="${1#*=}"; verifier_pinned=1 ;;
+      # DIVE-4324: ONE question, asked at filing: who grades this row?
+      #   --review=none | check | temp | <seat>
+      # It is an ALIAS over the four flags that already reached those states,
+      # never a fifth mechanism — see the resolution block below the parser.
+      --review=*)    review_flag="${1#*=}" ;;
       # DIVE-969: explicit opt-out of the verifier-by-default posture. A plain
       # `task done` closes the resulting task directly (no maker→grader handoff).
       --no-verify)   no_verify="1" ;;
@@ -115,6 +123,47 @@ cmd_task_add() {
     if (( ${#title} > 200 )); then
       fail "$E_USAGE" "refusing: the title is ${#title} chars (limit 200) — a title that long is almost always body text swallowed past the '--' end-of-flags separator, where flags parse as positional title words instead. Put the prose in --body=/--body-file= BEFORE the '--' and keep the title to one line. Title as parsed: ${title:0:120}..."
     fi
+  fi
+  # ── DIVE-4324: --review= resolves INTO the existing flags, and stops ────────
+  #
+  # Deliberately an alias and not a parallel rail. Every one of these four states
+  # was already reachable and already has its own tested downstream behaviour
+  # (verify_optout, verify_command, the DIVE-969 default, a stored verifier); a
+  # second mechanism that meant the same things would be a second thing to keep
+  # true. What `--review=` adds is that the choice is made ONCE, by a filer who
+  # is told what it costs, instead of four flags nobody compares.
+  #
+  # EVERY CONTRADICTION IS A REFUSAL, never a silent precedence. A filer who
+  # wrote both `--review=none` and `--verify` has two intentions and we cannot
+  # know which survived; picking one for them is how a flag becomes a no-op that
+  # looks like a control.
+  if [[ -n "$review_flag" ]]; then
+    local _rm_kind; _rm_kind=$(review_mode_kind "$review_flag") || true
+    case "$_rm_kind" in
+      none)
+        [[ -n "$force_verify" ]] && fail "$E_VALIDATION" "--review=none and --verify contradict each other — one says no grader, the other demands one (DIVE-4324)"
+        [[ -n "$verifier" ]]     && fail "$E_VALIDATION" "--review=none and --verifier=$verifier contradict each other — pass one (DIVE-4324)"
+        [[ -n "$verify_cmd" ]]   && fail "$E_VALIDATION" "--review=none and --verify=<cmd> contradict each other — a row graded by a command is --review=check (DIVE-4324)"
+        no_verify="1" ;;
+      check)
+        [[ -n "$verify_cmd" ]] || fail "$E_USAGE" "--review=check needs the command that grades the row: pass --verify=\"<cmd>\" as well (DIVE-4324)"
+        [[ -n "$no_verify" ]]  && fail "$E_VALIDATION" "--review=check and --no-verify contradict each other — pass one (DIVE-4324)" ;;
+      temp)
+        [[ -n "$no_verify" ]] && fail "$E_VALIDATION" "--review=temp and --no-verify contradict each other — pass one (DIVE-4324)"
+        [[ -n "$verifier" ]]  && fail "$E_VALIDATION" "--review=temp and --verifier=$verifier contradict each other — 'temp' is the pool's fresh session, '$verifier' is a pinned seat (--review=$verifier) (DIVE-4324)"
+        # A DEMAND, exactly as a bare `--verify` is: it clears the DIVE-969/2681
+        # auto-skips and outranks a `never` box, which is what makes `temp` a
+        # choice rather than a wish.
+        force_verify="1" ;;
+      seat)
+        local _rm_seat="${review_flag#seat:}"
+        [[ -n "$no_verify" ]] && fail "$E_VALIDATION" "--review=$review_flag and --no-verify contradict each other — pass one (DIVE-4324)"
+        [[ -n "$verifier" && "$verifier" != "$_rm_seat" ]] \
+          && fail "$E_VALIDATION" "--review=$review_flag and --verifier=$verifier name two different reviewers — pass one (DIVE-4324)"
+        verifier="$_rm_seat"; verifier_pinned=1; force_verify="1" ;;
+      *)
+        fail "$E_VALIDATION" "bad --review value '$review_flag' — one of: none (no grader) | check (a command grades it, with --verify=<cmd>) | temp (one fresh pool session per delivery) | <seat> (a pinned standing reviewer) (DIVE-4324)" ;;
+    esac
   fi
   valid_task_priority "$priority" || fail "$E_VALIDATION" "bad priority '$priority' (low|medium|high|urgent)"
   # DIVE-476: --max-iters is the maker→verifier loop cap; must be a positive int.
@@ -538,6 +587,16 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
     local _grader; _grader=$(_task_default_verifier "$assignee" "$proj_lead")
     if [[ -n "$_grader" ]]; then
       verifier="$_grader"
+      # DIVE-4324: a CUSTOMER-FACING row defaults to a PINNED seat, not the pool's
+      # throwaway session. The ship rules already say a user-facing surface does
+      # not merge unseen — the PR carries a rendered screenshot and the verifier
+      # has LOOKED at it — and "has looked at it" is a standing seat's job: an
+      # ephemeral grader spawned for one delivery has no browser, no preview and
+      # no memory of what the page looked like yesterday. Same grader name either
+      # way; what changes is that the row RECORDS which of the two was bought, so
+      # a surface graded by a throwaway session is visible as such instead of
+      # being indistinguishable from one a seat reviewed.
+      [[ -n "$customer_facing" ]] && verifier_pinned=1
       accept="Deliverable meets the intent of: ${title}. Maker records in the done result WHAT was built and HOW it was checked; ${_grader} confirms against this before the task closes (refine these criteria as the work firms up)."
       verify_defaulted=1
     else
@@ -558,6 +617,15 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
   # BARE call, not `$( )` — the grade must survive into this shell. See the
   # contract note on task_actor_claim; a command substitution here silently
   # NULLs claimed_by for every divergent claim.
+  # DIVE-4324: the mode the row ACTUALLY got, derived from the fully-resolved
+  # state above (see _task_effective_review_mode for why it is read here and not
+  # written where the flag was parsed). `delivered-only` counts as granting:
+  # the grader is deferred to the delivery, not refused, and recording those two
+  # the same way is the collapse this column exists to prevent.
+  local review_mode _rv_grants=0
+  (( _vp_grants == 1 || _vp_deferred == 1 )) && _rv_grants=1
+  review_mode=$(_task_effective_review_mode "$no_verify" "$verify_cmd" "$verifier" \
+                                            "$_rv_grants" "$verify_skipped" "$verifier_pinned" "$_vp_deferred")
   task_actor_claim "$from"
   local creator="${from:-$ACTOR_BOARD}"
   # RECORD BOTH, with the columns the right way round. `created_by` keeps its
@@ -577,12 +645,12 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
   local id
   id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, derived_actor, parent_id, project_key, kind, schedule, fresh,
                               acceptance_criteria, verify_command, max_iterations, verifier, task_budget, verify_unavailable,
-                              verify_optout, verify_forced, on_overlap, overlap_bound)
+                              verify_optout, verify_forced, review_mode, on_overlap, overlap_bound)
            VALUES ($(sqlq "$title"), $(sqlq_or_null "$body"), $(sqlq "$priority"),
                    $(sqlq_or_null "$assignee"), $(sqlq "$creator"), $(sqlq_or_null "$derived_actor"), ${parent_sql}, $(sqlq "$project"),
                    $(sqlq "$kind"), ${schedule_sql}, ${fresh_sql},
                    $(sqlq_or_null "$accept"), $(sqlq_or_null "$verify_cmd"), ${max_iters:-NULL}, $(sqlq_or_null "$verifier"), $(sqlq_or_null "$task_budget"), $([[ $verify_unavailable == 1 ]] && echo 1 || echo NULL),
-                   $([[ -n "$no_verify" ]] && echo 1 || echo NULL), $([[ -n "$force_verify" ]] && echo 1 || echo NULL), ${on_overlap_sql}, ${overlap_bound_sql});
+                   $([[ -n "$no_verify" ]] && echo 1 || echo NULL), $([[ -n "$force_verify" ]] && echo 1 || echo NULL), $(sqlq_or_null "$review_mode"), ${on_overlap_sql}, ${overlap_bound_sql});
            SELECT last_insert_rowid();")
   # Ident is stamped by the AFTER INSERT trigger from the project's counter, so
   # read it back rather than assuming the DIVE- prefix (DIVE-484).
@@ -640,10 +708,31 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
     elif [[ -n "$no_verify" && "$_vp_policy" != "never" ]]; then
       verify_note+=" · grading skipped on this row (--no-verify), overriding the box default '$_vp_policy'"
     fi
-    ok "created ${ident} — $title${coord_note}${verify_note}" \
-       '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", autoCoordinated:($ac=="1"), verifyDefaulted:($vd=="1"), verifyUnavailable:($vu=="1"), verifySkipped:($vs!=""), verifySkipReason:$vs, verifier:$v, verifyPolicy:$vp, verifyOverride:$vo, verifyDeferred:($vdf=="1"), parentLinkWarning:($wi!=""), citedParent:$wi, citedSeries:(if $wi=="" then "" else ($wk+" #"+$wn) end), openTitleMatches:($wm|split(",")|map(select(length>0)))}' \
+    # DIVE-4324 deliverable 2: THE MODE IS PRINTED BACK, WITH ITS COST, ON THE
+    # LINE THE FILER IS ALREADY READING — and with WHY, when they passed nothing.
+    # A default nobody is shown is a default nobody revises, which is how every
+    # row on this board came to book a grader session: not because anyone chose
+    # one, but because nothing ever said one had been chosen for them.
+    local review_note=" · review: ${review_mode} ($(review_mode_cost_note "$review_mode"))"
+    if [[ -z "$review_flag" ]]; then
+      local _rv_why=""
+      if [[ -n "$no_verify" ]];        then _rv_why="--no-verify"
+      elif [[ -n "$verify_skipped" ]]; then _rv_why="$verify_skipped"
+      elif [[ -n "$verify_cmd" ]];     then _rv_why="--verify=<cmd> given"
+      elif (( _vp_deferred ));         then _rv_why="box verify=delivered-only — attached when a delivery is bound"
+      elif (( ! _rv_grants ));         then _rv_why="box verify=${_vp_policy}"
+      elif [[ -n "$customer_facing" ]] && (( verifier_pinned )); then _rv_why="customer-facing surface"
+      elif (( verify_defaulted ));     then _rv_why="default for a standard row"
+      elif [[ -n "$verifier" ]];       then _rv_why="reviewer named on the row"
+      else                                  _rv_why="no distinct grader available"
+      fi
+      review_note+=" — ${_rv_why}; choose deliberately with --review=none|check|temp|<seat>"
+    fi
+    ok "created ${ident} — $title${coord_note}${review_note}${verify_note}" \
+       '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", autoCoordinated:($ac=="1"), verifyDefaulted:($vd=="1"), verifyUnavailable:($vu=="1"), verifySkipped:($vs!=""), verifySkipReason:$vs, verifier:$v, verifyPolicy:$vp, verifyOverride:$vo, verifyDeferred:($vdf=="1"), reviewMode:$rm, reviewModeChosen:($rc=="1"), parentLinkWarning:($wi!=""), citedParent:$wi, citedSeries:(if $wi=="" then "" else ($wk+" #"+$wn) end), openTitleMatches:($wm|split(",")|map(select(length>0)))}' \
        --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg ac "$auto_coordinated" --arg vd "$verify_defaulted" --arg vu "$verify_unavailable" --arg vs "$verify_skipped" --arg v "${verifier:-}" \
        --arg vp "$_vp_policy" --arg vo "$_vp_override" --arg vdf "$_vp_deferred" \
+       --arg rm "$review_mode" --arg rc "$([[ -n "$review_flag" ]] && echo 1 || echo 0)" \
        --arg wi "$followup_warn_ident" --arg wk "$followup_warn_kind" --arg wn "$followup_warn_number" --arg wm "$followup_warn_matches"
   fi
 }
@@ -775,7 +864,7 @@ cmd_task_ls() {
     # regression test asserts against (tests/task_reject_trace_unit.sh, arm C).
     # NB: no inline SQL `--` comments in this string —
     # dbfmt flattens newlines, so a `--` would comment out the rest of the query.
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, merge_owner, merge_hold_reason, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, need_answered_relay, need_answered_tap_uid, tier, gate_mode, kind, schedule, last_fired_at, last_skipped_at, on_overlap, overlap_bound, parked_at, park_reason, wake_at, project_key, maker_agent, verifier,
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, merge_owner, merge_hold_reason, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, need_answered_relay, need_answered_tap_uid, tier, gate_mode, kind, schedule, last_fired_at, last_skipped_at, on_overlap, overlap_bound, parked_at, park_reason, wake_at, project_key, maker_agent, verifier, review_mode,
              CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
                   THEN CASE WHEN handoff_ack_at IS NOT NULL THEN 'reviewing' ELSE 'delivered' END
                   ELSE NULL END AS handoff_state,
@@ -835,7 +924,8 @@ cmd_task_ls() {
                   THEN 'graded->merge:'||COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''), COALESCE(assignee,'?'))
                   ELSE status END AS status,
              ${_gate_cell} AS gate,
-             priority, COALESCE(assignee,'-') AS assignee, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, title FROM tasks WHERE ${where} ${order};"
+             priority, COALESCE(assignee,'-') AS assignee, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref,
+             COALESCE(NULLIF(review_mode,''),'-') AS review, title FROM tasks WHERE ${where} ${order};"
     else
       # DIVE-3098: a graded-and-waiting row must not read as todo/blocked/in_progress
       # to the eye, and the render must name who owes the MERGE - the maker or ship
@@ -846,7 +936,8 @@ cmd_task_ls() {
                   THEN 'graded->merge:'||COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''), COALESCE(assignee,'?'))
                   ELSE status END AS status,
              ${_gate_cell} AS gate,
-             priority, COALESCE(assignee,'-') AS assignee, title FROM tasks WHERE ${where} ${order};"
+             priority, COALESCE(assignee,'-') AS assignee,
+             COALESCE(NULLIF(review_mode,''),'-') AS review, title FROM tasks WHERE ${where} ${order};"
     fi
     # DIVE-3366 acceptance 3: the skew belongs ON THE BOARD, under the queue,
     # because that is where the routing decision is actually made — a number in a
@@ -1021,6 +1112,16 @@ cmd_task_show() {
         _sh_eff="no grader yet — one is attached when a delivery is bound (task deliver --pr=…)"
       else _sh_eff="no grader; 'task done' closes it outright"; fi
       echo; echo "verify: ${_sh_pol} (${_sh_src}) — ${_sh_eff}"
+      # DIVE-4324 deliverable 3: the mode the row was FILED with, beside the
+      # policy that caps it. NULL is printed as `unrecorded`, never as `none`:
+      # every row filed before this column existed has one, and reading those as
+      # "the filer chose no reviewer" would invent a decision nobody made.
+      local _sh_rm; _sh_rm=$(db "SELECT COALESCE(review_mode,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+      if [[ -n "$_sh_rm" ]]; then
+        echo "review: ${_sh_rm} — $(review_mode_cost_note "$_sh_rm")"
+      else
+        echo "review: unrecorded (row predates the filing-time review mode, DIVE-4324)"
+      fi
     fi
     # DIVE-476: loop spec (only when any field is set) — the declarative verify
     # loop the (c) runner executes. Mirrors the conditional human-gate block.

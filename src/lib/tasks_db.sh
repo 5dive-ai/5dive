@@ -845,6 +845,26 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- "this one row was singled out for grading". NULL is "no force", true of every
   -- pre-existing row.
   verify_forced           INTEGER,
+  -- DIVE-4324: THE REVIEW MODE, CHOSEN AT FILING. lodar, 2026-09-11: "I think it
+  -- should be per task. easy tasks no reviewer at all. some with spawnable temp
+  -- reviewer some with agent reviewer."
+  --   none          no grader at all — `task done` closes it outright
+  --   check         a COMMAND grades it (verify_command); no grader session
+  --   temp          one fresh pool session grades one delivery, then is gone
+  --   seat:<agent>  a PINNED standing reviewer grades it in its own session
+  -- WHY A COLUMN AND NOT A DERIVATION. The four modes are already REACHABLE
+  -- today through four unrelated flags (--no-verify / --verify=<cmd> / the
+  -- DIVE-969 default / --verifier=<agent>), and that is exactly the problem this
+  -- records: the stored state of "the filer chose the pool lane" and "the filer
+  -- said nothing and the default picked the pool lane" is byte-identical, so
+  -- nobody could measure how many graded rows were ever CHOSEN. Same argument as
+  -- verify_optout/verify_forced directly above — a decision and a default that
+  -- produce the same state are the same state until one of them is written down.
+  -- NULL is "this build never recorded it", true of every pre-existing row, and
+  -- is NOT a synonym for `none`: readers must render it as unknown, not as
+  -- ungraded. Written once at `task add`; the run-time authority on whether a
+  -- grader actually spends a session stays verify_grants_grader(), never this.
+  review_mode             TEXT,
   -- DIVE-3251: THE FIRST TIME REAL WORK STARTED ON THIS ROW, and the one clock in
   -- this table that no nudge/reclaim path may touch. `started_at` is the CURRENT
   -- claim's clock and the heartbeat ladder deliberately clears it on reclaim, "so
@@ -1785,6 +1805,10 @@ _TASKS_ADDITIVE_COLUMNS=(
   'verify_optout INTEGER'
   # DIVE-4251: the add-time `--verify`. See the CREATE TABLE comment.
   'verify_forced INTEGER'
+  # DIVE-4324: the filing-time review mode (none|check|temp|seat:<agent>).
+  # Nullable — NULL is "never recorded", which is a real third state and not
+  # `none`. See the CREATE TABLE comment.
+  'review_mode TEXT'
   # DIVE-3251: the durable first-start clock, split out of `started_at` so the
   # reclaim ladder can keep restarting the age without destroying the evidence
   # that work happened. Nullable — NULL means "this build never recorded it",

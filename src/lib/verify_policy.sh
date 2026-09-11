@@ -132,3 +132,57 @@ _task_verify_row_source() {  # <task-id>
   [[ "$forced" == "1" ]] && ov="force"
   verify_policy_source "$ov"
 }
+
+# ── DIVE-4324: the review MODE, one field, chosen at filing ──────────────────
+#
+# lodar, 2026-09-11: "I think it should be per task. easy tasks no reviewer at
+# all. some with spawnable temp reviewer some with agent reviewer .. encoded
+# into 5dive and 5dive skill"
+#
+# All four modes were already reachable before this — through four unrelated
+# flags nobody picks between at filing time (`--no-verify`, `--verify=<cmd>`,
+# the DIVE-969 default, `--verifier=<agent>`). What was missing is a single
+# question asked ONCE, at the only moment the filer is thinking about the row:
+# who, if anyone, grades this?
+#
+#   none          nobody. `task done` closes it outright.
+#   check         a COMMAND grades it (`--verify=<cmd>`). No session is spent.
+#   temp          one fresh pool session grades one delivery, then is gone
+#                 (DIVE-4164's ephemeral grader — today's default).
+#   seat:<agent>  a pinned standing reviewer grades it in its own session.
+#
+# THE MODE IS NOT THE AUTHORITY ON SPEND. `verify_grants_grader` above is, and
+# the box policy still CAPS the mode: on a `verify=never` box every mode that
+# would cost a session resolves to `none`. A mode is what the filer asked for; a
+# policy is what the box will pay for, and conflating them is how `--tier=1` on
+# an approval became a no-op that looked like a control (see the rules file).
+_REVIEW_MODE_FIXED="none check temp"
+
+# `review_mode_kind <mode>` — none|check|temp|seat|invalid. `seat` is any other
+# non-empty token, validated as an agent name by the caller (which has the lane
+# helpers); this function is pure string classification so the harness can call
+# it without a task store.
+review_mode_kind() {  # <mode>
+  local m="${1:-}" f
+  [[ -n "$m" ]] || { printf 'invalid'; return 1; }
+  for f in $_REVIEW_MODE_FIXED; do [[ "$m" == "$f" ]] && { printf '%s' "$f"; return 0; }; done
+  [[ "$m" == seat:* ]] && m="${m#seat:}"
+  # An agent name. Deliberately narrow: a mode that accepted arbitrary text
+  # would store a typo'd seat as a pinned reviewer that never wakes.
+  [[ "$m" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { printf 'invalid'; return 1; }
+  printf 'seat'
+}
+
+# `review_mode_cost_note <mode>` — what this mode COSTS, in the words the filer
+# reads on the `task add` line. DIVE-4251 deliverable 3 established that the
+# cost is said where the choice is made; this keeps the four answers in one
+# place so the add line, `task show` and the help table cannot drift apart.
+review_mode_cost_note() {  # <mode>
+  case "$(review_mode_kind "${1:-}")" in
+    none)  printf 'no grader — "task done" closes it outright' ;;
+    check) printf 'graded by a command, no grader session' ;;
+    temp)  printf 'one grader session per delivery, then gone' ;;
+    seat)  printf 'graded by %s in its own session' "${1#seat:}" ;;
+    *)     printf 'unknown' ;;
+  esac
+}
