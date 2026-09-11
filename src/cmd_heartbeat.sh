@@ -1724,6 +1724,135 @@ _hb_tier_rank() {
   esac
 }
 
+# DIVE-4279: one tmux send-keys step, with its stderr KEPT. Measured 2026-09-11
+# 04:45:24Z on lodar's box 5dive-exact-swallow (5dive 0.31.0): the devops wake
+# logged only the two bare lines (nudge send failed, then the retry notice) and
+# NOTHING else, because all three send-keys calls here were bare `|| return 1` with
+# `2>/dev/null` — the one diagnostic that would name the cause was the thing
+# discarded. Each step now names ITSELF and quotes what tmux said, so an operator
+# (or the supervisor) reads a cause instead of guessing.
+# `2>&1 >/dev/null` (that order) keeps stderr and drops stdout.
+_HB_SENDKEYS_ERR=""
+_hb_send_keys_step() {
+  local name="$1" step="$2"; shift 2
+  local err rc=0
+  err=$(sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" "$@" 2>&1 >/dev/null) || rc=$?
+  if (( rc == 0 )); then _HB_SENDKEYS_ERR=""; return 0; fi
+  err="${err//$'\n'/ }"
+  _HB_SENDKEYS_ERR="$err"
+  _hb_log "[$name] ${step} failed (tmux rc ${rc}): ${err:-<tmux wrote nothing to stderr>}" 2>/dev/null || true
+  return 1
+}
+
+# DIVE-4279 part 2: a failed keystroke is not proof the payload was not received.
+# On the same box the seat STARTED the row 23s after the 'nudge send failed', so
+# the tick's `woke 0` may be a FALSE NEGATIVE, not just a missing reason. Before
+# typing we mark the seat's newest transcript (path + byte size); after a failed
+# step we re-read the bytes appended SINCE the mark and look for THIS payload.
+#
+# DIVE-4279 iteration 2 — the first cut turned that false negative into a false
+# POSITIVE, which is worse. It accepted ANY `"type":"user"` record in the window,
+# and Claude Code writes every TOOL RESULT as a user record (6 of 9 user records
+# in a live transcript were tool_results), so a seat that is merely WORKING mints
+# one every few seconds. The receipt must therefore be a property of THIS
+# PAYLOAD, not of the record type:
+#   * the record must carry a distinguishing run of the payload text verbatim;
+#   * tool_result-shaped records are excluded outright, so a tool result that
+#     happens to quote the payload back (a `task show`, a grep of the log) can
+#     never be mistaken for the seat receiving it;
+#   * if no such run can be derived, or nothing matches, the answer is "could not
+#     tell" and the WAKE FAILS — DIVE-2159: never report a state nobody measured.
+# Same file and grown only: a NEW newest file is a new session, which is not
+# evidence that this payload landed, so that reads as not-landed and says so.
+_HB_TRANSCRIPT_ROOT=""      # test seam; empty = the seat's real ~/.claude/projects
+_HB_LANDED_FILE=""; _HB_LANDED_SIZE=""; _HB_LANDED_EVIDENCE=""
+_hb_transcript_newest() {
+  local name="$1"
+  local root="${_HB_TRANSCRIPT_ROOT:-/home/agent-${name}/.claude/projects}"
+  sudo -n -u "agent-${name}" bash -c "ls -1t ${root}/*/*.jsonl 2>/dev/null | head -1" 2>/dev/null
+}
+# ONE fork on the healthy path: newest transcript + its byte size in a single
+# shell. This runs before every injected line, so it must stay cheap and must
+# never fail the send — an unreadable store just leaves the mark empty and the
+# landed check then reports "could not tell" instead of guessing.
+_hb_landed_mark() {
+  local name="$1" out
+  local root="${_HB_TRANSCRIPT_ROOT:-/home/agent-${name}/.claude/projects}"
+  _HB_LANDED_FILE=""; _HB_LANDED_SIZE=""; _HB_LANDED_EVIDENCE=""
+  out=$(sudo -n -u "agent-${name}" bash -c "f=\$(ls -1t ${root}/*/*.jsonl 2>/dev/null | head -1); [ -n \"\$f\" ] && stat -c '%s %n' \"\$f\"" 2>/dev/null) || return 0
+  [[ "$out" == *" "* ]] || return 0
+  _HB_LANDED_SIZE="${out%% *}"; _HB_LANDED_FILE="${out#* }"
+  [[ "$_HB_LANDED_SIZE" =~ ^[0-9]+$ ]] || { _HB_LANDED_SIZE=""; _HB_LANDED_FILE=""; }
+  return 0
+}
+# The longest run of the payload that survives JSON encoding byte-for-byte, so a
+# plain fixed-string grep over the raw transcript can match it. Split on every
+# byte a JSON writer may re-spell — anything outside printable ASCII (control
+# bytes, and UTF-8 that some writers emit as `\uXXXX`) plus `"` and `\` — and the
+# longest surviving run is the needle. Too short a run is not distinguishing —
+# "ok" would match half the corpus — so below the floor we return failure and the
+# caller reports "could not tell" rather than guessing.
+_HB_LANDED_NEEDLE_MIN="${_HB_LANDED_NEEDLE_MIN:-12}"
+_hb_landed_needle() {
+  local text="$1" best="" part
+  # `|| [[ -n "$part" ]]`: the last run carries no trailing newline, and a plain
+  # `read` drops it — which silently threw away the whole needle for any payload
+  # holding no escapable byte at all.
+  while IFS= read -r part || [[ -n "$part" ]]; do
+    (( ${#part} > ${#best} )) && best="$part"
+  done < <(printf '%s' "$text" \
+    | LC_ALL=C tr -c '\040-\176' '\n' \
+    | LC_ALL=C tr '"\\' '\n\n')
+  best="${best#"${best%%[![:space:]]*}"}"      # trim: leading run of blanks
+  best="${best%"${best##*[![:space:]]}"}"      # trim: trailing run of blanks
+  (( ${#best} >= _HB_LANDED_NEEDLE_MIN )) || return 1
+  printf '%s' "${best:0:200}"
+}
+
+# 0 = THIS payload demonstrably reached the seat despite the failed keystroke (the
+# caller counts the wake as delivered, so `woke N` matches reality); 1 = it did
+# not, or we could not tell — either way the reason is logged, never inferred.
+# NEVER call this for a step that precedes the payload keystroke: a failed C-u
+# means the text was never typed, so nothing appended in the window can be a
+# receipt for it and a match there could only be somebody else's record.
+_hb_landed_check() {
+  local name="$1" text="$2" now_file now_size needle tail_rc=0
+  _HB_LANDED_EVIDENCE=""
+  if ! needle=$(_hb_landed_needle "$text"); then
+    _hb_log "[$name] could not tell whether the line landed: the payload has no ${_HB_LANDED_NEEDLE_MIN}-char run distinctive enough to match in the transcript, so nothing is claimed either way (DIVE-4279/DIVE-2159)" 2>/dev/null || true
+    return 1
+  fi
+  if [[ -z "$_HB_LANDED_FILE" || -z "$_HB_LANDED_SIZE" ]]; then
+    _hb_log "[$name] could not tell whether the line landed: no readable transcript to compare against (DIVE-4279)" 2>/dev/null || true
+    return 1
+  fi
+  sleep "${_HB_LANDED_WAIT_SEC:-1}"
+  now_file=$(_hb_transcript_newest "$name")
+  if [[ "$now_file" != "$_HB_LANDED_FILE" ]]; then
+    _hb_log "[$name] line did NOT land: the seat's newest transcript changed to '${now_file:-<none>}' (a new session), which is not evidence for this payload (DIVE-4279)" 2>/dev/null || true
+    return 1
+  fi
+  now_size=$(sudo -n -u "agent-${name}" stat -c %s "$_HB_LANDED_FILE" 2>/dev/null) || now_size=""
+  if ! [[ "$now_size" =~ ^[0-9]+$ ]] || (( now_size <= _HB_LANDED_SIZE )); then
+    _hb_log "[$name] line did NOT land: transcript $(basename "$_HB_LANDED_FILE") gained no bytes since the send (DIVE-4279)" 2>/dev/null || true
+    return 1
+  fi
+  # user record AND not tool_result-shaped AND carrying this payload's own text.
+  # The tool_result exclusion is a whole-RECORD drop, not a field test: a tool
+  # result that quotes the payload back must not read as the seat receiving it.
+  sudo -n -u "agent-${name}" tail -c "+$(( _HB_LANDED_SIZE + 1 ))" "$_HB_LANDED_FILE" 2>/dev/null \
+    | grep -a '"type"[[:space:]]*:[[:space:]]*"user"' \
+    | grep -av -e '"type"[[:space:]]*:[[:space:]]*"tool_result"' -e '"tool_use_id"' \
+    | grep -aqF -- "$needle" || tail_rc=1
+  if (( tail_rc != 0 )); then
+    _hb_log "[$name] line did NOT land: transcript $(basename "$_HB_LANDED_FILE") grew, but no non-tool_result user record since byte ${_HB_LANDED_SIZE} carries this payload ('${needle:0:40}') (DIVE-4279)" 2>/dev/null || true
+    return 1
+  fi
+  _HB_LANDED_EVIDENCE="$(basename "$_HB_LANDED_FILE") gained a user record carrying this payload ('${needle:0:40}') after byte ${_HB_LANDED_SIZE}"
+  _hb_log "[$name] the keystroke failed but the line DID land — ${_HB_LANDED_EVIDENCE}; counting the wake as delivered (DIVE-4279)" 2>/dev/null || true
+  return 0
+}
+
 # Inject one literal line + Enter into an agent's tmux pane. Returns nonzero
 # (never exits) so a single dead pane can't abort the whole tick.
 _hb_send_line() {
@@ -1777,8 +1906,14 @@ _hb_send_line() {
   # that is mid-turn ABORTS the turn, C-u only edits the composer. Ghost text
   # (CC 2.1.267 promptSuggestion, rendered DIM) is not input and is replaced by
   # typing anyway; it is excluded from the verify below rather than cleared.
-  sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" C-u 2>/dev/null || return 1
-  sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" -l -- "$text" 2>/dev/null || return 1
+  # DIVE-4279: mark the transcript BEFORE the first keystroke, so a failed step
+  # can be checked against what the seat actually received.
+  _hb_landed_mark "$name"
+  # NO landed check on this step: the payload has not been typed yet, so a failed
+  # C-u can never mean the line landed. (DIVE-4279 iteration 2 — checking here is
+  # how the first cut counted a busy seat's tool_result as a delivered wake.)
+  _hb_send_keys_step "$name" "composer clear (C-u)" C-u || return 1
+  _hb_send_keys_step "$name" "payload text" -l -- "$text" || { _hb_landed_check "$name" "$text" && return 0; return 1; }
   # DIVE-1217: `send-keys -l` lands as a bracketed PASTE. Claude commits it
   # synchronously so an immediate Enter submits (leave that path alone). Non-claude
   # TUIs (codex/grok/agy/opencode) render the paste inline and a trailing Enter
@@ -1795,17 +1930,17 @@ _hb_send_line() {
   # the pre-DIVE-2244 behaviour for exactly this task and strictly better than a
   # claim on a prompt nobody received.
   if [[ -n "$(_hb_claude_pid "$name")" ]]; then
-    sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter 2>/dev/null || return 1
+    _hb_send_keys_step "$name" "submit (Enter)" Enter || { _hb_landed_check "$name" "$text" && return 0; return 1; }
     _hb_verify_submit "$name" && return 0
     sleep "${_HB_SUBMIT_RETRY_SEC:-0.5}"
-    sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter 2>/dev/null || return 1
+    _hb_send_keys_step "$name" "submit retry (Enter)" Enter || { _hb_landed_check "$name" "$text" && return 0; return 1; }
     _hb_verify_submit "$name" && return 0
     _hb_log "[$name] submit UNVERIFIED — the composer still holds ${#_HB_COMPOSER_UNSENT} chars of non-ghost text after 2 Enters ('${_HB_COMPOSER_UNSENT:0:60}'); returning failure so nothing is claimed on it (DIVE-4242)" 2>/dev/null || true
     return 1
   fi
   sleep 0.4
   while (( tries < 5 )); do
-    sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter 2>/dev/null || return 1
+    _hb_send_keys_step "$name" "submit (Enter, attempt $((tries+1)))" Enter || { _hb_landed_check "$name" "$text" && return 0; return 1; }
     sleep 0.5
     # idle()==0 means the Enter did not take (still at the prompt) -> retry; any
     # other state (busy/blocked/unknown) means the composer accepted it.
