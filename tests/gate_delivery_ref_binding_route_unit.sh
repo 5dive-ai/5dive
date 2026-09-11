@@ -261,12 +261,30 @@ OUT8=$(cmd_task_need DIVE-9008 --type=manual --ask="$PLAIN_ASK" --from=dev 2>&1)
   && ok_t "an UNBOUND manual gate is not routed — absence still keeps it human" \
   || bad_t "an unbound manual gate routed to '$(reviewer_of DIVE-9008)'" "$OUT8"
 
+# DIVE-4329 MOVED THE VALUE, NOT THE PROPERTY. This arm asserted that a
+# delivery-bound `manual` routes to the lead, at parity with the branch-bound
+# one. A tier-2 `manual` gate is now never handed to an agent by ANY kind-route:
+# the type's definition is "a step only a person can perform", so routing it to a
+# seat asks a seat to do a thing the gate itself says it cannot. (Measured
+# 2026-09-11 14:24Z on DIVE-4239: a browser login queued on a lead seat and was
+# never pinged.) The PARITY property this arm exists to defend is untouched and is
+# still what is graded — the two bindings must agree about the same type, and they
+# do, now at "not routed" for both. The branch-bound half is asserted alongside it
+# here rather than assumed, because parity is a claim about two values and a
+# one-sided arm cannot make it.
 seed DIVE-9018 "$PR_REF"
 actor_seam_as dev
 OUT8B=$(cmd_task_need DIVE-9018 --type=manual --ask="$PLAIN_ASK" --from=dev 2>&1)
-[[ "$(reviewer_of DIVE-9018)" == "main" ]] \
-  && ok_t "a delivery-bound manual routes, at PARITY with the branch-bound one main already routes" \
-  || bad_t "a delivery-bound manual did not route" "the two bindings disagree about the same type: $OUT8B"
+seed DIVE-9019
+db "UPDATE tasks SET body='Branch: dive-4329-parity-control' WHERE ident='DIVE-9019';"
+actor_seam_as dev
+OUT8C=$(cmd_task_need DIVE-9019 --type=manual --ask="$PLAIN_ASK" --from=dev 2>&1)
+[[ "$(reviewer_of DIVE-9018)" == "$(reviewer_of DIVE-9019)" ]] \
+  && ok_t "the two bindings AGREE about \`manual\` (parity, DIVE-3228's property)" \
+  || bad_t "the two bindings disagree about the same type" "delivery-ref=[$(reviewer_of DIVE-9018)] branch=[$(reviewer_of DIVE-9019)]: $OUT8B"
+[[ -z "$(reviewer_of DIVE-9018)" ]] \
+  && ok_t "... and they agree at NOT ROUTED: a tier-2 manual gate is the holder's (DIVE-4329)" \
+  || bad_t "a tier-2 manual gate routed to '$(reviewer_of DIVE-9018)'" "$OUT8B"
 
 # --- 9. NO NEW SEAT: a filer the chart cannot route still reaches the human ------
 # main is the root — `_gate_route_reviewer` skips any candidate equal to the filer,
