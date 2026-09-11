@@ -266,9 +266,28 @@ _task_unparented_followup_advisory() {
 # before it was built). Frozen keeps every property that was actually wanted —
 # close-one-to-file-one, no lane can grow, nobody defends a magic N.
 _task_lane_actionable() {
+  # DIVE-4298 -- A DELIVERED ROW IS NOT ACTIONABLE BY THE MAKER. It sits
+  # status=in_progress waiting on a GRADER, and the maker cannot move it. Counted
+  # raw, it made a free seat look full to filers and idle to the dispatcher at the
+  # same instant: measured 2026-09-11, `task add --assignee=dev2` was refused at
+  # 07:5xZ with "lane dev2 is at its WIP cap (3/2 actionable)" counting
+  # DIVE-4278/4280/4289 -- all three DELIVERED and awaiting a grade -- and dev2
+  # then logged "no todo -- stay idle" from 08:15 to 08:28Z with nothing assigned.
+  # The cap exists to bound what a lane is CARRYING, so it must count what the
+  # lane can still act on.
+  #
+  # REJECTED IS ACTIONABLE AGAIN, which is why this is not a bare
+  # `handoff_delivered_at IS NULL`: `task reject` stamps handoff_rejected_at and
+  # leaves handoff_delivered_at set (delivery.sh keeps both clocks so the two
+  # states can be told apart), so the row comes back to the maker and must count.
+  # A graded-but-unmerged row was delivered and never rejected, so it is excluded
+  # by the same clause -- correctly: its next move is the merge owner's.
   db "SELECT COUNT(*) FROM tasks
       WHERE assignee=$(sqlq "$1") AND kind='standard'
-        AND status IN ('todo','in_progress') AND parked_at IS NULL;" 2>/dev/null || echo ""
+        AND status IN ('todo','in_progress') AND parked_at IS NULL
+        AND NOT (handoff_delivered_at IS NOT NULL
+                 AND (handoff_rejected_at IS NULL
+                      OR handoff_rejected_at < handoff_delivered_at));" 2>/dev/null || echo ""
 }
 
 # _task_wip_cap <lane> — READ ONLY. A lane with no INSTALLED cap is not capped,

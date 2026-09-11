@@ -1547,7 +1547,7 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
           # is the half that fails silently — an accept sourced from a repo that is not
           # where the delivery went reads as a clean close and nothing invites a second
           # look. Measured on DIVE-2303: accepted on a commit in 5dive-ai/5dive while
-          # the delivery sat in character-packs, which was not in the searched set at
+          # the delivery sat in the marketplace registry, which was not in the searched set at
           # all. Only stated when the task DECLARED no repo, because a declared repo
           # narrows the scan to itself and there is no unsearched remainder to warn about.
           _attr_scope=""

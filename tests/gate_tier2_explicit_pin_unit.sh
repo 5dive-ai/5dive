@@ -175,7 +175,7 @@ actor_seam_as dev; cmd_task_need DIVE-910 --type=approval --tier=2 --rubber-stam
 assert_pin_held DIVE-910 "curation in ASK: explicit --tier=2 survives"
 
 # 8: TITLE AXIS — curation vocabulary only in the title.
-route_reset; seed DIVE-911 'Approve the persona pack for the character-packs publish queue'
+route_reset; seed DIVE-911 'Approve the persona pack for the 5dive-marketplace publish queue'
 actor_seam_as dev; cmd_task_need DIVE-911 --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --from=dev \
   --ask="Which of the two brand palettes should we commit to?" \
   --options="A|B" --recommend="A" >/dev/null 2>&1

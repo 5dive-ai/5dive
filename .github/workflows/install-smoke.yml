@@ -333,7 +333,7 @@ jobs:
       # repo ships no plugins.
       # DIVE-4196: the TEMPLATE half is not mounted either, and is fetched by
       # the contract from inside the container — templates moved to
-      # <org>/character-packs (teams/) and that index is the only declaration
+      # <org>/5dive-marketplace (teams/) and that index is the only declaration
       # there is, so a mounted checkout copy would grade a file no customer
       # reads.
       #

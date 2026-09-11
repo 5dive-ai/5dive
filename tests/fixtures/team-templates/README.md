@@ -1,7 +1,7 @@
 # Parser fixtures — NOT a bundled template dir
 
 DIVE-4196 moved the shipped team templates to the marketplace registry
-(`5dive-ai/character-packs`, `teams/`). Nothing here is staged by `install.sh`,
+(`5dive-ai/5dive-marketplace`, `teams/`). Nothing here is staged by `install.sh`,
 copied by `docker/Dockerfile`, or resolvable by `5dive team import <slug>` — a
 slug resolves in the registry and nowhere else.
 
