@@ -175,8 +175,18 @@ else
 fi
 
 echo "== the tick decisions that mean 'working' all stamp =="
-n_seen=$(grep -c '_hb_mark_seen "\$name"' "$SRC/cmd_heartbeat.sh")
+# Same class as the arm below (DIVE-4299): a raw grep counts a COMMENT that
+# quotes the call as readily as the call itself. Drop whole-line comments.
+stamp_call_sites() { # <source-file> -> code lines calling _hb_mark_seen "$name"
+  grep -v '^[[:space:]]*#' "$1" | grep -c '_hb_mark_seen "\$name"'
+}
+n_seen=$(stamp_call_sites "$SRC/cmd_heartbeat.sh")
 is 'busy-skip, active-defer and no-work each record their decision' "$n_seen" '3'
+CMT_FIX="$TMPD/stamp_comment.sh"
+{ printf '# a comment quoting the call: _hb_mark_seen "$name" "$now" "why"\n'
+  cat "$SRC/cmd_heartbeat.sh"; } > "$CMT_FIX"
+is 'and a COMMENT quoting that call does not inflate the count' \
+   "$(stamp_call_sites "$CMT_FIX")" '3'
 # The wake-failure path must NOT stamp: an undeliverable wake is the stall this
 # column exists to show, and stamping it would make the alarm unreachable.
 #
