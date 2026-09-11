@@ -31,6 +31,7 @@ command -v column >/dev/null || { echo 'SKIP - column unavailable'; exit 0; }
 
 # Source the real compose implementation; it is function definitions only.
 # Shared CLI helpers are replaced below only at their external seams.
+. "$ROOT/src/lib/marketplace.sh"   # THE registry constant; never re-spell the URL here
 . "$ROOT/src/cmd_compose.sh"
 unset TEAM_TG_TOKEN
 SPEC=$(_compose_parse "$TPL" 2>"$TMP/parse.err"); parse_rc=$?
@@ -193,7 +194,7 @@ _compose_self() { printf '%s' "$TMP/self.sh"; }
 # test are the real ones.
 _teams_get() {
   local url="$1" out="$2" rel
-  rel="${url##*/character-packs/main/}"   # separate statement: same-`local` refs are unreliable
+  rel="${url#"$(_marketplace_raw_base)/"}"   # separate statement: same-`local` refs are unreliable
   case "$rel" in
     teams/index.json) cp "$ROOT/tests/fixtures/team-templates/index.json" "$out" ;;
     teams/*)          [[ -f "$ROOT/tests/fixtures/team-templates/${rel#teams/}" ]] \

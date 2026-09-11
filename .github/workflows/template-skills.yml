@@ -27,7 +27,7 @@ name: template-skills
 #    version-assign bot cannot bypass branch protection. Land it non-required,
 #    watch it, promote it separately and on purpose.
 #
-# 4. DIVE-4196 MOVED THE SHIPPED TEMPLATES. They live in 5dive-ai/character-packs
+# 4. DIVE-4196 MOVED THE SHIPPED TEMPLATES. They live in 5dive-ai/5dive-marketplace
 #    (teams/) now, and the run that grades what customers actually import is the
 #    copy of this check that moved with them. This job still runs — against the
 #    parser fixtures in tests/fixtures/team-templates/ — because a broken skill

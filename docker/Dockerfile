@@ -68,7 +68,7 @@ COPY systemd /opt/5dive-bundle/systemd/
 #
 # DIVE-4202: plugins are published to 5dive-ai/5dive-plugins and `5dive plugin`
 # registers that registry itself.
-# DIVE-4196: team templates are published to <org>/character-packs under teams/
+# DIVE-4196: team templates are published to <org>/5dive-marketplace under teams/
 # and `5dive team` reads that index live.
 #
 # Do not restore a COPY for either: bundling is what made a fix reach a customer
