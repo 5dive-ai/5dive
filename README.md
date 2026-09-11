@@ -337,7 +337,7 @@ sudo 5dive agent marketplace ls            # browse the character-pack registry
 sudo 5dive agent import olivia --as=ceo    # spin up a named agent from a pack
 ```
 
-`--as` is the agent's name on your box; the pack supplies the persona, model, and skills. Add `--channels=telegram` to wire a bot at import time. Packs live in the [`5dive-ai/character-packs`](https://github.com/5dive-ai/character-packs) registry, and a `5dive.yaml` can reference one with `pack: <slug>`.
+`--as` is the agent's name on your box; the pack supplies the persona, model, and skills. Add `--channels=telegram` to wire a bot at import time. Packs live in the [`5dive-ai/5dive-marketplace`](https://github.com/5dive-ai/5dive-marketplace) registry, and a `5dive.yaml` can reference one with `pack: <slug>`.
 
 ### See the org layer: `5dive ui`
 

@@ -21,11 +21,12 @@
 PACK_FORMAT_VERSION=1
 
 # -------- character-pack git registry (DIVE-473/509) -----------------------
-# The marketplace is a curated GitHub repo (<org>/character-packs) that the CLI
+# The marketplace is a curated GitHub repo (<org>/5dive-marketplace) that the CLI
 # reads directly — no api.5dive.com dependency, same pattern as <org>/skills.
 # A bare slug to `agent import` resolves here; `agent marketplace ls` browses it.
 
-_marketplace_base() { echo "https://raw.githubusercontent.com/$(gh_org)/character-packs/main"; }
+# One definition of the registry repo lives in header.sh (FIVE_MARKETPLACE_REPO).
+_marketplace_base() { _marketplace_raw_base; }
 
 # DIVE-644: opt-in import telemetry (the ONLY api.5dive.com touchpoint on the
 # pack path, and only when the user passes `agent import <slug> --report-import`;
@@ -605,8 +606,8 @@ cmd_marketplace() {
       jq -e '.packs' >/dev/null 2>&1 <<<"$idx" \
         || fail "$E_GENERIC" "registry index is malformed"
       if (( JSON_MODE )); then
-        ok "" '{registry:($org+"/character-packs"), packs:($idx.packs)}' \
-           --arg org "$(gh_org)" --argjson idx "$idx"
+        ok "" '{registry:$registry, packs:($idx.packs)}' \
+           --arg registry "$(_marketplace_slug)" --argjson idx "$idx"
       else
         echo "Character packs — import any with: 5dive agent import <slug> --as=<name>"
         echo
@@ -745,19 +746,19 @@ cmd_market() {
   local n total; n=$(jq 'length' <<<"$filtered"); total=$(jq '.packs|length' <<<"$idx")
 
   if (( JSON_MODE )); then
-    ok "" '{registry:($org+"/character-packs"), query:{keyword:$kw,role:$role,rarity:$rar,seasoned:($s==1)}, total:$t, count:$n, packs:$p}' \
-       --arg org "$(gh_org)" --arg kw "$kw" --arg role "$role" --arg rar "$rarity" \
+    ok "" '{registry:$registry, query:{keyword:$kw,role:$role,rarity:$rar,seasoned:($s==1)}, total:$t, count:$n, packs:$p}' \
+       --arg registry "$(_marketplace_slug)" --arg kw "$kw" --arg role "$role" --arg rar "$rarity" \
        --argjson s "$seasoned" --argjson t "$total" --argjson n "$n" --argjson p "$filtered"
     return
   fi
 
   if (( n == 0 )); then
     local q=""; [[ -n "$kw" ]] && q+=" '$kw'"; [[ -n "$role" ]] && q+=" role=$role"; [[ -n "$rarity" ]] && q+=" rarity=$rarity"
-    echo "No agents match${q} in the market ($(gh_org)/character-packs)."
+    echo "No agents match${q} in the market ($(_marketplace_slug))."
     echo "Browse all: 5dive market"
     return
   fi
-  local hdr="AGENT MARKET — $(gh_org)/character-packs  ($n"
+  local hdr="AGENT MARKET — $(_marketplace_slug)  ($n"
   [[ "$n" != "$total" ]] && hdr+=" of $total, filtered"
   echo "${hdr} packs)"
   echo
@@ -1167,7 +1168,7 @@ _pack_usage() {
                                   #      user/feedback facts excluded) for you to review + edit.
                                   #   2) export <name> --approve-memory=<draft dir>  -> seals the
                                   #      reviewed memory into the pack. Nothing is packed unreviewed.
-  5dive agent marketplace [ls]    # browse the character-pack registry (<org>/character-packs)
+  5dive agent marketplace [ls]    # browse the character-pack registry (<org>/5dive-marketplace)
   5dive agent inspect <pack|slug> # read-only "this pack runs X" disclosure —
                                   # hooks (arbitrary shell), skills, plugins, whether it
                                   # re-renders the system prompt, seeds memory, or adopts a
@@ -1293,7 +1294,7 @@ _pack_secret_tripwire() {
 
 # --- DIVE-2567: the memory leak-check, ENFORCED on the export path -----------
 #
-# character-packs/README.md has always REQUIRED that a published pack carry
+# The registry README.md has always REQUIRED that a published pack carry
 # "distilled seed memory ... never raw private memory or secrets". That rule was
 # DOCUMENTED AND NOT ENFORCED: nothing in the CLI or CI had ever looked at memory
 # CONTENT on the way out. It survived only because five packs ship memory and a
@@ -1316,7 +1317,7 @@ _pack_secret_tripwire() {
 # so it covers whoever exists HERE rather than a list someone must remember to
 # update. Empty is a legitimate answer (no agents) — the pattern rules still run.
 # Roster entries that are ORDINARY ENGLISH or a generic role noun are dropped.
-# Measured, not guessed: with them in, all five published character-packs failed
+# Measured, not guessed: with them in, all five published character packs failed
 # this gate, on lines like "commit to main" and "Creative lessons distilled" —
 # a gate that red-flags every honest pack is a gate somebody turns off.
 # The cost is a real blind spot (an agent literally named 'main' goes unnamed),

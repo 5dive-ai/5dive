@@ -1185,10 +1185,10 @@ _gate_branch_refs_from_text() {
 # so the tests can point the whole gate at fixtures.
 # DIVE-2431: the default was exactly those three, and a delivery to any OTHER repo we
 # ship from was graded by a set that never contained it. Both directions were live and
-# both were measured on DIVE-2303, whose delivery landed in 5dive-ai/character-packs:
+# both were measured on DIVE-2303, whose delivery landed in the marketplace registry:
 #   FALSE ACCEPT  — the gate found the ident in 5dive-ai/5dive (step 1 of the same
 #                   ticket, days earlier) and closed clean having never looked at
-#                   character-packs. Correct by luck.
+#                   the marketplace registry. Correct by luck.
 #   FALSE REFUSE  — strip that coincidence and genuinely-landed work is refused with
 #                   "nothing on main in <3 slugs> shows branch ... landed", whose remedy
 #                   is an audited `--force-merge-gate` override for a gate that was
@@ -1407,7 +1407,7 @@ _gate_repo_slugs() {
     # than every repo we own — an inactive repo costs a lookup on every close and has
     # never received a delivery.
     raw="$(_push_repo_slug "$_PUSH_DEFAULT_REPO") lodar/5dive-api lodar/5dive-frontend"
-    raw="$raw 5dive-ai/character-packs 5dive-ai/skills 5dive-ai/5dive-plugins"
+    raw="$raw 5dive-ai/5dive-marketplace 5dive-ai/skills 5dive-ai/5dive-plugins"
     raw="$raw 5dive-ai/5dive-mcp 5dive-ai/openagent 5dive-ai/ops"
     raw="$raw lodar/5dive-blog lodar/5dive-mobile"
   fi

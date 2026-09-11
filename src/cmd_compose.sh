@@ -1367,7 +1367,7 @@ _compose_export_loops() {
 # -------- team templates come from the MARKETPLACE REGISTRY (DIVE-4196) -----
 #
 # Curated team templates live in the same curated GitHub repo the character packs
-# come from — <org>/character-packs, under teams/ — and the CLI reads them there,
+# come from — <org>/5dive-marketplace, under teams/ — and the CLI reads them there,
 # live. They are no longer bundled with this binary.
 #
 # WHY. They used to ship inside this repo and be staged by install.sh AT INSTALL
@@ -1389,7 +1389,8 @@ TEAM_SCHEMA_MAX=2
 
 # Registry ROOT (not the teams/ dir): index entries carry a repo-relative
 # `path`, so root + path is the one place the layout is written down.
-_teams_registry_base() { echo "https://raw.githubusercontent.com/$(gh_org)/character-packs/main"; }
+# Same one definition the packs path reads (header.sh: FIVE_MARKETPLACE_REPO).
+_teams_registry_base() { _marketplace_raw_base; }
 
 # Fetch one registry object, preserving the failure class so a transient fetch
 # failure is never reported as the much stronger claim that the slug does not
@@ -1495,7 +1496,7 @@ usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
        5dive team ps [<slug|path>] [--type=<harness>]
        5dive team ls
   Provision a whole company-structure template in one call (wraps 5dive up).
-  <slug> resolves in the marketplace registry (<org>/character-packs, teams/),
+  <slug> resolves in the marketplace registry (<org>/5dive-marketplace, teams/),
   read live — a template published there works on this box with no update.
   A path is used as-is, and is the offline / bring-your-own route.
 
@@ -1555,7 +1556,7 @@ _team_resolve_template() {
 _team_resolve_fail() {
   local ref="$1" rc="$2" why
   case "$rc" in
-    1) fail "$E_NOT_FOUND" "no template '$ref' in $(gh_org)/character-packs (try: 5dive team ls)" ;;
+    1) fail "$E_NOT_FOUND" "no template '$ref' in $(_marketplace_slug) (try: 5dive team ls)" ;;
     3) fail "$E_NOT_FOUND" "the registry lists '$ref' but the entry carries no path — the registry index is broken, not your command" ;;
     4) why="the template body could not be fetched from the registry" ;;
     2?) why=$(_teams_index_diag "$(( rc - 20 ))") ;;
@@ -1646,7 +1647,7 @@ HELP
         if (( ps_unreadable > 0 )); then
           fail "$E_NOT_FOUND" "could not determine which teams are installed — ${ps_why} ($ps_unreadable of the registry's templates could not be read). This is NOT a claim that no roster is installed; retry, or name one: 5dive team ps <slug|path>"
         fi
-        fail "$E_NOT_FOUND" "no complete team roster from $(gh_org)/character-packs is installed (try: 5dive team import <slug>)"
+        fail "$E_NOT_FOUND" "no complete team roster from $(_marketplace_slug) is installed (try: 5dive team import <slug>)"
       fi
       local ps_i=0
       for ps_file in "${ps_matches[@]}"; do
@@ -1666,7 +1667,7 @@ HELP
       if (( ls_rc != 0 )); then
         fail "$E_NOT_FOUND" "cannot read the team registry — $(_teams_index_diag "$ls_rc"). A local file still imports: 5dive team import ./<file>.5dive.yaml"
       fi
-      echo "Available templates ($(gh_org)/character-packs → teams/):"
+      echo "Available templates ($(_marketplace_slug) → teams/):"
       # A template the registry advertises but this binary cannot read is LISTED
       # and marked, not hidden: a customer who sees nothing concludes the
       # registry is empty, and the actionable fact is that their CLI is old.

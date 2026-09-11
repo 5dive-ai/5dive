@@ -17,7 +17,7 @@
 # flaked fetch and a skill that has never existed print the same warning and suggest the
 # same futile rerun. This script removes the ambiguity by asking the repo directly.
 #
-# DIVE-4196 — the SHIPPED templates moved to 5dive-ai/character-packs (teams/).
+# DIVE-4196 — the SHIPPED templates moved to 5dive-ai/5dive-marketplace (teams/).
 # The authoritative run of this check is the copy that moved with them
 # (scripts/check-team-skills.sh there, on the same daily cron): it is the one
 # that grades what customers actually import. This copy now defaults to the
