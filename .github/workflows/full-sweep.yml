@@ -244,6 +244,21 @@ jobs:
       fail-fast: false
       matrix: { shard: [1, 2, 3] }
     steps:
+      # DIVE-3963: the OTHER HALF of the Codex channel seam. tests/codex_channel_e2e_unit.sh
+      # moves a payload the real CLI produced into the real dispatcher that lives in
+      # 5dive-plugins and asserts what comes out the other end; the seam it grades is a
+      # file contract with one writer in each repo and nothing forcing them to agree.
+      # Without this tree the end-to-end arms cannot run and the harness FAILS rather
+      # than skipping, on purpose — a gate whose end-to-end arms quietly vanish on the
+      # runner is the false green the row was filed to remove.
+      #
+      # Public repo, so no secret and no PAT. Cloned into RUNNER_TEMP rather than
+      # checked out with actions/checkout, whose `path` cannot escape the workspace and
+      # would leave a second git tree inside the one harness-tree-guard.sh grades.
+      - name: Fetch 5dive-plugins (the dispatcher half of the DIVE-3963 seam)
+        run: |
+          git clone --depth 1 --quiet https://github.com/5dive-ai/5dive-plugins "$RUNNER_TEMP/5dive-plugins"
+          echo "TELEGRAM_CODEX_PLUGIN_DIR=$RUNNER_TEMP/5dive-plugins/plugins/telegram-codex" >> "$GITHUB_ENV"
       # DIVE-2229: full history — pinned baselines must resolve here too.
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -302,6 +317,21 @@ jobs:
       fail-fast: false
       matrix: { shard: [1, 2, 3] }
     steps:
+      # DIVE-3963: the OTHER HALF of the Codex channel seam. tests/codex_channel_e2e_unit.sh
+      # moves a payload the real CLI produced into the real dispatcher that lives in
+      # 5dive-plugins and asserts what comes out the other end; the seam it grades is a
+      # file contract with one writer in each repo and nothing forcing them to agree.
+      # Without this tree the end-to-end arms cannot run and the harness FAILS rather
+      # than skipping, on purpose — a gate whose end-to-end arms quietly vanish on the
+      # runner is the false green the row was filed to remove.
+      #
+      # Public repo, so no secret and no PAT. Cloned into RUNNER_TEMP rather than
+      # checked out with actions/checkout, whose `path` cannot escape the workspace and
+      # would leave a second git tree inside the one harness-tree-guard.sh grades.
+      - name: Fetch 5dive-plugins (the dispatcher half of the DIVE-3963 seam)
+        run: |
+          git clone --depth 1 --quiet https://github.com/5dive-ai/5dive-plugins "$RUNNER_TEMP/5dive-plugins"
+          echo "TELEGRAM_CODEX_PLUGIN_DIR=$RUNNER_TEMP/5dive-plugins/plugins/telegram-codex" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       # DIVE-1919 / DIVE-2018: seed the host state that actually differs from a
@@ -445,6 +475,21 @@ jobs:
     if: github.event_name != 'pull_request'
     timeout-minutes: 60
     steps:
+      # DIVE-3963: the OTHER HALF of the Codex channel seam. tests/codex_channel_e2e_unit.sh
+      # moves a payload the real CLI produced into the real dispatcher that lives in
+      # 5dive-plugins and asserts what comes out the other end; the seam it grades is a
+      # file contract with one writer in each repo and nothing forcing them to agree.
+      # Without this tree the end-to-end arms cannot run and the harness FAILS rather
+      # than skipping, on purpose — a gate whose end-to-end arms quietly vanish on the
+      # runner is the false green the row was filed to remove.
+      #
+      # Public repo, so no secret and no PAT. Cloned into RUNNER_TEMP rather than
+      # checked out with actions/checkout, whose `path` cannot escape the workspace and
+      # would leave a second git tree inside the one harness-tree-guard.sh grades.
+      - name: Fetch 5dive-plugins (the dispatcher half of the DIVE-3963 seam)
+        run: |
+          git clone --depth 1 --quiet https://github.com/5dive-ai/5dive-plugins "$RUNNER_TEMP/5dive-plugins"
+          echo "TELEGRAM_CODEX_PLUGIN_DIR=$RUNNER_TEMP/5dive-plugins/plugins/telegram-codex" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       # DIVE-2525: BUILD THE BUNDLE FIRST, EXPLICITLY. Three harnesses
@@ -517,6 +562,21 @@ jobs:
     if: github.event_name != 'pull_request'
     timeout-minutes: 60
     steps:
+      # DIVE-3963: the OTHER HALF of the Codex channel seam. tests/codex_channel_e2e_unit.sh
+      # moves a payload the real CLI produced into the real dispatcher that lives in
+      # 5dive-plugins and asserts what comes out the other end; the seam it grades is a
+      # file contract with one writer in each repo and nothing forcing them to agree.
+      # Without this tree the end-to-end arms cannot run and the harness FAILS rather
+      # than skipping, on purpose — a gate whose end-to-end arms quietly vanish on the
+      # runner is the false green the row was filed to remove.
+      #
+      # Public repo, so no secret and no PAT. Cloned into RUNNER_TEMP rather than
+      # checked out with actions/checkout, whose `path` cannot escape the workspace and
+      # would leave a second git tree inside the one harness-tree-guard.sh grades.
+      - name: Fetch 5dive-plugins (the dispatcher half of the DIVE-3963 seam)
+        run: |
+          git clone --depth 1 --quiet https://github.com/5dive-ai/5dive-plugins "$RUNNER_TEMP/5dive-plugins"
+          echo "TELEGRAM_CODEX_PLUGIN_DIR=$RUNNER_TEMP/5dive-plugins/plugins/telegram-codex" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       - name: Simulate a box with 5dive installed
@@ -634,6 +694,21 @@ jobs:
       # verdict costs minutes, not that it may go ungraded.
       SLOW_HARNESSES: gate_channel_session_t2_mutation.sh
     steps:
+      # DIVE-3963: the OTHER HALF of the Codex channel seam. tests/codex_channel_e2e_unit.sh
+      # moves a payload the real CLI produced into the real dispatcher that lives in
+      # 5dive-plugins and asserts what comes out the other end; the seam it grades is a
+      # file contract with one writer in each repo and nothing forcing them to agree.
+      # Without this tree the end-to-end arms cannot run and the harness FAILS rather
+      # than skipping, on purpose — a gate whose end-to-end arms quietly vanish on the
+      # runner is the false green the row was filed to remove.
+      #
+      # Public repo, so no secret and no PAT. Cloned into RUNNER_TEMP rather than
+      # checked out with actions/checkout, whose `path` cannot escape the workspace and
+      # would leave a second git tree inside the one harness-tree-guard.sh grades.
+      - name: Fetch 5dive-plugins (the dispatcher half of the DIVE-3963 seam)
+        run: |
+          git clone --depth 1 --quiet https://github.com/5dive-ai/5dive-plugins "$RUNNER_TEMP/5dive-plugins"
+          echo "TELEGRAM_CODEX_PLUGIN_DIR=$RUNNER_TEMP/5dive-plugins/plugins/telegram-codex" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       # DIVE-2525: BUILD THE BUNDLE FIRST, EXPLICITLY. Three harnesses
