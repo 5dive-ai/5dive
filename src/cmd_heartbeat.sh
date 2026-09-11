@@ -1248,6 +1248,40 @@ _hb_mark_active_defer() {
   printf '%s' "$n"
 }
 
+# DIVE-4278 — record a tick that OBSERVED this seat alive WITHOUT waking it.
+#
+# `lastRunAt` (_hb_mark_run) is a wake receipt, and the two commonest tick
+# outcomes for a working seat are not wakes: `busy — N in_progress, skip` and
+# `active (mid-turn/conversation) — defer nudge this tick`. Both leave lastRunAt
+# frozen, so `agent list` rendered the busiest seats as the most overdue ones —
+# 4 of 4 seats flagged and 0 stalled on lodar's box during the v0.31.0 shakedown,
+# including a seat the same tick had just logged as mid-turn.
+#
+# So the tick writes down what it saw, in its own words. The heartbeat is the
+# right (and only) writer: it runs as root, and the registry is 640 root:claude —
+# a seat cannot stamp its own liveness here even if we asked it to.
+#
+# This must never do the opposite job: it is POSITIVE evidence only, it is never
+# cleared to accuse a seat, and `agent list` only consults it inside the same 2x
+# window the age is judged against. A seat nobody observed simply has no stamp
+# and is judged exactly as it was before this shipped.
+#
+# Best-effort and non-fatal: a failed stamp costs a false OVERDUE next tick, and
+# must never abort a dispatch tick. Must run under with_registry_lock, like
+# _hb_mark_run / _hb_mark_active_defer.
+_hb_mark_seen() { # <name> <now> <why>
+  local name="$1" now="$2" why="$3"
+  local reg; reg=$(registry_read) || return 0
+  # Only for a seat that HAS a heartbeat block — never conjure one, or an
+  # un-enrolled seat grows a half-object that reads as enrolled elsewhere.
+  reg=$(echo "$reg" | jq --arg n "$name" --argjson t "$now" --arg w "$why" '
+    if .agents[$n].heartbeat then
+      .agents[$n].heartbeat.lastSeenAt = $t
+      | .agents[$n].heartbeat.lastSeenWhy = $w
+    else . end') || return 0
+  echo "$reg" | registry_write || return 0
+}
+
 # DIVE-3503 — record the pane fingerprint an active-defer escalation FIRED ON.
 # Survives _hb_clear_active_defer's counter reset on purpose: the counter is the
 # episode's nudge budget, this is the evidence of what the last remedy was aimed
@@ -5630,7 +5664,11 @@ cmd_heartbeat_tick() {
                               AND COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''),
                                            COALESCE(assignee,'?')) <> $(sqlq "$name") );" 2>/dev/null || echo 0)
     if [[ "${inprog:-0}" != "0" ]]; then
-      sk_busy=$((sk_busy + 1)); _hb_log "[$name] busy — $inprog in_progress, skip"; continue
+      sk_busy=$((sk_busy + 1)); _hb_log "[$name] busy — $inprog in_progress, skip"
+      # DIVE-4278: this tick just PROVED the seat is working. Say so on the
+      # record, or `agent list` reports it as the most stalled seat on the box.
+      with_registry_lock _hb_mark_seen "$name" "$now" "busy ${inprog} in_progress" >/dev/null 2>&1 || true
+      continue
     fi
 
     # --- DIVE-3465 hard-cap dispatch hold --------------------------------------
@@ -5806,7 +5844,15 @@ cmd_heartbeat_tick() {
     if (( _picked == 0 )); then
       task_id=""; task_ident=""
       if (( _cand_n == 0 )); then
-        sk_nowork=$((sk_nowork + 1)); _hb_log "[$name] no todo — stay idle"; continue
+        sk_nowork=$((sk_nowork + 1)); _hb_log "[$name] no todo — stay idle"
+        # DIVE-4278: a decision, and a WEAKER one than the two above — it says
+        # the tick had nothing to dispatch, NOT that anyone saw this seat work.
+        # Recorded (and labelled `idle` so the row and the legend say so) because
+        # ageing a seat the heartbeat deliberately left alone is what produced
+        # "4 of 4 OVERDUE, 0 stalled". Proof of life for an idle seat is
+        # `5dive liveness`, and the legend points there.
+        with_registry_lock _hb_mark_seen "$name" "$now" "idle (no work)" >/dev/null 2>&1 || true
+        continue
       fi
       # Every candidate we looked at was held. Not silent, and it names the cap:
       # if _cand_n hit _HB_PICK_SCAN there may be runnable rows we never reached,
@@ -6052,7 +6098,10 @@ cmd_heartbeat_tick() {
         with_registry_lock _hb_mark_escalation_fp "$name" "$defer_fp" >/dev/null 2>&1 || true
         # deliberately no `continue` — fall through to the wake below.
       else
-        sk_active=$((sk_active + 1)); _hb_log "[$name] active (mid-turn/conversation) — defer nudge this tick (active-defer #${defer_n})"; continue
+        sk_active=$((sk_active + 1)); _hb_log "[$name] active (mid-turn/conversation) — defer nudge this tick (active-defer #${defer_n})"
+        # DIVE-4278: mid-turn is the loudest proof of life the tick ever has.
+        with_registry_lock _hb_mark_seen "$name" "$now" "mid-turn" >/dev/null 2>&1 || true
+        continue
       fi
     fi
 
