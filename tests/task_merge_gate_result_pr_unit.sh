@@ -293,11 +293,22 @@ run_done OK-4 --result='No PR here at all.'
 : >"$AUDIT_CALLS"
 seed LOUD-1
 GH_STUB_LIST_FAIL=1 run_done LOUD-1 --result='no pr named'
-if [[ $RC -eq 0 && "$OUT" == *"could not query GitHub"* ]] && grep -q "merge-gate-unverified" "$AUDIT_CALLS"; then
+# DIVE-4282: this seat HOLDS a token (GH_STUB_AUTH_TOKEN is set at the top of this
+# file) and the listing is the thing that fails, so the announcement is now the
+# scan-failure sentence rather than the credential one — the whole point of that
+# change, and LOUD-2 below still pins the credential wording for the seat it is true
+# of. The graded property is unchanged: ANNOUNCED and AUDITED, never a silent "clean".
+# The stub exits 1 with no stderr, so the named reason is the gate's own "no error
+# text" fallback, which is itself the honest answer for a call killed without a word.
+if [[ $RC -eq 0 && "$OUT" == *"repo scan FAILED"* && "$OUT" == *"partial-repo-scan-0-of-"* ]] \
+   && grep -q "merge-gate-unverified" "$AUDIT_CALLS"; then
   ok_t "a scan that could not run is announced + audited (not silently 'clean')"
 else
   bad_t "unverified scan must be loud + audited" "rc=$RC out=$OUT audit=$(cat "$AUDIT_CALLS")"
 fi
+grep -q "scan_err=" "$AUDIT_CALLS" \
+  && ok_t "DIVE-4282: the scan's own failure reason reaches the AUDIT ROW, not just the terminal" \
+  || bad_t "scan_err on the audit row" "audit=$(cat "$AUDIT_CALLS")"
 : >"$AUDIT_CALLS"
 seed LOUD-2
 GH_STUB_AUTH_TOKEN="" run_done LOUD-2 --result='no pr named'

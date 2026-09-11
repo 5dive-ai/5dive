@@ -202,5 +202,40 @@ grep -q -- 'ls-remote <repo-url> refs/heads/main' "$CODE_NOCOMMENT" \
           "the ls-remote|grep -q form is still emitted" \
   || ok_t "T9 the tip-equality form is gone from the emitted refusal (kept only in a comment)"
 
+# --- T10 (DIVE-4282): A FAILING SELFTEST MUST NOT RENDER AS A CLI BUG. ---------
+# Reported from a customer box as "crashes under set -euo pipefail": the verb printed
+# its warnings and then `error: 5dive task exited 1 without reporting a reason. This
+# is a bug in the CLI`. It never crashed — lib/output.sh's EXIT backstop fires on any
+# non-zero exit that did not `mark_reported`, and this verb's whole contract is to
+# exit non-zero with a finding. So the one diagnostic the merge-gate warning tells an
+# operator to run answered them with a bug report.
+#
+# The assertion is on the FLAG the backstop reads, not on the backstop's text: the
+# trap only runs when the real process exits, which a sourced harness never does.
+JSON_MODE=0
+rm -f "$FIVE_REPORTED_FLAG" 2>/dev/null
+out=$(GH_TOKEN="" GITHUB_TOKEN="" SUDO_USER="" SUDO_STUB_MODE=refused SUDO_STUB_BOT=0 \
+      GH_STUB_STATE="" GH_STUB_AUTH_TOKEN="" cmd_task_merge_gate_selftest --pr="$CTRL" 2>&1); rc=$?
+{ [[ $rc -ne 0 ]] && [[ -e "$FIVE_REPORTED_FLAG" ]] && [[ "$out" == *"merge-gate selftest FAILED"* ]]; } \
+  && ok_t "T10 a blind seat's TEXT-mode finding marks itself reported (no 'bug in the CLI' overprint)" \
+  || bad_t "T10 text-mode finding must mark_reported" "rc=$rc flag=$([[ -e "$FIVE_REPORTED_FLAG" ]] && echo present || echo ABSENT) out=$out"
+
+# T10b: the same for --json, which takes the other return and had the same hole.
+rm -f "$FIVE_REPORTED_FLAG" 2>/dev/null
+out=$(JSON_MODE=1 GH_TOKEN="" GITHUB_TOKEN="" SUDO_USER="" SUDO_STUB_MODE=refused SUDO_STUB_BOT=0 \
+      GH_STUB_STATE="" GH_STUB_AUTH_TOKEN="" cmd_task_merge_gate_selftest --pr="$CTRL" 2>&1); rc=$?
+{ [[ $rc -ne 0 ]] && [[ -e "$FIVE_REPORTED_FLAG" ]]; } \
+  && ok_t "T10b the --json finding exit is marked reported too" \
+  || bad_t "T10b json finding must mark_reported" "rc=$rc out=$out"
+
+# T10c: POSITIVE CONTROL — a PASSING selftest is reported through `ok`, so the flag
+# is not simply always set by this harness's own earlier calls.
+rm -f "$FIVE_REPORTED_FLAG" 2>/dev/null
+out=$(JSON_MODE=1 GH_TOKEN="tok" GH_STUB_STATE="MERGED" cmd_task_merge_gate_selftest --pr="$CTRL" 2>&1); rc=$?
+[[ $rc -eq 0 ]] \
+  && ok_t "T10c control: the passing path still exits 0 (the fix did not change a verdict)" \
+  || bad_t "T10c passing path" "rc=$rc out=$out"
+JSON_MODE=0
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
