@@ -102,8 +102,14 @@ fi
 seed_pending() { # <override:none|skip|force> -> ident
   local ov="$1"
   local t="pool ${ov} $RANDOM"
-  db "INSERT INTO tasks (title,status,assignee,verifier,maker_agent,kind,priority,created_by,delivery_ref)
-      VALUES ($(sqlq "$t"),'todo','quinn','quinn','dev2','standard','high','main','https://github.com/o/r/pull/8');" >/dev/null
+  # This fixture says it is delivered, so stamp the canonical delivery clock
+  # that the real _task_route_to_verifier path always writes. A delivery_ref is
+  # only an artifact binding; treating it as proof of a live handoff would put
+  # already-graded merge work back into the pending pool.
+  db "INSERT INTO tasks (title,status,assignee,verifier,maker_agent,kind,priority,created_by,
+                         handoff_delivered_at,delivery_ref)
+      VALUES ($(sqlq "$t"),'todo','quinn','quinn','dev2','standard','high','main',
+              datetime('now'),'https://github.com/o/r/pull/8');" >/dev/null
   local id; id=$(db "SELECT ident FROM tasks ORDER BY id DESC LIMIT 1;")
   case "$ov" in
     skip)  db "UPDATE tasks SET verify_optout=1 WHERE ident=$(sqlq "$id");" >/dev/null ;;
@@ -227,6 +233,14 @@ fi
 # the delivery itself when it routes, which is the realistic shape.
 db "INSERT INTO lifecycle_events (kind,ident,actor,idem_key,detail)
     VALUES ('task.grade.requested',$(sqlq "$_d_skip"),'sys',$(sqlq "req-${_d_skip}-$RANDOM"),'fixture');" >/dev/null
+# Model the state after a request was queued and policy then flipped to skip:
+# the handoff remains delivered to its verifier, but the current policy must
+# decline it. cmd_task_deliver correctly leaves an opted-out row with its maker,
+# so the fixture must construct this historical transition explicitly.
+db "UPDATE tasks
+       SET status='todo', assignee='quinn', verifier='quinn',
+           handoff_delivered_at=datetime('now')
+     WHERE ident=$(sqlq "$_d_skip");" >/dev/null
 _j=$(tick_counts); _pl_now=$(planned "$_j"); _dk_now=$(jq -r '.dark' <<<"$_j")
 if [[ "$_pl_now" == "$((_pl_base+1))" && "$_dk_now" == "$((_dk_base+1))" ]]; then
   ok_t "always: the tick plans a grade for the plain delivered row and NONE for the --no-verify one (+1 planned, +1 declined)"
