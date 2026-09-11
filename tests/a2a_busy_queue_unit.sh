@@ -68,6 +68,17 @@ tmux() { printf 'TMUX %s\n' "$*" >>"$TYPED"; return 0; }
 _agent_delivery_inbox()   { return 1; }   # pane seat, not a dispatcher seat
 _agent_pane_safe_to_type(){ return 0; }
 _hb_claude_pid()          { printf '4214\n'; }
+# DIVE-4246: the injector's claude path now VERIFIES the submit against the
+# composer, and `_hb_verify_submit` — like `_hb_claude_pid` and `_hb_agent_idle`
+# above — is defined in src/cmd_heartbeat.sh, which this harness does not source.
+# In the shipped bundle that call resolves through the lazy-dispatch autoload stub
+# (`_hb_verify_submit(){ _lazy_autoload cmd_heartbeat _hb_verify_submit; ...}`),
+# so production is unaffected; a harness that sources the raw src file gets no
+# stub and must supply one. Returning 0 = "the Enter took", which is the state
+# every arm here assumes: this harness grades the QUEUE decision, not the submit
+# verify (tests/agent_send_injector_hygiene_unit.sh grades that, and pins both
+# halves of it with its own mutation arm).
+_hb_verify_submit()       { return 0; }
 wait_agent_input_ready()  { return 0; }
 require_agent()           { :; }
 mirror_interagent_outbound() { :; }

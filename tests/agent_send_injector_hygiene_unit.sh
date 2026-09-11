@@ -46,12 +46,16 @@ set +e
 STATE_DIR="$TMP"
 KEYS="$TMP/keys"; PANE_I="$TMP/pane_i"
 PANES=()
-_reset() { : >"$KEYS"; echo 0 >"$PANE_I"; }
+_reset() { : >"$KEYS"; echo 0 >"$PANE_I"; rm -rf "$TMP/agent-seatx"; }
 # Fake sudo: `sudo -u agent-x tmux send-keys ...` logs the keystroke; `capture-pane`
 # returns the next scripted pane (the last one repeats). Counter lives in a file
 # because capture-pane is called inside $(...) subshells.
 sudo() {
   while [ $# -gt 0 ]; do case "$1" in -u) shift 2;; -n|-H) shift;; *) break;; esac; done
+  # DIVE-4246 x DIVE-4214: the spool's own verbs run for real against $TMP (see
+  # _a2a_queue_dir below), so "the message was queued" is graded on a file that
+  # exists, not on a stub that says yes. Everything else keeps returning 0.
+  case "${1:-}" in mkdir|tee|mv|rm|find|cat) "$@"; return $?;; esac
   [[ "${1:-}" == tmux ]] || return 0
   shift
   case "${1:-}" in
@@ -65,6 +69,23 @@ sudo() {
 _agent_delivery_inbox()    { return 1; }   # no dispatcher inbox: the tmux path under test
 _agent_pane_safe_to_type() { return 0; }
 _hb_claude_pid()           { echo 4242; }  # claude path (Enter + composer verify)
+# DIVE-4214 landed a busy-seat QUEUE in front of this injector: _a2a_should_queue
+# reads _hb_agent_idle and, on rc 1 (busy) ONLY, spools the payload and returns 4
+# without typing anything. Every arm below B1..B12 grades what the injector does
+# once it has decided to TYPE, so the seat must be a seat that types — IDLE_RC=0.
+# Left as the real predicate this harness would read the scripted panes (which
+# carry no idle marker) as BUSY and silently grade the queue path instead: that
+# is exactly the cross-PR hole quinn measured on the merged tree, where B4/B6/B11
+# and the B12 MUTATION arm all went green-to-red without either branch changing.
+# B13/B14 at the bottom grade the queue decision itself.
+IDLE_RC=0
+_hb_agent_idle()           { return "${IDLE_RC:-0}"; }
+# B12 MUTATES _hb_verify_submit and must not leak that into the arms after it.
+# Snapshot the real one here, while it is still the real one, and restore by eval.
+_REAL_VERIFY_SUBMIT="$(declare -f _hb_verify_submit)"
+# The spool lives under $TMP, not in a real seat's home.
+_a2a_queue_dir()           { printf '%s\n' "$TMP/agent-${1}/.5dive/a2a-queue"; }
+spooled()                  { find "$(_a2a_queue_dir "$1")" -maxdepth 1 -name '*.msg' 2>/dev/null | wc -l | tr -d ' '; }
 sleep()                    { :; }
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
@@ -138,11 +159,18 @@ grade "B10 differential: the pre-fix body returns 0 on that same stuck pane — 
 # B11 — non-claude TUIs keep the idle-state confirmation (no composer glyph to
 # read there), and STILL get the C-u clear.
 _hb_claude_pid()  { echo ""; }
-_hb_agent_idle()  { return 1; }            # not idle == the Enter took
+# Stateful, and that is the honest model rather than a convenience: the injector
+# reads idle TWICE on this path and wants a different answer each time. Before
+# typing, rc 0 (idle) — a busy seat would have been spooled by DIVE-4214 and this
+# code never reached. After the Enter, rc 1 (busy) — which is how the non-claude
+# path confirms the submit took, since there is no composer glyph to read.
+_B11_N="$TMP/b11n"; echo 0 >"$_B11_N"
+_hb_agent_idle()  { local n; n=$(cat "$_B11_N"); echo $((n+1)) >"$_B11_N"; (( n == 0 )) && return 0; return 1; }
 _reset; PANES=("$P_EMPTY"); inject_and_submit seatx "$MSG"; rc=$?
 grade "B11 non-claude TUIs keep the idle-state confirmation and still get the C-u clear" \
       "[[ $rc -eq 0 && \$(sed -n 1p '$KEYS') == 'C-u' ]]"
 _hb_claude_pid()  { echo 4242; }
+_hb_agent_idle()  { return "${IDLE_RC:-0}"; }
 
 # B12 — MUTATION: with the verify stubbed to always-pass, B7's stuck fixture
 # returns 0 again on one Enter. Proves B7/B9 are graded by the verify, not by the
@@ -150,6 +178,31 @@ _hb_claude_pid()  { echo 4242; }
 _hb_verify_submit() { return 0; }
 _reset; PANES=("$P_STUCK" "$P_STUCK"); inject_and_submit seatx "$MSG"; rc=$?
 grade "B12 mutation: dropping the verify turns B7's rc back to 0 — the arm is live" "[[ $rc -eq 0 && \$(enters) -eq 1 ]]"
+
+# --- B13/B14 — the seam with DIVE-4214, graded from THIS side --------------
+# The composer hygiene is a thing this injector does to a pane. A BUSY seat has
+# no pane it may touch: DIVE-4214 spools the payload and returns 4. So the whole
+# hygiene sequence must be ABSENT there — not just the payload, the C-u and the
+# Enter too, because a C-u into a running turn edits a composer the operator may
+# be using and an Enter submits whatever it holds.
+#
+# This is the arm neither branch could have had: #866 wrote the hygiene and #862
+# wrote the queue, each green alone, and the merged tree was red in both
+# directions while `git merge-tree` reported no conflict. Grading the ORDERING
+# from both sides is what makes that measurable from one branch.
+eval "$_REAL_VERIFY_SUBMIT"   # undo B12's mutation — the real verify is back
+IDLE_RC=1
+_reset; PANES=("$P_EMPTY"); inject_and_submit seatx "$MSG"; rc=$?
+grade "B13 a BUSY seat is spooled at rc 4 and NOTHING is typed — no C-u, no payload, no Enter" \
+      "[[ $rc -eq 4 && ! -s '$KEYS' && \$(spooled seatx) -eq 1 ]]"
+
+# B14 — the control for B13. With the queue switched off the SAME busy fixture
+# types and submits, so B13 is graded by the queue decision rather than by the
+# arm happening to reach no code at all.
+_reset; PANES=("$P_EMPTY"); FIVE_A2A_QUEUE=off inject_and_submit seatx "$MSG"; rc=$?
+grade "B14 control: with the queue off the same busy seat is typed to, C-u first (so B13 grades the ordering)" \
+      "[[ $rc -eq 0 && \$(sed -n 1p '$KEYS') == 'C-u' && \$(sed -n 2p '$KEYS') == '$MSG' && \$(spooled seatx) -eq 0 ]]"
+IDLE_RC=0
 
 printf '%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
