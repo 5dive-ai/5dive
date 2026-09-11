@@ -5379,6 +5379,11 @@ _hb_memory_consolidate_sweep() {
   # the third bucket that quiet failure now has to land in, and IDLE separates
   # "ran, nothing to distil" from "ran and produced".
   _HB_CONS_ATOMS=0; _HB_CONS_DFAIL=0; _HB_CONS_IDLE=0
+  # DIVE-4284: the regrowth control's fleet numbers. ROUTED = indexes this pass
+  # brought back under the loader limit; OVER = indexes still over it afterwards,
+  # i.e. still being loaded with their TAIL dropped. OVER is the one that matters:
+  # it is the 24-hours-later number DIVE-4222's saving evaporated against.
+  _HB_CONS_ROUTED=0; _HB_CONS_OVER=0
   [[ "${MEMORY_CONSOLIDATE:-on}" == "off" ]] && return 0
   local every="${MEMORY_CONSOLIDATE_EVERY_MIN:-${_HB_CONSOLIDATE_EVERY_MIN}}"
   [[ "$every" =~ ^[0-9]+$ ]] && (( every > 0 )) || every="$_HB_CONSOLIDATE_EVERY_MIN"
@@ -5442,6 +5447,16 @@ _hb_memory_consolidate_sweep() {
     fi
     [[ "$n_dfail" =~ ^[0-9]+$ ]] || n_dfail=0
     [[ "$n_proc"  =~ ^[0-9]+$ ]] || n_proc=0
+    # DIVE-4284 index regrowth, read from the same envelope. Booleans, so the
+    # `pick` helper's `select(. != null)` is what keeps a `false` from reading as
+    # absent — and an ABSENT field (a seat still on a pre-4284 binary) counts as
+    # neither bucket, because "no answer" is not "index fine" and must not be a
+    # fleet alarm either.
+    local n_routed n_over
+    n_routed=$(jq -s -r "$jf pick(\"index_rerouted\")"         <<<"$out" 2>/dev/null) || n_routed=""
+    n_over=$(jq -s -r "$jf pick(\"index_still_over_limit\")"    <<<"$out" 2>/dev/null) || n_over=""
+    [[ "$n_routed" == "true" ]] && _HB_CONS_ROUTED=$((_HB_CONS_ROUTED + 1)) || :
+    [[ "$n_over"   == "true" ]] && _HB_CONS_OVER=$((_HB_CONS_OVER + 1)) || :
     _HB_CONS_ATOMS=$((_HB_CONS_ATOMS + n_atoms))
     if (( n_dfail > 0 )); then
       _HB_CONS_DFAIL=$((_HB_CONS_DFAIL + 1))
@@ -5537,8 +5552,10 @@ cmd_heartbeat_tick() {
   _hb_memory_consolidate_sweep "$now" || _hb_log "[memory-consolidate] pass errored (non-fatal)"
   # DIVE-3711: the atom count leads, because it is the only number here that can
   # be zero when the pipeline is dead. Every other field is an attempt count.
-  (( ${_HB_CONS_RAN:-0} || ${_HB_CONS_FAILED:-0} || ${_HB_CONS_DFAIL:-0} || ${_HB_CONS_IDLE:-0} )) \
-    && _hb_log "[memory-consolidate] ${_HB_CONS_ATOMS:-0} atom(s) from ${_HB_CONS_RAN:-0} seat(s), ${_HB_CONS_DFAIL:-0} distiller-failed, ${_HB_CONS_FAILED:-0} could not run, ${_HB_CONS_IDLE:-0} nothing to distil, ${_HB_CONS_SKIPPED:-0} not due" || true
+  # DIVE-4284: ROUTED/OVER join the guard so an index event alone still logs —
+  # a seat with nothing to distil can still be the seat whose index is truncated.
+  (( ${_HB_CONS_RAN:-0} || ${_HB_CONS_FAILED:-0} || ${_HB_CONS_DFAIL:-0} || ${_HB_CONS_IDLE:-0} || ${_HB_CONS_ROUTED:-0} || ${_HB_CONS_OVER:-0} )) \
+    && _hb_log "[memory-consolidate] ${_HB_CONS_ATOMS:-0} atom(s) from ${_HB_CONS_RAN:-0} seat(s), ${_HB_CONS_DFAIL:-0} distiller-failed, ${_HB_CONS_FAILED:-0} could not run, ${_HB_CONS_IDLE:-0} nothing to distil, ${_HB_CONS_SKIPPED:-0} not due; index: ${_HB_CONS_ROUTED:-0} re-routed under limit, ${_HB_CONS_OVER:-0} STILL OVER" || true
   # DIVE-3343: there is NO per-TASK budget sweep here any more, and its absence
   # is deliberate — see the block above _hb_loop_ceiling_sweep's neighbours in
   # this file for why the figure it enforced could not be attributed to a row.

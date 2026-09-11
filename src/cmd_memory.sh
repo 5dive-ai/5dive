@@ -134,6 +134,16 @@ _memory_usage() {
       failure, or a pass that legitimately found nothing durable, still exits 0.
       In --json, `ok` mirrors that. Read the atom count, never the exit code, if
       what you want to know is whether anything was produced.
+      REGROWTH CONTROL (DIVE-4284): every pass re-checks MEMORY.md against the
+      loader limit and RE-INVOKES `memory router --write` when it is over —
+      unconditionally, not only when atoms were written, because the growth comes
+      from `memory add` between passes. Hand-written lines between the
+      router:keep markers survive; nothing is deleted; the old index is backed
+      up. An index the router cannot bring under the limit is LOUD on stderr and
+      carried in --json (`index_over_limit`, `index_rerouted`,
+      `index_still_over_limit`) — it is never silently retried away. Without this
+      the router was a one-shot: the DIVE-4222 compaction was 30-91% regrown 4.5
+      hours later. --dry-run reports what it WOULD re-route and touches nothing.
       Idempotent: a ledger (.consolidated.tsv beside the store) records each
       (session, byte count), and `add` refuses a slug that already exists — so a
       re-run is a no-op even if the ledger is lost.
@@ -151,6 +161,22 @@ _memory_usage() {
       seat per day, and a seat with no NEW finished transcript costs $0 (the
       ledger short-circuits before the distiller is ever invoked). Lower it
       further with --max-chars, or point --distiller at a cheaper model.
+
+  5dive memory size [--agent=<name>|--all] [--root=<dir>] [--strict] [--json]
+      Bytes / limit / over-or-under for every always-loaded MEMORY.md. The one
+      number nothing on the box used to print: an index PAST the loader limit is
+      loaded with its TAIL dropped and no error, which is how a 367 KB index sat
+      on one seat for weeks (DIVE-4222). Reports every store under the home, not
+      just the one `consolidate` picks — a seat loads whichever matches its cwd.
+        --all     every seat on the box (per-user 0600: root, else the others
+                  are reported UNREADABLE, never counted as under)
+        --strict  exit 3 if any index is over the limit or unreadable, so a cron
+                  line or a check can branch on it. Default exit is 0: a read is
+                  a read.
+      The limit is the loader's, 24400 B (override: FIVEDIVE_MEMORY_INDEX_LIMIT).
+      The router regenerates to a LOWER budget, 20000 B (override:
+      FIVEDIVE_MEMORY_ROUTER_BUDGET), so a fresh index has headroom before it is
+      over anything again — the two numbers are not the same number.
 
   5dive memory check [--roots=a,b] [--store=all|mine|wiki] [--agent=<name>]
                      [--slug=<slug>]... [--timeout=SEC] [--dry-run] [--json]
@@ -180,6 +206,38 @@ _memory_usage() {
 Searches the agent's own ~/.claude/projects/*/memory stores (+ the shared wiki
 when present) unless --roots/--store/--agent narrow it.
 EOF
+}
+
+# DIVE-4284 — the two numbers, in one place, because they are NOT the same number
+# and conflating them is what made the DIVE-4222 compaction a one-shot.
+#
+#   LIMIT  = the loader's ceiling on an always-loaded file. Past it the harness
+#            drops the TAIL and says nothing, so the oldest atoms in the index
+#            stop existing with no error line anywhere. It is a property of the
+#            loader, not a preference.
+#   BUDGET = what `memory router` regenerates TO. Deliberately under the limit,
+#            so a freshly-routed index has headroom to absorb the next few
+#            `memory add` appends before it is over anything.
+#
+# Measured (DIVE-4222, 2026-09-10): main's index was router-generated on
+# 2026-09-03 under this same 20,000 B budget and reached 50,569 B seven days
+# later purely through post-generation appends the router never saw again. A
+# correct initial budget is therefore not a control; something has to re-check.
+_MEM_INDEX_LIMIT_DEFAULT=24400
+_MEM_ROUTER_BUDGET_DEFAULT=20000
+
+# Both overridable for tests and for a box whose loader limit differs. A junk
+# override falls back to the default rather than disabling the check — an
+# unparseable limit must never read as "no limit".
+_memory_index_limit() {
+  local v="${FIVEDIVE_MEMORY_INDEX_LIMIT:-$_MEM_INDEX_LIMIT_DEFAULT}"
+  [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -gt 0 ] || v="$_MEM_INDEX_LIMIT_DEFAULT"
+  printf '%s\n' "$v"
+}
+_memory_router_budget() {
+  local v="${FIVEDIVE_MEMORY_ROUTER_BUDGET:-$_MEM_ROUTER_BUDGET_DEFAULT}"
+  [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -gt 0 ] || v="$_MEM_ROUTER_BUDGET_DEFAULT"
+  printf '%s\n' "$v"
 }
 
 # Root helpers (DIVE-897): own stores, another agent's stores, the shared wiki.
@@ -1686,6 +1744,57 @@ _memory_consolidate() {
     fi
   done < <(ls -1t "$HOME"/.claude/projects/*/*.jsonl 2>/dev/null)
 
+  # DIVE-4284 — THE REGROWTH CONTROL. `memory router` was a one-shot: a task
+  # rediscovered the problem, compacted eight seats, and 4.5 hours later the
+  # files were already 30-91% regrown (quinn's measurement on DIVE-4222). The
+  # growth does not come from this pass — it comes from every `memory add`
+  # between passes, which is why the check is UNCONDITIONAL here and not gated on
+  # having written an atom: a seat that distilled nothing can still be over the
+  # limit because its author appended twenty lines by hand.
+  #
+  # Over-limit is measured against the LOADER's limit and regenerated to the
+  # router's BUDGET, deliberately lower, so the next appends have headroom and
+  # this does not re-fire on every pass.
+  #
+  # Known residual: if the router cannot get under the limit even at its floor
+  # (a huge hand-written router:keep block), each pass re-runs it and leaves
+  # another MEMORY.md.pre-router-* backup. That case is LOUD on stderr rather
+  # than silently retried away, because an index nothing can shrink is an
+  # operator decision about the keep block, not a thing this pass may fix.
+  local idx="$dir/MEMORY.md"
+  local idx_limit idx_budget
+  idx_limit=$(_memory_index_limit)
+  idx_budget=$(_memory_router_budget)
+  local idx_before=0 idx_after=0 idx_rerouted=false idx_over=false idx_still_over=false
+  idx_before=$(stat -c %s "$idx" 2>/dev/null || echo 0)
+  idx_after="$idx_before"
+  if [ "$idx_before" -gt "$idx_limit" ]; then
+    idx_over=true
+    if [ "$dry" -eq 1 ]; then
+      idx_still_over=true
+      (( JSON_MODE )) || echo "  index: ${idx_before} B is over the ${idx_limit} B loader limit — would re-invoke the router (budget ${idx_budget}); dry run, not touched"
+    else
+      # A subshell + `|| rc=$?`: `_memory_router` can `fail` (no node, an
+      # unwritable store), and that must not take the consolidate pass with it —
+      # atoms already landed. Same errexit-safe form as the parse call above.
+      local rout="" rrc=0
+      rout=$( _memory_router --root="$dir" --budget="$idx_budget" --write 2>&1 ) || rrc=$?
+      idx_after=$(stat -c %s "$idx" 2>/dev/null || echo "$idx_before")
+      if [ "$rrc" -eq 0 ] && [ "$idx_after" -le "$idx_limit" ]; then
+        idx_rerouted=true
+        (( JSON_MODE )) || echo "  index: was ${idx_before} B, over the ${idx_limit} B loader limit — router re-invoked → ${idx_after} B (budget ${idx_budget}); hand edits between the router:keep markers carried over"
+      else
+        idx_still_over=true
+        [ "$idx_after" -le "$idx_limit" ] || idx_rerouted=false
+        # Never silent, and never folded into the atom counts: an index the
+        # router could not bring under the limit is loaded TRUNCATED at every
+        # session start, which is the whole defect this row exists to remove.
+        echo "  INDEX OVER LIMIT: ${idx} is ${idx_after} B against a ${idx_limit} B loader limit and the router did not bring it under (rc ${rrc}) — the TAIL of this index is being dropped at every session load, with no error. Run \`5dive memory router --write\` and check the router:keep block." >&2
+        [ -n "$rout" ] && printf '%s\n' "$rout" | sed 's/^/    router: /' >&2 || :
+      fi
+    fi
+  fi
+
   # DIVE-3711: a pass in which EVERY attempted distillation failed wrote nothing,
   # and must not exit 0. The old contract — rc 0 whatever happened — is exactly
   # what let the heartbeat log "13 seat(s) distilled" every 6h for four days
@@ -1705,11 +1814,19 @@ _memory_consolidate() {
        --argjson live "$skipped_live" --argjson done "$skipped_done" \
        --argjson dfail "$distill_failed" \
        --argjson ok "$([ "$pass_rc" -eq 0 ] && echo true || echo false)" \
+       --argjson ibefore "$idx_before" --argjson iafter "$idx_after" \
+       --argjson ilimit "$idx_limit" --argjson ibudget "$idx_budget" \
+       --argjson iover "$idx_over" --argjson irouted "$idx_rerouted" \
+       --argjson istill "$idx_still_over" \
        --arg store "$dir" --arg ledger "$ledger" --argjson dry "$([ "$dry" -eq 1 ] && echo true || echo false)" \
       '{ok:$ok, data:{store:$store, ledger:$ledger, dry_run:$dry, considered:$considered,
         processed:$processed, atoms_written:$written, atoms_refused:$refused,
         atoms_duplicate:$dupes, skipped_live:$live, skipped_consolidated:$done,
-        distiller_failed:$dfail}}'
+        distiller_failed:$dfail,
+        index_bytes_before:$ibefore, index_bytes_after:$iafter,
+        index_limit:$ilimit, index_router_budget:$ibudget,
+        index_over_limit:$iover, index_rerouted:$irouted,
+        index_still_over_limit:$istill}}'
   else
     echo "consolidate: $processed session(s) distilled → $written atom(s) into $dir"
     echo "  skipped: $skipped_live live (touched < ${idle_min}m ago) · $skipped_done already consolidated · $dupes duplicate atom(s)"
@@ -1846,7 +1963,7 @@ MEMGETJS
 # the newest atoms; the other N-hundred stay on disk, unchanged, reachable
 # through `memory search --index` + `memory get`. NOTHING is deleted.
 _memory_router() {
-  local root="" agent="" budget=20000 recent=20 write=0
+  local root="" agent="" budget="" recent=20 write=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --root=*)    root="${1#*=}" ;;
@@ -1860,6 +1977,10 @@ _memory_router() {
     shift
   done
   require_node "memory router"
+  # DIVE-4284: one definition of the budget, shared with the regrowth control in
+  # `memory consolidate` — a re-invoke that regenerated to a different number
+  # than a hand run would is two controls, not one.
+  [ -n "$budget" ] || budget=$(_memory_router_budget)
   if [ -z "$root" ]; then
     # Own (or --agent's) primary store = the one with the most atoms.
     local cand best="" bestn=-1 n
@@ -2016,6 +2137,154 @@ MEMROUTERJS
   node "$js" --root="$root" --budget="$budget" --recent="$recent" --write="$write"
 }
 
+# memory size — DIVE-4284 item 3: the READ that makes the regrowth visible.
+#
+# The silent tail-drop hid a 367 KB index on one seat for weeks (DIVE-4222)
+# because nothing on the box ever printed the one number that mattered. This
+# prints bytes / limit / over-or-under per always-loaded index, so the hourly
+# count, `agent list` and a cron line can all consume the same answer.
+#
+# It reads EVERY store under the home, not just the one `consolidate` picks: a
+# seat with two project dirs loads whichever matches its cwd, so a check that
+# looked at one of them would pass while the loaded one was truncated.
+_memory_size() {
+  local agent="" all=0 strict=0 root=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --agent=*)  agent="${1#*=}" ;;
+      --root=*)   root="${1#*=}" ;;
+      --all)      all=1 ;;
+      --strict)   strict=1 ;;
+      -h|--help)  _memory_usage; return 0 ;;
+      *)          fail "$E_USAGE" "memory size: unknown argument: $1" ;;
+    esac
+    shift
+  done
+  [ "$all" -eq 1 ] && [ -n "$agent" ] && fail "$E_USAGE" "memory size: --all and --agent are exclusive"
+
+  local limit; limit=$(_memory_index_limit)
+  local budget; budget=$(_memory_router_budget)
+
+  # Candidate index files, one per line, plus the homes we could not even look
+  # inside — kept apart so the second can never be mistaken for the first.
+  local -a idxs=() blind_homes=()
+  local f
+  if [ -n "$root" ]; then
+    idxs=("$root/MEMORY.md")
+  elif [ "$all" -eq 1 ]; then
+    # Every home on the box. Per-user stores are 0600, so a non-root caller sees
+    # only its own — reported as unreadable rather than skipped, because
+    # "0 seats over" from a caller that could not look is the DIVE-4222 defect.
+    # A home whose stores cannot even be ENUMERATED (0700, a non-root caller)
+    # yields nothing from the glob, and a silent nothing is exactly the "0 over"
+    # a caller who could not look must never be handed. Such a home is carried in
+    # its OWN list, not as a synthetic path in `idxs` — a fabricated path would
+    # fall through the loop's "does this file exist" test and land in the
+    # no-index-yet bucket, i.e. it would report a home it could not open as a
+    # home with nothing in it. That is the fail-open this whole read exists to
+    # remove. FIVEDIVE_HOMES_ROOT is the test seam; the fleet path is /home.
+    local h
+    for h in "${FIVEDIVE_HOMES_ROOT:-/home}"/*; do
+      [ -d "$h/.claude/projects" ] || continue
+      local got=0
+      while IFS= read -r f; do idxs+=("$f"); got=1; done < <(ls -1 "$h"/.claude/projects/*/memory/MEMORY.md 2>/dev/null)
+      if [ "$got" -eq 0 ] && [ ! -r "$h/.claude/projects" ]; then
+        blind_homes+=("$h")
+      fi
+    done
+  else
+    local d
+    local IFS=,
+    for d in $(_memory_own_roots "$agent"); do idxs+=("$d/MEMORY.md"); done
+    unset IFS
+  fi
+  [ "${#idxs[@]}" -gt 0 ] || [ "${#blind_homes[@]}" -gt 0 ] || fail "$E_NOT_FOUND" "no always-loaded memory index found${agent:+ for agent '$agent'} (looked for ~/.claude/projects/*/memory/MEMORY.md)"
+
+  local rows="" n_over=0 n_seen=0 n_unreadable=0 n_missing=0
+  for h in "${blind_homes[@]:-}"; do
+    [ -n "$h" ] || continue
+    n_unreadable=$((n_unreadable+1))
+    local bseat; bseat=$(basename "$h"); bseat="${bseat#agent-}"
+    rows+=$(printf '%s\t%s\t%s\t-1\t0\tfalse\n' "$bseat" "$h/.claude/projects" "(stores not enumerable)")$'\n'
+  done
+  for f in "${idxs[@]:-}"; do
+    [ -n "$f" ] || continue
+    local store; store=$(dirname "$f")
+    # <home>/.claude/projects/<slug>/memory — FOUR levels up is the home, and the
+    # home's basename is the seat. Three levels reaches `.claude`, which is what
+    # every row was labelled before this was measured against a real store.
+    local seat; seat=$(basename "$(dirname "$(dirname "$(dirname "$(dirname "$store")")")")"); seat="${seat#agent-}"
+    # A store with NO index yet is not an unreadable index. Conflating the two
+    # makes --strict red on a brand-new store and buries a REAL unreadable one in
+    # noise — measured on this seat, which has three index-less project dirs.
+    if [ ! -e "$f" ]; then
+      n_missing=$((n_missing+1)); continue
+    fi
+    if [ ! -r "$f" ]; then
+      n_unreadable=$((n_unreadable+1))
+      rows+=$(printf '%s\t%s\t%s\t-1\t0\tfalse\n' "$seat" "$store" "$f")$'\n'
+      continue
+    fi
+    n_seen=$((n_seen+1))
+    local bytes; bytes=$(stat -c %s "$f" 2>/dev/null || echo 0)
+    local atoms; atoms=$(find "$store" -maxdepth 1 -name '*.md' ! -name 'MEMORY.md' 2>/dev/null | wc -l)
+    local routed=false
+    grep -q '<!-- router:generated -->' "$f" 2>/dev/null && routed=true
+    [ "$bytes" -gt "$limit" ] && n_over=$((n_over+1))
+    rows+=$(printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$seat" "$store" "$f" "$bytes" "$atoms" "$routed")$'\n'
+  done
+
+  if (( JSON_MODE )); then
+    printf '%s' "$rows" | jq -R -s --argjson limit "$limit" --argjson budget "$budget" \
+      --argjson over "$n_over" --argjson unreadable "$n_unreadable" \
+      --argjson missing "$n_missing" '
+      { ok: true, data: {
+          limit: $limit, router_budget: $budget, over_limit: $over,
+          unreadable: $unreadable, no_index: $missing,
+          indexes: [ split("\n")[] | select(length > 0) | split("\t")
+            | { agent: .[0], store: .[1], index: .[2],
+                bytes: (.[3]|tonumber), atoms: (.[4]|tonumber),
+                router_generated: (.[5] == "true"),
+                readable: ((.[3]|tonumber) >= 0),
+                over: ((.[3]|tonumber) > $limit),
+                over_by: (if (.[3]|tonumber) > $limit then (.[3]|tonumber) - $limit else 0 end) } ] } }'
+  else
+    echo "memory index size — limit ${limit} B (past it the loader drops the TAIL, with no error); router regenerates to ${budget} B"
+    echo ""
+    local seat store idx bytes atoms routed
+    while IFS=$'\t' read -r seat store idx bytes atoms routed; do
+      [ -n "${seat:-}" ] || continue
+      if [ "$bytes" -lt 0 ]; then
+        printf '  %-6s %-10s %s\n' "?" "$seat" "unreadable (per-user 0600 — run as that seat, or as root): $idx"
+        continue
+      fi
+      if [ "$bytes" -gt "$limit" ]; then
+        printf '  %-6s %-10s %8s B / %s B  OVER BY %s  %s atoms  %s%s\n' \
+          "OVER" "$seat" "$bytes" "$limit" "$((bytes - limit))" "$atoms" "$store" \
+          "$([ "$routed" = true ] && echo " (router-generated, regrown since)" || echo " (flat index — never routed)")"
+      else
+        printf '  %-6s %-10s %8s B / %s B  %s atoms  %s\n' "under" "$seat" "$bytes" "$limit" "$atoms" "$store"
+      fi
+    done <<< "$rows"
+    echo ""
+    if [ "$n_over" -gt 0 ]; then
+      echo "  ${n_over} of ${n_seen} index(es) OVER the limit — each is being loaded TRUNCATED at every session start." >&2
+      echo "  Fix: 5dive memory router --write   (or --agent=<seat> --write as root; hand edits between the router:keep markers survive, nothing is deleted)" >&2
+    fi
+    [ "$n_unreadable" -gt 0 ] && echo "  ${n_unreadable} index(es) could not be read — this is NOT a clean result." >&2 || :
+    [ "$n_missing" -gt 0 ] && echo "  ${n_missing} store(s) have no MEMORY.md yet (nothing to load, nothing to check)." || :
+  fi
+
+  # --strict makes this a CHECK a cron line / selfcheck can branch on. Default
+  # stays 0 so the read is a read: a plain `memory size` in a pipeline must not
+  # abort the pipeline for reporting the truth it was asked for.
+  if [ "$strict" -eq 1 ] && { [ "$n_over" -gt 0 ] || [ "$n_unreadable" -gt 0 ]; }; then
+    mark_reported
+    return "$E_VALIDATION"
+  fi
+  return 0
+}
+
 cmd_memory() {
   local sub="${1:-}"; shift 2>/dev/null || true
   case "$sub" in
@@ -2026,6 +2295,7 @@ cmd_memory() {
     check)       _memory_check "$@" ;;
     doctor|hygiene) _memory_doctor "$@" ;;
     consolidate|distill) _memory_consolidate "$@" ;;
+    size|index-size) _memory_size "$@" ;;
     ""|-h|--help) _memory_usage ;;
     *)           _memory_usage; fail "$E_USAGE" "memory: unknown subcommand: $sub" ;;
   esac

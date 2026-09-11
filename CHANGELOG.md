@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased — feat(memory): the router re-invokes itself, and an over-limit index stops being silent (DIVE-4284)
+
+DIVE-4222 compacted eight seats' `MEMORY.md` routers — one of them from 367 KB — and 4.5 hours
+later they were 30-91% regrown. The router was a one-shot: nothing re-ran it, and past the loader's
+~24.4 KB limit an always-loaded file is loaded with its **TAIL dropped and no error**, so the oldest
+facts in it simply stop existing. Measured again on this box while building the fix: one seat's
+index, router-generated on 2026-09-01, was back to 104,811 B — 4.3x the limit.
+
+- **`memory consolidate` re-checks the index every pass and re-invokes `memory router --write`
+  when it is over the limit.** Unconditional, not gated on having distilled anything: the growth
+  comes from `memory add` between passes, so a seat that distilled nothing can still be the seat
+  whose index is truncated. Lines between the `router:keep` markers are carried over, the old file
+  is backed up, nothing is deleted.
+- **Two numbers, not one.** The LIMIT (24,400 B) is the loader's ceiling; the BUDGET (20,000 B) is
+  what the router regenerates to, deliberately lower so a fresh index has headroom before it is
+  over anything again. Both are one definition now (`FIVEDIVE_MEMORY_INDEX_LIMIT`,
+  `FIVEDIVE_MEMORY_ROUTER_BUDGET`), shared by the verb and the re-invoke.
+- **An index the router cannot shrink is LOUD**, on stderr and in `--json`
+  (`index_over_limit`, `index_rerouted`, `index_still_over_limit`) — never silently retried away.
+  The heartbeat's `[memory-consolidate]` line now carries the fleet counts, and "still over" is the
+  number that matters 24 hours after a compaction.
+- **`5dive memory size`** — bytes / limit / over-or-under per always-loaded index, `--all` for the
+  box, `--strict` to exit 3 so a cron line can branch on it. It reports every store under the home
+  (a seat loads whichever matches its cwd), and an index it could NOT read is its own bucket: a
+  checker that silently skips what it cannot open prints "0 over" and is wrong in exactly the way
+  this row exists to fix.
+- **The loader side fails loud**: the SessionStart hook warns, in the very context that lost the
+  tail, that the index was truncated and that an empty search is not evidence of absence.
+
 ## Unreleased — feat(self-update): the update path checks the box it just updated still runs an agent (DIVE-4068)
 
 0.26.1 shipped a launcher that could not start any agent (DIVE-4067). The nightly installs the
