@@ -8,9 +8,12 @@
 #     manifest declares is not in PLUGIN_GRANTS. Nothing in CI ever ran
 #     `plugin add` on a bundled plugin, so a plugin that cannot be installed
 #     shipped green.
-#   * #808 — the `distribution` team template was in team-templates/index.json
-#     but not in install.sh's staging list, so `team import distribution`
-#     resolved to nothing on a real box while every unit test passed.
+#   * #808 — the `distribution` team template was in the team index but not in
+#     install.sh's staging list, so `team import distribution` resolved to
+#     nothing on a real box while every unit test passed. (DIVE-4196 deleted
+#     that staging list: templates now come from the registry. The arm below is
+#     re-pointed at the registry and still grades the same question — every
+#     advertised slug resolves on a fresh box.)
 # tests/plugin_contract_unit.sh set-compares install.sh's staged FILE list
 # against what plugins/ contains. That is a filename comparison; it cannot see
 # that the file it certifies as present refuses to install.
@@ -27,7 +30,13 @@
 #                  that would drift is the registry's, not ours: a plugin
 #                  PUBLISHED there is graded on a fresh box the day it lands,
 #                  with no edit here and no CLI release.
-#   * templates <- team-templates/index.json (same).
+#   * templates <- the LIVE registry index, <org>/character-packs teams/index.json,
+#                  fetched inside the container (DIVE-4196). Same move, one repo
+#                  over. It is FETCHED rather than mounted because the registry
+#                  is now the only declaration there is: mounting a checkout copy
+#                  would grade a file no customer reads. This arm is therefore
+#                  ONLINE by design, and a fetch failure is a FAIL, never a skip
+#                  — "could not ask" must not report as "clean".
 #   * verbs     <- the INSTALLED BUNDLE's own dispatch table. Not src/main.sh:
 #                  reading the artifact means a verb that exists in source but
 #                  did not survive build.sh is a red, not a blind spot.
@@ -37,7 +46,8 @@
 # the box made for itself. Reading the box's own copy would make the box its own
 # examiner: a plugin the box failed to fetch would simply not be enumerated, and
 # #808 would pass again. For plugins that outside copy is the registry's
-# published manifest; for templates it is still this checkout's index.json.
+# published manifest; for templates it is the registry index fetched over the
+# network inside the container — neither is read out of $LIB_DIR.
 #
 # WHY scripts/ AND NOT tests/. Every tests/*.sh is a corpus harness: CLAUDE.md
 # makes it `core` tier by default and scripts/run-harnesses.sh globs the
@@ -50,7 +60,6 @@
 # RUN IT:
 #   docker run --rm -v $PWD/scripts/install-contract.sh:/contract.sh:ro \
 #     -v $PWD/5dive-plugins-marketplace.json:/manifests/marketplace.json:ro \
-#     -v $PWD/team-templates/index.json:/manifests/team-index.json:ro \
 #     --entrypoint /bin/bash 5dive-smoke /contract.sh
 set -uo pipefail
 
@@ -215,9 +224,16 @@ fi
 # parses" without provisioning agents — which on a container would need a
 # harness binary and a credential, and would grade the agent-create path this
 # job already covers elsewhere.
-INDEX="$MANIFEST_DIR/team-index.json"
+# DIVE-4196 — fetched, not mounted: the registry IS the source of truth now.
+# TEAM_REGISTRY_INDEX is overridable so a fork or a test can point it elsewhere.
+TEAM_REGISTRY_INDEX="${TEAM_REGISTRY_INDEX:-https://raw.githubusercontent.com/${FIVE_GH_ORG:-5dive-ai}/character-packs/main/teams/index.json}"
+INDEX="$(mktemp)"
+if ! curl -fsSL --max-time 30 "$TEAM_REGISTRY_INDEX" -o "$INDEX" \
+   || ! jq -e '.companies | type == "array" and length > 0' "$INDEX" >/dev/null 2>&1; then
+  rm -f "$INDEX"; INDEX="/nonexistent-registry-index"
+fi
 if [[ ! -f "$INDEX" ]]; then
-  bad_t "T3 preconditions" "team registry not mounted at $INDEX"
+  bad_t "T3 preconditions" "could not read the team registry index at $TEAM_REGISTRY_INDEX (fetch failed or malformed). NOT a skip: an unreadable registry is exactly what a customer's failed import looks like."
 else
   mapfile -t SLUGS < <(jq -r '.companies[].slug' "$INDEX")
   (( ${#SLUGS[@]} > 0 )) || bad_t "T3 preconditions" "index.json declares no companies"
@@ -232,7 +248,7 @@ else
     # grading the TEMPLATE rather than that gap.
     out=$(TEAM_AUTH_PROFILE=__install_contract__ timeout 60 "$FIVE" --json team ps "$s" </dev/null 2>&1); rc=$?
     if (( rc != 0 )); then
-      bad_t "T3a $s: 5dive team ps $s" "rc=$rc — $(printf '%s' "$out" | tail -3 | tr '\n' ' ') (a slug in team-templates/index.json that install.sh did not stage looks exactly like this — #808)"
+      bad_t "T3a $s: 5dive team ps $s" "rc=$rc — $(printf '%s' "$out" | tail -3 | tr '\n' ' ') (a slug the registry advertises that the installed CLI cannot resolve looks exactly like this — #808)"
       continue
     fi
     ok_t "T3a $s: template resolves and parses on the installed box"
@@ -240,7 +256,7 @@ else
     if [[ "$got" == "$want" ]]; then
       ok_t "T3b $s: roster is $got agents, matching the registry"
     else
-      bad_t "T3b $s: roster matches the registry" "registry says $want agents, the staged spec parses to ${got:-<unparseable>} — the two halves of one template have drifted"
+      bad_t "T3b $s: roster matches the registry" "registry says $want agents, the fetched spec parses to ${got:-<unparseable>} — the two halves of one template have drifted"
     fi
   done
 fi

@@ -395,6 +395,44 @@ _hb_autosleep_sweep() {
   return 0
 }
 
+# DIVE-4214: drain the a2a spool. A send to a seat that was mid-attempt was
+# written to /home/agent-<name>/.5dive/a2a-queue instead of being typed into the
+# running turn (see the queue block in cmd_agent_runtime.sh); this is the other
+# half — the seat's next idle, which is also its next wake, since a woken seat is
+# idle before its first turn.
+#
+# ONE MESSAGE PER SEAT PER TICK, and that is the design, not a throttle. Typing
+# the second message straight after the first would land it inside the turn the
+# first just started — the exact defect. So the flush re-asks the idle question
+# every tick and a backlog drains one message per idle observation.
+#
+# ORDERED BEFORE THE AUTOSLEEP SWEEP in the tick: a seat with mail waiting must
+# not be stopped with it still spooled. The spool survives a stop (it is a file
+# in the seat's home), but the seat would then sleep until something else woke
+# it, which turns a queued message into an indefinitely deferred one.
+#
+# Same isolation contract as every other sweep — a failure here must NEVER abort
+# the wake loop.
+_HB_A2A_FLUSHED=0
+_hb_a2a_queue_sweep() {
+  local reg name depth
+  _HB_A2A_FLUSHED=0
+  declare -F a2a_queue_flush_one >/dev/null 2>&1 || return 0
+  reg=$(registry_read) || return 0
+  for name in $(jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null); do
+    depth=$(_a2a_queue_depth "$name")
+    [[ "$depth" =~ ^[0-9]+$ ]] || continue
+    (( depth > 0 )) || continue
+    systemctl is-active --quiet "5dive-agent@${name}.service" 2>/dev/null || continue
+    if a2a_queue_flush_one "$name"; then
+      _HB_A2A_FLUSHED=$((_HB_A2A_FLUSHED + 1))
+      _hb_log "[$name] delivered 1 queued a2a message at idle (${depth} were spooled)"
+    fi
+  done
+  (( _HB_A2A_FLUSHED > 0 )) && _hb_log "[a2a-queue] pass done — ${_HB_A2A_FLUSHED} delivered"
+  return 0
+}
+
 _hb_log() { printf '%s [heartbeat] %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
 
 _hb_usage() {
@@ -1984,8 +2022,16 @@ _hb_ident() {
 #   * WHERE status='todo' AND kind='standard' — never stomps a row something else
 #     already moved between the wake and this stamp, and never touches a
 #     recurring TEMPLATE (starting one silently retires it, DIVE-2055/2059);
-#   * started_at=COALESCE(started_at, ...) — same idempotence as `task start`, so
-#     an agent that DOES run `task start` afterwards is a no-op, not a re-clock.
+#   * started_at=datetime('now') — a claim is only ever made from `todo`, and a
+#     todo row has NO live attempt, so the clock is the claim's, not an older one's.
+#     DIVE-4253: it used to be COALESCE(started_at, now), which kept the started_at
+#     a gate-answered row carried back from its previous attempt (`task need` ->
+#     blocked -> answer -> todo clears nothing). The next claim then inherited an
+#     hours-old clock and _hb_reclaim reaped it on its FIRST tick — measured
+#     2026-09-10: DIVE-4218 claimed 22:30:21Z, reaped 22:35:09Z; DIVE-4214 gate
+#     answered 22:28:11Z, reaped 22:30:13Z. One wasted attempt per gated row.
+#     `task start` on an already-in_progress row stays a no-op (it COALESCEs on
+#     in_progress only), so the DIVE-2244 idempotence arm still holds.
 #
 # Returns nonzero when the claim did not land, so the caller can say so out loud
 # rather than logging a claim it never made. Never exits: the agent is already
@@ -1998,7 +2044,7 @@ _hb_claim_task() {
   # blindness this column exists to remove. Seeded from started_at too, so a row
   # already claimed when this ships keeps its real start.
   db "UPDATE tasks SET status='in_progress',
-        started_at=COALESCE(started_at, datetime('now')),
+        started_at=datetime('now'),
         first_started_at=COALESCE(first_started_at, started_at, datetime('now')),
         updated_at=datetime('now')
       WHERE id=${id} AND status='todo' AND kind='standard';" 2>/dev/null || return 1
@@ -2625,7 +2671,10 @@ _hb_reclaim() {
         #
         # (2) started_at SURVIVED THE PAUSE, and every path back to `todo`
         # COALESCEs it: cmd_task_unblock sets status only, cmd_task_start is
-        # `started_at=COALESCE(started_at, datetime('now'))`. So an unblocked row
+        # `started_at=COALESCE(started_at, datetime('now'))`. (DIVE-4253 later made
+        # the dispatcher claim and `task start` stamp a FRESH clock on any start
+        # from todo, so this clear is now belt-and-braces, not the only defence;
+        # it stays — a pause that hands back a stale clock is still wrong.) So an unblocked row
         # re-entered in_progress carrying a timestamp from hours earlier,
         # `age_min >= budget` was true immediately, and it was reaped on the
         # FIRST tick after the unblock — it never got its ${budget} minutes.
@@ -5429,6 +5478,11 @@ cmd_heartbeat_tick() {
   # agents after the idle threshold. Isolated like every other sweep — a failure
   # here must NEVER abort the wake loop (the heartbeat-never-woke bug class). No-op
   # unless at least one agent is opt-in wake_mode=cold.
+  # DIVE-4214: drain a2a messages spooled while the seat was mid-attempt. BEFORE
+  # the autosleep pass, so a seat with mail waiting is not stopped with it still
+  # spooled. Same isolation contract — a failure here must never abort the wake
+  # loop.
+  _hb_a2a_queue_sweep || _hb_log "[a2a-queue] pass errored (non-fatal)"
   _hb_autosleep_sweep "$now" || _hb_log "[autosleep] pass errored (non-fatal)"
   # DIVE-3173: fire any restart `self-update` deferred because the agent was
   # holding an in_progress row. This tick is where the TASK BOUNDARY is observed
@@ -5545,8 +5599,36 @@ cmd_heartbeat_tick() {
         sk_notdue=$((sk_notdue + 1)); _hb_log "[$name] not due ($(( (lastRun + everyMin*60 - now + 59) / 60 ))m left)"; continue
       fi
     fi
+    # DIVE-4261 — A GRADE THIS SEAT CANNOT MERGE IS NOT WORK IN PROGRESS.
+    # After `task verify` PASS the row stays status=in_progress with
+    # assignee=<the grader>, and the merge is owed by a different seat (the
+    # board paints it graded->merge:<owner>). Counted raw, every such row reads
+    # as this seat being busy, so a grader holding one grade it has already
+    # passed is busy-skipped on EVERY tick until some other seat presses the
+    # button -- measured 2026-09-11 00:55-01:05Z, quinn logged
+    # "busy -- 1 in_progress, skip" each tick while sitting at an empty prompt
+    # with 4 graded->merge rows and nothing it could act on; ops the same hour.
+    # That is the maker-side wedge DIVE-4206 fixed, arriving from the grader
+    # side: there the reclaimer drops the stale claim, but a GRADER's claim is
+    # not stale -- it is the record of who graded -- so it must not be
+    # reclaimed, only discounted here.
+    #
+    # SCOPED TO OTHER SEATS' MERGES, exactly like the picker clause and the
+    # reclaimer's merge_elsewhere column: when the owner IS this seat the merge
+    # is its next move, the picker will hand the row back, and it is correctly
+    # busy. The owner expression is the board's, character for character, so
+    # the busy guard, the picker and the board cannot disagree about whose move
+    # a row is.
+    #
+    # NO BACKTICKS AND NO DOUBLE QUOTES IN THIS COMMENT -- the whole statement
+    # below is one double-quoted bash string (the trap already recorded on the
+    # picker and reclaimer queries).
     local inprog
-    inprog=$(db "SELECT COUNT(*) FROM tasks WHERE assignee=$(sqlq "$name") AND status='in_progress';" 2>/dev/null || echo 0)
+    inprog=$(db "SELECT COUNT(*) FROM tasks
+                  WHERE assignee=$(sqlq "$name") AND status='in_progress'
+                    AND NOT ( (${_TASKS_TFV_SQL})
+                              AND COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''),
+                                           COALESCE(assignee,'?')) <> $(sqlq "$name") );" 2>/dev/null || echo 0)
     if [[ "${inprog:-0}" != "0" ]]; then
       sk_busy=$((sk_busy + 1)); _hb_log "[$name] busy — $inprog in_progress, skip"; continue
     fi

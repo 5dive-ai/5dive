@@ -653,6 +653,22 @@ USAGE
     echo >&2
   fi
 
+  # --- DIVE-4251: the box's verification default, stamped at provisioning ---
+  # `delivered-only` for a NEW customer box (main's recommendation, 2026-09-10):
+  # code that ships gets graded, and knowledge/ops/coordination rows do not book a
+  # grader session each. Written ONLY when nothing has chosen yet, so re-running
+  # `init` never overwrites a customer's own answer.
+  #
+  # NOT retroactive, deliberately: an existing box has no box.json and
+  # `box_verify_policy` reads that absence as `always`, which is the behaviour it
+  # already had. A default that reaches back over installed boxes would silently
+  # remove grading from fleets that were relying on it — ours included.
+  if [[ ! -e "$(_box_config_path)" ]]; then
+    cmd_box_config "verify=delivered-only" >/dev/null 2>&1 \
+      && _init_note "Verification: this box grades deliveries that ship code (5dive config verify=always|delivered-only|never)." \
+      || true
+  fi
+
   # --- Step 8: next steps ---
   echo >&2
   _init_ok "$name is ready"

@@ -1450,6 +1450,38 @@ _task_roster_unestablished_note() {
   return 0
 }
 
+# _task_lane_asleep_note <name> <flag> — WARN, never refuse, when the row is
+# being addressed to a registered seat whose heartbeat is off (DIVE-4269).
+#
+# WHY A WARNING AND NOT A REFUSAL. "Registered" and "woken by the tick" are two
+# different things and only the first was ever checked here, so `task assign
+# <id> <seat>` reported success over a seat nothing iterates — "assign to a seat"
+# silently meant "never", which is how a customer box reached 65 rows that no
+# tick would ever reach. But a human-driven seat is a LEGITIMATE target: a person
+# reads that board and works those rows. Refusing would break the deliberate case
+# to protect the accidental one. So the verb still succeeds and the line says
+# which of the two the caller just chose, with the one command that changes it.
+#
+# `task doctor` reports the same condition per row (dead-lane) after the fact;
+# this is the same predicate at the moment the row is addressed, which is the
+# only moment the caller is in a position to pick a different seat.
+_task_lane_asleep_note() {
+  local name="${1:-}" flag="${2:-}" rc=0
+  [[ -n "$name" ]] || return 0
+  # The doctor helper is the SINGLE source of "would the tick ever wake this"
+  # (it reproduces the tick's own `heartbeat.enabled == true` population). A
+  # second copy of that rule here is exactly how the picker and the report came
+  # to disagree in the first place. Absent (routing.sh sourced alone in a unit
+  # harness) -> say nothing rather than guess.
+  declare -F _task_doctor_lane_wakeable >/dev/null 2>&1 || return 0
+  _task_doctor_lane_wakeable "$name" && rc=0 || rc=$?
+  # rc 2 is "could not read the registry" — not a finding. Same degrade rule the
+  # doctor lane check uses: never turn "could not measure" into "it is dead".
+  [[ "$rc" == "1" ]] || return 0
+  warn "${flag:-<agent>}='${name}' is a registered seat that NOTHING WAKES — its heartbeat is off, so the tick never iterates it and no row addressed to it is ever picked up on its own. This is fine if a human drives '${name}'; if it is meant to run itself, enrol it: sudo 5dive heartbeat on ${name}   (board-wide view: 5dive task doctor)"
+  return 0
+}
+
 # _task_require_lane <name> <flag> — REFUSE a name that is not a dispatchable
 # lane. Callers pass the flag spelling the user typed so the refusal is actionable.
 _task_require_lane() {
@@ -1457,7 +1489,7 @@ _task_require_lane() {
   [[ -n "$name" ]] || return 0
   _task_roster
   [[ "$_TASK_ROSTER_STATE" == "ok" ]] || { _task_roster_unestablished_note "$name"; return 0; }
-  if _task_roster_has "$name"; then return 0; fi
+  if _task_roster_has "$name"; then _task_lane_asleep_note "$name" "$flag"; return 0; fi
   # The sentinel gets its own refusal: it is a legal created_by, so "not a
   # registered agent" would read as a contradiction to anyone who has seen it in
   # that column.

@@ -177,7 +177,9 @@ OUT=$(file_gate DIVE-110 dev --type=approval --tier=2 --ask="$ASK_MISS")
   || bad_t "C1 --tier=2 must not route" "routed_reviewer='$(reviewerof DIVE-110)'"
 
 seed DIVE-111 'gate routing bug report' dive-3224-inbox
-OUT=$(file_gate DIVE-111 dev --type=approval --ask="Push the branch and approve the \$900 vercel invoice?")
+# DIVE-4175 arm C: the reserved class is reached by DECLARATION now, not by a
+# substring of the ask. The outcome asserted below is unchanged.
+OUT=$(file_gate DIVE-111 dev --type=approval --needs=spend_authority --ask="Push the branch and approve the \$900 vercel invoice?")
 [[ -z "$(reviewerof DIVE-111)" ]] \
   && ok_t "C2 the T2 category floor still wins on a bound row (money)" \
   || bad_t "C2 floored gate must not route" "routed_reviewer='$(reviewerof DIVE-111)'; out=$OUT"
@@ -253,9 +255,14 @@ OUT=$(file_gate DIVE-131 main --type=approval --ask="$ASK_MISS")
   || bad_t "E2 must not offer the re-word remedy to the root" "out=$OUT"
 
 seed DIVE-132 'gate routing bug report'
-OUT=$(file_gate DIVE-132 dev --type=approval --ask="approve the \$5000 ad spend budget?")
-[[ "$OUT" == *"NOT ROUTED"* && "$OUT" == *"T2 category floor"* ]] \
-  && ok_t "E3 a floored gate says so (human-only by class, not an accident)" \
+# DIVE-4175 arm C: the reserved class is reached by DECLARATION now, not by a
+# substring of the ask. The outcome asserted below is unchanged.
+OUT=$(file_gate DIVE-132 dev --type=approval --needs=spend_authority --ask="approve the \$5000 ad spend budget?")
+# DIVE-4175 arm C: the cause named is now the DECLARATION, not the keyword floor.
+# The property is unchanged and is the whole point of E3 — a human-only gate says
+# WHY it is human-only, so the filer can tell "by class" from "by accident".
+[[ "$OUT" == *"NOT ROUTED"* && "$OUT" == *"capability was declared"* && "$OUT" == *"spend_authority"* ]] \
+  && ok_t "E3 a human-only-by-class gate names its cause (arm C: the declaration)" \
   || bad_t "E3 floored cause must be named" "out=$OUT"
 
 seed DIVE-133 'gate routing bug report'

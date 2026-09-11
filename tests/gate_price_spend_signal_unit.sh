@@ -210,21 +210,33 @@ _prov=$(db "SELECT COALESCE(floor_provenance,'') FROM tasks WHERE ident='DIVE-40
 
 db "INSERT INTO tasks (ident, title, status, created_by) VALUES
      ('DIVE-4091','pro plan repricing','todo','main');"
+# DIVE-4175 arm C: this suite's subject is the price/spend SIGNAL — whether the
+# predicate can tell a commercial call from a row about /models. That question is
+# untouched: `floor_provenance` still records the axis and the term. What the tier
+# can no longer show is whether the signal REACHED a person, so the two halves are
+# now asserted separately — the signal off the stamp, the reach off the declaration.
 ( cmd_task_need DIVE-4091 --type=decision --ask="should we raise prices on the pro plan" \
   --options="A|B" --recommend="A" ) >/dev/null 2>&1
-_tier=$(db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='DIVE-4091';")
-[[ "$_tier" == "2" ]] \
-  && ok_t "T7 e2e: a real repricing decision still floors to tier 2" \
-  || bad_t "T7 e2e repricing floor" "got tier $_tier — a commercial price call stopped reaching a person"
+_prov=$(db "SELECT COALESCE(floor_provenance,'') FROM tasks WHERE ident='DIVE-4091';")
+[[ "$_prov" == axis=ask* ]] \
+  && ok_t "T7 e2e: a real repricing decision is still DETECTED as a price call ($_prov)" \
+  || bad_t "T7 e2e repricing floor" "got provenance '$_prov' — a commercial price call stopped being detected at all"
+db "INSERT INTO tasks (ident, title, status, created_by) VALUES
+     ('DIVE-4095','pro plan repricing','todo','main');"
+( cmd_task_need DIVE-4095 --type=decision --needs=spend_authority --ask="should we raise prices on the pro plan" \
+  --options="A|B" --recommend="A" ) >/dev/null 2>&1
+[[ "$(db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='DIVE-4095';")" == "2" ]] \
+  && ok_t "T7 e2e: a DECLARED repricing decision reaches a person (tier 2)" \
+  || bad_t "T7 e2e repricing declared" "got tier $(db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='DIVE-4095';")"
 
 db "INSERT INTO tasks (ident, title, status, created_by) VALUES
      ('DIVE-4092','ads budget','todo','main');"
 ( cmd_task_need DIVE-4092 --type=decision --ask='approve $500 for the ads campaign' \
   --options="A|B" --recommend="A" ) >/dev/null 2>&1
-_tier=$(db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='DIVE-4092';")
-[[ "$_tier" == "2" ]] \
-  && ok_t "T7 e2e: a real spend still floors to tier 2 (negative control)" \
-  || bad_t "T7 e2e spend floor" "got tier $_tier"
+_prov=$(db "SELECT COALESCE(floor_provenance,'') FROM tasks WHERE ident='DIVE-4092';")
+[[ "$_prov" == axis=ask* ]] \
+  && ok_t "T7 e2e: a real spend is still DETECTED (negative control, $_prov)" \
+  || bad_t "T7 e2e spend floor" "got provenance '$_prov'"
 
 db "INSERT INTO tasks (ident, title, status, created_by) VALUES
      ('DIVE-4093','key rotation','todo','main');"

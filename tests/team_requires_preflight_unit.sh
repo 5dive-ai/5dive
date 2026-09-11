@@ -23,7 +23,7 @@ trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 SRC="$ROOT/src/cmd_compose.sh"
-TPL="$ROOT/team-templates/deploy-team.5dive.yaml"
+TPL="$ROOT/tests/fixtures/team-templates/deploy-team.5dive.yaml"
 TMP="$(mktemp -d)"
 
 pass=0; fail=0
@@ -248,10 +248,10 @@ pins() { ( set -uo pipefail; . "$TMP/req.sh"; _compose_spec_pins_auth_profile "$
   && ok_t 'T16e the production auth-profile predicate was extracted — T16/T16n are not grading a missing function' \
   || bad_t 'T16e _compose_spec_pins_auth_profile was not extracted from the source; T16/T16n are vacuous' ''
 
-if pins "$ROOT/team-templates/eng-studio.5dive.yaml" && ! pins "$TPL"; then
+if pins "$ROOT/tests/fixtures/team-templates/eng-studio.5dive.yaml" && ! pins "$TPL"; then
   ok_t 'T16 the inert-flag guard separates a template that pins an account from one that does not'
 else
-  bad_t 'T16 the --auth-profile guard cannot distinguish the two template shapes' "eng=$(pins "$ROOT/team-templates/eng-studio.5dive.yaml" && echo yes || echo no) deploy=$(pins "$TPL" && echo yes || echo no)"
+  bad_t 'T16 the --auth-profile guard cannot distinguish the two template shapes' "eng=$(pins "$ROOT/tests/fixtures/team-templates/eng-studio.5dive.yaml" && echo yes || echo no) deploy=$(pins "$TPL" && echo yes || echo no)"
 fi
 printf 'version: "2"\n# mentions ${TEAM_AUTH_PROFILE} only in a comment\nagents:\n  a:\n    type: claude\n' > "$TMP/comment-only.yaml"
 pins "$TMP/comment-only.yaml" \
@@ -271,7 +271,7 @@ fi
 
 # Registry parity: `5dive team ls` reads the directory, but the marketplace
 # index is what the dashboard renders. A template absent from it is invisible.
-idx="$ROOT/team-templates/index.json"
+idx="$ROOT/tests/fixtures/team-templates/index.json"
 if jq -e '.companies[] | select(.slug == "deploy-team")' "$idx" >/dev/null 2>&1; then
   ok_t 'T15 deploy-team is listed in the marketplace index'
   isize=$(jq -r '.companies[] | select(.slug=="deploy-team") | .size' "$idx")
@@ -284,7 +284,7 @@ if jq -e '.companies[] | select(.slug == "deploy-team")' "$idx" >/dev/null 2>&1;
     && ok_t 'T15b the index roster names the same four seats as the template' \
     || bad_t 'T15b index roster drifted from the template' "index=$ikeys template=$tkeys"
 else
-  bad_t 'T15 deploy-team is missing from team-templates/index.json — invisible to the marketplace' ''
+  bad_t 'T15 deploy-team is missing from the team index fixture — invisible to the marketplace' ''
 fi
 
 echo "-----"

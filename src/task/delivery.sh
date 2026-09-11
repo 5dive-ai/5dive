@@ -154,6 +154,39 @@ cmd_task_deliver() {
   local _vfier _asignee
   _vfier=$(db "SELECT COALESCE(verifier,'')  FROM tasks WHERE id=${id};")
   _asignee=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
+  # DIVE-4251: `verify=delivered-only` — THIS is the moment the box said a grader
+  # is warranted. The row was filed without one because at `task add` there was no
+  # delivery to judge; binding a PR is what makes it "code that ships". Attaching
+  # here, after delivery_ref is written, is what makes `bound=1` true for the
+  # resolver — the ordering is load-bearing, not incidental.
+  #
+  # Only when the row has NO verifier: an explicitly wired grader is never
+  # replaced, and a row the customer opted out of (`--no-verify`) is not
+  # re-attached behind their back — `_task_verify_grants` answers both.
+  if [[ -z "$_vfier" ]] && _task_verify_grants "$id"; then
+    local _dl_grader; _dl_grader=$(_task_default_verifier "$_asignee" "")
+    if [[ -n "$_dl_grader" ]]; then
+      local _dl_title; _dl_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
+      db "UPDATE tasks
+             SET verifier=$(sqlq "$_dl_grader"),
+                 acceptance_criteria=COALESCE(acceptance_criteria, $(sqlq "Deliverable meets the intent of: ${_dl_title}. Maker records in the done result WHAT was built and HOW it was checked; ${_dl_grader} confirms against this before the task closes."))
+           WHERE id=${id};"
+      _vfier="$_dl_grader"
+      warn "$ident: grader attached at delivery (verify=$(box_verify_policy), DIVE-4251) — this row ships code, so a grader session will grade it. '5dive config verify=never' or 'task add --no-verify' opts out."
+    fi
+  fi
+  # DIVE-4251: the box may grant no grader at all (verify=never, or a row's
+  # --no-verify). Then the delivery is RECORDED and the handoff degrades to the
+  # non-routing arm below, which leaves the row in_progress for its own close —
+  # rather than routing it to a grader the customer is not paying for.
+  if [[ -n "$_vfier" && "$_vfier" != "$_asignee" ]] && ! _task_verify_grants "$id"; then
+    warn "$ident: delivery recorded, grading handoff DECLINED (verify=$(box_verify_policy), DIVE-4251) — the grader named on the row is '$_vfier', but this box's verification policy grants this row no grader session, so it is not routed and no grader is spawned. It stays with '$_asignee' to close. Change the box with '5dive config verify=always', or file the row with --verify."
+    (( want_result )) && db "UPDATE tasks SET result=$(sqlq_or_null "$result") WHERE id=${id};"
+    ok "$ident delivered ($pr) — recorded; not routed for grading (verify=$(box_verify_policy))" \
+       '{id:($i|tonumber), ident:$id, deliveryRef:$p, delivered:true, routedTo:null, gradingDeclined:true, verifyPolicy:$vp, status:"in_progress"}' \
+       --arg i "$id" --arg id "$ident" --arg p "$pr" --arg vp "$(box_verify_policy)"
+    return 0
+  fi
   if [[ -n "$_vfier" && "$_vfier" != "$_asignee" ]]; then
     # Hand off to the verifier exactly like a maker's `task done` (DIVE-477).
     # DIVE-2682: the trailing 1 stamps delivery_ref_iteration alongside the bump —

@@ -24,6 +24,28 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # DIVE-4237 — MAKE THE HEAD SHA AN OBJECT BEFORE ANYTHING DIFFS IT.
+      # actions/checkout gets a PR's tree from `refs/pull/<n>/merge`, and GitHub
+      # rebuilds that ref whenever the base branch moves. A run started in that
+      # window finds it missing, and checkout falls back to the base branch
+      # SILENTLY — so `pull_request.head.sha` below names no object and every
+      # `git` call in this job dies with exit 128 before it grades anything.
+      # `refs/pull/<n>/head` is the PR branch's own tip: written when the author
+      # pushes, never recomputed against the base. Measured on 5dive-api#153,
+      # same head, same workflow, 59 minutes apart — one run got the merge ref
+      # and one got heads+tags only. The script REFUSES if it cannot, which is
+      # the point: a job that cannot read the change must not report on it.
+      - name: Materialise the PR head (DIVE-4237)
+        if: github.event_name == 'pull_request'
+        env:
+          # The `if:` above already keeps this step off `merge_group`, but
+          # tests/merge_queue_triggers_unit.sh arm3 is a TEXT grep over the file
+          # and cannot see a step-level condition. Use the branching idiom the
+          # rest of this repo uses, so the expression is safe on either event.
+          HEAD_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: bash scripts/pr-head-ref.sh --sha="$HEAD_SHA" --pr="$PR_NUMBER"
+
       - name: Scan for denylisted PII
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}

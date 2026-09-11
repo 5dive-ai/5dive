@@ -617,29 +617,35 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# TEMPLATE ARM — scope item 4: the path must be exercised by a bundled template,
-# not only by a future one.
+# TEMPLATE ARM — scope item 4: the path must be exercised by a REAL shipped
+# template, not only by a future one.
+#
+# DIVE-4196 moved the shipped templates to the registry repo, so these two arms
+# read tests/fixtures/team-templates/ — real v2 specs kept locally so a unit test
+# stays deterministic and offline. They grade the PARSER against a real spec;
+# whether the catalogue is complete and self-consistent is graded in the registry
+# repo by scripts/check-teams.sh. See the fixture dir's README.
 # ---------------------------------------------------------------------------
 _tpl_with_loops=0
-for f in "$ROOT"/team-templates/*.5dive.yaml; do
+for f in "$ROOT"/tests/fixtures/team-templates/*.5dive.yaml; do
   [[ -f "$f" ]] || continue
   TEAM_AUTH_PROFILE=x parse "$f" 2>/dev/null | jq -e '[.agents[] | (.loops // []) | length] | add > 0' >/dev/null 2>&1 \
     && _tpl_with_loops=$((_tpl_with_loops+1))
 done
 (( _tpl_with_loops > 0 )) \
-  && ok_t "T15 $_tpl_with_loops bundled template(s) declare real loops — the path ships exercised, not theoretical" \
-  || bad_t 'T15 no bundled template declares a loop — every import still lands an idle roster' ''
+  && ok_t "T15 $_tpl_with_loops shipped template(s) declare real loops — the path ships exercised, not theoretical" \
+  || bad_t 'T15 no shipped template declares a loop — every import still lands an idle roster' ''
 
-# And every bundled template must still parse: `loops:` is additive, so a template
+# And every shipped template must still parse: `loops:` is additive, so a template
 # that never gained one must be byte-for-byte unaffected.
 _tpl_bad=0
-for f in "$ROOT"/team-templates/*.5dive.yaml; do
+for f in "$ROOT"/tests/fixtures/team-templates/*.5dive.yaml; do
   [[ -f "$f" ]] || continue
   TEAM_AUTH_PROFILE=x parse "$f" >/dev/null 2>&1 || { _tpl_bad=$((_tpl_bad+1)); echo "   parse failed: $f"; }
 done
 (( _tpl_bad == 0 )) \
-  && ok_t 'T16 every bundled template still parses — the addition is purely additive' \
-  || bad_t "T16 $_tpl_bad bundled template(s) no longer parse" ''
+  && ok_t 'T16 every shipped template still parses — the addition is purely additive' \
+  || bad_t "T16 $_tpl_bad shipped template(s) no longer parse" ''
 
 echo "-----"
 echo "compose_loops_unit: $pass passed, $fail failed"

@@ -91,6 +91,7 @@ CORE_FILES=(
   src/lib/reap.sh
   src/lib/registry.sh
   src/lib/agent_env.sh
+  src/lib/verify_policy.sh
   src/lib/tasks_db.sh
   src/lib/runs.sh
   src/lib/actor.sh
@@ -124,6 +125,7 @@ LAZY_FILES=(
   src/cmd_watch.sh
   src/cmd_compose.sh
   src/cmd_whoami.sh
+  src/cmd_box_config.sh
   src/task/dispatch.sh
   src/task/routing.sh
   src/task/crud.sh

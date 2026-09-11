@@ -5629,9 +5629,57 @@ cmd_council() {
   local sub="${1:-}"; [[ $# -gt 0 ]] && shift || true
   case "$sub" in
     ""|-h|--help|help) _council_help; return 0 ;;
-    convene|schedule|bench|init|lineage|veto|gate-clear|rot-triage|roster|log|record|verify|promote|demote|expel|amend|sign-vote|verify-votes|ballot-tap) ;;
+    convene|schedule|bench|init|lineage|veto|gate-clear|rot-triage|roster|log|record|verify|promote|demote|expel|amend|sign-vote|verify-votes|ballot-tap|floor-diff) ;;
     *) fail "$E_USAGE" "unknown council command: $sub (try: 5dive council --help)" ;;
   esac
+
+  # DIVE-4175: SEAL-TIME DIFF. The loader REPLACES the shipped floor with the
+  # constitution's, it does not union them — so ratifying a document silently
+  # repeals every default it forgot to restate, and nothing says so. Measured on
+  # this host 2026-09-09: the sealed `hard_gates` omit `€[0-9]` and
+  # `drop[^.]{0,20}table`, both present in the shipped floor, so a euro-denominated
+  # spend ask and a `drop … table` ask reach no tier-2 text floor at all. Nobody
+  # chose that; it is the gap between two lists meant to be the same list, and it
+  # went unnoticed for as long as the seal has stood.
+  #
+  # REPORTING ONLY. It changes no gating and takes no view on which list is right —
+  # the terms are the constitution's to set, and closing the gap by unioning them
+  # back in would change what the seal enforces without anybody deciding to. It
+  # only makes the difference visible, at the moment an amendment is being prepared
+  # rather than a year later.
+  if [[ "$sub" == "floor-diff" ]]; then
+    local _live_rx _ship_rx _t _miss_c=0 _miss_s=0
+    _live_rx="$(_council_hard_gate_rx 2>/dev/null || printf '')"
+    _ship_rx="${_GATE_T2_FLOOR_RX:-}"
+    if [[ -z "$_ship_rx" ]]; then
+      warn "the shipped floor is not in scope in this build — nothing to compare against"; return 0
+    fi
+    if [[ -z "$_live_rx" || "$_live_rx" == "null" ]]; then
+      ok "no sealed hard-gate regex is in force — the shipped floor IS the policy, nothing to diff"
+      return 0
+    fi
+    # STRIP THE GROUPING PARENS BEFORE COMPARING. The loader joins the constitution's
+    # named classes as `(classA)|(classB)|...`, so a bare `tr '|'` split yields `(spend`
+    # and `pricing)` — boundary terms then match nothing and the report names nine
+    # terms as repealed that are plainly present. Caught by running it: the answer was
+    # already known behaviourally (only `€[0-9]` and `drop…table` actually miss), so a
+    # report that disagreed with the measurement was the report being wrong.
+    _norm() { printf '%s' "$1" | tr '|' '\n' | sed -e 's/^(*//' -e 's/)*$//' | grep -v '^$'; }
+    printf 'terms in the SHIPPED floor but NOT in the sealed constitution (silently repealed):\n'
+    while IFS= read -r _t; do
+      [[ -n "$_t" ]] || continue
+      case "|$(_norm "$_live_rx" | tr '\n' '|')|" in *"|$_t|"*) ;; *) printf '  - %s\n' "$_t"; _miss_c=$(( _miss_c + 1 )) ;; esac
+    done < <(_norm "$_ship_rx")
+    (( _miss_c )) || printf '  (none)\n'
+    printf 'terms in the sealed constitution but NOT in the shipped floor (org additions):\n'
+    while IFS= read -r _t; do
+      [[ -n "$_t" ]] || continue
+      case "|$(_norm "$_ship_rx" | tr '\n' '|')|" in *"|$_t|"*) ;; *) printf '  - %s\n' "$_t"; _miss_s=$(( _miss_s + 1 )) ;; esac
+    done < <(_norm "$_live_rx")
+    (( _miss_s )) || printf '  (none)\n'
+    printf 'repealed=%s added=%s\n' "$_miss_c" "$_miss_s"
+    return 0
+  fi
 
   local dir; dir="$(mktemp -d -t 5dive-council.XXXXXX)" || fail "$E_GENERIC" "mktemp failed"
   # shellcheck disable=SC2064
