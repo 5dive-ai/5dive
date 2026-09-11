@@ -133,92 +133,52 @@ seedplain() { db "INSERT INTO tasks(ident,title,status,created_by,assignee)
 # only floor term ('secret') is NARRATION of the subsystem under test.
 SCOPE_ASK="Does acceptance criterion 3 require covering the secret-drop delivery path, or is the fence enough for this iteration?"
 
-# ============================================================================
-# DIVE-4175 arm C — DIVE-2012's DEFECT IS FIXED AT SOURCE, SO THE ARMS MOVED.
-#
-# The dead-end this file grades was: a scoping ask NARRATES the subsystem under
-# test, the keyword floor fires on the narration, the gate goes to tier 2,
-# DIVE-1495's verifier-route (guarded on `tier != 2`) never runs, routed_reviewer
-# stays NULL, and the one agent who could answer is locked out while the human is
-# paged for a call that was never theirs.
-#
-# Arm C deletes the promoter. The narration no longer promotes anything, so the
-# verifier-route runs and the gate lands on the VERIFIER — which is the outcome
-# DIVE-2012's whole apparatus (a warning plus a `--discusses` appeal) existed to
-# reach by hand. Arms 1-2 therefore no longer assert the repro; they assert that
-# the repro's ask now produces the destination, because a repro arm for a defect
-# that cannot occur grades nothing.
-#
-# THE DEAD-END WARNING IS NOW UNREACHABLE BY CONSTRUCTION, and that is a proof
-# rather than an observation. Its guard (need.sh:2513) requires
-# `tier_floored==1 && type=="decision" && _needs_human==0 && tier_arg!="2"`. After
-# arm C the only writers of `tier_floored=1` are `type==secret` (excluded by the
-# `decision` clause), `--needs=<human capability>` (excluded by `_needs_human==0`),
-# a pinned `--tier=2` (excluded by `tier_arg`), and the DIVE-2241 re-assert, which
-# fires only when `_needs_human==1`. No input satisfies all four clauses. Every
-# `! warned "CANNOT clear it"` arm below is therefore VACUOUSLY true now — they are
-# kept because they were the safety arms and their prose still binds, but they can
-# no longer distinguish anything, and each says so. The non-vacuous assertions are
-# the routing ones.
-#
-# WHAT STILL HAS AN OBSERVABLE, measured here rather than assumed: the STRUCTURAL
-# discriminator does (arms 13-14 — a loop routes to the verifier, a non-loop and a
-# self-filed gate route to the lead), and the DECLARATION does (arm 11). What does
-# NOT is DIVE-2089's `--discusses` appeal: arm 3's row is byte-identical to arm 1's,
-# asserted as an equality in arm 3b. That is DIVE-4232's evidence, and the mechanism
-# code is left in place, untouched, per the 2026-09-10 gate answer.
-# ============================================================================
-
-# --- 1-2: THE REPRO'S ASK NOW REACHES THE VERIFIER --------------------------
+# --- 1: THE REPRO — floored, human pinged, routed_reviewer NULL ---------------
 reset; seedloop DIVE-921
 actor_seam_as dev; cmd_task_need DIVE-921 --type=decision --from=dev \
   --ask="$SCOPE_ASK" --options="split|keep" --recommend="split" 2>"$ERR" >/dev/null
-[[ "$(tierof DIVE-921)" == "1" ]] && ok_t "repro fixed: the verifier-scoping ask is no longer promoted by its narration" || bad_t "repro no longer floors" "got tier '$(tierof DIVE-921)'"
-[[ "$HUMAN_PINGED" == "0" ]] && ok_t "repro fixed: the paired human is NOT pinged for a call that was never theirs" || bad_t "repro human not pinged" "HUMAN_PINGED=$HUMAN_PINGED"
-[[ "$(routedof DIVE-921)" == "olivia" ]] && ok_t "repro fixed: routed_reviewer=olivia — the designated answerer HAS standing (DIVE-1495 runs)" || bad_t "repro routed verifier" "got '$(routedof DIVE-921)' — expected the verifier"
-# The floor PREDICATE is untouched by arm C; only the promotion left. Read it off
-# the stamp, so this arm still reds if the term list or the axis split regresses.
-[[ "$(db "SELECT COALESCE(floor_provenance,'') FROM tasks WHERE ident='DIVE-921';")" == axis=ask* ]] \
-  && ok_t "repro fixed: the floor still MATCHED the narration (stamp kept, promotion gone)" \
-  || bad_t "repro prov" "got '$(db "SELECT COALESCE(floor_provenance,'') FROM tasks WHERE ident='DIVE-921';")'"
+[[ "$(tierof DIVE-921)" == "2" ]] && ok_t "repro: verifier-scoping ask floors to tier 2" || bad_t "repro tier 2" "got '$(tierof DIVE-921)'"
+[[ "$HUMAN_PINGED" == "1" ]] && ok_t "repro: the paired human is pinged for a call that was never theirs" || bad_t "repro human pinged" "HUMAN_PINGED=$HUMAN_PINGED"
 
-# --- 3-5: THE REMEDY still lands on the VERIFIER (unchanged by arm C) --------
+# --- 2: the OTHER half — the designated answerer is locked out ---------------
+# routed_reviewer NULL is exactly what leaves the verifier with no standing: the
+# DIVE-1117 provenance floor refuses a non-human answer on a tier-2 gate, and the
+# designated-reviewer exception it would otherwise take is keyed on this column.
+[[ -z "$(routedof DIVE-921)" ]] && ok_t "repro: routed_reviewer NULL — the verifier has no standing to answer" || bad_t "repro routed NULL" "got '$(routedof DIVE-921)'"
+
+# --- 3-5: THE REMEDY LANDS ON THE VERIFIER, not the lead ---------------------
+# Load-bearing for shipping a warning rather than a sixth downgrade class: if the
+# appeal routed to main (the lead) this fix would be pointing at the wrong door.
 reset; seedloop DIVE-922
 actor_seam_as dev; cmd_task_need DIVE-922 --type=decision --from=dev \
   --discusses="scoping my own acceptance criteria with the verifier; no secret is handled here" \
   --ask="$SCOPE_ASK" --options="split|keep" --recommend="split" 2>"$ERR" >/dev/null
-[[ "$(tierof DIVE-922)" == "1" ]] && ok_t "remedy: the appealed scoping gate is tier 1" || bad_t "remedy tier 1" "got '$(tierof DIVE-922)'"
+[[ "$(tierof DIVE-922)" == "1" ]] && ok_t "remedy: --discusses downgrades the floored scoping gate to tier 1" || bad_t "remedy tier 1" "got '$(tierof DIVE-922)'"
 [[ "$(routedof DIVE-922)" == "olivia" ]] && ok_t "remedy: routed_reviewer=olivia (the VERIFIER, not lead main)" || bad_t "remedy routed olivia" "got '$(routedof DIVE-922)'"
 [[ "$HUMAN_PINGED" == "0" && "$(route_to)" == "olivia" ]] && ok_t "remedy: human NOT pinged; the handoff send went to olivia" || bad_t "remedy no human ping" "HUMAN_PINGED=$HUMAN_PINGED route=$(route_to)"
 
-# --- 3b: DIVE-2089's APPEAL HAS NOTHING LEFT TO APPEAL (DIVE-4232 evidence).
-#     `--discusses` exists to downgrade a gate the floor over-promoted. With no
-#     promotion there is no downgrade to perform, and arm 3's row is identical to
-#     arm 1's. Asserted as an EQUALITY on purpose: if a later change gives the
-#     appeal an observable again this goes RED and names it.
-# LIVENESS FIRST — an equality is satisfied by two EMPTY values.
-[[ -n "$(tierof DIVE-921)" && -n "$(routedof DIVE-921)" && -n "$(tierof DIVE-922)" && -n "$(routedof DIVE-922)" ]] \
-  && ok_t "DIVE-4232 liveness: both appeal-discriminator rows filed and routed (the equality below is not vacuous)" \
-  || bad_t "2089 discriminator liveness" "921(tier='$(tierof DIVE-921)' routed='$(routedof DIVE-921)') 922(tier='$(tierof DIVE-922)' routed='$(routedof DIVE-922)')"
-[[ -n "$(tierof DIVE-921)" && "$(tierof DIVE-921)" == "$(tierof DIVE-922)" && "$(routedof DIVE-921)" == "$(routedof DIVE-922)" ]] \
-  && ok_t "DIVE-4232 evidence: --discusses changes NO observable at the gate (with=$(tierof DIVE-922)/$(routedof DIVE-922), without=$(tierof DIVE-921)/$(routedof DIVE-921))" \
-  || bad_t "2089 appeal discriminator" "with(tier=$(tierof DIVE-922) routed=$(routedof DIVE-922)) != without(tier=$(tierof DIVE-921) routed=$(routedof DIVE-921)) — DIVE-2089 HAS an observable again; re-read DIVE-4232 before retiring it"
-
-# --- 6-7: THE DEAD-END ADVICE IS UNREACHABLE. There is no dead-end to announce:
-#     the filer's gate already reached the verifier in arm 1. Asserted as the
-#     OUTCOME (the advice's whole purpose was to get the filer to olivia) plus the
-#     silence, which is now true by construction — see the header proof.
+# --- 6-7: THE FIX — the dead-end announces itself and names both the verifier
+#          and the flag. Asserted on CONTENT, not on "a warning appeared": a
+#          message that fires but names the lead would be worse than silence.
 reset; seedloop DIVE-923
 actor_seam_as dev; cmd_task_need DIVE-923 --type=decision --from=dev \
   --ask="$SCOPE_ASK" --options="split|keep" --recommend="split" 2>"$ERR" >/dev/null
-[[ "$(routedof DIVE-923)" == "olivia" && "$HUMAN_PINGED" == "0" ]] \
-  && ok_t "fix superseded: the filer reaches olivia WITHOUT being advised to re-file" \
-  || bad_t "fix reaches verifier unaided" "routed='$(routedof DIVE-923)' HUMAN_PINGED=$HUMAN_PINGED"
-! warned "CANNOT clear it" \
-  && ok_t "fix superseded: no dead-end advice (VACUOUS — the guard is unreachable after arm C)" \
-  || bad_t "deadend must not fire" "stderr: $(tr '\n' ' ' <"$ERR" | tail -c 300)"
+# Pin the TARGET, not merely the presence of the name: a mutant that advised
+# re-filing to "the lead" survived an assertion that only required 'olivia' to
+# appear somewhere in the message, because the message names the verifier twice.
+# NOTE the quoting: `warned_on "..." -- "--discusses"` puts the `--` in $2, so the
+# second grep searched for "--" and matched almost anything. warned_on already
+# passes -- to grep itself; the needle goes in $2 unadorned.
+warned_on "CANNOT clear it" "routes it to olivia" && warned_on "CANNOT clear it" '--discusses="<why>"' \
+  && ok_t "fix: the advice names the VERIFIER as the re-file target and names the flag" \
+  || bad_t "fix names verifier + flag" "stderr: $(tr '\n' ' ' <"$ERR" | tail -c 300)"
+warned_on "CANNOT clear it" "matched 'secret'" \
+  && ok_t "fix: the warning names the floor term that actually fired ('secret')" \
+  || bad_t "fix names the term" "stderr: $(tr '\n' ' ' <"$ERR" | tail -c 300)"
 
-# --- 8: NEGATIVE CONTROL — an appealed gate still gets no dead-end warning.
+# --- 8: NEGATIVE CONTROL — the warning must not fire when the appeal APPLIED.
+#        Re-uses arm 3's gate: a downgraded gate is already routed to the verifier,
+#        so advising a re-file there would be noise pointing at a solved problem.
 reset; seedloop DIVE-924
 actor_seam_as dev; cmd_task_need DIVE-924 --type=decision --from=dev \
   --discusses="scoping my own acceptance criteria with the verifier" \
@@ -227,12 +187,11 @@ actor_seam_as dev; cmd_task_need DIVE-924 --type=decision --from=dev \
   && ok_t "no-op: a successfully appealed gate gets no dead-end warning" \
   || bad_t "no-op appealed gate silent" "stderr: $(tr '\n' ' ' <"$ERR" | tail -c 300)"
 
-# --- 9-10: THE APPEAL-REFUSAL PATH IS ALSO DEAD. A money ask on a loop used to be
-#     floored, appealed, and REFUSED (Rule 3: 'spend' survives the residual), and
-#     the refusal line had to name the surviving term. Nothing floors it now, so
-#     there is no appeal to refuse. What replaces the property: the ask reaches the
-#     verifier undeclared (below), and reaches the HUMAN when the filer DECLARES
-#     that it spends money (arm 11).
+# --- 9-10: THE SECOND FIX — an appeal REFUSAL names the surviving term.
+#           Before this change the line read $_dd_residual (deleted by DIVE-2224),
+#           so it printed `matched ''` and raised unbound-variable under set -u.
+#           Arm 10 is the non-vacuity arm: it asserts the refusal is not merely
+#           quiet but names the MONEY term, which is the one that survived.
 reset; seedloop DIVE-925
 actor_seam_as dev; cmd_task_need DIVE-925 --type=decision --from=dev \
   --discusses="just a design discussion" \
@@ -241,95 +200,83 @@ actor_seam_as dev; cmd_task_need DIVE-925 --type=decision --from=dev \
 ! warned "_dd_residual" \
   && ok_t "refusal: no unbound-variable error naming _dd_residual" \
   || bad_t "refusal no unbound var" "stderr: $(tr '\n' ' ' <"$ERR" | tail -c 300)"
-! warned "discusses REFUSED" \
-  && ok_t "refusal path dead: nothing floored the money ask, so the appeal had nothing to refuse" \
-  || bad_t "refusal path dead" "stderr: $(tr '\n' ' ' <"$ERR" | tail -c 300)"
+# On the REFUSAL line specifically — see warned_on. The DIVE-2012 dead-end warning
+# fires on this same gate and also names 'spend', so a file-wide grep here graded
+# the wrong writer and passed against the restored bug.
+warned_on "discusses REFUSED" "matched 'spend'" \
+  && ok_t "refusal: the REFUSAL line names the surviving term ('spend'), not ''" \
+  || bad_t "refusal names term" "stderr: $(tr '\n' ' ' <"$ERR" | tail -c 300)"
 
-# --- 11: SAFETY — a money ask on a loop reaches the HUMAN when DECLARED, and the
-#     human keeps the call: no seat is routed it. This is the arm that carries the
-#     old 'safety: money stays tier 2, unrouted' property across arm C.
-reset; seedloop DIVE-941
-actor_seam_as dev; cmd_task_need DIVE-941 --type=decision --from=dev --needs=spend_authority \
-  --ask="Should we spend \$500 on the ads test before grading criterion 3?" \
-  --options="yes|no" --recommend="no" 2>"$ERR" >/dev/null
-[[ "$(tierof DIVE-941)" == "2" && -z "$(routedof DIVE-941)" && "$HUMAN_PINGED" == "1" ]] \
-  && ok_t "safety: a DECLARED money ask on a loop stays tier 2, unrouted, and pings the human" \
-  || bad_t "safety money declared" "tier=$(tierof DIVE-941) routed='$(routedof DIVE-941)' HUMAN_PINGED=$HUMAN_PINGED"
-[[ "$(routedof DIVE-941)" != "olivia" ]] \
-  && ok_t "safety: the verifier is NOT handed a spend decision (the declaration outranks the loop route)" \
-  || bad_t "safety money not to verifier" "routed='$(routedof DIVE-941)'"
+# --- 11: SAFETY — a genuine money ask on a loop stays hard-human and gets NO
+#         dead-end advice. The advice must never read as "one flag and this
+#         reaches an agent" on the one class that may not.
+[[ "$(tierof DIVE-925)" == "2" && "$(routedof DIVE-925)" == "" ]] \
+  && ok_t "safety: money ask on a loop stays tier 2, unrouted (human keeps the call)" \
+  || bad_t "safety money tier 2" "tier=$(tierof DIVE-925) routed='$(routedof DIVE-925)'"
 
-# --- 11b: a REFUSED appeal gets no advice to re-try the flag that just refused.
-#     Kept verbatim; VACUOUS after arm C (nothing is refused any more).
+# --- 11b: THE CLAIM ARM 11 ONLY MADE IN PROSE. Its comment has always promised
+#          "gets NO dead-end advice", but it asserted tier and route only, so the
+#          advice was free to fire and did. DIVE-925 above passed --discusses and
+#          was REFUSED (Rule 3, 'spend' survives the residual); the dead-end
+#          warning then told the same filer, on the same invocation, to re-file
+#          with --discusses. That is the DIVE-2801 defect — a message recommending
+#          the remedy the code refused one line above. Grade the stderr, not the
+#          columns: two arms can agree on tier=2 and disagree about what was said.
 ! warned "CANNOT clear it" \
-  && ok_t "safety: a refused appeal gets no advice to re-try the flag (VACUOUS after arm C)" \
+  && ok_t "safety: a REFUSED appeal gets no advice to re-try the flag that just refused" \
   || bad_t "safety refused-appeal silent" "stderr: $(tr '\n' ' ' <"$ERR" | tail -c 400)"
 
-# --- 11c: THE CONTROL FOR WHAT ARM C GIVES UP. The identical money ask with
-#     nothing declared no longer reaches the human at all — it goes to the
-#     verifier. This is the loosening, recorded rather than lost.
+# --- 11c: the same class reached WITHOUT --discusses. 11b proves the advice is
+#          wrong once the appeal has spoken; this proves we do not offer it in the
+#          first place, which is the shape a filer actually hits. Separate arm
+#          because the two reach the guard by different routes (refused appeal vs
+#          never attempted) and a single fixture cannot fail for both reasons.
 reset; seedloop DIVE-931
 actor_seam_as dev; cmd_task_need DIVE-931 --type=decision --from=dev \
   --ask="Should we spend \$500 on the ads test before grading criterion 3?" \
   --options="yes|no" --recommend="no" 2>"$ERR" >/dev/null
-[[ "$(tierof DIVE-931)" == "1" && "$(routedof DIVE-931)" == "olivia" && "$HUMAN_PINGED" == "0" ]] \
-  && ok_t "arm C control: the SAME money ask UNDECLARED reaches the verifier, not the human" \
-  || bad_t "control money undeclared" "tier=$(tierof DIVE-931) routed='$(routedof DIVE-931)' HUMAN_PINGED=$HUMAN_PINGED"
+[[ "$(tierof DIVE-931)" == "2" ]] && ! warned "CANNOT clear it" \
+  && ok_t "safety: an unappealed money ask is floored silently, with no dead-end advice" \
+  || bad_t "safety plain money silent" "tier=$(tierof DIVE-931) stderr: $(tr '\n' ' ' <"$ERR" | tail -c 400)"
 
-# --- 11d: RULE 4 — no lead sits above the filer. The appeal would have refused
-#     for want of a route; the LOOP still supplies one, so the gate reaches the
-#     verifier rather than dead-ending. Property converted from 'floored silently'
-#     to 'reaches the designated answerer'.
+# --- 11d: RULE 4 — the appeal also refuses when no lead sits above the filer, so
+#          advice promising a route we cannot mint is the same defect by another
+#          cause. `main` is the org root in the fixture above (reports_to NULL),
+#          so reviewer(main) is empty. The loop is otherwise valid and floored,
+#          which is what makes this a guard on the REMEDY and not on the trigger.
 reset; seedloop DIVE-932 main
 actor_seam_as main; cmd_task_need DIVE-932 --type=decision --from=main \
   --ask="$SCOPE_ASK" --options="split|keep" --recommend="split" 2>"$ERR" >/dev/null
-[[ "$(routedof DIVE-932)" == "olivia" && "$HUMAN_PINGED" == "0" ]] \
-  && ok_t "no-lead: the loop supplies the route the org chart could not — reaches olivia" \
-  || bad_t "safety no-lead routes to verifier" "routed='$(routedof DIVE-932)' HUMAN_PINGED=$HUMAN_PINGED"
-! warned "CANNOT clear it" \
-  && ok_t "no-lead: no advice promising a route the appeal would refuse (VACUOUS after arm C)" \
-  || bad_t "safety no-lead silent" "stderr: $(tr '\n' ' ' <"$ERR" | tail -c 400)"
+[[ "$(tierof DIVE-932)" == "2" ]] && ! warned "CANNOT clear it" \
+  && ok_t "safety: no lead above the filer — no advice promising a route the appeal would refuse" \
+  || bad_t "safety no-lead silent" "tier=$(tierof DIVE-932) stderr: $(tr '\n' ' ' <"$ERR" | tail -c 400)"
 
 # --- 12: SAFETY — an EXPLICIT --tier=2 is the caller's hard-human contract
-#         (DIVE-1957). Untouched by arm C: the pinned tier never came from the
-#         keyword promoter, and this arm is the proof that arm C did not widen
-#         itself into the pinned axis.
+#         (DIVE-1957). No advice, because there is nothing to appeal.
 reset; seedloop DIVE-926
 actor_seam_as dev; cmd_task_need DIVE-926 --type=decision --from=dev --tier=2 \
   --ask="$SCOPE_ASK" --options="split|keep" --recommend="split" 2>"$ERR" >/dev/null
-[[ "$(tierof DIVE-926)" == "2" && "$HUMAN_PINGED" == "1" ]] && ! warned "CANNOT clear it" \
+[[ "$(tierof DIVE-926)" == "2" ]] && ! warned "CANNOT clear it" \
   && ok_t "safety: explicit --tier=2 stays hard-human and gets no appeal advice" \
-  || bad_t "safety pinned tier 2 silent" "tier=$(tierof DIVE-926) HUMAN_PINGED=$HUMAN_PINGED stderr: $(tr '\n' ' ' <"$ERR" | tail -c 200)"
+  || bad_t "safety pinned tier 2 silent" "tier=$(tierof DIVE-926) stderr: $(tr '\n' ' ' <"$ERR" | tail -c 200)"
 
-# --- 13: STRUCTURAL DISCRIMINATOR — AND IT STILL HAS AN OBSERVABLE. Byte-identical
-#         ask to arm 1 on a task with NO loop: it routes to the LEAD (main), where
-#         the loop version routed to the VERIFIER (olivia). This is the arm that
-#         proves the trigger is the LOOP and not the vocabulary, and unlike the
-#         appeal in 3b it survives arm C intact — so DIVE-1495's verifier-route is
-#         NOT a candidate for retirement on DIVE-4232.
+# --- 13: STRUCTURAL DISCRIMINATOR — no loop on the task, no advice. This is the
+#         arm that proves the trigger is the LOOP and not the vocabulary: byte
+#         identical ask to arm 6, and it must stay silent.
 reset; seedplain DIVE-927
 actor_seam_as dev; cmd_task_need DIVE-927 --type=decision --from=dev \
   --ask="$SCOPE_ASK" --options="split|keep" --recommend="split" 2>"$ERR" >/dev/null
-[[ "$(routedof DIVE-927)" == "main" ]] \
-  && ok_t "discriminator: identical ask on a NON-loop task routes to the LEAD, not the verifier" \
-  || bad_t "discriminator non-loop routes to lead" "routed='$(routedof DIVE-927)'"
-[[ "$(routedof DIVE-927)" != "$(routedof DIVE-921)" ]] \
-  && ok_t "DIVE-4232 evidence: the LOOP discriminator DOES still change an observable (loop=$(routedof DIVE-921) vs non-loop=$(routedof DIVE-927))" \
-  || bad_t "loop discriminator" "loop and non-loop both routed to '$(routedof DIVE-927)' — the verifier-route stopped discriminating"
-! warned "CANNOT clear it" \
-  && ok_t "discriminator: a non-loop task gets no dead-end advice (VACUOUS after arm C)" \
-  || bad_t "discriminator non-loop silent" "stderr: $(tr '\n' ' ' <"$ERR" | tail -c 200)"
+[[ "$(tierof DIVE-927)" == "2" ]] && ! warned "CANNOT clear it" \
+  && ok_t "discriminator: identical ask on a NON-loop task floors silently (trigger is the loop)" \
+  || bad_t "discriminator non-loop silent" "tier=$(tierof DIVE-927) stderr: $(tr '\n' ' ' <"$ERR" | tail -c 200)"
 
 # --- 14: SELF-ROUTE — the VERIFIER filing on their own loop is not their own
-#         answerer, so the gate falls to the lead instead. Also still observable.
+#         answerer, so there is nobody to advise them to reach.
 reset; seedloop DIVE-928 olivia
 actor_seam_as olivia; cmd_task_need DIVE-928 --type=decision --from=olivia \
   --ask="$SCOPE_ASK" --options="split|keep" --recommend="split" 2>"$ERR" >/dev/null
-[[ "$(routedof DIVE-928)" != "olivia" ]] \
-  && ok_t "self-route: the verifier's own gate is not routed back to themselves (got '$(routedof DIVE-928)')" \
-  || bad_t "self-route not to self" "routed='$(routedof DIVE-928)'"
 ! warned "CANNOT clear it" \
-  && ok_t "self-route: no advice to reach themselves (VACUOUS after arm C)" \
+  && ok_t "self-route: the verifier's own gate gets no advice to reach themselves" \
   || bad_t "self-route silent" "stderr: $(tr '\n' ' ' <"$ERR" | tail -c 300)"
 
 echo

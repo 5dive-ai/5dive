@@ -118,27 +118,6 @@ askof()     { db "SELECT COALESCE(ask,'') FROM tasks WHERE ident='$1';"; }
 DESIGN_ASK="Should an agent's right to act come from the credentials it holds, or from a separately declared clearance level?"
 DESIGN_WHY="this is a data-model sizing question about how to REPRESENT credential handling; it performs no credential operation and grants nothing"
 
-# ===========================================================================
-# DIVE-4175 arm C — THE APPEAL HAS NOTHING LEFT TO APPEAL.
-#
-# `--discusses` (DIVE-2089) exists to downgrade a gate the KEYWORD FLOOR promoted
-# to tier 2 on a substring of prose. Arm C deletes that promotion, so there is no
-# promotion to appeal: every arm below that used to read `tier == 2` was reading
-# the transition, not the property.
-#
-# Each arm is converted to the OUTCOME it defends, reached by the route that
-# survives arm C — the filer DECLARING the capability (`--needs=`, DIVE-2241) —
-# and each keeps the loosening as an explicit negative control. The floor
-# PREDICATE is untouched, so any arm that only needed "this ask trips the floor"
-# now reads it off `floor_provenance`, which still records axis and term.
-#
-# THE MEASUREMENT THIS SUITE NOW CARRIES (DIVE-4232 evidence): with the promotion
-# gone, a gate filed WITH `--discusses` and the identical gate filed WITHOUT it
-# produce the same tier and the same route. The flag's only surviving trace is an
-# audit line saying the appeal was REFUSED. Asserted as an equality in arm 3b so
-# that a later change restoring an observable turns it red instead of silent.
-# The DIVE-2089 code is left in place, untouched, per the 2026-09-10 gate answer.
-# ===========================================================================
 # ---------------------------------------------------------------------------
 # 1: THE REPRO, ask axis — a design decision naming 'credential' reaches the LEAD
 route_reset; seed DIVE-401
@@ -166,35 +145,8 @@ actor_seam_as dev; cmd_task_need DIVE-402 --type=decision --from=dev \
 route_reset; seed DIVE-403
 actor_seam_as dev; cmd_task_need DIVE-403 --type=decision --from=dev \
   --ask="$DESIGN_ASK" --options="capability|clearance" --recommend="clearance" >/dev/null 2>&1
-# DIVE-4175 arm C: the guard's JOB is to prove this suite is not vacuous — that
-# the floor still FIRES on this ask, so arms 1-2 are grading something. The tier
-# can no longer show that; `floor_provenance` can, and it names the axis and term.
-[[ "$(db "SELECT COALESCE(floor_provenance,'') FROM tasks WHERE ident='DIVE-403';")" == axis=ask*term=credential* ]] \
-  && ok_t "mutation: the floor still MATCHES the ask WITHOUT --discusses (prov names axis+term)" \
-  || bad_t "mutation ask still matches" "got prov '$(db "SELECT COALESCE(floor_provenance,'') FROM tasks WHERE ident='DIVE-403';")' — the floor stopped firing and every arm above is vacuous"
-[[ "$HUMAN_PINGED" == "0" ]] && ok_t "arm C control: the undeclared design ask no longer pages the human" || bad_t "control undeclared no page" "HUMAN_PINGED=$HUMAN_PINGED"
-
-# 3b: DIVE-2089 IS INERT (DIVE-4232 evidence). Arm 1 filed this ask WITH the flag,
-#     arm 3 filed it WITHOUT. Same tier, same route. The flag's only surviving
-#     trace is the audit line in arm 13. Equality asserted on purpose: a later
-#     change that gives the appeal an observable again turns this RED.
-# LIVENESS FIRST — an equality is satisfied by two EMPTY values, and unlike arm 1
-#     DIVE-403 has no absolute tier/route assertion of its own anywhere else.
-[[ "$(tierof DIVE-403)" == "1" && "$(routedof DIVE-403)" == "main" ]] \
-  && ok_t "DIVE-4232 liveness: the unappealed gate filed and lead-routed (tier 1 -> main), so the equality below is not vacuous" \
-  || bad_t "2089 discriminator liveness" "403(tier='$(tierof DIVE-403)' routed='$(routedof DIVE-403)') — an empty or unrouted side makes the equality meaningless"
-[[ -n "$(tierof DIVE-401)" && "$(tierof DIVE-401)" == "$(tierof DIVE-403)" && "$(routedof DIVE-401)" == "$(routedof DIVE-403)" ]] \
-  && ok_t "DIVE-4232 evidence: --discusses changes NO observable at the gate (with=$(tierof DIVE-401)/$(routedof DIVE-401), without=$(tierof DIVE-403)/$(routedof DIVE-403))" \
-  || bad_t "2089 appeal discriminator" "with(tier=$(tierof DIVE-401) routed=$(routedof DIVE-401)) != without(tier=$(tierof DIVE-403) routed=$(routedof DIVE-403)) — DIVE-2089 HAS an observable again; re-read DIVE-4232 before retiring it"
-
-# 3c: AND THE HUMAN IS STILL REACHABLE — by declaration, which is the route arm C
-#     leaves standing. Non-vacuity for the whole "safety" family below.
-route_reset; seed DIVE-453
-actor_seam_as dev; cmd_task_need DIVE-453 --type=decision --from=dev --needs=human_tap \
-  --ask="$DESIGN_ASK" --options="capability|clearance" --recommend="clearance" >/dev/null 2>&1
-[[ "$(tierof DIVE-453)" == "2" && "$HUMAN_PINGED" == "1" ]] \
-  && ok_t "arm C: the SAME ask with a DECLARED capability is tier 2 and reaches the human" \
-  || bad_t "declared reaches human" "tier=$(tierof DIVE-453) HUMAN_PINGED=$HUMAN_PINGED"
+[[ "$(tierof DIVE-403)" == "2" ]] && ok_t "mutation: same ask WITHOUT --discusses still floors to tier 2" || bad_t "mutation ask tier 2" "got '$(tierof DIVE-403)'"
+[[ "$HUMAN_PINGED" == "1" ]] && ok_t "mutation: same ask WITHOUT --discusses still pings the human" || bad_t "mutation ask pings human" "HUMAN_PINGED=$HUMAN_PINGED"
 # DIVE-2224 answer A (lodar, 2026-07-28 05:32): this arm changed DISPOSITION, not
 # PURPOSE. A floor term in the TITLE with a substantive ask no longer floors -- it
 # routes to the lead stamped floored_by=title. The guard still has to prove the title
@@ -212,24 +164,16 @@ res404=$( JSON_MODE=0; cmd_task_need DIVE-404 --type=decision --from=dev \
 route_reset; seed DIVE-405
 actor_seam_as dev; cmd_task_need DIVE-405 --type=decision --from=dev \
   --ask="How should we model the credential store, and do we refund the affected customers \$500 each?" \
-  --options="A|B" --recommend="A" --needs=spend_authority >/dev/null 2>&1
-[[ "$(tierof DIVE-405)" == "2" ]] && ok_t "safety: a DECLARED money ask is tier 2, whatever else the ask says" || bad_t "safety money tier 2" "got '$(tierof DIVE-405)'"
-[[ "$HUMAN_PINGED" == "1" ]] && ok_t "safety: the declared money ask pings the human" || bad_t "safety money pings human" "HUMAN_PINGED=$HUMAN_PINGED"
-# control — the loosening: the same ask, declaring nothing, reaches the lead instead.
-route_reset; seed DIVE-465
-actor_seam_as dev; cmd_task_need DIVE-465 --type=decision --from=dev \
-  --ask="How should we model the credential store, and do we refund the affected customers \$500 each?" \
   --options="A|B" --recommend="A" --discusses="mostly a data-model question" >/dev/null 2>&1
-[[ "$(routedof DIVE-465)" == "main" && "$HUMAN_PINGED" == "0" ]] \
-  && ok_t "arm C control: the same money ask UNDECLARED lead-routes — the appeal no longer decides it" \
-  || bad_t "control money undeclared" "routed='$(routedof DIVE-465)' HUMAN_PINGED=$HUMAN_PINGED"
+[[ "$(tierof DIVE-405)" == "2" ]] && ok_t "safety: money residual refuses the appeal, stays tier 2" || bad_t "safety money tier 2" "got '$(tierof DIVE-405)'"
+[[ "$HUMAN_PINGED" == "1" ]] && ok_t "safety: money residual still pings the human" || bad_t "safety money pings human" "HUMAN_PINGED=$HUMAN_PINGED"
 
 # 5: SAFETY — the non-appealable IRREVERSIBLE-INFRA core survives any declaration.
 route_reset; seed DIVE-406
 actor_seam_as dev; cmd_task_need DIVE-406 --type=decision --from=dev \
   --ask="Model the credential lifecycle — and revoke the leaked key + move the dns record while we are here?" \
-  --options="A|B" --recommend="A" --needs=secret_provision >/dev/null 2>&1
-[[ "$(tierof DIVE-406)" == "2" && "$HUMAN_PINGED" == "1" ]] && ok_t "safety: a DECLARED irreversible-infra ask is tier 2 and reaches the human" || bad_t "safety infra tier 2" "tier='$(tierof DIVE-406)' HUMAN_PINGED=$HUMAN_PINGED"
+  --options="A|B" --recommend="A" --discusses="framing it as a lifecycle design question" >/dev/null 2>&1
+[[ "$(tierof DIVE-406)" == "2" ]] && ok_t "safety: revoke/dns residual refuses the appeal, stays tier 2" || bad_t "safety infra tier 2" "got '$(tierof DIVE-406)'"
 
 # 6: DIVE-2146 REGRESSION GUARD — an APPROVAL gate declares an ACTION, so the
 #    appeal does not exist for it. This is what makes the self-restart confirm
@@ -304,12 +248,7 @@ route_reset; seed DIVE-410
 actor_seam_as main; cmd_task_need DIVE-410 --type=decision --from=main \
   --ask="$DESIGN_ASK" --options="capability|clearance" --recommend="clearance" \
   --discusses="$DESIGN_WHY" >/dev/null 2>&1
-# DIVE-4175 arm C: the tier moved 2 -> 1, the OUTCOME did not. Nobody sits above
-# the lead, so the `_routable` backstop resolves no seat and the gate lands on the
-# paired human exactly as before. This arm never depended on the promoter.
-[[ "$HUMAN_PINGED" == "1" && -z "$(routedof DIVE-410)" ]] \
-  && ok_t "safety: lead-filed gate has no reviewer above it, so it reaches the human" \
-  || bad_t "safety lead reaches human" "tier=$(tierof DIVE-410) routed='$(routedof DIVE-410)' HUMAN_PINGED=$HUMAN_PINGED"
+[[ "$(tierof DIVE-410)" == "2" ]] && ok_t "safety: lead-filed appeal has no reviewer, stays tier 2" || bad_t "safety lead tier 2" "got '$(tierof DIVE-410)'"
 
 # 10: NO-OP — a decision the floor never touched is unchanged by the flag's absence
 #     AND by its presence (the appeal warns rather than silently re-tiering).
@@ -324,30 +263,16 @@ actor_seam_as dev; cmd_task_need DIVE-411 --type=decision --from=dev \
 route_reset; seed DIVE-412
 ann=$(cmd_task_need DIVE-412 --type=decision --from=dev \
   --ask="$DESIGN_ASK" --options="capability|clearance" --recommend="clearance" 2>&1 >/dev/null)
-# DIVE-4175 arm C: THE ANNOUNCEMENT SURVIVES, ITS THREE CLAIMS CHANGED.
-#   - "FORCED to tier 2" is retired: nothing is forced any more. What the filer
-#     must be told instead is that their wording did NOT reach a person, which is
-#     the arm below.
-#   - "--discusses" is retired as the offer: the appeal has nothing to appeal
-#     (arm 3b). The message now names `--needs=`, which is the route that works.
-#   - the anti-laundering line is retired WITH ITS INCENTIVE. It warned against
-#     rewording an ask to duck the floor; when wording no longer promotes, a
-#     reworded ask buys the filer nothing, so there is nothing to deter.
-# The MATCHED-TERM claim is unchanged and still asserted — it was always the
-# load-bearing half, and it is what makes the warning actionable.
+grep -qi "FORCED to tier 2" <<<"$ann" && ok_t "announce: the escalation is stated at file time, not left silent" || bad_t "announce states escalation" "stderr: $ann"
 grep -qi "credential" <<<"$ann" && ok_t "announce: names the MATCHED TERM ('credential'), not just 'the floor'" || bad_t "announce names term" "stderr: $ann"
-grep -qi "NOT routed to the paired human" <<<"$ann" && ok_t "announce: states the CONSEQUENCE — this wording did not reach a person" || bad_t "announce states consequence" "stderr: $ann"
-grep -q -- "--needs=" <<<"$ann" && ok_t "announce: offers the route that actually reaches a person (--needs=)" || bad_t "announce offers needs" "stderr: $ann"
-grep -q -- "--discusses" <<<"$ann" && bad_t "announce must NOT offer the inert appeal" "stderr: $ann" || ok_t "announce: does NOT offer --discusses, which would change nothing (arm 3b)"
+grep -q -- "--discusses" <<<"$ann" && ok_t "announce: offers the recorded appeal to a decision filer" || bad_t "announce offers appeal" "stderr: $ann"
+grep -qi "reword" <<<"$ann" && ok_t "announce: explicitly warns against rewording the ask (anti-laundering)" || bad_t "announce anti-laundering" "stderr: $ann"
 
 # 12: ANNOUNCE — a non-decision gate must NOT be offered an appeal it cannot use.
 route_reset; seed DIVE-413
 ann2=$(cmd_task_need DIVE-413 --type=approval --from=dev \
   --ask="Approve deleting the leaked credential from the store." 2>&1 >/dev/null)
-# DIVE-4175 arm C: same conversion. The lint is type-agnostic by construction (it
-# sits in the axis `case`, before any type branch), so an approval filer is told
-# the same true thing; and it still must not advertise an appeal approval cannot use.
-grep -qi "credential" <<<"$ann2" && ok_t "announce/approval: names the matched term on a non-decision gate too" || bad_t "announce approval names term" "stderr: $ann2"
+grep -qi "FORCED to tier 2" <<<"$ann2" && ok_t "announce/approval: still states the escalation" || bad_t "announce approval states" "stderr: $ann2"
 grep -q -- "--discusses" <<<"$ann2" && bad_t "announce/approval must NOT advertise --discusses" "stderr: $ann2" || ok_t "announce/approval: does NOT advertise an appeal that would be refused"
 
 # 13: AUDIT — the declaration is on the record whether it applied or was refused.
@@ -356,16 +281,8 @@ route_reset; seed DIVE-414
 actor_seam_as dev; cmd_task_need DIVE-414 --type=decision --from=dev \
   --ask="$DESIGN_ASK" --options="capability|clearance" --recommend="clearance" \
   --discusses="$DESIGN_WHY" >/dev/null 2>&1
-# DIVE-4175 arm C: there is no APPLIED appeal left to record — with no promotion
-# there is nothing to downgrade, so DIVE-2089 takes its refusal path on every
-# input. The property this arm actually defends is ATTRIBUTABILITY: whatever the
-# filer declared is on the record, which is the whole reason a declaration beats a
-# reworded ask. That survives, on the refusal line.
-grep -q "floor-appeal" "$AUDIT_FILE" && ok_t "audit: the appeal attempt is recorded (applied or refused — an attempt is evidence)" || bad_t "audit appeal recorded" "$(cat "$AUDIT_FILE")"
+grep -q "floor-appeal applied" "$AUDIT_FILE" && ok_t "audit: an APPLIED appeal is recorded" || bad_t "audit applied" "$(cat "$AUDIT_FILE")"
 grep -q "declared=" "$AUDIT_FILE" && ok_t "audit: the declared reason is recorded verbatim" || bad_t "audit declared" "$(cat "$AUDIT_FILE")"
-grep -q "floor-appeal applied" "$AUDIT_FILE" \
-  && bad_t "2089 appeal discriminator (audit)" "an appeal APPLIED — DIVE-2089 has an observable again; re-read DIVE-4232 before retiring it. $(cat "$AUDIT_FILE")" \
-  || ok_t "DIVE-4232 evidence: the appeal is REFUSED on every input now — it never applies"
 route_reset; seed DIVE-415
 actor_seam_as dev; cmd_task_need DIVE-415 --type=decision --from=dev \
   --ask="Model the store, and refund the customer \$500?" --options="A|B" --recommend="A" \
@@ -373,24 +290,9 @@ actor_seam_as dev; cmd_task_need DIVE-415 --type=decision --from=dev \
 grep -q "floor-appeal refused" "$AUDIT_FILE" && ok_t "audit: a REFUSED appeal is recorded too (an attempt is evidence)" || bad_t "audit refused" "$(cat "$AUDIT_FILE")"
 
 # 14: the reviewer the gate was moved TO can see the claim it was moved on.
-# DIVE-4175 arm C: the ask is rewritten only by an APPLIED appeal, and none apply
-# now (arm 13). So the reviewer no longer sees the claim in the ask they grade —
-# it is on the audit record instead. That is a REAL loss of surface, recorded here
-# rather than deleted: the reviewer reading only the gate does not see the
-# declaration. It is DIVE-4232's to decide, since the fix is either to retire the
-# flag or to write the declaration on a surface that does not depend on the appeal.
-[[ "$(askof DIVE-414)" == *"$DESIGN_WHY"* ]] \
-  && bad_t "2089 appeal discriminator (ask rewrite)" "the ask carries the declaration — DIVE-2089 has an observable again; re-read DIVE-4232 before retiring it" \
-  || ok_t "DIVE-4232 evidence: the declaration no longer reaches the ask the reviewer grades (audit-only)"
-# Own fixture: arm 13's second half reset the audit file, so re-file rather than
-# grading a leftover from another gate's run.
-route_reset; seed DIVE-454
-actor_seam_as dev; cmd_task_need DIVE-454 --type=decision --from=dev \
-  --ask="$DESIGN_ASK" --options="capability|clearance" --recommend="clearance" \
-  --discusses="$DESIGN_WHY" >/dev/null 2>&1
-grep -qF -- "declared=$DESIGN_WHY" "$AUDIT_FILE" \
-  && ok_t "handoff: the declaration is still attributable — recorded verbatim on the audit line" \
-  || bad_t "handoff declaration audited" "$(cat "$AUDIT_FILE")"
+[[ "$(askof DIVE-414)" == *"floor appeal"* && "$(askof DIVE-414)" == *"$DESIGN_WHY"* ]] \
+  && ok_t "handoff: the declaration is written into the ask the reviewer grades" \
+  || bad_t "handoff declaration in ask" "got '$(askof DIVE-414)'"
 
 # 15: hygiene — the flag cannot ride along on --withdraw, and must say something.
 route_reset; seed DIVE-416
@@ -469,27 +371,10 @@ grep -qi "category floor" <<<"$res3" \
 route_reset; seed DIVE-423
 jres=$(cmd_task_need DIVE-423 --type=decision --from=dev \
   --ask="$DESIGN_ASK" --options="capability|clearance" --recommend="clearance" 2>/dev/null)
-# DIVE-4175 arm C: SAME PROPERTY, DIFFERENT PAYLOAD. `tier_floored` is the
-# UNROUTED payload's field, and before arm C a floored gate was unrouted so a
-# --json filer always got it. Arm C sends this class to a seat, so the row now
-# renders through the ROUTED payload — where the machine-readable WHY is
-# `route_trigger`, naming the AXIS the term came from. `floor_term` was added
-# alongside it in the same change, because a trigger without the term leaves the
-# JSON reader in exactly the state defect 2 describes.
-[[ "$(jq -r '.data.route_trigger' <<<"$jres" 2>/dev/null)" == "floored-by-ask" ]] \
-  && ok_t "json: route_trigger reports the floor fired AND names the AXIS it fired on" \
-  || bad_t "json route_trigger axis" "$jres"
+[[ "$(jq -r '.data.tier_floored' <<<"$jres" 2>/dev/null)" == "true" ]] \
+  && ok_t "json: tier_floored is reported" || bad_t "json tier_floored" "$jres"
 [[ "$(jq -r '.data.floor_term' <<<"$jres" 2>/dev/null)" == "credential" ]] \
   && ok_t "json: the matched term rides the JSON payload" || bad_t "json floor_term" "$jres"
-# and the axis is not a constant: a TITLE-axis hit must say so.
-route_reset; seed DIVE-425 "design the token exchange between the runtime and the broker"
-actor_seam_as dev; jres3=$(cmd_task_need DIVE-425 --type=decision --from=dev \
-  --ask="Should the exchange be modelled as a synchronous call or an async queue?" \
-  --options="sync|async" --recommend="async" 2>/dev/null)
-[[ "$(jq -r '.data.route_trigger' <<<"$jres3" 2>/dev/null)" == "floored-by-title" \
-   && "$(jq -r '.data.floor_term' <<<"$jres3" 2>/dev/null)" == "token" ]] \
-  && ok_t "json: the axis and term are per-gate, not constants (title axis reports title+token)" \
-  || bad_t "json axis not constant" "$jres3"
 route_reset; seed DIVE-424
 jres2=$(cmd_task_need DIVE-424 --type=decision --from=dev \
   --ask="Should the dashboard column order be priority-first or age-first?" \

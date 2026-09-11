@@ -2361,7 +2361,28 @@ cmd_task_need() {
           _floor_term=$(_gate_tier2_floor_term "$ttl_title" 2>/dev/null) || _floor_term="" ;;
       esac
       _floor_prov="axis=${_floor_axis}${_floor_term:+;term=${_floor_term}}"
-      # DIVE-4175 arm C: THE KEYWORD FLOOR NO LONGER PROMOTES THE TIER.
+      # DIVE-4175 arm C: THE KEYWORD FLOOR NO LONGER PROMOTES THE TIER ON
+      # `type=approval` — AND STILL DOES ON EVERY OTHER TYPE.
+      #
+      # NARROWED 2026-09-11 on ops's answered gate ("Hold until the 9 are
+      # fixed"). The first shape of this arm deleted the promotion for ALL types.
+      # Replaying 30 days of `gate_history` ∪ live `tasks` (751 gates, 228
+      # human-facing) said that demoted 80 gates, and 27 of those 80 had actually
+      # been ANSWERED by the paired human. Split by TYPE, those 27 are two
+      # different things:
+      #   * 18 are `approval` — Floor B (`task answer` refuses
+      #     approval/secret/manual from an `agent-*` unix identity) means the
+      #     seat they now route to CANNOT clear them. The human still answers; a
+      #     seat reads it first and escalates with context. A RE-ROUTE.
+      #   * 9 are `decision` — a lead CAN auto-apply a tier-1 decision, so the
+      #     human answer is genuinely GONE. A REGRESSION.
+      # So the thing that decides whether a demotion costs a human answer is not
+      # the wording and not the class: it is whether anything stands behind the
+      # tier. Floor B stands behind `approval`. Nothing stands behind `decision`
+      # or `access`. The promoter is therefore deleted exactly where it is
+      # redundant and kept exactly where it is load-bearing —
+      # **0 regressions, 51 demotions, 33 of them gates he never answered.**
+      # (`community/wiki/a-demoted-gate-is-not-a-lost-human-answer-floor-b-decides-that-by-type.md`)
       #
       # `_floor_axis` is still computed and still stamped into floor_provenance —
       # the measurement continues, and every other consumer of
@@ -2394,6 +2415,25 @@ cmd_task_need() {
       # ticket title.
       case "$_floor_axis" in
         ask|title-fallback)
+          if [[ "$type" != "approval" ]]; then
+            # THE PROMOTER SURVIVES HERE, and this is the narrowing ops's gate
+            # bought. On a type a seat can clear by itself — `decision`,
+            # `access` — a demotion is not a re-route, it is a human answer
+            # deleted: 9 of the 30-day window's `decision` gates carrying a
+            # floor term were answered by the paired human, and a lead would
+            # have auto-applied all 9. Unchanged behaviour, unchanged stamp.
+            tier=2; tier_floored=1
+            if [[ "$_floor_axis" == "title-fallback" ]]; then
+              warn "gate floored on the TITLE because the ask states nothing of its own ('${ask}'). A self-contained ask is the standing rule; the floor fails closed rather than trust a filing whose only statement of the request is the ticket title."
+            fi
+            if [[ -z "$needs" ]]; then
+              # The lint half, on this branch too — the gate reaches a person
+              # either way, so it asks for the DECLARATION rather than warning
+              # about a route. Naming the capability is what will let this floor
+              # narrow further; reading it out of prose is what over-fires.
+              warn "gate floored on the WORD '${_floor_term:-?}' in the ask, not on a declared capability — wording is a weak signal and it over-fires (DIVE-4175). If the ask really does consume a human-only capability, re-file with --needs=${_GATE_HUMAN_CAPABILITIES%% *} (or the one that fits); if it does not, the floor is a false page."
+            fi
+          else
           # THE LINT (arm C's second half), and it is a WARNING, not a refusal.
           # Sized before building: 16 gates in the 30-day window carry a floor
           # term in the ask, 15 of them declare no capability — and reading all
@@ -2430,7 +2470,8 @@ cmd_task_need() {
           # new has to be trusted.
           _floored_by_title=1; _ft_title="$ttl_title"
           if [[ -z "$needs" ]]; then
-            warn "the ask names a term from a human-reserved class ('${_floor_term:-?}') but declares no capability, so this gate is NOT routed to the paired human. Wording alone no longer promotes a gate (DIVE-4175). If the ask really is asking to spend, to hand over a secret, or to destroy something, re-file with --needs=${_GATE_HUMAN_CAPABILITIES%% *} (or the capability that fits) — that is what reaches a person."
+            warn "the ask names a term from a human-reserved class ('${_floor_term:-?}') but declares no capability, so this gate is NOT routed to the paired human. Wording alone no longer promotes an APPROVAL gate (DIVE-4175) — Floor B still refuses to let a seat clear it, so the human answers it if the seat cannot. If the ask really is asking to spend, to hand over a secret, or to destroy something, re-file with --needs=${_GATE_HUMAN_CAPABILITIES%% *} (or the capability that fits) — that is what pages a person directly."
+          fi
           fi
           ;;
         title)

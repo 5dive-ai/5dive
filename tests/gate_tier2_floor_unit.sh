@@ -160,30 +160,17 @@ cmd_task_answer DIVE-103 --value=A >/dev/null 2>&1
 # --- T4: the tier-2 floor is need_type-agnostic — a gate floored to tier 2 by the
 #     T2 CATEGORY HEURISTIC (not an explicit --tier) is refused for a bare agent too.
 #     "secrets" in the ask trips _gate_tier2_floor_hit (the exact OSS-16 mechanism).
-# DIVE-4175 arm C: the CATEGORY HEURISTIC no longer promotes the tier — wording
-# alone is not a route to the human any more. What T4 is actually protecting is
-# OSS-16's property: a decision gate that IS tier 2 without an explicit --tier
-# cannot be cleared by a bare agent. The route to tier 2 is now the DECLARATION,
-# so the arm files one; the refusal it then asserts is unchanged.
-#
-# The deleted half is kept as an explicit negative control directly below, so the
-# corpus records what arm C gave up rather than losing it silently.
 seed_task DIVE-104
-cmd_task_need DIVE-104 --type=decision --needs=secret_provision --ask="rotate the prod secrets now?" --options="yes|no" --recommend="no" >/dev/null 2>&1
-seed_task DIVE-105
-cmd_task_need DIVE-105 --type=decision --ask="rotate the prod secrets now?" --options="yes|no" --recommend="no" >/dev/null 2>&1
-[[ "$(tierof DIVE-105)" == "1" ]] \
-  && ok_t "T4 negative control: the SAME ask with no declared capability is NOT floored (arm C)" \
-  || bad_t "T4 undeclared ask must not floor" "got tier '$(tierof DIVE-105)' — the keyword promoter is back"
+cmd_task_need DIVE-104 --type=decision --ask="rotate the prod secrets now?" --options="yes|no" --recommend="no" >/dev/null 2>&1
 if [[ "$(tierof DIVE-104)" == "2" ]]; then
-  ok_t "T4 a DECLARED human capability floors the decision gate to tier 2"
+  ok_t "T4 category heuristic floored the decision gate to tier 2"
   out=$(cmd_task_answer DIVE-104 --value=no 2>&1); rc=$?
   [[ "$(answered DIVE-104)" == "open" && $rc -ne 0 ]] \
     && ok_t "T4 bare-agent answer on category-floored tier-2 gate REFUSED" \
     || bad_t "T4 category-floored refused" "rc=$rc state=$(answered DIVE-104) out=$out"
 else
   # If the floor keyword set ever changes, don't silently pass — flag it.
-  bad_t "T4 declared capability floored to tier 2" "got tier '$(tierof DIVE-104)' (the --needs human half is the sole route now)"
+  bad_t "T4 category heuristic floored to tier 2" "got tier '$(tierof DIVE-104)' (keyword floor may have moved)"
 fi
 
 # --- T5: DIVE-2588 — THE FLOOR IS NOT SWITCHABLE. This arm asserted the OPPOSITE
