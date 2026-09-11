@@ -25,7 +25,7 @@ PACK_FORMAT_VERSION=1
 # reads directly — no api.5dive.com dependency, same pattern as <org>/skills.
 # A bare slug to `agent import` resolves here; `agent marketplace ls` browses it.
 
-# One definition of the registry repo lives in header.sh (FIVE_MARKETPLACE_REPO).
+# One definition of the registry repo lives in src/lib/marketplace.sh (FIVE_MARKETPLACE_REPO).
 _marketplace_base() { _marketplace_raw_base; }
 
 # DIVE-644: opt-in import telemetry (the ONLY api.5dive.com touchpoint on the

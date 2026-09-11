@@ -1389,7 +1389,7 @@ TEAM_SCHEMA_MAX=2
 
 # Registry ROOT (not the teams/ dir): index entries carry a repo-relative
 # `path`, so root + path is the one place the layout is written down.
-# Same one definition the packs path reads (header.sh: FIVE_MARKETPLACE_REPO).
+# Same one definition the packs path reads (src/lib/marketplace.sh: FIVE_MARKETPLACE_REPO).
 _teams_registry_base() { _marketplace_raw_base; }
 
 # Fetch one registry object, preserving the failure class so a transient fetch
