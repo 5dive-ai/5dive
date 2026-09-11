@@ -191,6 +191,10 @@ is 'busy-skip, active-defer and no-work each record their decision' "$n_seen" '3
 # indentation instead of running to EOF, and (c) says NO-ANCHOR rather than 0
 # when the log line is gone, so a renamed message fails loud instead of passing
 # an arm that is no longer looking at anything.
+# (d) A branch collapsed onto its own `if`/`else` line carries the enclosing
+# block's indent, so it is graded as a single line rather than expanded — the
+# alternative swallows its siblings and re-creates the false positive in the
+# small.
 wake_failure_stamps() { # <source-file> -> _hb_mark_seen calls inside the wake-failure branch
   awk '
     {
@@ -198,13 +202,21 @@ wake_failure_stamps() { # <source-file> -> _hb_mark_seen calls inside the wake-f
       bare = $0; sub(/^[[:space:]]*/, "", bare); txt[NR] = bare
       match($0, /^[[:space:]]*/); ind[NR] = RLENGTH
       if (bare ~ /^#/) cmt[NR] = 1
-      if (!anchor && !cmt[NR] && /_hb_log/ && /wake failed — will retry next tick/) anchor = NR
+      if (!anchor && !cmt[NR] && /_hb_log/ && /wake failed — will retry next tick/) {
+        anchor = NR
+        # A branch collapsed onto its own if/else line carries the indent of the
+        # enclosing block, so expanding by indent would swallow its siblings.
+        # Such a line IS the whole branch: grade it alone.
+        if ($0 ~ /(^|[[:space:];])(if|elif|else|then)([[:space:];]|$)/) solo = 1
+      }
     }
     END {
       if (!anchor) { print "NO-ANCHOR"; exit }
       lo = anchor; hi = anchor; base = ind[anchor]
-      for (i = anchor - 1; i >= 1;  i--) { if (cmt[i] || txt[i] == "") continue; if (ind[i] < base) break; lo = i }
-      for (i = anchor + 1; i <= NR; i++) { if (cmt[i] || txt[i] == "") continue; if (ind[i] < base) break; hi = i }
+      if (!solo) {
+        for (i = anchor - 1; i >= 1;  i--) { if (cmt[i] || txt[i] == "") continue; if (ind[i] < base) break; lo = i }
+        for (i = anchor + 1; i <= NR; i++) { if (cmt[i] || txt[i] == "") continue; if (ind[i] < base) break; hi = i }
+      }
       c = 0
       for (i = lo; i <= hi; i++) if (!cmt[i] && raw[i] ~ /_hb_mark_seen/) c++
       print c
@@ -270,6 +282,19 @@ tick() {
 is 'a missing log line reads NO-ANCHOR, not a passing 0' \
    "$(wake_failure_stamps "$(fixture gone '#!/usr/bin/env bash
 tick() { if wake; then :; else _hb_log "[$name] could not wake"; fi; }')")" 'NO-ANCHOR'
+
+# (6)/(7) a branch collapsed onto one line is graded alone, not widened to its siblings.
+is 'a collapsed one-line branch does not swallow the next statement' \
+   "$(wake_failure_stamps "$(fixture collapsed '#!/usr/bin/env bash
+tick() {
+  if wake; then :; else _hb_log "[$name] wake failed — will retry next tick"; fi
+  _hb_mark_seen "$name" "$now" "idle (no work)"
+}')")" '0'
+is 'and a violation ON that collapsed line is still caught' \
+   "$(wake_failure_stamps "$(fixture collapsed_bad '#!/usr/bin/env bash
+tick() {
+  if wake; then :; else _hb_mark_seen "$n" "$t" "x"; _hb_log "[$name] wake failed — will retry next tick"; fi
+}')")" '1'
 
 printf '\nPASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
