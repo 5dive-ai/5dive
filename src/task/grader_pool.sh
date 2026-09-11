@@ -550,6 +550,27 @@ cmd_task_grader_tick() {
       n_refuse=$((n_refuse+1))
       plan+="skip    $ident  (verification policy grants this row no grader — 5dive config verify=)"$'\n'; continue
     fi
+    # DIVE-4324: a row filed with a PINNED standing reviewer who is not in this
+    # pool is not this lane's row. `seat:<agent>` means "that agent grades it in
+    # its own session"; routing has already handed the row to them, so spawning a
+    # throwaway grader on a pool seat here would buy a SECOND session for a grade
+    # that was deliberately bought as a first.
+    #
+    # SCOPED TO NON-POOL SEATS ON PURPOSE, and this is the load-bearing half: the
+    # fleet's usual pins (quinn, main2) ARE the pool, and for those the pool's
+    # fresh session IS how that seat grades. Skipping those would strand every
+    # pinned row on this box. So the skip fires only where the two genuinely
+    # disagree — a pin naming somebody the pool cannot spawn.
+    local _gp_rm=""
+    [[ -n "$_gp_id" ]] && _gp_rm=$(db "SELECT COALESCE(review_mode,'') FROM tasks WHERE id=${_gp_id};" 2>/dev/null || printf '')
+    if [[ "$_gp_rm" == seat:* ]]; then
+      local _gp_pin="${_gp_rm#seat:}" _gp_in_pool=0 _gp_s
+      for _gp_s in $_GRADER_POOL; do [[ "$_gp_s" == "$_gp_pin" ]] && { _gp_in_pool=1; break; }; done
+      if (( ! _gp_in_pool )); then
+        n_refuse=$((n_refuse+1))
+        plan+="skip    $ident  (review=$_gp_rm — pinned standing reviewer, not a pool seat; $_gp_pin grades it in its own session)"$'\n'; continue
+      fi
+    fi
     # THE CAP IS CHECKED BEFORE THE SEAT, so a full lane costs no meter reads and
     # no credential probes — a queued delivery must be cheap or the tick becomes
     # the burn it was meant to bound.

@@ -71,7 +71,86 @@ _task_verify_skip_reason() {
     [[ "$t" =~ (^|[^a-z])(typo|typos|bump|rename|tweak|nit|nits|lint|format|reformat|comment|comments|whitespace|changelog|readme|docs|doc|wording|copy[[:space:]]fix|version[[:space:]]bump)([^a-z]|$) ]] \
       && { printf 'bodyless chore title'; return 0; }
   fi
+  # DIVE-4324, the two arms lodar's "easy tasks no reviewer at all" needs that
+  # the title classifier above cannot reach, because both are properties of the
+  # BODY and the arm above only fires when there is no body at all.
+  #
+  # BOTH ARE DELIBERATELY NARROW, and the narrowness is the point: a body that
+  # merely MENTIONS docs must not lose its grader, so nothing here matches prose.
+  # An explicit tag line, or a body that is literally one command, are the two
+  # shapes a filer can type on purpose and a reader can audit afterwards.
+  if [[ -n "$_body" ]]; then
+    # 1. A declared tag: `tag: mechanical`, `kind: doc`, `review: copy`. Anchored
+    #    at line start with a colon, so the word has to be a FIELD, not a noun in
+    #    a sentence.
+    if printf '%s' "$_body" \
+         | grep -qiE '^[[:space:]]*(tags?|kind|review):[[:space:]]*(mechanical|copy|docs?)[[:space:]]*(,|$)'; then
+      printf 'tagged mechanical/copy/doc'; return 0
+    fi
+    # 2. A body that is ONE read-back command and nothing else — the shape of a
+    #    row whose whole acceptance is "run this and look". There is nothing for
+    #    a grader to grade that the command does not already answer.
+    local _nonblank; _nonblank=$(printf '%s\n' "$_body" | grep -c '[^[:space:]]' || true)
+    if [[ "$_nonblank" == "1" ]] \
+       && printf '%s' "$_body" \
+            | grep -qE '^[[:space:]]*`?(5dive|git|grep|rg|cat|sed|awk|ls|jq|curl|npm|pnpm|bash|sh|sudo|test)[[:space:]]'; then
+      printf 'body is a single read-back command'; return 0
+    fi
+  fi
   return 0
+}
+
+# `_task_effective_review_mode` — DIVE-4324. The mode the row ACTUALLY got, read
+# off the resolved state at the end of `task add`, never off the flags alone.
+#
+# WHY IT IS DERIVED AT THE END AND NOT SET WHERE THE FLAG IS PARSED. Four
+# independent things can still overrule a filer between the flag and the INSERT:
+# the box policy (`verify=never`), the DIVE-969/2681 auto-skips, the absence of
+# any distinct grader in a solo org, and `delivered-only` deferring the whole
+# question to delivery. A mode written at parse time would record what was ASKED
+# FOR and read, downstream, as what happened — which is the exact
+# declared-vs-actual collapse the column's own comment exists to end.
+#
+# PRECEDENCE, and the one non-obvious rung: a PINNED SEAT outranks `check`. A row
+# with both a pinned reviewer and a command has a person on it; the command is
+# that person's instrument, not a replacement for them.
+#
+# WHAT THE BOX POLICY CAPS — stated here because iteration 2 of DIVE-4324 found
+# the code and the record disagreeing, and the record was right. `<grants>` is 0
+# when the box refused, and it gates BOTH the `seat:` rung and the `temp` rung,
+# so under `verify=never` a row filed `--review=temp` or `--review=<seat>`
+# resolves to `none` — "never wins", which is this row's acceptance criterion.
+# What previously defeated that was not this function but `crud.sh` setting
+# `force_verify` on the new spelling, which turned the box's answer into an
+# override the filer could type past. `check` is the ONE exemption and it is
+# tested ABOVE the cap on purpose: a command books no grader session, so a
+# statement about SPEND has nothing to refuse there.
+#
+# THE TWO RUNGS BELOW ARE MUTATION-TESTED AGAINST THIS FUNCTION'S OWN TEXT.
+# tests/task_review_mode_unit.sh deletes the `_grants` term, and separately the
+# `seat:` rung, out of `declare -f` output and requires the capped arms and the
+# precedence arm to go RED. An earlier version substituted a STUB instead, which
+# proved only that a stub returning 'temp' returns 'temp' — do not go back to
+# that shape; mutate the predicate that ships.
+_task_effective_review_mode() {  # <no_verify> <verify_cmd> <verifier> <grants> <skip_reason> <pinned> <deferred>
+  local _nv="${1:-}" _cmd="${2:-}" _vf="${3:-}" _grants="${4:-0}" _skip="${5:-}" _pinned="${6:-0}" _defer="${7:-0}"
+  [[ -n "$_nv" ]] && { printf 'none'; return 0; }
+  # `check` is tested BEFORE the box policy, and that is not an oversight: a
+  # command costs no grader session, so `verify=never` — a statement about SPEND
+  # — has nothing to refuse. Capping it there would silently downgrade the one
+  # mode a cost-conscious box should be steered toward.
+  [[ "$_pinned" == 1 && -n "$_vf" && "$_grants" == 1 ]] && { printf 'seat:%s' "$_vf"; return 0; }
+  [[ -n "$_cmd" ]] && { printf 'check'; return 0; }
+  # `delivered-only` with no override is a DEFERRAL, not a refusal: the row has
+  # no verifier at add time by construction (it has no delivery yet), and
+  # `task deliver --pr=` attaches the pool grader then. Reading that empty
+  # verifier as `none` would print the one mode the row is guaranteed NOT to
+  # get, on the box setting a cost-conscious customer is most likely to be on.
+  [[ "$_defer" == 1 ]] && { printf 'temp'; return 0; }
+  [[ "$_grants" == 1 ]] || { printf 'none'; return 0; }
+  [[ -n "$_skip" ]] && { printf 'none'; return 0; }
+  [[ -n "$_vf" ]]   && { printf 'temp'; return 0; }
+  printf 'none'
 }
 
 # DIVE-2719: THE DEPTH DECISION IS MADE AT THE ONE MOMENT IT CANNOT BE ANSWERED.
