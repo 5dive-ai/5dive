@@ -1168,7 +1168,7 @@ a2a_queue_flush_one() {
 }
 
 inject_and_submit() {
-  local name="$1" payload="$2" tries=0 pane
+  local name="$1" payload="$2" tries=0
   local user="agent-${name}"   # separate stmt: ${name} in the same line aborts under set -u (silent msg drop)
   # DIVE-4036: route BEFORE the pane guard, because on a dispatcher seat there is
   # no chat pane to guard. _agent_pane_safe_to_type exists to stop a payload being
@@ -1199,11 +1199,23 @@ inject_and_submit() {
     _a2a_queue_put "$name" "$payload" && return 4
   fi
   _agent_pane_safe_to_type "$name" || return 3
+  # DIVE-4246: COMPOSER HYGIENE, then the payload — the same pair DIVE-4242 gave
+  # the heartbeat's `_hb_send_line`. This is the OTHER typed-send site (`send`,
+  # `ask` and `_deliver` all funnel here) and it carried both halves of the same
+  # blind spot: it typed into whatever the composer happened to be holding (a
+  # previous injector's unsent remainder gets PREPENDED to this payload), and it
+  # confirmed the submit by polling for the `[Pasted text #N]` placeholder, which
+  # a leftover TAIL clears — `❯ [Pasted text #7]irst (verify before relying…`,
+  # measured 2026-09-10 15:43Z on ops, reads as SUBMITTED under that grep.
+  # C-u, never Escape: Escape on a seat that is mid-turn ABORTS the turn, C-u
+  # only edits the composer. Ghost text (CC 2.1.267 promptSuggestion, rendered
+  # DIM) is not input and is replaced by typing anyway; the verify excludes it.
+  sudo -u "$user" tmux send-keys -t "agent-${name}" C-u 2>/dev/null || return 1
   sudo -u "$user" tmux send-keys -t "agent-${name}" -l -- "$payload"
   # Let the TUI finish ingesting the (possibly bracketed-paste) payload before the
   # Enter, so the newline isn't bundled into the paste sequence.
   sleep 0.3
-  # Non-claude TUIs: no paste placeholder to poll — confirm via idle-state instead.
+  # Non-claude TUIs: no composer glyph to read — confirm via idle-state instead.
   if [[ -z "$(_hb_claude_pid "$name")" ]]; then
     sleep 0.4
     while (( tries < 5 )); do
@@ -1216,16 +1228,17 @@ inject_and_submit() {
     done
     return 1
   fi
-  while (( tries < 5 )); do
-    sudo -u "$user" tmux send-keys -t "agent-${name}" Enter
-    sleep 0.4
-    pane=$(sudo -u "$user" tmux capture-pane -p -t "agent-${name}" 2>/dev/null || true)
-    # Submitted once the unsubmitted-paste placeholder clears from the prompt.
-    # (We only re-send Enter while it's still showing, so a message that already
-    # submitted never gets stray extra Enters.)
-    grep -q '\[Pasted text #[0-9]' <<<"$pane" || return 0
-    tries=$((tries+1))
-  done
+  # DIVE-4246: claude path — VERIFY the submit against the COMPOSER (no non-ghost
+  # text left after the last `❯`) rather than against the paste placeholder. One
+  # retry, then rc 1 so `send` / `ask` / `_deliver` report sent:false loudly
+  # instead of handing back a receipt for a message the seat never received. Two
+  # Enters is the ceiling, as in `_hb_send_line`: a third Enter into a composer
+  # that is not accepting is a stray keystroke, not a fix.
+  sudo -u "$user" tmux send-keys -t "agent-${name}" Enter
+  _hb_verify_submit "$name" && return 0
+  sleep "${_HB_SUBMIT_RETRY_SEC:-0.5}"
+  sudo -u "$user" tmux send-keys -t "agent-${name}" Enter
+  _hb_verify_submit "$name" && return 0
   return 1
 }
 
@@ -1242,7 +1255,7 @@ _agent_submit_unconfirmed_reason() {
     if [[ "${2:-1}" == "2" ]]; then _agent_dispatch_write_failed_reason; else _agent_dispatch_unconfirmed_reason; fi
     return 0
   fi
-  printf '%s\n' 'pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)'
+  printf '%s\n' 'the composer still holds unsent text after two Enters — the payload was typed but the submit could not be verified (DIVE-4246; was the DIVE-147 paste-placeholder poll)'
 }
 
 # `ask` has no successful reply to return when its initial submit cannot be
