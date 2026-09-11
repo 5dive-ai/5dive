@@ -158,6 +158,24 @@ out=$(run --cap=5 --commit)
   || bad_ 'both locks off spawns 3' "got: $(spawns)"
 grep -q 'task.grade.spawned' "$EMITF" && ok_ 'records task.grade.spawned' || bad_ 'records spawn' "$(emits)"
 
+# ── an active non-pool owner is never reassigned ────────────────────────────
+# The query may encounter a stale request while its maker is already working
+# again.  This guard runs before the cap/meter/read probes and must explain the
+# refusal in the plan, not quietly turn the row into a verifier assignment.
+_grader_non_pool_working_owner(){ [[ "$1" == DIVE-2 ]] && printf 'dev'; }
+out=$(run --cap=5 --commit)
+grep -q 'skip    DIVE-2  (owner is dev, not a pool seat)' <<<"$out" \
+  && ok_ 'OWNER: plan names the non-pool working owner' \
+  || bad_ 'owner skip line' "$out"
+grep -q ':DIVE-2$' "$SPAWNF" \
+  && bad_ 'OWNER: active maker is never assigned away' "$(spawns)" \
+  || ok_ 'OWNER: active maker is never assigned away'
+[[ "$(grep -c . "$SPAWNF")" == 2 ]] \
+  && ok_ 'OWNER control: other pending rows still spawn' \
+  || bad_ 'owner control spawns the other rows' "$(spawns)"
+_grader_non_pool_working_owner(){ return 1; }
+_grader_row_is_in_progress(){ return 1; }
+
 # ── the cap ──────────────────────────────────────────────────────────────────
 out=$(run --cap=1 --commit)
 [[ $(grep -c . "$SPAWNF") == 1 ]] && ok_ 'cap=1 spawns exactly one' || bad_ 'cap=1' "got: $(spawns)"
