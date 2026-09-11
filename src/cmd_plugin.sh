@@ -184,6 +184,7 @@ _plugin_usage() {
 
   5dive plugin list [--json]                      # what is installed, with version and tier
   5dive plugin add <plugin>[@<marketplace>] [--yes]
+  5dive plugin add <owner>/<repo>[/<plugin>] [--as=<marketplace>] [--yes]
   5dive plugin remove <plugin>[@<marketplace>]
   5dive plugin upgrade <plugin>[@<marketplace>]
   5dive plugin enable|disable <plugin>[@<marketplace>]    # a flag flip; the code stays on disk
@@ -544,10 +545,11 @@ cmd_plugin_marketplace() {
 }
 
 _plugin_mkt_add() {
-  local src="" name="" a
+  local src="" name="" require_index=0 a
   for a in "$@"; do
     case "$a" in
       --as=*) name="${a#--as=}" ;;
+      --require-index) require_index=1 ;; # internal: one-step foreign install
       --*)    fail "$E_USAGE" "unknown flag: $a" ;;
       *)      [[ -z "$src" ]] && src="$a" || fail "$E_USAGE" "one source at a time" ;;
     esac
@@ -585,6 +587,17 @@ _plugin_mkt_add() {
       git clone --quiet --depth 1 "$url" "$dest" 2>/dev/null \
         || fail "$E_GENERIC" "could not clone $url"
     fi
+  fi
+
+  # The ordinary marketplace verb intentionally accepts an unindexed local
+  # directory and discovers plugin manifests below it.  The one-step FOREIGN
+  # form cannot: its selection rules come from the repository's declared index,
+  # and silently walking directories would install code the publisher did not
+  # list. Validate before recording the marketplace so a refusal leaves no
+  # half-registered source behind.
+  if (( require_index )) && [[ ! -f "$dest/.claude-plugin/marketplace.json" ]]; then
+    rm -rf "$dest"
+    fail "$E_VALIDATION" "$src has no .claude-plugin/marketplace.json — a one-step repository install requires that file"
   fi
 
   local tmp; tmp=$(mktemp)
@@ -765,16 +778,112 @@ _plugin_resolve_installed_key() {
   _PL_KEY="${m[0]}"
 }
 
+# Parse the one-step source forms into globals.  Existing plugin@marketplace
+# refs never reach this helper, so their meaning is unchanged.
+_plugin_foreign_parse() {  # <source-ref>
+  local ref="$1" stem="$1" suffix=""
+  local -a part=()
+  _PL_FOREIGN_SOURCE=""; _PL_FOREIGN_PLUGIN=""; _PL_FOREIGN_MKT=""
+
+  if [[ -d "$ref" || "$ref" == *://* || "$ref" == git@*:* ]]; then
+    _PL_FOREIGN_SOURCE="$ref"
+    _PL_FOREIGN_MKT=$(_plugin_mkt_default_name "$ref")
+    return 0
+  fi
+
+  # owner/repo@ref remains a marketplace source. The @ syntax is ambiguous
+  # only for a slash-free plugin@marketplace ref, which the caller excludes.
+  if [[ "$stem" == *@* ]]; then suffix="@${stem##*@}"; stem="${stem%@*}"; fi
+  IFS=/ read -r -a part <<<"$stem"
+  (( ${#part[@]} == 2 || ${#part[@]} == 3 )) \
+    || fail "$E_VALIDATION" "'$ref' must be <owner>/<repo>, <owner>/<repo>/<plugin>, or a git URL"
+  [[ "${part[0]}" =~ ^[A-Za-z0-9._-]+$ && "${part[1]}" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || fail "$E_VALIDATION" "'$ref' has an invalid GitHub owner or repository name"
+  _PL_FOREIGN_SOURCE="${part[0]}/${part[1]}${suffix}"
+  _PL_FOREIGN_PLUGIN="${part[2]:-}"
+  _PL_FOREIGN_MKT=$(printf '%s' "${part[1]}" | tr '[:upper:]' '[:lower:]')
+}
+
+_plugin_sources_equivalent() {  # <registered> <requested>
+  local a="$1" b="$2" _pl_side v
+  for _pl_side in a b; do
+    v="${!_pl_side}"
+    v="${v#https://github.com/}"; v="${v#http://github.com/}"
+    v="${v#git@github.com:}"; v="${v%/}"; v="${v%.git}"
+    printf -v "$_pl_side" '%s' "$v"
+  done
+  [[ "$a" == "$b" ]]
+}
+
+_plugin_add_foreign() {  # <source-ref> <as-name> <assume-yes>
+  local ref="$1" as_name="$2" assume_yes="$3"
+  _plugin_foreign_parse "$ref"
+  local source="$_PL_FOREIGN_SOURCE" wanted="$_PL_FOREIGN_PLUGIN"
+  local mkt="${as_name:-$_PL_FOREIGN_MKT}"
+  _plugin_valid_mkt_name "$mkt" \
+    || fail "$E_VALIDATION" "marketplace name '$mkt' must be lowercase kebab/dot/underscore"
+
+  _plugin_ensure_store
+  if jq -e --arg n "$mkt" 'has($n)' "$(_plugin_mkt_json)" >/dev/null 2>&1; then
+    local registered
+    registered=$(jq -r --arg n "$mkt" '.[$n].source // ""' "$(_plugin_mkt_json)")
+    _plugin_sources_equivalent "$registered" "$source" \
+      || fail "$E_CONFLICT" "marketplace '$mkt' is already registered from $registered, not $source — choose another name with --as="
+  else
+    # Suppress the intermediate success envelope: one CLI invocation has one
+    # result, especially under --json. Errors remain on stderr.
+    _plugin_mkt_add "$source" --as="$mkt" --require-index >/dev/null
+  fi
+
+  local idx
+  idx="$(_plugin_mkt_dir)/$mkt/.claude-plugin/marketplace.json"
+  [[ -f "$idx" ]] \
+    || fail "$E_VALIDATION" "$source has no .claude-plugin/marketplace.json — a one-step repository install requires that file"
+  jq -e '.plugins | type=="array"' "$idx" >/dev/null 2>&1 \
+    || fail "$E_VALIDATION" "$idx does not contain a plugins array"
+
+  local -a names=()
+  mapfile -t names < <(jq -r '.plugins[]?.name // empty' "$idx")
+  (( ${#names[@]} > 0 )) || fail "$E_NOT_FOUND" "$idx lists no plugins"
+
+  if [[ -n "$wanted" ]]; then
+    jq -e --arg p "$wanted" 'any(.plugins[]?; .name==$p)' "$idx" >/dev/null 2>&1 \
+      || fail "$E_NOT_FOUND" "no plugin '$wanted' in $source; available: ${names[*]}"
+  elif (( ${#names[@]} == 1 )); then
+    wanted="${names[0]}"
+  elif jq -e --arg p "$_PL_FOREIGN_MKT" 'any(.plugins[]?; .name==$p)' "$idx" >/dev/null 2>&1; then
+    wanted="$_PL_FOREIGN_MKT"
+  else
+    fail "$E_USAGE" "$source offers multiple plugins: ${names[*]}. Choose one: 5dive plugin add <owner>/<repo>/<plugin>"
+  fi
+
+  local -a install_args=("${wanted}@${mkt}")
+  (( assume_yes )) && install_args+=(--yes)
+  # Re-enter the canonical installer. This is load-bearing: the foreign path
+  # gets the exact same trust gate and DIVE-995 consent disclosure as the
+  # long-standing plugin@marketplace form, with no second copy to drift.
+  cmd_plugin_add "${install_args[@]}"
+}
+
 cmd_plugin_add() {
-  local ref="" assume_yes=0 a
+  local ref="" as_name="" assume_yes=0 a
   for a in "$@"; do
     case "$a" in
       --yes|-y) assume_yes=1 ;;
+      --as=*)   as_name="${a#--as=}" ;;
       --*)      fail "$E_USAGE" "unknown flag: $a" ;;
       *)        [[ -z "$ref" ]] && ref="$a" || fail "$E_USAGE" "one plugin at a time" ;;
     esac
   done
-  [[ -n "$ref" ]] || fail "$E_USAGE" "usage: 5dive plugin add <plugin>[@<marketplace>] [--yes]"
+  [[ -n "$ref" ]] || fail "$E_USAGE" "usage: 5dive plugin add <plugin>[@<marketplace>]|<owner>/<repo>[/<plugin>] [--as=<marketplace>] [--yes]"
+
+  if [[ "$ref" != *@* && "$ref" == */* ]] \
+     || [[ "$ref" == */*@* ]] \
+     || [[ "$ref" == *://* || "$ref" == git@*:* ]]; then
+    _plugin_add_foreign "$ref" "$as_name" "$assume_yes"
+    return
+  fi
+  [[ -z "$as_name" ]] || fail "$E_USAGE" "--as applies only to a repository source (<owner>/<repo> or URL)"
   _plugin_ensure_store
 
   # BEFORE resolution, deliberately. quinn measured that on a fresh box this hint
@@ -1171,7 +1280,7 @@ readonly PLUGIN_VERB_BINDIR="bin"
 # re-extracts the case labels from src/main.sh and asserts set equality, so a new
 # builtin verb that forgets this line reds the suite rather than silently
 # becoming claimable by a plugin.
-readonly FIVEDIVE_BUILTIN_VERBS="a2a account acp activity agent _audit_append bug buzz company config constitution cost council crew deploy _deploy_do digest doctor down export fire fleet gate-proof gh _gh_do goal -h heartbeat --help help hire host human humans init liveness loop market memory _merge_do models objective objectives org paperclip-seed plugin project projects proof ps push _push_do run runs secret selfcheck self-update self_update supervisor task _task_answer team trace trigger triggers ui uninstall up update usage -v --version version watch whoami"
+readonly FIVEDIVE_BUILTIN_VERBS="a2a account acp activity agent _audit_append bug buzz company config constitution cost council crew deploy _deploy_do digest doctor down export fire fleet gate-proof gh _gh_do goal -h heartbeat --help help hire host human humans init liveness loop market memory _merge_do models objective objectives org paperclip-seed plugin plugins project projects proof ps push _push_do run runs secret selfcheck self-update self_update supervisor task _task_answer team trace trigger triggers ui uninstall up update usage -v --version version watch whoami"
 
 _plugin_verb_name_ok()   { [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]; }
 _plugin_verb_is_builtin(){ [[ " $FIVEDIVE_BUILTIN_VERBS " == *" $1 "* ]]; }
