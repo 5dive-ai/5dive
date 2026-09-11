@@ -829,12 +829,38 @@ _gate_gh_blind_err() {
   grep -qiE 'could not resolve to a repository|not found \(http 404\)|http 404|resource not accessible by integration' "$f" 2>/dev/null
 }
 
+# DIVE-4282: _GATE_GH_ERRF — the CALLER'S sink for "why did this call fail".
+#
+# `_GATE_GH_LAST_ERR` is a variable, and every counting caller invokes _gate_gh in a
+# COMMAND SUBSTITUTION, i.e. a subshell — so the variable cannot travel back and the
+# caller is left holding a bare non-zero status. That is exactly how the autodetect
+# scan came to report `partial-repo-scan-0-of-11` on a seat whose token was fine: the
+# scan knew only HOW MANY repos declined, never WHAT any of them said, so the only
+# sentence it could print was "could not query GitHub" — which points the reader at
+# the credential when the credential is not the problem. Measured on a customer box,
+# 2026-09-11 (5dive-exact-swallow): arm 4 RESOLVED, 0 of 11 repos answered, and the
+# reason was unrecoverable from the warning by construction.
+#
+# Same mechanism as DIVE-3496 it.2's `_GATE_GH_NOCRED_ERRF`, one level up: a FILE
+# crosses the subshell boundary a variable cannot. Opt-in — unset, nothing is written
+# and no path changes — which keeps DIVE-2705's decision intact (gh's stderr is still
+# never sprayed on a call that answered; it is published only where a caller has asked
+# for it because it is about to explain a failure).
+_gate_gh_publish_err() {
+  [[ -n "${_GATE_GH_ERRF:-}" ]] || return 0
+  printf '%s' "${_GATE_GH_LAST_ERR:-}" >"$_GATE_GH_ERRF" 2>/dev/null || true
+  return 0
+}
+
 _gate_gh() {
   local tok="${1:-}" secs="${2:-0}"; shift 2
   local -a bound=()
   local _rc=0 _errf
   _GATE_GH_LAST_ERR=""
   _GATE_GH_NOCRED_ERRF=""   # DIVE-3496 it.2: only the escalation below sets a sink
+  # DIVE-4282: truncate the caller's sink at entry, so a call that ANSWERS never
+  # leaves the previous call's failure sitting in it for the caller to misread.
+  [[ -n "${_GATE_GH_ERRF:-}" ]] && { : >"$_GATE_GH_ERRF" 2>/dev/null || true; }
   _errf="${TMPDIR:-/tmp}/.5dive-gate-gh-err.$$"
   if [[ -n "$tok" ]]; then
     [[ "$secs" != "0" ]] && bound=(timeout "${secs}s")
@@ -917,16 +943,23 @@ _gate_gh() {
         return 0
       fi
       _GATE_GH_LAST_ERR="the caller's own credential cannot see this repository (${_blind}); the seat's owner-scoped read token for '${_own:-?}' ${_own:+was ${_otok:+tried and could not answer}${_otok:-not present on this seat}}, and the credential-free rails were tried too and could not answer: ${_esc_err}"
+      _gate_gh_publish_err
       rm -f "$_errf" 2>/dev/null || true
       printf ''
       return "$_rc"
     fi
   else
+    # DIVE-4282: the credential-free rails write their own reason; point them at the
+    # caller's sink so a no-token scan explains itself exactly like a tokened one.
+    local _nc_prev="${_GATE_GH_NOCRED_ERRF:-}"
+    [[ -n "${_GATE_GH_ERRF:-}" ]] && _GATE_GH_NOCRED_ERRF="$_GATE_GH_ERRF"
     _gate_gh_nocred "$secs" "$@" || _rc=$?
+    _GATE_GH_NOCRED_ERRF="$_nc_prev"
     rm -f "$_errf" 2>/dev/null || true
     return "$_rc"
   fi
   [[ -s "$_errf" ]] && _GATE_GH_LAST_ERR="$(cat "$_errf" 2>/dev/null || printf '')"
+  (( _rc != 0 )) && _gate_gh_publish_err
   rm -f "$_errf" 2>/dev/null || true
   return "$_rc"
 }

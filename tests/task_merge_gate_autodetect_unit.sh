@@ -47,12 +47,23 @@ TMP="$(mktemp -d /tmp/gate-autodetect-unit.XXXXXX)"
 # an unstubbed harness reaches the HOST's real gh login and asserts against a live
 # credential the fleet does not have. No test here wants a real token.
 mkdir -p "$TMP/bin"
-printf '#!/usr/bin/env bash\nexit 1\n' >"$TMP/bin/sudo"
+# DIVE-4282 needs the OTHER seat shape too — no own gh login, but `sudo -u claude gh
+# auth token` RESOLVES (arm 4). That is the shape every managed customer box has, and
+# it is the one the 0-of-11 report came from. Default stays exit 1, so every arm
+# written before this one keeps the seat it was written against.
+cat >"$TMP/bin/sudo" <<'SUDOSTUB'
+#!/usr/bin/env bash
+[[ "${SUDO_STUB_MODE:-refused}" == "token" ]] || exit 1
+[[ "$*" == *"-l "* ]] && exit 1          # the bot rail stays unavailable
+printf '%s\n' "${SUDO_STUB_TOKEN:-claude-token}"
+SUDOSTUB
 chmod +x "$TMP/bin/sudo"
 cat >"$TMP/bin/gh" <<'STUB'
 #!/usr/bin/env bash
-printf 'ARGS=%s\n' "$*" >>"$GH_ARGS_LOG"
+printf 'TOKEN=%s ARGS=%s\n' "${GH_TOKEN:-}" "$*" >>"$GH_ARGS_LOG"
 if [[ "$1" == "auth" && "$2" == "token" ]]; then printf '%s\n' "${GH_STUB_AUTH_TOKEN:-}"; exit 0; fi
+# DIVE-4282: a repo that DECLINES the listing, with gh's own words on stderr.
+if [[ -n "${GH_STUB_FAIL:-}" ]]; then printf '%s\n' "$GH_STUB_FAIL" >&2; exit 1; fi
 # `pr list ... --json ...`: emit the fixture JSON array, let the caller's -q jq run.
 if [[ "$1" == "pr" && "$2" == "list" ]]; then
   # honour a simulated hang so the gate's `timeout 5s` can be exercised.
@@ -229,6 +240,94 @@ out=$(cmd_task_done DIVE-908 --result="close under test (DIVE-2773: a first clos
 [[ $rc -eq $E_CONFLICT && "$(statusof DIVE-908)" != "done" ]] \
   && ok_t "T8 declared delivery_ref still gated by the DIVE-1830 (fail-closed) path" \
   || bad_t "T8 declared path intact" "rc=$rc status=$(statusof DIVE-908) out=$out"
+
+# ── DIVE-4282: the scan's CREDENTIAL and the scan's FAILURE ────────────────────
+# The customer report was "arm 4 RESOLVED and the scan still returned 0 of 11", and
+# its suggested fix was "check whether the resolved token is handed to the scan, or
+# resolved and then dropped". T10 is that check, standing: it asserts the arm-4 token
+# reaches `gh` on every repo listing. MUTATION (run by hand, DIVE-4282): drop the
+# `"$_ghtok2"` argument at the _gate_gh call site in src/task/status.sh and T10 goes
+# red on the TOKEN= assertion while T11 stays green — the two arms are independent.
+#
+# The identity pin is load-bearing for the same reason the selftest harness carries
+# one: arm 4 only fires for a non-`claude` caller, and without the pin this grades
+# whoever runs it (DIVE-2484).
+_gate_caller_uid()    { printf '%s' "${CALLER_UID_STUB:-990002}"; }
+_gate_passwd_stream() {
+  printf '%s\n' "$(</etc/passwd)"
+  printf 'claude:x:990001:990001::/nonexistent:/bin/false\n'
+  printf 'agent-fixture:x:990002:990002::/nonexistent:/bin/false\n'
+}
+[[ "$(actor_caller_unix_name)" == "agent-fixture" ]] \
+  && ok_t "T10a the caller-identity pin lands (non-claude, so arm 4 is live)" \
+  || bad_t "T10a identity pin" "name=[$(actor_caller_unix_name)]"
+
+# The property is "whatever _gate_gh_token RESOLVED is what `gh` is invoked with",
+# which is independent of WHICH arm resolved it — so it is graded on an arm that runs
+# everywhere (arm 1), and then again on the customer's own arm 4 where the host allows
+# it. tests/lib/env_isolation.sh replaces `sudo` with a refusing FUNCTION on any host
+# whose PAM restores FIVE_* knobs from /etc/environment (DIVE-3096) — that neuters the
+# sudo stub, so the arm-4 case SKIPS WITH ITS REASON PRINTED rather than passing
+# vacuously. (Measured on this dev host 2026-09-11: the guard is installed, which is
+# also why T2/T5 of tests/task_merge_gate_selftest_unit.sh are red here on origin/main.)
+seed DIVE-910
+export GH_STUB_PRLIST='[]'
+export GH_STUB_AUTH_TOKEN=""
+: >"$GH_ARGS_LOG"
+out=$(GH_TOKEN="resolved-tok-4282" cmd_task_done DIVE-910 --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1); rc=$?
+scanned=$(grep -c 'ARGS=pr list' "$GH_ARGS_LOG")
+tokened=$(grep 'ARGS=pr list' "$GH_ARGS_LOG" | grep -c '^TOKEN=resolved-tok-4282 ')
+{ [[ $rc -eq 0 && "$(statusof DIVE-910)" == "done" ]] && (( scanned > 0 )) && (( tokened == scanned )); } \
+  && ok_t "T10 the RESOLVED token is handed to the scan — $tokened/$scanned repo listings carried it" \
+  || bad_t "T10 resolved token reaches the scan" "rc=$rc scanned=$scanned tokened=$tokened log=$(head -3 "$GH_ARGS_LOG")"
+[[ "$out" != *"UNVERIFIED"* ]] \
+  && ok_t "T10 a scan that answered on every repo closes verified-clean (no UNVERIFIED warning)" \
+  || bad_t "T10 clean close must not warn" "out=$out"
+
+if [[ "$(type -t sudo)" == "function" ]]; then
+  printf 'SKIP - T10b arm-4 hand-off: tests/lib/env_isolation.sh has replaced sudo with a refusing function on this host (DIVE-3096), so the arm-4 fixture cannot be built here. Runs on a host without the PAM knob restore.\n'
+else
+  seed DIVE-9101
+  : >"$GH_ARGS_LOG"
+  out=$(SUDO_STUB_MODE=token SUDO_USER="" cmd_task_done DIVE-9101 --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1); rc=$?
+  scanned=$(grep -c 'ARGS=pr list' "$GH_ARGS_LOG")
+  tokened=$(grep 'ARGS=pr list' "$GH_ARGS_LOG" | grep -c '^TOKEN=claude-token ')
+  { [[ $rc -eq 0 ]] && (( scanned > 0 )) && (( tokened == scanned )) && [[ "$out" != *"UNVERIFIED"* ]]; } \
+    && ok_t "T10b THE CUSTOMER SEAT: no own gh login, arm 4 (sudo -u claude) resolves — $tokened/$scanned listings carried that token and the close is verified-clean" \
+    || bad_t "T10b arm-4 token reaches the scan" "rc=$rc scanned=$scanned tokened=$tokened out=$out"
+fi
+
+# T11: THE SENTENCE THE OPERATOR READS. A held rail plus a failing listing used to
+# print "merge-gate could not query GitHub (partial-repo-scan-0-of-11)" — a statement
+# about the credential, on a box whose credential read the org's issues by hand. The
+# reason existed (gh wrote it to stderr) and died in the command substitution.
+seed DIVE-911
+: >"$GH_ARGS_LOG"
+out=$(GH_TOKEN="resolved-tok-4282" \
+      GH_STUB_FAIL="HTTP 403: API rate limit exceeded for user ID 4242 (https://api.github.com/repos/x)" \
+      cmd_task_done DIVE-911 --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1); rc=$?
+[[ $rc -eq 0 && "$(statusof DIVE-911)" == "done" ]] \
+  && ok_t "T11 fail-open intact: a scan whose every listing fails still does not stall the close" \
+  || bad_t "T11 fail-open on scan failure" "rc=$rc status=$(statusof DIVE-911)"
+{ [[ "$out" == *"repo scan FAILED"* ]] && [[ "$out" == *"rate limit exceeded"* ]] \
+  && [[ "$out" == *"partial-repo-scan-0-of-"* ]]; } \
+  && ok_t "T11 the warning NAMES what the scan failed on, not 'could not query GitHub'" \
+  || bad_t "T11 warning names the scan failure" "out=$out"
+[[ "$out" != *"could not query GitHub"* ]] \
+  && ok_t "T11 the credential wording is GONE from a close whose credential resolved" \
+  || bad_t "T11 credential wording must not appear" "out=$out"
+
+# T12: POSITIVE CONTROL for T11's wording swap — a seat with NO rail at all still
+# gets the original credential sentence. That case is the one it is true of, and a
+# fix that relabelled it too would have destroyed the distinction it exists to make.
+seed DIVE-912
+unset GH_STUB_FAIL
+out=$(SUDO_STUB_MODE=refused SUDO_USER="" GH_STUB_AUTH_TOKEN="" \
+      cmd_task_done DIVE-912 --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1); rc=$?
+{ [[ $rc -eq 0 ]] && [[ "$out" == *"could not query GitHub"* ]] && [[ "$out" == *"no-gh-token"* ]]; } \
+  && ok_t "T12 control: a seat holding NO rail still reads 'could not query GitHub (no-gh-token)'" \
+  || bad_t "T12 no-rail wording preserved" "rc=$rc out=$out"
+export GH_STUB_AUTH_TOKEN="tok"
 
 echo "-----"
 printf 'task_merge_gate_autodetect_unit: %d passed, %d failed\n' "$PASS" "$FAIL"

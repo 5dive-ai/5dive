@@ -301,6 +301,17 @@ cmd_task_merge_gate_selftest() {
   fi
   # A failing self-test is a FINDING, not a crash: it is the only surface on which an
   # inert gate announces itself, so it prints the same fields and exits non-zero.
+  #
+  # DIVE-4282: AND IT MUST SAY SO TO THE EXIT-TRAP BACKSTOP. Without `mark_reported`,
+  # lib/output.sh's `_report_silent_exit` sees a non-zero exit with nothing marked and
+  # overprints this verb's own verdict with "5dive task exited 1 without reporting a
+  # reason. This is a bug in the CLI ... Please file it: 5dive bug." Reported from a
+  # customer box 2026-09-11 as a `set -euo pipefail` crash; it is not one — the verb
+  # ran to completion, printed its finding, and returned its verdict. The damage is
+  # that the merge-gate warning tells an operator to run THIS command, and the command
+  # answers with a bug report instead of the diagnosis it just printed. Same fix, same
+  # reason, as cmd_task_merge_unverified's findings exit two functions below.
+  mark_reported
   if (( JSON_MODE )); then
     ok "merge-gate selftest: $detail" \
        '{verdict:$v, seat:$s, controlPr:$p, state:$st, tokenResolved:($tk=="1"), tokenTrace:$tr, botRail:$b, anonRail:$a}' \
