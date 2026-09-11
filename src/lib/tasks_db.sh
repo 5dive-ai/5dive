@@ -332,9 +332,14 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- a pull request they had closed out. The verifier's close now DECIDES the owner
   -- (src/task/delivery.sh, _merge_disp_decide) and records it, so the board renders
   -- a decision that was actually made rather than a guess re-derived per render.
-  --   merge_owner  the seat that owes the look — 'main' for every hold except the
-  --                one a maker alone can clear (a conflicted branch needing a
-  --                rebase), which names the maker.
+  --   merge_owner  the seat that owes the look. DIVE-4326: the decider emits a
+  --                ROLE ('merger' or 'maker') and never a seat, and the role is
+  --                resolved once — 'maker' from the row (a conflicted branch is
+  --                the one hold a maker alone can clear), 'merger' from the repo
+  --                and the roster: ops, and 'main' only where ops cannot reach.
+  --                Before DIVE-4326 it was the literal 'main' on every hold, and
+  --                the heartbeat's DIVE-4206 rule then made every such row
+  --                dispatchable to main alone.
   --   merge_hold_reason  the disposition's own reason token, e.g.
   --                'graded-sha-is-not-the-head', 'merge-state-BLOCKED',
   --                'user-facing-surface'. Rendered in `task show`, not on the
