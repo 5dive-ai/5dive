@@ -1364,13 +1364,107 @@ _compose_export_loops() {
   jq -c '.loops' <<<"$env"
 }
 
-# Where curated team templates live. Installed alongside the other shared
-# plugin assets; falls back to a repo-local team-templates/ for source checkouts.
-_team_templates_dir() {
-  if   [[ -d /usr/local/lib/5dive/team-templates ]]; then printf '%s' /usr/local/lib/5dive/team-templates
-  elif [[ -d "$(dirname "$(_compose_self)")/../team-templates" ]]; then
-    realpath "$(dirname "$(_compose_self)")/../team-templates"
-  else return 1
+# -------- team templates come from the MARKETPLACE REGISTRY (DIVE-4196) -----
+#
+# Curated team templates live in the same curated GitHub repo the character packs
+# come from — <org>/character-packs, under teams/ — and the CLI reads them there,
+# live. They are no longer bundled with this binary.
+#
+# WHY. They used to ship inside this repo and be staged by install.sh AT INSTALL
+# TIME ONLY. So publishing a template needed a PR here, an edit to the
+# installer's hand-maintained staging list, a release cut and a self-update on
+# every box — and even then an ALREADY-installed box never received it. Measured
+# 2026-09-10: this host ran 0.29.0 with 4 staged templates while the tag shipped
+# 6 (DIVE-4141). Two of the three template defects in the record are that shape:
+# a slug in index.json that install.sh never staged, advertised by `team ls` and
+# refused on import (#807 deploy-team, #808 distribution). Reading the registry
+# deletes the whole class: one declaration, no staging list to drift from it, and
+# a published template reaches every box on the next `team ls` with no cut.
+#
+# WHAT IT COSTS, stated rather than hidden: there is no bundled copy to fall back
+# to, so a slug import needs the network. A PATH still resolves as a path
+# (`5dive team import ./my-team.5dive.yaml`) — that is the offline and BYO route,
+# and it is the only fallback.
+TEAM_SCHEMA_MAX=2
+
+# Registry ROOT (not the teams/ dir): index entries carry a repo-relative
+# `path`, so root + path is the one place the layout is written down.
+_teams_registry_base() { echo "https://raw.githubusercontent.com/$(gh_org)/character-packs/main"; }
+
+# Fetch one registry object, preserving the failure class so a transient fetch
+# failure is never reported as the much stronger claim that the slug does not
+# exist. Returns 0=2xx, 1=404, 2=other HTTP, 3=timeout, 4=transport.
+# Deliberately self-contained rather than reusing cmd_pack.sh's twin: harnesses
+# source this file alone, and a cross-file dependency would make them red on a
+# seam that has nothing to do with what they grade.
+_teams_get() {
+  local url="$1" out="$2" http rc
+  if http=$(curl -sSL --max-time 20 -o "$out" -w '%{http_code}' "$url" 2>/dev/null); then
+    case "$http" in 2??) return 0 ;; 404) return 1 ;; *) return 2 ;; esac
+  else
+    rc=$?; (( rc == 28 )) && return 3; return 4
+  fi
+}
+
+# Fetch the index. It is NOT memoised in a variable, and the reason is the same
+# subshell rule that _team_resolve_template documents below: every caller reads
+# this through `idx=$(_teams_registry_index)`, a command substitution, so an
+# assignment made in here happens in the subshell and is discarded. A cache
+# written that way is inert — worse than none, because a green "fetched once"
+# arm can only be written by calling this function in a shape no caller uses.
+#
+# So the index is CARRIED instead of cached: a caller fetches it once and passes
+# it to _team_resolve_template, which is what keeps `team ps` at one index round
+# trip instead of one per slug. Nothing is written to disk either: a cache on
+# disk is a second thing that can be stale, which is the defect this row exists
+# to remove.
+_teams_registry_index() {
+  local tmp rc; tmp=$(mktemp)
+  # CAPTURE BEFORE BRANCHING. `$?` read inside `if ! cmd; then` is the status
+  # the `!` produced, not the one the command exited with — it is 0 exactly when
+  # the command failed. Written that way this returned 0-with-empty-output on
+  # every network failure, and the caller then reported a transport error as
+  # "no such template", which is the one conflation this path exists to avoid.
+  _teams_get "$(_teams_registry_base)/teams/index.json" "$tmp"; rc=$?
+  if (( rc != 0 )); then rm -f "$tmp"; return "$rc"; fi
+  if ! jq -e '.companies | type == "array"' >/dev/null 2>&1 <"$tmp"; then
+    rm -f "$tmp"; return 5
+  fi
+  cat "$tmp"; rm -f "$tmp"
+}
+
+# One sentence per failure class, so "cannot reach the registry" never reads as
+# "that template does not exist".
+_teams_index_diag() {
+  case "$1" in
+    1) echo "the registry index is missing (404 at $(_teams_registry_base)/teams/index.json)" ;;
+    2) echo "the registry returned an HTTP error" ;;
+    3) echo "the registry fetch timed out" ;;
+    5) echo "the registry index is malformed (no companies[])" ;;
+    *) echo "the registry could not be reached (network/transport)" ;;
+  esac
+}
+
+# THE SCHEMA GATE. This is the one thing bundling gave away for free: a template
+# and the CLI that read it shipped in the same artifact, so a template could not
+# declare a schema this binary does not understand. Publishing to a registry
+# decouples them, so the CLI has to say it itself — and it has to NAME the
+# version, because "unsupported template" with no number tells the customer
+# nothing they can act on and half-parsing it is worse than refusing.
+#
+# Applied to a --path import too, not just a slug: the hazard is the FILE, and a
+# newer template handed over on disk is the same file.
+_team_schema_version() {
+  sed -n 's/^version:[[:space:]]*"\{0,1\}\([0-9][0-9]*\)"\{0,1\}[[:space:]]*$/\1/p' "$1" | head -1
+}
+_team_assert_schema() {
+  local file="$1" label="$2" v
+  v=$(_team_schema_version "$file")
+  # No `version:` at all is a v1 template; the parser has always owned that case
+  # and this gate must not change its answer.
+  [[ -n "$v" ]] || return 0
+  if (( v > TEAM_SCHEMA_MAX )); then
+    fail "$E_USAGE" "template '$label' declares team schema v$v; 5dive $FIVE_VERSION reads up to v$TEAM_SCHEMA_MAX. Upgrade first: sudo 5dive self-update"
   fi
 }
 
@@ -1401,7 +1495,9 @@ usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
        5dive team ps [<slug|path>] [--type=<harness>]
        5dive team ls
   Provision a whole company-structure template in one call (wraps 5dive up).
-  <slug> resolves to a bundled template; a path is used as-is.
+  <slug> resolves in the marketplace registry (<org>/character-packs, teams/),
+  read live — a template published there works on this box with no update.
+  A path is used as-is, and is the offline / bring-your-own route.
 
   --type=<harness>  Create the whole roster on this harness instead of the
                     template's own (every bundled template says claude).
@@ -1413,20 +1509,59 @@ usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
 HELP
 }
 
+# <slug|path> [<index-json>] -> a readable local file. A path is used as-is; a
+# slug is resolved through the registry index and fetched. Return codes are
+# distinct on purpose, so the caller can tell "no such slug" from "could not
+# ask".
+#
+# The optional second argument is an ALREADY-FETCHED index, and it is how a
+# caller that resolves more than one slug (`team ps` with no slug) stays at one
+# index round trip: the index cannot be memoised here, because every caller
+# reads this function through a command substitution and an assignment made in
+# a subshell is discarded. Omit it and this fetches the index itself, which is
+# right for the one-slug callers (`team import <slug>`, `team ps <slug>`) and
+# keeps a PATH resolving with no network at all.
+#    1     = the fetched, valid index has no such slug — the ONLY code that
+#            licenses telling a customer their template does not exist
+#    3     = the index entry carries no path (a broken registry, not a bad call)
+#    4     = the template body itself could not be fetched
+#   21..25 = the INDEX could not be read; the low digit is _teams_get's class
+#
+# The class rides in the RETURN CODE and not in a variable on purpose: every
+# caller reads this function through a command substitution, which is a
+# subshell, so a variable set in here is gone by the time the caller looks at
+# it. A diagnostic that silently empties is worse than none — it prints
+# "unknown" and reads like a bug in the customer's command.
 _team_resolve_template() {
-  local ref="$1"
+  local ref="$1" idx="${2-}"
   if [[ -f "$ref" ]]; then
     printf '%s' "$ref"
     return 0
   fi
-  local dir; dir=$(_team_templates_dir) || return 1
-  if [[ -f "$dir/${ref}.5dive.yaml" ]]; then
-    printf '%s' "$dir/${ref}.5dive.yaml"
-  elif [[ -f "$dir/${ref}.5dive.yml" ]]; then
-    printf '%s' "$dir/${ref}.5dive.yml"
-  else
-    return 1
+  local rc entry path dest
+  if [[ -z "$idx" ]]; then
+    idx=$(_teams_registry_index); rc=$?   # never inside `if !` — see _teams_registry_index
+    if (( rc != 0 )); then return $(( 20 + rc )); fi
   fi
+  entry=$(jq -e --arg s "$ref" '.companies[] | select(.slug==$s)' <<<"$idx" 2>/dev/null) || return 1
+  path=$(jq -r '.path // empty' <<<"$entry"); [[ -n "$path" ]] || return 3
+  dest="$(mktemp -d)/${ref}.5dive.yaml"
+  _teams_get "$(_teams_registry_base)/$path" "$dest"; rc=$?
+  if (( rc != 0 )); then rm -rf "$(dirname "$dest")"; return 4; fi
+  printf '%s' "$dest"
+}
+
+# The message a caller shows when _team_resolve_template did not produce a file.
+_team_resolve_fail() {
+  local ref="$1" rc="$2" why
+  case "$rc" in
+    1) fail "$E_NOT_FOUND" "no template '$ref' in $(gh_org)/character-packs (try: 5dive team ls)" ;;
+    3) fail "$E_NOT_FOUND" "the registry lists '$ref' but the entry carries no path — the registry index is broken, not your command" ;;
+    4) why="the template body could not be fetched from the registry" ;;
+    2?) why=$(_teams_index_diag "$(( rc - 20 ))") ;;
+    *) why="unknown" ;;
+  esac
+  fail "$E_NOT_FOUND" "could not resolve template '$ref' — ${why}. This is NOT a claim that '$ref' does not exist; retry, or import a local file: 5dive team import ./<file>.5dive.yaml"
 }
 
 cmd_team() {
@@ -1438,15 +1573,16 @@ cmd_team() {
         cat >&2 <<'HELP'
 usage: 5dive team ps [<slug|path>] [--type=<harness>]
   Show a marketplace team's roster, state, scheduled loops and capability mode.
-  With no slug, show every bundled team whose complete roster is installed.
+  With no slug, show every registry team whose complete roster is installed.
 HELP
         return 0
       fi
       local ps_ref="${1:-}"
       if [[ -n "$ps_ref" && "$ps_ref" != --* ]]; then
         shift || true
-        local ps_file; ps_file=$(_team_resolve_template "$ps_ref") \
-          || fail "$E_NOT_FOUND" "no template '$ps_ref' (try: 5dive team ls)"
+        local ps_file ps_rc
+        ps_file=$(_team_resolve_template "$ps_ref") || { ps_rc=$?; _team_resolve_fail "$ps_ref" "$ps_rc"; }
+        _team_assert_schema "$ps_file" "$ps_ref"
         cmd_compose_ps -f "$ps_file" "$@"
         return 0
       fi
@@ -1455,38 +1591,89 @@ HELP
       # marketplace import. Detect complete installed rosters from registry
       # state; do not persist a mutable "last import" pointer that can lie after
       # a second team is installed or removed.
-      local ps_dir ps_reg ps_candidate ps_spec ps_name
-      local -a ps_matches=()
-      ps_dir=$(_team_templates_dir) || fail "$E_NOT_FOUND" "no team-templates dir found"
+      local ps_idx ps_rc ps_reg ps_slug ps_candidate ps_spec ps_res_rc ps_why
+      local -a ps_matches=() ps_names=()
+      local ps_unreadable=0
+      ps_idx=$(_teams_registry_index); ps_rc=$?
+      if (( ps_rc != 0 )); then
+        fail "$E_NOT_FOUND" "cannot list installed teams — $(_teams_index_diag "$ps_rc"). Name a template instead: 5dive team ps <slug|path>"
+      fi
       ps_reg=$(registry_read)
-      for ps_candidate in "$ps_dir"/*.5dive.yaml "$ps_dir"/*.5dive.yml; do
-        [[ -f "$ps_candidate" ]] || continue
+      while IFS= read -r ps_slug; do
+        [[ -n "$ps_slug" ]] || continue
+        # THE INDEX IS CARRIED IN, not refetched per slug: this loop is the one
+        # caller that resolves N slugs, so `$ps_idx` here is what keeps the
+        # whole command at a single index round trip.
+        #
+        # And the RETURN CODE is read rather than `|| continue`d. `|| continue`
+        # swallowed rc 4 (the template BODY could not be fetched) and rc 21..25
+        # (the index could not be read) identically to rc 1 (no such slug) — so
+        # a dropped connection came out the bottom of this loop as the much
+        # stronger claim that no roster is installed, which is the exact
+        # conflation the rest of this path exists to remove, one level up.
+        ps_candidate=$(_team_resolve_template "$ps_slug" "$ps_idx"); ps_res_rc=$?
+        if (( ps_res_rc != 0 )); then
+          case "$ps_res_rc" in
+            1) : ;;   # the index named it and it is gone: genuinely absent, skip
+            3) warn "registry entry '$ps_slug' carries no path — skipping it (the registry index is broken, not your command)" ;;
+            4) ps_unreadable=$((ps_unreadable+1))
+               ps_why="the template body could not be fetched from the registry"
+               warn "could not read template '$ps_slug' — ${ps_why}; its roster is not counted here" ;;
+            2?) ps_unreadable=$((ps_unreadable+1))
+                ps_why=$(_teams_index_diag "$(( ps_res_rc - 20 ))")
+                warn "could not read template '$ps_slug' — ${ps_why}; its roster is not counted here" ;;
+            *) ps_unreadable=$((ps_unreadable+1))
+               ps_why="the template could not be read (rc=$ps_res_rc)"
+               warn "could not read template '$ps_slug' — ${ps_why}; its roster is not counted here" ;;
+          esac
+          continue
+        fi
+        # A registry template this binary cannot read is skipped, not fatal: the
+        # question here is "which rosters are installed", and one unreadable
+        # template must not hide the ones that are.
+        [[ "$(_team_schema_version "$ps_candidate")" -le "$TEAM_SCHEMA_MAX" ]] 2>/dev/null || continue
         ps_spec=$(TEAM_AUTH_PROFILE="${TEAM_AUTH_PROFILE:-__team_ps__}" _compose_parse "$ps_candidate" 2>/dev/null) || continue
         if jq -e --argjson reg "$ps_reg" \
           '(.agents | length) > 0 and ([.agents | keys[] as $n | $reg.agents[$n] != null] | all)' \
           <<<"$ps_spec" >/dev/null; then
-          ps_matches+=("$ps_candidate")
+          ps_matches+=("$ps_candidate"); ps_names+=("$ps_slug")
         fi
-      done
-      (( ${#ps_matches[@]} > 0 )) \
-        || fail "$E_NOT_FOUND" "no complete bundled team roster is installed (try: 5dive team import <slug>)"
+      done < <(jq -r '.companies[].slug' <<<"$ps_idx")
+      # NOTHING MATCHED — and the two reasons are not the same answer. If any
+      # template could not be READ, "no roster is installed" is a claim this
+      # command did not earn: it never got to look. Say which it was.
+      if (( ${#ps_matches[@]} == 0 )); then
+        if (( ps_unreadable > 0 )); then
+          fail "$E_NOT_FOUND" "could not determine which teams are installed — ${ps_why} ($ps_unreadable of the registry's templates could not be read). This is NOT a claim that no roster is installed; retry, or name one: 5dive team ps <slug|path>"
+        fi
+        fail "$E_NOT_FOUND" "no complete team roster from $(gh_org)/character-packs is installed (try: 5dive team import <slug>)"
+      fi
+      local ps_i=0
       for ps_file in "${ps_matches[@]}"; do
         if (( ${#ps_matches[@]} > 1 )); then
-          ps_name=$(basename "$ps_file"); ps_name=${ps_name%.5dive.yaml}; ps_name=${ps_name%.5dive.yml}
-          echo "TEAM  $ps_name"
+          echo "TEAM  ${ps_names[$ps_i]}"
         fi
         cmd_compose_ps -f "$ps_file" "$@"
+        ps_i=$((ps_i+1))
       done
       return 0 ;;
     ls|list)
-      local dir; dir=$(_team_templates_dir) || fail "$E_NOT_FOUND" "no team-templates dir found"
-      echo "Available templates ($dir):"
-      local f
-      for f in "$dir"/*.5dive.yaml "$dir"/*.5dive.yml; do
-        [[ -f "$f" ]] || continue
-        local slug; slug=$(basename "$f"); slug="${slug%%.5dive.*}"
-        printf '  %-16s %s\n' "$slug" "$f"
-      done
+      # Read live from the registry. A template published there is listed here
+      # on the next call, on a box that has not been updated — which is the whole
+      # point of the move (DIVE-4196).
+      local ls_idx ls_rc
+      ls_idx=$(_teams_registry_index); ls_rc=$?
+      if (( ls_rc != 0 )); then
+        fail "$E_NOT_FOUND" "cannot read the team registry — $(_teams_index_diag "$ls_rc"). A local file still imports: 5dive team import ./<file>.5dive.yaml"
+      fi
+      echo "Available templates ($(gh_org)/character-packs → teams/):"
+      # A template the registry advertises but this binary cannot read is LISTED
+      # and marked, not hidden: a customer who sees nothing concludes the
+      # registry is empty, and the actionable fact is that their CLI is old.
+      jq -r --argjson max "$TEAM_SCHEMA_MAX" '
+        .companies[]
+        | "  \(.slug)\t\(.size // "?") roles\t\(.description // .name // "")\(if (.schemaVersion // 1) > $max then "   [needs a newer 5dive: schema v\(.schemaVersion)]" else "" end)"
+      ' <<<"$ls_idx" | column -t -s$'\t' 2>/dev/null || jq -r '.companies[].slug' <<<"$ls_idx"
       return 0 ;;
     -h|--help|"" )
       _team_usage
@@ -1513,9 +1700,12 @@ HELP
   done
   [[ -n "$ref" ]] || fail "$E_USAGE" "usage: 5dive team import <slug|path>"
 
-  local file=""
-  file=$(_team_resolve_template "$ref") \
-    || fail "$E_NOT_FOUND" "no template '$ref' (try: 5dive team ls)"
+  local file="" resolve_rc=0
+  file=$(_team_resolve_template "$ref") || { resolve_rc=$?; _team_resolve_fail "$ref" "$resolve_rc"; }
+  # Refuse a template this binary cannot read BEFORE the parser sees it. A
+  # half-parsed newer schema comes up as a roster missing whatever the new keys
+  # wired, which is worse than not importing at all.
+  _team_assert_schema "$file" "$ref"
 
   # --auth-profile overrides the template's ${TEAM_AUTH_PROFILE} default.
   #
