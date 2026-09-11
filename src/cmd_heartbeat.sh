@@ -432,6 +432,74 @@ _HB_A2A_FLUSHED=0
 # without a revert.
 _HB_A2A_DRAIN_BUDGET_SEC="${FIVE_A2A_DRAIN_BUDGET_SEC:-90}"
 _HB_A2A_DRAIN_POLL_SEC="${FIVE_A2A_DRAIN_POLL_SEC:-5}"
+# DIVE-4296 iteration 2 — IS THIS SPOOLED MESSAGE STILL WORTH TYPING?
+#
+# The faster drain shrinks the window between "correct when written" and
+# "stale on arrival"; it does not close it. A seat busy for two hours still
+# receives a two-hour-old nudge. Measured 2026-09-11: the answered-gate nudge
+# for DIVE-4284 was written at 07:55:09Z, spooled behind quinn's 15-18 deep
+# backlog, and typed at 10:00:11Z — after main2 closed the row at 09:56:47Z.
+# quinn, 10:00Z: "Fifth false wake. DIVE-4284 was closed four minutes before the
+# message reached me." Eight such nudges reached quinn between 07:25 and 09:55Z.
+#
+# THREE WAYS A MACHINE NUDGE GOES STALE IN THE SPOOL, all measured on quinn's
+# live spool at 10:15Z (main, 10:10Z + 10:20Z):
+#   1. the row it names is done or cancelled;
+#   2. the row is no longer ASSIGNED to the recipient (4 of quinn's 15: DIVE-4288
+#      had moved to ops, DIVE-4293 to main2, two nudges each);
+#   3. a newer nudge for the same row is already spooled behind it (3 older
+#      duplicates) — delivering both spends two rounds to say one thing.
+#
+# ONLY from=task-engine, AND THAT IS THE WHOLE SAFETY ARGUMENT. A machine nudge
+# is a re-derivable statement about a row's state, so re-deriving it at delivery
+# time and finding it false makes it noise. A human- or agent-authored message is
+# not re-derivable and is NEVER dropped: it may be a question, a correction, or
+# the only copy of something. This predicate returns "deliver" for anything it
+# cannot positively prove stale — an unreadable row, an unparseable ident, a db
+# that does not answer. It fails OPEN, in the direction of delivering twice
+# rather than losing one.
+#
+# Prints the reason and returns 0 when the message should be DROPPED; returns 1
+# when it should be delivered.
+_a2a_nudge_ident() {
+  local payload="$1" id
+  case "$payload" in
+    '[5dive-msg from=task-engine '*|'[5dive-msg from=task-engine]'*) ;;
+    *) return 1 ;;
+  esac
+  # -m1 rather than a grep-into-head pipe: header.sh sets -o pipefail, and a grep
+  # whose reader closes early returns non-zero, which would abort the caller.
+  id="$(grep -m1 -oE 'DIVE-[0-9]+' <<<"$payload" 2>/dev/null)" || return 1
+  [[ -n "$id" ]] || return 1
+  printf '%s' "$id"
+}
+
+_a2a_stale_nudge_reason() {
+  local seat="$1" payload="$2"; shift 2
+  local ident row status asg later lmsg lident
+  ident="$(_a2a_nudge_ident "$payload")" || return 1
+  row="$(db "SELECT COALESCE(status,'')||x'1f'||COALESCE(assignee,'')
+              FROM tasks WHERE COALESCE(ident,'DIVE-'||id)=$(sqlq "$ident");" 2>/dev/null)" || row=""
+  # No row, or a db that did not answer: deliver. Never drop on a failed read.
+  [[ -n "$row" ]] || return 1
+  IFS=$'\x1f' read -r status asg <<<"$row"
+  case "$status" in
+    done|cancelled) printf '%s is %s' "$ident" "$status"; return 0 ;;
+  esac
+  if [[ -n "$asg" && "$asg" != "$seat" ]]; then
+    printf '%s is now on %s' "$ident" "$asg"; return 0
+  fi
+  # (3) A NEWER nudge for the same row sits behind this one. The caller passes the
+  # rest of the spool in delivery order, so anything here is strictly newer.
+  for later in "$@"; do
+    lmsg="$(sudo -u "agent-${seat}" cat "$later" 2>/dev/null)" || continue
+    lident="$(_a2a_nudge_ident "$lmsg")" || continue
+    [[ "$lident" == "$ident" ]] || continue
+    printf 'a newer nudge for %s is already spooled behind it' "$ident"; return 0
+  done
+  return 1
+}
+
 _hb_a2a_queue_sweep() {
   local reg name depth deadline rounds=0
   local -a seats=() remaining=()
@@ -4915,12 +4983,27 @@ _hb_stall_sweep() {
     IFS=$'\x1f' read -r gid gident gfier ganswered <<<"$grow"
     [[ -n "$gid" && -n "$gfier" ]] || continue
     gmins=$(( ($(date -u +%s) - $(date -u -d "$ganswered" +%s 2>/dev/null || date -u +%s)) / 60 ))
-    ( cmd_send "$gfier" --from="task-engine" \
-        --message="✅ ${gident}: the human gate that was blocking it was ANSWERED ${gmins}m ago, so grading is genuinely yours again — nothing is waiting on a person. Pick it back up: \`5dive task start ${gident}\` then \`task done\`/\`task reject\` (DIVE-2207)." ) >/dev/null 2>&1 || true
-    ( cmd_send "ops" --from="task-engine" \
-        --message="✅ Answered-gate delivery: ${gident} is back on verifier '${gfier}' — its gate was answered ${gmins}m ago and the row had left gap#2's view, so it is surfaced here rather than sitting invisible (DIVE-2207)." ) >/dev/null 2>&1 || true
+    # DIVE-4296 iteration 2 (DO 5) — THE TWO SENDS THAT USED TO LIVE HERE ARE GONE.
+    # DIVE-2207 wrote them when an answered gate left the row invisible to the
+    # queue: nothing would dispatch it, so an a2a ping WAS the delivery. DIVE-4253
+    # (v0.31.0) made a gate-answered row dispatchable again, and that turned both
+    # sends into duplicates of the tick's own pick. lodar, 2026-09-11 09:18Z: "are
+    # these messages important? i thought we use only tasks queue for that?"
+    #
+    # A DUPLICATE HERE IS NOT FREE, which is why this is a deletion and not a
+    # throttle. The ping lands in the grader's live pane as a prompt, or spools
+    # behind the drain and arrives late: measured 2026-09-11, this arm's message
+    # for DIVE-4276 was typed 101 minutes after the answer, to a seat that no
+    # longer graded that row. Each such arrival costs the recipient a full
+    # re-investigation of a row they had closed out (the a2a rule the house runs
+    # on: the round is the cost, not the message).
+    #
+    # THE OBSERVATION IS KEPT, only the sends go. The stamp still latches so the
+    # sweep does not re-examine the row every tick, and the log line still records
+    # that this arm saw it — what changes is that the DELIVERY is now the tick's
+    # dispatch, which is the one mechanism that knows who owns the row NOW.
     db "UPDATE tasks SET gate_answered_nudged_at=datetime('now') WHERE id=${gid};"
-    _hb_log "[stall-sweep] ${gident} gate answered ${gmins}m ago, back on ${gfier} -> surfaced"
+    _hb_log "[stall-sweep] ${gident} gate answered ${gmins}m ago, back on ${gfier} -> left to the queue (no a2a; DIVE-4296)"
   done < <(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id)||x'1f'||verifier||x'1f'||need_answered_at
                FROM tasks
                WHERE verifier IS NOT NULL AND maker_agent IS NOT NULL
