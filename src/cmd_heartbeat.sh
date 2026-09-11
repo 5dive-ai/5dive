@@ -1692,8 +1692,8 @@ _hb_tier_rank() {
 
 # DIVE-4279: one tmux send-keys step, with its stderr KEPT. Measured 2026-09-11
 # 04:45:24Z on lodar's box 5dive-exact-swallow (5dive 0.31.0): the devops wake
-# logged `nudge send failed` / `wake failed — will retry next tick` and NOTHING
-# else, because all three send-keys calls here were bare `|| return 1` with
+# logged only the two bare lines (nudge send failed, then the retry notice) and
+# NOTHING else, because all three send-keys calls here were bare `|| return 1` with
 # `2>/dev/null` — the one diagnostic that would name the cause was the thing
 # discarded. Each step now names ITSELF and quotes what tmux said, so an operator
 # (or the supervisor) reads a cause instead of guessing.
