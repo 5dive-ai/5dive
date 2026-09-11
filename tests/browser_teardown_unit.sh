@@ -23,7 +23,7 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 ROOT="$PWD"
 HOOK="$ROOT/hooks/stop-browser-teardown.sh"
 START="$ROOT/5dive-agent-start"
@@ -83,8 +83,27 @@ EOF
 # .../node_modules/agent-browser/bin/, and the fakes exec those.
 fake_bindir() { echo "$1/fake/node_modules/agent-browser/bin"; }
 
+# WAIT FOR THE EXEC TO LAND. A backgrounded `setsid prog` passes through
+# bash -> setsid -> prog, so for a short window /proc/<pid>/exe is still
+# /usr/bin/bash or /usr/bin/setsid (measured on this host: 200/200 reads taken
+# at the instant of spawn saw an unsettled exe). The hook selects BY EXE, so a
+# fake read before its exec completes is correctly skipped and the arm reads
+# as "nothing running" -- which is exactly the arm2 red CI saw at f90cafa7,
+# while a fast host wins the race and the suite passes. Blocking here removes
+# the race from every spawn arm instead of relying on host speed.
+settle_exe() { # settle_exe <pid> -- returns 0 once exe matches, 1 on timeout
+  local pid="$1" i exe
+  for ((i=0;i<200;i++)); do            # 200 * 0.05s = 10s ceiling
+    exe="$(readlink "/proc/$pid/exe" 2>/dev/null)"
+    [[ "$exe" =~ [/.]agent-browser[-/] ]] && return 0
+    kill -0 "$pid" 2>/dev/null || return 1
+    sleep 0.05
+  done
+  return 1
+}
+
 spawn_fake() { # spawn_fake <pidfile> <count> [ignore-term]
-  local f="$1" n="$2" ignore="${3:-}" i dir bin
+  local f="$1" n="$2" ignore="${3:-}" i dir bin pid
   dir="$(dirname "$f")"; bin="$(fake_bindir "$dir")"
   : >"$f"
   for ((i=0;i<n;i++)); do
@@ -93,7 +112,11 @@ spawn_fake() { # spawn_fake <pidfile> <count> [ignore-term]
     else
       setsid "$bin/agent-browser-linux-x64" 300 >/dev/null 2>&1 &
     fi
-    echo "$!" >>"$f"
+    pid=$!
+    echo "$pid" >>"$f"
+    settle_exe "$pid" \
+      || bad "fixture: fake browser pid $pid never reached an agent-browser exe" \
+             "exe=[$(readlink "/proc/$pid/exe" 2>/dev/null)]"
   done
 }
 
