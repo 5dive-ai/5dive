@@ -237,5 +237,40 @@ else
   bad_t "the unknown-deadline fallback changed" "got '$U6', expected ~${EXP6}"
 fi
 
+# ── 7. THE COST OF THE COMMON TICK (iteration 3) ─────────────────────────────
+# Iteration 2 asked sqlite for the newest observation in its OWN `db` call at
+# the top of every `_hb_reclaim` — one extra sqlite3 fork per seat per tick even
+# when nothing anywhere is parked, which is the shape of almost every tick and
+# of almost every harness in the corpus. The read now rides the SAME invocation
+# as the seat's rows, so an ordinary tick must issue exactly ONE query here.
+#
+# THE NUMBER IS THE ASSERTION, not a comment about one: this arm counts `db`
+# invocations across a whole reclaim of a seat that is NOT parked and holds one
+# row well inside its budget. It reads 1 with the fold and 2 without it, so
+# re-adding an unconditional pre-query reddens this arm rather than quietly
+# costing the corpus a fork per tick again.
+#
+# COUNTED THROUGH A FILE, not a variable: the query runs inside `mapfile < <(…)`,
+# a subshell whose increments never reach this shell.
+reset_all; spies_reset
+DB_LOG="$TMP/dbcalls"
+eval "_db_real() $(declare -f db | tail -n +2)"
+db() { printf 'x\n' >>"$DB_LOG"; _db_real "$@"; }
+sup_obs codex idle "1 minute" unknown ""     # observed, and NOT walled
+T7=$(mk_overrun codex 3)                     # a held row, comfortably inside budget
+: >"$DB_LOG"
+_hb_reclaim codex 15 >/dev/null 2>&1
+DBN=$(wc -l <"$DB_LOG" | tr -d ' ')
+(( DBN == 1 )) \
+  && ok_t "an un-parked tick costs ONE query — the observation rides the row read, not a second fork" \
+  || bad_t "the common reclaim tick issues ${DBN} queries, not 1" \
+           "the un-park is paying for a read on every tick of every seat again"
+# NON-VACUITY: the counter is real, and the row was genuinely judged — a reclaim
+# that queried nothing because it did nothing would also read 1.
+{ [[ "$(row "$T7")" == in_progress\|* ]] && (( $(wc -l <"$DB_LOG") > 0 )); } \
+  && ok_t "[control] the counted tick really ran — the row is still held, inside its budget" \
+  || bad_t "the cost arm graded an empty tick" "row=$(row "$T7") calls=$(wc -l <"$DB_LOG")"
+unset -f db; eval "db() $(declare -f _db_real | tail -n +2)"
+
 printf '\n%d passed / %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
