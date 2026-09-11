@@ -1503,6 +1503,42 @@ cmd_update_check() {
   local frozen_armed="${fz[3]:-yes}" frozen_armed_json=true
   [[ "$frozen_armed" == yes ]] || frozen_armed_json=false
 
+  # >>> DIVE-4294 resolved target readback
+  # DIVE-4294: what this box will actually INSTALL, and from which rung.
+  #
+  # `latest` above answers "what is the newest published version" — it is NOT
+  # the target. A pinned box and a canary box sitting on the same pin report an
+  # IDENTICAL `latest` and install DIFFERENT tags, which is exactly the pair of
+  # boxes this reading exists for. We do not re-derive the ladder here: its only
+  # authority is install.sh's resolve_cli_target, and a second copy of a
+  # resolver is the shape that goes stale and is then read back as proof. We
+  # read the RECEIPT that resolver wrote on its last success.
+  #
+  # An unreadable or malformed receipt yields nulls, never a guess — an absent
+  # field must read as "not observed" at every surface downstream.
+  local receipt="${CLI_TARGET_RECEIPT_FILE:-/var/lib/5dive/cli-target.json}"
+  local rt_json=null rr_json=null rd_json=null ra_json=null
+  if [[ -r "$receipt" ]]; then
+    local rec; rec="$(jq -c . "$receipt" 2>/dev/null)" || rec=""
+    if [[ -n "$rec" ]]; then
+      local rt rr rd ra
+      rt="$(jq -r '.tag // empty' <<<"$rec" 2>/dev/null)"
+      rr="$(jq -r '.rung // empty' <<<"$rec" 2>/dev/null)"
+      rd="$(jq -r '.rungDetail // empty' <<<"$rec" 2>/dev/null)"
+      ra="$(jq -r '.at // empty' <<<"$rec" 2>/dev/null)"
+      # A tag is only reported if it still LOOKS like a tag; a receipt whose tag
+      # field was truncated mid-write must not become a version string on a
+      # customer's dashboard.
+      if [[ "$rt" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        rt_json="$(jq -n --arg v "$rt" '$v')"
+        [[ -n "$rr" ]] && rr_json="$(jq -n --arg v "$rr" '$v')"
+        [[ -n "$rd" ]] && rd_json="$(jq -n --arg v "$rd" '$v')"
+        [[ -n "$ra" ]] && ra_json="$(jq -n --arg v "$ra" '$v')"
+      fi
+    fi
+  fi
+  # <<< DIVE-4294 resolved target readback
+
   local prose
   if [[ "$behind" == true ]]; then
     prose="CLI $current is behind (latest $latest)"
@@ -1511,6 +1547,16 @@ cmd_update_check() {
     prose="CLI $current is AHEAD of the newest release $latest — the installer will refuse to move it (a release cut is owed)"
   else
     prose="CLI $current is up to date"
+  fi
+  # The same sentence a human running `5dive update --check` reads. It names the
+  # target, not `latest`, and it names the rung — on a pinned box those two
+  # clauses are the entire answer to "why did it skip the update?".
+  if [[ "$rt_json" != null ]]; then
+    local rt_p rr_p
+    rt_p="$(jq -r . <<<"$rt_json")"
+    rr_p="$(jq -r . <<<"$rd_json" 2>/dev/null)"; [[ "$rd_json" == null ]] && rr_p=""
+    prose+=" · this box installs $rt_p"
+    [[ -n "$rr_p" ]] && prose+=" (from $rr_p)"
   fi
   [[ "$frozen_state" == frozen ]] && prose+=" · ⚠ $frozen_detail"
   # An unarmed alarm never says "frozen", so this line is the only thing that
@@ -1529,7 +1575,9 @@ cmd_update_check() {
   # or unwritable record is "unknown", and a caller must not be able to read a
   # green out of an observation we never made.
   ok "$prose" \
-     '{current:$cur, latest:$lat, behind:$beh, ahead:$ahd, stale:$stl, frozen:$fz, frozenAgeSec:$fza, frozenDetail:$fzd, frozenArmed:$fzarm, lastUpdateOk:$luo, lastUpdateAt:$lua, source:$src}' \
+     '{current:$cur, latest:$lat, behind:$beh, ahead:$ahd, stale:$stl, frozen:$fz, frozenAgeSec:$fza, frozenDetail:$fzd, frozenArmed:$fzarm, lastUpdateOk:$luo, lastUpdateAt:$lua, source:$src, resolvedTarget:$rtg, resolvedRung:$rrg, resolvedRungDetail:$rrd, resolvedAt:$rat}' \
+     --argjson rtg "$rt_json" --argjson rrg "$rr_json" \
+     --argjson rrd "$rd_json" --argjson rat "$ra_json" \
      --arg cur "$current" --arg lat "$latest" --arg src "$detail" \
      --arg fz "$frozen_state" --arg fzd "$frozen_detail" \
      --argjson fzarm "$frozen_armed_json" \
