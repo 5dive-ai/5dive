@@ -1190,23 +1190,25 @@ cmd_push_do() {
   # DIVE-1923: ship ledger. After the push, never before — this records what
   # landed, so a failed push must leave no trace. Never fatal.
   _push_record_ship_ledger "$repopath" "$branch" "$ident" "$slug" 2>/dev/null || true
-  # DIVE-4288: the override's receipt has to be findable FROM THE SEAT THAT SIGNED
-  # IT. The rail appends the reason to <git-common-dir>/5dive-push-override.log,
-  # and here that append happens as ROOT inside an agent-owned checkout — so the
-  # file is created root-owned and a later non-delegated push silently fails to
-  # append to it (the rail's write is `|| true`). Hand it back to the checkout's
-  # owner and PRINT the path: a signature nobody can locate is not an audit trail.
+  # DIVE-4288 (iteration 2, main2's finding): THIS FUNCTION TOUCHES NO PATH INSIDE
+  # THE AGENT'S CHECKOUT. Iteration 1 stat'd and chown'd
+  # <git-common-dir>/5dive-push-override.log from here to hand root's append back
+  # to the signing seat. Every one of those operations DEREFERENCES — `[[ -f ]]`
+  # follows a symlink, and `chown --reference` affects the referent (coreutils
+  # documents --dereference as the default) — so an agent who plants that path as
+  # a symlink gets root to append its own text to, and then hand it ownership of,
+  # any file root can write. A real delegated checkout is agent-dev:claude and
+  # /etc/5dive/connectors is root:claude 0750, traversable by any seat: the target
+  # was nameable. That is exactly the boundary this file's header defends.
+  #
+  # The guard is not the fix — the crossing is. The rail now writes root's receipt
+  # to the root-owned /var/log/5dive/push-override.log and PRINTS the path in the
+  # push output above, which is all "findable from the seat that signed it" ever
+  # asked for. So there is nothing to own back, nothing to stat, and no symlink
+  # guard needed to be correct.
+  # community/wiki/a-fix-that-makes-a-path-root-reachable-inherits-that-paths-safety.md
   if [[ -n "$override" ]]; then
-    local _gcd _olog
-    _gcd=$("${G[@]}" rev-parse --git-common-dir 2>/dev/null) || _gcd=""
-    [[ -n "$_gcd" && "$_gcd" != /* ]] && _gcd="${repopath}/${_gcd}"
-    _olog="${_gcd}/5dive-push-override.log"
-    if [[ -n "$_gcd" && -f "$_olog" ]]; then
-      chown --reference="$repopath" -- "$_olog" 2>/dev/null || true
-      echo "[5dive] override signed for ${ident}; the reason is logged at ${_olog} (owned by this checkout, so the signing seat can read it)." >&2
-    else
-      echo "[5dive] override signed for ${ident}; the rail printed the signed reason above. No override log was written at ${_olog:-<git-common-dir>/5dive-push-override.log} — that path is the rail's, and it writes best-effort." >&2
-    fi
+    echo "[5dive] override signed for ${ident}; the rail printed the signed reason and the path of its root-owned log above. Nothing was written into your checkout as root." >&2
   fi
   local author_note; [[ -n "$author" ]] && author_note="author enforced" || author_note="no author restriction"
   ok "pushed ${branch}@${sha} → ${slug} (delegated, repo-scoped token, ${author_note}, gate cleared)" \

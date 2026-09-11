@@ -37,10 +37,20 @@
 #                                  is what sent DIVE-4282 to "hand the branch to a
 #                                  credentialed seat or edit the red gate".
 #   the signature is FINDABLE      B9: an accepted override prints the path of the
-#                                  log it was written to. On a delegated push that
-#                                  file is written by root inside an agent-owned
-#                                  checkout; a receipt nobody can locate is not an
-#                                  audit trail.
+#                                  log it was written to. A receipt nobody can
+#                                  locate is not an audit trail.
+#   root writes NOWHERE the agent  B10/B10b/B10c (iteration 2, main2's finding):
+#   controls                       carrying the reason across the boundary made
+#                                  `override_taken()`'s append reachable ROOT-side
+#                                  for the first time, and it appended to
+#                                  <git-common-dir>/5dive-push-override.log — a
+#                                  path inside the agent's own checkout. `>>`
+#                                  writes THROUGH a symlink, so that was root
+#                                  appending agent-supplied text into any file root
+#                                  can write. The receipt now goes to the root-owned
+#                                  /var/log/5dive/push-override.log; B10b plants the
+#                                  symlink and asserts the target is untouched, with
+#                                  its own non-vacuity control one env flag away.
 #
 # NO ROOT, NO NETWORK. `cmd_push_do` itself is root-only and mints a real token,
 # so it is not run here: the pieces it is built from are functions precisely so
@@ -232,15 +242,97 @@ grep -q 'FIVE_PUSH_DELEGATED' "$HOOK" \
   || bad_t "B8b the hook still prints one escape block for both kinds of push"
 
 # ── B9: the signature is findable ─────────────────────────────────────────────
-out="$( cd "$SB" && FIVE_PUSH_OVERRIDE="$FIVE" bash scripts/pre-push-rail.sh "$SB_BASE" HEAD --only=harnesses 2>&1 )"; rc=$?
-{ (( rc == 0 )) && grep -q 'OVERRIDDEN' <<<"$out" \
-  && grep -q 'logged to:.*5dive-push-override.log' <<<"$out"; } \
-  && ok_t "B9 an accepted override prints the PATH of the log it was written to — on a delegated push that file is written by root inside the agent's checkout" \
-  || bad_t "B9 the accepted override did not name its log path (rc=$rc): $out"
+#
+# THIS HARNESS DOES NOT KNOW ITS OWN PRIVILEGE, AND MUST NOT ASSUME IT. The rail
+# runs it from the pre-push hook, and on a DELEGATED push that hook is root's — so
+# the arms below execute as root roughly half the time. `override_taken()` keys its
+# destination on EUID precisely because root is the hazard, so "the ordinary path
+# writes into the checkout" is true for an agent and FALSE for root, and an arm
+# that hard-codes the agent's answer reds on the very behaviour it is grading.
+# Each arm below therefore names the expectation for the uid it is actually
+# running under, and grades both. (Measured 2026-09-11: the first delivery of
+# these arms went red inside the real hook for exactly this reason.)
+if [[ ${EUID:-$(id -u)} -eq 0 ]]; then WRITER=root; else WRITER=agent; fi
+# A root-side run appends to the REAL /var/log/5dive/push-override.log, which is an
+# audit trail people read. Mark the fixture so an entry from this harness is never
+# mistaken for a signature somebody actually gave.
+FIVE_MARKED=$'0) HARNESS FIXTURE — tests/push_override_delegated_unit.sh. NOT a real override.\n'"$FIVE"
 
-grep -Fq 'chown --reference="$repopath"' "$SRC/cmd_push.sh" \
-  && ok_t "B9b _push_do hands the override log back to the checkout's owner — root's append would otherwise leave a file the signing seat cannot write" \
-  || bad_t "B9b the override log is left root-owned in an agent's checkout"
+out="$( cd "$SB" && FIVE_PUSH_OVERRIDE="$FIVE_MARKED" bash scripts/pre-push-rail.sh "$SB_BASE" HEAD --only=harnesses 2>&1 )"; rc=$?
+if [[ $WRITER == root ]]; then _want='logged to:.*/var/log/5dive/push-override.log'; else _want='logged to:.*5dive-push-override.log'; fi
+{ (( rc == 0 )) && grep -q 'OVERRIDDEN' <<<"$out" && grep -qE "$_want" <<<"$out"; } \
+  && ok_t "B9 an accepted override prints the PATH of the log it was written to (writer=$WRITER) — a receipt nobody can locate is not an audit trail" \
+  || bad_t "B9 the accepted override did not name its log path (writer=$WRITER, rc=$rc): $out"
+
+# ── B10: root does not write into the agent's checkout ────────────────────────
+#
+# main2's finding on iteration 1, and the arm it asked for. These are BEHAVIOURAL:
+# the arm that was here before was `grep -Fq 'chown --reference="$repopath"'` — a
+# presence-grep on source text, which reads identically green with `-h` present
+# and with `-h` absent, i.e. green on both the safe and the unsafe version of the
+# line it names. A security property cannot be graded by grepping for the code
+# that implements it.
+CKLOG="$SB/.git/5dive-push-override.log"
+rm -f "$CKLOG"
+
+out="$( cd "$SB" && FIVE_PUSH_DELEGATED=1 FIVE_PUSH_TASK=DIVE-4288 FIVE_PUSH_OVERRIDE="$FIVE_MARKED" \
+        bash scripts/pre-push-rail.sh "$SB_BASE" HEAD --only=harnesses 2>&1 )"; rc=$?
+{ (( rc == 0 )) && grep -q 'OVERRIDDEN' <<<"$out" \
+  && grep -q '/var/log/5dive/push-override.log' <<<"$out" \
+  && ! grep -q "$SB" <<<"$(grep -E 'logged to:|NOT LOGGED' <<<"$out")" \
+  && [[ ! -e "$CKLOG" ]]; } \
+  && ok_t "B10 on a DELEGATED push the receipt goes to the root-owned /var/log/5dive/push-override.log and the checkout's .git is not written at all — the path is named either way, which is the whole of 'findable from the seat that signed it'" \
+  || bad_t "B10 the delegated receipt still resolves inside the agent's checkout (rc=$rc, checkout log exists: $([[ -e "$CKLOG" ]] && echo yes || echo no)): $out"
+
+# THE SYMLINK ARM. `>>` writes THROUGH a symlink into the target and leaves the
+# link intact — that is the whole mechanism, and it is why a guard on the WRITE
+# was never the fix. The arm plants the link at the path iteration 1 wrote to and
+# asserts the target is untouched.
+TARGET="$TMP/victim.conf"
+printf 'root-only-secret\n' > "$TARGET"
+before="$(cat "$TARGET")"
+rm -f "$CKLOG"; ln -s "$TARGET" "$CKLOG"
+
+# NON-VACUITY, PROVED WITHOUT THE RAIL AND AT ANY PRIVILEGE: the planted link is
+# LIVE. Without this, B10b would read green if nothing ever wrote that path for
+# any reason — a tautology about a dead file dressed as a security property.
+printf 'control-write\n' >> "$CKLOG"
+{ [[ "$(cat "$TARGET")" != "$before" ]] && [[ -L "$CKLOG" ]]; } \
+  && ok_t "B10b-control the planted link IS live: a plain '>>' to <git-common-dir>/5dive-push-override.log lands in the target and leaves the link intact — so B10b below is a measurement, not a claim about a path nothing writes" \
+  || bad_t "B10b-control the control write did not reach the target, so B10b proves nothing"
+printf 'root-only-secret\n' > "$TARGET"; before="$(cat "$TARGET")"
+
+( cd "$SB" && FIVE_PUSH_DELEGATED=1 FIVE_PUSH_TASK=DIVE-4288 FIVE_PUSH_OVERRIDE="$FIVE_MARKED" \
+    bash scripts/pre-push-rail.sh "$SB_BASE" HEAD --only=harnesses ) >/dev/null 2>&1
+after_delegated="$(cat "$TARGET")"
+
+( cd "$SB" && FIVE_PUSH_OVERRIDE="$FIVE_MARKED" \
+    bash scripts/pre-push-rail.sh "$SB_BASE" HEAD --only=harnesses ) >/dev/null 2>&1
+after_ordinary="$(cat "$TARGET")"
+
+[[ "$after_delegated" == "$before" ]] \
+  && ok_t "B10b a symlink planted at <git-common-dir>/5dive-push-override.log is NOT followed on a delegated push — the target is byte-identical, so root appends the agent's own text nowhere" \
+  || bad_t "B10b the delegated push wrote THROUGH the planted symlink into $TARGET"
+
+# B10d, the EUID key itself, and the reason it is not just the flag: a root-run
+# `git push` in an agent's checkout has the same shape with NO flag set. Under
+# root the ordinary run must ALSO refuse that path; under an agent it must still
+# use it, because nothing about an agent writing its own checkout is a crossing.
+if [[ $WRITER == root ]]; then
+  [[ "$after_ordinary" == "$before" ]] \
+    && ok_t "B10d the destination is keyed on EUID, not only on the flag: root running an ORDINARY push in an agent's checkout also writes root-side and does not follow the planted link" \
+    || bad_t "B10d as root, an ordinary push still wrote THROUGH the planted symlink into $TARGET — the EUID key is not doing its job"
+else
+  [[ "$after_ordinary" != "$before" ]] \
+    && ok_t "B10d an agent writing its OWN checkout still logs there (the link is followed, as it always was) — the fix narrowed root, it did not take the local receipt away" \
+    || bad_t "B10d the ordinary agent-side push stopped writing its own override log"
+fi
+
+# A RATCHET, and named as one: it is evidence that the deleted operations stayed
+# deleted, NOT evidence of the security property — B10/B10b are that.
+{ ! grep -vE '^[[:space:]]*#' "$SRC/cmd_push.sh" | grep -nE 'chown|--reference' | grep -qiE 'olog|override|git-common-dir'; } \
+  && ok_t "B10c ratchet: _push_do performs no chown and no --reference on the override log — the crossing is deleted, not guarded, so there is no path in the agent's checkout for root to dereference" \
+  || bad_t "B10c cmd_push.sh chowns the override log again — that operation follows symlinks (coreutils: --dereference is the default)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 )) || exit 1
