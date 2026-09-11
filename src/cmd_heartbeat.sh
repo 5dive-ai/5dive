@@ -401,10 +401,22 @@ _hb_autosleep_sweep() {
 # half — the seat's next idle, which is also its next wake, since a woken seat is
 # idle before its first turn.
 #
-# ONE MESSAGE PER SEAT PER TICK, and that is the design, not a throttle. Typing
-# the second message straight after the first would land it inside the turn the
-# first just started — the exact defect. So the flush re-asks the idle question
-# every tick and a backlog drains one message per idle observation.
+# ONE MESSAGE PER IDLE OBSERVATION — and the observation is no longer the CRON
+# TICK (DIVE-4296). Typing the second message straight after the first would land
+# it inside the turn the first just started, so the drain must re-ask the idle
+# question before every delivery; what it must NOT do is wait five minutes to ask.
+# Measured 2026-09-11 07:35-07:40Z: quinn held 15 then 16 spooled messages, a
+# 75-80 minute backlog at one per tick, and olivia force-woke ops to get round it.
+# So the pass now ROUND-ROBINS every seat with a spool, delivering at most one per
+# seat per round, sleeping _HB_A2A_DRAIN_POLL_SEC between rounds (which is both the
+# idle re-poll interval and the settle window that stops round N+1 typing into the
+# turn round N started), until every spool is empty or the pass budget is spent.
+# The budget is what keeps a tick bounded: an empty or busy fleet costs one round.
+#
+# RESIDUAL, named: a seat whose turns run longer than the remaining budget still
+# carries its backlog into the next tick — bounded now by the seat's own turn
+# length rather than by cron. Draining at the seat's own turn end needs a Stop
+# hook in the agent scaffold, which is a different rail and not in this diff.
 #
 # ORDERED BEFORE THE AUTOSLEEP SWEEP in the tick: a seat with mail waiting must
 # not be stopped with it still spooled. The spool survives a stop (it is a file
@@ -414,8 +426,15 @@ _hb_autosleep_sweep() {
 # Same isolation contract as every other sweep — a failure here must NEVER abort
 # the wake loop.
 _HB_A2A_FLUSHED=0
+# Seconds the whole drain pass may spend waiting for seats to go idle, and the
+# gap between rounds. Both overridable so a fleet can tune or neutralise the
+# in-tick drain (BUDGET=0 restores the pre-4296 one-round behaviour exactly)
+# without a revert.
+_HB_A2A_DRAIN_BUDGET_SEC="${FIVE_A2A_DRAIN_BUDGET_SEC:-90}"
+_HB_A2A_DRAIN_POLL_SEC="${FIVE_A2A_DRAIN_POLL_SEC:-5}"
 _hb_a2a_queue_sweep() {
-  local reg name depth
+  local reg name depth deadline rounds=0
+  local -a seats=() remaining=()
   _HB_A2A_FLUSHED=0
   declare -F a2a_queue_flush_one >/dev/null 2>&1 || return 0
   reg=$(registry_read) || return 0
@@ -424,12 +443,35 @@ _hb_a2a_queue_sweep() {
     [[ "$depth" =~ ^[0-9]+$ ]] || continue
     (( depth > 0 )) || continue
     systemctl is-active --quiet "5dive-agent@${name}.service" 2>/dev/null || continue
-    if a2a_queue_flush_one "$name"; then
-      _HB_A2A_FLUSHED=$((_HB_A2A_FLUSHED + 1))
-      _hb_log "[$name] delivered 1 queued a2a message at idle (${depth} were spooled)"
-    fi
+    seats+=("$name")
   done
-  (( _HB_A2A_FLUSHED > 0 )) && _hb_log "[a2a-queue] pass done — ${_HB_A2A_FLUSHED} delivered"
+  (( ${#seats[@]} > 0 )) || return 0
+  deadline=$(( $(date +%s) + ${_HB_A2A_DRAIN_BUDGET_SEC:-0} ))
+  while (( ${#seats[@]} > 0 )); do
+    rounds=$((rounds + 1))
+    remaining=()
+    for name in "${seats[@]}"; do
+      if a2a_queue_flush_one "$name"; then
+        _HB_A2A_FLUSHED=$((_HB_A2A_FLUSHED + 1))
+        depth=$(_a2a_queue_depth "$name")
+        # Depth AFTER the drain, every time: the backlog is the number the next
+        # reader of this log needs, and it is what makes a stuck spool visible.
+        _hb_log "[$name] delivered 1 queued a2a message at idle (${depth:-?} still spooled)"
+      else
+        depth=$(_a2a_queue_depth "$name")
+      fi
+      [[ "$depth" =~ ^[0-9]+$ ]] && (( depth > 0 )) && remaining+=("$name")
+    done
+    seats=( ${remaining[@]+"${remaining[@]}"} )
+    (( ${#seats[@]} > 0 )) || break
+    # Budget check BEFORE the sleep, so the pass can never overrun it.
+    if (( $(date +%s) + ${_HB_A2A_DRAIN_POLL_SEC:-0} > deadline )); then
+      _hb_log "[a2a-queue] drain budget (${_HB_A2A_DRAIN_BUDGET_SEC}s) spent after ${rounds} round(s) — ${#seats[@]} seat(s) still spooled, next tick continues"
+      break
+    fi
+    sleep "${_HB_A2A_DRAIN_POLL_SEC}"
+  done
+  (( _HB_A2A_FLUSHED > 0 )) && _hb_log "[a2a-queue] pass done — ${_HB_A2A_FLUSHED} delivered in ${rounds} round(s)"
   return 0
 }
 
@@ -444,10 +486,13 @@ _hb_usage() {
   5dive heartbeat off <name>              # stop waking the agent (keeps its settings)
   5dive heartbeat ls                      # show enrolled agents + next-wake + queued count
   5dive heartbeat tick                    # cron driver: wake every due agent that has work
-  5dive heartbeat wake-task <agent> <task_id> [<ident>]
+  5dive heartbeat wake-task [--fresh|--no-fresh] <agent> <task_id> [<ident>]
                                           # root: drive ONE agent onto ONE task now, bypassing the
                                           # cadence. The manual exit from a tier-guard hold, and
                                           # what \`loop\` uses to start a just-spawned row.
+                                          # Clears first exactly when the tick would (the seat's
+                                          # \`fresh\` setting, or the row's own override); --fresh /
+                                          # --no-fresh force it either way.
   5dive heartbeat held [--json] [--stalled-hours=<h>]
                                           # seats whose ENTIRE runnable queue is tier-guard held
                                           # (breach-only: prints nothing when no seat is stranded)
@@ -492,19 +537,74 @@ cmd_heartbeat() {
   esac
 }
 
+# THE ONE DEFINITION OF "does this wake clear first?" (DIVE-4296). Two callers
+# ask it — the tick and the forced `wake-task` — and before this row they gave
+# different answers for the same seat: the tick read the registry's
+# `heartbeat.fresh`, and wake-task hard-coded the literal "false". A fresh seat's
+# whole point is that each goal starts on a blank context, so a forced wake (every
+# hotfix wake, every grader force-wake, every `loop spawn`) landed its /goal under
+# the previous turn's output — measured 2026-09-11 07:45Z on ops and 07:49Z on
+# quinn, both registered `heartbeat.fresh: true`.
+#
+# Precedence, highest first: an explicit caller override, then the task row's own
+# `fresh` column (DIVE-138's per-instance override), then the seat's registry
+# setting, then false. The third argument lets the tick pass the agent-level value
+# it already has in its `$reg` snapshot instead of re-reading the registry per
+# seat; omit it and the registry is read here.
+_hb_effective_fresh() {
+  local name="$1" task_id="$2" agent_fresh="${3:-}"
+  if [[ -z "$agent_fresh" ]]; then
+    local reg
+    reg=$(registry_read 2>/dev/null) || reg=""
+    if [[ -n "$reg" ]]; then
+      agent_fresh=$(jq -r --arg n "$name" \
+        '(.agents[$n].heartbeat | if has("fresh") then .fresh else false end)' <<<"$reg" 2>/dev/null) \
+        || agent_fresh="false"
+    fi
+  fi
+  [[ "$agent_fresh" == "true" ]] || agent_fresh="false"
+  local task_fresh
+  task_fresh=$(db "SELECT COALESCE(fresh,'') FROM tasks WHERE id=${task_id};" 2>/dev/null || echo "")
+  [[ "$task_fresh" == "1" ]] && agent_fresh="true"
+  printf '%s' "$agent_fresh"
+}
+
 # DIVE-1349 wake-on-spawn helper (internal plumbing, not in _hb_usage). Nudges
 # ONE agent to start a specific just-spawned task now instead of on its next
 # tick. Root-gated because it drives systemd + the agent's tmux session; invoked
 # by `loop spawn` — directly when already root, else via `sudo -n 5dive heartbeat
 # wake-task …` from the claude-owned shelld exec context. Reuses the exact tick
-# nudge (_hb_wake, fresh=false: pick the task up in the running context, no
-# /clear). Best-effort by contract: _hb_wake's own failures are non-fatal here.
+# nudge (_hb_wake). Best-effort by contract: _hb_wake's own failures are non-fatal
+# here.
+#
+# DIVE-4296: `fresh` is RESOLVED, not assumed. The old literal "false" meant a
+# forced wake on a fresh seat skipped the /clear the tick would have sent, so the
+# goal landed in a warm context. `--no-fresh` keeps the old behaviour explicitly
+# (pick the task up in the running context) and `--fresh` forces the clear.
 cmd_heartbeat_wake_task() {
   require_root
-  local name="${1:-}" task_id="${2:-}" task_ident="${3:-DIVE-${2:-}}"
+  local fresh_override=""
+  local -a _pos=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --fresh)    fresh_override="true"; shift ;;
+      --no-fresh) fresh_override="false"; shift ;;
+      --)         shift; while [[ $# -gt 0 ]]; do _pos+=("$1"); shift; done ;;
+      *)          _pos+=("$1"); shift ;;
+    esac
+  done
+  local name="${_pos[0]:-}" task_id="${_pos[1]:-}"
+  local task_ident="${_pos[2]:-DIVE-${_pos[1]:-}}"
   [[ -n "$name" && "$task_id" =~ ^[0-9]+$ ]] \
-    || fail "$E_USAGE" "usage: 5dive heartbeat wake-task <agent> <task_id> [<task_ident>]"
-  _hb_wake "$name" "false" "$task_id" "$task_ident" || true
+    || fail "$E_USAGE" "usage: 5dive heartbeat wake-task [--fresh|--no-fresh] <agent> <task_id> [<task_ident>]"
+  local fresh
+  if [[ -n "$fresh_override" ]]; then
+    fresh="$fresh_override"
+  else
+    fresh="$(_hb_effective_fresh "$name" "$task_id")"
+  fi
+  _hb_log "[$name] forced wake onto ${task_ident} (fresh=${fresh}${fresh_override:+, caller override})"
+  _hb_wake "$name" "$fresh" "$task_id" "$task_ident" || true
 }
 
 # Parse a duration into whole minutes. Accepts a bare integer (minutes),
@@ -6108,9 +6208,12 @@ cmd_heartbeat_tick() {
     # Per-task fresh override (DIVE-138): a materialized recurring instance can
     # carry fresh=1 to force a clean /clear before its turn, regardless of the
     # agent-level heartbeat fresh setting. NULL/0 falls back to the agent default.
-    local eff_fresh="$fresh" task_fresh
-    task_fresh=$(db "SELECT COALESCE(fresh,'') FROM tasks WHERE id=${task_id};" 2>/dev/null || echo "")
-    [[ "$task_fresh" == "1" ]] && eff_fresh="true"
+    # DIVE-4296: resolved by the shared helper, which is also what `wake-task`
+    # calls — one definition, so a forced wake and a tick wake cannot disagree
+    # about whether this seat gets its /clear. The agent-level value is passed in
+    # from the $reg snapshot this loop already holds.
+    local eff_fresh
+    eff_fresh="$(_hb_effective_fresh "$name" "$task_id" "$fresh")"
 
     # DIVE-1858 Stage 1: wake-budget guardrail. A cold-mode agent that has spent
     # today's wake cap is skipped this tick so a chatty trigger can't thrash it

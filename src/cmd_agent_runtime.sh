@@ -1134,8 +1134,22 @@ _a2a_should_queue() {
 
 # Reason string for the rc-4 receipt. One definition, because `send` and the
 # scoped `_deliver` must not disagree about why sent:false (DIVE-2362's rule).
+#
+# DIVE-4296: it now names the DEPTH. A sender that is told only "queued, delivers
+# at its next idle" has no way to tell a 1-deep spool from the 15-deep one quinn
+# was carrying at 07:35Z, and so narrates "async by design" to a human who has
+# been waiting an hour. Position and the force verb are the two facts that turn
+# the receipt into a decision. The pre-4296 sentence is preserved verbatim as the
+# prefix — callers (and tests) that match on it are unaffected.
 _a2a_queued_reason() {
-  printf '%s\n' "target is mid-attempt — queued, delivers at its next idle or wake (DIVE-4214)"
+  local depth="${1:-}" base
+  base="target is mid-attempt — queued, delivers at its next idle or wake (DIVE-4214)"
+  if [[ "$depth" =~ ^[0-9]+$ ]] && (( depth > 0 )); then
+    base="${base}; it is #${depth} in that seat's spool"
+    if (( depth > 1 )); then base="${base} ($(( depth - 1 )) ahead of it)"; fi
+    base="${base}. The heartbeat drains the spool as the seat goes idle, about one message per turn; to jump the queue, force the seat onto the row with '5dive heartbeat wake-task <agent> <task_id>'"
+  fi
+  printf '%s\n' "$base"
 }
 
 # Drain ONE spooled message into a seat that is idle right now. One per call on
@@ -1756,7 +1770,7 @@ cmd_deliver() {
     # as an unconfirmed submit (see cmd_send) plus the additive queued:true.
     _delivered=0
     _queued=1
-    _reason="$(_a2a_queued_reason)"
+    _reason="$(_a2a_queued_reason "$(_a2a_queue_depth "$target")")"
   elif (( _rc != 0 )); then
     _delivered=0
     _reason="$(_agent_submit_unconfirmed_reason "$target" "$_rc")"
@@ -2495,7 +2509,7 @@ cmd_send() {
     # the two apart, and it is additive.
     _sent=0
     _queued=1
-    _reason="$(_a2a_queued_reason)"
+    _reason="$(_a2a_queued_reason "$(_a2a_queue_depth "$name")")"
   elif (( _rc != 0 )); then
     _sent=0
     _reason="$(_agent_submit_unconfirmed_reason "$name" "$_rc")"
