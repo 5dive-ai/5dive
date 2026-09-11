@@ -395,6 +395,44 @@ _hb_autosleep_sweep() {
   return 0
 }
 
+# DIVE-4214: drain the a2a spool. A send to a seat that was mid-attempt was
+# written to /home/agent-<name>/.5dive/a2a-queue instead of being typed into the
+# running turn (see the queue block in cmd_agent_runtime.sh); this is the other
+# half — the seat's next idle, which is also its next wake, since a woken seat is
+# idle before its first turn.
+#
+# ONE MESSAGE PER SEAT PER TICK, and that is the design, not a throttle. Typing
+# the second message straight after the first would land it inside the turn the
+# first just started — the exact defect. So the flush re-asks the idle question
+# every tick and a backlog drains one message per idle observation.
+#
+# ORDERED BEFORE THE AUTOSLEEP SWEEP in the tick: a seat with mail waiting must
+# not be stopped with it still spooled. The spool survives a stop (it is a file
+# in the seat's home), but the seat would then sleep until something else woke
+# it, which turns a queued message into an indefinitely deferred one.
+#
+# Same isolation contract as every other sweep — a failure here must NEVER abort
+# the wake loop.
+_HB_A2A_FLUSHED=0
+_hb_a2a_queue_sweep() {
+  local reg name depth
+  _HB_A2A_FLUSHED=0
+  declare -F a2a_queue_flush_one >/dev/null 2>&1 || return 0
+  reg=$(registry_read) || return 0
+  for name in $(jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null); do
+    depth=$(_a2a_queue_depth "$name")
+    [[ "$depth" =~ ^[0-9]+$ ]] || continue
+    (( depth > 0 )) || continue
+    systemctl is-active --quiet "5dive-agent@${name}.service" 2>/dev/null || continue
+    if a2a_queue_flush_one "$name"; then
+      _HB_A2A_FLUSHED=$((_HB_A2A_FLUSHED + 1))
+      _hb_log "[$name] delivered 1 queued a2a message at idle (${depth} were spooled)"
+    fi
+  done
+  (( _HB_A2A_FLUSHED > 0 )) && _hb_log "[a2a-queue] pass done — ${_HB_A2A_FLUSHED} delivered"
+  return 0
+}
+
 _hb_log() { printf '%s [heartbeat] %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
 
 _hb_usage() {
@@ -5440,6 +5478,11 @@ cmd_heartbeat_tick() {
   # agents after the idle threshold. Isolated like every other sweep — a failure
   # here must NEVER abort the wake loop (the heartbeat-never-woke bug class). No-op
   # unless at least one agent is opt-in wake_mode=cold.
+  # DIVE-4214: drain a2a messages spooled while the seat was mid-attempt. BEFORE
+  # the autosleep pass, so a seat with mail waiting is not stopped with it still
+  # spooled. Same isolation contract — a failure here must never abort the wake
+  # loop.
+  _hb_a2a_queue_sweep || _hb_log "[a2a-queue] pass errored (non-fatal)"
   _hb_autosleep_sweep "$now" || _hb_log "[autosleep] pass errored (non-fatal)"
   # DIVE-3173: fire any restart `self-update` deferred because the agent was
   # holding an in_progress row. This tick is where the TASK BOUNDARY is observed
