@@ -54,6 +54,7 @@ run_target(){ # route [installed] [allow]   -> stdout only; stderr in $LOGF
     FIVE_ALLOW_DOWNGRADE="${3:-0}" CLI_VERSION_OVERRIDE_FILE="$TD/etc/override" \
     CLI_CANARY_FILE="$TD/etc/canary" CLI_VERSION_KNOWN_FILE="$TD/state/known" \
     CLI_VERSION_URL=https://control.invalid/cli-version CLI_INSTALLED_BIN="$TD/bin/installed" \
+    CLI_TARGET_RECEIPT_FILE="${RECEIPT:-$TD/state/cli-target.json}" \
     bash -c "set -euo pipefail
 resolve_gh_tag(){ printf 'v9.9.9\\n'; }
 $block
@@ -212,6 +213,197 @@ resolve_cli_target" 2>/dev/null)"
   [[ "$out" != v1.4.0 ]] && ok "mutation anchor: a diagnostic on stdout is caught" \
     || bad "mutation anchor: a diagnostic on stdout was NOT caught" "$out"
 fi
+# ---------------------------------------------------------------------------
+# DIVE-4294: the resolution RECEIPT. The tag and the rung existed only in this
+# function's locals; the dashboard could not name either. These arms grade the
+# receipt as the READER sees it, and the load-bearing one is the negative:
+# a pinned box and a canary box ON THE SAME TAG must not read identically.
+# ---------------------------------------------------------------------------
+RECEIPT="$TD/state/cli-target.json"
+rget(){ jq -r "$1 // empty" "$RECEIPT" 2>/dev/null; }
+
+rm -f "$RECEIPT"; printf 'v1.2.3\n' > "$TD/etc/override"
+out="$(run_target v8.0.0)"
+[[ "$out" == v1.2.3 ]] && ok "receipt: resolver return value is still ONLY the tag (no receipt noise on stdout/stderr)" \
+  || bad "receipt writing leaked onto the resolver's own output" "$out"
+[[ "$(rget .tag)" == v1.2.3 && "$(rget .rung)" == override ]] \
+  && ok "receipt: override rung is recorded with its tag" \
+  || bad "override receipt wrong" "$(cat "$RECEIPT" 2>/dev/null)"
+[[ "$(rget .rungDetail)" == *"$TD/etc/override"* ]] \
+  && ok "receipt: rungDetail names the file the pin came from" \
+  || bad "rungDetail did not name the override file" "$(rget .rungDetail)"
+[[ "$(rget .at)" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+  && ok "receipt: carries an ISO-8601 UTC stamp" || bad "receipt stamp malformed" "$(rget .at)"
+jq -e . "$RECEIPT" >/dev/null 2>&1 && ok "receipt: is parseable JSON" || bad "receipt is not JSON" "$(cat "$RECEIPT")"
+
+# THE NEGATIVE ARM. Same tag, two rungs. `latest` is identical on these two
+# boxes and so is `tag`; only `rung` separates them, which is why the rung is
+# a field and not a nicety.
+pin_json="$(cat "$RECEIPT")"
+rm -f "$TD/etc/override" "$RECEIPT"; : > "$TD/etc/canary"
+out="$(run_target fail)"
+canary_tag="$(rget .tag)"; canary_rung="$(rget .rung)"
+[[ "$out" == v9.9.9 && "$canary_tag" == v9.9.9 && "$canary_rung" == canary ]] \
+  && ok "receipt: canary rung is recorded" || bad "canary receipt wrong" "$out / $(cat "$RECEIPT" 2>/dev/null)"
+# Re-pin the override to the SAME tag the canary resolved, then compare.
+printf 'v9.9.9\n' > "$TD/etc/override"; rm -f "$RECEIPT"
+out="$(run_target fail)"
+[[ "$(rget .tag)" == "$canary_tag" && "$(rget .rung)" != "$canary_rung" ]] \
+  && ok "receipt: pin and canary ON THE SAME TAG are distinguishable (rung differs, tag does not)" \
+  || bad "pin and canary read identically on the same tag" "$(cat "$RECEIPT" 2>/dev/null)"
+rm -f "$TD/etc/override" "$TD/etc/canary"
+
+rm -f "$RECEIPT" "$TD/state/known"
+out="$(run_target v1.4.0)"
+[[ "$(rget .tag)" == v1.4.0 && "$(rget .rung)" == route ]] \
+  && ok "receipt: fleet-route rung is recorded" || bad "route receipt wrong" "$(cat "$RECEIPT" 2>/dev/null)"
+rm -f "$RECEIPT"
+out="$(run_target fail)"
+[[ "$(rget .tag)" == v1.4.0 && "$(rget .rung)" == last-known ]] \
+  && ok "receipt: last-known rung is recorded and is NOT reported as the route" \
+  || bad "last-known receipt wrong" "$(cat "$RECEIPT" 2>/dev/null)"
+
+set +e
+# A resolve that FAILS must leave no receipt: a stale "this box installs X"
+# outliving the failure is the exact lie the dashboard would then print.
+rm -f "$RECEIPT" "$TD/state/known"
+out="$(run_target fail)"; rc=$?
+[[ $rc -ne 0 && ! -e "$RECEIPT" ]] \
+  && ok "receipt: a failed resolve writes no receipt" || bad "failed resolve left a receipt" "rc=$rc $(cat "$RECEIPT" 2>/dev/null)"
+# Same for the downgrade refusal — it returns before the record.
+printf 'v1.0.0\n' > "$TD/etc/override"; rm -f "$RECEIPT"
+out="$(run_target fail 9.9.9)"; rc=$?
+[[ $rc -ne 0 && ! -e "$RECEIPT" ]] \
+  && ok "receipt: a refused downgrade writes no receipt" || bad "downgrade refusal left a receipt" "rc=$rc"
+rm -f "$TD/etc/override"
+
+# A state directory the receipt cannot be written into must cost NOTHING on
+# either stream — this is the arm that grades the REDIRECTION ORDER in
+# _record_cli_target_receipt.
+#
+# DIVE-4294 iteration 3 (quinn): the previous shape was vacuous twice over. It
+# pointed CLI_TARGET_RECEIPT_FILE at a NON-EXISTENT dir, so
+# `mkdir -p "$dir" 2>/dev/null || return 0` returned before the printf
+# redirection was ever set up; and it asserted on stdout, while the leak the
+# order prevents is on STDERR. Reversing the two redirections left it at 39/0.
+#
+# So the fixture must (a) let mkdir -p SUCCEED and make `> "$tmp"` itself the
+# failing step, and (b) assert on the silenced stream. Two fixtures do (a):
+#   1. /proc/self as the state dir — it EXISTS (mkdir -p succeeds) and procfs
+#      refuses file creation for EVERY uid, root included, so this fixture
+#      binds in CI, where a mode bit would not;
+#   2. an existing 0555 directory — the realistic shape, skipped loudly when
+#      the running uid can write it anyway (root).
+rm -f "$TD/etc/override" "$TD/etc/canary"; printf 'v1.4.0\n' > "$TD/state/known"
+
+# --- fixture 1: /proc/self — exists, and unwritable for every uid ---
+silence_arm(){ # receipt_path label
+  local receipt="$1" label="$2" err
+  out="$(RECEIPT="$receipt" run_target fail)"
+  err="$(tlog)"
+  [[ "$out" == v1.4.0 ]] \
+    && ok "receipt: $label leaks nothing onto stdout" \
+    || bad "$label leaked onto the resolver's output" "$out"
+  # The silenced stream. The ONE line that belongs on stderr is the rung
+  # diagnostic; bash's own write error is exactly what the order prevents.
+  if [[ "$(grep -c . <<<"$err")" == 1 ]] \
+     && grep -q '5dive install: CLI target .* — source: ' <<<"$err" \
+     && [[ "$(grep -c . <<<"$err")" == 1 ]]; then
+    ok "receipt: $label leaks nothing onto stderr (only the CLI target diagnostic)"
+  else
+    bad "$label leaked onto stderr" "$err"
+  fi
+  [[ ! -e "$receipt" ]] \
+    && ok "receipt: no receipt is written when $label" \
+    || bad "a receipt appeared where it could not be written" "$receipt"
+}
+silence_arm /proc/self/cli-target.json "an unwritable receipt path"
+
+# Mutation meta-anchor: reverse the two redirections (`2>/dev/null > "$tmp"`
+# -> `> "$tmp" 2>/dev/null`). Redirections are applied left to right, so the
+# reversed order lets BASH print the write error onto the caller's stderr. If
+# the stderr assertion above is real, the mutant must be observably noisy.
+mut_redir="$(sed 's|2>/dev/null > "$tmp"|> "$tmp" 2>/dev/null|' <<<"$block")"
+if [[ "$mut_redir" == "$block" ]]; then
+  bad "redirection-order mutation applied" "mutation did not change extracted source"
+else
+  env -i PATH="$TD/bin:/usr/bin:/bin" FAKE_ROUTE=fail FAKE_INSTALLED=0.0.0 \
+    CLI_VERSION_OVERRIDE_FILE="$TD/etc/override" CLI_CANARY_FILE="$TD/etc/canary" \
+    CLI_VERSION_KNOWN_FILE="$TD/state/known" CLI_INSTALLED_BIN="$TD/bin/installed" \
+    CLI_TARGET_RECEIPT_FILE=/proc/self/cli-target.json \
+    bash -c "set -euo pipefail
+resolve_gh_tag(){ printf 'v9.9.9\\n'; }
+$mut_redir
+resolve_cli_target" >/dev/null 2>"$TD/mut-err"
+  [[ "$(grep -c . "$TD/mut-err")" -gt 1 ]] \
+    && ok "redirection-order mutation is reachable by the stderr arm (mutant leaks the write error)" \
+    || bad "redirection-order mutation was not exercised" "$(cat "$TD/mut-err")"
+fi
+
+# --- fixture 2: the realistic shape — a directory that EXISTS and is 0555 ---
+rodir="$TD/ro"; rm -rf "$rodir"; mkdir -p "$rodir"; chmod 0555 "$rodir"
+if [[ "$(id -u)" == 0 ]] || ( : > "$rodir/.probe" ) 2>/dev/null; then
+  # Root cannot make a mode bit fail, so this fixture would pass without
+  # observing anything. Skip LOUDLY, never vacuously — fixture 1 still binds.
+  rm -f "$rodir/.probe" 2>/dev/null
+  printf 'SKIP - receipt: an unwritable state DIR is silent on both streams (uid=%s can write a 0555 dir; fixture 1 covers this under root)\n' "$(id -u)"
+else
+  silence_arm "$rodir/cli-target.json" "an unwritable state dir"
+fi
+chmod 0755 "$rodir" 2>/dev/null || true; rm -rf "$rodir"
+
+# Mutation anchor: collapse the canary rung onto the override rung. If the
+# negative arm above is real, this must go red.
+mutant4294="$(sed 's/rung=canary/rung=override/' <<<"$block")"
+if [[ "$mutant4294" == "$block" ]]; then
+  bad "rung mutation applied" "mutation did not change extracted source"
+else
+  rm -f "$RECEIPT" "$TD/etc/override"; : > "$TD/etc/canary"
+  env -i PATH="$TD/bin:/usr/bin:/bin" FAKE_ROUTE=fail CLI_VERSION_OVERRIDE_FILE="$TD/etc/override" \
+    CLI_CANARY_FILE="$TD/etc/canary" CLI_VERSION_KNOWN_FILE="$TD/state/known" \
+    CLI_INSTALLED_BIN="$TD/bin/installed" CLI_TARGET_RECEIPT_FILE="$RECEIPT" \
+    bash -c "set -euo pipefail
+resolve_gh_tag(){ printf 'v9.9.9\n'; }
+$mutant4294
+resolve_cli_target" >/dev/null 2>&1
+  [[ "$(rget .rung)" == override ]] \
+    && ok "rung mutation is reachable by the pin/canary arm (mutant reports a canary as a pin)" \
+    || bad "rung mutation was not exercised" "$(cat "$RECEIPT" 2>/dev/null)"
+  rm -f "$TD/etc/canary" "$RECEIPT"
+fi
+unset RECEIPT
+
+# --- the READER half: `update --check --json` must report the receipt, and must
+# never mint a target it did not observe.
+reader="$(sed -n '/# >>> DIVE-4294 resolved target readback/,/# <<< DIVE-4294 resolved target readback/p' src/cmd_selfupdate.sh)"
+if [[ -n "$reader" ]] && grep -q 'CLI_TARGET_RECEIPT_FILE' <<<"$reader"; then
+  ok "resolved-target readback is extractable from src/cmd_selfupdate.sh"
+else
+  bad "resolved-target readback is missing from src/cmd_selfupdate.sh"
+fi
+read_receipt(){ # receipt-file -> "rt|rr|rd"
+  # The block uses `local`, so it is graded inside a function — the same way
+  # cmd_selfupdate runs it.
+  bash -c "set -uo pipefail
+CLI_TARGET_RECEIPT_FILE='$1'
+readback(){
+$reader
+printf '%s|%s|%s\n' \"\$rt_json\" \"\$rr_json\" \"\$rd_json\"
+}
+readback" 2>&1
+}
+printf '{"tag":"v1.2.3","rung":"override","rungDetail":"local override /etc/5dive/cli-version","at":"2026-09-11T00:00:00Z"}\n' > "$TD/state/r.json"
+got="$(read_receipt "$TD/state/r.json")"
+[[ "$got" == '"v1.2.3"|"override"|"local override /etc/5dive/cli-version"' ]] \
+  && ok "readback: a good receipt becomes JSON fields the dashboard can render" || bad "readback wrong" "$got"
+got="$(read_receipt "$TD/state/absent.json")"
+[[ "$got" == 'null|null|null' ]] && ok "readback: an ABSENT receipt reads as null, never as a guess" || bad "absent receipt did not read null" "$got"
+printf '{"tag":"v1.2' > "$TD/state/trunc.json"
+got="$(read_receipt "$TD/state/trunc.json")"
+[[ "$got" == 'null|null|null' ]] && ok "readback: a truncated receipt reads as null (no half-tag on a customer screen)" || bad "truncated receipt leaked" "$got"
+printf '{"tag":"main","rung":"override"}\n' > "$TD/state/bad.json"
+got="$(read_receipt "$TD/state/bad.json")"
+[[ "$got" == 'null|null|null' ]] && ok "readback: a non-tag value is refused (a ref is not a version)" || bad "non-tag value leaked" "$got"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
