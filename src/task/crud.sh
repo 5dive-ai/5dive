@@ -14,6 +14,7 @@ cmd_task_add() {
   local body="" priority="medium" assignee="" parent="" from="" recurring="" fresh="" project="dive"
   local on_overlap="" overlap_bound=""   # DIVE-2272: per-template overlap policy
   local accept="" verify_cmd="" max_iters="" verifier="" task_budget="" no_verify="" branch=""
+  local force_verify=""   # DIVE-4251: bare --verify, the row's demand for a grade
   local customer_facing="" already_blocked="" materialized=""
   # DIVE-2627: which flag supplied each prose value (see _read_prose_file).
   local body_src="" accept_src=""
@@ -54,6 +55,12 @@ cmd_task_add() {
       # DIVE-969: explicit opt-out of the verifier-by-default posture. A plain
       # `task done` closes the resulting task directly (no maker→grader handoff).
       --no-verify)   no_verify="1" ;;
+      # DIVE-4251: the OTHER direction. `--verify=<cmd>` above is the loop's
+      # acceptance COMMAND and is unrelated; a BARE `--verify` is the row-level
+      # demand for a grader, which is what makes a `verify=never` box a default
+      # rather than a ceiling. Bare `--verify` used to hit the unknown-flag arm,
+      # so nothing is being re-spelled here.
+      --verify)      force_verify="1" ;;
       # DIVE-2681 (the filing cap): the two declared escapes from the internal
       # classifier. --customer says the scan was WRONG (this is a customer
       # surface); --already-blocked=<what> says the scan was RIGHT and this is
@@ -486,6 +493,27 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
   # this whole block and is stored verbatim) — the auto-skip is a DEFAULT, not a
   # ceiling. --no-verify is an explicit, already-visible opt-out, so it stays quiet.
   local verify_defaulted=0 verify_unavailable=0 verify_skipped=""
+  # DIVE-4251: the BOX's answer, consulted before any of the code's own defaults.
+  # `--verify`/`--no-verify` are the row's override and win in both directions;
+  # everything below is the box default speaking. `delivered-only` grants nothing
+  # HERE — a row has no delivery at add time, by construction — so the grader is
+  # attached later, by `task deliver --pr=`, which is the moment the row becomes
+  # "code that ships". See src/lib/verify_policy.sh for the three values.
+  local _vp_policy _vp_override="" _vp_deferred=0
+  _vp_policy=$(box_verify_policy)
+  [[ -n "$no_verify" ]]    && _vp_override="skip"
+  [[ -n "$force_verify" ]] && _vp_override="force"
+  if [[ -n "$no_verify" && -n "$force_verify" ]]; then
+    fail "$E_VALIDATION" "--verify and --no-verify contradict each other — pass one (DIVE-4251)"
+  fi
+  local _vp_grants=0
+  verify_grants_grader "$_vp_policy" "$_vp_override" 0 && _vp_grants=1
+  # `delivered-only` with no override is NOT a refusal, it is a DEFERRAL, and the
+  # two must not read the same downstream: the filer is told the grader arrives
+  # with the delivery rather than told there is none.
+  if (( ! _vp_grants )) && [[ -z "$_vp_override" && "$_vp_policy" == "delivered-only" ]]; then
+    _vp_deferred=1
+  fi
   if [[ "$kind" == "standard" && -z "$no_verify" && "${FIVE_VERIFY_DEFAULT:-1}" != "0" \
         && -z "$accept" && -z "$verify_cmd" && -z "$verifier" ]]; then
    verify_skipped=$(_task_verify_skip_reason "$title" "$body" "$priority")
@@ -498,7 +526,14 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
    # ceiling; `task verifier <id> <agent>` attaches grading afterwards.
    [[ -z "$verify_skipped" && -n "$internal_reason" ]] && verify_skipped="$internal_reason"
   fi
+  # DIVE-4251: a bare `--verify` is a DEMAND, so it clears the DIVE-969/2681
+  # auto-skips exactly as an explicit `--verifier=<agent>` already does. Without
+  # this, `--verify` on a low-priority or internal row would be silently ignored
+  # and the customer's one way to buy a grade back on a `never` box would not work
+  # on the rows most likely to need it.
+  [[ -n "$force_verify" ]] && verify_skipped=""
   if [[ "$kind" == "standard" && -z "$no_verify" && "${FIVE_VERIFY_DEFAULT:-1}" != "0" \
+        && $_vp_grants == 1 \
         && -z "$accept" && -z "$verify_cmd" && -z "$verifier" && -z "$verify_skipped" ]]; then
     local _grader; _grader=$(_task_default_verifier "$assignee" "$proj_lead")
     if [[ -n "$_grader" ]]; then
@@ -542,12 +577,12 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
   local id
   id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, derived_actor, parent_id, project_key, kind, schedule, fresh,
                               acceptance_criteria, verify_command, max_iterations, verifier, task_budget, verify_unavailable,
-                              verify_optout, on_overlap, overlap_bound)
+                              verify_optout, verify_forced, on_overlap, overlap_bound)
            VALUES ($(sqlq "$title"), $(sqlq_or_null "$body"), $(sqlq "$priority"),
                    $(sqlq_or_null "$assignee"), $(sqlq "$creator"), $(sqlq_or_null "$derived_actor"), ${parent_sql}, $(sqlq "$project"),
                    $(sqlq "$kind"), ${schedule_sql}, ${fresh_sql},
                    $(sqlq_or_null "$accept"), $(sqlq_or_null "$verify_cmd"), ${max_iters:-NULL}, $(sqlq_or_null "$verifier"), $(sqlq_or_null "$task_budget"), $([[ $verify_unavailable == 1 ]] && echo 1 || echo NULL),
-                   $([[ -n "$no_verify" ]] && echo 1 || echo NULL), ${on_overlap_sql}, ${overlap_bound_sql});
+                   $([[ -n "$no_verify" ]] && echo 1 || echo NULL), $([[ -n "$force_verify" ]] && echo 1 || echo NULL), ${on_overlap_sql}, ${overlap_bound_sql});
            SELECT last_insert_rowid();")
   # Ident is stamped by the AFTER INSERT trigger from the project's counter, so
   # read it back rather than assuming the DIVE- prefix (DIVE-484).
@@ -584,9 +619,31 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
     # reasonably assumes the by-default grading they were told about applied.
     [[ -n "$verify_skipped" ]] \
       && verify_note=" · NOT verifier-graded ($verify_skipped) — 'task done' will close it outright; attach a grader with: 5dive task verifier $ident <agent>"
+    # DIVE-4251 deliverable 3: SAY WHAT IT COSTS, on the line the filer already
+    # reads. A grader is now an ephemeral SESSION per delivery (DIVE-4164), so the
+    # filer of a graded row is spending one — and the two ways not to (the box
+    # setting and the per-row flag) are named here rather than left in a doc. No
+    # pricing math: we do not know the customer's rate and a made-up number is
+    # worse than none.
+    if (( verify_defaulted )) || [[ -n "$force_verify" && -n "$verifier" ]]; then
+      verify_note+=" · a grader session will grade this delivery; set '5dive config verify=never' or pass --no-verify to skip"
+    fi
+    # The three box-policy states, each said plainly. `delivered-only` is the one
+    # that is neither "graded" nor "ungraded" yet, so it gets its own sentence
+    # instead of being folded into either.
+    if (( _vp_deferred )); then
+      verify_note=" · verify=delivered-only (box default) — no grader yet; one is attached when you bind a delivery ('task deliver --pr=…'), and a grader session grades it then. Demand one now with --verify."
+    elif [[ "$_vp_policy" == "never" && -z "$_vp_override" && "$kind" == "standard" ]]; then
+      verify_note=" · verify=never (box default) — 'task done' closes it outright, no grader session. Demand a grade for one row with --verify."
+    elif [[ -n "$force_verify" ]]; then
+      verify_note+=" · verify demanded on this row (--verify), overriding the box default '$_vp_policy'"
+    elif [[ -n "$no_verify" && "$_vp_policy" != "never" ]]; then
+      verify_note+=" · grading skipped on this row (--no-verify), overriding the box default '$_vp_policy'"
+    fi
     ok "created ${ident} — $title${coord_note}${verify_note}" \
-       '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", autoCoordinated:($ac=="1"), verifyDefaulted:($vd=="1"), verifyUnavailable:($vu=="1"), verifySkipped:($vs!=""), verifySkipReason:$vs, verifier:$v, parentLinkWarning:($wi!=""), citedParent:$wi, citedSeries:(if $wi=="" then "" else ($wk+" #"+$wn) end), openTitleMatches:($wm|split(",")|map(select(length>0)))}' \
+       '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", autoCoordinated:($ac=="1"), verifyDefaulted:($vd=="1"), verifyUnavailable:($vu=="1"), verifySkipped:($vs!=""), verifySkipReason:$vs, verifier:$v, verifyPolicy:$vp, verifyOverride:$vo, verifyDeferred:($vdf=="1"), parentLinkWarning:($wi!=""), citedParent:$wi, citedSeries:(if $wi=="" then "" else ($wk+" #"+$wn) end), openTitleMatches:($wm|split(",")|map(select(length>0)))}' \
        --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg ac "$auto_coordinated" --arg vd "$verify_defaulted" --arg vu "$verify_unavailable" --arg vs "$verify_skipped" --arg v "${verifier:-}" \
+       --arg vp "$_vp_policy" --arg vo "$_vp_override" --arg vdf "$_vp_deferred" \
        --arg wi "$followup_warn_ident" --arg wk "$followup_warn_kind" --arg wn "$followup_warn_number" --arg wm "$followup_warn_matches"
   fi
 }
@@ -950,6 +1007,21 @@ cmd_task_show() {
                                      THEN ' (awaiting RATIFICATION of an action already taken)' ELSE '' END END
                FROM tasks WHERE id=${id} AND need_type IS NOT NULL;")
     [[ -n "$gate" ]] && { echo; echo "human gate:"; printf '%s\n' "$gate" | indent2; }
+    # DIVE-4251: the verification policy in force for THIS row, and where it came
+    # from. Printed unconditionally on standard rows because its absence is the
+    # thing readers get wrong: a row with no `verifier:` line under `loop spec`
+    # could mean the box declined, the filer declined, or no grader existed, and
+    # those three were indistinguishable in this output.
+    local _sh_kind; _sh_kind=$(db "SELECT COALESCE(kind,'standard') FROM tasks WHERE id=${id};")
+    if [[ "$_sh_kind" == "standard" ]]; then
+      local _sh_pol _sh_src _sh_eff
+      _sh_pol=$(box_verify_policy); _sh_src=$(_task_verify_row_source "$id")
+      if _task_verify_grants "$id"; then _sh_eff="a grader grades this delivery"
+      elif [[ "$_sh_pol" == "delivered-only" && "$_sh_src" == "box default" ]]; then
+        _sh_eff="no grader yet — one is attached when a delivery is bound (task deliver --pr=…)"
+      else _sh_eff="no grader; 'task done' closes it outright"; fi
+      echo; echo "verify: ${_sh_pol} (${_sh_src}) — ${_sh_eff}"
+    fi
     # DIVE-476: loop spec (only when any field is set) — the declarative verify
     # loop the (c) runner executes. Mirrors the conditional human-gate block.
     local loopspec
@@ -1277,7 +1349,13 @@ cmd_task_verifier() {
         acceptance_criteria=$(sqlq "$new_accept"),
         max_iterations=$([[ -n "$max_iters" ]] && echo "$max_iters" || echo "max_iterations"),
         verify_unavailable=NULL,
-        verify_optout=NULL${move_sql}
+        verify_optout=NULL,
+        -- DIVE-4251: naming a grader by hand IS the row's demand for a grade, so
+        -- it sets the same flag `task add --verify` does. Without this, the
+        -- retrofit stored a verifier that a `verify=never` box then declined to
+        -- route to — an attach that appears to work and grades nothing, which is
+        -- the worst of the three possible outcomes.
+        verify_forced=1${move_sql}
       WHERE id=${id};"
   # DIVE-2812 — RECORD THE EDIT TO THE BAR THE ROW IS GRADED AGAINST.
   #

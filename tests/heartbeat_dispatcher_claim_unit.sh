@@ -198,6 +198,41 @@ _hb_claim_task dev "$T4" && bad_t "claim refuses a recurring TEMPLATE (DIVE-2055
 [[ "$(row "$T4")" == "todo|NULL" ]] && ok_t "refused claim left the template firing (still todo)" \
                                     || bad_t "refused claim left the template firing" "got $(row "$T4")"
 
+# --- 3b) DIVE-4253: a claim from todo RE-CLOCKS — the gate-return shape -------
+# A row that was in_progress, went blocked on a gate and came back to todo on the
+# answer still carries its previous attempt's started_at (`task need`, `answer`
+# and `unblock` clear nothing). Pre-fix the claim COALESCEd it, so the reaper's
+# very next tick read `age_min >= budget` and reclaimed a row claimed minutes
+# earlier — measured 2026-09-10: DIVE-4218 claimed 22:30:21Z, reaped 22:35:09Z;
+# DIVE-4214 gate answered 22:28:11Z, reaped 22:30:13Z. One wasted attempt per
+# gated row. first_started_at is the durable history (DIVE-3251) and must NOT move.
+T5=$(mk "came back from a gate")
+db "UPDATE tasks SET started_at=datetime('now','-200 minutes'), first_started_at=datetime('now','-200 minutes') WHERE id=${T5};"
+T5_FIRST=$(db "SELECT first_started_at FROM tasks WHERE id=${T5};")
+_hb_claim_task dev "$T5" >/dev/null 2>&1
+T5_AGE=$(db "SELECT CAST((julianday('now') - julianday(started_at)) * 1440 AS INTEGER) FROM tasks WHERE id=${T5};")
+[[ "$(row "$T5")" == in_progress\|* ]] && (( ${T5_AGE:-999} < 2 )) \
+  && ok_t "[4253] a claim from todo stamps a FRESH started_at (stale clock was 200m old, now ${T5_AGE}m)" \
+  || bad_t "[4253] a claim from todo stamps a FRESH started_at" "row=$(row "$T5") age_min=${T5_AGE:-?}"
+[[ "$(db "SELECT first_started_at FROM tasks WHERE id=${T5};")" == "$T5_FIRST" ]] \
+  && ok_t "[4253] first_started_at is history and does not move on re-claim" \
+  || bad_t "[4253] first_started_at must not move" "was $T5_FIRST now $(db "SELECT first_started_at FROM tasks WHERE id=${T5};")"
+# The consequence that matters: the reaper's next tick does NOT take it back.
+# Same budget as arm 5 (everyMin 30 => 90m); a fresh clock is far under it.
+read -r T5_RC _ < <(_hb_reclaim dev 30)
+[[ "$(row "$T5")" == in_progress\|* ]] && (( ${T5_RC:-0} == 0 )) \
+  && ok_t "[4253] the re-claimed row survives the reaper's next tick (gets its full budget window)" \
+  || bad_t "[4253] re-claimed row must survive the next reap" "row=$(row "$T5") reclaimed=${T5_RC:-?}"
+# Same shape through the agent's own verb: `task start` from todo is a new attempt
+# (arm 4 above holds the other half — on an in_progress row it is still a no-op).
+T6=$(mk "came back from a gate, started by hand")
+db "UPDATE tasks SET started_at=datetime('now','-200 minutes'), first_started_at=datetime('now','-200 minutes') WHERE id=${T6};"
+cmd_task_start "$T6" >/dev/null 2>&1
+T6_AGE=$(db "SELECT CAST((julianday('now') - julianday(started_at)) * 1440 AS INTEGER) FROM tasks WHERE id=${T6};")
+[[ "$(row "$T6")" == in_progress\|* ]] && (( ${T6_AGE:-999} < 2 )) \
+  && ok_t "[4253] 'task start' from todo also stamps a FRESH started_at" \
+  || bad_t "[4253] 'task start' from todo stamps a fresh started_at" "row=$(row "$T6") age_min=${T6_AGE:-?}"
+
 # --- 5) End-to-end reaper, reached ONLY via the dispatcher claim -------------
 # This is the assertion the ticket asked to mutation-grade. Note what is NOT
 # done: the in_progress row is never INSERTed. It is produced by running the
@@ -413,6 +448,96 @@ cmd_heartbeat_tick >/dev/null 2>&1
 (( WAKE_CALLS == 1 )) \
   && ok_t "[3465] NEGATIVE CONTROL: same fixture with no hold IS dispatched" \
   || bad_t "[3465] un-held seat must still be dispatched" "wakes=$WAKE_CALLS"
+
+
+# --- DIVE-4261: A GRADE THIS SEAT CANNOT MERGE IS NOT WORK IN PROGRESS -------
+# The busy guard counted EVERY in_progress row for the seat. After `task verify`
+# PASS the row stays in_progress assigned to the GRADER while the merge is owed
+# by another seat, so a grader holding one such row was busy-skipped on every
+# tick — measured 2026-09-11 00:55-01:05Z: quinn logged "busy — 1 in_progress,
+# skip" each tick while sitting at an empty prompt with 4 graded->merge rows and
+# nothing it could act on. This is DIVE-4206's maker-side wedge arriving from the
+# grader side; there the claim is stale and gets reclaimed, here it is the record
+# of who graded and must NOT be — only discounted by the busy count.
+#
+# Note what these arms do NOT do: they never hand-write the busy count. Each one
+# runs the real tick and reads the WAKE and the ROW, so a fix that only changed
+# the log line would leave them red.
+db "UPDATE tasks SET status='cancelled' WHERE status NOT IN ('done','cancelled');"
+db "DELETE FROM lifecycle_events;"
+
+# gm <merge_owner> -> id of a graded->merge row held by dev, merge owed by <owner>.
+# Satisfies _TASKS_TFV_SQL exactly: graded, bound to a delivery, passed, and not
+# bounced. started_at is FRESH so the reaper cannot be what moves it.
+gm() {
+  local id; id=$(mk "graded, merge owed by ${1}" in_progress standard dev)
+  db "UPDATE tasks SET maker_agent='dev2', verifier='dev', graded_by='dev',
+             graded_at=datetime('now','-5 minutes'), graded_verdict='pass',
+             delivery_ref='https://github.com/5dive-ai/5dive/pull/9$id',
+             merge_owner=$(sqlq "$1"), handoff_rejected_at=NULL,
+             started_at=datetime('now','-5 minutes')
+       WHERE id=${id};"
+  printf '%s' "$id"
+}
+
+# Arm A — THE DEFECT. One graded->merge row owed by ANOTHER seat plus one todo
+# row: the seat must be dispatched onto the todo row, not busy-skipped.
+G1=$(gm quinn)
+TG=$(mk "the row dev can actually do")
+: > "$HB_LOG"; seed_reg 0; WAKE_RC=0; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+(( WAKE_CALLS == 1 )) \
+  && ok_t "[4261] a seat holding a graded->merge row owed by ANOTHER seat is still dispatched" \
+  || bad_t "[4261] graded->merge row owed elsewhere must not make the seat busy" "wakes=$WAKE_CALLS log=[$(grep -c busy "$HB_LOG") busy lines]"
+[[ "$(row "$TG")" == in_progress\|* ]] \
+  && ok_t "[4261] and it is dispatched onto the TODO row (claimed in_progress)" \
+  || bad_t "[4261] the todo row must be claimed" "got $(row "$TG")"
+grep -q "busy —" "$HB_LOG" \
+  && bad_t "[4261] no busy-skip is logged for that seat" "log: $(grep 'busy —' "$HB_LOG")" \
+  || ok_t "[4261] no busy-skip is logged for that seat"
+# The grade itself is untouched: the claim is the record of who graded it, so
+# nothing here may reclaim, reassign or re-open the graded row.
+[[ "$(db "SELECT status||'|'||COALESCE(assignee,'')||'|'||COALESCE(graded_by,'') FROM tasks WHERE id=${G1};")" == "in_progress|dev|dev" ]] \
+  && ok_t "[4261] the graded row itself is untouched (still in_progress, still dev's grade)" \
+  || bad_t "[4261] graded row must not be reclaimed or reassigned" "got $(db "SELECT status||'|'||COALESCE(assignee,'')||'|'||COALESCE(graded_by,'') FROM tasks WHERE id=${G1};")"
+
+# Arm B — SCOPE. The same row with the merge owed by THIS seat is its next move,
+# so the seat is correctly busy and must NOT be dispatched onto anything else.
+db "UPDATE tasks SET status='cancelled' WHERE id=${TG};"
+db "UPDATE tasks SET merge_owner='dev' WHERE id=${G1};"
+TG2=$(mk "must not be picked while dev owes a merge")
+: > "$HB_LOG"; seed_reg 0; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+(( WAKE_CALLS == 0 )) && [[ "$(row "$TG2")" == "todo|NULL" ]] \
+  && ok_t "[4261] SCOPE: when the merge is owed by THIS seat the row still counts busy" \
+  || bad_t "[4261] a merge this seat owes must still read busy" "wakes=$WAKE_CALLS row=$(row "$TG2")"
+grep -q "busy —" "$HB_LOG" \
+  && ok_t "[4261] and the busy-skip is logged for it" \
+  || bad_t "[4261] busy-skip must still be logged" "log=[$(cat "$HB_LOG")]"
+
+# Arm C — NEGATIVE CONTROL for arm A: an ORDINARY in_progress row (not graded,
+# no delivery bound) on the same seat with the same fixture shape still reads
+# busy. Without this, arm A would also pass if the busy guard had simply been
+# deleted.
+db "UPDATE tasks SET status='cancelled' WHERE id=${G1};"
+P1=$(mk "ordinary work in flight" in_progress standard dev)
+db "UPDATE tasks SET started_at=datetime('now','-5 minutes') WHERE id=${P1};"
+: > "$HB_LOG"; seed_reg 0; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+(( WAKE_CALLS == 0 )) && [[ "$(row "$TG2")" == "todo|NULL" ]] \
+  && ok_t "[4261] NEGATIVE CONTROL: a plain in_progress row still busy-skips the seat" \
+  || bad_t "[4261] the busy guard must survive for ordinary work" "wakes=$WAKE_CALLS row=$(row "$TG2")"
+
+# Arm D — a graded row owed elsewhere that is ALSO the seat's only row leaves it
+# dispatchable but with nothing to pick: no wake, and specifically NOT a busy
+# skip. This separates "discounted" from "hidden" — the seat is simply idle.
+db "UPDATE tasks SET status='cancelled' WHERE id IN (${P1}, ${TG2});"
+db "UPDATE tasks SET status='in_progress', merge_owner='quinn' WHERE id=${G1};"
+: > "$HB_LOG"; seed_reg 0; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+(( WAKE_CALLS == 0 )) && ! grep -q "busy —" "$HB_LOG" \
+  && ok_t "[4261] with only that row the seat is idle, not busy (no wake, no busy line)" \
+  || bad_t "[4261] seat must read idle, not busy" "wakes=$WAKE_CALLS log=[$(cat "$HB_LOG")]"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

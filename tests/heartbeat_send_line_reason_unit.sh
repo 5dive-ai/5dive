@@ -135,7 +135,7 @@ _hb_send_line seatx "$TEXT"; rc=$?
 sleep() { :; }
 grade "B1 a failed Enter whose line DID land returns 0 so the tick's 'woke N' matches reality" "[[ $rc -eq 0 ]]"
 grade "B2 ...and the log states the evidence (the transcript gained a user record)" \
-  "grep -q 'the keystroke failed but the line DID land' '$HBLOG' && grep -q 'gained a user record after byte' '$HBLOG'"
+  "grep -q 'the keystroke failed but the line DID land' '$HBLOG' && grep -q 'gained a user record carrying this payload' '$HBLOG'"
 
 # B3 — transcript did not grow: still a failure, and the reason says which check said so.
 _reset; PANES=("$P_EMPTY"); _HB_TRANSCRIPT_ROOT=$(mk_store "$TMP/st2"); FAIL_ENTER=1
@@ -149,8 +149,8 @@ _reset; PANES=("$P_EMPTY"); _HB_TRANSCRIPT_ROOT=$(mk_store "$TMP/st3"); FAIL_ENT
 sleep() { printf '%s\n' '{"type":"assistant","message":{"role":"assistant"}}' >>"$TMP/st3/proj/s1.jsonl"; }
 _hb_send_line seatx "$TEXT"; rc=$?
 sleep() { :; }
-grade "B4 transcript growth without a user record is NOT delivery (rc 1, 'gained no user record')" \
-  "[[ $rc -eq 1 ]] && grep -q 'grew but gained no user record' '$HBLOG'"
+grade "B4 transcript growth without a user record is NOT delivery (rc 1, names this payload)" \
+  "[[ $rc -eq 1 ]] && grep -q 'grew, but no non-tool_result user record' '$HBLOG'"
 
 # B5 — a NEW newest transcript (the seat started a fresh session) is not evidence
 # for THIS payload.
@@ -203,6 +203,93 @@ grade "D2 mutation: restoring the 2>/dev/null discard kills A1's reason line —
 _reset; PANES=("$P_EMPTY"); FAIL_KEY='C-u'; _hb_send_line seatx "$TEXT" >/dev/null 2>&1
 grade "D3 ...and the un-mutated function logs the reason again (the restore took)" \
   "grep -q 'composer clear (C-u) failed' '$HBLOG'"
+
+# === E. the receipt is a property of THIS PAYLOAD, not of the record type =======
+# Iteration 1 accepted ANY `"type":"user"` record in the window. Claude Code
+# writes every TOOL RESULT as a user record, so a seat that is merely WORKING
+# mints one every few seconds — and the check was wired onto the C-u step, where
+# the payload has not been typed yet. Together that turned the reported false
+# NEGATIVE into a false POSITIVE: the tick claimed a row on a prompt nobody
+# received. These arms pin both halves of the fix.
+TOOL_RESULT='{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01ABC","type":"tool_result","content":"exit 0"}]},"isMeta":false}'
+
+# E1 — the verifier's reproduction: a REAL tool_result lands in the window while
+# the C-u fails. Must be rc 1, must NOT say the line landed, and must not consult
+# the transcript at all — a failed C-u precedes the payload keystroke.
+_reset; PANES=("$P_EMPTY"); _HB_TRANSCRIPT_ROOT=$(mk_store "$TMP/st5"); FAIL_KEY='C-u'
+sleep() { printf '%s\n' "$TOOL_RESULT" >>"$TMP/st5/proj/s1.jsonl"; }
+_hb_send_line seatx "$TEXT"; rc=$?
+sleep() { :; }
+grade "E1 a failed C-u with a real tool_result in the window is rc 1 and never says 'DID land'" \
+  "[[ $rc -eq 1 ]] && ! grep -q 'DID land' '$HBLOG'"
+grade "E2 ...and the C-u step does not consult the transcript at all (it precedes the payload)" \
+  "! grep -q 'land' '$HBLOG' && [[ \$(wc -l <'$KEYS') -eq 1 ]]"
+
+# E3 — same record, but on a step that DOES follow the payload (a failed Enter on
+# a busy seat). A tool result is not a receipt: rc 1, and the reason names why.
+_reset; PANES=("$P_EMPTY"); _HB_TRANSCRIPT_ROOT=$(mk_store "$TMP/st6"); FAIL_ENTER=1
+sleep() { printf '%s\n' "$TOOL_RESULT" >>"$TMP/st6/proj/s1.jsonl"; }
+_hb_send_line seatx "$TEXT"; rc=$?
+sleep() { :; }
+grade "E3 a busy seat's tool_result is NOT a delivered wake (rc 1, not 'DID land')" \
+  "[[ $rc -eq 1 ]] && ! grep -q 'DID land' '$HBLOG' && grep -q 'no non-tool_result user record' '$HBLOG'"
+
+# E4 — the nastier shape: a tool_result that QUOTES THE PAYLOAD BACK (a `task
+# show`, a grep of the heartbeat log). The record type exclusion, not the text
+# match, is what must save this one.
+_reset; PANES=("$P_EMPTY"); _HB_TRANSCRIPT_ROOT=$(mk_store "$TMP/st7"); FAIL_ENTER=1
+sleep() { printf '%s\n' '{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_02","type":"tool_result","content":"'"$TEXT"'"}]}}' >>"$TMP/st7/proj/s1.jsonl"; }
+_hb_send_line seatx "$TEXT"; rc=$?
+sleep() { :; }
+grade "E4 a tool_result that quotes the payload back is still NOT a receipt (rc 1)" \
+  "[[ $rc -eq 1 ]] && ! grep -q 'DID land' '$HBLOG'"
+
+# E5 — a user record from the human/dispatcher that is NOT this payload (a
+# different line typed in the same window) must not be read as this one landing.
+_reset; PANES=("$P_EMPTY"); _HB_TRANSCRIPT_ROOT=$(mk_store "$TMP/st8"); FAIL_ENTER=1
+sleep() { printf '%s\n' '{"type":"user","message":{"role":"user","content":"some other line entirely"}}' >>"$TMP/st8/proj/s1.jsonl"; }
+_hb_send_line seatx "$TEXT"; rc=$?
+sleep() { :; }
+grade "E5 a user record carrying a DIFFERENT line is not this payload's receipt (rc 1)" \
+  "[[ $rc -eq 1 ]] && ! grep -q 'DID land' '$HBLOG'"
+
+# E6 — a payload with no distinguishing run: say "could not tell" and FAIL the
+# wake (DIVE-2159), even though a real user record did appear in the window.
+_reset; PANES=("$P_EMPTY"); _HB_TRANSCRIPT_ROOT=$(mk_store "$TMP/st9"); FAIL_ENTER=1
+sleep() { printf '%s\n' '{"type":"user","message":{"role":"user","content":"ok"}}' >>"$TMP/st9/proj/s1.jsonl"; }
+_hb_send_line seatx "ok"; rc=$?
+sleep() { :; }
+grade "E6 an unmatchable payload reports 'could not tell' and fails the wake, never 'DID land'" \
+  "[[ $rc -eq 1 ]] && grep -q 'could not tell whether the line landed' '$HBLOG' && ! grep -q 'DID land' '$HBLOG'"
+
+# E7 — the needle is derived from the payload, and splits on what a JSON writer
+# re-spells, so a quote or a newline in the payload cannot produce a bogus match.
+grade "E7 the needle is the longest JSON-safe run of the payload" \
+  "[[ \$(_hb_landed_needle 'ab\"the distinguishing run\"cd') == 'the distinguishing run' ]]"
+grade "E8 ...and a payload with no run at the floor yields no needle at all (rc 1)" \
+  "! _hb_landed_needle 'a\"b\"c' >/dev/null 2>&1"
+
+# E9 — MUTATION: restore iteration 1's type-only check and E3 goes red, so E3 is
+# pinned to the payload-aware receipt and not to the fixture.
+_reset; PANES=("$P_EMPTY"); _HB_TRANSCRIPT_ROOT=$(mk_store "$TMP/st10"); FAIL_ENTER=1
+_orig_check=$(declare -f _hb_landed_check)
+_hb_landed_check() {
+  local name="$1"
+  sleep "${_HB_LANDED_WAIT_SEC:-1}"
+  sudo -n -u "agent-${name}" tail -c "+$(( _HB_LANDED_SIZE + 1 ))" "$_HB_LANDED_FILE" 2>/dev/null \
+    | grep -aq '"type"[[:space:]]*:[[:space:]]*"user"' || return 1
+  _hb_log "[$name] the keystroke failed but the line DID land"; return 0; }
+sleep() { printf '%s\n' "$TOOL_RESULT" >>"$TMP/st10/proj/s1.jsonl"; }
+_hb_send_line seatx "$TEXT"; mut_rc=$?
+sleep() { :; }
+eval "$_orig_check"
+grade "E9 mutation: the iteration-1 type-only check counts the tool_result as delivered — the arm is live" \
+  "[[ $mut_rc -eq 0 ]]"
+_reset; PANES=("$P_EMPTY"); _HB_TRANSCRIPT_ROOT=$(mk_store "$TMP/st11"); FAIL_ENTER=1
+sleep() { printf '%s\n' "$TOOL_RESULT" >>"$TMP/st11/proj/s1.jsonl"; }
+_hb_send_line seatx "$TEXT"; rc=$?
+sleep() { :; }
+grade "E10 ...and the restored function refuses it again (the restore took)" "[[ $rc -eq 1 ]]"
 
 echo "-----"
 printf '%d passed, %d failed\n' "$PASS" "$FAIL"

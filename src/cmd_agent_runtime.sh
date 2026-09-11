@@ -1044,6 +1044,129 @@ _agent_dispatch_write_failed_reason() {
   printf '%s\n' 'could not write to the codex dispatcher inbox — the seat declares dispatcher delivery but its inbox is unwritable (DIVE-4036)'
 }
 
+# --- DIVE-4214: a send to a BUSY seat QUEUES ---------------------------------
+#
+# Delivery below is `tmux send-keys -l` into the live pane, so a send that
+# arrives while the seat holds a task attempt becomes that seat's NEXT USER TURN
+# in the middle of the row it is working. Measured over the 24h to 2026-09-10:
+# 67 of 170 fleet-wide a2a sends went to ops, and 40 of those 67 landed inside a
+# running attempt. This repo's own a2a rule (CLAUDE.md, measured 2026-08-12) is
+# that the cost is not the bytes — 387 KB fleet-wide is under 0.5% of burn — it
+# is that each inbound makes the recipient re-investigate. A mid-attempt inbound
+# spends a seat's attempt on a turn that is not its row.
+#
+# So: busy -> write the payload to the target's spool and return rc 4. The
+# heartbeat tick flushes the spool at the seat's next idle (_hb_a2a_queue_sweep),
+# which is also the seat's next wake, since a woken seat is idle before its
+# first turn. An IDLE seat is untouched — same code, same one turn, same latency.
+#
+# BUSY IS `_hb_agent_idle` SAYING BUSY, i.e. rc 1, and nothing else. rc 0 (idle),
+# rc 2 (no signal) and rc 3 (blocked on a permission dialog) all fall through to
+# today's path: queueing on a reading we could not take would convert an
+# unmeasurable seat into a silently deaf one, which is the DIVE-4036 shape.
+#
+# THE INTERRUPTING CLASS IS ENUMERATED HERE AND IS NOT A CALLER FLAG. An
+# `--urgent` flag becomes every caller's default within a week and stops meaning
+# anything, so the set is derived from what the transport already knows:
+#   1. TUI control lines (/clear, /goal clear, /compact) — _agent_dispatch_is_tui_control.
+#      These are the heartbeat's own thread-reset verbs, not conversation; a
+#      queued /clear would reset the WRONG thread one turn later.
+#   2. `ask` (cmd_ask) — a synchronous request whose caller is blocked polling
+#      the pane for the reply. Queueing it does not delay it, it breaks it. The
+#      caller pays for its own round, which is why it is not the volume problem.
+#   3. The flush itself (_A2A_INTERRUPTING=1), which by construction only ever
+#      runs against a seat that just read idle.
+#   4. Dispatcher-inbox seats, which never reach here — the dispatcher owns turn
+#      scheduling and its inbox IS a queue. Unchanged by this ticket.
+# Members 1-3 set _A2A_INTERRUPTING=1 or are matched by predicate; there is no
+# fifth member and no way for a caller to add one.
+#
+# RESIDUAL, named: `ask` can still land mid-attempt. It was 1 of the 170 sends
+# measured. Closing it needs a reply channel that survives a queued turn, which
+# is a different transport, not a flag.
+
+# Spool directory for a target seat. Lives in the TARGET's home, owned by the
+# target, for the same reason _agent_dispatch_inbox_send writes as the target:
+# the flush runs from the heartbeat as root and must never be induced to read a
+# path the sender chose.
+_a2a_queue_dir() { printf '%s\n' "/home/agent-${1}/.5dive/a2a-queue"; }
+
+# Append one payload to the target's spool. rc 0 = queued, rc 1 = could not.
+# The filename carries a nanosecond stamp so the flush drains in send order.
+_a2a_queue_put() {
+  local name="$1" payload="$2" dir id tmp dst
+  dir="$(_a2a_queue_dir "$name")"
+  id="$(date +%s%N)-$$-${RANDOM}"
+  tmp="${dir}/.${id}.msg.part"
+  dst="${dir}/${id}.msg"
+  sudo -u "agent-${name}" mkdir -p "$dir" 2>/dev/null || return 1
+  # Dot-prefixed while partial and renamed into place, so the flush can never
+  # read a half-written message (same discipline as the dispatcher inbox).
+  printf '%s' "$payload" | sudo -u "agent-${name}" tee "$tmp" >/dev/null 2>&1 || return 1
+  sudo -u "agent-${name}" mv -f "$tmp" "$dst" 2>/dev/null || {
+    sudo -u "agent-${name}" rm -f "$tmp" 2>/dev/null || true
+    return 1
+  }
+  return 0
+}
+
+# How many messages are spooled for a seat (0 when the spool is absent).
+_a2a_queue_depth() {
+  local name="$1" dir
+  dir="$(_a2a_queue_dir "$name")"
+  sudo -u "agent-${name}" find "$dir" -maxdepth 1 -name '*.msg' 2>/dev/null | wc -l
+}
+
+# Should this send be spooled instead of typed? Deliberately a separate pure-ish
+# predicate so a test can drive every rc of _hb_agent_idle without tmux.
+_a2a_should_queue() {
+  local name="$1" payload="$2"
+  [[ "${_A2A_INTERRUPTING:-0}" == "1" ]] && return 1
+  [[ "${FIVE_A2A_QUEUE:-on}" == "on" ]] || return 1
+  _agent_dispatch_is_tui_control "$payload" && return 1
+  # Harnesses that source only cmd_agent_runtime.sh have no idle predicate; an
+  # absent signal is "unknown", which does not queue.
+  declare -F _hb_agent_idle >/dev/null 2>&1 || return 1
+  local _irc=0
+  _hb_agent_idle "$name" "${FIVE_A2A_QUEUE_IDLE_GAP:-0.4}" || _irc=$?
+  (( _irc == 1 ))
+}
+
+# Reason string for the rc-4 receipt. One definition, because `send` and the
+# scoped `_deliver` must not disagree about why sent:false (DIVE-2362's rule).
+_a2a_queued_reason() {
+  printf '%s\n' "target is mid-attempt — queued, delivers at its next idle or wake (DIVE-4214)"
+}
+
+# Drain ONE spooled message into a seat that is idle right now. One per call on
+# purpose: typing the second message straight after the first would land it
+# inside the turn the first just started, which is the defect this ticket is
+# about. The heartbeat re-enters every tick, so a backlog drains at one message
+# per idle observation and never mid-turn.
+# rc 0 = one delivered, 1 = nothing to do / not idle / delivery failed.
+# The locals are `seat`/`msg` and NOT `name`/`payload` on purpose:
+# tests/agent_send_wake_unit.sh arm H pins the readiness gate to sit before the
+# FIRST inject-and-submit call spelled with those two variable names in this
+# file, meaning cmd_send's call site. A second call spelled the same way would take that grep over and
+# green the arm against the wrong function — the assertion would still pass and
+# would have stopped grading what it names. Renaming here keeps the control
+# pointed at cmd_send rather than widening the control to admit this line.
+a2a_queue_flush_one() {
+  local seat="$1" dir f msg _rc=0
+  dir="$(_a2a_queue_dir "$seat")"
+  f="$(sudo -u "agent-${seat}" find "$dir" -maxdepth 1 -name '*.msg' 2>/dev/null | sort | head -1)"
+  [[ -n "$f" ]] || return 1
+  _hb_agent_idle "$seat" "${FIVE_A2A_QUEUE_IDLE_GAP:-0.4}" || return 1
+  msg="$(sudo -u "agent-${seat}" cat "$f" 2>/dev/null)" || return 1
+  [[ -n "$msg" ]] || { sudo -u "agent-${seat}" rm -f "$f" 2>/dev/null; return 1; }
+  # Unlink BEFORE typing. A message delivered twice is worse than one lost: the
+  # duplicate costs the recipient a second full re-investigation, which is the
+  # burn this ticket exists to remove.
+  sudo -u "agent-${seat}" rm -f "$f" 2>/dev/null || return 1
+  _A2A_INTERRUPTING=1 inject_and_submit "$seat" "$msg" || _rc=$?
+  (( _rc == 0 ))
+}
+
 inject_and_submit() {
   local name="$1" payload="$2" tries=0
   local user="agent-${name}"   # separate stmt: ${name} in the same line aborts under set -u (silent msg drop)
@@ -1066,6 +1189,15 @@ inject_and_submit() {
   # for the same reason the readiness marker set was collapsed into one predicate
   # in DIVE-1528 — a per-site copy is a per-site drift. Distinct rc 3 so callers
   # can tell "refused, nothing was typed" from rc 1 "typed but maybe unsubmitted".
+  # DIVE-4214: busy seat -> spool instead of typing into a running turn. Placed
+  # after the dispatcher branch (that seat has its own queue) and BEFORE the
+  # credential guard, because a spooled message is not typed anywhere: the guard
+  # protects a pane this path does not touch, and re-checking it here would make
+  # a seat parked on a login prompt lose a message the spool would have kept.
+  # Distinct rc 4 so callers report "queued", never "failed" and never "sent".
+  if _a2a_should_queue "$name" "$payload"; then
+    _a2a_queue_put "$name" "$payload" && return 4
+  fi
   _agent_pane_safe_to_type "$name" || return 3
   # DIVE-4246: COMPOSER HYGIENE, then the payload — the same pair DIVE-4242 gave
   # the heartbeat's `_hb_send_line`. This is the OTHER typed-send site (`send`,
@@ -1615,10 +1747,16 @@ cmd_deliver() {
   if ! _agent_delivery_inbox "$target" >/dev/null 2>&1 && ! wait_agent_input_ready "$target"; then
     step "agent '$target' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
   fi
-  local _rc=0 _delivered=1 _reason="" _summary=""
+  local _rc=0 _delivered=1 _queued=0 _reason="" _summary=""
   inject_and_submit "$target" "$payload" || _rc=$?
   if (( _rc == 3 )); then
     fail "$E_AUTH_REQUIRED" "$(_agent_credential_refusal_msg "$target")"
+  elif (( _rc == 4 )); then
+    # DIVE-4214: spooled for the target's next idle. Same delivered:false receipt
+    # as an unconfirmed submit (see cmd_send) plus the additive queued:true.
+    _delivered=0
+    _queued=1
+    _reason="$(_a2a_queued_reason)"
   elif (( _rc != 0 )); then
     _delivered=0
     _reason="$(_agent_submit_unconfirmed_reason "$target" "$_rc")"
@@ -1644,12 +1782,17 @@ cmd_deliver() {
        '{name:$n, delivered:true, from:$s, tier:($t|select(length>0))}' \
        --arg n "$target" --arg s "$s" --arg t "$tier"
   else
-    _summary="delivery to agent '$target' is unconfirmed — ${_reason}."
+    if (( _queued )); then
+      _summary="queued for agent '$target' — ${_reason}."
+    else
+      _summary="delivery to agent '$target' is unconfirmed — ${_reason}."
+    fi
     ok "$_summary" \
        '({name:$n, delivered:false, from:$s}
          + (if ($t|length) > 0 then {tier:$t} else {} end)
+         + (if $q == "1" then {queued:true} else {} end)
          + {reason:$r})' \
-       --arg n "$target" --arg s "$s" --arg t "$tier" --arg r "$_reason"
+       --arg n "$target" --arg s "$s" --arg t "$tier" --arg r "$_reason" --arg q "$_queued"
   fi
 }
 
@@ -2340,10 +2483,19 @@ cmd_send() {
     step "agent '$name' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
   fi
 
-  local _rc=0 _sent=1 _reason="" _summary=""
+  local _rc=0 _sent=1 _queued=0 _reason="" _summary=""
   inject_and_submit "$name" "$payload" || _rc=$?
   if (( _rc == 3 )); then
     fail "$E_AUTH_REQUIRED" "$(_agent_credential_refusal_msg "$name")"
+  elif (( _rc == 4 )); then
+    # DIVE-4214: accepted and spooled, not typed. It rides the SAME sent:false
+    # receipt as an unconfirmed submit, because the honest claim is identical —
+    # the message has not reached the model yet — and a caller that already
+    # handles sent:false correctly needs no change. `queued:true` is what tells
+    # the two apart, and it is additive.
+    _sent=0
+    _queued=1
+    _reason="$(_a2a_queued_reason)"
   elif (( _rc != 0 )); then
     _sent=0
     _reason="$(_agent_submit_unconfirmed_reason "$name" "$_rc")"
@@ -2375,16 +2527,21 @@ cmd_send() {
        '{name:$n, sent:true, bytes:($p|length), woken:($w=="1"), ready:($rd|select(length>0)), from:($s|select(length>0)), msg_id:($i|select(length>0)), reply_to_chat:($rc|select(length>0)), reply_to_msg:($rm|select(length>0))}' \
        --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY"
   else
-    _summary="send to agent '$name' is unconfirmed — ${_reason}."
+    if (( _queued )); then
+      _summary="queued for agent '$name' — ${_reason}."
+    else
+      _summary="send to agent '$name' is unconfirmed — ${_reason}."
+    fi
     ok "$_summary" \
        '({name:$n, sent:false, bytes:($p|length), woken:($w=="1")}
+         + (if $q == "1" then {queued:true} else {} end)
          + (if ($rd|length) > 0 then {ready:$rd} else {} end)
          + (if ($s|length) > 0 then {from:$s} else {} end)
          + (if ($i|length) > 0 then {msg_id:$i} else {} end)
          + (if ($rc|length) > 0 then {reply_to_chat:$rc} else {} end)
          + (if ($rm|length) > 0 then {reply_to_msg:$rm} else {} end)
          + {reason:$reason})' \
-       --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY" --arg reason "$_reason"
+       --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY" --arg reason "$_reason" --arg q "$_queued"
   fi
 }
 
@@ -2470,15 +2627,28 @@ cmd_ask() {
   local use_scoped=0
   a2a_needs_scoped "$name" && use_scoped=1
 
+  # DIVE-4277: a scoped ask reaches this same guard in cmd_deliver after the
+  # sudo re-exec. The full-trust path does not, so grade it here and only here:
+  # every real ask is recorded once, and the existing soft-cap warning applies
+  # to ask exactly as it does to send without double-counting scoped callers.
+  local _gcaller _a2a_refusal
+  _gcaller="$(_envelope_caller)"
+  if (( ! use_scoped )); then
+    if ! _a2a_refusal="$(a2a_round_guard "$_gcaller" "$name" "$message")"; then
+      fail "$E_VALIDATION" "$_a2a_refusal"
+    fi
+  fi
+
   # Resolve sender — ask always wraps because we need a marker to slice the reply
   # window. On the scoped path `_deliver` re-derives the sender + tier from the
   # real sudo caller, so this local `sender` is only for this command's JSON
-  # summary. Fall back to a literal "ask" if we can't infer one.
+  # summary. Use the same measured caller as the guard/audit path; the literal
+  # fallback exists only for a genuinely unmeasurable process.
   local sender msg_id
   if (( from_set )); then
     sender="$from"
   else
-    sender="$(auto_sender_from_sudo)"
+    sender="$_gcaller"
   fi
   [[ -n "$sender" ]] || sender="ask"
   valid_sender_label "$sender" \
@@ -2491,7 +2661,6 @@ cmd_ask() {
   # `_gcaller` is the same resolver as `_audit_caller` and `_dcaller` below
   # (DIVE-2281's one-resolver rule), so the refusal, the audit row and the rendered
   # via= cannot disagree about who called.
-  local _gcaller; _gcaller="$(_envelope_caller)"
   _agent_refuse_peer_forgery "$sender" "$_gcaller" ask
   msg_id="$(gen_msg_id)"
 
@@ -2605,7 +2774,12 @@ cmd_ask() {
       step "agent '$name' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
     fi
     local _rc=0
-    inject_and_submit "$name" "$payload" || _rc=$?
+    # DIVE-4214: `ask` is member 2 of the enumerated interrupting class. It is a
+    # SYNCHRONOUS request — the block below polls the target's pane for the reply
+    # to this msg_id — so spooling it does not delay the question, it strands the
+    # asker on a reply that will never render. The marker is set here, by the
+    # transport, and there is no caller flag that can set it.
+    _A2A_INTERRUPTING=1 inject_and_submit "$name" "$payload" || _rc=$?
     if (( _rc == 3 )); then
       fail "$E_AUTH_REQUIRED" "$(_agent_credential_refusal_msg "$name")"
     elif (( _rc != 0 )); then

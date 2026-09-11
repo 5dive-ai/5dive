@@ -2,10 +2,10 @@
 # DIVE-3318: the a2a ROUND cap and the acknowledgement refusal.
 #
 # Grades the guard itself (src/lib/a2a_rounds.sh) against a ledger in a temp dir.
-# Both send paths (`cmd_send`'s direct branch and `cmd_deliver`'s scoped branch)
-# call `a2a_round_guard` and fail on its non-zero return, so the decision graded
+# All recording paths (`cmd_send`, scoped `cmd_deliver`, and full-trust
+# `cmd_ask`) call `a2a_round_guard`, so the decision graded
 # here IS the decision the fleet gets — the wiring is asserted separately below
-# by grepping both call sites, because a guard nothing calls passes every test
+# by grepping all call sites, because a guard nothing calls passes every test
 # it has.
 set -uo pipefail
 trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits).
@@ -230,11 +230,11 @@ rm -f "$A2A_ROUND_LEDGER"
 check "a freshly created ledger is group-writable" "$(stat -c %a "$A2A_ROUND_LEDGER")" "660"
 A2A_ROUND_LEDGER="$TMP/rounds.tsv"
 
-echo "== the guard is actually wired into BOTH delivery paths =="
+echo "== the guard is actually wired into every recording path =="
 rt="$ROOT/src/cmd_agent_runtime.sh"
 n="$(grep -c 'a2a_round_guard' "$rt")"
-if [ "$n" -ge 2 ]; then ok "a2a_round_guard called $n× in cmd_agent_runtime.sh"; else
-  bad "a2a_round_guard must be called on both cmd_send and cmd_deliver (found $n)"; fi
+if [ "$n" -ge 3 ]; then ok "a2a_round_guard called $n× in cmd_agent_runtime.sh"; else
+  bad "a2a_round_guard must cover send, scoped deliver and full-trust ask (found $n)"; fi
 # Slice ONE top-level function body: from its `name() {` line to the next
 # top-level definition (or EOF). `~` binds TIGHTER than concatenation in awk, so
 # the parens around the built pattern are load-bearing: without them the match is
@@ -259,27 +259,34 @@ _fn_body() {  # <file> <fn>
 # find one that belongs to a different function.
 _send_body="$(_fn_body "$rt" cmd_send)"
 _deliver_body="$(_fn_body "$rt" cmd_deliver)"
-if printf '%s' "$_send_body" | grep -q 'msg_src'; then
+_ask_body="$(_fn_body "$rt" cmd_ask)"
+if grep -q 'msg_src' <<<"$_send_body"; then
   ok "control: the function extractor finds cmd_send's own code"
 else
   bad "control: the extractor cannot read cmd_send — every wiring assertion below is void"
 fi
-if printf '%s' "$_send_body" | grep -q 'require_root "agent _deliver"'; then
+if grep -q 'require_root "agent _deliver"' <<<"$_send_body"; then
   bad "control: the extractor leaked cmd_deliver's body into cmd_send"
 else
   ok "control: the extractor does not leak across function boundaries"
 fi
 # The scoped path is the one every standard-isolation agent takes. A cap enforced
 # only in cmd_send is a cap on admins, i.e. on nobody being counted.
-if printf '%s' "$_deliver_body" | grep -q 'a2a_round_guard'; then
+if grep -q 'a2a_round_guard' <<<"$_deliver_body"; then
   ok "cmd_deliver (the scoped path) enforces the cap"
 else
   bad "cmd_deliver does not enforce the cap — scoped agents would bypass it"
 fi
-if printf '%s' "$_send_body" | grep -q 'a2a_round_guard'; then
+if grep -q 'a2a_round_guard' <<<"$_send_body"; then
   ok "cmd_send (the direct path) enforces the cap"
 else
   bad "cmd_send does not enforce the cap"
+fi
+if [ "$(grep -c 'a2a_round_guard' <<<"$_ask_body")" = "1" ] \
+   && grep -q 'if (( ! use_scoped )); then' <<<"$_ask_body"; then
+  ok "cmd_ask grades only its full-trust path; scoped asks remain single-counted by cmd_deliver"
+else
+  bad "cmd_ask must call the guard exactly once and only for !use_scoped"
 fi
 # The notify marker must survive the sudo re-exec, or a gate ping gets refused.
 if grep -q '_deliver --notify' "$rt"; then

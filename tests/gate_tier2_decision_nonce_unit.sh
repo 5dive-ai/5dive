@@ -188,16 +188,20 @@ cmd_task_need DIVE-201 --type=decision --ask="pick a lane" --options="A|B" --rec
 # --- T2: same, via the CATEGORY FLOOR rather than an explicit pin. -------------
 #     "secrets" in the ask trips _gate_tier2_floor_hit — the OSS-16 mechanism, and
 #     the way most tier-2 decisions actually get there.
+# DIVE-4175 arm C: the category heuristic no longer promotes the tier, so the way
+# "most tier-2 decisions actually get there" is now the DECLARATION. T2's property
+# is unchanged — a tier-2 decision reached WITHOUT an explicit --tier pin still
+# mints a nonce — and `--needs=` is the remaining un-pinned route to tier 2.
 seed_task DIVE-202
-cmd_task_need DIVE-202 --type=decision --ask="rotate the prod secrets now?" --options="yes|no" --recommend="no" >/dev/null 2>&1
+cmd_task_need DIVE-202 --type=decision --needs=secret_provision --ask="rotate the prod secrets now?" --options="yes|no" --recommend="no" >/dev/null 2>&1
 if [[ "$(tierof DIVE-202)" == "2" ]]; then
-  ok_t "T2 precondition: category heuristic floored the decision to tier 2"
+  ok_t "T2 precondition: a DECLARED capability floored the decision to tier 2 (no explicit --tier)"
   [[ "$(hashof DIVE-202)" =~ ^[0-9a-f]{64}$ ]] \
     && ok_t "T2 category-FLOORED tier-2 decision mints a nonce" \
     || bad_t "T2 category-floored tier-2 decision mints a nonce" "got '$(hashof DIVE-202)'"
 else
   # Never pass silently if the keyword floor moves — that would make T2 vacuous.
-  bad_t "T2 precondition: category floor" "got tier '$(tierof DIVE-202)' (keyword floor may have moved)"
+  bad_t "T2 precondition: category floor" "got tier '$(tierof DIVE-202)' (the --needs human half is the sole un-pinned route to tier 2 after DIVE-4175 arm C)"
 fi
 
 # --- T3: the RESCUE path — a gate filed BEFORE this change (nonce-less at rest)

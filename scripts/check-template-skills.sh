@@ -17,6 +17,14 @@
 # flaked fetch and a skill that has never existed print the same warning and suggest the
 # same futile rerun. This script removes the ambiguity by asking the repo directly.
 #
+# DIVE-4196 — the SHIPPED templates moved to 5dive-ai/character-packs (teams/).
+# The authoritative run of this check is the copy that moved with them
+# (scripts/check-team-skills.sh there, on the same daily cron): it is the one
+# that grades what customers actually import. This copy now defaults to the
+# local parser fixtures, so it still catches a broken reference in a spec this
+# repo's harnesses exercise — pass --templates=<registry checkout>/teams to
+# grade the shipped catalogue from here.
+#
 # Usage:
 #   scripts/check-template-skills.sh                     # fetch the live skill list via gh
 #   scripts/check-template-skills.sh --skills-list=FILE   # grade against a list (offline/tests)
@@ -42,7 +50,7 @@ for arg in "$@"; do
 done
 
 if [[ -z "$TEMPLATES_DIR" ]]; then
-  TEMPLATES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/team-templates"
+  TEMPLATES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/tests/fixtures/team-templates"
 fi
 [[ -d "$TEMPLATES_DIR" ]] || { printf 'SKIP — no templates dir at %s\n' "$TEMPLATES_DIR" >&2; exit 2; }
 

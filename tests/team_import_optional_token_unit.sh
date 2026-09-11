@@ -26,7 +26,7 @@ trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 SRC="$ROOT/src/cmd_compose.sh"
-TPL="$ROOT/team-templates"
+TPL="$ROOT/tests/fixtures/team-templates"
 TMP="$(mktemp -d)"
 
 pass=0; fail=0

@@ -395,6 +395,44 @@ _hb_autosleep_sweep() {
   return 0
 }
 
+# DIVE-4214: drain the a2a spool. A send to a seat that was mid-attempt was
+# written to /home/agent-<name>/.5dive/a2a-queue instead of being typed into the
+# running turn (see the queue block in cmd_agent_runtime.sh); this is the other
+# half — the seat's next idle, which is also its next wake, since a woken seat is
+# idle before its first turn.
+#
+# ONE MESSAGE PER SEAT PER TICK, and that is the design, not a throttle. Typing
+# the second message straight after the first would land it inside the turn the
+# first just started — the exact defect. So the flush re-asks the idle question
+# every tick and a backlog drains one message per idle observation.
+#
+# ORDERED BEFORE THE AUTOSLEEP SWEEP in the tick: a seat with mail waiting must
+# not be stopped with it still spooled. The spool survives a stop (it is a file
+# in the seat's home), but the seat would then sleep until something else woke
+# it, which turns a queued message into an indefinitely deferred one.
+#
+# Same isolation contract as every other sweep — a failure here must NEVER abort
+# the wake loop.
+_HB_A2A_FLUSHED=0
+_hb_a2a_queue_sweep() {
+  local reg name depth
+  _HB_A2A_FLUSHED=0
+  declare -F a2a_queue_flush_one >/dev/null 2>&1 || return 0
+  reg=$(registry_read) || return 0
+  for name in $(jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null); do
+    depth=$(_a2a_queue_depth "$name")
+    [[ "$depth" =~ ^[0-9]+$ ]] || continue
+    (( depth > 0 )) || continue
+    systemctl is-active --quiet "5dive-agent@${name}.service" 2>/dev/null || continue
+    if a2a_queue_flush_one "$name"; then
+      _HB_A2A_FLUSHED=$((_HB_A2A_FLUSHED + 1))
+      _hb_log "[$name] delivered 1 queued a2a message at idle (${depth} were spooled)"
+    fi
+  done
+  (( _HB_A2A_FLUSHED > 0 )) && _hb_log "[a2a-queue] pass done — ${_HB_A2A_FLUSHED} delivered"
+  return 0
+}
+
 _hb_log() { printf '%s [heartbeat] %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
 
 _hb_usage() {
@@ -1676,10 +1714,22 @@ _hb_send_keys_step() {
 # On the same box the seat STARTED the row 23s after the 'nudge send failed', so
 # the tick's `woke 0` may be a FALSE NEGATIVE, not just a missing reason. Before
 # typing we mark the seat's newest transcript (path + byte size); after a failed
-# step we re-read it and ask DIVE-4247's question — did the transcript gain a
-# `"type":"user"` record? — over the bytes appended SINCE the mark. Same file and
-# grown only: a NEW newest file is a new session, which is not evidence that this
-# payload landed, so that reads as not-landed and says so.
+# step we re-read the bytes appended SINCE the mark and look for THIS payload.
+#
+# DIVE-4279 iteration 2 — the first cut turned that false negative into a false
+# POSITIVE, which is worse. It accepted ANY `"type":"user"` record in the window,
+# and Claude Code writes every TOOL RESULT as a user record (6 of 9 user records
+# in a live transcript were tool_results), so a seat that is merely WORKING mints
+# one every few seconds. The receipt must therefore be a property of THIS
+# PAYLOAD, not of the record type:
+#   * the record must carry a distinguishing run of the payload text verbatim;
+#   * tool_result-shaped records are excluded outright, so a tool result that
+#     happens to quote the payload back (a `task show`, a grep of the log) can
+#     never be mistaken for the seat receiving it;
+#   * if no such run can be derived, or nothing matches, the answer is "could not
+#     tell" and the WAKE FAILS — DIVE-2159: never report a state nobody measured.
+# Same file and grown only: a NEW newest file is a new session, which is not
+# evidence that this payload landed, so that reads as not-landed and says so.
 _HB_TRANSCRIPT_ROOT=""      # test seam; empty = the seat's real ~/.claude/projects
 _HB_LANDED_FILE=""; _HB_LANDED_SIZE=""; _HB_LANDED_EVIDENCE=""
 _hb_transcript_newest() {
@@ -1701,12 +1751,43 @@ _hb_landed_mark() {
   [[ "$_HB_LANDED_SIZE" =~ ^[0-9]+$ ]] || { _HB_LANDED_SIZE=""; _HB_LANDED_FILE=""; }
   return 0
 }
-# 0 = the payload demonstrably reached the seat despite the failed keystroke (the
+# The longest run of the payload that survives JSON encoding byte-for-byte, so a
+# plain fixed-string grep over the raw transcript can match it. Split on every
+# byte a JSON writer may re-spell — anything outside printable ASCII (control
+# bytes, and UTF-8 that some writers emit as `\uXXXX`) plus `"` and `\` — and the
+# longest surviving run is the needle. Too short a run is not distinguishing —
+# "ok" would match half the corpus — so below the floor we return failure and the
+# caller reports "could not tell" rather than guessing.
+_HB_LANDED_NEEDLE_MIN="${_HB_LANDED_NEEDLE_MIN:-12}"
+_hb_landed_needle() {
+  local text="$1" best="" part
+  # `|| [[ -n "$part" ]]`: the last run carries no trailing newline, and a plain
+  # `read` drops it — which silently threw away the whole needle for any payload
+  # holding no escapable byte at all.
+  while IFS= read -r part || [[ -n "$part" ]]; do
+    (( ${#part} > ${#best} )) && best="$part"
+  done < <(printf '%s' "$text" \
+    | LC_ALL=C tr -c '\040-\176' '\n' \
+    | LC_ALL=C tr '"\\' '\n\n')
+  best="${best#"${best%%[![:space:]]*}"}"      # trim: leading run of blanks
+  best="${best%"${best##*[![:space:]]}"}"      # trim: trailing run of blanks
+  (( ${#best} >= _HB_LANDED_NEEDLE_MIN )) || return 1
+  printf '%s' "${best:0:200}"
+}
+
+# 0 = THIS payload demonstrably reached the seat despite the failed keystroke (the
 # caller counts the wake as delivered, so `woke N` matches reality); 1 = it did
 # not, or we could not tell — either way the reason is logged, never inferred.
+# NEVER call this for a step that precedes the payload keystroke: a failed C-u
+# means the text was never typed, so nothing appended in the window can be a
+# receipt for it and a match there could only be somebody else's record.
 _hb_landed_check() {
-  local name="$1" now_file now_size tail_rc=0
+  local name="$1" text="$2" now_file now_size needle tail_rc=0
   _HB_LANDED_EVIDENCE=""
+  if ! needle=$(_hb_landed_needle "$text"); then
+    _hb_log "[$name] could not tell whether the line landed: the payload has no ${_HB_LANDED_NEEDLE_MIN}-char run distinctive enough to match in the transcript, so nothing is claimed either way (DIVE-4279/DIVE-2159)" 2>/dev/null || true
+    return 1
+  fi
   if [[ -z "$_HB_LANDED_FILE" || -z "$_HB_LANDED_SIZE" ]]; then
     _hb_log "[$name] could not tell whether the line landed: no readable transcript to compare against (DIVE-4279)" 2>/dev/null || true
     return 1
@@ -1722,13 +1803,18 @@ _hb_landed_check() {
     _hb_log "[$name] line did NOT land: transcript $(basename "$_HB_LANDED_FILE") gained no bytes since the send (DIVE-4279)" 2>/dev/null || true
     return 1
   fi
+  # user record AND not tool_result-shaped AND carrying this payload's own text.
+  # The tool_result exclusion is a whole-RECORD drop, not a field test: a tool
+  # result that quotes the payload back must not read as the seat receiving it.
   sudo -n -u "agent-${name}" tail -c "+$(( _HB_LANDED_SIZE + 1 ))" "$_HB_LANDED_FILE" 2>/dev/null \
-    | grep -aq '"type"[[:space:]]*:[[:space:]]*"user"' || tail_rc=1
+    | grep -a '"type"[[:space:]]*:[[:space:]]*"user"' \
+    | grep -av -e '"type"[[:space:]]*:[[:space:]]*"tool_result"' -e '"tool_use_id"' \
+    | grep -aqF -- "$needle" || tail_rc=1
   if (( tail_rc != 0 )); then
-    _hb_log "[$name] line did NOT land: transcript $(basename "$_HB_LANDED_FILE") grew but gained no user record (DIVE-4279)" 2>/dev/null || true
+    _hb_log "[$name] line did NOT land: transcript $(basename "$_HB_LANDED_FILE") grew, but no non-tool_result user record since byte ${_HB_LANDED_SIZE} carries this payload ('${needle:0:40}') (DIVE-4279)" 2>/dev/null || true
     return 1
   fi
-  _HB_LANDED_EVIDENCE="$(basename "$_HB_LANDED_FILE") gained a user record after byte ${_HB_LANDED_SIZE}"
+  _HB_LANDED_EVIDENCE="$(basename "$_HB_LANDED_FILE") gained a user record carrying this payload ('${needle:0:40}') after byte ${_HB_LANDED_SIZE}"
   _hb_log "[$name] the keystroke failed but the line DID land — ${_HB_LANDED_EVIDENCE}; counting the wake as delivered (DIVE-4279)" 2>/dev/null || true
   return 0
 }
@@ -1789,8 +1875,11 @@ _hb_send_line() {
   # DIVE-4279: mark the transcript BEFORE the first keystroke, so a failed step
   # can be checked against what the seat actually received.
   _hb_landed_mark "$name"
-  _hb_send_keys_step "$name" "composer clear (C-u)" C-u || { _hb_landed_check "$name" && return 0; return 1; }
-  _hb_send_keys_step "$name" "payload text" -l -- "$text" || { _hb_landed_check "$name" && return 0; return 1; }
+  # NO landed check on this step: the payload has not been typed yet, so a failed
+  # C-u can never mean the line landed. (DIVE-4279 iteration 2 — checking here is
+  # how the first cut counted a busy seat's tool_result as a delivered wake.)
+  _hb_send_keys_step "$name" "composer clear (C-u)" C-u || return 1
+  _hb_send_keys_step "$name" "payload text" -l -- "$text" || { _hb_landed_check "$name" "$text" && return 0; return 1; }
   # DIVE-1217: `send-keys -l` lands as a bracketed PASTE. Claude commits it
   # synchronously so an immediate Enter submits (leave that path alone). Non-claude
   # TUIs (codex/grok/agy/opencode) render the paste inline and a trailing Enter
@@ -1807,17 +1896,17 @@ _hb_send_line() {
   # the pre-DIVE-2244 behaviour for exactly this task and strictly better than a
   # claim on a prompt nobody received.
   if [[ -n "$(_hb_claude_pid "$name")" ]]; then
-    _hb_send_keys_step "$name" "submit (Enter)" Enter || { _hb_landed_check "$name" && return 0; return 1; }
+    _hb_send_keys_step "$name" "submit (Enter)" Enter || { _hb_landed_check "$name" "$text" && return 0; return 1; }
     _hb_verify_submit "$name" && return 0
     sleep "${_HB_SUBMIT_RETRY_SEC:-0.5}"
-    _hb_send_keys_step "$name" "submit retry (Enter)" Enter || { _hb_landed_check "$name" && return 0; return 1; }
+    _hb_send_keys_step "$name" "submit retry (Enter)" Enter || { _hb_landed_check "$name" "$text" && return 0; return 1; }
     _hb_verify_submit "$name" && return 0
     _hb_log "[$name] submit UNVERIFIED — the composer still holds ${#_HB_COMPOSER_UNSENT} chars of non-ghost text after 2 Enters ('${_HB_COMPOSER_UNSENT:0:60}'); returning failure so nothing is claimed on it (DIVE-4242)" 2>/dev/null || true
     return 1
   fi
   sleep 0.4
   while (( tries < 5 )); do
-    _hb_send_keys_step "$name" "submit (Enter, attempt $((tries+1)))" Enter || { _hb_landed_check "$name" && return 0; return 1; }
+    _hb_send_keys_step "$name" "submit (Enter, attempt $((tries+1)))" Enter || { _hb_landed_check "$name" "$text" && return 0; return 1; }
     sleep 0.5
     # idle()==0 means the Enter did not take (still at the prompt) -> retry; any
     # other state (busy/blocked/unknown) means the composer accepted it.
@@ -2068,8 +2157,16 @@ _hb_ident() {
 #   * WHERE status='todo' AND kind='standard' — never stomps a row something else
 #     already moved between the wake and this stamp, and never touches a
 #     recurring TEMPLATE (starting one silently retires it, DIVE-2055/2059);
-#   * started_at=COALESCE(started_at, ...) — same idempotence as `task start`, so
-#     an agent that DOES run `task start` afterwards is a no-op, not a re-clock.
+#   * started_at=datetime('now') — a claim is only ever made from `todo`, and a
+#     todo row has NO live attempt, so the clock is the claim's, not an older one's.
+#     DIVE-4253: it used to be COALESCE(started_at, now), which kept the started_at
+#     a gate-answered row carried back from its previous attempt (`task need` ->
+#     blocked -> answer -> todo clears nothing). The next claim then inherited an
+#     hours-old clock and _hb_reclaim reaped it on its FIRST tick — measured
+#     2026-09-10: DIVE-4218 claimed 22:30:21Z, reaped 22:35:09Z; DIVE-4214 gate
+#     answered 22:28:11Z, reaped 22:30:13Z. One wasted attempt per gated row.
+#     `task start` on an already-in_progress row stays a no-op (it COALESCEs on
+#     in_progress only), so the DIVE-2244 idempotence arm still holds.
 #
 # Returns nonzero when the claim did not land, so the caller can say so out loud
 # rather than logging a claim it never made. Never exits: the agent is already
@@ -2082,7 +2179,7 @@ _hb_claim_task() {
   # blindness this column exists to remove. Seeded from started_at too, so a row
   # already claimed when this ships keeps its real start.
   db "UPDATE tasks SET status='in_progress',
-        started_at=COALESCE(started_at, datetime('now')),
+        started_at=datetime('now'),
         first_started_at=COALESCE(first_started_at, started_at, datetime('now')),
         updated_at=datetime('now')
       WHERE id=${id} AND status='todo' AND kind='standard';" 2>/dev/null || return 1
@@ -2709,7 +2806,10 @@ _hb_reclaim() {
         #
         # (2) started_at SURVIVED THE PAUSE, and every path back to `todo`
         # COALESCEs it: cmd_task_unblock sets status only, cmd_task_start is
-        # `started_at=COALESCE(started_at, datetime('now'))`. So an unblocked row
+        # `started_at=COALESCE(started_at, datetime('now'))`. (DIVE-4253 later made
+        # the dispatcher claim and `task start` stamp a FRESH clock on any start
+        # from todo, so this clear is now belt-and-braces, not the only defence;
+        # it stays — a pause that hands back a stale clock is still wrong.) So an unblocked row
         # re-entered in_progress carrying a timestamp from hours earlier,
         # `age_min >= budget` was true immediately, and it was reaped on the
         # FIRST tick after the unblock — it never got its ${budget} minutes.
@@ -5513,6 +5613,11 @@ cmd_heartbeat_tick() {
   # agents after the idle threshold. Isolated like every other sweep — a failure
   # here must NEVER abort the wake loop (the heartbeat-never-woke bug class). No-op
   # unless at least one agent is opt-in wake_mode=cold.
+  # DIVE-4214: drain a2a messages spooled while the seat was mid-attempt. BEFORE
+  # the autosleep pass, so a seat with mail waiting is not stopped with it still
+  # spooled. Same isolation contract — a failure here must never abort the wake
+  # loop.
+  _hb_a2a_queue_sweep || _hb_log "[a2a-queue] pass errored (non-fatal)"
   _hb_autosleep_sweep "$now" || _hb_log "[autosleep] pass errored (non-fatal)"
   # DIVE-3173: fire any restart `self-update` deferred because the agent was
   # holding an in_progress row. This tick is where the TASK BOUNDARY is observed
@@ -5629,8 +5734,36 @@ cmd_heartbeat_tick() {
         sk_notdue=$((sk_notdue + 1)); _hb_log "[$name] not due ($(( (lastRun + everyMin*60 - now + 59) / 60 ))m left)"; continue
       fi
     fi
+    # DIVE-4261 — A GRADE THIS SEAT CANNOT MERGE IS NOT WORK IN PROGRESS.
+    # After `task verify` PASS the row stays status=in_progress with
+    # assignee=<the grader>, and the merge is owed by a different seat (the
+    # board paints it graded->merge:<owner>). Counted raw, every such row reads
+    # as this seat being busy, so a grader holding one grade it has already
+    # passed is busy-skipped on EVERY tick until some other seat presses the
+    # button -- measured 2026-09-11 00:55-01:05Z, quinn logged
+    # "busy -- 1 in_progress, skip" each tick while sitting at an empty prompt
+    # with 4 graded->merge rows and nothing it could act on; ops the same hour.
+    # That is the maker-side wedge DIVE-4206 fixed, arriving from the grader
+    # side: there the reclaimer drops the stale claim, but a GRADER's claim is
+    # not stale -- it is the record of who graded -- so it must not be
+    # reclaimed, only discounted here.
+    #
+    # SCOPED TO OTHER SEATS' MERGES, exactly like the picker clause and the
+    # reclaimer's merge_elsewhere column: when the owner IS this seat the merge
+    # is its next move, the picker will hand the row back, and it is correctly
+    # busy. The owner expression is the board's, character for character, so
+    # the busy guard, the picker and the board cannot disagree about whose move
+    # a row is.
+    #
+    # NO BACKTICKS AND NO DOUBLE QUOTES IN THIS COMMENT -- the whole statement
+    # below is one double-quoted bash string (the trap already recorded on the
+    # picker and reclaimer queries).
     local inprog
-    inprog=$(db "SELECT COUNT(*) FROM tasks WHERE assignee=$(sqlq "$name") AND status='in_progress';" 2>/dev/null || echo 0)
+    inprog=$(db "SELECT COUNT(*) FROM tasks
+                  WHERE assignee=$(sqlq "$name") AND status='in_progress'
+                    AND NOT ( (${_TASKS_TFV_SQL})
+                              AND COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''),
+                                           COALESCE(assignee,'?')) <> $(sqlq "$name") );" 2>/dev/null || echo 0)
     if [[ "${inprog:-0}" != "0" ]]; then
       sk_busy=$((sk_busy + 1)); _hb_log "[$name] busy — $inprog in_progress, skip"; continue
     fi

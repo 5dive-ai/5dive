@@ -19,7 +19,9 @@ _task_usage() {
       [--priority=low|medium|high|urgent] [--branch=<name>]
       [--assignee=<agent|role:<r>|charter:<kw>>]
       [--recurring="<5-field cron>"] [--accept=<criteria>|--accept-file=<path>] [--verify=<cmd>]
-      [--verifier=<agent>] [--max-iters=<n>] [--no-verify] [--task-budget=<tokens|\$cost>]
+      [--verifier=<agent>] [--max-iters=<n>] [--no-verify] [--verify] [--task-budget=<tokens|\$cost>]
+      --no-verify / --verify   skip / demand a grader session for THIS row, whatever the
+                               box default is ('5dive config verify=always|delivered-only|never')
       [--customer] [--already-blocked=<what it blocked>]   escapes for the internal-filing cap
   ls [--status=] [--assignee=] [--mine] [--all] [--recurring]   open rows, priority-ordered
   ls --gated[=human|agent]                      only rows holding a live gate. The 'gate' column is

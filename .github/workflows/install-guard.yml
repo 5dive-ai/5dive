@@ -38,12 +38,39 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # DIVE-4237 — MAKE THE HEAD SHA AN OBJECT BEFORE ANYTHING DIFFS IT.
+      # actions/checkout gets a PR's tree from `refs/pull/<n>/merge`, and GitHub
+      # rebuilds that ref whenever the base branch moves. A run started in that
+      # window finds it missing, and checkout falls back to the base branch
+      # SILENTLY — so `pull_request.head.sha` below names no object and every
+      # `git` call in this job dies with exit 128 before it grades anything.
+      # `refs/pull/<n>/head` is the PR branch's own tip: written when the author
+      # pushes, never recomputed against the base. Measured on 5dive-api#153,
+      # same head, same workflow, 59 minutes apart — one run got the merge ref
+      # and one got heads+tags only. The script REFUSES if it cannot, which is
+      # the point: a job that cannot read the change must not report on it.
+      - name: Materialise the PR head (DIVE-4237)
+        if: github.event_name == 'pull_request'
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: bash scripts/pr-head-ref.sh --sha="$HEAD_SHA" --pr="$PR_NUMBER"
+
       - name: Surface the root-path diff
         run: |
           set -uo pipefail
           base="${{ github.event.pull_request.base.sha }}"
           head="${{ github.event.pull_request.head.sha }}"
-          files=$(git diff --name-only "$base" "$head" -- install.sh src/cmd_selfupdate.sh)
+          # DIVE-4237: separate "git could not answer" from "git answered nothing".
+          # This step ran without errexit, so a dead `git diff` left $files empty and
+          # fell into the branch below — which exits 0. The check went GREEN and the
+          # root-path diff this job exists to put in front of a human was never
+          # rendered. That is the fails-OPEN half of the merge-ref defect, and it is
+          # the half nobody notices.
+          if ! files=$(git diff --name-only "$base" "$head" -- install.sh src/cmd_selfupdate.sh); then
+            echo "::error::install-guard could not diff ${base:0:12}..${head:0:12}, so it rendered no diff for anyone to read. Refusing rather than reporting a green root-path review that did not happen (DIVE-4237)."
+            exit 1
+          fi
 
           # The path filter above already decided this job should run, so an empty
           # diff here means the filter and the diff disagree — do not report "clean".
@@ -82,7 +109,7 @@ jobs:
             echo "repos ships to the fleet with no tag, no cut, and no review in this repo."
             echo
             echo '```diff'
-            git diff "$base" "$head" -- install.sh src/cmd_selfupdate.sh
+            git diff "$base" "$head" -- install.sh src/cmd_selfupdate.sh || echo "(DIVE-4237: the diff could not be rendered — this summary is INCOMPLETE)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 

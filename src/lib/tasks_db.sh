@@ -836,6 +836,15 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- being one. Set only by `task add --no-verify`; cleared by
   -- `task verifier <id> <agent>`, since an explicit attach supersedes the refusal.
   verify_optout           INTEGER,
+  -- DIVE-4251: the filer's EXPLICIT `--verify` at add time — the mirror image of
+  -- verify_optout, and it exists for the same reason that column does: a box on
+  -- `verify=never` produces a row with no verifier, which is byte-identical to a
+  -- row the filer DEMANDED a grade for but which had not been bound to a delivery
+  -- yet. Without this column the override cannot outlive `task add`, so
+  -- `task deliver` on a `never` box could not tell "the customer wants none" from
+  -- "this one row was singled out for grading". NULL is "no force", true of every
+  -- pre-existing row.
+  verify_forced           INTEGER,
   -- DIVE-3251: THE FIRST TIME REAL WORK STARTED ON THIS ROW, and the one clock in
   -- this table that no nudge/reclaim path may touch. `started_at` is the CURRENT
   -- claim's clock and the heartbeat ladder deliberately clears it on reclaim, "so
@@ -1774,6 +1783,8 @@ _TASKS_ADDITIVE_COLUMNS=(
   # backfill is a no-op. See the CREATE TABLE comment for why an unpersisted
   # refusal reads downstream as a default absence.
   'verify_optout INTEGER'
+  # DIVE-4251: the add-time `--verify`. See the CREATE TABLE comment.
+  'verify_forced INTEGER'
   # DIVE-3251: the durable first-start clock, split out of `started_at` so the
   # reclaim ladder can keep restarting the age without destroying the evidence
   # that work happened. Nullable — NULL means "this build never recorded it",

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# DIVE-4093 — the bundled Distribution team is a roster AND a scheduled loop.
+# DIVE-4093 — the Distribution team is a roster AND a scheduled loop.
+# DIVE-4196: the template now ships from the registry repo; this harness grades
+# the PARSER against a local fixture copy (tests/fixtures/team-templates/).
 set +e -o pipefail
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
 # Three-state: if the helper is unreachable (a staged copy that did not carry
@@ -12,7 +14,7 @@ set +e -o pipefail
 trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"
-TPL="$ROOT/team-templates/distribution.5dive.yaml"
+TPL="$ROOT/tests/fixtures/team-templates/distribution.5dive.yaml"
 # Keep the verdict counter in statement position on its own line: the empirical
 # harness-verdict probe identifies and mutates this variable to prove failures
 # reach the process exit status. A second assignment on the PASS line is valid
@@ -151,12 +153,16 @@ done
 
 jq -e '([.companies[] | select(.slug=="distribution")] | length) == 1 and
        (.companies[] | select(.slug=="distribution") | .size==7 and .loop.id=="distribution-cycle")' \
-  "$ROOT/team-templates/index.json" >/dev/null \
+  "$ROOT/tests/fixtures/team-templates/index.json" >/dev/null \
   && ok_t 'the marketplace registry advertises the roster and loop' \
   || bad_t 'index.json does not advertise the working team' ''
-grep -Eq 'for _tpl in .*distribution\.5dive\.yaml' "$ROOT/install.sh" \
-  && ok_t 'the installer stages the template onto fresh boxes' \
-  || bad_t 'the template exists in source but is absent from the installer manifest' ''
+# DIVE-4196 — the installer no longer stages templates, so "is it on the staging
+# list" has no subject. The question it was really asking (does a fresh box get
+# this template?) is now answered by the registry, and the CLI-side half of that
+# is: nothing in this repo may reintroduce a bundled copy that shadows it.
+grep -Eq 'for _tpl in' "$ROOT/install.sh" \
+  && bad_t 'install.sh stages team templates again — a bundled copy shadows the registry (DIVE-4196)' '' \
+  || ok_t 'the installer stages no templates: a fresh box reads the registry, like every other box'
 
 cat >"$TMP/untrusted-capability.yaml" <<'YAML'
 version: "2"
@@ -182,7 +188,20 @@ STUB
 chmod +x "$TMP/self.sh"
 JSON_MODE=0
 _compose_self() { printf '%s' "$TMP/self.sh"; }
-_team_templates_dir() { printf '%s' "$ROOT/team-templates"; }
+# DIVE-4196: `team ps` resolves through the registry. Replace the ONE network
+# seam (_teams_get) with the local fixture — the index and the resolver under
+# test are the real ones.
+_teams_get() {
+  local url="$1" out="$2" rel
+  rel="${url##*/character-packs/main/}"   # separate statement: same-`local` refs are unreliable
+  case "$rel" in
+    teams/index.json) cp "$ROOT/tests/fixtures/team-templates/index.json" "$out" ;;
+    teams/*)          [[ -f "$ROOT/tests/fixtures/team-templates/${rel#teams/}" ]] \
+                        && cp "$ROOT/tests/fixtures/team-templates/${rel#teams/}" "$out" || return 1 ;;
+    *) return 1 ;;
+  esac
+}
+gh_org() { echo 5dive-ai; }
 ensure_state_ro() { :; }
 tasks_db_init() { :; }
 sqlq() { printf "'%s'" "$1"; }
