@@ -1763,7 +1763,7 @@ PI_ENV
 # analogue of the claude .claude.json hasTrustDialogAccepted pre-seed above.
 # Merge-safe / idempotent: preserves any existing entries, only sets our key.
 seed_pi_project_trust() {
-  local name="$1" user="agent-${name}"
+  local name="$1"; local user="agent-${name}"   # DIVE-4067: two `local`s — SC2318
   local trusted_dir="${2:-/home/claude/projects}"
   step "Pre-seeding pi project-trust for $trusted_dir ($user)"
   if ! sudo -u "$user" -H env TRUSTED_DIR="$trusted_dir" python3 - >&2 <<'PY'
@@ -1879,7 +1879,7 @@ PI_DEFAULT_EXTENSIONS=(
 # Install the pinned default extensions for agent-<name>, verifying each against
 # its recorded npm integrity and failing closed on any mismatch.
 install_default_pi_extensions() {
-  local name="$1" user="agent-${name}"
+  local name="$1"; local user="agent-${name}"   # DIVE-4067: two `local`s — SC2318
 
   case "${FIVE_PI_DEFAULT_EXTENSIONS:-1}" in
     0|no|off|false|NO|OFF|FALSE)
