@@ -607,6 +607,16 @@ mk_graded_awaiting_merge() {   # <maker> <merge-owner>
   db "UPDATE tasks
          SET assignee=$(sqlq "$maker"), status='in_progress',
              started_at=datetime('now','-40 minutes'),
+             -- DIVE-4327: the delivery clock is back-dated with the rest of them.
+             -- mk_delivered_unacked stamps handoff_delivered_at at NOW, and this
+             -- helper then wrote a grade THIRTY MINUTES EARLIER -- a row graded
+             -- before it was delivered, which cannot happen in production and only
+             -- passed because nothing read the two clocks against each other. The
+             -- iteration bind in _TASKS_TFV_SQL does read them, and it is right to
+             -- call a delivery newer than its grade an UNGRADED iteration. The
+             -- shape this fixture means (delivered, then graded, merge owed) is
+             -- unchanged; only the impossible ordering is.
+             handoff_delivered_at=datetime('now','-35 minutes'),
              graded_at=datetime('now','-30 minutes'), graded_by='quinn',
              graded_verdict='pass', merge_owner=$(sqlq "$owner"),
              delivery_ref='https://example.com/pr/1'

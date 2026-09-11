@@ -832,7 +832,7 @@ cmd_task_ls() {
       # detail would get the LESS accurate answer.
       dbfmt -box "SELECT ident,
              CASE WHEN ${_TASKS_TFV_SQL}
-                  THEN 'graded->merge:'||COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''), COALESCE(assignee,'?'))
+                  THEN 'graded->merge:'||$(_tasks_merge_owner_sql)
                   ELSE status END AS status,
              ${_gate_cell} AS gate,
              priority, COALESCE(assignee,'-') AS assignee, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, title FROM tasks WHERE ${where} ${order};"
@@ -843,7 +843,7 @@ cmd_task_ls() {
       # cell rather than a new column so the compact board stays compact.
       dbfmt -box "SELECT ident,
              CASE WHEN ${_TASKS_TFV_SQL}
-                  THEN 'graded->merge:'||COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''), COALESCE(assignee,'?'))
+                  THEN 'graded->merge:'||$(_tasks_merge_owner_sql)
                   ELSE status END AS status,
              ${_gate_cell} AS gate,
              priority, COALESCE(assignee,'-') AS assignee, title FROM tasks WHERE ${where} ${order};"

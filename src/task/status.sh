@@ -666,8 +666,7 @@ _task_status_cmd() {
       # request actually reached main. An unmerged row refuses there, citing the
       # rule that is actually stopping it.
       local _gm_owner=''
-      _gm_owner=$(db "SELECT COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''),
-                                      COALESCE(assignee,'?'))
+      _gm_owner=$(db "SELECT $(_tasks_merge_owner_sql)
                         FROM tasks WHERE id=${id} AND (${_TASKS_TFV_SQL});" 2>/dev/null || true)
       if [[ -n "$_maker" && "$_actor" != "$_vfier" && "$_actor" != "cli" \
             && "$_st" != "done" && "$_st" != "cancelled" \
