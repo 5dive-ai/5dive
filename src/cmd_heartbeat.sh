@@ -672,9 +672,58 @@ cmd_heartbeat_wake_task() {
     fresh="$(_hb_effective_fresh "$name" "$task_id")"
   fi
   _hb_log "[$name] forced wake onto ${task_ident} (fresh=${fresh}${fresh_override:+, caller override})"
+  _hb_wake_task_record_defect "$name" "$task_id" "$task_ident"
   # DIVE-4310: a forced wake fails with the same named cause as a tick wake.
   _hb_wake "$name" "$fresh" "$task_id" "$task_ident" \
     || _hb_log "[$name] forced wake FAILED at ${_HB_WAKE_FAIL_REASON:-<step not recorded — a wake exit is missing its _hb_wake_fail>}"
+}
+
+# DIVE-4327 — EVERY FORCED WAKE IS A LOOP DEFECT, AND IT IS RECORDED AS ONE.
+#
+# `heartbeat wake-task` is a debugging verb. Each use means the tick that should
+# have dispatched this row did not, and on 2026-09-11 that hand-wake was the tool
+# the fleet ran on: main was force-woken onto DIVE-4274/4276, ops declined a forced
+# wake because the board's merge owner read a fallback, and codex was force-woken
+# 5h past its own quota wall. None of those left a record that a HUMAN had to move
+# the loop -- the wake looked like the loop working.
+#
+# So the verb now writes, for every call: the row's stage, the owner that stage
+# names, and WHETHER THE PICKER WOULD HAVE HANDED THE ROW TO THIS SEAT ON ITS OWN.
+# That last field is the whole diagnostic, and it splits the two causes that look
+# identical in a log:
+#   pickable=no  -> the picker and the board disagree about this row (invariant 2)
+#                   -- the defect is in the predicate, and this is DIVE-4276's shape.
+#   pickable=yes -> the row WAS runnable and the tick still did not fire it
+#                   -- the defect is in the wake rail or the seat, not the query.
+# Best-effort by contract: a forced wake must never fail because its own audit
+# line could not be written, so every step here is guarded and the function
+# always returns 0.
+_hb_wake_task_record_defect() {
+  local name="$1" task_id="$2" task_ident="$3"
+  local stage='' owner='' assignee='' status='' pickable='unknown' ids=''
+  status=$(db "SELECT COALESCE(status,'?') FROM tasks WHERE id=${task_id};" 2>/dev/null) || status=''
+  [[ -n "$status" ]] || status='row-not-found'
+  assignee=$(db "SELECT COALESCE(assignee,'?') FROM tasks WHERE id=${task_id};" 2>/dev/null) || assignee='?'
+  if [[ "$(db "SELECT 1 FROM tasks WHERE id=${task_id} AND ${_TASKS_TFV_SQL};" 2>/dev/null)" == "1" ]]; then
+    owner=$(db "SELECT $(_tasks_merge_owner_sql) FROM tasks WHERE id=${task_id};" 2>/dev/null) || owner='?'
+    stage="MERGING"
+  else
+    owner="${assignee}"
+    stage="MAKING/GRADING"
+  fi
+  # The picker's own answer, not a re-derivation of it -- asking any other way is
+  # the copy-of-a-predicate mistake this row exists to end.
+  ids=$(_hb_pick_tasks "$name" 200 2>/dev/null) || ids=''
+  if [[ -n "$ids" ]]; then
+    if grep -qx -- "$task_id" <<<"$ids" 2>/dev/null; then pickable='yes'; else pickable='no'; fi
+  else
+    pickable='no'
+  fi
+  _hb_log "[loop-defect] ${task_ident} forced awake on ${name} by hand: stage=${stage} stage-owner=${owner} assignee=${assignee} status=${status} pickable-by-${name}=${pickable} — a forced wake is a defect in the loop, not a tool of it (DIVE-4327); the tick should have dispatched this row"
+  ledger_emit "loop.defect" ident="$task_ident" task_id="$task_id" \
+    actor="${SUDO_USER:-$(whoami 2>/dev/null || echo root)}" authority="heartbeat wake-task" \
+    detail="forced wake of ${name} onto ${task_ident}: stage=${stage} stage_owner=${owner} assignee=${assignee} status=${status} pickable=${pickable}" 2>/dev/null || true
+  return 0
 }
 
 # Parse a duration into whole minutes. Accepts a bare integer (minutes),
@@ -1909,8 +1958,7 @@ _hb_pick_tasks() {
           -- is only ever read on a graded-and-waiting row.
           AND ( t.assignee=$(sqlq "$name")
                 OR ( (${_TASKS_TFV_SQL})
-                     AND COALESCE(NULLIF(t.merge_owner,''), NULLIF(t.maker_agent,''),
-                                  COALESCE(t.assignee,'?')) = $(sqlq "$name") ) )
+                     AND $(_tasks_merge_owner_sql t.) = $(sqlq "$name") ) )
           AND NOT (t.need_type IS NOT NULL AND t.need_answered_at IS NULL)
           AND NOT EXISTS (
             SELECT 1 FROM task_deps dd JOIN tasks b ON b.id = dd.blocked_by
@@ -1940,8 +1988,7 @@ _hb_pick_tasks() {
           -- agent the merge is its move and waking it is the whole point. The
           -- owner expression is the board's, character for character.
           AND NOT ( (${_TASKS_TFV_SQL})
-                    AND COALESCE(NULLIF(t.merge_owner,''), NULLIF(t.maker_agent,''),
-                                 COALESCE(t.assignee,'?')) <> $(sqlq "$name") )
+                    AND $(_tasks_merge_owner_sql t.) <> $(sqlq "$name") )
         ORDER BY CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1
                                  WHEN 'medium' THEN 2 ELSE 3 END,
                  COALESCE(c.cp,0) DESC, t.id
@@ -3286,8 +3333,7 @@ _hb_reclaim() {
                  -- quotes -- either one silently truncates or executes part of
                  -- this statement.
                  CASE WHEN (${_TASKS_TFV_SQL})
-                           AND COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''),
-                                        COALESCE(assignee,'?')) <> $(sqlq "$name")
+                           AND $(_tasks_merge_owner_sql) <> $(sqlq "$name")
                       THEN 1 ELSE 0 END
                FROM tasks
                WHERE assignee=$(sqlq "$name") AND status='in_progress';" 2>/dev/null || true)
@@ -3441,8 +3487,7 @@ _hb_loop_terminal_clause() {
                WHERE id=${task_id}
                  AND ( assignee=$(sqlq "$name")
                        OR ( (${_TASKS_TFV_SQL})
-                            AND COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''),
-                                         COALESCE(assignee,'?')) = $(sqlq "$name") ) )
+                            AND $(_tasks_merge_owner_sql) = $(sqlq "$name") ) )
                  AND status NOT IN ('done','cancelled');" 2>/dev/null) || return 0
   vfier="${row%%|*}"; rest="${row#*|}"; maker="${rest%%|*}"; creator="${rest#*|}"
   [[ -n "$vfier" ]] || return 0
@@ -3463,7 +3508,7 @@ _hb_loop_terminal_clause() {
   # another pass, so it is deliberately not gated on which one was woken.
   if [[ "$(db "SELECT 1 FROM tasks WHERE id=${task_id} AND ${_TASKS_TFV_SQL};" 2>/dev/null)" == "1" ]]; then
     local _tfv_owner
-    _tfv_owner=$(db "SELECT COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''), COALESCE(assignee,'?')) FROM tasks WHERE id=${task_id};" 2>/dev/null)
+    _tfv_owner=$(db "SELECT $(_tasks_merge_owner_sql) FROM tasks WHERE id=${task_id};" 2>/dev/null)
     # DIVE-4220 — THE OWNER'S OWN ROW IS NOT TERMINAL FOR THE OWNER. The clause
     # below is correct for everyone EXCEPT the seat that owes the merge, and to
     # that seat it says the exact opposite of the truth: stop, someone else acts.
@@ -6231,8 +6276,7 @@ cmd_heartbeat_tick() {
     inprog=$(db "SELECT COUNT(*) FROM tasks
                   WHERE assignee=$(sqlq "$name") AND status='in_progress'
                     AND NOT ( (${_TASKS_TFV_SQL})
-                              AND COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''),
-                                           COALESCE(assignee,'?')) <> $(sqlq "$name") );" 2>/dev/null || echo 0)
+                              AND $(_tasks_merge_owner_sql) <> $(sqlq "$name") );" 2>/dev/null || echo 0)
     if [[ "${inprog:-0}" != "0" ]]; then
       sk_busy=$((sk_busy + 1)); _hb_log "[$name] busy — $inprog in_progress, skip"
       # DIVE-4278: this tick just PROVED the seat is working. Say so on the

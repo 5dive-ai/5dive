@@ -1934,7 +1934,43 @@ _TASKS_TFV_SQL="graded_at IS NOT NULL
        AND (maker_agent IS NULL OR graded_by IS NULL OR graded_by <> maker_agent)
        AND (handoff_rejected_at IS NULL OR handoff_rejected_at < graded_at)
        AND (graded_verdict IS NULL OR graded_verdict = 'pass')
+       -- DIVE-4327 (invariant 3): A GRADE BINDS TO AN ITERATION, NOT JUST TO A ROW.
+       -- NO BACKTICKS AND NO DOUBLE QUOTES IN THIS COMMENT: the whole constant is
+       -- one double-quoted bash string, so a backticked verb name here RUNS AS A
+       -- COMMAND before sqlite ever sees the SQL, and a double quote ends the string.
+       -- The verb 'task deliver' does not clear graded_at, so after a redelivery
+       -- (or any iteration-2 delivery) the iteration-1 PASS was still sitting on the
+       -- row and this predicate read it as graded-and-waiting-on-a-merge. Measured
+       -- 2026-09-11 on DIVE-4276: the board painted graded->merge:main off an
+       -- iteration-1 PASS while iteration 2 sat delivered-and-UNGRADED, the verifier
+       -- was never woken, and the seat that was woken had nothing to do. A delivery
+       -- clock LATER than the grade clock is, by construction, a delivery the grade
+       -- did not grade. Narrowing, and only in that direction: the rows it removes
+       -- are exactly the ones awaiting a first grade of the current iteration.
+       AND (handoff_delivered_at IS NULL OR handoff_delivered_at <= graded_at)
        AND status NOT IN ('done','cancelled')"
+
+# DIVE-4327 — THE MERGE OWNER IS ONE FUNCTION, NOT NINE COPIES.
+#
+# Invariant 1 of the loop state machine (community/wiki/the-loop-end-to-end-one-
+# state-machine-from-filing-to-merge.md): a row's stage owner is a FACT on the row,
+# and the board's label and the picker's runnable predicate must be ONE function.
+# They were the same TEXT -- nine hand-copied COALESCE chains, each carrying a
+# comment promising it matched the board "character for character". A promise in a
+# comment is not a shared function: on 2026-09-11 the board painted
+# graded->merge:main, the picker answered "not runnable for you", and a seat logged
+# "no todo" every minute for 95 minutes while TODO=2. Nothing here can drift now
+# because there is only one copy; tests/loop_state_machine_invariants_unit.sh
+# arm 1 reds if a tenth literal copy is reintroduced anywhere in src/.
+#
+# <prefix> is the SQL table alias the caller's query uses ('t.' or empty). It is
+# the only variation between the nine sites, and it is the one thing a hand copy
+# got right -- the drift risk was never the alias, it was the fallback ORDER.
+_tasks_merge_owner_sql() {
+  local p="${1:-}"
+  printf "COALESCE(NULLIF(%smerge_owner,''), NULLIF(%smaker_agent,''), COALESCE(%sassignee,'?'))" \
+    "$p" "$p" "$p"
+}
 
 _TASKS_DB_GATE_COLUMNS=''
 _TASKS_DB_GATE_EPOCH=''
