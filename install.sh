@@ -1044,7 +1044,7 @@ JOURNALD
   fi
 
   # DIVE-4196 — TEAM TEMPLATES ARE NO LONGER STAGED. They moved to the same
-  # marketplace registry the character packs come from (<org>/character-packs,
+  # marketplace registry the character packs come from (<org>/5dive-marketplace,
   # under teams/) and `5dive team` reads them live.
   #
   # Do not restore a staging loop here. Staging at install time is the defect,

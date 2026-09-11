@@ -180,7 +180,7 @@ slug_case 'a `Repo:` line given as a URL still declares' \
 want_default='5dive-ai/5dive
 lodar/5dive-api
 lodar/5dive-frontend
-5dive-ai/character-packs
+5dive-ai/5dive-marketplace
 5dive-ai/skills
 5dive-ai/5dive-plugins
 5dive-ai/5dive-mcp

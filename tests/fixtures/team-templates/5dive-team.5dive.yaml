@@ -8,7 +8,7 @@
 # out, along with host-specific detail like account profiles and workdirs. Add
 # them when one seat is the bottleneck, not before.
 #
-# Every seat is a curated character pack (5dive-ai/character-packs) referenced by
+# Every seat is a curated character pack (5dive-ai/5dive-marketplace) referenced by
 # `pack:` (DIVE-536): the pack supplies the persona, art, skills, and
 # model/effort, so the spec only declares the org structure. Two seats run under
 # a different name on our own box — our verifier is the `vesper` pack and our
