@@ -672,7 +672,9 @@ cmd_heartbeat_wake_task() {
     fresh="$(_hb_effective_fresh "$name" "$task_id")"
   fi
   _hb_log "[$name] forced wake onto ${task_ident} (fresh=${fresh}${fresh_override:+, caller override})"
-  _hb_wake "$name" "$fresh" "$task_id" "$task_ident" || true
+  # DIVE-4310: a forced wake fails with the same named cause as a tick wake.
+  _hb_wake "$name" "$fresh" "$task_id" "$task_ident" \
+    || _hb_log "[$name] forced wake FAILED at ${_HB_WAKE_FAIL_REASON:-<step not recorded — a wake exit is missing its _hb_wake_fail>}"
 }
 
 # Parse a duration into whole minutes. Accepts a bare integer (minutes),
@@ -1901,6 +1903,11 @@ _hb_tier_rank() {
 # (or the supervisor) reads a cause instead of guessing.
 # `2>&1 >/dev/null` (that order) keeps stderr and drops stdout.
 _HB_SENDKEYS_ERR=""
+# DIVE-4310: the reason THIS send attempt failed, in the injector's own words —
+# which step (dispatcher inbox / pane-safe guard / send-keys / submit verify),
+# its rc, and the first line of whatever the underlying tool said. Set by every
+# failing exit of `_hb_send_line`; cleared at its entry so it is never stale.
+_HB_SEND_FAIL_REASON=""
 _hb_send_keys_step() {
   local name="$1" step="$2"; shift 2
   local err rc=0
@@ -1908,6 +1915,10 @@ _hb_send_keys_step() {
   if (( rc == 0 )); then _HB_SENDKEYS_ERR=""; return 0; fi
   err="${err//$'\n'/ }"
   _HB_SENDKEYS_ERR="$err"
+  # DIVE-4310: publish the SAME reason to the send-line/wake seam. The log line
+  # below is read by an operator; this variable is what lets `_hb_wake` (and the
+  # tick's one-line verdict) name the step instead of saying "wake failed".
+  _HB_SEND_FAIL_REASON="send-keys/${step} (tmux rc ${rc}): ${err:-<tmux wrote nothing to stderr>}"
   _hb_log "[$name] ${step} failed (tmux rc ${rc}): ${err:-<tmux wrote nothing to stderr>}" 2>/dev/null || true
   return 1
 }
@@ -2025,6 +2036,7 @@ _hb_landed_check() {
 # (never exits) so a single dead pane can't abort the whole tick.
 _hb_send_line() {
   local name="$1" text="$2" tries=0
+  _HB_SEND_FAIL_REASON=""   # DIVE-4310: never report a previous attempt's cause
   # DIVE-2137: the heartbeat is the FOURTH typed-send site (send / ask / _deliver
   # are the three in cmd_agent_runtime.sh) and had the same blind spot — it types
   # a nudge into whatever the pane happens to be showing. An agent that booted
@@ -2053,13 +2065,17 @@ _hb_send_line() {
     local _hb_drc=0
     _agent_dispatch_inbox_send "$name" "$text" "$_hb_inbox" || _hb_drc=$?
     (( _hb_drc == 0 )) && return 0
-    _hb_log "send to ${name} FAILED: $(_agent_submit_unconfirmed_reason "$name" "$_hb_drc")" 2>/dev/null || true
+    local _hb_drsn; _hb_drsn="$(_agent_submit_unconfirmed_reason "$name" "$_hb_drc" 2>/dev/null)"
+    _HB_SEND_FAIL_REASON="dispatcher inbox (rc ${_hb_drc}): ${_hb_drsn:-<no reason reported>}"   # DIVE-4310
+    _hb_log "send to ${name} FAILED: ${_hb_drsn:-<no reason reported>}" 2>/dev/null || true
     return 1
   fi
   _agent_pane_safe_to_type "$name" || {
     if [[ "${_AGENT_PANE_REFUSAL_REASON:-}" == "unreadable" ]]; then
+      _HB_SEND_FAIL_REASON="pane-safe guard (rc 1): could not read the pane (tmux capture-pane failed after retries) — fail-closed, nothing typed (DIVE-2159)"
       _hb_log "skip send to ${name}: could not read the pane (tmux capture-pane failed after retries) — fail-closed, nothing typed (DIVE-2159)" 2>/dev/null || true
     else
+      _HB_SEND_FAIL_REASON="pane-safe guard (rc 1): pane is a credential/login prompt, not a chat input (DIVE-2137)"
       _hb_log "skip send to ${name}: pane is a credential/login prompt, not a chat input (DIVE-2137)" 2>/dev/null || true
     fi
     return 1
@@ -2103,6 +2119,7 @@ _hb_send_line() {
     sleep "${_HB_SUBMIT_RETRY_SEC:-0.5}"
     _hb_send_keys_step "$name" "submit retry (Enter)" Enter || { _hb_landed_check "$name" "$text" && return 0; return 1; }
     _hb_verify_submit "$name" && return 0
+    _HB_SEND_FAIL_REASON="submit unverified (rc 1): the composer still holds ${#_HB_COMPOSER_UNSENT} chars of non-ghost text after 2 Enters ('${_HB_COMPOSER_UNSENT:0:60}') (DIVE-4242)"
     _hb_log "[$name] submit UNVERIFIED — the composer still holds ${#_HB_COMPOSER_UNSENT} chars of non-ghost text after 2 Enters ('${_HB_COMPOSER_UNSENT:0:60}'); returning failure so nothing is claimed on it (DIVE-4242)" 2>/dev/null || true
     return 1
   fi
@@ -2115,6 +2132,10 @@ _hb_send_line() {
     _hb_agent_idle "$name" 0.4 || return 0
     tries=$((tries+1))
   done
+  # DIVE-4310: this exit was the silent one — five Enters, the seat never left
+  # idle, and the function returned 1 with nothing written anywhere.
+  _HB_SEND_FAIL_REASON="submit not accepted (rc 1): the seat was still idle after ${tries} Enter attempts — the paste never committed (DIVE-1217 path)"
+  _hb_log "[$name] ${_HB_SEND_FAIL_REASON}" 2>/dev/null || true
   return 1
 }
 
@@ -3500,8 +3521,33 @@ _hb_carryover_clause() { # <agent> <task_id> <ident>
   printf '%s' "$c"
 }
 
+# DIVE-4310 — EVERY wake-failure exit names ITSELF. DIVE-4279 (#874) gave the
+# tmux send-keys step a reason (which step, its rc, what it wrote to stderr); the
+# exits AROUND it still returned a bare 1, and the tick's own verdict was the
+# bare "[name] wake failed — will retry next tick". Re-measured on lodar's box
+# (5dive-exact-swallow, 0.32.0) as still-not-fixed: a seat that fails to wake and
+# logs no reason is the one class of stall nobody can diagnose from the log, and
+# it is the shape behind every "HB is buggy, X is not taking his task" report.
+#
+# The reason is written HERE (so the heartbeat log carries it at the point of
+# failure) and published in _HB_WAKE_FAIL_REASON so the caller's one-line verdict
+# carries it too — an operator reads one line, not two, and `wake-task` gets the
+# same treatment as the tick. Returns 1 so it can stand in for the bare `return 1`.
+_HB_WAKE_FAIL_STEP=""
+_HB_WAKE_FAIL_REASON=""
+_hb_wake_fail() {
+  local name="$1" step="$2" rc="${3:-?}" detail="${4:-}"
+  detail="${detail%%$'\n'*}"                              # FIRST line of stderr only
+  detail="${detail#"${detail%%[![:space:]]*}"}"            # ...trimmed
+  _HB_WAKE_FAIL_STEP="$step"
+  _HB_WAKE_FAIL_REASON="${step} (rc ${rc}): ${detail:-<no stderr>}"
+  _hb_log "[$name] wake FAILED at ${_HB_WAKE_FAIL_REASON} (DIVE-4310)" 2>/dev/null || true
+  return 1
+}
+
 _hb_wake() {
   local name="$1" fresh="$2" task_id="$3" task_ident="${4:-DIVE-$3}"
+  _HB_WAKE_FAIL_STEP=""; _HB_WAKE_FAIL_REASON=""   # DIVE-4310: never stale
   # DIVE-1475 status guard: never inject a /goal for a task that isn't actionable.
   # The tick's picker (_hb_pick_task) only ever hands us a live todo, but the direct
   # `heartbeat wake-task` verb — and any buggy or looping caller (e.g. a test harness
@@ -3523,19 +3569,24 @@ _hb_wake() {
     return 0
   fi
   if ! systemctl is-active --quiet "5dive-agent@${name}.service"; then
-    systemctl start "5dive-agent@${name}.service" 2>/dev/null \
-      || { _hb_log "[$name] systemctl start failed"; return 1; }
+    # DIVE-4310: keep systemd's stderr. `2>/dev/null` here discarded the one
+    # string that distinguishes "unit not found" from "job failed" from a
+    # masked unit — and then the caller printed neither.
+    local _sc_err _sc_rc=0
+    _sc_err=$(systemctl start "5dive-agent@${name}.service" 2>&1 >/dev/null) || _sc_rc=$?
+    (( _sc_rc == 0 )) || { _hb_wake_fail "$name" "systemctl start (5dive-agent@${name}.service)" "$_sc_rc" "$_sc_err"; return 1; }
     local i
     for ((i = 0; i < 30; i++)); do
       sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null && break
       sleep 2
     done
   fi
-  sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null \
-    || { _hb_log "[$name] no tmux session after start"; return 1; }
+  local _ts_err _ts_rc=0
+  _ts_err=$(sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>&1 >/dev/null) || _ts_rc=$?
+  (( _ts_rc == 0 )) || { _hb_wake_fail "$name" "tmux session probe (agent-${name} has no session after start)" "$_ts_rc" "$_ts_err"; return 1; }
 
   if [[ "$fresh" == "true" ]]; then
-    _hb_send_line "$name" "/clear" || { _hb_log "[$name] /clear failed"; return 1; }
+    _hb_send_line "$name" "/clear" || { _hb_wake_fail "$name" "/clear injection" 1 "${_HB_SEND_FAIL_REASON:-<injector reported no reason>}"; return 1; }
     sleep 4
   fi
 
@@ -3616,7 +3667,7 @@ _hb_wake() {
     nudge="${nudge} Separately: ${_gq} gate(s) are ROUTED TO YOU and waiting — they were filed WITHOUT interrupting you (DIVE-3474). Read them with '5dive task queue' and answer each with '5dive task answer <ident> --value=\"<choice>\"' before you finish this turn; the filer's recommendation is shown but is NOT the answer (measured: 54 of 121 answered gates returned it, so the majority did not)."
   fi
 
-  _hb_send_line "$name" "$nudge" || { _hb_log "[$name] nudge send failed"; return 1; }
+  _hb_send_line "$name" "$nudge" || { _hb_wake_fail "$name" "nudge injection (/goal ${task_ident})" 1 "${_HB_SEND_FAIL_REASON:-<injector reported no reason>}"; return 1; }
   return 0
 }
 
@@ -6514,7 +6565,10 @@ cmd_heartbeat_tick() {
       # is the lever. Separate threshold, separate ladder — see _hb_nudge_enforce.
       _hb_nudge_enforce "$name" "$task_id" "$task_ident" "${nudge_n:-0}" || true
     else
-      sk_fail=$((sk_fail + 1)); _hb_log "[$name] wake failed — will retry next tick"
+      # DIVE-4310: the verdict carries the CAUSE. Every failing exit of _hb_wake
+      # sets _HB_WAKE_FAIL_REASON; the fallback fires only if some future exit
+      # forgets to, and says so rather than printing the old bare line.
+      sk_fail=$((sk_fail + 1)); _hb_log "[$name] wake failed at ${_HB_WAKE_FAIL_REASON:-<step not recorded — a wake exit is missing its _hb_wake_fail>} — will retry next tick"
     fi
   done < <(jq -r '.agents | to_entries
                   | map(select(.value.heartbeat.enabled == true))

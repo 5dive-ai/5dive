@@ -120,6 +120,7 @@ _task_usage() {
   queue [--for=<agent>] [--json]                gates ROUTED TO YOU, filed without waking you
   inbox [--send [--channel-proof=<chat>]]       every unanswered human gate IN THE FLEET (already
                                                 fleet-wide; --fleet accepted as a no-op); --send DMs the owner
+  gates                                         alias of \`inbox\` (DIVE-4310)
   coordinator [--json]                          the agent fronting the needs-you banner
 
   loops [--stuck] [--escalate-stuck] [--all] [--runs] [--watch[=secs]] [--kill <loopId>]
@@ -292,7 +293,11 @@ cmd_task() {
     need)            cmd_task_need "$@" ;;
     gate-escalate)   cmd_task_gate_escalate "$@" ;;   # DIVE-1927 internal, root-only
     queue)           cmd_task_queue "$@" ;;         # DIVE-3474 gates routed TO ME
-    inbox)           cmd_task_inbox "$@" ;;
+    # DIVE-4310: `gates` is the name a human reaches for — measured on lodar's
+    # box, where `5dive task gates` returned "unknown task command" and the verb
+    # that answers it is spelled `inbox`. Pure alias, same function, so the two
+    # spellings can never diverge.
+    inbox|gates)     cmd_task_inbox "$@" ;;
     coordinator)     cmd_task_coordinator "$@" ;;
     answer)          cmd_task_answer "$@" ;;
     clear-recs)      cmd_task_clear_recs "$@" ;;
