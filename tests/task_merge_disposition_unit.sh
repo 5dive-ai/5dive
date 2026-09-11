@@ -593,7 +593,7 @@ eq "F9b ...and the reason survives intact" \
 #   M12  `_gate_mq_note` UNKNOWN arm -> the NEVER wording   killed 1 arm  (G16)
 #   M13  the whole reason `case` reverted to the order-only removal arm this
 #        iteration replaced (any trailing removal reads EJECTED)
-#                             killed 6 arms (G4, G21, G22, G25, G26, G27)
+#                        killed 7 arms (G4, G21, G22, G24, G25, G26, G27)
 #   M14  the unrecognised-reason case -> EJECTED   killed 3 arms (G4, G25, G26)
 #   M15  `_gate_mq_note`'s MERGED arm reworded with the EJECTED sentence
 #                                                          killed 1 arm  (G22)
@@ -702,13 +702,19 @@ fi
 #     removal of EACH kind, so the ejection arm and its inverse sit on the same
 #     pull request.
 #
-#     Mutants driven by hand against the shipped classifier:
-#       M13  the `merged)` case deleted (falls to the failed_checks arm)
-#                                                       killed 2 arms (G21, G22)
-#       M14  the `*)` unrecognised case -> EJECTED       killed 2 arms (G24, G25)
+#     LIVE CONTROL, run from this seat through the machine-account rail against
+#     5dive-ai/5dive on 2026-09-11, so the payloads below are TRANSCRIBED and
+#     not invented: #897 -> `0|||19:01:41Z|19:42:26Z|merged` and #894 — evicted
+#     on a ONE-SECOND overage, re-enqueued, then landed ->
+#     `0|||18:29:56Z|19:21:54Z|merged`. BOTH read EJECTED before this iteration.
+#     #894's 19:00:56Z eviction has dropped off its own timeline, so the live
+#     failed_checks fixture that survives is #897's earlier removal (G23).
+#
+#     Mutants for this arm are listed with the rest at the head of section G
+#     (M13, M14, M15).
 P897_MERGED="$(mq 0 '' '' 2026-09-11T19:01:41Z 2026-09-11T19:42:26Z merged)"
 P897_EJECT="$(mq 0 '' '' 2026-09-11T18:15:27Z 2026-09-11T19:00:30Z failed_checks)"
-P894_EJECT="$(mq 0 '' '' 2026-09-11T18:21:00Z 2026-09-11T19:00:56Z failed_checks)"
+P894_MERGED="$(mq 0 '' '' 2026-09-11T18:29:56Z 2026-09-11T19:21:54Z merged)"
 
 GH_RAW="$P897_MERGED"; GH_RC=0
 eq "G21 #897's real removal reason=merged -> MERGED, NOT ejected (through the leaf)" \
@@ -725,9 +731,9 @@ GH_RAW="$P897_EJECT"; GH_RC=0
 eq "G23 the SAME pull request's earlier removal, reason=failed_checks -> EJECTED" \
    "EJECTED|2026-09-11T19:00:30Z|failed_checks" \
    "$(_gate_pr_queue_state "https://github.com/5dive-ai/5dive/pull/897" tok "5dive-ai/5dive")"
-GH_RAW="$P894_EJECT"; GH_RC=0
-eq "G24 #894, the budget eviction this row was filed on -> EJECTED" \
-   "EJECTED|2026-09-11T19:00:56Z|failed_checks" \
+GH_RAW="$P894_MERGED"; GH_RC=0
+eq "G24 #894 — ejected on a 1s overage, re-enqueued, LANDED: its last removal is the merge" \
+   "MERGED|2026-09-11T19:21:54Z" \
    "$(_gate_pr_queue_state "https://github.com/5dive-ai/5dive/pull/894" tok "5dive-ai/5dive")"
 eq "G25 a reason outside the observed enum -> UNKNOWN, never an ejection" \
    "UNKNOWN|removal-reason-unrecognised" \
