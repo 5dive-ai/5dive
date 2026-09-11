@@ -22,6 +22,13 @@
 #                                  extra steps.
 #   both callers use one selector  A9/A10: the CI job calls the script and carries
 #                                  no second pathspec; the hook calls the rail.
+#   the fragment rule is RUN,       A18-A24 (DIVE-4336). The fragment lint is the
+#   not restated                   second step of the required `title` context and
+#                                  had no local arm: six PRs red on it in one day,
+#                                  each costing a verifier grade round. A22/A23 are
+#                                  its anti-drift pair — the heading string lives in
+#                                  the lint script and nowhere in the rail, and
+#                                  mutating that script moves the rail's verdict.
 #
 # NO NETWORK, NO ROOT: every arm runs against throwaway git repos under a temp
 # dir. Nothing here runs the real corpus.
@@ -53,6 +60,7 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_COMMON_DIR \
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 RAIL="$ROOT/scripts/pre-push-rail.sh"
 SEL="$ROOT/scripts/changed-harnesses.sh"
+FRAGLINT="$ROOT/scripts/lint-changelog-fragments.sh"
 PASS=0; FAIL=0; SKIP=0
 ok()   { PASS=$((PASS+1)); printf 'ok   %s\n' "$1"; }
 no()   { FAIL=$((FAIL+1)); printf 'FAIL %s\n' "$1"; }
@@ -69,6 +77,9 @@ mk_sandbox() { # <dir>
   mkdir -p "$d/scripts" "$d/.github/workflows" "$d/tests"
   cp "$RAIL" "$d/scripts/pre-push-rail.sh"
   cp "$SEL"  "$d/scripts/changed-harnesses.sh"
+  # DIVE-4336: the fragment stage runs THIS script, so the sandbox needs its own
+  # copy — that is what lets A23 mutate the rule and watch the verdict move.
+  cp "$FRAGLINT" "$d/scripts/lint-changelog-fragments.sh"
   cp "$ROOT/.github/workflows/pr-title-lint.yml" "$d/.github/workflows/"
   git -C "$d" init -q
   git -C "$d" config user.email t@example.com
@@ -235,9 +246,20 @@ out="$(FIVE_PUSH_OVERRIDE="$five" rail "$BASE" HEAD)"; rc=$?
 { (( rc == 0 )) && grep -q 'OVERRIDDEN' <<<"$out" && ! grep -q 'FAILED: tests/red_unit.sh' <<<"$out"; } \
   && ok "A8b a five-clause reason is accepted, printed, and skips the rail (the red harness above did not run)" \
   || no "A8b the five-clause override did not take (rc=$rc): $out"
-[[ -s "$SB/.git/5dive-push-override.log" ]] \
-  && ok "A8c the accepted reason is written to .git/5dive-push-override.log, so it is findable from the branch" \
-  || no "A8c no override log was written"
+# A8c: THE RECEIPT IS FINDABLE AT THE PATH THE RAIL PRINTED — which is not one
+# fixed path. Since DIVE-4288 the rail writes to .git/5dive-push-override.log
+# when you run the push yourself and to the root-owned
+# /var/log/5dive/push-override.log when root runs it (EUID 0, i.e. every
+# delegated `5dive push`). Hard-coding the .git path made this arm red on any
+# ROOT-side run of this harness — exactly the run that gates a delegated push —
+# while the rail was behaving correctly. Grade the property instead: the rail
+# names a path, and that path holds the reason.
+logpath="$(sed -n 's/^ *logged to: //p' <<<"$out" | tail -1)"
+# the rail printed it from inside $SB, so a relative path resolves there.
+[[ -n "$logpath" && "$logpath" != /* ]] && logpath="$SB/$logpath"
+{ [[ -n "$logpath" ]] && [[ -s "$logpath" ]] && grep -q 'the harness box is offline' "$logpath"; } \
+  && ok "A8c the accepted reason is written to the log the rail names ($logpath), so it is findable from the branch" \
+  || no "A8c no override log was written at the printed path (printed: ${logpath:-<none>})"
 
 # A13: THE CAP MUST BOUND ONE HARNESS. A between-harnesses check lets a single
 # long file run arbitrarily past the cap — measured at >10 min against a 360s cap
@@ -325,6 +347,107 @@ out="$( cd "$SB4" && bash scripts/pre-push-rail.sh "$push_base" HEAD --only=harn
 { grep -q 'widening base' <<<"$out" && grep -q 'a_corpus_contract_unit.sh' <<<"$out"; } \
   && ok "A17 the rail widens the push range to the PR range, so a follow-up commit is graded against the base CI grades" \
   || no "A17 the rail graded the narrow push range (rc=$rc): $out"
+
+# ── the changelog fragment (DIVE-4336) ────────────────────────────────────────
+#
+# THE DEFECT THESE CLOSE. `title` is one required context with TWO steps, and only
+# the first had a local arm. Measured 2026-09-11: six PRs (#882 #894 #895 #897
+# #898 #899) red on that context, every one of them on the fragment step, none on
+# the type arm — so the rail greened and CI red, which is the shape of hole the
+# rail exists to close, reached through the one check it did not run.
+SB5="$TMP/frag"; mk_sandbox "$SB5"
+frag_base="$(git -C "$SB5" rev-parse HEAD)"
+frail() { ( cd "$SB5" && bash scripts/pre-push-rail.sh "$@" ) 2>&1; }
+
+echo 'a change' >"$SB5/src_thing.sh"
+git -C "$SB5" add -A >/dev/null; git -C "$SB5" commit -qm 'feat(x): a thing' >/dev/null
+
+out="$(PR_TITLE='feat(x): a thing (DIVE-1)' frail "$frag_base" HEAD --only=fragment)"; rc=$?
+{ (( rc == 1 )) && grep -q 'must add a changelog.d/ fragment' <<<"$out" \
+  && grep -q 'whose first line is' <<<"$out" && grep -q '## Unreleased' <<<"$out"; } \
+  && ok "A18 a feat PR with no changelog.d/ fragment refuses the push AND prints the exact first line the fragment must carry" \
+  || no "A18 the missing fragment did not refuse, or did not print the required first line (rc=$rc): $out"
+
+# A24: TWO FACTS, ONE ROUND. Both door checks are ~0s and both report on the same
+# required context, so the rail must not hand back the title red, take a re-push,
+# and only then mention the fragment — that is the two-round cost this row exists
+# to remove, reproduced locally.
+out="$(PR_TITLE='just some words' frail "$frag_base" HEAD)"; rc=$?
+{ (( rc == 1 )) && grep -q 'not a conventional-commit subject' <<<"$out" \
+  && grep -q 'pre-push-rail: fragment' <<<"$out"; } \
+  && ok "A24 a red title does not suppress the fragment stage — both door checks report in one push" \
+  || no "A24 the fragment stage did not run alongside a red title (rc=$rc): $out"
+
+# A20 first, because it runs on the SAME fragment-less range: a docs PR is a
+# WARNING, not a refusal. The rail must not be stricter than the gate it stands
+# in for — a local check that reds what CI passes gets overridden, then ignored.
+out="$(PR_TITLE='docs(readme): a note' frail "$frag_base" HEAD --only=fragment)"; rc=$?
+{ (( rc == 0 )) && grep -q '::warning' <<<"$out"; } \
+  && ok "A20 a docs PR with no fragment passes and prints the lint's warning — the rail is not stricter than the gate" \
+  || no "A20 a fragment-less docs PR was mis-graded (rc=$rc): $out"
+
+out="$(PR_TITLE='not a conventional subject at all' frail "$frag_base" HEAD --only=fragment)"; rc=$?
+(( rc == 0 )) \
+  && ok "A20b a non-conventional title has no type, so the fragment stage says nothing — pr-title-lint owns that error, and reporting it twice teaches nobody" \
+  || no "A20b the fragment stage reported on a title with no type (rc=$rc): $out"
+
+# A21: PRESENT IS NOT ENOUGH. #882 carried a fragment and was red anyway — it
+# opened `### Fixed`, which the release fold SKIPS onto a log nobody reads.
+mkdir -p "$SB5/changelog.d"
+printf '### Fixed\n\n- a thing\n' >"$SB5/changelog.d/DIVE-1.md"
+git -C "$SB5" add -A >/dev/null; git -C "$SB5" commit -qm 'chore: bad fragment' >/dev/null
+out="$(PR_TITLE='feat(x): a thing (DIVE-1)' frail "$frag_base" HEAD --only=fragment)"; rc=$?
+{ (( rc == 1 )) && grep -q 'would be SKIPPED by the release fold' <<<"$out"; } \
+  && ok "A21 a fragment whose first line is not the fold's heading refuses the push — present is not foldable (#882's own red)" \
+  || no "A21 a malformed fragment was accepted (rc=$rc): $out"
+
+# A19: and the same branch with the fragment fixed is GREEN. Without this arm the
+# stage could refuse unconditionally and A18/A21 would both still pass.
+printf '## Unreleased — feat(x): a thing (DIVE-1)\n\n- a thing\n' >"$SB5/changelog.d/DIVE-1.md"
+git -C "$SB5" add -A >/dev/null; git -C "$SB5" commit -qm 'chore: fix fragment' >/dev/null
+out="$(PR_TITLE='feat(x): a thing (DIVE-1)' frail "$frag_base" HEAD --only=fragment)"; rc=$?
+{ (( rc == 0 )) && grep -q '1 changelog.d fragment(s) graded' <<<"$out"; } \
+  && ok "A19 the same branch with a well-formed fragment passes, and the stage says how many it graded" \
+  || no "A19 a well-formed fragment did not pass (rc=$rc): $out"
+
+# A22/A23 ARE THE ANTI-DRIFT PAIR, and they are the reason this row says "that
+# same script" rather than "the same rule". The heading is an EXACT STRING; a
+# second copy of it in the rail would let the rail green what the merge gate reds
+# (or the reverse) and nothing would ever say so.
+#
+# A22 is the static half: one script, called by both readers, restated by neither.
+{ grep -q 'bash scripts/lint-changelog-fragments.sh' "$ROOT/.github/workflows/pr-title-lint.yml" \
+  && grep -q 'scripts/lint-changelog-fragments.sh' "$RAIL" \
+  && grep -q 'Unreleased' "$FRAGLINT" \
+  && ! grep -q 'Unreleased' "$RAIL"; } \
+  && ok "A22 the CI step and the rail both CALL lint-changelog-fragments.sh, and the accepted heading is written in that script and nowhere in the rail" \
+  || no "A22 the fragment rule is stated in more than one place, or a caller stopped calling the script — the rail and the merge gate can now drift"
+
+# A23 is the live half, the fragment-stage analogue of A3: mutate the rule inside
+# the sandbox's own copy of the lint and require the rail's verdict to MOVE. A
+# rail carrying a forked copy passes A18-A21 and fails this one.
+sed -i 's/Unreleased/Zzzreleased/' "$SB5/scripts/lint-changelog-fragments.sh"
+if grep -q 'Zzzreleased' "$SB5/scripts/lint-changelog-fragments.sh"; then
+  out_a="$(PR_TITLE='feat(x): a thing (DIVE-1)' frail "$frag_base" HEAD --only=fragment)"; rc_a=$?
+  printf '## Zzzreleased — feat(x): a thing (DIVE-1)\n\n- a thing\n' >"$SB5/changelog.d/DIVE-1.md"
+  git -C "$SB5" add -A >/dev/null; git -C "$SB5" commit -qm 'chore: mutated heading' >/dev/null
+  out_b="$(PR_TITLE='feat(x): a thing (DIVE-1)' frail "$frag_base" HEAD --only=fragment)"; rc_b=$?
+  { (( rc_a == 1 )) && (( rc_b == 0 )); } \
+    && ok "A23 the fragment rule is RUN from lint-changelog-fragments.sh, not forked — mutating that script moves the rail's verdict in both directions" \
+    || no "A23 the rail did not follow the mutated lint (old-heading rc=$rc_a, new-heading rc=$rc_b) — it is grading a copy: $out_a | $out_b"
+else
+  skip "A23 could not mutate the lint rule in the sandbox"
+fi
+
+# A25: THE INSTRUMENT MISSING IS NOT A PASS THAT LOOKS LIKE A PASS. Every stage of
+# this rail fails open on a missing tool and says so out loud; a fragment stage
+# that printed plain `ok` with no script present would be the quietest possible
+# version of the hole this row closes.
+rm -f "$SB5/scripts/lint-changelog-fragments.sh"
+out="$(PR_TITLE='feat(x): a thing (DIVE-1)' frail "$frag_base" HEAD --only=fragment)"; rc=$?
+{ (( rc == 0 )) && grep -q 'SKIPPED' <<<"$out" && grep -q "CI's fragment step is the net" <<<"$out"; } \
+  && ok "A25 with the lint script absent the stage fails OPEN and says SKIPPED — 'I could not run it' and 'it passed' print differently" \
+  || no "A25 a missing lint script did not fail open loudly (rc=$rc): $out"
 
 # ── both callers use the one selector ─────────────────────────────────────────
 wf="$ROOT/.github/workflows/unit-tests.yml"
