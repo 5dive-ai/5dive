@@ -1090,6 +1090,30 @@ cmd_task_show() {
       *)                    printf 'created_by_tier = %s
 ' "$_ctier" ;;
     esac
+    # DIVE-4337: THE BOARD'S THIRD STATE, WHICH THE BOARD CANNOT SEE.
+    #
+    # `merge_owner` above renders `graded->merge:<seat>` for a row whose PR is
+    # QUEUED, for one the merge queue EJECTED unmerged, and for one nobody has
+    # pressed — three world states, one label, and the pull request's own fields
+    # are byte-identical across all three after an eviction (see _gate_mq_classify).
+    # The stored columns cannot tell them apart because the transition happens at
+    # GitHub and writes nothing back, so this is a LIVE read and has to be.
+    #
+    # FENCED, because `task show` is the most-called verb on the board and a
+    # network read per call is not free: only a row that is actually painting
+    # `graded->merge` (merge_owner set), still open, and carrying a delivery_ref.
+    # `FIVE_TASK_SHOW_QUEUE=0` turns it off entirely. It prints in every state
+    # including NOT MEASURED — an omitted line is how "we did not look" becomes
+    # indistinguishable from "there is nothing there", which is the defect this
+    # whole row is against.
+    if [[ "${FIVE_TASK_SHOW_QUEUE:-1}" != "0" ]] && declare -F _gate_pr_queue_state >/dev/null 2>&1; then
+      local _mq_dref _mq_own _mq_st
+      _mq_dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id} AND COALESCE(merge_owner,'')<>'' AND status NOT IN ('done','cancelled');" 2>/dev/null || printf '')
+      if [[ "$_mq_dref" == http*/pull/* ]]; then
+        _mq_st=$(_gate_pr_queue_state "$_mq_dref" "$(_gate_gh_token 2>/dev/null || printf '')" "$(_gate_slug_from_url "$_mq_dref")")
+        printf 'merge_queue = %s\n' "$(_gate_mq_note "$_mq_st")"
+      fi
+    fi
     _gate_history_show_summary "$id"
     # Human gate (only when set) — mirrors the conditional subtasks/blockers
     # blocks below so an ordinary task's `show` stays clean.
