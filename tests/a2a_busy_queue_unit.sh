@@ -216,8 +216,8 @@ is "T10: off spools nothing"            "0" "$(spool_count ops)"
 # presence alone stays green on a build where the sweep never runs, or runs after
 # a seat with mail waiting has already been stopped.
 HB=src/cmd_heartbeat.sh
-_flush_line=$(grep -n '^  _hb_a2a_queue_sweep || _hb_log' "$HB" | head -1 | cut -d: -f1)
-_sleep_line=$(grep -n '^  _hb_autosleep_sweep "\$now" || _hb_log' "$HB" | head -1 | cut -d: -f1)
+_flush_line=$(grep -n '^  _hb_a2a_queue_sweep || _hb_log' "$HB" | head -1 | cut -d: -f1) || _flush_line=""
+_sleep_line=$(grep -n '^  _hb_autosleep_sweep "\$now" || _hb_log' "$HB" | head -1 | cut -d: -f1) || _sleep_line=""
 if [[ -n "$_flush_line" && -n "$_sleep_line" ]] && (( _flush_line < _sleep_line )); then
   ok_t "T11: the a2a flush runs in the tick, before the autosleep pass"
 else
