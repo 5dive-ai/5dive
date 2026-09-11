@@ -563,6 +563,190 @@ eq "F9  a bare \`merger\` role is resolved to a seat before it is recorded" \
 eq "F9b ...and the reason survives intact" \
    "disposition-probe-failed" "$(col "$f2" merge_hold_reason)"
 
+
+# ===================================================================
+# G. DIVE-4337 — THE MERGE QUEUE, WHICH IS THE ONE DISPOSITION INPUT THE
+#    PULL REQUEST DOES NOT REPORT.
+#
+# Folded into THIS file rather than given its own (CLAUDE.md's first way out of
+# the core budget: merge by subject). The subject is the same one — what the
+# board should tell a merge owner about a graded pull request — and the setup
+# above is already paid for. The core tier was 310s against a 300s cap in the
+# 18:40-19:01Z cycle of 2026-09-11, so a new file here would have been a new
+# harness added to a tier that was at that moment ejecting graded passes.
+#
+# THE DEFECT: after the queue evicts a PR, `state`, `merged`, `mergeable` and
+# `mergeStateStatus` all read exactly as they do for a PR nobody ever pressed.
+# `_gate_mq_classify` is PURE over the six-field projection, so every one of the
+# three states — and the NOT-MEASURED non-state — is gradable here with no
+# network at all, which is the only way the ejected arm is ever gradable: it is
+# the branch that does not fire when things are healthy.
+#
+# Mutants driven by hand against the shipped functions (5dive rule: evidence is
+# killed mutants, not arm counts):
+#   M9   `printf UNKNOWN|queue-state-unreadable` -> `printf NEVER` on the
+#        field-count guard                                 killed 3 arms (G8, G9, G12)
+#   M10  membership test `[[ $inq == 1 || -n $pos ]]` -> `[[ -n $pos ]]`
+#                                                          killed 1 arm  (G2)
+#   M11  the add-vs-removal comparison deleted (any removal reads EJECTED)
+#                                                          killed 1 arm  (G5)
+#   M12  `_gate_mq_note` UNKNOWN arm -> the NEVER wording   killed 1 arm  (G16)
+#   M13  the whole reason `case` reverted to the order-only removal arm this
+#        iteration replaced (any trailing removal reads EJECTED)
+#                        killed 7 arms (G4, G21, G22, G24, G25, G26, G27)
+#   M14  the unrecognised-reason case -> EJECTED   killed 3 arms (G4, G25, G26)
+#   M15  `_gate_mq_note`'s MERGED arm reworded with the EJECTED sentence
+#                                                          killed 1 arm  (G22)
+# M9 and M12 are the polarity this section exists to protect, in the two places
+# it can be lost: an unreadable read must never classify as, or READ as, "nobody
+# pressed merge" (DIVE-2318 — an unreached question printed as a measured no).
+# ===================================================================
+US=$'\x1f'
+mq() { # mq <inQueue> <position> <entryState> <addedAt> <removedAt> <reason>
+  printf '%s%s%s%s%s%s%s%s%s%s%s' "$1" "$US" "$2" "$US" "$3" "$US" "$4" "$US" "$5" "$US" "$6"
+}
+T1=2026-09-11T18:15:27Z
+T2=2026-09-11T19:00:56Z
+
+# --- the three world states, which is the whole ticket ---
+eq "G1  a live entry                     -> QUEUED at its position" \
+   "QUEUED|1|AWAITING_CHECKS" "$(_gate_mq_classify "$(mq 1 1 AWAITING_CHECKS "$T1" '' '')")"
+eq "G2  isInMergeQueue true, entry unreadable under this scope -> still QUEUED" \
+   "QUEUED|?|state-unread" "$(_gate_mq_classify "$(mq 1 '' '' "$T1" '' '')")"
+eq "G3  added, then REMOVED for failed_checks, no entry -> EJECTED, time and reason" \
+   "EJECTED|$T2|failed_checks" \
+   "$(_gate_mq_classify "$(mq 0 '' '' "$T1" "$T2" 'failed_checks')")"
+eq "G4  ...and a removal GitHub stated NO reason for is NOT an ejection — UNKNOWN" \
+   "UNKNOWN|removal-reason-unrecognised" \
+   "$(_gate_mq_classify "$(mq 0 '' '' "$T1" "$T2" '')")"
+eq "G5  RE-ENQUEUED after an eviction (add is LATER than the removal) -> not ejected" \
+   "ENQUEUED|2026-09-11T19:05:00Z" \
+   "$(_gate_mq_classify "$(mq 0 '' '' 2026-09-11T19:05:00Z "$T2" 'failed_checks')")"
+eq "G6  no add event has ever existed    -> NEVER ENQUEUED" \
+   "NEVER" "$(_gate_mq_classify "$(mq 0 '' '' '' '' '')")"
+eq "G7  a removal with no add at all (history truncated) -> still EJECTED, not NEVER" \
+   "EJECTED|$T2|failed_checks" "$(_gate_mq_classify "$(mq 0 '' '' '' "$T2" 'failed_checks')")"
+
+# --- THE POLARITY. An unreached question is never a measured no. ---
+eq "G8  EMPTY payload                    -> UNKNOWN, never NEVER" \
+   "UNKNOWN|queue-state-unreadable" "$(_gate_mq_classify "")"
+eq "G9  a GraphQL error envelope (too few fields) -> UNKNOWN" \
+   "UNKNOWN|queue-state-unreadable" "$(_gate_mq_classify "0${US}${US}")"
+
+# --- the impure leaf's guards, all reachable with no network ---
+eq "G10 a delivery_ref that names no PR number -> UNKNOWN, no read attempted" \
+   "UNKNOWN|pr-number-unreadable" "$(_gate_pr_queue_state "https://example.com/x" "" "o/r")"
+eq "G11 an unresolved repo slug                -> UNKNOWN, no read attempted" \
+   "UNKNOWN|repo-unresolved" "$(_gate_pr_queue_state "https://github.com/o/r/pull/897" "" "notaslug")"
+GH_RAW=""; GH_RC=1
+_gate_gh() { [[ -n "$GH_RAW" ]] && printf '%s' "$GH_RAW"; return "$GH_RC"; }
+eq "G12 the ONE gh read fails             -> UNKNOWN (the read is the only input)" \
+   "UNKNOWN|queue-state-unreadable" \
+   "$(_gate_pr_queue_state "https://github.com/o/r/pull/897" tok "o/r")"
+GH_RAW="$(mq 0 '' '' "$T1" "$T2" 'failed_checks')"; GH_RC=0
+eq "G13 the read ANSWERS with an eviction -> EJECTED, through the live leaf" \
+   "EJECTED|$T2|failed_checks" \
+   "$(_gate_pr_queue_state "https://github.com/o/r/pull/897" tok "o/r")"
+eq "G14 a bare PR number resolves the same way" \
+   "EJECTED|$T2|failed_checks" "$(_gate_pr_queue_state "897" tok "o/r")"
+
+# --- the WORDING, because both call sites (the DIVE-1830 close refusal and
+#     `task show`'s merge_queue line) render through this one function, and a
+#     NOT-MEASURED that reads like a NEVER is the defect with a new coat. ---
+case "$(_gate_mq_note "$(_gate_mq_classify "$(mq 0 '' '' "$T1" "$T2" 'failed_checks')")")" in
+  *EJECTED*"$T2"*failed_checks*) ok_t "G15 the ejected note names WHEN and WHY" ;;
+  *) bad_t "G15 the ejected note names WHEN and WHY" "got: $(_gate_mq_note "EJECTED|$T2|failed_checks")" ;;
+esac
+_g16=$(_gate_mq_note "UNKNOWN|queue-state-unreadable")
+if [[ "$_g16" == *"NOT MEASURED"* && "$_g16" != *"NEVER ENQUEUED"* ]]; then
+  ok_t "G16 an unreadable queue reads as NOT MEASURED and NEVER as never-enqueued"
+else
+  bad_t "G16 an unreadable queue reads as NOT MEASURED and NEVER as never-enqueued" "got: $_g16"
+fi
+case "$(_gate_mq_note "QUEUED|1|AWAITING_CHECKS")" in
+  *"position 1"*) ok_t "G17 the queued note names the position" ;;
+  *) bad_t "G17 the queued note names the position" "got: $(_gate_mq_note "QUEUED|1|AWAITING_CHECKS")" ;;
+esac
+
+# --- WIRED, asserted against the shipped source. Both call sites are inside
+#     branches that need a live pull request, so their PLACEMENT is what a unit
+#     harness can grade — the same move section D makes for the merge itself. ---
+if grep -q '_gate_mq_note "$(_gate_pr_queue_state' "$SRC/task/status.sh"; then
+  ok_t "G18 the DIVE-1830 close refusal reads the queue state"
+else
+  bad_t "G18 the DIVE-1830 close refusal reads the queue state" "no call in src/task/status.sh"
+fi
+if grep -q 'merge_queue = ' "$SRC/task/crud.sh"; then
+  ok_t "G19 \`task show\` carries a merge_queue line beside graded->merge"
+else
+  bad_t "G19 \`task show\` carries a merge_queue line beside graded->merge" "no line in src/task/crud.sh"
+fi
+# The fence is part of the claim: an unconditional live read on the board's
+# most-called verb is a cost nobody agreed to.
+if grep -q 'FIVE_TASK_SHOW_QUEUE' "$SRC/task/crud.sh"; then
+  ok_t "G20 ...and that read is fenced and switchable off"
+else
+  bad_t "G20 ...and that read is fenced and switchable off" "no fence in src/task/crud.sh"
+fi
+
+# --- G21-G27  THE REASON, NOT THE ORDER (iteration 1, quinn's finding).
+#     A SUCCESSFUL MERGE ALSO EMITS RemovedFromMergeQueueEvent — with
+#     reason=merged. Deciding EJECTED on add-vs-removal ORDER therefore reported
+#     the PR that LANDED as thrown out, and `task show`'s fence (merge_owner set
+#     + row open + a pull URL, blind to PR state) reaches that window in
+#     production: 24 minutes of merged-but-not-yet-closed on DIVE-4299.
+#
+#     The payloads below are the LIVE ones ops read off 5dive-ai/5dive on
+#     2026-09-11, so these arms are the canned-payload harness's answer to the
+#     one class of fixture it could not invent for itself. #897 carries one
+#     removal of EACH kind, so the ejection arm and its inverse sit on the same
+#     pull request.
+#
+#     LIVE CONTROL, run from this seat through the machine-account rail against
+#     5dive-ai/5dive on 2026-09-11, so the payloads below are TRANSCRIBED and
+#     not invented: #897 -> `0|||19:01:41Z|19:42:26Z|merged` and #894 — evicted
+#     on a ONE-SECOND overage, re-enqueued, then landed ->
+#     `0|||18:29:56Z|19:21:54Z|merged`. BOTH read EJECTED before this iteration.
+#     #894's 19:00:56Z eviction has dropped off its own timeline, so the live
+#     failed_checks fixture that survives is #897's earlier removal (G23).
+#
+#     Mutants for this arm are listed with the rest at the head of section G
+#     (M13, M14, M15).
+P897_MERGED="$(mq 0 '' '' 2026-09-11T19:01:41Z 2026-09-11T19:42:26Z merged)"
+P897_EJECT="$(mq 0 '' '' 2026-09-11T18:15:27Z 2026-09-11T19:00:30Z failed_checks)"
+P894_MERGED="$(mq 0 '' '' 2026-09-11T18:29:56Z 2026-09-11T19:21:54Z merged)"
+
+GH_RAW="$P897_MERGED"; GH_RC=0
+eq "G21 #897's real removal reason=merged -> MERGED, NOT ejected (through the leaf)" \
+   "MERGED|2026-09-11T19:42:26Z" \
+   "$(_gate_pr_queue_state "https://github.com/5dive-ai/5dive/pull/897" tok "5dive-ai/5dive")"
+_g22=$(_gate_mq_note "$(_gate_pr_queue_state "https://github.com/5dive-ai/5dive/pull/897" tok "5dive-ai/5dive")")
+if [[ "$_g22" == *"MERGED at 2026-09-11T19:42:26Z"* && "$_g22" == *"LANDED"* \
+      && "$_g22" != *EJECTED* && "$_g22" != *unmerged* ]]; then
+  ok_t "G22 ...and the note a merge owner reads says it landed, never ejected/unmerged"
+else
+  bad_t "G22 ...and the note a merge owner reads says it landed, never ejected/unmerged" "got: $_g22"
+fi
+GH_RAW="$P897_EJECT"; GH_RC=0
+eq "G23 the SAME pull request's earlier removal, reason=failed_checks -> EJECTED" \
+   "EJECTED|2026-09-11T19:00:30Z|failed_checks" \
+   "$(_gate_pr_queue_state "https://github.com/5dive-ai/5dive/pull/897" tok "5dive-ai/5dive")"
+GH_RAW="$P894_MERGED"; GH_RC=0
+eq "G24 #894 — ejected on a 1s overage, re-enqueued, LANDED: its last removal is the merge" \
+   "MERGED|2026-09-11T19:21:54Z" \
+   "$(_gate_pr_queue_state "https://github.com/5dive-ai/5dive/pull/894" tok "5dive-ai/5dive")"
+eq "G25 a reason outside the observed enum -> UNKNOWN, never an ejection" \
+   "UNKNOWN|removal-reason-unrecognised" \
+   "$(_gate_mq_classify "$(mq 0 '' '' "$T1" "$T2" 'dequeued_by_a_human')")"
+_g26=$(_gate_mq_note "$(_gate_mq_classify "$(mq 0 '' '' "$T1" "$T2" 'dequeued_by_a_human')")")
+if [[ "$_g26" == *"NOT MEASURED"* && "$_g26" != *EJECTED* && "$_g26" != *"NEVER ENQUEUED"* ]]; then
+  ok_t "G26 ...and it RENDERS as NOT MEASURED — not an ejection and not a never-pressed"
+else
+  bad_t "G26 ...and it RENDERS as NOT MEASURED — not an ejection and not a never-pressed" "got: $_g26"
+fi
+eq "G27 the enum arrives upper-cased -> still MERGED, not 'unrecognised'" \
+   "MERGED|$T2" "$(_gate_mq_classify "$(mq 0 '' '' "$T1" "$T2" 'MERGED')")"
+
 printf '\n%s\n' "----------------------------------------------------------"
 printf 'PASS=%s FAIL=%s\n' "$PASS" "$FAIL"
 (( FAIL == 0 )) || exit 1

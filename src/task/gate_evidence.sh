@@ -1729,6 +1729,158 @@ _gate_pr_state() {
       2>/dev/null || true
 }
 
+# --- DIVE-4337: THE MERGE QUEUE IS A STATE THE PULL REQUEST DOES NOT REPORT ----
+#
+# A queue-protected branch has three world states that every field a reader would
+# check renders IDENTICALLY. After the queue evicts a PR it reads
+# `state=OPEN merged=false mergeStateStatus=CLEAN mergeable=MERGEABLE
+# isInMergeQueue=false` - byte-for-byte what a PR that was never enqueued reads.
+# Measured 2026-09-11: #897 (DIVE-4327) sat at queue position 1 for 45 minutes and
+# left unmerged at 19:00:56Z on a 10s budget overage; #894 (DIVE-4324) the same
+# cycle on a 1s overage. Both were graded PASS and green ON THEIR OWN HEADS - the
+# merge group prices a different corpus (`main@HEAD + PR`, re-sharded) than the
+# branch did. The row read `graded->merge:<seat>` in all three states.
+#
+# WHY `mergeStateStatus` CANNOT ANSWER THIS, since every previous reader reached
+# for it: it does not carry queue membership at all. A QUEUED pull request reads
+# CLEAN. Inferring "nothing was enqueued" from `mergeStateStatus != QUEUED` is the
+# misread that produced the superseded four-for-four reading in
+# community/wiki/a-rail-that-prints-merged-before-re-reading-merged-is-a-false-record.md.
+#
+# BOTH FIELDS ARE GRAPHQL-ONLY. `gh pr view --json` exposes neither
+# `mergeQueueEntry` nor `isInMergeQueue`, so this is the one read in the gate that
+# cannot be a `pr view`.
+#
+# AND THE EVICTION'S WITNESS IS THE TIMELINE, NOT THE WORKFLOW RUN. The obvious
+# witness - the `unit-tests` run on `gh-readonly-queue/main/pr-NNN-<sha>` - is
+# EPHEMERAL: the queue deletes that ref as it re-forms groups, and #897's failing
+# run was already absent from `gh run list --event merge_group --limit 40` twenty
+# minutes later. `RemovedFromMergeQueueEvent` is ON the pull request and persists,
+# so it is what this reads. A reason string GitHub does not supply degrades to
+# "reason not stated", never to "never enqueued".
+
+# The query and the projection are constants so a harness can drive the PURE half
+# with a canned payload and never touch the network - the _merge_disp_* split.
+readonly _GATE_MQ_GQL='query($owner:String!,$name:String!,$number:Int!){
+  repository(owner:$owner,name:$name){ pullRequest(number:$number){
+    isInMergeQueue
+    mergeQueueEntry{ position state }
+    timelineItems(last:20, itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){
+      nodes{ __typename
+             ... on AddedToMergeQueueEvent{ createdAt }
+             ... on RemovedFromMergeQueueEvent{ createdAt reason } } } } } }'
+
+# US-joined, the same separator discipline _merge_disp_probe uses: six fields,
+# none of which may be dropped when empty, so the parser below can index by
+# position. `reason` is free text and may contain anything except a US.
+readonly _GATE_MQ_JQ='
+  ( .data.repository.pullRequest // {} ) as $p
+  | ( [ ($p.timelineItems.nodes // [])[] | select(.__typename=="AddedToMergeQueueEvent") ] | last ) as $add
+  | ( [ ($p.timelineItems.nodes // [])[] | select(.__typename=="RemovedFromMergeQueueEvent") ] | last ) as $rm
+  | [ (if ($p.isInMergeQueue // false) then "1" else "0" end),
+      (($p.mergeQueueEntry.position // "") | tostring),
+      ($p.mergeQueueEntry.state // ""),
+      ($add.createdAt // ""),
+      ($rm.createdAt // ""),
+      ($rm.reason // "") ] | join("\u001f")'
+
+# _gate_mq_classify <us-joined-fields> -> one machine token:
+#
+#   QUEUED|<position>|<entry-state>   in the queue right now
+#   MERGED|<when>                     removed because IT LANDED (reason=merged)
+#   EJECTED|<when>|<reason>           removed UNMERGED by the queue (reason=failed_checks)
+#   ENQUEUED|<when>                   an add with no entry and no later removal -
+#                                     the race window, deliberately not EJECTED
+#   NEVER                             no add event has ever been recorded
+#   UNKNOWN|<why>                     nothing was measured; never a negative
+#
+# THE REASON DECIDES, NOT THE ORDER (DIVE-4337 iteration 1, quinn). A SUCCESSFUL
+# MERGE ALSO EMITS `RemovedFromMergeQueueEvent` - with `reason=merged`. So "the
+# last queue event is a removal" is not ejection: on #897 three of six removals
+# across the sampled PRs were merges, and #897 itself carries one of each
+# (19:00:30Z failed_checks, then 19:42:26Z merged). Deciding on add-vs-removal
+# ORDER reported the PR that LANDED as thrown out - a false record about merge
+# state, the exact class this row exists to end. The order test still runs first
+# (a re-enqueue after a removal is ENQUEUED whatever the removal said), but the
+# verdict for a trailing removal comes from `reason` alone.
+#
+# AND AN UNRECOGNISED REASON IS NOT AN EJECTION EITHER. The observed enum is
+# `failed_checks` and `merged` (ops, live read, 2026-09-11); anything else -
+# including the empty string GitHub gives when it states no reason - is
+# UNKNOWN|removal-reason-unrecognised and RENDERS as NOT MEASURED. Same fail-safe
+# direction as the rest of this classifier: a value we cannot read must never be
+# printed as a measured claim about what happened to the merge.
+#
+# PURE, and that is the whole point of the split: UNKNOWN must be reachable in a
+# harness with no network, because an unreadable queue read rendered as NEVER is
+# this ticket's own defect wearing a new coat (DIVE-2318's rule - an unreached
+# question must never print as a measured no).
+_gate_mq_classify() {
+  local raw="${1:-}" inq pos st add rmv why rest
+  # A field count that does not match means the payload was not the projection
+  # above - an error envelope, a truncated read, an empty string. Not an answer.
+  [[ -n "$raw" && "$raw" == *$'\x1f'*$'\x1f'*$'\x1f'*$'\x1f'*$'\x1f'* ]] \
+    || { printf 'UNKNOWN|queue-state-unreadable'; return 0; }
+  inq="${raw%%$'\x1f'*}"; rest="${raw#*$'\x1f'}"
+  pos="${rest%%$'\x1f'*}"; rest="${rest#*$'\x1f'}"
+  st="${rest%%$'\x1f'*}";  rest="${rest#*$'\x1f'}"
+  add="${rest%%$'\x1f'*}"; rest="${rest#*$'\x1f'}"
+  rmv="${rest%%$'\x1f'*}"; why="${rest#*$'\x1f'}"
+  # MEMBERSHIP FIRST, and either witness is enough: `isInMergeQueue` can be true
+  # while the entry itself is not readable under this token's scope.
+  if [[ "$inq" == "1" || -n "$pos" ]]; then
+    printf 'QUEUED|%s|%s' "${pos:-?}" "${st:-state-unread}"; return 0
+  fi
+  # Not a member. These are ISO-8601 UTC strings from one API, so they compare
+  # correctly AS STRINGS - which is why no date parsing happens here.
+  if [[ -n "$rmv" && ( -z "$add" || ! "$add" > "$rmv" ) ]]; then
+    # The removal is the last queue event. WHICH removal it is, is `reason`.
+    # Lowercased first: the observed values are lowercase, but this is a GraphQL
+    # field and an upper-case enum must not silently become "unrecognised".
+    case "${why,,}" in
+      merged)        printf 'MERGED|%s' "$rmv"; return 0 ;;
+      failed_checks) printf 'EJECTED|%s|%s' "$rmv" "$why"; return 0 ;;
+      *)             printf 'UNKNOWN|removal-reason-unrecognised'; return 0 ;;
+    esac
+  fi
+  [[ -n "$add" ]] && { printf 'ENQUEUED|%s' "$add"; return 0; }
+  printf 'NEVER'
+}
+
+# _gate_mq_note <machine-token> - the same fact as a sentence a merge owner can
+# act on. Separate from the classifier so both call sites render ONE wording and
+# a harness can grade that wording without a network read.
+_gate_mq_note() {
+  local tok="${1:-}" a b
+  case "$tok" in
+    QUEUED\|*)   a="${tok#QUEUED|}"; b="${a#*|}"; a="${a%%|*}"
+                 printf 'MERGE QUEUE: QUEUED at position %s (%s) - it is pressed and waiting, so nobody owes this row an action yet.' "$a" "$b" ;;
+    MERGED\|*)   printf 'MERGE QUEUE: MERGED at %s - the queue removed it because IT LANDED, not because it was thrown out. `reason=merged` on the removal event; a successful merge and a merge-group eviction are BOTH RemovedFromMergeQueueEvent, and only the reason separates them (DIVE-4337). Nothing is owed here but closing the row.' "${tok#MERGED|}" ;;
+    EJECTED\|*)  a="${tok#EJECTED|}"; b="${a#*|}"; a="${a%%|*}"
+                 printf 'MERGE QUEUE: EJECTED at %s - %s. It WAS enqueued and the queue removed it unmerged, which leaves no trace on the pull request (DIVE-4337): every other field here reads exactly as it would had it never been pressed. A merge group prices `main@HEAD + this PR`, re-sharded, so a head that was green can still red in the queue on a time budget or on another PR in the same group. Re-enqueue it, or read the merge-group run before charging this to the diff.' "$a" "$b" ;;
+    ENQUEUED\|*) printf 'MERGE QUEUE: an ADD was recorded at %s with no live entry and no removal - read it again in a moment; this is the window between the add and the entry appearing.' "${tok#ENQUEUED|}" ;;
+    NEVER)       printf 'MERGE QUEUE: NEVER ENQUEUED - no add event exists on this pull request, so nobody has pressed merge. Measured on the timeline, not inferred from `mergeStateStatus` (which reads CLEAN for a queued PR and cannot answer this).' ;;
+    UNKNOWN\|*)  printf 'MERGE QUEUE: NOT MEASURED (%s) - this says NOTHING about whether it is queued, was ejected, or was never pressed; do not read it as any of the three.' "${tok#UNKNOWN|}" ;;
+    *)           printf 'MERGE QUEUE: NOT MEASURED (no classification) - read it as nothing at all.' ;;
+  esac
+}
+
+# _gate_pr_queue_state <pr-ref-or-number> <tok> <slug> - the IMPURE half: one
+# GraphQL read, then the pure classifier. Every failure mode yields UNKNOWN.
+_gate_pr_queue_state() {
+  local ref="${1:-}" tok="${2:-}" slug="${3:-}" num owner name raw
+  num="${ref##*/}"; num="${num##*#}"
+  [[ "$num" =~ ^[0-9]+$ ]] || { printf 'UNKNOWN|pr-number-unreadable'; return 0; }
+  owner="${slug%%/*}"; name="${slug#*/}"
+  [[ -n "$owner" && -n "$name" && "$owner" != "$slug" ]] \
+    || { printf 'UNKNOWN|repo-unresolved'; return 0; }
+  command -v gh >/dev/null 2>&1 || { printf 'UNKNOWN|gh-absent'; return 0; }
+  raw=$(_gate_gh "$tok" 10 api graphql \
+          -f query="$_GATE_MQ_GQL" -F owner="$owner" -F name="$name" -F number="$num" \
+          -q "$_GATE_MQ_JQ" 2>/dev/null) || raw=""
+  _gate_mq_classify "$raw"
+}
+
 # DIVE-2296: _gate_branch_open_pr <slug> <branch> <tok> — is there an OPEN PR for
 # this head, and where are its checks? Prints `N|CHECKS` (CHECKS as in
 # _gate_pr_state: FAILURE / NONE / OK) or EMPTY for "no open PR found, or the
