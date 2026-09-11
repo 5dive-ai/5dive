@@ -83,6 +83,33 @@ _task_doctor_lane_wakeable() {
   [[ "$v" == "true" ]]
 }
 
+# _task_doctor_fleet_note — the FLEET-level reading behind a pile of dead lanes
+# (DIVE-4269). Prints nothing when the fleet is healthy.
+#
+# WHY THIS IS NOT JUST MORE PER-ROW FINDINGS. The customer box that filed this
+# row had 65 rows on dead lanes at once. Sixty-five per-row remedies is not the
+# answer to that; "only 7 of your 37 seats are enrolled, and the supervisor tick
+# is not armed" is. The per-row remedy re-points ONE row at a live seat; this
+# line names the reason the board keeps producing them.
+#
+# READ-ONLY, like every other thing `doctor` prints. It arms nothing.
+_task_doctor_fleet_note() {
+  local reg="${STATE_DIR:-/var/lib/5dive}/agents.json" total=0 enrolled=0 sup=""
+  [[ -r "$reg" ]] || return 0
+  total=$(jq -r '(.agents // {}) | length' "$reg" 2>/dev/null) || return 0
+  [[ -n "$total" && "$total" != "0" ]] || return 0
+  enrolled=$(jq -r '[(.agents // {}) | to_entries[] | select((.value.heartbeat.enabled // false) == true)] | length' "$reg" 2>/dev/null) || return 0
+  [[ -f "${STATE_DIR:-/var/lib/5dive}/supervisor.enabled" ]] || sup=1
+  # A fully enrolled fleet with an armed supervisor has nothing to say here.
+  [[ "$enrolled" == "$total" && -z "$sup" ]] && return 0
+  local out="fleet: ${enrolled}/${total} seats carry a heartbeat — the tick iterates ONLY those, so a row assigned anywhere else is never picked up and never says so."
+  (( enrolled < total )) && out+="
+  Enrol the lanes that are meant to run themselves: sudo 5dive heartbeat on <agent>   (roster: 5dive agent list)"
+  [[ -n "$sup" ]] && out+="
+  The supervisor tick is NOT armed (${STATE_DIR:-/var/lib/5dive}/supervisor.enabled is absent), so a stuck or dead seat is not observed or recovered either: sudo touch ${STATE_DIR:-/var/lib/5dive}/supervisor.enabled"
+  printf '%s' "$out"
+}
+
 # The four classes, as SQL predicates over open standard rows. Kept as one
 # function so the report and the --json payload cannot drift apart.
 #
@@ -382,6 +409,10 @@ cmd_task_doctor() {
   # whatever the registry says. A verb that threw them away because agents.json
   # was unreadable would hide the stale edges behind a registry problem.
   local lane_note="" lanes=""
+  # DIVE-4269: hoisted to function scope. The census below has to subtract the
+  # rows sitting on these lanes, and a `local` inside the branch would leave the
+  # census reading the honest number only by accident of shell scoping.
+  local bad_lanes="" bad_graders=""
   lanes=$(_task_roster_sql_notin)
   if [[ -z "$lanes" ]]; then
     lane_note="lane check SKIPPED — the agent roster is ${_TASK_ROSTER_STATE:-unknown}; with no roster every lane would read as dead. Fix the registry first: 5dive doctor"
@@ -398,7 +429,6 @@ cmd_task_doctor() {
     # spent. Same predicate, same sub-cases, one loop, two columns: a second copy
     # of the rule is how the picker and the report came to disagree in the first
     # place.
-    local bad_lanes="" bad_graders=""
     _scan_column() {  # <sql for DISTINCT names> <out-var name>
       local _sql="$1" _out="$2" name seen="" bad="" rc
       while IFS= read -r name; do
@@ -471,14 +501,63 @@ cmd_task_doctor() {
           AND parked_at IS NOT NULL AND wake_at IS NOT NULL AND wake_at > datetime('now'));" 2>/dev/null || echo "")
   local c_open c_todo c_prog c_park c_gate c_dep c_nextwake
   IFS='|' read -r c_open c_todo c_prog c_park c_gate c_dep c_nextwake <<<"${census:-0|0|0|0|0|0|}"
-  local census_line="open ${c_open:-0}: ${c_todo:-0} dispatchable now, ${c_prog:-0} in progress, ${c_park:-0} parked${c_nextwake:+ (next wakes ${c_nextwake}Z)}, ${c_gate:-0} awaiting a human gate, ${c_dep:-0} behind a live blocker"
 
-  local payload='{findings:($f|length), rows:$f, census:{open:($o|tonumber), dispatchable:($t|tonumber), inProgress:($p|tonumber), parked:($pk|tonumber), gated:($g|tonumber), blockedLive:($d|tonumber), nextWake:(($w|select(length>0)) // null)}, laneCheck:(($ln|select(length>0)) // null)}'
-  local -a jargs=( --argjson f "$findings" --arg o "${c_open:-0}" --arg t "${c_todo:-0}" --arg p "${c_prog:-0}"
+  # ---- DIVE-4269: "dispatchable now" must mean DISPATCHABLE ------------------
+  # The count above is `status='todo' AND parked_at IS NULL` — board state only.
+  # It never asked whether anything WAKES the seat the row is parked on, so this
+  # verb printed "64 dispatchable now" in the same breath as it listed 65
+  # dead-lane findings: one command, two contradictory answers, and the reassuring
+  # one is the footer. Reported 2026-09-11 from a customer box (87 open, 78 that
+  # nothing would ever pick up, footer still reading "64 dispatchable now").
+  #
+  # The subtraction uses `bad_lanes` — the SAME set the dead-lane findings are
+  # built from, not a second evaluation of the rule — so the footer and the
+  # findings cannot disagree by construction. `dead-verifier` is deliberately NOT
+  # subtracted: that row IS dispatchable now and strands one step later, at
+  # handoff, which is exactly what its own explain line says.
+  #
+  # BOTH numbers are printed, never just the honest one. A footer that silently
+  # shrank from 64 to 13 would leave the reader with no way to see that 51 rows
+  # are addressed to seats nothing wakes — which is the finding, not a detail.
+  # When the lane check could not run (no roster) the stall count is unknown and
+  # the line SAYS SO rather than implying zero.
+  local c_stalled="" c_live="${c_todo:-0}" stall_note=""
+  if [[ -n "$bad_lanes" ]]; then
+    c_stalled=$(db "SELECT COUNT(*) FROM tasks WHERE kind='standard' AND status='todo'
+                      AND parked_at IS NULL AND assignee IN (${bad_lanes});" 2>/dev/null || echo "")
+  elif [[ -n "$lanes" ]]; then
+    c_stalled=0
+  fi
+  if [[ -n "$c_stalled" ]]; then
+    c_live=$(( ${c_todo:-0} - c_stalled ))
+    (( c_stalled > 0 )) && stall_note=" (${c_todo:-0} todo, ${c_stalled} of them on a lane nothing wakes — see the dead-lane rows above: 5dive heartbeat on <agent>)"
+  else
+    c_live="${c_todo:-0}"
+    stall_note=" (todo; the lane check could not run, so how many of these a tick would actually reach is UNKNOWN)"
+  fi
+  local census_line="open ${c_open:-0}: ${c_live} dispatchable now${stall_note}, ${c_prog:-0} in progress, ${c_park:-0} parked${c_nextwake:+ (next wakes ${c_nextwake}Z)}, ${c_gate:-0} awaiting a human gate, ${c_dep:-0} behind a live blocker"
+
+  # ---- DIVE-4269: fleet enrolment, the reason the number was wrong -----------
+  # A per-row remedy does not answer "why are 65 rows on dead lanes at once".
+  # The answer on a fresh box is that `agent create` never enrolled the seats and
+  # the supervisor tick was never armed, so "assign it to a seat" silently meant
+  # "never". One line, read-only, printed whenever the enrolled share is short.
+  local fleet_note=""
+  fleet_note=$(_task_doctor_fleet_note)
+
+  # `dispatchable` keeps its name and CHANGES its meaning to the honest one:
+  # a consumer reading it wants the number it always thought it was reading.
+  # `todo` carries the raw board count it used to hold, and `todoOnDeadLane` is
+  # null (not 0) when the lane check could not run — "unknown" and "none" are
+  # different answers and a machine reader must be able to tell them apart.
+  local payload='{findings:($f|length), rows:$f, census:{open:($o|tonumber), dispatchable:($t|tonumber), todo:($tt|tonumber), todoOnDeadLane:(($st|select(length>0)|tonumber) // null), inProgress:($p|tonumber), parked:($pk|tonumber), gated:($g|tonumber), blockedLive:($d|tonumber), nextWake:(($w|select(length>0)) // null)}, laneCheck:(($ln|select(length>0)) // null), fleet:(($fn|select(length>0)) // null)}'
+  local -a jargs=( --argjson f "$findings" --arg o "${c_open:-0}" --arg t "${c_live}" --arg tt "${c_todo:-0}"
+                   --arg st "${c_stalled}" --arg fn "$fleet_note" --arg p "${c_prog:-0}"
                    --arg pk "${c_park:-0}" --arg g "${c_gate:-0}" --arg d "${c_dep:-0}"
                    --arg w "${c_nextwake:-}" --arg ln "$lane_note" )
 
   [[ -z "$lane_note" ]] || warn "$lane_note"
+  [[ -z "$fleet_note" ]] || warn "$fleet_note"
 
   if [[ "${n:-0}" == "0" ]]; then
     ok "no undispatchable rows — every open row has a live revisit anchor, a wakeable assignee and a wakeable verifier
