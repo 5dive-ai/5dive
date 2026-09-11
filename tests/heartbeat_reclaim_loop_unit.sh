@@ -609,13 +609,30 @@ mk_graded_awaiting_merge() {   # <maker> <merge-owner>
              started_at=datetime('now','-40 minutes'),
              -- DIVE-4327: the delivery clock is back-dated with the rest of them.
              -- mk_delivered_unacked stamps handoff_delivered_at at NOW, and this
-             -- helper then wrote a grade THIRTY MINUTES EARLIER -- a row graded
-             -- before it was delivered, which cannot happen in production and only
-             -- passed because nothing read the two clocks against each other. The
-             -- iteration bind in _TASKS_TFV_SQL does read them, and it is right to
-             -- call a delivery newer than its grade an UNGRADED iteration. The
-             -- shape this fixture means (delivered, then graded, merge owed) is
-             -- unchanged; only the impossible ordering is.
+             -- helper then wrote a grade THIRTY MINUTES EARLIER, i.e. graded_at
+             -- BEFORE handoff_delivered_at.
+             --
+             -- That ordering is NOT impossible -- it is one of the commonest
+             -- shapes on the board. 75 live rows carried it when this was
+             -- measured (2026-09-11), among them DIVE-4323, DIVE-4310,
+             -- DIVE-3963, DIVE-4288, DIVE-4295, DIVE-4239, DIVE-4280 and
+             -- DIVE-4289. What it MEANS is that the standing grade belongs to a
+             -- PREVIOUS iteration: the row was graded, then re-delivered, so the
+             -- grade is stale rather than current.
+             --
+             -- So the ordering is exactly what cannot hold on a row that is
+             -- genuinely graded-and-awaiting-merge, which is the state this
+             -- helper's name claims to build -- there, the delivery precedes the
+             -- grade that is waiting on it. The iteration bind in _TASKS_TFV_SQL
+             -- reads the two clocks and is right to call a delivery newer than
+             -- its grade an UNGRADED iteration; the old helper was building the
+             -- state its own name contradicted.
+             --
+             -- Do NOT read this as: the clause guards an impossible state and is
+             -- safe to relax. The shape this fixture means (delivered, then
+             -- graded, merge owed) is unchanged; only the contradictory ordering
+             -- is. The stale-grade ordering itself is pinned by inv3a in
+             -- tests/loop_state_machine_invariants_unit.sh.
              handoff_delivered_at=datetime('now','-35 minutes'),
              graded_at=datetime('now','-30 minutes'), graded_by='quinn',
              graded_verdict='pass', merge_owner=$(sqlq "$owner"),
